@@ -192,13 +192,16 @@ describe('Capture Library — columns + filters', () => {
 });
 
 describe('Capture Library — actions (PR #2 Section 5)', () => {
-  it('disables Analyzer when the capture has no dataset_id', async () => {
+  it('opens preserved packet evidence when the capture has no dataset_id', async () => {
     stubBackend({});
     render(renderWithProviders(<CaptureLibraryPage />));
     await waitFor(() => expect(screen.getByText('live-sbi')).toBeInTheDocument());
     const analyzer = screen.getByTestId('analyzer-sha256:bb');
-    expect(analyzer.tagName).toBe('BUTTON');
-    expect(analyzer).toBeDisabled();
+    expect(analyzer.tagName).toBe('A');
+    expect(analyzer).toHaveAttribute(
+      'href',
+      '/analyzer/analysis/packets?capture_id=sha256%3Abb',
+    );
   });
 
   it('preserves capture_id and dataset_id in the Analyzer URL', async () => {
@@ -210,6 +213,7 @@ describe('Capture Library — actions (PR #2 Section 5)', () => {
     const analyzer = screen.getByTestId('analyzer-sha256:aa');
     expect(analyzer).toHaveAttribute('href');
     const url = analyzer.getAttribute('href')!;
+    expect(url).toContain('/analyzer/investigation/sessions?');
     expect(url).toContain('capture_id=sha256%3Aaa');
     expect(url).toContain('dataset_id=ds-1');
   });
