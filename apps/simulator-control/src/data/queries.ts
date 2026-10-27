@@ -3,6 +3,9 @@ import { api, type ApiOptions } from '@shared/api';
 import type {
   Capabilities,
   LabConfiguration,
+  LoginRequest,
+  LoginResult,
+  NodeInventory,
   PolarisAuthState,
   ScenarioCapabilities,
   ScenarioList,
@@ -14,6 +17,19 @@ import type {
   ValidationResult,
 } from './polarisTypes';
 
+const CSRF_KEY = 'polaris.csrf_token';
+
+function readCsrf(): string | null {
+  if (typeof sessionStorage === 'undefined') return null;
+  return sessionStorage.getItem(CSRF_KEY);
+}
+
+export function writeCsrf(value: string | null): void {
+  if (typeof sessionStorage === 'undefined') return;
+  if (value) sessionStorage.setItem(CSRF_KEY, value);
+  else sessionStorage.removeItem(CSRF_KEY);
+}
+
 // Every POLARIS request names the `polaris` auth scope so the shared
 // client can only attach the POLARIS token (never an OIRAN one) and only
 // to the POLARIS API base. See packages/ui/src/api.ts.
@@ -23,7 +39,15 @@ const POLARIS_SCOPE: ApiOptions = {
 };
 
 async function polarisApi<T>(path: string, extra: Omit<ApiOptions, 'authScope' | 'base'> = {}) {
-  const envelope = await api<T>(path, { ...POLARIS_SCOPE, ...extra });
+  const method = (extra.method ?? 'GET').toUpperCase();
+  // POLARIS enforces CSRF on write methods — attach the stored token on
+  // POST/PUT/DELETE/PATCH. The token is refreshed by /auth/login.
+  const extraHeaders = new Headers(extra.headers);
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    const csrf = readCsrf();
+    if (csrf) extraHeaders.set('x-csrf-token', csrf);
+  }
+  const envelope = await api<T>(path, { ...POLARIS_SCOPE, ...extra, headers: extraHeaders });
   // POLARIS Rust backend may return the body directly (no envelope); the
   // shared `api()` wraps it as `{ data, meta }` so the data field is the
   // raw payload. Return `data` for consumer ergonomics.
@@ -155,6 +179,44 @@ export function useStartUe() {
       }),
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: ['polaris', 'ues'] });
+    },
+  });
+}
+
+export function useNodes() {
+  return useQuery({
+    queryKey: ['polaris', 'nodes'],
+    queryFn: () => polarisApi<NodeInventory>('/nodes'),
+    refetchInterval: 5_000,
+  });
+}
+
+export function useLogin() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (request: LoginRequest) => {
+      const result = await polarisApi<LoginResult>('/auth/login', {
+        method: 'POST',
+        body: JSON.stringify(request),
+      });
+      if (result.csrf_token) writeCsrf(result.csrf_token);
+      return result;
+    },
+    onSuccess: async () => {
+      await client.invalidateQueries({ queryKey: ['polaris', 'auth'] });
+    },
+  });
+}
+
+export function useLogout() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      await polarisApi<unknown>('/auth/logout', { method: 'POST', body: '{}' });
+      writeCsrf(null);
+    },
+    onSuccess: async () => {
+      await client.invalidateQueries({ queryKey: ['polaris', 'auth'] });
     },
   });
 }

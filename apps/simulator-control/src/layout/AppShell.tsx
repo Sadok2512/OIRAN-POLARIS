@@ -5,6 +5,7 @@ import clsx from 'clsx';
 import { SidebarNavigation } from './SidebarNavigation';
 import { useTheme } from '@/hooks/useTheme';
 import type { ThemePreference } from '@shared/theme';
+import { useAuth } from '@/data/queries';
 
 const THEME_OPTIONS: { value: ThemePreference; label: string; Icon: typeof Sun }[] = [
   { value: 'light', label: 'Light', Icon: Sun },
@@ -15,6 +16,7 @@ const THEME_OPTIONS: { value: ThemePreference; label: string; Icon: typeof Sun }
 export function AppShell() {
   const [collapsed, setCollapsed] = useState(false);
   const theme = useTheme();
+  const auth = useAuth();
 
   return (
     <div
@@ -74,9 +76,23 @@ export function AppShell() {
       </aside>
       <main className="flex flex-col min-w-0">
         <header className="h-14 border-b border-border bg-surface flex items-center justify-between px-5">
-          <div className="text-ep-sm text-text-secondary">
-            Enterprise Precision ·{' '}
-            <span className="text-text-primary">POLARIS Simulator Control V1</span>
+          <div className="text-ep-sm text-text-secondary flex items-center gap-3">
+            <span>
+              Enterprise Precision ·{' '}
+              <span className="text-text-primary">POLARIS Simulator Control V1</span>
+            </span>
+            {auth.data?.authenticated ? (
+              <span
+                className="ep-badge border-success/40 text-success"
+                data-testid="header-identity"
+              >
+                {auth.data.username} · {auth.data.role}
+              </span>
+            ) : (
+              <span className="ep-badge border-warning/40 text-warning" data-testid="header-identity">
+                Not signed in
+              </span>
+            )}
           </div>
           <div
             className="inline-flex items-center gap-1 rounded-md border border-border bg-canvas p-0.5"

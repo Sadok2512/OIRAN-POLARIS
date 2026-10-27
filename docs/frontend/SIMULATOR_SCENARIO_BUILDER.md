@@ -11,17 +11,26 @@ professional Scenario Library + Builder + UE Assignment + Execution
 Monitor on top of the existing POLARIS Control v1 API. The POLARIS Rust
 backend is **not modified**.
 
-## Pages
+## Pages (single unified Simulator Control)
 
 | Route                                   | Component              | Purpose                                                  |
 | --------------------------------------- | ---------------------- | -------------------------------------------------------- |
 | `/console`                              | `ConsolePage`          | Lab state tiles, scenario mode, approved destinations    |
+| `/nodes`                                | `NetworkNodesPage`     | gNB / eNB inventory (POLARIS `/nodes`), controller vs shared |
 | `/ues`                                  | `UeManagerPage`        | POLARIS UEs + Assigned Scenario column + Run / Stop      |
+| `/traffic`                              | `TrafficPage`          | Live `/traffic/status` + approved destinations           |
 | `/scenarios`                            | `ScenariosLibraryPage` | TanStack-style library with Create/Edit/Duplicate/Delete |
 | `/scenarios/new` + `/scenarios/:id/edit`| `ScenarioBuilderPage`  | Step palette, Fixed/Random params, loop config, timeline |
 | `/scenarios/monitor`                    | `ExecutionMonitorPage` | Backend-reported scenario runtime + traffic + timeline   |
 | `/history`                              | `HistoryPage`          | POLARIS `/scenarios/history` table                       |
-| `/settings`                             | `SettingsPage`         | Operator + scenario policy + local-catalog diagnostics   |
+| `/settings`                             | `SettingsPage`         | Operator Login (CSRF) + scenario policy + local-catalog diagnostics |
+
+**This app is the single Simulator Control** — it integrates the
+Scenario Builder into the existing POLARIS surface (UE Manager + gNB
+Manager + Traffic + Operator Login + History). No parallel application
+is introduced; the preview at `/simulator/` can swap the legacy
+single-file `POLARIS_CONTROL/apps/web` for `apps/simulator-control/dist`
+without exposing any new backend port.
 
 ## Scenario model
 
@@ -120,15 +129,53 @@ fake success is ever reported.
 | -------------------------------------- | ----------------------------------------- | ----- |
 | `src/scenarios/model.test.ts`          | `sampleParam`, `sampleLoopCount`, `validateScenario`, `certifiedProfileFor` | 18 |
 | `src/scenarios/store.test.ts`          | CRUD, duplicate, cascade delete, multi-UE assignments | 8 |
-| `src/app/App.test.tsx`                 | Routing, nav links, library → builder, unknown-route redirect | 4 |
+| `src/app/App.test.tsx`                 | Routing, nav links, library → builder, Network Nodes nav, Traffic nav, Operator Login form, header identity, unknown-route redirect | 8 |
 
-**Total: 30/30 passing** · `npm run typecheck` clean · `npm run build`
-succeeds (278 kB JS gzip 84 kB).
+**Total: 34/34 passing** · `npm run typecheck` clean · `npm run build`
+succeeds (289 kB JS gzip 86 kB).
 
 Playwright is not yet extended to this app because the shared
 `e2e/mock-api.ts` currently only routes OIRAN endpoints — adding a
 POLARIS mock surface is tracked as a follow-up to keep this PR focused
 on scenario modeling and UE assignment logic.
+
+## Integration with the current Simulator Control preview
+
+The current preview deployment at `https://151.242.147.49:8020/simulator/`
+serves the legacy single-file `POLARIS_CONTROL/apps/web/main.tsx`. This
+app (`apps/simulator-control/dist`) is a **drop-in replacement** that:
+
+1. Reuses every public POLARIS v1 route (`/auth/*`, `/capabilities`,
+   `/scenario-capabilities`, `/lab`, `/system/health`, `/nodes`, `/ues`,
+   `/ues/start`, `/ues/stop`, `/traffic/status`, `/scenarios/*`).
+2. Adds the Scenario Library + Builder + Execution Monitor without
+   touching any Rust file.
+3. Stays mounted at the same `/simulator/` base path thanks to the
+   `base: '/simulator/'` option in `vite.config.ts`.
+4. Preserves Enterprise Precision design tokens via `packages/ui`.
+
+Preview swap:
+
+```bash
+# On the preview host:
+cd apps/simulator-control
+npm install && npm run build
+# Point the preview reverse-proxy /simulator/ at apps/simulator-control/dist
+```
+
+No new backend port is exposed. Operator Login writes `polaris.csrf_token`
+to sessionStorage (per-scope key); the shared client attaches the token
+only to writes against `/polaris-api/v1/*`.
+
+## Operator Login contract
+
+- `POST /auth/login { username, password }` → `{ authenticated, username,
+  role, csrf_token, expires_at_epoch_s }`. The CSRF token is stored and
+  automatically attached to every subsequent write (POST / PUT / DELETE /
+  PATCH).
+- `POST /auth/logout` clears the stored CSRF.
+- The login form in `/settings` refuses to submit when the browser is
+  neither HTTPS nor localhost — the message is shown inline.
 
 ## Dev / test commands
 
