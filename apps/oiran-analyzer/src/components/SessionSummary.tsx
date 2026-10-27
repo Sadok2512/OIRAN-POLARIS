@@ -6,6 +6,10 @@ import { count, isoToLocal } from '@/data/format';
 
 function fieldOrDash(value: string | undefined | null): string {
   if (value == null || value === '') return '—';
+  // The backend emits the sentinel string "NOT AVAILABLE" when it has no
+  // value — surface that as a dash so the UI stays visually consistent
+  // with other missing fields.
+  if (/^NOT[_\s]AVAILABLE$/i.test(value)) return '—';
   return value;
 }
 
@@ -76,6 +80,41 @@ export function SessionSummary({
           {count(session.decode_completeness.partial)} /{' '}
           {count(session.decode_completeness.unresolved_fields)}
         </dd>
+      </dl>
+
+      {/*
+        PDU-session-level identity fields required by the brief (DNN,
+        S-NSSAI, PDU Type, UE IP, SM Context Reference, QFI). The current
+        OIRAN v1 backend does NOT emit DNN / S-NSSAI / PDU Type /
+        SM Context Reference / QFI on `/sessions/:id` — those remain
+        honestly "Not available". UE IP + TEIDs come from
+        `session.runtime_evidence` on live sessions.
+      */}
+      <dl className="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-1 text-ep-sm mt-3 pt-3 border-t border-border">
+        <dt className="text-text-secondary">UE IP</dt>
+        <dd className="mono text-ep-xs break-all">
+          {fieldOrDash(pdu?.ueIp)}
+        </dd>
+        <dt className="text-text-secondary">DNN</dt>
+        <dd className="text-text-secondary italic">Not available</dd>
+        <dt className="text-text-secondary">S-NSSAI</dt>
+        <dd className="text-text-secondary italic">Not available</dd>
+        <dt className="text-text-secondary">PDU type</dt>
+        <dd className="text-text-secondary italic">Not available</dd>
+        <dt className="text-text-secondary">SM Context ref</dt>
+        <dd className="text-text-secondary italic">Not available</dd>
+        <dt className="text-text-secondary">QFI</dt>
+        <dd>
+          {pdu && pdu.qfis.length > 0 ? (
+            <span className="mono text-ep-xs">{pdu.qfis.join(', ')}</span>
+          ) : (
+            <span className="text-text-secondary italic">Not available</span>
+          )}
+        </dd>
+        <dt className="text-text-secondary">PFCP SEID count</dt>
+        <dd className="num">{count(pdu?.pfcpSeids.length ?? 0)}</dd>
+        <dt className="text-text-secondary">GTP-U TEID count</dt>
+        <dd className="num">{count(pdu?.gtpuTeids.length ?? 0)}</dd>
       </dl>
 
       {pdu && (

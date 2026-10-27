@@ -277,12 +277,33 @@ export interface UeContext {
   last_timestamp_ns: string;
   event_count: number;
   session_count: number;
+  /** Set on live UE contexts (`live_ue_summary` in the backend). */
+  dataset_id?: string;
+  dataset_kind?: DatasetKind;
+}
+
+/**
+ * Runtime evidence attached to a live session (`live_session_summary` on
+ * the OIRAN API). The backend derives these fields from the controller
+ * runtime — they are the only *proven* source for UE IP, UL/DL direction
+ * and per-TEID observation. Treat them as backend-reported; never
+ * substitute values when absent.
+ */
+export interface SessionRuntimeEvidence {
+  observed_epoch_ms?: number | null;
+  provenance?: string | null;
+  correlation_status?: string | null;
+  ue_ip?: string | null;
+  teids?: string[] | null;
+  directions?: Record<string, string> | null;
 }
 
 export interface Session {
   session_id: string;
-  dataset_id: string;
-  dataset_kind?: DatasetKind;
+  /** `dataset_id` may be null when the backend manifest did not expose a
+   * `scenario_id` (historical dataset without a tagged scenario). */
+  dataset_id: string | null;
+  dataset_kind?: DatasetKind | string;
   ue_context_id: string;
   technology: string;
   ue_pseudonym: string;
@@ -303,6 +324,8 @@ export interface Session {
     unresolved_fields: number;
   };
   state: string;
+  /** Present on live sessions only. */
+  runtime_evidence?: SessionRuntimeEvidence | null;
 }
 
 export interface PacketReference {
@@ -336,7 +359,12 @@ export interface CallFlowEvent {
   source_participant: string;
   destination_participant: string;
   direction: string;
-  decoded_ie_tree: InformationElement[];
+  /**
+   * The backend declares this as `Value` (serde_json::Value) so callers
+   * must defensively treat it as a wide union. In practice OIRAN emits
+   * `InformationElement[]`; absent/null/object shapes are tolerated.
+   */
+  decoded_ie_tree: InformationElement[] | Record<string, unknown> | null;
   decoding_status: DecodeStatus;
   semantic_status: 'NORMAL' | 'SUCCESS' | 'FAILURE' | 'PARTIAL';
   association: Association;
@@ -347,6 +375,18 @@ export interface CallFlowEvent {
   decoder_version: string;
   raw_payload_reference: string;
   errors: string[];
+}
+
+/**
+ * Shape returned by `GET /sessions/:id/correlations`:
+ *   `{ "status": <correlation_status>, "edges": <CorrelationEdge[]> }`
+ * where `status` is the same `BTreeMap<String, String>` found on
+ * `CallFlow.correlation_status`. The envelope `data` is this object, NOT
+ * the plain `CorrelationEdge[]`.
+ */
+export interface SessionCorrelationsResponse {
+  status: Record<string, string>;
+  edges: CorrelationEdge[];
 }
 
 export type CorrelationEvidenceType =

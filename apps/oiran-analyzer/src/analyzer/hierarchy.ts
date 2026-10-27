@@ -16,9 +16,15 @@ export type HierarchyPduSession = {
   interfaces: string[];
   pfcpSeids: string[];
   gtpuTeids: string[];
+  qfis: string[];
   flows: HierarchyFlow[];
   eventCount: number;
   correlation: Confidence;
+  /** Backend `runtime_evidence.ue_ip`; empty string when absent. */
+  ueIp: string;
+  /** Backend `runtime_evidence.directions` (TEID → UL/DL). Empty when
+   * absent — never derived heuristically. */
+  directions: Record<string, string>;
 };
 
 export type HierarchyUe = {
@@ -110,7 +116,12 @@ function buildPduSessionNode(
 ): HierarchyPduSession {
   const events: CallFlowEvent[] = callflow?.events ?? [];
   const pfcpSeids = Array.from(collectIeValues(events, /\b(?:F?SEID|seid)\b/i));
-  const gtpuTeids = Array.from(collectIeValues(events, /\bTEID\b/i));
+  // Merge TEIDs from the decoded IE tree with backend runtime_evidence.
+  const ieTeids = collectIeValues(events, /\bTEID\b/i);
+  const runtime = session.runtime_evidence ?? null;
+  for (const teid of runtime?.teids ?? []) ieTeids.add(teid);
+  const gtpuTeids = Array.from(ieTeids);
+  const qfis = Array.from(collectIeValues(events, /\bQ(?:oS)?_?F(?:low)?_?I(?:D)?\b/i));
   const flows = aggregateFlows(events);
   return {
     pduSessionId: session.pdu_session_id,
@@ -118,9 +129,15 @@ function buildPduSessionNode(
     interfaces: session.interfaces,
     pfcpSeids,
     gtpuTeids,
+    qfis,
     flows,
     eventCount: events.length || session.message_count,
     correlation: session.correlation_status,
+    ueIp: typeof runtime?.ue_ip === 'string' ? runtime.ue_ip : '',
+    directions:
+      runtime?.directions && typeof runtime.directions === 'object'
+        ? (runtime.directions as Record<string, string>)
+        : {},
   };
 }
 
@@ -137,26 +154,38 @@ function countNasEvents(pduSessions: HierarchyPduSession[]): number {
   );
 }
 
+type IeNode = {
+  name?: unknown;
+  value?: unknown;
+  children?: unknown;
+};
+
 function collectIeValues(
   events: CallFlowEvent[],
   nameRegex: RegExp,
 ): Set<string> {
   const seen = new Set<string>();
   for (const event of events) {
+    // The backend declares decoded_ie_tree as a loose JSON Value. Guard
+    // against null, objects and malformed children before iterating.
     walkIe(event.decoded_ie_tree, (ie) => {
-      if (nameRegex.test(ie.name) && ie.value) seen.add(ie.value);
+      const name = typeof ie.name === 'string' ? ie.name : '';
+      const value = typeof ie.value === 'string' ? ie.value : null;
+      if (nameRegex.test(name) && value) seen.add(value);
     });
   }
   return seen;
 }
 
-function walkIe(
-  tree: CallFlowEvent['decoded_ie_tree'],
-  visit: (ie: CallFlowEvent['decoded_ie_tree'][number]) => void,
-): void {
-  for (const ie of tree) {
-    visit(ie);
-    if (ie.children?.length) walkIe(ie.children, visit);
+function walkIe(tree: unknown, visit: (ie: IeNode) => void): void {
+  if (!Array.isArray(tree)) return;
+  for (const raw of tree) {
+    if (!raw || typeof raw !== 'object') continue;
+    const node = raw as IeNode;
+    visit(node);
+    if (Array.isArray(node.children) && node.children.length) {
+      walkIe(node.children, visit);
+    }
   }
 }
 

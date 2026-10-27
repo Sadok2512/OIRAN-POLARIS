@@ -52,8 +52,9 @@ export function CorrelationStudioPage() {
   const callflow = useSessionCallFlow(selectedSessionId);
   const correlations = useSessionCorrelations(selectedSessionId);
 
+  const correlationEdges = correlations.data?.edges ?? [];
   const graph = useMemo(() => {
-    if (!callflow.data || !correlations.data) return { nodes: [], edges: [] };
+    if (!callflow.data) return { nodes: [], edges: [] };
     const nodes: Node[] = callflow.data.events.map((event, index) => ({
       id: event.event_id,
       position: {
@@ -74,24 +75,35 @@ export function CorrelationStudioPage() {
         whiteSpace: 'pre-wrap',
       },
     }));
-    const edges: Edge[] = correlations.data.map((edge) => ({
-      id: edge.edge_id,
-      source: edge.source_event_id,
-      target: edge.target_event_id,
-      label: edge.confidence,
-      type: 'smoothstep',
-      animated: edge.confidence === 'EXACT',
-      style: {
-        stroke: CONFIDENCE_COLOR[edge.confidence],
-        strokeWidth: edge.confidence === 'EXACT' ? 2 : 1,
-      },
-      labelStyle: {
-        fontSize: 10,
-        fill: CONFIDENCE_COLOR[edge.confidence],
-      },
-    }));
+    const edges: Edge[] = correlationEdges.map((edge) => {
+      // The backend declares `confidence` as a loose `String` — accept
+      // anything, fall back to UNKNOWN rather than crashing on an
+      // unknown confidence tier.
+      const confidence: Confidence =
+        (['EXACT', 'STRONG', 'POSSIBLE', 'UNKNOWN'] as Confidence[]).includes(
+          edge.confidence as Confidence,
+        )
+          ? (edge.confidence as Confidence)
+          : 'UNKNOWN';
+      return {
+        id: edge.edge_id,
+        source: edge.source_event_id,
+        target: edge.target_event_id,
+        label: confidence,
+        type: 'smoothstep',
+        animated: confidence === 'EXACT',
+        style: {
+          stroke: CONFIDENCE_COLOR[confidence],
+          strokeWidth: confidence === 'EXACT' ? 2 : 1,
+        },
+        labelStyle: {
+          fontSize: 10,
+          fill: CONFIDENCE_COLOR[confidence],
+        },
+      };
+    });
     return { nodes, edges };
-  }, [callflow.data, correlations.data]);
+  }, [callflow.data, correlationEdges]);
 
   return (
     <>
@@ -203,7 +215,7 @@ export function CorrelationStudioPage() {
                       <dt className="text-text-secondary">{level}</dt>
                       <dd className="num text-right">
                         {
-                          correlations.data.filter(
+                          correlationEdges.filter(
                             (edge) => edge.confidence === level,
                           ).length
                         }

@@ -75,9 +75,10 @@ export function EventInspector({
         <h4 className="text-ep-sm font-semibold mb-1">
           Information Element tree
         </h4>
-        {event.decoded_ie_tree.length ? (
+        {Array.isArray(event.decoded_ie_tree) &&
+        event.decoded_ie_tree.length > 0 ? (
           <div className="border border-border rounded-md max-h-80 overflow-y-auto">
-            <IeTree nodes={event.decoded_ie_tree} />
+            <IeTree nodes={event.decoded_ie_tree as InformationElement[]} />
           </div>
         ) : (
           <p className="text-ep-xs text-text-secondary">

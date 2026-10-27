@@ -140,13 +140,34 @@ export function UserPlanePage() {
             {selectedPdu.gtpuTeids.length === 0 ? (
               <Unavailable reason="Backend decoded tree did not expose any TEID for this session." />
             ) : (
-              <ul className="flex flex-wrap gap-1">
-                {selectedPdu.gtpuTeids.map((teid) => (
-                  <li key={teid}>
-                    <span className="ep-badge mono">TEID {teid}</span>
-                  </li>
-                ))}
+              <ul className="flex flex-col gap-1">
+                {selectedPdu.gtpuTeids.map((teid) => {
+                  const direction = selectedPdu.directions[teid];
+                  return (
+                    <li
+                      key={teid}
+                      className="flex items-center gap-2 text-ep-xs"
+                    >
+                      <span className="ep-badge mono">TEID {teid}</span>
+                      {direction ? (
+                        <span className="ep-badge">
+                          {direction.toUpperCase()}
+                        </span>
+                      ) : (
+                        <span className="text-text-secondary italic">
+                          direction: backend-unreported
+                        </span>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
+            )}
+            {selectedPdu.ueIp && (
+              <p className="text-ep-xs text-text-secondary mt-2">
+                UE IP (runtime evidence):{' '}
+                <span className="mono text-text-primary">{selectedPdu.ueIp}</span>
+              </p>
             )}
             <h3 className="text-ep-sm font-semibold mt-4 mb-1">PFCP SEIDs</h3>
             {selectedPdu.pfcpSeids.length === 0 ? (
@@ -159,6 +180,18 @@ export function UserPlanePage() {
                   </li>
                 ))}
               </ul>
+            )}
+            {selectedPdu.qfis.length > 0 && (
+              <>
+                <h3 className="text-ep-sm font-semibold mt-4 mb-1">QFI</h3>
+                <ul className="flex flex-wrap gap-1">
+                  {selectedPdu.qfis.map((qfi) => (
+                    <li key={qfi}>
+                      <span className="ep-badge mono">QFI {qfi}</span>
+                    </li>
+                  ))}
+                </ul>
+              </>
             )}
           </section>
 

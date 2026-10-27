@@ -64,14 +64,23 @@ function packetToEvent(packet: Packet): CallFlowEvent {
 export function PacketAnalyzerPage() {
   const [params] = useSearchParams();
   const captureId = params.get('capture_id') ?? undefined;
-  const sessionId = params.get('session_id') ?? undefined;
+  const eventId = params.get('event_id') ?? undefined;
+  const interfaceFilter = params.get('interface') ?? undefined;
+  const protocolFilter = params.get('protocol') ?? undefined;
 
   const [page, setPage] = useState(1);
   const [pageSize] = useState(DEFAULT_PACKETS_PAGE_SIZE);
   const [sorting, setSorting] = useState<SortingState>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  const packets = usePackets({ page, pageSize, captureId, sessionId });
+  const packets = usePackets({
+    page,
+    pageSize,
+    captureId,
+    eventId,
+    interface: interfaceFilter,
+    protocol: protocolFilter,
+  });
   const packetDetail = usePacket(selectedId);
 
   const columns: ColumnDef<Packet>[] = [
@@ -134,14 +143,21 @@ export function PacketAnalyzerPage() {
         }
       />
 
-      {captureId || sessionId ? (
-        <div className="ep-card p-3 mb-3 text-ep-xs text-text-secondary flex flex-wrap items-center gap-2" data-testid="scope-notice">
+      {captureId || eventId || interfaceFilter || protocolFilter ? (
+        <div
+          className="ep-card p-3 mb-3 text-ep-xs text-text-secondary flex flex-wrap items-center gap-2"
+          data-testid="scope-notice"
+        >
           Scope:
           {captureId && (
             <span className="ep-badge mono">capture={captureId}</span>
           )}
-          {sessionId && (
-            <span className="ep-badge mono">session={sessionId}</span>
+          {eventId && <span className="ep-badge mono">event={eventId}</span>}
+          {interfaceFilter && (
+            <span className="ep-badge mono">interface={interfaceFilter}</span>
+          )}
+          {protocolFilter && (
+            <span className="ep-badge mono">protocol={protocolFilter}</span>
           )}
         </div>
       ) : null}

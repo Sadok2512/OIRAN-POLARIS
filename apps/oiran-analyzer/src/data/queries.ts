@@ -10,6 +10,7 @@ import type {
   Metrics,
   Packet,
   Session,
+  SessionCorrelationsResponse,
   UeContext,
   VersionInfo,
 } from '@shared/types';
@@ -162,16 +163,38 @@ export function useSessionEvents(sessionId: string | null) {
   });
 }
 
+/**
+ * Returns the FULL correlation envelope `{ status, edges }` emitted by
+ * the backend. Earlier versions of this hook treated `envelope.data` as
+ * `CorrelationEdge[]` which is wrong — the real backend wraps the
+ * edges inside a `{ status, edges }` object (see
+ * `OIRAN/apps/api/src/lib.rs::session_correlations`). The Correlation
+ * Studio must read `.edges` from this return value.
+ */
+export type SessionCorrelations = {
+  status: Record<string, string>;
+  edges: CorrelationEdge[];
+};
+
 export function useSessionCorrelations(sessionId: string | null) {
-  return useQuery({
+  return useQuery<SessionCorrelations>({
     queryKey: ['session-correlations', sessionId],
-    queryFn: () =>
-      sessionId
-        ? api<CorrelationEdge[]>(
-            `/sessions/${encodeURIComponent(sessionId)}/correlations?page_size=1000`,
-            OIRAN_SCOPE,
-          ).then((x) => x.data)
-        : Promise.reject(new Error('no-session')),
+    queryFn: async () => {
+      if (!sessionId) throw new Error('no-session');
+      const envelope = await api<SessionCorrelationsResponse | CorrelationEdge[]>(
+        `/sessions/${encodeURIComponent(sessionId)}/correlations?page_size=1000`,
+        OIRAN_SCOPE,
+      );
+      const payload = envelope.data;
+      if (Array.isArray(payload)) {
+        // Older backend variant returned a bare array.
+        return { status: {}, edges: payload };
+      }
+      return {
+        status: payload?.status ?? {},
+        edges: payload?.edges ?? [],
+      };
+    },
     enabled: !!sessionId,
   });
 }
@@ -191,22 +214,42 @@ export function usePackets({
   page,
   pageSize = DEFAULT_PACKETS_PAGE_SIZE,
   captureId,
-  sessionId,
+  eventId,
+  interface: iface,
+  protocol,
 }: {
   page: number;
   pageSize?: number;
   captureId?: string;
-  sessionId?: string;
+  /** Narrows to a specific event (backend-supported). */
+  eventId?: string;
+  /** Narrows to a specific logical interface (N2/N3/N4/SBI). */
+  interface?: string;
+  protocol?: string;
 }) {
+  // NOTE: the backend `/packets` handler does NOT support a `session_id`
+  // query parameter — we deliberately omit it instead of silently sending
+  // an ignored filter that would mislead the user into thinking packets
+  // were scoped to a session.
   return useQuery<PacketsPage>({
-    queryKey: ['packets', page, pageSize, captureId ?? '', sessionId ?? ''],
+    queryKey: [
+      'packets',
+      page,
+      pageSize,
+      captureId ?? '',
+      eventId ?? '',
+      iface ?? '',
+      protocol ?? '',
+    ],
     queryFn: async () => {
       const params = new URLSearchParams({
         page: String(page),
         page_size: String(pageSize),
       });
       if (captureId) params.set('capture_id', captureId);
-      if (sessionId) params.set('session_id', sessionId);
+      if (eventId) params.set('event_id', eventId);
+      if (iface) params.set('interface', iface);
+      if (protocol) params.set('protocol', protocol);
       const envelope: ApiEnvelope<Packet[]> = await api<Packet[]>(
         `/packets?${params}`,
         OIRAN_SCOPE,

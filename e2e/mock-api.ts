@@ -430,7 +430,12 @@ export async function installMockApi(page: Page, mode: MockMode = 'populated') {
       [/^\/sessions\/[^/]+\/events(\?.*)?$/, analyzerFixtures.callflow.events],
       [
         /^\/sessions\/[^/]+\/correlations(\?.*)?$/,
-        analyzerFixtures.callflow.correlation_edges,
+        // Backend wraps correlations in a `{ status, edges }` envelope
+        // (see OIRAN/apps/api/src/lib.rs::session_correlations).
+        {
+          status: analyzerFixtures.callflow.correlation_status,
+          edges: analyzerFixtures.callflow.correlation_edges,
+        },
       ],
       [/^\/packets(\?.*)?$/, analyzerFixtures.packets],
       [/^\/packets\/[^/]+$/, analyzerFixtures.packets[0] ?? null],
@@ -554,7 +559,24 @@ function buildAnalyzerFixtures(mode: MockMode) {
     pdu_session_id: '2',
     procedure: 'PDU Session Modification',
   };
-  const sessionC = { ...session, session_id: 'session-ue-B-pdu-1', ue_context_id: 'ue-B', ue_pseudonym: 'UE-002' };
+  const sessionC = {
+    ...session,
+    session_id: 'session-ue-B-pdu-1',
+    ue_context_id: 'ue-B',
+    ue_pseudonym: 'UE-002',
+    // Backend-reported live runtime evidence — only present on live sessions.
+    runtime_evidence: {
+      observed_epoch_ms: 1761559260000,
+      provenance: 'controller-runtime',
+      correlation_status: 'EXACT',
+      ue_ip: '10.46.0.7',
+      teids: ['0xRUNTIME-UL', '0xRUNTIME-DL'],
+      directions: {
+        '0xRUNTIME-UL': 'UL',
+        '0xRUNTIME-DL': 'DL',
+      },
+    },
+  };
 
   const makeEvent = (
     id: string,
