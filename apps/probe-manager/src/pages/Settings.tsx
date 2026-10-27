@@ -36,7 +36,7 @@ export function SettingsPage() {
           ) : (
             <EmptyState
               title="Not authenticated"
-              description="Operator permissions require a signed-in session. The portal and the authentication service are external to this app."
+              description="Operator permissions require validation through the Operator Login control. Login remains disabled on public HTTP and requires HTTPS or a private localhost tunnel."
             />
           )}
         </article>

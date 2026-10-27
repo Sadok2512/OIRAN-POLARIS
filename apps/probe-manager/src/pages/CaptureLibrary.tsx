@@ -238,9 +238,13 @@ export function CaptureLibraryPage({
           const sizeBytes =
             capture.size_bytes ?? capture.metrics?.storage_bytes ?? null;
           const downloadable = authenticated && (sizeBytes ?? 0) > 0;
+          const analyzerParams = new URLSearchParams({
+            capture_id: capture.capture_id,
+          });
+          if (capture.dataset_id) analyzerParams.set('dataset_id', capture.dataset_id);
           const analyzerUrl = capture.dataset_id
-            ? `/oiran/#/investigation/sessions?capture_id=${encodeURIComponent(capture.capture_id)}&dataset_id=${encodeURIComponent(capture.dataset_id)}`
-            : null;
+            ? `/analyzer/investigation/sessions?${analyzerParams}`
+            : `/analyzer/analysis/packets?${analyzerParams}`;
           return (
             <div className="flex items-center gap-1">
               <button
@@ -256,28 +260,17 @@ export function CaptureLibraryPage({
                 <Eye width={13} height={13} aria-hidden="true" />
                 View
               </button>
-              {analyzerUrl ? (
-                <a
-                  className="ep-button ep-button-sm"
-                  href={analyzerUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  onClick={(event) => event.stopPropagation()}
-                  data-testid={`analyzer-${capture.capture_id}`}
-                >
-                  Analyzer
-                </a>
-              ) : (
-                <button
-                  type="button"
-                  className="ep-button ep-button-sm"
-                  disabled
-                  title="Dataset not registered — cannot open in Analyzer"
-                  data-testid={`analyzer-${capture.capture_id}`}
-                >
-                  Analyzer
-                </button>
-              )}
+              <a
+                className="ep-button ep-button-sm"
+                href={analyzerUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={(event) => event.stopPropagation()}
+                data-testid={`analyzer-${capture.capture_id}`}
+                title={capture.dataset_id ? 'Open exact capture dataset in Session Explorer' : 'Inspect preserved capture evidence in Packet Analyzer'}
+              >
+                Analyzer
+              </a>
               <button
                 type="button"
                 className="ep-button ep-button-sm"

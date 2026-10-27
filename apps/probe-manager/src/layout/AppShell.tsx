@@ -78,34 +78,37 @@ export function AppShell() {
             Enterprise Precision ·{' '}
             <span className="text-text-primary">Read-only inventory until authenticated</span>
           </div>
-          <div
-            className="inline-flex items-center gap-1 rounded-md border border-border bg-canvas p-0.5"
-            role="radiogroup"
-            aria-label="Theme"
-            data-testid="theme-switch"
-          >
-            {THEME_OPTIONS.map((option) => {
-              const selected = theme.preference === option.value;
-              const { Icon } = option;
-              return (
-                <button
-                  key={option.value}
-                  type="button"
-                  role="radio"
-                  aria-checked={selected}
-                  aria-label={option.label}
-                  className={clsx(
-                    'inline-flex items-center justify-center h-7 w-7 rounded-sm transition-colors',
-                    selected
-                      ? 'bg-surface text-text-primary shadow-[0_1px_2px_rgba(0,0,0,0.08)]'
-                      : 'text-text-secondary hover:text-text-primary',
-                  )}
-                  onClick={() => theme.setPreference(option.value)}
-                >
-                  <Icon width={14} height={14} aria-hidden="true" />
-                </button>
-              );
-            })}
+          <div className="flex items-center gap-2">
+            <div data-operator-auth-slot aria-label="OIRAN Operator session" />
+            <div
+              className="inline-flex items-center gap-1 rounded-md border border-border bg-canvas p-0.5"
+              role="radiogroup"
+              aria-label="Theme"
+              data-testid="theme-switch"
+            >
+              {THEME_OPTIONS.map((option) => {
+                const selected = theme.preference === option.value;
+                const { Icon } = option;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    role="radio"
+                    aria-checked={selected}
+                    aria-label={option.label}
+                    className={clsx(
+                      'inline-flex items-center justify-center h-7 w-7 rounded-sm transition-colors',
+                      selected
+                        ? 'bg-surface text-text-primary shadow-[0_1px_2px_rgba(0,0,0,0.08)]'
+                        : 'text-text-secondary hover:text-text-primary',
+                    )}
+                    onClick={() => theme.setPreference(option.value)}
+                  >
+                    <Icon width={14} height={14} aria-hidden="true" />
+                  </button>
+                );
+              })}
+            </div>
           </div>
         </header>
         <div className="flex-1 min-h-0 overflow-y-auto px-5 py-5">
