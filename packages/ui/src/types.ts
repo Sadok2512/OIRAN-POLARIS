@@ -218,6 +218,231 @@ export interface CaptureRequest {
   scenario_id?: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// OIRAN v1 Analyzer contract — Dataset / UE context / Session / Call Flow /
+// Correlation edges / Packet. Mirrors OIRAN/apps/web/src/types/api.ts so the
+// Analyzer app does not reach into the legacy workspace.
+// ---------------------------------------------------------------------------
+
+export type Association = 'SESSION' | 'BACKGROUND' | 'UNMATCHED';
+
+export type DecodeStatus =
+  | 'DECODED'
+  | 'PARTIAL'
+  | 'UNSUPPORTED'
+  | 'MALFORMED'
+  | 'ENCRYPTED_OR_PROTECTED';
+
+export type DatasetKind = 'HISTORICAL' | 'CAPTURED_LIVE' | 'RECOVERED';
+
+export interface Dataset {
+  dataset_id: string;
+  display_name: string;
+  dataset_kind: DatasetKind;
+  source: string;
+  technology: string;
+  ingestion_status: string;
+  ingestion_generation: number;
+  session_count: number;
+  ue_context_count: number | null;
+  pdu_session_count?: number;
+  event_count: number;
+  normalized_event_count?: number;
+  packet_count?: number;
+  background_event_count: number | null;
+  unmatched_event_count: number | null;
+  duplicate_observation_count: number | null;
+  error_count: number;
+  read_only: boolean;
+  captures: Capture[];
+  capture_id?: string;
+  session_ids?: string[];
+  capture_start_timestamp?: number | null;
+  capture_end_timestamp?: number | null;
+  accounting_status?: string;
+  decoder_versions: Record<string, string>;
+}
+
+export interface UeContext {
+  ue_context_id: string;
+  ue_pseudonym: string;
+  ran_ue_ngap_id?: string;
+  amf_ue_ngap_id?: string;
+  ran_endpoint: string;
+  amf_endpoint: string;
+  association_id: string;
+  lifecycle_generation: number;
+  state: string;
+  first_timestamp_ns: string;
+  last_timestamp_ns: string;
+  event_count: number;
+  session_count: number;
+}
+
+export interface Session {
+  session_id: string;
+  dataset_id: string;
+  dataset_kind?: DatasetKind;
+  ue_context_id: string;
+  technology: string;
+  ue_pseudonym: string;
+  pdu_session_id: string;
+  serving_node?: string;
+  procedure: string;
+  start_timestamp: string;
+  end_timestamp: string;
+  duration_ns: string;
+  interfaces: string[];
+  message_count: number;
+  source_event_count: number;
+  background_event_count: number;
+  correlation_status: Confidence;
+  decode_completeness: {
+    decoded: number;
+    partial: number;
+    unresolved_fields: number;
+  };
+  state: string;
+}
+
+export interface PacketReference {
+  source_file: string;
+  packet_number: number;
+  byte_offset: number;
+  interface_id: number;
+  captured_length: number;
+  original_length: number;
+}
+
+export interface InformationElement {
+  id: number | null;
+  name: string;
+  length: number;
+  value: string | null;
+  raw_sha256: string | null;
+  status: DecodeStatus;
+  children?: InformationElement[];
+  byte_start?: number;
+  byte_end?: number;
+}
+
+export interface CallFlowEvent {
+  event_id: string;
+  timestamp: string;
+  timestamp_ns: string;
+  interface: string;
+  protocol: string;
+  message_name: string;
+  source_participant: string;
+  destination_participant: string;
+  direction: string;
+  decoded_ie_tree: InformationElement[];
+  decoding_status: DecodeStatus;
+  semantic_status: 'NORMAL' | 'SUCCESS' | 'FAILURE' | 'PARTIAL';
+  association: Association;
+  procedure_group: string;
+  packet_references: PacketReference[];
+  capture_id: string;
+  decoder_name: string;
+  decoder_version: string;
+  raw_payload_reference: string;
+  errors: string[];
+}
+
+export type CorrelationEvidenceType =
+  | 'EXACT_TUNNEL_MATCH'
+  | 'EXACT_CONTEXT_MATCH'
+  | 'STRONG_CONTEXT_ASSOCIATION'
+  | 'POSSIBLE_ASSOCIATION'
+  | 'UNKNOWN';
+
+export interface CorrelationEdge {
+  edge_id: string;
+  source_event_id: string;
+  target_event_id: string;
+  source_interface: string;
+  target_interface: string;
+  matching_identifiers: string[];
+  rule_id: string;
+  rule_version: string;
+  evidence_description: string;
+  packet_references: PacketReference[];
+  confidence: Confidence;
+  evidence_type?: CorrelationEvidenceType;
+  scope?: string;
+  limitations?: string[];
+}
+
+export interface CallFlow {
+  callflow_id: string;
+  session_id: string;
+  technology: string;
+  start_timestamp: string;
+  end_timestamp: string;
+  participants: { id: string; role: string; addresses: string[] }[];
+  interfaces: string[];
+  procedures: { id: string; name: string; event_ids: string[]; status: string }[];
+  events: CallFlowEvent[];
+  correlation_edges: CorrelationEdge[];
+  correlation_status: {
+    N2_N4: Confidence;
+    N2_SBI?: Confidence;
+    SBI_N4?: Confidence;
+    N4_N3: Confidence;
+    E2E: Confidence;
+  };
+  decoder_versions: Record<string, string>;
+  schema_version: string;
+  capture_references: string[];
+  accounting: {
+    source_events: number;
+    session_events: number;
+    background_events: number;
+    unmatched_events: number;
+    duplicate_events: number;
+    extra_events: number;
+  };
+  unresolved_fields: number;
+}
+
+export interface Packet {
+  packet_id: string;
+  capture_id: string;
+  event_id: string;
+  timestamp: string;
+  timestamp_ns: string;
+  interface: string;
+  protocol: string;
+  source: string;
+  destination: string;
+  direction: string;
+  message_name: string;
+  captured_length: number;
+  original_length: number;
+  byte_offset: number;
+  packet_number: number;
+  source_file: string;
+  decode_status: DecodeStatus;
+  decoder_name: string;
+  decoder_version: string;
+  raw_payload_reference: string;
+  information_elements: InformationElement[];
+  raw_bytes: string;
+}
+
+export interface VersionInfo {
+  platform_core: string;
+  backend_api: string;
+  web_frontend: string;
+  event_schema: string;
+  callflow_schema: string;
+  session_engine: string;
+  correlation_engine: string;
+  dataset_registry?: string;
+  disk_safety?: string;
+  decoders: Record<string, string>;
+}
+
 // Logical telecom plane descriptors used by both apps.
 export const TELECOM_PLANES = [
   { id: 'N2', label: 'NG-C', protocol: 'NGAP / SCTP', family: 'control' },

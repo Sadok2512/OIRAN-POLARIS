@@ -407,6 +407,7 @@ export async function installMockApi(page: Page, mode: MockMode = 'populated') {
       return;
     }
 
+    const analyzerFixtures = buildAnalyzerFixtures(mode);
     const map: Array<[RegExp, unknown]> = [
       [/^\/probes$/, source.probes],
       [/^\/probes\/[^/]+$/, (source.probes as unknown[])?.[0] ?? null],
@@ -417,7 +418,22 @@ export async function installMockApi(page: Page, mode: MockMode = 'populated') {
       [/^\/auth\/me$/, source.auth],
       [/^\/system\/health$/, { status: 'ok', service: 'POLARIS Control' }],
       [/^\/health$/, { status: 'healthy', backend_api: '2.3.0' }],
-      [/^\/version$/, { backend_api: '2.3.0' }],
+      [/^\/version$/, analyzerFixtures.version],
+      [/^\/datasets(\?.*)?$/, analyzerFixtures.datasets],
+      [/^\/datasets\/[^/]+$/, analyzerFixtures.datasets[0] ?? null],
+      [/^\/datasets\/[^/]+\/sessions(\?.*)?$/, analyzerFixtures.sessions],
+      [/^\/ues(\?.*)?$/, analyzerFixtures.ues],
+      [/^\/ues\/[^/]+$/, analyzerFixtures.ues[0] ?? null],
+      [/^\/ues\/[^/]+\/sessions(\?.*)?$/, analyzerFixtures.sessions],
+      [/^\/sessions\/[^/]+$/, analyzerFixtures.sessions[0] ?? null],
+      [/^\/sessions\/[^/]+\/callflow$/, analyzerFixtures.callflow],
+      [/^\/sessions\/[^/]+\/events(\?.*)?$/, analyzerFixtures.callflow.events],
+      [
+        /^\/sessions\/[^/]+\/correlations(\?.*)?$/,
+        analyzerFixtures.callflow.correlation_edges,
+      ],
+      [/^\/packets(\?.*)?$/, analyzerFixtures.packets],
+      [/^\/packets\/[^/]+$/, analyzerFixtures.packets[0] ?? null],
     ];
     for (const [pattern, data] of map) {
       if (pattern.test(path)) {
@@ -439,4 +455,305 @@ export async function installMockApi(page: Page, mode: MockMode = 'populated') {
   // Route both the OIRAN API base and the per-app POLARIS API base.
   await page.route('**/api/v1/**', handler);
   await page.route('**/polaris-api/v1/**', handler);
+}
+
+// ---------------------------------------------------------------------------
+// Analyzer fixtures — fixture-only, never shipped to production. Mirrors the
+// shapes defined in packages/ui/src/types.ts.
+// ---------------------------------------------------------------------------
+
+function buildAnalyzerFixtures(mode: MockMode) {
+  if (mode === 'empty') {
+    return {
+      version: {
+        platform_core: '0.0.1',
+        backend_api: '2.3.0',
+        web_frontend: 'test',
+        event_schema: '1',
+        callflow_schema: '1',
+        session_engine: 'test',
+        correlation_engine: 'test',
+        decoders: {},
+      },
+      datasets: [],
+      sessions: [],
+      ues: [],
+      callflow: {
+        callflow_id: '',
+        session_id: '',
+        technology: '',
+        start_timestamp: '',
+        end_timestamp: '',
+        participants: [],
+        interfaces: [],
+        procedures: [],
+        events: [],
+        correlation_edges: [],
+        correlation_status: { N2_N4: 'UNKNOWN', N4_N3: 'UNKNOWN', E2E: 'UNKNOWN' },
+        decoder_versions: {},
+        schema_version: '1',
+        capture_references: [],
+        accounting: {
+          source_events: 0,
+          session_events: 0,
+          background_events: 0,
+          unmatched_events: 0,
+          duplicate_events: 0,
+          extra_events: 0,
+        },
+        unresolved_fields: 0,
+      },
+      packets: [],
+    };
+  }
+
+  const nowIso = new Date('2026-10-27T10:00:00Z').toISOString();
+  const captureId = 'sha256:11aa22bb33cc44dd55ee66ff7788990011223344556677889900aabbccddeeff';
+  const sessionId = 'session-ue-A-pdu-1';
+  const ueId = 'ue-A';
+  const ue = {
+    ue_context_id: ueId,
+    ue_pseudonym: 'UE-001',
+    ran_ue_ngap_id: '12',
+    amf_ue_ngap_id: '34',
+    ran_endpoint: 'gnb01',
+    amf_endpoint: 'amf01',
+    association_id: 'assoc-1',
+    lifecycle_generation: 1,
+    state: 'REGISTERED',
+    first_timestamp_ns: '0',
+    last_timestamp_ns: '60000000000',
+    event_count: 42,
+    session_count: 2,
+  };
+  const ueB = { ...ue, ue_context_id: 'ue-B', ue_pseudonym: 'UE-002' };
+  const session = {
+    session_id: sessionId,
+    dataset_id: 'ds-20261027-1004',
+    dataset_kind: 'CAPTURED_LIVE' as const,
+    ue_context_id: ueId,
+    technology: '5G SA',
+    ue_pseudonym: 'UE-001',
+    pdu_session_id: '1',
+    serving_node: 'gNB-01',
+    procedure: 'PDU Session Establishment',
+    start_timestamp: nowIso,
+    end_timestamp: new Date('2026-10-27T10:01:00Z').toISOString(),
+    duration_ns: '60000000000',
+    interfaces: ['N2', 'N4', 'N3', 'SBI'],
+    message_count: 24,
+    source_event_count: 24,
+    background_event_count: 0,
+    correlation_status: 'STRONG',
+    decode_completeness: { decoded: 24, partial: 0, unresolved_fields: 0 },
+    state: 'ACTIVE',
+  };
+  const sessionB = {
+    ...session,
+    session_id: 'session-ue-A-pdu-2',
+    pdu_session_id: '2',
+    procedure: 'PDU Session Modification',
+  };
+  const sessionC = { ...session, session_id: 'session-ue-B-pdu-1', ue_context_id: 'ue-B', ue_pseudonym: 'UE-002' };
+
+  const makeEvent = (
+    id: string,
+    iface: string,
+    protocol: string,
+    message: string,
+    source: string,
+    destination: string,
+    offset: number,
+    tree: Array<Record<string, unknown>> = [],
+  ) => ({
+    event_id: id,
+    timestamp: new Date(1761559200000 + offset).toISOString(),
+    timestamp_ns: String(offset * 1_000_000),
+    interface: iface,
+    protocol,
+    message_name: message,
+    source_participant: source,
+    destination_participant: destination,
+    direction: source === 'UE' ? 'UL' : 'DL',
+    decoded_ie_tree: tree,
+    decoding_status: 'DECODED',
+    semantic_status: 'NORMAL',
+    association: 'SESSION',
+    procedure_group: protocol,
+    packet_references: [
+      {
+        source_file: 'captures/pdu1.pcap',
+        packet_number: offset,
+        byte_offset: offset * 128,
+        interface_id: 0,
+        captured_length: 128,
+        original_length: 128,
+      },
+    ],
+    capture_id: captureId,
+    decoder_name: protocol.toLowerCase(),
+    decoder_version: '1.0',
+    raw_payload_reference: `ref-${id}`,
+    errors: [],
+  });
+
+  const events = [
+    makeEvent('e1', 'N2', 'NGAP', 'InitialUeMessage', 'UE', 'AMF', 10, []),
+    makeEvent('e2', 'N2', 'NAS-5GMM', 'RegistrationRequest', 'UE', 'AMF', 20),
+    makeEvent('e3', 'SBI', 'HTTP/2', 'Nsmf_PDUSession_CreateSMContext', 'AMF', 'SMF', 30),
+    makeEvent('e4', 'N4', 'PFCP', 'SessionEstablishmentRequest', 'SMF', 'UPF', 40, [
+      { id: 1, name: 'F-SEID', length: 8, value: '0x1111', raw_sha256: null, status: 'DECODED' },
+      { id: 2, name: 'F-SEID', length: 8, value: '0x2222', raw_sha256: null, status: 'DECODED' },
+    ]),
+    makeEvent('e5', 'N4', 'PFCP', 'SessionEstablishmentResponse', 'UPF', 'SMF', 50),
+    makeEvent('e6', 'SBI', 'HTTP/2', 'Nsmf_PDUSession_CreateSMContext Response', 'SMF', 'AMF', 60),
+    makeEvent('e7', 'N2', 'NGAP', 'PDU Session Resource Setup Request', 'AMF', 'gNB', 70),
+    makeEvent('e8', 'N3', 'GTP-U', 'G-PDU', 'gNB', 'UPF', 80, [
+      { id: null, name: 'TEID', length: 4, value: '0xDEADBEEF', raw_sha256: null, status: 'DECODED' },
+    ]),
+    makeEvent('e9', 'N3', 'GTP-U', 'G-PDU', 'UPF', 'gNB', 90, [
+      { id: null, name: 'TEID', length: 4, value: '0xCAFEBABE', raw_sha256: null, status: 'DECODED' },
+    ]),
+  ];
+
+  const correlationEdges = [
+    {
+      edge_id: 'edge-1',
+      source_event_id: 'e4',
+      target_event_id: 'e8',
+      source_interface: 'N4',
+      target_interface: 'N3',
+      matching_identifiers: ['TEID'],
+      rule_id: 'pfcp-gtpu-teid-bridge',
+      rule_version: '1.0',
+      evidence_description: 'TEID published by PFCP matches TEID on N3',
+      packet_references: [],
+      confidence: 'EXACT',
+      evidence_type: 'EXACT_TUNNEL_MATCH',
+      scope: 'PDU-1',
+    },
+    {
+      edge_id: 'edge-2',
+      source_event_id: 'e2',
+      target_event_id: 'e4',
+      source_interface: 'N2',
+      target_interface: 'N4',
+      matching_identifiers: ['UE context', 'DNN'],
+      rule_id: 'nas-pfcp-context',
+      rule_version: '1.0',
+      evidence_description: 'Strong contextual association via UE context + DNN',
+      packet_references: [],
+      confidence: 'STRONG',
+      evidence_type: 'STRONG_CONTEXT_ASSOCIATION',
+    },
+  ];
+
+  const callflow = {
+    callflow_id: 'cf-1',
+    session_id: sessionId,
+    technology: '5G SA',
+    start_timestamp: nowIso,
+    end_timestamp: new Date('2026-10-27T10:01:00Z').toISOString(),
+    participants: [
+      { id: 'UE', role: 'UE', addresses: ['10.46.0.5'] },
+      { id: 'gNB', role: 'RAN', addresses: ['10.46.0.1'] },
+      { id: 'AMF', role: 'NF', addresses: ['10.46.0.10'] },
+      { id: 'SMF', role: 'NF', addresses: ['10.46.0.11'] },
+      { id: 'UPF', role: 'NF', addresses: ['10.46.0.12'] },
+    ],
+    interfaces: ['N2', 'N4', 'N3', 'SBI'],
+    procedures: [
+      { id: 'proc-1', name: 'PDU Session Establishment', event_ids: events.map((e) => e.event_id), status: 'SUCCESS' },
+    ],
+    events,
+    correlation_edges: correlationEdges,
+    correlation_status: {
+      N2_N4: 'STRONG',
+      N2_SBI: 'STRONG',
+      SBI_N4: 'STRONG',
+      N4_N3: 'EXACT',
+      E2E: 'STRONG',
+    },
+    decoder_versions: { NGAP: '1.0', NAS: '1.0', PFCP: '1.0', GTPU: '1.0', SBI: '1.0' },
+    schema_version: '1',
+    capture_references: [captureId],
+    accounting: {
+      source_events: events.length,
+      session_events: events.length,
+      background_events: 0,
+      unmatched_events: 0,
+      duplicate_events: 0,
+      extra_events: 0,
+    },
+    unresolved_fields: 0,
+  };
+
+  const datasets = [
+    {
+      dataset_id: 'ds-20261027-1004',
+      display_name: 'POLARIS 5G SA · 2026-10-27 10:04',
+      dataset_kind: 'CAPTURED_LIVE',
+      source: 'POLARIS_WEB_BOUNDED',
+      technology: '5G SA',
+      ingestion_status: 'READY',
+      ingestion_generation: 1,
+      session_count: 3,
+      ue_context_count: 2,
+      pdu_session_count: 3,
+      event_count: events.length,
+      normalized_event_count: events.length,
+      packet_count: 1000,
+      background_event_count: 0,
+      unmatched_event_count: 0,
+      duplicate_observation_count: 0,
+      error_count: 0,
+      read_only: true,
+      captures: [],
+      session_ids: [session.session_id, sessionB.session_id, sessionC.session_id],
+      decoder_versions: { NGAP: '1.0', NAS: '1.0' },
+    },
+  ];
+
+  const packets = events.map((event, index) => ({
+    packet_id: `pkt-${index + 1}`,
+    capture_id: captureId,
+    event_id: event.event_id,
+    timestamp: event.timestamp,
+    timestamp_ns: event.timestamp_ns,
+    interface: event.interface,
+    protocol: event.protocol,
+    source: event.source_participant,
+    destination: event.destination_participant,
+    direction: event.direction,
+    message_name: event.message_name,
+    captured_length: 128,
+    original_length: 128,
+    byte_offset: event.packet_references[0]?.byte_offset ?? 0,
+    packet_number: event.packet_references[0]?.packet_number ?? index + 1,
+    source_file: 'captures/pdu1.pcap',
+    decode_status: 'DECODED',
+    decoder_name: event.decoder_name,
+    decoder_version: event.decoder_version,
+    raw_payload_reference: event.raw_payload_reference,
+    information_elements: event.decoded_ie_tree,
+    raw_bytes: '',
+  }));
+
+  return {
+    version: {
+      platform_core: '0.0.1',
+      backend_api: '2.3.0',
+      web_frontend: 'preview',
+      event_schema: '1.2',
+      callflow_schema: '1',
+      session_engine: 'oiran-session-1.0',
+      correlation_engine: 'oiran-correlation-1.0',
+      decoders: { NGAP: '1.0', NAS: '1.0', PFCP: '1.0', GTPU: '1.0', SBI: '1.0' },
+    },
+    datasets,
+    ues: [ue, ueB],
+    sessions: [session, sessionB, sessionC],
+    callflow,
+    packets,
+  };
 }

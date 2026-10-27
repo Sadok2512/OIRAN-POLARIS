@@ -16,6 +16,7 @@ mkdirSync(SCREENSHOT_DIR, { recursive: true });
 
 const PORTAL_URL = process.env.PORTAL_URL ?? 'http://127.0.0.1:4300';
 const PROBE_URL = process.env.PROBE_URL ?? 'http://127.0.0.1:4310';
+const ANALYZER_URL = process.env.ANALYZER_URL ?? 'http://127.0.0.1:4320/analyzer';
 
 const VIEWPORTS = [
   { width: 1920, height: 1080, label: '1920x1080' },
@@ -73,6 +74,57 @@ for (const theme of ['light', 'dark'] as const) {
         await page.goto(`${PROBE_URL}/#${route.hash}`);
         await setTheme(page, theme);
         await page.goto(`${PROBE_URL}/#${route.hash}`);
+        await page.waitForSelector(route.wait, { timeout: 20_000 });
+        await snap(page, `${route.name}_${theme}_${viewport.label}`);
+      });
+    }
+  }
+}
+
+const ANALYZER_ROUTES: Array<{ path: string; wait: string; name: string }> = [
+  { path: '/overview', wait: '[data-testid="metric-tile"]', name: 'analyzer_overview' },
+  { path: '/datasets', wait: '[data-testid="datasets-table"]', name: 'analyzer_datasets' },
+  {
+    path: '/investigation/sessions',
+    wait: '[data-testid="session-explorer"]',
+    name: 'analyzer_session_explorer',
+  },
+  {
+    path: '/investigation/signaling',
+    wait: '[data-testid="signaling-dataset-select"]',
+    name: 'analyzer_signaling',
+  },
+  {
+    path: '/investigation/user-plane',
+    wait: '[data-testid="page-header"]',
+    name: 'analyzer_user_plane',
+  },
+  {
+    path: '/investigation/correlation',
+    wait: '[data-testid="correlation-graph"]',
+    name: 'analyzer_correlation',
+  },
+  {
+    path: '/analysis/packets',
+    wait: '[data-testid="page-header"]',
+    name: 'analyzer_packets',
+  },
+  {
+    path: '/analysis/kpi',
+    wait: '[data-testid="kpi-tile"]',
+    name: 'analyzer_kpi',
+  },
+];
+
+for (const theme of ['light', 'dark'] as const) {
+  for (const viewport of VIEWPORTS) {
+    for (const route of ANALYZER_ROUTES) {
+      test(`analyzer · ${route.name} · ${theme} · ${viewport.label}`, async ({ page }) => {
+        await page.setViewportSize({ width: viewport.width, height: viewport.height });
+        await installMockApi(page, 'populated');
+        await page.goto(`${ANALYZER_URL}${route.path}`);
+        await setTheme(page, theme);
+        await page.goto(`${ANALYZER_URL}${route.path}`);
         await page.waitForSelector(route.wait, { timeout: 20_000 });
         await snap(page, `${route.name}_${theme}_${viewport.label}`);
       });
