@@ -1,0 +1,21 @@
+node_modules/
+dist/
+.vite/
+.turbo/
+.cache/
+coverage/
+*.log
+*.tsbuildinfo
+
+# Playwright / test outputs
+e2e/test-results/
+e2e/playwright-report/
+e2e/package-lock.json
+
+# OS
+.DS_Store
+
+# Env
+.env
+.env.local
+.env.*.local
