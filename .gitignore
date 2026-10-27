@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!.env.*.example
 *.local
 
 # Secrets, credentials, and private keys
@@ -11,10 +12,23 @@
 *.pfx
 *.jks
 *.keystore
-*secret*
-*credential*
-*token*
-!.gitignore
+*.secret
+*.secrets
+*.credentials.json
+*.credentials.yaml
+*.credentials.yml
+service-account.json
+service-account-*.json
+secrets/
+**/secrets/
+.secrets/
+**/.secrets/
+credentials/
+**/credentials/
+.credentials/
+**/.credentials/
+.npmrc
+.pypirc
 
 # Rust
 target/

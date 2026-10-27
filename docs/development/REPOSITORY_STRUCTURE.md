@@ -9,6 +9,7 @@ apps/
 services/
 packages/
   contracts/
+  ui/
 infrastructure/
 docs/
   architecture/
@@ -21,7 +22,7 @@ docs/
 
 - `apps/`: independently buildable user-facing applications.
 - `services/`: independently deployable backend processes with one clear owner.
-- `packages/`: versioned shared contracts and reusable technical libraries.
+- `packages/`: versioned shared contracts and reusable technical or UI libraries.
 - `infrastructure/`: reviewed deployment templates and manifests without secrets.
 - `docs/`: architecture, contracts, operational boundaries, and contributor guides.
 - `.github/workflows/`: targeted automation for components that actually exist.
