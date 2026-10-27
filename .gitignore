@@ -1,0 +1,84 @@
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.local
+
+# Secrets, credentials, and private keys
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.secret
+*.secrets
+*.credentials.json
+*.credentials.yaml
+*.credentials.yml
+service-account.json
+service-account-*.json
+secrets/
+**/secrets/
+.secrets/
+**/.secrets/
+credentials/
+**/credentials/
+.credentials/
+**/.credentials/
+.npmrc
+.pypirc
+
+# Rust
+target/
+**/target/
+
+# JavaScript / TypeScript
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+build/
+**/build/
+.next/
+coverage/
+
+# Captures and raw datasets
+*.pcap
+*.pcapng
+*.cap
+captures/
+raw-datasets/
+datasets/raw/
+
+# Runtime and persistent state
+runtime/
+registries/
+*.registry.json
+*.checkpoint
+*.checkpoint.*
+*.pid
+*.sock
+
+# Databases and dumps
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.sql
+
+# Backups and temporary files
+*.bak
+*.backup
+*.old
+*.orig
+*.tmp
+*.swp
+*~
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
