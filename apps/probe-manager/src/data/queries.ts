@@ -143,7 +143,12 @@ export function useAuth() {
 
 type ValidationResult = {
   authorization: string;
-  validation: { valid?: boolean; errors?: string[]; warnings?: string[] };
+  validation: {
+    valid: boolean;
+    blockers: string[];
+    capture_control_available: boolean;
+    state: string;
+  };
 };
 
 export function useValidateCapture() {
