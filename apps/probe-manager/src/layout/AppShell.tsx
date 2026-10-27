@@ -4,7 +4,6 @@ import { PanelLeftClose, PanelLeftOpen, Sun, Moon, Monitor } from 'lucide-react'
 import clsx from 'clsx';
 import { SidebarNavigation } from './SidebarNavigation';
 import { useTheme } from '@/hooks/useTheme';
-import { OperatorAuth } from '@/components/OperatorAuth';
 import type { ThemePreference } from '@shared/theme';
 
 const THEME_OPTIONS: { value: ThemePreference; label: string; Icon: typeof Sun }[] = [
@@ -80,7 +79,7 @@ export function AppShell() {
             <span className="text-text-primary">Read-only inventory until authenticated</span>
           </div>
           <div className="flex items-center gap-2">
-            <OperatorAuth />
+            <div data-operator-auth-slot aria-label="OIRAN Operator session" />
             <div
               className="inline-flex items-center gap-1 rounded-md border border-border bg-canvas p-0.5"
               role="radiogroup"

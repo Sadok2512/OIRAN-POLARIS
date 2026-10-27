@@ -88,6 +88,9 @@ function proxyApi(request, response, targetPort, targetPath) {
 }
 
 async function staticFile(pathname) {
+  if (pathname === '/shared/operator-login.js') {
+    return resolve(root, 'shared/operator-login.js');
+  }
   const match = pathname.match(/^\/(portal|probe-manager|simulator|analyzer)(?:\/(.*))?$/);
   if (!match || !applications.has(match[1])) return null;
   const appRoot = resolve(root, match[1]);
@@ -138,8 +141,14 @@ const server = http.createServer(async (request, response) => {
   }
   const type = mime[extname(file)] ?? 'application/octet-stream';
   response.writeHead(200, securityHeaders(type));
-  if (request.method === 'HEAD') response.end();
-  else createReadStream(file).pipe(response);
+  if (request.method === 'HEAD') {
+    response.end();
+  } else if (type.startsWith('text/html') && (url.pathname.startsWith('/probe-manager') || url.pathname.startsWith('/analyzer'))) {
+    const html = await fs.readFile(file, 'utf8');
+    response.end(html.replace('</body>', '<script type="module" src="/shared/operator-login.js"></script></body>'));
+  } else {
+    createReadStream(file).pipe(response);
+  }
 });
 
 server.listen(port, host, () => {
