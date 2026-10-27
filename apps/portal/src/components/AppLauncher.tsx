@@ -15,14 +15,9 @@ const ACCENT_RING: Record<AppWithHealth['accent'], string> = {
 
 export function AppLauncher({ app, loading }: AppLauncherProps) {
   const { Icon } = app;
-  const healthLabel =
-    app.health.state === 'ok'
-      ? `Reachable · ${app.health.latencyMs} ms`
-      : app.health.state === 'degraded'
-        ? app.health.detail
-        : loading
-          ? 'Checking service…'
-          : app.health.detail;
+  const healthLabel = loading
+    ? 'Checking service…'
+    : app.health.detail;
 
   return (
     <article

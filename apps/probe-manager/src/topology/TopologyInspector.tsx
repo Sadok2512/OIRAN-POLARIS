@@ -5,8 +5,10 @@ import { StatusIndicator } from '@/ui/StatusIndicator';
 
 const EVIDENCE_DESCRIPTION: Record<TopologyNodeData['evidence'], string> = {
   DISCOVERED: 'Reported by the backend (API evidence).',
-  CONFIGURED: 'Declared by configuration (not independently verified live).',
-  INFERRED: 'Added from the 5G SA reference topology to anchor the view.',
+  CONFIGURED:
+    'Declared by an operator-reviewed configuration mapping (not independently verified live).',
+  INFERRED:
+    'Added from the 5G SA reference topology or inferred from an interface name — no backend-verified mapping.',
   UNKNOWN: 'Observed with insufficient evidence to classify.',
 };
 

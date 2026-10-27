@@ -21,7 +21,7 @@ export function LiveCapturesPage() {
 
   const live = useMemo(
     () =>
-      captures.data?.filter((item) =>
+      captures.data?.items?.filter((item) =>
         ACTIVE_STATES.includes(item.state ?? ''),
       ) ?? [],
     [captures.data],
@@ -152,8 +152,11 @@ export function LiveCapturesPage() {
 
               <footer className="pt-2 border-t border-border flex items-center justify-between gap-2">
                 <span className="text-ep-xs text-text-secondary">
-                  Stop is only sent to the backend once confirmed; the frontend
-                  does not issue capture commands by itself.
+                  {control && execution
+                    ? 'Stop is only sent after an explicit confirmation; this UI will not report success until the backend confirms STOPPING → COMPLETED.'
+                    : !control
+                      ? 'Operator role required to issue capture commands.'
+                      : 'Backend execution gate is disabled; stop is unavailable until an operator enables it.'}
                 </span>
                 <button
                   type="button"
@@ -161,6 +164,13 @@ export function LiveCapturesPage() {
                   disabled={!control || !execution}
                   onClick={() => setConfirmStop(capture.capture_id)}
                   data-testid={`stop-capture-${capture.capture_id}`}
+                  title={
+                    !control
+                      ? 'Operator permission required'
+                      : !execution
+                        ? 'Backend execution gate is disabled'
+                        : undefined
+                  }
                 >
                   Stop capture
                 </button>

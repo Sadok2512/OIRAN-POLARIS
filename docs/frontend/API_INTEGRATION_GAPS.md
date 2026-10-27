@@ -37,7 +37,10 @@ requiring any client fabrication:
 
 | Capability needed                                                    | Proposed contract                                                             |
 | -------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| Independent list of physical topology links (not derived from planes)| `GET /topology/links` returning `{ source, target, kind, evidence }`         |
+| Independent list of physical topology links (not derived from planes)| `GET /topology/links` returning `{ source, target, kind, evidence }`. The frontend ships a `VerifiedInterfaceMapping` input ready to consume this contract — see `apps/probe-manager/src/topology/types.ts`. |
+| Server-side capture pagination (`page`, `page_size`, `meta.total`, `meta.total_pages`) | Capture Library now requests `GET /captures?page=N&page_size=M` and renders a `partial-results-notice` when `meta.total` is absent. See PR #2 Section 4. |
+| Per-application auth boundaries                                      | Each app now owns a dedicated session-storage scope (`oiran`, `polaris`, `probe-manager`) and a dedicated `apiBase`. Shared client refuses cross-origin tokens. See PR #2 Section 3 and `docs/contracts/AUTHENTICATION_BOUNDARIES.md`. |
+| Authorized PCAP download                                             | `GET /api/v1/captures/:id/download` is the frontend target; the Download action stays disabled until `/auth/me.authenticated === true` AND `size_bytes > 0`. |
 | Historical trend for CPU/RAM/disk per probe                          | `GET /probes/:id/telemetry?window=5m` → time-series samples                   |
 | Per-interface live counters (packets/s, bits/s, drops)               | `GET /interfaces/:id/metrics` streaming via SSE or short-poll JSON            |
 | Capture job events                                                   | `GET /captures/:id/events` or WebSocket `/captures/:id/stream`                |

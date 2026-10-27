@@ -4,7 +4,13 @@ import type {
   EvidenceLevel,
   Probe,
 } from '@shared/types';
-import type { TopologyEdgeData, TopologyNodeData, TopologyNodeKind } from './types';
+import type {
+  TopologyEdgeData,
+  TopologyEdgeKind,
+  TopologyNodeData,
+  TopologyNodeKind,
+  VerifiedInterfaceMapping,
+} from './types';
 
 // Logical column assignment per node kind. The order matches the typical
 // 5G SA topology left → right so the layout stays readable.
@@ -53,13 +59,9 @@ function node(
   };
 }
 
-function placeInColumn(
-  nodes: Node<TopologyNodeData>[],
-  kinds: TopologyNodeKind[] | 'ALL' = 'ALL',
-) {
+function placeInColumn(nodes: Node<TopologyNodeData>[]) {
   const counts: Partial<Record<TopologyNodeKind, number>> = {};
   for (const n of nodes) {
-    if (kinds !== 'ALL' && !kinds.includes(n.data.kind)) continue;
     const count = counts[n.data.kind] ?? 0;
     n.position = {
       ...n.position,
@@ -86,13 +88,46 @@ function telecomEdge(
   };
 }
 
+/**
+ * Infer which plane an interface *name* suggests, used solely to render an
+ * `INFERRED` hint edge. This function returns `null` for interface names
+ * that do not match a known plane prefix (the edge is simply omitted
+ * rather than classified `UNKNOWN`, which would clutter the view with
+ * speculative lines).
+ */
+function inferPlaneFromName(
+  interfaceLabel: string,
+): { kind: TopologyEdgeKind; targetNf: string } | null {
+  const upper = interfaceLabel.toUpperCase();
+  // Longest/most specific first.
+  if (upper.includes('SBI')) return { kind: 'SBI', targetNf: 'amf' };
+  if (upper.includes('N2')) return { kind: 'NG-C', targetNf: 'amf' };
+  if (upper.includes('N3')) return { kind: 'NG-U', targetNf: 'upf' };
+  if (upper.includes('N4')) return { kind: 'N4', targetNf: 'smf' };
+  return null;
+}
+
+export type BuildTopologyInput = {
+  probes?: Probe[];
+  interfaces?: CaptureInterface[];
+  /**
+   * Explicit verified mappings between interfaces and NFs. Each mapping
+   * becomes a CONFIGURED or DISCOVERED edge — depending on its own
+   * evidence level — and prevents the heuristic INFERRED edge for the
+   * same (interface, nf) pair.
+   *
+   * The frontend never synthesizes these; they must come from the
+   * backend (future `/topology/links` contract) or from an operator-
+   * reviewed configuration file.
+   */
+  verifiedMappings?: VerifiedInterfaceMapping[];
+};
+
 export function buildTopology({
   probes = [],
   interfaces = [],
-}: {
-  probes?: Probe[];
-  interfaces?: CaptureInterface[];
-}): TopologyGraph {
+  verifiedMappings = [],
+}: BuildTopologyInput): TopologyGraph {
   const nodes: Node<TopologyNodeData>[] = [];
   const edges: Edge<TopologyEdgeData>[] = [];
   const added = new Set<string>();
@@ -109,9 +144,10 @@ export function buildTopology({
     nodes.push(node(id, kind, label, evidence, options));
   };
 
-  // Core 5G SA scaffold. We ALWAYS show these as INFERRED when nothing is
-  // reported — a topology view is pointless without a baseline. They become
-  // CONFIGURED/DISCOVERED when the backend confirms them.
+  // Core 5G SA scaffold. Always INFERRED when nothing is reported — a
+  // topology view is pointless without a baseline. Backend evidence
+  // never upgrades them from here; a separate contract would be
+  // required to publish a node as DISCOVERED.
   const scaffold: Array<[string, TopologyNodeKind, string]> = [
     ['ue', 'UE', 'UE'],
     ['gnb', 'GNB', 'gNB'],
@@ -130,22 +166,27 @@ export function buildTopology({
       kind: 'LINK',
       evidence: 'INFERRED',
       label: 'Uu',
+      evidenceSource: '5G SA reference scaffold',
     }),
     telecomEdge('e-gnb-amf', 'gnb', 'amf', {
       kind: 'NG-C',
       evidence: 'INFERRED',
+      evidenceSource: '5G SA reference scaffold',
     }),
     telecomEdge('e-amf-smf', 'amf', 'smf', {
       kind: 'SBI',
       evidence: 'INFERRED',
+      evidenceSource: '5G SA reference scaffold',
     }),
     telecomEdge('e-smf-upf', 'smf', 'upf', {
       kind: 'N4',
       evidence: 'INFERRED',
+      evidenceSource: '5G SA reference scaffold',
     }),
     telecomEdge('e-gnb-upf', 'gnb', 'upf', {
       kind: 'NG-U',
       evidence: 'INFERRED',
+      evidenceSource: '5G SA reference scaffold',
     }),
   );
 
@@ -164,9 +205,16 @@ export function buildTopology({
     });
   }
 
-  // Add real interfaces as leaf nodes that attach to the probe reporting
-  // them (DISCOVERED) and to the nearest NF (INFERRED unless the capture
-  // point tags it explicitly).
+  // Track (interface, nf) pairs that have an explicit verified mapping
+  // so the heuristic INFERRED edge is suppressed for those pairs only.
+  const verifiedByInterface = new Map<string, VerifiedInterfaceMapping[]>();
+  for (const mapping of verifiedMappings) {
+    const list = verifiedByInterface.get(mapping.interface) ?? [];
+    list.push(mapping);
+    verifiedByInterface.set(mapping.interface, list);
+  }
+
+  // Add real interfaces as leaf nodes.
   for (const iface of interfaces) {
     const id = `iface:${iface.interface}`;
     ensure(id, 'INTERFACE', iface.interface, 'DISCOVERED', {
@@ -178,46 +226,56 @@ export function buildTopology({
         'Live capture': iface.live_capture_available ? 'authorized' : 'gated',
       },
     });
+
     const owningProbe = probes.find((probe) =>
       probe.connected_interfaces.includes(iface.interface),
     );
     if (owningProbe) {
       edges.push(
-        telecomEdge(`e-${owningProbe.probe_id}-${id}`, owningProbe.probe_id, id, {
-          kind: 'MONITOR',
-          evidence: 'DISCOVERED',
-          label: 'Monitors',
+        telecomEdge(
+          `e-${owningProbe.probe_id}-${id}`,
+          owningProbe.probe_id,
+          id,
+          {
+            kind: 'MONITOR',
+            evidence: 'DISCOVERED',
+            label: 'Monitors',
+            evidenceSource: `probe ${owningProbe.probe_id} reports this interface as a capture point`,
+          },
+        ),
+      );
+    }
+
+    const explicitMappings = verifiedByInterface.get(iface.interface) ?? [];
+    const explicitNfTargets = new Set(
+      explicitMappings.map((mapping) => mapping.networkFunction),
+    );
+
+    // Emit CONFIGURED/DISCOVERED edges from explicit verified mappings.
+    for (const mapping of explicitMappings) {
+      edges.push(
+        telecomEdge(`e-${id}-${mapping.networkFunction}-verified`, id, mapping.networkFunction, {
+          kind: mapping.kind,
+          evidence: mapping.evidence,
+          label: mapping.kind,
+          evidenceSource: mapping.evidenceSource,
         }),
       );
     }
-    // Associate the interface with the nearest NF based on the plane label.
-    const plane = iface.interface.toUpperCase();
-    if (plane.includes('N2')) {
+
+    // Only emit the plane-name heuristic edge when no verified mapping
+    // covers the same NF. The heuristic edge is tagged INFERRED because
+    // an interface name is not configuration evidence — Section 2 of the
+    // review brief.
+    const inferredHint = inferPlaneFromName(iface.interface);
+    if (inferredHint && !explicitNfTargets.has(inferredHint.targetNf)) {
       edges.push(
-        telecomEdge(`e-${id}-amf`, id, 'amf', {
-          kind: 'NG-C',
-          evidence: 'CONFIGURED',
-        }),
-      );
-    } else if (plane.includes('N3')) {
-      edges.push(
-        telecomEdge(`e-${id}-upf`, id, 'upf', {
-          kind: 'NG-U',
-          evidence: 'CONFIGURED',
-        }),
-      );
-    } else if (plane.includes('N4')) {
-      edges.push(
-        telecomEdge(`e-${id}-smf`, id, 'smf', {
-          kind: 'N4',
-          evidence: 'CONFIGURED',
-        }),
-      );
-    } else if (plane.includes('SBI')) {
-      edges.push(
-        telecomEdge(`e-${id}-amf-sbi`, id, 'amf', {
-          kind: 'SBI',
-          evidence: 'CONFIGURED',
+        telecomEdge(`e-${id}-${inferredHint.targetNf}-inferred`, id, inferredHint.targetNf, {
+          kind: inferredHint.kind,
+          evidence: 'INFERRED',
+          label: `${inferredHint.kind} (inferred from name)`,
+          evidenceSource:
+            'interface name prefix matches a 5G plane; no backend-verified mapping was supplied',
         }),
       );
     }

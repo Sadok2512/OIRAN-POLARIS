@@ -3,6 +3,65 @@
 All notable changes to the `apps/portal`, `apps/probe-manager`,
 `packages/ui`, `e2e` and `docs/frontend` scopes. Dates are UTC.
 
+## [0.3.0] – 2026-10-27 — PR #2 review corrections
+
+### Fixed (P0)
+
+- **Topology evidence.** `apps/probe-manager/src/topology/buildTopology.ts`
+  no longer upgrades plane-name heuristics (`N2`/`N3`/`N4`/`SBI`) to
+  `CONFIGURED`. All name-based edges are now explicitly `INFERRED` with
+  `evidenceSource: "interface name prefix matches a 5G plane; no
+  backend-verified mapping was supplied"`. A new `VerifiedInterfaceMapping`
+  input lets the backend (future `/topology/links` contract) supply
+  genuinely `CONFIGURED` or `DISCOVERED` edges without touching unrelated
+  edges. `probe→interface` MONITOR edges stay `DISCOVERED`.
+- **Cross-application authentication.** `packages/ui/src/api.ts` now
+  requires `options.authScope` to attach `Authorization`. Tokens live in
+  per-scope session storage keys (`oiran`, `polaris`, `probe-manager`).
+  Cross-origin absolute bases never receive a token. `apps/portal`
+  declares a dedicated `apiBase` per application; health probes bypass
+  the shared client to guarantee anonymity.
+- **Portal health classification.** `apps/portal/src/config/usePortalConfig.ts`
+  now distinguishes four states — `ok`, `auth-required`, `degraded`,
+  `unknown` — based on both the HTTP status and the body. A 200 reply
+  with `{data: {status: "degraded"}}` is reported as degraded, not healthy.
+
+### Fixed (P1)
+
+- **Capture Library pagination.** `useCapturesPage({ page, pageSize })`
+  queries `GET /captures?page=N&page_size=M` and consumes `meta.total`
+  / `meta.total_pages`. The page footer renders the actual server totals
+  (`Page 1 of 10 · Showing 25 / 25`). When the backend omits `meta.total`
+  the UI shows a `partial-results-notice` instead of pretending the
+  dataset is complete.
+- **Capture actions.** View opens an in-page metadata panel without any
+  network call. Analyzer deep-link stays disabled unless the capture has
+  a `dataset_id`. Download is disabled unless the user is authenticated
+  AND the capture has stored bytes; the endpoint is
+  `/api/v1/captures/:id/download` (requires backend authorization).
+  Stop capture still never dispatches a request from this UI.
+- **API contract validation.** New `apps/probe-manager/src/data/apiContract.test.ts`
+  exercises null/missing fields on `Probe`, `CaptureInterface`,
+  `DiskSafety`; empty captures; 401 error envelopes; network failures;
+  cross-origin token isolation; HTTP status classification.
+
+### Verified
+
+- `apps/portal`: `tsc -b` PASS · Vitest 11/11 · `vite build` PASS
+- `apps/probe-manager`: `tsc -b` PASS · Vitest 51/51 · `vite build` PASS
+- `e2e`: Playwright 65/65 · 65 PNGs regenerated at
+  `docs/frontend/SCREENSHOTS/`
+
+### Not changed
+
+- Enterprise Precision design system (tokens, spacing, radii, typography)
+- Portal three-card layout + Probe Manager navigation
+- React Flow topology scaffold + inspector affordances
+- TanStack Table columns + filters
+- Light/Dark/responsive layouts
+- Any backend file (`BACKEND_CHANGED = FALSE`)
+- No live capture dispatched (`LIVE_CAPTURE_EXECUTED = FALSE`)
+
 ## [0.2.0] – 2026-10-27
 
 ### Changed

@@ -2,14 +2,12 @@ import { useMemo, useState } from 'react';
 import {
   flexRender,
   getCoreRowModel,
-  getFilteredRowModel,
-  getPaginationRowModel,
   getSortedRowModel,
   useReactTable,
   type ColumnDef,
   type SortingState,
 } from '@tanstack/react-table';
-import { Download, FileSearch, Filter } from 'lucide-react';
+import { AlertTriangle, Download, Eye, FileSearch, Filter } from 'lucide-react';
 import { PageHeader } from '@/ui/PageHeader';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import {
@@ -18,7 +16,9 @@ import {
   LoadingSkeleton,
 } from '@/ui/EmptyErrorLoading';
 import {
-  useCaptures,
+  DEFAULT_CAPTURE_PAGE_SIZE,
+  useAuth,
+  useCapturesPage,
   useInterfaces,
   useProbes,
 } from '@/data/queries';
@@ -35,20 +35,35 @@ const STATUS_OPTIONS: Capture['state'][] = [
   'FAILED',
 ];
 
-export function CaptureLibraryPage() {
-  const captures = useCaptures();
+type CaptureLibraryPageProps = {
+  /** Default page size override, used by tests. */
+  defaultPageSize?: number;
+};
+
+export function CaptureLibraryPage({
+  defaultPageSize = DEFAULT_CAPTURE_PAGE_SIZE,
+}: CaptureLibraryPageProps = {}) {
+  const [page, setPage] = useState(1);
+  const [pageSize] = useState(defaultPageSize);
+  const captures = useCapturesPage({ page, pageSize });
   const probes = useProbes();
   const interfaces = useInterfaces();
+  const auth = useAuth();
 
+  const [selected, setSelected] = useState<Capture | null>(null);
   const [search, setSearch] = useState('');
   const [probeFilter, setProbeFilter] = useState('');
   const [interfaceFilter, setInterfaceFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [sorting, setSorting] = useState<SortingState>([]);
 
-  const data = useMemo(
+  // Filters apply to the current page returned by the backend. If the
+  // backend exposes server-side filters later, these can forward through
+  // the query string instead. For now we're explicit about the scope.
+  const pageItems = captures.data?.items ?? [];
+  const filtered = useMemo(
     () =>
-      captures.data?.filter((capture) => {
+      pageItems.filter((capture) => {
         if (
           search &&
           !`${capture.name} ${capture.capture_id} ${capture.interface ?? ''} ${capture.interfaces?.join(' ') ?? ''}`
@@ -67,9 +82,11 @@ export function CaptureLibraryPage() {
           return false;
         if (statusFilter && capture.state !== statusFilter) return false;
         return true;
-      }) ?? [],
-    [captures.data, search, probeFilter, interfaceFilter, statusFilter],
+      }),
+    [pageItems, search, probeFilter, interfaceFilter, statusFilter],
   );
+
+  const authenticated = auth.data?.authenticated === true;
 
   const columns = useMemo<ColumnDef<Capture>[]>(
     () => [
@@ -182,24 +199,35 @@ export function CaptureLibraryPage() {
         cell: ({ row }) => {
           const capture = row.original;
           const failed = (capture.state ?? capture.status) === 'FAILED';
+          const sizeBytes =
+            capture.size_bytes ?? capture.metrics?.storage_bytes ?? null;
+          const downloadable = authenticated && (sizeBytes ?? 0) > 0;
+          const analyzerUrl = capture.dataset_id
+            ? `/oiran/#/investigation/sessions?capture_id=${encodeURIComponent(capture.capture_id)}&dataset_id=${encodeURIComponent(capture.dataset_id)}`
+            : null;
           return (
             <div className="flex items-center gap-1">
               <button
                 type="button"
                 className="ep-button ep-button-sm"
-                aria-label="View capture"
-                onClick={(event) => event.stopPropagation()}
+                aria-label={`View capture ${capture.name}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setSelected(capture);
+                }}
                 data-testid={`view-${capture.capture_id}`}
               >
+                <Eye width={13} height={13} aria-hidden="true" />
                 View
               </button>
-              {capture.dataset_id ? (
+              {analyzerUrl ? (
                 <a
                   className="ep-button ep-button-sm"
-                  href={`/oiran/#/investigation/sessions?capture_id=${encodeURIComponent(capture.capture_id)}&dataset_id=${encodeURIComponent(capture.dataset_id)}`}
+                  href={analyzerUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                   onClick={(event) => event.stopPropagation()}
+                  data-testid={`analyzer-${capture.capture_id}`}
                 >
                   Analyzer
                 </a>
@@ -209,18 +237,37 @@ export function CaptureLibraryPage() {
                   className="ep-button ep-button-sm"
                   disabled
                   title="Dataset not registered — cannot open in Analyzer"
+                  data-testid={`analyzer-${capture.capture_id}`}
                 >
                   Analyzer
                 </button>
               )}
-              <a
-                className="ep-button ep-button-sm"
-                href={`/api/v1/captures/${encodeURIComponent(capture.capture_id)}`}
-                onClick={(event) => event.stopPropagation()}
-                aria-label="Download PCAP metadata"
-              >
-                <Download width={13} height={13} aria-hidden="true" />
-              </a>
+              {downloadable ? (
+                <a
+                  className="ep-button ep-button-sm"
+                  href={`/api/v1/captures/${encodeURIComponent(capture.capture_id)}/download`}
+                  onClick={(event) => event.stopPropagation()}
+                  aria-label={`Download PCAP for ${capture.name}`}
+                  data-testid={`download-${capture.capture_id}`}
+                >
+                  <Download width={13} height={13} aria-hidden="true" />
+                </a>
+              ) : (
+                <button
+                  type="button"
+                  className="ep-button ep-button-sm"
+                  disabled
+                  aria-label="Download disabled"
+                  title={
+                    !authenticated
+                      ? 'Download requires an authenticated operator role'
+                      : 'Capture has no stored bytes — nothing to download'
+                  }
+                  data-testid={`download-${capture.capture_id}`}
+                >
+                  <Download width={13} height={13} aria-hidden="true" />
+                </button>
+              )}
               {failed && (
                 <span
                   className="ep-badge border-error/40 text-error"
@@ -234,20 +281,24 @@ export function CaptureLibraryPage() {
         },
       },
     ],
-    [],
+    [authenticated],
   );
 
   const table = useReactTable({
-    data,
+    data: filtered,
     columns,
     state: { sorting },
     onSortingChange: setSorting,
     getCoreRowModel: getCoreRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
     getSortedRowModel: getSortedRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    initialState: { pagination: { pageSize: 20 } },
+    // No TanStack-paginated model: pagination is server-side.
   });
+
+  const total = captures.data?.total ?? null;
+  const totalPages = captures.data?.totalPages ?? null;
+  const totalUnknown = captures.data?.totalUnknown ?? true;
+  const atFirst = page <= 1;
+  const atLast = totalPages != null ? page >= totalPages : pageItems.length < pageSize;
 
   return (
     <>
@@ -258,7 +309,8 @@ export function CaptureLibraryPage() {
         actions={
           <span className="text-ep-xs text-text-secondary flex items-center gap-1.5">
             <Filter width={13} height={13} aria-hidden="true" />
-            {count(data.length)} of {count(captures.data?.length)} records
+            {count(filtered.length)} shown
+            {total != null && ` of ${count(total)} total`}
           </span>
         }
       />
@@ -313,7 +365,9 @@ export function CaptureLibraryPage() {
         </select>
       </div>
 
-      {captures.isLoading && <LoadingSkeleton label="Loading capture inventory" />}
+      {captures.isLoading && !captures.data && (
+        <LoadingSkeleton label="Loading capture inventory" />
+      )}
 
       {captures.error && !captures.isLoading && (
         <ErrorState
@@ -323,14 +377,24 @@ export function CaptureLibraryPage() {
         />
       )}
 
-      {!captures.isLoading && !captures.error && !data.length && (
+      {!captures.isLoading && !captures.error && !filtered.length && (
         <EmptyState
-          title="No captures match"
-          description="Adjust the filters or wait for the backend to register captures."
+          title={
+            totalUnknown
+              ? 'No captures on this page'
+              : total === 0
+                ? 'No captures match'
+                : 'No captures match the current filters'
+          }
+          description={
+            totalUnknown
+              ? 'The backend did not advertise a total; try the previous page.'
+              : 'Adjust the filters or wait for the backend to register captures.'
+          }
         />
       )}
 
-      {data.length > 0 && (
+      {filtered.length > 0 && (
         <div className="ep-card overflow-hidden">
           <div className="overflow-x-auto">
             <table className="ep-table" data-testid="capture-table">
@@ -361,7 +425,12 @@ export function CaptureLibraryPage() {
               </thead>
               <tbody>
                 {table.getRowModel().rows.map((row) => (
-                  <tr key={row.id}>
+                  <tr
+                    key={row.id}
+                    data-selected={selected?.capture_id === row.original.capture_id}
+                    onClick={() => setSelected(row.original)}
+                    className="cursor-pointer"
+                  >
                     {row.getVisibleCells().map((cell) => (
                       <td key={cell.id}>
                         {flexRender(
@@ -375,31 +444,112 @@ export function CaptureLibraryPage() {
               </tbody>
             </table>
           </div>
-          <div className="flex items-center justify-between gap-2 px-3 py-2 border-t border-border text-ep-xs text-text-secondary">
+          <div
+            className="flex items-center justify-between gap-2 px-3 py-2 border-t border-border text-ep-xs text-text-secondary"
+            data-testid="capture-pagination"
+          >
             <span>
-              Page {table.getState().pagination.pageIndex + 1} of{' '}
-              {Math.max(1, table.getPageCount())}
+              Page <span className="num text-text-primary">{page}</span>
+              {totalPages != null ? (
+                <>
+                  {' '}of <span className="num text-text-primary">{totalPages}</span>
+                </>
+              ) : (
+                ' · total unknown'
+              )}
+              {' · '}
+              Showing <span className="num text-text-primary">{pageItems.length}</span>
+              {' / '}
+              <span className="num text-text-primary">{pageSize}</span>
             </span>
             <div className="flex items-center gap-1">
               <button
                 type="button"
                 className="ep-button ep-button-sm"
-                onClick={() => table.previousPage()}
-                disabled={!table.getCanPreviousPage()}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={atFirst || captures.isFetching}
+                data-testid="pagination-previous"
               >
                 Previous
               </button>
               <button
                 type="button"
                 className="ep-button ep-button-sm"
-                onClick={() => table.nextPage()}
-                disabled={!table.getCanNextPage()}
+                onClick={() => setPage((p) => p + 1)}
+                disabled={atLast || captures.isFetching}
+                data-testid="pagination-next"
               >
                 Next
               </button>
             </div>
           </div>
+          {totalUnknown && pageItems.length === pageSize && (
+            <div
+              className="px-3 py-2 flex items-start gap-2 text-ep-xs text-text-secondary border-t border-border"
+              data-testid="partial-results-notice"
+            >
+              <AlertTriangle
+                width={13}
+                height={13}
+                className="text-warning mt-0.5 shrink-0"
+                aria-hidden="true"
+              />
+              <span>
+                The backend did not report <code className="mono">meta.total</code>.
+                Showing only the current page; later pages may exist. See
+                <code className="mono"> docs/frontend/API_INTEGRATION_GAPS.md</code>.
+              </span>
+            </div>
+          )}
         </div>
+      )}
+
+      {selected && (
+        <aside
+          className="ep-card mt-4 p-4"
+          data-testid="capture-detail"
+          aria-label="Selected capture metadata"
+        >
+          <header className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-ep-xs uppercase tracking-wider text-text-secondary">
+                Capture metadata
+              </p>
+              <h2 className="text-ep-lg font-semibold">{selected.name}</h2>
+              <p className="mono text-ep-xs text-text-secondary break-all">
+                {selected.capture_id}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="ep-button ep-button-sm"
+              onClick={() => setSelected(null)}
+              aria-label="Close capture metadata"
+            >
+              Close
+            </button>
+          </header>
+          <dl className="grid grid-cols-2 md:grid-cols-3 gap-x-6 gap-y-1 text-ep-sm mt-3">
+            <dt className="text-text-secondary">Probe</dt>
+            <dd>{selected.probe_id ?? '—'}</dd>
+            <dt className="text-text-secondary">Interfaces</dt>
+            <dd>{selected.interface ?? selected.interfaces?.join(' + ') ?? '—'}</dd>
+            <dt className="text-text-secondary">Protocol</dt>
+            <dd>{selected.protocol ?? '—'}</dd>
+            <dt className="text-text-secondary">Dataset</dt>
+            <dd className="mono break-all">{selected.dataset_id ?? 'Not registered'}</dd>
+            <dt className="text-text-secondary">Packets</dt>
+            <dd className="num">{count(selected.packet_count ?? selected.metrics?.packets_received)}</dd>
+            <dt className="text-text-secondary">Size</dt>
+            <dd className="num">{bytes(selected.size_bytes ?? selected.metrics?.storage_bytes)}</dd>
+            {selected.error && (
+              <>
+                <dt className="text-text-secondary">Error</dt>
+                <dd className="col-span-2 break-words">{selected.error}</dd>
+              </>
+            )}
+          </dl>
+        </aside>
       )}
     </>
   );

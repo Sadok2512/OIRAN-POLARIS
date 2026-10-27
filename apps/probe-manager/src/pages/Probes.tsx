@@ -149,7 +149,7 @@ export function ProbesPage() {
               </span>
             </div>
           </div>
-          <ProbeInspector probe={selected ?? null} captures={captures.data} />
+          <ProbeInspector probe={selected ?? null} captures={captures.data?.items} />
         </div>
       )}
     </>

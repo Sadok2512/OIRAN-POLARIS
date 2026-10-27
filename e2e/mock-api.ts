@@ -338,8 +338,10 @@ const BACKEND_DATA = {
 
 type MockMode = 'populated' | 'empty';
 
+type Meta = Record<string, unknown>;
+
 export async function installMockApi(page: Page, mode: MockMode = 'populated') {
-  const payload = (data: unknown) => ({ data, meta: {} });
+  const payload = (data: unknown, meta: Meta = {}) => ({ data, meta });
 
   const empty: Record<string, unknown> = {
     probes: [],
@@ -378,20 +380,43 @@ export async function installMockApi(page: Page, mode: MockMode = 'populated') {
 
   const source = mode === 'populated' ? BACKEND_DATA : empty;
 
-  await page.route('**/api/v1/**', async (route: Route, request: Request) => {
+  const handler = async (route: Route, request: Request) => {
     const url = new URL(request.url());
-    const path = url.pathname.replace(/^.*\/api\/v1/, '');
+    const path = url.pathname.replace(/^.*\/api\/v1/, '').replace(/^.*\/polaris-api\/v1/, '');
+
+    // Capture pagination honors ?page / ?page_size exactly like the backend
+    // would — Section 4 of the review.
+    if (/^\/captures(\?.*)?$/.test(path)) {
+      const captures = source.captures as unknown[];
+      const page = Number(url.searchParams.get('page') ?? '1');
+      const pageSize = Number(url.searchParams.get('page_size') ?? String(captures.length));
+      const start = (page - 1) * pageSize;
+      const slice = captures.slice(start, start + pageSize);
+      await route.fulfill({
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(
+          payload(slice, {
+            total: captures.length,
+            total_pages: Math.max(1, Math.ceil(captures.length / pageSize)),
+            page,
+            page_size: pageSize,
+          }),
+        ),
+      });
+      return;
+    }
+
     const map: Array<[RegExp, unknown]> = [
       [/^\/probes$/, source.probes],
       [/^\/probes\/[^/]+$/, (source.probes as unknown[])?.[0] ?? null],
       [/^\/probes\/[^/]+\/interfaces$/, source.interfaces],
       [/^\/interfaces$/, source.interfaces],
-      [/^\/captures(\?.*)?$/, source.captures],
       [/^\/metrics$/, source.metrics],
       [/^\/storage\/safety$/, source.storageSafety],
       [/^\/auth\/me$/, source.auth],
-      [/^\/system\/health$/, source.systemHealth],
-      [/^\/health$/, { status: 'OK' }],
+      [/^\/system\/health$/, { status: 'ok', service: 'POLARIS Control' }],
+      [/^\/health$/, { status: 'healthy', backend_api: '2.3.0' }],
       [/^\/version$/, { backend_api: '2.3.0' }],
     ];
     for (const [pattern, data] of map) {
@@ -409,5 +434,9 @@ export async function installMockApi(page: Page, mode: MockMode = 'populated') {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload([])),
     });
-  });
+  };
+
+  // Route both the OIRAN API base and the per-app POLARIS API base.
+  await page.route('**/api/v1/**', handler);
+  await page.route('**/polaris-api/v1/**', handler);
 }

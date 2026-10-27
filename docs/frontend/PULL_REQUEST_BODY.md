@@ -2,11 +2,71 @@
 
 > Paste the content below as the body of PR
 > `feat/frontend-portal-probe-manager → main` at
-> https://github.com/Sadok2512/OIRAN-POLARIS/pull/new/feat/frontend-portal-probe-manager
+> https://github.com/Sadok2512/OIRAN-POLARIS/pull/2
 >
 > The gh CLI token stored at `~/.config/gh/hosts.yml` is reported as
 > `Bad credentials` by `GET /user`. Re-run `gh auth login -h github.com`
 > if you want this agent to open PRs directly in the future.
+
+---
+
+## Review corrections (follow-up on PR #2 feedback)
+
+Five issues identified in the PR #2 review were addressed on this
+branch. See the full details in `docs/frontend/CHANGELOG.md` entry
+`[0.3.0] – 2026-10-27`.
+
+### P0
+
+1. **Topology evidence** —
+   `apps/probe-manager/src/topology/buildTopology.ts` no longer promotes
+   plane-name heuristics (`N2`/`N3`/`N4`/`SBI`) to `CONFIGURED`. All
+   name-derived edges are now `INFERRED` with an explicit
+   `evidenceSource`. A new `VerifiedInterfaceMapping` input (see
+   `apps/probe-manager/src/topology/types.ts`) is the ONLY way to upgrade
+   an edge to `CONFIGURED` or `DISCOVERED`. 11 new tests enforce this.
+2. **Authentication isolation + honest health** —
+   `packages/ui/src/api.ts` now requires an explicit `authScope`
+   (`oiran` / `polaris` / `probe-manager`) and stores tokens under
+   per-scope session-storage keys. Cross-origin absolute bases never
+   receive a token. The Portal probes each app with its own `apiBase`
+   via a dedicated anonymous `fetch` so no OIRAN token can leak to
+   POLARIS. Health states are now four — `ok`, `auth-required`,
+   `degraded`, `unknown` — derived from HTTP status AND the response
+   body (`{data.status}` or `{status}`).
+
+### P1
+
+3. **Capture Library pagination** — `useCapturesPage` requests
+   `GET /captures?page=N&page_size=M` and consumes
+   `meta.total`/`meta.total_pages`. When the backend omits the total the
+   UI shows a `partial-results-notice` instead of silently truncating.
+4. **Capture actions** — View opens an in-page metadata panel with no
+   network request. Analyzer stays disabled unless `dataset_id` exists
+   (test enforces this). Download target is
+   `/api/v1/captures/:id/download` and the button stays disabled unless
+   `/auth/me.authenticated === true` AND `size_bytes > 0`. Stop still
+   dispatches nothing from this UI (`LIVE_CAPTURE_AUTHORIZED = FALSE`).
+5. **API contract validation** — new file
+   `apps/probe-manager/src/data/apiContract.test.ts` exercises nullable
+   fields, empty captures, 401 envelopes, `fetch`-rejection paths, HTTP
+   status classification, and cross-scope token isolation.
+
+### Verified
+
+- `apps/portal`: `tsc -b` PASS · Vitest 11/11 · `vite build` PASS
+- `apps/probe-manager`: `tsc -b` PASS · Vitest 51/51 · `vite build` PASS
+- `e2e`: Playwright 65/65 · 65 PNGs regenerated at
+  `docs/frontend/SCREENSHOTS/`
+
+### Not changed
+
+- Enterprise Precision design system (tokens, spacing, radii, typography)
+- Portal three-card layout + Probe Manager navigation
+- React Flow topology scaffold + inspector affordances
+- TanStack Table columns + filters
+- Light/Dark/responsive layouts
+- Any backend file; no live capture executed
 
 ---
 

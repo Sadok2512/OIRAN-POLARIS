@@ -60,7 +60,7 @@ export function OverviewPage() {
     probes.error || interfaces.error || captures.error || metrics.error;
 
   const online = probes.data?.filter((p) => p.online).length ?? 0;
-  const activeCapture = captures.data?.find((item) =>
+  const activeCapture = captures.data?.items?.find((item) =>
     ['CAPTURING', 'STARTING', 'STOPPING', 'PROCESSING'].includes(
       item.state ?? '',
     ),
@@ -120,7 +120,7 @@ export function OverviewPage() {
           />
           <MetricTile
             label="Captures recorded"
-            value={count(captures.data?.length)}
+            value={count(captures.data?.items?.length)}
             sub={activeCapture ? 'Capture in progress' : 'No active capture'}
             state={activeCapture ? 'CAPTURING' : 'READY'}
           />
@@ -225,7 +225,7 @@ export function OverviewPage() {
           </header>
           {captures.isLoading ? (
             <LoadingSkeleton label="Loading capture inventory" />
-          ) : !captures.data?.length ? (
+          ) : !captures.data?.items?.length ? (
             <EmptyState
               title="No captures reported"
               description="The library will populate once the backend registers at least one capture."
@@ -233,7 +233,7 @@ export function OverviewPage() {
           ) : (
             <dl className="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-1 text-ep-sm">
               <dt className="text-text-secondary">Total records</dt>
-              <dd className="num text-right">{count(captures.data.length)}</dd>
+              <dd className="num text-right">{count(captures.data.items.length)}</dd>
               <dt className="text-text-secondary">Active</dt>
               <dd className="num text-right">
                 {activeCapture ? '1' : '0'}
@@ -241,7 +241,7 @@ export function OverviewPage() {
               <dt className="text-text-secondary">Historical</dt>
               <dd className="num text-right">
                 {count(
-                  captures.data.filter(
+                  captures.data.items.filter(
                     (item) => item.dataset_kind === 'HISTORICAL',
                   ).length,
                 )}
@@ -249,7 +249,7 @@ export function OverviewPage() {
               <dt className="text-text-secondary">Captured live</dt>
               <dd className="num text-right">
                 {count(
-                  captures.data.filter(
+                  captures.data.items.filter(
                     (item) => item.dataset_kind === 'CAPTURED_LIVE',
                   ).length,
                 )}

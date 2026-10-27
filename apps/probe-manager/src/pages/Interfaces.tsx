@@ -162,7 +162,7 @@ export function InterfacesPage() {
             iface={selected}
             probes={probes.data}
             metrics={metrics.data}
-            captures={captures.data}
+            captures={captures.data?.items}
           />
         </div>
       )}
