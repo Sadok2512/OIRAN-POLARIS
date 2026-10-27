@@ -1,0 +1,37 @@
+{
+  "name": "@telecom/portal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Telecom Platform Portal — three-card landing for Simulator Control, Probe Manager and OIRAN Analyzer.",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 4300",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --pretty false",
+    "preview": "vite preview --host 127.0.0.1 --port 4300",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint:css": "node -e \"console.log('no lint rule yet')\""
+  },
+  "dependencies": {
+    "@tanstack/react-query": "5.59.20",
+    "lucide-react": "0.468.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "6.6.3",
+    "@testing-library/react": "16.1.0",
+    "@types/node": "20.17.6",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "@vitejs/plugin-react": "4.3.4",
+    "autoprefixer": "10.4.20",
+    "jsdom": "25.0.1",
+    "postcss": "8.5.3",
+    "tailwindcss": "3.4.17",
+    "typescript": "5.7.2",
+    "vite": "5.4.11",
+    "vitest": "2.1.8"
+  }
+}
