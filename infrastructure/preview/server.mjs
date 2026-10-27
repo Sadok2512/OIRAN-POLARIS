@@ -3,7 +3,7 @@ import http from 'node:http';
 import { createReadStream, promises as fs } from 'node:fs';
 import { extname, resolve, sep } from 'node:path';
 
-const host = '0.0.0.0';
+const host = process.env.PREVIEW_HOST ?? '0.0.0.0';
 const port = Number(process.env.PREVIEW_PORT ?? 8020);
 const root = resolve(process.env.PREVIEW_PUBLIC_ROOT ?? new URL('./public/', import.meta.url).pathname);
 const allowedClient = process.env.ALLOWED_CLIENT_IP ?? '*';
@@ -28,8 +28,15 @@ function securityHeaders(type) {
 }
 
 function clientIp(request) {
-  const address = request.socket.remoteAddress ?? '';
-  return address.startsWith('::ffff:') ? address.slice(7) : address;
+  const socketAddress = request.socket.remoteAddress ?? '';
+  const normalizedSocket = socketAddress.startsWith('::ffff:')
+    ? socketAddress.slice(7)
+    : socketAddress;
+  const forwarded = request.headers['x-forwarded-for'];
+  if (['127.0.0.1', '::1'].includes(normalizedSocket) && typeof forwarded === 'string') {
+    return forwarded.split(',')[0].trim();
+  }
+  return normalizedSocket;
 }
 
 function localPrivateAccess(request) {
@@ -46,7 +53,9 @@ function reject(response, status, code, message, allow) {
 
 function proxyApi(request, response, targetPort, targetPath) {
   const readOnly = request.method === 'GET' || request.method === 'HEAD';
-  if (!readOnly && !localPrivateAccess(request)) {
+  const forwardedProto = request.headers['x-forwarded-proto'];
+  const secureRequest = request.socket.encrypted === true || forwardedProto === 'https';
+  if (!readOnly && !localPrivateAccess(request) && !secureRequest) {
     reject(
       response,
       403,
