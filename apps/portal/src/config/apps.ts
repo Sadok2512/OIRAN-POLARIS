@@ -32,9 +32,9 @@ export type AppDescriptor = {
 const env = import.meta.env ?? {};
 
 const APP_URLS = {
-  simulator: env.VITE_APP_SIMULATOR_URL ?? '/polaris/',
+  simulator: env.VITE_APP_SIMULATOR_URL ?? '/simulator/',
   probeManager: env.VITE_APP_PROBE_MANAGER_URL ?? '/probe-manager/',
-  oiranAnalyzer: env.VITE_APP_OIRAN_URL ?? '/oiran/',
+  oiranAnalyzer: env.VITE_APP_OIRAN_URL ?? '/analyzer/',
 } as const;
 
 const API_BASES = {

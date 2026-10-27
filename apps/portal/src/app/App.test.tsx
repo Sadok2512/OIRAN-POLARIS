@@ -58,7 +58,7 @@ describe('Portal App — layout', () => {
     renderApp();
     expect(screen.getByTestId('app-open-simulator')).toHaveAttribute(
       'href',
-      expect.stringMatching(/polaris/),
+      '/simulator/',
     );
     expect(screen.getByTestId('app-open-probe-manager')).toHaveAttribute(
       'href',
@@ -66,7 +66,7 @@ describe('Portal App — layout', () => {
     );
     expect(screen.getByTestId('app-open-oiran-analyzer')).toHaveAttribute(
       'href',
-      expect.stringMatching(/oiran/),
+      '/analyzer/',
     );
   });
 });

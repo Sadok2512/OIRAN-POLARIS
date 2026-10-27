@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, type ApiOptions } from '@shared/api';
 import type {
   ApiEnvelope,
@@ -8,6 +8,7 @@ import type {
   DiskSafety,
   Metrics,
   Probe,
+  CaptureRequest,
 } from '@shared/types';
 
 // The Probe Manager is an OIRAN consumer. Every request names the OIRAN
@@ -137,5 +138,52 @@ export function useAuth() {
       api<AuthState>('/auth/me', OIRAN_SCOPE).then((x) => x.data),
     refetchInterval: 15_000,
     retry: false,
+  });
+}
+
+type ValidationResult = {
+  authorization: string;
+  validation: { valid?: boolean; errors?: string[]; warnings?: string[] };
+};
+
+export function useValidateCapture() {
+  return useMutation({
+    mutationFn: (request: CaptureRequest) =>
+      api<ValidationResult>('/captures/validate', {
+        ...OIRAN_SCOPE,
+        method: 'POST',
+        body: JSON.stringify(request),
+      }).then((result) => result.data),
+  });
+}
+
+export function useStartCapture() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (request: CaptureRequest) =>
+      api<Capture>('/captures/start', {
+        ...OIRAN_SCOPE,
+        method: 'POST',
+        body: JSON.stringify(request),
+      }).then((result) => result.data),
+    onSuccess: async () => {
+      await client.invalidateQueries({ queryKey: ['captures-first-page'] });
+      await client.invalidateQueries({ queryKey: ['captures-page'] });
+    },
+  });
+}
+
+export function useStopCapture() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (captureId: string) =>
+      api<Capture>(`/captures/${encodeURIComponent(captureId)}/stop`, {
+        ...OIRAN_SCOPE,
+        method: 'POST',
+      }).then((result) => result.data),
+    onSuccess: async () => {
+      await client.invalidateQueries({ queryKey: ['captures-first-page'] });
+      await client.invalidateQueries({ queryKey: ['captures-page'] });
+    },
   });
 }
