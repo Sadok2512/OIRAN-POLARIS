@@ -8,16 +8,75 @@ import {
 } from '@/ui/EmptyErrorLoading';
 import { ConfirmDialog } from '@/ui/ConfirmDialog';
 import { bits, bytes, count, durationSeconds, pps } from '@/data/format';
-import { useAuth, useCaptures } from '@/data/queries';
+import {
+  useAuth,
+  useCaptures,
+  useInterfaces,
+  useProbes,
+  useStartCapture,
+  useStopCapture,
+  useValidateCapture,
+} from '@/data/queries';
+import type { CaptureRequest } from '@shared/types';
 
 const ACTIVE_STATES = ['READY', 'STARTING', 'CAPTURING', 'STOPPING'];
 
 export function LiveCapturesPage() {
   const captures = useCaptures();
   const auth = useAuth();
+  const probes = useProbes();
+  const interfaces = useInterfaces();
+  const validateCapture = useValidateCapture();
+  const startCapture = useStartCapture();
+  const stopCapture = useStopCapture();
   const [confirmStop, setConfirmStop] = useState<string | null>(null);
+  const [selectedInterfaces, setSelectedInterfaces] = useState<string[]>([]);
+  const [duration, setDuration] = useState(60);
+  const [feedback, setFeedback] = useState('');
   const control = auth.data?.capture_control === true;
   const execution = auth.data?.capture_execution_enabled === true;
+  const availableInterfaces = interfaces.data?.filter(
+    (item) => item.live_capture_available && item.status === 'AVAILABLE',
+  ) ?? [];
+  const probeId = probes.data?.find((probe) => probe.online)?.probe_id ?? '';
+
+  const request = (): CaptureRequest => ({
+    probe_id: probeId,
+    name: `Portal capture ${new Date().toISOString()}`,
+    interfaces: selectedInterfaces,
+    duration_seconds: duration,
+    max_bytes: 256 * 1024 * 1024,
+    rotation_files: 1,
+    profile: 'POLARIS 5G SA',
+    optional_filter: null,
+  });
+
+  async function validateOnly() {
+    setFeedback('');
+    try {
+      const result = await validateCapture.mutateAsync(request());
+      setFeedback(result.validation.valid === false
+        ? `Validation rejected: ${(result.validation.errors ?? []).join(', ')}`
+        : 'Validation passed. No capture was started.');
+    } catch (error) {
+      setFeedback((error as Error).message);
+    }
+  }
+
+  async function start() {
+    setFeedback('');
+    try {
+      const validation = await validateCapture.mutateAsync(request());
+      if (validation.validation.valid === false) {
+        setFeedback(`Validation rejected: ${(validation.validation.errors ?? []).join(', ')}`);
+        return;
+      }
+      const job = await startCapture.mutateAsync(request());
+      setFeedback(`Capture request accepted: ${job.capture_id}`);
+    } catch (error) {
+      setFeedback((error as Error).message);
+    }
+  }
 
   const live = useMemo(
     () =>
@@ -48,6 +107,64 @@ export function LiveCapturesPage() {
           </div>
         }
       />
+
+      <section className="ep-card mb-4 p-5" aria-label="Capture controls">
+        <div className="grid gap-4 md:grid-cols-[1fr_auto]">
+          <div>
+            <h2 className="text-ep-lg font-semibold">Bounded capture</h2>
+            <p className="text-ep-sm text-text-secondary">
+              Select verified backend interfaces. Validation never starts acquisition.
+            </p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {availableInterfaces.map((item) => (
+                <label className="ep-button ep-button-sm" key={item.interface}>
+                  <input
+                    type="checkbox"
+                    checked={selectedInterfaces.includes(item.interface)}
+                    onChange={(event) => setSelectedInterfaces((current) =>
+                      event.target.checked
+                        ? [...current, item.interface]
+                        : current.filter((value) => value !== item.interface))}
+                  />
+                  {item.interface} · {item.protocol}
+                </label>
+              ))}
+            </div>
+          </div>
+          <label className="text-ep-sm">
+            Duration (seconds)
+            <input
+              className="ep-input ml-2 w-24"
+              type="number"
+              min={1}
+              max={120}
+              value={duration}
+              onChange={(event) => setDuration(Number(event.target.value))}
+            />
+          </label>
+        </div>
+        <div className="mt-4 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            className="ep-button"
+            disabled={!control || !execution || !probeId || selectedInterfaces.length === 0 || validateCapture.isPending}
+            onClick={() => void validateOnly()}
+          >
+            Validate capture
+          </button>
+          <button
+            type="button"
+            className="ep-button ep-button-primary"
+            disabled={!control || !execution || !probeId || selectedInterfaces.length === 0 || startCapture.isPending}
+            onClick={() => void start()}
+          >
+            Start capture
+          </button>
+          <span className="text-ep-xs text-text-secondary">
+            {!control ? 'Operator authentication required.' : feedback}
+          </span>
+        </div>
+      </section>
 
       {captures.isLoading && <LoadingSkeleton label="Loading capture jobs" />}
       {captures.error && !captures.isLoading && (
@@ -188,11 +305,12 @@ export function LiveCapturesPage() {
         tone="danger"
         onCancel={() => setConfirmStop(null)}
         onConfirm={() => {
-          // Deliberately does not call the backend here; the acceptance
-          // criteria require that no live capture is executed from this UI
-          // during this review. The real request is wired through
-          // `/captures/:id/stop` once the deployment gate is enabled.
+          const captureId = confirmStop;
           setConfirmStop(null);
+          if (!captureId) return;
+          void stopCapture.mutateAsync(captureId)
+            .then(() => setFeedback(`Stop request accepted: ${captureId}`))
+            .catch((error: Error) => setFeedback(error.message));
         }}
       />
     </>
