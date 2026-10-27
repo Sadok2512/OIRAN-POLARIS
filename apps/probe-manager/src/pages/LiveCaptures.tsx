@@ -42,12 +42,12 @@ export function LiveCapturesPage() {
 
   const request = (): CaptureRequest => ({
     probe_id: probeId,
-    name: `Portal capture ${new Date().toISOString()}`,
+    name: `Portal-${Date.now()}`,
     interfaces: selectedInterfaces,
     duration_seconds: duration,
     max_bytes: 256 * 1024 * 1024,
     rotation_files: 1,
-    profile: 'POLARIS 5G SA',
+    profile: 'POLARIS_5G_SA',
     optional_filter: null,
   });
 
@@ -56,7 +56,7 @@ export function LiveCapturesPage() {
     try {
       const result = await validateCapture.mutateAsync(request());
       setFeedback(result.validation.valid === false
-        ? `Validation rejected: ${(result.validation.errors ?? []).join(', ')}`
+        ? `Validation rejected: ${result.validation.blockers.join(', ')}`
         : 'Validation passed. No capture was started.');
     } catch (error) {
       setFeedback((error as Error).message);
@@ -68,7 +68,7 @@ export function LiveCapturesPage() {
     try {
       const validation = await validateCapture.mutateAsync(request());
       if (validation.validation.valid === false) {
-        setFeedback(`Validation rejected: ${(validation.validation.errors ?? []).join(', ')}`);
+        setFeedback(`Validation rejected: ${validation.validation.blockers.join(', ')}`);
         return;
       }
       const job = await startCapture.mutateAsync(request());

@@ -41,7 +41,7 @@ describe('Live capture controls', () => {
       if (url.includes('/auth/me')) return response({ authenticated: true, role: 'operator', permissions: ['captures.validate', 'captures.start'], capture_control: true, capture_execution_enabled: true, reason: 'AUTHENTICATED_OPERATOR' });
       if (url.includes('/interfaces')) return response([{ interface: 'N2', protocol: 'NGAP / SCTP', capture_point: 'n2', source: 'backend', status: 'AVAILABLE', packet_count: null, file_size: null, capture_start: null, capture_end: null, live_capture_available: true }]);
       if (url.includes('/probes')) return response([{ probe_id: 'probe-a', online: true }]);
-      if (url.endsWith('/captures/validate')) return response({ authorization: 'operator', validation: { valid: true } });
+      if (url.endsWith('/captures/validate')) return response({ authorization: 'operator', validation: { valid: true, blockers: [], capture_control_available: true, state: 'READY' } });
       if (url.endsWith('/captures/start')) return response({ capture_id: 'capture-test', name: 'test', state: 'STARTING' });
       return response([]);
     }) as unknown as typeof fetch;
