@@ -1,0 +1,124 @@
+{
+  "summary_version": 1,
+  "source": "unknown-dnn.pcap",
+  "capture": {
+    "frames_total": null,
+    "frames_decoded": 12,
+    "messages": 12,
+    "flows": 2,
+    "duration_s": null,
+    "signalling_span_s": 0.232,
+    "started_at": "2026-08-17T11:10:10.464000+00:00",
+    "protocols": [
+      "ngap"
+    ]
+  },
+  "not_visible": {
+    "ciphered_nas": 6,
+    "ecies_protected_suci": 0,
+    "only_n2": true,
+    "frames_not_decoded": null,
+    "sbi_streams_with_undecoded_headers": 0,
+    "narrowed": [],
+    "auto_decode": [],
+    "undecoded_traffic": [],
+    "coverage_notes": []
+  },
+  "network_elements": [
+    {
+      "role": "gNB",
+      "ip": "172.22.0.23",
+      "ports": [
+        35786
+      ],
+      "messages": 12
+    },
+    {
+      "role": "AMF",
+      "ip": "172.22.0.10",
+      "ports": [
+        38412
+      ],
+      "messages": 12
+    }
+  ],
+  "subscribers": [
+    {
+      "supi": "001011234567895",
+      "flows": 1,
+      "messages": 10,
+      "failures": 0,
+      "aliases": [
+        {
+          "kind": "amf_ue_ngap_id",
+          "value": "5",
+          "scope": "172.22.0.10|172.22.0.23"
+        },
+        {
+          "kind": "ran_ue_ngap_id",
+          "value": "5",
+          "scope": "172.22.0.10|172.22.0.23"
+        }
+      ],
+      "pdu_sessions": []
+    }
+  ],
+  "unlinked_identities": [
+    {
+      "kind": "amf_ue_ngap_id",
+      "value": "4",
+      "scope": "172.22.0.10|172.22.0.23",
+      "messages": 2,
+      "failures": 0
+    },
+    {
+      "kind": "ran_ue_ngap_id",
+      "value": "4",
+      "scope": "172.22.0.10|172.22.0.23",
+      "messages": 2,
+      "failures": 0
+    }
+  ],
+  "procedures": [
+    {
+      "procedure": "registration",
+      "supi": "001011234567895",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 7,
+      "end_frame": 19,
+      "messages": 10,
+      "failures": 0,
+      "duration_s": 0.232,
+      "protocols": [
+        "ngap"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    },
+    {
+      "procedure": "ue-context-release",
+      "supi": null,
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 12,
+      "end_frame": 13,
+      "messages": 2,
+      "failures": 0,
+      "duration_s": 0.0,
+      "protocols": [
+        "ngap"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    }
+  ],
+  "failures": [],
+  "cause_rollup": []
+}

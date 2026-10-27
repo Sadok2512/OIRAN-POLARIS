@@ -1,0 +1,14 @@
+[package]
+name = "benchmark-engine"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+capture-core = { path = "../capture-core" }
+flow-dispatcher = { path = "../flow-dispatcher" }
+packet-classifier = { path = "../packet-classifier" }
+telemetry = { path = "../telemetry" }
+worker-runtime = { path = "../worker-runtime" }
+

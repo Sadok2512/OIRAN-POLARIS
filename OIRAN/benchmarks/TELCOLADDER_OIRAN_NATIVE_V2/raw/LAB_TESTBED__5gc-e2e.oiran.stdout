@@ -1,0 +1,1 @@
+capture_format=PcapNg packets=626 events=28 warnings=0 transport_errors=0 sctp_errors=0 incomplete_sctp=0 output=/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/raw/LAB_TESTBED__5gc-e2e.oiran.jsonl

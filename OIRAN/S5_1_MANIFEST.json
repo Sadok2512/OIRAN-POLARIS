@@ -1,0 +1,280 @@
+{
+  "project": "OIRAN",
+  "mission": "NATIVE_SLL2_PCAP_DECODING_AND_CORPUS_CERTIFICATION",
+  "branch": "feat/s5-1-native-sll2",
+  "source_commit": "537aa7e3dafb92dcf60a62b32998eb6339e4e95d",
+  "base_commit": "1fc0f9f375ac9b305bae5958a67830cf580a1617",
+  "components": {
+    "capture_pcap": "0.2.0",
+    "event_schema": "1.3.0",
+    "oiran_decode": "0.2.0",
+    "tshark": "4.2.2",
+    "telcoladder": "0.1.0"
+  },
+  "corpus": {
+    "files": 13,
+    "packets": 4205,
+    "bytes": 758864,
+    "sha256": {
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/5gc-e2e.pcap": "74f36548a60e1fe2e105d3a6a8e07e67d8a877bad1743c9f03c9a0d3d824f283",
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/5gc-registration.pcap": "b6ace8e6eb7a0bae835e5291d69adf250ab9d38308e2dde1349364d4d6a91f83",
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/ki-mismatch.pcap": "134d5730047459d8bedb72e51800991affb85c6c0d24dd602e6ddf391a0aa4cb",
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap": "a55fd3ffdc0bfaa0b62ff2f7697113584bba6547f4e0be32ca07023bdfc35d5d",
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/supi-not-provisioned.pcap": "e815d4633a4972bb311ce356cabab94c66d792d13f9eb31db1b35e07dca6c58e",
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/unknown-dnn.pcap": "3de425bd925b483c3a70cc172553d3d3653cdedea96312eb0981f2b6d40bb96b",
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/userplane.pcap": "08cd12bd66b9524f428097bb8fd3c07eb77f41bd7f0008a5315a04a3da739404",
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/OIRAN_A/N2.pcapng": "2f23390dd619dda464ec8f2cfbd3b9fe59ca0587b043f6267a8ffc5a752cf54e",
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/OIRAN_A/N3.pcapng": "806a4ae1eb758a1b2c08ae10d7b7f54881c5e571c7f80ed047f564cb222cb35a",
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/OIRAN_A/N4.pcapng": "8fad2f3401e79ea1695aa26cba649c03711e24ee0602625ec569ef82c3e6cfe7",
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/OIRAN_B/N2.pcap": "5bc19ed6dbed4c804af75e959b21b2f058d3d90ba001a9829a2f3aaf47f9a921",
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/OIRAN_B/N3.pcap": "acc530668c8bc60b2d229281130b1899bfc81d70fdada5c34b3236c628f739c8",
+      "/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/OIRAN_B/N4.pcap": "1e82d3e787da37c56bd184c169917ea5bca0bf1da3a7a8ac43a227992f823032"
+    },
+    "integrity": "PASS"
+  },
+  "results": {
+    "corpus_files": 13,
+    "corpus_packets": 4205,
+    "corpus_bytes": 758864,
+    "lab_packets": 4075,
+    "previously_blocked_messages": 1441,
+    "newly_comparable_messages": 318,
+    "messages_exact": 239,
+    "messages_mismatched": 0,
+    "messages_missing": 0,
+    "messages_unsupported": 79,
+    "messages_extra": 0,
+    "messages_unresolved_subset": 116,
+    "telcoladder_total_count_parity": "NOT_COMPARABLE_DIFFERENT_MESSAGE_GRANULARITY",
+    "multi_imsi": {
+      "ue_contexts": 6,
+      "pdu_sessions": 5,
+      "pfcp_sessions": 6,
+      "gtpu_tunnels": 0,
+      "pdu_contexts_unique": true,
+      "cross_ue_contamination": "NONE_OBSERVED"
+    },
+    "rows": [
+      {
+        "dataset": "5gc-e2e",
+        "sha256": "74f36548a60e1fe2e105d3a6a8e07e67d8a877bad1743c9f03c9a0d3d824f283",
+        "packets": 626,
+        "oiran_messages": 28,
+        "messages_exact": 28,
+        "messages_mismatched": 0,
+        "nas_messages_missing": 8,
+        "telcoladder_messages": 177,
+        "telcoladder_count_parity": "NOT_COMPARABLE",
+        "partial_events": 11,
+        "provenance_failures": 0,
+        "timestamp_failures": 0,
+        "endpoint_failures": 0,
+        "ue_contexts": 2,
+        "pdu_sessions": 1,
+        "pfcp_sessions": 2,
+        "gtpu_tunnels": 0,
+        "duplicate_observations": 0
+      },
+      {
+        "dataset": "5gc-registration",
+        "sha256": "b6ace8e6eb7a0bae835e5291d69adf250ab9d38308e2dde1349364d4d6a91f83",
+        "packets": 44,
+        "oiran_messages": 16,
+        "messages_exact": 16,
+        "messages_mismatched": 0,
+        "nas_messages_missing": 6,
+        "telcoladder_messages": 15,
+        "telcoladder_count_parity": "NOT_COMPARABLE",
+        "partial_events": 15,
+        "provenance_failures": 0,
+        "timestamp_failures": 0,
+        "endpoint_failures": 0,
+        "ue_contexts": 1,
+        "pdu_sessions": 1,
+        "pfcp_sessions": 0,
+        "gtpu_tunnels": 0,
+        "duplicate_observations": 0
+      },
+      {
+        "dataset": "ki-mismatch",
+        "sha256": "134d5730047459d8bedb72e51800991affb85c6c0d24dd602e6ddf391a0aa4cb",
+        "packets": 13,
+        "oiran_messages": 4,
+        "messages_exact": 4,
+        "messages_mismatched": 0,
+        "nas_messages_missing": 4,
+        "telcoladder_messages": 4,
+        "telcoladder_count_parity": "NOT_COMPARABLE",
+        "partial_events": 4,
+        "provenance_failures": 0,
+        "timestamp_failures": 0,
+        "endpoint_failures": 0,
+        "ue_contexts": 1,
+        "pdu_sessions": 0,
+        "pfcp_sessions": 0,
+        "gtpu_tunnels": 0,
+        "duplicate_observations": 0
+      },
+      {
+        "dataset": "multi-imsi",
+        "sha256": "a55fd3ffdc0bfaa0b62ff2f7697113584bba6547f4e0be32ca07023bdfc35d5d",
+        "packets": 2710,
+        "oiran_messages": 132,
+        "messages_exact": 132,
+        "messages_mismatched": 0,
+        "nas_messages_missing": 48,
+        "telcoladder_messages": 1031,
+        "telcoladder_count_parity": "NOT_COMPARABLE",
+        "partial_events": 63,
+        "provenance_failures": 0,
+        "timestamp_failures": 0,
+        "endpoint_failures": 0,
+        "ue_contexts": 6,
+        "pdu_sessions": 5,
+        "pfcp_sessions": 6,
+        "gtpu_tunnels": 0,
+        "duplicate_observations": 0
+      },
+      {
+        "dataset": "supi-not-provisioned",
+        "sha256": "e815d4633a4972bb311ce356cabab94c66d792d13f9eb31db1b35e07dca6c58e",
+        "packets": 12,
+        "oiran_messages": 4,
+        "messages_exact": 4,
+        "messages_mismatched": 0,
+        "nas_messages_missing": 2,
+        "telcoladder_messages": 4,
+        "telcoladder_count_parity": "NOT_COMPARABLE",
+        "partial_events": 2,
+        "provenance_failures": 0,
+        "timestamp_failures": 0,
+        "endpoint_failures": 0,
+        "ue_contexts": 1,
+        "pdu_sessions": 0,
+        "pfcp_sessions": 0,
+        "gtpu_tunnels": 0,
+        "duplicate_observations": 0
+      },
+      {
+        "dataset": "unknown-dnn",
+        "sha256": "3de425bd925b483c3a70cc172553d3d3653cdedea96312eb0981f2b6d40bb96b",
+        "packets": 22,
+        "oiran_messages": 13,
+        "messages_exact": 13,
+        "messages_mismatched": 0,
+        "nas_messages_missing": 4,
+        "telcoladder_messages": 12,
+        "telcoladder_count_parity": "NOT_COMPARABLE",
+        "partial_events": 10,
+        "provenance_failures": 0,
+        "timestamp_failures": 0,
+        "endpoint_failures": 0,
+        "ue_contexts": 2,
+        "pdu_sessions": 0,
+        "pfcp_sessions": 0,
+        "gtpu_tunnels": 0,
+        "duplicate_observations": 0
+      },
+      {
+        "dataset": "userplane",
+        "sha256": "08cd12bd66b9524f428097bb8fd3c07eb77f41bd7f0008a5315a04a3da739404",
+        "packets": 648,
+        "oiran_messages": 42,
+        "messages_exact": 42,
+        "messages_mismatched": 0,
+        "nas_messages_missing": 7,
+        "telcoladder_messages": 198,
+        "telcoladder_count_parity": "NOT_COMPARABLE",
+        "partial_events": 11,
+        "provenance_failures": 0,
+        "timestamp_failures": 0,
+        "endpoint_failures": 0,
+        "ue_contexts": 2,
+        "pdu_sessions": 1,
+        "pfcp_sessions": 2,
+        "gtpu_tunnels": 1,
+        "duplicate_observations": 0
+      }
+    ]
+  },
+  "performance": {
+    "method": {
+      "warmup_runs": 1,
+      "measured_runs": 5,
+      "packets": 4205,
+      "files": 13,
+      "memory_allocations": "NOT_MEASURED"
+    },
+    "median_total_seconds": 0.02,
+    "min_total_seconds": 0.02,
+    "max_total_seconds": 0.03,
+    "median_packets_per_second": 210250.0,
+    "peak_rss_kib": 4188,
+    "mean_cpu_percent": 80.70769230769231,
+    "runs": [
+      {
+        "iteration": 0,
+        "warmup": true,
+        "total_seconds": 0.02,
+        "peak_rss_kib": 4184,
+        "mean_cpu_percent": 77.0
+      },
+      {
+        "iteration": 1,
+        "warmup": false,
+        "total_seconds": 0.02,
+        "peak_rss_kib": 4188,
+        "mean_cpu_percent": 83.07692307692308
+      },
+      {
+        "iteration": 2,
+        "warmup": false,
+        "total_seconds": 0.03,
+        "peak_rss_kib": 4184,
+        "mean_cpu_percent": 79.53846153846153
+      },
+      {
+        "iteration": 3,
+        "warmup": false,
+        "total_seconds": 0.02,
+        "peak_rss_kib": 4188,
+        "mean_cpu_percent": 84.07692307692308
+      },
+      {
+        "iteration": 4,
+        "warmup": false,
+        "total_seconds": 0.02,
+        "peak_rss_kib": 4184,
+        "mean_cpu_percent": 69.76923076923077
+      },
+      {
+        "iteration": 5,
+        "warmup": false,
+        "total_seconds": 0.02,
+        "peak_rss_kib": 4188,
+        "mean_cpu_percent": 87.07692307692308
+      }
+    ]
+  },
+  "tests": {
+    "rust_workspace": {
+      "passed": 140,
+      "failed": 0
+    },
+    "corpus_replay": "PASS",
+    "clippy": "NOT_AVAILABLE_ON_HOST"
+  },
+  "safety": {
+    "production_changed": false,
+    "live_capture_executed": false,
+    "simulator_started": false,
+    "polaris_changed": false,
+    "polaris_control_changed": false,
+    "etv_otv_changed": false
+  },
+  "artifact_sha256": {
+    "S5_1_RESULTS.csv": "e4a4f7c7aa33a104b69ed72ea0c3210a8d4527c0950edc630acbcd2df1fe8c68",
+    "analysis_summary.json": "adb0046118f7b14b89940e7afb7c6d2e24b41f4dc79be80db78bdc923baaf372",
+    "performance.json": "7db2632623ed1a4558148eb550aca220c416a63f18aa6511db212eb53e88c0ac"
+  }
+}

@@ -1,0 +1,151 @@
+{
+  "summary_version": 1,
+  "source": "supi-not-provisioned.pcap",
+  "capture": {
+    "frames_total": null,
+    "frames_decoded": 4,
+    "messages": 4,
+    "flows": 1,
+    "duration_s": null,
+    "signalling_span_s": 0.008,
+    "started_at": "2026-08-17T11:06:45.053000+00:00",
+    "protocols": [
+      "ngap"
+    ]
+  },
+  "not_visible": {
+    "ciphered_nas": 0,
+    "ecies_protected_suci": 0,
+    "only_n2": true,
+    "frames_not_decoded": null,
+    "sbi_streams_with_undecoded_headers": 0,
+    "narrowed": [],
+    "auto_decode": [],
+    "undecoded_traffic": [],
+    "coverage_notes": []
+  },
+  "network_elements": [
+    {
+      "role": "gNB",
+      "ip": "172.22.0.23",
+      "ports": [
+        35786
+      ],
+      "messages": 4
+    },
+    {
+      "role": "AMF",
+      "ip": "172.22.0.10",
+      "ports": [
+        38412
+      ],
+      "messages": 4
+    }
+  ],
+  "subscribers": [
+    {
+      "supi": "001019999999999",
+      "flows": 1,
+      "messages": 4,
+      "failures": 1,
+      "aliases": [
+        {
+          "kind": "amf_ue_ngap_id",
+          "value": "2",
+          "scope": "172.22.0.10|172.22.0.23"
+        },
+        {
+          "kind": "ran_ue_ngap_id",
+          "value": "2",
+          "scope": "172.22.0.10|172.22.0.23"
+        }
+      ],
+      "pdu_sessions": []
+    }
+  ],
+  "unlinked_identities": [],
+  "procedures": [
+    {
+      "procedure": "registration",
+      "supi": "001019999999999",
+      "outcome": "failure",
+      "cause": "This subscriber has no subscription for 5GS services.",
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 5,
+      "end_frame": 6,
+      "messages": 2,
+      "failures": 1,
+      "duration_s": 0.008,
+      "protocols": [
+        "ngap"
+      ],
+      "note": "",
+      "cause_ref": {
+        "table": "nas_5gmm",
+        "value": 7,
+        "known": true,
+        "name": "5GS services not allowed",
+        "spec": "3GPP TS 24.501",
+        "clause": "§9.11.3.2"
+      },
+      "root_cause_ref": null
+    },
+    {
+      "procedure": "ue-context-release",
+      "supi": "001019999999999",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 7,
+      "end_frame": 9,
+      "messages": 2,
+      "failures": 0,
+      "duration_s": 0.0,
+      "protocols": [
+        "ngap"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    }
+  ],
+  "failures": [
+    {
+      "frame": 6,
+      "ts": 0.008,
+      "protocol": "ngap",
+      "from": "AMF",
+      "to": "gNB",
+      "message": "DownlinkNASTransport ▸ Registration reject",
+      "supi": "001019999999999",
+      "cause": {
+        "table": "nas_5gmm",
+        "value": 7,
+        "known": true,
+        "name": "5GS services not allowed",
+        "spec": "3GPP TS 24.501",
+        "clause": "§9.11.3.2"
+      },
+      "explanation": "This subscriber has no subscription for 5GS services.",
+      "common_causes": [
+        "The SUPI is not in the UDM/UDR at all - the SIM was never provisioned. The most common one in practice; the core log says `Cannot find SUPI [404]` (seen in tests/fixtures/supi-not-provisioned)",
+        "5G access is not enabled in the subscription",
+        "An access restriction in the UDM blocks 3GPP access"
+      ]
+    }
+  ],
+  "cause_rollup": [
+    {
+      "cause": "This subscriber has no subscription for 5GS services.",
+      "count": 1,
+      "frames": [
+        6
+      ],
+      "supis": [
+        "001019999999999"
+      ]
+    }
+  ]
+}

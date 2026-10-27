@@ -1,0 +1,48 @@
+{
+  "project": "POLARIS_CONTROL",
+  "mission": "UE_TARGETED_TRAFFIC_PRODUCTION_DEPLOYMENT",
+  "deployed_at_utc": "2026-10-26T21:44:31Z",
+  "source_commit": "7845580d527feb0cf4e3bac0d506a7b8a84b0d75",
+  "service": "polaris-control.service",
+  "pid": 4021164,
+  "api_sha256": "1f016dd2bc2dc2cd9dea93c2e99233b184ec1fd57aa86b26f917d6a7b64c4579",
+  "frontend_index_sha256": "178a820d9cf78369af9b4dfff16d7a722df07a654054b3aff266b27877fd3297",
+  "frontend_javascript_sha256": "fc3ce37ce88b17ed3a6e2a8583ddfb5d734ca72734e6ada03004ecdb01d11b0f",
+  "configuration": {
+    "ue_profiles": 4,
+    "running_ues": 3,
+    "registered_ues": 3,
+    "active_pdu_sessions": 3,
+    "gnb_profiles": 1,
+    "ue_04_started": false,
+    "live_traffic_generated": false
+  },
+  "tests": {
+    "rust": "71/71 PASS",
+    "api": "37/37 PASS",
+    "frontend": "5/5 PASS",
+    "candidate_e2e": "1/1 PASS",
+    "production_e2e": "1/1 PASS"
+  },
+  "resource_safety": {
+    "disk_used_percent": 63.2,
+    "disk_free_bytes": 152709644288,
+    "disk_free_inodes": 51110540,
+    "cpu_gate": "CPU_CONTENTION_LIMIT",
+    "disk_gate": "NORMAL"
+  },
+  "screenshots": {
+    "directory": "/root/POLARIS_CONTROL/screenshots/v3_2_ue_targeted",
+    "count": 16,
+    "sizes": ["1440x900", "1920x1080"],
+    "themes": ["light", "dark"]
+  },
+  "backup": "/root/POLARIS_CONTROL/deployment/backups/20261026T2144Z_pre_ue_targeted",
+  "rollback_ready": true,
+  "open5gs_changed": false,
+  "shared_gnb_changed": false,
+  "shared_ues_changed": false,
+  "oiran_changed": false,
+  "etv_otv_changed": false
+}
+

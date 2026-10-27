@@ -1,0 +1,13 @@
+supi: 'imsi-001010000000001'
+mcc: '001'
+mnc: '01'
+key: '00112233445566778899aabbccddeeff'
+opType: 'OPC'
+op: 'ffeeddccbbaa99887766554433221100'
+amf: '8000'
+configured-nssai: [{sst: 1, sd: 0x010203}]
+default-nssai: [{sst: 1, sd: 0x010203}]
+sessions:
+  - type: IPv4
+    apn: internet
+    slice: {sst: 1, sd: 0x010203}

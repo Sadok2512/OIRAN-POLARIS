@@ -1,0 +1,39 @@
+{
+  "project": "OIRAN",
+  "mission": "NATIVE_5G_NAS_DECODING_AND_PROCEDURE_CERTIFICATION",
+  "branch": "feat/s5-2-native-nas",
+  "baseline_commit": "ca623fe38ca9c9a1d9be695678cdd464d5555cfd",
+  "implementation_commit": "2f3bfee560335e04b86f0d1441a9a16dc7386157",
+  "versions": {
+    "decoder_nas": "0.1.0",
+    "decoder_ngap": "0.3.0",
+    "event_schema": "1.4.0",
+    "session_engine": "0.3.0",
+    "tshark": "4.2.2",
+    "telcoladder": "0.1.0",
+    "rustc": "1.75.0"
+  },
+  "corpus": {
+    "files": 13,
+    "packets": 4205,
+    "bytes": 758864,
+    "sha256_integrity": "PASS",
+    "manifest": "benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/SHA256SUMS"
+  },
+  "results": {
+    "nas_envelopes": 116,
+    "plain_decoded_or_partial": 46,
+    "protected_classified": 70,
+    "ciphered_unresolved": 60,
+    "tshark_fields_comparable": 464,
+    "tshark_fields_exact": 404,
+    "tshark_fields_mismatched": 0,
+    "rust_tests": "152/152 PASS"
+  },
+  "artifact_sha256": {
+    "oiran_decode": "0bd4feda4ef375f5f9f03714e0833c90015213652259cd44105721a320a6a6b3",
+    "decoder_nas_source": "03c5203b3d566b4ec4c9d9b38da20462cb97d3dd22ead6ff6d4a798eb4e62c08"
+  },
+  "production_changed": false,
+  "live_capture_executed": false
+}

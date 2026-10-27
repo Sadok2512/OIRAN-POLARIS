@@ -1,0 +1,44 @@
+[Unit]
+Description=OIRAN Analyzer API
+After=network.target oiran-capture-helper.service
+Wants=oiran-capture-helper.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+SupplementaryGroups=oiran-capture
+WorkingDirectory=/root/OIRAN_VPROBE
+EnvironmentFile=-/etc/oiran/oiran-web.env
+EnvironmentFile=/etc/oiran/operator.env
+Environment=OIRAN_API_BIND=127.0.0.1:49152
+Environment=OIRAN_WORKSPACE=/root/OIRAN_VPROBE
+Environment=OIRAN_CAPTURE_EXECUTION_ENABLED=1
+Environment=OIRAN_CAPTURE_HELPER_SOCKET=/run/oiran/capture-helper.sock
+Environment=OIRAN_CAPTURE_HELPER_UID=995
+Environment=OIRAN_CAPTURE_ROOT=/var/lib/oiran/captures
+ExecStart=/opt/oiran/bin/oiran-api
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/root/OIRAN_VPROBE
+ReadWritePaths=/var/lib/oiran/captures
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryMax=256M
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

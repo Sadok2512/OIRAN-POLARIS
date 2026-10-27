@@ -1,0 +1,66 @@
+{
+  "xdr_version": 1,
+  "source": "5gc-e2e.pcap",
+  "procedures": [
+    {
+      "procedure": "registration",
+      "supi": "001011234567895",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 100,
+      "end_frame": 387,
+      "messages": 57,
+      "failures": 0,
+      "duration_s": 0.232,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "sbi"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "ue-context-release",
+      "supi": null,
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 315,
+      "end_frame": 318,
+      "messages": 2,
+      "failures": 0,
+      "duration_s": 0.0,
+      "protocols": [
+        "ngap"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "pdu-session-establishment",
+      "supi": "001011234567895",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 388,
+      "end_frame": 522,
+      "messages": 39,
+      "failures": 0,
+      "duration_s": 0.011,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "pfcp",
+        "sbi"
+      ],
+      "note": ""
+    }
+  ],
+  "messages_total": 182,
+  "messages_in_procedures": 98,
+  "messages_unassigned": 84,
+  "cause_rollup": []
+}

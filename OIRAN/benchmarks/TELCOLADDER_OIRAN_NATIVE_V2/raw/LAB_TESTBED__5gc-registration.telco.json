@@ -1,0 +1,133 @@
+{
+  "summary_version": 1,
+  "source": "5gc-registration.pcap",
+  "capture": {
+    "frames_total": null,
+    "frames_decoded": 15,
+    "messages": 15,
+    "flows": 2,
+    "duration_s": null,
+    "signalling_span_s": 20.835,
+    "started_at": "2026-08-17T10:53:54.211000+00:00",
+    "protocols": [
+      "ngap"
+    ]
+  },
+  "not_visible": {
+    "ciphered_nas": 6,
+    "ecies_protected_suci": 0,
+    "only_n2": true,
+    "frames_not_decoded": null,
+    "sbi_streams_with_undecoded_headers": 0,
+    "narrowed": [],
+    "auto_decode": [],
+    "undecoded_traffic": [],
+    "coverage_notes": []
+  },
+  "network_elements": [
+    {
+      "role": "gNB",
+      "ip": "172.22.0.23",
+      "ports": [
+        35786
+      ],
+      "messages": 15
+    },
+    {
+      "role": "AMF",
+      "ip": "172.22.0.10",
+      "ports": [
+        38412
+      ],
+      "messages": 15
+    }
+  ],
+  "subscribers": [
+    {
+      "supi": "001011234567895",
+      "flows": 1,
+      "messages": 13,
+      "failures": 1,
+      "aliases": [
+        {
+          "kind": "amf_ue_ngap_id",
+          "value": "1",
+          "scope": "172.22.0.10|172.22.0.23"
+        },
+        {
+          "kind": "ran_ue_ngap_id",
+          "value": "1",
+          "scope": "172.22.0.10|172.22.0.23"
+        }
+      ],
+      "pdu_sessions": [
+        {
+          "pdu_session_id": 1,
+          "ue_ipv4": null,
+          "dnn": null,
+          "sst": "01",
+          "5qi": "9",
+          "qfi": "1"
+        }
+      ]
+    }
+  ],
+  "unlinked_identities": [],
+  "procedures": [
+    {
+      "procedure": "registration",
+      "supi": "001011234567895",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 13,
+      "end_frame": 27,
+      "messages": 13,
+      "failures": 1,
+      "duration_s": 0.36,
+      "protocols": [
+        "ngap"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    }
+  ],
+  "failures": [
+    {
+      "frame": 15,
+      "ts": 20.502,
+      "protocol": "ngap",
+      "from": "gNB",
+      "to": "AMF",
+      "message": "UplinkNASTransport ▸ Authentication failure",
+      "supi": "001011234567895",
+      "cause": {
+        "table": "nas_5gmm",
+        "value": 21,
+        "known": true,
+        "name": "Synch failure",
+        "spec": "3GPP TS 24.501",
+        "clause": "§9.11.3.2"
+      },
+      "explanation": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "common_causes": [
+        "The same SIM in use on two core networks at once",
+        "A UDM database rollback that moved SQN backwards"
+      ]
+    }
+  ],
+  "cause_rollup": [
+    {
+      "cause": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "count": 1,
+      "frames": [
+        15
+      ],
+      "supis": [
+        "001011234567895"
+      ]
+    }
+  ]
+}

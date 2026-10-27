@@ -1,0 +1,11 @@
+{
+  "scenario_id": "OIRAN_5G_PDU_SESSION_DATA_V1",
+  "evidence": [
+    {"relationship":"N2 intra-interface","classification":"EXACT","source":"N2 packets 3-17","identifiers":["RAN UE NGAP ID 4","AMF UE NGAP ID 4","PDU Session ID 1"]},
+    {"relationship":"N4 intra-interface","classification":"EXACT","source":"N4 packets 7-10","identifiers":["PFCP sequence 93/94","SMF F-SEID 0x1a8","UPF F-SEID 0x35e"]},
+    {"relationship":"N3 tunnel","classification":"EXACT","source":"N3 packets 1-10","identifiers":["TEID 0x96a8 gNB-to-UPF","TEID 0x3 UPF-to-gNB"]},
+    {"relationship":"N2 to N4","classification":"STRONG","source":"N2 packets 15/17 and N4 packets 8/9","identifiers":["0x96a8 at 10.77.22.13","0x3 at 10.77.22.20"]},
+    {"relationship":"N4 to N3","classification":"EXACT","source":"N4 packets 8/9 and N3 packets 1-10","identifiers":["same directional TEIDs","same gNB/UPF endpoints"]},
+    {"relationship":"N2 to N4 to N3","classification":"STRONG","source":"all three captures plus unchanged UE/NF lifetimes","identifiers":["paired TEIDs and endpoints","PDU Session ID 1","no session-owner restart"]}
+  ]
+}

@@ -1,0 +1,53 @@
+sequenceDiagram
+    autonumber
+    participant SMF
+    participant UPF
+    Note over UPF,UPF: Unidentified flow
+    UPF->>SMF: #35;1 Heartbeat Request
+    SMF->>UPF: #35;2 Heartbeat Response
+    SMF->>UPF: #35;3 Heartbeat Request
+    UPF->>SMF: #35;4 Heartbeat Response
+    UPF->>SMF: #35;11 Heartbeat Request
+    SMF->>UPF: #35;12 Heartbeat Response
+    SMF->>UPF: #35;13 Heartbeat Request
+    UPF->>SMF: #35;14 Heartbeat Response
+    UPF->>SMF: #35;15 Heartbeat Request
+    SMF->>UPF: #35;16 Heartbeat Response
+    SMF->>UPF: #35;17 Heartbeat Request
+    UPF->>SMF: #35;18 Heartbeat Response
+    UPF->>SMF: #35;19 Heartbeat Request
+    SMF->>UPF: #35;20 Heartbeat Response
+    SMF->>UPF: #35;21 Heartbeat Request
+    UPF->>SMF: #35;22 Heartbeat Response
+    UPF->>SMF: #35;23 Heartbeat Request
+    SMF->>UPF: #35;24 Heartbeat Response
+    SMF->>UPF: #35;25 Heartbeat Request
+    UPF->>SMF: #35;26 Heartbeat Response
+    UPF->>SMF: #35;27 Heartbeat Request
+    SMF->>UPF: #35;28 Heartbeat Response
+    SMF->>UPF: #35;29 Heartbeat Request
+    UPF->>SMF: #35;30 Heartbeat Response
+
+sequenceDiagram
+    autonumber
+    participant SMF
+    participant UPF
+    Note over SMF,UPF: PDU session 1504
+    SMF->>UPF: #35;5 Session Deletion Request
+
+sequenceDiagram
+    autonumber
+    participant SMF
+    participant UPF
+    Note over UPF,UPF: PDU session 1144
+    UPF->>SMF: #35;6 Session Deletion Response
+
+sequenceDiagram
+    autonumber
+    participant SMF
+    participant UPF
+    Note over SMF,UPF: PDU session 862
+    SMF->>UPF: #35;7 Session Establishment Request
+    UPF->>SMF: #35;8 Session Establishment Response
+    SMF->>UPF: #35;9 Session Modification Request
+    UPF->>SMF: #35;10 Session Modification Response

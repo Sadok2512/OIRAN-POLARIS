@@ -1,0 +1,26 @@
+{
+  "project": "OIRAN",
+  "mission": "CONTROLLED_FOUR_PLANE_LIVE_E2E_VALIDATION",
+  "test_id": "OIRAN-E2E-001",
+  "phase": "PREFLIGHT_ONLY",
+  "operator_approval": "NOT_GRANTED",
+  "live_execution_authorized": false,
+  "live_capture_executed": false,
+  "simulator_started": false,
+  "traffic_generated": false,
+  "ue_target": "UE-04",
+  "ue04_provisioning_attestation": "PASS_READ_ONLY",
+  "ue04_current_configuration": "NOT_CONFIGURED",
+  "traffic_targeting": "BLOCKED_FIXED_TO_SHARED_UE01_NAMESPACE",
+  "capture_readiness": {
+    "ng_c": "READY",
+    "sbi": "READY",
+    "n4": "READY",
+    "ng_u": "READY"
+  },
+  "disk_usage_percent": 62.68,
+  "resource_safety": "BLOCKED_CPU_CONTENTION",
+  "dataset_registered": false,
+  "e2e_session_certified": false,
+  "final_status": "BLOCKED"
+}

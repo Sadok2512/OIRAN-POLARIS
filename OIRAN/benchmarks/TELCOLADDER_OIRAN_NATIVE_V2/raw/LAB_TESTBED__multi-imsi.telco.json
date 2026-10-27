@@ -1,0 +1,698 @@
+{
+  "summary_version": 1,
+  "source": "multi-imsi.pcap",
+  "capture": {
+    "frames_total": null,
+    "frames_decoded": 1031,
+    "messages": 1031,
+    "flows": 15,
+    "duration_s": null,
+    "signalling_span_s": 110.042,
+    "started_at": "2026-08-17T16:37:07.438000+00:00",
+    "protocols": [
+      "nas-5gs",
+      "ngap",
+      "pfcp",
+      "sbi"
+    ]
+  },
+  "not_visible": {
+    "ciphered_nas": 30,
+    "ecies_protected_suci": 0,
+    "only_n2": false,
+    "frames_not_decoded": null,
+    "sbi_streams_with_undecoded_headers": 62,
+    "narrowed": [],
+    "auto_decode": [],
+    "undecoded_traffic": [],
+    "coverage_notes": []
+  },
+  "network_elements": [
+    {
+      "role": "gNB",
+      "ip": "172.22.0.23",
+      "ports": [
+        34314
+      ],
+      "messages": 65
+    },
+    {
+      "role": "AMF",
+      "ip": "172.22.0.10",
+      "ports": [
+        7777,
+        32994,
+        38412
+      ],
+      "messages": 204
+    },
+    {
+      "role": "SCP",
+      "ip": "172.22.0.35",
+      "ports": [
+        7777,
+        33442,
+        35550,
+        46298,
+        46428,
+        46958,
+        49678,
+        51822,
+        58918
+      ],
+      "messages": 904
+    },
+    {
+      "role": "AUSF",
+      "ip": "172.22.0.11",
+      "ports": [
+        7777,
+        48292
+      ],
+      "messages": 77
+    },
+    {
+      "role": "UDM",
+      "ip": "172.22.0.13",
+      "ports": [
+        7777,
+        54984
+      ],
+      "messages": 184
+    },
+    {
+      "role": "UDR",
+      "ip": "172.22.0.14",
+      "ports": [
+        7777,
+        37358
+      ],
+      "messages": 101
+    },
+    {
+      "role": "PCF",
+      "ip": "172.22.0.27",
+      "ports": [
+        7777,
+        55424
+      ],
+      "messages": 65
+    },
+    {
+      "role": "BSF",
+      "ip": "172.22.0.29",
+      "ports": [
+        7777,
+        60028
+      ],
+      "messages": 23
+    },
+    {
+      "role": "NRF",
+      "ip": "172.22.0.12",
+      "ports": [
+        7777
+      ],
+      "messages": 194
+    },
+    {
+      "role": "SMF",
+      "ip": "172.22.0.7",
+      "ports": [
+        7777,
+        8805,
+        59476
+      ],
+      "messages": 172
+    },
+    {
+      "role": "UPF",
+      "ip": "172.22.0.8",
+      "ports": [
+        8805
+      ],
+      "messages": 62
+    },
+    {
+      "role": null,
+      "ip": "172.22.0.28",
+      "ports": [
+        39170
+      ],
+      "messages": 11
+    }
+  ],
+  "subscribers": [
+    {
+      "supi": "001011234567894",
+      "flows": 1,
+      "messages": 107,
+      "failures": 1,
+      "aliases": [
+        {
+          "kind": "amf_ue_ngap_id",
+          "value": "7",
+          "scope": "172.22.0.10|172.22.0.23"
+        },
+        {
+          "kind": "ran_ue_ngap_id",
+          "value": "7",
+          "scope": "172.22.0.10|172.22.0.23"
+        }
+      ],
+      "pdu_sessions": [
+        {
+          "pdu_session_id": 1,
+          "ue_ipv4": "192.168.100.8",
+          "dnn": "internet",
+          "sst": "1",
+          "5qi": "9",
+          "qfi": "1"
+        }
+      ]
+    },
+    {
+      "supi": "001011234567891",
+      "flows": 1,
+      "messages": 105,
+      "failures": 1,
+      "aliases": [
+        {
+          "kind": "amf_ue_ngap_id",
+          "value": "4",
+          "scope": "172.22.0.10|172.22.0.23"
+        },
+        {
+          "kind": "ran_ue_ngap_id",
+          "value": "4",
+          "scope": "172.22.0.10|172.22.0.23"
+        }
+      ],
+      "pdu_sessions": [
+        {
+          "pdu_session_id": 1,
+          "ue_ipv4": "192.168.100.5",
+          "dnn": "internet",
+          "sst": "1",
+          "5qi": "9",
+          "qfi": "1"
+        }
+      ]
+    },
+    {
+      "supi": "001011234567892",
+      "flows": 1,
+      "messages": 105,
+      "failures": 1,
+      "aliases": [
+        {
+          "kind": "amf_ue_ngap_id",
+          "value": "5",
+          "scope": "172.22.0.10|172.22.0.23"
+        },
+        {
+          "kind": "ran_ue_ngap_id",
+          "value": "5",
+          "scope": "172.22.0.10|172.22.0.23"
+        }
+      ],
+      "pdu_sessions": [
+        {
+          "pdu_session_id": 1,
+          "ue_ipv4": "192.168.100.6",
+          "dnn": "internet",
+          "sst": "1",
+          "5qi": "9",
+          "qfi": "1"
+        }
+      ]
+    },
+    {
+      "supi": "001011234567893",
+      "flows": 1,
+      "messages": 105,
+      "failures": 1,
+      "aliases": [
+        {
+          "kind": "amf_ue_ngap_id",
+          "value": "6",
+          "scope": "172.22.0.10|172.22.0.23"
+        },
+        {
+          "kind": "ran_ue_ngap_id",
+          "value": "6",
+          "scope": "172.22.0.10|172.22.0.23"
+        }
+      ],
+      "pdu_sessions": [
+        {
+          "pdu_session_id": 1,
+          "ue_ipv4": "192.168.100.7",
+          "dnn": "internet",
+          "sst": "1",
+          "5qi": "9",
+          "qfi": "1"
+        }
+      ]
+    },
+    {
+      "supi": "001011234567895",
+      "flows": 1,
+      "messages": 105,
+      "failures": 0,
+      "aliases": [
+        {
+          "kind": "amf_ue_ngap_id",
+          "value": "8",
+          "scope": "172.22.0.10|172.22.0.23"
+        },
+        {
+          "kind": "ran_ue_ngap_id",
+          "value": "8",
+          "scope": "172.22.0.10|172.22.0.23"
+        }
+      ],
+      "pdu_sessions": [
+        {
+          "pdu_session_id": 1,
+          "ue_ipv4": "192.168.100.9",
+          "dnn": "internet",
+          "sst": "1",
+          "5qi": "9",
+          "qfi": "1"
+        }
+      ]
+    }
+  ],
+  "unlinked_identities": [
+    {
+      "kind": "amf_ue_ngap_id",
+      "value": "3",
+      "scope": "172.22.0.10|172.22.0.23",
+      "messages": 2,
+      "failures": 0
+    },
+    {
+      "kind": "pfcp_seid",
+      "value": "1170",
+      "scope": "172.22.0.7|172.22.0.8",
+      "messages": 1,
+      "failures": 0
+    },
+    {
+      "kind": "pfcp_seid",
+      "value": "3241",
+      "scope": "172.22.0.7|172.22.0.8",
+      "messages": 1,
+      "failures": 0
+    },
+    {
+      "kind": "ran_ue_ngap_id",
+      "value": "3",
+      "scope": "172.22.0.10|172.22.0.23",
+      "messages": 2,
+      "failures": 0
+    },
+    {
+      "kind": "sm_context_ref",
+      "value": "3",
+      "scope": "172.22.0.35:7777",
+      "messages": 2,
+      "failures": 0
+    },
+    {
+      "kind": "sm_context_ref",
+      "value": "5",
+      "scope": "172.22.0.35:7777",
+      "messages": 2,
+      "failures": 0
+    },
+    {
+      "kind": "sm_context_ref",
+      "value": "6",
+      "scope": "172.22.0.35:7777",
+      "messages": 2,
+      "failures": 0
+    },
+    {
+      "kind": "sm_context_ref",
+      "value": "7",
+      "scope": "172.22.0.35:7777",
+      "messages": 2,
+      "failures": 0
+    },
+    {
+      "kind": "sm_context_ref",
+      "value": "8",
+      "scope": "172.22.0.35:7777",
+      "messages": 2,
+      "failures": 0
+    },
+    {
+      "kind": "sm_context_ref",
+      "value": "3",
+      "scope": "172.22.0.7:7777",
+      "messages": 2,
+      "failures": 0
+    }
+  ],
+  "procedures": [
+    {
+      "procedure": "registration",
+      "supi": "001011234567891",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 105,
+      "end_frame": 362,
+      "messages": 62,
+      "failures": 1,
+      "duration_s": 0.234,
+      "protocols": [
+        "ngap",
+        "sbi"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    },
+    {
+      "procedure": "pdu-session-establishment",
+      "supi": "001011234567891",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 363,
+      "end_frame": 533,
+      "messages": 43,
+      "failures": 0,
+      "duration_s": 0.03,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "pfcp",
+        "sbi"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    },
+    {
+      "procedure": "registration",
+      "supi": "001011234567892",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 723,
+      "end_frame": 923,
+      "messages": 62,
+      "failures": 1,
+      "duration_s": 0.233,
+      "protocols": [
+        "ngap",
+        "sbi"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    },
+    {
+      "procedure": "pdu-session-establishment",
+      "supi": "001011234567892",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 924,
+      "end_frame": 1046,
+      "messages": 43,
+      "failures": 0,
+      "duration_s": 0.011,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "pfcp",
+        "sbi"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    },
+    {
+      "procedure": "registration",
+      "supi": "001011234567893",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 1251,
+      "end_frame": 1441,
+      "messages": 62,
+      "failures": 1,
+      "duration_s": 0.233,
+      "protocols": [
+        "ngap",
+        "sbi"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    },
+    {
+      "procedure": "pdu-session-establishment",
+      "supi": "001011234567893",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 1442,
+      "end_frame": 1564,
+      "messages": 43,
+      "failures": 0,
+      "duration_s": 0.01,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "pfcp",
+        "sbi"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    },
+    {
+      "procedure": "registration",
+      "supi": "001011234567894",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 1799,
+      "end_frame": 1989,
+      "messages": 64,
+      "failures": 1,
+      "duration_s": 0.234,
+      "protocols": [
+        "ngap",
+        "sbi"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    },
+    {
+      "procedure": "pdu-session-establishment",
+      "supi": "001011234567894",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 1990,
+      "end_frame": 2112,
+      "messages": 43,
+      "failures": 0,
+      "duration_s": 0.014,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "pfcp",
+        "sbi"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    },
+    {
+      "procedure": "registration",
+      "supi": "001011234567895",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 2309,
+      "end_frame": 2493,
+      "messages": 62,
+      "failures": 0,
+      "duration_s": 0.235,
+      "protocols": [
+        "ngap",
+        "sbi"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    },
+    {
+      "procedure": "ue-context-release",
+      "supi": null,
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 2421,
+      "end_frame": 2423,
+      "messages": 2,
+      "failures": 0,
+      "duration_s": 0.0,
+      "protocols": [
+        "ngap"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    },
+    {
+      "procedure": "pdu-session-establishment",
+      "supi": "001011234567895",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 2494,
+      "end_frame": 2614,
+      "messages": 43,
+      "failures": 0,
+      "duration_s": 0.012,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "pfcp",
+        "sbi"
+      ],
+      "note": "",
+      "cause_ref": null,
+      "root_cause_ref": null
+    }
+  ],
+  "failures": [
+    {
+      "frame": 193,
+      "ts": 11.408,
+      "protocol": "ngap",
+      "from": "gNB",
+      "to": "AMF",
+      "message": "UplinkNASTransport ▸ Authentication failure",
+      "supi": "001011234567891",
+      "cause": {
+        "table": "nas_5gmm",
+        "value": 21,
+        "known": true,
+        "name": "Synch failure",
+        "spec": "3GPP TS 24.501",
+        "clause": "§9.11.3.2"
+      },
+      "explanation": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "common_causes": [
+        "The same SIM in use on two core networks at once",
+        "A UDM database rollback that moved SQN backwards"
+      ]
+    },
+    {
+      "frame": 761,
+      "ts": 33.764,
+      "protocol": "ngap",
+      "from": "gNB",
+      "to": "AMF",
+      "message": "UplinkNASTransport ▸ Authentication failure",
+      "supi": "001011234567892",
+      "cause": {
+        "table": "nas_5gmm",
+        "value": 21,
+        "known": true,
+        "name": "Synch failure",
+        "spec": "3GPP TS 24.501",
+        "clause": "§9.11.3.2"
+      },
+      "explanation": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "common_causes": [
+        "The same SIM in use on two core networks at once",
+        "A UDM database rollback that moved SQN backwards"
+      ]
+    },
+    {
+      "frame": 1289,
+      "ts": 56.148,
+      "protocol": "ngap",
+      "from": "gNB",
+      "to": "AMF",
+      "message": "UplinkNASTransport ▸ Authentication failure",
+      "supi": "001011234567893",
+      "cause": {
+        "table": "nas_5gmm",
+        "value": 21,
+        "known": true,
+        "name": "Synch failure",
+        "spec": "3GPP TS 24.501",
+        "clause": "§9.11.3.2"
+      },
+      "explanation": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "common_causes": [
+        "The same SIM in use on two core networks at once",
+        "A UDM database rollback that moved SQN backwards"
+      ]
+    },
+    {
+      "frame": 1837,
+      "ts": 78.532,
+      "protocol": "ngap",
+      "from": "gNB",
+      "to": "AMF",
+      "message": "UplinkNASTransport ▸ Authentication failure",
+      "supi": "001011234567894",
+      "cause": {
+        "table": "nas_5gmm",
+        "value": 21,
+        "known": true,
+        "name": "Synch failure",
+        "spec": "3GPP TS 24.501",
+        "clause": "§9.11.3.2"
+      },
+      "explanation": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "common_causes": [
+        "The same SIM in use on two core networks at once",
+        "A UDM database rollback that moved SQN backwards"
+      ]
+    }
+  ],
+  "cause_rollup": [
+    {
+      "cause": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "count": 4,
+      "frames": [
+        193,
+        761,
+        1289,
+        1837
+      ],
+      "supis": [
+        "001011234567891",
+        "001011234567892",
+        "001011234567893",
+        "001011234567894"
+      ]
+    }
+  ]
+}

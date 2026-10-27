@@ -1,0 +1,50 @@
+{
+  "summary_version": 1,
+  "source": "N4.pcap",
+  "capture": {
+    "frames_total": null,
+    "frames_decoded": 20,
+    "messages": 20,
+    "flows": 1,
+    "duration_s": null,
+    "signalling_span_s": 44.015,
+    "started_at": "2026-10-26T14:25:56.785000+00:00",
+    "protocols": [
+      "pfcp"
+    ]
+  },
+  "not_visible": {
+    "ciphered_nas": 0,
+    "ecies_protected_suci": 0,
+    "only_n2": false,
+    "frames_not_decoded": null,
+    "sbi_streams_with_undecoded_headers": 0,
+    "narrowed": [],
+    "auto_decode": [],
+    "undecoded_traffic": [],
+    "coverage_notes": []
+  },
+  "network_elements": [
+    {
+      "role": null,
+      "ip": "10.77.23.12",
+      "ports": [
+        8805
+      ],
+      "messages": 20
+    },
+    {
+      "role": null,
+      "ip": "10.77.23.13",
+      "ports": [
+        8805
+      ],
+      "messages": 20
+    }
+  ],
+  "subscribers": [],
+  "unlinked_identities": [],
+  "procedures": [],
+  "failures": [],
+  "cause_rollup": []
+}

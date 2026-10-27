@@ -1,0 +1,39 @@
+{
+  "project": "OIRAN",
+  "version": "2.0.0-dev",
+  "branch": "feat/v2-premium-analyzer",
+  "base_commit": "7cdc0d2879afa6dcda848f1216b8d70b979a738f",
+  "git_commit": "RECORDED_IN_FINAL_REPORT",
+  "components": {
+    "backend_api": "2.0.0",
+    "web_frontend": "2.0.0-dev",
+    "event_schema": "1.2.0",
+    "callflow_schema": "1.0.0",
+    "session_engine": "0.2.0",
+    "correlation_engine": "0.2.0",
+    "decoder_ngap": "0.2.0",
+    "decoder_pfcp": "0.2.0",
+    "decoder_gtpu": "0.1.0"
+  },
+  "certification": {
+    "ui_implemented": true,
+    "backend_integrated": true,
+    "live_capture_validated": false,
+    "decoder_regression_passed": true,
+    "distributed_probe_validated": false
+  },
+  "dataset": {
+    "id": "OIRAN_5G_PDU_SESSION_DATA_V1",
+    "source_events": 54,
+    "session_events": 26,
+    "background_events": 28,
+    "correlation_edges": 12,
+    "callflow_sha256": "bc89ddd79d23af2ad53a5bc0b46e69c988fbc02d69b92c9462ece760b27432cb"
+  },
+  "build_checksums": {
+    "oiran_api": "4a17ecf9c696cb18f67b82d4d91d237b8f5d08dd594202201ca71e48c85c5040",
+    "frontend_index": "65e5c0f4238cfa7aa202d168616b89b698d6dd1d103ec8bbe424defa338748ca",
+    "frontend_css": "88a5ff1882aeed8936a3761687ff40fbde221b586223273e67e060a852c8288c",
+    "frontend_javascript": "3c1076650fceec1facfc35bd3637ef80fbe74f26068daa5bf783694e042c6d02"
+  }
+}

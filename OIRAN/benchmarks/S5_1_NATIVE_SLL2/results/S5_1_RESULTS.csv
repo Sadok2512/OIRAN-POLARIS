@@ -1,0 +1,8 @@
+dataset,sha256,packets,oiran_messages,messages_exact,messages_mismatched,nas_messages_missing,telcoladder_messages,telcoladder_count_parity,partial_events,provenance_failures,timestamp_failures,endpoint_failures,ue_contexts,pdu_sessions,pfcp_sessions,gtpu_tunnels,duplicate_observations
+5gc-e2e,74f36548a60e1fe2e105d3a6a8e07e67d8a877bad1743c9f03c9a0d3d824f283,626,28,28,0,8,177,NOT_COMPARABLE,11,0,0,0,2,1,2,0,0
+5gc-registration,b6ace8e6eb7a0bae835e5291d69adf250ab9d38308e2dde1349364d4d6a91f83,44,16,16,0,6,15,NOT_COMPARABLE,15,0,0,0,1,1,0,0,0
+ki-mismatch,134d5730047459d8bedb72e51800991affb85c6c0d24dd602e6ddf391a0aa4cb,13,4,4,0,4,4,NOT_COMPARABLE,4,0,0,0,1,0,0,0,0
+multi-imsi,a55fd3ffdc0bfaa0b62ff2f7697113584bba6547f4e0be32ca07023bdfc35d5d,2710,132,132,0,48,1031,NOT_COMPARABLE,63,0,0,0,6,5,6,0,0
+supi-not-provisioned,e815d4633a4972bb311ce356cabab94c66d792d13f9eb31db1b35e07dca6c58e,12,4,4,0,2,4,NOT_COMPARABLE,2,0,0,0,1,0,0,0,0
+unknown-dnn,3de425bd925b483c3a70cc172553d3d3653cdedea96312eb0981f2b6d40bb96b,22,13,13,0,4,12,NOT_COMPARABLE,10,0,0,0,2,0,0,0,0
+userplane,08cd12bd66b9524f428097bb8fd3c07eb77f41bd7f0008a5315a04a3da739404,648,42,42,0,7,198,NOT_COMPARABLE,11,0,0,0,2,1,2,1,0

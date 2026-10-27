@@ -1,0 +1,19 @@
+{
+  "project": "POLARIS_CONTROL",
+  "mission": "RELEASE_INTEGRATION_AND_REGRESSION_CORRECTION",
+  "generated_at": "2026-10-27T00:12:47Z",
+  "branch": "feat/e2e-002-release-stabilization",
+  "source_fix_commit": "c0a4369006b5b039110e2ef773a9d48a6b295450",
+  "v3_2_lineage_preserved": true,
+  "cpu_decision_evidence_preserved": true,
+  "tests": {
+    "rust": {"passed": 88, "failed": 0},
+    "api": {"passed": 54, "failed": 0},
+    "frontend": {"passed": 5, "failed": 0},
+    "browser": {"passed": 20, "failed": 0, "skipped": 0},
+    "authenticated_browser": {"passed": 3, "failed": 0, "skipped": 0}
+  },
+  "production_changed": false,
+  "live_execution": false,
+  "credentials_committed": false
+}

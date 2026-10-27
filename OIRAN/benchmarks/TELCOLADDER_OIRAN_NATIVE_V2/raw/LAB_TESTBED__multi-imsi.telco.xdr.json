@@ -1,0 +1,239 @@
+{
+  "xdr_version": 1,
+  "source": "multi-imsi.pcap",
+  "procedures": [
+    {
+      "procedure": "registration",
+      "supi": "001011234567891",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 105,
+      "end_frame": 362,
+      "messages": 68,
+      "failures": 1,
+      "duration_s": 0.234,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "sbi"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "pdu-session-establishment",
+      "supi": "001011234567891",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 363,
+      "end_frame": 533,
+      "messages": 43,
+      "failures": 0,
+      "duration_s": 0.03,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "pfcp",
+        "sbi"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "registration",
+      "supi": "001011234567892",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 723,
+      "end_frame": 923,
+      "messages": 68,
+      "failures": 1,
+      "duration_s": 0.233,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "sbi"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "pdu-session-establishment",
+      "supi": "001011234567892",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 924,
+      "end_frame": 1046,
+      "messages": 43,
+      "failures": 0,
+      "duration_s": 0.011,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "pfcp",
+        "sbi"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "registration",
+      "supi": "001011234567893",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 1251,
+      "end_frame": 1441,
+      "messages": 68,
+      "failures": 1,
+      "duration_s": 0.233,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "sbi"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "pdu-session-establishment",
+      "supi": "001011234567893",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 1442,
+      "end_frame": 1564,
+      "messages": 43,
+      "failures": 0,
+      "duration_s": 0.01,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "pfcp",
+        "sbi"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "registration",
+      "supi": "001011234567894",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 1799,
+      "end_frame": 1989,
+      "messages": 70,
+      "failures": 1,
+      "duration_s": 0.234,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "sbi"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "pdu-session-establishment",
+      "supi": "001011234567894",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 1990,
+      "end_frame": 2112,
+      "messages": 43,
+      "failures": 0,
+      "duration_s": 0.014,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "pfcp",
+        "sbi"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "registration",
+      "supi": "001011234567895",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 2309,
+      "end_frame": 2493,
+      "messages": 66,
+      "failures": 0,
+      "duration_s": 0.235,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "sbi"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "ue-context-release",
+      "supi": null,
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 2421,
+      "end_frame": 2423,
+      "messages": 2,
+      "failures": 0,
+      "duration_s": 0.0,
+      "protocols": [
+        "ngap"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "pdu-session-establishment",
+      "supi": "001011234567895",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 2494,
+      "end_frame": 2614,
+      "messages": 43,
+      "failures": 0,
+      "duration_s": 0.012,
+      "protocols": [
+        "nas-5gs",
+        "ngap",
+        "pfcp",
+        "sbi"
+      ],
+      "note": ""
+    }
+  ],
+  "messages_total": 1064,
+  "messages_in_procedures": 557,
+  "messages_unassigned": 507,
+  "cause_rollup": [
+    {
+      "cause": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "count": 4,
+      "frames": [
+        193,
+        761,
+        1289,
+        1837
+      ],
+      "supis": [
+        "001011234567891",
+        "001011234567892",
+        "001011234567893",
+        "001011234567894"
+      ]
+    }
+  ]
+}

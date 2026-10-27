@@ -1,0 +1,12 @@
+{
+  "scenario_id": "OIRAN_5G_PDU_SESSION_DATA_V1",
+  "sequence": [
+    {"phase":1,"interface":"N2","events":"Initial UE and NAS transport","key":"RAN/AMF UE NGAP ID 4"},
+    {"phase":2,"interface":"N2","events":"Initial Context Setup","key":"RAN/AMF UE NGAP ID 4"},
+    {"phase":3,"interface":"N4","events":"PFCP Session Establishment Request/Response","key":"F-SEID 0x1a8/0x35e; uplink TEID 0x96a8"},
+    {"phase":4,"interface":"N2","events":"PDU Session Resource Setup Request/Response","key":"PDU Session ID 1; TEID 0x96a8/0x3"},
+    {"phase":5,"interface":"N4","events":"PFCP Session Modification Request/Response","key":"downlink TEID 0x3 at gNB 10.77.22.20"},
+    {"phase":6,"interface":"N3","events":"five uplink G-PDUs","key":"TEID 0x96a8, gNB to UPF"},
+    {"phase":7,"interface":"N3","events":"five downlink G-PDUs carrying ICMP errors","key":"TEID 0x3, UPF to gNB"}
+  ]
+}

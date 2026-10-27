@@ -1,0 +1,20 @@
+{
+  "project": "POLARIS_CONTROL",
+  "mission": "RELEASE_CONSOLIDATION_V1",
+  "source_commit": "836196e8bb372bd3cc2bcb39f048ff43af3544b2",
+  "candidate_base": "ddbc53f703cc1e4f8dce3cba1fd4310c3233368d",
+  "build_date_utc": "2026-10-27",
+  "toolchain": {"rustc": "1.75.0", "cargo": "1.75.0", "node": "22.23.4", "npm": "9.2.0"},
+  "locks": {
+    "Cargo.lock": "4fb38bb19e57399c162b59285578f75c53ab5582f62f1567df0ab832ca371b15",
+    "apps/web/package-lock.json": "54121be4245fba9064dc242a979a308968b84a4d258d6a8e3da8002d2780f397"
+  },
+  "artifacts": {
+    "polaris-control-api": "0a276b96182fea8c8ae424a469df85ca848b091ac014b0be7773f61cc1658eff",
+    "frontend_tree": "020e95220b1f6664a7ea480683c65b2ad3b90fe3e576aab8177bef5309970d3c"
+  },
+  "tests": {"rust": "88/88 PASS", "api": "54/54 PASS", "frontend": "5/5 PASS", "e2e": "20/20 PASS"},
+  "reproducibility": {"polaris-control-api": "BYTE_IDENTICAL", "frontend_files": "BYTE_IDENTICAL"},
+  "production_changed": false,
+  "live_execution": false
+}

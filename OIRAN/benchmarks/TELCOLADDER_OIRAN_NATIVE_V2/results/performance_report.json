@@ -1,0 +1,1114 @@
+{
+  "benchmark": "TELCOLADDER_OIRAN_NATIVE_BENCHMARK_V2",
+  "method": {
+    "warmup_runs": 1,
+    "measured_runs": 3,
+    "corpus_files": 13,
+    "corpus_bytes": 758864,
+    "corpus_packets": 4205,
+    "same_host": true,
+    "oiran_phase_detail": "decode/normalize total only; session reconstruction is a separate S3.3 artifact and is not exposed by this CLI",
+    "telcoladder_phase_detail": "summarize total only; internal parsing/reconstruction timers are not exposed by v0.1.0",
+    "tshark_phase_detail": "dissection only; no session reconstruction",
+    "tshark_isolation": "TShark 4.2.2 invoked inside the existing lab container through a stdin-streaming wrapper",
+    "memory_caveat": "TShark/TelcoLadder peak RSS records the host process only and excludes the containerized TShark worker"
+  },
+  "aggregates": {
+    "oiran": {
+      "runs": 3,
+      "warmup_runs": 1,
+      "median_total_seconds": 0.07,
+      "min_total_seconds": 0.07,
+      "max_total_seconds": 0.07,
+      "median_packets_per_second": 60071.428571428565,
+      "peak_rss_kib_observed": 3968,
+      "all_return_codes_zero": true
+    },
+    "telcoladder": {
+      "runs": 3,
+      "warmup_runs": 1,
+      "median_total_seconds": 100.35,
+      "min_total_seconds": 98.79,
+      "max_total_seconds": 102.48,
+      "median_packets_per_second": 41.90333831589437,
+      "peak_rss_kib_observed": 28672,
+      "all_return_codes_zero": true
+    },
+    "tshark": {
+      "runs": 3,
+      "warmup_runs": 1,
+      "median_total_seconds": 14.36,
+      "min_total_seconds": 14.2,
+      "max_total_seconds": 14.76,
+      "median_packets_per_second": 292.8272980501393,
+      "peak_rss_kib_observed": 28288,
+      "all_return_codes_zero": true
+    }
+  },
+  "performance_ratio": {
+    "status": "NOT_COMPARABLE",
+    "reason": "TShark/TelcoLadder include Docker exec and stdin transport overhead, and container worker RSS is not observable from the host wrapper",
+    "wall_clock_ratios_for_context_only": {
+      "telcoladder_over_oiran": 1433.5714285714284,
+      "tshark_over_oiran": 205.1428571428571
+    }
+  },
+  "runs": [
+    {
+      "engine": "oiran",
+      "iteration": 0,
+      "warmup": true,
+      "total_seconds": 0.07,
+      "peak_rss_kib": 3968,
+      "all_return_codes_zero": true,
+      "per_capture": [
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-e2e.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.01,
+          "peak_rss_kib": 2688
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-registration.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/ki-mismatch.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/multi-imsi.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.05,
+          "peak_rss_kib": 3968
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/supi-not-provisioned.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/unknown-dnn.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/userplane.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.01,
+          "peak_rss_kib": 2688
+        },
+        {
+          "capture": "corpus/OIRAN_A/N2.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_A/N3.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_A/N4.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2432
+        },
+        {
+          "capture": "corpus/OIRAN_B/N2.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_B/N3.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2176
+        },
+        {
+          "capture": "corpus/OIRAN_B/N4.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        }
+      ]
+    },
+    {
+      "engine": "oiran",
+      "iteration": 1,
+      "warmup": false,
+      "total_seconds": 0.07,
+      "peak_rss_kib": 3840,
+      "all_return_codes_zero": true,
+      "per_capture": [
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-e2e.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.01,
+          "peak_rss_kib": 2688
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-registration.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2176
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/ki-mismatch.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/multi-imsi.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.05,
+          "peak_rss_kib": 3840
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/supi-not-provisioned.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/unknown-dnn.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/userplane.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.01,
+          "peak_rss_kib": 2688
+        },
+        {
+          "capture": "corpus/OIRAN_A/N2.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2432
+        },
+        {
+          "capture": "corpus/OIRAN_A/N3.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_A/N4.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2432
+        },
+        {
+          "capture": "corpus/OIRAN_B/N2.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_B/N3.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_B/N4.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        }
+      ]
+    },
+    {
+      "engine": "oiran",
+      "iteration": 2,
+      "warmup": false,
+      "total_seconds": 0.07,
+      "peak_rss_kib": 3968,
+      "all_return_codes_zero": true,
+      "per_capture": [
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-e2e.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.01,
+          "peak_rss_kib": 2688
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-registration.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/ki-mismatch.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/multi-imsi.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.05,
+          "peak_rss_kib": 3968
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/supi-not-provisioned.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/unknown-dnn.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/userplane.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.01,
+          "peak_rss_kib": 2688
+        },
+        {
+          "capture": "corpus/OIRAN_A/N2.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_A/N3.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_A/N4.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2432
+        },
+        {
+          "capture": "corpus/OIRAN_B/N2.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_B/N3.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_B/N4.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        }
+      ]
+    },
+    {
+      "engine": "oiran",
+      "iteration": 3,
+      "warmup": false,
+      "total_seconds": 0.07,
+      "peak_rss_kib": 3968,
+      "all_return_codes_zero": true,
+      "per_capture": [
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-e2e.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.01,
+          "peak_rss_kib": 2688
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-registration.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/ki-mismatch.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/multi-imsi.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.05,
+          "peak_rss_kib": 3968
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/supi-not-provisioned.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/unknown-dnn.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/userplane.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.01,
+          "peak_rss_kib": 2688
+        },
+        {
+          "capture": "corpus/OIRAN_A/N2.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_A/N3.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_A/N4.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2432
+        },
+        {
+          "capture": "corpus/OIRAN_B/N2.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_B/N3.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        },
+        {
+          "capture": "corpus/OIRAN_B/N4.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.0,
+          "peak_rss_kib": 2304
+        }
+      ]
+    },
+    {
+      "engine": "telcoladder",
+      "iteration": 0,
+      "warmup": true,
+      "total_seconds": 96.34,
+      "peak_rss_kib": 28416,
+      "all_return_codes_zero": true,
+      "per_capture": [
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-e2e.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.82,
+          "peak_rss_kib": 28288
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-registration.pcap",
+          "return_code": 0,
+          "wall_seconds": 6.88,
+          "peak_rss_kib": 28416
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/ki-mismatch.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.06,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/multi-imsi.pcap",
+          "return_code": 0,
+          "wall_seconds": 11.3,
+          "peak_rss_kib": 28416
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/supi-not-provisioned.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.19,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/unknown-dnn.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.36,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/userplane.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.7,
+          "peak_rss_kib": 27776
+        },
+        {
+          "capture": "corpus/OIRAN_A/N2.pcapng",
+          "return_code": 0,
+          "wall_seconds": 6.56,
+          "peak_rss_kib": 28160
+        },
+        {
+          "capture": "corpus/OIRAN_A/N3.pcapng",
+          "return_code": 0,
+          "wall_seconds": 6.68,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_A/N4.pcapng",
+          "return_code": 0,
+          "wall_seconds": 6.79,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_B/N2.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.03,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_B/N3.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.19,
+          "peak_rss_kib": 28416
+        },
+        {
+          "capture": "corpus/OIRAN_B/N4.pcap",
+          "return_code": 0,
+          "wall_seconds": 6.78,
+          "peak_rss_kib": 27904
+        }
+      ]
+    },
+    {
+      "engine": "telcoladder",
+      "iteration": 1,
+      "warmup": false,
+      "total_seconds": 100.35,
+      "peak_rss_kib": 28416,
+      "all_return_codes_zero": true,
+      "per_capture": [
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-e2e.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.78,
+          "peak_rss_kib": 28160
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-registration.pcap",
+          "return_code": 0,
+          "wall_seconds": 6.89,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/ki-mismatch.pcap",
+          "return_code": 0,
+          "wall_seconds": 6.66,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/multi-imsi.pcap",
+          "return_code": 0,
+          "wall_seconds": 10.83,
+          "peak_rss_kib": 28416
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/supi-not-provisioned.pcap",
+          "return_code": 0,
+          "wall_seconds": 6.98,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/unknown-dnn.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.99,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/userplane.pcap",
+          "return_code": 0,
+          "wall_seconds": 8.62,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_A/N2.pcapng",
+          "return_code": 0,
+          "wall_seconds": 7.38,
+          "peak_rss_kib": 27648
+        },
+        {
+          "capture": "corpus/OIRAN_A/N3.pcapng",
+          "return_code": 0,
+          "wall_seconds": 7.81,
+          "peak_rss_kib": 28160
+        },
+        {
+          "capture": "corpus/OIRAN_A/N4.pcapng",
+          "return_code": 0,
+          "wall_seconds": 7.86,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_B/N2.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.5,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/OIRAN_B/N3.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.37,
+          "peak_rss_kib": 27776
+        },
+        {
+          "capture": "corpus/OIRAN_B/N4.pcap",
+          "return_code": 0,
+          "wall_seconds": 6.68,
+          "peak_rss_kib": 27904
+        }
+      ]
+    },
+    {
+      "engine": "telcoladder",
+      "iteration": 2,
+      "warmup": false,
+      "total_seconds": 102.48,
+      "peak_rss_kib": 28672,
+      "all_return_codes_zero": true,
+      "per_capture": [
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-e2e.pcap",
+          "return_code": 0,
+          "wall_seconds": 9.22,
+          "peak_rss_kib": 28160
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-registration.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.77,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/ki-mismatch.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.69,
+          "peak_rss_kib": 28288
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/multi-imsi.pcap",
+          "return_code": 0,
+          "wall_seconds": 11.62,
+          "peak_rss_kib": 28672
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/supi-not-provisioned.pcap",
+          "return_code": 0,
+          "wall_seconds": 6.75,
+          "peak_rss_kib": 28160
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/unknown-dnn.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.48,
+          "peak_rss_kib": 28288
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/userplane.pcap",
+          "return_code": 0,
+          "wall_seconds": 8.56,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_A/N2.pcapng",
+          "return_code": 0,
+          "wall_seconds": 7.6,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_A/N3.pcapng",
+          "return_code": 0,
+          "wall_seconds": 7.57,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_A/N4.pcapng",
+          "return_code": 0,
+          "wall_seconds": 7.2,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/OIRAN_B/N2.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.26,
+          "peak_rss_kib": 28160
+        },
+        {
+          "capture": "corpus/OIRAN_B/N3.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.2,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/OIRAN_B/N4.pcap",
+          "return_code": 0,
+          "wall_seconds": 6.56,
+          "peak_rss_kib": 28032
+        }
+      ]
+    },
+    {
+      "engine": "telcoladder",
+      "iteration": 3,
+      "warmup": false,
+      "total_seconds": 98.79,
+      "peak_rss_kib": 28416,
+      "all_return_codes_zero": true,
+      "per_capture": [
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-e2e.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.89,
+          "peak_rss_kib": 28160
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-registration.pcap",
+          "return_code": 0,
+          "wall_seconds": 6.67,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/ki-mismatch.pcap",
+          "return_code": 0,
+          "wall_seconds": 6.85,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/multi-imsi.pcap",
+          "return_code": 0,
+          "wall_seconds": 12.39,
+          "peak_rss_kib": 28416
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/supi-not-provisioned.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.47,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/unknown-dnn.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.53,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/userplane.pcap",
+          "return_code": 0,
+          "wall_seconds": 8.13,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_A/N2.pcapng",
+          "return_code": 0,
+          "wall_seconds": 7.32,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_A/N3.pcapng",
+          "return_code": 0,
+          "wall_seconds": 6.96,
+          "peak_rss_kib": 27776
+        },
+        {
+          "capture": "corpus/OIRAN_A/N4.pcapng",
+          "return_code": 0,
+          "wall_seconds": 6.63,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/OIRAN_B/N2.pcap",
+          "return_code": 0,
+          "wall_seconds": 6.59,
+          "peak_rss_kib": 28288
+        },
+        {
+          "capture": "corpus/OIRAN_B/N3.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.15,
+          "peak_rss_kib": 28160
+        },
+        {
+          "capture": "corpus/OIRAN_B/N4.pcap",
+          "return_code": 0,
+          "wall_seconds": 7.21,
+          "peak_rss_kib": 27776
+        }
+      ]
+    },
+    {
+      "engine": "tshark",
+      "iteration": 0,
+      "warmup": true,
+      "total_seconds": 14.82,
+      "peak_rss_kib": 28288,
+      "all_return_codes_zero": true,
+      "per_capture": [
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-e2e.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.2,
+          "peak_rss_kib": 27520
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-registration.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.09,
+          "peak_rss_kib": 28160
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/ki-mismatch.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.12,
+          "peak_rss_kib": 27520
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/multi-imsi.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.78,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/supi-not-provisioned.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.1,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/unknown-dnn.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.0,
+          "peak_rss_kib": 28288
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/userplane.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.16,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_A/N2.pcapng",
+          "return_code": 0,
+          "wall_seconds": 1.11,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/OIRAN_A/N3.pcapng",
+          "return_code": 0,
+          "wall_seconds": 1.1,
+          "peak_rss_kib": 27648
+        },
+        {
+          "capture": "corpus/OIRAN_A/N4.pcapng",
+          "return_code": 0,
+          "wall_seconds": 1.18,
+          "peak_rss_kib": 27648
+        },
+        {
+          "capture": "corpus/OIRAN_B/N2.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.99,
+          "peak_rss_kib": 27776
+        },
+        {
+          "capture": "corpus/OIRAN_B/N3.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.97,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/OIRAN_B/N4.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.02,
+          "peak_rss_kib": 27648
+        }
+      ]
+    },
+    {
+      "engine": "tshark",
+      "iteration": 1,
+      "warmup": false,
+      "total_seconds": 14.36,
+      "peak_rss_kib": 28288,
+      "all_return_codes_zero": true,
+      "per_capture": [
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-e2e.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.16,
+          "peak_rss_kib": 28288
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-registration.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.08,
+          "peak_rss_kib": 27264
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/ki-mismatch.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.93,
+          "peak_rss_kib": 27648
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/multi-imsi.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.76,
+          "peak_rss_kib": 27648
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/supi-not-provisioned.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.02,
+          "peak_rss_kib": 27520
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/unknown-dnn.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.98,
+          "peak_rss_kib": 27776
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/userplane.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.18,
+          "peak_rss_kib": 27520
+        },
+        {
+          "capture": "corpus/OIRAN_A/N2.pcapng",
+          "return_code": 0,
+          "wall_seconds": 1.02,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/OIRAN_A/N3.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.99,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_A/N4.pcapng",
+          "return_code": 0,
+          "wall_seconds": 1.0,
+          "peak_rss_kib": 27776
+        },
+        {
+          "capture": "corpus/OIRAN_B/N2.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.09,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/OIRAN_B/N3.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.05,
+          "peak_rss_kib": 27776
+        },
+        {
+          "capture": "corpus/OIRAN_B/N4.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.1,
+          "peak_rss_kib": 27648
+        }
+      ]
+    },
+    {
+      "engine": "tshark",
+      "iteration": 2,
+      "warmup": false,
+      "total_seconds": 14.2,
+      "peak_rss_kib": 28160,
+      "all_return_codes_zero": true,
+      "per_capture": [
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-e2e.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.18,
+          "peak_rss_kib": 27392
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-registration.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.93,
+          "peak_rss_kib": 27520
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/ki-mismatch.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.06,
+          "peak_rss_kib": 27776
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/multi-imsi.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.88,
+          "peak_rss_kib": 27520
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/supi-not-provisioned.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.99,
+          "peak_rss_kib": 27776
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/unknown-dnn.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.99,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/userplane.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.02,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_A/N2.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.98,
+          "peak_rss_kib": 27136
+        },
+        {
+          "capture": "corpus/OIRAN_A/N3.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.9,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/OIRAN_A/N4.pcapng",
+          "return_code": 0,
+          "wall_seconds": 0.89,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/OIRAN_B/N2.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.07,
+          "peak_rss_kib": 27648
+        },
+        {
+          "capture": "corpus/OIRAN_B/N3.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.13,
+          "peak_rss_kib": 27520
+        },
+        {
+          "capture": "corpus/OIRAN_B/N4.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.18,
+          "peak_rss_kib": 28160
+        }
+      ]
+    },
+    {
+      "engine": "tshark",
+      "iteration": 3,
+      "warmup": false,
+      "total_seconds": 14.76,
+      "peak_rss_kib": 28288,
+      "all_return_codes_zero": true,
+      "per_capture": [
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-e2e.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.17,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/5gc-registration.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.0,
+          "peak_rss_kib": 27776
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/ki-mismatch.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.1,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/multi-imsi.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.88,
+          "peak_rss_kib": 27136
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/supi-not-provisioned.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.07,
+          "peak_rss_kib": 27776
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/unknown-dnn.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.01,
+          "peak_rss_kib": 27520
+        },
+        {
+          "capture": "corpus/LAB_TESTBED/userplane.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.19,
+          "peak_rss_kib": 27520
+        },
+        {
+          "capture": "corpus/OIRAN_A/N2.pcapng",
+          "return_code": 0,
+          "wall_seconds": 1.02,
+          "peak_rss_kib": 28288
+        },
+        {
+          "capture": "corpus/OIRAN_A/N3.pcapng",
+          "return_code": 0,
+          "wall_seconds": 1.05,
+          "peak_rss_kib": 27392
+        },
+        {
+          "capture": "corpus/OIRAN_A/N4.pcapng",
+          "return_code": 0,
+          "wall_seconds": 1.1,
+          "peak_rss_kib": 27648
+        },
+        {
+          "capture": "corpus/OIRAN_B/N2.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.08,
+          "peak_rss_kib": 28032
+        },
+        {
+          "capture": "corpus/OIRAN_B/N3.pcap",
+          "return_code": 0,
+          "wall_seconds": 1.13,
+          "peak_rss_kib": 27904
+        },
+        {
+          "capture": "corpus/OIRAN_B/N4.pcap",
+          "return_code": 0,
+          "wall_seconds": 0.96,
+          "peak_rss_kib": 27520
+        }
+      ]
+    }
+  ]
+}

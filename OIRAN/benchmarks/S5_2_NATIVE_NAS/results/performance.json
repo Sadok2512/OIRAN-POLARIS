@@ -1,0 +1,56 @@
+{
+  "method": {
+    "warmup_runs": 1,
+    "measured_runs": 5,
+    "files": 13,
+    "packets": 4205
+  },
+  "median_total_seconds": 0.04,
+  "median_packets_per_second": 105125.0,
+  "median_nas_messages_per_second": 2900.0,
+  "peak_rss_kib": 4492,
+  "runs": [
+    {
+      "iteration": 0,
+      "warmup": true,
+      "seconds": 0.04,
+      "peak_rss_kib": 4484,
+      "nas_events": 116
+    },
+    {
+      "iteration": 1,
+      "warmup": false,
+      "seconds": 0.09,
+      "peak_rss_kib": 4356,
+      "nas_events": 116
+    },
+    {
+      "iteration": 2,
+      "warmup": false,
+      "seconds": 0.04,
+      "peak_rss_kib": 4484,
+      "nas_events": 116
+    },
+    {
+      "iteration": 3,
+      "warmup": false,
+      "seconds": 0.03,
+      "peak_rss_kib": 4484,
+      "nas_events": 116
+    },
+    {
+      "iteration": 4,
+      "warmup": false,
+      "seconds": 0.04,
+      "peak_rss_kib": 4488,
+      "nas_events": 116
+    },
+    {
+      "iteration": 5,
+      "warmup": false,
+      "seconds": 0.04,
+      "peak_rss_kib": 4492,
+      "nas_events": 116
+    }
+  ]
+}

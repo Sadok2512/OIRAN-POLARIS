@@ -1,0 +1,2 @@
+packet_error=11 InvalidNetwork at byte 1244: unsupported EtherType 0x0806
+packet_error=12 InvalidNetwork at byte 1302: unsupported EtherType 0x0806

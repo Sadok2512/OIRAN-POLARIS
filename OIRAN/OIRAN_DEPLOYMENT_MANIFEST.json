@@ -1,0 +1,44 @@
+{
+  "schema_version": "1.0",
+  "project": "OIRAN",
+  "mission": "DATASET_PIPELINE_FIX_DEPLOYMENT",
+  "deployed_at": "2026-10-25T22:11:23Z",
+  "source_commit": "07333b2f01131ce408b9dc883f13d5752c7f4a00",
+  "binaries": {
+    "api": {
+      "path": "/opt/oiran/bin/oiran-api",
+      "sha256": "9d8c296e6eca8a9aedd28a6ca7ec15ab3ca86e4fabc08b1ae987460d790bcc17"
+    },
+    "capture_helper": {
+      "path": "/opt/oiran/bin/oiran-capture-helper",
+      "sha256": "83bec7371c9a32885c79a14ac015acb4c83b80f3d86dcbb1d11b5fd9537d5b96"
+    },
+    "recovery_cli": {
+      "path": "/opt/oiran/bin/oiran-recover",
+      "sha256": "94f00480ed90af81d6379363dc0808844e5bcac3b27a689488643903fa875649"
+    }
+  },
+  "ipc_socket": "/run/oiran/capture-helper.sock",
+  "recovered_dataset": {
+    "dataset_id": "recovered-dataset-live-1792964646320-0003",
+    "source_capture_id": "live-1792964646320-0003",
+    "packets": 50,
+    "events": 20,
+    "sessions": 0,
+    "api_visible": true
+  },
+  "validation": {
+    "n2": "READY",
+    "n3": "READY",
+    "n4": "READY",
+    "disk_usage_percent": 47.22,
+    "rust_tests": "131/131 PASS",
+    "api_tests": "16/16 PASS",
+    "frontend_tests": "10/10 PASS",
+    "e2e_tests": "34/34 PASS",
+    "historical_dataset_integrity": "UNCHANGED"
+  },
+  "live_capture_executed": false,
+  "simulator_traffic_generated": false,
+  "rollback_path": "/var/backups/oiran/dataset-fix-07333b2-20261025T220800Z"
+}

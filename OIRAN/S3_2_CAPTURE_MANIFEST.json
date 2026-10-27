@@ -1,0 +1,62 @@
+{
+  "schema_version": "1.0.0",
+  "generated_utc": "2026-10-24T21:40:00Z",
+  "selection_policy": "small finalized laboratory N2/N4 pair plus one immutable Open5GS multi-protocol reference; empty finalized N3 retained as negative evidence",
+  "captures": [
+    {
+      "capture_id": "sha256:2f23390dd619dda464ec8f2cfbd3b9fe59ca0587b043f6267a8ffc5a752cf54e",
+      "source_file": "/var/lib/docker/volumes/oiran_lab_pcap/_data/n2/n2_20261024T200731Z_00001_20261024200732.pcapng",
+      "interface": "N2",
+      "format": "PCAPNG",
+      "link_types": [1],
+      "bytes": 6180,
+      "packets": 38,
+      "first_packet_utc": "2026-10-24T20:07:37.663157043Z",
+      "last_packet_utc": "2026-10-24T20:08:40.639213004Z",
+      "finalized": true,
+      "selected": true
+    },
+    {
+      "capture_id": "sha256:8fad2f3401e79ea1695aa26cba649c03711e24ee0602625ec569ef82c3e6cfe7",
+      "source_file": "/var/lib/docker/volumes/oiran_lab_pcap/_data/n4/n4_20261024T200731Z_00001_20261024200732.pcapng",
+      "interface": "N4",
+      "format": "PCAPNG",
+      "link_types": [1],
+      "bytes": 3912,
+      "packets": 30,
+      "first_packet_utc": "2026-10-24T20:07:40.866283311Z",
+      "last_packet_utc": "2026-10-24T20:08:36.854438107Z",
+      "finalized": true,
+      "selected": true
+    },
+    {
+      "capture_id": "sha256:0bc683fedfd4c67b2fc5b6f9f2e0947a2a848fd5bee003298366d26db2a5ffa9",
+      "source_file": "/var/lib/docker/volumes/oiran_lab_pcap/_data/n3/n3_20261024T200731Z_00001_20261024200732.pcapng",
+      "interface": "N3",
+      "format": "PCAPNG",
+      "link_types": [1],
+      "bytes": 292,
+      "packets": 0,
+      "first_packet_utc": null,
+      "last_packet_utc": null,
+      "finalized": true,
+      "selected": false,
+      "reason": "negative evidence: operational N3 capture is empty"
+    },
+    {
+      "capture_id": "sha256:d1250694017f99b4cddff820a1129c2decf864233f93a881c2a14611996f3ff1",
+      "source_file": "/root/POLARIS/src/open5gs/docs/assets/pcapng/5g-roaming-lbo.pcapng",
+      "interface": "REFERENCE",
+      "format": "PCAPNG",
+      "link_types": [113],
+      "bytes": 632228,
+      "packets": 2690,
+      "first_packet_utc": "2023-10-02T10:12:40.000049621Z",
+      "last_packet_utc": "2023-10-02T10:12:46.569920478Z",
+      "finalized": true,
+      "selected": true,
+      "origin": "Open5GS immutable documentation fixture under POLARIS"
+    }
+  ],
+  "polaris_files_modified": false
+}

@@ -1,0 +1,13 @@
+frame.number,frame.time_epoch,frame.protocols,_ws.col.protocol,_ws.col.info,ip.src,ip.dst,ipv6.src,ipv6.dst,ngap.procedureCode,ngap.AMF_UE_NGAP_ID,ngap.RAN_UE_NGAP_ID,nas-5gs.mm.message_type,nas-5gs.sm.message_type,pfcp.seid,gtp.teid,http2.streamid,http2.header.name,http2.header.value
+"7","1786965010.464137000","sll:ethertype:ip:sctp:ngap:ngap:nas-5gs","NGAP/NAS-5GS","InitialUEMessage, Registration request","172.22.0.23","172.22.0.10",,,"15",,"5","0x41",,,,,,
+"8","1786965010.474790000","sll:ethertype:ip:sctp:ngap:ngap:nas-5gs","NGAP/NAS-5GS","SACK (Ack=0, Arwnd=106496) , DownlinkNASTransport, Authentication request","172.22.0.10","172.22.0.23",,,"4","5","5","0x56",,,,,,
+"9","1786965010.478038000","sll:ethertype:ip:sctp:ngap:ngap:nas-5gs","NGAP/NAS-5GS","SACK (Ack=0, Arwnd=106496) , UplinkNASTransport, Authentication response","172.22.0.23","172.22.0.10",,,"46","5","5","0x57",,,,,,
+"10","1786965010.481854000","sll:ethertype:ip:sctp:ngap:ngap:nas-5gs","NGAP/NAS-5GS","SACK (Ack=1, Arwnd=106496) , DownlinkNASTransport, Security mode command","172.22.0.10","172.22.0.23",,,"4","5","5","0x5d",,,,,,
+"11","1786965010.483973000","sll:ethertype:ip:sctp:ngap:ngap:nas-5gs","NGAP/NAS-5GS","SACK (Ack=1, Arwnd=106496) , UplinkNASTransport","172.22.0.23","172.22.0.10",,,"46","5","5",,,,,,,
+"12","1786965010.484331000","sll:ethertype:ip:sctp:ngap:ngap","NGAP","SACK (Ack=2, Arwnd=106496) , UEContextReleaseCommand","172.22.0.10","172.22.0.23",,,"41","4","4",,,,,,,
+"13","1786965010.484423000","sll:ethertype:ip:sctp:ngap:ngap","NGAP","SACK (Ack=2, Arwnd=106496) , UEContextReleaseComplete","172.22.0.23","172.22.0.10",,,"41","4","4",,,,,,,
+"14","1786965010.491069000","sll:ethertype:ip:sctp:ngap:ngap:nas-5gs","NGAP/NAS-5GS","SACK (Ack=3, Arwnd=106496) , InitialContextSetupRequest","172.22.0.10","172.22.0.23",,,"14","5","5",,,,,,,
+"15","1786965010.491221000","sll:ethertype:ip:sctp:ngap:ngap","NGAP","SACK (Ack=3, Arwnd=106496) , InitialContextSetupResponse","172.22.0.23","172.22.0.10",,,"14","5","5",,,,,,,
+"17","1786965010.695683000","sll:ethertype:ip:sctp:ngap:ngap:nas-5gs:ngap:ngap:nas-5gs","NGAP/NAS-5GS","UplinkNASTransport, UplinkNASTransport","172.22.0.23","172.22.0.10",,,"46,46","5,5","5,5",,,,,,,
+"18","1786965010.696251000","sll:ethertype:ip:sctp:ngap:ngap:nas-5gs","NGAP/NAS-5GS","SACK (Ack=6, Arwnd=106496) , DownlinkNASTransport","172.22.0.10","172.22.0.23",,,"4","5","5",,,,,,,
+"19","1786965010.696606000","sll:ethertype:ip:sctp:ngap:ngap:nas-5gs","NGAP/NAS-5GS","DownlinkNASTransport","172.22.0.10","172.22.0.23",,,"4","5","5",,,,,,,

@@ -1,0 +1,25 @@
+{
+  "source": {
+    "system": "OPEN5GS",
+    "database": "open5gs",
+    "collection": "subscribers",
+    "exported_at_epoch_s": 1792972800
+  },
+  "subscribers": [
+    {
+      "imsi": "001010000000001",
+      "security": {
+        "k": "00112233445566778899aabbccddeeff",
+        "opc": "ffeeddccbbaa99887766554433221100",
+        "amf": "8000"
+      },
+      "slice": [
+        {
+          "sst": 1,
+          "sd": "010203",
+          "session": [{"name": "internet"}]
+        }
+      ]
+    }
+  ]
+}

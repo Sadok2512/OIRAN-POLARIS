@@ -1,0 +1,243 @@
+{
+  "ue_contexts": [
+    {
+      "context_id": "uectx-70b161768bc4e1c5",
+      "pseudonym": "UE-efd4bb68e91d8d96",
+      "ran_ue_ngap_id": "1",
+      "amf_ue_ngap_id": "1",
+      "ran_endpoint": "172.22.0.23",
+      "amf_endpoint": "172.22.0.10",
+      "association_id": "N2:172.22.0.23:172.22.0.10",
+      "lifecycle_generation": 1,
+      "state": "ACTIVE",
+      "first_timestamp_ns": 1786964054686902000,
+      "last_timestamp_ns": 1786964055046692000,
+      "event_ids": [
+        "evt-6211c39d4872ce76",
+        "evt-0f57cad843faea6f",
+        "evt-26538644e8a6bb0b",
+        "evt-20186db8dc127736",
+        "evt-68293916d4272227",
+        "evt-616a16b5a14ba596",
+        "evt-91fe3402a9bc963a",
+        "evt-0c19de83031a3a4b",
+        "evt-89c93ae0bb1c26fb",
+        "evt-185f750dbbfbce46",
+        "evt-b860c0d3619a6724",
+        "evt-a736aff25c69e35e",
+        "evt-64e3b88581a32252",
+        "evt-dc6a51dd4f488ce0",
+        "evt-4761258b9e51f3af",
+        "evt-bc02b944604bcf53",
+        "evt-14df89cd77242a4e",
+        "evt-0b38cb313233f4a2",
+        "evt-5f5ab296b293734e",
+        "evt-d667cdec21ed4a87",
+        "evt-d92b54e683410d68",
+        "evt-9e72bca2a6df08eb",
+        "evt-5920757f025267a2",
+        "evt-f0597d3d112123f8",
+        "evt-7cdaf2a3b7e14b46",
+        "evt-a48b333828c17d99"
+      ]
+    }
+  ],
+  "pdu_sessions": [
+    {
+      "session_id": "5g-session-e8f5b3d8f6904a13",
+      "ue_context_id": "uectx-70b161768bc4e1c5",
+      "pdu_session_id": "1",
+      "dnn": null,
+      "snssai": null,
+      "state": "ACTIVE",
+      "establishment_timestamp_ns": 1786964055043035000,
+      "release_timestamp_ns": null,
+      "interfaces": [
+        "N2"
+      ],
+      "correlation_status": "UNKNOWN",
+      "event_ids": [
+        "evt-64e3b88581a32252",
+        "evt-a48b333828c17d99",
+        "evt-dc6a51dd4f488ce0"
+      ]
+    }
+  ],
+  "pfcp_sessions": [],
+  "gtpu_tunnels": [],
+  "procedures": [
+    {
+      "procedure_id": "procedure-083f8aceb8147fb0",
+      "procedure_type": "PROTECTED_NAS",
+      "ue_context_id": "uectx-70b161768bc4e1c5",
+      "pdu_session_id": "5g-session-e8f5b3d8f6904a13",
+      "start_timestamp_ns": 1786964055043035000,
+      "end_timestamp_ns": 1786964055043035000,
+      "event_ids": [
+        "evt-a48b333828c17d99"
+      ],
+      "result": "INCOMPLETE",
+      "start_event_id": "evt-a48b333828c17d99",
+      "end_event_id": null,
+      "duration_ns": 0,
+      "failure_cause": null,
+      "missing_evidence": [
+        "no explicit completion or failure observed for PROTECTED_NAS"
+      ],
+      "evidence": "POSSIBLE"
+    },
+    {
+      "procedure_id": "procedure-12ca6034c45b60f4",
+      "procedure_type": "AUTHENTICATION",
+      "ue_context_id": "uectx-70b161768bc4e1c5",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964054710695000,
+      "end_timestamp_ns": 1786964054713280000,
+      "event_ids": [
+        "evt-bc02b944604bcf53",
+        "evt-14df89cd77242a4e"
+      ],
+      "result": "FAILURE",
+      "start_event_id": "evt-bc02b944604bcf53",
+      "end_event_id": "evt-14df89cd77242a4e",
+      "duration_ns": 2585000,
+      "failure_cause": "21",
+      "missing_evidence": [],
+      "evidence": "EXACT"
+    },
+    {
+      "procedure_id": "procedure-7f9aaeefc61cdf4d",
+      "procedure_type": "AUTHENTICATION",
+      "ue_context_id": "uectx-70b161768bc4e1c5",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964054730032000,
+      "end_timestamp_ns": 1786964054731913000,
+      "event_ids": [
+        "evt-0b38cb313233f4a2",
+        "evt-5f5ab296b293734e"
+      ],
+      "result": "SUCCESS",
+      "start_event_id": "evt-0b38cb313233f4a2",
+      "end_event_id": "evt-5f5ab296b293734e",
+      "duration_ns": 1881000,
+      "failure_cause": null,
+      "missing_evidence": [],
+      "evidence": "EXACT"
+    },
+    {
+      "procedure_id": "procedure-936779d74004349f",
+      "procedure_type": "PROTECTED_NAS",
+      "ue_context_id": "uectx-70b161768bc4e1c5",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964054740650000,
+      "end_timestamp_ns": 1786964054985421000,
+      "event_ids": [
+        "evt-d92b54e683410d68",
+        "evt-9e72bca2a6df08eb",
+        "evt-5920757f025267a2",
+        "evt-f0597d3d112123f8",
+        "evt-7cdaf2a3b7e14b46"
+      ],
+      "result": "INCOMPLETE",
+      "start_event_id": "evt-d92b54e683410d68",
+      "end_event_id": null,
+      "duration_ns": 244771000,
+      "failure_cause": null,
+      "missing_evidence": [
+        "no explicit completion or failure observed for PROTECTED_NAS"
+      ],
+      "evidence": "POSSIBLE"
+    },
+    {
+      "procedure_id": "procedure-94379ca2ef7dfd3d",
+      "procedure_type": "SECURITY_MODE",
+      "ue_context_id": "uectx-70b161768bc4e1c5",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964054738591000,
+      "end_timestamp_ns": 1786964054738591000,
+      "event_ids": [
+        "evt-d667cdec21ed4a87"
+      ],
+      "result": "INCOMPLETE",
+      "start_event_id": "evt-d667cdec21ed4a87",
+      "end_event_id": null,
+      "duration_ns": 0,
+      "failure_cause": null,
+      "missing_evidence": [
+        "no explicit completion or failure observed for SECURITY_MODE"
+      ],
+      "evidence": "POSSIBLE"
+    },
+    {
+      "procedure_id": "procedure-ae4823acd5511306",
+      "procedure_type": "REGISTRATION",
+      "ue_context_id": "uectx-70b161768bc4e1c5",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964054686902000,
+      "end_timestamp_ns": 1786964054686902000,
+      "event_ids": [
+        "evt-4761258b9e51f3af"
+      ],
+      "result": "INCOMPLETE",
+      "start_event_id": "evt-4761258b9e51f3af",
+      "end_event_id": null,
+      "duration_ns": 0,
+      "failure_cause": null,
+      "missing_evidence": [
+        "no explicit completion or failure observed for REGISTRATION"
+      ],
+      "evidence": "POSSIBLE"
+    },
+    {
+      "procedure_id": "procedure-bec5fb35556297ab",
+      "procedure_type": "PDU_SESSION",
+      "ue_context_id": "uectx-70b161768bc4e1c5",
+      "pdu_session_id": "5g-session-e8f5b3d8f6904a13",
+      "start_timestamp_ns": 1786964055043035000,
+      "end_timestamp_ns": 1786964055046692000,
+      "event_ids": [
+        "evt-64e3b88581a32252",
+        "evt-dc6a51dd4f488ce0"
+      ],
+      "result": "SUCCESS",
+      "start_event_id": "evt-64e3b88581a32252",
+      "end_event_id": "evt-dc6a51dd4f488ce0",
+      "duration_ns": 3657000,
+      "failure_cause": null,
+      "missing_evidence": [],
+      "evidence": "EXACT"
+    },
+    {
+      "procedure_id": "procedure-d3b8e24028802bcd",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-70b161768bc4e1c5",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964054778500000,
+      "end_timestamp_ns": 1786964054779066000,
+      "event_ids": [
+        "evt-0c19de83031a3a4b",
+        "evt-89c93ae0bb1c26fb"
+      ],
+      "result": "SUCCESS",
+      "start_event_id": "evt-0c19de83031a3a4b",
+      "end_event_id": "evt-89c93ae0bb1c26fb",
+      "duration_ns": 566000,
+      "failure_cause": null,
+      "missing_evidence": [],
+      "evidence": "EXACT"
+    }
+  ],
+  "background_event_ids": [],
+  "unmatched_event_ids": [
+    "evt-2cbba7d3d09eb3f8",
+    "evt-44caedb133c3c55e"
+  ],
+  "duplicate_observations": [],
+  "event_accounting": {
+    "background_events": 0,
+    "duplicate_observations": 0,
+    "session_events": 26,
+    "source_events": 28,
+    "unmatched_events": 2
+  }
+}

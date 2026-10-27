@@ -1,0 +1,35 @@
+{
+  "test_id": "POLARIS-LIVE-001",
+  "scenario_id": "POLARIS_5G_PDU_SESSION_DATA_LIVE_001",
+  "state": "COMPLETED",
+  "started_at_epoch_s": 1792934220,
+  "completed_at_epoch_s": 1792934225,
+  "technology": "5G SA",
+  "simulator": "UERANSIM",
+  "existing_registration_verified": true,
+  "existing_pdu_session_verified": true,
+  "shared_gnb_restarted": false,
+  "shared_ue_restarted": false,
+  "open5gs_restarted": false,
+  "controller_owned_processes_active": 0,
+  "traffic": {
+    "protocol": "UDP",
+    "destination": "10.46.0.1",
+    "destination_port": 49001,
+    "requested_datagrams": 5,
+    "uplink_datagrams_observed": 5,
+    "downlink_icmp_responses_observed": 5,
+    "command_exit_code": 0
+  },
+  "captures": {
+    "n2": {"valid": true, "packets_at_integrity_check": 136, "session_establishment_in_test_window": false},
+    "n3": {"valid": true, "packets": 10, "size_bytes": 1832, "sha256": "cae6d69a4a19a53422093fdcc2bf03fab652e37d623873398f07806d5c26a518"},
+    "n4": {"valid": true, "packets_at_integrity_check": 132, "session_establishment_in_test_window": false}
+  },
+  "disk_usage_percent": 80.71,
+  "approval_consumed": true,
+  "approval_present_after_test": false,
+  "generic_live_control": false,
+  "orphan_processes": 0,
+  "error": null
+}

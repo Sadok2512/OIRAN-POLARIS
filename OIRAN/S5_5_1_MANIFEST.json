@@ -1,0 +1,30 @@
+{
+  "project": "OIRAN",
+  "mission": "FOUR_PLANE_VALIDATOR_CONTRACT_CORRECTION",
+  "baseline_commit": "ab5e3e34dfbf27416940d3e9f986f5d432bbbac8",
+  "branch": "feat/s5-5-1-validator-contract",
+  "contract": {
+    "max_capture_planes": 4,
+    "logical_planes": ["NG-C", "SBI", "N4", "NG-U"],
+    "wire_identifiers": ["N2", "SBI", "N4", "N3"],
+    "arbitrary_interface_names": false,
+    "custom_filters": false
+  },
+  "validation": {
+    "api_four_plane": "PASS",
+    "helper_four_plane": "PASS",
+    "http_to_unix_ipc": "PASS",
+    "acquisition_initialized": false,
+    "rust_tests": {"passed": 172, "failed": 0},
+    "api_tests": {"passed": 19, "failed": 0},
+    "frontend_tests": {"passed": 19, "failed": 0},
+    "e2e_tests": {"passed": 46, "failed": 0}
+  },
+  "safety": {
+    "production_changed": false,
+    "live_capture_executed": false,
+    "simulator_execution": false,
+    "historical_datasets_changed": false
+  },
+  "status": "FIX_VALIDATED"
+}

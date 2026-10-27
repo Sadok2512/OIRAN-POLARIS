@@ -1,0 +1,21 @@
+[Unit]
+Description=POLARIS Control (approval-gated example)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/POLARIS_CONTROL
+EnvironmentFile=/root/POLARIS_CONTROL/config/polaris-control.env
+ExecStart=/root/POLARIS_CONTROL/target/release/polaris-control-api
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/polaris-control /var/log/polaris-control
+ReadOnlyPaths=/root/POLARIS
+MemoryMax=256M
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+/target/
+*.profraw
+*.log
+apps/web/node_modules/
+apps/web/test-results/
+apps/web/playwright-report/
+apps/web/*.tsbuildinfo
+runtime/
+deployment/rollback/
+

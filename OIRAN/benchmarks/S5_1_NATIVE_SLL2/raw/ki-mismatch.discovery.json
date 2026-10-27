@@ -1,0 +1,53 @@
+{
+  "ue_contexts": [
+    {
+      "context_id": "uectx-e7298db31b515a43",
+      "pseudonym": "UE-32940958d97ade43",
+      "ran_ue_ngap_id": "3",
+      "amf_ue_ngap_id": "3",
+      "ran_endpoint": "172.22.0.10",
+      "amf_endpoint": "172.22.0.23",
+      "association_id": "N2:172.22.0.10:172.22.0.23",
+      "lifecycle_generation": 1,
+      "state": "REGISTERING",
+      "first_timestamp_ns": 1786964869746575000,
+      "last_timestamp_ns": 1786964869765085000,
+      "event_ids": [
+        "evt-1432dbbab24d9b7b",
+        "evt-7213ca6f42e6f719",
+        "evt-853451f1e204a69e",
+        "evt-3e711fb9ae5a859f"
+      ]
+    }
+  ],
+  "pdu_sessions": [],
+  "pfcp_sessions": [],
+  "gtpu_tunnels": [],
+  "procedures": [
+    {
+      "procedure_id": "procedure-8f7ea65b7ebb54ca",
+      "procedure_type": "REGISTRATION",
+      "ue_context_id": "uectx-e7298db31b515a43",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964869746575000,
+      "end_timestamp_ns": 1786964869765085000,
+      "event_ids": [
+        "evt-1432dbbab24d9b7b",
+        "evt-7213ca6f42e6f719",
+        "evt-853451f1e204a69e",
+        "evt-3e711fb9ae5a859f"
+      ],
+      "result": "INCOMPLETE"
+    }
+  ],
+  "background_event_ids": [],
+  "unmatched_event_ids": [],
+  "duplicate_observations": [],
+  "event_accounting": {
+    "background_events": 0,
+    "duplicate_observations": 0,
+    "session_events": 4,
+    "source_events": 4,
+    "unmatched_events": 0
+  }
+}

@@ -1,0 +1,1 @@
+capture_format=Pcap packets=0 events=0 warnings=0 transport_errors=0 sctp_errors=0 incomplete_sctp=0 output=/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/raw/OIRAN_B__N3.oiran.jsonl

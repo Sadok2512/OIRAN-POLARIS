@@ -1,0 +1,69 @@
+{
+  "project": "OIRAN",
+  "mission": "NATIVE_SBI_HTTP2_AND_CROSS_INTERFACE_CORRELATION",
+  "version": "1.0.0-dev",
+  "generated_at": "2026-10-26T18:41:40Z",
+  "branch": "feat/s5-3-sbi-correlation",
+  "baseline_s5_1": "ca623fe38ca9c9a1d9be695678cdd464d5555cfd",
+  "baseline_s5_2": "0ec2a6fcfa30da5d152606b0e305e55153a78160",
+  "implementation_commit": "ae7b625",
+  "components": {
+    "transport_tcp": "0.1.0",
+    "decoder_sbi": "0.1.0",
+    "event_schema": "1.5.0-dev",
+    "oiran_decode": "0.3.0",
+    "correlation_engine": "0.3.0",
+    "callflow_schema": "1.1.0",
+    "hpack": "0.3.0 (MIT)"
+  },
+  "reference": {
+    "tshark": "4.2.2",
+    "telcoladder": "0.1.0 Apache-2.0 retained research baseline",
+    "corpus_files": 13,
+    "corpus_packets": 4205,
+    "sha256_integrity": "PASS"
+  },
+  "results": {
+    "tcp_connections": 48,
+    "http2_streams": 708,
+    "http2_frames": 2316,
+    "sbi_transactions": 198,
+    "priority_operations": 20,
+    "fields_comparable": 766,
+    "fields_exact": 766,
+    "fields_mismatched": 0,
+    "fields_unresolved": 26,
+    "ue_contexts": 6,
+    "pdu_sessions": 5,
+    "cross_ue_contamination": "NONE_OBSERVED"
+  },
+  "artifact_sha256": {
+    "S5_3_RESULTS.csv": "a7ae2fb18ffff75761e4c0520dc40b29b19131934acd0680fcfef6043ff4b56b",
+    "summary.json": "d158f5bfce3f4a411c7293d59de53f81846d4b47a0a9a57e4c1625bee4c90b20",
+    "sbi_parity.csv": "2b7ba2a18f643df3c585f1e7811a248ff0e224372686c9f67ab8ab87ca05539b",
+    "performance.json": "6d9b87ff55496ac79b972becc1999ce2a3bbb67689db6ddaf312f55ce6273077"
+  },
+  "certification": {
+    "tcp_reassembly": "PASS",
+    "http2_decoder": "PASS",
+    "sbi_decoder": "PARTIAL",
+    "n2_sbi_n4_correlation": "NOT_CERTIFIED",
+    "e2e_session": "NOT_CERTIFIED",
+    "final_status": "PARTIAL"
+  },
+  "tests": {
+    "rust_workspace": "162/162 PASS",
+    "frontend": "18/18 PASS",
+    "typescript": "PASS",
+    "frontend_production_build": "PASS",
+    "corpus_replay": "PASS"
+  },
+  "safety": {
+    "polaris_changed": false,
+    "polaris_control_changed": false,
+    "etv_otv_changed": false,
+    "production_changed": false,
+    "live_capture_executed": false,
+    "simulator_started": false
+  }
+}

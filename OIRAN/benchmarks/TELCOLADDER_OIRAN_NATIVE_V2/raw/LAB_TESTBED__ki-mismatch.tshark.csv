@@ -1,0 +1,5 @@
+frame.number,frame.time_epoch,_ws.col.protocol,_ws.col.info,ngap.procedureCode,ngap.AMF_UE_NGAP_ID,ngap.RAN_UE_NGAP_ID,nas-5gs.mm.message_type,nas-5gs.sm.message_type,pfcp.seid,gtp.teid
+"7","1786964869.746575000","NGAP/NAS-5GS","InitialUEMessage, Registration request","15",,"3","0x41",,,
+"8","1786964869.760925000","NGAP/NAS-5GS","SACK (Ack=0, Arwnd=106496) , DownlinkNASTransport, Authentication request","4","3","3","0x56",,,
+"9","1786964869.763049000","NGAP/NAS-5GS","SACK (Ack=0, Arwnd=106496) , UplinkNASTransport, Authentication failure (Synch failure)","46","3","3","0x59",,,
+"10","1786964869.765085000","NGAP/NAS-5GS","SACK (Ack=1, Arwnd=106496) , DownlinkNASTransport, Registration reject (Protocol error, unspecified)","4","3","3","0x44",,,

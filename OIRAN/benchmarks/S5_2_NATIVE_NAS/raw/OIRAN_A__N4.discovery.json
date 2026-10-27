@@ -1,0 +1,97 @@
+{
+  "ue_contexts": [],
+  "pdu_sessions": [],
+  "pfcp_sessions": [
+    {
+      "pfcp_session_id": "pfcp-0c6fc44cd5d1ff11",
+      "smf_endpoint": "10.77.23.12",
+      "upf_endpoint": "10.77.23.13",
+      "seids": [
+        "0x0000000000000478",
+        "0x00000000000005e0"
+      ],
+      "pdr_ids": [],
+      "far_ids": [],
+      "tunnel_ids": [],
+      "state": "DELETED",
+      "first_timestamp_ns": 1792872462982066621,
+      "last_timestamp_ns": 1792872462982735972,
+      "event_ids": [
+        "evt-3dfcfcbb1c3c9d11",
+        "evt-cb3c9294970750b7"
+      ]
+    },
+    {
+      "pfcp_session_id": "pfcp-702d78899f538900",
+      "smf_endpoint": "10.77.23.12",
+      "upf_endpoint": "10.77.23.13",
+      "seids": [
+        "0x00000000000001a8",
+        "0x000000000000035e"
+      ],
+      "pdr_ids": [
+        "1",
+        "2",
+        "3",
+        "4"
+      ],
+      "far_ids": [
+        "1",
+        "2",
+        "3"
+      ],
+      "tunnel_ids": [
+        "pfcp-tunnel-16ea3c24a8af59f7",
+        "pfcp-tunnel-ba4ec83c66c7ad2e",
+        "pfcp-tunnel-d6309fb5750e9893",
+        "pfcp-tunnel-103b1fa1d7dacd67"
+      ],
+      "state": "ESTABLISHED",
+      "first_timestamp_ns": 1792872463246506940,
+      "last_timestamp_ns": 1792872463257186563,
+      "event_ids": [
+        "evt-028bbb05fa976805",
+        "evt-7d457531981874c4",
+        "evt-0428c3e95e87e071",
+        "evt-8d37a4b5d62d3f39"
+      ]
+    }
+  ],
+  "gtpu_tunnels": [],
+  "procedures": [],
+  "background_event_ids": [
+    "evt-c62bd9d111a9fdcb",
+    "evt-2d27286d97395dbd",
+    "evt-109fd474d3e74f33",
+    "evt-1e9c159c64aa775f",
+    "evt-243961205f3dbd0f",
+    "evt-677c7b9101d6ec0b",
+    "evt-a7aa625e03b27468",
+    "evt-b3e1117ac0bb78cb",
+    "evt-b53d830aedffc735",
+    "evt-b13695ee2057904a",
+    "evt-52489cd75af72da2",
+    "evt-11430fbf561a53e2",
+    "evt-39fa5152d18e3b87",
+    "evt-4b4ef7547c5ab00b",
+    "evt-64bc23274b0085f0",
+    "evt-fb96b3e096da44b3",
+    "evt-8969d50135fe1ce1",
+    "evt-4201b8c8bfc7f1e5",
+    "evt-4d3f30974ec96326",
+    "evt-317d0c2480fe35d1",
+    "evt-583dc03fa80fcdef",
+    "evt-94a22a599125c9eb",
+    "evt-858a5e17cac04de0",
+    "evt-971bb05d99f8746f"
+  ],
+  "unmatched_event_ids": [],
+  "duplicate_observations": [],
+  "event_accounting": {
+    "background_events": 24,
+    "duplicate_observations": 0,
+    "session_events": 6,
+    "source_events": 30,
+    "unmatched_events": 0
+  }
+}

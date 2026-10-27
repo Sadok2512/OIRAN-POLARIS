@@ -1,0 +1,13 @@
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/5gc-e2e.pcap: OK
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/5gc-registration.pcap: OK
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/ki-mismatch.pcap: OK
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/multi-imsi.pcap: OK
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/supi-not-provisioned.pcap: OK
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/unknown-dnn.pcap: OK
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/LAB_TESTBED/userplane.pcap: OK
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/OIRAN_A/N2.pcapng: OK
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/OIRAN_A/N3.pcapng: OK
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/OIRAN_A/N4.pcapng: OK
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/OIRAN_B/N2.pcap: OK
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/OIRAN_B/N3.pcap: OK
+/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/corpus/OIRAN_B/N4.pcap: OK

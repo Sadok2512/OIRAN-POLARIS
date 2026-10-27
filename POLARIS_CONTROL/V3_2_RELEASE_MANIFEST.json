@@ -1,0 +1,28 @@
+{
+  "project": "POLARIS_CONTROL",
+  "mission": "TEN_UE_SUBSCRIBER_PROVISIONING",
+  "source_commit": "b71e26611268266f909cfef5df14ef960a22674c",
+  "platform_version": "3.2.0",
+  "api_version": "0.8.0",
+  "controller_version": "0.3.0",
+  "ueransim_adapter_version": "0.3.0",
+  "scenario_engine_version": "0.2.0",
+  "running_api_sha256": "c2d9485c606fd4dcb17cfd9c1ef1d1e47fc697da1655931053e5152afd650bab",
+  "frontend_index_sha256": "aea1e58c666afebd01d764d6ec8a6d39c273b8f65349a6f44fc9d4c22c8efe21",
+  "subscribers_before": 1,
+  "subscribers_created": 9,
+  "subscribers_total": 10,
+  "profiles_ready": 10,
+  "max_ues_configurable": 10,
+  "max_ues_live_certified": 1,
+  "new_ue_processes": 0,
+  "new_gnb_processes": 0,
+  "database_backup_sha256": "6e2ed52166a20bc5f135feba3325d03e9ad9816d4bf67bc8445e4654f318841b",
+  "tests": {
+    "rust": "38/38 PASS",
+    "api": "15/15 PASS",
+    "frontend": "3/3 PASS",
+    "candidate_e2e": "15 PASS / 1 production-only SKIPPED",
+    "deployed_https_smoke": "1/1 PASS"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "dataset": "datasets/OIRAN_5G_PDU_SESSION_DATA_V1",
+  "scenario_id": "OIRAN_5G_PDU_SESSION_DATA_V1",
+  "certification": "CERTIFIED_STRONG_E2E",
+  "captures": {
+    "N2": {"sha256":"2f23390dd619dda464ec8f2cfbd3b9fe59ca0587b043f6267a8ffc5a752cf54e","packets":38,"ngap_messages":14},
+    "N4": {"sha256":"8fad2f3401e79ea1695aa26cba649c03711e24ee0602625ec569ef82c3e6cfe7","packets":30,"pfcp_messages":30},
+    "N3": {"sha256":"806a4ae1eb758a1b2c08ae10d7b7f54881c5e571c7f80ed047f564cb222cb35a","packets":10,"gtpu_packets":10}
+  },
+  "events": 54,
+  "provenance": "54/54",
+  "tshark_parity": "54/54 message/header alignment; 10/10 N3 TEID/length/timestamp exact",
+  "limitations": ["NGAP nested APER remains partial", "control-plane and user-plane captures are separated in time within one continuously active session"]
+}

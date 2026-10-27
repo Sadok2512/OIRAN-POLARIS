@@ -1,0 +1,29 @@
+{
+  "mission": "CPU_GATE_EVIDENCE_AND_E2E_CORRELATION_FIX",
+  "source_capture": "live-1793054609378-0001",
+  "source_dataset": "dataset-live-1793054609378-0001",
+  "derived_dataset": "derived-dataset-live-1793054609378-0001",
+  "packets": { "total": 543, "N2": 46, "SBI": 461, "N4": 36, "N3": 0 },
+  "events": 92,
+  "reconstructed_sessions": 1,
+  "source_sha256": {
+    "N2.pcap0": "7300ed27e24b2595a1235458a8241530339621d4d6d2a2dda2d396fa592eb556",
+    "SBI.pcap0": "eb2afb0bce014ecbeba486871227935361e2bdccef783bfa5189510c06d9b5b1",
+    "N4.pcap0": "4854b0d8df8d81dbb89622fe5d20ce3ed4397aea09c069fa835c214edfc9622e",
+    "N3.pcap0": "acc530668c8bc60b2d229281130b1899bfc81d70fdada5c34b3236c628f739c8"
+  },
+  "derived_sha256": {
+    "oiran_events.jsonl": "d3526a35cdf0c54f3e4d05750de69ce64e398eeaee3a80390b521786ee053319",
+    "correlation_evidence.json": "ce266703aca18f30a8e7fd4dcbe38282c11e388460450dd0348fc6e31b5836c2"
+  },
+  "correlation": {
+    "ngap_pfcp": "EXACT_TUNNEL_MATCH",
+    "ngap_sbi": "STRONG_CONTEXT_ASSOCIATION",
+    "sbi_pfcp": "STRONG_CONTEXT_ASSOCIATION",
+    "pfcp_gtpu": "UNKNOWN"
+  },
+  "production_changed": false,
+  "live_capture_executed": false,
+  "ue_started": false,
+  "udp_sent": 0
+}

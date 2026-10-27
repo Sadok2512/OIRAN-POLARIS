@@ -1,0 +1,1 @@
+capture_format=Pcap packets=22 events=13 warnings=0 transport_errors=0 sctp_errors=0 incomplete_sctp=0 output=/root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/raw/LAB_TESTBED__unknown-dnn.oiran.jsonl

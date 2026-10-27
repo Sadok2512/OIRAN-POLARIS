@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0.0",
+  "scenario_id": "OIRAN_5G_PDU_SESSION_DATA_V1",
+  "test_ue": "UE-A",
+  "subscriber_identity": "PSEUDONYMIZED",
+  "session_start_utc": "2026-10-24T20:07:42.963249856Z",
+  "traffic_start_utc": "2026-10-24T22:22:43.660165635Z",
+  "traffic_end_utc": "2026-10-24T22:22:43.772972948Z",
+  "traffic": {
+    "kind": "bounded_udp_with_icmp_port_unreachable_response",
+    "source": "10.46.0.4 via uesimtun0",
+    "destination": "10.46.0.1 UDP/9 (laboratory UPF gateway)",
+    "requests": 5,
+    "responses": 5
+  },
+  "network_functions": {
+    "amf_n2": "10.77.21.11",
+    "gnb_n2": "10.77.21.20",
+    "smf_n4": "10.77.23.12",
+    "upf_n4": "10.77.23.13",
+    "gnb_n3": "10.77.22.20",
+    "upf_n3": "10.77.22.13"
+  },
+  "identifiers": {
+    "ran_ue_ngap_id": 4,
+    "amf_ue_ngap_id": 4,
+    "pdu_session_id": 1,
+    "smf_f_seid": "0x00000000000001a8",
+    "upf_f_seid": "0x000000000000035e",
+    "uplink_teid": "0x000096a8",
+    "downlink_teid": "0x00000003"
+  },
+  "captures": [
+    {"interface":"N2","file":"N2.pcapng","sha256":"2f23390dd619dda464ec8f2cfbd3b9fe59ca0587b043f6267a8ffc5a752cf54e","packets":38,"decoded_messages":14},
+    {"interface":"N4","file":"N4.pcapng","sha256":"8fad2f3401e79ea1695aa26cba649c03711e24ee0602625ec569ef82c3e6cfe7","packets":30,"decoded_messages":30},
+    {"interface":"N3","file":"N3.pcapng","sha256":"806a4ae1eb758a1b2c08ae10d7b7f54881c5e571c7f80ed047f564cb222cb35a","packets":10,"decoded_messages":10}
+  ],
+  "decoder_versions": {"ngap":"0.2.0","pfcp":"0.2.0","gtpu":"0.1.0","event_schema":"1.2.0"},
+  "tshark_version": "4.2.2",
+  "coherence": "STRONG",
+  "coherence_basis": "continuous UE/NF lifetimes plus exact paired TEID and endpoint matches; not timestamp proximity"
+}

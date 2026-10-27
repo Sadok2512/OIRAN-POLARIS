@@ -1,0 +1,78 @@
+{
+  "ue_contexts": [
+    {
+      "context_id": "uectx-534839b7f91cbcd8",
+      "pseudonym": "UE-9fd60ea399f024ce",
+      "ran_ue_ngap_id": "2",
+      "amf_ue_ngap_id": "2",
+      "ran_endpoint": "172.22.0.23",
+      "amf_endpoint": "172.22.0.10",
+      "association_id": "N2:172.22.0.23:172.22.0.10",
+      "lifecycle_generation": 1,
+      "state": "RELEASED",
+      "first_timestamp_ns": 1786964805053097000,
+      "last_timestamp_ns": 1786964805061509000,
+      "event_ids": [
+        "evt-f6d070dc32c44edd",
+        "evt-7e1365d0774d1edd",
+        "evt-1ba152154f565ccb",
+        "evt-2d22ba6e547a647c",
+        "evt-cd34398e22da3926",
+        "evt-7e855eea3bdacc41"
+      ]
+    }
+  ],
+  "pdu_sessions": [],
+  "pfcp_sessions": [],
+  "gtpu_tunnels": [],
+  "procedures": [
+    {
+      "procedure_id": "procedure-1e8223c9c77c1add",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-534839b7f91cbcd8",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964805061097000,
+      "end_timestamp_ns": 1786964805061509000,
+      "event_ids": [
+        "evt-1ba152154f565ccb",
+        "evt-2d22ba6e547a647c"
+      ],
+      "result": "SUCCESS",
+      "start_event_id": "evt-1ba152154f565ccb",
+      "end_event_id": "evt-2d22ba6e547a647c",
+      "duration_ns": 412000,
+      "failure_cause": null,
+      "missing_evidence": [],
+      "evidence": "EXACT"
+    },
+    {
+      "procedure_id": "procedure-e540bc10290ef1bb",
+      "procedure_type": "REGISTRATION",
+      "ue_context_id": "uectx-534839b7f91cbcd8",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964805053097000,
+      "end_timestamp_ns": 1786964805061067000,
+      "event_ids": [
+        "evt-cd34398e22da3926",
+        "evt-7e855eea3bdacc41"
+      ],
+      "result": "FAILURE",
+      "start_event_id": "evt-cd34398e22da3926",
+      "end_event_id": "evt-7e855eea3bdacc41",
+      "duration_ns": 7970000,
+      "failure_cause": "7",
+      "missing_evidence": [],
+      "evidence": "EXACT"
+    }
+  ],
+  "background_event_ids": [],
+  "unmatched_event_ids": [],
+  "duplicate_observations": [],
+  "event_accounting": {
+    "background_events": 0,
+    "duplicate_observations": 0,
+    "session_events": 6,
+    "source_events": 6,
+    "unmatched_events": 0
+  }
+}

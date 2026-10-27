@@ -1,0 +1,11 @@
+[package]
+name = "plugin-runtime"
+version = "1.1.0-dev"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+capture-core = { path = "../capture-core" }
+event-schema = { path = "../event-schema" }
+

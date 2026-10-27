@@ -1,0 +1,20 @@
+{
+  "fixture_label": "TEST DATA — NOT CAPTURED NETWORK EVIDENCE",
+  "schema_version": "1.0.0",
+  "technology": "5G SA",
+  "capture_id": "test-capture-v2-3-multi-session",
+  "capture_point_id": "test-probe-01",
+  "ues": [
+    {"ue": "TEST-UE-01", "ran_ue_ngap_id": "101", "amf_ue_ngap_id": "1001", "pdu_session_id": "1", "pfcp_sequence": "201", "seid": "0x0000000000002001", "teid": "0x00003001", "gnb_n3": "10.20.0.11"},
+    {"ue": "TEST-UE-02", "ran_ue_ngap_id": "102", "amf_ue_ngap_id": "1002", "pdu_session_id": "1", "pfcp_sequence": "202", "seid": "0x0000000000002002", "teid": "0x00003002", "gnb_n3": "10.20.0.12"},
+    {"ue": "TEST-UE-03", "ran_ue_ngap_id": "103", "amf_ue_ngap_id": "1003", "pdu_session_id": "1", "pfcp_sequence": "203", "seid": "0x0000000000002003", "teid": "0x00003003", "gnb_n3": "10.20.0.13"}
+  ],
+  "expected": {
+    "ue_contexts": 3,
+    "pdu_sessions": 3,
+    "pfcp_sessions": 3,
+    "gtpu_tunnels": 3,
+    "unique_callflows": 3,
+    "cross_ue_contamination": 0
+  }
+}

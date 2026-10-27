@@ -1,0 +1,29 @@
+{
+  "project": "OIRAN",
+  "mission": "RELEASE_CONSOLIDATION_V1",
+  "source_commit": "f31d2e40b4f3056a2b479a3fbbec913c1a5702d6",
+  "candidate_base": "f4f844fac5a5fd57aed73f2ae3dd33bf0b081689",
+  "preserved_production_source": "7ef47076b72c6d5a811a9ef3542da496d5da502a",
+  "build_date_utc": "2026-10-27",
+  "toolchain": {"rustc": "1.75.0", "cargo": "1.75.0", "node": "22.23.4", "npm": "9.2.0"},
+  "locks": {
+    "Cargo.lock": "802cf01d909d09bfe0fb9213eaac671956881fc02456eae99ea4eb2fe99dcc9f",
+    "apps/web/package-lock.json": "9fb7cdb0d82a1d7670c9f15cd0bb1e0fe5e51353e11d3d0db6e4729ed06f1462"
+  },
+  "artifacts": {
+    "oiran-api": "4c862b8a37e511317bbe5067f9247f584b22198ac32348fcbd1bd516a0e70246",
+    "oiran-capture-helper": "40066162b18cf59247208681eb64f71c0c85b59e99cdcd43ee94a48768a96686",
+    "oiran-recover": "43925e7d0e2d36fb7f69e7c1e1d121b38f63682971cb31e19a019db744815d48",
+    "frontend_tree": "44949b8dcb4fcd841bebf862d65b327177ed852aa6817dd822370f3490cf8aa0"
+  },
+  "tests": {"rust": "196/196 PASS", "api": "21/21 PASS", "frontend": "20/20 PASS", "e2e": "47/47 PASS"},
+  "reproducibility": {
+    "oiran-api": "BYTE_IDENTICAL",
+    "oiran-recover": "BYTE_IDENTICAL",
+    "frontend_files": "BYTE_IDENTICAL",
+    "oiran-capture-helper": "PATH_DEPENDENT; clean rebuild sha256 25d928f83d5980cdc936a5e5daf091ced45204224b3853d4b97506f1105301f1"
+  },
+  "historical_dataset_digest": "0b44367c3ccf483dbdf281191a854e83fd9ecd19cecfdcc679f5e6d5b00893ab",
+  "production_changed": false,
+  "live_execution": false
+}

@@ -1,0 +1,20 @@
+sequenceDiagram
+    autonumber
+    participant UE
+    participant gNB
+    participant AMF
+    Note over gNB,AMF: SUPI 001011234567895
+    gNB->>AMF: #35;7 InitialUEMessage
+    UE->>AMF: #35;7 Registration request
+    AMF->>gNB: #35;8 DownlinkNASTransport
+    AMF->>UE: #35;8 Authentication request
+    gNB->>AMF: #35;9 UplinkNASTransport
+    rect rgb(255, 226, 226)
+    UE->>AMF: #35;9 Authentication failure
+    Note over AMF: Synch failure (#35;21) — 3GPP TS 24.501 §9.11.3.2
+    end
+    AMF->>gNB: #35;10 DownlinkNASTransport
+    rect rgb(255, 226, 226)
+    AMF->>UE: #35;10 Registration reject
+    Note over UE: Protocol error, unspecified (#35;111) — 3GPP TS 24.501 §9.11.3.2
+    end

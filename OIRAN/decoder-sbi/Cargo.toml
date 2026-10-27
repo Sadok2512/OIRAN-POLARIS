@@ -1,0 +1,12 @@
+[package]
+name = "decoder-sbi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+event-schema = { path = "../event-schema" }
+transport-tcp = { path = "../transport-tcp" }
+hpack = "0.3.0"
+serde_json = "1.0"

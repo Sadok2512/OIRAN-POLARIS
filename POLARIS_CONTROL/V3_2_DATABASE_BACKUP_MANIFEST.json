@@ -1,0 +1,14 @@
+{
+  "created_at_utc": "2026-10-25T23:32:31Z",
+  "database": "open5gs",
+  "collection_scope": "full database archive",
+  "path": "/root/POLARIS_CONTROL/deployment/backups/20261025T2335Z_pre_v3_2_subscribers/open5gs.archive.gz",
+  "sha256": "6e2ed52166a20bc5f135feba3325d03e9ad9816d4bf67bc8445e4654f318841b",
+  "size_bytes": 826,
+  "mode": "0600",
+  "owner": "root:root",
+  "mongorestore_dry_run": "PASS",
+  "subscribers_at_backup": 1,
+  "contains_secrets": true,
+  "report_exposes_secrets": false
+}

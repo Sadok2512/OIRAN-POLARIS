@@ -1,0 +1,20 @@
+{
+  "test_id": "OIRAN-E2E-001",
+  "state": "PLANNED_NOT_EXECUTED",
+  "capture_group_id": "OIRAN-E2E-001",
+  "scenario_id": "OIRAN-E2E-001",
+  "duration_seconds": 180,
+  "maximum_total_bytes": 268435456,
+  "rotation_files": 4,
+  "planes": [
+    {"logical_plane":"NG-C","interface":"N2","device":"br-oiran-n2","filter":"sctp and port 38412","state":"READY"},
+    {"logical_plane":"SBI","interface":"SBI","device":"br-oiran-sbi","filter":"tcp port 7777","state":"READY"},
+    {"logical_plane":"N4","interface":"N4","device":"br-oiran-n4","filter":"udp port 8805","state":"READY"},
+    {"logical_plane":"NG-U","interface":"N3","device":"br-oiran-n3","filter":"udp port 2152","state":"READY"}
+  ],
+  "capture_ids": [],
+  "packet_counts": null,
+  "drop_counts": null,
+  "source_sha256": [],
+  "live_capture_executed": false
+}

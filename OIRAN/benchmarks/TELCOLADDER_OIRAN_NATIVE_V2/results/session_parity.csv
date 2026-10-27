@@ -1,0 +1,10 @@
+dataset,oiran_ue_contexts,telcoladder_ue_contexts,oiran_pdu_sessions,telcoladder_pdu_sessions,tshark_session_reconstruction,classification,cross_ue_contamination,evidence
+LAB_TESTBED__5gc-e2e,0,1,0,1,NOT_AVAILABLE,MISSING,UNKNOWN,OIRAN cannot ingest SLL2 corpus; TShark exposes fields but is not a session engine
+LAB_TESTBED__5gc-registration,0,1,0,1,NOT_AVAILABLE,MISSING,UNKNOWN,OIRAN cannot ingest SLL2 corpus; TShark exposes fields but is not a session engine
+LAB_TESTBED__ki-mismatch,0,1,0,0,NOT_AVAILABLE,MISSING,UNKNOWN,OIRAN cannot ingest SLL2 corpus; TShark exposes fields but is not a session engine
+LAB_TESTBED__multi-imsi,0,5,0,5,NOT_AVAILABLE,MISSING,UNKNOWN,OIRAN cannot ingest SLL2 corpus; TShark exposes fields but is not a session engine
+LAB_TESTBED__supi-not-provisioned,0,1,0,0,NOT_AVAILABLE,MISSING,UNKNOWN,OIRAN cannot ingest SLL2 corpus; TShark exposes fields but is not a session engine
+LAB_TESTBED__unknown-dnn,0,1,0,0,NOT_AVAILABLE,MISSING,UNKNOWN,OIRAN cannot ingest SLL2 corpus; TShark exposes fields but is not a session engine
+LAB_TESTBED__userplane,0,1,0,1,NOT_AVAILABLE,MISSING,UNKNOWN,OIRAN cannot ingest SLL2 corpus; TShark exposes fields but is not a session engine
+OIRAN_A,1,1,1,1,EVIDENCE_ONLY,EXACT,NONE_OBSERVED_SINGLE_UE,"PDU session 1, AMF/RAN IDs, PFCP and GTP-U evidence; existing OIRAN N2-N4 STRONG and N4-N3 EXACT edges"
+OIRAN_B,0,0,0,0,NOT_AVAILABLE,EXACT,NOT_APPLICABLE,PFCP heartbeat-only dataset; no session fabricated

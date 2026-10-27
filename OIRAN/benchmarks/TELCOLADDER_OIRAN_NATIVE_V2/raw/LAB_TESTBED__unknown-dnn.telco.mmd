@@ -1,0 +1,29 @@
+sequenceDiagram
+    autonumber
+    participant UE
+    participant gNB
+    participant AMF
+    Note over gNB,AMF: SUPI 001011234567895
+    gNB->>AMF: #35;7 InitialUEMessage
+    UE->>AMF: #35;7 Registration request
+    AMF->>gNB: #35;8 DownlinkNASTransport
+    AMF->>UE: #35;8 Authentication request
+    gNB->>AMF: #35;9 UplinkNASTransport
+    UE->>AMF: #35;9 Authentication response
+    AMF->>gNB: #35;10 DownlinkNASTransport
+    AMF->>UE: #35;10 Security mode command
+    gNB->>AMF: #35;11 UplinkNASTransport
+    AMF->>gNB: #35;14 InitialContextSetup
+    gNB->>AMF: #35;15 InitialContextSetupResponse
+    gNB->>AMF: #35;17 UplinkNASTransport
+    gNB->>AMF: #35;17 UplinkNASTransport
+    AMF->>gNB: #35;18 DownlinkNASTransport
+    AMF->>gNB: #35;19 DownlinkNASTransport
+
+sequenceDiagram
+    autonumber
+    participant gNB
+    participant AMF
+    Note over AMF,AMF: amf_ue_ngap_id 172.22.0.10|172.22.0.23/4
+    AMF->>gNB: #35;12 UEContextRelease
+    gNB->>AMF: #35;13 UEContextReleaseResponse

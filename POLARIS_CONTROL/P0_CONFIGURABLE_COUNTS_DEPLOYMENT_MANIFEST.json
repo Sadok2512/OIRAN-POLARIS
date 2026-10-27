@@ -1,0 +1,38 @@
+{
+  "project": "POLARIS_CONTROL",
+  "mission": "P0_CONFIGURABLE_COUNTS",
+  "deployed_at_utc": "2026-10-25T23:26:24Z",
+  "source_commit": "c0c85d14743a94ced03230178e6d9c7b541a059f",
+  "platform_version": "3.1.1",
+  "api_version": "0.7.1",
+  "controller_version": "0.2.1",
+  "service": "polaris-control.service",
+  "running_pid": 3419133,
+  "api_sha256": "fd46d08b81a4295a648a3b383451a0ab739f4fd3436fecba105358b9db2e51d1",
+  "frontend": {
+    "index_sha256": "c5bf61d2ed3842bcba30fe794443a159aba2d53a4a3edfd29267ac7e2e581ba6",
+    "javascript_sha256": "199af10f24739621ee1a2433090544085ddecf11be35757573f771ebc4d180ea",
+    "stylesheet_sha256": "905c40221e77af63560d81505633c2247ed61e9c614e7366842b2683a6317194"
+  },
+  "configuration": {
+    "path": "/var/lib/polaris-control/configuration.json",
+    "mode": "0600",
+    "ue_count": 1,
+    "gnb_count": 1,
+    "max_ues_configurable": 5,
+    "max_gnbs_configurable": 2,
+    "max_ues_live_certified": 1,
+    "max_gnbs_live_certified": 1
+  },
+  "tests": {
+    "rust": "38/38 PASS",
+    "api": "15/15 PASS",
+    "frontend": "3/3 PASS",
+    "candidate_e2e": "15/15 PASS",
+    "deployed_browser_smoke": "1/1 PASS"
+  },
+  "rollback_directory": "/root/POLARIS_CONTROL/deployment/backups/20261025T2326Z_pre_p0_counts",
+  "new_ue_started": 0,
+  "new_gnb_started": 0,
+  "subscribers_created": 0
+}

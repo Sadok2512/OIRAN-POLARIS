@@ -1,0 +1,4 @@
+protocol,decoder_version,messages_or_packets,fully_decoded,partial,unsupported,malformed,validation
+NGAP,0.2.0,37,9,28,0,0,"581-field combined curated parity; unresolved nested APER documented"
+PFCP,0.2.0,52,52,0,0,0,"observed grouped/leaf IE set aligned with TShark"
+GTP-U,0.1.0,10,10,0,0,0,"fixture only; operational N3 empty"

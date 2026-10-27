@@ -1,0 +1,20 @@
+{
+  "dataset_id": "derived-e2e-002-live-1793054609378-0001",
+  "source_capture_id": "live-1793054609378-0001",
+  "source_dataset_id": "dataset-live-1793054609378-0001",
+  "kind": "OFFLINE_DERIVED_REPLAY",
+  "packet_count": 543,
+  "event_count": 92,
+  "ue_context_count": 1,
+  "pdu_session_count": 1,
+  "pfcp_session_count": 1,
+  "gtpu_tunnel_count": 0,
+  "correlation_edge_count": 3,
+  "source_immutable": true,
+  "registered_in_production": false,
+  "complete_e2e_certified": false,
+  "artifacts": {
+    "oiran_events.jsonl": "sha256:d3526a35cdf0c54f3e4d05750de69ce64e398eeaee3a80390b521786ee053319",
+    "correlation_evidence.json": "sha256:ce266703aca18f30a8e7fd4dcbe38282c11e388460450dd0348fc6e31b5836c2"
+  }
+}

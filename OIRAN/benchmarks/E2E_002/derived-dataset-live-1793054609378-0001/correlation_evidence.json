@@ -1,0 +1,157 @@
+{
+  "correlation_edges": [
+    {
+      "confidence": "EXACT",
+      "edge_id": "edge-ngap-pfcp-exact-tunnel-evt-6aa39fc5d7be13c7-evt-ef283664f688f643",
+      "evidence_description": "A unique NGAP UP transport endpoint/TEID equals a unique PFCP Created-PDR F-TEID in the same capture scope",
+      "evidence_type": "EXACT_TUNNEL_MATCH",
+      "limitations": [
+        "The tunnel match does not by itself prove UE or full session identity"
+      ],
+      "matching_identifiers": [
+        "endpoint_ip=10.77.22.13",
+        "teid=0xb3b5",
+        "capture_scope=live-1793054609378-0001"
+      ],
+      "packet_references": [
+        {
+          "byte_offset": 5224,
+          "captured_length": 250,
+          "interface_id": 0,
+          "original_length": 250,
+          "packet_number": 39,
+          "source_file": "/var/lib/oiran/captures/live-1793054609378-0001/pcap/N2.pcap0"
+        },
+        {
+          "byte_offset": 2750,
+          "captured_length": 158,
+          "interface_id": 0,
+          "original_length": 158,
+          "packet_number": 30,
+          "source_file": "/var/lib/oiran/captures/live-1793054609378-0001/pcap/N4.pcap0"
+        }
+      ],
+      "rule_id": "ngap-pfcp-exact-tunnel",
+      "rule_version": "2.0.0",
+      "scope": "tunnel-only",
+      "source_event_id": "evt-6aa39fc5d7be13c7",
+      "source_interface": "N2",
+      "target_event_id": "evt-ef283664f688f643",
+      "target_interface": "N4"
+    },
+    {
+      "confidence": "STRONG",
+      "edge_id": "edge-ngap-sbi-context-association-evt-6aa39fc5d7be13c7-evt-f4fcc07cfa43194f",
+      "evidence_description": "The uniquely scoped NGAP context and SBI operation share the observed PDU Session ID",
+      "evidence_type": "STRONG_CONTEXT_ASSOCIATION",
+      "limitations": [
+        "No explicit verified NGAP UE identifier to SBI subscriber identity bridge is present"
+      ],
+      "matching_identifiers": [
+        "pdu_session_id=1"
+      ],
+      "packet_references": [
+        {
+          "byte_offset": 5224,
+          "captured_length": 250,
+          "interface_id": 0,
+          "original_length": 250,
+          "packet_number": 39,
+          "source_file": "/var/lib/oiran/captures/live-1793054609378-0001/pcap/N2.pcap0"
+        },
+        {
+          "byte_offset": 52128,
+          "captured_length": 1285,
+          "interface_id": 0,
+          "original_length": 1285,
+          "packet_number": 336,
+          "source_file": "/var/lib/oiran/captures/live-1793054609378-0001/pcap/SBI.pcap0"
+        },
+        {
+          "byte_offset": 58115,
+          "captured_length": 176,
+          "interface_id": 0,
+          "original_length": 176,
+          "packet_number": 363,
+          "source_file": "/var/lib/oiran/captures/live-1793054609378-0001/pcap/SBI.pcap0"
+        },
+        {
+          "byte_offset": 58994,
+          "captured_length": 77,
+          "interface_id": 0,
+          "original_length": 77,
+          "packet_number": 372,
+          "source_file": "/var/lib/oiran/captures/live-1793054609378-0001/pcap/SBI.pcap0"
+        }
+      ],
+      "rule_id": "ngap-sbi-context-association",
+      "rule_version": "2.0.0",
+      "scope": "capture+pdu-session",
+      "source_event_id": "evt-6aa39fc5d7be13c7",
+      "source_interface": "N2",
+      "target_event_id": "evt-f4fcc07cfa43194f",
+      "target_interface": "SBI"
+    },
+    {
+      "confidence": "STRONG",
+      "edge_id": "edge-sbi-pfcp-context-association-evt-f4fcc07cfa43194f-evt-8b759a13fb9b22ac",
+      "evidence_description": "A unique CreateSMContext and PFCP Session Establishment in the same capture scope share DNN and observed SMF procedure context",
+      "evidence_type": "STRONG_CONTEXT_ASSOCIATION",
+      "limitations": [
+        "SM Context reference and PFCP SEIDs are preserved but no direct mapping between them is claimed"
+      ],
+      "matching_identifiers": [
+        "dnn=internet",
+        "sm_context_reference=6",
+        "pfcp_session_identifier=0x0000000000000000",
+        "pfcp_session_identifier=0x0000000000000db8"
+      ],
+      "packet_references": [
+        {
+          "byte_offset": 52128,
+          "captured_length": 1285,
+          "interface_id": 0,
+          "original_length": 1285,
+          "packet_number": 336,
+          "source_file": "/var/lib/oiran/captures/live-1793054609378-0001/pcap/SBI.pcap0"
+        },
+        {
+          "byte_offset": 58115,
+          "captured_length": 176,
+          "interface_id": 0,
+          "original_length": 176,
+          "packet_number": 363,
+          "source_file": "/var/lib/oiran/captures/live-1793054609378-0001/pcap/SBI.pcap0"
+        },
+        {
+          "byte_offset": 58994,
+          "captured_length": 77,
+          "interface_id": 0,
+          "original_length": 77,
+          "packet_number": 372,
+          "source_file": "/var/lib/oiran/captures/live-1793054609378-0001/pcap/SBI.pcap0"
+        },
+        {
+          "byte_offset": 2096,
+          "captured_length": 638,
+          "interface_id": 0,
+          "original_length": 638,
+          "packet_number": 29,
+          "source_file": "/var/lib/oiran/captures/live-1793054609378-0001/pcap/N4.pcap0"
+        }
+      ],
+      "rule_id": "sbi-pfcp-context-association",
+      "rule_version": "2.0.0",
+      "scope": "capture+smf-procedure+dnn",
+      "source_event_id": "evt-f4fcc07cfa43194f",
+      "source_interface": "SBI",
+      "target_event_id": "evt-8b759a13fb9b22ac",
+      "target_interface": "N4"
+    }
+  ],
+  "gtpu_tunnels": 0,
+  "pdu_sessions": 1,
+  "pfcp_sessions": 1,
+  "source_events": 92,
+  "ue_contexts": 1
+}

@@ -1,0 +1,56 @@
+{
+  "ue_contexts": [],
+  "pdu_sessions": [],
+  "pfcp_sessions": [],
+  "gtpu_tunnels": [
+    {
+      "tunnel_id": "tunnel-8989ae276f01d948",
+      "teid": "0x00000003",
+      "source_endpoint": "10.77.22.13",
+      "destination_endpoint": "10.77.22.20",
+      "direction": "UNKNOWN",
+      "related_pfcp_session": null,
+      "first_timestamp_ns": 1792880563771183693,
+      "last_timestamp_ns": 1792880563771427572,
+      "packet_count": 5,
+      "byte_count": 720,
+      "event_ids": [
+        "evt-591152b26f3476bb",
+        "evt-8a9961b49886acdd",
+        "evt-abd370de060206d0",
+        "evt-ef07d13dddd6479c",
+        "evt-e16b0356b5d74aae"
+      ]
+    },
+    {
+      "tunnel_id": "tunnel-0e9a73185ce65843",
+      "teid": "0x000096a8",
+      "source_endpoint": "10.77.22.20",
+      "destination_endpoint": "10.77.22.13",
+      "direction": "UNKNOWN",
+      "related_pfcp_session": null,
+      "first_timestamp_ns": 1792880563765541804,
+      "last_timestamp_ns": 1792880563765659669,
+      "packet_count": 5,
+      "byte_count": 580,
+      "event_ids": [
+        "evt-31143717c19295f9",
+        "evt-2c8a6122de353cce",
+        "evt-28f6ad1b8135af80",
+        "evt-3f0b26ce9a226d60",
+        "evt-86d26f7c5e312eeb"
+      ]
+    }
+  ],
+  "procedures": [],
+  "background_event_ids": [],
+  "unmatched_event_ids": [],
+  "duplicate_observations": [],
+  "event_accounting": {
+    "background_events": 0,
+    "duplicate_observations": 0,
+    "session_events": 10,
+    "source_events": 10,
+    "unmatched_events": 0
+  }
+}

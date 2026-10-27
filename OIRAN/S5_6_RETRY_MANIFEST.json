@@ -1,0 +1,44 @@
+{
+  "project": "OIRAN",
+  "mission": "S5_6_CORRECTED_PRODUCTION_DEPLOYMENT",
+  "source_commit": "d7d8ec700b1b1f90222a44ba10f74d24913c5fa4",
+  "deployment_timestamp_utc": "2026-10-26T21:03:50Z",
+  "api": {
+    "service": "oiran-api.service",
+    "pid": 3897041,
+    "executable": "/opt/oiran/bin/oiran-api",
+    "sha256": "1d928d0175d9cc4a40e76e600920d0dbe4630b476ce3531bf2badc6b8a7fd191",
+    "port": 49152
+  },
+  "capture_helper": {
+    "service": "oiran-capture-helper.service",
+    "pid": 3891823,
+    "executable": "/opt/oiran/bin/oiran-capture-helper",
+    "sha256": "b26963459cad9810cdda6ae31ff2ab446b842835cd5db14375746f206b6c5850",
+    "socket": "/run/oiran/capture-helper.sock"
+  },
+  "frontend_tree_sha256": "76ddbd52e8988660dbf1b4b4057f55ef0edfe683d595a3751f5bc7118a33ad7a",
+  "validation": {
+    "ng_c": "PASS",
+    "sbi": "PASS",
+    "n4": "PASS",
+    "ng_u": "PASS",
+    "four_plane": "PASS",
+    "live_capture_executed": false,
+    "simulator_traffic_generated": false
+  },
+  "tests": {
+    "rust": "172/172 PASS",
+    "api": "19/19 PASS",
+    "frontend": "19/19 PASS",
+    "e2e": "46/46 PASS"
+  },
+  "safety": {
+    "disk_usage_percent": 63,
+    "disk_available_bytes": 154838474752,
+    "inodes_available": 51125024,
+    "capture_request_max_bytes": 268435456,
+    "state": "NORMAL"
+  },
+  "backup": "/var/backups/oiran/s5_6_retry_20261026T210023Z"
+}

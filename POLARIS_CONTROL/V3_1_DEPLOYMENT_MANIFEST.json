@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.0",
+  "project": "POLARIS_CONTROL",
+  "mission": "V3_1_PRODUCTION_DEPLOYMENT",
+  "deployment_timestamp_utc": "2026-10-25T23:09:38Z",
+  "verification_timestamp_utc": "2026-10-25T23:11:33Z",
+  "deployed_source_commit": "09e43ff26e1577907318e752acc7d62cd53f9e87",
+  "service": {
+    "name": "polaris-control.service",
+    "pid": 3349866,
+    "port": 49153,
+    "url": "https://polaris.etv-sadok.duckdns.org/"
+  },
+  "versions": {
+    "platform": "3.1.0",
+    "api": "0.7.0",
+    "multi_ue_controller": "0.2.0",
+    "ueransim_adapter": "0.2.0"
+  },
+  "sha256": {
+    "api": "c685ea3220f3fdf08beae9da4e47981e2ad63efdcafb5a298ea7deb859edaa70",
+    "frontend_aggregate": "c47cc71d4991f8a34df58b955a3616634ec436847291b4b65cfa73543397e7c0",
+    "frontend_index": "a86a6a3099213f7c41d34a33c4343c5f319a93419c50fed0a517743158efa3d2",
+    "systemd_unit": "2e409c6ff5b57cdbb16d5f41d56d5a1425cf7797eb52592a63c2aaf231447b8e"
+  },
+  "capacity": {
+    "max_ues_configurable": 5,
+    "max_ues_live_certified": 1,
+    "max_gnb_configurable": 2,
+    "max_gnb_live_certified": 1
+  },
+  "tests": {
+    "rust": "34/34 PASS",
+    "api": "13/13 PASS",
+    "frontend": "3/3 PASS",
+    "e2e_production": "12/12 PASS"
+  },
+  "live_actions": {
+    "new_ues_started": 0,
+    "new_gnbs_started": 0,
+    "subscribers_created": 0,
+    "simulator_traffic_generated": false
+  },
+  "rollback_backup": "deployment/backups/20261025T2307Z_pre_v3_1"
+}

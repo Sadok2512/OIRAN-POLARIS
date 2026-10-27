@@ -1,0 +1,59 @@
+{
+  "method": {
+    "warmup_runs": 1,
+    "measured_runs": 5,
+    "packets": 4205,
+    "files": 13,
+    "memory_allocations": "NOT_MEASURED"
+  },
+  "median_total_seconds": 0.02,
+  "min_total_seconds": 0.02,
+  "max_total_seconds": 0.03,
+  "median_packets_per_second": 210250.0,
+  "peak_rss_kib": 4188,
+  "mean_cpu_percent": 80.70769230769231,
+  "runs": [
+    {
+      "iteration": 0,
+      "warmup": true,
+      "total_seconds": 0.02,
+      "peak_rss_kib": 4184,
+      "mean_cpu_percent": 77.0
+    },
+    {
+      "iteration": 1,
+      "warmup": false,
+      "total_seconds": 0.02,
+      "peak_rss_kib": 4188,
+      "mean_cpu_percent": 83.07692307692308
+    },
+    {
+      "iteration": 2,
+      "warmup": false,
+      "total_seconds": 0.03,
+      "peak_rss_kib": 4184,
+      "mean_cpu_percent": 79.53846153846153
+    },
+    {
+      "iteration": 3,
+      "warmup": false,
+      "total_seconds": 0.02,
+      "peak_rss_kib": 4188,
+      "mean_cpu_percent": 84.07692307692308
+    },
+    {
+      "iteration": 4,
+      "warmup": false,
+      "total_seconds": 0.02,
+      "peak_rss_kib": 4184,
+      "mean_cpu_percent": 69.76923076923077
+    },
+    {
+      "iteration": 5,
+      "warmup": false,
+      "total_seconds": 0.02,
+      "peak_rss_kib": 4188,
+      "mean_cpu_percent": 87.07692307692308
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+export function MetricStrip({items}:{items:{label:string;value:string|number;tone?:string}[]}){return <div className="metric-strip">{items.map(x=><div className="metric" key={x.label}><span>{x.label}</span><strong className={x.tone}>{x.value}</strong></div>)}</div>}

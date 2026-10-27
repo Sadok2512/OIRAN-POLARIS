@@ -1,0 +1,1 @@
+{"schema_version":"1.1.0","fields":["scenario_id","synthetic_ue_pseudonym","serving_gnb","start_timestamp","end_timestamp","capture_id","capture_interface","dataset_id","session_id","dataset_manifest","session_references"],"decoded_events_supplied":false,"correlation_results_supplied":false,"identity_secrets_supplied":false}

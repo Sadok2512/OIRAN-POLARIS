@@ -1,0 +1,17 @@
+[workspace]
+members = [
+  "apps/api",
+  "crates/safety-guard",
+  "crates/job-registry",
+  "crates/scenario-engine",
+  "crates/traffic-engine",
+  "crates/ueransim-adapter",
+  "crates/simulator-controller",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Proprietary"
+rust-version = "1.75"
+

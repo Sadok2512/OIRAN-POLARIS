@@ -1,0 +1,2 @@
+No 5G signalling found in N2.pcap.
+Supported: NGAP / NAS-5GS / PFCP / HTTP/2 SBI / GTP-U. If the SBI in this capture is encrypted, its contents are invisible to this tool.

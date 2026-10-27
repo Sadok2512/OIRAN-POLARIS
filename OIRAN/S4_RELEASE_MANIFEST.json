@@ -1,0 +1,57 @@
+{
+  "project": "OIRAN",
+  "mission": "S4_PREMIUM_WEB_APPLICATION_INTEGRATION",
+  "generated_at": "2026-10-24T23:18:00Z",
+  "source_git_commit": "ac1b8ef927ab55c7eacfdeedef53ada99d994222",
+  "base_commit": "15804dee6bb15e9eb6ad75ef1a15afb78124ce37",
+  "branch": "feat/s4-premium-web-app",
+  "versions": {
+    "platform": "1.0.0-dev",
+    "frontend": "1.0.0-dev",
+    "backend_api": "1.0.0",
+    "rust_vprobe": "1.0.0-dev",
+    "event_schema": "1.2.0",
+    "callflow_schema": "1.0.0",
+    "session_engine": "0.1.0",
+    "correlation_engine": "0.1.0",
+    "decoders": {
+      "ngap": "0.2.0",
+      "pfcp": "0.2.0",
+      "gtpu": "0.1.0"
+    }
+  },
+  "modules": {
+    "probe-manager": "1.0.0-dev",
+    "session-explorer": "1.0.0-dev",
+    "callflow-viewer": "1.0.0-dev",
+    "correlation-studio": "1.0.0-dev",
+    "settings": "1.0.0-dev",
+    "module-versions": "1.0.0-dev"
+  },
+  "certified_dataset": {
+    "id": "OIRAN_5G_PDU_SESSION_DATA_V1",
+    "source_events": 54,
+    "session_events": 26,
+    "background_events": 28,
+    "correlation_edges": 12,
+    "provenance": "54/54"
+  },
+  "build_sha256": {
+    "target/release/oiran-api": "176414e4c7374f28eac1bea88b247030f61a59d33b9b018c9f9cc220cb16bf3c",
+    "apps/web/dist/index.html": "30ec33ba01dfd3d36ce5861ccdad11bb8fa7c461e272a7f0df260d0596bb4b15",
+    "apps/web/dist/assets/index-BQvoP4ec.js": "ef1a2ad1028132e7897f081763f99ff7fc0ea249f245067e651031de612975e5",
+    "apps/web/dist/assets/index-Dh3rAlzA.css": "3750d118740a8ab3dca81ca0791c8a5a53a64b3ce2262a15e63d4920cf86afa7"
+  },
+  "immutable_input_sha256": {
+    "OIRAN_5G_E2E_CALLFLOW.json": "bc89ddd79d23af2ad53a5bc0b46e69c988fbc02d69b92c9462ece760b27432cb",
+    "OIRAN_5G_E2E_CALLFLOW.html": "024d34492e713666d4ec318575fdb30f44d3c937b960d75c117bb22057c8a8f5"
+  },
+  "test_results": {
+    "rust": "71/71 PASS",
+    "frontend": "8/8 PASS",
+    "e2e": "25/25 PASS",
+    "npm_vulnerabilities": 0
+  },
+  "deployment": "NOT_STARTED_LOCAL_BUILD_ONLY",
+  "status": "S4_CERTIFIED"
+}

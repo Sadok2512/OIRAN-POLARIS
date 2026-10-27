@@ -1,0 +1,6 @@
+packet_error=1 InvalidNetwork at byte 24: unsupported EtherType 0x0806
+packet_error=2 InvalidNetwork at byte 82: unsupported EtherType 0x0806
+packet_error=15 InvalidNetwork at byte 1028: unsupported EtherType 0x0806
+packet_error=16 InvalidNetwork at byte 1086: unsupported EtherType 0x0806
+packet_error=21 InvalidNetwork at byte 1440: unsupported EtherType 0x0806
+packet_error=22 InvalidNetwork at byte 1498: unsupported EtherType 0x0806

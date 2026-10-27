@@ -1,0 +1,47 @@
+{
+  "project": "POLARIS_CONTROL",
+  "mission": "HOST_CGROUP_AWARE_CPU_SAFETY_CORRECTION",
+  "version": "3.2.1",
+  "deployed_at_utc": "2026-10-26T22:32:48Z",
+  "source_commit": "0314b8a20dd10e64e1b802e1c00aadfb1ff98147",
+  "branch": "feat/v3-2-1-cpu-safety",
+  "service": "polaris-control.service",
+  "running_pid": 19295,
+  "api_sha256": "141605dfa8a506c233091dc6f226a47677fcf991d3d672743bc3ff57dcd7b1e8",
+  "frontend": {
+    "index_sha256": "94c4ba896637c7b48bb74a58d06f72f31aa1a50a6136b9bf6407462f15a7146e",
+    "javascript_sha256": "03634e8228a651648f9f08f395b5c16439488d319aab1e89ba01c5897ee6cef3",
+    "css_sha256": "905c40221e77af63560d81505633c2247ed61e9c614e7366842b2683a6317194"
+  },
+  "tests": {
+    "rust": "84/84 PASS",
+    "api": "50/50 PASS",
+    "frontend": "5/5 PASS",
+    "e2e": "2/2 PASS"
+  },
+  "final_evidence": {
+    "host_cpu_count": 10,
+    "host_cpu_utilization_percent": 17.33,
+    "host_cpu_idle_percent": 76.95,
+    "host_cpu_steal_percent": 0.80,
+    "api_cgroup_capacity_cpus": 1.0,
+    "ue_target_capacity_cpus": 0.75,
+    "cpu_psi_some_avg10_percent": 5.01,
+    "cpu_safety_state": "READY",
+    "telemetry_age_ms": 656,
+    "disk_usage_percent": 65.63,
+    "ram_available_bytes": 8995676160
+  },
+  "runtime": {
+    "registered_ues": 3,
+    "active_pdu_sessions": 3,
+    "ue_04_running": false
+  },
+  "live_actions": {
+    "new_ues_started": 0,
+    "traffic_generated": false,
+    "capture_executed": false
+  },
+  "backup_path": "/root/POLARIS_CONTROL/backups/v3_2_1_20261026T223500Z",
+  "rollback_ready": true
+}

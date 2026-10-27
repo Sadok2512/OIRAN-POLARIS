@@ -1,0 +1,172 @@
+{
+  "summary_version": 1,
+  "source": "ki-mismatch.pcap",
+  "capture": {
+    "frames_total": null,
+    "frames_decoded": 4,
+    "messages": 4,
+    "flows": 1,
+    "duration_s": null,
+    "signalling_span_s": 0.019,
+    "started_at": "2026-08-17T11:07:49.746000+00:00",
+    "protocols": [
+      "ngap"
+    ]
+  },
+  "not_visible": {
+    "ciphered_nas": 0,
+    "ecies_protected_suci": 0,
+    "only_n2": true,
+    "frames_not_decoded": null,
+    "sbi_streams_with_undecoded_headers": 0,
+    "narrowed": [],
+    "auto_decode": [],
+    "undecoded_traffic": [],
+    "coverage_notes": []
+  },
+  "network_elements": [
+    {
+      "role": "gNB",
+      "ip": "172.22.0.23",
+      "ports": [
+        35786
+      ],
+      "messages": 4
+    },
+    {
+      "role": "AMF",
+      "ip": "172.22.0.10",
+      "ports": [
+        38412
+      ],
+      "messages": 4
+    }
+  ],
+  "subscribers": [
+    {
+      "supi": "001011234567895",
+      "flows": 1,
+      "messages": 4,
+      "failures": 2,
+      "aliases": [
+        {
+          "kind": "amf_ue_ngap_id",
+          "value": "3",
+          "scope": "172.22.0.10|172.22.0.23"
+        },
+        {
+          "kind": "ran_ue_ngap_id",
+          "value": "3",
+          "scope": "172.22.0.10|172.22.0.23"
+        }
+      ],
+      "pdu_sessions": []
+    }
+  ],
+  "unlinked_identities": [],
+  "procedures": [
+    {
+      "procedure": "registration",
+      "supi": "001011234567895",
+      "outcome": "failure",
+      "cause": "Protocol error; the spec does not say more than that. This is the least informative cause there is - it means roughly \"I cannot make sense of this message, but I cannot tell you what is wrong with it\".",
+      "root_cause": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "pdu_session_id": null,
+      "start_frame": 7,
+      "end_frame": 10,
+      "messages": 4,
+      "failures": 2,
+      "duration_s": 0.019,
+      "protocols": [
+        "ngap"
+      ],
+      "note": "",
+      "cause_ref": {
+        "table": "nas_5gmm",
+        "value": 111,
+        "known": true,
+        "name": "Protocol error, unspecified",
+        "spec": "3GPP TS 24.501",
+        "clause": "§9.11.3.2"
+      },
+      "root_cause_ref": {
+        "table": "nas_5gmm",
+        "value": 21,
+        "known": true,
+        "name": "Synch failure",
+        "spec": "3GPP TS 24.501",
+        "clause": "§9.11.3.2"
+      }
+    }
+  ],
+  "failures": [
+    {
+      "frame": 9,
+      "ts": 0.017,
+      "protocol": "ngap",
+      "from": "gNB",
+      "to": "AMF",
+      "message": "UplinkNASTransport ▸ Authentication failure",
+      "supi": "001011234567895",
+      "cause": {
+        "table": "nas_5gmm",
+        "value": 21,
+        "known": true,
+        "name": "Synch failure",
+        "spec": "3GPP TS 24.501",
+        "clause": "§9.11.3.2"
+      },
+      "explanation": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "common_causes": [
+        "The same SIM in use on two core networks at once",
+        "A UDM database rollback that moved SQN backwards"
+      ]
+    },
+    {
+      "frame": 10,
+      "ts": 0.019,
+      "protocol": "ngap",
+      "from": "AMF",
+      "to": "gNB",
+      "message": "DownlinkNASTransport ▸ Registration reject",
+      "supi": "001011234567895",
+      "cause": {
+        "table": "nas_5gmm",
+        "value": 111,
+        "known": true,
+        "name": "Protocol error, unspecified",
+        "spec": "3GPP TS 24.501",
+        "clause": "§9.11.3.2"
+      },
+      "explanation": "Protocol error; the spec does not say more than that. This is the least informative cause there is - it means roughly \"I cannot make sense of this message, but I cannot tell you what is wrong with it\".",
+      "common_causes": [
+        "An authentication key mismatch: when Ki or OPc disagree, the UE answers Synch failure (#21) first, the AUTS it computes cannot be used by the network to resynchronise, and the network ends up rejecting with this cause. A #21 immediately followed by #111 is almost always a key problem (seen in tests/fixtures/ki-mismatch)",
+        "Encode/decode incompatibility, common when equipment from different vendors interconnects",
+        "A mandatory IE missing, or a length field computed wrongly",
+        "A 3GPP release gap where an older peer refuses a newer IE"
+      ]
+    }
+  ],
+  "cause_rollup": [
+    {
+      "cause": "Protocol error; the spec does not say more than that. This is the least informative cause there is - it means roughly \"I cannot make sense of this message, but I cannot tell you what is wrong with it\".",
+      "count": 1,
+      "frames": [
+        10
+      ],
+      "supis": [
+        "001011234567895"
+      ]
+    },
+    {
+      "cause": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "count": 1,
+      "frames": [
+        9
+      ],
+      "supis": [
+        "001011234567895"
+      ]
+    }
+  ]
+}

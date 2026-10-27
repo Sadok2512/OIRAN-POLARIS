@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0.0",
+  "project": "OIRAN",
+  "mission": "S4_2_FULL_SESSION_CAPTURE",
+  "scenario_id": "OIRAN_5G_MULTI_UE_S4_2",
+  "execution_status": "NOT_RUN_AWAITING_APPROVAL",
+  "synthetic_ue_target": 5,
+  "captures": [],
+  "normalized_events": null,
+  "callflows": [],
+  "correlation_edges": 0,
+  "provenance_coverage": "NOT_AVAILABLE",
+  "disk_policy": {
+    "information_percent": 75,
+    "warning_percent": 80,
+    "stop_percent": 85,
+    "hard_limit_percent": 90,
+    "max_file_bytes": 268435456,
+    "max_files": 8,
+    "max_job_seconds": 900,
+    "max_concurrent_jobs": 1,
+    "poll_interval_ms": 1000,
+    "failure_mode": "FAIL_CLOSED",
+    "automatic_cleanup": false
+  },
+  "blocker": "Explicit approval is required for new POLARIS UE profiles/processes and scenario-owned captures",
+  "existing_reference_dataset": "OIRAN_5G_PDU_SESSION_DATA_V1"
+}

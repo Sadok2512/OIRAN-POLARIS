@@ -1,0 +1,49 @@
+{
+  "xdr_version": 1,
+  "source": "ki-mismatch.pcap",
+  "procedures": [
+    {
+      "procedure": "registration",
+      "supi": "001011234567895",
+      "outcome": "failure",
+      "cause": "Protocol error; the spec does not say more than that. This is the least informative cause there is - it means roughly \"I cannot make sense of this message, but I cannot tell you what is wrong with it\".",
+      "root_cause": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "pdu_session_id": null,
+      "start_frame": 7,
+      "end_frame": 10,
+      "messages": 7,
+      "failures": 2,
+      "duration_s": 0.019,
+      "protocols": [
+        "nas-5gs",
+        "ngap"
+      ],
+      "note": ""
+    }
+  ],
+  "messages_total": 8,
+  "messages_in_procedures": 7,
+  "messages_unassigned": 1,
+  "cause_rollup": [
+    {
+      "cause": "Protocol error; the spec does not say more than that. This is the least informative cause there is - it means roughly \"I cannot make sense of this message, but I cannot tell you what is wrong with it\".",
+      "count": 1,
+      "frames": [
+        10
+      ],
+      "supis": [
+        "001011234567895"
+      ]
+    },
+    {
+      "cause": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "count": 1,
+      "frames": [
+        9
+      ],
+      "supis": [
+        "001011234567895"
+      ]
+    }
+  ]
+}

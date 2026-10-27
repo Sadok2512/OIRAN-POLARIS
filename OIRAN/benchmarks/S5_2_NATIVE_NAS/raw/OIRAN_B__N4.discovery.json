@@ -1,0 +1,38 @@
+{
+  "ue_contexts": [],
+  "pdu_sessions": [],
+  "pfcp_sessions": [],
+  "gtpu_tunnels": [],
+  "procedures": [],
+  "background_event_ids": [
+    "evt-6da56d5b8fceef37",
+    "evt-1c5afc4de96e286e",
+    "evt-a627e32f7d90d60b",
+    "evt-513f65b4d461c689",
+    "evt-7052aba511b59f0c",
+    "evt-2a92989ab7fd3200",
+    "evt-c06a59300f480394",
+    "evt-c797a13749f0ab3b",
+    "evt-97358c7858da9722",
+    "evt-070f50ed192b33ba",
+    "evt-e2beadb2bc3d77e0",
+    "evt-9952ef9b53d71987",
+    "evt-bb1b019e75b5e9e3",
+    "evt-50876d8959701074",
+    "evt-9988cffbe8fe2add",
+    "evt-5e1b1b582609954f",
+    "evt-c755a19dcd07537a",
+    "evt-8de3c5fb3390c143",
+    "evt-3fd85ab0b697a1b5",
+    "evt-b4ae30236f1e0c45"
+  ],
+  "unmatched_event_ids": [],
+  "duplicate_observations": [],
+  "event_accounting": {
+    "background_events": 20,
+    "duplicate_observations": 0,
+    "session_events": 0,
+    "source_events": 20,
+    "unmatched_events": 0
+  }
+}

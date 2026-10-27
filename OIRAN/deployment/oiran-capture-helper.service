@@ -1,0 +1,42 @@
+[Unit]
+Description=OIRAN isolated native packet capture helper
+After=network.target
+Before=oiran-api.service
+
+[Service]
+Type=simple
+User=oiran-capture
+Group=oiran-capture
+EnvironmentFile=/etc/oiran/capture-helper.env
+ExecStart=/opt/oiran/bin/oiran-capture-helper
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=oiran
+RuntimeDirectoryMode=0750
+StateDirectory=oiran
+StateDirectoryMode=0770
+UMask=0007
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+RestrictAddressFamilies=AF_UNIX AF_PACKET
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+ReadWritePaths=/run/oiran /var/lib/oiran
+MemoryMax=256M
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

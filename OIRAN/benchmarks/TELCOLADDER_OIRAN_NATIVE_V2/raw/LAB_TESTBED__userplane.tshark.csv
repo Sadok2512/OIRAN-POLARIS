@@ -1,0 +1,42 @@
+frame.number,frame.time_epoch,_ws.col.protocol,_ws.col.info,ngap.procedureCode,ngap.AMF_UE_NGAP_ID,ngap.RAN_UE_NGAP_ID,nas-5gs.mm.message_type,nas-5gs.sm.message_type,pfcp.seid,gtp.teid
+"68","1787314725.046643000","PFCP","PFCP Heartbeat Request",,,,,,,
+"69","1787314725.046751000","PFCP","PFCP Heartbeat Response",,,,,,,
+"70","1787314725.046774000","PFCP","PFCP Heartbeat Request",,,,,,,
+"71","1787314725.046842000","PFCP","PFCP Heartbeat Response",,,,,,,
+"134","1787314728.539701000","NGAP/NAS-5GS","InitialUEMessage, Registration request","15",,"3","0x41",,,
+"141","1787314728.541565000","PFCP","PFCP Session Deletion Request",,,,,,"0x00000000000005aa",
+"142","1787314728.541672000","PFCP","PFCP Session Deletion Response",,,,,,"0x0000000000000420",
+"209","1787314728.547806000","NGAP/NAS-5GS","SACK (Ack=0, Arwnd=106496) , DownlinkNASTransport, Authentication request","4","3","3","0x56",,,
+"210","1787314728.550866000","NGAP/NAS-5GS","SACK (Ack=0, Arwnd=106496) , UplinkNASTransport, Authentication response","46","3","3","0x57",,,
+"243","1787314728.555344000","NGAP/NAS-5GS","SACK (Ack=1, Arwnd=106496) , DownlinkNASTransport, Security mode command","4","3","3","0x5d",,,
+"244","1787314728.557364000","NGAP/NAS-5GS","SACK (Ack=1, Arwnd=106496) , UplinkNASTransport","46","3","3",,,,
+"245","1787314728.557655000","NGAP","SACK (Ack=2, Arwnd=106496) , UEContextReleaseCommand","41","2","2",,,,
+"249","1787314728.557769000","NGAP","SACK (Ack=2, Arwnd=106496) , UEContextReleaseComplete","41","2","2",,,,
+"311","1787314728.562785000","NGAP/NAS-5GS","SACK (Ack=3, Arwnd=106496) , InitialContextSetupRequest","14","3","3",,,,
+"312","1787314728.562921000","NGAP","SACK (Ack=3, Arwnd=106496) , InitialContextSetupResponse","14","3","3",,,,
+"315","1787314728.770599000","NGAP/NAS-5GS","UplinkNASTransport, UplinkNASTransport","46,46","3,3","3,3",,,,
+"316","1787314728.771064000","NGAP/NAS-5GS","SACK (Ack=6, Arwnd=106496) , DownlinkNASTransport","4","3","3",,,,
+"392","1787314728.778510000","PFCP","PFCP Session Establishment Request",,,,,,"0x0000000000000000,0x0000000000000204",
+"393","1787314728.778836000","PFCP","PFCP Session Establishment Response",,,,,,"0x0000000000000204,0x000000000000073f",
+"402","1787314728.779620000","NGAP/NAS-5GS","PDUSessionResourceSetupRequest","29","3","3",,,,
+"409","1787314728.780708000","NGAP","PDUSessionResourceSetupResponse","29","3","3",,,,
+"416","1787314728.782581000","PFCP","PFCP Session Modification Request",,,,,,"0x000000000000073f",
+"417","1787314728.782711000","PFCP","PFCP Session Modification Response",,,,,,"0x0000000000000204",
+"502","1787314736.047117000","PFCP","PFCP Heartbeat Request",,,,,,,
+"503","1787314736.047254000","PFCP","PFCP Heartbeat Response",,,,,,,
+"504","1787314736.047280000","PFCP","PFCP Heartbeat Request",,,,,,,
+"505","1787314736.047330000","PFCP","PFCP Heartbeat Response",,,,,,,
+"548","1787314743.442980000","GTP <ICMP>","Echo (ping) request  id=0x0002, seq=1/256, ttl=64",,,,,,,"0x00000003"
+"549","1787314743.746148000","GTP <ICMP>","Echo (ping) request  id=0x0002, seq=2/512, ttl=64",,,,,,,"0x00000003"
+"550","1787314744.050679000","GTP <ICMP>","Echo (ping) request  id=0x0002, seq=3/768, ttl=64",,,,,,,"0x00000003"
+"556","1787314744.354686000","GTP <ICMP>","Echo (ping) request  id=0x0002, seq=4/1024, ttl=64",,,,,,,"0x00000003"
+"557","1787314744.662154000","GTP <ICMP>","Echo (ping) request  id=0x0002, seq=5/1280, ttl=64",,,,,,,"0x00000003"
+"568","1787314744.969815000","GTP <ICMP>","Echo (ping) request  id=0x0002, seq=6/1536, ttl=64",,,,,,,"0x00000003"
+"579","1787314745.273788000","GTP <ICMP>","Echo (ping) request  id=0x0002, seq=7/1792, ttl=64",,,,,,,"0x00000003"
+"590","1787314745.577769000","GTP <ICMP>","Echo (ping) request  id=0x0002, seq=8/2048, ttl=64",,,,,,,"0x00000003"
+"601","1787314745.882856000","GTP <ICMP>","Echo (ping) request  id=0x0002, seq=9/2304, ttl=64",,,,,,,"0x00000003"
+"602","1787314746.185759000","GTP <ICMP>","Echo (ping) request  id=0x0002, seq=10/2560, ttl=64",,,,,,,"0x00000003"
+"623","1787314747.056791000","PFCP","PFCP Heartbeat Request",,,,,,,
+"624","1787314747.056826000","PFCP","PFCP Heartbeat Request",,,,,,,
+"625","1787314747.056881000","PFCP","PFCP Heartbeat Response",,,,,,,
+"626","1787314747.056908000","PFCP","PFCP Heartbeat Response",,,,,,,

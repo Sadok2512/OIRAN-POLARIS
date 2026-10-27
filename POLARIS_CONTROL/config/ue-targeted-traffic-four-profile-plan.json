@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "purpose": "OFFLINE_CONFIGURATION_PLAN",
+  "apply_to_production": false,
+  "desired_ue_count": 4,
+  "profiles": [
+    { "ue_id": "UE-01", "ownership": "SHARED_PROTECTED", "traffic_selectable": false },
+    { "ue_id": "UE-02", "ownership": "CONTROLLER_OWNED", "traffic_selectable_when_runtime_verified": true },
+    { "ue_id": "UE-03", "ownership": "CONTROLLER_OWNED", "traffic_selectable_when_runtime_verified": true },
+    { "ue_id": "UE-04", "ownership": "CONTROLLER_OWNED", "traffic_selectable_when_runtime_verified": true }
+  ],
+  "traffic_profile": {
+    "id": "bounded-controller-ue-udp-v1",
+    "protocol": "UDP",
+    "destination": "10.46.0.1",
+    "destination_port": 49001,
+    "packet_count": 5,
+    "packet_size_bytes": 64,
+    "interval_seconds": 1
+  },
+  "execution_authorized": false
+}

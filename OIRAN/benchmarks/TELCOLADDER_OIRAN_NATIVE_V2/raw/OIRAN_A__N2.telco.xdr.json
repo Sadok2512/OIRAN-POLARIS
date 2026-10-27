@@ -1,0 +1,45 @@
+{
+  "xdr_version": 1,
+  "source": "N2.pcapng",
+  "procedures": [
+    {
+      "procedure": "registration",
+      "supi": "001010000000001",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 3,
+      "end_frame": 17,
+      "messages": 15,
+      "failures": 0,
+      "duration_s": 0.292,
+      "protocols": [
+        "nas-5gs",
+        "ngap"
+      ],
+      "note": ""
+    },
+    {
+      "procedure": "ue-context-release",
+      "supi": null,
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": null,
+      "start_frame": 8,
+      "end_frame": 9,
+      "messages": 2,
+      "failures": 0,
+      "duration_s": 0.0,
+      "protocols": [
+        "ngap"
+      ],
+      "note": ""
+    }
+  ],
+  "messages_total": 18,
+  "messages_in_procedures": 17,
+  "messages_unassigned": 1,
+  "cause_rollup": []
+}

@@ -1,0 +1,19 @@
+[package]
+name = "live-probe"
+version = "0.1.0-dev"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+capture-helper = { path = "../capture-helper" }
+callflow-renderer = { path = "../callflow-renderer" }
+callflow-schema = { path = "../callflow-schema" }
+correlation-engine = { path = "../correlation-engine" }
+disk-safety = { path = "../disk-safety" }
+event-schema = { path = "../event-schema" }
+oiran-decode = { path = "../oiran-decode" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+session-engine = { path = "../session-engine" }
+libc = "0.2"

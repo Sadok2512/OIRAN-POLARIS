@@ -1,0 +1,1214 @@
+sequenceDiagram
+    autonumber
+    participant AMF
+    participant SCP
+    participant AUSF
+    participant UDM
+    participant UDR
+    participant PCF
+    participant BSF
+    participant NRF
+    participant SMF
+    participant UPF
+    participant N10 as 172.22.0.28
+    Note over NRF,N10: Unidentified flow
+    NRF->>SCP: #35;7 204
+    SCP->>SMF: #35;9 204
+    NRF->>SCP: #35;19 204
+    SCP->>PCF: #35;21 204
+    SMF->>UPF: #35;23 Heartbeat Request
+    UPF->>SMF: #35;24 Heartbeat Response
+    UPF->>SMF: #35;25 Heartbeat Request
+    SMF->>UPF: #35;26 Heartbeat Response
+    NRF->>SCP: #35;33 204
+    SCP->>AMF: #35;35 204
+    NRF->>SCP: #35;40 204
+    NRF->>SCP: #35;50 204
+    SCP->>N10: #35;52 204
+    NRF->>SCP: #35;60 204
+    SCP->>UDM: #35;62 204
+    SCP->>NRF: #35;70 PATCH /nnrf-nfm/v1/nf-instances/df19a060-9a4b-41f1-86c9-9d3de05ba3c9
+    SCP->>NRF: #35;73 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    NRF->>SCP: #35;76 204
+    NRF->>SCP: #35;77 204
+    SCP->>BSF: #35;79 204
+    SCP->>AUSF: #35;81 204
+    SCP->>NRF: #35;86 PATCH /nnrf-nfm/v1/nf-instances/df1a1216-9a4b-41f1-8c6e-e761e6369f1a
+    NRF->>SCP: #35;89 204
+    SCP->>UDR: #35;90 204
+    SCP->>NRF: #35;98 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    NRF->>SCP: #35;101 204
+    SCP->>SMF: #35;103 204
+    AMF->>SCP: #35;106 POST /nausf-auth/v1/ue-authentications
+    SCP->>AUSF: #35;121 POST /nausf-auth/v1/ue-authentications
+    AUSF->>SCP: #35;185 201
+    SCP->>AMF: #35;188 201
+    AMF->>SCP: #35;194 POST /nausf-auth/v1/ue-authentications
+    SCP->>AUSF: #35;197 POST /nausf-auth/v1/ue-authentications
+    SCP->>UDM: #35;213 204
+    AUSF->>SCP: #35;220 201
+    SCP->>AMF: #35;223 201
+    AMF->>SCP: #35;228 PUT /nausf-auth/v1/ue-authentications/2/5g-aka-confirmation
+    SCP->>AUSF: #35;231 PUT /nausf-auth/v1/ue-authentications/2/5g-aka-confirmation
+    AUSF->>SCP: #35;254 200
+    SCP->>AMF: #35;257 200
+    AMF->>SCP: #35;318 POST /npcf-am-policy-control/v1/policies
+    SCP->>PCF: #35;333 POST /npcf-am-policy-control/v1/policies
+    PCF->>SCP: #35;350 201
+    SCP->>AMF: #35;353 201
+    SMF->>SCP: #35;416 POST /npcf-smpolicycontrol/v1/sm-policies
+    SCP->>PCF: #35;420 POST /npcf-smpolicycontrol/v1/sm-policies
+    PCF->>SCP: #35;435 POST /nbsf-management/v1/pcfBindings
+    SCP->>BSF: #35;450 POST /nbsf-management/v1/pcfBindings
+    BSF->>SCP: #35;458 201
+    SCP->>PCF: #35;461 201
+    PCF->>SCP: #35;464 201
+    SCP->>SMF: #35;468 201
+    AMF->>SCP: #35;505 POST /nsmf-pdusession/v1/sm-contexts/4/modify
+    SCP->>AMF: #35;534 204
+    SCP->>NRF: #35;545 PATCH /nnrf-nfm/v1/nf-instances/df14a3ee-9a4b-41f1-ba01-cd78719e5f34
+    NRF->>SCP: #35;548 204
+    SCP->>PCF: #35;550 204
+    AMF->>SCP: #35;552 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    SCP->>NRF: #35;555 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    NRF->>SCP: #35;558 204
+    SCP->>AMF: #35;560 204
+    SMF->>UPF: #35;562 Heartbeat Request
+    UPF->>SMF: #35;563 Heartbeat Response
+    UPF->>SMF: #35;564 Heartbeat Request
+    SMF->>UPF: #35;565 Heartbeat Response
+    SCP->>NRF: #35;566 PATCH /nnrf-nfm/v1/nf-instances/47e2893a-9a43-41f1-a42f-3148c9e4f549
+    NRF->>SCP: #35;569 204
+    SCP->>NRF: #35;574 PATCH /nnrf-nfm/v1/nf-instances/d9233090-9a4b-41f1-a1e5-ffa5d923b237
+    NRF->>SCP: #35;577 204
+    SCP->>N10: #35;579 204
+    SCP->>NRF: #35;584 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    NRF->>SCP: #35;587 204
+    SCP->>UDM: #35;589 204
+    AUSF->>SCP: #35;591 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    SCP->>NRF: #35;594 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    NRF->>SCP: #35;597 204
+    SCP->>AUSF: #35;598 204
+    SCP->>NRF: #35;602 PATCH /nnrf-nfm/v1/nf-instances/df19a060-9a4b-41f1-86c9-9d3de05ba3c9
+    NRF->>SCP: #35;605 204
+    SCP->>BSF: #35;606 204
+    SCP->>NRF: #35;613 PATCH /nnrf-nfm/v1/nf-instances/df1a1216-9a4b-41f1-8c6e-e761e6369f1a
+    NRF->>SCP: #35;616 204
+    SCP->>UDR: #35;618 204
+    SMF->>SCP: #35;622 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    SCP->>NRF: #35;625 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    NRF->>SCP: #35;628 204
+    SCP->>SMF: #35;630 204
+    SCP->>NRF: #35;635 PATCH /nnrf-nfm/v1/nf-instances/df14a3ee-9a4b-41f1-ba01-cd78719e5f34
+    NRF->>SCP: #35;638 204
+    SCP->>PCF: #35;640 204
+    AMF->>SCP: #35;644 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    SCP->>NRF: #35;647 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    NRF->>SCP: #35;650 204
+    SCP->>AMF: #35;652 204
+    SCP->>NRF: #35;654 PATCH /nnrf-nfm/v1/nf-instances/47e2893a-9a43-41f1-a42f-3148c9e4f549
+    NRF->>SCP: #35;657 204
+    SCP->>NRF: #35;662 PATCH /nnrf-nfm/v1/nf-instances/d9233090-9a4b-41f1-a1e5-ffa5d923b237
+    UPF->>SMF: #35;664 Heartbeat Request
+    SMF->>UPF: #35;666 Heartbeat Response
+    SMF->>UPF: #35;667 Heartbeat Request
+    NRF->>SCP: #35;668 204
+    UPF->>SMF: #35;670 Heartbeat Response
+    SCP->>N10: #35;671 204
+    SCP->>NRF: #35;676 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    NRF->>SCP: #35;679 204
+    SCP->>UDM: #35;680 204
+    AUSF->>SCP: #35;682 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    SCP->>NRF: #35;685 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    NRF->>SCP: #35;688 204
+    SCP->>AUSF: #35;689 204
+    SCP->>NRF: #35;694 PATCH /nnrf-nfm/v1/nf-instances/df19a060-9a4b-41f1-86c9-9d3de05ba3c9
+    NRF->>SCP: #35;697 204
+    SCP->>BSF: #35;698 204
+    SCP->>NRF: #35;704 PATCH /nnrf-nfm/v1/nf-instances/df1a1216-9a4b-41f1-8c6e-e761e6369f1a
+    NRF->>SCP: #35;707 204
+    SCP->>UDR: #35;709 204
+    SMF->>SCP: #35;711 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    SCP->>NRF: #35;714 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    NRF->>SCP: #35;717 204
+    SCP->>SMF: #35;719 204
+    AMF->>SCP: #35;724 POST /nausf-auth/v1/ue-authentications
+    SCP->>AUSF: #35;727 POST /nausf-auth/v1/ue-authentications
+    AUSF->>SCP: #35;753 201
+    SCP->>AMF: #35;756 201
+    AMF->>SCP: #35;762 POST /nausf-auth/v1/ue-authentications
+    SCP->>AUSF: #35;765 POST /nausf-auth/v1/ue-authentications
+    SCP->>UDM: #35;781 204
+    AUSF->>SCP: #35;788 201
+    SCP->>AMF: #35;791 201
+    AMF->>SCP: #35;796 PUT /nausf-auth/v1/ue-authentications/3/5g-aka-confirmation
+    SCP->>AUSF: #35;799 PUT /nausf-auth/v1/ue-authentications/3/5g-aka-confirmation
+    AUSF->>SCP: #35;822 200
+    SCP->>AMF: #35;825 200
+    AMF->>SCP: #35;886 POST /npcf-am-policy-control/v1/policies
+    SCP->>PCF: #35;889 POST /npcf-am-policy-control/v1/policies
+    PCF->>SCP: #35;901 201
+    SCP->>AMF: #35;905 201
+    SCP->>NRF: #35;913 PATCH /nnrf-nfm/v1/nf-instances/df14a3ee-9a4b-41f1-ba01-cd78719e5f34
+    NRF->>SCP: #35;916 204
+    SCP->>PCF: #35;918 204
+    SMF->>SCP: #35;960 POST /npcf-smpolicycontrol/v1/sm-policies
+    SCP->>PCF: #35;965 POST /npcf-smpolicycontrol/v1/sm-policies
+    PCF->>SCP: #35;980 POST /nbsf-management/v1/pcfBindings
+    SCP->>BSF: #35;983 POST /nbsf-management/v1/pcfBindings
+    BSF->>SCP: #35;986 201
+    SCP->>PCF: #35;990 201
+    PCF->>SCP: #35;993 201
+    SCP->>SMF: #35;997 201
+    AMF->>SCP: #35;1053 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    SCP->>NRF: #35;1056 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    NRF->>SCP: #35;1059 204
+    SCP->>AMF: #35;1061 204
+    SCP->>NRF: #35;1063 PATCH /nnrf-nfm/v1/nf-instances/47e2893a-9a43-41f1-a42f-3148c9e4f549
+    NRF->>SCP: #35;1066 204
+    SCP->>NRF: #35;1071 PATCH /nnrf-nfm/v1/nf-instances/d9233090-9a4b-41f1-a1e5-ffa5d923b237
+    NRF->>SCP: #35;1074 204
+    SCP->>N10: #35;1076 204
+    SCP->>NRF: #35;1081 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    NRF->>SCP: #35;1086 204
+    SCP->>UDM: #35;1087 204
+    AUSF->>SCP: #35;1089 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    SCP->>NRF: #35;1092 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    NRF->>SCP: #35;1095 204
+    SCP->>AUSF: #35;1096 204
+    SCP->>NRF: #35;1100 PATCH /nnrf-nfm/v1/nf-instances/df19a060-9a4b-41f1-86c9-9d3de05ba3c9
+    NRF->>SCP: #35;1103 204
+    SCP->>BSF: #35;1104 204
+    SCP->>NRF: #35;1111 PATCH /nnrf-nfm/v1/nf-instances/df1a1216-9a4b-41f1-8c6e-e761e6369f1a
+    NRF->>SCP: #35;1114 204
+    SCP->>UDR: #35;1116 204
+    UPF->>SMF: #35;1118 Heartbeat Request
+    SMF->>UPF: #35;1119 Heartbeat Response
+    SMF->>UPF: #35;1120 Heartbeat Request
+    UPF->>SMF: #35;1121 Heartbeat Response
+    SMF->>SCP: #35;1124 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    SCP->>NRF: #35;1127 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    NRF->>SCP: #35;1130 204
+    SCP->>SMF: #35;1132 204
+    SCP->>NRF: #35;1137 PATCH /nnrf-nfm/v1/nf-instances/df14a3ee-9a4b-41f1-ba01-cd78719e5f34
+    NRF->>SCP: #35;1140 204
+    SCP->>PCF: #35;1142 204
+    AMF->>SCP: #35;1144 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    SCP->>NRF: #35;1147 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    NRF->>SCP: #35;1150 204
+    SCP->>AMF: #35;1152 204
+    SCP->>NRF: #35;1156 PATCH /nnrf-nfm/v1/nf-instances/47e2893a-9a43-41f1-a42f-3148c9e4f549
+    NRF->>SCP: #35;1159 204
+    SCP->>NRF: #35;1164 PATCH /nnrf-nfm/v1/nf-instances/d9233090-9a4b-41f1-a1e5-ffa5d923b237
+    NRF->>SCP: #35;1167 204
+    SCP->>N10: #35;1169 204
+    SCP->>NRF: #35;1174 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    NRF->>SCP: #35;1177 204
+    SCP->>UDM: #35;1179 204
+    AUSF->>SCP: #35;1181 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    SCP->>NRF: #35;1184 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    NRF->>SCP: #35;1187 204
+    SCP->>AUSF: #35;1188 204
+    SCP->>NRF: #35;1193 PATCH /nnrf-nfm/v1/nf-instances/df19a060-9a4b-41f1-86c9-9d3de05ba3c9
+    NRF->>SCP: #35;1196 204
+    SCP->>BSF: #35;1197 204
+    SCP->>NRF: #35;1203 PATCH /nnrf-nfm/v1/nf-instances/df1a1216-9a4b-41f1-8c6e-e761e6369f1a
+    NRF->>SCP: #35;1206 204
+    SCP->>UDR: #35;1208 204
+    UPF->>SMF: #35;1210 Heartbeat Request
+    SMF->>UPF: #35;1211 Heartbeat Request
+    UPF->>SMF: #35;1212 Heartbeat Response
+    SMF->>UPF: #35;1213 Heartbeat Response
+    SMF->>SCP: #35;1214 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    SCP->>NRF: #35;1217 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    NRF->>SCP: #35;1220 204
+    SCP->>SMF: #35;1222 204
+    SCP->>NRF: #35;1229 PATCH /nnrf-nfm/v1/nf-instances/df14a3ee-9a4b-41f1-ba01-cd78719e5f34
+    NRF->>SCP: #35;1232 204
+    SCP->>PCF: #35;1234 204
+    AMF->>SCP: #35;1236 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    SCP->>NRF: #35;1239 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    NRF->>SCP: #35;1242 204
+    SCP->>AMF: #35;1244 204
+    SCP->>NRF: #35;1246 PATCH /nnrf-nfm/v1/nf-instances/47e2893a-9a43-41f1-a42f-3148c9e4f549
+    NRF->>SCP: #35;1249 204
+    AMF->>SCP: #35;1252 POST /nausf-auth/v1/ue-authentications
+    SCP->>AUSF: #35;1255 POST /nausf-auth/v1/ue-authentications
+    AUSF->>SCP: #35;1281 201
+    SCP->>AMF: #35;1284 201
+    AMF->>SCP: #35;1290 POST /nausf-auth/v1/ue-authentications
+    SCP->>AUSF: #35;1293 POST /nausf-auth/v1/ue-authentications
+    SCP->>UDM: #35;1309 204
+    AUSF->>SCP: #35;1316 201
+    SCP->>AMF: #35;1319 201
+    AMF->>SCP: #35;1324 PUT /nausf-auth/v1/ue-authentications/4/5g-aka-confirmation
+    SCP->>AUSF: #35;1327 PUT /nausf-auth/v1/ue-authentications/4/5g-aka-confirmation
+    AUSF->>SCP: #35;1350 200
+    SCP->>AMF: #35;1353 200
+    AMF->>SCP: #35;1414 POST /npcf-am-policy-control/v1/policies
+    SCP->>PCF: #35;1417 POST /npcf-am-policy-control/v1/policies
+    PCF->>SCP: #35;1429 201
+    SCP->>AMF: #35;1433 201
+    SMF->>SCP: #35;1478 POST /npcf-smpolicycontrol/v1/sm-policies
+    SCP->>PCF: #35;1483 POST /npcf-smpolicycontrol/v1/sm-policies
+    PCF->>SCP: #35;1498 POST /nbsf-management/v1/pcfBindings
+    SCP->>BSF: #35;1501 POST /nbsf-management/v1/pcfBindings
+    BSF->>SCP: #35;1504 201
+    SCP->>PCF: #35;1508 201
+    PCF->>SCP: #35;1511 201
+    SCP->>SMF: #35;1515 201
+    SCP->>NRF: #35;1573 PATCH /nnrf-nfm/v1/nf-instances/d9233090-9a4b-41f1-a1e5-ffa5d923b237
+    NRF->>SCP: #35;1576 204
+    SCP->>N10: #35;1578 204
+    UDM->>SCP: #35;1580 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    SCP->>NRF: #35;1583 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    NRF->>SCP: #35;1586 204
+    SCP->>UDM: #35;1587 204
+    AUSF->>SCP: #35;1589 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    SCP->>NRF: #35;1592 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    NRF->>SCP: #35;1595 204
+    SCP->>AUSF: #35;1596 204
+    SCP->>NRF: #35;1600 PATCH /nnrf-nfm/v1/nf-instances/df19a060-9a4b-41f1-86c9-9d3de05ba3c9
+    NRF->>SCP: #35;1603 204
+    SCP->>BSF: #35;1604 204
+    SCP->>NRF: #35;1612 PATCH /nnrf-nfm/v1/nf-instances/df1a1216-9a4b-41f1-8c6e-e761e6369f1a
+    NRF->>SCP: #35;1615 204
+    SCP->>UDR: #35;1617 204
+    SMF->>UPF: #35;1619 Heartbeat Request
+    UPF->>SMF: #35;1620 Heartbeat Request
+    SMF->>UPF: #35;1621 Heartbeat Response
+    UPF->>SMF: #35;1622 Heartbeat Response
+    SMF->>SCP: #35;1623 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    SCP->>NRF: #35;1626 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    NRF->>SCP: #35;1629 204
+    SCP->>SMF: #35;1631 204
+    SCP->>NRF: #35;1638 PATCH /nnrf-nfm/v1/nf-instances/df14a3ee-9a4b-41f1-ba01-cd78719e5f34
+    NRF->>SCP: #35;1641 204
+    SCP->>PCF: #35;1643 204
+    AMF->>SCP: #35;1645 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    SCP->>NRF: #35;1648 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    NRF->>SCP: #35;1651 204
+    SCP->>AMF: #35;1653 204
+    SCP->>NRF: #35;1655 PATCH /nnrf-nfm/v1/nf-instances/47e2893a-9a43-41f1-a42f-3148c9e4f549
+    NRF->>SCP: #35;1658 204
+    SCP->>NRF: #35;1663 PATCH /nnrf-nfm/v1/nf-instances/d9233090-9a4b-41f1-a1e5-ffa5d923b237
+    NRF->>SCP: #35;1666 204
+    SCP->>N10: #35;1668 204
+    UDM->>SCP: #35;1670 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    SCP->>NRF: #35;1673 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    NRF->>SCP: #35;1676 204
+    SCP->>UDM: #35;1677 204
+    AUSF->>SCP: #35;1679 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    SCP->>NRF: #35;1685 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    SCP->>NRF: #35;1688 PATCH /nnrf-nfm/v1/nf-instances/df19a060-9a4b-41f1-86c9-9d3de05ba3c9
+    NRF->>SCP: #35;1691 204
+    NRF->>SCP: #35;1692 204
+    SCP->>AUSF: #35;1694 204
+    SCP->>BSF: #35;1696 204
+    SCP->>NRF: #35;1701 PATCH /nnrf-nfm/v1/nf-instances/df1a1216-9a4b-41f1-8c6e-e761e6369f1a
+    NRF->>SCP: #35;1704 204
+    SCP->>UDR: #35;1705 204
+    SMF->>SCP: #35;1710 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    SCP->>NRF: #35;1713 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    NRF->>SCP: #35;1716 204
+    SCP->>SMF: #35;1718 204
+    SMF->>UPF: #35;1720 Heartbeat Request
+    UPF->>SMF: #35;1721 Heartbeat Response
+    UPF->>SMF: #35;1722 Heartbeat Request
+    SMF->>UPF: #35;1723 Heartbeat Response
+    SCP->>NRF: #35;1727 PATCH /nnrf-nfm/v1/nf-instances/df14a3ee-9a4b-41f1-ba01-cd78719e5f34
+    NRF->>SCP: #35;1730 204
+    SCP->>PCF: #35;1732 204
+    AMF->>SCP: #35;1734 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    SCP->>NRF: #35;1737 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    NRF->>SCP: #35;1740 204
+    SCP->>AMF: #35;1742 204
+    SCP->>NRF: #35;1746 PATCH /nnrf-nfm/v1/nf-instances/47e2893a-9a43-41f1-a42f-3148c9e4f549
+    NRF->>SCP: #35;1749 204
+    SCP->>NRF: #35;1754 PATCH /nnrf-nfm/v1/nf-instances/d9233090-9a4b-41f1-a1e5-ffa5d923b237
+    NRF->>SCP: #35;1757 204
+    SCP->>N10: #35;1759 204
+    UDM->>SCP: #35;1761 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    SCP->>NRF: #35;1764 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    NRF->>SCP: #35;1767 204
+    SCP->>UDM: #35;1768 204
+    AUSF->>SCP: #35;1770 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    SCP->>NRF: #35;1773 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    NRF->>SCP: #35;1776 204
+    SCP->>AUSF: #35;1777 204
+    SCP->>NRF: #35;1782 PATCH /nnrf-nfm/v1/nf-instances/df19a060-9a4b-41f1-86c9-9d3de05ba3c9
+    NRF->>SCP: #35;1785 204
+    SCP->>BSF: #35;1786 204
+    SCP->>NRF: #35;1792 PATCH /nnrf-nfm/v1/nf-instances/df1a1216-9a4b-41f1-8c6e-e761e6369f1a
+    NRF->>SCP: #35;1795 204
+    SCP->>UDR: #35;1797 204
+    AMF->>SCP: #35;1800 POST /nausf-auth/v1/ue-authentications
+    SCP->>AUSF: #35;1803 POST /nausf-auth/v1/ue-authentications
+    AUSF->>SCP: #35;1829 201
+    SCP->>AMF: #35;1832 201
+    AMF->>SCP: #35;1838 POST /nausf-auth/v1/ue-authentications
+    SCP->>AUSF: #35;1841 POST /nausf-auth/v1/ue-authentications
+    AUSF->>SCP: #35;1864 201
+    SCP->>AMF: #35;1867 201
+    AMF->>SCP: #35;1872 PUT /nausf-auth/v1/ue-authentications/5/5g-aka-confirmation
+    SCP->>AUSF: #35;1875 PUT /nausf-auth/v1/ue-authentications/5/5g-aka-confirmation
+    AUSF->>SCP: #35;1898 200
+    SCP->>AMF: #35;1901 200
+    AMF->>SCP: #35;1962 POST /npcf-am-policy-control/v1/policies
+    SCP->>PCF: #35;1965 POST /npcf-am-policy-control/v1/policies
+    PCF->>SCP: #35;1977 201
+    SCP->>AMF: #35;1981 201
+    SMF->>SCP: #35;2026 POST /npcf-smpolicycontrol/v1/sm-policies
+    SCP->>PCF: #35;2031 POST /npcf-smpolicycontrol/v1/sm-policies
+    PCF->>SCP: #35;2046 POST /nbsf-management/v1/pcfBindings
+    SCP->>BSF: #35;2049 POST /nbsf-management/v1/pcfBindings
+    BSF->>SCP: #35;2052 201
+    SCP->>PCF: #35;2056 201
+    PCF->>SCP: #35;2059 201
+    SCP->>SMF: #35;2063 201
+    SMF->>SCP: #35;2119 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    SCP->>NRF: #35;2122 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    NRF->>SCP: #35;2125 204
+    SCP->>SMF: #35;2127 204
+    UPF->>SMF: #35;2129 Heartbeat Request
+    SMF->>UPF: #35;2130 Heartbeat Request
+    UPF->>SMF: #35;2131 Heartbeat Response
+    SMF->>UPF: #35;2132 Heartbeat Response
+    SCP->>NRF: #35;2136 PATCH /nnrf-nfm/v1/nf-instances/df14a3ee-9a4b-41f1-ba01-cd78719e5f34
+    NRF->>SCP: #35;2139 204
+    SCP->>PCF: #35;2141 204
+    AMF->>SCP: #35;2145 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    SCP->>NRF: #35;2148 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    NRF->>SCP: #35;2151 204
+    SCP->>AMF: #35;2153 204
+    SCP->>NRF: #35;2155 PATCH /nnrf-nfm/v1/nf-instances/47e2893a-9a43-41f1-a42f-3148c9e4f549
+    NRF->>SCP: #35;2158 204
+    SCP->>NRF: #35;2163 PATCH /nnrf-nfm/v1/nf-instances/d9233090-9a4b-41f1-a1e5-ffa5d923b237
+    NRF->>SCP: #35;2166 204
+    SCP->>N10: #35;2168 204
+    UDM->>SCP: #35;2170 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    SCP->>NRF: #35;2173 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    NRF->>SCP: #35;2176 204
+    SCP->>UDM: #35;2177 204
+    AUSF->>SCP: #35;2180 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    SCP->>NRF: #35;2185 PATCH /nnrf-nfm/v1/nf-instances/df19a060-9a4b-41f1-86c9-9d3de05ba3c9
+    SCP->>NRF: #35;2187 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    NRF->>SCP: #35;2191 204
+    NRF->>SCP: #35;2192 204
+    SCP->>BSF: #35;2194 204
+    SCP->>AUSF: #35;2196 204
+    SCP->>NRF: #35;2201 PATCH /nnrf-nfm/v1/nf-instances/df1a1216-9a4b-41f1-8c6e-e761e6369f1a
+    NRF->>SCP: #35;2204 204
+    SCP->>UDR: #35;2205 204
+    SMF->>SCP: #35;2208 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    SCP->>NRF: #35;2211 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    NRF->>SCP: #35;2214 204
+    SCP->>SMF: #35;2216 204
+    UPF->>SMF: #35;2220 Heartbeat Request
+    SMF->>UPF: #35;2221 Heartbeat Request
+    SMF->>UPF: #35;2222 Heartbeat Response
+    UPF->>SMF: #35;2223 Heartbeat Response
+    SCP->>NRF: #35;2227 PATCH /nnrf-nfm/v1/nf-instances/df14a3ee-9a4b-41f1-ba01-cd78719e5f34
+    NRF->>SCP: #35;2230 204
+    SCP->>PCF: #35;2232 204
+    AMF->>SCP: #35;2234 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    SCP->>NRF: #35;2237 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    NRF->>SCP: #35;2240 204
+    SCP->>AMF: #35;2242 204
+    SCP->>NRF: #35;2244 PATCH /nnrf-nfm/v1/nf-instances/47e2893a-9a43-41f1-a42f-3148c9e4f549
+    NRF->>SCP: #35;2247 204
+    SCP->>NRF: #35;2252 PATCH /nnrf-nfm/v1/nf-instances/d9233090-9a4b-41f1-a1e5-ffa5d923b237
+    NRF->>SCP: #35;2255 204
+    SCP->>N10: #35;2257 204
+    UDM->>SCP: #35;2259 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    SCP->>NRF: #35;2262 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    NRF->>SCP: #35;2265 204
+    SCP->>UDM: #35;2266 204
+    AUSF->>SCP: #35;2268 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    SCP->>NRF: #35;2271 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    NRF->>SCP: #35;2274 204
+    SCP->>AUSF: #35;2275 204
+    SCP->>NRF: #35;2280 PATCH /nnrf-nfm/v1/nf-instances/df19a060-9a4b-41f1-86c9-9d3de05ba3c9
+    NRF->>SCP: #35;2283 204
+    SCP->>BSF: #35;2284 204
+    SCP->>NRF: #35;2290 PATCH /nnrf-nfm/v1/nf-instances/df1a1216-9a4b-41f1-8c6e-e761e6369f1a
+    NRF->>SCP: #35;2293 204
+    SCP->>UDR: #35;2295 204
+    SMF->>SCP: #35;2299 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    SCP->>NRF: #35;2302 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    NRF->>SCP: #35;2305 204
+    SCP->>SMF: #35;2307 204
+    SMF->>SCP: #35;2318 POST /npcf-smpolicycontrol/v1/sm-policies/3/delete
+    SCP->>PCF: #35;2321 POST /npcf-smpolicycontrol/v1/sm-policies/3/delete
+    PCF->>SCP: #35;2324 DELETE /nbsf-management/v1/pcfBindings/3
+    SCP->>BSF: #35;2325 DELETE /nbsf-management/v1/pcfBindings/3
+    BSF->>SCP: #35;2326 204
+    SCP->>PCF: #35;2328 204
+    PCF->>SCP: #35;2330 204
+    SCP->>SMF: #35;2332 204
+    AMF->>SCP: #35;2352 POST /nausf-auth/v1/ue-authentications
+    SCP->>AUSF: #35;2355 POST /nausf-auth/v1/ue-authentications
+    AUSF->>SCP: #35;2379 201
+    SCP->>AMF: #35;2382 201
+    AMF->>SCP: #35;2387 PUT /nausf-auth/v1/ue-authentications/1/5g-aka-confirmation
+    SCP->>AUSF: #35;2390 PUT /nausf-auth/v1/ue-authentications/1/5g-aka-confirmation
+    AUSF->>SCP: #35;2413 200
+    SCP->>AMF: #35;2416 200
+    AMF->>SCP: #35;2467 POST /npcf-am-policy-control/v1/policies
+    SCP->>PCF: #35;2470 POST /npcf-am-policy-control/v1/policies
+    PCF->>SCP: #35;2481 201
+    SCP->>AMF: #35;2484 201
+    SMF->>SCP: #35;2530 POST /npcf-smpolicycontrol/v1/sm-policies
+    SCP->>PCF: #35;2535 POST /npcf-smpolicycontrol/v1/sm-policies
+    PCF->>SCP: #35;2549 POST /nbsf-management/v1/pcfBindings
+    SCP->>BSF: #35;2552 POST /nbsf-management/v1/pcfBindings
+    BSF->>SCP: #35;2555 201
+    SCP->>PCF: #35;2559 201
+    PCF->>SCP: #35;2562 201
+    SCP->>SMF: #35;2565 201
+    UPF->>SMF: #35;2621 Heartbeat Request
+    SMF->>UPF: #35;2622 Heartbeat Request
+    SMF->>UPF: #35;2623 Heartbeat Response
+    UPF->>SMF: #35;2624 Heartbeat Response
+    SCP->>NRF: #35;2628 PATCH /nnrf-nfm/v1/nf-instances/df14a3ee-9a4b-41f1-ba01-cd78719e5f34
+    NRF->>SCP: #35;2631 204
+    SCP->>PCF: #35;2633 204
+    AMF->>SCP: #35;2635 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    SCP->>NRF: #35;2638 PATCH /nnrf-nfm/v1/nf-instances/d93d0ac4-9a4b-41f1-9543-39200c7fc87d
+    NRF->>SCP: #35;2641 204
+    SCP->>AMF: #35;2643 204
+    SCP->>NRF: #35;2645 PATCH /nnrf-nfm/v1/nf-instances/47e2893a-9a43-41f1-a42f-3148c9e4f549
+    NRF->>SCP: #35;2648 204
+    SCP->>NRF: #35;2653 PATCH /nnrf-nfm/v1/nf-instances/d9233090-9a4b-41f1-a1e5-ffa5d923b237
+    NRF->>SCP: #35;2656 204
+    SCP->>N10: #35;2658 204
+    UDM->>SCP: #35;2660 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    SCP->>NRF: #35;2663 PATCH /nnrf-nfm/v1/nf-instances/d924f52e-9a4b-41f1-ba42-2bbf57836f1f
+    NRF->>SCP: #35;2666 204
+    SCP->>UDM: #35;2667 204
+    AUSF->>SCP: #35;2669 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    SCP->>NRF: #35;2672 PATCH /nnrf-nfm/v1/nf-instances/d922a27e-9a4b-41f1-b2b1-77958ec566d2
+    NRF->>SCP: #35;2676 204
+    SCP->>AUSF: #35;2677 204
+    SCP->>NRF: #35;2682 PATCH /nnrf-nfm/v1/nf-instances/df19a060-9a4b-41f1-86c9-9d3de05ba3c9
+    NRF->>SCP: #35;2685 204
+    SCP->>BSF: #35;2686 204
+    SCP->>NRF: #35;2694 PATCH /nnrf-nfm/v1/nf-instances/df1a1216-9a4b-41f1-8c6e-e761e6369f1a
+    NRF->>SCP: #35;2697 204
+    SCP->>UDR: #35;2699 204
+    SMF->>SCP: #35;2701 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    SCP->>NRF: #35;2704 PATCH /nnrf-nfm/v1/nf-instances/ee973070-9a4b-41f1-92ea-235afe95239d
+    NRF->>SCP: #35;2707 204
+    SCP->>SMF: #35;2709 204
+
+sequenceDiagram
+    autonumber
+    participant UE
+    participant gNB
+    participant AMF
+    participant SCP
+    participant AUSF
+    participant UDM
+    participant UDR
+    participant PCF
+    participant SMF
+    participant UPF
+    Note over gNB,UPF: SUPI 001011234567891
+    gNB->>AMF: #35;105 InitialUEMessage
+    UE->>AMF: #35;105 Registration request
+    AUSF->>SCP: #35;129 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567891/security-information/generate-auth-data
+    SCP->>UDM: #35;142 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567891/security-information/generate-auth-data
+    UDM->>SCP: #35;152 GET /nudr-dr/v1/subscription-data/imsi-001011234567891/authentication-data/authentication-subscription
+    SCP->>UDR: #35;163 GET /nudr-dr/v1/subscription-data/imsi-001011234567891/authentication-data/authentication-subscription
+    UDR->>SCP: #35;171 200
+    SCP->>UDM: #35;174 200
+    UDM->>SCP: #35;178 200
+    SCP->>AUSF: #35;181 200
+    AMF->>gNB: #35;192 DownlinkNASTransport
+    AMF->>UE: #35;192 Authentication request
+    gNB->>AMF: #35;193 UplinkNASTransport
+    rect rgb(255, 226, 226)
+    UE->>AMF: #35;193 Authentication failure
+    Note over AMF: Synch failure (#35;21) — 3GPP TS 24.501 §9.11.3.2
+    end
+    AUSF->>SCP: #35;200 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567891/security-information/generate-auth-data
+    SCP->>UDM: #35;203 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567891/security-information/generate-auth-data
+    SCP->>UDR: #35;209 PATCH /nudr-dr/v1/subscription-data/imsi-001011234567891/authentication-data/authentication-subscription
+    UDR->>SCP: #35;212 204
+    UDM->>SCP: #35;214 200
+    SCP->>AUSF: #35;217 200
+    AMF->>gNB: #35;226 DownlinkNASTransport
+    AMF->>UE: #35;226 Authentication request
+    gNB->>AMF: #35;227 UplinkNASTransport
+    UE->>AMF: #35;227 Authentication response
+    AUSF->>SCP: #35;234 POST /nudm-ueau/v1/imsi-001011234567891/auth-events
+    SCP->>UDM: #35;237 POST /nudm-ueau/v1/imsi-001011234567891/auth-events
+    UDM->>SCP: #35;240 PUT /nudr-dr/v1/subscription-data/imsi-001011234567891/authentication-data/authentication-status
+    SCP->>UDR: #35;243 PUT /nudr-dr/v1/subscription-data/imsi-001011234567891/authentication-data/authentication-status
+    UDR->>SCP: #35;246 204
+    SCP->>UDM: #35;247 204
+    UDM->>SCP: #35;248 201
+    SCP->>AUSF: #35;251 201
+    AMF->>gNB: #35;260 DownlinkNASTransport
+    AMF->>UE: #35;260 Security mode command
+    gNB->>AMF: #35;261 UplinkNASTransport
+    AMF->>SCP: #35;262 PUT /nudm-uecm/v1/imsi-001011234567891/registrations/amf-3gpp-access
+    SCP->>UDM: #35;265 PUT /nudm-uecm/v1/imsi-001011234567891/registrations/amf-3gpp-access
+    UDM->>SCP: #35;268 PUT /nudr-dr/v1/subscription-data/imsi-001011234567891/context-data/amf-3gpp-access
+    SCP->>UDR: #35;271 PUT /nudr-dr/v1/subscription-data/imsi-001011234567891/context-data/amf-3gpp-access
+    UDR->>SCP: #35;274 204
+    SCP->>UDM: #35;275 204
+    UDM->>SCP: #35;276 201
+    SCP->>AMF: #35;279 201
+    AMF->>SCP: #35;282 GET /nudm-sdm/v2/imsi-001011234567891?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D&dataset-names=AM%2CSMF_SEL
+    SCP->>UDM: #35;283 GET /nudm-sdm/v2/imsi-001011234567891?dataset-names=AM%2CSMF_SEL&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;284 GET /nudr-dr/v1/subscription-data/imsi-001011234567891/00101/provisioned-data?dataset-names=AM%2CSMF_SEL
+    SCP->>UDR: #35;285 GET /nudr-dr/v1/subscription-data/imsi-001011234567891/00101/provisioned-data?dataset-names=AM%2CSMF_SEL
+    UDR->>SCP: #35;286 200
+    SCP->>UDM: #35;289 200
+    UDM->>SCP: #35;292 200
+    SCP->>AMF: #35;295 200
+    AMF->>SCP: #35;298 GET /nudm-sdm/v2/imsi-001011234567891/ue-context-in-smf-data?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    SCP->>UDM: #35;299 GET /nudm-sdm/v2/imsi-001011234567891/ue-context-in-smf-data?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;300 200
+    SCP->>AMF: #35;303 200
+    AMF->>SCP: #35;306 POST /nudm-sdm/v2/imsi-001011234567891/sdm-subscriptions
+    SCP->>UDM: #35;309 POST /nudm-sdm/v2/imsi-001011234567891/sdm-subscriptions
+    UDM->>SCP: #35;312 201
+    SCP->>AMF: #35;315 201
+    PCF->>SCP: #35;341 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567891/am-data
+    SCP->>UDR: #35;342 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567891/am-data
+    UDR->>SCP: #35;343 200
+    SCP->>PCF: #35;346 200
+    AMF->>gNB: #35;356 InitialContextSetup
+    gNB->>AMF: #35;357 InitialContextSetupResponse
+    gNB->>AMF: #35;360 UplinkNASTransport
+    gNB->>AMF: #35;360 UplinkNASTransport
+    AMF->>gNB: #35;361 DownlinkNASTransport
+    AMF->>SCP: #35;362 POST /nsmf-pdusession/v1/sm-contexts
+    AMF->>SCP: #35;363 PDU session establishment request
+    SCP->>SMF: #35;377 POST /nsmf-pdusession/v1/sm-contexts
+    SCP->>SMF: #35;379 PDU session establishment request
+    SMF->>SCP: #35;385 GET /nudm-sdm/v2/imsi-001011234567891/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    SCP->>UDM: #35;386 GET /nudm-sdm/v2/imsi-001011234567891/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;387 GET /nudr-dr/v1/subscription-data/imsi-001011234567891/00101/provisioned-data/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet
+    SCP->>UDR: #35;388 GET /nudr-dr/v1/subscription-data/imsi-001011234567891/00101/provisioned-data/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet
+    UDR->>SCP: #35;389 200
+    SCP->>UDM: #35;392 200
+    UDM->>SCP: #35;395 200
+    SCP->>SMF: #35;398 200
+    SMF->>SCP: #35;402 POST /nudm-sdm/v2/imsi-001011234567891/sdm-subscriptions
+    SCP->>UDM: #35;405 POST /nudm-sdm/v2/imsi-001011234567891/sdm-subscriptions
+    UDM->>SCP: #35;408 201
+    SCP->>SMF: #35;411 201
+    SMF->>SCP: #35;414 201
+    SCP->>AMF: #35;423 201
+    PCF->>SCP: #35;426 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567891/sm-data?dnn=internet&snssai=%7B%22sst%22%3A1%7D
+    SCP->>UDR: #35;427 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567891/sm-data?dnn=internet&snssai=%7B%22sst%22%3A1%7D
+    UDR->>SCP: #35;428 200
+    SCP->>PCF: #35;431 200
+    SMF->>UPF: #35;471 Session Establishment Request
+    UPF->>SMF: #35;472 Session Establishment Response
+    SMF->>SCP: #35;473 POST /namf-comm/v1/ue-contexts/imsi-001011234567891/n1-n2-messages
+    SMF->>SCP: #35;474 PDU session establishment accept
+    SCP->>AMF: #35;488 POST /namf-comm/v1/ue-contexts/imsi-001011234567891/n1-n2-messages
+    SCP->>AMF: #35;490 PDU session establishment accept
+    AMF->>gNB: #35;496 PDUSessionResourceSetup
+    AMF->>SCP: #35;498 200
+    SCP->>SMF: #35;501 200
+    gNB->>AMF: #35;504 PDUSessionResourceSetupResponse
+    SCP->>SMF: #35;508 POST /nsmf-pdusession/v1/sm-contexts/4/modify
+    SMF->>UPF: #35;511 Session Modification Request
+    UPF->>SMF: #35;512 Session Modification Response
+    SMF->>SCP: #35;513 PUT /nudm-uecm/v1/imsi-001011234567891/registrations/smf-registrations/1
+    SCP->>UDM: #35;516 PUT /nudm-uecm/v1/imsi-001011234567891/registrations/smf-registrations/1
+    UDM->>SCP: #35;519 PUT /nudr-dr/v1/subscription-data/imsi-001011234567891/context-data/smf-registrations/1
+    SCP->>UDR: #35;522 PUT /nudr-dr/v1/subscription-data/imsi-001011234567891/context-data/smf-registrations/1
+    UDR->>SCP: #35;525 204
+    SCP->>UDM: #35;526 204
+    UDM->>SCP: #35;527 201
+    SCP->>SMF: #35;530 201
+    SMF->>SCP: #35;533 204
+
+sequenceDiagram
+    autonumber
+    participant UE
+    participant gNB
+    participant AMF
+    participant SCP
+    participant AUSF
+    participant UDM
+    participant UDR
+    participant PCF
+    participant SMF
+    participant UPF
+    Note over gNB,UPF: SUPI 001011234567892
+    gNB->>AMF: #35;723 InitialUEMessage
+    UE->>AMF: #35;723 Registration request
+    AUSF->>SCP: #35;730 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567892/security-information/generate-auth-data
+    SCP->>UDM: #35;733 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567892/security-information/generate-auth-data
+    UDM->>SCP: #35;736 GET /nudr-dr/v1/subscription-data/imsi-001011234567892/authentication-data/authentication-subscription
+    SCP->>UDR: #35;737 GET /nudr-dr/v1/subscription-data/imsi-001011234567892/authentication-data/authentication-subscription
+    UDR->>SCP: #35;738 200
+    SCP->>UDM: #35;742 200
+    UDM->>SCP: #35;746 200
+    SCP->>AUSF: #35;749 200
+    AMF->>gNB: #35;760 DownlinkNASTransport
+    AMF->>UE: #35;760 Authentication request
+    gNB->>AMF: #35;761 UplinkNASTransport
+    rect rgb(255, 226, 226)
+    UE->>AMF: #35;761 Authentication failure
+    Note over AMF: Synch failure (#35;21) — 3GPP TS 24.501 §9.11.3.2
+    end
+    AUSF->>SCP: #35;768 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567892/security-information/generate-auth-data
+    SCP->>UDM: #35;771 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567892/security-information/generate-auth-data
+    SCP->>UDR: #35;777 PATCH /nudr-dr/v1/subscription-data/imsi-001011234567892/authentication-data/authentication-subscription
+    UDR->>SCP: #35;780 204
+    UDM->>SCP: #35;782 200
+    SCP->>AUSF: #35;785 200
+    AMF->>gNB: #35;794 DownlinkNASTransport
+    AMF->>UE: #35;794 Authentication request
+    gNB->>AMF: #35;795 UplinkNASTransport
+    UE->>AMF: #35;795 Authentication response
+    AUSF->>SCP: #35;802 POST /nudm-ueau/v1/imsi-001011234567892/auth-events
+    SCP->>UDM: #35;805 POST /nudm-ueau/v1/imsi-001011234567892/auth-events
+    UDM->>SCP: #35;808 PUT /nudr-dr/v1/subscription-data/imsi-001011234567892/authentication-data/authentication-status
+    SCP->>UDR: #35;811 PUT /nudr-dr/v1/subscription-data/imsi-001011234567892/authentication-data/authentication-status
+    UDR->>SCP: #35;814 204
+    SCP->>UDM: #35;815 204
+    UDM->>SCP: #35;816 201
+    SCP->>AUSF: #35;819 201
+    AMF->>gNB: #35;828 DownlinkNASTransport
+    AMF->>UE: #35;828 Security mode command
+    gNB->>AMF: #35;829 UplinkNASTransport
+    AMF->>SCP: #35;830 PUT /nudm-uecm/v1/imsi-001011234567892/registrations/amf-3gpp-access
+    SCP->>UDM: #35;833 PUT /nudm-uecm/v1/imsi-001011234567892/registrations/amf-3gpp-access
+    UDM->>SCP: #35;836 PUT /nudr-dr/v1/subscription-data/imsi-001011234567892/context-data/amf-3gpp-access
+    SCP->>UDR: #35;839 PUT /nudr-dr/v1/subscription-data/imsi-001011234567892/context-data/amf-3gpp-access
+    UDR->>SCP: #35;842 204
+    SCP->>UDM: #35;843 204
+    UDM->>SCP: #35;844 201
+    SCP->>AMF: #35;847 201
+    AMF->>SCP: #35;850 GET /nudm-sdm/v2/imsi-001011234567892?dataset-names=AM%2CSMF_SEL&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    SCP->>UDM: #35;851 GET /nudm-sdm/v2/imsi-001011234567892?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D&dataset-names=AM%2CSMF_SEL
+    UDM->>SCP: #35;852 GET /nudr-dr/v1/subscription-data/imsi-001011234567892/00101/provisioned-data?dataset-names=AM%2CSMF_SEL
+    SCP->>UDR: #35;853 GET /nudr-dr/v1/subscription-data/imsi-001011234567892/00101/provisioned-data?dataset-names=AM%2CSMF_SEL
+    UDR->>SCP: #35;854 200
+    SCP->>UDM: #35;857 200
+    UDM->>SCP: #35;860 200
+    SCP->>AMF: #35;863 200
+    AMF->>SCP: #35;866 GET /nudm-sdm/v2/imsi-001011234567892/ue-context-in-smf-data?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    SCP->>UDM: #35;867 GET /nudm-sdm/v2/imsi-001011234567892/ue-context-in-smf-data?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;868 200
+    SCP->>AMF: #35;871 200
+    AMF->>SCP: #35;874 POST /nudm-sdm/v2/imsi-001011234567892/sdm-subscriptions
+    SCP->>UDM: #35;877 POST /nudm-sdm/v2/imsi-001011234567892/sdm-subscriptions
+    UDM->>SCP: #35;880 201
+    SCP->>AMF: #35;883 201
+    PCF->>SCP: #35;892 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567892/am-data
+    SCP->>UDR: #35;893 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567892/am-data
+    UDR->>SCP: #35;894 200
+    SCP->>PCF: #35;897 200
+    AMF->>gNB: #35;908 InitialContextSetup
+    gNB->>AMF: #35;909 InitialContextSetupResponse
+    gNB->>AMF: #35;921 UplinkNASTransport
+    gNB->>AMF: #35;921 UplinkNASTransport
+    AMF->>gNB: #35;922 DownlinkNASTransport
+    AMF->>SCP: #35;923 POST /nsmf-pdusession/v1/sm-contexts
+    AMF->>SCP: #35;924 PDU session establishment request
+    SCP->>SMF: #35;926 POST /nsmf-pdusession/v1/sm-contexts
+    SCP->>SMF: #35;927 PDU session establishment request
+    SMF->>SCP: #35;929 GET /nudm-sdm/v2/imsi-001011234567892/sm-data?dnn=internet&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D&single-nssai=%7B%22sst%22%3A1%7D
+    SCP->>UDM: #35;930 GET /nudm-sdm/v2/imsi-001011234567892/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;931 GET /nudr-dr/v1/subscription-data/imsi-001011234567892/00101/provisioned-data/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet
+    SCP->>UDR: #35;932 GET /nudr-dr/v1/subscription-data/imsi-001011234567892/00101/provisioned-data/sm-data?dnn=internet&single-nssai=%7B%22sst%22%3A1%7D
+    UDR->>SCP: #35;933 200
+    SCP->>UDM: #35;936 200
+    UDM->>SCP: #35;939 200
+    SCP->>SMF: #35;942 200
+    SMF->>SCP: #35;946 POST /nudm-sdm/v2/imsi-001011234567892/sdm-subscriptions
+    SCP->>UDM: #35;949 POST /nudm-sdm/v2/imsi-001011234567892/sdm-subscriptions
+    UDM->>SCP: #35;952 201
+    SCP->>SMF: #35;955 201
+    SMF->>SCP: #35;958 201
+    SCP->>AMF: #35;968 201
+    PCF->>SCP: #35;971 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567892/sm-data?dnn=internet&snssai=%7B%22sst%22%3A1%7D
+    SCP->>UDR: #35;972 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567892/sm-data?dnn=internet&snssai=%7B%22sst%22%3A1%7D
+    UDR->>SCP: #35;973 200
+    SCP->>PCF: #35;976 200
+    SMF->>UPF: #35;1000 Session Establishment Request
+    UPF->>SMF: #35;1001 Session Establishment Response
+    SMF->>SCP: #35;1002 POST /namf-comm/v1/ue-contexts/imsi-001011234567892/n1-n2-messages
+    SMF->>SCP: #35;1003 PDU session establishment accept
+    SCP->>AMF: #35;1005 POST /namf-comm/v1/ue-contexts/imsi-001011234567892/n1-n2-messages
+    SCP->>AMF: #35;1006 PDU session establishment accept
+    AMF->>SCP: #35;1008 200
+    AMF->>gNB: #35;1010 PDUSessionResourceSetup
+    SCP->>SMF: #35;1014 200
+    gNB->>AMF: #35;1017 PDUSessionResourceSetupResponse
+    SCP->>SMF: #35;1021 POST /nsmf-pdusession/v1/sm-contexts/5/modify
+    SMF->>UPF: #35;1024 Session Modification Request
+    UPF->>SMF: #35;1025 Session Modification Response
+    SMF->>SCP: #35;1026 PUT /nudm-uecm/v1/imsi-001011234567892/registrations/smf-registrations/1
+    SCP->>UDM: #35;1029 PUT /nudm-uecm/v1/imsi-001011234567892/registrations/smf-registrations/1
+    UDM->>SCP: #35;1032 PUT /nudr-dr/v1/subscription-data/imsi-001011234567892/context-data/smf-registrations/1
+    SCP->>UDR: #35;1035 PUT /nudr-dr/v1/subscription-data/imsi-001011234567892/context-data/smf-registrations/1
+    UDR->>SCP: #35;1038 204
+    SCP->>UDM: #35;1039 204
+    UDM->>SCP: #35;1040 201
+    SCP->>SMF: #35;1043 201
+    SMF->>SCP: #35;1046 204
+
+sequenceDiagram
+    autonumber
+    participant AMF
+    participant SCP
+    Note over AMF,SCP: PDU session 5
+    AMF->>SCP: #35;1018 POST /nsmf-pdusession/v1/sm-contexts/5/modify
+    SCP->>AMF: #35;1047 204
+
+sequenceDiagram
+    autonumber
+    participant UE
+    participant gNB
+    participant AMF
+    participant SCP
+    participant AUSF
+    participant UDM
+    participant UDR
+    participant PCF
+    participant SMF
+    participant UPF
+    Note over gNB,UPF: SUPI 001011234567893
+    gNB->>AMF: #35;1251 InitialUEMessage
+    UE->>AMF: #35;1251 Registration request
+    AUSF->>SCP: #35;1258 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567893/security-information/generate-auth-data
+    SCP->>UDM: #35;1261 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567893/security-information/generate-auth-data
+    UDM->>SCP: #35;1264 GET /nudr-dr/v1/subscription-data/imsi-001011234567893/authentication-data/authentication-subscription
+    SCP->>UDR: #35;1265 GET /nudr-dr/v1/subscription-data/imsi-001011234567893/authentication-data/authentication-subscription
+    UDR->>SCP: #35;1266 200
+    SCP->>UDM: #35;1270 200
+    UDM->>SCP: #35;1274 200
+    SCP->>AUSF: #35;1277 200
+    AMF->>gNB: #35;1288 DownlinkNASTransport
+    AMF->>UE: #35;1288 Authentication request
+    gNB->>AMF: #35;1289 UplinkNASTransport
+    rect rgb(255, 226, 226)
+    UE->>AMF: #35;1289 Authentication failure
+    Note over AMF: Synch failure (#35;21) — 3GPP TS 24.501 §9.11.3.2
+    end
+    AUSF->>SCP: #35;1296 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567893/security-information/generate-auth-data
+    SCP->>UDM: #35;1299 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567893/security-information/generate-auth-data
+    SCP->>UDR: #35;1305 PATCH /nudr-dr/v1/subscription-data/imsi-001011234567893/authentication-data/authentication-subscription
+    UDR->>SCP: #35;1308 204
+    UDM->>SCP: #35;1310 200
+    SCP->>AUSF: #35;1313 200
+    AMF->>gNB: #35;1322 DownlinkNASTransport
+    AMF->>UE: #35;1322 Authentication request
+    gNB->>AMF: #35;1323 UplinkNASTransport
+    UE->>AMF: #35;1323 Authentication response
+    AUSF->>SCP: #35;1330 POST /nudm-ueau/v1/imsi-001011234567893/auth-events
+    SCP->>UDM: #35;1333 POST /nudm-ueau/v1/imsi-001011234567893/auth-events
+    UDM->>SCP: #35;1336 PUT /nudr-dr/v1/subscription-data/imsi-001011234567893/authentication-data/authentication-status
+    SCP->>UDR: #35;1339 PUT /nudr-dr/v1/subscription-data/imsi-001011234567893/authentication-data/authentication-status
+    UDR->>SCP: #35;1342 204
+    SCP->>UDM: #35;1343 204
+    UDM->>SCP: #35;1344 201
+    SCP->>AUSF: #35;1347 201
+    AMF->>gNB: #35;1356 DownlinkNASTransport
+    AMF->>UE: #35;1356 Security mode command
+    gNB->>AMF: #35;1357 UplinkNASTransport
+    AMF->>SCP: #35;1358 PUT /nudm-uecm/v1/imsi-001011234567893/registrations/amf-3gpp-access
+    SCP->>UDM: #35;1361 PUT /nudm-uecm/v1/imsi-001011234567893/registrations/amf-3gpp-access
+    UDM->>SCP: #35;1364 PUT /nudr-dr/v1/subscription-data/imsi-001011234567893/context-data/amf-3gpp-access
+    SCP->>UDR: #35;1367 PUT /nudr-dr/v1/subscription-data/imsi-001011234567893/context-data/amf-3gpp-access
+    UDR->>SCP: #35;1370 204
+    SCP->>UDM: #35;1371 204
+    UDM->>SCP: #35;1372 201
+    SCP->>AMF: #35;1375 201
+    AMF->>SCP: #35;1378 GET /nudm-sdm/v2/imsi-001011234567893?dataset-names=AM%2CSMF_SEL&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    SCP->>UDM: #35;1379 GET /nudm-sdm/v2/imsi-001011234567893?dataset-names=AM%2CSMF_SEL&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;1380 GET /nudr-dr/v1/subscription-data/imsi-001011234567893/00101/provisioned-data?dataset-names=AM%2CSMF_SEL
+    SCP->>UDR: #35;1381 GET /nudr-dr/v1/subscription-data/imsi-001011234567893/00101/provisioned-data?dataset-names=AM%2CSMF_SEL
+    UDR->>SCP: #35;1382 200
+    SCP->>UDM: #35;1385 200
+    UDM->>SCP: #35;1388 200
+    SCP->>AMF: #35;1391 200
+    AMF->>SCP: #35;1394 GET /nudm-sdm/v2/imsi-001011234567893/ue-context-in-smf-data?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    SCP->>UDM: #35;1395 GET /nudm-sdm/v2/imsi-001011234567893/ue-context-in-smf-data?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;1396 200
+    SCP->>AMF: #35;1399 200
+    AMF->>SCP: #35;1402 POST /nudm-sdm/v2/imsi-001011234567893/sdm-subscriptions
+    SCP->>UDM: #35;1405 POST /nudm-sdm/v2/imsi-001011234567893/sdm-subscriptions
+    UDM->>SCP: #35;1408 201
+    SCP->>AMF: #35;1411 201
+    PCF->>SCP: #35;1420 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567893/am-data
+    SCP->>UDR: #35;1421 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567893/am-data
+    UDR->>SCP: #35;1422 200
+    SCP->>PCF: #35;1425 200
+    AMF->>gNB: #35;1436 InitialContextSetup
+    gNB->>AMF: #35;1437 InitialContextSetupResponse
+    gNB->>AMF: #35;1439 UplinkNASTransport
+    gNB->>AMF: #35;1439 UplinkNASTransport
+    AMF->>gNB: #35;1440 DownlinkNASTransport
+    AMF->>SCP: #35;1441 POST /nsmf-pdusession/v1/sm-contexts
+    AMF->>SCP: #35;1442 PDU session establishment request
+    SCP->>SMF: #35;1444 POST /nsmf-pdusession/v1/sm-contexts
+    SCP->>SMF: #35;1445 PDU session establishment request
+    SMF->>SCP: #35;1447 GET /nudm-sdm/v2/imsi-001011234567893/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    SCP->>UDM: #35;1448 GET /nudm-sdm/v2/imsi-001011234567893/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;1449 GET /nudr-dr/v1/subscription-data/imsi-001011234567893/00101/provisioned-data/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet
+    SCP->>UDR: #35;1450 GET /nudr-dr/v1/subscription-data/imsi-001011234567893/00101/provisioned-data/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet
+    UDR->>SCP: #35;1451 200
+    SCP->>UDM: #35;1454 200
+    UDM->>SCP: #35;1457 200
+    SCP->>SMF: #35;1460 200
+    SMF->>SCP: #35;1464 POST /nudm-sdm/v2/imsi-001011234567893/sdm-subscriptions
+    SCP->>UDM: #35;1467 POST /nudm-sdm/v2/imsi-001011234567893/sdm-subscriptions
+    UDM->>SCP: #35;1470 201
+    SCP->>SMF: #35;1473 201
+    SMF->>SCP: #35;1476 201
+    SCP->>AMF: #35;1486 201
+    PCF->>SCP: #35;1489 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567893/sm-data?dnn=internet&snssai=%7B%22sst%22%3A1%7D
+    SCP->>UDR: #35;1490 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567893/sm-data?dnn=internet&snssai=%7B%22sst%22%3A1%7D
+    UDR->>SCP: #35;1491 200
+    SCP->>PCF: #35;1494 200
+    SMF->>UPF: #35;1518 Session Establishment Request
+    UPF->>SMF: #35;1519 Session Establishment Response
+    SMF->>SCP: #35;1520 POST /namf-comm/v1/ue-contexts/imsi-001011234567893/n1-n2-messages
+    SMF->>SCP: #35;1521 PDU session establishment accept
+    SCP->>AMF: #35;1523 POST /namf-comm/v1/ue-contexts/imsi-001011234567893/n1-n2-messages
+    SCP->>AMF: #35;1524 PDU session establishment accept
+    AMF->>SCP: #35;1526 200
+    AMF->>gNB: #35;1528 PDUSessionResourceSetup
+    SCP->>SMF: #35;1532 200
+    gNB->>AMF: #35;1535 PDUSessionResourceSetupResponse
+    SCP->>SMF: #35;1539 POST /nsmf-pdusession/v1/sm-contexts/6/modify
+    SMF->>UPF: #35;1542 Session Modification Request
+    UPF->>SMF: #35;1543 Session Modification Response
+    SMF->>SCP: #35;1544 PUT /nudm-uecm/v1/imsi-001011234567893/registrations/smf-registrations/1
+    SCP->>UDM: #35;1547 PUT /nudm-uecm/v1/imsi-001011234567893/registrations/smf-registrations/1
+    UDM->>SCP: #35;1550 PUT /nudr-dr/v1/subscription-data/imsi-001011234567893/context-data/smf-registrations/1
+    SCP->>UDR: #35;1553 PUT /nudr-dr/v1/subscription-data/imsi-001011234567893/context-data/smf-registrations/1
+    UDR->>SCP: #35;1556 204
+    SCP->>UDM: #35;1557 204
+    UDM->>SCP: #35;1558 201
+    SCP->>SMF: #35;1561 201
+    SMF->>SCP: #35;1564 204
+
+sequenceDiagram
+    autonumber
+    participant AMF
+    participant SCP
+    Note over AMF,SCP: PDU session 6
+    AMF->>SCP: #35;1536 POST /nsmf-pdusession/v1/sm-contexts/6/modify
+    SCP->>AMF: #35;1565 204
+
+sequenceDiagram
+    autonumber
+    participant UE
+    participant gNB
+    participant AMF
+    participant SCP
+    participant AUSF
+    participant UDM
+    participant UDR
+    participant PCF
+    participant SMF
+    participant UPF
+    Note over gNB,UPF: SUPI 001011234567894
+    gNB->>AMF: #35;1799 InitialUEMessage
+    UE->>AMF: #35;1799 Registration request
+    AUSF->>SCP: #35;1806 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567894/security-information/generate-auth-data
+    SCP->>UDM: #35;1809 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567894/security-information/generate-auth-data
+    UDM->>SCP: #35;1812 GET /nudr-dr/v1/subscription-data/imsi-001011234567894/authentication-data/authentication-subscription
+    SCP->>UDR: #35;1813 GET /nudr-dr/v1/subscription-data/imsi-001011234567894/authentication-data/authentication-subscription
+    UDR->>SCP: #35;1814 200
+    SCP->>UDM: #35;1818 200
+    UDM->>SCP: #35;1822 200
+    SCP->>AUSF: #35;1825 200
+    AMF->>gNB: #35;1836 DownlinkNASTransport
+    AMF->>UE: #35;1836 Authentication request
+    gNB->>AMF: #35;1837 UplinkNASTransport
+    rect rgb(255, 226, 226)
+    UE->>AMF: #35;1837 Authentication failure
+    Note over AMF: Synch failure (#35;21) — 3GPP TS 24.501 §9.11.3.2
+    end
+    AUSF->>SCP: #35;1844 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567894/security-information/generate-auth-data
+    SCP->>UDM: #35;1847 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567894/security-information/generate-auth-data
+    UDM->>SCP: #35;1850 PATCH /nudr-dr/v1/subscription-data/imsi-001011234567894/authentication-data/authentication-subscription
+    SCP->>UDR: #35;1853 PATCH /nudr-dr/v1/subscription-data/imsi-001011234567894/authentication-data/authentication-subscription
+    UDR->>SCP: #35;1856 204
+    SCP->>UDM: #35;1857 204
+    UDM->>SCP: #35;1858 200
+    SCP->>AUSF: #35;1861 200
+    AMF->>gNB: #35;1870 DownlinkNASTransport
+    AMF->>UE: #35;1870 Authentication request
+    gNB->>AMF: #35;1871 UplinkNASTransport
+    UE->>AMF: #35;1871 Authentication response
+    AUSF->>SCP: #35;1878 POST /nudm-ueau/v1/imsi-001011234567894/auth-events
+    SCP->>UDM: #35;1881 POST /nudm-ueau/v1/imsi-001011234567894/auth-events
+    UDM->>SCP: #35;1884 PUT /nudr-dr/v1/subscription-data/imsi-001011234567894/authentication-data/authentication-status
+    SCP->>UDR: #35;1887 PUT /nudr-dr/v1/subscription-data/imsi-001011234567894/authentication-data/authentication-status
+    UDR->>SCP: #35;1890 204
+    SCP->>UDM: #35;1891 204
+    UDM->>SCP: #35;1892 201
+    SCP->>AUSF: #35;1895 201
+    AMF->>gNB: #35;1904 DownlinkNASTransport
+    AMF->>UE: #35;1904 Security mode command
+    gNB->>AMF: #35;1905 UplinkNASTransport
+    AMF->>SCP: #35;1906 PUT /nudm-uecm/v1/imsi-001011234567894/registrations/amf-3gpp-access
+    SCP->>UDM: #35;1909 PUT /nudm-uecm/v1/imsi-001011234567894/registrations/amf-3gpp-access
+    UDM->>SCP: #35;1912 PUT /nudr-dr/v1/subscription-data/imsi-001011234567894/context-data/amf-3gpp-access
+    SCP->>UDR: #35;1915 PUT /nudr-dr/v1/subscription-data/imsi-001011234567894/context-data/amf-3gpp-access
+    UDR->>SCP: #35;1918 204
+    SCP->>UDM: #35;1919 204
+    UDM->>SCP: #35;1920 201
+    SCP->>AMF: #35;1923 201
+    AMF->>SCP: #35;1926 GET /nudm-sdm/v2/imsi-001011234567894?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D&dataset-names=AM%2CSMF_SEL
+    SCP->>UDM: #35;1927 GET /nudm-sdm/v2/imsi-001011234567894?dataset-names=AM%2CSMF_SEL&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;1928 GET /nudr-dr/v1/subscription-data/imsi-001011234567894/00101/provisioned-data?dataset-names=AM%2CSMF_SEL
+    SCP->>UDR: #35;1929 GET /nudr-dr/v1/subscription-data/imsi-001011234567894/00101/provisioned-data?dataset-names=AM%2CSMF_SEL
+    UDR->>SCP: #35;1930 200
+    SCP->>UDM: #35;1933 200
+    UDM->>SCP: #35;1936 200
+    SCP->>AMF: #35;1939 200
+    AMF->>SCP: #35;1942 GET /nudm-sdm/v2/imsi-001011234567894/ue-context-in-smf-data?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    SCP->>UDM: #35;1943 GET /nudm-sdm/v2/imsi-001011234567894/ue-context-in-smf-data?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;1944 200
+    SCP->>AMF: #35;1947 200
+    AMF->>SCP: #35;1950 POST /nudm-sdm/v2/imsi-001011234567894/sdm-subscriptions
+    SCP->>UDM: #35;1953 POST /nudm-sdm/v2/imsi-001011234567894/sdm-subscriptions
+    UDM->>SCP: #35;1956 201
+    SCP->>AMF: #35;1959 201
+    PCF->>SCP: #35;1968 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567894/am-data
+    SCP->>UDR: #35;1969 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567894/am-data
+    UDR->>SCP: #35;1970 200
+    SCP->>PCF: #35;1973 200
+    AMF->>gNB: #35;1984 InitialContextSetup
+    gNB->>AMF: #35;1985 InitialContextSetupResponse
+    gNB->>AMF: #35;1987 UplinkNASTransport
+    gNB->>AMF: #35;1987 UplinkNASTransport
+    AMF->>gNB: #35;1988 DownlinkNASTransport
+    AMF->>SCP: #35;1989 POST /nsmf-pdusession/v1/sm-contexts
+    AMF->>SCP: #35;1990 PDU session establishment request
+    SCP->>SMF: #35;1992 POST /nsmf-pdusession/v1/sm-contexts
+    SCP->>SMF: #35;1993 PDU session establishment request
+    SMF->>SCP: #35;1995 GET /nudm-sdm/v2/imsi-001011234567894/sm-data?dnn=internet&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D&single-nssai=%7B%22sst%22%3A1%7D
+    SCP->>UDM: #35;1996 GET /nudm-sdm/v2/imsi-001011234567894/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;1997 GET /nudr-dr/v1/subscription-data/imsi-001011234567894/00101/provisioned-data/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet
+    SCP->>UDR: #35;1998 GET /nudr-dr/v1/subscription-data/imsi-001011234567894/00101/provisioned-data/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet
+    UDR->>SCP: #35;1999 200
+    SCP->>UDM: #35;2002 200
+    UDM->>SCP: #35;2005 200
+    SCP->>SMF: #35;2008 200
+    SMF->>SCP: #35;2012 POST /nudm-sdm/v2/imsi-001011234567894/sdm-subscriptions
+    SCP->>UDM: #35;2015 POST /nudm-sdm/v2/imsi-001011234567894/sdm-subscriptions
+    UDM->>SCP: #35;2018 201
+    SCP->>SMF: #35;2021 201
+    SMF->>SCP: #35;2024 201
+    SCP->>AMF: #35;2034 201
+    PCF->>SCP: #35;2037 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567894/sm-data?dnn=internet&snssai=%7B%22sst%22%3A1%7D
+    SCP->>UDR: #35;2038 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567894/sm-data?dnn=internet&snssai=%7B%22sst%22%3A1%7D
+    UDR->>SCP: #35;2039 200
+    SCP->>PCF: #35;2042 200
+    SMF->>UPF: #35;2066 Session Establishment Request
+    UPF->>SMF: #35;2067 Session Establishment Response
+    SMF->>SCP: #35;2068 POST /namf-comm/v1/ue-contexts/imsi-001011234567894/n1-n2-messages
+    SMF->>SCP: #35;2069 PDU session establishment accept
+    SCP->>AMF: #35;2071 POST /namf-comm/v1/ue-contexts/imsi-001011234567894/n1-n2-messages
+    SCP->>AMF: #35;2072 PDU session establishment accept
+    AMF->>SCP: #35;2074 200
+    AMF->>gNB: #35;2076 PDUSessionResourceSetup
+    SCP->>SMF: #35;2080 200
+    gNB->>AMF: #35;2083 PDUSessionResourceSetupResponse
+    SCP->>SMF: #35;2087 POST /nsmf-pdusession/v1/sm-contexts/7/modify
+    SMF->>UPF: #35;2090 Session Modification Request
+    UPF->>SMF: #35;2091 Session Modification Response
+    SMF->>SCP: #35;2092 PUT /nudm-uecm/v1/imsi-001011234567894/registrations/smf-registrations/1
+    SCP->>UDM: #35;2095 PUT /nudm-uecm/v1/imsi-001011234567894/registrations/smf-registrations/1
+    UDM->>SCP: #35;2098 PUT /nudr-dr/v1/subscription-data/imsi-001011234567894/context-data/smf-registrations/1
+    SCP->>UDR: #35;2101 PUT /nudr-dr/v1/subscription-data/imsi-001011234567894/context-data/smf-registrations/1
+    UDR->>SCP: #35;2104 204
+    SCP->>UDM: #35;2105 204
+    UDM->>SCP: #35;2106 201
+    SCP->>SMF: #35;2109 201
+    SMF->>SCP: #35;2112 204
+
+sequenceDiagram
+    autonumber
+    participant AMF
+    participant SCP
+    Note over AMF,SCP: PDU session 7
+    AMF->>SCP: #35;2084 POST /nsmf-pdusession/v1/sm-contexts/7/modify
+    SCP->>AMF: #35;2113 204
+
+sequenceDiagram
+    autonumber
+    participant UE
+    participant gNB
+    participant AMF
+    participant SCP
+    participant AUSF
+    participant UDM
+    participant UDR
+    participant PCF
+    participant SMF
+    participant UPF
+    Note over gNB,UPF: SUPI 001011234567895
+    gNB->>AMF: #35;2309 InitialUEMessage
+    UE->>AMF: #35;2309 Registration request
+    SMF->>SCP: #35;2334 DELETE /nudm-sdm/v2/imsi-001011234567895/sdm-subscriptions/a90fd1f0-9a4c-41f1-ba42-2bbf57836f1f
+    SCP->>UDM: #35;2335 DELETE /nudm-sdm/v2/imsi-001011234567895/sdm-subscriptions/a90fd1f0-9a4c-41f1-ba42-2bbf57836f1f
+    UDM->>SCP: #35;2336 204
+    SCP->>SMF: #35;2337 204
+    SMF->>SCP: #35;2338 DELETE /nudm-uecm/v1/imsi-001011234567895/registrations/smf-registrations/1
+    SCP->>UDM: #35;2339 DELETE /nudm-uecm/v1/imsi-001011234567895/registrations/smf-registrations/1
+    UDM->>SCP: #35;2340 DELETE /nudr-dr/v1/subscription-data/imsi-001011234567895/context-data/smf-registrations/1
+    SCP->>UDR: #35;2341 DELETE /nudr-dr/v1/subscription-data/imsi-001011234567895/context-data/smf-registrations/1
+    UDR->>SCP: #35;2342 204
+    SCP->>UDM: #35;2344 204
+    UDM->>SCP: #35;2346 204
+    SCP->>SMF: #35;2347 204
+    AUSF->>SCP: #35;2358 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567895/security-information/generate-auth-data
+    SCP->>UDM: #35;2361 POST /nudm-ueau/v1/suci-0-001-01-0000-0-0-1234567895/security-information/generate-auth-data
+    UDM->>SCP: #35;2364 GET /nudr-dr/v1/subscription-data/imsi-001011234567895/authentication-data/authentication-subscription
+    SCP->>UDR: #35;2365 GET /nudr-dr/v1/subscription-data/imsi-001011234567895/authentication-data/authentication-subscription
+    UDR->>SCP: #35;2366 200
+    SCP->>UDM: #35;2369 200
+    UDM->>SCP: #35;2372 200
+    SCP->>AUSF: #35;2375 200
+    AMF->>gNB: #35;2385 DownlinkNASTransport
+    AMF->>UE: #35;2385 Authentication request
+    gNB->>AMF: #35;2386 UplinkNASTransport
+    UE->>AMF: #35;2386 Authentication response
+    AUSF->>SCP: #35;2393 POST /nudm-ueau/v1/imsi-001011234567895/auth-events
+    SCP->>UDM: #35;2396 POST /nudm-ueau/v1/imsi-001011234567895/auth-events
+    UDM->>SCP: #35;2399 PUT /nudr-dr/v1/subscription-data/imsi-001011234567895/authentication-data/authentication-status
+    SCP->>UDR: #35;2402 PUT /nudr-dr/v1/subscription-data/imsi-001011234567895/authentication-data/authentication-status
+    UDR->>SCP: #35;2405 204
+    SCP->>UDM: #35;2406 204
+    UDM->>SCP: #35;2407 201
+    SCP->>AUSF: #35;2410 201
+    AMF->>gNB: #35;2419 DownlinkNASTransport
+    AMF->>UE: #35;2419 Security mode command
+    gNB->>AMF: #35;2420 UplinkNASTransport
+    AMF->>SCP: #35;2422 PUT /nudm-uecm/v1/imsi-001011234567895/registrations/amf-3gpp-access
+    SCP->>UDM: #35;2426 PUT /nudm-uecm/v1/imsi-001011234567895/registrations/amf-3gpp-access
+    UDM->>SCP: #35;2429 PUT /nudr-dr/v1/subscription-data/imsi-001011234567895/context-data/amf-3gpp-access
+    SCP->>UDR: #35;2432 PUT /nudr-dr/v1/subscription-data/imsi-001011234567895/context-data/amf-3gpp-access
+    UDR->>SCP: #35;2435 204
+    SCP->>UDM: #35;2436 204
+    UDM->>SCP: #35;2437 200
+    SCP->>AMF: #35;2440 200
+    AMF->>SCP: #35;2443 GET /nudm-sdm/v2/imsi-001011234567895?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D&dataset-names=AM%2CSMF_SEL
+    SCP->>UDM: #35;2444 GET /nudm-sdm/v2/imsi-001011234567895?dataset-names=AM%2CSMF_SEL&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;2445 GET /nudr-dr/v1/subscription-data/imsi-001011234567895/00101/provisioned-data?dataset-names=AM%2CSMF_SEL
+    SCP->>UDR: #35;2446 GET /nudr-dr/v1/subscription-data/imsi-001011234567895/00101/provisioned-data?dataset-names=AM%2CSMF_SEL
+    UDR->>SCP: #35;2447 200
+    SCP->>UDM: #35;2450 200
+    UDM->>SCP: #35;2453 200
+    SCP->>AMF: #35;2456 200
+    AMF->>SCP: #35;2459 GET /nudm-sdm/v2/imsi-001011234567895/ue-context-in-smf-data?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    SCP->>UDM: #35;2460 GET /nudm-sdm/v2/imsi-001011234567895/ue-context-in-smf-data?plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;2461 200
+    SCP->>AMF: #35;2464 200
+    PCF->>SCP: #35;2473 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567895/am-data
+    SCP->>UDR: #35;2474 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567895/am-data
+    UDR->>SCP: #35;2475 200
+    SCP->>PCF: #35;2478 200
+    AMF->>gNB: #35;2487 InitialContextSetup
+    gNB->>AMF: #35;2488 InitialContextSetupResponse
+    gNB->>AMF: #35;2491 UplinkNASTransport
+    gNB->>AMF: #35;2491 UplinkNASTransport
+    AMF->>gNB: #35;2492 DownlinkNASTransport
+    AMF->>SCP: #35;2493 POST /nsmf-pdusession/v1/sm-contexts
+    AMF->>SCP: #35;2494 PDU session establishment request
+    SCP->>SMF: #35;2496 POST /nsmf-pdusession/v1/sm-contexts
+    SCP->>SMF: #35;2497 PDU session establishment request
+    SMF->>SCP: #35;2499 GET /nudm-sdm/v2/imsi-001011234567895/sm-data?dnn=internet&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D&single-nssai=%7B%22sst%22%3A1%7D
+    SCP->>UDM: #35;2500 GET /nudm-sdm/v2/imsi-001011234567895/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet&plmn-id=%7B%22mcc%22%3A%22001%22%2C%22mnc%22%3A%2201%22%7D
+    UDM->>SCP: #35;2501 GET /nudr-dr/v1/subscription-data/imsi-001011234567895/00101/provisioned-data/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet
+    SCP->>UDR: #35;2502 GET /nudr-dr/v1/subscription-data/imsi-001011234567895/00101/provisioned-data/sm-data?single-nssai=%7B%22sst%22%3A1%7D&dnn=internet
+    UDR->>SCP: #35;2503 200
+    SCP->>UDM: #35;2506 200
+    UDM->>SCP: #35;2509 200
+    SCP->>SMF: #35;2512 200
+    SMF->>SCP: #35;2516 POST /nudm-sdm/v2/imsi-001011234567895/sdm-subscriptions
+    SCP->>UDM: #35;2519 POST /nudm-sdm/v2/imsi-001011234567895/sdm-subscriptions
+    UDM->>SCP: #35;2522 201
+    SCP->>SMF: #35;2525 201
+    SMF->>SCP: #35;2528 201
+    SCP->>AMF: #35;2538 201
+    PCF->>SCP: #35;2541 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567895/sm-data?dnn=internet&snssai=%7B%22sst%22%3A1%7D
+    SCP->>UDR: #35;2542 GET /nudr-dr/v1/policy-data/ues/imsi-001011234567895/sm-data?dnn=internet&snssai=%7B%22sst%22%3A1%7D
+    UDR->>SCP: #35;2543 200
+    SCP->>PCF: #35;2546 200
+    SMF->>UPF: #35;2568 Session Establishment Request
+    UPF->>SMF: #35;2569 Session Establishment Response
+    SMF->>SCP: #35;2570 POST /namf-comm/v1/ue-contexts/imsi-001011234567895/n1-n2-messages
+    SMF->>SCP: #35;2571 PDU session establishment accept
+    SCP->>AMF: #35;2573 POST /namf-comm/v1/ue-contexts/imsi-001011234567895/n1-n2-messages
+    SCP->>AMF: #35;2574 PDU session establishment accept
+    AMF->>SCP: #35;2576 200
+    AMF->>gNB: #35;2578 PDUSessionResourceSetup
+    SCP->>SMF: #35;2582 200
+    gNB->>AMF: #35;2585 PDUSessionResourceSetupResponse
+    SCP->>SMF: #35;2589 POST /nsmf-pdusession/v1/sm-contexts/8/modify
+    SMF->>UPF: #35;2592 Session Modification Request
+    UPF->>SMF: #35;2593 Session Modification Response
+    SMF->>SCP: #35;2594 PUT /nudm-uecm/v1/imsi-001011234567895/registrations/smf-registrations/1
+    SCP->>UDM: #35;2597 PUT /nudm-uecm/v1/imsi-001011234567895/registrations/smf-registrations/1
+    UDM->>SCP: #35;2600 PUT /nudr-dr/v1/subscription-data/imsi-001011234567895/context-data/smf-registrations/1
+    SCP->>UDR: #35;2603 PUT /nudr-dr/v1/subscription-data/imsi-001011234567895/context-data/smf-registrations/1
+    UDR->>SCP: #35;2606 204
+    SCP->>UDM: #35;2607 204
+    UDM->>SCP: #35;2608 200
+    SCP->>SMF: #35;2611 200
+    SMF->>SCP: #35;2614 204
+
+sequenceDiagram
+    autonumber
+    participant AMF
+    participant SCP
+    Note over AMF,SCP: PDU session 3
+    AMF->>SCP: #35;2310 POST /nsmf-pdusession/v1/sm-contexts/3/release
+    SCP->>AMF: #35;2350 204
+
+sequenceDiagram
+    autonumber
+    participant SCP
+    participant SMF
+    Note over SCP,SMF: PDU session 3
+    SCP->>SMF: #35;2313 POST /nsmf-pdusession/v1/sm-contexts/3/release
+    SMF->>SCP: #35;2348 204
+
+sequenceDiagram
+    autonumber
+    participant SMF
+    participant UPF
+    Note over SMF,UPF: PDU session 3241
+    SMF->>UPF: #35;2316 Session Deletion Request
+
+sequenceDiagram
+    autonumber
+    participant SMF
+    participant UPF
+    Note over UPF,UPF: PDU session 1170
+    UPF->>SMF: #35;2317 Session Deletion Response
+
+sequenceDiagram
+    autonumber
+    participant gNB
+    participant AMF
+    Note over AMF,AMF: amf_ue_ngap_id 172.22.0.10|172.22.0.23/3
+    AMF->>gNB: #35;2421 UEContextRelease
+    gNB->>AMF: #35;2423 UEContextReleaseResponse
+
+sequenceDiagram
+    autonumber
+    participant AMF
+    participant SCP
+    Note over AMF,SCP: PDU session 8
+    AMF->>SCP: #35;2586 POST /nsmf-pdusession/v1/sm-contexts/8/modify
+    SCP->>AMF: #35;2615 204

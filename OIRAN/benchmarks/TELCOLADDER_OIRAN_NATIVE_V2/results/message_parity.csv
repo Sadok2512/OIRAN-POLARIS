@@ -1,0 +1,16 @@
+dataset,protocol,comparison,oiran,telcoladder,tshark,classification,evidence
+LAB_TESTBED__5gc-e2e,ALL_5G_SIGNALING,decoded message inventory,0,177,27,MISSING,OIRAN UnsupportedLinkType on all 626 SLL2 frames
+LAB_TESTBED__5gc-registration,ALL_5G_SIGNALING,decoded message inventory,0,15,15,MISSING,OIRAN UnsupportedLinkType on all 44 SLL2 frames
+LAB_TESTBED__ki-mismatch,ALL_5G_SIGNALING,decoded message inventory,0,4,4,MISSING,OIRAN UnsupportedLinkType on all 13 SLL2 frames
+LAB_TESTBED__multi-imsi,ALL_5G_SIGNALING,decoded message inventory,0,1031,127,MISSING,OIRAN UnsupportedLinkType on all 2710 SLL2 frames
+LAB_TESTBED__supi-not-provisioned,ALL_5G_SIGNALING,decoded message inventory,0,4,4,MISSING,OIRAN UnsupportedLinkType on all 12 SLL2 frames
+LAB_TESTBED__unknown-dnn,ALL_5G_SIGNALING,decoded message inventory,0,12,12,MISSING,OIRAN UnsupportedLinkType on all 22 SLL2 frames
+LAB_TESTBED__userplane,ALL_5G_SIGNALING,decoded message inventory,0,198,41,MISSING,OIRAN UnsupportedLinkType on all 648 SLL2 frames
+OIRAN_A,NGAP,canonical message occurrences,14,14,14,EXACT,All 14 NGAP procedure occurrences align after canonical request/response normalization
+OIRAN_A,NGAP,literal message names,10,10,14,MISMATCH,TelcoLadder collapses four Request/Command/Complete names to procedure-level labels
+OIRAN_A,NAS-5GS,nested NAS message names,0,4,4,MISSING,OIRAN preserves NAS-PDU status/hash but does not identify the four nested NAS messages
+OIRAN_A,GTP-U,G-PDU occurrences,10,10,10,EXACT,10 G-PDU packets
+OIRAN_A,PFCP,canonical message occurrences,30,30,30,EXACT,24 heartbeats plus six session messages
+OIRAN_B,PFCP,canonical message occurrences,20,20,20,EXACT,10 heartbeat request/response pairs
+OIRAN_B,NGAP,empty interface,0,0,0,NOT_COMPARABLE,No NGAP signaling observed
+OIRAN_B,GTP-U,empty interface,0,0,0,NOT_COMPARABLE,Zero-frame N3 capture

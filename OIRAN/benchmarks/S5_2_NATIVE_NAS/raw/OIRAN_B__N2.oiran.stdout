@@ -1,0 +1,1 @@
+capture_format=Pcap packets=26 events=0 warnings=0 transport_errors=2 sctp_errors=0 incomplete_sctp=0 output=/root/OIRAN_VPROBE/.worktrees/s5_2/benchmarks/S5_2_NATIVE_NAS/raw/OIRAN_B__N2.events.jsonl

@@ -1,0 +1,12 @@
+/target/
+/apps/web/node_modules/
+/apps/web/dist/
+test-results/
+*.tsbuildinfo
+/apps/web/vite.config.js
+/apps/web/vite.config.d.ts
+*.log
+.env
+/config/polaris-control.env
+/config/initial-credentials.env
+/config/operator-initial-password

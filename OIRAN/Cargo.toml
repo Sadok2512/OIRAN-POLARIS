@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "capture-core",
+    "packet-classifier",
+    "flow-dispatcher",
+    "worker-runtime",
+    "event-schema",
+    "plugin-runtime",
+    "telemetry",
+    "benchmark-engine",
+    "capture-pcap",
+    "transport-sctp",
+    "transport-tcp",
+    "decoder-ngap",
+    "decoder-nas",
+    "decoder-sbi",
+    "decoder-pfcp",
+    "decoder-gtpu",
+    "oiran-decode",
+    "session-engine",
+    "correlation-engine",
+    "callflow-schema",
+    "callflow-renderer",
+    "oiran-callflow",
+    "apps/api",
+    "dataset-registry",
+    "disk-safety",
+    "live-probe",
+    "capture-helper",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+

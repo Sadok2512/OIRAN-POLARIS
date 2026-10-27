@@ -1,0 +1,39 @@
+{
+  "xdr_version": 1,
+  "source": "5gc-registration.pcap",
+  "procedures": [
+    {
+      "procedure": "registration",
+      "supi": "001011234567895",
+      "outcome": "success",
+      "cause": null,
+      "root_cause": null,
+      "pdu_session_id": "1",
+      "start_frame": 13,
+      "end_frame": 27,
+      "messages": 19,
+      "failures": 1,
+      "duration_s": 0.36,
+      "protocols": [
+        "nas-5gs",
+        "ngap"
+      ],
+      "note": ""
+    }
+  ],
+  "messages_total": 22,
+  "messages_in_procedures": 19,
+  "messages_unassigned": 3,
+  "cause_rollup": [
+    {
+      "cause": "The sequence number is out of sync; the UE is asking the network to resynchronise.",
+      "count": 1,
+      "frames": [
+        15
+      ],
+      "supis": [
+        "001011234567895"
+      ]
+    }
+  ]
+}

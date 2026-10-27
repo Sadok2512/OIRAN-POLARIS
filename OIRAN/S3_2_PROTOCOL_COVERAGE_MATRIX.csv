@@ -1,0 +1,21 @@
+layer,feature,status,real_evidence,test_evidence,limitation
+PCAP,classic microsecond/nanosecond reader,VALIDATED_SYNTHETIC,NONE,unit fixtures,no selected real classic-PCAP file
+PCAPNG,section and enhanced packet reader,VALIDATED_REAL,2758 packets,unit fixtures,
+PCAPNG,multiple interfaces and per-interface timestamp resolution,VALIDATED_SYNTHETIC,selected files use one interface,decimal and binary unit fixtures,
+Link,Ethernet VLAN IPv4 IPv6 UDP SCTP,VALIDATED_REAL,Ethernet N2/N4,unit fixtures,IPv4 fragments and IPv6 extension chains unsupported
+Link,Linux cooked v1,VALIDATED_REAL,2690-packet Open5GS fixture,real decode,
+SCTP,common header DATA chunks streams PPID,VALIDATED_REAL,37 NGAP messages,unit fixtures,
+SCTP,multiple chunks per packet,VALIDATED_REAL,N2 frame 13,unit fixtures,
+SCTP,fragment reassembly duplicate missing fragment,VALIDATED_SYNTHETIC,no fragmented real sample,unit fixtures,
+SCTP,I-DATA interleaving,UNSUPPORTED,none,explicit rejection,never passed to NGAP
+NGAP,APER PDU envelope and IE container,VALIDATED_REAL,37 of 37 aligned,unit fixtures,
+NGAP,procedure and message identification,VALIDATED_REAL,37 of 37 exact,unit fixtures,
+NGAP,AMF and RAN UE IDs,VALIDATED_REAL,accessible values aligned,unit fixtures,
+NGAP,nested typed Release-17 IE values,PARTIAL,33 messages retain opaque values,unknown and extension tests,complete generated schema binding absent
+NGAP,NAS,PARTIAL,protected state and pseudonym emitted,real samples,no decryption or full NAS decode
+PFCP,header SEID sequence and message type,VALIDATED_REAL,52 of 52 exact,unit fixtures,
+PFCP,grouped and unknown IE handling,VALIDATED_REAL,12 partial messages,unit fixtures,not every IE typed
+PFCP,F-SEID PDR FAR F-TEID UE-IP Cause Network-Instance,PARTIAL,values extracted where present,unit fixtures,conditional semantics deferred
+GTP-U,header TEID optional fields lengths,VALIDATED_REAL,10 of 10 exact,unit fixtures,operational N3 empty
+GTP-U,extension chain PDU Session Container,VALIDATED_SYNTHETIC,not present in selected sample,unit fixtures,other extensions retained by hash
+Events,deterministic ID complete provenance versions,VALIDATED_REAL,99 of 99 events,unit fixtures,

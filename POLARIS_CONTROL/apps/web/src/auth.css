@@ -1,0 +1,21 @@
+.signin-link {
+  color: #2878e3;
+  font-size: 10px;
+  font-weight: 750;
+  text-decoration: none;
+}
+
+.signin-link:hover {
+  text-decoration: underline;
+}
+
+.signin-link:focus-visible {
+  border-radius: 3px;
+  outline: 2px solid #2878e3;
+  outline-offset: 3px;
+}
+
+.validation a {
+  color: inherit;
+  font-weight: 800;
+}

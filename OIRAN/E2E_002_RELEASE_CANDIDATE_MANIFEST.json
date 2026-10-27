@@ -1,0 +1,30 @@
+{
+  "project": "OIRAN",
+  "mission": "RELEASE_INTEGRATION_AND_REGRESSION_CORRECTION",
+  "generated_at": "2026-10-27T00:12:47Z",
+  "branch": "feat/e2e-002-release-stabilization",
+  "source_fix_commit": "c7ae16aaf31a30d6185b60f65b479686cc5004c4",
+  "source_capture": "live-1793054609378-0001",
+  "source_dataset": "dataset-live-1793054609378-0001",
+  "derived_dataset": "derived-e2e-002-live-1793054609378-0001",
+  "packets": 543,
+  "events": 92,
+  "sessions": 1,
+  "correlation": {
+    "ngap_pfcp": "EXACT_TUNNEL_MATCH",
+    "ngap_sbi": "STRONG_CONTEXT_ASSOCIATION",
+    "sbi_pfcp": "STRONG_CONTEXT_ASSOCIATION",
+    "pfcp_gtpu": "UNKNOWN",
+    "complete_e2e_certified": false
+  },
+  "tests": {
+    "rust": {"passed": 178, "failed": 0},
+    "api": {"passed": 20, "failed": 0},
+    "frontend": {"passed": 20, "failed": 0},
+    "browser": {"passed": 47, "failed": 0, "skipped": 0}
+  },
+  "source_integrity": true,
+  "production_changed": false,
+  "live_capture": false,
+  "credentials_committed": false
+}

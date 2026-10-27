@@ -1,0 +1,752 @@
+{
+  "ue_contexts": [
+    {
+      "context_id": "uectx-1882fcba0a7c4674",
+      "pseudonym": "UE-ecb83fe5f99640ea",
+      "ran_ue_ngap_id": "6",
+      "amf_ue_ngap_id": "6",
+      "ran_endpoint": "172.22.0.10",
+      "amf_endpoint": "172.22.0.23",
+      "association_id": "N2:172.22.0.10:172.22.0.23",
+      "lifecycle_generation": 1,
+      "state": "ACTIVE",
+      "first_timestamp_ns": 1786984683579052000,
+      "last_timestamp_ns": 1786984683820657000,
+      "event_ids": [
+        "evt-14befe292593389a",
+        "evt-042a4b4f62732f4e",
+        "evt-8c6f6dcc8eae8b33",
+        "evt-cd05b57c96dc96ab",
+        "evt-025a526b47d2af91",
+        "evt-97ef47ba2c7b0dab",
+        "evt-488f169eb657ae24",
+        "evt-bda88895c70600b9",
+        "evt-2be3456cd28fb54c",
+        "evt-a6e4d1b675236fa7",
+        "evt-d357b1f967b74d35",
+        "evt-2abc577048d5f886",
+        "evt-0a9881b2d9e472b7",
+        "evt-2b5e622a8bb865f2"
+      ]
+    },
+    {
+      "context_id": "uectx-74d34fdccd361b18",
+      "pseudonym": "UE-8023aaf87f58fde6",
+      "ran_ue_ngap_id": "3",
+      "amf_ue_ngap_id": "3",
+      "ran_endpoint": "172.22.0.10",
+      "amf_endpoint": "172.22.0.23",
+      "association_id": "N2:172.22.0.10:172.22.0.23",
+      "lifecycle_generation": 1,
+      "state": "RELEASED",
+      "first_timestamp_ns": 1786984728414590000,
+      "last_timestamp_ns": 1786984728414709000,
+      "event_ids": [
+        "evt-50ba3d813b8ffd27",
+        "evt-1536b15e67689323"
+      ]
+    },
+    {
+      "context_id": "uectx-90b5973b23d7c762",
+      "pseudonym": "UE-6c649faa34f444f6",
+      "ran_ue_ngap_id": "8",
+      "amf_ue_ngap_id": "8",
+      "ran_endpoint": "172.22.0.10",
+      "amf_endpoint": "172.22.0.23",
+      "association_id": "N2:172.22.0.10:172.22.0.23",
+      "lifecycle_generation": 1,
+      "state": "ACTIVE",
+      "first_timestamp_ns": 1786984728393613000,
+      "last_timestamp_ns": 1786984728637806000,
+      "event_ids": [
+        "evt-fb8ecb7f1507bd78",
+        "evt-e0d772388a2c12b5",
+        "evt-aa32e525a8a14dfb",
+        "evt-03afd2732788cfda",
+        "evt-6f6b8e8738c88e1b",
+        "evt-e8e747c1aa68c2b4",
+        "evt-cd402017c14b4ff3",
+        "evt-2d0e4c4eca3e0916",
+        "evt-a52be13dd989160d",
+        "evt-7f1d2390d7beb706",
+        "evt-7c9640a6d9985727",
+        "evt-b0384d32691f3d5a"
+      ]
+    },
+    {
+      "context_id": "uectx-ab6134133a328f0f",
+      "pseudonym": "UE-3814e6b0eadd92bf",
+      "ran_ue_ngap_id": "7",
+      "amf_ue_ngap_id": "7",
+      "ran_endpoint": "172.22.0.10",
+      "amf_endpoint": "172.22.0.23",
+      "association_id": "N2:172.22.0.10:172.22.0.23",
+      "lifecycle_generation": 1,
+      "state": "ACTIVE",
+      "first_timestamp_ns": 1786984705962113000,
+      "last_timestamp_ns": 1786984706207561000,
+      "event_ids": [
+        "evt-5a6bafe42ee652e9",
+        "evt-aa5664026c69a454",
+        "evt-867402e53866ad8a",
+        "evt-fab802f170069b64",
+        "evt-3bb44cbe4d8a1889",
+        "evt-3e8ad198d6aa018a",
+        "evt-d01052d4ea127cd3",
+        "evt-4a79d47d3890ebf4",
+        "evt-f6614548f7303a2d",
+        "evt-1ac0109bb1701e23",
+        "evt-d1965b8218199486",
+        "evt-6bd1a0d74b259b05",
+        "evt-b94dfe29c1f01b40",
+        "evt-3de0bec7454363c6"
+      ]
+    },
+    {
+      "context_id": "uectx-e9834565f84b5b01",
+      "pseudonym": "UE-53abba504566681e",
+      "ran_ue_ngap_id": "5",
+      "amf_ue_ngap_id": "5",
+      "ran_endpoint": "172.22.0.10",
+      "amf_endpoint": "172.22.0.23",
+      "association_id": "N2:172.22.0.10:172.22.0.23",
+      "lifecycle_generation": 1,
+      "state": "ACTIVE",
+      "first_timestamp_ns": 1786984661195034000,
+      "last_timestamp_ns": 1786984661436902000,
+      "event_ids": [
+        "evt-7e0fc3fafea4feb1",
+        "evt-1074c44d0a8955b5",
+        "evt-a07c8d966c486bb0",
+        "evt-d7cf9b59e05ad6ed",
+        "evt-16e6243bf3176fdc",
+        "evt-beb873b04d5a9de0",
+        "evt-624056e3e016afc4",
+        "evt-594af79e01740ae1",
+        "evt-201a39061fb21e8d",
+        "evt-130cf0d5cb070b7a",
+        "evt-a5b5faaa364ccf91",
+        "evt-cc344338c8150c64",
+        "evt-9c20bf8acb060851",
+        "evt-089cbbaf0aa0f7f2"
+      ]
+    },
+    {
+      "context_id": "uectx-ecaf55e823600406",
+      "pseudonym": "UE-cb77d658898ac384",
+      "ran_ue_ngap_id": "4",
+      "amf_ue_ngap_id": "4",
+      "ran_endpoint": "172.22.0.10",
+      "amf_endpoint": "172.22.0.23",
+      "association_id": "N2:172.22.0.10:172.22.0.23",
+      "lifecycle_generation": 1,
+      "state": "ACTIVE",
+      "first_timestamp_ns": 1786984638837574000,
+      "last_timestamp_ns": 1786984639097615000,
+      "event_ids": [
+        "evt-40450568ad421bae",
+        "evt-4c01f1e947ee4f91",
+        "evt-a20ab760a0913d28",
+        "evt-8f4d2bfef4919df1",
+        "evt-9f8b7dada1065a9b",
+        "evt-5da4c9e6fad32f85",
+        "evt-22696b376ff7b719",
+        "evt-2d4ec6500d491b42",
+        "evt-602c82d1888c5d2d",
+        "evt-3a4d222dbe18c581",
+        "evt-d9557adcaf3bb3ab",
+        "evt-415f9c6fe8cb94fc",
+        "evt-2c9927ed7b85bc0e",
+        "evt-18d3fed9648f6196"
+      ]
+    }
+  ],
+  "pdu_sessions": [
+    {
+      "session_id": "5g-session-19d763cc3233a52a",
+      "ue_context_id": "uectx-ab6134133a328f0f",
+      "pdu_session_id": "1",
+      "dnn": null,
+      "snssai": null,
+      "state": "ACTIVE",
+      "establishment_timestamp_ns": 1786984706206385000,
+      "release_timestamp_ns": null,
+      "interfaces": [
+        "N2"
+      ],
+      "correlation_status": "UNKNOWN",
+      "event_ids": [
+        "evt-b94dfe29c1f01b40",
+        "evt-3de0bec7454363c6"
+      ]
+    },
+    {
+      "session_id": "5g-session-1a4400b7c2648173",
+      "ue_context_id": "uectx-90b5973b23d7c762",
+      "pdu_session_id": "1",
+      "dnn": null,
+      "snssai": null,
+      "state": "ACTIVE",
+      "establishment_timestamp_ns": 1786984728636644000,
+      "release_timestamp_ns": null,
+      "interfaces": [
+        "N2"
+      ],
+      "correlation_status": "UNKNOWN",
+      "event_ids": [
+        "evt-7c9640a6d9985727",
+        "evt-b0384d32691f3d5a"
+      ]
+    },
+    {
+      "session_id": "5g-session-6ea8c68086048287",
+      "ue_context_id": "uectx-1882fcba0a7c4674",
+      "pdu_session_id": "1",
+      "dnn": null,
+      "snssai": null,
+      "state": "ACTIVE",
+      "establishment_timestamp_ns": 1786984683819560000,
+      "release_timestamp_ns": null,
+      "interfaces": [
+        "N2"
+      ],
+      "correlation_status": "UNKNOWN",
+      "event_ids": [
+        "evt-0a9881b2d9e472b7",
+        "evt-2b5e622a8bb865f2"
+      ]
+    },
+    {
+      "session_id": "5g-session-a93ff16614b02411",
+      "ue_context_id": "uectx-ecaf55e823600406",
+      "pdu_session_id": "1",
+      "dnn": null,
+      "snssai": null,
+      "state": "ACTIVE",
+      "establishment_timestamp_ns": 1786984639095579000,
+      "release_timestamp_ns": null,
+      "interfaces": [
+        "N2"
+      ],
+      "correlation_status": "UNKNOWN",
+      "event_ids": [
+        "evt-2c9927ed7b85bc0e",
+        "evt-18d3fed9648f6196"
+      ]
+    },
+    {
+      "session_id": "5g-session-affe909354229ebb",
+      "ue_context_id": "uectx-e9834565f84b5b01",
+      "pdu_session_id": "1",
+      "dnn": null,
+      "snssai": null,
+      "state": "ACTIVE",
+      "establishment_timestamp_ns": 1786984661435794000,
+      "release_timestamp_ns": null,
+      "interfaces": [
+        "N2"
+      ],
+      "correlation_status": "UNKNOWN",
+      "event_ids": [
+        "evt-9c20bf8acb060851",
+        "evt-089cbbaf0aa0f7f2"
+      ]
+    }
+  ],
+  "pfcp_sessions": [
+    {
+      "pfcp_session_id": "pfcp-7eed159487c4e77d",
+      "smf_endpoint": "172.22.0.7",
+      "upf_endpoint": "172.22.0.8",
+      "seids": [
+        "0x0000000000000627",
+        "0x0000000000000dd2"
+      ],
+      "pdr_ids": [
+        "1",
+        "2",
+        "3",
+        "4"
+      ],
+      "far_ids": [
+        "1",
+        "2",
+        "3"
+      ],
+      "tunnel_ids": [
+        "pfcp-tunnel-3a8e71c935140cdd",
+        "pfcp-tunnel-b5bcf2bbab29bb99",
+        "pfcp-tunnel-bb7f3494d7aa0f1f",
+        "pfcp-tunnel-300b8184407a2d3c"
+      ],
+      "state": "ESTABLISHED",
+      "first_timestamp_ns": 1786984639091610000,
+      "last_timestamp_ns": 1786984639098856000,
+      "event_ids": [
+        "evt-5e8eacc4b2a089aa",
+        "evt-71dfb143166c5d2f",
+        "evt-400c895829547a9d",
+        "evt-c35222b0a5ecfcf3"
+      ]
+    },
+    {
+      "pfcp_session_id": "pfcp-cc962b2ea731f936",
+      "smf_endpoint": "172.22.0.7",
+      "upf_endpoint": "172.22.0.8",
+      "seids": [
+        "0x0000000000000c55",
+        "0x0000000000000f10"
+      ],
+      "pdr_ids": [
+        "1",
+        "2",
+        "3",
+        "4"
+      ],
+      "far_ids": [
+        "1",
+        "2",
+        "3"
+      ],
+      "tunnel_ids": [
+        "pfcp-tunnel-66736e854bf138b2",
+        "pfcp-tunnel-8c58a54b24b10dec",
+        "pfcp-tunnel-0bc7589687b9577c",
+        "pfcp-tunnel-424e8c8c9195ef5d"
+      ],
+      "state": "ESTABLISHED",
+      "first_timestamp_ns": 1786984661434641000,
+      "last_timestamp_ns": 1786984661437508000,
+      "event_ids": [
+        "evt-fc4ec3ff16369c62",
+        "evt-ff0ef714e98feba0",
+        "evt-9cafc700df6ea36a",
+        "evt-82d954491ad3e82a"
+      ]
+    },
+    {
+      "pfcp_session_id": "pfcp-8f3b46c0c8a59e12",
+      "smf_endpoint": "172.22.0.7",
+      "upf_endpoint": "172.22.0.8",
+      "seids": [
+        "0x0000000000000455",
+        "0x0000000000000759"
+      ],
+      "pdr_ids": [
+        "1",
+        "2",
+        "3",
+        "4"
+      ],
+      "far_ids": [
+        "1",
+        "2",
+        "3"
+      ],
+      "tunnel_ids": [
+        "pfcp-tunnel-c38cd2df9ac13cb3",
+        "pfcp-tunnel-d303e7856b6f9677",
+        "pfcp-tunnel-e4c2ab05c293b05e",
+        "pfcp-tunnel-a1e334e5fd151792"
+      ],
+      "state": "ESTABLISHED",
+      "first_timestamp_ns": 1786984683818451000,
+      "last_timestamp_ns": 1786984683821257000,
+      "event_ids": [
+        "evt-5c2a2ab91e025184",
+        "evt-91c4652e4d0191c5",
+        "evt-a6a3fdc722cd1ad3",
+        "evt-8ab2a21cc514f074"
+      ]
+    },
+    {
+      "pfcp_session_id": "pfcp-4412608e5d330d92",
+      "smf_endpoint": "172.22.0.7",
+      "upf_endpoint": "172.22.0.8",
+      "seids": [
+        "0x000000000000090d",
+        "0x0000000000000e75"
+      ],
+      "pdr_ids": [
+        "1",
+        "2",
+        "3",
+        "4"
+      ],
+      "far_ids": [
+        "1",
+        "2",
+        "3"
+      ],
+      "tunnel_ids": [
+        "pfcp-tunnel-efb59b26b9a9c4b8",
+        "pfcp-tunnel-1520b4cfed8860da",
+        "pfcp-tunnel-e9ee22bcf6dff01e",
+        "pfcp-tunnel-33ab80224686b843"
+      ],
+      "state": "ESTABLISHED",
+      "first_timestamp_ns": 1786984706205009000,
+      "last_timestamp_ns": 1786984706208481000,
+      "event_ids": [
+        "evt-9eba6ff008a8adbd",
+        "evt-dcb01e298e578760",
+        "evt-1f407deab7981652",
+        "evt-942945966906caf2"
+      ]
+    },
+    {
+      "pfcp_session_id": "pfcp-7bcddca0a8e299a4",
+      "smf_endpoint": "172.22.0.7",
+      "upf_endpoint": "172.22.0.8",
+      "seids": [
+        "0x0000000000000492",
+        "0x0000000000000ca9"
+      ],
+      "pdr_ids": [],
+      "far_ids": [],
+      "tunnel_ids": [],
+      "state": "DELETED",
+      "first_timestamp_ns": 1786984728395360000,
+      "last_timestamp_ns": 1786984728395501000,
+      "event_ids": [
+        "evt-380ece434c14c26a",
+        "evt-dab030418b0087fa"
+      ]
+    },
+    {
+      "pfcp_session_id": "pfcp-51f8ae21d6cb7807",
+      "smf_endpoint": "172.22.0.7",
+      "upf_endpoint": "172.22.0.8",
+      "seids": [
+        "0x0000000000000518",
+        "0x0000000000000947"
+      ],
+      "pdr_ids": [
+        "1",
+        "2",
+        "3",
+        "4"
+      ],
+      "far_ids": [
+        "1",
+        "2",
+        "3"
+      ],
+      "tunnel_ids": [
+        "pfcp-tunnel-0838dcf24e7b4fb1",
+        "pfcp-tunnel-29798938f50f9eed",
+        "pfcp-tunnel-30af4f4ed6570054",
+        "pfcp-tunnel-6c4a7c136f14d4fe"
+      ],
+      "state": "ESTABLISHED",
+      "first_timestamp_ns": 1786984728635412000,
+      "last_timestamp_ns": 1786984728638630000,
+      "event_ids": [
+        "evt-c0f650079b2ec528",
+        "evt-18cbe46ff1b91a56",
+        "evt-fd105b80b3957cc1",
+        "evt-1df2aa1c0d14bf7a"
+      ]
+    }
+  ],
+  "gtpu_tunnels": [],
+  "procedures": [
+    {
+      "procedure_id": "procedure-061e77227da8b91d",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-74d34fdccd361b18",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786984728414590000,
+      "end_timestamp_ns": 1786984728414709000,
+      "event_ids": [
+        "evt-50ba3d813b8ffd27",
+        "evt-1536b15e67689323"
+      ],
+      "result": "SUCCESS"
+    },
+    {
+      "procedure_id": "procedure-072ff6d0a5c3c644",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-e9834565f84b5b01",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786984661218856000,
+      "end_timestamp_ns": 1786984661219016000,
+      "event_ids": [
+        "evt-594af79e01740ae1",
+        "evt-201a39061fb21e8d"
+      ],
+      "result": "SUCCESS"
+    },
+    {
+      "procedure_id": "procedure-14557ef66f7740e6",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-ab6134133a328f0f",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786984705993962000,
+      "end_timestamp_ns": 1786984705994130000,
+      "event_ids": [
+        "evt-4a79d47d3890ebf4",
+        "evt-f6614548f7303a2d"
+      ],
+      "result": "SUCCESS"
+    },
+    {
+      "procedure_id": "procedure-22a9cf00c7cd84d5",
+      "procedure_type": "REGISTRATION",
+      "ue_context_id": "uectx-e9834565f84b5b01",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786984661195034000,
+      "end_timestamp_ns": 1786984661427469000,
+      "event_ids": [
+        "evt-7e0fc3fafea4feb1",
+        "evt-1074c44d0a8955b5",
+        "evt-a07c8d966c486bb0",
+        "evt-d7cf9b59e05ad6ed",
+        "evt-16e6243bf3176fdc",
+        "evt-beb873b04d5a9de0",
+        "evt-624056e3e016afc4",
+        "evt-130cf0d5cb070b7a",
+        "evt-a5b5faaa364ccf91",
+        "evt-cc344338c8150c64"
+      ],
+      "result": "INCOMPLETE"
+    },
+    {
+      "procedure_id": "procedure-368f68e006ae96e7",
+      "procedure_type": "PDU_SESSION",
+      "ue_context_id": "uectx-ab6134133a328f0f",
+      "pdu_session_id": "5g-session-19d763cc3233a52a",
+      "start_timestamp_ns": 1786984706206385000,
+      "end_timestamp_ns": 1786984706207561000,
+      "event_ids": [
+        "evt-b94dfe29c1f01b40",
+        "evt-3de0bec7454363c6"
+      ],
+      "result": "SUCCESS"
+    },
+    {
+      "procedure_id": "procedure-4c03ead0e73057dd",
+      "procedure_type": "REGISTRATION",
+      "ue_context_id": "uectx-ab6134133a328f0f",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786984705962113000,
+      "end_timestamp_ns": 1786984706195483000,
+      "event_ids": [
+        "evt-5a6bafe42ee652e9",
+        "evt-aa5664026c69a454",
+        "evt-867402e53866ad8a",
+        "evt-fab802f170069b64",
+        "evt-3bb44cbe4d8a1889",
+        "evt-3e8ad198d6aa018a",
+        "evt-d01052d4ea127cd3",
+        "evt-1ac0109bb1701e23",
+        "evt-d1965b8218199486",
+        "evt-6bd1a0d74b259b05"
+      ],
+      "result": "INCOMPLETE"
+    },
+    {
+      "procedure_id": "procedure-79b42a80430485bb",
+      "procedure_type": "REGISTRATION",
+      "ue_context_id": "uectx-ecaf55e823600406",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786984638837574000,
+      "end_timestamp_ns": 1786984639069291000,
+      "event_ids": [
+        "evt-40450568ad421bae",
+        "evt-4c01f1e947ee4f91",
+        "evt-a20ab760a0913d28",
+        "evt-8f4d2bfef4919df1",
+        "evt-9f8b7dada1065a9b",
+        "evt-5da4c9e6fad32f85",
+        "evt-22696b376ff7b719",
+        "evt-3a4d222dbe18c581",
+        "evt-d9557adcaf3bb3ab",
+        "evt-415f9c6fe8cb94fc"
+      ],
+      "result": "INCOMPLETE"
+    },
+    {
+      "procedure_id": "procedure-7c12573bc0fe6477",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-ecaf55e823600406",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786984638864418000,
+      "end_timestamp_ns": 1786984638864561000,
+      "event_ids": [
+        "evt-2d4ec6500d491b42",
+        "evt-602c82d1888c5d2d"
+      ],
+      "result": "SUCCESS"
+    },
+    {
+      "procedure_id": "procedure-9312688deb650cdf",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-1882fcba0a7c4674",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786984683602939000,
+      "end_timestamp_ns": 1786984683603124000,
+      "event_ids": [
+        "evt-bda88895c70600b9",
+        "evt-2be3456cd28fb54c"
+      ],
+      "result": "SUCCESS"
+    },
+    {
+      "procedure_id": "procedure-9f8cbdc599a2eb1e",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-90b5973b23d7c762",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786984728422505000,
+      "end_timestamp_ns": 1786984728422669000,
+      "event_ids": [
+        "evt-e8e747c1aa68c2b4",
+        "evt-cd402017c14b4ff3"
+      ],
+      "result": "SUCCESS"
+    },
+    {
+      "procedure_id": "procedure-ae4ef867eb0828af",
+      "procedure_type": "REGISTRATION",
+      "ue_context_id": "uectx-1882fcba0a7c4674",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786984683579052000,
+      "end_timestamp_ns": 1786984683811443000,
+      "event_ids": [
+        "evt-14befe292593389a",
+        "evt-042a4b4f62732f4e",
+        "evt-8c6f6dcc8eae8b33",
+        "evt-cd05b57c96dc96ab",
+        "evt-025a526b47d2af91",
+        "evt-97ef47ba2c7b0dab",
+        "evt-488f169eb657ae24",
+        "evt-a6e4d1b675236fa7",
+        "evt-d357b1f967b74d35",
+        "evt-2abc577048d5f886"
+      ],
+      "result": "INCOMPLETE"
+    },
+    {
+      "procedure_id": "procedure-c89678c409d956a2",
+      "procedure_type": "REGISTRATION",
+      "ue_context_id": "uectx-90b5973b23d7c762",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786984728393613000,
+      "end_timestamp_ns": 1786984728627716000,
+      "event_ids": [
+        "evt-fb8ecb7f1507bd78",
+        "evt-e0d772388a2c12b5",
+        "evt-aa32e525a8a14dfb",
+        "evt-03afd2732788cfda",
+        "evt-6f6b8e8738c88e1b",
+        "evt-2d0e4c4eca3e0916",
+        "evt-a52be13dd989160d",
+        "evt-7f1d2390d7beb706"
+      ],
+      "result": "INCOMPLETE"
+    },
+    {
+      "procedure_id": "procedure-c9af16c0c860e844",
+      "procedure_type": "PDU_SESSION",
+      "ue_context_id": "uectx-90b5973b23d7c762",
+      "pdu_session_id": "5g-session-1a4400b7c2648173",
+      "start_timestamp_ns": 1786984728636644000,
+      "end_timestamp_ns": 1786984728637806000,
+      "event_ids": [
+        "evt-7c9640a6d9985727",
+        "evt-b0384d32691f3d5a"
+      ],
+      "result": "SUCCESS"
+    },
+    {
+      "procedure_id": "procedure-d286cc30e984de95",
+      "procedure_type": "PDU_SESSION",
+      "ue_context_id": "uectx-ecaf55e823600406",
+      "pdu_session_id": "5g-session-a93ff16614b02411",
+      "start_timestamp_ns": 1786984639095579000,
+      "end_timestamp_ns": 1786984639097615000,
+      "event_ids": [
+        "evt-2c9927ed7b85bc0e",
+        "evt-18d3fed9648f6196"
+      ],
+      "result": "SUCCESS"
+    },
+    {
+      "procedure_id": "procedure-e8fe7dd6f37389c3",
+      "procedure_type": "PDU_SESSION",
+      "ue_context_id": "uectx-1882fcba0a7c4674",
+      "pdu_session_id": "5g-session-6ea8c68086048287",
+      "start_timestamp_ns": 1786984683819560000,
+      "end_timestamp_ns": 1786984683820657000,
+      "event_ids": [
+        "evt-0a9881b2d9e472b7",
+        "evt-2b5e622a8bb865f2"
+      ],
+      "result": "SUCCESS"
+    },
+    {
+      "procedure_id": "procedure-fa2a2e8a321cc9aa",
+      "procedure_type": "PDU_SESSION",
+      "ue_context_id": "uectx-e9834565f84b5b01",
+      "pdu_session_id": "5g-session-affe909354229ebb",
+      "start_timestamp_ns": 1786984661435794000,
+      "end_timestamp_ns": 1786984661436902000,
+      "event_ids": [
+        "evt-9c20bf8acb060851",
+        "evt-089cbbaf0aa0f7f2"
+      ],
+      "result": "SUCCESS"
+    }
+  ],
+  "background_event_ids": [
+    "evt-b0302d59f67b52c8",
+    "evt-e24614b110d0c854",
+    "evt-118665e4921135bc",
+    "evt-2a4e68fa594fa7f4",
+    "evt-60f499489d92fad8",
+    "evt-bd263f97ee15c5e6",
+    "evt-88102b23f79612b4",
+    "evt-9f6a6876bd66a4ad",
+    "evt-4bbbcc0df61ba2a4",
+    "evt-288127e8dd399082",
+    "evt-363a773fb88b42dd",
+    "evt-fcb2910f18da14bb",
+    "evt-8877586d82f33c24",
+    "evt-acd612665feeb77b",
+    "evt-45af4c00d030228f",
+    "evt-4db6c799ce465b29",
+    "evt-c86c71aa006d36f3",
+    "evt-cc3601881df60e5e",
+    "evt-a1181d865310312c",
+    "evt-094597922c8e136f",
+    "evt-a0e26269c786eab1",
+    "evt-2fbd12b28ce12737",
+    "evt-33f33f6bb1fc3c7c",
+    "evt-e2ed54df3faccf01",
+    "evt-cbf476481a63ffa8",
+    "evt-3b968b92d185dd14",
+    "evt-d631c3353f117261",
+    "evt-24895f6708bc945b",
+    "evt-8a9cf8fc73dc4d06",
+    "evt-9491fb13284a25bc",
+    "evt-660c7e268c44f12b",
+    "evt-ff7bbcf9b0e7d309",
+    "evt-f422bd4f9c909bd2",
+    "evt-49d8905f85a98d72",
+    "evt-06973f19b66a427d",
+    "evt-741ce0b0dda227e4",
+    "evt-40b31297e84e10c4",
+    "evt-946f7381ddafbf0f",
+    "evt-04c59c3daac548c1",
+    "evt-06b897ebeafb8b17"
+  ],
+  "unmatched_event_ids": [],
+  "duplicate_observations": [],
+  "event_accounting": {
+    "background_events": 40,
+    "duplicate_observations": 0,
+    "session_events": 92,
+    "source_events": 132,
+    "unmatched_events": 0
+  }
+}

@@ -1,0 +1,2 @@
+import { useState, type ReactNode } from 'react';
+export function InspectorTabs({tabs}:{tabs:{id:string;label:string;content:ReactNode}[]}){const [active,setActive]=useState(tabs[0]?.id);return <><div className="tabs" role="tablist">{tabs.map(t=><button role="tab" aria-selected={active===t.id} className={active===t.id?'active':''} onClick={()=>setActive(t.id)} key={t.id}>{t.label}</button>)}</div>{tabs.map(t=><div key={t.id} role="tabpanel" hidden={active!==t.id} className="tab-panel">{t.content}</div>)}</>}

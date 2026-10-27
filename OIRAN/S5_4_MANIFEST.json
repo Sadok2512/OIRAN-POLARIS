@@ -1,0 +1,64 @@
+{
+  "project": "OIRAN",
+  "mission": "COMPLETE_5G_E2E_CAPTURE_READINESS",
+  "version": "1.0.0-dev",
+  "branch": "feat/s5-4-e2e-readiness",
+  "baseline_s5_3": "f343c67cf8422c621100ad328beac44e732397dc",
+  "audit_timestamp_utc": "2026-10-26T19:11:51Z",
+  "laboratory": {
+    "open5gs_version": "2.8.0",
+    "ueransim_version": "3.3.0",
+    "open5gs_health": "HEALTHY",
+    "gnb_running": 1,
+    "ue_processes_running": 3,
+    "ues_registered": 3,
+    "pdu_sessions_active": 3,
+    "subscriber_profiles_present": 10,
+    "scp_present": false,
+    "sbi_transport": "PLAINTEXT_HTTP2_DIRECT_AMF_SMF"
+  },
+  "capture_points": {
+    "n2": {"interface": "br-oiran-n2", "filter": "sctp port 38412", "verified": true},
+    "n3": {"interface": "br-oiran-n3", "filter": "udp port 2152", "verified": true},
+    "n4": {"interface": "br-oiran-n4", "filter": "udp port 8805", "verified": true},
+    "sbi": {"interface": "br-oiran-sbi", "filter": "tcp port 7777", "verified": true, "native_helper_allowlisted": false}
+  },
+  "offline_validation": {
+    "n2_sha256": "d5a70d67ee2b712e3cd9633eecfa9074ba0bfc5f95ecc96f60233366136039d4",
+    "n4_sha256": "6927aedadaee4e235b672073b6dacc29bd0015a1e42a55e90c7a920c346e1251",
+    "sbi_sha256": "2b3cfb526a4a5726dedbfc328def407dac6be11ae99bb9d605ea473675220afe",
+    "ngap_pdus": 41,
+    "pfcp_messages": 1316,
+    "http2_frames": 8986,
+    "sbi_priority_operations": 6,
+    "ue_contexts": 3,
+    "pdu_sessions": 2,
+    "pfcp_sessions": 2,
+    "gtpu_tunnels": 0,
+    "cross_ue_contamination": "NONE_OBSERVED",
+    "result": "PARTIAL_MISSING_N3_AND_EXPLICIT_SBI_PFCP_BRIDGE"
+  },
+  "tests": {
+    "transport_tcp_decoder_sbi_correlation": "17/17 PASS",
+    "reference_corpus_sha256": "13/13 PASS",
+    "tshark_version": "4.2.2"
+  },
+  "resource_snapshot": {
+    "disk_usage_percent": 60.98,
+    "disk_available_bytes": 161874448384,
+    "available_inodes": 51179469,
+    "memory_available_bytes": 15298248704,
+    "logical_cpus": 10,
+    "capture_budget_allowed": true,
+    "headroom_to_disk_stop_bytes": 99636224204
+  },
+  "safety": {
+    "live_capture_executed": false,
+    "simulator_started": false,
+    "open5gs_changed": false,
+    "polaris_changed": false,
+    "oiran_production_changed": false,
+    "etv_otv_changed": false
+  },
+  "status": "PARTIAL"
+}

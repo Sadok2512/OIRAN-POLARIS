@@ -1,0 +1,80 @@
+{
+  "ue_contexts": [
+    {
+      "context_id": "uectx-5e53bcbf09a64c53",
+      "pseudonym": "UE-736cd8853b4f7f1f",
+      "ran_ue_ngap_id": "3",
+      "amf_ue_ngap_id": "3",
+      "ran_endpoint": "172.22.0.23",
+      "amf_endpoint": "172.22.0.10",
+      "association_id": "N2:172.22.0.23:172.22.0.10",
+      "lifecycle_generation": 1,
+      "state": "REGISTERING",
+      "first_timestamp_ns": 1786964869746575000,
+      "last_timestamp_ns": 1786964869765085000,
+      "event_ids": [
+        "evt-1432dbbab24d9b7b",
+        "evt-7213ca6f42e6f719",
+        "evt-853451f1e204a69e",
+        "evt-3e711fb9ae5a859f",
+        "evt-3bc04046833a3df4",
+        "evt-5ab7377d4c66b22f",
+        "evt-0f5f9196eee8c9c7",
+        "evt-748f2eafa12ba8cd"
+      ]
+    }
+  ],
+  "pdu_sessions": [],
+  "pfcp_sessions": [],
+  "gtpu_tunnels": [],
+  "procedures": [
+    {
+      "procedure_id": "procedure-66d9d730218358d6",
+      "procedure_type": "REGISTRATION",
+      "ue_context_id": "uectx-5e53bcbf09a64c53",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964869746575000,
+      "end_timestamp_ns": 1786964869765085000,
+      "event_ids": [
+        "evt-3bc04046833a3df4",
+        "evt-748f2eafa12ba8cd"
+      ],
+      "result": "FAILURE",
+      "start_event_id": "evt-3bc04046833a3df4",
+      "end_event_id": "evt-748f2eafa12ba8cd",
+      "duration_ns": 18510000,
+      "failure_cause": "111",
+      "missing_evidence": [],
+      "evidence": "EXACT"
+    },
+    {
+      "procedure_id": "procedure-d62519a3b1f0a880",
+      "procedure_type": "AUTHENTICATION",
+      "ue_context_id": "uectx-5e53bcbf09a64c53",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964869760925000,
+      "end_timestamp_ns": 1786964869763049000,
+      "event_ids": [
+        "evt-5ab7377d4c66b22f",
+        "evt-0f5f9196eee8c9c7"
+      ],
+      "result": "FAILURE",
+      "start_event_id": "evt-5ab7377d4c66b22f",
+      "end_event_id": "evt-0f5f9196eee8c9c7",
+      "duration_ns": 2124000,
+      "failure_cause": "21",
+      "missing_evidence": [],
+      "evidence": "EXACT"
+    }
+  ],
+  "background_event_ids": [],
+  "unmatched_event_ids": [],
+  "duplicate_observations": [],
+  "event_accounting": {
+    "background_events": 0,
+    "duplicate_observations": 0,
+    "session_events": 8,
+    "source_events": 8,
+    "unmatched_events": 0
+  }
+}

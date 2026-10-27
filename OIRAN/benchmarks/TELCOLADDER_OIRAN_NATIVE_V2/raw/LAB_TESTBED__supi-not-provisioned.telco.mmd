@@ -1,0 +1,15 @@
+sequenceDiagram
+    autonumber
+    participant UE
+    participant gNB
+    participant AMF
+    Note over gNB,AMF: SUPI 001019999999999
+    gNB->>AMF: #35;5 InitialUEMessage
+    UE->>AMF: #35;5 Registration request
+    AMF->>gNB: #35;6 DownlinkNASTransport
+    rect rgb(255, 226, 226)
+    AMF->>UE: #35;6 Registration reject
+    Note over UE: 5GS services not allowed (#35;7) — 3GPP TS 24.501 §9.11.3.2
+    end
+    AMF->>gNB: #35;7 UEContextRelease
+    gNB->>AMF: #35;9 UEContextReleaseResponse

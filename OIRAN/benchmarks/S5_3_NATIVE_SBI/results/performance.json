@@ -1,0 +1,56 @@
+{
+  "method": {
+    "warmup_runs": 1,
+    "measured_runs": 5,
+    "files": 13,
+    "packets": 4205
+  },
+  "median_total_seconds": 0.13,
+  "median_packets_per_second": 32346.153846153844,
+  "median_sbi_transactions_per_second": 1523.076923076923,
+  "peak_rss_kib": 6796,
+  "runs": [
+    {
+      "iteration": 0,
+      "warmup": true,
+      "seconds": 0.13,
+      "peak_rss_kib": 6796,
+      "sbi_transactions": 198
+    },
+    {
+      "iteration": 1,
+      "warmup": false,
+      "seconds": 0.13,
+      "peak_rss_kib": 6792,
+      "sbi_transactions": 198
+    },
+    {
+      "iteration": 2,
+      "warmup": false,
+      "seconds": 0.12,
+      "peak_rss_kib": 6792,
+      "sbi_transactions": 198
+    },
+    {
+      "iteration": 3,
+      "warmup": false,
+      "seconds": 0.13,
+      "peak_rss_kib": 6792,
+      "sbi_transactions": 198
+    },
+    {
+      "iteration": 4,
+      "warmup": false,
+      "seconds": 0.13,
+      "peak_rss_kib": 6792,
+      "sbi_transactions": 198
+    },
+    {
+      "iteration": 5,
+      "warmup": false,
+      "seconds": 0.12,
+      "peak_rss_kib": 6796,
+      "sbi_transactions": 198
+    }
+  ]
+}

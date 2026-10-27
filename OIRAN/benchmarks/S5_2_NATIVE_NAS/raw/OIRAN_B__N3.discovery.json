@@ -1,0 +1,17 @@
+{
+  "ue_contexts": [],
+  "pdu_sessions": [],
+  "pfcp_sessions": [],
+  "gtpu_tunnels": [],
+  "procedures": [],
+  "background_event_ids": [],
+  "unmatched_event_ids": [],
+  "duplicate_observations": [],
+  "event_accounting": {
+    "background_events": 0,
+    "duplicate_observations": 0,
+    "session_events": 0,
+    "source_events": 0,
+    "unmatched_events": 0
+  }
+}

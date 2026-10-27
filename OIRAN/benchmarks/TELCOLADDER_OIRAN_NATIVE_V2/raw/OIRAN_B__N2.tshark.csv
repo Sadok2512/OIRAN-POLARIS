@@ -1,0 +1,1 @@
+frame.number,frame.time_epoch,_ws.col.protocol,_ws.col.info,ngap.procedureCode,ngap.AMF_UE_NGAP_ID,ngap.RAN_UE_NGAP_ID,nas-5gs.mm.message_type,nas-5gs.sm.message_type,pfcp.seid,gtp.teid

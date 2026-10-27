@@ -1,0 +1,6 @@
+import { flexRender, getCoreRowModel, getSortedRowModel, useReactTable, type ColumnDef, type SortingState } from '@tanstack/react-table';
+import { useState } from 'react';
+export function DataTable<T>({data,columns,onRowClick,selectedId,getId}:{data:T[];columns:ColumnDef<T>[];onRowClick?:(row:T)=>void;selectedId?:string;getId?:(row:T)=>string}){
+  const [sorting,setSorting]=useState<SortingState>([]);const table=useReactTable({data,columns,state:{sorting},onSortingChange:setSorting,getCoreRowModel:getCoreRowModel(),getSortedRowModel:getSortedRowModel()});
+  return <div className="table-wrap"><table><thead>{table.getHeaderGroups().map(g=><tr key={g.id}>{g.headers.map(h=><th key={h.id} onClick={h.column.getToggleSortingHandler()} className={h.column.getCanSort()?'sortable':''}>{flexRender(h.column.columnDef.header,h.getContext())}{h.column.getIsSorted()==='asc'?' ↑':h.column.getIsSorted()==='desc'?' ↓':''}</th>)}</tr>)}</thead><tbody>{table.getRowModel().rows.map(r=><tr key={r.id} tabIndex={onRowClick?0:undefined} className={getId?.(r.original)===selectedId?'selected':''} onClick={()=>onRowClick?.(r.original)} onKeyDown={e=>{if(e.key==='Enter')onRowClick?.(r.original)}}>{r.getVisibleCells().map(c=><td key={c.id}>{flexRender(c.column.columnDef.cell,c.getContext())}</td>)}</tr>)}</tbody></table></div>
+}

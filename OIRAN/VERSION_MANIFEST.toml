@@ -1,0 +1,202 @@
+project = "OIRAN"
+mission = "RUST_MULTICORE_FOUNDATION"
+project_version = "1.0.0-dev"
+rust_edition = "2021"
+minimum_rust_version = "1.75"
+plugin_api_version = "1.1.0"
+event_schema_version = "1.5.0"
+
+[components]
+capture_core = "0.3.0"
+packet_classifier = "0.1.0"
+flow_dispatcher = "0.1.0"
+worker_runtime = "0.3.0"
+event_schema = "1.5.0-dev"
+plugin_runtime = "1.1.0-dev"
+telemetry = "0.2.0"
+benchmark_engine = "0.3.0"
+capture_pcap = "0.2.0"
+transport_sctp = "0.1.0"
+transport_tcp = "0.1.0"
+decoder_ngap = "0.3.0"
+decoder_nas = "0.1.0"
+decoder_sbi = "0.1.0"
+decoder_pfcp = "0.2.0"
+decoder_gtpu = "0.1.0"
+oiran_decode = "0.3.0"
+live_probe = "0.1.0-dev"
+capture_helper = "0.1.0-dev"
+session_engine = "0.3.0"
+correlation_engine = "0.3.0"
+dataset_registry = "0.1.0"
+disk_safety = "0.1.0"
+callflow_schema = "1.1.0"
+callflow_renderer = "0.1.0"
+oiran_callflow = "0.1.0"
+backend_api = "2.3.0"
+web_frontend = "2.3.0-dev"
+
+[s5_2]
+branch = "feat/s5-2-native-nas"
+base_commit = "ca623fe38ca9c9a1d9be695678cdd464d5555cfd"
+decoder_nas = "0.1.0"
+decoder_ngap = "0.3.0"
+event_schema = "1.4.0"
+session_engine = "0.3.0"
+specification = "3GPP TS 24.501 Release 17"
+corpus_files = 13
+corpus_packets = 4205
+live_capture_executed = false
+production_deployment = false
+status = "native_plain_nas_validated_ciphered_and_sbi_partial"
+
+[s5_1]
+branch = "feat/s5-1-native-sll2"
+base_commit = "1fc0f9f375ac9b305bae5958a67830cf580a1617"
+capture_pcap = "0.2.0"
+event_schema = "1.3.0"
+linktype_linux_sll2 = 276
+corpus_files = 13
+corpus_packets = 4205
+live_capture_executed = false
+production_deployment = false
+status = "reader_certified_message_and_session_partial"
+
+[v2_3]
+branch = "feat/v2-3-multi-session-explorer"
+base_commit = "cab6bfa"
+backend_api = "2.3.0"
+web_frontend = "2.3.0-dev"
+session_engine = "0.2.0"
+fixture_ue_contexts = 3
+fixture_pdu_sessions = 3
+real_multi_ue_capture = "not_available"
+live_execution = false
+production_deployment = false
+status = "offline_validated"
+
+[v2_2]
+branch = "feat/v2-2-session-callflow"
+base_commit = "aa6eddc38ca0b8ffb42612dfacb23f42a7aeb67b"
+backend_api = "2.2.0"
+web_frontend = "2.2.0-dev"
+callflow_schema = "1.0.0"
+navigation_context = "capture_dataset_session_strict"
+live_capture_executed = false
+status = "certified_not_deployed"
+
+[live_v1]
+branch = "feat/live-vprobe-capture-v1"
+capture_backend = "0.1.0-dev"
+capture_driver = "native_rust_af_packet_isolated_unix_ipc"
+capture_helper_protocol = "1.0"
+capture_helper_deployment = "not_deployed_awaiting_approval"
+default_execution = "disabled"
+interfaces = ["N2", "N3", "N4"]
+live_capture_certified = false
+live_decoding_certified = false
+live_session_reconstruction_certified = false
+status = "implementation_validated_pending_controlled_live_approval"
+
+[v2]
+branch = "feat/v2-premium-analyzer"
+base_commit = "7cdc0d2879afa6dcda848f1216b8d70b979a738f"
+backend_api = "2.0.0"
+web_frontend = "2.0.0-dev"
+default_theme = "dark"
+live_capture = "not_configured"
+distributed_probe = "not_validated"
+status = "partial_live_capture_and_distributed_probe_not_validated"
+
+[s4_1]
+branch = "feat/s4-1-multi-session"
+base_commit = "d3d92eae3d6883dba0d66aa9f0fc26ea3be1a5d2"
+session_engine = "0.2.0"
+correlation_engine = "0.2.0"
+dataset_registry = "0.1.0"
+backend_api = "1.1.0"
+web_frontend = "1.1.0-dev"
+real_multi_ue_dataset = "not_available"
+synthetic_fixture = "five_ues_six_pdu_sessions"
+status = "partial_pending_real_multi_ue_capture"
+
+[s4_2]
+branch = "feat/s4-2-full-session-capture"
+base_commit = "84b2c41"
+disk_safety = "0.1.0"
+backend_api = "1.2.0"
+web_frontend = "1.2.0-dev"
+scenario = "OIRAN_5G_MULTI_UE_S4_2"
+live_execution = "not_run_awaiting_approval"
+status = "partial_prepared_disk_safety_validated"
+
+[s4]
+branch = "feat/s4-premium-web-app"
+base_commit = "15804dee6bb15e9eb6ad75ef1a15afb78124ce37"
+platform_core = "1.0.0-dev"
+backend_api = "1.0.0"
+web_frontend = "1.0.0-dev"
+callflow_schema = "1.0.0"
+module_registry = "1.0.0"
+status = "certified_local_read_only"
+
+[s3]
+branch = "feat/s3-5g-capture-decode"
+base_commit = "00eeee25c75ec71e1a087d1872f6eeb798e01a0b"
+ngap_schema = "3GPP TS 38.413 V17.3.0"
+ngap_schema_sha256 = "b705532dd52674fce67ccc01df7bd17a8412341ea82740c164029a5b545f04d2"
+status = "partial_nested_ngap_pfcp_and_empty_operational_n3"
+
+[s3_2_1]
+branch = "feat/s3-2-1-decoder-completeness"
+base_commit = "c59a39764278a143ff3e26e8e0438ba341593dea"
+ngap_schema = "3GPP TS 38.413 V17.3.0"
+ngap_decoder = "0.2.0"
+pfcp_decoder = "0.2.0"
+event_schema = "1.2.0"
+status = "partial_ngap_and_no_operational_n3_dataset"
+
+[s3_3]
+branch = "feat/s3-3-e2e-callflow"
+base_commit = "0ef53843370785833cb0e6b5a1f62540f7f3f98a"
+dataset = "OIRAN_5G_PDU_SESSION_DATA_V1"
+callflow_schema = "1.0.0"
+correlation_rules = "1.0.0"
+status = "certified_strong_e2e"
+
+[s2_1]
+branch = "feat/s2-1-multicore-correction"
+base_commit = "089aebe3a0ddc81c39866efed100663da89bec89"
+status = "implemented_benchmark_deferred_resource_safety"
+performance_measurements = "NOT_RUN"
+
+[s2]
+branch = "feat/s2-multicore-performance"
+baseline_commit = "1b5a3fb04098a561f57248b5b31a54be3a203afc"
+optimization_commit = "db3ddb53200ebe4232cb2e6511b668dc136243ed"
+status = "partial_safety_stop"
+
+[build_baseline]
+rustc = "1.75.0"
+cargo = "1.75.0"
+target = "x86_64-unknown-linux-gnu"
+third_party_crates = 0
+
+[s5_3]
+branch = "feat/s5-3-sbi-correlation"
+base_s5_1 = "ca623fe38ca9c9a1d9be695678cdd464d5555cfd"
+base_s5_2 = "0ec2a6fcfa30da5d152606b0e305e55153a78160"
+transport_tcp = "0.1.0"
+decoder_sbi = "0.1.0"
+event_schema = "1.5.0"
+correlation_engine = "0.3.0"
+callflow_schema = "1.1.0"
+corpus_files = 13
+corpus_packets = 4205
+http2_frames = 2316
+sbi_transactions = 198
+live_capture_executed = false
+simulator_started = false
+production_deployment = false
+status = "http2_validated_sbi_and_cross_interface_partial"
+

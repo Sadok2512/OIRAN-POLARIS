@@ -1,0 +1,7 @@
+[package]
+name = "event-schema"
+version = "1.5.0-dev"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+

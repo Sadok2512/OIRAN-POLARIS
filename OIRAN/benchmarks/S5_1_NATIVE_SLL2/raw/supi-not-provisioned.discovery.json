@@ -1,0 +1,64 @@
+{
+  "ue_contexts": [
+    {
+      "context_id": "uectx-02c4fb4f9efabc88",
+      "pseudonym": "UE-61dfb5be4fd70aa8",
+      "ran_ue_ngap_id": "2",
+      "amf_ue_ngap_id": "2",
+      "ran_endpoint": "172.22.0.10",
+      "amf_endpoint": "172.22.0.23",
+      "association_id": "N2:172.22.0.10:172.22.0.23",
+      "lifecycle_generation": 1,
+      "state": "RELEASED",
+      "first_timestamp_ns": 1786964805053097000,
+      "last_timestamp_ns": 1786964805061509000,
+      "event_ids": [
+        "evt-f6d070dc32c44edd",
+        "evt-7e1365d0774d1edd",
+        "evt-1ba152154f565ccb",
+        "evt-2d22ba6e547a647c"
+      ]
+    }
+  ],
+  "pdu_sessions": [],
+  "pfcp_sessions": [],
+  "gtpu_tunnels": [],
+  "procedures": [
+    {
+      "procedure_id": "procedure-a79cd9bad71ec9f5",
+      "procedure_type": "REGISTRATION",
+      "ue_context_id": "uectx-02c4fb4f9efabc88",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964805053097000,
+      "end_timestamp_ns": 1786964805061067000,
+      "event_ids": [
+        "evt-f6d070dc32c44edd",
+        "evt-7e1365d0774d1edd"
+      ],
+      "result": "INCOMPLETE"
+    },
+    {
+      "procedure_id": "procedure-c149ccafb588c10f",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-02c4fb4f9efabc88",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786964805061097000,
+      "end_timestamp_ns": 1786964805061509000,
+      "event_ids": [
+        "evt-1ba152154f565ccb",
+        "evt-2d22ba6e547a647c"
+      ],
+      "result": "SUCCESS"
+    }
+  ],
+  "background_event_ids": [],
+  "unmatched_event_ids": [],
+  "duplicate_observations": [],
+  "event_accounting": {
+    "background_events": 0,
+    "duplicate_observations": 0,
+    "session_events": 4,
+    "source_events": 4,
+    "unmatched_events": 0
+  }
+}

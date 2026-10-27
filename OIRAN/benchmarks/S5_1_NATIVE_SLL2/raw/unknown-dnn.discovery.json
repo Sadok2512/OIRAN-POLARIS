@@ -1,0 +1,108 @@
+{
+  "ue_contexts": [
+    {
+      "context_id": "uectx-db185ecccf83d4c8",
+      "pseudonym": "UE-892eb1b26429cb43",
+      "ran_ue_ngap_id": "4",
+      "amf_ue_ngap_id": "4",
+      "ran_endpoint": "172.22.0.10",
+      "amf_endpoint": "172.22.0.23",
+      "association_id": "N2:172.22.0.10:172.22.0.23",
+      "lifecycle_generation": 1,
+      "state": "RELEASED",
+      "first_timestamp_ns": 1786965010484331000,
+      "last_timestamp_ns": 1786965010484423000,
+      "event_ids": [
+        "evt-711d6db0498ea0f7",
+        "evt-71a71c68f2b84d45"
+      ]
+    },
+    {
+      "context_id": "uectx-e9834565f84b5b01",
+      "pseudonym": "UE-53abba504566681e",
+      "ran_ue_ngap_id": "5",
+      "amf_ue_ngap_id": "5",
+      "ran_endpoint": "172.22.0.10",
+      "amf_endpoint": "172.22.0.23",
+      "association_id": "N2:172.22.0.10:172.22.0.23",
+      "lifecycle_generation": 1,
+      "state": "ACTIVE",
+      "first_timestamp_ns": 1786965010464137000,
+      "last_timestamp_ns": 1786965010696606000,
+      "event_ids": [
+        "evt-b420e28fa0fbf2b5",
+        "evt-51ef0327393b73c0",
+        "evt-2f2d1ac36aa95c2f",
+        "evt-5010a1846ac8a855",
+        "evt-6863ae13167ffb55",
+        "evt-802621ce412a32d9",
+        "evt-90425a9bf8a45e2e",
+        "evt-5fcec2363dc2b129",
+        "evt-693319286ebaaffd",
+        "evt-56bfc2114b755be2",
+        "evt-117ae09a9530434c"
+      ]
+    }
+  ],
+  "pdu_sessions": [],
+  "pfcp_sessions": [],
+  "gtpu_tunnels": [],
+  "procedures": [
+    {
+      "procedure_id": "procedure-1e9302be87841420",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-e9834565f84b5b01",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786965010491069000,
+      "end_timestamp_ns": 1786965010491221000,
+      "event_ids": [
+        "evt-802621ce412a32d9",
+        "evt-90425a9bf8a45e2e"
+      ],
+      "result": "SUCCESS"
+    },
+    {
+      "procedure_id": "procedure-4520d88eed8346cf",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-db185ecccf83d4c8",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786965010484331000,
+      "end_timestamp_ns": 1786965010484423000,
+      "event_ids": [
+        "evt-711d6db0498ea0f7",
+        "evt-71a71c68f2b84d45"
+      ],
+      "result": "SUCCESS"
+    },
+    {
+      "procedure_id": "procedure-af523f4361732c33",
+      "procedure_type": "REGISTRATION",
+      "ue_context_id": "uectx-e9834565f84b5b01",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786965010464137000,
+      "end_timestamp_ns": 1786965010696606000,
+      "event_ids": [
+        "evt-b420e28fa0fbf2b5",
+        "evt-51ef0327393b73c0",
+        "evt-2f2d1ac36aa95c2f",
+        "evt-5010a1846ac8a855",
+        "evt-6863ae13167ffb55",
+        "evt-5fcec2363dc2b129",
+        "evt-693319286ebaaffd",
+        "evt-56bfc2114b755be2",
+        "evt-117ae09a9530434c"
+      ],
+      "result": "INCOMPLETE"
+    }
+  ],
+  "background_event_ids": [],
+  "unmatched_event_ids": [],
+  "duplicate_observations": [],
+  "event_accounting": {
+    "background_events": 0,
+    "duplicate_observations": 0,
+    "session_events": 13,
+    "source_events": 13,
+    "unmatched_events": 0
+  }
+}

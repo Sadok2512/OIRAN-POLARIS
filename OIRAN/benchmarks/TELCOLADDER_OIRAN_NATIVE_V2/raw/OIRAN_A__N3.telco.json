@@ -1,0 +1,65 @@
+{
+  "summary_version": 1,
+  "source": "N3.pcapng",
+  "capture": {
+    "frames_total": null,
+    "frames_decoded": 10,
+    "messages": 10,
+    "flows": 2,
+    "duration_s": null,
+    "signalling_span_s": 0.006,
+    "started_at": "2026-10-24T22:22:43.765000+00:00",
+    "protocols": [
+      "gtp"
+    ]
+  },
+  "not_visible": {
+    "ciphered_nas": 0,
+    "ecies_protected_suci": 0,
+    "only_n2": false,
+    "frames_not_decoded": null,
+    "sbi_streams_with_undecoded_headers": 0,
+    "narrowed": [],
+    "auto_decode": [],
+    "undecoded_traffic": [],
+    "coverage_notes": []
+  },
+  "network_elements": [
+    {
+      "role": null,
+      "ip": "10.77.22.13",
+      "ports": [
+        2152
+      ],
+      "messages": 10
+    },
+    {
+      "role": null,
+      "ip": "10.77.22.20",
+      "ports": [
+        2152
+      ],
+      "messages": 10
+    }
+  ],
+  "subscribers": [],
+  "unlinked_identities": [
+    {
+      "kind": "gtp_teid",
+      "value": "38568",
+      "scope": "10.77.22.13",
+      "messages": 5,
+      "failures": 0
+    },
+    {
+      "kind": "gtp_teid",
+      "value": "3",
+      "scope": "10.77.22.20",
+      "messages": 5,
+      "failures": 0
+    }
+  ],
+  "procedures": [],
+  "failures": [],
+  "cause_rollup": []
+}

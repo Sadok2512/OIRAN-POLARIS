@@ -1,0 +1,14 @@
+frame.number,frame.time_epoch,frame.protocols,_ws.col.info,nas-5gs.epd,nas-5gs.security_header_type,nas-5gs.mm.message_type,nas-5gs.sm.message_type,nas-5gs.pdu_session_id,nas-5gs.proc_trans_id,nas-5gs.mm.5gmm_cause,nas-5gs.sm.5gsm_cause,nas-5gs.cmn.dnn
+100,1786978946.742848000,sll:ethertype:ip:sctp:ngap:ngap:nas-5gs,"InitialUEMessage, Registration request",126,0,0x41,,,,,,
+279,1786978946.753664000,sll:ethertype:ip:sctp:ngap:ngap:nas-5gs,"SACK (Ack=0, Arwnd=106496) , DownlinkNASTransport, Authentication request",126,0,0x56,,,,,,
+280,1786978946.757174000,sll:ethertype:ip:sctp:ngap:ngap:nas-5gs,"SACK (Ack=0, Arwnd=106496) , UplinkNASTransport, Authentication response",126,0,0x57,,,,,,
+313,1786978946.760459000,sll:ethertype:ip:sctp:ngap:ngap:nas-5gs,"SACK (Ack=1, Arwnd=106496) , DownlinkNASTransport, Security mode command","126,126","3,0",0x5d,,,,,,
+314,1786978946.762774000,sll:ethertype:ip:sctp:ngap:ngap:nas-5gs,"SACK (Ack=1, Arwnd=106496) , UplinkNASTransport",126,4,,,,,,,
+381,1786978946.769176000,sll:ethertype:ip:sctp:ngap:ngap:nas-5gs,"SACK (Ack=3, Arwnd=106496) , InitialContextSetupRequest",126,2,,,,,,,
+385,1786978946.973281000,sll:ethertype:ip:sctp:ngap:ngap:nas-5gs:ngap:ngap:nas-5gs,"UplinkNASTransport, UplinkNASTransport","126,126","2,2",,,,,,,
+386,1786978946.973764000,sll:ethertype:ip:sctp:ngap:ngap:nas-5gs,"SACK (Ack=6, Arwnd=106496) , DownlinkNASTransport",126,2,,,,,,,
+388,1786978946.974391000,sll:ethertype:ip:tcp:http2:mime_multipart:json:nas-5gs:nas-5gs,"DATA[149], JSON (application/json), PDU session establishment request",46,,,0xc1,1,1,,,
+391,1786978946.974709000,sll:ethertype:ip:tcp:http2:mime_multipart:json:nas-5gs:nas-5gs,"DATA[3], JSON (application/json), PDU session establishment request",46,,,0xc1,1,1,,,
+463,1786978946.981504000,sll:ethertype:ip:tcp:http2:mime_multipart:json:nas-5gs:nas-5gs:ngap:ngap,"DATA[135], JSON (application/json), PDU session establishment accept",46,,,0xc2,1,1,,,internet
+477,1786978946.981748000,sll:ethertype:ip:tcp:http2:mime_multipart:json:nas-5gs:nas-5gs:ngap:ngap,"DATA[1], JSON (application/json), PDU session establishment accept",46,,,0xc2,1,1,,,internet
+485,1786978946.982207000,sll:ethertype:ip:sctp:ngap:ngap:nas-5gs,PDUSessionResourceSetupRequest,126,2,,,,,,,

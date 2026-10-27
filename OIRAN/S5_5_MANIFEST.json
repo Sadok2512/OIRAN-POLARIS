@@ -1,0 +1,22 @@
+{
+  "project": "OIRAN",
+  "mission": "FOUR_PLANE_CAPTURE_AND_UNIFIED_DECODER_INTEGRATION",
+  "version": "1.0.0-dev",
+  "branch": "feat/s5-5-four-plane-integration",
+  "base_commit": "29ce76469a9a83acab87cf53cf16b76c93e2a925",
+  "integrated_commits": {
+    "s5_1": "ca623fe38ca9c9a1d9be695678cdd464d5555cfd",
+    "s5_2": "0ec2a6fcfa30da5d152606b0e305e55153a78160",
+    "s5_3": "f343c67cf8422c621100ad328beac44e732397dc"
+  },
+  "planes": {
+    "NG-C": {"interface": "br-oiran-n2", "filter": "sctp port 38412"},
+    "SBI": {"interface": "br-oiran-sbi", "filter": "tcp port 7777"},
+    "N4": {"interface": "br-oiran-n4", "filter": "udp port 8805"},
+    "NG-U": {"interface": "br-oiran-n3", "filter": "udp port 2152"}
+  },
+  "offline_regression": {"rust_tests": 166, "frontend_tests": 18, "e2e_tests": 46, "screenshots": 20},
+  "multi_imsi": {"ue_contexts": 6, "pdu_sessions": 5, "pfcp_sessions": 6, "gtpu_tunnels": 0, "cross_ue_contamination": "NONE_OBSERVED"},
+  "safety": {"live_capture_executed": false, "simulator_started": false, "production_changed": false, "polaris_changed": false, "polaris_control_changed": false, "etv_otv_changed": false},
+  "certification": {"four_plane_implementation_validated": true, "four_plane_live_certified": false, "e2e_correlation_certified": false}
+}

@@ -1,0 +1,194 @@
+{
+  "ue_contexts": [
+    {
+      "context_id": "uectx-c804612b700c8051",
+      "pseudonym": "UE-1269cb8f43afaec9",
+      "ran_ue_ngap_id": "5",
+      "amf_ue_ngap_id": "5",
+      "ran_endpoint": "172.22.0.23",
+      "amf_endpoint": "172.22.0.10",
+      "association_id": "N2:172.22.0.23:172.22.0.10",
+      "lifecycle_generation": 1,
+      "state": "ACTIVE",
+      "first_timestamp_ns": 1786965010464137000,
+      "last_timestamp_ns": 1786965010696606000,
+      "event_ids": [
+        "evt-b420e28fa0fbf2b5",
+        "evt-51ef0327393b73c0",
+        "evt-2f2d1ac36aa95c2f",
+        "evt-5010a1846ac8a855",
+        "evt-6863ae13167ffb55",
+        "evt-802621ce412a32d9",
+        "evt-90425a9bf8a45e2e",
+        "evt-5fcec2363dc2b129",
+        "evt-693319286ebaaffd",
+        "evt-56bfc2114b755be2",
+        "evt-117ae09a9530434c",
+        "evt-f1073f487f2e29c2",
+        "evt-d36bcce545dee8d0",
+        "evt-18c0ecfd658ccffa",
+        "evt-539f70076055f1ce",
+        "evt-3e922aad985930e7",
+        "evt-2956b5072358a9f5",
+        "evt-0cceda3ef50e5d61",
+        "evt-c46f4c2e28feec15",
+        "evt-79497f790c436a2c",
+        "evt-50cf2343ca40a678"
+      ]
+    },
+    {
+      "context_id": "uectx-e4c45e20ee7f4f38",
+      "pseudonym": "UE-87f9b47bbe8da29b",
+      "ran_ue_ngap_id": "4",
+      "amf_ue_ngap_id": "4",
+      "ran_endpoint": "172.22.0.23",
+      "amf_endpoint": "172.22.0.10",
+      "association_id": "N2:172.22.0.23:172.22.0.10",
+      "lifecycle_generation": 1,
+      "state": "RELEASED",
+      "first_timestamp_ns": 1786965010484331000,
+      "last_timestamp_ns": 1786965010484423000,
+      "event_ids": [
+        "evt-711d6db0498ea0f7",
+        "evt-71a71c68f2b84d45"
+      ]
+    }
+  ],
+  "pdu_sessions": [],
+  "pfcp_sessions": [],
+  "gtpu_tunnels": [],
+  "procedures": [
+    {
+      "procedure_id": "procedure-181286ccc5489746",
+      "procedure_type": "SECURITY_MODE",
+      "ue_context_id": "uectx-c804612b700c8051",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786965010481854000,
+      "end_timestamp_ns": 1786965010481854000,
+      "event_ids": [
+        "evt-539f70076055f1ce"
+      ],
+      "result": "INCOMPLETE",
+      "start_event_id": "evt-539f70076055f1ce",
+      "end_event_id": null,
+      "duration_ns": 0,
+      "failure_cause": null,
+      "missing_evidence": [
+        "no explicit completion or failure observed for SECURITY_MODE"
+      ],
+      "evidence": "POSSIBLE"
+    },
+    {
+      "procedure_id": "procedure-28c9594095fb4ecf",
+      "procedure_type": "PROTECTED_NAS",
+      "ue_context_id": "uectx-c804612b700c8051",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786965010483973000,
+      "end_timestamp_ns": 1786965010696606000,
+      "event_ids": [
+        "evt-3e922aad985930e7",
+        "evt-2956b5072358a9f5",
+        "evt-0cceda3ef50e5d61",
+        "evt-c46f4c2e28feec15",
+        "evt-79497f790c436a2c",
+        "evt-50cf2343ca40a678"
+      ],
+      "result": "INCOMPLETE",
+      "start_event_id": "evt-3e922aad985930e7",
+      "end_event_id": null,
+      "duration_ns": 212633000,
+      "failure_cause": null,
+      "missing_evidence": [
+        "no explicit completion or failure observed for PROTECTED_NAS"
+      ],
+      "evidence": "POSSIBLE"
+    },
+    {
+      "procedure_id": "procedure-420cdc4ae5a449f7",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-e4c45e20ee7f4f38",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786965010484331000,
+      "end_timestamp_ns": 1786965010484423000,
+      "event_ids": [
+        "evt-711d6db0498ea0f7",
+        "evt-71a71c68f2b84d45"
+      ],
+      "result": "SUCCESS",
+      "start_event_id": "evt-711d6db0498ea0f7",
+      "end_event_id": "evt-71a71c68f2b84d45",
+      "duration_ns": 92000,
+      "failure_cause": null,
+      "missing_evidence": [],
+      "evidence": "EXACT"
+    },
+    {
+      "procedure_id": "procedure-52e84fc0f4f70664",
+      "procedure_type": "REGISTRATION",
+      "ue_context_id": "uectx-c804612b700c8051",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786965010464137000,
+      "end_timestamp_ns": 1786965010464137000,
+      "event_ids": [
+        "evt-f1073f487f2e29c2"
+      ],
+      "result": "INCOMPLETE",
+      "start_event_id": "evt-f1073f487f2e29c2",
+      "end_event_id": null,
+      "duration_ns": 0,
+      "failure_cause": null,
+      "missing_evidence": [
+        "no explicit completion or failure observed for REGISTRATION"
+      ],
+      "evidence": "POSSIBLE"
+    },
+    {
+      "procedure_id": "procedure-712c6f5f138e444b",
+      "procedure_type": "AUTHENTICATION",
+      "ue_context_id": "uectx-c804612b700c8051",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786965010474790000,
+      "end_timestamp_ns": 1786965010478038000,
+      "event_ids": [
+        "evt-d36bcce545dee8d0",
+        "evt-18c0ecfd658ccffa"
+      ],
+      "result": "SUCCESS",
+      "start_event_id": "evt-d36bcce545dee8d0",
+      "end_event_id": "evt-18c0ecfd658ccffa",
+      "duration_ns": 3248000,
+      "failure_cause": null,
+      "missing_evidence": [],
+      "evidence": "EXACT"
+    },
+    {
+      "procedure_id": "procedure-f80b2056be9e3ce3",
+      "procedure_type": "UE_CONTEXT",
+      "ue_context_id": "uectx-c804612b700c8051",
+      "pdu_session_id": null,
+      "start_timestamp_ns": 1786965010491069000,
+      "end_timestamp_ns": 1786965010491221000,
+      "event_ids": [
+        "evt-802621ce412a32d9",
+        "evt-90425a9bf8a45e2e"
+      ],
+      "result": "SUCCESS",
+      "start_event_id": "evt-802621ce412a32d9",
+      "end_event_id": "evt-90425a9bf8a45e2e",
+      "duration_ns": 152000,
+      "failure_cause": null,
+      "missing_evidence": [],
+      "evidence": "EXACT"
+    }
+  ],
+  "background_event_ids": [],
+  "unmatched_event_ids": [],
+  "duplicate_observations": [],
+  "event_accounting": {
+    "background_events": 0,
+    "duplicate_observations": 0,
+    "session_events": 23,
+    "source_events": 23,
+    "unmatched_events": 0
+  }
+}

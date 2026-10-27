@@ -1,0 +1,37 @@
+sequenceDiagram
+    autonumber
+    participant gNB
+    participant AMF
+    Note over gNB,AMF: Unidentified flow
+    gNB->>AMF: #35;5 NGSetup
+    AMF->>gNB: #35;7 NGSetupResponse
+
+sequenceDiagram
+    autonumber
+    participant UE
+    participant gNB
+    participant AMF
+    Note over gNB,AMF: SUPI 001011234567895
+    gNB->>AMF: #35;13 InitialUEMessage
+    UE->>AMF: #35;13 Registration request
+    AMF->>gNB: #35;14 DownlinkNASTransport
+    AMF->>UE: #35;14 Authentication request
+    gNB->>AMF: #35;15 UplinkNASTransport
+    rect rgb(255, 226, 226)
+    UE->>AMF: #35;15 Authentication failure
+    Note over AMF: Synch failure (#35;21) — 3GPP TS 24.501 §9.11.3.2
+    end
+    AMF->>gNB: #35;16 DownlinkNASTransport
+    AMF->>UE: #35;16 Authentication request
+    gNB->>AMF: #35;17 UplinkNASTransport
+    UE->>AMF: #35;17 Authentication response
+    AMF->>gNB: #35;18 DownlinkNASTransport
+    AMF->>UE: #35;18 Security mode command
+    gNB->>AMF: #35;19 UplinkNASTransport
+    AMF->>gNB: #35;20 InitialContextSetup
+    gNB->>AMF: #35;21 InitialContextSetupResponse
+    gNB->>AMF: #35;23 UplinkNASTransport
+    gNB->>AMF: #35;23 UplinkNASTransport
+    AMF->>gNB: #35;24 DownlinkNASTransport
+    AMF->>gNB: #35;25 PDUSessionResourceSetup
+    gNB->>AMF: #35;27 PDUSessionResourceSetupResponse

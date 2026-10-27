@@ -1,0 +1,107 @@
+{
+  "summary_version": 1,
+  "source": "N4.pcapng",
+  "capture": {
+    "frames_total": null,
+    "frames_decoded": 30,
+    "messages": 30,
+    "flows": 4,
+    "duration_s": null,
+    "signalling_span_s": 55.988,
+    "started_at": "2026-10-24T20:07:40.866000+00:00",
+    "protocols": [
+      "pfcp"
+    ]
+  },
+  "not_visible": {
+    "ciphered_nas": 0,
+    "ecies_protected_suci": 0,
+    "only_n2": false,
+    "frames_not_decoded": null,
+    "sbi_streams_with_undecoded_headers": 0,
+    "narrowed": [],
+    "auto_decode": [],
+    "undecoded_traffic": [],
+    "coverage_notes": []
+  },
+  "network_elements": [
+    {
+      "role": "SMF",
+      "ip": "10.77.23.12",
+      "ports": [
+        8805
+      ],
+      "messages": 30
+    },
+    {
+      "role": "UPF",
+      "ip": "10.77.23.13",
+      "ports": [
+        8805
+      ],
+      "messages": 30
+    }
+  ],
+  "subscribers": [],
+  "unlinked_identities": [
+    {
+      "kind": "gtp_teid",
+      "value": "3",
+      "scope": "10.77.22.12",
+      "messages": 4,
+      "failures": 0
+    },
+    {
+      "kind": "gtp_teid",
+      "value": "38568",
+      "scope": "10.77.22.13",
+      "messages": 4,
+      "failures": 0
+    },
+    {
+      "kind": "gtp_teid",
+      "value": "55981",
+      "scope": "10.77.22.13",
+      "messages": 4,
+      "failures": 0
+    },
+    {
+      "kind": "gtp_teid",
+      "value": "3",
+      "scope": "10.77.22.20",
+      "messages": 4,
+      "failures": 0
+    },
+    {
+      "kind": "pfcp_seid",
+      "value": "1144",
+      "scope": "10.77.23.12|10.77.23.13",
+      "messages": 1,
+      "failures": 0
+    },
+    {
+      "kind": "pfcp_seid",
+      "value": "1504",
+      "scope": "10.77.23.12|10.77.23.13",
+      "messages": 1,
+      "failures": 0
+    },
+    {
+      "kind": "pfcp_seid",
+      "value": "424",
+      "scope": "10.77.23.12|10.77.23.13",
+      "messages": 4,
+      "failures": 0
+    },
+    {
+      "kind": "pfcp_seid",
+      "value": "862",
+      "scope": "10.77.23.12|10.77.23.13",
+      "messages": 4,
+      "failures": 0
+    }
+  ],
+  "procedures": [],
+  "failures": [],
+  "cause_rollup": []
+}

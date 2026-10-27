@@ -1,0 +1,6 @@
+Written to /root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/raw/LAB_TESTBED__5gc-e2e.telco.mmd
+Written to /root/OIRAN_VPROBE/benchmarks/TELCOLADDER_OIRAN_NATIVE_V2/raw/LAB_TESTBED__5gc-e2e.telco.xdr.json
+
+7 flows, 182 messages
+⚠ 6 further NAS messages are ciphered and their contents invisible (normal after Security Mode Command).
+  If a flow looks successful but actually failed, the reason may be in there - check the core network logs.
