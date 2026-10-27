@@ -21,7 +21,6 @@ function securityHeaders(type) {
     'Cache-Control': type.startsWith('text/html') ? 'no-store' : 'public, max-age=300',
     'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://rsms.me; font-src 'self' https://rsms.me; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
     'Content-Type': type,
-    'Cross-Origin-Opener-Policy': 'same-origin',
     'Referrer-Policy': 'no-referrer',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
