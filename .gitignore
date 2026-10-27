@@ -82,3 +82,16 @@ registries/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# TypeScript incremental build info
+*.tsbuildinfo
+**/*.tsbuildinfo
+
+# Vite / Vitest caches
+.vite/
+**/.vite/
+.vitest-cache/
+
+# Playwright
+**/playwright-report/
+**/test-results/

@@ -1,0 +1,16 @@
+{
+  "name": "@oiran-polaris/ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared Enterprise Precision presentation primitives: design tokens, theme helpers, and typed OIRAN v1 contract mirror. Must not contain application-specific workflows, API ownership, authentication logic, or domain state.",
+  "exports": {
+    "./tokens": "./src/tokens.ts",
+    "./theme": "./src/theme.ts",
+    "./api": "./src/api.ts",
+    "./types": "./src/types.ts"
+  },
+  "files": [
+    "src"
+  ]
+}
