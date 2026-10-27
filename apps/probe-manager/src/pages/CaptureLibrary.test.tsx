@@ -230,11 +230,12 @@ describe('Capture Library — actions (PR #2 Section 5)', () => {
     render(renderWithProviders(<CaptureLibraryPage />));
     await waitFor(() => {
       const download = screen.getByTestId('download-sha256:aa');
-      expect(download.tagName).toBe('A');
-      expect(download).toHaveAttribute(
-        'href',
-        '/api/v1/captures/sha256%3Aaa/download',
-      );
+      // The download is a BUTTON (not <a href>) so the Bearer token can
+      // be sent in a header. The target URL stays off the DOM to avoid
+      // ever leaking a token through the href.
+      expect(download.tagName).toBe('BUTTON');
+      expect(download).not.toBeDisabled();
+      expect(download).not.toHaveAttribute('href');
     });
   });
 
@@ -269,6 +270,120 @@ describe('Capture Library — actions (PR #2 Section 5)', () => {
     await user.click(screen.getByTestId('view-sha256:aa'));
     expect(screen.getByTestId('capture-detail')).toBeInTheDocument();
     expect(networkCalls).toBe(before);
+  });
+});
+
+describe('Capture Library — explicit filter scope (PR #2 final review)', () => {
+  it('shows a visible badge stating that filters act on the current page only', async () => {
+    stubBackend({});
+    render(renderWithProviders(<CaptureLibraryPage />));
+    expect(await screen.findByTestId('filter-scope-badge')).toHaveTextContent(
+      /current page/i,
+    );
+    expect(screen.getByTestId('filter-scope-note').textContent).toMatch(
+      /current page only/i,
+    );
+  });
+});
+
+describe('Capture Library — PCAP download (PR #2 final review)', () => {
+  const createBlobUrlMock = vi.fn(() => 'blob:dl-url');
+  const revokeBlobUrlMock = vi.fn();
+
+  beforeEach(() => {
+    createBlobUrlMock.mockClear();
+    revokeBlobUrlMock.mockClear();
+    (globalThis as unknown as { URL: typeof URL }).URL.createObjectURL =
+      createBlobUrlMock as unknown as typeof URL.createObjectURL;
+    (globalThis as unknown as { URL: typeof URL }).URL.revokeObjectURL =
+      revokeBlobUrlMock as unknown as typeof URL.revokeObjectURL;
+  });
+
+  it('sends Authorization: Bearer and does not leak the token in the URL', async () => {
+    sessionStorage.setItem('oiran.access_token', 'secret-token');
+    const user = userEvent.setup();
+    const requests: { url: string; headers: Record<string, string> }[] = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const headers = Object.fromEntries(new Headers(init?.headers).entries());
+      requests.push({ url, headers });
+      if (url.includes('/download')) {
+        return new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: {
+            'content-type': 'application/vnd.tcpdump.pcap',
+            'content-disposition': 'attachment; filename="historical-ng-c.pcap"',
+          },
+        });
+      }
+      if (url.includes('/captures?')) {
+        return respond(200, { data: CAPTURES, meta: { total: 2, total_pages: 1 } });
+      }
+      if (url.includes('/auth/me'))
+        return respond(200, {
+          data: {
+            authenticated: true,
+            role: 'operator',
+            permissions: ['capture.read'],
+            capture_control: true,
+            capture_execution_enabled: true,
+            reason: 'OK',
+          },
+          meta: {},
+        });
+      return respond(200, { data: [], meta: {} });
+    }) as unknown as typeof fetch;
+
+    render(renderWithProviders(<CaptureLibraryPage />));
+    await waitFor(() =>
+      expect(screen.getByText('historical-ng-c')).toBeInTheDocument(),
+    );
+    await user.click(screen.getByTestId('download-sha256:aa'));
+    await waitFor(() =>
+      expect(requests.some((r) => r.url.includes('/download'))).toBe(true),
+    );
+    const dl = requests.find((r) => r.url.includes('/download'))!;
+    expect(dl.url).not.toContain('secret-token');
+    expect(dl.url).not.toMatch(/token=|access_token=|bearer=/i);
+    expect(dl.headers['authorization']).toBe('Bearer secret-token');
+    expect(createBlobUrlMock).toHaveBeenCalled();
+    expect(revokeBlobUrlMock).toHaveBeenCalledWith('blob:dl-url');
+  });
+
+  it('surfaces a download error without a fabricated success notification', async () => {
+    sessionStorage.setItem('oiran.access_token', 'secret-token');
+    const user = userEvent.setup();
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/download')) {
+        return respond(403, { error: { code: 'FORBIDDEN', message: 'nope' } });
+      }
+      if (url.includes('/captures?'))
+        return respond(200, { data: CAPTURES, meta: { total: 2, total_pages: 1 } });
+      if (url.includes('/auth/me'))
+        return respond(200, {
+          data: {
+            authenticated: true,
+            role: 'operator',
+            permissions: ['capture.read'],
+            capture_control: true,
+            capture_execution_enabled: true,
+            reason: 'OK',
+          },
+          meta: {},
+        });
+      return respond(200, { data: [], meta: {} });
+    }) as unknown as typeof fetch;
+
+    render(renderWithProviders(<CaptureLibraryPage />));
+    await waitFor(() =>
+      expect(screen.getByText('historical-ng-c')).toBeInTheDocument(),
+    );
+    await user.click(screen.getByTestId('download-sha256:aa'));
+    await waitFor(() =>
+      expect(screen.getByTestId('download-error')).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId('download-error').textContent).toMatch(/403/);
   });
 });
 

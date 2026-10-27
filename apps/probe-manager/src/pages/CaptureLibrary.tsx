@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import {
   flexRender,
   getCoreRowModel,
@@ -7,7 +7,7 @@ import {
   type ColumnDef,
   type SortingState,
 } from '@tanstack/react-table';
-import { AlertTriangle, Download, Eye, FileSearch, Filter } from 'lucide-react';
+import { AlertTriangle, Download, Eye, FileSearch, Filter, Loader2 } from 'lucide-react';
 import { PageHeader } from '@/ui/PageHeader';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import {
@@ -24,6 +24,7 @@ import {
 } from '@/data/queries';
 import { bytes, count, durationSeconds, isoToLocal } from '@/data/format';
 import type { Capture } from '@shared/types';
+import { ApiError, authenticatedDownload } from '@shared/api';
 
 const STATUS_OPTIONS: Capture['state'][] = [
   'READY',
@@ -87,6 +88,41 @@ export function CaptureLibraryPage({
   );
 
   const authenticated = auth.data?.authenticated === true;
+
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+
+  const triggerDownload = useCallback(async (capture: Capture) => {
+    setDownloadError(null);
+    setDownloadingId(capture.capture_id);
+    try {
+      const dl = await authenticatedDownload(
+        `/captures/${encodeURIComponent(capture.capture_id)}/download`,
+        { authScope: 'oiran' },
+      );
+      try {
+        const anchor = document.createElement('a');
+        anchor.href = dl.objectUrl;
+        anchor.download = dl.filename ?? `${capture.name}.pcap`;
+        anchor.rel = 'noopener';
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+      } finally {
+        dl.revoke();
+      }
+    } catch (error) {
+      setDownloadError(
+        error instanceof ApiError
+          ? `Download failed: HTTP ${error.status} ${error.code}`
+          : error instanceof Error
+            ? error.message
+            : 'Download failed',
+      );
+    } finally {
+      setDownloadingId(null);
+    }
+  }, []);
 
   const columns = useMemo<ColumnDef<Capture>[]>(
     () => [
@@ -242,32 +278,34 @@ export function CaptureLibraryPage({
                   Analyzer
                 </button>
               )}
-              {downloadable ? (
-                <a
-                  className="ep-button ep-button-sm"
-                  href={`/api/v1/captures/${encodeURIComponent(capture.capture_id)}/download`}
-                  onClick={(event) => event.stopPropagation()}
-                  aria-label={`Download PCAP for ${capture.name}`}
-                  data-testid={`download-${capture.capture_id}`}
-                >
+              <button
+                type="button"
+                className="ep-button ep-button-sm"
+                disabled={!downloadable || downloadingId === capture.capture_id}
+                aria-label={
+                  downloadable
+                    ? `Download PCAP for ${capture.name}`
+                    : 'Download disabled'
+                }
+                title={
+                  !authenticated
+                    ? 'Download requires an authenticated operator role'
+                    : !downloadable
+                      ? 'Capture has no stored bytes — nothing to download'
+                      : 'Download PCAP (Bearer-authenticated, token not in URL)'
+                }
+                data-testid={`download-${capture.capture_id}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void triggerDownload(capture);
+                }}
+              >
+                {downloadingId === capture.capture_id ? (
+                  <Loader2 width={13} height={13} className="animate-spin" aria-hidden="true" />
+                ) : (
                   <Download width={13} height={13} aria-hidden="true" />
-                </a>
-              ) : (
-                <button
-                  type="button"
-                  className="ep-button ep-button-sm"
-                  disabled
-                  aria-label="Download disabled"
-                  title={
-                    !authenticated
-                      ? 'Download requires an authenticated operator role'
-                      : 'Capture has no stored bytes — nothing to download'
-                  }
-                  data-testid={`download-${capture.capture_id}`}
-                >
-                  <Download width={13} height={13} aria-hidden="true" />
-                </button>
-              )}
+                )}
+              </button>
               {failed && (
                 <span
                   className="ep-badge border-error/40 text-error"
@@ -307,21 +345,50 @@ export function CaptureLibraryPage({
         title="Capture Library"
         description="Every capture record reported by the backend. Original PCAPs stay immutable; opening in Analyzer preserves the capture and dataset context."
         actions={
-          <span className="text-ep-xs text-text-secondary flex items-center gap-1.5">
-            <Filter width={13} height={13} aria-hidden="true" />
-            {count(filtered.length)} shown
-            {total != null && ` of ${count(total)} total`}
-          </span>
+          <div className="flex items-center gap-2">
+            <span
+              className="ep-badge"
+              title="Filters and sorting apply to the CURRENT page only. Pagination is server-driven."
+              data-testid="filter-scope-badge"
+            >
+              <Filter width={11} height={11} aria-hidden="true" />
+              Filters: current page
+            </span>
+            <span className="text-ep-xs text-text-secondary">
+              {count(filtered.length)} shown
+              {total != null && ` of ${count(total)} total`}
+            </span>
+          </div>
         }
       />
 
-      <div className="ep-card p-3 flex flex-wrap items-center gap-2 mb-4">
+      {downloadError && (
+        <div
+          role="alert"
+          className="ep-card border-error/30 p-3 mb-3 text-ep-sm text-error"
+          data-testid="download-error"
+        >
+          {downloadError}
+        </div>
+      )}
+
+      <div
+        className="ep-card p-3 flex flex-wrap items-center gap-2 mb-4"
+        data-testid="capture-filters"
+      >
+        <p
+          className="w-full text-ep-xs text-text-secondary"
+          data-testid="filter-scope-note"
+        >
+          Search · sort · filters below act on the <strong>current page only</strong>;
+          use Previous/Next to request additional pages from the backend.
+        </p>
         <input
           className="ep-input flex-1 min-w-[200px]"
-          placeholder="Search by name, ID, interface"
+          placeholder="Search by name, ID, interface (current page)"
           value={search}
           onChange={(event) => setSearch(event.target.value)}
-          aria-label="Search captures"
+          aria-label="Search captures (current page)"
           data-testid="capture-search"
         />
         <select

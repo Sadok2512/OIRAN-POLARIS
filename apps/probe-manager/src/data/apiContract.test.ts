@@ -1,9 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
+  allowedBasesForScope,
   api,
   ApiError,
+  applyAuthHeader,
+  authenticatedDownload,
   classifyHttpStatus,
   getAccessToken,
+  isBaseAuthorizedForScope,
   scopeStorageKey,
   setAccessToken,
 } from '@shared/api';
@@ -82,6 +86,128 @@ describe('shared api — authentication scope isolation (PR #2 Section 3)', () =
     expect(sessionStorage.getItem(scopeStorageKey('polaris'))).toBe('t');
     expect(getAccessToken('polaris')).toBe('t');
     expect(getAccessToken('oiran')).toBeNull();
+  });
+});
+
+describe('shared api — scope ↔ base allowlist (PR #2 final review)', () => {
+  it('publishes a non-empty allowlist per scope', () => {
+    expect(allowedBasesForScope('oiran')).toContain('/api/v1');
+    expect(allowedBasesForScope('polaris')).toContain('/polaris-api/v1');
+    expect(allowedBasesForScope('probe-manager')).toContain('/api/v1');
+  });
+
+  it('isBaseAuthorizedForScope rejects a same-origin base that targets a different service', () => {
+    // OIRAN scope must NOT be authorized to reach /polaris-api/v1 even
+    // though both are same-origin.
+    expect(isBaseAuthorizedForScope('/polaris-api/v1', 'oiran')).toBe(false);
+    expect(isBaseAuthorizedForScope('/polaris-api/v1', 'polaris')).toBe(true);
+  });
+
+  it('isBaseAuthorizedForScope rejects ambiguous paths that only share a prefix lexically', () => {
+    // "/api/v1-admin" starts lexically with "/api/v1" but is a different
+    // service — must NOT inherit the oiran token.
+    expect(isBaseAuthorizedForScope('/api/v1-admin', 'oiran')).toBe(false);
+    expect(isBaseAuthorizedForScope('/api/v1/admin', 'oiran')).toBe(true);
+    expect(isBaseAuthorizedForScope('/api/v1', 'oiran')).toBe(true);
+  });
+
+  it('applyAuthHeader does NOT attach the oiran token to a same-origin /polaris-api/v1 base', async () => {
+    sessionStorage.setItem(scopeStorageKey('oiran'), 'oiran-token');
+    stub(() => respond(200, { data: {}, meta: {} }));
+    await api('/something', { authScope: 'oiran', base: '/polaris-api/v1' });
+    const headers = new Headers(calls[0].init?.headers);
+    expect(headers.get('authorization')).toBeNull();
+  });
+
+  it('applyAuthHeader does NOT attach the polaris token to the /api/v1 base', async () => {
+    sessionStorage.setItem(scopeStorageKey('polaris'), 'polaris-token');
+    stub(() => respond(200, { data: {}, meta: {} }));
+    await api('/something', { authScope: 'polaris', base: '/api/v1' });
+    const headers = new Headers(calls[0].init?.headers);
+    expect(headers.get('authorization')).toBeNull();
+  });
+
+  it('attaches the token to any sub-path of an allowlisted base', () => {
+    const headers = new Headers();
+    sessionStorage.setItem(scopeStorageKey('oiran'), 'tok');
+    applyAuthHeader(headers, 'oiran', '/api/v1');
+    expect(headers.get('authorization')).toBe('Bearer tok');
+    const headers2 = new Headers();
+    applyAuthHeader(headers2, 'oiran', '/api/v1/captures');
+    expect(headers2.get('authorization')).toBe('Bearer tok');
+  });
+});
+
+describe('shared api — authenticatedDownload (PR #2 final review)', () => {
+  const createBlobUrlMock = vi.fn(() => 'blob:mock-url');
+  const revokeBlobUrlMock = vi.fn();
+
+  beforeEach(() => {
+    createBlobUrlMock.mockClear();
+    revokeBlobUrlMock.mockClear();
+    (globalThis as unknown as { URL: typeof URL }).URL.createObjectURL = createBlobUrlMock as unknown as typeof URL.createObjectURL;
+    (globalThis as unknown as { URL: typeof URL }).URL.revokeObjectURL = revokeBlobUrlMock as unknown as typeof URL.revokeObjectURL;
+  });
+
+  it('sends Authorization: Bearer and never puts the token in the URL', async () => {
+    sessionStorage.setItem(scopeStorageKey('oiran'), 'secret-token');
+    stub(() =>
+      new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: {
+          'content-type': 'application/vnd.tcpdump.pcap',
+          'content-disposition': 'attachment; filename="capture.pcap"',
+        },
+      }),
+    );
+    const dl = await authenticatedDownload(
+      '/captures/sha256:aa/download',
+      { authScope: 'oiran' },
+    );
+    expect(calls[0].url).not.toContain('secret-token');
+    expect(calls[0].url).not.toMatch(/token=|access_token=|bearer=/i);
+    const headers = new Headers(calls[0].init?.headers);
+    expect(headers.get('authorization')).toBe('Bearer secret-token');
+    expect(dl.objectUrl).toBe('blob:mock-url');
+    expect(dl.filename).toBe('capture.pcap');
+    dl.revoke();
+    expect(revokeBlobUrlMock).toHaveBeenCalledWith('blob:mock-url');
+  });
+
+  it('refuses the download when authScope has no token available', async () => {
+    stub(() => respond(200, { data: {}, meta: {} }));
+    await expect(
+      authenticatedDownload('/x', { authScope: 'oiran' }),
+    ).rejects.toMatchObject({
+      status: 401,
+      code: 'MISSING_OR_UNAUTHORIZED_TOKEN',
+    });
+    expect(calls.length).toBe(0);
+  });
+
+  it('refuses the download when authScope cannot reach the base', async () => {
+    sessionStorage.setItem(scopeStorageKey('oiran'), 'secret-token');
+    stub(() => respond(200, { data: {}, meta: {} }));
+    await expect(
+      authenticatedDownload('/x', {
+        authScope: 'oiran',
+        base: '/polaris-api/v1',
+      }),
+    ).rejects.toMatchObject({
+      status: 401,
+      code: 'MISSING_OR_UNAUTHORIZED_TOKEN',
+    });
+    expect(calls.length).toBe(0);
+  });
+
+  it('surfaces non-2xx responses as ApiError', async () => {
+    sessionStorage.setItem(scopeStorageKey('oiran'), 'secret-token');
+    stub(() =>
+      respond(403, { error: { code: 'FORBIDDEN', message: 'nope' } }),
+    );
+    await expect(
+      authenticatedDownload('/x', { authScope: 'oiran' }),
+    ).rejects.toMatchObject({ status: 403, code: 'FORBIDDEN' });
   });
 });
 
