@@ -6,12 +6,16 @@ import {
   Activity,
   History,
   Settings as SettingsIcon,
+  Antenna,
+  Zap,
 } from 'lucide-react';
 import clsx from 'clsx';
 
 const NAV = [
   { to: '/console', label: 'Console', Icon: LayoutDashboard, section: 'OPERATIONS' },
+  { to: '/nodes', label: 'Network Nodes', Icon: Antenna, section: 'OPERATIONS' },
   { to: '/ues', label: 'UE Manager', Icon: Smartphone, section: 'OPERATIONS' },
+  { to: '/traffic', label: 'Traffic Generator', Icon: Zap, section: 'OPERATIONS' },
   { to: '/scenarios', label: 'Scenarios', Icon: Workflow, section: 'WORKFLOWS' },
   { to: '/scenarios/monitor', label: 'Execution Monitor', Icon: Activity, section: 'WORKFLOWS' },
   { to: '/history', label: 'History', Icon: History, section: 'REVIEW' },

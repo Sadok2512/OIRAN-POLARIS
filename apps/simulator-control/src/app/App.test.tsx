@@ -43,6 +43,8 @@ function stubFetch() {
       return respond(200, { data: { state: 'IDLE', packets_requested: 0, packets_sent: null, packets_received: null, bytes: null, accounting_source: 'none', last_result: null, approved_destinations: [] }, meta: {} });
     if (url.includes('/ues'))
       return respond(200, { data: { items: [], configured_profiles: [], configured_count: 0, active_count: 0, registered_count: 0, source: 'test' }, meta: {} });
+    if (url.includes('/nodes'))
+      return respond(200, { data: { items: [], configured_count: 0, running_count: 0, observed_at_epoch_s: 0, source: 'test' }, meta: {} });
     if (url.includes('/lab'))
       return respond(200, { data: { ue_count: 0, desired_ue_count: 0, gnb_count: 0, max_ues: 4, max_gnbs: 2, max_ues_live_certified: 4, max_gnbs_live_certified: 2, missing_subscriber_profiles: 0, updated_at_epoch_s: 0, updated_by: '', observed_controller_running: 0, observed_total_running: 0, reconciliation: { operation_id: null, desired_count: 0, state: 'IDLE', started_at_epoch_s: null, completed_at_epoch_s: null, started: [], stopped: [], failures: [] }, execution_started: false }, meta: {} });
     if (url.includes('/system/health'))
@@ -74,11 +76,55 @@ describe('Simulator Control routes', () => {
     expect(await screen.findByRole('heading', { name: /console/i, level: 1 })).toBeInTheDocument();
   });
 
-  it('exposes every mandated nav link', () => {
+  it('exposes every mandated nav link including Network Nodes + Traffic', () => {
     renderApp();
-    for (const label of ['Console', 'UE Manager', 'Scenarios', 'Execution Monitor', 'History', 'Settings']) {
+    for (const label of [
+      'Console',
+      'Network Nodes',
+      'UE Manager',
+      'Traffic Generator',
+      'Scenarios',
+      'Execution Monitor',
+      'History',
+      'Settings',
+    ]) {
       expect(screen.getByRole('link', { name: new RegExp(label, 'i') })).toBeInTheDocument();
     }
+  });
+
+  it('navigates to Network Nodes', async () => {
+    renderApp();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('link', { name: /network nodes/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('heading', { name: /network nodes/i, level: 1 })).toBeInTheDocument(),
+    );
+  });
+
+  it('navigates to Traffic Generator', async () => {
+    renderApp();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('link', { name: /traffic generator/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('heading', { name: /traffic generator/i, level: 1 })).toBeInTheDocument(),
+    );
+  });
+
+  it('shows an Operator login form in Settings when not authenticated', async () => {
+    renderApp();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('link', { name: /settings/i }));
+    await waitFor(() =>
+      expect(screen.getByTestId('operator-login-form')).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId('operator-login-username')).toBeInTheDocument();
+    expect(screen.getByTestId('operator-login-password')).toBeInTheDocument();
+    expect(screen.getByTestId('operator-login-submit')).toBeInTheDocument();
+  });
+
+  it('surfaces the header identity badge', async () => {
+    renderApp();
+    expect(await screen.findByTestId('header-identity')).toHaveTextContent(/not signed in/i);
   });
 
   it('navigates to Scenarios library and opens the builder', async () => {

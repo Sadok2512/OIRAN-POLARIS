@@ -1,7 +1,17 @@
-# PR body — `feat(simulator): advanced mobile scenario builder V1`
+# PR body — `feat(simulator): advanced mobile scenario builder V1 — integrated`
 
 > Paste below as the PR body
 > `feat/polaris-advanced-scenario-builder → main`.
+
+## Final integration update
+
+Added the missing POLARIS surface so `apps/simulator-control` is a
+drop-in replacement for the legacy preview served at `/simulator/`:
+Network Nodes page (`/nodes`), Traffic Generator page (`/traffic`),
+Operator Login with CSRF handling, and a header identity badge. **No
+second Simulator Control app** — the Scenario Builder is now inside the
+single app that owns UE Manager, gNB Manager, Operator Login, Traffic
+and History. Backend untouched.
 
 ## Scope
 

@@ -79,6 +79,45 @@ export interface ScenarioCapabilities {
   role: string;
 }
 
+export interface NodeItem {
+  id: string;
+  name: string;
+  technology: string;
+  simulator: string;
+  plmn: string;
+  cell_id: string;
+  link_ip: string;
+  n2_endpoint: string | null;
+  n3_endpoint: string | null;
+  process_state: string;
+  health: string;
+  configured: boolean;
+  controller_owned: boolean;
+  uptime_seconds: number | null;
+  actions: { start: boolean; stop: boolean; reason: string };
+}
+
+export interface NodeInventory {
+  items: NodeItem[];
+  configured_count: number;
+  running_count: number;
+  observed_at_epoch_s: number;
+  source: string;
+}
+
+export interface LoginRequest {
+  username: string;
+  password: string;
+}
+
+export interface LoginResult {
+  authenticated: true;
+  username: string;
+  role: 'operator' | 'administrator';
+  csrf_token: string;
+  expires_at_epoch_s: number;
+}
+
 export interface UeState {
   id: string;
   internal_ue_id?: string;

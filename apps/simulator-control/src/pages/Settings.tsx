@@ -1,7 +1,14 @@
+import { useState } from 'react';
 import { PageHeader } from '@/ui/PageHeader';
 import { StatusIndicator } from '@/ui/StatusIndicator';
-import { EmptyState, LoadingSkeleton, Unavailable } from '@/ui/EmptyErrorLoading';
-import { useAuth, useCapabilities, useScenarioCapabilities } from '@/data/queries';
+import { LoadingSkeleton, Unavailable } from '@/ui/EmptyErrorLoading';
+import {
+  useAuth,
+  useCapabilities,
+  useLogin,
+  useLogout,
+  useScenarioCapabilities,
+} from '@/data/queries';
 import { useAssignments, useScenarios } from '@/scenarios/store';
 
 export function SettingsPage() {
@@ -10,6 +17,40 @@ export function SettingsPage() {
   const scenarioCapabilities = useScenarioCapabilities();
   const library = useScenarios();
   const assignments = useAssignments();
+  const login = useLogin();
+  const logout = useLogout();
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [message, setMessage] = useState<string | null>(null);
+
+  const secureTransport =
+    typeof window === 'undefined' ||
+    window.location.protocol === 'https:' ||
+    window.location.hostname === '127.0.0.1' ||
+    window.location.hostname === 'localhost';
+
+  async function handleLogin(event: React.FormEvent) {
+    event.preventDefault();
+    setMessage(null);
+    try {
+      await login.mutateAsync({ username: username.trim(), password });
+      setPassword('');
+      setMessage(`Signed in as ${username}.`);
+    } catch (error) {
+      setMessage((error as Error).message.replaceAll('_', ' '));
+      setPassword('');
+    }
+  }
+
+  async function handleLogout() {
+    setMessage(null);
+    try {
+      await logout.mutateAsync();
+      setMessage('Signed out.');
+    } catch (error) {
+      setMessage((error as Error).message.replaceAll('_', ' '));
+    }
+  }
 
   return (
     <>
@@ -19,26 +60,76 @@ export function SettingsPage() {
         description="Deployment-controlled toggles are read-only from this UI. The frontend never writes permissions."
       />
       <div className="grid gap-4 md:grid-cols-2">
-        <section className="ep-card p-5">
+        <section className="ep-card p-5" data-testid="operator-account">
           <h2 className="text-ep-md font-semibold mb-2">Operator account</h2>
           {auth.isLoading ? (
             <LoadingSkeleton label="Loading" />
           ) : auth.data?.authenticated ? (
-            <dl className="grid grid-cols-2 gap-x-5 gap-y-1 text-ep-sm">
-              <dt className="text-text-secondary">Username</dt>
-              <dd>{auth.data.username}</dd>
-              <dt className="text-text-secondary">Role</dt>
-              <dd>{auth.data.role}</dd>
-              <dt className="text-text-secondary">Can start</dt>
-              <dd>{auth.data.can_start ? 'Yes' : 'No'}</dd>
-              <dt className="text-text-secondary">Manage permissions</dt>
-              <dd>{auth.data.can_manage_permissions ? 'Yes' : 'No'}</dd>
-            </dl>
+            <>
+              <dl className="grid grid-cols-2 gap-x-5 gap-y-1 text-ep-sm">
+                <dt className="text-text-secondary">Username</dt>
+                <dd>{auth.data.username}</dd>
+                <dt className="text-text-secondary">Role</dt>
+                <dd>{auth.data.role}</dd>
+                <dt className="text-text-secondary">Can start</dt>
+                <dd>{auth.data.can_start ? 'Yes' : 'No'}</dd>
+                <dt className="text-text-secondary">Manage permissions</dt>
+                <dd>{auth.data.can_manage_permissions ? 'Yes' : 'No'}</dd>
+              </dl>
+              <button
+                type="button"
+                className="ep-button ep-button-sm mt-3"
+                onClick={() => void handleLogout()}
+                disabled={logout.isPending}
+                data-testid="operator-logout"
+              >
+                Sign out
+              </button>
+            </>
           ) : (
-            <EmptyState
-              title="Not authenticated"
-              description="Sign in through the POLARIS operator flow to enable write actions."
-            />
+            <form className="flex flex-col gap-2" onSubmit={handleLogin} data-testid="operator-login-form">
+              {!secureTransport && (
+                <p className="text-ep-xs text-error">
+                  Operator sign-in requires HTTPS or localhost — the browser URL does not meet that requirement.
+                </p>
+              )}
+              <label className="flex flex-col gap-1 text-ep-sm">
+                <span className="text-text-secondary">Username</span>
+                <input
+                  className="ep-input"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  autoComplete="username"
+                  disabled={!secureTransport}
+                  data-testid="operator-login-username"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-ep-sm">
+                <span className="text-text-secondary">Password</span>
+                <input
+                  type="password"
+                  className="ep-input"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  autoComplete="current-password"
+                  disabled={!secureTransport}
+                  data-testid="operator-login-password"
+                />
+              </label>
+              <button
+                type="submit"
+                className="ep-button ep-button-sm ep-button-primary mt-1"
+                disabled={!secureTransport || login.isPending || !username.trim() || !password}
+                data-testid="operator-login-submit"
+              >
+                {login.isPending ? 'Signing in…' : 'Sign in securely'}
+              </button>
+            </form>
+          )}
+          {message && (
+            <p className="text-ep-xs text-text-secondary mt-2" data-testid="operator-login-feedback">
+              {message}
+            </p>
           )}
         </section>
 
