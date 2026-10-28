@@ -3,6 +3,11 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.6.3 — 2026-10-28 (patch)
+
+- Use the persistent POLARIS UE registry as the inventory whenever provisioning is enabled, so a
+  successfully provisioned UE is immediately visible instead of being hidden by legacy local data.
+
 ## 0.6.2 — 2026-10-28 (patch)
 
 - Fix Add UE to send the API 0.15.2 minimal subscriber contract

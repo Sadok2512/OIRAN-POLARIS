@@ -68,7 +68,12 @@ export interface BackendProfileSource {
 }
 
 export function useBackendProfiles(): BackendProfileSource {
-  const enabled = useFeatureFlag('profileBackend');
+  const profileBackend = useFeatureFlag('profileBackend');
+  const provisioningBackend = useFeatureFlag('polarisProvisioning');
+  // Provisioning creates profiles directly in the POLARIS registry, so that
+  // same registry must also be the inventory source. Otherwise a successful
+  // Add UE is hidden behind the legacy localStorage list.
+  const enabled = profileBackend || provisioningBackend;
   const client = useQueryClient();
   const list = useQuery({
     queryKey: PROFILES_KEY,
