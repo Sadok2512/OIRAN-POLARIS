@@ -9,7 +9,7 @@
 
 ### Changed
 
-- Probe liveness now derives only from measured capture ingestion or packet timestamps; probes without a real heartbeat remain `PENDING`, offline, and expose a `null` heartbeat.
+- Probe liveness now derives only from measured capture ingestion or packet timestamps; probes without a real heartbeat remain `PENDING`, while stale measured activity is `DEGRADED` after the native segment window.
 - Live dataset capture interface and size evidence now remain `null` when no capture job supplies those values.
 - Raw PCAP download now fails closed with `403 DOWNLOAD_POLICY_PENDING` pending a subscriber-identity-safe export policy.
 

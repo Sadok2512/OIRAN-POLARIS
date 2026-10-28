@@ -35,7 +35,7 @@ use tower_http::{
 
 pub const API_VERSION: &str = "2.4.0";
 pub const PLATFORM_VERSION: &str = "2.4.0-dev";
-const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 120;
+const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 
 #[derive(Clone)]
@@ -896,7 +896,7 @@ fn probe_value(state: &AppState, record: &ProbeRecord) -> Value {
     } else if online {
         "ONLINE"
     } else {
-        "OFFLINE"
+        "DEGRADED"
     };
     json!({
         "probe_id":record.probe_id,"name":record.name,"host":record.host,"mgmt_ip":record.mgmt_ip,"site":record.site,
@@ -2544,6 +2544,12 @@ mod tests {
         .await;
         assert_eq!(value["data"][0]["online"], false);
         assert_eq!(value["data"][0]["probe_state"], "PROBE_PENDING");
+    }
+
+    #[test]
+    fn measured_heartbeat_outside_native_segment_window_is_not_online() {
+        assert!(probe_online(Some(100), 115));
+        assert!(!probe_online(Some(100), 116));
     }
 
     #[test]

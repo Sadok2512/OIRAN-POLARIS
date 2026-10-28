@@ -158,7 +158,7 @@ pub fn validate_input(input: &ProbeInput) -> Result<(), String> {
         ("host", input.host.as_str()),
         ("site", input.site.as_str()),
     ] {
-        if value.trim().is_empty() || value.len() > 128 || value.contains(['\n', '\r', '\0']) {
+        if value.trim().is_empty() || value.len() > 128 || contains_forbidden_control(value) {
             return Err(format!("{field} is invalid"));
         }
     }
@@ -184,7 +184,7 @@ pub fn validate_input(input: &ProbeInput) -> Result<(), String> {
         }
         if interface.bpf_filter.trim().is_empty()
             || interface.bpf_filter.len() > 512
-            || interface.bpf_filter.contains(['\n', '\r', '\0'])
+            || contains_forbidden_control(&interface.bpf_filter)
         {
             return Err("bpf_filter is invalid".into());
         }
@@ -193,6 +193,12 @@ pub fn validate_input(input: &ProbeInput) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn contains_forbidden_control(value: &str) -> bool {
+    value
+        .bytes()
+        .any(|byte| matches!(byte, b'\n' | b'\r' | b'\0'))
 }
 
 fn validate_document(document: &RegistryDocument) -> Result<(), String> {
