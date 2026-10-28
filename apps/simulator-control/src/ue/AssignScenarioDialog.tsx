@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
-import type { Scenario } from '@/scenarios/model';
+import type { Scenario, ScenarioExecutionCompatibility } from '@/scenarios/model';
 
 export function AssignScenarioDialog({
   open,
   selectedCount,
   scenarios,
+  compatibility,
   busy,
   onSubmit,
   onCancel,
@@ -13,6 +14,7 @@ export function AssignScenarioDialog({
   open: boolean;
   selectedCount: number;
   scenarios: Scenario[];
+  compatibility: Map<string, ScenarioExecutionCompatibility>;
   busy?: boolean;
   onSubmit: (payload: { scenarioId: string | null; autoRun: boolean }) => void;
   onCancel: () => void;
@@ -22,9 +24,9 @@ export function AssignScenarioDialog({
 
   useEffect(() => {
     if (!open) return;
-    setScenarioId(scenarios[0]?.id ?? '');
+    setScenarioId(scenarios.find((scenario) => compatibility.get(scenario.id)?.executable)?.id ?? '');
     setAutoRun(false);
-  }, [open, scenarios]);
+  }, [open, scenarios, compatibility]);
 
   if (!open) return null;
 
@@ -73,11 +75,17 @@ export function AssignScenarioDialog({
             data-testid="assign-scenario-select"
           >
             <option value="">— None (clear) —</option>
-            {scenarios.map((scenario) => (
-              <option key={scenario.id} value={scenario.id}>
-                {scenario.name} (v{scenario.version})
+            {scenarios.map((scenario) => {
+              const state = compatibility.get(scenario.id);
+              const reason = state?.executable
+                ? null
+                : `${state?.stepType ?? 'scenario'} → ${state?.reason ?? 'CAPABILITIES_UNAVAILABLE'}`;
+              return (
+              <option key={scenario.id} value={scenario.id} disabled={Boolean(reason)}>
+                {scenario.name} (v{scenario.version}){reason ? ` — ${reason}` : ''}
               </option>
-            ))}
+              );
+            })}
           </select>
           {scenarios.length === 0 && (
             <span className="text-ep-xs text-warning">

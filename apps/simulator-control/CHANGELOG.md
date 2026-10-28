@@ -3,6 +3,13 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.6.4 — 2026-10-28 (patch)
+
+- Uses the scenario-only UE profile `PATCH` contract so assignment cannot clear subscriber provisioning evidence.
+- Disables incompatible scenarios with the exact failing step and backend code instead of a generic support message.
+- Migrates legacy browser flags to schema v2 defaults and makes the persistent POLARIS profile registry authoritative.
+- Corrects the UE Manager persistence description.
+
 ## 0.6.3 — 2026-10-28 (patch)
 
 - Use the persistent POLARIS UE registry as the inventory whenever provisioning is enabled, so a

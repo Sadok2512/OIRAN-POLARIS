@@ -20,6 +20,7 @@ import { ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
 import { ConfirmDialog } from '@/ui/ConfirmDialog';
 import {
   useAuth,
+  useCapabilities,
   useStartScenario,
   useStartUe,
   useStopScenario,
@@ -29,7 +30,11 @@ import {
 } from '@/data/queries';
 import { useAssignments } from '@/scenarios/store';
 import { useScenarioLibrary } from '@/scenarios/library';
-import { certifiedProfileFor, type Scenario } from '@/scenarios/model';
+import {
+  certifiedProfileFor,
+  scenarioExecutionCompatibility,
+  type Scenario,
+} from '@/scenarios/model';
 import type { UeState } from '@/data/polarisTypes';
 import {
   parseCsv,
@@ -72,6 +77,7 @@ interface MergedRow {
 
 export function UeManagerPage() {
   const auth = useAuth();
+  const capabilities = useCapabilities();
   const uesQuery = useUes();
   const library = useScenarioLibrary();
   const assignments = useAssignments();
@@ -170,6 +176,23 @@ export function UeManagerPage() {
     () => new Map(library.scenarios.map((scenario) => [scenario.id, scenario])),
     [library.scenarios],
   );
+  const scenarioCompatibility = useMemo(() => {
+    const executable =
+      capabilities.data?.executable_scenario_step_types ??
+      capabilities.data?.scenario_step_kinds;
+    const unavailable = capabilities.data?.unavailable_scenario_step_types;
+    return new Map(
+      library.scenarios.map((scenario) => [
+        scenario.id,
+        scenarioExecutionCompatibility(scenario, executable, unavailable),
+      ]),
+    );
+  }, [
+    capabilities.data?.executable_scenario_step_types,
+    capabilities.data?.scenario_step_kinds,
+    capabilities.data?.unavailable_scenario_step_types,
+    library.scenarios,
+  ]);
 
   const ownerOptions = useMemo(() => uniqueSorted(profiles.map((profile) => profile.owner)), [profiles]);
   const gnbOptions = useMemo(
@@ -493,7 +516,7 @@ export function UeManagerPage() {
       <PageHeader
         eyebrow="Operations"
         title="UE Profile Manager"
-        description="Operator-authored UE profiles reconciled with the POLARIS backend inventory. Profiles persist in the browser until a backend CRUD contract is available; backend state (registration, PDU, UE IP, traffic) is read live from POLARIS."
+        description="Operator-authored UE profiles and scenario assignments persist in the POLARIS registry; runtime state (Registration, PDU, UE IP and traffic) is observed independently."
         actions={
           <div className="flex items-center gap-2">
             <StatusIndicator
@@ -749,6 +772,9 @@ export function UeManagerPage() {
               const assignment = assignmentByUe.get(row.profile.id);
               const scenario = assignment ? scenarioById.get(assignment.scenarioId) : undefined;
               const profile = scenario ? certifiedProfileFor(scenario) : null;
+              const compatibility = scenario
+                ? scenarioCompatibility.get(scenario.id) ?? { executable: false, reason: 'CAPABILITIES_UNAVAILABLE' }
+                : null;
               const isShared = row.backend ? !row.backend.controller_owned : false;
               const backendId = row.backend?.internal_ue_id ?? row.backend?.id;
               const isActiveForUe =
@@ -864,16 +890,22 @@ export function UeManagerPage() {
                         data-testid={`assign-select-${row.profile.id}`}
                       >
                         <option value="">— None —</option>
-                        {library.scenarios.map((item) => (
-                          <option key={item.id} value={item.id}>
-                            {item.name} (v{item.version})
+                        {library.scenarios.map((item) => {
+                          const itemCompatibility = scenarioCompatibility.get(item.id);
+                          const reason = itemCompatibility?.executable
+                            ? null
+                            : `${itemCompatibility?.stepType ?? 'scenario'} → ${itemCompatibility?.reason ?? 'CAPABILITIES_UNAVAILABLE'}`;
+                          return (
+                          <option key={item.id} value={item.id} disabled={Boolean(reason)}>
+                            {item.name} (v{item.version}){reason ? ` — ${reason}` : ''}
                           </option>
-                        ))}
+                          );
+                        })}
                       </select>
-                      {scenario && !profile && (
+                      {scenario && compatibility && !compatibility.executable && (
                         <span className="text-ep-xs text-warning flex items-center gap-1">
                           <AlertTriangle width={10} height={10} />
-                          Backend support required.
+                          {compatibility.stepType ?? 'scenario'} → {compatibility.reason ?? 'CAPABILITIES_UNAVAILABLE'}
                         </span>
                       )}
                     </div>
@@ -944,15 +976,17 @@ export function UeManagerPage() {
                           isShared ||
                           notProvisioned ||
                           !scenario ||
-                          !profile
+                          (scenarioBackend ? !compatibility?.executable : !profile)
                         }
                         title={
                           notProvisioned
                             ? 'Not provisioned on backend'
                             : !scenario
                               ? 'No scenario assigned'
-                              : !profile
-                                ? 'Backend support required'
+                              : scenarioBackend && !compatibility?.executable
+                                ? `${compatibility?.stepType ?? 'scenario'} → ${compatibility?.reason ?? 'CAPABILITIES_UNAVAILABLE'}`
+                                : !scenarioBackend && !profile
+                                  ? 'SCENARIO_SHAPE_NOT_CERTIFIED'
                                 : undefined
                         }
                         data-testid={`ue-run-${row.profile.id}`}
@@ -1149,6 +1183,7 @@ export function UeManagerPage() {
         open={assignOpen}
         selectedCount={selected.size}
         scenarios={library.scenarios}
+        compatibility={scenarioCompatibility}
         onCancel={() => setAssignOpen(false)}
         onSubmit={handleAssign}
       />

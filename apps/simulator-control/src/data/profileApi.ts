@@ -135,6 +135,17 @@ export function updateUeProfile(ueId: string, body: WireUeProfileMutation) {
   });
 }
 
+/** Scenario-only mutation. It never resubmits protected subscriber or network fields. */
+export function assignUeProfileScenario(
+  ueId: string,
+  body: { scenario_id: string | null; auto_run_scenario: boolean },
+) {
+  return polarisApi<WireUeProfile>(`/ue-profiles/${encodeURIComponent(ueId)}/scenario`, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  });
+}
+
 export function deleteUeProfile(ueId: string) {
   return polarisApi<{ deleted: string; profile_secret_deleted: boolean }>(
     `/ue-profiles/${encodeURIComponent(ueId)}`,

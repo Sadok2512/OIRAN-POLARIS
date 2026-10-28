@@ -5,6 +5,7 @@ import {
   newStepId,
   sampleLoopCount,
   sampleParam,
+  scenarioExecutionCompatibility,
   validateScenario,
   type Scenario,
   type ScenarioStep,
@@ -39,6 +40,33 @@ describe('sampleParam', () => {
   it('samples a float when bounds are not both integers', () => {
     const result = sampleParam({ mode: 'random', min: 0, max: 1.5 }, () => 0.5);
     expect(result).toBeCloseTo(0.75);
+  });
+});
+
+describe('scenarioExecutionCompatibility', () => {
+  it('reports the exact blocked nested step and backend code', () => {
+    const nested = makeStep('REPEAT');
+    nested.steps = [makeStep('TRAFFIC_DL')];
+    const result = scenarioExecutionCompatibility(
+      scenario({ steps: [nested] }),
+      ['repeat', 'traffic_ul'],
+      [{ type: 'traffic_dl', reason: 'DL_SENDER_NOT_AVAILABLE' }],
+    );
+    expect(result).toEqual({
+      executable: false,
+      stepType: 'traffic_dl',
+      reason: 'DL_SENDER_NOT_AVAILABLE',
+    });
+  });
+
+  it('accepts only scenarios whose complete step tree is executable', () => {
+    expect(
+      scenarioExecutionCompatibility(
+        scenario({ steps: [makeStep('UE_START'), makeStep('WAIT'), makeStep('UE_STOP')] }),
+        ['ue_start', 'wait', 'ue_stop'],
+        [],
+      ),
+    ).toEqual({ executable: true });
   });
 });
 

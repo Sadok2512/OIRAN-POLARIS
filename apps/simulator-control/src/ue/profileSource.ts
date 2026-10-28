@@ -9,6 +9,7 @@ import { useMemo } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useFeatureFlag } from '@/data/featureFlags';
 import {
+  assignUeProfileScenario,
   bulkCreateUeProfiles,
   cloneUeProfile,
   createProvisionedUeProfile,
@@ -17,7 +18,6 @@ import {
   fetchAllUeProfiles,
   fetchGnbs,
   fetchProvisioningSlots,
-  mutationFromRecord,
   updateUeProfile,
   validateUeProvisioning,
   type WireBulkProfileInput,
@@ -149,13 +149,10 @@ export function useBackendProfiles(): BackendProfileSource {
               continue;
             }
             try {
-              await updateUeProfile(
-                id,
-                mutationFromRecord(record, {
-                  scenario_id: scenarioId,
-                  auto_run_scenario: scenarioId ? autoRun : false,
-                }),
-              );
+              await assignUeProfileScenario(id, {
+                scenario_id: scenarioId,
+                auto_run_scenario: scenarioId ? autoRun : false,
+              });
             } catch (error) {
               failures.push(`${id}: ${(error as { code?: string }).code ?? (error as Error).message}`);
             }

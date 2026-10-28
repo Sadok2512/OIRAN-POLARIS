@@ -9,7 +9,9 @@
 
 import { useCallback, useSyncExternalStore } from 'react';
 
-const FLAGS_KEY = 'polaris.featureFlags.v1';
+const FLAGS_KEY = 'polaris.featureFlags.v2';
+const LEGACY_FLAGS_KEY = 'polaris.featureFlags.v1';
+const FLAGS_SCHEMA_VERSION = 2;
 
 export interface FeatureFlags {
   /**
@@ -64,7 +66,7 @@ export interface FeatureFlags {
 // "offline draft" and reminds them that nothing will reach the backend.
 const DEFAULTS: FeatureFlags = {
   scenarioBackend: true,
-  profileBackend: false,
+  profileBackend: true,
   scenarioTemplates: true,
   polarisProvisioning: true,
 };
@@ -73,9 +75,24 @@ function read(): FeatureFlags {
   if (typeof localStorage === 'undefined') return DEFAULTS;
   try {
     const raw = localStorage.getItem(FLAGS_KEY);
-    if (!raw) return DEFAULTS;
-    const parsed = JSON.parse(raw) as Partial<FeatureFlags>;
-    return { ...DEFAULTS, ...parsed };
+    if (raw) {
+      const parsed = JSON.parse(raw) as { schemaVersion?: number; flags?: Partial<FeatureFlags> };
+      if (parsed.schemaVersion === FLAGS_SCHEMA_VERSION && parsed.flags) {
+        return { ...DEFAULTS, ...parsed.flags };
+      }
+    }
+    const legacyRaw = localStorage.getItem(LEGACY_FLAGS_KEY);
+    if (!legacyRaw) return DEFAULTS;
+    const legacy = JSON.parse(legacyRaw) as Partial<FeatureFlags>;
+    const migrated = {
+      ...DEFAULTS,
+      ...legacy,
+      // Provisioning is backed by the persistent profile registry; the old local profile source
+      // must not remain authoritative after migration.
+      profileBackend: legacy.polarisProvisioning === false ? (legacy.profileBackend ?? true) : true,
+    };
+    write(migrated);
+    return migrated;
   } catch {
     return DEFAULTS;
   }
@@ -83,7 +100,10 @@ function read(): FeatureFlags {
 
 function write(flags: FeatureFlags): void {
   if (typeof localStorage === 'undefined') return;
-  localStorage.setItem(FLAGS_KEY, JSON.stringify(flags));
+  localStorage.setItem(
+    FLAGS_KEY,
+    JSON.stringify({ schemaVersion: FLAGS_SCHEMA_VERSION, flags }),
+  );
 }
 
 type Listener = () => void;
@@ -132,6 +152,13 @@ export function useFeatureFlag<K extends keyof FeatureFlags>(key: K): FeatureFla
 
 /* Test helpers. */
 export function _resetFlags(): void {
-  if (typeof localStorage !== 'undefined') localStorage.removeItem(FLAGS_KEY);
+  if (typeof localStorage !== 'undefined') {
+    localStorage.removeItem(FLAGS_KEY);
+    localStorage.removeItem(LEGACY_FLAGS_KEY);
+  }
+  notify();
+}
+
+export function _reloadFlags(): void {
   notify();
 }

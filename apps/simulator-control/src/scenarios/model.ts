@@ -241,6 +241,37 @@ export function isStepKindExecutable(
   return advertisedWireTypes.includes(wire);
 }
 
+export interface ScenarioExecutionCompatibility {
+  executable: boolean;
+  stepType?: string;
+  reason?: string;
+}
+
+/** Returns the first evidence-backed backend incompatibility, including nested repeat steps. */
+export function scenarioExecutionCompatibility(
+  scenario: Scenario,
+  executableWireTypes: readonly string[] | undefined,
+  unavailable: readonly { type: string; reason: string }[] | undefined,
+): ScenarioExecutionCompatibility {
+  const blocked = new Map((unavailable ?? []).map((item) => [item.type, item.reason]));
+  const inspect = (steps: readonly ScenarioStep[]): ScenarioExecutionCompatibility => {
+    for (const step of steps) {
+      const wire = WIRE_STEP_TYPE[step.kind] ?? step.kind.toLowerCase();
+      const reason = blocked.get(wire);
+      if (reason) return { executable: false, stepType: wire, reason };
+      if (!isStepKindExecutable(step.kind, executableWireTypes)) {
+        return { executable: false, stepType: wire, reason: 'SCENARIO_STEP_TYPE_UNSUPPORTED' };
+      }
+      if (step.steps?.length) {
+        const nested = inspect(step.steps);
+        if (!nested.executable) return nested;
+      }
+    }
+    return { executable: true };
+  };
+  return inspect(scenario.steps);
+}
+
 export type FixedOrRandom =
   | { mode: 'fixed'; value: number }
   | { mode: 'random'; min: number; max: number };

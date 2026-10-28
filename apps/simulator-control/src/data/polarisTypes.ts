@@ -59,6 +59,11 @@ export interface Capabilities {
   scenario_step_kinds?: string[];
   /** API 0.14.0+ canonical name. */
   executable_scenario_step_types?: string[];
+  unavailable_scenario_step_types?: Array<{
+    type: string;
+    http_status: number;
+    reason: string;
+  }>;
 }
 
 /**

@@ -71,6 +71,7 @@ beforeEach(() => {
   if (typeof localStorage !== 'undefined') localStorage.clear();
   _resetFlags();
   setFlag('polarisProvisioning', false);
+  setFlag('profileBackend', false);
   _resetProfiles();
   stubFetch('operator');
 });
