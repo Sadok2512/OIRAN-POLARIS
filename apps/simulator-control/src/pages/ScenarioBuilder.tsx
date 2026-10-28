@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   AlertTriangle,
   ArrowDown,
@@ -38,11 +38,23 @@ import { ScenarioTimeline } from '@/components/ScenarioTimeline';
 export function ScenarioBuilderPage() {
   const { scenarioId } = useParams<{ scenarioId: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const library = useScenarioLibrary();
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
+  // 0.6.0 — Template Clone navigates here with `state.seedFromTemplate`
+  // carrying a decoded Scenario. The Builder consumes it ONCE on mount
+  // (so a page refresh falls back to the empty draft) and clears the id
+  // so Save creates a brand-new definition rather than updating the
+  // template.
+  const seededFromTemplate = (location.state as { seedFromTemplate?: Scenario } | null)
+    ?.seedFromTemplate;
+
   const [draft, setDraft] = useState<Scenario>(() => {
+    if (seededFromTemplate) {
+      return { ...seededFromTemplate, id: emptyScenario().id, version: 1 };
+    }
     const existing = scenarioId
       ? library.scenarios.find((item) => item.id === scenarioId)
       : null;

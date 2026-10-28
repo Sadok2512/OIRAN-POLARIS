@@ -47,12 +47,15 @@ import {
 } from '@/ue/profileStore';
 import { UeProfileFormDialog, type ProfileFormMode } from '@/ue/UeProfileForm';
 import { UeProfileBackendFormDialog } from '@/ue/UeProfileBackendForm';
+import { UeProvisioningAddDialog, type UeProvisioningAddValues } from '@/ue/UeProvisioningAddDialog';
 import { useBackendProfiles } from '@/ue/profileSource';
-import type { WireUeProfileMutation } from '@/data/profileApi';
+import { fetchGnbs, type WireGnb, type WireUeProfileMutation } from '@/data/profileApi';
 import { useFeatureFlag } from '@/data/featureFlags';
+import { useOwners } from '@/data/provisioningApi';
 import { useStartScenarioRun } from '@/data/scenarioApi';
 import { UeBulkCreateDialog } from '@/ue/UeBulkCreateDialog';
 import { AssignScenarioDialog } from '@/ue/AssignScenarioDialog';
+import { useQuery } from '@tanstack/react-query';
 
 const PAGE_SIZES = [25, 50, 100, 250] as const;
 
@@ -91,6 +94,22 @@ export function UeManagerPage() {
     mode: ProfileFormMode;
     initial?: UeProfileDraft;
   } | null>(null);
+  const polarisProvisioning = useFeatureFlag('polarisProvisioning');
+  const [provisioningAddOpen, setProvisioningAddOpen] = useState(false);
+  const [provisioningAddError, setProvisioningAddError] = useState<string | null>(null);
+  const [provisioningAddSubmitting, setProvisioningAddSubmitting] = useState(false);
+  // The gNB directory is already published by polaris-control-api 0.11.0;
+  // reuse the hook to feed the Add UE dropdown. We ping the owner directory
+  // under the polarisProvisioning flag so the hook stays off when the
+  // backend branch is not yet deployed.
+  const gnbList = useQuery({
+    queryKey: ['polaris', 'gnbs'],
+    queryFn: fetchGnbs,
+    enabled: polarisProvisioning,
+    retry: false,
+    staleTime: 60_000,
+  });
+  const ownerList = useOwners();
   const [bulkOpen, setBulkOpen] = useState(false);
   const [assignOpen, setAssignOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string[] | null>(null);
@@ -187,6 +206,41 @@ export function UeManagerPage() {
   const activeJob = runtime.data?.active_job;
 
   /* ----------------------------- Mutators ------------------------------ */
+
+  // 0.6.0 — polarisProvisioning Add UE flow. The backend owns PLMN /
+  // DNN / S-NSSAI resolution from the operator-chosen owner + gNB; the
+  // UI sends the minimal body and renders the resolved values from the
+  // response. The IMSI leaves this function as a `supi` field and is
+  // never kept after the awaited mutation returns.
+  async function submitProvisioningAdd(values: UeProvisioningAddValues) {
+    setProvisioningAddError(null);
+    setProvisioningAddSubmitting(true);
+    try {
+      const body: WireUeProfileMutation = {
+        ue_id: '',
+        name: values.name,
+        supi: values.imsi,
+        authentication_key: null,
+        opc: null,
+        plmn_mcc: '',
+        plmn_mnc: '',
+        dnn: '',
+        sst: 1,
+        sd: null,
+        serving_gnb: values.serving_gnb,
+        scenario_id: null,
+        auto_run_scenario: false,
+      };
+      await backendProfiles.create(body);
+      setProvisioningAddOpen(false);
+      setFeedback(`UE ${values.name} created on POLARIS (owner: ${values.owner}).`);
+    } catch (error) {
+      const code = (error as { code?: string }).code ?? 'UE_CREATE_FAILED';
+      setProvisioningAddError(`${code} · ${(error as Error).message}`);
+    } finally {
+      setProvisioningAddSubmitting(false);
+    }
+  }
 
   async function submitBackend(body: WireUeProfileMutation, mode: ProfileFormMode) {
     if (mode === 'create') {
@@ -529,7 +583,11 @@ export function UeManagerPage() {
           <button
             type="button"
             className="ep-button ep-button-sm ep-button-primary"
-            onClick={() => setFormState({ mode: 'create' })}
+            onClick={() =>
+              polarisProvisioning
+                ? setProvisioningAddOpen(true)
+                : setFormState({ mode: 'create' })
+            }
             disabled={!canOperate}
             data-testid="ue-add"
           >
@@ -1002,6 +1060,29 @@ export function UeManagerPage() {
       )}
 
       {/* Dialogs */}
+      <UeProvisioningAddDialog
+        open={polarisProvisioning && provisioningAddOpen}
+        onClose={() => {
+          setProvisioningAddOpen(false);
+          setProvisioningAddError(null);
+        }}
+        onSubmit={submitProvisioningAdd}
+        gnbs={(gnbList.data?.items ?? []) as WireGnb[]}
+        owners={ownerList.data?.items ?? []}
+        gnbsLoading={gnbList.isLoading}
+        ownersLoading={ownerList.isLoading}
+        gnbsError={
+          gnbList.isError ? `GNBs backend pending · ${(gnbList.error as Error).message}` : null
+        }
+        ownersError={
+          ownerList.isError
+            ? `Owners backend pending · ${(ownerList.error as Error).message}`
+            : null
+        }
+        submitting={provisioningAddSubmitting}
+        submitError={provisioningAddError}
+      />
+
       <UeProfileBackendFormDialog
         mode={formState?.mode ?? 'create'}
         open={profileBackend && formState != null}
@@ -1014,18 +1095,23 @@ export function UeManagerPage() {
         onSubmit={submitBackend}
       />
 
-      <UeProfileFormDialog
-        mode={formState?.mode ?? 'create'}
-        initial={formState?.initial}
-        open={!profileBackend && formState != null}
-        onCancel={() => setFormState(null)}
-        onSubmit={async (draft) => {
-          if (!formState) return;
-          if (formState.mode === 'create') await submitCreate(draft);
-          else if (formState.mode === 'edit') await submitEdit(draft);
-          else await submitClone(draft);
-        }}
-      />
+      {/* 0.6.0 — the local-draft form stays mounted only when polarisProvisioning
+          is OFF. The LOT requires it to disappear entirely in the new UX; profileBackend
+          then becomes the only path. */}
+      {!polarisProvisioning && (
+        <UeProfileFormDialog
+          mode={formState?.mode ?? 'create'}
+          initial={formState?.initial}
+          open={!profileBackend && formState != null}
+          onCancel={() => setFormState(null)}
+          onSubmit={async (draft) => {
+            if (!formState) return;
+            if (formState.mode === 'create') await submitCreate(draft);
+            else if (formState.mode === 'edit') await submitEdit(draft);
+            else await submitClone(draft);
+          }}
+        />
+      )}
 
       <UeBulkCreateDialog
         open={bulkOpen}
