@@ -160,8 +160,11 @@ export function ScenarioBuilderPage() {
     }));
   }
 
-  const backendBlocked =
-    library.backend && (!isLoopRepresentable(draft.loop.kind) || hasLockedStep);
+  // Catalog persistence and live execution are separate contracts. The
+  // backend accepts definitions containing currently locked step kinds
+  // (notably the read-only IMS/traffic templates), while /scenarios/start
+  // still refuses them until the matching capability is certified.
+  const backendBlocked = library.backend && !isLoopRepresentable(draft.loop.kind);
 
   async function save() {
     if (errors.length > 0 || backendBlocked || saving) return;
@@ -205,9 +208,7 @@ export function ScenarioBuilderPage() {
               title={
                 errors.length > 0
                   ? 'Fix validation errors first'
-                  : library.backend && hasLockedStep
-                    ? 'Remove the non-certified step(s) before saving to the backend'
-                    : library.backend && !isLoopRepresentable(draft.loop.kind)
+                  : library.backend && !isLoopRepresentable(draft.loop.kind)
                       ? 'This loop mode cannot be saved to the backend catalog'
                       : undefined
               }
@@ -334,9 +335,9 @@ export function ScenarioBuilderPage() {
           >
             <AlertTriangle width={14} height={14} className="mt-0.5 shrink-0" aria-hidden="true" />
             <span>
-              This draft contains a step the backend will refuse. Remove it, or switch to
-              <strong> Offline draft </strong> in Settings. Save is blocked until the draft only
-              contains backend-certified steps.
+              This definition contains a step that is not currently executable. It may be saved
+              in the catalog, but live execution remains locked until the backend advertises the
+              required capability.
             </span>
           </div>
         )}
