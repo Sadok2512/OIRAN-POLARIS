@@ -16,10 +16,12 @@ import { PageHeader } from '@/ui/PageHeader';
 import { EmptyState } from '@/ui/EmptyErrorLoading';
 import { useScenarioLibrary } from '@/scenarios/library';
 import { isLoopRepresentable } from '@/scenarios/wireCodec';
+import { useCapabilities } from '@/data/queries';
 import {
   PARAM_META,
   STEP_METADATA,
   emptyScenario,
+  isStepKindExecutable,
   newStepId,
   validateScenario,
   type FixedOrRandom,
@@ -56,22 +58,27 @@ export function ScenarioBuilderPage() {
   const issues = useMemo(() => validateScenario(draft), [draft]);
   const errors = issues.filter((issue) => issue.level === 'error');
 
-  // Honest palette: only backend-certified kinds are clickable in backend mode.
-  // In offline-draft mode we keep every kind clickable but still render them
-  // in the "Not supported yet" group so the operator sees the backend reason.
+  // 0.5.2 — The three new-contract kinds (TRAFFIC_UL, DETACH, REPEAT) are
+  // metadata-flagged `backendCertified: false` until the backend advertises
+  // them. `GET /capabilities.scenario_step_kinds` is the single source of
+  // truth: when it names a wire type, the matching kind is promoted to
+  // "Supported" without touching STEP_METADATA.
+  const capabilities = useCapabilities();
+  const advertisedKinds = capabilities.data?.scenario_step_kinds;
+
   const paletteGroups = useMemo(() => {
     const supported: ScenarioStepKind[] = [];
     const locked: ScenarioStepKind[] = [];
     for (const kind of Object.keys(STEP_METADATA) as ScenarioStepKind[]) {
-      if (STEP_METADATA[kind].backendCertified) supported.push(kind);
+      if (isStepKindExecutable(kind, advertisedKinds)) supported.push(kind);
       else locked.push(kind);
     }
     return { supported, locked };
-  }, []);
+  }, [advertisedKinds]);
 
   const hasLockedStep = useMemo(
-    () => draft.steps.some((step) => !STEP_METADATA[step.kind].backendCertified),
-    [draft.steps],
+    () => draft.steps.some((step) => !isStepKindExecutable(step.kind, advertisedKinds)),
+    [draft.steps, advertisedKinds],
   );
 
   function updateDraft(update: Partial<Scenario>) {

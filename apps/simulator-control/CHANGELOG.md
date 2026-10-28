@@ -3,6 +3,40 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.5.2 — 2026-10-28 (patch)
+
+Honesty follow-up on the Scenario Builder palette: `TRAFFIC_UL`, `DETACH`
+and `REPEAT` are NOT executed by the production backend today. 0.5.1
+incorrectly offered them as clickable because scenario-definition v2 was
+assumed landed on `polaris-control-api`. It is not.
+
+### Changed
+
+- **`STEP_METADATA` demotion**: `TRAFFIC_UL`, `DETACH`, `REPEAT` move from
+  `backendCertified: true` to `backendCertified: false`. Each now carries
+  the exact reason **"Backend pending: feat/polaris-traffic-templates."**.
+  Pre-0.5.2 whitelist of clickable chips is now: `UE_START`,
+  `PDU_ESTABLISH`, `UDP_TRAFFIC`, `IDLE`, `PDU_RELEASE`, `UE_STOP` — **6
+  chips**.
+- **Capabilities-driven promotion**: `Capabilities` gains an optional
+  `scenario_step_kinds?: string[]`. When `GET /capabilities` lists a wire
+  type (e.g. `"traffic_ul"`), the Builder promotes that kind back to
+  "Supported" automatically — without touching `STEP_METADATA`. The
+  single source of truth for "the backend will execute this step" is the
+  capabilities payload, not a frontend constant.
+- **New helper** `isStepKindExecutable(kind, advertisedWireTypes)` in
+  `src/scenarios/model.ts` centralises the OR between the metadata flag
+  and the advertised wire-type list, so ScenarioBuilder, Save guard and
+  banner all answer the same question identically.
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → **Test Files 17 passed (17) · Tests 129 passed (129)**
+  (new test covers both the 6-chip baseline and the capabilities-driven
+  promotion of `traffic_ul` / `detach` / `repeat`).
+- `npm run build` → clean, no fixture leak in `dist/`.
+
 ## 0.5.1 — 2026-10-28 (patch)
 
 Honesty pass on the Scenario Builder: `scenarioBackend` now defaults to ON,
