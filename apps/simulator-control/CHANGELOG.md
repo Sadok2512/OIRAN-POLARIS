@@ -3,6 +3,68 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.6.0 — 2026-10-28 (minor)
+
+Provisioning layer anticipating Codex's `feat/polaris-provisioning` branch
+(polaris-control-api). Everything new sits behind the
+**`polarisProvisioning`** feature flag, default **OFF**, honest "Backend
+pending" placeholders when the backend returns 404. Three commits
+compose this release:
+
+### Added
+
+- **Flag `polarisProvisioning`** (default OFF). When ON, the UI consumes
+  `/owners`, `/plmns`, `/dnns`, `/subscribers`, `/ue-profiles/import`,
+  `/provisioning/import` and `/ue-profiles/:id`. `profileBackend` is
+  forced ON (the local UE form path is unmounted).
+- **Templates "Clone"** no longer POSTs the backend clone route. It
+  decodes the template into a `Scenario` and navigates to
+  `/scenarios/new` with `location.state.seedFromTemplate`. The Builder
+  consumes the seed, clears the id/version so Save creates a new
+  definition; `tpl-*` stay read-only.
+- **Add UE dialog** (`UeProvisioningAddDialog`) exposes four fields —
+  Name, gNB, Owner, Note, masked IMSI. IMSI is a password input,
+  cleared from component state immediately after submit; the backend
+  echoes it back as `PROTECTED`.
+- **Provisioning page** (`/provisioning`): subscriber directory + CSV
+  import (≤ 100 000 rows). Sidebar entry under `PLATFORM`.
+- **Shared `CsvImportDialog`** with a streaming preview
+  (`src/data/csvImport.ts`): non-blocking chunked read (1 MiB blocks,
+  yielding to the event loop between chunks), local cap at
+  `CSV_IMPORT_MAX_LINES = 100 000`, per-line backend error report
+  rendered as a scrollable table (code column + message). Used by
+  Provisioning AND the UE Manager (Import CSV button swaps to the
+  backend dialog under the flag).
+- **UE detail page** (`/ues/:ueId`) with eight structured blocks —
+  Identity, Provisioning, Network profile, Registration, PDU sessions,
+  IMS, Scenario, Traffic. IMSI/authentication display as `PROTECTED`
+  (with a lock icon). Links from UE Manager rows when the flag is ON.
+- **Dropdowns**: `/owners`, `/plmns`, `/dnns`, `/gnbs` and
+  `/scenario-definitions` back every write path. Free-text input is
+  gone from the create-time surface; dropdowns show "Backend pending"
+  when their directory is empty or 404.
+- **Playwright minimal setup**: `playwright.config.ts` with two
+  projects (`chromium-light`, `chromium-dark`), `e2e/captures.spec.ts`
+  with `page.route`-mocked POLARIS, screenshots for Templates /
+  UE Manager / Provisioning / UE detail land in
+  `docs/screenshots/v0.6.0/*.{chromium-light,chromium-dark}.png`.
+  Captures are tagged as "mocked API" in `docs/screenshots/v0.6.0/README.md`.
+
+### Benchmarks
+
+- **CSV preview — 100 000 rows parsed in ~211 ms** (jsdom, see
+  `src/data/csvImport.test.ts` stdout). A `setTimeout(…, 0)` sentinel
+  task fires during the parse — proof the main thread yields and the
+  UI stays responsive without a Web Worker.
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → **Test Files 22 passed (22) · Tests 144 passed (144)**
+- `npm run build` → clean
+- Playwright captures: run `npm run e2e` after
+  `npm install @playwright/test@1.57.0` (added to `devDependencies`).
+
 ## 0.5.2 — 2026-10-28 (patch)
 
 Honesty follow-up on the Scenario Builder palette: `TRAFFIC_UL`, `DETACH`

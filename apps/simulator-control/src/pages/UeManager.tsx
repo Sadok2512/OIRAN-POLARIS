@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   AlertTriangle,
   ChevronLeft,
@@ -790,7 +791,17 @@ export function UeManagerPage() {
                   </td>
                   <td>
                     <div className="flex flex-col">
-                      <span className="font-medium mono">{row.profile.id}</span>
+                      {polarisProvisioning ? (
+                        <Link
+                          to={`/ues/${encodeURIComponent(row.profile.id)}`}
+                          className="font-medium mono text-primary hover:underline"
+                          data-testid={`ue-detail-link-${row.profile.id}`}
+                        >
+                          {row.profile.id}
+                        </Link>
+                      ) : (
+                        <span className="font-medium mono">{row.profile.id}</span>
+                      )}
                       {row.backend?.internal_ue_id && (
                         <span className="text-text-secondary text-ep-xs mono truncate">
                           {row.backend.internal_ue_id}
