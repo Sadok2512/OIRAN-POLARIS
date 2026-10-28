@@ -168,7 +168,7 @@ export function SettingsPage() {
             <dd>localStorage (polaris.scenarios.v1 / polaris.assignments.v1)</dd>
             <dt className="text-text-secondary">Server-side CRUD</dt>
             <dd>
-              polaris-control-api 0.9.0:{' '}
+              polaris-control-api 0.10.0+:{' '}
               <code className="mono">/scenario-definitions</code> (flag-gated)
             </dd>
           </dl>
@@ -183,13 +183,31 @@ export function SettingsPage() {
               data-testid="flag-scenario-backend-toggle"
             />
             <span>
-              <span className="font-medium">Use backend scenario catalog (0.9.0)</span>
+              <span className="font-medium">Use backend scenario catalog</span>
               <span className="block text-ep-xs text-text-secondary">
-                When enabled, the Scenario Builder and Execution Monitor call
+                When enabled, the Scenario Library, Builder and Execution Monitor use
                 <code className="mono"> /scenario-definitions </code> and
                 <code className="mono"> /scenarios/:job_id/steps </code> instead of the local
-                catalog. Default off: polaris.scenarios.v1 stays authoritative until Codex
-                pushes the backend branch.
+                catalog. Only integer loops (1–10 000) can be saved.
+              </span>
+            </span>
+          </label>
+          <label
+            className="flex items-start gap-2 text-ep-sm mt-3 border-t border-border pt-3"
+            data-testid="flag-profile-backend"
+          >
+            <input
+              type="checkbox"
+              checked={flags.profileBackend}
+              onChange={(event) => setFlag('profileBackend', event.target.checked)}
+              data-testid="flag-profile-backend-toggle"
+            />
+            <span>
+              <span className="font-medium">Use POLARIS UE profile registry</span>
+              <span className="block text-ep-xs text-text-secondary">
+                When enabled, the UE Manager creates, edits, clones, deletes and assigns profiles through
+                <code className="mono"> /ue-profiles </code>. SUPI, K and OPc are write-only and never
+                stored in this browser. Local profiles (polaris.ueProfiles.v1) are not migrated.
               </span>
             </span>
           </label>

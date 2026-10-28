@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  InfiniteLoopUnsupportedError,
+  NonIntegerRandomRangeError,
+  UnsupportedLoopError,
   UnsupportedStepTypeError,
   decodeDefinition,
   decodeParam,
@@ -8,29 +9,33 @@ import {
   encodeDefinition,
   encodeParam,
   encodeStep,
+  epochSecondsToLocal,
+  isLoopRepresentable,
   type WireScenarioDefinition,
   type WireScenarioStep,
 } from './wireCodec';
-import { emptyScenario, newStepId } from './model';
+import { emptyScenario, newStepId, type Scenario } from './model';
 
-describe('wireCodec — parameter shape', () => {
-  it('encodes a fixed value as a bare number', () => {
-    expect(encodeParam({ mode: 'fixed', value: 100 })).toBe(100);
+describe('wireCodec — parameter shape (scenario_definitions.rs ParameterSpec)', () => {
+  it('encodes a fixed value as {"fixed": value} — a bare number is rejected by the backend', () => {
+    expect(encodeParam('duration_s', { mode: 'fixed', value: 5 })).toEqual({ fixed: 5 });
   });
 
-  it('encodes random as { random: { min, max } } — contract example', () => {
-    // Example from the contract: "duration_ms": {"random":{"min":10,"max":20}}
-    expect(encodeParam({ mode: 'random', min: 10, max: 20 })).toEqual({
+  it('encodes random as {"random":{"min","max"}} with integer bounds', () => {
+    expect(encodeParam('duration_s', { mode: 'random', min: 10, max: 20 })).toEqual({
       random: { min: 10, max: 20 },
     });
   });
 
-  it('round-trips both modes', () => {
-    expect(decodeParam(encodeParam({ mode: 'fixed', value: 42 }))).toEqual({
-      mode: 'fixed',
-      value: 42,
-    });
-    expect(decodeParam(encodeParam({ mode: 'random', min: 1, max: 7 }))).toEqual({
+  it('refuses non-integer random bounds (backend RandomRange is i64)', () => {
+    expect(() => encodeParam('duration_s', { mode: 'random', min: 1.5, max: 3 })).toThrow(
+      NonIntegerRandomRangeError,
+    );
+  });
+
+  it('decodes {"fixed"} and {"random"} and round-trips both modes', () => {
+    expect(decodeParam({ fixed: 5 })).toEqual({ mode: 'fixed', value: 5 });
+    expect(decodeParam(encodeParam('p', { mode: 'random', min: 1, max: 7 }))).toEqual({
       mode: 'random',
       min: 1,
       max: 7,
@@ -48,102 +53,96 @@ describe('wireCodec — step types (6-type whitelist)', () => {
     ['IDLE', 'wait'],
   ];
 
-  it.each(certifiedPairs)(
-    'encodes %s as wire type "%s"',
-    (kind, wire) => {
-      const step = { id: newStepId(), kind: kind as never, params: {} };
-      expect(encodeStep(step, 1).type).toBe(wire);
-    },
-  );
+  it.each(certifiedPairs)('encodes %s as wire type "%s" with step loop_count 1', (kind, wire) => {
+    const step = { id: newStepId(), kind: kind as never, params: {} };
+    expect(encodeStep(step)).toEqual({ type: wire, loop_count: 1, parameters: {} });
+  });
 
   it('refuses to encode a step outside the whitelist', () => {
-    expect(() =>
-      encodeStep({ id: 's1', kind: 'REGISTER_5G', params: {} }, 1),
-    ).toThrow(UnsupportedStepTypeError);
-    expect(() =>
-      encodeStep({ id: 's2', kind: 'TCP_TRAFFIC', params: {} }, 1),
-    ).toThrow(UnsupportedStepTypeError);
+    expect(() => encodeStep({ id: 's1', kind: 'REGISTER_5G', params: {} })).toThrow(
+      UnsupportedStepTypeError,
+    );
+    expect(() => encodeStep({ id: 's2', kind: 'TCP_TRAFFIC', params: {} })).toThrow(
+      UnsupportedStepTypeError,
+    );
   });
 
   it('refuses to decode an unknown wire type', () => {
-    const wire: WireScenarioStep = {
-      type: 'tcp_traffic',
-      loop_count: 1,
-      parameters: {},
-    };
+    const wire: WireScenarioStep = { type: 'rrc_idle', loop_count: 1, parameters: {} };
     expect(() => decodeStep(wire)).toThrow(UnsupportedStepTypeError);
   });
 });
 
-describe('wireCodec — definition shape', () => {
-  it('matches the contract example {id, name, version, steps:[{type, loop_count, parameters}]}', () => {
-    const scenario = {
-      ...emptyScenario('contract-sample'),
-      version: 1,
-      steps: [
-        {
-          id: 's1',
-          kind: 'UDP_TRAFFIC' as const,
-          params: {
-            duration_s: { mode: 'random', min: 10, max: 20 } as const,
-            packet_count: { mode: 'fixed', value: 500 } as const,
-          },
-        },
-      ],
-      loop: { kind: 'ONCE' as const },
-    };
-    const wire = encodeDefinition(scenario);
-    expect(wire).toEqual({
-      id: scenario.id,
-      name: 'contract-sample',
-      version: 1,
-      steps: [
-        {
-          type: 'udp_traffic',
-          loop_count: 1,
-          parameters: {
-            duration_s: { random: { min: 10, max: 20 } },
-            packet_count: 500,
-          },
-        },
-      ],
-    });
+describe('wireCodec — scenario loop (definition loop_count)', () => {
+  function scenarioWith(loop: Scenario['loop']): Scenario {
+    const scenario = emptyScenario('loop test');
+    scenario.steps = [{ id: newStepId(), kind: 'IDLE', params: { duration_s: { mode: 'fixed', value: 5 } } }];
+    scenario.loop = loop;
+    return scenario;
+  }
+
+  it('maps ONCE → 1 and FIXED → cycles at the DEFINITION level, never on steps', () => {
+    expect(encodeDefinition(scenarioWith({ kind: 'ONCE' })).loop_count).toBe(1);
+    const fixed = encodeDefinition(scenarioWith({ kind: 'FIXED', cycles: 50 }));
+    expect(fixed.loop_count).toBe(50);
+    expect(fixed.steps.every((step) => step.loop_count === 1)).toBe(true);
   });
 
-  it('rejects INFINITE loop (positive-integer per-step contract)', () => {
-    const scenario = {
-      ...emptyScenario('infinite'),
-      steps: [{ id: 's1', kind: 'UDP_TRAFFIC' as const, params: {} }],
-      loop: { kind: 'INFINITE' as const },
-    };
-    expect(() => encodeDefinition(scenario)).toThrow(InfiniteLoopUnsupportedError);
+  it('refuses RANDOM and INFINITE loops instead of converting them silently', () => {
+    expect(() => encodeDefinition(scenarioWith({ kind: 'RANDOM', min: 1, max: 9 }))).toThrow(
+      UnsupportedLoopError,
+    );
+    expect(() => encodeDefinition(scenarioWith({ kind: 'INFINITE' }))).toThrow(UnsupportedLoopError);
+    expect(isLoopRepresentable('RANDOM')).toBe(false);
+    expect(isLoopRepresentable('INFINITE')).toBe(false);
+    expect(isLoopRepresentable('FIXED')).toBe(true);
   });
 
-  it('decodes a backend definition into the local model with ONCE fallback', () => {
-    const wire: WireScenarioDefinition = {
-      id: 'scn-be-1',
-      name: 'from-backend',
-      version: 3,
-      steps: [
-        { type: 'ue_start', loop_count: 1, parameters: {} },
-        {
-          type: 'udp_traffic',
-          loop_count: 2,
-          parameters: {
-            duration_ms: { random: { min: 10, max: 20 } },
-          },
-        },
-      ],
-    };
-    const decoded = decodeDefinition(wire);
-    expect(decoded.name).toBe('from-backend');
-    expect(decoded.version).toBe(3);
-    expect(decoded.steps[0].kind).toBe('UE_START');
-    expect(decoded.steps[1].kind).toBe('UDP_TRAFFIC');
-    expect(decoded.steps[1].params).toEqual({
-      duration_ms: { mode: 'random', min: 10, max: 20 },
+  it('refuses a FIXED loop outside 1..=10000', () => {
+    expect(() => encodeDefinition(scenarioWith({ kind: 'FIXED', cycles: 10_001 }))).toThrow(
+      UnsupportedLoopError,
+    );
+  });
+
+  it('produces exactly the mutation body the backend accepts', () => {
+    const scenario = scenarioWith({ kind: 'FIXED', cycles: 2 });
+    scenario.id = 'scenario-contract';
+    scenario.name = 'Contract scenario';
+    expect(encodeDefinition(scenario)).toEqual({
+      id: 'scenario-contract',
+      name: 'Contract scenario',
+      loop_count: 2,
+      steps: [{ type: 'wait', loop_count: 1, parameters: { duration_s: { fixed: 5 } } }],
     });
-    // scenario-level loop_count is OPEN in the contract; UI falls back to ONCE
-    expect(decoded.loop).toEqual({ kind: 'ONCE' });
+  });
+});
+
+describe('wireCodec — definition decoding (measured contract response)', () => {
+  // Response of POST /api/v1/scenario-definitions in scenario-definitions.contract.md.
+  const measured: WireScenarioDefinition = {
+    created_at_epoch_s: 1793186621,
+    id: 'scenario-contract',
+    loop_count: 2,
+    name: 'Contract scenario',
+    steps: [{ loop_count: 2, parameters: { duration_ms: { fixed: 5 } }, type: 'wait' }],
+    updated_at_epoch_s: 1793186621,
+    version: 1,
+  };
+
+  it('decodes loop_count, steps and epoch-second timestamps', () => {
+    const scenario = decodeDefinition(measured);
+    expect(scenario.loop).toEqual({ kind: 'FIXED', cycles: 2 });
+    expect(scenario.steps[0].kind).toBe('IDLE');
+    expect(scenario.createdAt).toBe(1793186621 * 1000);
+    expect(scenario.version).toBe(1);
+  });
+
+  it('decodes loop_count 1 as ONCE', () => {
+    expect(decodeDefinition({ ...measured, loop_count: 1 }).loop).toEqual({ kind: 'ONCE' });
+  });
+
+  it('formats epoch seconds, not milliseconds', () => {
+    expect(epochSecondsToLocal(1793186621)).toBe(new Date(1793186621 * 1000).toLocaleString());
+    expect(epochSecondsToLocal(null)).toBe('—');
   });
 });

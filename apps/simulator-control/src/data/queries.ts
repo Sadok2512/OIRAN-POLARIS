@@ -1,5 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api, type ApiOptions } from '@shared/api';
+import { polarisApi, writeCsrf } from './polarisClient';
+
+export { writeCsrf };
 import type {
   Capabilities,
   LabConfiguration,
@@ -17,42 +19,10 @@ import type {
   ValidationResult,
 } from './polarisTypes';
 
-const CSRF_KEY = 'polaris.csrf_token';
 
-function readCsrf(): string | null {
-  if (typeof sessionStorage === 'undefined') return null;
-  return sessionStorage.getItem(CSRF_KEY);
-}
 
-export function writeCsrf(value: string | null): void {
-  if (typeof sessionStorage === 'undefined') return;
-  if (value) sessionStorage.setItem(CSRF_KEY, value);
-  else sessionStorage.removeItem(CSRF_KEY);
-}
 
-// Every POLARIS request names the `polaris` auth scope so the shared
-// client can only attach the POLARIS token (never an OIRAN one) and only
-// to the POLARIS API base. See packages/ui/src/api.ts.
-const POLARIS_SCOPE: ApiOptions = {
-  authScope: 'polaris',
-  base: '/polaris-api/v1',
-};
 
-async function polarisApi<T>(path: string, extra: Omit<ApiOptions, 'authScope' | 'base'> = {}) {
-  const method = (extra.method ?? 'GET').toUpperCase();
-  // POLARIS enforces CSRF on write methods — attach the stored token on
-  // POST/PUT/DELETE/PATCH. The token is refreshed by /auth/login.
-  const extraHeaders = new Headers(extra.headers);
-  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-    const csrf = readCsrf();
-    if (csrf) extraHeaders.set('x-csrf-token', csrf);
-  }
-  const envelope = await api<T>(path, { ...POLARIS_SCOPE, ...extra, headers: extraHeaders });
-  // POLARIS Rust backend may return the body directly (no envelope); the
-  // shared `api()` wraps it as `{ data, meta }` so the data field is the
-  // raw payload. Return `data` for consumer ergonomics.
-  return envelope.data;
-}
 
 export function useAuth() {
   return useQuery({

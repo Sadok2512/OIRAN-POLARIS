@@ -21,10 +21,17 @@ export interface FeatureFlags {
    * /scenarios/start shape (certified-profile mapping).
    */
   scenarioBackend: boolean;
+  /**
+   * When true, UE profiles and their scenario assignment live in POLARIS
+   * (/api/v1/ue-profiles, contract 0.11.0). SUPI/K/OPc are write-only and never
+   * stored in the browser. When false, polaris.ueProfiles.v1 stays authoritative.
+   */
+  profileBackend: boolean;
 }
 
 const DEFAULTS: FeatureFlags = {
   scenarioBackend: false,
+  profileBackend: false,
 };
 
 function read(): FeatureFlags {

@@ -23,6 +23,10 @@ export interface UeProfileRecord extends UeProfileDraft {
   updatedAt: number;
   /** When true, this profile was synthesized from the backend UE inventory and never persisted. */
   derived?: boolean;
+  /** Backend mode only: Open5GS provisioning status reported by POLARIS. */
+  subscriptionStatus?: string;
+  /** Backend mode only: scenario assigned on the profile itself. */
+  scenarioId?: string | null;
 }
 
 export const MAX_PROFILES = 10_000;

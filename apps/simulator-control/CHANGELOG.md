@@ -3,6 +3,48 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.3.0 — 2026-10-28 (minor)
+
+Wired to polaris-control-api 0.11.0 (`feat/polaris-gnb-binding-and-provisioning`).
+Both backend switches stay OFF by default.
+
+### Fixed (would have broken every backend call)
+
+- **POLARIS bodies are raw JSON**, not the OIRAN `{data, meta}` envelope. Every
+  POLARIS query read `envelope.data` and therefore received `undefined` in
+  production; the test fixtures used the envelope, which hid it. New
+  `src/data/polarisClient.ts` reads the raw body (and still unwraps a real
+  `{data, meta}` envelope). `queries.ts` and `scenarioApi.ts` share it.
+- **POLARIS error codes**: `{"error":"CODE"}` is now surfaced as `ApiError.code`
+  (shared `packages/ui/src/api.ts`, backward compatible with OIRAN errors).
+- **Fixed parameters** are sent as `{"fixed": value}`; a bare number is rejected
+  by the backend (`ParameterSpec` is an untagged enum of `fixed` / `random`).
+- **Random bounds** must be integers (backend `i64`); non-integers are refused.
+- **Scenario loop** is the definition `loop_count` (scenario 0.10.0); steps get
+  `loop_count: 1`. RANDOM and INFINITE loops are refused instead of being
+  converted to `max` — the editor disables them in backend mode (V2 badge).
+- `GET /scenario-definitions` returns `{items, total, schema_version}`;
+  `GET /scenarios/:job_id/steps` returns `{job_id, scenario_definition_id, steps}`;
+  step times are epoch **seconds**; clone requires `{target_id}`.
+- Execution Monitor follows the current job (active, else latest terminal), so
+  mock-mode definition runs — which complete immediately — are visible; shows
+  scenario/step loop positions.
+
+### Added
+
+- `src/scenarios/library.ts` — `useScenarioLibrary()`: Library, Builder,
+  Console, UE Manager and Monitor use the backend catalog when
+  `scenarioBackend` is ON (create = POST on first save, update = PUT).
+- `profileBackend` flag + `src/data/profileApi.ts`, `src/ue/profileSource.ts`,
+  `src/ue/UeProfileBackendForm.tsx`: UE profiles created, edited, cloned,
+  deleted and assigned through `/ue-profiles`. Identity is write-only:
+  preferred path is a **provisioned subscriber slot** (backend reads SUPI/K/OPc
+  server-side); manual SUPI/K/OPc use password inputs and are never stored.
+  Serving gNB comes from `GET /gnbs`. Open5GS status badge per row.
+  Sanitized CSV export from the server. CSV import and bulk stay disabled in
+  backend mode (no import route; bulk UI planned for V1.1).
+- Tests on measured contract bodies: 83 → 100 (`npm test`: 11 files, 100 passed).
+
 ## 0.2.0 — 2026-10-28 (minor)
 
 Alignment on polaris-control-api 0.9.0 (commit `f676ceb`, not yet pushed to

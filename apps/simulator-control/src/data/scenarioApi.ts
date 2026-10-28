@@ -1,4 +1,4 @@
-// Typed client for polaris-control-api 0.9.0 scenario surface.
+// Typed client for polaris-control-api 0.10.0+ scenario surface.
 //
 // Routes (contract from Codex, commit f676ceb — not yet pushed to the
 // shared remote at the time of writing):
@@ -21,48 +21,25 @@
 //     but not consumed in UI (no field invented, strict read-only).
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api, type ApiOptions } from '@shared/api';
+import { polarisApi } from './polarisClient';
 import { useFeatureFlag } from './featureFlags';
 import type {
   WireScenarioDefinition,
-  WireScenarioStepStatus,
+  WireScenarioDefinitionList,
+  WireScenarioMutation,
+  WireScenarioStepsResponse,
   WireStartScenarioRequest,
 } from '@/scenarios/wireCodec';
 
-const CSRF_KEY = 'polaris.csrf_token';
 
-function readCsrf(): string | null {
-  if (typeof sessionStorage === 'undefined') return null;
-  return sessionStorage.getItem(CSRF_KEY);
-}
 
-// Same scope used by src/data/queries.ts — the shared client only
-// attaches a POLARIS token to its allowlisted base.
-const POLARIS_SCOPE: ApiOptions = {
-  authScope: 'polaris',
-  base: '/polaris-api/v1',
-};
 
-async function polarisApi<T>(
-  path: string,
-  extra: Omit<ApiOptions, 'authScope' | 'base'> = {},
-): Promise<T> {
-  const method = (extra.method ?? 'GET').toUpperCase();
-  const extraHeaders = new Headers(extra.headers);
-  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-    const csrf = readCsrf();
-    if (csrf) extraHeaders.set('x-csrf-token', csrf);
-  }
-  const envelope = await api<T>(path, { ...POLARIS_SCOPE, ...extra, headers: extraHeaders });
-  return envelope.data;
-}
 
 /* ------------------------------- Error shape ------------------------------ */
 
 /**
- * Backend error envelope. The exact JSON shape returned by 0.9.0 is still
- * being documented; the UI surfaces `.message` as a string so later
- * refinement does not require UI changes.
+ * POLARIS errors are `{"error":"CODE"}`. The shared client turns them into an
+ * ApiError whose `.code` carries CODE (see polarisClient.ts).
  */
 export interface ScenarioApiError {
   code: string;
@@ -75,7 +52,8 @@ export function useScenarioDefinitions() {
   const enabled = useFeatureFlag('scenarioBackend');
   return useQuery({
     queryKey: ['polaris', 'scenario-definitions'],
-    queryFn: () => polarisApi<WireScenarioDefinition[]>('/scenario-definitions'),
+    // Real body: { items, total, schema_version } — not a bare array.
+    queryFn: () => polarisApi<WireScenarioDefinitionList>('/scenario-definitions'),
     enabled,
     refetchInterval: enabled ? 10_000 : false,
   });
@@ -95,7 +73,8 @@ export function useScenarioSteps(jobId: string | null) {
   return useQuery({
     queryKey: ['polaris', 'scenario-steps', jobId],
     queryFn: () =>
-      polarisApi<WireScenarioStepStatus[]>(`/scenarios/${jobId}/steps`),
+      // Real body: { job_id, scenario_definition_id, steps: [...] }.
+      polarisApi<WireScenarioStepsResponse>(`/scenarios/${jobId}/steps`),
     enabled,
     refetchInterval: enabled ? 2_000 : false,
   });
@@ -106,7 +85,7 @@ export function useScenarioSteps(jobId: string | null) {
 export function useCreateScenarioDefinition() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (body: WireScenarioDefinition) =>
+    mutationFn: (body: WireScenarioMutation) =>
       polarisApi<WireScenarioDefinition>('/scenario-definitions', {
         method: 'POST',
         body: JSON.stringify(body),
@@ -120,8 +99,8 @@ export function useCreateScenarioDefinition() {
 export function useUpdateScenarioDefinition() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, body }: { id: string; body: WireScenarioDefinition }) =>
-      // Contract 0.9.0 registers PUT (not PATCH) on /scenario-definitions/:id.
+    mutationFn: ({ id, body }: { id: string; body: WireScenarioMutation }) =>
+      // The router registers PUT (not PATCH) on /scenario-definitions/:id.
       polarisApi<WireScenarioDefinition>(`/scenario-definitions/${id}`, {
         method: 'PUT',
         body: JSON.stringify(body),
@@ -139,7 +118,7 @@ export function useDeleteScenarioDefinition() {
   const client = useQueryClient();
   return useMutation({
     mutationFn: (id: string) =>
-      polarisApi<unknown>(`/scenario-definitions/${id}`, { method: 'DELETE' }),
+      polarisApi<{ deleted: string }>(`/scenario-definitions/${id}`, { method: 'DELETE' }),
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: ['polaris', 'scenario-definitions'] });
     },
@@ -149,10 +128,11 @@ export function useDeleteScenarioDefinition() {
 export function useCloneScenarioDefinition() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) =>
+    // The backend requires the new definition id: { "target_id": "..." }.
+    mutationFn: ({ id, targetId }: { id: string; targetId: string }) =>
       polarisApi<WireScenarioDefinition>(`/scenario-definitions/${id}/clone`, {
         method: 'POST',
-        body: '{}',
+        body: JSON.stringify({ target_id: targetId }),
       }),
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: ['polaris', 'scenario-definitions'] });
@@ -164,7 +144,7 @@ export function useStartScenarioRun() {
   const client = useQueryClient();
   return useMutation({
     mutationFn: (body: WireStartScenarioRequest) =>
-      polarisApi<{ job_id: string }>('/scenarios/start', {
+      polarisApi<{ job_id: string; state: string; terminal_result?: string }>('/scenarios/start', {
         method: 'POST',
         body: JSON.stringify(body),
       }),

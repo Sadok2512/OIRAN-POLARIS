@@ -13,7 +13,8 @@ import {
 } from 'lucide-react';
 import { PageHeader } from '@/ui/PageHeader';
 import { EmptyState } from '@/ui/EmptyErrorLoading';
-import { useScenarios } from '@/scenarios/store';
+import { useScenarioLibrary } from '@/scenarios/library';
+import { isLoopRepresentable } from '@/scenarios/wireCodec';
 import {
   PARAM_META,
   STEP_METADATA,
@@ -34,7 +35,9 @@ import { ScenarioTimeline } from '@/components/ScenarioTimeline';
 export function ScenarioBuilderPage() {
   const { scenarioId } = useParams<{ scenarioId: string }>();
   const navigate = useNavigate();
-  const library = useScenarios();
+  const library = useScenarioLibrary();
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   const [draft, setDraft] = useState<Scenario>(() => {
     const existing = scenarioId
@@ -119,11 +122,22 @@ export function ScenarioBuilderPage() {
     }));
   }
 
-  function save() {
-    if (errors.length > 0) return;
-    const saved = library.save(draft);
-    setDraft(saved);
-    navigate(`/scenarios/${saved.id}/edit`, { replace: true });
+  const backendBlocked = library.backend && !isLoopRepresentable(draft.loop.kind);
+
+  async function save() {
+    if (errors.length > 0 || backendBlocked || saving) return;
+    setSaveError(null);
+    setSaving(true);
+    try {
+      const saved = await library.save(draft);
+      setDraft(saved);
+      navigate(`/scenarios/${saved.id}/edit`, { replace: true });
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      setSaveError(code ? `${code} — ${(error as Error).message}` : (error as Error).message);
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -146,17 +160,34 @@ export function ScenarioBuilderPage() {
             <button
               type="button"
               className="ep-button ep-button-primary"
-              onClick={save}
-              disabled={errors.length > 0}
+              onClick={() => void save()}
+              disabled={errors.length > 0 || backendBlocked || saving}
               data-testid="builder-save"
-              title={errors.length > 0 ? 'Fix validation errors first' : undefined}
+              title={
+                errors.length > 0
+                  ? 'Fix validation errors first'
+                  : backendBlocked
+                    ? 'This loop mode cannot be saved to the backend catalog'
+                    : undefined
+              }
             >
               <Save width={14} height={14} aria-hidden="true" />
-              Save scenario
+              {saving ? 'Saving…' : library.backend ? 'Save to backend' : 'Save scenario'}
             </button>
           </div>
         }
       />
+
+      {saveError && (
+        <section
+          className="ep-card border-error/40 p-4 mb-4 text-ep-sm text-error flex items-start gap-2"
+          role="alert"
+          data-testid="builder-save-error"
+        >
+          <AlertTriangle width={14} height={14} className="mt-0.5 shrink-0" aria-hidden="true" />
+          <span>Save failed: {saveError}</span>
+        </section>
+      )}
 
       <section className="ep-card p-5 mb-4 grid gap-3 md:grid-cols-2">
         <label className="flex flex-col gap-1">
@@ -188,7 +219,11 @@ export function ScenarioBuilderPage() {
         <p className="text-ep-xs text-text-secondary mb-3">
           Random cycle count is sampled once per scenario run. Infinite loops require a manual Stop and server-side execution limits.
         </p>
-        <LoopEditor loop={draft.loop} onChange={(loop: LoopMode) => updateDraft({ loop })} />
+        <LoopEditor
+          loop={draft.loop}
+          onChange={(loop: LoopMode) => updateDraft({ loop })}
+          backendOnly={library.backend}
+        />
       </section>
 
       <section className="ep-card p-5 mb-4">

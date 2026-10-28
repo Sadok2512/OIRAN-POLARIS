@@ -9,18 +9,19 @@ import {
   useStopScenario,
   useTraffic,
 } from '@/data/queries';
-import { useAssignments, useScenarios } from '@/scenarios/store';
+import { useAssignments } from '@/scenarios/store';
+import { useScenarioLibrary } from '@/scenarios/library';
 import { ScenarioTimeline } from '@/components/ScenarioTimeline';
 import { count, isoToLocal } from '@/data/format';
 import { useFeatureFlag } from '@/data/featureFlags';
 import { useScenarioSteps } from '@/data/scenarioApi';
-import type { WireScenarioStepStatus } from '@/scenarios/wireCodec';
+import { epochSecondsToLocal, type WireScenarioStepStatus } from '@/scenarios/wireCodec';
 
 export function ExecutionMonitorPage() {
   const auth = useAuth();
   const runtime = useScenarioRuntime();
   const traffic = useTraffic();
-  const library = useScenarios();
+  const library = useScenarioLibrary();
   const assignments = useAssignments();
   const stopScenario = useStopScenario();
   const scenarioBackend = useFeatureFlag('scenarioBackend');
@@ -28,7 +29,9 @@ export function ExecutionMonitorPage() {
   const active = runtime.data?.active_job;
   const terminal = runtime.data?.latest_terminal_job;
   const current = active ?? terminal;
-  const steps = useScenarioSteps(scenarioBackend ? active?.job_id ?? null : null);
+  // Definition jobs may already be terminal (mock mode completes synchronously), so follow the
+  // current job — active, else latest terminal — rather than the active one only.
+  const steps = useScenarioSteps(scenarioBackend ? current?.job_id ?? null : null);
 
   const scenarioForActive = useMemo(() => {
     if (!active?.target_ue_id) return null;
@@ -163,7 +166,7 @@ export function ExecutionMonitorPage() {
             <section className="ep-card p-5 mb-4" data-testid="backend-steps">
               <header className="flex items-center justify-between mb-2 gap-2">
                 <h3 className="text-ep-md font-semibold">
-                  Step execution (polaris-control-api 0.9.0 /steps)
+                  Step execution (backend /scenarios/:job_id/steps)
                 </h3>
                 <StatusIndicator
                   state={steps.data ? 'LIVE' : steps.isLoading ? 'LOADING' : 'IDLE'}
@@ -174,19 +177,22 @@ export function ExecutionMonitorPage() {
               {steps.isLoading && !steps.data && <LoadingSkeleton label="Loading /steps" />}
               {steps.error && (
                 <p className="text-ep-xs text-error">
-                  Could not load /scenarios/{active?.job_id}/steps:{' '}
+                  Could not load /scenarios/{current?.job_id}/steps:{' '}
                   {(steps.error as Error).message}
                 </p>
               )}
-              {steps.data && steps.data.length === 0 && (
+              {steps.data && steps.data.steps.length === 0 && (
                 <p className="text-ep-xs text-text-secondary">
-                  Backend returned no step yet for job {active?.job_id ?? '—'}.
+                  Backend returned no step yet for job {current?.job_id ?? '—'}.
                 </p>
               )}
-              {steps.data && steps.data.length > 0 && (
+              {steps.data && steps.data.steps.length > 0 && (
                 <ol className="flex flex-col gap-1 text-ep-sm" data-testid="backend-steps-list">
-                  {steps.data.map((step) => (
-                    <BackendStepRow key={step.index} step={step} />
+                  {steps.data.steps.map((step) => (
+                    <BackendStepRow
+                      key={`${step.scenario_loop.iteration}-${step.index}-${step.step_loop.iteration}`}
+                      step={step}
+                    />
                   ))}
                 </ol>
               )}
@@ -231,28 +237,31 @@ function BackendStepRow({ step }: { step: WireScenarioStepStatus }) {
   return (
     <li
       className="border border-border rounded-md px-3 py-2 flex flex-col gap-1"
-      data-testid={`backend-step-${step.index}`}
+      data-testid={`backend-step-${step.scenario_loop.iteration}-${step.index}-${step.step_loop.iteration}`}
     >
       <div className="flex items-center gap-2 flex-wrap">
         <span className="mono text-ep-xs text-text-secondary">#{step.index}</span>
         <span className="font-medium mono">{step.type}</span>
-        <span className="text-ep-xs text-text-secondary">loop {step.loop}</span>
+        <span className="text-ep-xs text-text-secondary">
+          scenario loop {step.scenario_loop.iteration}/{step.scenario_loop.count} · step loop{' '}
+          {step.step_loop.iteration}/{step.step_loop.count}
+        </span>
         <StatusIndicator state={step.state} compact />
         {step.started_at && (
           <span className="text-ep-xs text-text-secondary">
-            started {isoToLocal(step.started_at)}
+            started {epochSecondsToLocal(step.started_at)}
           </span>
         )}
         {step.ended_at && (
           <span className="text-ep-xs text-text-secondary">
-            ended {isoToLocal(step.ended_at)}
+            ended {epochSecondsToLocal(step.ended_at)}
           </span>
         )}
       </div>
       {resolved.length > 0 && (
         <ul className="text-ep-xs text-text-secondary mono flex flex-wrap gap-2">
           {resolved.map(([key, value]) => (
-            <li key={key} data-testid={`resolved-${step.index}-${key}`}>
+            <li key={key} data-testid={`resolved-${step.scenario_loop.iteration}-${step.index}-${step.step_loop.iteration}-${key}`}>
               {key} = {value}
             </li>
           ))}
