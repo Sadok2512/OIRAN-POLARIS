@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const VERSION: &str = "0.1.0-dev";
+pub const VERSION: &str = "0.2.0-dev";
 const PROBE_ID: &str = "oiran-vprobe-local-01";
 const MIN_CAPTURE_BYTES: u64 = 1024 * 1024;
 const MAX_CONTINUOUS_EVENTS: usize = 50_000;
@@ -76,6 +76,8 @@ impl CaptureState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureInterface {
     pub interface: String,
+    #[serde(default)]
+    pub role: Option<String>,
     pub device: String,
     pub protocol: String,
     pub capture_point: String,
@@ -2812,6 +2814,7 @@ fn spec(
 ) -> CaptureInterface {
     CaptureInterface {
         interface: interface.into(),
+        role: None,
         device: device.into(),
         protocol: protocol.into(),
         capture_point: point.into(),

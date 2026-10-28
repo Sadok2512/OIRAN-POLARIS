@@ -1,5 +1,23 @@
 # Changelog
 
+## [OIRAN API 2.4.0-dev / live-probe 0.2.0-dev] - 2026-10-28
+
+### Added
+
+- Added an atomic, mode-`0600` probe registry seeded with `oiran-vprobe-local-01` and an Operator-plus-CSRF `POST /api/v1/probes` contract.
+- Added registry-backed capture-interface roles while keeping unregistered roles explicitly `null`.
+
+### Changed
+
+- Probe liveness now derives only from measured capture ingestion or packet timestamps; probes without a real heartbeat remain `PENDING`, offline, and expose a `null` heartbeat.
+- Live dataset capture interface and size evidence now remain `null` when no capture job supplies those values.
+- Raw PCAP download now fails closed with `403 DOWNLOAD_POLICY_PENDING` pending a subscriber-identity-safe export policy.
+
+### Validation
+
+- Added API tests for truthful liveness, persistent creation, duplicate and invalid payload rejection, CSRF enforcement, role mapping, absent capture evidence, and download denial.
+- No production service, external capture, UE, Open5GS component, or dataset was modified.
+
 ## Release consolidation V1.1 - lossless continuous checkpoint resume
 
 - Preserve evidence-backed session identifiers when live activity credit expires or a continuous import is finalized.
