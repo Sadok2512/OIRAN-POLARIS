@@ -13,20 +13,66 @@ function ie(name: string, children?: InformationElement[]): InformationElement {
   } as InformationElement;
 }
 
-describe('isIdentityIe', () => {
-  it.each(['IMSI', 'imsi', '5G-GUTI', 'c-rnti', 'MaskedIMEISV', 'IMEI', 'TMSI', 'SUPI', 'SUCI', 'MSISDN'])(
-    'treats "%s" as an identity IE',
-    (name) => {
-      expect(isIdentityIe({ name })).toBe(true);
-    },
-  );
+describe('isIdentityIe (2.4.1 — CONTAINS semantics on decoder-sourced names)', () => {
+  // Names below are the exact strings produced today by the OIRAN
+  // decoders (decoder-ngap, decoder-nas, …). The list intentionally
+  // covers the historical BC4 leaks: 5GS mobile identity on registration,
+  // 5G-S-TMSI in NGAP, MaskedIMEISV in InitialContextSetup.
+  it.each([
+    // Decoder output: exact strings from decoder-nas / decoder-ngap.
+    '5GS mobile identity',
+    'nas-5gs-mobile-identity',
+    'NAS_5GS_Mobile_Identity',
+    'FiveG-S-TMSI',
+    'five_g_s_tmsi',
+    '5G-S-TMSI',
+    'MaskedIMEISV',
+    'Masked-IMEISV',
+    'IMEISV',
+    'IMEI',
+    'IMSI',
+    'imsi',
+    'IMSISV',
+    'TMSI',
+    'M-TMSI',
+    'P-TMSI',
+    'S-TMSI',
+    'GUTI',
+    '5G-GUTI',
+    '5g_guti',
+    'SUPI',
+    'suci',
+    'SUCI',
+    'MSISDN',
+    'PEI',
+    // Historical normalised exact names kept for backward compatibility.
+    'RNTI',
+    'c-rnti',
+  ])('treats "%s" as an identity IE', (name) => {
+    expect(isIdentityIe({ name })).toBe(true);
+  });
 
-  it.each(['RAN UE NGAP ID', 'AMF UE NGAP ID', 'NAS-PDU', 'UserLocationInformation', 'SecurityKey'])(
-    'does NOT withhold "%s" — these are not subscriber identities',
-    (name) => {
-      expect(isIdentityIe({ name })).toBe(false);
-    },
-  );
+  it.each([
+    // *-NGAP-ID is a transport-layer handle, not a subscriber identity.
+    'RAN UE NGAP ID',
+    'AMF UE NGAP ID',
+    'ran_ue_ngap_id',
+    'amf_ue_ngap_id',
+    // Pseudonyms are safe by construction — the backend already withheld
+    // the real UE identity before publishing the pseudonym.
+    'ue_identity_pseudonym',
+    'UE Identity Pseudonym',
+    // Common NGAP / NAS fields that must remain visible to the operator.
+    'NAS-PDU',
+    'UserLocationInformation',
+    'SecurityKey',
+    'AllowedNSSAI',
+    'GUAMI',
+    'RRCEstablishmentCause',
+    'UEContextRequest',
+  ])('does NOT withhold "%s" — these are not subscriber identities', (name) => {
+    expect(isIdentityIe({ name })).toBe(false);
+  });
 });
 
 describe('withholdIdentity', () => {

@@ -8,44 +8,59 @@
 
 import type { InformationElement } from '../types/api';
 
-// Names are compared case-insensitively against the IE's `name` field.
-// Normalisation strips spaces and hyphens so variants like "5G-GUTI" and
-// "5G GUTI" collapse to the same key.
-const IDENTITY_NAMES = new Set(
-  [
-    'IMSI',
-    'IMSISV',
-    'IMEI',
-    'IMEISV',
-    'MASKED_IMEISV',
-    'MASKED IMEISV',
-    'TMSI',
-    'M-TMSI',
-    'M_TMSI',
-    'PTMSI',
-    'P-TMSI',
-    'GUTI',
-    '5G-GUTI',
-    '5G_GUTI',
-    'S-TMSI',
-    'S_TMSI',
-    'RNTI',
-    'C-RNTI',
-    'SUPI',
-    'SUCI',
-    'MSISDN',
-    'PEI',
-  ].map(normalize),
+// Normalise a decoded IE name: lowercase, strip every character that is
+// not a letter or digit. This collapses "5GS mobile identity",
+// "5gs_mobile_identity", "5gs-mobile-identity", "nas-5GS-Mobile-Identity"
+// into the same key so a single rule catches every decoder variant.
+function normalize(value: string): string {
+  return value.replace(/[^a-z0-9]+/gi, '').toLowerCase();
+}
+
+// 2.4.0 EXACT-match set. Kept intact so the previous contract is not
+// relaxed by the new contains-matcher below.
+const EXACT_IDENTITY_NAMES = new Set(
+  ['RNTI', 'C-RNTI', 'MSISDN', 'PEI'].map(normalize),
 );
 
-function normalize(value: string): string {
-  return value.replace(/[\s\-_]+/g, '').toUpperCase();
-}
+// 2.4.1 CONTAINS-match fragments. Any decoded IE whose normalised name
+// contains one of these fragments is withheld. Rationale:
+//   * MOBILEIDENTITY → "5GS mobile identity", "nas-5gs-mobile-identity"
+//   * IMSI          → "IMSI", "IMSISV"
+//   * IMEI          → "IMEI", "IMEISV", "MASKED-IMEISV", "MaskedIMEISV"
+//   * TMSI          → "TMSI", "M-TMSI", "P-TMSI", "S-TMSI", "5G-S-TMSI",
+//                      "FiveG-S-TMSI", "five_g_s_tmsi"
+//   * GUTI          → "GUTI", "5G-GUTI"
+//   * SUPI, SUCI    → the names themselves
+//   * MSISDN        → kept as exact + contains to catch "MSISDN sent"
+// None of these fragments appear in `*-NGAP-ID` ("ranuengapid",
+// "amfuengapid") or in `ue_identity_pseudonym` ("ueidentitypseudonym"),
+// which stay in the tree (they are NOT subscriber identities).
+const CONTAINS_IDENTITY_FRAGMENTS: readonly string[] = [
+  'mobileidentity',
+  'imsi',
+  'imei',
+  'tmsi',
+  'guti',
+  'supi',
+  'suci',
+  'msisdn',
+];
+
+// 2.4.1 EQUAL match (3-letter codes that would false-positive if used as
+// substring — kept exact). The only one is PEI.
+const EQUAL_IDENTITY_NAMES: readonly string[] = ['pei'];
 
 /** True when an IE name is one of the subscriber / equipment identities. */
 export function isIdentityIe(ie: Pick<InformationElement, 'name'>): boolean {
   if (!ie?.name) return false;
-  return IDENTITY_NAMES.has(normalize(ie.name));
+  const key = normalize(ie.name);
+  if (!key) return false;
+  if (EXACT_IDENTITY_NAMES.has(key)) return true;
+  if (EQUAL_IDENTITY_NAMES.includes(key)) return true;
+  for (const fragment of CONTAINS_IDENTITY_FRAGMENTS) {
+    if (key.includes(fragment)) return true;
+  }
+  return false;
 }
 
 export interface WithholdResult {

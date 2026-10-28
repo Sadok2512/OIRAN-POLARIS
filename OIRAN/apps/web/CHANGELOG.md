@@ -2,6 +2,59 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.4.1-dev — 2026-10-28 (patch)
+
+Review feedback on 2.4.0-dev (BC4): subscriber-identity IEs still slipped
+through the exact-name matcher when the decoder spelled them differently
+("5GS mobile identity", "FiveG-S-TMSI", "MaskedIMEISV"). The Packet
+Analyzer's Fields tab also rendered the raw IE list without going through
+`withholdIdentity()`, which exposed the same strings on a second surface.
+
+### Fixed
+
+- `isIdentityIe()` is upgraded from EXACT-set lookup to a two-layer
+  matcher: (a) a small EXACT list for codes that would false-positive
+  as substrings (`RNTI`, `C-RNTI`, `MSISDN`, `PEI`), and (b) a CONTAINS
+  pass on the normalised name against the fragments
+  `mobileidentity`, `imsi`, `imei`, `tmsi`, `guti`, `supi`, `suci`,
+  `msisdn`. Normalisation strips every non-alphanumeric character and
+  lower-cases, so "5GS mobile identity", "nas-5gs-mobile-identity",
+  "NAS_5GS_Mobile_Identity", "5G-S-TMSI", "FiveG-S-TMSI", "five_g_s_tmsi",
+  "MaskedIMEISV", "Masked-IMEISV" and friends all collapse to the same
+  hit. Verified negatives: `RAN UE NGAP ID`, `AMF UE NGAP ID`,
+  `ue_identity_pseudonym`, `NAS-PDU`, `UserLocationInformation`,
+  `SecurityKey`, `AllowedNSSAI`, `GUAMI`, `RRCEstablishmentCause`,
+  `UEContextRequest` — none are withheld.
+- Packet Analyzer `PacketInspector` now routes `packet.information_elements`
+  through `withholdIdentity()` before the Fields tab renders them. The
+  shield-banner, the identity-count, and the "no raw bytes" reminder on
+  the Raw Hex tab match the CallFlow page contract.
+
+### Added tests
+
+- `identityIes.test.ts`: 44 unit tests (was 19). The positive list is
+  seeded with the exact strings produced today by `decoder-ngap` and
+  `decoder-nas`; the negative list locks `*-NGAP-ID` and
+  `ue_identity_pseudonym`.
+- `test/packet-analyzer-identity.test.tsx`: 4 UI tests covering the
+  Packet Analyzer Fields tab banner, the DOM removal of
+  "5GS mobile identity" / "FiveG-S-TMSI" / "MaskedIMEISV", the
+  preservation of `RAN UE NGAP ID` and `ue_identity_pseudonym`, and the
+  Raw Hex tab reminder.
+
+### Audit
+
+- `grep -rE "information_elements|decoded_ie_tree" OIRAN/apps/web/src/`
+  returns only the two inspector sites (CallFlowViewer + PacketAnalyzer);
+  both are now behind `withholdIdentity()`. No other page exposes an IE
+  tree today.
+
+### Validation (manual, no CI)
+
+- `npm run typecheck` → clean
+- `npm test` → Test Files 9 passed (9) · Tests 71 passed (71)
+- `npm run build` → `dist/assets/index-CYSJ74BI.js 357.48 kB │ gzip: 105.93 kB`
+
 ## 2.4.0-dev — 2026-10-28 (minor)
 
 Alignment on `docs/ui-mockups/oiran-analyzer.html`
