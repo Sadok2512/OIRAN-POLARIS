@@ -27,11 +27,23 @@ export interface FeatureFlags {
    * stored in the browser. When false, polaris.ueProfiles.v1 stays authoritative.
    */
   profileBackend: boolean;
+  /**
+   * 0.5.0 — When true, the UI calls the new scenario templates surface:
+   *   GET  /scenario-definitions                     (tpl-* appear in the list)
+   *   GET  /scenario-definitions/:id/estimate        → { duration_ms }
+   *   GET  /scenario-definitions/:id/export          → attachment JSON v2
+   *   POST /scenario-definitions/import              operator + CSRF
+   * When false, the Templates tab shows a "Backend pending" placeholder
+   * and no network call is issued. Default OFF until Codex pushes
+   * `feat/polaris-traffic-templates`.
+   */
+  scenarioTemplates: boolean;
 }
 
 const DEFAULTS: FeatureFlags = {
   scenarioBackend: false,
   profileBackend: false,
+  scenarioTemplates: false,
 };
 
 function read(): FeatureFlags {

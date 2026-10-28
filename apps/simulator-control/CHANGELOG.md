@@ -3,6 +3,58 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.5.0 — 2026-10-28 (minor)
+
+Preparation layer for the scenario-definition v2 contract that Codex ships
+on `feat/polaris-traffic-templates` (`polaris-control-api` 0.11.0). Nothing
+in this release calls the new backend by default — every network path is
+gated behind the `scenarioTemplates` feature flag (OFF by default) so the
+UI continues to work against today's 0.10.0 contract until an operator
+flips the flag in Settings.
+
+### Added
+
+- **Feature flag `scenarioTemplates`** (default OFF) in
+  `src/data/featureFlags.ts`. Everything below is gated by it.
+- **Scenario model**: 6 new step kinds — `TRAFFIC_DL`, `TRAFFIC_UL`,
+  `DETACH`, `REPEAT`, `IMS_REGISTER`, `VOICE_CALL`. Each one carries its
+  own `backendCertified` + `backendNote`, so the editor renders the exact
+  backend refusal code (`DL_SENDER_NOT_AVAILABLE`, `IMS_NOT_AVAILABLE`,
+  …). The new numeric parameters `bytes`, `rate_kbps`, `duration_ms` and
+  `loop_count` land in `PARAM_META` with the backend caps
+  (`bytes ≤ 200 MiB`, `loop_count ≤ 10 000`). `MAX_REPEAT_NESTING = 2`
+  and `MAX_RESOLVED_STEPS = 10_000` mirror the backend validator.
+- **Wire codec**: `WireScenarioStep.steps?` (nested list used by
+  `type: "repeat"`), `SCENARIO_SCHEMA_VERSION =
+  "polaris.scenario-definition.v2"` and `WireScenarioExportFile` matching
+  the `GET /scenario-definitions/:id/export` response.
+- **Scenario-templates client** `src/data/scenarioTemplatesApi.ts`:
+  `useScenarioTemplates()` (filters `/scenario-definitions` to `tpl-*`),
+  `useScenarioEstimate(id)`, `downloadScenarioExport(id)` (parses
+  `Content-Disposition`, falls back to `${id}-v${version}.json`,
+  surfaces the exact backend code on failure), and `useScenarioImport()`
+  (`POST /scenario-definitions/import?mode=new_version | ?rename=<id>`,
+  propagates 409 / 413 / 422 verbatim).
+- **Scenarios page** gains a **Templates** tab (locked when the flag is
+  OFF, honest "Backend pending" message when the backend returns 404),
+  with Clone and Download JSON actions per template.
+- **Import JSON dialog** (`src/scenarios/ImportScenarioDialog.tsx`): file
+  picker → local JSON parse → local `schema_version` check → structural
+  preview with the nested step tree → `POST /scenario-definitions/import`;
+  on 409 (`SCENARIO_ID_EXISTS` or `TEMPLATE_ID_RESERVED`), offers "Import
+  as new version" or "Rename & import"; backend error codes are shown
+  verbatim (no translation).
+- **Builder**: nested step editor for `REPEAT` with a nested palette and
+  a depth guard aligned on `MAX_REPEAT_NESTING = 2`. Locked step kinds
+  render their backend-note badge verbatim so the operator sees the exact
+  refusal code before saving.
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → Test Files 16 passed (16) · Tests 124 passed (124)
+- `check-dist-leaks` guard stays clean (fixtures live only in tests).
+
 ## 0.4.1 — 2026-10-28 (patch)
 
 Review feedback on 0.4.0: four honesty corrections on the new Network section.
