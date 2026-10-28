@@ -1,5 +1,12 @@
 # Changelog
 
+## Follow-up security ticket — migrate React Router 7
+
+- The laboratory deployment decision accepted the two moderate advisories reported by
+  `npm audit --omit=dev` for the explicitly pinned `react-router-dom` 6.30.6 candidate.
+- Track a separately reviewed migration to React Router 7; do not apply npm's breaking
+  `--force` upgrade without frontend contract and browser regression validation.
+
 ## 0.12.1 (polaris-control-api)
 
 - Patch: execute `pdu_establish` with UERANSIM `nr-cli ps-establish` and `pdu_release` with
