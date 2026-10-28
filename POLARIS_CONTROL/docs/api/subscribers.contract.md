@@ -20,7 +20,7 @@ Single-create request shape:
 
 ```json
 {
-  "imsi": "<15 decimal digits; write-only>",
+  "imsi": "<15 decimal digits or imsi- prefix; write-only>",
   "k": "<32 hexadecimal characters; write-only>",
   "opc": "<32 hexadecimal characters; write-only>",
   "sst": 1,
@@ -49,6 +49,9 @@ imsi,k,opc,sst,sd,dnns,ambr_uplink,ambr_downlink
 ```
 
 Multiple DNNs use `|`, for example `internet|ims`. Allowed DNNs are `internet` and `ims`.
+Both IMSI forms are canonicalized to 15 digits before lookup/storage. S-NSSAI and DNN must be
+present in `POLARIS_SERVED_SNSSAIS` and `POLARIS_SERVED_DNNS`; an unsupported slice returns
+`422 {"error":"SNSSAI_NOT_SERVED"}` before any MongoDB write.
 The response is `{ok, errors, results[], secrets_exposed:false}`; each result contains only row,
 status, slot, and error. `413` is returned above 100,000 data rows. Existing non-POLARIS records
 return `409 SUBSCRIBER_NOT_POLARIS_OWNED` and are never changed.

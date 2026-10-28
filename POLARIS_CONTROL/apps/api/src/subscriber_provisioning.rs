@@ -432,6 +432,17 @@ pub fn validate_mutation(input: &SubscriberMutation) -> Result<(), String> {
     Ok(())
 }
 
+/// Accepts the two operator-facing IMSI forms while keeping the Open5GS
+/// storage representation canonical (15 decimal digits, no SUPI prefix).
+pub fn normalize_imsi(value: &str) -> Result<String, String> {
+    let digits = value.strip_prefix("imsi-").unwrap_or(value);
+    if digits.len() == 15 && digits.chars().all(|c| c.is_ascii_digit()) {
+        Ok(digits.to_string())
+    } else {
+        Err("IMSI_INVALID".into())
+    }
+}
+
 pub fn sanitize(record: &SubscriberRecord) -> SanitizedSubscriber {
     SanitizedSubscriber {
         slot: record.slot.clone(),
@@ -534,6 +545,22 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn imsi_normalization_accepts_digits_and_supi_prefix_only() {
+        assert_eq!(
+            normalize_imsi("001010000000201").unwrap(),
+            "001010000000201"
+        );
+        assert_eq!(
+            normalize_imsi("imsi-001010000000201").unwrap(),
+            "001010000000201"
+        );
+        assert_eq!(
+            normalize_imsi("supi-001010000000201").unwrap_err(),
+            "IMSI_INVALID"
+        );
+    }
+
     #[test]
     fn one_hundred_thousand_rows_validate_without_secret_serialization() {
         fn rss_kib() -> u64 {

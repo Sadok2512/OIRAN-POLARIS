@@ -293,11 +293,11 @@ impl ProfileStore {
         if registry.profiles.len() >= ueransim_adapter::MAX_CONFIGURABLE_UES {
             return Err("UE_PROFILE_CAPACITY_REACHED".into());
         }
-        if registry
-            .profiles
-            .iter()
-            .any(|record| record.profile.ue_id == input.ue_id)
-        {
+        let requested_index = parse_ue_index(&input.ue_id)?;
+        if registry.profiles.iter().any(|record| {
+            record.profile.ue_id == input.ue_id
+                || parse_ue_index(&record.profile.ue_id).ok() == Some(requested_index)
+        }) {
             return Err("UE_PROFILE_ALREADY_EXISTS".into());
         }
         let secrets = self.creation_secrets(&input)?;
@@ -787,9 +787,10 @@ fn parse_ue_index(ue_id: &str) -> Result<usize, String> {
     let canonical = if index <= 99 {
         format!("UE-{index:02}")
     } else {
-        format!("UE-{index:05}")
+        format!("UE-{index}")
     };
-    if ue_id != canonical {
+    let legacy = (index > 99).then(|| format!("UE-{index:05}"));
+    if ue_id != canonical && legacy.as_deref() != Some(ue_id) {
         return Err("UE_ID_INVALID".into());
     }
     Ok(index)

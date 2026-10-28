@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.15.2 (polaris-control-api)
+
+- Patch: create a UE from a POLARIS-owned subscriber using IMSI alone; K and OPc are resolved
+  inside the protected subscriber backend and never cross the API response or audit boundary.
+- Patch: accept canonical 15-digit IMSIs and the equivalent `imsi-` form for subscriber
+  provisioning, UE creation and CSV imports.
+- Safety: validate subscriber S-NSSAI and DNN against the explicitly configured AMF/SMF served
+  network policy; unsupported slices fail with `422 SNSSAI_NOT_SERVED`.
+
 ## 0.15.1 (polaris-control-api)
 
 - Patch: raise the persistent UE profile registry ceiling to 100,000 while retaining the

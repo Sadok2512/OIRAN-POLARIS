@@ -28,16 +28,17 @@ Create/replace input fields are `ue_id`, `name`, `supi`, `authentication_key`, `
 `plmn_mcc`, `plmn_mnc`, `dnn`, `sst`, `sd`, `serving_gnb`, `scenario_id`, and
 `auto_run_scenario`. `supi`, `authentication_key`, and `opc` are write-only.
 
-API 0.15.1 accepts this protected subscriber-binding request on `POST /ue-profiles`:
+API 0.15.2 accepts this protected subscriber-binding request on `POST /ue-profiles`:
 
 ```json
-{"ue_id":"UE-11","gnb_id":"GNB-01","note":"Lab profile","imsi":"<15 digits; write-only>"}
+{"ue_id":"UE-201","name":"UE-201","gnb_id":"GNB-01","note":"Lab profile","imsi":"<15 digits or imsi- prefix; write-only>"}
 ```
 
 The server resolves the POLARIS-owned Open5GS subscriber and fills PLMN, S-NSSAI, preferred DNN,
 AMBR/provisioning evidence, K, and OPc server-side. An unknown or non-POLARIS identity returns
 `422 SUBSCRIBER_NOT_PROVISIONED`. Responses retain `subscriber_identity: PROTECTED` and
 `authentication_material: PROTECTED`.
+An S-NSSAI outside the configured AMF/SMF served policy returns `422 SNSSAI_NOT_SERVED`.
 
 For CSV import, `POST /ue-profiles/bulk` also accepts `Content-Type: text/csv` with exact columns:
 

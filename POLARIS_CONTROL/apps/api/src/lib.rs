@@ -41,8 +41,9 @@ use std::{
 #[cfg(test)]
 use subscriber_provisioning::MemorySubscriberBackend;
 use subscriber_provisioning::{
-    validate_mutation as validate_subscriber_mutation, MongoSubscriberBackend, ProvisionResult,
-    SubscriberBackend, SubscriberMutation, MAX_BULK_ROWS, WRITE_BATCH_ROWS,
+    normalize_imsi, validate_mutation as validate_subscriber_mutation, MongoSubscriberBackend,
+    ProvisionResult, SubscriberBackend, SubscriberMutation, SubscriberRecord, MAX_BULK_ROWS,
+    WRITE_BATCH_ROWS,
 };
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -83,6 +84,7 @@ pub struct AppState {
     profile_store: ProfileStore,
     profile_registry: Arc<Mutex<UeProfileRegistry>>,
     subscriber_backend: Arc<dyn SubscriberBackend>,
+    served_network: ServedNetworkPolicy,
     scenario_definition_store: ScenarioDefinitionStore,
     scenario_catalog: Arc<Mutex<ScenarioCatalog>>,
     definition_live_enabled: bool,
@@ -106,6 +108,89 @@ pub struct AppState {
     ue_reconciliation_running: Arc<AtomicBool>,
     ue_reconciliation: Arc<Mutex<UeReconciliation>>,
     startup_reconcile: bool,
+}
+
+#[derive(Clone)]
+struct ServedNetworkPolicy {
+    snssais: BTreeSet<(u8, Option<String>)>,
+    dnns: BTreeSet<String>,
+}
+
+impl ServedNetworkPolicy {
+    fn from_env() -> Result<Self, String> {
+        let snssais = std::env::var("POLARIS_SERVED_SNSSAIS")
+            .map_err(|_| "SERVED_NETWORK_POLICY_UNAVAILABLE")?;
+        let dnns = std::env::var("POLARIS_SERVED_DNNS")
+            .map_err(|_| "SERVED_NETWORK_POLICY_UNAVAILABLE")?;
+        Self::parse(&snssais, &dnns)
+    }
+
+    fn parse(snssais: &str, dnns: &str) -> Result<Self, String> {
+        let mut parsed_snssais = BTreeSet::new();
+        for item in snssais.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+            let (sst, sd) = item
+                .split_once('/')
+                .ok_or("SERVED_NETWORK_POLICY_INVALID")?;
+            let sst = sst
+                .parse::<u8>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or("SERVED_NETWORK_POLICY_INVALID")?;
+            let sd = match sd {
+                "-" => None,
+                value if value.len() == 6 && value.chars().all(|c| c.is_ascii_hexdigit()) => {
+                    Some(value.to_ascii_uppercase())
+                }
+                _ => return Err("SERVED_NETWORK_POLICY_INVALID".into()),
+            };
+            parsed_snssais.insert((sst, sd));
+        }
+        let parsed_dnns = dnns
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        if parsed_snssais.is_empty() || parsed_dnns.is_empty() {
+            return Err("SERVED_NETWORK_POLICY_INVALID".into());
+        }
+        Ok(Self {
+            snssais: parsed_snssais,
+            dnns: parsed_dnns,
+        })
+    }
+
+    fn validate(&self, subscriber: &SubscriberRecord) -> Result<(), String> {
+        let snssai = (
+            subscriber.sst,
+            subscriber
+                .sd
+                .as_ref()
+                .map(|value| value.to_ascii_uppercase()),
+        );
+        if !self.snssais.contains(&snssai) {
+            return Err("SNSSAI_NOT_SERVED".into());
+        }
+        if subscriber.dnns.iter().any(|dnn| !self.dnns.contains(dnn)) {
+            return Err("DNN_NOT_SERVED".into());
+        }
+        Ok(())
+    }
+
+    fn validate_mutation(&self, input: &SubscriberMutation) -> Result<(), String> {
+        self.validate(&SubscriberRecord {
+            imsi: String::new(),
+            k: String::new(),
+            opc: String::new(),
+            slot: String::new(),
+            plmn_mcc: String::new(),
+            plmn_mnc: String::new(),
+            sst: input.sst,
+            sd: input.sd.clone(),
+            dnns: input.dnns.clone(),
+            ambr: input.ambr.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1623,6 +1708,7 @@ impl AppState {
         let scenario_catalog = scenario_definition_store.load()?;
         let subscriber_backend: Arc<dyn SubscriberBackend> =
             Arc::new(MongoSubscriberBackend::from_env()?);
+        let served_network = ServedNetworkPolicy::from_env()?;
         let fallback_profiles = ueransim_adapter::planned_profiles()
             .into_iter()
             .take(configuration.ue_count)
@@ -1684,6 +1770,7 @@ impl AppState {
             profile_store,
             profile_registry: Arc::new(Mutex::new(profile_registry)),
             subscriber_backend,
+            served_network,
             scenario_definition_store,
             scenario_catalog: Arc::new(Mutex::new(scenario_catalog)),
             definition_live_enabled: std::env::var("POLARIS_DEFINITION_LIVE_ENABLED")
@@ -2723,6 +2810,8 @@ fn managed_profile_json(record: &ManagedUeProfile) -> Value {
 #[derive(Deserialize)]
 struct SubscriberProfileInput {
     ue_id: String,
+    #[serde(default)]
+    name: Option<String>,
     gnb_id: String,
     #[serde(default)]
     note: String,
@@ -2757,12 +2846,18 @@ async fn list_subscribers(State(state): State<Arc<AppState>>) -> impl IntoRespon
 async fn create_subscriber(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
-    Json(input): Json<SubscriberMutation>,
+    Json(mut input): Json<SubscriberMutation>,
 ) -> impl IntoResponse {
     if let Err(error) = require_operator(&identity) {
         return error;
     }
-    if let Err(error) = validate_subscriber_mutation(&input) {
+    input.imsi = match normalize_imsi(&input.imsi) {
+        Ok(imsi) => imsi,
+        Err(error) => return subscriber_error(error),
+    };
+    if let Err(error) = validate_subscriber_mutation(&input)
+        .and_then(|_| state.served_network.validate_mutation(&input))
+    {
         return subscriber_error(error);
     }
     let backend = state.subscriber_backend.clone();
@@ -2797,7 +2892,10 @@ async fn create_subscriber(
     }
 }
 
-fn parse_subscriber_csv(body: &[u8]) -> (Vec<(usize, SubscriberMutation)>, Vec<ProvisionResult>) {
+fn parse_subscriber_csv(
+    body: &[u8],
+    served_network: &ServedNetworkPolicy,
+) -> (Vec<(usize, SubscriberMutation)>, Vec<ProvisionResult>) {
     let mut valid = Vec::new();
     let mut errors = Vec::new();
     let mut reader = csv::ReaderBuilder::new()
@@ -2850,7 +2948,7 @@ fn parse_subscriber_csv(body: &[u8]) -> (Vec<(usize, SubscriberMutation)>, Vec<P
             .map_err(|_| "CSV_ROW_INVALID".to_string())
             .and_then(|r| {
                 let input = SubscriberMutation {
-                    imsi: r[0].to_string(),
+                    imsi: normalize_imsi(&r[0])?,
                     k: r[1].to_string(),
                     opc: r[2].to_string(),
                     sst: r[3].parse().map_err(|_| "SNSSAI_INVALID")?,
@@ -2862,6 +2960,7 @@ fn parse_subscriber_csv(body: &[u8]) -> (Vec<(usize, SubscriberMutation)>, Vec<P
                     },
                 };
                 validate_subscriber_mutation(&input)?;
+                served_network.validate_mutation(&input)?;
                 if !identities.insert(input.imsi.clone()) {
                     return Err("DUPLICATE_SUBSCRIBER_IDENTITY".into());
                 }
@@ -2888,7 +2987,7 @@ async fn bulk_create_subscribers(
     if let Err(error) = require_operator(&identity) {
         return error;
     }
-    let (valid, mut results) = parse_subscriber_csv(&body);
+    let (valid, mut results) = parse_subscriber_csv(&body, &state.served_network);
     if results
         .iter()
         .any(|r| r.error.as_deref() == Some("SUBSCRIBER_BULK_TOO_LARGE"))
@@ -3134,10 +3233,16 @@ async fn import_ue_profiles_csv(
     identity: EffectiveIdentity,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
-    let rows = match parse_profile_csv(&body) {
+    let mut rows = match parse_profile_csv(&body) {
         Ok(rows) => rows,
         Err(error) => return error,
     };
+    for row in &mut rows {
+        row.imsi = match normalize_imsi(&row.imsi) {
+            Ok(imsi) => imsi,
+            Err(_) => return profile_mutation_error("SUBSCRIBER_NOT_PROVISIONED".into()),
+        };
+    }
     let identities = rows.iter().map(|r| r.imsi.clone()).collect::<Vec<_>>();
     let backend = state.subscriber_backend.clone();
     let subscribers =
@@ -3176,6 +3281,12 @@ async fn import_ue_profiles_csv(
             Some("UNKNOWN_SERVING_GNB")
         } else if !subscribers.contains_key(&row.imsi) {
             Some("SUBSCRIBER_NOT_PROVISIONED")
+        } else if state
+            .served_network
+            .validate(&subscribers[&row.imsi])
+            .is_err()
+        {
+            Some("SNSSAI_NOT_SERVED")
         } else {
             None
         };
@@ -3386,13 +3497,14 @@ async fn create_ue_profile(
         return error;
     }
     let (input, provisioned) = if value.get("imsi").is_some() {
-        let request: SubscriberProfileInput = match serde_json::from_value(value) {
+        let mut request: SubscriberProfileInput = match serde_json::from_value(value) {
             Ok(request) => request,
             Err(_) => return profile_mutation_error("UE_PROFILE_FIELDS_INVALID".into()),
         };
-        if request.imsi.len() != 15 || !request.imsi.chars().all(|c| c.is_ascii_digit()) {
-            return profile_mutation_error("SUBSCRIBER_NOT_PROVISIONED".into());
-        }
+        request.imsi = match normalize_imsi(&request.imsi) {
+            Ok(imsi) => imsi,
+            Err(_) => return profile_mutation_error("SUBSCRIBER_NOT_PROVISIONED".into()),
+        };
         let backend = state.subscriber_backend.clone();
         let identity = request.imsi.clone();
         let records = match tokio::task::spawn_blocking(move || {
@@ -3408,6 +3520,9 @@ async fn create_ue_profile(
             Some(record) => record,
             None => return profile_mutation_error("SUBSCRIBER_NOT_PROVISIONED".into()),
         };
+        if let Err(error) = state.served_network.validate(subscriber) {
+            return profile_mutation_error(error);
+        }
         let dnn = if subscriber.dnns.iter().any(|d| d == "internet") {
             "internet".to_string()
         } else {
@@ -3416,11 +3531,16 @@ async fn create_ue_profile(
         (
             ProfileMutationInput {
                 ue_id: request.ue_id.clone(),
-                name: if request.note.trim().is_empty() {
-                    request.ue_id
-                } else {
-                    request.note
-                },
+                name: request
+                    .name
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        if request.note.trim().is_empty() {
+                            request.ue_id.clone()
+                        } else {
+                            request.note.clone()
+                        }
+                    }),
                 supi: Some(format!("imsi-{}", subscriber.imsi)),
                 authentication_key: Some(subscriber.k.clone()),
                 opc: Some(subscriber.opc.clone()),
@@ -7391,6 +7511,7 @@ mod p0_tests {
             ),
             profile_registry: Arc::new(Mutex::new(profile_registry)),
             subscriber_backend: Arc::new(MemorySubscriberBackend::default()),
+            served_network: ServedNetworkPolicy::parse("1/010203", "internet,ims").unwrap(),
             scenario_definition_store: ScenarioDefinitionStore::new(
                 root.join("scenario-definitions.json"),
             ),
@@ -7593,7 +7714,7 @@ mod p0_tests {
         let secret_identity = "001010000009999";
         let secret_key = "11".repeat(16);
         let secret_opc = "22".repeat(16);
-        let payload = json!({"imsi":secret_identity,"k":secret_key,"opc":secret_opc,"sst":1,"sd":"010203","dnns":["internet","ims"],"ambr":{"uplink":1000000,"downlink":2000000}});
+        let payload = json!({"imsi":format!("imsi-{secret_identity}"),"k":secret_key,"opc":secret_opc,"sst":1,"sd":"010203","dnns":["internet","ims"],"ambr":{"uplink":1000000,"downlink":2000000}});
         let denied = application
             .clone()
             .oneshot(
@@ -7655,7 +7776,7 @@ mod p0_tests {
         assert!(!listed_body.contains(secret_identity));
         assert!(!listed_body.contains(&secret_key));
         assert!(!listed_body.contains(&secret_opc));
-        let profile=application.clone().oneshot(Request::builder().method(Method::POST).uri("/api/v1/ue-profiles").header(header::CONTENT_TYPE,"application/json").header(header::COOKIE,&cookie).header("x-csrf-token",&csrf).body(Body::from(json!({"ue_id":"UE-99","gnb_id":"GNB-01","note":"Protected profile","imsi":secret_identity}).to_string())).unwrap()).await.unwrap();
+        let profile=application.clone().oneshot(Request::builder().method(Method::POST).uri("/api/v1/ue-profiles").header(header::CONTENT_TYPE,"application/json").header(header::COOKIE,&cookie).header("x-csrf-token",&csrf).body(Body::from(json!({"ue_id":"UE-201","name":"UE-201","gnb_id":"GNB-01","note":"Protected profile","imsi":secret_identity}).to_string())).unwrap()).await.unwrap();
         assert_eq!(profile.status(), StatusCode::CREATED);
         let profile_body = String::from_utf8(
             to_bytes(profile.into_body(), usize::MAX)
@@ -7671,7 +7792,7 @@ mod p0_tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/ue-profiles/UE-99")
+                    .uri("/api/v1/ue-profiles/UE-201")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -7721,7 +7842,7 @@ mod p0_tests {
         assert!(!bulk_body.contains(csv_identity));
         assert!(bulk_body.contains("\"ok\":1"));
         let profile_csv =
-            format!("ue_id,gnb_id,note,imsi\nUE-97,GNB-01,Bulk protected,{csv_identity}\n");
+            format!("ue_id,gnb_id,note,imsi\nUE-97,GNB-01,Bulk protected,imsi-{csv_identity}\n");
         let profile_bulk = application
             .clone()
             .oneshot(
@@ -7746,6 +7867,31 @@ mod p0_tests {
         .unwrap();
         assert!(!profile_bulk_body.contains(csv_identity));
         assert!(profile_bulk_body.contains("\"ok\":1"));
+
+        let rejected_slice = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/subscribers")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        json!({"imsi":"001010000006666","k":"55".repeat(16),"opc":"66".repeat(16),"sst":1,"sd":"000001","dnns":["internet"],"ambr":{"uplink":1000000,"downlink":2000000}}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected_slice.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let rejected_body: Value = serde_json::from_slice(
+            &to_bytes(rejected_slice.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rejected_body["error"], "SNSSAI_NOT_SERVED");
         for uri in [
             "/api/v1/gnbs",
             "/api/v1/owners",
@@ -7968,7 +8114,8 @@ mod p0_tests {
             ));
             profiles.push_str(&format!("UE-{index:05},GNB-01,Bulk,{identity}\n"));
         }
-        let (valid, errors) = parse_subscriber_csv(subscribers.as_bytes());
+        let policy = ServedNetworkPolicy::parse("1/010203", "internet,ims").unwrap();
+        let (valid, errors) = parse_subscriber_csv(subscribers.as_bytes(), &policy);
         assert_eq!(valid.len(), MAX_BULK_ROWS);
         assert!(errors.is_empty());
         let parsed = parse_profile_csv(profiles.as_bytes()).unwrap();
