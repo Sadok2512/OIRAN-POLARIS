@@ -4,7 +4,8 @@ import { Copy, Edit, Plus, Search, Trash2, Workflow } from 'lucide-react';
 import { PageHeader } from '@/ui/PageHeader';
 import { EmptyState } from '@/ui/EmptyErrorLoading';
 import { ConfirmDialog } from '@/ui/ConfirmDialog';
-import { useAssignments, useScenarios } from '@/scenarios/store';
+import { useAssignments } from '@/scenarios/store';
+import { useScenarioLibrary } from '@/scenarios/library';
 import { emptyScenario, type LoopMode, type Scenario } from '@/scenarios/model';
 import { isoToLocal } from '@/data/format';
 
@@ -23,7 +24,7 @@ function loopLabel(loop: LoopMode): string {
 
 export function ScenariosLibraryPage() {
   const navigate = useNavigate();
-  const library = useScenarios();
+  const library = useScenarioLibrary();
   const assignments = useAssignments();
   const [search, setSearch] = useState('');
   const [confirmDelete, setConfirmDelete] = useState<Scenario | null>(null);
@@ -40,8 +41,14 @@ export function ScenariosLibraryPage() {
   }, [library.scenarios, search]);
 
   function createScenario() {
+    // The backend rejects an empty definition (no steps), so in backend mode the new
+    // scenario is created on first save from the builder rather than here.
+    if (library.backend) {
+      navigate('/scenarios/new');
+      return;
+    }
     const scenario = emptyScenario('Untitled scenario');
-    library.save(scenario);
+    void library.save(scenario);
     navigate(`/scenarios/${scenario.id}/edit`);
   }
 
@@ -159,7 +166,7 @@ export function ScenariosLibraryPage() {
                         type="button"
                         className="ep-button ep-button-sm"
                         aria-label={`Duplicate ${scenario.name}`}
-                        onClick={() => library.duplicate(scenario.id)}
+                        onClick={() => void library.duplicate(scenario.id)}
                         data-testid={`scenario-duplicate-${scenario.id}`}
                       >
                         <Copy width={13} height={13} />
@@ -185,12 +192,12 @@ export function ScenariosLibraryPage() {
       <ConfirmDialog
         open={confirmDelete != null}
         title="Delete scenario"
-        description={`Remove "${confirmDelete?.name ?? ''}" from the local library. Any UE assignment pointing at it will also be cleared. This action cannot be undone.`}
+        description={`Remove "${confirmDelete?.name ?? ''}" from the ${library.backend ? 'backend catalog' : 'local library'}. Any UE assignment pointing at it will also be cleared. This action cannot be undone.`}
         confirmLabel="Delete"
         tone="danger"
         onCancel={() => setConfirmDelete(null)}
         onConfirm={() => {
-          if (confirmDelete) library.delete(confirmDelete.id);
+          if (confirmDelete) void library.delete(confirmDelete.id);
           setConfirmDelete(null);
         }}
       />

@@ -1,14 +1,24 @@
-// Codec between the frontend scenario model and the polaris-control-api
-// 0.9.0 wire shape. Grounded strictly on the published examples:
+// Codec between the frontend scenario model and polaris-control-api 0.10.0+.
 //
-//   Definition  : { id, name, version, steps: [{ type, loop_count, parameters }] }
-//   Step types  : ue_start, ue_stop, pdu_establish, pdu_release, udp_traffic, wait
-//   Random param: { "random": { "min": a, "max": b } }
-//   Fixed param : <number>
+// Every shape below was checked against the Rust source
+// (apps/api/src/scenario_definitions.rs, apps/api/src/lib.rs) and the measured
+// examples in POLARIS_CONTROL/docs/api/scenario-definitions.contract.md:
 //
-// Nothing in this file invents fields outside that contract. Scenario-
-// level loop_count is marked OPEN until Codex confirms (see
-// CHANGELOG.md and the BLOCKERS section).
+//   Definition     : { id, name, version, loop_count, steps, created_at_epoch_s, updated_at_epoch_s }
+//   Mutation       : { id, name, loop_count, steps }
+//   Step           : { type, loop_count, parameters }
+//   Parameter      : { "fixed": <value> } | { "random": { "min": <int>, "max": <int> } }
+//   List           : { items: Definition[], total, schema_version }
+//   Clone input    : { target_id }
+//   Steps response : { job_id, scenario_definition_id, steps: StepState[] }
+//   Times          : epoch SECONDS (numbers), not ISO strings
+//   Errors         : { "error": "CODE" }
+//
+// Loops: the definition `loop_count` repeats the whole scenario N times; each
+// step's `loop_count` repeats that step M times inside an iteration. Both are
+// integers in 1..=10000 and default to 1. A random or infinite scenario loop
+// has NO wire representation, so encoding one is refused — it is never
+// silently converted into a fixed count.
 
 import {
   INTERNAL_STEP_KIND,
@@ -20,9 +30,13 @@ import {
   newStepId,
 } from './model';
 
-/* --------------------------- Wire types (0.9.0) --------------------------- */
+export const MAX_WIRE_LOOP_COUNT = 10_000;
 
-export type WireNumericParam = number | { random: { min: number; max: number } };
+/* ------------------------------- Wire types ------------------------------- */
+
+export type WireNumericParam =
+  | { fixed: number }
+  | { random: { min: number; max: number } };
 
 export interface WireScenarioStep {
   type: string;
@@ -30,22 +44,48 @@ export interface WireScenarioStep {
   parameters: Record<string, WireNumericParam>;
 }
 
-export interface WireScenarioDefinition {
+export interface WireScenarioMutation {
   id: string;
   name: string;
-  version: number;
+  loop_count: number;
   steps: WireScenarioStep[];
+}
+
+export interface WireScenarioDefinition extends WireScenarioMutation {
+  version: number;
+  created_at_epoch_s?: number;
+  updated_at_epoch_s?: number;
+}
+
+export interface WireScenarioDefinitionList {
+  items: WireScenarioDefinition[];
+  total: number;
+  schema_version: number;
+}
+
+export interface WireLoopPosition {
+  count: number;
+  iteration: number;
 }
 
 export interface WireScenarioStepStatus {
   index: number;
   type: string;
-  loop: number;
   state: string;
-  started_at: string | null;
-  ended_at: string | null;
+  scenario_loop: WireLoopPosition;
+  step_loop: WireLoopPosition;
+  /** Epoch seconds. */
+  started_at: number | null;
+  /** Epoch seconds. */
+  ended_at: number | null;
   error: string | null;
   resolved_parameters: Record<string, number>;
+}
+
+export interface WireScenarioStepsResponse {
+  job_id: string;
+  scenario_definition_id: string | null;
+  steps: WireScenarioStepStatus[];
 }
 
 export interface WireStartScenarioRequest {
@@ -53,37 +93,59 @@ export interface WireStartScenarioRequest {
   ue_ids: string[];
 }
 
-/* ----------------------------- Parameter codec ---------------------------- */
-
-export function encodeParam(value: FixedOrRandom): WireNumericParam {
-  if (value.mode === 'fixed') return value.value;
-  return { random: { min: value.min, max: value.max } };
-}
-
-export function decodeParam(value: WireNumericParam): FixedOrRandom {
-  if (typeof value === 'number') return { mode: 'fixed', value };
-  const { min, max } = value.random;
-  return { mode: 'random', min, max };
-}
-
-/* ------------------------------- Step codec ------------------------------- */
+/* ------------------------------ Error classes ----------------------------- */
 
 export class UnsupportedStepTypeError extends Error {
   constructor(public kind: string) {
-    super(`Step kind "${kind}" is not in polaris-control-api 0.9.0 (6-type whitelist).`);
+    super(`Step kind "${kind}" is not accepted by polaris-control-api (6-type V1 whitelist).`);
     this.name = 'UnsupportedStepTypeError';
   }
 }
 
-export function encodeStep(step: ScenarioStep, loopCount: number): WireScenarioStep {
+export class UnsupportedLoopError extends Error {
+  constructor(public kind: string) {
+    super(
+      `A ${kind.toLowerCase()} scenario loop has no polaris-control-api representation (integer loop_count only).`,
+    );
+    this.name = 'UnsupportedLoopError';
+  }
+}
+
+export class NonIntegerRandomRangeError extends Error {
+  constructor(public param: string) {
+    super(`Random range for "${param}" must use integer bounds (backend contract).`);
+    this.name = 'NonIntegerRandomRangeError';
+  }
+}
+
+/* ----------------------------- Parameter codec ---------------------------- */
+
+export function encodeParam(name: string, value: FixedOrRandom): WireNumericParam {
+  if (value.mode === 'fixed') return { fixed: value.value };
+  if (!Number.isInteger(value.min) || !Number.isInteger(value.max)) {
+    throw new NonIntegerRandomRangeError(name);
+  }
+  return { random: { min: value.min, max: value.max } };
+}
+
+export function decodeParam(value: WireNumericParam | number): FixedOrRandom {
+  // A bare number is not produced by the backend; accepted defensively on read only.
+  if (typeof value === 'number') return { mode: 'fixed', value };
+  if ('fixed' in value) return { mode: 'fixed', value: Number(value.fixed) };
+  return { mode: 'random', min: value.random.min, max: value.random.max };
+}
+
+/* ------------------------------- Step codec ------------------------------- */
+
+export function encodeStep(step: ScenarioStep): WireScenarioStep {
   const type = WIRE_STEP_TYPE[step.kind];
   if (!type) throw new UnsupportedStepTypeError(step.kind);
   const parameters: Record<string, WireNumericParam> = {};
   (Object.keys(step.params) as (keyof StepParams)[]).forEach((key) => {
     const value = step.params[key];
-    if (value) parameters[key] = encodeParam(value);
+    if (value) parameters[key] = encodeParam(key, value);
   });
-  return { type, loop_count: loopCount, parameters };
+  return { type, loop_count: 1, parameters };
 }
 
 export function decodeStep(wire: WireScenarioStep): ScenarioStep {
@@ -98,60 +160,58 @@ export function decodeStep(wire: WireScenarioStep): ScenarioStep {
 
 /* ----------------------------- Definition codec --------------------------- */
 
-/**
- * Encode a frontend scenario to the wire format accepted by
- * polaris-control-api 0.9.0.
- *
- * NOTE — scenario-level loop_count is pending clarification from Codex
- * (declared OPEN in CHANGELOG.md). Until it ships, the encoder spreads
- * the scenario's loop across every step: FIXED/ONCE use their numeric
- * cycle count, RANDOM uses `max` as an upper bound, INFINITE is rejected
- * because the per-step contract requires a positive integer. The caller
- * is expected to surface the INFINITE case in UI.
- */
-export function encodeDefinition(scenario: Scenario): WireScenarioDefinition {
-  const loopPerStep = resolvePerStepLoop(scenario);
+export function encodeScenarioLoop(scenario: Scenario): number {
+  switch (scenario.loop.kind) {
+    case 'ONCE':
+      return 1;
+    case 'FIXED':
+      if (
+        !Number.isInteger(scenario.loop.cycles) ||
+        scenario.loop.cycles < 1 ||
+        scenario.loop.cycles > MAX_WIRE_LOOP_COUNT
+      ) {
+        throw new UnsupportedLoopError('FIXED');
+      }
+      return scenario.loop.cycles;
+    case 'RANDOM':
+    case 'INFINITE':
+      throw new UnsupportedLoopError(scenario.loop.kind);
+  }
+}
+
+/** Body for POST /scenario-definitions and PUT /scenario-definitions/:id. */
+export function encodeDefinition(scenario: Scenario): WireScenarioMutation {
   return {
     id: scenario.id,
     name: scenario.name,
-    version: scenario.version,
-    steps: scenario.steps.map((step) => encodeStep(step, loopPerStep)),
+    loop_count: encodeScenarioLoop(scenario),
+    steps: scenario.steps.map(encodeStep),
   };
 }
 
 export function decodeDefinition(wire: WireScenarioDefinition): Scenario {
-  const now = Date.now();
+  const created = (wire.created_at_epoch_s ?? 0) * 1000;
+  const updated = (wire.updated_at_epoch_s ?? wire.created_at_epoch_s ?? 0) * 1000;
+  const loopCount = wire.loop_count ?? 1;
   return {
     id: wire.id,
     name: wire.name,
     description: '',
     version: wire.version,
-    createdAt: now,
-    updatedAt: now,
+    createdAt: created,
+    updatedAt: updated,
     steps: wire.steps.map(decodeStep),
-    // Scenario-level loop is not exposed on the wire yet; fall back to ONCE.
-    loop: { kind: 'ONCE' },
+    loop: loopCount > 1 ? { kind: 'FIXED', cycles: loopCount } : { kind: 'ONCE' },
   };
 }
 
-export class InfiniteLoopUnsupportedError extends Error {
-  constructor() {
-    super(
-      'Infinite loop is not representable in polaris-control-api 0.9.0 step.loop_count (positive integer).',
-    );
-    this.name = 'InfiniteLoopUnsupportedError';
-  }
+/** True when a loop mode can be saved to the backend. */
+export function isLoopRepresentable(kind: Scenario['loop']['kind']): boolean {
+  return kind === 'ONCE' || kind === 'FIXED';
 }
 
-function resolvePerStepLoop(scenario: Scenario): number {
-  switch (scenario.loop.kind) {
-    case 'ONCE':
-      return 1;
-    case 'FIXED':
-      return scenario.loop.cycles;
-    case 'RANDOM':
-      return scenario.loop.max;
-    case 'INFINITE':
-      throw new InfiniteLoopUnsupportedError();
-  }
+/** Formats an epoch-seconds timestamp; `null` stays an em dash. */
+export function epochSecondsToLocal(value: number | null | undefined): string {
+  if (value === null || value === undefined) return '—';
+  return new Date(value * 1000).toLocaleString();
 }

@@ -15,7 +15,7 @@ import {
   useTraffic,
   useUes,
 } from '@/data/queries';
-import { useScenarios } from '@/scenarios/store';
+import { useScenarioLibrary } from '@/scenarios/library';
 import { bytes, count, percent } from '@/data/format';
 
 function Tile({ label, value, sub, state }: { label: string; value: string; sub?: string; state?: string }) {
@@ -39,7 +39,7 @@ export function ConsolePage() {
   const ues = useUes();
   const runtime = useScenarioRuntime();
   const traffic = useTraffic();
-  const library = useScenarios();
+  const library = useScenarioLibrary();
 
   const loading = capabilities.isLoading || lab.isLoading || health.isLoading;
   const error = capabilities.error || lab.error || health.error;

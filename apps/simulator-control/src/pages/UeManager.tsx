@@ -26,7 +26,8 @@ import {
   useScenarioRuntime,
   useUes,
 } from '@/data/queries';
-import { useAssignments, useScenarios } from '@/scenarios/store';
+import { useAssignments } from '@/scenarios/store';
+import { useScenarioLibrary } from '@/scenarios/library';
 import { certifiedProfileFor, type Scenario } from '@/scenarios/model';
 import type { UeState } from '@/data/polarisTypes';
 import {
@@ -45,6 +46,11 @@ import {
   useProfiles,
 } from '@/ue/profileStore';
 import { UeProfileFormDialog, type ProfileFormMode } from '@/ue/UeProfileForm';
+import { UeProfileBackendFormDialog } from '@/ue/UeProfileBackendForm';
+import { useBackendProfiles } from '@/ue/profileSource';
+import type { WireUeProfileMutation } from '@/data/profileApi';
+import { useFeatureFlag } from '@/data/featureFlags';
+import { useStartScenarioRun } from '@/data/scenarioApi';
 import { UeBulkCreateDialog } from '@/ue/UeBulkCreateDialog';
 import { AssignScenarioDialog } from '@/ue/AssignScenarioDialog';
 
@@ -58,7 +64,7 @@ interface MergedRow {
 export function UeManagerPage() {
   const auth = useAuth();
   const uesQuery = useUes();
-  const library = useScenarios();
+  const library = useScenarioLibrary();
   const assignments = useAssignments();
   const runtime = useScenarioRuntime();
   const startScenario = useStartScenario();
@@ -66,7 +72,12 @@ export function UeManagerPage() {
   const startUe = useStartUe();
   const stopUe = useStopUe();
 
-  const profiles = useProfiles();
+  const backendProfiles = useBackendProfiles();
+  const profileBackend = backendProfiles.enabled;
+  const localProfiles = useProfiles();
+  const profiles = profileBackend ? backendProfiles.profiles : localProfiles;
+  const scenarioBackend = useFeatureFlag('scenarioBackend');
+  const startDefinitionRun = useStartScenarioRun();
 
   const [search, setSearch] = useState('');
   const [ownerFilter, setOwnerFilter] = useState('');
@@ -104,10 +115,30 @@ export function UeManagerPage() {
     return map;
   }, [uesQuery.data?.items]);
 
-  const assignmentByUe = useMemo(
-    () => new Map(assignments.assignments.map((assignment) => [assignment.ueId, assignment])),
-    [assignments.assignments],
-  );
+  const assignmentByUe = useMemo(() => {
+    if (profileBackend) {
+      return new Map(
+        profiles
+          .filter((profile) => profile.scenarioId)
+          .map((profile) => [
+            profile.id,
+            {
+              ueId: profile.id,
+              scenarioId: profile.scenarioId as string,
+              autoRun: backendProfiles.wireById.get(profile.id)?.auto_run_scenario ?? false,
+              updatedAt: profile.updatedAt,
+            },
+          ]),
+      );
+    }
+    return new Map(assignments.assignments.map((assignment) => [assignment.ueId, assignment]));
+  }, [profileBackend, profiles, backendProfiles.wireById, assignments.assignments]);
+
+  async function setBackendAssignment(ueIds: string[], scenarioId: string | null, autoRun: boolean) {
+    const failures = await backendProfiles.assign(ueIds, scenarioId, autoRun);
+    if (failures.length > 0) setFeedback(`Assignment failed · ${failures.join(' · ')}`);
+    return failures;
+  }
 
   const scenarioById = useMemo(
     () => new Map(library.scenarios.map((scenario) => [scenario.id, scenario])),
@@ -157,6 +188,20 @@ export function UeManagerPage() {
 
   /* ----------------------------- Mutators ------------------------------ */
 
+  async function submitBackend(body: WireUeProfileMutation, mode: ProfileFormMode) {
+    if (mode === 'create') {
+      await backendProfiles.create(body);
+      setFeedback(`Profile ${body.ue_id} created on POLARIS.`);
+    } else if (mode === 'edit' && formState?.initial) {
+      await backendProfiles.update(formState.initial.id, { ...body, ue_id: formState.initial.id });
+      setFeedback(`Profile ${formState.initial.id} updated on POLARIS.`);
+    } else if (mode === 'clone' && formState?.initial) {
+      await backendProfiles.clone(formState.initial.id, body.ue_id);
+      setFeedback(`Profile ${body.ue_id} cloned from ${formState.initial.id} (not provisioned yet).`);
+    }
+    setFormState(null);
+  }
+
   async function submitCreate(draft: UeProfileDraft) {
     createProfile(draft);
     setFormState(null);
@@ -179,8 +224,19 @@ export function UeManagerPage() {
     setFeedback(`Profile ${draft.id} cloned from ${formState.initial.id}.`);
   }
 
-  function removeSelected() {
+  async function removeSelected() {
     if (!confirmDelete) return;
+    if (profileBackend) {
+      const ids = confirmDelete;
+      setConfirmDelete(null);
+      const result = await backendProfiles.remove(ids);
+      setSelected(new Set());
+      setFeedback(
+        `${result.deleted} profile${result.deleted === 1 ? '' : 's'} deleted on POLARIS.` +
+          (result.failures.length > 0 ? ` Failed: ${result.failures.join(' · ')}` : ''),
+      );
+      return;
+    }
     const removed = deleteProfiles(confirmDelete);
     for (const id of confirmDelete) assignments.clear(id);
     setConfirmDelete(null);
@@ -207,7 +263,29 @@ export function UeManagerPage() {
     );
   }
 
-  function handleExport() {
+  async function handleExport() {
+    if (profileBackend) {
+      // Sanitized server-side export (no SUPI/K/OPc columns).
+      try {
+        const response = await fetch('/polaris-api/v1/ue-profiles/export.csv', {
+          credentials: 'same-origin',
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `ue-profiles-polaris-${timestampSuffix()}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+        setFeedback('Exported the POLARIS profile registry (sanitized CSV).');
+      } catch (error) {
+        setFeedback(`Export failed · ${(error as Error).message}`);
+      }
+      return;
+    }
     const csv = toCsv(selectedProfiles.length > 0 ? selectedProfiles : profiles);
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
@@ -251,6 +329,18 @@ export function UeManagerPage() {
       setAssignOpen(false);
       return;
     }
+    if (profileBackend) {
+      setAssignOpen(false);
+      const failures = await setBackendAssignment(targetIds, scenarioId, autoRun);
+      if (failures.length === 0) {
+        setFeedback(
+          scenarioId
+            ? `Assigned scenario to ${targetIds.length} UE${targetIds.length === 1 ? '' : 's'} on POLARIS.`
+            : `Cleared scenario assignment on ${targetIds.length} UE${targetIds.length === 1 ? '' : 's'}.`,
+        );
+      }
+      return;
+    }
     for (const id of targetIds) {
       if (scenarioId) assignments.assign(id, scenarioId, autoRun);
       else assignments.clear(id);
@@ -264,6 +354,23 @@ export function UeManagerPage() {
   }
 
   async function runScenarioOn(row: MergedRow, scenario: Scenario) {
+    if (scenarioBackend) {
+      try {
+        const job = await startDefinitionRun.mutateAsync({
+          scenario_definition_id: scenario.id,
+          ue_ids: [row.profile.id],
+        });
+        setFeedback(`Scenario ${scenario.name} started for ${row.profile.id} · job ${job.job_id} (${job.state}).`);
+      } catch (error) {
+        const code = (error as { code?: string }).code;
+        setFeedback(
+          code === 'SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED'
+            ? 'Live execution of backend scenario definitions is locked on this controller (mock mode only).'
+            : `${code ?? 'Start failed'} · ${(error as Error).message}`,
+        );
+      }
+      return;
+    }
     if (!row.backend) {
       setFeedback(`${row.profile.id}: backend has not reported this UE yet — not provisioned.`);
       return;
@@ -433,7 +540,8 @@ export function UeManagerPage() {
             type="button"
             className="ep-button ep-button-sm"
             onClick={() => setBulkOpen(true)}
-            disabled={!canOperate}
+            disabled={!canOperate || profileBackend}
+            title={profileBackend ? 'Bulk via the POLARIS API (10/100/1000/10000) — UI planned for V1.1' : undefined}
             data-testid="ue-bulk"
           >
             <Users width={13} height={13} />
@@ -443,7 +551,8 @@ export function UeManagerPage() {
             type="button"
             className="ep-button ep-button-sm"
             onClick={() => fileInputRef.current?.click()}
-            disabled={!canOperate}
+            disabled={!canOperate || profileBackend}
+            title={profileBackend ? 'Backend required — POLARIS has no CSV import route' : undefined}
             data-testid="ue-import"
           >
             <Upload width={13} height={13} />
@@ -464,7 +573,7 @@ export function UeManagerPage() {
           <button
             type="button"
             className="ep-button ep-button-sm"
-            onClick={handleExport}
+            onClick={() => void handleExport()}
             disabled={profiles.length === 0}
             data-testid="ue-export"
           >
@@ -614,9 +723,21 @@ export function UeManagerPage() {
                           {row.backend.internal_ue_id}
                         </span>
                       )}
-                      {notProvisioned && (
+                      {notProvisioned && !profileBackend && (
                         <span className="text-ep-xs text-text-secondary">
                           Not provisioned on backend
+                        </span>
+                      )}
+                      {profileBackend && row.profile.subscriptionStatus && (
+                        <span
+                          className={`text-ep-xs ${
+                            row.profile.subscriptionStatus === 'VERIFIED' ? 'text-success' : 'text-warning'
+                          }`}
+                          data-testid={`ue-subscription-${row.profile.id}`}
+                        >
+                          {row.profile.subscriptionStatus === 'VERIFIED'
+                            ? 'Open5GS subscription verified'
+                            : 'Not provisioned in Open5GS'}
                         </span>
                       )}
                       {isShared && (
@@ -651,7 +772,13 @@ export function UeManagerPage() {
                         className="ep-input text-ep-sm py-1 h-8"
                         value={assignment?.scenarioId ?? ''}
                         onChange={(event) => {
-                          if (event.target.value === '') {
+                          if (profileBackend) {
+                            void setBackendAssignment(
+                              [row.profile.id],
+                              event.target.value === '' ? null : event.target.value,
+                              assignment?.autoRun ?? false,
+                            );
+                          } else if (event.target.value === '') {
                             assignments.clear(row.profile.id);
                           } else {
                             assignments.assign(
@@ -875,10 +1002,22 @@ export function UeManagerPage() {
       )}
 
       {/* Dialogs */}
+      <UeProfileBackendFormDialog
+        mode={formState?.mode ?? 'create'}
+        open={profileBackend && formState != null}
+        initial={formState?.initial ? backendProfiles.wireById.get(formState.initial.id) ?? null : null}
+        template={backendProfiles.wireById.values().next().value ?? null}
+        gnbs={backendProfiles.gnbs}
+        slots={backendProfiles.slots}
+        slotsError={backendProfiles.slotsError}
+        onCancel={() => setFormState(null)}
+        onSubmit={submitBackend}
+      />
+
       <UeProfileFormDialog
         mode={formState?.mode ?? 'create'}
         initial={formState?.initial}
-        open={formState != null}
+        open={!profileBackend && formState != null}
         onCancel={() => setFormState(null)}
         onSubmit={async (draft) => {
           if (!formState) return;
@@ -916,7 +1055,7 @@ export function UeManagerPage() {
         confirmLabel="Delete"
         tone="danger"
         onCancel={() => setConfirmDelete(null)}
-        onConfirm={removeSelected}
+        onConfirm={() => void removeSelected()}
       />
 
       <ConfirmDialog

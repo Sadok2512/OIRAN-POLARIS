@@ -178,7 +178,9 @@ export async function api<T>(
     error: { code: 'INVALID_RESPONSE', message: 'Invalid API response' },
   }));
   if (!response.ok) {
-    const err = (body as { error?: { code?: string; message?: string } }).error;
+    // OIRAN returns {error:{code,message}}; POLARIS returns {error:"CODE"}.
+    const raw = (body as { error?: string | { code?: string; message?: string } }).error;
+    const err = typeof raw === 'string' ? { code: raw, message: raw } : raw;
     throw new ApiError(
       response.status,
       err?.code ?? 'REQUEST_FAILED',

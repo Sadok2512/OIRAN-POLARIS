@@ -20,39 +20,42 @@ function stubFetch() {
     const url = typeof input === 'string' ? input : input.toString();
     calls.push(url);
     if (url.endsWith('/scenario-definitions')) {
+      // Raw body of GET /api/v1/scenario-definitions (polaris-control-api 0.10.0, lib.rs
+      // list_scenario_definitions): { items, total, schema_version } — no {data, meta}.
       return respond(200, {
-        data: [
+        items: [
           {
-            id: 'scn-be-1',
-            name: 'from-backend',
+            created_at_epoch_s: 1793186621,
+            id: 'scenario-contract',
+            loop_count: 2,
+            name: 'Contract scenario',
+            steps: [{ loop_count: 2, parameters: { duration_ms: { fixed: 5 } }, type: 'wait' }],
+            updated_at_epoch_s: 1793186621,
             version: 1,
-            steps: [
-              {
-                type: 'udp_traffic',
-                loop_count: 1,
-                parameters: { duration_ms: { random: { min: 10, max: 20 } } },
-              },
-            ],
           },
         ],
-        meta: {},
+        total: 1,
+        schema_version: 1,
       });
     }
     if (url.includes('/scenarios/') && url.endsWith('/steps')) {
+      // Copied from scenario-definitions.contract.md (measured /steps response, first element).
       return respond(200, {
-        data: [
+        job_id: 'scenario-contract-1a98345aaa93',
+        scenario_definition_id: 'scenario-contract',
+        steps: [
           {
-            index: 0,
-            type: 'udp_traffic',
-            loop: 1,
-            state: 'RUNNING',
-            started_at: '2026-10-28T10:00:00Z',
-            ended_at: null,
+            ended_at: 1793186621,
             error: null,
-            resolved_parameters: { duration_ms: 15 },
+            index: 0,
+            resolved_parameters: { duration_ms: 5 },
+            scenario_loop: { count: 2, iteration: 1 },
+            started_at: 1793186621,
+            state: 'COMPLETED',
+            step_loop: { count: 2, iteration: 1 },
+            type: 'wait',
           },
         ],
-        meta: {},
       });
     }
     return respond(404, { error: 'not stubbed' });
@@ -92,7 +95,8 @@ describe('scenarioApi — flag gating', () => {
       wrapper: ({ children }) => withClient(children),
     });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data?.[0].name).toBe('from-backend');
+    expect(result.current.data?.items[0].name).toBe('Contract scenario');
+    expect(result.current.data?.total).toBe(1);
     expect(calls.some((url) => url.includes('/scenario-definitions'))).toBe(true);
   });
 
@@ -102,11 +106,14 @@ describe('scenarioApi — flag gating', () => {
       wrapper: ({ children }) => withClient(children),
     });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data?.[0]).toMatchObject({
+    expect(result.current.data?.job_id).toBe('scenario-contract-1a98345aaa93');
+    expect(result.current.data?.steps[0]).toMatchObject({
       index: 0,
-      type: 'udp_traffic',
-      state: 'RUNNING',
-      resolved_parameters: { duration_ms: 15 },
+      type: 'wait',
+      state: 'COMPLETED',
+      scenario_loop: { count: 2, iteration: 1 },
+      step_loop: { count: 2, iteration: 1 },
+      resolved_parameters: { duration_ms: 5 },
     });
   });
 
