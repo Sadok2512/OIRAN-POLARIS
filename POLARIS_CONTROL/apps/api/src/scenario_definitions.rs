@@ -32,6 +32,8 @@ pub struct ScenarioDefinition {
     pub id: String,
     pub name: String,
     pub version: u64,
+    #[serde(default = "default_loop_count")]
+    pub loop_count: u32,
     pub steps: Vec<ScenarioStep>,
     pub created_at_epoch_s: u64,
     pub updated_at_epoch_s: u64,
@@ -41,6 +43,8 @@ pub struct ScenarioDefinition {
 pub struct ScenarioMutation {
     pub id: String,
     pub name: String,
+    #[serde(default = "default_loop_count")]
+    pub loop_count: u32,
     pub steps: Vec<ScenarioStep>,
 }
 
@@ -48,6 +52,7 @@ pub struct ScenarioMutation {
 pub struct ScenarioStep {
     #[serde(rename = "type")]
     pub step_type: String,
+    #[serde(default = "default_loop_count")]
     pub loop_count: u32,
     #[serde(default)]
     pub parameters: BTreeMap<String, ParameterSpec>,
@@ -71,8 +76,10 @@ pub struct ResolvedStep {
     pub index: usize,
     #[serde(rename = "type")]
     pub step_type: String,
-    pub loop_iteration: u32,
-    pub loop_count: u32,
+    pub scenario_loop_iteration: u32,
+    pub scenario_loop_count: u32,
+    pub step_loop_iteration: u32,
+    pub step_loop_count: u32,
     pub parameters: BTreeMap<String, Value>,
 }
 
@@ -136,6 +143,7 @@ impl ScenarioDefinitionStore {
             id: input.id,
             name: input.name,
             version: 1,
+            loop_count: input.loop_count,
             steps: input.steps,
             created_at_epoch_s: now,
             updated_at_epoch_s: now,
@@ -170,6 +178,7 @@ impl ScenarioDefinitionStore {
             id: input.id,
             name: input.name,
             version: previous.version.saturating_add(1),
+            loop_count: input.loop_count,
             steps: input.steps,
             created_at_epoch_s: previous.created_at_epoch_s,
             updated_at_epoch_s: epoch_seconds(),
@@ -218,6 +227,7 @@ impl ScenarioDefinitionStore {
             ScenarioMutation {
                 id: target_id.into(),
                 name: format!("{} (clone)", source.name),
+                loop_count: source.loop_count,
                 steps: source.steps,
             },
         )
@@ -227,33 +237,37 @@ impl ScenarioDefinitionStore {
 pub fn resolve_steps(definition: &ScenarioDefinition) -> Result<Vec<ResolvedStep>, String> {
     validate_definition(definition)?;
     let mut resolved = Vec::new();
-    for (index, step) in definition.steps.iter().enumerate() {
-        for iteration in 1..=step.loop_count {
-            let mut parameters = BTreeMap::new();
-            for (name, value) in &step.parameters {
-                let selected = match value {
-                    ParameterSpec::Fixed { fixed } => fixed.clone(),
-                    ParameterSpec::Random { random } => {
-                        let span = random
-                            .max
-                            .checked_sub(random.min)
-                            .and_then(|value| value.checked_add(1))
-                            .ok_or("SCENARIO_RANDOM_RANGE_INVALID")?
-                            as u64;
-                        let mut bytes = [0_u8; 8];
-                        OsRng.fill_bytes(&mut bytes);
-                        Value::from(random.min + (u64::from_le_bytes(bytes) % span) as i64)
-                    }
-                };
-                parameters.insert(name.clone(), selected);
+    for scenario_iteration in 1..=definition.loop_count {
+        for (index, step) in definition.steps.iter().enumerate() {
+            for step_iteration in 1..=step.loop_count {
+                let mut parameters = BTreeMap::new();
+                for (name, value) in &step.parameters {
+                    let selected = match value {
+                        ParameterSpec::Fixed { fixed } => fixed.clone(),
+                        ParameterSpec::Random { random } => {
+                            let span = random
+                                .max
+                                .checked_sub(random.min)
+                                .and_then(|value| value.checked_add(1))
+                                .ok_or("SCENARIO_RANDOM_RANGE_INVALID")?
+                                as u64;
+                            let mut bytes = [0_u8; 8];
+                            OsRng.fill_bytes(&mut bytes);
+                            Value::from(random.min + (u64::from_le_bytes(bytes) % span) as i64)
+                        }
+                    };
+                    parameters.insert(name.clone(), selected);
+                }
+                resolved.push(ResolvedStep {
+                    index,
+                    step_type: step.step_type.clone(),
+                    scenario_loop_iteration: scenario_iteration,
+                    scenario_loop_count: definition.loop_count,
+                    step_loop_iteration: step_iteration,
+                    step_loop_count: step.loop_count,
+                    parameters,
+                });
             }
-            resolved.push(ResolvedStep {
-                index,
-                step_type: step.step_type.clone(),
-                loop_iteration: iteration,
-                loop_count: step.loop_count,
-                parameters,
-            });
         }
     }
     Ok(resolved)
@@ -277,6 +291,7 @@ fn validate_definition(definition: &ScenarioDefinition) -> Result<(), String> {
     validate_mutation(&ScenarioMutation {
         id: definition.id.clone(),
         name: definition.name.clone(),
+        loop_count: definition.loop_count,
         steps: definition.steps.clone(),
     })
 }
@@ -287,6 +302,9 @@ fn validate_mutation(input: &ScenarioMutation) -> Result<(), String> {
     }
     if input.steps.is_empty() || input.steps.len() > MAX_STEPS {
         return Err("SCENARIO_STEP_COUNT_INVALID".into());
+    }
+    if !(1..=MAX_LOOP_COUNT).contains(&input.loop_count) {
+        return Err("SCENARIO_LOOP_COUNT_INVALID".into());
     }
     let mut resolved_step_count = 0_usize;
     for step in &input.steps {
@@ -316,7 +334,17 @@ fn validate_mutation(input: &ScenarioMutation) -> Result<(), String> {
             }
         }
     }
+    resolved_step_count = resolved_step_count
+        .checked_mul(input.loop_count as usize)
+        .ok_or("SCENARIO_RESOLVED_STEP_COUNT_INVALID")?;
+    if resolved_step_count > MAX_RESOLVED_STEPS {
+        return Err("SCENARIO_RESOLVED_STEP_COUNT_INVALID".into());
+    }
     Ok(())
+}
+
+const fn default_loop_count() -> u32 {
+    1
 }
 
 fn safe_id(value: &str) -> bool {
@@ -373,6 +401,7 @@ mod tests {
         ScenarioMutation {
             id: id.into(),
             name: "bounded scenario".into(),
+            loop_count: 1,
             steps: vec![ScenarioStep {
                 step_type: "wait".into(),
                 loop_count: 2,
@@ -454,16 +483,37 @@ mod tests {
             id: "s1".into(),
             name: "test".into(),
             version: 1,
+            loop_count: 2,
             steps: mutation("s1").steps,
             created_at_epoch_s: 0,
             updated_at_epoch_s: 0,
         };
         let resolved = resolve_steps(&definition).unwrap();
-        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved.len(), 4);
+        assert_eq!(resolved[0].scenario_loop_iteration, 1);
+        assert_eq!(resolved[2].scenario_loop_iteration, 2);
+        assert!(resolved.iter().all(|step| {
+            step.scenario_loop_count == 2
+                && step.step_loop_count == 2
+                && (1..=2).contains(&step.step_loop_iteration)
+        }));
         assert!(resolved.iter().all(|step| {
             step.parameters["duration_ms"]
                 .as_i64()
                 .is_some_and(|value| (10..=20).contains(&value))
         }));
+    }
+
+    #[test]
+    fn omitted_scenario_and_step_loops_default_to_one() {
+        let mutation: ScenarioMutation = serde_json::from_value(serde_json::json!({
+            "id":"default-loop",
+            "name":"Default loop",
+            "steps":[{"type":"wait","parameters":{}}]
+        }))
+        .unwrap();
+        assert_eq!(mutation.loop_count, 1);
+        assert_eq!(mutation.steps[0].loop_count, 1);
+        validate_mutation(&mutation).unwrap();
     }
 }

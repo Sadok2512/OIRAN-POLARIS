@@ -1,14 +1,16 @@
 import { expect, test } from '@playwright/test';
 import { mkdirSync } from 'node:fs';
+import { installInventoryFixture } from './inventory-fixture';
 
 const password = process.env.POLARIS_OPERATOR_PASSWORD;
 const username = process.env.POLARIS_OPERATOR_USERNAME;
 const shots = `${process.env.RELEASE_SCREENSHOT_DIR ?? 'screenshots/release_consolidation_v1'}/config`;
 
-test('deployed operator sees configurable counts without starting processes', async ({ page }) => {
+test('operator sees fixture inventory without starting processes', async ({ page }) => {
   expect(username, 'POLARIS_OPERATOR_USERNAME must be securely injected').toBeTruthy();
   expect(password, 'POLARIS_OPERATOR_PASSWORD must be securely injected').toBeTruthy();
   mkdirSync(shots, { recursive: true });
+  await installInventoryFixture(page);
 
   await page.goto('/#/settings');
   await page.getByLabel('Username').fill(username!);

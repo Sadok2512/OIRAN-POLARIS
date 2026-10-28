@@ -1,22 +1,24 @@
 import { expect, test } from '@playwright/test';
 import { mkdirSync } from 'node:fs';
+import { installInventoryFixture, knownInventory } from './inventory-fixture';
 
 const password = process.env.POLARIS_OPERATOR_PASSWORD;
 const username = process.env.POLARIS_OPERATOR_USERNAME;
 const shots = `${process.env.RELEASE_SCREENSHOT_DIR ?? 'screenshots/release_consolidation_v1'}/traffic`;
 
-test('deployed four-UE inventory and targeted traffic remain safe', async ({ page }) => {
+test('fixture four-UE inventory and targeted traffic remain safe', async ({ page }) => {
   test.setTimeout(120_000);
   expect(username, 'POLARIS_OPERATOR_USERNAME must be securely injected').toBeTruthy();
   expect(password, 'POLARIS_OPERATOR_PASSWORD must be securely injected').toBeTruthy();
   mkdirSync(shots, { recursive: true });
+  await installInventoryFixture(page);
 
   await page.goto('/#/settings');
   await page.getByLabel('Username').fill(username!);
   await page.getByLabel('Password').fill(password!);
   await page.getByRole('button', { name: 'Sign in securely' }).click();
   await expect(page.getByText(username!, { exact: true }).first()).toBeVisible();
-  const observedInventory = await (await page.request.get('/api/v1/ues')).json();
+  const observedInventory = knownInventory;
   const observedUe04 = observedInventory.items.find((item: { internal_ue_id?: string }) => item.internal_ue_id === 'UE-04');
   expect(observedUe04).toBeTruthy();
 

@@ -131,10 +131,16 @@
 - Added a non-deployed gNB-02 plan; multi-gNB execution remains locked for LIVE-005.
 - Preserved the one-UE live certification boundary and kept all new lifecycle actions locked pending LIVE-002/003/004.
 - Added offline multi-UE, authorization, resource-safety and UI regression coverage.
-## 0.9.0
+## API 0.10.0 — minor
 
 - Add an atomic, versioned scenario-definition catalog with CRUD and clone routes.
-- Add fixed-loop V1 step validation, backend random-parameter resolution, persisted resolved values,
-  definition-based offline execution history, and per-job step status retrieval.
+- Add nested scenario/step fixed-loop V1 validation, backend random-parameter resolution, persisted
+  resolved values, definition-based offline execution history, and per-job step status retrieval.
+- Add versioned UE inventory snapshots and fixture-backed browser inventory coverage.
 - Preserve the legacy certified scenario endpoints and reject definition-based Live execution until
   it receives separate authorization and validation.
+
+## Web 3.2.2 — patch
+
+- Replace four lab-state-dependent inventory checks with a strict, known API fixture.
+- Keep a separate read-only Live inventory test disabled by default and manually selectable.

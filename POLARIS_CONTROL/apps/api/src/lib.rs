@@ -47,7 +47,7 @@ use ueransim_adapter::{
     LiveLaunchSpec, ProvisionedProfileEvidence, ProvisioningBinding, UeObservation, UeProfileSpec,
 };
 
-pub const VERSION: &str = "0.9.0";
+pub const VERSION: &str = "0.10.0";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -4683,7 +4683,8 @@ fn run_mock_definition_scenario(
             json!({
                 "index":step.index,
                 "type":step.step_type,
-                "loop":{"iteration":step.loop_iteration,"count":step.loop_count},
+                "scenario_loop":{"iteration":step.scenario_loop_iteration,"count":step.scenario_loop_count},
+                "step_loop":{"iteration":step.step_loop_iteration,"count":step.step_loop_count},
                 "state":"PENDING",
                 "started_at":Value::Null,
                 "ended_at":Value::Null,
@@ -7691,74 +7692,131 @@ mod p0_tests {
         assert!(body.to_string().find("authentication_key").is_none());
     }
 
-    #[tokio::test]
-    async fn ue_profile_http_put_clone_and_delete_succeed_for_stopped_profiles() {
-        let application = app(state());
-        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
-        let profile = |ue_id: &str, supi: &str, name: &str| {
-            json!({
-                "ue_id":ue_id,"name":name,"supi":supi,
-                "authentication_key":"11".repeat(16),"opc":"22".repeat(16),
-                "plmn_mcc":"001","plmn_mnc":"01","dnn":"internet","sst":1,
-                "sd":"010203","serving_gnb":"GNB-01","scenario_id":"scenario-a",
-                "auto_run_scenario":false
-            })
-        };
-        let request = |method: Method, uri: &str, body: Value| {
-            Request::builder()
-                .method(method)
-                .uri(uri)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::COOKIE, &cookie)
-                .header("x-csrf-token", &csrf)
-                .body(Body::from(body.to_string()))
-                .unwrap()
-        };
-        let created = application
+    fn profile_http_input(ue_id: &str, supi: &str, name: &str) -> Value {
+        json!({
+            "ue_id":ue_id,"name":name,"supi":supi,
+            "authentication_key":"11".repeat(16),"opc":"22".repeat(16),
+            "plmn_mcc":"001","plmn_mnc":"01","dnn":"internet","sst":1,
+            "sd":"010203","serving_gnb":"GNB-01","scenario_id":"scenario-a",
+            "auto_run_scenario":false
+        })
+    }
+
+    fn profile_http_request(
+        method: Method,
+        uri: &str,
+        body: Value,
+        cookie: &str,
+        csrf: &str,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, cookie)
+            .header("x-csrf-token", csrf)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn create_http_profile(
+        application: &Router,
+        cookie: &str,
+        csrf: &str,
+        ue_id: &str,
+        supi: &str,
+    ) {
+        let response = application
             .clone()
-            .oneshot(request(
+            .oneshot(profile_http_request(
                 Method::POST,
                 "/api/v1/ue-profiles",
-                profile("UE-11", "imsi-001010000000011", "UE 11"),
+                profile_http_input(ue_id, supi, ue_id),
+                cookie,
+                csrf,
             ))
             .await
             .unwrap();
-        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
 
-        let mut update = profile("UE-11", "imsi-001010000000011", "UE 11 updated");
+    #[tokio::test]
+    async fn ue_profile_http_put_succeeds_for_stopped_profile() {
+        let application = app(state());
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        create_http_profile(
+            &application,
+            &cookie,
+            &csrf,
+            "UE-11",
+            "imsi-001010000000011",
+        )
+        .await;
+        let mut update = profile_http_input("UE-11", "imsi-001010000000011", "UE 11 updated");
         update["supi"] = Value::Null;
         update["authentication_key"] = Value::Null;
         update["opc"] = Value::Null;
-        let updated = application
-            .clone()
-            .oneshot(request(Method::PUT, "/api/v1/ue-profiles/UE-11", update))
-            .await
-            .unwrap();
-        assert_eq!(updated.status(), StatusCode::OK);
-
-        let cloned = application
-            .clone()
-            .oneshot(request(
-                Method::POST,
-                "/api/v1/ue-profiles/UE-11/clone",
-                json!({"target_ue_id":"UE-12"}),
+        let response = application
+            .oneshot(profile_http_request(
+                Method::PUT,
+                "/api/v1/ue-profiles/UE-11",
+                update,
+                &cookie,
+                &csrf,
             ))
             .await
             .unwrap();
-        assert_eq!(cloned.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 
-        for ue_id in ["UE-12", "UE-11"] {
-            let deleted = application
-                .clone()
-                .oneshot(request(
-                    Method::DELETE,
-                    &format!("/api/v1/ue-profiles/{ue_id}"),
-                    json!({}),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(deleted.status(), StatusCode::OK);
-        }
+    #[tokio::test]
+    async fn ue_profile_http_clone_succeeds_for_stopped_profile() {
+        let application = app(state());
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        create_http_profile(
+            &application,
+            &cookie,
+            &csrf,
+            "UE-11",
+            "imsi-001010000000011",
+        )
+        .await;
+        let response = application
+            .oneshot(profile_http_request(
+                Method::POST,
+                "/api/v1/ue-profiles/UE-11/clone",
+                json!({"target_ue_id":"UE-12"}),
+                &cookie,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn ue_profile_http_delete_succeeds_for_stopped_profile() {
+        let application = app(state());
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        create_http_profile(
+            &application,
+            &cookie,
+            &csrf,
+            "UE-11",
+            "imsi-001010000000011",
+        )
+        .await;
+        let response = application
+            .oneshot(profile_http_request(
+                Method::DELETE,
+                "/api/v1/ue-profiles/UE-11",
+                json!({}),
+                &cookie,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -7778,6 +7836,7 @@ mod p0_tests {
         let definition = |id: &str, name: &str, step_type: &str| {
             json!({
                 "id":id,"name":name,
+                "loop_count":2,
                 "steps":[{
                     "type":step_type,"loop_count":2,
                     "parameters":{"duration_ms":{"random":{"min":10,"max":20}}}
@@ -7895,9 +7954,11 @@ mod p0_tests {
         let job: Value =
             serde_json::from_slice(&to_bytes(started.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(job["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(job["steps"].as_array().unwrap().len(), 4);
         assert!(job["steps"].as_array().unwrap().iter().all(|step| {
             step["state"] == "COMPLETED"
+                && step["scenario_loop"]["count"] == 2
+                && step["step_loop"]["count"] == 2
                 && (10..=20).contains(&step["resolved_parameters"]["duration_ms"].as_i64().unwrap())
         }));
         let steps = application
