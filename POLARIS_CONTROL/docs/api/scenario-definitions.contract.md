@@ -1,6 +1,6 @@
 # Scenario Definitions API contract
 
-API version: `0.10.0`. Base path: `/api/v1`. The catalog schema is `1` and is stored by
+API version: `0.12.0`. Base path: `/api/v1`. The catalog schema is `1` and is stored by
 atomic private write in `/var/lib/polaris-control/scenario-definitions.json`.
 
 ## Routes
@@ -13,8 +13,9 @@ atomic private write in `/var/lib/polaris-control/scenario-definitions.json`.
 | `PUT` | `/scenario-definitions/:id` | Replaces the definition and increments `version`; ID is immutable. |
 | `DELETE` | `/scenario-definitions/:id` | Deletes one definition. |
 | `POST` | `/scenario-definitions/:id/clone` | Creates `target_id` at version `1`. |
-| `POST` | `/scenarios/start` | Accepts `scenario_definition_id` and `ue_ids`; currently executable only in mock/offline mode. |
+| `POST` | `/scenarios/start` | Accepts `scenario_definition_id` and `ue_ids`; Live requires both Live execution mode and `POLARIS_DEFINITION_LIVE_ENABLED=true`. |
 | `GET` | `/scenarios/:job_id/steps` | Ordered resolved step states and parameters. |
+| `POST` | `/scenarios/stop` | Requests graceful cancellation; stops only UEs started by that definition job. |
 
 Allowed V1 step types are `ue_start`, `ue_stop`, `pdu_establish`, `pdu_release`,
 `udp_traffic`, and `wait`. Any other value returns HTTP `422` with
@@ -27,8 +28,15 @@ Parameters are either `{"fixed": value}` or integer `{"random":{"min":a,"max":b}
 Random values are selected by the backend and stored in `resolved_parameters`.
 
 One `POST /scenarios/start` request creates one job containing all selected `ue_ids`, not one
-job per UE. Definition jobs are Live-locked in this version; the legacy Live runtime stores at
-most one active scenario job.
+job per UE. The Live definition executor permits one active definition job and preserves
+`PENDING`, `RUNNING`, `COMPLETED`, or `FAILED` per-step evidence. The safety switch defaults to
+disabled; a missing or non-exact value returns HTTP `423`.
+
+`udp_traffic` reuses the certified five-datagram profile and rejects any other `packet_count`.
+`pdu_establish` observes the runtime until the PDU is `ACTIVE`. UERANSIM exposes no independent
+PDU release command in this integration; `pdu_release` is realized by a graceful stop of the
+selected controller-owned UE, which releases its PDU with the UE lifecycle. It does not write
+Open5GS.
 
 ## Measured examples
 
@@ -92,4 +100,4 @@ HTTP 422
 | `404` | `SCENARIO_DEFINITION_NOT_FOUND`, `SCENARIO_JOB_NOT_FOUND` |
 | `409` | `SCENARIO_DEFINITION_ALREADY_EXISTS` |
 | `422` | Invalid ID/name, immutable ID, step count/type, loop count, resolved-step cap, parameter/range, duplicate/invalid UE selection or unowned UE. Exact code is returned in `error`. |
-| `423` | `SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED` outside mock mode. |
+| `423` | `SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED` unless explicitly enabled in Live mode. |

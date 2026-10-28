@@ -1,4 +1,4 @@
-use polaris_control_api::verify_open5gs_profile_binding;
+use polaris_control_api::{verify_open5gs_profile_binding, UeProfileRegistry};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -16,6 +16,7 @@ fn main() {
     let mut ue01_profile = PathBuf::from("/root/POLARIS/runtime/ueransim/ue.yaml");
     let mut output = PathBuf::from("/var/lib/polaris-control/ue-provisioning-attestation.json");
     let mut count = 3_usize;
+    let mut profile_registry = None;
     let mut write = false;
     let mut offline_fixture = false;
     let mut args = std::env::args().skip(1);
@@ -46,6 +47,7 @@ fn main() {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or_else(|| fail("COUNT_INVALID"))
             }
+            "--profile-registry" => profile_registry = args.next().map(PathBuf::from),
             "--write" => write = true,
             "--offline-fixture" => offline_fixture = true,
             _ => fail("ARGUMENT_INVALID"),
@@ -74,12 +76,36 @@ fn main() {
         .get("subscribers")
         .and_then(Value::as_array)
         .unwrap_or_else(|| fail("OPEN5GS_RECORDS_INVALID"));
+    let profiles = if let Some(path) = profile_registry {
+        if !offline_fixture {
+            require_private_root_file(&path).unwrap_or_else(|error| fail(&error));
+        }
+        let registry: UeProfileRegistry = serde_json::from_slice(
+            &fs::read(path).unwrap_or_else(|_| fail("PROFILE_REGISTRY_UNREADABLE")),
+        )
+        .unwrap_or_else(|_| fail("PROFILE_REGISTRY_INVALID"));
+        registry
+            .profiles
+            .into_iter()
+            .filter(|record| record.profile.configured)
+            .map(|record| record.profile)
+            .take(count)
+            .collect::<Vec<_>>()
+    } else {
+        planned_profiles().into_iter().take(count).collect()
+    };
+    if profiles.len() != count {
+        fail("PROFILE_COUNT_MISMATCH");
+    }
     let mut bindings = Vec::<ProvisioningBinding>::new();
-    for profile in planned_profiles().into_iter().take(count) {
-        let path = if profile.ue_id == "UE-01" {
+    for profile in profiles {
+        let managed_path = profile_root.join(&profile.profile_name);
+        let path = if managed_path.is_file() {
+            managed_path
+        } else if profile.ue_id == "UE-01" {
             ue01_profile.clone()
         } else {
-            profile_root.join(&profile.profile_name)
+            fail("PROFILE_UNREADABLE")
         };
         if !offline_fixture {
             require_private_root_file(&path).unwrap_or_else(|error| fail(&error));

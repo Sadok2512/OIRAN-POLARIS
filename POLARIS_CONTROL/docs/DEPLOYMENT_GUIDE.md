@@ -25,6 +25,10 @@ sudo target/release/polaris-provisioning-attest \
 
 Securely remove the secret-bearing export after verification. The resulting attestation is a trust input derived from independently queried records, not ongoing proof of database state.
 
+For profiles bound through a provisioning slot, use the reviewed two-phase regeneration script
+and procedure in `docs/operations/PROVISIONING_ATTESTATION_REGENERATION.md`. It reads the current
+profile registry and does not write Open5GS.
+
 Build with the commands in `README.md`. Create the untracked mode-0600 runtime environment from the example and provision named Operator/Administrator accounts with `polaris-userctl`.
 
 The binary refuses a non-`127.0.0.1` bind. The public-IP HTTP proxy strips cookies and remains Viewer-only. Use `https://polaris.etv-sadok.duckdns.org/` for privileged sessions.

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "ue_id": "UE-01",
+      "pseudonym": "UE-PSEUDONYM-01",
+      "profile_name": "ue-01.yaml",
+      "serving_gnb": "GNB-01",
+      "plmn_mcc": "001",
+      "plmn_mnc": "01",
+      "dnn": "internet",
+      "sst": 1,
+      "sd": "010203",
+      "configured": true,
+      "subscription_verified": false,
+      "subscriber_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "scenario_id": null,
+      "auto_run_scenario": false,
+      "revision": 1,
+      "created_at_epoch_s": 1792972800,
+      "updated_at_epoch_s": 1792972800
+    }
+  ]
+}

@@ -18,7 +18,7 @@ use cpu_safety::{CpuSafetyEvidence, CpuSafetyMonitor, ScenarioResourceBudget};
 use rand_core::{OsRng, RngCore};
 use safety_guard::{evaluate, measure, Policy};
 use scenario_definitions::{
-    resolve_steps, ScenarioCatalog, ScenarioDefinitionStore, ScenarioMutation,
+    resolve_steps, ResolvedStep, ScenarioCatalog, ScenarioDefinitionStore, ScenarioMutation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -40,14 +40,14 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,
 };
-use ue_profiles::{
-    BulkProfileInput, ManagedUeProfile, ProfileMutationInput, ProfileStore, UeProfileRegistry,
-};
+use ue_profiles::{BulkProfileInput, ManagedUeProfile, ProfileMutationInput, ProfileStore};
 use ueransim_adapter::{
     LiveLaunchSpec, ProvisionedProfileEvidence, ProvisioningBinding, UeObservation, UeProfileSpec,
 };
 
-pub const VERSION: &str = "0.10.0";
+pub use ue_profiles::UeProfileRegistry;
+
+pub const VERSION: &str = "0.12.0";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -76,6 +76,8 @@ pub struct AppState {
     profile_registry: Arc<Mutex<UeProfileRegistry>>,
     scenario_definition_store: ScenarioDefinitionStore,
     scenario_catalog: Arc<Mutex<ScenarioCatalog>>,
+    definition_live_enabled: bool,
+    definition_jobs: Arc<Mutex<BTreeMap<String, DefinitionJobControl>>>,
     policy_path: PathBuf,
     policy_enabled: Arc<AtomicBool>,
     execution_mode: String,
@@ -284,6 +286,12 @@ struct ControlRuntime {
     history: Vec<Value>,
 }
 
+#[derive(Clone)]
+struct DefinitionJobControl {
+    cancel: Arc<AtomicBool>,
+    started_ues: Arc<Mutex<BTreeSet<String>>>,
+}
+
 struct OwnedScenarioJob {
     job_id: String,
     started_at: u64,
@@ -340,6 +348,28 @@ trait UeRuntime: Send + Sync {
     ) -> Result<VerifiedTrafficTarget, String> {
         let _ = (job, destination);
         Err("TRAFFIC_TARGET_RESOLUTION_UNSUPPORTED".into())
+    }
+    fn execute_bounded_udp(&self, target: &VerifiedTrafficTarget) -> Result<(), String> {
+        let status = Command::new("/usr/bin/nsenter")
+            .args([
+                "--target",
+                &target.namespace_pid.to_string(),
+                "--net",
+                "--",
+                "/usr/bin/bash",
+                "-lc",
+                TRAFFIC_EXECUTION_COMMAND,
+            ])
+            .status()
+            .map_err(|_| "TRAFFIC_PROCESS_SPAWN_FAILED".to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "TRAFFIC_PROCESS_EXIT_{}",
+                status.code().unwrap_or(-1)
+            ))
+        }
     }
 }
 
@@ -1481,6 +1511,9 @@ impl AppState {
             profile_registry: Arc::new(Mutex::new(profile_registry)),
             scenario_definition_store,
             scenario_catalog: Arc::new(Mutex::new(scenario_catalog)),
+            definition_live_enabled: std::env::var("POLARIS_DEFINITION_LIVE_ENABLED")
+                .is_ok_and(|value| value == "true"),
+            definition_jobs: Arc::new(Mutex::new(BTreeMap::new())),
             policy_path,
             policy_enabled: Arc::new(AtomicBool::new(policy_enabled)),
             execution_mode: std::env::var("POLARIS_EXECUTION_MODE")
@@ -1549,6 +1582,25 @@ fn recover_runtime(stored: Option<Value>) -> ControlRuntime {
         .as_ref()
         .and_then(|value| value["history"].as_array().cloned())
         .unwrap_or_default();
+    for record in &mut history {
+        let interrupted_definition = record.get("scenario_definition_id").is_some()
+            && matches!(
+                record.get("state").and_then(Value::as_str),
+                Some("RUNNING" | "STOPPING")
+            );
+        if interrupted_definition {
+            record["state"] = json!("FAILED");
+            record["ended_at_epoch_s"] = json!(epoch_seconds());
+            record["terminal_result"] = json!("CONTROLLER_RESTART_RECOVERY");
+            if let Some(steps) = record.get_mut("steps").and_then(Value::as_array_mut) {
+                for step in steps.iter_mut().filter(|step| step["state"] == "RUNNING") {
+                    step["state"] = json!("FAILED");
+                    step["ended_at"] = json!(epoch_seconds());
+                    step["error"] = json!("CONTROLLER_RESTART_INTERRUPTED_STEP");
+                }
+            }
+        }
+    }
     history.iter_mut().for_each(normalize_terminal_record);
     if let Some(mut interrupted) = stored.and_then(|value| value["active"].as_object().cloned()) {
         interrupted.insert("state".into(), json!("FAILED"));
@@ -4767,6 +4819,378 @@ fn run_mock_definition_scenario(
     Ok(runtime.history[record_index].clone())
 }
 
+fn definition_record_index(runtime: &ControlRuntime, job_id: &str) -> Option<usize> {
+    runtime
+        .history
+        .iter()
+        .position(|record| record["job_id"].as_str() == Some(job_id))
+}
+
+fn update_definition_record(
+    state: &AppState,
+    job_id: &str,
+    update: impl FnOnce(&mut Value),
+) -> Result<Value, String> {
+    let mut runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?;
+    let index = definition_record_index(&runtime, job_id).ok_or("SCENARIO_JOB_NOT_FOUND")?;
+    update(&mut runtime.history[index]);
+    let value = runtime.history[index].clone();
+    persist_runtime(state, &runtime);
+    Ok(value)
+}
+
+fn resolved_parameter_u64(
+    step: &ResolvedStep,
+    name: &str,
+    default: u64,
+    maximum: u64,
+) -> Result<u64, String> {
+    let value = step
+        .parameters
+        .get(name)
+        .map(|value| value.as_u64().ok_or("SCENARIO_PARAMETER_INVALID"))
+        .transpose()?
+        .unwrap_or(default);
+    if value > maximum {
+        return Err("SCENARIO_PARAMETER_OUT_OF_RANGE".into());
+    }
+    Ok(value)
+}
+
+fn observe_controller_ue(state: &AppState, ue_id: &str) -> Result<UeObservation, String> {
+    let job = state
+        .multi_ue
+        .lock()
+        .map_err(|_| "UE_REGISTRY_UNAVAILABLE".to_string())?
+        .snapshot()
+        .into_iter()
+        .find(|job| job.ue_id == ue_id)
+        .ok_or("UE_NOT_STARTED")?;
+    let approved = job
+        .approved_runtime
+        .ok_or("LIVE_RUNTIME_APPROVAL_MISSING")?;
+    let handle = job.process_handle.ok_or("UE_NOT_STARTED")?;
+    let observation = state.ue_runtime.observe_owned(&approved, &handle)?;
+    let mut controller = state
+        .multi_ue
+        .lock()
+        .map_err(|_| "UE_REGISTRY_UNAVAILABLE".to_string())?;
+    controller.apply_observation(
+        ue_id,
+        &observation.process_state,
+        &observation.registration_state,
+        &observation.pdu_session_state,
+        observation.ue_ip.as_deref(),
+    )?;
+    persist_ue_registry(state, &controller)?;
+    Ok(observation)
+}
+
+fn wait_for_pdu_state(
+    state: &AppState,
+    ue_id: &str,
+    expected: &str,
+    timeout_seconds: u64,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("SCENARIO_STOP_REQUESTED".into());
+        }
+        match observe_controller_ue(state, ue_id) {
+            Ok(observation) if observation.pdu_session_state == expected => return Ok(()),
+            Ok(_) | Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Ok(_) => return Err(format!("PDU_STATE_{expected}_NOT_OBSERVED")),
+            Err(error) if expected == "INACTIVE" && error == "UE_NOT_STARTED" => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn run_bounded_udp_for_ue(state: &AppState, ue_id: &str) -> Result<(), String> {
+    let target = resolve_controller_traffic_target(state, ue_id)?;
+    state.ue_runtime.execute_bounded_udp(&target)
+}
+
+fn execute_live_definition_step(
+    state: &AppState,
+    step: &ResolvedStep,
+    ue_ids: &[String],
+    control: &DefinitionJobControl,
+) -> Result<(), String> {
+    match step.step_type.as_str() {
+        "wait" => {
+            let duration_ms = resolved_parameter_u64(step, "duration_ms", 1_000, 120_000)?;
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
+            while std::time::Instant::now() < deadline {
+                if control.cancel.load(Ordering::SeqCst) {
+                    return Err("SCENARIO_STOP_REQUESTED".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(())
+        }
+        "ue_start" => {
+            for ue_id in ue_ids {
+                if control.cancel.load(Ordering::SeqCst) {
+                    return Err("SCENARIO_STOP_REQUESTED".into());
+                }
+                let already_running = state
+                    .multi_ue
+                    .lock()
+                    .map_err(|_| "UE_REGISTRY_UNAVAILABLE".to_string())?
+                    .snapshot()
+                    .iter()
+                    .any(|job| job.ue_id == *ue_id && job.process_state == "RUNNING");
+                if !already_running {
+                    start_one_live(state, ue_id)?;
+                    control
+                        .started_ues
+                        .lock()
+                        .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                        .insert(ue_id.clone());
+                }
+            }
+            Ok(())
+        }
+        "ue_stop" | "pdu_release" => {
+            for ue_id in ue_ids {
+                let running = state
+                    .multi_ue
+                    .lock()
+                    .map_err(|_| "UE_REGISTRY_UNAVAILABLE".to_string())?
+                    .snapshot()
+                    .iter()
+                    .any(|job| job.ue_id == *ue_id && job.process_state == "RUNNING");
+                if running {
+                    stop_one_live(state, ue_id)?;
+                }
+                control
+                    .started_ues
+                    .lock()
+                    .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                    .remove(ue_id);
+            }
+            Ok(())
+        }
+        "pdu_establish" => {
+            let timeout = resolved_parameter_u64(step, "timeout_seconds", 30, 120)?;
+            for ue_id in ue_ids {
+                wait_for_pdu_state(state, ue_id, "ACTIVE", timeout, &control.cancel)?;
+            }
+            Ok(())
+        }
+        "udp_traffic" => {
+            let packets = resolved_parameter_u64(step, "packet_count", 5, 5)?;
+            if packets != 5 {
+                return Err("UDP_PROFILE_MUST_USE_FIVE_DATAGRAMS".into());
+            }
+            for ue_id in ue_ids {
+                if control.cancel.load(Ordering::SeqCst) {
+                    return Err("SCENARIO_STOP_REQUESTED".into());
+                }
+                run_bounded_udp_for_ue(state, ue_id)?;
+            }
+            Ok(())
+        }
+        _ => Err("SCENARIO_STEP_TYPE_UNSUPPORTED".into()),
+    }
+}
+
+fn cleanup_definition_started_ues(state: &AppState, control: &DefinitionJobControl) -> Vec<String> {
+    let started = control
+        .started_ues
+        .lock()
+        .map(|ids| ids.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut errors = Vec::new();
+    for ue_id in started {
+        if let Err(error) = stop_one_live(state, &ue_id) {
+            errors.push(format!("{ue_id}:{error}"));
+        } else if let Ok(mut ids) = control.started_ues.lock() {
+            ids.remove(&ue_id);
+        }
+    }
+    errors
+}
+
+fn execute_live_definition_job(
+    state: Arc<AppState>,
+    job_id: String,
+    resolved: Vec<ResolvedStep>,
+    ue_ids: Vec<String>,
+    control: DefinitionJobControl,
+) {
+    let mut terminal_state = "COMPLETED";
+    let mut terminal_result = "LIVE_COMPLETED".to_string();
+    for (position, step) in resolved.iter().enumerate() {
+        if control.cancel.load(Ordering::SeqCst) {
+            terminal_state = "STOPPED";
+            terminal_result = "OPERATOR_STOP".into();
+            break;
+        }
+        let _ = update_definition_record(&state, &job_id, |record| {
+            record["steps"][position]["state"] = json!("RUNNING");
+            record["steps"][position]["started_at"] = json!(epoch_seconds());
+        });
+        match execute_live_definition_step(&state, step, &ue_ids, &control) {
+            Ok(()) => {
+                let _ = update_definition_record(&state, &job_id, |record| {
+                    record["steps"][position]["state"] = json!("COMPLETED");
+                    record["steps"][position]["ended_at"] = json!(epoch_seconds());
+                });
+            }
+            Err(error) if error == "SCENARIO_STOP_REQUESTED" => {
+                terminal_state = "STOPPED";
+                terminal_result = "OPERATOR_STOP".into();
+                let _ = update_definition_record(&state, &job_id, |record| {
+                    record["steps"][position]["state"] = json!("FAILED");
+                    record["steps"][position]["ended_at"] = json!(epoch_seconds());
+                    record["steps"][position]["error"] = json!(error);
+                });
+                break;
+            }
+            Err(error) => {
+                terminal_state = "FAILED";
+                terminal_result = "STEP_FAILED".into();
+                let _ = update_definition_record(&state, &job_id, |record| {
+                    record["steps"][position]["state"] = json!("FAILED");
+                    record["steps"][position]["ended_at"] = json!(epoch_seconds());
+                    record["steps"][position]["error"] = json!(error);
+                });
+                break;
+            }
+        }
+    }
+    let cleanup_errors = if terminal_state == "COMPLETED" {
+        Vec::new()
+    } else {
+        cleanup_definition_started_ues(&state, &control)
+    };
+    if !cleanup_errors.is_empty() {
+        terminal_state = "FAILED";
+        terminal_result = "UE_CLEANUP_FAILED".into();
+    }
+    let _ = update_definition_record(&state, &job_id, |record| {
+        record["state"] = json!(terminal_state);
+        record["ended_at_epoch_s"] = json!(epoch_seconds());
+        record["terminal_result"] = json!(terminal_result);
+        record["cleanup_errors"] = json!(cleanup_errors);
+    });
+    if let Ok(mut jobs) = state.definition_jobs.lock() {
+        jobs.remove(&job_id);
+    }
+}
+
+fn start_live_definition_scenario(
+    state: Arc<AppState>,
+    definition_id: &str,
+    ue_ids: &[String],
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    if !state.definition_live_enabled || state.execution_mode != "live" {
+        return Err((
+            StatusCode::LOCKED,
+            Json(json!({"error":"SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED"})),
+        ));
+    }
+    if ue_ids.is_empty() || ue_ids.len() > ueransim_adapter::MAX_LIVE_UES {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"SCENARIO_UE_SELECTION_INVALID"})),
+        ));
+    }
+    if ue_ids.iter().collect::<BTreeSet<_>>().len() != ue_ids.len() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"SCENARIO_UE_SELECTION_DUPLICATE"})),
+        ));
+    }
+    let profiles = state.multi_ue.lock().unwrap().profiles();
+    if ue_ids.iter().any(|ue_id| {
+        !controller_owns_ue(&state, ue_id)
+            || !profiles.iter().any(|profile| profile.ue_id == *ue_id)
+    }) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"SCENARIO_UE_NOT_CONTROLLER_OWNED"})),
+        ));
+    }
+    resource_gate(&state).map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(cpu_error_response(&state, &error)),
+        )
+    })?;
+    let definition = state
+        .scenario_catalog
+        .lock()
+        .unwrap()
+        .definitions
+        .iter()
+        .find(|item| item.id == definition_id)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"SCENARIO_DEFINITION_NOT_FOUND"})),
+            )
+        })?;
+    let resolved = resolve_steps(&definition).map_err(scenario_definition_error)?;
+    let job_id = format!("{}-{}", definition.id, random_hex(6));
+    let steps = resolved
+        .iter()
+        .map(|step| {
+            json!({
+                "index":step.index,
+                "type":step.step_type,
+                "scenario_loop":{"iteration":step.scenario_loop_iteration,"count":step.scenario_loop_count},
+                "step_loop":{"iteration":step.step_loop_iteration,"count":step.step_loop_count},
+                "state":"PENDING","started_at":Value::Null,"ended_at":Value::Null,
+                "error":Value::Null,"resolved_parameters":step.parameters
+            })
+        })
+        .collect::<Vec<_>>();
+    let record = json!({
+        "job_id":job_id,"scenario_id":definition.id,"scenario_definition_id":definition.id,
+        "scenario_definition_version":definition.version,"ue_ids":ue_ids,"state":"RUNNING",
+        "traffic_state":"PENDING","started_at_epoch_s":epoch_seconds(),
+        "ended_at_epoch_s":Value::Null,"terminal_result":Value::Null,"steps":steps
+    });
+    let control = DefinitionJobControl {
+        cancel: Arc::new(AtomicBool::new(false)),
+        started_ues: Arc::new(Mutex::new(BTreeSet::new())),
+    };
+    {
+        let mut jobs = state.definition_jobs.lock().unwrap();
+        if !jobs.is_empty() {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error":"SCENARIO_CONFLICT"})),
+            ));
+        }
+        jobs.insert(job_id.clone(), control.clone());
+    }
+    {
+        let mut runtime = state.runtime.lock().unwrap();
+        runtime.history.push(record.clone());
+        persist_runtime(&state, &runtime);
+    }
+    let worker_state = state.clone();
+    let worker_job_id = job_id.clone();
+    let worker_ues = ue_ids.to_vec();
+    std::thread::spawn(move || {
+        execute_live_definition_job(worker_state, worker_job_id, resolved, worker_ues, control)
+    });
+    Ok(record)
+}
+
 async fn start_scenario(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
@@ -4796,7 +5220,12 @@ async fn start_scenario(
         );
     }
     if let Some(definition_id) = input.scenario_definition_id.as_deref() {
-        return match run_mock_definition_scenario(&state, definition_id, &input.ue_ids) {
+        let outcome = if state.execution_mode == "mock" {
+            run_mock_definition_scenario(&state, definition_id, &input.ue_ids)
+        } else {
+            start_live_definition_scenario(state.clone(), definition_id, &input.ue_ids)
+        };
+        return match outcome {
             Ok(record) => (StatusCode::OK, Json(record)),
             Err(error) => error,
         };
@@ -5044,6 +5473,27 @@ async fn stop_scenario(
             StatusCode::FORBIDDEN,
             Json(json!({"error":"CSRF_TOKEN_REQUIRED"})),
         );
+    }
+    let definition_control = state
+        .definition_jobs
+        .lock()
+        .ok()
+        .and_then(|jobs| jobs.get(&input.job_id).cloned());
+    if let Some(control) = definition_control {
+        control.cancel.store(true, Ordering::SeqCst);
+        let response = update_definition_record(&state, &input.job_id, |record| {
+            record["state"] = json!("STOPPING");
+            record["terminal_result"] = json!("OPERATOR_STOP_REQUESTED");
+        })
+        .unwrap_or_else(|_| json!({"job_id":input.job_id,"state":"STOPPING"}));
+        audit(
+            &state,
+            &identity.role,
+            "STOP_SCENARIO_DEFINITION",
+            "STOPPING",
+            Some(&input.job_id),
+        );
+        return (StatusCode::OK, Json(response));
     }
     let mut runtime = state.runtime.lock().unwrap();
     if refresh_runtime_with_state(&state, &mut runtime) {
@@ -5650,6 +6100,10 @@ mod p0_tests {
                 ue_ip: job.ue_ip.clone().ok_or("UE_IP_NOT_VERIFIED")?,
             })
         }
+
+        fn execute_bounded_udp(&self, _: &VerifiedTrafficTarget) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     struct PostRunInspectionFailureRuntime {
@@ -5851,6 +6305,8 @@ mod p0_tests {
                 root.join("scenario-definitions.json"),
             ),
             scenario_catalog: Arc::new(Mutex::new(ScenarioCatalog::default())),
+            definition_live_enabled: false,
+            definition_jobs: Arc::new(Mutex::new(BTreeMap::new())),
             policy_path: root.join("policy.json"),
             policy_enabled: Arc::new(AtomicBool::new(true)),
             execution_mode: "mock".into(),
@@ -8080,5 +8536,238 @@ mod p0_tests {
                 .unwrap();
             assert_eq!(deleted.status(), StatusCode::OK);
         }
+    }
+
+    fn install_definition(
+        test_state: &mut AppState,
+        id: &str,
+        steps: Vec<scenario_definitions::ScenarioStep>,
+    ) {
+        let now = epoch_seconds();
+        test_state
+            .scenario_catalog
+            .lock()
+            .unwrap()
+            .definitions
+            .push(scenario_definitions::ScenarioDefinition {
+                id: id.into(),
+                name: id.into(),
+                version: 1,
+                loop_count: 1,
+                steps,
+                created_at_epoch_s: now,
+                updated_at_epoch_s: now,
+            });
+    }
+
+    fn fixed_parameter(value: Value) -> scenario_definitions::ParameterSpec {
+        scenario_definitions::ParameterSpec::Fixed { fixed: value }
+    }
+
+    #[test]
+    fn definition_live_execution_is_locked_by_default() {
+        let test_state = Arc::new(state());
+        let error =
+            start_live_definition_scenario(test_state, "missing", &["UE-02".into()]).unwrap_err();
+        assert_eq!(error.0, StatusCode::LOCKED);
+        assert_eq!(
+            error.1 .0["error"],
+            "SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED"
+        );
+    }
+
+    #[test]
+    fn definition_recovery_fails_interrupted_step_closed() {
+        let recovered = recover_runtime(Some(json!({
+            "active":Value::Null,
+            "history":[{
+                "job_id":"definition-restart",
+                "scenario_definition_id":"definition",
+                "state":"RUNNING",
+                "started_at_epoch_s":1,
+                "steps":[{"state":"RUNNING","error":Value::Null}]
+            }]
+        })));
+        assert_eq!(recovered.history[0]["state"], "FAILED");
+        assert_eq!(
+            recovered.history[0]["terminal_result"],
+            "CONTROLLER_RESTART_RECOVERY"
+        );
+        assert_eq!(recovered.history[0]["steps"][0]["state"], "FAILED");
+        assert_eq!(
+            recovered.history[0]["steps"][0]["error"],
+            "CONTROLLER_RESTART_INTERRUPTED_STEP"
+        );
+    }
+
+    #[test]
+    fn live_definition_reports_real_step_transitions_without_host_execution() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        test_state.definition_live_enabled = true;
+        test_state.additional_ue_live_enabled = true;
+        test_state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .configure_count(2)
+            .unwrap();
+        install_definition(
+            &mut test_state,
+            "live-state-test",
+            vec![
+                scenario_definitions::ScenarioStep {
+                    step_type: "ue_start".into(),
+                    loop_count: 1,
+                    parameters: BTreeMap::new(),
+                },
+                scenario_definitions::ScenarioStep {
+                    step_type: "pdu_establish".into(),
+                    loop_count: 1,
+                    parameters: BTreeMap::from([(
+                        "timeout_seconds".into(),
+                        fixed_parameter(json!(1)),
+                    )]),
+                },
+                scenario_definitions::ScenarioStep {
+                    step_type: "wait".into(),
+                    loop_count: 1,
+                    parameters: BTreeMap::from([("duration_ms".into(), fixed_parameter(json!(1)))]),
+                },
+                scenario_definitions::ScenarioStep {
+                    step_type: "udp_traffic".into(),
+                    loop_count: 1,
+                    parameters: BTreeMap::from([(
+                        "packet_count".into(),
+                        fixed_parameter(json!(5)),
+                    )]),
+                },
+                scenario_definitions::ScenarioStep {
+                    step_type: "pdu_release".into(),
+                    loop_count: 1,
+                    parameters: BTreeMap::new(),
+                },
+                scenario_definitions::ScenarioStep {
+                    step_type: "ue_stop".into(),
+                    loop_count: 1,
+                    parameters: BTreeMap::new(),
+                },
+            ],
+        );
+        let state = Arc::new(test_state);
+        let record =
+            start_live_definition_scenario(state.clone(), "live-state-test", &["UE-02".into()])
+                .unwrap();
+        let job_id = record["job_id"].as_str().unwrap().to_string();
+        for _ in 0..200 {
+            let terminal = state
+                .runtime
+                .lock()
+                .unwrap()
+                .history
+                .iter()
+                .find(|item| item["job_id"] == job_id)
+                .cloned()
+                .unwrap();
+            if terminal["state"] != "RUNNING" {
+                assert_eq!(terminal["state"], "COMPLETED");
+                assert!(terminal["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|step| step["state"] == "COMPLETED"));
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("definition job did not terminate");
+    }
+
+    #[test]
+    fn operator_stop_cancels_definition_and_cleans_only_job_started_ues() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        test_state.definition_live_enabled = true;
+        test_state.additional_ue_live_enabled = true;
+        test_state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .configure_count(2)
+            .unwrap();
+        install_definition(
+            &mut test_state,
+            "cancel-test",
+            vec![
+                scenario_definitions::ScenarioStep {
+                    step_type: "ue_start".into(),
+                    loop_count: 1,
+                    parameters: BTreeMap::new(),
+                },
+                scenario_definitions::ScenarioStep {
+                    step_type: "wait".into(),
+                    loop_count: 1,
+                    parameters: BTreeMap::from([(
+                        "duration_ms".into(),
+                        fixed_parameter(json!(5_000)),
+                    )]),
+                },
+            ],
+        );
+        let state = Arc::new(test_state);
+        let record =
+            start_live_definition_scenario(state.clone(), "cancel-test", &["UE-02".into()])
+                .unwrap();
+        let job_id = record["job_id"].as_str().unwrap().to_string();
+        for _ in 0..100 {
+            let started = state
+                .definition_jobs
+                .lock()
+                .unwrap()
+                .get(&job_id)
+                .unwrap()
+                .started_ues
+                .lock()
+                .unwrap()
+                .contains("UE-02");
+            if started {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        state
+            .definition_jobs
+            .lock()
+            .unwrap()
+            .get(&job_id)
+            .unwrap()
+            .cancel
+            .store(true, Ordering::SeqCst);
+        for _ in 0..200 {
+            if !state.definition_jobs.lock().unwrap().contains_key(&job_id) {
+                let terminal = state
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .history
+                    .iter()
+                    .find(|item| item["job_id"] == job_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(terminal["state"], "STOPPED");
+                let ue = state
+                    .multi_ue
+                    .lock()
+                    .unwrap()
+                    .snapshot()
+                    .into_iter()
+                    .find(|item| item.ue_id == "UE-02")
+                    .unwrap();
+                assert_ne!(ue.process_state, "RUNNING");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("definition cancellation did not terminate");
     }
 }

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.12.0 (polaris-control-api)
+
+- Minor: execute the six V1 scenario-definition steps through the existing controller-owned UE
+  runtime, bounded UDP profile and `MAX_LIVE_UES` selection limit.
+- Minor: keep definition execution fail-closed behind
+  `POLARIS_DEFINITION_LIVE_ENABLED=true` (disabled by default), persist real per-step transitions,
+  and make Operator stop clean up only UEs started by the job.
+- Minor: allow `polaris-provisioning-attest` to attest the current protected UE profile registry
+  after slot binding; the documented helper remains dry-run by default and never writes Open5GS.
+
 ## 3.2.5 - Candidate UE inventory latency correction
 
 - Replaced process-global UE observation coordination with per-application state.
