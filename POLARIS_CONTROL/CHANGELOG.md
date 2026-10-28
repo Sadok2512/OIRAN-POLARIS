@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.12.1 (polaris-control-api)
+
+- Patch: execute `pdu_establish` with UERANSIM `nr-cli ps-establish` and `pdu_release` with
+  `nr-cli ps-release-all` inside the exact controller-owned UE container.
+- Patch: require an observed `ACTIVE`/`INACTIVE` state after each PDU command; PDU release no
+  longer stops the UE process.
+
 ## 0.12.0 (polaris-control-api)
 
 - Minor: execute the six V1 scenario-definition steps through the existing controller-owned UE

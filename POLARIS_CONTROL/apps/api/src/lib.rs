@@ -47,7 +47,7 @@ use ueransim_adapter::{
 
 pub use ue_profiles::UeProfileRegistry;
 
-pub const VERSION: &str = "0.12.0";
+pub const VERSION: &str = "0.12.1";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -341,6 +341,25 @@ trait UeRuntime: Send + Sync {
     fn observe_shared(&self) -> Result<UeObservation, String>;
     fn owns(&self, spec: &LiveLaunchSpec, handle: &str) -> bool;
     fn stop(&self, spec: &LiveLaunchSpec, handle: &str) -> Result<(), String>;
+    fn establish_pdu(
+        &self,
+        job: &simulator_controller::UeJob,
+        profile: &UeProfileSpec,
+        timeout_seconds: u64,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let _ = (job, profile, timeout_seconds, cancel);
+        Err("PDU_RUNTIME_COMMAND_UNSUPPORTED".into())
+    }
+    fn release_pdu(
+        &self,
+        job: &simulator_controller::UeJob,
+        timeout_seconds: u64,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let _ = (job, timeout_seconds, cancel);
+        Err("PDU_RUNTIME_COMMAND_UNSUPPORTED".into())
+    }
     fn resolve_traffic_target(
         &self,
         job: &simulator_controller::UeJob,
@@ -899,6 +918,65 @@ impl DockerUeRuntime {
         ]
     }
 
+    fn ue_cli_node(target: &str) -> Result<String, String> {
+        let nodes = Self::output(&Self::node_list_command(target))?;
+        let mut names = nodes.lines().map(str::trim).filter(|line| !line.is_empty());
+        let node_name = names.next().ok_or("UE_CLI_NODE_NOT_OBSERVED")?;
+        if names.next().is_some() {
+            return Err("UE_CLI_NODE_AMBIGUOUS".into());
+        }
+        Ok(node_name.into())
+    }
+
+    fn execute_ue_cli(target: &str, command: String) -> Result<(), String> {
+        let node_name = Self::ue_cli_node(target)?;
+        Self::output(&[
+            "exec".into(),
+            target.into(),
+            "nr-cli".into(),
+            node_name,
+            "-e".into(),
+            command,
+        ])
+        .map(|_| ())
+    }
+
+    fn pdu_establish_command(profile: &UeProfileSpec) -> String {
+        let mut command = format!(
+            "ps-establish IPv4 --dnn {} --sst {}",
+            profile.dnn, profile.sst
+        );
+        if let Some(sd) = profile.sd.as_deref() {
+            command.push_str(" --sd ");
+            command.push_str(sd);
+        }
+        command
+    }
+
+    fn wait_for_owned_pdu(
+        &self,
+        spec: &LiveLaunchSpec,
+        handle: &str,
+        expected: &str,
+        timeout_seconds: u64,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Err("SCENARIO_STOP_REQUESTED".into());
+            }
+            let observed = self.observe_owned(spec, handle)?;
+            if observed.pdu_session_state == expected {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("PDU_STATE_{expected}_NOT_OBSERVED"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
     fn node_list_command(target: &str) -> Vec<String> {
         vec![
             "exec".into(),
@@ -914,13 +992,8 @@ impl DockerUeRuntime {
         if process_state != "running" {
             return Ok(ueransim_adapter::observe_ueransim(process_state, "", ""));
         }
-        let nodes = Self::output(&Self::node_list_command(target))?;
-        let mut names = nodes.lines().map(str::trim).filter(|line| !line.is_empty());
-        let node_name = names.next().ok_or("UE_CLI_NODE_NOT_OBSERVED")?;
-        if names.next().is_some() {
-            return Err("UE_CLI_NODE_AMBIGUOUS".into());
-        }
-        let commands = Self::observation_commands(target, node_name);
+        let node_name = Self::ue_cli_node(target)?;
+        let commands = Self::observation_commands(target, &node_name);
         let status = Self::output(&commands[0])?;
         let sessions = Self::output(&commands[1])?;
         let tunnels = Self::output(&commands[2])?;
@@ -1147,6 +1220,51 @@ impl UeRuntime for DockerUeRuntime {
             return Ok(());
         }
         Self::output(&["stop".into(), "--time".into(), "10".into(), id.into()]).map(|_| ())
+    }
+
+    fn establish_pdu(
+        &self,
+        job: &simulator_controller::UeJob,
+        profile: &UeProfileSpec,
+        timeout_seconds: u64,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let handle = job.process_handle.as_deref().ok_or("UE_NOT_STARTED")?;
+        let spec = job
+            .approved_runtime
+            .as_ref()
+            .ok_or("LIVE_RUNTIME_APPROVAL_MISSING")?;
+        if !self.owns(spec, handle) {
+            return Err("LIVE_UE_OWNERSHIP_NOT_PROVEN".into());
+        }
+        if self.observe_owned(spec, handle)?.pdu_session_state == "ACTIVE" {
+            return Ok(());
+        }
+        let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
+        Self::execute_ue_cli(target, Self::pdu_establish_command(profile))?;
+        self.wait_for_owned_pdu(spec, handle, "ACTIVE", timeout_seconds, cancel)
+    }
+
+    fn release_pdu(
+        &self,
+        job: &simulator_controller::UeJob,
+        timeout_seconds: u64,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        let handle = job.process_handle.as_deref().ok_or("UE_NOT_STARTED")?;
+        let spec = job
+            .approved_runtime
+            .as_ref()
+            .ok_or("LIVE_RUNTIME_APPROVAL_MISSING")?;
+        if !self.owns(spec, handle) {
+            return Err("LIVE_UE_OWNERSHIP_NOT_PROVEN".into());
+        }
+        if self.observe_owned(spec, handle)?.pdu_session_state == "INACTIVE" {
+            return Ok(());
+        }
+        let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
+        Self::execute_ue_cli(target, "ps-release-all".into())?;
+        self.wait_for_owned_pdu(spec, handle, "INACTIVE", timeout_seconds, cancel)
     }
 
     fn resolve_traffic_target(
@@ -4889,30 +5007,6 @@ fn observe_controller_ue(state: &AppState, ue_id: &str) -> Result<UeObservation,
     Ok(observation)
 }
 
-fn wait_for_pdu_state(
-    state: &AppState,
-    ue_id: &str,
-    expected: &str,
-    timeout_seconds: u64,
-    cancel: &AtomicBool,
-) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
-    loop {
-        if cancel.load(Ordering::SeqCst) {
-            return Err("SCENARIO_STOP_REQUESTED".into());
-        }
-        match observe_controller_ue(state, ue_id) {
-            Ok(observation) if observation.pdu_session_state == expected => return Ok(()),
-            Ok(_) | Err(_) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-            Ok(_) => return Err(format!("PDU_STATE_{expected}_NOT_OBSERVED")),
-            Err(error) if expected == "INACTIVE" && error == "UE_NOT_STARTED" => return Ok(()),
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 fn run_bounded_udp_for_ue(state: &AppState, ue_id: &str) -> Result<(), String> {
     let target = resolve_controller_traffic_target(state, ue_id)?;
     state.ue_runtime.execute_bounded_udp(&target)
@@ -4960,7 +5054,7 @@ fn execute_live_definition_step(
             }
             Ok(())
         }
-        "ue_stop" | "pdu_release" => {
+        "ue_stop" => {
             for ue_id in ue_ids {
                 let running = state
                     .multi_ue
@@ -4983,7 +5077,51 @@ fn execute_live_definition_step(
         "pdu_establish" => {
             let timeout = resolved_parameter_u64(step, "timeout_seconds", 30, 120)?;
             for ue_id in ue_ids {
-                wait_for_pdu_state(state, ue_id, "ACTIVE", timeout, &control.cancel)?;
+                let (job, profile) = {
+                    let controller = state
+                        .multi_ue
+                        .lock()
+                        .map_err(|_| "UE_REGISTRY_UNAVAILABLE".to_string())?;
+                    let job = controller
+                        .snapshot()
+                        .into_iter()
+                        .find(|job| job.ue_id == *ue_id)
+                        .ok_or("UE_NOT_STARTED")?;
+                    let profile = controller
+                        .profiles()
+                        .into_iter()
+                        .find(|profile| profile.ue_id == *ue_id)
+                        .ok_or("UNKNOWN_UE_PROFILE")?;
+                    (job, profile)
+                };
+                state
+                    .ue_runtime
+                    .establish_pdu(&job, &profile, timeout, &control.cancel)?;
+                let observation = observe_controller_ue(state, ue_id)?;
+                if observation.pdu_session_state != "ACTIVE" {
+                    return Err("PDU_STATE_ACTIVE_NOT_OBSERVED".into());
+                }
+            }
+            Ok(())
+        }
+        "pdu_release" => {
+            let timeout = resolved_parameter_u64(step, "timeout_seconds", 30, 120)?;
+            for ue_id in ue_ids {
+                let job = state
+                    .multi_ue
+                    .lock()
+                    .map_err(|_| "UE_REGISTRY_UNAVAILABLE".to_string())?
+                    .snapshot()
+                    .into_iter()
+                    .find(|job| job.ue_id == *ue_id)
+                    .ok_or("UE_NOT_STARTED")?;
+                state
+                    .ue_runtime
+                    .release_pdu(&job, timeout, &control.cancel)?;
+                let observation = observe_controller_ue(state, ue_id)?;
+                if observation.pdu_session_state != "INACTIVE" {
+                    return Err("PDU_STATE_INACTIVE_NOT_OBSERVED".into());
+                }
             }
             Ok(())
         }
@@ -6046,6 +6184,19 @@ mod p0_tests {
             if self.fail_observation {
                 return Err("INJECTED_OBSERVATION_FAILURE".into());
             }
+            if self
+                .stopped
+                .lock()
+                .unwrap()
+                .contains(&format!("PDU_RELEASED:{}", spec.ue_id))
+            {
+                return Ok(UeObservation {
+                    process_state: "RUNNING".into(),
+                    registration_state: "REGISTERED".into(),
+                    pdu_session_state: "INACTIVE".into(),
+                    ue_ip: None,
+                });
+            }
             Ok(Self::observation(if spec.ue_id == "UE-02" {
                 "10.46.0.5"
             } else {
@@ -6069,6 +6220,33 @@ mod p0_tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn establish_pdu(
+            &self,
+            job: &simulator_controller::UeJob,
+            _: &UeProfileSpec,
+            _: u64,
+            _: &AtomicBool,
+        ) -> Result<(), String> {
+            self.stopped
+                .lock()
+                .unwrap()
+                .retain(|item| item != &format!("PDU_RELEASED:{}", job.ue_id));
+            Ok(())
+        }
+
+        fn release_pdu(
+            &self,
+            job: &simulator_controller::UeJob,
+            _: u64,
+            _: &AtomicBool,
+        ) -> Result<(), String> {
+            self.stopped
+                .lock()
+                .unwrap()
+                .push(format!("PDU_RELEASED:{}", job.ue_id));
+            Ok(())
         }
 
         fn resolve_traffic_target(
@@ -7352,6 +7530,52 @@ mod p0_tests {
             .iter()
             .flatten()
             .all(|argument| argument != "sh" && argument != "-c"));
+        let profile = ueransim_adapter::planned_profiles().remove(0);
+        assert_eq!(
+            DockerUeRuntime::pdu_establish_command(&profile),
+            "ps-establish IPv4 --dnn internet --sst 1 --sd 010203"
+        );
+    }
+
+    #[test]
+    fn pdu_commands_change_session_state_without_stopping_owned_ue() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        test_state.additional_ue_live_enabled = true;
+        test_state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .configure_count(2)
+            .unwrap();
+        start_one_live(&test_state, "UE-02").unwrap();
+        let (job, profile) = {
+            let controller = test_state.multi_ue.lock().unwrap();
+            (
+                controller
+                    .snapshot()
+                    .into_iter()
+                    .find(|item| item.ue_id == "UE-02")
+                    .unwrap(),
+                controller
+                    .profiles()
+                    .into_iter()
+                    .find(|item| item.ue_id == "UE-02")
+                    .unwrap(),
+            )
+        };
+        let cancel = AtomicBool::new(false);
+        test_state.ue_runtime.release_pdu(&job, 1, &cancel).unwrap();
+        let released = observe_controller_ue(&test_state, "UE-02").unwrap();
+        assert_eq!(released.process_state, "RUNNING");
+        assert_eq!(released.pdu_session_state, "INACTIVE");
+        test_state
+            .ue_runtime
+            .establish_pdu(&job, &profile, 1, &cancel)
+            .unwrap();
+        let established = observe_controller_ue(&test_state, "UE-02").unwrap();
+        assert_eq!(established.process_state, "RUNNING");
+        assert_eq!(established.pdu_session_state, "ACTIVE");
     }
 
     #[test]

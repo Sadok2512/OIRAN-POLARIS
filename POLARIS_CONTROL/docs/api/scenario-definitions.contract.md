@@ -1,6 +1,6 @@
 # Scenario Definitions API contract
 
-API version: `0.12.0`. Base path: `/api/v1`. The catalog schema is `1` and is stored by
+API version: `0.12.1`. Base path: `/api/v1`. The catalog schema is `1` and is stored by
 atomic private write in `/var/lib/polaris-control/scenario-definitions.json`.
 
 ## Routes
@@ -33,10 +33,9 @@ job per UE. The Live definition executor permits one active definition job and p
 disabled; a missing or non-exact value returns HTTP `423`.
 
 `udp_traffic` reuses the certified five-datagram profile and rejects any other `packet_count`.
-`pdu_establish` observes the runtime until the PDU is `ACTIVE`. UERANSIM exposes no independent
-PDU release command in this integration; `pdu_release` is realized by a graceful stop of the
-selected controller-owned UE, which releases its PDU with the UE lifecycle. It does not write
-Open5GS.
+`pdu_establish` executes UERANSIM `nr-cli ps-establish IPv4` using the profile's validated DNN and
+S-NSSAI, then requires the runtime to become `ACTIVE`. `pdu_release` executes
+`nr-cli ps-release-all` and requires `INACTIVE`; it does not stop the UE or write Open5GS.
 
 ## Measured examples
 
