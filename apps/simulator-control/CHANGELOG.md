@@ -19,6 +19,9 @@ Because API 0.15.1 is the required backend for this release,
 `polarisProvisioning` now defaults to ON for fresh browser sessions
 instead of rendering an unavailable provisioning page. The independent
 UE profile-registry switch retains its prior default.
+The UE detail reader now normalizes the measured API 0.15.1 response
+(`subscriber`, `snssai`, `last_job`) and renders missing Registration or
+PDU fields as unavailable instead of crashing the route.
 
 ### Changed
 

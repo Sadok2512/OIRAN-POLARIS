@@ -44,9 +44,12 @@ interface UeDetail {
     last_registered_at_epoch_s: number | null;
   };
   pdu_sessions: {
-    id: number;
+    key: string;
+    id: number | null;
     dnn: string;
     type: string;
+    state: string;
+    source: string;
     ip: string | null;
     established_at_epoch_s: number | null;
   }[];
@@ -66,10 +69,65 @@ interface UeDetail {
   };
 }
 
+type RawUeDetail = Record<string, any>;
+
+function normalizeUeDetail(raw: RawUeDetail): UeDetail {
+  const sessions = Array.isArray(raw.pdu_sessions) ? raw.pdu_sessions : [];
+  return {
+    ue_id: String(raw.ue_id ?? ''),
+    identity: {
+      name: String(raw.identity?.name ?? raw.name ?? raw.ue_id ?? 'Not available'),
+      owner: String(raw.identity?.owner ?? 'Not available'),
+      note: raw.identity?.note ?? null,
+      imsi: 'PROTECTED',
+      authentication: 'PROTECTED',
+    },
+    provisioning: {
+      status: String(raw.provisioning?.status ?? raw.subscription_status ?? raw.subscriber?.state ?? 'NOT_AVAILABLE'),
+      subscriber_id: raw.provisioning?.subscriber_id ?? raw.subscriber?.slot ?? null,
+      bound_at_epoch_s: raw.provisioning?.bound_at_epoch_s ?? null,
+    },
+    network_profile: {
+      plmn: raw.network_profile?.plmn ?? raw.plmn ?? { mcc: '—', mnc: '—' },
+      dnn: String(raw.network_profile?.dnn ?? raw.dnn ?? 'Not available'),
+      sst: Number(raw.network_profile?.sst ?? raw.snssai?.sst ?? 0),
+      sd: raw.network_profile?.sd ?? raw.snssai?.sd ?? null,
+      serving_gnb: String(raw.network_profile?.serving_gnb ?? raw.serving_gnb ?? 'Not available'),
+    },
+    registration: raw.registration ?? { state: 'NOT_AVAILABLE', last_registered_at_epoch_s: null },
+    pdu_sessions: sessions.map((session: RawUeDetail, index: number) => ({
+      key: String(session.id ?? `${session.dnn ?? 'unknown'}-${index}`),
+      id: Number.isInteger(session.id) ? session.id : null,
+      dnn: String(session.dnn ?? 'Not available'),
+      type: String(session.type ?? 'Not available'),
+      state: String(session.state ?? 'NOT_AVAILABLE'),
+      source: String(session.source ?? 'NOT_AVAILABLE'),
+      ip: session.ip ?? null,
+      established_at_epoch_s: session.established_at_epoch_s ?? null,
+    })),
+    ims: {
+      state: String(raw.ims?.state ?? 'NOT_AVAILABLE'),
+      reason: raw.ims?.reason ?? null,
+    },
+    scenario: {
+      assigned_id: raw.scenario?.assigned_id ?? raw.scenario_id ?? null,
+      auto_run: Boolean(raw.scenario?.auto_run ?? raw.auto_run_scenario),
+      last_job_id: raw.scenario?.last_job_id ?? raw.last_job?.job_id ?? null,
+    },
+    traffic: {
+      bytes_dl: Number(raw.traffic?.bytes_dl ?? raw.last_job?.bytes_dl ?? 0),
+      bytes_ul: Number(raw.traffic?.bytes_ul ?? raw.last_job?.bytes_ul ?? 0),
+      last_sample_epoch_s: raw.traffic?.last_sample_epoch_s ?? null,
+    },
+  };
+}
+
 function useUeDetail(ueId: string, enabled: boolean) {
   return useQuery({
     queryKey: ['polaris', 'ue-detail', ueId],
-    queryFn: () => polarisApi<UeDetail>(`/ue-profiles/${encodeURIComponent(ueId)}`),
+    queryFn: async () => normalizeUeDetail(
+      await polarisApi<RawUeDetail>(`/ue-profiles/${encodeURIComponent(ueId)}`),
+    ),
     enabled,
     retry: false,
     staleTime: 10_000,
@@ -169,16 +227,18 @@ export function UeDetailPage() {
                   <th className="text-left">#</th>
                   <th className="text-left">DNN</th>
                   <th className="text-left">Type</th>
+                  <th className="text-left">State</th>
                   <th className="text-left">IP</th>
                   <th className="text-left">Established</th>
                 </tr>
               </thead>
               <tbody>
                 {data.pdu_sessions.map((session) => (
-                  <tr key={session.id} data-testid={`ue-pdu-row-${session.id}`}>
-                    <td className="num">{session.id}</td>
+                  <tr key={session.key} data-testid={`ue-pdu-row-${session.key}`}>
+                    <td className="num">{session.id ?? '—'}</td>
                     <td className="mono">{session.dnn}</td>
                     <td>{session.type}</td>
+                    <td>{session.state}</td>
                     <td className="mono">{session.ip ?? '—'}</td>
                     <td className="mono">{formatEpoch(session.established_at_epoch_s)}</td>
                   </tr>
