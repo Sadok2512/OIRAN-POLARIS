@@ -1,4 +1,5 @@
 mod cpu_safety;
+mod scenario_definitions;
 mod ue_profiles;
 
 use argon2::{
@@ -16,6 +17,9 @@ use axum::{
 use cpu_safety::{CpuSafetyEvidence, CpuSafetyMonitor, ScenarioResourceBudget};
 use rand_core::{OsRng, RngCore};
 use safety_guard::{evaluate, measure, Policy};
+use scenario_definitions::{
+    resolve_steps, ScenarioCatalog, ScenarioDefinitionStore, ScenarioMutation,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use simulator_controller::MultiUeController;
@@ -43,7 +47,7 @@ use ueransim_adapter::{
     LiveLaunchSpec, ProvisionedProfileEvidence, ProvisioningBinding, UeObservation, UeProfileSpec,
 };
 
-pub const VERSION: &str = "0.8.2";
+pub const VERSION: &str = "0.9.0";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -70,6 +74,8 @@ pub struct AppState {
     configuration_path: PathBuf,
     profile_store: ProfileStore,
     profile_registry: Arc<Mutex<UeProfileRegistry>>,
+    scenario_definition_store: ScenarioDefinitionStore,
+    scenario_catalog: Arc<Mutex<ScenarioCatalog>>,
     policy_path: PathBuf,
     policy_enabled: Arc<AtomicBool>,
     execution_mode: String,
@@ -84,6 +90,7 @@ pub struct AppState {
     ue_operations: Arc<Mutex<()>>,
     ue_inventory_running: Arc<AtomicBool>,
     ue_inventory_last_observed_epoch_s: Arc<AtomicU64>,
+    ue_inventory_cache_version: Arc<AtomicU64>,
     shared_ue_cache: Arc<Mutex<Option<UeObservation>>>,
     ue_reconciliation_running: Arc<AtomicBool>,
     ue_reconciliation: Arc<Mutex<UeReconciliation>>,
@@ -1400,6 +1407,12 @@ impl AppState {
                 .unwrap_or_else(|_| ueransim_adapter::LIVE_PROFILE_ROOT.into())
                 .into(),
         );
+        let scenario_definition_store = ScenarioDefinitionStore::new(
+            std::env::var("POLARIS_SCENARIO_CATALOG_PATH")
+                .unwrap_or_else(|_| "/var/lib/polaris-control/scenario-definitions.json".into())
+                .into(),
+        );
+        let scenario_catalog = scenario_definition_store.load()?;
         let fallback_profiles = ueransim_adapter::planned_profiles()
             .into_iter()
             .take(configuration.ue_count)
@@ -1460,6 +1473,8 @@ impl AppState {
             configuration_path,
             profile_store,
             profile_registry: Arc::new(Mutex::new(profile_registry)),
+            scenario_definition_store,
+            scenario_catalog: Arc::new(Mutex::new(scenario_catalog)),
             policy_path,
             policy_enabled: Arc::new(AtomicBool::new(policy_enabled)),
             execution_mode: std::env::var("POLARIS_EXECUTION_MODE")
@@ -1476,6 +1491,7 @@ impl AppState {
             ue_operations: Arc::new(Mutex::new(())),
             ue_inventory_running: Arc::new(AtomicBool::new(false)),
             ue_inventory_last_observed_epoch_s: Arc::new(AtomicU64::new(0)),
+            ue_inventory_cache_version: Arc::new(AtomicU64::new(0)),
             shared_ue_cache: Arc::new(Mutex::new(None)),
             ue_reconciliation_running: Arc::new(AtomicBool::new(false)),
             ue_reconciliation: Arc::new(Mutex::new(UeReconciliation::default())),
@@ -3353,6 +3369,144 @@ async fn history(State(state): State<Arc<AppState>>) -> Json<Value> {
         json!({"items":runtime.history,"total":runtime.history.len(),"source":"controller registry"}),
     )
 }
+
+fn scenario_definition_error(error: String) -> (StatusCode, Json<Value>) {
+    let status = match error.as_str() {
+        "SCENARIO_DEFINITION_NOT_FOUND" => StatusCode::NOT_FOUND,
+        "SCENARIO_DEFINITION_ALREADY_EXISTS" => StatusCode::CONFLICT,
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    (status, Json(json!({"error":error})))
+}
+
+async fn list_scenario_definitions(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let catalog = state.scenario_catalog.lock().unwrap();
+    Json(json!({
+        "items":catalog.definitions,
+        "total":catalog.definitions.len(),
+        "schema_version":catalog.schema_version
+    }))
+}
+
+async fn get_scenario_definition(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    let catalog = state.scenario_catalog.lock().unwrap();
+    match catalog.definitions.iter().find(|item| item.id == id) {
+        Some(definition) => (StatusCode::OK, Json(json!(definition))),
+        None => scenario_definition_error("SCENARIO_DEFINITION_NOT_FOUND".into()),
+    }
+}
+
+async fn create_scenario_definition(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Json(input): Json<ScenarioMutation>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let mut catalog = state.scenario_catalog.lock().unwrap();
+    match state.scenario_definition_store.create(&mut catalog, input) {
+        Ok(definition) => (StatusCode::CREATED, Json(json!(definition))),
+        Err(error) => scenario_definition_error(error),
+    }
+}
+
+async fn update_scenario_definition(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(id): AxumPath<String>,
+    Json(input): Json<ScenarioMutation>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let mut catalog = state.scenario_catalog.lock().unwrap();
+    match state
+        .scenario_definition_store
+        .update(&mut catalog, &id, input)
+    {
+        Ok(definition) => (StatusCode::OK, Json(json!(definition))),
+        Err(error) => scenario_definition_error(error),
+    }
+}
+
+async fn delete_scenario_definition(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let mut catalog = state.scenario_catalog.lock().unwrap();
+    match state.scenario_definition_store.delete(&mut catalog, &id) {
+        Ok(definition) => (StatusCode::OK, Json(json!({"deleted":definition.id}))),
+        Err(error) => scenario_definition_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct CloneScenarioDefinitionInput {
+    target_id: String,
+}
+
+async fn clone_scenario_definition(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(id): AxumPath<String>,
+    Json(input): Json<CloneScenarioDefinitionInput>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let mut catalog = state.scenario_catalog.lock().unwrap();
+    match state
+        .scenario_definition_store
+        .clone_definition(&mut catalog, &id, &input.target_id)
+    {
+        Ok(definition) => (StatusCode::CREATED, Json(json!(definition))),
+        Err(error) => scenario_definition_error(error),
+    }
+}
+
+async fn scenario_steps(
+    State(state): State<Arc<AppState>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let mut runtime = state.runtime.lock().unwrap();
+    if refresh_runtime_with_state(&state, &mut runtime) {
+        persist_runtime(&state, &runtime);
+    }
+    let record = runtime
+        .active
+        .as_ref()
+        .map(job_json)
+        .filter(|job| job["job_id"] == job_id)
+        .or_else(|| {
+            runtime
+                .history
+                .iter()
+                .find(|job| job["job_id"] == job_id)
+                .cloned()
+        });
+    match record {
+        Some(job) => (
+            StatusCode::OK,
+            Json(json!({
+                "job_id":job_id,
+                "scenario_definition_id":job["scenario_definition_id"],
+                "steps":job["steps"].as_array().cloned().unwrap_or_default()
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"SCENARIO_JOB_NOT_FOUND"})),
+        ),
+    }
+}
 fn authorized_ue_control_ids(state: &AppState, identity: &EffectiveIdentity) -> BTreeSet<String> {
     identity
         .session_id
@@ -3402,6 +3556,7 @@ async fn ues(
     let ue01_controller_owned = state.ue01_controller_owned;
     let inventory_running = state.ue_inventory_running.clone();
     let last_observed = state.ue_inventory_last_observed_epoch_s.clone();
+    let cache_version_counter = state.ue_inventory_cache_version.clone();
     let observed = tokio::task::spawn_blocking(move || {
         let unknown = || UeObservation {
             process_state: "UNKNOWN".into(),
@@ -3451,6 +3606,7 @@ async fn ues(
         };
         if perform_observation {
             last_observed.store(epoch_seconds(), Ordering::Release);
+            cache_version_counter.fetch_add(1, Ordering::AcqRel);
             inventory_running.store(false, Ordering::Release);
         }
         (shared, owned)
@@ -3649,7 +3805,7 @@ async fn ues(
         .filter(|job| job.pdu_session_state == "ACTIVE")
         .count();
     Json(
-        json!({"items":items,"configured_profiles":profiles,"configured_count":controller.configured_count(),"planned_count":controller_inventory.len(),"max_configurable":ueransim_adapter::MAX_CONFIGURABLE_UES,"active_count":usize::from(shared_observation.process_state == "RUNNING")+controller_active,"registered_count":usize::from(shared_observation.registration_state == "REGISTERED")+controller_registered,"pdu_session_count":usize::from(shared_observation.pdu_session_state == "ACTIVE")+controller_pdu,"observed_at_epoch_s":epoch_seconds(),"source":"CURRENT_NAS_PDU_AND_CONTROLLER_REGISTRY"}),
+        json!({"items":items,"configured_profiles":profiles,"configured_count":controller.configured_count(),"planned_count":controller_inventory.len(),"max_configurable":ueransim_adapter::MAX_CONFIGURABLE_UES,"active_count":usize::from(shared_observation.process_state == "RUNNING")+controller_active,"registered_count":usize::from(shared_observation.registration_state == "REGISTERED")+controller_registered,"pdu_session_count":usize::from(shared_observation.pdu_session_state == "ACTIVE")+controller_pdu,"observed_at_epoch_s":epoch_seconds(),"cache_version":state.ue_inventory_cache_version.load(Ordering::Acquire),"cache_fresh":cache_fresh,"source":"CURRENT_NAS_PDU_AND_CONTROLLER_REGISTRY"}),
     )
 }
 
@@ -4452,10 +4608,16 @@ async fn scenario_capabilities(
 
 #[derive(Deserialize)]
 struct StartScenarioInput {
-    scenario_id: String,
-    scenario_type: String,
+    #[serde(default)]
+    scenario_id: Option<String>,
+    #[serde(default)]
+    scenario_type: Option<String>,
     #[serde(default)]
     target_ue_id: Option<String>,
+    #[serde(default)]
+    scenario_definition_id: Option<String>,
+    #[serde(default)]
+    ue_ids: Vec<String>,
 }
 
 fn valid_job_id(value: &str) -> bool {
@@ -4466,18 +4628,120 @@ fn valid_job_id(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
+fn run_mock_definition_scenario(
+    state: &AppState,
+    definition_id: &str,
+    ue_ids: &[String],
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    if state.execution_mode != "mock" {
+        return Err((
+            StatusCode::LOCKED,
+            Json(json!({"error":"SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED"})),
+        ));
+    }
+    if ue_ids.is_empty() || ue_ids.len() > ueransim_adapter::MAX_LIVE_UES {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"SCENARIO_UE_SELECTION_INVALID"})),
+        ));
+    }
+    if ue_ids.iter().collect::<BTreeSet<_>>().len() != ue_ids.len() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"SCENARIO_UE_SELECTION_DUPLICATE"})),
+        ));
+    }
+    let profiles = state.multi_ue.lock().unwrap().profiles();
+    if ue_ids.iter().any(|ue_id| {
+        !controller_owns_ue(state, ue_id) || !profiles.iter().any(|profile| profile.ue_id == *ue_id)
+    }) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"SCENARIO_UE_NOT_CONTROLLER_OWNED"})),
+        ));
+    }
+    let definition = state
+        .scenario_catalog
+        .lock()
+        .unwrap()
+        .definitions
+        .iter()
+        .find(|item| item.id == definition_id)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"SCENARIO_DEFINITION_NOT_FOUND"})),
+            )
+        })?;
+    let resolved = resolve_steps(&definition).map_err(|error| scenario_definition_error(error))?;
+    let job_id = format!("{}-{}", definition.id, random_hex(6));
+    let started_at = epoch_seconds();
+    let steps = resolved
+        .iter()
+        .map(|step| {
+            json!({
+                "index":step.index,
+                "type":step.step_type,
+                "loop":{"iteration":step.loop_iteration,"count":step.loop_count},
+                "state":"PENDING",
+                "started_at":Value::Null,
+                "ended_at":Value::Null,
+                "error":Value::Null,
+                "resolved_parameters":step.parameters
+            })
+        })
+        .collect::<Vec<_>>();
+    let record = json!({
+        "job_id":job_id,
+        "scenario_id":definition.id,
+        "scenario_definition_id":definition.id,
+        "scenario_definition_version":definition.version,
+        "ue_ids":ue_ids,
+        "state":"RUNNING",
+        "traffic_state":"NOT_EXECUTED_OFFLINE",
+        "started_at_epoch_s":started_at,
+        "ended_at_epoch_s":Value::Null,
+        "terminal_result":Value::Null,
+        "steps":steps
+    });
+    let mut runtime = state.runtime.lock().unwrap();
+    runtime.history.push(record);
+    persist_runtime(state, &runtime);
+    // Mock mode is the deterministic offline executor. Each PENDING state is durably published
+    // before the ordered transition; no UE process, PDU session or traffic generator is touched.
+    let record_index = runtime.history.len() - 1;
+    for step_index in 0..resolved.len() {
+        runtime.history[record_index]["steps"][step_index]["state"] = json!("RUNNING");
+        runtime.history[record_index]["steps"][step_index]["started_at"] = json!(epoch_seconds());
+        persist_runtime(state, &runtime);
+        runtime.history[record_index]["steps"][step_index]["state"] = json!("COMPLETED");
+        runtime.history[record_index]["steps"][step_index]["ended_at"] = json!(epoch_seconds());
+        persist_runtime(state, &runtime);
+    }
+    runtime.history[record_index]["state"] = json!("COMPLETED");
+    runtime.history[record_index]["ended_at_epoch_s"] = json!(epoch_seconds());
+    runtime.history[record_index]["terminal_result"] = json!("OFFLINE_MOCK_COMPLETED");
+    persist_runtime(state, &runtime);
+    Ok(runtime.history[record_index].clone())
+}
+
 async fn start_scenario(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
     Json(input): Json<StartScenarioInput>,
 ) -> impl IntoResponse {
     if !matches!(identity.role.as_str(), "operator" | "administrator") {
+        let audit_id = input
+            .scenario_definition_id
+            .as_deref()
+            .or(input.scenario_id.as_deref());
         audit(
             &state,
             &identity.role,
             "START_SCENARIO",
             "DENIED_ROLE",
-            Some(&input.scenario_id),
+            audit_id,
         );
         return (
             StatusCode::FORBIDDEN,
@@ -4490,14 +4754,32 @@ async fn start_scenario(
             Json(json!({"error":"CSRF_TOKEN_REQUIRED"})),
         );
     }
+    if let Some(definition_id) = input.scenario_definition_id.as_deref() {
+        return match run_mock_definition_scenario(&state, definition_id, &input.ue_ids) {
+            Ok(record) => (StatusCode::OK, Json(record)),
+            Err(error) => error,
+        };
+    }
+    let Some(scenario_id) = input.scenario_id.as_deref() else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"SCENARIO_ID_REQUIRED"})),
+        );
+    };
+    let Some(scenario_type) = input.scenario_type.as_deref() else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"SCENARIO_TYPE_REQUIRED"})),
+        );
+    };
     let requested_target = input.target_ue_id.clone().unwrap_or_else(|| "UE-01".into());
-    let scenario_target_valid = match input.scenario_type.as_str() {
+    let scenario_target_valid = match scenario_type {
         "bounded-existing-ue-udp-v1" => requested_target == "UE-01" && !state.ue01_controller_owned,
         "bounded-controller-ue-udp-v1" => controller_owns_ue(&state, &requested_target),
         _ => false,
     };
     if !scenario_target_valid
-        || !valid_job_id(&input.scenario_id)
+        || !valid_job_id(scenario_id)
         || !state.policy_enabled.load(Ordering::SeqCst)
     {
         audit(
@@ -4505,7 +4787,7 @@ async fn start_scenario(
             &identity.role,
             "START_SCENARIO",
             "DENIED_POLICY",
-            Some(&input.scenario_id),
+            Some(scenario_id),
         );
         return (
             StatusCode::LOCKED,
@@ -4523,8 +4805,7 @@ async fn start_scenario(
                     session
                         .certified_validation_until
                         .is_some_and(|deadline| deadline >= epoch_seconds())
-                        && session.certified_scenario_type.as_deref()
-                            == Some(input.scenario_type.as_str())
+                        && session.certified_scenario_type.as_deref() == Some(scenario_type)
                         && session.certified_target_ue_id.as_deref()
                             == Some(requested_target.as_str()),
                 )
@@ -4544,7 +4825,7 @@ async fn start_scenario(
     if let Some(previous) = runtime
         .history
         .iter()
-        .find(|item| item["job_id"] == input.scenario_id)
+        .find(|item| item["job_id"] == scenario_id)
     {
         if previous["target_ue_id"].as_str() != Some(requested_target.as_str()) {
             return (
@@ -4557,7 +4838,7 @@ async fn start_scenario(
         return (StatusCode::OK, Json(response));
     }
     if let Some(active) = runtime.active.as_ref() {
-        if active.job_id == input.scenario_id {
+        if active.job_id == scenario_id {
             return (StatusCode::OK, Json(job_json(active)));
         }
         return (
@@ -4571,7 +4852,7 @@ async fn start_scenario(
             &identity.role,
             "START_SCENARIO",
             &error,
-            Some(&input.scenario_id),
+            Some(scenario_id),
         );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4661,7 +4942,7 @@ async fn start_scenario(
     }
     let process_id = child.as_ref().map(Child::id);
     runtime.active = Some(OwnedScenarioJob {
-        job_id: input.scenario_id.clone(),
+        job_id: scenario_id.to_string(),
         started_at: epoch_seconds(),
         started_at_epoch_ms: epoch_millis(),
         ended_at: None,
@@ -4686,7 +4967,7 @@ async fn start_scenario(
         &identity.role,
         "START_SCENARIO",
         "RUNNING",
-        Some(&input.scenario_id),
+        Some(scenario_id),
     );
     (
         StatusCode::OK,
@@ -5077,9 +5358,24 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/scenario-capabilities", get(scenario_capabilities))
         .route("/admin/scenario-policy", post(update_policy))
         .route("/scenarios", get(scenarios))
+        .route(
+            "/scenario-definitions",
+            get(list_scenario_definitions).post(create_scenario_definition),
+        )
+        .route(
+            "/scenario-definitions/:id",
+            get(get_scenario_definition)
+                .put(update_scenario_definition)
+                .delete(delete_scenario_definition),
+        )
+        .route(
+            "/scenario-definitions/:id/clone",
+            post(clone_scenario_definition),
+        )
         .route("/scenarios/running", get(scenarios))
         .route("/scenarios/status", get(scenario_status))
         .route("/scenarios/history", get(history))
+        .route("/scenarios/:job_id/steps", get(scenario_steps))
         .route("/scenarios/validate", post(validate_scenario))
         .route("/scenarios/start", post(start_scenario))
         .route("/scenarios/stop", post(stop_scenario))
@@ -5505,6 +5801,10 @@ mod p0_tests {
                 root.join("ue-profiles"),
             ),
             profile_registry: Arc::new(Mutex::new(profile_registry)),
+            scenario_definition_store: ScenarioDefinitionStore::new(
+                root.join("scenario-definitions.json"),
+            ),
+            scenario_catalog: Arc::new(Mutex::new(ScenarioCatalog::default())),
             policy_path: root.join("policy.json"),
             policy_enabled: Arc::new(AtomicBool::new(true)),
             execution_mode: "mock".into(),
@@ -5530,6 +5830,7 @@ mod p0_tests {
             ue_operations: Arc::new(Mutex::new(())),
             ue_inventory_running: Arc::new(AtomicBool::new(false)),
             ue_inventory_last_observed_epoch_s: Arc::new(AtomicU64::new(0)),
+            ue_inventory_cache_version: Arc::new(AtomicU64::new(0)),
             shared_ue_cache: Arc::new(Mutex::new(None)),
             ue_reconciliation_running: Arc::new(AtomicBool::new(false)),
             ue_reconciliation: Arc::new(Mutex::new(UeReconciliation::default())),
@@ -6925,6 +7226,7 @@ mod p0_tests {
         let first = ues(State(test_state.clone()), viewer()).await.0;
         assert_eq!(first["configured_count"], 1);
         assert_eq!(first["registered_count"], 1);
+        assert_eq!(first["cache_version"], 1);
         assert!(
             test_state
                 .ue_inventory_last_observed_epoch_s
@@ -6943,6 +7245,8 @@ mod p0_tests {
         assert!(started.elapsed() < std::time::Duration::from_millis(100));
         assert_eq!(cached["configured_count"], 1);
         assert_eq!(cached["registered_count"], 1);
+        assert_eq!(cached["cache_version"], first["cache_version"]);
+        assert_eq!(cached["cache_fresh"], true);
         assert!(test_state.ue_inventory_running.load(Ordering::Acquire));
         test_state
             .ue_inventory_running
@@ -7385,5 +7689,243 @@ mod p0_tests {
         assert!(body["total"].as_u64().unwrap() >= 4);
         assert_eq!(body["items"].as_array().unwrap().len(), 3);
         assert!(body.to_string().find("authentication_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn ue_profile_http_put_clone_and_delete_succeed_for_stopped_profiles() {
+        let application = app(state());
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let profile = |ue_id: &str, supi: &str, name: &str| {
+            json!({
+                "ue_id":ue_id,"name":name,"supi":supi,
+                "authentication_key":"11".repeat(16),"opc":"22".repeat(16),
+                "plmn_mcc":"001","plmn_mnc":"01","dnn":"internet","sst":1,
+                "sd":"010203","serving_gnb":"GNB-01","scenario_id":"scenario-a",
+                "auto_run_scenario":false
+            })
+        };
+        let request = |method: Method, uri: &str, body: Value| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", &csrf)
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let created = application
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/v1/ue-profiles",
+                profile("UE-11", "imsi-001010000000011", "UE 11"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let mut update = profile("UE-11", "imsi-001010000000011", "UE 11 updated");
+        update["supi"] = Value::Null;
+        update["authentication_key"] = Value::Null;
+        update["opc"] = Value::Null;
+        let updated = application
+            .clone()
+            .oneshot(request(Method::PUT, "/api/v1/ue-profiles/UE-11", update))
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+
+        let cloned = application
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/v1/ue-profiles/UE-11/clone",
+                json!({"target_ue_id":"UE-12"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cloned.status(), StatusCode::CREATED);
+
+        for ue_id in ["UE-12", "UE-11"] {
+            let deleted = application
+                .clone()
+                .oneshot(request(
+                    Method::DELETE,
+                    &format!("/api/v1/ue-profiles/{ue_id}"),
+                    json!({}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(deleted.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn scenario_definition_http_contract_is_versioned_strict_and_step_observable() {
+        let application = app(state());
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let request = |method: Method, uri: &str, body: Value| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", &csrf)
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let definition = |id: &str, name: &str, step_type: &str| {
+            json!({
+                "id":id,"name":name,
+                "steps":[{
+                    "type":step_type,"loop_count":2,
+                    "parameters":{"duration_ms":{"random":{"min":10,"max":20}}}
+                }]
+            })
+        };
+        let unsupported = application
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/v1/scenario-definitions",
+                definition("bad", "bad", "rrc_idle"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unsupported.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let error: Value =
+            serde_json::from_slice(&to_bytes(unsupported.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(error["error"], "SCENARIO_STEP_TYPE_UNSUPPORTED");
+
+        let created = application
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/v1/scenario-definitions",
+                definition("scenario-one", "one", "wait"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let listed = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/scenario-definitions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: Value =
+            serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["schema_version"], 1);
+
+        let fetched = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/scenario-definitions/scenario-one")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let fetched: Value =
+            serde_json::from_slice(&to_bytes(fetched.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(fetched["id"], "scenario-one");
+        assert_eq!(fetched["version"], 1);
+
+        let updated = application
+            .clone()
+            .oneshot(request(
+                Method::PUT,
+                "/api/v1/scenario-definitions/scenario-one",
+                definition("scenario-one", "two", "wait"),
+            ))
+            .await
+            .unwrap();
+        let updated: Value =
+            serde_json::from_slice(&to_bytes(updated.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(updated["version"], 2);
+        let cloned = application
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/v1/scenario-definitions/scenario-one/clone",
+                json!({"target_id":"scenario-two"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cloned.status(), StatusCode::CREATED);
+
+        let duplicate_selection = application
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/v1/scenarios/start",
+                json!({"scenario_definition_id":"scenario-one","ue_ids":["UE-02","UE-02"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            duplicate_selection.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        let started = application
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/v1/scenarios/start",
+                json!({"scenario_definition_id":"scenario-one","ue_ids":["UE-02"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+        let job: Value =
+            serde_json::from_slice(&to_bytes(started.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(job["steps"].as_array().unwrap().len(), 2);
+        assert!(job["steps"].as_array().unwrap().iter().all(|step| {
+            step["state"] == "COMPLETED"
+                && (10..=20).contains(&step["resolved_parameters"]["duration_ms"].as_i64().unwrap())
+        }));
+        let steps = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/scenarios/{}/steps",
+                        job["job_id"].as_str().unwrap()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(steps.status(), StatusCode::OK);
+
+        for id in ["scenario-two", "scenario-one"] {
+            let deleted = application
+                .clone()
+                .oneshot(request(
+                    Method::DELETE,
+                    &format!("/api/v1/scenario-definitions/{id}"),
+                    json!({}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(deleted.status(), StatusCode::OK);
+        }
     }
 }

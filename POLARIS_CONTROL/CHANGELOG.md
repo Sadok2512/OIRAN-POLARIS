@@ -131,3 +131,10 @@
 - Added a non-deployed gNB-02 plan; multi-gNB execution remains locked for LIVE-005.
 - Preserved the one-UE live certification boundary and kept all new lifecycle actions locked pending LIVE-002/003/004.
 - Added offline multi-UE, authorization, resource-safety and UI regression coverage.
+## 0.9.0
+
+- Add an atomic, versioned scenario-definition catalog with CRUD and clone routes.
+- Add fixed-loop V1 step validation, backend random-parameter resolution, persisted resolved values,
+  definition-based offline execution history, and per-job step status retrieval.
+- Preserve the legacy certified scenario endpoints and reject definition-based Live execution until
+  it receives separate authorization and validation.
