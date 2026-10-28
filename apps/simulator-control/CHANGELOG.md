@@ -3,6 +3,14 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.6.2 — 2026-10-28 (patch)
+
+- Fix Add UE to send the API 0.15.2 minimal subscriber contract
+  `{ue_id,name,gnb_id,owner,note,imsi}` instead of misrouting IMSI into `supi` with empty K/OPc.
+- Accept both 15-digit IMSI and `imsi-` prefixed forms in Add Subscriber and Add UE.
+- Keep subscriber authentication material server-side; the browser sends no K/OPc when creating
+  a profile from an existing POLARIS-owned subscriber.
+
 ## 0.6.1 — 2026-10-28 (patch)
 
 Align the provisioning calls with the real backend contract shipped by

@@ -53,6 +53,16 @@ export interface WireUeProfileMutation {
   auto_run_scenario: boolean;
 }
 
+/** Minimal API 0.15.2 create contract. Subscriber secrets are resolved server-side. */
+export interface WireProvisionedUeProfileMutation {
+  ue_id: string;
+  name: string;
+  gnb_id: string;
+  owner: string;
+  note: string;
+  imsi: string;
+}
+
 export interface WireBulkProfileInput {
   count: 10 | 100 | 1000 | 10000;
   name_prefix: string;
@@ -109,6 +119,13 @@ export async function fetchAllUeProfiles(): Promise<WireUeProfile[]> {
 
 export function createUeProfile(body: WireUeProfileMutation) {
   return polarisApi<WireUeProfile>('/ue-profiles', { method: 'POST', body: JSON.stringify(body) });
+}
+
+export function createProvisionedUeProfile(body: WireProvisionedUeProfileMutation) {
+  return polarisApi<WireUeProfile>('/ue-profiles', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
 }
 
 export function updateUeProfile(ueId: string, body: WireUeProfileMutation) {

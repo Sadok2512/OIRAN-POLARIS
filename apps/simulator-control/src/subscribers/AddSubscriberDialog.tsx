@@ -16,7 +16,7 @@ import {
   type SubscriberCreateResponse,
 } from '@/data/provisioningApi';
 
-const IMSI_RE = /^\d{15}$/;
+const IMSI_RE = /^(?:imsi-)?\d{15}$/;
 const HEX32 = /^[0-9a-fA-F]{32}$/;
 
 interface State {
@@ -172,11 +172,11 @@ export function AddSubscriberDialog({
 
         <SecretField
           label="IMSI"
-          placeholder="208930000000001"
+          placeholder="001010000000201 or imsi-001010000000201"
           value={state.imsi}
           onChange={(value) => setState((prev) => ({ ...prev, imsi: value }))}
           invalid={imsiInvalid}
-          hint="Format: exactly 15 digits"
+          hint="Format: exactly 15 digits, optional imsi- prefix"
           testid="subscriber-imsi"
           onBlur={() => setState((prev) => ({ ...prev, touched: true }))}
         />

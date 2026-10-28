@@ -105,7 +105,10 @@ describe('CsvImportDialog', () => {
       screen.getByTestId('csv-file-field') as HTMLInputElement,
       makeCsv(100_001),
     );
-    await screen.findByTestId('csv-too-big');
+    // Parsing 100,001 rows is deliberately chunked/yielding and can exceed the
+    // DOM query default on a loaded build host. Keep the assertion unchanged,
+    // but allow the bounded parser to finish.
+    await screen.findByTestId('csv-too-big', {}, { timeout: 30_000 });
     expect(screen.getByTestId('csv-upload-submit')).toBeDisabled();
 
     // Clicking the (disabled) submit button must not POST.

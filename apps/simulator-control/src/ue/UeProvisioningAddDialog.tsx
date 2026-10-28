@@ -16,10 +16,10 @@
 
 import { useEffect, useState } from 'react';
 import { AlertTriangle, X } from 'lucide-react';
-import type { WireGnb } from '@/data/profileApi';
+import type { WireGnb, WireProvisionedUeProfileMutation } from '@/data/profileApi';
 import type { Owner } from '@/data/provisioningApi';
 
-const IMSI_RE = /^imsi-\d{5,15}$/;
+const IMSI_RE = /^(?:imsi-)?\d{15}$/;
 
 export interface UeProvisioningAddValues {
   name: string;
@@ -28,6 +28,19 @@ export interface UeProvisioningAddValues {
   note: string;
   /** Written once; cleared from state immediately after submit. */
   imsi: string;
+}
+
+export function provisionedMutationFromValues(
+  values: UeProvisioningAddValues,
+): WireProvisionedUeProfileMutation {
+  return {
+    ue_id: values.name,
+    name: values.name,
+    gnb_id: values.serving_gnb,
+    owner: values.owner,
+    note: values.note,
+    imsi: values.imsi,
+  };
 }
 
 interface State {
@@ -191,7 +204,7 @@ export function UeProvisioningAddDialog({
             value={state.imsi}
             onChange={(event) => setState((prev) => ({ ...prev, imsi: event.target.value }))}
             onBlur={() => setState((prev) => ({ ...prev, imsiTouched: true }))}
-            placeholder="imsi-208930000000001"
+            placeholder="001010000000201 or imsi-001010000000201"
             aria-invalid={imsiInvalid ? 'true' : 'false'}
             data-testid="ue-add-imsi"
           />
@@ -202,7 +215,7 @@ export function UeProvisioningAddDialog({
           {imsiInvalid && (
             <span className="text-ep-xs text-error flex items-start gap-1" data-testid="ue-add-imsi-error">
               <AlertTriangle width={11} height={11} className="mt-0.5 shrink-0" />
-              IMSI must match <code className="mono">imsi-&lt;5-15 digits&gt;</code>
+              IMSI must contain exactly 15 digits, with an optional <code className="mono">imsi-</code> prefix.
             </span>
           )}
         </label>

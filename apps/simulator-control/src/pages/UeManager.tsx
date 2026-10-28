@@ -48,7 +48,11 @@ import {
 } from '@/ue/profileStore';
 import { UeProfileFormDialog, type ProfileFormMode } from '@/ue/UeProfileForm';
 import { UeProfileBackendFormDialog } from '@/ue/UeProfileBackendForm';
-import { UeProvisioningAddDialog, type UeProvisioningAddValues } from '@/ue/UeProvisioningAddDialog';
+import {
+  provisionedMutationFromValues,
+  UeProvisioningAddDialog,
+  type UeProvisioningAddValues,
+} from '@/ue/UeProvisioningAddDialog';
 import { useBackendProfiles } from '@/ue/profileSource';
 import { fetchGnbs, type WireGnb, type WireUeProfileMutation } from '@/data/profileApi';
 import { useFeatureFlag } from '@/data/featureFlags';
@@ -219,22 +223,7 @@ export function UeManagerPage() {
     setProvisioningAddError(null);
     setProvisioningAddSubmitting(true);
     try {
-      const body: WireUeProfileMutation = {
-        ue_id: '',
-        name: values.name,
-        supi: values.imsi,
-        authentication_key: null,
-        opc: null,
-        plmn_mcc: '',
-        plmn_mnc: '',
-        dnn: '',
-        sst: 1,
-        sd: null,
-        serving_gnb: values.serving_gnb,
-        scenario_id: null,
-        auto_run_scenario: false,
-      };
-      await backendProfiles.create(body);
+      await backendProfiles.createProvisioned(provisionedMutationFromValues(values));
       setProvisioningAddOpen(false);
       setFeedback(`UE ${values.name} created on POLARIS (owner: ${values.owner}).`);
     } catch (error) {

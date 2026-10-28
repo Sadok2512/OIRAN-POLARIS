@@ -5,7 +5,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { UeProvisioningAddDialog } from './UeProvisioningAddDialog';
+import { provisionedMutationFromValues, UeProvisioningAddDialog } from './UeProvisioningAddDialog';
 import type { WireGnb } from '@/data/profileApi';
 import type { Owner } from '@/data/provisioningApi';
 
@@ -40,6 +40,25 @@ function renderDialog(overrides: Partial<Parameters<typeof UeProvisioningAddDial
 }
 
 describe('UeProvisioningAddDialog', () => {
+  it('maps Add UE to the minimal API 0.15.2 subscriber contract without K or OPc', () => {
+    expect(
+      provisionedMutationFromValues({
+        name: 'UE-201',
+        serving_gnb: 'GNB-01',
+        owner: 'ops-nancy',
+        note: 'production check',
+        imsi: '001010000000201',
+      }),
+    ).toEqual({
+      ue_id: 'UE-201',
+      name: 'UE-201',
+      gnb_id: 'GNB-01',
+      owner: 'ops-nancy',
+      note: 'production check',
+      imsi: '001010000000201',
+    });
+  });
+
   it('exposes only the four create-time fields (Name, gNB, Owner, Note, IMSI)', () => {
     renderDialog();
     expect(screen.getByTestId('ue-add-name')).toBeInTheDocument();
@@ -83,6 +102,19 @@ describe('UeProvisioningAddDialog', () => {
       }),
     );
     expect(screen.getByTestId('ue-add-imsi')).toHaveValue('');
+  });
+
+  it('accepts the canonical 15-digit IMSI form without a prefix', async () => {
+    const user = userEvent.setup();
+    const { onSubmit } = renderDialog();
+    await user.type(screen.getByTestId('ue-add-name'), 'UE-201');
+    await user.selectOptions(screen.getByTestId('ue-add-gnb'), 'GNB-01');
+    await user.selectOptions(screen.getByTestId('ue-add-owner'), 'ops-nancy');
+    await user.type(screen.getByTestId('ue-add-imsi'), '001010000000201');
+    await user.click(screen.getByTestId('ue-add-submit'));
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ imsi: '001010000000201' })),
+    );
   });
 
   it('shows "Backend pending" when a dropdown has no options', () => {
