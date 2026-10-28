@@ -56,5 +56,41 @@ test('Simulator 0.5.2 authenticates an Operator and renders current BrowserRoute
     await expect(page.getByTestId(`template-row-${templateId}`)).toBeVisible();
   }
 
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByTestId('template-download-tpl-high-runner').click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe('tpl-high-runner-v1.json');
+
+  const exported = await page.evaluate(async () => {
+    const response = await fetch('/polaris-api/v1/scenario-definitions/tpl-high-runner/export');
+    return { status: response.status, body: await response.text() };
+  });
+  expect(exported.status).toBe(200);
+
+  await page.getByTestId('scenarios-import').click();
+  await page.getByTestId('import-file-field').setInputFiles({
+    name: download.suggestedFilename(),
+    mimeType: 'application/json',
+    buffer: Buffer.from(exported.body),
+  });
+  await expect(page.getByTestId('import-preview')).toBeVisible();
+  const collisionResponse = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'POST' &&
+      response.url().includes('/scenario-definitions/import'),
+  );
+  await page.getByTestId('import-submit').click();
+  expect((await collisionResponse).status()).toBe(409);
+  await expect(page.getByTestId('import-collision')).toBeVisible();
+  await page.getByTestId('import-rename-field').fill('ui-import-681d42e');
+  const renamedResponse = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'POST' &&
+      response.url().includes('/scenario-definitions/import?rename=ui-import-681d42e'),
+  );
+  await page.getByTestId('import-rename-submit').click();
+  expect((await renamedResponse).status()).toBe(201);
+  await expect(page.getByTestId('import-scenario-dialog')).toBeHidden();
+
   expect(pageErrors).toEqual([]);
 });
