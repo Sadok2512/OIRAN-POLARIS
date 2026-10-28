@@ -216,9 +216,8 @@ export function UeManagerPage() {
 
   // 0.6.0 — polarisProvisioning Add UE flow. The backend owns PLMN /
   // DNN / S-NSSAI resolution from the operator-chosen owner + gNB; the
-  // UI sends the minimal body and renders the resolved values from the
-  // response. The IMSI leaves this function as a `supi` field and is
-  // never kept after the awaited mutation returns.
+  // UI sends the minimal IMSI body and renders the resolved values from the
+  // response. The IMSI is never kept after the awaited mutation returns.
   async function submitProvisioningAdd(values: UeProvisioningAddValues) {
     setProvisioningAddError(null);
     setProvisioningAddSubmitting(true);
