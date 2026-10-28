@@ -54,6 +54,53 @@ describe('Portal App — layout', () => {
     expect(screen.getByTestId('app-grid').children).toHaveLength(3);
   });
 
+  it('names the POLARIS card "POLARIS Control" with the Core · RAN · UE · Scenarios tagline (0.2.0)', () => {
+    renderApp();
+    const card = screen.getByTestId('app-card-simulator');
+    expect(card.textContent).toMatch(/POLARIS Control/);
+    expect(card.textContent).toMatch(/Core · RAN · UE · Scenarios/);
+    // The old "Simulator Control" name is gone.
+    expect(card.textContent).not.toMatch(/^Simulator Control$/m);
+  });
+
+  it('surfaces scope chips per card (POLARIS: Open5GS, gNB / eNB, Topology, UE Manager, Scenarios)', () => {
+    renderApp();
+    const polaris = screen.getByTestId('app-scope-simulator').textContent ?? '';
+    for (const chip of ['Open5GS', 'gNB / eNB', 'Topology', 'UE Manager', 'Scenarios']) {
+      expect(polaris).toContain(chip);
+    }
+    const probe = screen.getByTestId('app-scope-probe-manager').textContent ?? '';
+    for (const chip of ['Probes', 'Interfaces', 'Live captures', 'Library']) {
+      expect(probe).toContain(chip);
+    }
+    const analyzer = screen.getByTestId('app-scope-oiran-analyzer').textContent ?? '';
+    for (const chip of ['Sessions', 'Call flow', 'Correlation', 'Packets', 'Datasets']) {
+      expect(analyzer).toContain(chip);
+    }
+  });
+
+  it('shows the exact GET route the health probe uses in a mono line', () => {
+    renderApp();
+    expect(screen.getByTestId('app-health-route-simulator').textContent).toBe(
+      'GET /polaris-api/v1/system/health',
+    );
+    expect(screen.getByTestId('app-health-route-probe-manager').textContent).toBe(
+      'GET /api/v1/health',
+    );
+    expect(screen.getByTestId('app-health-route-oiran-analyzer').textContent).toBe(
+      'GET /api/v1/health',
+    );
+  });
+
+  it('renders the Responsibilities card below the grid', () => {
+    renderApp();
+    const resp = screen.getByTestId('responsibilities');
+    expect(resp.textContent).toMatch(/POLARIS Control/);
+    expect(resp.textContent).toMatch(/Probe Manager/);
+    expect(resp.textContent).toMatch(/anonymous/i);
+    expect(resp.textContent).toMatch(/no token is ever sent/i);
+  });
+
   it('provides an Open Application link per card', () => {
     renderApp();
     expect(screen.getByTestId('app-open-simulator')).toHaveAttribute(

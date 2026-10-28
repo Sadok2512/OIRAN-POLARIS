@@ -47,6 +47,30 @@ export function App() {
               <AppLauncher key={app.id} app={app} loading={loading} />
             ))}
           </div>
+
+          <section
+            className="ep-card mt-8 p-4 text-ep-sm text-text-secondary flex flex-col gap-1"
+            data-testid="responsibilities"
+            aria-label="Responsibilities"
+          >
+            <p className="font-medium text-text-primary">Responsibilities</p>
+            <p>
+              <span className="text-text-primary font-medium">POLARIS Control</span> drives the
+              lab network: Open5GS core, gNodeBs and eNB, topology, UEs and scenarios.
+            </p>
+            <p>
+              <span className="text-text-primary font-medium">Probe Manager</span> manages probes
+              only — virtual and physical, several interfaces each. Topology moved to POLARIS.
+            </p>
+            <p>
+              <span className="text-text-primary font-medium">OIRAN Analyzer</span> replays
+              captured sessions: call flow, correlation and packet forensics across datasets.
+            </p>
+            <p>
+              Health is an anonymous <code className="mono">GET</code> on each app's own API
+              base; no token is ever sent to a sibling app.
+            </p>
+          </section>
         </section>
       </main>
       <PortalFooter />

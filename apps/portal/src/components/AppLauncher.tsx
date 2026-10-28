@@ -15,9 +15,13 @@ const ACCENT_RING: Record<AppWithHealth['accent'], string> = {
 
 export function AppLauncher({ app, loading }: AppLauncherProps) {
   const { Icon } = app;
-  const healthLabel = loading
-    ? 'Checking service…'
-    : app.health.detail;
+  const healthLabel = loading ? 'Checking service…' : app.health.detail;
+  // Build the exact GET path probed by `probeHealth()` so the footer line
+  // matches what the browser actually sends. An anonymous fetch (no token)
+  // is enforced in usePortalConfig.
+  const healthUrl = app.healthEndpoint
+    ? `${app.healthEndpoint.base ?? app.apiBase}${app.healthEndpoint.path}`
+    : null;
 
   return (
     <article
@@ -43,16 +47,37 @@ export function AppLauncher({ app, loading }: AppLauncherProps) {
           </h2>
         </div>
         <p className="text-ep-sm text-text-secondary">{app.description}</p>
-      </div>
-      <footer className="flex items-center justify-between pt-1 border-t border-border">
-        <span
-          className="text-ep-xs text-text-secondary"
-          data-testid={`app-health-${app.id}`}
+        <ul
+          className="flex flex-wrap gap-1.5 mt-1"
+          aria-label="Scope"
+          data-testid={`app-scope-${app.id}`}
         >
-          {healthLabel}
+          {app.scope.map((chip) => (
+            <li key={chip}>
+              <span className="ep-badge text-ep-xs text-text-secondary">{chip}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <footer className="flex items-center justify-between gap-3 pt-1 border-t border-border">
+        <span className="text-ep-xs text-text-secondary min-w-0 flex flex-col leading-tight">
+          <span
+            className="truncate"
+            data-testid={`app-health-${app.id}`}
+          >
+            {healthLabel}
+          </span>
+          {healthUrl && (
+            <span
+              className="mono truncate opacity-80"
+              data-testid={`app-health-route-${app.id}`}
+            >
+              GET {healthUrl}
+            </span>
+          )}
         </span>
         <a
-          className="ep-button ep-button-primary h-9 px-3 text-ep-sm"
+          className="ep-button ep-button-primary h-9 px-3 text-ep-sm shrink-0"
           href={app.openUrl}
           target="_blank"
           rel="noopener noreferrer"

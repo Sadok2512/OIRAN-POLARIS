@@ -14,6 +14,8 @@ export type AppDescriptor = {
   name: string;
   tagline: string;
   description: string;
+  /** Short scope chips shown under the description (mockup 0.2.0). */
+  scope: string[];
   Icon: ComponentType<SVGProps<SVGSVGElement>>;
   openUrl: string;
   /** API base owned by this app. Health probes default to this base. */
@@ -46,10 +48,13 @@ const API_BASES = {
 export const APPS: AppDescriptor[] = [
   {
     id: 'simulator',
-    name: 'Simulator Control',
-    tagline: 'POLARIS Control · 5G SA UERANSIM',
+    // Mockup 0.2.0: the brick is "POLARIS Control" (the backend product),
+    // not "Simulator Control" (its old umbrella name).
+    name: 'POLARIS Control',
+    tagline: 'Core · RAN · UE · Scenarios',
     description:
-      'Operate the certified laboratory simulator: configure UE profiles, run bounded traffic, inspect scenario state.',
+      'Operate the 5G SA lab: Open5GS core functions, gNodeBs and eNB, network topology, UE profiles and bounded scenarios.',
+    scope: ['Open5GS', 'gNB / eNB', 'Topology', 'UE Manager', 'Scenarios'],
     Icon: SlidersHorizontal,
     openUrl: APP_URLS.simulator,
     apiBase: API_BASES.simulator,
@@ -60,9 +65,10 @@ export const APPS: AppDescriptor[] = [
   {
     id: 'probe-manager',
     name: 'Probe Manager',
-    tagline: 'Topology · Probes · Live captures',
+    tagline: 'vProbes · Physical probes · Captures',
     description:
-      'Visualize probes, interfaces and capture jobs. Start, stop and audit N2/N3/N4/SBI bounded captures.',
+      'Register and supervise probes, each with several capture interfaces. Follow live captures, disk budget and the capture library. Topology moved to POLARIS.',
+    scope: ['Probes', 'Interfaces', 'Live captures', 'Library'],
     Icon: Radio,
     openUrl: APP_URLS.probeManager,
     apiBase: API_BASES.probeManager,
@@ -76,6 +82,7 @@ export const APPS: AppDescriptor[] = [
     tagline: 'Call flow · Correlation · Packet forensics',
     description:
       'Reconstruct sessions, inspect decoded IE trees, correlate N2 ↔ SBI ↔ N4 ↔ N3 evidence across datasets.',
+    scope: ['Sessions', 'Call flow', 'Correlation', 'Packets', 'Datasets'],
     Icon: Activity,
     openUrl: APP_URLS.oiranAnalyzer,
     apiBase: API_BASES.oiranAnalyzer,
