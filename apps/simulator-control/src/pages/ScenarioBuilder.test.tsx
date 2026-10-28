@@ -145,7 +145,7 @@ describe('ScenarioBuilder — honest palette (0.5.1 + 0.5.2)', () => {
     expect(screen.getByTestId('loop-preset-×100')).toBeEnabled();
   });
 
-  it('blocks Save and shows a banner when the draft contains a locked step (ims_register)', async () => {
+  it('allows catalog Save but warns when the draft contains a live-locked step (ims_register)', async () => {
     const user = userEvent.setup();
     renderPage();
 
@@ -162,12 +162,12 @@ describe('ScenarioBuilder — honest palette (0.5.1 + 0.5.2)', () => {
     const kindSelect = (await screen.findByLabelText(/Step 1 kind/i)) as HTMLSelectElement;
     await user.selectOptions(kindSelect, 'IMS_REGISTER');
 
-    // Banner appears and Save is blocked.
+    // The warning remains honest, while catalog persistence stays available.
     await screen.findByTestId('builder-locked-step-banner');
-    expect(save).toBeDisabled();
-    expect(save).toHaveAttribute(
-      'title',
-      'Remove the non-certified step(s) before saving to the backend',
+    expect(save).toBeEnabled();
+    expect(save).not.toHaveAttribute('title');
+    expect(screen.getByTestId('builder-locked-step-banner')).toHaveTextContent(
+      /live execution remains locked/i,
     );
   });
 
