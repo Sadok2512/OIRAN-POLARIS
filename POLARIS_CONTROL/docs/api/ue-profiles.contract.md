@@ -8,6 +8,7 @@ Operator or Administrator session and its CSRF header. Reads never expose SUPI, 
 | Method | Path | Result |
 |---|---|---|
 | `GET` | `/ue-profiles?page=1&page_size=100&search=&scenario_id=&subscription_status=` | Paginated sanitized profiles. `page >= 1`; `page_size` is clamped to `1..500`. Status filter accepts `VERIFIED` or `PROVISIONING_REQUIRED`. |
+| `GET` | `/ue-profiles/:id` | Sanitized profile detail, observed PDU state, IMS availability, scenario assignment, and last-job UL/DL bytes. |
 | `POST` | `/ue-profiles` | Creates one stopped local profile and restricted UERANSIM YAML. Does **not** provision Open5GS. |
 | `PUT` | `/ue-profiles/:ue_id` | Replaces public fields on a stopped profile. The ID is immutable. All three secret fields may be `null` together to preserve existing material. |
 | `DELETE` | `/ue-profiles/:ue_id` | Deletes a stopped POLARIS-owned local profile and YAML. Does **not** delete an Open5GS subscription. |
@@ -25,6 +26,27 @@ There is no CSV import route in this version.
 Create/replace input fields are `ue_id`, `name`, `supi`, `authentication_key`, `opc`,
 `plmn_mcc`, `plmn_mnc`, `dnn`, `sst`, `sd`, `serving_gnb`, `scenario_id`, and
 `auto_run_scenario`. `supi`, `authentication_key`, and `opc` are write-only.
+
+API 0.15.0 additionally accepts this protected subscriber-binding request on `POST /ue-profiles`:
+
+```json
+{"ue_id":"UE-11","gnb_id":"GNB-01","note":"Lab profile","imsi":"<15 digits; write-only>"}
+```
+
+The server resolves the POLARIS-owned Open5GS subscriber and fills PLMN, S-NSSAI, preferred DNN,
+AMBR/provisioning evidence, K, and OPc server-side. An unknown or non-POLARIS identity returns
+`422 SUBSCRIBER_NOT_PROVISIONED`. Responses retain `subscriber_identity: PROTECTED` and
+`authentication_material: PROTECTED`.
+
+For CSV import, `POST /ue-profiles/bulk` also accepts `Content-Type: text/csv` with exact columns:
+
+```text
+ue_id,gnb_id,note,imsi
+```
+
+At most 100,000 input rows are parsed and individually reported. The persistent profile registry
+still enforces its independently certified 10,000-profile capacity; excess rows return
+`UE_PROFILE_CAPACITY_REACHED` rather than being silently dropped.
 
 On creation, `provisioning_slot` (for example `"UE-02"`) may replace the three secret fields:
 the backend then reads SUPI/K/OPc from the protected server-side plan. Sending a slot together

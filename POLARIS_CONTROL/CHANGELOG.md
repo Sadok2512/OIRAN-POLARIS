@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.15.0 (polaris-control-api)
+
+- Minor: add Operator/CSRF-protected Open5GS subscriber provisioning with mandatory protected
+  `mongodump`, POLARIS ownership markers, sanitized inventory, and bounded CSV batching.
+- Minor: create UE profiles by protected subscriber identity, add bounded CSV profile import,
+  sanitized profile detail, and real gNB/owner/PLMN/DNN menu registries.
+- Security: IMSI, K, and OPc remain write-only and are excluded from response types, audit targets,
+  errors, and logs; existing non-POLARIS subscriber records are never modified.
+
 ## 0.14.0 (polaris-control-api)
 
 - Minor: advertise the scenario-definition step contract through `GET /api/v1/capabilities`,

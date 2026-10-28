@@ -211,6 +211,15 @@ impl ProfileStore {
         &self.gnbs
     }
 
+    /// Internal-only lookup used to join a protected profile with its Open5GS subscription.
+    /// The returned identity must never be serialized, logged, or included in an API response.
+    pub fn subscriber_imsi(&self, record: &ManagedUeProfile) -> Result<String, String> {
+        let supi = self.read_existing_secrets(&record.profile.profile_name)?.0;
+        supi.strip_prefix("imsi-")
+            .map(str::to_string)
+            .ok_or_else(|| "UE_PROFILE_SECRET_INVALID".to_string())
+    }
+
     pub fn load_or_bootstrap(
         &self,
         fallback: Vec<UeProfileSpec>,
@@ -314,6 +323,91 @@ impl ProfileStore {
             return Err(error);
         }
         Ok(record)
+    }
+
+    /// Creates a caller-validated import batch in one registry generation. Secret-bearing inputs
+    /// remain in memory; generated YAML files are staged privately and published before the
+    /// single atomic registry swap.
+    pub fn create_many(
+        &self,
+        registry: &mut UeProfileRegistry,
+        inputs: Vec<ProfileMutationInput>,
+    ) -> Result<Vec<ManagedUeProfile>, String> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        if registry.profiles.len().saturating_add(inputs.len())
+            > ueransim_adapter::MAX_CONFIGURABLE_UES
+        {
+            return Err("UE_PROFILE_CAPACITY_REACHED".into());
+        }
+        let original = registry.clone();
+        let mut candidate = registry.clone();
+        let mut records = Vec::with_capacity(inputs.len());
+        let mut staged = Vec::with_capacity(inputs.len());
+        let generation = random_hex(8);
+        for input in inputs {
+            if candidate
+                .profiles
+                .iter()
+                .any(|record| record.profile.ue_id == input.ue_id)
+            {
+                return Err("UE_PROFILE_ALREADY_EXISTS".into());
+            }
+            let secrets = self.creation_secrets(&input)?;
+            let mut record = self.build_record(input, &secrets, 1, epoch_seconds())?;
+            record.profile.subscription_verified = true;
+            self.ensure_identity_unique(&candidate, &record.subscriber_identity_sha256, None)?;
+            let yaml = render_profile_with_gnbs(
+                &record.profile,
+                UeSecrets {
+                    supi: &secrets.0,
+                    key: &secrets.1,
+                    opc: &secrets.2,
+                },
+                &self.gnbs,
+            )?;
+            let final_path = self.profile_root.join(&record.profile.profile_name);
+            if final_path.exists() {
+                return Err("UE_PROFILE_ALREADY_EXISTS".into());
+            }
+            let stage_path = self.profile_root.join(format!(
+                ".{}.{}.tmp",
+                record.profile.profile_name, generation
+            ));
+            if let Err(error) = atomic_private_write(&stage_path, yaml.as_bytes()) {
+                for (stage, _) in &staged {
+                    let _ = fs::remove_file(stage);
+                }
+                return Err(error);
+            }
+            candidate.profiles.push(record.clone());
+            staged.push((stage_path, final_path));
+            records.push(record);
+        }
+        self.validate_registry(&candidate)?;
+        let mut published = Vec::new();
+        for (stage, final_path) in &staged {
+            if fs::rename(stage, final_path).is_err() {
+                for path in &published {
+                    let _ = fs::remove_file(path);
+                }
+                for (pending, _) in &staged {
+                    let _ = fs::remove_file(pending);
+                }
+                return Err("UE_BULK_PROFILE_PUBLISH_FAILED".into());
+            }
+            published.push(final_path.clone());
+        }
+        if let Err(error) = self.persist(&candidate) {
+            for path in published {
+                let _ = fs::remove_file(path);
+            }
+            *registry = original;
+            return Err(error);
+        }
+        *registry = candidate;
+        Ok(records)
     }
 
     /// Adds an approved batch in one registry generation. Profile files are staged before the

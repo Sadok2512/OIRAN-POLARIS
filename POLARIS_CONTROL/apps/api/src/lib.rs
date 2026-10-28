@@ -1,5 +1,6 @@
 mod cpu_safety;
 mod scenario_definitions;
+mod subscriber_provisioning;
 mod ue_profiles;
 
 use argon2::{
@@ -11,7 +12,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, post},
     Json, Router,
 };
 use cpu_safety::{CpuSafetyEvidence, CpuSafetyMonitor, ScenarioResourceBudget};
@@ -37,6 +38,12 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(test)]
+use subscriber_provisioning::MemorySubscriberBackend;
+use subscriber_provisioning::{
+    validate_mutation as validate_subscriber_mutation, MongoSubscriberBackend, ProvisionResult,
+    SubscriberBackend, SubscriberMutation, MAX_BULK_ROWS, WRITE_BATCH_ROWS,
+};
 use tower_http::{
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,
@@ -48,7 +55,7 @@ use ueransim_adapter::{
 
 pub use ue_profiles::UeProfileRegistry;
 
-pub const VERSION: &str = "0.14.0";
+pub const VERSION: &str = "0.15.0";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -75,6 +82,7 @@ pub struct AppState {
     configuration_path: PathBuf,
     profile_store: ProfileStore,
     profile_registry: Arc<Mutex<UeProfileRegistry>>,
+    subscriber_backend: Arc<dyn SubscriberBackend>,
     scenario_definition_store: ScenarioDefinitionStore,
     scenario_catalog: Arc<Mutex<ScenarioCatalog>>,
     definition_live_enabled: bool,
@@ -1613,6 +1621,8 @@ impl AppState {
                 .into(),
         );
         let scenario_catalog = scenario_definition_store.load()?;
+        let subscriber_backend: Arc<dyn SubscriberBackend> =
+            Arc::new(MongoSubscriberBackend::from_env()?);
         let fallback_profiles = ueransim_adapter::planned_profiles()
             .into_iter()
             .take(configuration.ue_count)
@@ -1673,6 +1683,7 @@ impl AppState {
             configuration_path,
             profile_store,
             profile_registry: Arc::new(Mutex::new(profile_registry)),
+            subscriber_backend,
             scenario_definition_store,
             scenario_catalog: Arc::new(Mutex::new(scenario_catalog)),
             definition_live_enabled: std::env::var("POLARIS_DEFINITION_LIVE_ENABLED")
@@ -2709,6 +2720,268 @@ fn managed_profile_json(record: &ManagedUeProfile) -> Value {
     })
 }
 
+#[derive(Deserialize)]
+struct SubscriberProfileInput {
+    ue_id: String,
+    gnb_id: String,
+    #[serde(default)]
+    note: String,
+    imsi: String,
+}
+
+fn subscriber_error(error: String) -> (StatusCode, Json<Value>) {
+    let status = match error.as_str() {
+        "SUBSCRIBER_ALREADY_EXISTS" | "SUBSCRIBER_NOT_POLARIS_OWNED" => StatusCode::CONFLICT,
+        "SUBSCRIBER_NOT_PROVISIONED" => StatusCode::UNPROCESSABLE_ENTITY,
+        "SUBSCRIBER_BULK_TOO_LARGE" => StatusCode::PAYLOAD_TOO_LARGE,
+        "OPEN5GS_DATABASE_UNAVAILABLE" | "SUBSCRIBER_BACKUP_FAILED" => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    (status, Json(json!({"error":error})))
+}
+
+async fn list_subscribers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let backend = state.subscriber_backend.clone();
+    match tokio::task::spawn_blocking(move || backend.list()).await {
+        Ok(Ok(items)) => (
+            StatusCode::OK,
+            Json(json!({"items":items,"total":items.len(),"secrets_exposed":false})),
+        ),
+        Ok(Err(error)) => subscriber_error(error),
+        Err(_) => subscriber_error("OPEN5GS_DATABASE_UNAVAILABLE".into()),
+    }
+}
+
+async fn create_subscriber(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Json(input): Json<SubscriberMutation>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    if let Err(error) = validate_subscriber_mutation(&input) {
+        return subscriber_error(error);
+    }
+    let backend = state.subscriber_backend.clone();
+    let result = tokio::task::spawn_blocking(move || backend.provision_batch(vec![(1, input)]))
+        .await
+        .map_err(|_| "OPEN5GS_DATABASE_UNAVAILABLE".to_string())
+        .and_then(|result| result);
+    match result {
+        Ok(mut rows) if rows.len() == 1 && rows[0].ok => {
+            let row = rows.remove(0);
+            audit(
+                &state,
+                &identity.role,
+                "CREATE_SUBSCRIBER",
+                "CREATED",
+                row.slot.as_deref(),
+            );
+            (
+                StatusCode::CREATED,
+                Json(
+                    json!({"slot":row.slot,"state":"PROVISIONED","subscriber_identity":"PROTECTED","authentication_material":"PROTECTED","open5gs_changed":true}),
+                ),
+            )
+        }
+        Ok(mut rows) if rows.len() == 1 => subscriber_error(
+            rows.remove(0)
+                .error
+                .unwrap_or_else(|| "SUBSCRIBER_WRITE_FAILED".into()),
+        ),
+        Ok(_) => subscriber_error("OPEN5GS_DATABASE_RESPONSE_INVALID".into()),
+        Err(error) => subscriber_error(error),
+    }
+}
+
+fn parse_subscriber_csv(body: &[u8]) -> (Vec<(usize, SubscriberMutation)>, Vec<ProvisionResult>) {
+    let mut valid = Vec::new();
+    let mut errors = Vec::new();
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_reader(body);
+    let headers = match reader.headers() {
+        Ok(headers) => headers.clone(),
+        Err(_) => {
+            errors.push(ProvisionResult {
+                row: 1,
+                ok: false,
+                slot: None,
+                error: Some("CSV_INVALID".into()),
+            });
+            return (valid, errors);
+        }
+    };
+    let expected = [
+        "imsi",
+        "k",
+        "opc",
+        "sst",
+        "sd",
+        "dnns",
+        "ambr_uplink",
+        "ambr_downlink",
+    ];
+    if headers.iter().collect::<Vec<_>>() != expected {
+        errors.push(ProvisionResult {
+            row: 1,
+            ok: false,
+            slot: None,
+            error: Some("CSV_HEADER_INVALID".into()),
+        });
+        return (valid, errors);
+    }
+    let mut identities = BTreeSet::new();
+    for (offset, row) in reader.records().enumerate() {
+        let row_number = offset + 2;
+        if row_number > MAX_BULK_ROWS + 1 {
+            errors.push(ProvisionResult {
+                row: row_number,
+                ok: false,
+                slot: None,
+                error: Some("SUBSCRIBER_BULK_TOO_LARGE".into()),
+            });
+            break;
+        }
+        let parsed = row
+            .map_err(|_| "CSV_ROW_INVALID".to_string())
+            .and_then(|r| {
+                let input = SubscriberMutation {
+                    imsi: r[0].to_string(),
+                    k: r[1].to_string(),
+                    opc: r[2].to_string(),
+                    sst: r[3].parse().map_err(|_| "SNSSAI_INVALID")?,
+                    sd: (!r[4].is_empty()).then(|| r[4].to_string()),
+                    dnns: r[5].split('|').map(str::to_string).collect(),
+                    ambr: subscriber_provisioning::SubscriberAmbr {
+                        uplink: r[6].parse().map_err(|_| "AMBR_INVALID")?,
+                        downlink: r[7].parse().map_err(|_| "AMBR_INVALID")?,
+                    },
+                };
+                validate_subscriber_mutation(&input)?;
+                if !identities.insert(input.imsi.clone()) {
+                    return Err("DUPLICATE_SUBSCRIBER_IDENTITY".into());
+                }
+                Ok(input)
+            });
+        match parsed {
+            Ok(input) => valid.push((row_number, input)),
+            Err(error) => errors.push(ProvisionResult {
+                row: row_number,
+                ok: false,
+                slot: None,
+                error: Some(error),
+            }),
+        }
+    }
+    (valid, errors)
+}
+
+async fn bulk_create_subscribers(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let (valid, mut results) = parse_subscriber_csv(&body);
+    if results
+        .iter()
+        .any(|r| r.error.as_deref() == Some("SUBSCRIBER_BULK_TOO_LARGE"))
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error":"SUBSCRIBER_BULK_TOO_LARGE","results":results})),
+        );
+    }
+    for batch in valid.chunks(WRITE_BATCH_ROWS) {
+        let backend = state.subscriber_backend.clone();
+        let owned = batch.to_vec();
+        match tokio::task::spawn_blocking(move || backend.provision_batch(owned)).await {
+            Ok(Ok(mut batch_results)) => results.append(&mut batch_results),
+            Ok(Err(error)) => results.extend(batch.iter().map(|(row, _)| ProvisionResult {
+                row: *row,
+                ok: false,
+                slot: None,
+                error: Some(error.clone()),
+            })),
+            Err(_) => results.extend(batch.iter().map(|(row, _)| ProvisionResult {
+                row: *row,
+                ok: false,
+                slot: None,
+                error: Some("OPEN5GS_DATABASE_UNAVAILABLE".into()),
+            })),
+        }
+    }
+    results.sort_by_key(|row| row.row);
+    let ok = results.iter().filter(|row| row.ok).count();
+    let failed = results.len().saturating_sub(ok);
+    audit(
+        &state,
+        &identity.role,
+        "BULK_CREATE_SUBSCRIBERS",
+        if failed == 0 { "CREATED" } else { "PARTIAL" },
+        None,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({"ok":ok,"errors":failed,"results":results,"secrets_exposed":false})),
+    )
+}
+
+async fn list_owners(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let registry = state.profile_registry.lock().unwrap();
+    let mut items = BTreeSet::new();
+    if !registry.profiles.is_empty() {
+        items.insert("POLARIS_CONTROLLER");
+    }
+    if registry.profiles.iter().any(|p| p.profile.ue_id == "UE-01") && !state.ue01_controller_owned
+    {
+        items.insert("SHARED_PROTECTED");
+    }
+    Json(json!({"items":items,"source":"CURRENT_OWNERSHIP_REGISTRY"}))
+}
+
+async fn list_plmns(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let backend = state.subscriber_backend.clone();
+    match tokio::task::spawn_blocking(move || backend.list()).await {
+        Ok(Ok(items)) => {
+            let values = items
+                .into_iter()
+                .map(|i| format!("{}-{}", i.plmn.mcc, i.plmn.mnc))
+                .collect::<BTreeSet<_>>();
+            (
+                StatusCode::OK,
+                Json(json!({"items":values,"source":"OPEN5GS_POLARIS_OWNED"})),
+            )
+        }
+        Ok(Err(error)) => subscriber_error(error),
+        Err(_) => subscriber_error("OPEN5GS_DATABASE_UNAVAILABLE".into()),
+    }
+}
+
+async fn list_dnns(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let backend = state.subscriber_backend.clone();
+    match tokio::task::spawn_blocking(move || backend.list()).await {
+        Ok(Ok(items)) => {
+            let values = items
+                .into_iter()
+                .flat_map(|i| i.dnns)
+                .collect::<BTreeSet<_>>();
+            (
+                StatusCode::OK,
+                Json(json!({"items":values,"source":"OPEN5GS_POLARIS_OWNED"})),
+            )
+        }
+        Ok(Err(error)) => subscriber_error(error),
+        Err(_) => subscriber_error("OPEN5GS_DATABASE_UNAVAILABLE".into()),
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct UeProfileListQuery {
     page: Option<usize>,
@@ -2771,14 +3044,11 @@ async fn list_ue_profiles(
     }))
 }
 
-async fn bulk_create_ue_profiles(
-    State(state): State<Arc<AppState>>,
-    Extension(identity): Extension<EffectiveIdentity>,
-    Json(input): Json<BulkProfileInput>,
-) -> impl IntoResponse {
-    if let Err(error) = require_operator(&identity) {
-        return error;
-    }
+fn bulk_create_generated_ue_profiles(
+    state: &Arc<AppState>,
+    identity: &EffectiveIdentity,
+    input: BulkProfileInput,
+) -> (StatusCode, Json<Value>) {
     let _operation = state.ue_operations.lock().unwrap();
     let mut registry = state.profile_registry.lock().unwrap();
     let records = match state.profile_store.create_bulk(&mut registry, input) {
@@ -2816,6 +3086,193 @@ async fn bulk_create_ue_profiles(
             "live_started":0
         })),
     )
+}
+
+struct ProfileCsvRow {
+    row: usize,
+    ue_id: String,
+    gnb_id: String,
+    note: String,
+    imsi: String,
+}
+
+fn parse_profile_csv(body: &[u8]) -> Result<Vec<ProfileCsvRow>, (StatusCode, Json<Value>)> {
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_reader(body);
+    let headers = reader
+        .headers()
+        .map_err(|_| profile_mutation_error("CSV_INVALID".into()))?
+        .clone();
+    if headers.iter().collect::<Vec<_>>() != ["ue_id", "gnb_id", "note", "imsi"] {
+        return Err(profile_mutation_error("CSV_HEADER_INVALID".into()));
+    }
+    let mut rows = Vec::new();
+    for (offset, item) in reader.records().enumerate() {
+        if offset >= MAX_BULK_ROWS {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"error":"UE_PROFILE_BULK_TOO_LARGE"})),
+            ));
+        }
+        let item = item.map_err(|_| profile_mutation_error("CSV_ROW_INVALID".into()))?;
+        rows.push(ProfileCsvRow {
+            row: offset + 2,
+            ue_id: item[0].into(),
+            gnb_id: item[1].into(),
+            note: item[2].into(),
+            imsi: item[3].into(),
+        });
+    }
+    Ok(rows)
+}
+
+async fn import_ue_profiles_csv(
+    state: Arc<AppState>,
+    identity: EffectiveIdentity,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<Value>) {
+    let rows = match parse_profile_csv(&body) {
+        Ok(rows) => rows,
+        Err(error) => return error,
+    };
+    let identities = rows.iter().map(|r| r.imsi.clone()).collect::<Vec<_>>();
+    let backend = state.subscriber_backend.clone();
+    let subscribers =
+        match tokio::task::spawn_blocking(move || backend.lookup_many(&identities)).await {
+            Ok(Ok(records)) => records,
+            Ok(Err(error)) => return subscriber_error(error),
+            Err(_) => return subscriber_error("OPEN5GS_DATABASE_UNAVAILABLE".into()),
+        };
+    let existing = {
+        let registry = state.profile_registry.lock().unwrap();
+        registry
+            .profiles
+            .iter()
+            .map(|r| r.profile.ue_id.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let available = ueransim_adapter::MAX_CONFIGURABLE_UES.saturating_sub(existing.len());
+    let mut accepted = Vec::new();
+    let mut accepted_rows = Vec::new();
+    let mut results = Vec::new();
+    let mut ids = BTreeSet::new();
+    let mut subscriber_ids = BTreeSet::new();
+    for row in rows {
+        let error = if !ids.insert(row.ue_id.clone()) || existing.contains(&row.ue_id) {
+            Some("UE_PROFILE_ALREADY_EXISTS")
+        } else if !subscriber_ids.insert(row.imsi.clone()) {
+            Some("DUPLICATE_SUBSCRIBER_IDENTITY")
+        } else if accepted.len() >= available {
+            Some("UE_PROFILE_CAPACITY_REACHED")
+        } else if !state
+            .profile_store
+            .gnbs()
+            .iter()
+            .any(|g| g.gnb_id == row.gnb_id)
+        {
+            Some("UNKNOWN_SERVING_GNB")
+        } else if !subscribers.contains_key(&row.imsi) {
+            Some("SUBSCRIBER_NOT_PROVISIONED")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            results.push(json!({"row":row.row,"ue_id":row.ue_id,"ok":false,"error":error}));
+            continue;
+        }
+        let subscriber = &subscribers[&row.imsi];
+        let dnn = if subscriber.dnns.iter().any(|d| d == "internet") {
+            "internet".to_string()
+        } else {
+            subscriber.dnns.first().cloned().unwrap_or_default()
+        };
+        accepted.push(ProfileMutationInput {
+            ue_id: row.ue_id.clone(),
+            name: if row.note.trim().is_empty() {
+                row.ue_id.clone()
+            } else {
+                row.note
+            },
+            supi: Some(format!("imsi-{}", subscriber.imsi)),
+            authentication_key: Some(subscriber.k.clone()),
+            opc: Some(subscriber.opc.clone()),
+            plmn_mcc: subscriber.plmn_mcc.clone(),
+            plmn_mnc: subscriber.plmn_mnc.clone(),
+            dnn,
+            sst: subscriber.sst,
+            sd: subscriber.sd.clone(),
+            serving_gnb: row.gnb_id,
+            scenario_id: None,
+            auto_run_scenario: false,
+            provisioning_slot: None,
+        });
+        accepted_rows.push((row.row, row.ue_id));
+    }
+    if !accepted.is_empty() {
+        let _operation = state.ue_operations.lock().unwrap();
+        let mut registry = state.profile_registry.lock().unwrap();
+        match state.profile_store.create_many(&mut registry, accepted) {
+            Ok(records) => {
+                if let Err(error) = state
+                    .multi_ue
+                    .lock()
+                    .unwrap()
+                    .add_profiles(records.iter().map(|r| r.profile.clone()).collect())
+                {
+                    for (row, ue_id) in accepted_rows {
+                        results.push(json!({"row":row,"ue_id":ue_id,"ok":false,"error":error}));
+                    }
+                } else {
+                    for (row, ue_id) in accepted_rows {
+                        results.push(json!({"row":row,"ue_id":ue_id,"ok":true,"subscription_status":"VERIFIED"}));
+                    }
+                }
+            }
+            Err(error) => {
+                for (row, ue_id) in accepted_rows {
+                    results.push(json!({"row":row,"ue_id":ue_id,"ok":false,"error":error}));
+                }
+            }
+        }
+    }
+    results.sort_by_key(|r| r["row"].as_u64().unwrap_or(0));
+    let ok = results.iter().filter(|r| r["ok"] == true).count();
+    let errors = results.len().saturating_sub(ok);
+    audit(
+        &state,
+        &identity.role,
+        "BULK_IMPORT_UE_PROFILES",
+        if errors == 0 { "CREATED" } else { "PARTIAL" },
+        None,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({"ok":ok,"errors":errors,"results":results,"secrets_exposed":false})),
+    )
+}
+
+async fn bulk_create_ue_profiles(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/csv"))
+    {
+        return import_ue_profiles_csv(state, identity, body).await;
+    }
+    let input = match serde_json::from_slice::<BulkProfileInput>(&body) {
+        Ok(input) => input,
+        Err(_) => return profile_mutation_error("UE_BULK_REQUEST_INVALID".into()),
+    };
+    bulk_create_generated_ue_profiles(&state, &identity, input)
 }
 
 fn csv_cell(value: &str) -> String {
@@ -2921,17 +3378,88 @@ fn persist_profile_configuration(
 async fn create_ue_profile(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
-    Json(input): Json<ProfileMutationInput>,
+    Json(value): Json<Value>,
 ) -> impl IntoResponse {
     if let Err(error) = require_operator(&identity) {
         return error;
     }
+    let (input, provisioned) = if value.get("imsi").is_some() {
+        let request: SubscriberProfileInput = match serde_json::from_value(value) {
+            Ok(request) => request,
+            Err(_) => return profile_mutation_error("UE_PROFILE_FIELDS_INVALID".into()),
+        };
+        if request.imsi.len() != 15 || !request.imsi.chars().all(|c| c.is_ascii_digit()) {
+            return profile_mutation_error("SUBSCRIBER_NOT_PROVISIONED".into());
+        }
+        let backend = state.subscriber_backend.clone();
+        let identity = request.imsi.clone();
+        let records = match tokio::task::spawn_blocking(move || {
+            backend.lookup_many(std::slice::from_ref(&identity))
+        })
+        .await
+        {
+            Ok(Ok(records)) => records,
+            Ok(Err(error)) => return subscriber_error(error),
+            Err(_) => return subscriber_error("OPEN5GS_DATABASE_UNAVAILABLE".into()),
+        };
+        let subscriber = match records.get(&request.imsi) {
+            Some(record) => record,
+            None => return profile_mutation_error("SUBSCRIBER_NOT_PROVISIONED".into()),
+        };
+        let dnn = if subscriber.dnns.iter().any(|d| d == "internet") {
+            "internet".to_string()
+        } else {
+            subscriber.dnns.first().cloned().unwrap_or_default()
+        };
+        (
+            ProfileMutationInput {
+                ue_id: request.ue_id.clone(),
+                name: if request.note.trim().is_empty() {
+                    request.ue_id
+                } else {
+                    request.note
+                },
+                supi: Some(format!("imsi-{}", subscriber.imsi)),
+                authentication_key: Some(subscriber.k.clone()),
+                opc: Some(subscriber.opc.clone()),
+                plmn_mcc: subscriber.plmn_mcc.clone(),
+                plmn_mnc: subscriber.plmn_mnc.clone(),
+                dnn,
+                sst: subscriber.sst,
+                sd: subscriber.sd.clone(),
+                serving_gnb: request.gnb_id,
+                scenario_id: None,
+                auto_run_scenario: false,
+                provisioning_slot: None,
+            },
+            true,
+        )
+    } else {
+        let input = match serde_json::from_value::<ProfileMutationInput>(value) {
+            Ok(input) => input,
+            Err(_) => return profile_mutation_error("UE_PROFILE_FIELDS_INVALID".into()),
+        };
+        (input, false)
+    };
     let _operation = state.ue_operations.lock().unwrap();
     let mut registry = state.profile_registry.lock().unwrap();
-    let record = match state.profile_store.create(&mut registry, input) {
+    let mut record = match state.profile_store.create(&mut registry, input) {
         Ok(record) => record,
         Err(error) => return profile_mutation_error(error),
     };
+    if provisioned {
+        record.profile.subscription_verified = true;
+        if let Some(stored) = registry
+            .profiles
+            .iter_mut()
+            .find(|item| item.profile.ue_id == record.profile.ue_id)
+        {
+            stored.profile.subscription_verified = true;
+        }
+        if let Err(error) = state.profile_store.persist(&registry) {
+            return profile_mutation_error(error);
+        }
+    }
     if let Err(error) = state
         .multi_ue
         .lock()
@@ -2955,6 +3483,66 @@ async fn create_ue_profile(
         Some(&record.profile.ue_id),
     );
     (StatusCode::CREATED, Json(managed_profile_json(&record)))
+}
+
+async fn get_ue_profile(
+    State(state): State<Arc<AppState>>,
+    AxumPath(ue_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let record = {
+        let registry = state.profile_registry.lock().unwrap();
+        match registry
+            .profiles
+            .iter()
+            .find(|record| record.profile.ue_id == ue_id)
+            .cloned()
+        {
+            Some(record) => record,
+            None => return profile_mutation_error("UNKNOWN_UE_PROFILE".into()),
+        }
+    };
+    let imsi = match state.profile_store.subscriber_imsi(&record) {
+        Ok(imsi) => imsi,
+        Err(error) => return profile_mutation_error(error),
+    };
+    let backend = state.subscriber_backend.clone();
+    let identity = imsi.clone();
+    let subscriber = match tokio::task::spawn_blocking(move || {
+        backend.lookup_many(std::slice::from_ref(&identity))
+    })
+    .await
+    {
+        Ok(Ok(records)) => records.get(&imsi).cloned(),
+        Ok(Err(error)) => return subscriber_error(error),
+        Err(_) => return subscriber_error("OPEN5GS_DATABASE_UNAVAILABLE".into()),
+    };
+    let job = state
+        .multi_ue
+        .lock()
+        .unwrap()
+        .snapshot()
+        .into_iter()
+        .find(|job| job.ue_id == ue_id);
+    let pdu_state = job
+        .as_ref()
+        .map(|job| job.pdu_session_state.as_str())
+        .unwrap_or("NOT_OBSERVED");
+    let last_job = {
+        let runtime = state.runtime.lock().unwrap();
+        runtime
+            .history
+            .iter()
+            .rev()
+            .find(|item| item["target_ue_id"] == ue_id)
+            .cloned()
+    };
+    let mut value = managed_profile_json(&record);
+    let object = value.as_object_mut().unwrap();
+    object.insert("pdu_sessions".into(),json!([{"dnn":record.profile.dnn,"state":pdu_state,"source":"CURRENT_CONTROLLER_OBSERVATION"}]));
+    object.insert("ims".into(),json!({"configured":subscriber.as_ref().is_some_and(|s|s.dnns.iter().any(|d|d=="ims")),"state":"NOT_OBSERVED"}));
+    object.insert("subscriber".into(),subscriber.as_ref().map(subscriber_provisioning::sanitize).map(|s|serde_json::to_value(s).unwrap()).unwrap_or_else(||json!({"state":"NOT_PROVISIONED","subscriber_identity":"PROTECTED","authentication_material":"PROTECTED"})));
+    object.insert("last_job".into(),json!({"bytes_ul":last_job.as_ref().and_then(|j|j["bytes_sent"].as_u64()),"bytes_dl":last_job.as_ref().and_then(|j|j["bytes_received"].as_u64()),"job_id":last_job.as_ref().and_then(|j|j["job_id"].as_str())}));
+    (StatusCode::OK, Json(value))
 }
 
 async fn update_ue_profile(
@@ -6245,11 +6833,27 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/nodes", get(nodes))
         .route("/ues", get(ues))
         .route("/gnbs", get(list_gnbs))
+        .route("/owners", get(list_owners))
+        .route("/plmns", get(list_plmns))
+        .route("/dnns", get(list_dnns))
+        .route(
+            "/subscribers",
+            get(list_subscribers).post(create_subscriber),
+        )
+        .route(
+            "/subscribers/bulk",
+            post(bulk_create_subscribers)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route(
             "/ue-profiles",
             get(list_ue_profiles).post(create_ue_profile),
         )
-        .route("/ue-profiles/bulk", post(bulk_create_ue_profiles))
+        .route(
+            "/ue-profiles/bulk",
+            post(bulk_create_ue_profiles)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route(
             "/ue-profiles/provisioning-slots",
             get(list_provisioning_slots),
@@ -6257,7 +6861,9 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/ue-profiles/export.csv", get(export_ue_profiles_csv))
         .route(
             "/ue-profiles/:ue_id",
-            put(update_ue_profile).delete(delete_ue_profile),
+            get(get_ue_profile)
+                .put(update_ue_profile)
+                .delete(delete_ue_profile),
         )
         .route("/ue-profiles/:ue_id/clone", post(clone_ue_profile))
         .route(
@@ -6782,6 +7388,7 @@ mod p0_tests {
                 root.join("ue-profiles"),
             ),
             profile_registry: Arc::new(Mutex::new(profile_registry)),
+            subscriber_backend: Arc::new(MemorySubscriberBackend::default()),
             scenario_definition_store: ScenarioDefinitionStore::new(
                 root.join("scenario-definitions.json"),
             ),
@@ -6972,6 +7579,222 @@ mod p0_tests {
         );
         assert_eq!(body["scenario_step_limits"]["repeat_depth_max"], 2);
         assert_eq!(body["scenario_step_limits"]["resolved_steps_max"], 10_000);
+    }
+
+    #[tokio::test]
+    async fn subscriber_provisioning_is_csrf_protected_backed_up_and_never_exposes_identity() {
+        let backend = MemorySubscriberBackend::default();
+        let mut test_state = state();
+        test_state.subscriber_backend = Arc::new(backend.clone());
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let secret_identity = "001010000009999";
+        let secret_key = "11".repeat(16);
+        let secret_opc = "22".repeat(16);
+        let payload = json!({"imsi":secret_identity,"k":secret_key,"opc":secret_opc,"sst":1,"sd":"010203","dnns":["internet","ims"],"ambr":{"uplink":1000000,"downlink":2000000}});
+        let denied = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/subscribers")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let created = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/subscribers")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(backend.backup_count(), 1);
+        let created_body = String::from_utf8(
+            to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!created_body.contains(secret_identity));
+        assert!(!created_body.contains(&secret_key));
+        assert!(!created_body.contains(&secret_opc));
+        assert!(created_body.contains("PROTECTED"));
+        let listed = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/subscribers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed_body = String::from_utf8(
+            to_bytes(listed.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!listed_body.contains(secret_identity));
+        assert!(!listed_body.contains(&secret_key));
+        assert!(!listed_body.contains(&secret_opc));
+        let profile=application.clone().oneshot(Request::builder().method(Method::POST).uri("/api/v1/ue-profiles").header(header::CONTENT_TYPE,"application/json").header(header::COOKIE,&cookie).header("x-csrf-token",&csrf).body(Body::from(json!({"ue_id":"UE-99","gnb_id":"GNB-01","note":"Protected profile","imsi":secret_identity}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(profile.status(), StatusCode::CREATED);
+        let profile_body = String::from_utf8(
+            to_bytes(profile.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!profile_body.contains(secret_identity));
+        assert!(!profile_body.contains(&secret_key));
+        assert!(!profile_body.contains(&secret_opc));
+        let detail = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ue-profiles/UE-99")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_body = String::from_utf8(
+            to_bytes(detail.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!detail_body.contains(secret_identity));
+        assert!(!detail_body.contains(&secret_key));
+        assert!(!detail_body.contains(&secret_opc));
+        assert!(detail_body.contains("PROTECTED"));
+        let unknown=application.clone().oneshot(Request::builder().method(Method::POST).uri("/api/v1/ue-profiles").header(header::CONTENT_TYPE,"application/json").header(header::COOKIE,&cookie).header("x-csrf-token",&csrf).body(Body::from(json!({"ue_id":"UE-98","gnb_id":"GNB-01","note":"Unknown","imsi":"001010000008888"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(unknown.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let csv_identity = "001010000007777";
+        let subscriber_csv = format!(
+            "imsi,k,opc,sst,sd,dnns,ambr_uplink,ambr_downlink\n{csv_identity},{},{},1,010203,internet,1000000,2000000\n",
+            "33".repeat(16), "44".repeat(16)
+        );
+        let bulk = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/subscribers/bulk")
+                    .header(header::CONTENT_TYPE, "text/csv")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(subscriber_csv))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bulk.status(), StatusCode::OK);
+        let bulk_body = String::from_utf8(
+            to_bytes(bulk.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!bulk_body.contains(csv_identity));
+        assert!(bulk_body.contains("\"ok\":1"));
+        let profile_csv =
+            format!("ue_id,gnb_id,note,imsi\nUE-97,GNB-01,Bulk protected,{csv_identity}\n");
+        let profile_bulk = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ue-profiles/bulk")
+                    .header(header::CONTENT_TYPE, "text/csv")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(profile_csv))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(profile_bulk.status(), StatusCode::OK);
+        let profile_bulk_body = String::from_utf8(
+            to_bytes(profile_bulk.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!profile_bulk_body.contains(csv_identity));
+        assert!(profile_bulk_body.contains("\"ok\":1"));
+        for uri in [
+            "/api/v1/gnbs",
+            "/api/v1/owners",
+            "/api/v1/plmns",
+            "/api/v1/dnns",
+        ] {
+            let response = application
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[test]
+    fn one_hundred_thousand_row_csv_contracts_are_bounded_and_measured() {
+        fn rss_kib() -> u64 {
+            fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("VmRSS:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(0)
+        }
+        let rss_before = rss_kib();
+        let started = std::time::Instant::now();
+        let mut subscribers = String::from("imsi,k,opc,sst,sd,dnns,ambr_uplink,ambr_downlink\n");
+        let mut profiles = String::from("ue_id,gnb_id,note,imsi\n");
+        for index in 0..MAX_BULK_ROWS {
+            let identity = format!("00101{index:010}");
+            subscribers.push_str(&format!(
+                "{identity},{},{},1,010203,internet,1000000,2000000\n",
+                "11".repeat(16),
+                "22".repeat(16)
+            ));
+            profiles.push_str(&format!("UE-{index:05},GNB-01,Bulk,{identity}\n"));
+        }
+        let (valid, errors) = parse_subscriber_csv(subscribers.as_bytes());
+        assert_eq!(valid.len(), MAX_BULK_ROWS);
+        assert!(errors.is_empty());
+        let parsed = parse_profile_csv(profiles.as_bytes()).unwrap();
+        assert_eq!(parsed.len(), MAX_BULK_ROWS);
+        eprintln!(
+            "CSV_100K_ELAPSED_MS={} RSS_DELTA_KIB={}",
+            started.elapsed().as_millis(),
+            rss_kib().saturating_sub(rss_before)
+        );
     }
 
     #[tokio::test]
