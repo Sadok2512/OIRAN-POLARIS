@@ -31,3 +31,5 @@
 @media(max-width:1450px){.session-table-panel .table-wrap table{min-width:1360px}.session-table-panel .table-wrap th{font-size:9.5px}.session-table-panel .table-wrap td{font-size:11.5px}.filterbar .search-box.wide{width:280px}.filterbar select{min-width:138px}.filterbar select[aria-label="Dataset filter"]{min-width:230px}}
 .flow-event.sbi .message-line{stroke:var(--warning)}.flow-event.sbi marker path{fill:var(--warning)}
 @media(max-width:1100px){.interface-grid,.plane-selector{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+.withheld-banner{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;margin:0 0 10px 0;border:1px solid var(--warning);background:#FDF1E1;border-radius:7px;font-size:10px;color:var(--text)}:root[data-theme="dark"] .withheld-banner{background:#3A2A10}.withheld-banner b{color:var(--warning)}.withheld-banner svg{color:var(--warning);flex-shrink:0;margin-top:1px}
