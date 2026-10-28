@@ -114,6 +114,60 @@ impl MultiUeController {
         self.profiles.values().cloned().collect()
     }
 
+    /// Replaces one stopped profile. Runtime ownership is deliberately not inferred from profile
+    /// data; an active or reserved job must be stopped and reconciled first.
+    pub fn upsert_profile(&mut self, profile: UeProfileSpec) -> Result<(), String> {
+        let mut profiles = self.profiles.values().cloned().collect::<Vec<_>>();
+        if let Some(existing) = profiles.iter_mut().find(|item| item.ue_id == profile.ue_id) {
+            if self.jobs.get(&profile.ue_id).is_some_and(|job| {
+                job.process_handle.is_some()
+                    || !matches!(job.lifecycle, UeLifecycle::Stopped | UeLifecycle::Failed)
+            }) {
+                return Err("UE_PROFILE_ACTIVE".into());
+            }
+            *existing = profile.clone();
+        } else {
+            profiles.push(profile.clone());
+        }
+        validate_profile_set(&profiles)?;
+        self.profiles.insert(profile.ue_id.clone(), profile);
+        Ok(())
+    }
+
+    /// Adds a persistent catalog batch after one aggregate validation. This does not allocate a
+    /// runtime job and therefore cannot start or reserve any UE.
+    pub fn add_profiles(&mut self, additions: Vec<UeProfileSpec>) -> Result<(), String> {
+        if additions
+            .iter()
+            .any(|profile| self.profiles.contains_key(&profile.ue_id))
+        {
+            return Err("UE_PROFILE_ALREADY_EXISTS".into());
+        }
+        let mut profiles = self.profiles.values().cloned().collect::<Vec<_>>();
+        profiles.extend(additions.iter().cloned());
+        validate_profile_set(&profiles)?;
+        for profile in additions {
+            self.profiles.insert(profile.ue_id.clone(), profile);
+        }
+        Ok(())
+    }
+
+    /// Deletes only a stopped profile. A retained terminal job is removed with the profile so it
+    /// cannot later be mistaken for a newly-created UE using the same stable ID.
+    pub fn delete_profile(&mut self, ue_id: &str) -> Result<UeProfileSpec, String> {
+        let profile = self.profiles.get(ue_id).ok_or("UNKNOWN_UE_PROFILE")?;
+        if self.jobs.get(ue_id).is_some_and(|job| {
+            job.process_handle.is_some()
+                || !matches!(job.lifecycle, UeLifecycle::Stopped | UeLifecycle::Failed)
+        }) {
+            return Err("UE_PROFILE_ACTIVE".into());
+        }
+        let removed = profile.clone();
+        self.profiles.remove(ue_id);
+        self.jobs.remove(ue_id);
+        Ok(removed)
+    }
+
     pub fn configured_count(&self) -> usize {
         self.profiles
             .values()
@@ -127,9 +181,19 @@ impl MultiUeController {
         }
     }
 
+    pub fn set_profile_subscription_verified(
+        &mut self,
+        ue_id: &str,
+        verified: bool,
+    ) -> Result<(), String> {
+        let profile = self.profiles.get_mut(ue_id).ok_or("UNKNOWN_UE_PROFILE")?;
+        profile.subscription_verified = verified;
+        Ok(())
+    }
+
     /// Changes desired configuration only. It never starts or stops a UE process.
     pub fn configure_count(&mut self, count: usize) -> Result<(), String> {
-        if count == 0 || count > self.profiles.len() || count > 10 {
+        if count > self.profiles.len() || count > ueransim_adapter::MAX_LIVE_UES {
             return Err("UE_COUNT_OUT_OF_RANGE".into());
         }
         let selected = self
@@ -936,9 +1000,9 @@ mod tests {
     }
 
     #[test]
-    fn configuration_supports_one_two_five_and_ten_without_starting_processes() {
+    fn configuration_supports_zero_one_two_five_and_ten_without_starting_processes() {
         let mut controller = MultiUeController::new(ready_profiles(10), 10).unwrap();
-        for count in [1, 2, 5, 10] {
+        for count in [0, 1, 2, 5, 10] {
             controller.configure_count(count).unwrap();
             assert_eq!(controller.configured_count(), count);
             assert!(controller
@@ -946,6 +1010,44 @@ mod tests {
                 .iter()
                 .all(|job| job.process_handle.is_none()));
         }
+    }
+
+    #[test]
+    fn profile_crud_requires_stopped_state_and_removes_terminal_identity() {
+        let mut profiles = ready_profiles(2);
+        profiles[0].configured = true;
+        profiles[1].configured = true;
+        let mut controller = MultiUeController::new(profiles.clone(), 10).unwrap();
+        let mut added = profiles[1].clone();
+        added.ue_id = "UE-03".into();
+        added.profile_name = "ue-03.yaml".into();
+        added.pseudonym = "UE-PSEUDONYM-03".into();
+        controller.upsert_profile(added.clone()).unwrap();
+        assert!(controller
+            .profiles()
+            .iter()
+            .any(|item| item.ue_id == "UE-03"));
+
+        controller.start_offline("UE-03").unwrap();
+        assert_eq!(
+            controller.delete_profile("UE-03").unwrap_err(),
+            "UE_PROFILE_ACTIVE"
+        );
+        controller.stop_offline("UE-03").unwrap();
+        controller.delete_profile("UE-03").unwrap();
+        assert!(!controller
+            .profiles()
+            .iter()
+            .any(|item| item.ue_id == "UE-03"));
+        assert!(!controller
+            .snapshot()
+            .iter()
+            .any(|item| item.ue_id == "UE-03"));
+
+        controller.delete_profile("UE-01").unwrap();
+        controller.delete_profile("UE-02").unwrap();
+        assert!(controller.profiles().is_empty());
+        assert!(controller.inventory().is_empty());
     }
 
     #[test]
@@ -1022,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn live_start_protects_ue_01_and_allows_bounded_profiles_through_ue_10() {
+    fn live_start_supports_bounded_profiles_after_api_ownership_authorization() {
         let mut controller = MultiUeController::new(ready_profiles(10), 10).unwrap();
         assert_eq!(
             controller
@@ -1030,12 +1132,9 @@ mod tests {
                 .unwrap_err(),
             "INVALID_PROCESS_HANDLE"
         );
-        assert_eq!(
-            controller
-                .record_live_start("UE-01", &format!("container:{}", "a".repeat(64)))
-                .unwrap_err(),
-            "PROTECTED_OR_UNAPPROVED_UE"
-        );
+        controller
+            .record_live_start("UE-01", &format!("container:{}", "a".repeat(64)))
+            .unwrap();
         controller
             .record_live_start("UE-02", &format!("container:{}", "b".repeat(64)))
             .unwrap();
@@ -1134,5 +1233,36 @@ mod tests {
             assert_eq!(job.registration_state, "NOT_OBSERVED");
             assert_eq!(job.pdu_session_state, "INACTIVE");
         }
+    }
+
+    #[test]
+    fn catalog_capacity_is_independent_from_live_capacity() {
+        let mut controller = MultiUeController::new(Vec::new(), 10).unwrap();
+        let additions = (1..=100)
+            .map(|index| UeProfileSpec {
+                ue_id: format!("UE-{index:05}"),
+                pseudonym: format!("UE {index}"),
+                profile_name: format!("ue-{index:05}.yaml"),
+                serving_gnb: "GNB-01".into(),
+                plmn_mcc: "001".into(),
+                plmn_mnc: "01".into(),
+                dnn: "internet".into(),
+                sst: 1,
+                sd: Some("010203".into()),
+                configured: true,
+                subscription_verified: false,
+            })
+            .collect();
+        controller.add_profiles(additions).unwrap();
+        assert_eq!(controller.configured_count(), 100);
+        controller.configure_count(10).unwrap();
+        assert_eq!(
+            controller.configure_count(11).unwrap_err(),
+            "UE_COUNT_OUT_OF_RANGE"
+        );
+        assert!(controller
+            .inventory()
+            .iter()
+            .all(|ue| ue.process_handle.is_none()));
     }
 }

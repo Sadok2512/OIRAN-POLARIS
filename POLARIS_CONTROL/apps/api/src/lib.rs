@@ -1,15 +1,16 @@
 mod cpu_safety;
+mod ue_profiles;
 
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
 use axum::{
-    extract::{Extension, Request, State},
+    extract::{Extension, Path as AxumPath, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use cpu_safety::{CpuSafetyEvidence, CpuSafetyMonitor, ScenarioResourceBudget};
@@ -35,6 +36,9 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,
 };
+use ue_profiles::{
+    BulkProfileInput, ManagedUeProfile, ProfileMutationInput, ProfileStore, UeProfileRegistry,
+};
 use ueransim_adapter::{
     LiveLaunchSpec, ProvisionedProfileEvidence, ProvisioningBinding, UeObservation, UeProfileSpec,
 };
@@ -47,6 +51,9 @@ static LIVE_RUNNING: AtomicBool = AtomicBool::new(false);
 static LIVE_APPROVAL_CONSUMED: AtomicBool = AtomicBool::new(false);
 static LIVE_RECORD: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
 const UE_INVENTORY_OBSERVATION_TTL_SECONDS: u64 = 10;
+const UE_CONTROL_AUTHORIZATION_SECONDS: u64 = 5 * 60;
+const UE01_TRANSFER_ATTESTATION_PATH: &str =
+    "/var/lib/polaris-control/ue-01-ownership-transfer.json";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -61,10 +68,13 @@ pub struct AppState {
     cpu_decision_lock: Arc<Mutex<()>>,
     latest_cpu_decision: Arc<Mutex<Option<CpuSafetyEvidence>>>,
     configuration_path: PathBuf,
+    profile_store: ProfileStore,
+    profile_registry: Arc<Mutex<UeProfileRegistry>>,
     policy_path: PathBuf,
     policy_enabled: Arc<AtomicBool>,
     execution_mode: String,
     additional_ue_live_enabled: bool,
+    ue01_controller_owned: bool,
     ue_runtime: Arc<dyn UeRuntime>,
     resource_override: Option<Result<(), String>>,
     cpu_safety: Arc<Mutex<CpuSafetyMonitor>>,
@@ -78,6 +88,142 @@ pub struct AppState {
     ue_reconciliation_running: Arc<AtomicBool>,
     ue_reconciliation: Arc<Mutex<UeReconciliation>>,
     startup_reconcile: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Ue01OwnershipTransferAttestation {
+    schema_version: u8,
+    ue_id: String,
+    state: String,
+    legacy_container_name: String,
+    legacy_container_id: String,
+    legacy_compose_project: String,
+    legacy_compose_service: String,
+    legacy_compose_sha256: String,
+    profile_sha256: String,
+    ownership_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct Ue01OwnershipTransferEvidence {
+    legacy_container_present: bool,
+    legacy_container_running: bool,
+    legacy_container_id: Option<String>,
+    compose_sha256: String,
+    profile_sha256: String,
+    ownership_id: String,
+}
+
+fn validate_ue01_ownership_transfer(
+    transfer: &Ue01OwnershipTransferAttestation,
+    evidence: &Ue01OwnershipTransferEvidence,
+) -> Result<(), String> {
+    if transfer.schema_version != 1
+        || transfer.ue_id != "UE-01"
+        || transfer.state != "CONTROLLER_OWNED"
+        || transfer.legacy_container_name != "oiran-lab-ueransim-ue-1"
+        || transfer.legacy_compose_project != "oiran-lab"
+        || transfer.legacy_compose_service != "ueransim-ue"
+    {
+        return Err("UE01_TRANSFER_ATTESTATION_INVALID".into());
+    }
+    if transfer.legacy_container_id.len() != 64
+        || !transfer
+            .legacy_container_id
+            .chars()
+            .all(|value| value.is_ascii_hexdigit())
+        || transfer.legacy_compose_sha256.len() != 64
+        || transfer.profile_sha256.len() != 64
+        || transfer.ownership_id.len() != 64
+    {
+        return Err("UE01_TRANSFER_ATTESTATION_INVALID".into());
+    }
+    if evidence.legacy_container_present || evidence.legacy_container_running {
+        return Err("UE01_LEGACY_OWNER_STILL_PRESENT".into());
+    }
+    if evidence
+        .legacy_container_id
+        .as_deref()
+        .is_some_and(|id| id != transfer.legacy_container_id)
+    {
+        return Err("UE01_LEGACY_OWNER_ID_MISMATCH".into());
+    }
+    if evidence.compose_sha256 != transfer.legacy_compose_sha256
+        || evidence.profile_sha256 != transfer.profile_sha256
+        || evidence.ownership_id != transfer.ownership_id
+    {
+        return Err("UE01_TRANSFER_EVIDENCE_MISMATCH".into());
+    }
+    Ok(())
+}
+
+fn controller_owns_ue(state: &AppState, ue_id: &str) -> bool {
+    ueransim_adapter::is_approved_controller_ue(ue_id)
+        && (ue_id != "UE-01" || state.ue01_controller_owned)
+}
+
+fn compose_disables_legacy_ue01(document: &str) -> bool {
+    let mut in_service = false;
+    let mut marker = false;
+    let mut profiles_disable_normal_5g = false;
+    for line in document.lines() {
+        if line == "  ueransim-ue:" {
+            in_service = true;
+            continue;
+        }
+        if in_service
+            && line.starts_with("  ")
+            && !line.starts_with("    ")
+            && line.trim_end().ends_with(':')
+        {
+            break;
+        }
+        if in_service {
+            marker |= line.contains("POLARIS_UE01_OWNERSHIP_TRANSFERRED");
+            if line.trim_start().starts_with("profiles:") {
+                profiles_disable_normal_5g = !line.contains("\"5g\"") && !line.contains("'5g'");
+            }
+        }
+    }
+    marker && profiles_disable_normal_5g
+}
+
+fn disable_legacy_ue01_service(document: &str) -> Result<String, String> {
+    if document.contains("POLARIS_UE01_OWNERSHIP_TRANSFERRED") {
+        return Ok(document.to_string());
+    }
+    let mut output = Vec::new();
+    let mut in_service = false;
+    let mut replaced = false;
+    for line in document.lines() {
+        if line == "  ueransim-ue:" {
+            in_service = true;
+            output.push(line.to_string());
+            continue;
+        }
+        if in_service
+            && line.starts_with("  ")
+            && !line.starts_with("    ")
+            && line.trim_end().ends_with(':')
+        {
+            in_service = false;
+        }
+        if in_service && line.trim() == "profiles: [\"5g\"]" {
+            output.push("    # POLARIS_UE01_OWNERSHIP_TRANSFERRED".into());
+            output.push("    profiles: [\"polaris-ue01-legacy-disabled\"]".into());
+            replaced = true;
+        } else {
+            output.push(line.to_string());
+        }
+    }
+    if !replaced {
+        return Err("UE01_COMPOSE_PROFILE_NOT_RECOGNIZED".into());
+    }
+    let mut result = output.join("\n");
+    if document.ends_with('\n') {
+        result.push('\n');
+    }
+    Ok(result)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,17 +280,26 @@ struct ControlRuntime {
 struct OwnedScenarioJob {
     job_id: String,
     started_at: u64,
+    started_at_epoch_ms: u64,
     ended_at: Option<u64>,
+    ended_at_epoch_ms: Option<u64>,
     state: String,
     child: Option<Child>,
     process_id: Option<u32>,
     packets_requested: u64,
     packets_sent: Option<u64>,
+    packets_received: Option<u64>,
+    bytes_sent: Option<u64>,
+    bytes_received: Option<u64>,
     terminal_result: Option<String>,
     target_ue_id: String,
     target_ue_pseudonym: String,
     tun_interface: Option<String>,
 }
+
+const TRAFFIC_PACKET_COUNT: u64 = 5;
+const TRAFFIC_PACKET_BYTES: u64 = 64;
+const TRAFFIC_EXECUTION_COMMAND: &str = "for i in 1 2 3 4 5; do printf '%-64s' \"POLARIS-CONTROL-V2.1:${i}\" > /dev/udp/10.46.0.1/49001 || exit 70; /usr/bin/sleep 1; done";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifiedTrafficTarget {
@@ -242,6 +397,61 @@ impl DockerUeRuntime {
         value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit())
     }
 
+    fn ue01_transfer_is_active(ownership_id: Option<&str>) -> Result<bool, String> {
+        #[cfg(unix)]
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let path = Path::new(UE01_TRANSFER_ATTESTATION_PATH);
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err("UE01_TRANSFER_ATTESTATION_UNREADABLE".into()),
+        };
+        if !metadata.file_type().is_file()
+            || metadata.len() > 16_384
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err("UE01_TRANSFER_ATTESTATION_UNSAFE".into());
+        }
+        let ownership_id = ownership_id
+            .filter(|value| Self::valid_digest(value))
+            .ok_or("LIVE_UE_OWNERSHIP_ID_REQUIRED")?;
+        let transfer: Ue01OwnershipTransferAttestation = serde_json::from_slice(
+            &fs::read(path).map_err(|_| "UE01_TRANSFER_ATTESTATION_UNREADABLE")?,
+        )
+        .map_err(|_| "UE01_TRANSFER_ATTESTATION_INVALID")?;
+        let compose_path = Path::new("/root/POLARIS/compose/docker-compose.oiran-lab.yml");
+        let compose = fs::read(compose_path).map_err(|_| "UE01_COMPOSE_UNREADABLE")?;
+        if !compose_disables_legacy_ue01(&String::from_utf8_lossy(&compose)) {
+            return Err("UE01_COMPOSE_TRANSFER_MARKER_MISSING".into());
+        }
+        let profile = fs::read(Path::new(ueransim_adapter::LIVE_PROFILE_ROOT).join("ue-01.yaml"))
+            .map_err(|_| "UE01_PROFILE_UNREADABLE")?;
+        let legacy = Self::output(&[
+            "ps".into(),
+            "--all".into(),
+            "--filter".into(),
+            "name=oiran-lab-ueransim-ue-1".into(),
+            "--format".into(),
+            "{{.ID}}|{{.Names}}".into(),
+        ])?;
+        let legacy_id = legacy.lines().find_map(|line| {
+            let (id, name) = line.trim().split_once('|')?;
+            (name == "oiran-lab-ueransim-ue-1").then_some(id)
+        });
+        let evidence = Ue01OwnershipTransferEvidence {
+            legacy_container_present: legacy_id.is_some(),
+            legacy_container_running: false,
+            legacy_container_id: None,
+            compose_sha256: Self::hash_bytes(&compose)?,
+            profile_sha256: Self::hash_bytes(&profile)?,
+            ownership_id: ownership_id.into(),
+        };
+        validate_ue01_ownership_transfer(&transfer, &evidence)?;
+        Ok(true)
+    }
+
     fn hash_bytes(bytes: &[u8]) -> Result<String, String> {
         let mut child = Command::new("/usr/bin/timeout")
             .args([
@@ -279,9 +489,6 @@ impl DockerUeRuntime {
     }
 
     fn profile_path(ue_id: &str, basename: &str) -> Result<PathBuf, String> {
-        if ue_id == "UE-01" && basename == "ue-01.yaml" {
-            return Ok(PathBuf::from("/root/POLARIS/runtime/ueransim/ue.yaml"));
-        }
         let expected = ue_id
             .strip_prefix("UE-")
             .map(|suffix| format!("ue-{suffix}.yaml"));
@@ -824,7 +1031,7 @@ impl UeRuntime for DockerUeRuntime {
             "inspect".into(),
             "--format".into(),
             "{{.Image}}".into(),
-            "oiran-lab-ueransim-ue-1".into(),
+            "oiran-lab-ueransim-gnb-1".into(),
         ])?;
         ueransim_adapter::live_launch_spec(
             profile,
@@ -1124,6 +1331,8 @@ struct SessionRecord {
     certified_validation_until: Option<u64>,
     certified_scenario_type: Option<String>,
     certified_target_ue_id: Option<String>,
+    ue_control_authorized_until: Option<u64>,
+    ue_control_authorized_ids: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -1179,21 +1388,41 @@ impl AppState {
             Err(_) => return Err("CONFIGURATION_REGISTRY_UNREADABLE".into()),
         };
         validate_configuration(configuration.ue_count, configuration.gnb_count)?;
-        let ue_runtime: Arc<dyn UeRuntime> = Arc::new(DockerUeRuntime {
-            ownership_id: std::env::var("POLARIS_UE_OWNERSHIP_ID").ok(),
-        });
-        let mut profiles = ueransim_adapter::planned_profiles();
-        profiles
-            .iter_mut()
-            .enumerate()
-            .for_each(|(index, profile)| profile.configured = index < configuration.ue_count);
+        let ownership_id = std::env::var("POLARIS_UE_OWNERSHIP_ID").ok();
+        let ue01_controller_owned =
+            DockerUeRuntime::ue01_transfer_is_active(ownership_id.as_deref())?;
+        let ue_runtime: Arc<dyn UeRuntime> = Arc::new(DockerUeRuntime { ownership_id });
+        let profile_store = ProfileStore::new(
+            std::env::var("POLARIS_UE_PROFILE_REGISTRY_PATH")
+                .unwrap_or_else(|_| "/var/lib/polaris-control/ue-profile-registry.json".into())
+                .into(),
+            std::env::var("POLARIS_UE_PROFILE_ROOT")
+                .unwrap_or_else(|_| ueransim_adapter::LIVE_PROFILE_ROOT.into())
+                .into(),
+        );
+        let fallback_profiles = ueransim_adapter::planned_profiles()
+            .into_iter()
+            .take(configuration.ue_count)
+            .map(|mut profile| {
+                profile.configured = true;
+                profile
+            })
+            .collect();
+        let mut profile_registry = profile_store.load_or_bootstrap(fallback_profiles)?;
+        let mut profiles = profile_registry
+            .profiles
+            .iter()
+            .map(|record| record.profile.clone())
+            .collect::<Vec<_>>();
         if let Ok(verified) = ue_runtime.verify_provisioning(&profiles) {
             for profile in profiles.iter_mut().take(configuration.ue_count) {
                 profile.subscription_verified = verified.contains_key(&profile.ue_id);
             }
+            for record in &mut profile_registry.profiles {
+                record.profile.subscription_verified = verified.contains_key(&record.profile.ue_id);
+            }
         }
-        let mut multi_ue =
-            MultiUeController::new(profiles, ueransim_adapter::MAX_CONFIGURABLE_UES)?;
+        let mut multi_ue = MultiUeController::new(profiles, ueransim_adapter::MAX_LIVE_UES)?;
         multi_ue.configure_count(configuration.ue_count)?;
         if let Ok(value) = fs::read_to_string(&ue_job_state_path) {
             let mut records: Vec<simulator_controller::UeJob> =
@@ -1229,12 +1458,15 @@ impl AppState {
             cpu_decision_lock: Arc::new(Mutex::new(())),
             latest_cpu_decision: Arc::new(Mutex::new(None)),
             configuration_path,
+            profile_store,
+            profile_registry: Arc::new(Mutex::new(profile_registry)),
             policy_path,
             policy_enabled: Arc::new(AtomicBool::new(policy_enabled)),
             execution_mode: std::env::var("POLARIS_EXECUTION_MODE")
                 .unwrap_or_else(|_| "disabled".into()),
             additional_ue_live_enabled: std::env::var("POLARIS_ADDITIONAL_UE_LIVE_ENABLED")
                 .is_ok_and(|value| value == "true"),
+            ue01_controller_owned,
             ue_runtime,
             resource_override: None,
             cpu_safety: Arc::new(Mutex::new(CpuSafetyMonitor::default())),
@@ -1509,6 +1741,8 @@ async fn login(
             certified_validation_until: None,
             certified_scenario_type: None,
             certified_target_ue_id: None,
+            ue_control_authorized_until: None,
+            ue_control_authorized_ids: BTreeSet::new(),
         },
     );
     audit(&state, &user.role, "LOGIN", "SUCCESS", None);
@@ -1561,9 +1795,10 @@ async fn capabilities() -> Json<Value> {
     Json(json!({
         "live_control":true,
         "approval_state":"OPERATOR_AUTHORIZATION_REQUIRED",
-        "max_ues":ueransim_adapter::MAX_CONFIGURABLE_UES,
+        "max_ues":ueransim_adapter::MAX_LIVE_UES,
+        "max_configured_profiles":ueransim_adapter::MAX_CONFIGURABLE_UES,
         "max_ues_live_certified":1,
-        "max_ues_implemented":ueransim_adapter::MAX_CONFIGURABLE_UES,
+        "max_ues_implemented":ueransim_adapter::MAX_LIVE_UES,
         "max_nodes":2,
         "max_nodes_live_certified":1,
         "registration_modes":["STAGGERED"],
@@ -1928,11 +2163,28 @@ fn normalize_terminal_record(value: &mut Value) {
         })
     });
     record.entry("process_id").or_insert(Value::Null);
+    record
+        .entry("duration_milliseconds")
+        .or_insert(json!(duration.saturating_mul(1_000)));
+    record.entry("packet_size_bytes").or_insert(Value::Null);
+    record.entry("packets_received").or_insert(Value::Null);
+    record.entry("bytes_sent").or_insert(Value::Null);
+    record.entry("bytes_received").or_insert(Value::Null);
+    record
+        .entry("accounting_source")
+        .or_insert(json!("LEGACY_PROCESS_EXIT_ONLY"));
 }
 
 fn job_json(job: &OwnedScenarioJob) -> Value {
     let observed_end = job.ended_at.unwrap_or_else(epoch_seconds);
-    json!({"scenario_id":job.job_id,"job_id":job.job_id,"technology":"5G SA","simulator":"UERANSIM","started_at":job.started_at.to_string(),"started_at_epoch_s":job.started_at,"ended_at_epoch_s":job.ended_at,"duration_seconds":observed_end.saturating_sub(job.started_at),"configured_ues":1,"registered_ues":1,"active_pdu_sessions":1,"traffic_state":job.state,"packets_requested":job.packets_requested,"packets_sent":job.packets_sent,"terminal_result":job.terminal_result,"process_id":job.process_id,"cpu":"BOUNDED","memory":"BOUNDED","state":job.state,"controller_owned":true,"target_ue_id":job.target_ue_id,"target_ue_pseudonym":job.target_ue_pseudonym,"tun_interface":job.tun_interface})
+    let observed_end_ms = job.ended_at_epoch_ms.unwrap_or_else(epoch_millis);
+    let duration_ms = observed_end_ms.saturating_sub(job.started_at_epoch_ms);
+    let duration_seconds = if duration_ms == 0 {
+        observed_end.saturating_sub(job.started_at)
+    } else {
+        duration_ms.saturating_add(999) / 1_000
+    };
+    json!({"scenario_id":job.job_id,"job_id":job.job_id,"technology":"5G SA","simulator":"UERANSIM","started_at":job.started_at.to_string(),"started_at_epoch_s":job.started_at,"started_at_epoch_ms":job.started_at_epoch_ms,"ended_at_epoch_s":job.ended_at,"ended_at_epoch_ms":job.ended_at_epoch_ms,"duration_seconds":duration_seconds,"duration_milliseconds":duration_ms,"configured_ues":1,"registered_ues":1,"active_pdu_sessions":1,"traffic_state":job.state,"packets_requested":job.packets_requested,"packets_sent":job.packets_sent,"packets_received":job.packets_received,"packet_size_bytes":TRAFFIC_PACKET_BYTES,"bytes_sent":job.bytes_sent,"bytes_received":job.bytes_received,"accounting_source":"OWNED_PROCESS_EXIT_AND_FIXED_PROFILE","receive_accounting":"NOT_OBSERVED_SEND_ONLY_PROFILE","terminal_result":job.terminal_result,"process_id":job.process_id,"cpu":"BOUNDED","memory":"BOUNDED","state":job.state,"controller_owned":true,"target_ue_id":job.target_ue_id,"target_ue_pseudonym":job.target_ue_pseudonym,"tun_interface":job.tun_interface})
 }
 
 fn refresh_runtime(runtime: &mut ControlRuntime) -> Option<(String, String)> {
@@ -1945,8 +2197,11 @@ fn refresh_runtime(runtime: &mut ControlRuntime) -> Option<(String, String)> {
     if let Some((success, code)) = finished {
         if let Some(mut job) = runtime.active.take() {
             job.ended_at = Some(epoch_seconds());
+            job.ended_at_epoch_ms = Some(epoch_millis());
             job.state = if success { "COMPLETED" } else { "FAILED" }.into();
             job.packets_sent = success.then_some(job.packets_requested);
+            job.bytes_sent =
+                success.then_some(job.packets_requested.saturating_mul(TRAFFIC_PACKET_BYTES));
             job.terminal_result = Some(
                 if success {
                     "PROCESS_EXIT_SUCCESS"
@@ -1968,7 +2223,7 @@ fn refresh_runtime_with_state(state: &AppState, runtime: &mut ControlRuntime) ->
     let Some((target_ue_id, traffic_state)) = refresh_runtime(runtime) else {
         return false;
     };
-    if target_ue_id != "UE-01" {
+    if controller_owns_ue(state, &target_ue_id) {
         if let Ok(mut controller) = state.multi_ue.lock() {
             if controller
                 .set_traffic(&target_ue_id, &traffic_state)
@@ -2086,7 +2341,7 @@ fn persist_ue_registry(state: &AppState, controller: &MultiUeController) -> Resu
 }
 
 fn validate_configuration(ue_count: usize, gnb_count: usize) -> Result<(), String> {
-    if !(1..=ueransim_adapter::MAX_CONFIGURABLE_UES).contains(&ue_count) {
+    if ue_count > ueransim_adapter::MAX_LIVE_UES {
         return Err("UE_COUNT_OUT_OF_RANGE".into());
     }
     if !(1..=2).contains(&gnb_count) {
@@ -2146,21 +2401,23 @@ fn configuration_json(state: &AppState, configuration: &DesiredConfiguration) ->
             )
         })
         .count();
-    let observed_shared_running = state
-        .shared_ue_cache
-        .lock()
-        .ok()
-        .and_then(|cache| cache.as_ref().map(|item| item.process_state == "RUNNING"))
-        .unwrap_or(false);
+    let observed_shared_running = !state.ue01_controller_owned
+        && state
+            .shared_ue_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.as_ref().map(|item| item.process_state == "RUNNING"))
+            .unwrap_or(false);
     let reconciliation = state.ue_reconciliation.lock().unwrap().clone();
     json!({
         "ue_count":configuration.ue_count,
         "desired_ue_count":configuration.ue_count,
         "gnb_count":configuration.gnb_count,
-        "max_ues":ueransim_adapter::MAX_CONFIGURABLE_UES,
+        "max_ues":ueransim_adapter::MAX_LIVE_UES,
+        "max_configured_profiles":ueransim_adapter::MAX_CONFIGURABLE_UES,
         "max_gnbs":2,
         "max_ues_live_certified":1,
-        "max_ues_implemented":ueransim_adapter::MAX_CONFIGURABLE_UES,
+        "max_ues_implemented":ueransim_adapter::MAX_LIVE_UES,
         "max_gnbs_live_certified":1,
         "missing_subscriber_profiles":missing_subscriber_profiles,
         "updated_at_epoch_s":configuration.updated_at_epoch_s,
@@ -2170,6 +2427,750 @@ fn configuration_json(state: &AppState, configuration: &DesiredConfiguration) ->
         "reconciliation":reconciliation,
         "execution_started":reconciliation.state == "RUNNING"
     })
+}
+
+fn managed_profile_json(record: &ManagedUeProfile) -> Value {
+    json!({
+        "ue_id": record.profile.ue_id,
+        "name": record.profile.pseudonym,
+        "profile": record.profile.profile_name,
+        "serving_gnb": record.profile.serving_gnb,
+        "plmn":{"mcc":record.profile.plmn_mcc,"mnc":record.profile.plmn_mnc},
+        "dnn":record.profile.dnn,
+        "snssai":{"sst":record.profile.sst,"sd":record.profile.sd},
+        "pdu_session":{"type":"IPv4","dnn":record.profile.dnn},
+        "scenario_id":record.scenario_id,
+        "auto_run_scenario":record.auto_run_scenario,
+        "subscription_status":if record.profile.subscription_verified {"VERIFIED"} else {"PROVISIONING_REQUIRED"},
+        "subscriber_identity":"PROTECTED",
+        "authentication_material":"PROTECTED",
+        "revision":record.revision,
+        "updated_at_epoch_s":record.updated_at_epoch_s
+    })
+}
+
+#[derive(Deserialize, Default)]
+struct UeProfileListQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+    search: Option<String>,
+    scenario_id: Option<String>,
+    subscription_status: Option<String>,
+}
+
+async fn list_ue_profiles(
+    State(state): State<Arc<AppState>>,
+    Extension(_identity): Extension<EffectiveIdentity>,
+    Query(query): Query<UeProfileListQuery>,
+) -> Json<Value> {
+    let registry = state.profile_registry.lock().unwrap();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(100).clamp(1, 500);
+    let search = query
+        .search
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let filtered = registry
+        .profiles
+        .iter()
+        .filter(|record| {
+            let matches_search = search.is_empty()
+                || record.profile.ue_id.to_ascii_lowercase().contains(&search)
+                || record
+                    .profile
+                    .pseudonym
+                    .to_ascii_lowercase()
+                    .contains(&search);
+            let matches_scenario = query.scenario_id.as_ref().map_or(true, |scenario| {
+                record.scenario_id.as_deref() == Some(scenario.as_str())
+            });
+            let matches_status =
+                query
+                    .subscription_status
+                    .as_deref()
+                    .map_or(true, |status| match status {
+                        "VERIFIED" => record.profile.subscription_verified,
+                        "PROVISIONING_REQUIRED" => !record.profile.subscription_verified,
+                        _ => false,
+                    });
+            matches_search && matches_scenario && matches_status
+        })
+        .collect::<Vec<_>>();
+    let total = filtered.len();
+    let offset = (page - 1).saturating_mul(page_size);
+    Json(json!({
+        "items":filtered.into_iter().skip(offset).take(page_size).map(managed_profile_json).collect::<Vec<_>>(),
+        "total":total,
+        "page":page,
+        "page_size":page_size,
+        "pages":if total == 0 { 0 } else { (total + page_size - 1) / page_size },
+        "max":ueransim_adapter::MAX_CONFIGURABLE_UES,
+        "secrets_exposed":false
+    }))
+}
+
+async fn bulk_create_ue_profiles(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Json(input): Json<BulkProfileInput>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let _operation = state.ue_operations.lock().unwrap();
+    let mut registry = state.profile_registry.lock().unwrap();
+    let records = match state.profile_store.create_bulk(&mut registry, input) {
+        Ok(records) => records,
+        Err(error) => return profile_mutation_error(error),
+    };
+    if let Err(error) = state.multi_ue.lock().unwrap().add_profiles(
+        records
+            .iter()
+            .map(|record| record.profile.clone())
+            .collect(),
+    ) {
+        return profile_mutation_error(error);
+    }
+    if let Err(error) = persist_profile_configuration(
+        &state,
+        registry.profiles.len().min(ueransim_adapter::MAX_LIVE_UES),
+        &identity.role,
+    ) {
+        return profile_mutation_error(error);
+    }
+    audit(
+        &state,
+        &identity.role,
+        "BULK_CREATE_UE_PROFILES",
+        "CREATED",
+        None,
+    );
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "created":records.len(),
+            "total":registry.profiles.len(),
+            "subscription_status":"PROVISIONING_REQUIRED",
+            "live_started":0
+        })),
+    )
+}
+
+fn csv_cell(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+async fn export_ue_profiles_csv(
+    State(state): State<Arc<AppState>>,
+    Extension(_identity): Extension<EffectiveIdentity>,
+) -> impl IntoResponse {
+    let registry = state.profile_registry.lock().unwrap();
+    let mut csv =
+        String::from("ue_id,name,mcc,mnc,dnn,sst,sd,serving_gnb,scenario_id,subscription_status\n");
+    for record in &registry.profiles {
+        let sst = record.profile.sst.to_string();
+        let values = [
+            record.profile.ue_id.as_str(),
+            record.profile.pseudonym.as_str(),
+            record.profile.plmn_mcc.as_str(),
+            record.profile.plmn_mnc.as_str(),
+            record.profile.dnn.as_str(),
+            sst.as_str(),
+            record.profile.sd.as_deref().unwrap_or_default(),
+            record.profile.serving_gnb.as_str(),
+            record.scenario_id.as_deref().unwrap_or_default(),
+            if record.profile.subscription_verified {
+                "VERIFIED"
+            } else {
+                "PROVISIONING_REQUIRED"
+            },
+        ];
+        csv.push_str(&values.map(csv_cell).join(","));
+        csv.push('\n');
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=polaris-ue-profiles.csv",
+            ),
+        ],
+        csv,
+    )
+}
+
+fn profile_mutation_error(error: String) -> (StatusCode, Json<Value>) {
+    let status = match error.as_str() {
+        "UNKNOWN_UE_PROFILE" => StatusCode::NOT_FOUND,
+        "UE_PROFILE_ACTIVE" | "SHARED_UE_PROTECTED" => StatusCode::LOCKED,
+        "UE_PROFILE_ALREADY_EXISTS" | "DUPLICATE_SUBSCRIBER_IDENTITY" => StatusCode::CONFLICT,
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    (status, Json(json!({"error":error})))
+}
+
+fn persist_profile_configuration(
+    state: &AppState,
+    count: usize,
+    actor: &str,
+) -> Result<(), String> {
+    let mut configuration = state.configuration.lock().unwrap();
+    configuration.ue_count = count;
+    configuration.updated_at_epoch_s = epoch_seconds();
+    configuration.updated_by = actor.into();
+    persist_configuration(&state.configuration_path, &configuration)
+}
+
+async fn create_ue_profile(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Json(input): Json<ProfileMutationInput>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let _operation = state.ue_operations.lock().unwrap();
+    let mut registry = state.profile_registry.lock().unwrap();
+    let record = match state.profile_store.create(&mut registry, input) {
+        Ok(record) => record,
+        Err(error) => return profile_mutation_error(error),
+    };
+    if let Err(error) = state
+        .multi_ue
+        .lock()
+        .unwrap()
+        .upsert_profile(record.profile.clone())
+    {
+        return profile_mutation_error(error);
+    }
+    if let Err(error) = persist_profile_configuration(
+        &state,
+        registry.profiles.len().min(ueransim_adapter::MAX_LIVE_UES),
+        &identity.role,
+    ) {
+        return profile_mutation_error(error);
+    }
+    audit(
+        &state,
+        &identity.role,
+        "CREATE_UE_PROFILE",
+        "CREATED",
+        Some(&record.profile.ue_id),
+    );
+    (StatusCode::CREATED, Json(managed_profile_json(&record)))
+}
+
+async fn update_ue_profile(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(ue_id): AxumPath<String>,
+    Json(input): Json<ProfileMutationInput>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    if ue_id == "UE-01" && !state.ue01_controller_owned {
+        return profile_mutation_error("SHARED_UE_PROTECTED".into());
+    }
+    let _operation = state.ue_operations.lock().unwrap();
+    if state.multi_ue.lock().unwrap().snapshot().iter().any(|job| {
+        job.ue_id == ue_id
+            && (job.process_handle.is_some()
+                || !matches!(
+                    job.lifecycle,
+                    simulator_controller::UeLifecycle::Stopped
+                        | simulator_controller::UeLifecycle::Failed
+                ))
+    }) {
+        return profile_mutation_error("UE_PROFILE_ACTIVE".into());
+    }
+    let mut registry = state.profile_registry.lock().unwrap();
+    let record = match state.profile_store.update(&mut registry, &ue_id, input) {
+        Ok(record) => record,
+        Err(error) => return profile_mutation_error(error),
+    };
+    if let Err(error) = state
+        .multi_ue
+        .lock()
+        .unwrap()
+        .upsert_profile(record.profile.clone())
+    {
+        return profile_mutation_error(error);
+    }
+    audit(
+        &state,
+        &identity.role,
+        "UPDATE_UE_PROFILE",
+        "UPDATED",
+        Some(&ue_id),
+    );
+    (StatusCode::OK, Json(managed_profile_json(&record)))
+}
+
+#[derive(Deserialize)]
+struct CloneProfileInput {
+    target_ue_id: String,
+}
+
+async fn clone_ue_profile(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(source_ue_id): AxumPath<String>,
+    Json(input): Json<CloneProfileInput>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let _operation = state.ue_operations.lock().unwrap();
+    let mut registry = state.profile_registry.lock().unwrap();
+    let record =
+        match state
+            .profile_store
+            .clone_profile(&mut registry, &source_ue_id, &input.target_ue_id)
+        {
+            Ok(record) => record,
+            Err(error) => return profile_mutation_error(error),
+        };
+    if let Err(error) = state
+        .multi_ue
+        .lock()
+        .unwrap()
+        .upsert_profile(record.profile.clone())
+    {
+        return profile_mutation_error(error);
+    }
+    if let Err(error) = persist_profile_configuration(
+        &state,
+        registry.profiles.len().min(ueransim_adapter::MAX_LIVE_UES),
+        &identity.role,
+    ) {
+        return profile_mutation_error(error);
+    }
+    audit(
+        &state,
+        &identity.role,
+        "CLONE_UE_PROFILE",
+        "CREATED",
+        Some(&record.profile.ue_id),
+    );
+    (StatusCode::CREATED, Json(managed_profile_json(&record)))
+}
+
+async fn validate_ue_profile_provisioning(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(ue_id): AxumPath<String>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let profile = match state
+        .multi_ue
+        .lock()
+        .unwrap()
+        .profiles()
+        .into_iter()
+        .find(|profile| profile.ue_id == ue_id)
+    {
+        Some(profile) => profile,
+        None => return profile_mutation_error("UNKNOWN_UE_PROFILE".into()),
+    };
+    let verified = match state
+        .ue_runtime
+        .verify_provisioning(std::slice::from_ref(&profile))
+    {
+        Ok(verified) if verified.contains_key(&ue_id) => true,
+        Ok(_) => false,
+        Err(error) => return profile_mutation_error(error),
+    };
+    if let Err(error) = state
+        .multi_ue
+        .lock()
+        .unwrap()
+        .set_profile_subscription_verified(&ue_id, verified)
+    {
+        return profile_mutation_error(error);
+    }
+    let mut registry = state.profile_registry.lock().unwrap();
+    let Some(record) = registry
+        .profiles
+        .iter_mut()
+        .find(|record| record.profile.ue_id == ue_id)
+    else {
+        return profile_mutation_error("UNKNOWN_UE_PROFILE".into());
+    };
+    record.profile.subscription_verified = verified;
+    record.updated_at_epoch_s = epoch_seconds();
+    if let Err(error) = state.profile_store.persist(&registry) {
+        return profile_mutation_error(error);
+    }
+    audit(
+        &state,
+        &identity.role,
+        "VALIDATE_UE_PROVISIONING",
+        if verified { "VERIFIED" } else { "REJECTED" },
+        Some(&ue_id),
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ue_id":ue_id,
+            "subscription_status":if verified {"VERIFIED"} else {"NOT_PROVISIONED"},
+            "open5gs_changed":false
+        })),
+    )
+}
+
+async fn delete_ue_profile(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(ue_id): AxumPath<String>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    if ue_id == "UE-01" && !state.ue01_controller_owned {
+        return profile_mutation_error("SHARED_UE_PROTECTED".into());
+    }
+    let _operation = state.ue_operations.lock().unwrap();
+    let removed = match state.multi_ue.lock().unwrap().delete_profile(&ue_id) {
+        Ok(profile) => profile,
+        Err(error) => return profile_mutation_error(error),
+    };
+    let mut registry = state.profile_registry.lock().unwrap();
+    let record = match state.profile_store.delete(&mut registry, &ue_id) {
+        Ok(record) => record,
+        Err(error) => {
+            let _ = state.multi_ue.lock().unwrap().upsert_profile(removed);
+            return profile_mutation_error(error);
+        }
+    };
+    if let Err(error) = persist_ue_registry(&state, &state.multi_ue.lock().unwrap()) {
+        return profile_mutation_error(error);
+    }
+    if let Err(error) = persist_profile_configuration(
+        &state,
+        registry.profiles.len().min(ueransim_adapter::MAX_LIVE_UES),
+        &identity.role,
+    ) {
+        return profile_mutation_error(error);
+    }
+    audit(
+        &state,
+        &identity.role,
+        "DELETE_UE_PROFILE",
+        "DELETED",
+        Some(&ue_id),
+    );
+    (
+        StatusCode::OK,
+        Json(json!({"deleted":record.profile.ue_id,"profile_secret_deleted":true})),
+    )
+}
+
+async fn discover_legacy_ues(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let output = match DockerUeRuntime::output(&[
+        "ps".into(),
+        "--all".into(),
+        "--format".into(),
+        "{{.ID}}|{{.Names}}|{{.Status}}|{{.Label \"com.docker.compose.project\"}}|{{.Label \"com.docker.compose.service\"}}".into(),
+    ]) {
+        Ok(output) => output,
+        Err(error) => return profile_mutation_error(error),
+    };
+    let items = output
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split('|').collect::<Vec<_>>();
+            let name = *fields.get(1)?;
+            (name.contains("ueransim-ue") || name.starts_with("polaris-control-ue-"))
+                .then(|| json!({
+                    "container_id":fields.first().copied().unwrap_or_default(),
+                    "container_name":name,
+                    "status":fields.get(2).copied().unwrap_or("unknown"),
+                    "compose_project":fields.get(3).copied().unwrap_or_default(),
+                    "compose_service":fields.get(4).copied().unwrap_or_default(),
+                    "owner":if name.starts_with("polaris-control-") {"POLARIS_CONTROLLER"} else {"LEGACY_DOCKER_COMPOSE"},
+                    "migration_supported":name == "oiran-lab-ueransim-ue-1" && !state.ue01_controller_owned
+                }))
+        })
+        .collect::<Vec<_>>();
+    (
+        StatusCode::OK,
+        Json(json!({"items":items,"execution":"NOT_EXECUTED"})),
+    )
+}
+
+fn legacy_migration_preview(state: &AppState) -> Result<Value, String> {
+    if state.ue01_controller_owned {
+        return Ok(json!({"ue_id":"UE-01","state":"ALREADY_CONTROLLER_OWNED","executable":false}));
+    }
+    let fields = DockerUeRuntime::inspect_fields("oiran-lab-ueransim-ue-1")?;
+    let container_id = fields.first().cloned().ok_or("LEGACY_UE_NOT_FOUND")?;
+    let process_state = fields.get(1).cloned().unwrap_or_else(|| "unknown".into());
+    let compose_path = Path::new("/root/POLARIS/compose/docker-compose.oiran-lab.yml");
+    let compose = fs::read(compose_path).map_err(|_| "UE01_COMPOSE_UNREADABLE")?;
+    let shared_profile = fs::read("/root/POLARIS/runtime/ueransim/ue.yaml")
+        .map_err(|_| "UE01_SHARED_PROFILE_UNREADABLE")?;
+    let managed_profile =
+        fs::read(Path::new(ueransim_adapter::LIVE_PROFILE_ROOT).join("ue-01.yaml"))
+            .map_err(|_| "UE01_PROFILE_UNREADABLE")?;
+    let shared_sha256 = DockerUeRuntime::hash_bytes(&shared_profile)?;
+    let managed_sha256 = DockerUeRuntime::hash_bytes(&managed_profile)?;
+    let compose_sha256 = DockerUeRuntime::hash_bytes(&compose)?;
+    Ok(json!({
+        "ue_id":"UE-01",
+        "source":{"container_name":"oiran-lab-ueransim-ue-1","container_id":container_id,"compose_project":"oiran-lab","compose_service":"ueransim-ue","process_state":process_state},
+        "target":{"owner":"POLARIS_CONTROLLER","profile":"ue-01.yaml","container_name":"polaris-control-ue-01"},
+        "dependencies":{"gnb":"oiran-lab-ueransim-gnb-1","network":"oiran-lab-mgmt","open5gs_change_required":false},
+        "integrity":{"compose_sha256":compose_sha256,"shared_profile_sha256":shared_sha256,"managed_profile_sha256":managed_sha256,"profiles_match":shared_sha256 == managed_sha256},
+        "transaction":{"backup":true,"disable_restart":true,"stop_legacy":true,"rename_for_rollback":true,"install_attestation":true,"start_new_ue":false},
+        "executable":shared_sha256 == managed_sha256,
+        "execution":"NOT_EXECUTED"
+    }))
+}
+
+async fn preview_legacy_migration(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    match legacy_migration_preview(&state) {
+        Ok(preview) => (StatusCode::OK, Json(preview)),
+        Err(error) => profile_mutation_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyMigrationInput {
+    ue_id: String,
+    source_container_id: String,
+    confirmation: String,
+}
+
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|_| "MIGRATION_STORAGE_UNWRITABLE")?;
+    }
+    let temporary = path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|_| "MIGRATION_STORAGE_UNWRITABLE")?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "MIGRATION_STORAGE_UNWRITABLE")?;
+    fs::rename(temporary, path).map_err(|_| "MIGRATION_STORAGE_UNWRITABLE".to_string())
+}
+
+fn replace_compose_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::metadata(path).map_err(|_| "UE01_COMPOSE_UNREADABLE")?;
+    let temporary = path.with_extension("polaris.tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(metadata.permissions().mode())
+        .open(&temporary)
+        .map_err(|_| "UE01_COMPOSE_UNWRITABLE")?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "UE01_COMPOSE_UNWRITABLE")?;
+    fs::set_permissions(&temporary, metadata.permissions())
+        .map_err(|_| "UE01_COMPOSE_UNWRITABLE")?;
+    fs::rename(temporary, path).map_err(|_| "UE01_COMPOSE_UNWRITABLE".to_string())
+}
+
+async fn execute_legacy_migration(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Json(input): Json<LegacyMigrationInput>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    if std::env::var("POLARIS_LEGACY_MIGRATION_ENABLED").as_deref() != Ok("true") {
+        return (
+            StatusCode::LOCKED,
+            Json(json!({"error":"LEGACY_MIGRATION_MAINTENANCE_APPROVAL_REQUIRED"})),
+        );
+    }
+    if input.ue_id != "UE-01"
+        || input.confirmation != "TRANSFER_UE01_TO_POLARIS"
+        || input.source_container_id.len() != 64
+    {
+        return profile_mutation_error("MIGRATION_CONFIRMATION_INVALID".into());
+    }
+    let _operation = state.ue_operations.lock().unwrap();
+    let preview = match legacy_migration_preview(&state) {
+        Ok(preview) => preview,
+        Err(error) => return profile_mutation_error(error),
+    };
+    if preview["source"]["container_id"].as_str() != Some(&input.source_container_id)
+        || preview["integrity"]["profiles_match"] != json!(true)
+    {
+        return profile_mutation_error("MIGRATION_SOURCE_CHANGED".into());
+    }
+    if let Err(error) = resource_gate_preview(&state) {
+        return profile_mutation_error(error);
+    }
+    let compose_path = Path::new("/root/POLARIS/compose/docker-compose.oiran-lab.yml");
+    let original_compose = match fs::read(compose_path) {
+        Ok(value) => value,
+        Err(_) => return profile_mutation_error("UE01_COMPOSE_UNREADABLE".into()),
+    };
+    let disabled_compose =
+        match disable_legacy_ue01_service(&String::from_utf8_lossy(&original_compose)) {
+            Ok(value) => value,
+            Err(error) => return profile_mutation_error(error),
+        };
+    let timestamp = epoch_seconds();
+    let backup_root = PathBuf::from(format!(
+        "/var/lib/polaris-control/migrations/ue-01-{timestamp}"
+    ));
+    if let Err(error) = fs::create_dir_all(&backup_root) {
+        let _ = error;
+        return profile_mutation_error("MIGRATION_BACKUP_FAILED".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::set_permissions(&backup_root, fs::Permissions::from_mode(0o700)).is_err() {
+            return profile_mutation_error("MIGRATION_BACKUP_FAILED".into());
+        }
+    }
+    let container_inspect =
+        match DockerUeRuntime::output(&["inspect".into(), input.source_container_id.clone()]) {
+            Ok(value) => value,
+            Err(error) => return profile_mutation_error(error),
+        };
+    let original_restart_policy = DockerUeRuntime::inspect_fields(&input.source_container_id)
+        .ok()
+        .and_then(|fields| fields.get(20).cloned())
+        .filter(|policy| {
+            matches!(
+                policy.as_str(),
+                "no" | "always" | "unless-stopped" | "on-failure"
+            )
+        })
+        .unwrap_or_else(|| "no".into());
+    let shared_profile = match fs::read("/root/POLARIS/runtime/ueransim/ue.yaml") {
+        Ok(value) => value,
+        Err(_) => return profile_mutation_error("UE01_SHARED_PROFILE_UNREADABLE".into()),
+    };
+    let managed_profile =
+        match fs::read(Path::new(ueransim_adapter::LIVE_PROFILE_ROOT).join("ue-01.yaml")) {
+            Ok(value) => value,
+            Err(_) => return profile_mutation_error("UE01_PROFILE_UNREADABLE".into()),
+        };
+    for (name, bytes) in [
+        ("compose.yml", original_compose.as_slice()),
+        ("container-inspect.json", container_inspect.as_bytes()),
+        ("legacy-ue-01.yaml", shared_profile.as_slice()),
+        ("managed-ue-01.yaml", managed_profile.as_slice()),
+    ] {
+        if write_private_atomic(&backup_root.join(name), bytes).is_err() {
+            return profile_mutation_error("MIGRATION_BACKUP_FAILED".into());
+        }
+    }
+    let rollback_name = format!("oiran-lab-ueransim-ue-1-rollback-{timestamp}");
+    let result = (|| -> Result<(), String> {
+        DockerUeRuntime::output(&[
+            "update".into(),
+            "--restart=no".into(),
+            "oiran-lab-ueransim-ue-1".into(),
+        ])?;
+        DockerUeRuntime::output(&[
+            "stop".into(),
+            "--time".into(),
+            "20".into(),
+            "oiran-lab-ueransim-ue-1".into(),
+        ])?;
+        DockerUeRuntime::output(&[
+            "rename".into(),
+            "oiran-lab-ueransim-ue-1".into(),
+            rollback_name.clone(),
+        ])?;
+        replace_compose_atomically(compose_path, disabled_compose.as_bytes())?;
+        let profile = fs::read(Path::new(ueransim_adapter::LIVE_PROFILE_ROOT).join("ue-01.yaml"))
+            .map_err(|_| "UE01_PROFILE_UNREADABLE")?;
+        let ownership_id = std::env::var("POLARIS_UE_OWNERSHIP_ID")
+            .map_err(|_| "LIVE_UE_OWNERSHIP_ID_REQUIRED")?;
+        let attestation = Ue01OwnershipTransferAttestation {
+            schema_version: 1,
+            ue_id: "UE-01".into(),
+            state: "CONTROLLER_OWNED".into(),
+            legacy_container_name: "oiran-lab-ueransim-ue-1".into(),
+            legacy_container_id: input.source_container_id.clone(),
+            legacy_compose_project: "oiran-lab".into(),
+            legacy_compose_service: "ueransim-ue".into(),
+            legacy_compose_sha256: DockerUeRuntime::hash_bytes(disabled_compose.as_bytes())?,
+            profile_sha256: DockerUeRuntime::hash_bytes(&profile)?,
+            ownership_id,
+        };
+        write_private_atomic(
+            Path::new(UE01_TRANSFER_ATTESTATION_PATH),
+            &serde_json::to_vec_pretty(&attestation)
+                .map_err(|_| "UE01_TRANSFER_ATTESTATION_INVALID")?,
+        )
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(UE01_TRANSFER_ATTESTATION_PATH);
+        let _ = replace_compose_atomically(compose_path, &original_compose);
+        let _ = DockerUeRuntime::output(&[
+            "rename".into(),
+            rollback_name.clone(),
+            "oiran-lab-ueransim-ue-1".into(),
+        ]);
+        let _ = DockerUeRuntime::output(&[
+            "update".into(),
+            format!("--restart={original_restart_policy}"),
+            "oiran-lab-ueransim-ue-1".into(),
+        ]);
+        let _ = DockerUeRuntime::output(&["start".into(), "oiran-lab-ueransim-ue-1".into()]);
+        audit(
+            &state,
+            &identity.role,
+            "MIGRATE_LEGACY_UE",
+            "ROLLED_BACK",
+            Some("UE-01"),
+        );
+        return profile_mutation_error(format!("MIGRATION_ROLLED_BACK:{error}"));
+    }
+    audit(
+        &state,
+        &identity.role,
+        "MIGRATE_LEGACY_UE",
+        "TRANSFERRED_STOPPED",
+        Some("UE-01"),
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ue_id":"UE-01",
+            "state":"TRANSFERRED_STOPPED",
+            "legacy_backup_container":rollback_name,
+            "backup_path":backup_root,
+            "polaris_restart_required":true,
+            "ue_started":false,
+            "open5gs_changed":false
+        })),
+    )
 }
 
 fn reconcile_ue_count(
@@ -2352,7 +3353,34 @@ async fn history(State(state): State<Arc<AppState>>) -> Json<Value> {
         json!({"items":runtime.history,"total":runtime.history.len(),"source":"controller registry"}),
     )
 }
-async fn ues(State(state): State<Arc<AppState>>) -> Json<Value> {
+fn authorized_ue_control_ids(state: &AppState, identity: &EffectiveIdentity) -> BTreeSet<String> {
+    identity
+        .session_id
+        .as_ref()
+        .and_then(|session_id| {
+            let sessions = state.sessions.lock().ok()?;
+            let session = sessions.get(session_id)?;
+            session
+                .ue_control_authorized_until
+                .is_some_and(|deadline| deadline >= epoch_seconds())
+                .then(|| session.ue_control_authorized_ids.clone())
+        })
+        .unwrap_or_default()
+}
+
+fn ue_control_is_authorized(
+    state: &AppState,
+    identity: &EffectiveIdentity,
+    ue_ids: &[String],
+) -> bool {
+    let authorized = authorized_ue_control_ids(state, identity);
+    !ue_ids.is_empty() && ue_ids.iter().all(|ue_id| authorized.contains(ue_id))
+}
+
+async fn ues(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+) -> Json<Value> {
     let pending = state
         .multi_ue
         .lock()
@@ -2371,6 +3399,7 @@ async fn ues(State(state): State<Arc<AppState>>) -> Json<Value> {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
     let shared_cache = state.shared_ue_cache.clone();
+    let ue01_controller_owned = state.ue01_controller_owned;
     let inventory_running = state.ue_inventory_running.clone();
     let last_observed = state.ue_inventory_last_observed_epoch_s.clone();
     let observed = tokio::task::spawn_blocking(move || {
@@ -2380,7 +3409,9 @@ async fn ues(State(state): State<Arc<AppState>>) -> Json<Value> {
             pdu_session_state: "INACTIVE".into(),
             ue_ip: None,
         };
-        let shared = if perform_observation {
+        let shared = if ue01_controller_owned {
+            unknown()
+        } else if perform_observation {
             let observation = runtime.observe_shared().unwrap_or_else(|_| unknown());
             if let Ok(mut cache) = shared_cache.lock() {
                 *cache = Some(observation.clone());
@@ -2396,7 +3427,10 @@ async fn ues(State(state): State<Arc<AppState>>) -> Json<Value> {
         let owned = if live && perform_observation {
             pending
                 .iter()
-                .filter(|job| ueransim_adapter::is_approved_controller_ue(&job.ue_id))
+                .filter(|job| {
+                    ueransim_adapter::is_approved_controller_ue(&job.ue_id)
+                        && (job.ue_id != "UE-01" || ue01_controller_owned)
+                })
                 .filter_map(|job| {
                     let handle = job.process_handle.as_deref()?;
                     let spec = job.approved_runtime.as_ref()?;
@@ -2434,6 +3468,17 @@ async fn ues(State(state): State<Arc<AppState>>) -> Json<Value> {
         )
     });
     let (shared_observation, owned_observations) = observed;
+    let managed_profiles = state
+        .profile_registry
+        .lock()
+        .map(|registry| {
+            registry
+                .profiles
+                .iter()
+                .map(|record| (record.profile.ue_id.clone(), record.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let mut controller = state.multi_ue.lock().unwrap();
     if state.execution_mode == "live" {
         for (ue_id, handle, operation_id, generation, observation) in owned_observations {
@@ -2450,14 +3495,16 @@ async fn ues(State(state): State<Arc<AppState>>) -> Json<Value> {
     let controller_inventory = controller.inventory();
     let controller_jobs = controller.snapshot();
     let profile_specs = controller.profiles();
+    let control_authorized_ids = authorized_ue_control_ids(&state, &identity);
     let items = profile_specs
         .iter()
         .filter(|profile| profile.configured)
         .map(|profile| {
+            let managed = managed_profiles.get(&profile.ue_id);
             let job = controller_jobs
                 .iter()
                 .find(|job| job.ue_id == profile.ue_id);
-            let shared = profile.ue_id == "UE-01";
+            let shared = profile.ue_id == "UE-01" && !state.ue01_controller_owned;
             let process_state = if shared {
                 shared_observation.process_state.as_str()
             } else if let Some(job) = job {
@@ -2497,21 +3544,51 @@ async fn ues(State(state): State<Arc<AppState>>) -> Json<Value> {
                                 .is_some_and(|handle| state.ue_runtime.owns(spec, handle))
                         })
                 });
+            let traffic_reason = if shared {
+                "SHARED_UE_PROTECTED"
+            } else if process_state != "RUNNING" {
+                "UE_NOT_RUNNING"
+            } else if registration_state != "REGISTERED" {
+                "UE_NOT_REGISTERED"
+            } else if pdu_session != "ACTIVE" {
+                "PDU_SESSION_NOT_ACTIVE"
+            } else if !traffic_target_verified {
+                "UE_RUNTIME_OWNERSHIP_NOT_VERIFIED"
+            } else {
+                "READY"
+            };
             let subscription_status = if profile.subscription_verified {
                 "VERIFIED"
             } else {
                 "PROVISIONING_UNKNOWN"
             };
-            let reason = if shared {
+            let base_reason = if shared {
                 "SHARED_UE_PROTECTED"
             } else if !profile.subscription_verified {
                 "SUBSCRIBER_PROVISIONING_REVIEW_REQUIRED"
             } else if !ueransim_adapter::is_approved_controller_ue(&profile.ue_id) {
                 "PROTECTED_OR_UNAPPROVED_UE"
-            } else if state.execution_mode != "live" || !state.additional_ue_live_enabled {
-                "ADDITIONAL_UE_LIVE_AUTHORIZATION_REQUIRED"
+            } else if state.execution_mode != "live" {
+                "LIVE_EXECUTION_NOT_CONFIGURED"
             } else {
                 "READY"
+            };
+            let control_authorized = control_authorized_ids.contains(&profile.ue_id);
+            let start_reason = if base_reason != "READY" {
+                base_reason
+            } else if job.is_some_and(|value| value.process_handle.is_some()) {
+                "UE_ALREADY_RUNNING"
+            } else if !control_authorized {
+                "UE_CONTROL_VALIDATION_REQUIRED"
+            } else {
+                "READY"
+            };
+            let stop_reason = if shared {
+                "SHARED_UE_PROTECTED"
+            } else if job.is_some_and(|value| value.process_handle.is_some()) {
+                "READY"
+            } else {
+                "UE_NOT_RUNNING"
             };
             json!({
                 "id":profile.pseudonym,"internal_ue_id":profile.ue_id,"profile":profile.profile_name,
@@ -2523,12 +3600,17 @@ async fn ues(State(state): State<Arc<AppState>>) -> Json<Value> {
                 "uptime_seconds":if shared {Value::Null} else {job.and_then(|value|value.started_at_epoch_s).map(|started|epoch_seconds().saturating_sub(started)).map_or(Value::Null,Value::from)},
                 "last_event":job.and_then(|value|value.last_error.clone()).map_or(Value::Null,Value::from),
                 "controller_owned":!shared,
+                "ownership":if shared {"SHARED_PROTECTED"} else {"POLARIS_CONTROLLER"},
+                "scenario_id":managed.and_then(|record|record.scenario_id.clone()),
+                "auto_run_scenario":managed.is_some_and(|record|record.auto_run_scenario),
+                "control_authorized":control_authorized,
                 "traffic_target_verified":traffic_target_verified,
-                "actions":{"start":reason == "READY" && job.map_or(true, |value| value.process_handle.is_none()),"stop":job.is_some_and(|value|value.process_handle.is_some()),"pdu_start":false,"pdu_stop":false,"traffic":traffic_target_verified,"provisioning_review":!profile.subscription_verified,"reason":if traffic_target_verified {"READY_FOR_BOUNDED_TRAFFIC"} else {reason}}
+                "actions":{"authorize":base_reason == "READY" && !control_authorized && job.map_or(true, |value| value.process_handle.is_none()),"start":start_reason == "READY","start_reason":start_reason,"stop":stop_reason == "READY","stop_reason":stop_reason,"pdu_start":false,"pdu_stop":false,"traffic":traffic_target_verified,"traffic_reason":traffic_reason,"provisioning_review":!profile.subscription_verified,"reason":if traffic_target_verified {"READY_FOR_BOUNDED_TRAFFIC"} else {traffic_reason}}
             })
         })
         .collect::<Vec<_>>();
     let profiles = profile_specs.iter().map(|profile| {
+        let managed = managed_profiles.get(&profile.ue_id);
         let job = controller_inventory.iter().find(|job| job.ue_id == profile.ue_id);
         let state_label = if !profile.configured {
             "NOT_CONFIGURED".to_string()
@@ -2539,11 +3621,14 @@ async fn ues(State(state): State<Arc<AppState>>) -> Json<Value> {
                 .and_then(|value| value.as_str().map(str::to_string))
                 .unwrap_or_else(|| "CONFIGURED".into())
         };
-        let reason = if profile.ue_id == "UE-01" {"SHARED_UE_PROTECTED"} else if !profile.configured {"NOT_CONFIGURED"} else if !profile.subscription_verified {"SUBSCRIBER_PROVISIONING_REVIEW_REQUIRED"} else if !ueransim_adapter::is_approved_controller_ue(&profile.ue_id) {"PROTECTED_OR_UNAPPROVED_UE"} else if state.execution_mode != "live" || !state.additional_ue_live_enabled {"ADDITIONAL_UE_LIVE_AUTHORIZATION_REQUIRED"} else {"READY"};
+        let shared = profile.ue_id == "UE-01" && !state.ue01_controller_owned;
+        let reason = if shared {"SHARED_UE_PROTECTED"} else if !profile.configured {"NOT_CONFIGURED"} else if !profile.subscription_verified {"SUBSCRIBER_PROVISIONING_REVIEW_REQUIRED"} else if !controller_owns_ue(&state, &profile.ue_id) {"PROTECTED_OR_UNAPPROVED_UE"} else if state.execution_mode != "live" {"LIVE_EXECUTION_NOT_CONFIGURED"} else {"READY"};
+        let control_authorized = control_authorized_ids.contains(&profile.ue_id);
         json!({
             "id":profile.ue_id,"pseudonym":profile.pseudonym,"profile":profile.profile_name,"serving_gnb":profile.serving_gnb,"simulator":"UERANSIM",
-            "state":state_label,"configured":profile.configured,"controller_owned":profile.ue_id != "UE-01","subscription_status":if profile.subscription_verified {"VERIFIED"}else{"PROVISIONING_UNKNOWN"},
-            "actions":{"start":reason == "READY" && job.map_or(true, |value| value.process_handle.is_none()),"stop":job.is_some_and(|value|value.process_handle.is_some()),"traffic":false,"reason":reason}
+            "state":state_label,"configured":profile.configured,"controller_owned":!shared,"ownership":if shared {"SHARED_PROTECTED"} else {"POLARIS_CONTROLLER"},"control_authorized":control_authorized,"subscription_status":if profile.subscription_verified {"VERIFIED"}else{"PROVISIONING_UNKNOWN"},
+            "scenario_id":managed.and_then(|record|record.scenario_id.clone()),"auto_run_scenario":managed.is_some_and(|record|record.auto_run_scenario),
+            "actions":{"authorize":reason == "READY" && !control_authorized && job.map_or(true, |value| value.process_handle.is_none()),"start":reason == "READY" && control_authorized && job.map_or(true, |value| value.process_handle.is_none()),"stop":job.is_some_and(|value|value.process_handle.is_some()),"traffic":false,"reason":if reason == "READY" && !control_authorized {"UE_CONTROL_VALIDATION_REQUIRED"} else {reason}}
         })
     }).collect::<Vec<_>>();
     let controller_active = controller_inventory
@@ -2574,6 +3659,85 @@ struct UeActionInput {
 }
 
 #[derive(Deserialize)]
+struct UeControlValidationInput {
+    ue_ids: Vec<String>,
+}
+
+async fn validate_ue_control(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Json(input): Json<UeControlValidationInput>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    if input.ue_ids.is_empty() || input.ue_ids.len() > ueransim_adapter::MAX_LIVE_UES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"INVALID_GROUP_REQUEST"})),
+        );
+    }
+    let profiles = state.multi_ue.lock().unwrap().profiles();
+    if let Err(error) =
+        authorize_live_ue_request(&input.ue_ids, &profiles, state.ue01_controller_owned)
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":error})),
+        );
+    }
+    let additions = {
+        let controller = state.multi_ue.lock().unwrap();
+        let jobs = controller.snapshot();
+        input
+            .ue_ids
+            .iter()
+            .filter(|ue_id| {
+                jobs.iter()
+                    .find(|job| job.ue_id == **ue_id)
+                    .map_or(true, |job| job.process_handle.is_none())
+            })
+            .count()
+    };
+    if let Err(error) = resource_gate_for_additions(&state, additions) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":error})),
+        );
+    }
+    let Some(session_id) = identity.session_id.as_ref() else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"OPERATOR_SESSION_REQUIRED"})),
+        );
+    };
+    let expires_at = epoch_seconds() + UE_CONTROL_AUTHORIZATION_SECONDS;
+    let mut sessions = state.sessions.lock().unwrap();
+    let Some(session) = sessions.get_mut(session_id) else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"OPERATOR_SESSION_REQUIRED"})),
+        );
+    };
+    session.ue_control_authorized_until = Some(expires_at);
+    session.ue_control_authorized_ids = input.ue_ids.iter().cloned().collect();
+    drop(sessions);
+    audit(
+        &state,
+        &identity.role,
+        "VALIDATE_UE_CONTROL",
+        "AUTHORIZED_BOUNDED_WINDOW",
+        Some(&input.ue_ids.join(",")),
+    );
+    (
+        StatusCode::OK,
+        Json(
+            json!({"valid":true,"execution":"NOT_EXECUTED","ue_ids":input.ue_ids,"expires_at_epoch_s":expires_at}),
+        ),
+    )
+}
+
+#[derive(Deserialize)]
 struct UeGroupActionInput {
     ue_ids: Vec<String>,
     mode: Option<String>,
@@ -2583,6 +3747,7 @@ struct UeGroupActionInput {
 fn authorize_live_ue_request(
     ue_ids: &[String],
     profiles: &[ueransim_adapter::UeProfileSpec],
+    ue01_controller_owned: bool,
 ) -> Result<(), String> {
     let mut unique = BTreeSet::new();
     for ue_id in ue_ids {
@@ -2591,6 +3756,9 @@ fn authorize_live_ue_request(
         }
         if !ueransim_adapter::is_approved_controller_ue(ue_id) {
             return Err("PROTECTED_OR_UNAPPROVED_UE".into());
+        }
+        if ue_id == "UE-01" && !ue01_controller_owned {
+            return Err("SHARED_UE_PROTECTED".into());
         }
         let profile = profiles
             .iter()
@@ -2629,7 +3797,7 @@ fn start_one_live_inner(
         .lock()
         .map_err(|_| "UE_REGISTRY_UNAVAILABLE")?
         .profiles();
-    authorize_live_ue_request(&[ue_id.to_string()], &profiles)?;
+    authorize_live_ue_request(&[ue_id.to_string()], &profiles, state.ue01_controller_owned)?;
     let verified = state.ue_runtime.verify_provisioning(&profiles)?;
     let profile = {
         let controller = state
@@ -2800,7 +3968,7 @@ fn stop_one_live_inner(
     state: &AppState,
     ue_id: &str,
 ) -> Result<simulator_controller::UeJob, String> {
-    if !ueransim_adapter::is_approved_controller_ue(ue_id) {
+    if !controller_owns_ue(state, ue_id) {
         return Err("PROTECTED_OR_UNAPPROVED_UE".into());
     }
     let operation_id = random_hex(16);
@@ -2872,10 +4040,10 @@ async fn start_ue(
         }
     }
     if state.execution_mode == "live" {
-        if !state.additional_ue_live_enabled {
+        if !ue_control_is_authorized(&state, &identity, &[input.ue_id.clone()]) {
             return (
-                StatusCode::LOCKED,
-                Json(json!({"error":"ADDITIONAL_UE_LIVE_AUTHORIZATION_REQUIRED"})),
+                StatusCode::PRECONDITION_REQUIRED,
+                Json(json!({"error":"UE_CONTROL_VALIDATION_REQUIRED"})),
             );
         }
         let live_state = state.clone();
@@ -2975,7 +4143,7 @@ async fn start_ue_group(
         return error;
     }
     if input.ue_ids.is_empty()
-        || input.ue_ids.len() > ueransim_adapter::MAX_CONFIGURABLE_UES
+        || input.ue_ids.len() > ueransim_adapter::MAX_LIVE_UES
         || !matches!(
             input.mode.as_deref().unwrap_or("STAGGERED"),
             "SEQUENTIAL" | "STAGGERED" | "CONCURRENT"
@@ -2996,12 +4164,6 @@ async fn start_ue_group(
         }
     }
     if state.execution_mode == "live" {
-        if !state.additional_ue_live_enabled {
-            return (
-                StatusCode::LOCKED,
-                Json(json!({"error":"ADDITIONAL_UE_LIVE_AUTHORIZATION_REQUIRED"})),
-            );
-        }
         if input.mode.as_deref().unwrap_or("STAGGERED") != "STAGGERED" {
             return (
                 StatusCode::BAD_REQUEST,
@@ -3015,10 +4177,18 @@ async fn start_ue_group(
             );
         }
         let profiles = state.multi_ue.lock().unwrap().profiles();
-        if let Err(error) = authorize_live_ue_request(&input.ue_ids, &profiles) {
+        if let Err(error) =
+            authorize_live_ue_request(&input.ue_ids, &profiles, state.ue01_controller_owned)
+        {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({"error":error})),
+            );
+        }
+        if !ue_control_is_authorized(&state, &identity, &input.ue_ids) {
+            return (
+                StatusCode::PRECONDITION_REQUIRED,
+                Json(json!({"error":"UE_CONTROL_VALIDATION_REQUIRED"})),
             );
         }
         let mut result = simulator_controller::GroupResult {
@@ -3079,7 +4249,7 @@ async fn stop_ue_group(
     if let Err(error) = require_operator(&identity) {
         return error;
     }
-    if input.ue_ids.is_empty() || input.ue_ids.len() > ueransim_adapter::MAX_CONFIGURABLE_UES {
+    if input.ue_ids.is_empty() || input.ue_ids.len() > ueransim_adapter::MAX_LIVE_UES {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"INVALID_GROUP_REQUEST"})),
@@ -3103,7 +4273,7 @@ async fn stop_ue_group(
         }
         return (
             StatusCode::OK,
-            Json(serde_json::to_value(result).unwrap_or(Value::Null)),
+            Json(json!({"stopped":result.started,"failed":result.failed})),
         );
     }
     let result = state
@@ -3115,7 +4285,7 @@ async fn stop_ue_group(
     match persist_ue_registry(&state, &controller) {
         Ok(()) => (
             StatusCode::OK,
-            Json(serde_json::to_value(result).unwrap_or(Value::Null)),
+            Json(json!({"stopped":result.started,"failed":result.failed})),
         ),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3135,9 +4305,13 @@ async fn traffic_status(State(state): State<Arc<AppState>>) -> Json<Value> {
         "state":selected.and_then(|j|j["traffic_state"].as_str()).unwrap_or("IDLE"),
         "packets_requested":selected.and_then(|j|j["packets_requested"].as_u64()).unwrap_or(0),
         "packets_sent":selected.and_then(|j|j["packets_sent"].as_u64()),
-        "packets_received":Value::Null,
-        "bytes":Value::Null,
-        "accounting_source":"OWNED_PROCESS_EXIT",
+        "packets_received":selected.and_then(|j|j["packets_received"].as_u64()),
+        "packet_size_bytes":selected.and_then(|j|j["packet_size_bytes"].as_u64()),
+        "bytes":selected.and_then(|j|j["bytes_sent"].as_u64()),
+        "bytes_sent":selected.and_then(|j|j["bytes_sent"].as_u64()),
+        "bytes_received":selected.and_then(|j|j["bytes_received"].as_u64()),
+        "accounting_source":selected.and_then(|j|j["accounting_source"].as_str()).unwrap_or("NOT_AVAILABLE"),
+        "receive_accounting":selected.and_then(|j|j["receive_accounting"].as_str()).unwrap_or("NOT_OBSERVED_SEND_ONLY_PROFILE"),
         "target_ue_id":selected.and_then(|job|job["target_ue_id"].as_str()),
         "target_ue_pseudonym":selected.and_then(|job|job["target_ue_pseudonym"].as_str()),
         "tun_interface":selected.and_then(|job|job["tun_interface"].as_str()),
@@ -3181,19 +4355,27 @@ fn resource_gate_for_budget(
     if !cpu.ready {
         return Err(cpu.state.clone());
     }
-    if ![
+    let mut required_containers = vec![
         "oiran-lab-amf-1",
         "oiran-lab-upf-1",
         "oiran-lab-ueransim-gnb-1",
-        "oiran-lab-ueransim-ue-1",
         "oiran-lab-capture-1",
-    ]
-    .iter()
-    .all(|name| container_is_healthy(name))
+    ];
+    if !state.ue01_controller_owned {
+        required_containers.push("oiran-lab-ueransim-ue-1");
+    }
+    if !required_containers
+        .iter()
+        .all(|name| container_is_healthy(name))
     {
         return Err("LAB_HEALTH_GATE_FAILED".into());
     }
-    if !Path::new("/root/POLARIS/runtime/ueransim/ue.yaml").exists() {
+    let required_profile = if state.ue01_controller_owned {
+        Path::new(ueransim_adapter::LIVE_PROFILE_ROOT).join("ue-01.yaml")
+    } else {
+        PathBuf::from("/root/POLARIS/runtime/ueransim/ue.yaml")
+    };
+    if !required_profile.exists() {
         return Err("UE_PROFILE_UNAVAILABLE".into());
     }
     Ok(
@@ -3257,10 +4439,15 @@ async fn scenario_capabilities(
             Err(error) => ("INSUFFICIENT_RESOURCES".to_string(), error),
         }
     };
+    let cpu_decision = state
+        .latest_cpu_decision
+        .lock()
+        .ok()
+        .and_then(|decision| decision.clone());
     Json(json!({"items":[
             {"id":"bounded-existing-ue-udp-v1","version":"1.0.0","certified":true,"enabled":enabled,"technology":"5G SA","simulator":"UERANSIM","existing_ue_only":true,"creates_ue":false,"controls_gnb":false,"protocol":"UDP","datagrams":5,"destination":"10.46.0.1","destination_port":49001,"target_scope":"SHARED_UE_01_COMPATIBILITY"},
             {"id":"bounded-controller-ue-udp-v1","version":"1.0.0","certified":true,"enabled":enabled,"technology":"5G SA","simulator":"UERANSIM","existing_ue_only":true,"creates_ue":false,"controls_gnb":false,"protocol":"UDP","datagrams":5,"destination":"10.46.0.1","destination_port":49001,"target_scope":"VERIFIED_CONTROLLER_OWNED_UE"}
-        ],"execution_status":status,"reason":reason,"role":identity.role}))
+        ],"execution_status":status,"reason":reason,"resource_evidence":cpu_decision,"role":identity.role}))
 }
 
 #[derive(Deserialize)]
@@ -3305,10 +4492,8 @@ async fn start_scenario(
     }
     let requested_target = input.target_ue_id.clone().unwrap_or_else(|| "UE-01".into());
     let scenario_target_valid = match input.scenario_type.as_str() {
-        "bounded-existing-ue-udp-v1" => requested_target == "UE-01",
-        "bounded-controller-ue-udp-v1" => {
-            ueransim_adapter::is_approved_controller_ue(&requested_target)
-        }
+        "bounded-existing-ue-udp-v1" => requested_target == "UE-01" && !state.ue01_controller_owned,
+        "bounded-controller-ue-udp-v1" => controller_owns_ue(&state, &requested_target),
         _ => false,
     };
     if !scenario_target_valid
@@ -3393,7 +4578,7 @@ async fn start_scenario(
             Json(cpu_error_response(&state, &error)),
         );
     }
-    let target = if requested_target == "UE-01" {
+    let target = if requested_target == "UE-01" && !state.ue01_controller_owned {
         let pid = if state.execution_mode == "live" {
             match DockerUeRuntime::namespace_pid("oiran-lab-ueransim-ue-1") {
                 Ok(pid) => pid,
@@ -3434,12 +4619,17 @@ async fn start_scenario(
                 "--",
                 "/usr/bin/bash",
                 "-lc",
-                "for i in 1 2 3 4 5; do printf 'POLARIS-CONTROL-V2.1:%02d' \"$i\" > /dev/udp/10.46.0.1/49001 || exit 70; read -r -t 1 _ </dev/null || true; done",
+                TRAFFIC_EXECUTION_COMMAND,
             ])
             .spawn()
         {
             Ok(child) => Some(child),
-            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"TRAFFIC_PROCESS_SPAWN_FAILED"}))),
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":"TRAFFIC_PROCESS_SPAWN_FAILED"})),
+                )
+            }
         }
     } else if state.execution_mode == "mock" {
         None
@@ -3449,7 +4639,7 @@ async fn start_scenario(
             Json(json!({"error":"LIVE_EXECUTION_NOT_CONFIGURED"})),
         );
     };
-    if target.ue_id != "UE-01" {
+    if controller_owns_ue(&state, &target.ue_id) {
         let traffic_state = state
             .multi_ue
             .lock()
@@ -3473,12 +4663,17 @@ async fn start_scenario(
     runtime.active = Some(OwnedScenarioJob {
         job_id: input.scenario_id.clone(),
         started_at: epoch_seconds(),
+        started_at_epoch_ms: epoch_millis(),
         ended_at: None,
+        ended_at_epoch_ms: None,
         state: "RUNNING".into(),
         child,
         process_id,
-        packets_requested: 5,
+        packets_requested: TRAFFIC_PACKET_COUNT,
         packets_sent: None,
+        packets_received: None,
+        bytes_sent: None,
+        bytes_received: None,
         terminal_result: None,
         target_ue_id: target.ue_id,
         target_ue_pseudonym: target.pseudonym,
@@ -3563,7 +4758,7 @@ async fn stop_scenario(
     job.state = "STOPPED".into();
     job.ended_at = Some(epoch_seconds());
     job.terminal_result = Some("OPERATOR_STOP".into());
-    if job.target_ue_id != "UE-01" {
+    if controller_owns_ue(&state, &job.target_ue_id) {
         if let Ok(mut controller) = state.multi_ue.lock() {
             if controller.set_traffic(&job.target_ue_id, "STOPPED").is_ok() {
                 let _ = persist_ue_registry(&state, &controller);
@@ -3644,6 +4839,15 @@ fn epoch_seconds() -> u64 {
         .as_secs()
 }
 
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 fn container_is_healthy(name: &str) -> bool {
     let status = container_status(name);
     status["process_state"] == "running" && status["health"] == "healthy"
@@ -3691,7 +4895,7 @@ fn resolve_controller_traffic_target(
     state: &AppState,
     ue_id: &str,
 ) -> Result<VerifiedTrafficTarget, String> {
-    if !ueransim_adapter::is_approved_controller_ue(ue_id) {
+    if !controller_owns_ue(state, ue_id) {
         return Err("SHARED_UE_TRAFFIC_TARGET_FORBIDDEN".into());
     }
     let job = state
@@ -3788,7 +4992,7 @@ async fn validate_scenario(
     {
         Ok(()) => {
             let target_ue_id = input.target_ue_id.unwrap_or_else(|| "UE-01".into());
-            let scenario_type = if target_ue_id == "UE-01" {
+            let scenario_type = if target_ue_id == "UE-01" && !state.ue01_controller_owned {
                 "bounded-existing-ue-udp-v1"
             } else {
                 if let Err(error) = resolve_controller_traffic_target(&state, &target_ue_id) {
@@ -3839,6 +5043,31 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/lab", get(lab))
         .route("/nodes", get(nodes))
         .route("/ues", get(ues))
+        .route(
+            "/ue-profiles",
+            get(list_ue_profiles).post(create_ue_profile),
+        )
+        .route("/ue-profiles/bulk", post(bulk_create_ue_profiles))
+        .route("/ue-profiles/export.csv", get(export_ue_profiles_csv))
+        .route(
+            "/ue-profiles/:ue_id",
+            put(update_ue_profile).delete(delete_ue_profile),
+        )
+        .route("/ue-profiles/:ue_id/clone", post(clone_ue_profile))
+        .route(
+            "/ue-profiles/:ue_id/validate-provisioning",
+            post(validate_ue_profile_provisioning),
+        )
+        .route("/ues/legacy/discovery", get(discover_legacy_ues))
+        .route(
+            "/ues/legacy/migration/preview",
+            post(preview_legacy_migration),
+        )
+        .route(
+            "/ues/legacy/migration/execute",
+            post(execute_legacy_migration),
+        )
+        .route("/ues/control/validate", post(validate_ue_control))
         .route("/ues/start", post(start_ue))
         .route("/ues/stop", post(stop_ue))
         .route("/ues/group/start", post(start_ue_group))
@@ -4194,12 +5423,17 @@ mod p0_tests {
         OwnedScenarioJob {
             job_id: format!("process-job-{exit_code}"),
             started_at: epoch_seconds(),
+            started_at_epoch_ms: epoch_millis(),
             ended_at: None,
+            ended_at_epoch_ms: None,
             state: "RUNNING".into(),
             process_id: Some(child.id()),
             child: Some(child),
             packets_requested: 5,
             packets_sent: None,
+            packets_received: None,
+            bytes_sent: None,
+            bytes_received: None,
             terminal_result: None,
             target_ue_id: "UE-01".into(),
             target_ue_pseudonym: "UE-PSEUDONYM-01".into(),
@@ -4237,6 +5471,23 @@ mod p0_tests {
         profiles
             .iter_mut()
             .for_each(|profile| profile.subscription_verified = true);
+        let now = epoch_seconds();
+        let profile_registry = UeProfileRegistry {
+            schema_version: 1,
+            profiles: profiles
+                .iter()
+                .cloned()
+                .map(|profile| ManagedUeProfile {
+                    profile,
+                    subscriber_identity_sha256: "0".repeat(64),
+                    scenario_id: None,
+                    auto_run_scenario: false,
+                    revision: 1,
+                    created_at_epoch_s: now,
+                    updated_at_epoch_s: now,
+                })
+                .collect(),
+        };
         AppState {
             storage_path: "/root/POLARIS_CONTROL".into(),
             static_dir: root.join("no-web"),
@@ -4249,10 +5500,16 @@ mod p0_tests {
             cpu_decision_lock: Arc::new(Mutex::new(())),
             latest_cpu_decision: Arc::new(Mutex::new(None)),
             configuration_path: root.join("configuration.json"),
+            profile_store: ProfileStore::new(
+                root.join("ue-profile-registry.json"),
+                root.join("ue-profiles"),
+            ),
+            profile_registry: Arc::new(Mutex::new(profile_registry)),
             policy_path: root.join("policy.json"),
             policy_enabled: Arc::new(AtomicBool::new(true)),
             execution_mode: "mock".into(),
             additional_ue_live_enabled: false,
+            ue01_controller_owned: false,
             ue_runtime: Arc::new(FakeLiveUeRuntime {
                 stopped: Arc::new(Mutex::new(Vec::new())),
                 launched: Arc::new(Mutex::new(Vec::new())),
@@ -4267,7 +5524,7 @@ mod p0_tests {
                 history: Vec::new(),
             })),
             multi_ue: Arc::new(Mutex::new(
-                MultiUeController::new(profiles, ueransim_adapter::MAX_CONFIGURABLE_UES).unwrap(),
+                MultiUeController::new(profiles, ueransim_adapter::MAX_LIVE_UES).unwrap(),
             )),
             configuration: Arc::new(Mutex::new(DesiredConfiguration::default())),
             ue_operations: Arc::new(Mutex::new(())),
@@ -4712,9 +5969,29 @@ mod p0_tests {
             await_terminal(&mut runtime);
             assert_eq!(runtime.history[0]["state"], expected);
             assert_eq!(runtime.history[0]["packets_sent"].as_u64(), sent);
+            assert_eq!(
+                runtime.history[0]["bytes_sent"].as_u64(),
+                sent.map(|packets| packets * TRAFFIC_PACKET_BYTES)
+            );
+            assert!(runtime.history[0]["packets_received"].is_null());
+            assert_eq!(
+                runtime.history[0]["receive_accounting"],
+                "NOT_OBSERVED_SEND_ONLY_PROFILE"
+            );
             assert!(runtime.history[0]["ended_at_epoch_s"].as_u64().is_some());
+            assert!(runtime.history[0]["ended_at_epoch_ms"].as_u64().is_some());
             assert!(runtime.history[0]["duration_seconds"].as_u64().unwrap() <= 1);
         }
+    }
+
+    #[test]
+    fn bounded_udp_profile_is_five_fixed_size_datagrams_with_real_spacing() {
+        assert_eq!(TRAFFIC_PACKET_COUNT, 5);
+        assert_eq!(TRAFFIC_PACKET_BYTES, 64);
+        assert!(TRAFFIC_EXECUTION_COMMAND.contains("for i in 1 2 3 4 5"));
+        assert!(TRAFFIC_EXECUTION_COMMAND.contains("printf '%-64s'"));
+        assert!(TRAFFIC_EXECUTION_COMMAND.contains("/usr/bin/sleep 1"));
+        assert!(!TRAFFIC_EXECUTION_COMMAND.contains("</dev/null"));
     }
 
     #[tokio::test]
@@ -4901,28 +6178,98 @@ mod p0_tests {
                 profile
             })
             .collect::<Vec<_>>();
-        assert!(authorize_live_ue_request(&["UE-02".into()], &configured).is_ok());
-        assert!(authorize_live_ue_request(&["UE-02".into(), "UE-03".into()], &configured).is_ok());
-        assert_eq!(
-            authorize_live_ue_request(&["UE-01".into()], &configured).unwrap_err(),
-            "PROTECTED_OR_UNAPPROVED_UE"
+        assert!(authorize_live_ue_request(&["UE-02".into()], &configured, false).is_ok());
+        assert!(
+            authorize_live_ue_request(&["UE-02".into(), "UE-03".into()], &configured, false)
+                .is_ok()
         );
-        assert!(authorize_live_ue_request(&["UE-04".into(), "UE-05".into()], &configured).is_ok());
         assert_eq!(
-            authorize_live_ue_request(&["UE-10".into()], &configured).unwrap_err(),
+            authorize_live_ue_request(&["UE-01".into()], &configured, false).unwrap_err(),
+            "SHARED_UE_PROTECTED"
+        );
+        assert!(authorize_live_ue_request(&["UE-01".into()], &configured, true).is_ok());
+        assert!(
+            authorize_live_ue_request(&["UE-04".into(), "UE-05".into()], &configured, false)
+                .is_ok()
+        );
+        assert_eq!(
+            authorize_live_ue_request(&["UE-10".into()], &configured, false).unwrap_err(),
             "UNKNOWN_UE_PROFILE"
         );
         assert_eq!(
-            authorize_live_ue_request(&["UE-02".into(), "UE-02".into()], &configured).unwrap_err(),
+            authorize_live_ue_request(&["UE-02".into(), "UE-02".into()], &configured, false)
+                .unwrap_err(),
             "INVALID_GROUP_REQUEST"
         );
+    }
+
+    #[test]
+    fn ue01_transfer_requires_exact_evidence_and_no_legacy_owner() {
+        let transfer = Ue01OwnershipTransferAttestation {
+            schema_version: 1,
+            ue_id: "UE-01".into(),
+            state: "CONTROLLER_OWNED".into(),
+            legacy_container_name: "oiran-lab-ueransim-ue-1".into(),
+            legacy_container_id: "a".repeat(64),
+            legacy_compose_project: "oiran-lab".into(),
+            legacy_compose_service: "ueransim-ue".into(),
+            legacy_compose_sha256: "b".repeat(64),
+            profile_sha256: "c".repeat(64),
+            ownership_id: "d".repeat(64),
+        };
+        let evidence = Ue01OwnershipTransferEvidence {
+            legacy_container_present: false,
+            legacy_container_running: false,
+            legacy_container_id: None,
+            compose_sha256: "b".repeat(64),
+            profile_sha256: "c".repeat(64),
+            ownership_id: "d".repeat(64),
+        };
+        assert!(validate_ue01_ownership_transfer(&transfer, &evidence).is_ok());
+        assert_eq!(
+            validate_ue01_ownership_transfer(
+                &transfer,
+                &Ue01OwnershipTransferEvidence {
+                    legacy_container_present: true,
+                    ..evidence.clone()
+                }
+            )
+            .unwrap_err(),
+            "UE01_LEGACY_OWNER_STILL_PRESENT"
+        );
+        assert_eq!(
+            validate_ue01_ownership_transfer(
+                &transfer,
+                &Ue01OwnershipTransferEvidence {
+                    profile_sha256: "e".repeat(64),
+                    ..evidence
+                }
+            )
+            .unwrap_err(),
+            "UE01_TRANSFER_EVIDENCE_MISMATCH"
+        );
+        assert!(compose_disables_legacy_ue01(
+            "services:\n  ueransim-ue:\n    # POLARIS_UE01_OWNERSHIP_TRANSFERRED\n    profiles: [\"polaris-transferred\"]\n  amf:\n    image: example"
+        ));
+        assert!(!compose_disables_legacy_ue01(
+            "services:\n  ueransim-ue:\n    # POLARIS_UE01_OWNERSHIP_TRANSFERRED\n    profiles: [\"5g\"]"
+        ));
+        let disabled = disable_legacy_ue01_service(
+            "services:\n  ueransim-ue:\n    profiles: [\"5g\"]\n    image: pinned\n  amf:\n    image: pinned\n",
+        )
+        .unwrap();
+        assert!(compose_disables_legacy_ue01(&disabled));
+        assert!(disabled.contains("polaris-ue01-legacy-disabled"));
+        assert_eq!(disable_legacy_ue01_service(&disabled).unwrap(), disabled);
     }
 
     #[tokio::test]
     async fn live_group_starts_only_ue_02_and_ue_03_and_inventory_uses_current_observations() {
         let mut test_state = state();
         test_state.execution_mode = "live".into();
-        test_state.additional_ue_live_enabled = true;
+        // Direct, controller-owned lifecycle operations use an explicit,
+        // short-lived Operator validation instead of the desired-count gate.
+        test_state.additional_ue_live_enabled = false;
         test_state
             .multi_ue
             .lock()
@@ -4939,6 +6286,39 @@ mod p0_tests {
         });
         let application = app(test_state);
         let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let unvalidated = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ues/group/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        json!({"ue_ids":["UE-02","UE-03"],"mode":"STAGGERED","stagger_seconds":2})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unvalidated.status(), StatusCode::PRECONDITION_REQUIRED);
+        let validated = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ues/control/validate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(json!({"ue_ids":["UE-02","UE-03"]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(validated.status(), StatusCode::OK);
         let response = application
             .clone()
             .oneshot(
@@ -4980,6 +6360,27 @@ mod p0_tests {
         assert_eq!(inventory["pdu_session_count"], 3);
         assert_eq!(inventory["items"][1]["ue_ip"], "10.46.0.5");
         assert_eq!(inventory["items"][2]["ue_ip"], "10.46.0.6");
+
+        let stopped = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ues/group/stop")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(json!({"ue_ids":["UE-02"]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.status(), StatusCode::OK);
+        let stopped: Value =
+            serde_json::from_slice(&to_bytes(stopped.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(stopped["stopped"], json!(["UE-02"]));
+        assert!(stopped.get("started").is_none());
 
         let protected_stop = application
             .oneshot(
@@ -5476,7 +6877,7 @@ mod p0_tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(value["planned_count"], 10);
-        assert_eq!(value["max_configurable"], 10);
+        assert_eq!(value["max_configurable"], 10_000);
         assert!(value["configured_profiles"]
             .as_array()
             .unwrap()
@@ -5485,9 +6886,43 @@ mod p0_tests {
     }
 
     #[tokio::test]
+    async fn verified_transfer_removes_shared_state_and_exposes_ue01_control_contract() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        test_state.ue01_controller_owned = true;
+        let response = app(test_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ues")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let ue01 = &value["items"][0];
+        assert_eq!(ue01["internal_ue_id"], "UE-01");
+        assert_eq!(ue01["controller_owned"], true);
+        assert_eq!(ue01["ownership"], "POLARIS_CONTROLLER");
+        assert_eq!(ue01["process_state"], "NOT_STARTED");
+        assert_eq!(ue01["actions"]["authorize"], true);
+        assert_eq!(value["active_count"], 0);
+    }
+
+    #[tokio::test]
     async fn ue_inventory_reuses_fresh_runtime_observation_without_blocking_navigation() {
         let test_state = Arc::new(state());
-        let first = ues(State(test_state.clone())).await.0;
+        let viewer = || {
+            Extension(EffectiveIdentity {
+                role: "viewer".into(),
+                username: None,
+                session_id: None,
+                csrf_valid: true,
+            })
+        };
+        let first = ues(State(test_state.clone()), viewer()).await.0;
         assert_eq!(first["configured_count"], 1);
         assert_eq!(first["registered_count"], 1);
         assert!(
@@ -5504,7 +6939,7 @@ mod p0_tests {
             .ue_inventory_running
             .store(true, Ordering::Release);
         let started = std::time::Instant::now();
-        let cached = ues(State(test_state.clone())).await.0;
+        let cached = ues(State(test_state.clone()), viewer()).await.0;
         assert!(started.elapsed() < std::time::Duration::from_millis(100));
         assert_eq!(cached["configured_count"], 1);
         assert_eq!(cached["registered_count"], 1);
@@ -5635,6 +7070,7 @@ mod p0_tests {
 
     #[tokio::test]
     async fn configuration_rejects_out_of_range_counts() {
+        assert!(validate_configuration(0, 1).is_ok());
         let application = app(state());
         let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
         let response = application
@@ -5875,5 +7311,79 @@ mod p0_tests {
             evidence.decision_id
         );
         assert_eq!(response["cpu_decision"]["blocking"], true);
+    }
+
+    #[tokio::test]
+    async fn profile_mutation_requires_operator_and_migration_fails_closed() {
+        std::env::remove_var("POLARIS_LEGACY_MIGRATION_ENABLED");
+        let application = app(state());
+        let anonymous = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ue-profiles")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "ue_id":"UE-05","name":"test","supi":"imsi-001010000000005",
+                            "authentication_key":"11".repeat(16),"opc":"22".repeat(16),
+                            "plmn_mcc":"001","plmn_mnc":"01","dnn":"internet","sst":1,
+                            "sd":"010203","serving_gnb":"GNB-01","scenario_id":null,
+                            "auto_run_scenario":false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::FORBIDDEN);
+
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let blocked = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ues/legacy/migration/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .header("x-csrf-token", csrf)
+                    .body(Body::from(
+                        json!({
+                            "ue_id":"UE-01",
+                            "source_container_id":"a".repeat(64),
+                            "confirmation":"TRANSFER_UE01_TO_POLARIS"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::LOCKED);
+    }
+
+    #[tokio::test]
+    async fn profile_inventory_is_server_paginated_and_searchable() {
+        let application = app(state());
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ue-profiles?page=2&page_size=3&search=UE-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["page"], 2);
+        assert_eq!(body["page_size"], 3);
+        assert!(body["total"].as_u64().unwrap() >= 4);
+        assert_eq!(body["items"].as_array().unwrap().len(), 3);
+        assert!(body.to_string().find("authentication_key").is_none());
     }
 }
