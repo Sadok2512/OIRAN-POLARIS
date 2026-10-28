@@ -8,7 +8,7 @@ function simulatorPath(path: string): string {
   return new URL(path, simulatorUrl).toString();
 }
 
-test('Simulator 0.3.1 authenticates an Operator and renders current BrowserRouter routes', async ({ page }) => {
+test('Simulator 0.5.2 authenticates an Operator and renders current BrowserRouter routes', async ({ page }) => {
   expect(username, 'POLARIS_OPERATOR_USERNAME must be securely injected').toBeTruthy();
   expect(password, 'POLARIS_OPERATOR_PASSWORD must be securely injected').toBeTruthy();
 
@@ -35,12 +35,25 @@ test('Simulator 0.3.1 authenticates an Operator and renders current BrowserRoute
   expect(auth.body.role).toBe('operator');
 
   for (const [path, title] of [
-    ['nodes', 'Network Nodes'],
+    ['network/topology', 'Topology'],
+    ['network/gnbs', 'gNodeBs'],
     ['scenarios', 'Scenarios'],
     ['ues', 'UE Profile Manager'],
   ] as const) {
     await page.goto(simulatorPath(path), { waitUntil: 'domcontentloaded' });
     await expect(page.getByRole('heading', { name: title, level: 1 })).toBeVisible();
+  }
+
+  await page.goto(simulatorPath('scenarios'), { waitUntil: 'domcontentloaded' });
+  await page.getByRole('tab', { name: 'Templates (tpl-*)' }).click();
+  await expect(page.getByTestId('templates-table')).toBeVisible();
+  for (const templateId of [
+    'tpl-voice-long',
+    'tpl-voice-short',
+    'tpl-small-traffic',
+    'tpl-high-runner',
+  ]) {
+    await expect(page.getByTestId(`template-row-${templateId}`)).toBeVisible();
   }
 
   expect(pageErrors).toEqual([]);
