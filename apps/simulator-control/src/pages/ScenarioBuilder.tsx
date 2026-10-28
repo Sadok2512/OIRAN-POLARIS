@@ -7,6 +7,7 @@ import {
   ArrowUp,
   CheckCircle2,
   Copy,
+  Lock,
   Plus,
   Save,
   Trash2,
@@ -54,6 +55,24 @@ export function ScenarioBuilderPage() {
 
   const issues = useMemo(() => validateScenario(draft), [draft]);
   const errors = issues.filter((issue) => issue.level === 'error');
+
+  // Honest palette: only backend-certified kinds are clickable in backend mode.
+  // In offline-draft mode we keep every kind clickable but still render them
+  // in the "Not supported yet" group so the operator sees the backend reason.
+  const paletteGroups = useMemo(() => {
+    const supported: ScenarioStepKind[] = [];
+    const locked: ScenarioStepKind[] = [];
+    for (const kind of Object.keys(STEP_METADATA) as ScenarioStepKind[]) {
+      if (STEP_METADATA[kind].backendCertified) supported.push(kind);
+      else locked.push(kind);
+    }
+    return { supported, locked };
+  }, []);
+
+  const hasLockedStep = useMemo(
+    () => draft.steps.some((step) => !STEP_METADATA[step.kind].backendCertified),
+    [draft.steps],
+  );
 
   function updateDraft(update: Partial<Scenario>) {
     setDraft((prev) => ({ ...prev, ...update }));
@@ -122,7 +141,8 @@ export function ScenarioBuilderPage() {
     }));
   }
 
-  const backendBlocked = library.backend && !isLoopRepresentable(draft.loop.kind);
+  const backendBlocked =
+    library.backend && (!isLoopRepresentable(draft.loop.kind) || hasLockedStep);
 
   async function save() {
     if (errors.length > 0 || backendBlocked || saving) return;
@@ -166,9 +186,11 @@ export function ScenarioBuilderPage() {
               title={
                 errors.length > 0
                   ? 'Fix validation errors first'
-                  : backendBlocked
-                    ? 'This loop mode cannot be saved to the backend catalog'
-                    : undefined
+                  : library.backend && hasLockedStep
+                    ? 'Remove the non-certified step(s) before saving to the backend'
+                    : library.backend && !isLoopRepresentable(draft.loop.kind)
+                      ? 'This loop mode cannot be saved to the backend catalog'
+                      : undefined
               }
             >
               <Save width={14} height={14} aria-hidden="true" />
@@ -227,24 +249,78 @@ export function ScenarioBuilderPage() {
       </section>
 
       <section className="ep-card p-5 mb-4">
-        <header className="flex items-center justify-between mb-3">
-          <h2 className="text-ep-md font-semibold">Steps · {draft.steps.length}</h2>
-          <div className="flex flex-wrap gap-1" data-testid="step-palette">
-            {(Object.keys(STEP_METADATA) as ScenarioStepKind[]).map((kind) => (
-              <button
-                key={kind}
-                type="button"
-                className="ep-badge cursor-pointer hover:bg-primary/10"
-                onClick={() => addStep(kind)}
-                title={`Add ${STEP_METADATA[kind].label}`}
-                data-testid={`add-step-${kind}`}
+        <header className="flex flex-col gap-2 mb-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-ep-md font-semibold">Steps · {draft.steps.length}</h2>
+            {!library.backend && (
+              <span className="ep-badge" data-testid="builder-offline-draft-badge">
+                Offline draft
+              </span>
+            )}
+          </div>
+          <div className="flex flex-col gap-2" data-testid="step-palette">
+            <div className="flex flex-wrap gap-1" data-testid="step-palette-supported">
+              <span className="text-ep-xs uppercase tracking-wider text-text-secondary mr-1">
+                Supported
+              </span>
+              {paletteGroups.supported.map((kind) => (
+                <button
+                  key={kind}
+                  type="button"
+                  className="ep-badge cursor-pointer hover:bg-primary/10"
+                  onClick={() => addStep(kind)}
+                  title={`Add ${STEP_METADATA[kind].label}`}
+                  data-testid={`add-step-${kind}`}
+                >
+                  <Plus width={10} height={10} />
+                  {STEP_METADATA[kind].label}
+                </button>
+              ))}
+            </div>
+            {paletteGroups.locked.length > 0 && (
+              <div
+                className="flex flex-wrap gap-1 border-t border-border pt-2"
+                data-testid="step-palette-locked"
               >
-                <Plus width={10} height={10} />
-                {STEP_METADATA[kind].label}
-              </button>
-            ))}
+                <span className="text-ep-xs uppercase tracking-wider text-warning mr-1 flex items-center gap-1">
+                  <Lock width={11} height={11} />
+                  Not supported yet
+                </span>
+                {paletteGroups.locked.map((kind) => {
+                  const meta = STEP_METADATA[kind];
+                  const reason = meta.backendNote ?? 'Not accepted by polaris-control-api.';
+                  return (
+                    <span
+                      key={kind}
+                      className="ep-badge opacity-60 cursor-not-allowed"
+                      title={reason}
+                      aria-disabled="true"
+                      data-testid={`locked-step-${kind}`}
+                    >
+                      <Lock width={10} height={10} />
+                      {meta.label}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </header>
+
+        {hasLockedStep && library.backend && (
+          <div
+            role="alert"
+            className="ep-card border-warning/40 p-3 mb-3 text-ep-sm text-warning flex items-start gap-2"
+            data-testid="builder-locked-step-banner"
+          >
+            <AlertTriangle width={14} height={14} className="mt-0.5 shrink-0" aria-hidden="true" />
+            <span>
+              This draft contains a step the backend will refuse. Remove it, or switch to
+              <strong> Offline draft </strong> in Settings. Save is blocked until the draft only
+              contains backend-certified steps.
+            </span>
+          </div>
+        )}
 
         {draft.steps.length === 0 ? (
           <EmptyState title="No step yet" description="Add steps from the palette above." />

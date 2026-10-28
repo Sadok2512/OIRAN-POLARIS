@@ -80,6 +80,9 @@ afterEach(() => {
 
 describe('scenarioApi — flag gating', () => {
   it('does NOT call /scenario-definitions when scenarioBackend flag is off', async () => {
+    // 0.5.1 — scenarioBackend defaults to ON. Flip it off explicitly so the
+    // offline-draft branch of the hook stays covered.
+    setFlag('scenarioBackend', false);
     const { result } = renderHook(() => useScenarioDefinitions(), {
       wrapper: ({ children }) => withClient(children),
     });

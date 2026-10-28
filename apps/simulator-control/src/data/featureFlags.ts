@@ -40,8 +40,13 @@ export interface FeatureFlags {
   scenarioTemplates: boolean;
 }
 
+// 0.5.1 — `scenarioBackend` defaults to ON so the honest Scenario Builder
+// (certified-only palette + fixed-loop presets) is what the operator sees
+// out of the box. Operators who want to draft against the local catalog
+// toggle the flag off in Settings; the UI then clearly labels this as
+// "offline draft" and reminds them that nothing will reach the backend.
 const DEFAULTS: FeatureFlags = {
-  scenarioBackend: false,
+  scenarioBackend: true,
   profileBackend: false,
   scenarioTemplates: false,
 };

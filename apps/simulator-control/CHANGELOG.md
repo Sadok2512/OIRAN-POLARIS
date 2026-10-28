@@ -3,6 +3,43 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.5.1 — 2026-10-28 (patch)
+
+Honesty pass on the Scenario Builder: `scenarioBackend` now defaults to ON,
+so the first thing a new operator sees is the certified-only palette and
+the backend-safe loop presets. The local catalog becomes an explicit
+**offline-draft** mode behind the existing Settings toggle.
+
+### Changed
+
+- **`scenarioBackend` default: OFF → ON** (`src/data/featureFlags.ts`).
+  Settings now labels the toggle "Honest Builder" vs "Offline draft" so
+  operators understand what each state means.
+- **ScenarioBuilder palette** (`src/pages/ScenarioBuilder.tsx`): split
+  into two groups.
+  - **Supported** (9 chips, clickable): the backend-certified step kinds —
+    `UE_START`, `PDU_ESTABLISH`, `UDP_TRAFFIC`, `IDLE`, `PDU_RELEASE`,
+    `UE_STOP`, `TRAFFIC_UL`, `DETACH`, `REPEAT`.
+  - **Not supported yet** (11 chips, locked with `aria-disabled="true"`
+    and their exact `backendNote` on `title`): `REGISTER_5G`,
+    `WAIT_REGISTRATION`, `TCP_TRAFFIC`, `ICMP_TRAFFIC`, `HTTP_TRAFFIC`,
+    `WAIT_RRC_CONNECTED`, `WAIT_RRC_IDLE`, `DEREGISTER`, `TRAFFIC_DL`,
+    `IMS_REGISTER`, `VOICE_CALL`.
+- **LoopEditor** (`src/components/LoopEditor.tsx`): `Custom` joins
+  `Infinite` and `Random` as a locked preset when `backendOnly === true`.
+  Only `Once`, `×50` and `×100` stay clickable; operators who need an
+  exact count click a preset and edit the cycles input.
+- **Save blocked in backend mode when the draft holds a non-certified
+  step**. A warning banner (`data-testid="builder-locked-step-banner"`)
+  tells the operator to either remove the step or flip to offline-draft.
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → **Test Files 17 passed (17) · Tests 128 passed (128)**
+  (4 new tests in `src/pages/ScenarioBuilder.test.tsx`)
+- `npm run build` → clean (same bundle shape as 0.5.0, no fixture leak).
+
 ## 0.5.0 — 2026-10-28 (minor)
 
 Preparation layer for the scenario-definition v2 contract that Codex ships
