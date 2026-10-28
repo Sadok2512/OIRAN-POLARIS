@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.0 (polaris-control-api)
+
+- Minor: add four immutable, clonable traffic/voice scenario templates and bounded nested
+  `repeat`, `idle`, `detach`, `traffic_ul`, and `traffic_dl` contracts.
+- Minor: add duration estimates plus versioned JSON v2 export/import with Operator, CSRF,
+  collision, schema, and payload-size enforcement.
+- Safety: keep IMS steps locked with `IMS_NOT_AVAILABLE`, reject downlink execution without a
+  verified DN sender, retain the global live-definition feature lock, and record measured iperf3
+  uplink bytes only after an authorized execution.
+
 ## Follow-up security ticket — migrate React Router 7
 
 - The laboratory deployment decision accepted the two moderate advisories reported by

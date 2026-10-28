@@ -80,7 +80,10 @@ describe('Simulator Control routes', () => {
     renderApp();
     for (const label of [
       'Console',
-      'Network Nodes',
+      // Network section (0.4.0) replaces the single "Network Nodes" entry.
+      'Topology',
+      'Core · Open5GS',
+      'gNodeBs',
       'UE Manager',
       'Traffic Generator',
       'Scenarios',
@@ -92,12 +95,19 @@ describe('Simulator Control routes', () => {
     }
   });
 
-  it('navigates to Network Nodes', async () => {
+  it('navigates to the gNodeBs page (replaces /nodes)', async () => {
     renderApp();
     const user = userEvent.setup();
-    await user.click(screen.getByRole('link', { name: /network nodes/i }));
+    await user.click(screen.getByRole('link', { name: /gNodeBs/i }));
     await waitFor(() =>
-      expect(screen.getByRole('heading', { name: /network nodes/i, level: 1 })).toBeInTheDocument(),
+      expect(screen.getByRole('heading', { name: /gNodeBs/i, level: 1 })).toBeInTheDocument(),
+    );
+  });
+
+  it('redirects legacy /nodes URL to /network/gnbs', async () => {
+    renderApp('/nodes');
+    await waitFor(() =>
+      expect(screen.getByRole('heading', { name: /gNodeBs/i, level: 1 })).toBeInTheDocument(),
     );
   });
 

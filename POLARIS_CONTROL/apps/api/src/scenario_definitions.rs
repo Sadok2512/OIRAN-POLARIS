@@ -11,6 +11,9 @@ pub const SCHEMA_VERSION: u8 = 1;
 pub const MAX_STEPS: usize = 256;
 pub const MAX_LOOP_COUNT: u32 = 10_000;
 pub const MAX_RESOLVED_STEPS: usize = 10_000;
+pub const MAX_REPEAT_DEPTH: usize = 2;
+pub const MAX_TRAFFIC_BYTES: u64 = 200 * 1024 * 1024;
+pub const EXPORT_SCHEMA_VERSION: &str = "polaris.scenario-definition.v2";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ScenarioCatalog {
@@ -56,6 +59,8 @@ pub struct ScenarioStep {
     pub loop_count: u32,
     #[serde(default)]
     pub parameters: BTreeMap<String, ParameterSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<ScenarioStep>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -94,7 +99,7 @@ impl ScenarioDefinitionStore {
     }
 
     pub fn load(&self) -> Result<ScenarioCatalog, String> {
-        match fs::read(&self.path) {
+        let mut catalog = match fs::read(&self.path) {
             Ok(bytes) => {
                 #[cfg(unix)]
                 {
@@ -111,13 +116,18 @@ impl ScenarioDefinitionStore {
                 let catalog: ScenarioCatalog = serde_json::from_slice(&bytes)
                     .map_err(|_| "SCENARIO_CATALOG_INVALID".to_string())?;
                 validate_catalog(&catalog)?;
-                Ok(catalog)
+                catalog
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(ScenarioCatalog::default())
+                ScenarioCatalog::default()
             }
-            Err(_) => Err("SCENARIO_CATALOG_UNREADABLE".into()),
+            Err(_) => return Err("SCENARIO_CATALOG_UNREADABLE".into()),
+        };
+        let changed = seed_templates(&mut catalog)?;
+        if changed {
+            self.persist(&catalog)?;
         }
+        Ok(catalog)
     }
 
     pub fn persist(&self, catalog: &ScenarioCatalog) -> Result<(), String> {
@@ -135,6 +145,9 @@ impl ScenarioDefinitionStore {
         input: ScenarioMutation,
     ) -> Result<ScenarioDefinition, String> {
         validate_mutation(&input)?;
+        if template_id(&input.id) {
+            return Err("TEMPLATE_ID_RESERVED".into());
+        }
         if catalog.definitions.iter().any(|item| item.id == input.id) {
             return Err("SCENARIO_DEFINITION_ALREADY_EXISTS".into());
         }
@@ -166,6 +179,9 @@ impl ScenarioDefinitionStore {
         if input.id != id {
             return Err("SCENARIO_ID_IMMUTABLE".into());
         }
+        if template_id(id) {
+            return Err("SCENARIO_TEMPLATE_READ_ONLY".into());
+        }
         validate_mutation(&input)?;
         let index = catalog
             .definitions
@@ -196,6 +212,9 @@ impl ScenarioDefinitionStore {
         catalog: &mut ScenarioCatalog,
         id: &str,
     ) -> Result<ScenarioDefinition, String> {
+        if template_id(id) {
+            return Err("SCENARIO_TEMPLATE_READ_ONLY".into());
+        }
         let index = catalog
             .definitions
             .iter()
@@ -238,39 +257,84 @@ pub fn resolve_steps(definition: &ScenarioDefinition) -> Result<Vec<ResolvedStep
     validate_definition(definition)?;
     let mut resolved = Vec::new();
     for scenario_iteration in 1..=definition.loop_count {
-        for (index, step) in definition.steps.iter().enumerate() {
-            for step_iteration in 1..=step.loop_count {
-                let mut parameters = BTreeMap::new();
-                for (name, value) in &step.parameters {
-                    let selected = match value {
-                        ParameterSpec::Fixed { fixed } => fixed.clone(),
-                        ParameterSpec::Random { random } => {
-                            let span = random
-                                .max
-                                .checked_sub(random.min)
-                                .and_then(|value| value.checked_add(1))
-                                .ok_or("SCENARIO_RANDOM_RANGE_INVALID")?
-                                as u64;
-                            let mut bytes = [0_u8; 8];
-                            OsRng.fill_bytes(&mut bytes);
-                            Value::from(random.min + (u64::from_le_bytes(bytes) % span) as i64)
-                        }
-                    };
-                    parameters.insert(name.clone(), selected);
-                }
-                resolved.push(ResolvedStep {
-                    index,
-                    step_type: step.step_type.clone(),
-                    scenario_loop_iteration: scenario_iteration,
-                    scenario_loop_count: definition.loop_count,
-                    step_loop_iteration: step_iteration,
-                    step_loop_count: step.loop_count,
-                    parameters,
-                });
-            }
-        }
+        resolve_step_list(
+            &definition.steps,
+            scenario_iteration,
+            definition.loop_count,
+            &mut resolved,
+        )?;
     }
     Ok(resolved)
+}
+
+fn resolve_step_list(
+    steps: &[ScenarioStep],
+    scenario_iteration: u32,
+    scenario_count: u32,
+    resolved: &mut Vec<ResolvedStep>,
+) -> Result<(), String> {
+    for step in steps {
+        for step_iteration in 1..=step.loop_count {
+            if step.step_type == "repeat" {
+                resolve_step_list(&step.steps, scenario_iteration, scenario_count, resolved)?;
+                continue;
+            }
+            let mut parameters = BTreeMap::new();
+            for (name, value) in &step.parameters {
+                let selected = match value {
+                    ParameterSpec::Fixed { fixed } => fixed.clone(),
+                    ParameterSpec::Random { random } => {
+                        let span = random
+                            .max
+                            .checked_sub(random.min)
+                            .and_then(|value| value.checked_add(1))
+                            .ok_or("SCENARIO_RANDOM_RANGE_INVALID")?
+                            as u64;
+                        let mut bytes = [0_u8; 8];
+                        OsRng.fill_bytes(&mut bytes);
+                        Value::from(random.min + (u64::from_le_bytes(bytes) % span) as i64)
+                    }
+                };
+                parameters.insert(name.clone(), selected);
+            }
+            resolved.push(ResolvedStep {
+                index: resolved.len(),
+                step_type: step.step_type.clone(),
+                scenario_loop_iteration: scenario_iteration,
+                scenario_loop_count: scenario_count,
+                step_loop_iteration: step_iteration,
+                step_loop_count: step.loop_count,
+                parameters,
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn estimate_duration_ms(definition: &ScenarioDefinition) -> Result<u64, String> {
+    resolve_steps(definition)?
+        .iter()
+        .try_fold(0_u64, |total, step| {
+            let duration = match step.step_type.as_str() {
+                "wait" | "idle" | "voice_call" => resolved_u64(step, "duration_ms", 0)?,
+                _ => 0,
+            };
+            total
+                .checked_add(duration)
+                .ok_or_else(|| "SCENARIO_DURATION_OVERFLOW".into())
+        })
+}
+
+fn resolved_u64(step: &ResolvedStep, name: &str, default: u64) -> Result<u64, String> {
+    step.parameters
+        .get(name)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or("SCENARIO_PARAMETER_INVALID".to_string())
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
 }
 
 fn validate_catalog(catalog: &ScenarioCatalog) -> Result<(), String> {
@@ -306,41 +370,237 @@ fn validate_mutation(input: &ScenarioMutation) -> Result<(), String> {
     if !(1..=MAX_LOOP_COUNT).contains(&input.loop_count) {
         return Err("SCENARIO_LOOP_COUNT_INVALID".into());
     }
-    let mut resolved_step_count = 0_usize;
-    for step in &input.steps {
-        if !matches!(
-            step.step_type.as_str(),
-            "ue_start" | "ue_stop" | "pdu_establish" | "pdu_release" | "udp_traffic" | "wait"
-        ) {
-            return Err("SCENARIO_STEP_TYPE_UNSUPPORTED".into());
-        }
-        if !(1..=MAX_LOOP_COUNT).contains(&step.loop_count) {
-            return Err("SCENARIO_LOOP_COUNT_INVALID".into());
-        }
-        resolved_step_count = resolved_step_count
-            .checked_add(step.loop_count as usize)
-            .ok_or("SCENARIO_RESOLVED_STEP_COUNT_INVALID")?;
-        if resolved_step_count > MAX_RESOLVED_STEPS {
-            return Err("SCENARIO_RESOLVED_STEP_COUNT_INVALID".into());
-        }
-        for (name, value) in &step.parameters {
-            if !safe_id(name) {
-                return Err("SCENARIO_PARAMETER_INVALID".into());
-            }
-            match value {
-                ParameterSpec::Fixed { .. } => {}
-                ParameterSpec::Random { random } if random.min <= random.max => {}
-                ParameterSpec::Random { .. } => return Err("SCENARIO_RANDOM_RANGE_INVALID".into()),
-            }
-        }
-    }
-    resolved_step_count = resolved_step_count
+    let resolved_step_count = validate_steps(&input.steps, 0)?
         .checked_mul(input.loop_count as usize)
         .ok_or("SCENARIO_RESOLVED_STEP_COUNT_INVALID")?;
     if resolved_step_count > MAX_RESOLVED_STEPS {
         return Err("SCENARIO_RESOLVED_STEP_COUNT_INVALID".into());
     }
     Ok(())
+}
+
+fn validate_steps(steps: &[ScenarioStep], depth: usize) -> Result<usize, String> {
+    if steps.is_empty() || steps.len() > MAX_STEPS {
+        return Err("SCENARIO_STEP_COUNT_INVALID".into());
+    }
+    let mut resolved = 0_usize;
+    for step in steps {
+        if !(1..=MAX_LOOP_COUNT).contains(&step.loop_count) {
+            return Err("SCENARIO_LOOP_COUNT_INVALID".into());
+        }
+        let supported = matches!(
+            step.step_type.as_str(),
+            "ue_start"
+                | "ue_stop"
+                | "pdu_establish"
+                | "pdu_release"
+                | "udp_traffic"
+                | "wait"
+                | "traffic_dl"
+                | "traffic_ul"
+                | "idle"
+                | "detach"
+                | "repeat"
+                | "ims_register"
+                | "voice_call"
+        );
+        if !supported {
+            return Err("SCENARIO_STEP_TYPE_UNSUPPORTED".into());
+        }
+        if step.step_type == "repeat" {
+            if depth >= MAX_REPEAT_DEPTH || !step.parameters.is_empty() {
+                return Err("SCENARIO_REPEAT_INVALID".into());
+            }
+            let nested = validate_steps(&step.steps, depth + 1)?;
+            resolved = resolved
+                .checked_add(
+                    nested
+                        .checked_mul(step.loop_count as usize)
+                        .ok_or("SCENARIO_RESOLVED_STEP_COUNT_INVALID")?,
+                )
+                .ok_or("SCENARIO_RESOLVED_STEP_COUNT_INVALID")?;
+        } else {
+            if !step.steps.is_empty() {
+                return Err("SCENARIO_REPEAT_INVALID".into());
+            }
+            validate_parameters(step)?;
+            resolved = resolved
+                .checked_add(step.loop_count as usize)
+                .ok_or("SCENARIO_RESOLVED_STEP_COUNT_INVALID")?;
+        }
+        if resolved > MAX_RESOLVED_STEPS {
+            return Err("SCENARIO_RESOLVED_STEP_COUNT_INVALID".into());
+        }
+    }
+    Ok(resolved)
+}
+
+fn validate_parameters(step: &ScenarioStep) -> Result<(), String> {
+    for (name, value) in &step.parameters {
+        if !safe_id(name) {
+            return Err("SCENARIO_PARAMETER_INVALID".into());
+        }
+        match value {
+            ParameterSpec::Fixed { .. } => {}
+            ParameterSpec::Random { random } if random.min <= random.max => {}
+            ParameterSpec::Random { .. } => return Err("SCENARIO_RANDOM_RANGE_INVALID".into()),
+        }
+    }
+    if matches!(step.step_type.as_str(), "traffic_dl" | "traffic_ul") {
+        let bytes = parameter_max_u64(step, "bytes")?;
+        if bytes == 0 || bytes > MAX_TRAFFIC_BYTES {
+            return Err("TRAFFIC_BYTES_OUT_OF_RANGE".into());
+        }
+    }
+    if matches!(step.step_type.as_str(), "idle" | "voice_call") {
+        parameter_max_u64(step, "duration_ms")?;
+    }
+    Ok(())
+}
+
+fn parameter_max_u64(step: &ScenarioStep, name: &str) -> Result<u64, String> {
+    match step
+        .parameters
+        .get(name)
+        .ok_or("SCENARIO_PARAMETER_REQUIRED")?
+    {
+        ParameterSpec::Fixed { fixed } => fixed
+            .as_u64()
+            .ok_or_else(|| "SCENARIO_PARAMETER_INVALID".into()),
+        ParameterSpec::Random { random } if random.min >= 0 => Ok(random.max as u64),
+        ParameterSpec::Random { .. } => Err("SCENARIO_PARAMETER_INVALID".into()),
+    }
+}
+
+fn template_id(id: &str) -> bool {
+    id.starts_with("tpl-")
+}
+
+fn fixed(value: impl Into<Value>) -> ParameterSpec {
+    ParameterSpec::Fixed {
+        fixed: value.into(),
+    }
+}
+fn step(kind: &str, parameters: BTreeMap<String, ParameterSpec>) -> ScenarioStep {
+    ScenarioStep {
+        step_type: kind.into(),
+        loop_count: 1,
+        parameters,
+        steps: Vec::new(),
+    }
+}
+fn repeat(loop_count: u32, steps: Vec<ScenarioStep>) -> ScenarioStep {
+    ScenarioStep {
+        step_type: "repeat".into(),
+        loop_count,
+        parameters: BTreeMap::new(),
+        steps,
+    }
+}
+
+pub fn builtin_templates() -> Vec<ScenarioDefinition> {
+    let now = 0;
+    let p = |pairs: &[(&str, u64)]| {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).into(), fixed(*v)))
+            .collect()
+    };
+    let dnn = |name: &str| BTreeMap::from([("dnn".into(), fixed(name))]);
+    vec![
+        ScenarioDefinition {
+            id: "tpl-voice-long".into(),
+            name: "Voice long ×100".into(),
+            version: 1,
+            loop_count: 100,
+            steps: vec![
+                step("ue_start", BTreeMap::new()),
+                step("pdu_establish", dnn("ims")),
+                step("ims_register", BTreeMap::new()),
+                step("voice_call", p(&[("duration_ms", 600_000)])),
+                step("wait", p(&[("duration_ms", 60_000)])),
+                step("idle", p(&[("duration_ms", 60_000)])),
+                step("ue_stop", BTreeMap::new()),
+            ],
+            created_at_epoch_s: now,
+            updated_at_epoch_s: now,
+        },
+        ScenarioDefinition {
+            id: "tpl-voice-short".into(),
+            name: "Voice short".into(),
+            version: 1,
+            loop_count: 1,
+            steps: vec![
+                step("ue_start", BTreeMap::new()),
+                step("pdu_establish", dnn("ims")),
+                step("ims_register", BTreeMap::new()),
+                repeat(
+                    50,
+                    vec![
+                        step("voice_call", p(&[("duration_ms", 60_000)])),
+                        step("idle", p(&[("duration_ms", 20_000)])),
+                    ],
+                ),
+                step("detach", BTreeMap::new()),
+            ],
+            created_at_epoch_s: now,
+            updated_at_epoch_s: now,
+        },
+        ScenarioDefinition {
+            id: "tpl-small-traffic".into(),
+            name: "Small traffic".into(),
+            version: 1,
+            loop_count: 1,
+            steps: vec![
+                step("ue_start", BTreeMap::new()),
+                step("pdu_establish", dnn("internet")),
+                repeat(
+                    10,
+                    vec![
+                        step("traffic_dl", p(&[("bytes", 10 * 1024 * 1024)])),
+                        step("wait", p(&[("duration_ms", 20_000)])),
+                        step("traffic_ul", p(&[("bytes", 1024 * 1024)])),
+                        step("idle", p(&[("duration_ms", 20_000)])),
+                    ],
+                ),
+                step("detach", BTreeMap::new()),
+            ],
+            created_at_epoch_s: now,
+            updated_at_epoch_s: now,
+        },
+        ScenarioDefinition {
+            id: "tpl-high-runner".into(),
+            name: "High runner".into(),
+            version: 1,
+            loop_count: 1,
+            steps: vec![
+                step("ue_start", BTreeMap::new()),
+                step("pdu_establish", dnn("internet")),
+                step("traffic_dl", p(&[("bytes", 100 * 1024 * 1024)])),
+                step("traffic_ul", p(&[("bytes", 1_310_720)])),
+                step("idle", p(&[("duration_ms", 20_000)])),
+                step("detach", BTreeMap::new()),
+            ],
+            created_at_epoch_s: now,
+            updated_at_epoch_s: now,
+        },
+    ]
+}
+
+fn seed_templates(catalog: &mut ScenarioCatalog) -> Result<bool, String> {
+    let mut changed = false;
+    for template in builtin_templates() {
+        if !catalog
+            .definitions
+            .iter()
+            .any(|item| item.id == template.id)
+        {
+            validate_definition(&template)?;
+            catalog.definitions.push(template);
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 const fn default_loop_count() -> u32 {
@@ -411,6 +671,7 @@ mod tests {
                         random: RandomRange { min: 10, max: 20 },
                     },
                 )]),
+                steps: Vec::new(),
             }],
         }
     }
@@ -438,8 +699,8 @@ mod tests {
         );
         store.delete(&mut catalog, "s1").unwrap();
         let recovered = store.load().unwrap();
-        assert_eq!(recovered.definitions.len(), 1);
-        assert_eq!(recovered.definitions[0].id, "s2");
+        assert_eq!(recovered.definitions.len(), 5);
+        assert!(recovered.definitions.iter().any(|item| item.id == "s2"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -469,6 +730,7 @@ mod tests {
                 step_type: "wait".into(),
                 loop_count: 6_000,
                 parameters: BTreeMap::new(),
+                steps: Vec::new(),
             })
             .collect();
         assert_eq!(
@@ -515,5 +777,83 @@ mod tests {
         assert_eq!(mutation.loop_count, 1);
         assert_eq!(mutation.steps[0].loop_count, 1);
         validate_mutation(&mutation).unwrap();
+    }
+
+    #[test]
+    fn four_templates_are_seeded_read_only_and_bounded() {
+        let templates = builtin_templates();
+        assert_eq!(templates.len(), 4);
+        assert_eq!(
+            templates
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "tpl-voice-long",
+                "tpl-voice-short",
+                "tpl-small-traffic",
+                "tpl-high-runner"
+            ])
+        );
+        for template in &templates {
+            validate_definition(template).unwrap();
+            assert!(resolve_steps(template).unwrap().len() <= MAX_RESOLVED_STEPS);
+        }
+        let root = std::env::temp_dir().join(format!("polaris-templates-{}", epoch_seconds()));
+        let store = ScenarioDefinitionStore::new(root.join("catalog.json"));
+        let mut catalog = store.load().unwrap();
+        assert_eq!(
+            catalog
+                .definitions
+                .iter()
+                .filter(|item| template_id(&item.id))
+                .count(),
+            4
+        );
+        assert_eq!(
+            store.delete(&mut catalog, "tpl-voice-long").unwrap_err(),
+            "SCENARIO_TEMPLATE_READ_ONLY"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeat_depth_resolved_limit_and_traffic_bound_are_enforced() {
+        let leaf = step(
+            "idle",
+            BTreeMap::from([("duration_ms".into(), fixed(1_u64))]),
+        );
+        let mut valid = mutation("nested");
+        valid.steps = vec![repeat(2, vec![repeat(3, vec![leaf.clone()])])];
+        validate_mutation(&valid).unwrap();
+        assert_eq!(
+            resolve_steps(&ScenarioDefinition {
+                id: valid.id.clone(),
+                name: valid.name.clone(),
+                version: 1,
+                loop_count: 1,
+                steps: valid.steps.clone(),
+                created_at_epoch_s: 0,
+                updated_at_epoch_s: 0
+            })
+            .unwrap()
+            .len(),
+            6
+        );
+        let mut too_deep = valid.clone();
+        too_deep.steps = vec![repeat(1, vec![repeat(1, vec![repeat(1, vec![leaf])])])];
+        assert_eq!(
+            validate_mutation(&too_deep).unwrap_err(),
+            "SCENARIO_REPEAT_INVALID"
+        );
+        let mut too_large = mutation("too-large");
+        too_large.steps = vec![step(
+            "traffic_ul",
+            BTreeMap::from([("bytes".into(), fixed(MAX_TRAFFIC_BYTES + 1))]),
+        )];
+        assert_eq!(
+            validate_mutation(&too_large).unwrap_err(),
+            "TRAFFIC_BYTES_OUT_OF_RANGE"
+        );
     }
 }

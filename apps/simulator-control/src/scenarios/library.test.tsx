@@ -122,6 +122,9 @@ describe('useScenarioLibrary — backend mode', () => {
   });
 
   it('does not issue any request when the flag is off', async () => {
+    // 0.5.1 — scenarioBackend defaults to ON. Explicitly flip it off here to
+    // verify the offline-draft branch stays wired.
+    setFlag('scenarioBackend', false);
     const { result } = renderHook(() => useScenarioLibrary(), { wrapper });
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(result.current.backend).toBe(false);

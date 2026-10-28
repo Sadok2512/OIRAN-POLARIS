@@ -1,11 +1,9 @@
 // Minimal client-side feature-flag store.
 //
 // Flags live in localStorage so an operator can opt in / out from the
-// Settings page without a redeploy. The default is OFF for every flag —
-// nothing calls new backend contracts until the operator flips it. This
-// is the one guard that keeps the local scenario catalog (polaris.
-// scenarios.v1) authoritative while the backend 0.9.0 is still being
-// pushed by Codex.
+// Settings page without a redeploy. API-backed scenarios and templates are
+// enabled by default for the deployed API 0.13 contract; each remains
+// independently reversible from Settings.
 
 import { useCallback, useSyncExternalStore } from 'react';
 
@@ -27,11 +25,28 @@ export interface FeatureFlags {
    * stored in the browser. When false, polaris.ueProfiles.v1 stays authoritative.
    */
   profileBackend: boolean;
+  /**
+   * 0.5.0 — When true, the UI calls the new scenario templates surface:
+   *   GET  /scenario-definitions                     (tpl-* appear in the list)
+   *   GET  /scenario-definitions/:id/estimate        → { duration_ms }
+   *   GET  /scenario-definitions/:id/export          → attachment JSON v2
+   *   POST /scenario-definitions/import              operator + CSRF
+   * When false, the Templates tab shows a "Backend pending" placeholder
+   * and no network call is issued. Default OFF until Codex pushes
+   * `feat/polaris-traffic-templates`.
+   */
+  scenarioTemplates: boolean;
 }
 
+// 0.5.1 — `scenarioBackend` defaults to ON so the honest Scenario Builder
+// (certified-only palette + fixed-loop presets) is what the operator sees
+// out of the box. Operators who want to draft against the local catalog
+// toggle the flag off in Settings; the UI then clearly labels this as
+// "offline draft" and reminds them that nothing will reach the backend.
 const DEFAULTS: FeatureFlags = {
-  scenarioBackend: false,
+  scenarioBackend: true,
   profileBackend: false,
+  scenarioTemplates: true,
 };
 
 function read(): FeatureFlags {

@@ -42,6 +42,25 @@ export interface WireScenarioStep {
   type: string;
   loop_count: number;
   parameters: Record<string, WireNumericParam>;
+  /**
+   * 0.5.0 — nested step list, used by `type: "repeat"`. Absent on every
+   * other step type; the backend validator refuses it elsewhere.
+   */
+  steps?: WireScenarioStep[];
+}
+
+/**
+ * 0.5.0 — Shape of the scenario-definition v2 import / export file, as
+ * delivered by `GET /scenario-definitions/:id/export` and consumed by
+ * `POST /scenario-definitions/import`. The JSON Schema that Codex will
+ * publish lives in `docs/api/scenario-definition.v2.schema.json`.
+ */
+export const SCENARIO_SCHEMA_VERSION = 'polaris.scenario-definition.v2' as const;
+
+export interface WireScenarioExportFile {
+  schema_version: typeof SCENARIO_SCHEMA_VERSION;
+  exported_at_epoch_s?: number;
+  definition: WireScenarioDefinition;
 }
 
 export interface WireScenarioMutation {
@@ -142,10 +161,19 @@ export function encodeStep(step: ScenarioStep): WireScenarioStep {
   if (!type) throw new UnsupportedStepTypeError(step.kind);
   const parameters: Record<string, WireNumericParam> = {};
   (Object.keys(step.params) as (keyof StepParams)[]).forEach((key) => {
+    if (step.kind === 'REPEAT' && key === 'loop_count') return;
     const value = step.params[key];
     if (value) parameters[key] = encodeParam(key, value);
   });
-  return { type, loop_count: 1, parameters };
+  const repeatCount = step.kind === 'REPEAT' && step.params.loop_count?.mode === 'fixed'
+    ? step.params.loop_count.value
+    : 1;
+  return {
+    type,
+    loop_count: repeatCount,
+    parameters,
+    ...(step.kind === 'REPEAT' ? { steps: (step.steps ?? []).map(encodeStep) } : {}),
+  };
 }
 
 export function decodeStep(wire: WireScenarioStep): ScenarioStep {
@@ -153,9 +181,16 @@ export function decodeStep(wire: WireScenarioStep): ScenarioStep {
   if (!kind) throw new UnsupportedStepTypeError(wire.type);
   const params: StepParams = {};
   for (const [key, value] of Object.entries(wire.parameters)) {
+    if ('fixed' in value && typeof value.fixed !== 'number') continue;
     (params as Record<string, FixedOrRandom>)[key] = decodeParam(value);
   }
-  return { id: newStepId(), kind, params };
+  if (kind === 'REPEAT') params.loop_count = { mode: 'fixed', value: wire.loop_count ?? 1 };
+  return {
+    id: newStepId(),
+    kind,
+    params,
+    ...(kind === 'REPEAT' ? { steps: (wire.steps ?? []).map(decodeStep) } : {}),
+  };
 }
 
 /* ----------------------------- Definition codec --------------------------- */

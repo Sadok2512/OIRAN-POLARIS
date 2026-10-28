@@ -18,7 +18,8 @@ use cpu_safety::{CpuSafetyEvidence, CpuSafetyMonitor, ScenarioResourceBudget};
 use rand_core::{OsRng, RngCore};
 use safety_guard::{evaluate, measure, Policy};
 use scenario_definitions::{
-    resolve_steps, ResolvedStep, ScenarioCatalog, ScenarioDefinitionStore, ScenarioMutation,
+    estimate_duration_ms, resolve_steps, ResolvedStep, ScenarioCatalog, ScenarioDefinition,
+    ScenarioDefinitionStore, ScenarioMutation, EXPORT_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -47,7 +48,7 @@ use ueransim_adapter::{
 
 pub use ue_profiles::UeProfileRegistry;
 
-pub const VERSION: &str = "0.12.1";
+pub const VERSION: &str = "0.13.0";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -389,6 +390,38 @@ trait UeRuntime: Send + Sync {
                 status.code().unwrap_or(-1)
             ))
         }
+    }
+    fn execute_iperf_ul(&self, target: &VerifiedTrafficTarget, bytes: u64) -> Result<u64, String> {
+        let output = Command::new("/usr/bin/nsenter")
+            .args([
+                "--target",
+                &target.namespace_pid.to_string(),
+                "--net",
+                "--",
+                "/usr/bin/iperf3",
+                "-c",
+                "10.46.0.1",
+                "-n",
+                &bytes.to_string(),
+                "--connect-timeout",
+                "5000",
+                "-J",
+            ])
+            .output()
+            .map_err(|_| "IPERF3_PROCESS_SPAWN_FAILED".to_string())?;
+        if !output.status.success() {
+            return Err("IPERF3_UL_FAILED".into());
+        }
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| "IPERF3_REPORT_INVALID".to_string())?;
+        report
+            .pointer("/end/sum_sent/bytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "IPERF3_BYTES_NOT_MEASURED".into())
+    }
+    fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> {
+        let _ = job;
+        Err("UE_DEREGISTER_COMMAND_UNSUPPORTED".into())
     }
 }
 
@@ -1265,6 +1298,19 @@ impl UeRuntime for DockerUeRuntime {
         let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
         Self::execute_ue_cli(target, "ps-release-all".into())?;
         self.wait_for_owned_pdu(spec, handle, "INACTIVE", timeout_seconds, cancel)
+    }
+
+    fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> {
+        let handle = job.process_handle.as_deref().ok_or("UE_NOT_STARTED")?;
+        let spec = job
+            .approved_runtime
+            .as_ref()
+            .ok_or("LIVE_RUNTIME_APPROVAL_MISSING")?;
+        if !self.owns(spec, handle) {
+            return Err("LIVE_UE_OWNERSHIP_NOT_PROVEN".into());
+        }
+        let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
+        Self::execute_ue_cli(target, "deregister switch-off".into())
     }
 
     fn resolve_traffic_target(
@@ -3583,10 +3629,134 @@ async fn history(State(state): State<Arc<AppState>>) -> Json<Value> {
 fn scenario_definition_error(error: String) -> (StatusCode, Json<Value>) {
     let status = match error.as_str() {
         "SCENARIO_DEFINITION_NOT_FOUND" => StatusCode::NOT_FOUND,
-        "SCENARIO_DEFINITION_ALREADY_EXISTS" => StatusCode::CONFLICT,
+        "SCENARIO_DEFINITION_ALREADY_EXISTS"
+        | "SCENARIO_ID_EXISTS"
+        | "TEMPLATE_ID_RESERVED"
+        | "SCENARIO_TEMPLATE_READ_ONLY" => StatusCode::CONFLICT,
         _ => StatusCode::UNPROCESSABLE_ENTITY,
     };
     (status, Json(json!({"error":error})))
+}
+
+async fn estimate_scenario_definition(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    let catalog = state.scenario_catalog.lock().unwrap();
+    let Some(definition) = catalog.definitions.iter().find(|item| item.id == id) else {
+        return scenario_definition_error("SCENARIO_DEFINITION_NOT_FOUND".into());
+    };
+    match estimate_duration_ms(definition) {
+        Ok(duration_ms) => (StatusCode::OK, Json(json!({"duration_ms":duration_ms}))),
+        Err(error) => scenario_definition_error(error),
+    }
+}
+
+async fn export_scenario_definition(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let catalog = state.scenario_catalog.lock().unwrap();
+    let Some(definition) = catalog.definitions.iter().find(|item| item.id == id) else {
+        return scenario_definition_error("SCENARIO_DEFINITION_NOT_FOUND".into()).into_response();
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let filename = format!("{}-v{}.json", definition.id, definition.version);
+    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    (
+        headers,
+        Json(json!({
+            "schema_version":EXPORT_SCHEMA_VERSION,
+            "exported_at_epoch_s":epoch_seconds(),
+            "definition":definition
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct ImportScenarioQuery {
+    mode: Option<String>,
+    rename: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ScenarioExportFile {
+    schema_version: String,
+    definition: ScenarioDefinition,
+}
+
+async fn import_scenario_definition(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Query(query): Query<ImportScenarioQuery>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(error) = require_operator(&identity) {
+        return error.into_response();
+    }
+    if body.len() > 1024 * 1024 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error":"IMPORT_PAYLOAD_TOO_LARGE"})),
+        )
+            .into_response();
+    }
+    let imported: ScenarioExportFile = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return scenario_definition_error("SCENARIO_IMPORT_INVALID".into()).into_response()
+        }
+    };
+    if imported.schema_version != EXPORT_SCHEMA_VERSION {
+        return scenario_definition_error("SCHEMA_UNKNOWN".into()).into_response();
+    }
+    if query
+        .mode
+        .as_deref()
+        .is_some_and(|mode| mode != "new_version")
+        || (query.mode.is_some() && query.rename.is_some())
+    {
+        return scenario_definition_error("SCENARIO_IMPORT_MODE_INVALID".into()).into_response();
+    }
+    let mut mutation = ScenarioMutation {
+        id: imported.definition.id.clone(),
+        name: imported.definition.name,
+        loop_count: imported.definition.loop_count,
+        steps: imported.definition.steps,
+    };
+    let mut catalog = state.scenario_catalog.lock().unwrap();
+    let result = if let Some(target) = query.rename {
+        mutation.id = target;
+        state
+            .scenario_definition_store
+            .create(&mut catalog, mutation)
+    } else if query.mode.as_deref() == Some("new_version") {
+        let id = mutation.id.clone();
+        state
+            .scenario_definition_store
+            .update(&mut catalog, &id, mutation)
+    } else if catalog
+        .definitions
+        .iter()
+        .any(|item| item.id == mutation.id)
+    {
+        Err("SCENARIO_ID_EXISTS".into())
+    } else {
+        state
+            .scenario_definition_store
+            .create(&mut catalog, mutation)
+    };
+    match result {
+        Ok(definition) => (StatusCode::CREATED, Json(json!(definition))).into_response(),
+        Err(error) => scenario_definition_error(error).into_response(),
+    }
 }
 
 async fn list_scenario_definitions(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -5012,24 +5182,28 @@ fn run_bounded_udp_for_ue(state: &AppState, ue_id: &str) -> Result<(), String> {
     state.ue_runtime.execute_bounded_udp(&target)
 }
 
+fn cancellable_wait(control: &DefinitionJobControl, duration_ms: u64) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
+    while std::time::Instant::now() < deadline {
+        if control.cancel.load(Ordering::SeqCst) {
+            return Err("SCENARIO_STOP_REQUESTED".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(())
+}
+
 fn execute_live_definition_step(
     state: &AppState,
     step: &ResolvedStep,
     ue_ids: &[String],
     control: &DefinitionJobControl,
-) -> Result<(), String> {
+) -> Result<Value, String> {
     match step.step_type.as_str() {
         "wait" => {
             let duration_ms = resolved_parameter_u64(step, "duration_ms", 1_000, 120_000)?;
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
-            while std::time::Instant::now() < deadline {
-                if control.cancel.load(Ordering::SeqCst) {
-                    return Err("SCENARIO_STOP_REQUESTED".into());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Ok(())
+            cancellable_wait(control, duration_ms)?;
+            Ok(json!({"duration_ms":duration_ms}))
         }
         "ue_start" => {
             for ue_id in ue_ids {
@@ -5052,7 +5226,7 @@ fn execute_live_definition_step(
                         .insert(ue_id.clone());
                 }
             }
-            Ok(())
+            Ok(json!({}))
         }
         "ue_stop" => {
             for ue_id in ue_ids {
@@ -5072,12 +5246,12 @@ fn execute_live_definition_step(
                     .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
                     .remove(ue_id);
             }
-            Ok(())
+            Ok(json!({}))
         }
         "pdu_establish" => {
             let timeout = resolved_parameter_u64(step, "timeout_seconds", 30, 120)?;
             for ue_id in ue_ids {
-                let (job, profile) = {
+                let (job, mut profile) = {
                     let controller = state
                         .multi_ue
                         .lock()
@@ -5094,6 +5268,12 @@ fn execute_live_definition_step(
                         .ok_or("UNKNOWN_UE_PROFILE")?;
                     (job, profile)
                 };
+                if let Some(dnn) = step.parameters.get("dnn").and_then(Value::as_str) {
+                    if !matches!(dnn, "internet" | "ims") {
+                        return Err("DNN_NOT_ALLOWED".into());
+                    }
+                    profile.dnn = dnn.into();
+                }
                 state
                     .ue_runtime
                     .establish_pdu(&job, &profile, timeout, &control.cancel)?;
@@ -5102,7 +5282,7 @@ fn execute_live_definition_step(
                     return Err("PDU_STATE_ACTIVE_NOT_OBSERVED".into());
                 }
             }
-            Ok(())
+            Ok(json!({"pdu_state":"ACTIVE"}))
         }
         "pdu_release" => {
             let timeout = resolved_parameter_u64(step, "timeout_seconds", 30, 120)?;
@@ -5123,7 +5303,7 @@ fn execute_live_definition_step(
                     return Err("PDU_STATE_INACTIVE_NOT_OBSERVED".into());
                 }
             }
-            Ok(())
+            Ok(json!({"pdu_state":"INACTIVE"}))
         }
         "udp_traffic" => {
             let packets = resolved_parameter_u64(step, "packet_count", 5, 5)?;
@@ -5136,8 +5316,66 @@ fn execute_live_definition_step(
                 }
                 run_bounded_udp_for_ue(state, ue_id)?;
             }
-            Ok(())
+            Ok(json!({"datagrams":5}))
         }
+        "traffic_dl" => Err("DL_SENDER_NOT_AVAILABLE".into()),
+        "traffic_ul" => {
+            let bytes = resolved_parameter_u64(step, "bytes", 0, 200 * 1024 * 1024)?;
+            if bytes == 0 {
+                return Err("TRAFFIC_BYTES_OUT_OF_RANGE".into());
+            }
+            let mut measured = 0_u64;
+            for ue_id in ue_ids {
+                if control.cancel.load(Ordering::SeqCst) {
+                    return Err("SCENARIO_STOP_REQUESTED".into());
+                }
+                let target = resolve_controller_traffic_target(state, ue_id)?;
+                measured = measured
+                    .checked_add(state.ue_runtime.execute_iperf_ul(&target, bytes)?)
+                    .ok_or("IPERF3_BYTES_OVERFLOW")?;
+            }
+            Ok(json!({"requested_bytes_per_ue":bytes,"measured_ul_bytes":measured}))
+        }
+        "idle" => {
+            let duration_ms = resolved_parameter_u64(step, "duration_ms", 1_000, 3_600_000)?;
+            for ue_id in ue_ids {
+                if observe_controller_ue(state, ue_id)?.pdu_session_state != "ACTIVE" {
+                    return Err("IDLE_REQUIRES_ACTIVE_PDU".into());
+                }
+            }
+            cancellable_wait(control, duration_ms)?;
+            for ue_id in ue_ids {
+                if observe_controller_ue(state, ue_id)?.pdu_session_state != "ACTIVE" {
+                    return Err("IDLE_DID_NOT_PRESERVE_PDU".into());
+                }
+            }
+            Ok(json!({"duration_ms":duration_ms,"pdu_preserved":true}))
+        }
+        "detach" => {
+            for ue_id in ue_ids {
+                let job = state
+                    .multi_ue
+                    .lock()
+                    .map_err(|_| "UE_REGISTRY_UNAVAILABLE".to_string())?
+                    .snapshot()
+                    .into_iter()
+                    .find(|job| job.ue_id == *ue_id)
+                    .ok_or("UE_NOT_STARTED")?;
+                state.ue_runtime.release_pdu(&job, 30, &control.cancel)?;
+                state.ue_runtime.deregister_switch_off(&job)?;
+                stop_one_live(state, ue_id)?;
+                control
+                    .started_ues
+                    .lock()
+                    .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                    .remove(ue_id);
+            }
+            Ok(
+                json!({"pdu_state":"INACTIVE","registration_state":"DEREGISTERED","process_state":"STOPPED"}),
+            )
+        }
+        "ims_register" | "voice_call" => Err("IMS_NOT_AVAILABLE".into()),
+        "repeat" => Err("SCENARIO_REPEAT_NOT_RESOLVED".into()),
         _ => Err("SCENARIO_STEP_TYPE_UNSUPPORTED".into()),
     }
 }
@@ -5179,10 +5417,11 @@ fn execute_live_definition_job(
             record["steps"][position]["started_at"] = json!(epoch_seconds());
         });
         match execute_live_definition_step(&state, step, &ue_ids, &control) {
-            Ok(()) => {
+            Ok(measurements) => {
                 let _ = update_definition_record(&state, &job_id, |record| {
                     record["steps"][position]["state"] = json!("COMPLETED");
                     record["steps"][position]["ended_at"] = json!(epoch_seconds());
+                    record["steps"][position]["measurements"] = measurements;
                 });
             }
             Err(error) if error == "SCENARIO_STOP_REQUESTED" => {
@@ -5358,6 +5597,36 @@ async fn start_scenario(
         );
     }
     if let Some(definition_id) = input.scenario_definition_id.as_deref() {
+        let definition = state
+            .scenario_catalog
+            .lock()
+            .unwrap()
+            .definitions
+            .iter()
+            .find(|item| item.id == definition_id)
+            .cloned();
+        let Some(definition) = definition else {
+            return scenario_definition_error("SCENARIO_DEFINITION_NOT_FOUND".into());
+        };
+        let resolved = match resolve_steps(&definition) {
+            Ok(value) => value,
+            Err(error) => return scenario_definition_error(error),
+        };
+        if resolved
+            .iter()
+            .any(|step| matches!(step.step_type.as_str(), "ims_register" | "voice_call"))
+        {
+            return (
+                StatusCode::LOCKED,
+                Json(json!({"error":"IMS_NOT_AVAILABLE"})),
+            );
+        }
+        if resolved.iter().any(|step| step.step_type == "traffic_dl") {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":"DL_SENDER_NOT_AVAILABLE"})),
+            );
+        }
         let outcome = if state.execution_mode == "mock" {
             run_mock_definition_scenario(&state, definition_id, &input.ue_ids)
         } else {
@@ -6005,6 +6274,18 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/scenario-definitions/:id/clone",
             post(clone_scenario_definition),
+        )
+        .route(
+            "/scenario-definitions/:id/estimate",
+            get(estimate_scenario_definition),
+        )
+        .route(
+            "/scenario-definitions/:id/export",
+            get(export_scenario_definition),
+        )
+        .route(
+            "/scenario-definitions/import",
+            post(import_scenario_definition),
         )
         .route("/scenarios/running", get(scenarios))
         .route("/scenarios/status", get(scenario_status))
@@ -8762,6 +9043,98 @@ mod p0_tests {
         }
     }
 
+    #[tokio::test]
+    async fn scenario_template_export_import_estimate_and_unavailable_steps_are_honest() {
+        let test_state = state();
+        test_state.scenario_catalog.lock().unwrap().definitions =
+            scenario_definitions::builtin_templates();
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+
+        let estimate = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/scenario-definitions/tpl-high-runner/estimate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(estimate.status(), StatusCode::OK);
+
+        let exported = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/scenario-definitions/tpl-high-runner/export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exported.status(), StatusCode::OK);
+        assert!(exported
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("tpl-high-runner-v1.json"));
+        let exported_bytes = to_bytes(exported.into_body(), usize::MAX).await.unwrap();
+
+        let imported = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/scenario-definitions/import?rename=high-runner-copy")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(exported_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(imported.status(), StatusCode::CREATED);
+        let imported: Value =
+            serde_json::from_slice(&to_bytes(imported.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(imported["id"], "high-runner-copy");
+
+        for (id, expected, error) in [
+            ("tpl-voice-short", StatusCode::LOCKED, "IMS_NOT_AVAILABLE"),
+            (
+                "tpl-small-traffic",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "DL_SENDER_NOT_AVAILABLE",
+            ),
+        ] {
+            let response = application
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/scenarios/start")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, &cookie)
+                        .header("x-csrf-token", &csrf)
+                        .body(Body::from(
+                            json!({"scenario_definition_id":id,"ue_ids":["UE-02"]}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"], error);
+        }
+    }
+
     fn install_definition(
         test_state: &mut AppState,
         id: &str,
@@ -8844,6 +9217,7 @@ mod p0_tests {
                     step_type: "ue_start".into(),
                     loop_count: 1,
                     parameters: BTreeMap::new(),
+                    steps: Vec::new(),
                 },
                 scenario_definitions::ScenarioStep {
                     step_type: "pdu_establish".into(),
@@ -8852,11 +9226,13 @@ mod p0_tests {
                         "timeout_seconds".into(),
                         fixed_parameter(json!(1)),
                     )]),
+                    steps: Vec::new(),
                 },
                 scenario_definitions::ScenarioStep {
                     step_type: "wait".into(),
                     loop_count: 1,
                     parameters: BTreeMap::from([("duration_ms".into(), fixed_parameter(json!(1)))]),
+                    steps: Vec::new(),
                 },
                 scenario_definitions::ScenarioStep {
                     step_type: "udp_traffic".into(),
@@ -8865,16 +9241,19 @@ mod p0_tests {
                         "packet_count".into(),
                         fixed_parameter(json!(5)),
                     )]),
+                    steps: Vec::new(),
                 },
                 scenario_definitions::ScenarioStep {
                     step_type: "pdu_release".into(),
                     loop_count: 1,
                     parameters: BTreeMap::new(),
+                    steps: Vec::new(),
                 },
                 scenario_definitions::ScenarioStep {
                     step_type: "ue_stop".into(),
                     loop_count: 1,
                     parameters: BTreeMap::new(),
+                    steps: Vec::new(),
                 },
             ],
         );
@@ -8927,6 +9306,7 @@ mod p0_tests {
                     step_type: "ue_start".into(),
                     loop_count: 1,
                     parameters: BTreeMap::new(),
+                    steps: Vec::new(),
                 },
                 scenario_definitions::ScenarioStep {
                     step_type: "wait".into(),
@@ -8935,6 +9315,7 @@ mod p0_tests {
                         "duration_ms".into(),
                         fixed_parameter(json!(5_000)),
                     )]),
+                    steps: Vec::new(),
                 },
             ],
         );

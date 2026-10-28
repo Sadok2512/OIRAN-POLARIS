@@ -3,6 +3,185 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.5.2 — 2026-10-28 (patch)
+
+- Enable `scenarioTemplates` by default for the deployed API 0.13.0 contract while preserving
+  Operator authentication, CSRF enforcement, and all backend live-execution gates.
+
+## 0.5.1 — 2026-10-28 (patch)
+
+Honesty pass on the Scenario Builder: `scenarioBackend` now defaults to ON,
+so the first thing a new operator sees is the certified-only palette and
+the backend-safe loop presets. The local catalog becomes an explicit
+**offline-draft** mode behind the existing Settings toggle.
+
+### Changed
+
+- **`scenarioBackend` default: OFF → ON** (`src/data/featureFlags.ts`).
+  Settings now labels the toggle "Honest Builder" vs "Offline draft" so
+  operators understand what each state means.
+- **ScenarioBuilder palette** (`src/pages/ScenarioBuilder.tsx`): split
+  into two groups.
+  - **Supported** (9 chips, clickable): the backend-certified step kinds —
+    `UE_START`, `PDU_ESTABLISH`, `UDP_TRAFFIC`, `IDLE`, `PDU_RELEASE`,
+    `UE_STOP`, `TRAFFIC_UL`, `DETACH`, `REPEAT`.
+  - **Not supported yet** (11 chips, locked with `aria-disabled="true"`
+    and their exact `backendNote` on `title`): `REGISTER_5G`,
+    `WAIT_REGISTRATION`, `TCP_TRAFFIC`, `ICMP_TRAFFIC`, `HTTP_TRAFFIC`,
+    `WAIT_RRC_CONNECTED`, `WAIT_RRC_IDLE`, `DEREGISTER`, `TRAFFIC_DL`,
+    `IMS_REGISTER`, `VOICE_CALL`.
+- **LoopEditor** (`src/components/LoopEditor.tsx`): `Custom` joins
+  `Infinite` and `Random` as a locked preset when `backendOnly === true`.
+  Only `Once`, `×50` and `×100` stay clickable; operators who need an
+  exact count click a preset and edit the cycles input.
+- **Save blocked in backend mode when the draft holds a non-certified
+  step**. A warning banner (`data-testid="builder-locked-step-banner"`)
+  tells the operator to either remove the step or flip to offline-draft.
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → **Test Files 17 passed (17) · Tests 128 passed (128)**
+  (4 new tests in `src/pages/ScenarioBuilder.test.tsx`)
+- `npm run build` → clean (same bundle shape as 0.5.0, no fixture leak).
+
+## 0.5.0 — 2026-10-28 (minor)
+
+Preparation layer for the scenario-definition v2 contract that Codex ships
+on `feat/polaris-traffic-templates` (`polaris-control-api` 0.11.0). Nothing
+in this release calls the new backend by default — every network path is
+gated behind the `scenarioTemplates` feature flag (OFF by default) so the
+UI continues to work against today's 0.10.0 contract until an operator
+flips the flag in Settings.
+
+### Added
+
+- **Feature flag `scenarioTemplates`** (default OFF) in
+  `src/data/featureFlags.ts`. Everything below is gated by it.
+- **Scenario model**: 6 new step kinds — `TRAFFIC_DL`, `TRAFFIC_UL`,
+  `DETACH`, `REPEAT`, `IMS_REGISTER`, `VOICE_CALL`. Each one carries its
+  own `backendCertified` + `backendNote`, so the editor renders the exact
+  backend refusal code (`DL_SENDER_NOT_AVAILABLE`, `IMS_NOT_AVAILABLE`,
+  …). The new numeric parameters `bytes`, `rate_kbps`, `duration_ms` and
+  `loop_count` land in `PARAM_META` with the backend caps
+  (`bytes ≤ 200 MiB`, `loop_count ≤ 10 000`). `MAX_REPEAT_NESTING = 2`
+  and `MAX_RESOLVED_STEPS = 10_000` mirror the backend validator.
+- **Wire codec**: `WireScenarioStep.steps?` (nested list used by
+  `type: "repeat"`), `SCENARIO_SCHEMA_VERSION =
+  "polaris.scenario-definition.v2"` and `WireScenarioExportFile` matching
+  the `GET /scenario-definitions/:id/export` response.
+- **Scenario-templates client** `src/data/scenarioTemplatesApi.ts`:
+  `useScenarioTemplates()` (filters `/scenario-definitions` to `tpl-*`),
+  `useScenarioEstimate(id)`, `downloadScenarioExport(id)` (parses
+  `Content-Disposition`, falls back to `${id}-v${version}.json`,
+  surfaces the exact backend code on failure), and `useScenarioImport()`
+  (`POST /scenario-definitions/import?mode=new_version | ?rename=<id>`,
+  propagates 409 / 413 / 422 verbatim).
+- **Scenarios page** gains a **Templates** tab (locked when the flag is
+  OFF, honest "Backend pending" message when the backend returns 404),
+  with Clone and Download JSON actions per template.
+- **Import JSON dialog** (`src/scenarios/ImportScenarioDialog.tsx`): file
+  picker → local JSON parse → local `schema_version` check → structural
+  preview with the nested step tree → `POST /scenario-definitions/import`;
+  on 409 (`SCENARIO_ID_EXISTS` or `TEMPLATE_ID_RESERVED`), offers "Import
+  as new version" or "Rename & import"; backend error codes are shown
+  verbatim (no translation).
+- **Builder**: nested step editor for `REPEAT` with a nested palette and
+  a depth guard aligned on `MAX_REPEAT_NESTING = 2`. Locked step kinds
+  render their backend-note badge verbatim so the operator sees the exact
+  refusal code before saving.
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → Test Files 16 passed (16) · Tests 124 passed (124)
+- `check-dist-leaks` guard stays clean (fixtures live only in tests).
+
+## 0.4.1 — 2026-10-28 (patch)
+
+Review feedback on 0.4.0: four honesty corrections on the new Network section.
+
+### Fixed
+
+- `isLinkUp()` is replaced by `linkState()` returning `configured`, `down`
+  or `unknown`. The UI never says "UP" — NG Setup success stays `unknown`
+  until a dedicated backend route proves it. "configured" means the
+  process is running AND an endpoint is reported; "down" means the process
+  isn't running; "unknown" means no endpoint is reported.
+- Topology and Core · Open5GS now badge the aggregate container as
+  **`AMF container: <process_state>, <health>`** (source line explicitly
+  cites `/lab.observed.open5gs = oiran-lab-amf-1`). The old "5G Core
+  HEALTHY" aggregate wording is gone; every other NF remains "not exposed".
+- Topology eNB cards swap the 5G labels for LTE ones:
+  **S1-MME · S1AP** and **S1-U · GTP-U** instead of N2 / N3.
+- Screenshots refreshed under `docs/screenshots/`. The companion
+  `docs/screenshots/README.md` makes the "mocked API" nature explicit.
+
+### Validation (manual, no CI)
+
+- `npm run typecheck` → clean
+- `npm test` → Test Files 14 passed (14) · Tests 117 passed (117)
+
+## 0.4.0 — 2026-10-28 (minor)
+
+Alignment on the UI mockups in `docs/ui-mockups/polaris-control.html` (branch
+`origin/docs/ui-mockups` @ `04d7c79`). Adds a dedicated **Network** section
+with Topology, Core · Open5GS and gNodeBs; no mutating route is exercised,
+every unavailable backend contract is surfaced as a locked UI control with
+its reason text.
+
+### Added
+
+- `/network/topology` (`src/pages/Topology.tsx`): client-side composition
+  of `GET /lab` + `GET /nodes` + `GET /ues`. Shows the Open5GS container
+  state, each gNB with its PLMN / Cell ID / link / N2 / N3 endpoint, and
+  the UEs that report `serving_node = <id>`. NGAP state is "unknown" when
+  the backend didn't report an endpoint or state — never fabricated.
+- `/network/core` (`src/pages/CoreOpen5gs.tsx`), 3 tabs:
+  - **Network functions**: AMF HEALTHY read from the aggregate container
+    reported by `/lab`; every other NF (SMF/UPF/NRF/…) is listed with
+    `not exposed` because POLARIS does not yet surface per-NF state. Every
+    Restart button is locked with the reason text.
+  - **Configuration**: PLMN / TAC / S-NSSAI / DNN only when
+    `GET /capabilities` carries them, otherwise `not exposed`. Edit
+    configuration button locked.
+  - **Subscribers**: `GET /ue-profiles/provisioning-slots` with `slot_id`
+    and `bound_ue_id` only. Identity column is always "PROTECTED" — no
+    IMSI, K or OPc is ever requested or rendered. Provision button locked.
+- `/network/gnbs` (`src/pages/Gnbs.tsx`): reads `GET /nodes`. GNB-01
+  renders as the real card (`SHARED_NODE_PROTECTED` surfaced); GNB-02 is
+  dashed with the exact backend reason `LIVE_005_APPROVAL_REQUIRED` and
+  a locked "Deploy and start" button; ENB-01 lives under the "LTE profile
+  (not certified)" group with the badge `LTE_ATTACH_NOT_CERTIFIED`. "Add
+  gNodeB" and every start/stop button are locked.
+- `useLabObserved()`, `useProvisioningSlots()`, `useGnbs()` typed hooks in
+  `src/data/queries.ts`.
+- Tests: 112 pass (11 new across the three Network pages + 2 updated in
+  `App.test.tsx`). Commands reported in the PR summary.
+
+### Changed
+
+- Sidebar now shows an explicit **NETWORK** section (Topology, Core · Open5GS,
+  gNodeBs) and groups the simulator pages under **SIMULATION**. The legacy
+  `Network Nodes` entry is retired.
+- `/nodes` route still responds with a redirect to `/network/gnbs`, so old
+  bookmarks don't 404. `NetworkNodes.tsx` stays on disk for reference but
+  is no longer routed to.
+
+### Unchanged
+
+- UE Manager, Scenarios, Scenario Builder, Execution Monitor, Settings:
+  not touched. All their existing tests remain green.
+
+### Open items (declared)
+
+- Per-NF state (SMF/UPF/NRF/…): POLARIS `/lab` only exposes the aggregate
+  `open5gs` container; individual NF state renders as `not exposed` until
+  the backend splits them.
+- Topology link state: based on `process_state === 'running'` plus the
+  presence of an endpoint. There is no `/ng-setup` route yet; the UI never
+  guesses an NGAP OK status.
+
 ## 0.3.1 — 2026-10-28 (patch)
 
 - Update `react-router-dom` to `6.30.6` to close the production React Router redirect/XSS
