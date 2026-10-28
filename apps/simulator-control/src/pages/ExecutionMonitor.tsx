@@ -12,6 +12,9 @@ import {
 import { useAssignments, useScenarios } from '@/scenarios/store';
 import { ScenarioTimeline } from '@/components/ScenarioTimeline';
 import { count, isoToLocal } from '@/data/format';
+import { useFeatureFlag } from '@/data/featureFlags';
+import { useScenarioSteps } from '@/data/scenarioApi';
+import type { WireScenarioStepStatus } from '@/scenarios/wireCodec';
 
 export function ExecutionMonitorPage() {
   const auth = useAuth();
@@ -20,10 +23,12 @@ export function ExecutionMonitorPage() {
   const library = useScenarios();
   const assignments = useAssignments();
   const stopScenario = useStopScenario();
+  const scenarioBackend = useFeatureFlag('scenarioBackend');
 
   const active = runtime.data?.active_job;
   const terminal = runtime.data?.latest_terminal_job;
   const current = active ?? terminal;
+  const steps = useScenarioSteps(scenarioBackend ? active?.job_id ?? null : null);
 
   const scenarioForActive = useMemo(() => {
     if (!active?.target_ue_id) return null;
@@ -154,33 +159,110 @@ export function ExecutionMonitorPage() {
             )}
           </section>
 
-          <section className="ep-card p-5 mb-4">
-            <header className="flex items-center justify-between mb-2 gap-2">
-              <h3 className="text-ep-md font-semibold">Local timeline projection</h3>
-              <span className="ep-badge flex items-center gap-1 border-primary/40 text-primary">
-                <Info width={11} height={11} />
-                Frontend projection — not a backend execution log
-              </span>
-            </header>
-            {scenarioForActive ? (
-              <ScenarioTimeline scenario={scenarioForActive} />
-            ) : (
-              <p className="text-ep-xs text-text-secondary">
-                No local scenario definition linked to this run (assignment cleared, or scenario built on another host).
-              </p>
-            )}
-          </section>
+          {scenarioBackend ? (
+            <section className="ep-card p-5 mb-4" data-testid="backend-steps">
+              <header className="flex items-center justify-between mb-2 gap-2">
+                <h3 className="text-ep-md font-semibold">
+                  Step execution (polaris-control-api 0.9.0 /steps)
+                </h3>
+                <StatusIndicator
+                  state={steps.data ? 'LIVE' : steps.isLoading ? 'LOADING' : 'IDLE'}
+                  tone={steps.data ? 'success' : 'neutral'}
+                  compact
+                />
+              </header>
+              {steps.isLoading && !steps.data && <LoadingSkeleton label="Loading /steps" />}
+              {steps.error && (
+                <p className="text-ep-xs text-error">
+                  Could not load /scenarios/{active?.job_id}/steps:{' '}
+                  {(steps.error as Error).message}
+                </p>
+              )}
+              {steps.data && steps.data.length === 0 && (
+                <p className="text-ep-xs text-text-secondary">
+                  Backend returned no step yet for job {active?.job_id ?? '—'}.
+                </p>
+              )}
+              {steps.data && steps.data.length > 0 && (
+                <ol className="flex flex-col gap-1 text-ep-sm" data-testid="backend-steps-list">
+                  {steps.data.map((step) => (
+                    <BackendStepRow key={step.index} step={step} />
+                  ))}
+                </ol>
+              )}
+            </section>
+          ) : (
+            <>
+              <section className="ep-card p-5 mb-4">
+                <header className="flex items-center justify-between mb-2 gap-2">
+                  <h3 className="text-ep-md font-semibold">Local timeline projection</h3>
+                  <span className="ep-badge flex items-center gap-1 border-primary/40 text-primary">
+                    <Info width={11} height={11} />
+                    Frontend projection — not a backend execution log
+                  </span>
+                </header>
+                {scenarioForActive ? (
+                  <ScenarioTimeline scenario={scenarioForActive} />
+                ) : (
+                  <p className="text-ep-xs text-text-secondary">
+                    No local scenario definition linked to this run (assignment cleared, or scenario built on another host).
+                  </p>
+                )}
+              </section>
 
-          <section className="ep-card border-warning/30 p-4 text-ep-xs text-text-secondary flex items-start gap-2">
-            <AlertTriangle className="text-warning mt-0.5" width={13} height={13} />
-            <span>
-              Step-level `PENDING / RUNNING / WAITING / PASS / FAIL / SKIPPED / STOPPED` statuses require a dedicated
-              backend contract (`/scenarios/:id/steps`). Until that endpoint exists, the Monitor shows every step as
-              `PENDING` to avoid fabricating execution progress.
-            </span>
-          </section>
+              <section className="ep-card border-warning/30 p-4 text-ep-xs text-text-secondary flex items-start gap-2">
+                <AlertTriangle className="text-warning mt-0.5" width={13} height={13} />
+                <span>
+                  Step-level `PENDING / RUNNING / WAITING / PASS / FAIL / SKIPPED / STOPPED` statuses require the backend
+                  contract (`/scenarios/:job_id/steps`). Enable the flag in Settings → “Use backend scenario catalog
+                  (0.9.0)” to switch this panel to live backend data.
+                </span>
+              </section>
+            </>
+          )}
         </>
       )}
     </>
+  );
+}
+
+function BackendStepRow({ step }: { step: WireScenarioStepStatus }) {
+  const resolved = Object.entries(step.resolved_parameters);
+  return (
+    <li
+      className="border border-border rounded-md px-3 py-2 flex flex-col gap-1"
+      data-testid={`backend-step-${step.index}`}
+    >
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="mono text-ep-xs text-text-secondary">#{step.index}</span>
+        <span className="font-medium mono">{step.type}</span>
+        <span className="text-ep-xs text-text-secondary">loop {step.loop}</span>
+        <StatusIndicator state={step.state} compact />
+        {step.started_at && (
+          <span className="text-ep-xs text-text-secondary">
+            started {isoToLocal(step.started_at)}
+          </span>
+        )}
+        {step.ended_at && (
+          <span className="text-ep-xs text-text-secondary">
+            ended {isoToLocal(step.ended_at)}
+          </span>
+        )}
+      </div>
+      {resolved.length > 0 && (
+        <ul className="text-ep-xs text-text-secondary mono flex flex-wrap gap-2">
+          {resolved.map(([key, value]) => (
+            <li key={key} data-testid={`resolved-${step.index}-${key}`}>
+              {key} = {value}
+            </li>
+          ))}
+        </ul>
+      )}
+      {step.error && (
+        <p className="text-ep-xs text-error" data-testid={`step-error-${step.index}`}>
+          {step.error}
+        </p>
+      )}
+    </li>
   );
 }

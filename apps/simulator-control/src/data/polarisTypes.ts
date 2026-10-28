@@ -181,6 +181,10 @@ export interface UeInventory {
   pdu_session_count?: number;
   observed_at_epoch_s?: number;
   source: string;
+  // polaris-control-api 0.9.0 adds these two fields to /ues. Typed as
+  // optional so older backends keep deserializing; no UI consumption yet.
+  cache_version?: string;
+  cache_fresh?: boolean;
 }
 
 export interface ScenarioState {
