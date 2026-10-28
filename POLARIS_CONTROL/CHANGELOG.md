@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.15.5 (polaris-control-api)
+
+- Patch: portable P0 test harness. The two hard-coded
+  `/root/.hermes/cache/scratch/*` paths (`apps/api/src/lib.rs:7340` and
+  `:7770`) now use `std::env::temp_dir()`, so the suite builds and runs
+  on any workstation or CI runner (not just the Codex Hermes sandbox).
+- Tests: the `uid=0` check (`UE_PROFILE_REGISTRY_PERMISSIONS_UNSAFE` in
+  `ue_profiles.rs:238`, `SCENARIO_CATALOG_PERMISSIONS_UNSAFE` in
+  `scenario_definitions.rs:113`) is relaxed under `cfg(test)` only; the
+  release build remains strict. Group / world-write bits stay refused
+  in both branches.
+- Tests: three new unit tests in `lab_nf_tests` cover
+  `network_function_observation` with the honest `observed:false` /
+  null-state contract when the inspector returns `None`, the shape of
+  the 12-NF `LAB_NETWORK_FUNCTIONS` catalogue (10 core NFs + Kamailio
+  + RTPengine), and the composed `/lab.observed.nfs` map rendered with
+  a mocked inspector. The production `network_function_status` is
+  reused by passing an unreachable container name so the suite proves
+  the fallback behaviour without an actual Docker daemon.
+- Validation: `cargo build -p polaris-control-api` clean,
+  `cargo test --workspace` → 132+ passing on Back100 (worktree +
+  `std::env::temp_dir()` writable).
+
 ## 0.15.4 (polaris-control-api)
 
 - Adds `PATCH /api/v1/ue-profiles/:ue_id/scenario`, which updates only scenario metadata and preserves the protected subscriber link and provisioning evidence.

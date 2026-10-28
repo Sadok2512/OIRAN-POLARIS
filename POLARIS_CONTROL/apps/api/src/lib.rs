@@ -58,7 +58,7 @@ use ueransim_adapter::{
 
 pub use ue_profiles::UeProfileRegistry;
 
-pub const VERSION: &str = "0.15.4";
+pub const VERSION: &str = "0.15.5";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -2505,6 +2505,110 @@ fn container_status(name: &str) -> Value {
             json!({"process_state":process_state,"health":health,"observed":true})
         }
         None => json!({"process_state":"unknown","health":"unknown","observed":false}),
+    }
+}
+
+// 0.15.5 — Tests exercise the pure `network_function_observation` with
+// an injected `Option<(process_state, health)>`, which is the same shape
+// `inspect_container_state` would return in production. Any absent /
+// unreachable container is proven to render `observed: false` without
+// fabricating `process_state` or `health`.
+#[cfg(test)]
+mod lab_nf_tests {
+    use super::*;
+
+    /// Deterministic mock inspector: healthy for AMF/SMF/UPF, stopped
+    /// for NRF, absent for every other container.
+    fn mock_inspect(container: &str) -> Option<(String, String)> {
+        match container {
+            "oiran-lab-amf-1" | "oiran-lab-smf-1" | "oiran-lab-upf-1" => {
+                Some(("running".into(), "healthy".into()))
+            }
+            "oiran-lab-nrf-1" => Some(("stopped".into(), "unhealthy".into())),
+            _ => None,
+        }
+    }
+
+    fn render_observed_nfs(now: u64) -> Value {
+        let mut map = serde_json::Map::new();
+        for (nf, container) in LAB_NETWORK_FUNCTIONS {
+            map.insert(
+                nf.to_string(),
+                network_function_observation(nf, container, now, mock_inspect(container)),
+            );
+        }
+        Value::Object(map)
+    }
+
+    #[test]
+    fn network_function_observation_honours_the_inspector_contract() {
+        let present =
+            network_function_observation("AMF", "oiran-lab-amf-1", 42, Some(("running".into(), "healthy".into())));
+        assert_eq!(present["nf"], "AMF");
+        assert_eq!(present["container"], "oiran-lab-amf-1");
+        assert_eq!(present["process_state"], "running");
+        assert_eq!(present["health"], "healthy");
+        assert_eq!(present["observed_at"], 42);
+        assert_eq!(present["observed"], true);
+
+        let absent = network_function_observation("SMF", "oiran-lab-smf-1", 7, None);
+        assert_eq!(absent["observed"], false);
+        assert!(
+            absent["process_state"].is_null(),
+            "absent container must NOT publish a fabricated process_state"
+        );
+        assert!(
+            absent["health"].is_null(),
+            "absent container must NOT publish a fabricated health"
+        );
+    }
+
+    #[test]
+    fn lab_network_functions_catalogue_covers_12_nfs_from_core_and_ims_lite() {
+        let keys: Vec<&str> = LAB_NETWORK_FUNCTIONS.iter().map(|(nf, _)| *nf).collect();
+        assert_eq!(keys.len(), 12);
+        for expected in [
+            "AMF", "SMF", "UPF", "NRF", "AUSF", "UDM", "UDR", "PCF", "NSSF", "BSF", "Kamailio",
+            "RTPengine",
+        ] {
+            assert!(
+                keys.contains(&expected),
+                "catalogue is missing NF: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn observed_nfs_renders_all_catalogue_entries_with_mocked_inspector() {
+        let json = render_observed_nfs(123);
+        let object = json.as_object().unwrap();
+        assert_eq!(object.len(), 12);
+        // AMF / SMF / UPF are running + healthy.
+        for running in ["AMF", "SMF", "UPF"] {
+            let entry = &object[running];
+            assert_eq!(entry["process_state"], "running");
+            assert_eq!(entry["health"], "healthy");
+            assert_eq!(entry["observed"], true);
+            assert_eq!(entry["observed_at"], 123);
+        }
+        // NRF: stopped + unhealthy but still observed=true.
+        let nrf = &object["NRF"];
+        assert_eq!(nrf["process_state"], "stopped");
+        assert_eq!(nrf["health"], "unhealthy");
+        assert_eq!(nrf["observed"], true);
+        // Every other container is absent → observed=false, no fabricated state.
+        for absent in ["AUSF", "UDM", "UDR", "PCF", "NSSF", "BSF", "Kamailio", "RTPengine"] {
+            let entry = &object[absent];
+            assert!(entry["process_state"].is_null());
+            assert!(entry["health"].is_null());
+            assert_eq!(entry["observed"], false);
+        }
+        // network_function_status glues inspect_container_state + the pure
+        // observation renderer; prove the shape is identical to the pure
+        // path when the inspector returns None (prod code never gets a
+        // Some because docker isn't reachable from this test harness).
+        let via_status = network_function_status("AMF", "no-such-container", 123);
+        assert_eq!(via_status["observed"], false);
     }
 }
 
@@ -7674,8 +7778,11 @@ mod p0_tests {
 
     fn state() -> AppState {
         let id = TEST_ID.fetch_add(1, AtomicOrdering::Relaxed);
-        let root = PathBuf::from(format!(
-            "/root/.hermes/cache/scratch/polaris-control-p0-{}-{id}",
+        // 0.15.2 — honour TMPDIR / std::env::temp_dir() instead of hard-coding
+        // /root/.hermes/cache/scratch/*. The previous path only worked under the
+        // Codex Hermes sandbox; the new one works on any workstation or CI runner.
+        let root = std::env::temp_dir().join(format!(
+            "polaris-control-p0-{}-{id}",
             std::process::id()
         ));
         let users_path = root.join("users.json");
@@ -8152,8 +8259,9 @@ mod p0_tests {
     async fn restored_open5gs_copy_accepts_provisioning_without_secret_disclosure() {
         let container = std::env::var("POLARIS_TEST_MONGODB_CONTAINER")
             .expect("POLARIS_TEST_MONGODB_CONTAINER is required");
-        let root = PathBuf::from(format!(
-            "/root/.hermes/cache/scratch/polaris-mongo-copy-{}",
+        // 0.15.2 — portable tempdir (see state() above for rationale).
+        let root = std::env::temp_dir().join(format!(
+            "polaris-mongo-copy-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
