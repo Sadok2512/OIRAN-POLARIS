@@ -7868,6 +7868,31 @@ mod p0_tests {
         assert!(!profile_bulk_body.contains(csv_identity));
         assert!(profile_bulk_body.contains("\"ok\":1"));
 
+        let unknown_profile = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ue-profiles")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        json!({"ue_id":"UE-202","name":"UE-202","gnb_id":"GNB-01","note":"Unknown subscriber","imsi":"001010000009998"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_profile.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let unknown_body: Value = serde_json::from_slice(
+            &to_bytes(unknown_profile.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unknown_body["error"], "SUBSCRIBER_NOT_PROVISIONED");
+
         let rejected_slice = application
             .clone()
             .oneshot(
