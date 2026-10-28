@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.1 — 2026-10-28 (patch)
+
+Honesty fixes on Live Captures (no new feature; no shape change on any API
+contract). The previous build conflated "unknown" with "zero", which could
+mark a healthy capture as stalled during the first polling interval.
+
+### Fixed
+
+- `readSize(capture)` returns `null` when both `size_bytes` and
+  `metrics.storage_bytes` are missing. The storage cell renders `—` instead
+  of `0 B` in that case. 0 B is only shown when the backend actually
+  reported 0 B.
+- Growth is `null` until the sliding window reaches 10 s with at least two
+  real samples; the cell shows `measuring… (x.x s)` with the real elapsed
+  window — never `0 B`.
+- `Stalled` only counts captures whose growth is `0 B` over `≥ 10 s`
+  **or** whose state is in `STALL_STATES`. "Measuring" is never stalled;
+  "size unknown" is never stalled.
+- Sampling now triggers on `useCaptures().dataUpdatedAt` (TanStack Query
+  timestamp of the last fetch) rather than on `live` identity, so exactly
+  one sample is taken per observation. The growth label displays the
+  measured window span rounded to 0.1 s.
+
+### Added
+
+- `scripts/capture-screenshots.py` + screenshots under
+  `docs/screenshots/` for Probes, Register, Live Captures and Capture
+  Library in light and dark themes. Screenshots use a Playwright-mocked
+  OIRAN API (no live backend touched).
+- Tests on the pure helpers (`readSize`, `computeGrowth`, `isStalled` —
+  13) and three UI tests covering: no stalled on first load, size
+  absent → `—`, constant size over ≥ 10 s → stalled.
+- `npm test` → 92 passed · `npm run typecheck` → clean · `npm run build`
+  → `dist/assets/index-_I2s9ze7.js 336.01 kB │ gzip: 99.29 kB`.
+
 ## 0.2.0 — 2026-10-28 (minor)
 
 Alignment on the UI mockups in `docs/ui-mockups/` (branch `origin/docs/ui-mockups`,

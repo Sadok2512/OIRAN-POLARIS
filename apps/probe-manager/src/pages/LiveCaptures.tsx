@@ -24,14 +24,68 @@ const STALL_STATES = ['STOPPING', 'STARTING'];
 const START_LOCKED_REASON = 'Live start is disabled in this build (no mutating route exercised).';
 const STOP_LOCKED_REASON = 'Blocked until lossless resume is proven on OIRAN.';
 const DISK_WARN_THRESHOLD = 90;
+// A growth value is only honest once we have two real samples spanning the
+// window below. Shorter → "measuring…". We also keep samples a little past
+// the window so the oldest point stays usable while the newest arrives.
+const GROWTH_WINDOW_MS = 10_000;
+const SAMPLE_RETENTION_MS = GROWTH_WINDOW_MS + 5_000;
 
 interface GrowthSample {
   timestamp: number;
-  size: number;
+  /** `null` when the backend did not report any size on that sample. */
+  size: number | null;
 }
 
-function readSize(capture: Capture): number {
-  return capture.size_bytes ?? capture.metrics?.storage_bytes ?? 0;
+/**
+ * Return the capture size reported by the backend, or `null` when the
+ * backend omitted both `size_bytes` and `metrics.storage_bytes`. A missing
+ * size must never be surfaced as `0 B` — the UI has to say "unknown".
+ */
+export function readSize(capture: Capture): number | null {
+  const value = capture.size_bytes ?? capture.metrics?.storage_bytes;
+  return typeof value === 'number' ? value : null;
+}
+
+export interface GrowthReading {
+  /** `null` when the window is not full yet OR size is unknown. */
+  bytes: number | null;
+  /** Span (ms) between oldest and newest non-null sample. */
+  windowMs: number;
+  /** `true` when the backend reports a size for this capture. */
+  sizeKnown: boolean;
+}
+
+/**
+ * Reduce a per-capture sample history to a growth reading. Pure function
+ * so tests can lock the semantics without rendering.
+ */
+export function computeGrowth(samples: GrowthSample[]): GrowthReading {
+  const nonNull = samples.filter((s): s is GrowthSample & { size: number } => s.size !== null);
+  if (nonNull.length === 0) {
+    return { bytes: null, windowMs: 0, sizeKnown: false };
+  }
+  if (nonNull.length === 1) {
+    return { bytes: null, windowMs: 0, sizeKnown: true };
+  }
+  const first = nonNull[0];
+  const last = nonNull[nonNull.length - 1];
+  const windowMs = last.timestamp - first.timestamp;
+  if (windowMs < GROWTH_WINDOW_MS) {
+    return { bytes: null, windowMs, sizeKnown: true };
+  }
+  return { bytes: last.size - first.size, windowMs, sizeKnown: true };
+}
+
+/**
+ * A capture is "stalled" when either the backend state is a transition
+ * state (STARTING / STOPPING) OR we have a complete 10 s window with 0 B
+ * of growth. "Not yet measured" is NEVER stalled.
+ */
+export function isStalled(state: string | null | undefined, growth: GrowthReading): boolean {
+  if (STALL_STATES.includes(state ?? '')) return true;
+  if (!growth.sizeKnown) return false;
+  if (growth.bytes === null) return false;
+  return growth.bytes === 0 && growth.windowMs >= GROWTH_WINDOW_MS;
 }
 
 export function LiveCapturesPage() {
@@ -51,10 +105,11 @@ export function LiveCapturesPage() {
   const [selectedInterfaces, setSelectedInterfaces] = useState<string[]>([]);
   const [duration, setDuration] = useState(60);
 
-  // Growth tracking: keep a 10 s sliding window of (timestamp, size) per
-  // capture. useCaptures polls every 4 s so we normally get 2–3 samples,
-  // enough to display a 10 s growth number. Values are not stored across
-  // page reloads — strictly in-memory.
+  // Growth tracking is keyed on TanStack Query's `dataUpdatedAt`: each new
+  // fetch means a fresh backend reading, so we take exactly one sample per
+  // observation. The ref keeps the sliding window; a bump tick triggers a
+  // re-read for the memoized derivations. Nothing is persisted across page
+  // reloads.
   const historyRef = useRef<Map<string, GrowthSample[]>>(new Map());
   const [growthTick, setGrowthTick] = useState(0);
 
@@ -67,47 +122,55 @@ export function LiveCapturesPage() {
   );
 
   useEffect(() => {
-    const history = historyRef.current;
+    // Only sample when the backend actually gave us a fresh update.
+    if (!captures.dataUpdatedAt) return;
     const now = Date.now();
+    const history = historyRef.current;
     const liveIds = new Set(live.map((capture) => capture.capture_id));
     for (const capture of live) {
       const key = capture.capture_id;
       const samples = history.get(key) ?? [];
       samples.push({ timestamp: now, size: readSize(capture) });
-      // Keep only the last 10 s.
-      const cutoff = now - 10_000;
+      // Keep a little more than the growth window so the oldest sample
+      // stays within reach when the newest arrives.
+      const cutoff = now - SAMPLE_RETENTION_MS;
       while (samples.length > 1 && samples[0].timestamp < cutoff) samples.shift();
       history.set(key, samples);
     }
-    // Drop histories for captures that are no longer live.
     for (const key of Array.from(history.keys())) {
       if (!liveIds.has(key)) history.delete(key);
     }
     setGrowthTick((tick) => tick + 1);
-  }, [live]);
+    // live is captured through the dependency on captures.dataUpdatedAt.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [captures.dataUpdatedAt]);
 
   const growthByCapture = useMemo(() => {
-    const map = new Map<string, number>();
-    const history = historyRef.current;
-    for (const [key, samples] of history) {
-      if (samples.length < 2) {
-        map.set(key, 0);
-        continue;
-      }
-      map.set(key, samples[samples.length - 1].size - samples[0].size);
+    const map = new Map<string, GrowthReading>();
+    for (const [key, samples] of historyRef.current) {
+      map.set(key, computeGrowth(samples));
     }
     return map;
     // growthTick is the deterministic trigger that re-reads the ref.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [growthTick]);
 
-  const totalGrowth10s = Array.from(growthByCapture.values()).reduce(
-    (sum, value) => sum + value,
-    0,
+  const measurableGrowths = Array.from(growthByCapture.values()).filter(
+    (reading): reading is GrowthReading & { bytes: number } => reading.bytes !== null,
   );
+  const totalGrowthKnown = measurableGrowths.length > 0;
+  const totalGrowthBytes = measurableGrowths.reduce((sum, reading) => sum + reading.bytes, 0);
+  const measuringCount = live.filter(
+    (capture) => (growthByCapture.get(capture.capture_id)?.bytes ?? null) === null,
+  ).length;
+
   const stalledCount = live.filter((capture) => {
-    const growth = growthByCapture.get(capture.capture_id) ?? 0;
-    return STALL_STATES.includes(capture.state ?? '') || (ACTIVE_STATES.includes(capture.state ?? '') && growth === 0);
+    const growth = growthByCapture.get(capture.capture_id) ?? {
+      bytes: null,
+      windowMs: 0,
+      sizeKnown: readSize(capture) !== null,
+    };
+    return isStalled(capture.state, growth);
   }).length;
 
   const diskPercent = disk.data?.filesystem?.usage_percent ?? null;
@@ -140,9 +203,15 @@ export function LiveCapturesPage() {
         data-testid="live-capture-stats"
       >
         <StatCard
-          label="Written · 10s"
-          value={bytes(totalGrowth10s)}
-          detail={`${live.length} active capture${live.length === 1 ? '' : 's'}`}
+          label="Written · 10 s"
+          value={totalGrowthKnown ? bytes(totalGrowthBytes) : 'measuring…'}
+          detail={
+            live.length === 0
+              ? 'No active capture'
+              : measuringCount > 0
+                ? `${live.length} active · ${measuringCount} measuring`
+                : `${live.length} active capture${live.length === 1 ? '' : 's'}`
+          }
         />
         <StatCard
           label="Capturing"
@@ -152,7 +221,11 @@ export function LiveCapturesPage() {
         <StatCard
           label="Stalled"
           value={count(stalledCount)}
-          detail="Active jobs with 0 B growth in 10 s"
+          detail={
+            stalledCount === 0
+              ? 'No stalled job (needs ≥ 10 s window)'
+              : 'Active jobs with 0 B growth over ≥ 10 s'
+          }
           tone={stalledCount > 0 ? 'warning' : undefined}
         />
         <DiskCard
@@ -262,10 +335,14 @@ export function LiveCapturesPage() {
       <div className="grid gap-4" data-testid="live-capture-list">
         {live.map((capture) => {
           const metrics = capture.metrics;
-          const growth = growthByCapture.get(capture.capture_id) ?? 0;
-          const stalled =
-            STALL_STATES.includes(capture.state ?? '') ||
-            (ACTIVE_STATES.includes(capture.state ?? '') && growth === 0);
+          const size = readSize(capture);
+          const growth = growthByCapture.get(capture.capture_id) ?? {
+            bytes: null,
+            windowMs: 0,
+            sizeKnown: size !== null,
+          };
+          const stalled = isStalled(capture.state, growth);
+          const growthLabel = formatGrowthLabel(growth);
           return (
             <article
               key={capture.capture_id}
@@ -286,7 +363,7 @@ export function LiveCapturesPage() {
                   <StatusIndicator state={capture.state ?? 'UNKNOWN'} />
                   {stalled && (
                     <span className="ep-badge border-warning/40 text-warning">
-                      <AlertTriangle width={11} height={11} /> stalled 10 s
+                      <AlertTriangle width={11} height={11} /> stalled ≥ 10 s
                     </span>
                   )}
                 </div>
@@ -326,14 +403,14 @@ export function LiveCapturesPage() {
                 <dd className="num">{pps(metrics?.packets_per_second)}</dd>
                 <dt className="text-text-secondary">Bitrate</dt>
                 <dd className="num">{bits(metrics?.bits_per_second)}</dd>
-                <dt className="text-text-secondary">Growth · 10 s</dt>
+                <dt className="text-text-secondary">{growthLabel.header}</dt>
                 <dd className="num" data-testid={`growth-${capture.capture_id}`}>
-                  {bytes(growth)}
+                  {growthLabel.value}
                 </dd>
                 <dt className="text-text-secondary">Drops</dt>
                 <dd className="num">{count(metrics?.packet_drops)}</dd>
                 <dt className="text-text-secondary">Storage</dt>
-                <dd className="num">{bytes(metrics?.storage_bytes)}</dd>
+                <dd className="num">{size == null ? '—' : bytes(size)}</dd>
                 <dt className="text-text-secondary">Decode errors</dt>
                 <dd className="num">{count(metrics?.decode_errors)}</dd>
               </dl>
@@ -378,6 +455,19 @@ export function LiveCapturesPage() {
       </div>
     </>
   );
+}
+
+function formatGrowthLabel(growth: GrowthReading): { header: string; value: string } {
+  if (!growth.sizeKnown) {
+    return { header: 'Growth · 10 s', value: '—' };
+  }
+  if (growth.bytes === null) {
+    const seconds = growth.windowMs / 1000;
+    const detail = seconds > 0 ? ` (${seconds.toFixed(1)} s)` : '';
+    return { header: 'Growth · 10 s', value: `measuring…${detail}` };
+  }
+  const seconds = Math.max(10, growth.windowMs / 1000);
+  return { header: `Growth · ${seconds.toFixed(1)} s`, value: bytes(growth.bytes) };
 }
 
 function StatCard({
