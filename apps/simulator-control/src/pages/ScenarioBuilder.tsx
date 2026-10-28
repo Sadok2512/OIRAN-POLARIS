@@ -1,0 +1,310 @@
+import { useEffect, useMemo, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import {
+  AlertTriangle,
+  ArrowDown,
+  ArrowLeft,
+  ArrowUp,
+  CheckCircle2,
+  Copy,
+  Plus,
+  Save,
+  Trash2,
+} from 'lucide-react';
+import { PageHeader } from '@/ui/PageHeader';
+import { EmptyState } from '@/ui/EmptyErrorLoading';
+import { useScenarios } from '@/scenarios/store';
+import {
+  PARAM_META,
+  STEP_METADATA,
+  emptyScenario,
+  newStepId,
+  validateScenario,
+  type FixedOrRandom,
+  type LoopMode,
+  type Scenario,
+  type ScenarioStep,
+  type ScenarioStepKind,
+  type StepParams,
+} from '@/scenarios/model';
+import { StepEditor } from '@/components/StepEditor';
+import { LoopEditor } from '@/components/LoopEditor';
+import { ScenarioTimeline } from '@/components/ScenarioTimeline';
+
+export function ScenarioBuilderPage() {
+  const { scenarioId } = useParams<{ scenarioId: string }>();
+  const navigate = useNavigate();
+  const library = useScenarios();
+
+  const [draft, setDraft] = useState<Scenario>(() => {
+    const existing = scenarioId
+      ? library.scenarios.find((item) => item.id === scenarioId)
+      : null;
+    return existing ?? emptyScenario();
+  });
+
+  useEffect(() => {
+    if (!scenarioId) return;
+    const existing = library.scenarios.find((item) => item.id === scenarioId);
+    if (existing) setDraft(existing);
+  }, [scenarioId, library.scenarios]);
+
+  const issues = useMemo(() => validateScenario(draft), [draft]);
+  const errors = issues.filter((issue) => issue.level === 'error');
+
+  function updateDraft(update: Partial<Scenario>) {
+    setDraft((prev) => ({ ...prev, ...update }));
+  }
+
+  function addStep(kind: ScenarioStepKind) {
+    const defaultParams: StepParams = {};
+    const paramKeys = STEP_METADATA[kind].defaultParams ?? [];
+    for (const key of paramKeys) {
+      const paramMeta = PARAM_META[key as keyof StepParams];
+      defaultParams[key as keyof StepParams] = { mode: 'fixed', value: paramMeta.min };
+    }
+    const step: ScenarioStep = { id: newStepId(), kind, params: defaultParams };
+    setDraft((prev) => ({ ...prev, steps: [...prev.steps, step] }));
+  }
+
+  function updateStep(stepId: string, patch: Partial<ScenarioStep>) {
+    setDraft((prev) => ({
+      ...prev,
+      steps: prev.steps.map((step) => (step.id === stepId ? { ...step, ...patch } : step)),
+    }));
+  }
+
+  function removeStep(stepId: string) {
+    setDraft((prev) => ({
+      ...prev,
+      steps: prev.steps.filter((step) => step.id !== stepId),
+    }));
+  }
+
+  function duplicateStep(stepId: string) {
+    setDraft((prev) => {
+      const source = prev.steps.find((step) => step.id === stepId);
+      if (!source) return prev;
+      const index = prev.steps.findIndex((step) => step.id === stepId);
+      const copy: ScenarioStep = { ...source, id: newStepId(), params: { ...source.params } };
+      const next = [...prev.steps];
+      next.splice(index + 1, 0, copy);
+      return { ...prev, steps: next };
+    });
+  }
+
+  function moveStep(stepId: string, direction: -1 | 1) {
+    setDraft((prev) => {
+      const index = prev.steps.findIndex((step) => step.id === stepId);
+      if (index < 0) return prev;
+      const next = [...prev.steps];
+      const target = index + direction;
+      if (target < 0 || target >= next.length) return prev;
+      [next[index], next[target]] = [next[target], next[index]];
+      return { ...prev, steps: next };
+    });
+  }
+
+  function updateParam(stepId: string, key: keyof StepParams, value: FixedOrRandom | undefined) {
+    setDraft((prev) => ({
+      ...prev,
+      steps: prev.steps.map((step) =>
+        step.id !== stepId
+          ? step
+          : {
+              ...step,
+              params: value ? { ...step.params, [key]: value } : removeKey(step.params, key),
+            },
+      ),
+    }));
+  }
+
+  function save() {
+    if (errors.length > 0) return;
+    const saved = library.save(draft);
+    setDraft(saved);
+    navigate(`/scenarios/${saved.id}/edit`, { replace: true });
+  }
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="Workflows"
+        title="Scenario Builder"
+        description="Design a reusable scenario. Steps are declarative — randomization and loop execution run server-side once the matching backend contract exists. Backend-unsupported steps surface an honest 'Backend support required' notice."
+        actions={
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              className="ep-button"
+              onClick={() => navigate('/scenarios')}
+              data-testid="builder-back"
+            >
+              <ArrowLeft width={14} height={14} aria-hidden="true" />
+              Back to library
+            </button>
+            <button
+              type="button"
+              className="ep-button ep-button-primary"
+              onClick={save}
+              disabled={errors.length > 0}
+              data-testid="builder-save"
+              title={errors.length > 0 ? 'Fix validation errors first' : undefined}
+            >
+              <Save width={14} height={14} aria-hidden="true" />
+              Save scenario
+            </button>
+          </div>
+        }
+      />
+
+      <section className="ep-card p-5 mb-4 grid gap-3 md:grid-cols-2">
+        <label className="flex flex-col gap-1">
+          <span className="text-ep-xs uppercase tracking-wider text-text-secondary">Name</span>
+          <input
+            className="ep-input"
+            value={draft.name}
+            onChange={(event) => updateDraft({ name: event.target.value })}
+            data-testid="scenario-name"
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-ep-xs uppercase tracking-wider text-text-secondary">Version</span>
+          <input className="ep-input mono" value={`v${draft.version}`} readOnly />
+        </label>
+        <label className="flex flex-col gap-1 md:col-span-2">
+          <span className="text-ep-xs uppercase tracking-wider text-text-secondary">Description</span>
+          <textarea
+            className="ep-input py-2 h-20 resize-none"
+            value={draft.description ?? ''}
+            onChange={(event) => updateDraft({ description: event.target.value })}
+            data-testid="scenario-description"
+          />
+        </label>
+      </section>
+
+      <section className="ep-card p-5 mb-4">
+        <h2 className="text-ep-md font-semibold mb-2">Loop configuration</h2>
+        <p className="text-ep-xs text-text-secondary mb-3">
+          Random cycle count is sampled once per scenario run. Infinite loops require a manual Stop and server-side execution limits.
+        </p>
+        <LoopEditor loop={draft.loop} onChange={(loop: LoopMode) => updateDraft({ loop })} />
+      </section>
+
+      <section className="ep-card p-5 mb-4">
+        <header className="flex items-center justify-between mb-3">
+          <h2 className="text-ep-md font-semibold">Steps · {draft.steps.length}</h2>
+          <div className="flex flex-wrap gap-1" data-testid="step-palette">
+            {(Object.keys(STEP_METADATA) as ScenarioStepKind[]).map((kind) => (
+              <button
+                key={kind}
+                type="button"
+                className="ep-badge cursor-pointer hover:bg-primary/10"
+                onClick={() => addStep(kind)}
+                title={`Add ${STEP_METADATA[kind].label}`}
+                data-testid={`add-step-${kind}`}
+              >
+                <Plus width={10} height={10} />
+                {STEP_METADATA[kind].label}
+              </button>
+            ))}
+          </div>
+        </header>
+
+        {draft.steps.length === 0 ? (
+          <EmptyState title="No step yet" description="Add steps from the palette above." />
+        ) : (
+          <ol className="flex flex-col gap-2">
+            {draft.steps.map((step, index) => (
+              <li key={step.id} className="border border-border rounded-md" data-testid={`step-row-${step.id}`}>
+                <StepEditor
+                  index={index + 1}
+                  step={step}
+                  onUpdate={(patch) => updateStep(step.id, patch)}
+                  onParam={(key, value) => updateParam(step.id, key, value)}
+                  actions={
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        className="ep-button ep-button-sm"
+                        onClick={() => moveStep(step.id, -1)}
+                        disabled={index === 0}
+                        aria-label="Move step up"
+                        data-testid={`step-up-${step.id}`}
+                      >
+                        <ArrowUp width={13} height={13} />
+                      </button>
+                      <button
+                        type="button"
+                        className="ep-button ep-button-sm"
+                        onClick={() => moveStep(step.id, 1)}
+                        disabled={index === draft.steps.length - 1}
+                        aria-label="Move step down"
+                        data-testid={`step-down-${step.id}`}
+                      >
+                        <ArrowDown width={13} height={13} />
+                      </button>
+                      <button
+                        type="button"
+                        className="ep-button ep-button-sm"
+                        onClick={() => duplicateStep(step.id)}
+                        aria-label="Duplicate step"
+                        data-testid={`step-duplicate-${step.id}`}
+                      >
+                        <Copy width={13} height={13} />
+                      </button>
+                      <button
+                        type="button"
+                        className="ep-button ep-button-sm ep-button-danger"
+                        onClick={() => removeStep(step.id)}
+                        aria-label="Remove step"
+                        data-testid={`step-remove-${step.id}`}
+                      >
+                        <Trash2 width={13} height={13} />
+                      </button>
+                    </div>
+                  }
+                />
+              </li>
+            ))}
+          </ol>
+        )}
+      </section>
+
+      <section className="ep-card p-5 mb-4">
+        <h2 className="text-ep-md font-semibold mb-2">Timeline preview</h2>
+        <ScenarioTimeline scenario={draft} />
+      </section>
+
+      <section className="ep-card p-5">
+        <h2 className="text-ep-md font-semibold mb-2">Validation</h2>
+        {issues.length === 0 ? (
+          <p className="flex items-center gap-2 text-ep-sm text-success">
+            <CheckCircle2 width={14} height={14} /> Scenario is valid.
+          </p>
+        ) : (
+          <ul className="flex flex-col gap-1 text-ep-sm" data-testid="validation-issues">
+            {issues.map((issue, index) => (
+              <li
+                key={`${issue.path}-${index}`}
+                className={`flex items-start gap-2 ${issue.level === 'error' ? 'text-error' : 'text-warning'}`}
+              >
+                <AlertTriangle width={13} height={13} className="mt-0.5 shrink-0" />
+                <span>
+                  <code className="mono text-ep-xs mr-2">{issue.path}</code>
+                  {issue.message}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </>
+  );
+}
+
+function removeKey<T extends object>(object: T, key: keyof T): T {
+  const next = { ...object };
+  delete next[key];
+  return next;
+}
