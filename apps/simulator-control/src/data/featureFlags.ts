@@ -65,7 +65,7 @@ export interface FeatureFlags {
 const DEFAULTS: FeatureFlags = {
   scenarioBackend: true,
   profileBackend: false,
-  scenarioTemplates: false,
+  scenarioTemplates: true,
   polarisProvisioning: true,
 };
 
