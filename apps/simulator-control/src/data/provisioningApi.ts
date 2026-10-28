@@ -64,7 +64,13 @@ export function useOwners() {
   const enabled = useFeatureFlag('polarisProvisioning');
   return useQuery({
     queryKey: ['polaris', 'owners'],
-    queryFn: () => polarisApi<OwnerList>('/owners'),
+    queryFn: async () => {
+      const body = await polarisApi<{ items: string[] }>('/owners');
+      return {
+        items: body.items.map((owner) => ({ id: owner, name: owner, role: owner, email: null })),
+        total: body.items.length,
+      } satisfies OwnerList;
+    },
     enabled,
     staleTime: enabled ? 60_000 : Infinity,
     retry: false,
@@ -75,7 +81,16 @@ export function usePlmns() {
   const enabled = useFeatureFlag('polarisProvisioning');
   return useQuery({
     queryKey: ['polaris', 'plmns'],
-    queryFn: () => polarisApi<PlmnList>('/plmns'),
+    queryFn: async () => {
+      const body = await polarisApi<{ items: string[] }>('/plmns');
+      return {
+        items: body.items.map((plmn) => {
+          const [mcc = '', mnc = ''] = plmn.split('-', 2);
+          return { id: plmn, mcc, mnc, display_name: plmn, home_network: true };
+        }),
+        total: body.items.length,
+      } satisfies PlmnList;
+    },
     enabled,
     staleTime: enabled ? 60_000 : Infinity,
     retry: false,
@@ -86,7 +101,13 @@ export function useDnns() {
   const enabled = useFeatureFlag('polarisProvisioning');
   return useQuery({
     queryKey: ['polaris', 'dnns'],
-    queryFn: () => polarisApi<DnnList>('/dnns'),
+    queryFn: async () => {
+      const body = await polarisApi<{ items: string[] }>('/dnns');
+      return {
+        items: body.items.map((dnn) => ({ id: dnn, dnn, sst: 0, sd: null, description: dnn })),
+        total: body.items.length,
+      } satisfies DnnList;
+    },
     enabled,
     staleTime: enabled ? 60_000 : Infinity,
     retry: false,
@@ -148,7 +169,23 @@ export async function uploadCsvImport(
     }
     throw new ApiError(response.status, code, `HTTP ${response.status} ${code}`);
   }
-  return (await response.json()) as CsvImportReport;
+  const payload = (await response.json()) as {
+    ok: number;
+    errors: number;
+    results: { row: number; ok: boolean; error?: string | null }[];
+  };
+  return {
+    total: payload.ok + payload.errors,
+    accepted: payload.ok,
+    rejected: payload.errors,
+    errors: payload.results
+      .filter((row) => !row.ok)
+      .map((row) => ({
+        line: row.row,
+        code: row.error ?? 'ROW_REJECTED',
+        message: row.error ?? 'ROW_REJECTED',
+      })),
+  };
 }
 
 /**
@@ -168,16 +205,11 @@ export interface SubscriberCreateInput {
 }
 
 export interface SubscriberCreateResponse {
-  slot_id: string;
-  subscriber_id: string;
-  imsi: 'PROTECTED';
-  k: 'PROTECTED';
-  opc: 'PROTECTED';
-  sst: number;
-  sd: string | null;
-  dnns: string[];
-  ambr: { uplink: number; downlink: number };
-  created_at_epoch_s: number;
+  slot: string;
+  state: 'PROVISIONED';
+  subscriber_identity: 'PROTECTED';
+  authentication_material: 'PROTECTED';
+  open5gs_changed: boolean;
 }
 
 export async function createSubscriber(

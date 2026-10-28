@@ -10,6 +10,12 @@ Codex on polaris-control-api **0.15.1 (`fc6d8ed`)**. The 0.6.0 stubs
 (/provisioning/import, /ue-profiles/import, multipart form data) are
 gone; the UI now hits the real endpoints with the exact body shapes.
 
+The integrated release also preserves the V2 scenario wire contract,
+production base paths, live-locked template cloning, and adds an
+authenticated production test for one protected subscriber plus a
+two-row `/subscribers/bulk` import. Test credentials and subscriber
+secrets are injected through the process environment and never logged.
+
 ### Changed
 
 - **`POST /subscribers/bulk`** replaces `/provisioning/import`. Body is

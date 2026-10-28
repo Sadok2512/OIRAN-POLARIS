@@ -16,7 +16,7 @@ import {
   type SubscriberCreateResponse,
 } from '@/data/provisioningApi';
 
-const IMSI_RE = /^imsi-\d{5,15}$/;
+const IMSI_RE = /^\d{15}$/;
 const HEX32 = /^[0-9a-fA-F]{32}$/;
 
 interface State {
@@ -172,11 +172,11 @@ export function AddSubscriberDialog({
 
         <SecretField
           label="IMSI"
-          placeholder="imsi-208930000000001"
+          placeholder="208930000000001"
           value={state.imsi}
           onChange={(value) => setState((prev) => ({ ...prev, imsi: value }))}
           invalid={imsiInvalid}
-          hint="Format: imsi-<5-15 digits>"
+          hint="Format: exactly 15 digits"
           testid="subscriber-imsi"
           onBlur={() => setState((prev) => ({ ...prev, touched: true }))}
         />
@@ -312,7 +312,7 @@ export function AddSubscriberDialog({
           >
             <p>
               <strong>Subscriber created</strong> · slot{' '}
-              <span className="mono">{created.slot_id}</span>
+              <span className="mono">{created.slot}</span>
             </p>
             <p className="text-ep-xs text-text-secondary flex items-center gap-1">
               <Lock width={11} height={11} /> IMSI / K / OPc stored on the backend as

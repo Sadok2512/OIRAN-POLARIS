@@ -11,8 +11,8 @@ import userEvent from '@testing-library/user-event';
 import { CsvImportDialog } from './CsvImportDialog';
 
 function makeCsv(lines: number): File {
-  const header = 'subscriber_id,owner,imsi';
-  const row = 'sub-x,ops-nancy,imsi-208930000000000';
+  const header = 'imsi,k,opc,sst,sd,dnns,ambr_uplink,ambr_downlink';
+  const row = '208930000000000,00112233445566778899aabbccddeeff,ffeeddccbbaa99887766554433221100,1,010203,internet,1000000,2000000';
   const text = `${header}\n${Array.from({ length: lines - 1 }, () => row).join('\n')}`;
   const file = new File([text], 'subs.csv', { type: 'text/csv' });
   Object.defineProperty(file, 'text', { value: async () => text });
@@ -39,12 +39,11 @@ beforeEach(() => {
     // 0.6.1 — real contract: POST /subscribers/bulk (text/csv body).
     if (url.endsWith('/subscribers/bulk')) {
       return respond(200, {
-        total: 10,
-        accepted: 8,
-        rejected: 2,
-        errors: [
-          { line: 3, code: 'SUBSCRIBER_NOT_POLARIS_OWNED', message: 'IMSI belongs to a non-POLARIS subscriber' },
-          { line: 7, code: 'SUBSCRIBER_NOT_PROVISIONED', message: 'subscriber not registered yet' },
+        ok: 8,
+        errors: 2,
+        results: [
+          { row: 3, ok: false, error: 'SUBSCRIBER_NOT_POLARIS_OWNED' },
+          { row: 7, ok: false, error: 'SUBSCRIBER_NOT_PROVISIONED' },
         ],
       });
     }
@@ -86,7 +85,7 @@ describe('CsvImportDialog', () => {
     );
     expect(uploadCall).toBeDefined();
     expect(uploadCall?.headers.get('content-type')).toBe('text/csv');
-    expect(uploadCall?.body).toContain('subscriber_id,owner,imsi');
+    expect(uploadCall?.body).toContain('imsi,k,opc,sst,sd,dnns,ambr_uplink,ambr_downlink');
   });
 
   it('refuses to upload a file over the 100 000-row cap and never POSTs', async () => {

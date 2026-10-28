@@ -52,7 +52,7 @@ afterEach(() => {
 });
 
 async function fillValid(user: ReturnType<typeof userEvent.setup>) {
-  await user.type(screen.getByTestId('subscriber-imsi'), 'imsi-208930000000001');
+  await user.type(screen.getByTestId('subscriber-imsi'), '208930000000001');
   await user.type(
     screen.getByTestId('subscriber-k'),
     '0a1b2c3d4e5f60718293a4b5c6d7e8f9',
@@ -72,16 +72,11 @@ describe('AddSubscriberDialog', () => {
     stubFetch((call) =>
       call.method === 'POST' && call.url.endsWith('/subscribers')
         ? respond(201, {
-            slot_id: 'slot-01',
-            subscriber_id: 'sub-abc-01',
-            imsi: 'PROTECTED',
-            k: 'PROTECTED',
-            opc: 'PROTECTED',
-            sst: 1,
-            sd: null,
-            dnns: ['internet', 'ims'],
-            ambr: { uplink: 1_048_576, downlink: 1_048_576 },
-            created_at_epoch_s: 1_793_200_000,
+            slot: 'SUB-000000000001',
+            state: 'PROVISIONED',
+            subscriber_identity: 'PROTECTED',
+            authentication_material: 'PROTECTED',
+            open5gs_changed: true,
           })
         : respond(404, { error: 'not stubbed' }),
     );
@@ -95,7 +90,7 @@ describe('AddSubscriberDialog', () => {
     expect(post).toBeDefined();
     expect(post?.contentType).toBe('application/json');
     expect(post?.body).toEqual({
-      imsi: 'imsi-208930000000001',
+      imsi: '208930000000001',
       k: '0a1b2c3d4e5f60718293a4b5c6d7e8f9',
       opc: 'ffeeddccbbaa99887766554433221100',
       sst: 1,
@@ -108,7 +103,7 @@ describe('AddSubscriberDialog', () => {
     expect(screen.getByTestId('subscriber-k')).toHaveValue('');
     expect(screen.getByTestId('subscriber-opc')).toHaveValue('');
     // Response surfaces slot id and the PROTECTED banner.
-    expect(screen.getByTestId('add-subscriber-created')).toHaveTextContent('slot-01');
+    expect(screen.getByTestId('add-subscriber-created')).toHaveTextContent('SUB-000000000001');
     expect(screen.getByTestId('add-subscriber-created')).toHaveTextContent('PROTECTED');
   });
 

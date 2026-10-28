@@ -20,11 +20,14 @@ import { ApiError } from '@shared/api';
 import { useQueryClient } from '@tanstack/react-query';
 
 interface Subscriber {
-  subscriber_id: string;
-  owner: string;
-  imsi: 'PROTECTED';
-  provisioning_status: string;
-  updated_at_epoch_s: number;
+  slot: string;
+  state: string;
+  subscriber_identity: 'PROTECTED';
+  authentication_material: 'PROTECTED';
+  plmn: { mcc: string; mnc: string };
+  snssai: { sst: number; sd: string | null };
+  dnns: string[];
+  ambr: { uplink: number; downlink: number };
 }
 
 interface SubscriberList {
@@ -110,21 +113,25 @@ export function ProvisioningPage() {
             <table className="ep-table" data-testid="provisioning-subscribers">
               <thead>
                 <tr>
-                  <th>Subscriber id</th>
-                  <th>Owner</th>
-                  <th>IMSI</th>
+                  <th>Slot</th>
                   <th>Status</th>
-                  <th>Updated</th>
+                  <th>Identity</th>
+                  <th>PLMN</th>
+                  <th>S-NSSAI</th>
+                  <th>DNNs</th>
+                  <th>AMBR UL / DL</th>
                 </tr>
               </thead>
               <tbody>
                 {subscribers.data.items.map((item) => (
-                  <tr key={item.subscriber_id} data-testid={`subscriber-row-${item.subscriber_id}`}>
-                    <td className="mono">{item.subscriber_id}</td>
-                    <td>{item.owner}</td>
-                    <td className="mono">{item.imsi}</td>
-                    <td>{item.provisioning_status}</td>
-                    <td className="num">{item.updated_at_epoch_s}</td>
+                  <tr key={item.slot} data-testid={`subscriber-row-${item.slot}`}>
+                    <td className="mono">{item.slot}</td>
+                    <td>{item.state}</td>
+                    <td className="mono">{item.subscriber_identity}</td>
+                    <td className="mono">{item.plmn.mcc}/{item.plmn.mnc}</td>
+                    <td className="mono">{item.snssai.sst}/{item.snssai.sd ?? '—'}</td>
+                    <td>{item.dnns.join(', ')}</td>
+                    <td className="num">{item.ambr.uplink} / {item.ambr.downlink}</td>
                   </tr>
                 ))}
               </tbody>
