@@ -7,6 +7,7 @@ the implementation goes into the real apps with the existing `packages/ui` token
 
 | File | Target app | Screens |
 |---|---|---|
+| `portal.html` | `apps/portal` (:8020/portal/) | 3 bricks: POLARIS Control, Probe Manager, OIRAN Analyzer — same layout as today, new names/taglines/scope chips |
 | `probe-manager.html` | `apps/probe-manager` | Overview, Probes (multi-interface + inspector), Register probe dialog, Interfaces, Live captures, Capture library, Preferences |
 | `polaris-control.html` | `apps/simulator-control` | Console, Topology, Core · Open5GS (functions / config / subscribers), gNodeBs, UE Manager, Scenarios, Execution monitor, History |
 
