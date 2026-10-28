@@ -51,10 +51,10 @@ describe('UeProvisioningAddDialog', () => {
     expect(screen.getByTestId('ue-add-imsi')).toHaveAttribute('type', 'password');
   });
 
-  it('refuses to submit without a valid imsi-<digits> and surfaces the hint', async () => {
+  it('refuses to submit without a 15-digit IMSI and surfaces the hint', async () => {
     const user = userEvent.setup();
     renderDialog();
-    await user.type(screen.getByTestId('ue-add-name'), 'UE under test');
+    await user.type(screen.getByTestId('ue-add-name'), 'UE-09');
     await user.selectOptions(screen.getByTestId('ue-add-gnb'), 'GNB-01');
     await user.selectOptions(screen.getByTestId('ue-add-owner'), 'ops-nancy');
     const imsi = screen.getByTestId('ue-add-imsi');
@@ -67,19 +67,19 @@ describe('UeProvisioningAddDialog', () => {
   it('forwards values to onSubmit and clears IMSI from the input after submit', async () => {
     const user = userEvent.setup();
     const { onSubmit } = renderDialog();
-    await user.type(screen.getByTestId('ue-add-name'), 'UE under test');
+    await user.type(screen.getByTestId('ue-add-name'), 'UE-09');
     await user.selectOptions(screen.getByTestId('ue-add-gnb'), 'GNB-01');
     await user.selectOptions(screen.getByTestId('ue-add-owner'), 'ops-nancy');
     await user.type(screen.getByTestId('ue-add-note'), 'provisioning hand-off');
-    await user.type(screen.getByTestId('ue-add-imsi'), 'imsi-208930000000001');
+    await user.type(screen.getByTestId('ue-add-imsi'), '208930000000001');
     await user.click(screen.getByTestId('ue-add-submit'));
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith({
-        name: 'UE under test',
+        ue_id: 'UE-09',
         serving_gnb: 'GNB-01',
         owner: 'ops-nancy',
         note: 'provisioning hand-off',
-        imsi: 'imsi-208930000000001',
+        imsi: '208930000000001',
       }),
     );
     expect(screen.getByTestId('ue-add-imsi')).toHaveValue('');

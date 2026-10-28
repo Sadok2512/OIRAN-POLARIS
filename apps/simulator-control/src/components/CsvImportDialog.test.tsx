@@ -34,14 +34,13 @@ beforeEach(() => {
     const url = typeof input === 'string' ? input : input.toString();
     const method = (init?.method ?? 'GET').toUpperCase();
     calls.push({ method, url });
-    if (url.endsWith('/provisioning/import')) {
+    if (url.endsWith('/subscribers/bulk')) {
       return respond(200, {
-        total: 10,
-        accepted: 8,
-        rejected: 2,
-        errors: [
-          { line: 3, code: 'DUPLICATE_IMSI', message: 'imsi already provisioned' },
-          { line: 7, code: 'INVALID_PLMN', message: 'MCC/MNC pair not approved' },
+        ok: 8,
+        errors: 2,
+        results: [
+          { row: 3, ok: false, error: 'DUPLICATE_IMSI' },
+          { row: 7, ok: false, error: 'INVALID_PLMN' },
         ],
       });
     }
@@ -77,7 +76,7 @@ describe('CsvImportDialog', () => {
     expect(screen.getByTestId('csv-import-error-3')).toHaveTextContent('DUPLICATE_IMSI');
     expect(screen.getByTestId('csv-import-error-7')).toHaveTextContent('INVALID_PLMN');
 
-    const uploadCall = calls.find((c) => c.method === 'POST' && c.url.endsWith('/provisioning/import'));
+    const uploadCall = calls.find((c) => c.method === 'POST' && c.url.endsWith('/subscribers/bulk'));
     expect(uploadCall).toBeDefined();
   });
 

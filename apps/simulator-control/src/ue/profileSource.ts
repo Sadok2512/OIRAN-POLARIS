@@ -11,6 +11,7 @@ import { useFeatureFlag } from '@/data/featureFlags';
 import {
   bulkCreateUeProfiles,
   cloneUeProfile,
+  createSubscriberBoundUeProfile,
   createUeProfile,
   deleteUeProfile,
   fetchAllUeProfiles,
@@ -24,6 +25,7 @@ import {
   type WireProvisioningSlot,
   type WireUeProfile,
   type WireUeProfileMutation,
+  type WireSubscriberBoundProfileMutation,
 } from '@/data/profileApi';
 import type { UeProfileRecord } from './profileModel';
 
@@ -56,6 +58,7 @@ export interface BackendProfileSource {
   slotsError: Error | null;
   gnbs: WireGnb[];
   create: (body: WireUeProfileMutation) => Promise<WireUeProfile>;
+  createBySubscriber: (body: WireSubscriberBoundProfileMutation) => Promise<WireUeProfile>;
   update: (ueId: string, body: WireUeProfileMutation) => Promise<WireUeProfile>;
   clone: (ueId: string, targetUeId: string) => Promise<WireUeProfile>;
   remove: (ueIds: string[]) => Promise<{ deleted: number; failures: string[] }>;
@@ -110,6 +113,7 @@ export function useBackendProfiles(): BackendProfileSource {
     slotsError: (slots.error as Error | null) ?? null,
     gnbs: gnbs.data?.items ?? [],
     create: (body) => withRefresh(createUeProfile(body)),
+    createBySubscriber: (body) => withRefresh(createSubscriberBoundUeProfile(body)),
     update: (ueId, body) => withRefresh(updateUeProfile(ueId, body)),
     clone: (ueId, target) => withRefresh(cloneUeProfile(ueId, target)),
     remove: (ueIds) =>

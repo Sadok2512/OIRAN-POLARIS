@@ -219,24 +219,14 @@ export function UeManagerPage() {
     setProvisioningAddError(null);
     setProvisioningAddSubmitting(true);
     try {
-      const body: WireUeProfileMutation = {
-        ue_id: '',
-        name: values.name,
-        supi: values.imsi,
-        authentication_key: null,
-        opc: null,
-        plmn_mcc: '',
-        plmn_mnc: '',
-        dnn: '',
-        sst: 1,
-        sd: null,
-        serving_gnb: values.serving_gnb,
-        scenario_id: null,
-        auto_run_scenario: false,
-      };
-      await backendProfiles.create(body);
+      await backendProfiles.createBySubscriber({
+        ue_id: values.ue_id,
+        gnb_id: values.serving_gnb,
+        note: values.note,
+        imsi: values.imsi,
+      });
       setProvisioningAddOpen(false);
-      setFeedback(`UE ${values.name} created on POLARIS (owner: ${values.owner}).`);
+      setFeedback(`UE ${values.ue_id} created on POLARIS (owner: ${values.owner}).`);
     } catch (error) {
       const code = (error as { code?: string }).code ?? 'UE_CREATE_FAILED';
       setProvisioningAddError(`${code} · ${(error as Error).message}`);
@@ -1091,7 +1081,7 @@ export function UeManagerPage() {
         onClose={() => setBackendCsvOpen(false)}
         target="ue-profiles"
         title="Import UE profiles (CSV)"
-        description="One UE per line. Expected header: ue_id,name,serving_gnb,plmn_mcc,plmn_mnc,dnn,sst,sd,owner,imsi. Capped at 100 000 rows per request."
+        description="One UE per line. Expected header: ue_id,gnb_id,note,imsi. Capped at 100 000 rows per request."
         onImported={(report) =>
           setFeedback(`CSV import done · ${report.accepted} accepted · ${report.rejected} rejected.`)
         }

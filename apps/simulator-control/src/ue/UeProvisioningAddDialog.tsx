@@ -19,10 +19,11 @@ import { AlertTriangle, X } from 'lucide-react';
 import type { WireGnb } from '@/data/profileApi';
 import type { Owner } from '@/data/provisioningApi';
 
-const IMSI_RE = /^imsi-\d{5,15}$/;
+const IMSI_RE = /^\d{15}$/;
+const UE_ID_RE = /^UE-(?:\d{2}|\d{5}|100000)$/;
 
 export interface UeProvisioningAddValues {
-  name: string;
+  ue_id: string;
   serving_gnb: string;
   owner: string;
   note: string;
@@ -31,7 +32,7 @@ export interface UeProvisioningAddValues {
 }
 
 interface State {
-  name: string;
+  ue_id: string;
   serving_gnb: string;
   owner: string;
   note: string;
@@ -40,7 +41,7 @@ interface State {
 }
 
 const EMPTY: State = {
-  name: '',
+  ue_id: '',
   serving_gnb: '',
   owner: '',
   note: '',
@@ -83,7 +84,7 @@ export function UeProvisioningAddDialog({
   const imsiInvalid = state.imsiTouched && !IMSI_RE.test(state.imsi);
   const canSubmit =
     !submitting &&
-    !!state.name.trim() &&
+    UE_ID_RE.test(state.ue_id.trim()) &&
     !!state.serving_gnb &&
     !!state.owner &&
     IMSI_RE.test(state.imsi);
@@ -92,7 +93,7 @@ export function UeProvisioningAddDialog({
     event.preventDefault();
     if (!canSubmit) return;
     const values: UeProvisioningAddValues = {
-      name: state.name.trim(),
+      ue_id: state.ue_id.trim(),
       serving_gnb: state.serving_gnb,
       owner: state.owner,
       note: state.note.trim(),
@@ -131,17 +132,18 @@ export function UeProvisioningAddDialog({
         </header>
 
         <p className="text-ep-xs text-text-secondary">
-          Only four fields at create-time. The PLMN, DNN, S-NSSAI and provisioning status come back
+          The UE ID, gNB and subscriber identity bind this profile. PLMN, DNN, S-NSSAI and provisioning status come back
           from the backend and show up in the UE detail card.
         </p>
 
         <label className="flex flex-col gap-1 text-ep-sm">
-          <span className="text-ep-xs uppercase tracking-wider text-text-secondary">Name</span>
+          <span className="text-ep-xs uppercase tracking-wider text-text-secondary">UE ID</span>
           <input
             className="ep-input"
-            value={state.name}
-            onChange={(event) => setState((prev) => ({ ...prev, name: event.target.value }))}
-            maxLength={128}
+            value={state.ue_id}
+            onChange={(event) => setState((prev) => ({ ...prev, ue_id: event.target.value }))}
+            maxLength={9}
+            placeholder="UE-01"
             data-testid="ue-add-name"
             required
           />
@@ -191,7 +193,7 @@ export function UeProvisioningAddDialog({
             value={state.imsi}
             onChange={(event) => setState((prev) => ({ ...prev, imsi: event.target.value }))}
             onBlur={() => setState((prev) => ({ ...prev, imsiTouched: true }))}
-            placeholder="imsi-208930000000001"
+            placeholder="208930000000001"
             aria-invalid={imsiInvalid ? 'true' : 'false'}
             data-testid="ue-add-imsi"
           />
@@ -202,7 +204,7 @@ export function UeProvisioningAddDialog({
           {imsiInvalid && (
             <span className="text-ep-xs text-error flex items-start gap-1" data-testid="ue-add-imsi-error">
               <AlertTriangle width={11} height={11} className="mt-0.5 shrink-0" />
-              IMSI must match <code className="mono">imsi-&lt;5-15 digits&gt;</code>
+              IMSI must contain exactly 15 digits.
             </span>
           )}
         </label>

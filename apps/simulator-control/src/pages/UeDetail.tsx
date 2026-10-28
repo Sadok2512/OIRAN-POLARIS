@@ -60,16 +60,87 @@ interface UeDetail {
     last_job_id: string | null;
   };
   traffic: {
-    bytes_dl: number;
-    bytes_ul: number;
+    bytes_dl: number | null;
+    bytes_ul: number | null;
     last_sample_epoch_s: number | null;
+  };
+}
+
+interface WireUeDetail {
+  ue_id: string;
+  name: string;
+  serving_gnb: string;
+  plmn: { mcc: string; mnc: string };
+  dnn: string;
+  snssai: { sst: number; sd: string | null };
+  pdu_session: { type: string; dnn: string };
+  scenario_id: string | null;
+  auto_run_scenario: boolean;
+  subscription_status: string;
+  subscriber_identity: 'PROTECTED';
+  authentication_material: 'PROTECTED';
+  updated_at_epoch_s: number;
+  pdu_sessions: { dnn: string; state: string; source: string }[];
+  ims: { configured: boolean; state: string };
+  subscriber: { slot?: string; state: string };
+  last_job: { bytes_ul: number | null; bytes_dl: number | null; job_id: string | null };
+}
+
+function normalizeDetail(body: UeDetail | WireUeDetail): UeDetail {
+  if ('identity' in body) return body;
+  return {
+    ue_id: body.ue_id,
+    identity: {
+      name: body.name,
+      owner: 'POLARIS_CONTROLLER',
+      note: null,
+      imsi: body.subscriber_identity,
+      authentication: body.authentication_material,
+    },
+    provisioning: {
+      status: body.subscription_status,
+      subscriber_id: body.subscriber.slot ?? null,
+      bound_at_epoch_s: body.updated_at_epoch_s,
+    },
+    network_profile: {
+      plmn: body.plmn,
+      dnn: body.dnn,
+      sst: body.snssai.sst,
+      sd: body.snssai.sd,
+      serving_gnb: body.serving_gnb,
+    },
+    registration: { state: 'NOT_OBSERVED', last_registered_at_epoch_s: null },
+    pdu_sessions: body.pdu_sessions.map((session, index) => ({
+      id: index + 1,
+      dnn: session.dnn,
+      type: body.pdu_session.type,
+      ip: null,
+      established_at_epoch_s: null,
+    })),
+    ims: {
+      state: body.ims.state,
+      reason: body.ims.configured ? null : 'IMS DNN is not configured for this subscriber.',
+    },
+    scenario: {
+      assigned_id: body.scenario_id,
+      auto_run: body.auto_run_scenario,
+      last_job_id: body.last_job.job_id,
+    },
+    traffic: {
+      bytes_dl: body.last_job.bytes_dl,
+      bytes_ul: body.last_job.bytes_ul,
+      last_sample_epoch_s: null,
+    },
   };
 }
 
 function useUeDetail(ueId: string, enabled: boolean) {
   return useQuery({
     queryKey: ['polaris', 'ue-detail', ueId],
-    queryFn: () => polarisApi<UeDetail>(`/ue-profiles/${encodeURIComponent(ueId)}`),
+    queryFn: () =>
+      polarisApi<UeDetail | WireUeDetail>(`/ue-profiles/${encodeURIComponent(ueId)}`).then(
+        normalizeDetail,
+      ),
     enabled,
     retry: false,
     staleTime: 10_000,
@@ -208,8 +279,8 @@ export function UeDetailPage() {
         </Block>
 
         <Block title="Traffic" testid="ue-block-traffic">
-          <Field label="DL bytes" value={data.traffic.bytes_dl.toLocaleString()} mono />
-          <Field label="UL bytes" value={data.traffic.bytes_ul.toLocaleString()} mono />
+          <Field label="DL bytes" value={formatCounter(data.traffic.bytes_dl)} mono />
+          <Field label="UL bytes" value={formatCounter(data.traffic.bytes_ul)} mono />
           <Field
             label="Last sample"
             value={formatEpoch(data.traffic.last_sample_epoch_s)}
@@ -280,4 +351,8 @@ function Field({
 function formatEpoch(value: number | null | undefined): string {
   if (value === null || value === undefined) return '—';
   return new Date(value * 1000).toLocaleString();
+}
+
+function formatCounter(value: number | null | undefined): string {
+  return value === null || value === undefined ? 'Not observed' : value.toLocaleString();
 }

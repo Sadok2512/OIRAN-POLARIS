@@ -53,8 +53,16 @@ export interface WireUeProfileMutation {
   auto_run_scenario: boolean;
 }
 
+export interface WireSubscriberBoundProfileMutation {
+  ue_id: string;
+  gnb_id: string;
+  note: string;
+  /** Write-only; the backend never returns this value. */
+  imsi: string;
+}
+
 export interface WireBulkProfileInput {
-  count: 10 | 100 | 1000 | 10000;
+  count: 10 | 100 | 1000 | 10000 | 100000;
   name_prefix: string;
   plmn_mcc: string;
   plmn_mnc: string;
@@ -88,10 +96,10 @@ export interface WireGnbList {
   source: 'LAB_DEFAULT' | 'CONFIGURED_REGISTRY' | string;
 }
 
-export const BULK_COUNTS = [10, 100, 1000, 10000] as const;
+export const BULK_COUNTS = [10, 100, 1000, 10000, 100000] as const;
 export const MAX_PAGE_SIZE = 500;
 /** Backend UE ids: UE-NN (01–99) or UE-NNNNN (00100–10000). */
-export const BACKEND_UE_ID_RE = /^UE-(?:\d{2}|\d{5})$/;
+export const BACKEND_UE_ID_RE = /^UE-(?:\d{2}|\d{5}|100000)$/;
 
 /** Reads every page (page_size 500 → at most 20 requests for the 10 000 cap). */
 export async function fetchAllUeProfiles(): Promise<WireUeProfile[]> {
@@ -109,6 +117,13 @@ export async function fetchAllUeProfiles(): Promise<WireUeProfile[]> {
 
 export function createUeProfile(body: WireUeProfileMutation) {
   return polarisApi<WireUeProfile>('/ue-profiles', { method: 'POST', body: JSON.stringify(body) });
+}
+
+export function createSubscriberBoundUeProfile(body: WireSubscriberBoundProfileMutation) {
+  return polarisApi<WireUeProfile>('/ue-profiles', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
 }
 
 export function updateUeProfile(ueId: string, body: WireUeProfileMutation) {

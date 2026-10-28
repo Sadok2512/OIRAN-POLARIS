@@ -46,6 +46,7 @@ beforeEach(() => {
   _resetProfiles();
   _resetFlags();
   setFlag('profileBackend', true);
+  setFlag('polarisProvisioning', false);
   calls.length = 0;
   globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();

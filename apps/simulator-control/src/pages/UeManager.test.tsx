@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
 import { UeManagerPage } from './UeManager';
 import { _resetProfiles, _seedProfiles } from '@/ue/profileStore';
+import { _resetFlags, setFlag } from '@/data/featureFlags';
 
 function respond(status: number, body: unknown) {
   return new Response(JSON.stringify(body), {
@@ -68,6 +69,9 @@ function renderPage() {
 
 beforeEach(() => {
   if (typeof localStorage !== 'undefined') localStorage.clear();
+  _resetFlags();
+  setFlag('profileBackend', false);
+  setFlag('polarisProvisioning', false);
   _resetProfiles();
   stubFetch('operator');
 });
@@ -75,6 +79,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   _resetProfiles();
+  _resetFlags();
 });
 
 describe('UE Profile Manager — add / edit / delete', () => {

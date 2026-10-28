@@ -62,9 +62,9 @@ export interface FeatureFlags {
 // "offline draft" and reminds them that nothing will reach the backend.
 const DEFAULTS: FeatureFlags = {
   scenarioBackend: true,
-  profileBackend: false,
-  scenarioTemplates: false,
-  polarisProvisioning: false,
+  profileBackend: true,
+  scenarioTemplates: true,
+  polarisProvisioning: true,
 };
 
 function read(): FeatureFlags {
