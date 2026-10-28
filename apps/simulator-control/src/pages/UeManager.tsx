@@ -55,6 +55,7 @@ import { useOwners } from '@/data/provisioningApi';
 import { useStartScenarioRun } from '@/data/scenarioApi';
 import { UeBulkCreateDialog } from '@/ue/UeBulkCreateDialog';
 import { AssignScenarioDialog } from '@/ue/AssignScenarioDialog';
+import { CsvImportDialog } from '@/components/CsvImportDialog';
 import { useQuery } from '@tanstack/react-query';
 
 const PAGE_SIZES = [25, 50, 100, 250] as const;
@@ -98,6 +99,7 @@ export function UeManagerPage() {
   const [provisioningAddOpen, setProvisioningAddOpen] = useState(false);
   const [provisioningAddError, setProvisioningAddError] = useState<string | null>(null);
   const [provisioningAddSubmitting, setProvisioningAddSubmitting] = useState(false);
+  const [backendCsvOpen, setBackendCsvOpen] = useState(false);
   // The gNB directory is already published by polaris-control-api 0.11.0;
   // reuse the hook to feed the Add UE dropdown. We ping the owner directory
   // under the polarisProvisioning flag so the hook stays off when the
@@ -605,17 +607,30 @@ export function UeManagerPage() {
             <Users width={13} height={13} />
             Bulk create
           </button>
-          <button
-            type="button"
-            className="ep-button ep-button-sm"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={!canOperate || profileBackend}
-            title={profileBackend ? 'Backend required — POLARIS has no CSV import route' : undefined}
-            data-testid="ue-import"
-          >
-            <Upload width={13} height={13} />
-            Import CSV
-          </button>
+          {polarisProvisioning ? (
+            <button
+              type="button"
+              className="ep-button ep-button-sm"
+              onClick={() => setBackendCsvOpen(true)}
+              disabled={!canOperate}
+              data-testid="ue-import-backend"
+            >
+              <Upload width={13} height={13} />
+              Import CSV
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="ep-button ep-button-sm"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={!canOperate || profileBackend}
+              title={profileBackend ? 'Backend required — POLARIS has no CSV import route' : undefined}
+              data-testid="ue-import"
+            >
+              <Upload width={13} height={13} />
+              Import CSV
+            </button>
+          )}
           <input
             ref={fileInputRef}
             type="file"
@@ -1060,6 +1075,17 @@ export function UeManagerPage() {
       )}
 
       {/* Dialogs */}
+      <CsvImportDialog
+        open={polarisProvisioning && backendCsvOpen}
+        onClose={() => setBackendCsvOpen(false)}
+        target="ue-profiles"
+        title="Import UE profiles (CSV)"
+        description="One UE per line. Expected header: ue_id,name,serving_gnb,plmn_mcc,plmn_mnc,dnn,sst,sd,owner,imsi. Capped at 100 000 rows per request."
+        onImported={(report) =>
+          setFeedback(`CSV import done · ${report.accepted} accepted · ${report.rejected} rejected.`)
+        }
+      />
+
       <UeProvisioningAddDialog
         open={polarisProvisioning && provisioningAddOpen}
         onClose={() => {
