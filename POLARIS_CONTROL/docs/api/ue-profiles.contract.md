@@ -19,7 +19,8 @@ Operator or Administrator session and its CSRF header. Reads never expose SUPI, 
 | `GET` | `/gnbs` | gNB registry a profile may name as `serving_gnb`: `{items:[{gnb_id,link_ip}], total, source}`; `source` is `LAB_DEFAULT` or `CONFIGURED_REGISTRY`. |
 | `POST` | `/ue-profiles/:ue_id/validate-provisioning` | Read/attest existing provisioning; returns `open5gs_changed:false`. |
 
-There is no CSV import route in this version.
+CSV import reuses `POST /ue-profiles/bulk` with `Content-Type: text/csv`; the JSON bulk-create
+contract remains available on the same route.
 
 ## Shapes and protection
 
