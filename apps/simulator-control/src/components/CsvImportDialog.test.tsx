@@ -26,22 +26,25 @@ function respond(status: number, body: unknown) {
   });
 }
 
-const calls: { method: string; url: string }[] = [];
+const calls: { method: string; url: string; headers: Headers; body: string }[] = [];
 
 beforeEach(() => {
   calls.length = 0;
   globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     const method = (init?.method ?? 'GET').toUpperCase();
-    calls.push({ method, url });
-    if (url.endsWith('/provisioning/import')) {
+    const headers = new Headers(init?.headers);
+    const body = typeof init?.body === 'string' ? init.body : '';
+    calls.push({ method, url, headers, body });
+    // 0.6.1 — real contract: POST /subscribers/bulk (text/csv body).
+    if (url.endsWith('/subscribers/bulk')) {
       return respond(200, {
         total: 10,
         accepted: 8,
         rejected: 2,
         errors: [
-          { line: 3, code: 'DUPLICATE_IMSI', message: 'imsi already provisioned' },
-          { line: 7, code: 'INVALID_PLMN', message: 'MCC/MNC pair not approved' },
+          { line: 3, code: 'SUBSCRIBER_NOT_POLARIS_OWNED', message: 'IMSI belongs to a non-POLARIS subscriber' },
+          { line: 7, code: 'SUBSCRIBER_NOT_PROVISIONED', message: 'subscriber not registered yet' },
         ],
       });
     }
@@ -60,7 +63,7 @@ describe('CsvImportDialog', () => {
       <CsvImportDialog
         open
         onClose={() => undefined}
-        target="provisioning"
+        target="subscribers"
         title="Import subscribers (CSV)"
         description="dummy"
       />,
@@ -74,11 +77,16 @@ describe('CsvImportDialog', () => {
     await user.click(screen.getByTestId('csv-upload-submit'));
     await screen.findByTestId('csv-import-report');
     expect(screen.getByTestId('csv-import-report')).toHaveTextContent('8 accepted');
-    expect(screen.getByTestId('csv-import-error-3')).toHaveTextContent('DUPLICATE_IMSI');
-    expect(screen.getByTestId('csv-import-error-7')).toHaveTextContent('INVALID_PLMN');
+    expect(screen.getByTestId('csv-import-error-3')).toHaveTextContent('SUBSCRIBER_NOT_POLARIS_OWNED');
+    expect(screen.getByTestId('csv-import-error-7')).toHaveTextContent('SUBSCRIBER_NOT_PROVISIONED');
 
-    const uploadCall = calls.find((c) => c.method === 'POST' && c.url.endsWith('/provisioning/import'));
+    // 0.6.1 — the real contract uses text/csv (raw body), not multipart.
+    const uploadCall = calls.find(
+      (c) => c.method === 'POST' && c.url.endsWith('/subscribers/bulk'),
+    );
     expect(uploadCall).toBeDefined();
+    expect(uploadCall?.headers.get('content-type')).toBe('text/csv');
+    expect(uploadCall?.body).toContain('subscriber_id,owner,imsi');
   });
 
   it('refuses to upload a file over the 100 000-row cap and never POSTs', async () => {
@@ -87,7 +95,7 @@ describe('CsvImportDialog', () => {
       <CsvImportDialog
         open
         onClose={() => undefined}
-        target="provisioning"
+        target="subscribers"
         title="Import subscribers (CSV)"
         description="dummy"
       />,

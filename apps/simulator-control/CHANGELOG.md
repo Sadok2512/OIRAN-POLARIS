@@ -3,6 +3,60 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.6.1 — 2026-10-28 (patch)
+
+Align the provisioning calls with the real backend contract shipped by
+Codex on polaris-control-api **0.15.1 (`fc6d8ed`)**. The 0.6.0 stubs
+(/provisioning/import, /ue-profiles/import, multipart form data) are
+gone; the UI now hits the real endpoints with the exact body shapes.
+
+### Changed
+
+- **`POST /subscribers/bulk`** replaces `/provisioning/import`. Body is
+  **raw `text/csv`** (not multipart). Expected header:
+  `imsi,k,opc,sst,sd,dnns,ambr_uplink,ambr_downlink`.
+- **`POST /ue-profiles/bulk`** replaces `/ue-profiles/import`. Same
+  `text/csv` contract. Expected header:
+  `ue_id,gnb_id,note,imsi`.
+- **`uploadCsvImport(target, file)`** in `src/data/provisioningApi.ts`:
+  target type becomes `'subscribers' | 'ue-profiles'`; builds a plain
+  `text/csv` body (`await file.text()`) and sets the matching
+  `Content-Type` header.
+- **CsvImportDialog descriptions** reflect the new column headers so the
+  operator sees the real contract before uploading.
+
+### Added
+
+- **`AddSubscriberDialog`** (`src/subscribers/AddSubscriberDialog.tsx`)
+  wired to `POST /subscribers` with the exact body:
+  `{ imsi, k, opc, sst, sd, dnns[], ambr: { uplink, downlink } }`.
+  IMSI, K and OPc are password inputs; the three fields are **scrubbed
+  from React state immediately after submit** so the browser never
+  retains the secret across renders. On success, a green banner shows
+  the backend-assigned slot id and reminds the operator the material
+  is now `PROTECTED`.
+- Backend error codes are surfaced verbatim with the HTTP status —
+  `409 SUBSCRIBER_NOT_POLARIS_OWNED`, `422 SUBSCRIBER_NOT_PROVISIONED`
+  and others. No translation, no fallback copy.
+- **`createSubscriber(input)`** helper exported from
+  `src/data/provisioningApi.ts` so the dialog can live in its own
+  module without pulling in the full React Query mutation surface.
+
+### Removed
+
+- The disabled "Add subscriber" placeholder on the Provisioning page is
+  replaced with the real dialog.
+- `/provisioning/import` and `/ue-profiles/import` paths are no longer
+  referenced anywhere in the frontend.
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → **Test Files 23 passed (23) · Tests 148 passed (148)**
+  (4 new in `AddSubscriberDialog.test.tsx`, CSV test rewritten against
+  the real `text/csv` + `/subscribers/bulk` contract).
+- `npm run build` → clean, no fixture leak in `dist/`.
+
 ## 0.6.0 — 2026-10-28 (minor)
 
 Provisioning layer anticipating Codex's `feat/polaris-provisioning` branch

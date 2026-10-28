@@ -1,17 +1,19 @@
-// 0.6.0 — client for the richer provisioning surface Codex publishes on
-// `feat/polaris-provisioning`. Everything here is gated by the
-// `polarisProvisioning` feature flag so no request leaves the UI until
-// an operator flips the flag in Settings.
+// 0.6.1 — client for the provisioning surface shipped by Codex on
+// polaris-control-api 0.15.1 (fc6d8ed). The earlier /provisioning/import
+// and /ue-profiles/import multipart stubs are removed; the real
+// endpoints take raw CSV text bodies.
 //
-// Routes (contract from the LOT prompt):
+// Routes:
 //   GET  /api/v1/owners                            → { items: Owner[] }
 //   GET  /api/v1/plmns                             → { items: Plmn[] }
 //   GET  /api/v1/dnns                              → { items: Dnn[] }
+//   GET  /api/v1/subscribers                       → subscriber directory
+//   POST /api/v1/subscribers         JSON {imsi, k, opc, sst, sd, dnns[], ambr{uplink,downlink}}
+//   POST /api/v1/subscribers/bulk    text/csv: imsi,k,opc,sst,sd,dnns,ambr_uplink,ambr_downlink
+//   POST /api/v1/ue-profiles/bulk    text/csv: ue_id,gnb_id,note,imsi
 //   GET  /api/v1/ue-profiles/:ue_id                → detail card body
-//   POST /api/v1/provisioning/import   (multipart, operator + CSRF)
-//   POST /api/v1/ue-profiles/import    (multipart, operator + CSRF)
 //
-// All reads keep subscriber identity material opaque (SUPI, K and OPc
+// All reads keep subscriber identity material opaque (IMSI, K and OPc
 // are returned as the literal "PROTECTED"); this module never exposes
 // a getter that would reveal them.
 
@@ -92,17 +94,20 @@ export function useDnns() {
 }
 
 /**
- * 0.6.0 — Streaming multipart CSV upload.
+ * 0.6.1 — Raw-body CSV upload. polaris-control-api 0.15.1 reads the
+ * entire request body as `text/csv`; multipart form data is NOT
+ * accepted. The expected columns depend on the target:
  *
- * `target` picks the backend endpoint:
- *   - `provisioning` → `POST /provisioning/import` (subscriber bulk)
- *   - `ue-profiles`  → `POST /ue-profiles/import`  (UE bulk)
+ *   - `subscribers` → POST /subscribers/bulk
+ *     `imsi,k,opc,sst,sd,dnns,ambr_uplink,ambr_downlink`
+ *   - `ue-profiles` → POST /ue-profiles/bulk
+ *     `ue_id,gnb_id,note,imsi`
  *
  * The server answers with a per-line report. Both endpoints cap the body
- * at 100 000 rows (POLARIS backend-enforced); the UI pre-counts lines
- * before posting so the operator is told up-front when the file is too
- * big. We do NOT split the file client-side — splitting would break the
- * atomicity guarantees of the backend transaction.
+ * at 100 000 rows (backend-enforced); the UI pre-counts lines so the
+ * operator is told up-front when the file is too big. We do NOT split
+ * the file client-side — splitting would break the atomicity guarantees
+ * of the backend transaction.
  */
 export interface CsvImportReport {
   total: number;
@@ -111,16 +116,20 @@ export interface CsvImportReport {
   errors: { line: number; code: string; message: string }[];
 }
 
+export type CsvImportTarget = 'subscribers' | 'ue-profiles';
+
 export async function uploadCsvImport(
-  target: 'provisioning' | 'ue-profiles',
+  target: CsvImportTarget,
   file: File,
 ): Promise<CsvImportReport> {
-  const path = target === 'provisioning' ? '/provisioning/import' : '/ue-profiles/import';
-  const headers = new Headers({ Accept: 'application/json' });
+  const path = target === 'subscribers' ? '/subscribers/bulk' : '/ue-profiles/bulk';
+  const headers = new Headers({
+    Accept: 'application/json',
+    'Content-Type': 'text/csv',
+  });
   const csrf = readCsrf();
   if (csrf) headers.set('x-csrf-token', csrf);
-  const body = new FormData();
-  body.set('file', file, file.name);
+  const body = await file.text();
   const response = await fetch(`/polaris-api/v1${path}`, {
     method: 'POST',
     headers,
@@ -140,4 +149,43 @@ export async function uploadCsvImport(
     throw new ApiError(response.status, code, `HTTP ${response.status} ${code}`);
   }
   return (await response.json()) as CsvImportReport;
+}
+
+/**
+ * 0.6.1 — JSON create for `POST /subscribers`. Secret material (K, OPc)
+ * is write-only; the response body carries the backend-assigned slot id
+ * plus the two literals `PROTECTED` so the operator can see the
+ * subscriber is in place without ever seeing the key again.
+ */
+export interface SubscriberCreateInput {
+  imsi: string;
+  k: string;
+  opc: string;
+  sst: number;
+  sd: string | null;
+  dnns: string[];
+  ambr: { uplink: number; downlink: number };
+}
+
+export interface SubscriberCreateResponse {
+  slot_id: string;
+  subscriber_id: string;
+  imsi: 'PROTECTED';
+  k: 'PROTECTED';
+  opc: 'PROTECTED';
+  sst: number;
+  sd: string | null;
+  dnns: string[];
+  ambr: { uplink: number; downlink: number };
+  created_at_epoch_s: number;
+}
+
+export async function createSubscriber(
+  input: SubscriberCreateInput,
+): Promise<SubscriberCreateResponse> {
+  return polarisApi<SubscriberCreateResponse>('/subscribers', {
+    method: 'POST',
+    body: JSON.stringify(input),
+    headers: { 'Content-Type': 'application/json' },
+  });
 }

@@ -1091,7 +1091,7 @@ export function UeManagerPage() {
         onClose={() => setBackendCsvOpen(false)}
         target="ue-profiles"
         title="Import UE profiles (CSV)"
-        description="One UE per line. Expected header: ue_id,name,serving_gnb,plmn_mcc,plmn_mnc,dnn,sst,sd,owner,imsi. Capped at 100 000 rows per request."
+        description="POST /ue-profiles/bulk (text/csv). Expected header: ue_id,gnb_id,note,imsi. Capped at 100 000 rows per request."
         onImported={(report) =>
           setFeedback(`CSV import done · ${report.accepted} accepted · ${report.rejected} rejected.`)
         }

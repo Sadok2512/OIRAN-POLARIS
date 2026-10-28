@@ -15,7 +15,9 @@ import { EmptyState, LoadingSkeleton, Unavailable } from '@/ui/EmptyErrorLoading
 import { useFeatureFlag } from '@/data/featureFlags';
 import { polarisApi } from '@/data/polarisClient';
 import { CsvImportDialog } from '@/components/CsvImportDialog';
+import { AddSubscriberDialog } from '@/subscribers/AddSubscriberDialog';
 import { ApiError } from '@shared/api';
+import { useQueryClient } from '@tanstack/react-query';
 
 interface Subscriber {
   subscriber_id: string;
@@ -43,7 +45,9 @@ function useSubscribers(enabled: boolean) {
 export function ProvisioningPage() {
   const enabled = useFeatureFlag('polarisProvisioning');
   const [csvOpen, setCsvOpen] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
   const subscribers = useSubscribers(enabled);
+  const queryClient = useQueryClient();
 
   if (!enabled) {
     return (
@@ -82,8 +86,7 @@ export function ProvisioningPage() {
             <button
               type="button"
               className="ep-button ep-button-sm ep-button-primary"
-              disabled
-              title="Single-add dialog ships with the backend contract on feat/polaris-provisioning."
+              onClick={() => setAddOpen(true)}
               data-testid="provisioning-add"
             >
               <Plus width={13} height={13} /> Add subscriber
@@ -133,9 +136,20 @@ export function ProvisioningPage() {
       <CsvImportDialog
         open={csvOpen}
         onClose={() => setCsvOpen(false)}
-        target="provisioning"
+        target="subscribers"
         title="Import subscribers (CSV)"
-        description="One subscriber per line. Expected header: subscriber_id,owner,imsi,authentication_key,opc,plmn_mcc,plmn_mnc. The backend validates every row and returns an error list."
+        description="POST /subscribers/bulk (text/csv). Expected header: imsi,k,opc,sst,sd,dnns,ambr_uplink,ambr_downlink. The backend validates every row and returns an error list."
+        onImported={() =>
+          queryClient.invalidateQueries({ queryKey: ['polaris', 'subscribers'] })
+        }
+      />
+
+      <AddSubscriberDialog
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        onCreated={() =>
+          queryClient.invalidateQueries({ queryKey: ['polaris', 'subscribers'] })
+        }
       />
 
       {subscribers.data && (

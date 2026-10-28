@@ -1,6 +1,6 @@
 {
   "name": "@telecom/simulator-control",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "type": "module",
   "description": "POLARIS Simulator Control — UE Manager, scenario library, scenario builder, execution monitor.",

@@ -36,7 +36,7 @@ export function CsvImportDialog({
   open: boolean;
   onClose: () => void;
   onImported?: (report: CsvImportReport) => void;
-  target: 'provisioning' | 'ue-profiles';
+  target: 'subscribers' | 'ue-profiles';
   title: string;
   description: string;
 }) {
