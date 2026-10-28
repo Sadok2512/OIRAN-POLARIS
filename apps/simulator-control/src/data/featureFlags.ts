@@ -50,7 +50,9 @@ export interface FeatureFlags {
    * When false, the Provisioning page shows "Backend pending" and
    * dropdowns fall back to free-text + warning text. profileBackend is
    * also forced ON (local UE form path becomes unreachable from the UI).
-   * Default OFF until the backend branch is deployed.
+   * Default ON in Simulator 0.6.1 because the required API is part of
+   * polaris-control-api 0.15.1. Operators may still disable it locally
+   * for diagnostic comparison with the legacy UI.
    */
   polarisProvisioning: boolean;
 }
@@ -64,7 +66,7 @@ const DEFAULTS: FeatureFlags = {
   scenarioBackend: true,
   profileBackend: false,
   scenarioTemplates: false,
-  polarisProvisioning: false,
+  polarisProvisioning: true,
 };
 
 function read(): FeatureFlags {

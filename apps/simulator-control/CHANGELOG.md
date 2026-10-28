@@ -15,6 +15,10 @@ production base paths, live-locked template cloning, and adds an
 authenticated production test for one protected subscriber plus a
 two-row `/subscribers/bulk` import. Test credentials and subscriber
 secrets are injected through the process environment and never logged.
+Because API 0.15.1 is the required backend for this release,
+`polarisProvisioning` now defaults to ON for fresh browser sessions
+instead of rendering an unavailable provisioning page. The independent
+UE profile-registry switch retains its prior default.
 
 ### Changed
 
