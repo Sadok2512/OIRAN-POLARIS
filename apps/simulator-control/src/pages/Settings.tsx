@@ -10,6 +10,7 @@ import {
   useScenarioCapabilities,
 } from '@/data/queries';
 import { useAssignments, useScenarios } from '@/scenarios/store';
+import { setFlag, useFeatureFlags } from '@/data/featureFlags';
 
 export function SettingsPage() {
   const auth = useAuth();
@@ -19,6 +20,7 @@ export function SettingsPage() {
   const assignments = useAssignments();
   const login = useLogin();
   const logout = useLogout();
+  const flags = useFeatureFlags();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [message, setMessage] = useState<string | null>(null);
@@ -165,12 +167,32 @@ export function SettingsPage() {
             <dt className="text-text-secondary">Persistence</dt>
             <dd>localStorage (polaris.scenarios.v1 / polaris.assignments.v1)</dd>
             <dt className="text-text-secondary">Server-side CRUD</dt>
-            <dd>Not available — see docs</dd>
+            <dd>
+              polaris-control-api 0.9.0:{' '}
+              <code className="mono">/scenario-definitions</code> (flag-gated)
+            </dd>
           </dl>
-          <p className="text-ep-xs text-text-secondary mt-2">
-            A dedicated backend contract (`GET/POST/PUT/DELETE /scenarios/definitions`) is required to move the catalog
-            off the browser. See <code className="mono">docs/frontend/SIMULATOR_SCENARIO_BUILDER.md</code>.
-          </p>
+          <label
+            className="flex items-start gap-2 text-ep-sm mt-3 border-t border-border pt-3"
+            data-testid="flag-scenario-backend"
+          >
+            <input
+              type="checkbox"
+              checked={flags.scenarioBackend}
+              onChange={(event) => setFlag('scenarioBackend', event.target.checked)}
+              data-testid="flag-scenario-backend-toggle"
+            />
+            <span>
+              <span className="font-medium">Use backend scenario catalog (0.9.0)</span>
+              <span className="block text-ep-xs text-text-secondary">
+                When enabled, the Scenario Builder and Execution Monitor call
+                <code className="mono"> /scenario-definitions </code> and
+                <code className="mono"> /scenarios/:job_id/steps </code> instead of the local
+                catalog. Default off: polaris.scenarios.v1 stays authoritative until Codex
+                pushes the backend branch.
+              </span>
+            </span>
+          </label>
         </section>
 
         <section className="ep-card p-5">

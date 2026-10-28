@@ -28,13 +28,23 @@ export const STEP_METADATA: Record<
   ScenarioStepKind,
   { label: string; family: 'ACTION' | 'WAIT' | 'OBSERVATION'; defaultParams?: string[]; backendCertified: boolean; backendNote?: string }
 > = {
+  // polaris-control-api 0.9.0 accepts exactly 6 step types:
+  //   ue_start, ue_stop, pdu_establish, pdu_release, udp_traffic, wait.
+  // Any other type returns HTTP 422 SCENARIO_STEP_TYPE_UNSUPPORTED, so the
+  // UI keeps them visible but marks them non-certified and refuses to send.
   UE_START: { label: 'Start UE', family: 'ACTION', backendCertified: true },
-  REGISTER_5G: { label: '5G Registration', family: 'ACTION', backendCertified: true },
+  REGISTER_5G: {
+    label: '5G Registration',
+    family: 'ACTION',
+    backendCertified: false,
+    backendNote: 'Not in polaris-control-api 0.9.0 (6-type whitelist). Registration is implicit in ue_start.',
+  },
   WAIT_REGISTRATION: {
     label: 'Wait: Registration complete',
     family: 'WAIT',
     defaultParams: ['timeout_s'],
-    backendCertified: true,
+    backendCertified: false,
+    backendNote: 'Not in polaris-control-api 0.9.0 (6-type whitelist).',
   },
   PDU_ESTABLISH: { label: 'PDU Session Establishment', family: 'ACTION', backendCertified: true },
   UDP_TRAFFIC: {
@@ -42,53 +52,82 @@ export const STEP_METADATA: Record<
     family: 'ACTION',
     defaultParams: ['duration_s', 'packet_count', 'packet_size_bytes', 'packet_interval_ms', 'target_bitrate_kbps'],
     backendCertified: true,
-    backendNote: 'Mapped to bounded-controller-ue-udp-v1 when applicable.',
+    backendNote: 'Accepted by polaris-control-api 0.9.0 as udp_traffic.',
   },
   TCP_TRAFFIC: {
     label: 'TCP Traffic',
     family: 'ACTION',
     defaultParams: ['duration_s', 'packet_count', 'packet_size_bytes', 'target_bitrate_kbps'],
     backendCertified: false,
-    backendNote: 'TCP generator not exposed by POLARIS /scenarios/* yet.',
+    backendNote: 'Not in polaris-control-api 0.9.0 (6-type whitelist).',
   },
   ICMP_TRAFFIC: {
     label: 'ICMP Traffic',
     family: 'ACTION',
     defaultParams: ['duration_s', 'packet_count', 'packet_interval_ms'],
     backendCertified: false,
-    backendNote: 'ICMP generator not exposed by POLARIS /scenarios/* yet.',
+    backendNote: 'Not in polaris-control-api 0.9.0 (6-type whitelist).',
   },
   HTTP_TRAFFIC: {
     label: 'HTTP Traffic',
     family: 'ACTION',
     defaultParams: ['duration_s'],
     backendCertified: false,
-    backendNote: 'HTTP generator not implemented in the backend.',
+    backendNote: 'Not in polaris-control-api 0.9.0 (6-type whitelist).',
   },
   IDLE: {
     label: 'Idle / Wait',
     family: 'WAIT',
     defaultParams: ['duration_s'],
     backendCertified: true,
-    backendNote: 'Pure wait between actions.',
+    backendNote: 'Serialized to wire type "wait" (polaris-control-api 0.9.0).',
   },
   WAIT_RRC_CONNECTED: {
     label: 'Wait: RRC Connected (observed)',
     family: 'OBSERVATION',
     defaultParams: ['timeout_s'],
     backendCertified: false,
-    backendNote: 'RRC state is not exposed by POLARIS /ues; the UI cannot certify this observation yet.',
+    backendNote: 'Not in polaris-control-api 0.9.0 (6-type whitelist). RRC state not exposed by /ues.',
   },
   WAIT_RRC_IDLE: {
     label: 'Wait: RRC Idle (observed)',
     family: 'OBSERVATION',
     defaultParams: ['timeout_s'],
     backendCertified: false,
-    backendNote: 'RRC state is not exposed by POLARIS /ues.',
+    backendNote: 'Not in polaris-control-api 0.9.0 (6-type whitelist).',
   },
   PDU_RELEASE: { label: 'PDU Session Release', family: 'ACTION', backendCertified: true },
-  DEREGISTER: { label: 'Deregistration / Detach', family: 'ACTION', backendCertified: true },
+  DEREGISTER: {
+    label: 'Deregistration / Detach',
+    family: 'ACTION',
+    backendCertified: false,
+    backendNote: 'Not in polaris-control-api 0.9.0 (6-type whitelist). Deregistration is implicit in ue_stop.',
+  },
   UE_STOP: { label: 'Stop UE', family: 'ACTION', backendCertified: true },
+};
+
+/**
+ * Wire-level mapping imposed by polaris-control-api 0.9.0. The six keys
+ * here are the only `type` values the backend will accept. Any step
+ * whose kind is not in this map returns 422 SCENARIO_STEP_TYPE_UNSUPPORTED.
+ */
+export const WIRE_STEP_TYPE: Partial<Record<ScenarioStepKind, string>> = {
+  UE_START: 'ue_start',
+  UE_STOP: 'ue_stop',
+  PDU_ESTABLISH: 'pdu_establish',
+  PDU_RELEASE: 'pdu_release',
+  UDP_TRAFFIC: 'udp_traffic',
+  IDLE: 'wait',
+};
+
+/** Reverse map used when decoding a backend `type` into our internal kind. */
+export const INTERNAL_STEP_KIND: Record<string, ScenarioStepKind> = {
+  ue_start: 'UE_START',
+  ue_stop: 'UE_STOP',
+  pdu_establish: 'PDU_ESTABLISH',
+  pdu_release: 'PDU_RELEASE',
+  udp_traffic: 'UDP_TRAFFIC',
+  wait: 'IDLE',
 };
 
 export type FixedOrRandom =
