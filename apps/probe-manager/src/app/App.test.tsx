@@ -47,11 +47,10 @@ describe('Probe Manager routes', () => {
     );
   });
 
-  it('renders every mandated navigation entry', () => {
+  it('renders every mandated navigation entry (Topology moved to POLARIS in 0.2.0)', () => {
     renderApp();
     for (const label of [
       'Overview',
-      'Network Topology',
       'Probes',
       'Interfaces',
       'Live Captures',
@@ -62,6 +61,17 @@ describe('Probe Manager routes', () => {
         screen.getByRole('link', { name: new RegExp(label, 'i') }),
       ).toBeInTheDocument();
     }
+    // Topology is no longer in the Probe Manager sidebar — it lives in
+    // POLARIS Simulator Control. The /topology route still responds with
+    // a stub so old bookmarks don't 404 (asserted in a dedicated test).
+    expect(screen.queryByRole('link', { name: /network topology/i })).toBeNull();
+  });
+
+  it('renders a "Topology moved to POLARIS" stub at /topology instead of a 404', async () => {
+    renderApp('/topology');
+    await waitFor(() =>
+      expect(screen.getByTestId('topology-moved')).toBeInTheDocument(),
+    );
   });
 
   it('exposes a theme switch in the shell', () => {

@@ -1,14 +1,17 @@
-import type { Capture, Probe } from '@shared/types';
+import type { Capture, CaptureInterface, Probe } from '@shared/types';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import { EmptyState } from '@/ui/EmptyErrorLoading';
 import { bytes, count, percent, isoToLocal } from '@/data/format';
+import { roleBadgeClass, roleFor } from '@/data/roleMapping';
 
 export function ProbeInspector({
   probe,
   captures,
+  interfaces,
 }: {
   probe: Probe | null;
   captures?: Capture[];
+  interfaces?: CaptureInterface[];
 }) {
   if (!probe) {
     return (
@@ -30,6 +33,15 @@ export function ProbeInspector({
       !['CAPTURING', 'STARTING', 'STOPPING', 'PROCESSING'].includes(
         capture.state ?? '',
       ),
+  );
+
+  // The backend returns `connected_interfaces` as string[] on Probe, and the
+  // full CaptureInterface shape in `/interfaces`. Join them on the name so
+  // the inspector surfaces protocol / capture_point / status / device from
+  // real fields only — never fabricated.
+  const connectedNames = new Set(probe.connected_interfaces);
+  const detailedInterfaces = (interfaces ?? []).filter((item) =>
+    connectedNames.has(item.interface),
   );
 
   return (
@@ -80,19 +92,45 @@ export function ProbeInspector({
       </section>
 
       <section>
-        <h3 className="text-ep-sm font-semibold mb-1">Capture points</h3>
-        {probe.connected_interfaces.length ? (
-          <ul className="flex flex-wrap gap-1.5">
-            {probe.connected_interfaces.map((iface) => (
-              <li key={iface}>
-                <span className="ep-badge mono">{iface}</span>
+        <h3 className="text-ep-sm font-semibold mb-1">
+          Capture points · {count(probe.connected_interfaces.length)}
+        </h3>
+        {probe.connected_interfaces.length === 0 ? (
+          <p className="text-ep-xs text-text-secondary">
+            No capture points reported.
+          </p>
+        ) : detailedInterfaces.length === 0 ? (
+          <ul className="flex flex-wrap gap-1.5" data-testid="probe-interface-chips">
+            {probe.connected_interfaces.map((name) => (
+              <li key={name}>
+                <span className="ep-badge mono" title="Interface not resolved via /interfaces">
+                  {name}
+                </span>
               </li>
             ))}
           </ul>
         ) : (
-          <p className="text-ep-xs text-text-secondary">
-            No capture points reported.
-          </p>
+          <ul className="flex flex-col gap-1 text-ep-xs" data-testid="probe-interface-list">
+            {detailedInterfaces.map((item) => {
+              const role = roleFor(item);
+              return (
+                <li
+                  key={item.interface}
+                  className="flex items-center justify-between gap-2 border border-border rounded-md px-2 py-1"
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className={`ep-badge ${roleBadgeClass(role)}`}>{role ?? '—'}</span>
+                    <span className="mono truncate">{item.interface}</span>
+                    <span className="text-text-secondary">· {item.protocol}</span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="mono text-text-secondary">{item.device ?? '—'}</span>
+                    <StatusIndicator state={item.status} compact />
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
         )}
       </section>
 

@@ -1,7 +1,6 @@
 import { NavLink } from 'react-router-dom';
 import {
   LayoutDashboard,
-  Network,
   Radio,
   Cable,
   Activity,
@@ -10,9 +9,11 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 
+// Topology moved to POLARIS Simulator Control in LOT 1 (0.2.0). The
+// /topology route still responds inside Probe Manager with a stub page
+// so old bookmarks don't 404.
 const NAV = [
   { to: '/overview', label: 'Overview', Icon: LayoutDashboard, section: 'OPERATIONS' },
-  { to: '/topology', label: 'Network Topology', Icon: Network, section: 'OPERATIONS' },
   { to: '/probes', label: 'Probes', Icon: Radio, section: 'OPERATIONS' },
   { to: '/interfaces', label: 'Interfaces', Icon: Cable, section: 'OPERATIONS' },
   { to: '/live-captures', label: 'Live Captures', Icon: Activity, section: 'CAPTURE' },

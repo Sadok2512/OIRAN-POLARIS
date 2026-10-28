@@ -218,7 +218,7 @@ describe('Capture Library — actions (PR #2 Section 5)', () => {
     expect(url).toContain('dataset_id=ds-1');
   });
 
-  it('disables Download when the user is not authenticated', async () => {
+  it('keeps Download locked for an un-authenticated viewer (LOT 1: route missing)', async () => {
     stubBackend({ authenticated: false });
     render(renderWithProviders(<CaptureLibraryPage />));
     await waitFor(() =>
@@ -229,18 +229,22 @@ describe('Capture Library — actions (PR #2 Section 5)', () => {
     expect(download).toBeDisabled();
   });
 
-  it('enables Download when authenticated AND capture has size', async () => {
+  it('keeps Download locked even for an authenticated operator (GET /captures/:id/download = 404)', async () => {
     stubBackend({ authenticated: true });
     render(renderWithProviders(<CaptureLibraryPage />));
     await waitFor(() => {
       const download = screen.getByTestId('download-sha256:aa');
-      // The download is a BUTTON (not <a href>) so the Bearer token can
-      // be sent in a header. The target URL stays off the DOM to avoid
-      // ever leaking a token through the href.
+      // The route is not registered on the OIRAN API (grep '/download'
+      // OIRAN/apps/api/src/lib.rs → 0 match). The UI never fabricates a
+      // success — the button stays disabled regardless of role, and the
+      // page-level banner names the reason.
       expect(download.tagName).toBe('BUTTON');
-      expect(download).not.toBeDisabled();
-      expect(download).not.toHaveAttribute('href');
+      expect(download).toBeDisabled();
+      expect(download).toHaveAttribute('title', expect.stringMatching(/404/));
     });
+    expect(screen.getByTestId('download-locked-banner').textContent).toMatch(
+      /GET \/captures\/:id\/download = 404/,
+    );
   });
 
   it('View action opens the capture metadata panel without a network call', async () => {
@@ -290,78 +294,14 @@ describe('Capture Library — explicit filter scope (PR #2 final review)', () =>
   });
 });
 
-describe('Capture Library — PCAP download (PR #2 final review)', () => {
-  const createBlobUrlMock = vi.fn(() => 'blob:dl-url');
-  const revokeBlobUrlMock = vi.fn();
-
-  beforeEach(() => {
-    createBlobUrlMock.mockClear();
-    revokeBlobUrlMock.mockClear();
-    (globalThis as unknown as { URL: typeof URL }).URL.createObjectURL =
-      createBlobUrlMock as unknown as typeof URL.createObjectURL;
-    (globalThis as unknown as { URL: typeof URL }).URL.revokeObjectURL =
-      revokeBlobUrlMock as unknown as typeof URL.revokeObjectURL;
-  });
-
-  it('sends Authorization: Bearer and does not leak the token in the URL', async () => {
+describe('Capture Library — PCAP download locked (LOT 1 · 0.2.0)', () => {
+  it('never calls GET /captures/:id/download even when clicked by an operator', async () => {
     sessionStorage.setItem('oiran.access_token', 'secret-token');
     const user = userEvent.setup();
-    const requests: { url: string; headers: Record<string, string> }[] = [];
-    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === 'string' ? input : input.toString();
-      const headers = Object.fromEntries(new Headers(init?.headers).entries());
-      requests.push({ url, headers });
-      if (url.includes('/download')) {
-        return new Response(new Uint8Array([1, 2, 3]), {
-          status: 200,
-          headers: {
-            'content-type': 'application/vnd.tcpdump.pcap',
-            'content-disposition': 'attachment; filename="historical-ng-c.pcap"',
-          },
-        });
-      }
-      if (url.includes('/captures?')) {
-        return respond(200, { data: CAPTURES, meta: { total: 2, total_pages: 1 } });
-      }
-      if (url.includes('/auth/me'))
-        return respond(200, {
-          data: {
-            authenticated: true,
-            role: 'operator',
-            permissions: ['capture.read'],
-            capture_control: true,
-            capture_execution_enabled: true,
-            reason: 'OK',
-          },
-          meta: {},
-        });
-      return respond(200, { data: [], meta: {} });
-    }) as unknown as typeof fetch;
-
-    render(renderWithProviders(<CaptureLibraryPage />));
-    await waitFor(() =>
-      expect(screen.getByText('historical-ng-c')).toBeInTheDocument(),
-    );
-    await user.click(screen.getByTestId('download-sha256:aa'));
-    await waitFor(() =>
-      expect(requests.some((r) => r.url.includes('/download'))).toBe(true),
-    );
-    const dl = requests.find((r) => r.url.includes('/download'))!;
-    expect(dl.url).not.toContain('secret-token');
-    expect(dl.url).not.toMatch(/token=|access_token=|bearer=/i);
-    expect(dl.headers['authorization']).toBe('Bearer secret-token');
-    expect(createBlobUrlMock).toHaveBeenCalled();
-    expect(revokeBlobUrlMock).toHaveBeenCalledWith('blob:dl-url');
-  });
-
-  it('surfaces a download error without a fabricated success notification', async () => {
-    sessionStorage.setItem('oiran.access_token', 'secret-token');
-    const user = userEvent.setup();
+    const requests: string[] = [];
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === 'string' ? input : input.toString();
-      if (url.includes('/download')) {
-        return respond(403, { error: { code: 'FORBIDDEN', message: 'nope' } });
-      }
+      requests.push(url);
       if (url.includes('/captures?'))
         return respond(200, { data: CAPTURES, meta: { total: 2, total_pages: 1 } });
       if (url.includes('/auth/me'))
@@ -383,11 +323,21 @@ describe('Capture Library — PCAP download (PR #2 final review)', () => {
     await waitFor(() =>
       expect(screen.getByText('historical-ng-c')).toBeInTheDocument(),
     );
-    await user.click(screen.getByTestId('download-sha256:aa'));
+    const button = screen.getByTestId('download-sha256:aa');
+    expect(button).toBeDisabled();
+    await user.click(button);
+    expect(requests.some((url) => url.includes('/download'))).toBe(false);
+  });
+
+  it('surfaces the lock reason in a page-level banner (never a fabricated success)', async () => {
+    stubBackend({ authenticated: true });
+    render(renderWithProviders(<CaptureLibraryPage />));
     await waitFor(() =>
-      expect(screen.getByTestId('download-error')).toBeInTheDocument(),
+      expect(screen.getByTestId('download-locked-banner')).toBeInTheDocument(),
     );
-    expect(screen.getByTestId('download-error').textContent).toMatch(/403/);
+    expect(screen.getByTestId('download-locked-banner').textContent).toMatch(
+      /GET \/captures\/:id\/download = 404/,
+    );
   });
 });
 

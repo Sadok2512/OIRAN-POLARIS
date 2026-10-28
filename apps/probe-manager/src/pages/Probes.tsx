@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Search } from 'lucide-react';
+import { Plus, Search } from 'lucide-react';
 import { PageHeader } from '@/ui/PageHeader';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import {
@@ -9,20 +9,31 @@ import {
   LoadingSkeleton,
 } from '@/ui/EmptyErrorLoading';
 import { ProbeInspector } from '@/components/ProbeInspector';
-import { useCaptures, useProbes } from '@/data/queries';
+import { RegisterProbeDialog } from '@/components/RegisterProbeDialog';
+import { useCaptures, useInterfaces, useProbes } from '@/data/queries';
 import { bytes, count, percent } from '@/data/format';
+import { roleBadgeClass, roleFor } from '@/data/roleMapping';
+import type { CaptureInterface } from '@shared/types';
 
 export function ProbesPage() {
   const probes = useProbes();
   const captures = useCaptures();
+  const interfaces = useInterfaces();
   const { probeId } = useParams();
   const navigate = useNavigate();
   const [search, setSearch] = useState('');
+  const [registerOpen, setRegisterOpen] = useState(false);
+
+  const interfacesByName = useMemo(() => {
+    const map = new Map<string, CaptureInterface>();
+    for (const item of interfaces.data ?? []) map.set(item.interface, item);
+    return map;
+  }, [interfaces.data]);
 
   const filtered = useMemo(
     () =>
       probes.data?.filter((probe) =>
-        `${probe.name} ${probe.host} ${probe.probe_id}`
+        `${probe.name} ${probe.host} ${probe.probe_id} ${probe.connected_interfaces.join(' ')}`
           .toLowerCase()
           .includes(search.toLowerCase()),
       ) ?? [],
@@ -58,6 +69,14 @@ export function ProbesPage() {
                 data-testid="probe-search"
               />
             </label>
+            <button
+              type="button"
+              className="ep-button ep-button-sm ep-button-primary"
+              onClick={() => setRegisterOpen(true)}
+              data-testid="register-probe-open"
+            >
+              <Plus width={13} height={13} /> Register probe
+            </button>
           </div>
         }
       />
@@ -111,7 +130,36 @@ export function ProbesPage() {
                       <span className="ep-badge">{probe.probe_type}</span>
                     </td>
                     <td className="mono text-ep-xs">{probe.host}</td>
-                    <td className="num">{count(probe.connected_interfaces.length)}</td>
+                    <td>
+                      <div
+                        className="flex flex-wrap items-center gap-1"
+                        data-testid={`probe-row-chips-${probe.probe_id}`}
+                      >
+                        {probe.connected_interfaces.length === 0 && (
+                          <span className="text-text-secondary text-ep-xs">—</span>
+                        )}
+                        {probe.connected_interfaces.map((name) => {
+                          const item = interfacesByName.get(name);
+                          const role = item
+                            ? roleFor(item)
+                            : null;
+                          return (
+                            <span
+                              key={name}
+                              className={`ep-badge ${roleBadgeClass(role)}`}
+                              title={
+                                item
+                                  ? `${name} · ${item.protocol} · ${item.capture_point}`
+                                  : `${name} · not resolved via /interfaces`
+                              }
+                            >
+                              {role ?? '—'}
+                              <span className="mono text-text-secondary">· {name}</span>
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </td>
                     <td>
                       <StatusIndicator
                         state={probe.online ? 'ONLINE' : 'OFFLINE'}
@@ -147,11 +195,20 @@ export function ProbesPage() {
                   )}
                 </span>
               </span>
+              <span className="num">
+                {count(filtered.length)} probe{filtered.length === 1 ? '' : 's'}
+              </span>
             </div>
           </div>
-          <ProbeInspector probe={selected ?? null} captures={captures.data?.items} />
+          <ProbeInspector
+            probe={selected ?? null}
+            captures={captures.data?.items}
+            interfaces={interfaces.data}
+          />
         </div>
       )}
+
+      <RegisterProbeDialog open={registerOpen} onClose={() => setRegisterOpen(false)} />
     </>
   );
 }

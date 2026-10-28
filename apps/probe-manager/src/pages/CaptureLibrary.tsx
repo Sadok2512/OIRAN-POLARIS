@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   flexRender,
   getCoreRowModel,
@@ -7,7 +7,7 @@ import {
   type ColumnDef,
   type SortingState,
 } from '@tanstack/react-table';
-import { AlertTriangle, Download, Eye, FileSearch, Filter, Loader2 } from 'lucide-react';
+import { AlertTriangle, Eye, FileSearch, Filter, Lock } from 'lucide-react';
 import { PageHeader } from '@/ui/PageHeader';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import {
@@ -17,14 +17,17 @@ import {
 } from '@/ui/EmptyErrorLoading';
 import {
   DEFAULT_CAPTURE_PAGE_SIZE,
-  useAuth,
   useCapturesPage,
   useInterfaces,
   useProbes,
 } from '@/data/queries';
 import { bytes, count, durationSeconds, isoToLocal } from '@/data/format';
 import type { Capture } from '@shared/types';
-import { ApiError, authenticatedDownload } from '@shared/api';
+
+// Download is locked in this build: GET /captures/:id/download is not registered
+// on the OIRAN API router (grep '/download' OIRAN/apps/api/src/lib.rs → 0 match).
+// The button stays visible to make the gap explicit; nothing is fetched.
+const DOWNLOAD_LOCKED_REASON = 'GET /captures/:id/download = 404 (route not registered on OIRAN API).';
 
 const STATUS_OPTIONS: Capture['state'][] = [
   'READY',
@@ -49,7 +52,6 @@ export function CaptureLibraryPage({
   const captures = useCapturesPage({ page, pageSize });
   const probes = useProbes();
   const interfaces = useInterfaces();
-  const auth = useAuth();
 
   const [selected, setSelected] = useState<Capture | null>(null);
   const [search, setSearch] = useState('');
@@ -87,42 +89,6 @@ export function CaptureLibraryPage({
     [pageItems, search, probeFilter, interfaceFilter, statusFilter],
   );
 
-  const authenticated = auth.data?.authenticated === true;
-
-  const [downloadingId, setDownloadingId] = useState<string | null>(null);
-  const [downloadError, setDownloadError] = useState<string | null>(null);
-
-  const triggerDownload = useCallback(async (capture: Capture) => {
-    setDownloadError(null);
-    setDownloadingId(capture.capture_id);
-    try {
-      const dl = await authenticatedDownload(
-        `/captures/${encodeURIComponent(capture.capture_id)}/download`,
-        { authScope: 'oiran' },
-      );
-      try {
-        const anchor = document.createElement('a');
-        anchor.href = dl.objectUrl;
-        anchor.download = dl.filename ?? `${capture.name}.pcap`;
-        anchor.rel = 'noopener';
-        document.body.appendChild(anchor);
-        anchor.click();
-        anchor.remove();
-      } finally {
-        dl.revoke();
-      }
-    } catch (error) {
-      setDownloadError(
-        error instanceof ApiError
-          ? `Download failed: HTTP ${error.status} ${error.code}`
-          : error instanceof Error
-            ? error.message
-            : 'Download failed',
-      );
-    } finally {
-      setDownloadingId(null);
-    }
-  }, []);
 
   const columns = useMemo<ColumnDef<Capture>[]>(
     () => [
@@ -235,9 +201,6 @@ export function CaptureLibraryPage({
         cell: ({ row }) => {
           const capture = row.original;
           const failed = (capture.state ?? capture.status) === 'FAILED';
-          const sizeBytes =
-            capture.size_bytes ?? capture.metrics?.storage_bytes ?? null;
-          const downloadable = authenticated && (sizeBytes ?? 0) > 0;
           const analyzerParams = new URLSearchParams({
             capture_id: capture.capture_id,
           });
@@ -274,30 +237,13 @@ export function CaptureLibraryPage({
               <button
                 type="button"
                 className="ep-button ep-button-sm"
-                disabled={!downloadable || downloadingId === capture.capture_id}
-                aria-label={
-                  downloadable
-                    ? `Download PCAP for ${capture.name}`
-                    : 'Download disabled'
-                }
-                title={
-                  !authenticated
-                    ? 'Download requires an authenticated operator role'
-                    : !downloadable
-                      ? 'Capture has no stored bytes — nothing to download'
-                      : 'Download PCAP (Bearer-authenticated, token not in URL)'
-                }
+                disabled
+                aria-disabled="true"
+                title={DOWNLOAD_LOCKED_REASON}
                 data-testid={`download-${capture.capture_id}`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void triggerDownload(capture);
-                }}
+                aria-label={`Download locked for ${capture.name}`}
               >
-                {downloadingId === capture.capture_id ? (
-                  <Loader2 width={13} height={13} className="animate-spin" aria-hidden="true" />
-                ) : (
-                  <Download width={13} height={13} aria-hidden="true" />
-                )}
+                <Lock width={13} height={13} aria-hidden="true" />
               </button>
               {failed && (
                 <span
@@ -312,7 +258,7 @@ export function CaptureLibraryPage({
         },
       },
     ],
-    [authenticated],
+    [],
   );
 
   const table = useReactTable({
@@ -355,15 +301,17 @@ export function CaptureLibraryPage({
         }
       />
 
-      {downloadError && (
-        <div
-          role="alert"
-          className="ep-card border-error/30 p-3 mb-3 text-ep-sm text-error"
-          data-testid="download-error"
-        >
-          {downloadError}
-        </div>
-      )}
+      <div
+        role="status"
+        aria-live="polite"
+        className="ep-card border-warning/30 p-3 mb-3 flex items-start gap-2 text-ep-sm"
+        data-testid="download-locked-banner"
+      >
+        <Lock width={13} height={13} className="text-warning mt-0.5 shrink-0" aria-hidden="true" />
+        <span>
+          PCAP download is disabled across the library: {DOWNLOAD_LOCKED_REASON}
+        </span>
+      </div>
 
       <div
         className="ep-card p-3 flex flex-wrap items-center gap-2 mb-4"
