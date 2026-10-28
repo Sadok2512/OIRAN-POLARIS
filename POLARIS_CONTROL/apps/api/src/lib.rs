@@ -3900,24 +3900,48 @@ async fn validate_ue_profile_provisioning(
     if let Err(error) = require_operator(&identity) {
         return error;
     }
-    let profile = match state
-        .multi_ue
+    let record = match state
+        .profile_registry
         .lock()
         .unwrap()
-        .profiles()
-        .into_iter()
-        .find(|profile| profile.ue_id == ue_id)
+        .profiles
+        .iter()
+        .find(|record| record.profile.ue_id == ue_id)
+        .cloned()
     {
-        Some(profile) => profile,
+        Some(record) => record,
         None => return profile_mutation_error("UNKNOWN_UE_PROFILE".into()),
     };
-    let verified = match state
-        .ue_runtime
-        .verify_provisioning(std::slice::from_ref(&profile))
-    {
-        Ok(verified) if verified.contains_key(&ue_id) => true,
-        Ok(_) => false,
+    let imsi = match state.profile_store.subscriber_imsi(&record) {
+        Ok(imsi) => imsi,
         Err(error) => return profile_mutation_error(error),
+    };
+    let backend = state.subscriber_backend.clone();
+    let lookup_identity = imsi.clone();
+    let subscribers = match tokio::task::spawn_blocking(move || {
+        backend.lookup_many(std::slice::from_ref(&lookup_identity))
+    })
+    .await
+    {
+        Ok(Ok(records)) => records,
+        Ok(Err(error)) => return subscriber_error(error),
+        Err(_) => return subscriber_error("OPEN5GS_DATABASE_UNAVAILABLE".into()),
+    };
+    let verified = if let Some(subscriber) = subscribers.get(&imsi) {
+        match subscriber_matches_profile(&record, subscriber, &imsi, &state.served_network) {
+            Ok(verified) => verified,
+            Err(error) => return profile_mutation_error(error),
+        }
+    } else {
+        // Profiles created from the legacy provisioning-slot plan have no POLARIS-owned
+        // MongoDB record. Preserve their existing byte-exact attestation path.
+        match state
+            .ue_runtime
+            .verify_provisioning(std::slice::from_ref(&record.profile))
+        {
+            Ok(verified) => verified.contains_key(&ue_id),
+            Err(error) => return profile_mutation_error(error),
+        }
     };
     if let Err(error) = state
         .multi_ue
@@ -3955,6 +3979,22 @@ async fn validate_ue_profile_provisioning(
             "open5gs_changed":false
         })),
     )
+}
+
+fn subscriber_matches_profile(
+    record: &ManagedUeProfile,
+    subscriber: &SubscriberRecord,
+    imsi: &str,
+    served_network: &ServedNetworkPolicy,
+) -> Result<bool, String> {
+    let identity_digest = DockerUeRuntime::hash_bytes(format!("imsi-{imsi}").as_bytes())?;
+    Ok(served_network.validate(subscriber).is_ok()
+        && record.subscriber_identity_sha256 == identity_digest
+        && record.profile.plmn_mcc == subscriber.plmn_mcc
+        && record.profile.plmn_mnc == subscriber.plmn_mnc
+        && record.profile.sst == subscriber.sst
+        && record.profile.sd == subscriber.sd
+        && subscriber.dnns.iter().any(|dnn| dnn == &record.profile.dnn))
 }
 
 async fn delete_ue_profile(
@@ -10153,6 +10193,53 @@ mod p0_tests {
             .cloned()
             .unwrap();
         assert!(record.profile.subscription_verified);
+    }
+
+    #[test]
+    fn mongo_owned_subscriber_revalidates_only_an_exact_profile_binding() {
+        let test_state = state();
+        let mut record = test_state
+            .profile_registry
+            .lock()
+            .unwrap()
+            .profiles
+            .iter()
+            .find(|record| record.profile.ue_id == "UE-02")
+            .cloned()
+            .unwrap();
+        let imsi = "001010000000002";
+        record.subscriber_identity_sha256 =
+            DockerUeRuntime::hash_bytes(format!("imsi-{imsi}").as_bytes()).unwrap();
+        let subscriber = SubscriberRecord {
+            imsi: imsi.into(),
+            k: "11".repeat(16),
+            opc: "22".repeat(16),
+            slot: "slot-test".into(),
+            plmn_mcc: record.profile.plmn_mcc.clone(),
+            plmn_mnc: record.profile.plmn_mnc.clone(),
+            sst: record.profile.sst,
+            sd: record.profile.sd.clone(),
+            dnns: vec![record.profile.dnn.clone()],
+            ambr: subscriber_provisioning::SubscriberAmbr {
+                uplink: 1_000_000,
+                downlink: 2_000_000,
+            },
+        };
+
+        assert!(
+            subscriber_matches_profile(&record, &subscriber, imsi, &test_state.served_network)
+                .unwrap()
+        );
+
+        let mut incompatible = subscriber;
+        incompatible.dnns = vec!["ims".into()];
+        assert!(!subscriber_matches_profile(
+            &record,
+            &incompatible,
+            imsi,
+            &test_state.served_network
+        )
+        .unwrap());
     }
 
     #[tokio::test]
