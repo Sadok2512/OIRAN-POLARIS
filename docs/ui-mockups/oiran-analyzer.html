@@ -1,0 +1,491 @@
+<title>OIRAN Analyzer</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: app shell — collapsible sidebar + content; probe list with a sticky inspector. Tokens follow packages/ui/src/tokens.ts (Enterprise Precision). */
+:root {
+  --c-background: #F5F7FA; --c-surface: #FFFFFF; --c-sidebar: #F0F4F9; --c-text-primary: #17283F;
+  --c-text-secondary: #5B6A80; --c-border: #DEE5ED; --c-primary: #2563EB; --c-primary-soft: #E8EFFD;
+  --c-success: #047857; --c-success-soft: #E3F4EC; --c-warning: #B45309; --c-warning-soft: #FDF1E1;
+  --c-error: #DC2626; --c-error-soft: #FDECEC; --c-violet: #6D4AD9; --c-violet-soft: #EFEBFC;
+  --c-track: #E8EDF3;
+  --shadow-1: 0 1px 2px rgba(23,40,63,.06); --shadow-2: 0 8px 24px rgba(23,40,63,.10);
+  --font-sans: Inter, "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --c-background: #0B1220; --c-surface: #152238; --c-sidebar: #101B2C; --c-text-primary: #E7F0FF;
+  --c-text-secondary: #9AAAC0; --c-border: #2A3A54; --c-primary: #5B93F7; --c-primary-soft: #1A2C4D;
+  --c-success: #34D399; --c-success-soft: #123528; --c-warning: #FBBF24; --c-warning-soft: #3A2A10;
+  --c-error: #F87171; --c-error-soft: #3B1A1D; --c-violet: #A894F5; --c-violet-soft: #251D45;
+  --c-track: #22324B; --shadow-1: 0 1px 2px rgba(0,0,0,.4); --shadow-2: 0 8px 24px rgba(0,0,0,.45); color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --c-background: #0B1220; --c-surface: #152238; --c-sidebar: #101B2C; --c-text-primary: #E7F0FF;
+  --c-text-secondary: #9AAAC0; --c-border: #2A3A54; --c-primary: #5B93F7; --c-primary-soft: #1A2C4D;
+  --c-success: #34D399; --c-success-soft: #123528; --c-warning: #FBBF24; --c-warning-soft: #3A2A10;
+  --c-error: #F87171; --c-error-soft: #3B1A1D; --c-violet: #A894F5; --c-violet-soft: #251D45;
+  --c-track: #22324B; --shadow-1: 0 1px 2px rgba(0,0,0,.4); --shadow-2: 0 8px 24px rgba(0,0,0,.45); color-scheme: dark; }
+html, body { height: 100%; }
+body { background: var(--c-background); color: var(--c-text-primary); font-family: var(--font-sans); font-size: 13px; -webkit-font-smoothing: antialiased; font-feature-settings: "ss01","cv11"; }
+.mono, .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+table { font-variant-numeric: tabular-nums; }
+:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; border-radius: 4px; }
+h1, h2 { text-wrap: balance; }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+@keyframes pulse-dot { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+.live-dot { animation: pulse-dot 1.6s ease-in-out infinite; }
+</style>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>
+tailwind.config = {
+  darkMode: ['class', '[data-theme="dark"]'],
+  theme: { extend: {
+    colors: {
+      canvas: 'var(--c-background)', surface: 'var(--c-surface)', sidebar: 'var(--c-sidebar)', line: 'var(--c-border)',
+      ink: 'var(--c-text-primary)', mute: 'var(--c-text-secondary)', brand: 'var(--c-primary)', 'brand-soft': 'var(--c-primary-soft)',
+      ok: 'var(--c-success)', 'ok-soft': 'var(--c-success-soft)', warn: 'var(--c-warning)', 'warn-soft': 'var(--c-warning-soft)',
+      bad: 'var(--c-error)', 'bad-soft': 'var(--c-error-soft)', vio: 'var(--c-violet)', 'vio-soft': 'var(--c-violet-soft)', track: 'var(--c-track)'
+    },
+    fontSize: { xs2: ['11px', '1.4'], sm2: ['12px', '1.5'], base2: ['13px', '1.55'], md2: ['14px', '1.55'], xl2: ['18px', '1.4'], h2: ['22px', '1.3'], h1: ['26px', '1.25'] },
+    boxShadow: { e1: 'var(--shadow-1)', e2: 'var(--shadow-2)' }
+  } }
+};
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/htm@3.1.1/dist/htm.umd.js"></script>
+
+<div id="root"></div>
+<script>
+const { useState, useEffect, useMemo } = React;
+const html = htm.bind(React.createElement);
+
+/* ---------------- Icons ---------------- */
+const P = {
+  overview: 'M3 3h7v9H3zM14 3h7v5h-7zM14 12h7v9h-7zM3 16h7v5H3z',
+  sessions: 'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01',
+  flow: 'M6 3v18M18 3v18M6 8h12M18 14H6',
+  link: 'M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7',
+  packet: 'M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9zM14 3v6h6M10 17a3 3 0 1 0 0-6a3 3 0 0 0 0 6zM12.2 16.2L14 18',
+  db: 'M12 8c4.4 0 8-1.3 8-3s-3.6-3-8-3s-8 1.3-8 3s3.6 3 8 3zM4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3',
+  download: 'M12 3v12M7 10l5 5l5-5M5 21h14',
+  search: 'M11 19a8 8 0 1 0 0-16a8 8 0 0 0 0 16zM21 21l-4.3-4.3',
+  sun: 'M12 17a5 5 0 1 0 0-10a5 5 0 0 0 0 10zM12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4',
+  moon: 'M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z',
+  lock: 'M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4',
+  shield: 'M12 22s8-4 8-10V5l-8-3l-8 3v7c0 6 8 10 8 10z',
+  chevron: 'M9 6l6 6l-6 6',
+  arrow: 'M5 12h14M13 6l6 6l-6 6',
+  logo: 'M12 12m-2 0a2 2 0 1 0 4 0a2 2 0 1 0-4 0M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2'
+};
+function Icon({ name, size = 16, className = '' }) {
+  return html`<svg width=${size} height=${size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className=${className}><path d=${P[name]} /></svg>`;
+}
+
+/* ---------------- Primitives ---------------- */
+const TONES = { ok: 'bg-ok-soft text-ok', warn: 'bg-warn-soft text-warn', bad: 'bg-bad-soft text-bad', brand: 'bg-brand-soft text-brand', vio: 'bg-vio-soft text-vio', mute: 'bg-track text-mute' };
+function Pill({ tone = 'mute', children, dot }) {
+  return html`<span className=${'inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs2 font-semibold tracking-wide whitespace-nowrap ' + TONES[tone]}>
+    ${dot && html`<span className="h-1.5 w-1.5 rounded-full bg-current live-dot"></span>`}${children}</span>`;
+}
+function Card({ children, className = '' }) { return html`<section className=${'rounded-xl border border-line bg-surface shadow-e1 ' + className}>${children}</section>`; }
+function Locked({ children, reason }) {
+  return html`<button disabled title=${reason} className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-dashed border-line text-sm2 text-mute cursor-not-allowed whitespace-nowrap"><${Icon} name="lock" size=${12} />${children}</button>`;
+}
+function Btn({ children, icon, primary, onClick }) {
+  return html`<button onClick=${onClick} className=${'inline-flex items-center gap-1.5 h-9 px-4 rounded-md text-md2 font-medium whitespace-nowrap ' + (primary ? 'bg-brand text-white shadow-e1 hover:brightness-110' : 'border border-line bg-surface hover:bg-canvas')}>
+    ${icon && html`<${Icon} name=${icon} size=${15} />`}${children}</button>`;
+}
+function PageHeader({ eyebrow, title, desc, actions }) {
+  return html`<header className="flex flex-wrap items-end justify-between gap-3">
+    <div className="min-w-0"><p className="text-xs2 font-semibold uppercase tracking-wider text-mute">${eyebrow}</p>
+      <h1 className="text-h1 font-semibold">${title}</h1>${desc && html`<p className="mt-1 text-md2 text-mute max-w-[72ch]">${desc}</p>`}</div>${actions}</header>`;
+}
+function Stat({ label, value, sub }) {
+  return html`<${Card} className="p-4 flex flex-col gap-1"><p className="text-xs2 font-semibold uppercase tracking-wider text-mute">${label}</p>
+    <p className="num text-[26px] leading-tight font-medium">${value}</p><p className="text-sm2 text-mute">${sub}</p></${Card}>`;
+}
+function Tabs({ tabs, value, onChange, label }) {
+  return html`<div role="tablist" aria-label=${label} className="flex flex-wrap gap-1 border-b border-line">
+    ${tabs.map(([v, l]) => html`<button key=${v} role="tab" aria-selected=${value === v} onClick=${() => onChange(v)}
+      className=${'h-9 px-3 -mb-px border-b-2 text-sm2 whitespace-nowrap ' + (value === v ? 'border-brand text-brand font-semibold' : 'border-transparent text-mute hover:text-ink')}>${l}</button>`)}</div>`;
+}
+function Field({ k, v, mono }) {
+  return html`<div className="min-w-0"><dt className="text-xs2 uppercase tracking-wider text-mute">${k}</dt><dd className=${'truncate ' + (mono ? 'mono text-sm2' : '')} title=${typeof v === 'string' ? v : undefined}>${v}</dd></div>`;
+}
+const ifTone = (i) => ({ N2: 'brand', SBI: 'ok', N4: 'warn', N3: 'vio' }[i] || 'mute');
+const confTone = (c) => ({ EXACT: 'ok', STRONG: 'ok', POSSIBLE: 'warn', UNKNOWN: 'mute' }[c] || 'mute');
+const decTone = (d) => ({ DECODED: 'ok', PARTIAL: 'warn', UNSUPPORTED: 'mute', MALFORMED: 'bad', ENCRYPTED_OR_PROTECTED: 'vio' }[d] || 'mute');
+const kindTone = (k) => ({ CAPTURED_LIVE: 'ok', HISTORICAL: 'mute', RECOVERED: 'warn' }[k] || 'mute');
+function IfChip({ i }) { return html`<span className=${'mono text-xs2 font-semibold rounded px-1.5 py-0.5 ' + TONES[ifTone(i)]}>${i}</span>`; }
+
+/* ---------------- Example data (shapes follow OIRAN/apps/web/src/types/api.ts) ---------------- */
+const PARTS = [
+  { id: 'gNB', role: 'GNB-01', addr: '10.77.21.20 · 10.77.22.20' },
+  { id: 'AMF', role: 'Open5GS AMF', addr: '10.77.21.11' },
+  { id: 'SMF', role: 'Open5GS SMF', addr: 'SBI · N4' },
+  { id: 'UPF', role: 'Open5GS UPF', addr: 'N4 · N3' }
+];
+const E = (i, t, itf, proto, msg, nas, s, d, proc, dec, sem, extra = {}) => ({
+  event_id: 'ev-' + String(i).padStart(3, '0'), seq: i, timestamp: t, interface: itf, protocol: proto, message_name: msg, nas, source_participant: s, destination_participant: d,
+  procedure_group: proc, decoding_status: dec, semantic_status: sem, packet_number: 30 + i, byte_offset: 4096 + i * 212, captured_length: 120 + (i * 37) % 180, ...extra
+});
+const EVENTS = [
+  E(1, '22:44:41.226', 'N2', 'NGAP', 'InitialUEMessage', 'Registration Request', 'gNB', 'AMF', 'Registration', 'PARTIAL', 'NORMAL', { withheld: 2 }),
+  E(2, '22:44:41.292', 'N2', 'NGAP', 'DownlinkNASTransport', 'Authentication Request', 'AMF', 'gNB', 'Registration', 'DECODED', 'NORMAL'),
+  E(3, '22:44:41.294', 'N2', 'NGAP', 'UplinkNASTransport', 'Authentication Response', 'gNB', 'AMF', 'Registration', 'DECODED', 'SUCCESS'),
+  E(4, '22:44:41.309', 'N2', 'NGAP', 'DownlinkNASTransport', 'Security Mode Command', 'AMF', 'gNB', 'Registration', 'DECODED', 'NORMAL'),
+  E(5, '22:44:41.311', 'N2', 'NGAP', 'UplinkNASTransport', 'Security Mode Complete', 'gNB', 'AMF', 'Registration', 'ENCRYPTED_OR_PROTECTED', 'SUCCESS'),
+  E(6, '22:44:41.338', 'N2', 'NGAP', 'InitialContextSetupRequest', 'Registration Accept', 'AMF', 'gNB', 'Registration', 'ENCRYPTED_OR_PROTECTED', 'NORMAL', { withheld: 1 }),
+  E(7, '22:44:41.341', 'N2', 'NGAP', 'InitialContextSetupResponse', null, 'gNB', 'AMF', 'Registration', 'DECODED', 'SUCCESS'),
+  E(8, '22:44:41.402', 'N2', 'NGAP', 'UplinkNASTransport', 'PDU Session Establishment Request', 'gNB', 'AMF', 'PDU session', 'ENCRYPTED_OR_PROTECTED', 'NORMAL'),
+  E(9, '22:44:41.405', 'SBI', 'HTTP/2', 'POST sm-contexts', 'Nsmf_PDUSession_CreateSMContext', 'AMF', 'SMF', 'PDU session', 'DECODED', 'NORMAL'),
+  E(10, '22:44:41.409', 'SBI', 'HTTP/2', '201 Created', null, 'SMF', 'AMF', 'PDU session', 'DECODED', 'SUCCESS'),
+  E(11, '22:44:41.412', 'N4', 'PFCP', 'Session Establishment Request', null, 'SMF', 'UPF', 'PDU session', 'DECODED', 'NORMAL'),
+  E(12, '22:44:41.414', 'N4', 'PFCP', 'Session Establishment Response', null, 'UPF', 'SMF', 'PDU session', 'DECODED', 'SUCCESS'),
+  E(13, '22:44:41.418', 'SBI', 'HTTP/2', 'POST n1-n2-messages', 'Namf_Communication_N1N2MessageTransfer', 'SMF', 'AMF', 'PDU session', 'PARTIAL', 'NORMAL'),
+  E(14, '22:44:41.421', 'N2', 'NGAP', 'PDUSessionResourceSetupRequest', 'PDU Session Establishment Accept', 'AMF', 'gNB', 'PDU session', 'PARTIAL', 'NORMAL'),
+  E(15, '22:44:41.437', 'N2', 'NGAP', 'PDUSessionResourceSetupResponse', null, 'gNB', 'AMF', 'PDU session', 'DECODED', 'SUCCESS'),
+  E(16, '22:44:41.440', 'N4', 'PFCP', 'Session Modification Request', null, 'SMF', 'UPF', 'PDU session', 'DECODED', 'NORMAL'),
+  E(17, '22:44:41.442', 'N4', 'PFCP', 'Session Modification Response', null, 'UPF', 'SMF', 'PDU session', 'DECODED', 'SUCCESS'),
+  E(18, '22:44:41.513', 'N3', 'GTP-U', 'G-PDU (first uplink)', null, 'gNB', 'UPF', 'User plane', 'DECODED', 'NORMAL')
+];
+const IE_TREES = {
+  NGAP: [
+    { name: 'procedureCode', value: 'from message', status: 'DECODED' },
+    { name: 'criticality', value: 'reject / ignore', status: 'DECODED' },
+    { name: 'RAN-UE-NGAP-ID', value: '[id]', status: 'DECODED' },
+    { name: 'AMF-UE-NGAP-ID', value: '[id]', status: 'DECODED' },
+    { name: 'NAS-PDU', value: null, status: 'PARTIAL', children: [
+      { name: 'Extended protocol discriminator', value: '5GMM', status: 'DECODED' },
+      { name: 'Security header type', value: '[type]', status: 'DECODED' },
+      { name: 'Message type', value: 'from message', status: 'DECODED' }
+    ] },
+    { name: 'UserLocationInformation', value: null, status: 'DECODED', children: [
+      { name: 'NR-CGI · PLMN', value: '001/01', status: 'DECODED' }, { name: 'TAI · TAC', value: '200', status: 'DECODED' }
+    ] }
+  ],
+  PFCP: [
+    { name: 'Node ID', value: '[smf address]', status: 'DECODED' }, { name: 'CP F-SEID', value: '[seid]', status: 'DECODED' },
+    { name: 'Create PDR', value: null, status: 'DECODED', children: [{ name: 'PDR ID', value: '1', status: 'DECODED' }, { name: 'Source interface', value: 'Access', status: 'DECODED' }] },
+    { name: 'Create FAR', value: null, status: 'DECODED', children: [{ name: 'Apply action', value: 'FORW', status: 'DECODED' }] }
+  ],
+  'HTTP/2': [
+    { name: ':method', value: 'POST', status: 'DECODED' }, { name: ':path', value: '/nsmf-pdusession/v1/…', status: 'DECODED' },
+    { name: 'content-type', value: 'multipart/related', status: 'DECODED' },
+    { name: 'JSON body', value: null, status: 'PARTIAL', children: [{ name: 'pduSessionId', value: '1', status: 'DECODED' }, { name: 'dnn', value: 'internet', status: 'DECODED' }, { name: 'sNssai', value: '1 / 010203', status: 'DECODED' }] }
+  ],
+  'GTP-U': [{ name: 'Message type', value: 'G-PDU (255)', status: 'DECODED' }, { name: 'TEID', value: '[teid]', status: 'DECODED' }, { name: 'Inner IP', value: 'IPv4 · UDP', status: 'DECODED' }]
+};
+const EDGES = [
+  { edge_id: 'ce-01', from: 'ev-008', to: 'ev-009', pair: 'N2 ↔ SBI', ids: ['PDU session ID', 'AMF-UE-NGAP-ID ↔ smContext ref'], rule: 'n2-sbi.pdu-create', ver: '1.2.0', confidence: 'STRONG' },
+  { edge_id: 'ce-02', from: 'ev-009', to: 'ev-011', pair: 'SBI ↔ N4', ids: ['SM context ↔ CP F-SEID'], rule: 'sbi-n4.session', ver: '1.0.1', confidence: 'STRONG' },
+  { edge_id: 'ce-03', from: 'ev-014', to: 'ev-016', pair: 'N2 ↔ N4', ids: ['UL TEID', 'DL TEID'], rule: 'n2-n4.tunnel', ver: '1.1.0', confidence: 'EXACT' },
+  { edge_id: 'ce-04', from: 'ev-016', to: 'ev-018', pair: 'N4 ↔ N3', ids: ['UL TEID'], rule: 'n4-n3.teid', ver: '0.9.0', confidence: 'POSSIBLE', limitation: 'Only one G-PDU in the capture window' }
+];
+const CORR = [['N2 ↔ SBI', 'STRONG'], ['SBI ↔ N4', 'STRONG'], ['N2 ↔ N4', 'EXACT'], ['N4 ↔ N3', 'POSSIBLE'], ['End to end', 'POSSIBLE']];
+const SESSIONS = [
+  { session_id: '5g-session-18fe28a814c4b094', ue: 'UE-ebee45ec', tech: '5G SA', node: 'GNB-01', procedure: 'Registration + PDU session', start: '2026-10-26 22:44:41.226', dur: '287 ms', interfaces: ['N2', 'SBI', 'N4', 'N3'], messages: 18, corr: 'POSSIBLE', decoded: 11, partial: 4, protected: 3, dataset: 'derived-e2e-002-live' },
+  { session_id: '5g-session-07ac91d2e3f05b11', ue: 'UE-4d1a9c02', tech: '5G SA', node: 'GNB-01', procedure: 'Registration', start: '2026-10-26 22:46:02.118', dur: '141 ms', interfaces: ['N2'], messages: 8, corr: 'UNKNOWN', decoded: 6, partial: 0, protected: 2, dataset: 'derived-e2e-002-live' },
+  { session_id: '5g-session-c3b0f7718a2d4e60', ue: 'UE-ebee45ec', tech: '5G SA', node: 'GNB-01', procedure: 'PDU session release', start: '2026-10-26 22:51:13.904', dur: '64 ms', interfaces: ['N2', 'SBI', 'N4'], messages: 9, corr: 'STRONG', decoded: 9, partial: 0, protected: 0, dataset: 'derived-e2e-002-live' },
+  { session_id: '5g-session-9e14ab6c0d77f2a8', ue: 'UE-73f2e810', tech: '5G SA', node: 'GNB-01', procedure: 'Registration (auth failure)', start: '2026-10-25 09:12:37.551', dur: '38 ms', interfaces: ['N2'], messages: 4, corr: 'UNKNOWN', decoded: 3, partial: 1, protected: 0, dataset: 'historical-lab-1025' }
+];
+const DATASETS = [
+  { dataset_id: 'derived-e2e-002-live', name: 'E2E-002 live capture', kind: 'CAPTURED_LIVE', source: 'vProbe · oiran-lab-n2/n3/n4', sessions: 3, events: 35, packets: 1483, status: 'COMPLETE', accounting: 'BALANCED', read_only: true, decoders: { ngap: '0.3.0', nas: '0.2.1', pfcp: '0.2.0', sbi: '0.1.4', gtpu: '0.1.2' } },
+  { dataset_id: 'historical-lab-1025', name: 'Lab 25 Oct (imported)', kind: 'HISTORICAL', source: 'pcapng import', sessions: 1, events: 4, packets: 212, status: 'COMPLETE', accounting: 'BALANCED', read_only: true, decoders: { ngap: '0.3.0', nas: '0.2.1' } },
+  { dataset_id: 'recovered-prestop-1', name: 'Pre-stop checkpoint', kind: 'RECOVERED', source: 'checkpoint restore', sessions: 5, events: 123, packets: 1483, status: 'COMPLETE', accounting: 'BALANCED', read_only: true, decoders: { ngap: '0.3.0', pfcp: '0.2.0' } }
+];
+
+/* ---------------- Shell ---------------- */
+const NAV = [
+  { id: 'overview', label: 'Overview', icon: 'overview', section: 'Investigate' },
+  { id: 'sessions', label: 'Sessions', icon: 'sessions', section: 'Investigate' },
+  { id: 'callflow', label: 'Call flow', icon: 'flow', section: 'Investigate' },
+  { id: 'correlation', label: 'Correlation', icon: 'link', section: 'Investigate' },
+  { id: 'packets', label: 'Packets', icon: 'packet', section: 'Evidence' },
+  { id: 'datasets', label: 'Datasets', icon: 'db', section: 'Evidence' },
+  { id: 'exports', label: 'Exports', icon: 'download', section: 'Evidence' }
+];
+function readHash() { const h = (location.hash || '').slice(1); return NAV.some((n) => n.id === h) ? h : 'callflow'; }
+const go = (v) => { location.hash = v; };
+
+function App() {
+  const [view, setView] = useState(readHash());
+  const [theme, setTheme] = useState(() => { try { return localStorage.getItem('oa-theme') || ''; } catch { return ''; } });
+  useEffect(() => { const f = () => setView(readHash()); addEventListener('hashchange', f); return () => removeEventListener('hashchange', f); }, []);
+  useEffect(() => {
+    if (theme) document.documentElement.setAttribute('data-theme', theme); else document.documentElement.removeAttribute('data-theme');
+    try { theme ? localStorage.setItem('oa-theme', theme) : localStorage.removeItem('oa-theme'); } catch {}
+  }, [theme]);
+  const isDark = theme === 'dark' || (!theme && matchMedia('(prefers-color-scheme: dark)').matches);
+  const V = { overview: Overview, sessions: Sessions, callflow: CallFlow, correlation: Correlation, packets: Packets, datasets: Datasets, exports: Exports }[view];
+  const pad = { paddingLeft: 'max(16px, env(safe-area-inset-left, 0px))', paddingRight: 'max(16px, env(safe-area-inset-right, 0px))' };
+
+  return html`<div className="min-h-full flex flex-col md:flex-row">
+    <aside className="md:w-56 shrink-0 bg-sidebar border-b md:border-b-0 md:border-r border-line md:min-h-screen">
+      <div className="flex items-center gap-2.5 py-4" style=${{ paddingLeft: 'max(16px, env(safe-area-inset-left, 0px))', paddingRight: '16px' }}>
+        <div className="grid place-items-center h-8 w-8 rounded-lg bg-ok text-white"><${Icon} name="logo" size=${17} /></div>
+        <div className="leading-tight"><p className="text-md2 font-semibold">OIRAN Analyzer</p><p className="text-sm2 text-mute">Signalling evidence</p></div>
+      </div>
+      <nav aria-label="Primary" className="flex md:flex-col gap-1 overflow-x-auto md:overflow-visible pb-3 md:pb-0" style=${{ paddingLeft: 'max(12px, env(safe-area-inset-left, 0px))', paddingRight: '12px' }}>
+        ${['Investigate', 'Evidence'].map((section) => html`<div key=${section} className="flex md:flex-col gap-1 md:mb-3">
+          <p className="hidden md:block px-2 py-1 text-xs2 font-semibold uppercase tracking-wider text-mute">${section}</p>
+          ${NAV.filter((n) => n.section === section).map((n) => html`<a key=${n.id} href=${'#' + n.id} aria-current=${view === n.id ? 'page' : undefined}
+            className=${'flex items-center gap-2.5 whitespace-nowrap rounded-md px-2.5 py-2 text-md2 transition-colors ' + (view === n.id ? 'bg-surface text-ink font-medium shadow-e1' : 'text-mute hover:text-ink hover:bg-surface')}>
+            <${Icon} name=${n.icon} />${n.label}</a>`)}</div>`)}
+        <div className="hidden md:flex mt-2 mx-2 border-t border-line pt-3 gap-2 text-sm2 text-mute"><${Icon} name="shield" size=${15} className="shrink-0 mt-0.5" />
+          <span>Subscriber identities (IMSI, IMEI, TMSI, GUTI) are never stored or shown.</span></div>
+      </nav>
+    </aside>
+    <div className="flex-1 min-w-0 flex flex-col">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line bg-surface py-2.5" style=${pad}>
+        <label className="relative flex-1 min-w-[220px] max-w-md">
+          <span className="sr-only">Search sessions</span>
+          <${Icon} name="search" size=${15} className="absolute left-3 top-1/2 -translate-y-1/2 text-mute" />
+          <input placeholder="Session ID, UE pseudonym or procedure" className="w-full h-9 pl-9 pr-3 rounded-md border border-line bg-canvas text-md2 placeholder:text-mute" />
+        </label>
+        <div className="flex flex-wrap items-center gap-3 text-sm2 text-mute">
+          <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-ok live-dot"></span>vProbe connected</span>
+          <span className="num">5G SA</span>
+          <span className="rounded border border-line px-1.5 py-0.5 text-xs2">Example data</span>
+          <button onClick=${() => setTheme(isDark ? 'light' : 'dark')} className="inline-flex items-center gap-2 h-8 px-3 rounded-md border border-line text-sm2 text-ink hover:bg-canvas" aria-label="Toggle colour theme">
+            <${Icon} name=${isDark ? 'sun' : 'moon'} size=${14} />${isDark ? 'Light' : 'Dark'}</button>
+        </div>
+      </div>
+      <main className="flex-1 min-w-0 flex flex-col gap-5" style=${{ paddingTop: '24px', paddingBottom: '40px', ...pad }}><${V} /></main>
+    </div>
+  </div>`;
+}
+
+/* ---------------- Overview ---------------- */
+function Overview() {
+  return html`<${PageHeader} eyebrow="Investigate" title="Overview" desc="Datasets, reconstructed sessions and decode quality across everything the probes have captured." />
+    <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+      <${Stat} label="Datasets" value="3" sub="1 live · 1 historical · 1 recovered" />
+      <${Stat} label="Sessions" value="9" sub="reconstructed PDU sessions" />
+      <${Stat} label="Events" value="162" sub="0 unmatched · 0 duplicates" />
+      <${Stat} label="Decode errors" value="0" sub="malformed messages" />
+    </div>
+    <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px] items-start">
+      <${Card} className="overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-line"><h2 className="font-semibold">Latest sessions</h2>
+          <button onClick=${() => go('sessions')} className="text-sm2 text-brand inline-flex items-center gap-1">All sessions <${Icon} name="chevron" size=${13} /></button></div>
+        <ul className="divide-y divide-line">${SESSIONS.slice(0, 4).map((s) => html`<li key=${s.session_id}>
+          <button onClick=${() => go('callflow')} className="w-full text-left px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-1 hover:bg-canvas">
+            <span className="min-w-0 flex-1"><span className="block font-medium truncate">${s.procedure}</span><span className="block mono text-xs2 text-mute truncate">${s.session_id}</span></span>
+            <span className="flex gap-1">${s.interfaces.map((i) => html`<${IfChip} key=${i} i=${i} />`)}</span>
+            <span className="mono text-sm2 text-mute w-24 text-right">${s.start.slice(11, 19)}</span>
+            <${Pill} tone=${confTone(s.corr)}>${s.corr}</${Pill}></button></li>`)}</ul></${Card}>
+      <${Card} className="p-5"><h2 className="font-semibold mb-3">Decoder versions</h2>
+        <dl className="grid grid-cols-2 gap-x-4 gap-y-2.5">${Object.entries({ NGAP: '0.3.0', 'NAS-5GS': '0.2.1', PFCP: '0.2.0', SBI: '0.1.4', 'GTP-U': '0.1.2', 'Session engine': '0.4.0' }).map(([k, v]) => html`<${Field} key=${k} k=${k} v=${v} mono />`)}</dl>
+        <p className="mt-4 border-t border-line pt-3 text-sm2 text-mute">All datasets are read-only. Analysis never changes a capture.</p></${Card}>
+    </div>`;
+}
+
+/* ---------------- Sessions ---------------- */
+function Sessions() {
+  const [sel, setSel] = useState(SESSIONS[0].session_id);
+  const [itf, setItf] = useState('all');
+  const rows = SESSIONS.filter((s) => itf === 'all' || s.interfaces.includes(itf));
+  const s = SESSIONS.find((x) => x.session_id === sel) || rows[0];
+  const total = s ? s.decoded + s.partial + s.protected : 1;
+  return html`<${PageHeader} eyebrow="Investigate" title="Sessions" desc="UE contexts and PDU sessions reconstructed from the captured signalling. UEs appear only as pseudonyms."
+      actions=${html`<${Btn} icon="flow" primary onClick=${() => go('callflow')}>Open call flow</${Btn}>`} />
+    <div className="flex flex-wrap gap-2">
+      <select className="h-9 px-3 rounded-md border border-line bg-surface text-md2" aria-label="Dataset"><option>All datasets</option>${DATASETS.map((d) => html`<option key=${d.dataset_id}>${d.name}</option>`)}</select>
+      <select value=${itf} onChange=${(e) => setItf(e.target.value)} className="h-9 px-3 rounded-md border border-line bg-surface text-md2" aria-label="Interface">
+        <option value="all">All interfaces</option>${['N2', 'SBI', 'N4', 'N3'].map((i) => html`<option key=${i} value=${i}>${i}</option>`)}</select>
+      <select className="h-9 px-3 rounded-md border border-line bg-surface text-md2" aria-label="Correlation"><option>Any correlation</option><option>Exact / strong</option><option>Possible</option><option>Unknown</option></select>
+    </div>
+    <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_320px] items-start">
+      <${Card} className="overflow-hidden"><div className="overflow-x-auto"><table className="w-full min-w-[760px] text-md2">
+        <thead><tr className="text-left text-xs2 uppercase tracking-wider text-mute border-b border-line">
+          ${['Procedure', 'UE', 'Start (UTC)', 'Duration', 'Interfaces', 'Msgs', 'Correlation'].map((h, i) => html`<th key=${h} className=${'py-2.5 font-semibold ' + (i === 0 ? 'px-4' : 'px-3') + (h === 'Msgs' || h === 'Duration' ? ' text-right' : '')}>${h}</th>`)}</tr></thead>
+        <tbody>${rows.map((r) => html`<tr key=${r.session_id} onClick=${() => setSel(r.session_id)} aria-selected=${sel === r.session_id}
+          className=${'border-b border-line last:border-0 cursor-pointer ' + (sel === r.session_id ? 'bg-brand-soft' : 'hover:bg-canvas')}>
+          <td className="px-4 py-3 max-w-[260px]"><p className="font-medium truncate">${r.procedure}</p><p className="mono text-xs2 text-mute truncate">${r.session_id} · ${r.node}</p></td>
+          <td className="px-3 py-3 mono text-sm2 whitespace-nowrap">${r.ue}</td>
+          <td className="px-3 py-3 mono text-sm2 whitespace-nowrap">${r.start}</td><td className="px-3 py-3 num text-right">${r.dur}</td>
+          <td className="px-3 py-3"><span className="flex gap-1">${r.interfaces.map((i) => html`<${IfChip} key=${i} i=${i} />`)}</span></td>
+          <td className="px-3 py-3 num text-right">${r.messages}</td><td className="px-3 py-3"><${Pill} tone=${confTone(r.corr)}>${r.corr}</${Pill}></td></tr>`)}</tbody></table></div>
+        <div className="flex items-center justify-between px-4 py-2.5 border-t border-line text-sm2 text-mute"><span>${rows.length} sessions</span><span>Page 1 of 1</span></div></${Card}>
+      ${s && html`<${Card} className="p-5 flex flex-col gap-4 xl:sticky xl:top-4">
+        <div><p className="text-xs2 font-semibold uppercase tracking-wider text-mute">Selected session</p><h2 className="text-xl2 font-semibold">${s.procedure}</h2><p className="mono text-xs2 text-mute break-all">${s.session_id}</p></div>
+        <dl className="grid grid-cols-2 gap-x-4 gap-y-3"><${Field} k="UE pseudonym" v=${s.ue} mono /><${Field} k="PDU session" v="1" mono /><${Field} k="Serving node" v=${s.node} mono /><${Field} k="Technology" v=${s.tech} />
+          <${Field} k="Duration" v=${s.dur} mono /><${Field} k="Background events" v="0" mono /></dl>
+        <dl className="grid gap-y-3"><${Field} k="Start (UTC)" v=${s.start} mono /><${Field} k="Dataset" v=${s.dataset} mono /></dl>
+        <div><p className="text-xs2 font-semibold uppercase tracking-wider text-mute mb-1.5">Decode completeness · ${s.messages} messages</p>
+          <div className="flex h-2 rounded-full overflow-hidden bg-track" role="img" aria-label=${s.decoded + ' decoded, ' + s.partial + ' partial, ' + s.protected + ' protected'}>
+            <div className="bg-ok" style=${{ width: (s.decoded / total) * 100 + '%' }}></div><div className="bg-warn" style=${{ width: (s.partial / total) * 100 + '%' }}></div><div className="bg-vio" style=${{ width: (s.protected / total) * 100 + '%' }}></div></div>
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm2 text-mute">
+            <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-ok"></span>Decoded ${s.decoded}</span>
+            <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-warn"></span>Partial ${s.partial}</span>
+            <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-vio"></span>NAS protected ${s.protected}</span></div></div>
+        <div className="flex flex-wrap gap-2 border-t border-line pt-3"><${Btn} icon="flow" primary onClick=${() => go('callflow')}>Call flow</${Btn}><${Btn} icon="link" onClick=${() => go('correlation')}>Correlation</${Btn}></div>
+      </${Card}>`}
+    </div>`;
+}
+
+/* ---------------- Call flow ---------------- */
+const ROW = 46, HEAD = 0;
+function Ladder({ events, sel, onSel }) {
+  const n = PARTS.length, x = (id) => ((PARTS.findIndex((p) => p.id === id) + 0.5) / n) * 100;
+  const stroke = { N2: 'var(--c-primary)', SBI: 'var(--c-success)', N4: 'var(--c-warning)', N3: 'var(--c-violet)' };
+  let lastProc = null;
+  return html`<div className="min-w-[640px]">
+    <div className="grid border-b border-line bg-canvas sticky top-0 z-[1]" style=${{ gridTemplateColumns: 'repeat(' + n + ', minmax(0,1fr))' }}>
+      ${PARTS.map((p) => html`<div key=${p.id} className="text-center py-2.5 px-2"><p className="font-semibold">${p.id}</p><p className="mono text-xs2 text-mute truncate">${p.role}</p></div>`)}</div>
+    <div className="relative">
+      <svg className="absolute inset-0 w-full h-full pointer-events-none" aria-hidden="true">
+        ${PARTS.map((p) => html`<line key=${p.id} x1=${x(p.id) + '%'} x2=${x(p.id) + '%'} y1="0" y2="100%" stroke="var(--c-border)" strokeDasharray="4 4" />`)}
+      </svg>
+      ${events.map((e) => {
+        const header = e.procedure_group !== lastProc; lastProc = e.procedure_group;
+        const a = x(e.source_participant), b = x(e.destination_participant), l = Math.min(a, b), w = Math.abs(b - a), right = b > a, on = sel === e.event_id;
+        return html`<div key=${e.event_id}>
+          ${header && html`<div className="relative px-3 py-1 text-xs2 font-semibold uppercase tracking-wider text-mute"><span className="bg-surface pr-2">${e.procedure_group}</span></div>`}
+          <button onClick=${() => onSel(e.event_id)} aria-pressed=${on} aria-label=${e.seq + '. ' + e.message_name + ' ' + e.source_participant + ' to ' + e.destination_participant}
+            className=${'relative block w-full text-left ' + (on ? 'bg-brand-soft' : 'hover:bg-canvas')} style=${{ height: ROW + 'px' }}>
+            <span className="absolute left-2 top-1/2 -translate-y-1/2 mono text-xs2 text-mute">${e.seq}</span>
+            <span className="absolute text-center -translate-x-1/2 whitespace-nowrap" style=${{ left: l + w / 2 + '%', top: '4px' }}>
+              <span className=${'text-sm2 ' + (on ? 'font-semibold text-ink' : 'font-medium')}>${e.message_name}</span>
+              ${e.nas && html`<span className="text-xs2 text-mute"> · ${e.nas}</span>`}</span>
+            <span className="absolute h-0.5" style=${{ left: l + '%', width: w + '%', top: '29px', background: stroke[e.interface] }}></span>
+            <span className="absolute" style=${{ left: b + '%', top: '24px', transform: right ? 'translateX(-100%)' : 'none' }}>
+              <svg width="10" height="12" viewBox="0 0 10 12" style=${{ transform: right ? 'none' : 'scaleX(-1)', display: 'block' }}><path d="M0 0L10 6L0 12z" fill=${stroke[e.interface]} /></svg></span>
+            <span className="absolute h-2 w-2 rounded-full" style=${{ left: 'calc(' + a + '% - 4px)', top: '26px', background: stroke[e.interface] }}></span>
+            <span className="absolute mono text-[10px] text-mute -translate-x-1/2" style=${{ left: l + w / 2 + '%', top: '32px' }}>${e.timestamp} · ${e.interface}</span>
+          </button></div>`;
+      })}
+    </div></div>`;
+}
+function IeTree({ nodes, depth = 0 }) {
+  return html`<ul className=${depth ? 'ml-4 border-l border-line pl-3' : ''}>${nodes.map((n) => html`<li key=${n.name} className="py-1">
+    <div className="flex items-center justify-between gap-3"><span className="text-sm2">${n.name}</span>
+      <span className="flex items-center gap-2 min-w-0">${n.value != null && html`<span className="mono text-xs2 truncate">${n.value}</span>`}${n.status !== 'DECODED' && html`<${Pill} tone=${decTone(n.status)}>${n.status}</${Pill}>`}</span></div>
+    ${n.children && html`<${IeTree} nodes=${n.children} depth=${depth + 1} />`}</li>`)}</ul>`;
+}
+function Inspector({ e }) {
+  const [tab, setTab] = useState('ies');
+  const edges = EDGES.filter((x) => x.from === e.event_id || x.to === e.event_id);
+  return html`<${Card} className="p-4 flex flex-col gap-3 xl:sticky xl:top-4">
+    <div><p className="text-xs2 font-semibold uppercase tracking-wider text-mute">Message #${e.seq}</p><h2 className="text-xl2 font-semibold break-words">${e.message_name}</h2>
+      <div className="mt-1.5 flex flex-wrap items-center gap-1.5"><${IfChip} i=${e.interface} /><span className="text-sm2 text-mute">${e.protocol} · ${e.source_participant} → ${e.destination_participant}</span></div>
+      ${e.nas && html`<p className="mt-1 text-sm2">NAS: <span className="font-medium">${e.nas}</span></p>`}</div>
+    <div className="flex flex-wrap gap-1.5"><${Pill} tone=${decTone(e.decoding_status)}>${e.decoding_status.replaceAll('_', ' ')}</${Pill}><${Pill} tone=${e.semantic_status === 'SUCCESS' ? 'ok' : e.semantic_status === 'FAILURE' ? 'bad' : 'mute'}>${e.semantic_status}</${Pill}></div>
+    <${Tabs} label="Inspector" value=${tab} onChange=${setTab} tabs=${[['ies', 'IEs'], ['corr', 'Correlation · ' + edges.length], ['prov', 'Provenance']]} />
+    ${tab === 'ies' && html`<div className="flex flex-col gap-2">
+      ${e.withheld && html`<div className="flex gap-2 rounded-lg bg-vio-soft text-vio px-3 py-2 text-sm2"><${Icon} name="shield" size=${15} className="shrink-0 mt-0.5" />
+        <span>${e.withheld} identity IE${e.withheld > 1 ? 's' : ''} withheld. Mobile identities are never displayed, and this message is shown without raw bytes.</span></div>`}
+      ${e.decoding_status === 'ENCRYPTED_OR_PROTECTED' && html`<p className="text-sm2 text-mute">NAS payload is integrity-protected and ciphered; only the NGAP envelope is decoded.</p>`}
+      <${IeTree} nodes=${IE_TREES[e.protocol] || []} /></div>`}
+    ${tab === 'corr' && html`<div className="flex flex-col gap-2">${edges.length ? edges.map((x) => html`<div key=${x.edge_id} className="rounded-lg border border-line p-3">
+      <div className="flex items-center justify-between gap-2"><span className="font-medium">${x.pair}</span><${Pill} tone=${confTone(x.confidence)}>${x.confidence}</${Pill}></div>
+      <p className="mt-1 text-sm2 text-mute">Matched on ${x.ids.join(', ')}</p><p className="mono text-xs2 text-mute mt-1">${x.rule} v${x.ver} · ${x.from} → ${x.to}</p>
+      ${x.limitation && html`<p className="mt-1 text-sm2 text-warn">${x.limitation}</p>`}</div>`) : html`<p className="text-sm2 text-mute py-2">No correlation edge touches this message.</p>`}</div>`}
+    ${tab === 'prov' && html`<dl className="grid grid-cols-1 gap-y-3">
+      <${Field} k="Capture" v="sha256:7300ed27e24b2595…6fa592eb556" mono /><${Field} k="Dataset" v="derived-e2e-002-live" mono />
+      <${Field} k="Decoder" v=${'decoder-' + e.protocol.toLowerCase().replace('/2', '').replace('http', 'sbi') + ' · version pinned'} mono />
+      <div className="rounded-lg border border-line bg-canvas p-3"><p className="font-semibold">Packet ${e.packet_number}</p>
+        <p className="mono text-xs2 text-mute">capture://${e.interface}.pcap · offset ${e.byte_offset} · ${e.captured_length} / ${e.captured_length} bytes</p>
+        <button onClick=${() => go('packets')} className="mt-2 text-sm2 text-brand inline-flex items-center gap-1">Open in Packets <${Icon} name="arrow" size=${13} /></button></div></dl>`}
+  </${Card}>`;
+}
+function CallFlow() {
+  const [sel, setSel] = useState('ev-014');
+  const [itfs, setItfs] = useState({ N2: true, SBI: true, N4: true, N3: true });
+  const [q, setQ] = useState('');
+  const events = EVENTS.filter((e) => itfs[e.interface] && (!q || (e.message_name + ' ' + (e.nas || '')).toLowerCase().includes(q.toLowerCase())));
+  const e = EVENTS.find((x) => x.event_id === sel);
+  return html`<${PageHeader} eyebrow="Investigate · 5g-session-18fe28a814c4b094" title="Call flow" desc="Registration and PDU session for UE-ebee45ec on GNB-01, across N2, SBI, N4 and N3. Messages are listed in the order the API returns them; timestamps are UTC."
+      actions=${html`<div className="flex flex-wrap gap-2"><${Btn} onClick=${() => go('sessions')}>Back to session</${Btn}><${Btn} icon="download">HTML</${Btn}><${Btn} icon="download">JSON</${Btn}></div>`} />
+    <div className="flex flex-wrap items-center gap-2">
+      <label className="relative w-full sm:w-72"><span className="sr-only">Search message</span><${Icon} name="search" size=${15} className="absolute left-3 top-1/2 -translate-y-1/2 text-mute" />
+        <input value=${q} onInput=${(ev) => setQ(ev.target.value)} onChange=${(ev) => setQ(ev.target.value)} placeholder="Search message" className="w-full h-9 pl-9 pr-3 rounded-md border border-line bg-surface text-md2 placeholder:text-mute" /></label>
+      <div className="flex flex-wrap gap-1.5" role="group" aria-label="Interfaces">${Object.keys(itfs).map((i) => html`<button key=${i} aria-pressed=${itfs[i]} onClick=${() => setItfs({ ...itfs, [i]: !itfs[i] })}
+        className=${'h-9 px-3 rounded-md border text-sm2 font-semibold mono ' + (itfs[i] ? TONES[ifTone(i)] + ' border-transparent' : 'border-line text-mute')}>${i}</button>`)}</div>
+      <div className="flex flex-wrap gap-1.5 ml-auto">${CORR.slice(0, 4).map(([p, c]) => html`<span key=${p} className="inline-flex items-center gap-1.5 text-sm2 text-mute">${p} <${Pill} tone=${confTone(c)}>${c}</${Pill}></span>`)}</div>
+    </div>
+    <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px] items-start">
+      <${Card} className="overflow-hidden"><div className="overflow-auto max-h-[720px]"><${Ladder} events=${events} sel=${sel} onSel=${setSel} /></div>
+        <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 border-t border-line text-sm2 text-mute"><span>${events.length} of ${EVENTS.length} session events · 0 background · 0 unmatched</span>
+          <span className="flex gap-3">${Object.keys(itfs).map((i) => html`<span key=${i} className="inline-flex items-center gap-1"><span className=${'h-0.5 w-4 ' + { N2: 'bg-brand', SBI: 'bg-ok', N4: 'bg-warn', N3: 'bg-vio' }[i]}></span>${i}</span>`)}</span></div></${Card}>
+      ${e && html`<${Inspector} key=${e.event_id} e=${e} />`}
+    </div>`;
+}
+
+/* ---------------- Correlation ---------------- */
+const LINKC = ['STRONG', 'STRONG', 'POSSIBLE'];
+function Correlation() {
+  return html`<${PageHeader} eyebrow="Investigate · 5g-session-18fe28a814c4b094" title="Correlation" desc="How the N2, SBI, N4 and N3 legs of one session are tied together, with the rule and identifiers behind each link." />
+    <div className="grid gap-3 grid-cols-2 lg:grid-cols-5">${CORR.map(([p, c]) => html`<${Card} key=${p} className="p-4 flex flex-col gap-2"><p className="text-xs2 font-semibold uppercase tracking-wider text-mute">${p}</p><span className="self-start"><${Pill} tone=${confTone(c)}>${c}</${Pill}></span></${Card}>`)}</div>
+    <${Card} className="p-5 overflow-x-auto">
+      <div className="min-w-[640px] flex items-center justify-between gap-2">
+        ${['N2', 'SBI', 'N4', 'N3'].map((i, k, arr) => html`<div key=${i} className="contents">
+          <div className="flex-1 rounded-xl border border-line p-3 text-center"><${IfChip} i=${i} /><p className="mt-1.5 text-sm2 text-mute">${EVENTS.filter((e) => e.interface === i).length} event${EVENTS.filter((e) => e.interface === i).length > 1 ? 's' : ''}</p></div>
+          ${k < arr.length - 1 && html`<div className="flex flex-col items-center gap-1 w-28"><${Pill} tone=${confTone(LINKC[k])}>${LINKC[k]}</${Pill}><div className="h-0.5 w-full bg-line"></div></div>`}</div>`)}
+      </div></${Card}>
+    <${Card} className="overflow-hidden"><div className="overflow-x-auto"><table className="w-full min-w-[820px] text-md2">
+      <thead><tr className="text-left text-xs2 uppercase tracking-wider text-mute border-b border-line">${['Link', 'From → to', 'Matched on', 'Rule', 'Confidence', 'Limitations'].map((h, i) => html`<th key=${h} className=${'py-2.5 font-semibold ' + (i ? 'px-3' : 'px-4')}>${h}</th>`)}</tr></thead>
+      <tbody>${EDGES.map((x) => html`<tr key=${x.edge_id} className="border-b border-line last:border-0">
+        <td className="px-4 py-3 font-medium whitespace-nowrap">${x.pair}</td><td className="px-3 py-3 mono text-sm2 whitespace-nowrap">#${+x.from.slice(3)} → #${+x.to.slice(3)}</td>
+        <td className="px-3 py-3 text-sm2">${x.ids.join(', ')}</td><td className="px-3 py-3 mono text-xs2">${x.rule} v${x.ver}</td>
+        <td className="px-3 py-3"><${Pill} tone=${confTone(x.confidence)}>${x.confidence}</${Pill}></td><td className="px-3 py-3 text-sm2 text-mute">${x.limitation || '—'}</td></tr>`)}</tbody></table></div></${Card}>
+    <p className="text-sm2 text-mute">Confidence is the engine's verdict per rule. Exact = identical tunnel or context identifier on both sides; Possible = consistent but not unique in this capture window.</p>`;
+}
+
+/* ---------------- Packets ---------------- */
+function Packets() {
+  const [sel, setSel] = useState('ev-011');
+  const p = EVENTS.find((x) => x.event_id === sel);
+  return html`<${PageHeader} eyebrow="Evidence" title="Packets" desc="Every decoded frame with its exact position in the source capture. Raw bytes are not shown in the analyzer." />
+    <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px] items-start">
+      <${Card} className="overflow-hidden"><div className="overflow-x-auto"><table className="w-full min-w-[760px] text-md2">
+        <thead><tr className="text-left text-xs2 uppercase tracking-wider text-mute border-b border-line">${['Frame', 'Time (UTC)', 'Interface', 'Path', 'Message', 'Length', 'Decode'].map((h, i) => html`<th key=${h} className=${'py-2.5 font-semibold ' + (i ? 'px-3' : 'px-4') + (h === 'Length' ? ' text-right' : '')}>${h}</th>`)}</tr></thead>
+        <tbody>${EVENTS.map((e) => html`<tr key=${e.event_id} onClick=${() => setSel(e.event_id)} aria-selected=${sel === e.event_id}
+          className=${'border-b border-line last:border-0 cursor-pointer ' + (sel === e.event_id ? 'bg-brand-soft' : 'hover:bg-canvas')}>
+          <td className="px-4 py-2.5 num">${e.packet_number}</td><td className="px-3 py-2.5 mono text-sm2">${e.timestamp}</td>
+          <td className="px-3 py-2.5"><span className="inline-flex items-center gap-1.5"><${IfChip} i=${e.interface} /><span className="text-sm2 text-mute">${e.protocol}</span></span></td>
+          <td className="px-3 py-2.5 mono text-sm2 whitespace-nowrap">${e.source_participant} → ${e.destination_participant}</td>
+          <td className="px-3 py-2.5 max-w-[240px] truncate">${e.message_name}</td><td className="px-3 py-2.5 num text-right">${e.captured_length}</td>
+          <td className="px-3 py-2.5"><${Pill} tone=${decTone(e.decoding_status)}>${e.decoding_status === 'ENCRYPTED_OR_PROTECTED' ? 'PROTECTED' : e.decoding_status}</${Pill}></td></tr>`)}</tbody></table></div></${Card}>
+      ${p && html`<${Card} className="p-4 flex flex-col gap-3 xl:sticky xl:top-4">
+        <div><p className="text-xs2 font-semibold uppercase tracking-wider text-mute">Frame ${p.packet_number}</p><h2 className="text-xl2 font-semibold">${p.message_name}</h2></div>
+        <dl className="grid grid-cols-2 gap-x-4 gap-y-3"><${Field} k="Source file" v=${'capture://' + p.interface + '.pcap'} mono /><${Field} k="Byte offset" v=${String(p.byte_offset)} mono />
+          <${Field} k="Captured / original" v=${p.captured_length + ' / ' + p.captured_length + ' B'} mono /><${Field} k="Interface id" v="0" mono /></dl>
+        <div className="border-t border-line pt-3"><p className="text-xs2 font-semibold uppercase tracking-wider text-mute mb-1">Information elements</p><${IeTree} nodes=${IE_TREES[p.protocol] || []} /></div>
+        <div className="flex flex-wrap gap-2 border-t border-line pt-3"><${Btn} icon="flow" onClick=${() => go('callflow')}>Show in call flow</${Btn}>
+          <${Locked} reason="GET /captures/:id/download is not served yet (404)">Download frame</${Locked}></div>
+      </${Card}>`}
+    </div>`;
+}
+
+/* ---------------- Datasets ---------------- */
+function Datasets() {
+  return html`<${PageHeader} eyebrow="Evidence" title="Datasets" desc="What the analyzer reads from: live captures from Probe Manager, imported files and recovered checkpoints. All read-only." />
+    <div className="grid gap-5 lg:grid-cols-3">${DATASETS.map((d) => html`<${Card} key=${d.dataset_id} className="p-5 flex flex-col gap-4">
+      <div className="flex items-start justify-between gap-2"><div className="min-w-0"><h2 className="text-xl2 font-semibold truncate">${d.name}</h2><p className="mono text-xs2 text-mute truncate">${d.dataset_id}</p></div>
+        <${Pill} tone=${kindTone(d.kind)}>${d.kind.replace('_', ' ')}</${Pill}></div>
+      <dl className="grid grid-cols-3 gap-3"><${Field} k="Sessions" v=${String(d.sessions)} mono /><${Field} k="Events" v=${String(d.events)} mono /><${Field} k="Packets" v=${d.packets.toLocaleString('en-US')} mono /></dl>
+      <dl className="grid grid-cols-2 gap-3"><${Field} k="Source" v=${d.source} /><${Field} k="Ingestion" v=${d.status} mono /><${Field} k="Accounting" v=${d.accounting} mono /><${Field} k="Access" v=${d.read_only ? 'Read-only' : 'Writable'} /></dl>
+      <div className="flex flex-wrap gap-1.5 border-t border-line pt-3">${Object.entries(d.decoders).map(([k, v]) => html`<span key=${k} className="mono text-xs2 rounded border border-line px-1.5 py-0.5">${k} ${v}</span>`)}</div>
+      <button onClick=${() => go('sessions')} className="self-start text-sm2 text-brand inline-flex items-center gap-1">Open sessions <${Icon} name="arrow" size=${13} /></button></${Card}>`)}</div>`;
+}
+
+/* ---------------- Exports ---------------- */
+function Exports() {
+  const rows = [
+    ['Call flow · HTML', 'Self-contained page of the ladder, IE trees and correlation', true],
+    ['Call flow · JSON', 'callflow-schema document with events, edges and accounting', true],
+    ['Session summary · CSV', 'One row per session for the current filters', true],
+    ['PCAP slice of a session', 'Only the frames of one session, from the source captures', false]
+  ];
+  return html`<${PageHeader} eyebrow="Evidence" title="Exports" desc="Take evidence out of the analyzer. Exports never contain subscriber identities." />
+    <${Card} className="overflow-hidden"><ul className="divide-y divide-line">${rows.map(([t, d, ok]) => html`<li key=${t} className="px-5 py-4 flex flex-wrap items-center justify-between gap-3">
+      <div className="min-w-0"><p className="font-medium">${t}</p><p className="text-sm2 text-mute">${d}</p></div>
+      ${ok ? html`<${Btn} icon="download">Export</${Btn}>` : html`<${Locked} reason="Needs GET /captures/:id/download, not served yet">Export</${Locked}>`}</li>`)}</ul></${Card}>`;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+</script>

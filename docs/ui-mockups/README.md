@@ -9,6 +9,7 @@ the implementation goes into the real apps with the existing `packages/ui` token
 |---|---|---|
 | `portal.html` | `apps/portal` (:8020/portal/) | 3 bricks: POLARIS Control, Probe Manager, OIRAN Analyzer — same layout as today, new names/taglines/scope chips |
 | `probe-manager.html` | `apps/probe-manager` | Overview, Probes (multi-interface + inspector), Register probe dialog, Interfaces, Live captures, Capture library, Preferences |
+| `oiran-analyzer.html` | `OIRAN/apps/web` (served at /analyzer/) | Overview, Sessions, Call flow (ladder + IE inspector), Correlation, Packets, Datasets, Exports — Probe Manager page leaves the Analyzer |
 | `polaris-control.html` | `apps/simulator-control` | Console, Topology, Core · Open5GS (functions / config / subscribers), gNodeBs, UE Manager, Scenarios, Execution monitor, History |
 
 ## Architecture rule
@@ -23,6 +24,7 @@ the implementation goes into the real apps with the existing `packages/ui` token
 | gNB/eNB | `GET /nodes`, `GET /gnbs` | start/stop, create GNB-02 (LIVE-005), ENB-01 = `LTE_ATTACH_NOT_CERTIFIED` |
 | Topology | compose `/lab` + `/nodes` + `/ues` client-side | single topology route |
 | Probes | `GET /probes`, `/probes/:id`, `/probes/:id/interfaces`, `/interfaces` | `POST /probes` (register), physical type, interface role field |
+| Analyzer | `/sessions`, `/sessions/:id/callflow`, `/events/:id`, `/datasets`, `/packets` (OIRAN API, `{data,meta}`) | PCAP slice / frame download (`/captures/:id/download` = 404) |
 | Captures | `GET /captures*` | Stop stays locked; `/captures/:id/download` = 404 |
 
 Never display subscriber identity (IMSI, IMEI, TMSI, GUTI, RNTI, K, OPc): secrets are write-only (`PROTECTED`).

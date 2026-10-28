@@ -89,8 +89,8 @@ const APPS = [
   {
     id: 'oiran-analyzer', name: 'OIRAN Analyzer', tagline: 'Call flow · Correlation · Packet forensics', Icon: Activity, accent: 'teal',
     description: 'Reconstruct sessions, inspect decoded IE trees, correlate N2 ↔ SBI ↔ N4 ↔ N3 evidence across datasets.',
-    scope: ['Sessions', 'Call flow', 'IE tree', 'Correlation'],
-    health: { state: 'auth-required', detail: 'Reachable, authentication required (401)' }, api: '/api/v1/health', href: null
+    scope: ['Sessions', 'Call flow', 'Correlation', 'Packets', 'Datasets'],
+    health: { state: 'auth-required', detail: 'Reachable, authentication required (401)' }, api: '/api/v1/health', href: 'oiran-analyzer.html'
   }
 ];
 
