@@ -3,6 +3,57 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.7.0 — 2026-10-28 (minor)
+
+Topology redrawn to match the mockup
+(`origin/docs/ui-mockups/polaris-control.html` → `Topology` view).
+The page is now a true vertical tree — a Core block over an NF grid, two
+colored connectors (`N2 · NGAP`, `N3 · GTP-U`) stretching down into gNB
+cards, and a UE grid under each gNB.
+
+### Added
+
+- **NF grid** — Core block renders the ten canonical NFs (AMF, SMF, UPF,
+  NRF, AUSF, UDM, UDR, PCF, NSSF, BSF). Each pill carries a state dot
+  (green / amber / red / neutral) driven by the new
+  `nfPillState(nfKey, observed)` helper. The source of truth is
+  `/lab.observed.nfs` when the backend publishes a per-NF container map;
+  otherwise AMF reflects the aggregated `/lab.observed.open5gs` and the
+  other pills stay neutral with the honest "not exposed by
+  /lab.observed.nfs" tooltip. Core status badge shows `up / total` when
+  the per-NF map ships.
+- **Colored connectors** — a `Connector` component renders a vertical
+  line + label + line between the Core block and each gNB. Line colour
+  follows `linkState` single source of truth:
+  - green → `configured` (process running + endpoint reported)
+  - gray  → `unknown`   (no endpoint reported)
+  - red   → `down`       (process not running)
+  The UI never says `UP`.
+- **Technology-aware labels** — 5G nodes get `N2 · NGAP` and `N3 · GTP-U`;
+  LTE nodes get `S1-MME · S1AP` and `S1-U · GTP-U`.
+- **Dashed non-configured cards** — gNBs with `configured: false`
+  render dashed with a `data-dashed="true"` attribute. The existing
+  `controller_owned: false` reason (`SHARED_NODE_PROTECTED`,
+  `LIVE_005_APPROVAL_REQUIRED`, `LTE_ATTACH_NOT_CERTIFIED`, …) stays
+  inline.
+- **Wire type** — `WireLabObserved` grows an optional
+  `nfs?: Record<string, WireContainerStatus>`. The field is optional so
+  backends still publishing only the aggregated `open5gs` container keep
+  rendering the honest fallback.
+- **Playwright capture** `topology.chromium-{light,dark}.png` lands in
+  `docs/screenshots/v0.6.0/` alongside the other 0.6.x captures (the
+  mockup lives at `docs/ui-mockups/polaris-control.html` on
+  `origin/docs/ui-mockups`; the capture is tagged "mocked API").
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → **Test Files 23 passed (23) · Tests 152 passed (152)**
+  (7 new in `src/pages/Topology.test.tsx`: `nfPillState` suite, NF grid
+  tones from `/lab.observed.nfs`, aggregated fallback, N2/N3 connector
+  colour on a running gNB, dashed card + LTE labels on ENB-01 / GNB-02).
+- `npm run build` → clean, no fixture leak in `dist/`.
+
 ## 0.6.1 — 2026-10-28 (patch)
 
 Align the provisioning calls with the real backend contract shipped by

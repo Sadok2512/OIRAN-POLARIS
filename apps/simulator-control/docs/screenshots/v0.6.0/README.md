@@ -23,6 +23,7 @@ npx playwright test                   # terminal 2
 
 | File | Page | Theme |
 |---|---|---|
+| `topology.chromium-{light,dark}.png` (0.7.0) | `/network/topology` — vertical tree matching the mockup; NF grid, N2/N3 colored connectors, GNB-02 dashed, ENB-01 with LTE labels | both |
 | `templates.chromium-{light,dark}.png` | `/scenarios` — Templates tab, Clone + Download JSON actions, API-provided duration estimate | both |
 | `ue-manager.chromium-{light,dark}.png` | `/ues` — list under `polarisProvisioning` ON, Import CSV (backend) and Add UE buttons wired to the new dialogs | both |
 | `provisioning.chromium-{light,dark}.png` | `/provisioning` — subscriber directory, Import CSV button, IMSI always PROTECTED | both |

@@ -108,14 +108,68 @@ async function mockPolaris(page: Page) {
     } });
     if (path === '/scenario-definitions') return route.fulfill({ json: { items: TEMPLATES, total: TEMPLATES.length, schema_version: 1 } });
     if (path.startsWith('/scenario-definitions/') && path.endsWith('/estimate')) return route.fulfill({ json: { duration_ms: 1200 } });
-    if (path === '/ues') return route.fulfill({ json: { items: UES, total: UES.length, max: 100 } });
+    if (path === '/ues') return route.fulfill({ json: {
+      items: [
+        { id: 'UE-01', registration_state: 'REGISTERED', pdu_session: 'ACTIVE',
+          ue_ip: null, traffic_state: 'IDLE', serving_node: 'GNB-01', last_event: null,
+          controller_owned: true, name: 'UE under test', internal_ue_id: 'open5gs-UE-01',
+          state: 'READY', actions: { start: true, stop: false, reason: null } },
+        { id: 'UE-12', registration_state: 'REGISTERED', pdu_session: 'ACTIVE',
+          ue_ip: null, traffic_state: 'IDLE', serving_node: 'GNB-01', last_event: null,
+          controller_owned: true, name: 'Lab UE 12', internal_ue_id: 'open5gs-UE-12',
+          state: 'READY', actions: { start: true, stop: false, reason: null } },
+      ],
+      configured_profiles: [], configured_count: 2, active_count: 2, registered_count: 2, source: 'MOCK',
+      total: 2, max: 100,
+    } });
     if (path === '/ue-profiles') return route.fulfill({ json: { items: [], total: 0, page: 1, page_size: 50, pages: 0, max: 100, secrets_exposed: false } });
     if (path === '/ue-profiles/UE-01') return route.fulfill({ json: UE_DETAIL });
     if (path === '/gnbs') return route.fulfill({ json: { items: [{ gnb_id: 'GNB-01', link_ip: '10.77.0.20' }], total: 1, source: 'CONFIGURED_REGISTRY' } });
     if (path === '/owners') return route.fulfill({ json: { items: [{ id: 'ops-nancy', name: 'Nancy Operator', role: 'Operator', email: null }], total: 1 } });
     if (path === '/subscribers') return route.fulfill({ json: SUBSCRIBERS });
-    if (path === '/lab') return route.fulfill({ json: { services: [], observed: { 'open5gs': 'oiran-lab-amf-1' } } });
-    if (path === '/nodes') return route.fulfill({ json: { items: [], total: 0 } });
+    if (path === '/lab') return route.fulfill({ json: {
+      source: 'READ_ONLY_HOST_AUDIT',
+      observed: {
+        open5gs: { process_state: 'running', health: 'healthy', observed: true },
+        nfs: {
+          AMF: { process_state: 'running', health: 'healthy', observed: true },
+          SMF: { process_state: 'running', health: 'healthy', observed: true },
+          UPF: { process_state: 'running', health: 'healthy', observed: true },
+          NRF: { process_state: 'running', health: 'healthy', observed: true },
+          AUSF: { process_state: 'running', health: 'healthy', observed: true },
+          UDM: { process_state: 'running', health: 'healthy', observed: true },
+        },
+      },
+    } });
+    if (path === '/nodes') return route.fulfill({ json: {
+      items: [
+        {
+          id: 'GNB-01', name: 'Primary gNB', technology: '5G SA', simulator: 'UERANSIM',
+          plmn: '001/01', cell_id: '0x000000010', link_ip: '10.77.0.20',
+          n2_endpoint: '10.77.21.20', n3_endpoint: '10.77.22.20',
+          process_state: 'running', health: 'healthy', configured: true,
+          controller_owned: false, uptime_seconds: 42,
+          actions: { start: false, stop: false, reason: 'SHARED_NODE_PROTECTED' },
+        },
+        {
+          id: 'GNB-02', name: 'Second gNB plan', technology: '5G SA', simulator: 'UERANSIM',
+          plmn: '001/01', cell_id: 'UNASSIGNED', link_ip: 'NOT_CONFIGURED',
+          n2_endpoint: null, n3_endpoint: null,
+          process_state: 'NOT_DEPLOYED', health: 'NOT_VALIDATED', configured: false,
+          controller_owned: false, uptime_seconds: null,
+          actions: { start: false, stop: false, reason: 'LIVE_005_APPROVAL_REQUIRED' },
+        },
+        {
+          id: 'ENB-01', name: 'LTE eNB profile', technology: 'LTE', simulator: 'srsRAN',
+          plmn: '001/01', cell_id: 'NOT_AVAILABLE', link_ip: 'NOT_AVAILABLE',
+          n2_endpoint: null, n3_endpoint: null,
+          process_state: 'stopped', health: 'unknown', configured: false,
+          controller_owned: false, uptime_seconds: null,
+          actions: { start: false, stop: false, reason: 'LTE_ATTACH_NOT_CERTIFIED' },
+        },
+      ],
+      configured_count: 1, running_count: 1, observed_at_epoch_s: 0, source: 'MOCK',
+    } });
     return route.fulfill({ status: 404, json: { error: 'MOCK_NOT_IMPLEMENTED' } });
   });
 
@@ -141,6 +195,13 @@ function screenshotPath(name: string, project: string): string {
 
 test.beforeEach(async ({ page }) => {
   await mockPolaris(page);
+});
+
+test('capture — Topology', async ({ page }, info) => {
+  await page.goto('/network/topology');
+  await page.getByTestId('topology-view').waitFor();
+  await page.getByTestId('topology-nfs-grid').waitFor();
+  await page.screenshot({ path: screenshotPath('topology', info.project.name), fullPage: true });
 });
 
 test('capture — Templates tab', async ({ page }, info) => {
