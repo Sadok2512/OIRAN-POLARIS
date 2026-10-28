@@ -48,7 +48,7 @@ use ueransim_adapter::{
 
 pub use ue_profiles::UeProfileRegistry;
 
-pub const VERSION: &str = "0.13.0";
+pub const VERSION: &str = "0.14.0";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -2043,6 +2043,28 @@ async fn capabilities() -> Json<Value> {
         "additional_ue_ids":ueransim_adapter::planned_profiles().into_iter().skip(1).map(|profile|profile.ue_id).collect::<Vec<_>>(),
         "traffic_protocols":["ICMP","UDP","TCP"],
         "approved_destinations":["10.46.0.1"],
+        "executable_scenario_step_types":[
+            "ue_start",
+            "ue_stop",
+            "pdu_establish",
+            "pdu_release",
+            "udp_traffic",
+            "wait",
+            "traffic_ul",
+            "idle",
+            "detach",
+            "repeat"
+        ],
+        "unavailable_scenario_step_types":[
+            {"type":"traffic_dl","http_status":422,"reason":"DL_SENDER_NOT_AVAILABLE"},
+            {"type":"ims_register","http_status":423,"reason":"IMS_NOT_AVAILABLE"},
+            {"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}
+        ],
+        "scenario_step_limits":{
+            "traffic_bytes_max":209715200_u64,
+            "repeat_depth_max":2,
+            "resolved_steps_max":10000
+        },
         "certified_scenarios":[{"id":"bounded-existing-ue-udp-v1","name":"Bounded existing UE UDP","certified":true,"ue_lifecycle":false,"gnb_lifecycle":false,"max_datagrams":5,"destination":"10.46.0.1","destination_port":49001}],
         "profiles":ueransim_adapter::planned_profiles().into_iter().map(|profile|json!({"id":profile.ue_id,"name":profile.pseudonym,"available":profile.configured,"source":profile.profile_name,"subscription_verified":profile.subscription_verified})).collect::<Vec<_>>(),
         "technologies":[
@@ -6904,6 +6926,52 @@ mod p0_tests {
         target_ue_id: &str,
     ) -> StatusCode {
         application.clone().oneshot(Request::builder().method(Method::POST).uri("/api/v1/scenarios/validate").header(header::CONTENT_TYPE,"application/json").header(header::COOKIE,cookie).header("x-csrf-token",csrf).body(Body::from(json!({"scenario_id":"targeted-job","name":"Certified bounded controller UE traffic","ue_count":1,"start_mode":"SEQUENTIAL","stagger_seconds":0,"protocol":"UDP","destination":"10.46.0.1","packet_count":5,"packet_size":64,"rate_per_second":1,"duration_seconds":5,"target_ue_id":target_ue_id}).to_string())).unwrap()).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn capabilities_publish_executable_and_locked_scenario_step_types() {
+        let response = app(state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["executable_scenario_step_types"],
+            json!([
+                "ue_start",
+                "ue_stop",
+                "pdu_establish",
+                "pdu_release",
+                "udp_traffic",
+                "wait",
+                "traffic_ul",
+                "idle",
+                "detach",
+                "repeat"
+            ])
+        );
+        assert_eq!(
+            body["unavailable_scenario_step_types"],
+            json!([
+                {"type":"traffic_dl","http_status":422,"reason":"DL_SENDER_NOT_AVAILABLE"},
+                {"type":"ims_register","http_status":423,"reason":"IMS_NOT_AVAILABLE"},
+                {"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}
+            ])
+        );
+        assert_eq!(
+            body["scenario_step_limits"]["traffic_bytes_max"],
+            209_715_200
+        );
+        assert_eq!(body["scenario_step_limits"]["repeat_depth_max"], 2);
+        assert_eq!(body["scenario_step_limits"]["resolved_steps_max"], 10_000);
     }
 
     #[tokio::test]

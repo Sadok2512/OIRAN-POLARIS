@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.14.0 (polaris-control-api)
+
+- Minor: advertise the scenario-definition step contract through `GET /api/v1/capabilities`,
+  separating executable step types from the explicitly unavailable downlink and IMS types.
+- Contract: publish the enforced traffic-byte, repeat-depth, and resolved-step ceilings without
+  changing the live-definition authorization lock or any runtime safety gate.
+
 ## 0.13.0 (polaris-control-api)
 
 - Minor: add four immutable, clonable traffic/voice scenario templates and bounded nested
