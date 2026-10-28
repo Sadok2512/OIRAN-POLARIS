@@ -1,0 +1,592 @@
+<title>OIRAN Probe Manager</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: app shell — collapsible sidebar + content; probe list with a sticky inspector. Tokens follow packages/ui/src/tokens.ts (Enterprise Precision). */
+:root {
+  --c-background: #F5F7FA; --c-surface: #FFFFFF; --c-sidebar: #F0F4F9; --c-text-primary: #17283F;
+  --c-text-secondary: #5B6A80; --c-border: #DEE5ED; --c-primary: #2563EB; --c-primary-soft: #E8EFFD;
+  --c-success: #047857; --c-success-soft: #E3F4EC; --c-warning: #B45309; --c-warning-soft: #FDF1E1;
+  --c-error: #DC2626; --c-error-soft: #FDECEC; --c-violet: #6D4AD9; --c-violet-soft: #EFEBFC;
+  --c-track: #E8EDF3;
+  --shadow-1: 0 1px 2px rgba(23,40,63,.06); --shadow-2: 0 8px 24px rgba(23,40,63,.10);
+  --font-sans: Inter, "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --c-background: #0B1220; --c-surface: #152238; --c-sidebar: #101B2C; --c-text-primary: #E7F0FF;
+  --c-text-secondary: #9AAAC0; --c-border: #2A3A54; --c-primary: #5B93F7; --c-primary-soft: #1A2C4D;
+  --c-success: #34D399; --c-success-soft: #123528; --c-warning: #FBBF24; --c-warning-soft: #3A2A10;
+  --c-error: #F87171; --c-error-soft: #3B1A1D; --c-violet: #A894F5; --c-violet-soft: #251D45;
+  --c-track: #22324B; --shadow-1: 0 1px 2px rgba(0,0,0,.4); --shadow-2: 0 8px 24px rgba(0,0,0,.45); color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --c-background: #0B1220; --c-surface: #152238; --c-sidebar: #101B2C; --c-text-primary: #E7F0FF;
+  --c-text-secondary: #9AAAC0; --c-border: #2A3A54; --c-primary: #5B93F7; --c-primary-soft: #1A2C4D;
+  --c-success: #34D399; --c-success-soft: #123528; --c-warning: #FBBF24; --c-warning-soft: #3A2A10;
+  --c-error: #F87171; --c-error-soft: #3B1A1D; --c-violet: #A894F5; --c-violet-soft: #251D45;
+  --c-track: #22324B; --shadow-1: 0 1px 2px rgba(0,0,0,.4); --shadow-2: 0 8px 24px rgba(0,0,0,.45); color-scheme: dark; }
+html, body { height: 100%; }
+body { background: var(--c-background); color: var(--c-text-primary); font-family: var(--font-sans); font-size: 13px; -webkit-font-smoothing: antialiased; font-feature-settings: "ss01","cv11"; }
+.mono, .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+table { font-variant-numeric: tabular-nums; }
+:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; border-radius: 4px; }
+h1, h2 { text-wrap: balance; }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+@keyframes pulse-dot { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+.live-dot { animation: pulse-dot 1.6s ease-in-out infinite; }
+</style>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>
+tailwind.config = {
+  darkMode: ['class', '[data-theme="dark"]'],
+  theme: { extend: {
+    colors: {
+      canvas: 'var(--c-background)', surface: 'var(--c-surface)', sidebar: 'var(--c-sidebar)', line: 'var(--c-border)',
+      ink: 'var(--c-text-primary)', mute: 'var(--c-text-secondary)', brand: 'var(--c-primary)', 'brand-soft': 'var(--c-primary-soft)',
+      ok: 'var(--c-success)', 'ok-soft': 'var(--c-success-soft)', warn: 'var(--c-warning)', 'warn-soft': 'var(--c-warning-soft)',
+      bad: 'var(--c-error)', 'bad-soft': 'var(--c-error-soft)', vio: 'var(--c-violet)', 'vio-soft': 'var(--c-violet-soft)', track: 'var(--c-track)'
+    },
+    fontSize: { xs2: ['11px', '1.4'], sm2: ['12px', '1.5'], base2: ['13px', '1.55'], md2: ['14px', '1.55'], xl2: ['18px', '1.4'], h2: ['22px', '1.3'], h1: ['26px', '1.25'] },
+    boxShadow: { e1: 'var(--shadow-1)', e2: 'var(--shadow-2)' }
+  } }
+};
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/htm@3.1.1/dist/htm.umd.js"></script>
+
+<div id="root" class="h-full"></div>
+
+<script>
+const { useState, useMemo, useEffect } = React;
+const html = htm.bind(React.createElement);
+
+/* ---------------- Example data (field names from packages/ui/src/types.ts) ---------------- */
+const PROBES = [
+  { probe_id: 'vprobe-lab-01', name: 'Lab vProbe A', host: 'OIRAN', probe_type: 'vprobe', version: '2.3.0', health: 'HEALTHY', online: true,
+    capture_state: 'CAPTURING', last_heartbeat_epoch_s: 4, packet_rate_pps: 1840, decode_rate_eps: 212, packet_drops: 0,
+    cpu_usage_percent: 23, memory_usage_bytes: 1.9e9, memory_total_bytes: 8e9, disk_usage_percent: 75, capture_control_available: false,
+    interfaces: [
+      { interface: 'oiran-lab-n2', plane: 'N2', protocol: 'NGAP', filter: 'sctp port 38412', status: 'CAPTURING', pps: 41, file_size: 18.4e6, growth: 4468 },
+      { interface: 'oiran-lab-n3', plane: 'N3', protocol: 'GTP-U', filter: 'udp port 2152', status: 'CAPTURING', pps: 1720, file_size: 512.0e6, growth: 238000 },
+      { interface: 'oiran-lab-n4', plane: 'N4', protocol: 'PFCP', filter: 'udp port 8805', status: 'CAPTURING', pps: 79, file_size: 9.1e6, growth: 2100 },
+      { interface: 'oiran-lab-mgmt', plane: null, protocol: null, filter: null, status: 'IDLE', pps: null, file_size: null, growth: null }
+    ] },
+  { probe_id: 'vprobe-lab-02', name: 'Lab vProbe B', host: 'OIRAN', probe_type: 'vprobe', version: '2.3.0', health: 'DEGRADED', online: true,
+    capture_state: 'PARTIAL', last_heartbeat_epoch_s: 9, packet_rate_pps: 310, decode_rate_eps: 40, packet_drops: 132,
+    cpu_usage_percent: 71, memory_usage_bytes: 3.4e9, memory_total_bytes: 4e9, disk_usage_percent: 75, capture_control_available: false,
+    interfaces: [
+      { interface: 'eth1', plane: 'N2', protocol: 'NGAP', filter: 'sctp port 38412', status: 'CAPTURING', pps: 22, file_size: 6.2e6, growth: 1300 },
+      { interface: 'eth2', plane: 'N3', protocol: 'GTP-U', filter: 'udp port 2152', status: 'STALLED', pps: 0, file_size: 88.0e6, growth: 0 },
+      { interface: 'eth3', plane: 'N4', protocol: 'PFCP', filter: 'udp port 8805', status: 'CAPTURING', pps: 12, file_size: 2.4e6, growth: 610 }
+    ] },
+  { probe_id: 'probe-phy-paris-01', name: 'Paris rack probe', host: 'prb-paris-01', probe_type: 'physical', version: '2.2.4', health: 'HEALTHY', online: true,
+    capture_state: 'CAPTURING', last_heartbeat_epoch_s: 3, packet_rate_pps: 46200, decode_rate_eps: 3900, packet_drops: 0,
+    cpu_usage_percent: 38, memory_usage_bytes: 11.2e9, memory_total_bytes: 32e9, disk_usage_percent: 54, capture_control_available: false,
+    interfaces: [
+      { interface: 'ens1f0', plane: 'N2', protocol: 'NGAP', filter: 'sctp port 38412', status: 'CAPTURING', pps: 1900, file_size: 2.1e9, growth: 912000 },
+      { interface: 'ens1f1', plane: 'N3', protocol: 'GTP-U', filter: 'udp port 2152', status: 'CAPTURING', pps: 42100, file_size: 38.0e9, growth: 18400000 },
+      { interface: 'ens2f0', plane: 'N4', protocol: 'PFCP', filter: 'udp port 8805', status: 'CAPTURING', pps: 2200, file_size: 1.4e9, growth: 801000 },
+      { interface: 'ens2f1', plane: 'S1', protocol: 'S1AP', filter: 'sctp port 36412', status: 'CAPTURING', pps: 0, file_size: 0.3e9, growth: 0 },
+      { interface: 'eno1', plane: null, protocol: null, filter: null, status: 'IDLE', pps: null, file_size: null, growth: null }
+    ] },
+  { probe_id: 'probe-phy-lyon-01', name: 'Lyon edge probe', host: 'prb-lyon-01', probe_type: 'physical', version: '2.2.1', health: 'OFFLINE', online: false,
+    capture_state: 'STOPPED', last_heartbeat_epoch_s: 7340, packet_rate_pps: null, decode_rate_eps: null, packet_drops: null,
+    cpu_usage_percent: null, memory_usage_bytes: null, memory_total_bytes: 16e9, disk_usage_percent: null, capture_control_available: false,
+    interfaces: [
+      { interface: 'ens1f0', plane: 'N2', protocol: 'NGAP', filter: 'sctp port 38412', status: 'UNKNOWN', pps: null, file_size: null, growth: null },
+      { interface: 'ens1f1', plane: 'N3', protocol: 'GTP-U', filter: 'udp port 2152', status: 'UNKNOWN', pps: null, file_size: null, growth: null }
+    ] }
+];
+const PLANES = ['N2', 'N3', 'N4', 'S1', 'N6'];
+/* Capture filter suggested for each plane (standard ports). */
+const PLANE_FILTER = { N2: 'sctp port 38412', N3: 'udp port 2152', N4: 'udp port 8805', S1: 'sctp port 36412', N6: '' };
+const PLANE_PROTO = { N2: 'NGAP', N3: 'GTP-U', N4: 'PFCP', S1: 'S1AP', N6: 'IP' };
+const ProbesCtx = React.createContext(null);
+const useProbes = () => React.useContext(ProbesCtx);
+
+/* ---------------- Formatting ---------------- */
+const fmtBytes = (b) => b == null ? '—' : b >= 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b >= 1e6 ? (b / 1e6).toFixed(1) + ' MB' : b >= 1e3 ? (b / 1e3).toFixed(1) + ' kB' : b + ' B';
+const fmtNum = (n) => n == null ? '—' : n.toLocaleString('en-US');
+const fmtAge = (s) => s == null ? 'awaiting first heartbeat' : s < 60 ? s + ' s ago' : s < 3600 ? Math.round(s / 60) + ' min ago' : Math.round(s / 3600) + ' h ago';
+
+/* ---------------- Icons (stroke, currentColor) ---------------- */
+const P = {
+  overview: 'M3 3h7v9H3zM14 3h7v5h-7zM14 12h7v9h-7zM3 16h7v5H3z',
+  probe: 'M12 12m-2 0a2 2 0 1 0 4 0a2 2 0 1 0-4 0M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2',
+  iface: 'M7 7h10v6a5 5 0 0 1-10 0zM10 3v4M14 3v4M12 18v3',
+  live: 'M22 12h-4l-3 9L9 3l-3 9H2',
+  folder: 'M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
+  gear: 'M12 15a3 3 0 1 0 0-6a3 3 0 0 0 0 6zM19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3a1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5a1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8a1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5a1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z',
+  search: 'M11 19a8 8 0 1 0 0-16a8 8 0 0 0 0 16zM21 21l-4.3-4.3',
+  sun: 'M12 17a5 5 0 1 0 0-10a5 5 0 0 0 0 10zM12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4',
+  moon: 'M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z',
+  lock: 'M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4',
+  ext: 'M14 3h7v7M10 14L21 3M21 14v7H3V3h7',
+  alert: 'M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z',
+  close: 'M18 6L6 18M6 6l12 12',
+  plus: 'M12 5v14M5 12h14',
+  trash: 'M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14',
+  server: 'M3 4h18v6H3zM3 14h18v6H3zM7 7h.01M7 17h.01',
+  cloud: 'M17.5 19a4.5 4.5 0 1 0-1.4-8.8A6 6 0 1 0 6 18.9V19z'
+};
+function Icon({ name, size = 16, className = '' }) {
+  return html`<svg width=${size} height=${size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className=${className}><path d=${P[name]} /></svg>`;
+}
+
+/* ---------------- Primitives ---------------- */
+const TONES = {
+  ok: 'bg-ok-soft text-ok', warn: 'bg-warn-soft text-warn', bad: 'bg-bad-soft text-bad', brand: 'bg-brand-soft text-brand',
+  vio: 'bg-vio-soft text-vio', mute: 'bg-track text-mute'
+};
+function Pill({ tone = 'mute', children, dot }) {
+  return html`<span className=${'inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs2 font-semibold tracking-wide ' + TONES[tone]}>
+    ${dot && html`<span className=${'h-1.5 w-1.5 rounded-full bg-current ' + (dot === 'live' ? 'live-dot' : '')}></span>`}${children}</span>`;
+}
+const healthTone = (h) => ({ HEALTHY: 'ok', DEGRADED: 'warn', OFFLINE: 'bad', PENDING: 'brand' }[h] || 'mute');
+const statusTone = (s) => ({ CAPTURING: 'ok', STALLED: 'warn', IDLE: 'mute', UNKNOWN: 'mute', STOPPED: 'mute', PENDING: 'brand' }[s] || 'mute');
+const planeTone = (p) => ({ N2: 'brand', N3: 'vio', N4: 'warn', S1: 'ok' }[p] || 'mute');
+
+function Meter({ value, warnAt = 80, badAt = 90, label }) {
+  if (value == null) return html`<span className="text-mute">—</span>`;
+  const tone = value >= badAt ? 'bg-bad' : value >= warnAt ? 'bg-warn' : 'bg-brand';
+  return html`<div className="flex items-center gap-2 min-w-[110px]">
+    <div className="h-1.5 flex-1 rounded-full bg-track overflow-hidden" role="meter" aria-label=${label} aria-valuemin="0" aria-valuemax="100" aria-valuenow=${value}>
+      <div className=${'h-full rounded-full ' + tone} style=${{ width: value + '%' }}></div></div>
+    <span className="num text-sm2 w-9 text-right">${value}%</span></div>`;
+}
+function TypeBadge({ type }) {
+  const v = type === 'vprobe';
+  return html`<span className=${'inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-0.5 text-sm2 font-medium ' + (v ? 'text-brand' : 'text-vio')}>
+    <${Icon} name=${v ? 'cloud' : 'server'} size=${13} />${v ? 'vProbe' : 'Physical'}</span>`;
+}
+function Card({ children, className = '' }) {
+  return html`<section className=${'rounded-xl border border-line bg-surface shadow-e1 ' + className}>${children}</section>`;
+}
+function Locked({ children, reason }) {
+  return html`<button disabled title=${reason} className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-dashed border-line text-sm2 text-mute cursor-not-allowed">
+    <${Icon} name="lock" size=${12} />${children}</button>`;
+}
+function PageHeader({ eyebrow, title, desc, actions }) {
+  return html`<header className="flex flex-wrap items-end justify-between gap-3">
+    <div className="min-w-0"><p className="text-xs2 font-semibold uppercase tracking-wider text-mute">${eyebrow}</p>
+      <h1 className="text-h1 font-semibold">${title}</h1>${desc && html`<p className="mt-1 text-md2 text-mute max-w-[70ch]">${desc}</p>`}</div>
+    ${actions}</header>`;
+}
+
+/* ---------------- Shell ---------------- */
+const NAV = [
+  { id: 'overview', label: 'Overview', icon: 'overview', section: 'Operations' },
+  { id: 'probes', label: 'Probes', icon: 'probe', section: 'Operations' },
+  { id: 'interfaces', label: 'Interfaces', icon: 'iface', section: 'Operations' },
+  { id: 'live', label: 'Live captures', icon: 'live', section: 'Capture' },
+  { id: 'library', label: 'Capture library', icon: 'folder', section: 'Capture' },
+  { id: 'prefs', label: 'Preferences', icon: 'gear', section: 'Platform' }
+];
+function readHash() { const h = (location.hash || '').slice(1); return NAV.some((n) => n.id === h) ? h : 'probes'; }
+
+function App() {
+  const [view, setView] = useState(readHash());
+  const [theme, setTheme] = useState(() => { try { return localStorage.getItem('pm-theme') || ''; } catch { return ''; } });
+  useEffect(() => { const f = () => setView(readHash()); addEventListener('hashchange', f); return () => removeEventListener('hashchange', f); }, []);
+  useEffect(() => {
+    if (theme) document.documentElement.setAttribute('data-theme', theme); else document.documentElement.removeAttribute('data-theme');
+    try { theme ? localStorage.setItem('pm-theme', theme) : localStorage.removeItem('pm-theme'); } catch {}
+  }, [theme]);
+  const [probes, setProbes] = useState(PROBES);
+  const isDark = theme === 'dark' || (!theme && matchMedia('(prefers-color-scheme: dark)').matches);
+  const online = probes.filter((p) => p.online).length;
+
+  return html`<${ProbesCtx.Provider} value=${{ probes, setProbes }}><div className="min-h-full flex flex-col md:flex-row">
+    <aside className="md:w-60 shrink-0 bg-sidebar border-b md:border-b-0 md:border-r border-line md:min-h-screen">
+      <div className="flex items-center gap-2.5 py-4" style=${{ paddingLeft: 'max(16px, env(safe-area-inset-left, 0px))', paddingRight: '16px' }}>
+        <div className="grid place-items-center h-8 w-8 rounded-lg bg-brand text-white"><${Icon} name="probe" size=${17} /></div>
+        <div className="leading-tight"><p className="text-md2 font-semibold">OIRAN</p><p className="text-sm2 text-mute">Probe Manager</p></div>
+      </div>
+      <nav aria-label="Primary" className="flex md:flex-col gap-1 overflow-x-auto md:overflow-visible pb-3 md:pb-0" style=${{ paddingLeft: 'max(12px, env(safe-area-inset-left, 0px))', paddingRight: '12px' }}>
+        ${['Operations', 'Capture', 'Platform'].map((section) => html`<div key=${section} className="flex md:flex-col gap-1 md:mb-3">
+          <p className="hidden md:block px-2 py-1 text-xs2 font-semibold uppercase tracking-wider text-mute">${section}</p>
+          ${NAV.filter((n) => n.section === section).map((n) => html`<a key=${n.id} href=${'#' + n.id}
+            className=${'flex items-center gap-2.5 whitespace-nowrap rounded-md px-2.5 py-2 text-md2 transition-colors ' + (view === n.id ? 'bg-surface text-ink font-medium shadow-e1' : 'text-mute hover:text-ink hover:bg-surface')}
+            aria-current=${view === n.id ? 'page' : undefined}><${Icon} name=${n.icon} />${n.label}</a>`)}
+        </div>`)}
+        <p className="hidden md:block mt-2 mx-2 border-t border-line pt-3 text-sm2 text-mute">Core network, gNBs and topology are managed in POLARIS Control.</p>
+      </nav>
+    </aside>
+
+    <div className="flex-1 min-w-0 flex flex-col">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line bg-surface py-2.5" style=${{ paddingLeft: 'max(16px, env(safe-area-inset-left, 0px))', paddingRight: 'max(16px, env(safe-area-inset-right, 0px))' }}>
+        <div className="flex items-center gap-3 text-sm2 text-mute">
+          <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-ok live-dot"></span>Live · refresh 5 s</span>
+          <span className="num">${online}/${probes.length} probes online</span>
+          <span className="rounded border border-line px-1.5 py-0.5 text-xs2">Example data</span>
+        </div>
+        <button onClick=${() => setTheme(isDark ? 'light' : 'dark')} className="inline-flex items-center gap-2 h-8 px-3 rounded-md border border-line text-sm2 hover:bg-canvas" aria-label="Toggle colour theme">
+          <${Icon} name=${isDark ? 'sun' : 'moon'} size=${14} />${isDark ? 'Light' : 'Dark'}</button>
+      </div>
+      <main className="flex-1 min-w-0 flex flex-col gap-5" style=${{ paddingTop: '24px', paddingBottom: '40px', paddingLeft: 'max(16px, env(safe-area-inset-left, 0px))', paddingRight: 'max(16px, env(safe-area-inset-right, 0px))' }}>
+        ${view === 'overview' && html`<${Overview} />`}
+        ${view === 'probes' && html`<${Probes} />`}
+        ${view === 'interfaces' && html`<${Interfaces} />`}
+        ${view === 'live' && html`<${Live} />`}
+        ${view === 'library' && html`<${Library} />`}
+        ${view === 'prefs' && html`<${Prefs} theme=${theme} setTheme=${setTheme} />`}
+      </main>
+    </div>
+  </div></${ProbesCtx.Provider}>`;
+}
+
+/* ---------------- Overview ---------------- */
+function Stat({ label, value, sub, tone }) {
+  return html`<${Card} className="p-4 flex flex-col gap-1">
+    <p className="text-xs2 font-semibold uppercase tracking-wider text-mute">${label}</p>
+    <p className=${'num text-[28px] leading-tight font-medium ' + (tone ? 'text-' + tone : '')}>${value}</p>
+    <p className="text-sm2 text-mute">${sub}</p></${Card}>`;
+}
+function Overview() {
+  const { probes } = useProbes();
+  const ifaces = probes.flatMap((p) => p.interfaces.map((i) => ({ ...i, probe: p })));
+  const capturing = ifaces.filter((i) => i.status === 'CAPTURING').length;
+  const stalled = ifaces.filter((i) => i.status === 'STALLED');
+  const pps = probes.reduce((a, p) => a + (p.packet_rate_pps || 0), 0);
+  return html`<${PageHeader} eyebrow="Operations" title="Overview" desc="Fleet health at a glance: what is capturing, what needs attention." />
+    <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+      <${Stat} label="Probes online" value=${probes.filter((p) => p.online).length + ' / ' + probes.length} sub="heartbeat under 30 s" />
+      <${Stat} label="Interfaces capturing" value=${capturing + ' / ' + ifaces.length} sub="across all probes" />
+      <${Stat} label="Ingest rate" value=${fmtNum(pps)} sub="packets per second" />
+      <${Stat} label="Stalled captures" value=${stalled.length} sub="no growth over 10 s" tone=${stalled.length ? 'warn' : ''} />
+    </div>
+    <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_340px]">
+      <${Card} className="p-5"><h2 className="text-xl2 font-semibold mb-3">Probe health</h2>
+        <ul className="flex flex-col divide-y divide-line">${probes.map((p) => html`<li key=${p.probe_id} className="flex flex-wrap items-center gap-3 py-2.5">
+          <a href="#probes" className="min-w-[180px] flex-1"><p className="font-medium">${p.name}</p><p className="mono text-sm2 text-mute">${p.probe_id}</p></a>
+          <${TypeBadge} type=${p.probe_type} /><${Pill} tone=${healthTone(p.health)} dot=${p.online ? 'live' : true}>${p.health}</${Pill}>
+          <span className="num text-sm2 text-mute w-28 text-right">${fmtNum(p.packet_rate_pps)} pps</span></li>`)}</ul></${Card}>
+      <${Card} className="p-5"><h2 className="text-xl2 font-semibold mb-3">Needs attention</h2>
+        <ul className="flex flex-col gap-3 text-md2">
+          ${stalled.map((i) => html`<li key=${i.probe.probe_id + i.interface} className="flex gap-2.5"><span className="text-warn mt-0.5"><${Icon} name="alert" /></span>
+            <span><span className="mono">${i.probe.probe_id} · ${i.interface}</span><br/><span className="text-mute">${i.plane} capture stalled, file not growing</span></span></li>`)}
+          ${probes.filter((p) => !p.online).map((p) => html`<li key=${p.probe_id} className="flex gap-2.5"><span className="text-bad mt-0.5"><${Icon} name="alert" /></span>
+            <span><span className="mono">${p.probe_id}</span><br/><span className="text-mute">offline, last heartbeat ${fmtAge(p.last_heartbeat_epoch_s)}</span></span></li>`)}
+          ${probes.filter((p) => (p.packet_drops || 0) > 0).map((p) => html`<li key=${'d' + p.probe_id} className="flex gap-2.5"><span className="text-warn mt-0.5"><${Icon} name="alert" /></span>
+            <span><span className="mono">${p.probe_id}</span><br/><span className="text-mute">${fmtNum(p.packet_drops)} packets dropped</span></span></li>`)}
+        </ul></${Card}>
+    </div>`;
+}
+
+/* ---------------- Probes (list + inspector with all interfaces) ---------------- */
+function Probes() {
+  const { probes, setProbes } = useProbes();
+  const [registering, setRegistering] = useState(false);
+  const [q, setQ] = useState('');
+  const [type, setType] = useState('all');
+  const [sel, setSel] = useState(probes[0].probe_id);
+  const list = useMemo(() => probes.filter((p) => (type === 'all' || p.probe_type === type) &&
+    (p.name + ' ' + p.host + ' ' + p.probe_id + ' ' + p.interfaces.map((i) => i.interface).join(' ')).toLowerCase().includes(q.toLowerCase())), [q, type]);
+  const probe = probes.find((p) => p.probe_id === sel) || list[0];
+  return html`<${PageHeader} eyebrow="Operations" title="Probes" desc="Virtual and physical probes. Each probe listens on one or more interfaces; a role tells which 5G plane it observes."
+      actions=${html`<button onClick=${() => setRegistering(true)} data-testid="register-probe"
+        className="inline-flex items-center gap-1.5 h-9 px-4 rounded-md bg-brand text-white text-md2 font-medium shadow-e1 hover:brightness-110">
+        <${Icon} name="plus" size=${15} />Register probe</button>`} />
+    ${registering && html`<${RegisterDialog} existing=${probes} onCancel=${() => setRegistering(false)}
+      onCreate=${(probe) => { setProbes([...probes, probe]); setSel(probe.probe_id); setRegistering(false); }} />`}
+    <div className="flex flex-wrap items-center gap-2">
+      <label className="relative flex-1 min-w-[220px] max-w-md">
+        <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-mute"><${Icon} name="search" size=${14} /></span>
+        <input id="probe-search" value=${q} onChange=${(e) => setQ(e.target.value)} placeholder="Search probe, host or interface" aria-label="Search probes"
+          className="w-full h-9 pl-8 pr-3 rounded-md border border-line bg-surface text-md2 focus:outline-none focus:ring-2 focus:ring-brand focus:border-brand" /></label>
+      <div role="group" aria-label="Probe type" className="inline-flex rounded-md border border-line bg-surface p-0.5">
+        ${[['all', 'All'], ['vprobe', 'vProbe'], ['physical', 'Physical']].map(([v, l]) => html`<button key=${v} onClick=${() => setType(v)} aria-pressed=${type === v}
+          className=${'h-8 px-3 rounded text-sm2 ' + (type === v ? 'bg-brand-soft text-brand font-semibold' : 'text-mute hover:text-ink')}>${l}</button>`)}
+      </div>
+    </div>
+    <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px] items-start">
+      <${Card} className="overflow-hidden"><div className="overflow-x-auto">
+        <table className="w-full min-w-[760px] text-md2">
+          <thead><tr className="text-left text-xs2 uppercase tracking-wider text-mute border-b border-line">
+            <th className="px-4 py-2.5 font-semibold">Probe</th><th className="px-3 py-2.5 font-semibold">Type</th><th className="px-3 py-2.5 font-semibold">Health</th>
+            <th className="px-3 py-2.5 font-semibold">Interfaces</th><th className="px-3 py-2.5 font-semibold">CPU</th><th className="px-3 py-2.5 font-semibold">Disk</th>
+            <th className="px-4 py-2.5 font-semibold text-right">Heartbeat</th></tr></thead>
+          <tbody>${list.map((p) => html`<tr key=${p.probe_id} onClick=${() => setSel(p.probe_id)}
+              className=${'border-b border-line last:border-0 cursor-pointer transition-colors ' + (probe && probe.probe_id === p.probe_id ? 'bg-brand-soft' : 'hover:bg-canvas')}>
+            <td className="px-4 py-3"><button className="text-left" onClick=${() => setSel(p.probe_id)}><p className="font-medium">${p.name}</p><p className="mono text-sm2 text-mute">${p.host} · v${p.version}</p></button></td>
+            <td className="px-3 py-3"><${TypeBadge} type=${p.probe_type} /></td>
+            <td className="px-3 py-3"><${Pill} tone=${healthTone(p.health)} dot=${p.online ? 'live' : true}>${p.health}</${Pill}></td>
+            <td className="px-3 py-3"><div className="flex flex-wrap gap-1 max-w-[240px]">${p.interfaces.map((i) => html`<span key=${i.interface}
+              className=${'mono inline-flex items-center gap-1 rounded border border-line px-1.5 py-0.5 text-xs2 ' + (i.plane ? '' : 'text-mute')}>
+              ${i.plane && html`<span className=${'h-1.5 w-1.5 rounded-full ' + (i.status === 'CAPTURING' ? 'bg-ok' : i.status === 'STALLED' ? 'bg-warn' : 'bg-mute')}></span>`}${i.plane || '—'}</span>`)}</div>
+              <p className="text-sm2 text-mute mt-1">${p.interfaces.filter((i) => i.plane).length} assigned of ${p.interfaces.length}</p></td>
+            <td className="px-3 py-3"><${Meter} value=${p.cpu_usage_percent} label=${'CPU ' + p.name} /></td>
+            <td className="px-3 py-3"><${Meter} value=${p.disk_usage_percent} label=${'Disk ' + p.name} /></td>
+            <td className="px-4 py-3 text-right text-sm2 text-mute">${fmtAge(p.last_heartbeat_epoch_s)}</td></tr>`)}</tbody>
+        </table></div>
+        ${list.length === 0 && html`<p className="p-6 text-center text-mute">No probe matches. Clear the search or the type filter.</p>`}
+      </${Card}>
+      ${probe && html`<${Inspector} probe=${probe} />`}
+    </div>`;
+}
+
+function Inspector({ probe }) {
+  const [roles, setRoles] = useState({});
+  useEffect(() => setRoles({}), [probe.probe_id]);
+  const dirty = Object.keys(roles).length > 0;
+  const mem = probe.memory_usage_bytes != null ? Math.round((probe.memory_usage_bytes / probe.memory_total_bytes) * 100) : null;
+  return html`<${Card} className="p-5 flex flex-col gap-4 xl:sticky xl:top-4">
+    <div className="flex items-start justify-between gap-3"><div className="min-w-0">
+      <div className="flex flex-wrap items-center gap-2"><h2 className="text-xl2 font-semibold">${probe.name}</h2><${Pill} tone=${healthTone(probe.health)} dot=${probe.online ? 'live' : true}>${probe.health}</${Pill}></div>
+      <p className="mono text-sm2 text-mute break-all">${probe.probe_id} · ${probe.host}</p></div><${TypeBadge} type=${probe.probe_type} /></div>
+    <dl className="grid grid-cols-2 gap-x-4 gap-y-3 text-md2">
+      <div><dt className="text-xs2 uppercase tracking-wider text-mute">CPU</dt><dd><${Meter} value=${probe.cpu_usage_percent} label="CPU" /></dd></div>
+      <div><dt className="text-xs2 uppercase tracking-wider text-mute">Memory</dt><dd><${Meter} value=${mem} label="Memory" /></dd></div>
+      <div><dt className="text-xs2 uppercase tracking-wider text-mute">Disk</dt><dd><${Meter} value=${probe.disk_usage_percent} label="Disk" /></dd></div>
+      <div><dt className="text-xs2 uppercase tracking-wider text-mute">Ingest · decode</dt><dd className="num">${fmtNum(probe.packet_rate_pps)} pps · ${fmtNum(probe.decode_rate_eps)} ev/s</dd></div>
+      <div><dt className="text-xs2 uppercase tracking-wider text-mute">Packet drops</dt><dd className=${'num ' + ((probe.packet_drops || 0) > 0 ? 'text-warn font-semibold' : '')}>${fmtNum(probe.packet_drops)}</dd></div>
+      <div><dt className="text-xs2 uppercase tracking-wider text-mute">Heartbeat</dt><dd>${fmtAge(probe.last_heartbeat_epoch_s)}</dd></div>
+    </dl>
+    <div className="flex flex-col gap-2">
+      <div className="flex items-baseline justify-between"><h3 className="text-md2 font-semibold">Interfaces <span className="text-mute font-normal">(${probe.interfaces.length})</span></h3>
+        <span className="text-sm2 text-mute">role = observed plane</span></div>
+      <ul className="flex flex-col gap-2">${probe.interfaces.map((i) => {
+        const role = roles[i.interface] !== undefined ? roles[i.interface] : (i.plane || '');
+        const id = 'role-' + probe.probe_id + '-' + i.interface;
+        return html`<li key=${i.interface} className="rounded-lg border border-line p-3 flex flex-col gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2"><span className="mono font-medium">${i.interface}</span>
+            <${Pill} tone=${statusTone(i.status)} dot=${i.status === 'CAPTURING' ? 'live' : undefined}>${i.status}</${Pill}></div>
+          <div className="flex flex-wrap items-center gap-2">
+            <label htmlFor=${id} className="text-sm2 text-mute">Role</label>
+            <select id=${id} value=${role} onChange=${(e) => setRoles({ ...roles, [i.interface]: e.target.value })}
+              className="h-8 rounded-md border border-line bg-surface px-2 text-sm2 focus:outline-none focus:ring-2 focus:ring-brand">
+              <option value="">Unassigned</option>${PLANES.map((p) => html`<option key=${p} value=${p}>${p}</option>`)}</select>
+            ${i.filter && html`<span className="mono text-xs2 text-mute">${i.filter}</span>`}
+            ${i.pps != null && html`<span className="num text-sm2 text-mute ml-auto">${fmtNum(i.pps)} pps</span>`}</div>
+        </li>`;
+      })}</ul>
+      ${dirty && html`<p className="rounded-md bg-warn-soft text-warn text-sm2 px-3 py-2">Applying a new role restarts that interface's capture after closing the current file cleanly.</p>`}
+    </div>
+    <div className="flex flex-wrap gap-2 border-t border-line pt-3">
+      <${Locked} reason="Role assignment ships in V1.1">Apply roles</${Locked}>
+      <${Locked} reason="Blocked until lossless resume is proven (FIX V1.1)">Stop probe</${Locked}>
+      <a href="#live" className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-line text-sm2 text-brand hover:bg-canvas">Live captures <${Icon} name="ext" size=${12} /></a>
+    </div>
+  </${Card}>`;
+}
+
+
+/* ---------------- Register probe (multi-interface) ---------------- */
+const slug = (v) => v.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
+function Field({ id, label, hint, error, children }) {
+  return html`<div className="flex flex-col gap-1 min-w-0">
+    <label htmlFor=${id} className="text-xs2 font-semibold uppercase tracking-wider text-mute">${label}</label>${children}
+    ${error ? html`<span className="text-sm2 text-bad">${error}</span>` : hint ? html`<span className="text-sm2 text-mute">${hint}</span>` : null}</div>`;
+}
+const inputCls = 'h-9 w-full rounded-md border border-line bg-surface px-3 text-md2 focus:outline-none focus:ring-2 focus:ring-brand focus:border-brand';
+function RegisterDialog({ existing, onCancel, onCreate }) {
+  const [type, setType] = useState('vprobe');
+  const [name, setName] = useState('');
+  const [host, setHost] = useState('OIRAN');
+  const [mgmt, setMgmt] = useState('');
+  const [site, setSite] = useState('');
+  const [cpu, setCpu] = useState('2');
+  const [ram, setRam] = useState('4');
+  const [disk, setDisk] = useState('200');
+  const [ifaces, setIfaces] = useState([
+    { key: 1, interface: 'eth1', plane: 'N2', filter: PLANE_FILTER.N2 },
+    { key: 2, interface: 'eth2', plane: 'N3', filter: PLANE_FILTER.N3 },
+    { key: 3, interface: 'eth3', plane: 'N4', filter: PLANE_FILTER.N4 }
+  ]);
+  const [touched, setTouched] = useState(false);
+  useEffect(() => { const f = (e) => { if (e.key === 'Escape') onCancel(); }; addEventListener('keydown', f); return () => removeEventListener('keydown', f); }, []);
+
+  const probeId = slug((type === 'vprobe' ? 'vprobe-' : 'probe-phy-') + (name || ''));
+  const errors = {};
+  if (!name.trim()) errors.name = 'Give the probe a name';
+  else if (existing.some((p) => p.probe_id === probeId)) errors.name = 'A probe with this ID already exists';
+  if (!host.trim()) errors.host = 'Host is required';
+  if (type === 'physical' && !/^(\d{1,3}\.){3}\d{1,3}$/.test(mgmt.trim())) errors.mgmt = 'IPv4 management address, e.g. 10.20.0.15';
+  if (type === 'vprobe' && !(+cpu >= 1 && +ram >= 1 && +disk >= 20)) errors.res = 'At least 1 vCPU, 1 GB RAM and 20 GB disk';
+  const names = ifaces.map((i) => i.interface.trim());
+  const ifaceErr = {};
+  ifaces.forEach((i, n) => {
+    if (!i.interface.trim()) ifaceErr[i.key] = 'Interface name required';
+    else if (names.indexOf(i.interface.trim()) !== n) ifaceErr[i.key] = 'Duplicate interface';
+  });
+  if (ifaces.length === 0) errors.ifaces = 'Add at least one interface';
+  const valid = Object.keys(errors).length === 0 && Object.keys(ifaceErr).length === 0;
+  const show = (e) => (touched ? e : undefined);
+
+  function update(key, patch) { setIfaces(ifaces.map((i) => (i.key === key ? { ...i, ...patch } : i))); }
+  function setPlane(key, plane) { update(key, { plane, filter: plane ? PLANE_FILTER[plane] : '' }); }
+  function addIface() { const k = Math.max(0, ...ifaces.map((i) => i.key)) + 1; setIfaces([...ifaces, { key: k, interface: 'eth' + k, plane: '', filter: '' }]); }
+
+  function submit(e) {
+    e.preventDefault(); setTouched(true);
+    if (!valid) return;
+    onCreate({
+      probe_id: probeId, name: name.trim(), host: host.trim(), probe_type: type, version: '—', health: 'PENDING', online: false,
+      capture_state: 'NOT_STARTED', last_heartbeat_epoch_s: null, packet_rate_pps: null, decode_rate_eps: null, packet_drops: null,
+      cpu_usage_percent: null, memory_usage_bytes: null, memory_total_bytes: type === 'vprobe' ? +ram * 1e9 : null, disk_usage_percent: null,
+      capture_control_available: false,
+      interfaces: ifaces.map((i) => ({ interface: i.interface.trim(), plane: i.plane || null, protocol: i.plane ? PLANE_PROTO[i.plane] : null,
+        filter: i.filter || null, status: 'PENDING', pps: null, file_size: null, growth: null }))
+    });
+  }
+
+  return html`<div className="fixed inset-0 z-40 flex items-start sm:items-center justify-center bg-black/40 overflow-y-auto"
+      style=${{ paddingTop: 'max(16px, env(safe-area-inset-top, 0px))', paddingBottom: 'max(16px, env(safe-area-inset-bottom, 0px))', paddingLeft: 'max(16px, env(safe-area-inset-left, 0px))', paddingRight: 'max(16px, env(safe-area-inset-right, 0px))' }}>
+    <form role="dialog" aria-modal="true" aria-labelledby="reg-title" onSubmit=${submit}
+      className="w-full max-w-2xl rounded-xl border border-line bg-surface shadow-e2 flex flex-col">
+      <header className="flex items-start justify-between gap-3 px-5 pt-5">
+        <div><h2 id="reg-title" className="text-xl2 font-semibold">Register a probe</h2>
+          <p className="text-md2 text-mute">The probe appears as pending until its first heartbeat.</p></div>
+        <button type="button" onClick=${onCancel} aria-label="Close" className="grid place-items-center h-8 w-8 rounded-md border border-line hover:bg-canvas"><${Icon} name="close" size=${14} /></button>
+      </header>
+
+      <div className="flex flex-col gap-5 px-5 py-5">
+        <fieldset className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <legend className="sr-only">Probe type</legend>
+          ${[['vprobe', 'vProbe', 'Container deployed on a lab host', 'cloud'], ['physical', 'Physical probe', 'Rack appliance with capture NICs', 'server']].map(([v, l, d, ic]) => html`
+            <label key=${v} className=${'flex items-start gap-3 rounded-lg border p-3 cursor-pointer ' + (type === v ? 'border-brand bg-brand-soft' : 'border-line hover:bg-canvas')}>
+              <input type="radio" name="ptype" value=${v} checked=${type === v} onChange=${() => { setType(v); setHost(v === 'vprobe' ? 'OIRAN' : ''); }} className="mt-1" />
+              <span className=${type === v ? 'text-brand' : 'text-mute'}><${Icon} name=${ic} size=${18} /></span>
+              <span><span className="block font-semibold">${l}</span><span className="block text-sm2 text-mute">${d}</span></span></label>`)}
+        </fieldset>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <${Field} id="reg-name" label="Name" error=${show(errors.name)} hint=${name ? 'ID: ' + probeId : undefined}>
+            <input id="reg-name" className=${inputCls} value=${name} onChange=${(e) => setName(e.target.value)} placeholder=${type === 'vprobe' ? 'Lab vProbe C' : 'Marseille rack probe'} autoFocus /></${Field}>
+          ${type === 'vprobe' ? html`<${Field} id="reg-host" label="Lab host" error=${show(errors.host)}>
+              <select id="reg-host" className=${inputCls} value=${host} onChange=${(e) => setHost(e.target.value)}><option value="OIRAN">OIRAN</option></select></${Field}>`
+            : html`<${Field} id="reg-host" label="Hostname" error=${show(errors.host)}>
+              <input id="reg-host" className=${inputCls + ' mono'} value=${host} onChange=${(e) => setHost(e.target.value)} placeholder="prb-marseille-01" /></${Field}>`}
+          ${type === 'physical' && html`
+            <${Field} id="reg-mgmt" label="Management address" error=${show(errors.mgmt)}>
+              <input id="reg-mgmt" className=${inputCls + ' mono'} value=${mgmt} onChange=${(e) => setMgmt(e.target.value)} placeholder="10.20.0.15" /></${Field}>
+            <${Field} id="reg-site" label="Site" hint="Optional">
+              <input id="reg-site" className=${inputCls} value=${site} onChange=${(e) => setSite(e.target.value)} placeholder="Marseille DC2, rack B4" /></${Field}>`}
+          ${type === 'vprobe' && html`<div className="sm:col-span-2 grid grid-cols-3 gap-3">
+            <${Field} id="reg-cpu" label="vCPU"><input id="reg-cpu" type="number" min="1" className=${inputCls + ' num'} value=${cpu} onChange=${(e) => setCpu(e.target.value)} /></${Field}>
+            <${Field} id="reg-ram" label="RAM (GB)"><input id="reg-ram" type="number" min="1" className=${inputCls + ' num'} value=${ram} onChange=${(e) => setRam(e.target.value)} /></${Field}>
+            <${Field} id="reg-disk" label="Capture disk (GB)"><input id="reg-disk" type="number" min="20" className=${inputCls + ' num'} value=${disk} onChange=${(e) => setDisk(e.target.value)} /></${Field}>
+            ${show(errors.res) && html`<p className="col-span-3 text-sm2 text-bad">${errors.res}</p>`}</div>`}
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <div className="flex items-baseline justify-between gap-2"><h3 className="text-md2 font-semibold">Interfaces <span className="text-mute font-normal">(${ifaces.length})</span></h3>
+            <span className="text-sm2 text-mute">role sets the capture filter; edit it if needed</span></div>
+          <div className="overflow-x-auto rounded-lg border border-line"><table className="w-full min-w-[560px] text-md2">
+            <thead><tr className="text-left text-xs2 uppercase tracking-wider text-mute border-b border-line">
+              <th className="px-3 py-2 font-semibold">Interface</th><th className="px-3 py-2 font-semibold">Role</th><th className="px-3 py-2 font-semibold">Capture filter</th><th className="px-3 py-2"></th></tr></thead>
+            <tbody>${ifaces.map((i, n) => html`<tr key=${i.key} className="border-b border-line last:border-0 align-top">
+              <td className="px-3 py-2"><label htmlFor=${'if-name-' + i.key} className="sr-only">Interface ${n + 1} name</label>
+                <input id=${'if-name-' + i.key} className=${inputCls + ' mono h-8'} value=${i.interface} onChange=${(e) => update(i.key, { interface: e.target.value })} />
+                ${show(ifaceErr[i.key]) && html`<span className="text-sm2 text-bad">${ifaceErr[i.key]}</span>`}</td>
+              <td className="px-3 py-2"><label htmlFor=${'if-role-' + i.key} className="sr-only">Interface ${n + 1} role</label>
+                <select id=${'if-role-' + i.key} className=${inputCls + ' h-8'} value=${i.plane} onChange=${(e) => setPlane(i.key, e.target.value)}>
+                  <option value="">Unassigned</option>${PLANES.map((p) => html`<option key=${p} value=${p}>${p} · ${PLANE_PROTO[p]}</option>`)}</select></td>
+              <td className="px-3 py-2"><label htmlFor=${'if-filter-' + i.key} className="sr-only">Interface ${n + 1} capture filter</label>
+                <input id=${'if-filter-' + i.key} className=${inputCls + ' mono h-8'} value=${i.filter} placeholder=${i.plane ? 'capture all' : 'no capture'} disabled=${!i.plane}
+                  onChange=${(e) => update(i.key, { filter: e.target.value })} /></td>
+              <td className="px-3 py-2 text-right"><button type="button" onClick=${() => setIfaces(ifaces.filter((x) => x.key !== i.key))} aria-label=${'Remove ' + (i.interface || 'interface')}
+                className="grid place-items-center h-8 w-8 rounded-md border border-line text-mute hover:text-bad hover:bg-canvas"><${Icon} name="trash" size=${14} /></button></td></tr>`)}</tbody></table></div>
+          ${show(errors.ifaces) && html`<p className="text-sm2 text-bad">${errors.ifaces}</p>`}
+          <button type="button" onClick=${addIface} className="self-start inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-line text-sm2 text-brand hover:bg-canvas">
+            <${Icon} name="plus" size=${13} />Add interface</button>
+        </div>
+      </div>
+
+      <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-line px-5 py-4">
+        <span className="text-sm2 text-mute">Capture starts only after you apply roles on the registered probe.</span>
+        <div className="flex gap-2"><button type="button" onClick=${onCancel} className="h-9 px-4 rounded-md border border-line text-md2 hover:bg-canvas">Cancel</button>
+          <button type="submit" data-testid="register-submit" className="h-9 px-4 rounded-md bg-brand text-white text-md2 font-medium hover:brightness-110">Register probe</button></div>
+      </footer>
+    </form></div>`;
+}
+
+/* ---------------- Interfaces (all probes) ---------------- */
+function Interfaces() {
+  const { probes } = useProbes();
+  const [plane, setPlane] = useState('all');
+  const rows = probes.flatMap((p) => p.interfaces.map((i) => ({ ...i, probe: p }))).filter((r) => plane === 'all' || (plane === 'none' ? !r.plane : r.plane === plane));
+  return html`<${PageHeader} eyebrow="Operations" title="Interfaces" desc="Every listening interface across the fleet, grouped by the plane it observes." />
+    <div role="group" aria-label="Plane filter" className="flex flex-wrap gap-1.5">
+      ${[['all', 'All planes'], ...PLANES.map((p) => [p, p]), ['none', 'Unassigned']].map(([v, l]) => html`<button key=${v} onClick=${() => setPlane(v)} aria-pressed=${plane === v}
+        className=${'h-8 px-3 rounded-full border text-sm2 ' + (plane === v ? 'border-brand bg-brand-soft text-brand font-semibold' : 'border-line bg-surface text-mute hover:text-ink')}>${l}</button>`)}
+    </div>
+    <${Card} className="overflow-hidden"><div className="overflow-x-auto"><table className="w-full min-w-[820px] text-md2">
+      <thead><tr className="text-left text-xs2 uppercase tracking-wider text-mute border-b border-line">
+        <th className="px-4 py-2.5 font-semibold">Interface</th><th className="px-3 py-2.5 font-semibold">Probe</th><th className="px-3 py-2.5 font-semibold">Plane</th>
+        <th className="px-3 py-2.5 font-semibold">Protocol · filter</th><th className="px-3 py-2.5 font-semibold">Status</th><th className="px-3 py-2.5 font-semibold text-right">Rate</th><th className="px-4 py-2.5 font-semibold text-right">Current file</th></tr></thead>
+      <tbody>${rows.map((r) => html`<tr key=${r.probe.probe_id + r.interface} className="border-b border-line last:border-0">
+        <td className="px-4 py-3 mono font-medium">${r.interface}</td>
+        <td className="px-3 py-3"><p>${r.probe.name}</p><p className="mono text-sm2 text-mute">${r.probe.probe_id}</p></td>
+        <td className="px-3 py-3">${r.plane ? html`<${Pill} tone=${planeTone(r.plane)}>${r.plane}</${Pill}>` : html`<span className="text-mute">Unassigned</span>`}</td>
+        <td className="px-3 py-3"><p>${r.protocol || '—'}</p><p className="mono text-xs2 text-mute">${r.filter || ''}</p></td>
+        <td className="px-3 py-3"><${Pill} tone=${statusTone(r.status)} dot=${r.status === 'CAPTURING' ? 'live' : undefined}>${r.status}</${Pill}></td>
+        <td className="px-3 py-3 num text-right">${r.pps == null ? '—' : fmtNum(r.pps) + ' pps'}</td>
+        <td className="px-4 py-3 num text-right">${fmtBytes(r.file_size)}</td></tr>`)}</tbody></table></div></${Card}>`;
+}
+
+/* ---------------- Live captures (grouped by probe, growth) ---------------- */
+function Live() {
+  const { probes } = useProbes();
+  const [tick, setTick] = useState(0);
+  useEffect(() => { const t = setInterval(() => setTick((x) => x + 1), 5000); return () => clearInterval(t); }, []);
+  const groups = probes.filter((p) => p.interfaces.some((i) => i.plane));
+  const totalGrowth = probes.flatMap((p) => p.interfaces).reduce((a, i) => a + (i.growth || 0), 0);
+  return html`<${PageHeader} eyebrow="Capture" title="Live captures" desc="Continuous capture per probe and interface. A file that stops growing for 10 s is flagged as stalled." />
+    <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+      <${Stat} label="Written, last 10 s" value=${fmtBytes(totalGrowth)} sub="sum of file growth" />
+      <${Stat} label="Capturing" value=${probes.flatMap((p) => p.interfaces).filter((i) => i.status === 'CAPTURING').length} sub="interfaces" />
+      <${Stat} label="Stalled" value=${probes.flatMap((p) => p.interfaces).filter((i) => i.status === 'STALLED').length} sub="no growth over 10 s" tone="warn" />
+      <${Card} className="p-4 flex flex-col gap-2"><p className="text-xs2 font-semibold uppercase tracking-wider text-mute">Disk · OIRAN</p>
+        <div className="relative h-2 rounded-full bg-track overflow-hidden"><div className="h-full bg-brand" style=${{ width: '75%' }}></div>
+          <div className="absolute top-0 bottom-0 w-0.5 bg-bad" style=${{ left: '90%' }}></div></div>
+        <p className="text-sm2 text-mute"><span className="num text-ink">75%</span> used · writes stop at 90%</p></${Card}>
+    </div>
+    ${groups.map((p) => html`<${Card} key=${p.probe_id} className="overflow-hidden">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-line">
+        <div className="flex flex-wrap items-center gap-2"><h2 className="text-md2 font-semibold">${p.name}</h2><span className="mono text-sm2 text-mute">${p.probe_id}</span><${TypeBadge} type=${p.probe_type} /></div>
+        <${Pill} tone=${healthTone(p.health)} dot=${p.online ? 'live' : true}>${p.health}</${Pill}></div>
+      <div className="overflow-x-auto"><table className="w-full min-w-[760px] text-md2"><tbody>
+        ${p.interfaces.filter((i) => i.plane).map((i) => html`<tr key=${i.interface} className="border-b border-line last:border-0">
+          <td className="px-4 py-3 w-[190px]"><p className="mono font-medium">${i.interface}</p><p className="text-sm2 text-mute">${i.protocol}</p></td>
+          <td className="px-3 py-3 w-[70px]"><${Pill} tone=${planeTone(i.plane)}>${i.plane}</${Pill}></td>
+          <td className="px-3 py-3 w-[130px]"><${Pill} tone=${statusTone(i.status)} dot=${i.status === 'CAPTURING' ? 'live' : undefined}>${i.status}</${Pill}></td>
+          <td className="px-3 py-3"><p className="text-xs2 uppercase tracking-wider text-mute">Growth · 10 s</p><p className=${'num ' + (i.growth === 0 ? 'text-warn font-semibold' : '')}>+${fmtBytes(i.growth)}</p></td>
+          <td className="px-3 py-3"><p className="text-xs2 uppercase tracking-wider text-mute">File</p><p className="num">${fmtBytes(i.file_size)}</p></td>
+          <td className="px-3 py-3"><p className="text-xs2 uppercase tracking-wider text-mute">Rate</p><p className="num">${fmtNum(i.pps)} pps</p></td>
+          <td className="px-4 py-3 text-right whitespace-nowrap">
+            <a href="#library" className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-line text-sm2 text-brand hover:bg-canvas mr-2">Open in Analyzer</a>
+            <${Locked} reason="Blocked until lossless resume is proven (FIX V1.1)">Stop</${Locked}></td></tr>`)}
+      </tbody></table></div></${Card}>`)}
+    <p className="flex items-start gap-2 rounded-lg border border-line bg-warn-soft text-warn px-4 py-3 text-md2">
+      <span className="mt-0.5"><${Icon} name="alert" /></span>Stop is locked: the last maintenance showed that a restart did not restore every indexed session. Captures stay read-only until lossless resume is proven.</p>`;
+}
+
+/* ---------------- Library & Preferences ---------------- */
+function Library() {
+  const files = [
+    { capture_id: 'cap-n2-2026-10-28-12', name: 'N2 · vprobe-lab-01 · 12:00', protocol: 'NGAP', size_bytes: 18.4e6, packet_count: 1380, state: 'CLOSED' },
+    { capture_id: 'cap-n4-2026-10-28-12', name: 'N4 · vprobe-lab-01 · 12:00', protocol: 'PFCP', size_bytes: 9.1e6, packet_count: 1308, state: 'CLOSED' },
+    { capture_id: 'cap-n3-2026-10-28-11', name: 'N3 · probe-phy-paris-01 · 11:00', protocol: 'GTP-U', size_bytes: 38.0e9, packet_count: 152000000, state: 'CLOSED' }
+  ];
+  return html`<${PageHeader} eyebrow="Capture" title="Capture library" desc="Closed capture files, ready to open in the Analyzer." />
+    <${Card} className="overflow-hidden"><div className="overflow-x-auto"><table className="w-full min-w-[640px] text-md2">
+      <thead><tr className="text-left text-xs2 uppercase tracking-wider text-mute border-b border-line"><th className="px-4 py-2.5 font-semibold">Capture</th>
+        <th className="px-3 py-2.5 font-semibold">Protocol</th><th className="px-3 py-2.5 font-semibold text-right">Packets</th><th className="px-3 py-2.5 font-semibold text-right">Size</th><th className="px-4 py-2.5"></th></tr></thead>
+      <tbody>${files.map((f) => html`<tr key=${f.capture_id} className="border-b border-line last:border-0"><td className="px-4 py-3"><p className="font-medium">${f.name}</p><p className="mono text-sm2 text-mute">${f.capture_id}</p></td>
+        <td className="px-3 py-3">${f.protocol}</td><td className="px-3 py-3 num text-right">${fmtNum(f.packet_count)}</td><td className="px-3 py-3 num text-right">${fmtBytes(f.size_bytes)}</td>
+        <td className="px-4 py-3 text-right"><a href="#library" className="text-brand text-sm2">Open in Analyzer</a></td></tr>`)}</tbody></table></div></${Card}>`;
+}
+function Prefs({ theme, setTheme }) {
+  return html`<${PageHeader} eyebrow="Platform" title="Preferences" />
+    <${Card} className="p-5 max-w-xl flex flex-col gap-3"><h2 className="text-md2 font-semibold">Theme</h2>
+      <div role="group" aria-label="Theme" className="inline-flex rounded-md border border-line p-0.5 w-fit">
+        ${[['', 'System'], ['light', 'Light'], ['dark', 'Dark']].map(([v, l]) => html`<button key=${l} onClick=${() => setTheme(v)} aria-pressed=${theme === v}
+          className=${'h-8 px-3 rounded text-sm2 ' + (theme === v ? 'bg-brand-soft text-brand font-semibold' : 'text-mute hover:text-ink')}>${l}</button>`)}</div>
+      <p className="text-sm2 text-mute">Credentials and management endpoints are never shown in this console.</p></${Card}>`;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+</script>
