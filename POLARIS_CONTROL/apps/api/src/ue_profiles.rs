@@ -6,7 +6,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use ueransim_adapter::{render_profile, validate_profile_set, UeProfileSpec, UeSecrets};
+use ueransim_adapter::{
+    lab_gnb_registry, render_profile_with_gnbs, validate_profile_set, GnbEndpoint, UeProfileSpec,
+    UeSecrets,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedUeProfile {
@@ -47,7 +50,24 @@ pub struct ProfileMutationInput {
     pub scenario_id: Option<String>,
     #[serde(default)]
     pub auto_run_scenario: bool,
+    /// Binds the profile to a subscriber already provisioned in Open5GS (for example `UE-03`).
+    /// The backend reads SUPI/K/OPc from the protected server-side plan; the request must then
+    /// leave `supi`, `authentication_key` and `opc` empty.
+    #[serde(default)]
+    pub provisioning_slot: Option<String>,
 }
+
+/// One subscriber already provisioned in Open5GS, as listed to operators (never its secrets).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ProvisioningSlot {
+    pub slot_id: String,
+    pub bound_ue_id: Option<String>,
+}
+
+/// Default location of the V3.2 subscriber plan written by `deployment/provision-ten-subscribers.sh`.
+pub const DEFAULT_SUBSCRIBER_PLAN_PATH: &str =
+    "/var/lib/polaris-control/subscriber-secrets/v3.2.plan";
+const MAX_SUBSCRIBER_PLAN_BYTES: u64 = 65_536;
 
 /// Bulk provisioning creates protected local material but never provisions Open5GS. Every
 /// resulting profile therefore remains `PROVISIONING_REQUIRED` until independently attested.
@@ -68,14 +88,127 @@ pub struct BulkProfileInput {
 pub struct ProfileStore {
     registry_path: PathBuf,
     profile_root: PathBuf,
+    gnbs: Vec<GnbEndpoint>,
+    subscriber_plan_path: Option<PathBuf>,
 }
 
 impl ProfileStore {
+    /// Uses the laboratory default gNB registry (production loads it from the environment).
+    #[allow(dead_code)]
     pub fn new(registry_path: PathBuf, profile_root: PathBuf) -> Self {
+        Self::with_gnbs(registry_path, profile_root, lab_gnb_registry())
+    }
+
+    pub fn with_gnbs(
+        registry_path: PathBuf,
+        profile_root: PathBuf,
+        gnbs: Vec<GnbEndpoint>,
+    ) -> Self {
         Self {
             registry_path,
             profile_root,
+            gnbs,
+            subscriber_plan_path: None,
         }
+    }
+
+    /// Enables binding profiles to already-provisioned subscribers read from `path`.
+    pub fn with_subscriber_plan(mut self, path: PathBuf) -> Self {
+        self.subscriber_plan_path = Some(path);
+        self
+    }
+
+    /// Slot identifiers from the plan, each with the UE profile bound to it, if any.
+    pub fn provisioning_slots(
+        &self,
+        registry: &UeProfileRegistry,
+    ) -> Result<Vec<ProvisioningSlot>, String> {
+        self.read_subscriber_plan()?
+            .into_iter()
+            .map(|(slot_id, supi, _, _)| {
+                let identity = sha256(supi.as_bytes())?;
+                Ok(ProvisioningSlot {
+                    bound_ue_id: registry
+                        .profiles
+                        .iter()
+                        .find(|record| record.subscriber_identity_sha256 == identity)
+                        .map(|record| record.profile.ue_id.clone()),
+                    slot_id,
+                })
+            })
+            .collect()
+    }
+
+    fn slot_secrets(&self, slot_id: &str) -> Result<(String, String, String), String> {
+        self.read_subscriber_plan()?
+            .into_iter()
+            .find(|(id, _, _, _)| id == slot_id)
+            .map(|(_, supi, key, opc)| (supi, key, opc))
+            .ok_or_else(|| "UNKNOWN_PROVISIONING_SLOT".to_string())
+    }
+
+    /// Reads `UE-NN|imsi(15 digits)|K(32 hex)|OPc(32 hex)|…` lines from a private plan file.
+    fn read_subscriber_plan(&self) -> Result<Vec<(String, String, String, String)>, String> {
+        let path = self
+            .subscriber_plan_path
+            .as_ref()
+            .ok_or("PROVISIONING_SLOTS_UNAVAILABLE")?;
+        let metadata =
+            fs::symlink_metadata(path).map_err(|_| "PROVISIONING_SLOTS_UNAVAILABLE".to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err("SUBSCRIBER_PLAN_UNSAFE".into());
+            }
+        }
+        if !metadata.file_type().is_file() || metadata.len() > MAX_SUBSCRIBER_PLAN_BYTES {
+            return Err("SUBSCRIBER_PLAN_UNSAFE".into());
+        }
+        let document =
+            fs::read_to_string(path).map_err(|_| "PROVISIONING_SLOTS_UNAVAILABLE".to_string())?;
+        let mut slots = Vec::new();
+        let mut ids = BTreeSet::new();
+        for line in document.lines().filter(|line| !line.trim().is_empty()) {
+            let fields: Vec<&str> = line.split('|').collect();
+            let valid = fields.len() >= 4
+                && parse_ue_index(fields[0]).is_ok()
+                && fields[1].len() == 15
+                && fields[1].chars().all(|ch| ch.is_ascii_digit())
+                && [fields[2], fields[3]].iter().all(|value| {
+                    value.len() == 32 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+                });
+            if !valid || !ids.insert(fields[0].to_string()) {
+                return Err("SUBSCRIBER_PLAN_INVALID".into());
+            }
+            slots.push((
+                fields[0].to_string(),
+                format!("imsi-{}", fields[1]),
+                fields[2].to_string(),
+                fields[3].to_string(),
+            ));
+        }
+        Ok(slots)
+    }
+
+    fn creation_secrets(
+        &self,
+        input: &ProfileMutationInput,
+    ) -> Result<(String, String, String), String> {
+        match input.provisioning_slot.as_deref() {
+            None => required_secrets(input),
+            Some(slot) => {
+                if input.supi.is_some() || input.authentication_key.is_some() || input.opc.is_some()
+                {
+                    return Err("PROVISIONING_SLOT_EXCLUDES_SECRETS".into());
+                }
+                self.slot_secrets(slot)
+            }
+        }
+    }
+
+    pub fn gnbs(&self) -> &[GnbEndpoint] {
+        &self.gnbs
     }
 
     pub fn load_or_bootstrap(
@@ -158,16 +291,17 @@ impl ProfileStore {
         {
             return Err("UE_PROFILE_ALREADY_EXISTS".into());
         }
-        let secrets = required_secrets(&input)?;
+        let secrets = self.creation_secrets(&input)?;
         let record = self.build_record(input, &secrets, 1, epoch_seconds())?;
         self.ensure_identity_unique(registry, &record.subscriber_identity_sha256, None)?;
-        let yaml = render_profile(
+        let yaml = render_profile_with_gnbs(
             &record.profile,
             UeSecrets {
                 supi: &secrets.0,
                 key: &secrets.1,
                 opc: &secrets.2,
             },
+            &self.gnbs,
         )?;
         let profile_path = self.profile_root.join(&record.profile.profile_name);
         atomic_private_write(&profile_path, yaml.as_bytes())?;
@@ -241,15 +375,17 @@ impl ProfileStore {
                 serving_gnb: input.serving_gnb.clone(),
                 scenario_id: input.scenario_id.clone(),
                 auto_run_scenario: false,
+                provisioning_slot: None,
             };
             let record = self.build_record(mutation, &secrets, 1, epoch_seconds())?;
-            let yaml = render_profile(
+            let yaml = render_profile_with_gnbs(
                 &record.profile,
                 UeSecrets {
                     supi: &secrets.0,
                     key: &secrets.1,
                     opc: &secrets.2,
                 },
+                &self.gnbs,
             )?;
             let final_path = self.profile_root.join(&record.profile.profile_name);
             let stage_path = self.profile_root.join(format!(
@@ -319,13 +455,14 @@ impl ProfileStore {
             self.build_record(input, &secrets, old.revision + 1, old.created_at_epoch_s)?;
         record.profile.subscription_verified = false;
         self.ensure_identity_unique(registry, &record.subscriber_identity_sha256, Some(ue_id))?;
-        let yaml = render_profile(
+        let yaml = render_profile_with_gnbs(
             &record.profile,
             UeSecrets {
                 supi: &secrets.0,
                 key: &secrets.1,
                 opc: &secrets.2,
             },
+            &self.gnbs,
         )?;
         let path = self.profile_root.join(&record.profile.profile_name);
         let backup = fs::read(&path).map_err(|_| "UE_PROFILE_SECRET_UNREADABLE")?;
@@ -370,6 +507,7 @@ impl ProfileStore {
             serving_gnb: source.profile.serving_gnb,
             scenario_id: source.scenario_id,
             auto_run_scenario: false,
+            provisioning_slot: None,
         };
         self.create(registry, input)
     }
@@ -640,7 +778,124 @@ mod tests {
             serving_gnb: "GNB-01".into(),
             scenario_id: Some("scenario-1".into()),
             auto_run_scenario: false,
+            provisioning_slot: None,
         }
+    }
+
+    fn plan_store(name: &str, plan: &str, mode: u32) -> (ProfileStore, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("polaris-slots-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let plan_path = root.join("v3.2.plan");
+        fs::write(&plan_path, plan).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&plan_path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let store = ProfileStore::new(root.join("registry.json"), root.join("profiles"))
+            .with_subscriber_plan(plan_path);
+        (store, root)
+    }
+
+    const TEST_PLAN: &str = "UE-01|001010000000001|00112233445566778899aabbccddeeff|ffeeddccbbaa99887766554433221100|1|1\nUE-02|001010000000002|0123456789abcdef0123456789abcdef|fedcba9876543210fedcba9876543210|2|2\n";
+
+    fn slot_input(ue_id: &str, slot: &str) -> ProfileMutationInput {
+        let mut value = input(ue_id, "imsi-000000000000000");
+        value.supi = None;
+        value.authentication_key = None;
+        value.opc = None;
+        value.provisioning_slot = Some(slot.into());
+        value
+    }
+
+    #[test]
+    fn provisioning_slot_binds_server_side_secrets_without_exposing_them() {
+        let (store, root) = plan_store("bind", TEST_PLAN, 0o600);
+        let mut registry = UeProfileRegistry {
+            schema_version: 1,
+            profiles: vec![],
+        };
+        let record = store
+            .create(&mut registry, slot_input("UE-11", "UE-02"))
+            .unwrap();
+        assert_eq!(
+            record.subscriber_identity_sha256,
+            sha256(b"imsi-001010000000002").unwrap()
+        );
+        let yaml = fs::read_to_string(root.join("profiles").join("ue-11.yaml")).unwrap();
+        assert!(yaml.contains("supi: 'imsi-001010000000002'"));
+        assert!(yaml.contains("key: '0123456789abcdef0123456789abcdef'"));
+        assert!(!serde_json::to_string(&registry)
+            .unwrap()
+            .contains("0123456789abcdef"));
+        let slots = store.provisioning_slots(&registry).unwrap();
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[1].bound_ue_id.as_deref(), Some("UE-11"));
+        assert_eq!(slots[0].bound_ue_id, None);
+        assert!(!serde_json::to_string(&slots).unwrap().contains("00101"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provisioning_slot_is_bound_at_most_once() {
+        let (store, root) = plan_store("once", TEST_PLAN, 0o600);
+        let mut registry = UeProfileRegistry {
+            schema_version: 1,
+            profiles: vec![],
+        };
+        store
+            .create(&mut registry, slot_input("UE-11", "UE-01"))
+            .unwrap();
+        assert_eq!(
+            store
+                .create(&mut registry, slot_input("UE-12", "UE-01"))
+                .unwrap_err(),
+            "DUPLICATE_SUBSCRIBER_IDENTITY"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provisioning_slot_rejects_mixed_secrets_unknown_slots_and_unsafe_plans() {
+        let (store, root) = plan_store("reject", TEST_PLAN, 0o600);
+        let mut registry = UeProfileRegistry {
+            schema_version: 1,
+            profiles: vec![],
+        };
+        let mut mixed = slot_input("UE-11", "UE-01");
+        mixed.opc = Some("22".repeat(16));
+        assert_eq!(
+            store.create(&mut registry, mixed).unwrap_err(),
+            "PROVISIONING_SLOT_EXCLUDES_SECRETS"
+        );
+        assert_eq!(
+            store
+                .create(&mut registry, slot_input("UE-11", "UE-09"))
+                .unwrap_err(),
+            "UNKNOWN_PROVISIONING_SLOT"
+        );
+        fs::remove_dir_all(root).unwrap();
+        let (unsafe_store, unsafe_root) = plan_store("unsafe", TEST_PLAN, 0o644);
+        assert_eq!(
+            unsafe_store.provisioning_slots(&registry).unwrap_err(),
+            "SUBSCRIBER_PLAN_UNSAFE"
+        );
+        fs::remove_dir_all(unsafe_root).unwrap();
+        let (bad_store, bad_root) = plan_store("bad", "UE-01|123|x|y\n", 0o600);
+        assert_eq!(
+            bad_store.provisioning_slots(&registry).unwrap_err(),
+            "SUBSCRIBER_PLAN_INVALID"
+        );
+        fs::remove_dir_all(bad_root).unwrap();
+        let no_plan = temp_store("noplan");
+        assert_eq!(
+            no_plan
+                .create(&mut registry, slot_input("UE-11", "UE-01"))
+                .unwrap_err(),
+            "PROVISIONING_SLOTS_UNAVAILABLE"
+        );
     }
 
     #[test]

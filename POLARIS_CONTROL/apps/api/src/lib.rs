@@ -1399,12 +1399,18 @@ impl AppState {
         let ue01_controller_owned =
             DockerUeRuntime::ue01_transfer_is_active(ownership_id.as_deref())?;
         let ue_runtime: Arc<dyn UeRuntime> = Arc::new(DockerUeRuntime { ownership_id });
-        let profile_store = ProfileStore::new(
+        let profile_store = ProfileStore::with_gnbs(
             std::env::var("POLARIS_UE_PROFILE_REGISTRY_PATH")
                 .unwrap_or_else(|_| "/var/lib/polaris-control/ue-profile-registry.json".into())
                 .into(),
             std::env::var("POLARIS_UE_PROFILE_ROOT")
                 .unwrap_or_else(|_| ueransim_adapter::LIVE_PROFILE_ROOT.into())
+                .into(),
+            ueransim_adapter::load_gnb_registry_from_env()?,
+        )
+        .with_subscriber_plan(
+            std::env::var("POLARIS_SUBSCRIBER_PLAN_PATH")
+                .unwrap_or_else(|_| ue_profiles::DEFAULT_SUBSCRIBER_PLAN_PATH.into())
                 .into(),
         );
         let scenario_definition_store = ScenarioDefinitionStore::new(
@@ -2576,6 +2582,40 @@ async fn bulk_create_ue_profiles(
 
 fn csv_cell(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// Subscribers already provisioned in Open5GS that a new profile may bind to. Never returns secrets.
+async fn list_provisioning_slots(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let registry = state.profile_registry.lock().unwrap();
+    match state.profile_store.provisioning_slots(&registry) {
+        Ok(slots) => (
+            StatusCode::OK,
+            Json(json!({
+                "items": slots,
+                "total": slots.len(),
+                "available": slots.iter().filter(|slot| slot.bound_ue_id.is_none()).count(),
+                "secrets_exposed": false,
+            })),
+        ),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": error})),
+        ),
+    }
+}
+
+/// Read-only registry of gNBs a UE profile may name as `serving_gnb`.
+async fn list_gnbs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let gnbs = state.profile_store.gnbs();
+    Json(json!({
+        "items": gnbs,
+        "total": gnbs.len(),
+        "source": if std::env::var_os(ueransim_adapter::GNB_REGISTRY_ENV).is_some() {
+            "CONFIGURED_REGISTRY"
+        } else {
+            "LAB_DEFAULT"
+        },
+    }))
 }
 
 async fn export_ue_profiles_csv(
@@ -5325,11 +5365,16 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/lab", get(lab))
         .route("/nodes", get(nodes))
         .route("/ues", get(ues))
+        .route("/gnbs", get(list_gnbs))
         .route(
             "/ue-profiles",
             get(list_ue_profiles).post(create_ue_profile),
         )
         .route("/ue-profiles/bulk", post(bulk_create_ue_profiles))
+        .route(
+            "/ue-profiles/provisioning-slots",
+            get(list_provisioning_slots),
+        )
         .route("/ue-profiles/export.csv", get(export_ue_profiles_csv))
         .route(
             "/ue-profiles/:ue_id",
@@ -7767,6 +7812,53 @@ mod p0_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ue_profile_http_unknown_serving_gnb_is_rejected() {
+        let application = app(state());
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let mut input = profile_http_input("UE-13", "imsi-001010000000013", "UE 13");
+        input["serving_gnb"] = json!("GNB-99");
+        let response = application
+            .oneshot(profile_http_request(
+                Method::POST,
+                "/api/v1/ue-profiles",
+                input,
+                &cookie,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"], "UNKNOWN_SERVING_GNB");
+    }
+
+    #[tokio::test]
+    async fn gnbs_http_lists_the_registry_without_secrets() {
+        let application = app(state());
+        let (cookie, _csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/gnbs")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["gnb_id"], "GNB-01");
+        assert_eq!(body["items"][0]["link_ip"], "10.77.0.20");
+        assert_eq!(body["source"], "LAB_DEFAULT");
     }
 
     #[tokio::test]

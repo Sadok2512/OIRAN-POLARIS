@@ -144,3 +144,17 @@
 
 - Replace four lab-state-dependent inventory checks with a strict, known API fixture.
 - Keep a separate read-only Live inventory test disabled by default and manually selectable.
+
+## 0.11.0 (polaris-control-api) / 0.4.0 (ueransim-adapter)
+
+- Minor: `serving_gnb` now feeds the UERANSIM `gnbSearchList` through a gNB registry
+  (laboratory default `GNB-01 → 10.77.0.20`, or a validated JSON file named by
+  `POLARIS_GNB_REGISTRY_PATH`). An unknown gNB is refused with `UNKNOWN_SERVING_GNB`; there is
+  no silent fallback. Rendering for `GNB-01` is byte-identical to 0.10.0, so existing
+  provisioning attestations remain valid.
+- Minor: new read-only `GET /api/v1/gnbs`.
+- Minor: `POST /api/v1/ue-profiles` accepts `provisioning_slot` to bind a profile to a subscriber
+  already provisioned in Open5GS. SUPI/K/OPc are read server-side from the private V3.2 plan
+  (`POLARIS_SUBSCRIBER_PLAN_PATH`, default `/var/lib/polaris-control/subscriber-secrets/v3.2.plan`,
+  mode must deny group/other). A slot binds at most once. Open5GS is never written.
+- Minor: new read-only `GET /api/v1/ue-profiles/provisioning-slots` (slot ids and bound UE only).

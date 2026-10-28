@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.4.0";
 /// Maximum number of persistent definitions. This is not a live execution limit.
 pub const MAX_CONFIGURABLE_UES: usize = 10_000;
 /// Certified maximum number of concurrently running controller-owned UEs.
@@ -398,8 +398,95 @@ pub fn observe_ueransim(
     }
 }
 
+/// A gNB the controller may name in a UE profile, and the address a UE must search for it on.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GnbEndpoint {
+    pub gnb_id: String,
+    pub link_ip: String,
+}
+
+/// Environment variable naming an optional JSON registry that replaces the laboratory default.
+pub const GNB_REGISTRY_ENV: &str = "POLARIS_GNB_REGISTRY_PATH";
+const MAX_GNB_REGISTRY_BYTES: u64 = 16_384;
+const MAX_GNBS: usize = 16;
+
+/// The deployed laboratory gNB (GNB_CONFIGURATION_AUDIT.md: gNB-01 link IP on oiran-lab-mgmt).
+pub fn lab_gnb_registry() -> Vec<GnbEndpoint> {
+    vec![GnbEndpoint {
+        gnb_id: "GNB-01".into(),
+        link_ip: "10.77.0.20".into(),
+    }]
+}
+
+fn safe_gnb_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+pub fn validate_gnb_registry(registry: &[GnbEndpoint]) -> Result<(), String> {
+    if registry.is_empty() || registry.len() > MAX_GNBS {
+        return Err("GNB_REGISTRY_INVALID".into());
+    }
+    let mut ids = BTreeSet::new();
+    for gnb in registry {
+        if !safe_gnb_id(&gnb.gnb_id)
+            || gnb.link_ip.parse::<std::net::Ipv4Addr>().is_err()
+            || !ids.insert(gnb.gnb_id.as_str())
+        {
+            return Err("GNB_REGISTRY_INVALID".into());
+        }
+    }
+    Ok(())
+}
+
+/// Loads the registry named by `POLARIS_GNB_REGISTRY_PATH`, or the laboratory default when unset.
+/// A configured but unreadable or invalid registry is an error: it never falls back silently.
+pub fn load_gnb_registry_from_env() -> Result<Vec<GnbEndpoint>, String> {
+    match std::env::var_os(GNB_REGISTRY_ENV) {
+        None => Ok(lab_gnb_registry()),
+        Some(path) => load_gnb_registry(Path::new(&path)),
+    }
+}
+
+pub fn load_gnb_registry(path: &Path) -> Result<Vec<GnbEndpoint>, String> {
+    let metadata = std::fs::metadata(path).map_err(|_| "GNB_REGISTRY_UNREADABLE".to_string())?;
+    if !metadata.is_file() || metadata.len() > MAX_GNB_REGISTRY_BYTES {
+        return Err("GNB_REGISTRY_INVALID".into());
+    }
+    let bytes = std::fs::read(path).map_err(|_| "GNB_REGISTRY_UNREADABLE".to_string())?;
+    let registry: Vec<GnbEndpoint> =
+        serde_json::from_slice(&bytes).map_err(|_| "GNB_REGISTRY_INVALID".to_string())?;
+    validate_gnb_registry(&registry)?;
+    Ok(registry)
+}
+
+/// Returns the address that feeds `gnbSearchList`. An unknown gNB is refused, never defaulted.
+pub fn resolve_gnb_link_ip<'a>(
+    registry: &'a [GnbEndpoint],
+    serving_gnb: &str,
+) -> Result<&'a str, String> {
+    registry
+        .iter()
+        .find(|gnb| gnb.gnb_id == serving_gnb)
+        .map(|gnb| gnb.link_ip.as_str())
+        .ok_or_else(|| "UNKNOWN_SERVING_GNB".to_string())
+}
+
+/// Renders against the laboratory default registry.
 pub fn render_profile(profile: &UeProfileSpec, secrets: UeSecrets<'_>) -> Result<String, String> {
+    render_profile_with_gnbs(profile, secrets, &lab_gnb_registry())
+}
+
+pub fn render_profile_with_gnbs(
+    profile: &UeProfileSpec,
+    secrets: UeSecrets<'_>,
+    gnbs: &[GnbEndpoint],
+) -> Result<String, String> {
     validate_profile_set(std::slice::from_ref(profile))?;
+    let gnb_link_ip = resolve_gnb_link_ip(gnbs, &profile.serving_gnb)?;
     if secrets.supi.len() < 10
         || secrets.key.len() != 32
         || secrets.opc.len() != 32
@@ -412,7 +499,8 @@ pub fn render_profile(profile: &UeProfileSpec, secrets: UeSecrets<'_>) -> Result
         return Err("invalid subscriber secret material".into());
     }
     Ok(format!(
-        "supi: '{supi}'\nmcc: '{mcc}'\nmnc: '{mnc}'\nkey: '{key}'\nopType: 'OPC'\nop: '{opc}'\namf: '8000'\ngnbSearchList:\n  - 10.77.0.20\nsessions:\n  - type: 'IPv4'\n    apn: '{dnn}'\n    slice:\n      sst: {sst}\n      sd: '{sd}'\n",
+        "supi: '{supi}'\nmcc: '{mcc}'\nmnc: '{mnc}'\nkey: '{key}'\nopType: 'OPC'\nop: '{opc}'\namf: '8000'\ngnbSearchList:\n  - {gnb_link_ip}\nsessions:\n  - type: 'IPv4'\n    apn: '{dnn}'\n    slice:\n      sst: {sst}\n      sd: '{sd}'\n",
+        gnb_link_ip = gnb_link_ip,
         supi = secrets.supi,
         mcc = profile.plmn_mcc,
         mnc = profile.plmn_mnc,
@@ -509,6 +597,90 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    fn test_secrets() -> UeSecrets<'static> {
+        UeSecrets {
+            supi: "imsi-999990000000001",
+            key: "00112233445566778899aabbccddeeff",
+            opc: "ffeeddccbbaa99887766554433221100",
+        }
+    }
+
+    #[test]
+    fn gnb01_rendering_is_byte_identical_to_the_attested_format() {
+        // Existing provisioning attestations bind the SHA-256 of these exact bytes.
+        let profile = planned_profiles().remove(0);
+        let expected = "supi: 'imsi-999990000000001'\nmcc: '001'\nmnc: '01'\nkey: '00112233445566778899aabbccddeeff'\nopType: 'OPC'\nop: 'ffeeddccbbaa99887766554433221100'\namf: '8000'\ngnbSearchList:\n  - 10.77.0.20\nsessions:\n  - type: 'IPv4'\n    apn: 'internet'\n    slice:\n      sst: 1\n      sd: '010203'\n";
+        assert_eq!(render_profile(&profile, test_secrets()).unwrap(), expected);
+    }
+
+    #[test]
+    fn serving_gnb_feeds_gnb_search_list() {
+        let mut profile = planned_profiles().remove(0);
+        profile.serving_gnb = "GNB-02".into();
+        let registry = vec![
+            GnbEndpoint {
+                gnb_id: "GNB-01".into(),
+                link_ip: "10.77.0.20".into(),
+            },
+            GnbEndpoint {
+                gnb_id: "GNB-02".into(),
+                link_ip: "10.77.0.22".into(),
+            },
+        ];
+        let rendered = render_profile_with_gnbs(&profile, test_secrets(), &registry).unwrap();
+        assert!(rendered.contains("gnbSearchList:\n  - 10.77.0.22\n"));
+        assert!(!rendered.contains("10.77.0.20"));
+    }
+
+    #[test]
+    fn unknown_serving_gnb_is_refused_without_default() {
+        let mut profile = planned_profiles().remove(0);
+        profile.serving_gnb = "GNB-99".into();
+        assert_eq!(
+            render_profile(&profile, test_secrets()).unwrap_err(),
+            "UNKNOWN_SERVING_GNB"
+        );
+    }
+
+    #[test]
+    fn gnb_registry_rejects_invalid_or_duplicate_entries() {
+        let bad_ip = vec![GnbEndpoint {
+            gnb_id: "GNB-01".into(),
+            link_ip: "not-an-ip".into(),
+        }];
+        assert!(validate_gnb_registry(&bad_ip).is_err());
+        let duplicate = vec![lab_gnb_registry()[0].clone(), lab_gnb_registry()[0].clone()];
+        assert!(validate_gnb_registry(&duplicate).is_err());
+        let unsafe_id = vec![GnbEndpoint {
+            gnb_id: "../GNB".into(),
+            link_ip: "10.77.0.20".into(),
+        }];
+        assert!(validate_gnb_registry(&unsafe_id).is_err());
+        assert!(validate_gnb_registry(&[]).is_err());
+        assert!(validate_gnb_registry(&lab_gnb_registry()).is_ok());
+    }
+
+    #[test]
+    fn gnb_registry_file_is_loaded_and_validated() {
+        let dir = std::env::temp_dir().join(format!("gnb-registry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.json");
+        std::fs::write(
+            &good,
+            r#"[{"gnb_id":"GNB-01","link_ip":"10.77.0.20"},{"gnb_id":"GNB-02","link_ip":"10.77.0.22"}]"#,
+        )
+        .unwrap();
+        assert_eq!(load_gnb_registry(&good).unwrap().len(), 2);
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, r#"[{"gnb_id":"GNB-01"}]"#).unwrap();
+        assert_eq!(load_gnb_registry(&bad).unwrap_err(), "GNB_REGISTRY_INVALID");
+        assert_eq!(
+            load_gnb_registry(&dir.join("missing.json")).unwrap_err(),
+            "GNB_REGISTRY_UNREADABLE"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
