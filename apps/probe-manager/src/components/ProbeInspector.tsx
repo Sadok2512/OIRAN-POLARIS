@@ -1,8 +1,9 @@
 import type { Capture, CaptureInterface, Probe } from '@shared/types';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import { EmptyState } from '@/ui/EmptyErrorLoading';
-import { bytes, count, percent, isoToLocal } from '@/data/format';
-import { roleBadgeClass, roleFor } from '@/data/roleMapping';
+import { bytes, count, percent } from '@/data/format';
+import { roleBadgeClass, roleForInterface } from '@/data/roleMapping';
+import { formatHeartbeat, probeLifecycle, probeLifecycleTone } from '@/data/probeState';
 
 export function ProbeInspector({
   probe,
@@ -68,14 +69,29 @@ export function ProbeInspector({
         <dt className="text-text-secondary">Host / namespace</dt>
         <dd className="mono text-ep-xs break-all">{probe.host}</dd>
         <dt className="text-text-secondary">Last heartbeat</dt>
-        <dd>{isoToLocal(probe.last_heartbeat ?? undefined)}</dd>
-        <dt className="text-text-secondary">Health</dt>
+        <dd data-testid={`heartbeat-${probe.probe_id}`}>
+          {formatHeartbeat(probe.last_heartbeat_epoch_s)}
+        </dd>
+        <dt className="text-text-secondary">Lifecycle</dt>
         <dd>
-          <StatusIndicator state={probe.online ? 'ONLINE' : 'OFFLINE'} compact />
+          {(() => {
+            const lifecycle = probeLifecycle(probe);
+            return (
+              <StatusIndicator
+                state={lifecycle}
+                tone={probeLifecycleTone(lifecycle)}
+                compact
+              />
+            );
+          })()}
         </dd>
         <dt className="text-text-secondary">Capture state</dt>
         <dd>
-          <StatusIndicator state={probe.capture_state} compact />
+          {probe.capture_state ? (
+            <StatusIndicator state={probe.capture_state} compact />
+          ) : (
+            <span className="text-ep-xs text-text-secondary">—</span>
+          )}
         </dd>
       </dl>
 
@@ -112,7 +128,7 @@ export function ProbeInspector({
         ) : (
           <ul className="flex flex-col gap-1 text-ep-xs" data-testid="probe-interface-list">
             {detailedInterfaces.map((item) => {
-              const role = roleFor(item);
+              const role = roleForInterface(item);
               return (
                 <li
                   key={item.interface}

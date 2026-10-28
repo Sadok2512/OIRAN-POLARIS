@@ -78,7 +78,12 @@ describe('Probe Manager failed capture evidence', () => {
       </QueryClientProvider>,
     );
 
-    await userEvent.click(await screen.findByRole('button', { name: 'Select all planes' }));
+    // 2.5.0-dev: Validate is disabled until the operator picks a probe
+    // from the probe grid (no more hardcoded `oiran-vprobe-local-01`
+    // default). Click the probe card first, then run the flow.
+    const probeCard = await screen.findByRole('button', { pressed: false, name: /Local vProbe/i });
+    await userEvent.click(probeCard);
+    await userEvent.click(screen.getByRole('button', { name: 'Select all planes' }));
     await userEvent.click(screen.getByRole('button', { name: 'Apply configuration' }));
     await userEvent.click(screen.getByRole('button', { name: 'Validate capture' }));
 
@@ -86,6 +91,7 @@ describe('Probe Manager failed capture evidence', () => {
     expect(validationCall).toBeDefined();
     const payload = JSON.parse(String(validationCall?.[1]?.body));
     expect(payload.interfaces).toEqual(['N2', 'SBI', 'N4', 'N3']);
+    expect(payload.probe_id).toBe('oiran-vprobe-local-01');
     expect(await screen.findByText('READY — all current safety checks pass')).toBeVisible();
   });
 });

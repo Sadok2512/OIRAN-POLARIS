@@ -12,7 +12,7 @@ import { ProbeInspector } from '@/components/ProbeInspector';
 import { RegisterProbeDialog } from '@/components/RegisterProbeDialog';
 import { useCaptures, useInterfaces, useProbes } from '@/data/queries';
 import { bytes, count, percent } from '@/data/format';
-import { roleBadgeClass, roleFor } from '@/data/roleMapping';
+import { roleBadgeClass, roleForInterface } from '@/data/roleMapping';
 import type { CaptureInterface } from '@shared/types';
 
 export function ProbesPage() {
@@ -140,9 +140,7 @@ export function ProbesPage() {
                         )}
                         {probe.connected_interfaces.map((name) => {
                           const item = interfacesByName.get(name);
-                          const role = item
-                            ? roleFor(item)
-                            : null;
+                          const role = item ? roleForInterface(item) : null;
                           return (
                             <span
                               key={name}
