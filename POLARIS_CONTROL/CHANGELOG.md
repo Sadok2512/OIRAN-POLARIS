@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.15.4 (polaris-control-api)
+
+- Adds `PATCH /api/v1/ue-profiles/:ue_id/scenario`, which updates only scenario metadata and preserves the protected subscriber link and provisioning evidence.
+- Preserves `subscription_verified` on full profile updates when all subscriber-facing fields are unchanged; subscriber/network changes still require revalidation.
+- Rejects assignment of definitions containing unavailable steps with the exact backend code (`DL_SENDER_NOT_AVAILABLE` or `IMS_NOT_AVAILABLE`).
+
 ## 0.15.3 (polaris-control-api)
 
 - Patch: expose a measured `observed.nfs[]` inventory from `/lab` for every Open5GS network

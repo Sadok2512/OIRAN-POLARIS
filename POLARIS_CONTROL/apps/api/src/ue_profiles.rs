@@ -57,6 +57,13 @@ pub struct ProfileMutationInput {
     pub provisioning_slot: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct ScenarioAssignmentInput {
+    pub scenario_id: Option<String>,
+    #[serde(default)]
+    pub auto_run_scenario: bool,
+}
+
 /// One subscriber already provisioned in Open5GS, as listed to operators (never its secrets).
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ProvisioningSlot {
@@ -556,7 +563,16 @@ impl ProfileStore {
         };
         let mut record =
             self.build_record(input, &secrets, old.revision + 1, old.created_at_epoch_s)?;
-        record.profile.subscription_verified = false;
+        // A PUT that keeps every subscriber-facing field and the subscriber identity is not a
+        // provisioning change. Preserve its verified evidence; network/subscriber changes still
+        // fail closed and require a fresh validation.
+        record.profile.subscription_verified = old.profile.subscription_verified
+            && record.subscriber_identity_sha256 == old.subscriber_identity_sha256
+            && record.profile.plmn_mcc == old.profile.plmn_mcc
+            && record.profile.plmn_mnc == old.profile.plmn_mnc
+            && record.profile.dnn == old.profile.dnn
+            && record.profile.sst == old.profile.sst
+            && record.profile.sd == old.profile.sd;
         self.ensure_identity_unique(registry, &record.subscriber_identity_sha256, Some(ue_id))?;
         let yaml = render_profile_with_gnbs(
             &record.profile,
@@ -577,6 +593,33 @@ impl ProfileStore {
             return Err(error);
         }
         Ok(record)
+    }
+
+    /// Changes only scenario metadata. The protected profile file and subscriber/provisioning
+    /// evidence are deliberately not read or rewritten.
+    pub fn assign_scenario(
+        &self,
+        registry: &mut UeProfileRegistry,
+        ue_id: &str,
+        input: ScenarioAssignmentInput,
+    ) -> Result<ManagedUeProfile, String> {
+        let index = registry
+            .profiles
+            .iter()
+            .position(|record| record.profile.ue_id == ue_id)
+            .ok_or("UNKNOWN_UE_PROFILE")?;
+        let old = registry.profiles[index].clone();
+        let mut updated = old.clone();
+        updated.scenario_id = input.scenario_id;
+        updated.auto_run_scenario = updated.scenario_id.is_some() && input.auto_run_scenario;
+        updated.revision = updated.revision.saturating_add(1);
+        updated.updated_at_epoch_s = epoch_seconds();
+        registry.profiles[index] = updated.clone();
+        if let Err(error) = self.persist(registry) {
+            registry.profiles[index] = old;
+            return Err(error);
+        }
+        Ok(updated)
     }
 
     pub fn clone_profile(
@@ -1040,6 +1083,83 @@ mod tests {
         assert!(registry.profiles.is_empty());
         let recovered = store.load_or_bootstrap(vec![]).unwrap();
         assert!(recovered.profiles.is_empty());
+    }
+
+    #[test]
+    fn scenario_assignment_preserves_verified_subscriber_and_profile_bytes() {
+        let store = temp_store("scenario-assignment");
+        let mut registry = UeProfileRegistry {
+            schema_version: 1,
+            profiles: vec![],
+        };
+        let mut created = store
+            .create(&mut registry, input("UE-02", "imsi-001010000000002"))
+            .unwrap();
+        created.profile.subscription_verified = true;
+        registry.profiles[0] = created.clone();
+        store.persist(&registry).unwrap();
+        let profile_path = store.profile_root.join(&created.profile.profile_name);
+        let profile_before = fs::read(&profile_path).unwrap();
+        let identity_before = created.subscriber_identity_sha256.clone();
+
+        let assigned = store
+            .assign_scenario(
+                &mut registry,
+                "UE-02",
+                ScenarioAssignmentInput {
+                    scenario_id: Some("scenario-2".into()),
+                    auto_run_scenario: true,
+                },
+            )
+            .unwrap();
+
+        assert!(assigned.profile.subscription_verified);
+        assert_eq!(assigned.subscriber_identity_sha256, identity_before);
+        assert_eq!(assigned.scenario_id.as_deref(), Some("scenario-2"));
+        assert!(assigned.auto_run_scenario);
+        assert_eq!(fs::read(profile_path).unwrap(), profile_before);
+        assert_eq!(store.load_or_bootstrap(vec![]).unwrap(), registry);
+    }
+
+    #[test]
+    fn put_preserves_verification_only_when_subscription_fields_are_unchanged() {
+        let store = temp_store("put-verification");
+        let mut registry = UeProfileRegistry {
+            schema_version: 1,
+            profiles: vec![],
+        };
+        let mut created = store
+            .create(&mut registry, input("UE-02", "imsi-001010000000002"))
+            .unwrap();
+        created.profile.subscription_verified = true;
+        registry.profiles[0] = created;
+        store.persist(&registry).unwrap();
+
+        let mut scenario_only = input("UE-02", "imsi-001010000000002");
+        scenario_only.supi = None;
+        scenario_only.authentication_key = None;
+        scenario_only.opc = None;
+        scenario_only.scenario_id = Some("scenario-2".into());
+        assert!(
+            store
+                .update(&mut registry, "UE-02", scenario_only)
+                .unwrap()
+                .profile
+                .subscription_verified
+        );
+
+        let mut network_change = input("UE-02", "imsi-001010000000002");
+        network_change.supi = None;
+        network_change.authentication_key = None;
+        network_change.opc = None;
+        network_change.dnn = "ims".into();
+        assert!(
+            !store
+                .update(&mut registry, "UE-02", network_change)
+                .unwrap()
+                .profile
+                .subscription_verified
+        );
     }
 
     #[test]

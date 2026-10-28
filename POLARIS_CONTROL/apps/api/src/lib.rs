@@ -49,14 +49,16 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,
 };
-use ue_profiles::{BulkProfileInput, ManagedUeProfile, ProfileMutationInput, ProfileStore};
+use ue_profiles::{
+    BulkProfileInput, ManagedUeProfile, ProfileMutationInput, ProfileStore, ScenarioAssignmentInput,
+};
 use ueransim_adapter::{
     LiveLaunchSpec, ProvisionedProfileEvidence, ProvisioningBinding, UeObservation, UeProfileSpec,
 };
 
 pub use ue_profiles::UeProfileRegistry;
 
-pub const VERSION: &str = "0.15.3";
+pub const VERSION: &str = "0.15.4";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -3781,6 +3783,66 @@ async fn update_ue_profile(
     (StatusCode::OK, Json(managed_profile_json(&record)))
 }
 
+fn scenario_assignment_block_reason(
+    catalog: &ScenarioCatalog,
+    scenario_id: &str,
+) -> Result<Option<&'static str>, String> {
+    let definition = catalog
+        .definitions
+        .iter()
+        .find(|item| item.id == scenario_id)
+        .ok_or("SCENARIO_DEFINITION_NOT_FOUND")?;
+    let resolved = resolve_steps(definition)?;
+    if resolved.iter().any(|step| step.step_type == "traffic_dl") {
+        return Ok(Some("DL_SENDER_NOT_AVAILABLE"));
+    }
+    if resolved
+        .iter()
+        .any(|step| matches!(step.step_type.as_str(), "ims_register" | "voice_call"))
+    {
+        return Ok(Some("IMS_NOT_AVAILABLE"));
+    }
+    Ok(None)
+}
+
+async fn assign_ue_profile_scenario(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(ue_id): AxumPath<String>,
+    Json(input): Json<ScenarioAssignmentInput>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    if ue_id == "UE-01" && !state.ue01_controller_owned {
+        return profile_mutation_error("SHARED_UE_PROTECTED".into());
+    }
+    if let Some(scenario_id) = input.scenario_id.as_deref() {
+        let catalog = state.scenario_catalog.lock().unwrap();
+        match scenario_assignment_block_reason(&catalog, scenario_id) {
+            Ok(Some(reason)) => return profile_mutation_error(reason.into()),
+            Ok(None) => {}
+            Err(error) => return profile_mutation_error(error),
+        }
+    }
+    let mut registry = state.profile_registry.lock().unwrap();
+    let record = match state
+        .profile_store
+        .assign_scenario(&mut registry, &ue_id, input)
+    {
+        Ok(record) => record,
+        Err(error) => return profile_mutation_error(error),
+    };
+    audit(
+        &state,
+        &identity.role,
+        "ASSIGN_UE_PROFILE_SCENARIO",
+        "UPDATED",
+        Some(&ue_id),
+    );
+    (StatusCode::OK, Json(managed_profile_json(&record)))
+}
+
 #[derive(Deserialize)]
 struct CloneProfileInput {
     target_ue_id: String,
@@ -7054,6 +7116,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
                 .put(update_ue_profile)
                 .delete(delete_ue_profile),
         )
+        .route(
+            "/ue-profiles/:ue_id/scenario",
+            axum::routing::patch(assign_ue_profile_scenario),
+        )
         .route("/ue-profiles/:ue_id/clone", post(clone_ue_profile))
         .route(
             "/ue-profiles/:ue_id/validate-provisioning",
@@ -10028,6 +10094,65 @@ mod p0_tests {
             .await
             .unwrap();
         assert_eq!(blocked.status(), StatusCode::LOCKED);
+    }
+
+    #[tokio::test]
+    async fn scenario_patch_preserves_verified_provisioning_evidence() {
+        let mut test_state = state();
+        {
+            let mut registry = test_state.profile_registry.lock().unwrap();
+            let record = registry
+                .profiles
+                .iter_mut()
+                .find(|record| record.profile.ue_id == "UE-02")
+                .unwrap();
+            record.profile.subscription_verified = true;
+            test_state.profile_store.persist(&registry).unwrap();
+        }
+        install_definition(
+            &mut test_state,
+            "assignable-wait",
+            vec![scenario_definitions::ScenarioStep {
+                step_type: "wait".into(),
+                loop_count: 1,
+                parameters: BTreeMap::new(),
+                steps: Vec::new(),
+            }],
+        );
+        let application = app(test_state.clone());
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri("/api/v1/ue-profiles/UE-02/scenario")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .header("x-csrf-token", csrf)
+                    .body(Body::from(
+                        json!({"scenario_id":"assignable-wait","auto_run_scenario":false})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["scenario_id"], "assignable-wait");
+        assert_eq!(body["subscription_status"], "VERIFIED");
+        let record = test_state
+            .profile_registry
+            .lock()
+            .unwrap()
+            .profiles
+            .iter()
+            .find(|record| record.profile.ue_id == "UE-02")
+            .cloned()
+            .unwrap();
+        assert!(record.profile.subscription_verified);
     }
 
     #[tokio::test]
