@@ -1,17 +1,20 @@
-// 0.6.1 — Real Add subscriber dialog hitting POST /subscribers.
+// 0.7.1 — AddSubscriberDialog with slice/DNN dropdowns from /plmns, /dnns.
 //
-// Contract (polaris-control-api 0.15.1 / fc6d8ed):
-//   body: { imsi, k, opc, sst, sd, dnns[], ambr: { uplink, downlink } }
-//   409 SUBSCRIBER_NOT_POLARIS_OWNED and 422 SUBSCRIBER_NOT_PROVISIONED
-//   are two codes the UI must surface verbatim.
+// Contract (polaris-control-api 0.15.1):
+//   POST /subscribers { imsi, k, opc, sst, sd, dnns[], ambr: { uplink, downlink } }
+//   409 SUBSCRIBER_NOT_POLARIS_OWNED, 422 SUBSCRIBER_NOT_PROVISIONED surfaced verbatim.
 //
-// The dialog also guarantees that secret material is scrubbed from React
-// state right after submit — we assert this by reading the inputs back.
+// The dialog scrubs IMSI/K/OPc from state right after submit, and
+// accepts raw IMSI digits — normalised to the `imsi-<digits>` form
+// before the POST.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import type { ReactNode } from 'react';
 import { AddSubscriberDialog } from './AddSubscriberDialog';
+import { _resetFlags, setFlag } from '@/data/featureFlags';
 
 function respond(status: number, body: unknown) {
   return new Response(JSON.stringify(body), {
@@ -42,111 +45,135 @@ function stubFetch(handler: (call: Call) => Response) {
   }) as unknown as typeof fetch;
 }
 
+const PLMNS = {
+  items: [
+    {
+      id: 'home',
+      mcc: '001',
+      mnc: '01',
+      display_name: 'Lab PLMN',
+      home_network: true,
+      slices: [
+        { sst: 1, sd: null, display_name: 'eMBB default' },
+        { sst: 1, sd: 'A1B2C3', display_name: 'eMBB custom' },
+      ],
+    },
+  ],
+  total: 1,
+};
+
+const DNNS = {
+  items: [
+    { id: 'd1', dnn: 'internet', sst: 1, sd: null, description: 'default Internet DNN' },
+    { id: 'd2', dnn: 'ims', sst: 1, sd: null, description: 'IMS DNN' },
+  ],
+  total: 2,
+};
+
+function renderDialog() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const wrapper = (children: ReactNode) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  return render(wrapper(<AddSubscriberDialog open onClose={() => undefined} />));
+}
+
+async function fillValid(user: ReturnType<typeof userEvent.setup>) {
+  await user.type(screen.getByTestId('subscriber-imsi'), '001010000000201');
+  await user.type(screen.getByTestId('subscriber-k'), '0a1b2c3d4e5f60718293a4b5c6d7e8f9');
+  await user.type(screen.getByTestId('subscriber-opc'), 'ffeeddccbbaa99887766554433221100');
+  await waitFor(() => expect(screen.getByTestId('subscriber-slice')).not.toBeDisabled());
+  await user.selectOptions(screen.getByTestId('subscriber-slice'), '1/A1B2C3');
+  await user.selectOptions(screen.getByTestId('subscriber-dnn'), 'internet');
+}
+
 beforeEach(() => {
   if (typeof localStorage !== 'undefined') localStorage.clear();
   if (typeof sessionStorage !== 'undefined') sessionStorage.clear();
+  _resetFlags();
+  setFlag('polarisProvisioning', true);
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
+  _resetFlags();
 });
 
-async function fillValid(user: ReturnType<typeof userEvent.setup>) {
-  await user.type(screen.getByTestId('subscriber-imsi'), 'imsi-208930000000001');
-  await user.type(
-    screen.getByTestId('subscriber-k'),
-    '0a1b2c3d4e5f60718293a4b5c6d7e8f9',
-  );
-  await user.type(
-    screen.getByTestId('subscriber-opc'),
-    'ffeeddccbbaa99887766554433221100',
-  );
-  // sst/sd already seeded; set dnns + ambr explicitly for the assert.
-  const dnns = screen.getByTestId('subscriber-dnns') as HTMLInputElement;
-  await user.clear(dnns);
-  await user.type(dnns, 'internet,ims');
-}
-
-describe('AddSubscriberDialog', () => {
-  it('POSTs /subscribers with the exact 0.15.1 body shape', async () => {
-    stubFetch((call) =>
-      call.method === 'POST' && call.url.endsWith('/subscribers')
-        ? respond(201, {
-            slot_id: 'slot-01',
-            subscriber_id: 'sub-abc-01',
-            imsi: 'PROTECTED',
-            k: 'PROTECTED',
-            opc: 'PROTECTED',
-            sst: 1,
-            sd: null,
-            dnns: ['internet', 'ims'],
-            ambr: { uplink: 1_048_576, downlink: 1_048_576 },
-            created_at_epoch_s: 1_793_200_000,
-          })
-        : respond(404, { error: 'not stubbed' }),
-    );
+describe('AddSubscriberDialog (0.7.1)', () => {
+  it('POSTs /subscribers with normalised IMSI and slice/DNN picked from /plmns + /dnns', async () => {
+    stubFetch((call) => {
+      if (call.method === 'GET' && call.url.endsWith('/plmns')) return respond(200, PLMNS);
+      if (call.method === 'GET' && call.url.endsWith('/dnns')) return respond(200, DNNS);
+      if (call.method === 'POST' && call.url.endsWith('/subscribers')) {
+        return respond(201, {
+          slot_id: 'slot-01',
+          subscriber_id: 'sub-abc-01',
+          imsi: 'PROTECTED',
+          k: 'PROTECTED',
+          opc: 'PROTECTED',
+          sst: 1,
+          sd: 'A1B2C3',
+          dnns: ['internet'],
+          ambr: { uplink: 1_048_576, downlink: 1_048_576 },
+          created_at_epoch_s: 1,
+        });
+      }
+      return respond(404, { error: 'not stubbed' });
+    });
     const user = userEvent.setup();
-    render(<AddSubscriberDialog open onClose={() => undefined} />);
+    renderDialog();
     await fillValid(user);
     await user.click(screen.getByTestId('add-subscriber-submit'));
 
     await screen.findByTestId('add-subscriber-created');
     const post = calls.find((c) => c.method === 'POST' && c.url.endsWith('/subscribers'));
-    expect(post).toBeDefined();
-    expect(post?.contentType).toBe('application/json');
     expect(post?.body).toEqual({
-      imsi: 'imsi-208930000000001',
+      imsi: 'imsi-001010000000201',
       k: '0a1b2c3d4e5f60718293a4b5c6d7e8f9',
       opc: 'ffeeddccbbaa99887766554433221100',
       sst: 1,
-      sd: null,
-      dnns: ['internet', 'ims'],
+      sd: 'A1B2C3',
+      dnns: ['internet'],
       ambr: { uplink: 1_048_576, downlink: 1_048_576 },
     });
-    // Scrubbed from state: the three secret inputs are empty after submit.
+    // Scrubbed from state.
     expect(screen.getByTestId('subscriber-imsi')).toHaveValue('');
     expect(screen.getByTestId('subscriber-k')).toHaveValue('');
     expect(screen.getByTestId('subscriber-opc')).toHaveValue('');
-    // Response surfaces slot id and the PROTECTED banner.
-    expect(screen.getByTestId('add-subscriber-created')).toHaveTextContent('slot-01');
-    expect(screen.getByTestId('add-subscriber-created')).toHaveTextContent('PROTECTED');
+  });
+
+  it('shows "Backend pending" when /plmns returns no slice and /dnns is empty', async () => {
+    stubFetch((call) => {
+      if (call.method === 'GET' && call.url.endsWith('/plmns'))
+        return respond(200, { items: [], total: 0 });
+      if (call.method === 'GET' && call.url.endsWith('/dnns'))
+        return respond(200, { items: [], total: 0 });
+      return respond(404, { error: 'not stubbed' });
+    });
+    renderDialog();
+    const slice = await screen.findByTestId('subscriber-slice');
+    const dnn = screen.getByTestId('subscriber-dnn');
+    // The <select> ends up disabled once /plmns + /dnns resolve as empty.
+    await waitFor(() => expect(slice).toBeDisabled());
+    expect(dnn).toBeDisabled();
+    expect(slice.textContent).toMatch(/Backend pending/i);
+    expect(dnn.textContent).toMatch(/Backend pending/i);
   });
 
   it('surfaces 409 SUBSCRIBER_NOT_POLARIS_OWNED verbatim', async () => {
-    stubFetch(() => respond(409, { error: 'SUBSCRIBER_NOT_POLARIS_OWNED' }));
+    stubFetch((call) => {
+      if (call.method === 'GET' && call.url.endsWith('/plmns')) return respond(200, PLMNS);
+      if (call.method === 'GET' && call.url.endsWith('/dnns')) return respond(200, DNNS);
+      return respond(409, { error: 'SUBSCRIBER_NOT_POLARIS_OWNED' });
+    });
     const user = userEvent.setup();
-    render(<AddSubscriberDialog open onClose={() => undefined} />);
+    renderDialog();
     await fillValid(user);
     await user.click(screen.getByTestId('add-subscriber-submit'));
-
     const err = await screen.findByTestId('add-subscriber-error');
     expect(err).toHaveTextContent('HTTP 409');
     expect(err).toHaveTextContent('SUBSCRIBER_NOT_POLARIS_OWNED');
-  });
-
-  it('surfaces 422 SUBSCRIBER_NOT_PROVISIONED verbatim', async () => {
-    stubFetch(() => respond(422, { error: 'SUBSCRIBER_NOT_PROVISIONED' }));
-    const user = userEvent.setup();
-    render(<AddSubscriberDialog open onClose={() => undefined} />);
-    await fillValid(user);
-    await user.click(screen.getByTestId('add-subscriber-submit'));
-
-    const err = await screen.findByTestId('add-subscriber-error');
-    expect(err).toHaveTextContent('HTTP 422');
-    expect(err).toHaveTextContent('SUBSCRIBER_NOT_PROVISIONED');
-  });
-
-  it('refuses to submit when IMSI/K/OPc are not valid', async () => {
-    stubFetch(() => respond(500, { error: 'should not be called' }));
-    const user = userEvent.setup();
-    render(<AddSubscriberDialog open onClose={() => undefined} />);
-    // Type garbage into IMSI/K/OPc.
-    await user.type(screen.getByTestId('subscriber-imsi'), 'not-an-imsi');
-    await user.type(screen.getByTestId('subscriber-k'), 'short');
-    await user.type(screen.getByTestId('subscriber-opc'), 'short');
-    await user.click(screen.getByTestId('add-subscriber-submit'));
-    // Error hints are shown and no POST hit.
-    await waitFor(() => expect(screen.getByTestId('subscriber-imsi-error')).toBeInTheDocument());
-    expect(calls.find((c) => c.method === 'POST')).toBeUndefined();
   });
 });

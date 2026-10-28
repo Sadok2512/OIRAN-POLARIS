@@ -7,25 +7,29 @@
 // `PROTECTED` literals; the dialog surfaces them in a read-only banner
 // so the operator sees the subscriber is in place.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, Lock, X } from 'lucide-react';
 import { ApiError } from '@shared/api';
 import {
   createSubscriber,
+  useDnns,
+  usePlmns,
+  type PlmnSlice,
   type SubscriberCreateInput,
   type SubscriberCreateResponse,
 } from '@/data/provisioningApi';
+import { isImsiValid, normalizeImsi } from '@/data/identityFormats';
 
-const IMSI_RE = /^imsi-\d{5,15}$/;
 const HEX32 = /^[0-9a-fA-F]{32}$/;
 
 interface State {
   imsi: string;
   k: string;
   opc: string;
-  sst: string;
-  sd: string;
-  dnns: string;
+  /** Serialised "sst/sd" key referencing one PlmnSlice entry. */
+  slice: string;
+  /** DNN id picked from /dnns. */
+  dnn: string;
   ambr_uplink: string;
   ambr_downlink: string;
   touched: boolean;
@@ -35,13 +39,25 @@ const EMPTY: State = {
   imsi: '',
   k: '',
   opc: '',
-  sst: '1',
-  sd: '',
-  dnns: 'internet',
+  slice: '',
+  dnn: '',
   ambr_uplink: '1048576',
   ambr_downlink: '1048576',
   touched: false,
 };
+
+function sliceKey(slice: PlmnSlice): string {
+  return `${slice.sst}/${slice.sd ?? ''}`;
+}
+
+function parseSliceKey(key: string): { sst: number; sd: string | null } | null {
+  const match = /^(\d+)\/([0-9a-fA-F]*)$/.exec(key);
+  if (!match) return null;
+  const sst = Number(match[1]);
+  if (!Number.isInteger(sst) || sst < 1 || sst > 255) return null;
+  const sd = match[2].length === 0 ? null : match[2];
+  return { sst, sd };
+}
 
 export function AddSubscriberDialog({
   open,
@@ -59,6 +75,30 @@ export function AddSubscriberDialog({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [created, setCreated] = useState<SubscriberCreateResponse | null>(null);
 
+  const plmns = usePlmns();
+  const dnns = useDnns();
+
+  const sliceOptions = useMemo(() => {
+    const map = new Map<string, { key: string; label: string; sst: number; sd: string | null }>();
+    for (const plmn of plmns.data?.items ?? []) {
+      for (const slice of plmn.slices ?? []) {
+        const key = sliceKey(slice);
+        if (map.has(key)) continue;
+        const sliceLabel =
+          slice.display_name ?? `S-NSSAI ${slice.sst}${slice.sd ? `/${slice.sd}` : ''}`;
+        map.set(key, {
+          key,
+          label: `${plmn.mcc}/${plmn.mnc} · ${sliceLabel}`,
+          sst: slice.sst,
+          sd: slice.sd,
+        });
+      }
+    }
+    return Array.from(map.values());
+  }, [plmns.data?.items]);
+
+  const dnnOptions = useMemo(() => dnns.data?.items ?? [], [dnns.data?.items]);
+
   useEffect(() => {
     if (!open) {
       setState(EMPTY);
@@ -72,45 +112,45 @@ export function AddSubscriberDialog({
 
   if (!open) return null;
 
-  const imsiInvalid = state.touched && !IMSI_RE.test(state.imsi);
+  const imsiInvalid = state.touched && !isImsiValid(state.imsi);
   const kInvalid = state.touched && !HEX32.test(state.k);
   const opcInvalid = state.touched && !HEX32.test(state.opc);
-  const sstNum = Number(state.sst);
-  const sstInvalid = state.touched && (!Number.isInteger(sstNum) || sstNum < 1 || sstNum > 255);
-  const sdInvalid = state.touched && state.sd !== '' && !/^[0-9a-fA-F]{6}$/.test(state.sd);
+  const sliceParsed = parseSliceKey(state.slice);
+  const sliceInvalid = state.touched && !sliceParsed;
+  const dnnInvalid = state.touched && !state.dnn;
   const ulNum = Number(state.ambr_uplink);
   const dlNum = Number(state.ambr_downlink);
   const ambrInvalid =
     state.touched &&
     (!Number.isInteger(ulNum) || ulNum < 1 || !Number.isInteger(dlNum) || dlNum < 1);
-  const dnnsList = state.dnns
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
+
+  const plmnsEmpty = !plmns.isLoading && sliceOptions.length === 0;
+  const dnnsEmpty = !dnns.isLoading && dnnOptions.length === 0;
 
   const canSubmit =
     !submitting &&
     !created &&
-    IMSI_RE.test(state.imsi) &&
+    isImsiValid(state.imsi) &&
     HEX32.test(state.k) &&
     HEX32.test(state.opc) &&
-    Number.isInteger(sstNum) && sstNum >= 1 && sstNum <= 255 &&
-    (state.sd === '' || /^[0-9a-fA-F]{6}$/.test(state.sd)) &&
-    dnnsList.length > 0 &&
+    !!sliceParsed &&
+    !!state.dnn &&
     Number.isInteger(ulNum) && ulNum >= 1 &&
     Number.isInteger(dlNum) && dlNum >= 1;
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
     setState((prev) => ({ ...prev, touched: true }));
-    if (!canSubmit) return;
+    if (!canSubmit || !sliceParsed) return;
+    const normalisedImsi = normalizeImsi(state.imsi);
+    if (!normalisedImsi) return;
     const input: SubscriberCreateInput = {
-      imsi: state.imsi.trim(),
+      imsi: normalisedImsi,
       k: state.k.trim(),
       opc: state.opc.trim(),
-      sst: sstNum,
-      sd: state.sd ? state.sd.trim() : null,
-      dnns: dnnsList,
+      sst: sliceParsed.sst,
+      sd: sliceParsed.sd,
+      dnns: [state.dnn],
       ambr: { uplink: ulNum, downlink: dlNum },
     };
     // Scrub secret material from local state BEFORE the network call
@@ -172,11 +212,11 @@ export function AddSubscriberDialog({
 
         <SecretField
           label="IMSI"
-          placeholder="imsi-208930000000001"
+          placeholder="001010000000201 or imsi-001010000000201"
           value={state.imsi}
           onChange={(value) => setState((prev) => ({ ...prev, imsi: value }))}
           invalid={imsiInvalid}
-          hint="Format: imsi-<5-15 digits>"
+          hint="Raw digits (5–15) or imsi-<digits>; normalised before send."
           testid="subscriber-imsi"
           onBlur={() => setState((prev) => ({ ...prev, touched: true }))}
         />
@@ -203,53 +243,60 @@ export function AddSubscriberDialog({
           onBlur={() => setState((prev) => ({ ...prev, touched: true }))}
         />
 
-        <div className="grid gap-2 md:grid-cols-2">
-          <label className="flex flex-col gap-1 text-ep-sm">
-            <span className="text-ep-xs uppercase tracking-wider text-text-secondary">
-              S-NSSAI SST
-            </span>
-            <input
-              type="number"
-              min={1}
-              max={255}
-              step={1}
-              className="ep-input mono"
-              value={state.sst}
-              onChange={(event) => setState((prev) => ({ ...prev, sst: event.target.value }))}
-              aria-invalid={sstInvalid ? 'true' : 'false'}
-              data-testid="subscriber-sst"
-            />
-          </label>
-          <label className="flex flex-col gap-1 text-ep-sm">
-            <span className="text-ep-xs uppercase tracking-wider text-text-secondary">
-              S-NSSAI SD (optional)
-            </span>
-            <input
-              type="text"
-              className="ep-input mono"
-              placeholder="6 hex digits"
-              value={state.sd}
-              onChange={(event) => setState((prev) => ({ ...prev, sd: event.target.value }))}
-              aria-invalid={sdInvalid ? 'true' : 'false'}
-              data-testid="subscriber-sd"
-            />
-          </label>
-        </div>
-
         <label className="flex flex-col gap-1 text-ep-sm">
           <span className="text-ep-xs uppercase tracking-wider text-text-secondary">
-            DNNs (comma-separated)
+            Slice (S-NSSAI) · PLMN
           </span>
-          <input
-            type="text"
+          <select
             className="ep-input mono"
-            value={state.dnns}
-            onChange={(event) => setState((prev) => ({ ...prev, dnns: event.target.value }))}
-            data-testid="subscriber-dnns"
-          />
+            value={state.slice}
+            onChange={(event) => setState((prev) => ({ ...prev, slice: event.target.value }))}
+            disabled={plmnsEmpty || plmns.isLoading}
+            aria-invalid={sliceInvalid ? 'true' : 'false'}
+            data-testid="subscriber-slice"
+          >
+            <option value="">
+              {plmns.isLoading
+                ? 'Loading…'
+                : plmnsEmpty
+                  ? 'Backend pending — /plmns returned no slice'
+                  : 'Choose a slice'}
+            </option>
+            {sliceOptions.map((option) => (
+              <option key={option.key} value={option.key}>
+                {option.label}
+              </option>
+            ))}
+          </select>
           <span className="text-ep-xs text-text-secondary">
-            Example: <code className="mono">internet,ims</code>
+            Free SST/SD input is gone (hardening after two subscribers landed on 1/000001 and were
+            not served). Slices come from <code className="mono">/plmns</code>.
           </span>
+        </label>
+
+        <label className="flex flex-col gap-1 text-ep-sm">
+          <span className="text-ep-xs uppercase tracking-wider text-text-secondary">DNN</span>
+          <select
+            className="ep-input mono"
+            value={state.dnn}
+            onChange={(event) => setState((prev) => ({ ...prev, dnn: event.target.value }))}
+            disabled={dnnsEmpty || dnns.isLoading}
+            aria-invalid={dnnInvalid ? 'true' : 'false'}
+            data-testid="subscriber-dnn"
+          >
+            <option value="">
+              {dnns.isLoading
+                ? 'Loading…'
+                : dnnsEmpty
+                  ? 'Backend pending — /dnns returned no entry'
+                  : 'Choose a DNN'}
+            </option>
+            {dnnOptions.map((option) => (
+              <option key={option.id} value={option.dnn}>
+                {option.dnn} · {option.description}
+              </option>
+            ))}
+          </select>
         </label>
 
         <div className="grid gap-2 md:grid-cols-2">

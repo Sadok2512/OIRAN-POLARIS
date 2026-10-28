@@ -18,34 +18,44 @@ import { useEffect, useState } from 'react';
 import { AlertTriangle, X } from 'lucide-react';
 import type { WireGnb } from '@/data/profileApi';
 import type { Owner } from '@/data/provisioningApi';
+import {
+  isImsiValid,
+  isUeIdValid,
+  normalizeImsi,
+  UE_ID_HINT,
+} from '@/data/identityFormats';
 
-const IMSI_RE = /^imsi-\d{5,15}$/;
-
+/**
+ * 0.7.1 — The create-time body `POST /ue-profiles` accepts exactly these
+ * five fields. Any 0.11-era carrier (plmn_mcc / plmn_mnc / dnn / sst /
+ * sd / provisioning_slot / k / opc / keep_identity / scenario_id /
+ * auto_run_scenario) is rejected by the backend.
+ */
 export interface UeProvisioningAddValues {
-  name: string;
-  serving_gnb: string;
+  ue_id: string;
+  gnb_id: string;
   owner: string;
   note: string;
-  /** Written once; cleared from state immediately after submit. */
+  /** Normalised IMSI (`imsi-<5-15 digits>`). Cleared from state after submit. */
   imsi: string;
 }
 
 interface State {
-  name: string;
-  serving_gnb: string;
+  ue_id: string;
+  gnb_id: string;
   owner: string;
   note: string;
   imsi: string;
-  imsiTouched: boolean;
+  touched: boolean;
 }
 
 const EMPTY: State = {
-  name: '',
-  serving_gnb: '',
+  ue_id: '',
+  gnb_id: '',
   owner: '',
   note: '',
   imsi: '',
-  imsiTouched: false,
+  touched: false,
 };
 
 export function UeProvisioningAddDialog({
@@ -80,27 +90,31 @@ export function UeProvisioningAddDialog({
 
   if (!open) return null;
 
-  const imsiInvalid = state.imsiTouched && !IMSI_RE.test(state.imsi);
+  const ueIdInvalid = state.touched && !isUeIdValid(state.ue_id);
+  const imsiInvalid = state.touched && !isImsiValid(state.imsi);
   const canSubmit =
     !submitting &&
-    !!state.name.trim() &&
-    !!state.serving_gnb &&
+    isUeIdValid(state.ue_id) &&
+    !!state.gnb_id &&
     !!state.owner &&
-    IMSI_RE.test(state.imsi);
+    isImsiValid(state.imsi);
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
+    setState((prev) => ({ ...prev, touched: true }));
     if (!canSubmit) return;
+    const normalisedImsi = normalizeImsi(state.imsi);
+    if (!normalisedImsi) return;
     const values: UeProvisioningAddValues = {
-      name: state.name.trim(),
-      serving_gnb: state.serving_gnb,
+      ue_id: state.ue_id.trim(),
+      gnb_id: state.gnb_id,
       owner: state.owner,
       note: state.note.trim(),
-      imsi: state.imsi.trim(),
+      imsi: normalisedImsi,
     };
     // Scrub the secret from component state immediately. The parent
     // forwards `values` to the backend without keeping its own copy.
-    setState((prev) => ({ ...prev, imsi: '', imsiTouched: false }));
+    setState((prev) => ({ ...prev, imsi: '' }));
     await onSubmit(values);
   }
 
@@ -131,26 +145,38 @@ export function UeProvisioningAddDialog({
         </header>
 
         <p className="text-ep-xs text-text-secondary">
-          Only four fields at create-time. The PLMN, DNN, S-NSSAI and provisioning status come back
-          from the backend and show up in the UE detail card.
+          Five fields. POST <code className="mono">/ue-profiles</code> sends only{' '}
+          <code className="mono">{'{ue_id, gnb_id, owner, note, imsi}'}</code>; PLMN, DNN, S-NSSAI
+          and provisioning status come back from the backend.
         </p>
 
         <label className="flex flex-col gap-1 text-ep-sm">
-          <span className="text-ep-xs uppercase tracking-wider text-text-secondary">Name</span>
+          <span className="text-ep-xs uppercase tracking-wider text-text-secondary">UE ID</span>
           <input
-            className="ep-input"
-            value={state.name}
-            onChange={(event) => setState((prev) => ({ ...prev, name: event.target.value }))}
-            maxLength={128}
-            data-testid="ue-add-name"
+            className="ep-input mono"
+            value={state.ue_id}
+            onChange={(event) => setState((prev) => ({ ...prev, ue_id: event.target.value }))}
+            onBlur={() => setState((prev) => ({ ...prev, touched: true }))}
+            maxLength={16}
+            placeholder="UE-01"
+            aria-invalid={ueIdInvalid ? 'true' : 'false'}
+            data-testid="ue-add-ue-id"
             required
           />
+          {ueIdInvalid ? (
+            <span className="text-ep-xs text-error flex items-start gap-1" data-testid="ue-add-ue-id-error">
+              <AlertTriangle width={11} height={11} className="mt-0.5 shrink-0" />
+              {UE_ID_HINT}
+            </span>
+          ) : (
+            <span className="text-ep-xs text-text-secondary">{UE_ID_HINT}</span>
+          )}
         </label>
 
         <DropdownField
           label="gNB"
-          value={state.serving_gnb}
-          onChange={(value) => setState((prev) => ({ ...prev, serving_gnb: value }))}
+          value={state.gnb_id}
+          onChange={(value) => setState((prev) => ({ ...prev, gnb_id: value }))}
           options={gnbs.map((item) => ({ value: item.gnb_id, label: `${item.gnb_id}` }))}
           loading={gnbsLoading}
           error={gnbsError}
@@ -190,19 +216,20 @@ export function UeProvisioningAddDialog({
             className="ep-input mono"
             value={state.imsi}
             onChange={(event) => setState((prev) => ({ ...prev, imsi: event.target.value }))}
-            onBlur={() => setState((prev) => ({ ...prev, imsiTouched: true }))}
-            placeholder="imsi-208930000000001"
+            onBlur={() => setState((prev) => ({ ...prev, touched: true }))}
+            placeholder="001010000000201 or imsi-001010000000201"
             aria-invalid={imsiInvalid ? 'true' : 'false'}
             data-testid="ue-add-imsi"
           />
           <span className="text-ep-xs text-text-secondary">
-            Stored once in the request body, never kept in browser state. The backend reads it back
-            as <code className="mono">PROTECTED</code>.
+            Accepts raw digits ("001010000000201") or prefixed ("imsi-001010000000201"); normalised
+            before send. Stored once in the request body, never kept in browser state. The backend
+            reads it back as <code className="mono">PROTECTED</code>.
           </span>
           {imsiInvalid && (
             <span className="text-ep-xs text-error flex items-start gap-1" data-testid="ue-add-imsi-error">
               <AlertTriangle width={11} height={11} className="mt-0.5 shrink-0" />
-              IMSI must match <code className="mono">imsi-&lt;5-15 digits&gt;</code>
+              IMSI must be 5–15 digits, optionally prefixed with <code className="mono">imsi-</code>.
             </span>
           )}
         </label>

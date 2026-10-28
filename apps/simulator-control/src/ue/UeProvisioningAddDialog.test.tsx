@@ -1,6 +1,6 @@
-// 0.6.0 — Add UE dialog contract. The LOT reduces create to four fields:
-// Name + gNB + Note + masked IMSI. Everything else comes back from the
-// backend after save (PROTECTED).
+// 0.7.1 — Add UE dialog contract. The LOT reduces create to five fields:
+// UE ID + gNB + Owner + Note + masked IMSI. The onSubmit payload must
+// match the slim shape {ue_id, gnb_id, owner, note, imsi} exactly.
 
 import { describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
@@ -15,7 +15,6 @@ const GNBS: WireGnb[] = [
 ];
 const OWNERS: Owner[] = [
   { id: 'ops-nancy', name: 'Nancy Operator', role: 'Operator', email: null },
-  { id: 'eng-remy', name: 'Rémy Engineer', role: 'Engineer', email: null },
 ];
 
 function renderDialog(overrides: Partial<Parameters<typeof UeProvisioningAddDialog>[0]> = {}) {
@@ -39,59 +38,88 @@ function renderDialog(overrides: Partial<Parameters<typeof UeProvisioningAddDial
   return { ...utils, onClose, onSubmit };
 }
 
-describe('UeProvisioningAddDialog', () => {
-  it('exposes only the four create-time fields (Name, gNB, Owner, Note, IMSI)', () => {
+describe('UeProvisioningAddDialog (0.7.1 slim contract)', () => {
+  it('exposes exactly five fields (UE ID, gNB, Owner, Note, IMSI) — Name is gone', () => {
     renderDialog();
-    expect(screen.getByTestId('ue-add-name')).toBeInTheDocument();
+    expect(screen.getByTestId('ue-add-ue-id')).toBeInTheDocument();
     expect(screen.getByTestId('ue-add-gnb')).toBeInTheDocument();
     expect(screen.getByTestId('ue-add-owner')).toBeInTheDocument();
     expect(screen.getByTestId('ue-add-note')).toBeInTheDocument();
     expect(screen.getByTestId('ue-add-imsi')).toBeInTheDocument();
-    // IMSI stays masked (password input type) — the operator never sees it echoed.
+    expect(screen.queryByTestId('ue-add-name')).toBeNull();
     expect(screen.getByTestId('ue-add-imsi')).toHaveAttribute('type', 'password');
   });
 
-  it('refuses to submit without a valid imsi-<digits> and surfaces the hint', async () => {
+  it('rejects a malformed UE ID and surfaces the UE-NN hint', async () => {
     const user = userEvent.setup();
     renderDialog();
-    await user.type(screen.getByTestId('ue-add-name'), 'UE under test');
+    await user.type(screen.getByTestId('ue-add-ue-id'), 'not-a-ue-id');
     await user.selectOptions(screen.getByTestId('ue-add-gnb'), 'GNB-01');
     await user.selectOptions(screen.getByTestId('ue-add-owner'), 'ops-nancy');
-    const imsi = screen.getByTestId('ue-add-imsi');
-    await user.type(imsi, 'not-an-imsi');
-    imsi.blur();
-    await screen.findByTestId('ue-add-imsi-error');
-    expect(screen.getByTestId('ue-add-submit')).toBeDisabled();
+    await user.type(screen.getByTestId('ue-add-imsi'), '001010000000201');
+    await user.click(screen.getByTestId('ue-add-submit'));
+    await screen.findByTestId('ue-add-ue-id-error');
+    expect(screen.getByTestId('ue-add-ue-id-error').textContent).toMatch(/UE-NN/);
   });
 
-  it('forwards values to onSubmit and clears IMSI from the input after submit', async () => {
+  it('normalises IMSI (raw digits) and sends the slim body {ue_id, gnb_id, owner, note, imsi}', async () => {
     const user = userEvent.setup();
     const { onSubmit } = renderDialog();
-    await user.type(screen.getByTestId('ue-add-name'), 'UE under test');
+    await user.type(screen.getByTestId('ue-add-ue-id'), 'UE-01');
     await user.selectOptions(screen.getByTestId('ue-add-gnb'), 'GNB-01');
     await user.selectOptions(screen.getByTestId('ue-add-owner'), 'ops-nancy');
     await user.type(screen.getByTestId('ue-add-note'), 'provisioning hand-off');
-    await user.type(screen.getByTestId('ue-add-imsi'), 'imsi-208930000000001');
+    // Raw digits (no imsi- prefix) must be normalised before submit.
+    await user.type(screen.getByTestId('ue-add-imsi'), '001010000000201');
     await user.click(screen.getByTestId('ue-add-submit'));
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith({
-        name: 'UE under test',
-        serving_gnb: 'GNB-01',
+        ue_id: 'UE-01',
+        gnb_id: 'GNB-01',
         owner: 'ops-nancy',
         note: 'provisioning hand-off',
-        imsi: 'imsi-208930000000001',
+        imsi: 'imsi-001010000000201',
       }),
     );
+    // No 0.11-era carriers leak into the payload.
+    const payload = onSubmit.mock.calls[0][0] as Record<string, unknown>;
+    for (const forbidden of [
+      'provisioning_slot',
+      'k',
+      'opc',
+      'keep_identity',
+      'plmn_mcc',
+      'plmn_mnc',
+      'dnn',
+      'sst',
+      'sd',
+      'scenario_id',
+      'auto_run_scenario',
+      'name',
+    ]) {
+      expect(payload).not.toHaveProperty(forbidden);
+    }
+    // IMSI input is scrubbed.
     expect(screen.getByTestId('ue-add-imsi')).toHaveValue('');
+  });
+
+  it('accepts the already-prefixed IMSI without re-prefixing', async () => {
+    const user = userEvent.setup();
+    const { onSubmit } = renderDialog();
+    await user.type(screen.getByTestId('ue-add-ue-id'), 'UE-02');
+    await user.selectOptions(screen.getByTestId('ue-add-gnb'), 'GNB-01');
+    await user.selectOptions(screen.getByTestId('ue-add-owner'), 'ops-nancy');
+    await user.type(screen.getByTestId('ue-add-imsi'), 'imsi-208930000000001');
+    await user.click(screen.getByTestId('ue-add-submit'));
+    await waitFor(() =>
+      expect((onSubmit.mock.calls[0][0] as { imsi: string }).imsi).toBe('imsi-208930000000001'),
+    );
   });
 
   it('shows "Backend pending" when a dropdown has no options', () => {
     renderDialog({ gnbs: [], owners: [] });
-    const gnbSelect = screen.getByTestId('ue-add-gnb');
-    const ownerSelect = screen.getByTestId('ue-add-owner');
-    expect(gnbSelect).toBeDisabled();
-    expect(ownerSelect).toBeDisabled();
-    expect(gnbSelect).toHaveTextContent(/Backend pending/i);
-    expect(ownerSelect).toHaveTextContent(/Backend pending/i);
+    expect(screen.getByTestId('ue-add-gnb')).toBeDisabled();
+    expect(screen.getByTestId('ue-add-owner')).toBeDisabled();
+    expect(screen.getByTestId('ue-add-gnb').textContent).toMatch(/Backend pending/i);
   });
 });

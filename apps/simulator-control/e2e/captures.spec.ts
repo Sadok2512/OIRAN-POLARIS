@@ -127,6 +127,23 @@ async function mockPolaris(page: Page) {
     if (path === '/gnbs') return route.fulfill({ json: { items: [{ gnb_id: 'GNB-01', link_ip: '10.77.0.20' }], total: 1, source: 'CONFIGURED_REGISTRY' } });
     if (path === '/owners') return route.fulfill({ json: { items: [{ id: 'ops-nancy', name: 'Nancy Operator', role: 'Operator', email: null }], total: 1 } });
     if (path === '/subscribers') return route.fulfill({ json: SUBSCRIBERS });
+    if (path === '/subscribers/sub-abc-01') return route.fulfill({ json: {
+      slot_id: 'sub-abc-01', subscriber_id: 'sub-abc-01', provisioning_status: 'VERIFIED',
+      plmn: { mcc: '208', mnc: '93' }, slice: { sst: 1, sd: 'A1B2C3' },
+      dnns: ['internet', 'ims'], ambr: { uplink: 1_048_576, downlink: 1_048_576 },
+      bound_ues: ['UE-01', 'UE-12'],
+      imsi: 'PROTECTED', k: 'PROTECTED', opc: 'PROTECTED',
+      updated_at_epoch_s: 1_793_200_000,
+    } });
+    if (path === '/plmns') return route.fulfill({ json: {
+      items: [{ id: 'home', mcc: '001', mnc: '01', display_name: 'Lab PLMN', home_network: true,
+        slices: [{ sst: 1, sd: null, display_name: 'eMBB default' }] }],
+      total: 1,
+    } });
+    if (path === '/dnns') return route.fulfill({ json: {
+      items: [{ id: 'd1', dnn: 'internet', sst: 1, sd: null, description: 'default Internet DNN' }],
+      total: 1,
+    } });
     if (path === '/lab') return route.fulfill({ json: {
       source: 'READ_ONLY_HOST_AUDIT',
       observed: {
@@ -221,6 +238,13 @@ test('capture — Provisioning', async ({ page }, info) => {
   await page.goto('/provisioning');
   await page.getByTestId('provisioning-subscribers').waitFor();
   await page.screenshot({ path: screenshotPath('provisioning', info.project.name), fullPage: true });
+});
+
+test('capture — Provisioning subscriber detail', async ({ page }, info) => {
+  await page.goto('/provisioning');
+  await page.getByTestId('subscriber-row-sub-abc-01').click();
+  await page.getByTestId('subscriber-detail-panel').waitFor();
+  await page.screenshot({ path: screenshotPath('provisioning-detail', info.project.name), fullPage: true });
 });
 
 test('capture — UE detail', async ({ page }, info) => {

@@ -182,6 +182,67 @@ describe('Topology view — mockup fidelity (0.7.0)', () => {
     expect(node.textContent).toMatch(/SHARED_NODE_PROTECTED/);
   });
 
+  it('renders enriched UE mini-cards under each gNB (reg state + PDU + IP) from /ues (0.7.1)', async () => {
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return respond(200, { authenticated: false, role: 'viewer' });
+      if (url.includes('/lab'))
+        return respond(200, {
+          source: 'READ_ONLY_HOST_AUDIT',
+          observed: { open5gs: { process_state: 'running', health: 'healthy', observed: true } },
+        });
+      if (url.includes('/nodes'))
+        return respond(200, {
+          items: [
+            {
+              id: 'GNB-01', name: 'Primary gNB', technology: '5G SA', simulator: 'UERANSIM',
+              plmn: '001/01', cell_id: '0x10', link_ip: '10.77.0.20',
+              n2_endpoint: '10.77.21.20', n3_endpoint: '10.77.22.20',
+              process_state: 'running', health: 'healthy', configured: true,
+              controller_owned: true, uptime_seconds: 42,
+              actions: { start: false, stop: false, reason: null },
+            },
+          ],
+          configured_count: 1, running_count: 1, observed_at_epoch_s: 0, source: 'test',
+        });
+      if (url.includes('/ues'))
+        return respond(200, {
+          items: [
+            {
+              id: 'UE-01', registration_state: 'REGISTERED', pdu_session: 'ACTIVE',
+              ue_ip: '10.45.0.2', traffic_state: 'IDLE', serving_node: 'GNB-01',
+              last_event: null, controller_owned: true,
+            },
+            {
+              id: 'UE-13', registration_state: 'STOPPED', pdu_session: 'INACTIVE',
+              ue_ip: null, traffic_state: 'IDLE', serving_node: 'GNB-01',
+              last_event: null, controller_owned: true,
+            },
+          ],
+          configured_profiles: [], configured_count: 2, active_count: 2, registered_count: 1, source: 'test',
+        });
+      return respond(200, {});
+    }) as unknown as typeof fetch;
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId('topology-ue-UE-01')).toBeInTheDocument());
+
+    const ue01 = screen.getByTestId('topology-ue-UE-01');
+    expect(ue01).toHaveAttribute('data-registration', 'REGISTERED');
+    expect(ue01).toHaveAttribute('data-pdu', 'ACTIVE');
+    expect(within(ue01).getByTestId('topology-ue-UE-01-reg')).toHaveTextContent('REGISTERED');
+    // Active PDU → the "PDU" pill is rendered.
+    expect(within(ue01).getByTestId('topology-ue-UE-01-pdu')).toBeInTheDocument();
+    // IP comes from /ues (not fabricated).
+    expect(within(ue01).getByTestId('topology-ue-UE-01-ip')).toHaveTextContent('10.45.0.2');
+
+    const ue13 = screen.getByTestId('topology-ue-UE-13');
+    expect(ue13).toHaveAttribute('data-registration', 'STOPPED');
+    // No IP reported → em dash.
+    expect(within(ue13).getByTestId('topology-ue-UE-13-ip')).toHaveTextContent('—');
+    // Inactive PDU → no PDU badge.
+    expect(within(ue13).queryByTestId('topology-ue-UE-13-pdu')).toBeNull();
+  });
+
   it('draws GNB-02 dashed and ENB-01 with LTE labels; both connectors stay gray when no endpoint is reported', async () => {
     globalThis.fetch = vi.fn(async (input) => {
       const url = String(input);

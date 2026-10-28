@@ -52,7 +52,8 @@ import { UeProvisioningAddDialog, type UeProvisioningAddValues } from '@/ue/UePr
 import { useBackendProfiles } from '@/ue/profileSource';
 import { fetchGnbs, type WireGnb, type WireUeProfileMutation } from '@/data/profileApi';
 import { useFeatureFlag } from '@/data/featureFlags';
-import { useOwners } from '@/data/provisioningApi';
+import { createUeProvisioningProfile, useOwners } from '@/data/provisioningApi';
+import { ApiError } from '@shared/api';
 import { useStartScenarioRun } from '@/data/scenarioApi';
 import { UeBulkCreateDialog } from '@/ue/UeBulkCreateDialog';
 import { AssignScenarioDialog } from '@/ue/AssignScenarioDialog';
@@ -210,36 +211,27 @@ export function UeManagerPage() {
 
   /* ----------------------------- Mutators ------------------------------ */
 
-  // 0.6.0 — polarisProvisioning Add UE flow. The backend owns PLMN /
-  // DNN / S-NSSAI resolution from the operator-chosen owner + gNB; the
-  // UI sends the minimal body and renders the resolved values from the
-  // response. The IMSI leaves this function as a `supi` field and is
-  // never kept after the awaited mutation returns.
+  // 0.7.1 — polarisProvisioning Add UE flow. The backend accepts
+  // exactly {ue_id, gnb_id, owner, note, imsi}; `createUeProvisioningProfile`
+  // serialises those five fields and NOTHING ELSE so the 0.11-era
+  // carriers (k, opc, keep_identity, plmn_mcc, plmn_mnc, dnn, sst, sd,
+  // scenario_id, auto_run_scenario, provisioning_slot) never leak and
+  // AUTHENTICATION_KEY_REQUIRED can never be caused by this UI.
   async function submitProvisioningAdd(values: UeProvisioningAddValues) {
     setProvisioningAddError(null);
     setProvisioningAddSubmitting(true);
     try {
-      const body: WireUeProfileMutation = {
-        ue_id: '',
-        name: values.name,
-        supi: values.imsi,
-        authentication_key: null,
-        opc: null,
-        plmn_mcc: '',
-        plmn_mnc: '',
-        dnn: '',
-        sst: 1,
-        sd: null,
-        serving_gnb: values.serving_gnb,
-        scenario_id: null,
-        auto_run_scenario: false,
-      };
-      await backendProfiles.create(body);
+      await createUeProvisioningProfile(values);
       setProvisioningAddOpen(false);
-      setFeedback(`UE ${values.name} created on POLARIS (owner: ${values.owner}).`);
+      setFeedback(
+        `UE ${values.ue_id} created on POLARIS (owner: ${values.owner}, gNB: ${values.gnb_id}).`,
+      );
     } catch (error) {
-      const code = (error as { code?: string }).code ?? 'UE_CREATE_FAILED';
-      setProvisioningAddError(`${code} · ${(error as Error).message}`);
+      const code = error instanceof ApiError ? error.code : 'UE_CREATE_FAILED';
+      const status = error instanceof ApiError ? error.status : null;
+      setProvisioningAddError(
+        `${status ? `HTTP ${status} · ` : ''}${code} · ${(error as Error).message}`,
+      );
     } finally {
       setProvisioningAddSubmitting(false);
     }

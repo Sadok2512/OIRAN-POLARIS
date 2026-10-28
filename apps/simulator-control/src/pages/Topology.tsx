@@ -40,7 +40,7 @@ import {
   type WireContainerStatus,
   type WireLabObserved,
 } from '@/data/queries';
-import type { NodeItem } from '@/data/polarisTypes';
+import type { NodeItem, UeState } from '@/data/polarisTypes';
 
 /**
  * Fallback NF catalogue. The mockup renders a grid of ten; we expose
@@ -111,11 +111,11 @@ export function TopologyPage() {
   const openCoreTone = topologyCoreTone(observed);
 
   const uesByNode = useMemo(() => {
-    const map = new Map<string, string[]>();
+    const map = new Map<string, UeState[]>();
     for (const ue of ues.data?.items ?? []) {
       const key = ue.serving_node ?? 'UNASSIGNED';
       const list = map.get(key) ?? [];
-      list.push(ue.id);
+      list.push(ue);
       map.set(key, list);
     }
     return map;
@@ -232,7 +232,7 @@ function GnbTree({
   uesByNode,
 }: {
   nodes: NodeItem[];
-  uesByNode: Map<string, string[]>;
+  uesByNode: Map<string, UeState[]>;
 }) {
   if (nodes.length === 0) {
     return (
@@ -259,7 +259,7 @@ function GnbTree({
   );
 }
 
-function GnbColumn({ node, attachedUes }: { node: NodeItem; attachedUes: string[] }) {
+function GnbColumn({ node, attachedUes }: { node: NodeItem; attachedUes: UeState[] }) {
   const isLte = node.technology === 'LTE';
   const controlLabel = isLte ? 'S1-MME · S1AP' : 'N2 · NGAP';
   const userLabel = isLte ? 'S1-U · GTP-U' : 'N3 · GTP-U';
@@ -314,20 +314,55 @@ function GnbColumn({ node, attachedUes }: { node: NodeItem; attachedUes: string[
             No UE attached
           </p>
         ) : (
-          attachedUes.map((ueId) => (
-            <div
-              key={ueId}
-              className="rounded-lg border border-border bg-canvas p-2 flex items-center gap-1.5"
-              data-testid={`topology-ue-${ueId}`}
-            >
-              <Smartphone width={13} height={13} className="text-primary shrink-0" />
-              <span className="mono text-ep-sm font-medium truncate">{ueId}</span>
-            </div>
-          ))
+          attachedUes.map((ue) => <UeMiniCard key={ue.id} ue={ue} />)
         )}
       </div>
     </div>
   );
+}
+
+/**
+ * 0.7.1 — Compact UE card rendered under each gNB. Fields come straight
+ * from `/ues` (`UeState`): id, registration_state, pdu_session, ue_ip.
+ * No field is fabricated when `/ues` doesn't report it — the UI shows
+ * an em-dash instead.
+ */
+function UeMiniCard({ ue }: { ue: UeState }) {
+  const regTone = regTonePill(ue.registration_state);
+  const pduActive = (ue.pdu_session ?? '').toUpperCase() === 'ACTIVE';
+  return (
+    <div
+      className="rounded-lg border border-border bg-canvas p-2 flex flex-col gap-1"
+      data-testid={`topology-ue-${ue.id}`}
+      data-registration={ue.registration_state}
+      data-pdu={ue.pdu_session}
+    >
+      <div className="flex items-center gap-1.5">
+        <Smartphone width={13} height={13} className="text-primary shrink-0" />
+        <span className="mono text-ep-sm font-medium truncate">{ue.id}</span>
+      </div>
+      <div className="flex flex-wrap gap-1 text-[10px]">
+        <span className={`ep-badge ${regTone}`} data-testid={`topology-ue-${ue.id}-reg`}>
+          {ue.registration_state || 'UNKNOWN'}
+        </span>
+        {pduActive && (
+          <span className="ep-badge bg-success/15 text-success" data-testid={`topology-ue-${ue.id}-pdu`}>
+            PDU
+          </span>
+        )}
+      </div>
+      <p className="mono text-[10px] text-text-secondary truncate" data-testid={`topology-ue-${ue.id}-ip`}>
+        {ue.ue_ip ?? '—'}
+      </p>
+    </div>
+  );
+}
+
+function regTonePill(state: string | null | undefined): string {
+  const s = (state ?? '').toUpperCase();
+  if (s === 'REGISTERED') return 'bg-success/15 text-success';
+  if (s === 'STOPPED' || s === 'DEREGISTERED' || s === 'FAILED') return 'bg-error/15 text-error';
+  return 'bg-canvas text-text-secondary border border-border';
 }
 
 /**

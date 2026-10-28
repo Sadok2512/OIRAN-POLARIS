@@ -29,12 +29,27 @@ export interface Owner {
   email: string | null;
 }
 
+export interface PlmnSlice {
+  sst: number;
+  /** Hex SD (6 hex digits) or null when the slice has no SD. */
+  sd: string | null;
+  display_name?: string;
+}
+
 export interface Plmn {
   id: string;
   mcc: string;
   mnc: string;
   display_name: string;
   home_network: boolean;
+  /**
+   * 0.7.1 — Allowed S-NSSAI slices for this PLMN. When present, the UI
+   * replaces its free-text SST/SD inputs with a dropdown fed by this
+   * list. The hardening came after two subscribers landed on 1/000001
+   * via free SD input and were not served; this makes that mistake
+   * impossible to reproduce.
+   */
+  slices?: PlmnSlice[];
 }
 
 export interface Dnn {
@@ -184,6 +199,44 @@ export async function createSubscriber(
   input: SubscriberCreateInput,
 ): Promise<SubscriberCreateResponse> {
   return polarisApi<SubscriberCreateResponse>('/subscribers', {
+    method: 'POST',
+    body: JSON.stringify(input),
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+/**
+ * 0.7.1 — Slim create for `POST /ue-profiles`. The backend published on
+ * `feat/polaris-provisioning` accepts the whitelist {ue_id, gnb_id,
+ * owner, note, imsi} and refuses any extra field (notably the old 0.11
+ * carriers: provisioning_slot, k, opc, keep_identity, plmn_mcc,
+ * plmn_mnc, dnn, sst, sd, scenario_id, auto_run_scenario). This
+ * helper serialises exactly those five fields so the operator never
+ * runs into an AUTHENTICATION_KEY_REQUIRED-shaped surprise.
+ */
+export interface UeProvisioningProfileInput {
+  ue_id: string;
+  gnb_id: string;
+  owner: string;
+  note: string;
+  imsi: string;
+}
+
+export interface UeProvisioningProfileResponse {
+  ue_id: string;
+  gnb_id: string;
+  owner: string;
+  note: string;
+  imsi: 'PROTECTED';
+  authentication_material: 'PROTECTED';
+  provisioning_status: string;
+  created_at_epoch_s: number;
+}
+
+export async function createUeProvisioningProfile(
+  input: UeProvisioningProfileInput,
+): Promise<UeProvisioningProfileResponse> {
+  return polarisApi<UeProvisioningProfileResponse>('/ue-profiles', {
     method: 'POST',
     body: JSON.stringify(input),
     headers: { 'Content-Type': 'application/json' },

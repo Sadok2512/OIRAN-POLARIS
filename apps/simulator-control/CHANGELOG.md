@@ -3,6 +3,62 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.7.1 — 2026-10-28 (patch)
+
+Operator-driven recette fixes against the real backend contract. The LOT
+targeted five surface items; all land behind the existing
+`polarisProvisioning` flag.
+
+### Changed
+
+- **`POST /ue-profiles` body is now the slim whitelist**
+  `{ue_id, gnb_id, owner, note, imsi}`. The 0.11-era carriers
+  (`provisioning_slot`, `k`, `opc`, `keep_identity`, `plmn_mcc`,
+  `plmn_mnc`, `dnn`, `sst`, `sd`, `scenario_id`, `auto_run_scenario`,
+  `name`) are never attached — the UI can no longer cause the
+  AUTHENTICATION_KEY_REQUIRED surprise.
+- **Add UE dialog**: swaps `Name` for **`UE ID`** with live validation
+  (format `UE-NN` / `UE-NNNNN`) and the matching hint. Still asks for
+  gNB + Owner + Note + masked IMSI.
+- **IMSI normalization**: both the Add UE and Add Subscriber dialogs
+  accept raw digits (`001010000000201`) OR the prefixed form
+  (`imsi-001010000000201`); `normalizeImsi` canonicalises to the
+  prefixed form before send. Lives in a new
+  `src/data/identityFormats.ts` with full test coverage.
+- **Add Subscriber dialog**: slice (SST + SD) comes from a dropdown
+  fed by `/plmns.items[].slices[]`, DNN from `/dnns.items[]`. Free-text
+  SST, SD and DNN inputs are gone (hardening after two subscribers
+  landed on 1/000001 via free SD and were not served).
+- **Topology UE cards** under each gNB now render the UE id, the
+  registration-state pill, the `PDU` pill when the session is active,
+  and the UE IP straight from `/ues`. Nothing is fabricated — a missing
+  IP shows as an em-dash.
+- **Provisioning page**: clicking a subscriber row opens a detail panel
+  sourced from `GET /subscribers/:slot` with Identity (PROTECTED
+  triplet), Network (PLMN / slice / DNNs), AMBR and the list of
+  bound UEs. **Edit** button is present but disabled with the title
+  "Backend pending: `PUT /subscribers/:slot`" until the backend
+  publishes it.
+
+### Added
+
+- `src/data/identityFormats.ts` — `normalizeImsi`, `isImsiValid`,
+  `isUeIdValid`, `UE_ID_RE`, `UE_ID_HINT`.
+- `createUeProvisioningProfile(input)` in
+  `src/data/provisioningApi.ts` — the slim POST helper.
+- `src/pages/Provisioning.test.tsx` — detail panel + locked Edit tests.
+- Playwright capture `provisioning-detail.chromium-{light,dark}.png`
+  alongside the other 0.6.x/0.7.x shots in `docs/screenshots/v0.6.0/`.
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → **Test Files 25 passed (25) · Tests 162 passed (162)**
+  (3 new in `Provisioning.test.tsx`, 2 new in `identityFormats.test.ts`,
+  the Add dialogs rewritten against the new contract, one new Topology
+  assertion covering the enriched UE mini-card).
+- `npm run build` → clean, no fixture leak in `dist/`.
+
 ## 0.7.0 — 2026-10-28 (minor)
 
 Topology redrawn to match the mockup
