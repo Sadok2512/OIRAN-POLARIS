@@ -79,21 +79,18 @@ const UE_DETAIL = {
 const SUBSCRIBERS = {
   items: [
     {
-      subscriber_id: 'sub-abc-01',
-      owner: 'ops-nancy',
-      imsi: 'PROTECTED',
-      provisioning_status: 'VERIFIED',
-      updated_at_epoch_s: 1_793_200_000,
-    },
-    {
-      subscriber_id: 'sub-abc-02',
-      owner: 'eng-remy',
-      imsi: 'PROTECTED',
-      provisioning_status: 'PROVISIONING_REQUIRED',
-      updated_at_epoch_s: 1_793_200_040,
+      slot: 'SUB-000000000001',
+      state: 'PROVISIONED',
+      subscriber_identity: 'PROTECTED',
+      authentication_material: 'PROTECTED',
+      plmn: { mcc: '208', mnc: '93' },
+      snssai: { sst: 1, sd: 'A1B2C3' },
+      dnns: ['internet'],
+      ambr: { uplink: 1_000_000_000, downlink: 1_000_000_000 },
     },
   ],
-  total: 2,
+  total: 1,
+  secrets_exposed: false,
 };
 
 async function mockPolaris(page: Page) {
