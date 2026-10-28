@@ -144,26 +144,26 @@ test.beforeEach(async ({ page }) => {
 });
 
 test('capture — Templates tab', async ({ page }, info) => {
-  await page.goto('/scenarios');
+  await page.goto('scenarios');
   await page.getByTestId('scenarios-tab-templates').click();
   await page.getByTestId('templates-table').waitFor();
   await page.screenshot({ path: screenshotPath('templates', info.project.name), fullPage: true });
 });
 
 test('capture — UE Manager', async ({ page }, info) => {
-  await page.goto('/ues');
+  await page.goto('ues');
   await page.getByText(/UE Manager/i).first().waitFor();
   await page.screenshot({ path: screenshotPath('ue-manager', info.project.name), fullPage: true });
 });
 
 test('capture — Provisioning', async ({ page }, info) => {
-  await page.goto('/provisioning');
+  await page.goto('provisioning');
   await page.getByTestId('provisioning-subscribers').waitFor();
   await page.screenshot({ path: screenshotPath('provisioning', info.project.name), fullPage: true });
 });
 
 test('capture — UE detail', async ({ page }, info) => {
-  await page.goto('/ues/UE-01');
+  await page.goto('ues/UE-01');
   await page.getByTestId('ue-block-identity').waitFor();
   await page.screenshot({ path: screenshotPath('ue-detail', info.project.name), fullPage: true });
 });
