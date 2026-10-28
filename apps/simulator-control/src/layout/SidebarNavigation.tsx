@@ -8,21 +8,25 @@ import {
   Settings as SettingsIcon,
   Antenna,
   Zap,
+  Cpu,
+  Network,
 } from 'lucide-react';
 import clsx from 'clsx';
 
 const NAV = [
   { to: '/console', label: 'Console', Icon: LayoutDashboard, section: 'OPERATIONS' },
-  { to: '/nodes', label: 'Network Nodes', Icon: Antenna, section: 'OPERATIONS' },
-  { to: '/ues', label: 'UE Manager', Icon: Smartphone, section: 'OPERATIONS' },
-  { to: '/traffic', label: 'Traffic Generator', Icon: Zap, section: 'OPERATIONS' },
-  { to: '/scenarios', label: 'Scenarios', Icon: Workflow, section: 'WORKFLOWS' },
-  { to: '/scenarios/monitor', label: 'Execution Monitor', Icon: Activity, section: 'WORKFLOWS' },
+  { to: '/network/topology', label: 'Topology', Icon: Network, section: 'NETWORK' },
+  { to: '/network/core', label: 'Core · Open5GS', Icon: Cpu, section: 'NETWORK' },
+  { to: '/network/gnbs', label: 'gNodeBs', Icon: Antenna, section: 'NETWORK' },
+  { to: '/ues', label: 'UE Manager', Icon: Smartphone, section: 'SIMULATION' },
+  { to: '/scenarios', label: 'Scenarios', Icon: Workflow, section: 'SIMULATION' },
+  { to: '/scenarios/monitor', label: 'Execution Monitor', Icon: Activity, section: 'SIMULATION' },
+  { to: '/traffic', label: 'Traffic Generator', Icon: Zap, section: 'SIMULATION' },
   { to: '/history', label: 'History', Icon: History, section: 'REVIEW' },
   { to: '/settings', label: 'Settings', Icon: SettingsIcon, section: 'PLATFORM' },
 ] as const;
 
-const SECTIONS = ['OPERATIONS', 'WORKFLOWS', 'REVIEW', 'PLATFORM'] as const;
+const SECTIONS = ['OPERATIONS', 'NETWORK', 'SIMULATION', 'REVIEW', 'PLATFORM'] as const;
 
 export function SidebarNavigation({ collapsed }: { collapsed: boolean }) {
   return (

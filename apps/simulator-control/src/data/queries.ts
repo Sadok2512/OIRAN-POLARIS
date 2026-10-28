@@ -57,6 +57,36 @@ export function useLab() {
   });
 }
 
+/** Shape used by Core · Open5GS and Topology to render the NF containers. */
+export interface WireContainerStatus {
+  process_state: string;
+  health: string;
+  observed: boolean;
+}
+export interface WireLabObserved {
+  ueransim_ue_profile?: boolean;
+  ueransim_profile?: string;
+  open5gs?: WireContainerStatus;
+  ueransim_gnb?: WireContainerStatus;
+  ueransim_ue?: WireContainerStatus;
+  srsran_enb?: WireContainerStatus;
+  srsran_ue?: WireContainerStatus;
+  lte_attach?: string;
+  controller_owned_active_jobs?: number;
+}
+export interface WireLabEnvelope {
+  source?: string;
+  configuration_changed?: boolean;
+  observed?: WireLabObserved;
+}
+export function useLabObserved() {
+  return useQuery({
+    queryKey: ['polaris', 'lab-observed'],
+    queryFn: () => polarisApi<WireLabEnvelope>('/lab'),
+    refetchInterval: 10_000,
+  });
+}
+
 export function useSystemHealth() {
   return useQuery({
     queryKey: ['polaris', 'system-health'],
@@ -150,6 +180,30 @@ export function useStartUe() {
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: ['polaris', 'ues'] });
     },
+  });
+}
+
+/** Backend contract: GET /ue-profiles/provisioning-slots → identity-free. */
+export function useProvisioningSlots() {
+  return useQuery({
+    queryKey: ['polaris', 'provisioning-slots'],
+    queryFn: async () => {
+      const { fetchProvisioningSlots } = await import('./profileApi');
+      return fetchProvisioningSlots();
+    },
+    staleTime: 30_000,
+  });
+}
+
+/** Backend contract: GET /gnbs → registry of serving-gnb targets. */
+export function useGnbs() {
+  return useQuery({
+    queryKey: ['polaris', 'gnbs'],
+    queryFn: async () => {
+      const { fetchGnbs } = await import('./profileApi');
+      return fetchGnbs();
+    },
+    staleTime: 30_000,
   });
 }
 

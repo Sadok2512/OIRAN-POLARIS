@@ -3,6 +3,66 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.4.0 — 2026-10-28 (minor)
+
+Alignment on the UI mockups in `docs/ui-mockups/polaris-control.html` (branch
+`origin/docs/ui-mockups` @ `04d7c79`). Adds a dedicated **Network** section
+with Topology, Core · Open5GS and gNodeBs; no mutating route is exercised,
+every unavailable backend contract is surfaced as a locked UI control with
+its reason text.
+
+### Added
+
+- `/network/topology` (`src/pages/Topology.tsx`): client-side composition
+  of `GET /lab` + `GET /nodes` + `GET /ues`. Shows the Open5GS container
+  state, each gNB with its PLMN / Cell ID / link / N2 / N3 endpoint, and
+  the UEs that report `serving_node = <id>`. NGAP state is "unknown" when
+  the backend didn't report an endpoint or state — never fabricated.
+- `/network/core` (`src/pages/CoreOpen5gs.tsx`), 3 tabs:
+  - **Network functions**: AMF HEALTHY read from the aggregate container
+    reported by `/lab`; every other NF (SMF/UPF/NRF/…) is listed with
+    `not exposed` because POLARIS does not yet surface per-NF state. Every
+    Restart button is locked with the reason text.
+  - **Configuration**: PLMN / TAC / S-NSSAI / DNN only when
+    `GET /capabilities` carries them, otherwise `not exposed`. Edit
+    configuration button locked.
+  - **Subscribers**: `GET /ue-profiles/provisioning-slots` with `slot_id`
+    and `bound_ue_id` only. Identity column is always "PROTECTED" — no
+    IMSI, K or OPc is ever requested or rendered. Provision button locked.
+- `/network/gnbs` (`src/pages/Gnbs.tsx`): reads `GET /nodes`. GNB-01
+  renders as the real card (`SHARED_NODE_PROTECTED` surfaced); GNB-02 is
+  dashed with the exact backend reason `LIVE_005_APPROVAL_REQUIRED` and
+  a locked "Deploy and start" button; ENB-01 lives under the "LTE profile
+  (not certified)" group with the badge `LTE_ATTACH_NOT_CERTIFIED`. "Add
+  gNodeB" and every start/stop button are locked.
+- `useLabObserved()`, `useProvisioningSlots()`, `useGnbs()` typed hooks in
+  `src/data/queries.ts`.
+- Tests: 112 pass (11 new across the three Network pages + 2 updated in
+  `App.test.tsx`). Commands reported in the PR summary.
+
+### Changed
+
+- Sidebar now shows an explicit **NETWORK** section (Topology, Core · Open5GS,
+  gNodeBs) and groups the simulator pages under **SIMULATION**. The legacy
+  `Network Nodes` entry is retired.
+- `/nodes` route still responds with a redirect to `/network/gnbs`, so old
+  bookmarks don't 404. `NetworkNodes.tsx` stays on disk for reference but
+  is no longer routed to.
+
+### Unchanged
+
+- UE Manager, Scenarios, Scenario Builder, Execution Monitor, Settings:
+  not touched. All their existing tests remain green.
+
+### Open items (declared)
+
+- Per-NF state (SMF/UPF/NRF/…): POLARIS `/lab` only exposes the aggregate
+  `open5gs` container; individual NF state renders as `not exposed` until
+  the backend splits them.
+- Topology link state: based on `process_state === 'running'` plus the
+  presence of an endpoint. There is no `/ng-setup` route yet; the UI never
+  guesses an NGAP OK status.
+
 ## 0.3.1 — 2026-10-28 (patch)
 
 - Update `react-router-dom` to `6.30.6` to close the production React Router redirect/XSS
