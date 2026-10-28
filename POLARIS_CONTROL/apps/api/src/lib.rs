@@ -56,7 +56,7 @@ use ueransim_adapter::{
 
 pub use ue_profiles::UeProfileRegistry;
 
-pub const VERSION: &str = "0.15.2";
+pub const VERSION: &str = "0.15.3";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -2405,6 +2405,11 @@ async fn cpu_decisions(
 
 async fn lab(State(state): State<Arc<AppState>>) -> Json<Value> {
     let ue = Path::new("/root/POLARIS/runtime/ueransim/ue.yaml").exists();
+    let observed_at = epoch_seconds();
+    let nfs = LAB_NETWORK_FUNCTIONS
+        .iter()
+        .map(|(nf, container)| network_function_status(nf, container, observed_at))
+        .collect::<Vec<_>>();
     let active_jobs = state
         .runtime
         .lock()
@@ -2419,23 +2424,85 @@ async fn lab(State(state): State<Arc<AppState>>) -> Json<Value> {
             "ueransim_ue":container_status("oiran-lab-ueransim-ue-1"),
             "srsran_enb":container_status("oiran-lab-srsenb-1"),
             "srsran_ue":container_status("oiran-lab-srsue-1"),
+            "nfs":nfs,
             "lte_attach":"NOT_CERTIFIED",
             "controller_owned_active_jobs":active_jobs
         }}),
     )
 }
 
-fn container_status(name: &str) -> Value {
+const LAB_NETWORK_FUNCTIONS: [(&str, &str); 12] = [
+    ("AMF", "oiran-lab-amf-1"),
+    ("SMF", "oiran-lab-smf-1"),
+    ("UPF", "oiran-lab-upf-1"),
+    ("NRF", "oiran-lab-nrf-1"),
+    ("AUSF", "oiran-lab-ausf-1"),
+    ("UDM", "oiran-lab-udm-1"),
+    ("UDR", "oiran-lab-udr-1"),
+    ("PCF", "oiran-lab-pcf-1"),
+    ("NSSF", "oiran-lab-nssf-1"),
+    ("BSF", "oiran-lab-bsf-1"),
+    ("Kamailio", "oiran-ims-lite-ims-lite-proxy-1"),
+    ("RTPengine", "oiran-ims-lite-rtpengine-1"),
+];
+
+fn inspect_container_state(name: &str) -> Option<(String, String)> {
     let output = Command::new("/usr/bin/timeout")
         .args(["--signal=TERM", "--kill-after=1s", "10s", "/usr/bin/docker", "inspect", "--format", "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}not_available{{end}}", name])
-        .output();
-    match output {
-        Ok(value) if value.status.success() => {
-            let text = String::from_utf8_lossy(&value.stdout);
-            let mut fields = text.trim().split('|');
-            json!({"process_state":fields.next().unwrap_or("unknown"),"health":fields.next().unwrap_or("unknown"),"observed":true})
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let (process_state, health) = text.trim().split_once('|')?;
+    if process_state.is_empty() || health.is_empty() {
+        return None;
+    }
+    Some((process_state.to_string(), health.to_string()))
+}
+
+fn network_function_observation(
+    nf: &str,
+    container: &str,
+    observed_at: u64,
+    state: Option<(String, String)>,
+) -> Value {
+    match state {
+        Some((process_state, health)) => json!({
+            "nf":nf,
+            "container":container,
+            "process_state":process_state,
+            "health":health,
+            "observed_at":observed_at,
+            "observed":true
+        }),
+        None => json!({
+            "nf":nf,
+            "container":container,
+            "process_state":Value::Null,
+            "health":Value::Null,
+            "observed_at":observed_at,
+            "observed":false
+        }),
+    }
+}
+
+fn network_function_status(nf: &str, container: &str, observed_at: u64) -> Value {
+    network_function_observation(
+        nf,
+        container,
+        observed_at,
+        inspect_container_state(container),
+    )
+}
+
+fn container_status(name: &str) -> Value {
+    match inspect_container_state(name) {
+        Some((process_state, health)) => {
+            json!({"process_state":process_state,"health":health,"observed":true})
         }
-        _ => json!({"process_state":"unknown","health":"unknown","observed":false}),
+        None => json!({"process_state":"unknown","health":"unknown","observed":false}),
     }
 }
 
@@ -7137,6 +7204,48 @@ mod p0_tests {
     const OPERATOR_PASSWORD: &str = "operator-test-password-2026";
     const ADMIN_PASSWORD: &str = "administrator-test-password-2026";
     static TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn lab_network_function_catalog_is_complete_and_measured() {
+        let names = LAB_NETWORK_FUNCTIONS
+            .iter()
+            .map(|(nf, _)| *nf)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "AMF",
+                "SMF",
+                "UPF",
+                "NRF",
+                "AUSF",
+                "UDM",
+                "UDR",
+                "PCF",
+                "NSSF",
+                "BSF",
+                "Kamailio",
+                "RTPengine"
+            ]
+        );
+
+        let measured = network_function_observation(
+            "AMF",
+            "oiran-lab-amf-1",
+            123,
+            Some(("running".into(), "healthy".into())),
+        );
+        assert_eq!(measured["observed"], true);
+        assert_eq!(measured["process_state"], "running");
+        assert_eq!(measured["health"], "healthy");
+        assert_eq!(measured["observed_at"], 123);
+
+        let absent = network_function_observation("SMF", "missing", 124, None);
+        assert_eq!(absent["observed"], false);
+        assert!(absent["process_state"].is_null());
+        assert!(absent["health"].is_null());
+        assert_eq!(absent["observed_at"], 124);
+    }
 
     struct FakeLiveUeRuntime {
         stopped: Arc<Mutex<Vec<String>>>,

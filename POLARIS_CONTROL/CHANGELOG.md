@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.15.3 (polaris-control-api)
+
+- Patch: expose a measured `observed.nfs[]` inventory from `/lab` for every Open5GS network
+  function plus Kamailio and RTPengine, using Docker inspect state and health only.
+- Honesty: missing or uninspectable containers are returned with `observed: false` and null state
+  fields; the API never fabricates network-function availability.
+
 ## 0.15.2 (polaris-control-api)
 
 - Patch: create a UE from a POLARIS-owned subscriber using IMSI alone; K and OPc are resolved

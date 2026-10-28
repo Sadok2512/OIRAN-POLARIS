@@ -32,6 +32,11 @@ Read-only routes allow anonymous Viewer access. Operator and Administrator accou
 | `POST /admin/scenario-policy` | Administrator + CSRF | Persistently enables or disables the certified policy |
 | `GET /live-tests/polaris-live-001` | Viewer | Persistent result and current one-time approval state |
 
+`GET /lab` includes `observed.nfs[]`. Each entry is
+`{nf,container,process_state,health,observed_at,observed}` and comes from a bounded
+`docker inspect`. An absent or uninspectable container has `observed:false` with null
+`process_state` and `health`.
+
 The API never accepts filesystem paths, arbitrary destinations, or shell commands.
 
 Multi-UE responses keep desired, process, Registration, PDU Session and traffic state as independent fields. The stable profile allowlist is UE-01 through UE-10, while `max_ues_live_certified` remains `1`; implementation and offline tests are not certification. Current NAS (`nr-cli status`), current PDU (`nr-cli ps-list`), and a same-session address on a `uesimtunN` interface drive Registration/PDU state; container health and historical log success do not. Reconciliation also requires `POLARIS_ADDITIONAL_UE_LIVE_ENABLED=true` in live mode.
