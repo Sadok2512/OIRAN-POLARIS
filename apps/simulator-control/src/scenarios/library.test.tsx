@@ -71,7 +71,7 @@ function oneStep(id: string, loop: Scenario['loop']): Scenario {
   const scenario = emptyScenario('New one');
   scenario.id = id;
   scenario.loop = loop;
-  scenario.steps = [{ id: newStepId(), kind: 'IDLE', params: { duration_s: { mode: 'fixed', value: 3 } } }];
+  scenario.steps = [{ id: newStepId(), kind: 'WAIT', params: { duration_s: { mode: 'fixed', value: 3 } } }];
   return scenario;
 }
 

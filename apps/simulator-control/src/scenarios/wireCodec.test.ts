@@ -50,7 +50,7 @@ describe('wireCodec — step types (6-type whitelist)', () => {
     ['PDU_ESTABLISH', 'pdu_establish'],
     ['PDU_RELEASE', 'pdu_release'],
     ['UDP_TRAFFIC', 'udp_traffic'],
-    ['IDLE', 'wait'],
+    ['WAIT', 'wait'],
   ];
 
   it.each(certifiedPairs)('encodes %s as wire type "%s" with step loop_count 1', (kind, wire) => {
@@ -76,7 +76,7 @@ describe('wireCodec — step types (6-type whitelist)', () => {
 describe('wireCodec — scenario loop (definition loop_count)', () => {
   function scenarioWith(loop: Scenario['loop']): Scenario {
     const scenario = emptyScenario('loop test');
-    scenario.steps = [{ id: newStepId(), kind: 'IDLE', params: { duration_s: { mode: 'fixed', value: 5 } } }];
+    scenario.steps = [{ id: newStepId(), kind: 'WAIT', params: { duration_s: { mode: 'fixed', value: 5 } } }];
     scenario.loop = loop;
     return scenario;
   }
@@ -132,7 +132,7 @@ describe('wireCodec — definition decoding (measured contract response)', () =>
   it('decodes loop_count, steps and epoch-second timestamps', () => {
     const scenario = decodeDefinition(measured);
     expect(scenario.loop).toEqual({ kind: 'FIXED', cycles: 2 });
-    expect(scenario.steps[0].kind).toBe('IDLE');
+    expect(scenario.steps[0].kind).toBe('WAIT');
     expect(scenario.createdAt).toBe(1793186621 * 1000);
     expect(scenario.version).toBe(1);
   });

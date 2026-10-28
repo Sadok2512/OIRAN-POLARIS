@@ -76,7 +76,8 @@ export function ScenarioBuilderPage() {
   // truth: when it names a wire type, the matching kind is promoted to
   // "Supported" without touching STEP_METADATA.
   const capabilities = useCapabilities();
-  const advertisedKinds = capabilities.data?.scenario_step_kinds;
+  const advertisedKinds =
+    capabilities.data?.executable_scenario_step_types ?? capabilities.data?.scenario_step_kinds;
 
   const paletteGroups = useMemo(() => {
     const supported: ScenarioStepKind[] = [];

@@ -57,6 +57,8 @@ export interface Capabilities {
    * `STEP_METADATA` becomes clickable only when it appears in this list.
    */
   scenario_step_kinds?: string[];
+  /** API 0.14.0+ canonical name. */
+  executable_scenario_step_types?: string[];
 }
 
 /**

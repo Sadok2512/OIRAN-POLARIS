@@ -91,7 +91,7 @@ describe('ScenarioBuilder — honest palette (0.5.1 + 0.5.2)', () => {
       'UE_START',
       'PDU_ESTABLISH',
       'UDP_TRAFFIC',
-      'IDLE',
+      'WAIT',
       'PDU_RELEASE',
       'UE_STOP',
     ];
