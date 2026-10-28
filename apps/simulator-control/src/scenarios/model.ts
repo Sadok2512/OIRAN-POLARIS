@@ -17,6 +17,7 @@ export type ScenarioStepKind =
   | 'TCP_TRAFFIC'
   | 'ICMP_TRAFFIC'
   | 'HTTP_TRAFFIC'
+  | 'WAIT'
   | 'IDLE'
   | 'WAIT_RRC_CONNECTED'
   | 'WAIT_RRC_IDLE'
@@ -82,12 +83,19 @@ export const STEP_METADATA: Record<
     backendCertified: false,
     backendNote: 'Not in polaris-control-api 0.9.0 (6-type whitelist).',
   },
-  IDLE: {
-    label: 'Idle / Wait',
+  WAIT: {
+    label: 'Wait',
     family: 'WAIT',
-    defaultParams: ['duration_s'],
+    defaultParams: ['duration_ms'],
     backendCertified: true,
     backendNote: 'Serialized to wire type "wait" (polaris-control-api 0.9.0).',
+  },
+  IDLE: {
+    label: 'Session idle',
+    family: 'WAIT',
+    defaultParams: ['duration_ms'],
+    backendCertified: false,
+    backendNote: 'Keeps the PDU session established while the UE is idle.',
   },
   WAIT_RRC_CONNECTED: {
     label: 'Wait: RRC Connected (observed)',
@@ -173,7 +181,8 @@ export const WIRE_STEP_TYPE: Partial<Record<ScenarioStepKind, string>> = {
   PDU_ESTABLISH: 'pdu_establish',
   PDU_RELEASE: 'pdu_release',
   UDP_TRAFFIC: 'udp_traffic',
-  IDLE: 'wait',
+  WAIT: 'wait',
+  IDLE: 'idle',
   // 0.5.0 — scenario-definition v2 additions.
   TRAFFIC_DL: 'traffic_dl',
   TRAFFIC_UL: 'traffic_ul',
@@ -190,7 +199,8 @@ export const INTERNAL_STEP_KIND: Record<string, ScenarioStepKind> = {
   pdu_establish: 'PDU_ESTABLISH',
   pdu_release: 'PDU_RELEASE',
   udp_traffic: 'UDP_TRAFFIC',
-  wait: 'IDLE',
+  wait: 'WAIT',
+  idle: 'IDLE',
   traffic_dl: 'TRAFFIC_DL',
   traffic_ul: 'TRAFFIC_UL',
   detach: 'DETACH',
@@ -279,6 +289,8 @@ export interface ScenarioStep {
    * rule.
    */
   steps?: ScenarioStep[];
+  /** Wire parameters not editable by this UI (for example DNN strings). */
+  wireParameters?: Record<string, unknown>;
 }
 
 export type LoopMode =

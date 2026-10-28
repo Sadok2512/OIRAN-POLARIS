@@ -35,7 +35,7 @@ export const MAX_WIRE_LOOP_COUNT = 10_000;
 /* ------------------------------- Wire types ------------------------------- */
 
 export type WireNumericParam =
-  | { fixed: number }
+  | { fixed: number | string }
   | { random: { min: number; max: number } };
 
 export interface WireScenarioStep {
@@ -159,22 +159,40 @@ export function decodeParam(value: WireNumericParam | number): FixedOrRandom {
 export function encodeStep(step: ScenarioStep): WireScenarioStep {
   const type = WIRE_STEP_TYPE[step.kind];
   if (!type) throw new UnsupportedStepTypeError(step.kind);
-  const parameters: Record<string, WireNumericParam> = {};
+  const parameters: Record<string, WireNumericParam> = {
+    ...(step.wireParameters as Record<string, WireNumericParam> | undefined),
+  };
   (Object.keys(step.params) as (keyof StepParams)[]).forEach((key) => {
     const value = step.params[key];
     if (value) parameters[key] = encodeParam(key, value);
   });
-  return { type, loop_count: 1, parameters };
+  return {
+    type,
+    loop_count: 1,
+    parameters,
+    ...(step.steps ? { steps: step.steps.map(encodeStep) } : {}),
+  };
 }
 
 export function decodeStep(wire: WireScenarioStep): ScenarioStep {
   const kind = INTERNAL_STEP_KIND[wire.type];
   if (!kind) throw new UnsupportedStepTypeError(wire.type);
   const params: StepParams = {};
+  const wireParameters: Record<string, WireNumericParam> = {};
   for (const [key, value] of Object.entries(wire.parameters)) {
-    (params as Record<string, FixedOrRandom>)[key] = decodeParam(value);
+    if ('fixed' in value && typeof value.fixed !== 'number') {
+      wireParameters[key] = value;
+    } else {
+      (params as Record<string, FixedOrRandom>)[key] = decodeParam(value);
+    }
   }
-  return { id: newStepId(), kind, params };
+  return {
+    id: newStepId(),
+    kind,
+    params,
+    ...(Object.keys(wireParameters).length > 0 ? { wireParameters } : {}),
+    ...(wire.steps ? { steps: wire.steps.map(decodeStep) } : {}),
+  };
 }
 
 /* ----------------------------- Definition codec --------------------------- */
