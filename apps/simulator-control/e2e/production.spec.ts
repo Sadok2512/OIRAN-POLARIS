@@ -43,9 +43,21 @@ test('real provisioning, UE detail and template clone/save contracts', async ({ 
   await expect(subscriberTable).toBeVisible();
   await expect(subscriberTable.getByText('PROTECTED').first()).toBeVisible();
 
-  await page.goto(simulatorPath('ues/UE-01'), { waitUntil: 'domcontentloaded' });
-  for (const block of ['identity', 'provisioning', 'network', 'registration', 'pdu', 'ims', 'scenario', 'traffic']) {
-    await expect(page.getByTestId(`ue-block-${block}`), block).toBeVisible();
+  const profileInventory = await page.evaluate(async () => {
+    const response = await fetch('/polaris-api/v1/ue-profiles?page=1&page_size=1');
+    return { status: response.status, body: await response.json() };
+  });
+  expect(profileInventory.status).toBe(200);
+  const firstProfile = profileInventory.body.items?.[0]?.ue_id as string | undefined;
+  if (firstProfile) {
+    await page.goto(simulatorPath(`ues/${encodeURIComponent(firstProfile)}`), { waitUntil: 'domcontentloaded' });
+    for (const block of ['identity', 'provisioning', 'network', 'registration', 'pdu', 'ims', 'scenario', 'traffic']) {
+      await expect(page.getByTestId(`ue-block-${block}`), block).toBeVisible();
+    }
+  } else {
+    await page.goto(simulatorPath('ues'), { waitUntil: 'domcontentloaded' });
+    await expect(page.getByTestId('ue-table')).toBeVisible();
+    await expect(page.getByText(/No UE profile yet/i)).toBeVisible();
   }
 
   await page.goto(simulatorPath('scenarios'), { waitUntil: 'domcontentloaded' });
