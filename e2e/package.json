@@ -1,10 +1,11 @@
 {
   "name": "@telecom/e2e",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "scripts": {
     "test:e2e": "playwright test",
+    "test:simulator-production": "playwright test simulator-production.spec.ts",
     "screenshots": "playwright test screenshots.spec.ts"
   },
   "devDependencies": {

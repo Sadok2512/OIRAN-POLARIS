@@ -3,6 +3,13 @@
 All notable changes to the `apps/portal`, `apps/probe-manager`,
 `packages/ui`, `e2e` and `docs/frontend` scopes. Dates are UTC.
 
+## [e2e-0.1.1] – 2026-10-28 — Simulator production route correction
+
+- Version the authenticated Simulator 0.3.1 production check used during the API 0.12.1
+  maintenance. It uses the current BrowserRouter paths (`/simulator/settings`, `/nodes`,
+  `/scenarios`, `/ues`) and current headings (`Network Nodes`, `Scenarios`,
+  `UE Profile Manager`) without removing or weakening any authentication assertion.
+
 ## [0.3.0] – 2026-10-27 — PR #2 review corrections
 
 ### Fixed (P0)
