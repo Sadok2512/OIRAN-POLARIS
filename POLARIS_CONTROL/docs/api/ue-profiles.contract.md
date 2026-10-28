@@ -13,7 +13,7 @@ Operator or Administrator session and its CSRF header. Reads never expose SUPI, 
 | `PUT` | `/ue-profiles/:ue_id` | Replaces public fields on a stopped profile. The ID is immutable. All three secret fields may be `null` together to preserve existing material. |
 | `DELETE` | `/ue-profiles/:ue_id` | Deletes a stopped POLARIS-owned local profile and YAML. Does **not** delete an Open5GS subscription. |
 | `POST` | `/ue-profiles/:ue_id/clone` | Creates a stopped profile with a new UE ID, generated local SUPI/K/OPc and `PROVISIONING_REQUIRED`. |
-| `POST` | `/ue-profiles/bulk` | Creates exactly `10`, `100`, `1000` or `10000` local profiles; total registry capacity is `10000`; starts zero UEs. |
+| `POST` | `/ue-profiles/bulk` | Creates exactly `10`, `100`, `1000`, `10000` or `100000` local profiles; total registry capacity is `100000`; starts zero UEs. |
 | `GET` | `/ue-profiles/export.csv` | Sanitized CSV export. |
 | `GET` | `/ue-profiles/provisioning-slots` | Subscribers already provisioned in Open5GS (from the private V3.2 plan): slot id and bound UE only, never secrets. `503` with `PROVISIONING_SLOTS_UNAVAILABLE` / `SUBSCRIBER_PLAN_UNSAFE` / `SUBSCRIBER_PLAN_INVALID` when the plan cannot be used. |
 | `GET` | `/gnbs` | gNB registry a profile may name as `serving_gnb`: `{items:[{gnb_id,link_ip}], total, source}`; `source` is `LAB_DEFAULT` or `CONFIGURED_REGISTRY`. |
@@ -28,7 +28,7 @@ Create/replace input fields are `ue_id`, `name`, `supi`, `authentication_key`, `
 `plmn_mcc`, `plmn_mnc`, `dnn`, `sst`, `sd`, `serving_gnb`, `scenario_id`, and
 `auto_run_scenario`. `supi`, `authentication_key`, and `opc` are write-only.
 
-API 0.15.0 additionally accepts this protected subscriber-binding request on `POST /ue-profiles`:
+API 0.15.1 accepts this protected subscriber-binding request on `POST /ue-profiles`:
 
 ```json
 {"ue_id":"UE-11","gnb_id":"GNB-01","note":"Lab profile","imsi":"<15 digits; write-only>"}
@@ -46,8 +46,8 @@ ue_id,gnb_id,note,imsi
 ```
 
 At most 100,000 input rows are parsed and individually reported. The persistent profile registry
-still enforces its independently certified 10,000-profile capacity; excess rows return
-`UE_PROFILE_CAPACITY_REACHED` rather than being silently dropped.
+accepts at most 100,000 profiles; excess rows return `UE_PROFILE_CAPACITY_REACHED` rather than
+being silently dropped.
 
 On creation, `provisioning_slot` (for example `"UE-02"`) may replace the three secret fields:
 the backend then reads SUPI/K/OPc from the protected server-side plan. Sending a slot together
@@ -90,7 +90,7 @@ curl -sS 'http://127.0.0.1:49254/api/v1/ue-profiles?page=1&page_size=1&search=UE
 ```
 
 ```json
-{"items":[{"authentication_material":"PROTECTED","auto_run_scenario":false,"dnn":"internet","name":"Contract UE 11","pdu_session":{"dnn":"internet","type":"IPv4"},"plmn":{"mcc":"001","mnc":"01"},"profile":"ue-11.yaml","revision":1,"scenario_id":null,"serving_gnb":"GNB-01","snssai":{"sd":"010203","sst":1},"subscriber_identity":"PROTECTED","subscription_status":"PROVISIONING_REQUIRED","ue_id":"UE-11","updated_at_epoch_s":1793186621}],"max":10000,"page":1,"page_size":1,"pages":1,"secrets_exposed":false,"total":1}
+{"items":[{"authentication_material":"PROTECTED","auto_run_scenario":false,"dnn":"internet","name":"Contract UE 11","pdu_session":{"dnn":"internet","type":"IPv4"},"plmn":{"mcc":"001","mnc":"01"},"profile":"ue-11.yaml","revision":1,"scenario_id":null,"serving_gnb":"GNB-01","snssai":{"sd":"010203","sst":1},"subscriber_identity":"PROTECTED","subscription_status":"PROVISIONING_REQUIRED","ue_id":"UE-11","updated_at_epoch_s":1793186621}],"max":100000,"page":1,"page_size":1,"pages":1,"secrets_exposed":false,"total":1}
 ```
 
 ```bash

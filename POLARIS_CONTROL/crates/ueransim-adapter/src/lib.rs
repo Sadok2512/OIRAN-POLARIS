@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-pub const VERSION: &str = "0.4.0";
+pub const VERSION: &str = "0.5.0";
 /// Maximum number of persistent definitions. This is not a live execution limit.
-pub const MAX_CONFIGURABLE_UES: usize = 10_000;
+pub const MAX_CONFIGURABLE_UES: usize = 100_000;
 /// Certified maximum number of concurrently running controller-owned UEs.
 pub const MAX_LIVE_UES: usize = 10;
 pub const DEFAULT_PROFILE_SLOTS: usize = 10;
@@ -108,7 +108,7 @@ pub fn planned_profiles() -> Vec<UeProfileSpec> {
 pub fn is_approved_controller_ue(ue_id: &str) -> bool {
     let index = ue_id
         .strip_prefix("UE-")
-        .filter(|value| !value.is_empty() && value.len() <= 5)
+        .filter(|value| !value.is_empty() && value.len() <= 6)
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|index| (1..=MAX_CONFIGURABLE_UES).contains(index));
     index.is_some_and(|index| {
@@ -182,7 +182,7 @@ pub fn validate_provisioning_bindings(
 
 pub fn validate_profile_set(profiles: &[UeProfileSpec]) -> Result<(), String> {
     if profiles.len() > MAX_CONFIGURABLE_UES {
-        return Err("profile count must be between 0 and 10000".into());
+        return Err("profile count must be between 0 and 100000".into());
     }
     let mut ids = BTreeSet::new();
     let mut names = BTreeSet::new();
@@ -730,7 +730,8 @@ mod tests {
         .unwrap();
         assert_eq!(ue01.container_name, "polaris-control-ue-01");
         assert!(is_approved_controller_ue("UE-11"));
-        assert!(!is_approved_controller_ue("UE-10001"));
+        assert!(is_approved_controller_ue("UE-100000"));
+        assert!(!is_approved_controller_ue("UE-100001"));
         assert!(!is_approved_controller_ue("UE-2"));
     }
 

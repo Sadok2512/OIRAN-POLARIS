@@ -127,7 +127,7 @@ impl MongoSubscriberBackend {
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|_| "OPEN5GS_DATABASE_UNAVAILABLE")?;
         child
@@ -140,6 +140,23 @@ impl MongoSubscriberBackend {
             .wait_with_output()
             .map_err(|_| "OPEN5GS_DATABASE_UNAVAILABLE")?;
         if !output.status.success() {
+            #[cfg(test)]
+            {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let class = [
+                    "SyntaxError",
+                    "TypeError",
+                    "MongoServerError",
+                    "ReferenceError",
+                ]
+                .into_iter()
+                .find(|candidate| stderr.contains(candidate))
+                .unwrap_or("UNCLASSIFIED");
+                eprintln!(
+                    "MONGOSH_FAILURE_EXIT={:?} ERROR_CLASS={class}",
+                    output.status.code()
+                );
+            }
             return Err("OPEN5GS_DATABASE_OPERATION_FAILED".into());
         }
         let line = String::from_utf8(output.stdout)
@@ -233,11 +250,11 @@ impl MongoSubscriberBackend {
             ambr: SubscriberAmbr {
                 uplink: value
                     .pointer("/ambr/uplink/value")
-                    .and_then(Value::as_u64)
+                    .and_then(json_u64)
                     .ok_or("OPEN5GS_SUBSCRIBER_INVALID")?,
                 downlink: value
                     .pointer("/ambr/downlink/value")
-                    .and_then(Value::as_u64)
+                    .and_then(json_u64)
                     .ok_or("OPEN5GS_SUBSCRIBER_INVALID")?,
             },
         };
@@ -298,12 +315,14 @@ impl SubscriberBackend for MongoSubscriberBackend {
         let script = format!(
             r#"
 const requested={payload}; const mcc={mcc}; const mnc={mnc}; const results=[];
+const template=db.subscribers.findOne({{}},{{mme_realm:1}});
+const mmeRealm=template&&typeof template.mme_realm==="string"?template.mme_realm:"";
 for (const x of requested) {{
   const existing=db.subscribers.findOne({{imsi:x.imsi}});
-  if (existing) {{ results.push({{row:x.row,ok:false,error:existing.polaris&&existing.polaris.owned===true?\"SUBSCRIBER_ALREADY_EXISTS\":\"SUBSCRIBER_NOT_POLARIS_OWNED\"}}); continue; }}
+  if (existing) {{ results.push({{row:x.row,ok:false,error:existing.polaris&&existing.polaris.owned===true?"SUBSCRIBER_ALREADY_EXISTS":"SUBSCRIBER_NOT_POLARIS_OWNED"}}); continue; }}
   const sessions=x.dnns.map(name=>({{name,type:NumberInt(3),qos:{{index:NumberInt(9),arp:{{priority_level:NumberInt(8),pre_emption_capability:NumberInt(1),pre_emption_vulnerability:NumberInt(2)}}}},ambr:{{downlink:{{value:NumberLong(x.ambr.downlink),unit:NumberInt(0)}},uplink:{{value:NumberLong(x.ambr.uplink),unit:NumberInt(0)}}}},pcc_rule:[],_id:new ObjectId()}}));
-  const doc={{schema_version:NumberInt(1),imsi:x.imsi,msisdn:[],imeisv:[],mme_host:[],mm_realm:[],purge_flag:[],slice:[{{sst:NumberInt(x.sst),sd:x.sd,default_indicator:true,session:sessions,_id:new ObjectId()}}],security:{{k:x.k,op:null,opc:x.opc,amf:\"8000\"}},ambr:{{downlink:{{value:NumberLong(x.ambr.downlink),unit:NumberInt(0)}},uplink:{{value:NumberLong(x.ambr.uplink),unit:NumberInt(0)}}}},access_restriction_data:NumberInt(32),network_access_mode:NumberInt(0),subscriber_status:NumberInt(0),operator_determined_barring:NumberInt(0),subscribed_rau_tau_timer:NumberInt(12),polaris:{{owned:true,slot:x.slot,plmn_mcc:mcc,plmn_mnc:mnc}},__v:NumberInt(0)}};
-  try {{ db.subscribers.insertOne(doc); results.push({{row:x.row,ok:true,slot:x.slot}}); }} catch (_) {{ results.push({{row:x.row,ok:false,error:\"SUBSCRIBER_WRITE_FAILED\"}}); }}
+  const doc={{schema_version:NumberInt(1),imsi:x.imsi,msisdn:[],imeisv:[],mme_host:[],mm_realm:[],mme_realm:mmeRealm,mme_timestamp:NumberLong(0),purge_flag:[],slice:[{{sst:NumberInt(x.sst),sd:x.sd,default_indicator:true,session:sessions,_id:new ObjectId()}}],security:{{k:x.k,op:null,opc:x.opc,amf:"8000"}},ambr:{{downlink:{{value:NumberLong(x.ambr.downlink),unit:NumberInt(0)}},uplink:{{value:NumberLong(x.ambr.uplink),unit:NumberInt(0)}}}},access_restriction_data:NumberInt(32),network_access_mode:NumberInt(0),subscriber_status:NumberInt(0),operator_determined_barring:NumberInt(0),subscribed_rau_tau_timer:NumberInt(12),polaris:{{owned:true,slot:x.slot,plmn_mcc:mcc,plmn_mnc:mnc}},__v:NumberInt(0)}};
+  try {{ db.subscribers.insertOne(doc); results.push({{row:x.row,ok:true,slot:x.slot}}); }} catch (_) {{ results.push({{row:x.row,ok:false,error:"SUBSCRIBER_WRITE_FAILED"}}); }}
 }}
 print(JSON.stringify(results));
 "#
@@ -468,6 +487,21 @@ fn validate_plmn(mcc: &str, mnc: &str) -> Result<(), String> {
         Err("PLMN_INVALID".into())
     }
 }
+fn json_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| {
+            value
+                .get("$numberLong")
+                .and_then(Value::as_str)
+                .and_then(|number| number.parse().ok())
+        })
+        .or_else(|| {
+            let high = value.get("high")?.as_i64()?;
+            let low = value.get("low")?.as_i64()?;
+            (high >= 0).then(|| ((high as u64) << 32) | u64::from(low as u32))
+        })
+}
 fn slot_for(imsi: &str) -> String {
     let digest = format!("{:x}", Sha256::digest(imsi.as_bytes()));
     format!("SUB-{}", &digest[..12])
@@ -562,5 +596,19 @@ mod tests {
         assert_eq!(store.backup_count(), 0);
         assert!(store.provision_batch(vec![(1, row)]).unwrap()[0].ok);
         assert_eq!(store.backup_count(), 1);
+    }
+
+    #[test]
+    fn mongo_long_json_forms_decode_without_precision_loss() {
+        assert_eq!(json_u64(&json!(42)), Some(42));
+        assert_eq!(
+            json_u64(&json!({"$numberLong":"4294967297"})),
+            Some(4_294_967_297)
+        );
+        assert_eq!(
+            json_u64(&json!({"high":1,"low":1,"unsigned":false})),
+            Some(4_294_967_297)
+        );
+        assert_eq!(json_u64(&json!({"high":-1,"low":1,"unsigned":false})), None);
     }
 }

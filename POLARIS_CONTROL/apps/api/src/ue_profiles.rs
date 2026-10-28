@@ -345,19 +345,28 @@ impl ProfileStore {
         let mut candidate = registry.clone();
         let mut records = Vec::with_capacity(inputs.len());
         let mut staged = Vec::with_capacity(inputs.len());
+        let mut profile_ids = candidate
+            .profiles
+            .iter()
+            .map(|record| record.profile.ue_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut subscriber_identities = candidate
+            .profiles
+            .iter()
+            .filter(|record| record.subscriber_identity_sha256 != "0".repeat(64))
+            .map(|record| record.subscriber_identity_sha256.clone())
+            .collect::<BTreeSet<_>>();
         let generation = random_hex(8);
         for input in inputs {
-            if candidate
-                .profiles
-                .iter()
-                .any(|record| record.profile.ue_id == input.ue_id)
-            {
+            if !profile_ids.insert(input.ue_id.clone()) {
                 return Err("UE_PROFILE_ALREADY_EXISTS".into());
             }
             let secrets = self.creation_secrets(&input)?;
             let mut record = self.build_record(input, &secrets, 1, epoch_seconds())?;
             record.profile.subscription_verified = true;
-            self.ensure_identity_unique(&candidate, &record.subscriber_identity_sha256, None)?;
+            if !subscriber_identities.insert(record.subscriber_identity_sha256.clone()) {
+                return Err("DUPLICATE_SUBSCRIBER_IDENTITY".into());
+            }
             let yaml = render_profile_with_gnbs(
                 &record.profile,
                 UeSecrets {
@@ -418,7 +427,7 @@ impl ProfileStore {
         registry: &mut UeProfileRegistry,
         input: BulkProfileInput,
     ) -> Result<Vec<ManagedUeProfile>, String> {
-        if !matches!(input.count, 10 | 100 | 1_000 | 10_000)
+        if !matches!(input.count, 10 | 100 | 1_000 | 10_000 | 100_000)
             || registry.profiles.len().saturating_add(input.count)
                 > ueransim_adapter::MAX_CONFIGURABLE_UES
         {
@@ -769,7 +778,7 @@ fn required_secrets(input: &ProfileMutationInput) -> Result<(String, String, Str
 fn parse_ue_index(ue_id: &str) -> Result<usize, String> {
     let index = ue_id
         .strip_prefix("UE-")
-        .filter(|value| !value.is_empty() && value.len() <= 5)
+        .filter(|value| !value.is_empty() && value.len() <= 6)
         .and_then(|value| value.parse::<usize>().ok())
         .ok_or("UE_ID_INVALID")?;
     if !(1..=ueransim_adapter::MAX_CONFIGURABLE_UES).contains(&index) {
@@ -1094,6 +1103,66 @@ mod tests {
                 .collect::<BTreeSet<_>>()
                 .len(),
             10_000
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual 100000-profile persistence benchmark"]
+    fn hundred_thousand_profiles_bulk_persist_and_reload_with_measurements() {
+        fn rss_kib() -> u64 {
+            fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|document| {
+                    document
+                        .lines()
+                        .find(|line| line.starts_with("VmRSS:"))
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap_or(0)
+        }
+
+        let store = temp_store("bulk-100k");
+        let root = store.profile_root.parent().unwrap().to_path_buf();
+        let mut registry = UeProfileRegistry {
+            schema_version: 1,
+            profiles: vec![],
+        };
+        let rss_before = rss_kib();
+        let bulk_started = std::time::Instant::now();
+        let created = store
+            .create_bulk(
+                &mut registry,
+                BulkProfileInput {
+                    count: 100_000,
+                    name_prefix: "BENCH UE".into(),
+                    plmn_mcc: "001".into(),
+                    plmn_mnc: "01".into(),
+                    dnn: "internet".into(),
+                    sst: 1,
+                    sd: Some("010203".into()),
+                    serving_gnb: "GNB-01".into(),
+                    scenario_id: Some("scenario-capacity".into()),
+                },
+            )
+            .unwrap();
+        let bulk_ms = bulk_started.elapsed().as_millis();
+        let rss_after_bulk = rss_kib();
+        assert_eq!(created.len(), 100_000);
+        assert_eq!(registry.profiles.len(), 100_000);
+        assert_eq!(registry.profiles[99_999].profile.ue_id, "UE-100000");
+        assert!(store.profile_root.join("ue-100000.yaml").is_file());
+
+        drop(created);
+        drop(registry);
+        let load_started = std::time::Instant::now();
+        let recovered = store.load_or_bootstrap(vec![]).unwrap();
+        let load_ms = load_started.elapsed().as_millis();
+        assert_eq!(recovered.profiles.len(), 100_000);
+        eprintln!(
+            "PROFILE_100K_BULK_MS={bulk_ms} PROFILE_100K_LOAD_MS={load_ms} RSS_BEFORE_KIB={rss_before} RSS_AFTER_BULK_KIB={rss_after_bulk} RSS_AFTER_LOAD_KIB={}",
+            rss_kib()
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -55,7 +55,7 @@ use ueransim_adapter::{
 
 pub use ue_profiles::UeProfileRegistry;
 
-pub const VERSION: &str = "0.15.0";
+pub const VERSION: &str = "0.15.1";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -3005,36 +3005,38 @@ async fn list_ue_profiles(
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    let filtered = registry
-        .profiles
-        .iter()
-        .filter(|record| {
-            let matches_search = search.is_empty()
-                || record.profile.ue_id.to_ascii_lowercase().contains(&search)
-                || record
-                    .profile
-                    .pseudonym
-                    .to_ascii_lowercase()
-                    .contains(&search);
-            let matches_scenario = query.scenario_id.as_ref().map_or(true, |scenario| {
-                record.scenario_id.as_deref() == Some(scenario.as_str())
-            });
-            let matches_status =
-                query
-                    .subscription_status
-                    .as_deref()
-                    .map_or(true, |status| match status {
-                        "VERIFIED" => record.profile.subscription_verified,
-                        "PROVISIONING_REQUIRED" => !record.profile.subscription_verified,
-                        _ => false,
-                    });
-            matches_search && matches_scenario && matches_status
-        })
-        .collect::<Vec<_>>();
-    let total = filtered.len();
     let offset = (page - 1).saturating_mul(page_size);
+    let mut total = 0usize;
+    let mut items = Vec::with_capacity(page_size);
+    for record in &registry.profiles {
+        let matches_search = search.is_empty()
+            || record.profile.ue_id.to_ascii_lowercase().contains(&search)
+            || record
+                .profile
+                .pseudonym
+                .to_ascii_lowercase()
+                .contains(&search);
+        let matches_scenario = query.scenario_id.as_ref().map_or(true, |scenario| {
+            record.scenario_id.as_deref() == Some(scenario.as_str())
+        });
+        let matches_status =
+            query
+                .subscription_status
+                .as_deref()
+                .map_or(true, |status| match status {
+                    "VERIFIED" => record.profile.subscription_verified,
+                    "PROVISIONING_REQUIRED" => !record.profile.subscription_verified,
+                    _ => false,
+                });
+        if matches_search && matches_scenario && matches_status {
+            if total >= offset && items.len() < page_size {
+                items.push(managed_profile_json(record));
+            }
+            total += 1;
+        }
+    }
     Json(json!({
-        "items":filtered.into_iter().skip(offset).take(page_size).map(managed_profile_json).collect::<Vec<_>>(),
+        "items":items,
         "total":total,
         "page":page,
         "page_size":page_size,
@@ -7759,6 +7761,187 @@ mod p0_tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "manual isolated restored MongoDB contract validation"]
+    async fn restored_open5gs_copy_accepts_provisioning_without_secret_disclosure() {
+        let container = std::env::var("POLARIS_TEST_MONGODB_CONTAINER")
+            .expect("POLARIS_TEST_MONGODB_CONTAINER is required");
+        let root = PathBuf::from(format!(
+            "/root/.hermes/cache/scratch/polaris-mongo-copy-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        std::env::set_var("POLARIS_OPEN5GS_MONGODB_CONTAINER", &container);
+        std::env::set_var("POLARIS_SUBSCRIBER_BACKUP_ROOT", root.join("backups"));
+
+        let output = Command::new("/usr/bin/docker")
+            .args([
+                "exec",
+                container.as_str(),
+                "mongosh",
+                "--quiet",
+                "open5gs",
+                "--eval",
+                "const x=db.subscribers.findOne({$or:[{'polaris.owned':{$ne:true}},{polaris:{$exists:false}}]},{imsi:1});if(x)print(x.imsi)",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let non_polaris_identity = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        assert_eq!(non_polaris_identity.len(), 15);
+
+        let mut test_state = state();
+        test_state.subscriber_backend = Arc::new(MongoSubscriberBackend::from_env().unwrap());
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let key = "55".repeat(16);
+        let opc = "66".repeat(16);
+        let single_identity = "999980000000000";
+        let single_payload = json!({"imsi":single_identity,"k":key,"opc":opc,"sst":1,"sd":"010203","dnns":["internet","ims"],"ambr":{"uplink":1000000,"downlink":2000000}});
+        let created = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/subscribers")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(single_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created_status = created.status();
+        let created_body = String::from_utf8(
+            to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            created_status,
+            StatusCode::CREATED,
+            "safe backend error: {}",
+            serde_json::from_str::<Value>(&created_body)
+                .ok()
+                .and_then(|value| value["error"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "UNCLASSIFIED".into())
+        );
+        assert!(!created_body.contains(single_identity));
+        assert!(!created_body.contains(&key));
+        assert!(!created_body.contains(&opc));
+
+        let conflict_payload = json!({"imsi":non_polaris_identity,"k":"77".repeat(16),"opc":"88".repeat(16),"sst":1,"sd":"010203","dnns":["internet"],"ambr":{"uplink":1000000,"downlink":2000000}});
+        let conflict = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/subscribers")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(conflict_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict_body = String::from_utf8(
+            to_bytes(conflict.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&conflict_body).unwrap()["error"],
+            "SUBSCRIBER_NOT_POLARIS_OWNED"
+        );
+        assert!(!conflict_body.contains(&non_polaris_identity));
+
+        let mut csv = String::from("imsi,k,opc,sst,sd,dnns,ambr_uplink,ambr_downlink\n");
+        for index in 0..1_000 {
+            csv.push_str(&format!(
+                "99999{index:010},{},{},1,010203,internet,1000000,2000000\n",
+                "99".repeat(16),
+                "aa".repeat(16)
+            ));
+        }
+        let bulk = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/subscribers/bulk")
+                    .header(header::CONTENT_TYPE, "text/csv")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(csv))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bulk.status(), StatusCode::OK);
+        let bulk_body = String::from_utf8(
+            to_bytes(bulk.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let bulk_json: Value = serde_json::from_str(&bulk_body).unwrap();
+        assert_eq!(bulk_json["ok"], 1_000);
+        assert_eq!(bulk_json["errors"], 0);
+        assert!(!bulk_body.contains("999990000000000"));
+        assert!(!bulk_body.contains(&"99".repeat(16)));
+
+        let profile = application.clone().oneshot(Request::builder().method(Method::POST).uri("/api/v1/ue-profiles").header(header::CONTENT_TYPE,"application/json").header(header::COOKIE,&cookie).header("x-csrf-token",&csrf).body(Body::from(json!({"ue_id":"UE-99999","gnb_id":"GNB-01","note":"Isolated copy validation","imsi":single_identity}).to_string())).unwrap()).await.unwrap();
+        let profile_status = profile.status();
+        let profile_body = String::from_utf8(
+            to_bytes(profile.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            profile_status,
+            StatusCode::CREATED,
+            "safe profile error: {}",
+            serde_json::from_str::<Value>(&profile_body)
+                .ok()
+                .and_then(|value| value["error"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "UNCLASSIFIED".into())
+        );
+        assert!(!profile_body.contains(single_identity));
+
+        let unknown = application.clone().oneshot(Request::builder().method(Method::POST).uri("/api/v1/ue-profiles").header(header::CONTENT_TYPE,"application/json").header(header::COOKIE,&cookie).header("x-csrf-token",&csrf).body(Body::from(json!({"ue_id":"UE-99998","gnb_id":"GNB-01","note":"Unknown","imsi":"999970000000000"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(unknown.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let unknown_body = String::from_utf8(
+            to_bytes(unknown.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&unknown_body).unwrap()["error"],
+            "SUBSCRIBER_NOT_PROVISIONED"
+        );
+        assert!(!unknown_body.contains("999970000000000"));
+
+        let backups = fs::read_dir(root.join("backups")).unwrap().count();
+        assert_eq!(backups, 3);
+        eprintln!("ISOLATED_MONGO_SINGLE=201 BULK_OK=1000 NON_POLARIS=409 UNKNOWN_IMSI=422 BACKUPS={backups} SECRETS_EXPOSED=false");
+        std::env::remove_var("POLARIS_OPEN5GS_MONGODB_CONTAINER");
+        std::env::remove_var("POLARIS_SUBSCRIBER_BACKUP_ROOT");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn one_hundred_thousand_row_csv_contracts_are_bounded_and_measured() {
         fn rss_kib() -> u64 {
@@ -9076,7 +9259,7 @@ mod p0_tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(value["planned_count"], 10);
-        assert_eq!(value["max_configurable"], 10_000);
+        assert_eq!(value["max_configurable"], 100_000);
         assert!(value["configured_profiles"]
             .as_array()
             .unwrap()
@@ -9587,6 +9770,84 @@ mod p0_tests {
         assert!(body["total"].as_u64().unwrap() >= 4);
         assert_eq!(body["items"].as_array().unwrap().len(), 3);
         assert!(body.to_string().find("authentication_key").is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "manual 100000-profile pagination benchmark"]
+    async fn hundred_thousand_profile_inventory_is_paginated_and_searchable() {
+        fn rss_kib() -> u64 {
+            fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|document| {
+                    document
+                        .lines()
+                        .find(|line| line.starts_with("VmRSS:"))
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap_or(0)
+        }
+        let test_state = state();
+        let now = epoch_seconds();
+        let rss_before = rss_kib();
+        let build_started = std::time::Instant::now();
+        let records = (1..=100_000)
+            .map(|index| {
+                let ue_id = if index <= 99 {
+                    format!("UE-{index:02}")
+                } else {
+                    format!("UE-{index:05}")
+                };
+                ManagedUeProfile {
+                    profile: ueransim_adapter::UeProfileSpec {
+                        ue_id: ue_id.clone(),
+                        pseudonym: format!("BENCH-{index:06}"),
+                        profile_name: format!("ue-{index:05}.yaml"),
+                        serving_gnb: "GNB-01".into(),
+                        plmn_mcc: "001".into(),
+                        plmn_mnc: "01".into(),
+                        dnn: "internet".into(),
+                        sst: 1,
+                        sd: Some("010203".into()),
+                        configured: true,
+                        subscription_verified: true,
+                    },
+                    subscriber_identity_sha256: format!("{index:064x}"),
+                    scenario_id: None,
+                    auto_run_scenario: false,
+                    revision: 1,
+                    created_at_epoch_s: now,
+                    updated_at_epoch_s: now,
+                }
+            })
+            .collect::<Vec<_>>();
+        let build_ms = build_started.elapsed().as_millis();
+        *test_state.profile_registry.lock().unwrap() = UeProfileRegistry {
+            schema_version: 1,
+            profiles: records,
+        };
+        let application = app(test_state);
+        let get_started = std::time::Instant::now();
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ue-profiles?page=200&page_size=500&search=UE-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let get_ms = get_started.elapsed().as_millis();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["total"], 100_000);
+        assert_eq!(body["items"].as_array().unwrap().len(), 500);
+        eprintln!(
+            "PROFILE_100K_BUILD_MS={build_ms} PROFILE_100K_GET_MS={get_ms} RSS_BEFORE_KIB={rss_before} RSS_AFTER_GET_KIB={}",
+            rss_kib()
+        );
     }
 
     fn profile_http_input(ue_id: &str, supi: &str, name: &str) -> Value {

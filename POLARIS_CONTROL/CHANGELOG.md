@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.15.1 (polaris-control-api)
+
+- Patch: raise the persistent UE profile registry ceiling to 100,000 while retaining the
+  independently bounded live-UE limit, server-side pagination, search and atomic persistence.
+- Validation: benchmark 100,000-profile bulk persistence/reload and paginated search, and exercise
+  the production MongoDB adapter against an isolated restored Open5GS copy.
+
 ## 0.15.0 (polaris-control-api)
 
 - Minor: add Operator/CSRF-protected Open5GS subscriber provisioning with mandatory protected
