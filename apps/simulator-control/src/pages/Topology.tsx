@@ -4,6 +4,7 @@ import { PageHeader } from '@/ui/PageHeader';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import { EmptyState, ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
 import { useLabObserved, useNodes, useUes, type WireLabObserved } from '@/data/queries';
+import type { NodeItem } from '@/data/polarisTypes';
 
 // 3GPP core NFs we observe through container_status in POLARIS /lab.
 // The backend reports `open5gs` as a single aggregate container (the
@@ -45,7 +46,7 @@ export function TopologyPage() {
       <PageHeader
         eyebrow="Network"
         title="Topology"
-        description="Core, radio and UEs as POLARIS reports them. Links are shown as 'up' only when backend state proves it; nothing is simulated client-side."
+        description="Core, radio and UEs as POLARIS reports them. Interface links are marked 'configured' when the backend process is running AND an endpoint is advertised; 'down' when the process isn't running; 'unknown' when no endpoint is advertised. NG Setup stays 'unknown' until a dedicated backend route proves it."
         actions={
           <StatusIndicator
             state={openCore.state}
@@ -76,9 +77,9 @@ export function TopologyPage() {
             <header className="flex items-center justify-between gap-2 mb-3">
               <div className="flex items-center gap-2">
                 <Cpu className="text-primary" width={18} height={18} />
-                <h2 className="text-ep-md font-semibold">5G Core · Open5GS</h2>
+                <h2 className="text-ep-md font-semibold">5G Core</h2>
               </div>
-              <StatusIndicator state={openCore.state} tone={openCore.tone} compact />
+              <StatusIndicator state={openCore.state} tone={openCore.tone} label={openCore.label} compact />
             </header>
             <div className="grid grid-cols-2 md:grid-cols-6 gap-2 text-ep-sm">
               {CORE_NF_ROWS.map((row) => (
@@ -100,7 +101,7 @@ export function TopologyPage() {
                     title={
                       row.key === 'AMF'
                         ? openCore.label
-                        : 'not exposed by /lab (observed only on container "open5gs")'
+                        : 'not exposed by /lab (observed only on container "oiran-lab-amf-1")'
                     }
                   />
                 </div>
@@ -108,8 +109,9 @@ export function TopologyPage() {
             </div>
             <p className="text-ep-xs text-text-secondary mt-2 flex items-start gap-1">
               <AlertTriangle width={11} height={11} className="mt-0.5 shrink-0" />
-              POLARIS /lab reports a single aggregated container{' '}
-              <code className="mono mx-1">open5gs</code>. Per-NF health is not exposed yet.
+              POLARIS /lab reports a single aggregated container
+              <code className="mono mx-1">oiran-lab-amf-1</code> under <code className="mono">observed.open5gs</code>.
+              AMF reflects that container; every other NF stays "not exposed" until the backend splits them.
             </p>
           </article>
 
@@ -144,12 +146,7 @@ export function TopologyPage() {
                     <StatusIndicator state={node.process_state ?? 'UNKNOWN'} compact />
                   </header>
 
-                  <LinkRail
-                    n2Up={isLinkUp(node.process_state, node.n2_endpoint)}
-                    n3Up={isLinkUp(node.process_state, node.n3_endpoint)}
-                    n2Endpoint={node.n2_endpoint}
-                    n3Endpoint={node.n3_endpoint}
-                  />
+                  <LinkRail node={node} />
 
                   <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-ep-xs">
                     <dt className="text-text-secondary">PLMN</dt>
@@ -199,7 +196,9 @@ export function TopologyPage() {
 
           <p className="text-ep-xs text-text-secondary">
             Each UE searches only for its serving gNB (<span className="mono">gnbSearchList</span>). UERANSIM has no
-            handover, so a UE stays on its gNB. "NGAP: unknown" means POLARIS has not yet reported an NG Setup result.
+            handover, so a UE stays on its gNB. The link labels say "configured" (process running + endpoint known),
+            "down" (process not running), or "unknown" (no endpoint reported). NG Setup success stays "unknown" until
+            a dedicated backend route proves it.
           </p>
         </section>
       )}
@@ -207,41 +206,58 @@ export function TopologyPage() {
   );
 }
 
-export function isLinkUp(processState: string | null | undefined, endpoint: string | null): boolean {
-  if (!endpoint) return false;
-  return (processState ?? '').toUpperCase() === 'RUNNING';
+export type LinkState = 'configured' | 'down' | 'unknown';
+
+/**
+ * Translate the backend fields into one of three honest states:
+ *   configured — process is running AND an endpoint IP is reported;
+ *   down       — process is not running;
+ *   unknown    — no endpoint is reported (the UI can't name the link).
+ *
+ * "configured" never means "NGAP OK": the backend has no NG-Setup result
+ * yet, so the UI will never say "UP". Even for a running gNB the link
+ * stays "configured" until a dedicated route proves otherwise.
+ */
+export function linkState(
+  processState: string | null | undefined,
+  endpoint: string | null,
+): LinkState {
+  if (!endpoint) return 'unknown';
+  if ((processState ?? '').toLowerCase() !== 'running') return 'down';
+  return 'configured';
 }
 
-function LinkRail({
-  n2Up,
-  n3Up,
-  n2Endpoint,
-  n3Endpoint,
-}: {
-  n2Up: boolean;
-  n3Up: boolean;
-  n2Endpoint: string | null;
-  n3Endpoint: string | null;
-}) {
+const LTE_LABELS = {
+  controlPlane: 'S1-MME · S1AP',
+  userPlane: 'S1-U · GTP-U',
+};
+const NR_LABELS = {
+  controlPlane: 'N2 · NGAP',
+  userPlane: 'N3 · GTP-U',
+};
+
+function LinkRail({ node }: { node: NodeItem }) {
+  const labels = node.technology === 'LTE' ? LTE_LABELS : NR_LABELS;
   return (
-    <div className="flex gap-3 text-ep-xs" data-testid="link-rail">
+    <div className="flex gap-3 text-ep-xs flex-wrap" data-testid="link-rail">
       <LinkLabel
-        label="N2 · NGAP"
-        state={n2Endpoint ? (n2Up ? 'UP' : 'DOWN') : 'unknown'}
+        label={labels.controlPlane}
+        state={linkState(node.process_state, node.n2_endpoint)}
       />
       <LinkLabel
-        label="N3 · GTP-U"
-        state={n3Endpoint ? (n3Up ? 'UP' : 'DOWN') : 'unknown'}
+        label={labels.userPlane}
+        state={linkState(node.process_state, node.n3_endpoint)}
       />
     </div>
   );
 }
 
-function LinkLabel({ label, state }: { label: string; state: 'UP' | 'DOWN' | 'unknown' }) {
-  const tone = state === 'UP' ? 'success' : state === 'DOWN' ? 'danger' : 'neutral';
+function LinkLabel({ label, state }: { label: string; state: LinkState }) {
+  const tone =
+    state === 'configured' ? 'success' : state === 'down' ? 'danger' : 'neutral';
   return (
-    <span className="flex items-center gap-1">
-      <StatusIndicator state={state} tone={tone === 'neutral' ? 'neutral' : tone} compact />
+    <span className="flex items-center gap-1" data-testid={`link-${label}`}>
+      <StatusIndicator state={state} tone={tone} compact />
       <span className="mono text-text-secondary">{label}</span>
     </span>
   );
@@ -252,26 +268,23 @@ function containerTone(container: WireLabObserved['open5gs']): {
   tone: 'success' | 'warning' | 'danger' | 'neutral';
   label: string;
 } {
+  // The /lab endpoint reports a single container "oiran-lab-amf-1" under
+  // observed.open5gs. The badge must name AMF, not an aggregate "core".
   if (!container) {
     return {
       state: 'UNKNOWN',
       tone: 'neutral',
-      label: 'open5gs container not reported by /lab',
-    };
-  }
-  if (container.process_state === 'running' && container.health === 'healthy') {
-    return { state: 'HEALTHY', tone: 'success', label: 'open5gs: running, healthy' };
-  }
-  if (container.process_state === 'running') {
-    return {
-      state: 'DEGRADED',
-      tone: 'warning',
-      label: `open5gs: running, health=${container.health}`,
+      label: 'AMF container: not reported by /lab',
     };
   }
   return {
-    state: (container.process_state || 'UNKNOWN').toUpperCase(),
-    tone: 'danger',
-    label: `open5gs process_state=${container.process_state}`,
+    state: `${container.process_state}/${container.health}`,
+    tone:
+      container.process_state === 'running' && container.health === 'healthy'
+        ? 'success'
+        : container.process_state === 'running'
+          ? 'warning'
+          : 'danger',
+    label: `AMF container: ${container.process_state}, ${container.health}`,
   };
 }

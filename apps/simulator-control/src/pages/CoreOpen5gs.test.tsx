@@ -72,6 +72,19 @@ describe('Core · Open5GS', () => {
     expect(screen.getByTestId('core-restart-SMF')).toBeDisabled();
   });
 
+  it('renders the "AMF container: running, healthy" badge at the page header (0.4.1)', async () => {
+    stub();
+    renderPage();
+    const header = await screen.findByTestId('page-header');
+    await waitFor(() => {
+      expect(header.textContent).toMatch(/AMF container: running, healthy/);
+    });
+    expect(header.textContent).toMatch(/\/lab\.observed\.open5gs/);
+    expect(header.textContent).toMatch(/oiran-lab-amf-1/);
+    // The old "5G Core HEALTHY" aggregate wording must be gone.
+    expect(header.textContent).not.toMatch(/5G Core HEALTHY/);
+  });
+
   it('config tab reads /capabilities values and keeps the Edit button locked', async () => {
     stub();
     const user = userEvent.setup();

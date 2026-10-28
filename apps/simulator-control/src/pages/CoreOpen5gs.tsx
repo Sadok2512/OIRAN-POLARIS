@@ -32,6 +32,7 @@ export function CoreOpen5gsPage() {
   const slots = useProvisioningSlots();
 
   const openCore = lab.data?.observed?.open5gs;
+  const amfBadge = amfContainerBadge(openCore);
 
   return (
     <>
@@ -40,11 +41,16 @@ export function CoreOpen5gsPage() {
         title="Core · Open5GS"
         description="Read-only observation of the 5G core. NF restart, configuration edits and subscriber writes are deferred to V2 — the UI never issues a write."
         actions={
-          <StatusIndicator
-            state={lab.data?.source ?? 'UNKNOWN'}
-            tone="neutral"
-            label={`source: ${lab.data?.source ?? 'not exposed'}`}
-          />
+          <div className="flex items-center gap-2">
+            <StatusIndicator
+              state={amfBadge.state}
+              tone={amfBadge.tone}
+              label={amfBadge.label}
+            />
+            <span className="text-ep-xs text-text-secondary">
+              source · <code className="mono">/lab.observed.open5gs</code> = oiran-lab-amf-1
+            </span>
+          </div>
         }
       />
 
@@ -293,4 +299,23 @@ function containerTone(container: WireContainerStatus): 'success' | 'warning' | 
   if (container.process_state === 'running' && container.health === 'healthy') return 'success';
   if (container.process_state === 'running') return 'warning';
   return 'danger';
+}
+
+function amfContainerBadge(container: WireContainerStatus | undefined): {
+  state: string;
+  tone: 'success' | 'warning' | 'danger' | 'neutral';
+  label: string;
+} {
+  if (!container) {
+    return {
+      state: 'UNKNOWN',
+      tone: 'neutral',
+      label: 'AMF container: not reported by /lab',
+    };
+  }
+  return {
+    state: `${container.process_state}/${container.health}`,
+    tone: containerTone(container),
+    label: `AMF container: ${container.process_state}, ${container.health}`,
+  };
 }

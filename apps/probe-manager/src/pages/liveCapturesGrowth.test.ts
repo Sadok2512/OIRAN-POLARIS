@@ -83,9 +83,14 @@ describe('isStalled', () => {
     expect(isStalled('CAPTURING', { bytes: 0, windowMs: 9_999, sizeKnown: true })).toBe(false);
   });
 
-  it('is true for STARTING / STOPPING even without a window', () => {
-    expect(isStalled('STARTING', { bytes: null, windowMs: 0, sizeKnown: true })).toBe(true);
-    expect(isStalled('STOPPING', { bytes: 100, windowMs: 10_000, sizeKnown: true })).toBe(true);
+  it('is NOT stalled while STARTING or STOPPING — transition states are shown as-is', () => {
+    // These states are a legitimate backend transition, not a sign of trouble.
+    // Only a measured 0 B / ≥ 10 s window qualifies as stalled.
+    expect(isStalled('STARTING', { bytes: null, windowMs: 0, sizeKnown: true })).toBe(false);
+    expect(isStalled('STARTING', { bytes: 500, windowMs: 10_000, sizeKnown: true })).toBe(false);
+    expect(isStalled('STOPPING', { bytes: 500, windowMs: 10_000, sizeKnown: true })).toBe(false);
+    // But STOPPING with 0 B over ≥ 10 s is still stalled (growth is the authority).
+    expect(isStalled('STOPPING', { bytes: 0, windowMs: 10_000, sizeKnown: true })).toBe(true);
   });
 
   it('is false when the capture has growth within the window', () => {

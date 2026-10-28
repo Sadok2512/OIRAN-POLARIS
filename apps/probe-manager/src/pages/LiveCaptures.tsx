@@ -18,7 +18,6 @@ import {
 import type { Capture } from '@shared/types';
 
 const ACTIVE_STATES = ['READY', 'STARTING', 'CAPTURING', 'STOPPING'];
-const STALL_STATES = ['STOPPING', 'STARTING'];
 // Reason strings surfaced in the UI (never fabricated — these are the
 // backend gaps declared in docs/ui-mockups/README.md).
 const START_LOCKED_REASON = 'Live start is disabled in this build (no mutating route exercised).';
@@ -77,12 +76,13 @@ export function computeGrowth(samples: GrowthSample[]): GrowthReading {
 }
 
 /**
- * A capture is "stalled" when either the backend state is a transition
- * state (STARTING / STOPPING) OR we have a complete 10 s window with 0 B
- * of growth. "Not yet measured" is NEVER stalled.
+ * A capture is "stalled" when and only when we have a complete 10 s
+ * window with 0 B of growth. Transition states (STARTING / STOPPING)
+ * are rendered as-is through the StatusIndicator — they are a legitimate
+ * backend state, not a sign of trouble, so they never count as stalled.
+ * "Not yet measured" and "size unknown" are also never stalled.
  */
-export function isStalled(state: string | null | undefined, growth: GrowthReading): boolean {
-  if (STALL_STATES.includes(state ?? '')) return true;
+export function isStalled(_state: string | null | undefined, growth: GrowthReading): boolean {
   if (!growth.sizeKnown) return false;
   if (growth.bytes === null) return false;
   return growth.bytes === 0 && growth.windowMs >= GROWTH_WINDOW_MS;

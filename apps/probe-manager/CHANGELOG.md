@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.2 — 2026-10-28 (patch)
+
+Review feedback on 0.2.1: `STARTING` / `STOPPING` captures were being counted
+as stalled, which is wrong — those are legitimate backend transition states.
+
+### Fixed
+
+- `isStalled()` no longer treats `STARTING` / `STOPPING` as stalled. A row
+  is only "stalled" when a measured 10 s window shows `0 B` of growth —
+  state alone can never trigger the label. The state is still surfaced
+  on the row through `StatusIndicator` so the operator sees the real
+  backend state.
+- One new unit test (`liveCapturesGrowth.test.ts`) locks the contract on
+  both STARTING and STOPPING; one new UI test (`LiveCaptures.test.tsx`)
+  renders a STARTING capture and asserts the Stalled counter stays 0.
+- Playwright screenshots refreshed under `docs/screenshots/`. The companion
+  `docs/screenshots/README.md` makes the "mocked API" nature explicit.
+
+### Validation (manual, no CI)
+
+- `npm run typecheck` → clean
+- `npm test` → Test Files 9 passed (9) · Tests 93 passed (93)
+
 ## 0.2.1 — 2026-10-28 (patch)
 
 Honesty fixes on Live Captures (no new feature; no shape change on any API

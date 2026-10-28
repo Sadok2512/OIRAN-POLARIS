@@ -115,6 +115,22 @@ describe('Live capture stats — honest growth / stalled semantics (0.2.1)', () 
     expect(screen.getByTestId('growth-cap-1').textContent).toMatch(/measuring/);
   });
 
+  it('does NOT mark a STARTING capture as stalled (0.2.2 — transition states are not stalled)', async () => {
+    stub([
+      // STARTING is a legitimate backend transition; growth is still measuring.
+      { capture_id: 'cap-starting', name: 'cap-starting', state: 'STARTING', size_bytes: 0, probe_id: 'p1' },
+    ]);
+    render(renderWithProviders(<LiveCapturesPage />));
+    await waitFor(() =>
+      expect(screen.getByTestId('live-capture-cap-starting')).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId('stat-stalled').textContent).toMatch(/^Stalled0/);
+    // The row still shows STARTING as its real state (surfaced through StatusIndicator).
+    expect(screen.getByTestId('live-capture-cap-starting').textContent).toMatch(/STARTING/);
+    // No "stalled" badge is added to the header.
+    expect(screen.getByTestId('live-capture-cap-starting').textContent).not.toMatch(/stalled/i);
+  });
+
   it('renders "—" for the Storage cell when the backend reports no size', async () => {
     stub([
       { capture_id: 'cap-x', name: 'cap-x', state: 'CAPTURING', probe_id: 'p1' },

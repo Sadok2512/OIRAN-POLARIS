@@ -3,6 +3,31 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.4.1 — 2026-10-28 (patch)
+
+Review feedback on 0.4.0: four honesty corrections on the new Network section.
+
+### Fixed
+
+- `isLinkUp()` is replaced by `linkState()` returning `configured`, `down`
+  or `unknown`. The UI never says "UP" — NG Setup success stays `unknown`
+  until a dedicated backend route proves it. "configured" means the
+  process is running AND an endpoint is reported; "down" means the process
+  isn't running; "unknown" means no endpoint is reported.
+- Topology and Core · Open5GS now badge the aggregate container as
+  **`AMF container: <process_state>, <health>`** (source line explicitly
+  cites `/lab.observed.open5gs = oiran-lab-amf-1`). The old "5G Core
+  HEALTHY" aggregate wording is gone; every other NF remains "not exposed".
+- Topology eNB cards swap the 5G labels for LTE ones:
+  **S1-MME · S1AP** and **S1-U · GTP-U** instead of N2 / N3.
+- Screenshots refreshed under `docs/screenshots/`. The companion
+  `docs/screenshots/README.md` makes the "mocked API" nature explicit.
+
+### Validation (manual, no CI)
+
+- `npm run typecheck` → clean
+- `npm test` → Test Files 14 passed (14) · Tests 117 passed (117)
+
 ## 0.4.0 — 2026-10-28 (minor)
 
 Alignment on the UI mockups in `docs/ui-mockups/polaris-control.html` (branch
