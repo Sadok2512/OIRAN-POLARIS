@@ -3,6 +3,11 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.3.1 — 2026-10-28 (patch)
+
+- Update `react-router-dom` to `6.30.6` to close the production React Router redirect/XSS
+  advisories without changing routes or application behavior.
+
 ## 0.3.0 — 2026-10-28 (minor)
 
 Wired to polaris-control-api 0.11.0 (`feat/polaris-gnb-binding-and-provisioning`).

@@ -1,6 +1,6 @@
 {
   "name": "@telecom/probe-manager",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "OIRAN Probe Manager — telecom network topology, probes, interfaces, live captures, capture library.",
@@ -22,7 +22,7 @@
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "react-resizable-panels": "2.1.7",
-    "react-router-dom": "6.28.0"
+    "react-router-dom": "6.30.6"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "6.6.3",
