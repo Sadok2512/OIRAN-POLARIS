@@ -274,6 +274,92 @@ add('request_with_reflective_qos', 'PDUSessionResourceSetupRequestTransfer', {
 }, 'Reflective QoS subject-to on QFI 20')
 
 
+# ---- Outer list fixtures (PDUSessionResourceSetupListSUReq/SURes) ----
+
+# The inner transfer OCTET STRING is kept to a 1-byte stub so the outer-walker
+# ground truth stays small and deterministic. The outer walker is responsible
+# for extracting the transfer bytes verbatim; the inner decoder is already
+# validated by the request_* / response_* fixtures above.
+TRANSFER_STUB = b'\xab'
+
+add('list_sureq_1_session_sst_only', 'PDUSessionResourceSetupListSUReq', [
+    {
+        'pDUSessionID': 5,
+        's-NSSAI': {'sST': b'\x01'},
+        'pDUSessionResourceSetupRequestTransfer': TRANSFER_STUB,
+    },
+], 'SU-Req 1 session SST-only no NAS-PDU no iE-Ext')
+
+add('list_sureq_1_session_with_nas_pdu', 'PDUSessionResourceSetupListSUReq', [
+    {
+        'pDUSessionID': 7,
+        'pDUSessionNAS-PDU': b'\x7e\x00\x44\x6f',
+        's-NSSAI': {'sST': b'\x01'},
+        'pDUSessionResourceSetupRequestTransfer': TRANSFER_STUB,
+    },
+], 'SU-Req 1 session with 4-byte NAS-PDU SST-only')
+
+add('list_sureq_1_session_sst_sd', 'PDUSessionResourceSetupListSUReq', [
+    {
+        'pDUSessionID': 9,
+        's-NSSAI': {'sST': b'\x01', 'sD': b'\x02\x03\x04'},
+        'pDUSessionResourceSetupRequestTransfer': TRANSFER_STUB,
+    },
+], 'SU-Req 1 session SST+SD slice differentiator')
+
+add('list_sureq_1_session_item_ie_ext', 'PDUSessionResourceSetupListSUReq', [
+    {
+        'pDUSessionID': 11,
+        's-NSSAI': {'sST': b'\x01'},
+        'pDUSessionResourceSetupRequestTransfer': TRANSFER_STUB,
+        'iE-Extensions': {'dummy': 0},
+    },
+], 'SU-Req 1 session item iE-Extensions present')
+
+add('list_sureq_3_sessions_mixed', 'PDUSessionResourceSetupListSUReq', [
+    {
+        'pDUSessionID': 1,
+        'pDUSessionNAS-PDU': b'\x7e\x00\x44\x6f',
+        's-NSSAI': {'sST': b'\x01'},
+        'pDUSessionResourceSetupRequestTransfer': TRANSFER_STUB,
+    },
+    {
+        'pDUSessionID': 2,
+        's-NSSAI': {'sST': b'\x01', 'sD': b'\x01\x02\x03'},
+        'pDUSessionResourceSetupRequestTransfer': TRANSFER_STUB,
+    },
+    {
+        'pDUSessionID': 3,
+        's-NSSAI': {'sST': b'\x02'},
+        'pDUSessionResourceSetupRequestTransfer': TRANSFER_STUB,
+        'iE-Extensions': {'dummy': 0},
+    },
+], 'SU-Req 3 sessions: #1 NAS-PDU, #2 SST+SD, #3 iE-Ext')
+
+add('list_sures_1_session', 'PDUSessionResourceSetupListSURes', [
+    {
+        'pDUSessionID': 5,
+        'pDUSessionResourceSetupResponseTransfer': TRANSFER_STUB,
+    },
+], 'SU-Res 1 session')
+
+add('list_sures_3_sessions_item_ie_ext', 'PDUSessionResourceSetupListSURes', [
+    {
+        'pDUSessionID': 1,
+        'pDUSessionResourceSetupResponseTransfer': TRANSFER_STUB,
+    },
+    {
+        'pDUSessionID': 2,
+        'pDUSessionResourceSetupResponseTransfer': TRANSFER_STUB,
+    },
+    {
+        'pDUSessionID': 3,
+        'pDUSessionResourceSetupResponseTransfer': TRANSFER_STUB,
+        'iE-Extensions': {'dummy': 0},
+    },
+], 'SU-Res 3 sessions, last with iE-Ext')
+
+
 # Write to file
 output = []
 for f in fixtures:

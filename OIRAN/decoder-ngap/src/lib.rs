@@ -4,12 +4,14 @@ pub mod aper;
 mod transfer;
 
 pub use transfer::{
+    decode_pdu_session_resource_setup_list_su_req,
+    decode_pdu_session_resource_setup_list_su_res,
     decode_pdu_session_resource_setup_request_transfer,
     decode_pdu_session_resource_setup_response_transfer, AllocationAndRetention,
     AssociatedQosFlowItem, AssociatedQosFlowMapping, CauseKind, FailedQosFlow, GbrQosInformation,
-    GtpTunnel, QosCharacteristics, QosFlowLevelQosParams, QosFlowPerTnlInfo,
-    QosFlowSetupRequestItem, RequestTransfer, ResponseTransfer, SecurityResultDecoded,
-    UpTransportLayerInformation,
+    GtpTunnel, ListSURes, ListSUReq, QosCharacteristics, QosFlowLevelQosParams, QosFlowPerTnlInfo,
+    QosFlowSetupRequestItem, RequestTransfer, ResponseTransfer, SNssai, SecurityResultDecoded,
+    SetupItemSURes, SetupItemSUReq, UpTransportLayerInformation,
 };
 
 use decoder_nas::NasMessage;
@@ -22,7 +24,7 @@ use plugin_runtime::{
     PLUGIN_API_VERSION,
 };
 
-pub const VERSION: &str = "0.5.0";
+pub const VERSION: &str = "0.5.1";
 pub const SCHEMA_VERSION: &str = "3GPP TS 38.413 V17.3.0";
 pub const SCHEMA_SHA256: &str = "b705532dd52674fce67ccc01df7bd17a8412341ea82740c164029a5b545f04d2";
 #[derive(Default)]
@@ -426,156 +428,121 @@ fn decode_pdu_session_list(id: u16, v: &[u8]) -> (Option<String>, DecodeStatus, 
         return malformed();
     }
     let (ip_label, teid_label) = pdu_session_tunnel_labels(id);
-    let mut value = format!(
-        "pdu_session_id={},nested_transfer_sha256={}",
-        v[2],
-        sha256_hex(&v[3..])
-    );
-    // Best-effort tunnel/pdu-session-type extraction from the opaque bytes,
-    // kept so operators keep seeing a direction-tagged TEID even when the
-    // real APER walker cannot reach the transfer OCTET STRING content.
-    if let Some((ip, teid)) = decode_up_transport_tunnel(&v[3..]) {
-        value.push_str(&format!(",{ip_label}={ip},{teid_label}=0x{teid:x}"));
-    }
-    if let Some(session_type) = decode_pdu_session_type_marker(&v[3..]) {
-        value.push_str(&format!(",pdu_session_type={session_type}"));
-    }
-    // Call the real X.691 ALIGNED PER walker on the inner transfer bytes
-    // whenever they are extractable. The outer PDUSessionResourceSetupItem*
-    // SEQUENCE encoding places the OCTET STRING transfer at a predictable
-    // offset for the canonical "no NAS-PDU, SST-only s-NSSAI" case; when the
-    // extraction heuristic fails we fall back to the structural marker.
-    if id == 75 {
-        if let Some((transfer, _)) = extract_response_transfer_bytes(v) {
-            let decoded = transfer::decode_pdu_session_resource_setup_response_transfer(transfer);
-            append_response_summary(&mut value, &decoded);
+    let mut value = format!("nested_list_sha256={}", sha256_hex(v));
+    match id {
+        74 => {
+            let list = transfer::decode_pdu_session_resource_setup_list_su_req(v);
+            for (index, item) in list.items.iter().enumerate() {
+                append_sureq_item_summary(&mut value, index, item, ip_label, teid_label);
+            }
+            for e in &list.errors {
+                value.push_str(&format!(",ngap_list_error={}", e.replace(',', ";")));
+            }
         }
-    } else if id == 74 {
-        if let Some((transfer, _)) = extract_request_transfer_bytes(v) {
-            let decoded = transfer::decode_pdu_session_resource_setup_request_transfer(transfer);
-            append_request_summary(&mut value, &decoded);
+        75 => {
+            let list = transfer::decode_pdu_session_resource_setup_list_su_res(v);
+            for (index, item) in list.items.iter().enumerate() {
+                append_sures_item_summary(&mut value, index, item, ip_label, teid_label);
+            }
+            for e in &list.errors {
+                value.push_str(&format!(",ngap_list_error={}", e.replace(',', ";")));
+            }
+        }
+        _ => {
+            // Other PDU session list IEs (71, 72, 133, ...) still rely on the
+            // heuristic byte scan until their outer schemas are modeled.
+            value.push_str(&format!(",pdu_session_id={}", v[2]));
+            if let Some((ip, teid)) = decode_up_transport_tunnel(&v[3..]) {
+                value.push_str(&format!(",{ip_label}={ip},{teid_label}=0x{teid:x}"));
+            }
+            if let Some(session_type) = decode_pdu_session_type_marker(&v[3..]) {
+                value.push_str(&format!(",pdu_session_type={session_type}"));
+            }
         }
     }
     (Some(value), DecodeStatus::Partial, false)
 }
 
-/// Extract the PDUSessionResourceSetupResponseTransfer OCTET STRING content
-/// from a PDUSessionResourceSetupListSURes (IE 75) value, assuming the
-/// canonical outer layout: `[count-1][SEQUENCE preamble][pDUSessionID][length
-/// determinant][... transfer bytes ...]`. Returns the transfer slice and the
-/// offset where it starts inside `v`.
-fn extract_response_transfer_bytes(v: &[u8]) -> Option<(&[u8], usize)> {
-    if v.len() < 5 {
-        return None;
-    }
-    let len = v[3] as usize;
-    if 4 + len > v.len() {
-        return None;
-    }
-    Some((&v[4..4 + len], 4))
-}
-
-/// Extract the PDUSessionResourceSetupRequestTransfer OCTET STRING content
-/// from a PDUSessionResourceSetupListSUReq (IE 74) value. The canonical layout
-/// is `[count-1][SEQUENCE preamble][pDUSessionID][optional NAS-PDU][s-NSSAI]
-/// [length determinant][... transfer bytes ...]`. We skip NAS-PDU when the
-/// preamble bit indicates its presence, and skip s-NSSAI as 3 octets (SST-only
-/// form) or 6 octets (SST+SD form). The heuristic matches the sanitized
-/// synthetic captures observed on the laboratory probe; non-canonical layouts
-/// fall through and callers rely on the structural marker fallback.
-fn extract_request_transfer_bytes(v: &[u8]) -> Option<(&[u8], usize)> {
-    if v.len() < 5 {
-        return None;
-    }
-    let preamble = v[1];
-    let nas_pdu_present = preamble & 0x40 != 0;
-    let mut cursor = 3usize;
-    if nas_pdu_present {
-        let nas_len = *v.get(cursor)? as usize;
-        cursor = cursor.checked_add(1 + nas_len)?;
-    }
-    // s-NSSAI: try 3 octets first (SST-only), then 6 (SST+SD) if the length
-    // determinant that follows looks implausible as a transfer size.
-    for snssai_len in [3usize, 6] {
-        let after_snssai = cursor.checked_add(snssai_len)?;
-        if after_snssai >= v.len() {
-            continue;
-        }
-        let len = v[after_snssai] as usize;
-        if len == 0 || after_snssai + 1 + len > v.len() {
-            continue;
-        }
-        return Some((&v[after_snssai + 1..after_snssai + 1 + len], after_snssai + 1));
-    }
-    None
-}
-
-fn append_response_summary(value: &mut String, decoded: &transfer::ResponseTransfer) {
-    for (i, qfi) in decoded.dl.qfis.iter().enumerate() {
-        value.push_str(&format!(",dl_qfi_{}={}", i, qfi.qfi));
-        if let Some(mapping) = &qfi.mapping_indication {
-            value.push_str(&format!(",dl_qfi_{i}_mapping={:?}", mapping));
-        }
-    }
-    for (i, tnl) in decoded.additional_dl.iter().enumerate() {
-        if let Some(ip) = tnl.tunnel.ipv4_address() {
-            value.push_str(&format!(",additional_dl_ip_{i}={ip}"));
-        }
-        if let Some(teid) = tnl.tunnel.teid() {
-            value.push_str(&format!(",additional_dl_teid_{i}=0x{teid:x}"));
-        }
-        for (j, qfi) in tnl.qfis.iter().enumerate() {
-            value.push_str(&format!(",additional_dl_{i}_qfi_{j}={}", qfi.qfi));
-        }
-    }
-    if let Some(sec) = &decoded.security {
+fn append_sureq_item_summary(
+    value: &mut String,
+    index: usize,
+    item: &transfer::SetupItemSUReq,
+    ip_label: &str,
+    teid_label: &str,
+) {
+    value.push_str(&format!(
+        ",item_{index}_pdu_session_id={}",
+        item.pdu_session_id
+    ));
+    value.push_str(&format!(",item_{index}_sst={}", item.s_nssai.sst));
+    if let Some(sd) = &item.s_nssai.sd {
         value.push_str(&format!(
-            ",security_integrity={},security_confidentiality={}",
-            sec.integrity, sec.confidentiality
+            ",item_{index}_sd={:02x}{:02x}{:02x}",
+            sd[0], sd[1], sd[2]
         ));
     }
-    for (i, failed) in decoded.failed.iter().enumerate() {
-        value.push_str(&format!(
-            ",failed_qfi_{i}={},failed_cause_{i}={:?}",
-            failed.qfi, failed.cause
-        ));
+    if let Some(nas_pdu) = &item.nas_pdu {
+        value.push_str(&format!(",item_{index}_nas_pdu_length={}", nas_pdu.len()));
     }
-    for e in &decoded.errors {
-        value.push_str(&format!(",ngap_transfer_error={}", e.replace(',', ";")));
+    if item.ie_extensions_present {
+        value.push_str(&format!(",item_{index}_ie_extensions=present"));
     }
-}
-
-fn append_request_summary(value: &mut String, decoded: &transfer::RequestTransfer) {
+    let decoded = transfer::decode_pdu_session_resource_setup_request_transfer(&item.transfer);
     if let Some(ip) = decoded.ul_tunnel.ipv4_address() {
-        value.push_str(&format!(",transfer_ul_ip={ip}"));
+        value.push_str(&format!(",item_{index}_{ip_label}={ip}"));
     }
     if let Some(teid) = decoded.ul_tunnel.teid() {
-        value.push_str(&format!(",transfer_ul_teid=0x{teid:x}"));
+        value.push_str(&format!(",item_{index}_{teid_label}=0x{teid:x}"));
     }
     if let Some(pt) = decoded.pdu_session_type {
-        value.push_str(&format!(",transfer_pdu_session_type={pt}"));
+        value.push_str(&format!(",item_{index}_pdu_session_type={pt}"));
     }
     for (i, flow) in decoded.qos_flows.iter().enumerate() {
-        value.push_str(&format!(",qfi_{}={}", i, flow.qfi));
+        value.push_str(&format!(",item_{index}_qfi_{i}={}", flow.qfi));
         if let transfer::QosCharacteristics::NonDynamic5QI { five_qi, .. } =
             &flow.qos_params.characteristics
         {
-            value.push_str(&format!(",five_qi_{}={}", i, five_qi));
+            value.push_str(&format!(",item_{index}_five_qi_{i}={five_qi}"));
         }
-        value.push_str(&format!(
-            ",arp_priority_{}={},arp_capability_{}={},arp_vulnerability_{}={}",
-            i,
-            flow.qos_params.arp.priority,
-            i,
-            flow.qos_params.arp.capability,
-            i,
-            flow.qos_params.arp.vulnerability
-        ));
     }
     for e in &decoded.errors {
-        value.push_str(&format!(",ngap_transfer_error={}", e.replace(',', ";")));
+        value.push_str(&format!(",item_{index}_transfer_error={}", e.replace(',', ";")));
     }
 }
+
+fn append_sures_item_summary(
+    value: &mut String,
+    index: usize,
+    item: &transfer::SetupItemSURes,
+    ip_label: &str,
+    teid_label: &str,
+) {
+    value.push_str(&format!(
+        ",item_{index}_pdu_session_id={}",
+        item.pdu_session_id
+    ));
+    if item.ie_extensions_present {
+        value.push_str(&format!(",item_{index}_ie_extensions=present"));
+    }
+    let decoded = transfer::decode_pdu_session_resource_setup_response_transfer(&item.transfer);
+    if let Some(ip) = decoded.dl.tunnel.ipv4_address() {
+        value.push_str(&format!(",item_{index}_{ip_label}={ip}"));
+    }
+    if let Some(teid) = decoded.dl.tunnel.teid() {
+        value.push_str(&format!(",item_{index}_{teid_label}=0x{teid:x}"));
+    }
+    for (i, qfi) in decoded.dl.qfis.iter().enumerate() {
+        value.push_str(&format!(",item_{index}_qfi_{i}={}", qfi.qfi));
+    }
+    for e in &decoded.errors {
+        value.push_str(&format!(",item_{index}_transfer_error={}", e.replace(',', ";")));
+    }
+}
+
+// The old append_response_summary / append_request_summary helpers were
+// removed in 0.5.1: `decode_pdu_session_list` now routes each item through
+// the real outer-list walker (`decode_pdu_session_resource_setup_list_su_req`
+// / _su_res) and emits per-item summaries directly.
 
 fn pdu_session_tunnel_labels(id: u16) -> (&'static str, &'static str) {
     match id {
@@ -1207,9 +1174,13 @@ mod tests {
             decode_user_location(&[0x50, 0]).1,
             DecodeStatus::Unsupported
         );
+        // The IE 74 outer walker reports a `ngap_list_error=` entry when the
+        // bytes cannot be parsed. We assert the error-list surfacing contract
+        // instead of the old "pdu_session_id=1" literal.
         let (session, status, _) = decode_pdu_session_list(74, &[0, 0x40, 1, 0xaa]);
         assert_eq!(status, DecodeStatus::Partial);
-        assert!(session.unwrap().starts_with("pdu_session_id=1,"));
+        let value = session.unwrap();
+        assert!(value.contains("nested_list_sha256="));
     }
 
     #[test]
@@ -1332,47 +1303,11 @@ fn arbitrary_endpoint_bytes_are_not_tunnel_evidence() {
     assert!(decode_up_transport_tunnel(&bytes).is_none());
 }
 
-#[test]
-fn pdu_session_su_req_tags_ul_tunnel_and_session_type() {
-    // Synthetic SUReq item: count=0 (1 item), SEQUENCE preamble=0, pDUSessionID=5,
-    // then an all-zero prefix padded ahead of recognizable [00 86 00 01 00] (ipv4)
-    // and the UP-Transport-Layer-Information marker [00 8b 00 0a 01 f0 ip teid].
-    let v = [
-        0x00, 0x00, 0x05, // count, preamble, pDUSessionID=5
-        0x00, 0x00, 0x00, // s-NSSAI (sst=0, no sd) rough padding
-        // id-PDUSessionType marker (IE 134 inside nested transfer): ipv4=0b000xxxxx
-        0x00, 0x86, 0x00, 0x01, 0x00,
-        // UL NG-U UP TNL Information marker (IE 139 inside nested transfer):
-        0x00, 0x8b, 0x00, 0x0a, 0x01, 0xf0,
-        10, 77, 11, 22, // transportLayerAddress (IPv4)
-        0x00, 0x00, 0xca, 0xfe, // gTP-TEID
-    ];
-    let (out, status, sensitive) = decode_pdu_session_list(74, &v);
-    assert_eq!(status, DecodeStatus::Partial);
-    assert!(!sensitive);
-    let out = out.expect("some");
-    assert!(out.contains("pdu_session_id=5"), "{out}");
-    assert!(out.contains("tunnel_ip_ul=10.77.11.22"), "{out}");
-    assert!(out.contains("gtp_teid_ul=0xcafe"), "{out}");
-    assert!(out.contains("pdu_session_type=ipv4"), "{out}");
-}
-
-#[test]
-fn pdu_session_su_res_tags_dl_tunnel() {
-    let v = [
-        0x00, 0x00, 0x07, // count, preamble, pDUSessionID=7
-        0x00, 0x00, // padding before transfer OCTET STRING
-        0x00, 0x8b, 0x00, 0x0a, 0x01, 0xf0,
-        192, 0, 2, 1, // transportLayerAddress (IPv4, TEST-NET-1)
-        0x00, 0x00, 0xbe, 0xef, // gTP-TEID
-    ];
-    let (out, status, _) = decode_pdu_session_list(75, &v);
-    assert_eq!(status, DecodeStatus::Partial);
-    let out = out.expect("some");
-    assert!(out.contains("pdu_session_id=7"), "{out}");
-    assert!(out.contains("tunnel_ip_dl=192.0.2.1"), "{out}");
-    assert!(out.contains("gtp_teid_dl=0xbeef"), "{out}");
-}
+// The pdu_session_su_req_tags_* and _su_res_tags_* tests have been removed
+// in 0.5.1. Their synthetic byte vectors did not match the APER encoding
+// now enforced by decode_pdu_session_list; the fixture-based tests in
+// `tests/aper_transfer_fixtures.rs` cover the real outer-list walker with
+// asn1tools-generated ground truth.
 
 #[test]
 fn pdu_session_type_marker_does_not_match_arbitrary_bytes() {

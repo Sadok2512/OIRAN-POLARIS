@@ -5,6 +5,7 @@
 //! fails loudly.
 
 use decoder_ngap::{
+    decode_pdu_session_resource_setup_list_su_req, decode_pdu_session_resource_setup_list_su_res,
     decode_pdu_session_resource_setup_request_transfer,
     decode_pdu_session_resource_setup_response_transfer, AssociatedQosFlowMapping, CauseKind,
     QosCharacteristics, UpTransportLayerInformation,
@@ -266,6 +267,219 @@ fn truncated_response_transfer_reports_specific_errors_not_silently_rejected() {
         "errors should name the truncated primitive: {:?}",
         r.errors
     );
+}
+
+// ===== Outer list fixtures (PDUSessionResourceSetupListSUReq/SURes) ======
+
+#[test]
+fn list_sureq_1_session_sst_only_decodes_outer_envelope() {
+    let list = decode_pdu_session_resource_setup_list_su_req(&bytes(
+        "000005002001ab",
+    ));
+    assert!(list.errors.is_empty(), "errors: {:?}", list.errors);
+    assert_eq!(list.items.len(), 1);
+    let item = &list.items[0];
+    assert_eq!(item.pdu_session_id, 5);
+    assert_eq!(item.nas_pdu, None);
+    assert_eq!(item.s_nssai.sst, 1);
+    assert_eq!(item.s_nssai.sd, None);
+    assert!(!item.ie_extensions_present);
+    assert_eq!(item.transfer, vec![0xab]);
+}
+
+#[test]
+fn list_sureq_1_session_with_nas_pdu_round_trips_nas_bytes() {
+    let list = decode_pdu_session_resource_setup_list_su_req(&bytes(
+        "004007047e00446f002001ab",
+    ));
+    assert!(list.errors.is_empty(), "errors: {:?}", list.errors);
+    assert_eq!(list.items.len(), 1);
+    let item = &list.items[0];
+    assert_eq!(item.pdu_session_id, 7);
+    assert_eq!(item.nas_pdu, Some(vec![0x7e, 0x00, 0x44, 0x6f]));
+    assert_eq!(item.s_nssai.sst, 1);
+    assert_eq!(item.transfer, vec![0xab]);
+}
+
+#[test]
+fn list_sureq_1_session_sst_sd_exposes_slice_differentiator() {
+    let list = decode_pdu_session_resource_setup_list_su_req(&bytes(
+        "000009402002030401ab",
+    ));
+    assert!(list.errors.is_empty(), "errors: {:?}", list.errors);
+    assert_eq!(list.items.len(), 1);
+    let item = &list.items[0];
+    assert_eq!(item.pdu_session_id, 9);
+    assert_eq!(item.s_nssai.sst, 1);
+    assert_eq!(item.s_nssai.sd, Some([0x02, 0x03, 0x04]));
+    assert_eq!(item.transfer, vec![0xab]);
+}
+
+#[test]
+fn list_sureq_1_session_item_ie_ext_is_flagged() {
+    let list = decode_pdu_session_resource_setup_list_su_req(&bytes("00200b002001ab"));
+    assert_eq!(list.items.len(), 1);
+    let item = &list.items[0];
+    assert_eq!(item.pdu_session_id, 11);
+    assert!(item.ie_extensions_present);
+    assert_eq!(item.transfer, vec![0xab]);
+    assert!(
+        list.errors
+            .iter()
+            .any(|e| e.contains("iE-Extensions present")),
+        "errors should name the ext: {:?}",
+        list.errors
+    );
+}
+
+#[test]
+fn list_sureq_3_sessions_mixed_walks_each_item_with_its_own_optionals() {
+    let list = decode_pdu_session_resource_setup_list_su_req(&bytes(
+        "024001047e00446f002001ab0002402001020301ab2003004001ab",
+    ));
+    assert_eq!(list.items.len(), 3);
+    // Item 0: NAS-PDU present, SST only.
+    assert_eq!(list.items[0].pdu_session_id, 1);
+    assert_eq!(list.items[0].nas_pdu.as_deref(), Some(&[0x7e, 0x00, 0x44, 0x6f][..]));
+    assert_eq!(list.items[0].s_nssai.sst, 1);
+    assert_eq!(list.items[0].s_nssai.sd, None);
+    assert!(!list.items[0].ie_extensions_present);
+    assert_eq!(list.items[0].transfer, vec![0xab]);
+    // Item 1: no NAS-PDU, SST+SD.
+    assert_eq!(list.items[1].pdu_session_id, 2);
+    assert_eq!(list.items[1].nas_pdu, None);
+    assert_eq!(list.items[1].s_nssai.sst, 1);
+    assert_eq!(list.items[1].s_nssai.sd, Some([0x01, 0x02, 0x03]));
+    // Item 2: SST=2 and iE-Extensions present.
+    assert_eq!(list.items[2].pdu_session_id, 3);
+    assert_eq!(list.items[2].s_nssai.sst, 2);
+    assert_eq!(list.items[2].s_nssai.sd, None);
+    assert!(list.items[2].ie_extensions_present);
+    assert_eq!(list.items[2].transfer, vec![0xab]);
+}
+
+#[test]
+fn list_sures_1_session_decodes_pdu_session_id_and_transfer() {
+    let list = decode_pdu_session_resource_setup_list_su_res(&bytes("00000501ab"));
+    assert!(list.errors.is_empty(), "errors: {:?}", list.errors);
+    assert_eq!(list.items.len(), 1);
+    assert_eq!(list.items[0].pdu_session_id, 5);
+    assert_eq!(list.items[0].transfer, vec![0xab]);
+    assert!(!list.items[0].ie_extensions_present);
+}
+
+#[test]
+fn list_sures_3_sessions_item_ie_ext_flags_last_item() {
+    let list = decode_pdu_session_resource_setup_list_su_res(&bytes(
+        "02000101ab000201ab400301ab",
+    ));
+    assert_eq!(list.items.len(), 3);
+    assert_eq!(list.items[0].pdu_session_id, 1);
+    assert!(!list.items[0].ie_extensions_present);
+    assert_eq!(list.items[1].pdu_session_id, 2);
+    assert!(!list.items[1].ie_extensions_present);
+    assert_eq!(list.items[2].pdu_session_id, 3);
+    assert!(list.items[2].ie_extensions_present);
+    for item in &list.items {
+        assert_eq!(item.transfer, vec![0xab]);
+    }
+}
+
+#[test]
+fn qos_flow_mapping_indication_extension_decodes_normally_small_number() {
+    // Hand-crafted response transfer where associatedQosFlowList has one item
+    // whose qosFlowMappingIndication is in the extension additions. Encoding:
+    //   SEQUENCE preamble (6 bits = 000000) + 2 pad.
+    //   QosFlowPerTNLInformation preamble (2 bits = 00).
+    //   UPTransportLayerInformation CHOICE ext=0; GTPTunnel preamble (2 bits);
+    //   BIT STRING ext=0 + 8-bit size=31 → length byte 0x1f aligned.
+    //   32 bits of IP + 32 bits of TEID.
+    //   AssociatedQosFlowList size (6 bits = 000000 for 1 item).
+    //   SEQUENCE preamble (3 bits: ext=0, mapping=1, iE-Ext=0).
+    //   QFI (6 bits = 000010 for QFI=2).
+    //   qosFlowMappingIndication ENUMERATED extension: ext bit = 1,
+    //     NSNNWN prefix=0, 6 bits = 000011 → extension index 3.
+    // Rather than hand-pack bits, we start from response_minimal and splice
+    // the ext path by concatenating the first 11 bytes with our crafted tail.
+    //
+    // We rely on the aperreader bit-level decode: build the tail by writing
+    // bits via a helper, then verify.
+    let mut bits = BitBuffer::new();
+    bits.push_bits(0, 6); // response preamble ext=0 + 5 opts=0 (6 bits)
+    bits.push_bits(0, 2); // QosFlowPerTNLInformation preamble (ext + 1 opt)
+    bits.push_bits(0, 1); // UPTransportLayerInformation CHOICE ext
+    bits.push_bits(0, 2); // GTPTunnel preamble (ext + 1 opt)
+    bits.push_bits(0, 1); // TransportLayerAddress BIT STRING ext
+    bits.push_bits(31, 8); // size-1 (32 bits), unaligned bit-field
+    bits.align();
+    bits.push_octets(&[0xc0, 0x00, 0x02, 0x7f]); // IPv4
+    bits.push_octets(&[0x00, 0x00, 0xca, 0xfe]); // TEID
+    bits.push_bits(0, 6); // AssociatedQosFlowList size-1 (1 item)
+    bits.push_bits(0, 1); // AssociatedQosFlowItem ext
+    bits.push_bits(1, 1); // qosFlowMappingIndication present
+    bits.push_bits(0, 1); // iE-Ext absent
+    bits.push_bits(2, 6); // QFI = 2
+    bits.push_bits(1, 1); // qosFlowMappingIndication ENUMERATED ext=1
+    bits.push_bits(0, 1); // NSNNWN prefix: 0 → 6-bit value follows
+    bits.push_bits(3, 6); // extension index = 3
+    let payload = bits.finish();
+
+    let r = decode_pdu_session_resource_setup_response_transfer(&payload);
+    assert_eq!(r.dl.qfis.len(), 1);
+    assert_eq!(r.dl.qfis[0].qfi, 2);
+    assert_eq!(
+        r.dl.qfis[0].mapping_indication,
+        Some(AssociatedQosFlowMapping::UnknownExtension(3))
+    );
+}
+
+/// Minimal MSB-first bit buffer used by the extension-mapping fixture test.
+struct BitBuffer {
+    data: Vec<u8>,
+    cursor_bits: usize,
+}
+
+impl BitBuffer {
+    fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            cursor_bits: 0,
+        }
+    }
+
+    fn push_bit(&mut self, bit: u64) {
+        let bit = (bit & 1) as u8;
+        if self.cursor_bits % 8 == 0 {
+            self.data.push(0);
+        }
+        let byte_index = self.cursor_bits / 8;
+        let bit_offset = 7 - (self.cursor_bits % 8);
+        self.data[byte_index] |= bit << bit_offset;
+        self.cursor_bits += 1;
+    }
+
+    fn push_bits(&mut self, value: u64, width: usize) {
+        for i in (0..width).rev() {
+            self.push_bit((value >> i) & 1);
+        }
+    }
+
+    fn align(&mut self) {
+        while self.cursor_bits % 8 != 0 {
+            self.push_bit(0);
+        }
+    }
+
+    fn push_octets(&mut self, octets: &[u8]) {
+        self.align();
+        self.data.extend_from_slice(octets);
+        self.cursor_bits += octets.len() * 8;
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.align();
+        self.data
+    }
 }
 
 #[test]

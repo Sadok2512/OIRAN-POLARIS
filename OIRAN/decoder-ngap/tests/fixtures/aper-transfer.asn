@@ -215,4 +215,45 @@ PDUSessionResourceSetupResponseTransfer ::= SEQUENCE {
     ...
 }
 
+-- Outer SU-Req / SU-Res list types (TS 38.413 §9.3.1.1 / §9.3.1.2
+-- verbatim, with OCTET STRING transfer bodies decoupled from the
+-- CONTAINING constraint so asn1tools can compile the subset).
+
+maxnoofPDUSessionsSetup                 INTEGER ::= 256
+
+PDUSessionID                            ::= INTEGER (0..255)
+
+SST                                     ::= OCTET STRING (SIZE(1))
+
+SD                                      ::= OCTET STRING (SIZE(3))
+
+S-NSSAI ::= SEQUENCE {
+    sST             SST,
+    sD              SD                                      OPTIONAL,
+    iE-Extensions   SEQUENCE { dummy INTEGER (0..0) }       OPTIONAL,
+    ...
+}
+
+NAS-PDU                                 ::= OCTET STRING
+
+PDUSessionResourceSetupItemSUReq ::= SEQUENCE {
+    pDUSessionID                                PDUSessionID,
+    pDUSessionNAS-PDU                           NAS-PDU                                     OPTIONAL,
+    s-NSSAI                                     S-NSSAI,
+    pDUSessionResourceSetupRequestTransfer      OCTET STRING,
+    iE-Extensions                               SEQUENCE { dummy INTEGER (0..0) }           OPTIONAL,
+    ...
+}
+
+PDUSessionResourceSetupListSUReq ::= SEQUENCE (SIZE(1..maxnoofPDUSessionsSetup)) OF PDUSessionResourceSetupItemSUReq
+
+PDUSessionResourceSetupItemSURes ::= SEQUENCE {
+    pDUSessionID                                PDUSessionID,
+    pDUSessionResourceSetupResponseTransfer     OCTET STRING,
+    iE-Extensions                               SEQUENCE { dummy INTEGER (0..0) }           OPTIONAL,
+    ...
+}
+
+PDUSessionResourceSetupListSURes ::= SEQUENCE (SIZE(1..maxnoofPDUSessionsSetup)) OF PDUSessionResourceSetupItemSURes
+
 END

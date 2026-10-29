@@ -1,5 +1,45 @@
 # Changelog
 
+## oiran-decode v0.4.3 — real outer-list walker, ENUMERATED extension, diagnostic CLI
+
+- `decoder-ngap v0.5.1`:
+  - **Outer list walker, no more heuristic.** `decode_pdu_session_list` now
+    routes IE 74 and IE 75 through the new
+    `decode_pdu_session_resource_setup_list_su_req` /
+    `decode_pdu_session_resource_setup_list_su_res` entry points, which
+    implement the real X.691 ALIGNED PER encoding of
+    `PDUSessionResourceSetupListSUReq` and `PDUSessionResourceSetupListSURes`:
+    SIZE(1..256) size byte, per-item SEQUENCE preamble (ext +
+    optional-presence bits), `pDUSessionID` octet-aligned, `pDUSessionNAS-PDU`
+    with its APER length determinant, `S-NSSAI` SEQUENCE (`sST` as a SIZE(1)
+    bit-field, `sD` as SIZE(3) octet-aligned), and the transfer OCTET STRING
+    extracted via its own length determinant. The previous "canonical" byte
+    offset heuristic has been removed; non-canonical layouts surface their
+    specific failure in a per-item `errors` list and the `item_<i>_*` summary
+    keys name the exact field that did not decode.
+  - **`qosFlowMappingIndication` extension additions.** When the ENUMERATED
+    extension bit is set, the walker now reads the normally-small-non-negative
+    whole number for the extension index (X.691 Clause 10.6) and reports
+    `AssociatedQosFlowMapping::UnknownExtension(index)` instead of returning
+    `UnknownExtension(0)` for every extension value.
+  - **Diagnostic CLI.** New binary `ngap-decode-hex` (invoked as `cargo run
+    -p decoder-ngap --bin ngap-decode-hex`) reads a hex NGAP PDU from stdin
+    (whitespace and `0x` prefixes tolerated) and writes the decoded tree as
+    pretty-printed JSON on stdout. For IE 74 and IE 75 the embedded transfer
+    is decoded in the same JSON blob so operators can diff the result
+    side-by-side with `tshark -O ngap -J` on real captures.
+  - **New fixtures.** 7 additional asn1tools-generated ground-truth fixtures
+    cover the outer list envelope: 1 session SST-only, 1 session with NAS-PDU,
+    1 session with S-NSSAI SST+SD, 1 session with item iE-Extensions, 3
+    sessions mixed (NAS-PDU + SST/SD + iE-Ext), and SURes with/without
+    iE-Extensions on individual items. The hand-crafted bit-level fixture
+    `qos_flow_mapping_indication_extension_decodes_normally_small_number`
+    exercises the ENUMERATED extension path end-to-end.
+- Fixtures remain synthetic (PLMN 001/01 or TEST-NET addresses, NAS-PDU
+  stub 0x7e 00 44 6f = plain 5GMM Registration Reject). No real
+  SUPI/K/OPc/SUCI/GUTI/IMSI/IMEI material is present in test code,
+  fixtures, or decoders.
+
 ## oiran-decode v0.4.2 — real X.691 APER walker, HPACK Huffman recovery
 
 - `decoder-ngap v0.5.0`: removed the one-octet-per-primitive canonical walker

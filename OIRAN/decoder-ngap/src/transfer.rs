@@ -10,14 +10,14 @@
 
 use crate::aper::{AperError, AperReader};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GtpTunnel {
     pub transport_address: Vec<u8>,
     pub address_bits: usize,
     pub teid: [u8; 4],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum UpTransportLayerInformation {
     GtpTunnel(GtpTunnel),
     Unsupported(String),
@@ -54,27 +54,27 @@ impl UpTransportLayerInformation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum AssociatedQosFlowMapping {
     Ul,
     Dl,
     UnknownExtension(u64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AssociatedQosFlowItem {
     pub qfi: u8,
     pub mapping_indication: Option<AssociatedQosFlowMapping>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AllocationAndRetention {
     pub priority: u8,
     pub capability: &'static str,
     pub vulnerability: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum QosCharacteristics {
     NonDynamic5QI {
         five_qi: u16,
@@ -95,7 +95,7 @@ pub enum QosCharacteristics {
     Unsupported(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GbrQosInformation {
     pub maximum_flow_dl: u64,
     pub maximum_flow_ul: u64,
@@ -106,7 +106,7 @@ pub struct GbrQosInformation {
     pub maximum_packet_loss_ul: Option<u16>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct QosFlowLevelQosParams {
     pub characteristics: QosCharacteristics,
     pub arp: AllocationAndRetention,
@@ -115,26 +115,26 @@ pub struct QosFlowLevelQosParams {
     pub additional_qos_flow: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct QosFlowSetupRequestItem {
     pub qfi: u8,
     pub qos_params: QosFlowLevelQosParams,
     pub e_rab_id: Option<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct QosFlowPerTnlInfo {
     pub tunnel: UpTransportLayerInformation,
     pub qfis: Vec<AssociatedQosFlowItem>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SecurityResultDecoded {
     pub integrity: &'static str,
     pub confidentiality: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum CauseKind {
     RadioNetwork(u64),
     Transport(u64),
@@ -144,13 +144,13 @@ pub enum CauseKind {
     UnknownGroup(u64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FailedQosFlow {
     pub qfi: u8,
     pub cause: CauseKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct RequestTransfer {
     pub ul_tunnel: UpTransportLayerInformation,
     pub pdu_session_type: Option<&'static str>,
@@ -158,13 +158,47 @@ pub struct RequestTransfer {
     pub errors: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct ResponseTransfer {
     pub dl: QosFlowPerTnlInfo,
     pub additional_dl: Vec<QosFlowPerTnlInfo>,
     pub security: Option<SecurityResultDecoded>,
     pub failed: Vec<FailedQosFlow>,
     pub redundant: Option<QosFlowPerTnlInfo>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct SNssai {
+    pub sst: u8,
+    pub sd: Option<[u8; 3]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct SetupItemSUReq {
+    pub pdu_session_id: u8,
+    pub nas_pdu: Option<Vec<u8>>,
+    pub s_nssai: SNssai,
+    pub transfer: Vec<u8>,
+    pub ie_extensions_present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct SetupItemSURes {
+    pub pdu_session_id: u8,
+    pub transfer: Vec<u8>,
+    pub ie_extensions_present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct ListSUReq {
+    pub items: Vec<SetupItemSUReq>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct ListSURes {
+    pub items: Vec<SetupItemSURes>,
     pub errors: Vec<String>,
 }
 
@@ -272,7 +306,10 @@ fn decode_associated_qos_flow_list(
             return items;
         };
         let mapping = if has_mapping {
-            // ENUMERATED { ul, dl, ... } with ext marker: 1 ext + 1 bit value.
+            // ENUMERATED { ul, dl, ... } with extension marker.
+            // Root part: 1 bit value (ul=0, dl=1).
+            // Extension additions: 1-bit prefix flag + NSNNWN carrying the
+            // extension index (TS 38.413 extensions beyond the root).
             match reader.read_bit() {
                 Ok(e_ext) if !e_ext => match reader.read_bit() {
                     Ok(false) => Some(AssociatedQosFlowMapping::Ul),
@@ -282,12 +319,15 @@ fn decode_associated_qos_flow_list(
                         None
                     }
                 },
-                Ok(_) => {
-                    errors.push(
-                        "qosFlowMappingIndication extension (unknown enumeration value)".into(),
-                    );
-                    Some(AssociatedQosFlowMapping::UnknownExtension(0))
-                }
+                Ok(_) => match reader.read_normally_small_non_negative_whole_number() {
+                    Ok(idx) => Some(AssociatedQosFlowMapping::UnknownExtension(idx)),
+                    Err(e) => {
+                        errors.push(format!(
+                            "qosFlowMappingIndication extension index: {:?}", e
+                        ));
+                        Some(AssociatedQosFlowMapping::UnknownExtension(0))
+                    }
+                },
                 Err(e) => {
                     errors.push(format!("qosFlowMappingIndication ext: {:?}", e));
                     None
@@ -1003,4 +1043,214 @@ pub fn decode_pdu_session_resource_setup_response_transfer(bytes: &[u8]) -> Resp
         redundant,
         errors,
     }
+}
+
+/// Decode S-NSSAI (TS 38.413 §9.3.1.24).
+/// SEQUENCE { sST OCTET STRING SIZE(1), sD OCTET STRING SIZE(3) OPTIONAL,
+///            iE-Extensions OPTIONAL, ... }
+fn decode_s_nssai(reader: &mut AperReader<'_>, errors: &mut Vec<String>) -> SNssai {
+    let ext = reader.read_bit().unwrap_or(true);
+    let has_sd = reader.read_bit().unwrap_or(false);
+    let has_ie_ext = reader.read_bit().unwrap_or(false);
+    if ext {
+        errors.push("S-NSSAI SEQUENCE extension present".into());
+    }
+    // sST is OCTET STRING SIZE(1) → bit-field, unaligned (X.691 Clause 17.5
+    // case b).
+    let sst = match reader.read_aligned_fixed_octet_string(1) {
+        Ok(v) => v.first().copied().unwrap_or(0),
+        Err(e) => {
+            errors.push(format!("S-NSSAI sST: {:?}", e));
+            0
+        }
+    };
+    let sd = if has_sd {
+        // sD is OCTET STRING SIZE(3) → octet-aligned content.
+        match reader.read_aligned_fixed_octet_string(3) {
+            Ok(bytes) if bytes.len() == 3 => Some([bytes[0], bytes[1], bytes[2]]),
+            Ok(_) => {
+                errors.push("S-NSSAI sD unexpected length".into());
+                None
+            }
+            Err(e) => {
+                errors.push(format!("S-NSSAI sD: {:?}", e));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if has_ie_ext {
+        errors.push("S-NSSAI iE-Extensions present".into());
+    }
+    SNssai { sst, sd }
+}
+
+/// Decode PDUSessionResourceSetupListSUReq (TS 38.413 §9.3.1.1):
+///   SEQUENCE (SIZE(1..256)) OF PDUSessionResourceSetupItemSUReq.
+/// Each item is a SEQUENCE whose optional preamble carries the pDUSessionNAS-PDU
+/// and iE-Extensions presence flags. The transfer OCTET STRING is extracted
+/// verbatim per the APER semi-constrained length determinant rules.
+pub fn decode_pdu_session_resource_setup_list_su_req(bytes: &[u8]) -> ListSUReq {
+    let mut reader = AperReader::new(bytes);
+    let mut errors = Vec::new();
+    // SEQUENCE OF size: SIZE(1..256), range 256 → octet-aligned 1 octet
+    // (X.691 10.5.7.4 case c).
+    let size_minus_one = match reader.read_constrained_whole(256) {
+        Ok(v) => v,
+        Err(e) => {
+            errors.push(format!("ListSUReq size: {:?}", e));
+            return ListSUReq { items: Vec::new(), errors };
+        }
+    };
+    let count = (size_minus_one as usize) + 1;
+    let mut items = Vec::with_capacity(count);
+    for i in 0..count {
+        match decode_item_sureq(&mut reader, &mut errors, i) {
+            Some(item) => items.push(item),
+            None => break,
+        }
+    }
+    ListSUReq { items, errors }
+}
+
+fn decode_item_sureq(
+    reader: &mut AperReader<'_>,
+    errors: &mut Vec<String>,
+    index: usize,
+) -> Option<SetupItemSUReq> {
+    // SEQUENCE preamble: ext + 2 opts (pDUSessionNAS-PDU, iE-Extensions).
+    let ext = reader.read_bit().ok()?;
+    let has_nas_pdu = reader.read_bit().ok()?;
+    let has_ie_ext = reader.read_bit().ok()?;
+    if ext {
+        errors.push(format!(
+            "PDUSessionResourceSetupItemSUReq[{index}] SEQUENCE extension present"
+        ));
+    }
+    // pDUSessionID: INTEGER (0..255), range 256 → octet-aligned 1 octet.
+    let pdu_session_id = match reader.read_constrained_whole(256) {
+        Ok(v) => v as u8,
+        Err(e) => {
+            errors.push(format!("ItemSUReq[{index}] pDUSessionID: {:?}", e));
+            return None;
+        }
+    };
+    let nas_pdu = if has_nas_pdu {
+        // NAS-PDU is OCTET STRING with no size constraint: length determinant
+        // (1 or 2 octets) + octet-aligned content.
+        let len = match reader.read_length_determinant() {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(format!("ItemSUReq[{index}] NAS-PDU length: {:?}", e));
+                return None;
+            }
+        };
+        match reader.read_octets(len) {
+            Ok(bytes) => Some(bytes.to_vec()),
+            Err(e) => {
+                errors.push(format!("ItemSUReq[{index}] NAS-PDU content: {:?}", e));
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    let s_nssai = decode_s_nssai(reader, errors);
+    // pDUSessionResourceSetupRequestTransfer: OCTET STRING, length determinant.
+    let transfer_len = match reader.read_length_determinant() {
+        Ok(v) => v,
+        Err(e) => {
+            errors.push(format!("ItemSUReq[{index}] transfer length: {:?}", e));
+            return None;
+        }
+    };
+    let transfer = match reader.read_octets(transfer_len) {
+        Ok(bytes) => bytes.to_vec(),
+        Err(e) => {
+            errors.push(format!("ItemSUReq[{index}] transfer content: {:?}", e));
+            return None;
+        }
+    };
+    if has_ie_ext {
+        errors.push(format!(
+            "PDUSessionResourceSetupItemSUReq[{index}] iE-Extensions present"
+        ));
+    }
+    Some(SetupItemSUReq {
+        pdu_session_id,
+        nas_pdu,
+        s_nssai,
+        transfer,
+        ie_extensions_present: has_ie_ext,
+    })
+}
+
+/// Decode PDUSessionResourceSetupListSURes (TS 38.413 §9.3.1.2):
+///   SEQUENCE (SIZE(1..256)) OF PDUSessionResourceSetupItemSURes.
+pub fn decode_pdu_session_resource_setup_list_su_res(bytes: &[u8]) -> ListSURes {
+    let mut reader = AperReader::new(bytes);
+    let mut errors = Vec::new();
+    let size_minus_one = match reader.read_constrained_whole(256) {
+        Ok(v) => v,
+        Err(e) => {
+            errors.push(format!("ListSURes size: {:?}", e));
+            return ListSURes { items: Vec::new(), errors };
+        }
+    };
+    let count = (size_minus_one as usize) + 1;
+    let mut items = Vec::with_capacity(count);
+    for i in 0..count {
+        match decode_item_sures(&mut reader, &mut errors, i) {
+            Some(item) => items.push(item),
+            None => break,
+        }
+    }
+    ListSURes { items, errors }
+}
+
+fn decode_item_sures(
+    reader: &mut AperReader<'_>,
+    errors: &mut Vec<String>,
+    index: usize,
+) -> Option<SetupItemSURes> {
+    // SEQUENCE preamble: ext + 1 opt (iE-Extensions).
+    let ext = reader.read_bit().ok()?;
+    let has_ie_ext = reader.read_bit().ok()?;
+    if ext {
+        errors.push(format!(
+            "PDUSessionResourceSetupItemSURes[{index}] SEQUENCE extension present"
+        ));
+    }
+    let pdu_session_id = match reader.read_constrained_whole(256) {
+        Ok(v) => v as u8,
+        Err(e) => {
+            errors.push(format!("ItemSURes[{index}] pDUSessionID: {:?}", e));
+            return None;
+        }
+    };
+    let transfer_len = match reader.read_length_determinant() {
+        Ok(v) => v,
+        Err(e) => {
+            errors.push(format!("ItemSURes[{index}] transfer length: {:?}", e));
+            return None;
+        }
+    };
+    let transfer = match reader.read_octets(transfer_len) {
+        Ok(bytes) => bytes.to_vec(),
+        Err(e) => {
+            errors.push(format!("ItemSURes[{index}] transfer content: {:?}", e));
+            return None;
+        }
+    };
+    if has_ie_ext {
+        errors.push(format!(
+            "PDUSessionResourceSetupItemSURes[{index}] iE-Extensions present"
+        ));
+    }
+    Some(SetupItemSURes {
+        pdu_session_id,
+        transfer,
+        ie_extensions_present: has_ie_ext,
+    })
 }

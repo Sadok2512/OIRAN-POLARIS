@@ -163,6 +163,49 @@ impl<'a> AperReader<'a> {
         let octets = bit_length.div_ceil(8);
         Ok(self.read_octets(octets)?.to_vec())
     }
+
+    /// X.691 Clause 17.5 aligned PER encoding of a fixed-length OCTET STRING.
+    /// SIZE(0) encodes nothing; SIZE(1) and SIZE(2) are bit-fields placed in the
+    /// bit stream without octet alignment; SIZE >= 3 is octet-aligned content.
+    pub fn read_aligned_fixed_octet_string(&mut self, size: usize) -> Result<Vec<u8>, AperError> {
+        match size {
+            0 => Ok(Vec::new()),
+            1 => {
+                let v = self.read_bits(8)? as u8;
+                Ok(vec![v])
+            }
+            2 => {
+                let a = self.read_bits(8)? as u8;
+                let b = self.read_bits(8)? as u8;
+                Ok(vec![a, b])
+            }
+            n => Ok(self.read_octets(n)?.to_vec()),
+        }
+    }
+
+    /// Normally-small-non-negative-whole-number (X.691 Clause 10.6):
+    /// 1-bit prefix. If 0, the next 6 bits carry the value (0..63). If 1, the
+    /// value is encoded as a semi-constrained whole number with a length
+    /// determinant followed by octet-aligned value octets. Used for extension
+    /// addition indices in extensible CHOICE / ENUMERATED types.
+    pub fn read_normally_small_non_negative_whole_number(&mut self) -> Result<u64, AperError> {
+        let prefix = self.read_bit()?;
+        if !prefix {
+            self.read_bits(6)
+        } else {
+            let octets = self.read_length_determinant()?;
+            if octets == 0 || octets > 8 {
+                return Err(AperError::Unsupported(format!(
+                    "NSNNWN length {octets} not supported"
+                )));
+            }
+            let mut v = 0u64;
+            for _ in 0..octets {
+                v = (v << 8) | u64::from(self.read_octet()?);
+            }
+            Ok(v)
+        }
+    }
 }
 
 #[cfg(test)]
