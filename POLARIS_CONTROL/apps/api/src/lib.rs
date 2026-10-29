@@ -391,6 +391,11 @@ struct ControlRuntime {
 struct DefinitionJobControl {
     cancel: Arc<AtomicBool>,
     started_ues: Arc<Mutex<BTreeSet<String>>>,
+    // Immutable runtime approvals obtained by this definition job. Runtime
+    // observation may clear the registry copy after switch-off, but terminal
+    // steps and cleanup remain authorized by the job-owned copy until the job
+    // reaches a terminal state.
+    started_jobs: Arc<Mutex<BTreeMap<String, simulator_controller::UeJob>>>,
 }
 
 struct OwnedScenarioJob {
@@ -5895,7 +5900,7 @@ fn reconcile_ue_count(
     excess_ids.reverse();
     for ue_id in &excess_ids {
         let outcome = if state.execution_mode == "live" {
-            stop_one_live_inner(&state, ue_id).map(|_| ())
+            stop_one_live_inner(&state, ue_id, None).map(|_| ())
         } else {
             let mut controller = state.multi_ue.lock().unwrap();
             controller.stop_offline(ue_id).map(|_| ())
@@ -6941,6 +6946,7 @@ fn start_one_live(state: &AppState, ue_id: &str) -> Result<simulator_controller:
 fn stop_one_live_inner(
     state: &AppState,
     ue_id: &str,
+    job_approval: Option<&simulator_controller::UeJob>,
 ) -> Result<simulator_controller::UeJob, String> {
     if !controller_owns_ue(state, ue_id) {
         return Err("PROTECTED_OR_UNAPPROVED_UE".into());
@@ -6970,11 +6976,15 @@ fn stop_one_live_inner(
             persist_ue_registry(state, &controller)?;
             return Ok(stopped);
         }
-        let result = (
-            job.approved_runtime
-                .ok_or("LIVE_RUNTIME_APPROVAL_MISSING")?,
-            job.process_handle.ok_or("UE_NOT_STARTED")?,
-        );
+        let approved_runtime = job
+            .approved_runtime
+            .or_else(|| job_approval.and_then(|approved| approved.approved_runtime.clone()))
+            .ok_or("LIVE_RUNTIME_APPROVAL_MISSING")?;
+        let handle = job
+            .process_handle
+            .or_else(|| job_approval.and_then(|approved| approved.process_handle.clone()))
+            .ok_or("UE_NOT_STARTED")?;
+        let result = (approved_runtime, handle);
         controller.reserve_live_stop(ue_id, &operation_id)?;
         if let Err(error) = persist_ue_registry(state, &controller) {
             let _ = controller.fail_live_operation(ue_id, &operation_id, &error, true);
@@ -7024,7 +7034,19 @@ fn stop_one_live(state: &AppState, ue_id: &str) -> Result<simulator_controller::
         .ue_operations
         .lock()
         .map_err(|_| "UE_OPERATION_COORDINATOR_UNAVAILABLE")?;
-    stop_one_live_inner(state, ue_id)
+    stop_one_live_inner(state, ue_id, None)
+}
+
+fn stop_one_live_for_definition(
+    state: &AppState,
+    ue_id: &str,
+    job_approval: &simulator_controller::UeJob,
+) -> Result<simulator_controller::UeJob, String> {
+    let _operation_guard = state
+        .ue_operations
+        .lock()
+        .map_err(|_| "UE_OPERATION_COORDINATOR_UNAVAILABLE")?;
+    stop_one_live_inner(state, ue_id, Some(job_approval))
 }
 
 async fn start_ue(
@@ -7706,12 +7728,17 @@ fn execute_live_definition_step(
                     .iter()
                     .any(|job| job.ue_id == *ue_id && job.process_state == "RUNNING");
                 if !already_running {
-                    start_one_live(state, ue_id)?;
+                    let started_job = start_one_live(state, ue_id)?;
                     control
                         .started_ues
                         .lock()
                         .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
                         .insert(ue_id.clone());
+                    control
+                        .started_jobs
+                        .lock()
+                        .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                        .insert(ue_id.clone(), started_job);
                 }
             }
             Ok(json!({}))
@@ -7729,10 +7756,19 @@ fn execute_live_definition_step(
                     if let Ok(target) = resolve_controller_traffic_target(state, ue_id) {
                         state.ue_runtime.remove_policy_routing(&target)?;
                     }
-                    stop_one_live(state, ue_id)?;
+                    if let Some(approval) = definition_job_approval(control, ue_id)? {
+                        stop_one_live_for_definition(state, ue_id, &approval)?;
+                    } else {
+                        stop_one_live(state, ue_id)?;
+                    }
                 }
                 control
                     .started_ues
+                    .lock()
+                    .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                    .remove(ue_id);
+                control
+                    .started_jobs
                     .lock()
                     .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
                     .remove(ue_id);
@@ -7968,25 +8004,37 @@ fn execute_live_definition_step(
         "detach" => {
             for ue_id in ue_ids {
                 let target = resolve_controller_traffic_target(state, ue_id)?;
-                let job = state
-                    .multi_ue
-                    .lock()
-                    .map_err(|_| "UE_REGISTRY_UNAVAILABLE".to_string())?
-                    .snapshot()
-                    .into_iter()
-                    .find(|job| job.ue_id == *ue_id)
-                    .ok_or("UE_NOT_STARTED")?;
+                let job = if let Some(approval) = definition_job_approval(control, ue_id)? {
+                    approval
+                } else {
+                    state
+                        .multi_ue
+                        .lock()
+                        .map_err(|_| "UE_REGISTRY_UNAVAILABLE".to_string())?
+                        .snapshot()
+                        .into_iter()
+                        .find(|job| job.ue_id == *ue_id)
+                        .ok_or("UE_NOT_STARTED")?
+                };
                 state.ue_runtime.remove_policy_routing(&target)?;
                 request_terminal_detach(state.ue_runtime.as_ref(), &job)?;
-                stop_one_live(state, ue_id)?;
-                let final_observation = observe_controller_ue(state, ue_id)?;
-                if final_observation.process_state != "STOPPED"
-                    || final_observation.pdu_session_state != "INACTIVE"
+                let final_job = stop_one_live_for_definition(state, ue_id, &job)?;
+                // The stop result is the controller's authoritative terminal
+                // observation. Do not call observe_controller_ue here: that
+                // helper requires a live runtime approval which is correctly
+                // consumed once the UE is stopped.
+                if final_job.process_state != "STOPPED"
+                    || final_job.pdu_session_state != "INACTIVE"
                 {
                     return Err("DETACH_FINAL_STATE_NOT_OBSERVED".into());
                 }
                 control
                     .started_ues
+                    .lock()
+                    .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+                    .remove(ue_id);
+                control
+                    .started_jobs
                     .lock()
                     .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
                     .remove(ue_id);
@@ -8005,6 +8053,18 @@ fn execute_live_definition_step(
     }
 }
 
+fn definition_job_approval(
+    control: &DefinitionJobControl,
+    ue_id: &str,
+) -> Result<Option<simulator_controller::UeJob>, String> {
+    Ok(control
+        .started_jobs
+        .lock()
+        .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
+        .get(ue_id)
+        .cloned())
+}
+
 fn request_terminal_detach(
     runtime: &dyn UeRuntime,
     job: &simulator_controller::UeJob,
@@ -8021,10 +8081,19 @@ fn cleanup_definition_started_ues(state: &AppState, control: &DefinitionJobContr
         .unwrap_or_default();
     let mut errors = Vec::new();
     for ue_id in started {
-        if let Err(error) = stop_one_live(state, &ue_id) {
+        let approval = definition_job_approval(control, &ue_id).ok().flatten();
+        let result = if let Some(approval) = approval.as_ref() {
+            stop_one_live_for_definition(state, &ue_id, approval)
+        } else {
+            stop_one_live(state, &ue_id)
+        };
+        if let Err(error) = result {
             errors.push(format!("{ue_id}:{error}"));
         } else if let Ok(mut ids) = control.started_ues.lock() {
             ids.remove(&ue_id);
+            if let Ok(mut jobs) = control.started_jobs.lock() {
+                jobs.remove(&ue_id);
+            }
         }
     }
     errors
@@ -8185,6 +8254,7 @@ fn start_live_definition_scenario(
     let control = DefinitionJobControl {
         cancel: Arc::new(AtomicBool::new(false)),
         started_ues: Arc::new(Mutex::new(BTreeSet::new())),
+        started_jobs: Arc::new(Mutex::new(BTreeMap::new())),
     };
     {
         let mut jobs = state.definition_jobs.lock().unwrap();
@@ -12793,6 +12863,37 @@ mod p0_tests {
         assert!(!is_terminal_stop_state("RUNNING"));
         assert!(!is_terminal_stop_state("STARTING"));
         assert!(!is_terminal_stop_state("UNKNOWN"));
+    }
+
+    #[test]
+    fn definition_job_retains_runtime_approval_until_terminal_cleanup() {
+        let test_state = state();
+        prepare_owned_traffic_target(&test_state, "UE-02", true);
+        let approved = test_state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .snapshot()
+            .into_iter()
+            .find(|item| item.ue_id == "UE-02")
+            .unwrap();
+        let control = DefinitionJobControl {
+            cancel: Arc::new(AtomicBool::new(false)),
+            started_ues: Arc::new(Mutex::new(BTreeSet::from(["UE-02".into()]))),
+            started_jobs: Arc::new(Mutex::new(BTreeMap::from([(
+                "UE-02".into(),
+                approved.clone(),
+            )]))),
+        };
+        test_state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .stop_offline("UE-02")
+            .unwrap();
+        let retained = definition_job_approval(&control, "UE-02").unwrap().unwrap();
+        assert!(retained.approved_runtime.is_some());
+        assert!(retained.process_handle.is_some());
     }
 
     #[test]

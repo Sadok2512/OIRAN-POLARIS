@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.17.7 (polaris-control-api)
+
+- Retain the immutable runtime approval and process handle acquired by a
+  scenario job until that job reaches its terminal state.
+- Reuse the job-owned approval for `detach`, explicit terminal stop and failure
+  cleanup, while keeping already-`STOPPED` cleanup idempotent. Runtime
+  observation can therefore clear its registry copy without causing a false
+  `LIVE_RUNTIME_APPROVAL_MISSING` failure.
+- Use the controller stop result as the authoritative final `STOPPED` / PDU
+  `INACTIVE` observation instead of querying the already-terminated runtime a
+  second time.
+
 ## 0.17.6 (polaris-control-api)
 
 - Make terminal `detach` issue `ps-release-all`, immediately continue with
