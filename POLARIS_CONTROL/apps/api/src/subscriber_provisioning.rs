@@ -352,8 +352,9 @@ const mmeRealm=template&&typeof template.mme_realm==="string"?template.mme_realm
 for (const x of requested) {{
   const existing=db.subscribers.findOne({{imsi:x.imsi}});
   if (existing) {{ results.push({{row:x.row,ok:false,error:existing.polaris&&existing.polaris.owned===true?"SUBSCRIBER_ALREADY_EXISTS":"SUBSCRIBER_NOT_POLARIS_OWNED"}}); continue; }}
-  const sessions=x.dnns.map(name=>({{name,type:NumberInt(3),qos:{{index:NumberInt(9),arp:{{priority_level:NumberInt(8),pre_emption_capability:NumberInt(1),pre_emption_vulnerability:NumberInt(2)}}}},ambr:{{downlink:{{value:Number(x.ambr.downlink),unit:NumberInt(0)}},uplink:{{value:Number(x.ambr.uplink),unit:NumberInt(0)}}}},pcc_rule:[],_id:new ObjectId()}}));
-  const doc={{schema_version:NumberInt(1),imsi:x.imsi,msisdn:[],imeisv:[],mme_host:[],mm_realm:[],mme_realm:mmeRealm,mme_timestamp:NumberLong(0),purge_flag:[],slice:[{{sst:NumberInt(x.sst),sd:x.sd,default_indicator:true,session:sessions,_id:new ObjectId()}}],security:{{k:x.k,op:null,opc:x.opc,amf:"8000"}},ambr:{{downlink:{{value:Number(x.ambr.downlink),unit:NumberInt(0)}},uplink:{{value:Number(x.ambr.uplink),unit:NumberInt(0)}}}},access_restriction_data:NumberInt(32),network_access_mode:NumberInt(0),subscriber_status:NumberInt(0),operator_determined_barring:NumberInt(0),subscribed_rau_tau_timer:NumberInt(12),polaris:{{owned:true,slot:x.slot,plmn_mcc:mcc,plmn_mnc:mnc}},__v:NumberInt(0)}};
+  const dl=NumberLong(String(x.ambr.downlink)); const ul=NumberLong(String(x.ambr.uplink));
+  const sessions=x.dnns.map(name=>({{name,type:NumberInt(3),qos:{{index:NumberInt(9),arp:{{priority_level:NumberInt(8),pre_emption_capability:NumberInt(1),pre_emption_vulnerability:NumberInt(2)}}}},ambr:{{downlink:{{value:dl,unit:NumberInt(0)}},uplink:{{value:ul,unit:NumberInt(0)}}}},pcc_rule:[],_id:new ObjectId()}}));
+  const doc={{schema_version:NumberInt(1),imsi:x.imsi,msisdn:[],imeisv:[],mme_host:[],mm_realm:[],mme_realm:mmeRealm,mme_timestamp:NumberLong(0),purge_flag:[],slice:[{{sst:NumberInt(x.sst),sd:x.sd,default_indicator:true,session:sessions,_id:new ObjectId()}}],security:{{k:x.k,op:null,opc:x.opc,amf:"8000"}},ambr:{{downlink:{{value:dl,unit:NumberInt(0)}},uplink:{{value:ul,unit:NumberInt(0)}}}},access_restriction_data:NumberInt(32),network_access_mode:NumberInt(0),subscriber_status:NumberInt(0),operator_determined_barring:NumberInt(0),subscribed_rau_tau_timer:NumberInt(12),polaris:{{owned:true,slot:x.slot,plmn_mcc:mcc,plmn_mnc:mnc}},__v:NumberInt(0)}};
   try {{ db.subscribers.insertOne(doc); results.push({{row:x.row,ok:true,slot:x.slot}}); }} catch (_) {{ results.push({{row:x.row,ok:false,error:"SUBSCRIBER_WRITE_FAILED"}}); }}
 }}
 print(JSON.stringify(results));
@@ -405,65 +406,118 @@ print(JSON.stringify(results));
 }
 
 impl MongoSubscriberBackend {
+    /// Build the mongosh script that applies `update` to the record identified
+    /// by `slot`. The script emits real BSON types (`NumberLong` for AMBR
+    /// values, `NumberInt` for the AMBR unit and for integer schema fields) by
+    /// calling the mongosh constructors directly — it never injects EJSON
+    /// literals like `{"$numberLong":"N"}`, which mongosh would store as a
+    /// plain sub-document instead of a BSON long and which was the root cause
+    /// of the 0.17.0+ AMBR data corruption that broke Open5GS UDM reads.
     fn apply_update_script(&self, slot: &str, update: &SubscriberUpdate) -> Vec<u8> {
         let slot_json = serde_json::to_string(slot).unwrap_or_else(|_| "\"\"".into());
-        let mut set = serde_json::Map::new();
+
+        // Scalar / string field writes: emitted as `setFields["<path>"] = <expr>;`
+        // where <expr> is a typed mongosh expression (NumberInt / quoted string).
+        let mut scalar_sets: Vec<String> = Vec::new();
         if let Some(sst) = update.sst {
-            set.insert("slice.0.sst".into(), json!(sst));
+            scalar_sets.push(format!("setFields[\"slice.0.sst\"] = NumberInt({sst});"));
         }
         if let Some(sd) = &update.sd {
             match sd {
                 Some(value) => {
-                    set.insert("slice.0.sd".into(), json!(value));
+                    let s = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into());
+                    scalar_sets.push(format!("setFields[\"slice.0.sd\"] = {s};"));
                 }
-                None => {
-                    set.insert("slice.0.sd".into(), json!(null));
-                }
+                None => scalar_sets.push("setFields[\"slice.0.sd\"] = null;".into()),
             }
         }
-        if let Some(ambr) = &update.ambr {
-            set.insert(
-                "ambr.uplink.value".into(),
-                json!({ "$numberLong": ambr.uplink.to_string() }),
-            );
-            set.insert(
-                "ambr.downlink.value".into(),
-                json!({ "$numberLong": ambr.downlink.to_string() }),
-            );
-            set.insert(
-                "slice.0.session.0.ambr.uplink.value".into(),
-                json!({ "$numberLong": ambr.uplink.to_string() }),
-            );
-            set.insert(
-                "slice.0.session.0.ambr.downlink.value".into(),
-                json!({ "$numberLong": ambr.downlink.to_string() }),
-            );
-        }
         if let Some(k) = &update.k {
-            set.insert("security.k".into(), json!(k));
+            let s = serde_json::to_string(k).unwrap_or_else(|_| "\"\"".into());
+            scalar_sets.push(format!("setFields[\"security.k\"] = {s};"));
         }
         if let Some(opc) = &update.opc {
-            set.insert("security.opc".into(), json!(opc));
+            let s = serde_json::to_string(opc).unwrap_or_else(|_| "\"\"".into());
+            scalar_sets.push(format!("setFields[\"security.opc\"] = {s};"));
         }
-        let set_json = serde_json::to_string(&set).unwrap_or_else(|_| "{}".into());
-        if let Some(dnns) = &update.dnns {
-            let sessions_json = serde_json::to_string(
-                &dnns
-                    .iter()
-                    .map(|name| json!({ "name": name }))
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_else(|_| "[]".into());
+        let scalar_block = scalar_sets.join(" ");
+
+        // AMBR + DNN carry typed sub-documents and need the fetch/merge path.
+        let ambr_js = if let Some(ambr) = &update.ambr {
             format!(
-                "db.subscribers.updateOne({{\"polaris.slot\":{slot_json},\"polaris.owned\":true}},{{$set:{set_json},\"$set\":{{\"slice.0.session\":{sessions_json}}}}});print(JSON.stringify(db.subscribers.findOne({{\"polaris.slot\":{slot_json},\"polaris.owned\":true}})))"
+                "{{dl: NumberLong(\"{}\"), ul: NumberLong(\"{}\")}}",
+                ambr.downlink, ambr.uplink
             )
-            .into_bytes()
         } else {
-            format!(
-                "db.subscribers.updateOne({{\"polaris.slot\":{slot_json},\"polaris.owned\":true}},{{$set:{set_json}}});print(JSON.stringify(db.subscribers.findOne({{\"polaris.slot\":{slot_json},\"polaris.owned\":true}})))"
-            )
-            .into_bytes()
-        }
+            "null".into()
+        };
+        let dnns_js = if let Some(dnns) = &update.dnns {
+            let items: Vec<String> = dnns
+                .iter()
+                .map(|name| serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into()))
+                .collect();
+            format!("[{}]", items.join(", "))
+        } else {
+            "null".into()
+        };
+
+        let script = format!(
+            r#"
+const slotKey = {slot_json};
+const current = db.subscribers.findOne({{"polaris.slot": slotKey, "polaris.owned": true}});
+if (!current) {{ print("null"); }} else {{
+  const nextAmbr = {ambr_js};
+  const nextDnns = {dnns_js};
+  const setFields = {{}};
+  {scalar_block}
+  function parseLong(v) {{
+    if (v === null || v === undefined) return NumberLong("1000000000");
+    if (typeof v === "object" && v !== null && v.$numberLong !== undefined) {{ return NumberLong(v.$numberLong); }}
+    try {{ return NumberLong(String(v)); }} catch (_) {{ return NumberLong("1000000000"); }}
+  }}
+  function sessionAmbrOf(a) {{
+    return {{
+      downlink: {{ value: a.dl, unit: NumberInt(0) }},
+      uplink:   {{ value: a.ul, unit: NumberInt(0) }}
+    }};
+  }}
+  if (nextAmbr !== null) {{
+    setFields["ambr.uplink.value"]   = nextAmbr.ul;
+    setFields["ambr.uplink.unit"]    = NumberInt(0);
+    setFields["ambr.downlink.value"] = nextAmbr.dl;
+    setFields["ambr.downlink.unit"]  = NumberInt(0);
+  }}
+  const existingSessions = (current.slice && current.slice[0] && Array.isArray(current.slice[0].session))
+    ? current.slice[0].session : [];
+  if (nextDnns !== null) {{
+    const fallbackAmbr = {{
+      dl: parseLong(current.ambr && current.ambr.downlink && current.ambr.downlink.value),
+      ul: parseLong(current.ambr && current.ambr.uplink   && current.ambr.uplink.value)
+    }};
+    const effectiveAmbr = nextAmbr !== null ? nextAmbr : fallbackAmbr;
+    setFields["slice.0.session"] = nextDnns.map((name, i) => ({{
+      name: name,
+      type: NumberInt(3),
+      qos: {{ index: NumberInt(9),
+              arp: {{ priority_level: NumberInt(8),
+                      pre_emption_capability: NumberInt(1),
+                      pre_emption_vulnerability: NumberInt(2) }} }},
+      ambr: sessionAmbrOf(effectiveAmbr),
+      pcc_rule: [],
+      _id: (existingSessions[i] && existingSessions[i]._id) ? existingSessions[i]._id : new ObjectId()
+    }}));
+  }} else if (nextAmbr !== null) {{
+    setFields["slice.0.session"] = existingSessions.map(function(s) {{
+      return Object.assign({{}}, s, {{ ambr: sessionAmbrOf(nextAmbr) }});
+    }});
+  }}
+  if (Object.keys(setFields).length > 0) {{
+    db.subscribers.updateOne({{"polaris.slot": slotKey, "polaris.owned": true}}, {{"$set": setFields}});
+  }}
+  print(JSON.stringify(db.subscribers.findOne({{"polaris.slot": slotKey, "polaris.owned": true}})));
+}}
+"#
+        );
+        script.into_bytes()
     }
 }
 
@@ -1061,5 +1115,225 @@ mod tests {
             Some(4_294_967_297)
         );
         assert_eq!(json_u64(&json!({"high":-1,"low":1,"unsigned":false})), None);
+    }
+
+    /// 0.17.8 (#39) — regression lock: `apply_update_script` MUST emit real
+    /// mongosh `NumberLong(...)` / `NumberInt(...)` constructor calls, never
+    /// EJSON literals such as `{"$numberLong":"N"}`. The latter is parsed by
+    /// mongosh as a plain JS object and stored by MongoDB as a sub-document,
+    /// which was the root cause of the UDR "No UE-AMBR" / AMF HTTP 400
+    /// `am-data` incident reported against 0.17.0+.
+    #[test]
+    fn apply_update_script_never_emits_ejson_literals_for_ambr() {
+        let backend = MongoSubscriberBackend {
+            container: "unused".into(),
+            backup_root: PathBuf::from("/tmp/unused"),
+            plmn_mcc: "001".into(),
+            plmn_mnc: "01".into(),
+        };
+        let update = SubscriberUpdate {
+            ambr: Some(SubscriberAmbr {
+                uplink: 500_000_000,
+                downlink: 1_500_000_000,
+            }),
+            dnns: Some(vec!["internet".into(), "ims".into()]),
+            sst: Some(1),
+            sd: Some(Some("010203".into())),
+            k: None,
+            opc: None,
+        };
+        let script = backend.apply_update_script("SUB-regression", &update);
+        let script = std::str::from_utf8(&script).expect("script is utf-8");
+        // The EJSON injection form that corrupted documents in 0.17.0+ must be
+        // completely absent from the emitted script — both the raw key and the
+        // dollar-escaped mongosh key.
+        assert!(
+            !script.contains("$numberLong\":\""),
+            "apply_update_script re-emits EJSON literals for AMBR: {script}"
+        );
+        // The typed mongosh constructor calls MUST appear for both AMBR legs.
+        assert!(
+            script.contains("NumberLong(\"500000000\")"),
+            "uplink AMBR missing NumberLong constructor: {script}"
+        );
+        assert!(
+            script.contains("NumberLong(\"1500000000\")"),
+            "downlink AMBR missing NumberLong constructor: {script}"
+        );
+        // AMBR unit must be a BSON int32.
+        assert!(
+            script.contains("NumberInt(0)"),
+            "ambr.unit missing NumberInt(0): {script}"
+        );
+        // Session rebuild (DNN change) must carry typed qos.index + arp fields,
+        // not strip them (the old `$set` duplicate-key form silently did).
+        assert!(
+            script.contains("index: NumberInt(9)"),
+            "session qos.index not typed as NumberInt: {script}"
+        );
+        assert!(
+            script.contains("priority_level: NumberInt(8)"),
+            "session qos.arp.priority_level not typed as NumberInt: {script}"
+        );
+        // The duplicate `$set` key bug (two `$set` keys in the updateOne
+        // argument object, where the second silently clobbered the first) must
+        // not reappear — the script now constructs a single `setFields`.
+        let update_calls = script.matches("db.subscribers.updateOne").count();
+        assert_eq!(update_calls, 1, "expected a single updateOne call: {script}");
+    }
+
+    /// 0.17.8 (#39) — mandatory MongoDB integration test. Gated by
+    /// `POLARIS_TEST_MONGODB_CONTAINER` (NOT `#[ignore]`): when the env var is
+    /// set, the test MUST pass; when unset the test skips with a loud
+    /// `SKIPPED_NO_MONGO` marker so an operator can grep for it in CI logs.
+    /// Validates that a `PUT /subscribers/:slot` AMBR write produces real BSON
+    /// numeric types (`$type = "long"` for value, `"int"` for unit) at every
+    /// Open5GS schema path (`ambr.{dl,ul}.{value,unit}`, `slice.0.session.*
+    /// .ambr.{dl,ul}.{value,unit}`), not literal `{$numberLong}` sub-documents.
+    #[test]
+    fn ambr_put_writes_real_bson_long_in_live_mongo() {
+        let container = match std::env::var("POLARIS_TEST_MONGODB_CONTAINER") {
+            Ok(c) if !c.is_empty() => c,
+            _ => {
+                eprintln!("SKIPPED_NO_MONGO: POLARIS_TEST_MONGODB_CONTAINER unset");
+                return;
+            }
+        };
+        std::env::set_var("POLARIS_OPEN5GS_MONGODB_CONTAINER", &container);
+        let root = std::env::temp_dir().join(format!(
+            "polaris-ambr-bson-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        std::env::set_var("POLARIS_SUBSCRIBER_BACKUP_ROOT", &root);
+        let backend = MongoSubscriberBackend::from_env().expect("from_env");
+
+        // Pick a reserved IMSI slot deterministically keyed on the test name
+        // so repeat runs stay isolated from other POLARIS tests.
+        let imsi = "001019999999978".to_string();
+        let slot = slot_for(&imsi);
+        // Scrub prior residue from a previous (possibly aborted) run.
+        let cleanup = format!(
+            "db.subscribers.deleteMany({{imsi: {}}})",
+            serde_json::to_string(&imsi).unwrap()
+        );
+        let _ = backend.mongosh(cleanup.as_bytes());
+
+        let mutation = SubscriberMutation {
+            imsi: imsi.clone(),
+            k: "aa".repeat(16),
+            opc: "bb".repeat(16),
+            sst: 1,
+            sd: Some("010203".into()),
+            dnns: vec!["internet".into()],
+            ambr: SubscriberAmbr {
+                uplink: 1_000_000,
+                downlink: 2_000_000,
+            },
+        };
+        let provision = backend
+            .provision_batch(vec![(0, mutation)])
+            .expect("provision_batch");
+        assert!(provision[0].ok, "provision failed: {:?}", provision[0].error);
+
+        let update = SubscriberUpdate {
+            ambr: Some(SubscriberAmbr {
+                uplink: 500_000_000,
+                downlink: 1_500_000_000,
+            }),
+            ..SubscriberUpdate::default()
+        };
+        let after = backend
+            .apply_update(&slot, update)
+            .expect("apply_update must succeed on a provisioned slot");
+        assert_eq!(after.slot, slot);
+        assert_eq!(after.ambr.uplink, 500_000_000);
+        assert_eq!(after.ambr.downlink, 1_500_000_000);
+
+        // Authoritative BSON-type probe via `$type` aggregation. Returns a
+        // single-row document whose fields are the per-path BSON type names
+        // ("long", "int", "double", "object", ...).
+        let probe = format!(
+            r#"
+const r = db.subscribers.aggregate([
+  {{"$match": {{"polaris.slot": {slot_json}, "polaris.owned": true}}}},
+  {{"$project": {{
+    "_id": 0,
+    "ambr_dl_value": {{"$type": "$ambr.downlink.value"}},
+    "ambr_dl_unit":  {{"$type": "$ambr.downlink.unit"}},
+    "ambr_ul_value": {{"$type": "$ambr.uplink.value"}},
+    "ambr_ul_unit":  {{"$type": "$ambr.uplink.unit"}},
+    "s0_dl_value":   {{"$type": {{"$arrayElemAt": ["$slice.session.ambr.downlink.value", 0]}}}},
+    "s0_dl_unit":    {{"$type": {{"$arrayElemAt": ["$slice.session.ambr.downlink.unit",  0]}}}},
+    "s0_ul_value":   {{"$type": {{"$arrayElemAt": ["$slice.session.ambr.uplink.value",   0]}}}},
+    "s0_ul_unit":    {{"$type": {{"$arrayElemAt": ["$slice.session.ambr.uplink.unit",    0]}}}},
+    "ambr_dl_value_num": "$ambr.downlink.value",
+    "ambr_ul_value_num": "$ambr.uplink.value",
+    "s0_dl_value_num":   {{"$arrayElemAt": ["$slice.session.ambr.downlink.value", 0]}},
+    "s0_ul_value_num":   {{"$arrayElemAt": ["$slice.session.ambr.uplink.value",   0]}}
+  }}}}
+]).toArray();
+print(JSON.stringify(r[0] || null));
+"#,
+            slot_json = serde_json::to_string(&slot).unwrap()
+        );
+        let probe_value = backend
+            .mongosh(probe.as_bytes())
+            .expect("mongosh $type probe");
+        eprintln!("BSON_TYPES={probe_value}");
+
+        for key in [
+            "ambr_dl_value",
+            "ambr_ul_value",
+            "s0_dl_value",
+            "s0_ul_value",
+        ] {
+            let actual = probe_value
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("probe missing {key}: {probe_value}"));
+            assert!(
+                matches!(actual, "long" | "int"),
+                "{key} must be BSON int/long (Open5GS UDR requirement); was {actual}: {probe_value}"
+            );
+        }
+        for key in [
+            "ambr_dl_unit",
+            "ambr_ul_unit",
+            "s0_dl_unit",
+            "s0_ul_unit",
+        ] {
+            let actual = probe_value
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("probe missing {key}: {probe_value}"));
+            assert!(
+                matches!(actual, "int" | "long"),
+                "{key} must be BSON int/long; was {actual}: {probe_value}"
+            );
+        }
+        // The value fields must round-trip exactly — not just happen to parse —
+        // so we also compare the numeric payload the aggregation extracted.
+        assert_eq!(
+            json_u64(&probe_value["ambr_dl_value_num"]),
+            Some(1_500_000_000)
+        );
+        assert_eq!(
+            json_u64(&probe_value["ambr_ul_value_num"]),
+            Some(500_000_000)
+        );
+        assert_eq!(
+            json_u64(&probe_value["s0_dl_value_num"]),
+            Some(1_500_000_000)
+        );
+        assert_eq!(
+            json_u64(&probe_value["s0_ul_value_num"]),
+            Some(500_000_000)
+        );
+
+        // Clean up so repeat runs stay deterministic.
+        let _ = backend.mongosh(cleanup.as_bytes());
+        let _ = fs::remove_dir_all(&root);
     }
 }
