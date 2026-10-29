@@ -5540,18 +5540,13 @@ fn start_one_live_inner(
         .map_err(|_| "UE_REGISTRY_UNAVAILABLE")?
         .profiles();
     authorize_live_ue_request(&[ue_id.to_string()], &profiles, state.ue01_controller_owned)?;
-    let verified = state.ue_runtime.verify_provisioning(&profiles)?;
-    let profile = {
-        let controller = state
-            .multi_ue
-            .lock()
-            .map_err(|_| "UE_REGISTRY_UNAVAILABLE")?;
-        controller
-            .profiles()
-            .into_iter()
-            .find(|profile| profile.ue_id == ue_id)
-            .ok_or("UNKNOWN_UE_PROFILE")?
-    };
+    let profile = profiles
+        .into_iter()
+        .find(|profile| profile.ue_id == ue_id)
+        .ok_or("UNKNOWN_UE_PROFILE")?;
+    let verified = state
+        .ue_runtime
+        .verify_provisioning(std::slice::from_ref(&profile))?;
     let profile_sha256 = verified.get(ue_id).ok_or("UE_PROFILE_NOT_READY")?.clone();
     let approved_runtime = state.ue_runtime.approve_launch(&profile, &profile_sha256)?;
     let operation_id = random_hex(16);

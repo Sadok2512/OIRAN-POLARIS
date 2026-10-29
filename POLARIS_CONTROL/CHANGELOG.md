@@ -4,6 +4,7 @@
 
 - Fix controller-owned scenario resource validation so it no longer depends on the legacy shared UE-01 container or profile; disk, memory, CPU and shared lab infrastructure health gates remain enforced.
 - Normalize persistent controller UE identifiers and render the configured/default NSSAI fields required by runtime provisioning validation.
+- Scope launch-time provisioning verification to the explicitly requested controller-owned UE so unrelated legacy profiles cannot block or contaminate its lifecycle decision.
 
 ## 0.16.0 (polaris-control-api)
 
