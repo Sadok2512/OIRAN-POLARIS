@@ -5799,6 +5799,15 @@ fn stop_one_live_inner(
         }
         result
     };
+    if state.ue_runtime.discover(&approved_runtime)?.is_none() {
+        let mut controller = state
+            .multi_ue
+            .lock()
+            .map_err(|_| "UE_REGISTRY_UNAVAILABLE")?;
+        let job = controller.stop_offline(ue_id)?.clone();
+        persist_ue_registry(state, &controller)?;
+        return Ok(job);
+    }
     if let Err(error) = state.ue_runtime.stop(&approved_runtime, &handle) {
         if let Ok(mut controller) = state.multi_ue.lock() {
             let _ = controller.fail_live_operation(
