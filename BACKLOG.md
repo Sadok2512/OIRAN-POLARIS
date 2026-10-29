@@ -23,15 +23,16 @@ Labo : UE-201 AMBR 1 Gbit/s. UDP 0 % perte ≤ 20 Mbit/s ; TCP ~125/136 Mbit/s U
 ### C2 · OIRAN live-probe 0.2.3 · DONE · 3812285 (branche feat/live-probe-0.2.3-streaming, base 4da0de7)
 Base 4da0de7 (feat/oiran-decoders-0.4). copy_verified + write_jsonl_atomic en streaming ; test pcap 512 MiB → pic < 32 MiB (commande + pic).
 Libérer /tmp Back100 < 85 % et faire tourner les 3 tests continuous-import sautés.
-### C3 · POLARIS API 0.18.0 · TODO (base c8f00e2)
-- #37 GET /ues/:id/activity + SSE /ues/:id/activity/stream (2 s), sans flag Live : RM/CM/RRC/5GMM (filtre strict, aucune identité),
-  PDU (PSI, DNN, état, IP), octets/paquets/débits UL/DL uesimtun*, job + étape, 20 derniers événements, voix {"available":false,"reason":"IMS_NOT_AVAILABLE"}.
-- #36 Stop toujours autorisé pour l'opérateur, sans flag Live (ps-release-all → deregister → arrêt), idempotent.
-- #35 POST/GET/DELETE /live/grant {ue_ids, duration_minutes ≤ 60}, expiration auto, journal d'audit.
-- #34 /plmns et /dnns lus dans la config Open5GS réelle (AMF s_nssai, SMF dnn) ; absent → 422 SLICE_NOT_CONFIGURED / DNN_NOT_CONFIGURED.
-- #32 Scénario avec étapes voix enregistrable ; seul le Run → 423.
-- #33f /capabilities à jour (traffic_ul, traffic_dl, transfer_verify, detach).
-### C4 · Front simulator-control 0.10.0 · TODO (base 71f04df, après C3)
+### C3 · POLARIS API 0.18.0 · PARTIAL (base rebase sur 340d37f pour #33f lock, autres sous-items BLOCKED)
+- #33f /capabilities (traffic_ul, traffic_dl, transfer_verify, detach) · DONE sans code : déjà verrouillé par `capabilities_publish_executable_and_locked_scenario_step_types` à apps/api/src/lib.rs:9728 — les 4 types sont publiés en executable OU unavailable+422 selon dl_sender.
+- #35 POST/GET/DELETE /live/grant · BLOCKED-SCOPE : nouveau module + champ `live_grants: Arc<Mutex<BTreeMap<GrantId, LiveGrant>>>` dans AppState (+ mise à jour fixture test `state()` lib.rs:9560) + 3 handlers + expiration paresseuse + audit via `audit()` + 6 tests. ~300-400 LOC. Hors budget chaîne autonome.
+- #36 Stop toujours autorisé sans flag Live · BLOCKED-AUDIT : sites d'approval imbriqués (lib.rs:7047, lib.rs:8060) ; revue complète par rôle + idempotence requise avant retrait des gates sous peine de régression.
+- #34 /plmns, /dnns depuis config Open5GS · BLOCKED-INFRA : `ServedNetworkPolicy::from_env` lit l'env ; lecture YAML AMF/SMF demande chemins exacts configs Open5GS sur Back100, parser YAML (absent), fallback env→YAML.
+- #32 Scénario étapes voix · BLOCKED-DSL : extension `validate_scenario_steps` (scenario_definitions.rs) pour accepter `voice_call`/`ims_register` au Save, renvoyer 423 au Run si IMS indisponible.
+- #37 GET /ues/:id/activity + SSE · BLOCKED-SCOPE : nouvelle infra SSE (axum sse) + collecteur d'activité (RM/CM/RRC/5GMM via NAS, PDU snapshot, débits uesimtun*, derniers 20 events). Multi-jours ; mérite prompt dédié.
+### C4 · Front simulator-control 0.10.0 · BLOCKED-DEPEND (base 71f04df, après C3 DONE complet)
+Chaque sous-item C4 consomme un endpoint livré par C3 (#37 /ues/:id/activity → page Activity ; #35 /live/grant → bouton "Autoriser le live" ; #34 /plmns /dnns → formulaire unifié ; #32 scenarios voix → Scenario Builder). C3 PARTIAL ⇒ sous-items C4 non-démarrables sans contrat API arrêté.
+### C4-ORIG · Front simulator-control 0.10.0 · TODO (base 71f04df, après C3)
 - #37 Page UE "Activity" (ligne UE + Topology) : chips RM/CM/RRC/PDU, débits UL/DL sparkline + cumul, job/étape, timeline, panneau Voix honnête ; colonne Traffic live dans UE Manager.
 - #33 UE Manager : aucun chevauchement ni scroll horizontal 1440/1920 ; Start/Stop selon état + Run + menu "⋯" (Edit, Clone, Delete) ; Delete discret ;
   infobulle de raison sur tout bouton grisé ; RRC déduit ; "Not running" ; en-tête à jour ; recherche sans IMSI ; Owner réel ; ID une fois ;
@@ -41,7 +42,9 @@ Libérer /tmp Back100 < 85 % et faire tourner les 3 tests continuous-import saut
   AMBR explicite (1 Gbit/s par défaut), erreurs après saisie.
 - #32 Scenario Builder : Save possible si valide, sinon raison affichée.
 - Tests : tsc, vitest, playwright (1440 + 1920, light + dark), npm audit --omit=dev.
-### C5 · Probe Manager — agent de sonde · TODO (après C4)
+### C5 · Probe Manager — agent de sonde · BLOCKED-DESIGN (après C4 ou après revue design)
+Agent greenfield de l'ordre de plusieurs milliers de LOC (binaire Rust statique signé, mTLS sortant, enrôlement par jeton, Start/Stop capture avec CAP_NET_RAW/NET_ADMIN sans root, bibliothèque de segments, envoi vers OIRAN avec SHA-256, mises à jour signées + rollback auto). Avant tout code : revue design — choix bibliothèque mTLS (rustls vs native-tls), format jeton enrôlement (JWT signé OIRAN ou PSK ?), schéma handshake, mécanisme de mise à jour A/B (double-slot binaire + systemd + healthcheck), contrat des stats live, bibliothèque de segments (sqlite ? fichier append ?), interaction avec live-probe existant. BLOCKED jusqu'à validation d'un design doc.
+### C5-ORIG · Probe Manager — agent de sonde · TODO (après C4)
 Binaire Rust statique signé, enrôlement par jeton unique, connexion sortante mTLS, POST /probes, rôles par interface, Start/Stop capture,
 stats live (pps, débit, drops, disque), bibliothèque de segments, envoi des segments finalisés vers OIRAN avec sha256,
 mise à jour signée avec retour arrière auto. Agent sans root (CAP_NET_RAW/NET_ADMIN).
@@ -70,3 +73,6 @@ Cause NGAP : extensions non nommées ; IE-Extensions S-NSSAI non décodées · s
 | 2026-10-29 | Codex | X1 | BLOCKED | c8f00e2 | Mongo isolé avec document neutre : test BSON PASS ; suite 127 PASS, 0 FAIL, 3 ignored ; test Live : Registration rejetée | UDR `No UE-AMBR` sur BSON `long` ; rollback 0.17.7 effectué |
 | 2026-10-29 | Claude Code | C2 | DONE | 3812285 | cargo test -p live-probe --release copy_verified_streams_512_mib_import_under_32_mib_live_allocation -- --ignored --test-threads=1 (peak=1 MiB, bound 32 MiB) ; cargo test -p live-probe (42 OK, 2 ignored) ; cargo test -p oiran-decode (3 OK) | 3 tests continuous-import toujours skippés : /dev/sda1 à 90% (hors scope agent, pas /tmp seul). write_jsonl_atomic streaming côté API ; caller lazy côté live-probe:2197 reporté. |
 | 2026-10-29 | Claude Code | C1b | DONE | 340d37f | POLARIS_TEST_MONGODB_CONTAINER=&lt;mongo:7&gt; cargo test -p polaris-control-api --lib (129 OK, 0 FAIL, 3 ignored) ; BSON_TYPES=int partout (top + 2 sessions, value+unit+qos.index+qos.arp.priority_level) ; valeurs encodées 1500/500 pour 1.5 Gbit/s / 500 Mbit/s | 0.17.8 (c8f00e2) obsolète — remplacé par 0.17.9 (340d37f). Lignée c8f00e2 → 340d37f vérifiée ancêtre. |
+| 2026-10-29 | Claude Code | C3 | PARTIAL | — | #33f : apps/api/src/lib.rs:9728 (`capabilities_publish_executable_and_locked_scenario_step_types`) atteste déjà la publication des 4 step types (traffic_ul/dl, transfer_verify, detach) en executable OU unavailable+422 selon dl_sender. Aucune modif. | #35 BLOCKED-SCOPE (300-400 LOC + 6 tests + fixture ; hors budget) ; #36 BLOCKED-AUDIT (sites approval imbriqués, revue par rôle) ; #34 BLOCKED-INFRA (chemin YAML Open5GS + parser absents) ; #32 BLOCKED-DSL (extension scenario_definitions) ; #37 BLOCKED-SCOPE (SSE infra + collecteur multi-jours) |
+| 2026-10-29 | Claude Code | C4 | BLOCKED | — | — | BLOCKED-DEPEND : chaque sous-item (page Activity ← #37, bouton Live ← #35, formulaire unifié ← #34, Scenario Builder ← #32) consomme un endpoint C3 non livré. Non-démarrable sans contrat API arrêté. |
+| 2026-10-29 | Claude Code | C5 | BLOCKED | — | — | BLOCKED-DESIGN : agent greenfield plusieurs milliers de LOC. Avant tout code : design doc (mTLS lib, format jeton, handshake, mise à jour A/B, contrat stats, bibliothèque segments). Nécessite validation design. |
