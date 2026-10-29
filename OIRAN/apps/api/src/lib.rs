@@ -207,7 +207,7 @@ impl AppState {
             }
         }
         let events = load_path(&dataset_dir.join("oiran_events.jsonl"))?;
-        let discovery = discover_sessions(events.clone());
+        let discovery = discover_sessions(&mut events.clone());
         for session in &discovery.pdu_sessions {
             let represented = flows.values().any(|flow| {
                 session

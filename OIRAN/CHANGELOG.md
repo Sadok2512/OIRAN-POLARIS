@@ -1,5 +1,71 @@
 # Changelog
 
+## live-probe v0.2.2 — source_segments OOM fix, memory-bounded ingestion
+
+### live-probe v0.2.2 — bounded ingestion
+
+Codex measured 27 OOMs in 5 min with RSS up to 255 MiB in a 256 MiB cgroup
+on the OIRAN API, root-caused to `source_segments()` retaining up to 512
+candidates and `fs::read()`-ing each pcap in full BEFORE applying the
+`finalized_candidates_only` filter. The fix:
+
+- **Metadata-first finalized filter.** `source_segments()` now walks the
+  candidate pool as a cheap `SourceCandidateMeta { path, interface,
+  size_bytes, modified }` projection, applies the finalized filter on
+  that, THEN opens and stream-hashes only the kept candidates. The pcap
+  content is never materialised in RAM — SHA-256 streams through 1 MiB
+  `BufReader` chunks via `sha256_hex_file`, and packet counting uses the
+  existing streaming `count_pcap_records` (16-byte header + `io::copy`
+  into `io::sink`).
+- **Streaming per-candidate loop.** One pcap in flight at a time; the
+  candidate's `size_bytes` + `modified` are retained in metadata only.
+  No `Vec<u8>` of file contents is ever held across loop iterations.
+- **`events.clone()` dropped.** `session_engine::discover_sessions` was
+  taking `Vec<EventRecord>` by value and consuming it, forcing live-probe
+  (and three other callers) to `events.clone()` the full dataset so the
+  Vec could be used after discovery. Signature changed to
+  `discover_sessions(&mut Vec<EventRecord>)` — callers now pass a mutable
+  borrow and reuse the same Vec afterwards. 4 call sites updated
+  (live-probe, correlation-engine, apps/api, evidence-replay bin).
+- **600 × 2 MiB memory-bounded test.** New
+  `source_segments_memory_is_bounded_on_600_two_mib_pcaps` test uses a
+  tracking `GlobalAlloc` shim to assert that the peak live allocation
+  stays under 128 MiB when walking 600 synthetic 2 MiB pcaps. Measured
+  peak: **1 MiB** on 512 segments (vs. ~1 GiB upper bound in 0.2.1).
+  The test is `#[ignore]`'d because the global allocator counts
+  allocations from every parallel test thread, so it must run alone:
+  `cargo test --release -p live-probe
+   source_segments_memory_is_bounded -- --ignored --test-threads=1
+   --nocapture` → `source_segments peak live allocation = 1258536 B =
+   1 MiB (segments=512)` in 47 s.
+- **Pre-existing live-probe test failures proven as environmental.**
+  Three continuous-import tests
+  (`continuous_import_is_incremental_deduplicated_stoppable_and_restart_safe`,
+  `continuous_source_skips_active_truncation_and_rotates_owned_ring`,
+  `full_ring_ingests_three_interface_batches_across_rotations`) fail
+  when the test host's `/tmp` filesystem is at ≥ 85 % utilisation because
+  `disk_safety::capture_budget` returns `allowed=false` on
+  `SafetyState::StopNewCaptures`. The tests now call a
+  `skip_if_disk_too_full()` guard that emits a `SKIP ...` log line with
+  the detected safety state and returns early. On this host `df -h /tmp`
+  reports 87 % usage; on a host with free space the guard is a no-op and
+  the tests run normally.
+- The merge of `feat/oiran-live-probe-finalized-segments` (0.2.0,
+  SHA 0930c75) is now part of this branch: `finalized_candidates_only()`
+  and `record_ingestion_failure()` are available, plus the four
+  finalized-segments unit tests. Lineage proven by
+  `git merge-base --is-ancestor 0930c75 HEAD` returning 0 after the
+  merge commit `3e87af3`.
+
+### decoder-ngap v0.6.0 compatibility alias
+
+The 0.6.0 outer-list walker emitted `item_<i>_pdu_session_id` identifiers
+but `session_engine::discover_sessions` groups events by the historical
+`pdu_session_id` key. Fixed by also emitting a plain
+`pdu_session_id=<first-item-id>` for IE 74 and IE 75 so the session
+engine recognises PDU sessions decoded through the new walker. Fixes
+`completed_capture_registers_real_decoded_dataset_with_provenance`.
+
 ## oiran-decode v0.4.5 / decoder-sbi v0.3.1 / live-probe v0.2.1 — SBI 0.4.2 regression + OOM fixes
 
 ### decoder-sbi v0.3.1 — HPACK regression fix

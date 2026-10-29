@@ -474,6 +474,13 @@ fn append_sureq_item_summary(
         ",item_{index}_pdu_session_id={}",
         item.pdu_session_id
     ));
+    // Compatibility alias so the session engine can group events by PDU
+    // session (it keys on the plain `pdu_session_id` identifier). We emit
+    // the FIRST item's PDU session id as the canonical value; multi-session
+    // PDUs still expose each item under the `item_<i>_pdu_session_id` keys.
+    if index == 0 {
+        value.push_str(&format!(",pdu_session_id={}", item.pdu_session_id));
+    }
     value.push_str(&format!(",item_{index}_sst={}", item.s_nssai.sst));
     if let Some(sd) = &item.s_nssai.sd {
         value.push_str(&format!(
@@ -523,6 +530,9 @@ fn append_sures_item_summary(
         ",item_{index}_pdu_session_id={}",
         item.pdu_session_id
     ));
+    if index == 0 {
+        value.push_str(&format!(",pdu_session_id={}", item.pdu_session_id));
+    }
     if item.ie_extensions_present {
         value.push_str(&format!(",item_{index}_ie_extensions=present"));
     }
