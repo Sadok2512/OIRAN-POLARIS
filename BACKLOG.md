@@ -46,7 +46,11 @@ stats live (pps, débit, drops, disque), bibliothèque de segments, envoi des se
 mise à jour signée avec retour arrière auto. Agent sans root (CAP_NET_RAW/NET_ADMIN).
 
 ## Codex
-### X1 · Déployer POLARIS 0.17.8 (c8f00e2) · TODO
+### X1 · Déployer POLARIS 0.17.8 (c8f00e2) · BLOCKED
+Rollback vers 0.17.7 : le test Mongo isolé passe, mais Open5GS 2.8.0 rejette
+réellement les AMBR BSON `long` (`UDR: No UE-AMBR`, AMF `GET am-data` 400).
+Le profil, le scénario et l'abonné synthétique X1 ont été supprimés ; flag Live
+absent et labo revenu à zéro UE actif.
 ### X2 · Déployer OIRAN live-probe 0.2.3 + oiran-decode 0.4.5 · TODO (après C2)
 ### X3 · Déployer POLARIS 0.18.0 + front 0.10.0 + parcours UI réel · TODO (après C3 + C4)
 ### X4 · IMS-lite · TODO (après X3)
@@ -56,9 +60,10 @@ mise à jour signée avec retour arrière auto. Agent sans root (CAP_NET_RAW/NET
 #31 créer slices/DNN depuis l'UI (0.19.0) · IMS voie B · multi-instances / réseau réel.
 
 ## Écarts ouverts
-Cause NGAP : extensions non nommées ; IE-Extensions S-NSSAI non décodées · segment exact des anciens échecs d'import non conservé · pertes UDP > 50 Mbit/s (buffers gNB UERANSIM).
+Cause NGAP : extensions non nommées ; IE-Extensions S-NSSAI non décodées · segment exact des anciens échecs d'import non conservé · pertes UDP > 50 Mbit/s (buffers gNB UERANSIM) · POLARIS 0.17.8 écrit l'AMBR en BSON `long`, refusé par l'UDR Open5GS 2.8.0 du labo.
 
 ## Journal
 | Date | Agent | Tâche | Statut | SHA | Tests | Écarts |
 |---|---|---|---|---|---|---|
 | 2026-10-29 | Claude Code | C1 | DONE | c8f00e2 | cargo test -p polaris-control-api --lib (127 OK, Mongo réel) | — |
+| 2026-10-29 | Codex | X1 | BLOCKED | c8f00e2 | Mongo isolé avec document neutre : test BSON PASS ; suite 127 PASS, 0 FAIL, 3 ignored ; test Live : Registration rejetée | UDR `No UE-AMBR` sur BSON `long` ; rollback 0.17.7 effectué |
