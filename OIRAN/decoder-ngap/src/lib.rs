@@ -10,7 +10,7 @@ use plugin_runtime::{
     PLUGIN_API_VERSION,
 };
 
-pub const VERSION: &str = "0.3.1";
+pub const VERSION: &str = "0.4.0";
 pub const SCHEMA_VERSION: &str = "3GPP TS 38.413 V17.3.0";
 pub const SCHEMA_SHA256: &str = "b705532dd52674fce67ccc01df7bd17a8412341ea82740c164029a5b545f04d2";
 #[derive(Default)]
@@ -409,19 +409,66 @@ fn decode_guami(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
     )
 }
 
-fn decode_pdu_session_list(_id: u16, v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
+fn decode_pdu_session_list(id: u16, v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
     if v.len() < 3 {
         return malformed();
     }
+    let (ip_label, teid_label) = pdu_session_tunnel_labels(id);
     let mut value = format!(
         "pdu_session_id={},nested_transfer_sha256={}",
         v[2],
         sha256_hex(&v[3..])
     );
     if let Some((ip, teid)) = decode_up_transport_tunnel(&v[3..]) {
-        value.push_str(&format!(",tunnel_endpoint_ip={ip},gtp_teid=0x{teid:x}"));
+        value.push_str(&format!(",{ip_label}={ip},{teid_label}=0x{teid:x}"));
+    }
+    if let Some(session_type) = decode_pdu_session_type_marker(&v[3..]) {
+        value.push_str(&format!(",pdu_session_type={session_type}"));
+    }
+    if nested_qos_flow_marker_present(&v[3..]) {
+        value.push_str(",qos_flow_setup_list=present");
     }
     (Some(value), DecodeStatus::Partial, false)
+}
+
+fn pdu_session_tunnel_labels(id: u16) -> (&'static str, &'static str) {
+    match id {
+        // PDUSessionResourceSetupListSUReq: AMF→gNB, carries UL NG-U UP TNL (UPF side).
+        74 => ("tunnel_ip_ul", "gtp_teid_ul"),
+        // PDUSessionResourceSetupListSURes: gNB→AMF, carries DL NG-U UP TNL (gNB side).
+        75 => ("tunnel_ip_dl", "gtp_teid_dl"),
+        // PDUSessionResourceSetupListCxtReq (71) and other list IEs: direction depends on
+        // the enclosing procedure; keep neutral labels so they remain usable.
+        _ => ("tunnel_endpoint_ip", "gtp_teid"),
+    }
+}
+
+/// Scan the nested PDUSessionResource*Transfer OCTET STRING for the PDU Session Type
+/// IE marker. IE id 134 is a 1-octet ENUMERATED (ipv4=0, ipv6=1, ipv4v6=2, ethernet=3,
+/// unstructured=4), encoded in APER as the top three bits of a single octet. Requiring
+/// the full `[00 86 crit 01 <val>]` prefix prevents arbitrary bytes from being evidence.
+fn decode_pdu_session_type_marker(v: &[u8]) -> Option<&'static str> {
+    v.windows(5).find_map(|w| {
+        if w[0..2] != [0x00, 0x86] || w[2] & 0x3f != 0 || w[3] != 1 {
+            return None;
+        }
+        match w[4] >> 5 {
+            0 => Some("ipv4"),
+            1 => Some("ipv6"),
+            2 => Some("ipv4v6"),
+            3 => Some("ethernet"),
+            4 => Some("unstructured"),
+            _ => None,
+        }
+    })
+}
+
+/// Detect the presence of the QoSFlowSetupRequestList / QoSFlowPerTNLInformation IE
+/// container (id 136 = 0x0088) inside the nested transfer. We only report presence
+/// because the inner QFI bitfield cannot be decoded without full APER walking.
+fn nested_qos_flow_marker_present(v: &[u8]) -> bool {
+    v.windows(4)
+        .any(|w| w[0..2] == [0x00, 0x88] && w[2] & 0x3f == 0 && w[3] > 0)
 }
 
 /// Decode the observed NGAP UPTransportLayerInformation GTP tunnel open type.
@@ -599,7 +646,10 @@ impl ProtocolDecoder for NgapDecoder {
             supports_extensions: false,
             limitations: &[
                 "schema-derived generic IE container with partial typed IE coverage",
-                "nested transfer syntax is retained but not typed",
+                "nested PDU session SM transfers are partially typed: UP TNL (UL/DL \
+                 direction via IE 74/75), PDU session type and QoS flow setup presence \
+                 are detected by structural markers; QFI, QoS profile and secondary \
+                 fields are retained as SHA-256 provenance",
                 "APER fragmented lengths and extension additions unsupported",
                 "NAS contents are not decrypted",
             ],
@@ -645,6 +695,15 @@ impl ProtocolDecoder for NgapDecoder {
                                 ) || matches!(
                                     key,
                                     "pdu_session_id" | "sst" | "sd" | "nr_cell_id" | "tac" | "plmn"
+                                ) || matches!(
+                                    key,
+                                    "tunnel_endpoint_ip"
+                                        | "tunnel_ip_ul"
+                                        | "tunnel_ip_dl"
+                                        | "gtp_teid"
+                                        | "gtp_teid_ul"
+                                        | "gtp_teid_dl"
+                                        | "pdu_session_type"
                                 ) {
                                     identifiers.push(NamedValue {
                                         name: key.into(),
@@ -1113,4 +1172,72 @@ fn up_transport_tunnel_is_structurally_normalized() {
 fn arbitrary_endpoint_bytes_are_not_tunnel_evidence() {
     let bytes = [10, 77, 22, 13, 0, 0, 0xb3, 0xb5];
     assert!(decode_up_transport_tunnel(&bytes).is_none());
+}
+
+#[test]
+fn pdu_session_su_req_tags_ul_tunnel_and_session_type() {
+    // Synthetic SUReq item: count=0 (1 item), SEQUENCE preamble=0, pDUSessionID=5,
+    // then an all-zero prefix padded ahead of recognizable [00 86 00 01 00] (ipv4)
+    // and the UP-Transport-Layer-Information marker [00 8b 00 0a 01 f0 ip teid].
+    let v = [
+        0x00, 0x00, 0x05, // count, preamble, pDUSessionID=5
+        0x00, 0x00, 0x00, // s-NSSAI (sst=0, no sd) rough padding
+        // id-PDUSessionType marker (IE 134 inside nested transfer): ipv4=0b000xxxxx
+        0x00, 0x86, 0x00, 0x01, 0x00,
+        // UL NG-U UP TNL Information marker (IE 139 inside nested transfer):
+        0x00, 0x8b, 0x00, 0x0a, 0x01, 0xf0,
+        10, 77, 11, 22, // transportLayerAddress (IPv4)
+        0x00, 0x00, 0xca, 0xfe, // gTP-TEID
+    ];
+    let (out, status, sensitive) = decode_pdu_session_list(74, &v);
+    assert_eq!(status, DecodeStatus::Partial);
+    assert!(!sensitive);
+    let out = out.expect("some");
+    assert!(out.contains("pdu_session_id=5"), "{out}");
+    assert!(out.contains("tunnel_ip_ul=10.77.11.22"), "{out}");
+    assert!(out.contains("gtp_teid_ul=0xcafe"), "{out}");
+    assert!(out.contains("pdu_session_type=ipv4"), "{out}");
+}
+
+#[test]
+fn pdu_session_su_res_tags_dl_tunnel() {
+    let v = [
+        0x00, 0x00, 0x07, // count, preamble, pDUSessionID=7
+        0x00, 0x00, // padding before transfer OCTET STRING
+        0x00, 0x8b, 0x00, 0x0a, 0x01, 0xf0,
+        192, 0, 2, 1, // transportLayerAddress (IPv4, TEST-NET-1)
+        0x00, 0x00, 0xbe, 0xef, // gTP-TEID
+    ];
+    let (out, status, _) = decode_pdu_session_list(75, &v);
+    assert_eq!(status, DecodeStatus::Partial);
+    let out = out.expect("some");
+    assert!(out.contains("pdu_session_id=7"), "{out}");
+    assert!(out.contains("tunnel_ip_dl=192.0.2.1"), "{out}");
+    assert!(out.contains("gtp_teid_dl=0xbeef"), "{out}");
+}
+
+#[test]
+fn pdu_session_qos_flow_setup_marker_is_detected_structurally() {
+    // Nested IE 136 (0x0088) prefix: [00 88 crit len>0]. With real QoS content
+    // the identifier reports presence only.
+    let v = [
+        0x00, 0x00, 0x02, // count, preamble, pDUSessionID=2
+        0x00, 0x00, 0x00, // padding
+        0x00, 0x88, 0x00, 0x05, 0x00, 0x12, 0x34, 0x56, 0x78,
+    ];
+    let (out, _, _) = decode_pdu_session_list(74, &v);
+    let out = out.expect("some");
+    assert!(out.contains("qos_flow_setup_list=present"), "{out}");
+}
+
+#[test]
+fn pdu_session_type_marker_does_not_match_arbitrary_bytes() {
+    assert_eq!(decode_pdu_session_type_marker(&[0x00, 0x86, 0x40, 0x01, 0x00]), Some("ipv4"));
+    assert_eq!(decode_pdu_session_type_marker(&[0x00, 0x86, 0x00, 0x01, 0x40]), Some("ipv4v6"));
+    // Length byte != 1 → rejected.
+    assert!(decode_pdu_session_type_marker(&[0x00, 0x86, 0x00, 0x02, 0x00]).is_none());
+    // Low bits of criticality must be zero.
+    assert!(decode_pdu_session_type_marker(&[0x00, 0x86, 0x01, 0x01, 0x00]).is_none());
+    // Reserved enum value → rejected.
+    assert!(decode_pdu_session_type_marker(&[0x00, 0x86, 0x00, 0x01, 0xa0]).is_none());
 }

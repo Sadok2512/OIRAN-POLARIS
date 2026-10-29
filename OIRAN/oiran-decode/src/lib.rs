@@ -18,7 +18,7 @@ use std::{
 use transport_sctp::SctpReassembler;
 use transport_tcp::TcpReassembler;
 
-pub const VERSION: &str = "0.3.1";
+pub const VERSION: &str = "0.4.0";
 
 #[derive(Clone, Debug)]
 pub struct DecodeConfig {

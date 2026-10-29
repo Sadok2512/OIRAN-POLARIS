@@ -3,7 +3,7 @@
 
 use event_schema::{pseudonym, sha256_hex, DecodeStatus, InformationElement, NamedValue};
 
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.3.0";
 pub const SPECIFICATION: &str = "3GPP TS 24.501 Release 17 + 3GPP TS 24.301";
 pub const EPD_5GMM: u8 = 0x7e;
 pub const EPD_5GSM: u8 = 0x2e;
@@ -276,7 +276,42 @@ fn parse_5gmm_body(msg: &mut NasMessage, payload: &[u8], depth: u8) {
             ));
             parse_optional_tlvs(msg, &payload[5 + len..], 5 + len);
         }
-        0x57 | 0x5d | 0x5e | 0x5f | 0x42 | 0x43 | 0x45 | 0x46 | 0x47 | 0x48 | 0x4c | 0x4d
+        0x5d => {
+            // TS 24.501 §8.2.25 Security Mode Command: mandatory fields are
+            // Selected NAS security algorithms (V, 1), ngKSI + spare half-octet
+            // (V, 1) and Replayed UE security capabilities (LV, 3-9).
+            if payload.len() < 6 {
+                return mark_truncated(msg, "Security Mode Command mandatory fields");
+            }
+            msg.information_elements.push(ie(
+                "Selected NAS security algorithms",
+                &payload[3..4],
+                Some(format!(
+                    "ciphering=0x{:x},integrity=0x{:x}",
+                    payload[3] >> 4,
+                    payload[3] & 0x0f
+                )),
+                DecodeStatus::Decoded,
+            ));
+            msg.information_elements.push(ie(
+                "ngKSI",
+                &payload[4..5],
+                Some((payload[4] & 0x07).to_string()),
+                DecodeStatus::Decoded,
+            ));
+            let replayed_len = payload[5] as usize;
+            if 6 + replayed_len > payload.len() {
+                return mark_truncated(msg, "Replayed UE security capabilities");
+            }
+            msg.information_elements.push(ie(
+                "Replayed UE security capabilities",
+                &payload[6..6 + replayed_len],
+                decode_ue_security_capability(&payload[6..6 + replayed_len]),
+                DecodeStatus::Decoded,
+            ));
+            parse_optional_tlvs(msg, &payload[6 + replayed_len..], 6 + replayed_len);
+        }
+        0x57 | 0x5e | 0x5f | 0x42 | 0x43 | 0x45 | 0x46 | 0x47 | 0x48 | 0x4c | 0x4d
         | 0x54 | 0x55 | 0x5b | 0x5c => parse_optional_tlvs(msg, &payload[3..], 3),
         0x67 | 0x68 => {
             if payload.len() < 6 {
@@ -488,6 +523,16 @@ fn parse_optional_tlvs(msg: &mut NasMessage, bytes: &[u8], base: usize) {
                 DecodeStatus::Partial,
             ),
             0x2a => ("Session AMBR", None, DecodeStatus::Partial),
+            0x2e => (
+                "UE security capability",
+                decode_ue_security_capability(value),
+                DecodeStatus::Decoded,
+            ),
+            0x36 => (
+                "Additional 5G security information",
+                decode_additional_5g_security_information(value),
+                DecodeStatus::Decoded,
+            ),
             0x21 => ("RAND", None, DecodeStatus::Decoded),
             0x20 => ("AUTN", None, DecodeStatus::Decoded),
             0x2d => (
@@ -568,6 +613,34 @@ fn decode_pdu_address(value: &[u8]) -> Option<String> {
         [kind, a, b, c, d] => Some(format!("type={},address={a}.{b}.{c}.{d}", kind & 0x07)),
         _ => None,
     }
+}
+
+/// Decode UE security capability (TS 24.501 §9.11.3.54): first two octets are the 5G
+/// NR encryption/integrity algorithm bitmaps; additional pairs encode EPS algorithms.
+fn decode_ue_security_capability(value: &[u8]) -> Option<String> {
+    if value.len() < 2 {
+        return None;
+    }
+    let mut parts = vec![
+        format!("nr_encryption=0x{:02x}", value[0]),
+        format!("nr_integrity=0x{:02x}", value[1]),
+    ];
+    if value.len() >= 4 {
+        parts.push(format!("eutra_encryption=0x{:02x}", value[2]));
+        parts.push(format!("eutra_integrity=0x{:02x}", value[3]));
+    }
+    Some(parts.join(","))
+}
+
+/// Decode Additional 5G security information (TS 24.501 §9.11.3.12). Single octet
+/// carrying RINMR (bit 1) and HDP (bit 2); upper bits are spare.
+fn decode_additional_5g_security_information(value: &[u8]) -> Option<String> {
+    let byte = *value.first()?;
+    Some(format!(
+        "rinmr={},hdp={}",
+        (byte & 0x02) >> 1,
+        (byte & 0x04) >> 2
+    ))
 }
 
 fn mm_name(mt: u8) -> (&'static str, &'static str) {
@@ -1256,6 +1329,67 @@ mod tests {
         let r = decode(&hex("2e0101d159012a59022b2c"));
         assert_eq!(r.cause, Some(0x2a));
         assert!(r.information_elements.len() >= 2);
+    }
+
+    #[test]
+    fn registration_request_decodes_ue_security_capability_iei_2e() {
+        // 7e 00 41 → plain 5GMM Registration Request.
+        // Mandatory: 09 (reg_type/ngKSI), length 0004, 5GS mobile identity 00112233.
+        // Optional TLV: 2e (UE security capability) length 04 value 80 80 e0 f0.
+        let bytes = hex("7e004109000400112233 2e048080e0f0".replace(' ', "").as_str());
+        let r = decode(&bytes);
+        assert_eq!(r.message_name, "Registration Request");
+        assert_eq!(r.status, DecodeStatus::Decoded, "status: {:?}", r.status);
+        let ie_ue = r
+            .information_elements
+            .iter()
+            .find(|e| e.name == "UE security capability")
+            .expect("UE security capability IE");
+        let value = ie_ue.value.as_deref().expect("decoded value");
+        assert!(value.contains("nr_encryption=0x80"), "{value}");
+        assert!(value.contains("nr_integrity=0x80"), "{value}");
+        assert!(value.contains("eutra_encryption=0xe0"), "{value}");
+        assert!(value.contains("eutra_integrity=0xf0"), "{value}");
+    }
+
+    #[test]
+    fn security_mode_command_decodes_mandatory_fields_and_additional_info_iei_36() {
+        // Plain 5GMM Security Mode Command (0x7e 00 5d):
+        //   Selected NAS security algorithms: 0x22 → ciphering=2 (NEA2), integrity=2 (NIA2).
+        //   ngKSI + spare: 0x01 → ngKSI=1.
+        //   Replayed UE security capability LV: len=4 value 80 80 e0 f0.
+        //   Optional: 36 (Additional 5G security info) length 1 value 02 → rinmr=1, hdp=0.
+        let bytes = hex(
+            "7e005d220104 8080e0f0 3601 02"
+                .replace(' ', "")
+                .as_str(),
+        );
+        let r = decode(&bytes);
+        assert_eq!(r.message_name, "Security Mode Command");
+        assert_eq!(r.status, DecodeStatus::Decoded, "status: {:?}", r.status);
+        let sel = r
+            .information_elements
+            .iter()
+            .find(|e| e.name == "Selected NAS security algorithms")
+            .expect("Selected NAS algs IE");
+        let sel_v = sel.value.as_deref().expect("decoded value");
+        assert!(sel_v.contains("ciphering=0x2"), "{sel_v}");
+        assert!(sel_v.contains("integrity=0x2"), "{sel_v}");
+        let replayed = r
+            .information_elements
+            .iter()
+            .find(|e| e.name == "Replayed UE security capabilities")
+            .expect("Replayed UE security capability IE");
+        let replayed_v = replayed.value.as_deref().expect("decoded value");
+        assert!(replayed_v.contains("nr_encryption=0x80"), "{replayed_v}");
+        let addl = r
+            .information_elements
+            .iter()
+            .find(|e| e.name == "Additional 5G security information")
+            .expect("Additional 5G security info IE");
+        let addl_v = addl.value.as_deref().expect("decoded value");
+        assert!(addl_v.contains("rinmr=1"), "{addl_v}");
+        assert!(addl_v.contains("hdp=0"), "{addl_v}");
     }
 
     fn hex(s: &str) -> Vec<u8> {

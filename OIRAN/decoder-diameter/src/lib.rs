@@ -16,7 +16,7 @@ use plugin_runtime::{
     PLUGIN_API_VERSION,
 };
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 pub const SCHEMA_VERSION: &str = "IETF RFC 6733 + 3GPP TS 29.272";
 
 #[derive(Default)]
@@ -134,7 +134,8 @@ fn is_grouped_avp(code: u32, vendor_id: Option<u32>) -> bool {
     // Known grouped AVPs in RFC 6733 base and 3GPP S6a (TS 29.272).
     matches!(
         (code, vendor_id),
-        (284, None) // Proxy-Info
+        (260, None) // Vendor-Specific-Application-Id (RFC 6733 §6.11)
+            | (284, None) // Proxy-Info
             | (297, None) // Experimental-Result
             | (1400, Some(10415)) // Subscription-Data
             | (1430, Some(10415)) // APN-Configuration-Profile
@@ -175,6 +176,21 @@ fn decode_avp(
         (264, None) => decode_octet_string("origin_host", &avp.value, name),
         (293, None) => decode_octet_string("destination_host", &avp.value, name),
         (283, None) => decode_octet_string("destination_realm", &avp.value, name),
+        (263, None) => decode_octet_string("session_id", &avp.value, name),
+        (277, None) => decode_u32("auth_session_state", &avp.value, name),
+        (278, None) => decode_u32("origin_state_id", &avp.value, name),
+        (258, None) => decode_u32("auth_application_id", &avp.value, name),
+        (259, None) => decode_u32("acct_application_id", &avp.value, name),
+        (266, None) => decode_u32("vendor_id", &avp.value, name),
+        (260, None) => (
+            Some(format!(
+                "vendor_specific_application_id_children={}",
+                avp.children.len()
+            )),
+            DecodeStatus::Decoded,
+            false,
+            name,
+        ),
         (1407, Some(10415)) => decode_plmn_avp("visited_plmn_id", &avp.value, name),
         (1400, Some(10415)) => (
             Some(format!(
@@ -284,10 +300,15 @@ fn command_name(code: u32, is_request: bool) -> &'static str {
 fn avp_name(code: u32, vendor: Option<u32>) -> Option<&'static str> {
     Some(match (code, vendor) {
         (1, None) => "User-Name",
+        (258, None) => "Auth-Application-Id",
+        (259, None) => "Acct-Application-Id",
+        (260, None) => "Vendor-Specific-Application-Id",
         (263, None) => "Session-Id",
         (264, None) => "Origin-Host",
+        (266, None) => "Vendor-Id",
         (268, None) => "Result-Code",
         (277, None) => "Auth-Session-State",
+        (278, None) => "Origin-State-Id",
         (283, None) => "Destination-Realm",
         (293, None) => "Destination-Host",
         (296, None) => "Origin-Realm",
@@ -449,6 +470,11 @@ fn emit_avp(
                         | "visited_plmn_id"
                         | "origin_host"
                         | "origin_realm"
+                        | "destination_host"
+                        | "destination_realm"
+                        | "session_id"
+                        | "origin_state_id"
+                        | "auth_session_state"
                 ) {
                     identifiers.push(NamedValue {
                         name: key.into(),
@@ -718,5 +744,67 @@ mod tests {
         let m = DiameterDecoder.manifest();
         assert_eq!(m.protocol, Protocol::Diameter);
         plugin_runtime::validate_manifest(&m).expect("valid manifest");
+    }
+
+    #[test]
+    fn base_s6a_avps_keep_decoded_status() {
+        // Sanitized synthetic ULR with Session-Id, Origin-Host/Realm, Destination-Realm,
+        // Vendor-Specific-Application-Id (grouped: Vendor-Id 10415 + Auth-Application-Id 16777251),
+        // Origin-State-Id, Auth-Session-State and User-Name. All identities synthetic (PLMN 001/01).
+        let session_id = b"synthetic.mme.example.org;1;1;0";
+        let origin_host = b"synthetic.mme.example.org";
+        let origin_realm = b"example.org";
+        let dest_realm = b"hss.example.org";
+        let user_name = b"001010000000012";
+        let vendor_id_child = avp(266, None, 0x40, &[0, 0, 0x28, 0xaf]); // 10415
+        let auth_app_id_child = avp(258, None, 0x40, &[0x01, 0, 0, 0x23]); // 16777251 (S6a)
+        let mut vsai_group = Vec::new();
+        vsai_group.extend_from_slice(&vendor_id_child);
+        vsai_group.extend_from_slice(&auth_app_id_child);
+        let mut body = Vec::new();
+        body.extend_from_slice(&avp(263, None, 0x40, session_id));
+        body.extend_from_slice(&avp(260, None, 0x40, &vsai_group));
+        body.extend_from_slice(&avp(277, None, 0x40, &[0, 0, 0, 1])); // NO_STATE_MAINTAINED
+        body.extend_from_slice(&avp(264, None, 0x40, origin_host));
+        body.extend_from_slice(&avp(296, None, 0x40, origin_realm));
+        body.extend_from_slice(&avp(283, None, 0x40, dest_realm));
+        body.extend_from_slice(&avp(278, None, 0x40, &[0, 0, 0x12, 0x34]));
+        body.extend_from_slice(&avp(1, None, 0x40, user_name));
+        body.extend_from_slice(&avp(1407, Some(10415), 0x40, &[0x00, 0xf1, 0x10]));
+        let bytes = message(316, true, 16777251, &body);
+        let (p, t) = fixtures();
+        let in_ = input(&bytes, &p, &t, "MME", "HSS");
+        let out = DiameterDecoder.decode(&in_);
+        assert_eq!(out.status, DecodeStatus::Decoded, "status: {:?}", out.status);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let ev = &out.events[0];
+        let id = |k: &str| {
+            ev.session_identifiers
+                .iter()
+                .find(|v| v.name == k)
+                .map(|v| v.value.clone())
+        };
+        assert_eq!(id("origin_state_id").as_deref(), Some("4660"));
+        assert_eq!(id("auth_session_state").as_deref(), Some("1"));
+        assert_eq!(id("origin_host").as_deref(), Some("synthetic.mme.example.org"));
+        assert_eq!(id("origin_realm").as_deref(), Some("example.org"));
+        assert_eq!(id("destination_realm").as_deref(), Some("hss.example.org"));
+        assert!(id("session_id").as_deref().unwrap().starts_with("synthetic.mme"));
+        assert!(ev
+            .information_elements
+            .iter()
+            .any(|e| e.name == "Vendor-Specific-Application-Id"));
+        assert!(ev
+            .information_elements
+            .iter()
+            .any(|e| e.name == "Auth-Application-Id"));
+        assert!(ev
+            .information_elements
+            .iter()
+            .any(|e| e.name == "Vendor-Id"));
+        assert!(ev
+            .information_elements
+            .iter()
+            .any(|e| e.name == "Origin-State-Id"));
     }
 }

@@ -1,5 +1,34 @@
 # Changelog
 
+## oiran-decode v0.4.0 — N2 SM transfer typing, Diameter S6a base, Security Mode Command
+
+- `decoder-ngap v0.4.0`: PDUSessionResourceSetupListSUReq (IE 74) and
+  PDUSessionResourceSetupListSURes (IE 75) now expose direction-tagged tunnel
+  evidence from the nested PDU Session Resource Setup Request/Response Transfer.
+  IE 74 yields `tunnel_ip_ul` + `gtp_teid_ul`, IE 75 yields `tunnel_ip_dl` +
+  `gtp_teid_dl`. Structural scan also reports `pdu_session_type` (ipv4, ipv6,
+  ipv4v6, ethernet, unstructured) and the presence of a QoS Flow setup list. The
+  overall message status stays `PARTIAL` because QFI, QoS profile and secondary
+  fields remain SHA-256 provenance; the correlation keys needed for NGAP ↔ PFCP
+  ↔ GTP-U are now emitted explicitly instead of being hidden behind an
+  undirected `tunnel_endpoint_ip`/`gtp_teid` pair.
+- `decoder-nas v0.3.0` (TS 24.501):
+  - Registration Request now decodes the optional UE security capability
+    (IEI 0x2E = 46). The IE value is parsed into `nr_encryption`,
+    `nr_integrity`, and when present `eutra_encryption`/`eutra_integrity`.
+  - Security Mode Command (0x5D) now has a dedicated parser: Selected NAS
+    security algorithms (ciphering/integrity half-octets), ngKSI, Replayed UE
+    security capability (LV) and the optional Additional 5G security information
+    (IEI 0x36 = 54) which reports `rinmr` and `hdp`.
+- `decoder-diameter v0.2.0` (RFC 6733 + 3GPP TS 29.272): added base AVPs
+  Origin-State-Id (278), Session-Id (263), Auth-Session-State (277),
+  Vendor-Specific-Application-Id (260, grouped), Vendor-Id (266), Auth- and
+  Acct-Application-Id (258/259). These AVPs previously forced S6a messages to
+  `PARTIAL` because they were unsupported.
+- All new fixtures are synthetic (PLMN 001/01 or TEST-NET addresses). No real
+  identity, SUPI, K, OPc, SUCI, GUTI, IMEI or IMSI material is present in test
+  code.
+
 ## decoder-ngap v0.3.1 / oiran-decode v0.3.1 - NGAP status correction
 
 - Mark a structurally bounded NAS-PDU information element as decoded at the
