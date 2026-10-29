@@ -509,8 +509,14 @@ pub fn render_profile_with_gnbs(
     {
         return Err("invalid subscriber secret material".into());
     }
+    let ue_index = profile
+        .ue_id
+        .strip_prefix("UE-")
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or("invalid UE profile identifier")?;
     Ok(format!(
-        "supi: '{supi}'\nmcc: '{mcc}'\nmnc: '{mnc}'\nkey: '{key}'\nopType: 'OPC'\nop: '{opc}'\namf: '8000'\ngnbSearchList:\n  - {gnb_link_ip}\nconfigured-nssai: [{{sst: {sst}, sd: 0x{sd}}}]\ndefault-nssai: [{{sst: {sst}, sd: 0x{sd}}}]\nsessions:\n  - type: 'IPv4'\n    apn: '{dnn}'\n    slice: {{sst: {sst}, sd: 0x{sd}}}\n",
+        "supi: '{supi}'\nmcc: '{mcc}'\nmnc: '{mnc}'\nprotectionScheme: 0\nhomeNetworkPublicKey: '5a8d38864820197c3394b92613b20b91633cbd897119273bf8e4a6f4eec0a650'\nhomeNetworkPublicKeyId: 1\nroutingIndicator: '0000'\nkey: '{key}'\nop: '{opc}'\nopType: 'OPC'\namf: '8000'\nimei: '356938035{ue_index:06}'\nimeiSv: '356938035{ue_index:07}'\ngnbSearchList: [{gnb_link_ip}]\nuacAic: {{mps: false, mcs: false}}\nuacAcc: {{normalClass: 0, class11: false, class12: false, class13: false, class14: false, class15: false}}\nsessions:\n  - type: IPv4\n    apn: {dnn}\n    slice: {{sst: {sst}, sd: 0x{sd}}}\nconfigured-nssai: [{{sst: {sst}, sd: 0x{sd}}}]\ndefault-nssai: [{{sst: {sst}, sd: 0x{sd}}}]\nintegrity: {{IA1: true, IA2: true, IA3: true}}\nciphering: {{EA1: true, EA2: true, EA3: true}}\nintegrityMaxRate: {{uplink: full, downlink: full}}\n",
+        ue_index = ue_index,
         gnb_link_ip = gnb_link_ip,
         supi = secrets.supi,
         mcc = profile.plmn_mcc,
@@ -622,7 +628,7 @@ mod tests {
     fn gnb01_rendering_is_byte_identical_to_the_attested_format() {
         // Existing provisioning attestations bind the SHA-256 of these exact bytes.
         let profile = planned_profiles().remove(0);
-        let expected = "supi: 'imsi-999990000000001'\nmcc: '001'\nmnc: '01'\nkey: '00112233445566778899aabbccddeeff'\nopType: 'OPC'\nop: 'ffeeddccbbaa99887766554433221100'\namf: '8000'\ngnbSearchList:\n  - 10.77.0.20\nconfigured-nssai: [{sst: 1, sd: 0x010203}]\ndefault-nssai: [{sst: 1, sd: 0x010203}]\nsessions:\n  - type: 'IPv4'\n    apn: 'internet'\n    slice: {sst: 1, sd: 0x010203}\n";
+        let expected = "supi: 'imsi-999990000000001'\nmcc: '001'\nmnc: '01'\nprotectionScheme: 0\nhomeNetworkPublicKey: '5a8d38864820197c3394b92613b20b91633cbd897119273bf8e4a6f4eec0a650'\nhomeNetworkPublicKeyId: 1\nroutingIndicator: '0000'\nkey: '00112233445566778899aabbccddeeff'\nop: 'ffeeddccbbaa99887766554433221100'\nopType: 'OPC'\namf: '8000'\nimei: '356938035000001'\nimeiSv: '3569380350000001'\ngnbSearchList: [10.77.0.20]\nuacAic: {mps: false, mcs: false}\nuacAcc: {normalClass: 0, class11: false, class12: false, class13: false, class14: false, class15: false}\nsessions:\n  - type: IPv4\n    apn: internet\n    slice: {sst: 1, sd: 0x010203}\nconfigured-nssai: [{sst: 1, sd: 0x010203}]\ndefault-nssai: [{sst: 1, sd: 0x010203}]\nintegrity: {IA1: true, IA2: true, IA3: true}\nciphering: {EA1: true, EA2: true, EA3: true}\nintegrityMaxRate: {uplink: full, downlink: full}\n";
         assert_eq!(render_profile(&profile, test_secrets()).unwrap(), expected);
     }
 
@@ -641,7 +647,7 @@ mod tests {
             },
         ];
         let rendered = render_profile_with_gnbs(&profile, test_secrets(), &registry).unwrap();
-        assert!(rendered.contains("gnbSearchList:\n  - 10.77.0.22\n"));
+        assert!(rendered.contains("gnbSearchList: [10.77.0.22]\n"));
         assert!(!rendered.contains("10.77.0.20"));
     }
 
