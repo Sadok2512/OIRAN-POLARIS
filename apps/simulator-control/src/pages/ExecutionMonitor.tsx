@@ -174,6 +174,76 @@ export function ExecutionMonitorPage() {
                   compact
                 />
               </header>
+              {steps.data?.state ? (
+                <dl className="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-1 text-ep-sm mb-3">
+                  <dt className="text-text-secondary">Backend state</dt>
+                  <dd data-testid="backend-steps-state">{steps.data.state}</dd>
+                  <dt className="text-text-secondary">Started</dt>
+                  <dd data-testid="backend-steps-started">
+                    {steps.data.started_at
+                      ? epochSecondsToLocal(steps.data.started_at)
+                      : '—'}
+                  </dd>
+                  <dt className="text-text-secondary">Duration</dt>
+                  <dd className="num" data-testid="backend-steps-duration">
+                    {formatDurationMs(steps.data.duration_ms)}
+                  </dd>
+                  <dt className="text-text-secondary">Terminal step</dt>
+                  <dd className="mono text-ep-xs" data-testid="backend-steps-failed-step">
+                    {steps.data.failure?.step_id ?? '—'}
+                  </dd>
+                </dl>
+              ) : null}
+              {steps.data?.failure ? (
+                <article
+                  className="ep-card border-danger/40 bg-danger/5 p-3 mb-3 flex flex-col gap-2"
+                  data-testid="backend-steps-failure"
+                >
+                  <header className="flex items-center gap-2 text-ep-sm">
+                    <AlertTriangle className="text-danger" width={14} height={14} />
+                    <span className="font-semibold">Scenario failed</span>
+                    <span className="mono text-ep-xs">
+                      {steps.data.failure.code ?? 'UNKNOWN_ERROR'}
+                    </span>
+                  </header>
+                  {steps.data.failure.message ? (
+                    <p className="text-ep-sm" data-testid="backend-steps-failure-message">
+                      {steps.data.failure.message}
+                    </p>
+                  ) : null}
+                  <dl className="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-1 text-ep-xs">
+                    <dt className="text-text-secondary">Step name</dt>
+                    <dd>{steps.data.failure.step_name ?? '—'}</dd>
+                    <dt className="text-text-secondary">Started</dt>
+                    <dd>
+                      {steps.data.failure.started_at
+                        ? epochSecondsToLocal(steps.data.failure.started_at)
+                        : '—'}
+                    </dd>
+                    <dt className="text-text-secondary">Duration</dt>
+                    <dd className="num">{formatDurationMs(steps.data.failure.duration_ms)}</dd>
+                    <dt className="text-text-secondary">Ended</dt>
+                    <dd>
+                      {steps.data.failure.ended_at
+                        ? epochSecondsToLocal(steps.data.failure.ended_at)
+                        : '—'}
+                    </dd>
+                  </dl>
+                  {steps.data.failure.failure_evidence ? (
+                    <details className="text-ep-xs">
+                      <summary className="cursor-pointer text-text-secondary">
+                        failure_evidence (bounded)
+                      </summary>
+                      <pre
+                        className="mono text-ep-xs mt-1 whitespace-pre-wrap"
+                        data-testid="backend-steps-failure-evidence"
+                      >
+                        {JSON.stringify(steps.data.failure.failure_evidence, null, 2)}
+                      </pre>
+                    </details>
+                  ) : null}
+                </article>
+              ) : null}
               {steps.isLoading && !steps.data && <LoadingSkeleton label="Loading /steps" />}
               {steps.error && (
                 <p className="text-ep-xs text-error">
@@ -230,6 +300,16 @@ export function ExecutionMonitorPage() {
       )}
     </>
   );
+}
+
+function formatDurationMs(duration: number | null | undefined): string {
+  if (duration == null) return '—';
+  if (duration < 1000) return `${duration} ms`;
+  const seconds = duration / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)} s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds - minutes * 60);
+  return `${minutes}m ${rest}s`;
 }
 
 function BackendStepRow({ step }: { step: WireScenarioStepStatus }) {

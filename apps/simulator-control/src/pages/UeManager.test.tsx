@@ -153,8 +153,8 @@ describe('UE Profile Manager — pagination at 10K', () => {
     renderPage();
     const table = await screen.findByTestId('ue-table');
     const rows = within(table).getAllByRole('row');
-    // 1 header row + 50 body rows (default page size)
-    expect(rows.length).toBeLessThanOrEqual(51);
+    // 2 header rows (grouped Runtime header, 0.9.0) + 50 body rows
+    expect(rows.length).toBeLessThanOrEqual(52);
     expect(await screen.findByTestId('ue-pagination')).toHaveTextContent(/1 \/ 200/);
     expect(screen.getByText(/10,000/)).toBeInTheDocument();
   });
@@ -194,7 +194,7 @@ describe('UE Profile Manager — pagination at 10K', () => {
     await user.type(await screen.findByTestId('ue-search'), 'ue-00042');
     await waitFor(() => {
       const rows = within(screen.getByTestId('ue-table')).getAllByRole('row');
-      expect(rows.length).toBe(2); // header + 1 match
+      expect(rows.length).toBe(3); // 2 header rows (grouped Runtime, 0.9.0) + 1 match
     });
     expect(screen.getByTestId('ue-row-ue-00042')).toBeInTheDocument();
   });

@@ -229,6 +229,15 @@ export interface ScenarioList {
   note?: string;
 }
 
+/** 0.16.0 — bounded UL/DL traffic measurement, mirrored field for field by
+ * polaris-control-api. The DL sender (`polaris-dn-sender`) advertises
+ * `dl_sender_state` and `dl_sender_available`; the fail-closed contract keeps
+ * `traffic_dl` unexecutable when the sender is not healthy. */
+export interface TrafficDirectionCounters {
+  measured_sender_bytes: number | null;
+  measured_ue_bytes: number | null;
+}
+
 export interface TrafficState {
   state: string;
   packets_requested: number;
@@ -242,6 +251,14 @@ export interface TrafficState {
   tun_interface?: string | null;
   last_result: ScenarioState | null;
   approved_destinations: string[];
+  /** 0.16.0 — present when the backend ran the UL direction. */
+  traffic_ul?: TrafficDirectionCounters | null;
+  /** 0.16.0 — present when the backend ran (or attempted) the DL direction. */
+  traffic_dl?: TrafficDirectionCounters | null;
+  /** 0.16.0 — "HEALTHY" / "DEGRADED" / "DL_SENDER_NOT_AVAILABLE". */
+  dl_sender_state?: string | null;
+  /** 0.16.0 — true iff the DN sender, N6 IP and UPF route are all healthy. */
+  dl_sender_available?: boolean | null;
 }
 
 export interface ValidationResult {

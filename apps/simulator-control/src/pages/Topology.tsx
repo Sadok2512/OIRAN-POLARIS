@@ -161,7 +161,7 @@ export function TopologyPage() {
                     </dd>
                   </dl>
 
-                  <section>
+                  <section data-testid={`topology-ue-cards-${node.id}`}>
                     <p className="text-ep-xs uppercase tracking-wider text-text-secondary mb-1">
                       UEs attached · {attachedUes.length}
                     </p>
@@ -170,15 +170,40 @@ export function TopologyPage() {
                         No UE reports <span className="mono">serving_node = {node.id}</span>.
                       </p>
                     ) : (
-                      <ul className="flex flex-wrap gap-1.5" data-testid={`topology-ues-${node.id}`}>
-                        {attachedUes.map((ueId) => (
-                          <li key={ueId}>
-                            <span className="ep-badge inline-flex items-center gap-1 mono">
-                              <Smartphone width={11} height={11} />
-                              {ueId}
-                            </span>
-                          </li>
-                        ))}
+                      <ul
+                        className="grid grid-cols-2 md:grid-cols-3 gap-2"
+                        data-testid={`topology-ues-${node.id}`}
+                      >
+                        {attachedUes.map((ueId) => {
+                          const ue = (ues.data?.items ?? []).find((item) => item.id === ueId);
+                          return (
+                            <li
+                              key={ueId}
+                              className="ep-card border-border p-2 flex flex-col gap-1 text-ep-xs"
+                              data-testid={`topology-ue-card-${ueId}`}
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="inline-flex items-center gap-1 mono font-semibold">
+                                  <Smartphone width={11} height={11} />
+                                  {ueId}
+                                </span>
+                                <StatusIndicator
+                                  state={ue?.process_state ?? 'NOT_OBSERVED'}
+                                  tone={ue?.process_state === 'running' ? 'success' : 'neutral'}
+                                  compact
+                                />
+                              </div>
+                              <dl className="grid grid-cols-2 gap-x-2 gap-y-0 text-ep-xs text-text-secondary">
+                                <dt>registration</dt>
+                                <dd className="mono">{ue?.registration_state ?? 'NOT_OBSERVED'}</dd>
+                                <dt>pdu</dt>
+                                <dd className="mono">{ue?.pdu_session ?? 'INACTIVE'}</dd>
+                                <dt>identity</dt>
+                                <dd className="mono">PROTECTED</dd>
+                              </dl>
+                            </li>
+                          );
+                        })}
                       </ul>
                     )}
                   </section>

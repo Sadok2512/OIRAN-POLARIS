@@ -3,6 +3,79 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.9.0 — 2026-10-29 (minor)
+
+Manager / Execution Monitor / Traffic Generator / Topology refresh,
+aligned with polaris-control-api 0.17.0 enriched job status.
+
+### Added — Execution Monitor (#23 / #24)
+
+- The backend-steps section now consumes the 0.17.0 enriched
+  `GET /scenarios/:job_id/steps` payload: job-level `state`,
+  `started_at`, `ended_at`, `duration_ms`, plus a dedicated **failure**
+  banner surfacing `{step_name, code, message, started_at, ended_at,
+  duration_ms, failure_evidence}`. `failure_evidence` is pretty-printed
+  inside a `<details>` block so the bounded iperf3 payload from 0.16.3
+  is readable without saturating the layout.
+- New `WireScenarioJobFailure` type and new optional fields on
+  `WireScenarioStepsResponse` (`state`, `started_at`, `ended_at`,
+  `duration_ms`, `failure`).
+
+### Added — Traffic Generator (#25 / #27)
+
+- Dedicated **Uplink · traffic_ul** and **Downlink · traffic_dl** cards
+  showing `measured_sender_bytes` + `measured_ue_bytes` for each
+  direction, the DL sender state (`HEALTHY` / `DEGRADED` /
+  `DL_SENDER_NOT_AVAILABLE`) and a plain **Executable now** flag that
+  mirrors `dl_sender_available`.
+- `TrafficState` type extended with `traffic_ul`, `traffic_dl`,
+  `dl_sender_state`, `dl_sender_available`.
+- Page description rewritten to reflect the real UL + health-gated DL
+  pipeline (DN sender, N6 identity, UPF route).
+
+### Added — Topology
+
+- Each gNB card now renders an **UE cards grid** underneath, with per
+  UE process state, registration state, PDU session state and the
+  literal `PROTECTED` identity marker. No IMSI, K or OPc leaks here.
+
+### Changed — UE Manager (#19)
+
+- Table is `w-full table-fixed` with an explicit `<colgroup>` and a
+  grouped **Runtime** header spanning Registration / PDU / RRC /
+  UE IP / Traffic. The outer wrapper no longer uses `overflow-x-auto`
+  so there is no horizontal scrollbar at the default 1440×900.
+- Actions column stays on the far right and is right-aligned.
+
+### Changed — Scenario clone (#20)
+
+- `cloneTargetId` now combines the base-36 timestamp with a monotonic
+  counter: successive clones (even within the same millisecond) always
+  produce a unique target id, so no two cloned scenarios collide on
+  screen.
+
+### Changed — Run error (#21)
+
+- `UeManager.runScenarioOn` now joins HTTP status, backend code and
+  message explicitly: operators see `HTTP 423 ·
+  SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED · …` or
+  `HTTP 401 · AUTHENTICATION_REQUIRED · …` instead of a flattened
+  generic error.
+
+### Safety
+
+- No identity bytes travel through the UI anywhere added by this lot.
+  Topology UE cards display `PROTECTED`, Playwright mocks use
+  `PROTECTED`, no IMSI/K/OPc appears in artefacts.
+
+### Validation
+
+- `npx tsc --noEmit` clean.
+- `npm run test` (vitest) all green.
+- Playwright suite extended with `e2e/execution-monitor.spec.ts`,
+  `e2e/traffic.spec.ts`, `e2e/topology.spec.ts`, `e2e/ue-manager.spec.ts`
+  — all mocks render `PROTECTED` for identity material.
+
 ## 0.8.0 — 2026-10-29 (minor)
 
 Subscriber front surface aligned with polaris-control-api 0.17.0.

@@ -362,12 +362,18 @@ export function UeManagerPage() {
         });
         setFeedback(`Scenario ${scenario.name} started for ${row.profile.id} · job ${job.job_id} (${job.state}).`);
       } catch (error) {
+        const status = (error as { status?: number }).status;
         const code = (error as { code?: string }).code;
-        setFeedback(
-          code === 'SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED'
-            ? 'Live execution of backend scenario definitions is locked on this controller (mock mode only).'
-            : `${code ?? 'Start failed'} · ${(error as Error).message}`,
-        );
+        const message = (error as Error).message;
+        // 0.9.0 — surface the exact backend code and HTTP status so operators
+        // see e.g. "HTTP 423 · SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED"
+        // or "HTTP 401 · AUTHENTICATION_REQUIRED" instead of a generic error.
+        const parts = [
+          status != null ? `HTTP ${status}` : null,
+          code ?? null,
+          message || null,
+        ].filter(Boolean);
+        setFeedback(parts.join(' · ') || 'Start failed');
       }
       return;
     }
@@ -647,11 +653,27 @@ export function UeManagerPage() {
         )}
       </section>
 
-      <div className="ep-card overflow-x-auto">
-        <table className="ep-table" data-testid="ue-table">
+      <div className="ep-card">
+        <table
+          className="ep-table w-full table-fixed"
+          data-testid="ue-table"
+        >
+          <colgroup>
+            <col style={{ width: '2rem' }} />
+            <col style={{ width: '20%' }} />
+            <col style={{ width: '10%' }} />
+            <col style={{ width: '10%' }} />
+            <col className="runtime-col" style={{ width: '7%' }} />
+            <col className="runtime-col" style={{ width: '7%' }} />
+            <col className="runtime-col" style={{ width: '6%' }} />
+            <col className="runtime-col" style={{ width: '8%' }} />
+            <col className="runtime-col" style={{ width: '6%' }} />
+            <col style={{ width: '14%' }} />
+            <col style={{ width: '10%' }} />
+          </colgroup>
           <thead>
             <tr>
-              <th className="w-8">
+              <th className="w-8" rowSpan={2}>
                 <input
                   type="checkbox"
                   aria-label="Select all on page"
@@ -670,16 +692,21 @@ export function UeManagerPage() {
                   data-testid="ue-select-all"
                 />
               </th>
-              <th>UE ID / Profile</th>
-              <th>Owner</th>
-              <th>Serving gNB</th>
-              <th>Registration</th>
-              <th>PDU Session</th>
-              <th>RRC</th>
-              <th>UE IP</th>
-              <th>Traffic</th>
-              <th>Assigned Scenario</th>
-              <th>Actions</th>
+              <th rowSpan={2}>UE ID / Profile</th>
+              <th rowSpan={2}>Owner</th>
+              <th rowSpan={2}>Serving gNB</th>
+              <th colSpan={5} className="text-center border-b border-border">
+                Runtime
+              </th>
+              <th rowSpan={2}>Assigned Scenario</th>
+              <th rowSpan={2} className="text-right">Actions</th>
+            </tr>
+            <tr>
+              <th className="text-ep-xs font-normal text-text-secondary">Registration</th>
+              <th className="text-ep-xs font-normal text-text-secondary">PDU</th>
+              <th className="text-ep-xs font-normal text-text-secondary">RRC</th>
+              <th className="text-ep-xs font-normal text-text-secondary">UE IP</th>
+              <th className="text-ep-xs font-normal text-text-secondary">Traffic</th>
             </tr>
           </thead>
           <tbody>

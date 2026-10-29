@@ -1,4 +1,4 @@
-import { Info } from 'lucide-react';
+import { Info, ArrowDown, ArrowUp } from 'lucide-react';
 import { PageHeader } from '@/ui/PageHeader';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import { EmptyState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
@@ -14,7 +14,7 @@ export function TrafficPage() {
       <PageHeader
         eyebrow="Operations"
         title="Traffic Generator"
-        description="Observe the backend-reported bounded traffic state. User-driven bounded UDP runs through Scenarios → Run Scenario; this page is strictly observability — no action is dispatched from here."
+        description="Bounded UDP uplink + iperf3 downlink. Uplink is measured on the UE sender; downlink is measured on the health-gated DN sender (polaris-dn-sender) and on the UE receiver — the backend compares both counts. This page is observability only; executions start from Scenarios → Run Scenario."
       />
 
       {traffic.isLoading && !traffic.data && <LoadingSkeleton label="Loading traffic" />}
@@ -54,6 +54,71 @@ export function TrafficPage() {
           )}
         </section>
       )}
+
+      {traffic.data ? (
+        <section
+          className="grid gap-4 md:grid-cols-2 mb-4"
+          data-testid="traffic-directions"
+        >
+          <article className="ep-card p-4 flex flex-col gap-2" data-testid="traffic-ul-card">
+            <header className="flex items-center justify-between">
+              <h3 className="text-ep-md font-semibold flex items-center gap-2">
+                <ArrowUp width={14} height={14} /> Uplink · traffic_ul
+              </h3>
+              <StatusIndicator
+                state={traffic.data.traffic_ul ? 'MEASURED' : 'IDLE'}
+                tone={traffic.data.traffic_ul ? 'success' : 'neutral'}
+                compact
+              />
+            </header>
+            <dl className="grid grid-cols-2 gap-x-6 gap-y-1 text-ep-sm">
+              <dt className="text-text-secondary">UE sender bytes</dt>
+              <dd className="num" data-testid="traffic-ul-sender">
+                {count(traffic.data.traffic_ul?.measured_sender_bytes ?? null)}
+              </dd>
+              <dt className="text-text-secondary">DN receiver bytes</dt>
+              <dd className="num" data-testid="traffic-ul-ue">
+                {count(traffic.data.traffic_ul?.measured_ue_bytes ?? null)}
+              </dd>
+            </dl>
+          </article>
+
+          <article className="ep-card p-4 flex flex-col gap-2" data-testid="traffic-dl-card">
+            <header className="flex items-center justify-between">
+              <h3 className="text-ep-md font-semibold flex items-center gap-2">
+                <ArrowDown width={14} height={14} /> Downlink · traffic_dl
+              </h3>
+              <StatusIndicator
+                state={traffic.data.dl_sender_state ?? (traffic.data.dl_sender_available ? 'HEALTHY' : 'DL_SENDER_NOT_AVAILABLE')}
+                tone={traffic.data.dl_sender_available ? 'success' : 'warning'}
+                compact
+              />
+            </header>
+            <dl className="grid grid-cols-2 gap-x-6 gap-y-1 text-ep-sm">
+              <dt className="text-text-secondary">DN sender bytes</dt>
+              <dd className="num" data-testid="traffic-dl-sender">
+                {count(traffic.data.traffic_dl?.measured_sender_bytes ?? null)}
+              </dd>
+              <dt className="text-text-secondary">UE receiver bytes</dt>
+              <dd className="num" data-testid="traffic-dl-ue">
+                {count(traffic.data.traffic_dl?.measured_ue_bytes ?? null)}
+              </dd>
+              <dt className="text-text-secondary">Sender state</dt>
+              <dd data-testid="traffic-dl-state">
+                {traffic.data.dl_sender_state ?? '—'}
+              </dd>
+              <dt className="text-text-secondary">Executable now</dt>
+              <dd data-testid="traffic-dl-available">
+                {traffic.data.dl_sender_available == null
+                  ? '—'
+                  : traffic.data.dl_sender_available
+                  ? 'yes'
+                  : 'no — DL_SENDER_NOT_AVAILABLE'}
+              </dd>
+            </dl>
+          </article>
+        </section>
+      ) : null}
 
       <section className="ep-card p-5 mb-4" data-testid="traffic-destinations">
         <h3 className="text-ep-md font-semibold mb-2">Approved destinations</h3>

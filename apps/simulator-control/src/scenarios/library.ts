@@ -30,10 +30,24 @@ export interface ScenarioLibrary {
   duplicate: (id: string) => Promise<Scenario | null>;
 }
 
-/** Backend ids are `[A-Za-z0-9_-]{1,64}`; clone targets must satisfy the same rule. */
+/** Backend ids are `[A-Za-z0-9_-]{1,64}`; clone targets must satisfy the same rule.
+ *
+ * 0.9.0 — the suffix combines a base-36 timestamp with a monotonic counter
+ * so successive clones (even in the same millisecond) always produce a
+ * distinct target id. Two consecutive clones of the same source therefore
+ * never collide, which satisfies the recette requirement that every
+ * cloned scenario has a unique name on screen.
+ */
+let cloneCounter = 0;
 export function cloneTargetId(sourceId: string, now: number = Date.now()): string {
-  const suffix = `-copy-${now.toString(36)}`;
+  cloneCounter = (cloneCounter + 1) % 1_296; // 36^2 — stays short in base36
+  const suffix = `-copy-${now.toString(36)}-${cloneCounter.toString(36).padStart(2, '0')}`;
   return `${sourceId.slice(0, 64 - suffix.length)}${suffix}`;
+}
+
+/** Reset the clone counter — exercised by tests only. */
+export function _resetCloneCounterForTests(): void {
+  cloneCounter = 0;
 }
 
 function decodeAll(items: WireScenarioDefinition[] | undefined): {
