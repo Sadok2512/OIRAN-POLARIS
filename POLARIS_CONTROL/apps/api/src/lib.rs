@@ -12043,4 +12043,31 @@ mod p0_tests {
             "/opt/polaris-control/libexec/iperf3"
         );
     }
+
+    #[test]
+    fn iperf_failure_retains_json_stdout_error() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let stdout = serde_json::to_vec(&json!({
+            "error": "unable to connect to server: Connection refused"
+        }))
+        .unwrap();
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout,
+            stderr: Vec::new(),
+        };
+        let encoded = iperf_failure(
+            "IPERF3_UL_FAILED",
+            &output,
+            vec!["/opt/polaris-control/libexec/iperf3".into()],
+        );
+        let evidence: Value = serde_json::from_str(&encoded).unwrap();
+        let iperf: Value = serde_json::from_str(evidence["stdout"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            iperf["error"],
+            "unable to connect to server: Connection refused"
+        );
+        assert_eq!(evidence["stderr"], "");
+    }
 }
