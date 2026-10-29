@@ -280,6 +280,31 @@ Bounded-memory tests pin the contract:
   identity, SUPI, K, OPc, SUCI, GUTI, IMEI or IMSI material is present in test
   code.
 
+## live-probe v0.2.0 — finalized segments only + persistent failure log
+
+- Continuous import skips the still-live dumpcap target per interface. For
+  each interface the newest file is dropped from the candidate set whenever
+  its mtime is more recent than `2 × stable_age`; finalized files
+  (anything older) stay eligible. The pure helper
+  `finalized_candidates_only()` replaces the previous "stable-across-scans"
+  proxy at the discovery layer, so a running writer is never fed into
+  `copy_verified` and cannot trigger
+  `CONTINUOUS_SOURCE_CHANGED_DURING_IMPORT` as a hot-path error.
+- `ContinuousImportState` grows a bounded `failed_ingestions: VecDeque<
+  FailedIngestion>` persisted in `import_state.json`. Every ingestion
+  failure path (`CONTINUOUS_SEGMENT_NOT_FINALIZED` pre-copy / post-copy,
+  `CONTINUOUS_COPY_RETRYABLE`) now records `{source_path, error_code,
+  occurred_epoch_ms}` and writes the state atomically — the entry survives
+  probe restarts, so the operator can audit a 1 h window after the fact.
+  Bounded at `MAX_PERSISTED_INGESTION_FAILURES=256`, FIFO-evicted.
+- Pure helpers `record_ingestion_failure` and `finalized_candidates_only`
+  are exposed under tests; four new unit tests exercise FIFO eviction,
+  verbatim path/code/timestamp preservation, newest-per-interface skip
+  within the safety window and single-file acceptance after the window
+  has elapsed.
+- No live-probe behaviour change for successful imports; aggregate metrics
+  (`ingestion_failures`, `segments_ingested`, …) remain the same.
+
 ## decoder-ngap v0.3.1 / oiran-decode v0.3.1 - NGAP status correction
 
 - Mark a structurally bounded NAS-PDU information element as decoded at the
