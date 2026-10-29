@@ -20,7 +20,7 @@ STATE_DIR=${POLARIS_STATE_DIR:-/var/lib/polaris-control}
 BACKUP_ROOT=${POLARIS_BACKUP_ROOT:-/var/backups/polaris-control}
 SERVICE=${POLARIS_SERVICE:-polaris-control.service}
 API_BASE=${POLARIS_API_BASE:-http://127.0.0.1:49153}
-PREVIEW_BASE=${POLARIS_PREVIEW_BASE:-http://127.0.0.1:8020}
+PREVIEW_BASE=${POLARIS_PREVIEW_BASE:-https://151.242.147.49:8020}
 MONGO_CONTAINER=${POLARIS_MONGO_CONTAINER:-oiran-lab-mongodb-1}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 IPERF_SRC=${POLARIS_IPERF_ARTIFACT:-$SCRIPT_DIR/../release/iperf3-3.21}
@@ -36,6 +36,16 @@ say() { printf '[%s] %s\n' "$mode" "$*"; }
 run() { if [[ $mode == dry-run ]]; then printf '+ '; printf '%q ' "$@"; printf '\n'; else "$@"; fi; }
 require_file() { [[ -f $1 ]] || { echo "missing file: $1" >&2; exit 66; }; }
 verify_sha() { printf '%s  %s\n' "$2" "$1" | sha256sum -c -; }
+wait_http() {
+  local url=$1
+  local attempt
+  for attempt in $(seq 1 30); do
+    curl --fail --silent --show-error "$url" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "readiness timeout: $url" >&2
+  return 1
+}
 check_disk() {
   local used_pct
   used_pct=$(df -B1 -P / | awk 'NR == 2 && $2 > 0 {printf "%.2f", ($3 * 100) / $2}')
@@ -193,8 +203,9 @@ if [[ $mode == rollback ]]; then
   run tar -C / -xpf "$rollback_dir/state.tar"
   run mv -T "$FRONT_DST" "${FRONT_DST}.failed-$(date -u +%Y%m%dT%H%M%SZ)"
   run tar -C / -xpf "$rollback_dir/frontend.tar"
+  run systemctl daemon-reload
   run systemctl restart "$SERVICE"
-  run curl --fail --silent --show-error "$API_BASE/api/v1/system/health"
+  run wait_http "$API_BASE/api/v1/system/health"
   exit 0
 fi
 
@@ -228,7 +239,9 @@ if [[ $mode == dry-run ]]; then
   say "docker exec $MONGO_CONTAINER mongodump --db open5gs --archive > $backup/open5gs.archive"
 else
   docker exec "$MONGO_CONTAINER" mongodump --db open5gs --archive >"$backup/open5gs.archive"
-  sha256sum "$backup"/* "$backup"/api/* >"$backup/SHA256SUMS"
+  find "$backup" -type f ! -name SHA256SUMS -print0 \
+    | sort -z \
+    | xargs -0 sha256sum >"$backup/SHA256SUMS"
 fi
 
 say 'install candidate API, frontend and iperf3 atomically'
@@ -251,14 +264,14 @@ run systemctl daemon-reload
 say 'restart POLARIS only and run smoke tests; rollback automatically on failure'
 if [[ $mode == execute ]]; then
   if ! systemctl restart "$SERVICE" \
-    || ! curl --fail --silent --show-error "$API_BASE/api/v1/system/health" >/dev/null \
-    || ! curl --fail --silent --show-error "$PREVIEW_BASE/simulator/" >/dev/null; then
+    || ! wait_http "$API_BASE/api/v1/system/health" \
+    || ! wait_http "$PREVIEW_BASE/simulator/"; then
     "$0" --rollback "$backup"
     exit 1
   fi
 else
   run systemctl restart "$SERVICE"
-  run curl --fail --silent --show-error "$API_BASE/api/v1/system/health"
-  run curl --fail --silent --show-error "$PREVIEW_BASE/simulator/"
+  run wait_http "$API_BASE/api/v1/system/health"
+  run wait_http "$PREVIEW_BASE/simulator/"
 fi
 say "DEPLOYMENT=PASS backup=$backup"
