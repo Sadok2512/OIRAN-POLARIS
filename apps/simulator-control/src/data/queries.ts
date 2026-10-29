@@ -195,6 +195,75 @@ export function useProvisioningSlots() {
   });
 }
 
+/** Backend contract: GET /dnns → list of DNNs served by the lab. */
+export function useDnns() {
+  return useQuery({
+    queryKey: ['polaris', 'dnns'],
+    queryFn: async () => {
+      const { fetchDnns } = await import('./profileApi');
+      return fetchDnns();
+    },
+    staleTime: 60_000,
+  });
+}
+
+/** Backend contract: GET /plmns → list of PLMNs served by the lab. */
+export function usePlmns() {
+  return useQuery({
+    queryKey: ['polaris', 'plmns'],
+    queryFn: async () => {
+      const { fetchPlmns } = await import('./profileApi');
+      return fetchPlmns();
+    },
+    staleTime: 60_000,
+  });
+}
+
+/** Backend contract: GET /subscribers/:slot → PROTECTED subscriber record + linked UE ids. */
+export function useSubscriberDetail(slot: string | null | undefined) {
+  return useQuery({
+    queryKey: ['polaris', 'subscribers', slot ?? ''],
+    enabled: typeof slot === 'string' && slot.length > 0,
+    queryFn: async () => {
+      const { fetchSubscriberDetail } = await import('./profileApi');
+      return fetchSubscriberDetail(slot as string);
+    },
+    staleTime: 15_000,
+  });
+}
+
+/** Backend contract: PUT /subscribers/:slot (operator). K/OPc are write-only. */
+export function useUpdateSubscriber() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: {
+      slot: string;
+      body: import('./profileApi').WireSubscriberUpdate;
+    }) => {
+      const { updateSubscriber } = await import('./profileApi');
+      return updateSubscriber(input.slot, input.body);
+    },
+    onSuccess: (_result, variables) => {
+      client.invalidateQueries({ queryKey: ['polaris', 'subscribers', variables.slot] });
+      client.invalidateQueries({ queryKey: ['polaris', 'provisioning-slots'] });
+    },
+  });
+}
+
+/** Backend contract: POST /subscribers/generate (operator). CSPRNG K/OPc; never surfaced. */
+export function useGenerateSubscribers() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (body: import('./profileApi').WireGenerateSubscribersRequest) => {
+      const { generateSubscribers } = await import('./profileApi');
+      return generateSubscribers(body);
+    },
+    onSuccess: () => {
+      client.invalidateQueries({ queryKey: ['polaris', 'provisioning-slots'] });
+    },
+  });
+}
+
 /** Backend contract: GET /gnbs → registry of serving-gnb targets. */
 export function useGnbs() {
   return useQuery({

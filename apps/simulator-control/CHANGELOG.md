@@ -3,6 +3,51 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.8.0 — 2026-10-29 (minor)
+
+Subscriber front surface aligned with polaris-control-api 0.17.0.
+
+### Added
+
+- `GET /subscribers/:slot` consumer (`useSubscriberDetail`) and typed shapes
+  in `src/data/profileApi.ts` (`WireSanitizedSubscriber`, `WireSubscriberDetail`,
+  `WireSubscriberUpdate`, `WireGenerateSubscribersRequest`,
+  `WireGenerateSubscribersResponse`). All identity fields are typed as the
+  literal `"PROTECTED"`.
+- **Edit subscriber** dialog (`src/subscribers/SubscriberEditDialog.tsx`):
+  slot-scoped `PUT /subscribers/:slot`, dropdown pickers for SST, SD, DNN
+  (served by `/dnns` with a lab-default fallback), AMBR number inputs, and
+  an opt-in **Rotate authentication material** section whose `K` / `OPc`
+  inputs are `type="password"`, `autoComplete="off"`, placeholder
+  `PROTECTED — write-only`. The response never surfaces K/OPc.
+- **Generate subscribers** dialog (`src/subscribers/GenerateSubscribersDialog.tsx`):
+  `POST /subscribers/generate` with count (1-1000), SST/SD/DNN dropdowns
+  pre-filled from the lab defaults (SST=1, SD=010203, DNN=internet), AMBR
+  defaults 1 Mbps/1 Mbps. Response lists `{slot, state:"PROVISIONED",
+  subscriber_identity:"PROTECTED", authentication_material:"PROTECTED"}` —
+  K/OPc never leave the server.
+- `useDnns()` and `usePlmns()` query hooks (`src/data/queries.ts`) for the
+  dropdown data sources, with a 60 s cache.
+- Explicit lab defaults contract in `src/subscribers/subscriberOptions.ts`:
+  SST=1, SD=`010203`, DNNs=`['internet']`. The UI **always** sends
+  `sst`, `sd` and `dnns` on every mutation — the backend never has to
+  pick a default.
+
+### Changed
+
+- Core · Open5GS → Subscribers tab: each row now carries an **Edit**
+  action in a dedicated column. The previously disabled "Provision
+  (locked)" aside is replaced by a working **Generate…** button that
+  opens the Generate dialog (operator role still enforced by the API).
+
+### Safety
+
+- No identity bytes travel through the UI: `K`, `OPc`, raw IMSI are
+  never read from, logged, or displayed. All sensitive fields render
+  as `PROTECTED`.
+- Playwright test fixtures (`e2e/subscribers.spec.ts`) use `PROTECTED`
+  values in the mocked API — no real identity material in artefacts.
+
 ## 0.5.2 — 2026-10-28 (patch)
 
 - Enable `scenarioTemplates` by default for the deployed API 0.13.0 contract while preserving
