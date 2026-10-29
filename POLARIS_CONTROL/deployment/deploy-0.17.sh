@@ -30,17 +30,18 @@ IPERF_SHA=7548a6e3e7cf33d92595b7e68abea87da011a28d1ff10f043e1caf6bbcf1d3ed
 LIBIPERF_SHA=c38136e9bb1ca2fb09c23245d4fd9abc1dad34f3042a29067d5d8b16e76a35b9
 CANDIDATE_API=${POLARIS_CANDIDATE_API:-/root/POLARIS_API_017_BUILD/POLARIS_CONTROL/target/release/polaris-control-api}
 CANDIDATE_API_SHA=${POLARIS_CANDIDATE_API_SHA:-4129155dcd96a6f6edae9d75baa407a40b7573658aaf3ac7c426eada7e6eb92c}
-CANDIDATE_FRONTEND=${POLARIS_CANDIDATE_FRONTEND:-/path/to/simulator-0.17.0-dist}
+CANDIDATE_FRONTEND=${POLARIS_CANDIDATE_FRONTEND:-/root/OIRAN_POLARIS_SIM_091/apps/simulator-control/dist}
 
 say() { printf '[%s] %s\n' "$mode" "$*"; }
 run() { if [[ $mode == dry-run ]]; then printf '+ '; printf '%q ' "$@"; printf '\n'; else "$@"; fi; }
 require_file() { [[ -f $1 ]] || { echo "missing file: $1" >&2; exit 66; }; }
 verify_sha() { printf '%s  %s\n' "$2" "$1" | sha256sum -c -; }
 check_disk() {
-  local used
-  used=$(df -P / | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')
-  [[ $used =~ ^[0-9]+$ && $used -lt 90 ]] || {
-    echo "disk safety gate failed: root usage=${used:-unknown}%" >&2
+  local used_pct
+  used_pct=$(df -B1 -P / | awk 'NR == 2 && $2 > 0 {printf "%.2f", ($3 * 100) / $2}')
+  [[ $used_pct =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    && awk -v used="$used_pct" 'BEGIN {exit !(used < 85.0)}' || {
+    echo "disk safety gate failed: root usage=${used_pct:-unknown}%" >&2
     exit 75
   }
 }
@@ -208,7 +209,7 @@ fi
 run verify_sha "$IPERF_SRC/iperf3" "$IPERF_SHA"
 run verify_sha "$IPERF_SRC/lib/libiperf.so.0.0.0" "$LIBIPERF_SHA"
 run df -P /
-if [[ $mode == execute ]]; then check_disk; else say 'require root filesystem usage below 90%'; fi
+if [[ $mode == execute ]]; then check_disk; else say 'require root filesystem usage below 85%'; fi
 
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup=$BACKUP_ROOT/0.17.0-$stamp
