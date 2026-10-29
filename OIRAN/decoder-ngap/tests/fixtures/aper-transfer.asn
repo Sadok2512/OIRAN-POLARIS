@@ -1,0 +1,218 @@
+-- Minimal NGAP ASN.1 subset for fixture generation.
+-- Types reproduce TS 38.413 V17 verbatim where used; the module is
+-- self-contained so asn1tools can compile it without the full 3GPP tree.
+
+NGAP-Minimal DEFINITIONS AUTOMATIC TAGS ::=
+
+BEGIN
+
+maxnoofQosFlows                     INTEGER ::= 64
+maxnoofQoSParameters                INTEGER ::= 256
+maxnoofErrors                       INTEGER ::= 256
+maxnoofMultiConnectivityMinusOne    INTEGER ::= 3
+maxnoofMultiConnectivity            INTEGER ::= 4
+
+QosFlowIdentifier ::= INTEGER (0..63)
+
+FiveQI ::= INTEGER (0..255, ...)
+
+PriorityLevelARP ::= INTEGER (1..15, ...)
+
+Pre-emptionCapability ::= ENUMERATED {
+    shall-not-trigger-pre-emption,
+    may-trigger-pre-emption,
+    ...
+}
+
+Pre-emptionVulnerability ::= ENUMERATED {
+    not-pre-emptable,
+    pre-emptable,
+    ...
+}
+
+AllocationAndRetentionPriority ::= SEQUENCE {
+    priorityLevelARP        PriorityLevelARP,
+    pre-emptionCapability   Pre-emptionCapability,
+    pre-emptionVulnerability Pre-emptionVulnerability,
+    iE-Extensions           SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+NonDynamic5QIDescriptor ::= SEQUENCE {
+    fiveQI                      FiveQI,
+    priorityLevelQos            INTEGER (1..127, ...) OPTIONAL,
+    averagingWindow             INTEGER (0..4095, ...) OPTIONAL,
+    maximumDataBurstVolume      INTEGER (0..4095, ...) OPTIONAL,
+    iE-Extensions               SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+Dynamic5QIDescriptor ::= SEQUENCE {
+    priorityLevelQos            INTEGER (1..127),
+    packetDelayBudget           INTEGER (0..1023, ...),
+    packetErrorRate             SEQUENCE {
+        pERScalar                   INTEGER (0..9, ...),
+        pERExponent                 INTEGER (0..9, ...),
+        iE-Extensions               SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+        ...
+    },
+    fiveQI                      FiveQI OPTIONAL,
+    delayCritical               ENUMERATED { delay-critical, non-delay-critical, ... } OPTIONAL,
+    averagingWindow             INTEGER (0..4095, ...) OPTIONAL,
+    maximumDataBurstVolume      INTEGER (0..4095, ...) OPTIONAL,
+    iE-Extensions               SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+QosCharacteristics ::= CHOICE {
+    nonDynamic5QI       NonDynamic5QIDescriptor,
+    dynamic5QI          Dynamic5QIDescriptor,
+    ...
+}
+
+GBR-QosInformation ::= SEQUENCE {
+    maximumFlowBitRateDL        INTEGER (0..4000000000000, ...),
+    maximumFlowBitRateUL        INTEGER (0..4000000000000, ...),
+    guaranteedFlowBitRateDL     INTEGER (0..4000000000000, ...),
+    guaranteedFlowBitRateUL     INTEGER (0..4000000000000, ...),
+    notificationControl         ENUMERATED { notification-requested, ... } OPTIONAL,
+    maximumPacketLossRateDL     INTEGER (0..1000, ...) OPTIONAL,
+    maximumPacketLossRateUL     INTEGER (0..1000, ...) OPTIONAL,
+    iE-Extensions               SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+ReflectiveQosAttribute ::= ENUMERATED { subject-to, ... }
+
+AdditionalQosFlowInformation ::= ENUMERATED { more-likely, ... }
+
+QosFlowLevelQosParameters ::= SEQUENCE {
+    qoS-Characteristics             QosCharacteristics,
+    allocationAndRetentionPriority  AllocationAndRetentionPriority,
+    gBR-QosInformation              GBR-QosInformation OPTIONAL,
+    reflectiveQoSAttribute          ReflectiveQosAttribute OPTIONAL,
+    additionalQoSFlowInformation    AdditionalQosFlowInformation OPTIONAL,
+    iE-Extensions                   SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+QosFlowSetupRequestItem ::= SEQUENCE {
+    qosFlowIdentifier               QosFlowIdentifier,
+    qosFlowLevelQosParameters       QosFlowLevelQosParameters,
+    e-RAB-ID                        INTEGER (0..15, ...) OPTIONAL,
+    iE-Extensions                   SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+QosFlowSetupRequestList ::= SEQUENCE (SIZE(1..maxnoofQosFlows)) OF QosFlowSetupRequestItem
+
+AssociatedQosFlowItem ::= SEQUENCE {
+    qosFlowIdentifier               QosFlowIdentifier,
+    qosFlowMappingIndication        ENUMERATED { ul, dl, ... } OPTIONAL,
+    iE-Extensions                   SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+AssociatedQosFlowList ::= SEQUENCE (SIZE(1..maxnoofQosFlows)) OF AssociatedQosFlowItem
+
+TransportLayerAddress ::= BIT STRING (SIZE(1..160, ...))
+
+GTP-TEID ::= OCTET STRING (SIZE(4))
+
+GTPTunnel ::= SEQUENCE {
+    transportLayerAddress   TransportLayerAddress,
+    gTP-TEID                GTP-TEID,
+    iE-Extensions           SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+UPTransportLayerInformation ::= CHOICE {
+    gTPTunnel               GTPTunnel,
+    ...
+}
+
+QosFlowPerTNLInformation ::= SEQUENCE {
+    uPTransportLayerInformation     UPTransportLayerInformation,
+    associatedQosFlowList           AssociatedQosFlowList,
+    iE-Extensions                   SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+QosFlowPerTNLInformationItem ::= SEQUENCE {
+    qosFlowPerTNLInformation        QosFlowPerTNLInformation,
+    iE-Extensions                   SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+QosFlowPerTNLInformationList ::= SEQUENCE (SIZE(1..maxnoofMultiConnectivityMinusOne)) OF QosFlowPerTNLInformationItem
+
+CauseRadioNetwork ::= ENUMERATED {
+    unspecified,
+    txnrelocoverall-expiry,
+    successful-handover,
+    release-due-to-ngran-generated-reason,
+    release-due-to-5gc-generated-reason,
+    handover-cancelled,
+    partial-handover,
+    ...
+}
+
+Cause ::= CHOICE {
+    radioNetwork            CauseRadioNetwork,
+    transport               ENUMERATED { transport-resource-unavailable, unspecified, ... },
+    nas                     ENUMERATED { normal-release, authentication-failure, deregister, unspecified, ... },
+    protocol                ENUMERATED { transfer-syntax-error, abstract-syntax-error-reject, abstract-syntax-error-ignore-and-notify, message-not-compatible-with-receiver-state, semantic-error, abstract-syntax-error-falsely-constructed-message, unspecified, ... },
+    misc                    ENUMERATED { control-processing-overload, not-enough-user-plane-processing-resources, hardware-failure, om-intervention, unknown-pLMN-or-sNPN, unspecified, ... },
+    ...
+}
+
+QosFlowWithCauseItem ::= SEQUENCE {
+    qosFlowIdentifier               QosFlowIdentifier,
+    cause                           Cause,
+    iE-Extensions                   SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+QosFlowListWithCause ::= SEQUENCE (SIZE(1..maxnoofQosFlows)) OF QosFlowWithCauseItem
+
+ConfidentialityProtectionResult ::= ENUMERATED { performed, not-performed, ... }
+IntegrityProtectionResult ::= ENUMERATED { performed, not-performed, ... }
+
+SecurityResult ::= SEQUENCE {
+    integrityProtectionResult               IntegrityProtectionResult,
+    confidentialityProtectionResult         ConfidentialityProtectionResult,
+    iE-Extensions                           SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+PDUSessionResourceSetupRequestTransfer-IEs ::= SEQUENCE {
+    pDUSessionAggregateMaximumBitRate   SEQUENCE {
+        pDUSessionAggregateMaximumBitRateDL INTEGER (0..4000000000000, ...),
+        pDUSessionAggregateMaximumBitRateUL INTEGER (0..4000000000000, ...),
+        iE-Extensions                       SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+        ...
+    } OPTIONAL,
+    uLNGU-UP-TNLInformation             UPTransportLayerInformation,
+    additionalULNGU-UP-TNLInformation   SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    dataForwardingNotPossible           ENUMERATED { data-forwarding-not-possible, ... } OPTIONAL,
+    pDUSessionType                      ENUMERATED { ipv4, ipv6, ipv4v6, ethernet, unstructured, ... },
+    securityIndication                  SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    networkInstance                     INTEGER (1..256, ...) OPTIONAL,
+    qosFlowSetupRequestList             QosFlowSetupRequestList,
+    commonNetworkInstance               OCTET STRING OPTIONAL,
+    ...
+}
+
+PDUSessionResourceSetupRequestTransfer ::= PDUSessionResourceSetupRequestTransfer-IEs
+
+PDUSessionResourceSetupResponseTransfer ::= SEQUENCE {
+    dLQosFlowPerTNLInformation              QosFlowPerTNLInformation,
+    additionalDLQosFlowPerTNLInformation    QosFlowPerTNLInformationList OPTIONAL,
+    securityResult                          SecurityResult OPTIONAL,
+    qosFlowFailedToSetupList                QosFlowListWithCause OPTIONAL,
+    redundantDLQosFlowPerTNLInformation     QosFlowPerTNLInformation OPTIONAL,
+    iE-Extensions                           SEQUENCE { dummy INTEGER (0..0) } OPTIONAL,
+    ...
+}
+
+END

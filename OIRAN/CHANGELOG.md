@@ -1,5 +1,34 @@
 # Changelog
 
+## oiran-decode v0.4.2 — real X.691 APER walker, HPACK Huffman recovery
+
+- `decoder-ngap v0.5.0`: removed the one-octet-per-primitive canonical walker
+  and replaced it with a bit-accurate X.691 ALIGNED PER reader
+  (`aper::AperReader`) plus type-specific decoders for
+  `PDUSessionResourceSetupRequestTransfer` and
+  `PDUSessionResourceSetupResponseTransfer`
+  (`transfer::decode_pdu_session_resource_setup_{request,response}_transfer`).
+  The decoders are driven by 11 ground-truth fixtures generated with
+  `asn1tools` (Python, codec `per`) against the minimal TS 38.413 subset
+  shipped in `decoder-ngap/tests/fixtures/aper-transfer.asn`. Each fixture
+  round-trips value → bytes → decoder → value, so a byte-level drift fails
+  loudly. Optional fields covered end-to-end: `gBR-QosInformation`,
+  `dynamic5QI`, `reflectiveQoSAttribute`, `additionalDLQosFlowPerTNLInformation`
+  (multi-tunnel), `qosFlowFailedToSetupList` with Cause CHOICE, and
+  `SecurityResult`. Unsupported constructs (extension markers, choice
+  extensions, unknown Cause groups) are now **named** in a `errors` vector on
+  the returned structure instead of being silently dropped — the "canonical
+  only" rejection path has been removed.
+- `decoder-sbi v0.3.0`: `tolerant_literals` now decodes HPACK Huffman-encoded
+  literals via `hpack::huffman::HuffmanDecoder`. HTTP/2 header blocks that
+  only recovered static-name indexed-plain literals in 0.2.0 now also recover
+  the Huffman-encoded values that make up most SBI PATCH requests. Covered by
+  two unit tests: the RFC 7541 Appendix C.4.1 example for `:authority` =
+  `www.example.com` and a synthetic SBI `:path` = PATCH SM-context modify.
+- Fixtures remain synthetic (PLMN 001/01 or TEST-NET addresses). No real
+  SUPI/K/OPc/SUCI/GUTI/IMSI/IMEI/IMEISV material is present in test code,
+  fixtures, or decoders.
+
 ## oiran-decode v0.4.1 — SBI HPACK context, NGAP QoS flow walker, EPS SMC decoding
 
 - `decoder-sbi v0.2.0`: HPACK decode failures (dynamic table state lost when the
