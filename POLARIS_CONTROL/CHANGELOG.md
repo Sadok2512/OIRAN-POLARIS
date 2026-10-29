@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.3 (polaris-control-api)
+
+- Bound the TCP sender socket window to `64K` for both UL and DL iperf3
+  transfers. This prevents the client control channel from issuing
+  `TEST_END` while a large unacknowledged payload remains queued across a
+  lossy GTP-U path.
+- Preserve the byte-exact contract: a successful traffic step requires the
+  receiver report to equal the requested sender byte count.
+- Reproduce the prior short receive in disposable network namespaces with
+  packet loss and verify exact UL/DL delivery with the bounded window.
+
 ## 0.17.2 (polaris-control-api)
 
 - Install an idempotent source-policy rule inside each owned UE network

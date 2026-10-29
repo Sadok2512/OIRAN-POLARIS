@@ -442,6 +442,7 @@ struct IperfMeasurement {
 
 const UE_POLICY_TABLE: &str = "100";
 const UE_POLICY_PRIORITY: &str = "10000";
+const IPERF_TCP_WINDOW: &str = "64K";
 
 fn iperf3_program() -> String {
     std::env::var("POLARIS_IPERF3_PATH")
@@ -551,6 +552,28 @@ fn attach_preflight_to_failure(
         );
     }
     body.to_string()
+}
+
+fn validate_exact_iperf_bytes(
+    direction: &str,
+    requested: u64,
+    sender: u64,
+    receiver: u64,
+    preflight: &UeRoutePreflight,
+) -> Result<(), String> {
+    if sender == 0 || receiver == 0 {
+        return Err(format!("IPERF3_{direction}_ZERO_BYTES"));
+    }
+    if sender != requested || receiver != requested {
+        return Err(json!({
+            "error":format!("IPERF3_{direction}_BYTE_MISMATCH"),
+            "requested_bytes":requested,
+            "sender_bytes":sender,
+            "receiver_bytes":receiver,
+            "preflight":preflight,
+        }).to_string());
+    }
+    Ok(())
 }
 
 /// 0.17.1 — Run `ip route get <destination>` inside the UE network namespace
@@ -970,6 +993,8 @@ trait UeRuntime: Send + Sync {
             target.ue_ip.clone(),
             "--bind-dev".into(),
             target.tun_interface.clone(),
+            "-w".into(),
+            IPERF_TCP_WINDOW.into(),
         ];
         let client_output = Command::new("/usr/bin/timeout")
             .args([
@@ -997,6 +1022,8 @@ trait UeRuntime: Send + Sync {
                 &target.ue_ip,
                 "--bind-dev",
                 &target.tun_interface,
+                "-w",
+                IPERF_TCP_WINDOW,
             ])
             .output()
             .map_err(|_| "IPERF3_PROCESS_SPAWN_FAILED".to_string())?;
@@ -1041,9 +1068,13 @@ trait UeRuntime: Send + Sync {
             .pointer("/end/sum_received/bytes")
             .and_then(Value::as_u64)
             .ok_or("IPERF3_UL_RECEIVER_BYTES_NOT_MEASURED")?;
-        if client_sent_bytes == 0 || server_received_bytes == 0 {
-            return Err("IPERF3_UL_ZERO_BYTES".into());
-        }
+        validate_exact_iperf_bytes(
+            "UL",
+            bytes,
+            client_sent_bytes,
+            server_received_bytes,
+            &preflight,
+        )?;
         Ok(IperfMeasurement {
             client_sent_bytes,
             server_received_bytes,
@@ -1123,6 +1154,8 @@ trait UeRuntime: Send + Sync {
                 &bytes.to_string(),
                 "--connect-timeout",
                 "5000",
+                "-w",
+                IPERF_TCP_WINDOW,
                 "-J",
             ])
             .output()
@@ -1150,9 +1183,7 @@ trait UeRuntime: Send + Sync {
             .pointer("/end/sum_received/bytes")
             .and_then(Value::as_u64)
             .ok_or("IPERF3_DL_UE_BYTES_NOT_MEASURED")?;
-        if sender_bytes == 0 || ue_bytes == 0 {
-            return Err("IPERF3_DL_ZERO_BYTES".into());
-        }
+        validate_exact_iperf_bytes("DL", bytes, sender_bytes, ue_bytes, &preflight)?;
         Ok(IperfMeasurement {
             client_sent_bytes: sender_bytes,
             server_received_bytes: ue_bytes,
@@ -12444,6 +12475,30 @@ mod p0_tests {
             evidence["preflight"]["raw"],
             "10.77.24.30 from 10.46.0.5 dev uesimtun0 table 100"
         );
+    }
+
+    #[test]
+    fn iperf_requires_byte_exact_sender_and_receiver_reports() {
+        let preflight = evaluate_ue_route_preflight(
+            "10.77.24.30 from 10.46.0.5 dev uesimtun0 table 100",
+            "10.77.24.30",
+            "uesimtun0",
+            "UL_ROUTE_NOT_VIA_UE_TUN",
+        );
+        assert!(validate_exact_iperf_bytes(
+            "UL", 1_048_576, 1_048_576, 1_048_576, &preflight
+        )
+        .is_ok());
+        let error = validate_exact_iperf_bytes(
+            "UL", 1_048_576, 1_048_576, 786_432, &preflight,
+        )
+        .unwrap_err();
+        let evidence: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(evidence["error"], "IPERF3_UL_BYTE_MISMATCH");
+        assert_eq!(evidence["requested_bytes"], 1_048_576);
+        assert_eq!(evidence["receiver_bytes"], 786_432);
+        assert_eq!(evidence["preflight"]["actual_dev"], "uesimtun0");
+        assert_eq!(IPERF_TCP_WINDOW, "64K");
     }
 
     #[test]
