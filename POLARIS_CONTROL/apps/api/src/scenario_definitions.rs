@@ -122,8 +122,7 @@ impl ScenarioDefinitionStore {
                     use std::os::unix::fs::{MetadataExt, PermissionsExt};
                     let metadata = fs::symlink_metadata(&self.path)
                         .map_err(|_| "SCENARIO_CATALOG_UNREADABLE")?;
-                    if !metadata.file_type().is_file()
-                        || metadata.permissions().mode() & 0o022 != 0
+                    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o022 != 0
                     {
                         return Err("SCENARIO_CATALOG_PERMISSIONS_UNSAFE".into());
                     }
@@ -414,6 +413,7 @@ fn validate_steps(steps: &[ScenarioStep], depth: usize) -> Result<usize, String>
                 | "wait"
                 | "traffic_dl"
                 | "traffic_ul"
+                | "transfer_verify"
                 | "idle"
                 | "detach"
                 | "repeat"
@@ -470,6 +470,19 @@ fn validate_parameters(step: &ScenarioStep) -> Result<(), String> {
     }
     if matches!(step.step_type.as_str(), "idle" | "voice_call") {
         parameter_max_u64(step, "duration_ms")?;
+    }
+    if step.step_type == "transfer_verify" {
+        let direction = step
+            .parameters
+            .get("direction")
+            .ok_or("SCENARIO_PARAMETER_REQUIRED")?;
+        let value = match direction {
+            ParameterSpec::Fixed { fixed } => fixed.as_str(),
+            ParameterSpec::Random { .. } => None,
+        };
+        if !matches!(value, Some("ul" | "dl")) {
+            return Err("TRANSFER_VERIFY_DIRECTION_INVALID".into());
+        }
     }
     Ok(())
 }
@@ -870,6 +883,27 @@ mod tests {
         assert_eq!(
             validate_mutation(&too_large).unwrap_err(),
             "TRAFFIC_BYTES_OUT_OF_RANGE"
+        );
+    }
+
+    #[test]
+    fn transfer_verify_accepts_only_fixed_ul_or_dl_direction() {
+        for direction in ["ul", "dl"] {
+            let mut candidate = mutation("transfer-proof");
+            candidate.steps = vec![step(
+                "transfer_verify",
+                BTreeMap::from([("direction".into(), fixed(direction))]),
+            )];
+            validate_mutation(&candidate).unwrap();
+        }
+        let mut invalid = mutation("transfer-invalid");
+        invalid.steps = vec![step(
+            "transfer_verify",
+            BTreeMap::from([("direction".into(), fixed("sideways"))]),
+        )];
+        assert_eq!(
+            validate_mutation(&invalid).unwrap_err(),
+            "TRANSFER_VERIFY_DIRECTION_INVALID"
         );
     }
 }

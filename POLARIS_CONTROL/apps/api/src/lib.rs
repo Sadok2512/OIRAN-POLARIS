@@ -24,6 +24,7 @@ use scenario_definitions::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use simulator_controller::MultiUeController;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -42,10 +43,10 @@ use std::{
 #[cfg(test)]
 use subscriber_provisioning::MemorySubscriberBackend;
 use subscriber_provisioning::{
-    allocate_next_imsis, generate_authentication_key,
-    normalize_imsi, validate_mutation as validate_subscriber_mutation, MongoSubscriberBackend,
-    ProvisionResult, SubscriberBackend, SubscriberMutation, SubscriberRecord, SubscriberUpdate,
-    GENERATE_MAX_COUNT, MAX_BULK_ROWS, WRITE_BATCH_ROWS,
+    allocate_next_imsis, generate_authentication_key, normalize_imsi,
+    validate_mutation as validate_subscriber_mutation, MongoSubscriberBackend, ProvisionResult,
+    SubscriberBackend, SubscriberMutation, SubscriberRecord, SubscriberUpdate, GENERATE_MAX_COUNT,
+    MAX_BULK_ROWS, WRITE_BATCH_ROWS,
 };
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -437,12 +438,42 @@ struct DlSenderConfig {
 struct IperfMeasurement {
     client_sent_bytes: u64,
     server_received_bytes: u64,
+    rate: String,
+    tcp_window: String,
+    preflight: UeRoutePreflight,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct TransferVerification {
+    direction: String,
+    bytes: u64,
+    sender_sha256: String,
+    receiver_sha256: String,
     preflight: UeRoutePreflight,
 }
 
 const UE_POLICY_TABLE: &str = "100";
 const UE_POLICY_PRIORITY: &str = "10000";
 const IPERF_TCP_WINDOW: &str = "64K";
+const IPERF_DEFAULT_RATE: &str = "5M";
+const TRANSFER_VERIFY_BYTES: u64 = 1024 * 1024;
+
+fn iperf3_rate() -> Result<String, String> {
+    let value =
+        std::env::var("POLARIS_IPERF3_RATE").unwrap_or_else(|_| IPERF_DEFAULT_RATE.to_string());
+    let suffix_ok = value
+        .chars()
+        .last()
+        .is_some_and(|suffix| matches!(suffix, 'K' | 'M' | 'G'));
+    let number = value
+        .get(..value.len().saturating_sub(1))
+        .unwrap_or_default();
+    if suffix_ok && !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit()) {
+        Ok(value)
+    } else {
+        Err("IPERF3_RATE_INVALID".into())
+    }
+}
 
 fn iperf3_program() -> String {
     std::env::var("POLARIS_IPERF3_PATH")
@@ -520,7 +551,11 @@ pub fn evaluate_ue_route_preflight(
         src,
         raw: bounded,
         ok,
-        code: if ok { None } else { Some(failure_code.to_string()) },
+        code: if ok {
+            None
+        } else {
+            Some(failure_code.to_string())
+        },
     }
 }
 
@@ -564,14 +599,18 @@ fn validate_exact_iperf_bytes(
     if sender == 0 || receiver == 0 {
         return Err(format!("IPERF3_{direction}_ZERO_BYTES"));
     }
-    if sender != requested || receiver != requested {
+    // Pacing can finish at an iperf block boundary above the requested floor.
+    // Success still requires every byte reported sent to be reported received.
+    // transfer_verify provides the independent byte-exact 1 MiB proof.
+    if sender < requested || receiver != sender {
         return Err(json!({
             "error":format!("IPERF3_{direction}_BYTE_MISMATCH"),
             "requested_bytes":requested,
             "sender_bytes":sender,
             "receiver_bytes":receiver,
             "preflight":preflight,
-        }).to_string());
+        })
+        .to_string());
     }
     Ok(())
 }
@@ -603,7 +642,10 @@ fn ue_netns_ip(
     Ok(output)
 }
 
-fn ue_netns_ip_route_get(target: &VerifiedTrafficTarget, destination: &str) -> Result<String, String> {
+fn ue_netns_ip_route_get(
+    target: &VerifiedTrafficTarget,
+    destination: &str,
+) -> Result<String, String> {
     let output = ue_netns_ip(
         target,
         &["route", "get", destination, "from", &target.ue_ip],
@@ -617,14 +659,15 @@ fn ue_netns_ip_route_get(target: &VerifiedTrafficTarget, destination: &str) -> R
 fn ue_policy_rule_present(raw: &str, ue_ip: &str) -> bool {
     raw.lines().any(|line| {
         let fields = line.split_whitespace().collect::<Vec<_>>();
-        fields.first().is_some_and(|value| value.trim_end_matches(':') == UE_POLICY_PRIORITY)
+        fields
+            .first()
+            .is_some_and(|value| value.trim_end_matches(':') == UE_POLICY_PRIORITY)
             && fields.windows(2).any(|pair| {
-                pair[0] == "from"
-                    && (pair[1] == ue_ip || pair[1] == format!("{ue_ip}/32"))
+                pair[0] == "from" && (pair[1] == ue_ip || pair[1] == format!("{ue_ip}/32"))
             })
-            && fields.windows(2).any(|pair| {
-                pair[0] == "lookup" && pair[1] == UE_POLICY_TABLE
-            })
+            && fields
+                .windows(2)
+                .any(|pair| pair[0] == "lookup" && pair[1] == UE_POLICY_TABLE)
     })
 }
 
@@ -698,15 +741,7 @@ fn remove_ue_policy_routing(target: &VerifiedTrafficTarget) -> Result<(), String
             return Err("UE_POLICY_RULE_DELETE_FAILED".into());
         }
     }
-    let route = ue_netns_ip(
-        target,
-        &[
-            "route",
-            "flush",
-            "table",
-            UE_POLICY_TABLE,
-        ],
-    )?;
+    let route = ue_netns_ip(target, &["route", "flush", "table", UE_POLICY_TABLE])?;
     if !route.status.success() {
         return Err("UE_POLICY_ROUTE_REMOVE_FAILED".into());
     }
@@ -821,6 +856,241 @@ impl DlSenderConfig {
         }
         Ok(())
     }
+
+    fn namespace_pid(&self) -> Result<u32, String> {
+        let container = self
+            .container
+            .as_deref()
+            .ok_or("DL_SENDER_NOT_CONFIGURED")?;
+        let output = Command::new("/usr/bin/timeout")
+            .args([
+                "--signal=TERM",
+                "--kill-after=1s",
+                "5s",
+                "/usr/bin/docker",
+                "inspect",
+                "--format",
+                "{{.State.Pid}}",
+                container,
+            ])
+            .output()
+            .map_err(|_| "DL_SENDER_INSPECT_FAILED")?;
+        if !output.status.success() {
+            return Err("DL_SENDER_UNAVAILABLE".into());
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| "DL_SENDER_PID_INVALID".to_string())?
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| "DL_SENDER_PID_INVALID".to_string())
+    }
+}
+
+const TRANSFER_RECEIVER_PY: &str = r#"import hashlib,json,socket,sys
+bind_ip,port,out_path=sys.argv[1],int(sys.argv[2]),sys.argv[3]
+h=hashlib.sha256(); total=0
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind((bind_ip,port)); s.listen(1)
+c,_=s.accept()
+with open(out_path,'wb') as out:
+ while True:
+  data=c.recv(65536)
+  if not data: break
+  out.write(data); h.update(data); total+=len(data)
+c.close(); s.close()
+print(json.dumps({'bytes':total,'sha256':h.hexdigest()}))"#;
+
+const TRANSFER_SENDER_PY: &str = r#"import hashlib,json,socket,sys
+src_path,src_ip,dev,dst_ip,port=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4],int(sys.argv[5])
+h=hashlib.sha256(); total=0
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_BINDTODEVICE,(dev+'\0').encode()); s.bind((src_ip,0)); s.connect((dst_ip,port))
+with open(src_path,'rb') as src:
+ while True:
+  data=src.read(65536)
+  if not data: break
+  s.sendall(data); h.update(data); total+=len(data)
+s.shutdown(socket.SHUT_WR); s.close()
+print(json.dumps({'bytes':total,'sha256':h.hexdigest()}))"#;
+
+fn transfer_command_failure(code: &str, output: &std::process::Output) -> String {
+    json!({
+        "error":code,
+        "exit_code":output.status.code(),
+        "stdout":String::from_utf8_lossy(&output.stdout).chars().take(2048).collect::<String>(),
+        "stderr":String::from_utf8_lossy(&output.stderr).chars().take(2048).collect::<String>(),
+    })
+    .to_string()
+}
+
+fn execute_sha256_transfer(
+    target: &VerifiedTrafficTarget,
+    direction: &str,
+    sender: &DlSenderConfig,
+) -> Result<TransferVerification, String> {
+    sender.health()?;
+    if !matches!(direction, "ul" | "dl") {
+        return Err("TRANSFER_VERIFY_DIRECTION_INVALID".into());
+    }
+    let route_dest = sender.sender_ip.to_string();
+    let route_raw = ue_netns_ip_route_get(target, &route_dest)?;
+    let preflight = evaluate_ue_route_preflight(
+        &route_raw,
+        &route_dest,
+        &target.tun_interface,
+        if direction == "ul" {
+            "UL_ROUTE_NOT_VIA_UE_TUN"
+        } else {
+            "DL_ROUTE_NOT_VIA_UE_TUN"
+        },
+    );
+    if !preflight.ok {
+        return Err(preflight_failure(
+            preflight
+                .code
+                .as_deref()
+                .unwrap_or("TRANSFER_ROUTE_INVALID"),
+            &preflight,
+        ));
+    }
+    let root = Path::new("/var/lib/polaris-control/transfer-verify");
+    fs::create_dir_all(root).map_err(|_| "TRANSFER_VERIFY_STORAGE_UNAVAILABLE")?;
+    #[cfg(unix)]
+    fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .map_err(|_| "TRANSFER_VERIFY_STORAGE_UNSAFE")?;
+    let token = random_hex(12);
+    let source_path = root.join(format!("{token}.source"));
+    let received_path = root.join(format!("{token}.received"));
+    let mut payload = vec![0_u8; TRANSFER_VERIFY_BYTES as usize];
+    OsRng.fill_bytes(&mut payload);
+    let mut source = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&source_path)
+        .map_err(|_| "TRANSFER_VERIFY_SOURCE_CREATE_FAILED")?;
+    source
+        .write_all(&payload)
+        .map_err(|_| "TRANSFER_VERIFY_SOURCE_WRITE_FAILED")?;
+    source
+        .sync_all()
+        .map_err(|_| "TRANSFER_VERIFY_SOURCE_SYNC_FAILED")?;
+    let sender_sha256 = format!("{:x}", Sha256::digest(&payload));
+    drop(payload);
+
+    let dn_pid = sender.namespace_pid()?;
+    let port = 20_000 + (OsRng.next_u32() % 20_000) as u16;
+    let (receiver_pid, receiver_ip, sender_pid, sender_ip, sender_dev) = if direction == "ul" {
+        (
+            dn_pid,
+            sender.sender_ip.to_string(),
+            target.namespace_pid,
+            target.ue_ip.clone(),
+            target.tun_interface.clone(),
+        )
+    } else {
+        (
+            target.namespace_pid,
+            target.ue_ip.clone(),
+            dn_pid,
+            sender.sender_ip.to_string(),
+            "eth0".to_string(),
+        )
+    };
+    let mut receiver = Command::new("/usr/bin/timeout")
+        .args([
+            "--signal=TERM",
+            "--kill-after=1s",
+            "30s",
+            "/usr/bin/nsenter",
+            "--target",
+            &receiver_pid.to_string(),
+            "--net",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            TRANSFER_RECEIVER_PY,
+            &receiver_ip,
+            &port.to_string(),
+            received_path.to_string_lossy().as_ref(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| "TRANSFER_VERIFY_RECEIVER_SPAWN_FAILED")?;
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let sent = Command::new("/usr/bin/timeout")
+        .args([
+            "--signal=TERM",
+            "--kill-after=1s",
+            "30s",
+            "/usr/bin/nsenter",
+            "--target",
+            &sender_pid.to_string(),
+            "--net",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            TRANSFER_SENDER_PY,
+            source_path.to_string_lossy().as_ref(),
+            &sender_ip,
+            &sender_dev,
+            &receiver_ip,
+            &port.to_string(),
+        ])
+        .output()
+        .map_err(|_| "TRANSFER_VERIFY_SENDER_SPAWN_FAILED")?;
+    if !sent.status.success() {
+        let _ = receiver.kill();
+        let _ = receiver.wait();
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&received_path);
+        return Err(transfer_command_failure(
+            "TRANSFER_VERIFY_SENDER_FAILED",
+            &sent,
+        ));
+    }
+    let received = receiver
+        .wait_with_output()
+        .map_err(|_| "TRANSFER_VERIFY_RECEIVER_WAIT_FAILED")?;
+    if !received.status.success() {
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&received_path);
+        return Err(transfer_command_failure(
+            "TRANSFER_VERIFY_RECEIVER_FAILED",
+            &received,
+        ));
+    }
+    let sender_report: Value = serde_json::from_slice(&sent.stdout)
+        .map_err(|_| "TRANSFER_VERIFY_SENDER_REPORT_INVALID")?;
+    let receiver_report: Value = serde_json::from_slice(&received.stdout)
+        .map_err(|_| "TRANSFER_VERIFY_RECEIVER_REPORT_INVALID")?;
+    let sent_bytes = sender_report["bytes"].as_u64().unwrap_or(0);
+    let received_bytes = receiver_report["bytes"].as_u64().unwrap_or(0);
+    let receiver_sha256 = receiver_report["sha256"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let _ = fs::remove_file(&source_path);
+    let _ = fs::remove_file(&received_path);
+    if sent_bytes != TRANSFER_VERIFY_BYTES
+        || received_bytes != TRANSFER_VERIFY_BYTES
+        || sender_report["sha256"].as_str() != Some(sender_sha256.as_str())
+        || receiver_sha256 != sender_sha256
+    {
+        return Err(json!({
+            "error":"TRANSFER_VERIFY_SHA256_MISMATCH", "direction":direction,
+            "expected_bytes":TRANSFER_VERIFY_BYTES, "sender_bytes":sent_bytes,
+            "receiver_bytes":received_bytes, "sender_sha256":sender_sha256,
+            "receiver_sha256":receiver_sha256, "preflight":preflight,
+        })
+        .to_string());
+    }
+    Ok(TransferVerification {
+        direction: direction.to_string(),
+        bytes: received_bytes,
+        sender_sha256,
+        receiver_sha256,
+        preflight,
+    })
 }
 
 fn dl_sender_health(state: &AppState) -> Result<(), String> {
@@ -980,6 +1250,7 @@ trait UeRuntime: Send + Sync {
             return Err(preflight_failure("UL_ROUTE_NOT_VIA_UE_TUN", &preflight));
         }
         let iperf = iperf3_program();
+        let rate = iperf3_rate()?;
         let command = vec![
             iperf.clone(),
             "-c".into(),
@@ -993,6 +1264,9 @@ trait UeRuntime: Send + Sync {
             target.ue_ip.clone(),
             "--bind-dev".into(),
             target.tun_interface.clone(),
+            "-b".into(),
+            rate.clone(),
+            "--get-server-output".into(),
             "-w".into(),
             IPERF_TCP_WINDOW.into(),
         ];
@@ -1022,6 +1296,9 @@ trait UeRuntime: Send + Sync {
                 &target.ue_ip,
                 "--bind-dev",
                 &target.tun_interface,
+                "-b",
+                &rate,
+                "--get-server-output",
                 "-w",
                 IPERF_TCP_WINDOW,
             ])
@@ -1039,8 +1316,7 @@ trait UeRuntime: Send + Sync {
             if let Some(object) = body.as_object_mut() {
                 object.insert(
                     "preflight".to_string(),
-                    serde_json::to_value(&preflight)
-                        .unwrap_or_else(|_| json!(null)),
+                    serde_json::to_value(&preflight).unwrap_or_else(|_| json!(null)),
                 );
             }
             return Err(body.to_string());
@@ -1058,8 +1334,10 @@ trait UeRuntime: Send + Sync {
         }
         let client_report: Value = serde_json::from_slice(&client_output.stdout)
             .map_err(|_| "IPERF3_UL_CLIENT_REPORT_INVALID".to_string())?;
-        let receiver_report: Value = serde_json::from_slice(&receiver_output.stdout)
-            .map_err(|_| "IPERF3_UL_RECEIVER_REPORT_INVALID".to_string())?;
+        let receiver_report: Value = client_report
+            .get("server_output_json")
+            .cloned()
+            .ok_or_else(|| "IPERF3_UL_SERVER_OUTPUT_MISSING".to_string())?;
         let client_sent_bytes = client_report
             .pointer("/end/sum_sent/bytes")
             .and_then(Value::as_u64)
@@ -1078,6 +1356,8 @@ trait UeRuntime: Send + Sync {
         Ok(IperfMeasurement {
             client_sent_bytes,
             server_received_bytes,
+            rate,
+            tcp_window: IPERF_TCP_WINDOW.into(),
             preflight,
         })
     }
@@ -1117,6 +1397,7 @@ trait UeRuntime: Send + Sync {
             return Err(preflight_failure("DL_ROUTE_NOT_VIA_UE_TUN", &preflight));
         }
         let iperf = iperf3_program();
+        let rate = iperf3_rate()?;
         let mut receiver = Command::new("/usr/bin/timeout")
             .args([
                 "--signal=TERM",
@@ -1154,6 +1435,9 @@ trait UeRuntime: Send + Sync {
                 &bytes.to_string(),
                 "--connect-timeout",
                 "5000",
+                "-b",
+                &rate,
+                "--get-server-output",
                 "-w",
                 IPERF_TCP_WINDOW,
                 "-J",
@@ -1173,8 +1457,10 @@ trait UeRuntime: Send + Sync {
         }
         let sender_report: Value = serde_json::from_slice(&sender_output.stdout)
             .map_err(|_| "IPERF3_DL_SENDER_REPORT_INVALID")?;
-        let receiver_report: Value = serde_json::from_slice(&receiver_output.stdout)
-            .map_err(|_| "IPERF3_DL_RECEIVER_REPORT_INVALID")?;
+        let receiver_report: Value = sender_report
+            .get("server_output_json")
+            .cloned()
+            .ok_or("IPERF3_DL_SERVER_OUTPUT_MISSING")?;
         let sender_bytes = sender_report
             .pointer("/end/sum_sent/bytes")
             .and_then(Value::as_u64)
@@ -1187,8 +1473,18 @@ trait UeRuntime: Send + Sync {
         Ok(IperfMeasurement {
             client_sent_bytes: sender_bytes,
             server_received_bytes: ue_bytes,
+            rate,
+            tcp_window: IPERF_TCP_WINDOW.into(),
             preflight,
         })
+    }
+    fn execute_transfer_verify(
+        &self,
+        target: &VerifiedTrafficTarget,
+        direction: &str,
+        sender: &DlSenderConfig,
+    ) -> Result<TransferVerification, String> {
+        execute_sha256_transfer(target, direction, sender)
     }
     fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> {
         let _ = job;
@@ -2847,6 +3143,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
     if dl_sender.is_ok() {
         executable_steps.push("traffic_dl");
         executable_steps.push("traffic_ul");
+        executable_steps.push("transfer_verify");
     } else {
         unavailable_steps.insert(
             0,
@@ -2855,6 +3152,10 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
         unavailable_steps.insert(
             1,
             json!({"type":"traffic_ul","http_status":422,"reason":"UL_RECEIVER_NOT_AVAILABLE"}),
+        );
+        unavailable_steps.insert(
+            2,
+            json!({"type":"transfer_verify","http_status":422,"reason":"TRANSFER_PEER_NOT_AVAILABLE"}),
         );
     }
     Json(json!({
@@ -3255,8 +3556,12 @@ mod lab_nf_tests {
 
     #[test]
     fn network_function_observation_honours_the_inspector_contract() {
-        let present =
-            network_function_observation("AMF", "oiran-lab-amf-1", 42, Some(("running".into(), "healthy".into())));
+        let present = network_function_observation(
+            "AMF",
+            "oiran-lab-amf-1",
+            42,
+            Some(("running".into(), "healthy".into())),
+        );
         assert_eq!(present["nf"], "AMF");
         assert_eq!(present["container"], "oiran-lab-amf-1");
         assert_eq!(present["process_state"], "running");
@@ -3281,7 +3586,17 @@ mod lab_nf_tests {
         let keys: Vec<&str> = LAB_NETWORK_FUNCTIONS.iter().map(|(nf, _)| *nf).collect();
         assert_eq!(keys.len(), 12);
         for expected in [
-            "AMF", "SMF", "UPF", "NRF", "AUSF", "UDM", "UDR", "PCF", "NSSF", "BSF", "Kamailio",
+            "AMF",
+            "SMF",
+            "UPF",
+            "NRF",
+            "AUSF",
+            "UDM",
+            "UDR",
+            "PCF",
+            "NSSF",
+            "BSF",
+            "Kamailio",
             "RTPengine",
         ] {
             assert!(
@@ -3310,7 +3625,16 @@ mod lab_nf_tests {
         assert_eq!(nrf["health"], "unhealthy");
         assert_eq!(nrf["observed"], true);
         // Every other container is absent → observed=false, no fabricated state.
-        for absent in ["AUSF", "UDM", "UDR", "PCF", "NSSF", "BSF", "Kamailio", "RTPengine"] {
+        for absent in [
+            "AUSF",
+            "UDM",
+            "UDR",
+            "PCF",
+            "NSSF",
+            "BSF",
+            "Kamailio",
+            "RTPengine",
+        ] {
             let entry = &object[absent];
             assert!(entry["process_state"].is_null());
             assert!(entry["health"].is_null());
@@ -3927,8 +4251,7 @@ async fn get_subscriber(
 ) -> impl IntoResponse {
     let backend = state.subscriber_backend.clone();
     let fetch_slot = slot.clone();
-    let fetched =
-        tokio::task::spawn_blocking(move || backend.fetch_slot(&fetch_slot)).await;
+    let fetched = tokio::task::spawn_blocking(move || backend.fetch_slot(&fetch_slot)).await;
     let sanitized = match fetched {
         Ok(Ok(Some(record))) => record,
         Ok(Ok(None)) => {
@@ -3987,9 +4310,10 @@ async fn update_subscriber(
     let backend = state.subscriber_backend.clone();
     let slot_for_update = slot.clone();
     let update_for_backend = update.clone();
-    let result =
-        tokio::task::spawn_blocking(move || backend.apply_update(&slot_for_update, update_for_backend))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        backend.apply_update(&slot_for_update, update_for_backend)
+    })
+    .await;
     match result {
         Ok(Ok(sanitized)) => {
             audit(
@@ -4175,11 +4499,11 @@ fn validate_subscriber_update(
             k: "0".repeat(32),
             opc: "0".repeat(32),
             sst: update.sst.unwrap_or(1),
-            sd: update
-                .sd
+            sd: update.sd.clone().unwrap_or(None),
+            dnns: update
+                .dnns
                 .clone()
-                .unwrap_or(None),
-            dnns: update.dnns.clone().unwrap_or_else(|| vec!["internet".into()]),
+                .unwrap_or_else(|| vec!["internet".into()]),
             ambr: update
                 .ambr
                 .clone()
@@ -7471,6 +7795,8 @@ fn execute_live_definition_step(
             let mut sender_bytes = 0_u64;
             let mut ue_bytes = 0_u64;
             let mut preflights = Vec::new();
+            let mut rate = None;
+            let mut tcp_window = None;
             for ue_id in ue_ids {
                 if control.cancel.load(Ordering::SeqCst) {
                     return Err("SCENARIO_STOP_REQUESTED".into());
@@ -7487,11 +7813,15 @@ fn execute_live_definition_step(
                     .checked_add(measurement.server_received_bytes)
                     .ok_or("IPERF3_BYTES_OVERFLOW")?;
                 preflights.push(measurement.preflight);
+                rate = Some(measurement.rate);
+                tcp_window = Some(measurement.tcp_window);
             }
             Ok(json!({
                 "requested_bytes_per_ue":bytes,
                 "measured_sender_bytes":sender_bytes,
                 "measured_ue_bytes":ue_bytes,
+                "rate":rate,
+                "tcp_window":tcp_window,
                 "preflights":preflights
             }))
         }
@@ -7504,6 +7834,8 @@ fn execute_live_definition_step(
             let mut ue_sender_bytes = 0_u64;
             let mut dn_receiver_bytes = 0_u64;
             let mut preflights = Vec::new();
+            let mut rate = None;
+            let mut tcp_window = None;
             for ue_id in ue_ids {
                 if control.cancel.load(Ordering::SeqCst) {
                     return Err("SCENARIO_STOP_REQUESTED".into());
@@ -7520,13 +7852,45 @@ fn execute_live_definition_step(
                     .checked_add(measurement.server_received_bytes)
                     .ok_or("IPERF3_BYTES_OVERFLOW")?;
                 preflights.push(measurement.preflight);
+                rate = Some(measurement.rate);
+                tcp_window = Some(measurement.tcp_window);
             }
             Ok(json!({
                 "requested_bytes_per_ue":bytes,
                 "measured_ul_bytes":ue_sender_bytes,
                 "measured_ue_sender_bytes":ue_sender_bytes,
                 "measured_dn_receiver_bytes":dn_receiver_bytes,
+                "rate":rate,
+                "tcp_window":tcp_window,
                 "preflights":preflights
+            }))
+        }
+        "transfer_verify" => {
+            dl_sender_health(state).map_err(|_| "TRANSFER_PEER_NOT_AVAILABLE".to_string())?;
+            let direction = step
+                .parameters
+                .get("direction")
+                .and_then(Value::as_str)
+                .ok_or("TRANSFER_VERIFY_DIRECTION_INVALID")?;
+            if !matches!(direction, "ul" | "dl") {
+                return Err("TRANSFER_VERIFY_DIRECTION_INVALID".into());
+            }
+            let mut evidence = Vec::new();
+            for ue_id in ue_ids {
+                if control.cancel.load(Ordering::SeqCst) {
+                    return Err("SCENARIO_STOP_REQUESTED".into());
+                }
+                let target = resolve_controller_traffic_target(state, ue_id)?;
+                evidence.push(state.ue_runtime.execute_transfer_verify(
+                    &target,
+                    direction,
+                    &state.dl_sender,
+                )?);
+            }
+            Ok(json!({
+                "direction":direction,
+                "bytes_per_ue":TRANSFER_VERIFY_BYTES,
+                "transfers":evidence
             }))
         }
         "idle" => {
@@ -7839,6 +8203,16 @@ async fn start_scenario(
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({"error":"UL_RECEIVER_NOT_AVAILABLE"})),
+            );
+        }
+        if resolved
+            .iter()
+            .any(|step| step.step_type == "transfer_verify")
+            && dl_sender_health(&state).is_err()
+        {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":"TRANSFER_PEER_NOT_AVAILABLE"})),
             );
         }
         let outcome = if state.execution_mode == "mock" {
@@ -8449,10 +8823,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             post(bulk_create_subscribers)
                 .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
-        .route(
-            "/subscribers/generate",
-            post(generate_subscribers),
-        )
+        .route("/subscribers/generate", post(generate_subscribers))
         .route(
             "/subscribers/:slot",
             get(get_subscriber).put(update_subscriber),
@@ -8998,10 +9369,8 @@ mod p0_tests {
         // 0.15.2 — honour TMPDIR / std::env::temp_dir() instead of hard-coding
         // /root/.hermes/cache/scratch/*. The previous path only worked under the
         // Codex Hermes sandbox; the new one works on any workstation or CI runner.
-        let root = std::env::temp_dir().join(format!(
-            "polaris-control-p0-{}-{id}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("polaris-control-p0-{}-{id}", std::process::id()));
         let users_path = root.join("users.json");
         provision_user(&users_path, "operator-test", "operator", OPERATOR_PASSWORD).unwrap();
         provision_user(
@@ -9233,6 +9602,7 @@ mod p0_tests {
             json!([
                 {"type":"traffic_dl","http_status":422,"reason":"DL_SENDER_NOT_AVAILABLE"},
                 {"type":"traffic_ul","http_status":422,"reason":"UL_RECEIVER_NOT_AVAILABLE"},
+                {"type":"transfer_verify","http_status":422,"reason":"TRANSFER_PEER_NOT_AVAILABLE"},
                 {"type":"ims_register","http_status":423,"reason":"IMS_NOT_AVAILABLE"},
                 {"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}
             ])
@@ -9536,10 +9906,7 @@ mod p0_tests {
         let container = std::env::var("POLARIS_TEST_MONGODB_CONTAINER")
             .expect("POLARIS_TEST_MONGODB_CONTAINER is required");
         // 0.15.2 — portable tempdir (see state() above for rationale).
-        let root = std::env::temp_dir().join(format!(
-            "polaris-mongo-copy-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("polaris-mongo-copy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         std::env::set_var("POLARIS_OPEN5GS_MONGODB_CONTAINER", &container);
@@ -12478,27 +12845,38 @@ mod p0_tests {
     }
 
     #[test]
-    fn iperf_requires_byte_exact_sender_and_receiver_reports() {
+    fn iperf_requires_receiver_to_match_every_reported_sender_byte() {
         let preflight = evaluate_ue_route_preflight(
             "10.77.24.30 from 10.46.0.5 dev uesimtun0 table 100",
             "10.77.24.30",
             "uesimtun0",
             "UL_ROUTE_NOT_VIA_UE_TUN",
         );
-        assert!(validate_exact_iperf_bytes(
-            "UL", 1_048_576, 1_048_576, 1_048_576, &preflight
-        )
-        .is_ok());
-        let error = validate_exact_iperf_bytes(
-            "UL", 1_048_576, 1_048_576, 786_432, &preflight,
-        )
-        .unwrap_err();
+        assert!(
+            validate_exact_iperf_bytes("UL", 1_048_576, 1_048_576, 1_048_576, &preflight).is_ok()
+        );
+        let error = validate_exact_iperf_bytes("UL", 1_048_576, 1_048_576, 786_432, &preflight)
+            .unwrap_err();
         let evidence: Value = serde_json::from_str(&error).unwrap();
         assert_eq!(evidence["error"], "IPERF3_UL_BYTE_MISMATCH");
         assert_eq!(evidence["requested_bytes"], 1_048_576);
         assert_eq!(evidence["receiver_bytes"], 786_432);
         assert_eq!(evidence["preflight"]["actual_dev"], "uesimtun0");
         assert_eq!(IPERF_TCP_WINDOW, "64K");
+        assert!(
+            validate_exact_iperf_bytes("UL", 1_048_576, 1_310_720, 1_310_720, &preflight).is_ok()
+        );
+    }
+
+    #[test]
+    fn iperf_rate_is_bounded_to_an_explicit_numeric_unit() {
+        std::env::remove_var("POLARIS_IPERF3_RATE");
+        assert_eq!(iperf3_rate().unwrap(), "5M");
+        std::env::set_var("POLARIS_IPERF3_RATE", "750K");
+        assert_eq!(iperf3_rate().unwrap(), "750K");
+        std::env::set_var("POLARIS_IPERF3_RATE", "5M;touch /tmp/x");
+        assert_eq!(iperf3_rate().unwrap_err(), "IPERF3_RATE_INVALID");
+        std::env::remove_var("POLARIS_IPERF3_RATE");
     }
 
     #[test]
@@ -12582,12 +12960,8 @@ mod p0_tests {
     #[test]
     fn source_policy_preflight_accepts_route_get_from_ue_ip() {
         let raw = "10.77.24.30 dev uesimtun0 table 100 from 10.46.0.4 uid 0\n    cache";
-        let evidence = evaluate_ue_route_preflight(
-            raw,
-            "10.77.24.30",
-            "uesimtun0",
-            "UL_ROUTE_NOT_VIA_UE_TUN",
-        );
+        let evidence =
+            evaluate_ue_route_preflight(raw, "10.77.24.30", "uesimtun0", "UL_ROUTE_NOT_VIA_UE_TUN");
         assert!(evidence.ok);
         assert_eq!(evidence.actual_dev.as_deref(), Some("uesimtun0"));
         assert_eq!(evidence.src.as_deref(), Some("10.46.0.4"));

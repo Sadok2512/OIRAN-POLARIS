@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.17.4 (polaris-control-api)
+
+- Pace UL and DL iperf3 transfers with a validated configurable rate
+  (`POLARIS_IPERF3_RATE`, default `5M`) and retain the server's independent
+  JSON report through `--get-server-output`.
+- Keep the `64K` TCP window after isolated loss tests showed fewer
+  retransmissions and exact delivery than the unbounded run.
+- Add the strict `transfer_verify` scenario step for a byte-exact 1 MiB TCP
+  transfer with independent sender/receiver SHA-256 evidence.
+
 ## 0.17.3 (polaris-control-api)
 
 - Bound the TCP sender socket window to `64K` for both UL and DL iperf3
