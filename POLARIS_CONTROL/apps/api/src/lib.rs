@@ -947,7 +947,14 @@ impl DockerUeRuntime {
     fn profile_path(ue_id: &str, basename: &str) -> Result<PathBuf, String> {
         let expected = ue_id
             .strip_prefix("UE-")
-            .map(|suffix| format!("ue-{suffix}.yaml"));
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+            .map(|index| {
+                if index <= 99 {
+                    format!("ue-{index:02}.yaml")
+                } else {
+                    format!("ue-{index:05}.yaml")
+                }
+            });
         if !ueransim_adapter::is_approved_controller_ue(ue_id)
             || expected.as_deref() != Some(basename)
         {

@@ -106,18 +106,20 @@ pub fn planned_profiles() -> Vec<UeProfileSpec> {
 }
 
 pub fn is_approved_controller_ue(ue_id: &str) -> bool {
-    let index = ue_id
+    let suffix = ue_id
         .strip_prefix("UE-")
-        .filter(|value| !value.is_empty() && value.len() <= 6)
+        .filter(|value| !value.is_empty() && value.len() <= 6);
+    let index = suffix
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|index| (1..=MAX_CONFIGURABLE_UES).contains(index));
     index.is_some_and(|index| {
-        ue_id
-            == if index <= 99 {
-                format!("UE-{index:02}")
-            } else {
-                format!("UE-{index:05}")
-            }
+        let short = if index <= 99 {
+            format!("UE-{index:02}")
+        } else {
+            format!("UE-{index}")
+        };
+        let padded = format!("UE-{index:05}");
+        ue_id == short || ue_id == padded
     })
 }
 
@@ -730,6 +732,8 @@ mod tests {
         .unwrap();
         assert_eq!(ue01.container_name, "polaris-control-ue-01");
         assert!(is_approved_controller_ue("UE-11"));
+        assert!(is_approved_controller_ue("UE-201"));
+        assert!(is_approved_controller_ue("UE-00201"));
         assert!(is_approved_controller_ue("UE-100000"));
         assert!(!is_approved_controller_ue("UE-100001"));
         assert!(!is_approved_controller_ue("UE-2"));
