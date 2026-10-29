@@ -1,5 +1,39 @@
 # Changelog
 
+## oiran-decode v0.4.1 — SBI HPACK context, NGAP QoS flow walker, EPS SMC decoding
+
+- `decoder-sbi v0.2.0`: HPACK decode failures (dynamic table state lost when the
+  capture starts mid-connection, orphan CONTINUATION, header block exceeding the
+  configured maximum size) are now surfaced as explicit
+  `HPACK_CONTEXT_UNAVAILABLE` errors on the normalized event instead of being
+  rolled into a generic PARTIAL. Once a direction's HPACK state is poisoned, any
+  subsequent HEADERS block on that direction is attributed to
+  `HPACK_CONTEXT_UNAVAILABLE` because the dynamic table indices can no longer be
+  verified against the sender. Streams whose request headers failed to decode
+  are still emitted so the response remains correlatable by HTTP/2 stream ID
+  (previously these were silently dropped as incomplete). The CONTINUATION
+  reassembler was audited: orphan CONTINUATION frames and over-sized blocks now
+  flag the stream explicitly instead of being discarded.
+- `decoder-ngap v0.4.1`: added a canonical APER walker for
+  `QoSFlowSetupRequestList` inside `PDUSessionResourceSetupRequestTransfer`
+  (IE 74) and `AssociatedQosFlowList` inside the first
+  `QoSFlowPerTNLInformation` of `PDUSessionResourceSetupResponseTransfer`
+  (IE 75). When the walker matches the "no-optionals, nonDynamic5QI, canonical
+  one-octet-per-primitive" layout it emits per-item `qfi_<i>`, `five_qi_<i>`,
+  `arp_priority_<i>`, `arp_capability_<i>`, `arp_vulnerability_<i>` session
+  identifiers. Non-canonical encodings (extensions, additional optional
+  subfields, dynamic5QI) fall back to the existing structural
+  `qos_flow_setup_list=present` marker so operators can tell "scanned but could
+  not decode" apart from "no QoS flow IE at all".
+- `decoder-nas v0.3.1`: EPS Security Mode Command (0x5C) now has a dedicated
+  per-TS 24.301 §8.5 decoder (previously the body was preserved only by
+  SHA-256). Mandatory fields emitted: Selected NAS security algorithms
+  (`ciphering=EEAn, integrity=EIAn`), NAS key set identifier (`nas_ksi`,
+  `tsc`), and Replayed UE security capabilities parsed as EEA / EIA / UEA /
+  UIA / GEA bitmaps per TS 24.301 §9.9.3.34.
+- Fixtures are synthetic (PLMN 001/01 or TEST-NET addresses). No real
+  identity, key, SUCI, GUTI, IMEI or IMSI material is present in test code.
+
 ## oiran-decode v0.4.0 — N2 SM transfer typing, Diameter S6a base, Security Mode Command
 
 - `decoder-ngap v0.4.0`: PDUSessionResourceSetupListSUReq (IE 74) and

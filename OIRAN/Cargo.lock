@@ -215,14 +215,14 @@ dependencies = [
 
 [[package]]
 name = "decoder-nas"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "event-schema",
 ]
 
 [[package]]
 name = "decoder-ngap"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "decoder-nas",
  "event-schema",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-sbi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "event-schema",
  "hpack",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "capture-pcap",
  "decoder-gtpu",

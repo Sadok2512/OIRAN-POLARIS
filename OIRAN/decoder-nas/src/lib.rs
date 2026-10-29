@@ -3,7 +3,7 @@
 
 use event_schema::{pseudonym, sha256_hex, DecodeStatus, InformationElement, NamedValue};
 
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.3.1";
 pub const SPECIFICATION: &str = "3GPP TS 24.501 Release 17 + 3GPP TS 24.301";
 pub const EPD_5GMM: u8 = 0x7e;
 pub const EPD_5GSM: u8 = 0x2e;
@@ -643,6 +643,29 @@ fn decode_additional_5g_security_information(value: &[u8]) -> Option<String> {
     ))
 }
 
+/// Decode EPS UE network capability (TS 24.301 §9.9.3.34). Mandatory bytes 0..=1
+/// carry EEA/EIA algorithm bitmaps; additional bytes carry UMTS and GPRS capability
+/// bytes which are reported only as length-preserved provenance when present.
+fn decode_eps_ue_network_capability(value: &[u8]) -> Option<String> {
+    if value.len() < 2 {
+        return None;
+    }
+    let mut parts = vec![
+        format!("eea=0x{:02x}", value[0]),
+        format!("eia=0x{:02x}", value[1]),
+    ];
+    if value.len() >= 3 {
+        parts.push(format!("uea=0x{:02x}", value[2]));
+    }
+    if value.len() >= 4 {
+        parts.push(format!("uia=0x{:02x}", value[3]));
+    }
+    if value.len() >= 5 {
+        parts.push(format!("gea=0x{:02x}", value[4]));
+    }
+    Some(parts.join(","))
+}
+
 fn mm_name(mt: u8) -> (&'static str, &'static str) {
     match mt {
         0x41 => ("Registration Request", "REGISTRATION"),
@@ -995,13 +1018,57 @@ fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8]) {
             ));
         }
         0x5c => {
-            // Security Mode Command: selected algo (1), replayed UE sec cap LV, ngKSI (1).
+            // TS 24.301 §8.5 Security Mode Command: Selected NAS security algorithms (V, 1),
+            // NAS key set identifier + spare half octet (V, 1), Replayed UE security
+            // capabilities (LV, 3-6). Optional TLVs follow at variable positions.
+            if body.len() < 3 {
+                return mark_truncated(msg, "EPS Security Mode Command mandatory fields");
+            }
+            let selected = body[0];
             msg.information_elements.push(ie(
-                "Security Mode Command body",
-                body,
-                Some(format!("body_sha256={}", sha256_hex(body))),
+                "Selected NAS security algorithms",
+                &body[0..1],
+                Some(format!(
+                    "ciphering=EEA{},integrity=EIA{}",
+                    (selected >> 4) & 0x07,
+                    selected & 0x07
+                )),
                 DecodeStatus::Decoded,
             ));
+            let ksi = body[1];
+            msg.information_elements.push(ie(
+                "NAS key set identifier",
+                &body[1..2],
+                Some(format!(
+                    "nas_ksi={},tsc={}",
+                    ksi & 0x07,
+                    (ksi >> 3) & 0x01
+                )),
+                DecodeStatus::Decoded,
+            ));
+            let replayed_len = body[2] as usize;
+            if 3 + replayed_len > body.len() {
+                return mark_truncated(msg, "Replayed UE security capabilities");
+            }
+            let replayed = &body[3..3 + replayed_len];
+            msg.information_elements.push(ie(
+                "Replayed UE security capabilities",
+                replayed,
+                decode_eps_ue_network_capability(replayed),
+                DecodeStatus::Decoded,
+            ));
+            let trailing = &body[3 + replayed_len..];
+            if !trailing.is_empty() {
+                msg.information_elements.push(ie(
+                    "EPS Security Mode Command optional IEs",
+                    trailing,
+                    Some(format!("body_sha256={}", sha256_hex(trailing))),
+                    DecodeStatus::Partial,
+                ));
+                if msg.status == DecodeStatus::Decoded {
+                    msg.status = DecodeStatus::Partial;
+                }
+            }
         }
         _ => {
             msg.information_elements.push(ie(
@@ -1477,14 +1544,53 @@ mod tests {
     }
 
     #[test]
-    fn eps_security_mode_command_body_is_preserved() {
-        let bytes = &[0x07, 0x5c, 0x01, 0x02, 0x03, 0x04];
+    fn eps_security_mode_command_decodes_mandatory_fields_per_ts24301() {
+        // Byte 0 = 0x07 (PD EMM), byte 1 = 0x5C (Security Mode Command).
+        // Body: 0x12 = Selected NAS security algorithms (ciphering=EEA1, integrity=EIA2).
+        //       0x05 = NAS KSI (ksi=5, tsc=0).
+        //       0x05 = Replayed UE sec cap length.
+        //       0xf0 0xe0 0x80 0x40 0x20 = EEA bitmap / EIA / UEA / UIA / GEA bytes.
+        let bytes = &[
+            0x07, 0x5c, 0x12, 0x05, 0x05, 0xf0, 0xe0, 0x80, 0x40, 0x20,
+        ];
         let r = decode(bytes);
         assert_eq!(r.message_name, "Security Mode Command");
-        assert!(r
+        assert_eq!(r.status, DecodeStatus::Decoded, "status: {:?}", r.status);
+        let sel = r
             .information_elements
             .iter()
-            .any(|e| e.name == "Security Mode Command body"));
+            .find(|e| e.name == "Selected NAS security algorithms")
+            .expect("Selected NAS algs IE");
+        let sel_v = sel.value.as_deref().expect("decoded value");
+        assert!(sel_v.contains("ciphering=EEA1"), "{sel_v}");
+        assert!(sel_v.contains("integrity=EIA2"), "{sel_v}");
+        let ksi = r
+            .information_elements
+            .iter()
+            .find(|e| e.name == "NAS key set identifier")
+            .expect("NAS KSI IE");
+        let ksi_v = ksi.value.as_deref().expect("decoded value");
+        assert!(ksi_v.contains("nas_ksi=5"), "{ksi_v}");
+        assert!(ksi_v.contains("tsc=0"), "{ksi_v}");
+        let replayed = r
+            .information_elements
+            .iter()
+            .find(|e| e.name == "Replayed UE security capabilities")
+            .expect("Replayed UE sec cap IE");
+        let replayed_v = replayed.value.as_deref().expect("decoded value");
+        assert!(replayed_v.contains("eea=0xf0"), "{replayed_v}");
+        assert!(replayed_v.contains("eia=0xe0"), "{replayed_v}");
+        assert!(replayed_v.contains("uea=0x80"), "{replayed_v}");
+        assert!(replayed_v.contains("uia=0x40"), "{replayed_v}");
+        assert!(replayed_v.contains("gea=0x20"), "{replayed_v}");
+    }
+
+    #[test]
+    fn eps_security_mode_command_truncated_mandatory_fields_are_malformed() {
+        let short = &[0x07, 0x5c, 0x12, 0x05];
+        let r = decode(short);
+        assert_eq!(r.message_name, "Security Mode Command");
+        assert_eq!(r.status, DecodeStatus::Malformed);
     }
 
     #[test]

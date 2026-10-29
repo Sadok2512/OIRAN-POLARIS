@@ -10,7 +10,7 @@ use plugin_runtime::{
     PLUGIN_API_VERSION,
 };
 
-pub const VERSION: &str = "0.4.0";
+pub const VERSION: &str = "0.4.1";
 pub const SCHEMA_VERSION: &str = "3GPP TS 38.413 V17.3.0";
 pub const SCHEMA_SHA256: &str = "b705532dd52674fce67ccc01df7bd17a8412341ea82740c164029a5b545f04d2";
 #[derive(Default)]
@@ -425,7 +425,36 @@ fn decode_pdu_session_list(id: u16, v: &[u8]) -> (Option<String>, DecodeStatus, 
     if let Some(session_type) = decode_pdu_session_type_marker(&v[3..]) {
         value.push_str(&format!(",pdu_session_type={session_type}"));
     }
-    if nested_qos_flow_marker_present(&v[3..]) {
+    // Attempt to walk the nested QoS flow structure. IE 74 carries a
+    // QoSFlowSetupRequestList inside its PDUSessionResourceSetupRequestTransfer
+    // (IE id 136); IE 75 carries one QosFlowPerTNLInformation (and optional
+    // additional ones) inside its PDUSessionResourceSetupResponseTransfer (IE
+    // id 140 for the list, DLQosFlowPerTNLInformation is the first field of
+    // the SEQUENCE, so we scan for the associated qos flow list marker
+    // IE id 173 = 0x00ad). We fall back to the structural "present" marker if
+    // the walk fails so operators can tell "scanned but could not decode"
+    // apart from "no QoS flow IE at all".
+    let scanned_items = match id {
+        74 => scan_qos_flow_setup_request_list(&v[3..]),
+        75 => scan_qos_flow_per_tnl_information_list(&v[3..]),
+        _ => Vec::new(),
+    };
+    if !scanned_items.is_empty() {
+        let mut parts = Vec::new();
+        for (index, item) in scanned_items.iter().enumerate() {
+            parts.push(format!("qfi_{}={}", index, item.qfi));
+            if let Some(five_qi) = item.five_qi {
+                parts.push(format!("five_qi_{}={}", index, five_qi));
+            }
+            if let Some(arp) = &item.arp {
+                parts.push(format!(
+                    "arp_priority_{}={},arp_capability_{}={},arp_vulnerability_{}={}",
+                    index, arp.priority, index, arp.capability, index, arp.vulnerability
+                ));
+            }
+        }
+        value.push_str(&format!(",{}", parts.join(",")));
+    } else if nested_qos_flow_marker_present(&v[3..]) {
         value.push_str(",qos_flow_setup_list=present");
     }
     (Some(value), DecodeStatus::Partial, false)
@@ -469,6 +498,192 @@ fn decode_pdu_session_type_marker(v: &[u8]) -> Option<&'static str> {
 fn nested_qos_flow_marker_present(v: &[u8]) -> bool {
     v.windows(4)
         .any(|w| w[0..2] == [0x00, 0x88] && w[2] & 0x3f == 0 && w[3] > 0)
+}
+
+/// A QoS flow descriptor extracted from a PDUSessionResourceSetupRequestTransfer
+/// or PDUSessionResourceSetupResponseTransfer. Fields are populated when their
+/// APER subtree matches the canonical "one-octet-per-primitive, left-justified"
+/// encoding — the convention already used by `pdu_session_nas_contents` and the
+/// existing single-ENUMERATED decoders in this crate. Non-canonical encodings
+/// yield `None`; the structural marker fallback still emits "present".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScannedQosFlow {
+    pub qfi: u8,
+    pub five_qi: Option<u8>,
+    pub arp: Option<ScannedArp>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannedArp {
+    pub priority: u8,
+    pub capability: &'static str,
+    pub vulnerability: &'static str,
+}
+
+/// Find IE 136 (QoSFlowSetupRequestList) inside a nested
+/// PDUSessionResourceSetupRequestTransfer OCTET STRING and walk its contents.
+/// Returns the decoded items; an empty vector means no match or non-canonical
+/// encoding.
+pub fn scan_qos_flow_setup_request_list(bytes: &[u8]) -> Vec<ScannedQosFlow> {
+    let Some((offset, length)) = locate_inner_ie(bytes, 0x0088) else {
+        return Vec::new();
+    };
+    let Some(content) = bytes.get(offset..offset + length) else {
+        return Vec::new();
+    };
+    walk_qos_flow_setup_request_list(content).unwrap_or_default()
+}
+
+/// Walk a QoSFlowSetupRequestList content OCTET STRING assuming the canonical
+/// one-octet-per-primitive, left-justified APER layout. Each item occupies 14
+/// octets: SEQUENCE preamble, QFI (6 bits in high), QoS parameters preamble,
+/// QosCharacteristics CHOICE, NonDynamic5QIDescriptor preamble, fiveQI (ext +
+/// value), ARP preamble, priorityLevelARP (ext + 4-bit offset in high nibble),
+/// pre-emptionCapability (ext + value in bit 7), pre-emptionVulnerability (ext
+/// + value in bit 7).
+fn walk_qos_flow_setup_request_list(content: &[u8]) -> Option<Vec<ScannedQosFlow>> {
+    const ITEM_LEN: usize = 14;
+    if content.is_empty() {
+        return None;
+    }
+    let count = (content[0] as usize) + 1;
+    let mut items = Vec::with_capacity(count);
+    let mut cursor = 1usize;
+    for _ in 0..count {
+        let end = cursor.checked_add(ITEM_LEN)?;
+        if end > content.len() {
+            return None;
+        }
+        let item = &content[cursor..end];
+        // Preamble bytes must be the canonical no-optionals / nonDynamic5QI
+        // layout. If any ext/opt bit is set we stop decoding this item.
+        if item[0] != 0x00 || item[2] != 0x00 || item[4] != 0x00 || item[7] != 0x00 {
+            return None;
+        }
+        let qfi = item[1] >> 2;
+        if qfi > 63 {
+            return None;
+        }
+        // QosCharacteristics CHOICE must be nonDynamic5QI (ext=0, choice=0).
+        if item[3] != 0x00 {
+            return None;
+        }
+        // fiveQI: ext bit must be 0 in high bit of item[5]; value in item[6].
+        if item[5] & 0x80 != 0 {
+            return None;
+        }
+        let five_qi = item[6];
+        // priorityLevelARP: ext bit 0 in item[8], offset in high 4 bits of item[9].
+        if item[8] & 0x80 != 0 {
+            return None;
+        }
+        let priority = (item[9] >> 4).saturating_add(1);
+        if !(1..=15).contains(&priority) {
+            return None;
+        }
+        // pre-emptionCapability (ext=0, value in bit 7 of item[11]).
+        if item[10] & 0x80 != 0 {
+            return None;
+        }
+        let capability = match item[11] >> 7 {
+            0 => "shall-not-trigger-pre-emption",
+            1 => "may-trigger-pre-emption",
+            _ => return None,
+        };
+        // pre-emptionVulnerability (ext=0, value in bit 7 of item[13]).
+        if item[12] & 0x80 != 0 {
+            return None;
+        }
+        let vulnerability = match item[13] >> 7 {
+            0 => "not-pre-emptable",
+            1 => "pre-emptable",
+            _ => return None,
+        };
+        items.push(ScannedQosFlow {
+            qfi,
+            five_qi: Some(five_qi),
+            arp: Some(ScannedArp {
+                priority,
+                capability,
+                vulnerability,
+            }),
+        });
+        cursor = end;
+    }
+    Some(items)
+}
+
+/// Find the first QosFlowPerTNLInformation payload inside a
+/// PDUSessionResourceSetupResponseTransfer and walk its AssociatedQosFlowList
+/// (IE id 94 = 0x005e in the nested transfer schema). Each associated item is
+/// one QFI (optional qosFlowMappingIndication is ignored).
+pub fn scan_qos_flow_per_tnl_information_list(bytes: &[u8]) -> Vec<ScannedQosFlow> {
+    let Some((offset, length)) = locate_inner_ie(bytes, 0x005e) else {
+        return Vec::new();
+    };
+    let Some(content) = bytes.get(offset..offset + length) else {
+        return Vec::new();
+    };
+    walk_associated_qos_flow_list(content).unwrap_or_default()
+}
+
+fn walk_associated_qos_flow_list(content: &[u8]) -> Option<Vec<ScannedQosFlow>> {
+    // AssociatedQosFlowItem canonical form: preamble (1 octet), QFI (1 octet
+    // with value in high 6 bits). Optional qosFlowMappingIndication is signalled
+    // by bit 6 of the preamble; when present we skip 1 extra octet (ext bit) +
+    // 1 value octet.
+    if content.is_empty() {
+        return None;
+    }
+    let count = (content[0] as usize) + 1;
+    let mut items = Vec::with_capacity(count);
+    let mut cursor = 1usize;
+    for _ in 0..count {
+        let preamble = *content.get(cursor)?;
+        let has_mapping = preamble & 0x40 != 0;
+        // Only ext=0 with at most the mapping optional is accepted.
+        if preamble & 0xa0 != 0 {
+            return None;
+        }
+        let qfi_byte = *content.get(cursor + 1)?;
+        let qfi = qfi_byte >> 2;
+        if qfi > 63 {
+            return None;
+        }
+        items.push(ScannedQosFlow {
+            qfi,
+            five_qi: None,
+            arp: None,
+        });
+        cursor += 2;
+        if has_mapping {
+            cursor += 2;
+        }
+    }
+    Some(items)
+}
+
+/// Scan for a nested IE with the given id (big-endian 2-octet marker) in a
+/// PDUSessionResource transfer OCTET STRING. Returns the content offset and
+/// length when found. Only IEs with a single-octet APER length determinant
+/// (length < 128) are matched to avoid misinterpreting arbitrary bytes.
+fn locate_inner_ie(bytes: &[u8], ie_id: u16) -> Option<(usize, usize)> {
+    let marker = ie_id.to_be_bytes();
+    for i in 0..bytes.len().saturating_sub(4) {
+        if bytes[i] == marker[0]
+            && bytes[i + 1] == marker[1]
+            && bytes[i + 2] & 0x3f == 0
+            && bytes[i + 3] & 0x80 == 0
+            && bytes[i + 3] > 0
+        {
+            let len = bytes[i + 3] as usize;
+            let start = i + 4;
+            if start + len <= bytes.len() {
+                return Some((start, len));
+            }
+        }
+    }
+    None
 }
 
 /// Decode the observed NGAP UPTransportLayerInformation GTP tunnel open type.
@@ -704,7 +919,12 @@ impl ProtocolDecoder for NgapDecoder {
                                         | "gtp_teid_ul"
                                         | "gtp_teid_dl"
                                         | "pdu_session_type"
-                                ) {
+                                ) || key.starts_with("qfi_")
+                                    || key.starts_with("five_qi_")
+                                    || key.starts_with("arp_priority_")
+                                    || key.starts_with("arp_capability_")
+                                    || key.starts_with("arp_vulnerability_")
+                                {
                                     identifiers.push(NamedValue {
                                         name: key.into(),
                                         value: val.into(),
@@ -1240,4 +1460,187 @@ fn pdu_session_type_marker_does_not_match_arbitrary_bytes() {
     assert!(decode_pdu_session_type_marker(&[0x00, 0x86, 0x01, 0x01, 0x00]).is_none());
     // Reserved enum value → rejected.
     assert!(decode_pdu_session_type_marker(&[0x00, 0x86, 0x00, 0x01, 0xa0]).is_none());
+}
+
+/// Fixture builder for a canonical QoSFlowSetupRequestList content buffer.
+/// Each item is 14 octets in the one-octet-per-primitive layout described in
+/// `walk_qos_flow_setup_request_list`.
+#[cfg(test)]
+fn qos_flow_item(qfi: u8, five_qi: u8, priority: u8, may_trigger: bool, pre_emptable: bool) -> Vec<u8> {
+    let mut v = Vec::with_capacity(14);
+    v.push(0x00); // SEQUENCE preamble (ext=0, 2 opts=0)
+    v.push(qfi << 2); // QFI in high 6 bits
+    v.push(0x00); // QosFlowLevelQosParameters preamble
+    v.push(0x00); // QosCharacteristics CHOICE → nonDynamic5QI
+    v.push(0x00); // NonDynamic5QIDescriptor preamble
+    v.push(0x00); // fiveQI ext bit (0) + 7 pad
+    v.push(five_qi); // fiveQI value octet
+    v.push(0x00); // AllocationAndRetentionPriority preamble (ext=0, iE-Ext=0)
+    v.push(0x00); // priorityLevelARP ext bit (0) + 7 pad
+    v.push((priority - 1) << 4); // offset in high 4 bits
+    v.push(0x00); // pre-emptionCapability ext bit + 7 pad
+    v.push(if may_trigger { 0x80 } else { 0x00 });
+    v.push(0x00); // pre-emptionVulnerability ext bit + 7 pad
+    v.push(if pre_emptable { 0x80 } else { 0x00 });
+    v
+}
+
+#[cfg(test)]
+fn qos_flow_setup_request_list_content(items: &[Vec<u8>]) -> Vec<u8> {
+    // SEQUENCE OF count = N - 1 (SIZE(1..64), encoded as 1 octet).
+    assert!(!items.is_empty() && items.len() <= 64);
+    let mut content = Vec::new();
+    content.push((items.len() - 1) as u8);
+    for item in items {
+        content.extend_from_slice(item);
+    }
+    content
+}
+
+#[cfg(test)]
+fn wrap_inner_ie(id: u16, content: &[u8]) -> Vec<u8> {
+    assert!(content.len() < 128, "fixture requires 1-octet APER length");
+    let marker = id.to_be_bytes();
+    let mut v = Vec::with_capacity(4 + content.len());
+    v.push(marker[0]);
+    v.push(marker[1]);
+    v.push(0x00); // criticality low 6 bits zero
+    v.push(content.len() as u8);
+    v.extend_from_slice(content);
+    v
+}
+
+#[test]
+fn walker_decodes_canonical_single_item_qos_flow_setup_request_list() {
+    let item = qos_flow_item(1, 9, 7, true, false);
+    let content = qos_flow_setup_request_list_content(&[item]);
+    let flows = walk_qos_flow_setup_request_list(&content).expect("walker ok");
+    assert_eq!(flows.len(), 1);
+    assert_eq!(flows[0].qfi, 1);
+    assert_eq!(flows[0].five_qi, Some(9));
+    let arp = flows[0].arp.clone().expect("arp");
+    assert_eq!(arp.priority, 7);
+    assert_eq!(arp.capability, "may-trigger-pre-emption");
+    assert_eq!(arp.vulnerability, "not-pre-emptable");
+}
+
+#[test]
+fn walker_decodes_canonical_multi_item_qos_flow_setup_request_list() {
+    let items = vec![
+        qos_flow_item(5, 1, 8, false, true),
+        qos_flow_item(9, 7, 15, true, true),
+        qos_flow_item(63, 255, 1, false, false),
+    ];
+    let content = qos_flow_setup_request_list_content(&items);
+    let flows = walk_qos_flow_setup_request_list(&content).expect("walker ok");
+    assert_eq!(flows.len(), 3);
+    assert_eq!(flows[0].qfi, 5);
+    assert_eq!(flows[0].five_qi, Some(1));
+    assert_eq!(flows[0].arp.as_ref().unwrap().priority, 8);
+    assert_eq!(flows[0].arp.as_ref().unwrap().capability, "shall-not-trigger-pre-emption");
+    assert_eq!(flows[0].arp.as_ref().unwrap().vulnerability, "pre-emptable");
+    assert_eq!(flows[1].qfi, 9);
+    assert_eq!(flows[1].five_qi, Some(7));
+    assert_eq!(flows[1].arp.as_ref().unwrap().priority, 15);
+    assert_eq!(flows[2].qfi, 63);
+    assert_eq!(flows[2].five_qi, Some(255));
+    assert_eq!(flows[2].arp.as_ref().unwrap().priority, 1);
+}
+
+#[test]
+fn walker_rejects_non_canonical_optional_flags() {
+    // Flipping the preamble ext bit must disable the canonical walker so
+    // real-world captures with extensions are reported as structural "present"
+    // instead of being misdecoded.
+    let mut item = qos_flow_item(2, 8, 5, true, true);
+    item[0] = 0x80; // extension bit set
+    let content = qos_flow_setup_request_list_content(&[item]);
+    assert!(walk_qos_flow_setup_request_list(&content).is_none());
+}
+
+#[test]
+fn ie74_pdu_session_su_req_emits_qfi_five_qi_arp_from_nested_qos_flow_list() {
+    // Simulate an IE 74 value with:
+    //   byte 0: SEQUENCE OF count (1 item → 0)
+    //   byte 1: PDUSessionResourceSetupItemSUReq preamble (0x00)
+    //   byte 2: pDUSessionID = 3
+    //   remaining bytes: synthetic nested transfer that embeds IE 136
+    //     (QoSFlowSetupRequestList) with two canonical items plus the UL TNL
+    //     marker so direction labeling still fires.
+    let items = vec![
+        qos_flow_item(1, 9, 7, true, false),
+        qos_flow_item(5, 8, 10, false, true),
+    ];
+    let content = qos_flow_setup_request_list_content(&items);
+    let qos_flow_ie = wrap_inner_ie(0x0088, &content);
+    // UL-NGU-UP-TNLInformation marker (IE 139, octet string length 10,
+    // GTPTunnel choice tag 01 f0, synthetic IPv4 and TEID).
+    let ul_tnl_marker = [
+        0x00, 0x8b, 0x00, 0x0a, 0x01, 0xf0, 10, 77, 11, 22, 0xca, 0xfe, 0xba, 0xbe,
+    ];
+    let mut v = vec![0x00, 0x00, 0x03]; // count, preamble, pDUSessionID
+    v.extend_from_slice(&ul_tnl_marker);
+    v.extend_from_slice(&qos_flow_ie);
+    let (out, status, _) = decode_pdu_session_list(74, &v);
+    assert_eq!(status, DecodeStatus::Partial);
+    let out = out.expect("some");
+    assert!(out.contains("pdu_session_id=3"), "{out}");
+    assert!(out.contains("tunnel_ip_ul=10.77.11.22"), "{out}");
+    assert!(out.contains("gtp_teid_ul=0xcafebabe"), "{out}");
+    assert!(out.contains("qfi_0=1"), "{out}");
+    assert!(out.contains("five_qi_0=9"), "{out}");
+    assert!(out.contains("arp_priority_0=7"), "{out}");
+    assert!(out.contains("arp_capability_0=may-trigger-pre-emption"), "{out}");
+    assert!(out.contains("arp_vulnerability_0=not-pre-emptable"), "{out}");
+    assert!(out.contains("qfi_1=5"), "{out}");
+    assert!(out.contains("five_qi_1=8"), "{out}");
+    assert!(out.contains("arp_priority_1=10"), "{out}");
+}
+
+#[test]
+fn ie75_pdu_session_su_res_emits_qfis_from_associated_qos_flow_list() {
+    // IE 75 value with pDUSessionID = 7, DL tunnel marker, and a nested
+    // AssociatedQosFlowList (IE id 94 = 0x005e). Each AssociatedQosFlowItem
+    // is preamble + QFI byte.
+    let mut assoc_content = vec![0x01]; // count = 2
+    assoc_content.push(0x00); // preamble ext=0, no mapping optional
+    assoc_content.push(1 << 2); // QFI = 1
+    assoc_content.push(0x00); // preamble
+    assoc_content.push(9 << 2); // QFI = 9
+    let assoc_ie = wrap_inner_ie(0x005e, &assoc_content);
+    let dl_tnl_marker = [
+        0x00, 0x8b, 0x00, 0x0a, 0x01, 0xf0, 192, 0, 2, 1, 0, 0, 0xbe, 0xef,
+    ];
+    let mut v = vec![0x00, 0x00, 0x07];
+    v.extend_from_slice(&dl_tnl_marker);
+    v.extend_from_slice(&assoc_ie);
+    let (out, status, _) = decode_pdu_session_list(75, &v);
+    assert_eq!(status, DecodeStatus::Partial);
+    let out = out.expect("some");
+    assert!(out.contains("pdu_session_id=7"), "{out}");
+    assert!(out.contains("tunnel_ip_dl=192.0.2.1"), "{out}");
+    assert!(out.contains("gtp_teid_dl=0xbeef"), "{out}");
+    assert!(out.contains("qfi_0=1"), "{out}");
+    assert!(out.contains("qfi_1=9"), "{out}");
+    // AssociatedQosFlowItem has no five_qi / arp subfields.
+    assert!(!out.contains("five_qi_0"), "{out}");
+    assert!(!out.contains("arp_priority_0"), "{out}");
+}
+
+#[test]
+fn qos_flow_scan_falls_back_to_structural_marker_on_non_canonical_payload() {
+    // IE 136 is present but its content has an unsupported ext bit. The
+    // walker returns an empty vector; the fallback must still report
+    // qos_flow_setup_list=present so operators know a QoS flow IE existed.
+    let mut non_canonical_item = qos_flow_item(2, 7, 4, true, true);
+    non_canonical_item[2] = 0x80; // QosFlowLevelQosParameters preamble ext=1
+    let content = qos_flow_setup_request_list_content(&[non_canonical_item]);
+    let qos_flow_ie = wrap_inner_ie(0x0088, &content);
+    let mut v = vec![0x00, 0x00, 0x02];
+    v.extend_from_slice(&qos_flow_ie);
+    let (out, status, _) = decode_pdu_session_list(74, &v);
+    assert_eq!(status, DecodeStatus::Partial);
+    let out = out.expect("some");
+    assert!(out.contains("qos_flow_setup_list=present"), "{out}");
+    assert!(!out.contains("qfi_0="), "{out}");
 }

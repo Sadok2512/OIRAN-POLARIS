@@ -9,7 +9,13 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use transport_tcp::{ProvenanceSpan, ReassembledConnection, ReassembledDirection, TcpEndpoint};
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
+/// Public error code emitted on `NormalizedEvent::errors` when HPACK decoding fails
+/// for a HEADERS/CONTINUATION block (dynamic table state lost, Huffman literal that
+/// the hpack crate rejects, or any other HPACK framing error). Consumers use this
+/// prefix to distinguish "capture started mid-connection" from a generic
+/// `PARTIAL` status.
+pub const HPACK_CONTEXT_UNAVAILABLE: &str = "HPACK_CONTEXT_UNAVAILABLE";
 const MAX_FRAME_SIZE: usize = 1_048_576;
 const MAX_HEADER_BLOCK: usize = 256 * 1024;
 const MAX_BODY: usize = 4 * 1024 * 1024;
@@ -51,6 +57,13 @@ struct MessagePart {
     source: Option<TcpEndpoint>,
     destination: Option<TcpEndpoint>,
     partial: bool,
+    /// Set when at least one HEADERS/CONTINUATION block for this part failed to
+    /// HPACK-decode. The dynamic table state is poisoned from that point onward in
+    /// the enclosing direction; this flag lets `build_event` emit
+    /// `HPACK_CONTEXT_UNAVAILABLE` instead of a generic "partially decoded" error
+    /// so operators can distinguish mid-connection captures from genuine framing
+    /// faults.
+    hpack_unavailable: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -197,6 +210,14 @@ fn transactions(
     endpoint_names: &HashMap<String, String>,
 ) -> (Vec<NormalizedEvent>, usize, usize, Vec<String>) {
     let mut decoders = [Decoder::new(), Decoder::new()];
+    // Once HPACK decoding fails on a direction, the dynamic table state becomes
+    // inconsistent with the sender. The hpack crate 0.3 does not expose a way to
+    // resynchronize, and even successful subsequent HEADERS blocks are suspect
+    // because they may reference table entries whose indices are now shifted. We
+    // mark the direction as poisoned so any later HEADERS frame on that direction
+    // is attributed to HPACK_CONTEXT_UNAVAILABLE rather than silently producing
+    // partial headers via the tolerant literal recovery path.
+    let mut direction_poisoned = [false; 2];
     let mut continuations: HashMap<(usize, u32), (Vec<u8>, Frame)> = HashMap::new();
     let mut streams: BTreeMap<u32, StreamState> = BTreeMap::new();
     let mut errors = Vec::new();
@@ -229,6 +250,7 @@ fn transactions(
                         state,
                         &frame,
                         &mut decoders[frame.direction_index],
+                        &mut direction_poisoned[frame.direction_index],
                         block,
                         &mut errors,
                     );
@@ -237,16 +259,43 @@ fn transactions(
                         (frame.direction_index, frame.stream_id),
                         (block.to_vec(), frame),
                     );
+                } else {
+                    errors.push(format!(
+                        "{HPACK_CONTEXT_UNAVAILABLE}: HEADERS fragment stream {} exceeds configured \
+                         maximum header block size",
+                        frame.stream_id
+                    ));
+                    let part = part_for_direction(state, frame.direction_index);
+                    part.hpack_unavailable = true;
+                    part.partial = true;
                 }
             }
             9 => {
                 let key = (frame.direction_index, frame.stream_id);
                 let Some((mut block, first)) = continuations.remove(&key) else {
-                    errors.push(format!("orphan CONTINUATION stream {}", frame.stream_id));
+                    // An orphan CONTINUATION means we lost the HEADERS that opens
+                    // the header block. The surviving header block cannot be
+                    // decoded independently (HPACK state is sequential), so we
+                    // flag the stream as HPACK_CONTEXT_UNAVAILABLE and continue.
+                    errors.push(format!(
+                        "{HPACK_CONTEXT_UNAVAILABLE}: orphan CONTINUATION on stream {}; opening \
+                         HEADERS frame is not in the capture",
+                        frame.stream_id
+                    ));
+                    let part = part_for_direction(state, frame.direction_index);
+                    part.hpack_unavailable = true;
+                    part.partial = true;
                     continue;
                 };
                 if block.len() + frame.payload.len() > MAX_HEADER_BLOCK {
-                    errors.push("header block limit exceeded".into());
+                    errors.push(format!(
+                        "{HPACK_CONTEXT_UNAVAILABLE}: CONTINUATION block for stream {} exceeds \
+                         configured maximum header block size",
+                        frame.stream_id
+                    ));
+                    let part = part_for_direction(state, frame.direction_index);
+                    part.hpack_unavailable = true;
+                    part.partial = true;
                     continue;
                 }
                 block.extend_from_slice(&frame.payload);
@@ -255,6 +304,7 @@ fn transactions(
                         state,
                         &first,
                         &mut decoders[frame.direction_index],
+                        &mut direction_poisoned[frame.direction_index],
                         &block,
                         &mut errors,
                     );
@@ -267,14 +317,29 @@ fn transactions(
             other => errors.push(format!("unsupported HTTP/2 frame type {other}")),
         }
     }
-    for ((_, stream), _) in continuations {
-        streams.entry(stream).or_default().request.partial = true;
+    for ((direction, stream), (_, frame)) in continuations {
+        // The capture ended mid-way through a multi-frame header block. We cannot
+        // recover the block, but we still want to surface the stream so the
+        // response (if any) stays correlatable by stream-id.
+        let state = streams.entry(stream).or_default();
+        let part = part_for_direction(state, direction);
+        part.hpack_unavailable = true;
+        part.partial = true;
+        part.source.get_or_insert_with(|| frame.source.clone());
+        part.destination
+            .get_or_insert_with(|| frame.destination.clone());
     }
     let stream_count = streams.len();
     let mut incomplete = 0;
     let mut events = Vec::new();
     for (stream_id, state) in streams {
-        if state.request.headers.is_empty() {
+        let has_request_payload = !state.request.headers.is_empty()
+            || !state.request.body.is_empty()
+            || state.request.hpack_unavailable;
+        let has_response_payload = !state.response.headers.is_empty()
+            || !state.response.body.is_empty()
+            || state.response.hpack_unavailable;
+        if !has_request_payload && !has_response_payload {
             incomplete += 1;
             continue;
         }
@@ -291,6 +356,18 @@ fn transactions(
         ));
     }
     (events, stream_count, incomplete, errors)
+}
+
+/// Return the request part for the originating direction (direction_index == 0)
+/// or the response part otherwise. This is used by HPACK-failure paths where we
+/// cannot inspect decoded headers to decide, so we fall back to the capture-side
+/// direction index.
+fn part_for_direction(state: &mut StreamState, direction: usize) -> &mut MessagePart {
+    if direction == 0 {
+        &mut state.request
+    } else {
+        &mut state.response
+    }
 }
 
 fn choose_part(state: &mut StreamState, direction: usize) -> &mut MessagePart {
@@ -329,12 +406,13 @@ fn apply_headers(
     state: &mut StreamState,
     frame: &Frame,
     decoder: &mut Decoder<'_>,
+    direction_poisoned: &mut bool,
     block: &[u8],
     errors: &mut Vec<String>,
 ) {
     let decoded = decoder.decode(block);
-    let (mut headers, partial) = match decoded {
-        Ok(headers) => (
+    let (mut headers, partial, hpack_unavailable) = match decoded {
+        Ok(headers) if !*direction_poisoned => (
             headers
                 .into_iter()
                 .map(|(name, value)| {
@@ -345,10 +423,43 @@ fn apply_headers(
                 })
                 .collect::<Vec<_>>(),
             false,
+            false,
         ),
+        Ok(headers) => {
+            // The hpack crate accepted this block, but a previous block on the
+            // same direction failed, which means the dynamic table state is no
+            // longer consistent with the sender. Record the headers but mark the
+            // part as HPACK_CONTEXT_UNAVAILABLE so operators do not trust indexed
+            // values whose referent cannot be verified.
+            errors.push(format!(
+                "{HPACK_CONTEXT_UNAVAILABLE}: stream {} decoded under poisoned HPACK dynamic table \
+                 (previous HEADERS on this direction failed to decode); indexed field values are \
+                 unverified",
+                frame.stream_id
+            ));
+            (
+                headers
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (
+                            String::from_utf8_lossy(&name).into_owned(),
+                            String::from_utf8_lossy(&value).into_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                true,
+                true,
+            )
+        }
         Err(error) => {
-            errors.push(format!("HPACK stream {}: {error:?}", frame.stream_id));
-            (tolerant_literals(block), true)
+            *direction_poisoned = true;
+            errors.push(format!(
+                "{HPACK_CONTEXT_UNAVAILABLE}: stream {} failed HPACK decode ({error:?}); dynamic \
+                 table state lost or capture started mid-connection — subsequent frames on this \
+                 direction will be flagged as unavailable",
+                frame.stream_id
+            ));
+            (tolerant_literals(block), true, true)
         }
     };
     headers.retain(|(name, value)| {
@@ -365,7 +476,16 @@ fn apply_headers(
                 && value.chars().all(|ch| !ch.is_control() || ch == '\t')
         }
     });
-    let response = headers.iter().any(|(name, _)| name == ":status");
+    // When HPACK decode fails we have no ":status" pseudo-header to inspect, so
+    // fall back to the HTTP/2 frame direction index (direction_index == 0 is the
+    // client → server direction, i.e. the request).
+    let response = if headers.iter().any(|(name, _)| name == ":status") {
+        true
+    } else if headers.iter().any(|(name, _)| name == ":method") {
+        false
+    } else {
+        frame.direction_index != 0
+    };
     let part = if response {
         &mut state.response
     } else {
@@ -373,6 +493,7 @@ fn apply_headers(
     };
     part.headers.extend(headers);
     part.partial |= partial;
+    part.hpack_unavailable |= hpack_unavailable;
     part.timestamp_ns.get_or_insert(frame.timestamp_ns);
     if part.timestamp.is_none() {
         part.timestamp = frame
@@ -662,10 +783,32 @@ fn build_event(
         (Some(start), Some(end)) if end >= start => u64::try_from(end - start).ok(),
         _ => None,
     };
+    let hpack_unavailable = state.request.hpack_unavailable || state.response.hpack_unavailable;
     let partial = state.request.partial
         || state.response.partial
         || state.response.headers.is_empty()
-        || state.reset;
+        || state.reset
+        || hpack_unavailable;
+    let message_name = if let Some(operation) = operation.clone() {
+        operation
+    } else if hpack_unavailable {
+        format!(
+            "HpackContextUnavailable:{}",
+            method.clone().unwrap_or_else(|| "UNKNOWN".into())
+        )
+    } else {
+        "UnsupportedSbiOperation".into()
+    };
+    let mut errors = Vec::new();
+    if hpack_unavailable {
+        errors.push(format!(
+            "{HPACK_CONTEXT_UNAVAILABLE}: stream {stream_id} correlated by HTTP/2 stream-id only; \
+             HPACK dynamic table state lost (capture started mid-connection or indexed names refer \
+             to table entries never observed)"
+        ));
+    } else if partial {
+        errors.push("HTTP/2 transaction is incomplete or partially decoded".into());
+    }
     let mut event = NormalizedEvent {
         event_id: String::new(),
         parent_event_id: None,
@@ -676,9 +819,7 @@ fn build_event(
         timestamp,
         interface: "SBI".into(),
         protocol: Protocol::SbiHttp2,
-        message_name: operation
-            .clone()
-            .unwrap_or_else(|| "UnsupportedSbiOperation".into()),
+        message_name,
         message_type: status.map(u32::from).unwrap_or(0),
         procedure_code: None,
         procedure: service.clone(),
@@ -697,11 +838,7 @@ fn build_event(
         } else {
             DecodeStatus::Decoded
         },
-        errors: if partial {
-            vec!["HTTP/2 transaction is incomplete or partially decoded".into()]
-        } else {
-            vec![]
-        },
+        errors,
         raw_payload_reference: format!("sha256:{}", sha256_hex(&state.request.body)),
         evidence_references: vec![EvidenceReference {
             state: EvidenceState::Exact,
@@ -1063,6 +1200,166 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.message_name == "UpdateSMContext"));
+    }
+
+    #[test]
+    fn mid_connection_capture_marks_hpack_context_unavailable_and_correlates_by_stream_id() {
+        // Simulate a capture that starts in the middle of an HTTP/2 connection:
+        // the client-side HEADERS references dynamic-table entries whose
+        // definitions were never observed. The hpack crate rejects the block;
+        // the fallback must mark the event HPACK_CONTEXT_UNAVAILABLE and still
+        // emit it so the response on the same stream-id stays correlatable.
+        let client = TcpEndpoint {
+            address: "10.0.0.1".into(),
+            port: 40001,
+        };
+        let server = TcpEndpoint {
+            address: "10.0.0.2".into(),
+            port: 7777,
+        };
+        // Hand-crafted block referencing dynamic index 62 (first dynamic-table
+        // slot) which the fresh decoder cannot resolve → HPACK error.
+        let broken_block = vec![0xbe]; // Indexed Header Field, index 62.
+        let mut client_bytes = PREFACE.to_vec();
+        client_bytes.extend(frame(1, 5, 7, &broken_block));
+        let mut resp_enc = Encoder::new();
+        let ok = resp_enc.encode([(b":status".as_slice(), b"204".as_slice())]);
+        let mut server_bytes = Vec::new();
+        server_bytes.extend(frame(1, 5, 7, &ok));
+        let key = TcpConnectionKey::new(client.clone(), server.clone()).0;
+        let conn = ReassembledConnection {
+            key,
+            directions: [
+                direction(client.clone(), server.clone(), client_bytes, 1),
+                direction(server, client, server_bytes, 2),
+            ],
+        };
+        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
+        assert_eq!(events.len(), 1, "expected a single correlated event");
+        let event = &events[0];
+        assert_eq!(event.decoding_status, DecodeStatus::Partial);
+        assert!(
+            event
+                .errors
+                .iter()
+                .any(|e| e.starts_with(HPACK_CONTEXT_UNAVAILABLE)),
+            "errors: {:?}",
+            event.errors
+        );
+        assert!(
+            event.sbi.as_ref().map(|s| s.http2_stream_id) == Some(7),
+            "stream-id correlation lost: {:?}",
+            event.sbi
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains(HPACK_CONTEXT_UNAVAILABLE)),
+            "report errors: {:?}",
+            report.errors
+        );
+        // The response :status pseudo-header still decodes on its own HPACK
+        // decoder (direction 1) so http_status survives.
+        assert_eq!(event.sbi.as_ref().and_then(|s| s.http_status), Some(204));
+    }
+
+    #[test]
+    fn orphan_continuation_marks_stream_hpack_unavailable() {
+        // A capture that only sees a CONTINUATION (no preceding HEADERS) cannot
+        // reconstruct the header block. The event must surface with the explicit
+        // HPACK_CONTEXT_UNAVAILABLE reason.
+        let client = TcpEndpoint {
+            address: "10.0.0.1".into(),
+            port: 40002,
+        };
+        let server = TcpEndpoint {
+            address: "10.0.0.2".into(),
+            port: 7777,
+        };
+        let mut client_bytes = PREFACE.to_vec();
+        // CONTINUATION frame (type 9) with END_HEADERS flag but no opening HEADERS.
+        client_bytes.extend(frame(9, 4, 11, &[0x80, 0x81]));
+        let mut resp_enc = Encoder::new();
+        let ok = resp_enc.encode([(b":status".as_slice(), b"500".as_slice())]);
+        let mut server_bytes = Vec::new();
+        server_bytes.extend(frame(1, 5, 11, &ok));
+        let key = TcpConnectionKey::new(client.clone(), server.clone()).0;
+        let conn = ReassembledConnection {
+            key,
+            directions: [
+                direction(client.clone(), server.clone(), client_bytes, 1),
+                direction(server, client, server_bytes, 2),
+            ],
+        };
+        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.decoding_status, DecodeStatus::Partial);
+        assert!(event
+            .errors
+            .iter()
+            .any(|e| e.starts_with(HPACK_CONTEXT_UNAVAILABLE)));
+        assert_eq!(event.sbi.as_ref().and_then(|s| s.http_status), Some(500));
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("orphan CONTINUATION")));
+    }
+
+    #[test]
+    fn multi_frame_header_block_is_reassembled_before_hpack_decode() {
+        // HEADERS with END_HEADERS=0 followed by CONTINUATION with END_HEADERS=1.
+        // The decoder must concatenate both fragments before invoking HPACK.
+        let client = TcpEndpoint {
+            address: "10.0.0.1".into(),
+            port: 40003,
+        };
+        let server = TcpEndpoint {
+            address: "10.0.0.2".into(),
+            port: 7777,
+        };
+        let mut enc = Encoder::new();
+        let full = enc.encode([
+            (b":method".as_slice(), b"PATCH".as_slice()),
+            (
+                b":path".as_slice(),
+                b"/nsmf-pdusession/v1/sm-contexts/42/modify".as_slice(),
+            ),
+            (b":scheme".as_slice(), b"http".as_slice()),
+            (b":authority".as_slice(), b"smf.example".as_slice()),
+        ]);
+        let split = full.len() / 2;
+        let mut client_bytes = PREFACE.to_vec();
+        // HEADERS without END_HEADERS, with END_STREAM so no body expected.
+        client_bytes.extend(frame(1, 0x01, 5, &full[..split]));
+        // CONTINUATION with END_HEADERS.
+        client_bytes.extend(frame(9, 0x04, 5, &full[split..]));
+        let mut resp_enc = Encoder::new();
+        let ok = resp_enc.encode([(b":status".as_slice(), b"200".as_slice())]);
+        let mut server_bytes = Vec::new();
+        server_bytes.extend(frame(1, 0x05, 5, &ok));
+        let key = TcpConnectionKey::new(client.clone(), server.clone()).0;
+        let conn = ReassembledConnection {
+            key,
+            directions: [
+                direction(client.clone(), server.clone(), client_bytes, 1),
+                direction(server, client, server_bytes, 2),
+            ],
+        };
+        let (events, _report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.decoding_status, DecodeStatus::Decoded);
+        assert_eq!(event.message_name, "UpdateSMContext");
+        assert_eq!(
+            event
+                .sbi
+                .as_ref()
+                .and_then(|s| s.request_uri.as_deref()),
+            Some("/nsmf-pdusession/v1/sm-contexts/42/modify")
+        );
+        assert!(event.errors.is_empty(), "errors: {:?}", event.errors);
     }
 
     #[test]
