@@ -1,5 +1,17 @@
 # Changelog
 
+## decoder-ngap v0.3.1 / oiran-decode v0.3.1 - NGAP status correction
+
+- Mark a structurally bounded NAS-PDU information element as decoded at the
+  NGAP layer; the nested NAS child event independently retains
+  `ENCRYPTED_OR_PROTECTED`, `PARTIAL` or `MALFORMED`.
+- Correct the NAS security-header nibble and accept the observed eight-octet
+  as well as schema forty-bit `UEAggregateMaximumBitRate` encodings.
+- Keep PDU Session Resource Setup list items `PARTIAL` while their nested N2
+  SM transfer remains opaque; no missing field is promoted to decoded.
+- Replayed the unchanged finalized N2 inventory identified by SHA-256
+  `aabbe5e942ede445fcd59b8ad37184f7dadc57a8b16aee935b30b99e9ecdc084`.
+
 ## decoders-epc v1.0 - GTPv2-C, Diameter S6a, EPS NAS (TS 29.274 / RFC 6733 + TS 29.272 / TS 24.301)
 
 - `decoder-gtpv2c v0.1.0` (new crate, TS 29.274): Echo, Create/Modify/Delete Session, Create/Delete Bearer, Release Access Bearers. IEs IMSI, MSISDN, MEI are flagged identity (`pseudonymized: true`); F-TEID, Bearer Context (grouped), PAA, APN, AMBR, Serving Network (PLMN), EBI are decoded.

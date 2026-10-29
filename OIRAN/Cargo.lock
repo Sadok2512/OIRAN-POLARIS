@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-ngap"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "decoder-nas",
  "event-schema",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "capture-pcap",
  "decoder-gtpu",

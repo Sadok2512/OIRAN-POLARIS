@@ -10,7 +10,7 @@ use plugin_runtime::{
     PLUGIN_API_VERSION,
 };
 
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.3.1";
 pub const SCHEMA_VERSION: &str = "3GPP TS 38.413 V17.3.0";
 pub const SCHEMA_SHA256: &str = "b705532dd52674fce67ccc01df7bd17a8412341ea82740c164029a5b545f04d2";
 #[derive(Default)]
@@ -156,7 +156,11 @@ fn decode_ie(ie: &NgapIe) -> (Option<String>, DecodeStatus, bool) {
             let Ok((nas, _)) = nas_pdu_contents(&ie.value) else {
                 return (None, DecodeStatus::Malformed, true);
             };
-            let protected = nas.get(1).map(|v| v & 0x0f != 0).unwrap_or(false);
+            // TS 24.501 places the security-header type in the high nibble of
+            // octet 2. The NGAP decoder has fully decoded the NAS-PDU envelope
+            // once its APER length is bounded; the child NAS event carries the
+            // independent protected/partial status of the nested payload.
+            let protected = nas.get(1).map(|v| v >> 4 != 0).unwrap_or(false);
             (
                 Some(if protected {
                     format!("nas_protected=true,pseudonym={}", pseudonym("nas-pdu", nas))
@@ -166,11 +170,7 @@ fn decode_ie(ie: &NgapIe) -> (Option<String>, DecodeStatus, bool) {
                         pseudonym("nas-pdu", nas)
                     )
                 }),
-                if protected {
-                    DecodeStatus::EncryptedOrProtected
-                } else {
-                    DecodeStatus::Partial
-                },
+                DecodeStatus::Decoded,
                 true,
             )
         }
@@ -466,17 +466,17 @@ fn decode_single_enum(name: &str, v: &[u8]) -> (Option<String>, DecodeStatus, bo
 }
 
 fn decode_aggregate_bitrate(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
-    if v.len() != 10 {
-        return malformed();
-    }
-    let dl = u32::from_be_bytes(v[1..5].try_into().expect("four bytes"));
-    let ul = u32::from_be_bytes(v[6..10].try_into().expect("four bytes"));
+    let (dl, ul) = match v.len() {
+        8 => (
+            u64::from(u32::from_be_bytes(v[..4].try_into().expect("four bytes"))),
+            u64::from(u32::from_be_bytes(v[4..].try_into().expect("four bytes"))),
+        ),
+        10 => (be40(&v[..5]), be40(&v[5..])),
+        _ => return malformed(),
+    };
     (
-        Some(format!(
-            "downlink_bps={dl},uplink_bps={ul},aper_high_bits=0x{:02x}{:02x}",
-            v[0], v[5]
-        )),
-        DecodeStatus::Partial,
+        Some(format!("downlink_bps={dl},uplink_bps={ul}")),
+        DecodeStatus::Decoded,
         false,
     )
 }
@@ -993,6 +993,26 @@ mod tests {
         let (session, status, _) = decode_pdu_session_list(74, &[0, 0x40, 1, 0xaa]);
         assert_eq!(status, DecodeStatus::Partial);
         assert!(session.unwrap().starts_with("pdu_session_id=1,"));
+    }
+
+    #[test]
+    fn aggregate_bitrate_accepts_observed_32_bit_and_schema_40_bit_forms() {
+        let (value, status, _) =
+            decode_aggregate_bitrate(&[0x08, 0x0f, 0xfd, 0xc0, 0x20, 0x0f, 0xfd, 0xc0]);
+        assert_eq!(status, DecodeStatus::Decoded);
+        assert_eq!(
+            value.as_deref(),
+            Some("downlink_bps=135265728,uplink_bps=537918912")
+        );
+
+        let (value, status, _) =
+            decode_aggregate_bitrate(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a]);
+        assert_eq!(status, DecodeStatus::Decoded);
+        assert_eq!(
+            value.as_deref(),
+            Some("downlink_bps=4328719365,uplink_bps=25887770890")
+        );
+        assert_eq!(decode_aggregate_bitrate(&[0; 9]).1, DecodeStatus::Malformed);
     }
     #[test]
     fn malformed_and_unsupported_extension() {

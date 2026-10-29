@@ -73,6 +73,7 @@ fn sanitized_e2e_frames_preserve_decoder_status_without_subscriber_material() {
         };
         let output = NgapDecoder.decode(&input);
         let expected = match fixture.expected_status.as_str() {
+            "DECODED" => DecodeStatus::Decoded,
             "PARTIAL" => DecodeStatus::Partial,
             "MALFORMED" => DecodeStatus::Malformed,
             other => panic!("unexpected status {other}"),
