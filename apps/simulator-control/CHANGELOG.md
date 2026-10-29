@@ -3,6 +3,35 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.9.2 — 2026-10-29 (patch)
+
+Security — bump `react-router-dom` from `6.30.6` to `7.18.5` to clear the two
+moderate production advisories:
+
+- **CVE-2025-6803** — React Router open redirect via backslash in `<Link>`
+  and `useNavigate`.
+- **deserializeErrors() arbitrary constructor injection** — React Router
+  Framework.
+
+Drop-in bump: the `react-router-dom` import surface used across
+`App.tsx`, `AppShell.tsx`, `SidebarNavigation.tsx`, `main.tsx`,
+`UeManager.tsx`, `UeDetail.tsx`, `ScenariosLibrary.tsx`,
+`ScenarioBuilder.tsx` and the test harness (`MemoryRouter`, `Routes`,
+`Route`, `BrowserRouter`, `Navigate`, `Link`, `NavLink`, `Outlet`,
+`useNavigate`, `useParams`, `useLocation`) is re-exported unchanged by
+`react-router-dom@7`, so no source change was needed.
+
+Audit (`npm audit --omit=dev`):
+
+- Before: 2 moderate (react-router + react-router-dom via it).
+- After:  0 vulnerabilities (info 0, low 0, moderate 0, high 0, critical 0).
+
+Validation (Back100):
+
+- `npx tsc --noEmit` → clean.
+- `npm run test` (vitest) → **Test Files 25 passed · Tests 162 passed**.
+- `npx playwright test` against the Vite dev server → **26 passed** (50.1 s).
+
 ## 0.9.1 — 2026-10-29 (patch)
 
 - Merge the deployed 0.7.1 lineage into the 0.9 manager/execution/traffic
