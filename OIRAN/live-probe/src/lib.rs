@@ -364,6 +364,23 @@ impl ContinuousImportConfig {
     }
 }
 
+/// Bounded persistence for the import failure log so the operator can prove
+/// which upstream segment paths failed, with which error code, and when. Kept
+/// in `import_state.json` so the record survives probe restarts.
+pub const MAX_PERSISTED_INGESTION_FAILURES: usize = 256;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailedIngestion {
+    /// Source segment path as presented by the external capture pipeline
+    /// (never masked). The upstream pcap root is operator-controlled so no
+    /// subscriber identity is ever surfaced here.
+    pub source_path: String,
+    /// Error code recorded verbatim from the Err branch that caused the
+    /// failure. Prefixed-form (`CONTINUOUS_*`) matches the metric labels.
+    pub error_code: String,
+    pub occurred_epoch_ms: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ContinuousImportState {
     #[serde(default)]
@@ -372,6 +389,85 @@ struct ContinuousImportState {
     seen_checksums: BTreeSet<String>,
     #[serde(default)]
     seen_order: VecDeque<String>,
+    /// 0.2.0 — persisted log of per-segment ingestion failures (bounded,
+    /// FIFO-evicted). Each entry carries source_path + error_code +
+    /// occurred_epoch_ms so an operator can audit the 1h window without
+    /// losing the record across probe restarts.
+    #[serde(default)]
+    failed_ingestions: VecDeque<FailedIngestion>,
+}
+
+/// Push a new failure into the state's bounded failure log. Evicts the
+/// oldest entry when the cap is reached so the log never grows unbounded.
+pub fn record_ingestion_failure(
+    log: &mut VecDeque<FailedIngestion>,
+    source_path: impl Into<String>,
+    error_code: impl Into<String>,
+    occurred_epoch_ms: u64,
+) {
+    log.push_back(FailedIngestion {
+        source_path: source_path.into(),
+        error_code: error_code.into(),
+        occurred_epoch_ms,
+    });
+    while log.len() > MAX_PERSISTED_INGESTION_FAILURES {
+        log.pop_front();
+    }
+}
+
+/// 0.2.0 — Decide whether a candidate file is the active dumpcap target
+/// (= the newest file for its interface, still "young") and therefore must
+/// be excluded from ingestion. Dumpcap keeps writing to the latest file in
+/// its rotation ring until a new segment is created; its mtime moves on
+/// every pcap_dumper_flush. Filtering it out at discovery time guarantees
+/// we never trigger `CONTINUOUS_SOURCE_CHANGED_DURING_IMPORT` because of a
+/// still-live writer.
+///
+/// The rule is: for each interface, drop the single newest candidate if
+/// its mtime is more recent than `2 × stable_age`. Finalized files (older
+/// than that window) are always eligible, even when they are the newest
+/// for their interface — the next rotation simply did not happen yet.
+pub fn finalized_candidates_only(
+    mut candidates: Vec<FinalizationCandidate>,
+    now: SystemTime,
+    stable_age: Duration,
+) -> Vec<FinalizationCandidate> {
+    let safety_window = stable_age.saturating_mul(2);
+    let mut newest_by_interface: BTreeMap<String, usize> = BTreeMap::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let is_newer = match newest_by_interface.get(&candidate.interface) {
+            Some(&prev) => candidate.modified > candidates[prev].modified,
+            None => true,
+        };
+        if is_newer {
+            newest_by_interface.insert(candidate.interface.clone(), index);
+        }
+    }
+    let active_indexes: BTreeSet<usize> = newest_by_interface
+        .values()
+        .copied()
+        .filter(|index| {
+            now.duration_since(candidates[*index].modified)
+                .map(|age| age < safety_window)
+                .unwrap_or(true)
+        })
+        .collect();
+    let mut index = 0usize;
+    candidates.retain(|_| {
+        let keep = !active_indexes.contains(&index);
+        index += 1;
+        keep
+    });
+    candidates
+}
+
+/// Minimal shape consumed by `finalized_candidates_only`. Decoupled from
+/// `SourceSegment` so the pure function can be unit-tested without reading
+/// pcap bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizationCandidate {
+    pub interface: String,
+    pub modified: SystemTime,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1443,6 +1539,20 @@ impl CaptureManager {
                             job.metrics.ingestion_failures.saturating_add(1);
                         job.error = Some(format!("CONTINUOUS_SEGMENT_NOT_FINALIZED: {error}"));
                     })?;
+                    // 0.2.0 — persist the failure (source path + code + ts) so
+                    // the record survives a probe restart and the operator can
+                    // audit a 1h window without losing attempts.
+                    record_ingestion_failure(
+                        &mut state.failed_ingestions,
+                        candidate.path.display().to_string(),
+                        format!("CONTINUOUS_SEGMENT_NOT_FINALIZED: {error}"),
+                        epoch_ms(),
+                    );
+                    atomic_write(
+                        &state_path,
+                        &serde_json::to_vec_pretty(&state)
+                            .map_err(|error| error.to_string())?,
+                    )?;
                     continue;
                 }
                 while state.segments.len() >= usize::from(config.max_segments)
@@ -1503,6 +1613,17 @@ impl CaptureManager {
                             job.metrics.ingestion_failures.saturating_add(1);
                         job.error = Some(format!("CONTINUOUS_COPY_RETRYABLE: {error}"));
                     })?;
+                    record_ingestion_failure(
+                        &mut state.failed_ingestions,
+                        candidate.path.display().to_string(),
+                        format!("CONTINUOUS_COPY_RETRYABLE: {error}"),
+                        epoch_ms(),
+                    );
+                    atomic_write(
+                        &state_path,
+                        &serde_json::to_vec_pretty(&state)
+                            .map_err(|error| error.to_string())?,
+                    )?;
                     continue;
                 }
                 if let Err(error) = decode_capture(&DecodeConfig {
@@ -1517,6 +1638,17 @@ impl CaptureManager {
                             job.metrics.ingestion_failures.saturating_add(1);
                         job.error = Some(format!("CONTINUOUS_SEGMENT_NOT_FINALIZED: {error}"));
                     })?;
+                    record_ingestion_failure(
+                        &mut state.failed_ingestions,
+                        candidate.path.display().to_string(),
+                        format!("CONTINUOUS_SEGMENT_NOT_FINALIZED: {error}"),
+                        epoch_ms(),
+                    );
+                    atomic_write(
+                        &state_path,
+                        &serde_json::to_vec_pretty(&state)
+                            .map_err(|error| error.to_string())?,
+                    )?;
                     continue;
                 }
                 state.segments.insert(
@@ -3087,7 +3219,27 @@ fn source_segments(
             .cmp(&left.modified)
             .then_with(|| left.checksum.cmp(&right.checksum))
     });
-    Ok(segments)
+    // 0.2.0 — drop the still-live dumpcap target per interface. The pure
+    // `finalized_candidates_only()` helper rebuilds the kept set via a
+    // minimal `FinalizationCandidate` projection; `SourceSegment` is
+    // reconstructed by index so the public shape is unchanged.
+    let projections = segments
+        .iter()
+        .map(|segment| FinalizationCandidate {
+            interface: segment.interface.clone(),
+            modified: segment.modified,
+        })
+        .collect::<Vec<_>>();
+    let kept = finalized_candidates_only(projections, now, stable_age);
+    let mut filtered = Vec::with_capacity(kept.len());
+    for projection in kept {
+        if let Some(position) = segments.iter().position(|segment| {
+            segment.interface == projection.interface && segment.modified == projection.modified
+        }) {
+            filtered.push(segments.remove(position));
+        }
+    }
+    Ok(filtered)
 }
 
 fn native_segment_source(root: &Path, path: &Path) -> bool {
@@ -5334,5 +5486,98 @@ mod tests {
                 .unwrap_err(),
             "DATASET_REGISTRATION_CONFLICT"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // 0.2.0 — continuous-import finalized segments + failure log
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn record_ingestion_failure_appends_and_evicts_fifo() {
+        let mut log: VecDeque<FailedIngestion> = VecDeque::new();
+        for index in 0..(MAX_PERSISTED_INGESTION_FAILURES + 10) {
+            record_ingestion_failure(
+                &mut log,
+                format!("/var/lib/pcap/N2/segment-{index}.pcapng"),
+                "CONTINUOUS_SEGMENT_NOT_FINALIZED",
+                1_730_000_000_000 + index as u64,
+            );
+        }
+        assert_eq!(log.len(), MAX_PERSISTED_INGESTION_FAILURES);
+        // FIFO: oldest ten are evicted; the newest entry sits at the back.
+        assert!(log
+            .back()
+            .unwrap()
+            .source_path
+            .ends_with("segment-265.pcapng"));
+        assert!(log
+            .front()
+            .unwrap()
+            .source_path
+            .ends_with("segment-10.pcapng"));
+    }
+
+    #[test]
+    fn record_ingestion_failure_keeps_path_code_and_timestamp_verbatim() {
+        let mut log: VecDeque<FailedIngestion> = VecDeque::new();
+        record_ingestion_failure(
+            &mut log,
+            "/root/pcap/N3/live.pcapng",
+            "CONTINUOUS_COPY_RETRYABLE",
+            1_730_000_000_001,
+        );
+        let entry = log.back().unwrap();
+        assert_eq!(entry.source_path, "/root/pcap/N3/live.pcapng");
+        assert_eq!(entry.error_code, "CONTINUOUS_COPY_RETRYABLE");
+        assert_eq!(entry.occurred_epoch_ms, 1_730_000_000_001);
+    }
+
+    #[test]
+    fn finalized_candidates_only_drops_the_still_live_dumpcap_target_per_interface() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_730_000_300);
+        let stable_age = Duration::from_secs(10);
+        let candidates = vec![
+            // Finalized files per interface:
+            FinalizationCandidate {
+                interface: "N2".into(),
+                modified: now - Duration::from_secs(120),
+            },
+            FinalizationCandidate {
+                interface: "N3".into(),
+                modified: now - Duration::from_secs(300),
+            },
+            // Still-live writer on N2 (newest, < 2 × stable_age ago):
+            FinalizationCandidate {
+                interface: "N2".into(),
+                modified: now - Duration::from_secs(5),
+            },
+            // Still-live writer on N3 (newest, mtime inside the safety window):
+            FinalizationCandidate {
+                interface: "N3".into(),
+                modified: now - Duration::from_secs(15),
+            },
+        ];
+        let kept = finalized_candidates_only(candidates, now, stable_age);
+        assert_eq!(kept.len(), 2);
+        assert!(
+            kept.iter()
+                .all(|candidate| now.duration_since(candidate.modified).unwrap()
+                    >= Duration::from_secs(60)),
+            "the two newest-per-interface files were dropped as potentially active"
+        );
+    }
+
+    #[test]
+    fn finalized_candidates_only_keeps_the_single_file_when_safety_window_has_elapsed() {
+        let now = UNIX_EPOCH + Duration::from_secs(2_000);
+        let stable_age = Duration::from_secs(5);
+        let old_enough = FinalizationCandidate {
+            interface: "N2".into(),
+            modified: now - Duration::from_secs(120),
+        };
+        // A single file older than 2 * stable_age is finalized — no newer
+        // rotation observed, but mtime is well past the writer's cadence.
+        let kept = finalized_candidates_only(vec![old_enough.clone()], now, stable_age);
+        assert_eq!(kept, vec![old_enough]);
     }
 }
