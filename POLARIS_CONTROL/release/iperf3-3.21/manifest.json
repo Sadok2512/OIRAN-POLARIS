@@ -1,0 +1,27 @@
+{
+  "artifact": "polaris-iperf3-runtime",
+  "version": "3.21",
+  "source_image": "networkstatic/iperf3@sha256:bc267517f534d9f7cced2669f325799a1fd7fe1d5953c2ca2c6ea1db61affa08",
+  "files": [
+    {
+      "source": "/usr/bin/iperf3",
+      "target": "/opt/polaris-control/libexec/iperf3",
+      "mode": "0755",
+      "sha256": "7548a6e3e7cf33d92595b7e68abea87da011a28d1ff10f043e1caf6bbcf1d3ed"
+    },
+    {
+      "source": "/usr/lib/libiperf.so.0.0.0",
+      "target": "/opt/polaris-control/libexec/lib/libiperf.so.0.0.0",
+      "mode": "0644",
+      "sha256": "c38136e9bb1ca2fb09c23245d4fd9abc1dad34f3042a29067d5d8b16e76a35b9"
+    }
+  ],
+  "symlinks": {
+    "/opt/polaris-control/libexec/lib/libiperf.so.0": "libiperf.so.0.0.0"
+  },
+  "environment": {
+    "POLARIS_IPERF3_PATH": "/opt/polaris-control/libexec/iperf3",
+    "LD_LIBRARY_PATH": "/opt/polaris-control/libexec/lib"
+  },
+  "production_installed": false
+}
