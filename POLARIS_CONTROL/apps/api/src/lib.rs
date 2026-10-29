@@ -6960,6 +6960,16 @@ fn stop_one_live_inner(
             .into_iter()
             .find(|job| job.ue_id == ue_id)
             .ok_or("UE_NOT_STARTED")?;
+        // `deregister switch-off` may make the managed container exit before
+        // this function obtains the stop reservation.  Runtime observation
+        // then legitimately clears the launch approval and process handle.
+        // Treat that terminal observation as an idempotent successful stop
+        // instead of reporting a false LIVE_RUNTIME_APPROVAL_MISSING error.
+        if is_terminal_stop_state(&job.process_state) {
+            let stopped = controller.stop_offline(ue_id)?.clone();
+            persist_ue_registry(state, &controller)?;
+            return Ok(stopped);
+        }
         let result = (
             job.approved_runtime
                 .ok_or("LIVE_RUNTIME_APPROVAL_MISSING")?,
@@ -7003,6 +7013,10 @@ fn stop_one_live_inner(
     let job = controller.stop_offline(ue_id)?.clone();
     persist_ue_registry(state, &controller)?;
     Ok(job)
+}
+
+fn is_terminal_stop_state(process_state: &str) -> bool {
+    process_state == "STOPPED"
 }
 
 fn stop_one_live(state: &AppState, ue_id: &str) -> Result<simulator_controller::UeJob, String> {
@@ -12771,6 +12785,14 @@ mod p0_tests {
             )
             .unwrap();
         assert_eq!(observation.pdu_session_state, "INACTIVE");
+    }
+
+    #[test]
+    fn stop_after_switch_off_accepts_terminal_runtime_observation() {
+        assert!(is_terminal_stop_state("STOPPED"));
+        assert!(!is_terminal_stop_state("RUNNING"));
+        assert!(!is_terminal_stop_state("STARTING"));
+        assert!(!is_terminal_stop_state("UNKNOWN"));
     }
 
     #[test]

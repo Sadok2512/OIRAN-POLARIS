@@ -10,6 +10,9 @@
   window before UERANSIM automatic re-establishment as a durable state.
 - Record separate release-request and final-state evidence for completed
   detach steps.
+- Treat a controller-owned UE already observed `STOPPED` after switch-off as
+  an idempotent stop success, even when runtime observation has already
+  cleared its launch approval and process handle.
 
 ## 0.17.5 (polaris-control-api)
 
