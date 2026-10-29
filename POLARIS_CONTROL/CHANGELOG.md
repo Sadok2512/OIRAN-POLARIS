@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.2 (polaris-control-api)
+
+- Store Open5GS UE-AMBR and session AMBR values as native numeric BSON values so Open5GS 2.8 can produce AccessAndMobilitySubscriptionData.
+
 ## 0.16.1 (polaris-control-api)
 
 - Fix controller-owned scenario resource validation so it no longer depends on the legacy shared UE-01 container or profile; disk, memory, CPU and shared lab infrastructure health gates remain enforced.
