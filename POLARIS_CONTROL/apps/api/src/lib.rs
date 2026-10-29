@@ -115,6 +115,29 @@ pub struct AppState {
     ue_reconciliation_running: Arc<AtomicBool>,
     ue_reconciliation: Arc<Mutex<UeReconciliation>>,
     startup_reconcile: bool,
+    // 0.18.0 (#35) — operator-granted "live" authorisation for a bounded UE
+    // set with automatic expiration. Grants are in-memory per API process
+    // and audited through the same `audit()` sink as every other operator
+    // action. See `live_grant_*` handlers.
+    live_grants: Arc<Mutex<Vec<LiveGrant>>>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct LiveGrant {
+    pub id: String,
+    pub ue_ids: Vec<String>,
+    pub duration_minutes: u32,
+    pub granted_at_epoch_ms: u128,
+    pub expires_at_epoch_ms: u128,
+    pub granted_by: String,
+    #[serde(default)]
+    pub revoked: bool,
+}
+
+impl LiveGrant {
+    pub fn is_active(&self, now_ms: u128) -> bool {
+        !self.revoked && now_ms < self.expires_at_epoch_ms
+    }
 }
 
 #[derive(Clone)]
@@ -2815,6 +2838,7 @@ impl AppState {
             ue_reconciliation_running: Arc::new(AtomicBool::new(false)),
             ue_reconciliation: Arc::new(Mutex::new(UeReconciliation::default())),
             startup_reconcile: true,
+            live_grants: Arc::new(Mutex::new(Vec::new())),
         })
     }
 }
@@ -8768,6 +8792,197 @@ fn container_is_healthy(name: &str) -> bool {
     status["process_state"] == "running" && status["health"] == "healthy"
 }
 
+// -----------------------------------------------------------------------
+// 0.18.0 (#35) — /live/grant endpoint set.
+//
+// The operator opens a bounded Live window for a specific UE set from the
+// UI. Each grant carries an auto-expiration (max 60 minutes), an id, the
+// granter identity, and lands in the audit journal. Grants are checked for
+// expiration lazily on every read so an idle API process never leaves a
+// stale grant visible. State is in-memory on the API process — restarts
+// drop all open grants, which matches the "operator initiates the live"
+// contract (no persisted elevation across restart).
+// -----------------------------------------------------------------------
+
+const LIVE_GRANT_MAX_MINUTES: u32 = 60;
+
+#[derive(Deserialize)]
+struct LiveGrantRequest {
+    ue_ids: Vec<String>,
+    duration_minutes: u32,
+}
+
+fn epoch_millis_u128() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn purge_expired_grants(grants: &mut Vec<LiveGrant>) {
+    let now = epoch_millis_u128();
+    grants.retain(|g| g.is_active(now));
+}
+
+async fn create_live_grant(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Json(request): Json<LiveGrantRequest>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    if request.ue_ids.is_empty() {
+        audit(
+            &state,
+            &identity.role,
+            "LIVE_GRANT_CREATE",
+            "LIVE_GRANT_UE_IDS_REQUIRED",
+            None,
+        );
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"LIVE_GRANT_UE_IDS_REQUIRED"})),
+        );
+    }
+    if request.duration_minutes == 0 || request.duration_minutes > LIVE_GRANT_MAX_MINUTES {
+        audit(
+            &state,
+            &identity.role,
+            "LIVE_GRANT_CREATE",
+            "LIVE_GRANT_DURATION_INVALID",
+            None,
+        );
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error":"LIVE_GRANT_DURATION_INVALID",
+                "max_minutes": LIVE_GRANT_MAX_MINUTES,
+            })),
+        );
+    }
+    // Reject duplicated UE ids in the same request so the audit log and
+    // revocation flow stay deterministic.
+    let distinct: BTreeSet<_> = request.ue_ids.iter().cloned().collect();
+    if distinct.len() != request.ue_ids.len() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"LIVE_GRANT_DUPLICATE_UE_IDS"})),
+        );
+    }
+    let now = epoch_millis_u128();
+    let expires = now.saturating_add(u128::from(request.duration_minutes) * 60_000);
+    let id = format!("grant-{:x}", now);
+    let grant = LiveGrant {
+        id: id.clone(),
+        ue_ids: request.ue_ids.clone(),
+        duration_minutes: request.duration_minutes,
+        granted_at_epoch_ms: now,
+        expires_at_epoch_ms: expires,
+        granted_by: identity.role.clone(),
+        revoked: false,
+    };
+    {
+        let mut grants = match state.live_grants.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":"LIVE_GRANT_STORE_UNAVAILABLE"})),
+                );
+            }
+        };
+        purge_expired_grants(&mut grants);
+        grants.push(grant.clone());
+    }
+    audit(
+        &state,
+        &identity.role,
+        "LIVE_GRANT_CREATE",
+        "GRANTED",
+        Some(&id),
+    );
+    (
+        StatusCode::CREATED,
+        Json(serde_json::to_value(grant).unwrap_or(Value::Null)),
+    )
+}
+
+async fn list_live_grants(
+    State(state): State<Arc<AppState>>,
+    Extension(_identity): Extension<EffectiveIdentity>,
+) -> impl IntoResponse {
+    let mut grants = match state.live_grants.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"LIVE_GRANT_STORE_UNAVAILABLE"})),
+            );
+        }
+    };
+    purge_expired_grants(&mut grants);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "grants": grants.clone(),
+            "max_minutes": LIVE_GRANT_MAX_MINUTES,
+            "server_now_epoch_ms": epoch_millis_u128().to_string(),
+        })),
+    )
+}
+
+async fn revoke_live_grant(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let found = {
+        let mut grants = match state.live_grants.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":"LIVE_GRANT_STORE_UNAVAILABLE"})),
+                );
+            }
+        };
+        purge_expired_grants(&mut grants);
+        let mut hit = false;
+        for g in grants.iter_mut() {
+            if g.id == id {
+                g.revoked = true;
+                hit = true;
+            }
+        }
+        hit
+    };
+    if !found {
+        audit(
+            &state,
+            &identity.role,
+            "LIVE_GRANT_REVOKE",
+            "LIVE_GRANT_NOT_FOUND",
+            Some(&id),
+        );
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"LIVE_GRANT_NOT_FOUND"})),
+        );
+    }
+    audit(
+        &state,
+        &identity.role,
+        "LIVE_GRANT_REVOKE",
+        "REVOKED",
+        Some(&id),
+    );
+    (StatusCode::OK, Json(json!({"id": id, "revoked": true})))
+}
+
 async fn live_test_status() -> Json<Value> {
     let record = live_record()
         .lock()
@@ -9021,6 +9236,11 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/ues/group/stop", post(stop_ue_group))
         .route("/traffic/status", get(traffic_status))
         .route("/live-tests/polaris-live-001", get(live_test_status))
+        .route(
+            "/live/grant",
+            get(list_live_grants).post(create_live_grant),
+        )
+        .route("/live/grant/:id", axum::routing::delete(revoke_live_grant))
         .route("/scenario-capabilities", get(scenario_capabilities))
         .route("/admin/scenario-policy", post(update_policy))
         .route("/scenarios", get(scenarios))
@@ -9614,6 +9834,7 @@ mod p0_tests {
             ue_reconciliation_running: Arc::new(AtomicBool::new(false)),
             ue_reconciliation: Arc::new(Mutex::new(UeReconciliation::default())),
             startup_reconcile: false,
+            live_grants: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
