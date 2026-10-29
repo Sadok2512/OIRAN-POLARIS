@@ -6063,10 +6063,27 @@ fn cpu_safety_evidence(state: &AppState, budget: ScenarioResourceBudget) -> CpuS
         .evaluate(budget)
 }
 
+fn required_runtime_containers(
+    require_legacy_ue: bool,
+    ue01_controller_owned: bool,
+) -> Vec<&'static str> {
+    let mut required = vec![
+        "oiran-lab-amf-1",
+        "oiran-lab-upf-1",
+        "oiran-lab-ueransim-gnb-1",
+        "oiran-lab-capture-1",
+    ];
+    if require_legacy_ue && !ue01_controller_owned {
+        required.push("oiran-lab-ueransim-ue-1");
+    }
+    required
+}
+
 fn resource_gate_for_budget(
     state: &AppState,
     budget: ScenarioResourceBudget,
     record_decision: bool,
+    require_legacy_ue: bool,
 ) -> Result<Value, String> {
     if let Some(result) = state.resource_override.clone() {
         return result.map(|_| json!({"test_override":true}));
@@ -6090,28 +6107,23 @@ fn resource_gate_for_budget(
     if !cpu.ready {
         return Err(cpu.state.clone());
     }
-    let mut required_containers = vec![
-        "oiran-lab-amf-1",
-        "oiran-lab-upf-1",
-        "oiran-lab-ueransim-gnb-1",
-        "oiran-lab-capture-1",
-    ];
-    if !state.ue01_controller_owned {
-        required_containers.push("oiran-lab-ueransim-ue-1");
-    }
+    let required_containers =
+        required_runtime_containers(require_legacy_ue, state.ue01_controller_owned);
     if !required_containers
         .iter()
         .all(|name| container_is_healthy(name))
     {
         return Err("LAB_HEALTH_GATE_FAILED".into());
     }
-    let required_profile = if state.ue01_controller_owned {
-        Path::new(ueransim_adapter::LIVE_PROFILE_ROOT).join("ue-01.yaml")
-    } else {
-        PathBuf::from("/root/POLARIS/runtime/ueransim/ue.yaml")
-    };
-    if !required_profile.exists() {
-        return Err("UE_PROFILE_UNAVAILABLE".into());
+    if require_legacy_ue {
+        let required_profile = if state.ue01_controller_owned {
+            Path::new(ueransim_adapter::LIVE_PROFILE_ROOT).join("ue-01.yaml")
+        } else {
+            PathBuf::from("/root/POLARIS/runtime/ueransim/ue.yaml")
+        };
+        if !required_profile.exists() {
+            return Err("UE_PROFILE_UNAVAILABLE".into());
+        }
     }
     Ok(
         json!({"disk_usage_percent":f64::from(usage)/100.0,"memory_available_bytes":memory["available_bytes"],"cpu_safety":cpu}),
@@ -6119,16 +6131,24 @@ fn resource_gate_for_budget(
 }
 
 fn resource_gate(state: &AppState) -> Result<Value, String> {
-    resource_gate_for_budget(state, ScenarioResourceBudget::traffic(), true)
+    resource_gate_for_budget(state, ScenarioResourceBudget::traffic(), true, true)
 }
 
 fn resource_gate_preview(state: &AppState) -> Result<Value, String> {
-    resource_gate_for_budget(state, ScenarioResourceBudget::traffic(), false)
+    resource_gate_for_budget(state, ScenarioResourceBudget::traffic(), false, false)
+}
+
+fn controller_resource_gate(state: &AppState) -> Result<Value, String> {
+    resource_gate_for_budget(state, ScenarioResourceBudget::traffic(), true, false)
 }
 
 fn resource_gate_for_additions(state: &AppState, additions: usize) -> Result<Value, String> {
-    let evidence =
-        resource_gate_for_budget(state, ScenarioResourceBudget::ue(additions.max(1)), true)?;
+    let evidence = resource_gate_for_budget(
+        state,
+        ScenarioResourceBudget::ue(additions.max(1)),
+        true,
+        false,
+    )?;
     if state.resource_override.is_some() || additions == 0 {
         return Ok(evidence);
     }
@@ -6741,7 +6761,7 @@ fn start_live_definition_scenario(
             Json(json!({"error":"SCENARIO_UE_NOT_CONTROLLER_OWNED"})),
         ));
     }
-    resource_gate(&state).map_err(|error| {
+    controller_resource_gate(&state).map_err(|error| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(cpu_error_response(&state, &error)),
@@ -11429,5 +11449,21 @@ mod p0_tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("definition cancellation did not terminate");
+    }
+
+    #[test]
+    fn controller_scenario_health_gate_does_not_require_legacy_ue() {
+        let controller = required_runtime_containers(false, false);
+        assert!(!controller.contains(&"oiran-lab-ueransim-ue-1"));
+        for required in [
+            "oiran-lab-amf-1",
+            "oiran-lab-upf-1",
+            "oiran-lab-ueransim-gnb-1",
+            "oiran-lab-capture-1",
+        ] {
+            assert!(controller.contains(&required));
+        }
+        let legacy = required_runtime_containers(true, false);
+        assert!(legacy.contains(&"oiran-lab-ueransim-ue-1"));
     }
 }
