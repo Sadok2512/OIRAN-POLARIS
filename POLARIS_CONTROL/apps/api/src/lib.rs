@@ -556,6 +556,9 @@ fn dl_sender_health(state: &AppState) -> Result<(), String> {
 }
 
 trait UeRuntime: Send + Sync {
+    fn requires_authoritative_mongo_binding(&self) -> bool {
+        false
+    }
     fn verify_provisioning(
         &self,
         profiles: &[UeProfileSpec],
@@ -1498,6 +1501,10 @@ impl DockerUeRuntime {
 }
 
 impl UeRuntime for DockerUeRuntime {
+    fn requires_authoritative_mongo_binding(&self) -> bool {
+        true
+    }
+
     fn verify_provisioning(
         &self,
         profiles: &[UeProfileSpec],
@@ -1540,8 +1547,8 @@ impl UeRuntime for DockerUeRuntime {
             .as_deref()
             .filter(|value| Self::valid_digest(value))
             .ok_or("LIVE_UE_OWNERSHIP_ID_REQUIRED")?;
-        let current = self.verify_provisioning(std::slice::from_ref(profile))?;
-        if current.get(&profile.ue_id).map(String::as_str) != Some(profile_sha256) {
+        let current = Self::profile_evidence(profile)?;
+        if current.profile_sha256 != profile_sha256 {
             return Err("PROVISIONING_PROFILE_CHANGED".into());
         }
         let image_id = Self::output(&[
@@ -4302,6 +4309,39 @@ fn subscriber_matches_profile(
         && subscriber.dnns.iter().any(|dnn| dnn == &record.profile.dnn))
 }
 
+fn verify_mongo_subscriber_profile_for_launch(
+    profile: &UeProfileSpec,
+    subscriber: &SubscriberRecord,
+    served_network: &ServedNetworkPolicy,
+) -> Result<String, String> {
+    served_network.validate(subscriber)?;
+    let evidence = DockerUeRuntime::profile_evidence(profile)?;
+    let path = DockerUeRuntime::profile_path(&profile.ue_id, &profile.profile_name)?;
+    let bytes = fs::read(path).map_err(|_| "PROVISIONING_PROFILE_UNREADABLE".to_string())?;
+    let document =
+        std::str::from_utf8(&bytes).map_err(|_| "PROVISIONING_PROFILE_INVALID".to_string())?;
+    let scalar = |key: &str| {
+        DockerUeRuntime::top_level_scalar(document, key)
+            .ok_or_else(|| "PROVISIONING_PROFILE_INVALID".to_string())
+    };
+    let identity = scalar("supi")?;
+    let identity = identity.strip_prefix("imsi-").unwrap_or(&identity);
+    if identity != subscriber.imsi
+        || !scalar("key")?.eq_ignore_ascii_case(&subscriber.k)
+        || !scalar("op")?.eq_ignore_ascii_case(&subscriber.opc)
+        || !scalar("amf")?.eq_ignore_ascii_case("8000")
+        || !scalar("opType")?.eq_ignore_ascii_case("OPC")
+        || evidence.plmn_mcc != subscriber.plmn_mcc
+        || evidence.plmn_mnc != subscriber.plmn_mnc
+        || evidence.sst != subscriber.sst
+        || evidence.sd != subscriber.sd
+        || !subscriber.dnns.iter().any(|dnn| dnn == &evidence.dnn)
+    {
+        return Err("OPEN5GS_PROFILE_BINDING_MISMATCH".into());
+    }
+    Ok(evidence.profile_sha256)
+}
+
 async fn delete_ue_profile(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
@@ -5544,10 +5584,38 @@ fn start_one_live_inner(
         .into_iter()
         .find(|profile| profile.ue_id == ue_id)
         .ok_or("UNKNOWN_UE_PROFILE")?;
-    let verified = state
-        .ue_runtime
-        .verify_provisioning(std::slice::from_ref(&profile))?;
-    let profile_sha256 = verified.get(ue_id).ok_or("UE_PROFILE_NOT_READY")?.clone();
+    let profile_sha256 = if !state.ue_runtime.requires_authoritative_mongo_binding() {
+        state
+            .ue_runtime
+            .verify_provisioning(std::slice::from_ref(&profile))?
+            .get(ue_id)
+            .cloned()
+            .ok_or("UE_PROFILE_NOT_READY")?
+    } else {
+        let managed = state
+            .profile_registry
+            .lock()
+            .map_err(|_| "UE_PROFILE_REGISTRY_UNAVAILABLE")?
+            .profiles
+            .iter()
+            .find(|record| record.profile.ue_id == ue_id)
+            .cloned()
+            .ok_or("UNKNOWN_UE_PROFILE")?;
+        let imsi = state.profile_store.subscriber_imsi(&managed)?;
+        let subscribers = state
+            .subscriber_backend
+            .lookup_many(std::slice::from_ref(&imsi))?;
+        if let Some(subscriber) = subscribers.get(&imsi) {
+            verify_mongo_subscriber_profile_for_launch(&profile, subscriber, &state.served_network)?
+        } else {
+            state
+                .ue_runtime
+                .verify_provisioning(std::slice::from_ref(&profile))?
+                .get(ue_id)
+                .cloned()
+                .ok_or("UE_PROFILE_NOT_READY")?
+        }
+    };
     let approved_runtime = state.ue_runtime.approve_launch(&profile, &profile_sha256)?;
     let operation_id = random_hex(16);
     {
