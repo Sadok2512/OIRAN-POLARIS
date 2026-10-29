@@ -60,7 +60,7 @@ use ueransim_adapter::{
 
 pub use ue_profiles::UeProfileRegistry;
 
-pub const VERSION: &str = "0.17.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -437,7 +437,11 @@ struct DlSenderConfig {
 struct IperfMeasurement {
     client_sent_bytes: u64,
     server_received_bytes: u64,
+    preflight: UeRoutePreflight,
 }
+
+const UE_POLICY_TABLE: &str = "100";
+const UE_POLICY_PRIORITY: &str = "10000";
 
 fn iperf3_program() -> String {
     std::env::var("POLARIS_IPERF3_PATH")
@@ -490,7 +494,7 @@ pub fn parse_ip_route_get(line: &str) -> (Option<String>, Option<String>) {
             .and_then(|index| fields.get(index + 1).copied())
             .map(str::to_string)
     };
-    (after("dev"), after("src"))
+    (after("dev"), after("src").or_else(|| after("from")))
 }
 
 /// 0.17.1 — Evaluate a pre-captured `ip route get` output against the expected
@@ -537,7 +541,10 @@ pub fn preflight_failure(code: &str, preflight: &UeRoutePreflight) -> String {
 /// `evaluate_ue_route_preflight`) and attach the exact line to
 /// `failure_evidence`. The spawn itself is bounded by `/usr/bin/timeout 5s`
 /// so a hung namespace cannot block the UL/DL path.
-fn ue_netns_ip_route_get(target: &VerifiedTrafficTarget, destination: &str) -> Result<String, String> {
+fn ue_netns_ip(
+    target: &VerifiedTrafficTarget,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
     let output = Command::new("/usr/bin/timeout")
         .args([
             "--signal=TERM",
@@ -549,16 +556,121 @@ fn ue_netns_ip_route_get(target: &VerifiedTrafficTarget, destination: &str) -> R
             "--net",
             "--",
             "/usr/sbin/ip",
-            "route",
-            "get",
-            destination,
         ])
+        .args(args)
         .output()
         .map_err(|_| "UE_ROUTE_PREFLIGHT_SPAWN_FAILED".to_string())?;
+    Ok(output)
+}
+
+fn ue_netns_ip_route_get(target: &VerifiedTrafficTarget, destination: &str) -> Result<String, String> {
+    let output = ue_netns_ip(
+        target,
+        &["route", "get", destination, "from", &target.ue_ip],
+    )?;
     if !output.status.success() {
         return Err("UE_ROUTE_PREFLIGHT_FAILED".into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn ue_policy_rule_present(raw: &str, ue_ip: &str) -> bool {
+    raw.lines().any(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        fields.first().is_some_and(|value| value.trim_end_matches(':') == UE_POLICY_PRIORITY)
+            && fields.windows(2).any(|pair| {
+                pair[0] == "from"
+                    && (pair[1] == ue_ip || pair[1] == format!("{ue_ip}/32"))
+            })
+            && fields.windows(2).any(|pair| {
+                pair[0] == "lookup" && pair[1] == UE_POLICY_TABLE
+            })
+    })
+}
+
+/// Install the standard UERANSIM source-policy route inside the UE namespace.
+/// The fixed rule is added at most once; `route replace` is idempotent.
+fn ensure_ue_policy_routing(target: &VerifiedTrafficTarget) -> Result<(), String> {
+    let rules = ue_netns_ip(target, &["rule", "show"])?;
+    if !rules.status.success() {
+        return Err("UE_POLICY_RULE_INSPECTION_FAILED".into());
+    }
+    let rules = String::from_utf8_lossy(&rules.stdout);
+    if !ue_policy_rule_present(&rules, &target.ue_ip) {
+        let source = format!("{}/32", target.ue_ip);
+        let add = ue_netns_ip(
+            target,
+            &[
+                "rule",
+                "add",
+                "priority",
+                UE_POLICY_PRIORITY,
+                "from",
+                &source,
+                "table",
+                UE_POLICY_TABLE,
+            ],
+        )?;
+        if !add.status.success() {
+            return Err("UE_POLICY_RULE_ADD_FAILED".into());
+        }
+    }
+    let route = ue_netns_ip(
+        target,
+        &[
+            "route",
+            "replace",
+            "default",
+            "dev",
+            &target.tun_interface,
+            "table",
+            UE_POLICY_TABLE,
+        ],
+    )?;
+    if !route.status.success() {
+        return Err("UE_POLICY_ROUTE_REPLACE_FAILED".into());
+    }
+    Ok(())
+}
+
+fn remove_ue_policy_routing(target: &VerifiedTrafficTarget) -> Result<(), String> {
+    let rules = ue_netns_ip(target, &["rule", "show"])?;
+    if !rules.status.success() {
+        return Err("UE_POLICY_RULE_INSPECTION_FAILED".into());
+    }
+    let rules = String::from_utf8_lossy(&rules.stdout);
+    if ue_policy_rule_present(&rules, &target.ue_ip) {
+        let source = format!("{}/32", target.ue_ip);
+        let delete = ue_netns_ip(
+            target,
+            &[
+                "rule",
+                "del",
+                "priority",
+                UE_POLICY_PRIORITY,
+                "from",
+                &source,
+                "table",
+                UE_POLICY_TABLE,
+            ],
+        )?;
+        if !delete.status.success() {
+            return Err("UE_POLICY_RULE_DELETE_FAILED".into());
+        }
+    }
+    let route = ue_netns_ip(
+        target,
+        &[
+            "route",
+            "flush",
+            "table",
+            UE_POLICY_TABLE,
+        ],
+    )?;
+    if !route.status.success() {
+        return Err("UE_POLICY_ROUTE_REMOVE_FAILED".into());
+    }
+    Ok(())
 }
 
 impl DlSenderConfig {
@@ -723,6 +835,14 @@ trait UeRuntime: Send + Sync {
     ) -> Result<VerifiedTrafficTarget, String> {
         let _ = (job, destination);
         Err("TRAFFIC_TARGET_RESOLUTION_UNSUPPORTED".into())
+    }
+    fn ensure_policy_routing(&self, target: &VerifiedTrafficTarget) -> Result<(), String> {
+        let _ = target;
+        Ok(())
+    }
+    fn remove_policy_routing(&self, target: &VerifiedTrafficTarget) -> Result<(), String> {
+        let _ = target;
+        Ok(())
     }
     fn execute_bounded_udp(&self, target: &VerifiedTrafficTarget) -> Result<(), String> {
         let status = Command::new("/usr/bin/nsenter")
@@ -894,6 +1014,7 @@ trait UeRuntime: Send + Sync {
         Ok(IperfMeasurement {
             client_sent_bytes,
             server_received_bytes,
+            preflight,
         })
     }
     fn execute_iperf_dl(
@@ -907,14 +1028,12 @@ trait UeRuntime: Send + Sync {
             .container
             .as_deref()
             .ok_or("DL_SENDER_NOT_CONFIGURED")?;
-        // 0.17.1 — PREFLIGHT: `ip route get <ue_ip>` inside the UE netns must
-        // resolve via the UE TUN interface. For the DL direction this is the
-        // receiver's own address; if the kernel does not route it via
-        // uesimtun* the UE will never see the DN sender's packets. Fail
-        // before spawning iperf3 so the operator sees the exact route line.
-        let route_raw = ue_netns_ip_route_get(target, &target.ue_ip).map_err(|code| {
+        // 0.17.2 — prove the same source-policy route used by UL before the
+        // DN sender is allowed to connect back to the UE receiver.
+        let route_dest = sender.sender_ip.to_string();
+        let route_raw = ue_netns_ip_route_get(target, &route_dest).map_err(|code| {
             let preflight = UeRoutePreflight {
-                destination: target.ue_ip.clone(),
+                destination: route_dest.clone(),
                 expected_dev: target.tun_interface.clone(),
                 actual_dev: None,
                 src: None,
@@ -926,7 +1045,7 @@ trait UeRuntime: Send + Sync {
         })?;
         let preflight = evaluate_ue_route_preflight(
             &route_raw,
-            &target.ue_ip,
+            &route_dest,
             &target.tun_interface,
             "DL_ROUTE_NOT_VIA_UE_TUN",
         );
@@ -1004,6 +1123,7 @@ trait UeRuntime: Send + Sync {
         Ok(IperfMeasurement {
             client_sent_bytes: sender_bytes,
             server_received_bytes: ue_bytes,
+            preflight,
         })
     }
     fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> {
@@ -1960,6 +2080,14 @@ impl UeRuntime for DockerUeRuntime {
             tun_interface,
             ue_ip: ue_ip.into(),
         })
+    }
+
+    fn ensure_policy_routing(&self, target: &VerifiedTrafficTarget) -> Result<(), String> {
+        ensure_ue_policy_routing(target)
+    }
+
+    fn remove_policy_routing(&self, target: &VerifiedTrafficTarget) -> Result<(), String> {
+        remove_ue_policy_routing(target)
     }
 }
 
@@ -6412,6 +6540,10 @@ fn stop_one_live_inner(
     if !controller_owns_ue(state, ue_id) {
         return Err("PROTECTED_OR_UNAPPROVED_UE".into());
     }
+    // Remove the source-policy rule while the owned namespace still exists.
+    // If the UE has no active PDU there is no route to clean; stopping the
+    // container removes the namespace in either case.
+    let policy_target = resolve_controller_traffic_target(state, ue_id).ok();
     let operation_id = random_hex(16);
     let (approved_runtime, handle) = {
         let mut controller = state
@@ -6443,6 +6575,9 @@ fn stop_one_live_inner(
         let job = controller.stop_offline(ue_id)?.clone();
         persist_ue_registry(state, &controller)?;
         return Ok(job);
+    }
+    if let Some(target) = policy_target.as_ref() {
+        state.ue_runtime.remove_policy_routing(target)?;
     }
     if let Err(error) = state.ue_runtime.stop(&approved_runtime, &handle) {
         if let Ok(mut controller) = state.multi_ue.lock() {
@@ -7172,6 +7307,9 @@ fn execute_live_definition_step(
                     .iter()
                     .any(|job| job.ue_id == *ue_id && job.process_state == "RUNNING");
                 if running {
+                    if let Ok(target) = resolve_controller_traffic_target(state, ue_id) {
+                        state.ue_runtime.remove_policy_routing(&target)?;
+                    }
                     stop_one_live(state, ue_id)?;
                 }
                 control
@@ -7215,12 +7353,19 @@ fn execute_live_definition_step(
                 if observation.pdu_session_state != "ACTIVE" {
                     return Err("PDU_STATE_ACTIVE_NOT_OBSERVED".into());
                 }
+                let target = resolve_controller_traffic_target(state, ue_id)?;
+                state.ue_runtime.ensure_policy_routing(&target)?;
             }
-            Ok(json!({"pdu_state":"ACTIVE"}))
+            Ok(json!({
+                "pdu_state":"ACTIVE",
+                "policy_table":UE_POLICY_TABLE,
+                "policy_priority":UE_POLICY_PRIORITY
+            }))
         }
         "pdu_release" => {
             let timeout = resolved_parameter_u64(step, "timeout_seconds", 30, 120)?;
             for ue_id in ue_ids {
+                let target = resolve_controller_traffic_target(state, ue_id)?;
                 let job = state
                     .multi_ue
                     .lock()
@@ -7229,6 +7374,7 @@ fn execute_live_definition_step(
                     .into_iter()
                     .find(|job| job.ue_id == *ue_id)
                     .ok_or("UE_NOT_STARTED")?;
+                state.ue_runtime.remove_policy_routing(&target)?;
                 state
                     .ue_runtime
                     .release_pdu(&job, timeout, &control.cancel)?;
@@ -7260,6 +7406,7 @@ fn execute_live_definition_step(
             }
             let mut sender_bytes = 0_u64;
             let mut ue_bytes = 0_u64;
+            let mut preflights = Vec::new();
             for ue_id in ue_ids {
                 if control.cancel.load(Ordering::SeqCst) {
                     return Err("SCENARIO_STOP_REQUESTED".into());
@@ -7275,11 +7422,13 @@ fn execute_live_definition_step(
                 ue_bytes = ue_bytes
                     .checked_add(measurement.server_received_bytes)
                     .ok_or("IPERF3_BYTES_OVERFLOW")?;
+                preflights.push(measurement.preflight);
             }
             Ok(json!({
                 "requested_bytes_per_ue":bytes,
                 "measured_sender_bytes":sender_bytes,
-                "measured_ue_bytes":ue_bytes
+                "measured_ue_bytes":ue_bytes,
+                "preflights":preflights
             }))
         }
         "traffic_ul" => {
@@ -7290,6 +7439,7 @@ fn execute_live_definition_step(
             dl_sender_health(state).map_err(|_| "UL_RECEIVER_NOT_AVAILABLE".to_string())?;
             let mut ue_sender_bytes = 0_u64;
             let mut dn_receiver_bytes = 0_u64;
+            let mut preflights = Vec::new();
             for ue_id in ue_ids {
                 if control.cancel.load(Ordering::SeqCst) {
                     return Err("SCENARIO_STOP_REQUESTED".into());
@@ -7305,12 +7455,14 @@ fn execute_live_definition_step(
                 dn_receiver_bytes = dn_receiver_bytes
                     .checked_add(measurement.server_received_bytes)
                     .ok_or("IPERF3_BYTES_OVERFLOW")?;
+                preflights.push(measurement.preflight);
             }
             Ok(json!({
                 "requested_bytes_per_ue":bytes,
                 "measured_ul_bytes":ue_sender_bytes,
                 "measured_ue_sender_bytes":ue_sender_bytes,
-                "measured_dn_receiver_bytes":dn_receiver_bytes
+                "measured_dn_receiver_bytes":dn_receiver_bytes,
+                "preflights":preflights
             }))
         }
         "idle" => {
@@ -7330,6 +7482,7 @@ fn execute_live_definition_step(
         }
         "detach" => {
             for ue_id in ue_ids {
+                let target = resolve_controller_traffic_target(state, ue_id)?;
                 let job = state
                     .multi_ue
                     .lock()
@@ -7338,6 +7491,7 @@ fn execute_live_definition_step(
                     .into_iter()
                     .find(|job| job.ue_id == *ue_id)
                     .ok_or("UE_NOT_STARTED")?;
+                state.ue_runtime.remove_policy_routing(&target)?;
                 state.ue_runtime.release_pdu(&job, 30, &control.cancel)?;
                 state.ue_runtime.deregister_switch_off(&job)?;
                 stop_one_live(state, ue_id)?;
@@ -12293,6 +12447,32 @@ mod p0_tests {
         assert_eq!(decoded["preflight"]["expected_dev"], "uesimtun0");
         assert_eq!(decoded["preflight"]["actual_dev"], "enp0s3");
         assert_eq!(decoded["preflight"]["ok"], false);
+    }
+
+    #[test]
+    fn policy_rule_detection_is_idempotent_for_kernel_output() {
+        let rules = "0: from all lookup local\n10000: from 10.46.0.4 lookup 100\n32766: from all lookup main\n";
+        assert!(ue_policy_rule_present(rules, "10.46.0.4"));
+        assert!(!ue_policy_rule_present(rules, "10.46.0.5"));
+        assert!(ue_policy_rule_present(
+            "10000: from 10.46.0.4/32 lookup 100",
+            "10.46.0.4"
+        ));
+    }
+
+    #[test]
+    fn source_policy_preflight_accepts_route_get_from_ue_ip() {
+        let raw = "10.77.24.30 dev uesimtun0 table 100 from 10.46.0.4 uid 0\n    cache";
+        let evidence = evaluate_ue_route_preflight(
+            raw,
+            "10.77.24.30",
+            "uesimtun0",
+            "UL_ROUTE_NOT_VIA_UE_TUN",
+        );
+        assert!(evidence.ok);
+        assert_eq!(evidence.actual_dev.as_deref(), Some("uesimtun0"));
+        assert_eq!(evidence.src.as_deref(), Some("10.46.0.4"));
+        assert_eq!(evidence.raw, raw);
     }
 
     #[test]

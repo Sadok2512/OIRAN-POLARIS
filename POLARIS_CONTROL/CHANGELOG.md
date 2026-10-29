@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.17.2 (polaris-control-api)
+
+- Install an idempotent source-policy rule inside each owned UE network
+  namespace after PDU establishment: priority `10000`, source UE IPv4,
+  routing table `100`, default device the verified `uesimtunN` interface.
+- Remove that namespace-local rule and route on PDU release, detach and UE
+  stop. No host route or Open5GS configuration is changed.
+- Run UL and DL pre-flight as
+  `ip route get <DN sender> from <UE IPv4>` and retain the bounded raw kernel
+  result in successful step measurements as well as failure evidence.
+- Derive `GET /api/v1/version` from `CARGO_PKG_VERSION` to prevent release
+  metadata drift.
+- Add unit coverage for rule idempotence and source-policy pre-flight.
+
 ## 0.17.1 (polaris-control-api)
 
 - UL / DL pre-flight: before spawning iperf3 the API now runs
