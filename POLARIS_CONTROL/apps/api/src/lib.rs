@@ -459,6 +459,108 @@ fn iperf_failure(code: &str, output: &std::process::Output, command: Vec<String>
     .to_string()
 }
 
+/// 0.17.1 — Shape persisted in `failure_evidence` so the operator can prove the
+/// UE netns was actually routing through the TUN before iperf3 was spawned.
+///
+/// `destination` is the IP we called `ip route get` on (10.77.24.30 for UL, the
+/// UE IP for DL). `expected_dev` is the UE TUN interface. `actual_dev` is the
+/// `dev` field parsed from `ip route get`. `raw` is the original line (bounded
+/// to 1024 chars). `ok` is true iff the kernel resolved the route via the
+/// expected TUN; a false value is paired with the `code` the caller surfaced.
+#[derive(Clone, serde::Serialize, PartialEq, Eq, Debug)]
+pub struct UeRoutePreflight {
+    pub destination: String,
+    pub expected_dev: String,
+    pub actual_dev: Option<String>,
+    pub src: Option<String>,
+    pub raw: String,
+    pub ok: bool,
+    pub code: Option<String>,
+}
+
+/// Parse the first line of `ip route get <dest>` output and extract the fields
+/// we care about (dev, src). This is the testable core of the preflight: a
+/// pure string parser with no process spawn.
+pub fn parse_ip_route_get(line: &str) -> (Option<String>, Option<String>) {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let after = |key: &str| {
+        fields
+            .iter()
+            .position(|value| *value == key)
+            .and_then(|index| fields.get(index + 1).copied())
+            .map(str::to_string)
+    };
+    (after("dev"), after("src"))
+}
+
+/// 0.17.1 — Evaluate a pre-captured `ip route get` output against the expected
+/// UE TUN interface. Returns the structured evidence record used by both the
+/// UL and DL paths. The caller decides which error code to surface on failure
+/// (UL_ROUTE_NOT_VIA_UE_TUN / DL_ROUTE_NOT_VIA_UE_TUN) so the step record
+/// retains the exact context.
+pub fn evaluate_ue_route_preflight(
+    raw: &str,
+    destination: &str,
+    expected_dev: &str,
+    failure_code: &str,
+) -> UeRoutePreflight {
+    let bounded = raw.chars().take(1024).collect::<String>();
+    let line = bounded.lines().next().unwrap_or("");
+    let (actual_dev, src) = parse_ip_route_get(line);
+    let ok = actual_dev.as_deref() == Some(expected_dev);
+    UeRoutePreflight {
+        destination: destination.to_string(),
+        expected_dev: expected_dev.to_string(),
+        actual_dev,
+        src,
+        raw: bounded,
+        ok,
+        code: if ok { None } else { Some(failure_code.to_string()) },
+    }
+}
+
+/// Composite `failure_evidence` body for an UL/DL pre-flight failure. The
+/// `preflight` field is kept so the operator can see the exact `ip route get`
+/// line even when iperf3 was never spawned. No stdout / stderr / exit code is
+/// included because no process ran; those slots are filled by the regular
+/// `iperf_failure` once iperf3 does run.
+pub fn preflight_failure(code: &str, preflight: &UeRoutePreflight) -> String {
+    json!({
+        "error": code,
+        "preflight": preflight,
+    })
+    .to_string()
+}
+
+/// 0.17.1 — Run `ip route get <destination>` inside the UE network namespace
+/// via `nsenter`. Returns the raw stdout so the caller can both parse it (via
+/// `evaluate_ue_route_preflight`) and attach the exact line to
+/// `failure_evidence`. The spawn itself is bounded by `/usr/bin/timeout 5s`
+/// so a hung namespace cannot block the UL/DL path.
+fn ue_netns_ip_route_get(target: &VerifiedTrafficTarget, destination: &str) -> Result<String, String> {
+    let output = Command::new("/usr/bin/timeout")
+        .args([
+            "--signal=TERM",
+            "--kill-after=1s",
+            "5s",
+            "/usr/bin/nsenter",
+            "--target",
+            &target.namespace_pid.to_string(),
+            "--net",
+            "--",
+            "/usr/sbin/ip",
+            "route",
+            "get",
+            destination,
+        ])
+        .output()
+        .map_err(|_| "UE_ROUTE_PREFLIGHT_SPAWN_FAILED".to_string())?;
+    if !output.status.success() {
+        return Err("UE_ROUTE_PREFLIGHT_FAILED".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 impl DlSenderConfig {
     fn from_env() -> Result<Self, String> {
         let container = std::env::var("POLARIS_DL_SENDER_CONTAINER")
@@ -675,6 +777,37 @@ trait UeRuntime: Send + Sync {
             .spawn()
             .map_err(|_| "IPERF3_UL_RECEIVER_SPAWN_FAILED")?;
         std::thread::sleep(std::time::Duration::from_millis(200));
+        // 0.17.1 — PREFLIGHT: `ip route get <sender.sender_ip>` inside the UE
+        // netns must resolve via the UE TUN interface (uesimtun*). If the
+        // kernel resolves to anything else (host default route, bridge, …) we
+        // fail *before* iperf3 runs so we never send UL packets outside the
+        // GTP-U tunnel. The raw route output is kept in `failure_evidence`.
+        let route_dest = sender.sender_ip.to_string();
+        let route_raw = ue_netns_ip_route_get(target, &route_dest).map_err(|code| {
+            let preflight = UeRoutePreflight {
+                destination: route_dest.clone(),
+                expected_dev: target.tun_interface.clone(),
+                actual_dev: None,
+                src: None,
+                raw: String::new(),
+                ok: false,
+                code: Some(code.clone()),
+            };
+            let _ = receiver.kill();
+            let _ = receiver.wait();
+            preflight_failure(&code, &preflight)
+        })?;
+        let preflight = evaluate_ue_route_preflight(
+            &route_raw,
+            &route_dest,
+            &target.tun_interface,
+            "UL_ROUTE_NOT_VIA_UE_TUN",
+        );
+        if !preflight.ok {
+            let _ = receiver.kill();
+            let _ = receiver.wait();
+            return Err(preflight_failure("UL_ROUTE_NOT_VIA_UE_TUN", &preflight));
+        }
         let iperf = iperf3_program();
         let command = vec![
             iperf.clone(),
@@ -685,6 +818,10 @@ trait UeRuntime: Send + Sync {
             "--connect-timeout".into(),
             "5000".into(),
             "-J".into(),
+            "-B".into(),
+            target.ue_ip.clone(),
+            "--bind-dev".into(),
+            target.tun_interface.clone(),
         ];
         let client_output = Command::new("/usr/bin/timeout")
             .args([
@@ -704,13 +841,34 @@ trait UeRuntime: Send + Sync {
                 "--connect-timeout",
                 "5000",
                 "-J",
+                // 0.17.1 — Bind the UL client to the UE TUN endpoint so the
+                // socket cannot pick an unrelated host interface. iperf3 3.21
+                // supports `--bind-dev` (SO_BINDTODEVICE); the pinned
+                // release/iperf3-3.21 binary advertises it.
+                "-B",
+                &target.ue_ip,
+                "--bind-dev",
+                &target.tun_interface,
             ])
             .output()
             .map_err(|_| "IPERF3_PROCESS_SPAWN_FAILED".to_string())?;
         if !client_output.status.success() {
             let _ = receiver.kill();
             let _ = receiver.wait();
-            return Err(iperf_failure("IPERF3_UL_FAILED", &client_output, command));
+            // Attach the preflight evidence inside the iperf failure body so a
+            // "command sent but 0 bytes" post-mortem still shows the UE route
+            // state at the time of the spawn.
+            let mut body: Value =
+                serde_json::from_str(&iperf_failure("IPERF3_UL_FAILED", &client_output, command))
+                    .unwrap_or_else(|_| json!({ "error": "IPERF3_UL_FAILED" }));
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "preflight".to_string(),
+                    serde_json::to_value(&preflight)
+                        .unwrap_or_else(|_| json!(null)),
+                );
+            }
+            return Err(body.to_string());
         }
         let receiver_output = receiver
             .wait_with_output()
@@ -749,6 +907,32 @@ trait UeRuntime: Send + Sync {
             .container
             .as_deref()
             .ok_or("DL_SENDER_NOT_CONFIGURED")?;
+        // 0.17.1 — PREFLIGHT: `ip route get <ue_ip>` inside the UE netns must
+        // resolve via the UE TUN interface. For the DL direction this is the
+        // receiver's own address; if the kernel does not route it via
+        // uesimtun* the UE will never see the DN sender's packets. Fail
+        // before spawning iperf3 so the operator sees the exact route line.
+        let route_raw = ue_netns_ip_route_get(target, &target.ue_ip).map_err(|code| {
+            let preflight = UeRoutePreflight {
+                destination: target.ue_ip.clone(),
+                expected_dev: target.tun_interface.clone(),
+                actual_dev: None,
+                src: None,
+                raw: String::new(),
+                ok: false,
+                code: Some(code.clone()),
+            };
+            preflight_failure(&code, &preflight)
+        })?;
+        let preflight = evaluate_ue_route_preflight(
+            &route_raw,
+            &target.ue_ip,
+            &target.tun_interface,
+            "DL_ROUTE_NOT_VIA_UE_TUN",
+        );
+        if !preflight.ok {
+            return Err(preflight_failure("DL_ROUTE_NOT_VIA_UE_TUN", &preflight));
+        }
         let iperf = iperf3_program();
         let mut receiver = Command::new("/usr/bin/timeout")
             .args([
@@ -12042,6 +12226,73 @@ mod p0_tests {
             evidence["command"][0],
             "/opt/polaris-control/libexec/iperf3"
         );
+    }
+
+    #[test]
+    fn parse_ip_route_get_extracts_dev_and_src_from_tun_output() {
+        // Nominal: destination is reached via the UE TUN with the UE src IP.
+        let line = "10.77.24.30 dev uesimtun0 src 10.46.0.5 uid 0";
+        let (dev, src) = parse_ip_route_get(line);
+        assert_eq!(dev.as_deref(), Some("uesimtun0"));
+        assert_eq!(src.as_deref(), Some("10.46.0.5"));
+    }
+
+    #[test]
+    fn evaluate_ue_route_preflight_accepts_route_via_expected_tun() {
+        let raw = "10.77.24.30 dev uesimtun0 src 10.46.0.5 uid 0\n    cache";
+        let evidence =
+            evaluate_ue_route_preflight(raw, "10.77.24.30", "uesimtun0", "UL_ROUTE_NOT_VIA_UE_TUN");
+        assert!(evidence.ok);
+        assert!(evidence.code.is_none());
+        assert_eq!(evidence.actual_dev.as_deref(), Some("uesimtun0"));
+        assert_eq!(evidence.src.as_deref(), Some("10.46.0.5"));
+        assert_eq!(evidence.destination, "10.77.24.30");
+        assert_eq!(evidence.expected_dev, "uesimtun0");
+    }
+
+    #[test]
+    fn evaluate_ue_route_preflight_rejects_route_outside_tun() {
+        // Host default route: kernel chose enp0s3 instead of the UE TUN. This
+        // is the exact scenario the preflight catches so UL packets are not
+        // sent outside the GTP-U tunnel.
+        let raw = "10.77.24.30 via 10.0.2.2 dev enp0s3 src 10.0.2.15 uid 1000";
+        let evidence =
+            evaluate_ue_route_preflight(raw, "10.77.24.30", "uesimtun0", "UL_ROUTE_NOT_VIA_UE_TUN");
+        assert!(!evidence.ok);
+        assert_eq!(evidence.code.as_deref(), Some("UL_ROUTE_NOT_VIA_UE_TUN"));
+        assert_eq!(evidence.actual_dev.as_deref(), Some("enp0s3"));
+        assert_eq!(evidence.src.as_deref(), Some("10.0.2.15"));
+    }
+
+    #[test]
+    fn evaluate_ue_route_preflight_bounds_the_raw_route_output() {
+        let huge = "x".repeat(4096);
+        let evidence = evaluate_ue_route_preflight(
+            &huge,
+            "10.77.24.30",
+            "uesimtun0",
+            "UL_ROUTE_NOT_VIA_UE_TUN",
+        );
+        // 1024 cap applied on the raw blob; the parser handles the empty line.
+        assert_eq!(evidence.raw.len(), 1024);
+        assert!(!evidence.ok);
+        assert_eq!(evidence.actual_dev, None);
+    }
+
+    #[test]
+    fn preflight_failure_body_shape_is_stable() {
+        let evidence = evaluate_ue_route_preflight(
+            "10.77.24.30 via 10.0.2.2 dev enp0s3 src 10.0.2.15",
+            "10.77.24.30",
+            "uesimtun0",
+            "UL_ROUTE_NOT_VIA_UE_TUN",
+        );
+        let encoded = preflight_failure("UL_ROUTE_NOT_VIA_UE_TUN", &evidence);
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded["error"], "UL_ROUTE_NOT_VIA_UE_TUN");
+        assert_eq!(decoded["preflight"]["expected_dev"], "uesimtun0");
+        assert_eq!(decoded["preflight"]["actual_dev"], "enp0s3");
+        assert_eq!(decoded["preflight"]["ok"], false);
     }
 
     #[test]

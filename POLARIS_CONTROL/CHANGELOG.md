@@ -2,6 +2,30 @@
 
 ## 0.17.1 (polaris-control-api)
 
+- UL / DL pre-flight: before spawning iperf3 the API now runs
+  `ip route get <destination>` inside the UE network namespace
+  (`nsenter --target <ue_pid> --net -- ip route get …`) and parses the
+  `dev` field. If the kernel resolves the route to anything other than the
+  verified UE TUN interface (`uesimtun*`), the step fails fast with
+  `UL_ROUTE_NOT_VIA_UE_TUN` (uplink leg) or `DL_ROUTE_NOT_VIA_UE_TUN`
+  (downlink receiver), *without* spawning iperf3. The raw `ip route get`
+  output and the parsed `{expected_dev, actual_dev, src}` land in
+  `failure_evidence.preflight` so the operator can prove the UE routing
+  state at the exact spawn attempt time, even when iperf3 is never run.
+- UL client bind: the UE-side iperf3 client now runs with
+  `-B <ue_ip> --bind-dev <uesimtun*>` so the socket cannot pick an
+  unrelated host interface. The pinned `release/iperf3-3.21` binary
+  advertises `--bind-dev` (SO_BINDTODEVICE) — a feature added upstream
+  in iperf3 3.17 and present in 3.21.
+- Pre-flight failure body also carries over when iperf3 is spawned and
+  then fails later (`IPERF3_UL_FAILED`): the `preflight` object is
+  appended to the regular `failure_evidence` body, so a "command sent
+  but 0 bytes" post-mortem still shows the UE route state at the time
+  of the attempt.
+- Tests: new unit coverage for `parse_ip_route_get` /
+  `evaluate_ue_route_preflight` with two shapes (route-via-TUN → ok,
+  route-via-host-iface → `UL_ROUTE_NOT_VIA_UE_TUN`) and for the
+  composite `preflight_failure` JSON body.
 - Persist bounded iperf3 JSON `stdout` alongside `stderr`, exit code and the
   executed command in step `failure_evidence`. iperf3 emits `-J` connection
   errors on stdout, so prior evidence could retain an empty stderr while losing
