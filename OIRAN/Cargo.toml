@@ -18,6 +18,8 @@ members = [
     "decoder-sbi",
     "decoder-pfcp",
     "decoder-gtpu",
+    "decoder-gtpv2c",
+    "decoder-diameter",
     "oiran-decode",
     "session-engine",
     "correlation-engine",

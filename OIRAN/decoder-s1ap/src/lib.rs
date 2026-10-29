@@ -2,12 +2,13 @@
 //!
 //! Covered procedures: S1 Setup, InitialUEMessage, DL/UL NAS Transport,
 //! InitialContextSetup, UEContextRelease (and Request), E-RAB Setup/Release,
-//! Paging. Carried NAS-PDU is EPS NAS (TS 24.301) and is preserved as an opaque
-//! octet string with SHA-256 + length; it is not decoded by `decoder-nas`
-//! (which is 5G-only). Identity-bearing IEs (S-TMSI, UEPagingID, Masked-IMEISV,
-//! GUMMEI-ID) are flagged with `pseudonymized: true` so the Analyzer strips
-//! them before persistence.
+//! Paging. Carried NAS-PDU (IE id 26) is EPS NAS (TS 24.301) and is forwarded
+//! to `decoder-nas`, which emits a child `NormalizedEvent` with a parent link
+//! back to this S1AP event. Identity-bearing IEs (S-TMSI, UEPagingID,
+//! Masked-IMEISV, GUMMEI-ID) are flagged with `pseudonymized: true` so the
+//! Analyzer strips them before persistence.
 
+use decoder_nas::NasMessage;
 use event_schema::{
     pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState,
     InformationElement, NamedValue, NormalizedEvent, Protocol,
@@ -17,7 +18,7 @@ use plugin_runtime::{
     PLUGIN_API_VERSION,
 };
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 pub const SCHEMA_VERSION: &str = "3GPP TS 36.413";
 
 #[derive(Default)]
@@ -136,6 +137,17 @@ fn aper_length(data: &[u8]) -> Result<(usize, usize), String> {
     } else {
         Err("APER fragmented length determinant unsupported".into())
     }
+}
+
+fn nas_pdu_contents(value: &[u8]) -> Result<(&[u8], usize), String> {
+    let (length, octets) = aper_length(value)?;
+    let end = octets
+        .checked_add(length)
+        .ok_or("NAS-PDU length overflow")?;
+    if end != value.len() {
+        return Err("NAS-PDU open type length mismatch".into());
+    }
+    Ok((&value[octets..end], octets))
 }
 
 fn decode_ie(ie: &S1apIe) -> (Option<String>, DecodeStatus, bool) {
@@ -442,7 +454,17 @@ impl ProtocolDecoder for S1apDecoder {
                 let mut elements = Vec::new();
                 let mut errors = Vec::new();
                 let mut status = DecodeStatus::Decoded;
+                let mut nas_messages: Vec<NasMessage> = Vec::new();
                 for ie in &pdu.ies {
+                    if ie.id == 26 {
+                        match nas_pdu_contents(&ie.value) {
+                            Ok((nas, offset)) => {
+                                nas_messages
+                                    .push(decoder_nas::decode_with_offset(nas, offset));
+                            }
+                            Err(error) => errors.push(error),
+                        }
+                    }
                     let (value, ie_status, sensitive) = decode_ie(ie);
                     if matches!(
                         ie_status,
@@ -526,9 +548,22 @@ impl ProtocolDecoder for S1apDecoder {
                     sbi: None,
                 };
                 event.assign_deterministic_id();
+                let parent_id = event.event_id.clone();
+                let parent_identifiers = event.session_identifiers.clone();
+                let mut output_events = vec![event];
+                for nas in &nas_messages {
+                    append_eps_nas_events(
+                        &mut output_events,
+                        nas,
+                        &parent_id,
+                        &parent_identifiers,
+                        input,
+                        pdu.procedure_code,
+                    );
+                }
                 DecoderOutput {
                     status,
-                    events: vec![event],
+                    events: output_events,
                     errors,
                 }
             }
@@ -538,6 +573,99 @@ impl ProtocolDecoder for S1apDecoder {
                 errors: vec![e],
             },
         }
+    }
+}
+
+fn append_eps_nas_events(
+    events: &mut Vec<NormalizedEvent>,
+    nas: &NasMessage,
+    parent_id: &str,
+    parent_identifiers: &[NamedValue],
+    input: &DecoderInput<'_>,
+    s1ap_procedure: u8,
+) {
+    let mut identifiers = parent_identifiers.to_vec();
+    identifiers.extend(nas.identifiers.clone());
+    identifiers.push(NamedValue {
+        name: "parent_s1ap_event_id".into(),
+        value: parent_id.into(),
+        pseudonymized: false,
+    });
+    let protocol = if nas.epd == decoder_nas::EPD_EPS_SM {
+        Protocol::NasEpsSm
+    } else {
+        Protocol::NasEpsMm
+    };
+    let raw_reference = format!(
+        "{}#nas-offset={}",
+        input.raw_payload_reference, nas.source_offset
+    );
+    let mut event = NormalizedEvent {
+        event_id: String::new(),
+        parent_event_id: Some(parent_id.into()),
+        probe_id: "oiran-vprobe-01".into(),
+        capture_point_id: input.interface.into(),
+        capture_id: input.capture_id.into(),
+        packet_references: input.packet_references.to_vec(),
+        timestamp: input.timestamp.clone(),
+        interface: input.interface.into(),
+        protocol,
+        message_name: nas.message_name.clone(),
+        message_type: nas.message_type.unwrap_or(0) as u32,
+        procedure_code: nas.message_type.map(u32::from),
+        procedure: Some(nas.procedure.clone()),
+        security_state: Some(nas.security_state.as_str().into()),
+        source_byte_offset: u32::try_from(nas.source_offset).ok(),
+        source_endpoint: input.source_endpoint.clone(),
+        destination_endpoint: input.destination_endpoint.clone(),
+        direction: infer_eps_nas_direction(input, s1ap_procedure),
+        session_identifiers: identifiers,
+        information_elements: nas.information_elements.clone(),
+        decoder_name: "decoder-nas".into(),
+        decoder_version: decoder_nas::VERSION.into(),
+        schema_version: NormalizedEvent::SCHEMA_VERSION,
+        decoding_status: nas.status.clone(),
+        errors: nas.errors.clone(),
+        raw_payload_reference: raw_reference,
+        evidence_references: vec![
+            EvidenceReference {
+                state: EvidenceState::Exact,
+                kind: "parent-s1ap-event".into(),
+                reference: parent_id.into(),
+            },
+            EvidenceReference {
+                state: EvidenceState::Exact,
+                kind: "packet-provenance".into(),
+                reference: input.raw_payload_reference.into(),
+            },
+        ],
+        sbi: None,
+    };
+    event.assign_deterministic_id();
+    let nas_event_id = event.event_id.clone();
+    let nas_identifiers = event.session_identifiers.clone();
+    events.push(event);
+    for inner in &nas.inner {
+        append_eps_nas_events(
+            events,
+            inner,
+            &nas_event_id,
+            &nas_identifiers,
+            input,
+            s1ap_procedure,
+        );
+    }
+}
+
+fn infer_eps_nas_direction(input: &DecoderInput<'_>, procedure: u8) -> Direction {
+    let base = infer_direction(input, procedure);
+    if base != Direction::Unknown {
+        return base;
+    }
+    match procedure {
+        12 | 13 | 18 => Direction::RanToCore,
+        9 | 10 | 11 | 23 => Direction::CoreToRan,
+        _ => Direction::Unknown,
     }
 }
 
@@ -678,7 +806,10 @@ mod tests {
         let s_tmsi = &[0x11, 0x22, 0x33, 0x44, 0x55];
         // Synthetic EPS NAS Attach Request (TS 24.301): PD/SH + Attach Request
         // message type; contents are fully synthetic and never a real IMSI.
-        let eps_nas = &[0x07, 0x41, 0x02, 0x0b, 0xf6, 0x00];
+        // Inner APER length (6) followed by a synthetic plain EPS EMM Attach
+        // Request (TS 24.301): PD 0x07, MT 0x41, attach type/NAS-KSI, Mobile
+        // Identity LV with synthetic GUTI (type low-nibble = 6).
+        let eps_nas_pdu = &[0x06, 0x07, 0x41, 0x02, 0x01, 0xf6, 0x00];
         let enb_ue = &[0x00, 0x2a];
         let tai = &[0x00, 0xf1, 0x10, 0x00, 0x01];
         let eutran_cgi = &[0x00, 0xf1, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00];
@@ -688,7 +819,7 @@ mod tests {
             12,
             &[
                 (8, 0, enb_ue),
-                (26, 0, eps_nas),
+                (26, 0, eps_nas_pdu),
                 (67, 0, tai),
                 (100, 0, eutran_cgi),
                 (134, 1, rrc_cause),
@@ -698,7 +829,7 @@ mod tests {
         let (packets, timestamp) = fixtures();
         let input = synthetic_input(&bytes, &packets, &timestamp, "eNB", "MME");
         let out = S1apDecoder.decode(&input);
-        assert_eq!(out.events.len(), 1);
+        assert_eq!(out.events.len(), 2);
         let event = &out.events[0];
         assert_eq!(event.protocol, Protocol::S1ap);
         assert_eq!(event.message_name, "InitialUEMessage");
@@ -716,17 +847,20 @@ mod tests {
             .expect("s_tmsi identifier");
         assert!(s_tmsi_identifier.pseudonymized);
         assert!(s_tmsi_identifier.value.starts_with("psn-"));
-        let nas_ie = event
-            .information_elements
+        let nas_event = &out.events[1];
+        assert_eq!(nas_event.protocol, Protocol::NasEpsMm);
+        assert_eq!(nas_event.message_name, "Attach Request");
+        assert_eq!(
+            nas_event.parent_event_id.as_deref(),
+            Some(event.event_id.as_str())
+        );
+        let identity = nas_event
+            .session_identifiers
             .iter()
-            .find(|ie| ie.name == "NAS-PDU")
-            .expect("NAS-PDU IE");
-        assert_eq!(nas_ie.status, DecodeStatus::EncryptedOrProtected);
-        assert!(nas_ie
-            .value
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("nas_pdu_sha256="));
+            .find(|v| v.name == "ue_identity_pseudonym")
+            .expect("ue_identity_pseudonym");
+        assert!(identity.pseudonymized);
+        assert!(identity.value.starts_with("psn-"));
     }
 
     #[test]

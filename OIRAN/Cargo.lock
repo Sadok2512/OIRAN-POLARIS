@@ -190,6 +190,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "decoder-diameter"
+version = "0.1.0"
+dependencies = [
+ "event-schema",
+ "plugin-runtime",
+]
+
+[[package]]
 name = "decoder-gtpu"
 version = "0.1.0"
 dependencies = [
@@ -198,8 +206,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "decoder-nas"
+name = "decoder-gtpv2c"
 version = "0.1.0"
+dependencies = [
+ "event-schema",
+ "plugin-runtime",
+]
+
+[[package]]
+name = "decoder-nas"
+version = "0.2.0"
 dependencies = [
  "event-schema",
 ]
@@ -223,8 +239,9 @@ dependencies = [
 
 [[package]]
 name = "decoder-s1ap"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "decoder-nas",
  "event-schema",
  "plugin-runtime",
 ]
