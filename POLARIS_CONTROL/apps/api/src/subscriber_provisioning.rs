@@ -280,14 +280,20 @@ impl MongoSubscriberBackend {
             sd: slice["sd"].as_str().map(str::to_string),
             dnns,
             ambr: SubscriberAmbr {
-                uplink: value
-                    .pointer("/ambr/uplink/value")
-                    .and_then(json_u64)
-                    .ok_or("OPEN5GS_SUBSCRIBER_INVALID")?,
-                downlink: value
-                    .pointer("/ambr/downlink/value")
-                    .and_then(json_u64)
-                    .ok_or("OPEN5GS_SUBSCRIBER_INVALID")?,
+                uplink: decode_ambr_value_unit(
+                    value
+                        .pointer("/ambr/uplink/value")
+                        .and_then(json_u64)
+                        .ok_or("OPEN5GS_SUBSCRIBER_INVALID")?,
+                    value.pointer("/ambr/uplink/unit").and_then(json_u64).unwrap_or(0),
+                ),
+                downlink: decode_ambr_value_unit(
+                    value
+                        .pointer("/ambr/downlink/value")
+                        .and_then(json_u64)
+                        .ok_or("OPEN5GS_SUBSCRIBER_INVALID")?,
+                    value.pointer("/ambr/downlink/unit").and_then(json_u64).unwrap_or(0),
+                ),
             },
         };
         validate_record(&record)?;
@@ -336,9 +342,19 @@ impl SubscriberBackend for MongoSubscriberBackend {
             return Ok(Vec::new());
         }
         self.backup()?;
+        // 0.17.9 (#39 continued) — the Open5GS 2.8.0 UDR rejects AMBR values
+        // stored as BSON `long`, even though `bson_iter_as_int64` would read
+        // them in isolation. The lab's healthy subscribers (WebUI-created)
+        // store `value` and `unit` as BSON int32. We now encode each bps
+        // magnitude into the `(value: i32, unit: i32)` pair that keeps the
+        // value a small positive int (1 Gbit/s → {value: 1, unit: 3},
+        // 500 Mbit/s → {value: 500, unit: 2}) and emit both fields through
+        // `NumberInt(...)`.
         let requested = rows.iter().map(|(row, input)| {
             let slot = slot_for(&input.imsi);
-            json!({"row":row,"imsi":input.imsi,"k":input.k,"opc":input.opc,"sst":input.sst,"sd":input.sd,"dnns":input.dnns,"ambr":input.ambr,"slot":slot})
+            let (dl_v, dl_u) = encode_ambr_bps_to_value_unit(input.ambr.downlink);
+            let (ul_v, ul_u) = encode_ambr_bps_to_value_unit(input.ambr.uplink);
+            json!({"row":row,"imsi":input.imsi,"k":input.k,"opc":input.opc,"sst":input.sst,"sd":input.sd,"dnns":input.dnns,"ambr_dl_value":dl_v,"ambr_dl_unit":dl_u,"ambr_ul_value":ul_v,"ambr_ul_unit":ul_u,"slot":slot})
         }).collect::<Vec<_>>();
         let payload =
             serde_json::to_string(&requested).map_err(|_| "SUBSCRIBER_REQUEST_INVALID")?;
@@ -352,9 +368,9 @@ const mmeRealm=template&&typeof template.mme_realm==="string"?template.mme_realm
 for (const x of requested) {{
   const existing=db.subscribers.findOne({{imsi:x.imsi}});
   if (existing) {{ results.push({{row:x.row,ok:false,error:existing.polaris&&existing.polaris.owned===true?"SUBSCRIBER_ALREADY_EXISTS":"SUBSCRIBER_NOT_POLARIS_OWNED"}}); continue; }}
-  const dl=NumberLong(String(x.ambr.downlink)); const ul=NumberLong(String(x.ambr.uplink));
-  const sessions=x.dnns.map(name=>({{name,type:NumberInt(3),qos:{{index:NumberInt(9),arp:{{priority_level:NumberInt(8),pre_emption_capability:NumberInt(1),pre_emption_vulnerability:NumberInt(2)}}}},ambr:{{downlink:{{value:dl,unit:NumberInt(0)}},uplink:{{value:ul,unit:NumberInt(0)}}}},pcc_rule:[],_id:new ObjectId()}}));
-  const doc={{schema_version:NumberInt(1),imsi:x.imsi,msisdn:[],imeisv:[],mme_host:[],mm_realm:[],mme_realm:mmeRealm,mme_timestamp:NumberLong(0),purge_flag:[],slice:[{{sst:NumberInt(x.sst),sd:x.sd,default_indicator:true,session:sessions,_id:new ObjectId()}}],security:{{k:x.k,op:null,opc:x.opc,amf:"8000"}},ambr:{{downlink:{{value:dl,unit:NumberInt(0)}},uplink:{{value:ul,unit:NumberInt(0)}}}},access_restriction_data:NumberInt(32),network_access_mode:NumberInt(0),subscriber_status:NumberInt(0),operator_determined_barring:NumberInt(0),subscribed_rau_tau_timer:NumberInt(12),polaris:{{owned:true,slot:x.slot,plmn_mcc:mcc,plmn_mnc:mnc}},__v:NumberInt(0)}};
+  const ambr={{downlink:{{value:NumberInt(x.ambr_dl_value),unit:NumberInt(x.ambr_dl_unit)}},uplink:{{value:NumberInt(x.ambr_ul_value),unit:NumberInt(x.ambr_ul_unit)}}}};
+  const sessions=x.dnns.map(name=>({{name,type:NumberInt(3),qos:{{index:NumberInt(9),arp:{{priority_level:NumberInt(8),pre_emption_capability:NumberInt(1),pre_emption_vulnerability:NumberInt(2)}}}},ambr:{{downlink:{{value:NumberInt(x.ambr_dl_value),unit:NumberInt(x.ambr_dl_unit)}},uplink:{{value:NumberInt(x.ambr_ul_value),unit:NumberInt(x.ambr_ul_unit)}}}},pcc_rule:[],_id:new ObjectId()}}));
+  const doc={{schema_version:NumberInt(1),imsi:x.imsi,msisdn:[],imeisv:[],mme_host:[],mm_realm:[],mme_realm:mmeRealm,mme_timestamp:NumberLong(0),purge_flag:[],slice:[{{sst:NumberInt(x.sst),sd:x.sd,default_indicator:true,session:sessions,_id:new ObjectId()}}],security:{{k:x.k,op:null,opc:x.opc,amf:"8000"}},ambr:ambr,access_restriction_data:NumberInt(32),network_access_mode:NumberInt(0),subscriber_status:NumberInt(0),operator_determined_barring:NumberInt(0),subscribed_rau_tau_timer:NumberInt(12),polaris:{{owned:true,slot:x.slot,plmn_mcc:mcc,plmn_mnc:mnc}},__v:NumberInt(0)}};
   try {{ db.subscribers.insertOne(doc); results.push({{row:x.row,ok:true,slot:x.slot}}); }} catch (_) {{ results.push({{row:x.row,ok:false,error:"SUBSCRIBER_WRITE_FAILED"}}); }}
 }}
 print(JSON.stringify(results));
@@ -442,10 +458,15 @@ impl MongoSubscriberBackend {
         let scalar_block = scalar_sets.join(" ");
 
         // AMBR + DNN carry typed sub-documents and need the fetch/merge path.
+        // 0.17.9 — the AMBR is encoded as a `{value: i32, unit: i32}` pair
+        // because the lab's Open5GS 2.8.0 UDR rejects BSON `long` even for
+        // the AMBR magnitude. See `encode_ambr_bps_to_value_unit` for the
+        // unit convention (0=bps, 1=Kbps, 2=Mbps, 3=Gbps, …).
         let ambr_js = if let Some(ambr) = &update.ambr {
+            let (dl_v, dl_u) = encode_ambr_bps_to_value_unit(ambr.downlink);
+            let (ul_v, ul_u) = encode_ambr_bps_to_value_unit(ambr.uplink);
             format!(
-                "{{dl: NumberLong(\"{}\"), ul: NumberLong(\"{}\")}}",
-                ambr.downlink, ambr.uplink
+                "{{dl: {{value: NumberInt({dl_v}), unit: NumberInt({dl_u})}}, ul: {{value: NumberInt({ul_v}), unit: NumberInt({ul_u})}}}}"
             )
         } else {
             "null".into()
@@ -469,29 +490,47 @@ if (!current) {{ print("null"); }} else {{
   const nextDnns = {dnns_js};
   const setFields = {{}};
   {scalar_block}
-  function parseLong(v) {{
-    if (v === null || v === undefined) return NumberLong("1000000000");
-    if (typeof v === "object" && v !== null && v.$numberLong !== undefined) {{ return NumberLong(v.$numberLong); }}
-    try {{ return NumberLong(String(v)); }} catch (_) {{ return NumberLong("1000000000"); }}
+  function parseExistingAmbrLeg(leg) {{
+    // 0.17.9 — tolerate any shape previously written by POLARIS 0.17.0+ or
+    // directly by Open5GS WebUI: value+unit as int32/long/double, or the
+    // pre-0.17.8 EJSON corruption subdoc. Any other shape falls back to
+    // value=1 unit=3 (1 Gbit/s) so the DNN rewrite still carries a valid AMBR.
+    if (!leg || typeof leg !== "object") return {{ value: NumberInt(1), unit: NumberInt(3) }};
+    function toInt(v, def) {{
+      if (v === null || v === undefined) return NumberInt(def);
+      if (typeof v === "number") return NumberInt(Math.trunc(v));
+      if (typeof v === "object") {{
+        if (v.$numberLong !== undefined) {{ try {{ return NumberInt(parseInt(v.$numberLong, 10)); }} catch (_) {{ return NumberInt(def); }} }}
+        if (v._bsontype === "Long" || v._bsontype === "Int32" || v._bsontype === "Double") {{
+          try {{ return NumberInt(parseInt(String(v), 10)); }} catch (_) {{ return NumberInt(def); }}
+        }}
+      }}
+      try {{ return NumberInt(parseInt(String(v), 10)); }} catch (_) {{ return NumberInt(def); }}
+    }}
+    return {{ value: toInt(leg.value, 1), unit: toInt(leg.unit, 3) }};
   }}
   function sessionAmbrOf(a) {{
+    // `a` is `nextAmbr` carrying dl.value / dl.unit / ul.value / ul.unit,
+    // each already a BSON NumberInt produced on the Rust side. We pass
+    // them straight into the mongosh literal so the write keeps the BSON
+    // int32 type end-to-end.
     return {{
-      downlink: {{ value: a.dl, unit: NumberInt(0) }},
-      uplink:   {{ value: a.ul, unit: NumberInt(0) }}
+      downlink: {{ value: a.dl.value, unit: a.dl.unit }},
+      uplink:   {{ value: a.ul.value, unit: a.ul.unit }}
     }};
   }}
   if (nextAmbr !== null) {{
-    setFields["ambr.uplink.value"]   = nextAmbr.ul;
-    setFields["ambr.uplink.unit"]    = NumberInt(0);
-    setFields["ambr.downlink.value"] = nextAmbr.dl;
-    setFields["ambr.downlink.unit"]  = NumberInt(0);
+    setFields["ambr.uplink.value"]   = nextAmbr.ul.value;
+    setFields["ambr.uplink.unit"]    = nextAmbr.ul.unit;
+    setFields["ambr.downlink.value"] = nextAmbr.dl.value;
+    setFields["ambr.downlink.unit"]  = nextAmbr.dl.unit;
   }}
   const existingSessions = (current.slice && current.slice[0] && Array.isArray(current.slice[0].session))
     ? current.slice[0].session : [];
   if (nextDnns !== null) {{
     const fallbackAmbr = {{
-      dl: parseLong(current.ambr && current.ambr.downlink && current.ambr.downlink.value),
-      ul: parseLong(current.ambr && current.ambr.uplink   && current.ambr.uplink.value)
+      dl: parseExistingAmbrLeg(current.ambr && current.ambr.downlink),
+      ul: parseExistingAmbrLeg(current.ambr && current.ambr.uplink)
     }};
     const effectiveAmbr = nextAmbr !== null ? nextAmbr : fallbackAmbr;
     setFields["slice.0.session"] = nextDnns.map((name, i) => ({{
@@ -715,6 +754,58 @@ fn validate_plmn(mcc: &str, mnc: &str) -> Result<(), String> {
         Err("PLMN_INVALID".into())
     }
 }
+/// Encode a bits-per-second AMBR into the Open5GS `{value, unit}` pair where
+/// `value` is a positive BSON `int32` and `unit` is a 3GPP/Open5GS unit
+/// selector (`0=bps, 1=Kbps, 2=Mbps, 3=Gbps, 4=Tbps, 5=Pbps`). 0.17.9
+/// requires both fields to fit in BSON `int32` because the lab's Open5GS
+/// 2.8.0 UDR rejects long-typed AMBR with `No UE-AMBR` even though
+/// `bson_iter_as_int64` would read it in isolation. The encoder picks the
+/// largest unit for which the quotient is a positive integer that fits in
+/// `i32`, so 1 Gbit/s → `(1, 3)` and 500 Mbit/s → `(500, 2)` as the
+/// operator requested.
+pub fn encode_ambr_bps_to_value_unit(bps: u64) -> (i32, i32) {
+    const SCALES: [(i32, u64); 6] = [
+        (5, 1_000_000_000_000_000),
+        (4, 1_000_000_000_000),
+        (3, 1_000_000_000),
+        (2, 1_000_000),
+        (1, 1_000),
+        (0, 1),
+    ];
+    for (unit, scale) in SCALES {
+        if bps >= scale && bps % scale == 0 {
+            let candidate = bps / scale;
+            if candidate <= i32::MAX as u64 {
+                return (candidate as i32, unit);
+            }
+        }
+    }
+    // `validate_mutation` already rejects `ambr == 0`, so the only way we
+    // can arrive here is a non-zero `bps` whose smallest-scale (unit=0)
+    // quotient still overflows `i32`. Clamp to `i32::MAX` with unit=0 so a
+    // write never emits a negative or oversized BSON int, and let the
+    // operator see the saturation on the next read-back.
+    (i32::MAX, 0)
+}
+
+/// Reverse of `encode_ambr_bps_to_value_unit`. Reads the `(value, unit)` pair
+/// from a stored AMBR leg (any BSON numeric type reaching `json_u64` as a
+/// `u64`) and returns the bits-per-second magnitude. Tolerates `unit`
+/// defaulting to `0` for records written before 0.17.9 (where `value` was
+/// already in bps).
+pub fn decode_ambr_value_unit(value: u64, unit: u64) -> u64 {
+    let scale: u64 = match unit {
+        0 => 1,
+        1 => 1_000,
+        2 => 1_000_000,
+        3 => 1_000_000_000,
+        4 => 1_000_000_000_000,
+        5 => 1_000_000_000_000_000,
+        _ => 1,
+    };
+    value.saturating_mul(scale)
+}
+
 fn json_u64(value: &Value) -> Option<u64> {
     value
         .as_u64()
@@ -1103,6 +1194,54 @@ mod tests {
         }
     }
 
+    /// 0.17.9 — the lab's healthy Open5GS WebUI 2.8.0 subscribers store
+    /// `ambr.value` and `ambr.unit` as BSON int32. The encoder picks the
+    /// largest unit that keeps `value` a small positive int so neither leg
+    /// ever overflows int32 nor rounds the magnitude.
+    #[test]
+    fn encode_ambr_picks_largest_unit_with_integer_quotient() {
+        // Operator-specified reference points.
+        assert_eq!(encode_ambr_bps_to_value_unit(1_000_000_000), (1, 3));
+        assert_eq!(encode_ambr_bps_to_value_unit(500_000_000), (500, 2));
+        // Standard POLARIS defaults.
+        assert_eq!(encode_ambr_bps_to_value_unit(1_000_000), (1, 2));
+        assert_eq!(encode_ambr_bps_to_value_unit(2_000_000), (2, 2));
+        // Non-round-Gbit/s falls back to the next-smaller unit.
+        assert_eq!(encode_ambr_bps_to_value_unit(1_500_000_000), (1_500, 2));
+        // Sub-megabit values.
+        assert_eq!(encode_ambr_bps_to_value_unit(1_000), (1, 1));
+        assert_eq!(encode_ambr_bps_to_value_unit(1_234), (1_234, 0));
+        // Overflow guard: a value too big to fit int32 at any scale clamps
+        // to i32::MAX with unit=0 — `validate_mutation` rejects the input
+        // anyway, but we must never emit a negative BSON int.
+        assert_eq!(
+            encode_ambr_bps_to_value_unit(u64::MAX).0,
+            i32::MAX
+        );
+    }
+
+    #[test]
+    fn encode_decode_ambr_roundtrip_preserves_magnitude() {
+        for bps in [
+            1_000_u64,
+            2_000,
+            1_000_000,
+            500_000_000,
+            1_000_000_000,
+            1_500_000_000,
+            4_000_000_000,
+        ] {
+            let (value, unit) = encode_ambr_bps_to_value_unit(bps);
+            assert!(value > 0, "encoded value for {bps} must be positive");
+            assert!(unit >= 0 && unit <= 5, "unit for {bps} must be 0..=5");
+            assert_eq!(
+                decode_ambr_value_unit(value as u64, unit as u64),
+                bps,
+                "round-trip failed for {bps}: ({value}, {unit})"
+            );
+        }
+    }
+
     #[test]
     fn mongo_long_json_forms_decode_without_precision_loss() {
         assert_eq!(json_u64(&json!(42)), Some(42));
@@ -1151,19 +1290,30 @@ mod tests {
             !script.contains("$numberLong\":\""),
             "apply_update_script re-emits EJSON literals for AMBR: {script}"
         );
-        // The typed mongosh constructor calls MUST appear for both AMBR legs.
+        // 0.17.9 — AMBR is encoded as (value: int32, unit: int32).
+        // 500 Mbit/s → (500, 2); 1.5 Gbit/s is not an exact Gbps multiple,
+        // so it falls back to Mbps scale: (1500, 2).
         assert!(
-            script.contains("NumberLong(\"500000000\")"),
-            "uplink AMBR missing NumberLong constructor: {script}"
+            script.contains("NumberInt(500)"),
+            "uplink AMBR value missing NumberInt(500): {script}"
         );
         assert!(
-            script.contains("NumberLong(\"1500000000\")"),
-            "downlink AMBR missing NumberLong constructor: {script}"
+            script.contains("NumberInt(1500)"),
+            "downlink AMBR value missing NumberInt(1500): {script}"
         );
-        // AMBR unit must be a BSON int32.
         assert!(
-            script.contains("NumberInt(0)"),
-            "ambr.unit missing NumberInt(0): {script}"
+            script.contains("NumberInt(2)"),
+            "AMBR unit missing NumberInt(2) (Mbps): {script}"
+        );
+        // The pre-0.17.9 `NumberLong(...)` AMBR form must be gone — the
+        // lab's Open5GS 2.8.0 UDR rejected it with `No UE-AMBR`.
+        assert!(
+            !script.contains("NumberLong(\"500000000\")"),
+            "0.17.9 regression: AMBR value still written as NumberLong: {script}"
+        );
+        assert!(
+            !script.contains("NumberLong(\"1500000000\")"),
+            "0.17.9 regression: AMBR value still written as NumberLong: {script}"
         );
         // Session rebuild (DNN change) must carry typed qos.index + arp fields,
         // not strip them (the old `$set` duplicate-key form silently did).
@@ -1331,21 +1481,25 @@ print(JSON.stringify({{ sessions: sessions, top: top, shape: shape }}));
             .expect("mongosh $type probe");
         eprintln!("BSON_TYPES={probe_value}");
 
-        // 1. Top-level AMBR: $type must be int or long for value+unit,
-        //    numeric round-trip must match the PUT.
+        // 0.17.9: $type MUST be BSON int everywhere. The lab's Open5GS 2.8.0
+        // UDR rejected the 0.17.8 BSON-long form with `No UE-AMBR` even
+        // though `bson_iter_as_int64` would read it in isolation. The
+        // encoded pair for the PUT above:
+        //   downlink 1.5 Gbit/s → (1500, 2)  // 1500 Mbit/s
+        //   uplink   500 Mbit/s → (500,  2)  // 500 Mbit/s
         let top = &probe_value["top"];
         for key in ["dl_value_type", "ul_value_type", "dl_unit_type", "ul_unit_type"] {
             let actual = top
                 .get(key)
                 .and_then(Value::as_str)
                 .unwrap_or_else(|| panic!("top probe missing {key}: {probe_value}"));
-            assert!(
-                matches!(actual, "int" | "long"),
-                "top.{key} must be BSON int/long (Open5GS UDR requirement); was {actual}: {probe_value}"
+            assert_eq!(
+                actual, "int",
+                "top.{key} must be BSON int (Open5GS 2.8.0 UDR requirement); was {actual}: {probe_value}"
             );
         }
-        assert_eq!(json_u64(&top["dl_value"]), Some(1_500_000_000));
-        assert_eq!(json_u64(&top["ul_value"]), Some(500_000_000));
+        assert_eq!(json_u64(&top["dl_value"]), Some(1_500));
+        assert_eq!(json_u64(&top["ul_value"]), Some(500));
 
         // 2. EVERY session row (post-$unwind) must have int/long typed AMBR
         //    value/unit plus int qos.index + qos.arp.priority_level, and must
@@ -1373,20 +1527,21 @@ print(JSON.stringify({{ sessions: sessions, top: top, shape: shape }}));
                     .get(key)
                     .and_then(Value::as_str)
                     .unwrap_or_else(|| panic!("session[{idx}] missing {key}: {probe_value}"));
-                assert!(
-                    matches!(actual, "int" | "long"),
-                    "session[{idx}].{key} must be BSON int/long; was {actual}: {probe_value}"
+                assert_eq!(
+                    actual, "int",
+                    "session[{idx}].{key} must be BSON int (0.17.9 contract); was {actual}: {probe_value}"
                 );
             }
+            // 1.5 Gbit/s → (1500, 2) ; 500 Mbit/s → (500, 2) after 0.17.9 encoding.
             assert_eq!(
                 json_u64(&row["dl_value"]),
-                Some(1_500_000_000),
-                "session[{idx}].ambr.downlink.value must round-trip: {probe_value}"
+                Some(1_500),
+                "session[{idx}].ambr.downlink.value must round-trip to encoded int: {probe_value}"
             );
             assert_eq!(
                 json_u64(&row["ul_value"]),
-                Some(500_000_000),
-                "session[{idx}].ambr.uplink.value must round-trip: {probe_value}"
+                Some(500),
+                "session[{idx}].ambr.uplink.value must round-trip to encoded int: {probe_value}"
             );
             names.push(
                 row["name"]

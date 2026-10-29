@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.17.9 (polaris-control-api) — AMBR BSON int (0.17.8 rolled back in lab)
+
+- **#39 (continued), live labo rejection**: Codex deployed 0.17.8 (BSON
+  `long` for AMBR `value`) and observed `UDR: No UE-AMBR`, AMF `GET am-data`
+  returning HTTP 400, UE refused with `FIVEG_SERVICES_NOT_ALLOWED`. The
+  lab's healthy WebUI-created subscribers store both `ambr.value` and
+  `ambr.unit` as BSON `int32`; the Open5GS 2.8.0 UDR path running there
+  does not accept a `long` encoding for the AMBR magnitude, even though
+  `bson_iter_as_int64` would read it in isolation. 0.17.8 was rolled back
+  to 0.17.7 in production.
+- Fix: AMBR is now written as `(value: int32, unit: int32)` with the
+  largest unit for which the quotient is a positive int32. The 3GPP /
+  Open5GS unit convention is used (0=bps, 1=Kbps, 2=Mbps, 3=Gbps,
+  4=Tbps, 5=Pbps). Reference points matching the operator spec:
+  - 1 Gbit/s → `{value: 1,    unit: 3}`
+  - 500 Mbit/s → `{value: 500,  unit: 2}`
+  - 1 Mbit/s → `{value: 1,    unit: 2}`
+  - 1.5 Gbit/s → `{value: 1500, unit: 2}` (not an exact Gbps multiple).
+  The encoding/decoding lives in `encode_ambr_bps_to_value_unit` /
+  `decode_ambr_value_unit`; both are covered by round-trip unit tests.
+- `MongoSubscriberBackend::provision_batch` and
+  `apply_update_script` both emit the AMBR as `NumberInt(value)` /
+  `NumberInt(unit)` at every schema path (`ambr.{uplink,downlink}.*` and
+  `slice.0.session.*.ambr.{uplink,downlink}.*`). The 0.17.8 `NumberLong`
+  form is explicitly asserted absent by the regression test.
+- `decode_record` now reads the stored `(value, unit)` pair and
+  rematerialises the bps magnitude for the sanitised response, so the
+  `GET /subscribers/:slot` AMBR field continues to report the full bits-
+  per-second number the operator typed in.
+- `apply_update_script` adds a defensive `parseExistingAmbrLeg` helper
+  for the DNN-rewrite path: if the current record was previously written
+  by POLARIS 0.17.0..0.17.8 (EJSON sub-doc or BSON long) we still extract
+  a usable value, cast to BSON int32, and rewrite the sessions correctly.
+- Tests:
+  - Unit: `encode_ambr_picks_largest_unit_with_integer_quotient` locks
+    the operator's four reference points plus overflow guard;
+    `encode_decode_ambr_roundtrip_preserves_magnitude` round-trips 7
+    representative bps values.
+  - Static regression: `apply_update_script_never_emits_ejson_literals_for_ambr`
+    asserts the emitted mongosh script contains `NumberInt(500)`,
+    `NumberInt(1500)`, `NumberInt(2)` and does NOT contain the 0.17.8
+    `NumberLong("...")` form.
+  - Live-MongoDB: `ambr_put_writes_real_bson_long_in_live_mongo` (same
+    name kept for continuity) now asserts `$type == "int"` strictly for
+    every AMBR `value` and `unit` field (top-level and both sessions),
+    plus `qos.index` + `qos.arp.priority_level`. Round-trip proof on
+    live Mongo:
+    `BSON_TYPES={"sessions":[{"dl_unit_type":"int","dl_value":1500,"dl_value_type":"int",...}]`.
+    Reproduce: `POLARIS_TEST_MONGODB_CONTAINER=<container>
+    cargo test -p polaris-control-api --lib
+    subscriber_provisioning::tests::ambr_put_writes_real_bson_long_in_live_mongo
+    -- --nocapture`.
+  - Full suite: `cargo test -p polaris-control-api --lib` → **129 passed,
+    0 failed, 3 ignored** (up from 127 on 0.17.8; +2 encoding unit tests).
+
 ## 0.17.8 (polaris-control-api) — critical AMBR BSON corruption patch
 
 - **#39 critical, data corruption**: `PUT /subscribers/:slot` (regressed in
