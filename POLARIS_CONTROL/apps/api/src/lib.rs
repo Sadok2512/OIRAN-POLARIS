@@ -42,9 +42,10 @@ use std::{
 #[cfg(test)]
 use subscriber_provisioning::MemorySubscriberBackend;
 use subscriber_provisioning::{
+    allocate_next_imsis, generate_authentication_key,
     normalize_imsi, validate_mutation as validate_subscriber_mutation, MongoSubscriberBackend,
-    ProvisionResult, SubscriberBackend, SubscriberMutation, SubscriberRecord, MAX_BULK_ROWS,
-    WRITE_BATCH_ROWS,
+    ProvisionResult, SubscriberBackend, SubscriberMutation, SubscriberRecord, SubscriberUpdate,
+    GENERATE_MAX_COUNT, MAX_BULK_ROWS, WRITE_BATCH_ROWS,
 };
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -59,7 +60,7 @@ use ueransim_adapter::{
 
 pub use ue_profiles::UeProfileRegistry;
 
-pub const VERSION: &str = "0.16.4";
+pub const VERSION: &str = "0.17.0";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -3538,6 +3539,281 @@ async fn bulk_create_subscribers(
     )
 }
 
+/// GET /subscribers/:slot — return the sanitized subscriber plus every UE
+/// profile currently bound to that provisioning slot. Identity and
+/// authentication material remain PROTECTED (never surfaced in the body).
+async fn get_subscriber(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slot): AxumPath<String>,
+) -> impl IntoResponse {
+    let backend = state.subscriber_backend.clone();
+    let fetch_slot = slot.clone();
+    let fetched =
+        tokio::task::spawn_blocking(move || backend.fetch_slot(&fetch_slot)).await;
+    let sanitized = match fetched {
+        Ok(Ok(Some(record))) => record,
+        Ok(Ok(None)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"SUBSCRIBER_NOT_FOUND"})),
+            )
+        }
+        Ok(Err(error)) => return subscriber_error(error),
+        Err(_) => return subscriber_error("OPEN5GS_DATABASE_UNAVAILABLE".into()),
+    };
+    // Resolve the UE profiles currently bound to this slot via the
+    // provisioning-slots mapping (plan file + registry). Each entry carries
+    // only the opaque UE id — identity material never surfaces here.
+    let linked_profile_ue_ids: Vec<String> = {
+        let registry = state.profile_registry.lock().unwrap();
+        state
+            .profile_store
+            .provisioning_slots(&registry)
+            .ok()
+            .map(|slots| {
+                slots
+                    .into_iter()
+                    .filter(|binding| binding.slot_id == slot)
+                    .filter_map(|binding| binding.bound_ue_id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "subscriber": sanitized,
+            "linked_profile_ue_ids": linked_profile_ue_ids,
+            "linked_profile_count": linked_profile_ue_ids.len(),
+            "secrets_exposed": false,
+        })),
+    )
+}
+
+/// PUT /subscribers/:slot — apply a partial update to the slice (SST/SD),
+/// DNNs, AMBR and/or authentication material (K/OPc). `k` and `opc` are
+/// write-only: the response never carries them back. Operator-gated.
+async fn update_subscriber(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(slot): AxumPath<String>,
+    Json(update): Json<SubscriberUpdate>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    if let Err(error) = validate_subscriber_update(&update, &state.served_network) {
+        return subscriber_error(error);
+    }
+    let backend = state.subscriber_backend.clone();
+    let slot_for_update = slot.clone();
+    let update_for_backend = update.clone();
+    let result =
+        tokio::task::spawn_blocking(move || backend.apply_update(&slot_for_update, update_for_backend))
+            .await;
+    match result {
+        Ok(Ok(sanitized)) => {
+            audit(
+                &state,
+                &identity.role,
+                "UPDATE_SUBSCRIBER",
+                "UPDATED",
+                Some(slot.as_str()),
+            );
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "subscriber": sanitized,
+                    "open5gs_changed": true,
+                    "secrets_exposed": false,
+                })),
+            )
+        }
+        Ok(Err(error)) => subscriber_error(error),
+        Err(_) => subscriber_error("OPEN5GS_DATABASE_UNAVAILABLE".into()),
+    }
+}
+
+/// POST /subscribers/generate — allocate `count` fresh IMSIs in 001/01 and
+/// provision them with CSPRNG-generated K/OPc. Neither K nor OPc appear in
+/// the response body — only the opaque slot identifier does.
+#[derive(serde::Deserialize)]
+struct GenerateSubscribersRequest {
+    pub count: usize,
+    #[serde(default)]
+    pub sst: Option<u8>,
+    #[serde(default)]
+    pub sd: Option<String>,
+    #[serde(default)]
+    pub dnns: Option<Vec<String>>,
+    #[serde(default)]
+    pub ambr: Option<subscriber_provisioning::SubscriberAmbr>,
+}
+
+async fn generate_subscribers(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Json(request): Json<GenerateSubscribersRequest>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    if request.count == 0 || request.count > GENERATE_MAX_COUNT {
+        return subscriber_error("SUBSCRIBER_GENERATE_COUNT_INVALID".into());
+    }
+    let backend = state.subscriber_backend.clone();
+    let taken = match tokio::task::spawn_blocking(move || backend.taken_imsis()).await {
+        Ok(Ok(taken)) => taken,
+        Ok(Err(error)) => return subscriber_error(error),
+        Err(_) => return subscriber_error("OPEN5GS_DATABASE_UNAVAILABLE".into()),
+    };
+    let imsis = match allocate_next_imsis(&taken, request.count) {
+        Ok(imsis) => imsis,
+        Err(error) => return subscriber_error(error),
+    };
+    let sst = request.sst.unwrap_or(1);
+    let sd = request.sd.clone();
+    let dnns = request
+        .dnns
+        .clone()
+        .unwrap_or_else(|| vec!["internet".into()]);
+    let ambr = request
+        .ambr
+        .clone()
+        .unwrap_or(subscriber_provisioning::SubscriberAmbr {
+            uplink: 1_000_000,
+            downlink: 1_000_000,
+        });
+    let mut rows = Vec::with_capacity(imsis.len());
+    for (offset, imsi) in imsis.into_iter().enumerate() {
+        let k = match generate_authentication_key() {
+            Ok(k) => k,
+            Err(error) => return subscriber_error(error),
+        };
+        let opc = match generate_authentication_key() {
+            Ok(opc) => opc,
+            Err(error) => return subscriber_error(error),
+        };
+        let mutation = SubscriberMutation {
+            imsi,
+            k,
+            opc,
+            sst,
+            sd: sd.clone(),
+            dnns: dnns.clone(),
+            ambr: ambr.clone(),
+        };
+        if let Err(error) = validate_subscriber_mutation(&mutation)
+            .and_then(|_| state.served_network.validate_mutation(&mutation))
+        {
+            return subscriber_error(error);
+        }
+        rows.push((offset + 1, mutation));
+    }
+    let backend = state.subscriber_backend.clone();
+    let results = tokio::task::spawn_blocking(move || backend.provision_batch(rows)).await;
+    match results {
+        Ok(Ok(rows)) => {
+            let ok = rows.iter().filter(|row| row.ok).count();
+            let failed = rows.len().saturating_sub(ok);
+            audit(
+                &state,
+                &identity.role,
+                "GENERATE_SUBSCRIBERS",
+                if failed == 0 { "CREATED" } else { "PARTIAL" },
+                None,
+            );
+            let slots: Vec<Value> = rows
+                .iter()
+                .filter(|row| row.ok)
+                .filter_map(|row| row.slot.clone())
+                .map(|slot| {
+                    json!({
+                        "slot": slot,
+                        "state": "PROVISIONED",
+                        "subscriber_identity": "PROTECTED",
+                        "authentication_material": "PROTECTED",
+                    })
+                })
+                .collect();
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "ok": ok,
+                    "errors": failed,
+                    "slots": slots,
+                    "results": rows,
+                    "secrets_exposed": false,
+                })),
+            )
+        }
+        Ok(Err(error)) => subscriber_error(error),
+        Err(_) => subscriber_error("OPEN5GS_DATABASE_UNAVAILABLE".into()),
+    }
+}
+
+fn validate_subscriber_update(
+    update: &SubscriberUpdate,
+    policy: &ServedNetworkPolicy,
+) -> Result<(), String> {
+    if let Some(sst) = update.sst {
+        if sst == 0 {
+            return Err("SNSSAI_INVALID".into());
+        }
+    }
+    if let Some(Some(sd)) = &update.sd {
+        if sd.len() != 6 || !sd.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("SNSSAI_INVALID".into());
+        }
+    }
+    if let Some(dnns) = &update.dnns {
+        let distinct: BTreeSet<_> = dnns.iter().cloned().collect();
+        if dnns.is_empty()
+            || distinct.len() != dnns.len()
+            || dnns
+                .iter()
+                .any(|dnn| !matches!(dnn.as_str(), "internet" | "ims"))
+        {
+            return Err("DNN_INVALID".into());
+        }
+    }
+    if let Some(ambr) = &update.ambr {
+        if ambr.uplink == 0 || ambr.downlink == 0 {
+            return Err("AMBR_INVALID".into());
+        }
+    }
+    for key in [&update.k, &update.opc].iter().copied().flatten() {
+        if key.len() != 32 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("AUTHENTICATION_MATERIAL_INVALID".into());
+        }
+    }
+    // Served-network policy keeps authority over slice/DNN values. The policy
+    // currently exposes `validate_mutation`; we synthesize a minimal
+    // SubscriberMutation to run the same gate.
+    if update.sst.is_some() || update.dnns.is_some() || update.sd.is_some() {
+        let probe = SubscriberMutation {
+            imsi: "001010000000000".into(),
+            k: "0".repeat(32),
+            opc: "0".repeat(32),
+            sst: update.sst.unwrap_or(1),
+            sd: update
+                .sd
+                .clone()
+                .unwrap_or(None),
+            dnns: update.dnns.clone().unwrap_or_else(|| vec!["internet".into()]),
+            ambr: update
+                .ambr
+                .clone()
+                .unwrap_or(subscriber_provisioning::SubscriberAmbr {
+                    uplink: 1,
+                    downlink: 1,
+                }),
+        };
+        policy.validate_mutation(&probe)?;
+    }
+    Ok(())
+}
+
 async fn list_owners(State(state): State<Arc<AppState>>) -> Json<Value> {
     let registry = state.profile_registry.lock().unwrap();
     let mut items = BTreeSet::new();
@@ -5252,14 +5528,54 @@ async fn scenario_steps(
                 .cloned()
         });
     match record {
-        Some(job) => (
-            StatusCode::OK,
-            Json(json!({
-                "job_id":job_id,
-                "scenario_definition_id":job["scenario_definition_id"],
-                "steps":job["steps"].as_array().cloned().unwrap_or_default()
-            })),
-        ),
+        Some(job) => {
+            let steps = job["steps"].as_array().cloned().unwrap_or_default();
+            let state_str = job["state"].as_str().unwrap_or("UNKNOWN").to_string();
+            let started_at = job["started_at"].as_u64();
+            let ended_at = job["ended_at"].as_u64();
+            let duration_ms = match (started_at, ended_at) {
+                (Some(start), Some(end)) if end >= start => Some((end - start) * 1000),
+                _ => None,
+            };
+            // 0.17.0 — surface a job-level failure summary so the Execution
+            // Monitor can show {step, code, failure_evidence, started_at,
+            // duration} without re-walking the full step array itself.
+            let failure = steps
+                .iter()
+                .find(|step| step.get("state").and_then(Value::as_str) == Some("FAILED"))
+                .map(|failed| {
+                    let step_started_at = failed.get("started_at").and_then(Value::as_u64);
+                    let step_ended_at = failed.get("ended_at").and_then(Value::as_u64);
+                    let step_duration_ms = match (step_started_at, step_ended_at) {
+                        (Some(start), Some(end)) if end >= start => Some((end - start) * 1000),
+                        _ => None,
+                    };
+                    json!({
+                        "step_id": failed.get("step_id"),
+                        "step_name": failed.get("step_name"),
+                        "code": failed.get("error"),
+                        "message": failed.get("error_message")
+                            .or_else(|| failed.get("error")),
+                        "failure_evidence": failed.get("failure_evidence"),
+                        "started_at": step_started_at,
+                        "ended_at": step_ended_at,
+                        "duration_ms": step_duration_ms,
+                    })
+                });
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "job_id": job_id,
+                    "scenario_definition_id": job["scenario_definition_id"],
+                    "state": state_str,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "duration_ms": duration_ms,
+                    "steps": steps,
+                    "failure": failure,
+                })),
+            )
+        }
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({"error":"SCENARIO_JOB_NOT_FOUND"})),
@@ -7727,6 +8043,14 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             "/subscribers/bulk",
             post(bulk_create_subscribers)
                 .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/subscribers/generate",
+            post(generate_subscribers),
+        )
+        .route(
+            "/subscribers/:slot",
+            get(get_subscriber).put(update_subscriber),
         )
         .route(
             "/ue-profiles",

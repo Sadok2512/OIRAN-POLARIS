@@ -1,3 +1,4 @@
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -12,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_BULK_ROWS: usize = 100_000;
 pub const WRITE_BATCH_ROWS: usize = 5_000;
+pub const GENERATE_MAX_COUNT: usize = 1_000;
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SubscriberAmbr {
@@ -78,6 +80,22 @@ pub struct ProvisionResult {
     pub error: Option<String>,
 }
 
+/// Write-only partial update for `PUT /subscribers/:slot`. Fields set to
+/// `Some` are overwritten; a `None` on `k`/`opc` preserves the stored
+/// authentication material (no accidental zeroing). All fields are serde
+/// `default`-ed so an operator may send a minimal body (for example only
+/// `{"ambr": {...}}`).
+#[derive(Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct SubscriberUpdate {
+    pub sst: Option<u8>,
+    pub sd: Option<Option<String>>,
+    pub dnns: Option<Vec<String>>,
+    pub ambr: Option<SubscriberAmbr>,
+    pub k: Option<String>,
+    pub opc: Option<String>,
+}
+
 pub trait SubscriberBackend: Send + Sync {
     fn list(&self) -> Result<Vec<SanitizedSubscriber>, String>;
     fn lookup_many(
@@ -88,6 +106,20 @@ pub trait SubscriberBackend: Send + Sync {
         &self,
         rows: Vec<(usize, SubscriberMutation)>,
     ) -> Result<Vec<ProvisionResult>, String>;
+    fn fetch_slot(&self, slot: &str) -> Result<Option<SanitizedSubscriber>, String>;
+    /// Apply a partial update to the subscriber identified by `slot`. The
+    /// backend performs the IMSI/K/OPc confidentiality by never returning
+    /// them in `SanitizedSubscriber`.
+    fn apply_update(
+        &self,
+        slot: &str,
+        update: SubscriberUpdate,
+    ) -> Result<SanitizedSubscriber, String>;
+    /// Returns the lexicographically sorted list of taken IMSIs. Used by
+    /// `allocate_next_imsis()` to pick the next free MSIN. The MongoDB
+    /// implementation issues a projection over `_id` only, so the IMSI
+    /// digits are the only identity bytes that leave Mongo for this flow.
+    fn taken_imsis(&self) -> Result<BTreeSet<String>, String>;
 }
 
 #[derive(Clone)]
@@ -330,6 +362,109 @@ print(JSON.stringify(results));
         let value = self.mongosh(script.as_bytes())?;
         serde_json::from_value(value).map_err(|_| "OPEN5GS_DATABASE_RESPONSE_INVALID".into())
     }
+
+    fn fetch_slot(&self, slot: &str) -> Result<Option<SanitizedSubscriber>, String> {
+        let slot_json = serde_json::to_string(slot).map_err(|_| "SUBSCRIBER_REQUEST_INVALID")?;
+        let script = format!(
+            "const r=db.subscribers.findOne({{\"polaris.slot\":{slot_json},\"polaris.owned\":true}});print(JSON.stringify(r))"
+        );
+        let value = self.mongosh(script.as_bytes())?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        self.decode_record(&value).map(|record| Some(sanitize(&record)))
+    }
+
+    fn apply_update(
+        &self,
+        slot: &str,
+        update: SubscriberUpdate,
+    ) -> Result<SanitizedSubscriber, String> {
+        self.backup()?;
+        let script = self.apply_update_script(slot, &update);
+        let value = self.mongosh(&script)?;
+        if value.is_null() {
+            return Err("SUBSCRIBER_NOT_FOUND".into());
+        }
+        self.decode_record(&value).map(|record| sanitize(&record))
+    }
+
+    fn taken_imsis(&self) -> Result<BTreeSet<String>, String> {
+        let value = self.mongosh(br#"print(JSON.stringify(db.subscribers.find({},{imsi:1,_id:0}).toArray()))"#)?;
+        let array = value
+            .as_array()
+            .ok_or("OPEN5GS_DATABASE_RESPONSE_INVALID")?;
+        let mut taken = BTreeSet::new();
+        for item in array {
+            if let Some(imsi) = item.get("imsi").and_then(Value::as_str) {
+                taken.insert(imsi.to_string());
+            }
+        }
+        Ok(taken)
+    }
+}
+
+impl MongoSubscriberBackend {
+    fn apply_update_script(&self, slot: &str, update: &SubscriberUpdate) -> Vec<u8> {
+        let slot_json = serde_json::to_string(slot).unwrap_or_else(|_| "\"\"".into());
+        let mut set = serde_json::Map::new();
+        if let Some(sst) = update.sst {
+            set.insert("slice.0.sst".into(), json!(sst));
+        }
+        if let Some(sd) = &update.sd {
+            match sd {
+                Some(value) => {
+                    set.insert("slice.0.sd".into(), json!(value));
+                }
+                None => {
+                    set.insert("slice.0.sd".into(), json!(null));
+                }
+            }
+        }
+        if let Some(ambr) = &update.ambr {
+            set.insert(
+                "ambr.uplink.value".into(),
+                json!({ "$numberLong": ambr.uplink.to_string() }),
+            );
+            set.insert(
+                "ambr.downlink.value".into(),
+                json!({ "$numberLong": ambr.downlink.to_string() }),
+            );
+            set.insert(
+                "slice.0.session.0.ambr.uplink.value".into(),
+                json!({ "$numberLong": ambr.uplink.to_string() }),
+            );
+            set.insert(
+                "slice.0.session.0.ambr.downlink.value".into(),
+                json!({ "$numberLong": ambr.downlink.to_string() }),
+            );
+        }
+        if let Some(k) = &update.k {
+            set.insert("security.k".into(), json!(k));
+        }
+        if let Some(opc) = &update.opc {
+            set.insert("security.opc".into(), json!(opc));
+        }
+        let set_json = serde_json::to_string(&set).unwrap_or_else(|_| "{}".into());
+        if let Some(dnns) = &update.dnns {
+            let sessions_json = serde_json::to_string(
+                &dnns
+                    .iter()
+                    .map(|name| json!({ "name": name }))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".into());
+            format!(
+                "db.subscribers.updateOne({{\"polaris.slot\":{slot_json},\"polaris.owned\":true}},{{$set:{set_json},\"$set\":{{\"slice.0.session\":{sessions_json}}}}});print(JSON.stringify(db.subscribers.findOne({{\"polaris.slot\":{slot_json},\"polaris.owned\":true}})))"
+            )
+            .into_bytes()
+        } else {
+            format!(
+                "db.subscribers.updateOne({{\"polaris.slot\":{slot_json},\"polaris.owned\":true}},{{$set:{set_json}}});print(JSON.stringify(db.subscribers.findOne({{\"polaris.slot\":{slot_json},\"polaris.owned\":true}})))"
+            )
+            .into_bytes()
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -396,6 +531,34 @@ impl SubscriberBackend for MemorySubscriberBackend {
                 }
             })
             .collect())
+    }
+    fn fetch_slot(&self, slot: &str) -> Result<Option<SanitizedSubscriber>, String> {
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .values()
+            .find(|record| record.slot == slot)
+            .map(sanitize))
+    }
+    fn apply_update(
+        &self,
+        slot: &str,
+        update: SubscriberUpdate,
+    ) -> Result<SanitizedSubscriber, String> {
+        *self.backups.lock().unwrap() += 1;
+        let mut records = self.records.lock().unwrap();
+        let imsi = records
+            .iter()
+            .find(|(_, record)| record.slot == slot)
+            .map(|(imsi, _)| imsi.clone())
+            .ok_or("SUBSCRIBER_NOT_FOUND")?;
+        let record = records.get_mut(&imsi).expect("record exists");
+        apply_update_in_place(record, update)?;
+        Ok(sanitize(record))
+    }
+    fn taken_imsis(&self) -> Result<BTreeSet<String>, String> {
+        Ok(self.records.lock().unwrap().keys().cloned().collect())
     }
 }
 
@@ -530,6 +693,74 @@ fn random_suffix() -> String {
     )[..12]
         .to_string()
 }
+/// Generate 16 cryptographically random bytes, hex-encoded (32 chars). Used
+/// for both K and OPc when `POST /subscribers/generate` is called or when a
+/// CSV row omits them. Returns `AUTHENTICATION_KEY_GENERATION_FAILED` if the
+/// OS CSPRNG is unavailable, so the operator does not get a zero-filled key.
+pub fn generate_authentication_key() -> Result<String, String> {
+    let mut buffer = [0u8; 16];
+    OsRng
+        .try_fill_bytes(&mut buffer)
+        .map_err(|_| "AUTHENTICATION_KEY_GENERATION_FAILED".to_string())?;
+    let mut out = String::with_capacity(32);
+    for byte in buffer {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    Ok(out)
+}
+
+/// Allocate `count` fresh IMSIs in the fixed MCC=001 / MNC=01 range by picking
+/// the lowest MSIN values that are not already taken. MSIN digits 000000000 to
+/// 999999999 → 10^9 possible IMSIs. Returns `SUBSCRIBER_IMSI_POOL_EXHAUSTED`
+/// if fewer than `count` free slots remain.
+pub fn allocate_next_imsis(taken: &BTreeSet<String>, count: usize) -> Result<Vec<String>, String> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if count > GENERATE_MAX_COUNT {
+        return Err("SUBSCRIBER_GENERATE_COUNT_INVALID".into());
+    }
+    const MAX_MSIN: u64 = 1_000_000_000; // 10 decimal digits
+    let mut candidates = Vec::with_capacity(count);
+    let mut msin = 0u64;
+    while candidates.len() < count {
+        if msin >= MAX_MSIN {
+            return Err("SUBSCRIBER_IMSI_POOL_EXHAUSTED".into());
+        }
+        let imsi = format!("00101{msin:010}");
+        if !taken.contains(&imsi) {
+            candidates.push(imsi);
+        }
+        msin += 1;
+    }
+    Ok(candidates)
+}
+
+fn apply_update_in_place(
+    record: &mut SubscriberRecord,
+    update: SubscriberUpdate,
+) -> Result<(), String> {
+    if let Some(sst) = update.sst {
+        record.sst = sst;
+    }
+    if let Some(sd) = update.sd {
+        record.sd = sd;
+    }
+    if let Some(dnns) = update.dnns {
+        record.dnns = dnns;
+    }
+    if let Some(ambr) = update.ambr {
+        record.ambr = ambr;
+    }
+    if let Some(k) = update.k {
+        record.k = k;
+    }
+    if let Some(opc) = update.opc {
+        record.opc = opc;
+    }
+    validate_record(record)
+}
+
 fn private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -623,6 +854,199 @@ mod tests {
         assert_eq!(store.backup_count(), 0);
         assert!(store.provision_batch(vec![(1, row)]).unwrap()[0].ok);
         assert_eq!(store.backup_count(), 1);
+    }
+
+    #[test]
+    fn generate_authentication_key_is_32_hex_chars_and_random() {
+        let a = generate_authentication_key().expect("csprng ok");
+        let b = generate_authentication_key().expect("csprng ok");
+        assert_eq!(a.len(), 32);
+        assert_eq!(b.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "CSPRNG must not return identical keys back to back");
+    }
+
+    #[test]
+    fn allocate_next_imsis_skips_taken_and_rejects_invalid_count() {
+        let mut taken = BTreeSet::new();
+        taken.insert("001010000000000".to_string());
+        taken.insert("001010000000002".to_string());
+        let next = allocate_next_imsis(&taken, 3).expect("ok");
+        assert_eq!(
+            next,
+            vec![
+                "001010000000001".to_string(),
+                "001010000000003".to_string(),
+                "001010000000004".to_string(),
+            ]
+        );
+        assert_eq!(allocate_next_imsis(&taken, 0).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            allocate_next_imsis(&taken, GENERATE_MAX_COUNT + 1)
+                .unwrap_err(),
+            "SUBSCRIBER_GENERATE_COUNT_INVALID"
+        );
+    }
+
+    #[test]
+    fn apply_update_updates_only_requested_fields_and_preserves_authentication_material() {
+        let store = MemorySubscriberBackend::default();
+        let mutation = SubscriberMutation {
+            imsi: "001010000000005".into(),
+            k: "aa".repeat(16),
+            opc: "bb".repeat(16),
+            sst: 1,
+            sd: Some("010203".into()),
+            dnns: vec!["internet".into()],
+            ambr: SubscriberAmbr {
+                uplink: 100,
+                downlink: 200,
+            },
+        };
+        let result = store
+            .provision_batch(vec![(1, mutation)])
+            .expect("provision");
+        assert!(result[0].ok);
+        let slot = result[0].slot.clone().unwrap();
+
+        // Update only the slice/DNN/AMBR; K and OPc are left untouched.
+        let update = SubscriberUpdate {
+            sst: Some(2),
+            sd: Some(Some("040506".into())),
+            dnns: Some(vec!["ims".into()]),
+            ambr: Some(SubscriberAmbr {
+                uplink: 500,
+                downlink: 600,
+            }),
+            k: None,
+            opc: None,
+        };
+        let sanitized = store.apply_update(&slot, update).expect("update");
+        assert_eq!(sanitized.slot, slot);
+        assert_eq!(sanitized.snssai.sst, 2);
+        assert_eq!(sanitized.snssai.sd.as_deref(), Some("040506"));
+        assert_eq!(sanitized.dnns, vec!["ims".to_string()]);
+        assert_eq!(sanitized.ambr.uplink, 500);
+        assert_eq!(sanitized.ambr.downlink, 600);
+        assert_eq!(sanitized.subscriber_identity, "PROTECTED");
+        assert_eq!(sanitized.authentication_material, "PROTECTED");
+
+        // Confidentiality: the JSON representation must never contain the IMSI
+        // or the stored K/OPc values.
+        let json = serde_json::to_string(&sanitized).unwrap();
+        assert!(!json.contains("001010000000005"));
+        assert!(!json.contains(&"aa".repeat(16)));
+        assert!(!json.contains(&"bb".repeat(16)));
+    }
+
+    #[test]
+    fn apply_update_can_rewrite_authentication_material() {
+        let store = MemorySubscriberBackend::default();
+        let mutation = SubscriberMutation {
+            imsi: "001010000000006".into(),
+            k: "11".repeat(16),
+            opc: "22".repeat(16),
+            sst: 1,
+            sd: None,
+            dnns: vec!["internet".into()],
+            ambr: SubscriberAmbr {
+                uplink: 1,
+                downlink: 1,
+            },
+        };
+        let slot = store
+            .provision_batch(vec![(1, mutation)])
+            .unwrap()
+            .remove(0)
+            .slot
+            .unwrap();
+        let update = SubscriberUpdate {
+            k: Some("ff".repeat(16)),
+            opc: Some("ee".repeat(16)),
+            ..SubscriberUpdate::default()
+        };
+        let sanitized = store.apply_update(&slot, update).expect("update");
+        assert_eq!(sanitized.authentication_material, "PROTECTED");
+        let lookup = store
+            .lookup_many(&["001010000000006".into()])
+            .expect("lookup");
+        let record = &lookup["001010000000006"];
+        assert_eq!(record.k, "ff".repeat(16));
+        assert_eq!(record.opc, "ee".repeat(16));
+    }
+
+    #[test]
+    fn apply_update_on_unknown_slot_fails_closed() {
+        let store = MemorySubscriberBackend::default();
+        match store.apply_update("SUB-missing", SubscriberUpdate::default()) {
+            Ok(_) => panic!("missing slot must not resolve"),
+            Err(error) => assert_eq!(error, "SUBSCRIBER_NOT_FOUND"),
+        }
+    }
+
+    #[test]
+    fn fetch_slot_returns_sanitized_record() {
+        let store = MemorySubscriberBackend::default();
+        let imsi = "001010000000007";
+        let slot = store
+            .provision_batch(vec![(
+                1,
+                SubscriberMutation {
+                    imsi: imsi.into(),
+                    k: "33".repeat(16),
+                    opc: "44".repeat(16),
+                    sst: 1,
+                    sd: Some("010203".into()),
+                    dnns: vec!["internet".into()],
+                    ambr: SubscriberAmbr {
+                        uplink: 1,
+                        downlink: 1,
+                    },
+                },
+            )])
+            .unwrap()
+            .remove(0)
+            .slot
+            .unwrap();
+        let fetched = store.fetch_slot(&slot).unwrap().expect("slot present");
+        assert_eq!(fetched.slot, slot);
+        assert_eq!(fetched.state, "PROVISIONED");
+        assert_eq!(fetched.subscriber_identity, "PROTECTED");
+        assert_eq!(fetched.authentication_material, "PROTECTED");
+        let json = serde_json::to_string(&fetched).unwrap();
+        assert!(!json.contains(imsi));
+        assert!(!json.contains(&"33".repeat(16)));
+        assert!(!json.contains(&"44".repeat(16)));
+        assert!(store.fetch_slot("SUB-missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn taken_imsis_includes_every_provisioned_record() {
+        let store = MemorySubscriberBackend::default();
+        for i in 0..5 {
+            store
+                .provision_batch(vec![(
+                    i,
+                    SubscriberMutation {
+                        imsi: format!("00101{:010}", 100 + i),
+                        k: "55".repeat(16),
+                        opc: "66".repeat(16),
+                        sst: 1,
+                        sd: None,
+                        dnns: vec!["internet".into()],
+                        ambr: SubscriberAmbr {
+                            uplink: 1,
+                            downlink: 1,
+                        },
+                    },
+                )])
+                .unwrap();
+        }
+        let taken = store.taken_imsis().unwrap();
+        assert_eq!(taken.len(), 5);
+        for i in 0..5 {
+            assert!(taken.contains(&format!("00101{:010}", 100 + i)));
+        }
     }
 
     #[test]

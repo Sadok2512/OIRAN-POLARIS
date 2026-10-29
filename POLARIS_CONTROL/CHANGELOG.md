@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.17.0 (polaris-control-api)
+
+- Added `GET /api/v1/subscribers/:slot` — returns the sanitized subscriber
+  record (slot, state, PLMN, SNSSAI, DNNs, AMBR) plus
+  `linked_profile_ue_ids[]` resolved via the plan file and the UE profile
+  registry. Identity and authentication material remain `PROTECTED` and
+  are never surfaced in the response. Read-only, no operator role needed.
+- Added `PUT /api/v1/subscribers/:slot` — operator-gated partial update
+  of slice (SST/SD), DNNs, AMBR and/or authentication material (K/OPc).
+  `k` / `opc` are strictly write-only: they are never present in the
+  response body. The served-network policy still gates the slice/DNN
+  values. Backend writes the Open5GS record and takes a mongodump backup
+  first via the existing `backup()` path.
+- Added `POST /api/v1/subscribers/generate` — operator-gated bulk
+  generator. Allocates `count` fresh IMSIs in the fixed `001/01` range
+  (lowest free MSIN) and provisions each with `K`/`OPc` material drawn
+  from the OS CSPRNG (`rand_core::OsRng` via `getrandom`). Response is
+  the array of `{slot, state:"PROVISIONED", subscriber_identity:"PROTECTED",
+  authentication_material:"PROTECTED"}` — `K` and `OPc` never leave the
+  server. `count` is bounded by `GENERATE_MAX_COUNT=1000`.
+- Enriched `GET /api/v1/scenarios/:job_id/steps` with job-level `state`,
+  `started_at`, `ended_at`, `duration_ms` and a `failure` object
+  summarizing the first FAILED step: `{step_id, step_name, code, message,
+  failure_evidence, started_at, ended_at, duration_ms}`. `failure_evidence`
+  is the bounded iperf3 payload delivered in 0.16.3 and is passed through
+  unchanged. No change to the per-step records.
+- `subscriber_provisioning.rs` grew the new `SubscriberUpdate` type, three
+  new `SubscriberBackend` trait methods (`fetch_slot`, `apply_update`,
+  `taken_imsis`), a `generate_authentication_key()` CSPRNG helper and an
+  `allocate_next_imsis()` next-free MSIN allocator. All new logic lives
+  in that module — `lib.rs` only grew by the three HTTP handlers and the
+  update-side validator.
+- Tests: added seven new unit tests in `subscriber_provisioning::tests`
+  covering CSPRNG uniqueness, next-free IMSI allocation (including the
+  `SUBSCRIBER_GENERATE_COUNT_INVALID` bound), partial update behaviour,
+  authentication-material rewrite, missing-slot fail-closed, sanitized
+  fetch and the `taken_imsis` projection. Every sanitize-oriented test
+  explicitly asserts the serialized JSON does **not** contain the raw
+  IMSI, K or OPc.
+- Does not touch `POLARIS_IPERF3_PATH`, `failure_evidence` (0.16.3) nor
+  the pinned `release/iperf3-3.21/*` runtime (2e89c71).
+
 ## 0.16.4 (polaris-control-api)
 
 - Port the 0.15.5 portable test harness and `lab_nf_tests` module on top of
