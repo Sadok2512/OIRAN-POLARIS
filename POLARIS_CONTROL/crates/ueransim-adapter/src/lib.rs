@@ -245,7 +245,16 @@ pub fn live_launch_spec(
     {
         return Err("LIVE_RUNTIME_INPUT_NOT_ALLOWLISTED".into());
     }
-    let expected_basename = format!("ue-{}.yaml", &profile.ue_id[3..]);
+    let index = profile
+        .ue_id
+        .strip_prefix("UE-")
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or("UE_PROFILE_ASSOCIATION_MISMATCH")?;
+    let expected_basename = if index <= 99 {
+        format!("ue-{index:02}.yaml")
+    } else {
+        format!("ue-{index:05}.yaml")
+    };
     if profile.profile_name != expected_basename {
         return Err("UE_PROFILE_ASSOCIATION_MISMATCH".into());
     }
@@ -731,6 +740,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ue01.container_name, "polaris-control-ue-01");
+        let mut ue201 = profiles[0].clone();
+        ue201.ue_id = "UE-201".into();
+        ue201.profile_name = "ue-00201.yaml".into();
+        assert!(live_launch_spec(
+            &ue201,
+            Path::new(LIVE_PROFILE_ROOT),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Path::new(LIVE_START_SCRIPT),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        )
+        .is_ok());
         assert!(is_approved_controller_ue("UE-11"));
         assert!(is_approved_controller_ue("UE-201"));
         assert!(is_approved_controller_ue("UE-00201"));
