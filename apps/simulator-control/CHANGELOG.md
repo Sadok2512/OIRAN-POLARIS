@@ -12,6 +12,8 @@ UI-level changes between minor versions.
   deliberately replaced once by the four enabled backend defaults, while
   subsequent v2 operator choices remain persistent.
 - Display the exact package version in the application shell.
+- Adapt the Provisioning subscriber list/detail to the deployed API 0.17
+  `slot` contract while retaining compatibility with the earlier UI shape.
 
 ## 0.9.1 — 2026-10-29 (patch)
 

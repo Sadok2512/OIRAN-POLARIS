@@ -8,7 +8,11 @@ import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
 import type { ReactNode } from 'react';
-import { ProvisioningPage } from './Provisioning';
+import {
+  ProvisioningPage,
+  normalizeSubscriberDetail,
+  normalizeSubscriberList,
+} from './Provisioning';
 import { _resetFlags, setFlag } from '@/data/featureFlags';
 
 function respond(status: number, body: unknown) {
@@ -111,5 +115,47 @@ describe('ProvisioningPage — subscriber detail panel (0.7.1)', () => {
     await screen.findByTestId('subscriber-detail-panel');
     await user.click(screen.getByTestId('subscriber-detail-close'));
     await waitFor(() => expect(screen.queryByTestId('subscriber-detail-panel')).toBeNull());
+  });
+});
+
+describe('Provisioning API 0.17 adapter', () => {
+  it('maps protected slot records without exposing an identity', () => {
+    const result = normalizeSubscriberList({
+      items: [{
+        slot: 'SUB-safe-slot',
+        subscriber_identity: 'PROTECTED',
+        authentication_material: 'PROTECTED',
+        state: 'VERIFIED',
+      }],
+      total: 1,
+      secrets_exposed: false,
+    });
+    expect(result.items[0]).toEqual({
+      subscriber_id: 'SUB-safe-slot',
+      owner: 'Not provided',
+      imsi: 'PROTECTED',
+      provisioning_status: 'VERIFIED',
+      updated_at_epoch_s: null,
+    });
+  });
+
+  it('maps the wrapped detail and linked UE list', () => {
+    const detail = normalizeSubscriberDetail({
+      subscriber: {
+        slot: 'SUB-safe-slot',
+        subscriber_identity: 'PROTECTED',
+        authentication_material: 'PROTECTED',
+        state: 'VERIFIED',
+        plmn: { mcc: '001', mnc: '01' },
+        snssai: { sst: 1, sd: null },
+        dnns: ['internet'],
+        ambr: { uplink: 1000, downlink: 2000 },
+      },
+      linked_profile_ue_ids: ['UE-201'],
+      secrets_exposed: false,
+    });
+    expect(detail.subscriber_id).toBe('SUB-safe-slot');
+    expect(detail.bound_ues).toEqual(['UE-201']);
+    expect(detail.imsi).toBe('PROTECTED');
   });
 });

@@ -26,7 +26,7 @@ interface Subscriber {
   owner: string;
   imsi: 'PROTECTED';
   provisioning_status: string;
-  updated_at_epoch_s: number;
+  updated_at_epoch_s: number | null;
 }
 
 interface SubscriberList {
@@ -56,7 +56,7 @@ export interface SubscriberDetail {
 function useSubscribers(enabled: boolean) {
   return useQuery({
     queryKey: ['polaris', 'subscribers'],
-    queryFn: () => polarisApi<SubscriberList>('/subscribers'),
+    queryFn: async () => normalizeSubscriberList(await polarisApi<unknown>('/subscribers')),
     enabled,
     retry: false,
     staleTime: 15_000,
@@ -66,11 +66,84 @@ function useSubscribers(enabled: boolean) {
 function useSubscriberDetail(slot: string | null, enabled: boolean) {
   return useQuery({
     queryKey: ['polaris', 'subscriber-detail', slot],
-    queryFn: () => polarisApi<SubscriberDetail>(`/subscribers/${encodeURIComponent(slot!)}`),
+    queryFn: async () =>
+      normalizeSubscriberDetail(
+        await polarisApi<unknown>(`/subscribers/${encodeURIComponent(slot!)}`),
+      ),
     enabled: enabled && !!slot,
     retry: false,
     staleTime: 10_000,
   });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Accept both the 0.7 legacy UI contract and the deployed 0.17 API shape. */
+export function normalizeSubscriberList(body: unknown): SubscriberList {
+  if (!isRecord(body) || !Array.isArray(body.items)) return { items: [], total: 0 };
+  const items = body.items.flatMap((raw): Subscriber[] => {
+    if (!isRecord(raw)) return [];
+    const id = typeof raw.subscriber_id === 'string' ? raw.subscriber_id : raw.slot;
+    if (typeof id !== 'string' || id.length === 0) return [];
+    return [{
+      subscriber_id: id,
+      owner: typeof raw.owner === 'string' ? raw.owner : 'Not provided',
+      imsi: 'PROTECTED',
+      provisioning_status:
+        typeof raw.provisioning_status === 'string'
+          ? raw.provisioning_status
+          : typeof raw.state === 'string'
+            ? raw.state
+            : 'UNKNOWN',
+      updated_at_epoch_s:
+        typeof raw.updated_at_epoch_s === 'number' ? raw.updated_at_epoch_s : null,
+    }];
+  });
+  return { items, total: typeof body.total === 'number' ? body.total : items.length };
+}
+
+export function normalizeSubscriberDetail(body: unknown): SubscriberDetail {
+  if (!isRecord(body)) throw new Error('INVALID_SUBSCRIBER_DETAIL');
+  // API 0.17 wraps the protected subscriber with link metadata. Older
+  // versions returned the detail object directly.
+  const raw = isRecord(body.subscriber) ? body.subscriber : body;
+  const id = typeof raw.subscriber_id === 'string' ? raw.subscriber_id : raw.slot;
+  if (typeof id !== 'string') throw new Error('INVALID_SUBSCRIBER_DETAIL');
+  const plmn = isRecord(raw.plmn) ? raw.plmn : {};
+  const slice = isRecord(raw.slice) ? raw.slice : isRecord(raw.snssai) ? raw.snssai : {};
+  const ambr = isRecord(raw.ambr) ? raw.ambr : {};
+  const linked = Array.isArray(body.linked_profile_ue_ids) ? body.linked_profile_ue_ids : raw.bound_ues;
+  return {
+    slot_id: typeof raw.slot_id === 'string' ? raw.slot_id : id,
+    subscriber_id: id,
+    provisioning_status:
+      typeof raw.provisioning_status === 'string'
+        ? raw.provisioning_status
+        : typeof raw.state === 'string'
+          ? raw.state
+          : 'UNKNOWN',
+    plmn: {
+      mcc: typeof plmn.mcc === 'string' ? plmn.mcc : 'Not provided',
+      mnc: typeof plmn.mnc === 'string' ? plmn.mnc : 'Not provided',
+    },
+    slice: {
+      sst: typeof slice.sst === 'number' ? slice.sst : 0,
+      sd: typeof slice.sd === 'string' ? slice.sd : null,
+    },
+    dnns: Array.isArray(raw.dnns) ? raw.dnns.filter((v): v is string => typeof v === 'string') : [],
+    ambr: {
+      uplink: typeof ambr.uplink === 'number' ? ambr.uplink : 0,
+      downlink: typeof ambr.downlink === 'number' ? ambr.downlink : 0,
+    },
+    bound_ues: Array.isArray(linked) ? linked.filter((v): v is string => typeof v === 'string') : [],
+    imsi: 'PROTECTED',
+    k: 'PROTECTED',
+    opc: 'PROTECTED',
+    updated_at_epoch_s:
+      typeof raw.updated_at_epoch_s === 'number' ? raw.updated_at_epoch_s : 0,
+  };
 }
 
 export function ProvisioningPage() {
@@ -159,7 +232,7 @@ export function ProvisioningPage() {
                     <td>{item.owner}</td>
                     <td className="mono">{item.imsi}</td>
                     <td>{item.provisioning_status}</td>
-                    <td className="num">{item.updated_at_epoch_s}</td>
+                    <td className="num">{item.updated_at_epoch_s ?? 'Not provided'}</td>
                   </tr>
                 ))}
               </tbody>
