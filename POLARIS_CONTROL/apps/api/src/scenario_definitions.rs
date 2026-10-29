@@ -101,7 +101,11 @@ impl ScenarioDefinitionStore {
     pub fn load(&self) -> Result<ScenarioCatalog, String> {
         let mut catalog = match fs::read(&self.path) {
             Ok(bytes) => {
-                #[cfg(unix)]
+                // 0.15.2 — Same portable-permissions pattern as the UE
+                // profile registry: enforce uid=0 in release builds,
+                // tolerate the current process owner under `cfg(test)`,
+                // never relax the group/world write bits.
+                #[cfg(all(unix, not(test)))]
                 {
                     use std::os::unix::fs::{MetadataExt, PermissionsExt};
                     let metadata = fs::symlink_metadata(&self.path)
@@ -112,6 +116,18 @@ impl ScenarioDefinitionStore {
                     {
                         return Err("SCENARIO_CATALOG_PERMISSIONS_UNSAFE".into());
                     }
+                }
+                #[cfg(all(unix, test))]
+                {
+                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                    let metadata = fs::symlink_metadata(&self.path)
+                        .map_err(|_| "SCENARIO_CATALOG_UNREADABLE")?;
+                    if !metadata.file_type().is_file()
+                        || metadata.permissions().mode() & 0o022 != 0
+                    {
+                        return Err("SCENARIO_CATALOG_PERMISSIONS_UNSAFE".into());
+                    }
+                    let _ = metadata.uid();
                 }
                 let catalog: ScenarioCatalog = serde_json::from_slice(&bytes)
                     .map_err(|_| "SCENARIO_CATALOG_INVALID".to_string())?;

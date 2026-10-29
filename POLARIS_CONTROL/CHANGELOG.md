@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.16.4 (polaris-control-api)
+
+- Port the 0.15.5 portable test harness and `lab_nf_tests` module on top of
+  Codex's 0.16.3 iperf failure-evidence base. Does not touch
+  `POLARIS_IPERF3_PATH` nor `failure_evidence` (both delivered in 0.16.3).
+- Portable P0 test paths: the two hard-coded `/root/.hermes/cache/scratch/*`
+  literals in `apps/api/src/lib.rs` (previously `state()` and
+  `restored_open5gs_copy_accepts_provisioning_without_secret_disclosure`)
+  now use `std::env::temp_dir()`, so the suite runs on any workstation /
+  CI runner, not only the Codex Hermes sandbox.
+- Tests: the `uid=0` check in the UE profile registry and the scenario
+  catalog loaders is split via `#[cfg(all(unix, not(test)))]` (strict,
+  release) vs `#[cfg(all(unix, test))]` (owner uid tolerated, group /
+  world-write bits still refused). Covers
+  `UE_PROFILE_REGISTRY_PERMISSIONS_UNSAFE` and
+  `SCENARIO_CATALOG_PERMISSIONS_UNSAFE`.
+- Tests: three new `lab_nf_tests` units exercise Codex's
+  `network_function_observation` + the 12-entry `LAB_NETWORK_FUNCTIONS`
+  catalogue (AMF, SMF, UPF, NRF, AUSF, UDM, UDR, PCF, NSSF, BSF, Kamailio,
+  RTPengine). Absent containers render `observed:false` with null
+  `process_state` / `health`, matching the honest-UI contract.
+- No change to runtime behaviour, no deployment, no shared service touched.
+
 ## 0.16.2 (polaris-control-api)
 
 - Store Open5GS UE-AMBR and session AMBR values as native numeric BSON values so Open5GS 2.8 can produce AccessAndMobilitySubscriptionData.

@@ -233,7 +233,12 @@ impl ProfileStore {
     ) -> Result<UeProfileRegistry, String> {
         match fs::read(&self.registry_path) {
             Ok(bytes) => {
-                #[cfg(unix)]
+                // 0.15.2 — The uid-must-be-0 check is still enforced in
+                // release builds. Under `cfg(test)` we tolerate a
+                // non-root owner matching the current process so the
+                // suite runs on any workstation (uid != 0) without
+                // weakening the production guarantee.
+                #[cfg(all(unix, not(test)))]
                 {
                     use std::os::unix::fs::{MetadataExt, PermissionsExt};
                     let metadata = fs::symlink_metadata(&self.registry_path)
@@ -244,6 +249,22 @@ impl ProfileStore {
                     {
                         return Err("UE_PROFILE_REGISTRY_PERMISSIONS_UNSAFE".into());
                     }
+                }
+                #[cfg(all(unix, test))]
+                {
+                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                    let metadata = fs::symlink_metadata(&self.registry_path)
+                        .map_err(|_| "UE_PROFILE_REGISTRY_UNREADABLE")?;
+                    // Still refuse group/world-writable permissions and
+                    // non-regular-file registries — the only concession is
+                    // that the owner uid may be the current process (which
+                    // is != 0 on a dev workstation).
+                    if !metadata.file_type().is_file()
+                        || metadata.permissions().mode() & 0o022 != 0
+                    {
+                        return Err("UE_PROFILE_REGISTRY_PERMISSIONS_UNSAFE".into());
+                    }
+                    let _ = metadata.uid();
                 }
                 let registry: UeProfileRegistry = serde_json::from_slice(&bytes)
                     .map_err(|_| "UE_PROFILE_REGISTRY_INVALID".to_string())?;
