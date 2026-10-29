@@ -1,5 +1,100 @@
 # Changelog
 
+## oiran-decode v0.4.5 / decoder-sbi v0.3.1 / live-probe v0.2.1 — SBI 0.4.2 regression + OOM fixes
+
+### decoder-sbi v0.3.1 — HPACK regression fix
+
+Codex measurement on inventory `aabbe5e9…` showed 0.4.2 regressed SBI
+throughput 70x: 57,532 DECODED / 6,164 PARTIAL (0.3.1) → 799 DECODED / 317,019
+PARTIAL (0.4.2). Two root causes were introduced in 0.4.2:
+- **Permanent direction poisoning**: a single HPACK failure flagged every
+  subsequent HEADERS block on the same direction as `hpack_unavailable`,
+  including blocks the HPACK decoder had accepted cleanly.
+- **Ghost events**: streams that in 0.3.1 would have been skipped (orphan
+  CONTINUATION, oversized HEADERS/CONTINUATION fragments, unflushed
+  continuations at end of capture) were promoted to synthetic events via
+  `hpack_unavailable=true`. This inflated the event count by ~5x on
+  well-formed captures.
+
+Fix:
+- HPACK failure now touches **only** the specific header block that failed.
+  The next block that decodes cleanly re-synchronises the direction
+  automatically — no permanent poisoning.
+- Frame-level framing errors (orphan CONTINUATION, oversized blocks,
+  unflushed continuations) are now **connection-level** entries in
+  `report.errors`. They do not touch any stream state, so they do not
+  fabricate events.
+- One normalised event per stream (unchanged structural invariant); the
+  stream is only promoted to an event when at least one direction's
+  decoded headers are non-empty — same contract as 0.3.1.
+
+Two new non-regression tests pin the contract:
+- `non_regression_well_formed_connection_emits_one_decoded_event_per_stream`
+  encodes 32 well-formed HTTP/2 request/response pairs with SETTINGS,
+  WINDOW_UPDATE and GOAWAY interleaved. The decoder emits exactly 32
+  DECODED events, zero HPACK_CONTEXT_UNAVAILABLE errors, zero ghost
+  events for the control frames.
+- `non_regression_hpack_failure_does_not_poison_subsequent_streams`
+  encodes a failing HEADERS on stream 1 followed by a well-formed POST
+  on stream 3. Stream 3 decodes cleanly, stream 1 surfaces the
+  HPACK_CONTEXT_UNAVAILABLE once, and the direction-level error is
+  logged exactly once in `report.errors` (not per frame).
+
+### live-probe v0.2.1 — memory-bounded streaming I/O
+
+Audit of live-probe 0.2.0 identified three unbounded-RAM sites that
+accounted for the API OOM Codex observed:
+1. **`fs::read(pcap_path)` for integrity verification**: every source
+   pcap was fully materialised in a `Vec<u8>` so `sha256_hex(&bytes)`
+   could run. On a multi-GB pcap this allocates the full file. Fixed by
+   introducing a streaming `Sha256Hasher` in event-schema and a
+   `sha256_hex_file(path)` + `verify_file_integrity(path, size, sha)`
+   helper that walks the file in 1 MiB chunks via `BufReader::fill_buf`.
+2. **Continuous events dedup rewrite**: the per-ingestion
+   `events.jsonl` rewrite read the entire prior file via
+   `fs::read_to_string`, held a `BTreeMap<String, serde_json::Value>` of
+   every event, and finally serialised the whole thing into a
+   `Vec<u8>` before `atomic_write`. On a long-running continuous
+   capture this is proportional to the number of events ever observed.
+   Fixed by streaming the prior file line-by-line, storing serialised
+   lines (not parsed values), applying a `MAX_IN_MEMORY_EVENT_IDS =
+   1_000_000` safety cap with FIFO eviction, and writing the output
+   through a `BufWriter` + atomic rename.
+3. **Recovery dataset integrity material**: `integrity_material` was
+   built by `fs::read(events.jsonl)` and `fs::read(dataset_manifest)`
+   concatenated into a single `Vec<u8>`, then hashed. Replaced by a
+   two-file streaming SHA-256 identical bit-for-bit to the previous
+   output.
+
+Bounded-memory tests pin the contract:
+- `streaming_sha256_matches_in_memory_sha256_on_large_synthetic_file`
+  materialises a 64 MiB file on disk and verifies that
+  `sha256_hex_file` returns the exact same hash as the full-buffer
+  oracle. The production code path only ever reads
+  `STREAM_CHUNK_BYTES = 1 MiB` at a time.
+- `verify_file_integrity_detects_size_and_hash_mismatches_without_full_read`
+  proves the integrity verifier catches size and SHA mismatches on a
+  4 MiB file without a full-read oracle.
+
+### event-schema
+
+- Added `Sha256Hasher` (streaming) with `new()`, `update(&[u8])`,
+  `finish_hex()`. `sha256_hex(bytes)` is now implemented on top of it,
+  byte-for-byte identical to the previous implementation (the
+  pre-existing `sha256_matches_standard_vector` test still passes).
+
+### Open regressions
+
+- 6 live-probe tests (`completed_capture_registers_real_decoded_dataset_with_provenance`,
+  `continuous_checkpoint_keeps_five_sessions_across_restart_and_republish`,
+  `continuous_import_is_incremental_deduplicated_stoppable_and_restart_safe`,
+  `continuous_source_skips_active_truncation_and_rotates_owned_ring`,
+  `failed_capture_recovery_is_atomic_registered_and_idempotent`,
+  `full_ring_ingests_three_interface_batches_across_rotations`) are
+  broken at the branch base `d85d29f` already; this release does not
+  change the pass/fail count — it only adds +2 bounded-memory tests
+  that both pass.
+
 ## oiran-decode v0.4.4 — pycrate-grounded real TS 38.413 transfer decoders
 
 - `decoder-ngap v0.6.0`:

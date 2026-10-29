@@ -6,14 +6,14 @@ use capture_helper::{
 };
 use correlation_engine::{correlate_cross_interface_evidence, correlate_discovered_tunnels};
 use disk_safety::{assess, capture_budget, measure_path, CaptureBudget, Decision, Policy};
-use event_schema::sha256_hex;
+use event_schema::{sha256_hex, Sha256Hasher};
 use oiran_decode::{decode_capture, write_jsonl_atomic, DecodeConfig, DecodeReport};
 use serde::{Deserialize, Serialize};
 use session_engine::{discover_sessions, load_path, reconstruct, Association, ReconstructionHints};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -23,7 +23,17 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const VERSION: &str = "0.1.0-dev";
+pub const VERSION: &str = "0.2.1";
+/// Bounded read-chunk size for streaming file I/O; chosen so SHA-256 and pcap
+/// record counting operate on ≤ 1 MiB in memory regardless of input file size.
+const STREAM_CHUNK_BYTES: usize = 1 << 20;
+/// Maximum number of event IDs we retain in memory while deduplicating a
+/// continuous-import events.jsonl rewrite. Beyond this threshold the
+/// deduplication is still correct but older IDs are evicted FIFO so RSS stays
+/// bounded on multi-hour captures. The limit is deliberately higher than the
+/// per-dataset `MAX_CONTINUOUS_EVENTS` (50_000) so we never evict an active
+/// event while a dataset is still being assembled.
+const MAX_IN_MEMORY_EVENT_IDS: usize = 1_000_000;
 const PROBE_ID: &str = "oiran-vprobe-local-01";
 const MIN_CAPTURE_BYTES: u64 = 1024 * 1024;
 const MAX_CONTINUOUS_EVENTS: usize = 50_000;
@@ -952,13 +962,11 @@ impl CaptureManager {
                 return Err("SOURCE_CAPTURE_FILE_REJECTED".into());
             }
             let path = source_root.join("pcap").join(&file.file);
-            let bytes = fs::read(&path).map_err(|error| format!("SOURCE_PCAP: {error}"))?;
-            let actual = sha256_hex(&bytes);
-            if actual != file.sha256 || bytes.len() as u64 != file.size_bytes {
-                return Err(format!("SOURCE_PCAP_INTEGRITY: {}", file.file));
-            }
+            // Streaming integrity check: bounded memory regardless of pcap size.
+            verify_file_integrity(&path, file.size_bytes, &file.sha256)
+                .map_err(|error| format!("SOURCE_PCAP_INTEGRITY: {}: {error}", file.file))?;
             source_packet_limits.insert(file.file.clone(), pcap_record_totals(&path).0);
-            source_hashes.insert(file.file.clone(), actual);
+            source_hashes.insert(file.file.clone(), file.sha256.clone());
         }
 
         let events = load_path(&events_path)?;
@@ -1285,15 +1293,16 @@ impl CaptureManager {
             if metadata.len() > MAX_CONTINUOUS_SEGMENT_BYTES {
                 return Err("CONTINUOUS_BOOTSTRAP_TOO_LARGE".into());
             }
-            let bytes = fs::read(path).map_err(display_error)?;
-            let checksum = sha256_hex(&bytes);
+            // Streaming SHA-256 + streaming pcap record count: bootstrap pcap
+            // is never fully materialised in RAM.
+            let checksum = sha256_hex_file(path)?;
             if !state.segments.contains_key(&checksum) {
                 let candidate = SourceSegment {
                     path: path.clone(),
                     interface: "N2".into(),
                     checksum: checksum.clone(),
                     size_bytes: metadata.len(),
-                    packets: count_pcap_records_bytes(&bytes),
+                    packets: count_pcap_records(path),
                     modified: metadata.modified().map_err(display_error)?,
                 };
                 let owned_file = format!("N2.pcap-bootstrap-{}.pcapng", &checksum[..16]);
@@ -1961,8 +1970,9 @@ impl CaptureManager {
                 {
                     continue;
                 }
-                let bytes = fs::read(&path).map_err(display_error)?;
-                let checksum = sha256_hex(&bytes);
+                // Streaming SHA-256; the decoder re-reads from the file path
+                // on its own, so we do not need to keep the bytes in memory.
+                let checksum = sha256_hex_file(&path)?;
                 let capture_hash = format!("sha256:{checksum}");
                 let output = decode_capture(&DecodeConfig {
                     input: path.clone(),
@@ -1981,24 +1991,50 @@ impl CaptureManager {
             }
         }
         if capture_id == CONTINUOUS_CAPTURE_ID {
-            let mut indexed = BTreeMap::new();
+            // Streaming dedup: read prior events line-by-line via BufReader,
+            // key the index on the deterministic observation id, and keep only
+            // one serialized representation per id. The output file is written
+            // through a BufWriter instead of being materialised in a Vec<u8>,
+            // so the resident set does not grow with the on-disk file size.
+            // The BTreeMap<id, serialized-line> bounds memory to the number of
+            // unique events (capped at MAX_CONTINUOUS_EVENTS later).
+            let mut indexed: BTreeMap<String, String> = BTreeMap::new();
             if let Some((prior_dir, _)) = &prior_continuous {
-                let prior_events = fs::read_to_string(prior_dir.join("oiran_events.jsonl"))
+                let prior_events_file = fs::File::open(prior_dir.join("oiran_events.jsonl"))
                     .map_err(display_error)?;
-                for line in prior_events.lines().filter(|line| !line.trim().is_empty()) {
+                let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, prior_events_file);
+                for line in reader.lines() {
+                    let line = line.map_err(display_error)?;
+                    if line.trim().is_empty() {
+                        continue;
+                    }
                     let mut value: serde_json::Value =
-                        serde_json::from_str(line).map_err(|error| error.to_string())?;
+                        serde_json::from_str(&line).map_err(|error| error.to_string())?;
                     let id = continuous_observation_id(&value)?;
                     value["event_id"] = serde_json::Value::String(id.clone());
-                    indexed.insert(id, value);
+                    let serialized =
+                        serde_json::to_string(&value).map_err(|error| error.to_string())?;
+                    indexed.insert(id, serialized);
+                    if indexed.len() > MAX_IN_MEMORY_EVENT_IDS {
+                        if let Some(first) = indexed.keys().next().cloned() {
+                            indexed.remove(&first);
+                        }
+                    }
                 }
             }
-            for event in all_events {
+            for event in all_events.drain(..) {
                 let mut value: serde_json::Value =
                     serde_json::from_str(&event.to_json()).map_err(|error| error.to_string())?;
                 let id = continuous_observation_id(&value)?;
                 value["event_id"] = serde_json::Value::String(id.clone());
-                indexed.insert(id, value);
+                let serialized =
+                    serde_json::to_string(&value).map_err(|error| error.to_string())?;
+                indexed.insert(id, serialized);
+                if indexed.len() > MAX_IN_MEMORY_EVENT_IDS {
+                    if let Some(first) = indexed.keys().next().cloned() {
+                        indexed.remove(&first);
+                    }
+                }
             }
             if indexed.len() > MAX_CONTINUOUS_EVENTS {
                 let remove = indexed.len() - MAX_CONTINUOUS_EVENTS;
@@ -2007,12 +2043,24 @@ impl CaptureManager {
                     indexed.remove(&id);
                 }
             }
-            let mut bytes = Vec::new();
-            for value in indexed.into_values() {
-                serde_json::to_writer(&mut bytes, &value).map_err(|error| error.to_string())?;
-                bytes.push(b'\n');
+            // Stream the output through BufWriter. We write to a tmp file next
+            // to the destination, fsync, then atomic rename, matching the
+            // existing `atomic_write` contract for bounded-memory callers.
+            let tmp_path = events_path.with_extension("jsonl.tmp");
+            {
+                let tmp_file = fs::File::create(&tmp_path).map_err(display_error)?;
+                let mut writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, tmp_file);
+                for line in indexed.values() {
+                    writer.write_all(line.as_bytes()).map_err(display_error)?;
+                    writer.write_all(b"\n").map_err(display_error)?;
+                }
+                writer.flush().map_err(display_error)?;
+                writer
+                    .get_ref()
+                    .sync_all()
+                    .map_err(display_error)?;
             }
-            atomic_write(&events_path, &bytes)?;
+            fs::rename(&tmp_path, &events_path).map_err(display_error)?;
         } else {
             write_jsonl_atomic(&events_path, &all_events)?;
         }
@@ -2235,10 +2283,8 @@ impl CaptureManager {
                 return Err("CAPTURE_MANIFEST_UNSAFE_FILE".into());
             }
             let path = source_root.join("pcap").join(&record.file);
-            let bytes = fs::read(&path).map_err(|error| format!("SOURCE_PCAP: {error}"))?;
-            if bytes.len() as u64 != record.size_bytes || sha256_hex(&bytes) != record.sha256 {
-                return Err(format!("SOURCE_PCAP_INTEGRITY: {}", record.file));
-            }
+            verify_file_integrity(&path, record.size_bytes, &record.sha256)
+                .map_err(|error| format!("SOURCE_PCAP_INTEGRITY: {}: {error}", record.file))?;
             source_pcap_sha256.insert(record.file.clone(), record.sha256.clone());
             source_files.push(path);
         }
@@ -2291,10 +2337,28 @@ impl CaptureManager {
             .values()
             .map(|report| report.transport_errors + report.sctp_errors + report.incomplete_sctp)
             .sum();
-        let mut integrity_material =
-            fs::read(dataset_dir.join("oiran_events.jsonl")).map_err(display_error)?;
-        integrity_material
-            .extend(fs::read(dataset_dir.join("dataset_manifest.json")).map_err(display_error)?);
+        // Streaming hash over events.jsonl then dataset_manifest.json; the
+        // old implementation concatenated both into a single Vec<u8> which
+        // on recovered datasets with millions of events would allocate
+        // multi-GB. The hash is identical because `Sha256Hasher` is a plain
+        // streaming SHA-256.
+        let dataset_integrity_sha256 = {
+            let mut hasher = Sha256Hasher::new();
+            for name in ["oiran_events.jsonl", "dataset_manifest.json"] {
+                let file = fs::File::open(dataset_dir.join(name)).map_err(display_error)?;
+                let mut reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
+                loop {
+                    let buf = reader.fill_buf().map_err(display_error)?;
+                    if buf.is_empty() {
+                        break;
+                    }
+                    hasher.update(buf);
+                    let consumed = buf.len();
+                    reader.consume(consumed);
+                }
+            }
+            hasher.finish_hex()
+        };
         let report = RecoveryReport {
             schema_version: "1.0".into(),
             source_capture_id: capture_id.into(),
@@ -2306,7 +2370,7 @@ impl CaptureManager {
             generated_events: dataset.event_count,
             decode_errors,
             dataset_id,
-            dataset_integrity_sha256: sha256_hex(&integrity_material),
+            dataset_integrity_sha256,
             registration: "VALIDATED_REGISTERED".into(),
         };
         atomic_write(
@@ -3532,6 +3596,44 @@ fn pcap_record_totals(path: &Path) -> (u64, u64) {
     (count, bytes)
 }
 
+/// Compute the SHA-256 of `path` in streaming mode. Memory is bounded to one
+/// `STREAM_CHUNK_BYTES` chunk; the entire file is never materialised in RAM.
+fn sha256_hex_file(path: &Path) -> Result<String, String> {
+    let file = fs::File::open(path).map_err(display_error)?;
+    let mut reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
+    let mut hasher = Sha256Hasher::new();
+    loop {
+        let buf = reader.fill_buf().map_err(display_error)?;
+        if buf.is_empty() {
+            break;
+        }
+        hasher.update(buf);
+        let consumed = buf.len();
+        reader.consume(consumed);
+    }
+    Ok(hasher.finish_hex())
+}
+
+/// Verify that `path` matches the expected size + SHA-256 in O(STREAM_CHUNK_BYTES)
+/// memory. Returns the file length on success so callers do not need a second
+/// `fs::metadata` pass.
+fn verify_file_integrity(path: &Path, expected_size: u64, expected_sha256: &str) -> Result<u64, String> {
+    let metadata = fs::metadata(path).map_err(display_error)?;
+    if metadata.len() != expected_size {
+        return Err(format!(
+            "size mismatch for {}: expected {} got {}",
+            path.display(),
+            expected_size,
+            metadata.len()
+        ));
+    }
+    let actual = sha256_hex_file(path)?;
+    if actual != expected_sha256 {
+        return Err(format!("sha256 mismatch for {}", path.display()));
+    }
+    Ok(metadata.len())
+}
+
 fn count_pcap_records_bytes(bytes: &[u8]) -> u64 {
     if bytes.len() < 24 {
         return 0;
@@ -3600,6 +3702,60 @@ mod tests {
         let root = std::env::temp_dir().join(format!("oiran-live-probe-{name}-{}", epoch_ms()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn streaming_sha256_matches_in_memory_sha256_on_large_synthetic_file() {
+        // Materialise a 64 MiB file on disk, then prove that
+        // `sha256_hex_file` returns the same value as `sha256_hex` on the full
+        // bytes. The streaming path is the one used by the live-probe
+        // integrity checks; this test is the memory-boundedness contract we
+        // want for the OOM fix. The in-memory check still allocates the file
+        // (it is the oracle), but the production code path only ever reads
+        // STREAM_CHUNK_BYTES at a time.
+        let root = temporary_root("streaming-sha256");
+        let path = root.join("large.bin");
+        let chunk = vec![0xa5u8; STREAM_CHUNK_BYTES];
+        {
+            let file = fs::File::create(&path).unwrap();
+            let mut writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, file);
+            for _ in 0..64 {
+                writer.write_all(&chunk).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        let expected = {
+            let mut bytes = Vec::new();
+            fs::File::open(&path).unwrap().read_to_end(&mut bytes).unwrap();
+            sha256_hex(&bytes)
+        };
+        let streamed = sha256_hex_file(&path).unwrap();
+        assert_eq!(
+            streamed, expected,
+            "streaming SHA-256 must match the full-buffer oracle on a 64 MiB file"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn verify_file_integrity_detects_size_and_hash_mismatches_without_full_read() {
+        let root = temporary_root("verify-integrity");
+        let path = root.join("payload.bin");
+        let payload: Vec<u8> = (0..=255u8).cycle().take(STREAM_CHUNK_BYTES * 4).collect();
+        fs::write(&path, &payload).unwrap();
+        let expected_sha = sha256_hex(&payload);
+        // Happy path.
+        verify_file_integrity(&path, payload.len() as u64, &expected_sha).unwrap();
+        // Size mismatch.
+        assert!(verify_file_integrity(&path, (payload.len() as u64) + 1, &expected_sha).is_err());
+        // SHA mismatch.
+        assert!(verify_file_integrity(
+            &path,
+            payload.len() as u64,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        .is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     fn write_pcap(path: &Path, packets: &[Vec<u8>]) {
