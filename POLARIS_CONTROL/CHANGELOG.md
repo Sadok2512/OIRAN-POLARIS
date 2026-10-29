@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.16.0 (polaris-control-api)
+
+- Adds a health-gated N6 downlink sender for `traffic_dl`, using a digest-pinned, non-public
+  iperf3 container with a scoped route to the UE pool through the UPF.
+- Measures downlink bytes independently in the DN sender report and the UE-network-namespace
+  receiver report; no UE identity or authentication material is exposed.
+- Advertises `traffic_dl` as executable only while the sender container, N6 identity and UE route
+  are all measured healthy; otherwise the existing `DL_SENDER_NOT_AVAILABLE` fail-closed contract
+  remains active.
+
 ## 0.15.4 (polaris-control-api)
 
 - Adds `PATCH /api/v1/ue-profiles/:ue_id/scenario`, which updates only scenario metadata and preserves the protected subscriber link and provisioning evidence.

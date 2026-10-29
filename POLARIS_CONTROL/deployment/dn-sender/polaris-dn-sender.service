@@ -1,0 +1,17 @@
+[Unit]
+Description=POLARIS N6 downlink traffic sender
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/polaris-control/dn-sender
+ExecStart=/usr/bin/docker compose -f /opt/polaris-control/dn-sender/compose.yaml up -d
+ExecStartPost=/opt/polaris-control/dn-sender/configure-route.sh
+ExecStop=/usr/bin/docker compose -f /opt/polaris-control/dn-sender/compose.yaml down
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

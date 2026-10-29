@@ -29,6 +29,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
+    net::Ipv4Addr,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -58,7 +59,7 @@ use ueransim_adapter::{
 
 pub use ue_profiles::UeProfileRegistry;
 
-pub const VERSION: &str = "0.15.4";
+pub const VERSION: &str = "0.16.0";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -97,6 +98,8 @@ pub struct AppState {
     additional_ue_live_enabled: bool,
     ue01_controller_owned: bool,
     ue_runtime: Arc<dyn UeRuntime>,
+    dl_sender: DlSenderConfig,
+    dl_sender_health_override: Option<Result<(), String>>,
     resource_override: Option<Result<(), String>>,
     cpu_safety: Arc<Mutex<CpuSafetyMonitor>>,
     runtime: Arc<Mutex<ControlRuntime>>,
@@ -421,6 +424,137 @@ struct VerifiedTrafficTarget {
     ue_ip: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DlSenderConfig {
+    container: Option<String>,
+    network: String,
+    sender_ip: Ipv4Addr,
+    upf_ip: Ipv4Addr,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DlMeasurement {
+    sender_bytes: u64,
+    ue_bytes: u64,
+}
+
+impl DlSenderConfig {
+    fn from_env() -> Result<Self, String> {
+        let container = std::env::var("POLARIS_DL_SENDER_CONTAINER")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        if container.as_deref().is_some_and(|value| {
+            value.len() > 63
+                || !value.chars().all(|character| {
+                    character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+                })
+        }) {
+            return Err("DL_SENDER_CONTAINER_INVALID".into());
+        }
+        let network =
+            std::env::var("POLARIS_DL_SENDER_NETWORK").unwrap_or_else(|_| "oiran-lab-n6".into());
+        if network != "oiran-lab-n6" {
+            return Err("DL_SENDER_NETWORK_NOT_ALLOWLISTED".into());
+        }
+        let sender_ip: Ipv4Addr = std::env::var("POLARIS_DL_SENDER_IP")
+            .unwrap_or_else(|_| "10.77.24.30".into())
+            .parse()
+            .map_err(|_| "DL_SENDER_IP_INVALID")?;
+        let upf_ip: Ipv4Addr = std::env::var("POLARIS_DL_SENDER_UPF_IP")
+            .unwrap_or_else(|_| "10.77.24.13".into())
+            .parse()
+            .map_err(|_| "DL_SENDER_UPF_IP_INVALID")?;
+        if !sender_ip.octets().starts_with(&[10, 77, 24])
+            || !upf_ip.octets().starts_with(&[10, 77, 24])
+        {
+            return Err("DL_SENDER_N6_SCOPE_INVALID".into());
+        }
+        Ok(Self {
+            container,
+            network,
+            sender_ip,
+            upf_ip,
+        })
+    }
+
+    #[cfg(test)]
+    fn unavailable() -> Self {
+        Self {
+            container: None,
+            network: "oiran-lab-n6".into(),
+            sender_ip: Ipv4Addr::new(10, 77, 24, 30),
+            upf_ip: Ipv4Addr::new(10, 77, 24, 13),
+        }
+    }
+
+    fn health(&self) -> Result<(), String> {
+        let container = self
+            .container
+            .as_deref()
+            .ok_or("DL_SENDER_NOT_CONFIGURED")?;
+        let inspect = Command::new("/usr/bin/timeout")
+            .args([
+                "--signal=TERM",
+                "--kill-after=1s",
+                "5s",
+                "/usr/bin/docker",
+                "inspect",
+                "--format",
+                "{{.State.Running}}\t{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}\t{{(index .NetworkSettings.Networks \"oiran-lab-n6\").IPAddress}}\t{{.State.Pid}}",
+                container,
+            ])
+            .output()
+            .map_err(|_| "DL_SENDER_INSPECT_FAILED")?;
+        if !inspect.status.success() {
+            return Err("DL_SENDER_UNAVAILABLE".into());
+        }
+        let output = String::from_utf8(inspect.stdout).map_err(|_| "DL_SENDER_INSPECT_INVALID")?;
+        let fields = output.trim().split('\t').collect::<Vec<_>>();
+        if fields.len() != 4
+            || fields[0] != "true"
+            || fields[1] != "healthy"
+            || fields[2] != self.sender_ip.to_string()
+        {
+            return Err("DL_SENDER_UNHEALTHY".into());
+        }
+        let pid = fields[3]
+            .parse::<u32>()
+            .map_err(|_| "DL_SENDER_PID_INVALID")?;
+        let route = Command::new("/usr/bin/timeout")
+            .args([
+                "--signal=TERM",
+                "--kill-after=1s",
+                "5s",
+                "/usr/bin/nsenter",
+                "--target",
+                &pid.to_string(),
+                "--net",
+                "--",
+                "/usr/sbin/ip",
+                "-4",
+                "route",
+                "get",
+                "10.46.0.1",
+            ])
+            .output()
+            .map_err(|_| "DL_SENDER_ROUTE_CHECK_FAILED")?;
+        let route = String::from_utf8(route.stdout).map_err(|_| "DL_SENDER_ROUTE_INVALID")?;
+        if !route.contains(&format!("via {}", self.upf_ip))
+            || !route.contains(&format!("src {}", self.sender_ip))
+        {
+            return Err("DL_SENDER_UE_ROUTE_MISSING".into());
+        }
+        Ok(())
+    }
+}
+
+fn dl_sender_health(state: &AppState) -> Result<(), String> {
+    match &state.dl_sender_health_override {
+        Some(result) => result.clone(),
+        None => state.dl_sender.health(),
+    }
+}
+
 trait UeRuntime: Send + Sync {
     fn verify_provisioning(
         &self,
@@ -513,6 +647,89 @@ trait UeRuntime: Send + Sync {
             .pointer("/end/sum_sent/bytes")
             .and_then(Value::as_u64)
             .ok_or_else(|| "IPERF3_BYTES_NOT_MEASURED".into())
+    }
+    fn execute_iperf_dl(
+        &self,
+        target: &VerifiedTrafficTarget,
+        bytes: u64,
+        sender: &DlSenderConfig,
+    ) -> Result<DlMeasurement, String> {
+        sender.health()?;
+        let container = sender
+            .container
+            .as_deref()
+            .ok_or("DL_SENDER_NOT_CONFIGURED")?;
+        let mut receiver = Command::new("/usr/bin/timeout")
+            .args([
+                "--signal=TERM",
+                "--kill-after=1s",
+                "30s",
+                "/usr/bin/nsenter",
+                "--target",
+                &target.namespace_pid.to_string(),
+                "--net",
+                "--",
+                "/usr/bin/iperf3",
+                "-s",
+                "-1",
+                "-J",
+                "-B",
+                &target.ue_ip,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|_| "IPERF3_DL_RECEIVER_SPAWN_FAILED")?;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let sender_output = Command::new("/usr/bin/timeout")
+            .args([
+                "--signal=TERM",
+                "--kill-after=1s",
+                "30s",
+                "/usr/bin/docker",
+                "exec",
+                container,
+                "iperf3",
+                "-c",
+                &target.ue_ip,
+                "-n",
+                &bytes.to_string(),
+                "--connect-timeout",
+                "5000",
+                "-J",
+            ])
+            .output()
+            .map_err(|_| "IPERF3_DL_SENDER_SPAWN_FAILED")?;
+        if !sender_output.status.success() {
+            let _ = receiver.kill();
+            let _ = receiver.wait();
+            return Err("IPERF3_DL_SENDER_FAILED".into());
+        }
+        let receiver_output = receiver
+            .wait_with_output()
+            .map_err(|_| "IPERF3_DL_RECEIVER_WAIT_FAILED")?;
+        if !receiver_output.status.success() {
+            return Err("IPERF3_DL_RECEIVER_FAILED".into());
+        }
+        let sender_report: Value = serde_json::from_slice(&sender_output.stdout)
+            .map_err(|_| "IPERF3_DL_SENDER_REPORT_INVALID")?;
+        let receiver_report: Value = serde_json::from_slice(&receiver_output.stdout)
+            .map_err(|_| "IPERF3_DL_RECEIVER_REPORT_INVALID")?;
+        let sender_bytes = sender_report
+            .pointer("/end/sum_sent/bytes")
+            .and_then(Value::as_u64)
+            .ok_or("IPERF3_DL_SENDER_BYTES_NOT_MEASURED")?;
+        let ue_bytes = receiver_report
+            .pointer("/end/sum_received/bytes")
+            .and_then(Value::as_u64)
+            .ok_or("IPERF3_DL_UE_BYTES_NOT_MEASURED")?;
+        if sender_bytes == 0 || ue_bytes == 0 {
+            return Err("IPERF3_DL_ZERO_BYTES".into());
+        }
+        Ok(DlMeasurement {
+            sender_bytes,
+            ue_bytes,
+        })
     }
     fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> {
         let _ = job;
@@ -1711,6 +1928,7 @@ impl AppState {
         let subscriber_backend: Arc<dyn SubscriberBackend> =
             Arc::new(MongoSubscriberBackend::from_env()?);
         let served_network = ServedNetworkPolicy::from_env()?;
+        let dl_sender = DlSenderConfig::from_env()?;
         let fallback_profiles = ueransim_adapter::planned_profiles()
             .into_iter()
             .take(configuration.ue_count)
@@ -1786,6 +2004,8 @@ impl AppState {
                 .is_ok_and(|value| value == "true"),
             ue01_controller_owned,
             ue_runtime,
+            dl_sender,
+            dl_sender_health_override: None,
             resource_override: None,
             cpu_safety: Arc::new(Mutex::new(CpuSafetyMonitor::default())),
             runtime: Arc::new(Mutex::new(runtime)),
@@ -2128,8 +2348,33 @@ async fn version() -> Json<Value> {
         json!({"platform":"3.2.1","api":VERSION,"scenario_engine":scenario_engine::VERSION,"safety_guard":safety_guard::VERSION,"ueransim_adapter":ueransim_adapter::VERSION,"multi_ue_controller":simulator_controller::VERSION}),
     )
 }
-async fn capabilities() -> Json<Value> {
+async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
     let ue_profile = Path::new("/root/POLARIS/runtime/ueransim/ue.yaml").exists();
+    let dl_sender = dl_sender_health(&state);
+    let mut executable_steps = vec![
+        "ue_start",
+        "ue_stop",
+        "pdu_establish",
+        "pdu_release",
+        "udp_traffic",
+        "wait",
+        "traffic_ul",
+        "idle",
+        "detach",
+        "repeat",
+    ];
+    let mut unavailable_steps = vec![
+        json!({"type":"ims_register","http_status":423,"reason":"IMS_NOT_AVAILABLE"}),
+        json!({"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}),
+    ];
+    if dl_sender.is_ok() {
+        executable_steps.push("traffic_dl");
+    } else {
+        unavailable_steps.insert(
+            0,
+            json!({"type":"traffic_dl","http_status":422,"reason":"DL_SENDER_NOT_AVAILABLE"}),
+        );
+    }
     Json(json!({
         "live_control":true,
         "approval_state":"OPERATOR_AUTHORIZATION_REQUIRED",
@@ -2143,23 +2388,9 @@ async fn capabilities() -> Json<Value> {
         "additional_ue_ids":ueransim_adapter::planned_profiles().into_iter().skip(1).map(|profile|profile.ue_id).collect::<Vec<_>>(),
         "traffic_protocols":["ICMP","UDP","TCP"],
         "approved_destinations":["10.46.0.1"],
-        "executable_scenario_step_types":[
-            "ue_start",
-            "ue_stop",
-            "pdu_establish",
-            "pdu_release",
-            "udp_traffic",
-            "wait",
-            "traffic_ul",
-            "idle",
-            "detach",
-            "repeat"
-        ],
-        "unavailable_scenario_step_types":[
-            {"type":"traffic_dl","http_status":422,"reason":"DL_SENDER_NOT_AVAILABLE"},
-            {"type":"ims_register","http_status":423,"reason":"IMS_NOT_AVAILABLE"},
-            {"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}
-        ],
+        "executable_scenario_step_types":executable_steps,
+        "unavailable_scenario_step_types":unavailable_steps,
+        "dl_sender":{"healthy":dl_sender.is_ok(),"network":state.dl_sender.network},
         "scenario_step_limits":{
             "traffic_bytes_max":209715200_u64,
             "repeat_depth_max":2,
@@ -3786,6 +4017,7 @@ async fn update_ue_profile(
 fn scenario_assignment_block_reason(
     catalog: &ScenarioCatalog,
     scenario_id: &str,
+    dl_sender_available: bool,
 ) -> Result<Option<&'static str>, String> {
     let definition = catalog
         .definitions
@@ -3793,7 +4025,7 @@ fn scenario_assignment_block_reason(
         .find(|item| item.id == scenario_id)
         .ok_or("SCENARIO_DEFINITION_NOT_FOUND")?;
     let resolved = resolve_steps(definition)?;
-    if resolved.iter().any(|step| step.step_type == "traffic_dl") {
+    if !dl_sender_available && resolved.iter().any(|step| step.step_type == "traffic_dl") {
         return Ok(Some("DL_SENDER_NOT_AVAILABLE"));
     }
     if resolved
@@ -3819,7 +4051,11 @@ async fn assign_ue_profile_scenario(
     }
     if let Some(scenario_id) = input.scenario_id.as_deref() {
         let catalog = state.scenario_catalog.lock().unwrap();
-        match scenario_assignment_block_reason(&catalog, scenario_id) {
+        match scenario_assignment_block_reason(
+            &catalog,
+            scenario_id,
+            dl_sender_health(&state).is_ok(),
+        ) {
             Ok(Some(reason)) => return profile_mutation_error(reason.into()),
             Ok(None) => {}
             Err(error) => return profile_mutation_error(error),
@@ -6219,7 +6455,36 @@ fn execute_live_definition_step(
             }
             Ok(json!({"datagrams":5}))
         }
-        "traffic_dl" => Err("DL_SENDER_NOT_AVAILABLE".into()),
+        "traffic_dl" => {
+            dl_sender_health(state).map_err(|_| "DL_SENDER_NOT_AVAILABLE".to_string())?;
+            let bytes = resolved_parameter_u64(step, "bytes", 0, 200 * 1024 * 1024)?;
+            if bytes == 0 {
+                return Err("TRAFFIC_BYTES_OUT_OF_RANGE".into());
+            }
+            let mut sender_bytes = 0_u64;
+            let mut ue_bytes = 0_u64;
+            for ue_id in ue_ids {
+                if control.cancel.load(Ordering::SeqCst) {
+                    return Err("SCENARIO_STOP_REQUESTED".into());
+                }
+                let target = resolve_controller_traffic_target(state, ue_id)?;
+                let measurement =
+                    state
+                        .ue_runtime
+                        .execute_iperf_dl(&target, bytes, &state.dl_sender)?;
+                sender_bytes = sender_bytes
+                    .checked_add(measurement.sender_bytes)
+                    .ok_or("IPERF3_BYTES_OVERFLOW")?;
+                ue_bytes = ue_bytes
+                    .checked_add(measurement.ue_bytes)
+                    .ok_or("IPERF3_BYTES_OVERFLOW")?;
+            }
+            Ok(json!({
+                "requested_bytes_per_ue":bytes,
+                "measured_sender_bytes":sender_bytes,
+                "measured_ue_bytes":ue_bytes
+            }))
+        }
         "traffic_ul" => {
             let bytes = resolved_parameter_u64(step, "bytes", 0, 200 * 1024 * 1024)?;
             if bytes == 0 {
@@ -6523,10 +6788,12 @@ async fn start_scenario(
             );
         }
         if resolved.iter().any(|step| step.step_type == "traffic_dl") {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"error":"DL_SENDER_NOT_AVAILABLE"})),
-            );
+            if dl_sender_health(&state).is_err() {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({"error":"DL_SENDER_NOT_AVAILABLE"})),
+                );
+            }
         }
         let outcome = if state.execution_mode == "mock" {
             run_mock_definition_scenario(&state, definition_id, &input.ue_ids)
@@ -7745,6 +8012,8 @@ mod p0_tests {
                 fail_verification: false,
                 fail_stop: false,
             }),
+            dl_sender: DlSenderConfig::unavailable(),
+            dl_sender_health_override: Some(Err("DL_SENDER_NOT_AVAILABLE".into())),
             resource_override: Some(Ok(())),
             cpu_safety: Arc::new(Mutex::new(CpuSafetyMonitor::default())),
             runtime: Arc::new(Mutex::new(ControlRuntime {
@@ -7917,6 +8186,58 @@ mod p0_tests {
         );
         assert_eq!(body["scenario_step_limits"]["repeat_depth_max"], 2);
         assert_eq!(body["scenario_step_limits"]["resolved_steps_max"], 10_000);
+    }
+
+    #[tokio::test]
+    async fn healthy_dl_sender_promotes_traffic_dl_without_promoting_ims_steps() {
+        let mut test_state = state();
+        test_state.dl_sender.container = Some("polaris-dn-sender".into());
+        test_state.dl_sender_health_override = Some(Ok(()));
+        let response = app(test_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(body["executable_scenario_step_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step == "traffic_dl"));
+        assert!(!body["unavailable_scenario_step_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["type"] == "traffic_dl"));
+        assert!(body["unavailable_scenario_step_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["type"] == "ims_register"));
+        assert_eq!(body["dl_sender"]["healthy"], true);
+    }
+
+    #[test]
+    fn small_traffic_assignment_requires_a_healthy_dl_sender() {
+        let catalog = ScenarioCatalog {
+            schema_version: scenario_definitions::SCHEMA_VERSION,
+            definitions: scenario_definitions::builtin_templates(),
+        };
+        assert_eq!(
+            scenario_assignment_block_reason(&catalog, "tpl-small-traffic", false).unwrap(),
+            Some("DL_SENDER_NOT_AVAILABLE")
+        );
+        assert_eq!(
+            scenario_assignment_block_reason(&catalog, "tpl-small-traffic", true).unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,30 @@
+services:
+  polaris-dn-sender:
+    image: networkstatic/iperf3@sha256:bc267517f534d9f7cced2669f325799a1fd7fe1d5953c2ca2c6ea1db61affa08
+    container_name: polaris-dn-sender
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "trap 'exit 0' TERM INT; while :; do /usr/bin/sleep 3600 & wait $$!; done"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    healthcheck:
+      test: ["CMD", "iperf3", "--version"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
+    labels:
+      org.oiran-polaris.owner: "polaris-control"
+      org.oiran-polaris.role: "n6-dl-sender"
+    networks:
+      n6:
+        ipv4_address: 10.77.24.30
+
+networks:
+  n6:
+    name: oiran-lab-n6
+    external: true
