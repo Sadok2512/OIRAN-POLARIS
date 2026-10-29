@@ -35,6 +35,11 @@ test('fresh browser exposes the backend UE form and Provisioning', async ({ page
   await page.getByRole('button', { name: 'Close' }).click();
   await page.goto(url('provisioning'), { waitUntil: 'networkidle' });
   await expect(page.getByTestId('provisioning-subscribers')).toBeVisible();
+  const firstSlot = page.locator('[data-testid^="subscriber-row-"]').first();
+  await expect(firstSlot).toBeVisible();
+  await firstSlot.click();
+  await expect(page.getByTestId('subscriber-detail-panel')).toBeVisible();
+  await expect(page.getByTestId('subscriber-detail-identity')).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('provisioning-backend.png'), fullPage: true });
   expect(errors).toEqual([]);
 });
