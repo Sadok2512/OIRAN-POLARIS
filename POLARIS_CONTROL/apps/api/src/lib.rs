@@ -3864,12 +3864,16 @@ async fn generate_subscribers(
         .dnns
         .clone()
         .unwrap_or_else(|| vec!["internet".into()]);
+    // 0.17.8 (#38): default to 1 Gbit/s so freshly generated UEs run with a
+    // realistic 5G AMBR rather than the 1 Mbit/s placeholder that silently
+    // throttled early demos. The real BSON typing (NumberLong) is enforced
+    // downstream in `MongoSubscriberBackend::provision_batch`.
     let ambr = request
         .ambr
         .clone()
         .unwrap_or(subscriber_provisioning::SubscriberAmbr {
-            uplink: 1_000_000,
-            downlink: 1_000_000,
+            uplink: 1_000_000_000,
+            downlink: 1_000_000_000,
         });
     let mut rows = Vec::with_capacity(imsis.len());
     for (offset, imsi) in imsis.into_iter().enumerate() {

@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.17.8 (polaris-control-api) — critical AMBR BSON corruption patch
+
+- **#39 critical, data corruption**: `PUT /subscribers/:slot` (regressed in
+  0.17.0 when the subscriber update path was added) wrote the AMBR as a
+  literal JSON sub-document `{"$numberLong":"N"}` instead of a BSON long.
+  mongosh evaluates the surrounding `--file` input as JavaScript, not EJSON,
+  so each `$set` payload serialized through `serde_json::to_string` embedded
+  the EJSON marker as plain field names in a sub-document rather than as a
+  BSON `Long` constructor call. Downstream, the Open5GS UDR read the field
+  as a sub-document (`bson_iter_as_int64` fails), the AMF then returned
+  HTTP 400 on `GET am-data`, and the UE was refused with
+  `FIVEG_SERVICES_NOT_ALLOWED`.
+
+  Fix: `MongoSubscriberBackend::apply_update_script` now builds the mongosh
+  script text directly — not by serializing a `serde_json::Map` — and emits
+  real `NumberLong("N")` / `NumberInt(U)` constructor calls at every AMBR
+  path (`ambr.{uplink,downlink}.{value,unit}` and
+  `slice.0.session.*.ambr.{uplink,downlink}.{value,unit}`). The duplicate
+  `$set` key in the DNN-rewrite branch (two `$set` keys in the same
+  updateOne argument, where the second silently clobbered the first — the
+  AMBR update was dropped on the floor whenever DNNs were also updated) is
+  removed in favour of a single typed `setFields` object. The DNN rewrite
+  also preserves per-session `qos.index` / `qos.arp.*` and carries the AMBR
+  (either from the update or the current record) rather than reducing each
+  session to `{name}` only.
+
+- **#38**: `POST /subscribers/generate` default AMBR raised from 1 Mbit/s
+  to 1 Gbit/s uplink and downlink, with the same typed BSON encoding
+  flowing through `provision_batch`.
+
+- `MongoSubscriberBackend::provision_batch` now also emits `NumberLong(...)`
+  for the AMBR `value` field (previously it used the untyped mongosh
+  `Number()`, which stores as a BSON double — functional on the Open5GS
+  side, but not what the Open5GS WebUI 2.8.0 schema or 3GPP semantics want
+  for a potentially 64-bit bps value).
+
+- Tests:
+  - Static regression lock
+    (`apply_update_script_never_emits_ejson_literals_for_ambr`) asserts
+    that the emitted script never contains the EJSON injection form and
+    that it uses `NumberLong(...)` / `NumberInt(...)` for every typed
+    field, and that it issues exactly one `db.subscribers.updateOne` call.
+  - Mandatory live-MongoDB test
+    (`ambr_put_writes_real_bson_long_in_live_mongo`) gated by
+    `POLARIS_TEST_MONGODB_CONTAINER`. When the env var is set the test
+    MUST pass; when unset it skips with a loud `SKIPPED_NO_MONGO` marker
+    and is NOT `#[ignore]`'d. The test provisions a subscriber via
+    `provision_batch`, PUTs a new AMBR via `apply_update`, then runs a
+    `$type` aggregation on the stored document and asserts
+    `$type ∈ {int, long}` for every AMBR `value` and `unit` field (both
+    top-level and `slice.0.session[0]`), plus a round-trip value check.
+
 ## 0.17.1 (polaris-control-api)
 
 - UL / DL pre-flight: before spawning iperf3 the API now runs
