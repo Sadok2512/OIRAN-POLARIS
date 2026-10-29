@@ -1135,6 +1135,17 @@ trait UeRuntime: Send + Sync {
         let _ = (job, timeout_seconds, cancel);
         Err("PDU_RUNTIME_COMMAND_UNSUPPORTED".into())
     }
+    /// Requests release for a terminal detach sequence. Unlike a standalone
+    /// `pdu_release`, detach must immediately continue with switch-off
+    /// deregistration: UERANSIM may automatically re-establish its configured
+    /// session before the regular observation interval can see PS-INACTIVE.
+    fn request_pdu_release_for_detach(
+        &self,
+        job: &simulator_controller::UeJob,
+    ) -> Result<(), String> {
+        let cancel = AtomicBool::new(false);
+        self.release_pdu(job, 30, &cancel)
+    }
     fn resolve_traffic_target(
         &self,
         job: &simulator_controller::UeJob,
@@ -2366,6 +2377,22 @@ impl UeRuntime for DockerUeRuntime {
         let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
         Self::execute_ue_cli(target, "ps-release-all".into())?;
         self.wait_for_owned_pdu(spec, handle, "INACTIVE", timeout_seconds, cancel)
+    }
+
+    fn request_pdu_release_for_detach(
+        &self,
+        job: &simulator_controller::UeJob,
+    ) -> Result<(), String> {
+        let handle = job.process_handle.as_deref().ok_or("UE_NOT_STARTED")?;
+        let spec = job
+            .approved_runtime
+            .as_ref()
+            .ok_or("LIVE_RUNTIME_APPROVAL_MISSING")?;
+        if !self.owns(spec, handle) {
+            return Err("LIVE_UE_OWNERSHIP_NOT_PROVEN".into());
+        }
+        let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
+        Self::execute_ue_cli(target, "ps-release-all".into())
     }
 
     fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> {
@@ -7936,23 +7963,40 @@ fn execute_live_definition_step(
                     .find(|job| job.ue_id == *ue_id)
                     .ok_or("UE_NOT_STARTED")?;
                 state.ue_runtime.remove_policy_routing(&target)?;
-                state.ue_runtime.release_pdu(&job, 30, &control.cancel)?;
-                state.ue_runtime.deregister_switch_off(&job)?;
+                request_terminal_detach(state.ue_runtime.as_ref(), &job)?;
                 stop_one_live(state, ue_id)?;
+                let final_observation = observe_controller_ue(state, ue_id)?;
+                if final_observation.process_state != "STOPPED"
+                    || final_observation.pdu_session_state != "INACTIVE"
+                {
+                    return Err("DETACH_FINAL_STATE_NOT_OBSERVED".into());
+                }
                 control
                     .started_ues
                     .lock()
                     .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
                     .remove(ue_id);
             }
-            Ok(
-                json!({"pdu_state":"INACTIVE","registration_state":"DEREGISTERED","process_state":"STOPPED"}),
-            )
+            Ok(json!({
+                "pdu_state":"INACTIVE",
+                "registration_state":"DEREGISTERED",
+                "process_state":"STOPPED",
+                "release_evidence":"UERANSIM_PS_RELEASE_REQUEST_ACCEPTED",
+                "completion_evidence":"CONTROLLER_STOPPED_AND_PDU_INACTIVE"
+            }))
         }
         "ims_register" | "voice_call" => Err("IMS_NOT_AVAILABLE".into()),
         "repeat" => Err("SCENARIO_REPEAT_NOT_RESOLVED".into()),
         _ => Err("SCENARIO_STEP_TYPE_UNSUPPORTED".into()),
     }
+}
+
+fn request_terminal_detach(
+    runtime: &dyn UeRuntime,
+    job: &simulator_controller::UeJob,
+) -> Result<(), String> {
+    runtime.request_pdu_release_for_detach(job)?;
+    runtime.deregister_switch_off(job)
 }
 
 fn cleanup_definition_started_ues(state: &AppState, control: &DefinitionJobControl) -> Vec<String> {
@@ -9200,6 +9244,14 @@ mod p0_tests {
                 .lock()
                 .unwrap()
                 .push(format!("PDU_RELEASED:{}", job.ue_id));
+            Ok(())
+        }
+
+        fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> {
+            self.stopped
+                .lock()
+                .unwrap()
+                .push(format!("DEREGISTERED:{}", job.ue_id));
             Ok(())
         }
 
@@ -12696,6 +12748,29 @@ mod p0_tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("definition job did not terminate");
+    }
+
+    #[test]
+    fn detach_requests_release_then_switch_off_without_waiting_for_transient_inactive() {
+        let test_state = state();
+        prepare_owned_traffic_target(&test_state, "UE-02", true);
+        let job = test_state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .snapshot()
+            .into_iter()
+            .find(|item| item.ue_id == "UE-02")
+            .unwrap();
+        request_terminal_detach(test_state.ue_runtime.as_ref(), &job).unwrap();
+        let observation = test_state
+            .ue_runtime
+            .observe_owned(
+                job.approved_runtime.as_ref().unwrap(),
+                job.process_handle.as_deref().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(observation.pdu_session_state, "INACTIVE");
     }
 
     #[test]

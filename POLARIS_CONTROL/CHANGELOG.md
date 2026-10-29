@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.6 (polaris-control-api)
+
+- Make terminal `detach` issue `ps-release-all`, immediately continue with
+  switch-off deregistration and stop, then require the authoritative final
+  controller observation to be `STOPPED` with an `INACTIVE` PDU state.
+- Keep standalone `pdu_release` strict: it still waits for UERANSIM `ps-list`
+  to stop reporting an active PSI. This avoids treating the transient release
+  window before UERANSIM automatic re-establishment as a durable state.
+- Record separate release-request and final-state evidence for completed
+  detach steps.
+
 ## 0.17.5 (polaris-control-api)
 
 - Make `transfer_verify` SHA-256 equality the blocking delivery proof and run
