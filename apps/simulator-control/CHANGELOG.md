@@ -3,6 +3,28 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.9.3 — 2026-10-29 (patch)
+
+- Security — bump `react-router-dom` from `6.30.6` to `7.18.5` (ported from
+  the 0.9.2 security candidate) on top of the deployed 0.9.2-hotfix. Clears
+  the two moderate production advisories reported by
+  `npm audit --omit=dev`:
+  - **CVE-2025-6803** — React Router open redirect via backslash in `<Link>`
+    and `useNavigate`.
+  - **deserializeErrors() arbitrary constructor injection** — React Router
+    Framework.
+  Drop-in bump: `react-router-dom@7` re-exports the import surface used by
+  `App.tsx`, `AppShell.tsx`, `SidebarNavigation.tsx`, `main.tsx`,
+  `UeManager.tsx`, `UeDetail.tsx`, `ScenariosLibrary.tsx`,
+  `ScenarioBuilder.tsx` and the test harness (`MemoryRouter`, `Routes`,
+  `Route`, `BrowserRouter`, `Navigate`, `Link`, `NavLink`, `Outlet`,
+  `useNavigate`, `useParams`, `useLocation`) unchanged, so no source
+  change was needed.
+- Flags: 0.9.3 does **not** touch the feature-flag defaults or the
+  v1 → v2 migration shipped in 0.9.2-hotfix (`profileBackend`,
+  `polarisProvisioning`, `scenarioBackend`, `scenarioTemplates` all ON by
+  default; subsequent v2 operator choices remain persistent).
+
 ## 0.9.2-hotfix — 2026-10-29 (patch)
 
 - Enable `profileBackend`, `polarisProvisioning`, `scenarioBackend` and
