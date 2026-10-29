@@ -20,11 +20,15 @@ import { ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
 import { ConfirmDialog } from '@/ui/ConfirmDialog';
 import {
   useAuth,
+  useDnns,
+  useGenerateSubscribers,
+  usePlmns,
+  useScenarioRuntime,
   useStartScenario,
   useStartUe,
   useStopScenario,
   useStopUe,
-  useScenarioRuntime,
+  useSubscriberSlots,
   useUes,
 } from '@/data/queries';
 import { useAssignments } from '@/scenarios/store';
@@ -61,6 +65,25 @@ import { CsvImportDialog } from '@/components/CsvImportDialog';
 import { useQuery } from '@tanstack/react-query';
 
 const PAGE_SIZES = [25, 50, 100, 250] as const;
+
+/** Compute the next-free `UE-NN` id by scanning existing ids and picking
+ * the lowest unused slot (#29f). Padding matches the UE_ID regex
+ * (`UE-NN` for < 100, `UE-NNNNN` beyond) so the prefilled value is always
+ * a valid identifier. */
+export function nextFreeUeIdFrom(existing: string[]): string {
+  const used = new Set<number>();
+  for (const id of existing) {
+    const match = /^UE-(\d{2,})$/i.exec(id.trim());
+    if (match) used.add(Number(match[1]));
+  }
+  let candidate = 1;
+  while (used.has(candidate)) candidate += 1;
+  const padded =
+    candidate < 100
+      ? candidate.toString().padStart(2, '0')
+      : candidate.toString().padStart(5, '0');
+  return `UE-${padded}`;
+}
 
 interface MergedRow {
   profile: UeProfileRecord;
@@ -114,6 +137,11 @@ export function UeManagerPage() {
     staleTime: 60_000,
   });
   const ownerList = useOwners();
+  const plmnList = usePlmns();
+  const dnnList = useDnns();
+  const subscriberSlots = useSubscriberSlots();
+  const generateSubscriber = useGenerateSubscribers();
+  const [generateError, setGenerateError] = useState<string | null>(null);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [assignOpen, setAssignOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string[] | null>(null);
@@ -211,12 +239,10 @@ export function UeManagerPage() {
 
   /* ----------------------------- Mutators ------------------------------ */
 
-  // 0.7.1 — polarisProvisioning Add UE flow. The backend accepts
-  // exactly {ue_id, gnb_id, owner, note, imsi}; `createUeProvisioningProfile`
-  // serialises those five fields and NOTHING ELSE so the 0.11-era
-  // carriers (k, opc, keep_identity, plmn_mcc, plmn_mnc, dnn, sst, sd,
-  // scenario_id, auto_run_scenario, provisioning_slot) never leak and
-  // AUTHENTICATION_KEY_REQUIRED can never be caused by this UI.
+  // 0.9.4 — polarisProvisioning Add UE flow (#29). The dialog binds the
+  // UE profile to a provisioned subscriber slot (`provisioning_slot` =
+  // SUB-…) and surfaces PLMN / DNN / SST / SD as lab-served dropdowns.
+  // The IMSI text input is gone: identity material stays server-side.
   async function submitProvisioningAdd(values: UeProvisioningAddValues) {
     setProvisioningAddError(null);
     setProvisioningAddSubmitting(true);
@@ -1121,12 +1147,41 @@ export function UeManagerPage() {
         onClose={() => {
           setProvisioningAddOpen(false);
           setProvisioningAddError(null);
+          setGenerateError(null);
         }}
         onSubmit={submitProvisioningAdd}
+        onGenerateSubscriber={async () => {
+          setGenerateError(null);
+          try {
+            const result = await generateSubscriber.mutateAsync({
+              count: 1,
+              sst: 1,
+              sd: '010203',
+              dnns: ['internet'],
+            });
+            const slot = result.slots[0]?.slot ?? null;
+            if (slot) await subscriberSlots.refetch();
+            return slot;
+          } catch (error) {
+            const status = error instanceof ApiError ? error.status : null;
+            const code = error instanceof ApiError ? error.code : 'SUBSCRIBER_GENERATE_FAILED';
+            setGenerateError(
+              `${status ? `HTTP ${status} · ` : ''}${code} · ${(error as Error).message}`,
+            );
+            return null;
+          }
+        }}
         gnbs={(gnbList.data?.items ?? []) as WireGnb[]}
         owners={ownerList.data?.items ?? []}
+        plmns={plmnList.data?.items ?? []}
+        dnns={dnnList.data?.items ?? []}
+        subscribers={subscriberSlots.data ?? []}
+        nextFreeUeId={nextFreeUeIdFrom(profiles.map((item) => item.id))}
         gnbsLoading={gnbList.isLoading}
         ownersLoading={ownerList.isLoading}
+        plmnsLoading={plmnList.isLoading}
+        dnnsLoading={dnnList.isLoading}
+        subscribersLoading={subscriberSlots.isLoading}
         gnbsError={
           gnbList.isError ? `GNBs backend pending · ${(gnbList.error as Error).message}` : null
         }
@@ -1135,8 +1190,21 @@ export function UeManagerPage() {
             ? `Owners backend pending · ${(ownerList.error as Error).message}`
             : null
         }
+        plmnsError={
+          plmnList.isError ? `PLMNs backend pending · ${(plmnList.error as Error).message}` : null
+        }
+        dnnsError={
+          dnnList.isError ? `DNNs backend pending · ${(dnnList.error as Error).message}` : null
+        }
+        subscribersError={
+          subscriberSlots.isError
+            ? `Subscribers backend pending · ${(subscriberSlots.error as Error).message}`
+            : null
+        }
         submitting={provisioningAddSubmitting}
         submitError={provisioningAddError}
+        generating={generateSubscriber.isPending}
+        generateError={generateError}
       />
 
       <UeProfileBackendFormDialog

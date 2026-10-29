@@ -3,6 +3,19 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.9.4 — 2026-10-29 (patch)
+
+- Defect #29 — Add UE dialog recomposed to the audited surface. Lab defaults
+  preselected (GNB-01 / PLMN 001-01 / DNN internet / SST 1 / SD 010203 — #29b,
+  #29e), UE ID prefilled with the next free `UE-NN` id (#29f), IMSI text
+  input removed in favour of a provisioned-slot picker + Generate button
+  (#29c, identity stays `PROTECTED`), UE IP never collected (#29d), required
+  errors still deferred to touch/submit (#29a, unchanged). POST
+  `/ue-profiles` body is now `{ue_id, gnb_id, owner, note,
+  provisioning_slot, plmn, dnn, sst, sd}`; no IMSI, no K, no OPc, no UE IP.
+  New Playwright captures: `docs/screenshots/ue-add-dialog-empty.png` and
+  `docs/screenshots/ue-add-dialog-filled.png`.
+
 ## 0.9.3 — 2026-10-29 (patch)
 
 - Security — bump `react-router-dom` from `6.30.6` to `7.18.5` (ported from

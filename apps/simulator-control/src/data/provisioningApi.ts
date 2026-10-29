@@ -206,20 +206,24 @@ export async function createSubscriber(
 }
 
 /**
- * 0.7.1 — Slim create for `POST /ue-profiles`. The backend published on
- * `feat/polaris-provisioning` accepts the whitelist {ue_id, gnb_id,
- * owner, note, imsi} and refuses any extra field (notably the old 0.11
- * carriers: provisioning_slot, k, opc, keep_identity, plmn_mcc,
- * plmn_mnc, dnn, sst, sd, scenario_id, auto_run_scenario). This
- * helper serialises exactly those five fields so the operator never
- * runs into an AUTHENTICATION_KEY_REQUIRED-shaped surprise.
+ * 0.9.4 — Create body for `POST /ue-profiles` under the polarisProvisioning
+ * flow after defect #29. The IMSI text input is gone; the operator binds
+ * the UE profile to a pre-provisioned subscriber slot (`provisioning_slot`
+ * = SUB-…), so the identity material (SUPI / K / OPc) never leaves the
+ * server. `plmn`, `dnn`, `sst` and `sd` come from lab-served dropdowns
+ * (/plmns, /dnns + the SST/SD catalogue) so operators cannot land on a
+ * free-text slice value that is not actually served.
  */
 export interface UeProvisioningProfileInput {
   ue_id: string;
   gnb_id: string;
   owner: string;
   note: string;
-  imsi: string;
+  provisioning_slot: string;
+  plmn: string;
+  dnn: string;
+  sst: number;
+  sd: string | null;
 }
 
 export interface UeProvisioningProfileResponse {

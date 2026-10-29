@@ -227,6 +227,45 @@ export function usePlmns() {
   });
 }
 
+/** 0.9.4 — Compact subscriber slot list used by the Add UE dialog's slot
+ * picker (#29c). Every item renders identity as PROTECTED. */
+export interface SubscriberSlotRow {
+  slot: string;
+  state: string;
+}
+
+/** Backend contract: GET /subscribers → directory of provisioned slots.
+ * Accepts both the deployed 0.17 shape (`items[].slot`) and the 0.7
+ * compat shape (`items[].subscriber_id`). */
+export function useSubscriberSlots() {
+  return useQuery({
+    queryKey: ['polaris', 'subscriber-slots'],
+    queryFn: async (): Promise<SubscriberSlotRow[]> => {
+      const body = await polarisApi<{ items?: unknown[] }>('/subscribers');
+      const items = Array.isArray(body?.items) ? body.items : [];
+      return items.flatMap((raw): SubscriberSlotRow[] => {
+        if (typeof raw !== 'object' || raw === null) return [];
+        const record = raw as Record<string, unknown>;
+        const slot =
+          typeof record.slot === 'string'
+            ? record.slot
+            : typeof record.subscriber_id === 'string'
+              ? record.subscriber_id
+              : null;
+        if (!slot) return [];
+        const state =
+          typeof record.state === 'string'
+            ? record.state
+            : typeof record.provisioning_status === 'string'
+              ? record.provisioning_status
+              : 'PROVISIONED';
+        return [{ slot, state }];
+      });
+    },
+    staleTime: 15_000,
+  });
+}
+
 /** Backend contract: GET /subscribers/:slot → PROTECTED subscriber record + linked UE ids. */
 export function useSubscriberDetail(slot: string | null | undefined) {
   return useQuery({
