@@ -3422,7 +3422,10 @@ fn native_capture_fully_ingested(
         if metadata.len() > MAX_CONTINUOUS_SEGMENT_BYTES {
             return Err("CONTINUOUS_SOURCE_SEGMENT_TOO_LARGE".into());
         }
-        let checksum = sha256_hex(&fs::read(&path).map_err(display_error)?);
+        // 0.2.3: hash via bounded `BufReader` instead of `fs::read` to keep
+        // the resident set independent of segment size (same reason as
+        // `copy_verified`).
+        let checksum = sha256_hex_file(&path)?;
         if !seen_checksums.contains(&checksum) {
             return Ok(false);
         }
@@ -3699,13 +3702,24 @@ fn copy_verified(segment: &SourceSegment, destination: &Path) -> Result<(), Stri
         return Ok(());
     }
     let temporary = destination.with_extension("importing");
+    // `fs::copy` streams in kernel space without materialising the file in
+    // user memory. The post-copy integrity check must do the same — the
+    // previous `fs::read(&temporary)` loaded the full capture into RAM, so a
+    // 512 MiB pcap import spiked the resident set by half a gigabyte and
+    // triggered OOMs under the Codex-measured 256 MiB cgroup budget. 0.2.3
+    // hashes the destination through a bounded `BufReader` instead.
     fs::copy(&segment.path, &temporary).map_err(display_error)?;
     let current = fs::metadata(&segment.path).map_err(display_error)?;
-    let copied = fs::read(&temporary).map_err(display_error)?;
-    if current.len() != segment.size_bytes
-        || current.modified().ok() != Some(segment.modified)
-        || sha256_hex(&copied) != segment.checksum
-    {
+    let streamed_checksum = sha256_hex_file(&temporary);
+    let changed = match streamed_checksum {
+        Ok(ref checksum) => {
+            current.len() != segment.size_bytes
+                || current.modified().ok() != Some(segment.modified)
+                || checksum != &segment.checksum
+        }
+        Err(_) => true,
+    };
+    if changed {
         let _ = fs::remove_file(&temporary);
         return Err("CONTINUOUS_SOURCE_CHANGED_DURING_IMPORT".into());
     }
@@ -4097,6 +4111,89 @@ mod tests {
             streamed, expected,
             "streaming SHA-256 must match the full-buffer oracle on a 64 MiB file"
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 0.2.3 — regression lock on the OOM site Codex measured for pcap
+    /// imports: `copy_verified` previously called `fs::read` on the full
+    /// temporary copy before hashing, so a 512 MiB pcap import spiked live
+    /// allocation by ~512 MiB. The streaming fix uses `sha256_hex_file`
+    /// (`BufReader` of `STREAM_CHUNK_BYTES`) and keeps the resident set
+    /// independent of segment size. `#[ignore]`'d because the
+    /// `#[global_allocator]` tracker sees every parallel test's allocations;
+    /// reproduce with:
+    ///   cargo test --release -p live-probe
+    ///     copy_verified_streams_512_mib_import_under_32_mib_live_allocation
+    ///     -- --ignored --test-threads=1 --nocapture
+    /// (also allocates ~512 MiB of disk; the test cleans up on success.)
+    #[test]
+    #[ignore]
+    fn copy_verified_streams_512_mib_import_under_32_mib_live_allocation() {
+        let root = temporary_root("copy-verified-512mib-stream");
+        let source = root.join("source.pcap");
+        let destination = root.join("destination.pcap");
+
+        // Materialise a 512 MiB source pcap on disk from a repeating chunk,
+        // writing through a BufWriter so this fixture setup itself stays
+        // bounded. The content isn't a valid pcap — `copy_verified` only
+        // checks size + mtime + sha256 — which lets the test target the
+        // integrity path without decoding costs polluting the peak.
+        const TOTAL_BYTES: usize = 512 * 1024 * 1024;
+        let chunk = vec![0x5au8; STREAM_CHUNK_BYTES];
+        {
+            let file = fs::File::create(&source).unwrap();
+            let mut writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, file);
+            let mut written = 0usize;
+            while written < TOTAL_BYTES {
+                let take = (TOTAL_BYTES - written).min(chunk.len());
+                writer.write_all(&chunk[..take]).unwrap();
+                written += take;
+            }
+            writer.flush().unwrap();
+            writer.get_ref().sync_all().unwrap();
+        }
+        let metadata = fs::metadata(&source).unwrap();
+        assert_eq!(metadata.len() as usize, TOTAL_BYTES);
+        let expected_sha = sha256_hex_file(&source).unwrap();
+
+        let segment = SourceSegment {
+            path: source.clone(),
+            interface: "N3".to_string(),
+            checksum: expected_sha,
+            size_bytes: metadata.len(),
+            packets: 0,
+            modified: metadata.modified().unwrap(),
+        };
+
+        let guard = reset_allocation_peak();
+        copy_verified(&segment, &destination).expect("copy_verified must succeed on 512 MiB file");
+        let peak = allocation_peak();
+        stop_allocation_tracking();
+        drop(guard);
+
+        assert!(
+            destination.exists(),
+            "copy_verified must land the destination atomically"
+        );
+        assert_eq!(
+            fs::metadata(&destination).unwrap().len() as usize,
+            TOTAL_BYTES
+        );
+
+        const BOUND: usize = 32 * 1024 * 1024;
+        assert!(
+            peak < BOUND,
+            "copy_verified live allocation peak must stay under 32 MiB on a \
+             512 MiB pcap import (0.2.3 streaming contract); measured {} bytes \
+             ({} MiB)",
+            peak,
+            peak / (1024 * 1024)
+        );
+        eprintln!(
+            "COPY_VERIFIED_512MIB_PEAK_BYTES={peak} PEAK_MIB={} LIMIT_MIB=32",
+            peak / (1024 * 1024)
+        );
+
         fs::remove_dir_all(&root).unwrap();
     }
 

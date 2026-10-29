@@ -183,7 +183,17 @@ pub fn write_jsonl(path: &Path, events: &[NormalizedEvent], append: bool) -> Res
 /// Write a complete normalized-event stream without ever exposing a partial
 /// destination file. The caller must create and authorize the parent dataset
 /// directory before invoking this function.
-pub fn write_jsonl_atomic(path: &Path, events: &[NormalizedEvent]) -> Result<(), String> {
+///
+/// 0.4.5 — accepts any `IntoIterator<Item = &NormalizedEvent>` so a caller
+/// that produces events lazily does not have to materialise the full `Vec`
+/// before writing. The function still writes line-by-line through a bounded
+/// `BufWriter`; the public API change lifts the "collect first, write next"
+/// restriction that previously forced live-probe to hold the entire decoded
+/// stream in memory on top of the pcap bytes.
+pub fn write_jsonl_atomic<'a, I>(path: &Path, events: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = &'a NormalizedEvent>,
+{
     let parent = path
         .parent()
         .ok_or_else(|| format!("dataset output has no parent: {}", path.display()))?;

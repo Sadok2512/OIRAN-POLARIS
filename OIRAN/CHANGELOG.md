@@ -1,5 +1,37 @@
 # Changelog
 
+## live-probe v0.2.3 — pcap import streaming (copy_verified + write_jsonl_atomic)
+
+- `copy_verified` previously verified the freshly-copied temporary pcap by
+  calling `fs::read` on it and feeding the full byte vector to `sha256_hex`.
+  On a 512 MiB pcap import the live resident set spiked by ~512 MiB. 0.2.3
+  switches the integrity hash to `sha256_hex_file`, which is already the
+  streaming (`BufReader` of `STREAM_CHUNK_BYTES`) path used elsewhere in
+  the module. The post-copy integrity contract (`size`, `mtime`, `sha256`
+  all unchanged) is preserved; only the hashing memory footprint changes.
+- The second `fs::read`-into-`sha256_hex` leak at `continuous_source_dedup_ok`
+  was fixed with the same `sha256_hex_file` substitution.
+- Test (`copy_verified_streams_512_mib_import_under_32_mib_live_allocation`,
+  `#[ignore]`'d because the `#[global_allocator]` tracker is shared with
+  concurrent tests): materialises a 512 MiB source pcap on disk, computes
+  its expected SHA via the streaming hasher, builds a `SourceSegment` with
+  that checksum, resets the allocation peak, calls `copy_verified`, and
+  asserts the peak live allocation stays under 32 MiB. Measured on Back100:
+  `COPY_VERIFIED_512MIB_PEAK_BYTES=1048765 PEAK_MIB=1 LIMIT_MIB=32`. Full
+  live-probe suite: `cargo test -p live-probe` → 42 passed, 0 failed, 2
+  ignored. Reproduce:
+  `cargo test -p live-probe --release copy_verified_streams_512_mib_import_under_32_mib_live_allocation -- --ignored --test-threads=1 --nocapture`.
+
+## oiran-decode v0.4.5 — streaming-friendly write_jsonl_atomic signature
+
+- `write_jsonl_atomic` now accepts `IntoIterator<Item = &NormalizedEvent>`
+  instead of `&[NormalizedEvent]`. The function body was already streaming
+  through a bounded `BufWriter`; the API change lets a caller that produces
+  events lazily avoid materialising the full `Vec` before writing. Existing
+  callers (`live-probe/src/lib.rs:2197` with `&all_events` and
+  `oiran-decode/src/lib.rs:332` with `&[]`) compile unchanged because
+  `&Vec<T>` and `&[T]` both implement the new trait bound.
+
 ## live-probe v0.2.2 — source_segments OOM fix, memory-bounded ingestion
 
 ### live-probe v0.2.2 — bounded ingestion
