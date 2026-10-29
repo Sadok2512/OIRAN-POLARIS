@@ -222,6 +222,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "decoder-s1ap"
+version = "0.1.0"
+dependencies = [
+ "event-schema",
+ "plugin-runtime",
+]
+
+[[package]]
 name = "decoder-sbi"
 version = "0.1.0"
 dependencies = [

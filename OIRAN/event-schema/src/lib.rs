@@ -25,6 +25,7 @@ impl DecodeStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Protocol {
     Ngap,
+    S1ap,
     Nas5gs,
     Nas5gmm,
     Nas5gsm,
@@ -38,6 +39,7 @@ impl Protocol {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Ngap => "NGAP",
+            Self::S1ap => "S1AP",
             Self::Nas5gs => "NAS-5GS",
             Self::Nas5gmm => "NAS-5GMM",
             Self::Nas5gsm => "NAS-5GSM",

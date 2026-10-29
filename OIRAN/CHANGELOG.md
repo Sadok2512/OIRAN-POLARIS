@@ -1,5 +1,15 @@
 # Changelog
 
+## decoder-s1ap v0.1.0 - S1AP APER decoder (TS 36.413)
+
+- Added `OIRAN/decoder-s1ap` crate implementing the schema-independent S1AP-PDU/open-type envelope and ProtocolIE container, modelled on `decoder-ngap`.
+- Procedures recognised: S1 Setup (17), E-RAB Setup (5), E-RAB Release (7), Initial Context Setup (9), Paging (10), Downlink NAS Transport (11), Initial UE Message (12), Uplink NAS Transport (13), UE Context Release Request (18), UE Context Release Command / Complete (23).
+- Identity-bearing IEs (`S-TMSI`, `UEPagingID`, `GUMMEI-ID`, `SecurityKey`, `NAS-PDU`) are tagged `pseudonymized: true` so the Analyzer strips them before persistence.
+- Added `Protocol::S1ap` variant to the event-schema protocol enum.
+- Coverage: 10 unit tests on synthetic APER vectors built from TS 36.413 with synthetic PLMN `001/01` and synthetic identities only — no real IMSI/K/OPc material in fixtures.
+- Carried NAS-PDU is EPS NAS (TS 24.301) and preserved opaquely by SHA-256 + length; `decoder-nas` remains 5G-only (declared limitation).
+- Added `OIRAN/docs/PROTOCOL_AUDIT.md` with the static 12-plane coverage audit.
+
 ## Release consolidation V1.1 - lossless continuous checkpoint resume
 
 - Preserve evidence-backed session identifiers when live activity credit expires or a continuous import is finalized.
