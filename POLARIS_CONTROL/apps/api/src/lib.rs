@@ -445,11 +445,14 @@ fn iperf3_program() -> String {
 }
 
 fn iperf_failure(code: &str, output: &std::process::Output, command: Vec<String>) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.chars().take(2048).collect::<String>();
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.chars().take(2048).collect::<String>();
     json!({
         "error": code,
         "exit_code": output.status.code(),
+        "stdout": stdout,
         "stderr": stderr,
         "command": command,
     })
@@ -12022,7 +12025,7 @@ mod p0_tests {
 
         let output = std::process::Output {
             status: std::process::ExitStatus::from_raw(7 << 8),
-            stdout: Vec::new(),
+            stdout: vec![b'y'; 4096],
             stderr: vec![b'x'; 4096],
         };
         let encoded = iperf_failure(
@@ -12033,6 +12036,7 @@ mod p0_tests {
         let evidence: Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(evidence["error"], "IPERF3_UL_FAILED");
         assert_eq!(evidence["exit_code"], 7);
+        assert_eq!(evidence["stdout"].as_str().unwrap().len(), 2048);
         assert_eq!(evidence["stderr"].as_str().unwrap().len(), 2048);
         assert_eq!(
             evidence["command"][0],

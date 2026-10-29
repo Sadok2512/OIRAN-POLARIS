@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.17.1 (polaris-control-api)
+
+- Persist bounded iperf3 JSON `stdout` alongside `stderr`, exit code and the
+  executed command in step `failure_evidence`. iperf3 emits `-J` connection
+  errors on stdout, so prior evidence could retain an empty stderr while losing
+  the actionable diagnostic. Both streams are independently limited to 2048
+  characters and no command execution behaviour or safety gate is changed.
+
 ## 0.17.0 (polaris-control-api)
 
 - Added `GET /api/v1/subscribers/:slot` — returns the sanitized subscriber
