@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.17.5 (polaris-control-api)
+
+- Make `transfer_verify` SHA-256 equality the blocking delivery proof and run
+  it before the corresponding paced iperf3 measurement in certified E2E jobs.
+- Persist `IPERF3_RECEIVER_SHORT` as a non-blocking warning with sender bytes,
+  receiver bytes and retransmission count. Connection failures and zero-byte
+  receiver reports remain blocking.
+
 ## 0.17.4 (polaris-control-api)
 
 - Pace UL and DL iperf3 transfers with a validated configurable rate

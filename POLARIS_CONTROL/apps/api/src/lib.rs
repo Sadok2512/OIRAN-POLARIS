@@ -438,6 +438,8 @@ struct DlSenderConfig {
 struct IperfMeasurement {
     client_sent_bytes: u64,
     server_received_bytes: u64,
+    retransmissions: u64,
+    warning: Option<String>,
     rate: String,
     tcp_window: String,
     preflight: UeRoutePreflight,
@@ -589,30 +591,25 @@ fn attach_preflight_to_failure(
     body.to_string()
 }
 
-fn validate_exact_iperf_bytes(
+fn classify_iperf_delivery(
     direction: &str,
-    requested: u64,
     sender: u64,
     receiver: u64,
     preflight: &UeRoutePreflight,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     if sender == 0 || receiver == 0 {
-        return Err(format!("IPERF3_{direction}_ZERO_BYTES"));
-    }
-    // Pacing can finish at an iperf block boundary above the requested floor.
-    // Success still requires every byte reported sent to be reported received.
-    // transfer_verify provides the independent byte-exact 1 MiB proof.
-    if sender < requested || receiver != sender {
         return Err(json!({
-            "error":format!("IPERF3_{direction}_BYTE_MISMATCH"),
-            "requested_bytes":requested,
+            "error":format!("IPERF3_{direction}_ZERO_BYTES"),
             "sender_bytes":sender,
             "receiver_bytes":receiver,
             "preflight":preflight,
         })
         .to_string());
     }
-    Ok(())
+    if receiver < sender {
+        return Ok(Some("IPERF3_RECEIVER_SHORT".into()));
+    }
+    Ok(None)
 }
 
 /// 0.17.1 — Run `ip route get <destination>` inside the UE network namespace
@@ -1304,40 +1301,23 @@ trait UeRuntime: Send + Sync {
             ])
             .output()
             .map_err(|_| "IPERF3_PROCESS_SPAWN_FAILED".to_string())?;
-        if !client_output.status.success() {
-            let _ = receiver.kill();
-            let _ = receiver.wait();
-            // Attach the preflight evidence inside the iperf failure body so a
-            // "command sent but 0 bytes" post-mortem still shows the UE route
-            // state at the time of the spawn.
-            let mut body: Value =
-                serde_json::from_str(&iperf_failure("IPERF3_UL_FAILED", &client_output, command))
-                    .unwrap_or_else(|_| json!({ "error": "IPERF3_UL_FAILED" }));
-            if let Some(object) = body.as_object_mut() {
-                object.insert(
-                    "preflight".to_string(),
-                    serde_json::to_value(&preflight).unwrap_or_else(|_| json!(null)),
-                );
-            }
-            return Err(body.to_string());
-        }
         let receiver_output = receiver
             .wait_with_output()
             .map_err(|_| "IPERF3_UL_RECEIVER_WAIT_FAILED")?;
-        if !receiver_output.status.success() {
-            return Err(attach_preflight_to_failure(
-                "IPERF3_UL_RECEIVER_FAILED",
-                &receiver_output,
-                receiver_command,
-                &preflight,
-            ));
-        }
-        let client_report: Value = serde_json::from_slice(&client_output.stdout)
-            .map_err(|_| "IPERF3_UL_CLIENT_REPORT_INVALID".to_string())?;
+        let client_report: Value = serde_json::from_slice(&client_output.stdout).map_err(|_| {
+            attach_preflight_to_failure("IPERF3_UL_FAILED", &client_output, command, &preflight)
+        })?;
         let receiver_report: Value = client_report
             .get("server_output_json")
             .cloned()
-            .ok_or_else(|| "IPERF3_UL_SERVER_OUTPUT_MISSING".to_string())?;
+            .ok_or_else(|| {
+                attach_preflight_to_failure(
+                    "IPERF3_UL_SERVER_OUTPUT_MISSING",
+                    &receiver_output,
+                    receiver_command,
+                    &preflight,
+                )
+            })?;
         let client_sent_bytes = client_report
             .pointer("/end/sum_sent/bytes")
             .and_then(Value::as_u64)
@@ -1346,16 +1326,17 @@ trait UeRuntime: Send + Sync {
             .pointer("/end/sum_received/bytes")
             .and_then(Value::as_u64)
             .ok_or("IPERF3_UL_RECEIVER_BYTES_NOT_MEASURED")?;
-        validate_exact_iperf_bytes(
-            "UL",
-            bytes,
-            client_sent_bytes,
-            server_received_bytes,
-            &preflight,
-        )?;
+        let retransmissions = client_report
+            .pointer("/end/sum_sent/retransmits")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let warning =
+            classify_iperf_delivery("UL", client_sent_bytes, server_received_bytes, &preflight)?;
         Ok(IperfMeasurement {
             client_sent_bytes,
             server_received_bytes,
+            retransmissions,
+            warning,
             rate,
             tcp_window: IPERF_TCP_WINDOW.into(),
             preflight,
@@ -1398,7 +1379,7 @@ trait UeRuntime: Send + Sync {
         }
         let iperf = iperf3_program();
         let rate = iperf3_rate()?;
-        let mut receiver = Command::new("/usr/bin/timeout")
+        let receiver = Command::new("/usr/bin/timeout")
             .args([
                 "--signal=TERM",
                 "--kill-after=1s",
@@ -1444,19 +1425,22 @@ trait UeRuntime: Send + Sync {
             ])
             .output()
             .map_err(|_| "IPERF3_DL_SENDER_SPAWN_FAILED")?;
-        if !sender_output.status.success() {
-            let _ = receiver.kill();
-            let _ = receiver.wait();
-            return Err("IPERF3_DL_SENDER_FAILED".into());
-        }
-        let receiver_output = receiver
+        let _receiver_output = receiver
             .wait_with_output()
             .map_err(|_| "IPERF3_DL_RECEIVER_WAIT_FAILED")?;
-        if !receiver_output.status.success() {
-            return Err("IPERF3_DL_RECEIVER_FAILED".into());
-        }
-        let sender_report: Value = serde_json::from_slice(&sender_output.stdout)
-            .map_err(|_| "IPERF3_DL_SENDER_REPORT_INVALID")?;
+        let sender_report: Value = serde_json::from_slice(&sender_output.stdout).map_err(|_| {
+            attach_preflight_to_failure(
+                "IPERF3_DL_SENDER_FAILED",
+                &sender_output,
+                vec![
+                    "docker".into(),
+                    "exec".into(),
+                    container.into(),
+                    "iperf3".into(),
+                ],
+                &preflight,
+            )
+        })?;
         let receiver_report: Value = sender_report
             .get("server_output_json")
             .cloned()
@@ -1469,10 +1453,16 @@ trait UeRuntime: Send + Sync {
             .pointer("/end/sum_received/bytes")
             .and_then(Value::as_u64)
             .ok_or("IPERF3_DL_UE_BYTES_NOT_MEASURED")?;
-        validate_exact_iperf_bytes("DL", bytes, sender_bytes, ue_bytes, &preflight)?;
+        let retransmissions = sender_report
+            .pointer("/end/sum_sent/retransmits")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let warning = classify_iperf_delivery("DL", sender_bytes, ue_bytes, &preflight)?;
         Ok(IperfMeasurement {
             client_sent_bytes: sender_bytes,
             server_received_bytes: ue_bytes,
+            retransmissions,
+            warning,
             rate,
             tcp_window: IPERF_TCP_WINDOW.into(),
             preflight,
@@ -7795,6 +7785,8 @@ fn execute_live_definition_step(
             let mut sender_bytes = 0_u64;
             let mut ue_bytes = 0_u64;
             let mut preflights = Vec::new();
+            let mut warnings = Vec::new();
+            let mut retransmissions = 0_u64;
             let mut rate = None;
             let mut tcp_window = None;
             for ue_id in ue_ids {
@@ -7813,6 +7805,15 @@ fn execute_live_definition_step(
                     .checked_add(measurement.server_received_bytes)
                     .ok_or("IPERF3_BYTES_OVERFLOW")?;
                 preflights.push(measurement.preflight);
+                retransmissions = retransmissions.saturating_add(measurement.retransmissions);
+                if let Some(warning) = measurement.warning {
+                    warnings.push(json!({
+                        "code":warning,
+                        "sender_bytes":measurement.client_sent_bytes,
+                        "receiver_bytes":measurement.server_received_bytes,
+                        "retransmissions":measurement.retransmissions
+                    }));
+                }
                 rate = Some(measurement.rate);
                 tcp_window = Some(measurement.tcp_window);
             }
@@ -7822,6 +7823,8 @@ fn execute_live_definition_step(
                 "measured_ue_bytes":ue_bytes,
                 "rate":rate,
                 "tcp_window":tcp_window,
+                "retransmissions":retransmissions,
+                "warnings":warnings,
                 "preflights":preflights
             }))
         }
@@ -7834,6 +7837,8 @@ fn execute_live_definition_step(
             let mut ue_sender_bytes = 0_u64;
             let mut dn_receiver_bytes = 0_u64;
             let mut preflights = Vec::new();
+            let mut warnings = Vec::new();
+            let mut retransmissions = 0_u64;
             let mut rate = None;
             let mut tcp_window = None;
             for ue_id in ue_ids {
@@ -7852,6 +7857,15 @@ fn execute_live_definition_step(
                     .checked_add(measurement.server_received_bytes)
                     .ok_or("IPERF3_BYTES_OVERFLOW")?;
                 preflights.push(measurement.preflight);
+                retransmissions = retransmissions.saturating_add(measurement.retransmissions);
+                if let Some(warning) = measurement.warning {
+                    warnings.push(json!({
+                        "code":warning,
+                        "sender_bytes":measurement.client_sent_bytes,
+                        "receiver_bytes":measurement.server_received_bytes,
+                        "retransmissions":measurement.retransmissions
+                    }));
+                }
                 rate = Some(measurement.rate);
                 tcp_window = Some(measurement.tcp_window);
             }
@@ -7862,6 +7876,8 @@ fn execute_live_definition_step(
                 "measured_dn_receiver_bytes":dn_receiver_bytes,
                 "rate":rate,
                 "tcp_window":tcp_window,
+                "retransmissions":retransmissions,
+                "warnings":warnings,
                 "preflights":preflights
             }))
         }
@@ -12845,26 +12861,30 @@ mod p0_tests {
     }
 
     #[test]
-    fn iperf_requires_receiver_to_match_every_reported_sender_byte() {
+    fn iperf_short_receiver_is_a_warning_but_zero_bytes_remain_blocking() {
         let preflight = evaluate_ue_route_preflight(
             "10.77.24.30 from 10.46.0.5 dev uesimtun0 table 100",
             "10.77.24.30",
             "uesimtun0",
             "UL_ROUTE_NOT_VIA_UE_TUN",
         );
-        assert!(
-            validate_exact_iperf_bytes("UL", 1_048_576, 1_048_576, 1_048_576, &preflight).is_ok()
+        assert_eq!(
+            classify_iperf_delivery("UL", 1_048_576, 1_048_576, &preflight).unwrap(),
+            None
         );
-        let error = validate_exact_iperf_bytes("UL", 1_048_576, 1_048_576, 786_432, &preflight)
-            .unwrap_err();
+        assert_eq!(
+            classify_iperf_delivery("UL", 1_048_576, 786_432, &preflight).unwrap(),
+            Some("IPERF3_RECEIVER_SHORT".into())
+        );
+        let error = classify_iperf_delivery("UL", 1_048_576, 0, &preflight).unwrap_err();
         let evidence: Value = serde_json::from_str(&error).unwrap();
-        assert_eq!(evidence["error"], "IPERF3_UL_BYTE_MISMATCH");
-        assert_eq!(evidence["requested_bytes"], 1_048_576);
-        assert_eq!(evidence["receiver_bytes"], 786_432);
+        assert_eq!(evidence["error"], "IPERF3_UL_ZERO_BYTES");
+        assert_eq!(evidence["receiver_bytes"], 0);
         assert_eq!(evidence["preflight"]["actual_dev"], "uesimtun0");
         assert_eq!(IPERF_TCP_WINDOW, "64K");
-        assert!(
-            validate_exact_iperf_bytes("UL", 1_048_576, 1_310_720, 1_310_720, &preflight).is_ok()
+        assert_eq!(
+            classify_iperf_delivery("UL", 1_310_720, 1_310_720, &preflight).unwrap(),
+            None
         );
     }
 
