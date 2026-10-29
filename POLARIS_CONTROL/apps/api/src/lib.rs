@@ -536,6 +536,23 @@ pub fn preflight_failure(code: &str, preflight: &UeRoutePreflight) -> String {
     .to_string()
 }
 
+fn attach_preflight_to_failure(
+    code: &str,
+    output: &std::process::Output,
+    command: Vec<String>,
+    preflight: &UeRoutePreflight,
+) -> String {
+    let mut body: Value = serde_json::from_str(&iperf_failure(code, output, command))
+        .unwrap_or_else(|_| json!({ "error": code }));
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "preflight".to_string(),
+            serde_json::to_value(preflight).unwrap_or_else(|_| json!(null)),
+        );
+    }
+    body.to_string()
+}
+
 /// 0.17.1 — Run `ip route get <destination>` inside the UE network namespace
 /// via `nsenter`. Returns the raw stdout so the caller can both parse it (via
 /// `evaluate_ue_route_preflight`) and attach the exact line to
@@ -896,6 +913,17 @@ trait UeRuntime: Send + Sync {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|_| "IPERF3_UL_RECEIVER_SPAWN_FAILED")?;
+        let receiver_command = vec![
+            "docker".into(),
+            "exec".into(),
+            container.into(),
+            "iperf3".into(),
+            "-s".into(),
+            "-1".into(),
+            "-J".into(),
+            "-B".into(),
+            sender.sender_ip.to_string(),
+        ];
         std::thread::sleep(std::time::Duration::from_millis(200));
         // 0.17.1 — PREFLIGHT: `ip route get <sender.sender_ip>` inside the UE
         // netns must resolve via the UE TUN interface (uesimtun*). If the
@@ -994,7 +1022,12 @@ trait UeRuntime: Send + Sync {
             .wait_with_output()
             .map_err(|_| "IPERF3_UL_RECEIVER_WAIT_FAILED")?;
         if !receiver_output.status.success() {
-            return Err("IPERF3_UL_RECEIVER_FAILED".into());
+            return Err(attach_preflight_to_failure(
+                "IPERF3_UL_RECEIVER_FAILED",
+                &receiver_output,
+                receiver_command,
+                &preflight,
+            ));
         }
         let client_report: Value = serde_json::from_slice(&client_output.stdout)
             .map_err(|_| "IPERF3_UL_CLIENT_REPORT_INVALID".to_string())?;
@@ -12379,6 +12412,37 @@ mod p0_tests {
         assert_eq!(
             evidence["command"][0],
             "/opt/polaris-control/libexec/iperf3"
+        );
+    }
+
+    #[test]
+    fn post_preflight_iperf_failure_retains_raw_route_evidence() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: b"receiver failed".to_vec(),
+            stderr: Vec::new(),
+        };
+        let preflight = evaluate_ue_route_preflight(
+            "10.77.24.30 from 10.46.0.5 dev uesimtun0 table 100",
+            "10.77.24.30",
+            "uesimtun0",
+            "UL_ROUTE_NOT_VIA_UE_TUN",
+        );
+        let encoded = attach_preflight_to_failure(
+            "IPERF3_UL_RECEIVER_FAILED",
+            &output,
+            vec!["docker".into(), "exec".into(), "iperf3".into()],
+            &preflight,
+        );
+        let evidence: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(evidence["error"], "IPERF3_UL_RECEIVER_FAILED");
+        assert_eq!(evidence["preflight"]["ok"], true);
+        assert_eq!(evidence["preflight"]["actual_dev"], "uesimtun0");
+        assert_eq!(
+            evidence["preflight"]["raw"],
+            "10.77.24.30 from 10.46.0.5 dev uesimtun0 table 100"
         );
     }
 
