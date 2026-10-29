@@ -260,3 +260,7 @@
   (`POLARIS_SUBSCRIBER_PLAN_PATH`, default `/var/lib/polaris-control/subscriber-secrets/v3.2.plan`,
   mode must deny group/other). A slot binds at most once. Open5GS is never written.
 - Minor: new read-only `GET /api/v1/ue-profiles/provisioning-slots` (slot ids and bound UE only).
+# 0.16.3
+
+- Preserve bounded iperf3 failure evidence (command, exit code and bounded stderr).
+- Use the packaged POLARIS iperf3 client instead of assuming `/usr/bin/iperf3` exists.

@@ -59,7 +59,7 @@ use ueransim_adapter::{
 
 pub use ue_profiles::UeProfileRegistry;
 
-pub const VERSION: &str = "0.16.2";
+pub const VERSION: &str = "0.16.3";
 const LIVE_TEST_ID: &str = "POLARIS-LIVE-001";
 const LIVE_APPROVAL_PATH: &str = "/run/polaris-control/POLARIS-LIVE-001.approved";
 const LIVE_RESULT_PATH: &str = "/root/POLARIS_CONTROL/live-tests/POLARIS-LIVE-001-result.json";
@@ -438,6 +438,23 @@ struct IperfMeasurement {
     server_received_bytes: u64,
 }
 
+fn iperf3_program() -> String {
+    std::env::var("POLARIS_IPERF3_PATH")
+        .unwrap_or_else(|_| "/opt/polaris-control/libexec/iperf3".into())
+}
+
+fn iperf_failure(code: &str, output: &std::process::Output, command: Vec<String>) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.chars().take(2048).collect::<String>();
+    json!({
+        "error": code,
+        "exit_code": output.status.code(),
+        "stderr": stderr,
+        "command": command,
+    })
+    .to_string()
+}
+
 impl DlSenderConfig {
     fn from_env() -> Result<Self, String> {
         let container = std::env::var("POLARIS_DL_SENDER_CONTAINER")
@@ -654,6 +671,17 @@ trait UeRuntime: Send + Sync {
             .spawn()
             .map_err(|_| "IPERF3_UL_RECEIVER_SPAWN_FAILED")?;
         std::thread::sleep(std::time::Duration::from_millis(200));
+        let iperf = iperf3_program();
+        let command = vec![
+            iperf.clone(),
+            "-c".into(),
+            sender.sender_ip.to_string(),
+            "-n".into(),
+            bytes.to_string(),
+            "--connect-timeout".into(),
+            "5000".into(),
+            "-J".into(),
+        ];
         let client_output = Command::new("/usr/bin/timeout")
             .args([
                 "--signal=TERM",
@@ -664,7 +692,7 @@ trait UeRuntime: Send + Sync {
                 &target.namespace_pid.to_string(),
                 "--net",
                 "--",
-                "/usr/bin/iperf3",
+                &iperf,
                 "-c",
                 &sender.sender_ip.to_string(),
                 "-n",
@@ -678,7 +706,7 @@ trait UeRuntime: Send + Sync {
         if !client_output.status.success() {
             let _ = receiver.kill();
             let _ = receiver.wait();
-            return Err("IPERF3_UL_FAILED".into());
+            return Err(iperf_failure("IPERF3_UL_FAILED", &client_output, command));
         }
         let receiver_output = receiver
             .wait_with_output()
@@ -717,6 +745,7 @@ trait UeRuntime: Send + Sync {
             .container
             .as_deref()
             .ok_or("DL_SENDER_NOT_CONFIGURED")?;
+        let iperf = iperf3_program();
         let mut receiver = Command::new("/usr/bin/timeout")
             .args([
                 "--signal=TERM",
@@ -727,7 +756,7 @@ trait UeRuntime: Send + Sync {
                 &target.namespace_pid.to_string(),
                 "--net",
                 "--",
-                "/usr/bin/iperf3",
+                &iperf,
                 "-s",
                 "-1",
                 "-J",
@@ -6779,9 +6808,18 @@ fn execute_live_definition_job(
                 terminal_state = "FAILED";
                 terminal_result = "STEP_FAILED".into();
                 let _ = update_definition_record(&state, &job_id, |record| {
+                    let evidence = serde_json::from_str::<Value>(&error).ok();
+                    let code = evidence
+                        .as_ref()
+                        .and_then(|value| value.get("error"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&error);
                     record["steps"][position]["state"] = json!("FAILED");
                     record["steps"][position]["ended_at"] = json!(epoch_seconds());
-                    record["steps"][position]["error"] = json!(error);
+                    record["steps"][position]["error"] = json!(code);
+                    if let Some(evidence) = evidence {
+                        record["steps"][position]["failure_evidence"] = evidence;
+                    }
                 });
                 break;
             }
@@ -11544,5 +11582,29 @@ mod p0_tests {
         }
         let legacy = required_runtime_containers(true, false);
         assert!(legacy.contains(&"oiran-lab-ueransim-ue-1"));
+    }
+
+    #[test]
+    fn iperf_failure_preserves_bounded_diagnostics() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(7 << 8),
+            stdout: Vec::new(),
+            stderr: vec![b'x'; 4096],
+        };
+        let encoded = iperf_failure(
+            "IPERF3_UL_FAILED",
+            &output,
+            vec!["/opt/polaris-control/libexec/iperf3".into(), "-c".into()],
+        );
+        let evidence: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(evidence["error"], "IPERF3_UL_FAILED");
+        assert_eq!(evidence["exit_code"], 7);
+        assert_eq!(evidence["stderr"].as_str().unwrap().len(), 2048);
+        assert_eq!(
+            evidence["command"][0],
+            "/opt/polaris-control/libexec/iperf3"
+        );
     }
 }
