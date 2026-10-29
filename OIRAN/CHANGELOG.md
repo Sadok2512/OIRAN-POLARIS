@@ -1,5 +1,58 @@
 # Changelog
 
+## oiran-decode v0.4.4 — pycrate-grounded real TS 38.413 transfer decoders
+
+- `decoder-ngap v0.6.0`:
+  - **Real ASN.1 ground truth: pycrate.** Replaced the simplified asn1tools
+    schema (removed `tests/fixtures/aper-transfer.asn` and the asn1tools
+    generator) with pycrate (`pycrate_asn1dir.NGAP`), the only Python library
+    that compiles the full TS 38.413 3GPP ASN.1 module. Fixtures are now
+    pycrate `.to_aper()` outputs of real NGAP types.
+  - **Request transfer = ProtocolIE-Container.**
+    `decode_pdu_session_resource_setup_request_transfer` now walks the real
+    `SEQUENCE { protocolIEs ProtocolIE-Container {...} }` structure: outer
+    SEQUENCE ext + 1-bit, 2-octet container size, then per-item
+    `{ id, criticality, value OPEN TYPE }`. Decoded IEs:
+    `id-UL-NGU-UP-TNLInformation` (139), `id-PDUSessionType` (134),
+    `id-QosFlowSetupRequestList` (136),
+    `id-PDUSessionAggregateMaximumBitRate` (130). Unknown IEs are retained
+    with `{id, criticality, length}` on `unknown_protocol_ies` and named in
+    `errors`; the OPEN TYPE length determinant lets the walker skip them
+    cleanly instead of de-syncing.
+  - **Response transfer: 4 top-level OPTIONALs + extensions.** The response
+    SEQUENCE now reads the correct 5-bit preamble (ext + additional +
+    security + failed + iE-Ext) and parses the `iE-Extensions`
+    ProtocolExtensionContainer when present, extracting
+    `id-RedundantDLQosFlowPerTNLInformation` (id 196) into `redundant`;
+    other extensions are retained verbatim with their id/length.
+  - **IE 71 / IE 72 (Cxt-Req / Cxt-Res).**
+    `decode_pdu_session_resource_setup_list_cxt_req` and `_cxt_res` cover
+    `PDUSessionResourceSetupListCxtReq` / `CxtRes` from the
+    `InitialContextSetupRequest/Response` procedures (used by Open5GS to
+    mount the session via the Initial Context Setup path).
+  - **Correct extensibility on primitives.** Audited every INTEGER / ENUMERATED
+    / CHOICE in the real NGAP module and fixed the extension-marker handling:
+    `QosFlowIdentifier` is extensible (1 ext bit + 6-bit value, 7 bits total),
+    `PriorityLevelARP` is NOT extensible (4-bit bit-field),
+    `UPTransportLayerInformation` is NOT extensible (1-bit choice index for
+    gTPTunnel vs choice-Extensions),
+    `Cause` is NOT extensible (3-bit index for 6 root alternatives including
+    choice-Extensions). The old implementation was wrong on all four, which
+    is why the asn1tools-simplified fixtures looked self-consistent but
+    disagreed with real captures.
+  - **Guard-rail.** `tests/pycrate_fixtures.rs` includes an explicit guard
+    that encodes `TEID=0x11223344` and `QFI=5` with pycrate and asserts the
+    exact values round-trip through the decoder. Separate tests prove
+    mangled or truncated bytes return a NON-matching value AND surface
+    named `errors` entries — the decoder never silently fabricates a wrong
+    value.
+  - **8 new typed structs** exposed on the public API (`SNssai`,
+    `SetupItemSUReq`, `SetupItemSURes`, `ListSUReq`, `ListSURes`,
+    `UnknownProtocolIe`, `UpTransportLayerInformation::ChoiceExtensions`,
+    `QosCharacteristics::ChoiceExtensions`) plus `serde::Serialize` on
+    every public type so the `ngap-decode-hex` diagnostic CLI emits a
+    complete JSON tree.
+
 ## oiran-decode v0.4.3 — real outer-list walker, ENUMERATED extension, diagnostic CLI
 
 - `decoder-ngap v0.5.1`:

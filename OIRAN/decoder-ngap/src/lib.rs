@@ -4,14 +4,14 @@ pub mod aper;
 mod transfer;
 
 pub use transfer::{
-    decode_pdu_session_resource_setup_list_su_req,
-    decode_pdu_session_resource_setup_list_su_res,
+    decode_pdu_session_resource_setup_list_cxt_req, decode_pdu_session_resource_setup_list_cxt_res,
+    decode_pdu_session_resource_setup_list_su_req, decode_pdu_session_resource_setup_list_su_res,
     decode_pdu_session_resource_setup_request_transfer,
     decode_pdu_session_resource_setup_response_transfer, AllocationAndRetention,
     AssociatedQosFlowItem, AssociatedQosFlowMapping, CauseKind, FailedQosFlow, GbrQosInformation,
     GtpTunnel, ListSURes, ListSUReq, QosCharacteristics, QosFlowLevelQosParams, QosFlowPerTnlInfo,
     QosFlowSetupRequestItem, RequestTransfer, ResponseTransfer, SNssai, SecurityResultDecoded,
-    SetupItemSURes, SetupItemSUReq, UpTransportLayerInformation,
+    SetupItemSURes, SetupItemSUReq, UnknownProtocolIe, UpTransportLayerInformation,
 };
 
 use decoder_nas::NasMessage;
@@ -24,7 +24,7 @@ use plugin_runtime::{
     PLUGIN_API_VERSION,
 };
 
-pub const VERSION: &str = "0.5.1";
+pub const VERSION: &str = "0.6.0";
 pub const SCHEMA_VERSION: &str = "3GPP TS 38.413 V17.3.0";
 pub const SCHEMA_SHA256: &str = "b705532dd52674fce67ccc01df7bd17a8412341ea82740c164029a5b545f04d2";
 #[derive(Default)]
@@ -488,11 +488,13 @@ fn append_sureq_item_summary(
         value.push_str(&format!(",item_{index}_ie_extensions=present"));
     }
     let decoded = transfer::decode_pdu_session_resource_setup_request_transfer(&item.transfer);
-    if let Some(ip) = decoded.ul_tunnel.ipv4_address() {
-        value.push_str(&format!(",item_{index}_{ip_label}={ip}"));
-    }
-    if let Some(teid) = decoded.ul_tunnel.teid() {
-        value.push_str(&format!(",item_{index}_{teid_label}=0x{teid:x}"));
+    if let Some(ul) = &decoded.ul_tunnel {
+        if let Some(ip) = ul.ipv4_address() {
+            value.push_str(&format!(",item_{index}_{ip_label}={ip}"));
+        }
+        if let Some(teid) = ul.teid() {
+            value.push_str(&format!(",item_{index}_{teid_label}=0x{teid:x}"));
+        }
     }
     if let Some(pt) = decoded.pdu_session_type {
         value.push_str(&format!(",item_{index}_pdu_session_type={pt}"));
