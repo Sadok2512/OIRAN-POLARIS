@@ -14,7 +14,9 @@ systemctl restart oiran-api.service
 
 Expected effect: the importer opens its persisted checkpoint/ledger, resumes
 at the first uncommitted source record, and leaves OIRAN-native capture
-disabled. External `dumpcap` processes are independent and are not signalled.
+disabled. The source is the API's exact allowlisted collector volume,
+`/var/lib/docker/volumes/oiran_lab_pcap/_data`. External `dumpcap` processes
+are independent and are not signalled.
 Before executing, the checkpoint generation, source identities, offsets and
 event/session stable IDs must be snapshotted and verified according to the
 V1.1 lossless-recovery procedure.
