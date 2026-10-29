@@ -67,6 +67,14 @@ export interface WireLabObserved {
   ueransim_ue_profile?: boolean;
   ueransim_profile?: string;
   open5gs?: WireContainerStatus;
+  /**
+   * 0.7.0 — Per-NF container map, keyed by canonical NF name (AMF, SMF,
+   * UPF, NRF, AUSF, UDM, UDR, PCF, NSSF, BSF, SMSF…). Each entry is the
+   * same WireContainerStatus shape as `open5gs`. When the backend omits
+   * it, the Topology page falls back to the aggregated `open5gs`
+   * container and marks every other NF as "not exposed".
+   */
+  nfs?: Record<string, WireContainerStatus>;
   ueransim_gnb?: WireContainerStatus;
   ueransim_ue?: WireContainerStatus;
   srsran_enb?: WireContainerStatus;

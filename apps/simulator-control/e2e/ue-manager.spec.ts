@@ -82,10 +82,21 @@ async function mockApi(page: Page) {
 test.describe('UE Manager', () => {
   test.beforeEach(async ({ page }) => {
     await mockApi(page);
+    await page.addInitScript(() => {
+      localStorage.setItem(
+        'polaris.featureFlags.v1',
+        JSON.stringify({
+          scenarioBackend: true,
+          profileBackend: true,
+          scenarioTemplates: true,
+          polarisProvisioning: false,
+        }),
+      );
+    });
   });
 
   test('table has grouped Runtime header and fixed width', async ({ page }) => {
-    await page.goto('/#/ues');
+    await page.goto('./ues');
     const table = page.getByTestId('ue-table');
     await expect(table).toBeVisible();
     await expect(table).toContainText('Runtime');

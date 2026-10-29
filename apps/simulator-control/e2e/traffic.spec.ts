@@ -62,7 +62,7 @@ test.describe('traffic generator', () => {
   });
 
   test('shows UL and DL direction cards with measured bytes and DL sender state', async ({ page }) => {
-    await page.goto('/#/traffic');
+    await page.goto('./traffic');
     await expect(page.getByTestId('traffic-ul-card')).toBeVisible();
     await expect(page.getByTestId('traffic-dl-card')).toBeVisible();
     await expect(page.getByTestId('traffic-ul-sender')).toContainText('1');

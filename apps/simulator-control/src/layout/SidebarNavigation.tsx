@@ -10,6 +10,7 @@ import {
   Zap,
   Cpu,
   Network,
+  Users,
 } from 'lucide-react';
 import clsx from 'clsx';
 
@@ -23,6 +24,7 @@ const NAV = [
   { to: '/scenarios/monitor', label: 'Execution Monitor', Icon: Activity, section: 'SIMULATION' },
   { to: '/traffic', label: 'Traffic Generator', Icon: Zap, section: 'SIMULATION' },
   { to: '/history', label: 'History', Icon: History, section: 'REVIEW' },
+  { to: '/provisioning', label: 'Provisioning', Icon: Users, section: 'PLATFORM' },
   { to: '/settings', label: 'Settings', Icon: SettingsIcon, section: 'PLATFORM' },
 ] as const;
 

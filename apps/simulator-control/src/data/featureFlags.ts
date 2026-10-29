@@ -36,6 +36,21 @@ export interface FeatureFlags {
    * `feat/polaris-traffic-templates`.
    */
   scenarioTemplates: boolean;
+  /**
+   * 0.6.0 — When true, the UI calls the richer provisioning surface
+   * published by Codex on `feat/polaris-provisioning`:
+   *   GET  /owners                                   → owner directory
+   *   GET  /plmns                                    → allowed PLMNs
+   *   GET  /dnns                                     → allowed DNNs
+   *   POST /provisioning/import  (CSV, up to 100k rows)
+   *   POST /ue-profiles/import   (CSV, up to 100k rows)
+   *   GET  /ue-profiles/:ue_id                       → detail card body
+   * When false, the Provisioning page shows "Backend pending" and
+   * dropdowns fall back to free-text + warning text. profileBackend is
+   * also forced ON (local UE form path becomes unreachable from the UI).
+   * Default OFF until the backend branch is deployed.
+   */
+  polarisProvisioning: boolean;
 }
 
 // 0.5.1 — `scenarioBackend` defaults to ON so the honest Scenario Builder
@@ -47,6 +62,7 @@ const DEFAULTS: FeatureFlags = {
   scenarioBackend: true,
   profileBackend: false,
   scenarioTemplates: true,
+  polarisProvisioning: false,
 };
 
 function read(): FeatureFlags {

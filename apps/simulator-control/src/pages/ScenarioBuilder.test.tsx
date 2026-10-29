@@ -39,51 +39,95 @@ beforeEach(() => {
   _resetFlags();
   // 0.5.1 default is ON; be explicit for clarity.
   setFlag('scenarioBackend', true);
-  // The library hook fetches /scenario-definitions on mount; stub it so the
-  // page renders instantly without hitting the real backend.
+  // The library hook fetches /scenario-definitions on mount and the
+  // ScenarioBuilder fetches /capabilities; stub both. By default
+  // capabilities omits `scenario_step_kinds`, so only the pre-0.5.2
+  // whitelist stays clickable.
+  stubFetch({ advertisedKinds: undefined });
+});
+
+function stubFetch({ advertisedKinds }: { advertisedKinds?: string[] }) {
   globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.endsWith('/scenario-definitions')) {
       return respond(200, { items: [], total: 0, schema_version: 1 });
     }
+    if (url.endsWith('/capabilities')) {
+      return respond(200, {
+        live_control: false,
+        approval_state: 'LAB',
+        max_ues: 100,
+        max_nodes: 10,
+        registration_modes: [],
+        traffic_protocols: [],
+        approved_destinations: [],
+        profiles: [],
+        technologies: [],
+        services: [],
+        ...(advertisedKinds ? { scenario_step_kinds: advertisedKinds } : {}),
+      });
+    }
     return respond(404, { error: 'not stubbed' });
   }) as unknown as typeof fetch;
-});
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
   _resetFlags();
 });
 
-describe('ScenarioBuilder — honest palette (0.5.1)', () => {
-  it('exposes exactly 9 backend-certified step chips as clickable and locks the rest with their reason', async () => {
+describe('ScenarioBuilder — honest palette (0.5.1 + 0.5.2)', () => {
+  it('exposes exactly 6 backend-certified step chips when /capabilities omits scenario_step_kinds', async () => {
     renderPage();
-    // Wait for the hydrated draft.
     await screen.findByTestId('step-palette');
+    // Wait for /capabilities to resolve so the Builder has had a chance to
+    // promote any advertised kinds. Here capabilities omits the field, so the
+    // palette must only expose the pre-0.5.2 whitelist of six.
+    await waitFor(() => {
+      expect(screen.getByTestId('add-step-UE_START')).toBeInTheDocument();
+    });
 
-    const certifiedKinds = (Object.keys(STEP_METADATA) as ScenarioStepKind[]).filter(
-      (kind) => STEP_METADATA[kind].backendCertified,
-    );
-    const lockedKinds = (Object.keys(STEP_METADATA) as ScenarioStepKind[]).filter(
-      (kind) => !STEP_METADATA[kind].backendCertified,
-    );
-    // Sanity: 20 kinds total = 9 certified + 11 locked.
-    expect(certifiedKinds).toHaveLength(9);
-    expect(lockedKinds).toHaveLength(11);
-
-    for (const kind of certifiedKinds) {
-      const chip = screen.getByTestId(`add-step-${kind}`);
-      expect(chip).toBeEnabled();
+    const CERTIFIED_WHEN_UNANNOUNCED: ScenarioStepKind[] = [
+      'UE_START',
+      'PDU_ESTABLISH',
+      'UDP_TRAFFIC',
+      'IDLE',
+      'PDU_RELEASE',
+      'UE_STOP',
+    ];
+    expect(CERTIFIED_WHEN_UNANNOUNCED).toHaveLength(6);
+    for (const kind of CERTIFIED_WHEN_UNANNOUNCED) {
+      expect(screen.getByTestId(`add-step-${kind}`)).toBeEnabled();
     }
-    for (const kind of lockedKinds) {
+
+    // The 0.5.2-pending kinds show up as LOCKED with the exact "Backend
+    // pending: feat/polaris-traffic-templates" reason — because
+    // /capabilities did not advertise them.
+    for (const kind of ['TRAFFIC_UL', 'DETACH', 'REPEAT'] as const) {
       const chip = screen.getByTestId(`locked-step-${kind}`);
       expect(chip).toHaveAttribute('aria-disabled', 'true');
-      // The backendNote shows up verbatim in the chip's `title`.
-      const reason = STEP_METADATA[kind].backendNote ?? '';
-      if (reason) expect(chip).toHaveAttribute('title', reason);
+      expect(chip).toHaveAttribute('title', 'Backend pending: feat/polaris-traffic-templates.');
     }
-    // The chip count surfaced in the DOM matches the certified count exactly:
-    // "no non-certified chip is clickable" is enforced by the two loops above.
+    // STEP_METADATA bookkeeping is still consistent.
+    const metaCertifiedCount = (Object.keys(STEP_METADATA) as ScenarioStepKind[]).filter(
+      (k) => STEP_METADATA[k].backendCertified,
+    ).length;
+    expect(metaCertifiedCount).toBe(6);
+  });
+
+  it('promotes TRAFFIC_UL / DETACH / REPEAT to clickable when /capabilities advertises them (0.5.2)', async () => {
+    stubFetch({ advertisedKinds: ['traffic_ul', 'detach', 'repeat'] });
+    renderPage();
+    // Wait for the capabilities-driven promotion to show up.
+    await waitFor(() => {
+      expect(screen.getByTestId('add-step-TRAFFIC_UL')).toBeInTheDocument();
+    });
+    expect(screen.getByTestId('add-step-TRAFFIC_UL')).toBeEnabled();
+    expect(screen.getByTestId('add-step-DETACH')).toBeEnabled();
+    expect(screen.getByTestId('add-step-REPEAT')).toBeEnabled();
+    // The remaining locked kinds stay locked (TRAFFIC_DL, IMS_REGISTER, …).
+    expect(screen.getByTestId('locked-step-TRAFFIC_DL')).toHaveAttribute('aria-disabled', 'true');
+    expect(screen.getByTestId('locked-step-IMS_REGISTER')).toHaveAttribute('aria-disabled', 'true');
   });
 
   it('locks Infinite, Random and Custom loop presets when scenarioBackend is ON', async () => {

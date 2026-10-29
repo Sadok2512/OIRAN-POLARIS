@@ -48,6 +48,15 @@ export interface Capabilities {
   }[];
   technologies: Technology[];
   services: ServiceCapability[];
+  /**
+   * 0.5.2 — Wire step types the backend is willing to execute, as
+   * published by `GET /capabilities`. The field stays optional: when the
+   * backend omits it, we fall back to the six-type polaris-control-api
+   * 0.9.0 whitelist (`ue_start`, `ue_stop`, `pdu_establish`, `pdu_release`,
+   * `udp_traffic`, `wait`). Any kind flagged `backendCertified: false` in
+   * `STEP_METADATA` becomes clickable only when it appears in this list.
+   */
+  scenario_step_kinds?: string[];
 }
 
 /**

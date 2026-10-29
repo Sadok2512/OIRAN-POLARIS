@@ -98,11 +98,11 @@ test.describe('topology', () => {
   });
 
   test('each gNB card shows UE cards with PROTECTED identity marker', async ({ page }) => {
-    await page.goto('/#/network/topology');
+    await page.goto('./network/topology');
     const node = page.getByTestId('topology-node-GNB-01');
     await expect(node).toBeVisible();
-    await expect(page.getByTestId('topology-ue-cards-GNB-01')).toBeVisible();
-    const ueCard = page.getByTestId('topology-ue-card-UE-01');
+    await expect(page.getByTestId('topology-ues-GNB-01')).toBeVisible();
+    const ueCard = page.getByTestId('topology-ue-UE-01');
     await expect(ueCard).toBeVisible();
     await expect(ueCard).toContainText('REGISTERED');
     await expect(ueCard).toContainText('ACTIVE');

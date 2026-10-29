@@ -3,6 +3,15 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.9.1 — 2026-10-29 (patch)
+
+- Merge the deployed 0.7.1 lineage into the 0.9 manager/execution/traffic
+  candidate without dropping the 0.6 provisioning flows or the 0.7 topology.
+- Preserve the 0.7 NF/gNB topology and extend its UE cards with the 0.9 process
+  state and literal `PROTECTED` identity marker.
+- Retain every backend authorization and feature gate; this merge performs no
+  live UE, traffic or scenario action.
+
 ## 0.9.0 — 2026-10-29 (minor)
 
 Manager / Execution Monitor / Traffic Generator / Topology refresh,
@@ -121,11 +130,262 @@ Subscriber front surface aligned with polaris-control-api 0.17.0.
 - Playwright test fixtures (`e2e/subscribers.spec.ts`) use `PROTECTED`
   values in the mocked API — no real identity material in artefacts.
 
+## 0.7.1 — 2026-10-28 (patch)
+
+Operator-driven recette fixes against the real backend contract. The LOT
+targeted five surface items; all land behind the existing
+`polarisProvisioning` flag.
+
+### Changed
+
+- **`POST /ue-profiles` body is now the slim whitelist**
+  `{ue_id, gnb_id, owner, note, imsi}`. The 0.11-era carriers
+  (`provisioning_slot`, `k`, `opc`, `keep_identity`, `plmn_mcc`,
+  `plmn_mnc`, `dnn`, `sst`, `sd`, `scenario_id`, `auto_run_scenario`,
+  `name`) are never attached — the UI can no longer cause the
+  AUTHENTICATION_KEY_REQUIRED surprise.
+- **Add UE dialog**: swaps `Name` for **`UE ID`** with live validation
+  (format `UE-NN` / `UE-NNNNN`) and the matching hint. Still asks for
+  gNB + Owner + Note + masked IMSI.
+- **IMSI normalization**: both the Add UE and Add Subscriber dialogs
+  accept raw digits (`001010000000201`) OR the prefixed form
+  (`imsi-001010000000201`); `normalizeImsi` canonicalises to the
+  prefixed form before send. Lives in a new
+  `src/data/identityFormats.ts` with full test coverage.
+- **Add Subscriber dialog**: slice (SST + SD) comes from a dropdown
+  fed by `/plmns.items[].slices[]`, DNN from `/dnns.items[]`. Free-text
+  SST, SD and DNN inputs are gone (hardening after two subscribers
+  landed on 1/000001 via free SD and were not served).
+- **Topology UE cards** under each gNB now render the UE id, the
+  registration-state pill, the `PDU` pill when the session is active,
+  and the UE IP straight from `/ues`. Nothing is fabricated — a missing
+  IP shows as an em-dash.
+- **Provisioning page**: clicking a subscriber row opens a detail panel
+  sourced from `GET /subscribers/:slot` with Identity (PROTECTED
+  triplet), Network (PLMN / slice / DNNs), AMBR and the list of
+  bound UEs. **Edit** button is present but disabled with the title
+  "Backend pending: `PUT /subscribers/:slot`" until the backend
+  publishes it.
+
+### Added
+
+- `src/data/identityFormats.ts` — `normalizeImsi`, `isImsiValid`,
+  `isUeIdValid`, `UE_ID_RE`, `UE_ID_HINT`.
+- `createUeProvisioningProfile(input)` in
+  `src/data/provisioningApi.ts` — the slim POST helper.
+- `src/pages/Provisioning.test.tsx` — detail panel + locked Edit tests.
+- Playwright capture `provisioning-detail.chromium-{light,dark}.png`
+  alongside the other 0.6.x/0.7.x shots in `docs/screenshots/v0.6.0/`.
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → **Test Files 25 passed (25) · Tests 162 passed (162)**
+  (3 new in `Provisioning.test.tsx`, 2 new in `identityFormats.test.ts`,
+  the Add dialogs rewritten against the new contract, one new Topology
+  assertion covering the enriched UE mini-card).
+- `npm run build` → clean, no fixture leak in `dist/`.
+
+## 0.7.0 — 2026-10-28 (minor)
+
+Topology redrawn to match the mockup
+(`origin/docs/ui-mockups/polaris-control.html` → `Topology` view).
+The page is now a true vertical tree — a Core block over an NF grid, two
+colored connectors (`N2 · NGAP`, `N3 · GTP-U`) stretching down into gNB
+cards, and a UE grid under each gNB.
+
+### Added
+
+- **NF grid** — Core block renders the ten canonical NFs (AMF, SMF, UPF,
+  NRF, AUSF, UDM, UDR, PCF, NSSF, BSF). Each pill carries a state dot
+  (green / amber / red / neutral) driven by the new
+  `nfPillState(nfKey, observed)` helper. The source of truth is
+  `/lab.observed.nfs` when the backend publishes a per-NF container map;
+  otherwise AMF reflects the aggregated `/lab.observed.open5gs` and the
+  other pills stay neutral with the honest "not exposed by
+  /lab.observed.nfs" tooltip. Core status badge shows `up / total` when
+  the per-NF map ships.
+- **Colored connectors** — a `Connector` component renders a vertical
+  line + label + line between the Core block and each gNB. Line colour
+  follows `linkState` single source of truth:
+  - green → `configured` (process running + endpoint reported)
+  - gray  → `unknown`   (no endpoint reported)
+  - red   → `down`       (process not running)
+  The UI never says `UP`.
+- **Technology-aware labels** — 5G nodes get `N2 · NGAP` and `N3 · GTP-U`;
+  LTE nodes get `S1-MME · S1AP` and `S1-U · GTP-U`.
+- **Dashed non-configured cards** — gNBs with `configured: false`
+  render dashed with a `data-dashed="true"` attribute. The existing
+  `controller_owned: false` reason (`SHARED_NODE_PROTECTED`,
+  `LIVE_005_APPROVAL_REQUIRED`, `LTE_ATTACH_NOT_CERTIFIED`, …) stays
+  inline.
+- **Wire type** — `WireLabObserved` grows an optional
+  `nfs?: Record<string, WireContainerStatus>`. The field is optional so
+  backends still publishing only the aggregated `open5gs` container keep
+  rendering the honest fallback.
+- **Playwright capture** `topology.chromium-{light,dark}.png` lands in
+  `docs/screenshots/v0.6.0/` alongside the other 0.6.x captures (the
+  mockup lives at `docs/ui-mockups/polaris-control.html` on
+  `origin/docs/ui-mockups`; the capture is tagged "mocked API").
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → **Test Files 23 passed (23) · Tests 152 passed (152)**
+  (7 new in `src/pages/Topology.test.tsx`: `nfPillState` suite, NF grid
+  tones from `/lab.observed.nfs`, aggregated fallback, N2/N3 connector
+  colour on a running gNB, dashed card + LTE labels on ENB-01 / GNB-02).
+- `npm run build` → clean, no fixture leak in `dist/`.
+
+## 0.6.1 — 2026-10-28 (patch)
+
+Align the provisioning calls with the real backend contract shipped by
+Codex on polaris-control-api **0.15.1 (`fc6d8ed`)**. The 0.6.0 stubs
+(/provisioning/import, /ue-profiles/import, multipart form data) are
+gone; the UI now hits the real endpoints with the exact body shapes.
+
+### Changed
+
+- **`POST /subscribers/bulk`** replaces `/provisioning/import`. Body is
+  **raw `text/csv`** (not multipart). Expected header:
+  `imsi,k,opc,sst,sd,dnns,ambr_uplink,ambr_downlink`.
+- **`POST /ue-profiles/bulk`** replaces `/ue-profiles/import`. Same
+  `text/csv` contract. Expected header:
+  `ue_id,gnb_id,note,imsi`.
+- **`uploadCsvImport(target, file)`** in `src/data/provisioningApi.ts`:
+  target type becomes `'subscribers' | 'ue-profiles'`; builds a plain
+  `text/csv` body (`await file.text()`) and sets the matching
+  `Content-Type` header.
+- **CsvImportDialog descriptions** reflect the new column headers so the
+  operator sees the real contract before uploading.
+
+### Added
+
+- **`AddSubscriberDialog`** (`src/subscribers/AddSubscriberDialog.tsx`)
+  wired to `POST /subscribers` with the exact body:
+  `{ imsi, k, opc, sst, sd, dnns[], ambr: { uplink, downlink } }`.
+  IMSI, K and OPc are password inputs; the three fields are **scrubbed
+  from React state immediately after submit** so the browser never
+  retains the secret across renders. On success, a green banner shows
+  the backend-assigned slot id and reminds the operator the material
+  is now `PROTECTED`.
+- Backend error codes are surfaced verbatim with the HTTP status —
+  `409 SUBSCRIBER_NOT_POLARIS_OWNED`, `422 SUBSCRIBER_NOT_PROVISIONED`
+  and others. No translation, no fallback copy.
+- **`createSubscriber(input)`** helper exported from
+  `src/data/provisioningApi.ts` so the dialog can live in its own
+  module without pulling in the full React Query mutation surface.
+
+### Removed
+
+- The disabled "Add subscriber" placeholder on the Provisioning page is
+  replaced with the real dialog.
+- `/provisioning/import` and `/ue-profiles/import` paths are no longer
+  referenced anywhere in the frontend.
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → **Test Files 23 passed (23) · Tests 148 passed (148)**
+  (4 new in `AddSubscriberDialog.test.tsx`, CSV test rewritten against
+  the real `text/csv` + `/subscribers/bulk` contract).
+- `npm run build` → clean, no fixture leak in `dist/`.
+
+## 0.6.0 — 2026-10-28 (minor)
+
+Provisioning layer anticipating Codex's `feat/polaris-provisioning` branch
+(polaris-control-api). Everything new sits behind the
+**`polarisProvisioning`** feature flag, default **OFF**, honest "Backend
+pending" placeholders when the backend returns 404. Three commits
+compose this release:
+
+### Added
+
+- **Flag `polarisProvisioning`** (default OFF). When ON, the UI consumes
+  `/owners`, `/plmns`, `/dnns`, `/subscribers`, `/ue-profiles/import`,
+  `/provisioning/import` and `/ue-profiles/:id`. `profileBackend` is
+  forced ON (the local UE form path is unmounted).
+- **Templates "Clone"** no longer POSTs the backend clone route. It
+  decodes the template into a `Scenario` and navigates to
+  `/scenarios/new` with `location.state.seedFromTemplate`. The Builder
+  consumes the seed, clears the id/version so Save creates a new
+  definition; `tpl-*` stay read-only.
+- **Add UE dialog** (`UeProvisioningAddDialog`) exposes four fields —
+  Name, gNB, Owner, Note, masked IMSI. IMSI is a password input,
+  cleared from component state immediately after submit; the backend
+  echoes it back as `PROTECTED`.
+- **Provisioning page** (`/provisioning`): subscriber directory + CSV
+  import (≤ 100 000 rows). Sidebar entry under `PLATFORM`.
+- **Shared `CsvImportDialog`** with a streaming preview
+  (`src/data/csvImport.ts`): non-blocking chunked read (1 MiB blocks,
+  yielding to the event loop between chunks), local cap at
+  `CSV_IMPORT_MAX_LINES = 100 000`, per-line backend error report
+  rendered as a scrollable table (code column + message). Used by
+  Provisioning AND the UE Manager (Import CSV button swaps to the
+  backend dialog under the flag).
+- **UE detail page** (`/ues/:ueId`) with eight structured blocks —
+  Identity, Provisioning, Network profile, Registration, PDU sessions,
+  IMS, Scenario, Traffic. IMSI/authentication display as `PROTECTED`
+  (with a lock icon). Links from UE Manager rows when the flag is ON.
+- **Dropdowns**: `/owners`, `/plmns`, `/dnns`, `/gnbs` and
+  `/scenario-definitions` back every write path. Free-text input is
+  gone from the create-time surface; dropdowns show "Backend pending"
+  when their directory is empty or 404.
+- **Playwright minimal setup**: `playwright.config.ts` with two
+  projects (`chromium-light`, `chromium-dark`), `e2e/captures.spec.ts`
+  with `page.route`-mocked POLARIS, screenshots for Templates /
+  UE Manager / Provisioning / UE detail land in
+  `docs/screenshots/v0.6.0/*.{chromium-light,chromium-dark}.png`.
+  Captures are tagged as "mocked API" in `docs/screenshots/v0.6.0/README.md`.
+
+### Benchmarks
+
+- **CSV preview — 100 000 rows parsed in ~211 ms** (jsdom, see
+  `src/data/csvImport.test.ts` stdout). A `setTimeout(…, 0)` sentinel
+  task fires during the parse — proof the main thread yields and the
+  UI stays responsive without a Web Worker.
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → **Test Files 22 passed (22) · Tests 144 passed (144)**
+- `npm run build` → clean
+- Playwright captures: run `npm run e2e` after
+  `npm install @playwright/test@1.57.0` (added to `devDependencies`).
+
 ## 0.5.2 — 2026-10-28 (patch)
 
-- Enable `scenarioTemplates` by default for the deployed API 0.13.0 contract while preserving
-  Operator authentication, CSRF enforcement, and all backend live-execution gates.
+Honesty follow-up on the Scenario Builder palette: `TRAFFIC_UL`, `DETACH`
+and `REPEAT` are NOT executed by the production backend today. 0.5.1
+incorrectly offered them as clickable because scenario-definition v2 was
+assumed landed on `polaris-control-api`. It is not.
 
+### Changed
+
+- **`STEP_METADATA` demotion**: `TRAFFIC_UL`, `DETACH`, `REPEAT` move from
+  `backendCertified: true` to `backendCertified: false`. Each now carries
+  the exact reason **"Backend pending: feat/polaris-traffic-templates."**.
+  Pre-0.5.2 whitelist of clickable chips is now: `UE_START`,
+  `PDU_ESTABLISH`, `UDP_TRAFFIC`, `IDLE`, `PDU_RELEASE`, `UE_STOP` — **6
+  chips**.
+- **Capabilities-driven promotion**: `Capabilities` gains an optional
+  `scenario_step_kinds?: string[]`. When `GET /capabilities` lists a wire
+  type (e.g. `"traffic_ul"`), the Builder promotes that kind back to
+  "Supported" automatically — without touching `STEP_METADATA`. The
+  single source of truth for "the backend will execute this step" is the
+  capabilities payload, not a frontend constant.
+- **New helper** `isStepKindExecutable(kind, advertisedWireTypes)` in
+  `src/scenarios/model.ts` centralises the OR between the metadata flag
+  and the advertised wire-type list, so ScenarioBuilder, Save guard and
+  banner all answer the same question identically.
+
+### Validation (manual, no CI)
+
+- `npx tsc --noEmit` → clean
+- `npx vitest run` → **Test Files 17 passed (17) · Tests 129 passed (129)**
+  (new test covers both the 6-chip baseline and the capabilities-driven
+  promotion of `traffic_ul` / `detach` / `repeat`).
+- `npm run build` → clean, no fixture leak in `dist/`.
 ## 0.5.1 — 2026-10-28 (patch)
 
 Honesty pass on the Scenario Builder: `scenarioBackend` now defaults to ON,

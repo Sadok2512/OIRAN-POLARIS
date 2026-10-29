@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   AlertTriangle,
   ArrowDown,
@@ -16,10 +16,12 @@ import { PageHeader } from '@/ui/PageHeader';
 import { EmptyState } from '@/ui/EmptyErrorLoading';
 import { useScenarioLibrary } from '@/scenarios/library';
 import { isLoopRepresentable } from '@/scenarios/wireCodec';
+import { useCapabilities } from '@/data/queries';
 import {
   PARAM_META,
   STEP_METADATA,
   emptyScenario,
+  isStepKindExecutable,
   newStepId,
   validateScenario,
   type FixedOrRandom,
@@ -36,11 +38,23 @@ import { ScenarioTimeline } from '@/components/ScenarioTimeline';
 export function ScenarioBuilderPage() {
   const { scenarioId } = useParams<{ scenarioId: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const library = useScenarioLibrary();
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
+  // 0.6.0 — Template Clone navigates here with `state.seedFromTemplate`
+  // carrying a decoded Scenario. The Builder consumes it ONCE on mount
+  // (so a page refresh falls back to the empty draft) and clears the id
+  // so Save creates a brand-new definition rather than updating the
+  // template.
+  const seededFromTemplate = (location.state as { seedFromTemplate?: Scenario } | null)
+    ?.seedFromTemplate;
+
   const [draft, setDraft] = useState<Scenario>(() => {
+    if (seededFromTemplate) {
+      return { ...seededFromTemplate, id: emptyScenario().id, version: 1 };
+    }
     const existing = scenarioId
       ? library.scenarios.find((item) => item.id === scenarioId)
       : null;
@@ -56,22 +70,27 @@ export function ScenarioBuilderPage() {
   const issues = useMemo(() => validateScenario(draft), [draft]);
   const errors = issues.filter((issue) => issue.level === 'error');
 
-  // Honest palette: only backend-certified kinds are clickable in backend mode.
-  // In offline-draft mode we keep every kind clickable but still render them
-  // in the "Not supported yet" group so the operator sees the backend reason.
+  // 0.5.2 — The three new-contract kinds (TRAFFIC_UL, DETACH, REPEAT) are
+  // metadata-flagged `backendCertified: false` until the backend advertises
+  // them. `GET /capabilities.scenario_step_kinds` is the single source of
+  // truth: when it names a wire type, the matching kind is promoted to
+  // "Supported" without touching STEP_METADATA.
+  const capabilities = useCapabilities();
+  const advertisedKinds = capabilities.data?.scenario_step_kinds;
+
   const paletteGroups = useMemo(() => {
     const supported: ScenarioStepKind[] = [];
     const locked: ScenarioStepKind[] = [];
     for (const kind of Object.keys(STEP_METADATA) as ScenarioStepKind[]) {
-      if (STEP_METADATA[kind].backendCertified) supported.push(kind);
+      if (isStepKindExecutable(kind, advertisedKinds)) supported.push(kind);
       else locked.push(kind);
     }
     return { supported, locked };
-  }, []);
+  }, [advertisedKinds]);
 
   const hasLockedStep = useMemo(
-    () => draft.steps.some((step) => !STEP_METADATA[step.kind].backendCertified),
-    [draft.steps],
+    () => draft.steps.some((step) => !isStepKindExecutable(step.kind, advertisedKinds)),
+    [draft.steps, advertisedKinds],
   );
 
   function updateDraft(update: Partial<Scenario>) {

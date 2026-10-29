@@ -50,6 +50,8 @@ async function mockPolarisApi(page: Page) {
       body: JSON.stringify({
         observed: {
           open5gs: {
+            process_state: 'running',
+            health: 'healthy',
             amf: { process_state: 'running', health: 'healthy' },
             smf: { process_state: 'running', health: 'healthy' },
             upf: { process_state: 'running', health: 'healthy' },
@@ -166,7 +168,7 @@ test.describe('subscribers surface', () => {
   });
 
   test('subscribers tab renders slots with Edit action and Generate button', async ({ page }) => {
-    await page.goto('/#/core-open5gs');
+    await page.goto('./network/core');
     await page.getByRole('tab', { name: /subscribers/i }).click();
 
     const row = page.locator(`[data-testid="subscriber-slot-${SLOT_A}"]`);
@@ -184,7 +186,7 @@ test.describe('subscribers surface', () => {
   });
 
   test('Edit dialog shows SST/SD/DNN dropdowns and never surfaces K/OPc', async ({ page }) => {
-    await page.goto('/#/core-open5gs');
+    await page.goto('./network/core');
     await page.getByRole('tab', { name: /subscribers/i }).click();
     await page.getByTestId(`subscriber-edit-${SLOT_A}`).click();
 
@@ -209,7 +211,7 @@ test.describe('subscribers surface', () => {
   });
 
   test('Generate dialog produces a slot result with PROTECTED identity', async ({ page }) => {
-    await page.goto('/#/core-open5gs');
+    await page.goto('./network/core');
     await page.getByRole('tab', { name: /subscribers/i }).click();
     await page.getByTestId('core-provision-generate').click();
 

@@ -114,7 +114,7 @@ test.describe('execution monitor', () => {
   });
 
   test('failed job surfaces step name, code, message, duration and failure_evidence', async ({ page }) => {
-    await page.goto('/#/execution-monitor');
+    await page.goto('./scenarios/monitor');
     await expect(page.getByTestId('backend-steps')).toBeVisible();
     await expect(page.getByTestId('backend-steps-state')).toHaveText(/FAILED/);
     await expect(page.getByTestId('backend-steps-duration')).toContainText(/s/);
