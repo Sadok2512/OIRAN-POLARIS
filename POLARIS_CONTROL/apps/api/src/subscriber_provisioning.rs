@@ -1188,8 +1188,12 @@ mod tests {
     /// `SKIPPED_NO_MONGO` marker so an operator can grep for it in CI logs.
     /// Validates that a `PUT /subscribers/:slot` AMBR write produces real BSON
     /// numeric types (`$type = "long"` for value, `"int"` for unit) at every
-    /// Open5GS schema path (`ambr.{dl,ul}.{value,unit}`, `slice.0.session.*
-    /// .ambr.{dl,ul}.{value,unit}`), not literal `{$numberLong}` sub-documents.
+    /// Open5GS schema path (`ambr.{dl,ul}.{value,unit}` and
+    /// `slice[*].session[*].ambr.{dl,ul}.{value,unit}` for EVERY session, not
+    /// just the first) and that the document stays shaped as Open5GS expects
+    /// — `slice` is an array of session-bearing objects and `slice[].session`
+    /// is an array of session objects, with no `{"$numberLong":"N"}` sub-doc
+    /// debris left behind by the pre-0.17.8 EJSON injection bug.
     #[test]
     fn ambr_put_writes_real_bson_long_in_live_mongo() {
         let container = match std::env::var("POLARIS_TEST_MONGODB_CONTAINER") {
@@ -1220,13 +1224,15 @@ mod tests {
         );
         let _ = backend.mongosh(cleanup.as_bytes());
 
+        // Two DNNs → two sessions, so the "check EVERY session, not just the
+        // first" clause of the 0.17.8 contract is actually exercised.
         let mutation = SubscriberMutation {
             imsi: imsi.clone(),
             k: "aa".repeat(16),
             opc: "bb".repeat(16),
             sst: 1,
             sd: Some("010203".into()),
-            dnns: vec!["internet".into()],
+            dnns: vec!["internet".into(), "ims".into()],
             ambr: SubscriberAmbr {
                 uplink: 1_000_000,
                 downlink: 2_000_000,
@@ -1251,86 +1257,189 @@ mod tests {
         assert_eq!(after.ambr.uplink, 500_000_000);
         assert_eq!(after.ambr.downlink, 1_500_000_000);
 
-        // Authoritative BSON-type probe via `$type` aggregation. Returns a
-        // single-row document whose fields are the per-path BSON type names
-        // ("long", "int", "double", "object", ...).
+        // Authoritative BSON-type probe. `$type` directly on
+        // `"$slice.session.ambr.downlink.value"` would see an array (because
+        // `slice[]` and `slice[].session[]` are both arrays), so we `$unwind`
+        // both arrays first — this yields one row per session with scalar
+        // leaves that `$type` can honestly classify. We also project the top-
+        // level AMBR, a document-shape summary, and a scan for any residual
+        // `{"$numberLong":"…"}` sub-document EJSON debris.
+        let slot_json = serde_json::to_string(&slot).unwrap();
         let probe = format!(
             r#"
-const r = db.subscribers.aggregate([
-  {{"$match": {{"polaris.slot": {slot_json}, "polaris.owned": true}}}},
+const slot = {slot_json};
+const sessions = db.subscribers.aggregate([
+  {{"$match": {{"polaris.slot": slot, "polaris.owned": true}}}},
+  {{"$unwind": "$slice"}},
+  {{"$unwind": "$slice.session"}},
   {{"$project": {{
     "_id": 0,
-    "ambr_dl_value": {{"$type": "$ambr.downlink.value"}},
-    "ambr_dl_unit":  {{"$type": "$ambr.downlink.unit"}},
-    "ambr_ul_value": {{"$type": "$ambr.uplink.value"}},
-    "ambr_ul_unit":  {{"$type": "$ambr.uplink.unit"}},
-    "s0_dl_value":   {{"$type": {{"$arrayElemAt": ["$slice.session.ambr.downlink.value", 0]}}}},
-    "s0_dl_unit":    {{"$type": {{"$arrayElemAt": ["$slice.session.ambr.downlink.unit",  0]}}}},
-    "s0_ul_value":   {{"$type": {{"$arrayElemAt": ["$slice.session.ambr.uplink.value",   0]}}}},
-    "s0_ul_unit":    {{"$type": {{"$arrayElemAt": ["$slice.session.ambr.uplink.unit",    0]}}}},
-    "ambr_dl_value_num": "$ambr.downlink.value",
-    "ambr_ul_value_num": "$ambr.uplink.value",
-    "s0_dl_value_num":   {{"$arrayElemAt": ["$slice.session.ambr.downlink.value", 0]}},
-    "s0_ul_value_num":   {{"$arrayElemAt": ["$slice.session.ambr.uplink.value",   0]}}
+    "name": "$slice.session.name",
+    "dl_value_type":        {{"$type": "$slice.session.ambr.downlink.value"}},
+    "dl_unit_type":         {{"$type": "$slice.session.ambr.downlink.unit"}},
+    "ul_value_type":        {{"$type": "$slice.session.ambr.uplink.value"}},
+    "ul_unit_type":         {{"$type": "$slice.session.ambr.uplink.unit"}},
+    "qos_index_type":       {{"$type": "$slice.session.qos.index"}},
+    "qos_arp_priority_type":{{"$type": "$slice.session.qos.arp.priority_level"}},
+    "dl_value":             "$slice.session.ambr.downlink.value",
+    "ul_value":             "$slice.session.ambr.uplink.value"
   }}}}
 ]).toArray();
-print(JSON.stringify(r[0] || null));
+const top = db.subscribers.aggregate([
+  {{"$match": {{"polaris.slot": slot, "polaris.owned": true}}}},
+  {{"$project": {{
+    "_id": 0,
+    "dl_value_type": {{"$type": "$ambr.downlink.value"}},
+    "dl_unit_type":  {{"$type": "$ambr.downlink.unit"}},
+    "ul_value_type": {{"$type": "$ambr.uplink.value"}},
+    "ul_unit_type":  {{"$type": "$ambr.uplink.unit"}},
+    "dl_value":      "$ambr.downlink.value",
+    "ul_value":      "$ambr.uplink.value"
+  }}}}
+]).toArray()[0];
+const doc = db.subscribers.findOne({{"polaris.slot": slot, "polaris.owned": true}});
+function looksLikeEjsonLong(v) {{
+  // A real BSON Long is a Long instance (mongosh exposes it as such). A
+  // corrupted sub-document from the pre-0.17.8 EJSON injection bug is a
+  // plain JS object with a `$numberLong` string field — Long doesn't carry
+  // that field. We flag the latter and only the latter.
+  if (v === null || v === undefined) return false;
+  if (typeof v !== "object") return false;
+  if (v._bsontype === "Long" || v._bsontype === "Int32" || v._bsontype === "Double") return false;
+  return Object.prototype.hasOwnProperty.call(v, "$numberLong");
+}}
+const shape = {{
+  slice_is_array: Array.isArray(doc.slice),
+  slice_count: Array.isArray(doc.slice) ? doc.slice.length : -1,
+  slice_0_session_is_array: Array.isArray(doc.slice) && doc.slice[0] && Array.isArray(doc.slice[0].session),
+  session_count: Array.isArray(doc.slice) && doc.slice[0] && Array.isArray(doc.slice[0].session) ? doc.slice[0].session.length : -1,
+  top_dl_is_ejson_subdoc: looksLikeEjsonLong(doc.ambr && doc.ambr.downlink && doc.ambr.downlink.value),
+  top_ul_is_ejson_subdoc: looksLikeEjsonLong(doc.ambr && doc.ambr.uplink   && doc.ambr.uplink.value),
+  session_ejson_subdocs: (doc.slice && doc.slice[0] && Array.isArray(doc.slice[0].session) ? doc.slice[0].session : [])
+    .map((s, i) => ({{
+      i: i,
+      dl: looksLikeEjsonLong(s.ambr && s.ambr.downlink && s.ambr.downlink.value),
+      ul: looksLikeEjsonLong(s.ambr && s.ambr.uplink   && s.ambr.uplink.value)
+    }}))
+}};
+print(JSON.stringify({{ sessions: sessions, top: top, shape: shape }}));
 "#,
-            slot_json = serde_json::to_string(&slot).unwrap()
+            slot_json = slot_json
         );
         let probe_value = backend
             .mongosh(probe.as_bytes())
             .expect("mongosh $type probe");
         eprintln!("BSON_TYPES={probe_value}");
 
-        for key in [
-            "ambr_dl_value",
-            "ambr_ul_value",
-            "s0_dl_value",
-            "s0_ul_value",
-        ] {
-            let actual = probe_value
+        // 1. Top-level AMBR: $type must be int or long for value+unit,
+        //    numeric round-trip must match the PUT.
+        let top = &probe_value["top"];
+        for key in ["dl_value_type", "ul_value_type", "dl_unit_type", "ul_unit_type"] {
+            let actual = top
                 .get(key)
                 .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("probe missing {key}: {probe_value}"));
-            assert!(
-                matches!(actual, "long" | "int"),
-                "{key} must be BSON int/long (Open5GS UDR requirement); was {actual}: {probe_value}"
-            );
-        }
-        for key in [
-            "ambr_dl_unit",
-            "ambr_ul_unit",
-            "s0_dl_unit",
-            "s0_ul_unit",
-        ] {
-            let actual = probe_value
-                .get(key)
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("probe missing {key}: {probe_value}"));
+                .unwrap_or_else(|| panic!("top probe missing {key}: {probe_value}"));
             assert!(
                 matches!(actual, "int" | "long"),
-                "{key} must be BSON int/long; was {actual}: {probe_value}"
+                "top.{key} must be BSON int/long (Open5GS UDR requirement); was {actual}: {probe_value}"
             );
         }
-        // The value fields must round-trip exactly — not just happen to parse —
-        // so we also compare the numeric payload the aggregation extracted.
+        assert_eq!(json_u64(&top["dl_value"]), Some(1_500_000_000));
+        assert_eq!(json_u64(&top["ul_value"]), Some(500_000_000));
+
+        // 2. EVERY session row (post-$unwind) must have int/long typed AMBR
+        //    value/unit plus int qos.index + qos.arp.priority_level, and must
+        //    carry the AMBR values that were just PUT.
+        let sessions = probe_value["sessions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("sessions probe not an array: {probe_value}"));
         assert_eq!(
-            json_u64(&probe_value["ambr_dl_value_num"]),
-            Some(1_500_000_000)
+            sessions.len(),
+            2,
+            "expected 2 session rows (one per DNN); got {}: {probe_value}",
+            sessions.len()
+        );
+        let mut names: Vec<String> = Vec::new();
+        for (idx, row) in sessions.iter().enumerate() {
+            for key in [
+                "dl_value_type",
+                "ul_value_type",
+                "dl_unit_type",
+                "ul_unit_type",
+                "qos_index_type",
+                "qos_arp_priority_type",
+            ] {
+                let actual = row
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("session[{idx}] missing {key}: {probe_value}"));
+                assert!(
+                    matches!(actual, "int" | "long"),
+                    "session[{idx}].{key} must be BSON int/long; was {actual}: {probe_value}"
+                );
+            }
+            assert_eq!(
+                json_u64(&row["dl_value"]),
+                Some(1_500_000_000),
+                "session[{idx}].ambr.downlink.value must round-trip: {probe_value}"
+            );
+            assert_eq!(
+                json_u64(&row["ul_value"]),
+                Some(500_000_000),
+                "session[{idx}].ambr.uplink.value must round-trip: {probe_value}"
+            );
+            names.push(
+                row["name"]
+                    .as_str()
+                    .expect("session.name is a string")
+                    .to_string(),
+            );
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["ims".to_string(), "internet".to_string()],
+            "session names must survive the AMBR PUT: {probe_value}"
+        );
+
+        // 3. Document shape: slice[] + slice[].session[] stay arrays of
+        //    objects; no `{"$numberLong":"N"}` sub-document residue anywhere.
+        let shape = &probe_value["shape"];
+        assert_eq!(shape["slice_is_array"].as_bool(), Some(true), "shape: {shape}");
+        assert_eq!(shape["slice_count"].as_u64(), Some(1), "shape: {shape}");
+        assert_eq!(
+            shape["slice_0_session_is_array"].as_bool(),
+            Some(true),
+            "shape: {shape}"
+        );
+        assert_eq!(shape["session_count"].as_u64(), Some(2), "shape: {shape}");
+        assert_eq!(
+            shape["top_dl_is_ejson_subdoc"].as_bool(),
+            Some(false),
+            "top AMBR downlink.value is still a `$numberLong` sub-doc: {shape}"
         );
         assert_eq!(
-            json_u64(&probe_value["ambr_ul_value_num"]),
-            Some(500_000_000)
+            shape["top_ul_is_ejson_subdoc"].as_bool(),
+            Some(false),
+            "top AMBR uplink.value is still a `$numberLong` sub-doc: {shape}"
         );
-        assert_eq!(
-            json_u64(&probe_value["s0_dl_value_num"]),
-            Some(1_500_000_000)
-        );
-        assert_eq!(
-            json_u64(&probe_value["s0_ul_value_num"]),
-            Some(500_000_000)
-        );
+        for s in shape["session_ejson_subdocs"]
+            .as_array()
+            .expect("session_ejson_subdocs is an array")
+        {
+            assert_eq!(
+                s["dl"].as_bool(),
+                Some(false),
+                "session[{i}].ambr.downlink.value is still a `$numberLong` sub-doc: {shape}",
+                i = s["i"]
+            );
+            assert_eq!(
+                s["ul"].as_bool(),
+                Some(false),
+                "session[{i}].ambr.uplink.value is still a `$numberLong` sub-doc: {shape}",
+                i = s["i"]
+            );
+        }
 
         // Clean up so repeat runs stay deterministic.
         let _ = backend.mongosh(cleanup.as_bytes());

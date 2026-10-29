@@ -56,11 +56,26 @@
     (`ambr_put_writes_real_bson_long_in_live_mongo`) gated by
     `POLARIS_TEST_MONGODB_CONTAINER`. When the env var is set the test
     MUST pass; when unset it skips with a loud `SKIPPED_NO_MONGO` marker
-    and is NOT `#[ignore]`'d. The test provisions a subscriber via
+    and is NOT `#[ignore]`'d. The test provisions a subscriber with TWO
+    DNNs (so there are TWO sessions, not just the first) via
     `provision_batch`, PUTs a new AMBR via `apply_update`, then runs a
-    `$type` aggregation on the stored document and asserts
-    `$type ∈ {int, long}` for every AMBR `value` and `unit` field (both
-    top-level and `slice.0.session[0]`), plus a round-trip value check.
+    `$type` aggregation that **first `$unwind`s `$slice` and then
+    `$unwind`s `$slice.session`** before applying `$type` to the scalar
+    leaves. Applying `$type` directly to `"$slice.session.ambr.*"` would
+    have classified the paths as `array` (because `slice[]` and
+    `slice[].session[]` are both arrays), hiding whether each leaf is
+    actually a BSON long; the unwind pipeline forces one row per session
+    and gives honest leaf-level types. The test asserts
+    `$type ∈ {int, long}` for every AMBR `value` and `unit` on BOTH
+    top-level and EVERY session row, plus `qos.index` and
+    `qos.arp.priority_level`. It also re-reads the full document and
+    asserts that `slice` is still an array of session-bearing objects,
+    `slice[0].session` is still an array of session objects, and that
+    no AMBR `value` field anywhere in the document is a leftover
+    `{"$numberLong":"N"}` sub-doc from the pre-0.17.8 EJSON injection
+    bug. Validated locally against a `mongo:7` container; command for
+    operator reproduction:
+    `POLARIS_TEST_MONGODB_CONTAINER=<container> cargo test -p polaris-control-api --lib subscriber_provisioning::tests::ambr_put_writes_real_bson_long_in_live_mongo -- --nocapture`.
 
 ## 0.17.7 (polaris-control-api)
 
