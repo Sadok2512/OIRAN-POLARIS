@@ -18,7 +18,8 @@ POLARIS API 0.17.7 (ddfbca7) · front 0.9.4 (71f04df) · oiran-decode 0.3.1 · i
 Labo : UE-201 AMBR 1 Gbit/s. UDP 0 % perte ≤ 20 Mbit/s ; TCP ~125/136 Mbit/s UL/DL.
 
 ## Claude Code
-### C1 · POLARIS 0.17.8 (AMBR BSON + test Mongo réel) · DONE · c8f00e2
+### C1 · POLARIS 0.17.8 (AMBR BSON + test Mongo réel) · SUPERSEDED (voir C1b) · c8f00e2
+### C1b · POLARIS 0.17.9 (AMBR en BSON int, value+unit) · DONE · 340d37f (branche feat/polaris-0.17.9-ambr-int, base c8f00e2)
 ### C2 · OIRAN live-probe 0.2.3 · DONE · 3812285 (branche feat/live-probe-0.2.3-streaming, base 4da0de7)
 Base 4da0de7 (feat/oiran-decoders-0.4). copy_verified + write_jsonl_atomic en streaming ; test pcap 512 MiB → pic < 32 MiB (commande + pic).
 Libérer /tmp Back100 < 85 % et faire tourner les 3 tests continuous-import sautés.
@@ -68,3 +69,4 @@ Cause NGAP : extensions non nommées ; IE-Extensions S-NSSAI non décodées · s
 | 2026-10-29 | Claude Code | C1 | DONE | c8f00e2 | cargo test -p polaris-control-api --lib (127 OK, Mongo réel) | — |
 | 2026-10-29 | Codex | X1 | BLOCKED | c8f00e2 | Mongo isolé avec document neutre : test BSON PASS ; suite 127 PASS, 0 FAIL, 3 ignored ; test Live : Registration rejetée | UDR `No UE-AMBR` sur BSON `long` ; rollback 0.17.7 effectué |
 | 2026-10-29 | Claude Code | C2 | DONE | 3812285 | cargo test -p live-probe --release copy_verified_streams_512_mib_import_under_32_mib_live_allocation -- --ignored --test-threads=1 (peak=1 MiB, bound 32 MiB) ; cargo test -p live-probe (42 OK, 2 ignored) ; cargo test -p oiran-decode (3 OK) | 3 tests continuous-import toujours skippés : /dev/sda1 à 90% (hors scope agent, pas /tmp seul). write_jsonl_atomic streaming côté API ; caller lazy côté live-probe:2197 reporté. |
+| 2026-10-29 | Claude Code | C1b | DONE | 340d37f | POLARIS_TEST_MONGODB_CONTAINER=&lt;mongo:7&gt; cargo test -p polaris-control-api --lib (129 OK, 0 FAIL, 3 ignored) ; BSON_TYPES=int partout (top + 2 sessions, value+unit+qos.index+qos.arp.priority_level) ; valeurs encodées 1500/500 pour 1.5 Gbit/s / 500 Mbit/s | 0.17.8 (c8f00e2) obsolète — remplacé par 0.17.9 (340d37f). Lignée c8f00e2 → 340d37f vérifiée ancêtre. |
