@@ -6,6 +6,8 @@
   iperf3 container with a scoped route to the UE pool through the UPF.
 - Measures downlink bytes independently in the DN sender report and the UE-network-namespace
   receiver report; no UE identity or authentication material is exposed.
+- Routes `traffic_ul` to a one-shot iperf3 receiver in the same DN container and records both the
+  UE sender count and DN receiver count instead of assuming a server on the UPF tunnel address.
 - Advertises `traffic_dl` as executable only while the sender container, N6 identity and UE route
   are all measured healthy; otherwise the existing `DL_SENDER_NOT_AVAILABLE` fail-closed contract
   remains active.

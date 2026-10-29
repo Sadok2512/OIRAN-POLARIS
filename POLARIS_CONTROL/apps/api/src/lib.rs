@@ -433,9 +433,9 @@ struct DlSenderConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DlMeasurement {
-    sender_bytes: u64,
-    ue_bytes: u64,
+struct IperfMeasurement {
+    client_sent_bytes: u64,
+    server_received_bytes: u64,
 }
 
 impl DlSenderConfig {
@@ -620,16 +620,50 @@ trait UeRuntime: Send + Sync {
             ))
         }
     }
-    fn execute_iperf_ul(&self, target: &VerifiedTrafficTarget, bytes: u64) -> Result<u64, String> {
-        let output = Command::new("/usr/bin/nsenter")
+    fn execute_iperf_ul(
+        &self,
+        target: &VerifiedTrafficTarget,
+        bytes: u64,
+        sender: &DlSenderConfig,
+    ) -> Result<IperfMeasurement, String> {
+        sender.health()?;
+        let container = sender
+            .container
+            .as_deref()
+            .ok_or("DL_SENDER_NOT_CONFIGURED")?;
+        let mut receiver = Command::new("/usr/bin/timeout")
             .args([
+                "--signal=TERM",
+                "--kill-after=1s",
+                "30s",
+                "/usr/bin/docker",
+                "exec",
+                container,
+                "iperf3",
+                "-s",
+                "-1",
+                "-J",
+                "-B",
+                &sender.sender_ip.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|_| "IPERF3_UL_RECEIVER_SPAWN_FAILED")?;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let client_output = Command::new("/usr/bin/timeout")
+            .args([
+                "--signal=TERM",
+                "--kill-after=1s",
+                "30s",
+                "/usr/bin/nsenter",
                 "--target",
                 &target.namespace_pid.to_string(),
                 "--net",
                 "--",
                 "/usr/bin/iperf3",
                 "-c",
-                "10.46.0.1",
+                &sender.sender_ip.to_string(),
                 "-n",
                 &bytes.to_string(),
                 "--connect-timeout",
@@ -638,22 +672,43 @@ trait UeRuntime: Send + Sync {
             ])
             .output()
             .map_err(|_| "IPERF3_PROCESS_SPAWN_FAILED".to_string())?;
-        if !output.status.success() {
+        if !client_output.status.success() {
+            let _ = receiver.kill();
+            let _ = receiver.wait();
             return Err("IPERF3_UL_FAILED".into());
         }
-        let report: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|_| "IPERF3_REPORT_INVALID".to_string())?;
-        report
+        let receiver_output = receiver
+            .wait_with_output()
+            .map_err(|_| "IPERF3_UL_RECEIVER_WAIT_FAILED")?;
+        if !receiver_output.status.success() {
+            return Err("IPERF3_UL_RECEIVER_FAILED".into());
+        }
+        let client_report: Value = serde_json::from_slice(&client_output.stdout)
+            .map_err(|_| "IPERF3_UL_CLIENT_REPORT_INVALID".to_string())?;
+        let receiver_report: Value = serde_json::from_slice(&receiver_output.stdout)
+            .map_err(|_| "IPERF3_UL_RECEIVER_REPORT_INVALID".to_string())?;
+        let client_sent_bytes = client_report
             .pointer("/end/sum_sent/bytes")
             .and_then(Value::as_u64)
-            .ok_or_else(|| "IPERF3_BYTES_NOT_MEASURED".into())
+            .ok_or("IPERF3_UL_CLIENT_BYTES_NOT_MEASURED")?;
+        let server_received_bytes = receiver_report
+            .pointer("/end/sum_received/bytes")
+            .and_then(Value::as_u64)
+            .ok_or("IPERF3_UL_RECEIVER_BYTES_NOT_MEASURED")?;
+        if client_sent_bytes == 0 || server_received_bytes == 0 {
+            return Err("IPERF3_UL_ZERO_BYTES".into());
+        }
+        Ok(IperfMeasurement {
+            client_sent_bytes,
+            server_received_bytes,
+        })
     }
     fn execute_iperf_dl(
         &self,
         target: &VerifiedTrafficTarget,
         bytes: u64,
         sender: &DlSenderConfig,
-    ) -> Result<DlMeasurement, String> {
+    ) -> Result<IperfMeasurement, String> {
         sender.health()?;
         let container = sender
             .container
@@ -726,9 +781,9 @@ trait UeRuntime: Send + Sync {
         if sender_bytes == 0 || ue_bytes == 0 {
             return Err("IPERF3_DL_ZERO_BYTES".into());
         }
-        Ok(DlMeasurement {
-            sender_bytes,
-            ue_bytes,
+        Ok(IperfMeasurement {
+            client_sent_bytes: sender_bytes,
+            server_received_bytes: ue_bytes,
         })
     }
     fn deregister_switch_off(&self, job: &simulator_controller::UeJob) -> Result<(), String> {
@@ -2358,7 +2413,6 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
         "pdu_release",
         "udp_traffic",
         "wait",
-        "traffic_ul",
         "idle",
         "detach",
         "repeat",
@@ -2369,10 +2423,15 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
     ];
     if dl_sender.is_ok() {
         executable_steps.push("traffic_dl");
+        executable_steps.push("traffic_ul");
     } else {
         unavailable_steps.insert(
             0,
             json!({"type":"traffic_dl","http_status":422,"reason":"DL_SENDER_NOT_AVAILABLE"}),
+        );
+        unavailable_steps.insert(
+            1,
+            json!({"type":"traffic_ul","http_status":422,"reason":"UL_RECEIVER_NOT_AVAILABLE"}),
         );
     }
     Json(json!({
@@ -4027,6 +4086,9 @@ fn scenario_assignment_block_reason(
     let resolved = resolve_steps(definition)?;
     if !dl_sender_available && resolved.iter().any(|step| step.step_type == "traffic_dl") {
         return Ok(Some("DL_SENDER_NOT_AVAILABLE"));
+    }
+    if !dl_sender_available && resolved.iter().any(|step| step.step_type == "traffic_ul") {
+        return Ok(Some("UL_RECEIVER_NOT_AVAILABLE"));
     }
     if resolved
         .iter()
@@ -6473,10 +6535,10 @@ fn execute_live_definition_step(
                         .ue_runtime
                         .execute_iperf_dl(&target, bytes, &state.dl_sender)?;
                 sender_bytes = sender_bytes
-                    .checked_add(measurement.sender_bytes)
+                    .checked_add(measurement.client_sent_bytes)
                     .ok_or("IPERF3_BYTES_OVERFLOW")?;
                 ue_bytes = ue_bytes
-                    .checked_add(measurement.ue_bytes)
+                    .checked_add(measurement.server_received_bytes)
                     .ok_or("IPERF3_BYTES_OVERFLOW")?;
             }
             Ok(json!({
@@ -6490,17 +6552,31 @@ fn execute_live_definition_step(
             if bytes == 0 {
                 return Err("TRAFFIC_BYTES_OUT_OF_RANGE".into());
             }
-            let mut measured = 0_u64;
+            dl_sender_health(state).map_err(|_| "UL_RECEIVER_NOT_AVAILABLE".to_string())?;
+            let mut ue_sender_bytes = 0_u64;
+            let mut dn_receiver_bytes = 0_u64;
             for ue_id in ue_ids {
                 if control.cancel.load(Ordering::SeqCst) {
                     return Err("SCENARIO_STOP_REQUESTED".into());
                 }
                 let target = resolve_controller_traffic_target(state, ue_id)?;
-                measured = measured
-                    .checked_add(state.ue_runtime.execute_iperf_ul(&target, bytes)?)
+                let measurement =
+                    state
+                        .ue_runtime
+                        .execute_iperf_ul(&target, bytes, &state.dl_sender)?;
+                ue_sender_bytes = ue_sender_bytes
+                    .checked_add(measurement.client_sent_bytes)
+                    .ok_or("IPERF3_BYTES_OVERFLOW")?;
+                dn_receiver_bytes = dn_receiver_bytes
+                    .checked_add(measurement.server_received_bytes)
                     .ok_or("IPERF3_BYTES_OVERFLOW")?;
             }
-            Ok(json!({"requested_bytes_per_ue":bytes,"measured_ul_bytes":measured}))
+            Ok(json!({
+                "requested_bytes_per_ue":bytes,
+                "measured_ul_bytes":ue_sender_bytes,
+                "measured_ue_sender_bytes":ue_sender_bytes,
+                "measured_dn_receiver_bytes":dn_receiver_bytes
+            }))
         }
         "idle" => {
             let duration_ms = resolved_parameter_u64(step, "duration_ms", 1_000, 3_600_000)?;
@@ -6794,6 +6870,14 @@ async fn start_scenario(
                     Json(json!({"error":"DL_SENDER_NOT_AVAILABLE"})),
                 );
             }
+        }
+        if resolved.iter().any(|step| step.step_type == "traffic_ul")
+            && dl_sender_health(&state).is_err()
+        {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":"UL_RECEIVER_NOT_AVAILABLE"})),
+            );
         }
         let outcome = if state.execution_mode == "mock" {
             run_mock_definition_scenario(&state, definition_id, &input.ue_ids)
@@ -8166,7 +8250,6 @@ mod p0_tests {
                 "pdu_release",
                 "udp_traffic",
                 "wait",
-                "traffic_ul",
                 "idle",
                 "detach",
                 "repeat"
@@ -8176,6 +8259,7 @@ mod p0_tests {
             body["unavailable_scenario_step_types"],
             json!([
                 {"type":"traffic_dl","http_status":422,"reason":"DL_SENDER_NOT_AVAILABLE"},
+                {"type":"traffic_ul","http_status":422,"reason":"UL_RECEIVER_NOT_AVAILABLE"},
                 {"type":"ims_register","http_status":423,"reason":"IMS_NOT_AVAILABLE"},
                 {"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}
             ])
@@ -8211,6 +8295,11 @@ mod p0_tests {
             .unwrap()
             .iter()
             .any(|step| step == "traffic_dl"));
+        assert!(body["executable_scenario_step_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step == "traffic_ul"));
         assert!(!body["unavailable_scenario_step_types"]
             .as_array()
             .unwrap()
