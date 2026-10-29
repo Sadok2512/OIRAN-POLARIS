@@ -227,6 +227,8 @@ dependencies = [
  "decoder-nas",
  "event-schema",
  "plugin-runtime",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
