@@ -501,7 +501,7 @@ pub fn render_profile_with_gnbs(
         return Err("invalid subscriber secret material".into());
     }
     Ok(format!(
-        "supi: '{supi}'\nmcc: '{mcc}'\nmnc: '{mnc}'\nkey: '{key}'\nopType: 'OPC'\nop: '{opc}'\namf: '8000'\ngnbSearchList:\n  - {gnb_link_ip}\nsessions:\n  - type: 'IPv4'\n    apn: '{dnn}'\n    slice:\n      sst: {sst}\n      sd: '{sd}'\n",
+        "supi: '{supi}'\nmcc: '{mcc}'\nmnc: '{mnc}'\nkey: '{key}'\nopType: 'OPC'\nop: '{opc}'\namf: '8000'\ngnbSearchList:\n  - {gnb_link_ip}\nconfigured-nssai: [{{sst: {sst}, sd: 0x{sd}}}]\ndefault-nssai: [{{sst: {sst}, sd: 0x{sd}}}]\nsessions:\n  - type: 'IPv4'\n    apn: '{dnn}'\n    slice:\n      sst: {sst}\n      sd: '{sd}'\n",
         gnb_link_ip = gnb_link_ip,
         supi = secrets.supi,
         mcc = profile.plmn_mcc,
@@ -613,7 +613,7 @@ mod tests {
     fn gnb01_rendering_is_byte_identical_to_the_attested_format() {
         // Existing provisioning attestations bind the SHA-256 of these exact bytes.
         let profile = planned_profiles().remove(0);
-        let expected = "supi: 'imsi-999990000000001'\nmcc: '001'\nmnc: '01'\nkey: '00112233445566778899aabbccddeeff'\nopType: 'OPC'\nop: 'ffeeddccbbaa99887766554433221100'\namf: '8000'\ngnbSearchList:\n  - 10.77.0.20\nsessions:\n  - type: 'IPv4'\n    apn: 'internet'\n    slice:\n      sst: 1\n      sd: '010203'\n";
+        let expected = "supi: 'imsi-999990000000001'\nmcc: '001'\nmnc: '01'\nkey: '00112233445566778899aabbccddeeff'\nopType: 'OPC'\nop: 'ffeeddccbbaa99887766554433221100'\namf: '8000'\ngnbSearchList:\n  - 10.77.0.20\nconfigured-nssai: [{sst: 1, sd: 0x010203}]\ndefault-nssai: [{sst: 1, sd: 0x010203}]\nsessions:\n  - type: 'IPv4'\n    apn: 'internet'\n    slice:\n      sst: 1\n      sd: '010203'\n";
         assert_eq!(render_profile(&profile, test_secrets()).unwrap(), expected);
     }
 
