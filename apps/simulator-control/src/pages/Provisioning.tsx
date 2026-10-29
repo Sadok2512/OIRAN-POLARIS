@@ -89,13 +89,37 @@ export function ProvisioningPage() {
           title="Provisioning"
           description="Subscriber directory synchronised with Open5GS. One source of truth for IMSI → PLMN → gNB bindings."
         />
-        <Unavailable reason="Feature flag polarisProvisioning is OFF. Flip it in Settings when the backend branch feat/polaris-provisioning is deployed." />
+        <Unavailable
+          reason="Feature flag polarisProvisioning is OFF. Flip it in Settings to re-enable the subscriber directory."
+          data-testid="provisioning-flag-off"
+        />
       </>
     );
   }
 
+  // 0.9.2 — if the backend surface is genuinely unavailable, surface the
+  // exact HTTP status + backend code + message. No "backend pending"
+  // placeholder: operators see the real failure, not a flattened label.
+  const errorStatus =
+    subscribers.error instanceof ApiError ? (subscribers.error as ApiError).status : null;
   const errorCode =
     subscribers.error instanceof ApiError ? (subscribers.error as ApiError).code : 'LIST_FAILED';
+  const errorMessage =
+    subscribers.error instanceof Error
+      ? subscribers.error.message
+      : subscribers.error == null
+      ? ''
+      : String(subscribers.error);
+  // POLARIS returns `{error: "CODE"}` (string), which the client expands into
+  // `code=CODE, message=CODE`. Deduplicate so operators don't see the same
+  // string twice; the OIRAN-style `{error: {code, message}}` keeps both.
+  const errorReason = [
+    errorStatus != null ? `HTTP ${errorStatus}` : null,
+    errorCode,
+    errorMessage && errorMessage !== errorCode ? errorMessage : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
 
   return (
     <>
@@ -129,7 +153,10 @@ export function ProvisioningPage() {
         {subscribers.isLoading ? (
           <LoadingSkeleton />
         ) : subscribers.isError ? (
-          <Unavailable reason={`${errorCode} · ${(subscribers.error as Error).message}`} />
+          <Unavailable
+            reason={errorReason}
+            data-testid="provisioning-list-error"
+          />
         ) : !subscribers.data || subscribers.data.items.length === 0 ? (
           <EmptyState
             title="No subscriber yet"

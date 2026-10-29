@@ -46,6 +46,10 @@ beforeEach(() => {
   _resetProfiles();
   _resetFlags();
   setFlag('profileBackend', true);
+  // 0.9.2 — polarisProvisioning now defaults to ON. This file predates the
+  // UeProvisioningAddDialog and asserts the UeProfileBackendForm + legacy
+  // ue-import controls, so lock polarisProvisioning OFF here.
+  setFlag('polarisProvisioning', false);
   calls.length = 0;
   globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();

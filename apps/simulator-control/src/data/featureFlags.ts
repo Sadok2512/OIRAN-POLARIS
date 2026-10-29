@@ -37,18 +37,17 @@ export interface FeatureFlags {
    */
   scenarioTemplates: boolean;
   /**
-   * 0.6.0 — When true, the UI calls the richer provisioning surface
-   * published by Codex on `feat/polaris-provisioning`:
+   * 0.6.0 — When true, the UI calls the richer provisioning surface:
    *   GET  /owners                                   → owner directory
    *   GET  /plmns                                    → allowed PLMNs
    *   GET  /dnns                                     → allowed DNNs
    *   POST /provisioning/import  (CSV, up to 100k rows)
    *   POST /ue-profiles/import   (CSV, up to 100k rows)
    *   GET  /ue-profiles/:ue_id                       → detail card body
-   * When false, the Provisioning page shows "Backend pending" and
-   * dropdowns fall back to free-text + warning text. profileBackend is
-   * also forced ON (local UE form path becomes unreachable from the UI).
-   * Default OFF until the backend branch is deployed.
+   * When false, the Provisioning page falls back to the pre-0.6 flow.
+   * If a required endpoint is genuinely unavailable at runtime, the
+   * page surfaces the exact backend error (code + message) rather than
+   * hiding it behind a "backend pending" placeholder.
    */
   polarisProvisioning: boolean;
 }
@@ -58,20 +57,50 @@ export interface FeatureFlags {
 // out of the box. Operators who want to draft against the local catalog
 // toggle the flag off in Settings; the UI then clearly labels this as
 // "offline draft" and reminds them that nothing will reach the backend.
+// 0.9.2 — `polarisProvisioning` flips to ON by default (polaris-control-api
+// 0.17.0 is deployed). See `read()` below for the one-shot migration that
+// upgrades legacy localStorage shapes.
 const DEFAULTS: FeatureFlags = {
   scenarioBackend: true,
   profileBackend: false,
   scenarioTemplates: true,
-  polarisProvisioning: false,
+  polarisProvisioning: true,
 };
+
+/** Schema version persisted alongside the flags so we can tell apart
+ * "operator explicitly disabled this flag" from "stored OFF because the
+ * old default was OFF". Bumped to 2 in 0.9.2 to force-migrate
+ * `polarisProvisioning` from the 0.6.0-era default. */
+const SCHEMA_VERSION = 2;
+
+interface StoredShape extends Partial<FeatureFlags> {
+  _v?: number;
+}
+
+/** Apply the 0.9.2 migration to a parsed localStorage payload.
+ *
+ * The only field migrated here is `polarisProvisioning`: a stored `false`
+ * that came from the 0.6.0-era default (no `_v` key, or `_v < 2`) is
+ * promoted to `true` because the backend (polaris-control-api 0.17.0) is
+ * now deployed. A `_v >= 2` payload is trusted verbatim — an operator who
+ * explicitly turned the flag off keeps it off. */
+export function migrateStoredFlags(parsed: StoredShape): FeatureFlags {
+  const version = typeof parsed._v === 'number' ? parsed._v : 1;
+  const migrated: StoredShape = { ...parsed };
+  if (version < 2 && migrated.polarisProvisioning === false) {
+    migrated.polarisProvisioning = true;
+  }
+  const { _v: _ignored, ...flags } = migrated;
+  return { ...DEFAULTS, ...flags };
+}
 
 function read(): FeatureFlags {
   if (typeof localStorage === 'undefined') return DEFAULTS;
   try {
     const raw = localStorage.getItem(FLAGS_KEY);
     if (!raw) return DEFAULTS;
-    const parsed = JSON.parse(raw) as Partial<FeatureFlags>;
-    return { ...DEFAULTS, ...parsed };
+    const parsed = JSON.parse(raw) as StoredShape;
+    return migrateStoredFlags(parsed);
   } catch {
     return DEFAULTS;
   }
@@ -79,7 +108,8 @@ function read(): FeatureFlags {
 
 function write(flags: FeatureFlags): void {
   if (typeof localStorage === 'undefined') return;
-  localStorage.setItem(FLAGS_KEY, JSON.stringify(flags));
+  const payload: StoredShape = { ...flags, _v: SCHEMA_VERSION };
+  localStorage.setItem(FLAGS_KEY, JSON.stringify(payload));
 }
 
 type Listener = () => void;

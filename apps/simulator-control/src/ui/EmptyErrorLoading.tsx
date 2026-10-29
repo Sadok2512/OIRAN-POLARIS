@@ -68,11 +68,17 @@ export function LoadingSkeleton({ label = 'Loading' }: { label?: string }) {
   );
 }
 
-export function Unavailable({ reason }: { reason: string }) {
+export function Unavailable({
+  reason,
+  'data-testid': dataTestId,
+}: {
+  reason: string;
+  'data-testid'?: string;
+}) {
   return (
     <div
       className="ep-card border-warning/30 p-4 flex items-start gap-3"
-      data-testid="unavailable-state"
+      data-testid={dataTestId ?? 'unavailable-state'}
     >
       <AlertTriangle className="text-warning mt-0.5" width={16} height={16} aria-hidden="true" />
       <div className="text-ep-sm">

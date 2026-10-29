@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
 import { UeManagerPage } from './UeManager';
 import { _resetProfiles, _seedProfiles } from '@/ue/profileStore';
+import { _resetFlags, setFlag } from '@/data/featureFlags';
 
 function respond(status: number, body: unknown) {
   return new Response(JSON.stringify(body), {
@@ -69,6 +70,12 @@ function renderPage() {
 beforeEach(() => {
   if (typeof localStorage !== 'undefined') localStorage.clear();
   _resetProfiles();
+  _resetFlags();
+  // 0.9.2 — polarisProvisioning now defaults to ON. This file exercises the
+  // pre-polarisProvisioning flow (local store + the legacy UeProfileForm /
+  // ue-import controls), so lock the flag OFF to keep those code paths
+  // under test.
+  setFlag('polarisProvisioning', false);
   stubFetch('operator');
 });
 

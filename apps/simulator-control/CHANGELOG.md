@@ -5,8 +5,20 @@ UI-level changes between minor versions.
 
 ## 0.9.2 — 2026-10-29 (patch)
 
-Security — bump `react-router-dom` from `6.30.6` to `7.18.5` to clear the two
-moderate production advisories:
+- **Defect #28** — `polarisProvisioning` now defaults to **ON** (backend
+  `polaris-control-api 0.17.0` is deployed). A one-shot localStorage
+  migration (`polaris.featureFlags.v1 _v: 2`) upgrades a stored `false`
+  that came from the pre-0.9.2 default to `true`; a value an operator
+  explicitly disabled (payload with `_v >= 2`) is preserved. The
+  "Backend pending — flip when `feat/polaris-provisioning` is deployed"
+  wording is gone; when a backend endpoint is genuinely unreachable the
+  Provisioning page surfaces the exact API error (`HTTP <status> ·
+  <code> · <message>`, deduplicated for POLARIS-style string errors).
+  New unit tests in `src/data/featureFlags.test.ts` cover the migration
+  (5 cases); new Playwright spec `e2e/provisioning.spec.ts` captures
+  both the healthy table and the HTTP 503 error banner.
+- Security — bump `react-router-dom` from `6.30.6` to `7.18.5` to clear the two
+  moderate production advisories:
 
 - **CVE-2025-6803** — React Router open redirect via backslash in `<Link>`
   and `useNavigate`.
