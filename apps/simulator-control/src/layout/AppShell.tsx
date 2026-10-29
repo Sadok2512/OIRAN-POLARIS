@@ -6,6 +6,7 @@ import { SidebarNavigation } from './SidebarNavigation';
 import { useTheme } from '@/hooks/useTheme';
 import type { ThemePreference } from '@shared/theme';
 import { useAuth } from '@/data/queries';
+import packageJson from '../../package.json';
 
 const THEME_OPTIONS: { value: ThemePreference; label: string; Icon: typeof Sun }[] = [
   { value: 'light', label: 'Light', Icon: Sun },
@@ -79,7 +80,9 @@ export function AppShell() {
           <div className="text-ep-sm text-text-secondary flex items-center gap-3">
             <span>
               Enterprise Precision ·{' '}
-              <span className="text-text-primary">POLARIS Simulator Control V1</span>
+              <span className="text-text-primary">
+                POLARIS Simulator Control {packageJson.version}
+              </span>
             </span>
             {auth.data?.authenticated ? (
               <span

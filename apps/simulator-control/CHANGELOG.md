@@ -3,6 +3,16 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.9.2-hotfix — 2026-10-29 (patch)
+
+- Enable `profileBackend`, `polarisProvisioning`, `scenarioBackend` and
+  `scenarioTemplates` by default now that their production API contracts are
+  deployed.
+- Migrate `polaris.featureFlags.v1` to schema `v2`; legacy OFF values are
+  deliberately replaced once by the four enabled backend defaults, while
+  subsequent v2 operator choices remain persistent.
+- Display the exact package version in the application shell.
+
 ## 0.9.1 — 2026-10-29 (patch)
 
 - Merge the deployed 0.7.1 lineage into the 0.9 manager/execution/traffic
