@@ -6,7 +6,13 @@ import {
   type ProfileIssue,
   type UeProfileDraft,
 } from './profileModel';
-import { nextFreeImsiFor } from './imsiHelpers';
+import {
+  DEFAULT_LAB_PLMN,
+  nextFreeImsiFor,
+  parsePlmnString,
+  type LabPlmn,
+} from './imsiHelpers';
+import { usePlmns } from '@/data/queries';
 
 export type ProfileFormMode = 'create' | 'edit' | 'clone';
 
@@ -23,9 +29,9 @@ const FIELD_LABELS: Record<keyof UeProfileDraft, string> = {
 
 const FIELD_HINTS: Partial<Record<keyof UeProfileDraft, string>> = {
   id: 'Unique identifier (letters, digits, _ . : -)',
-  // 0.10.2 (#41) — The hint flags the lab-fictive 999... prefix so
-  // operators never paste a real IMSI into the form.
-  imsi: '14–16 digits. Default = next free lab IMSI (999010000000NNN).',
+  // 0.10.3 — The default IMSI uses the lab's REAL PLMN pulled from
+  // /plmns (fallback 001-01). The 999 prefix was unserviceable.
+  imsi: '14–16 digits. Default = next free IMSI on the lab PLMN.',
   plmn: 'Optional. 5 or 6 digits.',
   ueIp: 'Optional. IPv4 (set by backend when PDU session is up).',
   apn: 'Optional. Access Point Name used for PDU establishment.',
@@ -57,16 +63,40 @@ export function UeProfileFormDialog({
     dialogRef.current?.focus();
   }, [open, initial]);
 
-  // 0.10.2 (#41) — Prefill the IMSI field with the next free lab IMSI
-  // derived from the UE id as the operator types it. Only applied when
-  // the field is currently empty, so a manual override is sticky.
-  const defaultImsiForId = useMemo(() => nextFreeImsiFor(draft.id ?? ''), [draft.id]);
+  // 0.10.3 — Resolve the lab PLMN from /plmns (fallback: DEFAULT_LAB_PLMN,
+  // which is MCC 001 / MNC 01, the standard Open5GS lab configuration).
+  // The 0.10.2 revision defaulted to a fictive 99901 prefix that the
+  // Open5GS lab did not serve, stranding every freshly-created profile.
+  const plmnsQuery = usePlmns();
+  const labPlmn: LabPlmn = useMemo(() => {
+    const raw = (plmnsQuery.data as unknown as { items?: unknown[] })?.items ?? [];
+    for (const entry of raw) {
+      if (typeof entry === 'string') {
+        const parsed = parsePlmnString(entry);
+        if (parsed) return parsed;
+      } else if (entry && typeof entry === 'object') {
+        const record = entry as { id?: string; mcc?: string; mnc?: string };
+        if (record.mcc && record.mnc) return { mcc: record.mcc, mnc: record.mnc };
+        const parsed = parsePlmnString(record.id);
+        if (parsed) return parsed;
+      }
+    }
+    return DEFAULT_LAB_PLMN;
+  }, [plmnsQuery.data]);
+
+  // 0.10.3 — Prefill IMSI from UE id × live PLMN. Manual overrides stay
+  // sticky because the effect only runs when the field is empty.
+  const defaultImsiForId = useMemo(
+    () => nextFreeImsiFor(draft.id ?? '', labPlmn),
+    [draft.id, labPlmn],
+  );
   useEffect(() => {
     if (!open) return;
     if (!defaultImsiForId) return;
     if (draft.imsi && draft.imsi.trim().length > 0) return;
     setDraft((prev) => ({ ...prev, imsi: defaultImsiForId.replace(/^imsi-/, '') }));
   }, [open, defaultImsiForId, draft.imsi]);
+
 
   useEffect(() => {
     if (!open) return;
