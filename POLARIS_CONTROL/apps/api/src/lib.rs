@@ -11258,6 +11258,38 @@ mod p0_tests {
         application.clone().oneshot(Request::builder().method(Method::POST).uri("/api/v1/scenarios/validate").header(header::CONTENT_TYPE,"application/json").header(header::COOKIE,cookie).header("x-csrf-token",csrf).body(Body::from(json!({"scenario_id":"targeted-job","name":"Certified bounded controller UE traffic","ue_count":1,"start_mode":"SEQUENTIAL","stagger_seconds":0,"protocol":"UDP","destination":"10.46.0.1","packet_count":5,"packet_size":64,"rate_per_second":1,"duration_seconds":5,"target_ue_id":target_ue_id}).to_string())).unwrap()).await.unwrap().status()
     }
 
+    /// 0.19.8 — Guard against future "forgot to bump the crate" incidents
+    /// like the one that shipped 0.19.7 compiled with CARGO_PKG_VERSION=
+    /// 0.19.6. The test calls `GET /api/v1/version` and asserts that the
+    /// `api` field equals (a) the crate's own `CARGO_PKG_VERSION` and (b)
+    /// the current hardcoded release string. The second assertion is the
+    /// real tripwire: any Cargo.toml bump without updating this test —
+    /// or vice-versa — fails the build and forces the author to
+    /// synchronise the two.
+    #[tokio::test]
+    async fn version_endpoint_matches_cargo_package_version() {
+        let response = app(state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        // CARGO_PKG_VERSION comes from the surrounding Cargo.toml at
+        // compile time; this field is what the backend actually ships.
+        assert_eq!(body["api"], json!(env!("CARGO_PKG_VERSION")));
+        // Hardcoded expected release string. Bump this with Cargo.toml
+        // for every release, otherwise the test fails and the author
+        // sees the discrepancy before the API ships.
+        assert_eq!(body["api"], json!("0.19.8"));
+    }
+
     #[tokio::test]
     async fn capabilities_publish_executable_and_locked_scenario_step_types() {
         let response = app(state())
