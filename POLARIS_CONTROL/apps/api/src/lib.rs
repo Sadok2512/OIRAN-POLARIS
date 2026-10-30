@@ -7361,6 +7361,31 @@ async fn start_ue(
     }
 }
 
+/// 0.18.0 #36 — True when the UE has a live-mode launch recorded (both an
+/// `approved_runtime` spec and a `process_handle`). Used by the Stop
+/// handlers to route the request through `stop_one_live` regardless of
+/// the current `execution_mode` flag, so an operator can always stop
+/// what they started in live even after the API flipped back to mock /
+/// offline between the Start and the Stop (or after their live grant
+/// expired). The security guards inside `stop_one_live_inner`
+/// (`controller_owns_ue`, approved_runtime integrity) stay in place.
+fn ue_has_live_launch(state: &AppState, ue_id: &str) -> bool {
+    state
+        .multi_ue
+        .lock()
+        .map(|controller| {
+            controller
+                .snapshot()
+                .into_iter()
+                .any(|job| {
+                    job.ue_id == ue_id
+                        && job.approved_runtime.is_some()
+                        && job.process_handle.is_some()
+                })
+        })
+        .unwrap_or(false)
+}
+
 async fn stop_ue(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
@@ -7369,7 +7394,14 @@ async fn stop_ue(
     if let Err(error) = require_operator(&identity) {
         return error;
     }
-    if state.execution_mode == "live" {
+    // 0.18.0 #36 — Stop no longer requires the Live flag to be ON. We
+    // reach into the controller registry and route the Stop through the
+    // live path whenever a live-mode launch is still recorded for the
+    // UE. This fixes the case where execution_mode flipped off (or the
+    // grant expired) between Start and Stop, which previously stranded
+    // the running container because stop_offline only touches state.
+    let use_live_path = state.execution_mode == "live" || ue_has_live_launch(&state, &input.ue_id);
+    if use_live_path {
         let live_state = state.clone();
         let ue_id = input.ue_id.clone();
         let outcome = tokio::task::spawn_blocking(move || stop_one_live(&live_state, &ue_id))
@@ -7521,12 +7553,36 @@ async fn stop_ue_group(
             Json(json!({"error":"INVALID_GROUP_REQUEST"})),
         );
     }
-    if state.execution_mode == "live" {
+    // 0.18.0 #36 — Group Stop no longer requires the Live flag. We
+    // process each UE on the live path if a live launch is still recorded
+    // for it, and fall back to the offline-registry path only when there
+    // is no live container to tear down. See `ue_has_live_launch` for the
+    // live-origin predicate and the comment on `stop_ue`.
+    let any_live = state.execution_mode == "live"
+        || input
+            .ue_ids
+            .iter()
+            .any(|ue_id| ue_has_live_launch(&state, ue_id));
+    if any_live {
         let mut result = simulator_controller::GroupResult {
             started: Vec::new(),
             failed: Vec::new(),
         };
         for ue_id in &input.ue_ids {
+            if !(state.execution_mode == "live" || ue_has_live_launch(&state, ue_id)) {
+                // Not live-launched — fall back to the offline-registry stop
+                // for this specific UE so the group response stays coherent.
+                if let Ok(mut controller) = state.multi_ue.lock() {
+                    match controller.stop_offline(ue_id) {
+                        Ok(_) => {
+                            let _ = persist_ue_registry(&state, &controller);
+                            result.started.push(ue_id.clone());
+                        }
+                        Err(error) => result.failed.push((ue_id.clone(), error)),
+                    }
+                }
+                continue;
+            }
             let live_state = state.clone();
             let item = ue_id.clone();
             let outcome = tokio::task::spawn_blocking(move || stop_one_live(&live_state, &item))
@@ -11687,6 +11743,76 @@ mod p0_tests {
             let fields = envelope_fields_fixture(&spec, status);
             assert!(DockerUeRuntime::container_is_stopped(&fields));
         }
+    }
+
+    /// 0.18.0 #36 — When a UE already has a live launch recorded (both an
+    /// `approved_runtime` spec AND a non-empty `process_handle`), Stop must
+    /// route through the live path even if the API process has since
+    /// flipped `execution_mode` away from "live" — otherwise the running
+    /// container would leak. The predicate below is the one `stop_ue` and
+    /// `stop_ue_group` consult.
+    #[test]
+    fn ue_has_live_launch_requires_both_approved_runtime_and_process_handle() {
+        let state = state();
+        // Default test state: no job created yet.
+        assert!(!ue_has_live_launch(&state, "UE-02"));
+
+        // The planned profile list ships UE-02 with configured=false; it
+        // needs to be flipped on before reserve_live_start accepts it.
+        let mut configured_profile = state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .profiles()
+            .iter()
+            .find(|p| p.ue_id == "UE-02")
+            .cloned()
+            .expect("UE-02 planned profile");
+        configured_profile.configured = true;
+        configured_profile.subscription_verified = true;
+        state
+            .multi_ue
+            .lock()
+            .unwrap()
+            .upsert_profile(configured_profile.clone())
+            .expect("upsert UE-02 as configured");
+
+        let spec = ueransim_adapter::live_launch_spec(
+            &configured_profile,
+            Path::new(ueransim_adapter::LIVE_PROFILE_ROOT),
+            &format!("sha256:{}", "a".repeat(64)),
+            Path::new(ueransim_adapter::LIVE_START_SCRIPT),
+            &"b".repeat(64),
+            &"c".repeat(64),
+            &"d".repeat(64),
+        )
+        .expect("live_launch_spec");
+
+        {
+            let mut controller = state.multi_ue.lock().unwrap();
+            controller
+                .reserve_live_start("UE-02", "op-abc", spec)
+                .expect("reserve_live_start");
+        }
+        // Still false — no process_handle recorded yet.
+        assert!(!ue_has_live_launch(&state, "UE-02"));
+
+        // Complete the start by stamping a process handle. Now the Stop
+        // path must detect it as live-launched regardless of execution_mode.
+        {
+            let mut controller = state.multi_ue.lock().unwrap();
+            controller
+                .complete_live_start(
+                    "UE-02",
+                    "op-abc",
+                    "container:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .expect("complete_live_start");
+        }
+        assert!(ue_has_live_launch(&state, "UE-02"));
+
+        // Unknown UE id: predicate must return false, never panic.
+        assert!(!ue_has_live_launch(&state, "UE-ZZZ"));
     }
 
     #[test]
