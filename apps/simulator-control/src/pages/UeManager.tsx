@@ -14,7 +14,7 @@ import {
   Upload,
   Users,
 } from 'lucide-react';
-import { PageHeader } from '@/components/mockup';
+import { Card, PageHeader, Pill, regTone } from '@/components/mockup';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import { ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
 import { ConfirmDialog } from '@/ui/ConfirmDialog';
@@ -796,29 +796,30 @@ export function UeManagerPage() {
         )}
       </section>
 
-      <div className="ep-card">
+      <Card className="overflow-hidden">
         <table
           className="ep-table w-full table-fixed"
           data-testid="ue-table"
         >
           <colgroup>
-            {/* 0.10.4 — Runtime columns collapsed into a single "État" cell.
-                The pre-0.10.4 5-column Runtime block still crammed labels
-                into tight widths at 1280px; the chip layout fits the
-                compact label + IP under a single 18 % column. RRC and
-                traffic moved to the Activity page. Total = 100 %. */}
+            {/* 0.12.1 — Full mockup layout: 7 content columns
+                (UE / Serving gNB / Subscriber / Registration / PDU · IP /
+                Scenario / Actions) + one 2 rem checkbox prefix we keep for
+                bulk selection. IMSI + Owner fold into the UE sub-caption
+                so the Identity rule stays respected (operator sees the raw
+                IMSI, viewer stays on the solid mask). */}
             <col style={{ width: '2rem' }} />
+            <col style={{ width: '19%' }} />
             <col style={{ width: '10%' }} />
-            <col style={{ width: '18%' }} />
+            <col style={{ width: '13%' }} />
             <col style={{ width: '10%' }} />
-            <col style={{ width: '9%' }} />
-            <col className="runtime-col" style={{ width: '18%' }} />
-            <col style={{ width: '15%' }} />
-            <col style={{ width: '20%' }} />
+            <col style={{ width: '13%' }} />
+            <col style={{ width: '14%' }} />
+            <col style={{ width: '21%' }} />
           </colgroup>
           <thead>
-            <tr>
-              <th className="w-8">
+            <tr className="text-left text-ep-xs uppercase tracking-wider text-mute border-b border-line">
+              <th className="w-8 px-2 py-2.5 font-semibold">
                 <input
                   type="checkbox"
                   aria-label="Select all on page"
@@ -837,13 +838,13 @@ export function UeManagerPage() {
                   data-testid="ue-select-all"
                 />
               </th>
-              <th>UE ID</th>
-              <th>IMSI</th>
-              <th>Owner</th>
-              <th>Serving gNB</th>
-              <th>État</th>
-              <th>Scenario</th>
-              <th className="text-right">Actions</th>
+              <th className="px-3 py-2.5 font-semibold">UE</th>
+              <th className="px-3 py-2.5 font-semibold">Serving gNB</th>
+              <th className="px-3 py-2.5 font-semibold">Subscriber</th>
+              <th className="px-3 py-2.5 font-semibold">Registration</th>
+              <th className="px-3 py-2.5 font-semibold">PDU · IP</th>
+              <th className="px-3 py-2.5 font-semibold">Scenario</th>
+              <th className="px-3 py-2.5 font-semibold text-right">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -972,83 +973,92 @@ export function UeManagerPage() {
                       data-testid={`ue-select-${row.profile.id}`}
                     />
                   </td>
-                  <td>
-                    <div className="flex flex-col">
-                      {/* 0.11.0 (#37) — The UE id click now lands on the
-                          per-UE Activity page (the detail page stays
-                          reachable via the "UE detail" button inside
-                          Activity). The link is role-independent — Activity
-                          is read-only, open to every signed-in viewer. */}
-                      <Link
-                        to={`/ues/${encodeURIComponent(row.profile.id)}/activity`}
-                        className="font-medium mono text-primary hover:underline"
-                        data-testid={`ue-detail-link-${row.profile.id}`}
-                      >
-                        {row.profile.id}
-                      </Link>
-                      {row.backend?.internal_ue_id &&
-                        row.backend.internal_ue_id !== row.profile.id && (
-                          <span className="text-text-secondary text-ep-xs mono truncate">
-                            {row.backend.internal_ue_id}
-                          </span>
-                        )}
-                      {notProvisioned && !profileBackend && (
-                        <span className="text-ep-xs text-text-secondary">
-                          Not provisioned on backend
+                  <td className="px-3 py-3">
+                    {/* 0.12.1 — mockup cell: mono UE id (links to Activity),
+                        name sub-caption, owner & IMSI merged into the mute
+                        sub-line (IMSI role-gated via formatImsiForRole). */}
+                    <Link
+                      to={`/ues/${encodeURIComponent(row.profile.id)}/activity`}
+                      className="mono font-medium text-ink hover:underline"
+                      data-testid={`ue-detail-link-${row.profile.id}`}
+                    >
+                      {row.profile.id}
+                    </Link>
+                    {isShared ? (
+                      <div className="text-ep-sm text-warn inline-flex items-center gap-1">
+                        <AlertTriangle width={10} height={10} /> shared, protected
+                      </div>
+                    ) : null}
+                    <div className="flex items-center gap-2 text-ep-xs text-mute mt-0.5">
+                      {displayOwner !== '—' ? (
+                        <span data-testid={`ue-owner-${row.profile.id}`}>
+                          owner {displayOwner}
                         </span>
+                      ) : (
+                        <span data-testid={`ue-owner-${row.profile.id}`}>owner —</span>
                       )}
-                      {profileBackend && row.profile.subscriptionStatus && (
-                        <span
-                          className={`text-ep-xs ${
-                            row.profile.subscriptionStatus === 'VERIFIED' ? 'text-success' : 'text-warning'
-                          }`}
-                          data-testid={`ue-subscription-${row.profile.id}`}
-                        >
-                          {row.profile.subscriptionStatus === 'VERIFIED'
-                            ? 'Open5GS subscription verified'
-                            : 'Not provisioned in Open5GS'}
-                        </span>
-                      )}
-                      {isShared && (
-                        <span className="text-ep-xs text-warning flex items-center gap-1">
-                          <AlertTriangle width={10} height={10} />
-                          Shared — protected
-                        </span>
-                      )}
+                      <span className="mono" data-testid={`ue-imsi-${row.profile.id}`}>
+                        {formatImsiForRole(row.profile.imsi, canOperate)}
+                      </span>
                     </div>
                   </td>
-                  {/* 0.10.2 (#41) — IMSI column. Operators see the raw IMSI;
-                      viewers see the solid mask only. */}
-                  <td
-                    className="mono text-ep-xs"
-                    data-testid={`ue-imsi-${row.profile.id}`}
-                  >
-                    {formatImsiForRole(row.profile.imsi, canOperate)}
+                  <td className="px-3 py-3 mono" data-testid={`ue-gnb-${row.profile.id}`}>
+                    {row.profile.servingGnb || '—'}
                   </td>
-                  <td data-testid={`ue-owner-${row.profile.id}`}>{displayOwner}</td>
-                  <td className="mono">{row.profile.servingGnb || '—'}</td>
-                  {/* 0.10.4 — Single "État" cell replacing the 5-column
-                      Runtime block. The chip shows at most two state hints
-                      (`Registered · PDU active`), falls back to `Not running`
-                      when the UE is idle, and carries the UE IP on a second
-                      line below. RRC and traffic breakdown live on the
-                      Activity page now. */}
+                  <td className="px-3 py-3" data-testid={`ue-subscriber-${row.profile.id}`}>
+                    {row.backend ? (
+                      row.backend.controller_owned ? (
+                        <Pill tone="ok">Verified</Pill>
+                      ) : (
+                        <Pill tone="warn">Shared</Pill>
+                      )
+                    ) : (
+                      <Pill tone="warn">Not provisioned</Pill>
+                    )}
+                    {row.backend?.internal_ue_id &&
+                    row.backend.internal_ue_id !== row.profile.id ? (
+                      <p className="mono text-ep-xs text-mute mt-1">
+                        slot {row.backend.internal_ue_id}
+                      </p>
+                    ) : null}
+                    {profileBackend &&
+                    row.profile.subscriptionStatus &&
+                    row.profile.subscriptionStatus !== 'VERIFIED' ? (
+                      <p
+                        className="text-ep-xs text-warn mt-0.5"
+                        data-testid={`ue-subscription-${row.profile.id}`}
+                      >
+                        Not provisioned in Open5GS
+                      </p>
+                    ) : null}
+                  </td>
+                  <td className="px-3 py-3" data-testid={`ue-reg-${row.profile.id}`}>
+                    {renderRegistrationCell(row.backend, isRuntimeIdle)}
+                  </td>
                   <td
-                    className="px-2"
+                    className="px-3 py-3"
                     data-testid={`ue-etat-${row.profile.id}`}
                   >
-                    <div className="flex flex-col gap-0.5">
-                      <StatusIndicator
-                        state={etatToneState(row.backend, isRuntimeIdle)}
-                        label={etatLabel(row.backend, isRuntimeIdle)}
-                        compact
-                      />
-                      {(row.backend?.ue_ip ?? row.profile.ueIp) && (
-                        <span className="mono text-ep-xs text-text-secondary">
-                          {row.backend?.ue_ip ?? row.profile.ueIp}
-                        </span>
-                      )}
+                    {/* 0.12.1 — Mockup splits État back into Registration +
+                        PDU · IP cells. The compact label we exposed via
+                        `etatLabel` still powers the smoke tests but is now
+                        hidden inside a title tooltip for forward-compat. */}
+                    <div
+                      className="flex flex-col gap-0.5"
+                      title={etatLabel(row.backend, isRuntimeIdle)}
+                    >
+                      {renderPduCell(row.backend, isRuntimeIdle)}
+                      <span className="mono text-ep-xs text-mute">
+                        {row.backend?.ue_ip ?? row.profile.ueIp ?? '—'}
+                      </span>
                     </div>
+                    <span
+                      className="sr-only"
+                      data-testid={`ue-etat-label-${row.profile.id}`}
+                      aria-hidden="true"
+                    >
+                      {etatLabel(row.backend, isRuntimeIdle)}
+                    </span>
                   </td>
                   <td>
                     <div className="flex flex-col gap-1">
@@ -1179,7 +1189,7 @@ export function UeManagerPage() {
             })}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={8} className="text-center text-text-secondary py-6">
+                <td colSpan={8} className="text-center text-mute py-6">
                   {profiles.length === 0
                     ? 'No UE profile yet. Add one, bulk-create or import CSV.'
                     : 'No profile matches the current filter.'}
@@ -1188,10 +1198,10 @@ export function UeManagerPage() {
             )}
           </tbody>
         </table>
-      </div>
+      </Card>
 
       <nav
-        className="flex items-center justify-between gap-2 mt-3 text-ep-sm text-text-secondary"
+        className="flex items-center justify-between gap-2 mt-3 text-ep-sm text-mute"
         data-testid="ue-pagination"
       >
         <div>
@@ -1514,6 +1524,39 @@ function pad(n: number): string {
  *
  * Visible only exported for the unit tests that pin the wording.
  */
+/**
+ * 0.12.1 — mockup split: Registration cell renders one pill with a live
+ * dot when the UE is REGISTERED, dot-less for any other state. An idle
+ * UE (or no backend record) renders a `STOPPED` pill in mute tone.
+ */
+export function renderRegistrationCell(
+  backend: UeState | undefined,
+  idle: boolean,
+): import('react').ReactNode {
+  const state = idle || !backend ? 'STOPPED' : (backend.registration_state ?? 'UNKNOWN').toUpperCase();
+  return (
+    <Pill tone={regTone(state)} dot={state === 'REGISTERED' ? 'live' : undefined}>
+      {state}
+    </Pill>
+  );
+}
+
+/**
+ * 0.12.1 — mockup split: PDU · IP cell carries the PDU state label on top
+ * (ACTIVE / INACTIVE / em-dash) and the UE IP in a mono mute sub-caption.
+ * Idle UEs still render the mute em-dash so the row stays aligned.
+ */
+export function renderPduCell(
+  backend: UeState | undefined,
+  idle: boolean,
+): import('react').ReactNode {
+  if (idle || !backend) return <span className="text-mute">—</span>;
+  const pdu = (backend.pdu_session ?? '').toUpperCase();
+  if (pdu === 'ACTIVE') return <Pill tone="ok">ACTIVE</Pill>;
+  if (!pdu || pdu === 'UNKNOWN' || pdu === 'INACTIVE') return <span className="text-mute">—</span>;
+  return <Pill tone="mute">{pdu}</Pill>;
+}
+
 export function etatLabel(backend: UeState | undefined, idle: boolean): string {
   if (idle || !backend) return 'Not running';
   const parts: string[] = [];

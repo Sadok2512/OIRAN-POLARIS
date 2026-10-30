@@ -6,6 +6,7 @@ import {
   useCapabilities,
   useLabObserved,
   useProvisioningSlots,
+  useSubscriberSlots,
   type WireContainerStatus,
   type WireLabObserved,
 } from '@/data/queries';
@@ -42,6 +43,11 @@ export function CoreOpen5gsPage() {
   const lab = useLabObserved();
   const capabilities = useCapabilities();
   const slots = useProvisioningSlots();
+  // 0.12.1 (#45) — second feed carries AMBR + SD per subscriber so we can
+  // paint the orange warn pill in the Identity column. The two feeds are
+  // joined by slot id; subscribers without a matching provisioning row stay
+  // on the mockup "Free" tone.
+  const subscribers = useSubscriberSlots();
 
   const observed: WireLabObserved | undefined = lab.data?.observed;
   const openCore = observed?.open5gs;
@@ -238,7 +244,12 @@ export function CoreOpen5gsPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {slots.data.items.map((slot) => (
+                    {slots.data.items.map((slot) => {
+                      const row = (subscribers.data ?? []).find((r) => r.slot === slot.slot_id);
+                      const identity = row?.identity ?? 'PROTECTED';
+                      const identityExposed = identity !== 'PROTECTED';
+                      const warn = subscriberWarning(row?.ambr, row?.sd);
+                      return (
                       <tr
                         key={slot.slot_id}
                         className="border-b border-line last:border-0"
@@ -246,9 +257,23 @@ export function CoreOpen5gsPage() {
                       >
                         <td className="px-4 py-2.5 mono font-medium">{slot.slot_id}</td>
                         <td className="px-3 py-2.5">
-                          <span className="inline-flex items-center gap-1 mono text-ep-sm text-mute">
-                            <KeyRound width={12} height={12} /> PROTECTED
-                          </span>
+                          <div className="flex flex-col gap-0.5">
+                            <span
+                              className="inline-flex items-center gap-1 mono text-ep-sm text-mute"
+                              data-testid={`subscriber-identity-${slot.slot_id}`}
+                            >
+                              <KeyRound width={12} height={12} />{' '}
+                              {identityExposed ? identity : 'PROTECTED'}
+                            </span>
+                            {warn ? (
+                              <Pill
+                                tone="warn"
+                                data-testid={`subscriber-warn-${slot.slot_id}`}
+                              >
+                                {warn}
+                              </Pill>
+                            ) : null}
+                          </div>
                         </td>
                         <td className="px-3 py-2.5">
                           {slot.bound_ue_id ? (
@@ -271,7 +296,8 @@ export function CoreOpen5gsPage() {
                           </button>
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -356,3 +382,22 @@ function amfContainerBadge(container: WireContainerStatus | undefined): { label:
 
 // Keeps regTone imported (used indirectly in future enrichments).
 void regTone;
+
+/**
+ * 0.12.1 (#45) — Flag subscribers whose AMBR is below 10 Mbit/s (either
+ * direction) or whose S-NSSAI has no SD. Return a short label the UI
+ * shows in an orange warning pill. `null` → no warning.
+ */
+export function subscriberWarning(
+  ambr: { uplink: number; downlink: number } | null | undefined,
+  sd: string | null | undefined,
+): string | null {
+  const reasons: string[] = [];
+  if (ambr && (ambr.uplink < 10 || ambr.downlink < 10)) {
+    reasons.push('AMBR < 10 Mbit/s');
+  }
+  if (!sd || sd.trim() === '') {
+    reasons.push('no S-NSSAI SD');
+  }
+  return reasons.length === 0 ? null : reasons.join(' · ');
+}

@@ -169,6 +169,14 @@ export function ProvisioningPage() {
 
   const errorCode =
     subscribers.error instanceof ApiError ? (subscribers.error as ApiError).code : 'LIST_FAILED';
+  // 0.12.1 (#44) — surface the real HTTP status alongside the code and a
+  // visible Retry button, so a 500 or 503 is distinguishable from a 404
+  // "backend pending" state. The retry button clears the error cache for
+  // the list and refetches.
+  const errorStatus =
+    subscribers.error instanceof ApiError
+      ? (subscribers.error as ApiError).status
+      : null;
 
   return (
     <>
@@ -202,7 +210,37 @@ export function ProvisioningPage() {
         {subscribers.isLoading ? (
           <LoadingSkeleton />
         ) : subscribers.isError ? (
-          <Unavailable reason={`${errorCode} · ${(subscribers.error as Error).message}`} />
+          <div
+            className="flex flex-col gap-3 text-ep-sm"
+            data-testid="provisioning-error"
+          >
+            <div className="flex items-start gap-2 text-error">
+              <AlertTriangle width={14} height={14} className="mt-0.5 shrink-0" />
+              <div>
+                <p className="font-medium">
+                  {errorStatus != null ? `HTTP ${errorStatus} · ` : ''}
+                  {errorCode}
+                </p>
+                <p
+                  className="text-text-secondary mt-0.5"
+                  data-testid="provisioning-error-detail"
+                >
+                  {(subscribers.error as Error).message}
+                </p>
+              </div>
+            </div>
+            <div>
+              <button
+                type="button"
+                className="ep-button ep-button-sm"
+                onClick={() => void subscribers.refetch()}
+                disabled={subscribers.isFetching}
+                data-testid="provisioning-retry"
+              >
+                {subscribers.isFetching ? 'Retrying…' : 'Retry'}
+              </button>
+            </div>
+          </div>
         ) : !subscribers.data || subscribers.data.items.length === 0 ? (
           <EmptyState
             title="No subscriber yet"
