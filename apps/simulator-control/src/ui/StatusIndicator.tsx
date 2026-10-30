@@ -54,6 +54,20 @@ export function toneFor(value: string | undefined | null): Tone {
   return 'neutral';
 }
 
+const FRIENDLY_STATE_LABEL: Record<string, string> = {
+  UNKNOWN: 'Not running',
+  INACTIVE: 'Not running',
+  DEREGISTERED: 'Deregistered',
+  REGISTRATIONPDU: 'Registration · PDU',
+  NOT_PROVISIONED: 'Not provisioned',
+};
+
+export function friendlyStateLabel(value: string | null | undefined): string {
+  if (!value) return '—';
+  const upper = value.toUpperCase();
+  return FRIENDLY_STATE_LABEL[upper] ?? value;
+}
+
 export function StatusIndicator({
   state,
   label,
@@ -66,7 +80,7 @@ export function StatusIndicator({
   compact?: boolean;
 }) {
   const resolved: Tone = tone ?? toneFor(state);
-  const displayed = label ?? state ?? '—';
+  const displayed = label ?? friendlyStateLabel(state ?? null);
   return (
     <span
       className={clsx(

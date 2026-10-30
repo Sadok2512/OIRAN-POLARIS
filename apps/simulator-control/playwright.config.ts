@@ -1,4 +1,9 @@
 // 0.6.0 — minimal Playwright setup for simulator-control captures.
+// 0.10.0 — Added 1920×1080 viewport projects alongside 1440×900 so the
+// honest-UX pass (no overlap, no horizontal scroll in UE Manager, Scenario
+// Builder, Create Subscriber dialog) is validated at both reference
+// widths. Captures write screenshots regardless of pass/fail now; the
+// 0.10.0 report ships `screenshots-1440/` and `screenshots-1920/`.
 //
 // Scope:
 //   * Capture Templates, UE Manager, Provisioning, UE detail pages
@@ -26,8 +31,38 @@ export default defineConfig({
     screenshot: 'only-on-failure',
   },
   projects: [
-    { name: 'chromium-light', use: { ...devices['Desktop Chrome'], colorScheme: 'light' } },
-    { name: 'chromium-dark', use: { ...devices['Desktop Chrome'], colorScheme: 'dark' } },
+    {
+      name: 'chromium-1440-light',
+      use: {
+        ...devices['Desktop Chrome'],
+        colorScheme: 'light',
+        viewport: { width: 1440, height: 900 },
+      },
+    },
+    {
+      name: 'chromium-1440-dark',
+      use: {
+        ...devices['Desktop Chrome'],
+        colorScheme: 'dark',
+        viewport: { width: 1440, height: 900 },
+      },
+    },
+    {
+      name: 'chromium-1920-light',
+      use: {
+        ...devices['Desktop Chrome'],
+        colorScheme: 'light',
+        viewport: { width: 1920, height: 1080 },
+      },
+    },
+    {
+      name: 'chromium-1920-dark',
+      use: {
+        ...devices['Desktop Chrome'],
+        colorScheme: 'dark',
+        viewport: { width: 1920, height: 1080 },
+      },
+    },
   ],
   reporter: [['list']],
 });

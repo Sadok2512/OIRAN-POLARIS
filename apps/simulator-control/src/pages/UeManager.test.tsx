@@ -115,7 +115,9 @@ describe('UE Profile Manager — add / edit / delete', () => {
     ]);
     renderPage();
     const user = userEvent.setup();
-    await user.click(await screen.findByTestId('ue-edit-ue-1'));
+    // 0.10.0 — Edit / Clone / Delete now live under the ⋯ menu; open it first.
+    await user.click(await screen.findByTestId('ue-more-ue-1'));
+    await user.click(screen.getByTestId('ue-edit-ue-1'));
     const notesInput = screen.getAllByRole('textbox').find((element) =>
       (element as HTMLInputElement).parentElement?.textContent?.toLowerCase().includes('notes'),
     );
@@ -137,7 +139,8 @@ describe('UE Profile Manager — add / edit / delete', () => {
     ]);
     renderPage();
     const user = userEvent.setup();
-    await user.click(await screen.findByTestId('ue-delete-ue-del'));
+    await user.click(await screen.findByTestId('ue-more-ue-del'));
+    await user.click(screen.getByTestId('ue-delete-ue-del'));
     await user.click(screen.getByTestId('confirm-dialog-confirm'));
     await waitFor(() =>
       expect(screen.queryByTestId('ue-row-ue-del')).not.toBeInTheDocument(),

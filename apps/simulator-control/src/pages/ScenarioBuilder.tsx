@@ -163,6 +163,19 @@ export function ScenarioBuilderPage() {
   const backendBlocked =
     library.backend && (!isLoopRepresentable(draft.loop.kind) || hasLockedStep);
 
+  // 0.10.0 — Save disable reason, surfaced inline next to the button so
+  // the operator sees WHY Save is grayed without having to hover for the
+  // native tooltip. Order matches the disable predicate below.
+  const saveBlockReason: string | null = saving
+    ? null
+    : errors.length > 0
+      ? `${errors.length} erreur${errors.length > 1 ? 's' : ''} de validation à corriger.`
+      : library.backend && hasLockedStep
+        ? 'Au moins une étape non certifiée côté backend — à retirer avant Save.'
+        : library.backend && !isLoopRepresentable(draft.loop.kind)
+          ? 'Mode de boucle non représentable dans le catalog backend.'
+          : null;
+
   async function save() {
     if (errors.length > 0 || backendBlocked || saving) return;
     setSaveError(null);
@@ -196,21 +209,23 @@ export function ScenarioBuilderPage() {
               <ArrowLeft width={14} height={14} aria-hidden="true" />
               Back to library
             </button>
+            {saveBlockReason && (
+              <span
+                className="text-ep-xs text-warning flex items-center gap-1 max-w-xs"
+                data-testid="builder-save-reason"
+                role="status"
+              >
+                <AlertTriangle width={12} height={12} className="shrink-0" aria-hidden="true" />
+                <span>{saveBlockReason}</span>
+              </span>
+            )}
             <button
               type="button"
               className="ep-button ep-button-primary"
               onClick={() => void save()}
               disabled={errors.length > 0 || backendBlocked || saving}
               data-testid="builder-save"
-              title={
-                errors.length > 0
-                  ? 'Fix validation errors first'
-                  : library.backend && hasLockedStep
-                    ? 'Remove the non-certified step(s) before saving to the backend'
-                    : library.backend && !isLoopRepresentable(draft.loop.kind)
-                      ? 'This loop mode cannot be saved to the backend catalog'
-                      : undefined
-              }
+              title={saveBlockReason ?? undefined}
             >
               <Save width={14} height={14} aria-hidden="true" />
               {saving ? 'Saving…' : library.backend ? 'Save to backend' : 'Save scenario'}

@@ -165,9 +165,14 @@ describe('ScenarioBuilder — honest palette (0.5.1 + 0.5.2)', () => {
     // Banner appears and Save is blocked.
     await screen.findByTestId('builder-locked-step-banner');
     expect(save).toBeDisabled();
+    // 0.10.0 — Save reason is now surfaced both as an inline hint next to
+    // the button AND on the native tooltip, in French.
     expect(save).toHaveAttribute(
       'title',
-      'Remove the non-certified step(s) before saving to the backend',
+      'Au moins une étape non certifiée côté backend — à retirer avant Save.',
+    );
+    expect(screen.getByTestId('builder-save-reason')).toHaveTextContent(
+      /non certifiée côté backend/i,
     );
   });
 

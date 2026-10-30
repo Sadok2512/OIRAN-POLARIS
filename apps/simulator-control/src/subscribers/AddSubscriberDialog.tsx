@@ -35,14 +35,27 @@ interface State {
   touched: boolean;
 }
 
+// 0.10.0 — AMBR default raised to 1 Gbit/s in kbps (= 1_000_000). Operators
+// were defaulting the field manually before every create; honest UX is to
+// seed the field with the lab-standard throughput.
+const DEFAULT_AMBR_KBPS = '1000000';
+
+// 0.10.0 — Lab-standard S-NSSAI used when /plmns returns no slice descriptor
+// (the deployed backend currently serves `{items: ["001-01"]}` without
+// slices). We fall back to this pair and tag the option explicitly so the
+// operator knows it comes from the lab, not from the backend inventory.
+const LAB_FALLBACK_SST = 1;
+const LAB_FALLBACK_SD = '010203';
+const LAB_FALLBACK_SLICE_KEY = `${LAB_FALLBACK_SST}/${LAB_FALLBACK_SD}`;
+
 const EMPTY: State = {
   imsi: '',
   k: '',
   opc: '',
   slice: '',
   dnn: '',
-  ambr_uplink: '1048576',
-  ambr_downlink: '1048576',
+  ambr_uplink: DEFAULT_AMBR_KBPS,
+  ambr_downlink: DEFAULT_AMBR_KBPS,
   touched: false,
 };
 
@@ -78,26 +91,79 @@ export function AddSubscriberDialog({
   const plmns = usePlmns();
   const dnns = useDnns();
 
-  const sliceOptions = useMemo(() => {
+  // 0.10.0 — /plmns on the deployed backend returns `{items: string[]}`
+  // (PLMN labels only, no slice descriptors). The 0.7.1 schema that
+  // carries `.slices` is still typed here for forward compat. When no
+  // slice is advertised we fall back to the lab-standard SST=1 / SD=010203
+  // pair and tag the option explicitly so the operator sees it is a lab
+  // value, not something read from the backend.
+  const { sliceOptions, sliceFallback } = useMemo(() => {
     const map = new Map<string, { key: string; label: string; sst: number; sd: string | null }>();
-    for (const plmn of plmns.data?.items ?? []) {
+    const rawItems = (plmns.data as unknown as { items?: unknown[] })?.items ?? [];
+    let anySlice = false;
+    for (const raw of rawItems) {
+      if (!raw || typeof raw !== 'object') continue;
+      const plmn = raw as Partial<{
+        id: string;
+        mcc: string;
+        mnc: string;
+        slices: PlmnSlice[];
+      }>;
+      const mccMnc = plmn.mcc && plmn.mnc ? `${plmn.mcc}/${plmn.mnc}` : plmn.id ?? '—';
       for (const slice of plmn.slices ?? []) {
+        anySlice = true;
         const key = sliceKey(slice);
         if (map.has(key)) continue;
         const sliceLabel =
           slice.display_name ?? `S-NSSAI ${slice.sst}${slice.sd ? `/${slice.sd}` : ''}`;
         map.set(key, {
           key,
-          label: `${plmn.mcc}/${plmn.mnc} · ${sliceLabel}`,
+          label: `${mccMnc} · ${sliceLabel}`,
           sst: slice.sst,
           sd: slice.sd,
         });
       }
     }
-    return Array.from(map.values());
-  }, [plmns.data?.items]);
+    const fallback = !plmns.isLoading && !anySlice;
+    if (fallback) {
+      map.set(LAB_FALLBACK_SLICE_KEY, {
+        key: LAB_FALLBACK_SLICE_KEY,
+        label: `S-NSSAI ${LAB_FALLBACK_SST}/${LAB_FALLBACK_SD} · valeur du labo`,
+        sst: LAB_FALLBACK_SST,
+        sd: LAB_FALLBACK_SD,
+      });
+    }
+    return { sliceOptions: Array.from(map.values()), sliceFallback: fallback };
+  }, [plmns.data, plmns.isLoading]);
 
-  const dnnOptions = useMemo(() => dnns.data?.items ?? [], [dnns.data?.items]);
+  // 0.10.0 — /dnns on the deployed backend returns `{items: string[]}`
+  // (e.g. ["internet","ims"]). The old `Dnn[]` shape (objects with .dnn
+  // and .description) is still valid: normalize both into `{value,label}`
+  // so the dropdown stays honest and we no longer render a bare "·".
+  const dnnOptions = useMemo(() => {
+    const raw = (dnns.data as unknown as { items?: unknown[] })?.items ?? [];
+    const seen = new Set<string>();
+    const normalized: { value: string; label: string }[] = [];
+    for (const entry of raw) {
+      if (typeof entry === 'string') {
+        if (seen.has(entry)) continue;
+        seen.add(entry);
+        normalized.push({ value: entry, label: entry });
+        continue;
+      }
+      if (entry && typeof entry === 'object') {
+        const record = entry as { id?: string; dnn?: string; description?: string };
+        const value = record.dnn ?? record.id;
+        if (!value || seen.has(value)) continue;
+        seen.add(value);
+        normalized.push({
+          value,
+          label: record.description ? `${value} · ${record.description}` : value,
+        });
+      }
+    }
+    return normalized;
+  }, [dnns.data]);
 
   useEffect(() => {
     if (!open) {
@@ -272,6 +338,15 @@ export function AddSubscriberDialog({
             Free SST/SD input is gone (hardening after two subscribers landed on 1/000001 and were
             not served). Slices come from <code className="mono">/plmns</code>.
           </span>
+          {sliceFallback && (
+            <span
+              className="text-ep-xs text-warning flex items-start gap-1"
+              data-testid="subscriber-slice-fallback"
+            >
+              <AlertTriangle width={11} height={11} className="mt-0.5 shrink-0" />
+              /plmns ne publie pas de slice — proposition SST {LAB_FALLBACK_SST} / SD {LAB_FALLBACK_SD} (valeur du labo).
+            </span>
+          )}
         </label>
 
         <label className="flex flex-col gap-1 text-ep-sm">
@@ -292,8 +367,8 @@ export function AddSubscriberDialog({
                   : 'Choose a DNN'}
             </option>
             {dnnOptions.map((option) => (
-              <option key={option.id} value={option.dnn}>
-                {option.dnn} · {option.description}
+              <option key={option.value} value={option.value}>
+                {option.label}
               </option>
             ))}
           </select>

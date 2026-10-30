@@ -248,11 +248,12 @@ export function paginate(
   if (needle || ownerFilter || gnbFilter) {
     filtered = profiles.filter((profile) => {
       if (needle) {
+        // 0.10.0 — IMSI dropped from the search haystack (identity stays
+        // PROTECTED; the UI never surfaces it, so searching by it was a lie).
         const hay = [
           profile.id,
           profile.owner,
           profile.servingGnb,
-          profile.imsi ?? '',
           profile.ueIp ?? '',
           profile.notes ?? '',
         ]

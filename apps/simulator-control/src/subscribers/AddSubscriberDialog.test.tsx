@@ -136,7 +136,8 @@ describe('AddSubscriberDialog (0.7.1)', () => {
       sst: 1,
       sd: 'A1B2C3',
       dnns: ['internet'],
-      ambr: { uplink: 1_048_576, downlink: 1_048_576 },
+      // 0.10.0 — default AMBR raised to 1 Gbit/s on both directions.
+      ambr: { uplink: 1_000_000, downlink: 1_000_000 },
     });
     // Scrubbed from state.
     expect(screen.getByTestId('subscriber-imsi')).toHaveValue('');
@@ -155,10 +156,13 @@ describe('AddSubscriberDialog (0.7.1)', () => {
     renderDialog();
     const slice = await screen.findByTestId('subscriber-slice');
     const dnn = screen.getByTestId('subscriber-dnn');
-    // The <select> ends up disabled once /plmns + /dnns resolve as empty.
-    await waitFor(() => expect(slice).toBeDisabled());
-    expect(dnn).toBeDisabled();
-    expect(slice.textContent).toMatch(/Backend pending/i);
+    // 0.10.0 — /plmns without slice no longer disables slice selection; a
+    // lab-default S-NSSAI 1/010203 fallback is proposed instead, tagged
+    // explicitly "valeur du labo". /dnns truly empty still surfaces the
+    // "Backend pending" copy.
+    await screen.findByTestId('subscriber-slice-fallback');
+    expect(slice.textContent).toMatch(/valeur du labo/i);
+    await waitFor(() => expect(dnn).toBeDisabled());
     expect(dnn.textContent).toMatch(/Backend pending/i);
   });
 

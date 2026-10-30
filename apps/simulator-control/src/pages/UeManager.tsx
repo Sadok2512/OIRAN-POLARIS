@@ -18,6 +18,7 @@ import { PageHeader } from '@/ui/PageHeader';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import { ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
 import { ConfirmDialog } from '@/ui/ConfirmDialog';
+import { RowActionMenu } from '@/ui/RowActionMenu';
 import {
   useAuth,
   useDnns,
@@ -476,21 +477,25 @@ export function UeManagerPage() {
   }
 
   async function stopFor(row: MergedRow) {
-    if (!activeJob?.job_id) {
-      setFeedback('No active job to stop.');
-      return;
-    }
+    // 0.10.0 — Stop prefers the active scenario job (if the UE owns it), and
+    // falls back to the direct backend Stop action otherwise. Previously the
+    // button was disabled whenever no active_job existed; now the toggle
+    // follows backend.actions.stop so running UEs can be stopped directly.
     const backendId = row.backend?.internal_ue_id ?? row.backend?.id;
-    if (activeJob.target_ue_id && activeJob.target_ue_id !== backendId) {
-      setFeedback('Active job is not owned by this UE; stop ignored.');
+    if (activeJob?.job_id && (!activeJob.target_ue_id || activeJob.target_ue_id === backendId)) {
+      try {
+        await stopScenario.mutateAsync(activeJob.job_id);
+        setFeedback(`Stop sent for job ${activeJob.job_id}.`);
+      } catch (error) {
+        setFeedback((error as Error).message);
+      }
       return;
     }
-    try {
-      await stopScenario.mutateAsync(activeJob.job_id);
-      setFeedback(`Stop sent for job ${activeJob.job_id}.`);
-    } catch (error) {
-      setFeedback((error as Error).message);
+    if (row.backend?.actions?.stop) {
+      await stopBackendUe(row);
+      return;
     }
+    setFeedback('No active job and backend reports Stop not available.');
   }
 
   async function startBackendUe(row: MergedRow) {
@@ -529,7 +534,7 @@ export function UeManagerPage() {
       <PageHeader
         eyebrow="Operations"
         title="UE Profile Manager"
-        description="Operator-authored UE profiles reconciled with the POLARIS backend inventory. Profiles persist in the browser until a backend CRUD contract is available; backend state (registration, PDU, UE IP, traffic) is read live from POLARIS."
+        description="Operator-authored UE profiles reconciled with the POLARIS backend inventory. Backend state (registration, PDU, UE IP, traffic) is read live from POLARIS."
         actions={
           <div className="flex items-center gap-2">
             <StatusIndicator
@@ -563,7 +568,7 @@ export function UeManagerPage() {
             />
             <input
               className="ep-input pl-7 w-64"
-              placeholder="Search id, owner, gNB, IMSI, UE IP…"
+              placeholder="Search id, owner, gNB, UE IP…"
               value={search}
               onChange={(event) => {
                 setSearch(event.target.value);
@@ -811,6 +816,75 @@ export function UeManagerPage() {
               const isActiveForUe =
                 activeJob?.target_ue_id != null && activeJob.target_ue_id === backendId;
               const notProvisioned = !row.backend;
+              // 0.10.0 — Start / Stop is a state-driven toggle: the backend's
+              // own `actions` map tells us which transition is applicable
+              // right now. A running UE advertises `stop:true`; an idle one
+              // advertises `start:true`. The active-job path reinforces Stop
+              // when a controller-owned job is actually targeting this UE.
+              const backendCanStop = row.backend?.actions?.stop === true;
+              const backendCanStart = row.backend?.actions?.start === true;
+              const showStop = backendCanStop || isActiveForUe;
+              // 0.10.0 — explicit disable reasons so operators see WHY a button
+              // is grayed instead of guessing (viewer, 423-live-closed, UE active,
+              // shared, …). Returned string becomes the native tooltip.
+              const liveClosed = row.backend?.actions?.reason?.includes('423') ||
+                /LIVE_EXECUTION_NOT_AUTHORIZED/.test(row.backend?.actions?.reason ?? '');
+              const startDisabled =
+                !canOperate ||
+                isShared ||
+                notProvisioned ||
+                !backendCanStart ||
+                startUe.isPending;
+              const startReason = !canOperate
+                ? 'Rôle viewer : lecture seule.'
+                : isShared
+                  ? 'UE partagée — protégée.'
+                  : notProvisioned
+                    ? 'Pas provisionné côté backend.'
+                    : isActiveForUe
+                      ? 'UE déjà active.'
+                      : liveClosed
+                        ? 'Live fermé (HTTP 423) — approbation requise.'
+                        : !row.backend?.actions?.start
+                          ? row.backend?.actions?.reason || 'Start indisponible.'
+                          : null;
+              const stopDisabled =
+                !canOperate ||
+                isShared ||
+                notProvisioned ||
+                !(isActiveForUe || backendCanStop) ||
+                stopScenario.isPending;
+              const stopReason = !canOperate
+                ? 'Rôle viewer : lecture seule.'
+                : isShared
+                  ? 'UE partagée — protégée.'
+                  : notProvisioned
+                    ? 'Pas provisionné côté backend.'
+                    : !(isActiveForUe || backendCanStop)
+                      ? 'Aucune action Stop disponible côté backend.'
+                      : null;
+              const runDisabled =
+                !canOperate ||
+                isShared ||
+                notProvisioned ||
+                !scenario ||
+                (!scenarioBackend && !profile);
+              const runReason = !canOperate
+                ? 'Rôle viewer : lecture seule.'
+                : isShared
+                  ? 'UE partagée — protégée.'
+                  : notProvisioned
+                    ? 'Pas provisionné côté backend.'
+                    : !scenario
+                      ? 'Aucun scénario assigné.'
+                      : !scenarioBackend && !profile
+                        ? 'Scénario non couvert par le profil certifié legacy.'
+                        : liveClosed
+                          ? 'Live fermé (HTTP 423) — approbation requise.'
+                          : null;
+              const editDisabled = !canOperate;
+              const editReason = !canOperate ? 'Rôle viewer : lecture seule.' : null;
+              const deleteReason = !canOperate ? 'Rôle viewer : lecture seule.' : null;
 
               return (
                 <tr
@@ -847,11 +921,12 @@ export function UeManagerPage() {
                       ) : (
                         <span className="font-medium mono">{row.profile.id}</span>
                       )}
-                      {row.backend?.internal_ue_id && (
-                        <span className="text-text-secondary text-ep-xs mono truncate">
-                          {row.backend.internal_ue_id}
-                        </span>
-                      )}
+                      {row.backend?.internal_ue_id &&
+                        row.backend.internal_ue_id !== row.profile.id && (
+                          <span className="text-text-secondary text-ep-xs mono truncate">
+                            {row.backend.internal_ue_id}
+                          </span>
+                        )}
                       {notProvisioned && !profileBackend && (
                         <span className="text-ep-xs text-text-secondary">
                           Not provisioned on backend
@@ -927,7 +1002,11 @@ export function UeManagerPage() {
                           </option>
                         ))}
                       </select>
-                      {scenario && !profile && (
+                      {/* 0.10.0 — "Backend support required" is only honest for the legacy
+                          certified-profile runner (bounded-controller-ue-udp-v1). When
+                          scenarioBackend is on, /scenario-runs covers traffic_ul / traffic_dl /
+                          transfer_verify / detach, so we must not block the row for them. */}
+                      {!scenarioBackend && scenario && !profile && (
                         <span className="text-ep-xs text-warning flex items-center gap-1">
                           <AlertTriangle width={10} height={10} />
                           Backend support required.
@@ -936,111 +1015,83 @@ export function UeManagerPage() {
                     </div>
                   </td>
                   <td>
-                    <div className="flex items-center gap-1 flex-nowrap">
+                    <div className="flex items-center justify-end gap-1 flex-nowrap">
+                      {/* 0.10.0 — Start/Stop are state-driven: whichever action
+                          applies to the UE's current runtime is shown; the other is
+                          collapsed. Keeps the row within the 10% column at 1440/1920. */}
+                      {showStop ? (
+                        <button
+                          type="button"
+                          className="ep-button ep-button-sm ep-button-danger"
+                          onClick={() => setConfirmStop(row)}
+                          disabled={stopDisabled}
+                          title={stopReason ?? 'Arrêter le job actif de cette UE.'}
+                          data-testid={`ue-stop-${row.profile.id}`}
+                        >
+                          <StopCircle width={13} height={13} aria-hidden="true" />
+                          <span className="ml-1">Stop</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="ep-button ep-button-sm"
+                          onClick={() => void startBackendUe(row)}
+                          disabled={startDisabled}
+                          title={startReason ?? 'Démarrer cette UE sur le backend.'}
+                          data-testid={`ue-start-${row.profile.id}`}
+                        >
+                          Start
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="ep-button ep-button-sm"
-                        aria-label={`Edit ${row.profile.id}`}
-                        onClick={() =>
-                          setFormState({ mode: 'edit', initial: toDraft(row.profile) })
-                        }
-                        data-testid={`ue-edit-${row.profile.id}`}
-                      >
-                        <Edit width={13} height={13} />
-                      </button>
-                      <button
-                        type="button"
-                        className="ep-button ep-button-sm"
-                        aria-label={`Clone ${row.profile.id}`}
-                        onClick={() => {
-                          const next = { ...toDraft(row.profile), id: `${row.profile.id}-copy` };
-                          setFormState({ mode: 'clone', initial: next });
-                        }}
-                        data-testid={`ue-clone-${row.profile.id}`}
-                      >
-                        <Copy width={13} height={13} />
-                      </button>
-                      <button
-                        type="button"
-                        className="ep-button ep-button-sm ep-button-danger"
-                        aria-label={`Delete ${row.profile.id}`}
-                        onClick={() => setConfirmDelete([row.profile.id])}
-                        disabled={!canOperate}
-                        data-testid={`ue-delete-${row.profile.id}`}
-                      >
-                        <Trash2 width={13} height={13} />
-                      </button>
-                      <button
-                        type="button"
-                        className="ep-button ep-button-sm"
-                        aria-label={`Start ${row.profile.id}`}
-                        onClick={() => void startBackendUe(row)}
-                        disabled={
-                          !canOperate ||
-                          isShared ||
-                          notProvisioned ||
-                          !row.backend?.actions?.start ||
-                          startUe.isPending
-                        }
-                        title={
-                          notProvisioned
-                            ? 'Not provisioned on backend'
-                            : row.backend?.actions?.reason || undefined
-                        }
-                        data-testid={`ue-start-${row.profile.id}`}
-                      >
-                        Start
-                      </button>
-                      <button
-                        type="button"
-                        className="ep-button ep-button-sm"
-                        aria-label={`Run scenario on ${row.profile.id}`}
                         onClick={() => scenario && setConfirmRun({ row, scenario })}
-                        disabled={
-                          !canOperate ||
-                          isShared ||
-                          notProvisioned ||
-                          !scenario ||
-                          !profile
-                        }
-                        title={
-                          notProvisioned
-                            ? 'Not provisioned on backend'
-                            : !scenario
-                              ? 'No scenario assigned'
-                              : !profile
-                                ? 'Backend support required'
-                                : undefined
-                        }
+                        disabled={runDisabled}
+                        title={runReason ?? 'Dispatcher le scénario assigné sur cette UE.'}
                         data-testid={`ue-run-${row.profile.id}`}
                       >
                         Run
                       </button>
-                      <button
-                        type="button"
-                        className="ep-button ep-button-sm ep-button-danger"
-                        aria-label={`Stop scenario on ${row.profile.id}`}
-                        onClick={() => setConfirmStop(row)}
-                        disabled={
-                          !canOperate ||
-                          isShared ||
-                          notProvisioned ||
-                          !isActiveForUe ||
-                          stopScenario.isPending
-                        }
-                        title={
-                          isShared
-                            ? 'Shared UE — protected'
-                            : notProvisioned
-                              ? 'Not provisioned on backend'
-                              : !isActiveForUe
-                                ? 'No active job owned by this UE'
-                                : undefined
-                        }
-                        data-testid={`ue-stop-${row.profile.id}`}
-                      >
-                        <StopCircle width={13} height={13} />
-                      </button>
+                      <RowActionMenu
+                        ariaLabel={`More actions for ${row.profile.id}`}
+                        testid={`ue-more-${row.profile.id}`}
+                        items={[
+                          {
+                            key: 'edit',
+                            label: 'Edit',
+                            icon: <Edit width={12} height={12} aria-hidden="true" />,
+                            onSelect: () =>
+                              setFormState({ mode: 'edit', initial: toDraft(row.profile) }),
+                            disabled: editDisabled,
+                            disabledReason: editReason ?? undefined,
+                            testid: `ue-edit-${row.profile.id}`,
+                          },
+                          {
+                            key: 'clone',
+                            label: 'Clone',
+                            icon: <Copy width={12} height={12} aria-hidden="true" />,
+                            onSelect: () => {
+                              const next = {
+                                ...toDraft(row.profile),
+                                id: `${row.profile.id}-copy`,
+                              };
+                              setFormState({ mode: 'clone', initial: next });
+                            },
+                            testid: `ue-clone-${row.profile.id}`,
+                          },
+                          {
+                            key: 'delete',
+                            label: 'Delete',
+                            icon: <Trash2 width={12} height={12} aria-hidden="true" />,
+                            tone: 'danger',
+                            onSelect: () => setConfirmDelete([row.profile.id]),
+                            disabled: !canOperate,
+                            disabledReason: deleteReason ?? undefined,
+                            testid: `ue-delete-${row.profile.id}`,
+                          },
+                        ]}
+                      />
                     </div>
                   </td>
                 </tr>
@@ -1153,11 +1204,16 @@ export function UeManagerPage() {
         onGenerateSubscriber={async () => {
           setGenerateError(null);
           try {
+            // 0.10.0 — Default AMBR to 1 Gbit/s (1_000_000 kbps on each
+            // direction) so the Generate path matches the manual Add
+            // Subscriber flow. Operators were having to re-provision when
+            // the server-side default (1 Mbit/s legacy) was too tight.
             const result = await generateSubscriber.mutateAsync({
               count: 1,
               sst: 1,
               sd: '010203',
               dnns: ['internet'],
+              ambr: { uplink: 1_000_000, downlink: 1_000_000 },
             });
             const slot = result.slots[0]?.slot ?? null;
             if (slot) await subscriberSlots.refetch();

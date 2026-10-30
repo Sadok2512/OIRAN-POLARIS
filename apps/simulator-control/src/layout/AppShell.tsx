@@ -6,6 +6,7 @@ import { SidebarNavigation } from './SidebarNavigation';
 import { useTheme } from '@/hooks/useTheme';
 import type { ThemePreference } from '@shared/theme';
 import { useAuth } from '@/data/queries';
+import { SessionExpiredBanner } from '@/ui/SessionExpiredBanner';
 import packageJson from '../../package.json';
 
 const THEME_OPTIONS: { value: ThemePreference; label: string; Icon: typeof Sun }[] = [
@@ -128,6 +129,7 @@ export function AppShell() {
           </div>
         </header>
         <div className="flex-1 min-h-0 overflow-y-auto px-5 py-5">
+          <SessionExpiredBanner />
           <Outlet />
         </div>
       </main>
