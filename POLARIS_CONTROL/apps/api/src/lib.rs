@@ -1912,6 +1912,157 @@ impl DockerUeRuntime {
             .is_some_and(|actual| actual == expected)
     }
 
+    /// 0.18.0 #40 — Same envelope check as [`envelope_matches`] but ignoring
+    /// the `polaris.control.profile-sha256` label (field 7). Used to detect
+    /// the narrow "operator refreshed the UE profile while the container
+    /// was still stopped" case so Start can recreate the container instead
+    /// of refusing with `LIVE_UE_EXISTING_CONTAINER_ENVELOPE_MISMATCH`.
+    ///
+    /// Every other invariant stays strict: a foreign owner, a different
+    /// image, mismatched mounts, a tampered entrypoint — any of those still
+    /// returns `false` and keeps the hard refusal in place.
+    fn envelope_matches_ignoring_profile_sha256(fields: &[String], spec: &LiveLaunchSpec) -> bool {
+        // Replay the full predicate from envelope_matches with the single
+        // field 7 comparison bypassed. We keep this as a parallel function
+        // (rather than threading a flag through envelope_matches) so the
+        // security-critical hot path stays unchanged.
+        let mounts_ok = fields
+            .get(21)
+            .and_then(|value| serde_json::from_str::<Vec<Value>>(value).ok())
+            .is_some_and(|mounts| {
+                let required_binds = [
+                    (
+                        Path::new(ueransim_adapter::LIVE_PROFILE_ROOT)
+                            .join(&spec.profile_basename)
+                            .display()
+                            .to_string(),
+                        "/run/secrets/ue.yaml",
+                    ),
+                    (
+                        ueransim_adapter::LIVE_START_SCRIPT.to_string(),
+                        "/usr/local/bin/start-ueransim-ue",
+                    ),
+                ];
+                let binds_ok = required_binds.iter().all(|(source, destination)| {
+                    mounts.iter().any(|mount| {
+                        mount["Type"] == "bind"
+                            && mount["Source"] == *source
+                            && mount["Destination"] == *destination
+                            && mount["RW"] == false
+                    })
+                }) && mounts
+                    .iter()
+                    .filter(|mount| mount["Type"] == "bind")
+                    .count()
+                    == 2;
+                let expected_tmpfs = ["/tmp", "/etc/iproute2"];
+                let fixture_tmpfs_ok = expected_tmpfs.iter().all(|destination| {
+                    mounts.iter().any(|mount| {
+                        mount["Type"] == "tmpfs"
+                            && mount["Source"] == ""
+                            && mount["Destination"] == *destination
+                            && mount["RW"] == true
+                    })
+                }) && mounts
+                    .iter()
+                    .filter(|mount| mount["Type"] == "tmpfs")
+                    .count()
+                    == 2;
+                binds_ok && (mounts.len() == 2 || (mounts.len() == 4 && fixture_tmpfs_ok))
+            });
+        let tmpfs_ok = fields
+            .get(22)
+            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
+            .is_some_and(|tmpfs| {
+                tmpfs.len() == 2
+                    && tmpfs.get("/tmp").map(String::as_str) == Some("size=64m")
+                    && tmpfs.get("/etc/iproute2").map(String::as_str) == Some("size=1m")
+            });
+        let device_ok = fields
+            .get(23)
+            .and_then(|value| serde_json::from_str::<Vec<Value>>(value).ok())
+            .is_some_and(|devices| {
+                devices.len() == 1
+                    && devices[0]["PathOnHost"] == "/dev/net/tun"
+                    && devices[0]["PathInContainer"] == "/dev/net/tun"
+                    && devices[0]["CgroupPermissions"] == "rwm"
+            });
+        let networks_ok = fields
+            .get(27)
+            .and_then(|value| serde_json::from_str::<BTreeMap<String, Value>>(value).ok())
+            .is_some_and(|networks| {
+                networks.len() == 1 && networks.contains_key(ueransim_adapter::LIVE_DOCKER_NETWORK)
+            });
+        fields.first().is_some_and(|id| id.len() == 64)
+            && fields.get(2) == Some(&spec.image_id)
+            && fields
+                .get(3)
+                .is_some_and(|value| value == "polaris-control")
+            && fields.get(4) == Some(&spec.ue_id)
+            && fields.get(5) == Some(&spec.profile_basename)
+            && fields.get(6) == Some(&spec.owner_id)
+            // field 7 (profile_sha256) deliberately omitted.
+            && fields
+                .get(7)
+                .is_some_and(|value| Self::valid_digest(value))
+            && fields.get(8) == Some(&spec.script_sha256)
+            && fields
+                .get(9)
+                .is_some_and(|value| value == ueransim_adapter::LIVE_DOCKER_NETWORK)
+            && Self::json_array_equals(fields.get(10), &["/usr/local/bin/start-ueransim-ue"])
+            && Self::json_array_equals(fields.get(11), &["/run/secrets/ue.yaml"])
+            && fields.get(12).is_some_and(|value| value == "0:0")
+            && fields
+                .get(13)
+                .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+                .is_some_and(|capabilities| {
+                    capabilities.len() == 1
+                        && capabilities[0]
+                            .strip_prefix("CAP_")
+                            .unwrap_or(&capabilities[0])
+                            == "NET_ADMIN"
+                })
+            && Self::json_array_equals(fields.get(14), &["ALL"])
+            && fields.get(15).is_some_and(|value| value == "true")
+            && Self::json_array_equals(fields.get(16), &["no-new-privileges:true"])
+            && fields.get(17).is_some_and(|value| value == "128")
+            && fields.get(18).is_some_and(|value| value == "750000000")
+            && fields.get(19).is_some_and(|value| value == "536870912")
+            && fields.get(20).is_some_and(|value| value == "no")
+            && fields.get(24).is_some_and(|value| value == "false")
+            && fields.get(25).is_some_and(String::is_empty)
+            && fields
+                .get(26)
+                .is_some_and(|value| matches!(value.as_str(), "" | "private"))
+            && mounts_ok
+            && tmpfs_ok
+            && device_ok
+            && networks_ok
+    }
+
+    /// 0.18.0 #40 — Returns true when every envelope invariant matches but
+    /// the stored `profile_sha256` differs from the spec's. Used to decide
+    /// whether a stopped POLARIS-owned container can be recreated instead
+    /// of surfacing LIVE_UE_EXISTING_CONTAINER_ENVELOPE_MISMATCH.
+    fn only_profile_sha256_differs(fields: &[String], spec: &LiveLaunchSpec) -> bool {
+        Self::envelope_matches_ignoring_profile_sha256(fields, spec)
+            && fields
+                .get(7)
+                .map(String::as_str)
+                != Some(spec.profile_sha256.as_str())
+    }
+
+    /// 0.18.0 #40 — Container is "stopped" (safe to remove and recreate)
+    /// when its state is `exited` or `created`. `running`, `paused` and
+    /// `restarting` are explicitly excluded — a live container means we
+    /// never silently blow away work.
+    fn container_is_stopped(fields: &[String]) -> bool {
+        matches!(
+            fields.get(1).map(String::as_str),
+            Some("exited") | Some("created"),
+        )
+    }
+
     fn envelope_matches(fields: &[String], spec: &LiveLaunchSpec) -> bool {
         let mounts_ok = fields
             .get(21)
@@ -2194,6 +2345,24 @@ impl DockerUeRuntime {
             return Ok(None);
         };
         if !Self::envelope_matches(&fields, spec) {
+            // 0.18.0 #40 — Operators were running into
+            // LIVE_UE_EXISTING_CONTAINER_ENVELOPE_MISMATCH after editing a
+            // UE profile between runs: the only envelope delta was the
+            // profile_sha256 label, but the stopped container still
+            // belonged to POLARIS. We now recreate it in that exact
+            // case: sha256-only diff + stopped + POLARIS-owned →
+            // docker rm, then let launch() build a fresh container with
+            // the new hash. Any other mismatch (running container,
+            // foreign owner, image/mount tampering) keeps the hard
+            // refusal — that's the security-critical path.
+            if Self::only_profile_sha256_differs(&fields, spec)
+                && Self::container_is_stopped(&fields)
+            {
+                let id = fields.first().ok_or("LIVE_UE_INSPECT_INVALID")?;
+                Self::output(&["rm".into(), id.clone()])
+                    .map_err(|_| "LIVE_UE_STALE_CONTAINER_RM_FAILED".to_string())?;
+                return Ok(None);
+            }
             return Err("LIVE_UE_EXISTING_CONTAINER_ENVELOPE_MISMATCH".into());
         }
         let id = fields.first().ok_or("LIVE_UE_INSPECT_INVALID")?;
@@ -5545,10 +5714,53 @@ async fn delete_ue_profile(
         "DELETED",
         Some(&ue_id),
     );
+    // 0.18.0 #40 — Remove the matching POLARIS-owned container if it was
+    // stopped. Keeps the lab host tidy and prevents the next operator
+    // from running into LIVE_UE_EXISTING_CONTAINER_ENVELOPE_MISMATCH when
+    // they re-create the profile and press Start. Any failure here is
+    // non-fatal to the profile delete — the response reports the outcome
+    // in `container_cleanup` so the operator sees whether the host still
+    // carries a leftover container.
+    let cleanup = cleanup_profile_container(&record.profile.ue_id);
     (
         StatusCode::OK,
-        Json(json!({"deleted":record.profile.ue_id,"profile_secret_deleted":true})),
+        Json(json!({
+            "deleted": record.profile.ue_id,
+            "profile_secret_deleted": true,
+            "container_cleanup": cleanup,
+        })),
     )
+}
+
+/// 0.18.0 #40 — Best-effort removal of the UE's POLARIS-owned container
+/// after its profile was deleted. Returns a short status word so the
+/// delete handler can surface it in the JSON response:
+///
+///   * `"none"`      — no container with the derived name exists.
+///   * `"foreign"`   — a container exists but is not labeled polaris-control.
+///   * `"running"`   — container is still live; left alone on purpose.
+///   * `"removed"`   — stopped POLARIS-owned container was `docker rm`-ed.
+///   * `"error:…"`   — removal attempted and failed (docker rm non-zero).
+///
+/// The function never panics and never surfaces secrets.
+fn cleanup_profile_container(ue_id: &str) -> String {
+    let container = format!("polaris-control-{}", ue_id.to_ascii_lowercase());
+    let Ok(fields) = DockerUeRuntime::inspect_fields(&container) else {
+        return "none".into();
+    };
+    if fields.get(3).map(String::as_str) != Some("polaris-control") {
+        return "foreign".into();
+    }
+    if !DockerUeRuntime::container_is_stopped(&fields) {
+        return "running".into();
+    }
+    let Some(id) = fields.first() else {
+        return "error:no-id".into();
+    };
+    match DockerUeRuntime::output(&["rm".into(), id.clone()]) {
+        Ok(_) => "removed".into(),
+        Err(error) => format!("error:{error}"),
+    }
 }
 
 async fn discover_legacy_ues(
@@ -11374,6 +11586,106 @@ mod p0_tests {
             fields[index] = "unexpected".into();
             assert!(!DockerUeRuntime::envelope_matches(&fields, &spec));
             fields[index] = original;
+        }
+    }
+
+    /// 0.18.0 #40 — Fixture builder shared by the sha256-mismatch tests.
+    fn envelope_fields_fixture(spec: &LiveLaunchSpec, status: &str) -> Vec<String> {
+        let mounts = json!([
+            {"Type":"bind","Source":format!("/var/lib/polaris-control/ue-profiles/{}", spec.profile_basename),"Destination":"/run/secrets/ue.yaml","RW":false},
+            {"Type":"bind","Source":"/root/POLARIS/scripts/start-ueransim-ue.sh","Destination":"/usr/local/bin/start-ueransim-ue","RW":false}
+        ]);
+        let devices = json!([{"PathOnHost":"/dev/net/tun","PathInContainer":"/dev/net/tun","CgroupPermissions":"rwm"}]);
+        let tmpfs = json!({"/tmp":"size=64m","/etc/iproute2":"size=1m"});
+        vec![
+            "e".repeat(64),
+            status.into(),
+            spec.image_id.clone(),
+            "polaris-control".into(),
+            spec.ue_id.clone(),
+            spec.profile_basename.clone(),
+            spec.owner_id.clone(),
+            spec.profile_sha256.clone(),
+            spec.script_sha256.clone(),
+            ueransim_adapter::LIVE_DOCKER_NETWORK.into(),
+            r#"["/usr/local/bin/start-ueransim-ue"]"#.into(),
+            r#"["/run/secrets/ue.yaml"]"#.into(),
+            "0:0".into(),
+            r#"["CAP_NET_ADMIN"]"#.into(),
+            r#"["ALL"]"#.into(),
+            "true".into(),
+            r#"["no-new-privileges:true"]"#.into(),
+            "128".into(),
+            "750000000".into(),
+            "536870912".into(),
+            "no".into(),
+            mounts.to_string(),
+            tmpfs.to_string(),
+            devices.to_string(),
+            "false".into(),
+            "".into(),
+            "private".into(),
+            json!({ueransim_adapter::LIVE_DOCKER_NETWORK:{"IPAddress":"10.77.0.32"}}).to_string(),
+        ]
+    }
+
+    fn envelope_test_spec() -> LiveLaunchSpec {
+        LiveLaunchSpec {
+            ue_id: "UE-07".into(),
+            profile_basename: "ue-07.yaml".into(),
+            container_name: "polaris-control-ue-07".into(),
+            owner_id: "a".repeat(64),
+            profile_sha256: "c".repeat(64),
+            script_sha256: "d".repeat(64),
+            image_id: format!("sha256:{}", "b".repeat(64)),
+            docker_args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_profile_sha256_differs_true_when_hash_label_rotates_and_rest_matches() {
+        let spec = envelope_test_spec();
+        let mut fields = envelope_fields_fixture(&spec, "exited");
+        // Flip the stored profile_sha256 label to a different valid digest.
+        fields[7] = "f".repeat(64);
+        assert!(!DockerUeRuntime::envelope_matches(&fields, &spec));
+        assert!(DockerUeRuntime::only_profile_sha256_differs(&fields, &spec));
+        assert!(DockerUeRuntime::container_is_stopped(&fields));
+    }
+
+    #[test]
+    fn only_profile_sha256_differs_rejects_image_or_mount_drift() {
+        let spec = envelope_test_spec();
+        let mut fields = envelope_fields_fixture(&spec, "exited");
+        // sha256 differs (eligible on its own) …
+        fields[7] = "f".repeat(64);
+        // … but also the image id differs. Must stay strict.
+        fields[2] = format!("sha256:{}", "9".repeat(64));
+        assert!(!DockerUeRuntime::only_profile_sha256_differs(&fields, &spec));
+    }
+
+    #[test]
+    fn only_profile_sha256_differs_rejects_a_non_sha256_label() {
+        let spec = envelope_test_spec();
+        let mut fields = envelope_fields_fixture(&spec, "exited");
+        // Non-hex garbage must never satisfy the sha256-only predicate.
+        fields[7] = "not-a-digest".into();
+        assert!(!DockerUeRuntime::only_profile_sha256_differs(&fields, &spec));
+    }
+
+    #[test]
+    fn container_is_stopped_rejects_running_paused_and_restarting_states() {
+        let spec = envelope_test_spec();
+        for status in ["running", "paused", "restarting"] {
+            let fields = envelope_fields_fixture(&spec, status);
+            assert!(
+                !DockerUeRuntime::container_is_stopped(&fields),
+                "status {status} must not be treated as stopped",
+            );
+        }
+        for status in ["exited", "created"] {
+            let fields = envelope_fields_fixture(&spec, status);
+            assert!(DockerUeRuntime::container_is_stopped(&fields));
         }
     }
 
