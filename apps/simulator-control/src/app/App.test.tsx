@@ -76,20 +76,20 @@ describe('Simulator Control routes', () => {
     expect(await screen.findByRole('heading', { name: /console/i, level: 1 })).toBeInTheDocument();
   });
 
-  it('exposes every mandated nav link including Network Nodes + Traffic', () => {
+  it('exposes the 8 mockup primary nav links', () => {
     renderApp();
+    // 0.12.0 — nav mirrors docs/ui-mockups/polaris-control.html: 3 sections
+    // (Network, Simulation, Review), 8 items. Traffic / Settings / Provisioning
+    // stay reachable by URL for backward-compat.
     for (const label of [
       'Console',
-      // Network section (0.4.0) replaces the single "Network Nodes" entry.
       'Topology',
       'Core · Open5GS',
       'gNodeBs',
       'UE Manager',
-      'Traffic Generator',
       'Scenarios',
-      'Execution Monitor',
+      'Execution monitor',
       'History',
-      'Settings',
     ]) {
       expect(screen.getByRole('link', { name: new RegExp(label, 'i') })).toBeInTheDocument();
     }
@@ -111,19 +111,15 @@ describe('Simulator Control routes', () => {
     );
   });
 
-  it('navigates to Traffic Generator', async () => {
-    renderApp();
-    const user = userEvent.setup();
-    await user.click(screen.getByRole('link', { name: /traffic generator/i }));
+  it('keeps the Traffic Generator route reachable by URL', async () => {
+    renderApp('/traffic');
     await waitFor(() =>
       expect(screen.getByRole('heading', { name: /traffic generator/i, level: 1 })).toBeInTheDocument(),
     );
   });
 
   it('shows an Operator login form in Settings when not authenticated', async () => {
-    renderApp();
-    const user = userEvent.setup();
-    await user.click(screen.getByRole('link', { name: /settings/i }));
+    renderApp('/settings');
     await waitFor(() =>
       expect(screen.getByTestId('operator-login-form')).toBeInTheDocument(),
     );
