@@ -7306,7 +7306,14 @@ async fn start_ue(
         }
     }
     if state.execution_mode == "live" {
-        if !ue_control_is_authorized(&state, &identity, &[input.ue_id.clone()]) {
+        // 0.18.1 — Start accepts EITHER the session's
+        // `ue_control_authorized_ids` OR an active grant that covers the
+        // requested UE. Same rule as the Run gate so operators who hold
+        // a bounded Live grant can act without flipping the server flag.
+        let request = &[input.ue_id.clone()];
+        let authorised = ue_control_is_authorized(&state, &identity, request)
+            || active_grant_covers(&state, request);
+        if !authorised {
             return (
                 StatusCode::PRECONDITION_REQUIRED,
                 Json(json!({"error":"UE_CONTROL_VALIDATION_REQUIRED"})),
@@ -7483,7 +7490,12 @@ async fn start_ue_group(
                 Json(json!({"error":error})),
             );
         }
-        if !ue_control_is_authorized(&state, &identity, &input.ue_ids) {
+        // 0.18.1 — same relaxation as single-UE Start: an active grant
+        // covering every UE in the group substitutes for the session's
+        // ue_control_authorized_ids check.
+        let authorised = ue_control_is_authorized(&state, &identity, &input.ue_ids)
+            || active_grant_covers(&state, &input.ue_ids);
+        if !authorised {
             return (
                 StatusCode::PRECONDITION_REQUIRED,
                 Json(json!({"error":"UE_CONTROL_VALIDATION_REQUIRED"})),
@@ -8473,12 +8485,45 @@ fn execute_live_definition_job(
     }
 }
 
+/// 0.18.1 — True when the live_grants store holds at least one active
+/// (non-revoked, non-expired) grant whose `ue_ids` set is a superset of
+/// `requested`. Operators can now unlock Run / Start on a bounded UE set
+/// without flipping the server-wide `definition_live_enabled` flag.
+///
+/// Returns `false` when:
+///   * the mutex is poisoned (fail closed — safer than failing open),
+///   * `requested` is empty (no UEs → nothing to authorise),
+///   * no single grant covers every requested UE (partial coverage is
+///     deliberately NOT accepted — one half of a Run can't start live
+///     while the other half falls back to mock).
+fn active_grant_covers(state: &AppState, requested: &[String]) -> bool {
+    if requested.is_empty() {
+        return false;
+    }
+    let Ok(grants) = state.live_grants.lock() else {
+        return false;
+    };
+    let now = epoch_millis_u128();
+    let needed: BTreeSet<&String> = requested.iter().collect();
+    grants.iter().any(|grant| {
+        grant.is_active(now) && {
+            let covered: BTreeSet<&String> = grant.ue_ids.iter().collect();
+            needed.iter().all(|ue| covered.contains(ue))
+        }
+    })
+}
+
 fn start_live_definition_scenario(
     state: Arc<AppState>,
     definition_id: &str,
     ue_ids: &[String],
 ) -> Result<Value, (StatusCode, Json<Value>)> {
-    if !state.definition_live_enabled || state.execution_mode != "live" {
+    // 0.18.1 — Live Run accepts EITHER the server-wide
+    // `definition_live_enabled` flag OR an active grant that covers every
+    // UE in the request. `execution_mode == "live"` stays mandatory —
+    // the grant is permission, not a runtime provider.
+    let grant_covers = active_grant_covers(&state, ue_ids);
+    if (!state.definition_live_enabled && !grant_covers) || state.execution_mode != "live" {
         return Err((
             StatusCode::LOCKED,
             Json(json!({"error":"SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED"})),
@@ -11813,6 +11858,79 @@ mod p0_tests {
 
         // Unknown UE id: predicate must return false, never panic.
         assert!(!ue_has_live_launch(&state, "UE-ZZZ"));
+    }
+
+    /// 0.18.1 — Fixture helper: push a grant directly into the state,
+    /// bypassing the HTTP handler so individual tests stay focused on
+    /// the `active_grant_covers` predicate.
+    fn push_grant(state: &AppState, ue_ids: &[&str], duration_ms: u128, revoked: bool) {
+        let now = epoch_millis_u128();
+        let grant = LiveGrant {
+            id: format!("test-grant-{}", now.wrapping_add(ue_ids.len() as u128)),
+            ue_ids: ue_ids.iter().map(|&s| s.into()).collect(),
+            duration_minutes: 1,
+            granted_at_epoch_ms: now,
+            expires_at_epoch_ms: now.saturating_add(duration_ms),
+            granted_by: "operator-test".into(),
+            revoked,
+        };
+        state.live_grants.lock().unwrap().push(grant);
+    }
+
+    #[test]
+    fn active_grant_covers_true_only_when_grant_is_active_and_covers_every_ue() {
+        let state = state();
+        // No grant → covers nothing.
+        assert!(!active_grant_covers(&state, &["UE-201".into()]));
+
+        // Active grant for UE-201 → single-UE Run authorised.
+        push_grant(&state, &["UE-201"], 60_000, /* revoked */ false);
+        assert!(active_grant_covers(&state, &["UE-201".into()]));
+
+        // Different UE not in any grant → still refused.
+        assert!(!active_grant_covers(&state, &["UE-999".into()]));
+
+        // Multi-UE: the SAME grant must cover every requested UE. The
+        // existing grant only covers UE-201, so a Run on UE-201 + UE-07
+        // must stay refused even though a second disjoint grant exists.
+        push_grant(&state, &["UE-07"], 60_000, false);
+        assert!(active_grant_covers(&state, &["UE-201".into()]));
+        assert!(active_grant_covers(&state, &["UE-07".into()]));
+        assert!(
+            !active_grant_covers(&state, &["UE-201".into(), "UE-07".into()]),
+            "partial coverage across two grants must stay refused",
+        );
+
+        // A grant that covers BOTH UEs unlocks the multi-UE Run.
+        push_grant(&state, &["UE-201", "UE-07"], 60_000, false);
+        assert!(active_grant_covers(&state, &["UE-201".into(), "UE-07".into()]));
+    }
+
+    #[test]
+    fn active_grant_covers_refuses_expired_and_revoked_grants() {
+        let state = state();
+        // Expired grant (negative duration → expires_at < now).
+        push_grant(&state, &["UE-201"], 0, false);
+        assert!(
+            !active_grant_covers(&state, &["UE-201".into()]),
+            "expired grant must not satisfy the Run gate",
+        );
+
+        // Revoked but still within window: must still be refused.
+        push_grant(&state, &["UE-201"], 60_000, /* revoked */ true);
+        assert!(
+            !active_grant_covers(&state, &["UE-201".into()]),
+            "revoked grant must not satisfy the Run gate",
+        );
+    }
+
+    #[test]
+    fn active_grant_covers_refuses_an_empty_request() {
+        let state = state();
+        push_grant(&state, &["UE-201"], 60_000, false);
+        // No UEs requested → nothing to authorise; must stay false so
+        // the ambient Run gate still refuses by default.
+        assert!(!active_grant_covers(&state, &[]));
     }
 
     #[test]
