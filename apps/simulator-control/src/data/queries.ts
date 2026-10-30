@@ -228,10 +228,18 @@ export function usePlmns() {
 }
 
 /** 0.9.4 — Compact subscriber slot list used by the Add UE dialog's slot
- * picker (#29c). Every item renders identity as PROTECTED. */
+ * picker (#29c). Every item renders identity as PROTECTED (viewer) or the
+ * raw IMSI (operator / administrator, since polaris-api 0.19.7 #48).
+ *
+ * 0.12.0 (#45) — the row carries AMBR and S-NSSAI.sd so the Core ·
+ * Subscribers tab can paint an orange warning when either is "weak"
+ * (AMBR < 10 Mbit/s or no SD / default-slice SD). */
 export interface SubscriberSlotRow {
   slot: string;
   state: string;
+  identity: string | null;
+  ambr: { uplink: number; downlink: number } | null;
+  sd: string | null;
 }
 
 /** Backend contract: GET /subscribers → directory of provisioned slots.
@@ -259,7 +267,18 @@ export function useSubscriberSlots() {
             : typeof record.provisioning_status === 'string'
               ? record.provisioning_status
               : 'PROVISIONED';
-        return [{ slot, state }];
+        const identity =
+          typeof record.subscriber_identity === 'string'
+            ? record.subscriber_identity
+            : null;
+        const ambrRaw = record.ambr as { uplink?: number; downlink?: number } | undefined;
+        const ambr =
+          ambrRaw && typeof ambrRaw.uplink === 'number' && typeof ambrRaw.downlink === 'number'
+            ? { uplink: ambrRaw.uplink, downlink: ambrRaw.downlink }
+            : null;
+        const snssaiRaw = record.snssai as { sd?: string | null } | undefined;
+        const sd = snssaiRaw && typeof snssaiRaw.sd === 'string' ? snssaiRaw.sd : null;
+        return [{ slot, state, identity, ambr, sd }];
       });
     },
     staleTime: 15_000,

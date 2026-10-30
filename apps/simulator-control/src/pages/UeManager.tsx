@@ -1519,15 +1519,30 @@ export function etatLabel(backend: UeState | undefined, idle: boolean): string {
   const parts: string[] = [];
   const reg = (backend.registration_state ?? '').toUpperCase();
   const pdu = (backend.pdu_session ?? '').toUpperCase();
+  const rrc = (backend.rrc_state ?? '').toUpperCase();
   if (reg === 'REGISTERED') parts.push('Registered');
   else if (reg === 'DEREGISTERED') parts.push('Deregistered');
   else if (reg && reg !== 'UNKNOWN' && reg !== 'INACTIVE') {
     parts.push(humaniseState(reg));
   }
+  // 0.12.0 (#50) — surface RRC when the backend reports it, so the État
+  // cell reads "Registered · RRC Connected · PDU active" when relevant.
+  if (rrc === 'CONNECTED') parts.push('RRC Connected');
+  else if (rrc && !['UNKNOWN', 'INACTIVE', 'IDLE', 'DECONNECTED'].includes(rrc)) {
+    parts.push(`RRC ${humaniseState(rrc)}`);
+  }
   if (pdu === 'ACTIVE') parts.push('PDU active');
   else if (pdu && pdu !== 'UNKNOWN' && pdu !== 'INACTIVE' && pdu !== 'IDLE') {
     parts.push(humaniseState(pdu));
   }
+  // 0.12.0 (#50) — append traffic protocol / direction when the backend
+  // reports an active traffic step. We don't fabricate rate numbers from
+  // /ues; per-UE Activity page shows the full "↑ x Mbit/s ↓ y Mbit/s"
+  // once the live stream connects.
+  const traffic = (backend.traffic_state ?? '').toUpperCase();
+  if (traffic === 'RUNNING_UL' || traffic === 'UL') parts.push('↑ UL');
+  else if (traffic === 'RUNNING_DL' || traffic === 'DL') parts.push('↓ DL');
+  else if (traffic === 'RUNNING' || traffic === 'RUNNING_UL_DL') parts.push('↑↓ UL+DL');
   return parts.length === 0 ? 'Not running' : parts.join(' · ');
 }
 

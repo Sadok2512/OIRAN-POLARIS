@@ -204,3 +204,65 @@ Rule from README reconciled with Message B §3 ("IMSI pour l'operator"):
 8. **Anti-overlap**: existing test suite re-run at 1280/1440/1920.
 
 — BC3
+
+---
+
+## 12. Delivery log (0.12.0)
+
+Branch: `feat/simulator-0.12.0-mockup-audit` from `b0adf3b`.
+
+- `37a20fa` — audit doc (this file)
+- `f2caace` — shell + primitives (Card, Pill, Locked, Btn, PageHeader, Stat;
+  AppShell rework; SidebarNavigation collapsed to 3 sections / 8 items;
+  tokens extended; `.live-dot` keyframe)
+- `96b8ef9` — Network section rebuilt against mockup (Console, Topology,
+  Core · Open5GS, gNodeBs)
+- `08e4493` — Simulation + Review pages switch to mockup PageHeader
+  (UE Manager, Scenarios, Execution monitor, History + ScenarioBuilder,
+  Traffic, Provisioning, Settings, UeDetail, UeActivity)
+
+### Companion API lot
+- `ebd36f3` on `feat/polaris-0.19.7-imsi-expose` (base `28da715`): #48
+  role-aware IMSI exposure on `GET /subscribers` and `GET /subscribers/:slot`
+  (operator / administrator see the raw IMSI, viewer stays `PROTECTED`;
+  K/OPc never leave the backend); #50 full step protocole on the per-UE
+  `/activity` payload (`job_step.current_step` now carries protocol,
+  direction, datagrams, destination, destination_port, rate_per_second,
+  duration_seconds, packet_size when the backend reports them).
+
+### Done inside 0.12.0 front
+- #49 — Grant countdown + "Autoriser le live" dialog preserved from
+  0.11.1; the button sits in the UE Manager header actions slot.
+- #50 — `etatLabel` now folds RRC Connected + UL/DL/UL+DL direction into
+  the État cell. The full "↑ x Mbit/s ↓ y Mbit/s · TCP/UDP" formatting
+  lands in the per-UE Activity page where `/activity.job_step.current_step`
+  carries the protocole (from API 0.19.7).
+- Owner column — already shows `—` when `profile.owner === profile.id`
+  (0.10.2 behaviour kept).
+- IMSI column — role-gated through `formatImsiForRole`; wires to API
+  0.19.7 once both branches are deployed.
+- `SubscriberSlotRow` extended with `identity`, `ambr`, `sd` so the Core
+  tab can light up the #45 orange warning once the data flow swap lands.
+
+### Deferred to a 0.12.1 follow-up
+- #51 — UE detail page bug fix: no reproduction surfaced in this session;
+  routed `/ues/:ueId` still resolves to UeDetailPage with mockup
+  PageHeader. Needs the exact stack trace / scenario from Codex to pin.
+- #45 — Subscribers AMBR < 10 Mbit/s or no-SD orange warn: `SubscriberSlotRow`
+  now carries `ambr` and `sd`, but the Core · Subscribers table currently
+  consumes `useProvisioningSlots` (bound-UE view) rather than
+  `useSubscriberSlots` (AMBR / SD view). Follow-up swaps the two inputs
+  so the warning pill lands under the Identity cell when `operator` is
+  signed in.
+- #44 — Provisioning real HTTP code + Retry: ApiError already propagates
+  on existing mutations; UI needs a visible retry button and a status
+  code line. Trivial follow-up.
+
+### Captures
+Playwright projects at 1280/1440/1920 × light/dark exist in the config
+and the folder `apps/simulator-control/docs/screenshots/0.12.0/` is
+reserved for the side-by-side mockup + implementation pairs. The pairs
+require a live backend (POLARIS API running) and the mockup HTML served
+locally; they are produced by the follow-up CI run rather than inside
+this unit-test session.
+
