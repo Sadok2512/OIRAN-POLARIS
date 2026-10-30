@@ -20,8 +20,8 @@ use cpu_safety::{CpuSafetyEvidence, CpuSafetyMonitor, ScenarioResourceBudget};
 use rand_core::{OsRng, RngCore};
 use safety_guard::{evaluate, measure, Policy};
 use scenario_definitions::{
-    estimate_duration_ms, resolve_steps, ResolvedStep, ScenarioCatalog, ScenarioDefinition,
-    ScenarioDefinitionStore, ScenarioMutation, EXPORT_SCHEMA_VERSION,
+    estimate_duration_ms, resolve_steps, BuiltinMigrationReport, ResolvedStep, ScenarioCatalog,
+    ScenarioDefinition, ScenarioDefinitionStore, ScenarioMutation, EXPORT_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2962,7 +2962,17 @@ impl AppState {
                 .unwrap_or_else(|_| "/var/lib/polaris-control/scenario-definitions.json".into())
                 .into(),
         );
-        let scenario_catalog = scenario_definition_store.load()?;
+        // 0.19.3 — Builtin migration runs during catalog load. The
+        // report lists each replaced builtin version so we can snapshot
+        // the old definition into the audit log BEFORE AppState hands
+        // the new catalog to the request handlers. A second startup
+        // sees an empty report (idempotent).
+        let audit_path_for_startup = std::env::var("POLARIS_AUDIT_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| "/var/lib/polaris-control/audit.jsonl".into());
+        let (scenario_catalog, builtin_migration_report) =
+            scenario_definition_store.load_with_report()?;
+        audit_builtin_migration(&audit_path_for_startup, &builtin_migration_report);
         let subscriber_backend: Arc<dyn SubscriberBackend> =
             Arc::new(MongoSubscriberBackend::from_env()?);
         let served_network = ServedNetworkPolicy::from_env()?;
@@ -6306,6 +6316,51 @@ fn audit(state: &AppState, role: &str, action: &str, outcome: &str, job_id: Opti
         .open(&state.audit_path)
     {
         let entry = json!({"timestamp_epoch_s":epoch_seconds(),"role":role,"action":action,"outcome":outcome,"job_id":job_id});
+        let _ = writeln!(file, "{}", entry);
+    }
+}
+
+/// 0.19.3 — Writes a snapshot of every builtin template that the
+/// startup migration replaced (older version → newer builtin). Each
+/// line carries the OLD definition verbatim so a reader can compare
+/// the pre-migration catalog against the current builtin on disk. The
+/// `added_ids` list is also journaled so a reader can see which
+/// builtins the lab was missing until this restart.
+///
+/// This function is deliberately independent from the `audit()` sink
+/// above because the AppState doesn't exist yet at the time load +
+/// migration happen: we take the audit path from the environment.
+fn audit_builtin_migration(audit_path: &Path, report: &BuiltinMigrationReport) {
+    if !report.changed() {
+        return;
+    }
+    if let Some(parent) = audit_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(audit_path)
+    else {
+        return;
+    };
+    let timestamp = epoch_seconds();
+    for id in &report.added_ids {
+        let entry = json!({
+            "timestamp_epoch_s": timestamp,
+            "type": "builtin_template_added",
+            "builtin_id": id,
+        });
+        let _ = writeln!(file, "{}", entry);
+    }
+    for old in &report.replaced {
+        let entry = json!({
+            "timestamp_epoch_s": timestamp,
+            "type": "builtin_template_replaced",
+            "builtin_id": old.id,
+            "previous_version": old.version,
+            "previous_definition": old,
+        });
         let _ = writeln!(file, "{}", entry);
     }
 }
@@ -12714,6 +12769,62 @@ mod p0_tests {
         let snapshot = GrantAuthorisationSnapshot::never();
         assert!(!snapshot.authorised);
         assert!(snapshot.covered_ue_ids.is_empty());
+    }
+
+    /// 0.19.3 — `audit_builtin_migration` writes one entry per added
+    /// id and one per replaced definition. Each entry is JSON and
+    /// carries the previous definition verbatim so a reader can
+    /// restore it if the migration ever needed to be rolled back.
+    #[test]
+    fn audit_builtin_migration_writes_added_and_replaced_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "polaris-audit-migration-{}-{}",
+            epoch_seconds(),
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let audit_path = root.join("audit.jsonl");
+        let old_definition = scenario_definitions::ScenarioDefinition {
+            id: "tpl-small-traffic".into(),
+            name: "Small traffic".into(),
+            version: 1,
+            loop_count: 1,
+            steps: Vec::new(),
+            created_at_epoch_s: 42,
+            updated_at_epoch_s: 42,
+        };
+        let report = BuiltinMigrationReport {
+            added_ids: vec!["tpl-high-runner".into()],
+            replaced: vec![old_definition.clone()],
+        };
+        audit_builtin_migration(&audit_path, &report);
+        let log = fs::read_to_string(&audit_path).unwrap();
+        let entries: Vec<Value> = log
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(entries.len(), 2, "two entries: added + replaced");
+        let added = entries
+            .iter()
+            .find(|value| value["type"] == Value::String("builtin_template_added".into()))
+            .expect("added entry present");
+        assert_eq!(added["builtin_id"], Value::String("tpl-high-runner".into()));
+        let replaced = entries
+            .iter()
+            .find(|value| value["type"] == Value::String("builtin_template_replaced".into()))
+            .expect("replaced entry present");
+        assert_eq!(replaced["builtin_id"], Value::String("tpl-small-traffic".into()));
+        assert_eq!(replaced["previous_version"], Value::Number(1.into()));
+        assert_eq!(
+            replaced["previous_definition"]["name"],
+            Value::String("Small traffic".into()),
+            "old definition captured verbatim",
+        );
+        // No-op report must not write anything.
+        let noop_path = root.join("noop.jsonl");
+        audit_builtin_migration(&noop_path, &BuiltinMigrationReport::default());
+        assert!(!noop_path.exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// 0.19.2 — Small traffic template now interleaves a 1 MiB

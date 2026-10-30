@@ -98,7 +98,27 @@ impl ScenarioDefinitionStore {
         Self { path }
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 0.19.3 — `load()` kept for backwards compat: reads the catalog
+    /// file, runs the idempotent builtin migration, persists if any
+    /// change happened, and returns the resulting catalog. The caller
+    /// does NOT see the per-template report. New call sites should
+    /// prefer [`load_with_report`] so the audit log can record each
+    /// replaced builtin version before the new one takes its place.
     pub fn load(&self) -> Result<ScenarioCatalog, String> {
+        self.load_with_report().map(|(catalog, _)| catalog)
+    }
+
+    /// 0.19.3 — Reads the catalog, runs the idempotent builtin
+    /// migration, persists if changed, and returns both the catalog
+    /// and the migration report so the caller can audit each
+    /// replaced builtin before the new one overwrites it.
+    pub fn load_with_report(
+        &self,
+    ) -> Result<(ScenarioCatalog, BuiltinMigrationReport), String> {
         let mut catalog = match fs::read(&self.path) {
             Ok(bytes) => {
                 // 0.15.2 — Same portable-permissions pattern as the UE
@@ -138,11 +158,11 @@ impl ScenarioDefinitionStore {
             }
             Err(_) => return Err("SCENARIO_CATALOG_UNREADABLE".into()),
         };
-        let changed = seed_templates(&mut catalog)?;
-        if changed {
+        let report = seed_templates(&mut catalog)?;
+        if report.changed() {
             self.persist(&catalog)?;
         }
-        Ok(catalog)
+        Ok((catalog, report))
     }
 
     pub fn persist(&self, catalog: &ScenarioCatalog) -> Result<(), String> {
@@ -581,10 +601,12 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
         // on the exact direction about to run; a mismatch stops the
         // scenario with sha256-KO rather than letting iperf3 report
         // "all good" over a broken path.
+        // 0.19.3 — Version bumped to 2 so the startup migration
+        // replaces any pre-existing v1 copy in the catalog.
         ScenarioDefinition {
             id: "tpl-small-traffic".into(),
             name: "Small traffic".into(),
-            version: 1,
+            version: 2,
             loop_count: 1,
             steps: vec![
                 step("ue_start", BTreeMap::new()),
@@ -630,20 +652,83 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
     ]
 }
 
-fn seed_templates(catalog: &mut ScenarioCatalog) -> Result<bool, String> {
-    let mut changed = false;
+/// 0.19.3 — Report returned by [`migrate_builtin_templates`]. Lists the
+/// builtin IDs that were newly seeded, and the full old definitions
+/// that were replaced by a newer builtin version so the caller can
+/// persist them to the audit log before the catalog is overwritten.
+#[derive(Debug, Default)]
+pub struct BuiltinMigrationReport {
+    pub added_ids: Vec<String>,
+    pub replaced: Vec<ScenarioDefinition>,
+}
+
+impl BuiltinMigrationReport {
+    pub fn changed(&self) -> bool {
+        !self.added_ids.is_empty() || !self.replaced.is_empty()
+    }
+}
+
+/// 0.19.3 — Idempotent builtin-template migration. For each builtin:
+///
+///   * If the catalog has NO definition with the same id → push the
+///     new builtin and record the id under `added_ids`.
+///   * If the catalog HAS a definition with the same id AND it is a
+///     builtin (its id starts with the reserved `tpl-` prefix):
+///       - its stored `version` < builtin `version` → replace it in
+///         place, record the OLD definition under `replaced` so the
+///         caller can audit it before the write.
+///       - its stored `version` ≥ builtin `version` → leave alone
+///         (idempotence — a second startup produces no changes).
+///   * If the stored definition has the same id but is NOT a builtin
+///     (operator renamed a scenario to start with `tpl-`? impossible
+///     today because `template_id()` is rejected in `create`), leave
+///     it alone and never audit — operator state is never touched.
+///
+/// Operator-cloned scenarios have non-`tpl-` ids by construction
+/// (`create()` and `clone_definition()` both reject the prefix), so
+/// they are invisible to this pass.
+pub fn migrate_builtin_templates(
+    catalog: &mut ScenarioCatalog,
+) -> Result<BuiltinMigrationReport, String> {
+    let mut report = BuiltinMigrationReport::default();
     for template in builtin_templates() {
-        if !catalog
+        validate_definition(&template)?;
+        let existing = catalog
             .definitions
             .iter()
-            .any(|item| item.id == template.id)
-        {
-            validate_definition(&template)?;
-            catalog.definitions.push(template);
-            changed = true;
+            .position(|item| item.id == template.id);
+        match existing {
+            None => {
+                report.added_ids.push(template.id.clone());
+                catalog.definitions.push(template);
+            }
+            Some(index) => {
+                let stored = &catalog.definitions[index];
+                // Defensive: never touch an entry whose id matches a
+                // builtin but whose provenance is not a builtin. Today
+                // the create / clone paths reject `tpl-` ids, so this
+                // branch is theoretically unreachable — but we skip
+                // just in case the catalog file was hand-edited.
+                if !template_id(&stored.id) {
+                    continue;
+                }
+                if stored.version < template.version {
+                    let old = std::mem::replace(
+                        &mut catalog.definitions[index],
+                        template,
+                    );
+                    report.replaced.push(old);
+                }
+                // Equal or newer → leave alone (idempotence).
+            }
         }
     }
-    Ok(changed)
+    Ok(report)
+}
+
+/// Thin wrapper kept for ergonomics inside the store's `load()`.
+fn seed_templates(catalog: &mut ScenarioCatalog) -> Result<BuiltinMigrationReport, String> {
+    migrate_builtin_templates(catalog)
 }
 
 const fn default_loop_count() -> u32 {
@@ -919,5 +1004,133 @@ mod tests {
             validate_mutation(&invalid).unwrap_err(),
             "TRANSFER_VERIFY_DIRECTION_INVALID"
         );
+    }
+
+    /// 0.19.3 — Startup migration upgrades a stale builtin in place
+    /// (same id, bumped version) and reports the previous definition
+    /// so the caller can snapshot it in the audit log. Operator-cloned
+    /// scenarios (non-`tpl-` ids) stay untouched. We exercise the
+    /// pure migration function directly so the test isn't entangled
+    /// with the catalog's persistence validator.
+    #[test]
+    fn builtin_migration_upgrades_stale_small_traffic_and_leaves_operator_clone_intact() {
+        // Build a hand-crafted catalog that mirrors an older release:
+        // the small-traffic builtin at version 1 (no transfer_verify
+        // preludes) PLUS an operator clone that must stay untouched.
+        let mut catalog = ScenarioCatalog::default();
+        let mut tpl_small_v1 = builtin_templates()
+            .into_iter()
+            .find(|definition| definition.id == "tpl-small-traffic")
+            .unwrap();
+        tpl_small_v1.version = 1;
+        catalog.definitions.push(tpl_small_v1.clone());
+        for other_id in ["tpl-voice-long", "tpl-voice-short", "tpl-high-runner"] {
+            let template = builtin_templates()
+                .into_iter()
+                .find(|definition| definition.id == other_id)
+                .unwrap();
+            catalog.definitions.push(template);
+        }
+        let operator_clone = ScenarioDefinition {
+            id: "ops-smoke-clone".into(),
+            name: "Ops smoke clone".into(),
+            version: 7,
+            loop_count: 1,
+            steps: vec![step("ue_start", BTreeMap::new())],
+            created_at_epoch_s: 100,
+            updated_at_epoch_s: 200,
+        };
+        catalog.definitions.push(operator_clone.clone());
+
+        // First migration → small-traffic replaced from v1 to v2.
+        let report = migrate_builtin_templates(&mut catalog).unwrap();
+        assert!(report.added_ids.is_empty(), "nothing to add: {:?}", report);
+        assert_eq!(
+            report.replaced.len(),
+            1,
+            "exactly one builtin replaced: {:?}",
+            report.replaced,
+        );
+        assert_eq!(report.replaced[0].id, "tpl-small-traffic");
+        assert_eq!(report.replaced[0].version, 1);
+        assert_eq!(report.replaced[0], tpl_small_v1);
+
+        let new_small_traffic = catalog
+            .definitions
+            .iter()
+            .find(|definition| definition.id == "tpl-small-traffic")
+            .expect("small traffic still present");
+        assert_eq!(new_small_traffic.version, 2, "upgraded to v2");
+        // Operator clone preserved byte-for-byte.
+        let preserved = catalog
+            .definitions
+            .iter()
+            .find(|definition| definition.id == "ops-smoke-clone")
+            .expect("operator clone preserved");
+        assert_eq!(preserved, &operator_clone);
+
+        // Second migration → idempotence.
+        let idempotent = migrate_builtin_templates(&mut catalog).unwrap();
+        assert!(!idempotent.changed(), "second startup must be a no-op");
+    }
+
+    /// 0.19.3 — If the catalog ALREADY holds a newer version of a
+    /// builtin (operator-side override, or a future lab-local hotfix),
+    /// the migration must NOT downgrade it.
+    #[test]
+    fn builtin_migration_never_downgrades_a_newer_catalog_entry() {
+        let mut catalog = ScenarioCatalog::default();
+        let mut lab_hotfix = builtin_templates()
+            .into_iter()
+            .find(|definition| definition.id == "tpl-small-traffic")
+            .unwrap();
+        lab_hotfix.version = 9_999;
+        catalog.definitions.push(lab_hotfix.clone());
+        let report = migrate_builtin_templates(&mut catalog).unwrap();
+        // Three other builtins should be added, but tpl-small-traffic
+        // must stay at the lab-local 9_999.
+        assert!(
+            report.added_ids.contains(&"tpl-voice-long".into()),
+            "other builtins still get added",
+        );
+        assert!(
+            !report.added_ids.contains(&"tpl-small-traffic".into()),
+            "lab hotfix must not be re-added",
+        );
+        assert!(
+            report.replaced.is_empty(),
+            "nothing replaced when the stored entry is newer",
+        );
+        let preserved = catalog
+            .definitions
+            .iter()
+            .find(|definition| definition.id == "tpl-small-traffic")
+            .unwrap();
+        assert_eq!(preserved.version, 9_999);
+    }
+
+    /// 0.19.3 — Running `load_with_report` twice back-to-back against a
+    /// real filesystem catalog must be idempotent: first call seeds the
+    /// four builtins; second call reads them back unchanged.
+    #[test]
+    fn builtin_migration_double_startup_is_idempotent_through_the_store() {
+        let root = std::env::temp_dir().join(format!(
+            "polaris-migration-double-{}-{}",
+            epoch_seconds(),
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let store = ScenarioDefinitionStore::new(root.join("catalog.json"));
+        let (first_catalog, first_report) = store.load_with_report().unwrap();
+        assert_eq!(first_report.added_ids.len(), 4);
+        assert!(first_report.replaced.is_empty());
+        let (second_catalog, second_report) = store.load_with_report().unwrap();
+        assert!(
+            !second_report.changed(),
+            "second startup must be a no-op: {:?}",
+            second_report,
+        );
+        assert_eq!(first_catalog, second_catalog);
+        fs::remove_dir_all(&root).unwrap();
     }
 }
