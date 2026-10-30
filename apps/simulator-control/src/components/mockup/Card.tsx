@@ -1,9 +1,17 @@
 import clsx from 'clsx';
-import type { ReactNode } from 'react';
+import type { HTMLAttributes, ReactNode } from 'react';
 
-export function Card({ children, className }: { children: ReactNode; className?: string }) {
+type CardProps = Omit<HTMLAttributes<HTMLElement>, 'className'> & {
+  children: ReactNode;
+  className?: string;
+};
+
+export function Card({ children, className, ...rest }: CardProps) {
   return (
-    <section className={clsx('rounded-xl border border-line bg-surface shadow-e1', className)}>
+    <section
+      className={clsx('rounded-xl border border-line bg-surface shadow-e1', className)}
+      {...rest}
+    >
       {children}
     </section>
   );
