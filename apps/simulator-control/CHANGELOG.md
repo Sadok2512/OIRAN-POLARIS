@@ -3,6 +3,60 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## Backend compatibility matrix
+
+| simulator-control | polaris-api  | Notes |
+| ---               | ---          | --- |
+| ≥ 0.12.0          | **≥ 0.19.7** | Hard dependency. The operator inventory (`/subscribers`, `/subscribers/:slot`, `/ues → row IMSI column`) relies on polaris-api 0.19.7's role-aware `subscriber_identity` field (`SubscriberIdentityVisibility`). Running the 0.12.x front against polaris-api ≤ 0.19.6 yields a permanent `PROTECTED` IMSI column even for operators and silently disables the #45 AMBR / SD warn pill (the `ambr` and `sd` fields are only populated starting polaris-api 0.19.7). **Deploy both branches together.** |
+| ≥ 0.12.0          | ≥ 0.19.8     | Recommended. 0.19.8 downgrades every iperf3 _NOT_MEASURED / _ZERO_BYTES verdict to a measurement warning (never fails a job). The front renders those codes as yellow chips in Execution monitor + per-UE Activity. |
+
+## 0.12.1 — 2026-10-30 (minor)
+
+- UE Manager — final mockup pass: 7-column structure (UE · Serving gNB ·
+  Subscriber · Registration · PDU · IP · Scenario · Actions). IMSI + Owner
+  fold into the UE sub-caption (role-gated via `formatImsiForRole`).
+- #51 — UeDetail no longer bails on "Backend pending". When
+  `polarisProvisioning` is OFF or the detail endpoint errors, the page
+  renders a honest Identity + Registration fallback composed from
+  `/ues`, with a link to the Activity timeline. Full 7-block layout
+  still unfurls when the detail payload is available.
+- #45 — Core · Subscribers paints an orange warn pill (`AMBR < 10 Mbit/s
+  · no S-NSSAI SD`) under the Identity cell when the backend reports an
+  AMBR below 10 Mbit/s (either direction) or no slice differentiator.
+  Requires **polaris-api ≥ 0.19.7** so `/subscribers[].ambr` and `.sd`
+  are populated.
+- #44 — Provisioning error branch surfaces the real HTTP status
+  (`HTTP <status> · <code>`) plus a visible Retry button; "Retrying…"
+  disables the button while `isFetching`.
+- Side-by-side captures — `docs/screenshots/0.12.1/ue-manager/`
+  (mockup / impl / composite) at 1440 light + dark, reproduced via
+  `e2e/captures-0.12.1.spec.ts` (mocked backend).
+
+## 0.12.0 — 2026-10-30 (minor)
+
+- Shell + primitives rebuilt against `docs/ui-mockups/polaris-control.html`
+  (origin/docs/ui-mockups @ 48dea75): mockup `Card` / `Pill` /
+  `Locked` / `Btn` / `PageHeader` / `Stat`, `.live-dot` keyframe, tokens
+  extended with soft tones + violet + track; AppShell logo (antenna +
+  "POLARIS / 5G lab control"), 3 sections / 8 items sidebar, topbar
+  with Core health + PLMN · TAC + Live UEs + Light/Dark toggle.
+- Network pages wired to real API data (`/lab`, `/lab-observed`,
+  `/nodes`, `/ues`, `/capabilities`, `/scenarios/history`,
+  `/scenarios/status`): Console (4 tiles + Readiness + Recent activity),
+  Topology, Core · Open5GS, gNodeBs.
+- Simulation + Review pages switch to the mockup PageHeader; History
+  rebuilt to the mockup 5-column shape.
+- #49 — Grant countdown + "Autoriser le live" dialog preserved from
+  0.11.1 inside the new UE Manager header.
+- #50 (front) — `etatLabel` folds RRC Connected + UL / DL / UL+DL
+  direction. The full "↑ x Mbit/s ↓ y Mbit/s · TCP/UDP" per-step
+  rendering uses `/activity.job_step.current_step.protocol` served by
+  **polaris-api ≥ 0.19.7**.
+- #48 (front wiring) — `SubscriberSlotRow` extended with `identity`,
+  `ambr`, `sd`; operator sees the raw IMSI via `formatImsiForRole`
+  once polaris-api 0.19.7 is deployed, viewer stays on the solid
+  mask.
+
 ## 0.9.4 — 2026-10-29 (patch)
 
 - Defect #29 — Add UE dialog recomposed to the audited surface. Lab defaults
