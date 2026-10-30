@@ -669,25 +669,37 @@ fn attach_preflight_to_failure(
     body.to_string()
 }
 
+/// 0.19.8 — Classify how the iperf3 counters landed.
+///
+/// Rule: iperf3 is a **measurement** step, never blocking. The job only
+/// fails when the connection cannot be established at all (process spawn,
+/// wait, or stdout JSON parse). Anything we observe after that — zero
+/// bytes on one side, short delivery, missing counter — surfaces as a
+/// `warning` on `IperfMeasurement`. The caller tags the payload so the
+/// frontend can show "measurement incomplete" without the operator seeing
+/// a red failure. Pre-0.19.8 returned `Err(IPERF3_{dir}_ZERO_BYTES)` on
+/// zero bytes; that broke jobs when iperf3 ran successfully but the
+/// counter path was unavailable (for example `server_output_json`
+/// missing AND client receive counter missing on the same run).
 fn classify_iperf_delivery(
     direction: &str,
     sender: u64,
     receiver: u64,
-    preflight: &UeRoutePreflight,
-) -> Result<Option<String>, String> {
-    if sender == 0 || receiver == 0 {
-        return Err(json!({
-            "error":format!("IPERF3_{direction}_ZERO_BYTES"),
-            "sender_bytes":sender,
-            "receiver_bytes":receiver,
-            "preflight":preflight,
-        })
-        .to_string());
+    _preflight: &UeRoutePreflight,
+) -> Option<String> {
+    if sender == 0 && receiver == 0 {
+        return Some(format!("IPERF3_{direction}_ZERO_BYTES"));
+    }
+    if sender == 0 {
+        return Some(format!("IPERF3_{direction}_SENDER_ZERO_BYTES"));
+    }
+    if receiver == 0 {
+        return Some(format!("IPERF3_{direction}_RECEIVER_ZERO_BYTES"));
     }
     if receiver < sender {
-        return Ok(Some("IPERF3_RECEIVER_SHORT".into()));
+        return Some("IPERF3_RECEIVER_SHORT".into());
     }
-    Ok(None)
+    None
 }
 
 /// 0.19.6 — Combine the `server_output_json` fallback flag and the
@@ -696,19 +708,27 @@ fn classify_iperf_delivery(
 /// server echo is signalled but does not fail the step. A delivery
 /// drift (receiver < sender) is still reported alongside it when
 /// both conditions hold.
+///
+/// 0.19.8 — Extended to carry the per-side NOT_MEASURED tags (sender or
+/// receiver counter missing in the JSON) and the ZERO_BYTES diagnostic.
+/// Every warning is semicolon-separated so a reader can split on `;`
+/// to list every reason the measurement is incomplete.
+fn compose_iperf_warning_v2(codes: &[&str]) -> Option<String> {
+    let mut filtered: Vec<&str> = codes.iter().copied().filter(|c| !c.is_empty()).collect();
+    if filtered.is_empty() {
+        return None;
+    }
+    filtered.dedup();
+    Some(filtered.join(";"))
+}
+
 fn compose_iperf_warning(server_missing: bool, delivery: Option<String>) -> Option<String> {
-    let mut warnings: Vec<String> = Vec::new();
-    if server_missing {
-        warnings.push("IPERF3_SERVER_OUTPUT_MISSING".into());
-    }
-    if let Some(code) = delivery {
-        warnings.push(code);
-    }
-    if warnings.is_empty() {
-        None
-    } else {
-        Some(warnings.join(";"))
-    }
+    let delivery_str = delivery.unwrap_or_default();
+    let codes: Vec<&str> = vec![
+        if server_missing { "IPERF3_SERVER_OUTPUT_MISSING" } else { "" },
+        delivery_str.as_str(),
+    ];
+    compose_iperf_warning_v2(&codes)
 }
 
 /// 0.17.1 — Run `ip route get <destination>` inside the UE network namespace
@@ -1466,43 +1486,50 @@ trait UeRuntime: Send + Sync {
         let client_report: Value = serde_json::from_slice(&client_output.stdout).map_err(|_| {
             attach_preflight_to_failure("IPERF3_UL_FAILED", &client_output, command, &preflight)
         })?;
-        // 0.19.6 — Server output is a measurement nice-to-have, not a
-        // gate. When `server_output_json` is missing we fall back to
-        // the CLIENT's own `end.sum_received.bytes` (iperf3 reports
-        // the receiver's acknowledged bytes from its own view) and
-        // tag the measurement with IPERF3_SERVER_OUTPUT_MISSING. The
-        // job only fails when the client reports zero sent bytes
-        // (connection impossible) or zero received (nothing landed).
+        // 0.19.8 — iperf3 is a measurement step, never blocking. All the
+        // _NOT_MEASURED and _ZERO_BYTES codes surface as warnings on
+        // `IperfMeasurement.warning`; only process-spawn / wait / JSON
+        // parse errors (which mean the connection could not even be
+        // attempted) still fail the step. The caller's step payload still
+        // carries the measurement codes, and the operator sees a yellow
+        // "measurement incomplete" chip instead of a red failure.
         let receiver_report = client_report.get("server_output_json").cloned();
         let server_missing = receiver_report.is_none();
-        let client_sent_bytes = client_report
+        let client_sent = client_report
             .pointer("/end/sum_sent/bytes")
-            .and_then(Value::as_u64)
-            .ok_or("IPERF3_UL_CLIENT_BYTES_NOT_MEASURED")?;
-        let server_received_bytes = match &receiver_report {
+            .and_then(Value::as_u64);
+        let server_received = match &receiver_report {
             Some(report) => report
                 .pointer("/end/sum_received/bytes")
-                .and_then(Value::as_u64)
-                .ok_or("IPERF3_UL_RECEIVER_BYTES_NOT_MEASURED")?,
+                .and_then(Value::as_u64),
             None => client_report
                 .pointer("/end/sum_received/bytes")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    attach_preflight_to_failure(
-                        "IPERF3_UL_SERVER_OUTPUT_MISSING",
-                        &receiver_output,
-                        receiver_command,
-                        &preflight,
-                    )
-                })?,
+                .and_then(Value::as_u64),
         };
+        let client_sent_bytes = client_sent.unwrap_or(0);
+        let server_received_bytes = server_received.unwrap_or(0);
+        let _ = receiver_output;
+        let _ = receiver_command;
         let retransmissions = client_report
             .pointer("/end/sum_sent/retransmits")
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let delivery_warning =
-            classify_iperf_delivery("UL", client_sent_bytes, server_received_bytes, &preflight)?;
-        let warning = compose_iperf_warning(server_missing, delivery_warning);
+            classify_iperf_delivery("UL", client_sent_bytes, server_received_bytes, &preflight);
+        let warning = compose_iperf_warning_v2(&[
+            if server_missing { "IPERF3_SERVER_OUTPUT_MISSING" } else { "" },
+            if client_sent.is_none() {
+                "IPERF3_UL_CLIENT_BYTES_NOT_MEASURED"
+            } else {
+                ""
+            },
+            if server_received.is_none() {
+                "IPERF3_UL_RECEIVER_BYTES_NOT_MEASURED"
+            } else {
+                ""
+            },
+            delivery_warning.as_deref().unwrap_or(""),
+        ]);
         Ok(IperfMeasurement {
             client_sent_bytes,
             server_received_bytes,
@@ -1612,32 +1639,44 @@ trait UeRuntime: Send + Sync {
                 &preflight,
             )
         })?;
-        // 0.19.6 — Same fallback as UL: a missing `server_output_json`
-        // is a measurement warning, not a job failure. The DN
-        // sender's own `end.sum_received.bytes` is the client-side
-        // view of what the receiver acknowledged.
+        // 0.19.8 — Same rule as UL (see execute_iperf_ul): absence of
+        // measurement surfaces as a warning on `IperfMeasurement.warning`;
+        // the step only fails when the connection cannot be attempted
+        // (process spawn, wait, or stdout parsing).
         let receiver_report = sender_report.get("server_output_json").cloned();
         let server_missing = receiver_report.is_none();
-        let sender_bytes = sender_report
+        let sender_opt = sender_report
             .pointer("/end/sum_sent/bytes")
-            .and_then(Value::as_u64)
-            .ok_or("IPERF3_DL_SENDER_BYTES_NOT_MEASURED")?;
-        let ue_bytes = match &receiver_report {
+            .and_then(Value::as_u64);
+        let ue_opt = match &receiver_report {
             Some(report) => report
                 .pointer("/end/sum_received/bytes")
-                .and_then(Value::as_u64)
-                .ok_or("IPERF3_DL_UE_BYTES_NOT_MEASURED")?,
+                .and_then(Value::as_u64),
             None => sender_report
                 .pointer("/end/sum_received/bytes")
-                .and_then(Value::as_u64)
-                .ok_or("IPERF3_DL_SERVER_OUTPUT_MISSING")?,
+                .and_then(Value::as_u64),
         };
+        let sender_bytes = sender_opt.unwrap_or(0);
+        let ue_bytes = ue_opt.unwrap_or(0);
         let retransmissions = sender_report
             .pointer("/end/sum_sent/retransmits")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let delivery_warning = classify_iperf_delivery("DL", sender_bytes, ue_bytes, &preflight)?;
-        let warning = compose_iperf_warning(server_missing, delivery_warning);
+        let delivery_warning = classify_iperf_delivery("DL", sender_bytes, ue_bytes, &preflight);
+        let warning = compose_iperf_warning_v2(&[
+            if server_missing { "IPERF3_SERVER_OUTPUT_MISSING" } else { "" },
+            if sender_opt.is_none() {
+                "IPERF3_DL_SENDER_BYTES_NOT_MEASURED"
+            } else {
+                ""
+            },
+            if ue_opt.is_none() {
+                "IPERF3_DL_UE_BYTES_NOT_MEASURED"
+            } else {
+                ""
+            },
+            delivery_warning.as_deref().unwrap_or(""),
+        ]);
         Ok(IperfMeasurement {
             client_sent_bytes: sender_bytes,
             server_received_bytes: ue_bytes,
@@ -15698,32 +15737,48 @@ mod p0_tests {
         );
     }
 
+    /// 0.19.8 — Every outcome of `classify_iperf_delivery` is a warning
+    /// (or None). Pre-0.19.8 the zero-bytes case was a fatal error, which
+    /// made iperf3 measurement blocking when the counter path was
+    /// unavailable; the new contract is: iperf3 is a measurement, never
+    /// a gate. Connection impossibility is caught earlier (process
+    /// spawn, wait, JSON parse); classify never gates.
     #[test]
-    fn iperf_short_receiver_is_a_warning_but_zero_bytes_remain_blocking() {
+    fn classify_iperf_delivery_is_always_warning_never_blocking() {
         let preflight = evaluate_ue_route_preflight(
             "10.77.24.30 from 10.46.0.5 dev uesimtun0 table 100",
             "10.77.24.30",
             "uesimtun0",
             "UL_ROUTE_NOT_VIA_UE_TUN",
         );
+        // Equal counts → no drift, no warning.
+        assert_eq!(classify_iperf_delivery("UL", 1_048_576, 1_048_576, &preflight), None);
+        // Receiver short → delivery drift warning.
         assert_eq!(
-            classify_iperf_delivery("UL", 1_048_576, 1_048_576, &preflight).unwrap(),
-            None
-        );
-        assert_eq!(
-            classify_iperf_delivery("UL", 1_048_576, 786_432, &preflight).unwrap(),
+            classify_iperf_delivery("UL", 1_048_576, 786_432, &preflight),
             Some("IPERF3_RECEIVER_SHORT".into())
         );
-        let error = classify_iperf_delivery("UL", 1_048_576, 0, &preflight).unwrap_err();
-        let evidence: Value = serde_json::from_str(&error).unwrap();
-        assert_eq!(evidence["error"], "IPERF3_UL_ZERO_BYTES");
-        assert_eq!(evidence["receiver_bytes"], 0);
-        assert_eq!(evidence["preflight"]["actual_dev"], "uesimtun0");
-        assert_eq!(IPERF_TCP_WINDOW, "64K");
+        // Both sides zero → generic zero-bytes warning.
         assert_eq!(
-            classify_iperf_delivery("UL", 1_310_720, 1_310_720, &preflight).unwrap(),
-            None
+            classify_iperf_delivery("UL", 0, 0, &preflight),
+            Some("IPERF3_UL_ZERO_BYTES".into())
         );
+        // Receiver zero only.
+        assert_eq!(
+            classify_iperf_delivery("UL", 1_048_576, 0, &preflight),
+            Some("IPERF3_UL_RECEIVER_ZERO_BYTES".into())
+        );
+        // Sender zero only.
+        assert_eq!(
+            classify_iperf_delivery("UL", 0, 1_048_576, &preflight),
+            Some("IPERF3_UL_SENDER_ZERO_BYTES".into())
+        );
+        // DL direction uses the same vocabulary with the DL prefix.
+        assert_eq!(
+            classify_iperf_delivery("DL", 1_048_576, 0, &preflight),
+            Some("IPERF3_DL_RECEIVER_ZERO_BYTES".into())
+        );
+        assert_eq!(IPERF_TCP_WINDOW, "64K");
     }
 
     /// 0.19.6 — iperf3 is measurement, not a gate. Missing
@@ -15750,6 +15805,90 @@ mod p0_tests {
         assert_eq!(
             compose_iperf_warning(true, Some("IPERF3_RECEIVER_SHORT".into())).as_deref(),
             Some("IPERF3_SERVER_OUTPUT_MISSING;IPERF3_RECEIVER_SHORT"),
+        );
+    }
+
+    /// 0.19.8 — Every "measurement incomplete" variant surfaces on the
+    /// `warning` field of IperfMeasurement, never fails the step. The
+    /// test covers the UL and DL counter-missing codes, the zero-bytes
+    /// classify warnings and their combinations. The job only fails
+    /// when the connection cannot be attempted at all — those paths
+    /// (`IPERF3_PROCESS_SPAWN_FAILED`, `IPERF3_UL_RECEIVER_WAIT_FAILED`,
+    /// `IPERF3_UL_FAILED`, …) are tested separately in the step-level
+    /// integration tests.
+    #[test]
+    fn compose_iperf_warning_v2_surfaces_each_missing_measurement_variant() {
+        // Nothing missing + no delivery drift → None.
+        assert_eq!(compose_iperf_warning_v2(&["", "", "", ""]), None);
+        // Only the client-side UL counter is missing.
+        assert_eq!(
+            compose_iperf_warning_v2(&[
+                "",
+                "IPERF3_UL_CLIENT_BYTES_NOT_MEASURED",
+                "",
+                "",
+            ])
+            .as_deref(),
+            Some("IPERF3_UL_CLIENT_BYTES_NOT_MEASURED"),
+        );
+        // Only the receiver-side UL counter is missing.
+        assert_eq!(
+            compose_iperf_warning_v2(&[
+                "",
+                "",
+                "IPERF3_UL_RECEIVER_BYTES_NOT_MEASURED",
+                "",
+            ])
+            .as_deref(),
+            Some("IPERF3_UL_RECEIVER_BYTES_NOT_MEASURED"),
+        );
+        // Only the server echo is missing (receiver fallback used).
+        assert_eq!(
+            compose_iperf_warning_v2(&[
+                "IPERF3_SERVER_OUTPUT_MISSING",
+                "",
+                "",
+                "",
+            ])
+            .as_deref(),
+            Some("IPERF3_SERVER_OUTPUT_MISSING"),
+        );
+        // Chained: server echo + receiver counter + zero-byte classify.
+        assert_eq!(
+            compose_iperf_warning_v2(&[
+                "IPERF3_SERVER_OUTPUT_MISSING",
+                "",
+                "IPERF3_UL_RECEIVER_BYTES_NOT_MEASURED",
+                "IPERF3_UL_RECEIVER_ZERO_BYTES",
+            ])
+            .as_deref(),
+            Some(
+                "IPERF3_SERVER_OUTPUT_MISSING;IPERF3_UL_RECEIVER_BYTES_NOT_MEASURED;IPERF3_UL_RECEIVER_ZERO_BYTES",
+            ),
+        );
+        // DL-side missing counter.
+        assert_eq!(
+            compose_iperf_warning_v2(&[
+                "",
+                "IPERF3_DL_SENDER_BYTES_NOT_MEASURED",
+                "",
+                "",
+            ])
+            .as_deref(),
+            Some("IPERF3_DL_SENDER_BYTES_NOT_MEASURED"),
+        );
+        // Deduplicated: when the same code is listed twice (e.g. the
+        // delivery classify repeats a zero-bytes verdict), only one copy
+        // is kept so a reader doesn't see duplicates on the chip.
+        assert_eq!(
+            compose_iperf_warning_v2(&[
+                "IPERF3_UL_RECEIVER_ZERO_BYTES",
+                "",
+                "",
+                "IPERF3_UL_RECEIVER_ZERO_BYTES",
+            ])
+            .as_deref(),
+            Some("IPERF3_UL_RECEIVER_ZERO_BYTES"),
         );
     }
 
