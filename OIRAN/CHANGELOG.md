@@ -12,9 +12,10 @@
   during continuous deduplication. This closes the production OOM found when
   a finalized SBI segment expanded to many normalized events under a 256 MiB
   service limit.
-- Bound SBI response-only streams lacking decoded request identity to one
-  explicit HPACK-context evidence event per TCP connection, restoring the
-  pre-regression event-count contract without hiding the capture limitation.
+- Preserve all fully decoded SBI transactions while keeping response-only
+  PARTIAL streams lacking decoded request identity as connection-level HPACK
+  evidence rather than synthetic transactions, restoring the pre-regression
+  event-count contract without hiding the capture limitation.
 - Compact session-engine source metadata to the schema, procedure and SBI
   fields actually consumed after normalization instead of retaining a second
   copy of every decoded IE tree during call-flow reconstruction.

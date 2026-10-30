@@ -320,37 +320,39 @@ fn transactions(
     // Emission policy — one event per stream, at most once, same as 0.3.1 for
     // well-formed connections:
     //   * Skip streams that never carried any decoded content on EITHER side.
-    //   * Emit at most one response-only stream per TCP connection as explicit
-    //     HPACK-context evidence. A response-only stream has no trustworthy SBI
-    //     operation or resource identity; promoting every such stream inflated
-    //     mid-connection captures by hundreds of thousands of PARTIAL events.
+    //   * Keep response-only streams only when they are fully decoded. A
+    //     response-only PARTIAL stream has no trustworthy SBI operation or
+    //     resource identity; its HPACK limitation remains in the connection
+    //     report rather than becoming a synthetic transaction.
     //   * `hpack_unavailable` on a part is a decoration (surfaces an explicit
     //     error reason on the normalised event) but does NOT by itself promote
     //     a content-less stream to an event.
-    let mut response_only_emitted = false;
     for (stream_id, state) in streams {
         if state.request.headers.is_empty() && state.response.headers.is_empty() {
             incomplete += 1;
             continue;
         }
-        if state.request.headers.is_empty() {
-            if response_only_emitted {
-                incomplete += 1;
-                continue;
-            }
-            response_only_emitted = true;
-        }
+        let response_only = state.request.headers.is_empty();
         if state.response.headers.is_empty() {
             incomplete += 1;
         }
-        events.push(build_event(
+        let event = build_event(
             connection,
             stream_id,
             state,
             capture_id,
             interface,
             endpoint_names,
-        ));
+        );
+        // Preserve every fully decoded transaction (the 0.3.1 parity
+        // contract), including one whose request identity was recovered by
+        // tolerant HPACK parsing. Response-only PARTIAL evidence remains at
+        // connection level and is not promoted to a transaction.
+        if response_only && event.decoding_status != DecodeStatus::Decoded {
+            incomplete += 1;
+            continue;
+        }
+        events.push(event);
     }
     (events, stream_count, incomplete, errors)
 }
@@ -1182,8 +1184,9 @@ mod tests {
         // Simulate a capture that starts in the middle of an HTTP/2 connection:
         // the client-side HEADERS references dynamic-table entries whose
         // definitions were never observed. The hpack crate rejects the block;
-        // the fallback must mark the event HPACK_CONTEXT_UNAVAILABLE and still
-        // emit it so the response on the same stream-id stays correlatable.
+        // the fallback must record HPACK_CONTEXT_UNAVAILABLE at connection
+        // level. Without a decoded request identity it must not fabricate a
+        // transaction from the response alone.
         let client = TcpEndpoint {
             address: "10.0.0.1".into(),
             port: 40001,
@@ -1210,22 +1213,7 @@ mod tests {
             ],
         };
         let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
-        assert_eq!(events.len(), 1, "expected a single correlated event");
-        let event = &events[0];
-        assert_eq!(event.decoding_status, DecodeStatus::Partial);
-        assert!(
-            event
-                .errors
-                .iter()
-                .any(|e| e.starts_with(HPACK_CONTEXT_UNAVAILABLE)),
-            "errors: {:?}",
-            event.errors
-        );
-        assert!(
-            event.sbi.as_ref().map(|s| s.http2_stream_id) == Some(7),
-            "stream-id correlation lost: {:?}",
-            event.sbi
-        );
+        assert!(events.is_empty(), "response-only partial must not be promoted");
         assert!(
             report
                 .errors
@@ -1234,9 +1222,6 @@ mod tests {
             "report errors: {:?}",
             report.errors
         );
-        // The response :status pseudo-header still decodes on its own HPACK
-        // decoder (direction 1) so http_status survives.
-        assert_eq!(event.sbi.as_ref().and_then(|s| s.http_status), Some(204));
     }
 
     #[test]
@@ -1248,8 +1233,8 @@ mod tests {
         // 0.3.1 onwards the orphan is a *connection-level* framing error: it
         // goes into `report.errors` but the stream is only promoted to a
         // normalised event through its *own* decoded content. Here the
-        // paired response on stream 11 decoded cleanly, so the event remains
-        // DECODED and the error lives in the report, not on the event.
+        // paired response on stream 11 decoded cleanly, so that response
+        // evidence is retained; the orphan error remains connection-level.
         let client = TcpEndpoint {
             address: "10.0.0.1".into(),
             port: 40002,
@@ -1274,10 +1259,7 @@ mod tests {
         };
         let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
         assert_eq!(events.len(), 1);
-        let event = &events[0];
-        // Response decoded cleanly → the event itself is Partial only because
-        // the request headers are missing (not because of the orphan error).
-        assert_eq!(event.sbi.as_ref().and_then(|s| s.http_status), Some(500));
+        assert_eq!(events[0].decoding_status, DecodeStatus::Decoded);
         assert!(
             report
                 .errors
@@ -1286,15 +1268,12 @@ mod tests {
             "orphan CONTINUATION must surface at connection level: {:?}",
             report.errors
         );
-        // The event errors list contains the generic missing-request-partial
-        // reason (same as 0.3.1), not the connection-level orphan message.
         assert!(
-            !event
+            events[0]
                 .errors
                 .iter()
-                .any(|e| e.contains("orphan CONTINUATION")),
-            "orphan CONTINUATION must not pollute the per-stream event: {:?}",
-            event.errors
+                .all(|error| !error.contains("orphan CONTINUATION")),
+            "connection error must not pollute the decoded response event"
         );
     }
 
@@ -1596,10 +1575,10 @@ mod tests {
             ],
         };
         let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
-        // Stream 1 is retained as the single response-only HPACK-context
-        // evidence for this connection; stream 3 proves that the direction
-        // was NOT poisoned after stream 1's failure.
-        assert_eq!(events.len(), 2, "expected both evidence streams to emit events");
+        // Stream 1 is partial without a trustworthy request identity and is
+        // therefore omitted. Stream 3 proves that the direction was NOT
+        // poisoned after stream 1's failure.
+        assert_eq!(events.len(), 1, "only the fully decoded stream is emitted");
         let s1 = events
             .iter()
             .find(|e| e.sbi.as_ref().map(|s| s.http2_stream_id) == Some(3))
@@ -1614,17 +1593,9 @@ mod tests {
             "stream 3 must not inherit HPACK_CONTEXT_UNAVAILABLE from stream 1: {:?}",
             s1.errors
         );
-        let s0 = events
+        assert!(events
             .iter()
-            .find(|e| e.sbi.as_ref().map(|s| s.http2_stream_id) == Some(1))
-            .expect("stream 1 present");
-        assert!(
-            s0.errors
-                .iter()
-                .any(|e| e.starts_with(HPACK_CONTEXT_UNAVAILABLE)),
-            "stream 1 must surface HPACK_CONTEXT_UNAVAILABLE: {:?}",
-            s0.errors
-        );
+            .all(|e| e.sbi.as_ref().map(|s| s.http2_stream_id) != Some(1)));
         // The HPACK error is reported once per failing block, not per stream
         // or per frame.
         let unavail_count = report
