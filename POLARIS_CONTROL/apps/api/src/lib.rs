@@ -7449,6 +7449,11 @@ async fn stop_ue(
     if let Err(error) = require_operator(&identity) {
         return error;
     }
+    // 0.19.1 — Stop deliberately BYPASSES `resource_gate` (DISK_STOP_THRESHOLD
+    // and CPU guard). Stop releases resources — refusing it when the disk is
+    // 95 % full would leave the operator stranded exactly when they need to
+    // free space. The guard still blocks Start / Run (`start_ue`,
+    // `start_ue_group`, `start_live_definition_scenario`, `start_scenario`).
     // 0.18.0 #36 — Stop no longer requires the Live flag to be ON. We
     // reach into the controller registry and route the Stop through the
     // live path whenever a live-mode launch is still recorded for the
@@ -7599,6 +7604,9 @@ async fn start_ue_group(
     }
 }
 
+// 0.19.1 — Group Stop is exempt from `resource_gate` for the same reason
+// as single-UE Stop: stop releases resources. The guard protects Start /
+// Run only.
 async fn stop_ue_group(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
@@ -8059,6 +8067,33 @@ fn cancellable_wait(control: &DefinitionJobControl, duration_ms: u64) -> Result<
     Ok(())
 }
 
+/// 0.19.1 — Tagged helper that pushes a per-UE event when a scenario
+/// step branch succeeds OR fails. Returns the original result unchanged
+/// so the `?` operator in each branch keeps propagating the error.
+fn trace_step_result<T>(
+    state: &AppState,
+    ue_id: &str,
+    kind: &str,
+    detail_ok: impl FnOnce(&T) -> Value,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    match &result {
+        Ok(value) => {
+            record_activity_event(state, ue_id, kind, "OK", detail_ok(value));
+        }
+        Err(error) => {
+            record_activity_event(
+                state,
+                ue_id,
+                kind,
+                "FAILED",
+                json!({ "error": error }),
+            );
+        }
+    }
+    result
+}
+
 fn execute_live_definition_step(
     state: &AppState,
     step: &ResolvedStep,
@@ -8096,6 +8131,17 @@ fn execute_live_definition_step(
                         .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
                         .insert(ue_id.clone(), started_job);
                 }
+                // 0.19.1 (#37) — `ue_start` completing implies the UE
+                // was registered on the AMF (UERANSIM runs register
+                // immediately after boot). Push a dedicated "registration"
+                // event so the Activity timeline shows the handshake.
+                record_activity_event(
+                    state,
+                    ue_id,
+                    "registration",
+                    "OK",
+                    json!({ "already_running": already_running }),
+                );
             }
             Ok(json!({}))
         }
@@ -8157,11 +8203,25 @@ fn execute_live_definition_step(
                     }
                     profile.dnn = dnn.into();
                 }
-                state
-                    .ue_runtime
-                    .establish_pdu(&job, &profile, timeout, &control.cancel)?;
+                let pdu_profile_dnn = profile.dnn.clone();
+                trace_step_result(
+                    state,
+                    ue_id,
+                    "pdu_establish",
+                    |_: &()| json!({ "dnn": &pdu_profile_dnn }),
+                    state
+                        .ue_runtime
+                        .establish_pdu(&job, &profile, timeout, &control.cancel),
+                )?;
                 let observation = observe_controller_ue(state, ue_id)?;
                 if observation.pdu_session_state != "ACTIVE" {
+                    record_activity_event(
+                        state,
+                        ue_id,
+                        "pdu_establish",
+                        "FAILED",
+                        json!({ "error": "PDU_STATE_ACTIVE_NOT_OBSERVED" }),
+                    );
                     return Err("PDU_STATE_ACTIVE_NOT_OBSERVED".into());
                 }
                 let target = resolve_controller_traffic_target(state, ue_id)?;
@@ -8186,11 +8246,22 @@ fn execute_live_definition_step(
                     .find(|job| job.ue_id == *ue_id)
                     .ok_or("UE_NOT_STARTED")?;
                 state.ue_runtime.remove_policy_routing(&target)?;
-                state
-                    .ue_runtime
-                    .release_pdu(&job, timeout, &control.cancel)?;
+                trace_step_result(
+                    state,
+                    ue_id,
+                    "pdu_release",
+                    |_: &()| json!({}),
+                    state.ue_runtime.release_pdu(&job, timeout, &control.cancel),
+                )?;
                 let observation = observe_controller_ue(state, ue_id)?;
                 if observation.pdu_session_state != "INACTIVE" {
+                    record_activity_event(
+                        state,
+                        ue_id,
+                        "pdu_release",
+                        "FAILED",
+                        json!({ "error": "PDU_STATE_INACTIVE_NOT_OBSERVED" }),
+                    );
                     return Err("PDU_STATE_INACTIVE_NOT_OBSERVED".into());
                 }
             }
@@ -8227,10 +8298,24 @@ fn execute_live_definition_step(
                     return Err("SCENARIO_STOP_REQUESTED".into());
                 }
                 let target = resolve_controller_traffic_target(state, ue_id)?;
-                let measurement =
+                let measurement = trace_step_result(
+                    state,
+                    ue_id,
+                    "iperf3",
+                    |m: &IperfMeasurement| {
+                        json!({
+                            "direction": "DL",
+                            "sender_bytes": m.client_sent_bytes,
+                            "receiver_bytes": m.server_received_bytes,
+                            "retransmissions": m.retransmissions,
+                            "rate": m.rate,
+                            "warning": m.warning,
+                        })
+                    },
                     state
                         .ue_runtime
-                        .execute_iperf_dl(&target, bytes, &state.dl_sender)?;
+                        .execute_iperf_dl(&target, bytes, &state.dl_sender),
+                )?;
                 sender_bytes = sender_bytes
                     .checked_add(measurement.client_sent_bytes)
                     .ok_or("IPERF3_BYTES_OVERFLOW")?;
@@ -8279,10 +8364,24 @@ fn execute_live_definition_step(
                     return Err("SCENARIO_STOP_REQUESTED".into());
                 }
                 let target = resolve_controller_traffic_target(state, ue_id)?;
-                let measurement =
+                let measurement = trace_step_result(
+                    state,
+                    ue_id,
+                    "iperf3",
+                    |m: &IperfMeasurement| {
+                        json!({
+                            "direction": "UL",
+                            "sender_bytes": m.client_sent_bytes,
+                            "receiver_bytes": m.server_received_bytes,
+                            "retransmissions": m.retransmissions,
+                            "rate": m.rate,
+                            "warning": m.warning,
+                        })
+                    },
                     state
                         .ue_runtime
-                        .execute_iperf_ul(&target, bytes, &state.dl_sender)?;
+                        .execute_iperf_ul(&target, bytes, &state.dl_sender),
+                )?;
                 ue_sender_bytes = ue_sender_bytes
                     .checked_add(measurement.client_sent_bytes)
                     .ok_or("IPERF3_BYTES_OVERFLOW")?;
@@ -8330,11 +8429,33 @@ fn execute_live_definition_step(
                     return Err("SCENARIO_STOP_REQUESTED".into());
                 }
                 let target = resolve_controller_traffic_target(state, ue_id)?;
-                evidence.push(state.ue_runtime.execute_transfer_verify(
-                    &target,
-                    direction,
-                    &state.dl_sender,
-                )?);
+                // 0.19.1 (#37) — transfer_verify is where the operator wants
+                // to see sha256 match / mismatch most explicitly. The
+                // helper carries both digests + a boolean match flag on
+                // the OK event; the FAILED event carries the raw error
+                // code (TRANSFER_VERIFY_* / etc.).
+                let transfer = trace_step_result(
+                    state,
+                    ue_id,
+                    "transfer_verify",
+                    |t: &TransferVerification| {
+                        let matched = t.sender_sha256 == t.receiver_sha256;
+                        json!({
+                            "direction": &t.direction,
+                            "bytes": t.bytes,
+                            "sender_sha256": &t.sender_sha256,
+                            "receiver_sha256": &t.receiver_sha256,
+                            "sha256_match": matched,
+                            "status": if matched { "sha256-OK" } else { "sha256-KO" },
+                        })
+                    },
+                    state.ue_runtime.execute_transfer_verify(
+                        &target,
+                        direction,
+                        &state.dl_sender,
+                    ),
+                )?;
+                evidence.push(transfer);
             }
             Ok(json!({
                 "direction":direction,
@@ -8373,7 +8494,13 @@ fn execute_live_definition_step(
                         .ok_or("UE_NOT_STARTED")?
                 };
                 state.ue_runtime.remove_policy_routing(&target)?;
-                request_terminal_detach(state.ue_runtime.as_ref(), &job)?;
+                trace_step_result(
+                    state,
+                    ue_id,
+                    "detach",
+                    |_: &()| json!({ "phase": "release_requested" }),
+                    request_terminal_detach(state.ue_runtime.as_ref(), &job),
+                )?;
                 let final_job = stop_one_live_for_definition(state, ue_id, &job)?;
                 // The stop result is the controller's authoritative terminal
                 // observation. Do not call observe_controller_ue here: that
@@ -8382,8 +8509,25 @@ fn execute_live_definition_step(
                 if final_job.process_state != "STOPPED"
                     || final_job.pdu_session_state != "INACTIVE"
                 {
+                    record_activity_event(
+                        state,
+                        ue_id,
+                        "detach",
+                        "FAILED",
+                        json!({ "error": "DETACH_FINAL_STATE_NOT_OBSERVED" }),
+                    );
                     return Err("DETACH_FINAL_STATE_NOT_OBSERVED".into());
                 }
+                record_activity_event(
+                    state,
+                    ue_id,
+                    "detach",
+                    "OK",
+                    json!({
+                        "process_state": &final_job.process_state,
+                        "pdu_state": &final_job.pdu_session_state,
+                    }),
+                );
                 control
                     .started_ues
                     .lock()
@@ -9244,6 +9388,11 @@ struct StopScenarioInput {
     job_id: String,
 }
 
+// 0.19.1 — Stop (scenario / detach / cleanup) is exempt from
+// `resource_gate` (DISK_STOP_THRESHOLD + CPU guard). Scenario Stop
+// routes through `cleanup_definition_started_ues` → `stop_one_live*`,
+// which never touches the gate. The guard still blocks Start / Run
+// (`start_scenario`, `start_live_definition_scenario`).
 async fn stop_scenario(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
@@ -11386,6 +11535,149 @@ mod p0_tests {
             "10.46.0.6"
         )
         .is_err());
+    }
+
+    /// 0.19.1 (#37) — `trace_step_result` pushes an event on both success
+    /// and failure so the Activity timeline shows the handshake either
+    /// way. Covered: iperf3 success writes the sender/receiver bytes;
+    /// a failing branch writes the raw error code.
+    #[test]
+    fn trace_step_result_pushes_ok_and_failed_events_on_the_activity_ring() {
+        let test_state = state();
+        // Success path: tag an iperf3 OK event with the bytes.
+        let ok_outcome: Result<u64, String> = Ok(42);
+        let _ = trace_step_result(
+            &test_state,
+            "UE-02",
+            "iperf3",
+            |value: &u64| json!({ "sender_bytes": value }),
+            ok_outcome,
+        );
+        // Failure path: a transfer_verify error with its raw error code.
+        let fail_outcome: Result<u64, String> =
+            Err("TRANSFER_VERIFY_SHA256_MISMATCH".into());
+        let _ = trace_step_result(
+            &test_state,
+            "UE-02",
+            "transfer_verify",
+            |_: &u64| json!({ "unreached": true }),
+            fail_outcome,
+        );
+        let events = test_state.activity_events.snapshot("UE-02");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "iperf3");
+        assert_eq!(events[0].outcome, "OK");
+        assert_eq!(events[0].detail["sender_bytes"], Value::Number(42.into()));
+        assert_eq!(events[1].kind, "transfer_verify");
+        assert_eq!(events[1].outcome, "FAILED");
+        assert_eq!(
+            events[1].detail["error"],
+            Value::String("TRANSFER_VERIFY_SHA256_MISMATCH".into()),
+        );
+    }
+
+    /// 0.19.1 — The DISK_STOP_THRESHOLD / CPU guard must block Start and
+    /// Run, but NOT Stop: stopping a UE releases resources, so refusing it
+    /// when the disk is full would strand the operator. This test seeds a
+    /// mock-mode UE that is already running, flips the resource gate to
+    /// DISK_STOP_THRESHOLD at state construction time, then asserts
+    /// POST /ues/stop → 200 and POST /ues/start → 503.
+    #[tokio::test]
+    async fn stop_is_exempt_from_resource_gate_while_start_is_blocked() {
+        let mut test_state = state();
+        test_state.resource_override = Some(Err("DISK_STOP_THRESHOLD".into()));
+        {
+            let mut controller = test_state.multi_ue.lock().unwrap();
+            controller.configure_count(5).unwrap();
+            // Seed UE-02 as a running job in mock mode so stop_offline
+            // has something to tear down.
+            controller.start_offline("UE-02").unwrap();
+        }
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let action = |path: &str, id: &str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", &csrf)
+                .body(Body::from(json!({"ue_id":id}).to_string()))
+                .unwrap()
+        };
+
+        // Stop on a running UE must succeed even when the disk gate is at
+        // the stop threshold.
+        let stop = application
+            .clone()
+            .oneshot(action("/api/v1/ues/stop", "UE-02"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stop.status(),
+            StatusCode::OK,
+            "Stop must bypass DISK_STOP_THRESHOLD",
+        );
+
+        // Start on a different UE must be refused with 503 + the exact
+        // DISK_STOP_THRESHOLD reason so the operator sees why.
+        let start = application
+            .oneshot(action("/api/v1/ues/start", "UE-03"))
+            .await
+            .unwrap();
+        assert_eq!(
+            start.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Start must remain blocked by DISK_STOP_THRESHOLD",
+        );
+        let payload: Value =
+            serde_json::from_slice(&to_bytes(start.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(payload["error"], Value::String("DISK_STOP_THRESHOLD".into()));
+    }
+
+    /// 0.19.1 — Group Stop is exempt from the resource gate the same way
+    /// single-UE Stop is. Group Start on a different set stays blocked.
+    #[tokio::test]
+    async fn group_stop_is_exempt_from_resource_gate_while_group_start_is_blocked() {
+        let mut test_state = state();
+        test_state.resource_override = Some(Err("DISK_STOP_THRESHOLD".into()));
+        {
+            let mut controller = test_state.multi_ue.lock().unwrap();
+            controller.configure_count(5).unwrap();
+            controller.start_offline("UE-02").unwrap();
+        }
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let group = |path: &str, ids: &[&str]| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", &csrf)
+                .body(Body::from(json!({"ue_ids": ids}).to_string()))
+                .unwrap()
+        };
+        let stop_group = application
+            .clone()
+            .oneshot(group("/api/v1/ues/group/stop", &["UE-02"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            stop_group.status(),
+            StatusCode::OK,
+            "Group Stop must bypass DISK_STOP_THRESHOLD",
+        );
+        let start_group = application
+            .oneshot(group("/api/v1/ues/group/start", &["UE-03"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            start_group.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Group Start must remain blocked by DISK_STOP_THRESHOLD",
+        );
     }
 
     #[tokio::test]
