@@ -936,17 +936,18 @@ export function UeManagerPage() {
                   </td>
                   <td>
                     <div className="flex flex-col">
-                      {polarisProvisioning ? (
-                        <Link
-                          to={`/ues/${encodeURIComponent(row.profile.id)}`}
-                          className="font-medium mono text-primary hover:underline"
-                          data-testid={`ue-detail-link-${row.profile.id}`}
-                        >
-                          {row.profile.id}
-                        </Link>
-                      ) : (
-                        <span className="font-medium mono">{row.profile.id}</span>
-                      )}
+                      {/* 0.11.0 (#37) — The UE id click now lands on the
+                          per-UE Activity page (the detail page stays
+                          reachable via the "UE detail" button inside
+                          Activity). The link is role-independent — Activity
+                          is read-only, open to every signed-in viewer. */}
+                      <Link
+                        to={`/ues/${encodeURIComponent(row.profile.id)}/activity`}
+                        className="font-medium mono text-primary hover:underline"
+                        data-testid={`ue-detail-link-${row.profile.id}`}
+                      >
+                        {row.profile.id}
+                      </Link>
                       {row.backend?.internal_ue_id &&
                         row.backend.internal_ue_id !== row.profile.id && (
                           <span className="text-text-secondary text-ep-xs mono truncate">

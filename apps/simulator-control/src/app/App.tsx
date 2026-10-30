@@ -6,6 +6,7 @@ import { CoreOpen5gsPage } from '@/pages/CoreOpen5gs';
 import { GnbsPage } from '@/pages/Gnbs';
 import { UeManagerPage } from '@/pages/UeManager';
 import { UeDetailPage } from '@/pages/UeDetail';
+import { UeActivityPage } from '@/pages/UeActivity';
 import { TrafficPage } from '@/pages/Traffic';
 import { ScenariosLibraryPage } from '@/pages/ScenariosLibrary';
 import { ScenarioBuilderPage } from '@/pages/ScenarioBuilder';
@@ -28,6 +29,8 @@ export function App() {
         <Route path="/nodes" element={<Navigate to="/network/gnbs" replace />} />
         <Route path="/ues" element={<UeManagerPage />} />
         <Route path="/ues/:ueId" element={<UeDetailPage />} />
+        {/* 0.11.0 (#37) — Per-UE Activity page, SSE-backed. */}
+        <Route path="/ues/:ueId/activity" element={<UeActivityPage />} />
         <Route path="/provisioning" element={<ProvisioningPage />} />
         <Route path="/traffic" element={<TrafficPage />} />
         <Route path="/scenarios" element={<ScenariosLibraryPage />} />

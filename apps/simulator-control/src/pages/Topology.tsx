@@ -24,6 +24,7 @@
 // the same as "NGAP OK".
 
 import { useMemo } from 'react';
+import { Link } from 'react-router-dom';
 import {
   AlertTriangle,
   Antenna,
@@ -331,9 +332,14 @@ function GnbColumn({ node, attachedUes }: { node: NodeItem; attachedUes: UeState
 function UeMiniCard({ ue }: { ue: UeState }) {
   const regTone = regTonePill(ue.registration_state);
   const pduActive = (ue.pdu_session ?? '').toUpperCase() === 'ACTIVE';
+  // 0.11.0 (#37) — the card becomes the entry point to the per-UE
+  // Activity page. The whole card is clickable; nested interactive
+  // elements kept inside are purely informational chips so no nested
+  // button problem arises.
   return (
-    <div
-      className="rounded-lg border border-border bg-canvas p-2 flex flex-col gap-1"
+    <Link
+      to={`/ues/${encodeURIComponent(ue.id)}/activity`}
+      className="rounded-lg border border-border bg-canvas p-2 flex flex-col gap-1 hover:border-primary focus:outline-none focus:ring-2 focus:ring-primary/40"
       data-testid={`topology-ue-${ue.id}`}
       data-registration={ue.registration_state}
       data-pdu={ue.pdu_session}
@@ -361,7 +367,7 @@ function UeMiniCard({ ue }: { ue: UeState }) {
       <p className="mono text-[10px] text-text-secondary" data-testid={`topology-ue-${ue.id}-identity`}>
         PROTECTED
       </p>
-    </div>
+    </Link>
   );
 }
 
