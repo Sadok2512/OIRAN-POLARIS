@@ -42,6 +42,25 @@ export interface WireScenarioStep {
   type: string;
   loop_count: number;
   parameters: Record<string, WireNumericParam>;
+  /**
+   * 0.5.0 — nested step list, used by `type: "repeat"`. Absent on every
+   * other step type; the backend validator refuses it elsewhere.
+   */
+  steps?: WireScenarioStep[];
+}
+
+/**
+ * 0.5.0 — Shape of the scenario-definition v2 import / export file, as
+ * delivered by `GET /scenario-definitions/:id/export` and consumed by
+ * `POST /scenario-definitions/import`. The JSON Schema that Codex will
+ * publish lives in `docs/api/scenario-definition.v2.schema.json`.
+ */
+export const SCENARIO_SCHEMA_VERSION = 'polaris.scenario-definition.v2' as const;
+
+export interface WireScenarioExportFile {
+  schema_version: typeof SCENARIO_SCHEMA_VERSION;
+  exported_at_epoch_s?: number;
+  definition: WireScenarioDefinition;
 }
 
 export interface WireScenarioMutation {

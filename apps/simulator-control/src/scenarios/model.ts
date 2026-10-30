@@ -22,7 +22,14 @@ export type ScenarioStepKind =
   | 'WAIT_RRC_IDLE'
   | 'PDU_RELEASE'
   | 'DEREGISTER'
-  | 'UE_STOP';
+  | 'UE_STOP'
+  // 0.5.0 — scenario-definition v2 (Codex `feat/polaris-traffic-templates`).
+  | 'TRAFFIC_DL'
+  | 'TRAFFIC_UL'
+  | 'DETACH'
+  | 'REPEAT'
+  | 'IMS_REGISTER'
+  | 'VOICE_CALL';
 
 export const STEP_METADATA: Record<
   ScenarioStepKind,
@@ -104,6 +111,55 @@ export const STEP_METADATA: Record<
     backendNote: 'Not in polaris-control-api 0.9.0 (6-type whitelist). Deregistration is implicit in ue_stop.',
   },
   UE_STOP: { label: 'Stop UE', family: 'ACTION', backendCertified: true },
+  // 0.5.0 — new step types from scenario-definition v2 contract.
+  // Each one carries its own locking semantics; the UI badge comes from
+  // `backendNote` so the operator sees the exact backend code when the
+  // step is refused at validate / start time.
+  TRAFFIC_DL: {
+    label: 'Downlink traffic',
+    family: 'ACTION',
+    defaultParams: ['bytes', 'rate_kbps'],
+    backendCertified: false,
+    backendNote: 'DL_SENDER_NOT_AVAILABLE — no DN-side sender wired yet. Backend will refuse execution with 422.',
+  },
+  // 0.5.2 — Honest downgrade: scenario-definition v2 lands with Codex on
+  // `feat/polaris-traffic-templates` but is NOT yet executed by the
+  // production backend. We mark these three kinds as not certified by
+  // default; the UI promotes them back to "Supported" when (and only
+  // when) `GET /capabilities` advertises them via `scenario_step_kinds`.
+  TRAFFIC_UL: {
+    label: 'Uplink traffic',
+    family: 'ACTION',
+    defaultParams: ['bytes', 'rate_kbps'],
+    backendCertified: false,
+    backendNote: 'Backend pending: feat/polaris-traffic-templates.',
+  },
+  DETACH: {
+    label: 'Detach (release all PDU, stop UE)',
+    family: 'ACTION',
+    backendCertified: false,
+    backendNote: 'Backend pending: feat/polaris-traffic-templates.',
+  },
+  REPEAT: {
+    label: 'Repeat block',
+    family: 'ACTION',
+    defaultParams: ['loop_count'],
+    backendCertified: false,
+    backendNote: 'Backend pending: feat/polaris-traffic-templates.',
+  },
+  IMS_REGISTER: {
+    label: 'IMS registration',
+    family: 'ACTION',
+    backendCertified: false,
+    backendNote: 'IMS_NOT_AVAILABLE — contract validates but execution returns 423 until IMS is certified.',
+  },
+  VOICE_CALL: {
+    label: 'Voice call (AMR-WB)',
+    family: 'ACTION',
+    defaultParams: ['duration_ms'],
+    backendCertified: false,
+    backendNote: 'IMS_NOT_AVAILABLE — same as ims_register. AMR-WB is the only codec declared today.',
+  },
 };
 
 /**
@@ -118,6 +174,13 @@ export const WIRE_STEP_TYPE: Partial<Record<ScenarioStepKind, string>> = {
   PDU_RELEASE: 'pdu_release',
   UDP_TRAFFIC: 'udp_traffic',
   IDLE: 'wait',
+  // 0.5.0 — scenario-definition v2 additions.
+  TRAFFIC_DL: 'traffic_dl',
+  TRAFFIC_UL: 'traffic_ul',
+  DETACH: 'detach',
+  REPEAT: 'repeat',
+  IMS_REGISTER: 'ims_register',
+  VOICE_CALL: 'voice_call',
 };
 
 /** Reverse map used when decoding a backend `type` into our internal kind. */
@@ -128,7 +191,45 @@ export const INTERNAL_STEP_KIND: Record<string, ScenarioStepKind> = {
   pdu_release: 'PDU_RELEASE',
   udp_traffic: 'UDP_TRAFFIC',
   wait: 'IDLE',
+  traffic_dl: 'TRAFFIC_DL',
+  traffic_ul: 'TRAFFIC_UL',
+  detach: 'DETACH',
+  repeat: 'REPEAT',
+  ims_register: 'IMS_REGISTER',
+  voice_call: 'VOICE_CALL',
 };
+
+/**
+ * 0.5.0 — Backend reasons the UI must display verbatim when it locks the
+ * palette entry or shows an error on the executed scenario. Keep the
+ * strings aligned on the Rust `error.code` values in Codex's branch.
+ */
+export const BACKEND_LOCK_REASONS = {
+  DL_SENDER_NOT_AVAILABLE: 'traffic_dl is refused by the backend: no DN-side sender is wired yet (DL_SENDER_NOT_AVAILABLE).',
+  IMS_NOT_AVAILABLE: 'ims_register / voice_call are validated but execution stays blocked (IMS_NOT_AVAILABLE) until the IMS stack ships.',
+} as const;
+
+/** Max repeat nesting depth per scenario-definition v2 (REPEAT_NESTING_TOO_DEEP otherwise). */
+export const MAX_REPEAT_NESTING = 2;
+/** Shared resolved-steps cap kept in sync with the backend (RESOLVED_STEPS_LIMIT otherwise). */
+export const MAX_RESOLVED_STEPS = 10_000;
+
+/**
+ * 0.5.2 — "Effective" certification of a step kind: a kind is clickable
+ * in backend mode when its metadata is `backendCertified: true` OR when
+ * the backend advertised its wire type in `GET /capabilities`'s
+ * `scenario_step_kinds` array. Pass `undefined` for the capabilities
+ * list to fall back to the metadata flag alone.
+ */
+export function isStepKindExecutable(
+  kind: ScenarioStepKind,
+  advertisedWireTypes: readonly string[] | undefined,
+): boolean {
+  if (STEP_METADATA[kind].backendCertified) return true;
+  const wire = WIRE_STEP_TYPE[kind];
+  if (!wire || !advertisedWireTypes) return false;
+  return advertisedWireTypes.includes(wire);
+}
 
 export type FixedOrRandom =
   | { mode: 'fixed'; value: number }
@@ -143,6 +244,11 @@ export interface StepParams {
   delay_before_ms?: FixedOrRandom;
   retry_interval_ms?: FixedOrRandom;
   timeout_s?: FixedOrRandom;
+  // 0.5.0 — scenario-definition v2 numeric parameters.
+  bytes?: FixedOrRandom;
+  rate_kbps?: FixedOrRandom;
+  duration_ms?: FixedOrRandom;
+  loop_count?: FixedOrRandom;
 }
 
 export const PARAM_META: Record<keyof StepParams, { label: string; unit: string; min: number; max: number; integer: boolean }> = {
@@ -154,6 +260,11 @@ export const PARAM_META: Record<keyof StepParams, { label: string; unit: string;
   delay_before_ms: { label: 'Delay before', unit: 'ms', min: 0, max: 600_000, integer: true },
   retry_interval_ms: { label: 'Retry interval', unit: 'ms', min: 50, max: 60_000, integer: true },
   timeout_s: { label: 'Timeout', unit: 's', min: 1, max: 900, integer: true },
+  // 0.5.0 — bytes capped at 200 MiB per scenario-definition v2.
+  bytes: { label: 'Bytes', unit: 'B', min: 1, max: 200 * 1024 * 1024, integer: true },
+  rate_kbps: { label: 'Rate', unit: 'kbit/s', min: 1, max: 1_000_000, integer: true },
+  duration_ms: { label: 'Duration', unit: 'ms', min: 1, max: 900_000, integer: true },
+  loop_count: { label: 'Loop count', unit: '×', min: 1, max: 10_000, integer: true },
 };
 
 export interface ScenarioStep {
@@ -161,6 +272,13 @@ export interface ScenarioStep {
   kind: ScenarioStepKind;
   params: StepParams;
   note?: string;
+  /**
+   * 0.5.0 — Nested step list used ONLY by `kind: 'REPEAT'`. Nesting
+   * depth is capped at `MAX_REPEAT_NESTING` (= 2); the validator
+   * refuses deeper trees to match the backend REPEAT_NESTING_TOO_DEEP
+   * rule.
+   */
+  steps?: ScenarioStep[];
 }
 
 export type LoopMode =

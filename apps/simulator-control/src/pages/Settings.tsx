@@ -185,10 +185,19 @@ export function SettingsPage() {
             <span>
               <span className="font-medium">Use backend scenario catalog</span>
               <span className="block text-ep-xs text-text-secondary">
-                When enabled, the Scenario Library, Builder and Execution Monitor use
-                <code className="mono"> /scenario-definitions </code> and
-                <code className="mono"> /scenarios/:job_id/steps </code> instead of the local
-                catalog. Only integer loops (1–10 000) can be saved.
+                Default <strong>ON</strong>. The Scenario Library, Builder and Execution Monitor
+                hit <code className="mono"> /scenario-definitions </code> and{' '}
+                <code className="mono">/scenarios/:job_id/steps</code>. Only integer loops
+                (1–10 000) can be saved, and only backend-certified step kinds are offered
+                in the Builder palette.
+              </span>
+              <span
+                className={`block text-ep-xs mt-1 ${flags.scenarioBackend ? 'text-text-secondary' : 'text-warning'}`}
+                data-testid="flag-scenario-backend-offline-note"
+              >
+                {flags.scenarioBackend
+                  ? 'Honest Builder: backend-certified palette only, offline-draft disabled.'
+                  : 'Offline draft mode — scenarios stay in localStorage (polaris.scenarios.v1). Nothing reaches the backend; non-certified step kinds become editable again.'}
               </span>
             </span>
           </label>

@@ -798,7 +798,7 @@ mod tests {
                 json!([]),
             ),
         ];
-        let discovery = discover_sessions(events.clone());
+        let discovery = discover_sessions(&mut events.clone());
         let edges = correlate_discovered_tunnels(&events, &discovery);
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].confidence, "EXACT");
@@ -838,7 +838,7 @@ mod tests {
                 json!([]),
             ),
         ];
-        let discovery = discover_sessions(events.clone());
+        let discovery = discover_sessions(&mut events.clone());
         assert!(discovery.gtpu_tunnels[0].related_pfcp_session.is_none());
         assert!(correlate_discovered_tunnels(&events, &discovery).is_empty());
     }

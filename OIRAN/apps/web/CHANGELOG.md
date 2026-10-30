@@ -2,6 +2,62 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.5.0-dev — 2026-10-28 (minor)
+
+Zero-mock pass against the production backend at
+`https://151.242.147.49:8020`.
+
+### Added
+
+- `scripts/check-dist-leaks.mjs` — a build-time guard that fails the
+  `npm run build` pipeline if any of the fixture markers
+  (`oiran-vprobe-local-01`, `OIRAN_5G_PDU_SESSION_DATA_V1`) ends up
+  inside `dist/`. Confirmed clean on first run.
+- `scripts/capture-screenshots-live.py` and
+  `docs/screenshots-live/*.png` (8 PNGs — Overview, Sessions,
+  Packet Analyzer, Correlation Studio, light + dark). Rendered against
+  the production API; no fixture injected.
+- `docs/screenshots-live/README.md`.
+- `src/types/api.ts`: `InterfaceRole` typed enum, optional `role` on
+  `CaptureInterface`, optional `probe_state` on `Probe`, and
+  `last_heartbeat_epoch_s: number | null`.
+
+### Changed
+
+- `src/pages/ProbeManager.tsx` removes the hardcoded
+  `oiran-vprobe-local-01` default from the capture request. The
+  operator now picks a probe from the live probe grid (cards gained
+  a `role="button"` + keyboard handling); `Validate` and `Start`
+  stay disabled while `probe_id` is empty.
+- Probe cards show the new lifecycle (`probe_state` → `PENDING |
+  ONLINE | DEGRADED`) and the real `last_heartbeat_epoch_s`.
+- Interface cards expose the backend-declared `role` when the
+  registry carries one (otherwise `—`).
+- Selected-capture details stop defaulting `packet_count` to `0`;
+  unknown counters render as `—`.
+- Request `name` is no longer prefilled with `POLARIS-5G-SA` — the
+  operator must name the capture.
+
+### Validation (manual, no CI)
+
+- `npm run typecheck` → clean
+- `npm test` → Test Files 9 passed · Tests 71 passed
+- `npm run build` → `dist/assets/index-Dt4N0p25.js 357.96 kB │ gzip: 106.04 kB`
+  (check-dist-leaks: clean, 3 files scanned, 2 markers)
+
+### Live verification (GET only)
+
+| Screen | Route | HTTP | body |
+|---|---|---|---|
+| Sidebar | `GET /api/v1/modules` | 200 | 2780 B |
+| Sessions | `GET /api/v1/sessions` | 200 | 3486 B |
+| Datasets | `GET /api/v1/datasets` | 200 | 21874 B |
+| UE directory | `GET /api/v1/ues` | 200 | 2699 B |
+| Packet Analyzer | `GET /api/v1/packets` | 200 | 49418 B |
+| Correlation Studio | `GET /api/v1/correlation/edges` | 200 | 9839 B |
+| Correlation rules | `GET /api/v1/correlation/rules` | 200 | 367 B |
+| Platform · version | `GET /api/v1/version` | 200 | 352 B |
+
 ## 2.4.1-dev — 2026-10-28 (patch)
 
 Review feedback on 2.4.0-dev (BC4): subscriber-identity IEs still slipped

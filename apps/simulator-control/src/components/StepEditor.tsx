@@ -1,7 +1,9 @@
-import { AlertTriangle } from 'lucide-react';
+import { AlertTriangle, Plus, Trash2 } from 'lucide-react';
 import {
+  MAX_REPEAT_NESTING,
   PARAM_META,
   STEP_METADATA,
+  newStepId,
   type FixedOrRandom,
   type ScenarioStep,
   type ScenarioStepKind,
@@ -14,19 +16,57 @@ export function StepEditor({
   onUpdate,
   onParam,
   actions,
+  depth = 0,
 }: {
   index: number;
   step: ScenarioStep;
   onUpdate: (patch: Partial<ScenarioStep>) => void;
   onParam: (key: keyof StepParams, value: FixedOrRandom | undefined) => void;
   actions?: React.ReactNode;
+  depth?: number;
 }) {
   const meta = STEP_METADATA[step.kind];
   const paramKeys = Object.keys(step.params) as (keyof StepParams)[];
   const supportedKeys = meta.defaultParams ?? [];
+  const isRepeat = step.kind === 'REPEAT';
+  const nestedSteps = step.steps ?? [];
+  const canNestFurther = depth + 1 < MAX_REPEAT_NESTING;
+
+  function updateNestedStep(stepId: string, patch: Partial<ScenarioStep>) {
+    onUpdate({
+      steps: nestedSteps.map((child) => (child.id === stepId ? { ...child, ...patch } : child)),
+    });
+  }
+
+  function updateNestedParam(stepId: string, key: keyof StepParams, value: FixedOrRandom | undefined) {
+    onUpdate({
+      steps: nestedSteps.map((child) =>
+        child.id !== stepId
+          ? child
+          : {
+              ...child,
+              params: value ? { ...child.params, [key]: value } : removeKey(child.params, key),
+            },
+      ),
+    });
+  }
+
+  function removeNestedStep(stepId: string) {
+    onUpdate({ steps: nestedSteps.filter((child) => child.id !== stepId) });
+  }
+
+  function addNestedStep(kind: ScenarioStepKind) {
+    const defaultParams: StepParams = {};
+    for (const key of STEP_METADATA[kind].defaultParams ?? []) {
+      const paramMeta = PARAM_META[key as keyof StepParams];
+      defaultParams[key as keyof StepParams] = { mode: 'fixed', value: paramMeta.min };
+    }
+    const child: ScenarioStep = { id: newStepId(), kind, params: defaultParams };
+    onUpdate({ steps: [...nestedSteps, child] });
+  }
 
   return (
-    <article className="p-3 flex flex-col gap-2">
+    <article className="p-3 flex flex-col gap-2" data-testid={`step-editor-depth-${depth}`}>
       <header className="flex items-start justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
           <span className="ep-badge mono shrink-0">#{index}</span>
@@ -34,15 +74,17 @@ export function StepEditor({
             className="ep-input text-ep-sm"
             value={step.kind}
             onChange={(event) =>
-              onUpdate({ kind: event.target.value as ScenarioStepKind, params: {} })
+              onUpdate({ kind: event.target.value as ScenarioStepKind, params: {}, steps: undefined })
             }
             aria-label={`Step ${index} kind`}
           >
-            {(Object.keys(STEP_METADATA) as ScenarioStepKind[]).map((kind) => (
-              <option key={kind} value={kind}>
-                {STEP_METADATA[kind].label}
-              </option>
-            ))}
+            {(Object.keys(STEP_METADATA) as ScenarioStepKind[])
+              .filter((kind) => (depth === 0 ? true : kind !== 'REPEAT' || canNestFurther))
+              .map((kind) => (
+                <option key={kind} value={kind}>
+                  {STEP_METADATA[kind].label}
+                </option>
+              ))}
           </select>
           <span className="ep-badge">{meta.family}</span>
         </div>
@@ -81,8 +123,83 @@ export function StepEditor({
             Unused parameter: <code className="mono">{key}</code>
           </p>
         ))}
+
+      {isRepeat && (
+        <section
+          className="border-l-2 border-primary/40 pl-3 ml-1 flex flex-col gap-2"
+          data-testid={`repeat-body-${step.id}`}
+        >
+          <header className="flex items-center justify-between gap-2">
+            <p className="text-ep-xs uppercase tracking-wider text-text-secondary">
+              Nested steps · depth {depth + 1} / {MAX_REPEAT_NESTING}
+            </p>
+            <div className="flex flex-wrap gap-1" data-testid={`repeat-palette-${step.id}`}>
+              {(Object.keys(STEP_METADATA) as ScenarioStepKind[])
+                .filter((kind) => kind !== 'REPEAT' || canNestFurther)
+                .map((kind) => (
+                  <button
+                    key={kind}
+                    type="button"
+                    className="ep-badge cursor-pointer hover:bg-primary/10"
+                    onClick={() => addNestedStep(kind)}
+                    title={`Add ${STEP_METADATA[kind].label} inside repeat`}
+                    data-testid={`repeat-add-${kind}-${step.id}`}
+                  >
+                    <Plus width={10} height={10} />
+                    {STEP_METADATA[kind].label}
+                  </button>
+                ))}
+            </div>
+          </header>
+          {!canNestFurther && (
+            <p className="text-ep-xs text-warning flex items-start gap-1">
+              <AlertTriangle width={11} height={11} className="mt-0.5 shrink-0" />
+              REPEAT nesting cap reached (MAX_REPEAT_NESTING = {MAX_REPEAT_NESTING}). Deeper trees are refused by the backend
+              with REPEAT_NESTING_TOO_DEEP.
+            </p>
+          )}
+          {nestedSteps.length === 0 ? (
+            <p className="text-ep-xs text-text-secondary">No nested step yet.</p>
+          ) : (
+            <ol className="flex flex-col gap-2">
+              {nestedSteps.map((child, childIndex) => (
+                <li
+                  key={child.id}
+                  className="border border-border rounded-md"
+                  data-testid={`nested-step-row-${child.id}`}
+                >
+                  <StepEditor
+                    index={childIndex + 1}
+                    step={child}
+                    depth={depth + 1}
+                    onUpdate={(patch) => updateNestedStep(child.id, patch)}
+                    onParam={(key, value) => updateNestedParam(child.id, key, value)}
+                    actions={
+                      <button
+                        type="button"
+                        className="ep-button ep-button-sm ep-button-danger"
+                        onClick={() => removeNestedStep(child.id)}
+                        aria-label="Remove nested step"
+                        data-testid={`nested-step-remove-${child.id}`}
+                      >
+                        <Trash2 width={13} height={13} />
+                      </button>
+                    }
+                  />
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+      )}
     </article>
   );
+}
+
+function removeKey<T extends object>(object: T, key: keyof T): T {
+  const next = { ...object };
+  delete next[key];
+  return next;
 }
 
 function ParamEditor({

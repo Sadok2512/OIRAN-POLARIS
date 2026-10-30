@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.3.0 — 2026-10-28 (minor)
+
+Zero-mock pass: audit, hardening, and live-screenshot witness against the
+production OIRAN backend at `https://151.242.147.49:8020`.
+
+### Added
+
+- `scripts/check-dist-leaks.mjs` — a build-time guard that fails the
+  `npm run build` pipeline if any of the fixture markers
+  (`oiran-vprobe-local-01`, `oiran-lab-ueransim-gnb-1`, `probe-dc01.corp`,
+  `edge-rack-03`, `OIRAN_5G_PDU_SESSION_DATA_V1`) ends up inside `dist/`.
+  Confirmed clean on first run after the fixes.
+- `src/data/probeState.ts` + 10 unit tests: translate the backend
+  `probe_state` / `online` / `last_heartbeat_epoch_s` triplet into the
+  honest `PENDING | ONLINE | DEGRADED` vocabulary used by the UI. A
+  probe is never surfaced as ONLINE without a real heartbeat; the
+  legacy wire value `PROBE_ONLINE` is still accepted.
+- `scripts/capture-screenshots-live.py` and `docs/screenshots-live/*.png`
+  (10 PNGs, light + dark, Overview/Probes/Interfaces/Live-captures/
+  Capture-library). The script routes every `/api/v1/*` call to the
+  production host through Playwright; no fixture is injected and the
+  rendered values are the backend's own payload.
+- `docs/screenshots-live/README.md` explaining the live source.
+
+### Changed
+
+- `RegisterProbeDialog` placeholders no longer resemble fixture
+  hostnames (`oiran-lab-ueransim-gnb-1`, `probe-dc01.corp`). The
+  dialog now suggests `namespace.container.local` and
+  `hostname.corp.local` so the production bundle carries no
+  fixture-shaped strings.
+- `CaptureLibrary` download button is now backend-driven: it respects
+  `capture.download_available` and `capture.download_reason`. When
+  the backend blocks the download (currently `403 OPERATOR_REQUIRED`
+  on anonymous calls), the tooltip repeats the backend's own reason;
+  the page banner only appears when NOTHING on the current page is
+  downloadable, so unlocked captures surface the per-row state.
+- `CaptureLibrary` sort accessors stop defaulting unknown counters
+  to `0`. `sortUndefined: 'last'` sinks unknown rows to the bottom
+  instead of showing a fabricated zero at the top.
+- `ProbeInspector` renders `formatHeartbeat(probe.last_heartbeat_epoch_s)`
+  ("Awaiting heartbeat" when null) and the normalised lifecycle badge
+  via `probeLifecycle()` + `probeLifecycleTone()`.
+- `Probes` + `ProbeInspector` prefer `interface.role` from the backend
+  registry over the deterministic protocol-based inference. The
+  deterministic mapping stays as a fallback only when the backend
+  does not declare a role.
+- `@shared/types` carries the new fields: `Probe.last_heartbeat_epoch_s`
+  typed `number | null`, `Probe.probe_state`, `CaptureInterface.role`,
+  `Capture.download_available`, `Capture.download_reason`.
+
+### Validation (manual, no CI)
+
+- `npm run typecheck` → clean
+- `npm test` → Test Files 10 passed · Tests 101 passed
+- `npm run build` → `dist/assets/index-BTEyCCim.js 337.57 kB │ gzip: 99.76 kB`
+  (check-dist-leaks: clean, 3 files scanned, 5 markers)
+
+### Live verification (GET only against 151.242.147.49:8020)
+
+| Screen | Route | HTTP | items |
+|---|---|---|---|
+| Overview + Probes | `GET /api/v1/probes` | 200 | 1 |
+| Probes detail | `GET /api/v1/probes/oiran-vprobe-local-01` | 200 | (object) |
+| Probes · interfaces | `GET /api/v1/probes/oiran-vprobe-local-01/interfaces` | 200 | (array) |
+| Interfaces | `GET /api/v1/interfaces` | 200 | 4 |
+| Capture Library | `GET /api/v1/captures` | 200 | 20937 B body |
+| Capture groups | `GET /api/v1/capture-groups` | 200 | 18702 B body |
+| Live Captures · disk | `GET /api/v1/storage/safety` | 200 | (object) |
+| Overview · metrics | `GET /api/v1/metrics` | 200 | (object) |
+| Header · auth | `GET /api/v1/auth/me` | 200 | (object) |
+| Download gate | `GET /api/v1/captures/sha256:aa/download` | 403 | `{"error":{"code":"OPERATOR_REQUIRED"}}` |
+
 ## 0.2.2 — 2026-10-28 (patch)
 
 Review feedback on 0.2.1: `STARTING` / `STOPPING` captures were being counted

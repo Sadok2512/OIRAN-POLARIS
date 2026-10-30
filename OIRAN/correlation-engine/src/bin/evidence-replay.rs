@@ -17,7 +17,7 @@ fn run() -> Result<(), String> {
         return Err("usage: evidence-replay EVENTS OUTPUT".into());
     }
     let events = load_path(&input)?;
-    let discovery = discover_sessions(events.clone());
+    let discovery = discover_sessions(&mut events.clone());
     let edges = correlate_cross_interface_evidence(&events);
     let value = serde_json::json!({
         "source_events": events.len(),

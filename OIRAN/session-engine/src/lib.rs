@@ -555,9 +555,9 @@ pub fn reconstruct(mut events: Vec<EventRecord>, hints: ReconstructionHints) -> 
 /// Discovers independently scoped UE, PDU, PFCP and GTP-U state without assuming
 /// a single subscriber or a single PDU session. The function is deterministic and
 /// side-effect free so repeated ingestion of the same observations is idempotent.
-pub fn discover_sessions(mut events: Vec<EventRecord>) -> DiscoveryResult {
-    deterministic_sort(&mut events);
-    let duplicate_observations = duplicate_observation_keys(&events);
+pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
+    deterministic_sort(events);
+    let duplicate_observations = duplicate_observation_keys(events);
     let mut seen = HashSet::new();
     events.retain(|event| seen.insert(observation_key(event)));
 
@@ -733,7 +733,7 @@ pub fn discover_sessions(mut events: Vec<EventRecord>) -> DiscoveryResult {
     let assigned: HashSet<_> = event_context.keys().cloned().collect();
     let mut background_event_ids = Vec::new();
     let mut unmatched_event_ids = Vec::new();
-    for event in &events {
+    for event in events.iter() {
         if assigned.contains(&event.event_id)
             || pfcp_sessions
                 .iter()
@@ -1010,7 +1010,7 @@ fn discover_pfcp_sessions(events: &[EventRecord]) -> Vec<DiscoveredPfcpSession> 
     sessions
         .into_iter()
         .map(|session| {
-            let events = session.events;
+            let mut events = session.events;
             let state = if events
                 .iter()
                 .any(|event| event.message_name.contains("Deletion Response"))
@@ -1255,7 +1255,7 @@ mod tests {
 
     #[test]
     fn reconstructs_ue_and_pdu_context() {
-        let events = vec![event(
+        let mut events = vec![event(
             "n",
             "NGAP",
             "PDUSessionResourceSetupResponse",
@@ -1279,7 +1279,7 @@ mod tests {
 
     #[test]
     fn reconstructs_pfcp_session() {
-        let events = vec![event(
+        let mut events = vec![event(
             "p",
             "PFCP",
             "PFCP Session Establishment Response",
@@ -1349,7 +1349,7 @@ mod tests {
             &[("ran_ue_ngap_id", "11"), ("amf_ue_ngap_id", "101")],
             98,
         );
-        let result = discover_sessions(vec![parent, unrelated, child]);
+        let result = discover_sessions(&mut vec![parent, unrelated, child]);
         assert_eq!(result.ue_contexts.len(), 2);
         assert_eq!(result.pdu_sessions.len(), 1);
         let session = &result.pdu_sessions[0];
@@ -1364,7 +1364,7 @@ mod tests {
 
     #[test]
     fn discovers_multiple_ues_and_multiple_pdu_sessions() {
-        let events = vec![
+        let mut events = vec![
             event(
                 "ue-a-1",
                 "NGAP",
@@ -1406,7 +1406,7 @@ mod tests {
                 4,
             ),
         ];
-        let result = discover_sessions(events);
+        let result = discover_sessions(&mut events);
         assert_eq!(result.ue_contexts.len(), 2);
         assert_eq!(result.pdu_sessions.len(), 3);
         assert_eq!(
@@ -1429,7 +1429,7 @@ mod tests {
 
     #[test]
     fn identifier_reuse_after_release_creates_new_lifecycle() {
-        let events = vec![
+        let mut events = vec![
             event(
                 "first",
                 "NGAP",
@@ -1452,7 +1452,7 @@ mod tests {
                 3,
             ),
         ];
-        let result = discover_sessions(events);
+        let result = discover_sessions(&mut events);
         assert_eq!(result.ue_contexts.len(), 2);
         assert_eq!(
             result
@@ -1477,8 +1477,8 @@ mod tests {
             ],
             1,
         );
-        let first = discover_sessions(vec![original.clone(), original.clone()]);
-        let second = discover_sessions(vec![original]);
+        let first = discover_sessions(&mut vec![original.clone(), original.clone()]);
+        let second = discover_sessions(&mut vec![original]);
         assert_eq!(first.duplicate_observations.len(), 1);
         assert_eq!(first.pdu_sessions.len(), 1);
         assert_eq!(
@@ -1512,8 +1512,8 @@ mod tests {
             ],
             2,
         );
-        let a = discover_sessions(vec![second.clone(), first.clone()]);
-        let b = discover_sessions(vec![first, second]);
+        let a = discover_sessions(&mut vec![second.clone(), first.clone()]);
+        let b = discover_sessions(&mut vec![first, second]);
         assert_eq!(a.pdu_sessions[0].session_id, b.pdu_sessions[0].session_id);
         assert_eq!(a.pdu_sessions[0].event_ids, b.pdu_sessions[0].event_ids);
     }
@@ -1559,7 +1559,7 @@ mod tests {
             ],
             20,
         ));
-        let result = discover_sessions(events);
+        let result = discover_sessions(&mut events);
         assert_eq!(result.ue_contexts.len(), 5);
         assert_eq!(result.pdu_sessions.len(), 6);
         assert_eq!(
@@ -1665,7 +1665,7 @@ mod tests {
             events.push(gtpu);
         }
 
-        let result = discover_sessions(events);
+        let result = discover_sessions(&mut events);
         assert_eq!(result.ue_contexts.len(), 3);
         assert_eq!(result.pdu_sessions.len(), 3);
         assert_eq!(result.pfcp_sessions.len(), 3);
@@ -1698,7 +1698,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl");
-        let result = discover_sessions(load_path(&path).unwrap());
+        let result = discover_sessions(&mut load_path(&path).unwrap());
         assert_eq!(result.event_accounting["source_events"], 54);
         assert_eq!(result.ue_contexts.len(), 2);
         assert_eq!(result.pdu_sessions.len(), 1);

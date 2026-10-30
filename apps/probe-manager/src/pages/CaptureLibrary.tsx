@@ -24,10 +24,13 @@ import {
 import { bytes, count, durationSeconds, isoToLocal } from '@/data/format';
 import type { Capture } from '@shared/types';
 
-// Download is locked in this build: GET /captures/:id/download is not registered
-// on the OIRAN API router (grep '/download' OIRAN/apps/api/src/lib.rs → 0 match).
-// The button stays visible to make the gap explicit; nothing is fetched.
-const DOWNLOAD_LOCKED_REASON = 'GET /captures/:id/download = 404 (route not registered on OIRAN API).';
+// Download is driven by the backend. Each `Capture` carries
+// `download_available: boolean` and `download_reason: string | null`. When
+// available is false, we lock the button and surface the backend's reason
+// verbatim. When the backend doesn't send those fields yet, we default to
+// locked with a conservative reason — never to "download works".
+const DOWNLOAD_FALLBACK_REASON =
+  'Download gate not reported by backend. Request stays blocked until the backend declares its policy.';
 
 const STATUS_OPTIONS: Capture['state'][] = [
   'READY',
@@ -150,8 +153,12 @@ export function CaptureLibraryPage({
       {
         id: 'packet_count',
         header: 'Packets',
+        // Return `undefined` (not `?? 0`) when neither field is reported.
+        // TanStack sorts `undefined` last, so unknown counters sink to the
+        // bottom instead of showing a fabricated zero at the top.
         accessorFn: (capture) =>
-          capture.packet_count ?? capture.metrics?.packets_received ?? 0,
+          capture.packet_count ?? capture.metrics?.packets_received,
+        sortUndefined: 'last',
         cell: ({ row }) => (
           <span className="num">
             {count(
@@ -165,7 +172,8 @@ export function CaptureLibraryPage({
         id: 'size',
         header: 'Size',
         accessorFn: (capture) =>
-          capture.size_bytes ?? capture.metrics?.storage_bytes ?? 0,
+          capture.size_bytes ?? capture.metrics?.storage_bytes,
+        sortUndefined: 'last',
         cell: ({ row }) => (
           <span className="num">
             {bytes(
@@ -177,9 +185,12 @@ export function CaptureLibraryPage({
       {
         accessorKey: 'state',
         header: 'Status',
-        cell: ({ row }) => (
-          <StatusIndicator state={row.original.state ?? 'UNKNOWN'} />
-        ),
+        cell: ({ row }) =>
+          row.original.state ? (
+            <StatusIndicator state={row.original.state} />
+          ) : (
+            <span className="text-ep-xs text-text-secondary">—</span>
+          ),
       },
       {
         id: 'dataset',
@@ -234,17 +245,41 @@ export function CaptureLibraryPage({
               >
                 Analyzer
               </a>
-              <button
-                type="button"
-                className="ep-button ep-button-sm"
-                disabled
-                aria-disabled="true"
-                title={DOWNLOAD_LOCKED_REASON}
-                data-testid={`download-${capture.capture_id}`}
-                aria-label={`Download locked for ${capture.name}`}
-              >
-                <Lock width={13} height={13} aria-hidden="true" />
-              </button>
+              {(() => {
+                // Honest rule: the Download button is locked unless the
+                // backend explicitly says `download_available: true` AND
+                // the capture carries a `size_bytes > 0`. The tooltip
+                // repeats whatever `download_reason` the backend sent;
+                // if the backend didn't declare the gate at all, we fall
+                // back to a conservative locked state (never implicit "ok").
+                const sizeBytes =
+                  capture.size_bytes ?? capture.metrics?.storage_bytes ?? null;
+                const sizeKnown = typeof sizeBytes === 'number' && sizeBytes > 0;
+                const backendAllows = capture.download_available === true;
+                const unlocked = backendAllows && sizeKnown;
+                const title = backendAllows
+                  ? sizeKnown
+                    ? 'Download PCAP (opens through the backend; Bearer in header, not URL).'
+                    : 'Capture has no stored bytes — nothing to download.'
+                  : capture.download_reason ?? DOWNLOAD_FALLBACK_REASON;
+                return (
+                  <button
+                    type="button"
+                    className="ep-button ep-button-sm"
+                    disabled={!unlocked}
+                    aria-disabled={!unlocked}
+                    title={title}
+                    data-testid={`download-${capture.capture_id}`}
+                    aria-label={
+                      unlocked
+                        ? `Download PCAP for ${capture.name}`
+                        : `Download locked for ${capture.name}`
+                    }
+                  >
+                    <Lock width={13} height={13} aria-hidden="true" />
+                  </button>
+                );
+              })()}
               {failed && (
                 <span
                   className="ep-badge border-error/40 text-error"
@@ -301,17 +336,37 @@ export function CaptureLibraryPage({
         }
       />
 
-      <div
-        role="status"
-        aria-live="polite"
-        className="ep-card border-warning/30 p-3 mb-3 flex items-start gap-2 text-ep-sm"
-        data-testid="download-locked-banner"
-      >
-        <Lock width={13} height={13} className="text-warning mt-0.5 shrink-0" aria-hidden="true" />
-        <span>
-          PCAP download is disabled across the library: {DOWNLOAD_LOCKED_REASON}
-        </span>
-      </div>
+      {/*
+        Banner renders when NOTHING on the current page is downloadable —
+        i.e. every capture is either explicitly `download_available: false`
+        or did not declare the gate at all. If at least one capture is
+        unlocked we omit the global banner so the per-row tooltip remains
+        the source of truth.
+      */}
+      {pageItems.length > 0 &&
+        pageItems.every((capture) => capture.download_available !== true) && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="ep-card border-warning/30 p-3 mb-3 flex items-start gap-2 text-ep-sm"
+            data-testid="download-locked-banner"
+          >
+            <Lock
+              width={13}
+              height={13}
+              className="text-warning mt-0.5 shrink-0"
+              aria-hidden="true"
+            />
+            <span>
+              PCAP download is disabled for every capture on this page.
+              Reason reported by the backend:{' '}
+              <code className="mono">
+                {pageItems.find((capture) => capture.download_reason)
+                  ?.download_reason ?? DOWNLOAD_FALLBACK_REASON}
+              </code>
+            </span>
+          </div>
+        )}
 
       <div
         className="ep-card p-3 flex flex-wrap items-center gap-2 mb-4"

@@ -33,8 +33,8 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.4.0";
-pub const PLATFORM_VERSION: &str = "2.4.0-dev";
+pub const API_VERSION: &str = "2.5.0";
+pub const PLATFORM_VERSION: &str = "2.5.0";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -224,7 +224,7 @@ impl AppState {
             }
         }
         let events = load_path(&dataset_dir.join("oiran_events.jsonl"))?;
-        let discovery = discover_sessions(events.clone());
+        let discovery = discover_sessions(&mut events.clone());
         for session in &discovery.pdu_sessions {
             let represented = flows.values().any(|flow| {
                 session

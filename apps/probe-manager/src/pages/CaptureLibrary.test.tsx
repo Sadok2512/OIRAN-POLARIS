@@ -229,21 +229,21 @@ describe('Capture Library — actions (PR #2 Section 5)', () => {
     expect(download).toBeDisabled();
   });
 
-  it('keeps Download locked even for an authenticated operator (GET /captures/:id/download = 404)', async () => {
+  it('keeps Download locked when the backend reports download_available=false', async () => {
+    // 0.3.0 — the lock is now backend-driven. The stub returns
+    // download_available: false (default), which must keep the button
+    // disabled and surface the backend's own reason in the tooltip.
     stubBackend({ authenticated: true });
     render(renderWithProviders(<CaptureLibraryPage />));
     await waitFor(() => {
       const download = screen.getByTestId('download-sha256:aa');
-      // The route is not registered on the OIRAN API (grep '/download'
-      // OIRAN/apps/api/src/lib.rs → 0 match). The UI never fabricates a
-      // success — the button stays disabled regardless of role, and the
-      // page-level banner names the reason.
       expect(download.tagName).toBe('BUTTON');
       expect(download).toBeDisabled();
-      expect(download).toHaveAttribute('title', expect.stringMatching(/404/));
+      // Title must mention the backend gate, never a fabricated success.
+      expect(download.getAttribute('title')).toMatch(/download|policy|gate/i);
     });
     expect(screen.getByTestId('download-locked-banner').textContent).toMatch(
-      /GET \/captures\/:id\/download = 404/,
+      /PCAP download is disabled/i,
     );
   });
 
@@ -336,7 +336,7 @@ describe('Capture Library — PCAP download locked (LOT 1 · 0.2.0)', () => {
       expect(screen.getByTestId('download-locked-banner')).toBeInTheDocument(),
     );
     expect(screen.getByTestId('download-locked-banner').textContent).toMatch(
-      /GET \/captures\/:id\/download = 404/,
+      /PCAP download is disabled/i,
     );
   });
 });

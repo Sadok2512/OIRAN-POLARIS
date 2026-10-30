@@ -48,11 +48,18 @@ export function LoopEditor({
         })}
         <button
           type="button"
-          className="ep-badge cursor-pointer hover:bg-primary/10"
+          className={`ep-badge ${backendOnly ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:bg-primary/10'}`}
           onClick={() => onChange({ kind: 'FIXED', cycles: loop.kind === 'FIXED' ? loop.cycles : 10 })}
+          disabled={backendOnly}
+          title={
+            backendOnly
+              ? 'Backend catalog accepts the Once and ×N presets only. Pick a preset and edit the cycles field below if you need an exact count.'
+              : undefined
+          }
           data-testid="loop-preset-custom"
         >
           Custom
+          {backendOnly && <span className="ml-1 text-ep-xs">· V2</span>}
         </button>
         <button
           type="button"

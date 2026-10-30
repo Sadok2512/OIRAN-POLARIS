@@ -46,7 +46,18 @@ export interface Probe {
   connected_interfaces: string[];
   capture_state: string;
   last_heartbeat?: string | null;
-  last_heartbeat_epoch_s?: number;
+  /**
+   * Backend heartbeat as epoch seconds. `null` means the backend has never
+   * observed a real signal (new probe, PENDING state). The UI must render
+   * "—" or "Awaiting heartbeat" in that case — never a fabricated now().
+   */
+  last_heartbeat_epoch_s?: number | null;
+  /**
+   * Lifecycle state as reported by the backend. The new vocabulary is
+   * `PENDING | ONLINE | DEGRADED`; the legacy string `PROBE_ONLINE` is
+   * still accepted so the UI keeps rendering while Codex migrates.
+   */
+  probe_state?: string;
   packet_rate_pps: number | null;
   decode_rate_eps: number | null;
   packet_drops: number | null;
@@ -58,6 +69,9 @@ export interface Probe {
   distributed: boolean;
   capture_control_available?: boolean;
 }
+
+/** 3GPP interface role when the backend registry carries one. */
+export type InterfaceRole = 'N2' | 'N3' | 'N4' | 'S1' | 'N6';
 
 export interface CaptureInterface {
   interface: string;
@@ -72,6 +86,12 @@ export interface CaptureInterface {
   capture_start: string | null;
   capture_end: string | null;
   live_capture_available: boolean;
+  /**
+   * N2/N3/N4/S1/N6 as returned by the backend registry when the probe
+   * was declared with that role. `null` means the backend has no
+   * declaration for this interface; the UI must render "—", NOT guess.
+   */
+  role?: InterfaceRole | null;
 }
 
 export interface CapturePlaneStatus {
@@ -123,6 +143,15 @@ export interface Capture {
   capture_group_id?: string | null;
   scenario_id?: string | null;
   planes?: CapturePlaneStatus[];
+  /**
+   * Backend-controlled gate: when false, the frontend MUST keep the
+   * Download button locked and surface `download_reason` as the title.
+   * The current backend answers 403 `OPERATOR_REQUIRED` to anonymous
+   * calls on `/captures/:id/download`; when the identity-slice contract
+   * ships (Codex), 403 `DOWNLOAD_POLICY_PENDING` will take over.
+   */
+  download_available?: boolean;
+  download_reason?: string | null;
 }
 
 export interface DiskSafety {

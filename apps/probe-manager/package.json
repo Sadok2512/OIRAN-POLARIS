@@ -1,12 +1,12 @@
 {
   "name": "@telecom/probe-manager",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "OIRAN Probe Manager — telecom network topology, probes, interfaces, live captures, capture library.",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 4310",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/check-dist-leaks.mjs",
     "typecheck": "tsc -b --pretty false",
     "preview": "vite preview --host 127.0.0.1 --port 4310",
     "test": "vitest run",

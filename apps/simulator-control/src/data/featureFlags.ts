@@ -27,11 +27,44 @@ export interface FeatureFlags {
    * stored in the browser. When false, polaris.ueProfiles.v1 stays authoritative.
    */
   profileBackend: boolean;
+  /**
+   * 0.5.0 — When true, the UI calls the new scenario templates surface:
+   *   GET  /scenario-definitions                     (tpl-* appear in the list)
+   *   GET  /scenario-definitions/:id/estimate        → { duration_ms }
+   *   GET  /scenario-definitions/:id/export          → attachment JSON v2
+   *   POST /scenario-definitions/import              operator + CSRF
+   * When false, the Templates tab shows a "Backend pending" placeholder
+   * and no network call is issued. Default OFF until Codex pushes
+   * `feat/polaris-traffic-templates`.
+   */
+  scenarioTemplates: boolean;
+  /**
+   * 0.6.0 — When true, the UI calls the richer provisioning surface
+   * published by Codex on `feat/polaris-provisioning`:
+   *   GET  /owners                                   → owner directory
+   *   GET  /plmns                                    → allowed PLMNs
+   *   GET  /dnns                                     → allowed DNNs
+   *   POST /provisioning/import  (CSV, up to 100k rows)
+   *   POST /ue-profiles/import   (CSV, up to 100k rows)
+   *   GET  /ue-profiles/:ue_id                       → detail card body
+   * When false, the Provisioning page shows "Backend pending" and
+   * dropdowns fall back to free-text + warning text. profileBackend is
+   * also forced ON (local UE form path becomes unreachable from the UI).
+   * Default OFF until the backend branch is deployed.
+   */
+  polarisProvisioning: boolean;
 }
 
+// 0.5.1 — `scenarioBackend` defaults to ON so the honest Scenario Builder
+// (certified-only palette + fixed-loop presets) is what the operator sees
+// out of the box. Operators who want to draft against the local catalog
+// toggle the flag off in Settings; the UI then clearly labels this as
+// "offline draft" and reminds them that nothing will reach the backend.
 const DEFAULTS: FeatureFlags = {
-  scenarioBackend: false,
+  scenarioBackend: true,
   profileBackend: false,
+  scenarioTemplates: false,
+  polarisProvisioning: false,
 };
 
 function read(): FeatureFlags {

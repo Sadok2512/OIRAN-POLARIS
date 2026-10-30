@@ -178,7 +178,7 @@ export function RegisterProbeDialog({
                 className="ep-input mono"
                 value={host}
                 onChange={(event) => setHost(event.target.value)}
-                placeholder={kind === 'vprobe' ? 'oiran-lab-ueransim-gnb-1' : 'probe-dc01.corp'}
+                placeholder={kind === 'vprobe' ? 'namespace.container.local' : 'hostname.corp.local'}
                 data-testid="register-probe-host"
               />
             </Field>
