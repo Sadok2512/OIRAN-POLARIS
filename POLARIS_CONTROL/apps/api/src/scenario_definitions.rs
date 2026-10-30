@@ -575,6 +575,12 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
             created_at_epoch_s: now,
             updated_at_epoch_s: now,
         },
+        // 0.19.2 — Small traffic now interleaves a 1 MiB SHA-256
+        // transfer_verify BEFORE each iperf3 burst. The verify step
+        // proves end-to-end integrity (sender/receiver sha256 match)
+        // on the exact direction about to run; a mismatch stops the
+        // scenario with sha256-KO rather than letting iperf3 report
+        // "all good" over a broken path.
         ScenarioDefinition {
             id: "tpl-small-traffic".into(),
             name: "Small traffic".into(),
@@ -586,8 +592,16 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
                 repeat(
                     10,
                     vec![
+                        step(
+                            "transfer_verify",
+                            BTreeMap::from([("direction".into(), fixed("dl"))]),
+                        ),
                         step("traffic_dl", p(&[("bytes", 10 * 1024 * 1024)])),
                         step("wait", p(&[("duration_ms", 20_000)])),
+                        step(
+                            "transfer_verify",
+                            BTreeMap::from([("direction".into(), fixed("ul"))]),
+                        ),
                         step("traffic_ul", p(&[("bytes", 1024 * 1024)])),
                         step("idle", p(&[("duration_ms", 20_000)])),
                     ],

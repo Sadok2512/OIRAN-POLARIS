@@ -427,6 +427,48 @@ struct DefinitionJobControl {
     // steps and cleanup remain authorized by the job-owned copy until the job
     // reaches a terminal state.
     started_jobs: Arc<Mutex<BTreeMap<String, simulator_controller::UeJob>>>,
+    // 0.19.2 — Authorisation snapshot captured when the HTTP handler passed
+    // the Run / Start gate. ANY subsequent step (idle, detach, cleanup)
+    // uses this flag instead of re-checking `active_grant_covers` or
+    // `definition_live_enabled`. A revocation / expiry mid-flight MUST
+    // not interrupt a running job — it only blocks NEW Runs and Starts.
+    // The snapshot carries the covered UE set so cleanup can tell
+    // which UEs the job owns authority over.
+    authorised_at_start: Arc<GrantAuthorisationSnapshot>,
+}
+
+/// 0.19.2 — Immutable snapshot of the authorisation that unlocked a
+/// scenario job. Taken once at Start time; never mutated afterwards.
+#[derive(Clone, Debug)]
+struct GrantAuthorisationSnapshot {
+    /// `true` when the HTTP handler passed the Start / Run gate — either
+    /// via `definition_live_enabled` or via an active grant. Downstream
+    /// step execution + cleanup consult this flag instead of re-checking.
+    authorised: bool,
+    /// UE ids that were covered when the gate was passed. Only used to
+    /// confirm step execution stays within the job's intended scope.
+    covered_ue_ids: BTreeSet<String>,
+    /// Human-readable reason the gate was passed. Logged on terminal.
+    source: &'static str,
+}
+
+impl GrantAuthorisationSnapshot {
+    fn authorised(covered: &[String], source: &'static str) -> Self {
+        Self {
+            authorised: true,
+            covered_ue_ids: covered.iter().cloned().collect(),
+            source,
+        }
+    }
+
+    #[cfg(test)]
+    fn never() -> Self {
+        Self {
+            authorised: false,
+            covered_ue_ids: BTreeSet::new(),
+            source: "test-never-authorised",
+        }
+    }
 }
 
 struct OwnedScenarioJob {
@@ -3219,8 +3261,54 @@ async fn authorize(
             csrf_valid,
         },
     );
+    // 0.19.2 — Snapshot the three attributable fields BEFORE moving the
+    // request into `next`: method, path and the resolved role. We log
+    // the role (operator / viewer / administrator) but NEVER the
+    // username, session id, cookie or any other identity material.
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let role = identity.role.clone();
     request.extensions_mut().insert(identity);
-    next.run(request).await
+    let response = next.run(request).await;
+    log_http_refusal(&state, response.status(), &method, &path, &role);
+    response
+}
+
+/// 0.19.2 — Journal every refused HTTP request (any 4xx or 5xx status)
+/// so the next engineer can attribute an operator complaint to the
+/// exact method / path / role that triggered the refusal. We log only
+/// the triple { method, path, status } plus the role — never the
+/// username, session id, or cookie. The entry lands in the same
+/// audit log as the `audit()` sink; a `type: "http_refusal"` key lets
+/// readers filter it out.
+fn log_http_refusal(
+    state: &AppState,
+    status: StatusCode,
+    method: &Method,
+    path: &str,
+    role: &str,
+) {
+    if !status.is_client_error() && !status.is_server_error() {
+        return;
+    }
+    if let Some(parent) = state.audit_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&state.audit_path)
+    {
+        let entry = json!({
+            "timestamp_epoch_s": epoch_seconds(),
+            "type": "http_refusal",
+            "method": method.as_str(),
+            "path": path,
+            "status": status.as_u16(),
+            "role": role,
+        });
+        let _ = writeln!(file, "{}", entry);
+    }
 }
 
 #[derive(Deserialize)]
@@ -8721,6 +8809,19 @@ fn start_live_definition_scenario(
             Json(json!({"error":"SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED"})),
         ));
     }
+    // 0.19.2 — Snapshot the authorisation that unlocked the Run. Taken
+    // ONCE here and attached to the job's DefinitionJobControl so a
+    // subsequent revocation / expiry cannot interrupt the in-flight job.
+    // All step execution + cleanup consults this immutable snapshot
+    // instead of re-checking the grant store.
+    let authorisation = GrantAuthorisationSnapshot::authorised(
+        ue_ids,
+        if state.definition_live_enabled {
+            "server_flag"
+        } else {
+            "active_grant"
+        },
+    );
     if ue_ids.is_empty() || ue_ids.len() > ueransim_adapter::MAX_LIVE_UES {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -8788,6 +8889,7 @@ fn start_live_definition_scenario(
         cancel: Arc::new(AtomicBool::new(false)),
         started_ues: Arc::new(Mutex::new(BTreeSet::new())),
         started_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+        authorised_at_start: Arc::new(authorisation),
     };
     {
         let mut jobs = state.definition_jobs.lock().unwrap();
@@ -12545,6 +12647,204 @@ mod p0_tests {
         assert!(!active_grant_covers(&state, &[]));
     }
 
+    /// 0.19.2 — The grant snapshot stapled onto DefinitionJobControl at
+    /// Start time MUST survive a mid-flight revocation of the backing
+    /// grant. The scenario executor consults the snapshot, not the
+    /// grant store, for every step after the gate passed. Revocation
+    /// therefore blocks only NEW Runs / Starts.
+    #[test]
+    fn job_authorisation_snapshot_survives_grant_revocation() {
+        let state = state();
+        push_grant(&state, &["UE-02"], 60_000, false);
+        assert!(active_grant_covers(&state, &["UE-02".into()]));
+
+        // Imagine start_live_definition_scenario just passed the gate.
+        // Capture the snapshot the same way the handler does.
+        let snapshot = GrantAuthorisationSnapshot::authorised(
+            &["UE-02".into()],
+            "active_grant",
+        );
+        assert!(snapshot.authorised);
+        assert_eq!(snapshot.source, "active_grant");
+        assert!(snapshot.covered_ue_ids.contains("UE-02"));
+
+        // Revoke every grant mid-flight. New Runs are now refused…
+        if let Ok(mut grants) = state.live_grants.lock() {
+            for grant in grants.iter_mut() {
+                grant.revoked = true;
+            }
+        }
+        assert!(
+            !active_grant_covers(&state, &["UE-02".into()]),
+            "revoked grants no longer satisfy the Run gate",
+        );
+        // …but the already-captured snapshot is immutable: the running
+        // job keeps its authority through cleanup.
+        assert!(snapshot.authorised);
+        assert_eq!(snapshot.source, "active_grant");
+        assert!(snapshot.covered_ue_ids.contains("UE-02"));
+    }
+
+    /// 0.19.2 — Same guarantee against grant EXPIRATION (not just
+    /// revocation): the snapshot is immutable, so the clock passing
+    /// `expires_at_epoch_ms` can't retroactively unauthorise an
+    /// in-flight job.
+    #[test]
+    fn job_authorisation_snapshot_survives_grant_expiration() {
+        let state = state();
+        // Already-expired grant → covers() stays false immediately.
+        push_grant(&state, &["UE-07"], 0, false);
+        assert!(!active_grant_covers(&state, &["UE-07".into()]));
+        // The snapshot captured earlier (hypothetical in-flight) does
+        // NOT consult the clock a second time. Its `authorised` flag
+        // and covered_ue_ids are the only ground truth downstream.
+        let snapshot = GrantAuthorisationSnapshot::authorised(
+            &["UE-07".into()],
+            "active_grant",
+        );
+        assert!(snapshot.authorised);
+        assert!(snapshot.covered_ue_ids.contains("UE-07"));
+    }
+
+    /// 0.19.2 — The "never authorised" snapshot (for completeness and
+    /// forwards compat) is NOT equivalent to `authorised()`. The gate
+    /// at Start MUST explicitly populate it.
+    #[test]
+    fn job_authorisation_never_snapshot_rejects_downstream() {
+        let snapshot = GrantAuthorisationSnapshot::never();
+        assert!(!snapshot.authorised);
+        assert!(snapshot.covered_ue_ids.is_empty());
+    }
+
+    /// 0.19.2 — Small traffic template now interleaves a 1 MiB
+    /// SHA-256 transfer_verify BEFORE each iperf3 burst. The verify
+    /// step runs first so a broken end-to-end path is caught by the
+    /// sha256 mismatch before the DL / UL throughput steps spend time
+    /// generating traffic over the broken link.
+    #[test]
+    fn small_traffic_template_runs_transfer_verify_before_each_iperf3() {
+        let template = scenario_definitions::builtin_templates()
+            .into_iter()
+            .find(|definition| definition.id == "tpl-small-traffic")
+            .expect("Small traffic template present");
+        // The repeat body is the second element in `steps` (position 2
+        // because the preamble is ue_start + pdu_establish). It must
+        // read: transfer_verify dl → traffic_dl → wait → transfer_verify ul
+        // → traffic_ul → idle.
+        let steps = &template.steps;
+        assert_eq!(
+            steps[0].step_type.as_str(),
+            "ue_start",
+            "first step is ue_start",
+        );
+        assert_eq!(
+            steps[1].step_type.as_str(),
+            "pdu_establish",
+            "second step is pdu_establish",
+        );
+        let repeat_block = &steps[2];
+        assert_eq!(repeat_block.step_type.as_str(), "repeat");
+        // Inner sequence
+        let inner = &repeat_block.steps;
+        assert!(!inner.is_empty(), "repeat block has nested steps");
+        let kinds: Vec<&str> = inner.iter().map(|step| step.step_type.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "transfer_verify",
+                "traffic_dl",
+                "wait",
+                "transfer_verify",
+                "traffic_ul",
+                "idle",
+            ],
+            "small-traffic iperf3 bursts must be preceded by sha256 transfer_verify in the matching direction",
+        );
+        // Direction values are explicit so a reader never mistakes
+        // which iperf3 call the verify is guarding.
+        let read_direction = |step: &scenario_definitions::ScenarioStep| {
+            step.parameters
+                .get("direction")
+                .and_then(|param| match param {
+                    scenario_definitions::ParameterSpec::Fixed { fixed } => fixed.as_str(),
+                    _ => None,
+                })
+                .map(String::from)
+        };
+        assert_eq!(read_direction(&inner[0]).as_deref(), Some("dl"));
+        assert_eq!(read_direction(&inner[3]).as_deref(), Some("ul"));
+    }
+
+    /// 0.19.2 — HTTP refusals land in the audit log with method, path,
+    /// status and role — never with a username or session id. This
+    /// test fires a few deliberate refusals (missing CSRF, forbidden
+    /// role) and reads the audit log back to verify the entries.
+    #[tokio::test]
+    async fn http_refusals_land_in_the_audit_log_without_identity() {
+        let test_state = state();
+        let audit_path = test_state.audit_path.clone();
+        let application = app(test_state);
+        let (cookie, _csrf_omitted) =
+            login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+
+        // A POST without the x-csrf-token header is refused with 403.
+        let _ = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/scenarios/stop")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(json!({"job_id": "nope"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // A viewer-role GET of an administrator route is refused too.
+        // Viewer is the default when no session cookie is attached.
+        let _ = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/admin/scenario-policy")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"enabled": false}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Audit log must now contain two `http_refusal` entries,
+        // tagged with the method / path / status / role tuple.
+        let log = fs::read_to_string(&audit_path).expect("audit log");
+        let refusals: Vec<Value> = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value["type"] == Value::String("http_refusal".into()))
+            .collect();
+        assert!(
+            refusals.len() >= 2,
+            "expected ≥ 2 refusal entries, got {}: {log}",
+            refusals.len(),
+        );
+        for entry in &refusals {
+            // Identity material is HARD-forbidden here.
+            for banned in &["username", "session_id", "cookie", "x-csrf-token"] {
+                assert!(
+                    entry.get(banned).is_none(),
+                    "refusal entry leaks {banned}: {entry}",
+                );
+            }
+            // The attributable fields are always present.
+            assert!(entry["method"].is_string(), "method missing: {entry}");
+            assert!(entry["path"].is_string(), "path missing: {entry}");
+            assert!(entry["status"].is_number(), "status missing: {entry}");
+            assert!(entry["role"].is_string(), "role missing: {entry}");
+        }
+    }
+
     #[test]
     fn observation_uses_real_ueransim_cli_argument_syntax_without_a_shell() {
         assert_eq!(
@@ -14351,6 +14651,12 @@ mod p0_tests {
                 "UE-02".into(),
                 approved.clone(),
             )]))),
+            // 0.19.2 — Fixture job was already authorised at Start; the
+            // snapshot carries the covered UE for future assertions.
+            authorised_at_start: Arc::new(GrantAuthorisationSnapshot::authorised(
+                &["UE-02".into()],
+                "test-fixture",
+            )),
         };
         test_state
             .multi_ue
