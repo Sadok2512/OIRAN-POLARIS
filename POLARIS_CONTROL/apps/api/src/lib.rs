@@ -749,6 +749,16 @@ fn ue_policy_rule_present(raw: &str, ue_ip: &str) -> bool {
 /// Install the standard UERANSIM source-policy route inside the UE namespace.
 /// The fixed rule is added at most once; `route replace` is idempotent.
 fn ensure_ue_policy_routing(target: &VerifiedTrafficTarget) -> Result<(), String> {
+    // 0.19.4 — Sweep any residual rule for this UE ip BEFORE posting a
+    // new one. Previous sessions can leave a stale `ip rule from
+    // <ue_ip> table 100` entry (crash, Stop whose cleanup warned,
+    // double start). The sweep is idempotent (absent = success,
+    // duplicates all removed) and ignores the "nothing to flush"
+    // family of errors. A real command failure here is NOT fatal —
+    // the subsequent `rule add` either succeeds (the kernel ignored
+    // a benign error) or returns UE_POLICY_RULE_ADD_FAILED, which is
+    // the honest signal to surface.
+    let _ = remove_ue_policy_routing(target);
     let rules = ue_netns_ip(target, &["rule", "show"])?;
     if !rules.status.success() {
         return Err("UE_POLICY_RULE_INSPECTION_FAILED".into());
@@ -791,14 +801,32 @@ fn ensure_ue_policy_routing(target: &VerifiedTrafficTarget) -> Result<(), String
     Ok(())
 }
 
+// 0.19.4 — Fully idempotent policy-routing cleanup.
+//
+//   * rule missing → success, no delete attempted;
+//   * multiple duplicate rules → loop deletes until the probe stops
+//     reporting the source entry (bounded by UE_POLICY_MAX_RULE_SWEEPS
+//     so a buggy backend can't infinite-loop us);
+//   * `ip route flush table 100` empty / missing table → treated as
+//     success (there's nothing to flush and that's exactly the
+//     end-state we wanted);
+//   * ONLY a real command failure (non-matching stderr, broken ip
+//     binary) returns Err(UE_POLICY_ROUTE_REMOVE_FAILED). The caller
+//     turns that error into a non-fatal
+//     UE_POLICY_ROUTE_CLEANUP_WARNING on the Stop path.
+const UE_POLICY_MAX_RULE_SWEEPS: usize = 32;
+
 fn remove_ue_policy_routing(target: &VerifiedTrafficTarget) -> Result<(), String> {
-    let rules = ue_netns_ip(target, &["rule", "show"])?;
-    if !rules.status.success() {
-        return Err("UE_POLICY_RULE_INSPECTION_FAILED".into());
-    }
-    let rules = String::from_utf8_lossy(&rules.stdout);
-    if ue_policy_rule_present(&rules, &target.ue_ip) {
-        let source = format!("{}/32", target.ue_ip);
+    let source = format!("{}/32", target.ue_ip);
+    for _ in 0..UE_POLICY_MAX_RULE_SWEEPS {
+        let probe = ue_netns_ip(target, &["rule", "show"])?;
+        if !probe.status.success() {
+            return Err("UE_POLICY_RULE_INSPECTION_FAILED".into());
+        }
+        let rules_output = String::from_utf8_lossy(&probe.stdout);
+        if !ue_policy_rule_present(&rules_output, &target.ue_ip) {
+            break;
+        }
         let delete = ue_netns_ip(
             target,
             &[
@@ -813,11 +841,32 @@ fn remove_ue_policy_routing(target: &VerifiedTrafficTarget) -> Result<(), String
             ],
         )?;
         if !delete.status.success() {
+            // `ip rule del` with no matching entry prints an error but
+            // the rule is already gone — walk the probe once more and
+            // if the entry really is absent we return Ok. Otherwise
+            // surface the delete failure so the caller can warn.
+            let stderr = String::from_utf8_lossy(&delete.stderr).to_ascii_lowercase();
+            if stderr.contains("no such file")
+                || stderr.contains("no such process")
+                || stderr.contains("rule not found")
+            {
+                continue;
+            }
             return Err("UE_POLICY_RULE_DELETE_FAILED".into());
         }
     }
-    let route = ue_netns_ip(target, &["route", "flush", "table", UE_POLICY_TABLE])?;
-    if !route.status.success() {
+    let flush = ue_netns_ip(target, &["route", "flush", "table", UE_POLICY_TABLE])?;
+    if !flush.status.success() {
+        let stderr = String::from_utf8_lossy(&flush.stderr).to_ascii_lowercase();
+        // Empty / missing table counts as the desired end-state. The
+        // kernel emits different wording across iproute2 versions.
+        if stderr.contains("nothing to flush")
+            || stderr.contains("no such process")
+            || stderr.contains("no such file")
+            || stderr.contains("table does not exist")
+        {
+            return Ok(());
+        }
         return Err("UE_POLICY_ROUTE_REMOVE_FAILED".into());
     }
     Ok(())
@@ -7421,8 +7470,23 @@ fn stop_one_live_inner(
         persist_ue_registry(state, &controller)?;
         return Ok(job);
     }
+    // 0.19.4 — Policy-route cleanup is best-effort on Stop: if the
+    // kernel refuses the delete (stale rule, missing table, duplicate
+    // left behind by a prior crash), we DO NOT abort the Stop. Push
+    // UE_POLICY_ROUTE_CLEANUP_WARNING to the Activity timeline and
+    // continue; the actual stop will finish and the UE will land
+    // STOPPED. The next Start sweeps residual rules before posting a
+    // new one, so one skipped cleanup can't accumulate state forever.
     if let Some(target) = policy_target.as_ref() {
-        state.ue_runtime.remove_policy_routing(target)?;
+        if let Err(error) = state.ue_runtime.remove_policy_routing(target) {
+            record_activity_event(
+                state,
+                ue_id,
+                "UE_POLICY_ROUTE_CLEANUP_WARNING",
+                "WARNING",
+                json!({ "reason": error, "ue_ip": target.ue_ip }),
+            );
+        }
     }
     if let Err(error) = state.ue_runtime.stop(&approved_runtime, &handle) {
         if let Ok(mut controller) = state.multi_ue.lock() {
@@ -8299,7 +8363,16 @@ fn execute_live_definition_step(
                     .any(|job| job.ue_id == *ue_id && job.process_state == "RUNNING");
                 if running {
                     if let Ok(target) = resolve_controller_traffic_target(state, ue_id) {
-                        state.ue_runtime.remove_policy_routing(&target)?;
+                        // 0.19.4 — Best-effort cleanup. See `stop_one_live_inner`.
+                        if let Err(error) = state.ue_runtime.remove_policy_routing(&target) {
+                            record_activity_event(
+                                state,
+                                ue_id,
+                                "UE_POLICY_ROUTE_CLEANUP_WARNING",
+                                "WARNING",
+                                json!({ "reason": error, "ue_ip": target.ue_ip }),
+                            );
+                        }
                     }
                     if let Some(approval) = definition_job_approval(control, ue_id)? {
                         stop_one_live_for_definition(state, ue_id, &approval)?;
@@ -8388,7 +8461,17 @@ fn execute_live_definition_step(
                     .into_iter()
                     .find(|job| job.ue_id == *ue_id)
                     .ok_or("UE_NOT_STARTED")?;
-                state.ue_runtime.remove_policy_routing(&target)?;
+                // 0.19.4 — Best-effort cleanup; a stale route rule
+                // must not block pdu_release.
+                if let Err(error) = state.ue_runtime.remove_policy_routing(&target) {
+                    record_activity_event(
+                        state,
+                        ue_id,
+                        "UE_POLICY_ROUTE_CLEANUP_WARNING",
+                        "WARNING",
+                        json!({ "reason": error, "ue_ip": target.ue_ip }),
+                    );
+                }
                 trace_step_result(
                     state,
                     ue_id,
@@ -8636,7 +8719,20 @@ fn execute_live_definition_step(
                         .find(|job| job.ue_id == *ue_id)
                         .ok_or("UE_NOT_STARTED")?
                 };
-                state.ue_runtime.remove_policy_routing(&target)?;
+                // 0.19.4 — Best-effort cleanup; detach must land
+                // STOPPED even if the stale route rule can't be
+                // deleted (missing table, duplicate from a prior
+                // crash, etc.). We warn on the Activity timeline and
+                // continue to the release + stop flow.
+                if let Err(error) = state.ue_runtime.remove_policy_routing(&target) {
+                    record_activity_event(
+                        state,
+                        ue_id,
+                        "UE_POLICY_ROUTE_CLEANUP_WARNING",
+                        "WARNING",
+                        json!({ "reason": error, "ue_ip": target.ue_ip }),
+                    );
+                }
                 trace_step_result(
                     state,
                     ue_id,
@@ -10356,6 +10452,11 @@ mod p0_tests {
         fail_observation: bool,
         fail_verification: bool,
         fail_stop: bool,
+        // 0.19.4 — Injectable failure for the policy-route cleanup path.
+        // When set, `remove_policy_routing` returns the exact error
+        // string the test wants to observe downstream (defaults to
+        // UE_POLICY_ROUTE_REMOVE_FAILED).
+        fail_policy_route_cleanup: Option<String>,
     }
 
     impl FakeLiveUeRuntime {
@@ -10531,6 +10632,16 @@ mod p0_tests {
         }
 
         fn execute_bounded_udp(&self, _: &VerifiedTrafficTarget) -> Result<(), String> {
+            Ok(())
+        }
+
+        // 0.19.4 — Honour the injected failure so Stop-resilience
+        // tests can prove the cleanup error is swallowed and the UE
+        // still lands STOPPED.
+        fn remove_policy_routing(&self, _: &VerifiedTrafficTarget) -> Result<(), String> {
+            if let Some(reason) = self.fail_policy_route_cleanup.clone() {
+                return Err(reason);
+            }
             Ok(())
         }
     }
@@ -10750,6 +10861,7 @@ mod p0_tests {
                 fail_observation: false,
                 fail_verification: false,
                 fail_stop: false,
+            fail_policy_route_cleanup: None,
             }),
             dl_sender: DlSenderConfig::unavailable(),
             dl_sender_health_override: Some(Err("DL_SENDER_NOT_AVAILABLE".into())),
@@ -12216,6 +12328,7 @@ mod p0_tests {
             fail_observation: false,
             fail_verification: false,
             fail_stop: false,
+            fail_policy_route_cleanup: None,
         });
         let application = app(test_state);
         let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
@@ -12565,6 +12678,106 @@ mod p0_tests {
     /// flipped `execution_mode` away from "live" — otherwise the running
     /// container would leak. The predicate below is the one `stop_ue` and
     /// `stop_ue_group` consult.
+    #[test]
+    /// 0.19.4 — `ue_policy_rule_present` detects the entry regardless
+    /// of the `from` field CIDR notation and the lookup column order
+    /// (iproute2 reshuffles output between versions). The parser is
+    /// the lynchpin of the idempotent cleanup loop.
+    #[test]
+    fn policy_rule_parser_detects_absent_single_and_duplicate_entries() {
+        // Pre-canned shapes mirroring iproute2 `ip rule show` output.
+        let absent = "\
+0:  from all lookup local\n\
+32766:  from all lookup main\n\
+32767:  from all lookup default\n\
+";
+        let present_single = "\
+0:  from all lookup local\n\
+10000:  from 10.46.0.6/32 lookup 100\n\
+32766:  from all lookup main\n\
+";
+        let present_duplicate = "\
+0:  from all lookup local\n\
+10000:  from 10.46.0.6/32 lookup 100\n\
+10000:  from 10.46.0.6/32 lookup 100\n\
+32766:  from all lookup main\n\
+";
+        let bare_ip = "10000:  from 10.46.0.6 lookup 100";
+        assert!(!ue_policy_rule_present(absent, "10.46.0.6"));
+        assert!(ue_policy_rule_present(present_single, "10.46.0.6"));
+        assert!(ue_policy_rule_present(present_duplicate, "10.46.0.6"));
+        assert!(ue_policy_rule_present(bare_ip, "10.46.0.6"));
+        // Different ip must not match.
+        assert!(!ue_policy_rule_present(present_single, "10.46.0.7"));
+    }
+
+    /// 0.19.4 — When the runtime cleanup errors with
+    /// `UE_POLICY_ROUTE_REMOVE_FAILED`, Stop must still land the UE
+    /// in STOPPED, surface a UE_POLICY_ROUTE_CLEANUP_WARNING event on
+    /// the Activity timeline, and return 200 OK (NOT 409 like the
+    /// pre-0.19.4 behaviour reported by Codex).
+    #[tokio::test]
+    async fn stop_lands_the_ue_despite_a_policy_route_cleanup_failure() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        // 0.19.4 — Share the fake's `launched` list so the test can
+        // seed it with the UE id before calling Stop. Without this,
+        // `discover()` returns None and `stop_one_live_inner` takes
+        // the early-exit stop_offline branch, bypassing the policy
+        // cleanup path we want to exercise.
+        let launched = Arc::new(Mutex::new(vec!["UE-02".into()]));
+        test_state.ue_runtime = Arc::new(FakeLiveUeRuntime {
+            stopped: Arc::new(Mutex::new(Vec::new())),
+            launched,
+            fail_observation: false,
+            fail_verification: false,
+            fail_stop: false,
+            fail_policy_route_cleanup: Some("UE_POLICY_ROUTE_REMOVE_FAILED".into()),
+        });
+        prepare_owned_traffic_target(&test_state, "UE-02", /* pdu_active */ true);
+        let activity_events = test_state.activity_events.clone();
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ues/stop")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(json!({"ue_id":"UE-02"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "Stop must land 200 OK even when policy-route cleanup fails",
+        );
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["process_state"],
+            Value::String("STOPPED".into()),
+            "process_state must be STOPPED, got {body}",
+        );
+        // The warning landed on the Activity timeline with the exact
+        // kind the operator can grep for.
+        let events = activity_events.snapshot("UE-02");
+        let warned = events
+            .iter()
+            .any(|event| event.kind == "UE_POLICY_ROUTE_CLEANUP_WARNING");
+        assert!(
+            warned,
+            "Activity timeline must carry UE_POLICY_ROUTE_CLEANUP_WARNING, got {:?}",
+            events,
+        );
+    }
+
     #[test]
     fn ue_has_live_launch_requires_both_approved_runtime_and_process_handle() {
         let state = state();
@@ -13046,6 +13259,7 @@ mod p0_tests {
             fail_observation: true,
             fail_verification: false,
             fail_stop: false,
+            fail_policy_route_cleanup: None,
         });
         assert_eq!(
             start_one_live(&test_state, "UE-02").unwrap_err(),
@@ -13081,6 +13295,7 @@ mod p0_tests {
             fail_observation: true,
             fail_verification: false,
             fail_stop: true,
+            fail_policy_route_cleanup: None,
         });
         assert_eq!(
             start_one_live(&test_state, "UE-02").unwrap_err(),
@@ -13217,6 +13432,7 @@ mod p0_tests {
             fail_observation: false,
             fail_verification: false,
             fail_stop: false,
+            fail_policy_route_cleanup: None,
         });
         test_state.ue_runtime = runtime;
         *test_state.ue_reconciliation.lock().unwrap() = UeReconciliation {
@@ -13252,6 +13468,7 @@ mod p0_tests {
             fail_observation: true,
             fail_verification: false,
             fail_stop: false,
+            fail_policy_route_cleanup: None,
         });
         *test_state.ue_reconciliation.lock().unwrap() = UeReconciliation {
             desired_count: 3,
@@ -13300,6 +13517,7 @@ mod p0_tests {
             fail_observation: false,
             fail_verification: false,
             fail_stop: false,
+            fail_policy_route_cleanup: None,
         });
         assert_eq!(
             start_one_live(&test_state, "UE-02").unwrap_err(),
@@ -13325,6 +13543,7 @@ mod p0_tests {
             fail_observation: false,
             fail_verification: false,
             fail_stop: false,
+            fail_policy_route_cleanup: None,
         });
         let state = Arc::new(test_state);
         let first_state = state.clone();
@@ -13609,6 +13828,7 @@ mod p0_tests {
             fail_observation: false,
             fail_verification: true,
             fail_stop: false,
+            fail_policy_route_cleanup: None,
         });
         let application = app(test_state);
         let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
@@ -13642,6 +13862,7 @@ mod p0_tests {
             fail_observation: false,
             fail_verification: false,
             fail_stop: false,
+            fail_policy_route_cleanup: None,
         });
         let application = app(test_state);
         let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
@@ -13723,6 +13944,7 @@ mod p0_tests {
             fail_observation: false,
             fail_verification: false,
             fail_stop: false,
+            fail_policy_route_cleanup: None,
         });
         let running = test_state.ue_reconciliation_running.clone();
         let _application = app(test_state);
