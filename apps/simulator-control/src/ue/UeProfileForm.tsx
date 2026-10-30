@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import {
   emptyProfile,
@@ -6,6 +6,7 @@ import {
   type ProfileIssue,
   type UeProfileDraft,
 } from './profileModel';
+import { nextFreeImsiFor } from './imsiHelpers';
 
 export type ProfileFormMode = 'create' | 'edit' | 'clone';
 
@@ -22,7 +23,9 @@ const FIELD_LABELS: Record<keyof UeProfileDraft, string> = {
 
 const FIELD_HINTS: Partial<Record<keyof UeProfileDraft, string>> = {
   id: 'Unique identifier (letters, digits, _ . : -)',
-  imsi: 'Optional. 14–16 digits.',
+  // 0.10.2 (#41) — The hint flags the lab-fictive 999... prefix so
+  // operators never paste a real IMSI into the form.
+  imsi: '14–16 digits. Default = next free lab IMSI (999010000000NNN).',
   plmn: 'Optional. 5 or 6 digits.',
   ueIp: 'Optional. IPv4 (set by backend when PDU session is up).',
   apn: 'Optional. Access Point Name used for PDU establishment.',
@@ -53,6 +56,17 @@ export function UeProfileFormDialog({
     setServerError('');
     dialogRef.current?.focus();
   }, [open, initial]);
+
+  // 0.10.2 (#41) — Prefill the IMSI field with the next free lab IMSI
+  // derived from the UE id as the operator types it. Only applied when
+  // the field is currently empty, so a manual override is sticky.
+  const defaultImsiForId = useMemo(() => nextFreeImsiFor(draft.id ?? ''), [draft.id]);
+  useEffect(() => {
+    if (!open) return;
+    if (!defaultImsiForId) return;
+    if (draft.imsi && draft.imsi.trim().length > 0) return;
+    setDraft((prev) => ({ ...prev, imsi: defaultImsiForId.replace(/^imsi-/, '') }));
+  }, [open, defaultImsiForId, draft.imsi]);
 
   useEffect(() => {
     if (!open) return;

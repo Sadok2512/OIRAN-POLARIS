@@ -19,6 +19,7 @@ import { StatusIndicator } from '@/ui/StatusIndicator';
 import { ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
 import { ConfirmDialog } from '@/ui/ConfirmDialog';
 import { RowActionMenu } from '@/ui/RowActionMenu';
+import { formatImsiForRole } from '@/ue/imsiHelpers';
 import {
   useAuth,
   useDnns,
@@ -213,8 +214,9 @@ export function UeManagerPage() {
         pageSize,
         sortBy: 'id',
         sortDirection: 'asc',
+        includeImsi: canOperate,
       }),
-    [profiles, search, ownerFilter, gnbFilter, page, pageSize],
+    [profiles, search, ownerFilter, gnbFilter, page, pageSize, canOperate],
   );
 
   // Clamp page if filter shrinks the result set.
@@ -441,15 +443,11 @@ export function UeManagerPage() {
         const status = (error as { status?: number }).status;
         const code = (error as { code?: string }).code;
         const message = (error as Error).message;
-        // 0.9.0 — surface the exact backend code and HTTP status so operators
-        // see e.g. "HTTP 423 · SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED"
-        // or "HTTP 401 · AUTHENTICATION_REQUIRED" instead of a generic error.
-        const parts = [
-          status != null ? `HTTP ${status}` : null,
-          code ?? null,
-          message || null,
-        ].filter(Boolean);
-        setFeedback(parts.join(' · ') || 'Start failed');
+        // 0.10.2 (#43) — Translate the backend codes operators actually
+        // see into plain-language guidance. We keep the technical code
+        // trailing, once, small, so engineers still have the exact token
+        // to file a ticket on.
+        setFeedback(humanRunError(status, code, message));
       }
       return;
     }
@@ -568,7 +566,11 @@ export function UeManagerPage() {
             />
             <input
               className="ep-input pl-7 w-64"
-              placeholder="Search id, owner, gNB, UE IP…"
+              placeholder={
+                canOperate
+                  ? 'Search id, owner, gNB, IMSI, UE IP…'
+                  : 'Search id, owner, gNB, UE IP…'
+              }
               value={search}
               onChange={(event) => {
                 setSearch(event.target.value);
@@ -631,7 +633,13 @@ export function UeManagerPage() {
             className="ep-button ep-button-sm"
             onClick={() => setBulkOpen(true)}
             disabled={!canOperate || profileBackend}
-            title={profileBackend ? 'Bulk via the POLARIS API (10/100/1000/10000) — UI planned for V1.1' : undefined}
+            title={
+              !canOperate
+                ? 'Rôle viewer : création non autorisée.'
+                : profileBackend
+                  ? 'Bulk create via /ue-profiles/bulk — client UI planned for V1.1 (10/100/1000/10000).'
+                  : undefined
+            }
             data-testid="ue-bulk"
           >
             <Users width={13} height={13} />
@@ -757,16 +765,21 @@ export function UeManagerPage() {
         >
           <colgroup>
             <col style={{ width: '2rem' }} />
-            <col style={{ width: '20%' }} />
-            <col style={{ width: '10%' }} />
-            <col style={{ width: '10%' }} />
-            <col className="runtime-col" style={{ width: '7%' }} />
+            <col style={{ width: '8%' }} />
+            <col style={{ width: '13%' }} />
+            <col style={{ width: '9%' }} />
+            <col style={{ width: '7%' }} />
+            {/* 0.10.2 (#42) — Runtime: 5 cells wide enough that labels like
+                REGISTERED / CONNECTED fit inside their own cell at 1440 and
+                1920 widths (the pre-0.10.2 7%/6%/6% split let REGISTERED
+                bleed into the PDU dot). */}
+            <col className="runtime-col" style={{ width: '9%' }} />
             <col className="runtime-col" style={{ width: '7%' }} />
             <col className="runtime-col" style={{ width: '6%' }} />
             <col className="runtime-col" style={{ width: '8%' }} />
             <col className="runtime-col" style={{ width: '6%' }} />
-            <col style={{ width: '14%' }} />
             <col style={{ width: '10%' }} />
+            <col style={{ width: '17%' }} />
           </colgroup>
           <thead>
             <tr>
@@ -789,21 +802,25 @@ export function UeManagerPage() {
                   data-testid="ue-select-all"
                 />
               </th>
-              <th rowSpan={2}>UE ID / Profile</th>
+              <th rowSpan={2}>UE ID</th>
+              <th rowSpan={2}>IMSI</th>
               <th rowSpan={2}>Owner</th>
               <th rowSpan={2}>Serving gNB</th>
               <th colSpan={5} className="text-center border-b border-border">
                 Runtime
               </th>
-              <th rowSpan={2}>Assigned Scenario</th>
+              <th rowSpan={2}>Scenario</th>
               <th rowSpan={2} className="text-right">Actions</th>
             </tr>
             <tr>
-              <th className="text-ep-xs font-normal text-text-secondary">Registration</th>
-              <th className="text-ep-xs font-normal text-text-secondary">PDU</th>
-              <th className="text-ep-xs font-normal text-text-secondary">RRC</th>
-              <th className="text-ep-xs font-normal text-text-secondary">UE IP</th>
-              <th className="text-ep-xs font-normal text-text-secondary">Traffic</th>
+              {/* 0.10.2 (#42a) — Registration and PDU are two distinct
+                  sub-headers; the pre-0.10.2 layout rendered them without
+                  whitespace at narrow widths, which read as "REGISTRATIONPDU". */}
+              <th className="text-ep-xs font-normal text-text-secondary pr-2">Registration</th>
+              <th className="text-ep-xs font-normal text-text-secondary px-2">PDU</th>
+              <th className="text-ep-xs font-normal text-text-secondary px-2">RRC</th>
+              <th className="text-ep-xs font-normal text-text-secondary px-2">UE IP</th>
+              <th className="text-ep-xs font-normal text-text-secondary pl-2">Traffic</th>
             </tr>
           </thead>
           <tbody>
@@ -816,6 +833,27 @@ export function UeManagerPage() {
               const isActiveForUe =
                 activeJob?.target_ue_id != null && activeJob.target_ue_id === backendId;
               const notProvisioned = !row.backend;
+              // 0.10.2 (#42d) — Runtime cells collapse into a single
+              // "Not running" when the UE is stopped. Stopped is defined as:
+              //   * no backend record at all (not provisioned), OR
+              //   * every runtime state unknown / blank / INACTIVE.
+              const runtimeStates = [
+                row.backend?.registration_state,
+                row.backend?.pdu_session,
+                row.backend?.rrc_state,
+              ].map((state) => (state ?? '').toUpperCase());
+              const isRuntimeIdle =
+                !row.backend ||
+                runtimeStates.every(
+                  (state) => state === '' || state === 'UNKNOWN' || state === 'INACTIVE',
+                );
+              // 0.10.2 (#42f) — Honest owner: the backend currently stores
+              // the UE's display name in the `name` field; it is NOT the
+              // operator identity. If it equals the UE id (common default),
+              // show the em dash instead of pretending the UE owns itself.
+              const ownerCandidate = row.profile.owner?.trim();
+              const displayOwner =
+                ownerCandidate && ownerCandidate !== row.profile.id ? ownerCandidate : '—';
               // 0.10.0 — Start / Stop is a state-driven toggle: the backend's
               // own `actions` map tells us which transition is applicable
               // right now. A running UE advertises `stop:true`; an idle one
@@ -952,24 +990,48 @@ export function UeManagerPage() {
                       )}
                     </div>
                   </td>
-                  <td>{row.profile.owner}</td>
-                  <td className="mono">{row.profile.servingGnb}</td>
-                  <td>
-                    <StatusIndicator
-                      state={row.backend?.registration_state ?? 'UNKNOWN'}
-                      compact
-                    />
+                  {/* 0.10.2 (#41) — IMSI column. Operators see the raw IMSI;
+                      viewers see the solid mask only. */}
+                  <td
+                    className="mono text-ep-xs"
+                    data-testid={`ue-imsi-${row.profile.id}`}
+                  >
+                    {formatImsiForRole(row.profile.imsi, canOperate)}
                   </td>
-                  <td>
-                    <StatusIndicator state={row.backend?.pdu_session ?? 'UNKNOWN'} compact />
-                  </td>
-                  <td>
-                    <StatusIndicator state={row.backend?.rrc_state ?? 'UNKNOWN'} compact />
-                  </td>
-                  <td className="mono text-ep-xs">
-                    {row.backend?.ue_ip ?? row.profile.ueIp ?? '—'}
-                  </td>
-                  <td>{row.backend?.traffic_state ?? '—'}</td>
+                  <td data-testid={`ue-owner-${row.profile.id}`}>{displayOwner}</td>
+                  <td className="mono">{row.profile.servingGnb || '—'}</td>
+                  {/* 0.10.2 (#42d) — Collapsed Runtime cell when the UE is
+                      stopped. Keeps the row from stacking three "Not running"
+                      pills on two lines and leaves the dot/label pair clear
+                      of the next column. */}
+                  {isRuntimeIdle ? (
+                    <td
+                      colSpan={5}
+                      className="text-text-secondary text-ep-sm px-2"
+                      data-testid={`ue-runtime-idle-${row.profile.id}`}
+                    >
+                      <StatusIndicator state="UNKNOWN" compact />
+                    </td>
+                  ) : (
+                    <>
+                      <td className="pr-2">
+                        <StatusIndicator
+                          state={row.backend?.registration_state ?? 'UNKNOWN'}
+                          compact
+                        />
+                      </td>
+                      <td className="px-2">
+                        <StatusIndicator state={row.backend?.pdu_session ?? 'UNKNOWN'} compact />
+                      </td>
+                      <td className="px-2">
+                        <StatusIndicator state={row.backend?.rrc_state ?? 'UNKNOWN'} compact />
+                      </td>
+                      <td className="mono text-ep-xs px-2">
+                        {row.backend?.ue_ip ?? row.profile.ueIp ?? '—'}
+                      </td>
+                      <td className="pl-2">{row.backend?.traffic_state ?? '—'}</td>
+                    </>
+                  )}
                   <td>
                     <div className="flex flex-col gap-1">
                       <select
@@ -1099,7 +1161,7 @@ export function UeManagerPage() {
             })}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={11} className="text-center text-text-secondary py-6">
+                <td colSpan={12} className="text-center text-text-secondary py-6">
                   {profiles.length === 0
                     ? 'No UE profile yet. Add one, bulk-create or import CSV.'
                     : 'No profile matches the current filter.'}
@@ -1389,4 +1451,51 @@ function timestampSuffix(): string {
 
 function pad(n: number): string {
   return n.toString().padStart(2, '0');
+}
+
+/**
+ * 0.10.2 (#43) — Map the POLARIS Run error vocabulary onto French
+ * sentences the operator can act on. The returned string always carries
+ * the technical code once, trailing and small, so a reader can still
+ * paste the exact token into an incident ticket. Covers the cases the
+ * backend actually produces at Run time: HTTP 423 live refusals, HTTP
+ * 422 missing-receiver guards, HTTP 401 authentication, and the
+ * open-ended fallback.
+ */
+export function humanRunError(
+  status: number | undefined,
+  code: string | null | undefined,
+  message: string | null | undefined,
+): string {
+  const trailing = code ?? (status != null ? `HTTP ${status}` : 'ERROR');
+  const headline = (() => {
+    if (status === 401 || code === 'AUTHENTICATION_REQUIRED') {
+      return 'Session expirée — reconnectez-vous pour relancer le scénario.';
+    }
+    if (status === 423) {
+      if (code === 'SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED') {
+        return 'Exécution live non autorisée : demandez l’ouverture du live.';
+      }
+      if (code === 'LIVE_UE_EXISTING_CONTAINER_ENVELOPE_MISMATCH') {
+        return "Un conteneur de même nom existe déjà avec une configuration différente — supprimez-le ou éditez le profil.";
+      }
+      return 'Exécution live non autorisée : demandez l’ouverture du live.';
+    }
+    if (status === 422) {
+      if (code === 'DL_SENDER_NOT_AVAILABLE') {
+        return "Trafic descendant indisponible : le sender DN n’est pas prêt.";
+      }
+      if (code === 'UL_RECEIVER_NOT_AVAILABLE') {
+        return "Trafic montant indisponible : le receiver UL n’est pas prêt.";
+      }
+      if (code === 'TRANSFER_PEER_NOT_AVAILABLE') {
+        return "Vérification de transfert indisponible : le peer n’est pas prêt.";
+      }
+      if (code === 'IMS_NOT_AVAILABLE') {
+        return "IMS indisponible : voice-call / IMS register non exécutable.";
+      }
+    }
+    return message?.trim() || 'Démarrage du scénario refusé.';
+  })();
+  return `${headline} · ${trailing}`;
 }

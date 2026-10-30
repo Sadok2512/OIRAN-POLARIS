@@ -214,6 +214,12 @@ export interface ProfileListOptions {
   sortDirection?: 'asc' | 'desc';
   page: number;
   pageSize: number;
+  /**
+   * 0.10.2 (#41) — Include the IMSI column in the search haystack. Only
+   * the operator role may enable this; viewers never see IMSIs so they
+   * must not be able to probe by them.
+   */
+  includeImsi?: boolean;
 }
 
 export interface ProfilePage {
@@ -248,12 +254,14 @@ export function paginate(
   if (needle || ownerFilter || gnbFilter) {
     filtered = profiles.filter((profile) => {
       if (needle) {
-        // 0.10.0 — IMSI dropped from the search haystack (identity stays
-        // PROTECTED; the UI never surfaces it, so searching by it was a lie).
+        // 0.10.2 (#41) — Role-aware haystack. Operators see IMSI in the
+        // UE table, so they can search by it. Viewers never see IMSIs,
+        // so the search must not surface them as an oracle either.
         const hay = [
           profile.id,
           profile.owner,
           profile.servingGnb,
+          options.includeImsi ? profile.imsi ?? '' : '',
           profile.ueIp ?? '',
           profile.notes ?? '',
         ]

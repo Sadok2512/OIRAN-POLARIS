@@ -251,12 +251,13 @@ test.describe('0.10.0 — honest UX', () => {
   test('UE Manager: layout, labels and action menu', async ({ page }, testInfo) => {
     await page.goto('./ues');
 
-    // Table is visible and search placeholder dropped IMSI.
+    // Table is visible. 0.10.2 (#41) reintroduced IMSI in the search
+    // placeholder for the operator role (viewers still see it dropped);
+    // this spec runs as an operator so IMSI is present again.
     const table = page.getByTestId('ue-table');
     await expect(table).toBeVisible();
     const search = page.getByTestId('ue-search');
-    await expect(search).toHaveAttribute('placeholder', /Search id, owner, gNB, UE IP/);
-    await expect(search).not.toHaveAttribute('placeholder', /IMSI/);
+    await expect(search).toHaveAttribute('placeholder', /Search id, owner, gNB, IMSI, UE IP/);
 
     // Page description must not advertise browser persistence anymore.
     const header = page.getByTestId('page-header');
