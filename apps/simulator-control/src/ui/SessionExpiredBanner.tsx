@@ -9,12 +9,14 @@
 // back at the sign-in surface.
 
 import { useEffect, useRef, useState } from 'react';
+import { Link, useLocation } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
 import { ApiError } from '@shared/api';
 import { useAuth } from '@/data/queries';
 
 export function SessionExpiredBanner() {
   const auth = useAuth();
+  const location = useLocation();
   const wasAuthenticated = useRef(false);
   const [visible, setVisible] = useState(false);
 
@@ -33,6 +35,15 @@ export function SessionExpiredBanner() {
 
   if (!visible) return null;
 
+  // 0.10.1 — The reconnect target was pointing at
+  // `/polaris-api/v1/auth/login`, which is a POST-only API endpoint
+  // (not a page). Point at the Settings route instead — that's where
+  // the simulator-control app renders the `operator-login-form`. We
+  // route via react-router so the SPA shell is preserved. We also
+  // avoid showing the banner on /settings itself (there's nothing to
+  // reconnect from there).
+  const onLoginPage = location.pathname === '/settings';
+
   return (
     <div
       role="alert"
@@ -47,13 +58,15 @@ export function SessionExpiredBanner() {
         </span>
       </div>
       <div className="flex items-center gap-2">
-        <a
-          href="/polaris-api/v1/auth/login"
-          className="ep-button ep-button-sm ep-button-primary"
-          data-testid="session-expired-reconnect"
-        >
-          Se reconnecter
-        </a>
+        {!onLoginPage && (
+          <Link
+            to="/settings"
+            className="ep-button ep-button-sm ep-button-primary"
+            data-testid="session-expired-reconnect"
+          >
+            Se reconnecter
+          </Link>
+        )}
         <button
           type="button"
           className="ep-button ep-button-sm"
