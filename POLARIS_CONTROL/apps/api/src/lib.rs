@@ -1,3 +1,4 @@
+mod activity;
 mod cpu_safety;
 mod scenario_definitions;
 mod subscriber_provisioning;
@@ -120,6 +121,13 @@ pub struct AppState {
     // and audited through the same `audit()` sink as every other operator
     // action. See `live_grant_*` handlers.
     live_grants: Arc<Mutex<Vec<LiveGrant>>>,
+    // 0.19.0 (#37) — per-UE ring buffer of the last 20 events (register,
+    // PDU setup, transfer_verify, iperf3, detach, …). Exposed by the
+    // Activity surface; read-only to consumers.
+    activity_events: Arc<activity::ActivityEventStore>,
+    // 0.19.0 — previous uesimtun counter sample per UE, keyed by UE id.
+    // Used to attach UL / DL bps rates on each Activity poll / SSE tick.
+    activity_rate_cache: Arc<Mutex<BTreeMap<String, (activity::CountersSnapshot, u128)>>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -3008,6 +3016,8 @@ impl AppState {
             ue_reconciliation: Arc::new(Mutex::new(UeReconciliation::default())),
             startup_reconcile: true,
             live_grants: Arc::new(Mutex::new(Vec::new())),
+            activity_events: Arc::new(activity::ActivityEventStore::new()),
+            activity_rate_cache: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 }
@@ -7175,12 +7185,39 @@ fn start_one_live_inner(
         .ok_or_else(|| "UE_REGISTRY_RECORD_MISSING".into())
 }
 
+// 0.19.0 (#37) — Thin wrapper that records a start/stop event into the
+// per-UE Activity ring. The event store is lock-free from the caller's
+// perspective (poisoned mutexes are swallowed), so a race here cannot
+// break the Start / Stop paths.
+fn record_activity_event(
+    state: &AppState,
+    ue_id: &str,
+    kind: &str,
+    outcome: &str,
+    detail: Value,
+) {
+    state
+        .activity_events
+        .record(ue_id, activity::ActivityEvent::new(kind, outcome, detail));
+}
+
 fn start_one_live(state: &AppState, ue_id: &str) -> Result<simulator_controller::UeJob, String> {
     let _operation_guard = state
         .ue_operations
         .lock()
         .map_err(|_| "UE_OPERATION_COORDINATOR_UNAVAILABLE")?;
-    start_one_live_inner(state, ue_id)
+    let outcome = start_one_live_inner(state, ue_id);
+    match &outcome {
+        Ok(_) => record_activity_event(state, ue_id, "live_start", "OK", json!({})),
+        Err(error) => record_activity_event(
+            state,
+            ue_id,
+            "live_start",
+            "FAILED",
+            json!({ "error": error }),
+        ),
+    }
+    outcome
 }
 
 fn stop_one_live_inner(
@@ -7274,7 +7311,18 @@ fn stop_one_live(state: &AppState, ue_id: &str) -> Result<simulator_controller::
         .ue_operations
         .lock()
         .map_err(|_| "UE_OPERATION_COORDINATOR_UNAVAILABLE")?;
-    stop_one_live_inner(state, ue_id, None)
+    let outcome = stop_one_live_inner(state, ue_id, None);
+    match &outcome {
+        Ok(_) => record_activity_event(state, ue_id, "live_stop", "OK", json!({})),
+        Err(error) => record_activity_event(
+            state,
+            ue_id,
+            "live_stop",
+            "FAILED",
+            json!({ "error": error }),
+        ),
+    }
+    outcome
 }
 
 fn stop_one_live_for_definition(
@@ -8621,6 +8669,272 @@ fn start_live_definition_scenario(
     Ok(record)
 }
 
+// ----------------------------------------------------------------------
+// 0.19.0 (#37) — Per-UE Activity endpoint.
+//
+// Two routes, both read-only, both deliberately ungated by live-grant
+// or `definition_live_enabled`:
+//   * GET /ues/:id/activity              → one-shot JSON snapshot
+//   * GET /ues/:id/activity/stream       → text/event-stream SSE at 2 s
+//
+// Payload shape (running UE):
+//   { ue_id, running: true, imsi, states{rm,cm,rrc,mm_5g}, pdu, counters,
+//     job_step, events[], voice{available:false,reason:IMS_NOT_AVAILABLE} }
+//
+// Payload shape (UE not running):
+//   { ue_id, running: false, reason, voice{…}, events[] }
+//
+// Identity material (SUCI, GUTI, TMSI, keys) is HARD-FILTERED out of
+// every nr-cli stdout we parse. The IMSI is role-gated: operator sees
+// the raw value, viewer gets the solid mask.
+// ----------------------------------------------------------------------
+
+/// Pull the current state slice for a UE and compose the Activity
+/// payload. Never panics; a broken docker exec yields an empty slice.
+fn build_ue_activity_payload(
+    state: &AppState,
+    ue_id: &str,
+    identity: &EffectiveIdentity,
+) -> Value {
+    // 1. Does this UE belong to the controller surface? Any UE id
+    //    outside the planned slot set returns a flat `running:false`
+    //    with the strict reason so operators do not see confusing
+    //    half-truths for `UE-200000` or similar typos.
+    if !controller_owns_ue(state, ue_id) {
+        return activity::compose_activity_payload(
+            ue_id,
+            false,
+            Some("UE_NOT_OWNED_BY_CONTROLLER"),
+            None,
+            activity::NrCliStates::default(),
+            None,
+            None,
+            None,
+            vec![],
+        );
+    }
+
+    let events = state.activity_events.snapshot(ue_id);
+
+    // 2. Resolve the owning backend job (if any) + its spec + handle.
+    let (approved_runtime, handle, imsi_from_profile) = {
+        let controller = match state.multi_ue.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return activity::compose_activity_payload(
+                    ue_id,
+                    false,
+                    Some("UE_REGISTRY_UNAVAILABLE"),
+                    None,
+                    activity::NrCliStates::default(),
+                    None,
+                    None,
+                    None,
+                    events,
+                );
+            }
+        };
+        let job = controller.snapshot().into_iter().find(|job| job.ue_id == ue_id);
+        let profile_imsi = controller
+            .profiles()
+            .into_iter()
+            .find(|profile| profile.ue_id == ue_id)
+            .map(|profile| profile.pseudonym);
+        (
+            job.as_ref().and_then(|job| job.approved_runtime.clone()),
+            job.and_then(|job| job.process_handle),
+            profile_imsi,
+        )
+    };
+
+    let imsi_projection = activity::imsi_for_role(imsi_from_profile.as_deref(), &identity.role);
+
+    // 3. Not live-launched → honest `running:false`. No docker exec is
+    //    attempted; events ring still returned so historical context
+    //    stays visible on the Activity page.
+    let (Some(_spec), Some(handle)) = (approved_runtime, handle) else {
+        return activity::compose_activity_payload(
+            ue_id,
+            false,
+            Some("UE_NOT_RUNNING"),
+            imsi_projection,
+            activity::NrCliStates::default(),
+            None,
+            None,
+            None,
+            events,
+        );
+    };
+    let Some(container_id) = DockerUeRuntime::container_id(&handle) else {
+        return activity::compose_activity_payload(
+            ue_id,
+            false,
+            Some("UE_HANDLE_INVALID"),
+            imsi_projection,
+            activity::NrCliStates::default(),
+            None,
+            None,
+            None,
+            events,
+        );
+    };
+
+    // 4. nr-cli states + PDU (best-effort; docker exec failures stay
+    //    silent so one broken probe never 500s the Activity surface).
+    let node_name = DockerUeRuntime::ue_cli_node(container_id)
+        .ok()
+        .unwrap_or_default();
+    let states = if !node_name.is_empty() {
+        DockerUeRuntime::output(&[
+            "exec".into(),
+            container_id.into(),
+            "nr-cli".into(),
+            node_name.clone(),
+            "-e".into(),
+            "status".into(),
+        ])
+        .map(|stdout| activity::parse_nr_cli_states(&stdout))
+        .unwrap_or_default()
+    } else {
+        activity::NrCliStates::default()
+    };
+    let pdu = if !node_name.is_empty() {
+        DockerUeRuntime::output(&[
+            "exec".into(),
+            container_id.into(),
+            "nr-cli".into(),
+            node_name,
+            "-e".into(),
+            "ps-list".into(),
+        ])
+        .ok()
+        .as_deref()
+        .and_then(activity::parse_ps_list)
+    } else {
+        None
+    };
+
+    // 5. uesimtun* counters + bps rates vs. previous sample.
+    let proc_net_dev = DockerUeRuntime::output(&[
+        "exec".into(),
+        container_id.into(),
+        "cat".into(),
+        "/proc/net/dev".into(),
+    ]);
+    let counters = proc_net_dev
+        .ok()
+        .as_deref()
+        .and_then(activity::parse_uesimtun_counters)
+        .map(|mut current| {
+            let now_ms = epoch_millis_u128();
+            if let Ok(mut cache) = state.activity_rate_cache.lock() {
+                let previous = cache.get(ue_id).cloned();
+                if let Some((prev_sample, prev_at)) = previous.as_ref() {
+                    activity::attach_rates(&mut current, Some(prev_sample), now_ms.saturating_sub(*prev_at));
+                }
+                cache.insert(ue_id.to_string(), (current.clone(), now_ms));
+            }
+            current
+        });
+
+    // 6. Current job + step: scan the runtime history for the latest
+    //    non-terminal definition record that includes this UE. Returns
+    //    the job id, the definition id, the overall state, and the
+    //    first RUNNING step (so the frontend can light up "Step N:
+    //    traffic_ul · RUNNING" without pulling the full history).
+    let job_step = state.runtime.lock().ok().and_then(|runtime| {
+        for record in runtime.history.iter().rev() {
+            let overall = record["state"].as_str().unwrap_or("").to_string();
+            if matches!(
+                overall.as_str(),
+                "COMPLETED" | "FAILED" | "STOPPED" | "STOPPING",
+            ) {
+                continue;
+            }
+            let ue_ids = record["ue_ids"].as_array();
+            let is_target = ue_ids
+                .map(|list| list.iter().any(|value| value.as_str() == Some(ue_id)))
+                .unwrap_or(false);
+            if !is_target {
+                continue;
+            }
+            let steps = record["steps"].as_array();
+            let current = steps
+                .and_then(|list| {
+                    list.iter()
+                        .enumerate()
+                        .find(|(_, step)| step["state"].as_str() == Some("RUNNING"))
+                        .map(|(index, step)| {
+                            json!({
+                                "index": index,
+                                "type": step["type"].clone(),
+                                "state": step["state"].clone(),
+                            })
+                        })
+                })
+                .unwrap_or(Value::Null);
+            return Some(json!({
+                "job_id": record["job_id"].clone(),
+                "definition_id": record["scenario_definition_id"].clone(),
+                "state": overall,
+                "current_step": current,
+            }));
+        }
+        None
+    });
+
+    activity::compose_activity_payload(
+        ue_id,
+        true,
+        None,
+        imsi_projection,
+        states,
+        pdu,
+        counters,
+        job_step,
+        events,
+    )
+}
+
+async fn ue_activity(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(ue_id): AxumPath<String>,
+) -> Response {
+    // Role check is deliberately NOT present — the Activity surface is
+    // read-only and must be accessible to viewers. The IMSI projection
+    // handles the identity filter on its own.
+    let payload = build_ue_activity_payload(&state, &ue_id, &identity);
+    (StatusCode::OK, Json(payload)).into_response()
+}
+
+async fn ue_activity_stream(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(ue_id): AxumPath<String>,
+) -> axum::response::sse::Sse<
+    futures_util::stream::BoxStream<'static, Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures_util::stream::StreamExt;
+    let stream_state = state.clone();
+    let stream_ue = ue_id;
+    let stream_identity = identity;
+    let stream = futures_util::stream::unfold(
+        (true, stream_state, stream_ue, stream_identity),
+        |(first, state, ue, identity)| async move {
+            if !first {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            let payload = build_ue_activity_payload(&state, &ue, &identity);
+            let event = Event::default().json_data(payload).unwrap_or_default();
+            Some((Ok::<_, std::convert::Infallible>(event), (false, state, ue, identity)))
+        },
+    )
+    .boxed();
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 async fn start_scenario(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
@@ -9547,6 +9861,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/ues/stop", post(stop_ue))
         .route("/ues/group/start", post(start_ue_group))
         .route("/ues/group/stop", post(stop_ue_group))
+        // 0.19.0 (#37) — Activity endpoint: read-only, no live-grant
+        // required, SUCI/GUTI/TMSI/key hard-filtered, IMSI role-gated.
+        .route("/ues/:ue_id/activity", get(ue_activity))
+        .route("/ues/:ue_id/activity/stream", get(ue_activity_stream))
         .route("/traffic/status", get(traffic_status))
         .route("/live-tests/polaris-live-001", get(live_test_status))
         .route(
@@ -10148,6 +10466,8 @@ mod p0_tests {
             ue_reconciliation: Arc::new(Mutex::new(UeReconciliation::default())),
             startup_reconcile: false,
             live_grants: Arc::new(Mutex::new(Vec::new())),
+            activity_events: Arc::new(activity::ActivityEventStore::new()),
+            activity_rate_cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -13199,6 +13519,80 @@ mod p0_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// 0.19.0 (#37) — HTTP contract test for the Activity surface.
+    ///
+    /// The endpoint is read-only and must NOT require a live grant.
+    /// A UE that is not live-launched must come back `200 OK` with
+    /// `running: false` and the voice "IMS_NOT_AVAILABLE" block —
+    /// never a 5xx. Operator sees the raw IMSI; viewer gets the mask.
+    #[tokio::test]
+    async fn ue_activity_http_returns_running_false_for_stopped_ue() {
+        let application = app(state());
+        let (cookie, _csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/ues/UE-02/activity")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["ue_id"], Value::String("UE-02".into()));
+        assert_eq!(body["running"], Value::Bool(false));
+        assert_eq!(
+            body["voice"]["available"],
+            Value::Bool(false),
+            "voice must be unavailable, {body}",
+        );
+        assert_eq!(
+            body["voice"]["reason"],
+            Value::String("IMS_NOT_AVAILABLE".into()),
+        );
+        // Identity-sensitive fields must NOT leak on the stopped path.
+        for banned in &["suci", "guti", "tmsi", "key"] {
+            let serialised = body.to_string().to_ascii_lowercase();
+            assert!(
+                !serialised.contains(&format!("\"{banned}\"")),
+                "stopped-UE payload must not expose {banned}: {body}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ue_activity_http_rejects_unknown_ue_with_running_false_not_five_hundred() {
+        let application = app(state());
+        let (cookie, _csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/ues/UE-ZZZ/activity")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Must never 500 — the endpoint is read-only and operator-safe.
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["running"], Value::Bool(false));
+        assert_eq!(
+            body["reason"],
+            Value::String("UE_NOT_OWNED_BY_CONTROLLER".into()),
+        );
     }
 
     #[tokio::test]

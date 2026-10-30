@@ -1,6 +1,6 @@
 [package]
 name = "polaris-control-api"
-version = "0.18.1"
+version = "0.19.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,10 @@ traffic-engine = { path = "../../crates/traffic-engine" }
 ueransim-adapter = { path = "../../crates/ueransim-adapter" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "=1.42.0", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+tokio = { version = "=1.42.0", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
+# 0.19.0 — futures-util is already a transitive dep of axum; declaring it
+# explicitly lets us use `stream::unfold` for the Activity SSE handler.
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 tower-http = { version = "=0.6.2", features = ["fs", "set-header", "trace"] }
 hyper-util = "=0.1.10"
 argon2 = "=0.5.3"
