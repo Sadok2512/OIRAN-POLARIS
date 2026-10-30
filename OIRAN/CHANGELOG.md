@@ -1,5 +1,12 @@
 # Changelog
 
+## OIRAN API 2.5.2 / live-probe 0.2.5 - 2026-10-30
+
+- Commit continuous-import checksums only after the rebuilt dataset generation
+  has been published atomically. A failed marker write leaves the segment
+  retryable instead of reporting it imported without published events.
+- Add a regression test covering the atomic marker-write failure and retry.
+
 ## OIRAN API 2.5.1 / live-probe 0.2.4 - 2026-10-30
 
 - Added `OIRAN_CONTINUOUS_MAX_SEGMENT_BYTES`, defaulting to 1 GiB, with

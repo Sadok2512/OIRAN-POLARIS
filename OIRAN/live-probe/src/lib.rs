@@ -1401,7 +1401,7 @@ impl CaptureManager {
         }
         let recovered_dataset = self.dataset(CONTINUOUS_DATASET_ID);
         let mut observed = BTreeMap::<PathBuf, (u64, SystemTime)>::new();
-        let mut bootstrap_pending = false;
+        let mut bootstrap_pending = Vec::new();
         if let Some(path) = &config.historical_n2_bootstrap {
             if !allowlisted_historical_n2_bootstrap(path) {
                 return Err("CONTINUOUS_BOOTSTRAP_NOT_ALLOWLISTED".into());
@@ -1446,8 +1446,10 @@ impl CaptureManager {
                             historical_context: true,
                         },
                     );
-                    remember_checksum(&mut state, checksum);
-                    bootstrap_pending = true;
+                    // The copied segment is only a publication candidate at
+                    // this point. Its checksum becomes durable after the
+                    // rebuilt dataset has been published atomically.
+                    bootstrap_pending.push(checksum);
                 }
             }
         }
@@ -1589,7 +1591,8 @@ impl CaptureManager {
             self.update(CONTINUOUS_CAPTURE_ID, |job| {
                 job.metrics.pending_segments = pending
             })?;
-            let mut changed = std::mem::take(&mut bootstrap_pending);
+            let mut pending_publication = std::mem::take(&mut bootstrap_pending);
+            let mut changed = !pending_publication.is_empty();
             let prior_state = state.clone();
             let mut terminal_error = None;
             for candidate in candidates {
@@ -1740,7 +1743,7 @@ impl CaptureManager {
                         historical_context: false,
                     },
                 );
-                remember_checksum(&mut state, candidate.checksum);
+                pending_publication.push(candidate.checksum);
                 changed = true;
             }
             let mut published = !changed;
@@ -1752,10 +1755,13 @@ impl CaptureManager {
                 ) {
                     Ok(dataset) => {
                         self.upsert_dataset(dataset.clone(), &base.join("dataset"))?;
-                        atomic_write(
+                        // Publication is the commit point. If persisting the
+                        // marker fails, the checksum remains unseen and the
+                        // next scan safely retries the segment.
+                        persist_published_checksums(
                             &state_path,
-                            &serde_json::to_vec_pretty(&state)
-                                .map_err(|error| error.to_string())?,
+                            &mut state,
+                            &pending_publication,
                         )?;
                         let packets = dataset
                             .decode_reports
@@ -3474,6 +3480,26 @@ fn remember_checksum(state: &mut ContinuousImportState, checksum: String) {
             state.seen_checksums.remove(&oldest);
         }
     }
+}
+
+/// Durably marks checksums only after the caller has atomically published the
+/// corresponding dataset generation. The in-memory state is replaced only
+/// after the atomic state-file write succeeds.
+fn persist_published_checksums(
+    state_path: &Path,
+    state: &mut ContinuousImportState,
+    checksums: &[String],
+) -> Result<(), String> {
+    let mut committed = state.clone();
+    for checksum in checksums {
+        remember_checksum(&mut committed, checksum.clone());
+    }
+    atomic_write(
+        state_path,
+        &serde_json::to_vec_pretty(&committed).map_err(|error| error.to_string())?,
+    )?;
+    *state = committed;
+    Ok(())
 }
 
 fn cleanup_native_capture(root: &Path, capture_id: &str) -> Result<(), String> {
@@ -5613,6 +5639,50 @@ mod tests {
         assert_eq!(state.seen_order.len(), MAX_CONTINUOUS_SEEN);
         assert!(!state.seen_checksums.contains("checksum-00000"));
         assert!(state.seen_checksums.contains("checksum-04112"));
+    }
+
+    #[test]
+    fn imported_marker_is_committed_only_after_atomic_publication() {
+        let root = temporary_root("continuous-publish-marker");
+        let state_path = root.join("state/import_state.json");
+        let mut state = ContinuousImportState::default();
+        let checksum = "published-checksum".to_string();
+
+        state.segments.insert(
+            checksum.clone(),
+            ImportedSegment {
+                interface: "N3".into(),
+                owned_file: "N3.pcap-published.pcapng".into(),
+                size_bytes: 64,
+                packets: 1,
+                imported_epoch_ms: 1,
+                source_path: "/source/N3.pcapng".into(),
+                historical_context: false,
+            },
+        );
+        assert!(!state.seen_checksums.contains(&checksum));
+
+        assert!(persist_published_checksums(
+            &state_path,
+            &mut state,
+            std::slice::from_ref(&checksum),
+        )
+        .is_err());
+        assert!(!state.seen_checksums.contains(&checksum));
+        assert!(!state_path.exists());
+
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        persist_published_checksums(
+            &state_path,
+            &mut state,
+            std::slice::from_ref(&checksum),
+        )
+        .unwrap();
+        let persisted: ContinuousImportState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert!(state.seen_checksums.contains(&checksum));
+        assert!(persisted.seen_checksums.contains(&checksum));
+        assert_eq!(persisted.seen_order.back(), Some(&checksum));
     }
 
     #[test]
