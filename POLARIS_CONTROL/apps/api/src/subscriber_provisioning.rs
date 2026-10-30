@@ -48,6 +48,16 @@ pub struct SubscriberRecord {
     pub ambr: SubscriberAmbr,
 }
 
+/// Payload returned to the UI for each subscriber.
+///
+/// 0.19.7 (#48) — `subscriber_identity` is **role-aware**:
+///   - For a `viewer`, it stays the opaque string `"PROTECTED"`.
+///   - For an `operator` or `administrator`, it carries the raw IMSI
+///     digits (15 chars, PLMN prefix + MSIN) so the operator can
+///     cross-check what Open5GS stores.
+///
+/// `authentication_material` (K / OPc) stays `"PROTECTED"` for every
+/// role; those secrets never leave the backend.
 #[derive(Clone, Serialize, PartialEq, Eq)]
 pub struct SanitizedSubscriber {
     pub slot: String,
@@ -56,8 +66,8 @@ pub struct SanitizedSubscriber {
     pub snssai: SanitizedSnssai,
     pub dnns: Vec<String>,
     pub ambr: SubscriberAmbr,
-    pub subscriber_identity: &'static str,
-    pub authentication_material: &'static str,
+    pub subscriber_identity: String,
+    pub authentication_material: String,
 }
 
 #[derive(Clone, Serialize, PartialEq, Eq)]
@@ -98,6 +108,18 @@ pub struct SubscriberUpdate {
 
 pub trait SubscriberBackend: Send + Sync {
     fn list(&self) -> Result<Vec<SanitizedSubscriber>, String>;
+    /// 0.19.7 (#48) — list with a role-dependent identity visibility.
+    /// Backends should return the raw IMSI inside `subscriber_identity`
+    /// when `visibility` is `Imsi`; `"PROTECTED"` otherwise. The default
+    /// implementation falls back to [`SubscriberBackend::list`] (which
+    /// stays Protected).
+    fn list_with_visibility(
+        &self,
+        visibility: SubscriberIdentityVisibility,
+    ) -> Result<Vec<SanitizedSubscriber>, String> {
+        let _ = visibility;
+        self.list()
+    }
     fn lookup_many(
         &self,
         identities: &[String],
@@ -107,6 +129,15 @@ pub trait SubscriberBackend: Send + Sync {
         rows: Vec<(usize, SubscriberMutation)>,
     ) -> Result<Vec<ProvisionResult>, String>;
     fn fetch_slot(&self, slot: &str) -> Result<Option<SanitizedSubscriber>, String>;
+    /// 0.19.7 (#48) — fetch one slot with a role-dependent identity visibility.
+    fn fetch_slot_with_visibility(
+        &self,
+        slot: &str,
+        visibility: SubscriberIdentityVisibility,
+    ) -> Result<Option<SanitizedSubscriber>, String> {
+        let _ = visibility;
+        self.fetch_slot(slot)
+    }
     /// Apply a partial update to the subscriber identified by `slot`. The
     /// backend performs the IMSI/K/OPc confidentiality by never returning
     /// them in `SanitizedSubscriber`.
@@ -303,12 +334,19 @@ impl MongoSubscriberBackend {
 
 impl SubscriberBackend for MongoSubscriberBackend {
     fn list(&self) -> Result<Vec<SanitizedSubscriber>, String> {
+        self.list_with_visibility(SubscriberIdentityVisibility::Protected)
+    }
+
+    fn list_with_visibility(
+        &self,
+        visibility: SubscriberIdentityVisibility,
+    ) -> Result<Vec<SanitizedSubscriber>, String> {
         let value = self.mongosh(br#"print(JSON.stringify(db.subscribers.find({"polaris.owned":true},{imsi:1,security:1,slice:1,ambr:1,polaris:1}).toArray()))"#)?;
         value
             .as_array()
             .ok_or("OPEN5GS_DATABASE_RESPONSE_INVALID")?
             .iter()
-            .map(|v| self.decode_record(v).map(|r| sanitize(&r)))
+            .map(|v| self.decode_record(v).map(|r| sanitize_for_role(&r, visibility)))
             .collect()
     }
 
@@ -381,6 +419,14 @@ print(JSON.stringify(results));
     }
 
     fn fetch_slot(&self, slot: &str) -> Result<Option<SanitizedSubscriber>, String> {
+        self.fetch_slot_with_visibility(slot, SubscriberIdentityVisibility::Protected)
+    }
+
+    fn fetch_slot_with_visibility(
+        &self,
+        slot: &str,
+        visibility: SubscriberIdentityVisibility,
+    ) -> Result<Option<SanitizedSubscriber>, String> {
         let slot_json = serde_json::to_string(slot).map_err(|_| "SUBSCRIBER_REQUEST_INVALID")?;
         let script = format!(
             "const r=db.subscribers.findOne({{\"polaris.slot\":{slot_json},\"polaris.owned\":true}});print(JSON.stringify(r))"
@@ -389,7 +435,8 @@ print(JSON.stringify(results));
         if value.is_null() {
             return Ok(None);
         }
-        self.decode_record(&value).map(|record| Some(sanitize(&record)))
+        self.decode_record(&value)
+            .map(|record| Some(sanitize_for_role(&record, visibility)))
     }
 
     fn apply_update(
@@ -575,12 +622,19 @@ impl MemorySubscriberBackend {
 
 impl SubscriberBackend for MemorySubscriberBackend {
     fn list(&self) -> Result<Vec<SanitizedSubscriber>, String> {
+        self.list_with_visibility(SubscriberIdentityVisibility::Protected)
+    }
+
+    fn list_with_visibility(
+        &self,
+        visibility: SubscriberIdentityVisibility,
+    ) -> Result<Vec<SanitizedSubscriber>, String> {
         Ok(self
             .records
             .lock()
             .unwrap()
             .values()
-            .map(sanitize)
+            .map(|record| sanitize_for_role(record, visibility))
             .collect())
     }
     fn lookup_many(
@@ -626,13 +680,21 @@ impl SubscriberBackend for MemorySubscriberBackend {
             .collect())
     }
     fn fetch_slot(&self, slot: &str) -> Result<Option<SanitizedSubscriber>, String> {
+        self.fetch_slot_with_visibility(slot, SubscriberIdentityVisibility::Protected)
+    }
+
+    fn fetch_slot_with_visibility(
+        &self,
+        slot: &str,
+        visibility: SubscriberIdentityVisibility,
+    ) -> Result<Option<SanitizedSubscriber>, String> {
         Ok(self
             .records
             .lock()
             .unwrap()
             .values()
             .find(|record| record.slot == slot)
-            .map(sanitize))
+            .map(|record| sanitize_for_role(record, visibility)))
     }
     fn apply_update(
         &self,
@@ -699,7 +761,40 @@ pub fn normalize_imsi(value: &str) -> Result<String, String> {
     }
 }
 
+/// Default (viewer) sanitization: identity + K/OPc are opaque.
 pub fn sanitize(record: &SubscriberRecord) -> SanitizedSubscriber {
+    sanitize_for_role(record, SubscriberIdentityVisibility::Protected)
+}
+
+/// 0.19.7 (#48) — `operator` and `administrator` get the raw IMSI; everyone
+/// else keeps `"PROTECTED"`. K / OPc are **never** returned.
+#[derive(Clone, Copy)]
+pub enum SubscriberIdentityVisibility {
+    /// Return `"PROTECTED"` as the subscriber identity (viewer).
+    Protected,
+    /// Return the raw IMSI as the subscriber identity (operator / admin).
+    Imsi,
+}
+
+impl SubscriberIdentityVisibility {
+    /// Convenience helper: operators and administrators see the IMSI;
+    /// anyone else (viewers, unknown roles) stays `Protected`.
+    pub fn for_role(role: &str) -> Self {
+        match role {
+            "operator" | "administrator" => SubscriberIdentityVisibility::Imsi,
+            _ => SubscriberIdentityVisibility::Protected,
+        }
+    }
+}
+
+pub fn sanitize_for_role(
+    record: &SubscriberRecord,
+    visibility: SubscriberIdentityVisibility,
+) -> SanitizedSubscriber {
+    let identity = match visibility {
+        SubscriberIdentityVisibility::Imsi => record.imsi.clone(),
+        SubscriberIdentityVisibility::Protected => "PROTECTED".into(),
+    };
     SanitizedSubscriber {
         slot: record.slot.clone(),
         state: "PROVISIONED".into(),
@@ -713,8 +808,8 @@ pub fn sanitize(record: &SubscriberRecord) -> SanitizedSubscriber {
         },
         dnns: record.dnns.clone(),
         ambr: record.ambr.clone(),
-        subscriber_identity: "PROTECTED",
-        authentication_material: "PROTECTED",
+        subscriber_identity: identity,
+        authentication_material: "PROTECTED".into(),
     }
 }
 
@@ -1599,5 +1694,83 @@ print(JSON.stringify({{ sessions: sessions, top: top, shape: shape }}));
         // Clean up so repeat runs stay deterministic.
         let _ = backend.mongosh(cleanup.as_bytes());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // 0.19.7 (#48) — identity visibility matrix.
+    #[test]
+    fn sanitize_for_viewer_keeps_subscriber_identity_protected() {
+        let record = SubscriberRecord {
+            slot: "UE-07".into(),
+            imsi: "001011234567890".into(),
+            k: "aa".repeat(16),
+            opc: "bb".repeat(16),
+            plmn_mcc: "001".into(),
+            plmn_mnc: "01".into(),
+            sst: 1,
+            sd: Some("010203".into()),
+            dnns: vec!["internet".into()],
+            ambr: SubscriberAmbr {
+                uplink: 1,
+                downlink: 1,
+            },
+        };
+        let viewer = sanitize_for_role(&record, SubscriberIdentityVisibility::Protected);
+        assert_eq!(viewer.subscriber_identity, "PROTECTED");
+        assert_eq!(viewer.authentication_material, "PROTECTED");
+
+        // Operator view exposes the raw IMSI, but K / OPc stay PROTECTED.
+        let operator = sanitize_for_role(&record, SubscriberIdentityVisibility::Imsi);
+        assert_eq!(operator.subscriber_identity, "001011234567890");
+        assert_eq!(operator.authentication_material, "PROTECTED");
+
+        // JSON round-trip: operator payload must contain the IMSI once; the
+        // viewer payload must not contain any digit span that looks like one.
+        let operator_json = serde_json::to_string(&operator).unwrap();
+        assert!(operator_json.contains("001011234567890"));
+        let viewer_json = serde_json::to_string(&viewer).unwrap();
+        assert!(!viewer_json.contains("001011234567890"));
+
+        // Role → visibility mapping.
+        assert!(matches!(
+            SubscriberIdentityVisibility::for_role("viewer"),
+            SubscriberIdentityVisibility::Protected
+        ));
+        assert!(matches!(
+            SubscriberIdentityVisibility::for_role("operator"),
+            SubscriberIdentityVisibility::Imsi
+        ));
+        assert!(matches!(
+            SubscriberIdentityVisibility::for_role("administrator"),
+            SubscriberIdentityVisibility::Imsi
+        ));
+    }
+
+    #[test]
+    fn memory_backend_list_with_visibility_follows_role() {
+        let backend = MemorySubscriberBackend::default();
+        let mutation = SubscriberMutation {
+            imsi: "001010000000042".into(),
+            k: "cc".repeat(16),
+            opc: "dd".repeat(16),
+            sst: 1,
+            sd: Some("010203".into()),
+            dnns: vec!["internet".into()],
+            ambr: SubscriberAmbr {
+                uplink: 1,
+                downlink: 1,
+            },
+        };
+        backend.provision_batch(vec![(1, mutation)]).expect("provision");
+
+        let viewer = backend
+            .list_with_visibility(SubscriberIdentityVisibility::Protected)
+            .expect("list");
+        assert_eq!(viewer.len(), 1);
+        assert_eq!(viewer[0].subscriber_identity, "PROTECTED");
+
+        let operator = backend
+            .list_with_visibility(SubscriberIdentityVisibility::Imsi)
+            .expect("list");
+        assert_eq!(operator[0].subscriber_identity, "001010000000042");
     }
 }

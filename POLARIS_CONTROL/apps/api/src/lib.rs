@@ -4467,12 +4467,29 @@ fn subscriber_error(error: String) -> (StatusCode, Json<Value>) {
     (status, Json(json!({"error":error})))
 }
 
-async fn list_subscribers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn list_subscribers(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+) -> impl IntoResponse {
+    // 0.19.7 (#48) — operators and administrators see the raw IMSI; everyone
+    // else keeps `subscriber_identity = "PROTECTED"`. `secrets_exposed` tracks
+    // only the K/OPc material, which is **never** returned.
+    let visibility =
+        subscriber_provisioning::SubscriberIdentityVisibility::for_role(&identity.role);
+    let identity_exposed = matches!(
+        visibility,
+        subscriber_provisioning::SubscriberIdentityVisibility::Imsi
+    );
     let backend = state.subscriber_backend.clone();
-    match tokio::task::spawn_blocking(move || backend.list()).await {
+    match tokio::task::spawn_blocking(move || backend.list_with_visibility(visibility)).await {
         Ok(Ok(items)) => (
             StatusCode::OK,
-            Json(json!({"items":items,"total":items.len(),"secrets_exposed":false})),
+            Json(json!({
+                "items": items,
+                "total": items.len(),
+                "secrets_exposed": false,
+                "subscriber_identity_exposed": identity_exposed,
+            })),
         ),
         Ok(Err(error)) => subscriber_error(error),
         Err(_) => subscriber_error("OPEN5GS_DATABASE_UNAVAILABLE".into()),
@@ -4673,11 +4690,22 @@ async fn bulk_create_subscribers(
 /// authentication material remain PROTECTED (never surfaced in the body).
 async fn get_subscriber(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
     AxumPath(slot): AxumPath<String>,
 ) -> impl IntoResponse {
+    // 0.19.7 (#48) — identity visibility follows the caller's role.
+    let visibility =
+        subscriber_provisioning::SubscriberIdentityVisibility::for_role(&identity.role);
+    let identity_exposed = matches!(
+        visibility,
+        subscriber_provisioning::SubscriberIdentityVisibility::Imsi
+    );
     let backend = state.subscriber_backend.clone();
     let fetch_slot = slot.clone();
-    let fetched = tokio::task::spawn_blocking(move || backend.fetch_slot(&fetch_slot)).await;
+    let fetched = tokio::task::spawn_blocking(move || {
+        backend.fetch_slot_with_visibility(&fetch_slot, visibility)
+    })
+    .await;
     let sanitized = match fetched {
         Ok(Ok(Some(record))) => record,
         Ok(Ok(None)) => {
@@ -4714,6 +4742,7 @@ async fn get_subscriber(
             "linked_profile_ue_ids": linked_profile_ue_ids,
             "linked_profile_count": linked_profile_ue_ids.len(),
             "secrets_exposed": false,
+            "subscriber_identity_exposed": identity_exposed,
         })),
     )
 }
@@ -9428,17 +9457,39 @@ fn build_ue_activity_payload(
                 continue;
             }
             let steps = record["steps"].as_array();
+            // 0.19.7 (#50) — expose the step protocole in the current step:
+            // for traffic steps the UI needs the protocol (UDP/TCP), direction
+            // (UL/DL/UL+DL), optional datagram count and destination so the
+            // Activity surface can render "↑ UDP · 5 datagrams · 10.46.0.1".
+            // Non-null, non-empty fields only — we never fabricate.
             let current = steps
                 .and_then(|list| {
                     list.iter()
                         .enumerate()
                         .find(|(_, step)| step["state"].as_str() == Some("RUNNING"))
                         .map(|(index, step)| {
-                            json!({
+                            let mut payload = json!({
                                 "index": index,
                                 "type": step["type"].clone(),
                                 "state": step["state"].clone(),
-                            })
+                            });
+                            let obj = payload.as_object_mut().expect("object");
+                            for field in [
+                                "protocol",
+                                "direction",
+                                "datagrams",
+                                "destination",
+                                "destination_port",
+                                "rate_per_second",
+                                "duration_seconds",
+                                "packet_size",
+                            ] {
+                                let value = step.get(field).cloned().unwrap_or(Value::Null);
+                                if !value.is_null() {
+                                    obj.insert(field.into(), value);
+                                }
+                            }
+                            payload
                         })
                 })
                 .unwrap_or(Value::Null);
