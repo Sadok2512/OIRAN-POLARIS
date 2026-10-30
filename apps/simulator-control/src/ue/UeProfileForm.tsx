@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { X } from 'lucide-react';
+import { ApiError } from '@shared/api';
 import {
   emptyProfile,
   validateProfile,
@@ -125,7 +126,7 @@ export function UeProfileFormDialog({
       setServerError('');
       await onSubmit(draft);
     } catch (error) {
-      setServerError((error as Error).message);
+      setServerError(humaniseProfileFormError(error));
     }
   }
 
@@ -301,4 +302,27 @@ function indexIssues(issues: ProfileIssue[]): Partial<Record<keyof UeProfileDraf
     if (!map[issue.path]) map[issue.path] = issue.message;
   }
   return map;
+}
+
+/**
+ * 0.10.4 — Turn a server error into a plain-French sentence for the
+ * form banner. The 409 "IMSI already taken" case the operator hits
+ * most often gets its own line; everything else falls back to the raw
+ * message. The technical code is kept trailing, once, so engineers
+ * still have the exact token to grep for.
+ */
+export function humaniseProfileFormError(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.status === 409) {
+      const headline = /IMSI/i.test(error.code) || /IMSI/i.test(error.message)
+        ? "L'IMSI est déjà utilisé par un autre abonné. Choisissez-en un autre."
+        : "Conflit côté backend : la ressource existe déjà.";
+      return `${headline} · ${error.code}`;
+    }
+    if (error.status === 401) {
+      return `Session expirée — reconnectez-vous. · ${error.code}`;
+    }
+    return `${error.message || 'Requête refusée.'} · ${error.code}`;
+  }
+  return (error as Error)?.message ?? 'Erreur inconnue.';
 }

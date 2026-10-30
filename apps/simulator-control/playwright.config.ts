@@ -31,6 +31,25 @@ export default defineConfig({
     screenshot: 'only-on-failure',
   },
   projects: [
+    // 0.10.4 — 1280 added as the narrowest supported width. Operators on
+    // 13" laptops land here with sidebar expanded; the honest-UX pass has
+    // to hold without horizontal scroll at this width too.
+    {
+      name: 'chromium-1280-light',
+      use: {
+        ...devices['Desktop Chrome'],
+        colorScheme: 'light',
+        viewport: { width: 1280, height: 800 },
+      },
+    },
+    {
+      name: 'chromium-1280-dark',
+      use: {
+        ...devices['Desktop Chrome'],
+        colorScheme: 'dark',
+        viewport: { width: 1280, height: 800 },
+      },
+    },
     {
       name: 'chromium-1440-light',
       use: {

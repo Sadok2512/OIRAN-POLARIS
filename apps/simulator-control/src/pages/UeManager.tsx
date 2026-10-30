@@ -764,26 +764,23 @@ export function UeManagerPage() {
           data-testid="ue-table"
         >
           <colgroup>
+            {/* 0.10.4 — Runtime columns collapsed into a single "État" cell.
+                The pre-0.10.4 5-column Runtime block still crammed labels
+                into tight widths at 1280px; the chip layout fits the
+                compact label + IP under a single 18 % column. RRC and
+                traffic moved to the Activity page. Total = 100 %. */}
             <col style={{ width: '2rem' }} />
-            <col style={{ width: '8%' }} />
-            <col style={{ width: '13%' }} />
-            <col style={{ width: '9%' }} />
-            <col style={{ width: '7%' }} />
-            {/* 0.10.2 (#42) — Runtime: 5 cells wide enough that labels like
-                REGISTERED / CONNECTED fit inside their own cell at 1440 and
-                1920 widths (the pre-0.10.2 7%/6%/6% split let REGISTERED
-                bleed into the PDU dot). */}
-            <col className="runtime-col" style={{ width: '9%' }} />
-            <col className="runtime-col" style={{ width: '7%' }} />
-            <col className="runtime-col" style={{ width: '6%' }} />
-            <col className="runtime-col" style={{ width: '8%' }} />
-            <col className="runtime-col" style={{ width: '6%' }} />
             <col style={{ width: '10%' }} />
-            <col style={{ width: '17%' }} />
+            <col style={{ width: '18%' }} />
+            <col style={{ width: '10%' }} />
+            <col style={{ width: '9%' }} />
+            <col className="runtime-col" style={{ width: '18%' }} />
+            <col style={{ width: '15%' }} />
+            <col style={{ width: '20%' }} />
           </colgroup>
           <thead>
             <tr>
-              <th className="w-8" rowSpan={2}>
+              <th className="w-8">
                 <input
                   type="checkbox"
                   aria-label="Select all on page"
@@ -802,25 +799,13 @@ export function UeManagerPage() {
                   data-testid="ue-select-all"
                 />
               </th>
-              <th rowSpan={2}>UE ID</th>
-              <th rowSpan={2}>IMSI</th>
-              <th rowSpan={2}>Owner</th>
-              <th rowSpan={2}>Serving gNB</th>
-              <th colSpan={5} className="text-center border-b border-border">
-                Runtime
-              </th>
-              <th rowSpan={2}>Scenario</th>
-              <th rowSpan={2} className="text-right">Actions</th>
-            </tr>
-            <tr>
-              {/* 0.10.2 (#42a) — Registration and PDU are two distinct
-                  sub-headers; the pre-0.10.2 layout rendered them without
-                  whitespace at narrow widths, which read as "REGISTRATIONPDU". */}
-              <th className="text-ep-xs font-normal text-text-secondary pr-2">Registration</th>
-              <th className="text-ep-xs font-normal text-text-secondary px-2">PDU</th>
-              <th className="text-ep-xs font-normal text-text-secondary px-2">RRC</th>
-              <th className="text-ep-xs font-normal text-text-secondary px-2">UE IP</th>
-              <th className="text-ep-xs font-normal text-text-secondary pl-2">Traffic</th>
+              <th>UE ID</th>
+              <th>IMSI</th>
+              <th>Owner</th>
+              <th>Serving gNB</th>
+              <th>État</th>
+              <th>Scenario</th>
+              <th className="text-right">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -833,17 +818,20 @@ export function UeManagerPage() {
               const isActiveForUe =
                 activeJob?.target_ue_id != null && activeJob.target_ue_id === backendId;
               const notProvisioned = !row.backend;
-              // 0.10.2 (#42d) — Runtime cells collapse into a single
-              // "Not running" when the UE is stopped. Stopped is defined as:
-              //   * no backend record at all (not provisioned), OR
-              //   * every runtime state unknown / blank / INACTIVE.
+              // 0.10.4 — Idle (= "Not running" chip) now follows the
+              // backend's `process_state` signal, not just the registration /
+              // PDU / RRC trio. A UE whose process is `idle` is stopped even
+              // when it still carries a `DEREGISTERED` registration remnant.
+              const processState = (row.backend?.process_state ?? '').toLowerCase();
               const runtimeStates = [
                 row.backend?.registration_state,
                 row.backend?.pdu_session,
-                row.backend?.rrc_state,
               ].map((state) => (state ?? '').toUpperCase());
               const isRuntimeIdle =
                 !row.backend ||
+                processState === 'idle' ||
+                processState === 'stopped' ||
+                processState === 'exited' ||
                 runtimeStates.every(
                   (state) => state === '' || state === 'UNKNOWN' || state === 'INACTIVE',
                 );
@@ -1000,38 +988,29 @@ export function UeManagerPage() {
                   </td>
                   <td data-testid={`ue-owner-${row.profile.id}`}>{displayOwner}</td>
                   <td className="mono">{row.profile.servingGnb || '—'}</td>
-                  {/* 0.10.2 (#42d) — Collapsed Runtime cell when the UE is
-                      stopped. Keeps the row from stacking three "Not running"
-                      pills on two lines and leaves the dot/label pair clear
-                      of the next column. */}
-                  {isRuntimeIdle ? (
-                    <td
-                      colSpan={5}
-                      className="text-text-secondary text-ep-sm px-2"
-                      data-testid={`ue-runtime-idle-${row.profile.id}`}
-                    >
-                      <StatusIndicator state="UNKNOWN" compact />
-                    </td>
-                  ) : (
-                    <>
-                      <td className="pr-2">
-                        <StatusIndicator
-                          state={row.backend?.registration_state ?? 'UNKNOWN'}
-                          compact
-                        />
-                      </td>
-                      <td className="px-2">
-                        <StatusIndicator state={row.backend?.pdu_session ?? 'UNKNOWN'} compact />
-                      </td>
-                      <td className="px-2">
-                        <StatusIndicator state={row.backend?.rrc_state ?? 'UNKNOWN'} compact />
-                      </td>
-                      <td className="mono text-ep-xs px-2">
-                        {row.backend?.ue_ip ?? row.profile.ueIp ?? '—'}
-                      </td>
-                      <td className="pl-2">{row.backend?.traffic_state ?? '—'}</td>
-                    </>
-                  )}
+                  {/* 0.10.4 — Single "État" cell replacing the 5-column
+                      Runtime block. The chip shows at most two state hints
+                      (`Registered · PDU active`), falls back to `Not running`
+                      when the UE is idle, and carries the UE IP on a second
+                      line below. RRC and traffic breakdown live on the
+                      Activity page now. */}
+                  <td
+                    className="px-2"
+                    data-testid={`ue-etat-${row.profile.id}`}
+                  >
+                    <div className="flex flex-col gap-0.5">
+                      <StatusIndicator
+                        state={etatToneState(row.backend, isRuntimeIdle)}
+                        label={etatLabel(row.backend, isRuntimeIdle)}
+                        compact
+                      />
+                      {(row.backend?.ue_ip ?? row.profile.ueIp) && (
+                        <span className="mono text-ep-xs text-text-secondary">
+                          {row.backend?.ue_ip ?? row.profile.ueIp}
+                        </span>
+                      )}
+                    </div>
+                  </td>
                   <td>
                     <div className="flex flex-col gap-1">
                       <select
@@ -1161,7 +1140,7 @@ export function UeManagerPage() {
             })}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={12} className="text-center text-text-secondary py-6">
+                <td colSpan={8} className="text-center text-text-secondary py-6">
                   {profiles.length === 0
                     ? 'No UE profile yet. Add one, bulk-create or import CSV.'
                     : 'No profile matches the current filter.'}
@@ -1451,6 +1430,50 @@ function timestampSuffix(): string {
 
 function pad(n: number): string {
   return n.toString().padStart(2, '0');
+}
+
+/**
+ * 0.10.4 — Compact label for the single "État" cell. We render AT MOST
+ * two chips concatenated with a middle dot (`Registered · PDU active`)
+ * so the content fits inside a 18 % column at 1280 px. When the UE is
+ * idle (no backend record or every runtime state blank/UNKNOWN) we
+ * surface the honest `Not running` instead.
+ *
+ * Visible only exported for the unit tests that pin the wording.
+ */
+export function etatLabel(backend: UeState | undefined, idle: boolean): string {
+  if (idle || !backend) return 'Not running';
+  const parts: string[] = [];
+  const reg = (backend.registration_state ?? '').toUpperCase();
+  const pdu = (backend.pdu_session ?? '').toUpperCase();
+  if (reg === 'REGISTERED') parts.push('Registered');
+  else if (reg === 'DEREGISTERED') parts.push('Deregistered');
+  else if (reg && reg !== 'UNKNOWN' && reg !== 'INACTIVE') {
+    parts.push(humaniseState(reg));
+  }
+  if (pdu === 'ACTIVE') parts.push('PDU active');
+  else if (pdu && pdu !== 'UNKNOWN' && pdu !== 'INACTIVE' && pdu !== 'IDLE') {
+    parts.push(humaniseState(pdu));
+  }
+  return parts.length === 0 ? 'Not running' : parts.join(' · ');
+}
+
+/**
+ * 0.10.4 — Tone marker for the État chip. Fed to StatusIndicator's
+ * `state` prop so the existing tone-map (`REGISTERED` → success, etc.)
+ * paints the dot without us re-deriving the colour here.
+ */
+export function etatToneState(backend: UeState | undefined, idle: boolean): string {
+  if (idle || !backend) return 'UNKNOWN';
+  const reg = (backend.registration_state ?? '').toUpperCase();
+  if (reg === 'REGISTERED') return 'REGISTERED';
+  if (reg === 'DEREGISTERED') return 'OFFLINE';
+  return reg || 'UNKNOWN';
+}
+
+function humaniseState(upper: string): string {
+  const lower = upper.toLowerCase();
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
 }
 
 /**
