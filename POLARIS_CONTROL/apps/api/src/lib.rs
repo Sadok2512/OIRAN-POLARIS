@@ -690,6 +690,27 @@ fn classify_iperf_delivery(
     Ok(None)
 }
 
+/// 0.19.6 — Combine the `server_output_json` fallback flag and the
+/// delivery-classification warning into the single `warning` field
+/// on `IperfMeasurement`. iperf3 is a measurement step — a missing
+/// server echo is signalled but does not fail the step. A delivery
+/// drift (receiver < sender) is still reported alongside it when
+/// both conditions hold.
+fn compose_iperf_warning(server_missing: bool, delivery: Option<String>) -> Option<String> {
+    let mut warnings: Vec<String> = Vec::new();
+    if server_missing {
+        warnings.push("IPERF3_SERVER_OUTPUT_MISSING".into());
+    }
+    if let Some(code) = delivery {
+        warnings.push(code);
+    }
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join(";"))
+    }
+}
+
 /// 0.17.1 — Run `ip route get <destination>` inside the UE network namespace
 /// via `nsenter`. Returns the raw stdout so the caller can both parse it (via
 /// `evaluate_ue_route_preflight`) and attach the exact line to
@@ -1445,31 +1466,43 @@ trait UeRuntime: Send + Sync {
         let client_report: Value = serde_json::from_slice(&client_output.stdout).map_err(|_| {
             attach_preflight_to_failure("IPERF3_UL_FAILED", &client_output, command, &preflight)
         })?;
-        let receiver_report: Value = client_report
-            .get("server_output_json")
-            .cloned()
-            .ok_or_else(|| {
-                attach_preflight_to_failure(
-                    "IPERF3_UL_SERVER_OUTPUT_MISSING",
-                    &receiver_output,
-                    receiver_command,
-                    &preflight,
-                )
-            })?;
+        // 0.19.6 — Server output is a measurement nice-to-have, not a
+        // gate. When `server_output_json` is missing we fall back to
+        // the CLIENT's own `end.sum_received.bytes` (iperf3 reports
+        // the receiver's acknowledged bytes from its own view) and
+        // tag the measurement with IPERF3_SERVER_OUTPUT_MISSING. The
+        // job only fails when the client reports zero sent bytes
+        // (connection impossible) or zero received (nothing landed).
+        let receiver_report = client_report.get("server_output_json").cloned();
+        let server_missing = receiver_report.is_none();
         let client_sent_bytes = client_report
             .pointer("/end/sum_sent/bytes")
             .and_then(Value::as_u64)
             .ok_or("IPERF3_UL_CLIENT_BYTES_NOT_MEASURED")?;
-        let server_received_bytes = receiver_report
-            .pointer("/end/sum_received/bytes")
-            .and_then(Value::as_u64)
-            .ok_or("IPERF3_UL_RECEIVER_BYTES_NOT_MEASURED")?;
+        let server_received_bytes = match &receiver_report {
+            Some(report) => report
+                .pointer("/end/sum_received/bytes")
+                .and_then(Value::as_u64)
+                .ok_or("IPERF3_UL_RECEIVER_BYTES_NOT_MEASURED")?,
+            None => client_report
+                .pointer("/end/sum_received/bytes")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    attach_preflight_to_failure(
+                        "IPERF3_UL_SERVER_OUTPUT_MISSING",
+                        &receiver_output,
+                        receiver_command,
+                        &preflight,
+                    )
+                })?,
+        };
         let retransmissions = client_report
             .pointer("/end/sum_sent/retransmits")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let warning =
+        let delivery_warning =
             classify_iperf_delivery("UL", client_sent_bytes, server_received_bytes, &preflight)?;
+        let warning = compose_iperf_warning(server_missing, delivery_warning);
         Ok(IperfMeasurement {
             client_sent_bytes,
             server_received_bytes,
@@ -1579,23 +1612,32 @@ trait UeRuntime: Send + Sync {
                 &preflight,
             )
         })?;
-        let receiver_report: Value = sender_report
-            .get("server_output_json")
-            .cloned()
-            .ok_or("IPERF3_DL_SERVER_OUTPUT_MISSING")?;
+        // 0.19.6 — Same fallback as UL: a missing `server_output_json`
+        // is a measurement warning, not a job failure. The DN
+        // sender's own `end.sum_received.bytes` is the client-side
+        // view of what the receiver acknowledged.
+        let receiver_report = sender_report.get("server_output_json").cloned();
+        let server_missing = receiver_report.is_none();
         let sender_bytes = sender_report
             .pointer("/end/sum_sent/bytes")
             .and_then(Value::as_u64)
             .ok_or("IPERF3_DL_SENDER_BYTES_NOT_MEASURED")?;
-        let ue_bytes = receiver_report
-            .pointer("/end/sum_received/bytes")
-            .and_then(Value::as_u64)
-            .ok_or("IPERF3_DL_UE_BYTES_NOT_MEASURED")?;
+        let ue_bytes = match &receiver_report {
+            Some(report) => report
+                .pointer("/end/sum_received/bytes")
+                .and_then(Value::as_u64)
+                .ok_or("IPERF3_DL_UE_BYTES_NOT_MEASURED")?,
+            None => sender_report
+                .pointer("/end/sum_received/bytes")
+                .and_then(Value::as_u64)
+                .ok_or("IPERF3_DL_SERVER_OUTPUT_MISSING")?,
+        };
         let retransmissions = sender_report
             .pointer("/end/sum_sent/retransmits")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let warning = classify_iperf_delivery("DL", sender_bytes, ue_bytes, &preflight)?;
+        let delivery_warning = classify_iperf_delivery("DL", sender_bytes, ue_bytes, &preflight)?;
+        let warning = compose_iperf_warning(server_missing, delivery_warning);
         Ok(IperfMeasurement {
             client_sent_bytes: sender_bytes,
             server_received_bytes: ue_bytes,
@@ -6942,6 +6984,28 @@ async fn ues(
     let controller_jobs = controller.snapshot();
     let profile_specs = controller.profiles();
     let control_authorized_ids = authorized_ue_control_ids(&state, &identity);
+    // 0.19.6 — Pre-compute the set of UE ids covered by at least one
+    // active grant. The per-UE `actions.start` / `actions.run` flags
+    // below OR this against the session-level
+    // `ue_control_authorized_ids` so the UI reflects the same rule
+    // the Start / Run handlers apply (see `start_ue`,
+    // `start_live_definition_scenario`). A revocation / expiry
+    // immediately flips the flag back to false; a session-level
+    // authorization is still honoured on its own.
+    let grant_covered_ids: BTreeSet<String> = {
+        let now_ms = epoch_millis_u128();
+        state
+            .live_grants
+            .lock()
+            .map(|grants| {
+                grants
+                    .iter()
+                    .filter(|grant| grant.is_active(now_ms))
+                    .flat_map(|grant| grant.ue_ids.iter().cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let items = profile_specs
         .iter()
         .filter(|profile| profile.configured)
@@ -7019,7 +7083,10 @@ async fn ues(
             } else {
                 "READY"
             };
-            let control_authorized = control_authorized_ids.contains(&profile.ue_id);
+            // 0.19.6 — Authority = session-authorized OR grant-covered.
+            // Same rule as `start_ue` (the HTTP gate accepts either).
+            let control_authorized = control_authorized_ids.contains(&profile.ue_id)
+                || grant_covered_ids.contains(&profile.ue_id);
             let start_reason = if base_reason != "READY" {
                 base_reason
             } else if job.is_some_and(|value| value.process_handle.is_some()) {
@@ -7069,7 +7136,10 @@ async fn ues(
         };
         let shared = profile.ue_id == "UE-01" && !state.ue01_controller_owned;
         let reason = if shared {"SHARED_UE_PROTECTED"} else if !profile.configured {"NOT_CONFIGURED"} else if !profile.subscription_verified {"SUBSCRIBER_PROVISIONING_REVIEW_REQUIRED"} else if !controller_owns_ue(&state, &profile.ue_id) {"PROTECTED_OR_UNAPPROVED_UE"} else if state.execution_mode != "live" {"LIVE_EXECUTION_NOT_CONFIGURED"} else {"READY"};
-        let control_authorized = control_authorized_ids.contains(&profile.ue_id);
+        // 0.19.6 — Session OR grant authority, same as the live
+        // actions.start computed above and the Start / Run handlers.
+        let control_authorized = control_authorized_ids.contains(&profile.ue_id)
+            || grant_covered_ids.contains(&profile.ue_id);
         json!({
             "id":profile.ue_id,"pseudonym":profile.pseudonym,"profile":profile.profile_name,"serving_gnb":profile.serving_gnb,"simulator":"UERANSIM",
             "state":state_label,"configured":profile.configured,"controller_owned":!shared,"ownership":if shared {"SHARED_PROTECTED"} else {"POLARIS_CONTROLLER"},"control_authorized":control_authorized,"subscription_status":if profile.subscription_verified {"VERIFIED"}else{"PROVISIONING_UNKNOWN"},
@@ -12906,6 +12976,124 @@ mod p0_tests {
         assert!(job.operation_locked_at_epoch_s.is_none());
     }
 
+    /// 0.19.6 — `/ues` must flip `actions.start` to `true` as soon as
+    /// an active grant covers the UE (same rule as the Start handler).
+    /// Revocation flips it back to `false` with the honest
+    /// `UE_CONTROL_VALIDATION_REQUIRED` reason.
+    #[tokio::test]
+    async fn ues_actions_start_follows_the_active_grant_set() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        prepare_owned_traffic_target(&test_state, "UE-02", /* pdu_active */ false);
+        // Clear the started job so actions.start isn't masked by
+        // UE_ALREADY_RUNNING — we need the raw gate check.
+        {
+            let mut controller = test_state.multi_ue.lock().unwrap();
+            controller.stop_offline("UE-02").unwrap();
+        }
+        let grants_arc = test_state.live_grants.clone();
+        let application = app(test_state);
+        let (cookie, _csrf) =
+            login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+
+        let read_actions = |cookie: &str| {
+            let cookie = cookie.to_string();
+            let app_clone = application.clone();
+            async move {
+                let response = app_clone
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri("/api/v1/ues")
+                            .header(header::COOKIE, &cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body: Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                )
+                .unwrap();
+                body
+            }
+        };
+
+        // Baseline: no grant, no session authorisation → actions.start
+        // = false and the honest reason surfaces.
+        let before = read_actions(&cookie).await;
+        let ue02 = before["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["internal_ue_id"] == Value::String("UE-02".into()))
+            .expect("UE-02 present in /ues");
+        assert_eq!(
+            ue02["actions"]["start"],
+            Value::Bool(false),
+            "baseline must refuse Start without authority: {ue02}",
+        );
+        assert_eq!(
+            ue02["actions"]["start_reason"],
+            Value::String("UE_CONTROL_VALIDATION_REQUIRED".into()),
+        );
+
+        // Install an active grant for UE-02 → actions.start flips to
+        // true and the reason becomes READY.
+        {
+            let now = epoch_millis_u128();
+            let mut grants = grants_arc.lock().unwrap();
+            grants.push(LiveGrant {
+                id: "grant-ue02".into(),
+                ue_ids: vec!["UE-02".into()],
+                duration_minutes: 60,
+                granted_at_epoch_ms: now,
+                expires_at_epoch_ms: now.saturating_add(3_600_000),
+                granted_by: "operator".into(),
+                revoked: false,
+            });
+        }
+        let during = read_actions(&cookie).await;
+        let ue02 = during["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["internal_ue_id"] == Value::String("UE-02".into()))
+            .unwrap();
+        assert_eq!(
+            ue02["actions"]["start"],
+            Value::Bool(true),
+            "active grant must flip actions.start=true: {ue02}",
+        );
+        assert_eq!(ue02["actions"]["start_reason"], Value::String("READY".into()));
+
+        // Revoke the grant → actions.start flips back to false and
+        // the UE_CONTROL_VALIDATION_REQUIRED reason returns.
+        {
+            let mut grants = grants_arc.lock().unwrap();
+            for grant in grants.iter_mut() {
+                grant.revoked = true;
+            }
+        }
+        let after = read_actions(&cookie).await;
+        let ue02 = after["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["internal_ue_id"] == Value::String("UE-02".into()))
+            .unwrap();
+        assert_eq!(
+            ue02["actions"]["start"],
+            Value::Bool(false),
+            "revoked grant must flip actions.start=false: {ue02}",
+        );
+        assert_eq!(
+            ue02["actions"]["start_reason"],
+            Value::String("UE_CONTROL_VALIDATION_REQUIRED".into()),
+        );
+    }
+
     /// 0.19.5 — Orphan `operation_id` leftover from a crashed Stop
     /// gets reaped at `AppState::try_new`. We simulate this by
     /// pre-writing a ue-jobs.json that carries a stuck lock, then
@@ -15484,6 +15672,33 @@ mod p0_tests {
         assert_eq!(
             classify_iperf_delivery("UL", 1_310_720, 1_310_720, &preflight).unwrap(),
             None
+        );
+    }
+
+    /// 0.19.6 — iperf3 is measurement, not a gate. Missing
+    /// `server_output_json` surfaces as the IPERF3_SERVER_OUTPUT_MISSING
+    /// warning + the delivery classification is chained alongside
+    /// when it fires too. Zero bytes received stays fatal.
+    #[test]
+    fn compose_iperf_warning_chains_server_missing_with_delivery() {
+        // No fallback, no delivery drift → no warning at all.
+        assert_eq!(compose_iperf_warning(false, None), None);
+        // Delivery drift alone (sender==receiver but short) → single warning.
+        assert_eq!(
+            compose_iperf_warning(false, Some("IPERF3_RECEIVER_SHORT".into())).as_deref(),
+            Some("IPERF3_RECEIVER_SHORT"),
+        );
+        // Server output missing alone → operator-facing marker.
+        assert_eq!(
+            compose_iperf_warning(true, None).as_deref(),
+            Some("IPERF3_SERVER_OUTPUT_MISSING"),
+        );
+        // Both conditions → semicolon-joined, server-missing first so
+        // readers see the measurement-quality caveat before the
+        // delivery drift.
+        assert_eq!(
+            compose_iperf_warning(true, Some("IPERF3_RECEIVER_SHORT".into())).as_deref(),
+            Some("IPERF3_SERVER_OUTPUT_MISSING;IPERF3_RECEIVER_SHORT"),
         );
     }
 
