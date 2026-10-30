@@ -1,6 +1,8 @@
 //! Reusable native decoder pipeline used by both the CLI and live capture service.
 
-use capture_pcap::{read_capture, transport_view, CapturePacket, TransportProtocol, TransportView};
+use capture_pcap::{
+    transport_view, visit_capture, CapturePacket, TransportProtocol, TransportView,
+};
 use decoder_gtpu::GtpuDecoder;
 use decoder_ngap::NgapDecoder;
 use decoder_pfcp::PfcpDecoder;
@@ -56,8 +58,6 @@ pub struct DecodeOutput {
 
 pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
     validate_config(config)?;
-    let capture =
-        read_capture(&config.input, &config.capture_id).map_err(|error| error.to_string())?;
     let ngap = NgapDecoder;
     let pfcp = PfcpDecoder;
     let gtpu = GtpuDecoder;
@@ -66,16 +66,16 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
     let mut events = Vec::new();
     let mut transport_errors = 0usize;
 
-    for packet in &capture.packets {
+    let capture = visit_capture(&config.input, &config.capture_id, |packet| {
         if packet.metadata.truncated {
             transport_errors += 1;
-            continue;
+            return;
         }
-        let view = match transport_view(packet) {
+        let view = match transport_view(&packet) {
             Ok(view) => view,
             Err(_) => {
                 transport_errors += 1;
-                continue;
+                return;
             }
         };
         match view.protocol {
@@ -85,13 +85,13 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
                     view.destination_port.unwrap_or(0),
                 );
                 if ports.0 == 8805 || ports.1 == 8805 {
-                    decode_udp(&pfcp, packet, &view, config, "N4", &mut events);
+                    decode_udp(&pfcp, &packet, &view, config, "N4", &mut events);
                 } else if ports.0 == 2152 || ports.1 == 2152 {
-                    decode_udp(&gtpu, packet, &view, config, "N3", &mut events);
+                    decode_udp(&gtpu, &packet, &view, config, "N3", &mut events);
                 }
             }
             TransportProtocol::Sctp => {
-                for message in sctp.consume(packet, &view) {
+                for message in sctp.consume(&packet, &view) {
                     if message.ppid != 60 {
                         continue;
                     }
@@ -119,10 +119,11 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
                     events.extend(ngap.decode(&input).events);
                 }
             }
-            TransportProtocol::Tcp => tcp.consume(packet, &view),
+            TransportProtocol::Tcp => tcp.consume(&packet, &view),
             TransportProtocol::Other(_) => {}
         }
-    }
+    })
+    .map_err(|error| error.to_string())?;
     let (sctp_errors, incomplete_sctp) = sctp.finish();
     let (connections, tcp_errors) = tcp.finish();
     let (sbi_events, sbi_report) = decode_connections(
@@ -149,7 +150,7 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
     Ok(DecodeOutput {
         report: DecodeReport {
             capture_format: format!("{:?}", capture.format),
-            packets: capture.packets.len(),
+            packets: capture.packets,
             events: events.len(),
             warnings: capture.warnings.len(),
             transport_errors,

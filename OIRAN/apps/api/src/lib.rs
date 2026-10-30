@@ -14,7 +14,9 @@ use callflow_schema::{build_callflow, CallFlow};
 use dataset_registry::{CaptureRecord, DatasetRecord, DatasetRegistry};
 use disk_safety::{assess, capture_budget, measure_path, rotation_plan, Policy};
 use event_schema::sha256_hex;
-use live_probe::{CaptureManager, CaptureRequest, ContinuousImportConfig};
+use live_probe::{
+    CaptureManager, CaptureRequest, ContinuousImportConfig, DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+};
 use probe_registry::{CreateError as ProbeCreateError, ProbeInput, ProbeRecord, ProbeRegistry};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -33,8 +35,8 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.5.0";
-pub const PLATFORM_VERSION: &str = "2.5.0";
+pub const API_VERSION: &str = "2.5.1";
+pub const PLATFORM_VERSION: &str = "2.5.1";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -76,6 +78,7 @@ pub struct ApiConfig {
     pub continuous_native_capture: bool,
     pub continuous_import_source: Option<PathBuf>,
     pub continuous_historical_n2_bootstrap: Option<PathBuf>,
+    pub continuous_max_segment_bytes: u64,
 }
 
 impl ApiConfig {
@@ -106,6 +109,10 @@ impl ApiConfig {
                 .map(PathBuf::from),
             continuous_historical_n2_bootstrap: std::env::var_os("OIRAN_CONTINUOUS_BOOTSTRAP_N2")
                 .map(PathBuf::from),
+            continuous_max_segment_bytes: std::env::var("OIRAN_CONTINUOUS_MAX_SEGMENT_BYTES")
+                .ok()
+                .map(|value| value.parse::<u64>().unwrap_or(0))
+                .unwrap_or(DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES),
         }
     }
 }
@@ -154,6 +161,13 @@ impl AppState {
                 }
                 ContinuousImportConfig::bounded(source)
             };
+            let mut continuous = continuous;
+            continuous.max_segment_bytes = config.continuous_max_segment_bytes;
+            continuous.max_owned_bytes = continuous.max_owned_bytes.max(
+                config
+                    .continuous_max_segment_bytes
+                    .saturating_add(64 * 1024 * 1024),
+            );
             capture_manager.start_continuous_import(continuous)?;
         }
         Self::load_with_capture_manager(config, capture_manager)
@@ -2728,6 +2742,7 @@ mod tests {
                 scan_interval: std::time::Duration::from_millis(200),
                 stable_age: std::time::Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
                 max_segments: 8,
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,

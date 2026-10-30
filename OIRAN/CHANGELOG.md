@@ -1,5 +1,19 @@
 # Changelog
 
+## OIRAN API 2.5.1 / live-probe 0.2.4 - 2026-10-30
+
+- Added `OIRAN_CONTINUOUS_MAX_SEGMENT_BYTES`, defaulting to 1 GiB, with
+  validation against the existing bounded disk policy.
+- Reworked PCAP/PCAPNG decoding to visit packets incrementally; discovery,
+  SHA-256, copy, packet parsing and decoding no longer materialise an entire
+  capture file.
+- Oversized finalized segments are now persisted individually with source
+  path, observed byte size, timestamp and
+  `CONTINUOUS_SOURCE_SEGMENT_TOO_LARGE`; they no longer fail the continuous
+  import job or prevent eligible siblings from being ingested.
+- Added regression coverage for a streaming 300 MiB import below 32 MiB live
+  allocation and for mixed accepted/rejected segments.
+
 ## OIRAN API 2.5.0 / live-probe 0.2.3 / oiran-decode 0.4.5 - 2026-10-30
 
 - Integrated the persistent API 2.4 probe registry and its truthful heartbeat,

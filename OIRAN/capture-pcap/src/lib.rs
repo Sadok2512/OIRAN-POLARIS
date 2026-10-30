@@ -1,7 +1,11 @@
 //! Bounded native PCAP/PCAPNG reader with exact timestamp provenance.
 
 use event_schema::ExactTimestamp;
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs::File,
+    io::{BufReader, ErrorKind, Read},
+    path::Path,
+};
 
 pub const LINKTYPE_ETHERNET: u32 = 1;
 pub const LINKTYPE_LINUX_SLL: u32 = 113;
@@ -64,6 +68,14 @@ pub struct CaptureFile {
     pub format: CaptureFormat,
     pub interfaces: Vec<Interface>,
     pub packets: Vec<CapturePacket>,
+    pub warnings: Vec<CaptureError>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureSummary {
+    pub format: CaptureFormat,
+    pub interfaces: Vec<Interface>,
+    pub packets: usize,
     pub warnings: Vec<CaptureError>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -150,6 +162,389 @@ pub fn read_capture(path: impl AsRef<Path>, capture_id: &str) -> Result<CaptureF
         .map_err(|e| err(CaptureErrorKind::Io, 0, e.to_string()))?;
     let source = path.to_string_lossy().into_owned();
     read_capture_bytes(&data, &source, capture_id)
+}
+
+/// Visit one packet at a time without materialising the capture file or its
+/// packet vector. The largest allocation is bounded by `MAX_PACKET_BYTES`.
+pub fn visit_capture(
+    path: impl AsRef<Path>,
+    capture_id: &str,
+    mut visitor: impl FnMut(CapturePacket),
+) -> Result<CaptureSummary, CaptureError> {
+    let path = path.as_ref();
+    let source = path.to_string_lossy().into_owned();
+    let mut reader = BufReader::new(
+        File::open(path).map_err(|error| err(CaptureErrorKind::Io, 0, error.to_string()))?,
+    );
+    let mut magic = [0u8; 4];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|error| err(CaptureErrorKind::InvalidHeader, 0, error.to_string()))?;
+    if magic == [0x0a, 0x0d, 0x0d, 0x0a] {
+        visit_pcapng_stream(reader, magic, &source, capture_id, &mut visitor)
+    } else {
+        visit_pcap_stream(reader, magic, &source, capture_id, &mut visitor)
+    }
+}
+
+fn visit_pcap_stream(
+    mut reader: BufReader<File>,
+    magic: [u8; 4],
+    source: &str,
+    capture_id: &str,
+    visitor: &mut impl FnMut(CapturePacket),
+) -> Result<CaptureSummary, CaptureError> {
+    let (endian, nano) = match magic {
+        [0xd4, 0xc3, 0xb2, 0xa1] => (Endian::Little, false),
+        [0xa1, 0xb2, 0xc3, 0xd4] => (Endian::Big, false),
+        [0x4d, 0x3c, 0xb2, 0xa1] => (Endian::Little, true),
+        [0xa1, 0xb2, 0x3c, 0x4d] => (Endian::Big, true),
+        _ => {
+            return Err(err(
+                CaptureErrorKind::InvalidHeader,
+                0,
+                "unknown PCAP magic",
+            ))
+        }
+    };
+    let mut header = [0u8; 20];
+    reader
+        .read_exact(&mut header)
+        .map_err(|error| err(CaptureErrorKind::Truncated, 4, error.to_string()))?;
+    if endian.u16(&header[0..2]) != 2 {
+        return Err(err(
+            CaptureErrorKind::InvalidHeader,
+            4,
+            "unsupported PCAP major version",
+        ));
+    }
+    let snaplen = endian.u32(&header[12..16]);
+    let link = endian.u32(&header[16..20]);
+    let interface = Interface {
+        id: 0,
+        link_type: link,
+        snaplen,
+        ts_base: 10,
+        ts_exponent: if nano { 9 } else { 6 },
+        ts_offset_seconds: 0,
+    };
+    let mut offset = 24u64;
+    let mut number = 0u64;
+    loop {
+        let mut record = [0u8; 16];
+        if !read_exact_or_eof(&mut reader, &mut record, offset)? {
+            break;
+        }
+        let sec = endian.u32(&record[0..4]) as i64;
+        let fraction = endian.u32(&record[4..8]) as u64;
+        let cap = endian.u32(&record[8..12]);
+        let orig = endian.u32(&record[12..16]);
+        if orig < cap || (snaplen != 0 && cap > snaplen) {
+            return Err(err(
+                CaptureErrorKind::InvalidBlock,
+                offset,
+                "PCAP captured/original/snap lengths are inconsistent",
+            ));
+        }
+        if cap as usize > MAX_PACKET_BYTES {
+            return Err(err(
+                CaptureErrorKind::InvalidBlock,
+                offset,
+                "packet exceeds safety limit",
+            ));
+        }
+        let mut packet_data = vec![0u8; cap as usize];
+        reader.read_exact(&mut packet_data).map_err(|_| {
+            err(
+                CaptureErrorKind::Truncated,
+                offset,
+                "PCAP packet bytes truncated",
+            )
+        })?;
+        let units = if nano { 1_000_000_000 } else { 1_000_000 };
+        if fraction >= units {
+            return Err(err(
+                CaptureErrorKind::InvalidTimestamp,
+                offset,
+                "PCAP fractional timestamp out of range",
+            ));
+        }
+        number += 1;
+        visitor(CapturePacket {
+            metadata: PacketMetadata {
+                capture_id: capture_id.into(),
+                source_file: source.into(),
+                packet_number: number,
+                byte_offset: offset,
+                timestamp: ExactTimestamp {
+                    seconds: sec,
+                    nanoseconds: if nano {
+                        fraction as u32
+                    } else {
+                        (fraction * 1000) as u32
+                    },
+                    raw_ticks: (sec as u64).saturating_mul(units) + fraction,
+                    resolution_base: 10,
+                    resolution_exponent: if nano { 9 } else { 6 },
+                },
+                captured_length: cap,
+                original_length: orig,
+                interface_id: 0,
+                link_type: link,
+                sll2: sll2_metadata_if_valid(link, &packet_data),
+                truncated: cap < orig,
+            },
+            data: packet_data,
+        });
+        offset = offset.saturating_add(16 + u64::from(cap));
+    }
+    Ok(CaptureSummary {
+        format: CaptureFormat::Pcap,
+        interfaces: vec![interface],
+        packets: number as usize,
+        warnings: Vec::new(),
+    })
+}
+
+fn visit_pcapng_stream(
+    mut reader: BufReader<File>,
+    first_type: [u8; 4],
+    source: &str,
+    capture_id: &str,
+    visitor: &mut impl FnMut(CapturePacket),
+) -> Result<CaptureSummary, CaptureError> {
+    let mut next_type = Some(first_type);
+    let mut offset = 0u64;
+    let mut endian = None;
+    let mut interfaces = Vec::<Interface>::new();
+    let mut warnings = Vec::new();
+    let mut number = 0u64;
+    let mut section_seen = false;
+    loop {
+        let block_type_raw = if let Some(value) = next_type.take() {
+            value
+        } else {
+            let mut value = [0u8; 4];
+            if !read_exact_or_eof(&mut reader, &mut value, offset)? {
+                break;
+            }
+            value
+        };
+        let mut length_raw = [0u8; 4];
+        reader.read_exact(&mut length_raw).map_err(|_| {
+            err(
+                CaptureErrorKind::Truncated,
+                offset,
+                "PCAPNG block header truncated",
+            )
+        })?;
+        if block_type_raw == [0x0a, 0x0d, 0x0d, 0x0a] {
+            let mut bom = [0u8; 4];
+            reader.read_exact(&mut bom).map_err(|_| {
+                err(
+                    CaptureErrorKind::Truncated,
+                    offset,
+                    "section header truncated",
+                )
+            })?;
+            let e = match bom {
+                [0x4d, 0x3c, 0x2b, 0x1a] => Endian::Little,
+                [0x1a, 0x2b, 0x3c, 0x4d] => Endian::Big,
+                _ => {
+                    return Err(err(
+                        CaptureErrorKind::InvalidHeader,
+                        offset + 8,
+                        "invalid PCAPNG byte-order magic",
+                    ))
+                }
+            };
+            let len = e.u32(&length_raw) as usize;
+            validate_stream_block_length(len, offset)?;
+            if len < 28 {
+                return Err(err(
+                    CaptureErrorKind::Truncated,
+                    offset,
+                    "section header truncated",
+                ));
+            }
+            let mut remainder = vec![0u8; len - 12];
+            reader.read_exact(&mut remainder).map_err(|_| {
+                err(
+                    CaptureErrorKind::Truncated,
+                    offset,
+                    "section header truncated",
+                )
+            })?;
+            validate_stream_trailer(&remainder, len, e, offset)?;
+            if e.u16(&remainder[0..2]) != 1 {
+                return Err(err(
+                    CaptureErrorKind::InvalidHeader,
+                    offset + 12,
+                    "unsupported PCAPNG major version",
+                ));
+            }
+            endian = Some(e);
+            interfaces.clear();
+            section_seen = true;
+            offset = offset.saturating_add(len as u64);
+            continue;
+        }
+        let e = endian.ok_or_else(|| {
+            err(
+                CaptureErrorKind::InvalidHeader,
+                offset,
+                "block before section header",
+            )
+        })?;
+        let len = e.u32(&length_raw) as usize;
+        validate_stream_block_length(len, offset)?;
+        let mut remainder = vec![0u8; len - 8];
+        reader.read_exact(&mut remainder).map_err(|_| {
+            err(
+                CaptureErrorKind::Truncated,
+                offset,
+                "PCAPNG block exceeds file",
+            )
+        })?;
+        validate_stream_trailer(&remainder, len, e, offset)?;
+        let body = &remainder[..remainder.len() - 4];
+        match e.u32(&block_type_raw) {
+            1 => {
+                if body.len() < 8 {
+                    return Err(err(
+                        CaptureErrorKind::Truncated,
+                        offset,
+                        "interface description truncated",
+                    ));
+                }
+                let mut iface = Interface {
+                    id: interfaces.len() as u32,
+                    link_type: e.u16(&body[0..2]) as u32,
+                    snaplen: e.u32(&body[4..8]),
+                    ts_base: 10,
+                    ts_exponent: 6,
+                    ts_offset_seconds: 0,
+                };
+                parse_idb_options(&body[8..], e, &mut iface, offset as usize + 16)?;
+                interfaces.push(iface);
+            }
+            6 | 2 => {
+                if body.len() < 20 {
+                    return Err(err(
+                        CaptureErrorKind::Truncated,
+                        offset,
+                        "packet block truncated",
+                    ));
+                }
+                let iface_id = if e.u32(&block_type_raw) == 6 {
+                    e.u32(&body[0..4])
+                } else {
+                    e.u16(&body[0..2]) as u32
+                };
+                let iface = interfaces.get(iface_id as usize).ok_or_else(|| {
+                    err(
+                        CaptureErrorKind::InvalidBlock,
+                        offset,
+                        "packet references unknown interface",
+                    )
+                })?;
+                let ticks = ((e.u32(&body[4..8]) as u64) << 32) | e.u32(&body[8..12]) as u64;
+                let cap = e.u32(&body[12..16]);
+                let orig = e.u32(&body[16..20]);
+                if orig < cap || (iface.snaplen != 0 && cap > iface.snaplen) {
+                    return Err(err(
+                        CaptureErrorKind::InvalidBlock,
+                        offset,
+                        "packet lengths exceed original length or snaplen",
+                    ));
+                }
+                if cap as usize > MAX_PACKET_BYTES || 20 + align4(cap as usize) > body.len() {
+                    return Err(err(
+                        CaptureErrorKind::Truncated,
+                        offset,
+                        "packet data truncated",
+                    ));
+                }
+                number += 1;
+                let packet_data = body[20..20 + cap as usize].to_vec();
+                let mut packet_metadata =
+                    metadata(capture_id, source, number, offset, ticks, cap, orig, iface)?;
+                packet_metadata.sll2 = sll2_metadata_if_valid(iface.link_type, &packet_data);
+                visitor(CapturePacket {
+                    metadata: packet_metadata,
+                    data: packet_data,
+                });
+            }
+            3 => warnings.push(err(
+                CaptureErrorKind::UnsupportedPacket,
+                offset,
+                "simple packet block has no source timestamp and was not emitted",
+            )),
+            _ => {}
+        }
+        offset = offset.saturating_add(len as u64);
+    }
+    if !section_seen {
+        return Err(err(CaptureErrorKind::InvalidHeader, 0, "no PCAPNG section"));
+    }
+    Ok(CaptureSummary {
+        format: CaptureFormat::PcapNg,
+        interfaces,
+        packets: number as usize,
+        warnings,
+    })
+}
+
+fn read_exact_or_eof(
+    reader: &mut BufReader<File>,
+    bytes: &mut [u8],
+    offset: u64,
+) -> Result<bool, CaptureError> {
+    match reader.read(&mut bytes[..1]) {
+        Ok(0) => Ok(false),
+        Ok(1) => {
+            reader.read_exact(&mut bytes[1..]).map_err(|_| {
+                err(
+                    CaptureErrorKind::Truncated,
+                    offset,
+                    "capture record truncated",
+                )
+            })?;
+            Ok(true)
+        }
+        Ok(_) => unreachable!(),
+        Err(error) if error.kind() == ErrorKind::Interrupted => {
+            read_exact_or_eof(reader, bytes, offset)
+        }
+        Err(error) => Err(err(CaptureErrorKind::Io, offset, error.to_string())),
+    }
+}
+
+fn validate_stream_block_length(len: usize, offset: u64) -> Result<(), CaptureError> {
+    if len < 12 || len % 4 != 0 || len > MAX_PACKET_BYTES + 1024 * 1024 {
+        return Err(err(
+            CaptureErrorKind::InvalidBlock,
+            offset,
+            "invalid PCAPNG block length",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_trailer(
+    remainder: &[u8],
+    len: usize,
+    endian: Endian,
+    offset: u64,
+) -> Result<(), CaptureError> {
+    if remainder.len() < 4 || endian.u32(&remainder[remainder.len() - 4..]) as usize != len {
+        return Err(err(
+            CaptureErrorKind::InvalidBlock,
+            offset,
+            "PCAPNG trailing block length mismatch",
+        ));
+    }
+    Ok(())
 }
 pub fn read_capture_bytes(
     data: &[u8],
@@ -964,6 +1359,19 @@ fn parse_v6(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temporary_capture(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "capture-pcap-{name}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
     fn le32(v: u32) -> [u8; 4] {
         v.to_le_bytes()
     }
@@ -1086,6 +1494,21 @@ mod tests {
         assert!(f.packets[0].metadata.truncated);
         assert_eq!(f.packets[0].metadata.timestamp.nanoseconds, 2000);
     }
+
+    #[test]
+    fn streaming_pcap_matches_in_memory_metadata_and_packets() {
+        let bytes = pcap();
+        let path = temporary_capture("stream.pcap", &bytes);
+        let expected = read_capture_bytes(&bytes, &path.to_string_lossy(), "id").unwrap();
+        let mut packets = Vec::new();
+        let summary = visit_capture(&path, "id", |packet| packets.push(packet)).unwrap();
+        assert_eq!(summary.format, expected.format);
+        assert_eq!(summary.interfaces, expected.interfaces);
+        assert_eq!(summary.warnings, expected.warnings);
+        assert_eq!(summary.packets, expected.packets.len());
+        assert_eq!(packets, expected.packets);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn reads_pcapng_interfaces_and_resolution() {
         let f = read_capture_bytes(&pcapng(), "a.pcapng", "id").unwrap();
@@ -1096,6 +1519,21 @@ mod tests {
         assert_eq!(f.packets[0].metadata.timestamp.seconds, 1);
         assert_eq!(f.packets[0].metadata.timestamp.nanoseconds, 0);
         assert_eq!(f.packets[0].metadata.timestamp.raw_ticks, 1024);
+    }
+
+    #[test]
+    fn streaming_pcapng_matches_in_memory_metadata_and_packets() {
+        let bytes = pcapng();
+        let path = temporary_capture("stream.pcapng", &bytes);
+        let expected = read_capture_bytes(&bytes, &path.to_string_lossy(), "id").unwrap();
+        let mut packets = Vec::new();
+        let summary = visit_capture(&path, "id", |packet| packets.push(packet)).unwrap();
+        assert_eq!(summary.format, expected.format);
+        assert_eq!(summary.interfaces, expected.interfaces);
+        assert_eq!(summary.warnings, expected.warnings);
+        assert_eq!(summary.packets, expected.packets.len());
+        assert_eq!(packets, expected.packets);
+        std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn rejects_malformed_and_truncated() {

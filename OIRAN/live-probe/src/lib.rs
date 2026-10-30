@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const VERSION: &str = "0.2.3";
+pub const VERSION: &str = "0.2.4";
 /// Bounded read-chunk size for streaming file I/O; chosen so SHA-256 and pcap
 /// record counting operate on ≤ 1 MiB in memory regardless of input file size.
 const STREAM_CHUNK_BYTES: usize = 1 << 20;
@@ -39,8 +39,7 @@ const MIN_CAPTURE_BYTES: u64 = 1024 * 1024;
 const MAX_CONTINUOUS_EVENTS: usize = 50_000;
 const MAX_CONTINUOUS_DERIVED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SOURCE_CANDIDATES: usize = 512;
-const MAX_CONTINUOUS_SEGMENT_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_CONTINUOUS_OWNED_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONTINUOUS_SEEN: usize = 4096;
 const ACTIVE_PACKET_WINDOW_MS: u64 = 60_000;
 pub const CONTINUOUS_CAPTURE_ID: &str = "continuous-lab-import";
@@ -302,6 +301,7 @@ pub struct ContinuousImportConfig {
     pub scan_interval: Duration,
     pub stable_age: Duration,
     pub max_owned_bytes: u64,
+    pub max_segment_bytes: u64,
     pub max_segments: u16,
     pub native_segment_seconds: Option<u64>,
     pub historical_n2_bootstrap: Option<PathBuf>,
@@ -315,7 +315,9 @@ impl ContinuousImportConfig {
             source_root,
             scan_interval: Duration::from_millis(policy.polling_interval_ms),
             stable_age: Duration::from_secs(3),
-            max_owned_bytes: MAX_CONTINUOUS_OWNED_BYTES,
+            max_owned_bytes: DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES
+                .saturating_add(MAX_CONTINUOUS_DERIVED_BYTES),
+            max_segment_bytes: DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
             max_segments: policy.max_files,
             native_segment_seconds: None,
             historical_n2_bootstrap: None,
@@ -342,6 +344,11 @@ impl ContinuousImportConfig {
             || self.max_segments == 0
             || self.max_segments > policy.max_files
             || self.max_owned_bytes == 0
+            || self.max_segment_bytes == 0
+            || self.max_segment_bytes
+                > policy
+                    .max_file_bytes
+                    .saturating_mul(u64::from(policy.max_files))
             || self.max_owned_bytes
                 > policy
                     .max_file_bytes
@@ -387,6 +394,10 @@ pub struct FailedIngestion {
     /// (never masked). The upstream pcap root is operator-controlled so no
     /// subscriber identity is ever surfaced here.
     pub source_path: String,
+    /// Exact file size observed when the failure was classified. Older
+    /// checkpoints predate this field and deserialize it as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_size_bytes: Option<u64>,
     /// Error code recorded verbatim from the Err branch that caused the
     /// failure. Prefixed-form (`CONTINUOUS_*`) matches the metric labels.
     pub error_code: String,
@@ -417,8 +428,19 @@ pub fn record_ingestion_failure(
     error_code: impl Into<String>,
     occurred_epoch_ms: u64,
 ) {
+    record_ingestion_failure_with_size(log, source_path, None, error_code, occurred_epoch_ms);
+}
+
+pub fn record_ingestion_failure_with_size(
+    log: &mut VecDeque<FailedIngestion>,
+    source_path: impl Into<String>,
+    source_size_bytes: Option<u64>,
+    error_code: impl Into<String>,
+    occurred_epoch_ms: u64,
+) {
     log.push_back(FailedIngestion {
         source_path: source_path.into(),
+        source_size_bytes,
         error_code: error_code.into(),
         occurred_epoch_ms,
     });
@@ -1388,37 +1410,48 @@ impl CaptureManager {
                 return Err("CONTINUOUS_BOOTSTRAP_NOT_ALLOWLISTED".into());
             }
             let metadata = fs::metadata(path).map_err(display_error)?;
-            if metadata.len() > MAX_CONTINUOUS_SEGMENT_BYTES {
-                return Err("CONTINUOUS_BOOTSTRAP_TOO_LARGE".into());
-            }
-            // Streaming SHA-256 + streaming pcap record count: bootstrap pcap
-            // is never fully materialised in RAM.
-            let checksum = sha256_hex_file(path)?;
-            if !state.segments.contains_key(&checksum) {
-                let candidate = SourceSegment {
-                    path: path.clone(),
-                    interface: "N2".into(),
-                    checksum: checksum.clone(),
-                    size_bytes: metadata.len(),
-                    packets: count_pcap_records(path),
-                    modified: metadata.modified().map_err(display_error)?,
-                };
-                let owned_file = format!("N2.pcap-bootstrap-{}.pcapng", &checksum[..16]);
-                copy_verified(&candidate, &base.join("pcap").join(&owned_file))?;
-                state.segments.insert(
-                    checksum.clone(),
-                    ImportedSegment {
-                        interface: "N2".into(),
-                        owned_file,
-                        size_bytes: metadata.len(),
-                        packets: candidate.packets,
-                        imported_epoch_ms: epoch_ms(),
-                        source_path: path.display().to_string(),
-                        historical_context: true,
-                    },
+            if metadata.len() > config.max_segment_bytes {
+                record_ingestion_failure_with_size(
+                    &mut state.failed_ingestions,
+                    path.display().to_string(),
+                    Some(metadata.len()),
+                    "CONTINUOUS_SOURCE_SEGMENT_TOO_LARGE",
+                    epoch_ms(),
                 );
-                remember_checksum(&mut state, checksum);
-                bootstrap_pending = true;
+                atomic_write(
+                    &state_path,
+                    &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
+                )?;
+            } else {
+                // Streaming SHA-256 + streaming pcap record count: bootstrap
+                // pcap is never fully materialised in RAM.
+                let checksum = sha256_hex_file(path)?;
+                if !state.segments.contains_key(&checksum) {
+                    let candidate = SourceSegment {
+                        path: path.clone(),
+                        interface: "N2".into(),
+                        checksum: checksum.clone(),
+                        size_bytes: metadata.len(),
+                        packets: count_pcap_records(path),
+                        modified: metadata.modified().map_err(display_error)?,
+                    };
+                    let owned_file = format!("N2.pcap-bootstrap-{}.pcapng", &checksum[..16]);
+                    copy_verified(&candidate, &base.join("pcap").join(&owned_file))?;
+                    state.segments.insert(
+                        checksum.clone(),
+                        ImportedSegment {
+                            interface: "N2".into(),
+                            owned_file,
+                            size_bytes: metadata.len(),
+                            packets: candidate.packets,
+                            imported_epoch_ms: epoch_ms(),
+                            source_path: path.display().to_string(),
+                            historical_context: true,
+                        },
+                    );
+                    remember_checksum(&mut state, checksum);
+                    bootstrap_pending = true;
+                }
             }
         }
         self.update(CONTINUOUS_CAPTURE_ID, |job| {
@@ -1497,10 +1530,11 @@ impl CaptureManager {
                     }
                 }
             }
-            let candidates = match source_segments(
+            let discovery = match source_segments(
                 &config.source_root,
                 config.stable_age,
                 config.native_segment_seconds.is_some(),
+                config.max_segment_bytes,
             ) {
                 Ok(candidates) => candidates,
                 Err(error) if !terminal_native_captures.is_empty() => {
@@ -1514,6 +1548,38 @@ impl CaptureManager {
                 }
                 Err(error) => return Err(error),
             };
+            let mut newly_rejected = 0u64;
+            for rejected in &discovery.rejected {
+                let source_path = rejected.path.display().to_string();
+                let already_recorded = state.failed_ingestions.iter().any(|failure| {
+                    failure.source_path == source_path
+                        && failure.source_size_bytes == Some(rejected.size_bytes)
+                        && failure.error_code == "CONTINUOUS_SOURCE_SEGMENT_TOO_LARGE"
+                });
+                if !already_recorded {
+                    record_ingestion_failure_with_size(
+                        &mut state.failed_ingestions,
+                        source_path,
+                        Some(rejected.size_bytes),
+                        "CONTINUOUS_SOURCE_SEGMENT_TOO_LARGE",
+                        epoch_ms(),
+                    );
+                    newly_rejected = newly_rejected.saturating_add(1);
+                }
+            }
+            if newly_rejected > 0 {
+                atomic_write(
+                    &state_path,
+                    &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
+                )?;
+                self.update(CONTINUOUS_CAPTURE_ID, |job| {
+                    job.metrics.ingestion_failures = job
+                        .metrics
+                        .ingestion_failures
+                        .saturating_add(newly_rejected);
+                })?;
+            }
+            let candidates = discovery.segments;
             let candidate_paths = candidates
                 .iter()
                 .map(|candidate| candidate.path.clone())
@@ -1561,8 +1627,7 @@ impl CaptureManager {
                     );
                     atomic_write(
                         &state_path,
-                        &serde_json::to_vec_pretty(&state)
-                            .map_err(|error| error.to_string())?,
+                        &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
                     )?;
                     continue;
                 }
@@ -1632,8 +1697,7 @@ impl CaptureManager {
                     );
                     atomic_write(
                         &state_path,
-                        &serde_json::to_vec_pretty(&state)
-                            .map_err(|error| error.to_string())?,
+                        &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
                     )?;
                     continue;
                 }
@@ -1657,8 +1721,7 @@ impl CaptureManager {
                     );
                     atomic_write(
                         &state_path,
-                        &serde_json::to_vec_pretty(&state)
-                            .map_err(|error| error.to_string())?,
+                        &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
                     )?;
                     continue;
                 }
@@ -1734,6 +1797,7 @@ impl CaptureManager {
                         &config.source_root,
                         &capture_id,
                         &state.seen_checksums,
+                        config.max_segment_bytes,
                     )? {
                         self.finalize_native_capture(&config.source_root, &capture_id)?;
                     }
@@ -2134,8 +2198,8 @@ impl CaptureManager {
             // unique events (capped at MAX_CONTINUOUS_EVENTS later).
             let mut indexed: BTreeMap<String, String> = BTreeMap::new();
             if let Some((prior_dir, _)) = &prior_continuous {
-                let prior_events_file = fs::File::open(prior_dir.join("oiran_events.jsonl"))
-                    .map_err(display_error)?;
+                let prior_events_file =
+                    fs::File::open(prior_dir.join("oiran_events.jsonl")).map_err(display_error)?;
                 let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, prior_events_file);
                 for line in reader.lines() {
                     let line = line.map_err(display_error)?;
@@ -2189,10 +2253,7 @@ impl CaptureManager {
                     writer.write_all(b"\n").map_err(display_error)?;
                 }
                 writer.flush().map_err(display_error)?;
-                writer
-                    .get_ref()
-                    .sync_all()
-                    .map_err(display_error)?;
+                writer.get_ref().sync_all().map_err(display_error)?;
             }
             fs::rename(&tmp_path, &events_path).map_err(display_error)?;
         } else {
@@ -2203,10 +2264,8 @@ impl CaptureManager {
         // discover_sessions. The set is used later for the retained-event
         // provenance assertion. Taking owned Strings avoids holding an
         // immutable borrow of `events` across the `&mut events` call.
-        let retained_event_ids: BTreeSet<String> = events
-            .iter()
-            .map(|event| event.event_id.clone())
-            .collect();
+        let retained_event_ids: BTreeSet<String> =
+            events.iter().map(|event| event.event_id.clone()).collect();
         let capture_job = self.get(capture_id);
         let capture_started_epoch_ms = capture_job.as_ref().and_then(|job| job.started_epoch_ms);
         let activity_started_epoch_ms = capture_job
@@ -3255,11 +3314,24 @@ struct SourceCandidateMeta {
     modified: SystemTime,
 }
 
+#[derive(Clone, Debug)]
+struct RejectedSourceSegment {
+    path: PathBuf,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SourceDiscovery {
+    segments: Vec<SourceSegment>,
+    rejected: Vec<RejectedSourceSegment>,
+}
+
 fn source_segments(
     root: &Path,
     stable_age: Duration,
     native_only: bool,
-) -> Result<Vec<SourceSegment>, String> {
+    max_segment_bytes: u64,
+) -> Result<SourceDiscovery, String> {
     let mut paths = Vec::new();
     collect_source_paths(root, 0, &mut paths)?;
     let now = SystemTime::now();
@@ -3275,9 +3347,6 @@ fn source_segments(
         let Some(interface) = source_interface(root, &path) else {
             continue;
         };
-        if metadata.len() > MAX_CONTINUOUS_SEGMENT_BYTES {
-            return Err("CONTINUOUS_SOURCE_SEGMENT_TOO_LARGE".into());
-        }
         let modified = metadata.modified().map_err(display_error)?;
         if now.duration_since(modified).unwrap_or_default() < stable_age {
             continue;
@@ -3295,7 +3364,6 @@ fn source_segments(
             .cmp(&left.modified)
             .then_with(|| left.path.cmp(&right.path))
     });
-    eligible.truncate(MAX_SOURCE_CANDIDATES);
     // Apply the "drop the still-live dumpcap target per interface" filter on
     // the cheap metadata projection BEFORE any file content is read. The
     // previous order (fs::read for every candidate, THEN filter) made the
@@ -3330,7 +3398,20 @@ fn source_segments(
     // `fs::File::read_exact` with a 16-byte record header + `io::copy` into a
     // sink, so it also only buffers a fixed window.
     let mut segments = Vec::with_capacity(kept_meta.len());
+    let mut rejected = Vec::new();
     for candidate in kept_meta {
+        if candidate.size_bytes > max_segment_bytes {
+            if rejected.len() < MAX_PERSISTED_INGESTION_FAILURES {
+                rejected.push(RejectedSourceSegment {
+                    path: candidate.path,
+                    size_bytes: candidate.size_bytes,
+                });
+            }
+            continue;
+        }
+        if segments.len() >= MAX_SOURCE_CANDIDATES {
+            continue;
+        }
         let Ok(checksum) = sha256_hex_file(&candidate.path) else {
             continue;
         };
@@ -3350,7 +3431,8 @@ fn source_segments(
             .cmp(&left.modified)
             .then_with(|| left.checksum.cmp(&right.checksum))
     });
-    Ok(segments)
+    rejected.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(SourceDiscovery { segments, rejected })
 }
 
 fn native_segment_source(root: &Path, path: &Path) -> bool {
@@ -3407,6 +3489,7 @@ fn native_capture_fully_ingested(
     root: &Path,
     capture_id: &str,
     seen_checksums: &BTreeSet<String>,
+    max_segment_bytes: u64,
 ) -> Result<bool, String> {
     if !capture_id.starts_with("continuous-segment-") || !safe_identifier(capture_id) {
         return Err("CONTINUOUS_NATIVE_CLEANUP_TARGET_INVALID".into());
@@ -3422,8 +3505,8 @@ fn native_capture_fully_ingested(
         if source_interface(root, &path).is_none() {
             continue;
         }
-        if metadata.len() > MAX_CONTINUOUS_SEGMENT_BYTES {
-            return Err("CONTINUOUS_SOURCE_SEGMENT_TOO_LARGE".into());
+        if metadata.len() > max_segment_bytes {
+            return Ok(false);
         }
         // 0.2.3: hash via bounded `BufReader` instead of `fs::read` to keep
         // the resident set independent of segment size (same reason as
@@ -3830,7 +3913,11 @@ fn sha256_hex_file(path: &Path) -> Result<String, String> {
 /// Verify that `path` matches the expected size + SHA-256 in O(STREAM_CHUNK_BYTES)
 /// memory. Returns the file length on success so callers do not need a second
 /// `fs::metadata` pass.
-fn verify_file_integrity(path: &Path, expected_size: u64, expected_sha256: &str) -> Result<u64, String> {
+fn verify_file_integrity(
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<u64, String> {
     let metadata = fs::metadata(path).map_err(display_error)?;
     if metadata.len() != expected_size {
         return Err(format!(
@@ -4058,7 +4145,14 @@ mod tests {
         // them all.
         thread::sleep(Duration::from_millis(50));
         let _tracking_guard = reset_allocation_peak();
-        let segments = source_segments(&root, Duration::ZERO, false).unwrap();
+        let segments = source_segments(
+            &root,
+            Duration::ZERO,
+            false,
+            DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+        )
+        .unwrap()
+        .segments;
         let peak = allocation_peak();
         stop_allocation_tracking();
         // Up to 511 kept (newest per interface dropped by the finalized filter
@@ -4074,7 +4168,9 @@ mod tests {
         let peak_mib = peak / (1024 * 1024);
         eprintln!(
             "source_segments peak live allocation = {} B = {} MiB (segments={})",
-            peak, peak_mib, segments.len()
+            peak,
+            peak_mib,
+            segments.len()
         );
         assert!(
             peak < 128 * 1024 * 1024,
@@ -4106,7 +4202,10 @@ mod tests {
         }
         let expected = {
             let mut bytes = Vec::new();
-            fs::File::open(&path).unwrap().read_to_end(&mut bytes).unwrap();
+            fs::File::open(&path)
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
             sha256_hex(&bytes)
         };
         let streamed = sha256_hex_file(&path).unwrap();
@@ -4198,6 +4297,144 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 0.2.4 regression: a segment larger than the historical 32 MiB cap is
+    /// discovered, hashed, copied and decoded without materialising it.
+    #[test]
+    #[ignore]
+    fn continuous_import_streams_300_mib_segment_under_32_mib_live_allocation() {
+        if skip_if_disk_too_full(
+            "continuous_import_streams_300_mib_segment_under_32_mib_live_allocation",
+        ) {
+            return;
+        }
+        const MIB: usize = 1024 * 1024;
+        const PACKET_BYTES: usize = 15 * MIB;
+        const PACKETS: usize = 20;
+        let source = temporary_root("continuous-300mib-source");
+        let root = temporary_root("continuous-300mib-owned");
+        fs::create_dir_all(source.join("N3")).unwrap();
+        let path = source.join("N3/segment-300mib.pcap");
+        {
+            let file = fs::File::create(&path).unwrap();
+            let mut writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, file);
+            writer
+                .write_all(&[0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                .unwrap();
+            writer
+                .write_all(&(PACKET_BYTES as u32).to_le_bytes())
+                .unwrap();
+            writer.write_all(&1u32.to_le_bytes()).unwrap();
+            let chunk = vec![0xa5; STREAM_CHUNK_BYTES];
+            for second in 0..PACKETS as u32 {
+                writer.write_all(&second.to_le_bytes()).unwrap();
+                writer.write_all(&0u32.to_le_bytes()).unwrap();
+                writer
+                    .write_all(&(PACKET_BYTES as u32).to_le_bytes())
+                    .unwrap();
+                writer
+                    .write_all(&(PACKET_BYTES as u32).to_le_bytes())
+                    .unwrap();
+                for _ in 0..(PACKET_BYTES / STREAM_CHUNK_BYTES) {
+                    writer.write_all(&chunk).unwrap();
+                }
+            }
+            writer.flush().unwrap();
+            writer.get_ref().sync_all().unwrap();
+        }
+        assert!(fs::metadata(&path).unwrap().len() >= 300 * MIB as u64);
+        thread::sleep(Duration::from_millis(500));
+        let guard = reset_allocation_peak();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source.clone(),
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                max_owned_bytes: 400 * MIB as u64,
+                max_segment_bytes: DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+                max_segments: 2,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+            })
+            .unwrap();
+        wait_for(|| {
+            manager
+                .get(CONTINUOUS_CAPTURE_ID)
+                .is_some_and(|job| job.metrics.segments_ingested == 1)
+        });
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+        let peak = allocation_peak();
+        stop_allocation_tracking();
+        drop(guard);
+        assert!(
+            peak < 32 * MIB,
+            "300 MiB streaming import peak {peak} bytes exceeded 32 MiB"
+        );
+        eprintln!(
+            "CONTINUOUS_IMPORT_300MIB_PEAK_BYTES={peak} PEAK_MIB={} LIMIT_MIB=32",
+            peak / MIB
+        );
+        fs::remove_dir_all(source).ok();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn oversized_segment_is_persisted_individually_while_other_segment_imports() {
+        if skip_if_disk_too_full(
+            "oversized_segment_is_persisted_individually_while_other_segment_imports",
+        ) {
+            return;
+        }
+        let source = temporary_root("continuous-individual-rejection-source");
+        let root = temporary_root("continuous-individual-rejection-owned");
+        fs::create_dir_all(source.join("N2")).unwrap();
+        fs::create_dir_all(source.join("N4")).unwrap();
+        let rejected = source.join("N2/rejected.pcap");
+        let accepted = source.join("N4/accepted.pcap");
+        write_pcap(&rejected, &[vec![0; 128]]);
+        write_pcap(&accepted, &[vec![0; 16]]);
+        let rejected_size = fs::metadata(&rejected).unwrap().len();
+        assert!(rejected_size > 100);
+        assert!(fs::metadata(&accepted).unwrap().len() <= 100);
+        thread::sleep(Duration::from_millis(500));
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source.clone(),
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 100,
+                max_segments: 8,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+            })
+            .unwrap();
+        wait_for(|| {
+            manager.get(CONTINUOUS_CAPTURE_ID).is_some_and(|job| {
+                job.state == CaptureState::Capturing
+                    && job.metrics.segments_ingested == 1
+                    && job.metrics.ingestion_failures == 1
+            })
+        });
+        let state: ContinuousImportState = serde_json::from_slice(
+            &fs::read(root.join(CONTINUOUS_CAPTURE_ID).join("import_state.json")).unwrap(),
+        )
+        .unwrap();
+        let failure = state.failed_ingestions.back().unwrap();
+        assert_eq!(failure.source_path, rejected.display().to_string());
+        assert_eq!(failure.source_size_bytes, Some(rejected_size));
+        assert_eq!(failure.error_code, "CONTINUOUS_SOURCE_SEGMENT_TOO_LARGE");
+        let job = manager.get(CONTINUOUS_CAPTURE_ID).unwrap();
+        assert_eq!(job.state, CaptureState::Capturing);
+        assert_eq!(job.error, None);
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+        fs::remove_dir_all(source).ok();
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -4329,17 +4566,29 @@ mod tests {
         let mut config = ContinuousImportConfig::native(root);
         assert_eq!(config.stable_age, Duration::ZERO);
         assert_eq!(config.native_segment_seconds, Some(15));
+        assert_eq!(
+            config.max_segment_bytes,
+            DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES
+        );
         config.validate(Policy::default()).unwrap();
         config.max_segments = 2;
         assert_eq!(
             config.validate(Policy::default()).unwrap_err(),
             "CONTINUOUS_NATIVE_RING_TOO_SMALL"
         );
+        config.max_segments = 8;
+        config.max_segment_bytes = 0;
+        assert_eq!(
+            config.validate(Policy::default()).unwrap_err(),
+            "CONTINUOUS_IMPORT_BOUNDS_INVALID"
+        );
     }
 
     #[test]
     fn continuous_import_is_incremental_deduplicated_stoppable_and_restart_safe() {
-        if skip_if_disk_too_full("continuous_import_is_incremental_deduplicated_stoppable_and_restart_safe") {
+        if skip_if_disk_too_full(
+            "continuous_import_is_incremental_deduplicated_stoppable_and_restart_safe",
+        ) {
             return;
         }
         let root = temporary_root("continuous-import");
@@ -4364,6 +4613,7 @@ mod tests {
             scan_interval: Duration::from_millis(200),
             stable_age: Duration::from_millis(200),
             max_owned_bytes: 128 * 1024 * 1024,
+            max_segment_bytes: 64 * 1024 * 1024,
             max_segments: 8,
             native_segment_seconds: None,
             historical_n2_bootstrap: Some(bootstrap),
@@ -4445,7 +4695,8 @@ mod tests {
 
     #[test]
     fn continuous_source_skips_active_truncation_and_rotates_owned_ring() {
-        if skip_if_disk_too_full("continuous_source_skips_active_truncation_and_rotates_owned_ring") {
+        if skip_if_disk_too_full("continuous_source_skips_active_truncation_and_rotates_owned_ring")
+        {
             return;
         }
         let source = temporary_root("continuous-truncated");
@@ -4459,9 +4710,15 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(source_segments(&source, Duration::from_secs(60), false)
-            .unwrap()
-            .is_empty());
+        assert!(source_segments(
+            &source,
+            Duration::from_secs(60),
+            false,
+            DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+        )
+        .unwrap()
+        .segments
+        .is_empty());
 
         let root = temporary_root("continuous-quota");
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4479,6 +4736,7 @@ mod tests {
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
                 max_segments: 1,
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
@@ -4512,7 +4770,14 @@ mod tests {
         }
         fs::create_dir_all(source.join("N2")).unwrap();
         write_pcap(&source.join("N2/allowed.pcap"), &[vec![0; 64]]);
-        let segments = source_segments(&source, Duration::ZERO, false).unwrap();
+        let segments = source_segments(
+            &source,
+            Duration::ZERO,
+            false,
+            DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+        )
+        .unwrap()
+        .segments;
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].interface, "N2");
     }
@@ -5119,6 +5384,7 @@ mod tests {
                 scan_interval: Duration::from_millis(200),
                 stable_age: Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
                 max_segments: 8,
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
@@ -5196,10 +5462,22 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut seen = BTreeSet::from([checksums[0].clone(), checksums[2].clone()]);
-        assert!(!native_capture_fully_ingested(&root, capture_id, &seen).unwrap());
+        assert!(!native_capture_fully_ingested(
+            &root,
+            capture_id,
+            &seen,
+            DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+        )
+        .unwrap());
         assert!(root.join(capture_id).is_dir());
         seen.insert(checksums[1].clone());
-        assert!(native_capture_fully_ingested(&root, capture_id, &seen).unwrap());
+        assert!(native_capture_fully_ingested(
+            &root,
+            capture_id,
+            &seen,
+            DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+        )
+        .unwrap());
         cleanup_native_capture(&root, capture_id).unwrap();
         assert!(!root.join(capture_id).exists());
     }
