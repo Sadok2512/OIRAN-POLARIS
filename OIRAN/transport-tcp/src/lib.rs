@@ -199,26 +199,44 @@ impl TcpReassembler {
         insert_segment(half, segment, &mut self.errors);
     }
 
+    /// Return connections finalized by the idle timeout and release their
+    /// reassembly buffers immediately. Long-running captures must call this
+    /// while packets are being visited; retaining evicted connections until
+    /// EOF makes resident memory proportional to the complete capture.
+    pub fn take_finalized(&mut self) -> Vec<ReassembledConnection> {
+        let mut states = std::mem::take(&mut self.evicted);
+        states.sort_by(|a, b| a.0.cmp(&b.0));
+        finalize_states(states, &mut self.errors)
+    }
+
     pub fn finish(mut self) -> (Vec<ReassembledConnection>, Vec<TcpError>) {
-        let mut output = Vec::new();
         let mut states: Vec<_> = self.connections.drain().collect();
         states.append(&mut self.evicted);
         states.sort_by(|a, b| a.0.cmp(&b.0));
-        for (key, mut state) in states {
-            for half in &mut state.halves {
-                flush_pending(half, &mut self.errors);
-            }
-            let [a, b] = state.halves;
-            output.push(ReassembledConnection {
-                directions: [
-                    direction(key.low.clone(), key.high.clone(), a),
-                    direction(key.high.clone(), key.low.clone(), b),
-                ],
-                key,
-            });
-        }
+        let output = finalize_states(states, &mut self.errors);
         (output, self.errors)
     }
+}
+
+fn finalize_states(
+    states: Vec<(TcpConnectionKey, ConnectionState)>,
+    errors: &mut Vec<TcpError>,
+) -> Vec<ReassembledConnection> {
+    let mut output = Vec::with_capacity(states.len());
+    for (key, mut state) in states {
+        for half in &mut state.halves {
+            flush_pending(half, errors);
+        }
+        let [a, b] = state.halves;
+        output.push(ReassembledConnection {
+            directions: [
+                direction(key.low.clone(), key.high.clone(), a),
+                direction(key.high.clone(), key.low.clone(), b),
+            ],
+            key,
+        });
+    }
+    output
 }
 
 fn direction(

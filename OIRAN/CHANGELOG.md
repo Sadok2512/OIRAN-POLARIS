@@ -7,6 +7,14 @@
 - Reworked PCAP/PCAPNG decoding to visit packets incrementally; discovery,
   SHA-256, copy, packet parsing and decoding no longer materialise an entire
   capture file.
+- Stream decoded events through an on-disk spool, finalize idle TCP/SBI
+  connections during packet visitation, and retain only event-ID/offset pairs
+  during continuous deduplication. This closes the production OOM found when
+  a finalized SBI segment expanded to many normalized events under a 256 MiB
+  service limit.
+- Bound SBI response-only streams lacking decoded request identity to one
+  explicit HPACK-context evidence event per TCP connection, restoring the
+  pre-regression event-count contract without hiding the capture limitation.
 - Oversized finalized segments are now persisted individually with source
   path, observed byte size, timestamp and
   `CONTINUOUS_SOURCE_SEGMENT_TOO_LARGE`; they no longer fail the continuous

@@ -320,16 +320,25 @@ fn transactions(
     // Emission policy — one event per stream, at most once, same as 0.3.1 for
     // well-formed connections:
     //   * Skip streams that never carried any decoded content on EITHER side.
-    //   * Emit when at least one side (request OR response) has decoded
-    //     headers; this preserves the 0.4.1 behaviour of correlating a response
-    //     by stream-id even when the request headers failed HPACK.
+    //   * Emit at most one response-only stream per TCP connection as explicit
+    //     HPACK-context evidence. A response-only stream has no trustworthy SBI
+    //     operation or resource identity; promoting every such stream inflated
+    //     mid-connection captures by hundreds of thousands of PARTIAL events.
     //   * `hpack_unavailable` on a part is a decoration (surfaces an explicit
     //     error reason on the normalised event) but does NOT by itself promote
     //     a content-less stream to an event.
+    let mut response_only_emitted = false;
     for (stream_id, state) in streams {
         if state.request.headers.is_empty() && state.response.headers.is_empty() {
             incomplete += 1;
             continue;
+        }
+        if state.request.headers.is_empty() {
+            if response_only_emitted {
+                incomplete += 1;
+                continue;
+            }
+            response_only_emitted = true;
         }
         if state.response.headers.is_empty() {
             incomplete += 1;
@@ -1587,10 +1596,10 @@ mod tests {
             ],
         };
         let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
-        // Both streams produce an event (stream 1 partial because request
-        // HPACK failed; stream 3 fully decoded because the direction was NOT
-        // poisoned after stream 1's failure).
-        assert_eq!(events.len(), 2, "expected both streams to emit events");
+        // Stream 1 is retained as the single response-only HPACK-context
+        // evidence for this connection; stream 3 proves that the direction
+        // was NOT poisoned after stream 1's failure.
+        assert_eq!(events.len(), 2, "expected both evidence streams to emit events");
         let s1 = events
             .iter()
             .find(|e| e.sbi.as_ref().map(|s| s.http2_stream_id) == Some(3))

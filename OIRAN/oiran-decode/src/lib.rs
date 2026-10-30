@@ -6,7 +6,7 @@ use capture_pcap::{
 use decoder_gtpu::GtpuDecoder;
 use decoder_ngap::NgapDecoder;
 use decoder_pfcp::PfcpDecoder;
-use decoder_sbi::decode_connections;
+use decoder_sbi::{decode_connections, SbiDecodeReport};
 use event_schema::{sha256_hex, Endpoint, NormalizedEvent, PacketReference};
 use plugin_runtime::{DecoderInput, ProtocolDecoder};
 use serde::{Deserialize, Serialize};
@@ -57,16 +57,53 @@ pub struct DecodeOutput {
 }
 
 pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
+    let mut events = Vec::new();
+    let report = decode_capture_streaming(config, |event| {
+        events.push(event);
+        Ok(())
+    })?;
+    events.sort_by_key(|event| {
+        (
+            event.timestamp.seconds,
+            event.timestamp.nanoseconds,
+            event
+                .packet_references
+                .first()
+                .map(|packet| packet.packet_number)
+                .unwrap_or(0),
+        )
+    });
+    Ok(DecodeOutput { events, report })
+}
+
+/// Decode a capture while transferring ownership of every normalized event to
+/// the caller as soon as its protocol context permits. UDP and SCTP events are
+/// emitted during packet visitation. Idle TCP connections are finalized and
+/// decoded during visitation, rather than being retained until capture EOF.
+/// The sink is therefore the only component deciding whether events are kept
+/// in memory, written to disk, or processed incrementally.
+pub fn decode_capture_streaming<F>(
+    config: &DecodeConfig,
+    mut sink: F,
+) -> Result<DecodeReport, String>
+where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
     validate_config(config)?;
     let ngap = NgapDecoder;
     let pfcp = PfcpDecoder;
     let gtpu = GtpuDecoder;
     let mut sctp = SctpReassembler::new();
     let mut tcp = TcpReassembler::new();
-    let mut events = Vec::new();
+    let mut event_count = 0usize;
     let mut transport_errors = 0usize;
+    let mut sink_error = None;
+    let mut sbi_report = SbiDecodeReport::default();
 
     let capture = visit_capture(&config.input, &config.capture_id, |packet| {
+        if sink_error.is_some() {
+            return;
+        }
         if packet.metadata.truncated {
             transport_errors += 1;
             return;
@@ -85,9 +122,13 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
                     view.destination_port.unwrap_or(0),
                 );
                 if ports.0 == 8805 || ports.1 == 8805 {
-                    decode_udp(&pfcp, &packet, &view, config, "N4", &mut events);
+                    let mut decoded = Vec::new();
+                    decode_udp(&pfcp, &packet, &view, config, "N4", &mut decoded);
+                    emit_events(decoded, &mut sink, &mut event_count, &mut sink_error);
                 } else if ports.0 == 2152 || ports.1 == 2152 {
-                    decode_udp(&gtpu, &packet, &view, config, "N3", &mut events);
+                    let mut decoded = Vec::new();
+                    decode_udp(&gtpu, &packet, &view, config, "N3", &mut decoded);
+                    emit_events(decoded, &mut sink, &mut event_count, &mut sink_error);
                 }
             }
             TransportProtocol::Sctp => {
@@ -116,54 +157,117 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
                         payload: &message.payload,
                         raw_payload_reference: &raw,
                     };
-                    events.extend(ngap.decode(&input).events);
+                    emit_events(
+                        ngap.decode(&input).events,
+                        &mut sink,
+                        &mut event_count,
+                        &mut sink_error,
+                    );
                 }
             }
-            TransportProtocol::Tcp => tcp.consume(&packet, &view),
+            TransportProtocol::Tcp => {
+                tcp.consume(&packet, &view);
+                let finalized = tcp.take_finalized();
+                emit_sbi_connections(
+                    finalized,
+                    config,
+                    &mut sink,
+                    &mut event_count,
+                    &mut sink_error,
+                    &mut sbi_report,
+                );
+            }
             TransportProtocol::Other(_) => {}
         }
     })
     .map_err(|error| error.to_string())?;
+    if let Some(error) = sink_error.take() {
+        return Err(error);
+    }
     let (sctp_errors, incomplete_sctp) = sctp.finish();
     let (connections, tcp_errors) = tcp.finish();
-    let (sbi_events, sbi_report) = decode_connections(
-        &connections,
-        &config.capture_id,
-        &config.interface,
-        &config.endpoints,
+    emit_sbi_connections(
+        connections,
+        config,
+        &mut sink,
+        &mut event_count,
+        &mut sink_error,
+        &mut sbi_report,
     );
-    events.extend(sbi_events);
-    events.sort_by_key(|event| {
-        (
-            event.timestamp.seconds,
-            event.timestamp.nanoseconds,
-            event
-                .packet_references
-                .first()
-                .map(|packet| packet.packet_number)
-                .unwrap_or(0),
-        )
-    });
-    if events.iter().any(|event| !event.has_complete_provenance()) {
-        return Err("decoder emitted an event without complete packet provenance".into());
+    if let Some(error) = sink_error {
+        return Err(error);
     }
-    Ok(DecodeOutput {
-        report: DecodeReport {
-            capture_format: format!("{:?}", capture.format),
-            packets: capture.packets,
-            events: events.len(),
-            warnings: capture.warnings.len(),
-            transport_errors,
-            sctp_errors: sctp_errors.len(),
-            incomplete_sctp,
-            tcp_connections: sbi_report.tcp_connections,
-            tcp_errors: tcp_errors.len(),
-            http2_frames: sbi_report.http2_frames,
-            http2_streams: sbi_report.http2_streams,
-            sbi_transactions: sbi_report.sbi_transactions,
-        },
-        events,
+    Ok(DecodeReport {
+        capture_format: format!("{:?}", capture.format),
+        packets: capture.packets,
+        events: event_count,
+        warnings: capture.warnings.len(),
+        transport_errors,
+        sctp_errors: sctp_errors.len(),
+        incomplete_sctp,
+        tcp_connections: sbi_report.tcp_connections,
+        tcp_errors: tcp_errors.len(),
+        http2_frames: sbi_report.http2_frames,
+        http2_streams: sbi_report.http2_streams,
+        sbi_transactions: sbi_report.sbi_transactions,
     })
+}
+
+fn emit_events<F>(
+    events: impl IntoIterator<Item = NormalizedEvent>,
+    sink: &mut F,
+    event_count: &mut usize,
+    sink_error: &mut Option<String>,
+) where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
+    if sink_error.is_some() {
+        return;
+    }
+    for event in events {
+        if !event.has_complete_provenance() {
+            *sink_error =
+                Some("decoder emitted an event without complete packet provenance".into());
+            return;
+        }
+        if let Err(error) = sink(event) {
+            *sink_error = Some(error);
+            return;
+        }
+        *event_count += 1;
+    }
+}
+
+fn emit_sbi_connections<F>(
+    connections: Vec<transport_tcp::ReassembledConnection>,
+    config: &DecodeConfig,
+    sink: &mut F,
+    event_count: &mut usize,
+    sink_error: &mut Option<String>,
+    aggregate: &mut SbiDecodeReport,
+) where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
+    for connection in connections {
+        if sink_error.is_some() {
+            return;
+        }
+        let (events, report) = decode_connections(
+            std::slice::from_ref(&connection),
+            &config.capture_id,
+            &config.interface,
+            &config.endpoints,
+        );
+        aggregate.tcp_connections += report.tcp_connections;
+        aggregate.http2_frames += report.http2_frames;
+        aggregate.http2_streams += report.http2_streams;
+        aggregate.sbi_transactions += report.sbi_transactions;
+        aggregate.operations_decoded += report.operations_decoded;
+        aggregate.incomplete_streams += report.incomplete_streams;
+        aggregate.encrypted_connections += report.encrypted_connections;
+        aggregate.errors.extend(report.errors);
+        emit_events(events, sink, event_count, sink_error);
+    }
 }
 
 pub fn write_jsonl(path: &Path, events: &[NormalizedEvent], append: bool) -> Result<(), String> {

@@ -7,13 +7,13 @@ use capture_helper::{
 use correlation_engine::{correlate_cross_interface_evidence, correlate_discovered_tunnels};
 use disk_safety::{assess, capture_budget, measure_path, CaptureBudget, Decision, Policy};
 use event_schema::{sha256_hex, Sha256Hasher};
-use oiran_decode::{decode_capture, write_jsonl_atomic, DecodeConfig, DecodeReport};
+use oiran_decode::{decode_capture_streaming, DecodeConfig, DecodeReport};
 use serde::{Deserialize, Serialize};
 use session_engine::{discover_sessions, load_path, reconstruct, Association, ReconstructionHints};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, BufWriter, Read, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -27,13 +27,6 @@ pub const VERSION: &str = "0.2.4";
 /// Bounded read-chunk size for streaming file I/O; chosen so SHA-256 and pcap
 /// record counting operate on ≤ 1 MiB in memory regardless of input file size.
 const STREAM_CHUNK_BYTES: usize = 1 << 20;
-/// Maximum number of event IDs we retain in memory while deduplicating a
-/// continuous-import events.jsonl rewrite. Beyond this threshold the
-/// deduplication is still correct but older IDs are evicted FIFO so RSS stays
-/// bounded on multi-hour captures. The limit is deliberately higher than the
-/// per-dataset `MAX_CONTINUOUS_EVENTS` (50_000) so we never evict an active
-/// event while a dataset is still being assembled.
-const MAX_IN_MEMORY_EVENT_IDS: usize = 1_000_000;
 const PROBE_ID: &str = "oiran-vprobe-local-01";
 const MIN_CAPTURE_BYTES: u64 = 1024 * 1024;
 const MAX_CONTINUOUS_EVENTS: usize = 50_000;
@@ -1605,12 +1598,15 @@ impl CaptureManager {
                 if config.native_segment_seconds.is_none() && !stable_across_scans {
                     continue;
                 }
-                if let Err(error) = decode_capture(&DecodeConfig {
-                    input: candidate.path.clone(),
-                    capture_id: format!("sha256:{}", candidate.checksum),
-                    interface: candidate.interface.clone(),
-                    endpoints: endpoint_map(),
-                }) {
+                if let Err(error) = decode_capture_streaming(
+                    &DecodeConfig {
+                        input: candidate.path.clone(),
+                        capture_id: format!("sha256:{}", candidate.checksum),
+                        interface: candidate.interface.clone(),
+                        endpoints: endpoint_map(),
+                    },
+                    |_| Ok(()),
+                ) {
                     self.update(CONTINUOUS_CAPTURE_ID, |job| {
                         job.metrics.ingestion_failures =
                             job.metrics.ingestion_failures.saturating_add(1);
@@ -1701,12 +1697,15 @@ impl CaptureManager {
                     )?;
                     continue;
                 }
-                if let Err(error) = decode_capture(&DecodeConfig {
-                    input: destination.clone(),
-                    capture_id: format!("sha256:{}", candidate.checksum),
-                    interface: candidate.interface.clone(),
-                    endpoints: endpoint_map(),
-                }) {
+                if let Err(error) = decode_capture_streaming(
+                    &DecodeConfig {
+                        input: destination.clone(),
+                        capture_id: format!("sha256:{}", candidate.checksum),
+                        interface: candidate.interface.clone(),
+                        endpoints: endpoint_map(),
+                    },
+                    |_| Ok(()),
+                ) {
                     let _ = fs::remove_file(&destination);
                     self.update(CONTINUOUS_CAPTURE_ID, |job| {
                         job.metrics.ingestion_failures =
@@ -2153,7 +2152,13 @@ impl CaptureManager {
         };
         prepare_dataset_directory(dataset_dir)?;
         let events_path = dataset_dir.join("oiran_events.jsonl");
-        let mut all_events = Vec::new();
+        let decoded_spool_path = dataset_dir.join(".decoded-events.spool");
+        let decoded_spool_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&decoded_spool_path)
+            .map_err(display_error)?;
+        let mut decoded_spool = BufWriter::with_capacity(STREAM_CHUNK_BYTES, decoded_spool_file);
         let mut reports = BTreeMap::new();
         let mut checksums = BTreeMap::new();
         let endpoints = endpoint_map();
@@ -2172,75 +2177,76 @@ impl CaptureManager {
                 // on its own, so we do not need to keep the bytes in memory.
                 let checksum = sha256_hex_file(&path)?;
                 let capture_hash = format!("sha256:{checksum}");
-                let output = decode_capture(&DecodeConfig {
-                    input: path.clone(),
-                    capture_id: capture_hash,
-                    interface: interface.interface.clone(),
-                    endpoints: endpoints.clone(),
-                })?;
-                all_events.extend(output.events);
+                let report = decode_capture_streaming(
+                    &DecodeConfig {
+                        input: path.clone(),
+                        capture_id: capture_hash,
+                        interface: interface.interface.clone(),
+                        endpoints: endpoints.clone(),
+                    },
+                    |event| {
+                        decoded_spool
+                            .write_all(event.to_json().as_bytes())
+                            .and_then(|_| decoded_spool.write_all(b"\n"))
+                            .map_err(display_error)
+                    },
+                )?;
                 let key = path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("capture.pcap")
                     .to_string();
                 checksums.insert(key.clone(), checksum);
-                reports.insert(key, output.report);
+                reports.insert(key, report);
             }
         }
+        decoded_spool.flush().map_err(display_error)?;
+        decoded_spool.get_ref().sync_all().map_err(display_error)?;
+        drop(decoded_spool);
         if capture_id == CONTINUOUS_CAPTURE_ID {
-            // Streaming dedup: read prior events line-by-line via BufReader,
-            // key the index on the deterministic observation id, and keep only
-            // one serialized representation per id. The output file is written
-            // through a BufWriter instead of being materialised in a Vec<u8>,
-            // so the resident set does not grow with the on-disk file size.
-            // The BTreeMap<id, serialized-line> bounds memory to the number of
-            // unique events (capped at MAX_CONTINUOUS_EVENTS later).
-            let mut indexed: BTreeMap<String, String> = BTreeMap::new();
+            // Keep only IDs and offsets in memory. Normalized event JSON is
+            // spooled on disk, so resident memory is independent of event body
+            // size and of the number of events decoded from an input segment.
+            let normalized_spool_path = dataset_dir.join(".normalized-events.spool");
+            let normalized_spool_file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&normalized_spool_path)
+                .map_err(display_error)?;
+            let mut normalized_writer = BufWriter::with_capacity(
+                STREAM_CHUNK_BYTES,
+                normalized_spool_file.try_clone().map_err(display_error)?,
+            );
+            let mut normalized_offset = 0u64;
+            let mut indexed: BTreeMap<String, EventSpoolLocation> = BTreeMap::new();
             if let Some((prior_dir, _)) = &prior_continuous {
                 let prior_events_file =
                     fs::File::open(prior_dir.join("oiran_events.jsonl")).map_err(display_error)?;
                 let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, prior_events_file);
-                for line in reader.lines() {
-                    let line = line.map_err(display_error)?;
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let mut value: serde_json::Value =
-                        serde_json::from_str(&line).map_err(|error| error.to_string())?;
-                    let id = continuous_observation_id(&value)?;
-                    value["event_id"] = serde_json::Value::String(id.clone());
-                    let serialized =
-                        serde_json::to_string(&value).map_err(|error| error.to_string())?;
-                    indexed.insert(id, serialized);
-                    if indexed.len() > MAX_IN_MEMORY_EVENT_IDS {
-                        if let Some(first) = indexed.keys().next().cloned() {
-                            indexed.remove(&first);
-                        }
-                    }
-                }
+                index_event_stream(
+                    reader,
+                    &mut normalized_writer,
+                    &mut normalized_offset,
+                    &mut indexed,
+                )?;
             }
-            for event in all_events.drain(..) {
-                let mut value: serde_json::Value =
-                    serde_json::from_str(&event.to_json()).map_err(|error| error.to_string())?;
-                let id = continuous_observation_id(&value)?;
-                value["event_id"] = serde_json::Value::String(id.clone());
-                let serialized =
-                    serde_json::to_string(&value).map_err(|error| error.to_string())?;
-                indexed.insert(id, serialized);
-                if indexed.len() > MAX_IN_MEMORY_EVENT_IDS {
-                    if let Some(first) = indexed.keys().next().cloned() {
-                        indexed.remove(&first);
-                    }
-                }
-            }
-            if indexed.len() > MAX_CONTINUOUS_EVENTS {
-                let remove = indexed.len() - MAX_CONTINUOUS_EVENTS;
-                let old = indexed.keys().take(remove).cloned().collect::<Vec<_>>();
-                for id in old {
-                    indexed.remove(&id);
-                }
-            }
+            let decoded_reader = BufReader::with_capacity(
+                STREAM_CHUNK_BYTES,
+                fs::File::open(&decoded_spool_path).map_err(display_error)?,
+            );
+            index_event_stream(
+                decoded_reader,
+                &mut normalized_writer,
+                &mut normalized_offset,
+                &mut indexed,
+            )?;
+            normalized_writer.flush().map_err(display_error)?;
+            normalized_writer
+                .get_ref()
+                .sync_all()
+                .map_err(display_error)?;
+            drop(normalized_writer);
             // Stream the output through BufWriter. We write to a tmp file next
             // to the destination, fsync, then atomic rename, matching the
             // existing `atomic_write` contract for bounded-memory callers.
@@ -2248,16 +2254,28 @@ impl CaptureManager {
             {
                 let tmp_file = fs::File::create(&tmp_path).map_err(display_error)?;
                 let mut writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, tmp_file);
-                for line in indexed.values() {
-                    writer.write_all(line.as_bytes()).map_err(display_error)?;
-                    writer.write_all(b"\n").map_err(display_error)?;
+                let mut normalized_reader = normalized_spool_file;
+                let mut line = Vec::new();
+                for location in indexed.values() {
+                    normalized_reader
+                        .seek(SeekFrom::Start(location.offset))
+                        .map_err(display_error)?;
+                    line.resize(location.length as usize, 0);
+                    normalized_reader
+                        .read_exact(&mut line)
+                        .map_err(display_error)?;
+                    writer.write_all(&line).map_err(display_error)?;
                 }
                 writer.flush().map_err(display_error)?;
                 writer.get_ref().sync_all().map_err(display_error)?;
             }
             fs::rename(&tmp_path, &events_path).map_err(display_error)?;
+            fs::remove_file(&normalized_spool_path).map_err(display_error)?;
         } else {
-            write_jsonl_atomic(&events_path, &all_events)?;
+            fs::rename(&decoded_spool_path, &events_path).map_err(display_error)?;
+        }
+        if decoded_spool_path.exists() {
+            fs::remove_file(&decoded_spool_path).map_err(display_error)?;
         }
         let mut events = load_path(&events_path)?;
         // Materialise event-id set before taking a mutable borrow for
@@ -3529,6 +3547,50 @@ fn native_owned_usage(root: &Path) -> Result<(u64, usize), String> {
         directory_size(&root.join(CONTINUOUS_CAPTURE_ID)).saturating_add(segment_bytes),
         ids.len(),
     ))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EventSpoolLocation {
+    offset: u64,
+    length: u64,
+}
+
+fn index_event_stream<R: BufRead, W: Write>(
+    mut reader: R,
+    writer: &mut W,
+    output_offset: &mut u64,
+    indexed: &mut BTreeMap<String, EventSpoolLocation>,
+) -> Result<(), String> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).map_err(display_error)? == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut value: serde_json::Value =
+            serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        let id = continuous_observation_id(&value)?;
+        value["event_id"] = serde_json::Value::String(id.clone());
+        let serialized = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+        let bytes = serialized.as_bytes();
+        let offset = *output_offset;
+        writer.write_all(bytes).map_err(display_error)?;
+        writer.write_all(b"\n").map_err(display_error)?;
+        let length = (bytes.len() + 1) as u64;
+        *output_offset = (*output_offset).saturating_add(length);
+        indexed.insert(id, EventSpoolLocation { offset, length });
+        // This is the same final retention policy as the previous post-pass
+        // trim, but it never permits a transient one-million-line map.
+        if indexed.len() > MAX_CONTINUOUS_EVENTS {
+            if let Some(first) = indexed.keys().next().cloned() {
+                indexed.remove(&first);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn continuous_observation_id(value: &serde_json::Value) -> Result<String, String> {
