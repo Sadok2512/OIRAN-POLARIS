@@ -41,6 +41,12 @@ pub struct UeJob {
     pub process_handle: Option<String>,
     #[serde(default)]
     pub operation_id: Option<String>,
+    /// 0.19.5 — Epoch second at which `operation_id` was last stamped.
+    /// Reset to `None` whenever the lock clears. Used by
+    /// `release_stale_locks` to evict leftovers from a Stop that
+    /// crashed or raced the API process.
+    #[serde(default)]
+    pub operation_locked_at_epoch_s: Option<u64>,
     #[serde(default)]
     pub generation: u64,
     #[serde(default)]
@@ -59,6 +65,22 @@ pub struct MultiUeController {
     profiles: BTreeMap<String, UeProfileSpec>,
     jobs: BTreeMap<String, UeJob>,
     max_live_ues: usize,
+}
+
+/// 0.19.5 — Default max age for an operation lock. 2 minutes is the
+/// outer bound for any single Start / Stop step in the lab; a lock
+/// that stayed held past that is attributable to a crashed worker
+/// or a race with the API process restart.
+pub const MAX_OPERATION_LOCK_SECONDS: u64 = 120;
+
+/// 0.19.5 — Audit record returned by `release_stale_locks`. Lists the
+/// UE and the operation_id whose lock was reclaimed so the caller can
+/// emit one audit-log line per reclaim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleasedLock {
+    pub ue_id: String,
+    pub operation_id: String,
+    pub locked_at_epoch_s: Option<u64>,
 }
 
 impl MultiUeController {
@@ -100,6 +122,7 @@ impl MultiUeController {
                     controller_owned: true,
                     process_handle: None,
                     operation_id: None,
+                    operation_locked_at_epoch_s: None,
                     generation: 0,
                     approved_runtime: None,
                     started_at_epoch_s: None,
@@ -300,6 +323,7 @@ impl MultiUeController {
                 controller_owned: true,
                 process_handle: Some(format!("mock-ue:{ue_id}")),
                 operation_id: None,
+                operation_locked_at_epoch_s: None,
                 generation: 0,
                 approved_runtime: None,
                 started_at_epoch_s: Some(now),
@@ -390,6 +414,7 @@ impl MultiUeController {
                 controller_owned: true,
                 process_handle: Some(process_handle.into()),
                 operation_id: None,
+                operation_locked_at_epoch_s: None,
                 generation: 0,
                 approved_runtime: None,
                 started_at_epoch_s: Some(now),
@@ -416,6 +441,23 @@ impl MultiUeController {
         let profile = self.profiles.get(ue_id).ok_or("UNKNOWN_UE_PROFILE")?;
         if !profile.configured || !profile.subscription_verified {
             return Err("UE_PROFILE_NOT_READY".into());
+        }
+        // 0.19.5 — Evict an expired lock before enforcing the 409.
+        // Matches the Stop-side priority rule: during runtime a lock
+        // older than MAX_OPERATION_LOCK_SECONDS is treated as stale
+        // (its owning worker thread is gone) and silently reclaimed.
+        let now_epoch_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        if let Some(job) = self.jobs.get_mut(ue_id) {
+            if job.operation_id.is_some() {
+                let locked_at = job.operation_locked_at_epoch_s.unwrap_or(0);
+                if now_epoch_s.saturating_sub(locked_at) >= MAX_OPERATION_LOCK_SECONDS {
+                    job.operation_id = None;
+                    job.operation_locked_at_epoch_s = None;
+                }
+            }
         }
         if self
             .jobs
@@ -485,6 +527,7 @@ impl MultiUeController {
                 controller_owned: true,
                 process_handle: previous_handle,
                 operation_id: Some(operation_id.into()),
+                operation_locked_at_epoch_s: Some(now),
                 generation,
                 approved_runtime: Some(approved_runtime),
                 started_at_epoch_s: Some(now),
@@ -512,6 +555,7 @@ impl MultiUeController {
         }
         job.process_handle = Some(process_handle.into());
         job.operation_id = None;
+        job.operation_locked_at_epoch_s = None;
         job.lifecycle = UeLifecycle::Registering;
         job.process_state = "RUNNING".into();
         Ok(job)
@@ -549,6 +593,7 @@ impl MultiUeController {
             return Err("UE_OPERATION_MISMATCH".into());
         }
         job.operation_id = None;
+        job.operation_locked_at_epoch_s = None;
         job.lifecycle = UeLifecycle::Failed;
         job.process_state = "UNKNOWN".into();
         job.registration_state = "NOT_OBSERVED".into();
@@ -567,6 +612,7 @@ impl MultiUeController {
             return Err("UE_CLEANUP_HANDLE_MISSING".into());
         }
         job.operation_id = None;
+        job.operation_locked_at_epoch_s = None;
         job.lifecycle = UeLifecycle::Failed;
         job.process_state = "UNKNOWN".into();
         job.registration_state = "NOT_OBSERVED".into();
@@ -576,19 +622,84 @@ impl MultiUeController {
         Ok(job)
     }
 
-    pub fn reserve_live_stop(&mut self, ue_id: &str, operation_id: &str) -> Result<&UeJob, String> {
+    /// 0.19.5 — Test harness only: mutable access to the internal job
+    /// table so Stop-resilience tests in the API crate can hand-stamp
+    /// an expired `operation_locked_at`. Documented as "do not use in
+    /// production code"; the name screams the contract. We can't gate
+    /// this on `cfg(test)` because the consumer (polaris-control-api)
+    /// builds the simulator-controller crate in `dev` mode, not test
+    /// mode — so a `cfg(test)` method is invisible to API tests.
+    #[doc(hidden)]
+    pub fn jobs_mut_for_tests(&mut self) -> &mut BTreeMap<String, UeJob> {
+        &mut self.jobs
+    }
+
+    /// 0.19.5 — Release every operation lock that is `None` for a
+    /// locked_at or older than `max_age_s`. Called at startup with
+    /// `max_age_s = 0` to clear EVERY leftover (no operations are in
+    /// progress across an API restart), and periodically with
+    /// `MAX_OPERATION_LOCK_SECONDS` during runtime to evict stuck
+    /// locks whose owning worker thread died mid-flight.
+    pub fn release_stale_locks(
+        &mut self,
+        now_epoch_s: u64,
+        max_age_s: u64,
+    ) -> Vec<ReleasedLock> {
+        let mut released = Vec::new();
+        for job in self.jobs.values_mut() {
+            let Some(operation_id) = job.operation_id.clone() else {
+                continue;
+            };
+            let locked_at = job.operation_locked_at_epoch_s;
+            let is_stale = match locked_at {
+                None => true,
+                Some(epoch) => now_epoch_s.saturating_sub(epoch) >= max_age_s,
+            };
+            if !is_stale {
+                continue;
+            }
+            job.operation_id = None;
+            job.operation_locked_at_epoch_s = None;
+            released.push(ReleasedLock {
+                ue_id: job.ue_id.clone(),
+                operation_id,
+                locked_at_epoch_s: locked_at,
+            });
+        }
+        released
+    }
+
+    /// 0.19.5 — Stop reservation now has priority over an existing lock
+    /// if that lock is older than `max_age_s` (treated as expired).
+    /// `now_epoch_s` is passed in so the caller controls the clock
+    /// source (unit tests pin a fixed value). When the previous lock
+    /// is still fresh we return the historical UE_OPERATION_IN_PROGRESS
+    /// so Start / Run operators see the honest 409.
+    pub fn reserve_live_stop(
+        &mut self,
+        ue_id: &str,
+        operation_id: &str,
+        now_epoch_s: u64,
+        max_age_s: u64,
+    ) -> Result<&UeJob, String> {
         if !is_approved_controller_ue(ue_id) {
             return Err("PROTECTED_OR_UNAPPROVED_UE".into());
         }
         let job = self.jobs.get_mut(ue_id).ok_or("UE_NOT_STARTED")?;
         if job.operation_id.is_some() {
-            return Err("UE_OPERATION_IN_PROGRESS".into());
+            let locked_at = job.operation_locked_at_epoch_s.unwrap_or(0);
+            let age = now_epoch_s.saturating_sub(locked_at);
+            if age < max_age_s {
+                return Err("UE_OPERATION_IN_PROGRESS".into());
+            }
+            // Older than max age → treat as expired. Stop steals it.
         }
         if job.process_handle.is_none() {
             return Err("UE_NOT_STARTED".into());
         }
         job.lifecycle = UeLifecycle::Stopping;
         job.operation_id = Some(operation_id.into());
+        job.operation_locked_at_epoch_s = Some(now_epoch_s);
         Ok(job)
     }
 
@@ -682,6 +793,7 @@ impl MultiUeController {
                 job.traffic_state = "IDLE".into();
                 job.last_error = None;
                 job.operation_id = None;
+                job.operation_locked_at_epoch_s = None;
                 job.lifecycle = if matches!(job.process_state.as_str(), "EXITED" | "STOPPED") {
                     UeLifecycle::Stopped
                 } else if job.process_state != "RUNNING" {
@@ -701,6 +813,7 @@ impl MultiUeController {
                 job.ue_ip = None;
                 job.traffic_state = "STOPPED".into();
                 job.operation_id = None;
+                job.operation_locked_at_epoch_s = None;
                 job.last_error = Some("CONTROLLER_RESTART_OWNERSHIP_NOT_PROVEN".into());
             }
             reconciled.insert(job.ue_id.clone(), job);
@@ -737,6 +850,7 @@ impl MultiUeController {
         job.traffic_state = "STOPPED".into();
         job.process_handle = None;
         job.operation_id = None;
+        job.operation_locked_at_epoch_s = None;
         job.generation = job.generation.saturating_add(1);
         job.approved_runtime = None;
         Ok(job)
@@ -1264,5 +1378,121 @@ mod tests {
             .inventory()
             .iter()
             .all(|ue| ue.process_handle.is_none()));
+    }
+
+    /// 0.19.5 — Startup scenario: a leftover `operation_id` from a
+    /// crashed Stop. `release_stale_locks(_, 0)` must reap every
+    /// surviving lock regardless of its age, and return a per-UE
+    /// report so the caller can audit each reclaim.
+    #[test]
+    fn release_stale_locks_at_startup_reaps_every_leftover_lock() {
+        let mut controller = MultiUeController::new(ready_profiles(3), 3).unwrap();
+        controller
+            .reserve_live_start("UE-02", "op-abc", approved_runtime("UE-02"))
+            .unwrap();
+        // The lock is fresh (locked_at = now); `max_age_s = 0` means
+        // ANY surviving lock is treated as stale → reap.
+        let released = controller.release_stale_locks(now_epoch_s() + 1, 0);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].ue_id, "UE-02");
+        assert_eq!(released[0].operation_id, "op-abc");
+        assert!(released[0].locked_at_epoch_s.is_some());
+        // After reap, operation_id is None (the registry no longer
+        // reports a lock on this UE).
+        let job = &controller.inventory()[1];
+        assert_eq!(job.ue_id, "UE-02");
+        assert!(job.operation_id.is_none());
+        assert!(job.operation_locked_at_epoch_s.is_none());
+    }
+
+    /// 0.19.5 — Runtime scenario: a lock older than
+    /// MAX_OPERATION_LOCK_SECONDS expires. A fresher lock (younger
+    /// than max_age) stays untouched.
+    #[test]
+    fn release_stale_locks_during_runtime_evicts_only_locks_past_max_age() {
+        let mut controller = MultiUeController::new(ready_profiles(3), 3).unwrap();
+        controller
+            .reserve_live_start("UE-02", "op-stale", approved_runtime("UE-02"))
+            .unwrap();
+        controller
+            .complete_live_start(
+                "UE-02",
+                "op-stale",
+                &format!("container:{}", "e".repeat(64)),
+            )
+            .unwrap();
+        controller
+            .reserve_live_start("UE-03", "op-fresh", approved_runtime("UE-03"))
+            .unwrap();
+        // Make UE-02 look stale by rewriting its locked_at timestamp
+        // to five minutes ago. Then simulate reserve_live_stop by
+        // stamping a new lock on UE-02 directly to exercise the age
+        // check in isolation.
+        let now = now_epoch_s();
+        {
+            let job = controller
+                .jobs
+                .get_mut("UE-02")
+                .expect("UE-02 is in the registry");
+            job.operation_id = Some("op-stale-2".into());
+            job.operation_locked_at_epoch_s = Some(now.saturating_sub(600));
+        }
+        let released = controller.release_stale_locks(now, MAX_OPERATION_LOCK_SECONDS);
+        assert_eq!(released.len(), 1, "only the stale lock is reaped");
+        assert_eq!(released[0].ue_id, "UE-02");
+        // The fresh UE-03 lock survived the sweep.
+        let ue03 = controller.inventory().into_iter().find(|job| job.ue_id == "UE-03").unwrap();
+        assert_eq!(ue03.operation_id.as_deref(), Some("op-fresh"));
+    }
+
+    /// 0.19.5 — Stop priority: when the current lock is older than
+    /// MAX_OPERATION_LOCK_SECONDS, `reserve_live_stop` reclaims it
+    /// instead of returning UE_OPERATION_IN_PROGRESS. A FRESH lock
+    /// still produces the historical 409.
+    #[test]
+    fn reserve_live_stop_reclaims_an_expired_lock_but_refuses_a_fresh_one() {
+        let mut controller = MultiUeController::new(ready_profiles(3), 3).unwrap();
+        controller
+            .reserve_live_start("UE-02", "op-ghost", approved_runtime("UE-02"))
+            .unwrap();
+        controller
+            .complete_live_start(
+                "UE-02",
+                "op-ghost",
+                &format!("container:{}", "e".repeat(64)),
+            )
+            .unwrap();
+        // Install a fresh lock on UE-02 (simulate a stuck Stop
+        // in-flight) and attempt a competing Stop. Fresh → refused.
+        let now = now_epoch_s();
+        {
+            let job = controller.jobs.get_mut("UE-02").unwrap();
+            job.operation_id = Some("op-stuck".into());
+            job.operation_locked_at_epoch_s = Some(now);
+        }
+        let refused = controller.reserve_live_stop(
+            "UE-02",
+            "op-new",
+            now + 1,
+            MAX_OPERATION_LOCK_SECONDS,
+        );
+        assert_eq!(refused.unwrap_err(), "UE_OPERATION_IN_PROGRESS");
+
+        // Age the lock past the max → Stop reclaims it.
+        {
+            let job = controller.jobs.get_mut("UE-02").unwrap();
+            job.operation_locked_at_epoch_s = Some(now.saturating_sub(600));
+        }
+        let reclaimed = controller
+            .reserve_live_stop("UE-02", "op-new", now, MAX_OPERATION_LOCK_SECONDS)
+            .expect("expired lock must be reclaimed");
+        assert_eq!(reclaimed.operation_id.as_deref(), Some("op-new"));
+    }
+
+    fn now_epoch_s() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0)
     }
 }
