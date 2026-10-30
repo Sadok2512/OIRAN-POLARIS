@@ -1208,8 +1208,12 @@ impl CaptureManager {
                 .filter(|event| ids.contains(&event.event_id))
                 .cloned()
                 .collect::<Vec<_>>();
+            let mut edges = correlate_discovered_tunnels(&selected, &discovery);
+            edges.extend(correlate_cross_interface_evidence(&selected));
+            edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+            edges.dedup_by(|left, right| left.edge_id == right.edge_id);
             let mut reconstruction = reconstruct(
-                selected.clone(),
+                selected,
                 ReconstructionHints {
                     ue_pseudonym: context.map(|context| context.pseudonym.clone()),
                     ..Default::default()
@@ -2321,8 +2325,12 @@ impl CaptureManager {
                 .filter(|event| ids.contains(&event.event_id))
                 .cloned()
                 .collect::<Vec<_>>();
+            let mut edges = correlate_discovered_tunnels(&selected, &discovery);
+            edges.extend(correlate_cross_interface_evidence(&selected));
+            edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+            edges.dedup_by(|left, right| left.edge_id == right.edge_id);
             let mut reconstruction = reconstruct(
-                selected.clone(),
+                selected,
                 ReconstructionHints {
                     ue_pseudonym: context.map(|context| context.pseudonym.clone()),
                     ..Default::default()
@@ -2334,10 +2342,6 @@ impl CaptureManager {
                     .association
                     .insert(event.event_id.clone(), Association::Session);
             }
-            let mut edges = correlate_discovered_tunnels(&selected, &discovery);
-            edges.extend(correlate_cross_interface_evidence(&selected));
-            edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
-            edges.dedup_by(|left, right| left.edge_id == right.edge_id);
             let flow = build_callflow(&reconstruction, edges);
             let json_path = dataset_dir
                 .join("callflows")

@@ -307,6 +307,17 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
         .filter_map(Value::as_str)
         .map(ToOwned::to_owned)
         .collect();
+    // Keep only the top-level fields consumed after normalization. Retaining
+    // the complete source JSON duplicated the (potentially large)
+    // information-elements tree already stored on EventRecord and caused the
+    // continuous importer to exceed its 256 MiB service cgroup while building
+    // session/call-flow indexes.
+    let mut compact_source = serde_json::Map::new();
+    for key in ["schema_version", "procedure", "sbi"] {
+        if let Some(value) = v.get(key) {
+            compact_source.insert(key.to_string(), value.clone());
+        }
+    }
     Ok(EventRecord {
         event_id: string(&["event_id"])?,
         parent_event_id: v
@@ -341,7 +352,7 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
         raw_payload_reference: string(&["raw_payload_reference"])?,
         packet_references,
         errors,
-        source_json: v,
+        source_json: Value::Object(compact_source),
     })
 }
 

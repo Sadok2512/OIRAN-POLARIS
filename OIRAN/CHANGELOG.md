@@ -15,6 +15,9 @@
 - Bound SBI response-only streams lacking decoded request identity to one
   explicit HPACK-context evidence event per TCP connection, restoring the
   pre-regression event-count contract without hiding the capture limitation.
+- Compact session-engine source metadata to the schema, procedure and SBI
+  fields actually consumed after normalization instead of retaining a second
+  copy of every decoded IE tree during call-flow reconstruction.
 - Oversized finalized segments are now persisted individually with source
   path, observed byte size, timestamp and
   `CONTINUOUS_SOURCE_SEGMENT_TOO_LARGE`; they no longer fail the continuous
