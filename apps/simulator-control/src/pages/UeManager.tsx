@@ -20,6 +20,9 @@ import { ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
 import { ConfirmDialog } from '@/ui/ConfirmDialog';
 import { RowActionMenu } from '@/ui/RowActionMenu';
 import { formatImsiForRole } from '@/ue/imsiHelpers';
+import { LiveGrantDialog } from '@/ue/LiveGrantDialog';
+import { LiveGrantCountdown } from '@/ue/LiveGrantCountdown';
+import { Shield } from 'lucide-react';
 import {
   useAuth,
   useDnns,
@@ -149,6 +152,17 @@ export function UeManagerPage() {
   const [confirmDelete, setConfirmDelete] = useState<string[] | null>(null);
   const [confirmStop, setConfirmStop] = useState<MergedRow | null>(null);
   const [confirmRun, setConfirmRun] = useState<{ row: MergedRow; scenario: Scenario } | null>(null);
+  // 0.11.1 (#46) — Live-grant dialog state. `prefillUeIds` lets the
+  // 423 feedback banner open the dialog with the exact UE whose Run
+  // was refused.
+  const [grantDialog, setGrantDialog] = useState<{
+    open: boolean;
+    prefillUeIds?: string[];
+  }>({ open: false });
+  // 0.11.1 (#46) — When the last Run returned 423, remember which UE
+  // id triggered it so the feedback banner can offer an inline
+  // "Autoriser le live" shortcut that prefills the dialog.
+  const [feedbackGrantHint, setFeedbackGrantHint] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -448,6 +462,14 @@ export function UeManagerPage() {
         // trailing, once, small, so engineers still have the exact token
         // to file a ticket on.
         setFeedback(humanRunError(status, code, message));
+        // 0.11.1 (#46) — If the backend refused with 423
+        // LIVE_EXECUTION_NOT_AUTHORIZED, surface a one-click
+        // shortcut to the Grant dialog with the UE prefilled.
+        if (status === 423 && code === 'SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED') {
+          setFeedbackGrantHint(row.profile.id);
+        } else {
+          setFeedbackGrantHint(null);
+        }
       }
       return;
     }
@@ -534,7 +556,23 @@ export function UeManagerPage() {
         title="UE Profile Manager"
         description="Operator-authored UE profiles reconciled with the POLARIS backend inventory. Backend state (registration, PDU, UE IP, traffic) is read live from POLARIS."
         actions={
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap justify-end">
+            <LiveGrantCountdown canRevoke={canOperate} />
+            <button
+              type="button"
+              className="ep-button ep-button-sm"
+              onClick={() => setGrantDialog({ open: true })}
+              disabled={!canOperate}
+              title={
+                canOperate
+                  ? 'Ouvrir une fenêtre Live bornée (15 / 30 / 60 min)'
+                  : 'Rôle viewer : lecture seule.'
+              }
+              data-testid="live-grant-open"
+            >
+              <Shield width={13} height={13} aria-hidden="true" />
+              <span className="ml-1">Autoriser le live</span>
+            </button>
             <StatusIndicator
               state={canOperate ? 'OPERATOR_READY' : 'VIEWER_READONLY'}
               tone={canOperate ? 'success' : 'warning'}
@@ -1213,15 +1251,49 @@ export function UeManagerPage() {
       </nav>
 
       {feedback && (
-        <p
-          className="ep-badge mt-3 text-ep-sm border-primary/40"
-          data-testid="ue-feedback"
-          role="status"
-          aria-live="polite"
+        <div
+          className="mt-3 flex flex-wrap items-center gap-2"
+          data-testid="ue-feedback-row"
         >
-          {feedback}
-        </p>
+          <p
+            className="ep-badge text-ep-sm border-primary/40"
+            data-testid="ue-feedback"
+            role="status"
+            aria-live="polite"
+          >
+            {feedback}
+          </p>
+          {/* 0.11.1 (#46) — When a Run returned 423, offer a one-click
+              shortcut to the "Autoriser le live" dialog with the UE
+              prefilled. Visible only to operators. */}
+          {feedbackGrantHint && canOperate && (
+            <button
+              type="button"
+              className="ep-button ep-button-sm ep-button-primary"
+              onClick={() =>
+                setGrantDialog({ open: true, prefillUeIds: [feedbackGrantHint] })
+              }
+              data-testid="ue-feedback-open-grant"
+            >
+              <Shield width={13} height={13} aria-hidden="true" />
+              <span className="ml-1">Autoriser le live pour {feedbackGrantHint}</span>
+            </button>
+          )}
+        </div>
       )}
+
+      {/* 0.11.1 (#46) — Live-grant dialog, driven from the header
+          button and from the 423 Run-feedback shortcut. */}
+      <LiveGrantDialog
+        open={grantDialog.open}
+        availableUeIds={profiles.map((profile) => profile.id)}
+        defaultSelectedUeIds={grantDialog.prefillUeIds}
+        onClose={() => setGrantDialog({ open: false })}
+        onCreated={(id) => {
+          setFeedback(`Live grant ${id} ouvert.`);
+          setFeedbackGrantHint(null);
+        }}
+      />
 
       {/* Dialogs */}
       <CsvImportDialog
