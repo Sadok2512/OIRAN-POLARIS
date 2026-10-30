@@ -31,7 +31,7 @@ import {
   Signal,
   Wifi,
 } from 'lucide-react';
-import { PageHeader } from '@/ui/PageHeader';
+import { PageHeader } from '@/components/mockup';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 
 interface ActivityStates {

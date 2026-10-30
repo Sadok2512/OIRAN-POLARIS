@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { AlertTriangle, Info } from 'lucide-react';
-import { PageHeader } from '@/ui/PageHeader';
+import { PageHeader } from '@/components/mockup';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import { EmptyState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
 import {
@@ -44,9 +44,9 @@ export function ExecutionMonitorPage() {
   return (
     <>
       <PageHeader
-        eyebrow="Workflows"
-        title="Execution Monitor"
-        description="Real backend scenario runtime (POLARIS /scenarios/status + /traffic/status). The local timeline is a projection of the assigned scenario definition — not an authoritative execution log."
+        eyebrow="Simulation"
+        title="Execution monitor"
+        desc="Step states come from the controller, never from the browser."
         actions={
           <StatusIndicator
             state={auth.data?.can_start ? 'OPERATOR_READY' : 'VIEWER_READONLY'}

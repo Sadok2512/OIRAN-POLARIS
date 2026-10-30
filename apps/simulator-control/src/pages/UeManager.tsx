@@ -14,7 +14,7 @@ import {
   Upload,
   Users,
 } from 'lucide-react';
-import { PageHeader } from '@/ui/PageHeader';
+import { PageHeader } from '@/components/mockup';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import { ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
 import { ConfirmDialog } from '@/ui/ConfirmDialog';
@@ -552,9 +552,9 @@ export function UeManagerPage() {
   return (
     <>
       <PageHeader
-        eyebrow="Operations"
-        title="UE Profile Manager"
-        description="Operator-authored UE profiles reconciled with the POLARIS backend inventory. Backend state (registration, PDU, UE IP, traffic) is read live from POLARIS."
+        eyebrow="Simulation"
+        title="UE Manager"
+        desc="UE profiles bound to a serving gNB and, ideally, to a provisioned subscriber slot. Identity is write-only."
         actions={
           <div className="flex items-center gap-2 flex-wrap justify-end">
             <LiveGrantCountdown canRevoke={canOperate} />

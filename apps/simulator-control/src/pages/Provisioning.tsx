@@ -13,7 +13,7 @@
 import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Edit3, FileUp, Lock, Plus, Users, X } from 'lucide-react';
-import { PageHeader } from '@/ui/PageHeader';
+import { PageHeader } from '@/components/mockup';
 import { EmptyState, LoadingSkeleton, Unavailable } from '@/ui/EmptyErrorLoading';
 import { useFeatureFlag } from '@/data/featureFlags';
 import { polarisApi } from '@/data/polarisClient';

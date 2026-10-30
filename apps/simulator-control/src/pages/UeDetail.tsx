@@ -12,7 +12,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { useParams, Link } from 'react-router-dom';
 import { AlertTriangle, ArrowLeft, Lock } from 'lucide-react';
-import { PageHeader } from '@/ui/PageHeader';
+import { PageHeader } from '@/components/mockup';
 import { LoadingSkeleton, Unavailable } from '@/ui/EmptyErrorLoading';
 import { polarisApi } from '@/data/polarisClient';
 import { useFeatureFlag } from '@/data/featureFlags';

@@ -11,7 +11,7 @@ import {
   Upload,
   Workflow,
 } from 'lucide-react';
-import { PageHeader } from '@/ui/PageHeader';
+import { PageHeader } from '@/components/mockup';
 import { EmptyState, LoadingSkeleton, Unavailable } from '@/ui/EmptyErrorLoading';
 import { ConfirmDialog } from '@/ui/ConfirmDialog';
 import { useAssignments } from '@/scenarios/store';
@@ -84,9 +84,9 @@ export function ScenariosLibraryPage() {
   return (
     <>
       <PageHeader
-        eyebrow="Workflows"
+        eyebrow="Simulation"
         title="Scenarios"
-        description="Reusable mobile scenarios composed from step primitives. Definitions live in the browser until a backend scenario CRUD contract is published — see docs/frontend/SIMULATOR_SCENARIO_BUILDER.md."
+        desc="Saved on the controller with versions. Six V1 step types; numeric parameters can be fixed or random."
         actions={
           <div className="flex items-center gap-2">
             <label className="relative">

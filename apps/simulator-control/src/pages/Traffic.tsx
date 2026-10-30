@@ -1,5 +1,5 @@
 import { Info, ArrowDown, ArrowUp } from 'lucide-react';
-import { PageHeader } from '@/ui/PageHeader';
+import { PageHeader } from '@/components/mockup';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import { EmptyState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
 import { useCapabilities, useTraffic } from '@/data/queries';

@@ -12,7 +12,7 @@ import {
   Save,
   Trash2,
 } from 'lucide-react';
-import { PageHeader } from '@/ui/PageHeader';
+import { PageHeader } from '@/components/mockup';
 import { EmptyState } from '@/ui/EmptyErrorLoading';
 import { useScenarioLibrary } from '@/scenarios/library';
 import { isLoopRepresentable } from '@/scenarios/wireCodec';
