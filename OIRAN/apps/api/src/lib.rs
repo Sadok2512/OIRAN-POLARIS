@@ -15,6 +15,7 @@ use dataset_registry::{CaptureRecord, DatasetRecord, DatasetRegistry};
 use disk_safety::{assess, capture_budget, measure_path, rotation_plan, Policy};
 use event_schema::sha256_hex;
 use live_probe::{
+    lte_evidence::{LteEvidenceError, LteEvidenceImportRequest, LteEvidenceStore},
     read_callflow_page, CaptureManager, CaptureRequest, ContinuousImportConfig,
     DEFAULT_CALLFLOW_PAGE_EVENTS, DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES, MAX_CALLFLOW_PAGE_EVENTS,
 };
@@ -36,8 +37,8 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.5.4";
-pub const PLATFORM_VERSION: &str = "2.5.4";
+pub const API_VERSION: &str = "2.6.0";
+pub const PLATFORM_VERSION: &str = "2.6.0";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -60,6 +61,8 @@ struct Inner {
     capture_manager: CaptureManager,
     probe_registry: ProbeRegistry,
     derived_import_root: PathBuf,
+    lte_evidence_store: LteEvidenceStore,
+    lte_evidence_bundle_root: PathBuf,
     operator_token_sha256: Option<String>,
     administrator_token_sha256: Option<String>,
 }
@@ -73,6 +76,8 @@ pub struct ApiConfig {
     pub capture_root: PathBuf,
     pub probe_registry_path: PathBuf,
     pub derived_import_root: PathBuf,
+    pub lte_evidence_root: PathBuf,
+    pub lte_evidence_bundle_root: PathBuf,
     pub capture_execution_enabled: bool,
     pub operator_token_sha256: Option<String>,
     pub administrator_token_sha256: Option<String>,
@@ -99,6 +104,12 @@ impl ApiConfig {
             derived_import_root: std::env::var_os("OIRAN_DERIVED_IMPORT_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| workspace.join("benchmarks/E2E_002")),
+            lte_evidence_root: std::env::var_os("OIRAN_LTE_EVIDENCE_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| workspace.join("runtime/lte-evidence")),
+            lte_evidence_bundle_root: std::env::var_os("OIRAN_LTE_EVIDENCE_BUNDLE_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| workspace.join("runtime/lte-evidence-inbox")),
             capture_execution_enabled: std::env::var("OIRAN_CAPTURE_EXECUTION_ENABLED")
                 .is_ok_and(|value| value == "1"),
             operator_token_sha256: std::env::var("OIRAN_OPERATOR_TOKEN_SHA256").ok(),
@@ -187,6 +198,18 @@ impl AppState {
         let probe_registry = ProbeRegistry::load(config.probe_registry_path)?;
         let derived_import_root = config
             .derived_import_root
+            .canonicalize()
+            .map_err(io_error)?;
+        for path in [&config.lte_evidence_root, &config.lte_evidence_bundle_root] {
+            if !path.starts_with(&workspace) && !path.starts_with("/var/lib/oiran") && !cfg!(test) {
+                return Err("LTE evidence path escapes the allowlist".into());
+            }
+            fs::create_dir_all(path).map_err(io_error)?;
+        }
+        let lte_evidence_store = LteEvidenceStore::new(config.lte_evidence_root.clone())
+            .map_err(|error| error.to_string())?;
+        let lte_evidence_bundle_root = config
+            .lte_evidence_bundle_root
             .canonicalize()
             .map_err(io_error)?;
         if !capture_root.starts_with(&workspace)
@@ -352,6 +375,8 @@ impl AppState {
                 capture_manager,
                 probe_registry,
                 derived_import_root,
+                lte_evidence_store,
+                lte_evidence_bundle_root,
                 operator_token_sha256: config.operator_token_sha256,
                 administrator_token_sha256: config.administrator_token_sha256,
             }),
@@ -410,6 +435,20 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/storage/safety", get(storage_safety))
         .route("/datasets", get(datasets))
         .route("/datasets/import-derived", post(import_derived_dataset))
+        .route("/lte/evidence/import", post(import_lte_evidence))
+        .route("/lte/evidence/:run_id", get(lte_evidence_status))
+        .route(
+            "/lte/evidence/:run_id/sessions",
+            get(lte_evidence_sessions),
+        )
+        .route(
+            "/lte/evidence/:run_id/sessions/:session_id/callflow",
+            get(lte_evidence_callflow),
+        )
+        .route(
+            "/lte/evidence/:run_id/exports",
+            post(export_lte_evidence),
+        )
         .route("/datasets/:id", get(dataset))
         .route("/datasets/:id/sessions", get(dataset_sessions))
         .route("/ues", get(ues))
@@ -1446,6 +1485,113 @@ async fn import_derived_dataset(
             &error,
         ),
     }
+}
+
+async fn import_lte_evidence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<LteEvidenceImportRequest>,
+) -> Response {
+    if let Err(response) = require_operator_csrf(&state, &headers) {
+        return response;
+    }
+    let bundle = state.inner.lte_evidence_bundle_root.join(&request.bundle_id);
+    match state.inner.lte_evidence_store.ingest(&bundle, &request) {
+        Ok(result) => {
+            let status = if result.idempotent {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            (status, ok(json!(result))).into_response()
+        }
+        Err(error) => lte_evidence_error(error),
+    }
+}
+
+async fn lte_evidence_status(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Response {
+    match state.inner.lte_evidence_store.import_result(&run_id) {
+        Ok(result) => ok(json!(result)).into_response(),
+        Err(error) => lte_evidence_error(error),
+    }
+}
+
+async fn lte_evidence_sessions(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    match state.inner.lte_evidence_store.session_page(
+        &run_id,
+        query.page.unwrap_or(1),
+        query.page_size.unwrap_or(50),
+    ) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => lte_evidence_error(error),
+    }
+}
+
+async fn lte_evidence_callflow(
+    State(state): State<AppState>,
+    Path((run_id, session_id)): Path<(String, String)>,
+    Query(query): Query<CallflowQuery>,
+) -> Response {
+    match state.inner.lte_evidence_store.callflow_page(
+        &run_id,
+        &session_id,
+        query.cursor.as_deref(),
+        query.limit.unwrap_or(DEFAULT_CALLFLOW_PAGE_EVENTS),
+    ) {
+        Ok(value) => ok(value).into_response(),
+        Err(error) => lte_evidence_error(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LteExportRequest {
+    export_id: String,
+    transformation: String,
+}
+
+async fn export_lte_evidence(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<LteExportRequest>,
+) -> Response {
+    if let Err(response) = require_operator_csrf(&state, &headers) {
+        return response;
+    }
+    match state
+        .inner
+        .lte_evidence_store
+        .export_pending_review(&run_id, &request.export_id, &request.transformation)
+    {
+        Ok(manifest) => (StatusCode::CREATED, ok(json!(manifest))).into_response(),
+        Err(error) => lte_evidence_error(error),
+    }
+}
+
+fn lte_evidence_error(error: LteEvidenceError) -> Response {
+    let status = if error.code.contains("CONFLICT") {
+        StatusCode::CONFLICT
+    } else if error.code.contains("LIMIT_EXCEEDED") || error.code.contains("TOO_LARGE") {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else if error.code.contains("UNAVAILABLE") {
+        StatusCode::NOT_FOUND
+    } else if error.code.contains("WRITE_FAILED")
+        || error.code.contains("FINALIZE_FAILED")
+        || error.code.contains("SYNC_FAILED")
+    {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    api_error(status, error.code, &error.detail)
 }
 
 async fn dataset(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -2592,6 +2738,9 @@ mod tests {
     fn test_config(root: &FsPath, label: &str) -> ApiConfig {
         let mut config = ApiConfig::from_workspace(root);
         config.probe_registry_path = temporary_directory(label).join("probe-registry.json");
+        let evidence = temporary_directory(&format!("{label}-lte-evidence"));
+        config.lte_evidence_root = evidence.join("store");
+        config.lte_evidence_bundle_root = evidence.join("inbox");
         config
     }
     fn state() -> AppState {
@@ -2618,6 +2767,25 @@ mod tests {
     async fn json_body(response: Response) -> Value {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
     }
+    fn lte_import_payload() -> Value {
+        json!({
+            "schema_version":"oiran.lte-evidence-ingestion.v1",
+            "bundle_id":"bundle-synthetic-01",
+            "evidence":{
+                "schema_version":"oiran-polaris.lte-e2e-evidence.v1",
+                "run_id":"lte-run-synthetic-0001",
+                "profile_id":"LTE-SRSUE-TEST-01",
+                "scenario_id":"lte-e2e-certification-v1",
+                "started_at":"2026-10-31T12:00:00Z",
+                "ended_at":"2026-10-31T12:00:10Z",
+                "final_state":"COMPLETED",
+                "steps":[],
+                "capture_refs":[],
+                "cleanup":{"srsue_stopped":true,"srsenb_stopped":true,"sidecars_removed":true,"epc_healthy":true,"dumpcaps_preserved":true}
+            },
+            "capture_bindings":[]
+        })
+    }
     #[tokio::test]
     async fn unauthenticated_request_is_allowed_read_only() {
         assert_eq!(
@@ -2628,6 +2796,77 @@ mod tests {
                 .status(),
             StatusCode::OK
         )
+    }
+    #[tokio::test]
+    async fn lte_evidence_import_requires_operator_and_csrf() {
+        let body = serde_json::to_vec(&lte_import_payload()).unwrap();
+        let unauthenticated = router(state(), None)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/lte/evidence/import")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(unauthenticated).await["error"]["code"], "OPERATOR_REQUIRED");
+
+        let missing_csrf = router(operator_state(), None)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/lte/evidence/import")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(missing_csrf).await["error"]["code"], "CSRF_REQUIRED");
+
+        let export_unauthenticated = router(state(), None)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/lte/evidence/lte-run-synthetic-0001/exports")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"export_id":"export-synthetic-01","transformation":"VERIFIED_COPY"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(export_unauthenticated.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            json_body(export_unauthenticated).await["error"]["code"],
+            "OPERATOR_REQUIRED"
+        );
+    }
+
+    #[tokio::test]
+    async fn lte_evidence_view_routes_are_bounded_and_do_not_fabricate_missing_runs() {
+        let app = router(state(), None);
+        let missing = app
+            .clone()
+            .oneshot(req("/api/v1/lte/evidence/lte-run-missing-0001", false))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let invalid_page = app
+            .oneshot(req(
+                "/api/v1/lte/evidence/lte-run-missing-0001/sessions?page=1&page_size=101",
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_page.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json_body(invalid_page).await["error"]["code"], "LTE_PAGINATION_INVALID");
     }
     #[tokio::test]
     async fn health_reports_real_dataset() {
