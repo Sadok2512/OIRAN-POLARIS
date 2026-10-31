@@ -26,6 +26,7 @@ pub const MAX_INGEST_EVENTS: usize = 50_000;
 pub const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_RETAINED_EVENT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SESSION_PAGE_SIZE: usize = 100;
+pub const MAX_CATALOG_DATASETS: usize = 128;
 
 const PROFILE_ID: &str = "LTE-SRSUE-TEST-01";
 const SCENARIO_ID: &str = "lte-e2e-certification-v1";
@@ -444,6 +445,91 @@ impl LteEvidenceStore {
                 .join(format!("dataset-{run_id}"))
                 .join("ingestion_result.json"),
         )
+    }
+
+    /// Enumerates only atomically finalized LTE datasets. Temporary or partial
+    /// directories are ignored and the catalog has a fixed upper bound.
+    pub fn catalog(&self) -> Result<Vec<LteDatasetManifest>, LteEvidenceError> {
+        let mut paths = fs::read_dir(self.root.join("datasets"))
+            .map_err(io_error("LTE_STORE_UNAVAILABLE"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("dataset-") && !name.starts_with('.'))
+                    && path.join("ingestion_result.json").is_file()
+                    && path.join("dataset_manifest.json").is_file()
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        if paths.len() > MAX_CATALOG_DATASETS {
+            return Err(LteEvidenceError::new(
+                "LTE_CATALOG_LIMIT_EXCEEDED",
+                format!("{} finalized datasets exceeds {MAX_CATALOG_DATASETS}", paths.len()),
+            ));
+        }
+        paths
+            .into_iter()
+            .map(|path| read_json(&path.join("dataset_manifest.json")))
+            .collect()
+    }
+
+    /// Resolves a session by stable identifier using bounded, line-oriented
+    /// reads. No dataset event collection is loaded into memory.
+    pub fn find_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(LteDatasetManifest, LteSession)>, LteEvidenceError> {
+        if !safe_id(session_id) {
+            return Err(LteEvidenceError::new("LTE_SESSION_ID_INVALID", session_id));
+        }
+        for manifest in self.catalog()? {
+            if !manifest.session_ids.iter().any(|id| id == session_id) {
+                continue;
+            }
+            let path = self
+                .root
+                .join("datasets")
+                .join(&manifest.dataset_id)
+                .join("sessions.jsonl");
+            let reader = BufReader::new(
+                File::open(path).map_err(io_error("LTE_ARTIFACT_UNAVAILABLE"))?,
+            );
+            for line in reader.lines() {
+                let line = line.map_err(io_error("LTE_ARTIFACT_INVALID"))?;
+                if line.len() > MAX_EVENT_LINE_BYTES {
+                    return Err(LteEvidenceError::new(
+                        "LTE_ARTIFACT_LINE_TOO_LARGE",
+                        session_id,
+                    ));
+                }
+                let session: LteSession = serde_json::from_str(&line).map_err(|error| {
+                    LteEvidenceError::new("LTE_ARTIFACT_INVALID", error.to_string())
+                })?;
+                if session.session_id == session_id {
+                    return Ok(Some((manifest, session)));
+                }
+            }
+            return Err(LteEvidenceError::new(
+                "LTE_MANIFEST_SESSION_MISSING",
+                session_id,
+            ));
+        }
+        Ok(None)
+    }
+
+    pub fn callflow_page_by_session(
+        &self,
+        session_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Option<Value>, LteEvidenceError> {
+        let Some((manifest, _)) = self.find_session(session_id)? else {
+            return Ok(None);
+        };
+        self.callflow_page(&manifest.run_id, session_id, cursor, limit)
+            .map(Some)
     }
 
     pub fn session_page(
@@ -1468,11 +1554,21 @@ mod tests {
         let sessions = store.session_page(&request.evidence.run_id, 1, 10).unwrap();
         assert_eq!(sessions["pagination"]["total"], 1);
         let session_id = sessions["data"][0]["session_id"].as_str().unwrap();
+        let catalog = store.catalog().unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].dataset_id, first.dataset_id);
+        let (found_manifest, found_session) = store.find_session(session_id).unwrap().unwrap();
+        assert_eq!(found_manifest.dataset_id, first.dataset_id);
+        assert_eq!(found_session.session_id, session_id);
         let flow = store
             .callflow_page(&request.evidence.run_id, session_id, None, 2)
             .unwrap();
         assert_eq!(flow["technology"], "LTE");
         assert!(flow["events"].as_array().unwrap().len() <= 2);
+        assert!(store
+            .callflow_page_by_session(session_id, None, 2)
+            .unwrap()
+            .is_some());
         assert!(!store_root
             .join("datasets")
             .read_dir()
