@@ -1,8 +1,6 @@
-import { PageHeader } from '@/ui/PageHeader';
+import { Card, PageHeader, Pill, regTone } from '@/components/mockup';
 import { EmptyState, ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
-import { StatusIndicator } from '@/ui/StatusIndicator';
 import { useScenarioHistory } from '@/data/queries';
-import { count, isoToLocal } from '@/data/format';
 
 export function HistoryPage() {
   const history = useScenarioHistory();
@@ -11,8 +9,8 @@ export function HistoryPage() {
     <>
       <PageHeader
         eyebrow="Review"
-        title="Scenario history"
-        description="Terminal controller-owned jobs recorded by POLARIS. Live and controller-ignored jobs are not included — see /scenarios/history."
+        title="History"
+        desc="Terminal controller-owned jobs recorded by POLARIS."
       />
       {history.isLoading && !history.data && <LoadingSkeleton label="Loading history" />}
       {history.error && (
@@ -29,36 +27,42 @@ export function HistoryPage() {
         />
       )}
       {history.data && history.data.items.length > 0 && (
-        <div className="ep-card overflow-hidden">
-          <table className="ep-table" data-testid="history-table">
-            <thead>
-              <tr>
-                <th>Scenario ID</th>
-                <th>Target UE</th>
-                <th>Started</th>
-                <th>Duration</th>
-                <th>Packets</th>
-                <th>Terminal result</th>
-                <th>State</th>
-              </tr>
-            </thead>
-            <tbody>
-              {history.data.items.map((item) => (
-                <tr key={item.scenario_id}>
-                  <td className="mono text-ep-xs">{item.scenario_id}</td>
-                  <td>{item.target_ue_id ?? '—'}</td>
-                  <td>{isoToLocal(item.started_at)}</td>
-                  <td className="num">{item.duration_seconds}s</td>
-                  <td className="num">
-                    {count(item.packets_sent)} / {count(item.packets_requested)}
-                  </td>
-                  <td>{item.terminal_result ?? '—'}</td>
-                  <td><StatusIndicator state={item.state} compact /></td>
+        <Card className="overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[620px] text-ep-md" data-testid="history-table">
+              <thead>
+                <tr className="text-left text-ep-xs uppercase tracking-wider text-mute border-b border-line">
+                  <th className="px-4 py-2.5 font-semibold">Job</th>
+                  <th className="px-3 py-2.5 font-semibold">Scenario</th>
+                  <th className="px-3 py-2.5 font-semibold">UE</th>
+                  <th className="px-3 py-2.5 font-semibold">Loops</th>
+                  <th className="px-4 py-2.5 font-semibold">Result</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {history.data.items.map((item) => {
+                  const result = (item.terminal_result ?? item.state).toUpperCase();
+                  return (
+                    <tr
+                      key={item.job_id ?? item.scenario_id}
+                      className="border-b border-line last:border-0"
+                    >
+                      <td className="px-4 py-3 mono text-ep-sm">{item.job_id ?? '—'}</td>
+                      <td className="px-3 py-3">{item.scenario_id}</td>
+                      <td className="px-3 py-3 mono">{item.target_ue_id ?? '—'}</td>
+                      <td className="px-3 py-3 num">
+                        {item.packets_sent ?? 0} / {item.packets_requested}
+                      </td>
+                      <td className="px-4 py-3">
+                        <Pill tone={regTone(result)}>{result}</Pill>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
       )}
     </>
   );

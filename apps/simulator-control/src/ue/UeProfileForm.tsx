@@ -1,11 +1,19 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { X } from 'lucide-react';
+import { ApiError } from '@shared/api';
 import {
   emptyProfile,
   validateProfile,
   type ProfileIssue,
   type UeProfileDraft,
 } from './profileModel';
+import {
+  DEFAULT_LAB_PLMN,
+  nextFreeImsiFor,
+  parsePlmnString,
+  type LabPlmn,
+} from './imsiHelpers';
+import { usePlmns } from '@/data/queries';
 
 export type ProfileFormMode = 'create' | 'edit' | 'clone';
 
@@ -22,7 +30,9 @@ const FIELD_LABELS: Record<keyof UeProfileDraft, string> = {
 
 const FIELD_HINTS: Partial<Record<keyof UeProfileDraft, string>> = {
   id: 'Unique identifier (letters, digits, _ . : -)',
-  imsi: 'Optional. 14–16 digits.',
+  // 0.10.3 — The default IMSI uses the lab's REAL PLMN pulled from
+  // /plmns (fallback 001-01). The 999 prefix was unserviceable.
+  imsi: '14–16 digits. Default = next free IMSI on the lab PLMN.',
   plmn: 'Optional. 5 or 6 digits.',
   ueIp: 'Optional. IPv4 (set by backend when PDU session is up).',
   apn: 'Optional. Access Point Name used for PDU establishment.',
@@ -54,6 +64,41 @@ export function UeProfileFormDialog({
     dialogRef.current?.focus();
   }, [open, initial]);
 
+  // 0.10.3 — Resolve the lab PLMN from /plmns (fallback: DEFAULT_LAB_PLMN,
+  // which is MCC 001 / MNC 01, the standard Open5GS lab configuration).
+  // The 0.10.2 revision defaulted to a fictive 99901 prefix that the
+  // Open5GS lab did not serve, stranding every freshly-created profile.
+  const plmnsQuery = usePlmns();
+  const labPlmn: LabPlmn = useMemo(() => {
+    const raw = (plmnsQuery.data as unknown as { items?: unknown[] })?.items ?? [];
+    for (const entry of raw) {
+      if (typeof entry === 'string') {
+        const parsed = parsePlmnString(entry);
+        if (parsed) return parsed;
+      } else if (entry && typeof entry === 'object') {
+        const record = entry as { id?: string; mcc?: string; mnc?: string };
+        if (record.mcc && record.mnc) return { mcc: record.mcc, mnc: record.mnc };
+        const parsed = parsePlmnString(record.id);
+        if (parsed) return parsed;
+      }
+    }
+    return DEFAULT_LAB_PLMN;
+  }, [plmnsQuery.data]);
+
+  // 0.10.3 — Prefill IMSI from UE id × live PLMN. Manual overrides stay
+  // sticky because the effect only runs when the field is empty.
+  const defaultImsiForId = useMemo(
+    () => nextFreeImsiFor(draft.id ?? '', labPlmn),
+    [draft.id, labPlmn],
+  );
+  useEffect(() => {
+    if (!open) return;
+    if (!defaultImsiForId) return;
+    if (draft.imsi && draft.imsi.trim().length > 0) return;
+    setDraft((prev) => ({ ...prev, imsi: defaultImsiForId.replace(/^imsi-/, '') }));
+  }, [open, defaultImsiForId, draft.imsi]);
+
+
   useEffect(() => {
     if (!open) return;
     const handler = (event: KeyboardEvent) => {
@@ -81,7 +126,7 @@ export function UeProfileFormDialog({
       setServerError('');
       await onSubmit(draft);
     } catch (error) {
-      setServerError((error as Error).message);
+      setServerError(humaniseProfileFormError(error));
     }
   }
 
@@ -257,4 +302,27 @@ function indexIssues(issues: ProfileIssue[]): Partial<Record<keyof UeProfileDraf
     if (!map[issue.path]) map[issue.path] = issue.message;
   }
   return map;
+}
+
+/**
+ * 0.10.4 — Turn a server error into a plain-French sentence for the
+ * form banner. The 409 "IMSI already taken" case the operator hits
+ * most often gets its own line; everything else falls back to the raw
+ * message. The technical code is kept trailing, once, so engineers
+ * still have the exact token to grep for.
+ */
+export function humaniseProfileFormError(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.status === 409) {
+      const headline = /IMSI/i.test(error.code) || /IMSI/i.test(error.message)
+        ? "L'IMSI est déjà utilisé par un autre abonné. Choisissez-en un autre."
+        : "Conflit côté backend : la ressource existe déjà.";
+      return `${headline} · ${error.code}`;
+    }
+    if (error.status === 401) {
+      return `Session expirée — reconnectez-vous. · ${error.code}`;
+    }
+    return `${error.message || 'Requête refusée.'} · ${error.code}`;
+  }
+  return (error as Error)?.message ?? 'Erreur inconnue.';
 }

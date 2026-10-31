@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { PageHeader } from '@/ui/PageHeader';
+import { PageHeader } from '@/components/mockup';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import { LoadingSkeleton, Unavailable } from '@/ui/EmptyErrorLoading';
 import {

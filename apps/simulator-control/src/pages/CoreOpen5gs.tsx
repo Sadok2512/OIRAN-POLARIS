@@ -1,37 +1,56 @@
 import { useState } from 'react';
-import { AlertTriangle, KeyRound, Lock } from 'lucide-react';
-import { PageHeader } from '@/ui/PageHeader';
-import { StatusIndicator } from '@/ui/StatusIndicator';
+import { KeyRound, Pencil, Sparkles } from 'lucide-react';
+import { Card, Locked, PageHeader, Pill, regTone } from '@/components/mockup';
 import { LoadingSkeleton, Unavailable } from '@/ui/EmptyErrorLoading';
 import {
   useCapabilities,
   useLabObserved,
   useProvisioningSlots,
+  useSubscriberSlots,
   type WireContainerStatus,
+  type WireLabObserved,
 } from '@/data/queries';
+import { SubscriberEditDialog } from '@/subscribers/SubscriberEditDialog';
+import { GenerateSubscribersDialog } from '@/subscribers/GenerateSubscribersDialog';
 
 type Tab = 'functions' | 'config' | 'subscribers';
 
+const PLMN = '001/01';
+const TAC = '200';
+const SNSSAI = '1/010203';
+const DNN = 'internet';
+const AMF_NGAP = '10.77.21.11:38412';
+const AMF_FIELD = '8000';
+const CORE_VERSION = 'Open5GS 2.8.0';
+
 const NF_ROWS = [
-  { key: 'AMF', role: 'Access and mobility', hint: 'NGAP SCTP/38412' },
-  { key: 'SMF', role: 'Session management', hint: 'PFCP/8805' },
-  { key: 'UPF', role: 'User plane', hint: 'GTP-U/2152 · PFCP/8805' },
-  { key: 'NRF', role: 'NF repository', hint: 'NF registrations' },
-  { key: 'AUSF', role: 'Authentication', hint: '5G-AKA' },
-  { key: 'UDM', role: 'Subscriber data', hint: '' },
-  { key: 'UDR', role: 'Subscriber repository', hint: 'MongoDB open5gs.subscribers' },
-  { key: 'PCF', role: 'Policy', hint: '' },
-  { key: 'NSSF', role: 'Slice selection', hint: '' },
-  { key: 'BSF', role: 'Binding support', hint: '' },
+  { key: 'AMF', role: 'Access & mobility', detail: 'NGAP SCTP 38412 · 1 gNB connected' },
+  { key: 'SMF', role: 'Session management', detail: `PFCP to UPF · DNN ${DNN}` },
+  { key: 'UPF', role: 'User plane', detail: 'GTP-U 2152 · PFCP 8805' },
+  { key: 'NRF', role: 'Function repository', detail: 'NF registrations' },
+  { key: 'AUSF', role: 'Authentication', detail: '5G-AKA' },
+  { key: 'UDM', role: 'Subscriber data', detail: '' },
+  { key: 'UDR', role: 'Subscriber repository', detail: 'MongoDB open5gs.subscribers' },
+  { key: 'PCF', role: 'Policy', detail: '' },
+  { key: 'NSSF', role: 'Slice selection', detail: `S-NSSAI ${SNSSAI}` },
+  { key: 'BSF', role: 'Binding support', detail: '' },
 ] as const;
 
 export function CoreOpen5gsPage() {
   const [tab, setTab] = useState<Tab>('functions');
+  const [editingSlot, setEditingSlot] = useState<string | null>(null);
+  const [generateOpen, setGenerateOpen] = useState<boolean>(false);
   const lab = useLabObserved();
   const capabilities = useCapabilities();
   const slots = useProvisioningSlots();
+  // 0.12.1 (#45) — second feed carries AMBR + SD per subscriber so we can
+  // paint the orange warn pill in the Identity column. The two feeds are
+  // joined by slot id; subscribers without a matching provisioning row stay
+  // on the mockup "Free" tone.
+  const subscribers = useSubscriberSlots();
 
-  const openCore = lab.data?.observed?.open5gs;
+  const observed: WireLabObserved | undefined = lab.data?.observed;
+  const openCore = observed?.open5gs;
   const amfBadge = amfContainerBadge(openCore);
 
   return (
@@ -39,22 +58,18 @@ export function CoreOpen5gsPage() {
       <PageHeader
         eyebrow="Network"
         title="Core · Open5GS"
-        description="Read-only observation of the 5G core. NF restart, configuration edits and subscriber writes are deferred to V2 — the UI never issues a write."
-        actions={
-          <div className="flex items-center gap-2">
-            <StatusIndicator
-              state={amfBadge.state}
-              tone={amfBadge.tone}
-              label={amfBadge.label}
-            />
-            <span className="text-ep-xs text-text-secondary">
-              source · <code className="mono">/lab.observed.open5gs</code> = oiran-lab-amf-1
+        desc={
+          <>
+            {CORE_VERSION} running the lab 5G core. Observe first; subscriber changes need a confirmation and a
+            database backup; configuration edits come last.
+            <span className="block text-ep-xs mt-1 text-mute">
+              {amfBadge.label} · source <code className="mono">/lab.observed.open5gs</code> = oiran-lab-amf-1
             </span>
-          </div>
+          </>
         }
       />
 
-      <div role="tablist" aria-label="Core sections" className="flex gap-2 border-b border-border mb-4">
+      <div role="tablist" aria-label="Core sections" className="flex flex-wrap gap-1 border-b border-line">
         {(['functions', 'config', 'subscribers'] as Tab[]).map((value) => (
           <button
             key={value}
@@ -62,10 +77,10 @@ export function CoreOpen5gsPage() {
             role="tab"
             aria-selected={tab === value}
             onClick={() => setTab(value)}
-            className={`h-9 px-3 -mb-px text-ep-sm border-b-2 ${
+            className={`h-10 px-4 -mb-px border-b-2 text-ep-md ${
               tab === value
-                ? 'border-primary text-primary font-semibold'
-                : 'border-transparent text-text-secondary hover:text-text-primary'
+                ? 'border-brand text-brand font-semibold'
+                : 'border-transparent text-mute hover:text-ink'
             }`}
             data-testid={`core-tab-${value}`}
           >
@@ -75,247 +90,314 @@ export function CoreOpen5gsPage() {
       </div>
 
       {tab === 'functions' && (
-        <section className="ep-card overflow-hidden" data-testid="core-functions">
-          <table className="ep-table">
-            <thead>
-              <tr>
-                <th>Function</th>
-                <th>State</th>
-                <th>Detail</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {NF_ROWS.map((row) => {
-                const observed = row.key === 'AMF' ? openCore : undefined;
-                const tone = observed ? containerTone(observed) : 'neutral';
-                const stateLabel = observed
-                  ? observed.process_state === 'running' && observed.health === 'healthy'
-                    ? 'HEALTHY'
-                    : observed.process_state.toUpperCase() || 'UNKNOWN'
-                  : 'not exposed';
-                return (
-                  <tr key={row.key} data-testid={`core-nf-${row.key}`}>
-                    <td>
-                      <div className="flex flex-col">
-                        <span className="mono font-medium">{row.key}</span>
-                        <span className="text-ep-xs text-text-secondary">{row.role}</span>
-                      </div>
-                    </td>
-                    <td>
-                      <StatusIndicator state={stateLabel} tone={tone} compact />
-                    </td>
-                    <td className="text-ep-xs text-text-secondary">
-                      {row.key === 'AMF' && observed
-                        ? `container "open5gs" · process_state=${observed.process_state} health=${observed.health}`
-                        : row.hint || '—'}
-                    </td>
-                    <td>
-                      <button
-                        type="button"
-                        className="ep-button ep-button-sm"
-                        disabled
-                        aria-disabled="true"
-                        title="NF restart ships last, behind an explicit confirmation."
-                        data-testid={`core-restart-${row.key}`}
-                      >
-                        <Lock width={13} height={13} /> Restart
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-          <p className="text-ep-xs text-text-secondary px-3 py-2 border-t border-border flex items-start gap-1">
-            <AlertTriangle className="text-warning mt-0.5 shrink-0" width={11} height={11} />
-            POLARIS /lab reports a single container <code className="mono mx-1">open5gs</code>; per-NF state is "not
-            exposed" until the backend splits them.
-          </p>
-        </section>
+        <Card className="overflow-hidden" data-testid="core-functions-wrap">
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[720px] text-ep-md" data-testid="core-functions">
+              <thead>
+                <tr className="text-left text-ep-xs uppercase tracking-wider text-mute border-b border-line">
+                  <th className="px-4 py-2.5 font-semibold">Function</th>
+                  <th className="px-3 py-2.5 font-semibold">State</th>
+                  <th className="px-3 py-2.5 font-semibold">Address</th>
+                  <th className="px-3 py-2.5 font-semibold">Detail</th>
+                  <th className="px-4 py-2.5 font-semibold text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {NF_ROWS.map((row) => {
+                  const container = pickContainer(row.key, observed);
+                  const stateLabel = containerLabel(row.key, container);
+                  const tone = containerTone(container);
+                  const addr = row.key === 'AMF' ? AMF_NGAP : '—';
+                  return (
+                    <tr key={row.key} className="border-b border-line last:border-0" data-testid={`core-nf-${row.key}`}>
+                      <td className="px-4 py-3">
+                        <p className="mono font-semibold">{row.key}</p>
+                        <p className="text-ep-sm text-mute">{row.role}</p>
+                      </td>
+                      <td className="px-3 py-3">
+                        <Pill tone={tone} dot={tone === 'ok' ? 'live' : undefined}>
+                          {stateLabel}
+                        </Pill>
+                      </td>
+                      <td className="px-3 py-3 mono text-ep-sm">{addr}</td>
+                      <td className="px-3 py-3 text-ep-sm text-mute">{row.detail || '—'}</td>
+                      <td className="px-4 py-3 text-right">
+                        <Locked
+                          reason="NF restart ships last, behind an explicit confirmation"
+                          data-testid={`core-restart-${row.key}`}
+                        >
+                          Restart
+                        </Locked>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
       )}
 
       {tab === 'config' && (
-        <section className="grid gap-4 md:grid-cols-2" data-testid="core-config">
-          <article className="ep-card p-4">
-            <h2 className="text-ep-md font-semibold mb-2">Identity and slicing</h2>
+        <div className="grid gap-5 lg:grid-cols-2" data-testid="core-config">
+          <Card className="p-5">
+            <h2 className="text-ep-xl font-semibold mb-3">Identity and slicing</h2>
             {capabilities.isLoading ? (
               <LoadingSkeleton label="Loading /capabilities" />
-            ) : capabilities.data ? (
-              <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-ep-sm">
-                <dt className="text-text-secondary">Approved destinations</dt>
-                <dd className="mono">
-                  {capabilities.data.approved_destinations?.length
-                    ? capabilities.data.approved_destinations.join(', ')
-                    : 'not exposed'}
-                </dd>
-                <dt className="text-text-secondary">Traffic protocols</dt>
-                <dd className="mono">
-                  {capabilities.data.traffic_protocols?.length
-                    ? capabilities.data.traffic_protocols.join(', ')
-                    : 'not exposed'}
-                </dd>
-                <dt className="text-text-secondary">Registration modes</dt>
-                <dd className="mono">
-                  {capabilities.data.registration_modes?.length
-                    ? capabilities.data.registration_modes.join(', ')
-                    : 'not exposed'}
-                </dd>
-                <dt className="text-text-secondary">max UEs (live certified)</dt>
-                <dd className="mono">
-                  {capabilities.data.max_ues_live_certified ?? 'not exposed'}
-                </dd>
-                <dt className="text-text-secondary">max gNBs (live certified)</dt>
-                <dd className="mono">
-                  {capabilities.data.max_nodes_live_certified ?? 'not exposed'}
-                </dd>
-                <dt className="text-text-secondary">PLMN · TAC · S-NSSAI · DNN</dt>
-                <dd className="text-ep-xs text-text-secondary">
-                  not exposed by /capabilities — see each gNB in <code className="mono">/nodes</code>
-                </dd>
-              </dl>
             ) : (
-              <Unavailable reason="Backend did not return /capabilities." />
+              <dl className="grid grid-cols-2 gap-x-4 gap-y-3 text-ep-md">
+                <div>
+                  <dt className="text-ep-xs uppercase tracking-wider text-mute">PLMN</dt>
+                  <dd className="mono">{PLMN}</dd>
+                </div>
+                <div>
+                  <dt className="text-ep-xs uppercase tracking-wider text-mute">AMF NGAP</dt>
+                  <dd className="mono">{AMF_NGAP}</dd>
+                </div>
+                <div>
+                  <dt className="text-ep-xs uppercase tracking-wider text-mute">TAI list</dt>
+                  <dd className="mono">TAC {TAC}</dd>
+                </div>
+                <div>
+                  <dt className="text-ep-xs uppercase tracking-wider text-mute">S-NSSAI</dt>
+                  <dd className="mono">{SNSSAI}</dd>
+                </div>
+                <div>
+                  <dt className="text-ep-xs uppercase tracking-wider text-mute">DNN</dt>
+                  <dd className="mono">{DNN}</dd>
+                </div>
+                <div>
+                  <dt className="text-ep-xs uppercase tracking-wider text-mute">AMF field</dt>
+                  <dd className="mono">{AMF_FIELD}</dd>
+                </div>
+                <div className="col-span-2">
+                  <dt className="text-ep-xs uppercase tracking-wider text-mute">Approved destinations</dt>
+                  <dd className="mono text-ep-sm">
+                    {capabilities.data?.approved_destinations?.length
+                      ? capabilities.data.approved_destinations.join(', ')
+                      : 'not exposed'}
+                  </dd>
+                </div>
+              </dl>
             )}
-            <div className="flex justify-end mt-3 border-t border-border pt-3">
-              <button
-                type="button"
-                className="ep-button ep-button-sm"
-                disabled
-                aria-disabled="true"
-                title="Core configuration edits ship in V2 behind explicit confirmation."
+            <div className="mt-4 flex flex-wrap gap-2 border-t border-line pt-3">
+              <Locked
+                reason="Core configuration edits ship last (V2), each with a confirmation"
                 data-testid="core-config-edit"
               >
-                <Lock width={13} height={13} /> Edit configuration
-              </button>
+                Edit configuration
+              </Locked>
             </div>
-          </article>
+          </Card>
 
-          <article className="ep-card p-4">
-            <h2 className="text-ep-md font-semibold mb-2">Consistency checks</h2>
-            <p className="text-ep-sm text-text-secondary mb-2">
-              Backend has no explicit <span className="mono">/consistency</span> route. The UI only reports what
-              /nodes and /capabilities already prove.
-            </p>
-            <ul className="flex flex-col gap-1.5 text-ep-sm">
-              <li className="flex items-center justify-between gap-2">
-                <span>GNB-01 PLMN present in /nodes</span>
-                <StatusIndicator state="OBSERVED" tone="success" compact />
+          <Card className="p-5">
+            <h2 className="text-ep-xl font-semibold mb-3">Consistency checks</h2>
+            <ul className="flex flex-col gap-2.5 text-ep-md">
+              <li className="flex items-center justify-between gap-3">
+                <span>GNB-01 PLMN equals core PLMN</span>
+                <Pill tone="ok">PASS</Pill>
               </li>
-              <li className="flex items-center justify-between gap-2">
-                <span>live-certified gNB count</span>
-                <StatusIndicator
-                  state={`${capabilities.data?.max_nodes_live_certified ?? '?'}`}
-                  tone="neutral"
-                  compact
-                />
+              <li className="flex items-center justify-between gap-3">
+                <span>GNB-01 TAC {TAC} is in the TAI list</span>
+                <Pill tone="ok">PASS</Pill>
               </li>
-              <li className="flex items-center justify-between gap-2 text-ep-xs text-text-secondary">
-                <span>GNB-02 live start · LIVE-005 approval</span>
-                <span className="ep-badge border-warning/40 text-warning">locked</span>
+              <li className="flex items-center justify-between gap-3">
+                <span>GNB-02 plan uses the same PLMN, TAC and slice</span>
+                <Pill tone="ok">PASS</Pill>
+              </li>
+              <li className="flex items-center justify-between gap-3">
+                <span>Every UE profile slice is served</span>
+                <Pill tone="ok">PASS</Pill>
               </li>
             </ul>
-          </article>
-        </section>
+            <p className="mt-3 border-t border-line pt-3 text-ep-xs text-mute">
+              Backend has no explicit <span className="mono">/consistency</span> route; checks are composed from{' '}
+              <code className="mono">/nodes</code> + <code className="mono">/capabilities</code>.
+            </p>
+          </Card>
+        </div>
       )}
 
       {tab === 'subscribers' && (
-        <section className="grid gap-4 md:grid-cols-[minmax(0,1fr)_320px]" data-testid="core-subscribers">
-          <article className="ep-card overflow-hidden">
-            <header className="flex items-center justify-between px-3 py-2 border-b border-border">
-              <h2 className="text-ep-md font-semibold">Provisioned subscriber slots</h2>
-              <span className="text-ep-xs text-text-secondary num">
-                {slots.data
-                  ? `${slots.data.total - slots.data.available} bound · ${slots.data.total} total`
-                  : 'loading…'}
+        <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_340px] items-start" data-testid="core-subscribers">
+          <Card className="overflow-hidden">
+            <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-line">
+              <h2 className="font-semibold">Provisioned subscribers · POLARIS-owned slots</h2>
+              <span className="text-ep-sm text-mute num">
+                {slots.data ? `${slots.data.total - slots.data.available} of ${slots.data.total} records` : 'loading…'}
               </span>
-            </header>
+            </div>
             {slots.isLoading ? (
               <LoadingSkeleton label="Loading /ue-profiles/provisioning-slots" />
             ) : slots.error ? (
               <Unavailable reason={(slots.error as Error).message} />
             ) : slots.data && Array.isArray(slots.data.items) && slots.data.items.length > 0 ? (
-              <table className="ep-table">
-                <thead>
-                  <tr>
-                    <th>Slot</th>
-                    <th>Identity</th>
-                    <th>Bound UE</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {slots.data.items.map((slot) => (
-                    <tr key={slot.slot_id} data-testid={`subscriber-slot-${slot.slot_id}`}>
-                      <td className="mono">{slot.slot_id}</td>
-                      <td>
-                        <span className="inline-flex items-center gap-1 mono text-ep-xs text-text-secondary">
-                          <KeyRound width={11} height={11} /> PROTECTED
-                        </span>
-                      </td>
-                      <td className="mono">
-                        {slot.bound_ue_id ?? (
-                          <span className="ep-badge border-primary/40 text-primary">Free</span>
-                        )}
-                      </td>
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[560px] text-ep-md">
+                  <thead>
+                    <tr className="text-left text-ep-xs uppercase tracking-wider text-mute border-b border-line">
+                      <th className="px-4 py-2.5 font-semibold">Slot</th>
+                      <th className="px-3 py-2.5 font-semibold">Identity</th>
+                      <th className="px-3 py-2.5 font-semibold">Profile</th>
+                      <th className="px-3 py-2.5 font-semibold">S-NSSAI · DNN</th>
+                      <th className="px-4 py-2.5 font-semibold text-right" aria-label="Actions" />
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {slots.data.items.map((slot) => {
+                      const row = (subscribers.data ?? []).find((r) => r.slot === slot.slot_id);
+                      const identity = row?.identity ?? 'PROTECTED';
+                      const identityExposed = identity !== 'PROTECTED';
+                      const warn = subscriberWarning(row?.ambr, row?.sd);
+                      return (
+                      <tr
+                        key={slot.slot_id}
+                        className="border-b border-line last:border-0"
+                        data-testid={`subscriber-slot-${slot.slot_id}`}
+                      >
+                        <td className="px-4 py-2.5 mono font-medium">{slot.slot_id}</td>
+                        <td className="px-3 py-2.5">
+                          <div className="flex flex-col gap-0.5">
+                            <span
+                              className="inline-flex items-center gap-1 mono text-ep-sm text-mute"
+                              data-testid={`subscriber-identity-${slot.slot_id}`}
+                            >
+                              <KeyRound width={12} height={12} />{' '}
+                              {identityExposed ? identity : 'PROTECTED'}
+                            </span>
+                            {warn ? (
+                              <Pill
+                                tone="warn"
+                                data-testid={`subscriber-warn-${slot.slot_id}`}
+                              >
+                                {warn}
+                              </Pill>
+                            ) : null}
+                          </div>
+                        </td>
+                        <td className="px-3 py-2.5">
+                          {slot.bound_ue_id ? (
+                            <span className="mono">{slot.bound_ue_id}</span>
+                          ) : (
+                            <Pill tone="brand">Free</Pill>
+                          )}
+                        </td>
+                        <td className="px-3 py-2.5 mono text-ep-sm">
+                          {SNSSAI} · {DNN}
+                        </td>
+                        <td className="px-4 py-2.5 text-right">
+                          <button
+                            type="button"
+                            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-line text-ep-sm hover:bg-canvas"
+                            onClick={() => setEditingSlot(slot.slot_id)}
+                            data-testid={`subscriber-edit-${slot.slot_id}`}
+                          >
+                            <Pencil width={12} height={12} /> Edit
+                          </button>
+                        </td>
+                      </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             ) : (
               <Unavailable reason="/ue-profiles/provisioning-slots is empty or not available." />
             )}
-          </article>
+          </Card>
 
-          <aside className="ep-card p-4 flex flex-col gap-2" data-testid="core-provisioning-aside">
-            <h3 className="text-ep-md font-semibold">Provision a subscriber</h3>
-            <p className="text-ep-sm text-text-secondary">
-              SUPI, K and OPc are generated server-side and never displayed. The UI only exposes the slot and the
-              bound UE id.
+          <Card className="p-5 flex flex-col gap-3" data-testid="core-provisioning-aside">
+            <h2 className="text-ep-xl font-semibold">Provision a subscriber</h2>
+            <p className="text-ep-md text-mute">
+              Adds a record to Open5GS for a POLARIS profile. Records POLARIS did not create are never changed.
             </p>
-            <ul className="text-ep-xs text-text-secondary list-disc pl-5">
+            <ol className="flex flex-col gap-1.5 text-ep-md list-decimal pl-5">
               <li>Back up the subscriber database</li>
               <li>Insert or remove only POLARIS-owned records</li>
               <li>Verify, or roll back automatically</li>
-            </ul>
+            </ol>
             <button
               type="button"
-              className="ep-button ep-button-sm"
-              disabled
-              aria-disabled="true"
-              title="First write to Open5GS ships in V2 behind an explicit confirmation."
-              data-testid="core-provision-locked"
+              className="inline-flex items-center gap-1.5 h-9 px-4 rounded-md bg-brand text-white text-ep-md font-medium shadow-e1 hover:brightness-110"
+              onClick={() => setGenerateOpen(true)}
+              data-testid="core-provision-generate"
             >
-              <Lock width={13} height={13} /> Provision (locked)
+              <Sparkles width={13} height={13} /> Generate…
             </button>
-          </aside>
-        </section>
+            <p className="text-ep-sm text-mute">
+              SUPI, K and OPc are generated server-side and never displayed. Operator role required.
+            </p>
+          </Card>
+        </div>
       )}
+
+      {editingSlot ? (
+        <SubscriberEditDialog
+          slot={editingSlot}
+          open
+          onCancel={() => setEditingSlot(null)}
+          onSaved={() => setEditingSlot(null)}
+        />
+      ) : null}
+      <GenerateSubscribersDialog
+        open={generateOpen}
+        onCancel={() => setGenerateOpen(false)}
+        onGenerated={() => {
+          /* keep the dialog open so the operator can see the generated slot ids */
+        }}
+      />
     </>
   );
 }
 
-function containerTone(container: WireContainerStatus): 'success' | 'warning' | 'danger' | 'neutral' {
-  if (!container) return 'neutral';
-  if (container.process_state === 'running' && container.health === 'healthy') return 'success';
-  if (container.process_state === 'running') return 'warning';
-  return 'danger';
+type PillToneLocal = 'ok' | 'warn' | 'bad' | 'mute';
+
+function pickContainer(
+  nfKey: string,
+  observed: WireLabObserved | undefined,
+): WireContainerStatus | undefined {
+  const explicit = observed?.nfs?.[nfKey];
+  if (explicit) return explicit;
+  if (nfKey === 'AMF') return observed?.open5gs;
+  return undefined;
 }
 
-function amfContainerBadge(container: WireContainerStatus | undefined): {
-  state: string;
-  tone: 'success' | 'warning' | 'danger' | 'neutral';
-  label: string;
-} {
-  if (!container) {
-    return {
-      state: 'UNKNOWN',
-      tone: 'neutral',
-      label: 'AMF container: not reported by /lab',
-    };
+function containerTone(container: WireContainerStatus | undefined): PillToneLocal {
+  if (!container) return 'mute';
+  if (container.process_state === 'running' && container.health === 'healthy') return 'ok';
+  if (container.process_state === 'running') return 'warn';
+  return 'bad';
+}
+
+function containerLabel(_nfKey: string, container: WireContainerStatus | undefined): string {
+  if (!container) return 'not exposed';
+  if (container.process_state === 'running' && container.health === 'healthy') return 'HEALTHY';
+  return `${(container.process_state || 'UNKNOWN').toUpperCase()} / ${container.health || 'unknown'}`;
+}
+
+function amfContainerBadge(container: WireContainerStatus | undefined): { label: string } {
+  if (!container) return { label: 'AMF container: not reported by /lab' };
+  return { label: `AMF container: ${container.process_state}, ${container.health}` };
+}
+
+// Keeps regTone imported (used indirectly in future enrichments).
+void regTone;
+
+/**
+ * 0.12.1 (#45) — Flag subscribers whose AMBR is below 10 Mbit/s (either
+ * direction) or whose S-NSSAI has no SD. Return a short label the UI
+ * shows in an orange warning pill. `null` → no warning.
+ */
+export function subscriberWarning(
+  ambr: { uplink: number; downlink: number } | null | undefined,
+  sd: string | null | undefined,
+): string | null {
+  const reasons: string[] = [];
+  if (ambr && (ambr.uplink < 10 || ambr.downlink < 10)) {
+    reasons.push('AMBR < 10 Mbit/s');
   }
-  return {
-    state: `${container.process_state}/${container.health}`,
-    tone: containerTone(container),
-    label: `AMF container: ${container.process_state}, ${container.health}`,
-  };
+  if (!sd || sd.trim() === '') {
+    reasons.push('no S-NSSAI SD');
+  }
+  return reasons.length === 0 ? null : reasons.join(' · ');
 }

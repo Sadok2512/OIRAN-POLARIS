@@ -27,3 +27,14 @@ python3 scripts/capture-network-screenshots.py   # terminal 2
 | `network-topology-{light,dark}.png` | `/network/topology` — Core → gNB → UE composed from /lab + /nodes + /ues; link labels say `configured` / `down` / `unknown` (never "UP") | both |
 | `network-core-{light,dark}.png` | `/network/core` · functions tab — AMF HEALTHY, other NFs "not exposed"; header badge "AMF container: running, healthy" with source `/lab.observed.open5gs = oiran-lab-amf-1` | both |
 | `network-gnbs-{light,dark}.png` | `/network/gnbs` — GNB-01 real card, GNB-02 locked `LIVE_005_APPROVAL_REQUIRED`, ENB-01 under "LTE profile (not certified)" with `LTE_ATTACH_NOT_CERTIFIED` | both |
+| `subscribers-tab.png` | `/core-open5gs` · Subscribers tab — slot rows with PROTECTED identity, bound UE id or Free badge, Edit action, Generate button in aside | light |
+| `subscriber-edit-dialog.png` | SST / SD / DNN dropdowns, AMBR number inputs, opt-in "Rotate authentication material" with write-only K/OPc inputs placeholder `PROTECTED — write-only` | light |
+| `subscriber-generate-dialog.png` | count (1-1000), SST/SD/DNN dropdowns pre-filled from lab defaults (SST=1, SD=010203, DNN=internet), AMBR 1 Mbps defaults, result list showing a slot with PROTECTED identity | light |
+
+## 0.8.0 — Subscribers surface
+
+The `e2e/subscribers.spec.ts` suite (ran with `npx playwright test` after
+`npm install && npx playwright install chromium`) renders the three
+captures above. Every mocked response in the spec uses the literal
+`"PROTECTED"` for `subscriber_identity` / `authentication_material`; no
+real IMSI, K or OPc appears in artefacts, logs or assertion material.

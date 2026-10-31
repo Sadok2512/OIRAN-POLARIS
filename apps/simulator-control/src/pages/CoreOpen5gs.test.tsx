@@ -105,7 +105,7 @@ describe('Core · Open5GS', () => {
     const slotRow = screen.getByTestId('subscriber-slot-UE-01');
     expect(slotRow.textContent).toMatch(/PROTECTED/);
     expect(slotRow.textContent).not.toMatch(/\d{14,16}/); // no IMSI leaking
-    expect(screen.getByTestId('core-provision-locked')).toBeDisabled();
+    expect(screen.getByTestId('core-provision-generate')).toBeEnabled();
   });
 
   it('handles empty /ue-profiles/provisioning-slots honestly', async () => {

@@ -122,26 +122,30 @@ export const STEP_METADATA: Record<
     backendCertified: false,
     backendNote: 'DL_SENDER_NOT_AVAILABLE — no DN-side sender wired yet. Backend will refuse execution with 422.',
   },
+  // 0.5.2 — Honest downgrade: scenario-definition v2 lands with Codex on
+  // `feat/polaris-traffic-templates` but is NOT yet executed by the
+  // production backend. We mark these three kinds as not certified by
+  // default; the UI promotes them back to "Supported" when (and only
+  // when) `GET /capabilities` advertises them via `scenario_step_kinds`.
   TRAFFIC_UL: {
     label: 'Uplink traffic',
     family: 'ACTION',
     defaultParams: ['bytes', 'rate_kbps'],
-    backendCertified: true,
-    backendNote: 'Accepted by scenario-definition v2 as traffic_ul.',
+    backendCertified: false,
+    backendNote: 'Backend pending: feat/polaris-traffic-templates.',
   },
   DETACH: {
     label: 'Detach (release all PDU, stop UE)',
     family: 'ACTION',
-    backendCertified: true,
-    backendNote: 'Scenario-definition v2: pdu_release(all) + ue_stop. UERANSIM does not emit CM-IDLE.',
+    backendCertified: false,
+    backendNote: 'Backend pending: feat/polaris-traffic-templates.',
   },
   REPEAT: {
     label: 'Repeat block',
     family: 'ACTION',
     defaultParams: ['loop_count'],
-    backendCertified: true,
-    backendNote:
-      'Scenario-definition v2: nests other steps. Nesting depth capped at 2; cumulative resolved steps ≤ 10 000.',
+    backendCertified: false,
+    backendNote: 'Backend pending: feat/polaris-traffic-templates.',
   },
   IMS_REGISTER: {
     label: 'IMS registration',
@@ -210,6 +214,23 @@ export const BACKEND_LOCK_REASONS = {
 export const MAX_REPEAT_NESTING = 2;
 /** Shared resolved-steps cap kept in sync with the backend (RESOLVED_STEPS_LIMIT otherwise). */
 export const MAX_RESOLVED_STEPS = 10_000;
+
+/**
+ * 0.5.2 — "Effective" certification of a step kind: a kind is clickable
+ * in backend mode when its metadata is `backendCertified: true` OR when
+ * the backend advertised its wire type in `GET /capabilities`'s
+ * `scenario_step_kinds` array. Pass `undefined` for the capabilities
+ * list to fall back to the metadata flag alone.
+ */
+export function isStepKindExecutable(
+  kind: ScenarioStepKind,
+  advertisedWireTypes: readonly string[] | undefined,
+): boolean {
+  if (STEP_METADATA[kind].backendCertified) return true;
+  const wire = WIRE_STEP_TYPE[kind];
+  if (!wire || !advertisedWireTypes) return false;
+  return advertisedWireTypes.includes(wire);
+}
 
 export type FixedOrRandom =
   | { mode: 'fixed'; value: number }

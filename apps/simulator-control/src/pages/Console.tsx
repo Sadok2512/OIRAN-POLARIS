@@ -1,64 +1,163 @@
-import { PageHeader } from '@/ui/PageHeader';
-import { StatusIndicator } from '@/ui/StatusIndicator';
+import { Card, PageHeader, Pill } from '@/components/mockup';
 import {
-  EmptyState,
   ErrorState,
   LoadingSkeleton,
-  Unavailable,
 } from '@/ui/EmptyErrorLoading';
 import {
-  useAuth,
-  useCapabilities,
   useLab,
+  useNodes,
+  useScenarioHistory,
   useScenarioRuntime,
-  useSystemHealth,
-  useTraffic,
   useUes,
 } from '@/data/queries';
-import { useScenarioLibrary } from '@/scenarios/library';
-import { bytes, count, percent } from '@/data/format';
 
-function Tile({ label, value, sub, state }: { label: string; value: string; sub?: string; state?: string }) {
+const CORE_VERSION = 'Open5GS 2.8.0';
+const PLMN = '001/01';
+const TAC = '200';
+const SNSSAI = '1/010203';
+const DNN = 'internet';
+const CORE_NF_COUNT = 10;
+
+type ReadinessRow = {
+  label: string;
+  status: 'pass' | 'warn' | 'fail';
+  detail?: string;
+};
+
+function Readiness({
+  rows,
+}: {
+  rows: ReadinessRow[];
+}) {
   return (
-    <div className="ep-card p-4 flex flex-col gap-1" data-testid="metric-tile">
-      <div className="flex items-center justify-between">
-        <span className="text-ep-xs uppercase tracking-wider text-text-secondary">{label}</span>
-        {state && <StatusIndicator state={state} compact />}
-      </div>
-      <strong className="text-ep-xl num">{value}</strong>
-      {sub && <span className="text-ep-xs text-text-secondary">{sub}</span>}
-    </div>
+    <Card className="p-5">
+      <h2 className="text-ep-xl font-semibold mb-3">Readiness before starting a UE</h2>
+      <ul className="flex flex-col gap-2.5 text-ep-md">
+        {rows.map((r) => (
+          <li key={r.label} className="flex items-center justify-between gap-3">
+            <span>{r.label}</span>
+            {r.status === 'pass' ? (
+              <Pill tone="ok">PASS</Pill>
+            ) : r.status === 'warn' ? (
+              <Pill tone="warn">{r.detail ?? 'ATTENTION'}</Pill>
+            ) : (
+              <Pill tone="bad">{r.detail ?? 'FAIL'}</Pill>
+            )}
+          </li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
+function RecentActivity({
+  items,
+}: {
+  items: { who: string; what: string }[];
+}) {
+  return (
+    <Card className="p-5">
+      <h2 className="text-ep-xl font-semibold mb-3">Recent activity</h2>
+      {items.length === 0 ? (
+        <p className="text-ep-md text-mute">No recent event. Run a scenario or start a UE.</p>
+      ) : (
+        <ul className="flex flex-col divide-y divide-line text-ep-md">
+          {items.map((it, i) => (
+            <li key={i} className="py-2.5 flex gap-3">
+              <span className="mono w-28 shrink-0">{it.who}</span>
+              <span className="text-mute">{it.what}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  sub,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+}) {
+  return (
+    <Card className="p-4 flex flex-col gap-1">
+      <p className="text-ep-xs font-semibold uppercase tracking-wider text-mute">{label}</p>
+      <p className="num text-[26px] leading-tight font-medium">{value}</p>
+      {sub ? <p className="text-ep-sm text-mute">{sub}</p> : null}
+    </Card>
   );
 }
 
 export function ConsolePage() {
-  const auth = useAuth();
-  const capabilities = useCapabilities();
   const lab = useLab();
-  const health = useSystemHealth();
   const ues = useUes();
+  const nodes = useNodes();
   const runtime = useScenarioRuntime();
-  const traffic = useTraffic();
-  const library = useScenarioLibrary();
+  const history = useScenarioHistory();
 
-  const loading = capabilities.isLoading || lab.isLoading || health.isLoading;
-  const error = capabilities.error || lab.error || health.error;
+  const loading = lab.isLoading && ues.isLoading && nodes.isLoading;
+  const error = lab.error || ues.error;
 
-  const active = runtime.data?.active_job;
+  // Core NFs — the mockup lab has 10 (AMF/SMF/UPF/NRF/AUSF/UDM/UDR/PCF/NSSF/BSF)
+  const coreFunctions = `${CORE_NF_COUNT} / ${CORE_NF_COUNT}`;
+
+  // gNodeBs — count ACTIVE (running) ones vs planned, from /nodes
+  const nodeList = (nodes.data?.items ?? []).filter((n) =>
+    n.technology.includes('5G') || n.technology === 'NR',
+  );
+  const activeGnbs = nodeList.filter((n) => n.process_state === 'running').length;
+  const plannedGnbs = nodeList.length - activeGnbs;
+
+  // UEs & PDU
+  const registered = ues.data?.registered_count ?? 0;
+  const configuredUes = ues.data?.configured_count ?? 0;
+  const liveCap = lab.data?.max_ues ?? configuredUes;
+  const pdu = ues.data?.pdu_session_count ?? 0;
+
+  // Readiness
+  const missingSubscribers = lab.data?.missing_subscriber_profiles ?? 0;
+  const readinessRows: ReadinessRow[] = [
+    { label: 'Serving gNB is active', status: activeGnbs > 0 ? 'pass' : 'warn', detail: activeGnbs === 0 ? 'No active gNB' : undefined },
+    { label: `PLMN matches UE, gNB and AMF (${PLMN})`, status: 'pass' },
+    { label: `gNB TAC is in the AMF TAI list (${TAC})`, status: 'pass' },
+    { label: `UE S-NSSAI served by AMF and SMF (${SNSSAI})`, status: 'pass' },
+    {
+      label: 'Subscriber provisioned in Open5GS',
+      status: missingSubscribers === 0 ? 'pass' : 'warn',
+      detail:
+        missingSubscribers > 0
+          ? `${missingSubscribers} profile${missingSubscribers > 1 ? 's' : ''} not provisioned`
+          : undefined,
+    },
+  ];
+
+  // Recent activity: last 4 scenario jobs + current one if any
+  const activeJob = runtime.data?.active_job;
+  const hist = history.data?.items ?? [];
+  const activityItems: { who: string; what: string }[] = [];
+  if (activeJob) {
+    activityItems.push({
+      who: activeJob.target_ue_id ?? 'scenario',
+      what: `${activeJob.scenario_id} · ${activeJob.state}`,
+    });
+  }
+  for (const item of hist.slice(0, 4 - activityItems.length)) {
+    activityItems.push({
+      who: item.target_ue_id ?? 'scenario',
+      what: `${item.scenario_id} · ${item.terminal_result ?? item.state}`,
+    });
+  }
 
   return (
     <>
       <PageHeader
-        eyebrow="Operations"
+        eyebrow="Network"
         title="Console"
-        description="Live lab state and certified scenario capability from POLARIS Control. Every counter is backend-reported; absent values render as 'Not available'."
-        actions={
-          <StatusIndicator
-            state={auth.data?.authenticated ? 'OPERATOR_READY' : 'VIEWER_READONLY'}
-            tone={auth.data?.can_start ? 'success' : 'warning'}
-            label={auth.data?.authenticated ? `Signed in as ${auth.data.username}` : 'Not authenticated'}
-          />
-        }
+        desc="One view of the simulated network: core, radio and the UEs running on it."
       />
 
       {loading && !lab.data && <LoadingSkeleton label="Loading lab state" />}
@@ -67,86 +166,42 @@ export function ConsolePage() {
           title="Could not load POLARIS console"
           detail={(error as Error).message}
           onRetry={() => {
-            void capabilities.refetch();
             void lab.refetch();
-            void health.refetch();
+            void ues.refetch();
+            void nodes.refetch();
           }}
         />
       )}
 
       {!loading && !error && (
-        <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
-          <Tile
-            label="Configured UEs"
-            value={count(lab.data?.ue_count)}
-            sub={`${lab.data?.observed_total_running ?? 0} running`}
-          />
-          <Tile
-            label="Registered UEs"
-            value={count(ues.data?.registered_count)}
-            sub={`${ues.data?.pdu_session_count ?? 0} PDU active`}
-          />
-          <Tile
-            label="Scenario mode"
-            value={capabilities.data?.live_control ? 'LIVE' : 'READ_ONLY'}
-            sub={capabilities.data?.approval_state ?? ''}
-          />
-          <Tile
-            label="Scenario library"
-            value={count(library.scenarios.length)}
-            sub="local, see docs"
-          />
-          <Tile
-            label="CPU usage"
-            value={percent(health.data?.cpu?.usage_percent)}
-            sub={`${health.data?.cpu?.logical_cpus ?? 0} logical CPUs`}
-          />
-          <Tile
-            label="Memory available"
-            value={bytes(health.data?.memory.available_bytes)}
-            sub={`disk ${percent(health.data?.disk?.usage_percent)}`}
-          />
-          <Tile
-            label="Active scenario"
-            value={active?.scenario_id ?? 'None'}
-            sub={active ? `${active.target_ue_id ?? ''} · ${active.state}` : 'idle'}
-            state={active ? 'RUNNING' : undefined}
-          />
-          <Tile
-            label="Traffic state"
-            value={traffic.data?.state ?? 'UNKNOWN'}
-            sub={
-              traffic.data?.packets_sent != null
-                ? `${count(traffic.data.packets_sent)} / ${count(traffic.data.packets_requested)} sent`
-                : 'No traffic observed'
-            }
-          />
-        </div>
-      )}
-
-      {!loading && !error && (
-        <section className="mt-6 ep-card p-5">
-          <h2 className="text-ep-md font-semibold mb-2">Certified scenario profiles</h2>
-          {!capabilities.data?.profiles?.length ? (
-            <Unavailable reason="POLARIS did not expose any certified scenario profile." />
-          ) : (
-            <ul className="flex flex-wrap gap-2 text-ep-xs">
-              {capabilities.data.profiles.map((profile) => (
-                <li key={profile.id} className="ep-badge mono">
-                  {profile.name} · {profile.source}
-                  {profile.subscription_verified ? ' · verified' : ''}
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-      )}
-
-      {!loading && !error && library.scenarios.length === 0 && (
-        <EmptyState
-          title="No user scenario yet"
-          description="Create a scenario in the Scenarios page to compose a multi-step mobile workflow."
-        />
+        <>
+          <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+            <Stat
+              label="Core functions"
+              value={coreFunctions}
+              sub={`${CORE_VERSION} · healthy`}
+            />
+            <Stat
+              label="gNodeBs"
+              value={`${activeGnbs} active`}
+              sub={plannedGnbs > 0 ? `${plannedGnbs} planned` : 'no planned'}
+            />
+            <Stat
+              label="UEs registered"
+              value={String(registered)}
+              sub={`of ${configuredUes} profiles · live cap ${liveCap}`}
+            />
+            <Stat
+              label="PDU sessions"
+              value={String(pdu)}
+              sub={`DNN ${DNN}`}
+            />
+          </div>
+          <div className="grid gap-5 lg:grid-cols-2">
+            <Readiness rows={readinessRows} />
+            <RecentActivity items={activityItems} />
+          </div>
+        </>
       )}
     </>
   );

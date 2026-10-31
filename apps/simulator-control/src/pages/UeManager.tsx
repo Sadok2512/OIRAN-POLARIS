@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   AlertTriangle,
   ChevronLeft,
@@ -13,17 +14,26 @@ import {
   Upload,
   Users,
 } from 'lucide-react';
-import { PageHeader } from '@/ui/PageHeader';
+import { Card, PageHeader, Pill, regTone } from '@/components/mockup';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import { ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
 import { ConfirmDialog } from '@/ui/ConfirmDialog';
+import { RowActionMenu } from '@/ui/RowActionMenu';
+import { formatImsiForRole } from '@/ue/imsiHelpers';
+import { LiveGrantDialog } from '@/ue/LiveGrantDialog';
+import { LiveGrantCountdown } from '@/ue/LiveGrantCountdown';
+import { Shield } from 'lucide-react';
 import {
   useAuth,
+  useDnns,
+  useGenerateSubscribers,
+  usePlmns,
+  useScenarioRuntime,
   useStartScenario,
   useStartUe,
   useStopScenario,
   useStopUe,
-  useScenarioRuntime,
+  useSubscriberSlots,
   useUes,
 } from '@/data/queries';
 import { useAssignments } from '@/scenarios/store';
@@ -47,14 +57,38 @@ import {
 } from '@/ue/profileStore';
 import { UeProfileFormDialog, type ProfileFormMode } from '@/ue/UeProfileForm';
 import { UeProfileBackendFormDialog } from '@/ue/UeProfileBackendForm';
+import { UeProvisioningAddDialog, type UeProvisioningAddValues } from '@/ue/UeProvisioningAddDialog';
 import { useBackendProfiles } from '@/ue/profileSource';
-import type { WireUeProfileMutation } from '@/data/profileApi';
+import { fetchGnbs, type WireGnb, type WireUeProfileMutation } from '@/data/profileApi';
 import { useFeatureFlag } from '@/data/featureFlags';
+import { createUeProvisioningProfile, useOwners } from '@/data/provisioningApi';
+import { ApiError } from '@shared/api';
 import { useStartScenarioRun } from '@/data/scenarioApi';
 import { UeBulkCreateDialog } from '@/ue/UeBulkCreateDialog';
 import { AssignScenarioDialog } from '@/ue/AssignScenarioDialog';
+import { CsvImportDialog } from '@/components/CsvImportDialog';
+import { useQuery } from '@tanstack/react-query';
 
 const PAGE_SIZES = [25, 50, 100, 250] as const;
+
+/** Compute the next-free `UE-NN` id by scanning existing ids and picking
+ * the lowest unused slot (#29f). Padding matches the UE_ID regex
+ * (`UE-NN` for < 100, `UE-NNNNN` beyond) so the prefilled value is always
+ * a valid identifier. */
+export function nextFreeUeIdFrom(existing: string[]): string {
+  const used = new Set<number>();
+  for (const id of existing) {
+    const match = /^UE-(\d{2,})$/i.exec(id.trim());
+    if (match) used.add(Number(match[1]));
+  }
+  let candidate = 1;
+  while (used.has(candidate)) candidate += 1;
+  const padded =
+    candidate < 100
+      ? candidate.toString().padStart(2, '0')
+      : candidate.toString().padStart(5, '0');
+  return `UE-${padded}`;
+}
 
 interface MergedRow {
   profile: UeProfileRecord;
@@ -91,11 +125,44 @@ export function UeManagerPage() {
     mode: ProfileFormMode;
     initial?: UeProfileDraft;
   } | null>(null);
+  const polarisProvisioning = useFeatureFlag('polarisProvisioning');
+  const [provisioningAddOpen, setProvisioningAddOpen] = useState(false);
+  const [provisioningAddError, setProvisioningAddError] = useState<string | null>(null);
+  const [provisioningAddSubmitting, setProvisioningAddSubmitting] = useState(false);
+  const [backendCsvOpen, setBackendCsvOpen] = useState(false);
+  // The gNB directory is already published by polaris-control-api 0.11.0;
+  // reuse the hook to feed the Add UE dropdown. We ping the owner directory
+  // under the polarisProvisioning flag so the hook stays off when the
+  // backend branch is not yet deployed.
+  const gnbList = useQuery({
+    queryKey: ['polaris', 'gnbs'],
+    queryFn: fetchGnbs,
+    enabled: polarisProvisioning,
+    retry: false,
+    staleTime: 60_000,
+  });
+  const ownerList = useOwners();
+  const plmnList = usePlmns();
+  const dnnList = useDnns();
+  const subscriberSlots = useSubscriberSlots();
+  const generateSubscriber = useGenerateSubscribers();
+  const [generateError, setGenerateError] = useState<string | null>(null);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [assignOpen, setAssignOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string[] | null>(null);
   const [confirmStop, setConfirmStop] = useState<MergedRow | null>(null);
   const [confirmRun, setConfirmRun] = useState<{ row: MergedRow; scenario: Scenario } | null>(null);
+  // 0.11.1 (#46) — Live-grant dialog state. `prefillUeIds` lets the
+  // 423 feedback banner open the dialog with the exact UE whose Run
+  // was refused.
+  const [grantDialog, setGrantDialog] = useState<{
+    open: boolean;
+    prefillUeIds?: string[];
+  }>({ open: false });
+  // 0.11.1 (#46) — When the last Run returned 423, remember which UE
+  // id triggered it so the feedback banner can offer an inline
+  // "Autoriser le live" shortcut that prefills the dialog.
+  const [feedbackGrantHint, setFeedbackGrantHint] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -161,8 +228,9 @@ export function UeManagerPage() {
         pageSize,
         sortBy: 'id',
         sortDirection: 'asc',
+        includeImsi: canOperate,
       }),
-    [profiles, search, ownerFilter, gnbFilter, page, pageSize],
+    [profiles, search, ownerFilter, gnbFilter, page, pageSize, canOperate],
   );
 
   // Clamp page if filter shrinks the result set.
@@ -187,6 +255,30 @@ export function UeManagerPage() {
   const activeJob = runtime.data?.active_job;
 
   /* ----------------------------- Mutators ------------------------------ */
+
+  // 0.9.4 — polarisProvisioning Add UE flow (#29). The dialog binds the
+  // UE profile to a provisioned subscriber slot (`provisioning_slot` =
+  // SUB-…) and surfaces PLMN / DNN / SST / SD as lab-served dropdowns.
+  // The IMSI text input is gone: identity material stays server-side.
+  async function submitProvisioningAdd(values: UeProvisioningAddValues) {
+    setProvisioningAddError(null);
+    setProvisioningAddSubmitting(true);
+    try {
+      await createUeProvisioningProfile(values);
+      setProvisioningAddOpen(false);
+      setFeedback(
+        `UE ${values.ue_id} created on POLARIS (owner: ${values.owner}, gNB: ${values.gnb_id}).`,
+      );
+    } catch (error) {
+      const code = error instanceof ApiError ? error.code : 'UE_CREATE_FAILED';
+      const status = error instanceof ApiError ? error.status : null;
+      setProvisioningAddError(
+        `${status ? `HTTP ${status} · ` : ''}${code} · ${(error as Error).message}`,
+      );
+    } finally {
+      setProvisioningAddSubmitting(false);
+    }
+  }
 
   async function submitBackend(body: WireUeProfileMutation, mode: ProfileFormMode) {
     if (mode === 'create') {
@@ -362,12 +454,22 @@ export function UeManagerPage() {
         });
         setFeedback(`Scenario ${scenario.name} started for ${row.profile.id} · job ${job.job_id} (${job.state}).`);
       } catch (error) {
+        const status = (error as { status?: number }).status;
         const code = (error as { code?: string }).code;
-        setFeedback(
-          code === 'SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED'
-            ? 'Live execution of backend scenario definitions is locked on this controller (mock mode only).'
-            : `${code ?? 'Start failed'} · ${(error as Error).message}`,
-        );
+        const message = (error as Error).message;
+        // 0.10.2 (#43) — Translate the backend codes operators actually
+        // see into plain-language guidance. We keep the technical code
+        // trailing, once, small, so engineers still have the exact token
+        // to file a ticket on.
+        setFeedback(humanRunError(status, code, message));
+        // 0.11.1 (#46) — If the backend refused with 423
+        // LIVE_EXECUTION_NOT_AUTHORIZED, surface a one-click
+        // shortcut to the Grant dialog with the UE prefilled.
+        if (status === 423 && code === 'SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED') {
+          setFeedbackGrantHint(row.profile.id);
+        } else {
+          setFeedbackGrantHint(null);
+        }
       }
       return;
     }
@@ -395,21 +497,25 @@ export function UeManagerPage() {
   }
 
   async function stopFor(row: MergedRow) {
-    if (!activeJob?.job_id) {
-      setFeedback('No active job to stop.');
-      return;
-    }
+    // 0.10.0 — Stop prefers the active scenario job (if the UE owns it), and
+    // falls back to the direct backend Stop action otherwise. Previously the
+    // button was disabled whenever no active_job existed; now the toggle
+    // follows backend.actions.stop so running UEs can be stopped directly.
     const backendId = row.backend?.internal_ue_id ?? row.backend?.id;
-    if (activeJob.target_ue_id && activeJob.target_ue_id !== backendId) {
-      setFeedback('Active job is not owned by this UE; stop ignored.');
+    if (activeJob?.job_id && (!activeJob.target_ue_id || activeJob.target_ue_id === backendId)) {
+      try {
+        await stopScenario.mutateAsync(activeJob.job_id);
+        setFeedback(`Stop sent for job ${activeJob.job_id}.`);
+      } catch (error) {
+        setFeedback((error as Error).message);
+      }
       return;
     }
-    try {
-      await stopScenario.mutateAsync(activeJob.job_id);
-      setFeedback(`Stop sent for job ${activeJob.job_id}.`);
-    } catch (error) {
-      setFeedback((error as Error).message);
+    if (row.backend?.actions?.stop) {
+      await stopBackendUe(row);
+      return;
     }
+    setFeedback('No active job and backend reports Stop not available.');
   }
 
   async function startBackendUe(row: MergedRow) {
@@ -446,11 +552,27 @@ export function UeManagerPage() {
   return (
     <>
       <PageHeader
-        eyebrow="Operations"
-        title="UE Profile Manager"
-        description="Operator-authored UE profiles reconciled with the POLARIS backend inventory. Profiles persist in the browser until a backend CRUD contract is available; backend state (registration, PDU, UE IP, traffic) is read live from POLARIS."
+        eyebrow="Simulation"
+        title="UE Manager"
+        desc="UE profiles bound to a serving gNB and, ideally, to a provisioned subscriber slot. Identity is write-only."
         actions={
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap justify-end">
+            <LiveGrantCountdown canRevoke={canOperate} />
+            <button
+              type="button"
+              className="ep-button ep-button-sm"
+              onClick={() => setGrantDialog({ open: true })}
+              disabled={!canOperate}
+              title={
+                canOperate
+                  ? 'Ouvrir une fenêtre Live bornée (15 / 30 / 60 min)'
+                  : 'Rôle viewer : lecture seule.'
+              }
+              data-testid="live-grant-open"
+            >
+              <Shield width={13} height={13} aria-hidden="true" />
+              <span className="ml-1">Autoriser le live</span>
+            </button>
             <StatusIndicator
               state={canOperate ? 'OPERATOR_READY' : 'VIEWER_READONLY'}
               tone={canOperate ? 'success' : 'warning'}
@@ -482,7 +604,11 @@ export function UeManagerPage() {
             />
             <input
               className="ep-input pl-7 w-64"
-              placeholder="Search id, owner, gNB, IMSI, UE IP…"
+              placeholder={
+                canOperate
+                  ? 'Search id, owner, gNB, IMSI, UE IP…'
+                  : 'Search id, owner, gNB, UE IP…'
+              }
               value={search}
               onChange={(event) => {
                 setSearch(event.target.value);
@@ -529,7 +655,11 @@ export function UeManagerPage() {
           <button
             type="button"
             className="ep-button ep-button-sm ep-button-primary"
-            onClick={() => setFormState({ mode: 'create' })}
+            onClick={() =>
+              polarisProvisioning
+                ? setProvisioningAddOpen(true)
+                : setFormState({ mode: 'create' })
+            }
             disabled={!canOperate}
             data-testid="ue-add"
           >
@@ -541,23 +671,42 @@ export function UeManagerPage() {
             className="ep-button ep-button-sm"
             onClick={() => setBulkOpen(true)}
             disabled={!canOperate || profileBackend}
-            title={profileBackend ? 'Bulk via the POLARIS API (10/100/1000/10000) — UI planned for V1.1' : undefined}
+            title={
+              !canOperate
+                ? 'Rôle viewer : création non autorisée.'
+                : profileBackend
+                  ? 'Bulk create via /ue-profiles/bulk — client UI planned for V1.1 (10/100/1000/10000).'
+                  : undefined
+            }
             data-testid="ue-bulk"
           >
             <Users width={13} height={13} />
             Bulk create
           </button>
-          <button
-            type="button"
-            className="ep-button ep-button-sm"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={!canOperate || profileBackend}
-            title={profileBackend ? 'Backend required — POLARIS has no CSV import route' : undefined}
-            data-testid="ue-import"
-          >
-            <Upload width={13} height={13} />
-            Import CSV
-          </button>
+          {polarisProvisioning ? (
+            <button
+              type="button"
+              className="ep-button ep-button-sm"
+              onClick={() => setBackendCsvOpen(true)}
+              disabled={!canOperate}
+              data-testid="ue-import-backend"
+            >
+              <Upload width={13} height={13} />
+              Import CSV
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="ep-button ep-button-sm"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={!canOperate || profileBackend}
+              title={profileBackend ? 'Backend required — POLARIS has no CSV import route' : undefined}
+              data-testid="ue-import"
+            >
+              <Upload width={13} height={13} />
+              Import CSV
+            </button>
+          )}
           <input
             ref={fileInputRef}
             type="file"
@@ -647,11 +796,30 @@ export function UeManagerPage() {
         )}
       </section>
 
-      <div className="ep-card overflow-x-auto">
-        <table className="ep-table" data-testid="ue-table">
+      <Card className="overflow-hidden">
+        <table
+          className="ep-table w-full table-fixed"
+          data-testid="ue-table"
+        >
+          <colgroup>
+            {/* 0.12.1 — Full mockup layout: 7 content columns
+                (UE / Serving gNB / Subscriber / Registration / PDU · IP /
+                Scenario / Actions) + one 2 rem checkbox prefix we keep for
+                bulk selection. IMSI + Owner fold into the UE sub-caption
+                so the Identity rule stays respected (operator sees the raw
+                IMSI, viewer stays on the solid mask). */}
+            <col style={{ width: '2rem' }} />
+            <col style={{ width: '19%' }} />
+            <col style={{ width: '10%' }} />
+            <col style={{ width: '13%' }} />
+            <col style={{ width: '10%' }} />
+            <col style={{ width: '13%' }} />
+            <col style={{ width: '14%' }} />
+            <col style={{ width: '21%' }} />
+          </colgroup>
           <thead>
-            <tr>
-              <th className="w-8">
+            <tr className="text-left text-ep-xs uppercase tracking-wider text-mute border-b border-line">
+              <th className="w-8 px-2 py-2.5 font-semibold">
                 <input
                   type="checkbox"
                   aria-label="Select all on page"
@@ -670,16 +838,13 @@ export function UeManagerPage() {
                   data-testid="ue-select-all"
                 />
               </th>
-              <th>UE ID / Profile</th>
-              <th>Owner</th>
-              <th>Serving gNB</th>
-              <th>Registration</th>
-              <th>PDU Session</th>
-              <th>RRC</th>
-              <th>UE IP</th>
-              <th>Traffic</th>
-              <th>Assigned Scenario</th>
-              <th>Actions</th>
+              <th className="px-3 py-2.5 font-semibold">UE</th>
+              <th className="px-3 py-2.5 font-semibold">Serving gNB</th>
+              <th className="px-3 py-2.5 font-semibold">Subscriber</th>
+              <th className="px-3 py-2.5 font-semibold">Registration</th>
+              <th className="px-3 py-2.5 font-semibold">PDU · IP</th>
+              <th className="px-3 py-2.5 font-semibold">Scenario</th>
+              <th className="px-3 py-2.5 font-semibold text-right">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -692,6 +857,99 @@ export function UeManagerPage() {
               const isActiveForUe =
                 activeJob?.target_ue_id != null && activeJob.target_ue_id === backendId;
               const notProvisioned = !row.backend;
+              // 0.10.4 — Idle (= "Not running" chip) now follows the
+              // backend's `process_state` signal, not just the registration /
+              // PDU / RRC trio. A UE whose process is `idle` is stopped even
+              // when it still carries a `DEREGISTERED` registration remnant.
+              const processState = (row.backend?.process_state ?? '').toLowerCase();
+              const runtimeStates = [
+                row.backend?.registration_state,
+                row.backend?.pdu_session,
+              ].map((state) => (state ?? '').toUpperCase());
+              const isRuntimeIdle =
+                !row.backend ||
+                processState === 'idle' ||
+                processState === 'stopped' ||
+                processState === 'exited' ||
+                runtimeStates.every(
+                  (state) => state === '' || state === 'UNKNOWN' || state === 'INACTIVE',
+                );
+              // 0.10.2 (#42f) — Honest owner: the backend currently stores
+              // the UE's display name in the `name` field; it is NOT the
+              // operator identity. If it equals the UE id (common default),
+              // show the em dash instead of pretending the UE owns itself.
+              const ownerCandidate = row.profile.owner?.trim();
+              const displayOwner =
+                ownerCandidate && ownerCandidate !== row.profile.id ? ownerCandidate : '—';
+              // 0.10.0 — Start / Stop is a state-driven toggle: the backend's
+              // own `actions` map tells us which transition is applicable
+              // right now. A running UE advertises `stop:true`; an idle one
+              // advertises `start:true`. The active-job path reinforces Stop
+              // when a controller-owned job is actually targeting this UE.
+              const backendCanStop = row.backend?.actions?.stop === true;
+              const backendCanStart = row.backend?.actions?.start === true;
+              const showStop = backendCanStop || isActiveForUe;
+              // 0.10.0 — explicit disable reasons so operators see WHY a button
+              // is grayed instead of guessing (viewer, 423-live-closed, UE active,
+              // shared, …). Returned string becomes the native tooltip.
+              const liveClosed = row.backend?.actions?.reason?.includes('423') ||
+                /LIVE_EXECUTION_NOT_AUTHORIZED/.test(row.backend?.actions?.reason ?? '');
+              const startDisabled =
+                !canOperate ||
+                isShared ||
+                notProvisioned ||
+                !backendCanStart ||
+                startUe.isPending;
+              const startReason = !canOperate
+                ? 'Rôle viewer : lecture seule.'
+                : isShared
+                  ? 'UE partagée — protégée.'
+                  : notProvisioned
+                    ? 'Pas provisionné côté backend.'
+                    : isActiveForUe
+                      ? 'UE déjà active.'
+                      : liveClosed
+                        ? 'Live fermé (HTTP 423) — approbation requise.'
+                        : !row.backend?.actions?.start
+                          ? row.backend?.actions?.reason || 'Start indisponible.'
+                          : null;
+              const stopDisabled =
+                !canOperate ||
+                isShared ||
+                notProvisioned ||
+                !(isActiveForUe || backendCanStop) ||
+                stopScenario.isPending;
+              const stopReason = !canOperate
+                ? 'Rôle viewer : lecture seule.'
+                : isShared
+                  ? 'UE partagée — protégée.'
+                  : notProvisioned
+                    ? 'Pas provisionné côté backend.'
+                    : !(isActiveForUe || backendCanStop)
+                      ? 'Aucune action Stop disponible côté backend.'
+                      : null;
+              const runDisabled =
+                !canOperate ||
+                isShared ||
+                notProvisioned ||
+                !scenario ||
+                (!scenarioBackend && !profile);
+              const runReason = !canOperate
+                ? 'Rôle viewer : lecture seule.'
+                : isShared
+                  ? 'UE partagée — protégée.'
+                  : notProvisioned
+                    ? 'Pas provisionné côté backend.'
+                    : !scenario
+                      ? 'Aucun scénario assigné.'
+                      : !scenarioBackend && !profile
+                        ? 'Scénario non couvert par le profil certifié legacy.'
+                        : liveClosed
+                          ? 'Live fermé (HTTP 423) — approbation requise.'
+                          : null;
+              const editDisabled = !canOperate;
+              const editReason = !canOperate ? 'Rôle viewer : lecture seule.' : null;
+              const deleteReason = !canOperate ? 'Rôle viewer : lecture seule.' : null;
 
               return (
                 <tr
@@ -715,57 +973,93 @@ export function UeManagerPage() {
                       data-testid={`ue-select-${row.profile.id}`}
                     />
                   </td>
-                  <td>
-                    <div className="flex flex-col">
-                      <span className="font-medium mono">{row.profile.id}</span>
-                      {row.backend?.internal_ue_id && (
-                        <span className="text-text-secondary text-ep-xs mono truncate">
-                          {row.backend.internal_ue_id}
+                  <td className="px-3 py-3">
+                    {/* 0.12.1 — mockup cell: mono UE id (links to Activity),
+                        name sub-caption, owner & IMSI merged into the mute
+                        sub-line (IMSI role-gated via formatImsiForRole). */}
+                    <Link
+                      to={`/ues/${encodeURIComponent(row.profile.id)}/activity`}
+                      className="mono font-medium text-ink hover:underline"
+                      data-testid={`ue-detail-link-${row.profile.id}`}
+                    >
+                      {row.profile.id}
+                    </Link>
+                    {isShared ? (
+                      <div className="text-ep-sm text-warn inline-flex items-center gap-1">
+                        <AlertTriangle width={10} height={10} /> shared, protected
+                      </div>
+                    ) : null}
+                    <div className="flex items-center gap-2 text-ep-xs text-mute mt-0.5">
+                      {displayOwner !== '—' ? (
+                        <span data-testid={`ue-owner-${row.profile.id}`}>
+                          owner {displayOwner}
                         </span>
+                      ) : (
+                        <span data-testid={`ue-owner-${row.profile.id}`}>owner —</span>
                       )}
-                      {notProvisioned && !profileBackend && (
-                        <span className="text-ep-xs text-text-secondary">
-                          Not provisioned on backend
-                        </span>
-                      )}
-                      {profileBackend && row.profile.subscriptionStatus && (
-                        <span
-                          className={`text-ep-xs ${
-                            row.profile.subscriptionStatus === 'VERIFIED' ? 'text-success' : 'text-warning'
-                          }`}
-                          data-testid={`ue-subscription-${row.profile.id}`}
-                        >
-                          {row.profile.subscriptionStatus === 'VERIFIED'
-                            ? 'Open5GS subscription verified'
-                            : 'Not provisioned in Open5GS'}
-                        </span>
-                      )}
-                      {isShared && (
-                        <span className="text-ep-xs text-warning flex items-center gap-1">
-                          <AlertTriangle width={10} height={10} />
-                          Shared — protected
-                        </span>
-                      )}
+                      <span className="mono" data-testid={`ue-imsi-${row.profile.id}`}>
+                        {formatImsiForRole(row.profile.imsi, canOperate)}
+                      </span>
                     </div>
                   </td>
-                  <td>{row.profile.owner}</td>
-                  <td className="mono">{row.profile.servingGnb}</td>
-                  <td>
-                    <StatusIndicator
-                      state={row.backend?.registration_state ?? 'UNKNOWN'}
-                      compact
-                    />
+                  <td className="px-3 py-3 mono" data-testid={`ue-gnb-${row.profile.id}`}>
+                    {row.profile.servingGnb || '—'}
                   </td>
-                  <td>
-                    <StatusIndicator state={row.backend?.pdu_session ?? 'UNKNOWN'} compact />
+                  <td className="px-3 py-3" data-testid={`ue-subscriber-${row.profile.id}`}>
+                    {row.backend ? (
+                      row.backend.controller_owned ? (
+                        <Pill tone="ok">Verified</Pill>
+                      ) : (
+                        <Pill tone="warn">Shared</Pill>
+                      )
+                    ) : (
+                      <Pill tone="warn">Not provisioned</Pill>
+                    )}
+                    {row.backend?.internal_ue_id &&
+                    row.backend.internal_ue_id !== row.profile.id ? (
+                      <p className="mono text-ep-xs text-mute mt-1">
+                        slot {row.backend.internal_ue_id}
+                      </p>
+                    ) : null}
+                    {profileBackend &&
+                    row.profile.subscriptionStatus &&
+                    row.profile.subscriptionStatus !== 'VERIFIED' ? (
+                      <p
+                        className="text-ep-xs text-warn mt-0.5"
+                        data-testid={`ue-subscription-${row.profile.id}`}
+                      >
+                        Not provisioned in Open5GS
+                      </p>
+                    ) : null}
                   </td>
-                  <td>
-                    <StatusIndicator state={row.backend?.rrc_state ?? 'UNKNOWN'} compact />
+                  <td className="px-3 py-3" data-testid={`ue-reg-${row.profile.id}`}>
+                    {renderRegistrationCell(row.backend, isRuntimeIdle)}
                   </td>
-                  <td className="mono text-ep-xs">
-                    {row.backend?.ue_ip ?? row.profile.ueIp ?? '—'}
+                  <td
+                    className="px-3 py-3"
+                    data-testid={`ue-etat-${row.profile.id}`}
+                  >
+                    {/* 0.12.1 — Mockup splits État back into Registration +
+                        PDU · IP cells. The compact label we exposed via
+                        `etatLabel` still powers the smoke tests but is now
+                        hidden inside a title tooltip for forward-compat. */}
+                    <div
+                      className="flex flex-col gap-0.5"
+                      title={etatLabel(row.backend, isRuntimeIdle)}
+                    >
+                      {renderPduCell(row.backend, isRuntimeIdle)}
+                      <span className="mono text-ep-xs text-mute">
+                        {row.backend?.ue_ip ?? row.profile.ueIp ?? '—'}
+                      </span>
+                    </div>
+                    <span
+                      className="sr-only"
+                      data-testid={`ue-etat-label-${row.profile.id}`}
+                      aria-hidden="true"
+                    >
+                      {etatLabel(row.backend, isRuntimeIdle)}
+                    </span>
                   </td>
-                  <td>{row.backend?.traffic_state ?? '—'}</td>
                   <td>
                     <div className="flex flex-col gap-1">
                       <select
@@ -798,7 +1092,11 @@ export function UeManagerPage() {
                           </option>
                         ))}
                       </select>
-                      {scenario && !profile && (
+                      {/* 0.10.0 — "Backend support required" is only honest for the legacy
+                          certified-profile runner (bounded-controller-ue-udp-v1). When
+                          scenarioBackend is on, /scenario-runs covers traffic_ul / traffic_dl /
+                          transfer_verify / detach, so we must not block the row for them. */}
+                      {!scenarioBackend && scenario && !profile && (
                         <span className="text-ep-xs text-warning flex items-center gap-1">
                           <AlertTriangle width={10} height={10} />
                           Backend support required.
@@ -807,111 +1105,83 @@ export function UeManagerPage() {
                     </div>
                   </td>
                   <td>
-                    <div className="flex items-center gap-1 flex-nowrap">
+                    <div className="flex items-center justify-end gap-1 flex-nowrap">
+                      {/* 0.10.0 — Start/Stop are state-driven: whichever action
+                          applies to the UE's current runtime is shown; the other is
+                          collapsed. Keeps the row within the 10% column at 1440/1920. */}
+                      {showStop ? (
+                        <button
+                          type="button"
+                          className="ep-button ep-button-sm ep-button-danger"
+                          onClick={() => setConfirmStop(row)}
+                          disabled={stopDisabled}
+                          title={stopReason ?? 'Arrêter le job actif de cette UE.'}
+                          data-testid={`ue-stop-${row.profile.id}`}
+                        >
+                          <StopCircle width={13} height={13} aria-hidden="true" />
+                          <span className="ml-1">Stop</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="ep-button ep-button-sm"
+                          onClick={() => void startBackendUe(row)}
+                          disabled={startDisabled}
+                          title={startReason ?? 'Démarrer cette UE sur le backend.'}
+                          data-testid={`ue-start-${row.profile.id}`}
+                        >
+                          Start
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="ep-button ep-button-sm"
-                        aria-label={`Edit ${row.profile.id}`}
-                        onClick={() =>
-                          setFormState({ mode: 'edit', initial: toDraft(row.profile) })
-                        }
-                        data-testid={`ue-edit-${row.profile.id}`}
-                      >
-                        <Edit width={13} height={13} />
-                      </button>
-                      <button
-                        type="button"
-                        className="ep-button ep-button-sm"
-                        aria-label={`Clone ${row.profile.id}`}
-                        onClick={() => {
-                          const next = { ...toDraft(row.profile), id: `${row.profile.id}-copy` };
-                          setFormState({ mode: 'clone', initial: next });
-                        }}
-                        data-testid={`ue-clone-${row.profile.id}`}
-                      >
-                        <Copy width={13} height={13} />
-                      </button>
-                      <button
-                        type="button"
-                        className="ep-button ep-button-sm ep-button-danger"
-                        aria-label={`Delete ${row.profile.id}`}
-                        onClick={() => setConfirmDelete([row.profile.id])}
-                        disabled={!canOperate}
-                        data-testid={`ue-delete-${row.profile.id}`}
-                      >
-                        <Trash2 width={13} height={13} />
-                      </button>
-                      <button
-                        type="button"
-                        className="ep-button ep-button-sm"
-                        aria-label={`Start ${row.profile.id}`}
-                        onClick={() => void startBackendUe(row)}
-                        disabled={
-                          !canOperate ||
-                          isShared ||
-                          notProvisioned ||
-                          !row.backend?.actions?.start ||
-                          startUe.isPending
-                        }
-                        title={
-                          notProvisioned
-                            ? 'Not provisioned on backend'
-                            : row.backend?.actions?.reason || undefined
-                        }
-                        data-testid={`ue-start-${row.profile.id}`}
-                      >
-                        Start
-                      </button>
-                      <button
-                        type="button"
-                        className="ep-button ep-button-sm"
-                        aria-label={`Run scenario on ${row.profile.id}`}
                         onClick={() => scenario && setConfirmRun({ row, scenario })}
-                        disabled={
-                          !canOperate ||
-                          isShared ||
-                          notProvisioned ||
-                          !scenario ||
-                          !profile
-                        }
-                        title={
-                          notProvisioned
-                            ? 'Not provisioned on backend'
-                            : !scenario
-                              ? 'No scenario assigned'
-                              : !profile
-                                ? 'Backend support required'
-                                : undefined
-                        }
+                        disabled={runDisabled}
+                        title={runReason ?? 'Dispatcher le scénario assigné sur cette UE.'}
                         data-testid={`ue-run-${row.profile.id}`}
                       >
                         Run
                       </button>
-                      <button
-                        type="button"
-                        className="ep-button ep-button-sm ep-button-danger"
-                        aria-label={`Stop scenario on ${row.profile.id}`}
-                        onClick={() => setConfirmStop(row)}
-                        disabled={
-                          !canOperate ||
-                          isShared ||
-                          notProvisioned ||
-                          !isActiveForUe ||
-                          stopScenario.isPending
-                        }
-                        title={
-                          isShared
-                            ? 'Shared UE — protected'
-                            : notProvisioned
-                              ? 'Not provisioned on backend'
-                              : !isActiveForUe
-                                ? 'No active job owned by this UE'
-                                : undefined
-                        }
-                        data-testid={`ue-stop-${row.profile.id}`}
-                      >
-                        <StopCircle width={13} height={13} />
-                      </button>
+                      <RowActionMenu
+                        ariaLabel={`More actions for ${row.profile.id}`}
+                        testid={`ue-more-${row.profile.id}`}
+                        items={[
+                          {
+                            key: 'edit',
+                            label: 'Edit',
+                            icon: <Edit width={12} height={12} aria-hidden="true" />,
+                            onSelect: () =>
+                              setFormState({ mode: 'edit', initial: toDraft(row.profile) }),
+                            disabled: editDisabled,
+                            disabledReason: editReason ?? undefined,
+                            testid: `ue-edit-${row.profile.id}`,
+                          },
+                          {
+                            key: 'clone',
+                            label: 'Clone',
+                            icon: <Copy width={12} height={12} aria-hidden="true" />,
+                            onSelect: () => {
+                              const next = {
+                                ...toDraft(row.profile),
+                                id: `${row.profile.id}-copy`,
+                              };
+                              setFormState({ mode: 'clone', initial: next });
+                            },
+                            testid: `ue-clone-${row.profile.id}`,
+                          },
+                          {
+                            key: 'delete',
+                            label: 'Delete',
+                            icon: <Trash2 width={12} height={12} aria-hidden="true" />,
+                            tone: 'danger',
+                            onSelect: () => setConfirmDelete([row.profile.id]),
+                            disabled: !canOperate,
+                            disabledReason: deleteReason ?? undefined,
+                            testid: `ue-delete-${row.profile.id}`,
+                          },
+                        ]}
+                      />
                     </div>
                   </td>
                 </tr>
@@ -919,7 +1189,7 @@ export function UeManagerPage() {
             })}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={11} className="text-center text-text-secondary py-6">
+                <td colSpan={8} className="text-center text-mute py-6">
                   {profiles.length === 0
                     ? 'No UE profile yet. Add one, bulk-create or import CSV.'
                     : 'No profile matches the current filter.'}
@@ -928,10 +1198,10 @@ export function UeManagerPage() {
             )}
           </tbody>
         </table>
-      </div>
+      </Card>
 
       <nav
-        className="flex items-center justify-between gap-2 mt-3 text-ep-sm text-text-secondary"
+        className="flex items-center justify-between gap-2 mt-3 text-ep-sm text-mute"
         data-testid="ue-pagination"
       >
         <div>
@@ -991,17 +1261,132 @@ export function UeManagerPage() {
       </nav>
 
       {feedback && (
-        <p
-          className="ep-badge mt-3 text-ep-sm border-primary/40"
-          data-testid="ue-feedback"
-          role="status"
-          aria-live="polite"
+        <div
+          className="mt-3 flex flex-wrap items-center gap-2"
+          data-testid="ue-feedback-row"
         >
-          {feedback}
-        </p>
+          <p
+            className="ep-badge text-ep-sm border-primary/40"
+            data-testid="ue-feedback"
+            role="status"
+            aria-live="polite"
+          >
+            {feedback}
+          </p>
+          {/* 0.11.1 (#46) — When a Run returned 423, offer a one-click
+              shortcut to the "Autoriser le live" dialog with the UE
+              prefilled. Visible only to operators. */}
+          {feedbackGrantHint && canOperate && (
+            <button
+              type="button"
+              className="ep-button ep-button-sm ep-button-primary"
+              onClick={() =>
+                setGrantDialog({ open: true, prefillUeIds: [feedbackGrantHint] })
+              }
+              data-testid="ue-feedback-open-grant"
+            >
+              <Shield width={13} height={13} aria-hidden="true" />
+              <span className="ml-1">Autoriser le live pour {feedbackGrantHint}</span>
+            </button>
+          )}
+        </div>
       )}
 
+      {/* 0.11.1 (#46) — Live-grant dialog, driven from the header
+          button and from the 423 Run-feedback shortcut. */}
+      <LiveGrantDialog
+        open={grantDialog.open}
+        availableUeIds={profiles.map((profile) => profile.id)}
+        defaultSelectedUeIds={grantDialog.prefillUeIds}
+        onClose={() => setGrantDialog({ open: false })}
+        onCreated={(id) => {
+          setFeedback(`Live grant ${id} ouvert.`);
+          setFeedbackGrantHint(null);
+        }}
+      />
+
       {/* Dialogs */}
+      <CsvImportDialog
+        open={polarisProvisioning && backendCsvOpen}
+        onClose={() => setBackendCsvOpen(false)}
+        target="ue-profiles"
+        title="Import UE profiles (CSV)"
+        description="POST /ue-profiles/bulk (text/csv). Expected header: ue_id,gnb_id,note,imsi. Capped at 100 000 rows per request."
+        onImported={(report) =>
+          setFeedback(`CSV import done · ${report.accepted} accepted · ${report.rejected} rejected.`)
+        }
+      />
+
+      <UeProvisioningAddDialog
+        open={polarisProvisioning && provisioningAddOpen}
+        onClose={() => {
+          setProvisioningAddOpen(false);
+          setProvisioningAddError(null);
+          setGenerateError(null);
+        }}
+        onSubmit={submitProvisioningAdd}
+        onGenerateSubscriber={async () => {
+          setGenerateError(null);
+          try {
+            // 0.10.0 — Default AMBR to 1 Gbit/s (1_000_000 kbps on each
+            // direction) so the Generate path matches the manual Add
+            // Subscriber flow. Operators were having to re-provision when
+            // the server-side default (1 Mbit/s legacy) was too tight.
+            const result = await generateSubscriber.mutateAsync({
+              count: 1,
+              sst: 1,
+              sd: '010203',
+              dnns: ['internet'],
+              ambr: { uplink: 1_000_000, downlink: 1_000_000 },
+            });
+            const slot = result.slots[0]?.slot ?? null;
+            if (slot) await subscriberSlots.refetch();
+            return slot;
+          } catch (error) {
+            const status = error instanceof ApiError ? error.status : null;
+            const code = error instanceof ApiError ? error.code : 'SUBSCRIBER_GENERATE_FAILED';
+            setGenerateError(
+              `${status ? `HTTP ${status} · ` : ''}${code} · ${(error as Error).message}`,
+            );
+            return null;
+          }
+        }}
+        gnbs={(gnbList.data?.items ?? []) as WireGnb[]}
+        owners={ownerList.data?.items ?? []}
+        plmns={plmnList.data?.items ?? []}
+        dnns={dnnList.data?.items ?? []}
+        subscribers={subscriberSlots.data ?? []}
+        nextFreeUeId={nextFreeUeIdFrom(profiles.map((item) => item.id))}
+        gnbsLoading={gnbList.isLoading}
+        ownersLoading={ownerList.isLoading}
+        plmnsLoading={plmnList.isLoading}
+        dnnsLoading={dnnList.isLoading}
+        subscribersLoading={subscriberSlots.isLoading}
+        gnbsError={
+          gnbList.isError ? `GNBs backend pending · ${(gnbList.error as Error).message}` : null
+        }
+        ownersError={
+          ownerList.isError
+            ? `Owners backend pending · ${(ownerList.error as Error).message}`
+            : null
+        }
+        plmnsError={
+          plmnList.isError ? `PLMNs backend pending · ${(plmnList.error as Error).message}` : null
+        }
+        dnnsError={
+          dnnList.isError ? `DNNs backend pending · ${(dnnList.error as Error).message}` : null
+        }
+        subscribersError={
+          subscriberSlots.isError
+            ? `Subscribers backend pending · ${(subscriberSlots.error as Error).message}`
+            : null
+        }
+        submitting={provisioningAddSubmitting}
+        submitError={provisioningAddError}
+        generating={generateSubscriber.isPending}
+        generateError={generateError}
+      />
+
       <UeProfileBackendFormDialog
         mode={formState?.mode ?? 'create'}
         open={profileBackend && formState != null}
@@ -1014,18 +1399,23 @@ export function UeManagerPage() {
         onSubmit={submitBackend}
       />
 
-      <UeProfileFormDialog
-        mode={formState?.mode ?? 'create'}
-        initial={formState?.initial}
-        open={!profileBackend && formState != null}
-        onCancel={() => setFormState(null)}
-        onSubmit={async (draft) => {
-          if (!formState) return;
-          if (formState.mode === 'create') await submitCreate(draft);
-          else if (formState.mode === 'edit') await submitEdit(draft);
-          else await submitClone(draft);
-        }}
-      />
+      {/* 0.6.0 — the local-draft form stays mounted only when polarisProvisioning
+          is OFF. The LOT requires it to disappear entirely in the new UX; profileBackend
+          then becomes the only path. */}
+      {!polarisProvisioning && (
+        <UeProfileFormDialog
+          mode={formState?.mode ?? 'create'}
+          initial={formState?.initial}
+          open={!profileBackend && formState != null}
+          onCancel={() => setFormState(null)}
+          onSubmit={async (draft) => {
+            if (!formState) return;
+            if (formState.mode === 'create') await submitCreate(draft);
+            else if (formState.mode === 'edit') await submitEdit(draft);
+            else await submitClone(draft);
+          }}
+        />
+      )}
 
       <UeBulkCreateDialog
         open={bulkOpen}
@@ -1123,4 +1513,143 @@ function timestampSuffix(): string {
 
 function pad(n: number): string {
   return n.toString().padStart(2, '0');
+}
+
+/**
+ * 0.10.4 — Compact label for the single "État" cell. We render AT MOST
+ * two chips concatenated with a middle dot (`Registered · PDU active`)
+ * so the content fits inside a 18 % column at 1280 px. When the UE is
+ * idle (no backend record or every runtime state blank/UNKNOWN) we
+ * surface the honest `Not running` instead.
+ *
+ * Visible only exported for the unit tests that pin the wording.
+ */
+/**
+ * 0.12.1 — mockup split: Registration cell renders one pill with a live
+ * dot when the UE is REGISTERED, dot-less for any other state. An idle
+ * UE (or no backend record) renders a `STOPPED` pill in mute tone.
+ */
+export function renderRegistrationCell(
+  backend: UeState | undefined,
+  idle: boolean,
+): import('react').ReactNode {
+  const state = idle || !backend ? 'STOPPED' : (backend.registration_state ?? 'UNKNOWN').toUpperCase();
+  return (
+    <Pill tone={regTone(state)} dot={state === 'REGISTERED' ? 'live' : undefined}>
+      {state}
+    </Pill>
+  );
+}
+
+/**
+ * 0.12.1 — mockup split: PDU · IP cell carries the PDU state label on top
+ * (ACTIVE / INACTIVE / em-dash) and the UE IP in a mono mute sub-caption.
+ * Idle UEs still render the mute em-dash so the row stays aligned.
+ */
+export function renderPduCell(
+  backend: UeState | undefined,
+  idle: boolean,
+): import('react').ReactNode {
+  if (idle || !backend) return <span className="text-mute">—</span>;
+  const pdu = (backend.pdu_session ?? '').toUpperCase();
+  if (pdu === 'ACTIVE') return <Pill tone="ok">ACTIVE</Pill>;
+  if (!pdu || pdu === 'UNKNOWN' || pdu === 'INACTIVE') return <span className="text-mute">—</span>;
+  return <Pill tone="mute">{pdu}</Pill>;
+}
+
+export function etatLabel(backend: UeState | undefined, idle: boolean): string {
+  if (idle || !backend) return 'Not running';
+  const parts: string[] = [];
+  const reg = (backend.registration_state ?? '').toUpperCase();
+  const pdu = (backend.pdu_session ?? '').toUpperCase();
+  const rrc = (backend.rrc_state ?? '').toUpperCase();
+  if (reg === 'REGISTERED') parts.push('Registered');
+  else if (reg === 'DEREGISTERED') parts.push('Deregistered');
+  else if (reg && reg !== 'UNKNOWN' && reg !== 'INACTIVE') {
+    parts.push(humaniseState(reg));
+  }
+  // 0.12.0 (#50) — surface RRC when the backend reports it, so the État
+  // cell reads "Registered · RRC Connected · PDU active" when relevant.
+  if (rrc === 'CONNECTED') parts.push('RRC Connected');
+  else if (rrc && !['UNKNOWN', 'INACTIVE', 'IDLE', 'DECONNECTED'].includes(rrc)) {
+    parts.push(`RRC ${humaniseState(rrc)}`);
+  }
+  if (pdu === 'ACTIVE') parts.push('PDU active');
+  else if (pdu && pdu !== 'UNKNOWN' && pdu !== 'INACTIVE' && pdu !== 'IDLE') {
+    parts.push(humaniseState(pdu));
+  }
+  // 0.12.0 (#50) — append traffic protocol / direction when the backend
+  // reports an active traffic step. We don't fabricate rate numbers from
+  // /ues; per-UE Activity page shows the full "↑ x Mbit/s ↓ y Mbit/s"
+  // once the live stream connects.
+  const traffic = (backend.traffic_state ?? '').toUpperCase();
+  if (traffic === 'RUNNING_UL' || traffic === 'UL') parts.push('↑ UL');
+  else if (traffic === 'RUNNING_DL' || traffic === 'DL') parts.push('↓ DL');
+  else if (traffic === 'RUNNING' || traffic === 'RUNNING_UL_DL') parts.push('↑↓ UL+DL');
+  return parts.length === 0 ? 'Not running' : parts.join(' · ');
+}
+
+/**
+ * 0.10.4 — Tone marker for the État chip. Fed to StatusIndicator's
+ * `state` prop so the existing tone-map (`REGISTERED` → success, etc.)
+ * paints the dot without us re-deriving the colour here.
+ */
+export function etatToneState(backend: UeState | undefined, idle: boolean): string {
+  if (idle || !backend) return 'UNKNOWN';
+  const reg = (backend.registration_state ?? '').toUpperCase();
+  if (reg === 'REGISTERED') return 'REGISTERED';
+  if (reg === 'DEREGISTERED') return 'OFFLINE';
+  return reg || 'UNKNOWN';
+}
+
+function humaniseState(upper: string): string {
+  const lower = upper.toLowerCase();
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
+}
+
+/**
+ * 0.10.2 (#43) — Map the POLARIS Run error vocabulary onto French
+ * sentences the operator can act on. The returned string always carries
+ * the technical code once, trailing and small, so a reader can still
+ * paste the exact token into an incident ticket. Covers the cases the
+ * backend actually produces at Run time: HTTP 423 live refusals, HTTP
+ * 422 missing-receiver guards, HTTP 401 authentication, and the
+ * open-ended fallback.
+ */
+export function humanRunError(
+  status: number | undefined,
+  code: string | null | undefined,
+  message: string | null | undefined,
+): string {
+  const trailing = code ?? (status != null ? `HTTP ${status}` : 'ERROR');
+  const headline = (() => {
+    if (status === 401 || code === 'AUTHENTICATION_REQUIRED') {
+      return 'Session expirée — reconnectez-vous pour relancer le scénario.';
+    }
+    if (status === 423) {
+      if (code === 'SCENARIO_DEFINITION_LIVE_EXECUTION_NOT_AUTHORIZED') {
+        return 'Exécution live non autorisée : demandez l’ouverture du live.';
+      }
+      if (code === 'LIVE_UE_EXISTING_CONTAINER_ENVELOPE_MISMATCH') {
+        return "Un conteneur de même nom existe déjà avec une configuration différente — supprimez-le ou éditez le profil.";
+      }
+      return 'Exécution live non autorisée : demandez l’ouverture du live.';
+    }
+    if (status === 422) {
+      if (code === 'DL_SENDER_NOT_AVAILABLE') {
+        return "Trafic descendant indisponible : le sender DN n’est pas prêt.";
+      }
+      if (code === 'UL_RECEIVER_NOT_AVAILABLE') {
+        return "Trafic montant indisponible : le receiver UL n’est pas prêt.";
+      }
+      if (code === 'TRANSFER_PEER_NOT_AVAILABLE') {
+        return "Vérification de transfert indisponible : le peer n’est pas prêt.";
+      }
+      if (code === 'IMS_NOT_AVAILABLE') {
+        return "IMS indisponible : voice-call / IMS register non exécutable.";
+      }
+    }
+    return message?.trim() || 'Démarrage du scénario refusé.';
+  })();
+  return `${headline} · ${trailing}`;
 }

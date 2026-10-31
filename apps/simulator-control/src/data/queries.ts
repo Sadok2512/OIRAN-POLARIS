@@ -67,6 +67,14 @@ export interface WireLabObserved {
   ueransim_ue_profile?: boolean;
   ueransim_profile?: string;
   open5gs?: WireContainerStatus;
+  /**
+   * 0.7.0 — Per-NF container map, keyed by canonical NF name (AMF, SMF,
+   * UPF, NRF, AUSF, UDM, UDR, PCF, NSSF, BSF, SMSF…). Each entry is the
+   * same WireContainerStatus shape as `open5gs`. When the backend omits
+   * it, the Topology page falls back to the aggregated `open5gs`
+   * container and marks every other NF as "not exposed".
+   */
+  nfs?: Record<string, WireContainerStatus>;
   ueransim_gnb?: WireContainerStatus;
   ueransim_ue?: WireContainerStatus;
   srsran_enb?: WireContainerStatus;
@@ -192,6 +200,133 @@ export function useProvisioningSlots() {
       return fetchProvisioningSlots();
     },
     staleTime: 30_000,
+  });
+}
+
+/** Backend contract: GET /dnns → list of DNNs served by the lab. */
+export function useDnns() {
+  return useQuery({
+    queryKey: ['polaris', 'dnns'],
+    queryFn: async () => {
+      const { fetchDnns } = await import('./profileApi');
+      return fetchDnns();
+    },
+    staleTime: 60_000,
+  });
+}
+
+/** Backend contract: GET /plmns → list of PLMNs served by the lab. */
+export function usePlmns() {
+  return useQuery({
+    queryKey: ['polaris', 'plmns'],
+    queryFn: async () => {
+      const { fetchPlmns } = await import('./profileApi');
+      return fetchPlmns();
+    },
+    staleTime: 60_000,
+  });
+}
+
+/** 0.9.4 — Compact subscriber slot list used by the Add UE dialog's slot
+ * picker (#29c). Every item renders identity as PROTECTED (viewer) or the
+ * raw IMSI (operator / administrator, since polaris-api 0.19.7 #48).
+ *
+ * 0.12.0 (#45) — the row carries AMBR and S-NSSAI.sd so the Core ·
+ * Subscribers tab can paint an orange warning when either is "weak"
+ * (AMBR < 10 Mbit/s or no SD / default-slice SD). */
+export interface SubscriberSlotRow {
+  slot: string;
+  state: string;
+  identity: string | null;
+  ambr: { uplink: number; downlink: number } | null;
+  sd: string | null;
+}
+
+/** Backend contract: GET /subscribers → directory of provisioned slots.
+ * Accepts both the deployed 0.17 shape (`items[].slot`) and the 0.7
+ * compat shape (`items[].subscriber_id`). */
+export function useSubscriberSlots() {
+  return useQuery({
+    queryKey: ['polaris', 'subscriber-slots'],
+    queryFn: async (): Promise<SubscriberSlotRow[]> => {
+      const body = await polarisApi<{ items?: unknown[] }>('/subscribers');
+      const items = Array.isArray(body?.items) ? body.items : [];
+      return items.flatMap((raw): SubscriberSlotRow[] => {
+        if (typeof raw !== 'object' || raw === null) return [];
+        const record = raw as Record<string, unknown>;
+        const slot =
+          typeof record.slot === 'string'
+            ? record.slot
+            : typeof record.subscriber_id === 'string'
+              ? record.subscriber_id
+              : null;
+        if (!slot) return [];
+        const state =
+          typeof record.state === 'string'
+            ? record.state
+            : typeof record.provisioning_status === 'string'
+              ? record.provisioning_status
+              : 'PROVISIONED';
+        const identity =
+          typeof record.subscriber_identity === 'string'
+            ? record.subscriber_identity
+            : null;
+        const ambrRaw = record.ambr as { uplink?: number; downlink?: number } | undefined;
+        const ambr =
+          ambrRaw && typeof ambrRaw.uplink === 'number' && typeof ambrRaw.downlink === 'number'
+            ? { uplink: ambrRaw.uplink, downlink: ambrRaw.downlink }
+            : null;
+        const snssaiRaw = record.snssai as { sd?: string | null } | undefined;
+        const sd = snssaiRaw && typeof snssaiRaw.sd === 'string' ? snssaiRaw.sd : null;
+        return [{ slot, state, identity, ambr, sd }];
+      });
+    },
+    staleTime: 15_000,
+  });
+}
+
+/** Backend contract: GET /subscribers/:slot → PROTECTED subscriber record + linked UE ids. */
+export function useSubscriberDetail(slot: string | null | undefined) {
+  return useQuery({
+    queryKey: ['polaris', 'subscribers', slot ?? ''],
+    enabled: typeof slot === 'string' && slot.length > 0,
+    queryFn: async () => {
+      const { fetchSubscriberDetail } = await import('./profileApi');
+      return fetchSubscriberDetail(slot as string);
+    },
+    staleTime: 15_000,
+  });
+}
+
+/** Backend contract: PUT /subscribers/:slot (operator). K/OPc are write-only. */
+export function useUpdateSubscriber() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: {
+      slot: string;
+      body: import('./profileApi').WireSubscriberUpdate;
+    }) => {
+      const { updateSubscriber } = await import('./profileApi');
+      return updateSubscriber(input.slot, input.body);
+    },
+    onSuccess: (_result, variables) => {
+      client.invalidateQueries({ queryKey: ['polaris', 'subscribers', variables.slot] });
+      client.invalidateQueries({ queryKey: ['polaris', 'provisioning-slots'] });
+    },
+  });
+}
+
+/** Backend contract: POST /subscribers/generate (operator). CSPRNG K/OPc; never surfaced. */
+export function useGenerateSubscribers() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (body: import('./profileApi').WireGenerateSubscribersRequest) => {
+      const { generateSubscribers } = await import('./profileApi');
+      return generateSubscribers(body);
+    },
+    onSuccess: () => {
+      client.invalidateQueries({ queryKey: ['polaris', 'provisioning-slots'] });
+    },
   });
 }
 

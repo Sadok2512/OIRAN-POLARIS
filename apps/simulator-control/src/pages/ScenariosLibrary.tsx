@@ -11,12 +11,13 @@ import {
   Upload,
   Workflow,
 } from 'lucide-react';
-import { PageHeader } from '@/ui/PageHeader';
+import { PageHeader } from '@/components/mockup';
 import { EmptyState, LoadingSkeleton, Unavailable } from '@/ui/EmptyErrorLoading';
 import { ConfirmDialog } from '@/ui/ConfirmDialog';
 import { useAssignments } from '@/scenarios/store';
 import { useScenarioLibrary } from '@/scenarios/library';
 import { emptyScenario, type LoopMode, type Scenario } from '@/scenarios/model';
+import { decodeDefinition } from '@/scenarios/wireCodec';
 import { isoToLocal } from '@/data/format';
 import { useFeatureFlag } from '@/data/featureFlags';
 import {
@@ -28,7 +29,6 @@ import {
 import type { WireScenarioDefinition } from '@/scenarios/wireCodec';
 import { ApiError } from '@shared/api';
 import { ImportScenarioDialog } from '@/scenarios/ImportScenarioDialog';
-import { useCloneScenarioDefinition } from '@/data/scenarioApi';
 
 type Tab = 'library' | 'templates';
 
@@ -84,9 +84,9 @@ export function ScenariosLibraryPage() {
   return (
     <>
       <PageHeader
-        eyebrow="Workflows"
+        eyebrow="Simulation"
         title="Scenarios"
-        description="Reusable mobile scenarios composed from step primitives. Definitions live in the browser until a backend scenario CRUD contract is published — see docs/frontend/SIMULATOR_SCENARIO_BUILDER.md."
+        desc="Saved on the controller with versions. Six V1 step types; numeric parameters can be fixed or random."
         actions={
           <div className="flex items-center gap-2">
             <label className="relative">
@@ -374,10 +374,24 @@ function TemplateRow({
 }) {
   const navigate = useNavigate();
   const estimate = useScenarioEstimate(definition.id);
-  const clone = useCloneScenarioDefinition();
   const [downloading, setDownloading] = useState(false);
-  const [renaming, setRenaming] = useState(false);
-  const [targetId, setTargetId] = useState(`${definition.id.replace(/^tpl-/, 'copy-of-tpl-')}`);
+
+  // 0.6.0 — "Clone" no longer POSTs to /scenario-definitions/:id/clone and
+  // navigates to the server-side result. Instead it decodes the template
+  // (which is read-only, tpl-* backed by the backend) and hands the Builder
+  // a seeded draft via route state. The operator reviews, edits and clicks
+  // Save, which creates a brand-new definition — Clone becomes a real "copy
+  // and edit" instead of a silent backend duplication.
+  function openCloneInBuilder() {
+    onClearError();
+    try {
+      const seedFromTemplate = decodeDefinition(definition);
+      navigate('/scenarios/new', { state: { seedFromTemplate } });
+    } catch (error) {
+      const code = error instanceof ApiError ? (error as ApiError).code : 'CLONE_DECODE_FAILED';
+      onError(`Clone of ${definition.id} refused · ${code} · ${(error as Error).message}`);
+    }
+  }
 
   async function download() {
     onClearError();
@@ -440,56 +454,15 @@ function TemplateRow({
             <Download width={13} height={13} />
             {downloading ? 'Downloading…' : 'Download JSON'}
           </button>
-          {!renaming ? (
-            <button
-              type="button"
-              className="ep-button ep-button-sm"
-              onClick={() => setRenaming(true)}
-              data-testid={`template-clone-${definition.id}`}
-            >
-              <Copy width={13} height={13} /> Clone
-            </button>
-          ) : (
-            <div className="flex items-center gap-1">
-              <input
-                className="ep-input text-ep-sm py-1 h-8 mono"
-                value={targetId}
-                onChange={(event) => setTargetId(event.target.value)}
-                aria-label="Clone target id"
-                data-testid={`template-clone-target-${definition.id}`}
-              />
-              <button
-                type="button"
-                className="ep-button ep-button-sm ep-button-primary"
-                onClick={async () => {
-                  onClearError();
-                  try {
-                    const created = await clone.mutateAsync({
-                      id: definition.id,
-                      targetId: targetId.trim(),
-                    });
-                    setRenaming(false);
-                    navigate(`/scenarios/${created.id}/edit`);
-                  } catch (error) {
-                    const code =
-                      error instanceof ApiError ? (error as ApiError).code : 'CLONE_FAILED';
-                    onError(`Clone of ${definition.id} refused · ${code}`);
-                  }
-                }}
-                disabled={clone.isPending || !targetId.trim()}
-                data-testid={`template-clone-submit-${definition.id}`}
-              >
-                {clone.isPending ? 'Cloning…' : 'OK'}
-              </button>
-              <button
-                type="button"
-                className="ep-button ep-button-sm"
-                onClick={() => setRenaming(false)}
-              >
-                Cancel
-              </button>
-            </div>
-          )}
+          <button
+            type="button"
+            className="ep-button ep-button-sm"
+            onClick={openCloneInBuilder}
+            data-testid={`template-clone-${definition.id}`}
+            title="Open an editable copy in the Scenario Builder. Save creates a new definition; the template stays read-only."
+          >
+            <Copy width={13} height={13} /> Clone
+          </button>
         </div>
       </td>
     </tr>

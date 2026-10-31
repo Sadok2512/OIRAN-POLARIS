@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
 import { UeManagerPage } from './UeManager';
 import { _resetProfiles, _seedProfiles } from '@/ue/profileStore';
+import { _resetFlags, setFlag } from '@/data/featureFlags';
 
 function respond(status: number, body: unknown) {
   return new Response(JSON.stringify(body), {
@@ -69,12 +70,18 @@ function renderPage() {
 beforeEach(() => {
   if (typeof localStorage !== 'undefined') localStorage.clear();
   _resetProfiles();
+  _resetFlags();
+  // These tests intentionally cover the local/offline profile store. Backend
+  // mode is covered separately in UeManager.backend.test.tsx.
+  setFlag('profileBackend', false);
+  setFlag('polarisProvisioning', false);
   stubFetch('operator');
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
   _resetProfiles();
+  _resetFlags();
 });
 
 describe('UE Profile Manager — add / edit / delete', () => {
@@ -108,7 +115,9 @@ describe('UE Profile Manager — add / edit / delete', () => {
     ]);
     renderPage();
     const user = userEvent.setup();
-    await user.click(await screen.findByTestId('ue-edit-ue-1'));
+    // 0.10.0 — Edit / Clone / Delete now live under the ⋯ menu; open it first.
+    await user.click(await screen.findByTestId('ue-more-ue-1'));
+    await user.click(screen.getByTestId('ue-edit-ue-1'));
     const notesInput = screen.getAllByRole('textbox').find((element) =>
       (element as HTMLInputElement).parentElement?.textContent?.toLowerCase().includes('notes'),
     );
@@ -130,7 +139,8 @@ describe('UE Profile Manager — add / edit / delete', () => {
     ]);
     renderPage();
     const user = userEvent.setup();
-    await user.click(await screen.findByTestId('ue-delete-ue-del'));
+    await user.click(await screen.findByTestId('ue-more-ue-del'));
+    await user.click(screen.getByTestId('ue-delete-ue-del'));
     await user.click(screen.getByTestId('confirm-dialog-confirm'));
     await waitFor(() =>
       expect(screen.queryByTestId('ue-row-ue-del')).not.toBeInTheDocument(),
@@ -153,7 +163,8 @@ describe('UE Profile Manager — pagination at 10K', () => {
     renderPage();
     const table = await screen.findByTestId('ue-table');
     const rows = within(table).getAllByRole('row');
-    // 1 header row + 50 body rows (default page size)
+    // 0.10.4 — 1 header row (État column replaced the 5-cell Runtime
+    // breakdown) + up to 50 body rows.
     expect(rows.length).toBeLessThanOrEqual(51);
     expect(await screen.findByTestId('ue-pagination')).toHaveTextContent(/1 \/ 200/);
     expect(screen.getByText(/10,000/)).toBeInTheDocument();
@@ -194,7 +205,8 @@ describe('UE Profile Manager — pagination at 10K', () => {
     await user.type(await screen.findByTestId('ue-search'), 'ue-00042');
     await waitFor(() => {
       const rows = within(screen.getByTestId('ue-table')).getAllByRole('row');
-      expect(rows.length).toBe(2); // header + 1 match
+      // 0.10.4 — 1 header row + 1 match.
+      expect(rows.length).toBe(2);
     });
     expect(screen.getByTestId('ue-row-ue-00042')).toBeInTheDocument();
   });

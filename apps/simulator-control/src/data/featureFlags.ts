@@ -7,7 +7,8 @@
 
 import { useCallback, useSyncExternalStore } from 'react';
 
-const FLAGS_KEY = 'polaris.featureFlags.v1';
+const LEGACY_FLAGS_KEY = 'polaris.featureFlags.v1';
+const FLAGS_KEY = 'polaris.featureFlags.v2';
 
 export interface FeatureFlags {
   /**
@@ -36,6 +37,21 @@ export interface FeatureFlags {
    * `feat/polaris-traffic-templates`.
    */
   scenarioTemplates: boolean;
+  /**
+   * 0.6.0 — When true, the UI calls the richer provisioning surface
+   * published by Codex on `feat/polaris-provisioning`:
+   *   GET  /owners                                   → owner directory
+   *   GET  /plmns                                    → allowed PLMNs
+   *   GET  /dnns                                     → allowed DNNs
+   *   POST /provisioning/import  (CSV, up to 100k rows)
+   *   POST /ue-profiles/import   (CSV, up to 100k rows)
+   *   GET  /ue-profiles/:ue_id                       → detail card body
+   * When false, the Provisioning page shows "Backend pending" and
+   * dropdowns fall back to free-text + warning text. profileBackend is
+   * also forced ON (local UE form path becomes unreachable from the UI).
+   * Default OFF until the backend branch is deployed.
+   */
+  polarisProvisioning: boolean;
 }
 
 // 0.5.1 — `scenarioBackend` defaults to ON so the honest Scenario Builder
@@ -45,15 +61,24 @@ export interface FeatureFlags {
 // "offline draft" and reminds them that nothing will reach the backend.
 const DEFAULTS: FeatureFlags = {
   scenarioBackend: true,
-  profileBackend: false,
+  profileBackend: true,
   scenarioTemplates: true,
+  polarisProvisioning: true,
 };
 
 function read(): FeatureFlags {
   if (typeof localStorage === 'undefined') return DEFAULTS;
   try {
     const raw = localStorage.getItem(FLAGS_KEY);
-    if (!raw) return DEFAULTS;
+    if (!raw) {
+      // 0.9.2-hotfix: v1 allowed deployed backend features to remain OFF in
+      // upgraded browsers. The one-time v2 migration deliberately replaces
+      // those legacy values with the four enabled production defaults.
+      if (localStorage.getItem(LEGACY_FLAGS_KEY) !== null) {
+        localStorage.setItem(FLAGS_KEY, JSON.stringify(DEFAULTS));
+      }
+      return DEFAULTS;
+    }
     const parsed = JSON.parse(raw) as Partial<FeatureFlags>;
     return { ...DEFAULTS, ...parsed };
   } catch {
@@ -112,6 +137,9 @@ export function useFeatureFlag<K extends keyof FeatureFlags>(key: K): FeatureFla
 
 /* Test helpers. */
 export function _resetFlags(): void {
-  if (typeof localStorage !== 'undefined') localStorage.removeItem(FLAGS_KEY);
+  if (typeof localStorage !== 'undefined') {
+    localStorage.removeItem(FLAGS_KEY);
+    localStorage.removeItem(LEGACY_FLAGS_KEY);
+  }
   notify();
 }

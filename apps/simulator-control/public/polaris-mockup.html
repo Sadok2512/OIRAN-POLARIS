@@ -1,0 +1,440 @@
+<title>POLARIS Control</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: app shell — collapsible sidebar + content; probe list with a sticky inspector. Tokens follow packages/ui/src/tokens.ts (Enterprise Precision). */
+:root {
+  --c-background: #F5F7FA; --c-surface: #FFFFFF; --c-sidebar: #F0F4F9; --c-text-primary: #17283F;
+  --c-text-secondary: #5B6A80; --c-border: #DEE5ED; --c-primary: #2563EB; --c-primary-soft: #E8EFFD;
+  --c-success: #047857; --c-success-soft: #E3F4EC; --c-warning: #B45309; --c-warning-soft: #FDF1E1;
+  --c-error: #DC2626; --c-error-soft: #FDECEC; --c-violet: #6D4AD9; --c-violet-soft: #EFEBFC;
+  --c-track: #E8EDF3;
+  --shadow-1: 0 1px 2px rgba(23,40,63,.06); --shadow-2: 0 8px 24px rgba(23,40,63,.10);
+  --font-sans: Inter, "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --c-background: #0B1220; --c-surface: #152238; --c-sidebar: #101B2C; --c-text-primary: #E7F0FF;
+  --c-text-secondary: #9AAAC0; --c-border: #2A3A54; --c-primary: #5B93F7; --c-primary-soft: #1A2C4D;
+  --c-success: #34D399; --c-success-soft: #123528; --c-warning: #FBBF24; --c-warning-soft: #3A2A10;
+  --c-error: #F87171; --c-error-soft: #3B1A1D; --c-violet: #A894F5; --c-violet-soft: #251D45;
+  --c-track: #22324B; --shadow-1: 0 1px 2px rgba(0,0,0,.4); --shadow-2: 0 8px 24px rgba(0,0,0,.45); color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --c-background: #0B1220; --c-surface: #152238; --c-sidebar: #101B2C; --c-text-primary: #E7F0FF;
+  --c-text-secondary: #9AAAC0; --c-border: #2A3A54; --c-primary: #5B93F7; --c-primary-soft: #1A2C4D;
+  --c-success: #34D399; --c-success-soft: #123528; --c-warning: #FBBF24; --c-warning-soft: #3A2A10;
+  --c-error: #F87171; --c-error-soft: #3B1A1D; --c-violet: #A894F5; --c-violet-soft: #251D45;
+  --c-track: #22324B; --shadow-1: 0 1px 2px rgba(0,0,0,.4); --shadow-2: 0 8px 24px rgba(0,0,0,.45); color-scheme: dark; }
+html, body { height: 100%; }
+body { background: var(--c-background); color: var(--c-text-primary); font-family: var(--font-sans); font-size: 13px; -webkit-font-smoothing: antialiased; font-feature-settings: "ss01","cv11"; }
+.mono, .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+table { font-variant-numeric: tabular-nums; }
+:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; border-radius: 4px; }
+h1, h2 { text-wrap: balance; }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+@keyframes pulse-dot { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+.live-dot { animation: pulse-dot 1.6s ease-in-out infinite; }
+</style>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>
+tailwind.config = {
+  darkMode: ['class', '[data-theme="dark"]'],
+  theme: { extend: {
+    colors: {
+      canvas: 'var(--c-background)', surface: 'var(--c-surface)', sidebar: 'var(--c-sidebar)', line: 'var(--c-border)',
+      ink: 'var(--c-text-primary)', mute: 'var(--c-text-secondary)', brand: 'var(--c-primary)', 'brand-soft': 'var(--c-primary-soft)',
+      ok: 'var(--c-success)', 'ok-soft': 'var(--c-success-soft)', warn: 'var(--c-warning)', 'warn-soft': 'var(--c-warning-soft)',
+      bad: 'var(--c-error)', 'bad-soft': 'var(--c-error-soft)', vio: 'var(--c-violet)', 'vio-soft': 'var(--c-violet-soft)', track: 'var(--c-track)'
+    },
+    fontSize: { xs2: ['11px', '1.4'], sm2: ['12px', '1.5'], base2: ['13px', '1.55'], md2: ['14px', '1.55'], xl2: ['18px', '1.4'], h2: ['22px', '1.3'], h1: ['26px', '1.25'] },
+    boxShadow: { e1: 'var(--shadow-1)', e2: 'var(--shadow-2)' }
+  } }
+};
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script>/* htm 3.1.1 (inlined) */
+!function(n,e){"object"==typeof exports&&"undefined"!=typeof module?module.exports=e():"function"==typeof define&&define.amd?define(e):n.htm=e()}(this,function(){var n=function(e,t,u,s){var r;t[0]=0;for(var p=1;p<t.length;p++){var h=t[p++],o=t[p]?(t[0]|=h?1:2,u[t[p++]]):t[++p];3===h?s[0]=o:4===h?s[1]=Object.assign(s[1]||{},o):5===h?(s[1]=s[1]||{})[t[++p]]=o:6===h?s[1][t[++p]]+=o+"":h?(r=e.apply(o,n(e,o,u,["",null])),s.push(r),o[0]?t[0]|=2:(t[p-2]=0,t[p]=r)):s.push(o)}return s},e=new Map;return function(t){var u=e.get(this);return u||(u=new Map,e.set(this,u)),(u=n(this,u.get(t)||(u.set(t,u=function(n){for(var e,t,u=1,s="",r="",p=[0],h=function(n){1===u&&(n||(s=s.replace(/^\s*\n\s*|\s*\n\s*$/g,"")))?p.push(0,n,s):3===u&&(n||s)?(p.push(3,n,s),u=2):2===u&&"..."===s&&n?p.push(4,n,0):2===u&&s&&!n?p.push(5,0,!0,s):u>=5&&((s||!n&&5===u)&&(p.push(u,0,s,t),u=6),n&&(p.push(u,n,0,t),u=6)),s=""},o=0;o<n.length;o++){o&&(1===u&&h(),h(o));for(var f=0;f<n[o].length;f++)e=n[o][f],1===u?"<"===e?(h(),p=[p],u=3):s+=e:4===u?"--"===s&&">"===e?(u=1,s=""):s=e+s[0]:r?e===r?r="":s+=e:'"'===e||"'"===e?r=e:">"===e?(h(),u=1):u&&("="===e?(u=5,t=s,s=""):"/"===e&&(u<5||">"===n[o][f+1])?(h(),3===u&&(p=p[0]),u=p,(p=p[0]).push(2,0,u),u=0):" "===e||"\t"===e||"\n"===e||"\r"===e?(h(),u=2):s+=e),3===u&&"!--"===s&&(u=4,p=p[0])}return h(),p}(t)),u),arguments,[])).length>1?u:u[0]}});
+</script>
+
+<div id="root" class="h-full"></div>
+
+<script>
+const { useState, useMemo, useEffect } = React;
+const html = htm.bind(React.createElement);
+/* ---------------- Formatting ---------------- */
+const fmtBytes = (b) => b == null ? '—' : b >= 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b >= 1e6 ? (b / 1e6).toFixed(1) + ' MB' : b >= 1e3 ? (b / 1e3).toFixed(1) + ' kB' : b + ' B';
+const fmtNum = (n) => n == null ? '—' : n.toLocaleString('en-US');
+const fmtAge = (s) => s == null ? 'awaiting first heartbeat' : s < 60 ? s + ' s ago' : s < 3600 ? Math.round(s / 60) + ' min ago' : Math.round(s / 3600) + ' h ago';
+
+/* ---------------- Icons (stroke, currentColor) ---------------- */
+const P = {
+  overview: 'M3 3h7v9H3zM14 3h7v5h-7zM14 12h7v9h-7zM3 16h7v5H3z',
+  probe: 'M12 12m-2 0a2 2 0 1 0 4 0a2 2 0 1 0-4 0M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2',
+  iface: 'M7 7h10v6a5 5 0 0 1-10 0zM10 3v4M14 3v4M12 18v3',
+  live: 'M22 12h-4l-3 9L9 3l-3 9H2',
+  folder: 'M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
+  gear: 'M12 15a3 3 0 1 0 0-6a3 3 0 0 0 0 6zM19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3a1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5a1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8a1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5a1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z',
+  search: 'M11 19a8 8 0 1 0 0-16a8 8 0 0 0 0 16zM21 21l-4.3-4.3',
+  sun: 'M12 17a5 5 0 1 0 0-10a5 5 0 0 0 0 10zM12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4',
+  moon: 'M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z',
+  lock: 'M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4',
+  ext: 'M14 3h7v7M10 14L21 3M21 14v7H3V3h7',
+  alert: 'M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z',
+  close: 'M18 6L6 18M6 6l12 12',
+  plus: 'M12 5v14M5 12h14',
+  trash: 'M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14',
+  server: 'M3 4h18v6H3zM3 14h18v6H3zM7 7h.01M7 17h.01',
+  cloud: 'M17.5 19a4.5 4.5 0 1 0-1.4-8.8A6 6 0 1 0 6 18.9V19z'
+};
+function Icon({ name, size = 16, className = '' }) {
+  return html`<svg width=${size} height=${size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className=${className}><path d=${P[name]} /></svg>`;
+}
+
+/* ---------------- Primitives ---------------- */
+const TONES = {
+  ok: 'bg-ok-soft text-ok', warn: 'bg-warn-soft text-warn', bad: 'bg-bad-soft text-bad', brand: 'bg-brand-soft text-brand',
+  vio: 'bg-vio-soft text-vio', mute: 'bg-track text-mute'
+};
+function Pill({ tone = 'mute', children, dot }) {
+  return html`<span className=${'inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs2 font-semibold tracking-wide ' + TONES[tone]}>
+    ${dot && html`<span className=${'h-1.5 w-1.5 rounded-full bg-current ' + (dot === 'live' ? 'live-dot' : '')}></span>`}${children}</span>`;
+}
+const healthTone = (h) => ({ HEALTHY: 'ok', DEGRADED: 'warn', OFFLINE: 'bad', PENDING: 'brand' }[h] || 'mute');
+const statusTone = (s) => ({ CAPTURING: 'ok', STALLED: 'warn', IDLE: 'mute', UNKNOWN: 'mute', STOPPED: 'mute', PENDING: 'brand' }[s] || 'mute');
+const planeTone = (p) => ({ N2: 'brand', N3: 'vio', N4: 'warn', S1: 'ok' }[p] || 'mute');
+
+function Meter({ value, warnAt = 80, badAt = 90, label }) {
+  if (value == null) return html`<span className="text-mute">—</span>`;
+  const tone = value >= badAt ? 'bg-bad' : value >= warnAt ? 'bg-warn' : 'bg-brand';
+  return html`<div className="flex items-center gap-2 min-w-[110px]">
+    <div className="h-1.5 flex-1 rounded-full bg-track overflow-hidden" role="meter" aria-label=${label} aria-valuemin="0" aria-valuemax="100" aria-valuenow=${value}>
+      <div className=${'h-full rounded-full ' + tone} style=${{ width: value + '%' }}></div></div>
+    <span className="num text-sm2 w-9 text-right">${value}%</span></div>`;
+}
+function TypeBadge({ type }) {
+  const v = type === 'vprobe';
+  return html`<span className=${'inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-0.5 text-sm2 font-medium ' + (v ? 'text-brand' : 'text-vio')}>
+    <${Icon} name=${v ? 'cloud' : 'server'} size=${13} />${v ? 'vProbe' : 'Physical'}</span>`;
+}
+function Card({ children, className = '' }) {
+  return html`<section className=${'rounded-xl border border-line bg-surface shadow-e1 ' + className}>${children}</section>`;
+}
+function Locked({ children, reason }) {
+  return html`<button disabled title=${reason} className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-dashed border-line text-sm2 text-mute cursor-not-allowed">
+    <${Icon} name="lock" size=${12} />${children}</button>`;
+}
+function PageHeader({ eyebrow, title, desc, actions }) {
+  return html`<header className="flex flex-wrap items-end justify-between gap-3">
+    <div className="min-w-0"><p className="text-xs2 font-semibold uppercase tracking-wider text-mute">${eyebrow}</p>
+      <h1 className="text-h1 font-semibold">${title}</h1>${desc && html`<p className="mt-1 text-md2 text-mute max-w-[70ch]">${desc}</p>`}</div>
+    ${actions}</header>`;
+}
+
+
+Object.assign(P, {
+  core: 'M12 3l8 4.5v9L12 21l-8-4.5v-9zM12 12l8-4.5M12 12v9M12 12L4 7.5',
+  antenna: 'M12 12v9M8 21h8M5 5a10 10 0 0 0 0 14M19 5a10 10 0 0 1 0 14M8.5 8.5a5 5 0 0 0 0 7M15.5 8.5a5 5 0 0 1 0 7M12 12h.01',
+  topo: 'M5 5h4v4H5zM15 5h4v4h-4zM10 15h4v4h-4zM7 9v2h10V9M12 11v4',
+  phone: 'M7 2h10v20H7zM11 18h2',
+  flow: 'M4 6h6v4H4zM14 14h6v4h-6zM7 10v4h10',
+  zap: 'M13 2L4 14h7l-1 8 9-12h-7z',
+  hist: 'M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5M12 7v5l3 3',
+  key: 'M15 7a4 4 0 1 1-3.9 4.9L3 20v-3h3v-3h3l2.1-2.1A4 4 0 0 1 15 7z',
+  play: 'M7 4l13 8-13 8z',
+  stop: 'M6 6h12v12H6z'
+});
+
+/* ---------------- Lab data (values from POLARIS_CONTROL audits in the repo) ---------------- */
+const CORE = {
+  version: 'Open5GS 2.8.0', plmn: '001/01', tac: ['200'], snssai: [{ sst: 1, sd: '010203' }], dnn: ['internet'],
+  amf: '10.77.21.11:38412',
+  nfs: [
+    { nf: 'AMF', role: 'Access & mobility', state: 'HEALTHY', addr: '10.77.21.11', detail: 'NGAP SCTP 38412 · 1 gNB connected' },
+    { nf: 'SMF', role: 'Session management', state: 'HEALTHY', addr: '[addr]', detail: 'PFCP to UPF · DNN internet' },
+    { nf: 'UPF', role: 'User plane', state: 'HEALTHY', addr: '[addr]', detail: 'GTP-U 2152 · PFCP 8805' },
+    { nf: 'NRF', role: 'Function repository', state: 'HEALTHY', addr: '[addr]', detail: 'NF registrations' },
+    { nf: 'AUSF', role: 'Authentication', state: 'HEALTHY', addr: '[addr]', detail: '5G-AKA' },
+    { nf: 'UDM', role: 'Subscriber data', state: 'HEALTHY', addr: '[addr]', detail: '' },
+    { nf: 'UDR', role: 'Subscriber repository', state: 'HEALTHY', addr: '[addr]', detail: 'MongoDB open5gs.subscribers' },
+    { nf: 'PCF', role: 'Policy', state: 'HEALTHY', addr: '[addr]', detail: '' },
+    { nf: 'NSSF', role: 'Slice selection', state: 'HEALTHY', addr: '[addr]', detail: 'S-NSSAI 1/010203' },
+    { nf: 'BSF', role: 'Binding support', state: 'HEALTHY', addr: '[addr]', detail: '' }
+  ],
+  subscribers: { total: 10, polaris: 10, slots: Array.from({ length: 10 }, (_, i) => ({ slot: 'UE-' + String(i + 1).padStart(2, '0'), bound: i === 0 ? 'UE-01' : i === 2 ? 'UE-12' : null })) }
+};
+const GNBS = [
+  { gnb_id: 'GNB-01', state: 'ACTIVE', nci: '0x000000010', idLen: 32, plmn: '001/01', tac: '200', link: '10.77.0.20', ngap: '10.77.21.20', gtp: '10.77.22.20', ngSetup: 'SUCCESS', n3: 'UP', ues: ['UE-01', 'UE-12'], certified: true },
+  { gnb_id: 'GNB-02', state: 'PLANNED', nci: '0x000000020', idLen: 32, plmn: '001/01', tac: '200', link: '10.77.0.22', ngap: '10.77.21.21', gtp: '10.77.22.21', ngSetup: '—', n3: '—', ues: [], certified: false }
+];
+const UES = [
+  { ue_id: 'UE-01', name: 'Legacy shared UE', gnb: 'GNB-01', slot: 'UE-01', sub: 'VERIFIED', reg: 'REGISTERED', pdu: 'ACTIVE', ip: '[UE IP]', scenario: null, shared: true },
+  { ue_id: 'UE-12', name: 'Lab UE 12', gnb: 'GNB-01', slot: 'UE-03', sub: 'VERIFIED', reg: 'REGISTERED', pdu: 'ACTIVE', ip: '[UE IP]', scenario: 'attach-udp' },
+  { ue_id: 'UE-13', name: 'Lab UE 13', gnb: 'GNB-01', slot: null, sub: 'PROVISIONING_REQUIRED', reg: 'STOPPED', pdu: '—', ip: '—', scenario: 'pdu-cycle' },
+  { ue_id: 'UE-14', name: 'GNB-02 candidate', gnb: 'GNB-02', slot: null, sub: 'PROVISIONING_REQUIRED', reg: 'STOPPED', pdu: '—', ip: '—', scenario: null }
+];
+const SCENARIOS = [
+  { id: 'attach-udp', name: 'Attach + UDP burst', version: 3, loop: 50, steps: [['ue_start', 'wait REGISTERED · 30 s'], ['pdu_establish', 'DNN internet'], ['udp_traffic', '5 datagrams'], ['wait', 'random 5–15 s'], ['pdu_release', ''], ['ue_stop', '']] },
+  { id: 'pdu-cycle', name: 'PDU up/down', version: 1, loop: 10, steps: [['ue_start', ''], ['pdu_establish', ''], ['wait', 'fixed 10 s'], ['pdu_release', ''], ['ue_stop', '']] }
+];
+const regTone = (s) => ({ REGISTERED: 'ok', REGISTERING: 'warn', STOPPED: 'mute', FAILED: 'bad', ACTIVE: 'ok', VERIFIED: 'ok', PROVISIONING_REQUIRED: 'warn', PLANNED: 'brand', HEALTHY: 'ok', SUCCESS: 'ok', UP: 'ok' }[s] || 'mute');
+
+/* ---------------- Shell ---------------- */
+const NAV = [
+  { id: 'console', label: 'Console', icon: 'overview', section: 'Network' },
+  { id: 'topology', label: 'Topology', icon: 'topo', section: 'Network' },
+  { id: 'core', label: 'Core · Open5GS', icon: 'core', section: 'Network' },
+  { id: 'gnbs', label: 'gNodeBs', icon: 'antenna', section: 'Network' },
+  { id: 'ues', label: 'UE Manager', icon: 'phone', section: 'Simulation' },
+  { id: 'scenarios', label: 'Scenarios', icon: 'flow', section: 'Simulation' },
+  { id: 'monitor', label: 'Execution monitor', icon: 'live', section: 'Simulation' },
+  { id: 'history', label: 'History', icon: 'hist', section: 'Review' }
+];
+function readHash() { const h = (location.hash || '').slice(1); return NAV.some((n) => n.id === h) ? h : 'topology'; }
+
+function App() {
+  const [view, setView] = useState(readHash());
+  const [theme, setTheme] = useState(() => { try { return localStorage.getItem('pc-theme') || ''; } catch { return ''; } });
+  useEffect(() => { const f = () => setView(readHash()); addEventListener('hashchange', f); return () => removeEventListener('hashchange', f); }, []);
+  useEffect(() => {
+    if (theme) document.documentElement.setAttribute('data-theme', theme); else document.documentElement.removeAttribute('data-theme');
+    try { theme ? localStorage.setItem('pc-theme', theme) : localStorage.removeItem('pc-theme'); } catch {}
+  }, [theme]);
+  const isDark = theme === 'dark' || (!theme && matchMedia('(prefers-color-scheme: dark)').matches);
+  const Views = { console: Console, topology: Topology, core: Core, gnbs: Gnbs, ues: Ues, scenarios: Scenarios, monitor: Monitor, history: History };
+  const V = Views[view];
+
+  return html`<div className="min-h-full flex flex-col md:flex-row">
+    <aside className="md:w-60 shrink-0 bg-sidebar border-b md:border-b-0 md:border-r border-line md:min-h-screen">
+      <div className="flex items-center gap-2.5 py-4" style=${{ paddingLeft: 'max(16px, env(safe-area-inset-left, 0px))', paddingRight: '16px' }}>
+        <div className="grid place-items-center h-8 w-8 rounded-lg bg-brand text-white"><${Icon} name="antenna" size=${17} /></div>
+        <div className="leading-tight"><p className="text-md2 font-semibold">POLARIS</p><p className="text-sm2 text-mute">5G lab control</p></div>
+      </div>
+      <nav aria-label="Primary" className="flex md:flex-col gap-1 overflow-x-auto md:overflow-visible pb-3 md:pb-0" style=${{ paddingLeft: 'max(12px, env(safe-area-inset-left, 0px))', paddingRight: '12px' }}>
+        ${['Network', 'Simulation', 'Review'].map((section) => html`<div key=${section} className="flex md:flex-col gap-1 md:mb-3">
+          <p className="hidden md:block px-2 py-1 text-xs2 font-semibold uppercase tracking-wider text-mute">${section}</p>
+          ${NAV.filter((n) => n.section === section).map((n) => html`<a key=${n.id} href=${'#' + n.id}
+            className=${'flex items-center gap-2.5 whitespace-nowrap rounded-md px-2.5 py-2 text-md2 transition-colors ' + (view === n.id ? 'bg-surface text-ink font-medium shadow-e1' : 'text-mute hover:text-ink hover:bg-surface')}
+            aria-current=${view === n.id ? 'page' : undefined}><${Icon} name=${n.icon} />${n.label}</a>`)}
+        </div>`)}
+        <p className="hidden md:block mt-2 mx-2 border-t border-line pt-3 text-sm2 text-mute">Probes and captures are managed in the OIRAN Probe Manager.</p>
+      </nav>
+    </aside>
+    <div className="flex-1 min-w-0 flex flex-col">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line bg-surface py-2.5" style=${{ paddingLeft: 'max(16px, env(safe-area-inset-left, 0px))', paddingRight: 'max(16px, env(safe-area-inset-right, 0px))' }}>
+        <div className="flex flex-wrap items-center gap-3 text-sm2 text-mute">
+          <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-ok live-dot"></span>Core healthy</span>
+          <span className="num">PLMN ${CORE.plmn} · TAC ${CORE.tac.join(', ')}</span>
+          <span className="num">Live UEs 2 / 10</span>
+          <span className="rounded border border-line px-1.5 py-0.5 text-xs2">Example data</span>
+        </div>
+        <button onClick=${() => setTheme(isDark ? 'light' : 'dark')} className="inline-flex items-center gap-2 h-8 px-3 rounded-md border border-line text-sm2 hover:bg-canvas" aria-label="Toggle colour theme">
+          <${Icon} name=${isDark ? 'sun' : 'moon'} size=${14} />${isDark ? 'Light' : 'Dark'}</button>
+      </div>
+      <main className="flex-1 min-w-0 flex flex-col gap-5" style=${{ paddingTop: '24px', paddingBottom: '40px', paddingLeft: 'max(16px, env(safe-area-inset-left, 0px))', paddingRight: 'max(16px, env(safe-area-inset-right, 0px))' }}>
+        <${V} />
+      </main>
+    </div>
+  </div>`;
+}
+
+function Stat({ label, value, sub, tone }) {
+  return html`<${Card} className="p-4 flex flex-col gap-1"><p className="text-xs2 font-semibold uppercase tracking-wider text-mute">${label}</p>
+    <p className=${'num text-[26px] leading-tight font-medium ' + (tone ? 'text-' + tone : '')}>${value}</p><p className="text-sm2 text-mute">${sub}</p></${Card}>`;
+}
+function Btn({ children, icon, primary, onClick }) {
+  return html`<button onClick=${onClick} className=${'inline-flex items-center gap-1.5 h-9 px-4 rounded-md text-md2 font-medium ' + (primary ? 'bg-brand text-white shadow-e1 hover:brightness-110' : 'border border-line hover:bg-canvas')}>
+    ${icon && html`<${Icon} name=${icon} size=${15} />`}${children}</button>`;
+}
+
+/* ---------------- Console ---------------- */
+function Console() {
+  return html`<${PageHeader} eyebrow="Network" title="Console" desc="One view of the simulated network: core, radio and the UEs running on it." />
+    <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+      <${Stat} label="Core functions" value="10 / 10" sub=${CORE.version + ' · healthy'} />
+      <${Stat} label="gNodeBs" value="1 active" sub="1 planned (GNB-02)" />
+      <${Stat} label="UEs registered" value="2" sub="of 4 profiles · live cap 10" />
+      <${Stat} label="PDU sessions" value="2" sub="DNN internet" />
+    </div>
+    <div className="grid gap-5 lg:grid-cols-2">
+      <${Card} className="p-5"><h2 className="text-xl2 font-semibold mb-3">Readiness before starting a UE</h2>
+        <ul className="flex flex-col gap-2.5 text-md2">${[
+          ['Serving gNB is active', 'ok'], ['PLMN matches UE, gNB and AMF (001/01)', 'ok'], ['gNB TAC is in the AMF TAI list (200)', 'ok'],
+          ['UE S-NSSAI served by AMF and SMF (1/010203)', 'ok'], ['Subscriber provisioned in Open5GS', 'warn']
+        ].map(([t, tone]) => html`<li key=${t} className="flex items-center justify-between gap-3"><span>${t}</span><${Pill} tone=${tone}>${tone === 'ok' ? 'PASS' : '2 profiles not provisioned'}</${Pill}></li>`)}</ul></${Card}>
+      <${Card} className="p-5"><h2 className="text-xl2 font-semibold mb-3">Recent activity</h2>
+        <ul className="flex flex-col divide-y divide-line text-md2">${[
+          ['UE-12', 'Registered on GNB-01, PDU session active'], ['attach-udp v3', 'Job completed · 50/50 loops'], ['GNB-01', 'NG Setup successful with AMF'], ['UE-13', 'Start refused · subscriber not provisioned']
+        ].map(([a, b]) => html`<li key=${a + b} className="py-2.5 flex gap-3"><span className="mono w-28 shrink-0">${a}</span><span className="text-mute">${b}</span></li>`)}</ul></${Card}>
+    </div>`;
+}
+
+/* ---------------- Topology (core → gNB → UE) ---------------- */
+function Node({ title, sub, icon, tone, children, dashed }) {
+  return html`<div className=${'relative rounded-xl border bg-surface shadow-e1 p-3 min-w-0 ' + (dashed ? 'border-dashed border-line' : 'border-line')}>
+    <div className="flex items-center gap-2"><span className=${'grid place-items-center h-8 w-8 rounded-lg ' + TONES[tone]}><${Icon} name=${icon} size=${16} /></span>
+      <div className="min-w-0"><p className="font-semibold truncate">${title}</p><p className="mono text-xs2 text-mute truncate">${sub}</p></div></div>${children}</div>`;
+}
+function Link({ label, state }) {
+  const up = state === 'UP';
+  return html`<div className="flex flex-col items-center py-1" aria-label=${label + ' ' + state}>
+    <div className=${'w-0.5 h-6 ' + (up ? 'bg-ok' : 'bg-line')}></div>
+    <span className=${'mono text-xs2 px-1.5 rounded ' + (up ? 'text-ok bg-ok-soft' : 'text-mute bg-track')}>${label}</span>
+    <div className=${'w-0.5 h-6 ' + (up ? 'bg-ok' : 'bg-line')}></div></div>`;
+}
+function Topology() {
+  return html`<${PageHeader} eyebrow="Network" title="Topology" desc="Core, radio and UEs as they are wired now. Links show the live state of each interface."
+      actions=${html`<div className="flex flex-wrap gap-2"><${Pill} tone="ok" dot="live">N2 / N3 up</${Pill}><${Pill} tone="mute">No mobility (UERANSIM)</${Pill}></div>`} />
+    <${Card} className="p-5 overflow-x-auto">
+      <div className="min-w-[680px] flex flex-col items-center">
+        <div className="w-full max-w-3xl rounded-2xl border border-line bg-canvas p-4">
+          <div className="flex items-center justify-between mb-3"><p className="font-semibold">5G Core · ${CORE.version}</p><span className="mono text-sm2 text-mute">PLMN ${CORE.plmn} · S-NSSAI 1/010203 · DNN internet</span></div>
+          <div className="grid grid-cols-5 gap-2">${CORE.nfs.map((n) => html`<div key=${n.nf} className="flex items-center gap-1.5 rounded-md border border-line bg-surface px-2 py-1.5">
+            <span className="h-2 w-2 rounded-full bg-ok"></span><span className="mono text-sm2 font-medium">${n.nf}</span></div>`)}</div>
+        </div>
+        <div className="grid grid-cols-2 gap-16 w-full max-w-3xl">
+          ${GNBS.map((g) => html`<div key=${g.gnb_id} className="flex flex-col items-center">
+            <div className="flex gap-6"><${Link} label="N2 · NGAP" state=${g.ngSetup === 'SUCCESS' ? 'UP' : 'DOWN'} /><${Link} label="N3 · GTP-U" state=${g.n3} /></div>
+            <div className="w-full"><${Node} title=${g.gnb_id} sub=${'link ' + g.link + ' · TAC ' + g.tac} icon="antenna" tone=${g.state === 'ACTIVE' ? 'ok' : 'brand'} dashed=${g.state !== 'ACTIVE'}>
+              <div className="mt-2 flex flex-wrap gap-1.5"><${Pill} tone=${regTone(g.state)} dot=${g.state === 'ACTIVE' ? 'live' : undefined}>${g.state}</${Pill}>
+                ${!g.certified && html`<${Pill} tone="mute">multi-gNB locked · LIVE-005</${Pill}>`}</div></${Node}></div>
+            <div className="w-0.5 h-6 bg-line"></div>
+            <div className="w-full grid grid-cols-2 gap-2">${(UES.filter((u) => u.gnb === g.gnb_id)).map((u) => html`<div key=${u.ue_id} className="rounded-lg border border-line bg-surface p-2">
+              <div className="flex items-center gap-1.5"><${Icon} name="phone" size=${14} /><span className="mono text-sm2 font-medium">${u.ue_id}</span></div>
+              <div className="mt-1 flex flex-wrap gap-1"><${Pill} tone=${regTone(u.reg)}>${u.reg}</${Pill}>${u.pdu === 'ACTIVE' && html`<${Pill} tone="ok">PDU</${Pill}>`}</div></div>`)}
+              ${UES.filter((u) => u.gnb === g.gnb_id).length === 0 && html`<p className="col-span-2 text-center text-sm2 text-mute py-2">No UE attached</p>`}</div>
+          </div>`)}
+        </div>
+      </div></${Card}>
+    <p className="text-sm2 text-mute">Each UE searches only for its serving gNB (gnbSearchList). UERANSIM has no handover, so a UE stays on its gNB.</p>`;
+}
+
+/* ---------------- Core · Open5GS ---------------- */
+function Core() {
+  const [tab, setTab] = useState('functions');
+  return html`<${PageHeader} eyebrow="Network" title="Core · Open5GS" desc=${CORE.version + ' running the lab 5G core. Observe first; subscriber changes need a confirmation and a database backup; configuration edits come last.'} />
+    <div role="tablist" aria-label="Core sections" className="flex flex-wrap gap-1 border-b border-line">
+      ${[['functions', 'Network functions'], ['config', 'Configuration'], ['subscribers', 'Subscribers']].map(([v, l]) => html`<button key=${v} role="tab" aria-selected=${tab === v} onClick=${() => setTab(v)}
+        className=${'h-10 px-4 -mb-px border-b-2 text-md2 ' + (tab === v ? 'border-brand text-brand font-semibold' : 'border-transparent text-mute hover:text-ink')}>${l}</button>`)}
+    </div>
+    ${tab === 'functions' && html`<${Card} className="overflow-hidden"><div className="overflow-x-auto"><table className="w-full min-w-[720px] text-md2">
+      <thead><tr className="text-left text-xs2 uppercase tracking-wider text-mute border-b border-line"><th className="px-4 py-2.5 font-semibold">Function</th><th className="px-3 py-2.5 font-semibold">State</th>
+        <th className="px-3 py-2.5 font-semibold">Address</th><th className="px-3 py-2.5 font-semibold">Detail</th><th className="px-4 py-2.5 font-semibold text-right">Actions</th></tr></thead>
+      <tbody>${CORE.nfs.map((n) => html`<tr key=${n.nf} className="border-b border-line last:border-0">
+        <td className="px-4 py-3"><p className="mono font-semibold">${n.nf}</p><p className="text-sm2 text-mute">${n.role}</p></td>
+        <td className="px-3 py-3"><${Pill} tone="ok" dot="live">${n.state}</${Pill}></td>
+        <td className="px-3 py-3 mono text-sm2">${n.addr}</td><td className="px-3 py-3 text-sm2 text-mute">${n.detail || '—'}</td>
+        <td className="px-4 py-3 text-right"><${Locked} reason="NF restart ships last, behind an explicit confirmation">Restart</${Locked}></td></tr>`)}</tbody></table></div></${Card}>`}
+    ${tab === 'config' && html`<div className="grid gap-5 lg:grid-cols-2">
+      <${Card} className="p-5"><h2 className="text-xl2 font-semibold mb-3">Identity and slicing</h2>
+        <dl className="grid grid-cols-2 gap-x-4 gap-y-3 text-md2">
+          <div><dt className="text-xs2 uppercase tracking-wider text-mute">PLMN</dt><dd className="mono">${CORE.plmn}</dd></div>
+          <div><dt className="text-xs2 uppercase tracking-wider text-mute">AMF NGAP</dt><dd className="mono">${CORE.amf}</dd></div>
+          <div><dt className="text-xs2 uppercase tracking-wider text-mute">TAI list</dt><dd className="mono">TAC ${CORE.tac.join(', ')}</dd></div>
+          <div><dt className="text-xs2 uppercase tracking-wider text-mute">S-NSSAI</dt><dd className="mono">${CORE.snssai.map((x) => x.sst + '/' + x.sd).join(', ')}</dd></div>
+          <div><dt className="text-xs2 uppercase tracking-wider text-mute">DNN</dt><dd className="mono">${CORE.dnn.join(', ')}</dd></div>
+          <div><dt className="text-xs2 uppercase tracking-wider text-mute">AMF field</dt><dd className="mono">8000</dd></div>
+        </dl>
+        <div className="mt-4 flex flex-wrap gap-2 border-t border-line pt-3"><${Locked} reason="Core configuration edits ship last (V2), each with a confirmation">Edit configuration</${Locked}></div></${Card}>
+      <${Card} className="p-5"><h2 className="text-xl2 font-semibold mb-3">Consistency checks</h2>
+        <ul className="flex flex-col gap-2.5 text-md2">${[['GNB-01 PLMN equals core PLMN', 'ok'], ['GNB-01 TAC 200 is in the TAI list', 'ok'], ['GNB-02 plan uses the same PLMN, TAC and slice', 'ok'], ['Every UE profile slice is served', 'ok']]
+          .map(([t]) => html`<li key=${t} className="flex items-center justify-between gap-3"><span>${t}</span><${Pill} tone="ok">PASS</${Pill}></li>`)}</ul></${Card}>
+    </div>`}
+    ${tab === 'subscribers' && html`<div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_340px] items-start">
+      <${Card} className="overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-line"><h2 className="font-semibold">Provisioned subscribers · POLARIS-owned slots</h2>
+          <span className="text-sm2 text-mute num">${CORE.subscribers.polaris} of ${CORE.subscribers.total} records</span></div>
+        <div className="overflow-x-auto"><table className="w-full min-w-[560px] text-md2">
+          <thead><tr className="text-left text-xs2 uppercase tracking-wider text-mute border-b border-line"><th className="px-4 py-2.5 font-semibold">Slot</th><th className="px-3 py-2.5 font-semibold">Identity</th>
+            <th className="px-3 py-2.5 font-semibold">Profile</th><th className="px-3 py-2.5 font-semibold">S-NSSAI · DNN</th></tr></thead>
+          <tbody>${CORE.subscribers.slots.map((s) => html`<tr key=${s.slot} className="border-b border-line last:border-0">
+            <td className="px-4 py-2.5 mono font-medium">${s.slot}</td><td className="px-3 py-2.5"><span className="inline-flex items-center gap-1 mono text-sm2 text-mute"><${Icon} name="key" size=${12} />PROTECTED</span></td>
+            <td className="px-3 py-2.5">${s.bound ? html`<span className="mono">${s.bound}</span>` : html`<${Pill} tone="brand">Free</${Pill}>`}</td>
+            <td className="px-3 py-2.5 mono text-sm2">1/010203 · internet</td></tr>`)}</tbody></table></div></${Card}>
+      <${Card} className="p-5 flex flex-col gap-3"><h2 className="text-xl2 font-semibold">Provision a subscriber</h2>
+        <p className="text-md2 text-mute">Adds a record to Open5GS for a POLARIS profile. Records POLARIS did not create are never changed.</p>
+        <ol className="flex flex-col gap-1.5 text-md2 list-decimal pl-5"><li>Back up the subscriber database</li><li>Insert or remove only POLARIS-owned records</li><li>Verify, or roll back automatically</li></ol>
+        <${Locked} reason="Needs your authorisation: first write to Open5GS">Provision UE-13</${Locked}>
+        <p className="text-sm2 text-mute">SUPI, K and OPc are generated server-side and never displayed.</p></${Card}>
+    </div>`}`;
+}
+
+/* ---------------- gNodeBs ---------------- */
+function Gnbs() {
+  return html`<${PageHeader} eyebrow="Network" title="gNodeBs" desc="UERANSIM gNodeBs connected to the core. A UE profile names its serving gNB; the controller writes it into the UE's gnbSearchList."
+      actions=${html`<${Locked} reason="gNB creation ships in V1.1">Add gNodeB</${Locked}>`} />
+    <div className="grid gap-5 lg:grid-cols-2">${GNBS.map((g) => html`<${Card} key=${g.gnb_id} className=${'p-5 flex flex-col gap-4 ' + (g.state === 'PLANNED' ? 'border-dashed' : '')}>
+      <div className="flex flex-wrap items-start justify-between gap-2"><div><h2 className="mono text-xl2 font-semibold">${g.gnb_id}</h2><p className="text-sm2 text-mute">UERANSIM 3.3.0 · NCI ${g.nci} / ${g.idLen} bits</p></div>
+        <div className="flex flex-wrap gap-1.5"><${Pill} tone=${regTone(g.state)} dot=${g.state === 'ACTIVE' ? 'live' : undefined}>${g.state}</${Pill}>${g.certified ? html`<${Pill} tone="ok">Live certified</${Pill}>` : html`<${Pill} tone="mute">Not certified</${Pill}>`}</div></div>
+      <dl className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-3 text-md2">
+        <div><dt className="text-xs2 uppercase tracking-wider text-mute">PLMN · TAC</dt><dd className="mono">${g.plmn} · ${g.tac}</dd></div>
+        <div><dt className="text-xs2 uppercase tracking-wider text-mute">Link IP</dt><dd className="mono">${g.link}</dd></div>
+        <div><dt className="text-xs2 uppercase tracking-wider text-mute">NGAP IP</dt><dd className="mono">${g.ngap}</dd></div>
+        <div><dt className="text-xs2 uppercase tracking-wider text-mute">GTP-U IP</dt><dd className="mono">${g.gtp}</dd></div>
+        <div><dt className="text-xs2 uppercase tracking-wider text-mute">NG Setup</dt><dd>${g.ngSetup === 'SUCCESS' ? html`<${Pill} tone="ok">SUCCESS</${Pill}>` : '—'}</dd></div>
+        <div><dt className="text-xs2 uppercase tracking-wider text-mute">UEs attached</dt><dd className="mono">${g.ues.length ? g.ues.join(', ') : '—'}</dd></div>
+      </dl>
+      <div className="flex flex-wrap gap-2 border-t border-line pt-3">
+        ${g.state === 'ACTIVE'
+          ? html`<${Locked} reason="Stopping GNB-01 detaches every UE on it; ships with confirmation in V1.1">Stop gNB</${Locked}>`
+          : html`<div className="flex flex-wrap items-center gap-2"><${Locked} reason="Multi-gNB execution locked until LIVE-005">Deploy and start</${Locked}><span className="text-sm2 text-mute">Reserved addresses from the gNB audit; recheck before deploy.</span></div>`}
+      </div></${Card}>`)}</div>`;
+}
+
+/* ---------------- UE Manager ---------------- */
+function Ues() {
+  return html`<${PageHeader} eyebrow="Simulation" title="UE Manager" desc="UE profiles bound to a serving gNB and, ideally, to a provisioned subscriber slot. Identity is write-only."
+      actions=${html`<div className="flex flex-wrap gap-2"><${Btn} icon="plus" primary>Add UE</${Btn}><${Btn}>Export CSV</${Btn}></div>`} />
+    <${Card} className="overflow-hidden"><div className="overflow-x-auto"><table className="w-full min-w-[900px] text-md2">
+      <thead><tr className="text-left text-xs2 uppercase tracking-wider text-mute border-b border-line"><th className="px-4 py-2.5 font-semibold">UE</th><th className="px-3 py-2.5 font-semibold">Serving gNB</th>
+        <th className="px-3 py-2.5 font-semibold">Subscriber</th><th className="px-3 py-2.5 font-semibold">Registration</th><th className="px-3 py-2.5 font-semibold">PDU · IP</th>
+        <th className="px-3 py-2.5 font-semibold">Scenario</th><th className="px-4 py-2.5 font-semibold text-right">Actions</th></tr></thead>
+      <tbody>${UES.map((u) => html`<tr key=${u.ue_id} className="border-b border-line last:border-0">
+        <td className="px-4 py-3"><p className="mono font-medium">${u.ue_id}</p><p className="text-sm2 text-mute">${u.name}${u.shared ? ' · shared, protected' : ''}</p></td>
+        <td className="px-3 py-3 mono">${u.gnb}</td>
+        <td className="px-3 py-3"><${Pill} tone=${regTone(u.sub)}>${u.sub === 'VERIFIED' ? 'Verified' : 'Not provisioned'}</${Pill}>${u.slot && html`<p className="mono text-xs2 text-mute mt-1">slot ${u.slot}</p>`}</td>
+        <td className="px-3 py-3"><${Pill} tone=${regTone(u.reg)} dot=${u.reg === 'REGISTERED' ? 'live' : undefined}>${u.reg}</${Pill}></td>
+        <td className="px-3 py-3"><p>${u.pdu}</p><p className="mono text-xs2 text-mute">${u.ip}</p></td>
+        <td className="px-3 py-3">${u.scenario ? html`<span className="mono text-sm2">${u.scenario}</span>` : html`<span className="text-mute">—</span>`}</td>
+        <td className="px-4 py-3 text-right whitespace-nowrap">${u.shared ? html`<${Locked} reason="Shared legacy UE is protected">Protected</${Locked}>`
+          : u.reg === 'REGISTERED' ? html`<button className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-line text-sm2 hover:bg-canvas"><${Icon} name="stop" size=${12} />Stop</button>`
+          : u.sub !== 'VERIFIED' ? html`<${Locked} reason="Provision the subscriber first">Start</${Locked}>`
+          : html`<button className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md bg-brand text-white text-sm2"><${Icon} name="play" size=${12} />Start</button>`}</td></tr>`)}</tbody></table></div></${Card}>`;
+}
+
+/* ---------------- Scenarios, Monitor, History ---------------- */
+function Scenarios() {
+  const [sel, setSel] = useState(SCENARIOS[0].id);
+  const s = SCENARIOS.find((x) => x.id === sel);
+  return html`<${PageHeader} eyebrow="Simulation" title="Scenarios" desc="Saved on the controller with versions. Six V1 step types; numeric parameters can be fixed or random."
+      actions=${html`<${Btn} icon="plus" primary>New scenario</${Btn}>`} />
+    <div className="grid gap-5 lg:grid-cols-[260px_minmax(0,1fr)] items-start">
+      <${Card} className="p-2 flex flex-col gap-1">${SCENARIOS.map((x) => html`<button key=${x.id} onClick=${() => setSel(x.id)}
+        className=${'text-left rounded-lg px-3 py-2.5 ' + (sel === x.id ? 'bg-brand-soft' : 'hover:bg-canvas')}><p className="font-medium">${x.name}</p><p className="mono text-sm2 text-mute">v${x.version} · ${x.steps.length} steps · ×${x.loop}</p></button>`)}</${Card}>
+      <${Card} className="p-5 flex flex-col gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="text-xl2 font-semibold">${s.name} <span className="mono text-md2 text-mute">v${s.version}</span></h2><${Pill} tone="brand">Loop ×${s.loop}</${Pill}></div>
+        <ol className="flex flex-col gap-2">${s.steps.map(([t, d], i) => html`<li key=${i} className="flex items-center gap-3 rounded-lg border border-line px-3 py-2.5">
+          <span className="grid place-items-center h-6 w-6 rounded-full bg-track mono text-xs2">${i + 1}</span><span className="mono font-medium w-32">${t}</span><span className="text-sm2 text-mute">${d || '—'}</span></li>`)}</ol>
+      </${Card}>
+    </div>`;
+}
+function Monitor() {
+  const steps = [['ue_start', 'COMPLETED', ''], ['pdu_establish', 'COMPLETED', ''], ['udp_traffic', 'RUNNING', '5 datagrams'], ['wait', 'PENDING', 'drawn at step start'], ['pdu_release', 'PENDING', ''], ['ue_stop', 'PENDING', '']];
+  const tone = { COMPLETED: 'ok', RUNNING: 'brand', PENDING: 'mute', FAILED: 'bad' };
+  return html`<${PageHeader} eyebrow="Simulation" title="Execution monitor" desc="Step states come from the controller, never from the browser." />
+    <${Card} className="p-5 flex flex-wrap items-center justify-between gap-3"><div><p className="text-xl2 font-semibold">Attach + UDP burst · v3</p><p className="mono text-sm2 text-mute">UE-12 · job [job_id] · scenario loop 12 / 50</p></div>
+      <div className="flex gap-2"><${Pill} tone="brand" dot="live">RUNNING</${Pill}><button className="inline-flex items-center gap-1.5 h-9 px-4 rounded-md border border-bad text-bad text-md2 font-medium"><${Icon} name="stop" size=${13} />Stop job</button></div></${Card}>
+    <${Card} className="p-5"><ol className="flex flex-col gap-2">${steps.map(([t, st, d], i) => html`<li key=${i} className="flex flex-wrap items-center gap-3 rounded-lg border border-line px-3 py-2.5">
+      <span className="grid place-items-center h-6 w-6 rounded-full bg-track mono text-xs2">${i + 1}</span><span className="mono font-medium w-32">${t}</span><${Pill} tone=${tone[st]} dot=${st === 'RUNNING' ? 'live' : undefined}>${st}</${Pill}><span className="text-sm2 text-mute">${d}</span></li>`)}</ol></${Card}>`;
+}
+function History() {
+  return html`<${PageHeader} eyebrow="Review" title="History" />
+    <${Card} className="overflow-hidden"><div className="overflow-x-auto"><table className="w-full min-w-[620px] text-md2">
+      <thead><tr className="text-left text-xs2 uppercase tracking-wider text-mute border-b border-line"><th className="px-4 py-2.5 font-semibold">Job</th><th className="px-3 py-2.5 font-semibold">Scenario</th><th className="px-3 py-2.5 font-semibold">UE</th><th className="px-3 py-2.5 font-semibold">Loops</th><th className="px-4 py-2.5 font-semibold">Result</th></tr></thead>
+      <tbody>${[['attach-udp v3', 'UE-12', '50 / 50', 'COMPLETED', 'ok'], ['pdu-cycle v1', 'UE-13', '0 / 10', 'FAILED', 'bad'], ['attach-udp v2', 'UE-12', '8 / 50', 'STOPPED', 'mute']].map(([a, b, c, d, t]) => html`<tr key=${a + b + d} className="border-b border-line last:border-0">
+        <td className="px-4 py-3 mono text-sm2">[job_id]</td><td className="px-3 py-3">${a}</td><td className="px-3 py-3 mono">${b}</td><td className="px-3 py-3 num">${c}</td><td className="px-4 py-3"><${Pill} tone=${t}>${d}</${Pill}></td></tr>`)}</tbody></table></div></${Card}>`;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+</script>

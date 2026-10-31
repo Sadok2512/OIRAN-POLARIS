@@ -101,10 +101,28 @@ export interface WireScenarioStepStatus {
   resolved_parameters: Record<string, number>;
 }
 
+/** 0.17.0 — job-level failure summary surfaced on GET /scenarios/:id/steps. */
+export interface WireScenarioJobFailure {
+  step_id: string | number | null;
+  step_name: string | null;
+  code: string | null;
+  message: string | null;
+  failure_evidence: unknown | null;
+  started_at: number | null;
+  ended_at: number | null;
+  duration_ms: number | null;
+}
+
 export interface WireScenarioStepsResponse {
   job_id: string;
   scenario_definition_id: string | null;
   steps: WireScenarioStepStatus[];
+  /** 0.17.0 — present when the job is in a terminal state. */
+  state?: string;
+  started_at?: number | null;
+  ended_at?: number | null;
+  duration_ms?: number | null;
+  failure?: WireScenarioJobFailure | null;
 }
 
 export interface WireStartScenarioRequest {
