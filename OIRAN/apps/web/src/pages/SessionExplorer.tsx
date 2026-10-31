@@ -1,89 +1,421 @@
-import { useEffect, useMemo, useState } from 'react';
+// 2.4.0 — Sessions page rebuilt to match docs/ui-mockups/oiran-analyzer.html.
+//
+// Fix for the reported Session ID overlap bug: the Procedure cell now
+// carries the mono session hash on a second mute line, wrapped in a
+// `max-w-[260px] truncate` + `title={session_id}` so the full identifier
+// is reachable on hover but never bleeds into UE / Start / Interfaces /
+// Correlation at 1280 / 1440 / 1920. The explicit "Session ID" column is
+// gone — the hash lives under the procedure, exactly like the mockup.
+//
+// Columns (7 content cols + checkbox hidden; mockup contract):
+//   Procedure · UE · Start (UTC) · Duration · Interfaces · Msgs · Correlation
+//
+// Subscriber identity rule: UE column stays on the backend pseudonym
+// (never resolved to IMSI / IMEI / TMSI / GUTI).
+
+import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import type { ColumnDef } from '@tanstack/react-table';
-import { ArrowRight, FileSearch, ListTree, Search } from 'lucide-react';
+import { Waypoints } from 'lucide-react';
 import { api } from '../services/api';
-import type { ApiEnvelope, CallFlowEvent, CaptureContext, Dataset, Session, UeContext } from '../types/api';
-import { DataTable } from '../components/DataTable';
+import type { ApiEnvelope, Dataset, Session } from '../types/api';
 import { ErrorState, LoadingState, EmptyState } from '../components/AsyncState';
-import { StatusBadge } from '../components/StatusBadge';
-import { Pagination } from '../components/Pagination';
+import {
+  Btn,
+  Card,
+  IfChip,
+  PageHeader,
+  Pill,
+  confTone,
+} from '../components/mockup';
 import { formatTimestampUtc } from '../utils/time';
 
-type Detail={summary:Session;procedures:{name:string;event_ids:string[];status:string}[];accounting:Record<string,number>;capture_references:string[]};
-const duration=(value:string)=>{const ns=Number(value);if(!Number.isFinite(ns))return '—';if(ns<1_000_000_000)return `${(ns/1_000_000).toFixed(1)} ms`;return `${(ns/1_000_000_000).toFixed(3)} s`};
-const queryString=(params:URLSearchParams)=>{const value=params.toString();return value?`?${value}`:''};
-
-export function SessionExplorer(){
-  const navigate=useNavigate(),route=useParams();
-  const [params,setParams]=useSearchParams();
-  const [tab,setTab]=useState('summary'),[sessionPage,setSessionPage]=useState(Number(params.get('page')??1)),[eventPage,setEventPage]=useState(1);
-  const captureId=params.get('capture_id')??'',requestedDataset=params.get('dataset_id')??params.get('dataset')??'',datasetScope=params.get('dataset_scope')??'',probeId=params.get('probe_id')??'',technology=params.get('technology')??'';
-  const search=params.get('search')??'',ue=params.get('ue')??'',iface=params.get('interface')??'',status=params.get('status')??'';
-  const captureContext=useQuery({queryKey:['capture-context',captureId],queryFn:()=>api<CaptureContext>(`/captures/${encodeURIComponent(captureId)}/context`).then(x=>x.data),enabled:!!captureId});
-  const datasetId=requestedDataset||captureContext.data?.dataset?.dataset_id||'';
-  const datasets=useQuery({queryKey:['datasets'],queryFn:()=>api<Dataset[]>('/datasets?page_size=100').then(x=>x.data)});
-  const ues=useQuery({queryKey:['ues'],queryFn:()=>api<UeContext[]>('/ues?page_size=100').then(x=>x.data)});
-  useEffect(()=>{if(!requestedDataset&&captureContext.data?.dataset?.dataset_id){const next=new URLSearchParams(params);next.delete('dataset');next.delete('dataset_scope');next.set('dataset_id',captureContext.data.dataset.dataset_id);setParams(next,{replace:true})}},[captureContext.data?.dataset?.dataset_id,requestedDataset,params,setParams]);
-  const sessionQuery=new URLSearchParams({page:String(sessionPage),page_size:'25',sort:'start_timestamp',order:'asc'});if(search)sessionQuery.set('search',search);if(datasetId)sessionQuery.set('dataset_id',datasetId);if(datasetScope)sessionQuery.set('dataset_kind',datasetScope);if(ue)sessionQuery.set('ue_id',ue);if(technology)sessionQuery.set('technology',technology);if(iface)sessionQuery.set('interface',iface);if(status)sessionQuery.set('status',status);
-  const contextResolved=!captureId||!!datasetId;
-  const sessions=useQuery({queryKey:['sessions',sessionQuery.toString(),contextResolved],queryFn:()=>api<Session[]>(`/sessions?${sessionQuery}`).then(x=>x),enabled:contextResolved});
-  const selectedId=route.sessionId??sessions.data?.data[0]?.session_id;
-  const selectedBelongs=!selectedId||sessions.data?.data.some(session=>session.session_id===selectedId);
-  const detail=useQuery({queryKey:['session',selectedId],queryFn:()=>api<Detail>(`/sessions/${selectedId}`).then(x=>x.data),enabled:!!selectedId&&selectedBelongs});
-  const events=useQuery({queryKey:['session-events',selectedId,eventPage,tab],queryFn:()=>api<CallFlowEvent[]>(`/sessions/${selectedId}/events?page=${eventPage}&page_size=12&association=${tab==='background'?'BACKGROUND':'SESSION'}`),enabled:!!selectedId&&selectedBelongs&&(tab==='messages'||tab==='background')});
-  const update=(key:string,value:string,clearCapture=false)=>{const next=new URLSearchParams(params);value?next.set(key,value):next.delete(key);next.delete('dataset');next.delete('page');next.delete('session_id');if(clearCapture){next.delete('capture_id');next.delete('probe_id')}setSessionPage(1);setEventPage(1);setParams(next)};
-  const updateDataset=(value:string)=>{const next=new URLSearchParams(params);next.delete('dataset');next.delete('dataset_id');next.delete('dataset_scope');next.delete('capture_id');next.delete('probe_id');next.delete('page');next.delete('session_id');if(value.startsWith('scope:'))next.set('dataset_scope',value.slice(6));else if(value)next.set('dataset_id',value);setSessionPage(1);setEventPage(1);setParams(next)};
-  const contextParams=useMemo(()=>{const next=new URLSearchParams(params);next.delete('page');next.delete('search');return next},[params]);
-  const openSession=(session:Session)=>{const next=new URLSearchParams(contextParams);next.set('dataset_id',session.dataset_id);next.set('session_id',session.session_id);if(!next.get('technology'))next.set('technology',session.technology);navigate(`/investigation/sessions/${encodeURIComponent(session.session_id)}${queryString(next)}`)};
-  const openCallFlow=(session:Session)=>{const next=new URLSearchParams(contextParams);next.set('dataset_id',session.dataset_id);next.set('session_id',session.session_id);if(!next.get('technology'))next.set('technology',session.technology);navigate(`/investigation/callflow/${encodeURIComponent(session.session_id)}${queryString(next)}`)};
-  const columns=useMemo<ColumnDef<Session>[]>(()=>[
-    {accessorKey:'session_id',header:'Session ID',cell:i=><span className="mono strong">{i.getValue<string>()}</span>},
-    {accessorKey:'ue_pseudonym',header:'UE'},
-    {accessorKey:'technology',header:'Tech'},
-    {accessorKey:'serving_node',header:'Serving Node',cell:i=><span className="compact">{i.getValue<string>()??'NOT AVAILABLE'}</span>},
-    {accessorKey:'procedure',header:'Procedure',cell:i=><span className="compact">{i.getValue<string>()}</span>},
-    {accessorKey:'pdu_session_id',header:'PDU ID',cell:i=><span className="mono">{i.getValue<string>()}</span>},
-    {accessorKey:'start_timestamp',header:'Start Time (UTC)',cell:i=><span className="mono compact" title={i.getValue<string>()}>{formatTimestampUtc(i.getValue<string>())}</span>},
-    {accessorKey:'duration_ns',header:'Duration',cell:i=>duration(i.getValue<string>())},
-    {accessorKey:'interfaces',header:'Interfaces',cell:i=><div className="chips">{i.getValue<string[]>().map(x=><span key={x}>{x}</span>)}</div>},
-    {accessorKey:'message_count',header:'Messages'},
-    {accessorKey:'correlation_status',header:'Correlation',cell:i=><StatusBadge value={i.getValue<string>()}/>},
-    {id:'decode',header:'Decode Status',cell:i=><span>{i.row.original.decode_completeness.decoded}/{i.row.original.message_count}</span>},
-    {id:'action',header:'',cell:i=><button className="link-btn" onClick={event=>{event.stopPropagation();openCallFlow(i.row.original)}}>Call Flow <ArrowRight size={13}/></button>}
-  ],[contextParams]);
-  if(sessions.isLoading||datasets.isLoading||ues.isLoading||captureContext.isLoading)return <LoadingState/>;
-  const error=sessions.error||datasets.error||ues.error||captureContext.error;if(error)return <ErrorState error={error as Error} retry={()=>{void sessions.refetch();void datasets.refetch();void ues.refetch();void captureContext.refetch()}}/>;
-  if(captureId&&captureContext.data?.resolution==='DATASET_UNAVAILABLE')return <DatasetUnavailable captureId={captureId} reason={captureContext.data.capture.error??captureContext.data.reason}/>;
-  const selectedDataset=datasets.data?.find(item=>item.dataset_id===datasetId);
-  const zeroSession=!!datasetId&&sessions.data?.data.length===0;
-  return <div className="page-stack">
-    <section className="page-intro"><div><p className="eyebrow">INVESTIGATION · UTC</p><h1>Session Explorer</h1><p>Automatically discovered UE contexts and independently reconstructed PDU sessions.</p></div>{selectedId&&selectedBelongs&&<button className="btn primary" onClick={()=>{const session=sessions.data?.data.find(item=>item.session_id===selectedId);if(session)openCallFlow(session)}}>Open Call Flow <ArrowRight size={15}/></button>}</section>
-    {(captureId||datasetId||datasetScope)&&<section className="context-strip"><div><FileSearch/><span><small>Capture</small><b className="mono">{captureId||'NOT SPECIFIED'}</b></span></div><div><ListTree/><span><small>Dataset</small><b className="mono">{datasetId||`ALL ${datasetScope||'DATASETS'}`}</b></span></div>{probeId&&<div><span><small>Probe</small><b className="mono">{probeId}</b></span></div>}<div><span><small>Sessions</small><b>{sessions.data?.meta.total??0}</b></span></div><StatusBadge value={(selectedDataset?.dataset_kind??datasetScope)||'DATASET_CONTEXT'}/></section>}
-    <section className="filterbar">
-      <label className="search-box wide"><Search/><input aria-label="Search sessions" value={search} onChange={e=>update('search',e.target.value)} placeholder="Session ID, UE or procedure"/></label>
-      <select aria-label="Dataset filter" value={datasetId||(datasetScope?`scope:${datasetScope}`:'')} onChange={e=>updateDataset(e.target.value)}><option value="">All datasets</option><option value="scope:HISTORICAL">Historical datasets</option><option value="scope:CAPTURED_LIVE">Live captures</option><option value="scope:RECOVERED">Recovered datasets</option><option value="scope:DERIVED">Derived datasets</option>{(['HISTORICAL','CAPTURED_LIVE','RECOVERED','DERIVED'] as const).map(kind=><optgroup label={kind==='CAPTURED_LIVE'?'Live capture datasets':`${kind[0]}${kind.slice(1).toLowerCase()} datasets`} key={kind}>{datasets.data?.filter(item=>item.dataset_kind===kind).map(item=><option value={item.dataset_id} key={item.dataset_id}>{item.display_name} · {item.session_count} session{item.session_count===1?'':'s'}</option>)}</optgroup>)}</select>
-      <select aria-label="UE filter" value={ue} onChange={e=>update('ue',e.target.value)}><option value="">All UE contexts</option>{ues.data?.map(item=><option value={item.ue_context_id} key={item.ue_context_id}>{item.ue_pseudonym}</option>)}</select>
-      <select aria-label="Technology filter" value={technology} onChange={e=>update('technology',e.target.value)}><option value="">All technologies</option><option value="5G SA">5G SA</option></select>
-      <select aria-label="Interface filter" value={iface} onChange={e=>update('interface',e.target.value)}><option value="">All interfaces</option><option value="N2">N2</option><option value="SBI">SBI</option><option value="N4">N4</option><option value="N3">N3</option></select>
-      <select aria-label="Session status" value={status} onChange={e=>update('status',e.target.value)}><option value="">All statuses</option><option value="ACTIVE_WITH_USER_PLANE">Active with user plane</option><option value="INCOMPLETE">Incomplete</option><option value="RELEASED">Released</option></select>
-    </section>
-    <section className="panel session-table-panel">{zeroSession?<ZeroSession captureId={captureId} datasetId={datasetId}/>:sessions.data?.data.length?<><DataTable data={sessions.data.data} columns={columns} onRowClick={openSession} selectedId={selectedId} getId={item=>item.session_id}/><Pagination page={sessions.data.meta.page??1} totalPages={sessions.data.meta.total_pages??1} onChange={value=>{setSessionPage(value);const next=new URLSearchParams(params);next.set('page',String(value));setParams(next)}}/></>:<EmptyState title="No sessions match these filters"/>}</section>
-    {selectedId&&!selectedBelongs&&<section className="state-box error"><strong>Session outside the selected dataset</strong><span>OIRAN will not switch to another dataset automatically.</span></section>}
-    {selectedId&&selectedBelongs&&<section className="panel details"><div className="panel-head"><div><h2>{selectedId}</h2><p>Session-associated events stay separate from dataset background.</p></div>{detail.data&&<StatusBadge value={detail.data.summary.correlation_status}/>}</div><div className="tabs page-tabs">{['summary','procedures','messages','correlation','provenance','background'].map(value=><button key={value} className={tab===value?'active':''} onClick={()=>{setTab(value);setEventPage(1)}}>{value}</button>)}</div>{detail.isLoading?<LoadingState/>:detail.data&&<SessionTab tab={tab} detail={detail.data} events={events.data} loading={events.isLoading} page={eventPage} setPage={setEventPage}/>}</section>}
-  </div>;
+function formatDuration(ns: string): string {
+  const n = Number(ns);
+  if (!Number.isFinite(n)) return '—';
+  if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(0)} ms`;
+  return `${(n / 1_000_000_000).toFixed(3)} s`;
 }
 
-function ZeroSession({captureId,datasetId}:{captureId:string;datasetId:string}){const context=new URLSearchParams({dataset_id:datasetId});if(captureId)context.set('capture_id',captureId);return <div className="context-empty"><ListTree/><div><h2>{captureId?'No reconstructed sessions in this capture.':'No reconstructed sessions in this dataset.'}</h2><p>The dataset remains available for packet and decoded-event inspection. OIRAN will not substitute a historical session.</p><div className="header-actions"><Link className="btn primary" to={`/analysis/packets?${context}&view=packets`}>View Packets</Link><Link className="btn" to={`/analysis/packets?${context}&view=decoded`}>View Decoded Events</Link>{captureId&&<Link className="btn" to={`/operations/probes?search=${encodeURIComponent(captureId)}&capture_id=${encodeURIComponent(captureId)}`}>View Capture Details</Link>}</div></div></div>}
+interface DetailResponse {
+  summary: Session;
+  procedures: { name: string; event_ids: string[]; status: string }[];
+  accounting: Record<string, number>;
+  capture_references: string[];
+}
 
-function DatasetUnavailable({captureId,reason}:{captureId:string;reason:string}){return <div className="page-stack"><section className="page-intro"><div><p className="eyebrow">INVESTIGATION</p><h1>Session Explorer</h1></div></section><section className="panel context-empty error"><FileSearch/><div><h2>Dataset unavailable for this capture.</h2><p>{reason}</p><p>Recovery requires an authorized offline recovery operation; OIRAN will not substitute another dataset.</p><Link className="btn" to={`/operations/probes?search=${encodeURIComponent(captureId)}&capture_id=${encodeURIComponent(captureId)}`}>View Capture Details</Link></div></section></div>}
+export function SessionExplorer() {
+  const route = useParams();
+  const navigate = useNavigate();
+  const [params, setParams] = useSearchParams();
+  const [sessionPage, setSessionPage] = useState(Number(params.get('page') ?? 1));
 
-function SessionTab({tab,detail,events,loading,page,setPage}:{tab:string;detail:Detail;events:ApiEnvelope<CallFlowEvent[]>|undefined;loading:boolean;page:number;setPage:(n:number)=>void}){
-  if(tab==='summary')return <div className="detail-grid"><dl className="detail-list"><dt>UE pseudonym</dt><dd>{detail.summary.ue_pseudonym}</dd><dt>PDU Session ID</dt><dd>{detail.summary.pdu_session_id}</dd><dt>Last observed state</dt><dd>{detail.summary.state==='ACTIVE_WITH_USER_PLANE'?'PDU Active':detail.summary.state}</dd><dt>Technology</dt><dd>{detail.summary.technology}</dd><dt>Serving node</dt><dd>{detail.summary.serving_node??'NOT AVAILABLE'}</dd><dt>Interfaces</dt><dd>{detail.summary.interfaces.join(' · ')}</dd></dl><dl className="detail-list"><dt>Start (UTC)</dt><dd className="mono">{formatTimestampUtc(detail.summary.start_timestamp)}</dd><dt>Duration</dt><dd>{duration(detail.summary.duration_ns)}</dd><dt>Session events</dt><dd>{detail.summary.message_count}</dd><dt>Background events</dt><dd>{detail.summary.background_event_count}</dd><dt>Fully decoded</dt><dd>{detail.summary.decode_completeness.decoded}</dd><dt>Partial</dt><dd>{detail.summary.decode_completeness.partial}</dd></dl></div>;
-  if(tab==='procedures')return <div className="procedure-list">{detail.procedures.filter(x=>x.name!=='Background / Lifecycle').map(x=><article key={x.name}><StatusBadge value={x.status}/><div><b>{x.name}</b><p>{x.event_ids.length} observed events</p></div></article>)}</div>;
-  if(tab==='correlation')return <div className="evidence-summary"><StatusBadge value={detail.summary.correlation_status}/><p>Session-scoped evidence is available in Correlation Studio.</p></div>;
-  if(tab==='provenance')return <div className="capture-refs">{detail.capture_references.map(x=><code key={x}>{x}</code>)}</div>;
-  if(tab==='messages'||tab==='background'){if(loading)return <LoadingState/>;return <><div className="message-list">{events?.data.map(e=><article key={e.event_id}><span className="mono time">{formatTimestampUtc(e.timestamp)}</span><StatusBadge value={e.decoding_status}/><div><b>{e.message_name}</b><small>{e.protocol} · {e.interface} · packet {e.packet_references[0]?.packet_number}</small></div></article>)}</div><Pagination page={page} totalPages={events?.meta.total_pages??1} onChange={setPage}/></>}
-  return null;
+  const datasetId = params.get('dataset_id') ?? '';
+  const iface = params.get('interface') ?? '';
+  const correlation = params.get('correlation') ?? '';
+  const search = params.get('search') ?? '';
+
+  const datasets = useQuery({
+    queryKey: ['datasets'],
+    queryFn: () => api<Dataset[]>('/datasets?page_size=100').then((x) => x.data),
+  });
+
+  const sessionQuery = useMemo(() => {
+    const q = new URLSearchParams({
+      page: String(sessionPage),
+      page_size: '25',
+      sort: 'start_timestamp',
+      order: 'desc',
+    });
+    if (datasetId) q.set('dataset_id', datasetId);
+    if (iface) q.set('interface', iface);
+    if (correlation) q.set('correlation', correlation);
+    if (search) q.set('search', search);
+    return q;
+  }, [sessionPage, datasetId, iface, correlation, search]);
+
+  const sessions = useQuery({
+    queryKey: ['sessions', sessionQuery.toString()],
+    queryFn: () =>
+      api<Session[]>(`/sessions?${sessionQuery}`).then((x) => x as ApiEnvelope<Session[]>),
+  });
+
+  const rows = sessions.data?.data ?? [];
+  const selectedId = route.sessionId ?? rows[0]?.session_id;
+  const selected = selectedId
+    ? rows.find((r) => r.session_id === selectedId) ?? rows[0]
+    : rows[0];
+
+  const detail = useQuery({
+    queryKey: ['session-detail', selected?.session_id],
+    queryFn: () =>
+      api<DetailResponse>(`/sessions/${selected!.session_id}`).then((x) => x.data),
+    enabled: !!selected?.session_id,
+  });
+
+  function setParam(key: string, value: string) {
+    const next = new URLSearchParams(params);
+    if (value) next.set(key, value);
+    else next.delete(key);
+    next.delete('page');
+    setSessionPage(1);
+    setParams(next);
+  }
+
+  function openCallFlow(session: Session) {
+    const next = new URLSearchParams(params);
+    next.set('dataset_id', session.dataset_id);
+    navigate(`/investigation/callflow/${encodeURIComponent(session.session_id)}?${next}`);
+  }
+
+  function selectRow(session: Session) {
+    const next = new URLSearchParams(params);
+    next.set('dataset_id', session.dataset_id);
+    navigate(`/investigation/sessions/${encodeURIComponent(session.session_id)}?${next}`);
+  }
+
+  if (sessions.isLoading || datasets.isLoading) return <LoadingState />;
+  const error = sessions.error || datasets.error;
+  if (error)
+    return (
+      <ErrorState
+        error={error as Error}
+        retry={() => {
+          void sessions.refetch();
+          void datasets.refetch();
+        }}
+      />
+    );
+
+  const total = selected
+    ? selected.decode_completeness.decoded +
+      selected.decode_completeness.partial +
+      (selected.message_count -
+        selected.decode_completeness.decoded -
+        selected.decode_completeness.partial)
+    : 1;
+  const protectedCount = selected
+    ? selected.message_count -
+      selected.decode_completeness.decoded -
+      selected.decode_completeness.partial
+    : 0;
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="Investigate"
+        title="Sessions"
+        desc="UE contexts and PDU sessions reconstructed from the captured signalling. UEs appear only as pseudonyms."
+        actions={
+          selected ? (
+            <Btn
+              icon={Waypoints}
+              primary
+              onClick={() => openCallFlow(selected)}
+              data-testid="sessions-open-callflow"
+            >
+              Open call flow
+            </Btn>
+          ) : undefined
+        }
+      />
+
+      <div className="flex flex-wrap gap-2">
+        <select
+          aria-label="Dataset"
+          value={datasetId}
+          onChange={(e) => setParam('dataset_id', e.target.value)}
+          className="h-9 px-3 rounded-md border border-line bg-surface text-md2 text-ink"
+          data-testid="sessions-dataset-filter"
+        >
+          <option value="">All datasets</option>
+          {datasets.data?.map((d) => (
+            <option key={d.dataset_id} value={d.dataset_id}>
+              {d.display_name}
+            </option>
+          ))}
+        </select>
+        <select
+          aria-label="Interface"
+          value={iface}
+          onChange={(e) => setParam('interface', e.target.value)}
+          className="h-9 px-3 rounded-md border border-line bg-surface text-md2 text-ink"
+          data-testid="sessions-interface-filter"
+        >
+          <option value="">All interfaces</option>
+          {['N2', 'SBI', 'N4', 'N3'].map((i) => (
+            <option key={i} value={i}>
+              {i}
+            </option>
+          ))}
+        </select>
+        <select
+          aria-label="Correlation"
+          value={correlation}
+          onChange={(e) => setParam('correlation', e.target.value)}
+          className="h-9 px-3 rounded-md border border-line bg-surface text-md2 text-ink"
+          data-testid="sessions-correlation-filter"
+        >
+          <option value="">Any correlation</option>
+          <option value="STRONG">Exact / strong</option>
+          <option value="POSSIBLE">Possible</option>
+          <option value="UNKNOWN">Unknown</option>
+        </select>
+      </div>
+
+      <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_320px] items-start">
+        <Card className="overflow-hidden">
+          {rows.length === 0 ? (
+            <EmptyState title="No sessions match these filters" />
+          ) : (
+            <div className="overflow-x-auto">
+              <table
+                className="w-full min-w-[760px] text-md2 table-fixed"
+                data-testid="sessions-table"
+              >
+                <colgroup>
+                  <col style={{ width: '26%' }} />
+                  <col style={{ width: '13%' }} />
+                  <col style={{ width: '18%' }} />
+                  <col style={{ width: '9%' }} />
+                  <col style={{ width: '14%' }} />
+                  <col style={{ width: '7%' }} />
+                  <col style={{ width: '13%' }} />
+                </colgroup>
+                <thead>
+                  <tr className="text-left text-xs2 uppercase tracking-wider text-mute border-b border-line">
+                    <th className="px-4 py-2.5 font-semibold">Procedure</th>
+                    <th className="px-3 py-2.5 font-semibold">UE</th>
+                    <th className="px-3 py-2.5 font-semibold">Start (UTC)</th>
+                    <th className="px-3 py-2.5 font-semibold text-right">Duration</th>
+                    <th className="px-3 py-2.5 font-semibold">Interfaces</th>
+                    <th className="px-3 py-2.5 font-semibold text-right">Msgs</th>
+                    <th className="px-3 py-2.5 font-semibold">Correlation</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <tr
+                      key={r.session_id}
+                      onClick={() => selectRow(r)}
+                      aria-selected={selected?.session_id === r.session_id}
+                      data-testid={`session-row-${r.session_id}`}
+                      className={`border-b border-line last:border-0 cursor-pointer ${
+                        selected?.session_id === r.session_id
+                          ? 'bg-brand-soft'
+                          : 'hover:bg-canvas'
+                      }`}
+                    >
+                      <td className="px-4 py-3 max-w-[260px] overflow-hidden">
+                        {/* 2.4.0 fix: Procedure + mono session hash on a
+                            second mute line. The wrapper locks the cell
+                            to max-w-[260px] + truncate so the long hash
+                            never bleeds into neighbour columns at 1280
+                            / 1440 / 1920. `title` reveals the full id. */}
+                        <p className="font-medium truncate" title={r.procedure}>
+                          {r.procedure}
+                        </p>
+                        <p
+                          className="mono text-xs2 text-mute truncate"
+                          data-testid={`session-id-${r.session_id}`}
+                          title={r.session_id}
+                        >
+                          {r.session_id}
+                          {r.serving_node ? ` · ${r.serving_node}` : ''}
+                        </p>
+                      </td>
+                      <td
+                        className="px-3 py-3 mono text-sm2 whitespace-nowrap overflow-hidden text-ellipsis"
+                        title={r.ue_pseudonym}
+                      >
+                        {r.ue_pseudonym}
+                      </td>
+                      <td className="px-3 py-3 mono text-sm2 whitespace-nowrap">
+                        {formatTimestampUtc(r.start_timestamp)}
+                      </td>
+                      <td className="px-3 py-3 mono text-right whitespace-nowrap">
+                        {formatDuration(r.duration_ns)}
+                      </td>
+                      <td className="px-3 py-3">
+                        <span className="flex gap-1 flex-wrap">
+                          {r.interfaces.map((i) => (
+                            <IfChip key={i} i={i} />
+                          ))}
+                        </span>
+                      </td>
+                      <td className="px-3 py-3 mono text-right">{r.message_count}</td>
+                      <td className="px-3 py-3">
+                        <Pill tone={confTone(r.correlation_status)}>
+                          {r.correlation_status}
+                        </Pill>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div className="flex items-center justify-between px-4 py-2.5 border-t border-line text-sm2 text-mute">
+            <span>
+              {sessions.data?.meta.total ?? rows.length} sessions
+            </span>
+            <span>
+              Page {sessions.data?.meta.page ?? 1} of{' '}
+              {sessions.data?.meta.total_pages ?? 1}
+            </span>
+          </div>
+        </Card>
+
+        {selected ? (
+          <Card
+            className="p-5 flex flex-col gap-4 xl:sticky xl:top-4"
+            data-testid="sessions-detail"
+          >
+            <div>
+              <p className="text-xs2 font-semibold uppercase tracking-wider text-mute">
+                Selected session
+              </p>
+              <h2 className="text-xl2 font-semibold">{selected.procedure}</h2>
+              <p className="mono text-xs2 text-mute break-all" title={selected.session_id}>
+                {selected.session_id}
+              </p>
+            </div>
+            <dl className="grid grid-cols-2 gap-x-4 gap-y-3">
+              <div className="min-w-0">
+                <dt className="text-xs2 uppercase tracking-wider text-mute">UE pseudonym</dt>
+                <dd className="mono text-sm2 truncate" title={selected.ue_pseudonym}>
+                  {selected.ue_pseudonym}
+                </dd>
+              </div>
+              <div className="min-w-0">
+                <dt className="text-xs2 uppercase tracking-wider text-mute">PDU session</dt>
+                <dd className="mono text-sm2">{selected.pdu_session_id}</dd>
+              </div>
+              <div className="min-w-0">
+                <dt className="text-xs2 uppercase tracking-wider text-mute">Serving node</dt>
+                <dd className="mono text-sm2 truncate">{selected.serving_node ?? '—'}</dd>
+              </div>
+              <div className="min-w-0">
+                <dt className="text-xs2 uppercase tracking-wider text-mute">Technology</dt>
+                <dd className="text-sm2">{selected.technology}</dd>
+              </div>
+              <div className="min-w-0">
+                <dt className="text-xs2 uppercase tracking-wider text-mute">Duration</dt>
+                <dd className="mono text-sm2">{formatDuration(selected.duration_ns)}</dd>
+              </div>
+              <div className="min-w-0">
+                <dt className="text-xs2 uppercase tracking-wider text-mute">
+                  Background events
+                </dt>
+                <dd className="mono text-sm2">{selected.background_event_count}</dd>
+              </div>
+            </dl>
+            <dl className="grid gap-y-3">
+              <div className="min-w-0">
+                <dt className="text-xs2 uppercase tracking-wider text-mute">Start (UTC)</dt>
+                <dd className="mono text-sm2">{formatTimestampUtc(selected.start_timestamp)}</dd>
+              </div>
+              <div className="min-w-0">
+                <dt className="text-xs2 uppercase tracking-wider text-mute">Dataset</dt>
+                <dd className="mono text-sm2 truncate" title={selected.dataset_id}>
+                  {selected.dataset_id}
+                </dd>
+              </div>
+            </dl>
+            <div>
+              <p className="text-xs2 font-semibold uppercase tracking-wider text-mute mb-1.5">
+                Decode completeness · {selected.message_count} messages
+              </p>
+              <div
+                className="flex h-2 rounded-full overflow-hidden bg-track"
+                role="img"
+                aria-label={`${selected.decode_completeness.decoded} decoded, ${selected.decode_completeness.partial} partial, ${protectedCount} protected`}
+              >
+                <div
+                  className="bg-ok"
+                  style={{ width: `${(selected.decode_completeness.decoded / total) * 100}%` }}
+                />
+                <div
+                  className="bg-warn"
+                  style={{ width: `${(selected.decode_completeness.partial / total) * 100}%` }}
+                />
+                <div
+                  className="bg-vio"
+                  style={{ width: `${(protectedCount / total) * 100}%` }}
+                />
+              </div>
+              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm2 text-mute">
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-ok" />
+                  Decoded {selected.decode_completeness.decoded}
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-warn" />
+                  Partial {selected.decode_completeness.partial}
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-vio" />
+                  NAS protected {protectedCount}
+                </span>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2 border-t border-line pt-3">
+              <Btn icon={Waypoints} primary onClick={() => openCallFlow(selected)}>
+                Call flow
+              </Btn>
+              <Link
+                to={`/investigation/correlation/${encodeURIComponent(selected.session_id)}`}
+                className="inline-flex items-center gap-1.5 h-9 px-4 rounded-md text-md2 font-medium border border-line bg-surface hover:bg-canvas text-ink"
+              >
+                Correlation
+              </Link>
+            </div>
+            {detail.isLoading ? (
+              <p className="text-xs2 text-mute">Loading detail…</p>
+            ) : null}
+          </Card>
+        ) : null}
+      </div>
+    </>
+  );
 }
