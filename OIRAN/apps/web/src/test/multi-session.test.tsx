@@ -49,7 +49,13 @@ describe('multi-session navigation fixture', () => {
     );
     expect(await screen.findByRole('link', { name: /s1/ })).toBeVisible();
     await userEvent.click(screen.getByRole('link', { name: /s2/ }));
-    expect(await screen.findByText('s2', { selector: '.page-intro .mono' })).toBeVisible();
+    // 2.5.0 — the Call Flow header now uses the mockup PageHeader
+    // (data-testid="page-header"), with the session id baked into the
+    // eyebrow line "Investigate · <session_id>". The test guarantees that
+    // picking s2 actually navigates to the s2 call flow and triggers the
+    // right API call.
+    const header = await screen.findByTestId('page-header');
+    expect(header.textContent).toMatch(/Investigate · s2/);
     expect(vi.mocked(api)).toHaveBeenCalledWith('/sessions/s2/callflow');
   });
 });

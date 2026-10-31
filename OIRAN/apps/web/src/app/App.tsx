@@ -1,2 +1,47 @@
-import{Navigate,Route,Routes}from'react-router-dom';import{AppShell}from'../layouts/AppShell';import{Overview}from'../pages/Overview';import{ProbeManager}from'../pages/ProbeManager';import{SessionExplorer}from'../pages/SessionExplorer';import{CallFlowViewer}from'../pages/CallFlowViewer';import{CorrelationStudio}from'../pages/CorrelationStudio';import{PacketAnalyzer}from'../pages/PacketAnalyzer';import{ExportReports,LiveMonitoring}from'../pages/ReportsPages';import{SettingsPage,VersionsPage}from'../pages/PlatformPages';
-export function App(){return <Routes><Route element={<AppShell/>}><Route index element={<Navigate to="/overview" replace/>}/><Route path="/overview" element={<Overview/>}/><Route path="/operations/probes" element={<ProbeManager/>}/><Route path="/investigation/sessions" element={<SessionExplorer/>}/><Route path="/investigation/sessions/:sessionId" element={<SessionExplorer/>}/><Route path="/investigation/callflow" element={<CallFlowViewer/>}/><Route path="/investigation/callflow/:sessionId" element={<CallFlowViewer/>}/><Route path="/investigation/correlation" element={<CorrelationStudio/>}/><Route path="/investigation/correlation/:sessionId" element={<CorrelationStudio/>}/><Route path="/analysis/packets" element={<PacketAnalyzer/>}/><Route path="/reports/exports" element={<ExportReports/>}/><Route path="/reports/monitoring" element={<LiveMonitoring/>}/><Route path="/platform/settings" element={<SettingsPage/>}/><Route path="/platform/versions" element={<VersionsPage/>}/><Route path="*" element={<Navigate to="/overview" replace/>}/></Route></Routes>}
+import { Navigate, Route, Routes } from 'react-router-dom';
+import { AppShell } from '../layouts/AppShell';
+import { Overview } from '../pages/Overview';
+import { ProbeManager } from '../pages/ProbeManager';
+import { SessionExplorer } from '../pages/SessionExplorer';
+import { CallFlowViewer } from '../pages/CallFlowViewer';
+import { CorrelationStudio } from '../pages/CorrelationStudio';
+import { PacketAnalyzer } from '../pages/PacketAnalyzer';
+import { Datasets } from '../pages/Datasets';
+import { ExportReports, LiveMonitoring } from '../pages/ReportsPages';
+import { SettingsPage, VersionsPage } from '../pages/PlatformPages';
+
+export function App() {
+  return (
+    <Routes>
+      <Route element={<AppShell />}>
+        <Route index element={<Navigate to="/overview" replace />} />
+        <Route path="/overview" element={<Overview />} />
+        {/* 2.4.0 — primary nav items. */}
+        <Route path="/investigation/sessions" element={<SessionExplorer />} />
+        <Route
+          path="/investigation/sessions/:sessionId"
+          element={<SessionExplorer />}
+        />
+        <Route path="/investigation/callflow" element={<CallFlowViewer />} />
+        <Route
+          path="/investigation/callflow/:sessionId"
+          element={<CallFlowViewer />}
+        />
+        <Route path="/investigation/correlation" element={<CorrelationStudio />} />
+        <Route
+          path="/investigation/correlation/:sessionId"
+          element={<CorrelationStudio />}
+        />
+        <Route path="/analysis/packets" element={<PacketAnalyzer />} />
+        <Route path="/evidence/datasets" element={<Datasets />} />
+        <Route path="/reports/exports" element={<ExportReports />} />
+        {/* 2.4.0 — kept reachable by URL only. */}
+        <Route path="/operations/probes" element={<ProbeManager />} />
+        <Route path="/reports/monitoring" element={<LiveMonitoring />} />
+        <Route path="/platform/settings" element={<SettingsPage />} />
+        <Route path="/platform/versions" element={<VersionsPage />} />
+        <Route path="*" element={<Navigate to="/overview" replace />} />
+      </Route>
+    </Routes>
+  );
+}

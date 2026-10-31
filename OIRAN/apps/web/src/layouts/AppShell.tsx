@@ -1,59 +1,52 @@
+// 2.4.0 — AppShell rebuilt against docs/ui-mockups/oiran-analyzer.html.
+// Sidebar collapses to the 2 mockup sections (Investigate / Evidence) with
+// the 7 mockup items; Probe Manager, Live Monitoring, Settings and Module
+// Versions stay reachable by direct URL for backward-compat. Topbar
+// collapses to the mockup row: search + vProbe live-dot + 5G SA chip +
+// Light/Dark 2-state toggle. The identity note stays in the sidebar
+// footer: subscriber identities are never stored or shown.
+
 import { useEffect, useState } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
+import clsx from 'clsx';
 import {
-  Activity, BarChart3, Braces, ChevronLeft, ChevronRight, CircleUserRound,
-  Download, FileSearch, GitBranch, Menu, Network, RadioTower, Search,
-  Settings, Waypoints,
+  Activity, BarChart3, ChevronLeft, ChevronRight, Database,
+  Download, FileSearch, Link as LinkIcon, Menu, Moon, Radio, Search,
+  Shield, Sun, Waypoints,
 } from 'lucide-react';
 import { api } from '../services/api';
-import type { AuthState, Metrics, Module } from '../types/api';
+import type { AuthState, Metrics } from '../types/api';
 
-type Theme = 'light' | 'dark' | 'system';
+type Theme = 'light' | 'dark';
 
-const icons: Record<string, typeof Activity> = {
-  overview: BarChart3,
-  'probe-manager': RadioTower,
-  'session-explorer': Activity,
-  'callflow-viewer': Waypoints,
-  'correlation-studio': Network,
-  'packet-analyzer': FileSearch,
-  'export-reports': Download,
-  'live-monitoring': Activity,
-  settings: Settings,
-  'module-versions': Braces,
-};
-
-// LOT 3 — docs/ui-mockups/oiran-analyzer.html: the Analyzer sidebar now
-// splits into two groups ("Investigate" and "Evidence"). Probe Manager
-// has its own app (apps/probe-manager) and no longer appears here; the
-// `operations` section is intentionally omitted from `ordered` below so
-// any module the backend still tags that way is filtered out of the nav.
-const sections: Record<string, string> = {
-  overview: 'INVESTIGATE',
-  investigation: 'INVESTIGATE',
-  analysis: 'INVESTIGATE',
-  reports: 'EVIDENCE',
-  platform: 'SYSTEM',
-};
-
-const bytes = (value: number | null | undefined) =>
-  value == null ? '—' : `${(value / 1073741824).toFixed(1)}G`;
+const NAV: {
+  id: string;
+  to: string;
+  label: string;
+  Icon: typeof BarChart3;
+  section: 'Investigate' | 'Evidence';
+}[] = [
+  { id: 'overview', to: '/overview', label: 'Overview', Icon: BarChart3, section: 'Investigate' },
+  { id: 'sessions', to: '/investigation/sessions', label: 'Sessions', Icon: Activity, section: 'Investigate' },
+  { id: 'callflow', to: '/investigation/callflow', label: 'Call flow', Icon: Waypoints, section: 'Investigate' },
+  { id: 'correlation', to: '/investigation/correlation', label: 'Correlation', Icon: LinkIcon, section: 'Investigate' },
+  { id: 'packets', to: '/analysis/packets', label: 'Packets', Icon: FileSearch, section: 'Evidence' },
+  { id: 'datasets', to: '/evidence/datasets', label: 'Datasets', Icon: Database, section: 'Evidence' },
+  { id: 'exports', to: '/reports/exports', label: 'Exports', Icon: Download, section: 'Evidence' },
+];
 
 export function AppShell() {
   const [collapsed, setCollapsed] = useState(
     () => localStorage.getItem('oiran.sidebar') === 'collapsed',
   );
   const [theme, setTheme] = useState<Theme>(
-    () => (localStorage.getItem('oiran.theme') as Theme) || 'dark',
+    () => ((localStorage.getItem('oiran.theme') as Theme) || 'dark'),
   );
   const [search, setSearch] = useState('');
   const navigate = useNavigate();
   const location = useLocation();
-  const modules = useQuery({
-    queryKey: ['modules'],
-    queryFn: () => api<Module[]>('/modules').then((value) => value.data),
-  });
+
   const metrics = useQuery({
     queryKey: ['shell-metrics'],
     queryFn: () => api<Metrics>('/metrics').then((value) => value.data),
@@ -65,101 +58,190 @@ export function AppShell() {
   });
 
   useEffect(() => {
-    const media = matchMedia('(prefers-color-scheme: dark)');
-    const apply = () => {
-      const resolved = theme === 'system' ? (media.matches ? 'dark' : 'light') : theme;
-      document.documentElement.dataset.theme = resolved;
-      document.documentElement.style.colorScheme = resolved;
-    };
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
     localStorage.setItem('oiran.theme', theme);
-    apply();
-    media.addEventListener('change', apply);
-    return () => media.removeEventListener('change', apply);
   }, [theme]);
 
-  const breadcrumb = location.pathname
-    .split('/')
-    .filter(Boolean)
-    .map((part) => part.replaceAll('-', ' '));
-  // "operations" (Probe Manager) is excluded on purpose — see sections map.
-  const ordered = ['overview', 'investigation', 'analysis', 'reports', 'platform'];
-
+  const isDark = theme === 'dark';
   function submit(event: React.FormEvent) {
     event.preventDefault();
     navigate(`/investigation/sessions?search=${encodeURIComponent(search)}`);
   }
 
+  // Live-dot colour: ok when any metric is non-null (API reachable), mute otherwise.
+  const vprobeOnline = metrics.data != null;
+
   return (
-    <div className={`app-shell ${collapsed ? 'sidebar-collapsed' : ''}`}>
-      <aside className="sidebar">
-        <div className="sidebar-brand">
-          <span className="logo-mark small"><RadioTower size={18} /></span>
-          {!collapsed && <div><b>OIRAN</b><span>Signaling Intelligence</span></div>}
+    <div
+      className="min-h-screen flex flex-col md:flex-row bg-canvas text-ink"
+      data-testid="oiran-shell"
+    >
+      <aside
+        className={clsx(
+          'shrink-0 bg-sidebar border-b md:border-b-0 md:border-r border-line md:min-h-screen flex flex-col',
+          collapsed ? 'md:w-16' : 'md:w-56',
+        )}
+        aria-label="Primary navigation"
+      >
+        <div className="flex items-center gap-2.5 py-4 px-4">
+          <div
+            className="grid place-items-center h-8 w-8 rounded-lg bg-ok text-white"
+            aria-hidden="true"
+          >
+            <Radio width={17} height={17} />
+          </div>
+          {!collapsed ? (
+            <div className="leading-tight">
+              <p className="text-md2 font-semibold">OIRAN Analyzer</p>
+              <p className="text-sm2 text-mute">Signalling evidence</p>
+            </div>
+          ) : null}
         </div>
-        <nav aria-label="Primary navigation">
-          {ordered.map((section, index) => {
-            const items = modules.data?.filter(
-              (module) => module.navigation.section === section && module.enabled,
-            ) ?? [];
-            if (!items.length) return null;
-            const showLabel = index === 0 || sections[ordered[index - 1]] !== sections[section];
-            return (
-              <div className="nav-section" key={section}>
-                {!collapsed && showLabel && <div className="nav-label">{sections[section]}</div>}
-                {items.map((module) => {
-                  const Icon = icons[module.module_id] ?? GitBranch;
-                  return (
-                    <NavLink to={module.route} key={module.module_id} title={module.navigation.label}>
-                      <Icon size={17} />
-                      {!collapsed && <span>{module.navigation.label}</span>}
-                    </NavLink>
-                  );
-                })}
-              </div>
-            );
-          })}
+        <nav
+          className="flex md:flex-col gap-1 overflow-x-auto md:overflow-visible pb-3 md:pb-0 flex-1 px-3"
+          aria-label="Primary"
+        >
+          {(['Investigate', 'Evidence'] as const).map((section) => (
+            <div key={section} className="flex md:flex-col gap-1 md:mb-3">
+              {!collapsed ? (
+                <p className="hidden md:block px-2 py-1 text-xs2 font-semibold uppercase tracking-wider text-mute">
+                  {section}
+                </p>
+              ) : null}
+              {NAV.filter((n) => n.section === section).map(({ id, to, label, Icon }) => (
+                <NavLink
+                  key={id}
+                  to={to}
+                  title={collapsed ? label : undefined}
+                  className={({ isActive }) =>
+                    clsx(
+                      'flex items-center gap-2.5 whitespace-nowrap rounded-md px-2.5 py-2 text-md2 transition-colors',
+                      isActive
+                        ? 'bg-surface text-ink font-medium shadow-e1'
+                        : 'text-mute hover:text-ink hover:bg-surface',
+                    )
+                  }
+                >
+                  <Icon width={16} height={16} aria-hidden="true" />
+                  {!collapsed ? <span>{label}</span> : null}
+                </NavLink>
+              ))}
+            </div>
+          ))}
+          {!collapsed ? (
+            <div className="hidden md:flex mt-2 mx-2 border-t border-line pt-3 gap-2 text-sm2 text-mute">
+              <Shield width={15} height={15} className="shrink-0 mt-0.5" />
+              <span>
+                Subscriber identities (IMSI, IMEI, TMSI, GUTI) are never stored or shown.
+              </span>
+            </div>
+          ) : null}
         </nav>
         <button
-          className="collapse"
-          aria-label="Toggle sidebar"
-          onClick={() => setCollapsed((value) => {
-            localStorage.setItem('oiran.sidebar', !value ? 'collapsed' : 'open');
-            return !value;
-          })}
+          type="button"
+          onClick={() =>
+            setCollapsed((value) => {
+              localStorage.setItem('oiran.sidebar', !value ? 'collapsed' : 'open');
+              return !value;
+            })
+          }
+          aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          data-testid="sidebar-toggle"
+          className="border-t border-line py-2 text-mute hover:text-ink text-xs2 flex items-center justify-center gap-2"
         >
-          {collapsed ? <ChevronRight /> : <><ChevronLeft /><span>Collapse</span></>}
+          {collapsed ? (
+            <ChevronRight width={14} height={14} />
+          ) : (
+            <>
+              <ChevronLeft width={14} height={14} />
+              <span>Collapse</span>
+            </>
+          )}
         </button>
       </aside>
-      <section className="workspace">
-        <header className="topbar">
-          <button className="mobile-menu" aria-label="Menu"><Menu /></button>
-          <div className="product-title"><b>OIRAN Analyzer</b><small>{breadcrumb.at(-1) ?? 'overview'}</small></div>
-          <form className="global-search" onSubmit={submit}>
-            <Search size={15} />
-            <input aria-label="Global search" placeholder="Search session or message" value={search} onChange={(event) => setSearch(event.target.value)} />
+      <section className="flex-1 min-w-0 flex flex-col">
+        <header
+          className="flex flex-wrap items-center justify-between gap-3 border-b border-line bg-surface py-2.5 px-4"
+          data-testid="topbar"
+        >
+          <button
+            type="button"
+            className="md:hidden text-mute hover:text-ink"
+            aria-label="Menu"
+          >
+            <Menu width={18} height={18} />
+          </button>
+          <form onSubmit={submit} className="relative flex-1 min-w-[220px] max-w-md">
+            <label className="sr-only" htmlFor="oiran-topbar-search">
+              Search sessions
+            </label>
+            <Search
+              width={15}
+              height={15}
+              className="absolute left-3 top-1/2 -translate-y-1/2 text-mute"
+              aria-hidden
+            />
+            <input
+              id="oiran-topbar-search"
+              placeholder="Session ID, UE pseudonym or procedure"
+              className="w-full h-9 pl-9 pr-3 rounded-md border border-line bg-canvas text-md2 placeholder:text-mute text-ink"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+            />
           </form>
-          <select aria-label="Environment"><option>Certified Lab</option></select>
-          <select aria-label="Technology"><option>5G SA</option><option disabled>LTE · Not certified</option></select>
-          <span className="connection"><i />vProbe connected</span>
-          <div className="interface-indicators">
-            {metrics.data?.interfaces.map((item) => <span key={item.interface}><i />{item.interface} REF</span>)}
+          <div className="flex flex-wrap items-center gap-3 text-sm2 text-mute">
+            <span
+              className="inline-flex items-center gap-1.5"
+              data-testid="vprobe-status"
+            >
+              <span
+                className={clsx(
+                  'h-2 w-2 rounded-full',
+                  vprobeOnline ? 'bg-ok live-dot' : 'bg-mute',
+                )}
+                aria-hidden
+              />
+              <span className="text-ink">
+                {vprobeOnline ? 'vProbe connected' : 'vProbe unreachable'}
+              </span>
+            </span>
+            <span className="num" data-testid="topbar-tech">
+              5G SA
+            </span>
+            {auth.data?.role ? (
+              <span
+                className="rounded border border-line px-1.5 py-0.5 text-xs2"
+                data-testid="header-identity"
+              >
+                {auth.data.role}
+              </span>
+            ) : null}
+            <button
+              type="button"
+              onClick={() => setTheme(isDark ? 'light' : 'dark')}
+              className="inline-flex items-center gap-2 h-8 px-3 rounded-md border border-line text-sm2 text-ink hover:bg-canvas"
+              aria-label="Toggle colour theme"
+              data-testid="theme-toggle"
+            >
+              {isDark ? (
+                <Sun width={14} height={14} />
+              ) : (
+                <Moon width={14} height={14} />
+              )}
+              {isDark ? 'Light' : 'Dark'}
+            </button>
           </div>
-          <div className="resource-summary">
-            <span>Disk <b>{metrics.data?.disk ? `${metrics.data.disk.usage_percent.toFixed(0)}%` : '—'}</b></span>
-            <span>CPU <b>{metrics.data?.cpu.usage_percent == null ? `L${metrics.data?.cpu.load_one ?? '—'}` : `${metrics.data.cpu.usage_percent.toFixed(0)}%`}</b></span>
-            <span>RAM <b>{bytes(metrics.data?.memory.available_bytes)}</b></span>
-          </div>
-          <label className="theme-select">
-            <span>Theme</span>
-            <select aria-label="Theme" value={theme} onChange={(event) => setTheme(event.target.value as Theme)}>
-              <option value="dark">Dark</option>
-              <option value="light">Light</option>
-              <option value="system">System</option>
-            </select>
-          </label>
-          <div className="user"><CircleUserRound /><span>{auth.data?.role === 'viewer' ? 'Public viewer' : auth.data?.role ?? 'Unknown'}</span></div>
         </header>
-        <main className="page"><Outlet /></main>
+        <main
+          className="flex-1 min-w-0 flex flex-col gap-5 px-4 md:px-6 py-6"
+          data-testid="main"
+        >
+          <Outlet />
+        </main>
+        <p className="sr-only" data-testid="active-route">
+          {location.pathname}
+        </p>
       </section>
     </div>
   );
