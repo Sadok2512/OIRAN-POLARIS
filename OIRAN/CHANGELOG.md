@@ -1,5 +1,18 @@
 # Changelog
 
+## Real-lab read model / API 2.7.0 / live-probe 0.4.0 / Analyzer 2.7.0 — 2026-10-31
+
+- Disable bundled reference dataset loading by default; operational Session Explorer,
+  Call Flow and Dataset Library now read only persisted CaptureManager datasets and
+  atomically admitted LTE evidence. Reference artifacts require the explicit
+  `OIRAN_REFERENCE_DATASET_ENABLED=1` test/reference switch.
+- Catalog finalized LTE evidence datasets with bounded, line-oriented session lookup
+  and Call Flow pagination. Empty LTE observations remain empty/`UNKNOWN`.
+- Derive radio technology from observed planes, preserve missing counters as `null`,
+  and remove generated UE/PDU/context placeholders from operational responses.
+- Apply defense-in-depth subscriber-identity withholding to session and Call Flow
+  responses while retaining source-file provenance as `capture://` references.
+
 ## LTE evidence pipeline 1.1.0 / API 2.6.0 / live-probe 0.3.0 — 2026-10-31
 
 - Add the ANR1 V2 evidence adapter, canonical plane aliases and fail-closed

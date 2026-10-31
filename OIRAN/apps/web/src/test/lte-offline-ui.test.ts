@@ -4,9 +4,11 @@ import appShell from '../layouts/AppShell.tsx?raw';
 import packetAnalyzer from '../pages/PacketAnalyzer.tsx?raw';
 
 describe('LTE offline Analyzer contract', () => {
-  it('keeps LTE visibly synthetic-only and exposes all offline planes', () => {
-    expect(sessionExplorer).toContain('LTE · Prepared (synthetic only)');
-    expect(appShell).toContain('LTE · Prepared (synthetic only)');
+  it('keeps LTE availability evidence-driven and exposes all offline planes', () => {
+    expect(sessionExplorer).toContain("hasObservedLte?'LTE · observed dataset':'LTE · no observed dataset'");
+    expect(sessionExplorer).not.toContain('LTE · Prepared (synthetic only)');
+    expect(appShell).toContain('observedTechnologies');
+    expect(appShell).not.toContain('LTE · Prepared (synthetic only)');
     for (const plane of ['S1-MME', 'S11', 'S1-U']) expect(sessionExplorer).toContain(plane);
   });
 

@@ -2,6 +2,17 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.7.0-pre.1+real.lab.1 — 2026-10-31 (real-lab truthfulness)
+
+- Replace the hardcoded connected-vProbe and synthetic-only technology claims
+  with `/probes`, `/datasets` and `/metrics` observations. Pending or missing
+  probe state is rendered as not connected or `UNKNOWN`.
+- Add cursor pagination to Call Flow Viewer using the backend's bounded
+  `limit=100` contract, with exact returned and total event counts.
+- Preserve subscriber-identity withholding and show LTE as observed only when
+  an LTE dataset is actually returned by the API.
+- No capture, traffic, live UE or deployment action is introduced.
+
 ## 2.6.0-pre.1+lte.offline.1 — 2026-10-31 (test-only certification increment)
 
 - Add Analyzer regression checks that preserve both LTE synthetic-only labels

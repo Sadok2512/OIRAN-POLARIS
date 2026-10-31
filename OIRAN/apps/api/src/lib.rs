@@ -15,7 +15,9 @@ use dataset_registry::{CaptureRecord, DatasetRecord, DatasetRegistry};
 use disk_safety::{assess, capture_budget, measure_path, rotation_plan, Policy};
 use event_schema::sha256_hex;
 use live_probe::{
-    lte_evidence::{LteEvidenceError, LteEvidenceImportRequest, LteEvidenceStore},
+    lte_evidence::{
+        LteDatasetManifest, LteEvidenceError, LteEvidenceImportRequest, LteEvidenceStore,
+    },
     read_callflow_page, CaptureManager, CaptureRequest, ContinuousImportConfig,
     DEFAULT_CALLFLOW_PAGE_EVENTS, DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES, MAX_CALLFLOW_PAGE_EVENTS,
 };
@@ -23,7 +25,8 @@ use probe_registry::{CreateError as ProbeCreateError, ProbeInput, ProbeRecord, P
 use serde::Deserialize;
 use serde_json::{json, Value};
 use session_engine::{
-    discover_sessions, load_path, reconstruct, Association, DiscoveryResult, ReconstructionHints,
+    discover_sessions, load_path, reconstruct, Association, DiscoveryResult, LteSession,
+    ReconstructionHints,
 };
 use std::{
     collections::BTreeMap,
@@ -37,8 +40,8 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.6.0";
-pub const PLATFORM_VERSION: &str = "2.6.0";
+pub const API_VERSION: &str = "2.7.0";
+pub const PLATFORM_VERSION: &str = "2.7.0";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -86,6 +89,9 @@ pub struct ApiConfig {
     pub continuous_import_source: Option<PathBuf>,
     pub continuous_historical_n2_bootstrap: Option<PathBuf>,
     pub continuous_max_segment_bytes: u64,
+    /// Explicit test/reference mode. Operational startup must only expose
+    /// datasets recovered by CaptureManager or admitted by LteEvidenceStore.
+    pub reference_dataset_enabled: bool,
 }
 
 impl ApiConfig {
@@ -126,6 +132,9 @@ impl ApiConfig {
                 .ok()
                 .map(|value| value.parse::<u64>().unwrap_or(0))
                 .unwrap_or(DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES),
+            reference_dataset_enabled: cfg!(test)
+                || std::env::var("OIRAN_REFERENCE_DATASET_ENABLED")
+                    .is_ok_and(|value| value == "1"),
         }
     }
 }
@@ -190,6 +199,9 @@ impl AppState {
         config: ApiConfig,
         capture_manager: CaptureManager,
     ) -> Result<Self, String> {
+        if !config.reference_dataset_enabled {
+            return Self::load_operational(config, capture_manager);
+        }
         let workspace = config.workspace.canonicalize().map_err(io_error)?;
         let dataset_dir = config.dataset_dir.canonicalize().map_err(io_error)?;
         let callflow_json = config.callflow_json.canonicalize().map_err(io_error)?;
@@ -382,6 +394,67 @@ impl AppState {
             }),
         })
     }
+
+    fn load_operational(
+        config: ApiConfig,
+        capture_manager: CaptureManager,
+    ) -> Result<Self, String> {
+        let workspace = config.workspace.canonicalize().map_err(io_error)?;
+        let capture_root = config.capture_root;
+        if !capture_root.starts_with(&workspace)
+            && capture_root != FsPath::new("/var/lib/oiran/captures")
+            && !cfg!(test)
+        {
+            return Err("capture root escapes workspace".into());
+        }
+        if !config.probe_registry_path.starts_with(&workspace)
+            && !config.probe_registry_path.starts_with("/var/lib/oiran")
+            && !cfg!(test)
+        {
+            return Err("probe registry path escapes the allowlist".into());
+        }
+        let probe_registry = ProbeRegistry::load(config.probe_registry_path)?;
+        let derived_import_root = config
+            .derived_import_root
+            .canonicalize()
+            .map_err(io_error)?;
+        if !derived_import_root.starts_with(&workspace) && !cfg!(test) {
+            return Err("derived import root escapes workspace".into());
+        }
+        for path in [&config.lte_evidence_root, &config.lte_evidence_bundle_root] {
+            if !path.starts_with(&workspace) && !path.starts_with("/var/lib/oiran") && !cfg!(test) {
+                return Err("LTE evidence path escapes the allowlist".into());
+            }
+            fs::create_dir_all(path).map_err(io_error)?;
+        }
+        let lte_evidence_store = LteEvidenceStore::new(config.lte_evidence_root.clone())
+            .map_err(|error| error.to_string())?;
+        let lte_evidence_bundle_root = config
+            .lte_evidence_bundle_root
+            .canonicalize()
+            .map_err(io_error)?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                flows: BTreeMap::new(),
+                flow_values: BTreeMap::new(),
+                flow_paths: BTreeMap::new(),
+                primary_session_id: String::new(),
+                manifest: json!({}),
+                captures: Vec::new(),
+                registry: DatasetRegistry::default(),
+                discovery: discover_sessions(&mut Vec::new()),
+                storage_path: workspace,
+                html_export: config.callflow_html,
+                capture_manager,
+                probe_registry,
+                derived_import_root,
+                lte_evidence_store,
+                lte_evidence_bundle_root,
+                operator_token_sha256: config.operator_token_sha256,
+                administrator_token_sha256: config.administrator_token_sha256,
+            }),
+        })
+    }
 }
 
 fn build_captures(dataset_dir: &FsPath, manifest: &Value) -> Result<Vec<Value>, String> {
@@ -497,12 +570,8 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
     ))
 }
 
-fn primary_flow(state: &AppState) -> &CallFlow {
-    state
-        .inner
-        .flows
-        .get(&state.inner.primary_session_id)
-        .expect("primary flow validated at startup")
+fn primary_flow(state: &AppState) -> Option<&CallFlow> {
+    state.inner.flows.get(&state.inner.primary_session_id)
 }
 
 fn flow_for<'a>(state: &'a AppState, id: &str) -> Option<&'a CallFlow> {
@@ -560,11 +629,11 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 async fn version(State(state): State<AppState>) -> Json<Value> {
     let flow = primary_flow(&state);
     ok(json!({
-        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":"2.3.0-dev",
-        "event_schema":"1.2.0","callflow_schema":flow.schema_version,
+        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":"2.7.0",
+        "event_schema":"1.2.0","callflow_schema":flow.map(|value|value.schema_version.as_str()).unwrap_or("UNKNOWN"),
         "session_engine":session_engine::VERSION,"correlation_engine":"0.2.0","dataset_registry":dataset_registry::VERSION,
         "disk_safety":disk_safety::VERSION,
-        "decoders":flow.decoder_versions
+        "decoders":flow.map(|value|json!(value.decoder_versions)).unwrap_or_else(||json!({}))
     }))
 }
 
@@ -1321,7 +1390,7 @@ fn dataset_values(state: &AppState) -> Vec<Value> {
                     "display_name":dataset.dataset_id,
                     "dataset_kind":if derived {"DERIVED"} else if recovered {"RECOVERED"} else {"CAPTURED_LIVE"},
                     "source":if derived {"OFFLINE_DERIVED_REPLAY"} else if recovered {"OFFLINE_RECOVERY"} else {"LIVE_CAPTURE"},
-                    "technology":"5G SA",
+                    "technology":technology_from_interfaces(dataset.decode_reports.keys().map(String::as_str)),
                     "capture_id":dataset.capture_id,
                     "captures":[{"capture_id":dataset.capture_id,"probe_id":job.as_ref().map(|item|item.probe_id.as_str()).unwrap_or("oiran-vprobe-local-01"),"interface_type":interface_type,"packet_count":packet_count,"size_bytes":size_bytes}],
                     "capture_start_timestamp":job.as_ref().and_then(|item|item.started_epoch_ms),
@@ -1353,7 +1422,48 @@ fn dataset_values(state: &AppState) -> Vec<Value> {
                 }))
             }),
     );
+    if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
+        items.extend(catalog.into_iter().map(|manifest| lte_dataset_summary(&manifest)));
+    }
     items
+}
+
+fn technology_from_interfaces<'a>(interfaces: impl Iterator<Item = &'a str>) -> &'static str {
+    let observed = interfaces.collect::<Vec<_>>();
+    if observed.iter().any(|value| matches!(*value, "S1-MME" | "S11" | "S1-U")) {
+        "LTE"
+    } else if observed.iter().any(|value| matches!(*value, "N2" | "N3" | "N4" | "SBI")) {
+        "5G SA"
+    } else {
+        "UNKNOWN"
+    }
+}
+
+fn lte_dataset_summary(manifest: &LteDatasetManifest) -> Value {
+    json!({
+        "dataset_id":manifest.dataset_id,
+        "display_name":manifest.dataset_id,
+        "dataset_kind":"EVIDENCE",
+        "source":"ADMITTED_SANITIZED_EVIDENCE",
+        "technology":"LTE",
+        "ingestion_status":"IMPORTED",
+        "ingestion_generation":1,
+        "session_count":manifest.session_ids.len(),
+        "session_ids":manifest.session_ids,
+        "ue_context_count":Value::Null,
+        "pdu_session_count":manifest.session_ids.len(),
+        "event_count":manifest.event_count,
+        "normalized_event_count":manifest.event_count,
+        "packet_count":Value::Null,
+        "background_event_count":Value::Null,
+        "unmatched_event_count":Value::Null,
+        "duplicate_observation_count":Value::Null,
+        "error_count":0,
+        "decoder_versions":manifest.decoder_versions,
+        "accounting_status":"ATOMIC_SANITIZED_IMPORT",
+        "sanitization_state":manifest.sanitization_state,
+        "read_only":true
+    })
 }
 
 fn capture_observation(job: Option<&live_probe::CaptureJob>) -> (Option<String>, Option<u64>) {
@@ -1613,8 +1723,12 @@ async fn dataset_sessions(
     Path(id): Path<String>,
     Query(mut query): Query<ListQuery>,
 ) -> Response {
-    if state.inner.registry.get(&id).is_none() && state.inner.capture_manager.dataset(&id).is_none()
-    {
+    let lte_exists = state.inner.lte_evidence_store.catalog().ok().is_some_and(|items| {
+        items.iter().any(|manifest| manifest.dataset_id == id)
+    });
+    if state.inner.registry.get(&id).is_none()
+        && state.inner.capture_manager.dataset(&id).is_none()
+        && !lte_exists {
         return api_error(
             StatusCode::NOT_FOUND,
             "DATASET_NOT_FOUND",
@@ -2015,7 +2129,7 @@ fn session_summary(state: &AppState, flow: &CallFlow) -> Value {
             .trim()
             .to_owned()
         })
-        .unwrap_or_else(|| "NOT AVAILABLE".into());
+        .unwrap_or_else(|| "UNKNOWN".into());
     json!({
         "session_id":flow.session_id,"dataset_id":state.inner.manifest.get("scenario_id"),"ue_context_id":ue_context_id,
         "dataset_kind":"HISTORICAL",
@@ -2090,18 +2204,40 @@ fn live_session_summary(dataset: &live_probe::LiveDataset, flow: &CallFlow) -> V
             .trim()
             .to_owned()
         })
-        .unwrap_or_else(|| "NOT AVAILABLE".into());
+        .unwrap_or_else(|| "UNKNOWN".into());
     json!({
-        "session_id":flow.session_id,"dataset_id":dataset.dataset_id,"ue_context_id":discovered.map(|session|session.ue_context_id.clone()).unwrap_or_else(||format!("live-context-{}",flow.session_id)),
+        "session_id":flow.session_id,"dataset_id":dataset.dataset_id,"ue_context_id":discovered.map(|session|session.ue_context_id.clone()),
         "dataset_kind":if dataset.dataset_id.starts_with("derived-") {"DERIVED"} else if dataset.dataset_id.starts_with("recovered-dataset-") {"RECOVERED"} else if dataset.capture_id == live_probe::CONTINUOUS_CAPTURE_ID && !fresh_flow {"HISTORICAL"} else {"CAPTURED_LIVE"},
-        "technology":flow.technology,"ue_pseudonym":runtime.map(|context|context.internal_ue_id.as_str()).or_else(||context.map(|context|context.pseudonym.as_str())).unwrap_or("PSEUDONYMIZED"),"pdu_session_id":runtime.map(|context|context.pdu_session_id.as_str()).or_else(||discovered.map(|session|session.pdu_session_id.as_str())).unwrap_or("OBSERVED"),"serving_node":serving_node,
+        "technology":flow.technology,"ue_pseudonym":runtime.map(|context|context.internal_ue_id.as_str()).or_else(||context.map(|context|context.pseudonym.as_str())).unwrap_or("UNKNOWN"),"pdu_session_id":runtime.map(|context|context.pdu_session_id.as_str()).or_else(||discovered.map(|session|session.pdu_session_id.as_str())),"serving_node":serving_node,
         "procedure":flow.procedures.iter().map(|procedure|procedure.name.as_str()).collect::<Vec<_>>().join(" + "),
         "start_timestamp":flow.start_timestamp,"end_timestamp":flow.end_timestamp,"interfaces":flow.interfaces,
         "message_count":flow.accounting.session_events,"source_event_count":flow.accounting.source_events,
         "background_event_count":flow.accounting.background_events,"correlation_status":flow.correlation_status.get("E2E"),
         "decode_completeness":{"decoded":decoded,"partial":partial,"unresolved_fields":flow.unresolved_fields},
         "runtime_evidence":runtime.map(|context|json!({"observed_epoch_ms":context.observed_epoch_ms,"provenance":context.provenance,"correlation_status":context.correlation_status,"ue_ip":context.ue_ip,"teids":context.teids,"directions":context.directions})),
-        "state":if dataset.capture_id == live_probe::CONTINUOUS_CAPTURE_ID && !fresh_flow {"HISTORICAL_CONTEXT"} else if fresh_flow {"ACTIVE_WITH_USER_PLANE"} else {"PARTIAL"}
+        "state":if dataset.capture_id == live_probe::CONTINUOUS_CAPTURE_ID && !fresh_flow {"HISTORICAL_CONTEXT"} else if fresh_flow {"ACTIVE_WITH_USER_PLANE"} else {"UNKNOWN"}
+    })
+}
+
+fn lte_session_summary(manifest: &LteDatasetManifest, session: &LteSession) -> Value {
+    let packet_count = session.tunnels.iter().map(|tunnel| {
+        tunnel.uplink_packets + tunnel.downlink_packets + tunnel.unknown_direction_packets
+    }).sum::<usize>();
+    json!({
+        "session_id":session.session_id,"dataset_id":manifest.dataset_id,
+        "ue_context_id":Value::Null,"dataset_kind":"EVIDENCE","technology":"LTE",
+        "ue_pseudonym":session.ue_pseudonym,
+        "pdu_session_id":session.eps_bearer_ids.first().cloned(),"serving_node":Value::Null,
+        "procedure":session.procedures.join(" + "),
+        "start_timestamp":session.start_timestamp_ns.to_string(),
+        "end_timestamp":session.end_timestamp_ns.to_string(),"interfaces":session.interfaces,
+        "message_count":session.event_ids.len(),"duration_ns":session.duration_ns.to_string(),
+        "source_event_count":session.event_ids.len(),"background_event_count":Value::Null,
+        "correlation_status":"UNKNOWN",
+        "decode_completeness":{"decoded":Value::Null,"partial":Value::Null,"unresolved_fields":session.limitations.len()},
+        "state":session.state,
+        "user_plane_packets":if packet_count == 0 { Value::Null } else { Value::from(packet_count) },
+        "limitations":session.limitations
     })
 }
 
@@ -2120,6 +2256,19 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                 .callflow(&dataset.dataset_id, session_id)
             {
                 unique.insert(session_id.clone(), live_session_summary(&dataset, &flow));
+            }
+        }
+    }
+    if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
+        for manifest in catalog {
+            if let Ok(page) = state.inner.lte_evidence_store.session_page(&manifest.run_id, 1, 100) {
+                if let Some(records) = page["data"].as_array() {
+                    for record in records {
+                        if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
+                            unique.insert(session.session_id.clone(), lte_session_summary(&manifest, &session));
+                        }
+                    }
+                }
             }
         }
     }
@@ -2156,6 +2305,7 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
         query.sort.as_deref().unwrap_or("start_timestamp"),
         query.order.as_deref(),
     );
+    sanitize_all(&mut items);
     paginated(items, &query)
 }
 
@@ -2171,6 +2321,21 @@ async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Respo
             .expect("live flow dataset remains registered");
         return ok(json!({"summary":live_session_summary(&dataset,&flow),"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
     }
+    if let Ok(Some((manifest, lte))) = state.inner.lte_evidence_store.find_session(&id) {
+        let procedures = lte.procedures.iter().enumerate().map(|(index, name)| json!({
+            "id":format!("lte-procedure-{index}"),"name":name,"event_ids":[],"status":"OBSERVED"
+        })).collect::<Vec<_>>();
+        let capture_references = manifest.source_capture_sha256.keys()
+            .map(|plane| format!("capture:{plane}"))
+            .collect::<Vec<_>>();
+        let mut value = json!({
+            "summary":lte_session_summary(&manifest,&lte),"procedures":procedures,
+            "accounting":{"source_events":manifest.event_count,"session_events":lte.event_ids.len()},
+            "capture_references":capture_references
+        });
+        sanitize_value(&mut value);
+        return ok(value).into_response();
+    }
     api_error(
         StatusCode::NOT_FOUND,
         "SESSION_NOT_FOUND",
@@ -2184,6 +2349,11 @@ async fn session_procedures(State(state): State<AppState>, Path(id): Path<String
     }
     if let Some((_dataset, flow)) = live_flow_for(&state, &id) {
         return ok(json!(flow.procedures)).into_response();
+    }
+    if let Ok(Some((_manifest, lte))) = state.inner.lte_evidence_store.find_session(&id) {
+        return ok(json!(lte.procedures.iter().enumerate().map(|(index,name)| json!({
+            "id":format!("lte-procedure-{index}"),"name":name,"event_ids":[],"status":"OBSERVED"
+        })).collect::<Vec<_>>())).into_response();
     }
     api_error(
         StatusCode::NOT_FOUND,
@@ -2205,11 +2375,15 @@ async fn session_events(
             .and_then(|value| value.as_array().cloned())
             .unwrap_or_default()
     } else {
-        return api_error(
-            StatusCode::NOT_FOUND,
-            "SESSION_NOT_FOUND",
-            "unknown session id",
-        );
+        match state.inner.lte_evidence_store.callflow_page_by_session(
+            &id,
+            None,
+            MAX_CALLFLOW_PAGE_EVENTS,
+        ) {
+            Ok(Some(value)) => value["events"].as_array().cloned().unwrap_or_default(),
+            Ok(None) => return api_error(StatusCode::NOT_FOUND,"SESSION_NOT_FOUND","unknown session id"),
+            Err(error) => return lte_evidence_error(error),
+        }
     };
     filter_events(&mut items, &query);
     sanitize_all(&mut items);
@@ -2332,10 +2506,13 @@ async fn session_callflow(
     } else if let Some(flow_value) = flow_value_for(&state, &id) {
         callflow_page_from_value(flow_value, cursor, limit).map(Some)
     } else {
-        state
-            .inner
-            .capture_manager
-            .callflow_page_by_session(&id, cursor, limit)
+        match state.inner.capture_manager.callflow_page_by_session(&id, cursor, limit) {
+            Ok(Some(value)) => Ok(Some(value)),
+            Ok(None) => state.inner.lte_evidence_store
+                .callflow_page_by_session(&id, cursor, limit)
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        }
     };
     match result {
         Ok(Some(mut value)) => {
@@ -2357,11 +2534,20 @@ async fn session_correlations(State(state): State<AppState>, Path(id): Path<Stri
     } else if let Some((_dataset, flow)) = live_flow_for(&state, &id) {
         flow
     } else {
-        return api_error(
-            StatusCode::NOT_FOUND,
-            "SESSION_NOT_FOUND",
-            "unknown session id",
-        );
+        return match state.inner.lte_evidence_store.callflow_page_by_session(
+            &id, None, MAX_CALLFLOW_PAGE_EVENTS,
+        ) {
+            Ok(Some(mut flow)) => {
+                let mut value = json!({
+                    "status":flow["correlation_status"].take(),
+                    "edges":flow["correlation_edges"].take()
+                });
+                sanitize_value(&mut value);
+                ok(value).into_response()
+            }
+            Ok(None) => api_error(StatusCode::NOT_FOUND,"SESSION_NOT_FOUND","unknown session id"),
+            Err(error) => lte_evidence_error(error),
+        };
     };
     let mut value = json!({"status":flow.correlation_status,"edges":flow.correlation_edges});
     sanitize_value(&mut value);
@@ -2663,8 +2849,25 @@ fn sanitize_all(values: &mut [Value]) {
 fn sanitize_value(value: &mut Value) {
     match value {
         Value::Object(map) => {
+            let identity_ie = map.get("name").and_then(Value::as_str).is_some_and(|name| {
+                let normalized = name.to_ascii_lowercase();
+                ["imsi","supi","suci","guti","tmsi","imei","authentication key","opc"]
+                    .iter().any(|needle| normalized.contains(needle))
+            });
+            if identity_ie {
+                for field in ["value", "raw_value", "raw_hex", "raw_bytes"] {
+                    if map.contains_key(field) {
+                        map.insert(field.into(), Value::String("IDENTITY_WITHHELD".into()));
+                    }
+                }
+            }
             for (key, v) in map.iter_mut() {
-                if key == "source_file" {
+                let normalized_key = key.to_ascii_lowercase();
+                if ["imsi","supi","suci","guti","tmsi","imei","k","opc","authentication_key"]
+                    .contains(&normalized_key.as_str())
+                {
+                    *v = Value::String("IDENTITY_WITHHELD".into());
+                } else if key == "source_file" {
                     if let Some(path) = v.as_str() {
                         let name = FsPath::new(path)
                             .file_name()
@@ -2678,6 +2881,14 @@ fn sanitize_value(value: &mut Value) {
             }
         }
         Value::Array(items) => sanitize_all(items),
+        Value::String(text) => {
+            let lower = text.to_ascii_lowercase();
+            if ["imsi-", "supi-", "suci-", "5g-guti-", "5g-tmsi-", "imei-"]
+                .iter().any(|prefix| lower.contains(prefix))
+            {
+                *text = "IDENTITY_WITHHELD".into();
+            }
+        }
         _ => {}
     }
 }
@@ -2796,6 +3007,37 @@ mod tests {
                 .status(),
             StatusCode::OK
         )
+    }
+
+    #[tokio::test]
+    async fn operational_mode_never_preloads_reference_sessions() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap();
+        let mut config = test_config(workspace, "operational-real-only");
+        config.reference_dataset_enabled = false;
+        config.capture_root = temporary_directory("operational-captures");
+        let state = AppState::load(config).unwrap();
+        assert!(state.inner.flows.is_empty());
+        assert!(state.inner.registry.list().is_empty());
+        let response = router(state, None)
+            .oneshot(req("/api/v1/sessions", true)).await.unwrap();
+        let body = json_body(response).await;
+        assert_eq!(body["meta"]["total"], 0);
+        assert!(body["data"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn response_sanitizer_withholds_identity_fields_and_identity_ies() {
+        let mut value = json!({
+            "imsi":"synthetic-identity",
+            "nested":{"name":"5G-S-TMSI","value":"sensitive","source_file":"/private/a.pcapng"},
+            "description":"subscriber imsi-SYNTHETIC"
+        });
+        sanitize_value(&mut value);
+        assert_eq!(value["imsi"], "IDENTITY_WITHHELD");
+        assert_eq!(value["nested"]["value"], "IDENTITY_WITHHELD");
+        assert_eq!(value["nested"]["source_file"], "capture://a.pcapng");
+        assert_eq!(value["description"], "IDENTITY_WITHHELD");
     }
     #[tokio::test]
     async fn lte_evidence_import_requires_operator_and_csrf() {
@@ -3201,7 +3443,7 @@ mod tests {
     #[tokio::test]
     async fn provenance_is_sanitized() {
         let fixture = state();
-        let id = primary_flow(&fixture).events[0].event_id.clone();
+        let id = primary_flow(&fixture).unwrap().events[0].event_id.clone();
         let r = router(state(), None)
             .oneshot(req(&format!("/api/v1/events/{id}/provenance"), true))
             .await
@@ -3339,7 +3581,7 @@ mod tests {
     #[tokio::test]
     async fn packet_provenance_filters_resolve_one_exact_packet() {
         let fixture = state();
-        let event = primary_flow(&fixture)
+        let event = primary_flow(&fixture).unwrap()
             .events
             .iter()
             .find(|event| event.protocol == "GTP-U")
