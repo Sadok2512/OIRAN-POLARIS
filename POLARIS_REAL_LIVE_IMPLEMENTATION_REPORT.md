@@ -1,147 +1,104 @@
-# POLARIS real lab live implementation — ANR3 report
+# POLARIS / OIRAN real-lab implementation report
 
-Date: 2026-10-31
+Date: 2026-10-31 UTC
 
-Scope: OIRAN live-data frontend and read-only production audit
+Agents: ANR1 / ANR2 / ANR3
 
-Base: `integ/oiran-polaris-lte-e2e-v2` / `87daa3445e3058352d21efeba21d05fefe3029d4`
+Verdict: **PARTIAL — offline implementation integrated; production and LTE live certification blocked**
 
-Branch: `anr3/oiran-real-lab-ui-v1`
+## Provenance
 
-Production deployment: **not performed**
+| Component | Branch / SHA | Version |
+|---|---|---|
+| Reference base | `87daa3445e3058352d21efeba21d05fefe3029d4` | — |
+| ANR1 contract | `anr1/polaris-real-lab-live-v1` / `8fd3938583a6f76417560240c93ae194337c37a4` | contract v1 |
+| ANR2 POLARIS | `anr2/polaris-real-lab-live-ui` / `84a7833c9b44cecb94e9a267dcd5180455b9ca2a` | API 0.24.0, Simulator 0.17.2 |
+| ANR3 OIRAN | `anr3/oiran-real-lab-ui-v1` / `8c6630db010ea446bf36dc74d71b1783a767e4bf` | API 2.7.0, live-probe 0.4.0, Analyzer 2.7.0 |
+| Integration | `integ/polaris-real-lab-live-v1` | final SHA reported by Git after this document commit |
 
-## Implemented
+All three source SHAs are Git ancestors of the integration branch. Merges used the normal `ort` strategy; no `ours` merge or hidden conflict was used.
 
-- The Analyzer header now reads `/probes`, `/datasets` and `/metrics`; it no
-  longer claims `vProbe connected` when the real registry reports
-  `online=false`, `PROBE_PENDING` and no heartbeat.
-- Technology is derived from observed datasets. LTE is shown as observed only
-  when an LTE dataset exists; otherwise the UI says `LTE · no observed dataset`.
-- Interface chips display the backend state such as `REFERENCE_ONLY`, rather
-  than a hardcoded online state.
-- Call Flow Viewer now uses the real bounded cursor contract
-  (`limit=100`, `cursor`, `next_cursor`) and displays the returned range and
-  total. It no longer silently renders only the first 100 events of a
-  1,394-event session.
-- Existing subscriber/equipment identity withholding remains active in the
-  Session/Call Flow UI.
+## Real laboratory state
 
-Frontend version: `2.7.0-pre.1+real.lab.1`.
+Read-only commands used: `docker ps/inspect`, `docker network inspect`, `ss`, `systemctl`, `curl` to loopback read endpoints, `df`, `free`, and `pgrep`. No write endpoint was called.
 
-## Real laboratory evidence (GET only)
+- Production remains POLARIS API `0.19.8` / platform `3.2.1` and OIRAN API `2.5.4`; neither candidate is deployed.
+- Open5GS EPC/5GC NFs are running and healthy. UERANSIM gNB is running and healthy; no UERANSIM UE is running.
+- POLARIS reports two configured profiles and zero active, registered or PDU-active UEs.
+- No `srsenb` or `srsue` container exists. LTE attach/session state is therefore `UNKNOWN`, never `ATTACHED`.
+- LTE data planes are physically prepared: S1-MME (`br-oiran-s1m`, MME `:36412/SCTP`), S1-U (`br-oiran-s1u`, SGW-U `:2152/UDP`) and S11 (`br-oiran-s11`, `:2123/UDP`). The eNB endpoints are absent.
+- 5G planes are observed on `br-oiran-n2`, `br-oiran-n3`, `br-oiran-n4`, and `br-oiran-n6` with real AMF/gNB/SMF/UPF sockets.
+- OIRAN production reports 11 datasets and 11 reconstructed sessions, all measured from persisted data. No LTE dataset exists.
+- The registered vProbe is `PENDING` with no measured heartbeat; live counters remain null/reference-only.
 
-Commands used:
+The exact read-model and source rules are documented in `docs/contracts/POLARIS_REAL_LAB_READ_MODEL_V1.md`.
 
-```text
-curl --max-time 10 http://127.0.0.1:49152/api/v1/<endpoint>
-jq (structure/count projections only; no subscriber values printed)
-systemctl --type=service --state=running
-ss -ltnp
-ps -eo pid,comm,%cpu,%mem,rss,etime
-df -h /root
-free -b
-pgrep -a dumpcap | wc -l
-```
+## Implemented POLARIS behavior
 
-Observed API: OIRAN `2.5.4`, loopback `127.0.0.1:49152`.
+- Operational builds no longer enable browser/localStorage fixture branches; those paths remain available only under test mode.
+- UE Manager consumes `/ues` and `/ue-profiles`; lifecycle, registration, PDU, traffic and ownership are independent observed fields.
+- Topology joins `/lab`, `/nodes`, and `/ues`; configuration does not imply connection and missing facts render `NOT_AVAILABLE`.
+- Scenario Library/Builder consumes the real immutable 13-template backend catalogue and durable scenario definitions. Status distribution remains 3 `SUPPORTED`, 2 `CERTIFICATION_REQUIRED`, 8 `BACKEND_REQUIRED`.
+- Traffic Generator targets only real inventory entries and consumes `/traffic/sessions*`; the invented default UE target was removed.
+- Grant V2, operator RBAC, CSRF, ownership, digest, expiry, anti-replay and backend execution gates remain authoritative.
+- Historical traffic results are labelled historical and are not reused as live rates.
 
-| Endpoint | HTTP | Measured time | Result |
-|---|---:|---:|---|
-| `/api/v1/version` | 200 | 0.008738 s | API 2.5.4, web 2.3.0-dev |
-| `/api/v1/metrics` | 200 | measured | historical mode, 0 active captures/sessions |
-| `/api/v1/datasets` | 200 | measured | 11 datasets |
-| `/api/v1/sessions` | 200 | measured | 11 reconstructed sessions |
-| `/api/v1/probes` | 200 | measured | 1 registered, 0 online, PENDING |
-| `/api/v1/captures` | 200 | measured | 14 records |
-| `/api/v1/interfaces` | 200 | measured | N2/SBI/N4/N3; counters unavailable |
-| `/api/v1/ues` | 200 | 0.013378 s | real reconstructed UE contexts |
-| `/api/v1/packets` | 200 | 0.263541 s | persisted packet evidence |
-| `/api/v1/correlation/edges` | 200 | 0.001531 s | persisted edges |
-| `/api/v1/correlation/rules` | 200 | 0.001103 s | real rule catalogue |
-| `/api/v1/modules` | 200 | 0.001448 s | navigation contract |
-| `/api/v1/auth/me` | 200 | 0.000953 s | viewer state |
-| `/api/v1/versions` | 404 | measured | wrong route; `/version` is canonical |
+## Implemented OIRAN behavior
 
-Dataset accounting measured from the API:
+- Operational startup no longer preloads the bundled reference session; reference loading is explicit and disabled by default.
+- Dataset, Session Explorer, Call Flow and correlation routes read persisted CaptureManager N2/N3/N4/SBI data and atomically finalized LTE S1-MME/S11/S1-U evidence.
+- Missing observations are null/`UNKNOWN`; generated context identifiers and fixed technology labels were removed.
+- Call Flow uses bounded cursor pagination; LTE catalogue enumeration and event responses are bounded.
+- Subscriber/equipment identities and identity IEs are replaced by `IDENTITY_WITHHELD`; source paths are reduced to `capture://<basename>`.
+- Contract: `OIRAN/docs/REAL_LAB_SESSION_API.md`.
 
-| Kind | Datasets | Sessions | Events | Errors | Technology |
-|---|---:|---:|---:|---:|---|
-| CAPTURED_LIVE | 8 | 1 | 25,771 | 30 | 5G SA |
-| DERIVED | 1 | 1 | 92 | 0 | 5G SA |
-| HISTORICAL | 1 | 1 | 54 | 0 | 5G SA |
-| RECOVERED | 1 | 0 | 20 | 8 | 5G SA |
+## Manual tests
 
-The largest returned session has 1,394 messages over N2/N3/N4. Call-flow page
-1 and page 2 both returned 100 events with distinct cursors; total remained
-1,394. The API reports 1,382 correlation edges for that session. Timestamps
-were returned as UTC nanosecond strings and preserved without client sorting.
-
-No LTE dataset or S1-MME/S11/S1-U evidence is currently returned by production.
-The UI therefore does not claim LTE observation or LTE E2E PASS.
-
-## Tests run manually
-
-| Command | Result |
+| Scope | Result |
 |---|---|
-| initial `npm run typecheck` | FAIL: dependencies absent in isolated worktree; no compiler executed |
-| `npm ci` | PASS; 141 packages, 0 vulnerabilities; host Node 18 engine warnings, project-pinned Node 22 used by scripts |
-| targeted Vitest first pass | FAIL 1/12: pagination test mock omitted the undefined-path guard |
-| targeted Vitest after correction | PASS: 3 files, 12 tests |
-| `npm run typecheck && npm test && npm run build` first full pass | FAIL: new matchMedia test environment stub and superseded synthetic-label assertion |
-| final `npm run typecheck && npm test && npm run build` | PASS: 11 files, 75 tests; build 1,636 modules; JS 360.19 kB / 106.58 kB gzip; leak check clean |
+| ANR1 Grant V2 | 6/6 PASS |
+| ANR1 srsRAN controller | 8/8 PASS |
+| POLARIS Rust workspace | API 228 PASS, 3 manual benchmarks ignored; 45 other crate tests PASS |
+| Integrated POLARIS catalogue test | 1/1 PASS on merged HEAD |
+| Integrated Simulator frontend | TypeScript PASS; 36 files / 225 tests PASS; build PASS |
+| Integrated Playwright | 1/1 PASS at 1440 light; API mocked/offline, no live action |
+| OIRAN API | 37/37 PASS on merged HEAD |
+| OIRAN pipeline/correlation | 43/43 PASS on ANR3 branch |
+| Integrated Analyzer frontend | TypeScript PASS; 11 files / 75 tests PASS; build and dist leak scan PASS |
+| Dependency audit | Both production dependency audits report 0 vulnerabilities |
 
-No CI result is used.
-
-## Security and defects
-
-1. **P0 API identity exposure:** the production call-flow JSON contains a
-   `MaskedIMEISV` IE with a non-null value. The frontend withholds this IE, but
-   the raw viewer API remains accessible and must sanitize it server-side
-   before deployment can be certified.
-2. The real vProbe is registered but `online=false`, `PROBE_PENDING`, with no
-   heartbeat and no packet/decode/drop counters. The UI now reports this state.
-3. Metrics report `HISTORICAL_DATASET_ANALYSIS`, zero active capture/session,
-   null live rates, and N2/SBI/N4/N3 as `REFERENCE_ONLY`.
-4. Several capture records are FAILED, PARTIAL, BLOCKED or recovered with
-   missing source paths. No loss-free claim is possible.
-5. Production exposes no LTE dataset; S1AP/S11/S1-U real certification remains
-   blocked.
-6. The RAM gate first failed at `3,956,572,160` available bytes and dropped to
-   `2,587,959,296` bytes at the post-push control, both below 4 GiB. No
-   additional Playwright/Rust load was started after the initial failure.
+The standard OIRAN large-resource tests remain explicitly ignored and require their dedicated memory-test environment. React `act(...)` warnings and the host Node 18 engine warning are recorded; project-pinned Node is used by the OIRAN scripts.
 
 ## Resource and safety evidence
 
-- Disk: 49%, below 85%.
-- External dumpcap processes: 12 before and after.
-- No capture, UE, eNB/gNB, Grant V2, traffic or deployment was started.
-- Open5GS, OIRAN services and external captures were not modified or restarted.
-- No production write request was sent.
+- Disk remained below the 85% gate (48–50% during this mission).
+- External `dumpcap` count remained 12; PID-set SHA-256 remained `39f48afb57e037db9ac35e6671b98c8c2b91d618e417c449016ee103aeb09bc8`.
+- RAM availability crossed below 4 GiB during concurrent builds. A future live preflight must observe stable available RAM at or above 4 GiB before proceeding.
+- No UE/eNB/gNB/core lifecycle action, Grant V2, traffic, capture, Open5GS write, service restart or production deployment occurred.
+- No historical dataset was deleted or overwritten.
 
-## Concurrent work protection
+## Confirmed blockers
 
-The shared repository was already conflicted and was not touched. During this
-work, concurrent uncommitted backend changes appeared in the isolated worktree
-under `OIRAN/apps/api`, `OIRAN/live-probe`, the root OIRAN changelog/manifests
-and `OIRAN/docs/REAL_LAB_SESSION_API.md`. They are not authored by ANR3 and are
-excluded from the ANR3 commit.
+1. **LTE real certification absent:** srsENB/srsUE are stopped/absent and no real S1AP/S11/S1-U dataset exists. `REAL_PASS` is impossible without a separately authorized LTE run.
+2. **Production versions are old:** production `/lte/status` and `/scenario-templates` return HTTP 404; candidates are offline only.
+3. **OIRAN production raw API identity exposure:** a production Call Flow response contains a non-null masked equipment-identity IE. The candidate sanitizer is tested, but production remains unchanged.
+4. **vProbe liveness absent:** the registered probe is pending with no real heartbeat or live counters.
+5. **Resource gate unstable:** available RAM was not stably at least 4 GiB throughout validation.
+6. Some persisted capture records are failed/partial/recovered; no loss-free global claim is made.
 
-## Deployment plan
+## Controlled deployment plan
 
-1. Restore RAM available to at least 4 GiB.
-2. Integrate and test the server-side identity sanitizer, then verify raw API
-   output contains only `IDENTITY_WITHHELD`/hashes.
-3. Integrate ANR1/ANR2 backend contracts without `merge -s ours` and prove Git
-   ancestry.
-4. Run Rust API/pipeline tests, full frontend tests and real-data Playwright.
-5. Prepare backup and rollback, request separate deployment authorization,
-   deploy the Analyzer only, and roll back on any failed recette.
+1. Restore stable available RAM to at least 4 GiB and recheck disk plus all 12 external capture PIDs.
+2. Review the integrated diff and build exact release artifacts from the final integration SHA.
+3. Back up POLARIS/OIRAN binaries, static assets, configuration and persistent registries; hash every rollback artifact.
+4. Deploy POLARIS and OIRAN separately only after explicit authorization, with component-local rollback on failure.
+5. Run authenticated, non-live browser validation against real API data; prove no raw identity leakage.
+6. Request a separate Grant V2/live authorization for `LTE-SRSUE-TEST-01`; then certify S1 Setup, Attach, IP, bounded UL/DL, cleanup and OIRAN publication.
 
-## Verdict
+## Final status
 
-`BLOCKED` for real-lab PASS and deployment. The scoped UI implementation is
-offline-tested and truthful, but the production API identity exposure, absent
-LTE evidence, pending vProbe, failed/partial captures and RAM gate prevent the
-requested platform-wide PASS.
+The offline implementation is integrated, versioned and tested. It removes operational demo fallbacks and renders unobserved state honestly. Production remains unchanged, so the requested platform-wide real-lab PASS is **not** declared.
 
-— **ANR3**
+`FINAL_STATUS = PARTIAL`
+
+— ANR1 / ANR2 / ANR3
