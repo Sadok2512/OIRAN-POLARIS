@@ -1,5 +1,7 @@
 //! Reusable native decoder pipeline used by both the CLI and live capture service.
 
+pub mod lte_fixture;
+
 use capture_pcap::{
     transport_view, visit_capture, CapturePacket, TransportProtocol, TransportView,
 };
@@ -22,7 +24,7 @@ use std::{
 use transport_sctp::SctpReassembler;
 use transport_tcp::TcpReassembler;
 
-pub const VERSION: &str = "0.5.0";
+pub const VERSION: &str = "0.6.0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UdpRoute {

@@ -5,12 +5,12 @@ use serde::Deserialize;
 use session_engine::{component, Association, DiscoveryResult, EventRecord, Reconstruction};
 use std::collections::BTreeMap;
 
-pub const VERSION: &str = "0.4.0";
+pub const VERSION: &str = "0.5.0";
 pub const RULE_VERSION: &str = "1.0.0";
 pub const DISCOVERY_RULE_VERSION: &str = "1.1.0";
 pub const SBI_RULE_VERSION: &str = "1.0.0";
 pub const E2E_EVIDENCE_RULE_VERSION: &str = "2.0.0";
-pub const LTE_RULE_VERSION: &str = "0.1.0-pre-certification";
+pub const LTE_RULE_VERSION: &str = "1.0.0-offline.1";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TunnelCorrelationKey {
@@ -1205,5 +1205,57 @@ mod tests {
             json!([]),
         );
         assert!(correlate_lte_evidence(&[s11a, s11b, s1u]).is_empty());
+    }
+
+    #[test]
+    fn lte_two_ue_bearers_do_not_cross_correlate() {
+        let mut events = Vec::new();
+        for (ordinal, teid) in [(1u64, "0x01020304"), (2u64, "0x05060708")] {
+            events.push(e(
+                &format!("s1ap-{ordinal}"),
+                "S1-MME",
+                "S1AP",
+                "E-RABSetupResponse",
+                ordinal * 10,
+                &[("erab_teid", teid)],
+                json!([]),
+            ));
+            events.push(e(
+                &format!("s11-{ordinal}"),
+                "S11",
+                "GTPv2-C",
+                "CreateSessionResponse",
+                ordinal * 10 + 1,
+                &[("bearer_f_teid", teid)],
+                json!([]),
+            ));
+            events.push(e(
+                &format!("s1u-{ordinal}"),
+                "S1-U",
+                "GTP-U",
+                "G-PDU",
+                ordinal * 10 + 2,
+                &[("teid", teid)],
+                json!([]),
+            ));
+        }
+        let edges = correlate_lte_evidence(&events);
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/lte-offline-certification-synthetic-manifest.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            edges.len() as u64,
+            manifest["expected"]["correlation_edges"].as_u64().unwrap()
+        );
+        for teid in ["0x1020304", "0x5060708"] {
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|edge| edge.matching_identifiers.iter().any(|id| id.contains(teid)))
+                    .count(),
+                2
+            );
+        }
     }
 }

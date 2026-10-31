@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:oiran:lte-fixture-manifest:1.0.0",
+  "title": "OIRAN LTE offline fixture manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "certification_state", "fixture_id", "technology", "capture_mode", "real_capture", "anonymization", "files", "required_procedures", "expected", "approval"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "certification_state": {"type": "string", "minLength": 1},
+    "fixture_id": {"type": "string", "minLength": 1},
+    "technology": {"const": "LTE"},
+    "capture_mode": {"type": "string", "minLength": 1},
+    "real_capture": {"type": "boolean"},
+    "anonymization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "reviewed_by", "clear_subscriber_identities_present", "address_mapping", "forbidden_fields"],
+      "properties": {
+        "method": {"type": "string", "minLength": 1},
+        "reviewed_by": {"type": "string", "minLength": 1},
+        "clear_subscriber_identities_present": {"const": false},
+        "address_mapping": {"type": "string", "minLength": 1},
+        "forbidden_fields": {"type": "array", "minItems": 5, "items": {"type": "string"}}
+      }
+    },
+    "files": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["interface", "protocol", "path", "sha256", "packet_count", "size_bytes", "first_timestamp_utc", "last_timestamp_utc"],
+        "properties": {
+          "interface": {"enum": ["S1-MME", "S11", "S1-U"]},
+          "protocol": {"enum": ["S1AP_SCTP_PPID_18", "GTPV2_C_UDP_2123", "GTP_U_UDP_2152"]},
+          "path": {"type": "string"},
+          "sha256": {"type": "string"},
+          "packet_count": {"type": ["integer", "null"], "minimum": 1},
+          "size_bytes": {"type": ["integer", "null"], "minimum": 1},
+          "first_timestamp_utc": {"type": ["string", "null"]},
+          "last_timestamp_utc": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "required_procedures": {"type": "array", "minItems": 8, "items": {"type": "string"}},
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ue_sessions", "eps_bearers", "distinct_s1u_teids", "uplink_packets", "downlink_packets", "correlation_edges", "first_timestamp_utc", "last_timestamp_utc"],
+      "properties": {
+        "ue_sessions": {"type": ["integer", "null"], "minimum": 1},
+        "eps_bearers": {"type": ["integer", "null"], "minimum": 1},
+        "distinct_s1u_teids": {"type": ["integer", "null"], "minimum": 1},
+        "uplink_packets": {"type": ["integer", "null"], "minimum": 0},
+        "downlink_packets": {"type": ["integer", "null"], "minimum": 0},
+        "correlation_edges": {"type": ["integer", "null"], "minimum": 0},
+        "first_timestamp_utc": {"type": ["string", "null"]},
+        "last_timestamp_utc": {"type": ["string", "null"]}
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["anr1_reference", "approved_at_utc", "notes"],
+      "properties": {
+        "anr1_reference": {"type": ["string", "null"]},
+        "approved_at_utc": {"type": ["string", "null"]},
+        "notes": {"type": "string"}
+      }
+    }
+  }
+}

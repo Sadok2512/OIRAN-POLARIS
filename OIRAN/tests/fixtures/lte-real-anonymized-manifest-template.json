@@ -19,7 +19,9 @@
       "path": "REPLACE_WITH_SANITIZED_RELATIVE_PATH",
       "sha256": "REPLACE_WITH_64_HEX",
       "packet_count": null,
-      "size_bytes": null
+      "size_bytes": null,
+      "first_timestamp_utc": null,
+      "last_timestamp_utc": null
     },
     {
       "interface": "S11",
@@ -27,7 +29,9 @@
       "path": "REPLACE_WITH_SANITIZED_RELATIVE_PATH",
       "sha256": "REPLACE_WITH_64_HEX",
       "packet_count": null,
-      "size_bytes": null
+      "size_bytes": null,
+      "first_timestamp_utc": null,
+      "last_timestamp_utc": null
     },
     {
       "interface": "S1-U",
@@ -35,7 +39,9 @@
       "path": "REPLACE_WITH_SANITIZED_RELATIVE_PATH",
       "sha256": "REPLACE_WITH_64_HEX",
       "packet_count": null,
-      "size_bytes": null
+      "size_bytes": null,
+      "first_timestamp_utc": null,
+      "last_timestamp_utc": null
     }
   ],
   "required_procedures": [
@@ -54,7 +60,9 @@
     "distinct_s1u_teids": null,
     "uplink_packets": null,
     "downlink_packets": null,
-    "correlation_edges": null
+    "correlation_edges": null,
+    "first_timestamp_utc": null,
+    "last_timestamp_utc": null
   },
   "approval": {
     "anr1_reference": null,

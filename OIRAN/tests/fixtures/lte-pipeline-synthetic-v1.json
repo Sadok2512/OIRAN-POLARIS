@@ -23,6 +23,15 @@
       "expected_event": "CreateSessionResponse"
     },
     {
+      "id": "s1-erab-setup-response",
+      "decoder": "S1AP",
+      "interface": "S1-MME",
+      "source_role": "eNB",
+      "destination_role": "MME",
+      "payload_hex": "2005000f00000200000002000500080002002a",
+      "expected_event": "E-RABSetupResponse"
+    },
+    {
       "id": "s1u-uplink",
       "decoder": "GTP-U",
       "interface": "S1-U",
@@ -46,7 +55,7 @@
     }
   ],
   "expected": {
-    "decoded_cases": 4,
+    "decoded_cases": 5,
     "s1u_packets": 2,
     "s1u_uplink_packets": 1,
     "s1u_downlink_packets": 1,

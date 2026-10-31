@@ -1,5 +1,16 @@
 # Changelog
 
+## LTE offline certification 1.0.0-offline.1 — 2026-10-31
+
+- Validate mandatory S1-MME/S11/S1-U fixture fields separately from ANR1
+  readiness, with a machine-readable schema and fail-closed real-fixture gate.
+- Partition LTE sessions by explicit S1AP context, exact pseudonym and S11
+  F-TEID; add multi-UE, timestamps, UL/DL counters and ambiguity regressions.
+- Add canonical LTE Call Flow generation and offline correlation rule version
+  `1.0.0-offline.1` without enabling capture or production ingestion.
+- Extend the synthetic decoder fixture with E-RAB procedure coverage and keep
+  the approved-PCAP requirement explicit.
+
 ## LTE pipeline preparation 0.1.0 — 2026-10-31
 
 - Add explicit, non-aliased offline decoder routes for S1-MME/S1AP PPID 18,

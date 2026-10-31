@@ -2,6 +2,12 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.6.0-pre.1+lte.offline.1 — 2026-10-31 (test-only certification increment)
+
+- Add Analyzer regression checks that preserve both LTE synthetic-only labels
+  and the existing LTE/5G interface and protocol filters.
+- No runtime UI behavior, live capture capability or certification claim added.
+
 ## 2.6.0-pre.1 — 2026-10-31 (minor pre-release)
 
 - Prepare LTE technology, S1-MME/S11/S1-U interface and S1AP/EPS NAS/GTPv2-C

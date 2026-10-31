@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "callflow-schema"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -174,7 +174,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "correlation-engine"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "callflow-schema",
  "serde",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "capture-pcap",
  "decoder-gtpu",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "session-engine"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
