@@ -8,6 +8,7 @@ import { UeManagerPage } from '@/pages/UeManager';
 import { UeDetailPage } from '@/pages/UeDetail';
 import { UeActivityPage } from '@/pages/UeActivity';
 import { TrafficPage } from '@/pages/Traffic';
+import { TrafficSessionsPage } from '@/pages/TrafficSessions';
 import { ScenariosLibraryPage } from '@/pages/ScenariosLibrary';
 import { ScenarioBuilderPage } from '@/pages/ScenarioBuilder';
 import { ExecutionMonitorPage } from '@/pages/ExecutionMonitor';
@@ -33,6 +34,8 @@ export function App() {
         <Route path="/ues/:ueId/activity" element={<UeActivityPage />} />
         <Route path="/provisioning" element={<ProvisioningPage />} />
         <Route path="/traffic" element={<TrafficPage />} />
+        {/* 0.13.0 (#47) — Traffic Generator against polaris-api 0.20.0. */}
+        <Route path="/traffic/sessions" element={<TrafficSessionsPage />} />
         <Route path="/scenarios" element={<ScenariosLibraryPage />} />
         <Route path="/scenarios/new" element={<ScenarioBuilderPage />} />
         <Route path="/scenarios/:scenarioId/edit" element={<ScenarioBuilderPage />} />

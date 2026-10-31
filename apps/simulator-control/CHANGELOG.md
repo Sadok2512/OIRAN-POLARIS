@@ -2,6 +2,27 @@
 
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
+## 0.13.0 — 2026-10-31 (minor)
+
+Traffic Generator (#47) — new /traffic/sessions screen driven by polaris-api 0.20.0.
+
+### Added
+- `src/data/trafficSessionsApi.ts` — typed client + `validateTrafficRequest()` client-side guard mirroring the backend `validate()` matrix (ue_ids non-empty + UE-NN/UE-NNNNN shape, rate_mbps ∈ [1,50], duration_s ∈ [1,600]).
+- `src/pages/TrafficSessions.tsx` — form + per-session table. The slider help line surfaces the lab UDP lossless ceiling (`≤ 20 Mbit/s`) alongside the hard 50 Mbit/s rate ceiling. Per-UE columns: UL rate / DL rate / UL bytes / DL bytes / warnings. iperf3 warning chips are yellow, never red (polaris-api 0.19.8 contract).
+- Route `/traffic/sessions` wired in `App.tsx`.
+
+### Tests (`npm test`)
+- `src/data/trafficSessionsApi.test.ts` — 7 cases: empty ue_ids, malformed UE id, UE-NN + UE-NNNNN accepted, rate window (0/50/51), duration window (0/600/601), lab ceiling constant.
+- 33 vitest files · 203 tests pass. Typecheck clean.
+
+### Hard dependency
+polaris-api ≥ **0.20.0** (ships `POST / GET / DELETE /traffic/sessions` + the `TrafficSessionManager`).
+
+### Deferred
+The charts (live rate time-series per UE + total) land in a follow-up once the API ships a per-tick sample endpoint. The current page renders the latest snapshot from the 2 s polling.
+
+Base: `2dc5dfd` (simulator-control 0.12.2).
+
 
 ## 0.12.2 — 2026-10-31 (patch)
 

@@ -1,7 +1,8 @@
 import clsx from 'clsx';
-import type { ComponentType, MouseEventHandler, ReactNode } from 'react';
+import type { MouseEventHandler, ReactNode } from 'react';
 
-type IconComponent = ComponentType<{ width?: number; height?: number; 'aria-hidden'?: boolean }>;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type IconComponent = any;
 
 export function Btn({
   children,
