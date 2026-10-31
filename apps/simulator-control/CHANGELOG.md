@@ -1,11 +1,18 @@
 # @telecom/simulator-control — Changelog
 
-## 0.16.0 — 2026-10-31 — LTE orchestration V2 progress
+## 0.16.0 — 2026-10-31 — LTE orchestration and dual-RAT topology
 
 - Polls the durable certified LTE run and displays each real phase state,
   reason and cleanup requirement.
 - Aligns the browser-issued Grant V2 UDP duration with the ten-second ANR1
   orchestration bound while preserving all existing 5G controls.
+- Keeps the existing `/network/topology` route and renders two visible chains
+  in the same topology: Open5GS 5GC → UERANSIM gNB → UERANSIM UE, and
+  Open5GS EPC → srsENB → srsUE.
+- Labels N2/NGAP, N3/GTP-U, S1-MME/S1AP and S1-U/GTP-U independently, using
+  `UNKNOWN` whenever the backend does not publish an endpoint or function.
+- Adds browser assertions which fail when either `srsENB` or `srsUE`
+  disappears from the topology.
 
 ## 0.15.1 — 2026-10-31 — final LTE Grant V2 safety contract
 
