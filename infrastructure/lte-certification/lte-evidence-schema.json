@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oiran.invalid/schemas/lte-e2e-evidence-v1.json",
+  "title": "OIRAN/POLARIS LTE E2E evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "profile_id",
+    "scenario_id",
+    "started_at",
+    "ended_at",
+    "final_state",
+    "steps",
+    "capture_refs",
+    "cleanup"
+  ],
+  "properties": {
+    "schema_version": {"const": "oiran-polaris.lte-e2e-evidence.v1"},
+    "run_id": {"type": "string", "pattern": "^lte-run-[a-z0-9-]{8,64}$"},
+    "profile_id": {"const": "LTE-SRSUE-TEST-01"},
+    "scenario_id": {"const": "lte-e2e-certification-v1"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": "string", "format": "date-time"},
+    "final_state": {"enum": ["COMPLETED", "FAILED", "CANCELLED", "RECOVERY_BLOCKED"]},
+    "steps": {
+      "type": "array",
+      "maxItems": 11,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "type", "state", "started_at", "ended_at", "reason_code", "evidence_refs"],
+        "properties": {
+          "index": {"type": "integer", "minimum": 0, "maximum": 10},
+          "type": {"enum": ["preflight", "enb_start", "s1_setup", "ue_start", "lte_attach", "ue_ip", "ping_ul", "ping_dl", "udp_ul", "udp_dl", "cleanup"]},
+          "state": {"enum": ["PENDING", "RUNNING", "COMPLETED", "FAILED", "SKIPPED"]},
+          "started_at": {"type": ["string", "null"], "format": "date-time"},
+          "ended_at": {"type": ["string", "null"], "format": "date-time"},
+          "reason_code": {"type": ["string", "null"], "pattern": "^[A-Z0-9_]{3,96}$"},
+          "evidence_refs": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 256}},
+          "measurements": {"type": "object", "maxProperties": 32}
+        }
+      }
+    },
+    "capture_refs": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plane", "source_file_sha256", "first_frame", "last_frame", "sanitization_state"],
+        "properties": {
+          "plane": {"enum": ["S1_MME", "S11", "S1_U", "S5_C", "S5_U"]},
+          "source_file_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "first_frame": {"type": "integer", "minimum": 1},
+          "last_frame": {"type": "integer", "minimum": 1},
+          "sanitization_state": {"enum": ["RAW_PROTECTED", "SANITIZED_PENDING_REVIEW", "SANITIZED_APPROVED"]}
+        }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["srsue_stopped", "srsenb_stopped", "sidecars_removed", "epc_healthy", "dumpcaps_preserved"],
+      "properties": {
+        "srsue_stopped": {"type": "boolean"},
+        "srsenb_stopped": {"type": "boolean"},
+        "sidecars_removed": {"type": "boolean"},
+        "epc_healthy": {"type": "boolean"},
+        "dumpcaps_preserved": {"type": "boolean"}
+      }
+    }
+  }
+}
