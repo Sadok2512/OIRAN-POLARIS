@@ -8193,9 +8193,11 @@ async fn traffic_status(State(state): State<Arc<AppState>>) -> Json<Value> {
 // 0.19.8 "measurement never fails the session" invariant.
 
 async fn list_traffic_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let items = state.traffic_manager.list();
+    let total = items.len();
     (
         StatusCode::OK,
-        Json(json!({ "data": state.traffic_manager.list() })),
+        Json(json!({ "items": items, "total": total })),
     )
 }
 
@@ -8259,10 +8261,7 @@ async fn post_traffic_session(
         "STARTED",
         Some(&session.session_id),
     );
-    (
-        StatusCode::CREATED,
-        Json(json!({ "data": session })),
-    )
+    (StatusCode::CREATED, Json(serde_json::to_value(session).unwrap()))
 }
 
 async fn get_traffic_session(
@@ -8270,7 +8269,10 @@ async fn get_traffic_session(
     AxumPath(session_id): AxumPath<String>,
 ) -> impl IntoResponse {
     match state.traffic_manager.get(&session_id) {
-        Some(session) => (StatusCode::OK, Json(json!({ "data": session }))),
+        Some(session) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(session).unwrap()),
+        ),
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({"error":"TRAFFIC_SESSION_NOT_FOUND"})),
@@ -8302,7 +8304,7 @@ async fn delete_traffic_session(
                 "STOPPED",
                 Some(&session_id),
             );
-            (StatusCode::OK, Json(json!({ "data": session })))
+            (StatusCode::OK, Json(serde_json::to_value(session).unwrap()))
         }
         Err(code) => (
             StatusCode::NOT_FOUND,
@@ -8319,11 +8321,9 @@ async fn get_traffic_samples(
         Some(samples) => (
             StatusCode::OK,
             Json(json!({
-                "data": samples,
-                "meta": {
-                    "session_id": session_id,
-                    "samples_ring_max": traffic_sessions::SAMPLES_RING_MAX,
-                },
+                "items": samples,
+                "session_id": session_id,
+                "samples_ring_max": traffic_sessions::SAMPLES_RING_MAX,
             })),
         ),
         None => (
@@ -16484,7 +16484,7 @@ mod p0_tests {
         let body: Value =
             serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        let session_id = body["data"]["session_id"].as_str().unwrap().to_string();
+        let session_id = body["session_id"].as_str().unwrap().to_string();
         assert!(session_id.starts_with("traffic-"));
 
         tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
@@ -16504,7 +16504,8 @@ mod p0_tests {
         let listed_body: Value =
             serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        let data = listed_body["data"].as_array().unwrap();
+        let data = listed_body["items"].as_array().unwrap();
+        assert_eq!(listed_body["total"], Value::from(data.len()));
         assert!(data.iter().any(|s| s["session_id"] == session_id));
 
         let detail = application
@@ -16522,8 +16523,8 @@ mod p0_tests {
         let detail_body: Value =
             serde_json::from_slice(&to_bytes(detail.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(detail_body["data"]["session_id"], session_id);
-        let counters = detail_body["data"]["ue_counters"].as_array().unwrap();
+        assert_eq!(detail_body["session_id"], session_id);
+        let counters = detail_body["ue_counters"].as_array().unwrap();
         assert_eq!(counters.len(), 1);
         assert_eq!(counters[0]["ue_id"], "UE-02");
 
@@ -16542,15 +16543,16 @@ mod p0_tests {
         let samples_body: Value =
             serde_json::from_slice(&to_bytes(samples.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        let sample_array = samples_body["data"].as_array().unwrap();
+        let sample_array = samples_body["items"].as_array().unwrap();
         assert!(
             !sample_array.is_empty(),
             "expected at least one tick sample after 1.2s"
         );
         assert_eq!(
-            samples_body["meta"]["samples_ring_max"],
+            samples_body["samples_ring_max"],
             Value::from(traffic_sessions::SAMPLES_RING_MAX),
         );
+        assert_eq!(samples_body["session_id"], session_id);
         assert!(sample_array[0]["rate_ul_bps"].is_u64());
         assert!(sample_array[0]["rate_dl_bps"].is_null());
     }
@@ -16579,7 +16581,7 @@ mod p0_tests {
         let body: Value =
             serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        let session_id = body["data"]["session_id"].as_str().unwrap().to_string();
+        let session_id = body["session_id"].as_str().unwrap().to_string();
 
         let no_csrf = application
             .clone()
@@ -16612,7 +16614,7 @@ mod p0_tests {
         let body: Value =
             serde_json::from_slice(&to_bytes(stopped.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(body["data"]["state"], "STOPPED");
+        assert_eq!(body["state"], "STOPPED");
 
         let again = application
             .clone()

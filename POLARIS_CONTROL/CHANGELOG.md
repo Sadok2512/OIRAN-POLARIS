@@ -19,9 +19,19 @@ Rebased on top of `ebcf851` (0.20.0 — Traffic Generator state machine
   Stop-is-sacred rule); still requires a valid CSRF token.
 - `GET    /api/v1/traffic/sessions/:id/samples` — new in 0.20.1.
   Returns the per-session rolling ring (max 60 ticks at 1 Hz) for the
-  simulator-control 0.13.1 live charts. Shape: `{data: [TrafficSample…],
-  meta: {session_id, samples_ring_max: 60}}` where each sample carries
+  simulator-control 0.13.1 live charts. Shape (POLARIS top-level
+  envelope, matching `/live/grant`): `{items: [TrafficSample…],
+  session_id, samples_ring_max: 60}` where each sample carries
   `{epoch_s, bytes_ul_cum, bytes_dl_cum, rate_ul_bps?, rate_dl_bps?}`.
+
+### Response envelope
+POLARIS endpoints answer with raw top-level named fields (not the OIRAN
+`{data, meta}` envelope). This matches the existing `/scenarios`,
+`/live/grant`, `/subscribers` conventions and keeps `polarisApi<T>`'s
+`unwrapPolarisBody` auto-unwrap a no-op for the Traffic Generator routes.
+- `GET /traffic/sessions` → `{items: [TrafficSession…], total: N}`
+- `GET /traffic/sessions/:id` / `POST` / `DELETE` → raw `TrafficSession`
+- `GET /traffic/sessions/:id/samples` → `{items, session_id, samples_ring_max}`
 
 ### iperf3 (measurement, never blocking)
 - One `tokio::spawn` per POST drives the measurement loop at 1 Hz.
