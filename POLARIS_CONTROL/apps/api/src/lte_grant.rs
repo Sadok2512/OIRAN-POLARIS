@@ -101,6 +101,7 @@ pub struct GrantTarget {
     pub profile_id: String,
     pub profile_revision: u32,
     pub configuration_sha256: String,
+    pub compose_model_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -186,6 +187,7 @@ pub struct RunRequest {
     pub profile_id: String,
     pub profile_revision: u32,
     pub configuration_sha256: String,
+    pub compose_model_sha256: String,
     pub scenario_id: String,
     pub scenario_revision: u32,
     pub scenario_sha256: String,
@@ -235,6 +237,7 @@ impl GrantRequestV2 {
             return Err("LIVE_GRANT_DURATION_INVALID");
         }
         if !is_sha256(&self.target.configuration_sha256)
+            || !is_sha256(&self.target.compose_model_sha256)
             || !is_sha256(&self.scenario.scenario_sha256)
         {
             return Err("LIVE_GRANT_HASH_INVALID");
@@ -446,6 +449,7 @@ impl GrantStore {
         if request.profile_id != grant.target.profile_id
             || request.profile_revision != grant.target.profile_revision
             || request.configuration_sha256 != grant.target.configuration_sha256
+            || request.compose_model_sha256 != grant.target.compose_model_sha256
             || request.scenario_id != grant.scenario.scenario_id
             || request.scenario_revision != grant.scenario.scenario_revision
             || request.scenario_sha256 != grant.scenario.scenario_sha256
@@ -583,6 +587,7 @@ mod tests {
                 profile_id: PROFILE_ID.into(),
                 profile_revision: 1,
                 configuration_sha256: "a".repeat(64),
+                compose_model_sha256: "c".repeat(64),
             },
             scenario: GrantScenario {
                 scenario_id: SCENARIO_ID.into(),
@@ -663,6 +668,7 @@ mod tests {
             profile_id: PROFILE_ID.into(),
             profile_revision: 1,
             configuration_sha256: "a".repeat(64),
+            compose_model_sha256: "c".repeat(64),
             scenario_id: SCENARIO_ID.into(),
             scenario_revision: 1,
             scenario_sha256: SCENARIO_SHA256.into(),
@@ -781,6 +787,7 @@ mod tests {
             profile_id: PROFILE_ID.into(),
             profile_revision: 1,
             configuration_sha256: "a".repeat(64),
+            compose_model_sha256: "c".repeat(64),
             scenario_id: SCENARIO_ID.into(),
             scenario_revision: 1,
             scenario_sha256: SCENARIO_SHA256.into(),
@@ -825,6 +832,7 @@ mod tests {
             profile_id: PROFILE_ID.into(),
             profile_revision: 1,
             configuration_sha256: "a".repeat(64),
+            compose_model_sha256: "c".repeat(64),
             scenario_id: SCENARIO_ID.into(),
             scenario_revision: 1,
             scenario_sha256: SCENARIO_SHA256.into(),

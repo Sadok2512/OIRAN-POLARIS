@@ -194,11 +194,12 @@ export interface LteProfile {
   apn: string;
   max_running_ues: number;
   configuration_sha256: string;
+  compose_model_sha256: string;
   scenario_id: 'lte-e2e-certification-v1';
   scenario_revision: 1;
   scenario_sha256: string;
   grant_required: true;
-  evidence_schema: 'polaris.lte-evidence.v1';
+  evidence_schema: 'oiran-polaris.lte-e2e-evidence.v1';
 }
 
 export interface UeProfile {

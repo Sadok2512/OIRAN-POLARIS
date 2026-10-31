@@ -1,13 +1,14 @@
 import { Play, Square } from 'lucide-react';
 import { Btn, Card, Pill, regTone } from '@/components/mockup';
 import { useAuth, useLteAction, useLteLogs, useLteProfile, useLteStatus } from '@/data/queries';
-import { useStartLteCertifiedRun } from '@/data/liveGrantApi';
+import { useLteRun, useStartLteCertifiedRun } from '@/data/liveGrantApi';
 
 export function LteControlPanel({ compact = false }: { compact?: boolean }) {
   const auth = useAuth();
   const status = useLteStatus();
   const stop = useLteAction('stop');
   const startRun = useStartLteCertifiedRun();
+  const run = useLteRun(startRun.data?.run_id);
   const profile = useLteProfile();
   const enbLogs = useLteLogs('ENB-01');
   const ueLogs = useLteLogs('LTE-SRSUE-TEST-01');
@@ -81,6 +82,19 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
         >Stop srsENB</Btn>
       </div>
       {!ownershipVerified && (enbRunning || ueRunning) ? <p className="text-ep-sm text-bad">Running srsRAN service is not controller-owned; lifecycle actions are locked.</p> : null}
+
+      {run.data ? (
+        <section className="rounded-md border border-line bg-surface-2 p-3" aria-label="LTE certified run progress">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-ep-sm font-medium">Certified run</span>
+            <Pill tone={run.data.state === 'CLEAN' && run.data.final_state === 'COMPLETED' ? 'ok' : 'warn'}>{run.data.state}</Pill>
+          </div>
+          <ol className="mt-2 grid gap-1 text-ep-xs sm:grid-cols-2 lg:grid-cols-3">
+            {(run.data.steps ?? []).map((step) => <li key={step.index}>{step.type}: {step.state}{step.reason_code ? ` — ${step.reason_code}` : ''}</li>)}
+          </ol>
+          {run.data.cleanup_required ? <p className="mt-2 text-ep-xs text-warn">Cleanup required; traffic will not resume.</p> : null}
+        </section>
+      ) : null}
 
       {error ? <p className="text-ep-sm text-bad">{(error as Error).message}</p> : null}
       {!compact ? (

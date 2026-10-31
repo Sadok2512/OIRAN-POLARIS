@@ -1,5 +1,12 @@
 # @telecom/simulator-control — Changelog
 
+## 0.16.0 — 2026-10-31 — LTE orchestration V2 progress
+
+- Polls the durable certified LTE run and displays each real phase state,
+  reason and cleanup requirement.
+- Aligns the browser-issued Grant V2 UDP duration with the ten-second ANR1
+  orchestration bound while preserving all existing 5G controls.
+
 ## 0.15.1 — 2026-10-31 — final LTE Grant V2 safety contract
 
 - Uses the canonical `LTE-SRSUE-TEST-01` profile exposed by POLARIS 0.22.0.

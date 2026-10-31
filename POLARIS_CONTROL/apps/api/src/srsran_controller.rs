@@ -143,6 +143,12 @@ pub struct TrafficMeasurement {
     pub rate_dl_bps: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PingMeasurement {
+    pub sent: u32,
+    pub received: u32,
+}
+
 pub trait SrsranRuntime: Send + Sync {
     fn status(&self, certified: bool, live_enabled: bool) -> Result<LteStatus, String>;
     fn start(&self, target: Target) -> Result<(), String>;
@@ -155,6 +161,7 @@ pub trait SrsranRuntime: Send + Sync {
         protocol: &str,
         rate_mbps: u32,
     ) -> Result<TrafficMeasurement, String>;
+    fn ping(&self, direction: &str, packets: u32) -> Result<PingMeasurement, String>;
 }
 
 #[derive(Clone)]
@@ -511,6 +518,23 @@ pub fn profile_configuration_sha256() -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+pub fn compose_model_sha256() -> Result<String, String> {
+    fn canonical(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter().map(|(key,value)|(key.clone(),canonical(value))).collect()
+            ),
+            serde_json::Value::Array(values) => serde_json::Value::Array(values.iter().map(canonical).collect()),
+            other => other.clone(),
+        }
+    }
+    let output=Command::new("/usr/bin/timeout").args(["10s","/usr/bin/docker","compose","--project-name",PROJECT,"--env-file",ENV_FILE,"-f",COMPOSE,"config","--format","json"]).output().map_err(|_|"LTE_COMPOSE_MODEL_UNAVAILABLE")?;
+    if !output.status.success(){return Err("LTE_COMPOSE_MODEL_UNAVAILABLE".into());}
+    let parsed:serde_json::Value=serde_json::from_slice(&output.stdout).map_err(|_|"LTE_COMPOSE_MODEL_INVALID")?;
+    let bytes=serde_json::to_vec(&canonical(&parsed)).map_err(|_|"LTE_COMPOSE_MODEL_INVALID")?;
+    Ok(format!("{:x}",Sha256::digest(bytes)))
+}
+
 impl SrsranRuntime for DockerSrsranRuntime {
     fn status(&self, certified: bool, live_enabled: bool) -> Result<LteStatus, String> {
         let (enb, ec) = self.observe(Target::Enb)?;
@@ -635,6 +659,64 @@ impl SrsranRuntime for DockerSrsranRuntime {
         }
         Ok(m)
     }
+
+    fn ping(&self, direction: &str, packets: u32) -> Result<PingMeasurement, String> {
+        if !matches!(direction, "ul" | "dl") || packets == 0 || packets > 5 {
+            return Err("LTE_PING_PARAMETERS_INVALID".into());
+        }
+        let ue = self.owned(Target::Ue)?;
+        if ue.state != "running" {
+            return Err("LTE_UE_NOT_RUNNING".into());
+        }
+        let peer = std::env::var("POLARIS_LTE_TRAFFIC_PEER_IP")
+            .map_err(|_| "LTE_TRAFFIC_PEER_NOT_CONFIGURED")?;
+        let count = packets.to_string();
+        let output = if direction == "ul" {
+            Self::ok(
+                self.run(
+                    &["exec", &ue.id, "ping", "-n", "-c", &count, "-W", "1", &peer],
+                    10,
+                )?,
+                "LTE_PING_FAILED",
+            )?
+        } else {
+            let ue_ip = self.ue_ip(Some(&ue)).ok_or("LTE_UE_IP_NOT_READY")?;
+            Self::ok(
+                self.run(
+                    &[
+                        "exec",
+                        "polaris-dn-sender",
+                        "ping",
+                        "-n",
+                        "-c",
+                        &count,
+                        "-W",
+                        "1",
+                        &ue_ip,
+                    ],
+                    10,
+                )?,
+                "LTE_PING_FAILED",
+            )?
+        };
+        let summary = output
+            .stdout
+            .lines()
+            .find(|line| line.contains("packets transmitted"))
+            .ok_or("LTE_PING_RESULT_INVALID")?;
+        let values = summary.split(',').collect::<Vec<_>>();
+        let sent = values
+            .first()
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .ok_or("LTE_PING_RESULT_INVALID")?;
+        let received = values
+            .get(1)
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .ok_or("LTE_PING_RESULT_INVALID")?;
+        Ok(PingMeasurement { sent, received })
+    }
 }
 
 fn sanitize_log_line(line: &str) -> Option<String> {
@@ -735,6 +817,12 @@ impl SrsranRuntime for MockSrsranRuntime {
             },
             rate_ul_bps: matches!(direction, "ul" | "both").then_some(u64::from(rate) * 1_000_000),
             rate_dl_bps: matches!(direction, "dl" | "both").then_some(u64::from(rate) * 1_000_000),
+        })
+    }
+    fn ping(&self, _direction: &str, packets: u32) -> Result<PingMeasurement, String> {
+        Ok(PingMeasurement {
+            sent: packets,
+            received: packets,
         })
     }
 }

@@ -40,7 +40,7 @@ grant-independent to prevent stranded processes.
 
 ## Evidence handoff to ANR1 and ANR3
 
-Run responses identify `evidence_schema = polaris.lte-evidence.v1`. Evidence
+Run responses identify `evidence_schema = oiran-polaris.lte-e2e-evidence.v1`. Evidence
 must use ANR1's canonical schema and must not include subscriber identities.
 Before ANR3 ingestion, every `evidence_ref` must resolve to an approved
 `capture_ref` containing SHA-256, first/last frame and
@@ -48,13 +48,12 @@ Before ANR3 ingestion, every `evidence_ref` must resolve to an approved
 S1AP identifiers, EBI, F-TEID/TEID and endpoint roles; timestamp proximity
 alone is not a correlation key.
 
-## Current offline limitation
+## Offline implementation status
 
-Grant persistence, subject binding, runtime allowlisting, startup of the eNB
-phase and cleanup are implemented. The complete asynchronous state machine
-(S1 readiness, attach, bounded ping/UDP sidecars and evidence publication) is
-not implemented by this change. Consequently the profile defaults disabled,
-both deployment/certification flags default false, and live certification
-remains blocked.
+The persistent run journal, exclusive profile lease, restart-to-cleanup
+recovery, S1/Attach/IP observations, bounded ping/UDP phases and canonical
+evidence object are implemented and covered by offline mocks. The profile
+still defaults disabled and both deployment/certification flags default false:
+this change authorizes neither deployment nor live LTE certification.
 
 — ANR2

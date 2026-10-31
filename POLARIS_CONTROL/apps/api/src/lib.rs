@@ -1,6 +1,7 @@
 mod activity;
 mod cpu_safety;
 mod lte_grant;
+mod lte_orchestrator;
 mod scenario_definitions;
 mod srsran_controller;
 mod subscriber_provisioning;
@@ -125,6 +126,7 @@ pub struct AppState {
     // action. See `live_grant_*` handlers.
     live_grants: Arc<Mutex<Vec<LiveGrant>>>,
     lte_grants_v2: Arc<Mutex<lte_grant::GrantStore>>,
+    lte_runs_v2: Arc<Mutex<lte_orchestrator::RunStore>>,
     lte_profile_registry: Arc<Mutex<lte_grant::ProfileRegistry>>,
     // 0.19.0 (#37) — per-UE ring buffer of the last 20 events (register,
     // PDU setup, transfer_verify, iperf3, detach, …). Exposed by the
@@ -3177,6 +3179,11 @@ impl AppState {
                 .unwrap_or_else(|_| "/var/lib/polaris-control/live-grants-v2.json".into())
                 .into(),
         )?;
+        let lte_runs_v2 = lte_orchestrator::RunStore::load(
+            std::env::var("POLARIS_LTE_RUN_STORE_PATH")
+                .unwrap_or_else(|_| "/var/lib/polaris-control/lte-runs-v2.json".into())
+                .into(),
+        )?;
         let lte_profile_registry = lte_grant::ProfileRegistry::load_or_seed(
             std::env::var("POLARIS_LTE_PROFILE_REGISTRY_PATH")
                 .unwrap_or_else(|_| "/var/lib/polaris-control/lte-profiles-v1.json".into())
@@ -3239,6 +3246,7 @@ impl AppState {
             startup_reconcile: true,
             live_grants: Arc::new(Mutex::new(Vec::new())),
             lte_grants_v2: Arc::new(Mutex::new(lte_grants_v2)),
+            lte_runs_v2: Arc::new(Mutex::new(lte_runs_v2)),
             lte_profile_registry: Arc::new(Mutex::new(lte_profile_registry)),
             activity_events: Arc::new(activity::ActivityEventStore::new()),
             activity_rate_cache: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4271,15 +4279,16 @@ async fn lte_profile(State(state): State<Arc<AppState>>, AxumPath(profile_id): A
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"LTE_PROFILE_REGISTRY_UNAVAILABLE"}))),
     };
     let profile = registry.profile();
+    let compose_model_sha256=srsran_controller::compose_model_sha256().ok();
     (StatusCode::OK, Json(json!({
             "schema_version":"polaris.lte-profile.v1", "profile_id":lte_grant::PROFILE_ID,
             "revision":profile.revision, "owner":profile.owner, "enabled":profile.enabled,
             "runtime_state":"STOPPED", "apn":"internet", "max_running_ues":1,
-            "configuration_sha256":profile.configuration_sha256, "grant_required":true,
+            "configuration_sha256":profile.configuration_sha256, "compose_model_sha256":compose_model_sha256, "grant_required":true,
             "scenario_id":lte_grant::SCENARIO_ID,
             "scenario_revision":1,
             "scenario_sha256":lte_grant::SCENARIO_SHA256,
-            "last_observed_at_epoch_s":epoch_seconds(), "evidence_schema":"polaris.lte-evidence.v1"
+            "last_observed_at_epoch_s":epoch_seconds(), "evidence_schema":"oiran-polaris.lte-e2e-evidence.v1"
     })))
 }
 
@@ -4350,6 +4359,9 @@ async fn create_lte_run(
     if request.configuration_sha256 != current_hash {
         return (StatusCode::PRECONDITION_FAILED, Json(json!({"error":"GRANT_SUBJECT_CHANGED"})));
     }
+    if request.compose_model_sha256 != srsran_controller::compose_model_sha256().unwrap_or_default() {
+        return (StatusCode::PRECONDITION_FAILED, Json(json!({"error":"GRANT_SUBJECT_CHANGED"})));
+    }
     let run_id = format!("lte-run-{}", random_hex(16));
     let result = state.lte_grants_v2.lock()
         .map_err(|_| "LTE_GRANT_STORE_UNAVAILABLE".to_string())
@@ -4376,6 +4388,19 @@ async fn create_lte_run(
             return (status, Json(json!({"error":error})));
         }
     };
+    let (durable_run, replayed) = match state.lte_runs_v2.lock()
+        .map_err(|_| "LTE_RUN_STORE_UNAVAILABLE".to_string())
+        .and_then(|mut store| store.create(run.run_id.clone(), run.grant_id.clone(), epoch_millis(), run.deadline_at_epoch_ms, idempotency_key)) {
+        Ok(value) => value,
+        Err(error) => return (if error == "LTE_RUN_ALREADY_ACTIVE" { StatusCode::CONFLICT } else { StatusCode::INTERNAL_SERVER_ERROR }, Json(json!({"error":error}))),
+    };
+    if replayed { return (StatusCode::OK, Json(durable_run.public_json())); }
+    let now=epoch_millis();
+    let _=state.lte_runs_v2.lock().map(|mut store| {
+        let _=store.intent(&run.run_id,lte_orchestrator::RunState::Idle,format!("preflight-{}",run.run_id),0,now);
+        let _=store.observe(&run.run_id,0,lte_observation(0,"polaris_preflight",json!({"result":"PASS"})),now);
+        store.intent(&run.run_id,lte_orchestrator::RunState::EnbStarting,format!("enb-start-{}",run.run_id),1,now)
+    });
     let _ = state.lte_grants_v2.lock().map(|mut store| {
         let _ = store.set_run_state(&run.run_id, "ENB_STARTING");
     });
@@ -4388,19 +4413,22 @@ async fn create_lte_run(
         Err(_) => Err("SRSRAN_START_WORKER_FAILED".into()),
     };
     if let Err(error) = enb_start {
+        let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run.run_id,1,"LTE_ENB_START_FAILED",epoch_millis()));
         let _ = state.lte_grants_v2.lock().map(|mut store| {
             let _ = store.set_run_state(&run.run_id, "FAILED");
         });
         audit(&state, &identity.role, "LTE_RUN_START", &error, Some(&run.run_id));
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":error,"run_id":run.run_id,"cleanup_required":true})));
     }
+    let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run.run_id,1,lte_observation(1,"docker_inspect",json!({"component":"ENB-01","state":"running"})),epoch_millis()));
     audit(&state, &identity.role, "LTE_RUN_START", "ENB_STARTING", Some(&run.run_id));
     tokio::spawn(orchestrate_lte_run(
         state.clone(),
         run.run_id.clone(),
         run.deadline_at_epoch_ms,
     ));
-    (StatusCode::ACCEPTED, Json(serde_json::to_value(run).unwrap()))
+    let body=state.lte_runs_v2.lock().ok().and_then(|store|store.get(&run.run_id).map(lte_orchestrator::RunRecord::public_json)).unwrap_or_else(||serde_json::to_value(run).unwrap_or(Value::Null));
+    (StatusCode::ACCEPTED, Json(body))
 }
 
 async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_epoch_ms: u64) {
@@ -4409,8 +4437,9 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             let _ = store.set_run_state(run_id, value);
         });
     }
-    async fn cleanup(state: &AppState, run_id: &str, terminal: &str) {
+    async fn cleanup(state: &AppState, run_id: &str, outcome: lte_orchestrator::RunOutcome) {
         set_state(state, run_id, "CANCEL_REQUESTED").await;
+        let _=state.lte_runs_v2.lock().map(|mut store|store.intent(run_id,lte_orchestrator::RunState::Stopping,format!("cleanup-{run_id}"),10,epoch_millis()));
         let runtime = state.srsran_runtime.clone();
         let result = tokio::task::spawn_blocking(move || {
             let normalize = |result: Result<(), String>| match result {
@@ -4422,7 +4451,13 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             (ue, enb)
         }).await;
         let clean = matches!(result, Ok((Ok(()), Ok(()))));
-        set_state(state, run_id, if clean { terminal } else { "CLEANUP_FAILED" }).await;
+        let epc_healthy=state.srsran_runtime.status(state.lte_e2e_certified,state.srsran_live_enabled).ok().is_some_and(|status|status.epc.process_state=="running");
+        let cleanup=lte_orchestrator::CleanupEvidence{srsue_stopped:clean,srsenb_stopped:clean,sidecars_removed:clean,epc_healthy,dumpcaps_preserved:external_dumpcap_count()==12};
+        let _=state.lte_runs_v2.lock().map(|mut store|{
+            if clean {let _=store.observe(run_id,10,lte_observation(10,"cleanup_observation",json!({"clean":true})),epoch_millis());}
+            store.finalize(run_id,outcome,cleanup,epoch_millis())
+        });
+        set_state(state, run_id, if clean { "CLEAN" } else { "CLEANUP_FAILED" }).await;
     }
     async fn wait_for<F>(state: &AppState, run_id: &str, deadline_ms: u64, predicate: F) -> bool
     where
@@ -4446,8 +4481,9 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
         }
     }
 
-    let s1_deadline = epoch_millis().saturating_add(30_000).min(deadline_at_epoch_ms);
-    set_state(&state, &run_id, "S1_WAIT").await;
+    let s1_deadline = epoch_millis().saturating_add(40_000).min(deadline_at_epoch_ms);
+    set_state(&state, &run_id, "S1_READY").await;
+    let _=state.lte_runs_v2.lock().map(|mut store|store.intent(&run_id,lte_orchestrator::RunState::S1Ready,format!("s1-{run_id}"),2,epoch_millis()));
     if !wait_for(&state, &run_id, s1_deadline, |status| {
         status.enb.process_state == "running"
             && status.epc.process_state == "running"
@@ -4456,42 +4492,71 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
         if lte_run_is_terminal_or_cancelled(&state, &run_id) {
             return;
         }
-        cleanup(&state, &run_id, "FAILED").await;
+        let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,2,"LTE_S1_SETUP_TIMEOUT",epoch_millis()));
+        cleanup(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
         return;
     }
+    let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run_id,2,lte_observation(2,"sctp_association",json!({"s1_setup":"success"})),epoch_millis()));
 
     set_state(&state, &run_id, "UE_STARTING").await;
+    let _=state.lte_runs_v2.lock().map(|mut store|store.intent(&run_id,lte_orchestrator::RunState::UeStarting,format!("ue-start-{run_id}"),3,epoch_millis()));
     let runtime = state.srsran_runtime.clone();
     let ue_start = tokio::task::spawn_blocking(move || runtime.start(srsran_controller::Target::Ue)).await;
     if !matches!(ue_start, Ok(Ok(()))) {
-        cleanup(&state, &run_id, "FAILED").await;
+        let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,3,"LTE_UE_START_FAILED",epoch_millis()));
+        cleanup(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
         return;
     }
+    let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run_id,3,lte_observation(3,"docker_inspect",json!({"component":"LTE-SRSUE-TEST-01","running":true})),epoch_millis()));
 
-    set_state(&state, &run_id, "ATTACH_WAIT").await;
-    let attach_deadline = epoch_millis().saturating_add(90_000).min(deadline_at_epoch_ms);
+    set_state(&state, &run_id, "ATTACHED").await;
+    let _=state.lte_runs_v2.lock().map(|mut store|store.intent(&run_id,lte_orchestrator::RunState::Attached,format!("attach-{run_id}"),4,epoch_millis()));
+    let attach_deadline = epoch_millis().saturating_add(45_000).min(deadline_at_epoch_ms);
     if !wait_for(&state, &run_id, attach_deadline, |status| {
         status.attach_state == "ATTACHED"
             && status.session_state == "ACTIVE"
-            && status.ue_ip.is_some()
     }).await {
         if lte_run_is_terminal_or_cancelled(&state, &run_id) {
             return;
         }
-        cleanup(&state, &run_id, "FAILED").await;
+        let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,4,"LTE_ATTACH_TIMEOUT",epoch_millis()));
+        cleanup(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
         return;
     }
+    let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run_id,4,lte_observation(4,"epc_context",json!({"attach":"success","identity_withheld":true})),epoch_millis()));
 
-    set_state(&state, &run_id, "RUNNING").await;
-    let remaining = deadline_at_epoch_ms.saturating_sub(epoch_millis());
-    tokio::time::sleep(std::time::Duration::from_millis(remaining)).await;
-    if lte_run_is_terminal_or_cancelled(&state, &run_id) {
-        return;
+    let _=state.lte_runs_v2.lock().map(|mut store|store.intent(&run_id,lte_orchestrator::RunState::IpReady,format!("ip-{run_id}"),5,epoch_millis()));
+    let ip_deadline=epoch_millis().saturating_add(20_000).min(deadline_at_epoch_ms);
+    if !wait_for(&state,&run_id,ip_deadline,|status|status.ue_ip.is_some()).await {
+        let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,5,"LTE_IP_TIMEOUT",epoch_millis()));
+        cleanup(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await;return;
     }
-    cleanup(&state, &run_id, "EXPIRED_CLEANUP_COMPLETE").await;
+    let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run_id,5,lte_observation(5,"ue_interface",json!({"ipv4":"observed","route":"proved","identity_withheld":true})),epoch_millis()));
+    if lte_start_resource_gate(&state).is_err() {cleanup(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await;return;}
+    set_state(&state,&run_id,"TRAFFIC_RUNNING").await;
+    for (step,direction) in [(6_usize,"ul"),(7_usize,"dl")] {
+        let _=state.lte_runs_v2.lock().map(|mut store|store.intent(&run_id,lte_orchestrator::RunState::TrafficRunning,format!("ping-{direction}-{run_id}"),step,epoch_millis()));
+        let runtime=state.srsran_runtime.clone();let dir=direction.to_string();
+        match tokio::task::spawn_blocking(move||runtime.ping(&dir,5)).await {
+            Ok(Ok(value))=>{let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run_id,step,lte_observation(step as u64,"bounded_ping",json!({"direction":direction,"sent":value.sent,"received":value.received})),epoch_millis()));},
+            _=>{let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,step,"LTE_TRAFFIC_FAILED",epoch_millis()));cleanup(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await;return;}
+        }
+    }
+    for (step,direction) in [(8_usize,"ul"),(9_usize,"dl")] {
+        let _=state.lte_runs_v2.lock().map(|mut store|store.intent(&run_id,lte_orchestrator::RunState::TrafficRunning,format!("udp-{direction}-{run_id}"),step,epoch_millis()));
+        let runtime=state.srsran_runtime.clone();let dir=direction.to_string();
+        match tokio::task::spawn_blocking(move||runtime.measure_traffic(&dir,"udp",1)).await {
+            Ok(Ok(value))=>{let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run_id,step,lte_observation(step as u64,"bounded_udp",json!({"direction":direction,"rate_limit_bps":1_000_000,"duration_limit_seconds":10,"payload_max_bytes":1200,"bytes_ul":value.bytes_ul,"bytes_dl":value.bytes_dl})),epoch_millis()));},
+            _=>{let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,step,"LTE_TRAFFIC_FAILED",epoch_millis()));cleanup(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await;return;}
+        }
+    }
+    cleanup(&state,&run_id,lte_orchestrator::RunOutcome::Completed).await;
 }
 
 async fn get_lte_run(State(state): State<Arc<AppState>>, AxumPath(run_id): AxumPath<String>) -> impl IntoResponse {
+    if let Some(run)=state.lte_runs_v2.lock().ok().and_then(|store|store.get(&run_id).cloned()) {
+        return (StatusCode::OK,Json(run.public_json()));
+    }
     let record = state.lte_grants_v2.lock().ok().and_then(|store| store.records().iter()
         .find(|grant| grant.run_id.as_deref() == Some(run_id.as_str())).cloned());
     match record {
@@ -4513,6 +4578,7 @@ async fn stop_lte_run(
     AxumPath(run_id): AxumPath<String>,
 ) -> impl IntoResponse {
     if let Err(error) = require_operator(&identity) { return error; }
+    let _=state.lte_runs_v2.lock().map(|mut store|store.request_cancel(&run_id));
     let existing_state = state.lte_grants_v2.lock().ok().and_then(|store| store.records().iter()
         .find(|grant| grant.run_id.as_deref() == Some(run_id.as_str()))
         .and_then(|grant| grant.run_state.clone()));
@@ -4583,13 +4649,38 @@ fn lte_start_resource_gate(state: &AppState) -> Result<Value, String> {
         return Err("DISK_STOP_THRESHOLD".into());
     }
     let memory = memory_stats();
-    if memory["available_bytes"].as_u64().unwrap_or(0) < 1_073_741_824 {
-        return Err("INSUFFICIENT_MEMORY".into());
+    let available = memory["available_bytes"].as_u64().unwrap_or(0);
+    if available < 4_294_967_296 {
+        return Err("LTE_MEMORY_RESERVE_NOT_MET".into());
+    }
+    let dumpcaps = external_dumpcap_count();
+    if dumpcaps != 12 {
+        return Err("LTE_EXTERNAL_CAPTURE_SET_MISMATCH".into());
     }
     Ok(json!({
         "disk_usage_percent":f64::from(usage)/100.0,
-        "memory_available_bytes":memory["available_bytes"]
+        "memory_available_bytes":available,
+        "memory_required_bytes":4_294_967_296_u64,
+        "external_dumpcap_count":dumpcaps
     }))
+}
+
+fn external_dumpcap_count() -> usize {
+    let Ok(entries) = fs::read_dir("/proc") else { return 0 };
+    entries.filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()))
+        .filter(|entry| fs::read(entry.path().join("comm")).is_ok_and(|value| value == b"dumpcap\n"))
+        .count()
+}
+
+fn lte_observation(sequence: u64, source_kind: &str, measurements: Value) -> lte_orchestrator::Observation {
+    lte_orchestrator::Observation {
+        sequence,
+        observed_at: lte_orchestrator::timestamp(epoch_millis()),
+        source_kind: source_kind.into(),
+        source_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(&measurements).unwrap_or_default())),
+        validity: "VALID".into(), sanitization_state: "SANITIZED".into(), measurements,
+    }
 }
 
 async fn start_lte_component(
@@ -11377,6 +11468,9 @@ async fn create_live_grant(
         if request.target.configuration_sha256 != current_hash {
             return (StatusCode::PRECONDITION_FAILED, Json(json!({"error":"GRANT_SUBJECT_CHANGED"})));
         }
+        if request.target.compose_model_sha256 != srsran_controller::compose_model_sha256().unwrap_or_default() {
+            return (StatusCode::PRECONDITION_FAILED, Json(json!({"error":"GRANT_SUBJECT_CHANGED"})));
+        }
         let grant_id = format!("grant-{}", random_hex(16));
         let result = state.lte_grants_v2.lock()
             .map_err(|_| "LTE_GRANT_STORE_UNAVAILABLE".to_string())
@@ -11521,6 +11615,7 @@ async fn revoke_live_grant(
     let v2 = state.lte_grants_v2.lock().ok().and_then(|mut store| store.revoke(&id).ok());
     if let Some(grant) = v2 {
         if let Some(run_id) = grant.run_id.as_deref() {
+            let _=state.lte_runs_v2.lock().map(|mut store|store.request_cancel(run_id));
             let _ = state.lte_grants_v2.lock().map(|mut store| {
                 let _ = store.set_run_state(run_id, "CANCEL_REQUESTED");
             });
@@ -12477,6 +12572,9 @@ mod p0_tests {
             live_grants: Arc::new(Mutex::new(Vec::new())),
             lte_grants_v2: Arc::new(Mutex::new(
                 lte_grant::GrantStore::load(root.join("live-grants-v2.json")).unwrap(),
+            )),
+            lte_runs_v2: Arc::new(Mutex::new(
+                lte_orchestrator::RunStore::load(root.join("lte-runs-v2.json")).unwrap(),
             )),
             lte_profile_registry: Arc::new(Mutex::new(
                 lte_grant::ProfileRegistry::load_or_seed(

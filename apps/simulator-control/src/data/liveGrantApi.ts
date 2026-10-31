@@ -44,11 +44,16 @@ export interface LteRun {
   state: string;
   deadline_at_epoch_ms: number;
   evidence_url: string;
+  final_state?: 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'RECOVERY_BLOCKED' | null;
+  cleanup_required?: boolean;
+  cancel_requested?: boolean;
+  steps?: Array<{ index: number; type: string; state: string; reason_code: string | null }>;
 }
 
 export interface LteGrantProfileBinding {
   revision: number;
   configuration_sha256: string;
+  compose_model_sha256: string;
   scenario_id: 'lte-e2e-certification-v1';
   scenario_revision: 1;
   scenario_sha256: string;
@@ -77,6 +82,7 @@ export function useStartLteCertifiedRun() {
             profile_id: 'LTE-SRSUE-TEST-01',
             profile_revision: profile.revision,
             configuration_sha256: profile.configuration_sha256,
+            compose_model_sha256: profile.compose_model_sha256,
           },
           scenario: {
             scenario_id: profile.scenario_id,
@@ -90,7 +96,7 @@ export function useStartLteCertifiedRun() {
             ping: { max_packets_per_direction: 5 },
             udp: {
               max_rate_bps_per_direction: 1_000_000,
-              max_duration_seconds_per_direction: 30,
+              max_duration_seconds_per_direction: 10,
               max_payload_bytes: 1_200,
               max_parallel_streams: 1,
             },
@@ -110,6 +116,7 @@ export function useStartLteCertifiedRun() {
           profile_id: 'LTE-SRSUE-TEST-01',
           profile_revision: profile.revision,
           configuration_sha256: profile.configuration_sha256,
+          compose_model_sha256: profile.compose_model_sha256,
           scenario_id: profile.scenario_id,
           scenario_revision: profile.scenario_revision,
           scenario_sha256: profile.scenario_sha256,
@@ -120,6 +127,16 @@ export function useStartLteCertifiedRun() {
       await client.invalidateQueries({ queryKey: ['polaris', 'live-grants'] });
       await client.invalidateQueries({ queryKey: ['polaris', 'lte-status'] });
     },
+  });
+}
+
+export function useLteRun(runId: string | undefined) {
+  return useQuery({
+    queryKey: ['polaris', 'lte-run', runId],
+    queryFn: () => polarisApi<LteRun>(`/lte/runs/${encodeURIComponent(runId!)}`),
+    enabled: Boolean(runId),
+    refetchInterval: (query) => query.state.data?.state === 'CLEAN' ? false : 1_000,
+    retry: false,
   });
 }
 

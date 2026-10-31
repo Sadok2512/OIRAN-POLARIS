@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.23.0 (polaris-control-api) — 2026-10-31 — LTE orchestration V2
+
+- Adds the checksummed, atomic, mode-0600 LTE run journal, exclusive profile
+  lease, restart-to-cleanup recovery and idempotent run creation.
+- Implements the contracted ENB/S1/UE/Attach/IP/traffic/cleanup phase machine,
+  bounded retries and deadlines, cancellation and grant-independent cleanup.
+- Emits bounded sanitized evidence using
+  `oiran-polaris.lte-e2e-evidence.v1`; mandatory OIRAN capture references are
+  unique, approved and validated before handoff.
+- Raises the LTE preflight memory reserve to 4 GiB and requires the exact set
+  of twelve external dumpcap processes without signalling them.
+
 ## 0.22.1 (polaris-control-api) — 2026-10-31 — final LTE Grant V2 and runtime hardening
 
 - Adds the persistent, checksummed, mode-0600 LTE Grant V2 store with atomic
