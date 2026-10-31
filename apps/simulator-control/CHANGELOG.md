@@ -2,6 +2,51 @@
 
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
+## 0.13.1 — 2026-10-30 (patch)
+
+Live charts for the Traffic Generator (#47). Rebased on top of `38bb8fc`
+(0.13.0 Traffic Generator screen). `git merge-base --is-ancestor
+38bb8fc HEAD` → true.
+
+### Added
+- `src/components/TrafficSparkline.tsx` — hand-rolled SVG polyline
+  (no new npm dep). Draws UL + DL rate traces for a single session.
+  Zero samples → "awaiting first tick…" placeholder. One sample →
+  per-direction dot. Multiple samples → polyline per direction, with
+  the polyline for a direction omitted when every rate is null (no
+  misleading flat-zero line on UL-only / DL-only sessions). The
+  `aria-label` summarises the latest UL / DL rate so screen readers
+  get the same information as the chart.
+- `src/data/trafficSessionsApi.ts` — new `TrafficSample` interface,
+  `TrafficSamplesResponse`, `fetchTrafficSamples(session_id)` hitting
+  `GET /traffic/sessions/:id/samples` on polaris-api 0.20.1. The
+  ring buffer is server-bounded to 60 ticks at 1 Hz
+  (`TRAFFIC_SAMPLES_RING_MAX = 60`) → one minute of history, fixed
+  memory footprint.
+- `src/pages/TrafficSessions.tsx` — new `TrafficSparklineRow`
+  sub-component per session. Polls `/samples` every 1 s while the
+  session is `RUNNING` / `REQUESTED` and stops as soon as it reaches a
+  terminal state (`COMPLETED`, `STOPPED`, `FAILED`) so a finished
+  session does not keep spamming the API.
+
+### Response envelope alignment
+Mirrors the POLARIS top-level named convention
+(`polaris-control-api` 0.20.1 ships this): the samples endpoint
+returns `{items, session_id, samples_ring_max}` and the auto-unwrap
+in `polarisApi` is a no-op (the OIRAN `{data, meta}` guard only
+triggers for exactly those two keys).
+
+### Tests (`npm test`)
+- `src/components/TrafficSparkline.test.tsx` — 5 cases: empty →
+  placeholder; 1 sample → dots per direction; UL-only → UL polyline
+  only; aria-label mirrors UL / DL rate; no-data rows render the SVG
+  without any polyline/dot.
+- 34 vitest files · **208 tests pass**. Typecheck clean.
+
+### Hard dependency
+polaris-api ≥ **0.20.1** (ships `GET /traffic/sessions/:id/samples` + the
+ring buffer).
+
 ## 0.13.0 — 2026-10-31 (minor)
 
 Traffic Generator (#47) — new /traffic/sessions screen driven by polaris-api 0.20.0.

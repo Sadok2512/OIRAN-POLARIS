@@ -1,5 +1,10 @@
 // 0.13.0 — Traffic Generator (#47) front, driven by polaris-control-api
 // 0.20.0 `/traffic/sessions`.
+// 0.13.1 — Live sparkline per running session: polls the new
+// polaris-api 0.20.1 `/traffic/sessions/:id/samples` endpoint at 1 Hz
+// and draws UL + DL rate traces as an SVG polyline. No new npm dep.
+// The polling stops as soon as the session leaves RUNNING, so a
+// finished session does not keep spamming the API.
 //
 // Rules surfaced to the operator:
 //   - rate_mbps slider pinned to [1, 50]; the help line shows "UDP sans
@@ -25,6 +30,7 @@ import {
   TRAFFIC_RATE_MBPS_MAX,
   TRAFFIC_RATE_MBPS_MIN,
   UDP_LOSSLESS_CEILING_MBPS,
+  fetchTrafficSamples,
   fetchTrafficSessions,
   startTrafficSession,
   stopTrafficSession,
@@ -34,6 +40,7 @@ import {
   type TrafficSession,
   type TrafficSessionRequest,
 } from '@/data/trafficSessionsApi';
+import { TrafficSparkline } from '@/components/TrafficSparkline';
 import { ApiError } from '@shared/api';
 
 const QUERY_KEY = ['polaris', 'traffic-sessions'] as const;
@@ -60,6 +67,40 @@ function stateTone(state: TrafficSession['state']) {
     default:
       return 'mute' as const;
   }
+}
+
+function TrafficSparklineRow({ session }: { session: TrafficSession }) {
+  // 0.13.1 — poll /samples at 1 s while the session is RUNNING. On any
+  // terminal state we leave the last-fetched ring on screen so the
+  // operator keeps the final shape of the run.
+  const isLive = session.state === 'RUNNING' || session.state === 'REQUESTED';
+  const samples = useQuery({
+    queryKey: ['polaris', 'traffic-samples', session.session_id],
+    queryFn: () => fetchTrafficSamples(session.session_id).then((r) => r.items),
+    refetchInterval: isLive ? 1_000 : false,
+    enabled: true,
+  });
+  return (
+    <div
+      className="flex items-center gap-3"
+      data-testid={`traffic-sparkline-row-${session.session_id}`}
+    >
+      <TrafficSparkline
+        samples={samples.data ?? []}
+        label={session.session_id}
+      />
+      <div className="text-xs2 text-mute flex flex-col gap-0.5">
+        <span>
+          <span className="inline-block w-2 h-2 rounded-full bg-ok mr-1" />
+          UL
+        </span>
+        <span>
+          <span className="inline-block w-2 h-2 rounded-full bg-brand mr-1" />
+          DL
+        </span>
+      </div>
+    </div>
+  );
 }
 
 export function TrafficSessionsPage() {
@@ -278,6 +319,9 @@ export function TrafficSessionsPage() {
                   ))}
                 </div>
               ) : null}
+              <div className="mt-3 border-t border-line pt-3">
+                <TrafficSparklineRow session={session} />
+              </div>
               <div className="mt-3 border-t border-line pt-3 overflow-x-auto">
                 <table className="w-full text-sm2">
                   <thead>

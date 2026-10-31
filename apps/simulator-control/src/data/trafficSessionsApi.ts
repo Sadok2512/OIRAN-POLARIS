@@ -1,5 +1,9 @@
 // 0.13.0 — Typed client for the Traffic Generator contract shipped by
 // polaris-control-api 0.20.0 (#47).
+// 0.13.1 — Adds the per-tick samples endpoint consumed by the live
+// sparklines. The ring is bounded at `SAMPLES_RING_MAX = 60` entries
+// server-side (polaris-api 0.20.1); the front polls at 1 s so a session
+// never streams more than a few bytes per tick to the client.
 //
 // Rules mirrored from the backend (see
 // POLARIS_CONTROL/apps/api/src/traffic_sessions.rs):
@@ -92,6 +96,29 @@ export function stopTrafficSession(sessionId: string) {
   return polarisApi<TrafficSession>(
     `/traffic/sessions/${encodeURIComponent(sessionId)}`,
     { method: 'DELETE' },
+  );
+}
+
+// 0.13.1 — per-tick samples feeding the live chart.
+export const TRAFFIC_SAMPLES_RING_MAX = 60;
+
+export interface TrafficSample {
+  epoch_s: number;
+  bytes_ul_cum: number;
+  bytes_dl_cum: number;
+  rate_ul_bps: number | null;
+  rate_dl_bps: number | null;
+}
+
+export interface TrafficSamplesResponse {
+  items: TrafficSample[];
+  session_id: string;
+  samples_ring_max: number;
+}
+
+export function fetchTrafficSamples(sessionId: string) {
+  return polarisApi<TrafficSamplesResponse>(
+    `/traffic/sessions/${encodeURIComponent(sessionId)}/samples`,
   );
 }
 
