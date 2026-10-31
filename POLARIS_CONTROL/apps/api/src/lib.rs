@@ -3243,7 +3243,7 @@ impl AppState {
             activity_events: Arc::new(activity::ActivityEventStore::new()),
             activity_rate_cache: Arc::new(Mutex::new(BTreeMap::new())),
             traffic_manager: Arc::new(traffic_sessions::TrafficSessionManager::new()),
-            srsran_runtime: Arc::new(srsran_controller::DockerSrsranRuntime),
+            srsran_runtime: Arc::new(srsran_controller::DockerSrsranRuntime::default()),
             srsran_live_enabled: std::env::var("POLARIS_SRSRAN_LIVE_ENABLED")
                 .is_ok_and(|value| value == "true"),
             lte_e2e_certified: std::env::var("POLARIS_LTE_E2E_CERTIFIED")
@@ -4214,10 +4214,42 @@ struct LteLogsQuery {
 }
 
 fn lte_status_value(state: &AppState) -> Result<Value, String> {
-    state
+    let mut value = state
         .srsran_runtime
         .status(state.lte_e2e_certified, state.srsran_live_enabled)
-        .and_then(|status| serde_json::to_value(status).map_err(|_| "SRSRAN_STATUS_INVALID".into()))
+        .and_then(|status| serde_json::to_value(status).map_err(|_| "SRSRAN_STATUS_INVALID".into()))?;
+    let grant_active = active_lte_run_grant(state).is_some();
+    let safety_ready = lte_start_resource_gate(state).is_ok();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("grant_active".into(), Value::Bool(grant_active));
+        object.insert("safety_ready".into(), Value::Bool(safety_ready));
+        let runtime_ready = object.get("traffic_ready").and_then(Value::as_bool).unwrap_or(false);
+        object.insert("traffic_allowed".into(), Value::Bool(runtime_ready && grant_active && safety_ready));
+    }
+    Ok(value)
+}
+
+fn active_lte_run_grant(state: &AppState) -> Option<lte_grant::GrantRecord> {
+    let now = epoch_millis();
+    state.lte_grants_v2.lock().ok()?.records().iter().find(|grant| {
+        grant.state == lte_grant::GrantState::Consumed
+            && grant.run_id.is_some()
+            && now < grant.expires_at_epoch_ms
+            && !matches!(
+                grant.run_state.as_deref(),
+                Some("STOPPED" | "FAILED" | "CANCEL_REQUESTED" | "CLEANUP_FAILED")
+            )
+    }).cloned()
+}
+
+fn lte_run_is_terminal_or_cancelled(state: &AppState, run_id: &str) -> bool {
+    state.lte_grants_v2.lock().ok().and_then(|store| store.records().iter()
+        .find(|grant| grant.run_id.as_deref() == Some(run_id))
+        .and_then(|grant| grant.run_state.as_deref().map(str::to_string)))
+        .is_some_and(|run_state| matches!(
+            run_state.as_str(),
+            "CANCEL_REQUESTED" | "STOPPED" | "FAILED" | "CLEANUP_FAILED"
+        ))
 }
 
 async fn lte_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -4244,6 +4276,9 @@ async fn lte_profile(State(state): State<Arc<AppState>>, AxumPath(profile_id): A
             "revision":profile.revision, "owner":profile.owner, "enabled":profile.enabled,
             "runtime_state":"STOPPED", "apn":"internet", "max_running_ues":1,
             "configuration_sha256":profile.configuration_sha256, "grant_required":true,
+            "scenario_id":lte_grant::SCENARIO_ID,
+            "scenario_revision":1,
+            "scenario_sha256":lte_grant::SCENARIO_SHA256,
             "last_observed_at_epoch_s":epoch_seconds(), "evidence_schema":"polaris.lte-evidence.v1"
     })))
 }
@@ -4283,8 +4318,21 @@ async fn create_lte_run(
     Json(request): Json<lte_grant::RunRequest>,
 ) -> impl IntoResponse {
     if let Err(error) = require_operator(&identity) { return error; }
+    let Some(issuer_subject) = identity.session_id.as_deref() else {
+        return (StatusCode::FORBIDDEN, Json(json!({"error":"AUTHENTICATED_SESSION_REQUIRED"})));
+    };
     if state.execution_mode != "live" || !state.srsran_live_enabled || !state.lte_e2e_certified {
         return (StatusCode::LOCKED, Json(json!({"error":"LTE_E2E_CERTIFICATION_REQUIRED"})));
+    }
+    let profile_ready = state.lte_profile_registry.lock().is_ok_and(|registry| {
+        let profile = registry.profile();
+        profile.enabled
+            && profile.owner == "POLARIS_CONTROLLER"
+            && profile.revision == request.profile_revision
+            && profile.profile_id == request.profile_id
+    });
+    if !profile_ready {
+        return (StatusCode::LOCKED, Json(json!({"error":"LTE_PROFILE_NOT_READY"})));
     }
     if let Err(error) = lte_start_resource_gate(&state) {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":error})));
@@ -4305,7 +4353,15 @@ async fn create_lte_run(
     let run_id = format!("lte-run-{}", random_hex(16));
     let result = state.lte_grants_v2.lock()
         .map_err(|_| "LTE_GRANT_STORE_UNAVAILABLE".to_string())
-        .and_then(|mut store| store.consume(&request, nonce, idempotency_key, run_id, epoch_millis()));
+        .and_then(|mut store| store.consume(
+            &request,
+            nonce,
+            idempotency_key,
+            run_id,
+            epoch_millis(),
+            &identity.role,
+            issuer_subject,
+        ));
     let run = match result {
         Ok(run) => run,
         Err(error) => {
@@ -4320,12 +4376,119 @@ async fn create_lte_run(
             return (status, Json(json!({"error":error})));
         }
     };
-    if let Err(error) = state.srsran_runtime.start(srsran_controller::Target::Enb) {
+    let _ = state.lte_grants_v2.lock().map(|mut store| {
+        let _ = store.set_run_state(&run.run_id, "ENB_STARTING");
+    });
+    let runtime = state.srsran_runtime.clone();
+    let enb_start = tokio::task::spawn_blocking(move || {
+        runtime.start(srsran_controller::Target::Enb)
+    }).await;
+    let enb_start = match enb_start {
+        Ok(result) => result,
+        Err(_) => Err("SRSRAN_START_WORKER_FAILED".into()),
+    };
+    if let Err(error) = enb_start {
+        let _ = state.lte_grants_v2.lock().map(|mut store| {
+            let _ = store.set_run_state(&run.run_id, "FAILED");
+        });
         audit(&state, &identity.role, "LTE_RUN_START", &error, Some(&run.run_id));
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":error,"run_id":run.run_id,"cleanup_required":true})));
     }
     audit(&state, &identity.role, "LTE_RUN_START", "ENB_STARTING", Some(&run.run_id));
+    tokio::spawn(orchestrate_lte_run(
+        state.clone(),
+        run.run_id.clone(),
+        run.deadline_at_epoch_ms,
+    ));
     (StatusCode::ACCEPTED, Json(serde_json::to_value(run).unwrap()))
+}
+
+async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_epoch_ms: u64) {
+    async fn set_state(state: &AppState, run_id: &str, value: &str) {
+        let _ = state.lte_grants_v2.lock().map(|mut store| {
+            let _ = store.set_run_state(run_id, value);
+        });
+    }
+    async fn cleanup(state: &AppState, run_id: &str, terminal: &str) {
+        set_state(state, run_id, "CANCEL_REQUESTED").await;
+        let runtime = state.srsran_runtime.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let normalize = |result: Result<(), String>| match result {
+                Err(error) if error == "SRSRAN_SERVICE_NOT_FOUND" => Ok(()),
+                other => other,
+            };
+            let ue = normalize(runtime.stop(srsran_controller::Target::Ue));
+            let enb = normalize(runtime.stop(srsran_controller::Target::Enb));
+            (ue, enb)
+        }).await;
+        let clean = matches!(result, Ok((Ok(()), Ok(()))));
+        set_state(state, run_id, if clean { terminal } else { "CLEANUP_FAILED" }).await;
+    }
+    async fn wait_for<F>(state: &AppState, run_id: &str, deadline_ms: u64, predicate: F) -> bool
+    where
+        F: Fn(&srsran_controller::LteStatus) -> bool,
+    {
+        loop {
+            if lte_run_is_terminal_or_cancelled(state, run_id) {
+                return false;
+            }
+            if epoch_millis() >= deadline_ms {
+                return false;
+            }
+            let runtime = state.srsran_runtime.clone();
+            let certified = state.lte_e2e_certified;
+            let enabled = state.srsran_live_enabled;
+            let status = tokio::task::spawn_blocking(move || runtime.status(certified, enabled)).await;
+            if matches!(status, Ok(Ok(ref observed)) if predicate(observed)) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    let s1_deadline = epoch_millis().saturating_add(30_000).min(deadline_at_epoch_ms);
+    set_state(&state, &run_id, "S1_WAIT").await;
+    if !wait_for(&state, &run_id, s1_deadline, |status| {
+        status.enb.process_state == "running"
+            && status.epc.process_state == "running"
+            && status.s1_state == "CONNECTED"
+    }).await {
+        if lte_run_is_terminal_or_cancelled(&state, &run_id) {
+            return;
+        }
+        cleanup(&state, &run_id, "FAILED").await;
+        return;
+    }
+
+    set_state(&state, &run_id, "UE_STARTING").await;
+    let runtime = state.srsran_runtime.clone();
+    let ue_start = tokio::task::spawn_blocking(move || runtime.start(srsran_controller::Target::Ue)).await;
+    if !matches!(ue_start, Ok(Ok(()))) {
+        cleanup(&state, &run_id, "FAILED").await;
+        return;
+    }
+
+    set_state(&state, &run_id, "ATTACH_WAIT").await;
+    let attach_deadline = epoch_millis().saturating_add(90_000).min(deadline_at_epoch_ms);
+    if !wait_for(&state, &run_id, attach_deadline, |status| {
+        status.attach_state == "ATTACHED"
+            && status.session_state == "ACTIVE"
+            && status.ue_ip.is_some()
+    }).await {
+        if lte_run_is_terminal_or_cancelled(&state, &run_id) {
+            return;
+        }
+        cleanup(&state, &run_id, "FAILED").await;
+        return;
+    }
+
+    set_state(&state, &run_id, "RUNNING").await;
+    let remaining = deadline_at_epoch_ms.saturating_sub(epoch_millis());
+    tokio::time::sleep(std::time::Duration::from_millis(remaining)).await;
+    if lte_run_is_terminal_or_cancelled(&state, &run_id) {
+        return;
+    }
+    cleanup(&state, &run_id, "EXPIRED_CLEANUP_COMPLETE").await;
 }
 
 async fn get_lte_run(State(state): State<Arc<AppState>>, AxumPath(run_id): AxumPath<String>) -> impl IntoResponse {
@@ -4334,7 +4497,11 @@ async fn get_lte_run(State(state): State<Arc<AppState>>, AxumPath(run_id): AxumP
     match record {
         Some(grant) => (StatusCode::OK, Json(json!({
             "run_id":run_id, "grant_id":grant.grant_id, "profile_id":grant.target.profile_id,
-            "state":if grant.state == lte_grant::GrantState::RecoveryOnly {"RECOVERY_ONLY"} else {"PREFLIGHT"},
+            "state":if grant.state == lte_grant::GrantState::RecoveryOnly {
+                "RECOVERY_ONLY".to_string()
+            } else {
+                grant.run_state.unwrap_or_else(|| "UNKNOWN".into())
+            },
             "deadline_at_epoch_ms":grant.expires_at_epoch_ms, "evidence_schema":"polaris.lte-evidence.v1"
         }))),
         None => (StatusCode::NOT_FOUND, Json(json!({"error":"LTE_RUN_NOT_FOUND"}))),
@@ -4346,19 +4513,34 @@ async fn stop_lte_run(
     AxumPath(run_id): AxumPath<String>,
 ) -> impl IntoResponse {
     if let Err(error) = require_operator(&identity) { return error; }
-    let known = state.lte_grants_v2.lock().is_ok_and(|store| store.records().iter()
-        .any(|grant| grant.run_id.as_deref() == Some(run_id.as_str())));
-    if !known { return (StatusCode::NOT_FOUND, Json(json!({"error":"LTE_RUN_NOT_FOUND"}))); }
+    let existing_state = state.lte_grants_v2.lock().ok().and_then(|store| store.records().iter()
+        .find(|grant| grant.run_id.as_deref() == Some(run_id.as_str()))
+        .and_then(|grant| grant.run_state.clone()));
+    if existing_state.is_none() { return (StatusCode::NOT_FOUND, Json(json!({"error":"LTE_RUN_NOT_FOUND"}))); }
+    if existing_state.as_deref() == Some("STOPPED") {
+        return (StatusCode::OK, Json(json!({"run_id":run_id,"state":"STOPPED","idempotent":true})));
+    }
+    let _ = state.lte_grants_v2.lock().map(|mut store| {
+        let _ = store.set_run_state(&run_id, "CANCEL_REQUESTED");
+    });
     let ue = state.srsran_runtime.stop(srsran_controller::Target::Ue);
     let enb = state.srsran_runtime.stop(srsran_controller::Target::Enb);
     match (ue, enb) {
         (Ok(()), Ok(())) => {
+            let _ = state.lte_grants_v2.lock().map(|mut store| {
+                let _ = store.set_run_state(&run_id, "STOPPED");
+            });
             audit(&state, &identity.role, "LTE_RUN_STOP", "STOPPED", Some(&run_id));
-            (StatusCode::OK, Json(json!({"run_id":run_id,"state":"STOPPED"})))
+            (StatusCode::OK, Json(json!({"run_id":run_id,"state":"STOPPED","idempotent":false})))
         }
-        (ue, enb) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-            "error":"LTE_CLEANUP_FAILED", "ue_cleanup":ue.err(), "enb_cleanup":enb.err(), "run_id":run_id
-        }))),
+        (ue, enb) => {
+            let _ = state.lte_grants_v2.lock().map(|mut store| {
+                let _ = store.set_run_state(&run_id, "CLEANUP_FAILED");
+            });
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+                "error":"LTE_CLEANUP_FAILED", "ue_cleanup":ue.err(), "enb_cleanup":enb.err(), "run_id":run_id
+            })))
+        },
     }
 }
 
@@ -4499,6 +4681,13 @@ async fn stop_lte_component(
         Ok(target) => target,
         Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":error}))),
     };
+    // A stop does not need an active live grant, but it may only target a
+    // process whose exact container ID is recorded in POLARIS' ownership
+    // ledger. Grant expiry/revocation can never substitute for ownership.
+    if let Err(error) = state.srsran_runtime.verify_ownership(target) {
+        audit(&state, &identity.role, "SRSRAN_STOP", &error, Some(target.id()));
+        return (StatusCode::LOCKED, Json(json!({"error":error})));
+    }
     // Stop is deliberately grant-exempt: revocation/expiry must never trap
     // a controller-owned LTE process in a running state.
     let already_stopped = state
@@ -7697,7 +7886,6 @@ async fn ues(
     if let Some(lte) = lte_snapshot.as_ref() {
         let lte_granted = grant_covered_ids.contains(srsran_controller::LTE_UE_ID);
         let running = lte.ue.process_state == "running";
-        let attached = lte.attach_state == "ATTACHED";
         items.push(json!({
             "id":srsran_controller::LTE_UE_ID,
             "internal_ue_id":srsran_controller::LTE_UE_ID,
@@ -7719,12 +7907,12 @@ async fn ues(
             "traffic_state":if running {"IDLE"}else{"STOPPED"},
             "uptime_seconds":Value::Null,
             "last_event":lte.ue.last_error,
-            "controller_owned":true,
-            "ownership":"POLARIS_CONTROLLER",
+            "controller_owned":lte.ue.controller_owned,
+            "ownership":if lte.ue.controller_owned {"POLARIS_CONTROLLER"}else{"UNVERIFIED"},
             "subscriber_identity":if identity_exposed {"PROTECTED"}else{"PROTECTED"},
             "authentication_material":"PROTECTED",
             "control_authorized":lte_granted,
-            "traffic_target_verified":attached && lte.ue_ip.is_some(),
+            "traffic_target_verified":lte.traffic_ready && lte_granted,
             "actions":{
                 "authorize":state.lte_e2e_certified && state.srsran_live_enabled && !lte_granted,
                 "start":state.lte_e2e_certified && state.srsran_live_enabled && lte_granted && !running,
@@ -7733,8 +7921,8 @@ async fn ues(
                 "stop_reason":if running {"READY"}else{"UE_NOT_RUNNING"},
                 "pdu_start":false,
                 "pdu_stop":false,
-                "traffic":attached && lte.ue_ip.is_some(),
-                "traffic_reason":if attached && lte.ue_ip.is_some() {"READY"}else{"LTE_ATTACH_OR_IP_NOT_OBSERVED"},
+                "traffic":lte.traffic_ready && lte_granted,
+                "traffic_reason":if !lte.ownership_verified {"SRSRAN_CONTROLLER_OWNERSHIP_REQUIRED"}else if !lte_granted {"LTE_LIVE_GRANT_REQUIRED"}else if lte.traffic_ready {"READY"}else{"LTE_ATTACH_OR_IP_NOT_OBSERVED"},
                 "reason":if state.lte_e2e_certified && state.srsran_live_enabled {"LIVE_GRANT_REQUIRED"}else{"LTE_E2E_CERTIFICATION_REQUIRED"}
             }
         }));
@@ -8803,7 +8991,8 @@ async fn post_traffic_session(
             Json(json!({"error":code})),
         );
     }
-    if !active_grant_covers(&state, &request.ue_ids) {
+    let lte_request = request.ue_ids.iter().any(|id| id == srsran_controller::LTE_UE_ID);
+    if !lte_request && !active_grant_covers(&state, &request.ue_ids) {
         audit(
             &state,
             &identity.role,
@@ -8815,6 +9004,42 @@ async fn post_traffic_session(
             StatusCode::LOCKED,
             Json(json!({"error":"TRAFFIC_SESSION_GRANT_REQUIRED"})),
         );
+    }
+    if lte_request {
+        if request.ue_ids.len() != 1 || state.execution_mode != "live" || !state.lte_e2e_certified || !state.srsran_live_enabled {
+            return (StatusCode::LOCKED, Json(json!({"error":"LTE_E2E_CERTIFICATION_REQUIRED"})));
+        }
+        let status = match state.srsran_runtime.status(state.lte_e2e_certified, state.srsran_live_enabled) {
+            Ok(status) => status,
+            Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":error}))),
+        };
+        if !status.ownership_verified {
+            return (StatusCode::LOCKED, Json(json!({"error":"SRSRAN_CONTROLLER_OWNERSHIP_REQUIRED"})));
+        }
+        if !status.traffic_ready {
+            return (StatusCode::LOCKED, Json(json!({"error":"LTE_ATTACH_IP_SESSION_NOT_VERIFIED"})));
+        }
+        if let Err(error) = lte_start_resource_gate(&state) {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":error})));
+        }
+        let Some(grant) = active_lte_run_grant(&state) else {
+            return (StatusCode::LOCKED, Json(json!({"error":"LTE_GRANT_V2_CONSUMED_RUN_REQUIRED"})));
+        };
+        let required_actions: &[&str] = match request.direction {
+            traffic_sessions::Direction::Ul => &["udp_ul"],
+            traffic_sessions::Direction::Dl => &["udp_dl"],
+            traffic_sessions::Direction::Both => &["udp_ul", "udp_dl"],
+        };
+        if !matches!(request.protocol, traffic_sessions::Protocol::Udp)
+            || required_actions.iter().any(|required| {
+                !grant.constraints.allowed_actions.iter().any(|action| action == required)
+            })
+            || u64::from(request.rate_mbps) * 1_000_000
+                > grant.constraints.udp.max_rate_bps_per_direction
+            || request.duration_s > grant.constraints.udp.max_duration_seconds_per_direction
+        {
+            return (StatusCode::LOCKED, Json(json!({"error":"LTE_TRAFFIC_OUTSIDE_GRANT_CONSTRAINTS"})));
+        }
     }
     let session = match state.traffic_manager.start(request.clone()) {
         Ok(session) => session,
@@ -8834,7 +9059,11 @@ async fn post_traffic_session(
             Json(json!({"error":code})),
         );
     }
-    spawn_traffic_driver(state.clone(), session.session_id.clone(), request);
+    if lte_request {
+        spawn_lte_traffic_driver(state.clone(), session.session_id.clone(), request);
+    } else {
+        spawn_traffic_driver(state.clone(), session.session_id.clone(), request);
+    }
     audit(
         &state,
         &identity.role,
@@ -8843,6 +9072,24 @@ async fn post_traffic_session(
         Some(&session.session_id),
     );
     (StatusCode::CREATED, Json(serde_json::to_value(session).unwrap()))
+}
+
+fn spawn_lte_traffic_driver(state: Arc<AppState>, session_id: String, request: traffic_sessions::SessionRequest) {
+    tokio::spawn(async move {
+        let direction = match request.direction { traffic_sessions::Direction::Ul=>"ul", traffic_sessions::Direction::Dl=>"dl", traffic_sessions::Direction::Both=>"both" };
+        let protocol = match request.protocol { traffic_sessions::Protocol::Udp=>"udp", traffic_sessions::Protocol::Tcp=>"tcp" };
+        let mut cumulative_ul=0u64; let mut cumulative_dl=0u64;
+        for _ in 0..request.duration_s.max(1) {
+            if !state.traffic_manager.get(&session_id).is_some_and(|s| matches!(s.state,traffic_sessions::SessionState::Running)){return}
+            let runtime=state.srsran_runtime.clone(); let direction=direction.to_string(); let protocol=protocol.to_string(); let rate=request.rate_mbps;
+            let measured=tokio::task::spawn_blocking(move||runtime.measure_traffic(&direction,&protocol,rate)).await;
+            let measurement=match measured { Ok(Ok(m))=>m, Ok(Err(e))=>{let _=state.traffic_manager.fail(&session_id,e);return}, Err(_)=>{let _=state.traffic_manager.fail(&session_id,"LTE_TRAFFIC_WORKER_JOIN_FAILED".into());return} };
+            cumulative_ul=cumulative_ul.saturating_add(measurement.bytes_ul); cumulative_dl=cumulative_dl.saturating_add(measurement.bytes_dl);
+            let _=state.traffic_manager.record_measurement(&session_id,srsran_controller::LTE_UE_ID,measurement.bytes_ul,measurement.bytes_dl,measurement.rate_ul_bps,measurement.rate_dl_bps,vec![]);
+            let _=state.traffic_manager.push_sample(&session_id,traffic_sessions::TrafficSample{epoch_s:epoch_seconds(),bytes_ul_cum:cumulative_ul,bytes_dl_cum:cumulative_dl,rate_ul_bps:measurement.rate_ul_bps,rate_dl_bps:measurement.rate_dl_bps});
+        }
+        let _=state.traffic_manager.complete(&session_id);
+    });
 }
 
 async fn get_traffic_session(
@@ -9426,6 +9673,35 @@ fn cancellable_wait(control: &DefinitionJobControl, duration_ms: u64) -> Result<
     Ok(())
 }
 
+fn ensure_lte_attached(state: &AppState, control: &DefinitionJobControl) -> Result<Value, String> {
+    let before = state.srsran_runtime.status(state.lte_e2e_certified, state.srsran_live_enabled)?;
+    let started_enb = before.enb.process_state != "running";
+    if started_enb { state.srsran_runtime.start(srsran_controller::Target::Enb)?; }
+    else { state.srsran_runtime.verify_ownership(srsran_controller::Target::Enb)?; }
+    if before.ue.process_state != "running" {
+        if let Err(error) = state.srsran_runtime.start(srsran_controller::Target::Ue) {
+            if started_enb { let _ = state.srsran_runtime.stop(srsran_controller::Target::Enb); }
+            return Err(error);
+        }
+    } else { state.srsran_runtime.verify_ownership(srsran_controller::Target::Ue)?; }
+    control.started_ues.lock().map_err(|_|"SCENARIO_RUNTIME_UNAVAILABLE".to_string())?.insert(srsran_controller::LTE_UE_ID.into());
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);
+    while std::time::Instant::now()<deadline {
+        if control.cancel.load(Ordering::SeqCst) { return Err("SCENARIO_STOP_REQUESTED".into()); }
+        let status=state.srsran_runtime.status(state.lte_e2e_certified,state.srsran_live_enabled)?;
+        if status.traffic_ready { return Ok(json!({"attach_state":status.attach_state,"s1_state":status.s1_state,"ue_ip":status.ue_ip,"session_state":status.session_state})); }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    Err("LTE_ATTACH_TIMEOUT".into())
+}
+
+fn run_lte_scenario_traffic(state:&AppState,step:&ResolvedStep,direction:&str)->Result<Value,String>{
+    let bytes=resolved_parameter_u64(step,"bytes",1,200*1024*1024)?;
+    let rate=((bytes.saturating_mul(8).saturating_add(999_999))/1_000_000).clamp(1,50) as u32;
+    let measured=state.srsran_runtime.measure_traffic(direction,"tcp",rate)?;
+    Ok(json!({"measured_ul_bytes":measured.bytes_ul,"measured_dl_bytes":measured.bytes_dl,"rate_ul_bps":measured.rate_ul_bps,"rate_dl_bps":measured.rate_dl_bps}))
+}
+
 /// 0.19.1 — Tagged helper that pushes a per-UE event when a scenario
 /// step branch succeeds OR fails. Returns the original result unchanged
 /// so the `?` operator in each branch keeps propagating the error.
@@ -9460,6 +9736,16 @@ fn execute_live_definition_step(
     control: &DefinitionJobControl,
 ) -> Result<Value, String> {
     match step.step_type.as_str() {
+        "lte_attach" => ensure_lte_attached(state, control),
+        "lte_detach" => {
+            state.srsran_runtime.verify_ownership(srsran_controller::Target::Ue)?;
+            state.srsran_runtime.stop(srsran_controller::Target::Ue)?;
+            control.started_ues.lock().map_err(|_|"SCENARIO_RUNTIME_UNAVAILABLE".to_string())?.remove(srsran_controller::LTE_UE_ID);
+            Ok(json!({"attach_state":"UNKNOWN","process_state":"STOPPED"}))
+        }
+        "lte_traffic_ul" => run_lte_scenario_traffic(state,step,"ul"),
+        "lte_traffic_dl" => run_lte_scenario_traffic(state,step,"dl"),
+        "lte_attach_data" => { let attach=ensure_lte_attached(state,control)?; let traffic=run_lte_scenario_traffic(state,step,"both")?; Ok(json!({"attach":attach,"traffic":traffic})) },
         "wait" => {
             let duration_ms = resolved_parameter_u64(step, "duration_ms", 1_000, 120_000)?;
             cancellable_wait(control, duration_ms)?;
@@ -9972,6 +10258,13 @@ fn cleanup_definition_started_ues(state: &AppState, control: &DefinitionJobContr
         .unwrap_or_default();
     let mut errors = Vec::new();
     for ue_id in started {
+        if ue_id == srsran_controller::LTE_UE_ID {
+            let result = state.srsran_runtime.verify_ownership(srsran_controller::Target::Ue)
+                .and_then(|_| state.srsran_runtime.stop(srsran_controller::Target::Ue));
+            if let Err(error)=result { errors.push(format!("{ue_id}:{error}")); }
+            else if let Ok(mut ids)=control.started_ues.lock(){ids.remove(&ue_id);}
+            continue;
+        }
         let approval = definition_job_approval(control, &ue_id).ok().flatten();
         let result = if let Some(approval) = approval.as_ref() {
             stop_one_live_for_definition(state, &ue_id, approval)
@@ -10138,7 +10431,8 @@ fn start_live_definition_scenario(
         ));
     }
     let profiles = state.multi_ue.lock().unwrap().profiles();
-    if ue_ids.iter().any(|ue_id| {
+    let lte_job = ue_ids == [srsran_controller::LTE_UE_ID.to_string()];
+    if !lte_job && ue_ids.iter().any(|ue_id| {
         !controller_owns_ue(&state, ue_id)
             || !profiles.iter().any(|profile| profile.ue_id == *ue_id)
     }) {
@@ -10570,12 +10864,18 @@ async fn start_scenario(
             )
         });
         if has_lte_steps && state.execution_mode != "mock" {
-            // The catalog and mock executor are delivered now, but live LTE
-            // remains closed until ANR1 certification and an explicit deploy.
-            return (
-                StatusCode::LOCKED,
-                Json(json!({"error":"LTE_E2E_CERTIFICATION_REQUIRED"})),
-            );
+            if state.execution_mode != "live" || !state.lte_e2e_certified || !state.srsran_live_enabled {
+                return (StatusCode::LOCKED, Json(json!({"error":"LTE_E2E_CERTIFICATION_REQUIRED"})));
+            }
+            if input.ue_ids != [srsran_controller::LTE_UE_ID.to_string()] || active_lte_run_grant(&state).is_none() {
+                return (StatusCode::LOCKED, Json(json!({"error":"LTE_GRANT_V2_CONSUMED_RUN_REQUIRED"})));
+            }
+            if let Err(error) = state.srsran_runtime.verify_ownership(srsran_controller::Target::Ue) {
+                return (StatusCode::LOCKED, Json(json!({"error":error})));
+            }
+            if let Err(error) = lte_start_resource_gate(&state) {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":error})));
+            }
         }
         if resolved.iter().any(|step| step.step_type == "traffic_dl") {
             if dl_sender_health(&state).is_err() {
@@ -11040,11 +11340,6 @@ fn epoch_millis_u128() -> u128 {
         .as_millis()
 }
 
-fn purge_expired_grants(grants: &mut Vec<LiveGrant>) {
-    let now = epoch_millis_u128();
-    grants.retain(|g| g.is_active(now));
-}
-
 async fn create_live_grant(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
@@ -11061,6 +11356,9 @@ async fn create_live_grant(
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":"LIVE_GRANT_SCHEMA_AMBIGUOUS"})));
     }
     if has_v2 {
+        let Some(issuer_subject) = identity.session_id.as_deref() else {
+            return (StatusCode::FORBIDDEN, Json(json!({"error":"AUTHENTICATED_SESSION_REQUIRED"})));
+        };
         let request: lte_grant::GrantRequestV2 = match serde_json::from_value(body) {
             Ok(request) => request,
             Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":"LIVE_GRANT_SCHEMA_INVALID"}))),
@@ -11082,7 +11380,14 @@ async fn create_live_grant(
         let grant_id = format!("grant-{}", random_hex(16));
         let result = state.lte_grants_v2.lock()
             .map_err(|_| "LTE_GRANT_STORE_UNAVAILABLE".to_string())
-            .and_then(|mut store| store.create(request, grant_id, epoch_millis(), &identity.role, idempotency_key));
+            .and_then(|mut store| store.create(
+                request,
+                grant_id,
+                epoch_millis(),
+                &identity.role,
+                issuer_subject,
+                idempotency_key,
+            ));
         return match result {
             Ok((grant, idempotent)) => {
                 audit(&state, &identity.role, "LTE_LIVE_GRANT_CREATE", if idempotent {"IDEMPOTENT"} else {"ISSUED"}, Some(&grant.grant_id));
@@ -11142,7 +11447,7 @@ async fn create_live_grant(
     }
     let now = epoch_millis_u128();
     let expires = now.saturating_add(u128::from(request.duration_minutes) * 60_000);
-    let id = format!("grant-{:x}", now);
+    let id = format!("grant-{}", random_hex(16));
     let grant = LiveGrant {
         id: id.clone(),
         ue_ids: request.ue_ids.clone(),
@@ -11162,7 +11467,6 @@ async fn create_live_grant(
                 );
             }
         };
-        purge_expired_grants(&mut grants);
         grants.push(grant.clone());
     }
     audit(
@@ -11191,7 +11495,8 @@ async fn list_live_grants(
             );
         }
     };
-    purge_expired_grants(&mut grants);
+    let now = epoch_millis_u128();
+    grants.retain(|grant| grant.is_active(now));
     let lte_grants = state.lte_grants_v2.lock().map(|store| store.records().iter()
         .map(lte_grant::GrantRecord::public_json).collect::<Vec<_>>()).unwrap_or_default();
     (
@@ -11215,6 +11520,25 @@ async fn revoke_live_grant(
     }
     let v2 = state.lte_grants_v2.lock().ok().and_then(|mut store| store.revoke(&id).ok());
     if let Some(grant) = v2 {
+        if let Some(run_id) = grant.run_id.as_deref() {
+            let _ = state.lte_grants_v2.lock().map(|mut store| {
+                let _ = store.set_run_state(run_id, "CANCEL_REQUESTED");
+            });
+            let runtime = state.srsran_runtime.clone();
+            let cleanup = tokio::task::spawn_blocking(move || {
+                let ue = runtime.stop(srsran_controller::Target::Ue);
+                let enb = runtime.stop(srsran_controller::Target::Enb);
+                (ue, enb)
+            }).await;
+            let terminal = if matches!(cleanup, Ok((Ok(()), Ok(())))) {
+                "STOPPED"
+            } else {
+                "CLEANUP_FAILED"
+            };
+            let _ = state.lte_grants_v2.lock().map(|mut store| {
+                let _ = store.set_run_state(run_id, terminal);
+            });
+        }
         audit(&state, &identity.role, "LTE_LIVE_GRANT_REVOKE", "REVOKED", Some(&id));
         return (StatusCode::OK, Json(grant.public_json()));
     }
@@ -11228,7 +11552,6 @@ async fn revoke_live_grant(
                 );
             }
         };
-        purge_expired_grants(&mut grants);
         let mut hit = false;
         for g in grants.iter_mut() {
             if g.id == id {
@@ -12365,6 +12688,19 @@ mod p0_tests {
             .unwrap();
         assert_eq!(start.status(), StatusCode::LOCKED);
         assert!(runtime.started.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lte_stop_rejects_unowned_service_even_for_operator_without_requiring_grant() {
+        let runtime = srsran_controller::MockSrsranRuntime::default();
+        *runtime.ownership_verified.lock().unwrap() = false;
+        let mut test_state = state();
+        test_state.srsran_runtime = Arc::new(runtime.clone());
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let response = application.oneshot(Request::builder().method(Method::POST).uri("/api/v1/lte/components/stop").header(header::CONTENT_TYPE,"application/json").header(header::COOKIE,cookie).header("x-csrf-token",csrf).body(Body::from(json!({"component":"LTE-SRSUE-TEST-01","ue_id":"LTE-SRSUE-TEST-01"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::LOCKED);
+        assert!(runtime.stopped.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

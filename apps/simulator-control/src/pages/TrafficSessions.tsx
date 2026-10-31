@@ -110,6 +110,7 @@ export function TrafficSessionsPage() {
   const canOperate = auth.data?.can_start === true;
   const client = useQueryClient();
   const lte = useLteStatus();
+  const lteTrafficAllowed = lte.data?.traffic_allowed === true;
 
   const [ueIds, setUeIds] = useState('UE-01');
   const [technology, setTechnology] = useState<RadioTechnology>('5G_SA');
@@ -181,11 +182,16 @@ export function TrafficSessionsPage() {
           onChange={(next) => {
             setTechnology(next);
             setUeIds(next === 'LTE' ? 'LTE-SRSUE-TEST-01' : 'UE-01');
+            if (next === 'LTE') {
+              setProtocol('UDP');
+              setRateMbps(1);
+              setDurationS(30);
+            }
           }}
         />
         {technology === 'LTE' ? (
           <span className="text-ep-sm text-warn">
-            LTE traffic remains locked until E2E certification; attach state: {lte.data?.attach_state ?? 'NOT OBSERVED'}.
+            LTE traffic: {lteTrafficAllowed ? 'READY' : 'LOCKED'}; attach: {lte.data?.attach_state ?? 'UNKNOWN'}; ownership: {lte.data?.ownership_verified ? 'VERIFIED' : 'UNVERIFIED'}.
           </span>
         ) : null}
       </div>
@@ -226,7 +232,7 @@ export function TrafficSessionsPage() {
               data-testid="traffic-protocol"
             >
               <option value="UDP">UDP</option>
-              <option value="TCP">TCP</option>
+              <option value="TCP" disabled={technology === 'LTE'}>TCP</option>
             </select>
           </label>
           <label className="flex flex-col gap-1 text-sm2">
@@ -239,7 +245,7 @@ export function TrafficSessionsPage() {
             <input
               type="range"
               min={TRAFFIC_RATE_MBPS_MIN}
-              max={TRAFFIC_RATE_MBPS_MAX}
+              max={technology === 'LTE' ? 1 : TRAFFIC_RATE_MBPS_MAX}
               value={rateMbps}
               onChange={(e) => setRateMbps(Number(e.target.value))}
               data-testid="traffic-rate"
@@ -252,7 +258,7 @@ export function TrafficSessionsPage() {
             <input
               type="range"
               min={TRAFFIC_DURATION_S_MIN}
-              max={TRAFFIC_DURATION_S_MAX}
+              max={technology === 'LTE' ? 30 : TRAFFIC_DURATION_S_MAX}
               value={durationS}
               onChange={(e) => setDurationS(Number(e.target.value))}
               data-testid="traffic-duration"
@@ -264,11 +270,11 @@ export function TrafficSessionsPage() {
             icon={Zap}
             primary
             onClick={submit}
-            disabled={!canOperate || start.isPending || technology === 'LTE'}
-            title={technology === 'LTE' ? 'LTE_E2E_CERTIFICATION_REQUIRED' : canOperate ? undefined : 'Rôle operator requis + grant actif.'}
+            disabled={!canOperate || start.isPending || (technology === 'LTE' && !lteTrafficAllowed)}
+            title={technology === 'LTE' && !lteTrafficAllowed ? 'LTE requires certification, valid grant, verified controller ownership, current attach/IP/session and safety gates.' : canOperate ? undefined : 'Rôle operator requis + grant actif.'}
             data-testid="traffic-start"
           >
-            {start.isPending ? 'Starting…' : technology === 'LTE' ? 'Awaiting LTE certification' : 'Start session'}
+            {start.isPending ? 'Starting…' : technology === 'LTE' && !lteTrafficAllowed ? 'LTE traffic locked' : 'Start session'}
           </Btn>
           {formError ? (
             <span className="text-sm2 text-bad" data-testid="traffic-form-error">
