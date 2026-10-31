@@ -5,7 +5,7 @@ use serde::Deserialize;
 use session_engine::{component, Association, DiscoveryResult, EventRecord, Reconstruction};
 use std::collections::BTreeMap;
 
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.3.1";
 pub const RULE_VERSION: &str = "1.0.0";
 pub const DISCOVERY_RULE_VERSION: &str = "1.1.0";
 pub const SBI_RULE_VERSION: &str = "1.0.0";
@@ -192,24 +192,64 @@ fn tunnel_key(event: &EventRecord) -> Option<TunnelCorrelationKey> {
     tunnel_keys(event).into_iter().next()
 }
 
+fn directional_tunnel_components(value: &str) -> Vec<(String, String)> {
+    let components = value
+        .split(',')
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            Some((key.trim().to_owned(), value.trim().to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut pairs = Vec::new();
+    for direction in ["ul", "dl"] {
+        let endpoint_suffix = format!("tunnel_ip_{direction}");
+        let teid_suffix = format!("gtp_teid_{direction}");
+        for (endpoint_key, endpoint) in components.iter().filter(|(key, _)| {
+            key.as_str() == endpoint_suffix || key.ends_with(&format!("_{endpoint_suffix}"))
+        }) {
+            let prefix = endpoint_key
+                .strip_suffix(&endpoint_suffix)
+                .unwrap_or_default();
+            let teid_key = format!("{prefix}{teid_suffix}");
+            if let Some(teid) = components.get(&teid_key).and_then(|value| normalize_teid(value)) {
+                pairs.push((endpoint.clone(), teid));
+            }
+        }
+    }
+    pairs
+}
+
 fn tunnel_keys(event: &EventRecord) -> Vec<TunnelCorrelationKey> {
     let mut keys = event
         .information_elements
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|ie| {
-            let value = ie.get("value")?.as_str()?;
-            let endpoint_ip =
-                component(value, "tunnel_endpoint_ip").or_else(|| component(value, "ipv4"))?;
-            let teid = component(value, "gtp_teid")
-                .or_else(|| component(value, "teid"))
-                .and_then(|value| normalize_teid(&value))?;
-            Some(TunnelCorrelationKey {
-                endpoint_ip,
-                teid,
-                capture_id: capture_scope(event),
+        .flat_map(|ie| {
+            let Some(value) = ie.get("value").and_then(serde_json::Value::as_str) else {
+                return Vec::new();
+            };
+            let mut components = [
+                ("tunnel_endpoint_ip", "gtp_teid"),
+                ("ipv4", "teid"),
+            ]
+            .into_iter()
+            .filter_map(|(endpoint_name, teid_name)| {
+                let endpoint_ip = component(value, endpoint_name)?;
+                let teid = component(value, teid_name)
+                    .and_then(|value| normalize_teid(&value))?;
+                Some((endpoint_ip, teid))
             })
+            .collect::<Vec<_>>();
+            components.extend(directional_tunnel_components(value));
+            components
+                .into_iter()
+                .map(|(endpoint_ip, teid)| TunnelCorrelationKey {
+                    endpoint_ip,
+                    teid,
+                    capture_id: capture_scope(event),
+                })
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
     keys.sort();
@@ -930,6 +970,40 @@ mod tests {
         assert_eq!(edges[0].evidence_type, "EXACT_TUNNEL_MATCH");
         assert_eq!(edges[0].scope, "tunnel-only");
         assert!(!edges[0].limitations.is_empty());
+    }
+
+    #[test]
+    fn exact_tunnel_match_normalizes_directional_ngap_transfer_fields() {
+        let mut n2 = e(
+            "n2",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            801,
+            &[("pdu_session_id", "1")],
+            json!([{"value":"item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0xf68d"}]),
+        );
+        n2.packet_references[0].source_file =
+            "/var/lib/oiran/captures/continuous-lab-import/pcap/N2.pcap0".into();
+        let mut n4 = e(
+            "n4",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            803,
+            &[],
+            json!([{"value":"teid=0x0000f68d,v4=true,ipv4=10.77.22.13"}]),
+        );
+        n4.packet_references[0].source_file =
+            "/var/lib/oiran/captures/continuous-lab-import/pcap/N4.pcap0".into();
+
+        let edges = correlate_cross_interface_evidence(&[n2, n4]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].evidence_type, "EXACT_TUNNEL_MATCH");
+        assert!(edges[0]
+            .matching_identifiers
+            .iter()
+            .any(|identifier| identifier == "teid=0xf68d"));
     }
 
     #[test]

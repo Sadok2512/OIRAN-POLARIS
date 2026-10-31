@@ -5,6 +5,7 @@
 - Aggregate continuous N3 user-plane observations by TEID, direction, inner flow and QFI while decoding; packet and byte counters plus first/last provenance remain exact without retaining one event per G-PDU.
 - Bound N3 aggregate cardinality and fail an individual segment closed if the limit is exceeded; N2, N4 and SBI signalling remain individual normalized events.
 - Preserve the real packet count in continuous-import activity metrics while storing only first/last N3 packet references.
+- Normalize directional NGAP `tunnel_ip_{ul,dl}` / `gtp_teid_{ul,dl}` fields when building exact N2-to-N4 tunnel evidence (correlation-engine 0.3.1).
 
 ## OIRAN API 2.5.2 / live-probe 0.2.5 - 2026-10-30
 
