@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.7.1 — 2026-10-31
+
+- Remove subscriber and equipment identity fields and identity-bearing decoded
+  information elements from raw API responses instead of returning masked labels.
+- Apply response sanitization at the common success and pagination boundaries for
+  datasets, sessions, events, packets, Call Flow and future read handlers.
+- Add raw JSON regressions for unauthenticated/viewer and operator reads while
+  preserving protocol events, accounting counters and capture provenance.
+
 ## Real-lab read model / API 2.7.0 / live-probe 0.4.0 / Analyzer 2.7.0 — 2026-10-31
 
 - Disable bundled reference dataset loading by default; operational Session Explorer,

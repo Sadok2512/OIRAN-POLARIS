@@ -40,7 +40,7 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.7.0";
+pub const API_VERSION: &str = "2.7.1";
 pub const PLATFORM_VERSION: &str = "2.7.0";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
@@ -60,7 +60,6 @@ struct Inner {
     registry: DatasetRegistry,
     discovery: DiscoveryResult,
     storage_path: PathBuf,
-    html_export: PathBuf,
     capture_manager: CaptureManager,
     probe_registry: ProbeRegistry,
     derived_import_root: PathBuf,
@@ -383,7 +382,6 @@ impl AppState {
                 registry,
                 discovery,
                 storage_path: workspace,
-                html_export,
                 capture_manager,
                 probe_registry,
                 derived_import_root,
@@ -444,7 +442,6 @@ impl AppState {
                 registry: DatasetRegistry::default(),
                 discovery: discover_sessions(&mut Vec::new()),
                 storage_path: workspace,
-                html_export: config.callflow_html,
                 capture_manager,
                 probe_registry,
                 derived_import_root,
@@ -2730,23 +2727,20 @@ async fn export_callflow(
         "audit action=callflow_export session={} format={format}",
         id
     );
+    let mut value = flow_value_for(&state, &id)
+        .cloned()
+        .unwrap_or_else(|| serde_json::to_value(&flow).unwrap_or(json!({})));
+    sanitize_value(&mut value);
     match format {
         "json" => {
-            let mut value = flow_value_for(&state, &id)
-                .cloned()
-                .unwrap_or_else(|| serde_json::to_value(&flow).unwrap_or(json!({})));
-            sanitize_value(&mut value);
             let bytes = serde_json::to_vec_pretty(&value).unwrap_or_default();
             download(bytes, "application/json", "OIRAN_5G_E2E_CALLFLOW.json")
         }
         "html" => {
-            let bytes = if id == state.inner.primary_session_id {
-                fs::read(&state.inner.html_export).ok()
-            } else {
-                callflow_renderer::render(&flow)
-                    .ok()
-                    .map(String::into_bytes)
-            };
+            let bytes = serde_json::from_value::<CallFlow>(value)
+                .ok()
+                .and_then(|flow| callflow_renderer::render(&flow).ok())
+                .map(String::into_bytes);
             match bytes {
                 Some(bytes) => download(
                     bytes,
@@ -2823,7 +2817,8 @@ fn sort_values(items: &mut [Value], field: &str, order: Option<&str>) {
         items.reverse()
     }
 }
-fn paginated(items: Vec<Value>, query: &ListQuery) -> Json<Value> {
+fn paginated(mut items: Vec<Value>, query: &ListQuery) -> Json<Value> {
+    sanitize_all(&mut items);
     let total = items.len();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(25).clamp(1, 100);
@@ -2837,11 +2832,57 @@ fn paginated(items: Vec<Value>, query: &ListQuery) -> Json<Value> {
         json!({"data":data,"meta":{"page":page,"page_size":page_size,"total":total,"total_pages":total.div_ceil(page_size)}}),
     )
 }
-fn ok(data: Value) -> Json<Value> {
+fn ok(mut data: Value) -> Json<Value> {
+    sanitize_value(&mut data);
     Json(json!({"data":data,"meta":{"api_version":API_VERSION}}))
 }
 
-fn sanitize_all(values: &mut [Value]) {
+const IDENTITY_LABEL_MARKERS: &[&str] = &[
+    "imsi",
+    "supi",
+    "suci",
+    "guti",
+    "tmsi",
+    "imei",
+    "imeisv",
+    "msisdn",
+    "mobileidentity",
+    "ueidentitypseudonym",
+    "subscriberidentity",
+    "authenticationkey",
+    "subscriberkey",
+    "securitykey",
+    "opc",
+];
+
+fn normalized_privacy_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_identity_label(value: &str) -> bool {
+    let normalized = normalized_privacy_label(value);
+    IDENTITY_LABEL_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        || matches!(normalized.as_str(), "pei" | "k")
+        || normalized.contains("permanentequipmentidentifier")
+}
+
+fn is_identity_object(value: &Value) -> bool {
+    value.as_object().is_some_and(|map| {
+        ["name", "type", "field", "key"]
+            .iter()
+            .filter_map(|key| map.get(*key).and_then(Value::as_str))
+            .any(is_identity_label)
+    })
+}
+
+fn sanitize_all(values: &mut Vec<Value>) {
+    values.retain(|value| !is_identity_object(value));
     for value in values {
         sanitize_value(value)
     }
@@ -2849,25 +2890,24 @@ fn sanitize_all(values: &mut [Value]) {
 fn sanitize_value(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            let identity_ie = map.get("name").and_then(Value::as_str).is_some_and(|name| {
-                let normalized = name.to_ascii_lowercase();
-                ["imsi","supi","suci","guti","tmsi","imei","authentication key","opc"]
-                    .iter().any(|needle| normalized.contains(needle))
-            });
-            if identity_ie {
-                for field in ["value", "raw_value", "raw_hex", "raw_bytes"] {
-                    if map.contains_key(field) {
-                        map.insert(field.into(), Value::String("IDENTITY_WITHHELD".into()));
-                    }
-                }
+            if ["name", "type", "field", "key"]
+                .iter()
+                .filter_map(|key| map.get(*key).and_then(Value::as_str))
+                .any(is_identity_label)
+            {
+                map.clear();
+                return;
+            }
+            let identity_keys = map
+                .keys()
+                .filter(|key| is_identity_label(key))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in identity_keys {
+                map.remove(&key);
             }
             for (key, v) in map.iter_mut() {
-                let normalized_key = key.to_ascii_lowercase();
-                if ["imsi","supi","suci","guti","tmsi","imei","k","opc","authentication_key"]
-                    .contains(&normalized_key.as_str())
-                {
-                    *v = Value::String("IDENTITY_WITHHELD".into());
-                } else if key == "source_file" {
+                if key == "source_file" {
                     if let Some(path) = v.as_str() {
                         let name = FsPath::new(path)
                             .file_name()
@@ -2883,10 +2923,13 @@ fn sanitize_value(value: &mut Value) {
         Value::Array(items) => sanitize_all(items),
         Value::String(text) => {
             let lower = text.to_ascii_lowercase();
-            if ["imsi-", "supi-", "suci-", "5g-guti-", "5g-tmsi-", "imei-"]
-                .iter().any(|prefix| lower.contains(prefix))
+            if [
+                "imsi-", "supi-", "suci-", "5g-guti-", "5g-tmsi-", "imei-", "imeisv", "msisdn",
+            ]
+            .iter()
+            .any(|prefix| lower.contains(prefix))
             {
-                *text = "IDENTITY_WITHHELD".into();
+                *text = "REDACTED".into();
             }
         }
         _ => {}
@@ -2978,6 +3021,39 @@ mod tests {
     async fn json_body(response: Response) -> Value {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
     }
+    fn assert_no_identity_material(value: &Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, nested) in map {
+                    assert!(
+                        !is_identity_label(key),
+                        "identity-bearing key remained: {key}"
+                    );
+                    assert_no_identity_material(nested);
+                }
+                if let Some(label) = map.get("name").and_then(Value::as_str) {
+                    assert!(!is_identity_label(label), "identity IE remained: {label}");
+                }
+            }
+            Value::Array(items) => items.iter().for_each(assert_no_identity_material),
+            Value::String(text) => {
+                let lower = text.to_ascii_lowercase();
+                for forbidden in [
+                    "masked_imeisv=",
+                    "imsi-",
+                    "supi-",
+                    "suci-",
+                    "5g-guti-",
+                    "5g-tmsi-",
+                    "imei-",
+                    "msisdn=",
+                ] {
+                    assert!(!lower.contains(forbidden), "identity value remained");
+                }
+            }
+            _ => {}
+        }
+    }
     fn lte_import_payload() -> Value {
         json!({
             "schema_version":"oiran.lte-evidence-ingestion.v1",
@@ -3027,17 +3103,137 @@ mod tests {
     }
 
     #[test]
-    fn response_sanitizer_withholds_identity_fields_and_identity_ies() {
+    fn response_sanitizer_removes_identity_fields_and_identity_ies() {
         let mut value = json!({
             "imsi":"synthetic-identity",
             "nested":{"name":"5G-S-TMSI","value":"sensitive","source_file":"/private/a.pcapng"},
-            "description":"subscriber imsi-SYNTHETIC"
+            "description":"subscriber imsi-SYNTHETIC",
+            "useful":"InitialContextSetupRequest",
+            "information_elements":[
+                {"name":"MaskedIMEISV","value":"masked_imeisv=opaque"},
+                {"name":"RAN-UE-NGAP-ID","value":"42"}
+            ]
         });
         sanitize_value(&mut value);
-        assert_eq!(value["imsi"], "IDENTITY_WITHHELD");
-        assert_eq!(value["nested"]["value"], "IDENTITY_WITHHELD");
-        assert_eq!(value["nested"]["source_file"], "capture://a.pcapng");
-        assert_eq!(value["description"], "IDENTITY_WITHHELD");
+        assert!(value.get("imsi").is_none());
+        assert_eq!(value["nested"], json!({}));
+        assert_eq!(value["description"], "REDACTED");
+        assert_eq!(value["useful"], "InitialContextSetupRequest");
+        assert_eq!(value["information_elements"].as_array().unwrap().len(), 1);
+        assert_eq!(value["information_elements"][0]["name"], "RAN-UE-NGAP-ID");
+        assert!(!value.to_string().contains("IDENTITY_WITHHELD"));
+    }
+
+    #[tokio::test]
+    async fn raw_read_routes_remove_identity_material_for_viewer_and_operator() {
+        let fixture = state();
+        let raw = flow_value_for(&fixture, "5g-UE-A-pdu-1").unwrap().clone();
+        assert!(raw.to_string().contains("MaskedIMEISV"));
+        let app = router(fixture, None);
+        for route in [
+            "/api/v1/datasets?page_size=100",
+            "/api/v1/sessions?page_size=100",
+            "/api/v1/sessions/5g-UE-A-pdu-1",
+            "/api/v1/sessions/5g-UE-A-pdu-1/events?page_size=100",
+            "/api/v1/sessions/5g-UE-A-pdu-1/callflow?limit=100",
+            "/api/v1/packets?page_size=100",
+        ] {
+            let response = app.clone().oneshot(req(route, false)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "route {route}");
+            let body = json_body(response).await;
+            assert_no_identity_material(&body);
+            assert_ne!(body["data"], Value::Null, "useful data missing on {route}");
+        }
+
+        let identity_event_id = raw["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event.to_string().contains("MaskedIMEISV"))
+            .and_then(|event| event["event_id"].as_str())
+            .unwrap();
+        for route in [
+            format!("/api/v1/events/{identity_event_id}"),
+            format!("/api/v1/events/{identity_event_id}/provenance"),
+        ] {
+            let response = app.clone().oneshot(req(&route, false)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "route {route}");
+            assert_no_identity_material(&json_body(response).await);
+        }
+
+        let packet_list = app
+            .clone()
+            .oneshot(req("/api/v1/packets?page_size=100", false))
+            .await
+            .unwrap();
+        let packet_list = json_body(packet_list).await;
+        let packet_id = packet_list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|packet| packet["event_id"] == identity_event_id)
+            .and_then(|packet| packet["packet_id"].as_str())
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(req(&format!("/api/v1/packets/{packet_id}"), false))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_no_identity_material(&json_body(response).await);
+
+        let export = app
+            .clone()
+            .oneshot(req(
+                "/api/v1/exports/callflow/5g-UE-A-pdu-1?format=json",
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(export.status(), StatusCode::OK);
+        assert_no_identity_material(&json_body(export).await);
+
+        let export = app
+            .clone()
+            .oneshot(req(
+                "/api/v1/exports/callflow/5g-UE-A-pdu-1?format=html",
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(export.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            export
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!html.to_ascii_lowercase().contains("maskedimeisv"));
+        assert!(!html.to_ascii_lowercase().contains("masked_imeisv"));
+        assert!(html.contains("InitialContextSetupRequest"));
+
+        let operator_app = router(operator_state(), None);
+        let response = operator_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sessions/5g-UE-A-pdu-1/callflow?limit=100")
+                    .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_no_identity_material(&body);
+        assert!(body["data"]["events"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty()));
+        assert!(body["data"]["accounting"]["source_events"].is_number());
     }
     #[tokio::test]
     async fn lte_evidence_import_requires_operator_and_csrf() {
