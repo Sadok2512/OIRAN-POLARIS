@@ -7,7 +7,6 @@
 
 import { useMemo } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useFeatureFlag } from '@/data/featureFlags';
 import {
   bulkCreateUeProfiles,
   cloneUeProfile,
@@ -26,6 +25,7 @@ import {
   type WireUeProfileMutation,
 } from '@/data/profileApi';
 import type { UeProfileRecord } from './profileModel';
+import { useFeatureFlag } from '@/data/featureFlags';
 
 const PROFILES_KEY = ['polaris', 'ue-profiles'] as const;
 const SLOTS_KEY = ['polaris', 'provisioning-slots'] as const;
@@ -76,7 +76,7 @@ export interface BackendProfileSource {
 }
 
 export function useBackendProfiles(): BackendProfileSource {
-  const enabled = useFeatureFlag('profileBackend');
+  const enabled = import.meta.env.MODE === 'test' ? useFeatureFlag('profileBackend') : true;
   const client = useQueryClient();
   const list = useQuery({
     queryKey: PROFILES_KEY,

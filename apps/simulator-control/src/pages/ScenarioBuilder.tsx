@@ -258,7 +258,7 @@ export function ScenarioBuilderPage() {
         />
         {technology === 'LTE' ? (
           <span className="text-ep-sm text-warn">
-            Catalog and mock validation only · Live requires ANR1 LTE E2E certification.
+            Saved through the POLARIS scenario API · execution remains subject to Grant V2 and LTE certification.
           </span>
         ) : (
           <span className="text-ep-sm text-mute">Existing 5G SA scenarios remain unchanged.</span>

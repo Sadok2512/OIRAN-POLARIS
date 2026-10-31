@@ -18,12 +18,12 @@
 //   - iperf3 is measurement, never blocking: warnings in the IPERF3_*
 //     vocabulary appear as yellow chips, never red failures.
 
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Activity, Download, StopCircle, Upload, Zap } from 'lucide-react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Btn, Card, PageHeader, Pill } from '@/components/mockup';
 import { ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
-import { useAuth } from '@/data/queries';
+import { useAuth, useUes } from '@/data/queries';
 import {
   TRAFFIC_DURATION_S_MAX,
   TRAFFIC_DURATION_S_MIN,
@@ -110,15 +110,26 @@ export function TrafficSessionsPage() {
   const canOperate = auth.data?.can_start === true;
   const client = useQueryClient();
   const lte = useLteStatus();
+  const inventory = useUes();
   const lteTrafficAllowed = lte.data?.traffic_allowed === true;
 
-  const [ueIds, setUeIds] = useState('UE-01');
+  const [ueIds, setUeIds] = useState('');
   const [technology, setTechnology] = useState<RadioTechnology>('5G_SA');
   const [direction, setDirection] = useState<TrafficDirection>('BOTH');
   const [protocol, setProtocol] = useState<TrafficProtocol>('UDP');
   const [rateMbps, setRateMbps] = useState(5);
   const [durationS, setDurationS] = useState(30);
   const [formError, setFormError] = useState<string | null>(null);
+  const selectableUes = useMemo(
+    () => (inventory.data?.items ?? []).filter((ue) =>
+      technology === 'LTE' ? ue.technology === 'LTE 4G' : ue.technology !== 'LTE 4G'),
+    [inventory.data?.items, technology],
+  );
+  useEffect(() => {
+    if (!selectableUes.some((ue) => (ue.internal_ue_id ?? ue.id) === ueIds)) {
+      setUeIds(selectableUes[0] ? (selectableUes[0].internal_ue_id ?? selectableUes[0].id) : '');
+    }
+  }, [selectableUes, ueIds]);
 
   const list = useQuery({
     queryKey: QUERY_KEY,
@@ -181,7 +192,7 @@ export function TrafficSessionsPage() {
           value={technology}
           onChange={(next) => {
             setTechnology(next);
-            setUeIds(next === 'LTE' ? 'LTE-SRSUE-TEST-01' : 'UE-01');
+            setUeIds('');
             if (next === 'LTE') {
               setProtocol('UDP');
               setRateMbps(1);
@@ -202,13 +213,18 @@ export function TrafficSessionsPage() {
             <span className="text-xs2 uppercase tracking-wider text-mute">
               UE ids (comma or space separated)
             </span>
-            <input
+            <select
               className="h-9 px-3 rounded-md border border-line bg-surface text-md2 text-ink mono"
-              placeholder="UE-01, UE-02"
               value={ueIds}
               onChange={(e) => setUeIds(e.target.value)}
               data-testid="traffic-ue-ids"
-            />
+            >
+              <option value="">{inventory.isLoading ? 'Loading observed UEs…' : 'No observed UE available'}</option>
+              {selectableUes.map((ue) => {
+                const id = ue.internal_ue_id ?? ue.id;
+                return <option key={id} value={id}>{id} · {ue.process_state ?? 'NOT_AVAILABLE'}</option>;
+              })}
+            </select>
           </label>
           <label className="flex flex-col gap-1 text-sm2">
             <span className="text-xs2 uppercase tracking-wider text-mute">Direction</span>

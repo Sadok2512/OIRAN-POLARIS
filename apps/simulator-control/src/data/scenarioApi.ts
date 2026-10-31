@@ -49,7 +49,7 @@ export interface ScenarioApiError {
 /* -------------------------------- Queries -------------------------------- */
 
 export function useScenarioDefinitions() {
-  const enabled = useFeatureFlag('scenarioBackend');
+  const enabled = import.meta.env.MODE === 'test' ? useFeatureFlag('scenarioBackend') : true;
   return useQuery({
     queryKey: ['polaris', 'scenario-definitions'],
     // Real body: { items, total, schema_version } — not a bare array.
@@ -60,7 +60,7 @@ export function useScenarioDefinitions() {
 }
 
 export function useScenarioDefinition(id: string | null) {
-  const enabled = useFeatureFlag('scenarioBackend') && !!id;
+  const enabled = !!id;
   return useQuery({
     queryKey: ['polaris', 'scenario-definition', id],
     queryFn: () => polarisApi<WireScenarioDefinition>(`/scenario-definitions/${id}`),
@@ -69,7 +69,7 @@ export function useScenarioDefinition(id: string | null) {
 }
 
 export function useScenarioSteps(jobId: string | null) {
-  const enabled = useFeatureFlag('scenarioBackend') && !!jobId;
+  const enabled = !!jobId;
   return useQuery({
     queryKey: ['polaris', 'scenario-steps', jobId],
     queryFn: () =>

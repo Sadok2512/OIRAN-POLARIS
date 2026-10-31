@@ -1,5 +1,14 @@
 # @telecom/simulator-control — Changelog
 
+## 0.16.1 — 2026-10-31 — real-lab API-only operational views
+
+- Makes UE profiles, scenarios, templates and provisioning strictly API-backed;
+  browser flags can no longer restore demo/localStorage data operationally.
+- Populates Traffic Generator targets only from the observed `/ues` inventory.
+- Filters unconfigured planned nodes from Topology and renders absent values as
+  `NOT_AVAILABLE` or `UNKNOWN` instead of lab constants.
+- Describes the actual Grant V2/RBAC gates instead of a mock LTE workflow.
+
 ## 0.16.0 — 2026-10-31 — LTE orchestration V2 progress
 
 - Polls the durable certified LTE run and displays each real phase state,
