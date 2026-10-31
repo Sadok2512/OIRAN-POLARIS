@@ -15,7 +15,7 @@ use event_schema::{sha256_hex, Endpoint, NormalizedEvent, PacketReference};
 use plugin_runtime::{DecoderInput, ProtocolDecoder};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, OpenOptions},
     io::Write,
     path::Path,
@@ -25,6 +25,24 @@ use transport_sctp::SctpReassembler;
 use transport_tcp::TcpReassembler;
 
 pub const VERSION: &str = "0.6.0";
+
+pub fn installed_decoder_versions() -> BTreeMap<String, String> {
+    [
+        ("GTP-U", decoder_gtpu::VERSION),
+        ("GTPv2-C", decoder_gtpv2c::VERSION),
+        ("NAS-5GMM", decoder_nas::VERSION),
+        ("NAS-5GSM", decoder_nas::VERSION),
+        ("NAS-EPS-MM", decoder_nas::VERSION),
+        ("NAS-EPS-SM", decoder_nas::VERSION),
+        ("NGAP", decoder_ngap::VERSION),
+        ("PFCP", decoder_pfcp::VERSION),
+        ("S1AP", decoder_s1ap::VERSION),
+        ("SBI-HTTP2", decoder_sbi::VERSION),
+    ]
+    .into_iter()
+    .map(|(name, version)| (name.to_owned(), version.to_owned()))
+    .collect()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UdpRoute {

@@ -15,7 +15,8 @@ use dataset_registry::{CaptureRecord, DatasetRecord, DatasetRegistry};
 use disk_safety::{assess, capture_budget, measure_path, rotation_plan, Policy};
 use event_schema::sha256_hex;
 use live_probe::{
-    read_callflow_page, CaptureManager, CaptureRequest, ContinuousImportConfig,
+    offline_lte_callflows, read_callflow_page, CaptureManager, CaptureRequest,
+    ContinuousImportConfig,
     DEFAULT_CALLFLOW_PAGE_EVENTS, DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES, MAX_CALLFLOW_PAGE_EVENTS,
 };
 use probe_registry::{CreateError as ProbeCreateError, ProbeInput, ProbeRecord, ProbeRegistry};
@@ -36,8 +37,8 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.5.4";
-pub const PLATFORM_VERSION: &str = "2.5.4";
+pub const API_VERSION: &str = "2.6.0";
+pub const PLATFORM_VERSION: &str = "2.6.0";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -288,6 +289,14 @@ impl AppState {
             flow_values.insert(generated.session_id.clone(), generated_value);
             flows.insert(generated.session_id.clone(), generated);
         }
+        for generated in offline_lte_callflows(&events)? {
+            if flows.contains_key(&generated.session_id) {
+                continue;
+            }
+            let generated_value = serde_json::to_value(&generated).map_err(json_error)?;
+            flow_values.insert(generated.session_id.clone(), generated_value);
+            flows.insert(generated.session_id.clone(), generated);
+        }
         let dataset_id = manifest
             .get("scenario_id")
             .and_then(Value::as_str)
@@ -378,6 +387,9 @@ fn build_captures(dataset_dir: &FsPath, manifest: &Value) -> Result<Vec<Value>, 
                 "N3" => "GTP-U",
                 "N4" => "PFCP",
                 "SBI" => "SBI-HTTP2",
+                "S1-MME" => "S1AP",
+                "S11" => "GTPv2-C",
+                "S1-U" => "GTP-U",
                 _ => "UNKNOWN",
             };
             Ok(json!({
@@ -521,11 +533,11 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 async fn version(State(state): State<AppState>) -> Json<Value> {
     let flow = primary_flow(&state);
     ok(json!({
-        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":"2.3.0-dev",
+        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":"2.6.0-pre.1+lte.offline.1",
         "event_schema":"1.2.0","callflow_schema":flow.schema_version,
-        "session_engine":session_engine::VERSION,"correlation_engine":"0.2.0","dataset_registry":dataset_registry::VERSION,
+        "session_engine":session_engine::VERSION,"correlation_engine":correlation_engine::VERSION,"dataset_registry":dataset_registry::VERSION,
         "disk_safety":disk_safety::VERSION,
-        "decoders":flow.decoder_versions
+        "decoders":oiran_decode::installed_decoder_versions()
     }))
 }
 
@@ -1793,6 +1805,7 @@ async fn stop_capture(
 
 fn session_summary(state: &AppState, flow: &CallFlow) -> Value {
     let (parsed_ue, parsed_pdu) = parse_session_identity(&flow.session_id);
+    let is_lte = flow.technology == "LTE";
     let discovered = discovered_session_for_flow(state, flow);
     let context = discovered.and_then(|session| {
         state
@@ -1802,10 +1815,17 @@ fn session_summary(state: &AppState, flow: &CallFlow) -> Value {
             .iter()
             .find(|context| context.context_id == session.ue_context_id)
     });
-    let pdu_session_id = discovered
-        .map(|session| session.pdu_session_id.clone())
-        .unwrap_or(parsed_pdu);
-    let ue_pseudonym = if parsed_ue == "UNKNOWN_UE" {
+    let pdu_session_id = if is_lte {
+        "EPS".to_owned()
+    } else {
+        discovered
+            .map(|session| session.pdu_session_id.clone())
+            .unwrap_or(parsed_pdu)
+    };
+    let ue_pseudonym = if is_lte {
+        flow.session_id
+            .replacen("lte-session-", "LTE-UE-", 1)
+    } else if parsed_ue == "UNKNOWN_UE" {
         context
             .map(|context| context.pseudonym.clone())
             .unwrap_or(parsed_ue)
@@ -2560,6 +2580,7 @@ fn json_error(error: serde_json::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use axum::http::{Request, StatusCode};
     use capture_helper::{
         CaptureBackend, CaptureHelperClient, CaptureService, CaptureSession, HelperFailure,
@@ -2639,6 +2660,171 @@ mod tests {
         assert_eq!(v["data"]["source_events"], 54);
         assert_eq!(v["data"]["capabilities"]["live_capture"], true);
         assert_eq!(v["data"]["capabilities"]["capture_control"], false)
+    }
+
+    #[tokio::test]
+    async fn version_reports_installed_lte_and_5g_decoders() {
+        let response = router(state(), None)
+            .oneshot(req("/api/v1/version", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["data"]["backend_api"], "2.6.0");
+        for protocol in [
+            "S1AP",
+            "NAS-EPS-MM",
+            "NAS-EPS-SM",
+            "GTPv2-C",
+            "GTP-U",
+            "NGAP",
+            "NAS-5GMM",
+            "NAS-5GSM",
+            "PFCP",
+            "SBI-HTTP2",
+        ] {
+            assert!(
+                value["data"]["decoders"][protocol].is_string(),
+                "missing installed decoder {protocol}"
+            );
+        }
+    }
+
+    fn normalized_lte_event(
+        id: &str,
+        interface: &str,
+        protocol: &str,
+        name: &str,
+        identifiers: &[(&str, &str)],
+        packet: u64,
+    ) -> Value {
+        json!({
+            "event_id": id,
+            "capture_id": "sha256:synthetic-lte-api",
+            "capture_point_id": format!("offline:{interface}"),
+            "timestamp": {
+                "seconds": 1_793_448_000_u64,
+                "nanoseconds": packet,
+                "raw_ticks": 1_793_448_000_000_000_000_u64 + packet,
+                "display": format!("2026-10-31T12:00:00.{packet:09}Z")
+            },
+            "interface": interface,
+            "protocol": protocol,
+            "message_name": name,
+            "source_endpoint": {
+                "address": "192.0.2.10",
+                "network_function": if interface == "S1-MME" { "eNB" } else { "SGW" }
+            },
+            "destination_endpoint": {
+                "address": "192.0.2.20",
+                "network_function": if interface == "S1-MME" { "MME" } else { "eNB" }
+            },
+            "direction": if interface == "S11" { "DOWNLINK" } else { "UPLINK" },
+            "session_identifiers": identifiers.iter().map(|(key, value)| json!({
+                "name": key,
+                "value": value,
+                "pseudonymized": key.contains("pseudonym")
+            })).collect::<Vec<_>>(),
+            "information_elements": [],
+            "decoding_status": "DECODED",
+            "decoder_name": protocol,
+            "decoder_version": "synthetic-test",
+            "raw_payload_reference": format!("sha256:{id}"),
+            "packet_references": [{
+                "source_file": "synthetic-offline.pcap",
+                "packet_number": packet,
+                "byte_offset": packet * 64,
+                "interface_id": 0,
+                "captured_length": 64,
+                "original_length": 64
+            }],
+            "errors": []
+        })
+    }
+
+    #[tokio::test]
+    async fn api_load_materialises_synthetic_lte_session_without_live_capture() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let source = workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let dataset = workspace
+            .join("runtime")
+            .join(format!("api-lte-offline-{}", epoch_seconds()));
+        fs::create_dir_all(&dataset).unwrap();
+        for entry in fs::read_dir(&source).unwrap().filter_map(Result::ok) {
+            if entry.path().is_file() {
+                fs::copy(entry.path(), dataset.join(entry.file_name())).unwrap();
+            }
+        }
+        let mut events = fs::OpenOptions::new()
+            .append(true)
+            .open(dataset.join("oiran_events.jsonl"))
+            .unwrap();
+        for value in [
+            normalized_lte_event(
+                "api-lte-s1ap",
+                "S1-MME",
+                "S1AP",
+                "E-RABSetupResponse",
+                &[
+                    ("enb_ue_s1ap_id", "42"),
+                    ("mme_ue_s1ap_id", "84"),
+                    ("imsi_pseudonym", "lte-ue-anon-api"),
+                    ("eps_bearer_identity", "5"),
+                    ("erab_teid", "0x01020304"),
+                ],
+                101,
+            ),
+            normalized_lte_event(
+                "api-lte-s11",
+                "S11",
+                "GTPv2-C",
+                "CreateSessionResponse",
+                &[
+                    ("imsi_pseudonym", "lte-ue-anon-api"),
+                    ("bearer_f_teid", "0x01020304"),
+                ],
+                102,
+            ),
+            normalized_lte_event(
+                "api-lte-s1u",
+                "S1-U",
+                "GTP-U",
+                "G-PDU",
+                &[("teid", "0x01020304")],
+                103,
+            ),
+        ] {
+            writeln!(events, "{}", serde_json::to_string(&value).unwrap()).unwrap();
+        }
+        drop(events);
+        let mut config = test_config(workspace, "registry-lte-offline");
+        config.dataset_dir = dataset.clone();
+        let state = AppState::load(config).unwrap();
+        let lte = state
+            .inner
+            .flows
+            .values()
+            .find(|flow| flow.technology == "LTE")
+            .unwrap();
+        assert_eq!(lte.interfaces, vec!["S1-MME", "S1-U", "S11"]);
+        assert_eq!(lte.correlation_status["E2E"], "STRONG");
+        let response = router(state, None)
+            .oneshot(req("/api/v1/sessions?technology=LTE", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["meta"]["total"], 1);
+        assert_eq!(value["data"][0]["technology"], "LTE");
+        assert!(value["data"][0]["ue_pseudonym"]
+            .as_str()
+            .unwrap()
+            .starts_with("LTE-UE-"));
+        fs::remove_dir_all(dataset).unwrap();
     }
 
     fn probe_payload(probe_id: &str) -> Value {
