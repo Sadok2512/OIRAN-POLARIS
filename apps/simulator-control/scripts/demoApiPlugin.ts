@@ -13,11 +13,11 @@ const processObservation = (state: string, owned = false) => ({
 
 const ueItems = [
   {
-    id: 'UE-DEMO-5G-01', internal_ue_id: 'UE-00042', profile: 'DEMO 5G SA',
+    id: 'UE-201', internal_ue_id: 'UE-00201', profile: 'DEMO mirror of sanitized UE-201 state',
     profile_state: 'VERIFIED', subscription_status: 'PROTECTED', serving_node: 'GNB-DEMO-01',
-    process_state: 'running', registration_state: 'REGISTERED', rrc_state: 'CONNECTED',
-    pdu_session: 'ACTIVE', ue_ip: '10.46.0.42', traffic_state: 'COMPLETED', last_event: 'DEMO_PDU_ACTIVE',
-    controller_owned: true, technology: '5G SA', simulator: 'UERANSIM', dnn: 'internet', active_sessions: 1,
+    process_state: 'STOPPED', registration_state: 'DEREGISTERED', rrc_state: 'UNKNOWN',
+    pdu_session: 'INACTIVE', ue_ip: null, traffic_state: 'IDLE', last_event: null,
+    controller_owned: true, dnn: 'internet', active_sessions: 0,
     actions: { start: false, stop: false, pdu_start: false, pdu_stop: false, traffic: false, reason: 'DEMO_READ_ONLY' },
   },
   {
@@ -33,10 +33,18 @@ const ueItems = [
 const ueProfiles = [
   {
     authentication_material: 'PROTECTED', auto_run_scenario: false, dnn: 'internet',
-    name: 'DEMO 5G SA UE', pdu_session: { dnn: 'internet', type: 'IPv4' },
-    plmn: { mcc: '001', mnc: '01' }, profile: 'demo-5g.yaml', revision: 1,
+    name: 'DEMO UE-01', pdu_session: { dnn: 'internet', type: 'IPv4' },
+    plmn: { mcc: '001', mnc: '01' }, profile: 'demo-ue-01.yaml', revision: 1,
     scenario_id: null, serving_gnb: 'GNB-DEMO-01', snssai: { sd: '010203', sst: 1 },
-    subscriber_identity: 'PROTECTED', subscription_status: 'PROTECTED', ue_id: 'UE-DEMO-5G-01',
+    subscriber_identity: 'PROTECTED', subscription_status: 'VERIFIED', ue_id: 'UE-01',
+    updated_at_epoch_s: now,
+  },
+  {
+    authentication_material: 'PROTECTED', auto_run_scenario: false, dnn: 'internet',
+    name: 'DEMO UE-201', pdu_session: { dnn: 'internet', type: 'IPv4' },
+    plmn: { mcc: '001', mnc: '01' }, profile: 'demo-ue-201.yaml', revision: 1,
+    scenario_id: null, serving_gnb: 'GNB-DEMO-01', snssai: { sd: '010203', sst: 1 },
+    subscriber_identity: 'PROTECTED', subscription_status: 'VERIFIED', ue_id: 'UE-201',
     updated_at_epoch_s: now,
   },
   {
@@ -44,7 +52,7 @@ const ueProfiles = [
     name: 'DEMO LTE 4G UE', pdu_session: { dnn: 'internet', type: 'IPv4' },
     plmn: { mcc: '001', mnc: '01' }, profile: 'demo-lte.yaml', revision: 1,
     scenario_id: null, serving_gnb: 'ENB-DEMO-01', snssai: { sd: null, sst: 1 },
-    subscriber_identity: 'PROTECTED', subscription_status: 'PROTECTED', ue_id: 'LTE-SRSUE-TEST-01',
+    subscriber_identity: 'PROTECTED', subscription_status: 'VERIFIED', ue_id: 'LTE-SRSUE-TEST-01',
     updated_at_epoch_s: now,
   },
 ];
@@ -58,8 +66,8 @@ const trafficSessions = [
   },
   {
     session_id: 'traffic-demo-5g', state: 'COMPLETED',
-    request: { ue_ids: ['UE-00042'], direction: 'BOTH', protocol: 'TCP', rate_mbps: 5, duration_s: 30 },
-    ue_counters: [{ ue_id: 'UE-00042', packets_ul: 0, packets_dl: 0, bytes_ul: 18_750_000, bytes_dl: 18_500_000, rate_ul_bps: 5_000_000, rate_dl_bps: 4_930_000, warnings: [] }],
+    request: { ue_ids: ['UE-201'], direction: 'BOTH', protocol: 'TCP', rate_mbps: 5, duration_s: 30 },
+    ue_counters: [{ ue_id: 'UE-201', packets_ul: 0, packets_dl: 0, bytes_ul: 18_750_000, bytes_dl: 18_500_000, rate_ul_bps: 5_000_000, rate_dl_bps: 4_930_000, warnings: [] }],
     started_at_epoch_s: now - 180, ended_at_epoch_s: now - 150, warnings: [],
   },
 ];
@@ -80,7 +88,7 @@ function response(path: string): unknown {
   };
   if (path === '/scenario-capabilities') return { items: [], execution_status: 'DEMO_READ_ONLY', reason: 'DEMO_READ_ONLY', role: 'viewer' };
   if (path === '/lab') return {
-    ue_count: 2, desired_ue_count: 2, gnb_count: 1, max_ues: 10, max_gnbs: 2,
+    ue_count: 3, desired_ue_count: 3, gnb_count: 2, max_ues: 10, max_gnbs: 2,
     max_ues_live_certified: 0, max_gnbs_live_certified: 0, missing_subscriber_profiles: 0,
     updated_at_epoch_s: now, updated_by: 'DEMO', observed_controller_running: 2, observed_total_running: 2,
     reconciliation: { operation_id: null, desired_count: 2, state: 'IDLE', started_at_epoch_s: null, completed_at_epoch_s: null, started: [], stopped: [], failures: [] },
@@ -97,7 +105,16 @@ function response(path: string): unknown {
     },
   };
   if (path === '/system/health') return { cpu: { usage_percent: 18, idle_percent: 82, logical_cpus: 8 }, memory: { total_bytes: 16_000_000_000, available_bytes: 9_000_000_000, used_bytes: 7_000_000_000 }, disk: { total_bytes: 400_000_000_000, used_bytes: 280_000_000_000, available_bytes: 120_000_000_000, usage_percent: 70 }, decision: { state: 'DEMO', writes_allowed: false, reason: 'DEMO_READ_ONLY', maximum_budget_bytes: 0 }, load_average: '0.35 0.42 0.40', uptime_seconds: 86_400, observed_at_epoch_s: now };
-  if (path === '/ues') return { items: ueItems, configured_profiles: [], configured_count: 2, active_count: 2, registered_count: 2, pdu_session_count: 2, source: 'DEMO_SYNTHETIC' };
+  if (path === '/ues') return {
+    items: ueItems,
+    configured_profiles: [
+      { id: 'UE-01', profile: 'demo-ue-01.yaml', serving_gnb: 'GNB-DEMO-01', simulator: 'UERANSIM', state: 'CONFIGURED', configured: true, controller_owned: false, subscription_status: 'VERIFIED' },
+      { id: 'UE-201', profile: 'demo-ue-201.yaml', serving_gnb: 'GNB-DEMO-01', simulator: 'UERANSIM', state: 'STOPPED', configured: true, controller_owned: true, subscription_status: 'VERIFIED' },
+      { id: 'LTE-SRSUE-TEST-01', profile: 'demo-lte.yaml', serving_gnb: 'ENB-DEMO-01', simulator: 'srsRAN', state: 'CONFIGURED', configured: true, controller_owned: true, subscription_status: 'VERIFIED' },
+    ],
+    configured_count: 3, active_count: 1, registered_count: 1, pdu_session_count: 1,
+    source: 'DEMO_SYNTHETIC',
+  };
   if (path.startsWith('/ue-profiles/provisioning-slots')) return { items: [], total: 0, secrets_exposed: false };
   if (path.startsWith('/ue-profiles')) return { items: ueProfiles, total: ueProfiles.length, page: 1, page_size: 10, pages: 1, max: 10, secrets_exposed: false };
   if (path === '/nodes' || path === '/gnbs') return {

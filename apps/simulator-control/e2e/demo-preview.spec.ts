@@ -14,6 +14,25 @@ test('DEMO preview exposes LTE/5G pages read-only without horizontal overflow', 
   await expect(page.getByRole('button', { name: 'Start LTE certified run' })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Stop srsUE' })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Stop srsENB' })).toBeDisabled();
+  await expect(page.getByTestId('ue-technology-UE-01')).toContainText('5G SA');
+  await expect(page.getByTestId('ue-simulator-UE-01')).toHaveText('UERANSIM');
+  await expect(page.getByTestId('ue-reg-UE-01')).toContainText('UNKNOWN');
+  await expect(page.getByTestId('ue-etat-UE-01')).toContainText('UNKNOWN');
+  await expect(page.getByTestId('ue-technology-UE-201')).toContainText('5G SA');
+  await expect(page.getByTestId('ue-simulator-UE-201')).toHaveText('UERANSIM');
+  await expect(page.getByTestId('ue-reg-UE-201')).toContainText('DEREGISTERED');
+  await expect(page.getByTestId('ue-etat-UE-201')).toContainText('INACTIVE');
+  await expect(page.getByTestId('ue-technology-LTE-SRSUE-TEST-01')).toContainText('LTE 4G');
+  await expect(page.getByTestId('ue-simulator-LTE-SRSUE-TEST-01')).toHaveText('srsUE');
+  await expect(page.getByTestId('ue-gnb-LTE-SRSUE-TEST-01')).toContainText('srsENB');
+  await expect(page.getByTestId('ue-reg-LTE-SRSUE-TEST-01')).toContainText('ATTACHED');
+  await page.getByTestId('ue-filter-technology').selectOption('LTE 4G');
+  await expect(page.locator('tbody tr[data-testid^="ue-row-"]')).toHaveCount(1);
+  await expect(page.getByTestId('ue-row-LTE-SRSUE-TEST-01')).toBeVisible();
+  await page.getByTestId('ue-filter-technology').selectOption('');
+  await page.getByTestId('ue-filter-simulator').selectOption('UERANSIM');
+  await expect(page.locator('tbody tr[data-testid^="ue-row-"]')).toHaveCount(2);
+  await page.getByTestId('ue-filter-simulator').selectOption('');
   await expectNoOverflow(page);
   if (captureProject(testInfo.project.name)) await capture(page, testInfo.project.name, 'ue-manager-lte');
 
