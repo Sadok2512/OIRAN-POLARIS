@@ -1,10 +1,9 @@
-// 0.5.0 — client for the scenario-template surface published by Codex on
-// `feat/polaris-traffic-templates`. The contract is NOT shipped yet;
-// every hook here is gated by the `scenarioTemplates` feature flag. API 0.13
-// enables it by default; an operator can still disable the surface in Settings.
+// Client for the immutable catalogue finalized by ANR1 in
+// `polaris.scenario-template-catalog.v1`.
 //
 // Routes (contract from the LOT prompt):
-//   GET  /api/v1/scenario-definitions                      (tpl-* appear here)
+//   GET  /api/v1/scenario-templates                         immutable descriptors
+//   POST /api/v1/scenario-definitions/:template_id/clone    authoritative copy
 //   GET  /api/v1/scenario-definitions/:id/estimate         → { duration_ms }
 //   GET  /api/v1/scenario-definitions/:id/export           → attachment JSON v2
 //   POST /api/v1/scenario-definitions/import               operator + CSRF
@@ -20,7 +19,6 @@ import { useFeatureFlag } from './featureFlags';
 import {
   SCENARIO_SCHEMA_VERSION,
   type WireScenarioDefinition,
-  type WireScenarioDefinitionList,
   type WireScenarioExportFile,
 } from '@/scenarios/wireCodec';
 
@@ -35,18 +33,58 @@ export interface TemplateEstimate {
   duration_ms: number;
 }
 
-/** List of definitions, filtered client-side to templates (tpl-*). */
+export type ScenarioTemplateBackendSupport =
+  | 'SUPPORTED'
+  | 'BACKEND_REQUIRED'
+  | 'CERTIFICATION_REQUIRED';
+
+export interface ScenarioTemplateDescriptor {
+  template_id: string;
+  version: string;
+  rat: 'LTE' | '5G_SA';
+  simulator: 'srsRAN' | 'UERANSIM';
+  description: string;
+  steps: WireScenarioDefinition['steps'];
+  parameters: {
+    ue_count: number;
+    execution: string;
+    transport: string;
+    rate_bps: number;
+    duration_seconds: number;
+    tcp_authorized: boolean;
+    multi_ue: boolean;
+  };
+  required_capabilities: string[];
+  backend_support: ScenarioTemplateBackendSupport;
+  certification_required: boolean;
+  read_only: true;
+}
+
+export interface ScenarioTemplateCatalog {
+  schema_version: 'polaris.scenario-template-catalog.v1';
+  items: ScenarioTemplateDescriptor[];
+  total: number;
+  defaults: ScenarioTemplateDescriptor['parameters'];
+  multi_ue_templates: boolean;
+}
+
+/** Definitive ANR1 immutable catalogue. */
 export function useScenarioTemplates() {
   const enabled = useFeatureFlag('scenarioTemplates');
   return useQuery({
     queryKey: ['polaris', 'scenario-templates'],
     queryFn: async () => {
-      const body = await polarisApi<WireScenarioDefinitionList>('/scenario-definitions');
-      const templates = (body.items ?? []).filter((item) => isTemplateId(item.id));
-      return { items: templates, total: templates.length, schema_version: body.schema_version };
+      return polarisApi<ScenarioTemplateCatalog>('/scenario-templates');
     },
     enabled,
     staleTime: enabled ? 30_000 : Infinity,
+  });
+}
+
+export function cloneScenarioTemplate(templateId: string, targetId: string) {
+  return polarisApi<WireScenarioDefinition>(`/scenario-definitions/${templateId}/clone`, {
+    method: 'POST',
+    body: JSON.stringify({ target_id: targetId }),
   });
 }
 

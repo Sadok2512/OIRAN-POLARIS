@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.24.0 (polaris-control-api) — 2026-10-31 — professional default scenario catalogue
+
+- Adds the versioned read-only `/scenario-templates` catalogue with six LTE
+  srsRAN and seven 5G SA UERANSIM templates, exact RAT/simulator metadata,
+  required capabilities and honest `SUPPORTED`, `BACKEND_REQUIRED` or
+  `CERTIFICATION_REQUIRED` status.
+- Applies conservative defaults of one UE, one execution, UDP 1 Mbit/s for
+  60 seconds. TCP requires an explicit authorization parameter; no multi-UE
+  template is advertised before certification.
+- Keeps system templates immutable while server-side clone creates a durable,
+  mutable user definition with source provenance. Existing user scenarios are
+  migrated additively and never replaced.
+- Rejects UDP rate/duration templates with `SCENARIO_BACKEND_REQUIRED` until
+  the dedicated executor exists; existing 5G and LTE safety, RBAC, CSRF,
+  ownership, Grant V2 and certification gates remain authoritative.
+
 ## 0.23.1 (polaris-control-api) — 2026-10-31 — proof-before-state and unified LTE cleanup
 
 - Separates durable operation intent from public LTE run state; S1, Attach,
