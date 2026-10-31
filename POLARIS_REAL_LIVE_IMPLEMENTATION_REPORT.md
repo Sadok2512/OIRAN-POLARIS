@@ -106,8 +106,9 @@ No CI result is used.
    missing source paths. No loss-free claim is possible.
 5. Production exposes no LTE dataset; S1AP/S11/S1-U real certification remains
    blocked.
-6. The final RAM gate measured `3,956,572,160` available bytes, below 4 GiB.
-   No additional Playwright/Rust load was started after this failure.
+6. The RAM gate first failed at `3,956,572,160` available bytes and dropped to
+   `2,587,959,296` bytes at the post-push control, both below 4 GiB. No
+   additional Playwright/Rust load was started after the initial failure.
 
 ## Resource and safety evidence
 
