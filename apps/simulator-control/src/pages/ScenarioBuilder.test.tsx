@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, type InitialEntry } from 'react-router-dom';
 import type { ReactNode } from 'react';
 import { ScenarioBuilderPage } from './ScenarioBuilder';
 import { _resetFlags, setFlag } from '@/data/featureFlags';
@@ -24,11 +24,11 @@ function respond(status: number, body: unknown) {
   });
 }
 
-function renderPage(children: ReactNode = <ScenarioBuilderPage />) {
+function renderPage(children: ReactNode = <ScenarioBuilderPage />, initialEntries: InitialEntry[] = ['/scenarios/new']) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <MemoryRouter>{children}</MemoryRouter>
+      <MemoryRouter initialEntries={initialEntries}>{children}</MemoryRouter>
     </QueryClientProvider>,
   );
 }
@@ -66,6 +66,12 @@ function stubFetch({ advertisedKinds }: { advertisedKinds?: string[] }) {
         services: [],
         ...(advertisedKinds ? { scenario_step_kinds: advertisedKinds } : {}),
       });
+    }
+    if (url.endsWith('/auth/me')) {
+      return respond(200, { authenticated: true, username: 'operator-test', role: 'operator', can_start: true, can_manage_permissions: false });
+    }
+    if (url.endsWith('/lte/status')) {
+      return respond(200, { certified: false, grant_active: false });
     }
     return respond(404, { error: 'not stubbed' });
   }) as unknown as typeof fetch;
@@ -145,7 +151,7 @@ describe('ScenarioBuilder — honest palette (0.5.1 + 0.5.2)', () => {
     expect(screen.getByTestId('loop-preset-×100')).toBeEnabled();
   });
 
-  it('blocks Save and shows a banner when the draft contains a locked step (ims_register)', async () => {
+  it('allows saving a representable draft but keeps Run blocked for a non-executable step', async () => {
     const user = userEvent.setup();
     renderPage();
 
@@ -162,18 +168,69 @@ describe('ScenarioBuilder — honest palette (0.5.1 + 0.5.2)', () => {
     const kindSelect = (await screen.findByLabelText(/Step 1 kind/i)) as HTMLSelectElement;
     await user.selectOptions(kindSelect, 'IMS_REGISTER');
 
-    // Banner appears and Save is blocked.
+    // Banner appears, Save stays available for the definition copy, while Run is blocked.
     await screen.findByTestId('builder-locked-step-banner');
-    expect(save).toBeDisabled();
-    // 0.10.0 — Save reason is now surfaced both as an inline hint next to
-    // the button AND on the native tooltip, in French.
-    expect(save).toHaveAttribute(
-      'title',
-      'Au moins une étape non certifiée côté backend — à retirer avant Save.',
-    );
-    expect(screen.getByTestId('builder-save-reason')).toHaveTextContent(
-      /non certifiée côté backend/i,
-    );
+    expect(save).toBeEnabled();
+    expect(screen.getByTestId('builder-run')).toBeDisabled();
+    expect(screen.getByTestId('builder-run')).toHaveAttribute('title', expect.stringMatching(/backend execution support/i));
+  });
+
+  it('loads, edits and saves a new LTE system-template copy while Run remains certification-gated', async () => {
+    const calls: Array<{ method: string; body: string }> = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (url.endsWith('/scenario-definitions') && method === 'GET') return respond(200, { items: [], total: 0, schema_version: 1 });
+      if (url.endsWith('/scenario-definitions/tpl-lte-attach/clone') && method === 'POST') {
+        calls.push({ method, body: String(init?.body ?? '') });
+        const body = JSON.parse(String(init?.body)) as { target_id: string };
+        return respond(201, { id: body.target_id, name: 'LTE Attach copy', loop_count: 1, steps: [{ type: 'lte_attach', loop_count: 1, parameters: {} }], version: 1 });
+      }
+      if (url.includes('/scenario-definitions/') && method === 'PUT') {
+        calls.push({ method, body: String(init?.body ?? '') });
+        const body = JSON.parse(String(init?.body)) as { id: string; name: string; loop_count: number; steps: unknown[] };
+        return respond(200, { ...body, version: 2, created_at_epoch_s: 1, updated_at_epoch_s: 2 });
+      }
+      if (url.endsWith('/capabilities')) return respond(200, {
+        live_control: true, approval_state: 'OPERATOR_AUTHORIZATION_REQUIRED', max_ues: 1, max_nodes: 2,
+        registration_modes: [], traffic_protocols: [], approved_destinations: [], profiles: [], technologies: [], services: [],
+        scenario_step_kinds: [],
+      });
+      if (url.endsWith('/auth/me')) return respond(200, { authenticated: true, username: 'operator-test', role: 'operator', can_start: true, can_manage_permissions: false });
+      if (url.endsWith('/lte/status')) return respond(200, { certified: false, grant_active: false });
+      return respond(404, { error: 'not stubbed' });
+    }) as typeof fetch;
+
+    const now = Date.now();
+    renderPage(<ScenarioBuilderPage />, [{
+      pathname: '/scenarios/new',
+      state: {
+        seedFromTemplate: {
+          id: 'tpl-lte-attach', name: 'LTE Attach copy', description: 'draft',
+          version: 1, createdAt: now, updatedAt: now, technology: 'LTE', loop: { kind: 'ONCE' },
+          steps: [{ id: 'step-lte', kind: 'LTE_ATTACH', params: {} }],
+        },
+        systemTemplate: { id: 'tpl-lte-attach', name: 'LTE Attach', action: 'customize', support: 'CERTIFICATION_REQUIRED' },
+      },
+    }]);
+
+    expect(await screen.findByTestId('builder-template-source')).toHaveTextContent('immutable source');
+    const name = screen.getByTestId('scenario-name');
+    await userEvent.setup().clear(name);
+    await userEvent.setup().type(name, 'My LTE connectivity copy');
+    expect(screen.getByTestId('builder-run')).toBeDisabled();
+    expect(screen.getByTestId('builder-run')).toHaveAttribute('title', 'Backend execution support is missing for at least one step.');
+    expect(screen.getByTestId('builder-save')).toBeEnabled();
+    await userEvent.setup().click(screen.getByTestId('builder-save'));
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[0].method).toBe('POST');
+    const cloneBody = JSON.parse(calls[0].body) as { target_id: string };
+    expect(cloneBody.target_id).not.toMatch(/^tpl-/);
+    expect(calls[1].method).toBe('PUT');
+    const body = JSON.parse(calls[1].body) as { id: string; name: string; steps: Array<{ type: string }> };
+    expect(body.id).not.toBe('tpl-lte-attach');
+    expect(body.name).toBe('My LTE connectivity copy');
+    expect(body.steps[0].type).toBe('lte_attach');
   });
 
   it('offline-draft mode (flag OFF) hides the locked-step banner and clears the Save guard', async () => {
