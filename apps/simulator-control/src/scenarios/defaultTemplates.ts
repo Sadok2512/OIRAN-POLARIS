@@ -24,7 +24,7 @@ export interface SystemScenarioTemplate {
 const fixed = (value: number) => ({ fixed: value });
 const step = (type: string, parameters: WireScenarioDefinition['steps'][number]['parameters'] = {}): WireScenarioDefinition['steps'][number] => ({ type, loop_count: 1, parameters });
 function template(input: Omit<SystemScenarioTemplate, 'definition' | 'system'> & { steps: WireScenarioDefinition['steps'] }): SystemScenarioTemplate {
-  return { ...input, system: true, definition: { id: input.id, name: input.name, version: 1, loop_count: 1, steps: input.steps } };
+  return { ...input, system: true, definition: { id: input.id, name: input.name, version: 1, loop_count: 1, steps: input.steps, rat: input.rat, simulator: input.simulator, description: input.description } };
 }
 
 const LTE_BASE = ['LTE-SRSUE-TEST-01', 'Open5GS EPC', 'Valid Grant V2 for live execution'];
@@ -70,7 +70,7 @@ export function templateSupport(item: SystemScenarioTemplate): ScenarioTemplateS
 
 export function scenarioFromSystemTemplate(item: SystemScenarioTemplate): Scenario {
   const now = Date.now();
-  return { id: item.id, name: `${item.name} copy`, description: item.description, version: 1, createdAt: now, updatedAt: now, technology: item.rat, loop: { kind: 'ONCE' }, steps: item.definition.steps.map(toScenarioStep) };
+  return { id: item.id, name: `${item.name} copy`, description: item.description, version: 1, createdAt: now, updatedAt: now, technology: item.rat, simulator: item.simulator, backendSupport: item.support, loop: { kind: 'ONCE' }, steps: item.definition.steps.map(toScenarioStep) };
 }
 
 function toScenarioStep(entry: WireScenarioDefinition['steps'][number]): ScenarioStep {
@@ -78,8 +78,17 @@ function toScenarioStep(entry: WireScenarioDefinition['steps'][number]): Scenari
   const kind = wireToKind[entry.type];
   if (!kind || !STEP_METADATA[kind]) throw new Error(`SYSTEM_TEMPLATE_STEP_UNSUPPORTED:${entry.type}`);
   const params: StepParams = {};
+  const preservedWireParameters: ScenarioStep['preservedWireParameters'] = {};
   for (const [key, value] of Object.entries(entry.parameters)) {
-    (params as Record<string, StepParams[keyof StepParams]>)[key] = 'fixed' in value ? { mode: 'fixed', value: value.fixed } : { mode: 'random', min: value.random.min, max: value.random.max };
+    if ('fixed' in value) {
+      if (typeof value.fixed === 'number') {
+        (params as Record<string, StepParams[keyof StepParams]>)[key] = { mode: 'fixed', value: value.fixed };
+      } else {
+        preservedWireParameters[key] = value;
+      }
+    } else {
+      (params as Record<string, StepParams[keyof StepParams]>)[key] = { mode: 'random', min: value.random.min, max: value.random.max };
+    }
   }
-  return { id: newStepId(), kind, params };
+  return { id: newStepId(), kind, params, ...(Object.keys(preservedWireParameters).length > 0 ? { preservedWireParameters } : {}) };
 }

@@ -1,5 +1,14 @@
 # @telecom/simulator-control — Changelog
 
+## 0.17.1 — 2026-10-31 — backend/frontend contract integration
+
+- Preserves the catalogue RAT, simulator, description, provenance and support
+  metadata after server-side clone and subsequent saves.
+- Retains fixed string and boolean step parameters such as `dnn` and
+  `protocol` verbatim instead of coercing them to numbers or dropping them.
+- Adds integration tests using the enriched definition and scalar parameter
+  shapes returned by POLARIS API 0.24.0.
+
 ## 0.17.0 — 2026-10-31 — default LTE/5G scenario templates
 
 - Integrates the finalized ANR1 `polaris.scenario-template-catalog.v1` contract:

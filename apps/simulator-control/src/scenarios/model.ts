@@ -300,6 +300,15 @@ export interface StepParams {
   loop_count?: FixedOrRandom;
 }
 
+/**
+ * Wire values which are valid in the backend contract but do not have an
+ * editable numeric control in the current Builder (for example `dnn` and
+ * `protocol`). They are retained verbatim across clone/edit/save.
+ */
+export type PreservedWireParameter =
+  | { fixed: string | number | boolean }
+  | { random: { min: number; max: number } };
+
 export const PARAM_META: Record<keyof StepParams, { label: string; unit: string; min: number; max: number; integer: boolean }> = {
   duration_s: { label: 'Duration', unit: 's', min: 1, max: 900, integer: true },
   packet_count: { label: 'Packets', unit: 'pkt', min: 1, max: 1_000_000, integer: true },
@@ -321,6 +330,7 @@ export interface ScenarioStep {
   kind: ScenarioStepKind;
   params: StepParams;
   note?: string;
+  preservedWireParameters?: Record<string, PreservedWireParameter>;
   /**
    * 0.5.0 — Nested step list used ONLY by `kind: 'REPEAT'`. Nesting
    * depth is capped at `MAX_REPEAT_NESTING` (= 2); the validator
@@ -346,6 +356,9 @@ export interface Scenario {
   steps: ScenarioStep[];
   loop: LoopMode;
   technology?: '5G_SA' | 'LTE';
+  simulator?: 'UERANSIM' | 'srsRAN';
+  sourceDefinitionId?: string;
+  backendSupport?: 'SUPPORTED' | 'BACKEND_REQUIRED' | 'CERTIFICATION_REQUIRED';
 }
 
 export interface ScenarioAssignment {

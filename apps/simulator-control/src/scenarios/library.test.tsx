@@ -96,6 +96,9 @@ describe('useScenarioLibrary — backend mode', () => {
       id: 'scn-new-1',
       name: 'New one',
       loop_count: 50,
+      rat: '5G_SA',
+      simulator: 'UERANSIM',
+      description: '',
       steps: [{ type: 'wait', loop_count: 1, parameters: { duration_s: { fixed: 3 } } }],
     });
   });

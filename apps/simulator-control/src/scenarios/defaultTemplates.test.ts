@@ -30,4 +30,13 @@ describe('default scenario templates', () => {
     expect(draft.name).not.toBe(source.name);
     expect(source.definition.steps[0].parameters).toEqual({});
   });
+
+  it('keeps backend string parameters in a detached copy', () => {
+    const source = DEFAULT_SCENARIO_TEMPLATES.find((item) => item.id === 'tpl-5g-pdu-session')!;
+    source.definition.steps[1].parameters = { dnn: { fixed: 'internet' } };
+    const draft = scenarioFromSystemTemplate(source);
+    expect(draft.steps[1].preservedWireParameters).toEqual({ dnn: { fixed: 'internet' } });
+    expect(draft.technology).toBe('5G_SA');
+    expect(draft.simulator).toBe('UERANSIM');
+  });
 });
