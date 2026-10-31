@@ -1,10 +1,16 @@
-// 0.20.0 — Traffic Generator (#47).
+// 0.20.0 — Traffic Generator (#47) state machine + validation.
+// 0.20.1 — Per-session samples ring buffer + GET
+// `/traffic/sessions/:id/samples` endpoint feeding the simulator-control
+// 0.13.1 live charts. The ring is bounded (SAMPLES_RING_MAX = 60), so
+// the Analyzer-side memory bound mirrors the N3 aggregator one: no
+// per-packet retention, only per-tick snapshots of the counters.
 //
 // HTTP contract:
-//   POST   /api/v1/traffic/sessions  {ue_ids[], direction, protocol, rate_mbps, duration_s}
-//   GET    /api/v1/traffic/sessions                                     → list + per-UE live counters
-//   GET    /api/v1/traffic/sessions/:id                                  → one session
-//   DELETE /api/v1/traffic/sessions/:id                                  → stop (always allowed)
+//   POST   /api/v1/traffic/sessions          {ue_ids[], direction, protocol, rate_mbps, duration_s}
+//   GET    /api/v1/traffic/sessions                                       → list + per-UE live counters
+//   GET    /api/v1/traffic/sessions/:id                                    → one session
+//   DELETE /api/v1/traffic/sessions/:id                                    → stop (always allowed)
+//   GET    /api/v1/traffic/sessions/:id/samples                            → per-tick ring buffer (0.20.1)
 //
 // Rules (locked in tests):
 //   - rate_mbps ∈ [1, 50] — the lab UDP sender guarantees ≤ 20 Mbit/s
@@ -19,22 +25,26 @@
 //   - iperf3 is a measurement step; the per-session result reports the
 //     counters + warning codes but never fails the session (0.19.8).
 //
-// Memory bound: one `TrafficSession` per POST — fixed-size, no per-packet
-// retention. Live counters come from the iperf3 driver that produces
-// `IperfMeasurement` (0.19.8); we accumulate the counters, not the
-// frames.
+// Memory bound: one `TrafficSession` + one bounded `VecDeque<TrafficSample>`
+// (SAMPLES_RING_MAX = 60) per POST. Fixed-size, no per-packet retention.
+// Live counters come from the iperf3 driver that produces `IperfMeasurement`
+// (0.19.8); we accumulate the counters, not the frames.
 //
-// This file ships the state machine + validation + HTTP handlers. The
-// actual iperf3 spawn is wired to `UeRuntime::execute_iperf_ul` /
-// `execute_iperf_dl` by the handler below — those entry points are
-// already in place in 0.19.8 and the integration site is a single
-// `tokio::spawn_blocking` block per direction. Callers never block on
-// an iperf3 process; polling GET returns the latest snapshot.
+// The actual iperf3 spawn is wired to `UeRuntime::execute_iperf_ul` /
+// `execute_iperf_dl` by the handler layer — those entry points are already
+// in place in 0.19.8 and the integration site is a single
+// `tokio::spawn` block per direction. Callers never block on an iperf3
+// process; polling GET returns the latest snapshot.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Per-session rolling window of counter snapshots. 60 entries at 1 Hz
+/// is one minute of history — enough for an at-a-glance live chart but
+/// bounded so a long-running session cannot grow the API process RSS.
+pub const SAMPLES_RING_MAX: usize = 60;
 
 pub const RATE_MBPS_MIN: u32 = 1;
 pub const RATE_MBPS_MAX: u32 = 50;
@@ -115,6 +125,23 @@ pub struct SessionSnapshot {
     pub duration_s: u32,
 }
 
+/// A single tick snapshot of a traffic session's counters. The driver
+/// pushes one of these per second (or per iperf3 result window); the
+/// ring buffer is capped at `SAMPLES_RING_MAX` so an operator who leaves
+/// a 10-minute session running cannot grow the API process RSS.
+///
+/// Byte counters are cumulative since the session started so the client
+/// can draw either a cumulative line or diff two consecutive samples
+/// for an instantaneous rate.
+#[derive(Clone, Debug, Serialize)]
+pub struct TrafficSample {
+    pub epoch_s: u64,
+    pub bytes_ul_cum: u64,
+    pub bytes_dl_cum: u64,
+    pub rate_ul_bps: Option<u64>,
+    pub rate_dl_bps: Option<u64>,
+}
+
 /// Validation + state store. The HTTP handler layer plugs
 /// `TrafficSessionManager` into AppState and uses `tokio::task::spawn`
 /// to feed per-UE iperf3 drivers; the manager itself stays
@@ -123,6 +150,10 @@ pub struct SessionSnapshot {
 #[derive(Default)]
 pub struct TrafficSessionManager {
     sessions: Mutex<BTreeMap<String, TrafficSession>>,
+    /// Per-session bounded ring of counter snapshots (0.20.1). Keyed by
+    /// `session_id`. Separate map so the hot path for `get` / `list`
+    /// never has to iterate the sample history.
+    samples: Mutex<BTreeMap<String, VecDeque<TrafficSample>>>,
 }
 
 impl TrafficSessionManager {
@@ -195,6 +226,10 @@ impl TrafficSessionManager {
             .lock()
             .unwrap()
             .insert(session_id.clone(), session.clone());
+        self.samples
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), VecDeque::with_capacity(SAMPLES_RING_MAX));
         Ok(session)
     }
 
@@ -275,6 +310,58 @@ impl TrafficSessionManager {
 
     pub fn list(&self) -> Vec<TrafficSession> {
         self.sessions.lock().unwrap().values().cloned().collect()
+    }
+
+    /// 0.20.1 — Append a tick snapshot to the per-session ring. Capped at
+    /// `SAMPLES_RING_MAX`; older ticks fall off the front. Returns an
+    /// error only when the session_id is unknown (so the driver can log
+    /// and keep going without panicking).
+    pub fn push_sample(
+        &self,
+        session_id: &str,
+        sample: TrafficSample,
+    ) -> Result<(), &'static str> {
+        let mut map = self.samples.lock().unwrap();
+        let ring = map
+            .get_mut(session_id)
+            .ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
+        if ring.len() == SAMPLES_RING_MAX {
+            ring.pop_front();
+        }
+        ring.push_back(sample);
+        Ok(())
+    }
+
+    /// 0.20.1 — Snapshot of the ring buffer for GET `/samples`.
+    pub fn samples(&self, session_id: &str) -> Option<Vec<TrafficSample>> {
+        self.samples
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|ring| ring.iter().cloned().collect())
+    }
+
+    /// 0.20.1 — Flip a session to COMPLETED when the driver's duration
+    /// window closes naturally (as opposed to an operator STOP). No-op
+    /// if the session is already in a terminal state.
+    pub fn complete(&self, session_id: &str) -> Result<(), &'static str> {
+        let mut map = self.sessions.lock().unwrap();
+        let session = map
+            .get_mut(session_id)
+            .ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
+        if matches!(
+            session.state,
+            SessionState::Completed | SessionState::Stopped | SessionState::Failed
+        ) {
+            return Ok(());
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        session.state = SessionState::Completed;
+        session.ended_at_epoch_s = Some(now);
+        Ok(())
     }
 }
 
@@ -455,5 +542,84 @@ mod tests {
         assert_eq!(UDP_LOSSLESS_CEILING_MBPS, 20);
         assert_eq!(RATE_MBPS_MAX, 50);
         assert_eq!(DURATION_S_MAX, 600);
+    }
+
+    #[test]
+    fn samples_ring_is_created_on_start_and_queryable_empty() {
+        let mgr = TrafficSessionManager::new();
+        let s = mgr.start(req()).unwrap();
+        let got = mgr.samples(&s.session_id).unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn samples_evict_oldest_when_cap_reached() {
+        let mgr = TrafficSessionManager::new();
+        let s = mgr.start(req()).unwrap();
+        // Push 1.5× the cap; only the last `SAMPLES_RING_MAX` must remain
+        // and the earliest sample must be the (SAMPLES_RING_MAX / 2)-th
+        // one we pushed.
+        for i in 0..(SAMPLES_RING_MAX + SAMPLES_RING_MAX / 2) as u64 {
+            mgr.push_sample(
+                &s.session_id,
+                TrafficSample {
+                    epoch_s: 1_000_000 + i,
+                    bytes_ul_cum: i * 1_000,
+                    bytes_dl_cum: i * 500,
+                    rate_ul_bps: Some(1_000_000),
+                    rate_dl_bps: Some(500_000),
+                },
+            )
+            .unwrap();
+        }
+        let got = mgr.samples(&s.session_id).unwrap();
+        assert_eq!(got.len(), SAMPLES_RING_MAX);
+        assert_eq!(got.first().unwrap().epoch_s, 1_000_000 + (SAMPLES_RING_MAX / 2) as u64);
+        assert_eq!(
+            got.last().unwrap().epoch_s,
+            1_000_000 + (SAMPLES_RING_MAX + SAMPLES_RING_MAX / 2 - 1) as u64
+        );
+    }
+
+    #[test]
+    fn push_sample_rejects_unknown_session_without_panicking() {
+        let mgr = TrafficSessionManager::new();
+        let err = mgr
+            .push_sample(
+                "traffic-ffffffffffffffff",
+                TrafficSample {
+                    epoch_s: 0,
+                    bytes_ul_cum: 0,
+                    bytes_dl_cum: 0,
+                    rate_ul_bps: None,
+                    rate_dl_bps: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err, "TRAFFIC_SESSION_NOT_FOUND");
+    }
+
+    #[test]
+    fn complete_transitions_running_to_completed_once() {
+        let mgr = TrafficSessionManager::new();
+        let s = mgr.start(req()).unwrap();
+        mgr.transition_running(&s.session_id).unwrap();
+        mgr.complete(&s.session_id).unwrap();
+        let got = mgr.get(&s.session_id).unwrap();
+        assert_eq!(got.state, SessionState::Completed);
+        assert!(got.ended_at_epoch_s.is_some());
+        // Idempotent — a second `complete` on an already-COMPLETED session is a no-op.
+        mgr.complete(&s.session_id).unwrap();
+        assert_eq!(mgr.get(&s.session_id).unwrap().state, SessionState::Completed);
+    }
+
+    #[test]
+    fn complete_does_not_downgrade_a_stopped_session() {
+        let mgr = TrafficSessionManager::new();
+        let s = mgr.start(req()).unwrap();
+        mgr.stop(&s.session_id).unwrap();
+        mgr.complete(&s.session_id).unwrap();
+        // STOPPED stays STOPPED — an operator stop beats a natural completion.
+        assert_eq!(mgr.get(&s.session_id).unwrap().state, SessionState::Stopped);
     }
 }

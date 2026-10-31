@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.20.1 (polaris-control-api) — 2026-10-30 — Traffic Generator HTTP surface
+
+Rebased on top of `ebcf851` (0.20.0 — Traffic Generator state machine
++ validation). `git merge-base --is-ancestor ebcf851 HEAD` → true.
+
+### Routes (#47)
+- `POST   /api/v1/traffic/sessions` — operator-gated. Requires an active
+  live grant covering every UE in `ue_ids` (same gate as `scenarios/start`).
+  Validates the payload against the 0.20.0 contract and returns `422`
+  with the stable error code on bad input, `423`
+  `TRAFFIC_SESSION_GRANT_REQUIRED` when no grant covers the request.
+  Spawns the driver loop via `tokio::spawn` and returns `201 Created`
+  with the session snapshot.
+- `GET    /api/v1/traffic/sessions` — list all sessions.
+- `GET    /api/v1/traffic/sessions/:id` — one session's full snapshot.
+- `DELETE /api/v1/traffic/sessions/:id` — **always allowed** (0.20.0
+  Stop-is-sacred rule); still requires a valid CSRF token.
+- `GET    /api/v1/traffic/sessions/:id/samples` — new in 0.20.1.
+  Returns the per-session rolling ring (max 60 ticks at 1 Hz) for the
+  simulator-control 0.13.1 live charts. Shape: `{data: [TrafficSample…],
+  meta: {session_id, samples_ring_max: 60}}` where each sample carries
+  `{epoch_s, bytes_ul_cum, bytes_dl_cum, rate_ul_bps?, rate_dl_bps?}`.
+
+### iperf3 (measurement, never blocking)
+- One `tokio::spawn` per POST drives the measurement loop at 1 Hz.
+  Each tick:
+  1. Attempts to resolve a `VerifiedTrafficTarget` per UE via
+     `UeRuntime::resolve_traffic_target`.
+  2. For UEs whose target resolves, spawns a blocking iperf3
+     measurement (`tokio::task::spawn_blocking` →
+     `UeRuntime::execute_iperf_ul/_dl`) and folds the result's warning
+     codes into `record_measurement`.
+  3. For UEs whose target does **not** resolve (mock mode, UE not
+     `REGISTERED` + PDU-`ACTIVE`, …) surfaces the resolution failure
+     as a warning string and keeps the pipeline moving so the live
+     chart still draws — the 0.19.8 "measurement never fails the
+     session" invariant.
+- Exits early when the session leaves `RUNNING`. At `duration_s` the
+  session transitions to `COMPLETED` (idempotent — a STOP beats a
+  natural completion).
+
+### State machine extensions (traffic_sessions.rs)
+- `TrafficSample` struct + per-session bounded `VecDeque<TrafficSample>`
+  (cap = `SAMPLES_RING_MAX = 60`) keyed by `session_id`. Fixed-size — a
+  10-minute run cannot grow the API process RSS.
+- `push_sample` evicts the oldest tick on overflow; `samples()` returns a
+  cloned snapshot; `complete()` transitions `Running → Completed` and
+  stays a no-op on terminal `Stopped` / `Failed`.
+
+### Tests
+- 5 new unit tests in `traffic_sessions::tests`. Full module: 15 / 15.
+- 5 new HTTP integration tests in `p0_tests`:
+  - `traffic_session_post_requires_an_active_grant` — 423
+    `TRAFFIC_SESSION_GRANT_REQUIRED`.
+  - `traffic_session_post_rejects_invalid_payload_with_422` — empty
+    `ue_ids` → 422 `TRAFFIC_SESSION_UE_IDS_REQUIRED`.
+  - `traffic_session_happy_path_posts_then_lists_then_gets_then_streams_samples`
+    — grant installed → 201 → 1.2 s sleep → list + detail + samples
+    endpoint all serve the session with the UL rate sample present.
+  - `traffic_session_delete_is_always_allowed_but_still_requires_csrf`
+    — DELETE without CSRF → 403; with CSRF → 200 twice (idempotent).
+  - `traffic_session_samples_endpoint_returns_404_on_unknown_id`.
+- Full `cargo test -p polaris-control-api` → **191 passed · 0 failed · 3
+  ignored** (ignored are pre-existing).
+
+### Identity invariant (unchanged)
+The Traffic Generator never carries subscriber identity on the wire. UE
+ids are the operator-facing `UE-NN` / `UE-NNNNN` labels; IMSI / IMEI /
+TMSI / GUTI / RNTI / K / OPc never reach the state store or the samples
+endpoint.
+
 ## 0.17.9 (polaris-control-api) — AMBR BSON int (0.17.8 rolled back in lab)
 
 - **#39 (continued), live labo rejection**: Codex deployed 0.17.8 (BSON

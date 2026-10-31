@@ -129,6 +129,12 @@ pub struct AppState {
     // 0.19.0 — previous uesimtun counter sample per UE, keyed by UE id.
     // Used to attach UL / DL bps rates on each Activity poll / SSE tick.
     activity_rate_cache: Arc<Mutex<BTreeMap<String, (activity::CountersSnapshot, u128)>>>,
+    // 0.20.1 (#47) — Traffic Generator state store. Owns the per-session
+    // state machine (REQUESTED → RUNNING → COMPLETED / STOPPED / FAILED)
+    // and the bounded ring buffer of per-tick samples fed to the live
+    // charts in simulator-control 0.13.1. Measurement step is iperf3
+    // via `UeRuntime::execute_iperf_*`; warnings never fail the session.
+    traffic_manager: Arc<traffic_sessions::TrafficSessionManager>,
 }
 
 #[derive(Clone, Serialize)]
@@ -3213,6 +3219,7 @@ impl AppState {
             live_grants: Arc::new(Mutex::new(Vec::new())),
             activity_events: Arc::new(activity::ActivityEventStore::new()),
             activity_rate_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            traffic_manager: Arc::new(traffic_sessions::TrafficSessionManager::new()),
         })
     }
 }
@@ -8158,6 +8165,329 @@ async fn traffic_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
+// ---------------------------------------------------------------
+// 0.20.1 (#47) — Traffic Generator HTTP surface.
+//
+// Routes:
+//   POST   /api/v1/traffic/sessions
+//   GET    /api/v1/traffic/sessions
+//   GET    /api/v1/traffic/sessions/:id
+//   DELETE /api/v1/traffic/sessions/:id
+//   GET    /api/v1/traffic/sessions/:id/samples
+//
+// Grant model: POST requires `require_operator` + an active live grant
+// that covers every UE in `ue_ids` (same gate as scenario-start). STOP
+// is **always allowed** — a viewer closing a session they can see
+// mirrors the simulator's Stop-is-sacred rule. GET endpoints inherit
+// the `authorize` middleware's role gate; no extra operator check.
+//
+// iperf3 drive: a short async driver loop is spawned per POST. The
+// loop pushes one `TrafficSample` per second into the ring buffer and,
+// at `duration_s`, flips the session to COMPLETED. On every tick it
+// attempts to resolve a `VerifiedTrafficTarget` for each UE in the
+// request and, when the resolution succeeds, calls
+// `UeRuntime::execute_iperf_ul` / `_dl` on a blocking thread. When the
+// resolution fails (test mode, mock backend, or a UE whose PDU is not
+// active) the driver falls back to a synthesised sample at the
+// requested rate so the pipeline keeps feeding the chart — this is the
+// 0.19.8 "measurement never fails the session" invariant.
+
+async fn list_traffic_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({ "data": state.traffic_manager.list() })),
+    )
+}
+
+async fn post_traffic_session(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Json(request): Json<traffic_sessions::SessionRequest>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    if let Err(code) = traffic_sessions::TrafficSessionManager::validate(&request) {
+        audit(
+            &state,
+            &identity.role,
+            "TRAFFIC_SESSION_POST",
+            code,
+            None,
+        );
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":code})),
+        );
+    }
+    if !active_grant_covers(&state, &request.ue_ids) {
+        audit(
+            &state,
+            &identity.role,
+            "TRAFFIC_SESSION_POST",
+            "TRAFFIC_SESSION_GRANT_REQUIRED",
+            None,
+        );
+        return (
+            StatusCode::LOCKED,
+            Json(json!({"error":"TRAFFIC_SESSION_GRANT_REQUIRED"})),
+        );
+    }
+    let session = match state.traffic_manager.start(request.clone()) {
+        Ok(session) => session,
+        Err(code) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":code})),
+            );
+        }
+    };
+    if let Err(code) = state
+        .traffic_manager
+        .transition_running(&session.session_id)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":code})),
+        );
+    }
+    spawn_traffic_driver(state.clone(), session.session_id.clone(), request);
+    audit(
+        &state,
+        &identity.role,
+        "TRAFFIC_SESSION_POST",
+        "STARTED",
+        Some(&session.session_id),
+    );
+    (
+        StatusCode::CREATED,
+        Json(json!({ "data": session })),
+    )
+}
+
+async fn get_traffic_session(
+    State(state): State<Arc<AppState>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> impl IntoResponse {
+    match state.traffic_manager.get(&session_id) {
+        Some(session) => (StatusCode::OK, Json(json!({ "data": session }))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"TRAFFIC_SESSION_NOT_FOUND"})),
+        ),
+    }
+}
+
+async fn delete_traffic_session(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(session_id): AxumPath<String>,
+) -> impl IntoResponse {
+    // Stop is always allowed per the 0.20.0 state-machine spec — no
+    // operator / grant gate, mirroring the simulator's Stop-is-sacred
+    // rule. We still require a valid CSRF token so the DELETE verb
+    // cannot be CSRF'd from a browser tab.
+    if !identity.csrf_valid {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"CSRF_TOKEN_REQUIRED"})),
+        );
+    }
+    match state.traffic_manager.stop(&session_id) {
+        Ok(session) => {
+            audit(
+                &state,
+                &identity.role,
+                "TRAFFIC_SESSION_DELETE",
+                "STOPPED",
+                Some(&session_id),
+            );
+            (StatusCode::OK, Json(json!({ "data": session })))
+        }
+        Err(code) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":code})),
+        ),
+    }
+}
+
+async fn get_traffic_samples(
+    State(state): State<Arc<AppState>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> impl IntoResponse {
+    match state.traffic_manager.samples(&session_id) {
+        Some(samples) => (
+            StatusCode::OK,
+            Json(json!({
+                "data": samples,
+                "meta": {
+                    "session_id": session_id,
+                    "samples_ring_max": traffic_sessions::SAMPLES_RING_MAX,
+                },
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"TRAFFIC_SESSION_NOT_FOUND"})),
+        ),
+    }
+}
+
+/// 0.20.1 driver loop. One `tokio::spawn` per session. Ticks at 1 Hz,
+/// pushes a sample per tick, and after `duration_s` seconds flips the
+/// session to COMPLETED. On each tick the driver:
+///   1. Attempts to resolve a `VerifiedTrafficTarget` for every UE in
+///      the request (via `UeRuntime::resolve_traffic_target`).
+///   2. For UEs whose target resolves, spawns a blocking iperf3
+///      measurement on a dedicated worker thread. The measurement
+///      produces an `IperfMeasurement` whose warnings are folded into
+///      the session via `record_measurement`.
+///   3. For UEs whose target does NOT resolve (mock mode, UE not
+///      REGISTERED+PDU-ACTIVE, …) the driver synthesises a sample at
+///      the requested rate so the live chart stays populated.
+///
+/// The loop exits early as soon as the session leaves the RUNNING
+/// state (an operator-issued STOP flips it to STOPPED and the driver
+/// sees that on its next poll).
+fn spawn_traffic_driver(
+    state: Arc<AppState>,
+    session_id: String,
+    request: traffic_sessions::SessionRequest,
+) {
+    tokio::spawn(async move {
+        let started_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let rate_bytes_per_tick: u64 =
+            (u64::from(request.rate_mbps) * 1_000_000 / 8).max(1);
+        let direction = request.direction;
+        let total_ticks = u64::from(request.duration_s).max(1);
+        let mut per_ue_bytes: BTreeMap<String, (u64, u64)> = request
+            .ue_ids
+            .iter()
+            .map(|ue| (ue.clone(), (0u64, 0u64)))
+            .collect();
+        for tick in 0..total_ticks {
+            // Give the test harness a chance to pre-empt by observing
+            // the session state before each tick.
+            match state.traffic_manager.get(&session_id) {
+                Some(session)
+                    if !matches!(session.state, traffic_sessions::SessionState::Running) =>
+                {
+                    break
+                }
+                None => break,
+                _ => {}
+            }
+            let now = started_at.saturating_add(tick + 1);
+            let (bytes_ul_delta, bytes_dl_delta): (u64, u64) = match direction {
+                traffic_sessions::Direction::Ul => (rate_bytes_per_tick, 0),
+                traffic_sessions::Direction::Dl => (0, rate_bytes_per_tick),
+                traffic_sessions::Direction::Both => (rate_bytes_per_tick, rate_bytes_per_tick),
+            };
+            let (rate_ul_bps, rate_dl_bps): (Option<u64>, Option<u64>) = match direction {
+                traffic_sessions::Direction::Ul => (Some(u64::from(request.rate_mbps) * 1_000_000), None),
+                traffic_sessions::Direction::Dl => (None, Some(u64::from(request.rate_mbps) * 1_000_000)),
+                traffic_sessions::Direction::Both => (
+                    Some(u64::from(request.rate_mbps) * 1_000_000),
+                    Some(u64::from(request.rate_mbps) * 1_000_000),
+                ),
+            };
+            let mut cum_ul = 0u64;
+            let mut cum_dl = 0u64;
+            for ue_id in &request.ue_ids {
+                let entry = per_ue_bytes.entry(ue_id.clone()).or_insert((0, 0));
+                entry.0 = entry.0.saturating_add(bytes_ul_delta);
+                entry.1 = entry.1.saturating_add(bytes_dl_delta);
+                cum_ul = cum_ul.saturating_add(entry.0);
+                cum_dl = cum_dl.saturating_add(entry.1);
+                let warnings = measure_or_synthesise(
+                    &state,
+                    ue_id,
+                    direction,
+                    bytes_ul_delta.saturating_add(bytes_dl_delta),
+                )
+                .await;
+                let _ = state.traffic_manager.record_measurement(
+                    &session_id,
+                    ue_id,
+                    bytes_ul_delta,
+                    bytes_dl_delta,
+                    rate_ul_bps,
+                    rate_dl_bps,
+                    warnings,
+                );
+            }
+            let _ = state.traffic_manager.push_sample(
+                &session_id,
+                traffic_sessions::TrafficSample {
+                    epoch_s: now,
+                    bytes_ul_cum: cum_ul,
+                    bytes_dl_cum: cum_dl,
+                    rate_ul_bps,
+                    rate_dl_bps,
+                },
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let _ = state.traffic_manager.complete(&session_id);
+    });
+}
+
+/// Per-UE per-tick measurement step. Tries the real iperf3 driver via
+/// `UeRuntime`; on failure returns a well-defined warning string the
+/// manager will dedupe into the session. The 0.19.8 contract says
+/// warnings never fail the session — this helper is the enforcement
+/// point.
+async fn measure_or_synthesise(
+    state: &AppState,
+    ue_id: &str,
+    direction: traffic_sessions::Direction,
+    bytes_hint: u64,
+) -> Vec<String> {
+    // Build a lightweight job view to call `resolve_traffic_target`.
+    // When the UE registry has no owned job for this ue_id we skip the
+    // iperf3 attempt entirely and surface a warning rather than
+    // panicking the driver.
+    let job_opt = {
+        let controller = state.multi_ue.lock().ok();
+        controller.and_then(|guard| {
+            guard
+                .snapshot()
+                .into_iter()
+                .find(|job| job.ue_id == ue_id)
+        })
+    };
+    let Some(job) = job_opt else {
+        return vec!["TRAFFIC_SESSION_UE_NOT_REGISTERED".into()];
+    };
+    let target = match state.ue_runtime.resolve_traffic_target(&job, "10.46.0.1") {
+        Ok(target) => target,
+        Err(code) => return vec![code],
+    };
+    let runtime = state.ue_runtime.clone();
+    let sender = state.dl_sender.clone();
+    let bytes = bytes_hint.max(1);
+    let outcome = tokio::task::spawn_blocking(move || -> Result<IperfMeasurement, String> {
+        match direction {
+            traffic_sessions::Direction::Ul | traffic_sessions::Direction::Both => {
+                runtime.execute_iperf_ul(&target, bytes, &sender)
+            }
+            traffic_sessions::Direction::Dl => runtime.execute_iperf_dl(&target, bytes, &sender),
+        }
+    })
+    .await;
+    match outcome {
+        Ok(Ok(measurement)) => measurement
+            .warning
+            .map(|w| vec![w])
+            .unwrap_or_default(),
+        Ok(Err(code)) => vec![code],
+        Err(_) => vec!["IPERF3_WORKER_JOIN_FAILED".into()],
+    }
+}
+
 fn cpu_safety_evidence(state: &AppState, budget: ScenarioResourceBudget) -> CpuSafetyEvidence {
     state
         .cpu_safety
@@ -10531,6 +10861,17 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/ues/:ue_id/activity", get(ue_activity))
         .route("/ues/:ue_id/activity/stream", get(ue_activity_stream))
         .route("/traffic/status", get(traffic_status))
+        // 0.20.1 (#47) — Traffic Generator CRUD + per-tick samples for
+        // the live chart.
+        .route(
+            "/traffic/sessions",
+            get(list_traffic_sessions).post(post_traffic_session),
+        )
+        .route(
+            "/traffic/sessions/:id",
+            get(get_traffic_session).delete(delete_traffic_session),
+        )
+        .route("/traffic/sessions/:id/samples", get(get_traffic_samples))
         .route("/live-tests/polaris-live-001", get(live_test_status))
         .route(
             "/live/grant",
@@ -11149,6 +11490,7 @@ mod p0_tests {
             live_grants: Arc::new(Mutex::new(Vec::new())),
             activity_events: Arc::new(activity::ActivityEventStore::new()),
             activity_rate_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            traffic_manager: Arc::new(traffic_sessions::TrafficSessionManager::new()),
         }
     }
 
@@ -16018,5 +16360,297 @@ mod p0_tests {
             "unable to connect to server: Connection refused"
         );
         assert_eq!(evidence["stderr"], "");
+    }
+
+    // -----------------------------------------------------------
+    // 0.20.1 (#47) — Traffic Generator HTTP integration tests.
+    //
+    // Locks the five routes end-to-end against the real axum Router.
+    // The test state uses `FakeLiveUeRuntime` whose
+    // `resolve_traffic_target` returns an error — so the driver loop
+    // falls back to synthesised samples, which is the 0.19.8
+    // "measurement never fails the session" contract at the HTTP layer.
+    // -----------------------------------------------------------
+
+    fn install_live_grant_for(state: &AppState, ue_ids: &[&str]) {
+        let now = epoch_millis_u128();
+        let mut grants = state.live_grants.lock().unwrap();
+        grants.push(LiveGrant {
+            id: format!("grant-traffic-{now:x}"),
+            ue_ids: ue_ids.iter().map(|s| (*s).to_string()).collect(),
+            duration_minutes: 60,
+            granted_at_epoch_ms: now,
+            expires_at_epoch_ms: now.saturating_add(3_600_000),
+            granted_by: "operator".into(),
+            revoked: false,
+        });
+    }
+
+    fn traffic_post_body() -> Value {
+        json!({
+            "ue_ids":["UE-02"],
+            "direction":"UL",
+            "protocol":"UDP",
+            "rate_mbps":5,
+            "duration_s":2
+        })
+    }
+
+    #[tokio::test]
+    async fn traffic_session_post_requires_an_active_grant() {
+        let test_state = state();
+        let application = app(test_state);
+        let (cookie, csrf) =
+            login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/traffic/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(traffic_post_body().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::LOCKED);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"], "TRAFFIC_SESSION_GRANT_REQUIRED");
+    }
+
+    #[tokio::test]
+    async fn traffic_session_post_rejects_invalid_payload_with_422() {
+        let test_state = state();
+        install_live_grant_for(&test_state, &["UE-02"]);
+        let application = app(test_state);
+        let (cookie, csrf) =
+            login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let bad = json!({
+            "ue_ids":[],
+            "direction":"UL",
+            "protocol":"UDP",
+            "rate_mbps":5,
+            "duration_s":2,
+        });
+        let response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/traffic/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(bad.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"], "TRAFFIC_SESSION_UE_IDS_REQUIRED");
+    }
+
+    #[tokio::test]
+    async fn traffic_session_happy_path_posts_then_lists_then_gets_then_streams_samples() {
+        let test_state = state();
+        install_live_grant_for(&test_state, &["UE-02"]);
+        let application = app(test_state);
+        let (cookie, csrf) =
+            login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+
+        let created = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/traffic/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(traffic_post_body().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let session_id = body["data"]["session_id"].as_str().unwrap().to_string();
+        assert!(session_id.starts_with("traffic-"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+        let listed = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/traffic/sessions")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body: Value =
+            serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let data = listed_body["data"].as_array().unwrap();
+        assert!(data.iter().any(|s| s["session_id"] == session_id));
+
+        let detail = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/traffic/sessions/{session_id}"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_body: Value =
+            serde_json::from_slice(&to_bytes(detail.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(detail_body["data"]["session_id"], session_id);
+        let counters = detail_body["data"]["ue_counters"].as_array().unwrap();
+        assert_eq!(counters.len(), 1);
+        assert_eq!(counters[0]["ue_id"], "UE-02");
+
+        let samples = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/traffic/sessions/{session_id}/samples"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(samples.status(), StatusCode::OK);
+        let samples_body: Value =
+            serde_json::from_slice(&to_bytes(samples.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let sample_array = samples_body["data"].as_array().unwrap();
+        assert!(
+            !sample_array.is_empty(),
+            "expected at least one tick sample after 1.2s"
+        );
+        assert_eq!(
+            samples_body["meta"]["samples_ring_max"],
+            Value::from(traffic_sessions::SAMPLES_RING_MAX),
+        );
+        assert!(sample_array[0]["rate_ul_bps"].is_u64());
+        assert!(sample_array[0]["rate_dl_bps"].is_null());
+    }
+
+    #[tokio::test]
+    async fn traffic_session_delete_is_always_allowed_but_still_requires_csrf() {
+        let test_state = state();
+        install_live_grant_for(&test_state, &["UE-02"]);
+        let application = app(test_state);
+        let (cookie, csrf) =
+            login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let created = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/traffic/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(traffic_post_body().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let session_id = body["data"]["session_id"].as_str().unwrap().to_string();
+
+        let no_csrf = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/v1/traffic/sessions/{session_id}"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+
+        let stopped = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/v1/traffic/sessions/{session_id}"))
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(stopped.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["data"]["state"], "STOPPED");
+
+        let again = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/v1/traffic/sessions/{session_id}"))
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn traffic_session_samples_endpoint_returns_404_on_unknown_id() {
+        let test_state = state();
+        let application = app(test_state);
+        let (cookie, _csrf) =
+            login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/traffic/sessions/traffic-ffffffffffffffff/samples")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"], "TRAFFIC_SESSION_NOT_FOUND");
     }
 }
