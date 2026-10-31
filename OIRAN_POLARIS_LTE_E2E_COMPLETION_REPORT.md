@@ -53,7 +53,7 @@ counted as PASS, and keep the overall verdict from `OFFLINE_PASS`.
 
 ## Current safety gates
 
-At final review, `/` was 79% used, `MemAvailable` was 6,318,493,696 bytes and
+At final review, `/` was 79% used, `MemAvailable` was 4,517,359,616 bytes and
 12 exact `dumpcap` processes were present. No process was signalled or
 restarted. No UE, traffic, capture or production deployment was performed.
 
