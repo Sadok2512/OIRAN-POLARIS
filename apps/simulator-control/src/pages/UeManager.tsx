@@ -68,6 +68,8 @@ import { UeBulkCreateDialog } from '@/ue/UeBulkCreateDialog';
 import { AssignScenarioDialog } from '@/ue/AssignScenarioDialog';
 import { CsvImportDialog } from '@/components/CsvImportDialog';
 import { useQuery } from '@tanstack/react-query';
+import { TechnologySelector, type RadioTechnology } from '@/components/TechnologySelector';
+import { LteControlPanel } from '@/components/LteControlPanel';
 
 const PAGE_SIZES = [25, 50, 100, 250] as const;
 
@@ -120,6 +122,7 @@ export function UeManagerPage() {
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [feedback, setFeedback] = useState('');
+  const [technology, setTechnology] = useState<RadioTechnology>('5G_SA');
 
   const [formState, setFormState] = useState<{
     mode: ProfileFormMode;
@@ -581,6 +584,14 @@ export function UeManagerPage() {
           </div>
         }
       />
+
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+        <TechnologySelector value={technology} onChange={setTechnology} />
+        <span className="text-ep-sm text-mute">
+          One UE Manager · technology-specific state comes from POLARIS.
+        </span>
+      </div>
+      {technology === 'LTE' ? <LteControlPanel /> : null}
 
       {uesQuery.isLoading && !uesQuery.data && (
         <LoadingSkeleton label="Loading backend UE inventory" />

@@ -29,7 +29,12 @@ export type ScenarioStepKind =
   | 'DETACH'
   | 'REPEAT'
   | 'IMS_REGISTER'
-  | 'VOICE_CALL';
+  | 'VOICE_CALL'
+  | 'LTE_ATTACH'
+  | 'LTE_DETACH'
+  | 'LTE_DATA_UL'
+  | 'LTE_DATA_DL'
+  | 'LTE_ATTACH_DATA';
 
 export const STEP_METADATA: Record<
   ScenarioStepKind,
@@ -160,6 +165,39 @@ export const STEP_METADATA: Record<
     backendCertified: false,
     backendNote: 'IMS_NOT_AVAILABLE — same as ims_register. AMR-WB is the only codec declared today.',
   },
+  LTE_ATTACH: {
+    label: 'LTE Attach',
+    family: 'ACTION',
+    backendCertified: false,
+    backendNote: 'LTE_E2E_CERTIFICATION_REQUIRED — mock/catalog only until ANR1 certification.',
+  },
+  LTE_DETACH: {
+    label: 'LTE Detach',
+    family: 'ACTION',
+    backendCertified: false,
+    backendNote: 'LTE_E2E_CERTIFICATION_REQUIRED — Stop remains available through the bounded controller.',
+  },
+  LTE_DATA_UL: {
+    label: 'LTE Data UL',
+    family: 'ACTION',
+    defaultParams: ['bytes', 'rate_kbps'],
+    backendCertified: false,
+    backendNote: 'LTE_E2E_CERTIFICATION_REQUIRED — no live data is started by the Builder.',
+  },
+  LTE_DATA_DL: {
+    label: 'LTE Data DL',
+    family: 'ACTION',
+    defaultParams: ['bytes', 'rate_kbps'],
+    backendCertified: false,
+    backendNote: 'LTE_E2E_CERTIFICATION_REQUIRED — no live data is started by the Builder.',
+  },
+  LTE_ATTACH_DATA: {
+    label: 'LTE Attach + Data',
+    family: 'ACTION',
+    defaultParams: ['bytes', 'rate_kbps'],
+    backendCertified: false,
+    backendNote: 'LTE_E2E_CERTIFICATION_REQUIRED — atomic mock workflow until ANR1 certification.',
+  },
 };
 
 /**
@@ -181,6 +219,11 @@ export const WIRE_STEP_TYPE: Partial<Record<ScenarioStepKind, string>> = {
   REPEAT: 'repeat',
   IMS_REGISTER: 'ims_register',
   VOICE_CALL: 'voice_call',
+  LTE_ATTACH: 'lte_attach',
+  LTE_DETACH: 'lte_detach',
+  LTE_DATA_UL: 'lte_traffic_ul',
+  LTE_DATA_DL: 'lte_traffic_dl',
+  LTE_ATTACH_DATA: 'lte_attach_data',
 };
 
 /** Reverse map used when decoding a backend `type` into our internal kind. */
@@ -198,6 +241,11 @@ export const INTERNAL_STEP_KIND: Record<string, ScenarioStepKind> = {
   repeat: 'REPEAT',
   ims_register: 'IMS_REGISTER',
   voice_call: 'VOICE_CALL',
+  lte_attach: 'LTE_ATTACH',
+  lte_detach: 'LTE_DETACH',
+  lte_traffic_ul: 'LTE_DATA_UL',
+  lte_traffic_dl: 'LTE_DATA_DL',
+  lte_attach_data: 'LTE_ATTACH_DATA',
 };
 
 /**
@@ -297,6 +345,7 @@ export interface Scenario {
   updatedAt: number;
   steps: ScenarioStep[];
   loop: LoopMode;
+  technology?: '5G_SA' | 'LTE';
 }
 
 export interface ScenarioAssignment {
@@ -446,6 +495,7 @@ export function emptyScenario(name = 'New scenario'): Scenario {
     updatedAt: now,
     steps: [],
     loop: { kind: 'ONCE' },
+    technology: '5G_SA',
   };
 }
 

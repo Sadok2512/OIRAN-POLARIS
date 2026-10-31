@@ -3,6 +3,8 @@ import react from '@vitejs/plugin-react';
 import path from 'node:path';
 
 export default defineConfig({
+  // CI/audit runs can keep dependency metadata off a constrained system disk.
+  cacheDir: process.env.POLARIS_SIM_VITE_CACHE_DIR,
   plugins: [react()],
   // The Simulator Control app is served behind the preview reverse proxy
   // at `/simulator/` (apps/portal links to that path).

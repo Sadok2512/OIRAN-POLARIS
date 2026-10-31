@@ -7,6 +7,7 @@ import type {
   LabConfiguration,
   LoginRequest,
   LoginResult,
+  LteStatus,
   NodeInventory,
   PolarisAuthState,
   ScenarioCapabilities,
@@ -108,6 +109,43 @@ export function useUes() {
     queryKey: ['polaris', 'ues'],
     queryFn: () => polarisApi<UeInventory>('/ues'),
     refetchInterval: 4_000,
+  });
+}
+
+export function useLteStatus() {
+  return useQuery({
+    queryKey: ['polaris', 'lte-status'],
+    queryFn: () => polarisApi<LteStatus>('/lte/status'),
+    refetchInterval: 3_000,
+    retry: false,
+  });
+}
+
+export function useLteAction(action: 'start' | 'stop') {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (component: 'ENB-01' | 'LTE-UE-01') =>
+      polarisApi<{ component: string; state: string }>(`/lte/components/${action}`, {
+        method: 'POST',
+        body: JSON.stringify({ component, ue_id: 'LTE-UE-01' }),
+      }),
+    onSuccess: async () => {
+      await client.invalidateQueries({ queryKey: ['polaris', 'lte-status'] });
+      await client.invalidateQueries({ queryKey: ['polaris', 'ues'] });
+      await client.invalidateQueries({ queryKey: ['polaris', 'nodes'] });
+    },
+  });
+}
+
+export function useLteLogs(component: 'ENB-01' | 'LTE-UE-01') {
+  return useQuery({
+    queryKey: ['polaris', 'lte-logs', component],
+    queryFn: () =>
+      polarisApi<{ component: string; lines: string[]; redacted: boolean }>(
+        `/lte/logs?component=${encodeURIComponent(component)}`,
+      ),
+    refetchInterval: 5_000,
+    retry: false,
   });
 }
 

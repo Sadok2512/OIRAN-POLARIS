@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  INTERNAL_STEP_KIND,
+  WIRE_STEP_TYPE,
   certifiedProfileFor,
   emptyScenario,
   newStepId,
@@ -11,6 +13,23 @@ import {
   type ScenarioStepKind,
   type StepParams,
 } from './model';
+
+describe('LTE wire contract', () => {
+  it.each([
+    ['LTE_ATTACH', 'lte_attach'],
+    ['LTE_DETACH', 'lte_detach'],
+    ['LTE_DATA_UL', 'lte_traffic_ul'],
+    ['LTE_DATA_DL', 'lte_traffic_dl'],
+    ['LTE_ATTACH_DATA', 'lte_attach_data'],
+  ] as const)('maps %s without changing the existing 5G contract', (kind, wireType) => {
+    expect(WIRE_STEP_TYPE[kind]).toBe(wireType);
+    expect(INTERNAL_STEP_KIND[wireType]).toBe(kind);
+  });
+
+  it('keeps LTE scenarios outside the certified 5G profile mapper', () => {
+    expect(certifiedProfileFor(scenario({ steps: [makeStep('LTE_ATTACH')] }))).toBeNull();
+  });
+});
 
 function makeStep(kind: ScenarioStepKind, params: StepParams = {}): ScenarioStep {
   return { id: newStepId(), kind, params };

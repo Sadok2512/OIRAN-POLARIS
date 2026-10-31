@@ -42,6 +42,8 @@ import {
 } from '@/data/trafficSessionsApi';
 import { TrafficSparkline } from '@/components/TrafficSparkline';
 import { ApiError } from '@shared/api';
+import { TechnologySelector, type RadioTechnology } from '@/components/TechnologySelector';
+import { useLteStatus } from '@/data/queries';
 
 const QUERY_KEY = ['polaris', 'traffic-sessions'] as const;
 
@@ -107,8 +109,10 @@ export function TrafficSessionsPage() {
   const auth = useAuth();
   const canOperate = auth.data?.can_start === true;
   const client = useQueryClient();
+  const lte = useLteStatus();
 
   const [ueIds, setUeIds] = useState('UE-01');
+  const [technology, setTechnology] = useState<RadioTechnology>('5G_SA');
   const [direction, setDirection] = useState<TrafficDirection>('BOTH');
   const [protocol, setProtocol] = useState<TrafficProtocol>('UDP');
   const [rateMbps, setRateMbps] = useState(5);
@@ -170,6 +174,21 @@ export function TrafficSessionsPage() {
         title="Traffic Generator"
         desc="Ponctual iperf3-measured UL / DL sessions per UE. Lab ceiling: 50 Mbit/s hard; UDP lossless ≤ 20 Mbit/s. Stops never require a grant."
       />
+
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <TechnologySelector
+          value={technology}
+          onChange={(next) => {
+            setTechnology(next);
+            setUeIds(next === 'LTE' ? 'LTE-UE-01' : 'UE-01');
+          }}
+        />
+        {technology === 'LTE' ? (
+          <span className="text-ep-sm text-warn">
+            LTE traffic remains locked until E2E certification; attach state: {lte.data?.attach_state ?? 'NOT OBSERVED'}.
+          </span>
+        ) : null}
+      </div>
 
       <Card className="p-5 flex flex-col gap-4" data-testid="traffic-form">
         <div className="grid gap-3 md:grid-cols-2">
@@ -245,11 +264,11 @@ export function TrafficSessionsPage() {
             icon={Zap}
             primary
             onClick={submit}
-            disabled={!canOperate || start.isPending}
-            title={canOperate ? undefined : 'Rôle operator requis + grant actif.'}
+            disabled={!canOperate || start.isPending || technology === 'LTE'}
+            title={technology === 'LTE' ? 'LTE_E2E_CERTIFICATION_REQUIRED' : canOperate ? undefined : 'Rôle operator requis + grant actif.'}
             data-testid="traffic-start"
           >
-            {start.isPending ? 'Starting…' : 'Start session'}
+            {start.isPending ? 'Starting…' : technology === 'LTE' ? 'Awaiting LTE certification' : 'Start session'}
           </Btn>
           {formError ? (
             <span className="text-sm2 text-bad" data-testid="traffic-form-error">

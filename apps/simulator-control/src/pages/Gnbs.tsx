@@ -3,6 +3,7 @@ import { Card, Locked, PageHeader, Pill, regTone } from '@/components/mockup';
 import { EmptyState, ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
 import { useNodes, useUes } from '@/data/queries';
 import type { NodeItem } from '@/data/polarisTypes';
+import { LteControlPanel } from '@/components/LteControlPanel';
 
 const KNOWN_LOCK_REASONS: Record<string, string> = {
   LIVE_005_APPROVAL_REQUIRED: 'Multi-gNB execution locked until LIVE-005 approval.',
@@ -58,6 +59,7 @@ export function GnbsPage() {
       {enbs.length > 0 && (
         <section className="flex flex-col gap-3" data-testid="enbs-grid">
           <h2 className="text-ep-md font-semibold">LTE profile (not certified)</h2>
+          <LteControlPanel compact />
           <div className="grid gap-5 lg:grid-cols-2">
             {enbs.map((node) => (
               <GnbCard

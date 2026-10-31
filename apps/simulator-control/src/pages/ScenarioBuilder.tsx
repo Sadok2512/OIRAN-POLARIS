@@ -34,6 +34,15 @@ import {
 import { StepEditor } from '@/components/StepEditor';
 import { LoopEditor } from '@/components/LoopEditor';
 import { ScenarioTimeline } from '@/components/ScenarioTimeline';
+import { TechnologySelector, type RadioTechnology } from '@/components/TechnologySelector';
+
+const LTE_KINDS = new Set<ScenarioStepKind>([
+  'LTE_ATTACH',
+  'LTE_DETACH',
+  'LTE_DATA_UL',
+  'LTE_DATA_DL',
+  'LTE_ATTACH_DATA',
+]);
 
 export function ScenarioBuilderPage() {
   const { scenarioId } = useParams<{ scenarioId: string }>();
@@ -76,17 +85,19 @@ export function ScenarioBuilderPage() {
   // truth: when it names a wire type, the matching kind is promoted to
   // "Supported" without touching STEP_METADATA.
   const capabilities = useCapabilities();
-  const advertisedKinds = capabilities.data?.scenario_step_kinds;
+  const advertisedKinds = capabilities.data?.scenario_step_kinds ?? capabilities.data?.executable_scenario_step_types;
+  const technology: RadioTechnology = draft.technology ?? '5G_SA';
 
   const paletteGroups = useMemo(() => {
     const supported: ScenarioStepKind[] = [];
     const locked: ScenarioStepKind[] = [];
     for (const kind of Object.keys(STEP_METADATA) as ScenarioStepKind[]) {
+      if ((technology === 'LTE') !== LTE_KINDS.has(kind)) continue;
       if (isStepKindExecutable(kind, advertisedKinds)) supported.push(kind);
       else locked.push(kind);
     }
     return { supported, locked };
-  }, [advertisedKinds]);
+  }, [advertisedKinds, technology]);
 
   const hasLockedStep = useMemo(
     () => draft.steps.some((step) => !isStepKindExecutable(step.kind, advertisedKinds)),
@@ -233,6 +244,26 @@ export function ScenarioBuilderPage() {
           </div>
         }
       />
+
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <TechnologySelector
+          value={technology}
+          onChange={(next) =>
+            setDraft((previous) => ({
+              ...previous,
+              technology: next,
+              steps: (previous.technology ?? '5G_SA') !== next ? [] : previous.steps,
+            }))
+          }
+        />
+        {technology === 'LTE' ? (
+          <span className="text-ep-sm text-warn">
+            Catalog and mock validation only · Live requires ANR1 LTE E2E certification.
+          </span>
+        ) : (
+          <span className="text-ep-sm text-mute">Existing 5G SA scenarios remain unchanged.</span>
+        )}
+      </div>
 
       {saveError && (
         <section

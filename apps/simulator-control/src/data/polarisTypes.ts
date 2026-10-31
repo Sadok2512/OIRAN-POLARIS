@@ -57,6 +57,7 @@ export interface Capabilities {
    * `STEP_METADATA` becomes clickable only when it appears in this list.
    */
   scenario_step_kinds?: string[];
+  executable_scenario_step_types?: string[];
 }
 
 /**
@@ -143,6 +144,12 @@ export interface UeState {
   uptime_seconds?: number | null;
   last_event: string | null;
   controller_owned: boolean;
+  technology?: '5G SA' | 'LTE 4G' | string;
+  simulator?: 'UERANSIM' | 'srsRAN' | string;
+  attach_state?: string;
+  access_point_name?: string | null;
+  dnn?: string | null;
+  active_sessions?: number;
   traffic_target_verified?: boolean;
   actions?: {
     start: boolean;
@@ -153,6 +160,22 @@ export interface UeState {
     provisioning_review?: boolean;
     reason: string;
   };
+}
+
+export interface LteStatus {
+  technology: 'LTE 4G';
+  simulator: 'srsRAN';
+  certified: boolean;
+  live_enabled: boolean;
+  epc: { process_state: string; health: string; observed: boolean; last_error: string | null };
+  s1_state: string;
+  enb: { process_state: string; health: string; observed: boolean; last_error: string | null };
+  ue: { process_state: string; health: string; observed: boolean; last_error: string | null };
+  ue_id: string;
+  attach_state: string;
+  apn: string;
+  ue_ip: string | null;
+  active_sessions: number;
 }
 
 export interface UeProfile {

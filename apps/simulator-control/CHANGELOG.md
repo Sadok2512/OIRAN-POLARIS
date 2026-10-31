@@ -1,5 +1,21 @@
 # @telecom/simulator-control — Changelog
 
+## 0.14.0 — 2026-10-31 — unified LTE 4G / 5G SA control surface
+
+- Adds one reusable technology selector (`5G SA — UERANSIM` / `LTE 4G —
+  srsRAN`) to the existing UE Manager, Scenario Builder and Traffic Generator.
+- Adds the LTE UE runtime card inside UE Manager with technology, simulator,
+  srsUE/srsENB, EPC/S1, Attach, APN, UE IP, active-session and sanitized-log
+  fields. Start/Stop call only the bounded POLARIS LTE endpoints.
+- Adds LTE Attach, LTE Detach, LTE Data UL/DL and LTE Attach + Data to the
+  existing Scenario Builder palette. Existing 5G scenarios are unchanged.
+- Extends the existing gNodeBs page with the shared srsRAN controller card;
+  this is not a new application or duplicated manager.
+- Adds LTE UE selection to Traffic Generator while keeping Start visibly
+  locked until the backend reports E2E certification. Existing 0.13.1
+  UDP/TCP UL/DL sessions and live sparklines remain unchanged for 5G.
+
+
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 ## 0.13.1 — 2026-10-30 (patch)
