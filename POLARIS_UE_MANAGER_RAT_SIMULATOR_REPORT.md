@@ -6,6 +6,8 @@ Branche : `feat/polaris-ue-manager-rat-simulator-v1`
 
 Base : `9fc72cd05ec8b75aaf5d9f3cc1aa2504c28edd55`
 
+SHA implémentation testée : `16e14f84ef2299bda648cc10180661a3e8baa968`
+
 Version frontend : `0.17.0`
 
 Portée : code et preview DEMO uniquement ; aucune modification ou relance de production.
