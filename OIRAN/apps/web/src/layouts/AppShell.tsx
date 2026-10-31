@@ -24,12 +24,16 @@ const icons: Record<string, typeof Activity> = {
   'module-versions': Braces,
 };
 
+// LOT 3 — docs/ui-mockups/oiran-analyzer.html: the Analyzer sidebar now
+// splits into two groups ("Investigate" and "Evidence"). Probe Manager
+// has its own app (apps/probe-manager) and no longer appears here; the
+// `operations` section is intentionally omitted from `ordered` below so
+// any module the backend still tags that way is filtered out of the nav.
 const sections: Record<string, string> = {
-  overview: 'OVERVIEW',
-  operations: 'CAPTURE & ANALYSIS',
-  investigation: 'CAPTURE & ANALYSIS',
-  analysis: 'CAPTURE & ANALYSIS',
-  reports: 'REPORTS',
+  overview: 'INVESTIGATE',
+  investigation: 'INVESTIGATE',
+  analysis: 'INVESTIGATE',
+  reports: 'EVIDENCE',
   platform: 'SYSTEM',
 };
 
@@ -77,7 +81,8 @@ export function AppShell() {
     .split('/')
     .filter(Boolean)
     .map((part) => part.replaceAll('-', ' '));
-  const ordered = ['overview', 'operations', 'investigation', 'analysis', 'reports', 'platform'];
+  // "operations" (Probe Manager) is excluded on purpose — see sections map.
+  const ordered = ['overview', 'investigation', 'analysis', 'reports', 'platform'];
 
   function submit(event: React.FormEvent) {
     event.preventDefault();
