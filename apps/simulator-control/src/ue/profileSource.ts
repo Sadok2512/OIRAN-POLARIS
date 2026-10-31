@@ -33,6 +33,16 @@ const GNBS_KEY = ['polaris', 'gnbs'] as const;
 
 export function recordFromWire(wire: WireUeProfile): UeProfileRecord {
   const updated = wire.updated_at_epoch_s * 1000;
+  // 0.12.2 (#48 front wiring) — polaris-api 0.19.7 returns the raw IMSI
+  // in `subscriber_identity` when the caller is an operator /
+  // administrator; viewer stays on the literal `"PROTECTED"`. Carry the
+  // digits through so the UE Manager table can render them without a
+  // second per-row fetch. We never persist this to localStorage — it is
+  // read-only per session, driven by the authenticated API response.
+  const imsiFromBackend =
+    wire.subscriber_identity && wire.subscriber_identity !== 'PROTECTED'
+      ? wire.subscriber_identity
+      : undefined;
   return {
     id: wire.ue_id,
     owner: wire.name,
@@ -43,6 +53,7 @@ export function recordFromWire(wire: WireUeProfile): UeProfileRecord {
     updatedAt: updated,
     subscriptionStatus: wire.subscription_status,
     scenarioId: wire.scenario_id,
+    imsi: imsiFromBackend,
   };
 }
 

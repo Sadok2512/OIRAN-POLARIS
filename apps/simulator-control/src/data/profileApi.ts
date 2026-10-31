@@ -16,7 +16,14 @@ export interface WireUeProfile {
   scenario_id: string | null;
   auto_run_scenario: boolean;
   subscription_status: 'VERIFIED' | 'PROVISIONING_REQUIRED' | string;
-  subscriber_identity: 'PROTECTED';
+  /**
+   * 0.19.7 (#48) — role-aware. The backend returns the raw IMSI digits
+   * (15 chars, PLMN prefix + MSIN) when the caller is an operator /
+   * administrator; `"PROTECTED"` otherwise. The frontend passes the
+   * value through `formatImsiForRole()` which decides whether to show
+   * the digits or the solid mask based on the caller's role.
+   */
+  subscriber_identity: string;
   authentication_material: 'PROTECTED';
   profile: string;
   revision: number;
@@ -161,7 +168,8 @@ export interface WireSanitizedSubscriber {
   snssai: { sst: number; sd: string | null };
   dnns: string[];
   ambr: { uplink: number; downlink: number };
-  subscriber_identity: 'PROTECTED';
+  /** 0.19.7 (#48) — raw IMSI for operator / administrator, "PROTECTED" otherwise. */
+  subscriber_identity: string;
   authentication_material: 'PROTECTED';
 }
 

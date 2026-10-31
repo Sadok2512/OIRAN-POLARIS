@@ -3,6 +3,57 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.12.2 — 2026-10-31 (patch)
+
+#48 (front wiring) — operator IMSI reveal
+- `WireUeProfile.subscriber_identity` is now typed `string`, matching
+  the polaris-api 0.19.7 contract: the backend returns the raw IMSI
+  digits for `operator` / `administrator` roles and the literal
+  `"PROTECTED"` for everyone else. The payload is **never** persisted
+  to localStorage — it is read-only per session and travels through
+  the authenticated API response.
+- `recordFromWire(wire)` copies `subscriber_identity` into the
+  `UeProfileRecord.imsi` field when it is not `"PROTECTED"`. The UE
+  Manager row keeps the existing `formatImsiForRole(imsi, canOperate)`
+  pipeline — so an operator sees `imsi-001010000000042` and a viewer
+  sees the solid mask without any digit span in the DOM.
+
+#49 (verified) — grant countdown in the UE Manager header
+- `LiveGrantCountdown` + the `Autoriser le live` button are already
+  wired at the top of the UE Manager page (shipped in 0.11.1). This
+  release verifies the chip stays visible at 1280 / 1440 / 1920 in
+  both themes (anti-overlap spec).
+
+#50 (verified) — État + débits + protocole
+- `etatLabel()` already folds `Registered · RRC Connected · PDU active
+  · ↑ UL / ↓ DL / ↑↓ UL+DL` (shipped in 0.12.0). The per-step
+  protocol / destination / datagrams line lands in the per-UE
+  Activity page via `/activity.job_step.current_step` (polaris-api
+  0.19.7 #50). Compat verified in the anti-overlap suite.
+
+### Added tests
+- `src/pages/UeManager.imsi-operator.test.tsx` (5 cases):
+  - `recordFromWire` returns the raw IMSI when the backend ships it;
+  - `recordFromWire` returns `undefined` when the backend ships
+    `"PROTECTED"` or an empty string;
+  - UE Manager renders `imsi-<15 digits>` for a signed-in operator;
+  - UE Manager never surfaces a digit span for a viewer.
+- `e2e/no-overlap-0.12.2-imsi.spec.ts` — Playwright anti-overlap at
+  1280 / 1440 / 1920 × light / dark (6 cells). Asserts the operator
+  IMSI reveal, the grant button visibility, the row cell geometry
+  (no overlap between neighbours) and the État cell no-truncation
+  invariant (`scrollWidth ≤ clientWidth`).
+
+### Validation (manual, no CI)
+- `npm run typecheck` → clean
+- `npm run test` → `Test Files 32 passed · Tests 197 passed`
+- Playwright e2e: run manually with
+  `npm run dev` in one shell, then
+  `npx playwright test e2e/no-overlap-0.12.2-imsi.spec.ts`.
+
+Base: `cbb8e4a` (simulator-control 0.12.1). Hard dependency:
+polaris-api ≥ 0.19.7.
+
 ## 0.9.4 — 2026-10-29 (patch)
 
 - Defect #29 — Add UE dialog recomposed to the audited surface. Lab defaults
