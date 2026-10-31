@@ -1,7 +1,7 @@
 import { Play, Square } from 'lucide-react';
 import { Btn, Card, Pill, regTone } from '@/components/mockup';
 import { useAuth, useLteAction, useLteLogs, useLteProfile, useLteStatus } from '@/data/queries';
-import { useLteRun, useStartLteCertifiedRun } from '@/data/liveGrantApi';
+import { useEmergencyStopLteRun, useLteRun, useStartLteCertifiedRun } from '@/data/liveGrantApi';
 
 export function LteControlPanel({ compact = false }: { compact?: boolean }) {
   const auth = useAuth();
@@ -9,13 +9,15 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
   const stop = useLteAction('stop');
   const startRun = useStartLteCertifiedRun();
   const run = useLteRun(startRun.data?.run_id);
+  const emergencyStop = useEmergencyStopLteRun();
   const profile = useLteProfile();
   const enbLogs = useLteLogs('ENB-01');
   const ueLogs = useLteLogs('LTE-SRSUE-TEST-01');
   const data = status.data;
   const canOperate = auth.data?.can_start === true;
-  const liveReady = data?.certified === true && data.live_enabled === true && data.grant_active === true && data.safety_ready === true;
-  const startGateReady = data?.certified === true
+  const certificationMode = data?.operation_mode === 'CERTIFICATION_RUN';
+  const operationalMode = data?.operation_mode === 'LIVE_OPERATIONAL';
+  const startGateReady = (certificationMode || operationalMode)
     && data.live_enabled === true
     && data.safety_ready === true
     && profile.data?.enabled === true
@@ -24,7 +26,9 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
   const ownershipVerified = data?.ownership_verified === true;
   const ueRunning = data?.ue.process_state === 'running';
   const enbRunning = data?.enb.process_state === 'running';
-  const error = stop.error ?? startRun.error;
+  const certificationState = data?.certification_state ?? 'CERTIFICATION_PENDING';
+  const statusLabel = certificationState.replaceAll('_', ' ');
+  const error = stop.error ?? startRun.error ?? emergencyStop.error;
 
   return (
     <Card className="p-5 flex flex-col gap-4" data-testid="lte-control-panel">
@@ -32,12 +36,12 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
         <div>
           <h2 className="text-ep-xl font-semibold">LTE 4G — srsRAN</h2>
           <p className="text-ep-sm text-mute">
-            Existing POLARIS controller · live stays locked until ANR1 E2E certification.
+            Certification runs are bounded and never promote themselves to operational certification.
           </p>
         </div>
         <div className="flex gap-2">
-          <Pill tone={liveReady ? 'ok' : 'warn'}>
-            {liveReady ? 'LIVE CERTIFIED' : 'CERTIFICATION REQUIRED'}
+          <Pill tone={certificationState === 'CERTIFIED' ? 'ok' : certificationState === 'CERTIFICATION_FAILED' ? 'bad' : 'warn'}>
+            <span data-testid="lte-certification-state">{statusLabel}</span>
           </Pill>
           <Pill tone={regTone(data?.attach_state ?? 'UNKNOWN')}>{data?.attach_state ?? 'UNKNOWN'}</Pill>
         </div>
@@ -62,10 +66,11 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
           icon={Play}
           primary
           disabled={!canOperate || !startGateReady || startRun.isPending}
-          title={startGateReady ? 'Issues and consumes a one-time, five-minute LTE Grant V2.' : 'Requires ANR1 certification, enabled LTE profile, safety gates and no active LTE run.'}
+          title={startGateReady ? 'Issues and consumes a dedicated one-time, five-minute LTE Grant V2.' : 'Requires the exact certification or operational mode, enabled controller-owned profile, certified digests and safety gates.'}
           onClick={() => {
             if (profile.data?.compose_model_sha256) {
               startRun.mutate({
+                purpose: certificationMode ? 'CERTIFICATION_RUN' : 'LIVE_OPERATIONAL',
                 revision: profile.data.revision,
                 configuration_sha256: profile.data.configuration_sha256,
                 compose_model_sha256: profile.data.compose_model_sha256,
@@ -76,7 +81,15 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
             }
           }}
           data-testid="lte-enb-start"
-        >{startRun.isPending ? 'Starting certified run…' : 'Start LTE certified run'}</Btn>
+        >{startRun.isPending ? 'Starting bounded run…' : certificationMode ? 'Start LTE certification run' : 'Start LTE operational run'}</Btn>
+        {run.data && run.data.state !== 'CLEAN' ? (
+          <Btn
+            icon={Square}
+            onClick={() => emergencyStop.mutate(run.data!.run_id)}
+            disabled={!canOperate || emergencyStop.isPending}
+            data-testid="lte-emergency-stop"
+          >Emergency stop / cleanup</Btn>
+        ) : null}
         <Btn
           icon={Square}
           onClick={() => stop.mutate('LTE-SRSUE-TEST-01')}

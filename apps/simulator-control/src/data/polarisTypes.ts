@@ -172,6 +172,10 @@ export interface LteStatus {
   simulator: 'srsRAN';
   certified: boolean;
   live_enabled: boolean;
+  operation_mode: 'DISABLED' | 'CERTIFICATION_RUN' | 'LIVE_OPERATIONAL';
+  certification_state: 'CERTIFICATION_PENDING' | 'CERTIFICATION_RUNNING' | 'CERTIFICATION_FAILED' | 'CERTIFIED';
+  certification_run_enabled: boolean;
+  manual_certification_required: boolean;
   epc: { process_state: string; health: string; observed: boolean; controller_owned: boolean; last_error: string | null };
   s1_state: string;
   enb: { process_state: string; health: string; observed: boolean; controller_owned: boolean; last_error: string | null };

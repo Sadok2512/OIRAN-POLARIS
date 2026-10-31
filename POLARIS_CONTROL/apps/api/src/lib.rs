@@ -148,7 +148,28 @@ pub struct AppState {
     // deployment gate and the external LTE E2E certification gate.
     srsran_runtime: Arc<dyn srsran_controller::SrsranRuntime>,
     srsran_live_enabled: bool,
+    lte_certification_run_enabled: bool,
     lte_e2e_certified: bool,
+    certified_subject_override: Option<Result<(), String>>,
+    profile_configuration_override: Option<Result<String, String>>,
+    compose_model_override: Option<Result<String, String>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum LteOperationMode {
+    Disabled,
+    CertificationRun,
+    LiveOperational,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum LteCertificationState {
+    CertificationPending,
+    CertificationRunning,
+    CertificationFailed,
+    Certified,
 }
 
 #[derive(Clone, Serialize)]
@@ -3265,8 +3286,15 @@ impl AppState {
             srsran_runtime: Arc::new(srsran_controller::DockerSrsranRuntime::default()),
             srsran_live_enabled: std::env::var("POLARIS_SRSRAN_LIVE_ENABLED")
                 .is_ok_and(|value| value == "true"),
+            lte_certification_run_enabled: std::env::var(
+                "POLARIS_LTE_CERTIFICATION_RUN_ENABLED",
+            )
+            .is_ok_and(|value| value == "true"),
             lte_e2e_certified: std::env::var("POLARIS_LTE_E2E_CERTIFIED")
                 .is_ok_and(|value| value == "true"),
+            certified_subject_override: None,
+            profile_configuration_override: None,
+            compose_model_override: None,
         })
     }
 }
@@ -4296,6 +4324,82 @@ struct LteLogsQuery {
     component: String,
 }
 
+fn lte_operation_mode(state: &AppState) -> LteOperationMode {
+    if state.execution_mode != "live" || !state.srsran_live_enabled {
+        LteOperationMode::Disabled
+    } else if state.lte_e2e_certified {
+        LteOperationMode::LiveOperational
+    } else if state.lte_certification_run_enabled {
+        LteOperationMode::CertificationRun
+    } else {
+        LteOperationMode::Disabled
+    }
+}
+
+fn lte_certification_state(state: &AppState) -> LteCertificationState {
+    if state.lte_e2e_certified {
+        return LteCertificationState::Certified;
+    }
+    let latest = state
+        .lte_runs_v2
+        .lock()
+        .ok()
+        .and_then(|store| store.records().iter().max_by_key(|run| run.created_at_epoch_ms).cloned());
+    match latest {
+        Some(run)
+            if matches!(
+                run.outcome,
+                Some(
+                    lte_orchestrator::RunOutcome::Failed
+                        | lte_orchestrator::RunOutcome::Cancelled
+                        | lte_orchestrator::RunOutcome::RecoveryBlocked
+                )
+            ) =>
+        {
+            LteCertificationState::CertificationFailed
+        }
+        Some(run) if !run.state.terminal() => LteCertificationState::CertificationRunning,
+        _ => LteCertificationState::CertificationPending,
+    }
+}
+
+fn certified_release_subject_gate(state: &AppState) -> Result<(), String> {
+    if let Some(result) = state.certified_subject_override.clone() {
+        return result;
+    }
+    srsran_controller::verify_certified_release_subject()
+}
+
+fn current_lte_profile_configuration_sha256(state: &AppState) -> Result<String, String> {
+    state
+        .profile_configuration_override
+        .clone()
+        .unwrap_or_else(srsran_controller::profile_configuration_sha256)
+}
+
+fn current_lte_compose_model_sha256(state: &AppState) -> Result<String, String> {
+    state
+        .compose_model_override
+        .clone()
+        .unwrap_or_else(srsran_controller::compose_model_sha256)
+}
+
+fn purpose_matches_mode(
+    purpose: lte_grant::GrantPurpose,
+    mode: LteOperationMode,
+) -> bool {
+    matches!(
+        (purpose, mode),
+        (
+            lte_grant::GrantPurpose::CertificationRun,
+            LteOperationMode::CertificationRun
+        ) | (
+            lte_grant::GrantPurpose::LiveOperational,
+            LteOperationMode::LiveOperational
+        )
+    )
+}
+
 fn lte_status_value(state: &AppState) -> Result<Value, String> {
     let mut value = state
         .srsran_runtime
@@ -4306,6 +4410,22 @@ fn lte_status_value(state: &AppState) -> Result<Value, String> {
     let grant_active = active_lte_run_grant(state).is_some();
     let safety_ready = lte_start_resource_gate(state).is_ok();
     if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "operation_mode".into(),
+            serde_json::to_value(lte_operation_mode(state)).unwrap_or(Value::Null),
+        );
+        object.insert(
+            "certification_state".into(),
+            serde_json::to_value(lte_certification_state(state)).unwrap_or(Value::Null),
+        );
+        object.insert(
+            "certification_run_enabled".into(),
+            Value::Bool(state.lte_certification_run_enabled),
+        );
+        object.insert(
+            "manual_certification_required".into(),
+            Value::Bool(!state.lte_e2e_certified),
+        );
         object.insert("grant_active".into(), Value::Bool(grant_active));
         object.insert("safety_ready".into(), Value::Bool(safety_ready));
         let runtime_ready = object
@@ -4390,7 +4510,7 @@ async fn lte_profile(
         }
     };
     let profile = registry.profile();
-    let compose_model_sha256 = srsran_controller::compose_model_sha256().ok();
+    let compose_model_sha256 = current_lte_compose_model_sha256(&state).ok();
     let observed = state
         .srsran_runtime
         .status(state.lte_e2e_certified, state.srsran_live_enabled)
@@ -4488,11 +4608,39 @@ async fn create_lte_run(
             Json(json!({"error":"AUTHENTICATED_SESSION_REQUIRED"})),
         );
     };
-    if state.execution_mode != "live" || !state.srsran_live_enabled || !state.lte_e2e_certified {
+    let mode = lte_operation_mode(&state);
+    if mode == LteOperationMode::Disabled {
         return (
             StatusCode::LOCKED,
-            Json(json!({"error":"LTE_E2E_CERTIFICATION_REQUIRED"})),
+            Json(json!({
+                "error":if state.lte_e2e_certified {
+                    "SRSRAN_LIVE_DISABLED"
+                } else {
+                    "LTE_CERTIFICATION_RUN_REQUIRED"
+                },
+                "operation_mode":mode
+            })),
         );
+    }
+    let grant_purpose = state
+        .lte_grants_v2
+        .lock()
+        .ok()
+        .and_then(|store| {
+            store
+                .get(&request.grant_id)
+                .map(|grant| grant.purpose.unwrap_or_default())
+        });
+    if grant_purpose.is_some_and(|purpose| !purpose_matches_mode(purpose, mode)) {
+        return (
+            StatusCode::LOCKED,
+            Json(json!({"error":"LTE_GRANT_PURPOSE_MISMATCH","operation_mode":mode})),
+        );
+    }
+    if mode == LteOperationMode::CertificationRun {
+        if let Err(error) = certified_release_subject_gate(&state) {
+            return (StatusCode::PRECONDITION_FAILED, Json(json!({"error":error})));
+        }
     }
     let profile_ready = state.lte_profile_registry.lock().is_ok_and(|registry| {
         let profile = registry.profile();
@@ -4528,7 +4676,7 @@ async fn create_lte_run(
             Json(json!({"error":"IDEMPOTENCY_KEY_REQUIRED"})),
         );
     };
-    let current_hash = match srsran_controller::profile_configuration_sha256() {
+    let current_hash = match current_lte_profile_configuration_sha256(&state) {
         Ok(hash) => hash,
         Err(error) => return (StatusCode::LOCKED, Json(json!({"error":error}))),
     };
@@ -4538,8 +4686,7 @@ async fn create_lte_run(
             Json(json!({"error":"GRANT_SUBJECT_CHANGED"})),
         );
     }
-    if request.compose_model_sha256 != srsran_controller::compose_model_sha256().unwrap_or_default()
-    {
+    if request.compose_model_sha256 != current_lte_compose_model_sha256(&state).unwrap_or_default() {
         return (
             StatusCode::PRECONDITION_FAILED,
             Json(json!({"error":"GRANT_SUBJECT_CHANGED"})),
@@ -4677,7 +4824,7 @@ async fn create_lte_run(
         "ENB_STARTING",
         Some(&run.run_id),
     );
-    tokio::spawn(orchestrate_lte_run(
+    tokio::spawn(orchestrate_lte_run_with_timeout(
         state.clone(),
         run.run_id.clone(),
         run.deadline_at_epoch_ms,
@@ -4693,6 +4840,31 @@ async fn create_lte_run(
         })
         .unwrap_or_else(|| serde_json::to_value(run).unwrap_or(Value::Null));
     (StatusCode::ACCEPTED, Json(body))
+}
+
+async fn orchestrate_lte_run_with_timeout(
+    state: Arc<AppState>,
+    run_id: String,
+    deadline_at_epoch_ms: u64,
+) {
+    let remaining_ms = deadline_at_epoch_ms
+        .saturating_sub(epoch_millis())
+        .min(lte_orchestrator::MAX_RUN_MS);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(remaining_ms),
+        orchestrate_lte_run(state.clone(), run_id.clone(), deadline_at_epoch_ms),
+    )
+    .await;
+    if result.is_err() {
+        let _ = state.lte_runs_v2.lock().map(|mut store| {
+            store.fail_active_step(&run_id, "LTE_GLOBAL_TIMEOUT", epoch_millis())
+        });
+        let _ = state
+            .lte_grants_v2
+            .lock()
+            .map(|mut store| store.set_run_state(&run_id, "FAILED"));
+        let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
+    }
 }
 
 async fn cleanup_lte_run(
@@ -12345,6 +12517,25 @@ async fn create_live_grant(
                 )
             }
         };
+        let mode = lte_operation_mode(&state);
+        if !purpose_matches_mode(request.purpose, mode) {
+            return (
+                StatusCode::LOCKED,
+                Json(json!({
+                    "error": if request.purpose == lte_grant::GrantPurpose::CertificationRun {
+                        "LTE_CERTIFICATION_RUN_REQUIRED"
+                    } else {
+                        "LTE_E2E_CERTIFICATION_REQUIRED"
+                    },
+                    "operation_mode": mode
+                })),
+            );
+        }
+        if request.purpose == lte_grant::GrantPurpose::CertificationRun {
+            if let Err(error) = certified_release_subject_gate(&state) {
+                return (StatusCode::PRECONDITION_FAILED, Json(json!({"error":error})));
+            }
+        }
         let Some(idempotency_key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok())
         else {
             return (
@@ -12362,7 +12553,7 @@ async fn create_live_grant(
                 Json(json!({"error":"LTE_PROFILE_DISABLED"})),
             );
         }
-        let current_hash = match srsran_controller::profile_configuration_sha256() {
+        let current_hash = match current_lte_profile_configuration_sha256(&state) {
             Ok(hash) => hash,
             Err(error) => return (StatusCode::LOCKED, Json(json!({"error":error}))),
         };
@@ -12373,7 +12564,7 @@ async fn create_live_grant(
             );
         }
         if request.target.compose_model_sha256
-            != srsran_controller::compose_model_sha256().unwrap_or_default()
+            != current_lte_compose_model_sha256(&state).unwrap_or_default()
         {
             return (
                 StatusCode::PRECONDITION_FAILED,
@@ -12809,6 +13000,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/lte/runs", post(create_lte_run))
         .route("/lte/runs/:run_id", get(get_lte_run))
         .route("/lte/runs/:run_id/stop", post(stop_lte_run))
+        .route("/lte/runs/:run_id/emergency-stop", post(stop_lte_run))
         .route("/lte/logs", get(lte_logs))
         .route("/lte/components/start", post(start_lte_component))
         .route("/lte/components/stop", post(stop_lte_component))
@@ -12935,6 +13127,21 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+fn pending_lte_cleanup_ids(state: &AppState) -> Vec<String> {
+    state
+        .lte_runs_v2
+        .lock()
+        .map(|store| {
+            store
+                .records()
+                .iter()
+                .filter(|run| run.cleanup_required && !run.state.terminal())
+                .map(|run| run.run_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn app(state: AppState) -> Router {
     let shared = Arc::new(state);
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -12951,6 +13158,31 @@ pub fn app(state: AppState) -> Router {
                 tokio::time::sleep(interval).await;
             }
         });
+    }
+    if shared.startup_reconcile {
+        let recovery_ids = pending_lte_cleanup_ids(&shared);
+        if !recovery_ids.is_empty() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let recovery_state = shared.clone();
+                handle.spawn(async move {
+                    for run_id in recovery_ids {
+                        let clean = cleanup_lte_run(
+                            &recovery_state,
+                            &run_id,
+                            lte_orchestrator::RunOutcome::Cancelled,
+                        )
+                        .await;
+                        audit(
+                            &recovery_state,
+                            "startup",
+                            "LTE_RESTART_RECOVERY_CLEANUP",
+                            if clean { "CLEAN" } else { "RECOVERY_BLOCKED" },
+                            Some(&run_id),
+                        );
+                    }
+                });
+            }
+        }
     }
     if shared.startup_reconcile
         && shared.execution_mode == "live"
@@ -13552,7 +13784,11 @@ mod p0_tests {
             traffic_manager: Arc::new(traffic_sessions::TrafficSessionManager::new()),
             srsran_runtime: Arc::new(srsran_controller::MockSrsranRuntime::default()),
             srsran_live_enabled: false,
+            lte_certification_run_enabled: false,
             lte_e2e_certified: false,
+            certified_subject_override: Some(Ok(())),
+            profile_configuration_override: Some(Ok("a".repeat(64))),
+            compose_model_override: Some(Ok("c".repeat(64))),
         }
     }
 
@@ -13821,6 +14057,302 @@ mod p0_tests {
         )
         .unwrap();
         assert_eq!(response["error"], "CSRF_TOKEN_REQUIRED");
+    }
+
+    fn certification_grant_body(purpose: &str) -> Value {
+        json!({
+            "schema_version":"polaris.live-grant.v2",
+            "purpose":purpose,
+            "target":{
+                "kind":"srsran_lte_profile",
+                "profile_id":lte_grant::PROFILE_ID,
+                "profile_revision":1,
+                "configuration_sha256":"a".repeat(64),
+                "compose_model_sha256":"c".repeat(64)
+            },
+            "scenario":{
+                "scenario_id":lte_grant::SCENARIO_ID,
+                "scenario_revision":1,
+                "scenario_sha256":lte_grant::SCENARIO_SHA256
+            },
+            "duration_seconds":300,
+            "constraints":{
+                "max_ues":1,
+                "allowed_actions":["s1_setup","lte_attach","ping_ul","ping_dl","udp_ul","udp_dl","cleanup"],
+                "ping":{"max_packets_per_direction":5},
+                "udp":{
+                    "max_rate_bps_per_direction":1_000_000,
+                    "max_duration_seconds_per_direction":10,
+                    "max_payload_bytes":1_200,
+                    "max_parallel_streams":1
+                },
+                "hard_deadline_behavior":"STOP_TRAFFIC_AND_CLEANUP"
+            },
+            "execution_nonce":"n".repeat(43)
+        })
+    }
+
+    #[test]
+    fn lte_operation_modes_are_mutually_exclusive() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        test_state.srsran_live_enabled = true;
+        assert_eq!(lte_operation_mode(&test_state), LteOperationMode::Disabled);
+        test_state.lte_certification_run_enabled = true;
+        assert_eq!(lte_operation_mode(&test_state), LteOperationMode::CertificationRun);
+        test_state.lte_e2e_certified = true;
+        assert_eq!(lte_operation_mode(&test_state), LteOperationMode::LiveOperational);
+    }
+
+    #[test]
+    fn restart_recovery_selects_only_runs_that_still_require_cleanup() {
+        let test_state = state();
+        {
+            let mut runs = test_state.lte_runs_v2.lock().unwrap();
+            runs.create(
+                "lte-run-recovery-test".into(),
+                "grant-recovery-test".into(),
+                1,
+                300_001,
+                "recovery-key-1",
+            )
+            .unwrap();
+            runs.request_cancel("lte-run-recovery-test").unwrap();
+        }
+        assert_eq!(
+            pending_lte_cleanup_ids(&test_state),
+            vec!["lte-run-recovery-test".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_stop_cleanup_does_not_require_a_live_grant() {
+        let mut test_state = state();
+        let runtime = srsran_controller::MockSrsranRuntime::default();
+        *runtime.status_override.lock().unwrap() = Some(srsran_controller::LteStatus {
+            technology: "LTE 4G",
+            simulator: "srsRAN",
+            certified: false,
+            live_enabled: false,
+            epc: srsran_controller::ProcessObservation {
+                process_state: "running".into(),
+                health: "healthy".into(),
+                observed: true,
+                controller_owned: false,
+                last_error: None,
+            },
+            s1_state: "UNKNOWN".into(),
+            enb: srsran_controller::ProcessObservation {
+                process_state: "stopped".into(),
+                health: "unknown".into(),
+                observed: true,
+                controller_owned: false,
+                last_error: None,
+            },
+            ue: srsran_controller::ProcessObservation {
+                process_state: "stopped".into(),
+                health: "unknown".into(),
+                observed: true,
+                controller_owned: false,
+                last_error: None,
+            },
+            ue_id: srsran_controller::LTE_UE_ID,
+            attach_state: "UNKNOWN".into(),
+            attach_success_observed: false,
+            epc_context_observed: false,
+            apn: "UNKNOWN".into(),
+            ue_ip: None,
+            session_state: "UNKNOWN".into(),
+            active_sessions: 0,
+            ownership_verified: true,
+            traffic_ready: false,
+        });
+        test_state.srsran_runtime = Arc::new(runtime);
+        test_state
+            .lte_runs_v2
+            .lock()
+            .unwrap()
+            .create(
+                "lte-run-expired-grant".into(),
+                "grant-expired".into(),
+                1,
+                2,
+                "expired-run-key",
+            )
+            .unwrap();
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let stopped = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/lte/runs/lte-run-expired-grant/emergency-stop")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .header("x-csrf-token", csrf)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.status(), StatusCode::OK);
+        let stopped: Value = serde_json::from_slice(
+            &to_bytes(stopped.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stopped["state"], "CLEAN");
+    }
+
+    #[tokio::test]
+    async fn certification_mode_breaks_the_bootstrap_cycle_without_marking_certified() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        test_state.srsran_live_enabled = true;
+        test_state.lte_certification_run_enabled = true;
+        test_state.lte_e2e_certified = false;
+        test_state
+            .lte_profile_registry
+            .lock()
+            .unwrap()
+            .set_enabled(true)
+            .unwrap();
+        assert_eq!(lte_operation_mode(&test_state), LteOperationMode::CertificationRun);
+        let application = app(test_state.clone());
+        let pending = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/lte/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pending: Value = serde_json::from_slice(
+            &to_bytes(pending.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pending["certified"], false);
+        assert_eq!(pending["operation_mode"], "CERTIFICATION_RUN");
+        assert_eq!(pending["certification_state"], "CERTIFICATION_PENDING");
+
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let grant = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/live/grant")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .header("idempotency-key", "certification-grant-1")
+                    .body(Body::from(certification_grant_body("CERTIFICATION_RUN").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant.status(), StatusCode::CREATED);
+        let grant: Value =
+            serde_json::from_slice(&to_bytes(grant.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(grant["purpose"], "CERTIFICATION_RUN");
+
+        let run = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/lte/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .header("idempotency-key", "certification-run-1")
+                    .header("x-polaris-grant-nonce", "n".repeat(43))
+                    .body(Body::from(
+                        json!({
+                            "grant_id":grant["grant_id"],
+                            "profile_id":lte_grant::PROFILE_ID,
+                            "profile_revision":1,
+                            "configuration_sha256":"a".repeat(64),
+                            "compose_model_sha256":"c".repeat(64),
+                            "scenario_id":lte_grant::SCENARIO_ID,
+                            "scenario_revision":1,
+                            "scenario_sha256":lte_grant::SCENARIO_SHA256
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.status(), StatusCode::ACCEPTED);
+        let status = application
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/lte/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status: Value = serde_json::from_slice(
+            &to_bytes(status.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["certified"], false);
+        assert_eq!(status["certification_state"], "CERTIFICATION_RUNNING");
+    }
+
+    #[tokio::test]
+    async fn certification_mode_rejects_operational_purpose_and_bad_release_subject() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        test_state.srsran_live_enabled = true;
+        test_state.lte_certification_run_enabled = true;
+        test_state
+            .lte_profile_registry
+            .lock()
+            .unwrap()
+            .set_enabled(true)
+            .unwrap();
+        let application = app(test_state.clone());
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let wrong_mode = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/live/grant")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .header("idempotency-key", "operational-grant-1")
+                    .body(Body::from(certification_grant_body("LIVE_OPERATIONAL").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_mode.status(), StatusCode::LOCKED);
+
+        test_state.certified_subject_override = Some(Err("LTE_CERTIFIED_IMAGE_MISMATCH".into()));
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let wrong_digest = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/live/grant")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .header("x-csrf-token", csrf)
+                    .header("idempotency-key", "certification-grant-bad-subject")
+                    .body(Body::from(certification_grant_body("CERTIFICATION_RUN").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_digest.status(), StatusCode::PRECONDITION_FAILED);
     }
 
     #[tokio::test]
@@ -15529,7 +16061,6 @@ mod p0_tests {
     /// flipped `execution_mode` away from "live" — otherwise the running
     /// container would leak. The predicate below is the one `stop_ue` and
     /// `stop_ue_group` consult.
-    #[test]
     /// 0.19.4 — `ue_policy_rule_present` detects the entry regardless
     /// of the `from` field CIDR notation and the lookup column order
     /// (iproute2 reshuffles output between versions). The parser is

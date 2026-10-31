@@ -13,6 +13,14 @@ pub const SCENARIO_SHA256: &str =
     "13a8e488839b7542e3ae967b681b139870ad070b5438bb314ca28707134be67d";
 pub const MAX_DURATION_SECONDS: u32 = 300;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum GrantPurpose {
+    #[default]
+    CertificationRun,
+    LiveOperational,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LteProfileRecord {
     pub schema_version: String,
@@ -136,6 +144,7 @@ pub struct GrantConstraints {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GrantRequestV2 {
     pub schema_version: String,
+    pub purpose: GrantPurpose,
     pub target: GrantTarget,
     pub scenario: GrantScenario,
     pub duration_seconds: u32,
@@ -157,6 +166,10 @@ pub enum GrantState {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GrantRecord {
     pub schema_version: String,
+    // `None` is reserved for records written before purpose separation. Keeping
+    // the field absent preserves their checksum during an in-place upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<GrantPurpose>,
     pub grant_id: String,
     pub state: GrantState,
     pub target: GrantTarget,
@@ -259,21 +272,31 @@ impl GrantRequestV2 {
             "udp_dl",
             "cleanup",
         ];
+        let actions = self
+            .constraints
+            .allowed_actions
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let exact_actions = allowed
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         if self.constraints.max_ues != 1
-            || self.constraints.allowed_actions.is_empty()
+            || actions != exact_actions
+            || self.constraints.allowed_actions.len() != exact_actions.len()
             || self
                 .constraints
                 .allowed_actions
                 .iter()
                 .any(|action| !allowed.contains(&action.as_str()))
-            || !self
-                .constraints
-                .allowed_actions
-                .iter()
-                .any(|action| action == "cleanup")
+            || self.constraints.ping.max_packets_per_direction == 0
             || self.constraints.ping.max_packets_per_direction > 5
+            || self.constraints.udp.max_rate_bps_per_direction == 0
             || self.constraints.udp.max_rate_bps_per_direction > 1_000_000
+            || self.constraints.udp.max_duration_seconds_per_direction == 0
             || self.constraints.udp.max_duration_seconds_per_direction > 30
+            || self.constraints.udp.max_payload_bytes == 0
             || self.constraints.udp.max_payload_bytes > 1_200
             || self.constraints.udp.max_parallel_streams != 1
             || self.constraints.hard_deadline_behavior != "STOP_TRAFFIC_AND_CLEANUP"
@@ -288,6 +311,7 @@ impl GrantRecord {
     pub fn public_json(&self) -> serde_json::Value {
         serde_json::json!({
             "schema_version": self.schema_version,
+            "purpose": self.purpose.unwrap_or_default(),
             "grant_id": self.grant_id,
             "state": self.state,
             "target": self.target,
@@ -348,6 +372,10 @@ impl GrantStore {
         &self.grants
     }
 
+    pub fn get(&self, grant_id: &str) -> Option<&GrantRecord> {
+        self.grants.iter().find(|grant| grant.grant_id == grant_id)
+    }
+
     pub fn create(
         &mut self,
         request: GrantRequestV2,
@@ -374,6 +402,7 @@ impl GrantStore {
         }
         let record = GrantRecord {
             schema_version: request.schema_version,
+            purpose: Some(request.purpose),
             grant_id,
             state: GrantState::Issued,
             target: request.target,
@@ -582,6 +611,7 @@ mod tests {
     fn request() -> GrantRequestV2 {
         GrantRequestV2 {
             schema_version: "polaris.live-grant.v2".into(),
+            purpose: GrantPurpose::CertificationRun,
             target: GrantTarget {
                 kind: "srsran_lte_profile".into(),
                 profile_id: PROFILE_ID.into(),
@@ -597,7 +627,15 @@ mod tests {
             duration_seconds: 300,
             constraints: GrantConstraints {
                 max_ues: 1,
-                allowed_actions: vec!["s1_setup".into(), "cleanup".into()],
+                allowed_actions: vec![
+                    "s1_setup".into(),
+                    "lte_attach".into(),
+                    "ping_ul".into(),
+                    "ping_dl".into(),
+                    "udp_ul".into(),
+                    "udp_dl".into(),
+                    "cleanup".into(),
+                ],
                 ping: PingBounds {
                     max_packets_per_direction: 5,
                 },
@@ -766,6 +804,31 @@ mod tests {
             Err("LTE_CONSTRAINT_OUT_OF_RANGE")
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn certification_envelope_requires_every_bounded_action() {
+        let mut missing_ping = request();
+        missing_ping
+            .constraints
+            .allowed_actions
+            .retain(|action| action != "ping_dl");
+        assert_eq!(
+            missing_ping.validate(),
+            Err("LTE_CONSTRAINT_OUT_OF_RANGE")
+        );
+        let mut duplicate = request();
+        duplicate.constraints.allowed_actions.push("cleanup".into());
+        assert_eq!(duplicate.validate(), Err("LTE_CONSTRAINT_OUT_OF_RANGE"));
+        let mut zero_rate = request();
+        zero_rate.constraints.udp.max_rate_bps_per_direction = 0;
+        assert_eq!(zero_rate.validate(), Err("LTE_CONSTRAINT_OUT_OF_RANGE"));
+        let mut excessive_rate = request();
+        excessive_rate.constraints.udp.max_rate_bps_per_direction = 1_000_001;
+        assert_eq!(
+            excessive_rate.validate(),
+            Err("LTE_CONSTRAINT_OUT_OF_RANGE")
+        );
     }
 
     #[test]

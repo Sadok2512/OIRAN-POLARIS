@@ -1,5 +1,17 @@
 # @telecom/simulator-control — Changelog
 
+## 0.19.0 — 2026-10-31 — LTE certification gate
+
+- Displays the distinct certification state and enables only a dedicated,
+  bounded `CERTIFICATION_RUN` when the backend publishes the exact mode and
+  all profile, digest and safety gates are ready.
+- Keeps operational LTE locked until backend certification is explicitly set;
+  a completed test never promotes itself to `CERTIFIED` in the browser.
+- Adds a grant-independent Operator emergency Stop/Cleanup control for an
+  active run while preserving the existing LTE/5G views and lifecycle locks.
+- Adds frontend coverage proving the UI submits the dedicated Grant V2 purpose
+  and continues to show certification as pending.
+
 ## 0.18.2 — 2026-10-31 — release artifact without mock UI
 
 - Excludes the historical standalone `polaris-mockup.html` design fixture from

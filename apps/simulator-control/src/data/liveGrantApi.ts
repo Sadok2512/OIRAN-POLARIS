@@ -31,6 +31,7 @@ export interface LiveGrantList {
 
 export interface LteGrantV2 {
   schema_version: 'polaris.live-grant.v2';
+  purpose: 'CERTIFICATION_RUN' | 'LIVE_OPERATIONAL';
   grant_id: string;
   state: 'ISSUED' | 'CONSUMED' | 'REVOKED' | 'EXPIRED' | 'REVOKED_RESTART' | 'RECOVERY_ONLY';
   expires_at_epoch_ms: number;
@@ -51,6 +52,7 @@ export interface LteRun {
 }
 
 export interface LteGrantProfileBinding {
+  purpose: 'CERTIFICATION_RUN' | 'LIVE_OPERATIONAL';
   revision: number;
   configuration_sha256: string;
   compose_model_sha256: string;
@@ -77,6 +79,7 @@ export function useStartLteCertifiedRun() {
         headers: { 'Idempotency-Key': crypto.randomUUID() },
         body: JSON.stringify({
           schema_version: 'polaris.live-grant.v2',
+          purpose: profile.purpose,
           target: {
             kind: 'srsran_lte_profile',
             profile_id: 'LTE-SRSUE-TEST-01',
@@ -137,6 +140,21 @@ export function useLteRun(runId: string | undefined) {
     enabled: Boolean(runId),
     refetchInterval: (query) => query.state.data?.state === 'CLEAN' ? false : 1_000,
     retry: false,
+  });
+}
+
+export function useEmergencyStopLteRun() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (runId: string) => polarisApi<LteRun>(
+      `/lte/runs/${encodeURIComponent(runId)}/emergency-stop`,
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
+    onSettled: async (_data, _error, runId) => {
+      await client.invalidateQueries({ queryKey: ['polaris', 'lte-run', runId] });
+      await client.invalidateQueries({ queryKey: ['polaris', 'lte-status'] });
+      await client.invalidateQueries({ queryKey: ['polaris', 'live-grants'] });
+    },
   });
 }
 

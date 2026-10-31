@@ -331,6 +331,26 @@ impl RunStore {
         self.persist()
     }
 
+    pub fn fail_active_step(
+        &mut self,
+        run_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let run = self.run_mut(run_id)?;
+        if let Some(item) = run.steps.iter_mut().find(|item| item.state == StepState::Running) {
+            item.state = StepState::Failed;
+            item.reason_code = Some(reason.into());
+            item.ended_at = Some(timestamp(now_ms));
+        }
+        run.state = RunState::Stopping;
+        run.outcome = Some(RunOutcome::Failed);
+        run.cleanup_required = true;
+        run.operation_id = None;
+        run.intended_state = None;
+        self.persist()
+    }
+
     pub fn finalize(
         &mut self,
         run_id: &str,
@@ -720,6 +740,39 @@ mod tests {
         let r = s.get("lte-run-12345678").unwrap();
         assert!(r.cancel_requested && r.cleanup_required);
         assert_eq!(r.state, RunState::Stopping);
+        let _ = fs::remove_file(p);
+    }
+    #[test]
+    fn global_timeout_marks_the_active_step_failed_and_requires_cleanup() {
+        let p = path("global-timeout");
+        let _ = fs::remove_file(&p);
+        let mut store = RunStore::load(p.clone()).unwrap();
+        store
+            .create(
+                "lte-run-timeout-test".into(),
+                "grant-timeout".into(),
+                1,
+                999_999,
+                "timeout-key-1",
+            )
+            .unwrap();
+        store
+            .intent(
+                "lte-run-timeout-test",
+                RunState::S1Ready,
+                "wait-s1".into(),
+                2,
+                2,
+            )
+            .unwrap();
+        store
+            .fail_active_step("lte-run-timeout-test", "LTE_GLOBAL_TIMEOUT", 3)
+            .unwrap();
+        let run = store.get("lte-run-timeout-test").unwrap();
+        assert_eq!(run.state, RunState::Stopping);
+        assert_eq!(run.outcome, Some(RunOutcome::Failed));
+        assert!(run.cleanup_required);
+        assert_eq!(run.steps[2].reason_code.as_deref(), Some("LTE_GLOBAL_TIMEOUT"));
         let _ = fs::remove_file(p);
     }
     #[test]

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.26.0 (polaris-control-api) — 2026-10-31 — bounded LTE certification run
+
+- Separates the one-time `CERTIFICATION_RUN` bootstrap path from
+  `LIVE_OPERATIONAL` without changing `POLARIS_LTE_E2E_CERTIFIED` from real
+  evidence or a run result.
+- Requires the exact controller-owned LTE test profile, certified image and
+  canonical Compose digests, Grant V2 purpose, subject/session ownership,
+  RBAC, CSRF, nonce, expiry, anti-replay and the one-UE/five-minute traffic
+  envelope before the certification orchestrator can start.
+- Adds a five-minute global timeout, grant-independent emergency cleanup and
+  automatic restart recovery while preserving observed-state transitions and
+  the existing UERANSIM 5G paths.
+- Publishes certification pending/running/failed/certified state separately
+  from operation mode and keeps certification promotion manual.
+
 ## 0.25.2 (polaris-control-api) — 2026-10-31 — canonical LTE Compose model
 
 - Includes the `lte` profile explicitly in the fixed-argv canonical Compose

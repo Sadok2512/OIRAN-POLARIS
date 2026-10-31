@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import type { MouseEventHandler, ReactNode } from 'react';
+import type { ButtonHTMLAttributes, ReactNode } from 'react';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type IconComponent = any;
@@ -14,23 +14,20 @@ export function Btn({
   type = 'button',
   title,
   className,
+  ...buttonProps
 }: {
   children: ReactNode;
   icon?: IconComponent;
   primary?: boolean;
   danger?: boolean;
-  onClick?: MouseEventHandler<HTMLButtonElement>;
-  disabled?: boolean;
-  type?: 'button' | 'submit' | 'reset';
-  title?: string;
-  className?: string;
-}) {
+} & ButtonHTMLAttributes<HTMLButtonElement>) {
   return (
     <button
       type={type}
       onClick={onClick}
       disabled={disabled}
       title={title}
+      {...buttonProps}
       className={clsx(
         'inline-flex items-center gap-1.5 h-9 px-4 rounded-md text-ep-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
         primary

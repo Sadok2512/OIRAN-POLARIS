@@ -17,8 +17,12 @@ const COMPOSE: &str = "/root/POLARIS/compose/docker-compose.oiran-lab.yml";
 const ENV_FILE: &str = "/root/POLARIS/compose/versions.env";
 const UE_CONFIG: &str = "/root/POLARIS/runtime/srsran/ue.conf";
 const LEDGER: &str = "/var/lib/polaris-control/srsran-ownership.json";
-const EXPECTED_IMAGE_REFERENCE: &str =
+pub const CERTIFIED_IMAGE_REFERENCE: &str =
     "oiran/srsran4g@sha256:69e094349657cc6a062ce3717661d6b8a553a23ce571f821e33256beec753d43";
+pub const CERTIFIED_IMAGE_ID: &str =
+    "sha256:69e094349657cc6a062ce3717661d6b8a553a23ce571f821e33256beec753d43";
+pub const CERTIFIED_COMPOSE_MODEL_SHA256: &str =
+    "308053a274844259c16da7751708b39e6559cfec2b8d958dc4fcafebecd0da19";
 const PROFILE_CONFIGS: [&str; 5] = [
     "/root/POLARIS/runtime/srsran/ue.conf",
     "/root/POLARIS/config/srsran/enb.conf",
@@ -244,7 +248,7 @@ impl DockerSrsranRuntime {
         let f = data.stdout.trim().splitn(8, '|').collect::<Vec<_>>();
         let digest_matches = !matches!(service, "srsenb" | "srsue")
             || f.get(7)
-                .is_some_and(|reference| *reference == EXPECTED_IMAGE_REFERENCE);
+                .is_some_and(|reference| *reference == CERTIFIED_IMAGE_REFERENCE);
         if f.len() != 8 || f[1] != PROJECT || f[2] != service || f[3] != COMPOSE || !digest_matches
         {
             return Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into());
@@ -593,6 +597,43 @@ pub fn compose_model_sha256() -> Result<String, String> {
     let bytes =
         serde_json::to_vec(&canonical_json(&parsed)).map_err(|_| "LTE_COMPOSE_MODEL_INVALID")?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn validate_certified_release_subject(image_reference: &str, compose_model: &str) -> Result<(), String> {
+    if image_reference != CERTIFIED_IMAGE_REFERENCE {
+        return Err("LTE_CERTIFIED_IMAGE_MISMATCH".into());
+    }
+    if compose_model != CERTIFIED_COMPOSE_MODEL_SHA256 {
+        return Err("LTE_CERTIFIED_COMPOSE_MODEL_MISMATCH".into());
+    }
+    Ok(())
+}
+
+pub fn verify_certified_release_subject() -> Result<(), String> {
+    let versions =
+        fs::read_to_string(ENV_FILE).map_err(|_| "LTE_CERTIFIED_IMAGE_UNAVAILABLE")?;
+    let image_reference = versions
+        .lines()
+        .find_map(|line| line.strip_prefix("SRSRAN4G_IMAGE="))
+        .ok_or("LTE_CERTIFIED_IMAGE_UNAVAILABLE")?;
+    let compose_model = compose_model_sha256()?;
+    validate_certified_release_subject(image_reference, &compose_model)?;
+    let output = Command::new("/usr/bin/timeout")
+        .args([
+            "10s",
+            "/usr/bin/docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            CERTIFIED_IMAGE_ID,
+        ])
+        .output()
+        .map_err(|_| "LTE_CERTIFIED_IMAGE_UNAVAILABLE")?;
+    if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != CERTIFIED_IMAGE_ID {
+        return Err("LTE_CERTIFIED_IMAGE_UNAVAILABLE".into());
+    }
+    Ok(())
 }
 
 fn compose_config_args() -> [&'static str; 14] {
@@ -1060,6 +1101,25 @@ mod tests {
         );
     }
     #[test]
+    fn certification_subject_requires_both_certified_digests() {
+        assert!(validate_certified_release_subject(
+            CERTIFIED_IMAGE_REFERENCE,
+            CERTIFIED_COMPOSE_MODEL_SHA256
+        )
+        .is_ok());
+        assert_eq!(
+            validate_certified_release_subject(
+                "oiran/srsran4g@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                CERTIFIED_COMPOSE_MODEL_SHA256
+            ),
+            Err("LTE_CERTIFIED_IMAGE_MISMATCH".into())
+        );
+        assert_eq!(
+            validate_certified_release_subject(CERTIFIED_IMAGE_REFERENCE, &"f".repeat(64)),
+            Err("LTE_CERTIFIED_COMPOSE_MODEL_MISMATCH".into())
+        );
+    }
+    #[test]
     fn failed_new_container_start_removes_exact_id_and_clears_ownership() {
         let executor = Arc::new(ScriptExecutor::default());
         let id = "0123456789abcdef";
@@ -1070,7 +1130,7 @@ mod tests {
             output(
                 0,
                 &format!(
-                    "{id}|{PROJECT}|srsenb|{COMPOSE}|created|not_available||{EXPECTED_IMAGE_REFERENCE}\n"
+                    "{id}|{PROJECT}|srsenb|{COMPOSE}|created|not_available||{CERTIFIED_IMAGE_REFERENCE}\n"
                 ),
             ),
             output(1, ""),
