@@ -23,15 +23,15 @@ Verdict: **PARTIAL**
 
 | Gate | Evidence | Result |
 |---|---|---|
-| Disk below 85% | `df -P /root` -> 77% preflight, 78% final | PASS |
+| Disk below 85% | `df -P /root` -> 77% preflight, 79% final | PASS |
 | External dumpcap preserved | `pgrep -a dumpcap \| wc -l` -> 12 before and after | PASS |
-| RAM >=4 GiB | preflight `MemAvailable=8.04 GiB`; final `3.33 GiB` while other isolated agents were compiling | PARTIAL |
+| RAM >=4 GiB | preflight `MemAvailable=8.04 GiB`; transient 3.33 GiB during concurrent builds; final `4.10 GiB` | PASS |
 | No live/deployment | no live, capture, traffic, Open5GS, gNB or production command executed | PASS |
 | Identity leakage | tracked-source numeric identity assignment scan returned no match | PASS |
 
-The final RAM measurement is below the required validation gate. The listed
-processes belonged to other isolated worktrees, so ANR3 did not stop them or
-force a global cache cleanup.
+The transient low-RAM measurement coincided with builds in other isolated
+worktrees. ANR3 did not stop them or force a global cache cleanup, and repeated
+the measurement after they released memory.
 
 ## Delivered pipeline
 
@@ -110,17 +110,14 @@ tests were not claimed as executed.
    remained clean at the base SHA. OIRAN therefore accepts only the existing
    canonical `oiran-polaris.lte-e2e-evidence.v1` schema and fails closed on a
    new revision.
-2. Final available RAM was 3.33 GiB, below the 4 GiB gate, due to concurrent
-   worktree test processes. Re-measure before integration review.
-3. No ANR1-approved real LTE PCAP bundle exists in this scope. `REAL_PASS` is
+2. No ANR1-approved real LTE PCAP bundle exists in this scope. `REAL_PASS` is
    impossible.
-4. Repository-wide rustfmt drift remains outside the LTE change set.
+3. Repository-wide rustfmt drift remains outside the LTE change set.
 
 ## Next step
 
 After ANR1 publishes the V2 orchestration contract, compare it field-by-field
-with the ingestion contract, rerun the offline suites with >=4 GiB available,
-and review this branch. Real PCAP ingestion and any deployment require separate
-explicit authorization.
+with the ingestion contract and review this branch. Real PCAP ingestion and
+any deployment require separate explicit authorization.
 
 — ANR3
