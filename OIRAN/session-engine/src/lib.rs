@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{self, BufRead};
 
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.4.0";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PacketRef {
@@ -219,6 +219,156 @@ pub struct DiscoveryResult {
     pub unmatched_event_ids: Vec<String>,
     pub duplicate_observations: Vec<String>,
     pub event_accounting: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LteTunnelCounters {
+    pub teid: String,
+    pub uplink_packets: usize,
+    pub downlink_packets: usize,
+    pub unknown_direction_packets: usize,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LteSession {
+    pub session_id: String,
+    pub technology: String,
+    pub ue_pseudonym: String,
+    pub enb_ue_s1ap_id: Option<String>,
+    pub mme_ue_s1ap_id: Option<String>,
+    pub eps_bearer_ids: Vec<String>,
+    pub s11_f_teids: Vec<String>,
+    pub tunnels: Vec<LteTunnelCounters>,
+    pub procedures: Vec<String>,
+    pub interfaces: Vec<String>,
+    pub state: String,
+    pub event_ids: Vec<String>,
+    pub limitations: Vec<String>,
+}
+
+/// Builds a deterministic LTE preparation view from normalized S1AP/EPS NAS,
+/// S11 and S1-U events. It deliberately does not infer UE identity from timing
+/// and does not claim an S1AP/S11 bridge until an explicit bearer identifier is
+/// emitted by both decoders.
+pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
+    let mut lte = events
+        .iter()
+        .filter(|event| {
+            matches!(event.interface.as_str(), "S1-MME" | "S11" | "S1-U")
+                && matches!(
+                    event.protocol.as_str(),
+                    "S1AP" | "NAS-EPS-MM" | "NAS-EPS-SM" | "GTPv2-C" | "GTP-U"
+                )
+        })
+        .collect::<Vec<_>>();
+    lte.sort_by_key(|event| (event.timestamp_ns, event.packet_number(), &event.event_id));
+    let Some(anchor) = lte.iter().copied().find(|event| event.protocol == "S1AP") else {
+        return Vec::new();
+    };
+    let enb = lte
+        .iter()
+        .find_map(|event| event.first_identifier("enb_ue_s1ap_id"))
+        .map(str::to_owned);
+    let mme = lte
+        .iter()
+        .find_map(|event| event.first_identifier("mme_ue_s1ap_id"))
+        .map(str::to_owned);
+    let ue_pseudonym = lte
+        .iter()
+        .find_map(|event| event.first_identifier("imsi_pseudonym"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            stable_id(
+                "LTE-UE",
+                &format!("{}|{:?}|{:?}", anchor.capture_id, enb, mme),
+            )
+        });
+    let collect_ids = |names: &[&str]| {
+        let mut values = BTreeSet::new();
+        for event in &lte {
+            for (name, value) in &event.identifiers {
+                if names.contains(&name.as_str()) {
+                    values.insert(value.clone());
+                }
+            }
+        }
+        values.into_iter().collect::<Vec<_>>()
+    };
+    let eps_bearer_ids = collect_ids(&["eps_bearer_identity", "ebi", "bearer_ebi"]);
+    let s11_f_teids = collect_ids(&["f_teid", "bearer_f_teid"]);
+    let mut tunnel_map: BTreeMap<String, LteTunnelCounters> = BTreeMap::new();
+    for event in lte
+        .iter()
+        .filter(|event| event.interface == "S1-U" && event.protocol == "GTP-U")
+    {
+        let Some(teid) = event.first_identifier("teid") else {
+            continue;
+        };
+        let counters = tunnel_map.entry(teid.to_owned()).or_insert(LteTunnelCounters {
+            teid: teid.to_owned(),
+            uplink_packets: 0,
+            downlink_packets: 0,
+            unknown_direction_packets: 0,
+            bytes: 0,
+        });
+        match event.direction.as_str() {
+            "UPLINK" | "RAN_TO_CORE" => counters.uplink_packets += 1,
+            "DOWNLINK" | "CORE_TO_RAN" => counters.downlink_packets += 1,
+            _ => counters.unknown_direction_packets += 1,
+        }
+        counters.bytes += event
+            .packet_references
+            .first()
+            .map(|packet| u64::from(packet.captured_length))
+            .unwrap_or(0);
+    }
+    let procedures = lte
+        .iter()
+        .map(|event| event.message_name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let interfaces = lte
+        .iter()
+        .map(|event| event.interface.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let released = procedures
+        .iter()
+        .any(|name| name.contains("Detach") || name == "UEContextReleaseComplete");
+    let bearer_ready = procedures
+        .iter()
+        .any(|name| name == "E-RABSetupResponse" || name == "InitialContextSetupResponse");
+    let state = if released {
+        "RELEASED"
+    } else if bearer_ready && !tunnel_map.is_empty() {
+        "ACTIVE_WITH_USER_PLANE"
+    } else {
+        "INCOMPLETE"
+    };
+    vec![LteSession {
+        session_id: stable_id(
+            "lte-session",
+            &format!("{}|{}|{:?}|{:?}", anchor.capture_id, ue_pseudonym, enb, mme),
+        ),
+        technology: "LTE".into(),
+        ue_pseudonym,
+        enb_ue_s1ap_id: enb,
+        mme_ue_s1ap_id: mme,
+        eps_bearer_ids,
+        s11_f_teids,
+        tunnels: tunnel_map.into_values().collect(),
+        procedures,
+        interfaces,
+        state: state.into(),
+        event_ids: lte.iter().map(|event| event.event_id.clone()).collect(),
+        limitations: vec![
+            "Synthetic preparation only; real LTE evidence requires ANR1 certification".into(),
+            "No timestamp-only S1AP/S11/S1-U identity association is performed".into(),
+        ],
+    }]
 }
 
 pub fn load_jsonl<R: BufRead>(reader: R) -> Result<Vec<EventRecord>, String> {
@@ -1719,5 +1869,61 @@ mod tests {
             .gtpu_tunnels
             .iter()
             .all(|tunnel| tunnel.related_pfcp_session.is_some()));
+    }
+
+    #[test]
+    fn prepares_lte_session_and_s1u_counters_without_timing_identity_join() {
+        let mut s1ap = event(
+            "s1ap",
+            "S1AP",
+            "InitialContextSetupResponse",
+            &[("enb_ue_s1ap_id", "41"), ("mme_ue_s1ap_id", "7")],
+            1,
+        );
+        s1ap.interface = "S1-MME".into();
+        let mut nas = event(
+            "nas",
+            "NAS-EPS-MM",
+            "Attach Complete",
+            &[("imsi_pseudonym", "subscriber-opaque-a")],
+            2,
+        );
+        nas.interface = "S1-MME".into();
+        let mut s11 = event(
+            "s11",
+            "GTPv2-C",
+            "CreateSessionResponse",
+            &[("bearer_ebi", "5"), ("bearer_f_teid", "0x01020304")],
+            3,
+        );
+        s11.interface = "S11".into();
+        let mut uplink = event(
+            "s1u-ul",
+            "GTP-U",
+            "G-PDU",
+            &[("teid", "0x01020304")],
+            4,
+        );
+        uplink.interface = "S1-U".into();
+        uplink.direction = "UPLINK".into();
+        uplink.packet_references[0].captured_length = 128;
+        let mut downlink = uplink.clone();
+        downlink.event_id = "s1u-dl".into();
+        downlink.direction = "DOWNLINK".into();
+        downlink.timestamp_ns = 5;
+        downlink.packet_references[0].packet_number = 5;
+        downlink.packet_references[0].captured_length = 256;
+
+        let sessions = discover_lte_sessions(&[s1ap, nas, s11, uplink, downlink]);
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.technology, "LTE");
+        assert_eq!(session.ue_pseudonym, "subscriber-opaque-a");
+        assert_eq!(session.state, "ACTIVE_WITH_USER_PLANE");
+        assert_eq!(session.eps_bearer_ids, vec!["5"]);
+        assert_eq!(session.s11_f_teids, vec!["0x01020304"]);
+        assert_eq!(session.tunnels[0].uplink_packets, 1);
+        assert_eq!(session.tunnels[0].downlink_packets, 1);
+        assert_eq!(session.tunnels[0].bytes, 384);
     }
 }

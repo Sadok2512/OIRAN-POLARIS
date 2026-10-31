@@ -1,6 +1,6 @@
 {
   "name": "@oiran/web",
-  "version": "2.5.0-dev",
+  "version": "2.6.0-pre.1",
   "private": true,
   "type": "module",
   "scripts": {

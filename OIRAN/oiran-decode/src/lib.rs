@@ -4,8 +4,10 @@ use capture_pcap::{
     transport_view, visit_capture, CapturePacket, TransportProtocol, TransportView,
 };
 use decoder_gtpu::GtpuDecoder;
+use decoder_gtpv2c::Gtpv2cDecoder;
 use decoder_ngap::NgapDecoder;
 use decoder_pfcp::PfcpDecoder;
+use decoder_s1ap::S1apDecoder;
 use decoder_sbi::{decode_connections, SbiDecodeReport};
 use event_schema::{sha256_hex, Endpoint, NormalizedEvent, PacketReference};
 use plugin_runtime::{DecoderInput, ProtocolDecoder};
@@ -20,7 +22,34 @@ use std::{
 use transport_sctp::SctpReassembler;
 use transport_tcp::TcpReassembler;
 
-pub const VERSION: &str = "0.4.5";
+pub const VERSION: &str = "0.5.0";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpRoute {
+    N3Gtpu,
+    N4Pfcp,
+    S1uGtpu,
+    S11Gtpv2c,
+}
+
+fn udp_route(interface: &str, source_port: u16, destination_port: u16) -> Option<UdpRoute> {
+    let has_port = |port| source_port == port || destination_port == port;
+    match interface {
+        "N3" if has_port(2152) => Some(UdpRoute::N3Gtpu),
+        "N4" if has_port(8805) => Some(UdpRoute::N4Pfcp),
+        "S1-U" if has_port(2152) => Some(UdpRoute::S1uGtpu),
+        "S11" if has_port(2123) => Some(UdpRoute::S11Gtpv2c),
+        _ => None,
+    }
+}
+
+fn sctp_route(interface: &str, ppid: u32) -> Option<&'static str> {
+    match (interface, ppid) {
+        ("N2", 60) => Some("N2"),
+        ("S1-MME", 18) => Some("S1-MME"),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DecodeConfig {
@@ -91,8 +120,10 @@ where
 {
     validate_config(config)?;
     let ngap = NgapDecoder;
+    let s1ap = S1apDecoder;
     let pfcp = PfcpDecoder;
     let gtpu = GtpuDecoder;
+    let gtpv2c = Gtpv2cDecoder;
     let mut sctp = SctpReassembler::new();
     let mut tcp = TcpReassembler::new();
     let mut event_count = 0usize;
@@ -121,21 +152,23 @@ where
                     view.source_port.unwrap_or(0),
                     view.destination_port.unwrap_or(0),
                 );
-                if ports.0 == 8805 || ports.1 == 8805 {
+                if let Some(route) = udp_route(&config.interface, ports.0, ports.1) {
+                    let (decoder, interface): (&dyn ProtocolDecoder, &str) = match route {
+                        UdpRoute::N3Gtpu => (&gtpu, "N3"),
+                        UdpRoute::N4Pfcp => (&pfcp, "N4"),
+                        UdpRoute::S1uGtpu => (&gtpu, "S1-U"),
+                        UdpRoute::S11Gtpv2c => (&gtpv2c, "S11"),
+                    };
                     let mut decoded = Vec::new();
-                    decode_udp(&pfcp, &packet, &view, config, "N4", &mut decoded);
-                    emit_events(decoded, &mut sink, &mut event_count, &mut sink_error);
-                } else if ports.0 == 2152 || ports.1 == 2152 {
-                    let mut decoded = Vec::new();
-                    decode_udp(&gtpu, &packet, &view, config, "N3", &mut decoded);
+                    decode_udp(decoder, &packet, &view, config, interface, &mut decoded);
                     emit_events(decoded, &mut sink, &mut event_count, &mut sink_error);
                 }
             }
             TransportProtocol::Sctp => {
                 for message in sctp.consume(&packet, &view) {
-                    if message.ppid != 60 {
+                    let Some(interface) = sctp_route(&config.interface, message.ppid) else {
                         continue;
-                    }
+                    };
                     let source = endpoint(
                         &message.source_ip,
                         Some(message.source_port),
@@ -151,21 +184,26 @@ where
                         capture_id: &config.capture_id,
                         packet_references: &message.packet_references,
                         timestamp: &message.timestamp,
-                        interface: "N2",
+                        interface,
                         source_endpoint: source,
                         destination_endpoint: destination,
                         payload: &message.payload,
                         raw_payload_reference: &raw,
                     };
+                    let decoded = if interface == "S1-MME" {
+                        s1ap.decode(&input).events
+                    } else {
+                        ngap.decode(&input).events
+                    };
                     emit_events(
-                        ngap.decode(&input).events,
+                        decoded,
                         &mut sink,
                         &mut event_count,
                         &mut sink_error,
                     );
                 }
             }
-            TransportProtocol::Tcp => {
+            TransportProtocol::Tcp if config.interface == "SBI" => {
                 tcp.consume(&packet, &view);
                 let finalized = tcp.take_finalized();
                 emit_sbi_connections(
@@ -177,7 +215,7 @@ where
                     &mut sbi_report,
                 );
             }
-            TransportProtocol::Other(_) => {}
+            TransportProtocol::Tcp | TransportProtocol::Other(_) => {}
         }
     })
     .map_err(|error| error.to_string())?;
@@ -344,8 +382,11 @@ fn validate_config(config: &DecodeConfig) -> Result<(), String> {
     if !config.capture_id.starts_with("sha256:") || config.capture_id.len() != 71 {
         return Err("capture ID must be sha256: followed by 64 hex digits".into());
     }
-    if !matches!(config.interface.as_str(), "N2" | "N3" | "N4" | "SBI") {
-        return Err("interface must be N2, N3, N4 or SBI".into());
+    if !matches!(
+        config.interface.as_str(),
+        "N2" | "N3" | "N4" | "SBI" | "S1-MME" | "S1-U" | "S11"
+    ) {
+        return Err("interface must be N2, N3, N4, SBI, S1-MME, S1-U or S11".into());
     }
     Ok(())
 }
@@ -430,6 +471,32 @@ mod tests {
             endpoints: HashMap::new(),
         };
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn routes_lte_without_aliasing_five_g_planes() {
+        assert_eq!(sctp_route("S1-MME", 18), Some("S1-MME"));
+        assert_eq!(sctp_route("N2", 60), Some("N2"));
+        assert_eq!(sctp_route("S1-MME", 60), None);
+        assert_eq!(sctp_route("N2", 18), None);
+        assert_eq!(udp_route("S1-U", 2152, 9999), Some(UdpRoute::S1uGtpu));
+        assert_eq!(udp_route("N3", 2152, 9999), Some(UdpRoute::N3Gtpu));
+        assert_eq!(udp_route("S11", 2123, 9999), Some(UdpRoute::S11Gtpv2c));
+        assert_eq!(udp_route("N4", 8805, 9999), Some(UdpRoute::N4Pfcp));
+        assert_eq!(udp_route("S11", 2152, 9999), None);
+    }
+
+    #[test]
+    fn accepts_explicit_lte_interfaces() {
+        for interface in ["S1-MME", "S1-U", "S11"] {
+            let config = DecodeConfig {
+                input: "unused.pcap".into(),
+                capture_id: format!("sha256:{}", "0".repeat(64)),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+            };
+            assert!(validate_config(&config).is_ok(), "{interface}");
+        }
     }
 
     #[test]

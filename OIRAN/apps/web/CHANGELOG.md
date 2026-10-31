@@ -2,6 +2,13 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.6.0-pre.1 — 2026-10-31 (minor pre-release)
+
+- Prepare LTE technology, S1-MME/S11/S1-U interface and S1AP/EPS NAS/GTPv2-C
+  protocol filters for offline synthetic datasets.
+- Keep LTE explicitly labelled synthetic-only; this release does not claim
+  live capture or ANR1 fixture certification.
+
 ## 2.5.0-dev — 2026-10-28 (minor)
 
 Zero-mock pass against the production backend at

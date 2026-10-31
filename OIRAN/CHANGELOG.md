@@ -1,5 +1,15 @@
 # Changelog
 
+## LTE pipeline preparation 0.1.0 — 2026-10-31
+
+- Add explicit, non-aliased offline decoder routes for S1-MME/S1AP PPID 18,
+  S11/GTPv2-C UDP 2123 and S1-U/GTP-U UDP 2152 while retaining N2/N3/N4/SBI.
+- Add LTE session preparation with EPS bearer metadata and per-TEID UL/DL
+  packet/octet counters, without timestamp-only subscriber association.
+- Add ambiguity-safe S11-to-S1-U and prepared S1AP-to-S11 correlation rules.
+- Add Analyzer LTE filters marked synthetic-only and an ANR1-gated real-fixture
+  manifest template. No capture or production enablement is included.
+
 ## OIRAN API 2.5.3 / live-probe 0.2.6 - 2026-10-31
 
 - Aggregate continuous N3 user-plane observations by TEID, direction, inner flow and QFI while decoding; packet and byte counters plus first/last provenance remain exact without retaining one event per G-PDU.

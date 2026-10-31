@@ -174,7 +174,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "correlation-engine"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "callflow-schema",
  "serde",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-gtpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "event-schema",
  "plugin-runtime",
@@ -564,12 +564,14 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "capture-pcap",
  "decoder-gtpu",
+ "decoder-gtpv2c",
  "decoder-ngap",
  "decoder-pfcp",
+ "decoder-s1ap",
  "decoder-sbi",
  "event-schema",
  "plugin-runtime",
@@ -713,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "session-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",

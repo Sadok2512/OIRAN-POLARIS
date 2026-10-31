@@ -9,7 +9,7 @@ use plugin_runtime::{
     PLUGIN_API_VERSION,
 };
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 #[derive(Default)]
 pub struct GtpuDecoder;
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -269,9 +269,13 @@ fn infer_direction(i: &DecoderInput<'_>) -> Direction {
         .as_deref()
         .unwrap_or("")
         .to_ascii_lowercase();
-    if src.contains("gnb") && dst.contains("upf") {
+    if (src.contains("gnb") && dst.contains("upf"))
+        || (src.contains("enb") && dst.contains("sgw"))
+    {
         Direction::Uplink
-    } else if src.contains("upf") && dst.contains("gnb") {
+    } else if (src.contains("upf") && dst.contains("gnb"))
+        || (src.contains("sgw") && dst.contains("enb"))
+    {
         Direction::Downlink
     } else {
         Direction::Unknown
@@ -331,5 +335,38 @@ mod tests {
             inner_ipv4_addresses(&ipv4),
             Some(("10.46.0.4".into(), "10.46.0.1".into()))
         );
+    }
+
+    #[test]
+    fn infers_s1u_direction_from_enb_and_sgw_roles() {
+        let packets = vec![];
+        let timestamp = event_schema::ExactTimestamp {
+            seconds: 1,
+            nanoseconds: 0,
+            raw_ticks: 1,
+            resolution_base: 10,
+            resolution_exponent: 9,
+        };
+        let payload = [0x30, 0xff, 0, 0, 0, 0, 0, 1];
+        let make = |source: &str, destination: &str| DecoderInput {
+            capture_id: "sha256:synthetic",
+            packet_references: &packets,
+            timestamp: &timestamp,
+            interface: "S1-U",
+            source_endpoint: event_schema::Endpoint {
+                address: "192.0.2.1".into(),
+                port: Some(2152),
+                network_function: Some(source.into()),
+            },
+            destination_endpoint: event_schema::Endpoint {
+                address: "192.0.2.2".into(),
+                port: Some(2152),
+                network_function: Some(destination.into()),
+            },
+            payload: &payload,
+            raw_payload_reference: "sha256:synthetic",
+        };
+        assert_eq!(infer_direction(&make("eNB", "SGW-U")), Direction::Uplink);
+        assert_eq!(infer_direction(&make("SGW-U", "eNB")), Direction::Downlink);
     }
 }
