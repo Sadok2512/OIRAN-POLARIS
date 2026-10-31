@@ -1,11 +1,15 @@
 // Probe Agent MVP (see docs/probe-agent/DESIGN.md).
 //
 // This crate exposes the pure logic — config loader, enrollment
-// handshake, heartbeat payload, segment upload path. The transport
-// layer (TLS, HTTP client) lives in `main.rs` so unit tests can drive
-// the state machine without a network stack.
+// handshake, heartbeat payload, segment upload path — plus (since
+// 0.1.1) the mTLS transport that talks to the Probe Manager and the
+// IPC client that drives the capture-helper over a Unix socket.
+// Both transports live in `transport::*` so unit tests of the pure
+// state machine still run without a network stack.
 
 use serde::{Deserialize, Serialize};
+
+pub mod transport;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

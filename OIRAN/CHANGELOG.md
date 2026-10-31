@@ -1,5 +1,58 @@
 # Changelog
 
+## probe-agent 0.1.1 - 2026-10-30 — mTLS transport + capture-helper IPC
+
+Rebased on top of `03dcc4b` (probe-agent 0.1.0 MVP). `git merge-base
+--is-ancestor 03dcc4b HEAD` → true.
+
+### Added
+- `probe_agent::transport::mtls` — `MtlsTransport` +
+  `MtlsTransportSettings` on top of `reqwest` with
+  `rustls-tls-manual-roots`. The agent never trusts the system root
+  store; the Probe Manager's CA PEM is pinned at construction time.
+  `post_heartbeat`, `post_segment_manifest`, and the pre-mTLS
+  `enroll(probe_manager_url, bootstrap_token, csr)` entry point. Bad
+  PEM at build time → `TRANSPORT_CA_INVALID` /
+  `TRANSPORT_CLIENT_CERT_INVALID` / `TRANSPORT_CLIENT_KEY_INVALID`
+  before any network call.
+- `probe_agent::transport::capture` — `CaptureHelperClient` driving
+  the local `oiran-capture-helper` daemon over a Unix socket. One
+  JSON request → one JSON response, no framing (matches the
+  server-side implementation). Request vocabulary mirrors
+  `capture_helper::IpcRequest`: `validate_capture`, `start_capture`,
+  `stop_capture`, `get_status`. Error vocabulary:
+  `CAPTURE_SOCKET_CONNECT_FAILED`, `CAPTURE_SOCKET_TIMEOUT`,
+  `CAPTURE_RESPONSE_TOO_LARGE`, `CAPTURE_HELPER_<CATEGORY>` surfaced
+  from the helper's reply.
+- `tests/transport_e2e.rs` — real-wire E2E spec. `rcgen` mints a
+  throw-away CA + server cert + client cert; axum-server-0.7.3
+  serves `/agents/heartbeat` behind `WebPkiClientVerifier` (mTLS
+  required). The agent builds `MtlsTransport` with the (CA + client
+  cert + key) bundle, POSTs a `Heartbeat`, and the test asserts the
+  server recorded exactly one hit. In parallel, a tokio
+  `UnixListener` impersonates the capture-helper; the agent sends
+  `StartCapture` and verifies the returned `HelperJob` is in
+  `Starting`.
+
+### Dependencies
+- `tokio` 1.42.0 (macros + rt-multi-thread + net + io-util + time + sync)
+- `reqwest` 0.12.9 with `rustls-tls-manual-roots` + `json`
+- `rustls` 0.23.19 with `ring` provider; `rustls-pemfile` 2.2.0
+- `capture-helper` (workspace crate) — shared `IpcRequest` /
+  `IpcResponse` vocabulary.
+- Dev-only: `rcgen` 0.13.2 with `ring` + `pem`, `axum` 0.7.9,
+  `axum-server` 0.7.3 (`tls-rustls-no-provider`), `tempfile` 3.14.0.
+
+### Tests
+- `cargo test -p probe-agent` → **21 pass** (16 lib + 4 enrollment
+  handshake carried from 0.1.0 + 1 transport E2E).
+
+### Identity invariant (unchanged)
+The agent still forwards pcap bytes under mTLS without decoding any
+signalling field. IMSI / IMEI / TMSI / GUTI / RNTI stay inside the
+OIRAN decoders — the Probe Manager cannot observe them from this
+agent.
+
 ## OIRAN API 2.5.2 / live-probe 0.2.5 - 2026-10-30
 
 - Commit continuous-import checksums only after the rebuilt dataset generation
