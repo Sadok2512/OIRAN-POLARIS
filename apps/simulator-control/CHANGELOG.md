@@ -1,5 +1,19 @@
 # @telecom/simulator-control — Changelog
 
+## 0.17.0 — 2026-10-31 — UE RAT and simulator evidence
+
+- Adds Technology and Simulator columns to the existing UE Manager table and
+  renames Serving gNB to Serving RAN for both gNB and srsENB associations.
+- Resolves RAT/simulator strictly from `/ues`, configured backend profiles and
+  `/nodes`; missing associations remain `UNKNOWN` instead of being inferred
+  from an identifier or subscriber profile.
+- Adds Technology and Simulator filters while preserving RBAC, Grant V2,
+  actions and operator-only IMSI visibility.
+- Displays Attach/Registration, session and UE IP only from runtime evidence;
+  absent runtime observations are explicitly `UNKNOWN`.
+- Adds runtime-contract coverage for UE-01, UE-201 and
+  LTE-SRSUE-TEST-01 without adding subscriber secrets or live actions.
+
 ## 0.16.0 — 2026-10-31 — LTE orchestration and dual-RAT topology
 
 - Polls the durable certified LTE run and displays each real phase state,
