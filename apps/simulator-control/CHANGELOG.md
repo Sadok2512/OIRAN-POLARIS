@@ -1,5 +1,22 @@
 # @telecom/simulator-control — Changelog
 
+## 0.17.0 — 2026-10-31 — default LTE/5G scenario templates
+
+- Integrates the finalized ANR1 `polaris.scenario-template-catalog.v1` contract:
+  thirteen immutable templates (six LTE 4G srsRAN, seven 5G SA UERANSIM).
+  Multi-UE remains an explicit empty filter because the backend contract does
+  not advertise a certified Multi-UE system template.
+- Adds RAT/category filters, full step/prerequisite metadata, bounded duration
+  and throughput, plus honest `SUPPORTED`, `BACKEND_REQUIRED` and
+  `CERTIFICATION_REQUIRED` badges supplied authoritatively by the catalogue.
+- `Use Template` and `Customize` load detached editable copies into the
+  existing Scenario Builder; backend saves use the authoritative clone route
+  before updating the mutable copy and never mutate the system template.
+- Separates definition persistence from live execution eligibility. Run stays
+  disabled until role, backend step support, LTE certification and Grant V2
+  gates are satisfied; no live state is fabricated.
+- Preserves the ANR2 UE Manager integration unchanged.
+
 ## 0.16.0 — 2026-10-31 — LTE orchestration V2 progress
 
 - Polls the durable certified LTE run and displays each real phase state,

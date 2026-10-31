@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
   ArrowDown,
@@ -8,6 +9,7 @@ import {
   CheckCircle2,
   Copy,
   Lock,
+  Play,
   Plus,
   Save,
   Trash2,
@@ -15,11 +17,14 @@ import {
 import { PageHeader } from '@/components/mockup';
 import { EmptyState } from '@/ui/EmptyErrorLoading';
 import { useScenarioLibrary } from '@/scenarios/library';
-import { isLoopRepresentable } from '@/scenarios/wireCodec';
-import { useCapabilities } from '@/data/queries';
+import { decodeDefinition, encodeDefinition, isLoopRepresentable, type WireScenarioDefinition } from '@/scenarios/wireCodec';
+import { cloneScenarioTemplate } from '@/data/scenarioTemplatesApi';
+import { polarisApi } from '@/data/polarisClient';
+import { useAuth, useCapabilities, useLteStatus } from '@/data/queries';
 import {
   PARAM_META,
   STEP_METADATA,
+  WIRE_STEP_TYPE,
   emptyScenario,
   isStepKindExecutable,
   newStepId,
@@ -49,6 +54,7 @@ export function ScenarioBuilderPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const library = useScenarioLibrary();
+  const queryClient = useQueryClient();
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -57,8 +63,17 @@ export function ScenarioBuilderPage() {
   // (so a page refresh falls back to the empty draft) and clears the id
   // so Save creates a brand-new definition rather than updating the
   // template.
-  const seededFromTemplate = (location.state as { seedFromTemplate?: Scenario } | null)
-    ?.seedFromTemplate;
+  const routeState = location.state as {
+    seedFromTemplate?: Scenario;
+    systemTemplate?: {
+      id: string;
+      name: string;
+      action: 'use' | 'customize';
+      support: 'SUPPORTED' | 'BACKEND_REQUIRED' | 'CERTIFICATION_REQUIRED';
+    };
+  } | null;
+  const seededFromTemplate = routeState?.seedFromTemplate;
+  const sourceTemplate = routeState?.systemTemplate;
 
   const [draft, setDraft] = useState<Scenario>(() => {
     if (seededFromTemplate) {
@@ -85,6 +100,8 @@ export function ScenarioBuilderPage() {
   // truth: when it names a wire type, the matching kind is promoted to
   // "Supported" without touching STEP_METADATA.
   const capabilities = useCapabilities();
+  const auth = useAuth();
+  const lteStatus = useLteStatus();
   const advertisedKinds = capabilities.data?.scenario_step_kinds ?? capabilities.data?.executable_scenario_step_types;
   const technology: RadioTechnology = draft.technology ?? '5G_SA';
 
@@ -102,6 +119,10 @@ export function ScenarioBuilderPage() {
   const hasLockedStep = useMemo(
     () => draft.steps.some((step) => !isStepKindExecutable(step.kind, advertisedKinds)),
     [draft.steps, advertisedKinds],
+  );
+  const hasUnrepresentableStep = useMemo(
+    () => draft.steps.some((step) => !WIRE_STEP_TYPE[step.kind]),
+    [draft.steps],
   );
 
   function updateDraft(update: Partial<Scenario>) {
@@ -172,7 +193,17 @@ export function ScenarioBuilderPage() {
   }
 
   const backendBlocked =
-    library.backend && (!isLoopRepresentable(draft.loop.kind) || hasLockedStep);
+    library.backend && (!isLoopRepresentable(draft.loop.kind) || hasUnrepresentableStep);
+
+  const runGateReason = !auth.data?.can_start
+    ? 'Operator authorization is required.'
+    : hasLockedStep
+      ? 'Backend execution support is missing for at least one step.'
+      : technology === 'LTE' && lteStatus.data?.certified !== true
+        ? 'LTE E2E certification is required.'
+        : technology === 'LTE' && lteStatus.data?.grant_active !== true
+          ? 'A valid Grant V2 is required.'
+          : null;
 
   // 0.10.0 — Save disable reason, surfaced inline next to the button so
   // the operator sees WHY Save is grayed without having to hover for the
@@ -181,8 +212,8 @@ export function ScenarioBuilderPage() {
     ? null
     : errors.length > 0
       ? `${errors.length} erreur${errors.length > 1 ? 's' : ''} de validation à corriger.`
-      : library.backend && hasLockedStep
-        ? 'Au moins une étape non certifiée côté backend — à retirer avant Save.'
+      : library.backend && hasUnrepresentableStep
+        ? 'Au moins une étape ne peut pas être sérialisée par le contrat backend.'
         : library.backend && !isLoopRepresentable(draft.loop.kind)
           ? 'Mode de boucle non représentable dans le catalog backend.'
           : null;
@@ -192,7 +223,18 @@ export function ScenarioBuilderPage() {
     setSaveError(null);
     setSaving(true);
     try {
-      const saved = await library.save(draft);
+      let saved: Scenario;
+      if (sourceTemplate && library.backend) {
+        await cloneScenarioTemplate(sourceTemplate.id, draft.id);
+        const wire = await polarisApi<WireScenarioDefinition>(
+          `/scenario-definitions/${encodeURIComponent(draft.id)}`,
+          { method: 'PUT', body: JSON.stringify(encodeDefinition(draft)) },
+        );
+        saved = decodeDefinition(wire);
+        await queryClient.invalidateQueries({ queryKey: ['polaris', 'scenario-definitions'] });
+      } else {
+        saved = await library.save(draft);
+      }
       setDraft(saved);
       navigate(`/scenarios/${saved.id}/edit`, { replace: true });
     } catch (error) {
@@ -232,6 +274,17 @@ export function ScenarioBuilderPage() {
             )}
             <button
               type="button"
+              className="ep-button"
+              disabled={runGateReason != null || errors.length > 0}
+              title={runGateReason ?? 'Select target UE(s) in UE Manager before execution.'}
+              onClick={() => navigate('/ues')}
+              data-testid="builder-run"
+            >
+              <Play width={14} height={14} aria-hidden="true" />
+              Run
+            </button>
+            <button
+              type="button"
               className="ep-button ep-button-primary"
               onClick={() => void save()}
               disabled={errors.length > 0 || backendBlocked || saving}
@@ -244,6 +297,22 @@ export function ScenarioBuilderPage() {
           </div>
         }
       />
+
+      {sourceTemplate && (
+        <section className="ep-card border-primary/30 p-4 mb-4" data-testid="builder-template-source">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <p className="text-ep-xs uppercase tracking-wider text-primary">System template · immutable source</p>
+              <p className="font-semibold">{sourceTemplate.name}</p>
+              <p className="mono text-ep-xs text-text-secondary">{sourceTemplate.id}</p>
+            </div>
+            <span className="ep-badge">{sourceTemplate.support}</span>
+          </div>
+          <p className="text-ep-sm text-text-secondary mt-2">
+            {sourceTemplate.action === 'customize' ? 'Customize' : 'Use Template'} loaded a new editable copy. Saving never mutates the system template.
+          </p>
+        </section>
+      )}
 
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <TechnologySelector
@@ -380,9 +449,9 @@ export function ScenarioBuilderPage() {
           >
             <AlertTriangle width={14} height={14} className="mt-0.5 shrink-0" aria-hidden="true" />
             <span>
-              This draft contains a step the backend will refuse. Remove it, or switch to
-              <strong> Offline draft </strong> in Settings. Save is blocked until the draft only
-              contains backend-certified steps.
+              This draft contains a step the backend cannot execute with the current capabilities.
+              The definition may be saved as a copy, but Run remains blocked until backend support,
+              Grant V2 and certification gates are satisfied.
             </span>
           </div>
         )}
