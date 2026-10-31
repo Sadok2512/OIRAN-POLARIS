@@ -41,6 +41,12 @@ capture reference and exact equality with the OIRAN-owned binding.
 | OIRAN LTE pipeline/API targeted | 5 passed / 2 passed |
 | Analyzer tests/typecheck/build/leak scan | 73 passed / PASS / PASS / PASS |
 
+An additional clean-target integration rerun was attempted after the normal
+merge. Both linkers stopped with `No space left on device` on the 64 MiB
+`/dev/shm` tmpfs; this was an execution-environment failure, not a test
+failure. The complete component suites above ran successfully on the exact
+parent commits, and the merge changed disjoint POLARIS and OIRAN paths.
+
 The two open Simulator tests are the 10,000-profile search timeout and the
 100,001-row asynchronous CSV timeout. They are offline timing defects, not
 counted as PASS, and keep the overall verdict from `OFFLINE_PASS`.
