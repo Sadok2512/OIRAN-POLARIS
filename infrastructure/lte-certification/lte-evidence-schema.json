@@ -49,12 +49,14 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["plane", "source_file_sha256", "first_frame", "last_frame", "sanitization_state"],
+        "required": ["plane", "source_file_sha256", "first_frame", "last_frame", "decoder_version", "event_schema_version", "sanitization_state"],
         "properties": {
           "plane": {"enum": ["S1_MME", "S11", "S1_U", "S5_C", "S5_U"]},
           "source_file_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
           "first_frame": {"type": "integer", "minimum": 1},
           "last_frame": {"type": "integer", "minimum": 1},
+          "decoder_version": {"type": "string", "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$"},
+          "event_schema_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
           "sanitization_state": {"enum": ["RAW_PROTECTED", "SANITIZED_PENDING_REVIEW", "SANITIZED_APPROVED"]}
         }
       }

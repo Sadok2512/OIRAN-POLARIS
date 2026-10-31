@@ -35,6 +35,8 @@
   "plane_aliases": {"S1_MME": "S1-MME", "S11": "S11", "S1_U": "S1-U"},
   "optional_plane_policy": "REJECT_UNSUPPORTED",
   "evidence_schema": "oiran-polaris.lte-e2e-evidence.v1",
+  "capture_ref_required_fields": ["plane", "source_file_sha256", "first_frame", "last_frame", "decoder_version", "event_schema_version", "sanitization_state"],
+  "capture_binding_version_rule": "capture_ref.decoder_version and capture_ref.event_schema_version MUST equal the OIRAN binding values",
   "cleanup_is_grant_exempt": true,
   "resume_traffic_after_restart": false
 }
