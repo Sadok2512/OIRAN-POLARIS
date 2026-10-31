@@ -2186,33 +2186,10 @@ async fn session_callflow(
     } else if let Some(flow_value) = flow_value_for(&state, &id) {
         callflow_page_from_value(flow_value, cursor, limit).map(Some)
     } else {
-        let mut found = None;
-        for dataset in state.inner.capture_manager.datasets() {
-            if !dataset
-                .session_ids
-                .iter()
-                .any(|session_id| session_id == &id)
-            {
-                continue;
-            }
-            found = match state.inner.capture_manager.callflow_page(
-                &dataset.dataset_id,
-                &id,
-                cursor,
-                limit,
-            ) {
-                Ok(Some(value)) => Some(Ok(value)),
-                Ok(None) => None,
-                Err(error) => Some(Err(error)),
-            };
-            if found.is_some() {
-                break;
-            }
-        }
-        match found {
-            Some(result) => result.map(Some),
-            None => Ok(None),
-        }
+        state
+            .inner
+            .capture_manager
+            .callflow_page_by_session(&id, cursor, limit)
     };
     match result {
         Ok(Some(mut value)) => {

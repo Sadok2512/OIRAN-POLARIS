@@ -1190,19 +1190,23 @@ impl CaptureManager {
         if !safe_identifier(session_id) {
             return None;
         }
-        let dataset = self.dataset(dataset_id)?;
-        let dataset_root = if dataset.dataset_id.starts_with("derived-") {
+        let (stored_dataset_id, capture_id) = {
+            let datasets = self.datasets.lock().unwrap();
+            let dataset = datasets.get(dataset_id)?;
+            (dataset.dataset_id.clone(), dataset.capture_id.clone())
+        };
+        let dataset_root = if stored_dataset_id.starts_with("derived-") {
             self.root
                 .join("derived-datasets")
-                .join(&dataset.dataset_id)
+                .join(&stored_dataset_id)
                 .join("dataset")
-        } else if dataset.dataset_id.starts_with("recovered-dataset-") {
+        } else if stored_dataset_id.starts_with("recovered-dataset-") {
             self.root
                 .join("recovered-datasets")
-                .join(&dataset.capture_id)
+                .join(&capture_id)
                 .join("dataset")
         } else {
-            self.root.join(&dataset.capture_id).join("dataset")
+            self.root.join(&capture_id).join("dataset")
         };
         Some(
             dataset_root
@@ -1225,6 +1229,34 @@ impl CaptureManager {
             return Ok(None);
         }
         read_callflow_page(&path, cursor, limit).map(Some)
+    }
+
+    /// Resolves a persisted call flow without cloning `LiveDataset.discovery`.
+    /// The continuous dataset can retain thousands of event identifiers; a
+    /// read-only HTTP request must not duplicate that index merely to locate
+    /// one session artifact.
+    pub fn callflow_page_by_session(
+        &self,
+        session_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Option<Value>, String> {
+        let dataset_id = {
+            let datasets = self.datasets.lock().unwrap();
+            datasets
+                .values()
+                .find(|dataset| {
+                    dataset
+                        .session_ids
+                        .iter()
+                        .any(|candidate| candidate == session_id)
+                })
+                .map(|dataset| dataset.dataset_id.clone())
+        };
+        let Some(dataset_id) = dataset_id else {
+            return Ok(None);
+        };
+        self.callflow_page(&dataset_id, session_id, cursor, limit)
     }
 
     /// Validates and atomically registers a reviewed offline-derived dataset.
