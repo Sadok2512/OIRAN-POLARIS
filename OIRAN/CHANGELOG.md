@@ -1,5 +1,15 @@
 # Changelog
 
+## LTE evidence pipeline 0.6.1 — 2026-10-31
+
+- Materialize bounded offline LTE sessions and call flows in Live Probe/API
+  from S1AP, GTPv2-C and GTP-U normalized evidence while preserving N2/N3/N4.
+- Define the fail-closed POLARIS-to-OIRAN evidence admission contract and the
+  S1-MME/S11/S1-U mapping used by Session Explorer and Call Flow pagination.
+- Verify anonymized fixture bundles with root-confined paths, regular-file
+  enforcement, streaming SHA-256 and exact size matching. Real fixtures now
+  require `SANITIZED_APPROVED`; this is verification, not anonymization.
+
 ## LTE offline certification 1.0.0-offline.1 — 2026-10-31
 
 - Validate mandatory S1-MME/S11/S1-U fixture fields separately from ANR1

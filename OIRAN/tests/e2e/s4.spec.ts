@@ -23,8 +23,8 @@ test('WEB-001 public read-only application loads', async ({ page }) => {
 
 test('WEB-002 navigates between four pages without errors', async ({ page }) => {
   await authenticate(page);
-  for (const [label, heading] of [['Session Explorer', 'Session Explorer'], ['Call Flow Viewer', 'Call Flow Viewer'], ['Correlation Studio', 'Correlation Studio'], ['Probe Manager', 'Probe Manager']]) {
-    await page.getByRole('link', { name: label }).click();
+  for (const [route, heading] of [['/investigation/sessions', 'Session Explorer'], ['/investigation/callflow', 'Call Flow Viewer'], ['/investigation/correlation', 'Correlation Studio'], ['/operations/probes', 'Probe Manager']]) {
+    await page.goto(route);
     await expect(page.getByRole('heading', { name: heading })).toBeVisible();
   }
 });

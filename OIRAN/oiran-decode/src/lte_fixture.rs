@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    fs::{self, File},
+    io::Read,
+    path::{Component, Path},
+};
+
+use event_schema::Sha256Hasher;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LteFixtureFile {
@@ -71,6 +78,73 @@ impl LteManifestValidation {
     pub fn ready(&self) -> bool {
         self.structural_errors.is_empty() && self.readiness_blockers.is_empty()
     }
+}
+
+/// Verifies that a manifest can be packaged with its referenced, already
+/// anonymized captures. This function never modifies captures and is not an
+/// anonymizer: ANR1 approval remains mandatory for real evidence.
+pub fn verify_lte_fixture_files(manifest: &LteFixtureManifest, root: &Path) -> Vec<String> {
+    let mut errors = Vec::new();
+    for entry in &manifest.files {
+        let relative = Path::new(&entry.path);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            errors.push(format!(
+                "{} path must stay below bundle root",
+                entry.interface
+            ));
+            continue;
+        }
+        let path = root.join(relative);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                errors.push(format!("{} file unavailable: {error}", entry.interface));
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            errors.push(format!("{} path must be a regular file", entry.interface));
+            continue;
+        }
+        if Some(metadata.len()) != entry.size_bytes {
+            errors.push(format!(
+                "{} size mismatch: manifest={:?} actual={}",
+                entry.interface,
+                entry.size_bytes,
+                metadata.len()
+            ));
+        }
+        match sha256_file(&path) {
+            Ok(digest) if digest == entry.sha256 => {}
+            Ok(digest) => errors.push(format!(
+                "{} sha256 mismatch: manifest={} actual={digest}",
+                entry.interface, entry.sha256
+            )),
+            Err(error) => errors.push(format!("{} sha256 failed: {error}", entry.interface)),
+        }
+    }
+    errors
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256Hasher::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finish_hex())
 }
 
 const REQUIRED_POINTERS: &[&str] = &[
@@ -211,12 +285,30 @@ pub fn validate_lte_fixture_manifest(
     }
     let valid_timestamp = |value: &str| value.contains('T') && value.ends_with('Z');
     for file in &manifest.files {
+        let relative = Path::new(&file.path);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            validation
+                .structural_errors
+                .push(format!("{} path must be bundle-relative", file.interface));
+        }
         if placeholder(&file.path) {
             validation
                 .readiness_blockers
                 .push(format!("{} path is not populated", file.interface));
         }
-        if file.sha256.len() != 64 || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if file.sha256.len() != 64
+            || !file
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
             validation.readiness_blockers.push(format!(
                 "{} sha256 is not 64 hexadecimal characters",
                 file.interface
@@ -288,6 +380,11 @@ pub fn validate_lte_fixture_manifest(
             .readiness_blockers
             .push("real fixture requires ANR1 reference and approval timestamp".into());
     }
+    if manifest.real_capture && manifest.certification_state != "SANITIZED_APPROVED" {
+        validation
+            .readiness_blockers
+            .push("real fixture certification_state must be SANITIZED_APPROVED".into());
+    }
     Ok((manifest, validation))
 }
 
@@ -340,5 +437,55 @@ mod tests {
             .structural_errors
             .iter()
             .any(|error| error.contains("clear subscriber identities")));
+    }
+
+    #[test]
+    fn real_fixture_requires_sanitized_approval_state() {
+        let mut value: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/lte-offline-certification-synthetic-manifest.json"
+        ))
+        .unwrap();
+        value["real_capture"] = Value::Bool(true);
+        value["approval"]["anr1_reference"] = Value::String("ANR1-APPROVAL-TEST".into());
+        value["approval"]["approved_at_utc"] = Value::String("2026-10-31T12:00:01Z".into());
+        let (_, validation) = validate_lte_fixture_manifest(&value.to_string()).unwrap();
+        assert!(!validation.ready());
+        assert!(validation
+            .readiness_blockers
+            .iter()
+            .any(|error| error.contains("SANITIZED_APPROVED")));
+    }
+
+    #[test]
+    fn bundle_verification_is_bounded_to_root_and_checks_digest() {
+        let root = std::env::temp_dir().join(format!(
+            "oiran-lte-bundle-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let content = b"synthetic anonymized LTE evidence";
+        fs::write(root.join("s1-mme.pcap"), content).unwrap();
+        let mut value: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/lte-offline-certification-synthetic-manifest.json"
+        ))
+        .unwrap();
+        value["files"] = serde_json::json!([{
+            "interface": "S1-MME",
+            "protocol": "S1AP_SCTP_PPID_18",
+            "path": "s1-mme.pcap",
+            "sha256": event_schema::sha256_hex(content),
+            "packet_count": 1,
+            "size_bytes": content.len(),
+            "first_timestamp_utc": "2026-10-31T12:00:00Z",
+            "last_timestamp_utc": "2026-10-31T12:00:01Z"
+        }]);
+        let manifest: LteFixtureManifest = serde_json::from_value(value).unwrap();
+        assert!(verify_lte_fixture_files(&manifest, &root).is_empty());
+
+        let mut traversal = manifest.clone();
+        traversal.files[0].path = "../outside.pcap".into();
+        assert!(verify_lte_fixture_files(&traversal, &root)[0].contains("bundle root"));
+        fs::remove_dir_all(root).unwrap();
     }
 }

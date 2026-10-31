@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "capture-pcap",
  "decoder-gtpu",
