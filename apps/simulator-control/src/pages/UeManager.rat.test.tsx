@@ -3,9 +3,11 @@ import { render, screen } from '@testing-library/react';
 import {
   renderPduCell,
   renderRegistrationCell,
+  isCanonicalLteProfile,
+  recordFromLteProfile,
   resolveUeRatAssociation,
 } from './UeManager';
-import type { NodeItem, UeProfile, UeState } from '@/data/polarisTypes';
+import type { LteProfile, NodeItem, UeProfile, UeState } from '@/data/polarisTypes';
 import type { UeProfileRecord } from '@/ue/profileModel';
 
 const profile = (id: string, servingGnb: string): UeProfileRecord => ({
@@ -16,7 +18,11 @@ const node = (id: string, technology: string, simulator: string, coreLinked = fa
   id, name: id, technology, simulator, plmn: '001/01', cell_id: 'demo',
   link_ip: '10.77.0.1', n2_endpoint: coreLinked ? '10.77.1.1' : null,
   n3_endpoint: coreLinked ? '10.77.2.1' : null,
-  process_state: 'unknown', health: 'unknown', configured: true,
+  n2_state: coreLinked && !/LTE/i.test(technology) ? 'CONNECTED' : 'NOT_OBSERVED',
+  n3_state: coreLinked && !/LTE/i.test(technology) ? 'CONNECTED' : 'NOT_OBSERVED',
+  s1_state: coreLinked && /LTE/i.test(technology) ? 'CONNECTED' : 'NOT_OBSERVED',
+  epc_state: coreLinked && /LTE/i.test(technology) ? 'running' : 'NOT_OBSERVED',
+  process_state: coreLinked ? 'running' : 'unknown', health: 'unknown', configured: true,
   controller_owned: false, uptime_seconds: null,
   actions: { start: false, stop: false, reason: 'READ_ONLY' },
 });
@@ -26,7 +32,26 @@ const configured = (id: string, servingGnb: string, simulator: string): UeProfil
   configured: true, controller_owned: false,
 });
 
+const lteProfile = (): LteProfile => ({
+  schema_version: 'polaris.lte-profile.v1', profile_id: 'LTE-SRSUE-TEST-01',
+  technology: 'LTE 4G', simulator: 'srsUE', serving_ran: 'ENB-01',
+  serving_ran_type: 'srsENB', revision: 1, owner: 'POLARIS_CONTROLLER',
+  enabled: false, runtime_state: 'UNKNOWN', apn: 'NOT_AVAILABLE', max_running_ues: 1,
+  configuration_sha256: '0'.repeat(64), compose_model_sha256: null,
+  scenario_id: 'lte-e2e-certification-v1', scenario_revision: 1,
+  scenario_sha256: '1'.repeat(64), grant_required: true,
+  evidence_schema: 'oiran-polaris.lte-e2e-evidence.v1', last_observed_at_epoch_s: null,
+});
+
 describe('UE Manager RAT/simulator evidence resolution', () => {
+  it('accepts only the canonical LTE profile contract and never invents runtime state', () => {
+    expect(isCanonicalLteProfile(lteProfile())).toBe(true);
+    expect(isCanonicalLteProfile({ ...lteProfile(), serving_ran: undefined })).toBe(false);
+    const record = recordFromLteProfile(lteProfile());
+    expect(record.id).toBe('LTE-SRSUE-TEST-01');
+    expect(record).not.toHaveProperty('registration_state');
+    expect(record).not.toHaveProperty('ue_ip');
+  });
   it('proves UE-01 as 5G SA / UERANSIM through configured profile + GNB-01', () => {
     expect(resolveUeRatAssociation(
       profile('UE-01', 'GNB-01'), undefined,

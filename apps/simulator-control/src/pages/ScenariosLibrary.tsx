@@ -317,7 +317,7 @@ function TemplatesTab({
       />
     );
   }
-  if (templates.isLoading) return <LoadingSkeleton label="Loading /scenario-definitions (tpl-*)" />;
+  if (templates.isLoading) return <LoadingSkeleton label="Loading the backend scenario catalogue" />;
   if (templates.error) {
     const code =
       templates.error instanceof ApiError
@@ -330,8 +330,8 @@ function TemplatesTab({
   if (!templates.data || templates.data.items.length === 0) {
     return (
       <EmptyState
-        title="No tpl-* templates on this backend yet"
-        description="GET /scenario-definitions returned nothing with the tpl- prefix. Codex seeds the four read-only templates (tpl-voice-long, tpl-voice-short, tpl-small-traffic, tpl-high-runner) once the branch is deployed."
+        title="No backend templates available"
+        description="The real POLARIS catalogue returned no immutable tpl-* definition. No browser fallback is used."
       />
     );
   }

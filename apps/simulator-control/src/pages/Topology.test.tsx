@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
-import { TopologyPage, linkState, nfPillState } from './Topology';
+import { TopologyPage, linkState, nfPillState, observedLinkState } from './Topology';
 
 function respond(status: number, body: unknown) {
   return new Response(JSON.stringify(body), {
@@ -45,6 +45,15 @@ describe('linkState — three honest states, no "UP"', () => {
       linkState('running', null),
     ];
     expect(values).not.toContain('UP' as never);
+  });
+});
+
+describe('observedLinkState — proof required', () => {
+  it('uses only an explicit interface observation while the process is running', () => {
+    expect(observedLinkState('running', 'CONNECTED')).toBe('configured');
+    expect(observedLinkState('stopped', 'CONNECTED')).toBe('down');
+    expect(observedLinkState('running', 'NOT_OBSERVED')).toBe('unknown');
+    expect(observedLinkState('running', undefined)).toBe('unknown');
   });
 });
 
@@ -151,6 +160,7 @@ describe('Topology view — mockup fidelity (0.7.0)', () => {
               id: 'GNB-01', name: 'Primary gNB', technology: '5G SA', simulator: 'UERANSIM',
               plmn: '001/01', cell_id: '0x000000010', link_ip: '10.77.0.20',
               n2_endpoint: '10.77.21.20', n3_endpoint: '10.77.22.20',
+              n2_state: 'CONNECTED', n3_state: 'CONNECTED',
               process_state: 'running', health: 'healthy', configured: true,
               controller_owned: false, uptime_seconds: 42,
               actions: { start: false, stop: false, reason: 'SHARED_NODE_PROTECTED' },
@@ -198,6 +208,7 @@ describe('Topology view — mockup fidelity (0.7.0)', () => {
               id: 'GNB-01', name: 'Primary gNB', technology: '5G SA', simulator: 'UERANSIM',
               plmn: '001/01', cell_id: '0x10', link_ip: '10.77.0.20',
               n2_endpoint: '10.77.21.20', n3_endpoint: '10.77.22.20',
+              n2_state: 'CONNECTED', n3_state: 'CONNECTED',
               process_state: 'running', health: 'healthy', configured: true,
               controller_owned: true, uptime_seconds: 42,
               actions: { start: false, stop: false, reason: null },

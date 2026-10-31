@@ -27,6 +27,7 @@ import {
   useAuth,
   useDnns,
   useGenerateSubscribers,
+  useLteProfile,
   useNodes,
   usePlmns,
   useScenarioRuntime,
@@ -40,7 +41,7 @@ import {
 import { useAssignments } from '@/scenarios/store';
 import { useScenarioLibrary } from '@/scenarios/library';
 import { certifiedProfileFor, type Scenario } from '@/scenarios/model';
-import type { NodeItem, UeProfile as ConfiguredUeProfile, UeState } from '@/data/polarisTypes';
+import type { LteProfile, NodeItem, UeProfile as ConfiguredUeProfile, UeState } from '@/data/polarisTypes';
 import {
   parseCsv,
   toCsv,
@@ -138,7 +139,11 @@ export function resolveUeRatAssociation(
       : technology === '5G SA'
         ? 'gNB'
         : 'UNKNOWN';
-  const coreLinked = Boolean(node?.n2_endpoint || node?.n3_endpoint);
+  const observedState = (value: string | undefined) =>
+    Boolean(value && !/^(UNKNOWN|NOT_OBSERVED|NOT_AVAILABLE)$/i.test(value));
+  const coreLinked = technology === 'LTE 4G'
+    ? observedState(node?.s1_state) || observedState(node?.epc_state)
+    : observedState(node?.n2_state) || observedState(node?.n3_state);
   const core = coreLinked && technology === 'LTE 4G'
     ? 'Open5GS EPC'
     : coreLinked && technology === '5G SA'
@@ -147,10 +152,41 @@ export function resolveUeRatAssociation(
   return { technology, simulator, servingRan, servingRanType, core };
 }
 
+export function recordFromLteProfile(profile: LteProfile): UeProfileRecord {
+  const observedAt = (profile.last_observed_at_epoch_s ?? 0) * 1000;
+  return {
+    id: profile.profile_id,
+    owner: profile.owner,
+    servingGnb: profile.serving_ran,
+    apn: profile.apn,
+    createdAt: observedAt,
+    updatedAt: observedAt,
+    derived: true,
+    subscriptionStatus: 'PROTECTED',
+    scenarioId: profile.scenario_id,
+  };
+}
+
+export function isCanonicalLteProfile(value: unknown): value is LteProfile {
+  if (!value || typeof value !== 'object') return false;
+  const profile = value as Record<string, unknown>;
+  return profile.schema_version === 'polaris.lte-profile.v1'
+    && profile.profile_id === 'LTE-SRSUE-TEST-01'
+    && profile.technology === 'LTE 4G'
+    && profile.simulator === 'srsUE'
+    && typeof profile.serving_ran === 'string'
+    && profile.serving_ran_type === 'srsENB'
+    && profile.owner === 'POLARIS_CONTROLLER'
+    && (profile.last_observed_at_epoch_s === null
+      || typeof profile.last_observed_at_epoch_s === 'number')
+    && profile.evidence_schema === 'oiran-polaris.lte-e2e-evidence.v1';
+}
+
 export function UeManagerPage() {
   const auth = useAuth();
   const uesQuery = useUes();
   const nodesQuery = useNodes();
+  const lteProfileQuery = useLteProfile();
   const library = useScenarioLibrary();
   const assignments = useAssignments();
   const runtime = useScenarioRuntime();
@@ -162,7 +198,17 @@ export function UeManagerPage() {
   const backendProfiles = useBackendProfiles();
   const profileBackend = backendProfiles.enabled;
   const localProfiles = useProfiles();
-  const profiles = profileBackend ? backendProfiles.profiles : localProfiles;
+  const sourceProfiles = profileBackend ? backendProfiles.profiles : localProfiles;
+  const canonicalLteProfile = isCanonicalLteProfile(lteProfileQuery.data)
+    ? lteProfileQuery.data
+    : undefined;
+  const profiles = useMemo(() => {
+    if (!profileBackend || !canonicalLteProfile) return sourceProfiles;
+    if (sourceProfiles.some((profile) => profile.id === canonicalLteProfile.profile_id)) {
+      return sourceProfiles;
+    }
+    return [...sourceProfiles, recordFromLteProfile(canonicalLteProfile)];
+  }, [profileBackend, sourceProfiles, canonicalLteProfile]);
   const scenarioBackend = useFeatureFlag('scenarioBackend');
   const startDefinitionRun = useStartScenarioRun();
 
@@ -334,8 +380,9 @@ export function UeManagerPage() {
   );
 
   const selectedProfiles = useMemo(
-    () => profiles.filter((profile) => selected.has(profile.id)),
-    [profiles, selected],
+    () => profiles.filter((profile) =>
+      selected.has(profile.id) && profile.id !== canonicalLteProfile?.profile_id),
+    [profiles, selected, canonicalLteProfile?.profile_id],
   );
 
   const activeJob = runtime.data?.active_job;
@@ -951,12 +998,16 @@ export function UeManagerPage() {
                 <input
                   type="checkbox"
                   aria-label="Select all on page"
-                  checked={rows.length > 0 && rows.every((row) => selected.has(row.profile.id))}
+                  checked={rows.some((row) => row.profile.id !== canonicalLteProfile?.profile_id)
+                    && rows.filter((row) => row.profile.id !== canonicalLteProfile?.profile_id)
+                      .every((row) => selected.has(row.profile.id))}
                   onChange={(event) => {
                     setSelected((prev) => {
                       const next = new Set(prev);
                       if (event.target.checked) {
-                        for (const row of rows) next.add(row.profile.id);
+                        for (const row of rows) {
+                          if (row.profile.id !== canonicalLteProfile?.profile_id) next.add(row.profile.id);
+                        }
                       } else {
                         for (const row of rows) next.delete(row.profile.id);
                       }
@@ -982,6 +1033,7 @@ export function UeManagerPage() {
               const assignment = assignmentByUe.get(row.profile.id);
               const scenario = assignment ? scenarioById.get(assignment.scenarioId) : undefined;
               const profile = scenario ? certifiedProfileFor(scenario) : null;
+              const isCanonicalLte = row.profile.id === canonicalLteProfile?.profile_id;
               const isShared = row.backend ? !row.backend.controller_owned : false;
               const backendId = row.backend?.internal_ue_id ?? row.backend?.id;
               const isActiveForUe =
@@ -1025,12 +1077,14 @@ export function UeManagerPage() {
               const liveClosed = row.backend?.actions?.reason?.includes('423') ||
                 /LIVE_EXECUTION_NOT_AUTHORIZED/.test(row.backend?.actions?.reason ?? '');
               const startDisabled =
-                !canOperate ||
+                isCanonicalLte || !canOperate ||
                 isShared ||
                 notProvisioned ||
                 !backendCanStart ||
                 startUe.isPending;
-              const startReason = !canOperate
+              const startReason = isCanonicalLte
+                ? 'Profil LTE canonique : utiliser le contrôleur LTE sécurisé.'
+                : !canOperate
                 ? 'Rôle viewer : lecture seule.'
                 : isShared
                   ? 'UE partagée — protégée.'
@@ -1044,12 +1098,14 @@ export function UeManagerPage() {
                           ? row.backend?.actions?.reason || 'Start indisponible.'
                           : null;
               const stopDisabled =
-                !canOperate ||
+                isCanonicalLte || !canOperate ||
                 isShared ||
                 notProvisioned ||
                 !(isActiveForUe || backendCanStop) ||
                 stopScenario.isPending;
-              const stopReason = !canOperate
+              const stopReason = isCanonicalLte
+                ? 'Profil LTE canonique : utiliser le contrôleur LTE sécurisé.'
+                : !canOperate
                 ? 'Rôle viewer : lecture seule.'
                 : isShared
                   ? 'UE partagée — protégée.'
@@ -1059,12 +1115,14 @@ export function UeManagerPage() {
                       ? 'Aucune action Stop disponible côté backend.'
                       : null;
               const runDisabled =
-                !canOperate ||
+                isCanonicalLte || !canOperate ||
                 isShared ||
                 notProvisioned ||
                 !scenario ||
                 (!scenarioBackend && !profile);
-              const runReason = !canOperate
+              const runReason = isCanonicalLte
+                ? 'Le scénario LTE certifié est piloté par Grant V2.'
+                : !canOperate
                 ? 'Rôle viewer : lecture seule.'
                 : isShared
                   ? 'UE partagée — protégée.'
@@ -1077,9 +1135,13 @@ export function UeManagerPage() {
                         : liveClosed
                           ? 'Live fermé (HTTP 423) — approbation requise.'
                           : null;
-              const editDisabled = !canOperate;
-              const editReason = !canOperate ? 'Rôle viewer : lecture seule.' : null;
-              const deleteReason = !canOperate ? 'Rôle viewer : lecture seule.' : null;
+              const editDisabled = !canOperate || isCanonicalLte;
+              const editReason = isCanonicalLte
+                ? 'Profil LTE canonique en lecture seule.'
+                : !canOperate ? 'Rôle viewer : lecture seule.' : null;
+              const deleteReason = isCanonicalLte
+                ? 'Profil LTE canonique en lecture seule.'
+                : !canOperate ? 'Rôle viewer : lecture seule.' : null;
 
               return (
                 <tr
@@ -1092,6 +1154,7 @@ export function UeManagerPage() {
                       type="checkbox"
                       aria-label={`Select ${row.profile.id}`}
                       checked={selected.has(row.profile.id)}
+                      disabled={isCanonicalLte}
                       onChange={(event) => {
                         setSelected((prev) => {
                           const next = new Set(prev);
@@ -1147,7 +1210,9 @@ export function UeManagerPage() {
                     {row.rat.servingRan}
                   </td>
                   <td className="px-3 py-3" data-testid={`ue-subscriber-${row.profile.id}`}>
-                    {row.backend && !row.backend.controller_owned ? (
+                    {isCanonicalLte ? (
+                      <Pill tone="mute">Canonical LTE</Pill>
+                    ) : row.backend && !row.backend.controller_owned ? (
                       <Pill tone="warn">Shared</Pill>
                     ) : row.profile.subscriptionStatus === 'VERIFIED' ? (
                       <Pill tone="ok">Verified</Pill>
@@ -1160,7 +1225,7 @@ export function UeManagerPage() {
                         slot {row.backend.internal_ue_id}
                       </p>
                     ) : null}
-                    {profileBackend &&
+                    {profileBackend && !isCanonicalLte &&
                     row.profile.subscriptionStatus &&
                     row.profile.subscriptionStatus !== 'VERIFIED' ? (
                       <p
@@ -1221,7 +1286,7 @@ export function UeManagerPage() {
                             );
                           }
                         }}
-                        disabled={!canOperate || isShared}
+                        disabled={!canOperate || isShared || isCanonicalLte}
                         data-testid={`assign-select-${row.profile.id}`}
                       >
                         <option value="">— None —</option>
@@ -1307,6 +1372,10 @@ export function UeManagerPage() {
                               };
                               setFormState({ mode: 'clone', initial: next });
                             },
+                            disabled: isCanonicalLte,
+                            disabledReason: isCanonicalLte
+                              ? 'Profil LTE canonique en lecture seule.'
+                              : undefined,
                             testid: `ue-clone-${row.profile.id}`,
                           },
                           {
@@ -1315,7 +1384,7 @@ export function UeManagerPage() {
                             icon: <Trash2 width={12} height={12} aria-hidden="true" />,
                             tone: 'danger',
                             onSelect: () => setConfirmDelete([row.profile.id]),
-                            disabled: !canOperate,
+                            disabled: !canOperate || isCanonicalLte,
                             disabledReason: deleteReason ?? undefined,
                             testid: `ue-delete-${row.profile.id}`,
                           },

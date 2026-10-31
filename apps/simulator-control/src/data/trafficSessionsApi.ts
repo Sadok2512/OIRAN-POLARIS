@@ -116,6 +116,26 @@ export interface TrafficSamplesResponse {
   samples_ring_max: number;
 }
 
+/** Derive rates only from two observed cumulative counter samples. The first
+ * point stays unavailable; configured/requested rate is never substituted. */
+export function deriveObservedRates(items: TrafficSample[]): TrafficSample[] {
+  return items.map((sample, index) => {
+    if (index === 0) return { ...sample, rate_ul_bps: null, rate_dl_bps: null };
+    const previous = items[index - 1];
+    const elapsed = sample.epoch_s - previous.epoch_s;
+    if (elapsed <= 0) return { ...sample, rate_ul_bps: null, rate_dl_bps: null };
+    return {
+      ...sample,
+      rate_ul_bps: sample.bytes_ul_cum >= previous.bytes_ul_cum
+        ? Math.round(((sample.bytes_ul_cum - previous.bytes_ul_cum) * 8) / elapsed)
+        : null,
+      rate_dl_bps: sample.bytes_dl_cum >= previous.bytes_dl_cum
+        ? Math.round(((sample.bytes_dl_cum - previous.bytes_dl_cum) * 8) / elapsed)
+        : null,
+    };
+  });
+}
+
 export function fetchTrafficSamples(sessionId: string) {
   return polarisApi<TrafficSamplesResponse>(
     `/traffic/sessions/${encodeURIComponent(sessionId)}/samples`,
@@ -126,7 +146,7 @@ export function fetchTrafficSamples(sessionId: string) {
  * form submits only after this returns `null`. */
 export function validateTrafficRequest(body: TrafficSessionRequest): string | null {
   if (!body.ue_ids || body.ue_ids.length === 0) return 'TRAFFIC_SESSION_UE_IDS_REQUIRED';
-  const re = /^UE-(?:\d{2}|\d{5})$/;
+  const re = /^(?:UE-(?:\d{2}|\d{5})|LTE-SRSUE-TEST-01)$/;
   for (const id of body.ue_ids) {
     if (!re.test(id)) return 'TRAFFIC_SESSION_UE_ID_INVALID';
   }

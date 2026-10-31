@@ -1,5 +1,20 @@
 # @telecom/simulator-control — Changelog
 
+## 0.18.0 — 2026-10-31 — real laboratory sources only
+
+- Removes operational browser-local UE/scenario fallbacks; UE Manager,
+  Scenario Builder, Topology and Traffic Generator now require POLARIS APIs.
+- Joins the canonical srsUE profile with `/ues` runtime evidence and keeps
+  Attach, session and address `UNKNOWN` until the backend observes them.
+- Uses explicit N2/N3/S1/S1-U observations for topology link state and removes
+  hard-coded core addresses, versions, PLMN/TAC/slice and static PASS claims.
+- Sources the top-bar PLMN from `/plmns` and reports PLMN/TAC as `UNKNOWN`
+  when the API does not publish evidence instead of displaying lab defaults.
+- Selects Traffic Generator targets from the real inventory, accepts the
+  canonical LTE UE ID, and derives chart rates only from observed counters.
+- Consumes the backend-owned 13-template LTE/5G catalogue; no client fixture
+  is introduced into the operational build.
+
 ## 0.17.0 — 2026-10-31 — UE RAT and simulator evidence
 
 - Adds Technology and Simulator columns to the existing UE Manager table and

@@ -15,24 +15,18 @@ import { GenerateSubscribersDialog } from '@/subscribers/GenerateSubscribersDial
 
 type Tab = 'functions' | 'config' | 'subscribers';
 
-const PLMN = '001/01';
-const TAC = '200';
-const SNSSAI = '1/010203';
-const DNN = 'internet';
-const AMF_NGAP = '10.77.21.11:38412';
-const AMF_FIELD = '8000';
-const CORE_VERSION = 'Open5GS 2.8.0';
+const NOT_AVAILABLE = 'NOT_AVAILABLE';
 
 const NF_ROWS = [
-  { key: 'AMF', role: 'Access & mobility', detail: 'NGAP SCTP 38412 · 1 gNB connected' },
-  { key: 'SMF', role: 'Session management', detail: `PFCP to UPF · DNN ${DNN}` },
-  { key: 'UPF', role: 'User plane', detail: 'GTP-U 2152 · PFCP 8805' },
+  { key: 'AMF', role: 'Access & mobility', detail: 'NGAP endpoint not published' },
+  { key: 'SMF', role: 'Session management', detail: 'DNN not published' },
+  { key: 'UPF', role: 'User plane', detail: 'GTP-U/PFCP endpoints not published' },
   { key: 'NRF', role: 'Function repository', detail: 'NF registrations' },
   { key: 'AUSF', role: 'Authentication', detail: '5G-AKA' },
   { key: 'UDM', role: 'Subscriber data', detail: '' },
   { key: 'UDR', role: 'Subscriber repository', detail: 'MongoDB open5gs.subscribers' },
   { key: 'PCF', role: 'Policy', detail: '' },
-  { key: 'NSSF', role: 'Slice selection', detail: `S-NSSAI ${SNSSAI}` },
+  { key: 'NSSF', role: 'Slice selection', detail: 'S-NSSAI not published' },
   { key: 'BSF', role: 'Binding support', detail: '' },
 ] as const;
 
@@ -60,10 +54,10 @@ export function CoreOpen5gsPage() {
         title="Core · Open5GS"
         desc={
           <>
-            {CORE_VERSION} running the lab 5G core. Observe first; subscriber changes need a confirmation and a
+            Open5GS laboratory core. Version is {NOT_AVAILABLE}. Observe first; subscriber changes need a confirmation and a
             database backup; configuration edits come last.
             <span className="block text-ep-xs mt-1 text-mute">
-              {amfBadge.label} · source <code className="mono">/lab.observed.open5gs</code> = oiran-lab-amf-1
+              {amfBadge.label} · source <code className="mono">/lab.observed.open5gs</code>
             </span>
           </>
         }
@@ -107,7 +101,7 @@ export function CoreOpen5gsPage() {
                   const container = pickContainer(row.key, observed);
                   const stateLabel = containerLabel(row.key, container);
                   const tone = containerTone(container);
-                  const addr = row.key === 'AMF' ? AMF_NGAP : '—';
+                  const addr = NOT_AVAILABLE;
                   return (
                     <tr key={row.key} className="border-b border-line last:border-0" data-testid={`core-nf-${row.key}`}>
                       <td className="px-4 py-3">
@@ -148,27 +142,27 @@ export function CoreOpen5gsPage() {
               <dl className="grid grid-cols-2 gap-x-4 gap-y-3 text-ep-md">
                 <div>
                   <dt className="text-ep-xs uppercase tracking-wider text-mute">PLMN</dt>
-                  <dd className="mono">{PLMN}</dd>
+                  <dd className="mono">{NOT_AVAILABLE}</dd>
                 </div>
                 <div>
                   <dt className="text-ep-xs uppercase tracking-wider text-mute">AMF NGAP</dt>
-                  <dd className="mono">{AMF_NGAP}</dd>
+                  <dd className="mono">{NOT_AVAILABLE}</dd>
                 </div>
                 <div>
                   <dt className="text-ep-xs uppercase tracking-wider text-mute">TAI list</dt>
-                  <dd className="mono">TAC {TAC}</dd>
+                  <dd className="mono">{NOT_AVAILABLE}</dd>
                 </div>
                 <div>
                   <dt className="text-ep-xs uppercase tracking-wider text-mute">S-NSSAI</dt>
-                  <dd className="mono">{SNSSAI}</dd>
+                  <dd className="mono">{NOT_AVAILABLE}</dd>
                 </div>
                 <div>
                   <dt className="text-ep-xs uppercase tracking-wider text-mute">DNN</dt>
-                  <dd className="mono">{DNN}</dd>
+                  <dd className="mono">{NOT_AVAILABLE}</dd>
                 </div>
                 <div>
                   <dt className="text-ep-xs uppercase tracking-wider text-mute">AMF field</dt>
-                  <dd className="mono">{AMF_FIELD}</dd>
+                  <dd className="mono">{NOT_AVAILABLE}</dd>
                 </div>
                 <div className="col-span-2">
                   <dt className="text-ep-xs uppercase tracking-wider text-mute">Approved destinations</dt>
@@ -194,20 +188,20 @@ export function CoreOpen5gsPage() {
             <h2 className="text-ep-xl font-semibold mb-3">Consistency checks</h2>
             <ul className="flex flex-col gap-2.5 text-ep-md">
               <li className="flex items-center justify-between gap-3">
-                <span>GNB-01 PLMN equals core PLMN</span>
-                <Pill tone="ok">PASS</Pill>
+                <span>GNB PLMN equals core PLMN</span>
+                <Pill tone="mute">UNKNOWN</Pill>
               </li>
               <li className="flex items-center justify-between gap-3">
-                <span>GNB-01 TAC {TAC} is in the TAI list</span>
-                <Pill tone="ok">PASS</Pill>
+                <span>gNB TAC is in the TAI list</span>
+                <Pill tone="mute">UNKNOWN</Pill>
               </li>
               <li className="flex items-center justify-between gap-3">
-                <span>GNB-02 plan uses the same PLMN, TAC and slice</span>
-                <Pill tone="ok">PASS</Pill>
+                <span>Configured gNBs use the same PLMN, TAC and slice</span>
+                <Pill tone="mute">UNKNOWN</Pill>
               </li>
               <li className="flex items-center justify-between gap-3">
                 <span>Every UE profile slice is served</span>
-                <Pill tone="ok">PASS</Pill>
+                <Pill tone="mute">UNKNOWN</Pill>
               </li>
             </ul>
             <p className="mt-3 border-t border-line pt-3 text-ep-xs text-mute">
@@ -283,7 +277,8 @@ export function CoreOpen5gsPage() {
                           )}
                         </td>
                         <td className="px-3 py-2.5 mono text-ep-sm">
-                          {SNSSAI} · {DNN}
+                          {row?.sd ? `SST ${row.sst}/${row.sd}` : `SST ${row?.sst ?? NOT_AVAILABLE}`} ·{' '}
+                          {row?.dnns?.join(', ') || NOT_AVAILABLE}
                         </td>
                         <td className="px-4 py-2.5 text-right">
                           <button

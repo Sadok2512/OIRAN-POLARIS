@@ -68,6 +68,19 @@ export function linkState(
   return 'configured';
 }
 
+export function observedLinkState(
+  processState: string | null | undefined,
+  observedState: string | null | undefined,
+): LinkState {
+  const process = (processState ?? '').toUpperCase();
+  const observed = (observedState ?? '').toUpperCase();
+  if (!observed || observed === 'UNKNOWN' || observed === 'NOT_OBSERVED' || observed === 'NOT_AVAILABLE') {
+    return 'unknown';
+  }
+  if (process !== 'RUNNING') return 'down';
+  return ['CONNECTED', 'READY', 'ACTIVE', 'UP'].includes(observed) ? 'configured' : 'down';
+}
+
 type NfPillTone = 'success' | 'warning' | 'danger' | 'neutral';
 type NfPillState = { tone: NfPillTone; title: string };
 
@@ -121,13 +134,13 @@ export function TopologyPage() {
   const nodeList = nodes.data?.items ?? [];
   const any5gLinkUp = nodeList.some(
     (n) => n.technology.includes('5G') && (
-      linkState(n.process_state, n.n2_endpoint) === 'configured' ||
-      linkState(n.process_state, n.n3_endpoint) === 'configured'),
+      observedLinkState(n.process_state, n.n2_state) === 'configured' ||
+      observedLinkState(n.process_state, n.n3_state) === 'configured'),
   );
   const anyLteLinkUp = nodeList.some(
-    (n) => n.technology === 'LTE' && (
-      linkState(n.process_state, n.n2_endpoint) === 'configured' ||
-      linkState(n.process_state, n.n3_endpoint) === 'configured'),
+    (n) => /LTE/i.test(n.technology) && (
+      observedLinkState(n.process_state, n.s1_state) === 'configured' ||
+      observedLinkState(n.process_state, n.s1u_state) === 'configured'),
   );
 
   return (
@@ -144,7 +157,6 @@ export function TopologyPage() {
             <Pill tone={anyLteLinkUp ? 'ok' : 'mute'} dot={anyLteLinkUp ? 'live' : undefined}>
               {anyLteLinkUp ? 'S1-MME / S1-U configured' : 'S1-MME / S1-U UNKNOWN'}
             </Pill>
-            {import.meta.env.VITE_POLARIS_DEMO_MODE === '1' ? <Pill tone="warn">DEMO TOPOLOGY</Pill> : null}
           </div>
         }
       />
@@ -254,15 +266,15 @@ function AccessTopology({
       <AccessChain
         label="5G SA — UERANSIM"
         testId="topology-chain-5g"
-        core={<CoreBlock observed={observed} coreLabel={coreLabel} title="Open5GS 5GC · 5G SA" catalogue={FIVE_G_NF_CATALOGUE} testId="topology-core-5g" metadata="PLMN 001/01 · S-NSSAI 1/010203 · DNN internet" />}
+        core={<CoreBlock observed={observed} coreLabel={coreLabel} title="Open5GS 5GC · 5G SA" catalogue={FIVE_G_NF_CATALOGUE} testId="topology-core-5g" metadata="PLMN/S-NSSAI/DNN NOT_AVAILABLE" />}
         nodes={nodes.filter((node) => node.technology.includes('5G'))}
         uesByNode={uesByNode}
       />
       <AccessChain
         label="LTE 4G — srsRAN"
         testId="topology-chain-lte"
-        core={<CoreBlock observed={observed} coreLabel={catalogueCoreTone(LTE_NF_CATALOGUE, observed)} title="Open5GS EPC · LTE 4G" catalogue={LTE_NF_CATALOGUE} testId="topology-core-lte" metadata="PLMN 001/01 · APN internet" />}
-        nodes={nodes.filter((node) => node.technology === 'LTE')}
+        core={<CoreBlock observed={observed} coreLabel={catalogueCoreTone(LTE_NF_CATALOGUE, observed)} title="Open5GS EPC · LTE 4G" catalogue={LTE_NF_CATALOGUE} testId="topology-core-lte" metadata="PLMN/APN NOT_AVAILABLE" />}
+        nodes={nodes.filter((node) => /LTE/i.test(node.technology))}
         uesByNode={uesByNode}
       />
     </div>
@@ -290,11 +302,15 @@ function AccessChain({ label, testId, core, nodes, uesByNode }: {
 }
 
 function GnbColumn({ node, attachedUes }: { node: NodeItem; attachedUes: UeState[] }) {
-  const isLte = node.technology === 'LTE';
+  const isLte = /LTE/i.test(node.technology);
   const controlLabel = isLte ? 'S1-MME · S1AP' : 'N2 · NGAP';
   const userLabel = isLte ? 'S1-U · GTP-U' : 'N3 · GTP-U';
-  const controlState = linkState(node.process_state, node.n2_endpoint);
-  const userState = linkState(node.process_state, node.n3_endpoint);
+  const controlState = isLte
+    ? observedLinkState(node.process_state, node.s1_state)
+    : observedLinkState(node.process_state, node.n2_state);
+  const userState = isLte
+    ? observedLinkState(node.process_state, node.s1u_state)
+    : observedLinkState(node.process_state, node.n3_state);
   const running = (node.process_state ?? '').toLowerCase() === 'running';
   const stateLabel = running ? 'ACTIVE' : node.configured ? node.process_state : 'PLANNED';
 

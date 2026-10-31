@@ -288,6 +288,8 @@ export interface SubscriberSlotRow {
   identity: string | null;
   ambr: { uplink: number; downlink: number } | null;
   sd: string | null;
+  sst: number | null;
+  dnns: string[];
 }
 
 /** Backend contract: GET /subscribers → directory of provisioned slots.
@@ -324,9 +326,13 @@ export function useSubscriberSlots() {
           ambrRaw && typeof ambrRaw.uplink === 'number' && typeof ambrRaw.downlink === 'number'
             ? { uplink: ambrRaw.uplink, downlink: ambrRaw.downlink }
             : null;
-        const snssaiRaw = record.snssai as { sd?: string | null } | undefined;
+        const snssaiRaw = record.snssai as { sst?: number; sd?: string | null } | undefined;
         const sd = snssaiRaw && typeof snssaiRaw.sd === 'string' ? snssaiRaw.sd : null;
-        return [{ slot, state, identity, ambr, sd }];
+        const sst = snssaiRaw && typeof snssaiRaw.sst === 'number' ? snssaiRaw.sst : null;
+        const dnns = Array.isArray(record.dnns)
+          ? record.dnns.filter((dnn): dnn is string => typeof dnn === 'string')
+          : [];
+        return [{ slot, state, identity, ambr, sd, sst, dnns }];
       });
     },
     staleTime: 15_000,

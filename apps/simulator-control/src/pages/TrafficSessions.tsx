@@ -18,12 +18,12 @@
 //   - iperf3 is measurement, never blocking: warnings in the IPERF3_*
 //     vocabulary appear as yellow chips, never red failures.
 
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Activity, Download, StopCircle, Upload, Zap } from 'lucide-react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Btn, Card, PageHeader, Pill } from '@/components/mockup';
 import { ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
-import { useAuth } from '@/data/queries';
+import { useAuth, useLteProfile, useLteStatus, useUes } from '@/data/queries';
 import {
   TRAFFIC_DURATION_S_MAX,
   TRAFFIC_DURATION_S_MIN,
@@ -35,6 +35,7 @@ import {
   startTrafficSession,
   stopTrafficSession,
   validateTrafficRequest,
+  deriveObservedRates,
   type TrafficDirection,
   type TrafficProtocol,
   type TrafficSession,
@@ -43,7 +44,6 @@ import {
 import { TrafficSparkline } from '@/components/TrafficSparkline';
 import { ApiError } from '@shared/api';
 import { TechnologySelector, type RadioTechnology } from '@/components/TechnologySelector';
-import { useLteStatus } from '@/data/queries';
 
 const QUERY_KEY = ['polaris', 'traffic-sessions'] as const;
 
@@ -88,7 +88,7 @@ function TrafficSparklineRow({ session }: { session: TrafficSession }) {
       data-testid={`traffic-sparkline-row-${session.session_id}`}
     >
       <TrafficSparkline
-        samples={samples.data ?? []}
+        samples={deriveObservedRates(samples.data ?? [])}
         label={session.session_id}
       />
       <div className="text-xs2 text-mute flex flex-col gap-0.5">
@@ -110,15 +110,32 @@ export function TrafficSessionsPage() {
   const canOperate = auth.data?.can_start === true;
   const client = useQueryClient();
   const lte = useLteStatus();
+  const lteProfile = useLteProfile();
+  const ueInventory = useUes();
   const lteTrafficAllowed = lte.data?.traffic_allowed === true;
 
-  const [ueIds, setUeIds] = useState('UE-01');
+  const [ueIds, setUeIds] = useState('');
   const [technology, setTechnology] = useState<RadioTechnology>('5G_SA');
   const [direction, setDirection] = useState<TrafficDirection>('BOTH');
   const [protocol, setProtocol] = useState<TrafficProtocol>('UDP');
   const [rateMbps, setRateMbps] = useState(5);
   const [durationS, setDurationS] = useState(30);
   const [formError, setFormError] = useState<string | null>(null);
+
+  const eligibleUeIds = useMemo(() => {
+    if (technology === 'LTE') {
+      return lteProfile.data?.profile_id === 'LTE-SRSUE-TEST-01'
+        ? [lteProfile.data.profile_id]
+        : [];
+    }
+    return (ueInventory.data?.items ?? [])
+      .filter((ue) => !/LTE/i.test(ue.technology ?? '') && !/srs/i.test(ue.simulator ?? ''))
+      .map((ue) => ue.internal_ue_id ?? ue.id);
+  }, [technology, lteProfile.data, ueInventory.data?.items]);
+
+  useEffect(() => {
+    setUeIds((current) => eligibleUeIds.includes(current) ? current : (eligibleUeIds[0] ?? ''));
+  }, [eligibleUeIds]);
 
   const list = useQuery({
     queryKey: QUERY_KEY,
@@ -181,7 +198,7 @@ export function TrafficSessionsPage() {
           value={technology}
           onChange={(next) => {
             setTechnology(next);
-            setUeIds(next === 'LTE' ? 'LTE-SRSUE-TEST-01' : 'UE-01');
+            setUeIds('');
             if (next === 'LTE') {
               setProtocol('UDP');
               setRateMbps(1);
@@ -202,13 +219,15 @@ export function TrafficSessionsPage() {
             <span className="text-xs2 uppercase tracking-wider text-mute">
               UE ids (comma or space separated)
             </span>
-            <input
+            <select
               className="h-9 px-3 rounded-md border border-line bg-surface text-md2 text-ink mono"
-              placeholder="UE-01, UE-02"
               value={ueIds}
               onChange={(e) => setUeIds(e.target.value)}
               data-testid="traffic-ue-ids"
-            />
+            >
+              <option value="">No observed/configured UE available</option>
+              {eligibleUeIds.map((id) => <option key={id} value={id}>{id}</option>)}
+            </select>
           </label>
           <label className="flex flex-col gap-1 text-sm2">
             <span className="text-xs2 uppercase tracking-wider text-mute">Direction</span>
@@ -270,7 +289,7 @@ export function TrafficSessionsPage() {
             icon={Zap}
             primary
             onClick={submit}
-            disabled={!canOperate || start.isPending || (technology === 'LTE' && !lteTrafficAllowed)}
+            disabled={!canOperate || !ueIds || start.isPending || (technology === 'LTE' && !lteTrafficAllowed)}
             title={technology === 'LTE' && !lteTrafficAllowed ? 'LTE requires certification, valid grant, verified controller ownership, current attach/IP/session and safety gates.' : canOperate ? undefined : 'Rôle operator requis + grant actif.'}
             data-testid="traffic-start"
           >

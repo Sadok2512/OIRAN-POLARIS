@@ -80,7 +80,7 @@ describe('Core · Open5GS', () => {
       expect(header.textContent).toMatch(/AMF container: running, healthy/);
     });
     expect(header.textContent).toMatch(/\/lab\.observed\.open5gs/);
-    expect(header.textContent).toMatch(/oiran-lab-amf-1/);
+    expect(header.textContent).not.toMatch(/oiran-lab-amf-1/);
     // The old "5G Core HEALTHY" aggregate wording must be gone.
     expect(header.textContent).not.toMatch(/5G Core HEALTHY/);
   });

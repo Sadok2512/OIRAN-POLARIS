@@ -9,15 +9,14 @@ import {
   useLogout,
   useScenarioCapabilities,
 } from '@/data/queries';
-import { useAssignments, useScenarios } from '@/scenarios/store';
-import { setFlag, useFeatureFlags } from '@/data/featureFlags';
+import { useScenarioLibrary } from '@/scenarios/library';
+import { useFeatureFlags } from '@/data/featureFlags';
 
 export function SettingsPage() {
   const auth = useAuth();
   const capabilities = useCapabilities();
   const scenarioCapabilities = useScenarioCapabilities();
-  const library = useScenarios();
-  const assignments = useAssignments();
+  const library = useScenarioLibrary();
   const login = useLogin();
   const logout = useLogout();
   const flags = useFeatureFlags();
@@ -158,18 +157,18 @@ export function SettingsPage() {
         </section>
 
         <section className="ep-card p-5">
-          <h2 className="text-ep-md font-semibold mb-2">Local scenario catalog</h2>
+          <h2 className="text-ep-md font-semibold mb-2">Operational data sources</h2>
           <dl className="grid grid-cols-2 gap-x-5 gap-y-1 text-ep-sm">
-            <dt className="text-text-secondary">Scenarios saved locally</dt>
+            <dt className="text-text-secondary">Backend scenarios</dt>
             <dd className="num">{library.scenarios.length}</dd>
-            <dt className="text-text-secondary">UE assignments</dt>
-            <dd className="num">{assignments.assignments.length}</dd>
+            <dt className="text-text-secondary">Browser fixtures</dt>
+            <dd>DISABLED</dd>
             <dt className="text-text-secondary">Persistence</dt>
-            <dd>localStorage (polaris.scenarios.v1 / polaris.assignments.v1)</dd>
+            <dd>POLARIS API only</dd>
             <dt className="text-text-secondary">Server-side CRUD</dt>
             <dd>
               polaris-control-api 0.10.0+:{' '}
-              <code className="mono">/scenario-definitions</code> (flag-gated)
+              <code className="mono">/scenario-definitions</code> (required)
             </dd>
           </dl>
           <label
@@ -179,7 +178,7 @@ export function SettingsPage() {
             <input
               type="checkbox"
               checked={flags.scenarioBackend}
-              onChange={(event) => setFlag('scenarioBackend', event.target.checked)}
+              disabled
               data-testid="flag-scenario-backend-toggle"
             />
             <span>
@@ -195,9 +194,7 @@ export function SettingsPage() {
                 className={`block text-ep-xs mt-1 ${flags.scenarioBackend ? 'text-text-secondary' : 'text-warning'}`}
                 data-testid="flag-scenario-backend-offline-note"
               >
-                {flags.scenarioBackend
-                  ? 'Honest Builder: backend-certified palette only, offline-draft disabled.'
-                  : 'Offline draft mode — scenarios stay in localStorage (polaris.scenarios.v1). Nothing reaches the backend; non-certified step kinds become editable again.'}
+                Backend-certified palette only; offline draft mode is disabled.
               </span>
             </span>
           </label>
@@ -208,7 +205,7 @@ export function SettingsPage() {
             <input
               type="checkbox"
               checked={flags.profileBackend}
-              onChange={(event) => setFlag('profileBackend', event.target.checked)}
+              disabled
               data-testid="flag-profile-backend-toggle"
             />
             <span>

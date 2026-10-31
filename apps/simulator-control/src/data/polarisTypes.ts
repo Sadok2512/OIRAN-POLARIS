@@ -99,6 +99,11 @@ export interface NodeItem {
   link_ip: string;
   n2_endpoint: string | null;
   n3_endpoint: string | null;
+  n2_state?: string;
+  n3_state?: string;
+  s1_state?: string;
+  s1u_state?: string;
+  epc_state?: string;
   process_state: string;
   health: string;
   configured: boolean;
@@ -187,6 +192,10 @@ export interface LteStatus {
 export interface LteProfile {
   schema_version: 'polaris.lte-profile.v1';
   profile_id: 'LTE-SRSUE-TEST-01';
+  technology: 'LTE 4G';
+  simulator: 'srsUE';
+  serving_ran: 'ENB-01';
+  serving_ran_type: 'srsENB';
   revision: number;
   owner: 'POLARIS_CONTROLLER';
   enabled: boolean;
@@ -194,12 +203,13 @@ export interface LteProfile {
   apn: string;
   max_running_ues: number;
   configuration_sha256: string;
-  compose_model_sha256: string;
+  compose_model_sha256: string | null;
   scenario_id: 'lte-e2e-certification-v1';
   scenario_revision: 1;
   scenario_sha256: string;
   grant_required: true;
   evidence_schema: 'oiran-polaris.lte-e2e-evidence.v1';
+  last_observed_at_epoch_s: number | null;
 }
 
 export interface UeProfile {

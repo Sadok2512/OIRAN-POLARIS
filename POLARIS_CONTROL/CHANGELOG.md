@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.25.0 (polaris-control-api) — 2026-10-31 — real-lab evidence only
+
+- Makes `/nodes` publish Docker/process/socket and srsRAN observations with
+  explicit evidence sources; unavailable PLMN, cell, address and interface
+  evidence stays `NOT_AVAILABLE` or `NOT_OBSERVED`.
+- Enriches the canonical LTE profile contract for UE Manager and derives its
+  runtime/APN/timestamp fields from current srsRAN observation.
+- Removes requested-rate traffic accounting fallback: unavailable UERANSIM or
+  iperf measurement now fails the session without emitting synthetic samples.
+- Preserves Grant V2, RBAC, CSRF, ownership, bounded cleanup and the immutable
+  13-template LTE/5G catalogue introduced in 0.24.0.
+
 ## 0.24.0 (polaris-control-api) — 2026-10-31 — professional default scenario catalogue
 
 - Adds the versioned read-only `/scenario-templates` catalogue with six LTE
