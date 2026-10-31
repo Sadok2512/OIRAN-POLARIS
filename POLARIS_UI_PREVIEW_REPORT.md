@@ -12,6 +12,7 @@ Live LTE/5G, grant et trafic: **non exécutés**
 - Branche: `preview/polaris-lte-ui-v1`
 - Base demandée: `671282b6e4b540722f82f896d2a95aece924fc51`
 - Base de travail avant le commit preview: `75bf23134236c38505db3b3fd185dee2f34c7d75`
+- Commit d'implémentation preview testé: `dd7b334de296e0f90c5e1500971a1ac43cca4013`
 - Frontend: `@telecom/simulator-control` **0.15.1**
 
 Lignée vérifiée manuellement:
