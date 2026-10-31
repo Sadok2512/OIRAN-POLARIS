@@ -1,0 +1,1882 @@
+{
+  "data": {
+    "accounting": {
+      "background_events": 0,
+      "duplicate_events": 0,
+      "extra_events": 0,
+      "session_events": 23,
+      "source_events": 23,
+      "unmatched_events": 0
+    },
+    "callflow_id": "cf-5g-session-749c5eeb11c552c3",
+    "capture_references": [
+      "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+      "sha256:314d0278212dd9c65f1d3643e7f02a5ba8271b9c9f68c1f300a7b6321f553e50",
+      "sha256:b6fc9d77ceba5964a1d2a73c1b49a991ad1daf0818f64a50b8b4fefeade5e519"
+    ],
+    "correlation_edges": [
+      {
+        "confidence": "EXACT",
+        "edge_id": "edge-n4-n3-discovered-teid-endpoint-evt-60d1eb5b16af0bcc-evt-554d68dfdb3022e9",
+        "evidence_description": "A unique PFCP F-TEID endpoint matches the directional GTP-U tunnel",
+        "evidence_type": "EXACT_CONTEXT_MATCH",
+        "limitations": [],
+        "matching_identifiers": [
+          "teid=0x0000003f",
+          "endpoints=10.77.22.13<->10.77.22.20"
+        ],
+        "packet_references": [
+          {
+            "byte_offset": 63280,
+            "captured_length": 117,
+            "interface_id": 0,
+            "original_length": 117,
+            "packet_number": 677,
+            "source_file": "capture://N4.pcap-314d0278212dd9c6.pcapng"
+          },
+          {
+            "byte_offset": 292,
+            "captured_length": 118,
+            "interface_id": 0,
+            "original_length": 118,
+            "packet_number": 1,
+            "source_file": "capture://N3.pcap-b6fc9d77ceba5964.pcapng"
+          },
+          {
+            "byte_offset": 163599104,
+            "captured_length": 110,
+            "interface_id": 0,
+            "original_length": 110,
+            "packet_number": 150774,
+            "source_file": "capture://N3.pcap-b6fc9d77ceba5964.pcapng"
+          }
+        ],
+        "rule_id": "n4-n3-discovered-teid-endpoint",
+        "rule_version": "1.1.0",
+        "scope": "",
+        "source_event_id": "evt-60d1eb5b16af0bcc",
+        "source_interface": "N4",
+        "target_event_id": "evt-554d68dfdb3022e9",
+        "target_interface": "N3"
+      },
+      {
+        "confidence": "EXACT",
+        "edge_id": "edge-n4-n3-discovered-teid-endpoint-evt-67ae6e3ca7015aab-evt-a220527e5d183958",
+        "evidence_description": "A unique PFCP F-TEID endpoint matches the directional GTP-U tunnel",
+        "evidence_type": "EXACT_CONTEXT_MATCH",
+        "limitations": [],
+        "matching_identifiers": [
+          "teid=0x0000f68d",
+          "endpoints=10.77.22.20<->10.77.22.13"
+        ],
+        "packet_references": [
+          {
+            "byte_offset": 63088,
+            "captured_length": 158,
+            "interface_id": 0,
+            "original_length": 158,
+            "packet_number": 676,
+            "source_file": "capture://N4.pcap-314d0278212dd9c6.pcapng"
+          },
+          {
+            "byte_offset": 444,
+            "captured_length": 118,
+            "interface_id": 0,
+            "original_length": 118,
+            "packet_number": 2,
+            "source_file": "capture://N3.pcap-b6fc9d77ceba5964.pcapng"
+          },
+          {
+            "byte_offset": 163599392,
+            "captured_length": 110,
+            "interface_id": 0,
+            "original_length": 110,
+            "packet_number": 150776,
+            "source_file": "capture://N3.pcap-b6fc9d77ceba5964.pcapng"
+          }
+        ],
+        "rule_id": "n4-n3-discovered-teid-endpoint",
+        "rule_version": "1.1.0",
+        "scope": "",
+        "source_event_id": "evt-67ae6e3ca7015aab",
+        "source_interface": "N4",
+        "target_event_id": "evt-a220527e5d183958",
+        "target_interface": "N3"
+      },
+      {
+        "confidence": "EXACT",
+        "edge_id": "edge-ngap-pfcp-exact-tunnel-evt-068cbc345f220cbe-evt-60d1eb5b16af0bcc",
+        "evidence_description": "A unique NGAP UP transport endpoint/TEID equals a unique PFCP Created-PDR F-TEID in the same capture scope",
+        "evidence_type": "EXACT_TUNNEL_MATCH",
+        "limitations": [
+          "The tunnel match does not by itself prove UE or full session identity"
+        ],
+        "matching_identifiers": [
+          "endpoint_ip=10.77.22.20",
+          "teid=0x3f",
+          "capture_scope=continuous-lab-import"
+        ],
+        "packet_references": [
+          {
+            "byte_offset": 102244,
+            "captured_length": 126,
+            "interface_id": 0,
+            "original_length": 126,
+            "packet_number": 725,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          },
+          {
+            "byte_offset": 63280,
+            "captured_length": 117,
+            "interface_id": 0,
+            "original_length": 117,
+            "packet_number": 677,
+            "source_file": "capture://N4.pcap-314d0278212dd9c6.pcapng"
+          }
+        ],
+        "rule_id": "ngap-pfcp-exact-tunnel",
+        "rule_version": "2.0.0",
+        "scope": "tunnel-only",
+        "source_event_id": "evt-068cbc345f220cbe",
+        "source_interface": "N2",
+        "target_event_id": "evt-60d1eb5b16af0bcc",
+        "target_interface": "N4"
+      },
+      {
+        "confidence": "EXACT",
+        "edge_id": "edge-ngap-pfcp-exact-tunnel-evt-f948afb374cd5437-evt-67ae6e3ca7015aab",
+        "evidence_description": "A unique NGAP UP transport endpoint/TEID equals a unique PFCP Created-PDR F-TEID in the same capture scope",
+        "evidence_type": "EXACT_TUNNEL_MATCH",
+        "limitations": [
+          "The tunnel match does not by itself prove UE or full session identity"
+        ],
+        "matching_identifiers": [
+          "endpoint_ip=10.77.22.13",
+          "teid=0xf68d",
+          "capture_scope=continuous-lab-import"
+        ],
+        "packet_references": [
+          {
+            "byte_offset": 101864,
+            "captured_length": 250,
+            "interface_id": 0,
+            "original_length": 250,
+            "packet_number": 723,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          },
+          {
+            "byte_offset": 63088,
+            "captured_length": 158,
+            "interface_id": 0,
+            "original_length": 158,
+            "packet_number": 676,
+            "source_file": "capture://N4.pcap-314d0278212dd9c6.pcapng"
+          }
+        ],
+        "rule_id": "ngap-pfcp-exact-tunnel",
+        "rule_version": "2.0.0",
+        "scope": "tunnel-only",
+        "source_event_id": "evt-f948afb374cd5437",
+        "source_interface": "N2",
+        "target_event_id": "evt-67ae6e3ca7015aab",
+        "target_interface": "N4"
+      }
+    ],
+    "correlation_status": {
+      "E2E": "UNKNOWN",
+      "N2_N4": "EXACT",
+      "N2_SBI": "UNKNOWN",
+      "N4_N3": "EXACT",
+      "SBI_N4": "UNKNOWN"
+    },
+    "decoder_versions": {
+      "decoder-ngap": "0.6.0",
+      "decoder-pfcp": "0.2.0",
+      "live-probe-n3-flow-aggregator": "0.2.6"
+    },
+    "end_timestamp": "1793404571.961283816Z",
+    "events": [
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 38,
+            "length": 26,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          },
+          {
+            "id": 121,
+            "length": 19,
+            "name": "UserLocationInformation",
+            "raw_sha256": "a8190792022b078b41c1de4debfdbb5b95ed96a3aaa55e2caa102dfe4dbe8c61",
+            "status": "DECODED",
+            "value": "plmn=001-01,nr_cell_id=0x000000010,tai_plmn=001-01,tac=0x0000c8,location_timestamp=4002392711"
+          },
+          {
+            "id": 90,
+            "length": 1,
+            "name": "RRCEstablishmentCause",
+            "raw_sha256": "452ba1ddef80246c48be7690193c76c1d61185906be9401014fe14f1be64b74f",
+            "status": "DECODED",
+            "value": "rrc_establishment_cause=3"
+          },
+          {
+            "id": 112,
+            "length": 1,
+            "name": "UEContextRequest",
+            "raw_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+            "status": "DECODED",
+            "value": "ue_context_request=0"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "AMF",
+        "direction": "RAN_TO_CORE",
+        "errors": [],
+        "event_id": "evt-e55a0f6606d64834",
+        "interface": "N2",
+        "message_name": "InitialUEMessage",
+        "packet_references": [
+          {
+            "byte_offset": 99692,
+            "captured_length": 138,
+            "interface_id": 0,
+            "original_length": 138,
+            "packet_number": 711,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:02ade043b3dcd34095ffa1b6c28e443c69168fdb0e42380baf1f34c82223f6c9",
+        "semantic_status": "NORMAL",
+        "source_participant": "gNB",
+        "timestamp": "1793403911.939460239Z",
+        "timestamp_ns": "1793403911939460239"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 38,
+            "length": 43,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "gNB",
+        "direction": "CORE_TO_RAN",
+        "errors": [],
+        "event_id": "evt-047029ed63068c93",
+        "interface": "N2",
+        "message_name": "DownlinkNASTransport",
+        "packet_references": [
+          {
+            "byte_offset": 99864,
+            "captured_length": 146,
+            "interface_id": 0,
+            "original_length": 146,
+            "packet_number": 712,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:ff07b662284902b78c7520aaa41501cf9e19bf0d0a44f80e96f0aa99cd1914a8",
+        "semantic_status": "NORMAL",
+        "source_participant": "AMF",
+        "timestamp": "1793403911.998627078Z",
+        "timestamp_ns": "1793403911998627078"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 38,
+            "length": 22,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          },
+          {
+            "id": 121,
+            "length": 19,
+            "name": "UserLocationInformation",
+            "raw_sha256": "4c7bfd2a9cdc66cbb1b5b9b36bbabb7701dd63b3346bde6a38601892a9fa16ab",
+            "status": "DECODED",
+            "value": "plmn=001-01,nr_cell_id=0x000000010,tai_plmn=001-01,tac=0x0000c8,location_timestamp=4002392712"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "AMF",
+        "direction": "RAN_TO_CORE",
+        "errors": [],
+        "event_id": "evt-b8ac067c12df311e",
+        "interface": "N2",
+        "message_name": "UplinkNASTransport",
+        "packet_references": [
+          {
+            "byte_offset": 100044,
+            "captured_length": 146,
+            "interface_id": 0,
+            "original_length": 146,
+            "packet_number": 713,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:fdf10eb3055869ba981a3d0bfa407fe26ec04f56eb7e0c6390a386a5f20d2c12",
+        "semantic_status": "NORMAL",
+        "source_participant": "gNB",
+        "timestamp": "1793403912.002242010Z",
+        "timestamp_ns": "1793403912002242010"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 38,
+            "length": 22,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "gNB",
+        "direction": "CORE_TO_RAN",
+        "errors": [],
+        "event_id": "evt-cce134f33c98a004",
+        "interface": "N2",
+        "message_name": "DownlinkNASTransport",
+        "packet_references": [
+          {
+            "byte_offset": 100224,
+            "captured_length": 126,
+            "interface_id": 0,
+            "original_length": 126,
+            "packet_number": 714,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:dcfd4e5c6cd2ec1b97d209be8ad2ee034d58e18a6e83d797d90185d40995329a",
+        "semantic_status": "NORMAL",
+        "source_participant": "AMF",
+        "timestamp": "1793403912.015941511Z",
+        "timestamp_ns": "1793403912015941511"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 38,
+            "length": 64,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          },
+          {
+            "id": 121,
+            "length": 19,
+            "name": "UserLocationInformation",
+            "raw_sha256": "4c7bfd2a9cdc66cbb1b5b9b36bbabb7701dd63b3346bde6a38601892a9fa16ab",
+            "status": "DECODED",
+            "value": "plmn=001-01,nr_cell_id=0x000000010,tai_plmn=001-01,tac=0x0000c8,location_timestamp=4002392712"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "AMF",
+        "direction": "RAN_TO_CORE",
+        "errors": [],
+        "event_id": "evt-2f32f2a87361defc",
+        "interface": "N2",
+        "message_name": "UplinkNASTransport",
+        "packet_references": [
+          {
+            "byte_offset": 100384,
+            "captured_length": 190,
+            "interface_id": 0,
+            "original_length": 190,
+            "packet_number": 715,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:9ef8cb1539505571630312b998e9ec48eff7436cc0d37e44d8bc817d8b0bbb79",
+        "semantic_status": "NORMAL",
+        "source_participant": "gNB",
+        "timestamp": "1793403912.017467981Z",
+        "timestamp_ns": "1793403912017467981"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 28,
+            "length": 7,
+            "name": "GUAMI",
+            "raw_sha256": "5b4ffb3a68bac67b4bf82aedb5faf2cddea55a590b479aac454c03453a3b7898",
+            "status": "DECODED",
+            "value": "plmn=001-01,amf_region=2,amf_set_id=1,amf_pointer=0"
+          },
+          {
+            "id": 0,
+            "length": 5,
+            "name": "AllowedNSSAI",
+            "raw_sha256": "c76696fe17e607ec95d416eff4278a1cc564a4fded482221f78f8cfa23318022",
+            "status": "DECODED",
+            "value": "allowed_nssai_count=1,sst=1,sd=010203"
+          },
+          {
+            "id": 119,
+            "length": 9,
+            "name": "UESecurityCapabilities",
+            "raw_sha256": "b801451477f26c3ceafd251a8d627d6690fdbd9bfcd882678d92e81c37f37093",
+            "status": "DECODED",
+            "value": "nr_encryption=0xe000,nr_integrity=0xe000,eutra_encryption=0xe000,eutra_integrity=0xe000"
+          },
+          {
+            "id": 94,
+            "length": 32,
+            "name": "SecurityKey",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          },
+          {
+            "id": 34,
+            "length": 8,
+            "name": "MaskedIMEISV",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          },
+          {
+            "id": 38,
+            "length": 50,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "gNB",
+        "direction": "CORE_TO_RAN",
+        "errors": [],
+        "event_id": "evt-74603f774488257d",
+        "interface": "N2",
+        "message_name": "InitialContextSetupRequest",
+        "packet_references": [
+          {
+            "byte_offset": 100896,
+            "captured_length": 234,
+            "interface_id": 0,
+            "original_length": 234,
+            "packet_number": 718,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:0285fd643e4a1bc3de09b28ed828ffe8e9202a6a9d1179e40bd8aa453f54404b",
+        "semantic_status": "NORMAL",
+        "source_participant": "AMF",
+        "timestamp": "1793403912.062799773Z",
+        "timestamp_ns": "1793403912062799773"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "AMF",
+        "direction": "RAN_TO_CORE",
+        "errors": [],
+        "event_id": "evt-fb9b1c1ce0b22cc4",
+        "interface": "N2",
+        "message_name": "InitialContextSetupResponse",
+        "packet_references": [
+          {
+            "byte_offset": 101164,
+            "captured_length": 98,
+            "interface_id": 0,
+            "original_length": 98,
+            "packet_number": 719,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:19d90bd67891a67063338bce60063a22970108a6d85415bf3f58df0472c678e4",
+        "semantic_status": "SUCCESS",
+        "source_participant": "gNB",
+        "timestamp": "1793403912.063217232Z",
+        "timestamp_ns": "1793403912063217232"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 38,
+            "length": 55,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          },
+          {
+            "id": 121,
+            "length": 19,
+            "name": "UserLocationInformation",
+            "raw_sha256": "4c7bfd2a9cdc66cbb1b5b9b36bbabb7701dd63b3346bde6a38601892a9fa16ab",
+            "status": "DECODED",
+            "value": "plmn=001-01,nr_cell_id=0x000000010,tai_plmn=001-01,tac=0x0000c8,location_timestamp=4002392712"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "AMF",
+        "direction": "RAN_TO_CORE",
+        "errors": [],
+        "event_id": "evt-3346a50af6c53617",
+        "interface": "N2",
+        "message_name": "UplinkNASTransport",
+        "packet_references": [
+          {
+            "byte_offset": 101392,
+            "captured_length": 242,
+            "interface_id": 0,
+            "original_length": 242,
+            "packet_number": 721,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:d7202139d44d33068f5654451aea24b62c7591ddf70360902dd6ced6ae35dec1",
+        "semantic_status": "NORMAL",
+        "source_participant": "gNB",
+        "timestamp": "1793403912.271234237Z",
+        "timestamp_ns": "1793403912271234237"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 38,
+            "length": 11,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          },
+          {
+            "id": 121,
+            "length": 19,
+            "name": "UserLocationInformation",
+            "raw_sha256": "4c7bfd2a9cdc66cbb1b5b9b36bbabb7701dd63b3346bde6a38601892a9fa16ab",
+            "status": "DECODED",
+            "value": "plmn=001-01,nr_cell_id=0x000000010,tai_plmn=001-01,tac=0x0000c8,location_timestamp=4002392712"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "AMF",
+        "direction": "RAN_TO_CORE",
+        "errors": [],
+        "event_id": "evt-3e4bf02896252608",
+        "interface": "N2",
+        "message_name": "UplinkNASTransport",
+        "packet_references": [
+          {
+            "byte_offset": 101392,
+            "captured_length": 242,
+            "interface_id": 0,
+            "original_length": 242,
+            "packet_number": 721,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:1f135cb7c858ffe87555d06c9ad687531f81a48020c58201d1c61c975ee686ef",
+        "semantic_status": "NORMAL",
+        "source_participant": "gNB",
+        "timestamp": "1793403912.271234237Z",
+        "timestamp_ns": "1793403912271234237"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 38,
+            "length": 58,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "gNB",
+        "direction": "CORE_TO_RAN",
+        "errors": [],
+        "event_id": "evt-e0ac3db4ecccc379",
+        "interface": "N2",
+        "message_name": "DownlinkNASTransport",
+        "packet_references": [
+          {
+            "byte_offset": 101668,
+            "captured_length": 162,
+            "interface_id": 0,
+            "original_length": 162,
+            "packet_number": 722,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:d3e568b84ed4b885d4d99dce3bc869d22e2b340c7cd9ecf106066d94ca8c02ae",
+        "semantic_status": "NORMAL",
+        "source_participant": "AMF",
+        "timestamp": "1793403912.271794793Z",
+        "timestamp_ns": "1793403912271794793"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:314d0278212dd9c65f1d3643e7f02a5ba8271b9c9f68c1f300a7b6321f553e50",
+        "decoded_ie_tree": [
+          {
+            "id": 60,
+            "length": 5,
+            "name": "Node ID",
+            "raw_sha256": "4e47db22313110ae1831863d0cb901aa8e8b2d402439854a17924f028ca56984",
+            "status": "DECODED",
+            "value": "node_id_ipv4=10.77.23.13"
+          },
+          {
+            "id": 19,
+            "length": 1,
+            "name": "Cause",
+            "raw_sha256": "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+            "status": "DECODED",
+            "value": "cause=1"
+          },
+          {
+            "id": 57,
+            "length": 13,
+            "name": "F-SEID",
+            "raw_sha256": "5944febe40952b82717f7953b790863a47fb24e08b4c674e15352cc8c7ae32cd",
+            "status": "DECODED",
+            "value": "f_seid=0x0000000000000043,v4=true,v6=false,ipv4=10.77.23.13"
+          },
+          {
+            "id": 8,
+            "length": 19,
+            "name": "Created PDR",
+            "raw_sha256": "3fe0861caf60429b17c07eb06721b8d3914bf7426af64cf0818d5bed113f52e0",
+            "status": "DECODED",
+            "value": null
+          },
+          {
+            "id": 56,
+            "length": 2,
+            "name": "Created PDR/PDR ID",
+            "raw_sha256": "fcf0a6c700dd13e274b6fba8deea8dd9b26e4eedde3495717cac8408c9c5177f",
+            "status": "DECODED",
+            "value": "pdr_id=2"
+          },
+          {
+            "id": 21,
+            "length": 9,
+            "name": "Created PDR/F-TEID",
+            "raw_sha256": "696b3887a0944ba411cfaa5fd0d582681d6c846cc881dbe3e44c1328fb0f52b3",
+            "status": "DECODED",
+            "value": "teid=0x0000f68d,v4=true,v6=false,ipv4=10.77.22.13"
+          },
+          {
+            "id": 8,
+            "length": 19,
+            "name": "Created PDR",
+            "raw_sha256": "8db3d6a62ad516632517e38ede60baf6c69079c057273b2f20e28b376bc2a0ce",
+            "status": "DECODED",
+            "value": null
+          },
+          {
+            "id": 56,
+            "length": 2,
+            "name": "Created PDR/PDR ID",
+            "raw_sha256": "583c7dfb7b3055d99465544032a571e10a134b1b6f769422bbb71fd7fa167a5d",
+            "status": "DECODED",
+            "value": "pdr_id=3"
+          },
+          {
+            "id": 21,
+            "length": 9,
+            "name": "Created PDR/F-TEID",
+            "raw_sha256": "65d0ab40e98c2dafd16d963d5e3c9dee4aabb2bef62a67b398829362bdc7a135",
+            "status": "DECODED",
+            "value": "teid=0x000045c5,v4=true,v6=false,ipv4=10.77.22.13"
+          },
+          {
+            "id": 8,
+            "length": 19,
+            "name": "Created PDR",
+            "raw_sha256": "464c4bb80c7bdf5a8ef9817e275cd411f397e37c783582725b30a21c4cd76dfc",
+            "status": "DECODED",
+            "value": null
+          },
+          {
+            "id": 56,
+            "length": 2,
+            "name": "Created PDR/PDR ID",
+            "raw_sha256": "4f35212d12f9ad2036492c95f1fe79baf4ec7bd9bef3dffa7579f2293ff546a4",
+            "status": "DECODED",
+            "value": "pdr_id=4"
+          },
+          {
+            "id": 21,
+            "length": 9,
+            "name": "Created PDR/F-TEID",
+            "raw_sha256": "696b3887a0944ba411cfaa5fd0d582681d6c846cc881dbe3e44c1328fb0f52b3",
+            "status": "DECODED",
+            "value": "teid=0x0000f68d,v4=true,v6=false,ipv4=10.77.22.13"
+          }
+        ],
+        "decoder_name": "decoder-pfcp",
+        "decoder_version": "0.2.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "SMF",
+        "direction": "UPF_TO_SMF",
+        "errors": [],
+        "event_id": "evt-67ae6e3ca7015aab",
+        "interface": "N4",
+        "message_name": "PFCP Session Establishment Response",
+        "packet_references": [
+          {
+            "byte_offset": 63088,
+            "captured_length": 158,
+            "interface_id": 0,
+            "original_length": 158,
+            "packet_number": 676,
+            "source_file": "capture://N4.pcap-314d0278212dd9c6.pcapng"
+          }
+        ],
+        "procedure_group": "PFCP Session",
+        "protocol": "PFCP",
+        "raw_payload_reference": "sha256:53d88dfec2facfeb9d0ff51404c4d3adcc21fe1d853f80b70a2d6b6394c527ef",
+        "semantic_status": "SUCCESS",
+        "source_participant": "UPF",
+        "timestamp": "1793403912.289643455Z",
+        "timestamp_ns": "1793403912289643455"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 74,
+            "length": 146,
+            "name": "PDUSessionResourceSetupListSUReq",
+            "raw_sha256": "0b84fde493dca50c4545324c075ff7510ec32b89481dd6ec9d149f54c9e2b12f",
+            "status": "PARTIAL",
+            "value": "nested_list_sha256=0b84fde493dca50c4545324c075ff7510ec32b89481dd6ec9d149f54c9e2b12f,item_0_pdu_session_id=1,pdu_session_id=1,item_0_sst=1,item_0_sd=010203,item_0_nas_pdu_length=89,item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0xf68d,item_0_pdu_session_type=ipv4,item_0_qfi_0=1,item_0_five_qi_0=9"
+          },
+          {
+            "id": 110,
+            "length": 10,
+            "name": "UEAggregateMaximumBitRate",
+            "raw_sha256": "d2e0744a1c58969dec7f57dd7c785b7a69b5ca1de327747483e67d2d14798eaa",
+            "status": "DECODED",
+            "value": "downlink_bps=52539607552,uplink_bps=207158430208"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "PARTIAL",
+        "destination_participant": "gNB",
+        "direction": "CORE_TO_RAN",
+        "errors": [],
+        "event_id": "evt-f948afb374cd5437",
+        "interface": "N2",
+        "message_name": "PDUSessionResourceSetupRequest",
+        "packet_references": [
+          {
+            "byte_offset": 101864,
+            "captured_length": 250,
+            "interface_id": 0,
+            "original_length": 250,
+            "packet_number": 723,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "PDU Session Resource Setup",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:fbeaaee914328d03d388e01ea54022c50f524f1c5da0f4e25bef2b8012b0e7c6",
+        "semantic_status": "PARTIAL",
+        "source_participant": "AMF",
+        "timestamp": "1793403912.292668493Z",
+        "timestamp_ns": "1793403912292668493"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 75,
+            "length": 17,
+            "name": "PDUSessionResourceSetupListSURes",
+            "raw_sha256": "3df30042e57d6797a1628a4b2ee9a49efa375b1af27e3e86b6be4bb6de6b339d",
+            "status": "PARTIAL",
+            "value": "nested_list_sha256=3df30042e57d6797a1628a4b2ee9a49efa375b1af27e3e86b6be4bb6de6b339d,item_0_pdu_session_id=1,pdu_session_id=1,item_0_tunnel_ip_dl=10.77.22.20,item_0_gtp_teid_dl=0x3f,item_0_qfi_0=1"
+          },
+          {
+            "id": 121,
+            "length": 19,
+            "name": "UserLocationInformation",
+            "raw_sha256": "4c7bfd2a9cdc66cbb1b5b9b36bbabb7701dd63b3346bde6a38601892a9fa16ab",
+            "status": "DECODED",
+            "value": "plmn=001-01,nr_cell_id=0x000000010,tai_plmn=001-01,tac=0x0000c8,location_timestamp=4002392712"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "PARTIAL",
+        "destination_participant": "AMF",
+        "direction": "RAN_TO_CORE",
+        "errors": [],
+        "event_id": "evt-068cbc345f220cbe",
+        "interface": "N2",
+        "message_name": "PDUSessionResourceSetupResponse",
+        "packet_references": [
+          {
+            "byte_offset": 102244,
+            "captured_length": 126,
+            "interface_id": 0,
+            "original_length": 126,
+            "packet_number": 725,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "PDU Session Resource Setup",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:4df854813a1d796a812e63028a064caaf836d2278f4a13d6449fcf177203e321",
+        "semantic_status": "PARTIAL",
+        "source_participant": "gNB",
+        "timestamp": "1793403912.297724540Z",
+        "timestamp_ns": "1793403912297724540"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:314d0278212dd9c65f1d3643e7f02a5ba8271b9c9f68c1f300a7b6321f553e50",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 55,
+            "name": "Update FAR",
+            "raw_sha256": "26726fac94e304dfcd040c59c51a51be32a4e61d8542f8e33d1d44f9c92fa7ea",
+            "status": "DECODED",
+            "value": null
+          },
+          {
+            "id": 108,
+            "length": 4,
+            "name": "Update FAR/FAR ID",
+            "raw_sha256": "b40711a88c7039756fb8a73827eabe2c0fe5a0346ca7e0a104adc0fc764f528d",
+            "status": "DECODED",
+            "value": "far_id=1"
+          },
+          {
+            "id": 44,
+            "length": 2,
+            "name": "Update FAR/Apply Action",
+            "raw_sha256": "99be5efb88ca2013bd8e4eb035fd42d5245468fe9afa70d8ba9c1c419a48c4e8",
+            "status": "DECODED",
+            "value": "apply_action=0x0200"
+          },
+          {
+            "id": 11,
+            "length": 37,
+            "name": "Update FAR/Update Forwarding Parameters",
+            "raw_sha256": "0f1bbface3a7a3235b792819cb5e9ca078e74ccb33f6710f2dee0e91514efe48",
+            "status": "DECODED",
+            "value": null
+          },
+          {
+            "id": 42,
+            "length": 1,
+            "name": "Update FAR/Update Forwarding Parameters/Destination Interface",
+            "raw_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+            "status": "DECODED",
+            "value": "destination_interface=0"
+          },
+          {
+            "id": 22,
+            "length": 9,
+            "name": "Update FAR/Update Forwarding Parameters/Network Instance",
+            "raw_sha256": "1ba83facd1709a823c2001a63214b00910b8db9c896544508a4d55076413e60c",
+            "status": "DECODED",
+            "value": "network_instance=internet"
+          },
+          {
+            "id": 84,
+            "length": 10,
+            "name": "Update FAR/Update Forwarding Parameters/Outer Header Creation",
+            "raw_sha256": "48de922360413aa47c8cdcef024e06747b3e5d8975903ddb74ba89f6ac12e34f",
+            "status": "DECODED",
+            "value": "outer_header_description=0x0100,teid=0x0000003f,ipv4=10.77.22.20"
+          },
+          {
+            "id": 160,
+            "length": 1,
+            "name": "Update FAR/Update Forwarding Parameters/3GPP Interface Type",
+            "raw_sha256": "e7cf46a078fed4fafd0b5e3aff144802b853f8ae459a4f0c14add3314b7cc3a6",
+            "status": "DECODED",
+            "value": "interface_type=11"
+          }
+        ],
+        "decoder_name": "decoder-pfcp",
+        "decoder_version": "0.2.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "UPF",
+        "direction": "SMF_TO_UPF",
+        "errors": [],
+        "event_id": "evt-60d1eb5b16af0bcc",
+        "interface": "N4",
+        "message_name": "PFCP Session Modification Request",
+        "packet_references": [
+          {
+            "byte_offset": 63280,
+            "captured_length": 117,
+            "interface_id": 0,
+            "original_length": 117,
+            "packet_number": 677,
+            "source_file": "capture://N4.pcap-314d0278212dd9c6.pcapng"
+          }
+        ],
+        "procedure_group": "PFCP Session",
+        "protocol": "PFCP",
+        "raw_payload_reference": "sha256:6105d78e9714acf3a18e1f0b868ad11e3a0272b94724bebec3ba31bb021122bc",
+        "semantic_status": "NORMAL",
+        "source_participant": "SMF",
+        "timestamp": "1793403912.299020865Z",
+        "timestamp_ns": "1793403912299020865"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:b6fc9d77ceba5964a1d2a73c1b49a991ad1daf0818f64a50b8b4fefeade5e519",
+        "decoded_ie_tree": [
+          {
+            "id": 133,
+            "length": 2,
+            "name": "PDU Session Container",
+            "raw_sha256": "b413f47d13ee2fe6c845b2ee141af81de858df4ec549a58b7970bb96645bc8d2",
+            "status": "DECODED",
+            "value": "pdu_type=0,qfi=1"
+          },
+          {
+            "id": null,
+            "length": 0,
+            "name": "aggregate_packet_count",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "97739"
+          },
+          {
+            "id": null,
+            "length": 0,
+            "name": "aggregate_wire_bytes",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "128797117"
+          },
+          {
+            "id": null,
+            "length": 0,
+            "name": "aggregate_first_seen_ns",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "1793403915915241947"
+          },
+          {
+            "id": null,
+            "length": 0,
+            "name": "aggregate_last_seen_ns",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "1793404549086294288"
+          }
+        ],
+        "decoder_name": "live-probe-n3-flow-aggregator",
+        "decoder_version": "0.2.6",
+        "decoding_status": "DECODED",
+        "destination_participant": "gNB",
+        "direction": "DOWNLINK",
+        "errors": [],
+        "event_id": "evt-554d68dfdb3022e9",
+        "interface": "N3",
+        "message_name": "G-PDU",
+        "packet_references": [
+          {
+            "byte_offset": 292,
+            "captured_length": 118,
+            "interface_id": 0,
+            "original_length": 118,
+            "packet_number": 1,
+            "source_file": "capture://N3.pcap-b6fc9d77ceba5964.pcapng"
+          },
+          {
+            "byte_offset": 163599104,
+            "captured_length": 110,
+            "interface_id": 0,
+            "original_length": 110,
+            "packet_number": 150774,
+            "source_file": "capture://N3.pcap-b6fc9d77ceba5964.pcapng"
+          }
+        ],
+        "procedure_group": "User Plane",
+        "protocol": "GTP-U",
+        "raw_payload_reference": "n3-flow-aggregate:sha256:b6fc9d77ceba5964a1d2a73c1b49a991ad1daf0818f64a50b8b4fefeade5e519:0x0000003f:1-150774",
+        "semantic_status": "NORMAL",
+        "source_participant": "UPF",
+        "timestamp": "1793403915.915241947Z",
+        "timestamp_ns": "1793403915915241947"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:b6fc9d77ceba5964a1d2a73c1b49a991ad1daf0818f64a50b8b4fefeade5e519",
+        "decoded_ie_tree": [
+          {
+            "id": 133,
+            "length": 2,
+            "name": "PDU Session Container",
+            "raw_sha256": "27c24fcb8474773e2af799d0848495ff053272d33c432dc26277993df45c9276",
+            "status": "DECODED",
+            "value": "pdu_type=1,qfi=1"
+          },
+          {
+            "id": null,
+            "length": 0,
+            "name": "aggregate_packet_count",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "53037"
+          },
+          {
+            "id": null,
+            "length": 0,
+            "name": "aggregate_wire_bytes",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "29677165"
+          },
+          {
+            "id": null,
+            "length": 0,
+            "name": "aggregate_first_seen_ns",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "1793403915916858734"
+          },
+          {
+            "id": null,
+            "length": 0,
+            "name": "aggregate_last_seen_ns",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "1793404549087217970"
+          }
+        ],
+        "decoder_name": "live-probe-n3-flow-aggregator",
+        "decoder_version": "0.2.6",
+        "decoding_status": "DECODED",
+        "destination_participant": "UPF",
+        "direction": "UPLINK",
+        "errors": [],
+        "event_id": "evt-a220527e5d183958",
+        "interface": "N3",
+        "message_name": "G-PDU",
+        "packet_references": [
+          {
+            "byte_offset": 444,
+            "captured_length": 118,
+            "interface_id": 0,
+            "original_length": 118,
+            "packet_number": 2,
+            "source_file": "capture://N3.pcap-b6fc9d77ceba5964.pcapng"
+          },
+          {
+            "byte_offset": 163599392,
+            "captured_length": 110,
+            "interface_id": 0,
+            "original_length": 110,
+            "packet_number": 150776,
+            "source_file": "capture://N3.pcap-b6fc9d77ceba5964.pcapng"
+          }
+        ],
+        "procedure_group": "User Plane",
+        "protocol": "GTP-U",
+        "raw_payload_reference": "n3-flow-aggregate:sha256:b6fc9d77ceba5964a1d2a73c1b49a991ad1daf0818f64a50b8b4fefeade5e519:0x0000f68d:2-150776",
+        "semantic_status": "NORMAL",
+        "source_participant": "gNB",
+        "timestamp": "1793403915.916858734Z",
+        "timestamp_ns": "1793403915916858734"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 38,
+            "length": 22,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          },
+          {
+            "id": 121,
+            "length": 19,
+            "name": "UserLocationInformation",
+            "raw_sha256": "26d1e8afb1d5d2787bdc3a7968bd8c2625b8996ccf738b30a9a79588488ae14d",
+            "status": "DECODED",
+            "value": "plmn=001-01,nr_cell_id=0x000000010,tai_plmn=001-01,tac=0x0000c8,location_timestamp=4002393371"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "AMF",
+        "direction": "RAN_TO_CORE",
+        "errors": [],
+        "event_id": "evt-fca0ee754bf06b0f",
+        "interface": "N2",
+        "message_name": "UplinkNASTransport",
+        "packet_references": [
+          {
+            "byte_offset": 137500,
+            "captured_length": 130,
+            "interface_id": 0,
+            "original_length": 130,
+            "packet_number": 977,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:46bd72c136688c672facebca7b9f30cdac75aa5b4233241530234bcddf9aad76",
+        "semantic_status": "NORMAL",
+        "source_participant": "gNB",
+        "timestamp": "1793404571.538583768Z",
+        "timestamp_ns": "1793404571538583768"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 38,
+            "length": 21,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          },
+          {
+            "id": 79,
+            "length": 5,
+            "name": "PDUSessionResourceToReleaseListRelCmd",
+            "raw_sha256": "706cfb8d7efe15d74556391333ae0fc7f74a2e1e68eaef22a3f0d1acc27eb5b9",
+            "status": "PARTIAL",
+            "value": "nested_list_sha256=706cfb8d7efe15d74556391333ae0fc7f74a2e1e68eaef22a3f0d1acc27eb5b9,pdu_session_id=1"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "PARTIAL",
+        "destination_participant": "gNB",
+        "direction": "CORE_TO_RAN",
+        "errors": [],
+        "event_id": "evt-8655f0ef1fd4225b",
+        "interface": "N2",
+        "message_name": "UnknownNGAPProcedure",
+        "packet_references": [
+          {
+            "byte_offset": 137664,
+            "captured_length": 134,
+            "interface_id": 0,
+            "original_length": 134,
+            "packet_number": 978,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:288a62df646b80d54397ec10f4cf1da7fd4e481d87455b752e30614c1b3adf98",
+        "semantic_status": "PARTIAL",
+        "source_participant": "AMF",
+        "timestamp": "1793404571.542332166Z",
+        "timestamp_ns": "1793404571542332166"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 70,
+            "length": 5,
+            "name": "PDUSessionResourceReleasedListRelRes",
+            "raw_sha256": "750eb88149748868efb0f52fd85a49ff994b73d658bdd50f0e00530ba8f11d30",
+            "status": "PARTIAL",
+            "value": "nested_list_sha256=750eb88149748868efb0f52fd85a49ff994b73d658bdd50f0e00530ba8f11d30,pdu_session_id=1"
+          },
+          {
+            "id": 121,
+            "length": 19,
+            "name": "UserLocationInformation",
+            "raw_sha256": "26d1e8afb1d5d2787bdc3a7968bd8c2625b8996ccf738b30a9a79588488ae14d",
+            "status": "DECODED",
+            "value": "plmn=001-01,nr_cell_id=0x000000010,tai_plmn=001-01,tac=0x0000c8,location_timestamp=4002393371"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "PARTIAL",
+        "destination_participant": "AMF",
+        "direction": "RAN_TO_CORE",
+        "errors": [],
+        "event_id": "evt-20d468dfa946ca2a",
+        "interface": "N2",
+        "message_name": "UnknownNGAPProcedure",
+        "packet_references": [
+          {
+            "byte_offset": 137832,
+            "captured_length": 130,
+            "interface_id": 0,
+            "original_length": 130,
+            "packet_number": 979,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:26db3fa034d39aaf469028fb5512968be2811d2d775ab359cc502628eb8270e3",
+        "semantic_status": "PARTIAL",
+        "source_participant": "gNB",
+        "timestamp": "1793404571.542672196Z",
+        "timestamp_ns": "1793404571542672196"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 38,
+            "length": 20,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          },
+          {
+            "id": 121,
+            "length": 19,
+            "name": "UserLocationInformation",
+            "raw_sha256": "26d1e8afb1d5d2787bdc3a7968bd8c2625b8996ccf738b30a9a79588488ae14d",
+            "status": "DECODED",
+            "value": "plmn=001-01,nr_cell_id=0x000000010,tai_plmn=001-01,tac=0x0000c8,location_timestamp=4002393371"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "AMF",
+        "direction": "RAN_TO_CORE",
+        "errors": [],
+        "event_id": "evt-9956eed677393901",
+        "interface": "N2",
+        "message_name": "UplinkNASTransport",
+        "packet_references": [
+          {
+            "byte_offset": 138092,
+            "captured_length": 130,
+            "interface_id": 0,
+            "original_length": 130,
+            "packet_number": 981,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:73a56a7003abaaab15aa48eac271e2373ad6735c76f9754bc0900349d83ee8c4",
+        "semantic_status": "NORMAL",
+        "source_participant": "gNB",
+        "timestamp": "1793404571.743224974Z",
+        "timestamp_ns": "1793404571743224974"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 38,
+            "length": 25,
+            "name": "NAS-PDU",
+            "raw_sha256": null,
+            "status": "DECODED",
+            "value": "WITHHELD"
+          },
+          {
+            "id": 121,
+            "length": 19,
+            "name": "UserLocationInformation",
+            "raw_sha256": "26d1e8afb1d5d2787bdc3a7968bd8c2625b8996ccf738b30a9a79588488ae14d",
+            "status": "DECODED",
+            "value": "plmn=001-01,nr_cell_id=0x000000010,tai_plmn=001-01,tac=0x0000c8,location_timestamp=4002393371"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "AMF",
+        "direction": "RAN_TO_CORE",
+        "errors": [],
+        "event_id": "evt-28d5ba8ee382c450",
+        "interface": "N2",
+        "message_name": "UplinkNASTransport",
+        "packet_references": [
+          {
+            "byte_offset": 138352,
+            "captured_length": 134,
+            "interface_id": 0,
+            "original_length": 134,
+            "packet_number": 983,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "UE Registration and Context",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:066e55c52fc7096f541d701e2c561d2a6709268d948c032891e93c1a73cf45b0",
+        "semantic_status": "NORMAL",
+        "source_participant": "gNB",
+        "timestamp": "1793404571.951198384Z",
+        "timestamp_ns": "1793404571951198384"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 114,
+            "length": 4,
+            "name": "UE-NGAP-IDs",
+            "raw_sha256": "fdb64a48367e7df3b2b907538172928c3be811720d29818091a5b107f85cdff9",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65,ran_ue_ngap_id=65"
+          },
+          {
+            "id": 15,
+            "length": 1,
+            "name": "Cause",
+            "raw_sha256": "44bd7ae60f478fae1061e11a7739f4b94d1daf917982d33b6fc8a01a63f89c21",
+            "status": "DECODED",
+            "value": "cause_category=nas,cause_value=2"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "gNB",
+        "direction": "CORE_TO_RAN",
+        "errors": [],
+        "event_id": "evt-f958b70ab5a80dde",
+        "interface": "N2",
+        "message_name": "UEContextReleaseCommand",
+        "packet_references": [
+          {
+            "byte_offset": 138520,
+            "captured_length": 98,
+            "interface_id": 0,
+            "original_length": 98,
+            "packet_number": 984,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "Background / Lifecycle",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:dfc2fd78cc86c7e9e4ff7621292a8d9c0b8910e3424e2d83f5399bc8911c2ca2",
+        "semantic_status": "NORMAL",
+        "source_participant": "AMF",
+        "timestamp": "1793404571.960780835Z",
+        "timestamp_ns": "1793404571960780835"
+      },
+      {
+        "association": "SESSION",
+        "capture_id": "sha256:08f796ca57717531d808f9a65a84db8ccd0cf145c8d6ab893a78d4bfd7f22972",
+        "decoded_ie_tree": [
+          {
+            "id": 10,
+            "length": 2,
+            "name": "AMF-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "amf_ue_ngap_id=65"
+          },
+          {
+            "id": 85,
+            "length": 2,
+            "name": "RAN-UE-NGAP-ID",
+            "raw_sha256": "c00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d",
+            "status": "DECODED",
+            "value": "ran_ue_ngap_id=65"
+          },
+          {
+            "id": 121,
+            "length": 19,
+            "name": "UserLocationInformation",
+            "raw_sha256": "26d1e8afb1d5d2787bdc3a7968bd8c2625b8996ccf738b30a9a79588488ae14d",
+            "status": "DECODED",
+            "value": "plmn=001-01,nr_cell_id=0x000000010,tai_plmn=001-01,tac=0x0000c8,location_timestamp=4002393371"
+          }
+        ],
+        "decoder_name": "decoder-ngap",
+        "decoder_version": "0.6.0",
+        "decoding_status": "DECODED",
+        "destination_participant": "AMF",
+        "direction": "RAN_TO_CORE",
+        "errors": [],
+        "event_id": "evt-27804893e9da022d",
+        "interface": "N2",
+        "message_name": "UEContextReleaseComplete",
+        "packet_references": [
+          {
+            "byte_offset": 138652,
+            "captured_length": 122,
+            "interface_id": 0,
+            "original_length": 122,
+            "packet_number": 985,
+            "source_file": "capture://N2.pcap-08f796ca57717531.pcapng"
+          }
+        ],
+        "procedure_group": "Background / Lifecycle",
+        "protocol": "NGAP",
+        "raw_payload_reference": "sha256:a51a3250c39208c70226d15908c2bccd4afb5a1fcf9eaac3054403e45f4afce9",
+        "semantic_status": "SUCCESS",
+        "source_participant": "gNB",
+        "timestamp": "1793404571.961283816Z",
+        "timestamp_ns": "1793404571961283816"
+      }
+    ],
+    "interfaces": [
+      "N2",
+      "N3",
+      "N4"
+    ],
+    "participants": [
+      {
+        "addresses": [
+          "10.77.21.11"
+        ],
+        "id": "amf",
+        "role": "AMF"
+      },
+      {
+        "addresses": [
+          "10.77.23.12"
+        ],
+        "id": "smf",
+        "role": "SMF"
+      },
+      {
+        "addresses": [
+          "10.77.22.13",
+          "10.77.23.13"
+        ],
+        "id": "upf",
+        "role": "UPF"
+      },
+      {
+        "addresses": [
+          "10.77.21.20",
+          "10.77.22.20"
+        ],
+        "id": "gnb",
+        "role": "gNB"
+      }
+    ],
+    "procedures": [
+      {
+        "event_ids": [
+          "evt-f958b70ab5a80dde",
+          "evt-27804893e9da022d"
+        ],
+        "id": "background-/-lifecycle",
+        "name": "Background / Lifecycle",
+        "status": "OBSERVED"
+      },
+      {
+        "event_ids": [
+          "evt-f948afb374cd5437",
+          "evt-068cbc345f220cbe"
+        ],
+        "id": "pdu-session-resource-setup",
+        "name": "PDU Session Resource Setup",
+        "status": "OBSERVED"
+      },
+      {
+        "event_ids": [
+          "evt-67ae6e3ca7015aab",
+          "evt-60d1eb5b16af0bcc"
+        ],
+        "id": "pfcp-session",
+        "name": "PFCP Session",
+        "status": "OBSERVED"
+      },
+      {
+        "event_ids": [
+          "evt-e55a0f6606d64834",
+          "evt-047029ed63068c93",
+          "evt-b8ac067c12df311e",
+          "evt-cce134f33c98a004",
+          "evt-2f32f2a87361defc",
+          "evt-74603f774488257d",
+          "evt-fb9b1c1ce0b22cc4",
+          "evt-3346a50af6c53617",
+          "evt-3e4bf02896252608",
+          "evt-e0ac3db4ecccc379",
+          "evt-fca0ee754bf06b0f",
+          "evt-8655f0ef1fd4225b",
+          "evt-20d468dfa946ca2a",
+          "evt-9956eed677393901",
+          "evt-28d5ba8ee382c450"
+        ],
+        "id": "ue-registration-and-context",
+        "name": "UE Registration and Context",
+        "status": "OBSERVED"
+      },
+      {
+        "event_ids": [
+          "evt-554d68dfdb3022e9",
+          "evt-a220527e5d183958"
+        ],
+        "id": "user-plane",
+        "name": "User Plane",
+        "status": "OBSERVED"
+      }
+    ],
+    "schema_version": "1.1.0",
+    "session_id": "5g-session-749c5eeb11c552c3",
+    "start_timestamp": "1793403911.939460239Z",
+    "technology": "5G SA",
+    "unresolved_fields": 4
+  },
+  "meta": {
+    "api_version": "2.5.3"
+  }
+}
