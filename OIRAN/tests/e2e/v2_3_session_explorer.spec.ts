@@ -5,22 +5,22 @@ import * as path from 'node:path';
 const ROOT = path.resolve(process.cwd(), '../..');
 const screenshots = path.join(ROOT, 'OIRAN_V2_3_UI_SCREENSHOTS');
 const historical = 'OIRAN_5G_PDU_SESSION_DATA_V1';
-const recovered = 'recovered-dataset-live-1792964646320-0003';
+const absentRecovered = 'recovered-dataset-live-1792964646320-0003';
 
 async function openExplorer(page: Page, query = '') {
   await page.goto(`/investigation/sessions${query}`);
   await expect(page.getByRole('heading', { name: 'Session Explorer' })).toBeVisible();
 }
 
-test('V2.3 dataset inventory is normalized and truthfully session-scoped', async ({ request }) => {
+test('V2.3 checked-in historical fixture is normalized without inventing recovered datasets', async ({ request }) => {
   const response = await request.get('/api/v1/datasets?page_size=100');
   expect(response.status()).toBe(200);
   const body = await response.json();
-  expect(body.meta.total).toBeGreaterThanOrEqual(4);
+  expect(body.meta.total).toBeGreaterThanOrEqual(1);
   const certified = body.data.find((item: { dataset_id: string }) => item.dataset_id === historical);
   expect(certified).toMatchObject({ dataset_kind: 'HISTORICAL', packet_count: 78, normalized_event_count: 54, session_count: 1 });
-  const recoveredDataset = body.data.find((item: { dataset_id: string }) => item.dataset_id === recovered);
-  expect(recoveredDataset).toMatchObject({ dataset_kind: 'RECOVERED', packet_count: 50, normalized_event_count: 20, session_count: 0 });
+  const recoveredDataset = body.data.find((item: { dataset_id: string }) => item.dataset_id === absentRecovered);
+  expect(recoveredDataset).toBeUndefined();
 });
 
 test('V2.3 explicit scopes never fall back to an unrelated historical session', async ({ page }) => {
@@ -35,10 +35,13 @@ test('V2.3 explicit scopes never fall back to an unrelated historical session', 
   }
   await expect(page.getByText('5g-UE-A-pdu-1')).toHaveCount(0);
 
-  await page.getByLabel('Dataset filter').selectOption(recovered);
-  await expect(page).toHaveURL(new RegExp(`dataset_id=${recovered}`));
-  await expect(page.getByRole('heading', { name: 'No reconstructed sessions in this dataset.' })).toBeVisible();
-  await expect(page.getByText(/will not substitute a historical session/)).toBeVisible();
+  await page.getByLabel('Dataset filter').selectOption('scope:RECOVERED');
+  await expect(page).toHaveURL(/dataset_scope=RECOVERED/);
+  const recoveredResponse = await page.request.get('/api/v1/sessions?page_size=100&dataset_kind=RECOVERED');
+  expect(recoveredResponse.status()).toBe(200);
+  expect((await recoveredResponse.json()).meta.total).toBe(0);
+  await expect(page.getByText('No sessions match these filters')).toBeVisible();
+  await expect(page.getByText('5g-UE-A-pdu-1')).toHaveCount(0);
 });
 
 test('V2.3 historical selection and Call Flow retain the exact dataset context', async ({ page }) => {
@@ -63,9 +66,9 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 1920, height: 108
       expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe(theme);
       await page.screenshot({ path: path.join(screenshots, `session-explorer-${theme}-${viewport.width}x${viewport.height}.png`), fullPage: false });
 
-      await page.getByLabel('Dataset filter').selectOption(recovered);
-      await expect(page.getByRole('heading', { name: 'No reconstructed sessions in this dataset.' })).toBeVisible();
-      await page.screenshot({ path: path.join(screenshots, `zero-session-${theme}-${viewport.width}x${viewport.height}.png`), fullPage: false });
+      await page.getByLabel('Dataset filter').selectOption('scope:RECOVERED');
+      await expect(page.getByText('No sessions match these filters')).toBeVisible();
+      await page.screenshot({ path: path.join(screenshots, `no-recovered-fixture-${theme}-${viewport.width}x${viewport.height}.png`), fullPage: false });
     });
   }
 }

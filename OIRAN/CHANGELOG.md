@@ -986,3 +986,11 @@ All notable OIRAN vProbe changes are recorded here. Versions follow Semantic Ver
 - Keep live LTE capture disabled: no capture interface allowlist was expanded.
 - Limit offline LTE materialisation to 128 sessions per dataset to bound memory.
 
+## OIRAN API 2.6.1 / Analyzer 2.6.0-pre.2 - 2026-10-31
+
+- Stabilize the Session Explorer Playwright contract against the checked-in
+  `OIRAN_5G_PDU_SESSION_DATA_V1` fixture and explicit dataset scopes.
+- Assert that the absent recovered dataset remains absent instead of creating
+  or importing replacement history in an isolated test registry.
+- Preserve the historical 5G Call Flow regression and LTE offline contracts.
+

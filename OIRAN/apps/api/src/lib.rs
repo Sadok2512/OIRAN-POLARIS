@@ -37,8 +37,8 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.6.0";
-pub const PLATFORM_VERSION: &str = "2.6.0";
+pub const API_VERSION: &str = "2.6.1";
+pub const PLATFORM_VERSION: &str = "2.6.1";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -533,7 +533,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 async fn version(State(state): State<AppState>) -> Json<Value> {
     let flow = primary_flow(&state);
     ok(json!({
-        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":"2.6.0-pre.1+lte.offline.1",
+        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":"2.6.0-pre.2+lte.stabilization.1",
         "event_schema":"1.2.0","callflow_schema":flow.schema_version,
         "session_engine":session_engine::VERSION,"correlation_engine":correlation_engine::VERSION,"dataset_registry":dataset_registry::VERSION,
         "disk_safety":disk_safety::VERSION,
@@ -2670,7 +2670,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let value = json_body(response).await;
-        assert_eq!(value["data"]["backend_api"], "2.6.0");
+        assert_eq!(value["data"]["backend_api"], "2.6.1");
         for protocol in [
             "S1AP",
             "NAS-EPS-MM",

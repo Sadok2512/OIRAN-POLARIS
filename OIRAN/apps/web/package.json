@@ -1,6 +1,6 @@
 {
   "name": "@oiran/web",
-  "version": "2.6.0-pre.1+lte.offline.1",
+  "version": "2.6.0-pre.2+lte.stabilization.1",
   "private": true,
   "type": "module",
   "scripts": {
