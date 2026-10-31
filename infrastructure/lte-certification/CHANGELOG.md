@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1 — 2026-10-31
+
+- Require decoder and event-schema versions on every LTE capture reference
+  and exact equality with the OIRAN-owned binding.
+
 ## 1.1.0 — 2026-10-31
 
 - Add the machine-readable LTE orchestration V2 state, deadline, resource and

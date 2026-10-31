@@ -150,7 +150,10 @@ Mandatory canonical planes are `S1_MME`, `S11`, `S1_U`; decoder aliases are
 `S1-MME`, `S11`, `S1-U`. Unknown optional planes are rejected explicitly,
 not ignored. Each evidence reference must resolve to one capture reference.
 Capture references must be unique by plane and require SHA-256, frame bounds,
-decoder/schema version and sanitization state; `first_frame <= last_frame`.
+`decoder_version`, `event_schema_version` and sanitization state;
+`first_frame <= last_frame`. The two version fields are repeated in the
+OIRAN-owned binding and must match exactly. Absence or mismatch is a schema
+error.
 
 Only `SANITIZED_APPROVED` evidence may enter public Session Explorer or Call
 Flow. Required correlations are S1AP/NAS by pseudonymized S1 context,
