@@ -6,9 +6,11 @@
   "description": "POLARIS Simulator Control — UE Manager, scenario library, scenario builder, execution monitor.",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 4330",
+    "demo": "POLARIS_DEMO_MODE=1 VITE_POLARIS_DEMO_MODE=1 vite --host 127.0.0.1 --port 4331",
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --pretty false",
     "preview": "vite preview --host 127.0.0.1 --port 4330",
+    "preview:demo": "POLARIS_DEMO_MODE=1 VITE_POLARIS_DEMO_MODE=1 vite preview --host 127.0.0.1 --port 4331",
     "test": "vitest run",
     "test:watch": "vitest",
     "e2e": "playwright test"

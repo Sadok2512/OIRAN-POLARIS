@@ -94,8 +94,8 @@
     @apply bg-surface text-text-primary hover:bg-canvas disabled:opacity-50 disabled:cursor-not-allowed;
   }
   .ep-button-sm { @apply h-8 px-3 text-ep-sm; }
-  .ep-button-primary { @apply bg-primary text-white border-primary hover:brightness-110; }
-  .ep-button-danger { @apply bg-error text-white border-error hover:brightness-110; }
+  .ep-button-primary { @apply bg-primary text-white border-primary hover:bg-primary hover:brightness-110; }
+  .ep-button-danger { @apply bg-error text-white border-error hover:bg-error hover:brightness-110; }
 
   .ep-badge {
     @apply inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-ep-xs font-medium border border-border bg-canvas;

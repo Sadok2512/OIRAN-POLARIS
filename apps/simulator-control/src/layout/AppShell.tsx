@@ -27,6 +27,7 @@ export function AppShell() {
   const theme = useTheme();
   const auth = useAuth();
   const lab = useLabTopbarState();
+  const demoMode = import.meta.env.VITE_POLARIS_DEMO_MODE === '1';
 
   const isDark = theme.resolved === 'dark';
   const toggleTheme = () => theme.setPreference(isDark ? 'light' : 'dark');
@@ -60,7 +61,7 @@ export function AppShell() {
           {!collapsed && (
             <div className="leading-tight">
               <p className="text-ep-md font-semibold">POLARIS</p>
-              <p className="text-ep-sm text-mute">5G lab control</p>
+              <p className="text-ep-sm text-mute">LTE / 5G lab control</p>
             </div>
           )}
         </div>
@@ -86,6 +87,15 @@ export function AppShell() {
         </button>
       </aside>
       <main className="flex flex-col min-w-0">
+        {demoMode ? (
+          <div
+            className="border-b border-warn/50 bg-warn/10 px-5 py-2 text-center text-ep-sm font-semibold text-warn"
+            data-testid="demo-read-only-banner"
+            role="status"
+          >
+            DEMO SYNTHÉTIQUE · READ-ONLY · aucune action live, aucun secret abonné
+          </div>
+        ) : null}
         <header
           className="flex flex-wrap items-center justify-between gap-3 border-b border-line bg-surface py-2.5 px-5"
           data-testid="topbar"
