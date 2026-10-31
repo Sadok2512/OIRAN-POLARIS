@@ -1,5 +1,16 @@
 # Changelog
 
+## LTE evidence pipeline 1.1.0 / API 2.6.0 / live-probe 0.3.0 — 2026-10-31
+
+- Add the ANR1 V2 evidence adapter, canonical plane aliases and fail-closed
+  reference, approval, provenance and SHA-256 validation.
+- Add atomic/idempotent LTE materialization with bounded Session and streaming
+  Call Flow pagination, capture/binding decoder-version equality and a 64 MiB
+  retained-event allocation budget while preserving 5G reconstruction.
+- Add verified streaming export for already-sanitized PCAP/derived evidence;
+  exports start `SANITIZED_PENDING_REVIEW` and are not a generic anonymizer.
+- Add Operator+CSRF import/export routes and exact request/response contract.
+
 ## LTE offline certification 1.0.0-offline.1 — 2026-10-31
 
 - Validate mandatory S1-MME/S11/S1-U fixture fields separately from ANR1

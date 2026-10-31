@@ -1,6 +1,7 @@
 //! Strictly owned, allowlisted live capture jobs for the OIRAN local vProbe.
 
 mod callflow_page;
+pub mod lte_evidence;
 
 pub use callflow_page::{
     read_callflow_page, DEFAULT_CALLFLOW_PAGE_EVENTS, MAX_CALLFLOW_PAGE_EVENTS,
@@ -33,7 +34,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const VERSION: &str = "0.2.7";
+pub const VERSION: &str = "0.3.0";
 /// Bounded read-chunk size for streaming file I/O; chosen so SHA-256 and pcap
 /// record counting operate on ≤ 1 MiB in memory regardless of input file size.
 const STREAM_CHUNK_BYTES: usize = 1 << 20;
