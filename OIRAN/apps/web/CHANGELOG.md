@@ -2,6 +2,125 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.5.0 — 2026-10-31 (minor)
+
+Mockup pass against `docs/ui-mockups/oiran-analyzer.html`
+(origin/docs/ui-mockups @ 48dea75), rebased **on top of**
+`origin/integ/oiran-2.5.2-atomic-publish` so the three LOT 0 / 3 /
+BC4 commits (b734662, 562ed77, 62b6079) stay in the ancestry.
+`git merge-base --is-ancestor 62b6079 HEAD` → true.
+
+### Shell + primitives
+- Tailwind 3.4.17 + Enterprise Precision soft-tone palette (brand-soft,
+  ok-soft, warn-soft, bad-soft, violet / vio-soft, track); aliases ink
+  / mute / line / brand. `.live-dot` keyframe (reduced-motion aware).
+- `src/components/mockup/*`: Card, Pill (with `confTone` / `decTone` /
+  `kindTone` / `ifTone` / `IfChip` helpers), Locked, Btn, PageHeader,
+  Stat, Tabs, Field, IeTree.
+- `AppShell` rebuilt against the mockup: green antenna logo + "OIRAN
+  Analyzer / Signalling evidence", 2-section sidebar (Investigate /
+  Evidence) with the 7 mockup items. Probe Manager / Settings /
+  Module versions / Live monitoring stay reachable by direct URL —
+  the LOT 3 section mapping (b734662 / 562ed77) is preserved.
+- Topbar collapses to the mockup row: search + vProbe live-dot +
+  5G SA + role badge + Light/Dark 2-state toggle. Sidebar footer
+  carries the identity rule reminder (IMSI/IMEI/TMSI/GUTI/RNTI
+  never stored or shown).
+
+### Pages
+- **Overview** — 4 mockup tiles (Datasets / Sessions / Events / Decode
+  errors), "Latest sessions" card linking to Call flow, "Decoder
+  versions" card fed from `/modules`.
+- **Sessions** — 7-column mockup table (Procedure · UE · Start (UTC) ·
+  Duration · Interfaces · Msgs · Correlation) + sticky right card with
+  decode-completeness bar. **Honesty gates kept** (session-context
+  tests): /captures/:id/context `DATASET_UNAVAILABLE` → full-page
+  error, zero-session empty state, categorised dataset filter with
+  `scope:HISTORICAL / CAPTURED_LIVE / RECOVERED / DERIVED` buckets.
+- **Call flow** — mockup PageHeader (eyebrow `Investigate ·
+  <session_id>`, Back + HTML + JSON + Download frame locked + PCAP
+  slice locked). The ladder + inspector logic from 2.3 / LOT 3 stays
+  unchanged (zoom, resizable panels, procedure collapse, synchronised
+  arrow/row selection, `withholdIdentity()` on IE trees).
+- **Correlation** — mockup 5-card confidence strip + 4-interface flow
+  strip + 6-column edges table.
+- **Packets** — mockup PageHeader with the locked `Download frame`
+  (reason: `GET /captures/:id/download is not served yet (404)`).
+  **`withholdIdentity()` kept** (BC4 / 62b6079): the Fields tab routes
+  `packet.information_elements` through the matcher and renders the
+  `data-testid="packet-identity-withheld-banner"` when identities are
+  stripped. The two-layer matcher (EXACT list + CONTAINS pass on
+  normalised names) stays in `src/utils/identityIes.ts`.
+- **Datasets (new)** — grid of dataset cards (name · id · kind pill ·
+  Sessions / Events / Packets · Source · Ingestion · Accounting ·
+  Access · decoder-version chips · "Open sessions" link). Backed by
+  `GET /datasets`.
+- **Exports** — mockup 4-row list: Call flow · HTML, Call flow ·
+  JSON, Session summary · CSV (composed client-side from `/sessions`),
+  PCAP slice (locked, same 404 reason).
+
+### Session ID overlap fix (reported bug)
+Pre-2.4, the Sessions table rendered `session_id` as a dedicated first
+column with no `max-w` or `truncate`, so the 64-char hash spilled into
+UE / Tech / Serving Node / Procedure at 1280 and 1440. The explicit
+column is now gone; the mono hash lives on the Procedure cell's second
+line, inside `max-w-[260px] truncate` with `title={session_id}` for
+the hover tooltip. Covered by:
+- `src/test/sessions-2.4.0.test.tsx` — vitest unit (7-column header
+  set + class + title + max-w).
+- `e2e-2.4.0/no-overlap-sessions.spec.ts` — Playwright, 3 widths × 2
+  themes = 6 cells; asserts cell geometry + truncate class + title.
+- `playwright-2.4.0.config.ts` isolates the matrix from the certified
+  2.3 fixtures.
+
+### Preserved tests (zero deletion)
+Every pre-2.5 test is still present and still green:
+
+| Test file | Function covered | Status |
+| --- | --- | --- |
+| `src/utils/identityIes.test.ts` | `isIdentityIe`, `withholdIdentity` (BC4 matcher) | **preserved**, 44/44 pass |
+| `src/test/packet-analyzer-identity.test.tsx` | Packet Fields tab + identity banner + Raw Hex reminder | **preserved**, 4/4 pass |
+| `src/test/callflow-viewer.test.tsx` | Ladder arrows, inspector tabs, correlation evidence, Download frame + PCAP slice locks | **preserved**, 5/5 pass — testids `callflow-download-frame` + `callflow-pcap-slice` kept |
+| `src/test/multi-session.test.tsx` | Session navigation on the call flow picker | **preserved**, updated selector: `.page-intro .mono` → `data-testid="page-header"` + regex `/Investigate · s2/`. **Function unchanged** (clicking s2 opens its callflow and calls `/sessions/s2/callflow`) |
+| `src/test/session-context.test.tsx` | zero-session empty state, dataset unavailable, categorised dataset filter | **preserved**, 3/3 pass — SessionExplorer re-implements the captureContext query, zero-session block, dataset-scope dropdown with four buckets |
+| `src/test/sessions-2.4.0.test.tsx` | 7-column mockup contract + overlap fix | **new**, 2/2 pass |
+| `src/test/api.test.ts`, `components.test.tsx`, `probe-manager.test.tsx`, `time.test.ts` | unchanged | **preserved** |
+
+Vitest exclude pattern now ignores `e2e-2.4.0/**` (Playwright specs
+import `@playwright/test` which is not loadable under jsdom).
+
+### Functions dropped from the UI (declared)
+None. The mockup pass only reshapes the Sessions table and headers;
+every production behaviour (zero-session, dataset-unavailable,
+dataset-scope filter, identity withholding, locked downloads,
+captureContext resolution) still exists on the same route with the
+same URL parameters.
+
+### Captures
+Side-by-side mockup vs implementation under
+`docs/screenshots/2.4.0/sessions/`:
+- `mockup.{light,dark}.png` — mockup served from
+  `public/oiran-mockup.html`.
+- `impl.{light,dark}.png` — 2.5 Sessions page with 2 mocked rows.
+- `side-by-side.{light,dark}.png` — base64 composite.
+Anti-overlap screenshots under
+`docs/screenshots/2.4.0/sessions-no-overlap/` cover the 6 cells of
+the matrix (1280 / 1440 / 1920 × light / dark).
+
+### Dependencies
+- Added `tailwindcss@3.4.17` and `clsx@2.1.1`. PostCSS plugin list
+  updated in `postcss.config.js`.
+
+### Ancestor proof
+```
+$ git merge-base --is-ancestor b734662 HEAD && echo b734662 ok
+b734662 ok
+$ git merge-base --is-ancestor 62b6079 HEAD && echo 62b6079 ok
+62b6079 ok
+$ git merge-base --is-ancestor 562ed77 HEAD && echo 562ed77 ok
+562ed77 ok
+```
+
 ## 2.5.0-dev — 2026-10-28 (minor)
 
 Zero-mock pass against the production backend at
