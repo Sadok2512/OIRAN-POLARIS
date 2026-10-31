@@ -1,5 +1,12 @@
 # @telecom/simulator-control — Changelog
 
+## 0.15.0 — 2026-10-31 — LTE Grant V2 safety contract
+
+- Uses the canonical `LTE-SRSUE-TEST-01` profile exposed by POLARIS 0.22.0.
+- Shows the persistent profile/Grant V2 contract and removes direct LTE Start
+  affordances that cannot carry the one-time nonce and subject hashes.
+- Keeps grant-independent Operator Stop and all existing 5G controls intact.
+
 ## 0.14.0 — 2026-10-31 — unified LTE 4G / 5G SA control surface
 
 - Adds one reusable technology selector (`5G SA — UERANSIM` / `LTE 4G —

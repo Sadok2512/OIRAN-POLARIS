@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.22.0 (polaris-control-api) — 2026-10-31 — persistent LTE Grant V2 contract
+
+- Adds the persistent, checksummed, mode-0600 LTE Grant V2 store with atomic
+  writes, nonce hashing, subject binding, bounded idempotency and one-time
+  consumption. API restarts revoke issued grants and move consumed grants to
+  recovery-only instead of restoring privilege.
+- Adds the exact `LTE-SRSUE-TEST-01` profile and
+  `lte-e2e-certification-v1` run contract (`/lte/profiles/:id`, `/lte/runs`,
+  `/lte/runs/:id`, `/lte/runs/:id/stop`). V1 grants remain compatible only
+  with the existing UERANSIM paths; mixed V1/V2 bodies fail closed.
+- Replaces user-addressable LTE component Start with Grant V2 run
+  consumption. Cleanup remains Operator/CSRF protected but grant-exempt.
+- Pins the runtime to the exact Compose project/file/services and image,
+  verifies ownership labels, and bounds Compose operations with a timeout.
+  No HTTP value becomes a command, service, path or container argument.
+- Aligns run evidence with the ANR1 `polaris.lte-evidence.v1` schema and ANR3
+  sanitized capture handoff contract. Full live certification remains locked.
+
 ## 0.21.0 (polaris-control-api) — 2026-10-31 — bounded srsRAN LTE integration
 
 - Integrates LTE into the existing POLARIS API through `/lte/status`,

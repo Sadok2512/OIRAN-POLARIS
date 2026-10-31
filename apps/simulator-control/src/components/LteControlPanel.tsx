@@ -1,20 +1,20 @@
 import { Play, Square } from 'lucide-react';
 import { Btn, Card, Pill, regTone } from '@/components/mockup';
-import { useAuth, useLteAction, useLteLogs, useLteStatus } from '@/data/queries';
+import { useAuth, useLteAction, useLteLogs, useLteProfile, useLteStatus } from '@/data/queries';
 
 export function LteControlPanel({ compact = false }: { compact?: boolean }) {
   const auth = useAuth();
   const status = useLteStatus();
-  const start = useLteAction('start');
   const stop = useLteAction('stop');
+  const profile = useLteProfile();
   const enbLogs = useLteLogs('ENB-01');
-  const ueLogs = useLteLogs('LTE-UE-01');
+  const ueLogs = useLteLogs('LTE-SRSUE-TEST-01');
   const data = status.data;
   const canOperate = auth.data?.can_start === true;
   const liveReady = data?.certified === true && data.live_enabled === true;
   const ueRunning = data?.ue.process_state === 'running';
   const enbRunning = data?.enb.process_state === 'running';
-  const error = start.error ?? stop.error;
+  const error = stop.error;
 
   return (
     <Card className="p-5 flex flex-col gap-4" data-testid="lte-control-panel">
@@ -34,7 +34,7 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
       </header>
 
       <dl className={`grid gap-3 text-ep-md ${compact ? 'grid-cols-2 lg:grid-cols-4' : 'grid-cols-2 lg:grid-cols-5'}`}>
-        <div><dt className="text-ep-xs uppercase text-mute">UE</dt><dd className="mono">{data?.ue_id ?? 'LTE-UE-01'}</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">UE</dt><dd className="mono">{data?.ue_id ?? 'LTE-SRSUE-TEST-01'}</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">srsUE</dt><dd>{data?.ue.process_state ?? 'NOT OBSERVED'}</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">srsENB</dt><dd>{data?.enb.process_state ?? 'NOT OBSERVED'}</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">EPC / S1</dt><dd>{data?.epc.process_state ?? 'NOT OBSERVED'} / {data?.s1_state ?? 'NOT OBSERVED'}</dd></div>
@@ -44,27 +44,26 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
         <div><dt className="text-ep-xs uppercase text-mute">Sessions</dt><dd>{data?.active_sessions ?? 0}</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">Simulator</dt><dd>srsRAN</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">Technology</dt><dd>LTE 4G</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">Grant contract</dt><dd>{profile.data?.grant_required ? 'V2 REQUIRED' : 'NOT OBSERVED'}</dd></div>
       </dl>
 
       <div className="flex flex-wrap gap-2 border-t border-line pt-3">
         <Btn
           icon={Play}
-          onClick={() => start.mutate('ENB-01')}
-          disabled={!canOperate || !liveReady || enbRunning || start.isPending}
-          title={!canOperate ? 'Operator role required.' : !liveReady ? 'LTE E2E certification and deployment gate required.' : undefined}
+          disabled
+          title="Start is available only through a consumed LTE Grant V2 run."
           data-testid="lte-enb-start"
         >Start srsENB</Btn>
         <Btn
           icon={Play}
           primary
-          onClick={() => start.mutate('LTE-UE-01')}
-          disabled={!canOperate || !liveReady || !enbRunning || ueRunning || start.isPending}
-          title={!liveReady ? 'LTE E2E certification and a valid live grant are required.' : undefined}
+          disabled
+          title="Start is available only through POST /api/v1/lte/runs with a one-time Grant V2 nonce."
           data-testid="lte-ue-start"
         >Start srsUE</Btn>
         <Btn
           icon={Square}
-          onClick={() => stop.mutate('LTE-UE-01')}
+          onClick={() => stop.mutate('LTE-SRSUE-TEST-01')}
           disabled={!canOperate || !ueRunning || stop.isPending}
           data-testid="lte-ue-stop"
         >Stop srsUE</Btn>

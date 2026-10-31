@@ -180,7 +180,7 @@ export function TrafficSessionsPage() {
           value={technology}
           onChange={(next) => {
             setTechnology(next);
-            setUeIds(next === 'LTE' ? 'LTE-UE-01' : 'UE-01');
+            setUeIds(next === 'LTE' ? 'LTE-SRSUE-TEST-01' : 'UE-01');
           }}
         />
         {technology === 'LTE' ? (

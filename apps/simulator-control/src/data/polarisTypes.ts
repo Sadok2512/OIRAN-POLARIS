@@ -178,6 +178,20 @@ export interface LteStatus {
   active_sessions: number;
 }
 
+export interface LteProfile {
+  schema_version: 'polaris.lte-profile.v1';
+  profile_id: 'LTE-SRSUE-TEST-01';
+  revision: number;
+  owner: 'POLARIS_CONTROLLER';
+  enabled: boolean;
+  runtime_state: string;
+  apn: string;
+  max_running_ues: number;
+  configuration_sha256: string;
+  grant_required: true;
+  evidence_schema: 'polaris.lte-evidence.v1';
+}
+
 export interface UeProfile {
   id: string;
   pseudonym?: string;

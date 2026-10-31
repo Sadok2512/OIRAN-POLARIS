@@ -1,13 +1,27 @@
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::fs;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-pub const VERSION: &str = "0.1.0";
-pub const LTE_UE_ID: &str = "LTE-UE-01";
+pub const VERSION: &str = "0.2.0";
+pub const LTE_UE_ID: &str = "LTE-SRSUE-TEST-01";
 pub const ENB_ID: &str = "ENB-01";
 const ENB_CONTAINER: &str = "oiran-lab-srsenb-1";
 const UE_CONTAINER: &str = "oiran-lab-srsue-1";
 const EPC_CONTAINER: &str = "oiran-lab-mme-1";
+const COMPOSE_FILE: &str = "/root/POLARIS/compose/docker-compose.oiran-lab.yml";
+const ENV_FILE: &str = "/root/POLARIS/compose/versions.env";
+const COMPOSE_PROJECT: &str = "oiran-lab";
+const EXPECTED_IMAGE_DIGEST: &str =
+    "sha256:69e094349657cc6a062ce3717661d6b8a553a23ce571f821e33256beec753d43";
+const PROFILE_CONFIGS: [&str; 5] = [
+    "/root/POLARIS/runtime/srsran/ue.conf",
+    "/root/POLARIS/config/srsran/enb.conf",
+    "/root/POLARIS/config/srsran/rr.conf",
+    COMPOSE_FILE,
+    ENV_FILE,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Target {
@@ -19,7 +33,7 @@ impl Target {
     pub fn parse(component: &str, ue_id: Option<&str>) -> Result<Self, String> {
         match component {
             "ENB-01" if ue_id.is_none() => Ok(Self::Enb),
-            "LTE-UE-01" if ue_id.is_none() || ue_id == Some(LTE_UE_ID) => Ok(Self::Ue),
+            LTE_UE_ID if ue_id.is_none() || ue_id == Some(LTE_UE_ID) => Ok(Self::Ue),
             _ => Err("SRSRAN_TARGET_NOT_ALLOWLISTED".into()),
         }
     }
@@ -28,6 +42,13 @@ impl Target {
         match self {
             Self::Enb => ENB_CONTAINER,
             Self::Ue => UE_CONTAINER,
+        }
+    }
+
+    fn service(self) -> &'static str {
+        match self {
+            Self::Enb => "srsenb",
+            Self::Ue => "srsue",
         }
     }
 
@@ -86,6 +107,26 @@ pub trait SrsranRuntime: Send + Sync {
 pub struct DockerSrsranRuntime;
 
 impl DockerSrsranRuntime {
+    fn verify_ownership(target: Target) -> Result<(), String> {
+        let format = "{{index .Config.Labels \"com.docker.compose.project\"}}|{{index .Config.Labels \"com.docker.compose.service\"}}|{{.Image}}";
+        let output = Command::new("docker")
+            .args(["inspect", "--format", format, target.container()])
+            .output()
+            .map_err(|_| "SRSRAN_RUNTIME_UNAVAILABLE")?;
+        if !output.status.success() {
+            return Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into());
+        }
+        let observed = String::from_utf8_lossy(&output.stdout);
+        let mut fields = observed.trim().split('|');
+        if fields.next().unwrap_or_default() != COMPOSE_PROJECT
+            || fields.next().unwrap_or_default() != target.service()
+            || fields.next().unwrap_or_default() != EXPECTED_IMAGE_DIGEST
+        {
+            return Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into());
+        }
+        Ok(())
+    }
+
     fn observe_container(name: &str) -> ProcessObservation {
         let output = Command::new("docker")
             .args([
@@ -131,22 +172,34 @@ impl DockerSrsranRuntime {
     }
 
     fn run_exact(target: Target, verb: &str) -> Result<(), String> {
-        let mut command = Command::new("docker");
-        match verb {
-            "start" => {
-                command.args(["start", target.container()]);
-            }
-            "stop" => {
-                command.args(["stop", "--time", "10", target.container()]);
-            }
+        Self::verify_ownership(target)?;
+        let action = match verb {
+            "start" => "start",
+            "stop" => "stop",
             _ => return Err("SRSRAN_ACTION_NOT_ALLOWLISTED".into()),
-        }
+        };
+        let mut command = Command::new("/usr/bin/timeout");
+        command.args([
+            "30s", "docker", "compose", "--project-name", COMPOSE_PROJECT, "--file",
+            COMPOSE_FILE, "--env-file", ENV_FILE, action, target.service(),
+        ]);
         let status = command.status().map_err(|_| "SRSRAN_RUNTIME_UNAVAILABLE")?;
         status
             .success()
             .then_some(())
             .ok_or_else(|| "SRSRAN_ACTION_FAILED".into())
     }
+}
+
+pub fn profile_configuration_sha256() -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    for path in PROFILE_CONFIGS {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(fs::read(path).map_err(|_| "LTE_PROFILE_CONFIGURATION_UNREADABLE")?);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 impl SrsranRuntime for DockerSrsranRuntime {
@@ -262,12 +315,12 @@ mod tests {
     #[test]
     fn target_allowlist_rejects_arbitrary_container_or_ue() {
         assert_eq!(Target::parse("ENB-01", None), Ok(Target::Enb));
-        assert_eq!(Target::parse("LTE-UE-01", Some(LTE_UE_ID)), Ok(Target::Ue));
+        assert_eq!(Target::parse(LTE_UE_ID, Some(LTE_UE_ID)), Ok(Target::Ue));
         assert_eq!(
             Target::parse("../../docker", None),
             Err("SRSRAN_TARGET_NOT_ALLOWLISTED".into())
         );
-        assert!(Target::parse("LTE-UE-01", Some("LTE-UE-99")).is_err());
+        assert!(Target::parse(LTE_UE_ID, Some("LTE-UE-99")).is_err());
     }
 
     #[test]

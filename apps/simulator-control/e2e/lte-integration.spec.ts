@@ -25,7 +25,7 @@ async function mockPolaris(page: Page) {
       s1_state: 'CONNECTED',
       enb: { process_state: 'running', health: 'unknown', observed: true },
       ue: { process_state: 'stopped', health: 'unknown', observed: true },
-      ue_id: 'LTE-UE-01', attach_state: 'DETACHED', apn: 'internet', ue_ip: null, active_sessions: 0,
+      ue_id: 'LTE-SRSUE-TEST-01', attach_state: 'DETACHED', apn: 'internet', ue_ip: null, active_sessions: 0,
     })),
   );
   await page.route('**/polaris-api/v1/lte/logs**', (route) =>
