@@ -167,15 +167,21 @@ export interface LteStatus {
   simulator: 'srsRAN';
   certified: boolean;
   live_enabled: boolean;
-  epc: { process_state: string; health: string; observed: boolean; last_error: string | null };
+  epc: { process_state: string; health: string; observed: boolean; controller_owned: boolean; last_error: string | null };
   s1_state: string;
-  enb: { process_state: string; health: string; observed: boolean; last_error: string | null };
-  ue: { process_state: string; health: string; observed: boolean; last_error: string | null };
+  enb: { process_state: string; health: string; observed: boolean; controller_owned: boolean; last_error: string | null };
+  ue: { process_state: string; health: string; observed: boolean; controller_owned: boolean; last_error: string | null };
   ue_id: string;
   attach_state: string;
   apn: string;
   ue_ip: string | null;
   active_sessions: number;
+  session_state: string;
+  ownership_verified: boolean;
+  traffic_ready: boolean;
+  grant_active: boolean;
+  safety_ready: boolean;
+  traffic_allowed: boolean;
 }
 
 export interface LteProfile {
@@ -188,6 +194,9 @@ export interface LteProfile {
   apn: string;
   max_running_ues: number;
   configuration_sha256: string;
+  scenario_id: 'lte-e2e-certification-v1';
+  scenario_revision: 1;
+  scenario_sha256: string;
   grant_required: true;
   evidence_schema: 'polaris.lte-evidence.v1';
 }

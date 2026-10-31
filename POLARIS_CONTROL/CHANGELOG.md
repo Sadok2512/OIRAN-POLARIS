@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.22.0 (polaris-control-api) — 2026-10-31 — persistent LTE Grant V2 contract
+## 0.22.1 (polaris-control-api) — 2026-10-31 — final LTE Grant V2 and runtime hardening
 
 - Adds the persistent, checksummed, mode-0600 LTE Grant V2 store with atomic
   writes, nonce hashing, subject binding, bounded idempotency and one-time
@@ -17,6 +17,25 @@
   No HTTP value becomes a command, service, path or container argument.
 - Aligns run evidence with the ANR1 `polaris.lte-evidence.v1` schema and ANR3
   sanitized capture handoff contract. Full live certification remains locked.
+- Resolves the real `srsenb` and `srsue` Compose services by immutable Compose
+  labels and the authoritative `oiran-lab` configuration path; container names
+  are no longer assumed.
+- Adds an atomic mode-0600 ownership ledger. Start, Stop and traffic operate on
+  exact recorded container IDs and reject unowned or ambiguous instances.
+- Bounds Docker/Compose/exec operations with host-enforced TERM/KILL timeouts,
+  exact cleanup and start rollback. No shell or HTTP-supplied command is used.
+- Derives S1, Attach, UE IP and session from current structured observations;
+  unverifiable values are `UNKNOWN`, never inferred from stale logs.
+- Gates LTE traffic on certification, live mode, active non-expired grant,
+  verified ownership, current Attach/IP/session and disk/memory safety. LTE uses
+  bounded iperf3 results and never enters the legacy 5G synthetic-sample path.
+- Adds negative coverage for ownership, timeout classification, rollback and
+  the allowlisted LTE UE identifier while retaining existing RBAC/grant tests.
+- Binds Grant V2 consumption to the issuing authenticated session and role,
+  validates the canonical scenario hash, and prevents legacy V1 grants from
+  authorizing LTE traffic or scenario execution.
+- Adds a bounded ENB/S1/UE/Attach run orchestrator with persistent states,
+  hard-deadline cleanup, cancellation, revocation cleanup and rollback.
 
 ## 0.21.0 (polaris-control-api) — 2026-10-31 — bounded srsRAN LTE integration
 

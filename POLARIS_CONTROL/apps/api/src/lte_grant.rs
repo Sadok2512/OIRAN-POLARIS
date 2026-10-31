@@ -9,6 +9,8 @@ use std::{
 
 pub const PROFILE_ID: &str = "LTE-SRSUE-TEST-01";
 pub const SCENARIO_ID: &str = "lte-e2e-certification-v1";
+pub const SCENARIO_SHA256: &str =
+    "13a8e488839b7542e3ae967b681b139870ad070b5438bb314ca28707134be67d";
 pub const MAX_DURATION_SECONDS: u32 = 300;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -160,6 +162,8 @@ pub struct GrantRecord {
     pub issued_at_epoch_ms: u64,
     pub expires_at_epoch_ms: u64,
     pub role: String,
+    #[serde(default)]
+    pub issuer_subject_sha256: String,
     pub nonce_sha256: String,
     pub request_sha256: String,
     pub idempotency_key_sha256: String,
@@ -169,6 +173,8 @@ pub struct GrantRecord {
     pub run_request_sha256: Option<String>,
     #[serde(default)]
     pub run_idempotency_key_sha256: Option<String>,
+    #[serde(default)]
+    pub run_state: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -216,7 +222,10 @@ impl GrantRequestV2 {
         {
             return Err("LTE_PROFILE_NOT_FOUND");
         }
-        if self.scenario.scenario_id != SCENARIO_ID || self.scenario.scenario_revision != 1 {
+        if self.scenario.scenario_id != SCENARIO_ID
+            || self.scenario.scenario_revision != 1
+            || self.scenario.scenario_sha256 != SCENARIO_SHA256
+        {
             return Err("LTE_SCENARIO_NOT_ALLOWLISTED");
         }
         if self.duration_seconds == 0 || self.duration_seconds > MAX_DURATION_SECONDS {
@@ -339,6 +348,7 @@ impl GrantStore {
         grant_id: String,
         now_ms: u64,
         role: &str,
+        issuer_subject: &str,
         idempotency_key: &str,
     ) -> Result<(GrantRecord, bool), String> {
         request.validate().map_err(str::to_string)?;
@@ -367,6 +377,7 @@ impl GrantStore {
             issued_at_epoch_ms: now_ms,
             expires_at_epoch_ms: now_ms.saturating_add(u64::from(request.duration_seconds) * 1_000),
             role: role.to_string(),
+            issuer_subject_sha256: hash_bytes(issuer_subject.as_bytes()),
             nonce_sha256: hash_bytes(request.execution_nonce.as_bytes()),
             request_sha256,
             idempotency_key_sha256: key_hash,
@@ -374,6 +385,7 @@ impl GrantStore {
             run_id: None,
             run_request_sha256: None,
             run_idempotency_key_sha256: None,
+            run_state: None,
         };
         self.grants.push(record.clone());
         self.persist()?;
@@ -387,6 +399,8 @@ impl GrantStore {
         idempotency_key: &str,
         run_id: String,
         now_ms: u64,
+        role: &str,
+        issuer_subject: &str,
     ) -> Result<RunRecord, String> {
         validate_idempotency_key(idempotency_key)?;
         let run_request_sha256 = hash_json(request)?;
@@ -400,6 +414,11 @@ impl GrantStore {
             grant.state = GrantState::Expired;
             self.persist()?;
             return Err("LIVE_GRANT_INACTIVE".into());
+        }
+        if grant.role != role
+            || grant.issuer_subject_sha256 != hash_bytes(issuer_subject.as_bytes())
+        {
+            return Err("GRANT_SUBJECT_CHANGED".into());
         }
         if grant.run_idempotency_key_sha256.as_deref() == Some(run_key_sha256.as_str()) {
             if grant.run_request_sha256.as_deref() != Some(run_request_sha256.as_str()) {
@@ -435,6 +454,7 @@ impl GrantStore {
         grant.run_id = Some(run_id.clone());
         grant.run_request_sha256 = Some(run_request_sha256);
         grant.run_idempotency_key_sha256 = Some(run_key_sha256);
+        grant.run_state = Some("PREFLIGHT".into());
         let result = RunRecord {
             run_id: run_id.clone(),
             grant_id: grant.grant_id.clone(),
@@ -459,6 +479,16 @@ impl GrantStore {
         Ok(result)
     }
 
+    pub fn set_run_state(&mut self, run_id: &str, state: &str) -> Result<(), String> {
+        let grant = self
+            .grants
+            .iter_mut()
+            .find(|grant| grant.run_id.as_deref() == Some(run_id))
+            .ok_or("LTE_RUN_NOT_FOUND")?;
+        grant.run_state = Some(state.to_string());
+        self.persist()
+    }
+
     fn persist(&self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|_| "LTE_GRANT_STORE_WRITE_FAILED")?;
@@ -473,10 +503,20 @@ impl GrantStore {
 }
 
 fn atomic_write_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let temp = path.with_extension("tmp");
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
+            return Err("LTE_GRANT_STORE_INSECURE".into());
+        }
+    }
+    let parent = path.parent().ok_or("LTE_GRANT_STORE_WRITE_FAILED")?;
+    fs::create_dir_all(parent).map_err(|_| "LTE_GRANT_STORE_WRITE_FAILED")?;
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().and_then(|name| name.to_str()).unwrap_or("lte-store"),
+        std::process::id()
+    ));
     let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .mode(0o600)
         .open(&temp)
@@ -542,7 +582,7 @@ mod tests {
             scenario: GrantScenario {
                 scenario_id: SCENARIO_ID.into(),
                 scenario_revision: 1,
-                scenario_sha256: "b".repeat(64),
+                scenario_sha256: SCENARIO_SHA256.into(),
             },
             duration_seconds: 300,
             constraints: GrantConstraints {
@@ -579,7 +619,7 @@ mod tests {
         let path = path("persistent");
         let mut store = GrantStore::load(path.clone()).unwrap();
         store
-            .create(request(), "grant-1".into(), 100, "operator", "request-123")
+            .create(request(), "grant-1".into(), 100, "operator", "session-a", "request-123")
             .unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains(&"n".repeat(43)));
@@ -597,7 +637,7 @@ mod tests {
         let path = path("consume");
         let mut store = GrantStore::load(path.clone()).unwrap();
         store
-            .create(request(), "grant-1".into(), 100, "operator", "request-123")
+            .create(request(), "grant-1".into(), 100, "operator", "session-a", "request-123")
             .unwrap();
         let run = RunRequest {
             grant_id: "grant-1".into(),
@@ -606,21 +646,21 @@ mod tests {
             configuration_sha256: "a".repeat(64),
             scenario_id: SCENARIO_ID.into(),
             scenario_revision: 1,
-            scenario_sha256: "b".repeat(64),
+            scenario_sha256: SCENARIO_SHA256.into(),
         };
         assert!(store
-            .consume(&run, &"n".repeat(43), "run-request-1", "lte-run-1".into(), 101)
+            .consume(&run, &"n".repeat(43), "run-request-1", "lte-run-1".into(), 101, "operator", "session-a")
             .is_ok());
         assert_eq!(
             store
-                .consume(&run, &"n".repeat(43), "run-request-1", "lte-run-ignored".into(), 102)
+                .consume(&run, &"n".repeat(43), "run-request-1", "lte-run-ignored".into(), 102, "operator", "session-a")
                 .unwrap()
                 .run_id,
             "lte-run-1"
         );
         assert_eq!(
             store
-                .consume(&run, &"n".repeat(43), "run-request-2", "lte-run-2".into(), 102)
+                .consume(&run, &"n".repeat(43), "run-request-2", "lte-run-2".into(), 102, "operator", "session-a")
                 .unwrap_err(),
             "LIVE_GRANT_REPLAYED"
         );
@@ -632,12 +672,12 @@ mod tests {
         let path = path("bounds");
         let mut store = GrantStore::load(path.clone()).unwrap();
         let first = store
-            .create(request(), "grant-1".into(), 100, "operator", "request-123")
+            .create(request(), "grant-1".into(), 100, "operator", "session-a", "request-123")
             .unwrap();
         assert!(!first.1);
         assert!(
             store
-                .create(request(), "grant-2".into(), 101, "operator", "request-123")
+                .create(request(), "grant-2".into(), 101, "operator", "session-a", "request-123")
                 .unwrap()
                 .1
         );
@@ -645,7 +685,7 @@ mod tests {
         changed.duration_seconds = 200;
         assert_eq!(
             store
-                .create(changed, "grant-3".into(), 101, "operator", "request-123")
+                .create(changed, "grant-3".into(), 101, "operator", "session-a", "request-123")
                 .unwrap_err(),
             "IDEMPOTENCY_KEY_CONFLICT"
         );
@@ -655,6 +695,85 @@ mod tests {
             unsafe_request.validate(),
             Err("LTE_CONSTRAINT_OUT_OF_RANGE")
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn consumption_rejects_another_session_or_role() {
+        let path = path("subject-binding");
+        let mut store = GrantStore::load(path.clone()).unwrap();
+        store
+            .create(request(), "grant-1".into(), 100, "operator", "session-a", "request-123")
+            .unwrap();
+        let run = RunRequest {
+            grant_id: "grant-1".into(),
+            profile_id: PROFILE_ID.into(),
+            profile_revision: 1,
+            configuration_sha256: "a".repeat(64),
+            scenario_id: SCENARIO_ID.into(),
+            scenario_revision: 1,
+            scenario_sha256: SCENARIO_SHA256.into(),
+        };
+        assert_eq!(
+            store
+                .consume(&run, &"n".repeat(43), "run-request-1", "lte-run-1".into(), 101, "operator", "session-b")
+                .unwrap_err(),
+            "GRANT_SUBJECT_CHANGED"
+        );
+        assert_eq!(
+            store
+                .consume(&run, &"n".repeat(43), "run-request-2", "lte-run-2".into(), 101, "administrator", "session-a")
+                .unwrap_err(),
+            "GRANT_SUBJECT_CHANGED"
+        );
+        assert_eq!(store.records()[0].state, GrantState::Issued);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn expired_revoked_and_wrong_nonce_grants_fail_closed() {
+        let path = path("inactive");
+        let run = RunRequest {
+            grant_id: "grant-1".into(),
+            profile_id: PROFILE_ID.into(),
+            profile_revision: 1,
+            configuration_sha256: "a".repeat(64),
+            scenario_id: SCENARIO_ID.into(),
+            scenario_revision: 1,
+            scenario_sha256: SCENARIO_SHA256.into(),
+        };
+        let mut store = GrantStore::load(path.clone()).unwrap();
+        store
+            .create(request(), "grant-1".into(), 100, "operator", "session-a", "request-123")
+            .unwrap();
+        assert_eq!(
+            store
+                .consume(&run, &"x".repeat(43), "run-request-1", "lte-run-1".into(), 101, "operator", "session-a")
+                .unwrap_err(),
+            "LIVE_GRANT_NONCE_INVALID"
+        );
+        store.revoke("grant-1").unwrap();
+        assert_eq!(
+            store
+                .consume(&run, &"n".repeat(43), "run-request-2", "lte-run-2".into(), 102, "operator", "session-a")
+                .unwrap_err(),
+            "LIVE_GRANT_REPLAYED"
+        );
+
+        let mut expired_request = request();
+        expired_request.duration_seconds = 1;
+        store
+            .create(expired_request, "grant-2".into(), 100, "operator", "session-a", "request-456")
+            .unwrap();
+        let mut expired_run = run;
+        expired_run.grant_id = "grant-2".into();
+        assert_eq!(
+            store
+                .consume(&expired_run, &"n".repeat(43), "run-request-3", "lte-run-3".into(), 1_100, "operator", "session-a")
+                .unwrap_err(),
+            "LIVE_GRANT_INACTIVE"
+        );
+        assert_eq!(store.records()[1].state, GrantState::Expired);
         let _ = fs::remove_file(path);
     }
 
