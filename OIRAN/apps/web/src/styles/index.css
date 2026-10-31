@@ -33,3 +33,5 @@
 @media(max-width:1100px){.interface-grid,.plane-selector{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
 .withheld-banner{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;margin:0 0 10px 0;border:1px solid var(--warning);background:#FDF1E1;border-radius:7px;font-size:10px;color:var(--text)}:root[data-theme="dark"] .withheld-banner{background:#3A2A10}.withheld-banner b{color:var(--warning)}.withheld-banner svg{color:var(--warning);flex-shrink:0;margin-top:1px}
+.connection.connection-unknown{color:var(--warning)}.connection.connection-unknown i{background:var(--warning);box-shadow:0 0 0 3px #f5a52418}.observed-technology{font-size:9px;color:var(--muted);white-space:nowrap}
+.callflow-pagination{display:flex;align-items:center;gap:6px;margin-left:auto;color:var(--muted);font-size:9px;white-space:nowrap}

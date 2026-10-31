@@ -7,7 +7,7 @@ import {
   Settings, Waypoints,
 } from 'lucide-react';
 import { api } from '../services/api';
-import type { AuthState, Metrics, Module } from '../types/api';
+import type { AuthState, Dataset, Metrics, Module, Probe } from '../types/api';
 
 type Theme = 'light' | 'dark' | 'system';
 
@@ -63,9 +63,23 @@ export function AppShell() {
     queryKey: ['auth'],
     queryFn: () => api<AuthState>('/auth/me').then((value) => value.data),
   });
+  const probes = useQuery({
+    queryKey: ['shell-probes'],
+    queryFn: () => api<Probe[]>('/probes').then((value) => value.data),
+    refetchInterval: 5000,
+  });
+  const datasets = useQuery({
+    queryKey: ['shell-datasets'],
+    queryFn: () => api<Dataset[]>('/datasets?page_size=100').then((value) => value.data),
+    staleTime: 30_000,
+  });
 
   useEffect(() => {
-    const media = matchMedia('(prefers-color-scheme: dark)');
+    const media = window.matchMedia?.('(prefers-color-scheme: dark)') ?? {
+      matches: false,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    };
     const apply = () => {
       const resolved = theme === 'system' ? (media.matches ? 'dark' : 'light') : theme;
       document.documentElement.dataset.theme = resolved;
@@ -83,6 +97,15 @@ export function AppShell() {
     .map((part) => part.replaceAll('-', ' '));
   // "operations" (Probe Manager) is excluded on purpose — see sections map.
   const ordered = ['overview', 'investigation', 'analysis', 'reports', 'platform'];
+  const onlineProbes = probes.data?.filter((probe) => probe.online) ?? [];
+  const probeLabel = probes.isError
+    ? 'vProbe UNKNOWN'
+    : onlineProbes.length > 0
+      ? `${onlineProbes.length} vProbe connected`
+      : probes.data?.length
+        ? 'vProbe not connected'
+        : 'vProbe UNKNOWN';
+  const observedTechnologies = [...new Set(datasets.data?.map((item) => item.technology).filter(Boolean) ?? [])];
 
   function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -139,10 +162,12 @@ export function AppShell() {
             <input aria-label="Global search" placeholder="Search session or message" value={search} onChange={(event) => setSearch(event.target.value)} />
           </form>
           <select aria-label="Environment"><option>Certified Lab</option></select>
-          <select aria-label="Technology"><option>5G SA</option><option>LTE · Prepared (synthetic only)</option></select>
-          <span className="connection"><i />vProbe connected</span>
+          <span className="observed-technology" data-testid="observed-technologies">
+            {observedTechnologies.length ? `Observed: ${observedTechnologies.join(' / ')}` : 'Technology UNKNOWN'}
+          </span>
+          <span className={`connection ${onlineProbes.length ? '' : 'connection-unknown'}`} data-testid="probe-connection"><i />{probeLabel}</span>
           <div className="interface-indicators">
-            {metrics.data?.interfaces.map((item) => <span key={item.interface}><i />{item.interface} REF</span>)}
+            {metrics.data?.interfaces.map((item) => <span key={item.interface}><i />{item.interface} {item.state}</span>)}
           </div>
           <div className="resource-summary">
             <span>Disk <b>{metrics.data?.disk ? `${metrics.data.disk.usage_percent.toFixed(0)}%` : '—'}</b></span>

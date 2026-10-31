@@ -18,7 +18,7 @@ describe('directional Call Flow viewer',()=>{
   beforeEach(()=>vi.mocked(api).mockImplementation(async(path?:string)=>{
     if(path===undefined)return {data:[],meta:{}} as never;
     if(path==='/sessions/s1')return {data:{summary},meta:{}} as never;
-    if(path==='/sessions/s1/callflow')return {data:flow,meta:{}} as never;
+    if(path==='/sessions/s1/callflow?limit=100')return {data:flow,meta:{}} as never;
     throw new Error(`unexpected path ${path}`);
   }));
   const renderFlow=()=>{const client=new QueryClient({defaultOptions:{queries:{retry:false}}});return render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/investigation/callflow/s1?dataset_id=dataset-a&capture_id=cap-certified&probe_id=probe-a']}><Routes><Route path="/investigation/callflow/:sessionId" element={<CallFlowViewer/>}/></Routes></MemoryRouter></QueryClientProvider>)};
@@ -76,6 +76,25 @@ describe('directional Call Flow viewer',()=>{
     expect(frame.getAttribute('title')).toMatch(/\/captures\/:id\/download.*404/);
     expect(slice.getAttribute('title')).toMatch(/\/captures\/:id\/download.*404/);
   });
+
+  it('pages through the real cursor contract without hiding the total event count',async()=>{
+    const pagedFlow={...flow,pagination:{cursor:null,limit:100,next_cursor:'ng-down',returned_events:1,total_events:101},events:[events[0]]};
+    const secondPage={...flow,pagination:{cursor:'ng-down',limit:100,next_cursor:null,returned_events:1,total_events:101},events:[events[1]]};
+    vi.mocked(api).mockImplementation(async(path?:string)=>{
+      if(path===undefined)return {data:[],meta:{}} as never;
+      if(path==='/sessions/s1')return {data:{summary},meta:{}} as never;
+      if(path==='/sessions/s1/callflow?limit=100')return {data:pagedFlow,meta:{}} as never;
+      if(path==='/sessions/s1/callflow?limit=100&cursor=ng-down')return {data:secondPage,meta:{}} as never;
+      throw new Error(`unexpected path ${path}`);
+    });
+    renderFlow();
+    expect(await screen.findByTestId('callflow-pagination')).toHaveTextContent('1–1 of 101 observed');
+    await userEvent.click(screen.getByRole('button',{name:'Next'}));
+    expect(await screen.findByLabelText('DownlinkNASTransport, NGAP, AMF to gNB')).toBeVisible();
+    expect(screen.getByTestId('callflow-pagination')).toHaveTextContent('101–101 of 101 observed');
+    await userEvent.click(screen.getByRole('button',{name:'Previous'}));
+    expect(await screen.findByLabelText('InitialUEMessage, NGAP, gNB to AMF')).toBeVisible();
+  });
 });
 
 // Identity IEs are filtered BEFORE the inspector renders. We use a dedicated
@@ -111,7 +130,7 @@ describe('Call Flow viewer — identity IEs withheld (LOT 3)',()=>{
   beforeEach(()=>vi.mocked(api).mockImplementation(async(path?:string)=>{
     if(path===undefined)return {data:[],meta:{}} as never;
     if(path==='/sessions/identity')return {data:{summary:identitySummary},meta:{}} as never;
-    if(path==='/sessions/identity/callflow')return {data:identityFlow,meta:{}} as never;
+    if(path==='/sessions/identity/callflow?limit=100')return {data:identityFlow,meta:{}} as never;
     throw new Error(`unexpected path ${path}`);
   }));
 

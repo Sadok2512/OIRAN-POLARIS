@@ -30,7 +30,7 @@ describe('multi-session navigation fixture', () => {
     vi.mocked(api).mockImplementation(async (path: string) => {
       if (path.startsWith('/sessions?')) return { data: [session('s1', 'UE-1', '1'), session('s2', 'UE-1', '2')], meta: {} } as never;
       if (path === '/sessions/s2') return { data: { summary: session('s2', 'UE-1', '2') }, meta: {} } as never;
-      if (path === '/sessions/s2/callflow') return { data: flow('s2'), meta: {} } as never;
+      if (path === '/sessions/s2/callflow?limit=100') return { data: flow('s2'), meta: {} } as never;
       throw new Error(`unexpected path ${path}`);
     });
   });
@@ -50,6 +50,6 @@ describe('multi-session navigation fixture', () => {
     expect(await screen.findByRole('link', { name: /s1/ })).toBeVisible();
     await userEvent.click(screen.getByRole('link', { name: /s2/ }));
     expect(await screen.findByText('s2', { selector: '.page-intro .mono' })).toBeVisible();
-    expect(vi.mocked(api)).toHaveBeenCalledWith('/sessions/s2/callflow');
+    expect(vi.mocked(api)).toHaveBeenCalledWith('/sessions/s2/callflow?limit=100');
   });
 });
