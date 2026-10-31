@@ -85,7 +85,16 @@ function response(path: string): unknown {
     updated_at_epoch_s: now, updated_by: 'DEMO', observed_controller_running: 2, observed_total_running: 2,
     reconciliation: { operation_id: null, desired_count: 2, state: 'IDLE', started_at_epoch_s: null, completed_at_epoch_s: null, started: [], stopped: [], failures: [] },
     execution_started: false, source: 'DEMO_SYNTHETIC',
-    observed: { open5gs: processObservation('running'), ueransim_gnb: processObservation('running'), ueransim_ue: processObservation('running', true), srsran_enb: processObservation('running', true), srsran_ue: processObservation('running', true), lte_attach: 'ATTACHED' },
+    observed: {
+      open5gs: processObservation('running'),
+      nfs: Object.fromEntries(
+        ['AMF', 'SMF', 'UPF', 'NRF', 'AUSF', 'UDM', 'UDR', 'PCF', 'NSSF', 'BSF', 'MME', 'SGWC', 'SGWU', 'HSS', 'PCRF']
+          .map((nf) => [nf, processObservation('running')]),
+      ),
+      ueransim_gnb: processObservation('running'), ueransim_ue: processObservation('running', true),
+      srsran_enb: processObservation('running', true), srsran_ue: processObservation('running', true),
+      lte_attach: 'ATTACHED',
+    },
   };
   if (path === '/system/health') return { cpu: { usage_percent: 18, idle_percent: 82, logical_cpus: 8 }, memory: { total_bytes: 16_000_000_000, available_bytes: 9_000_000_000, used_bytes: 7_000_000_000 }, disk: { total_bytes: 400_000_000_000, used_bytes: 280_000_000_000, available_bytes: 120_000_000_000, usage_percent: 70 }, decision: { state: 'DEMO', writes_allowed: false, reason: 'DEMO_READ_ONLY', maximum_budget_bytes: 0 }, load_average: '0.35 0.42 0.40', uptime_seconds: 86_400, observed_at_epoch_s: now };
   if (path === '/ues') return { items: ueItems, configured_profiles: [], configured_count: 2, active_count: 2, registered_count: 2, pdu_session_count: 2, source: 'DEMO_SYNTHETIC' };
@@ -94,7 +103,7 @@ function response(path: string): unknown {
   if (path === '/nodes' || path === '/gnbs') return {
     items: [
       { id: 'GNB-DEMO-01', name: 'DEMO 5G gNB', technology: '5G SA', simulator: 'UERANSIM', plmn: '001-01', cell_id: '0xDEMO01', link_ip: '10.77.0.20', n2_endpoint: '10.77.21.20', n3_endpoint: '10.77.22.20', process_state: 'running', health: 'healthy', configured: true, controller_owned: false, uptime_seconds: 3600, actions: { start: false, stop: false, reason: 'DEMO_READ_ONLY' } },
-      { id: 'ENB-DEMO-01', name: 'DEMO LTE eNB', technology: 'LTE', simulator: 'srsRAN', plmn: '001-01', cell_id: '0xDEMO02', link_ip: '10.77.0.30', n2_endpoint: null, n3_endpoint: null, process_state: 'running', health: 'healthy', configured: true, controller_owned: true, uptime_seconds: 1800, actions: { start: false, stop: false, reason: 'DEMO_READ_ONLY' } },
+      { id: 'ENB-DEMO-01', name: 'DEMO LTE eNB', technology: 'LTE', simulator: 'srsRAN', plmn: '001-01', cell_id: '0xDEMO02', link_ip: '10.77.0.30', n2_endpoint: '10.77.31.30', n3_endpoint: '10.77.32.30', process_state: 'running', health: 'healthy', configured: true, controller_owned: true, uptime_seconds: 1800, actions: { start: false, stop: false, reason: 'DEMO_READ_ONLY' } },
     ], configured_count: 2, running_count: 2, observed_at_epoch_s: now, source: 'DEMO_SYNTHETIC',
   };
   if (path === '/lte/status') return {

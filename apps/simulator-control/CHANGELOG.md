@@ -1,5 +1,17 @@
 # @telecom/simulator-control — Changelog
 
+## 0.16.0 — 2026-10-31 — explicit LTE/5G topology
+
+- Keeps the existing `/network/topology` route and renders two visible chains
+  in the same topology: Open5GS 5GC → UERANSIM gNB → UERANSIM UE, and
+  Open5GS EPC → srsENB → srsUE.
+- Labels N2/NGAP, N3/GTP-U, S1-MME/S1AP and S1-U/GTP-U independently, using
+  `UNKNOWN` whenever the backend does not publish an endpoint or function.
+- Extends the isolated preview with clearly synthetic DEMO EPC/5GC evidence;
+  all live actions remain disabled and every mutating request remains locked.
+- Adds Playwright assertions and light/dark captures which fail when either
+  `srsENB` or `srsUE` disappears from the topology.
+
 ## 0.15.1 — 2026-10-31 — final LTE Grant V2 safety contract
 
 - Uses the canonical `LTE-SRSUE-TEST-01` profile exposed by POLARIS 0.22.0.

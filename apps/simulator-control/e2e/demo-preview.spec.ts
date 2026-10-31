@@ -17,6 +17,20 @@ test('DEMO preview exposes LTE/5G pages read-only without horizontal overflow', 
   await expectNoOverflow(page);
   if (captureProject(testInfo.project.name)) await capture(page, testInfo.project.name, 'ue-manager-lte');
 
+  await page.goto('./network/topology');
+  await expect(page.getByTestId('topology-chain-5g')).toContainText('Open5GS 5GC');
+  await expect(page.getByTestId('topology-chain-5g')).toContainText('UERANSIM gNB');
+  await expect(page.getByTestId('topology-chain-5g')).toContainText('UERANSIM UE');
+  await expect(page.getByTestId('topology-chain-lte')).toContainText('Open5GS EPC');
+  await expect(page.getByTestId('topology-chain-lte')).toContainText('srsENB');
+  await expect(page.getByTestId('topology-chain-lte')).toContainText('srsUE');
+  await expect(page.getByTestId('topology-link-S1-MME · S1AP')).toHaveAttribute('data-state', 'configured');
+  await expect(page.getByTestId('topology-link-S1-U · GTP-U')).toHaveAttribute('data-state', 'configured');
+  await expect(page.getByTestId('topology-link-N2 · NGAP')).toHaveAttribute('data-state', 'configured');
+  await expect(page.getByTestId('topology-link-N3 · GTP-U')).toHaveAttribute('data-state', 'configured');
+  await expectNoOverflow(page);
+  if (captureProject(testInfo.project.name)) await capture(page, testInfo.project.name, 'topology-lte-5g');
+
   await page.goto('./scenarios/new');
   await page.getByTestId('technology-lte').click();
   await expect(page.getByText(/Live requires ANR1 LTE E2E certification/)).toBeVisible();
