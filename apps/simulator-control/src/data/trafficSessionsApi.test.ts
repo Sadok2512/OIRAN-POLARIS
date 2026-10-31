@@ -7,6 +7,7 @@ import {
   TRAFFIC_DURATION_S_MAX,
   TRAFFIC_RATE_MBPS_MAX,
   UDP_LOSSLESS_CEILING_MBPS,
+  deriveObservedRates,
   validateTrafficRequest,
   type TrafficSessionRequest,
 } from './trafficSessionsApi';
@@ -41,6 +42,7 @@ describe('validateTrafficRequest', () => {
   it('accepts both UE-NN and UE-NNNNN', () => {
     expect(validateTrafficRequest(req({ ue_ids: ['UE-07'] }))).toBeNull();
     expect(validateTrafficRequest(req({ ue_ids: ['UE-00042'] }))).toBeNull();
+    expect(validateTrafficRequest(req({ ue_ids: ['LTE-SRSUE-TEST-01'] }))).toBeNull();
   });
 
   it('locks the rate window (1 ≤ rate_mbps ≤ 50)', () => {
@@ -68,5 +70,17 @@ describe('validateTrafficRequest', () => {
     expect(UDP_LOSSLESS_CEILING_MBPS).toBe(20);
     expect(TRAFFIC_RATE_MBPS_MAX).toBe(50);
     expect(TRAFFIC_DURATION_S_MAX).toBe(600);
+  });
+});
+
+describe('deriveObservedRates', () => {
+  it('derives rate from observed counter deltas and never uses a requested rate', () => {
+    const samples = deriveObservedRates([
+      { epoch_s: 10, bytes_ul_cum: 100, bytes_dl_cum: 50, rate_ul_bps: 9_999_999, rate_dl_bps: 9_999_999 },
+      { epoch_s: 12, bytes_ul_cum: 300, bytes_dl_cum: 150, rate_ul_bps: 9_999_999, rate_dl_bps: 9_999_999 },
+    ]);
+    expect(samples[0].rate_ul_bps).toBeNull();
+    expect(samples[1].rate_ul_bps).toBe(800);
+    expect(samples[1].rate_dl_bps).toBe(400);
   });
 });

@@ -9,13 +9,17 @@ import {
   useLogout,
   useScenarioCapabilities,
 } from '@/data/queries';
+import { useScenarioLibrary } from '@/scenarios/library';
+import { useFeatureFlags } from '@/data/featureFlags';
 
 export function SettingsPage() {
   const auth = useAuth();
   const capabilities = useCapabilities();
   const scenarioCapabilities = useScenarioCapabilities();
+  const library = useScenarioLibrary();
   const login = useLogin();
   const logout = useLogout();
+  const flags = useFeatureFlags();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [message, setMessage] = useState<string | null>(null);
@@ -153,18 +157,66 @@ export function SettingsPage() {
         </section>
 
         <section className="ep-card p-5">
-          <h2 className="text-ep-md font-semibold mb-2">Operational data contracts</h2>
+          <h2 className="text-ep-md font-semibold mb-2">Operational data sources</h2>
           <dl className="grid grid-cols-2 gap-x-5 gap-y-1 text-ep-sm">
+            <dt className="text-text-secondary">Backend scenarios</dt>
+            <dd className="num">{library.scenarios.length}</dd>
+            <dt className="text-text-secondary">Browser fixtures</dt>
+            <dd>DISABLED</dd>
             <dt className="text-text-secondary">Persistence</dt>
-            <dd>POLARIS server registries</dd>
+            <dd>POLARIS API only</dd>
             <dt className="text-text-secondary">Server-side CRUD</dt>
             <dd>
-              <code className="mono">/scenario-definitions</code> and <code className="mono">/ue-profiles</code>
+              polaris-control-api 0.10.0+:{' '}
+              <code className="mono">/scenario-definitions</code> (required)
             </dd>
           </dl>
-          <p className="text-ep-xs text-text-secondary mt-3 border-t border-border pt-3">
-            Operational pages are API-only. Browser demo stores and offline scenario/profile fixtures cannot be selected.
-          </p>
+          <label
+            className="flex items-start gap-2 text-ep-sm mt-3 border-t border-border pt-3"
+            data-testid="flag-scenario-backend"
+          >
+            <input
+              type="checkbox"
+              checked={flags.scenarioBackend}
+              disabled
+              data-testid="flag-scenario-backend-toggle"
+            />
+            <span>
+              <span className="font-medium">Use backend scenario catalog</span>
+              <span className="block text-ep-xs text-text-secondary">
+                Default <strong>ON</strong>. The Scenario Library, Builder and Execution Monitor
+                hit <code className="mono"> /scenario-definitions </code> and{' '}
+                <code className="mono">/scenarios/:job_id/steps</code>. Only integer loops
+                (1–10 000) can be saved, and only backend-certified step kinds are offered
+                in the Builder palette.
+              </span>
+              <span
+                className={`block text-ep-xs mt-1 ${flags.scenarioBackend ? 'text-text-secondary' : 'text-warning'}`}
+                data-testid="flag-scenario-backend-offline-note"
+              >
+                Backend-certified palette only; offline draft mode is disabled.
+              </span>
+            </span>
+          </label>
+          <label
+            className="flex items-start gap-2 text-ep-sm mt-3 border-t border-border pt-3"
+            data-testid="flag-profile-backend"
+          >
+            <input
+              type="checkbox"
+              checked={flags.profileBackend}
+              disabled
+              data-testid="flag-profile-backend-toggle"
+            />
+            <span>
+              <span className="font-medium">Use POLARIS UE profile registry</span>
+              <span className="block text-ep-xs text-text-secondary">
+                When enabled, the UE Manager creates, edits, clones, deletes and assigns profiles through
+                <code className="mono"> /ue-profiles </code>. SUPI, K and OPc are write-only and never
+                stored in this browser. Local profiles (polaris.ueProfiles.v1) are not migrated.
+              </span>
+            </span>
+          </label>
         </section>
 
         <section className="ep-card p-5">

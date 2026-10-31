@@ -23,7 +23,7 @@ import { Activity, Download, StopCircle, Upload, Zap } from 'lucide-react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Btn, Card, PageHeader, Pill } from '@/components/mockup';
 import { ErrorState, LoadingSkeleton } from '@/ui/EmptyErrorLoading';
-import { useAuth, useUes } from '@/data/queries';
+import { useAuth, useLteProfile, useLteStatus, useUes } from '@/data/queries';
 import {
   TRAFFIC_DURATION_S_MAX,
   TRAFFIC_DURATION_S_MIN,
@@ -35,6 +35,7 @@ import {
   startTrafficSession,
   stopTrafficSession,
   validateTrafficRequest,
+  deriveObservedRates,
   type TrafficDirection,
   type TrafficProtocol,
   type TrafficSession,
@@ -43,7 +44,6 @@ import {
 import { TrafficSparkline } from '@/components/TrafficSparkline';
 import { ApiError } from '@shared/api';
 import { TechnologySelector, type RadioTechnology } from '@/components/TechnologySelector';
-import { useLteStatus } from '@/data/queries';
 
 const QUERY_KEY = ['polaris', 'traffic-sessions'] as const;
 
@@ -88,7 +88,7 @@ function TrafficSparklineRow({ session }: { session: TrafficSession }) {
       data-testid={`traffic-sparkline-row-${session.session_id}`}
     >
       <TrafficSparkline
-        samples={samples.data ?? []}
+        samples={deriveObservedRates(samples.data ?? [])}
         label={session.session_id}
       />
       <div className="text-xs2 text-mute flex flex-col gap-0.5">
@@ -110,7 +110,8 @@ export function TrafficSessionsPage() {
   const canOperate = auth.data?.can_start === true;
   const client = useQueryClient();
   const lte = useLteStatus();
-  const inventory = useUes();
+  const lteProfile = useLteProfile();
+  const ueInventory = useUes();
   const lteTrafficAllowed = lte.data?.traffic_allowed === true;
 
   const [ueIds, setUeIds] = useState('');
@@ -120,16 +121,21 @@ export function TrafficSessionsPage() {
   const [rateMbps, setRateMbps] = useState(5);
   const [durationS, setDurationS] = useState(30);
   const [formError, setFormError] = useState<string | null>(null);
-  const selectableUes = useMemo(
-    () => (inventory.data?.items ?? []).filter((ue) =>
-      technology === 'LTE' ? ue.technology === 'LTE 4G' : ue.technology !== 'LTE 4G'),
-    [inventory.data?.items, technology],
-  );
-  useEffect(() => {
-    if (!selectableUes.some((ue) => (ue.internal_ue_id ?? ue.id) === ueIds)) {
-      setUeIds(selectableUes[0] ? (selectableUes[0].internal_ue_id ?? selectableUes[0].id) : '');
+
+  const eligibleUeIds = useMemo(() => {
+    if (technology === 'LTE') {
+      return lteProfile.data?.profile_id === 'LTE-SRSUE-TEST-01'
+        ? [lteProfile.data.profile_id]
+        : [];
     }
-  }, [selectableUes, ueIds]);
+    return (ueInventory.data?.items ?? [])
+      .filter((ue) => !/LTE/i.test(ue.technology ?? '') && !/srs/i.test(ue.simulator ?? ''))
+      .map((ue) => ue.internal_ue_id ?? ue.id);
+  }, [technology, lteProfile.data, ueInventory.data?.items]);
+
+  useEffect(() => {
+    setUeIds((current) => eligibleUeIds.includes(current) ? current : (eligibleUeIds[0] ?? ''));
+  }, [eligibleUeIds]);
 
   const list = useQuery({
     queryKey: QUERY_KEY,
@@ -219,11 +225,8 @@ export function TrafficSessionsPage() {
               onChange={(e) => setUeIds(e.target.value)}
               data-testid="traffic-ue-ids"
             >
-              <option value="">{inventory.isLoading ? 'Loading observed UEs…' : 'No observed UE available'}</option>
-              {selectableUes.map((ue) => {
-                const id = ue.internal_ue_id ?? ue.id;
-                return <option key={id} value={id}>{id} · {ue.process_state ?? 'NOT_AVAILABLE'}</option>;
-              })}
+              <option value="">No observed/configured UE available</option>
+              {eligibleUeIds.map((id) => <option key={id} value={id}>{id}</option>)}
             </select>
           </label>
           <label className="flex flex-col gap-1 text-sm2">
@@ -286,7 +289,7 @@ export function TrafficSessionsPage() {
             icon={Zap}
             primary
             onClick={submit}
-            disabled={!canOperate || start.isPending || (technology === 'LTE' && !lteTrafficAllowed)}
+            disabled={!canOperate || !ueIds || start.isPending || (technology === 'LTE' && !lteTrafficAllowed)}
             title={technology === 'LTE' && !lteTrafficAllowed ? 'LTE requires certification, valid grant, verified controller ownership, current attach/IP/session and safety gates.' : canOperate ? undefined : 'Rôle operator requis + grant actif.'}
             data-testid="traffic-start"
           >

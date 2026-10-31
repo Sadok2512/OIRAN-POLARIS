@@ -2,9 +2,9 @@ import { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Copy,
+  Download,
   Edit,
   FileJson,
-  Lock,
   Plus,
   Search,
   Trash2,
@@ -17,20 +17,19 @@ import { ConfirmDialog } from '@/ui/ConfirmDialog';
 import { useAssignments } from '@/scenarios/store';
 import { useScenarioLibrary } from '@/scenarios/library';
 import { emptyScenario, type LoopMode, type Scenario } from '@/scenarios/model';
+import { decodeDefinition } from '@/scenarios/wireCodec';
 import { isoToLocal } from '@/data/format';
 import { useFeatureFlag } from '@/data/featureFlags';
-import { useScenarioTemplates } from '@/data/scenarioTemplatesApi';
-import { ImportScenarioDialog } from '@/scenarios/ImportScenarioDialog';
 import {
-  DEFAULT_SCENARIO_TEMPLATES,
-  scenarioFromSystemTemplate,
-  templateFromDescriptor,
-  templateSupport,
-  type ScenarioTemplateCategory,
-  type ScenarioTemplateRat,
-  type ScenarioTemplateSupport,
-  type SystemScenarioTemplate,
-} from '@/scenarios/defaultTemplates';
+  defaultFilename,
+  downloadScenarioExport,
+  useScenarioEstimate,
+  useScenarioTemplates,
+  type ScenarioTemplateDescriptor,
+} from '@/data/scenarioTemplatesApi';
+import type { WireScenarioDefinition } from '@/scenarios/wireCodec';
+import { ApiError } from '@shared/api';
+import { ImportScenarioDialog } from '@/scenarios/ImportScenarioDialog';
 
 type Tab = 'library' | 'templates';
 
@@ -153,7 +152,7 @@ export function ScenariosLibraryPage() {
             }`}
             data-testid={`scenarios-tab-${value}`}
           >
-            {value === 'library' ? 'My scenarios' : 'Templates LTE / 5G'}
+            {value === 'library' ? 'My scenarios' : 'Templates (tpl-*)'}
           </button>
         ))}
       </div>
@@ -311,169 +310,191 @@ function TemplatesTab({
 }) {
   const flag = useFeatureFlag('scenarioTemplates');
   const templates = useScenarioTemplates();
-  const [rat, setRat] = useState<'ALL' | ScenarioTemplateRat>('ALL');
-  const [category, setCategory] = useState<'ALL' | ScenarioTemplateCategory>('ALL');
-
-  const catalog = useMemo(
-    () => templates.data?.schema_version === 'polaris.scenario-template-catalog.v1'
-      ? templates.data.items.map(templateFromDescriptor)
-      : DEFAULT_SCENARIO_TEMPLATES,
-    [templates.data],
-  );
-  const visible = useMemo(
-    () => catalog.filter((item) =>
-      (rat === 'ALL' || item.rat === rat) &&
-      (category === 'ALL' || item.category === category)),
-    [catalog, category, rat],
-  );
 
   if (!flag) {
     return (
       <Unavailable
-        reason="Template API disabled in Settings. The system catalog remains immutable and no backend request is issued."
+        reason="Backend pending — enable 'Scenario templates (0.5.0)' in Settings once Codex pushes feat/polaris-traffic-templates. Nothing is fetched while the flag is OFF."
+      />
+    );
+  }
+  if (templates.isLoading) return <LoadingSkeleton label="Loading the backend scenario catalogue" />;
+  if (templates.error) {
+    const code =
+      templates.error instanceof ApiError
+        ? (templates.error as ApiError).code
+        : 'TEMPLATE_FETCH_FAILED';
+    return (
+      <Unavailable reason={`${code} · ${(templates.error as Error).message}`} />
+    );
+  }
+  if (!templates.data || templates.data.items.length === 0) {
+    return (
+      <EmptyState
+        title="No backend templates available"
+        description="The real POLARIS catalogue returned no immutable tpl-* definition. No browser fallback is used."
       />
     );
   }
 
   return (
-    <div className="space-y-4" data-testid="templates-catalog">
-      <section className="ep-card p-4 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-        <div>
-          <h2 className="text-ep-md font-semibold">System templates</h2>
-          <p className="text-ep-sm text-text-secondary mt-1">
-            Immutable starting points. Use or customize always creates a new editable copy.
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-3">
-          <label className="flex flex-col gap-1 text-ep-xs text-text-secondary">
-            RAT
-            <select className="ep-input min-w-48" value={rat} onChange={(event) => setRat(event.target.value as typeof rat)} aria-label="Template RAT filter">
-              <option value="ALL">All RATs</option>
-              <option value="LTE">LTE 4G · srsRAN</option>
-              <option value="5G_SA">5G SA · UERANSIM</option>
-            </select>
-          </label>
-          <label className="flex flex-col gap-1 text-ep-xs text-text-secondary">
-            Category
-            <select className="ep-input min-w-48" value={category} onChange={(event) => setCategory(event.target.value as typeof category)} aria-label="Template category filter">
-              <option value="ALL">All categories</option>
-              {(['Connectivity', 'Session', 'Data UL/DL', 'Full Session', 'Multi-UE'] as ScenarioTemplateCategory[]).map((value) => <option key={value}>{value}</option>)}
-            </select>
-          </label>
-        </div>
-      </section>
-
-      {templates.isLoading && <LoadingSkeleton label="Checking backend template contract" />}
-      {templates.error && (
-        <div className="ep-card border-warning/30 p-3 text-ep-sm text-warning" role="status">
-          Backend template contract unavailable · system templates remain draft-only.
-        </div>
-      )}
-      {!templates.isLoading && !templates.error && (
-        <p className="text-ep-xs text-text-secondary" data-testid="backend-template-sync">
-          ANR1 catalogue synchronized · {templates.data?.items.length ?? 0} immutable descriptor(s) · {templates.data?.schema_version}.
-        </p>
-      )}
-
-      <div className="grid gap-4 xl:grid-cols-2" data-testid="templates-grid">
-        {visible.map((item) => (
-          <TemplateCard
-            key={item.id}
-            item={item}
-            support={templateSupport(item)}
-            onError={onError}
-            onClearError={onClearError}
-          />
-        ))}
-      </div>
-      {visible.length === 0 && <EmptyState title="No template matches" description="Adjust RAT or category filters." />}
+    <div className="ep-card overflow-hidden">
+      <table className="ep-table" data-testid="templates-table">
+        <thead>
+          <tr>
+            <th>Template</th>
+            <th>Steps</th>
+            <th>Loop</th>
+            <th>Estimated duration</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {templates.data.items.map((item) => {
+            const definition = definitionFromTemplateDescriptor(item);
+            return (
+            <TemplateRow
+              key={item.template_id}
+              definition={definition}
+              onError={onError}
+              onClearError={onClearError}
+            />
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }
 
-function TemplateCard({
-  item,
-  support,
+export function definitionFromTemplateDescriptor(
+  descriptor: ScenarioTemplateDescriptor,
+): WireScenarioDefinition {
+  const label = descriptor.template_id
+    .replace(/^tpl-/, '')
+    .split('-')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+  const major = Number.parseInt(descriptor.version.split('.')[0] ?? '1', 10);
+  return {
+    id: descriptor.template_id,
+    name: label || descriptor.template_id,
+    version: Number.isFinite(major) && major > 0 ? major : 1,
+    loop_count: 1,
+    steps: descriptor.steps,
+    rat: descriptor.rat,
+    simulator: descriptor.simulator,
+    description: descriptor.description,
+    catalog_scope: 'SYSTEM',
+    mutable: false,
+    cloneable: true,
+    backend_support: descriptor.backend_support,
+  };
+}
+
+function TemplateRow({
+  definition,
   onError,
   onClearError,
 }: {
-  item: SystemScenarioTemplate;
-  support: ScenarioTemplateSupport;
+  definition: WireScenarioDefinition;
   onError: (message: string) => void;
   onClearError: () => void;
 }) {
   const navigate = useNavigate();
-  function openInBuilder(action: 'use' | 'customize') {
+  const estimate = useScenarioEstimate(definition.id);
+  const [downloading, setDownloading] = useState(false);
+
+  // 0.6.0 — "Clone" no longer POSTs to /scenario-definitions/:id/clone and
+  // navigates to the server-side result. Instead it decodes the template
+  // (which is read-only, tpl-* backed by the backend) and hands the Builder
+  // a seeded draft via route state. The operator reviews, edits and clicks
+  // Save, which creates a brand-new definition — Clone becomes a real "copy
+  // and edit" instead of a silent backend duplication.
+  function openCloneInBuilder() {
     onClearError();
     try {
-      const seedFromTemplate = scenarioFromSystemTemplate(item);
-      navigate('/scenarios/new', {
-        state: {
-          seedFromTemplate,
-          systemTemplate: { id: item.id, name: item.name, action, support },
-        },
-      });
+      const seedFromTemplate = decodeDefinition(definition);
+      navigate('/scenarios/new', { state: { seedFromTemplate } });
     } catch (error) {
-      onError(`Template ${item.id} refused · ${(error as Error).message}`);
+      const code = error instanceof ApiError ? (error as ApiError).code : 'CLONE_DECODE_FAILED';
+      onError(`Clone of ${definition.id} refused · ${code} · ${(error as Error).message}`);
+    }
+  }
+
+  async function download() {
+    onClearError();
+    setDownloading(true);
+    try {
+      const { payload, filename } = await downloadScenarioExport(definition.id);
+      const expectedFilename = defaultFilename(payload.definition);
+      const resolved = filename && filename !== 'export.json' ? filename : expectedFilename;
+      const blob = new Blob([JSON.stringify(payload, null, 2)], {
+        type: 'application/json',
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = resolved;
+      anchor.rel = 'noopener';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      const code = error instanceof ApiError ? (error as ApiError).code : 'DOWNLOAD_FAILED';
+      onError(`Download ${definition.id} failed · ${code}`);
+    } finally {
+      setDownloading(false);
     }
   }
 
   return (
-    <article className="ep-card p-5 flex flex-col gap-4" data-testid={`template-card-${item.id}`}>
-      <header className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2 mb-1">
-            <FileJson width={15} height={15} className="text-primary" />
-            <span className="ep-badge">{item.category}</span>
-            <span className="ep-badge">{item.rat === 'LTE' ? 'LTE 4G' : '5G SA'}</span>
-            <SupportBadge value={support} />
+    <tr data-testid={`template-row-${definition.id}`}>
+      <td>
+        <div className="flex items-center gap-2">
+          <FileJson width={14} height={14} className="text-primary" />
+          <div className="min-w-0">
+            <div className="font-medium truncate">{definition.name}</div>
+            <div className="mono text-ep-xs text-text-secondary truncate">
+              {definition.id} · v{definition.version ?? '?'}
+            </div>
           </div>
-          <h3 className="text-ep-md font-semibold">{item.name}</h3>
-          <p className="mono text-ep-xs text-text-secondary">{item.id} · {item.simulator} · system/read-only</p>
         </div>
-        <Lock width={15} height={15} className="text-text-secondary shrink-0" aria-label="Immutable system template" />
-      </header>
-      <p className="text-ep-sm text-text-secondary">{item.description}</p>
-      <dl className="grid grid-cols-2 gap-2 text-ep-sm sm:grid-cols-4">
-        <div><dt className="text-ep-xs text-text-secondary">Steps</dt><dd className="font-semibold">{item.definition.steps.length}</dd></div>
-        <div><dt className="text-ep-xs text-text-secondary">Duration</dt><dd className="font-semibold">{item.durationSeconds}s</dd></div>
-        <div><dt className="text-ep-xs text-text-secondary">Throughput</dt><dd className="font-semibold">{item.throughputKbps ? `≤ ${item.throughputKbps} kbit/s` : 'None'}</dd></div>
-        <div><dt className="text-ep-xs text-text-secondary">Loop</dt><dd className="font-semibold">× {item.definition.loop_count}</dd></div>
-      </dl>
-      <div>
-        <p className="text-ep-xs uppercase tracking-wider text-text-secondary mb-2">Steps</p>
-        <ol className="flex flex-wrap gap-1" aria-label={`${item.name} steps`}>
-          {item.definition.steps.map((entry, index) => <li key={`${entry.type}-${index}`} className="ep-badge">{index + 1}. {entry.type}</li>)}
-        </ol>
-      </div>
-      <div>
-        <p className="text-ep-xs uppercase tracking-wider text-text-secondary mb-1">Prerequisites</p>
-        <ul className="text-ep-xs text-text-secondary list-disc pl-4">{item.prerequisites.map((value) => <li key={value}>{value}</li>)}</ul>
-      </div>
-      <footer className="mt-auto flex flex-wrap items-center gap-2 border-t border-border pt-3">
+      </td>
+      <td className="num">{definition.steps.length}</td>
+      <td>× {definition.loop_count ?? 1}</td>
+      <td className="mono text-ep-xs" data-testid={`template-estimate-${definition.id}`}>
+        {estimate.isLoading
+          ? 'estimating…'
+          : estimate.data
+            ? `${(estimate.data.duration_ms / 1000).toFixed(1)} s`
+            : '—'}
+      </td>
+      <td>
+        <div className="flex flex-wrap items-center gap-1">
           <button
             type="button"
-            className="ep-button ep-button-sm ep-button-primary"
-            onClick={() => openInBuilder('use')}
-            data-testid={`template-use-${item.id}`}
+            className="ep-button ep-button-sm"
+            onClick={download}
+            disabled={downloading}
+            data-testid={`template-download-${definition.id}`}
           >
-            Use Template
+            <Download width={13} height={13} />
+            {downloading ? 'Downloading…' : 'Download JSON'}
           </button>
           <button
             type="button"
             className="ep-button ep-button-sm"
-            onClick={() => openInBuilder('customize')}
-            data-testid={`template-customize-${item.id}`}
-            title="Open an editable copy. The system template remains immutable."
+            onClick={openCloneInBuilder}
+            data-testid={`template-clone-${definition.id}`}
+            title="Open an editable copy in the Scenario Builder. Save creates a new definition; the template stays read-only."
           >
-            <Copy width={13} height={13} /> Customize
+            <Copy width={13} height={13} /> Clone
           </button>
-      </footer>
-    </article>
+        </div>
+      </td>
+    </tr>
   );
-}
-
-function SupportBadge({ value }: { value: ScenarioTemplateSupport }) {
-  const tone = value === 'SUPPORTED' ? 'text-success' : value === 'CERTIFICATION_REQUIRED' ? 'text-warning' : 'text-text-secondary';
-  return <span className={`ep-badge ${tone}`} data-testid={`support-${value}`}>{value}</span>;
 }

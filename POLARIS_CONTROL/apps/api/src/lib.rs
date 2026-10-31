@@ -3437,6 +3437,24 @@ async fn authorize(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let path = request.uri().path().to_string();
+    if staging_read_only_enabled() && !staging_request_allowed(request.method(), &path) {
+        log_http_refusal(
+            &state,
+            StatusCode::LOCKED,
+            request.method(),
+            &path,
+            "staging",
+        );
+        return (
+            StatusCode::LOCKED,
+            Json(json!({
+                "error":"STAGING_READ_ONLY",
+                "mutations_enabled":false
+            })),
+        )
+            .into_response();
+    }
     let now = epoch_seconds();
     let session_id = cookie_value(request.headers(), "polaris_session");
     let session = session_id.as_ref().and_then(|id| {
@@ -3473,12 +3491,24 @@ async fn authorize(
     // the role (operator / viewer / administrator) but NEVER the
     // username, session id, cookie or any other identity material.
     let method = request.method().clone();
-    let path = request.uri().path().to_string();
     let role = identity.role.clone();
     request.extensions_mut().insert(identity);
     let response = next.run(request).await;
     log_http_refusal(&state, response.status(), &method, &path, &role);
     response
+}
+
+fn staging_read_only_enabled() -> bool {
+    std::env::var("POLARIS_STAGING_READ_ONLY").as_deref() == Ok("true")
+}
+
+fn staging_request_allowed(method: &Method, path: &str) -> bool {
+    matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+        || (*method == Method::POST
+            && matches!(
+                path,
+                "/auth/login" | "/auth/logout" | "/api/v1/auth/login" | "/api/v1/auth/logout"
+            ))
 }
 
 /// 0.19.2 — Journal every refused HTTP request (any 4xx or 5xx status)
@@ -3628,12 +3658,12 @@ async fn logout(
 
 async fn health() -> Json<Value> {
     Json(
-        json!({"status":"ok","service":"POLARIS Control","version":VERSION,"live_control":"OPERATOR_POLICY"}),
+        json!({"status":"ok","service":"POLARIS Control","version":VERSION,"live_control":"OPERATOR_POLICY","staging_read_only":staging_read_only_enabled()}),
     )
 }
 async fn version() -> Json<Value> {
     Json(
-        json!({"platform":"3.2.1","api":VERSION,"scenario_engine":scenario_engine::VERSION,"safety_guard":safety_guard::VERSION,"ueransim_adapter":ueransim_adapter::VERSION,"srsran_controller":srsran_controller::VERSION,"multi_ue_controller":simulator_controller::VERSION}),
+        json!({"platform":"3.2.1","api":VERSION,"scenario_engine":scenario_engine::VERSION,"safety_guard":safety_guard::VERSION,"ueransim_adapter":ueransim_adapter::VERSION,"srsran_controller":srsran_controller::VERSION,"multi_ue_controller":simulator_controller::VERSION,"staging_read_only":staging_read_only_enabled()}),
     )
 }
 async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -3975,6 +4005,12 @@ async fn lab(State(state): State<Arc<AppState>>) -> Json<Value> {
         .lock()
         .map(|runtime| usize::from(runtime.active.is_some()))
         .unwrap_or(0);
+    let lte_attach = state
+        .srsran_runtime
+        .status(state.lte_e2e_certified, state.srsran_live_enabled)
+        .ok()
+        .map(|status| status.attach_state)
+        .unwrap_or_else(|| "UNKNOWN".into());
     Json(
         json!({"source":"READ_ONLY_HOST_AUDIT","configuration_changed":false,"observed":{
             "ueransim_ue_profile":ue,
@@ -3985,7 +4021,7 @@ async fn lab(State(state): State<Arc<AppState>>) -> Json<Value> {
             "srsran_enb":container_status("oiran-lab-srsenb-1"),
             "srsran_ue":container_status("oiran-lab-srsue-1"),
             "nfs":nfs,
-            "lte_attach":"NOT_CERTIFIED",
+            "lte_attach":lte_attach,
             "controller_owned_active_jobs":active_jobs
         }}),
     )
@@ -4063,6 +4099,40 @@ fn container_status(name: &str) -> Value {
             json!({"process_state":process_state,"health":health,"observed":true})
         }
         None => json!({"process_state":"unknown","health":"unknown","observed":false}),
+    }
+}
+
+fn inspect_container_interface_state(name: &str, transport: &str, port: &str) -> String {
+    let filter = match transport {
+        "sctp" => format!("ss -H -n -A sctp state established | grep -F ':{}'", port),
+        "udp" => format!("ss -H -n -u -a | grep -F ':{}'", port),
+        _ => return "NOT_AVAILABLE".into(),
+    };
+    let output = Command::new("/usr/bin/timeout")
+        .args([
+            "--signal=TERM",
+            "--kill-after=1s",
+            "5s",
+            "/usr/bin/docker",
+            "exec",
+            name,
+            "/bin/sh",
+            "-c",
+            &filter,
+        ])
+        .output();
+    match output {
+        Ok(result) if result.status.success() && !result.stdout.is_empty() => {
+            if transport == "sctp" {
+                "CONNECTED".into()
+            } else {
+                // UDP has no connection handshake. A bound GTP-U socket is
+                // evidence of a socket only, never proof of an N3 peer.
+                "SOCKET_OBSERVED".into()
+            }
+        }
+        Ok(result) if result.status.code() == Some(1) => "NOT_OBSERVED".into(),
+        _ => "NOT_AVAILABLE".into(),
     }
 }
 
@@ -4321,17 +4391,32 @@ async fn lte_profile(
     };
     let profile = registry.profile();
     let compose_model_sha256 = srsran_controller::compose_model_sha256().ok();
+    let observed = state
+        .srsran_runtime
+        .status(state.lte_e2e_certified, state.srsran_live_enabled)
+        .ok();
+    let runtime_state = observed
+        .as_ref()
+        .map(|status| status.ue.process_state.as_str())
+        .unwrap_or("UNKNOWN");
+    let apn = observed
+        .as_ref()
+        .map(|status| status.apn.as_str())
+        .unwrap_or("NOT_AVAILABLE");
+    let last_observed_at = observed.as_ref().map(|_| epoch_seconds());
     (
         StatusCode::OK,
         Json(json!({
                 "schema_version":"polaris.lte-profile.v1", "profile_id":lte_grant::PROFILE_ID,
+                "technology":"LTE 4G", "simulator":"srsUE",
+                "serving_ran":"ENB-01", "serving_ran_type":"srsENB",
                 "revision":profile.revision, "owner":profile.owner, "enabled":profile.enabled,
-                "runtime_state":"STOPPED", "apn":"internet", "max_running_ues":1,
+                "runtime_state":runtime_state, "apn":apn, "max_running_ues":1,
                 "configuration_sha256":profile.configuration_sha256, "compose_model_sha256":compose_model_sha256, "grant_required":true,
                 "scenario_id":lte_grant::SCENARIO_ID,
                 "scenario_revision":1,
                 "scenario_sha256":lte_grant::SCENARIO_SHA256,
-                "last_observed_at_epoch_s":epoch_seconds(), "evidence_schema":"oiran-polaris.lte-e2e-evidence.v1"
+                "last_observed_at_epoch_s":last_observed_at, "evidence_schema":lte_orchestrator::EVIDENCE_SCHEMA
         })),
     )
 }
@@ -5025,7 +5110,7 @@ async fn get_lte_run(
                 } else {
                     grant.run_state.unwrap_or_else(|| "UNKNOWN".into())
                 },
-                "deadline_at_epoch_ms":grant.expires_at_epoch_ms, "evidence_schema":"polaris.lte-evidence.v1"
+                "deadline_at_epoch_ms":grant.expires_at_epoch_ms, "evidence_schema":lte_orchestrator::EVIDENCE_SCHEMA
             })),
         ),
         None => (
@@ -5368,6 +5453,17 @@ async fn stop_lte_component(
 
 async fn nodes(State(state): State<Arc<AppState>>) -> Json<Value> {
     let gnb = container_status("oiran-lab-ueransim-gnb-1");
+    let gnb_running = gnb["observed"] == true && gnb["process_state"] == "running";
+    let n2_state = if gnb_running {
+        inspect_container_interface_state("oiran-lab-ueransim-gnb-1", "sctp", "38412")
+    } else {
+        "NOT_OBSERVED".into()
+    };
+    let n3_state = if gnb_running {
+        inspect_container_interface_state("oiran-lab-ueransim-gnb-1", "udp", "2152")
+    } else {
+        "NOT_OBSERVED".into()
+    };
     let lte = state
         .srsran_runtime
         .status(state.lte_e2e_certified, state.srsran_live_enabled)
@@ -5382,16 +5478,57 @@ async fn nodes(State(state): State<Arc<AppState>>) -> Json<Value> {
         .unwrap_or("unknown");
     let lte_actions_enabled = state.lte_e2e_certified && state.srsran_live_enabled;
     let configured_gnbs = state.configuration.lock().unwrap().gnb_count;
+    let mut items = vec![json!({
+        "id":"GNB-01", "name":"Primary gNB", "technology":"5G SA", "simulator":"UERANSIM",
+        "plmn":"NOT_AVAILABLE", "cell_id":"NOT_OBSERVED", "link_ip":"NOT_OBSERVED",
+        "n2_endpoint":Value::Null, "n3_endpoint":Value::Null,
+        "n2_state":n2_state, "n3_state":n3_state,
+        "process_state":gnb["process_state"], "health":gnb["health"],
+        "configured":configured_gnbs >= 1, "controller_owned":false,
+        "uptime_seconds":Value::Null,
+        "evidence_source":"docker_inspect_and_socket_observation",
+        "actions":{"start":false,"stop":false,"reason":"SHARED_NODE_PROTECTED"}
+    })];
+    if configured_gnbs >= 2 {
+        items.push(json!({
+            "id":"GNB-02", "name":"Second configured gNB", "technology":"5G SA", "simulator":"UERANSIM",
+            "plmn":"NOT_AVAILABLE", "cell_id":"NOT_OBSERVED", "link_ip":"NOT_OBSERVED",
+            "n2_endpoint":Value::Null, "n3_endpoint":Value::Null,
+            "n2_state":"NOT_OBSERVED", "n3_state":"NOT_OBSERVED",
+            "process_state":"NOT_OBSERVED", "health":"NOT_OBSERVED", "configured":true,
+            "controller_owned":false, "uptime_seconds":Value::Null,
+            "evidence_source":"controller_configuration",
+            "actions":{"start":false,"stop":false,"reason":"LIVE_005_APPROVAL_REQUIRED"}
+        }));
+    }
+    let s1u_state = lte
+        .as_ref()
+        .map(|status| {
+            if status.active_sessions > 0 && status.ue_ip.is_some() {
+                "SESSION_OBSERVED"
+            } else {
+                "NOT_OBSERVED"
+            }
+        })
+        .unwrap_or("NOT_OBSERVED");
+    items.push(json!({
+        "id":"ENB-01", "name":"LTE eNB", "technology":"LTE 4G", "simulator":"srsRAN",
+        "plmn":"NOT_AVAILABLE", "cell_id":"NOT_OBSERVED", "link_ip":"NOT_OBSERVED",
+        "n2_endpoint":Value::Null, "n3_endpoint":Value::Null,
+        "s1_state":lte.as_ref().map(|status|status.s1_state.clone()).unwrap_or_else(||"NOT_OBSERVED".into()),
+        "s1u_state":s1u_state,
+        "epc_state":lte.as_ref().map(|status|status.epc.process_state.clone()).unwrap_or_else(||"NOT_OBSERVED".into()),
+        "process_state":enb_state, "health":enb_health,
+        "configured":lte.is_some(), "controller_owned":lte.as_ref().is_some_and(|status|status.enb.controller_owned),
+        "uptime_seconds":Value::Null, "evidence_source":"srsran_runtime_observation",
+        "actions":{"start":lte_actions_enabled && enb_state!="running","stop":enb_state=="running","reason":if lte_actions_enabled {"LIVE_GRANT_REQUIRED"}else{"LTE_E2E_CERTIFICATION_REQUIRED"}}
+    }));
     Json(json!({
-        "items":[
-            {"id":"GNB-01","name":"Primary gNB","technology":"5G SA","simulator":"UERANSIM","plmn":"001-01","cell_id":"0x000000010","link_ip":"10.77.0.20","n2_endpoint":"10.77.21.20","n3_endpoint":"10.77.22.20","process_state":gnb["process_state"],"health":gnb["health"],"configured":true,"controller_owned":false,"uptime_seconds":Value::Null,"actions":{"start":false,"stop":false,"reason":"SHARED_NODE_PROTECTED"}},
-            {"id":"GNB-02","name":"Second gNB plan","technology":"5G SA","simulator":"UERANSIM","plmn":"001-01","cell_id":"UNASSIGNED","link_ip":"NOT_CONFIGURED","n2_endpoint":Value::Null,"n3_endpoint":Value::Null,"process_state":"NOT_DEPLOYED","health":"NOT_VALIDATED","configured":configured_gnbs==2,"controller_owned":false,"uptime_seconds":Value::Null,"actions":{"start":false,"stop":false,"reason":"LIVE_005_APPROVAL_REQUIRED"}},
-            {"id":"ENB-01","name":"LTE eNB","technology":"LTE 4G","simulator":"srsRAN","plmn":"001-01","cell_id":"NOT_OBSERVED","link_ip":"NOT_OBSERVED","n2_endpoint":Value::Null,"n3_endpoint":Value::Null,"s1_state":lte.as_ref().map(|status|status.s1_state.clone()).unwrap_or_else(||"NOT_OBSERVED".into()),"epc_state":lte.as_ref().map(|status|status.epc.process_state.clone()).unwrap_or_else(||"NOT_OBSERVED".into()),"process_state":enb_state,"health":enb_health,"configured":true,"controller_owned":true,"uptime_seconds":Value::Null,"actions":{"start":lte_actions_enabled && enb_state!="running","stop":enb_state=="running","reason":if lte_actions_enabled {"LIVE_GRANT_REQUIRED"}else{"LTE_E2E_CERTIFICATION_REQUIRED"}}}
-        ],
-        "configured_count":configured_gnbs+1,
+        "items":items,
+        "configured_count":configured_gnbs+usize::from(lte.is_some()),
         "running_count":usize::from(gnb["process_state"]=="running")+usize::from(enb_state=="running"),
         "observed_at_epoch_s":epoch_seconds(),
-        "source":"READ_ONLY_LAB_STATE"
+        "source":"CONTROLLER_AND_RUNTIME_OBSERVATIONS"
     }))
 }
 
@@ -9640,10 +9777,8 @@ async fn traffic_status(State(state): State<Arc<AppState>>) -> Json<Value> {
 // attempts to resolve a `VerifiedTrafficTarget` for each UE in the
 // request and, when the resolution succeeds, calls
 // `UeRuntime::execute_iperf_ul` / `_dl` on a blocking thread. When the
-// resolution fails (test mode, mock backend, or a UE whose PDU is not
-// active) the driver falls back to a synthesised sample at the
-// requested rate so the pipeline keeps feeding the chart — this is the
-// 0.19.8 "measurement never fails the session" invariant.
+// resolution fails (test mode, unavailable UE, inactive PDU), the session
+// becomes FAILED and exposes no fabricated counter.
 
 async fn list_traffic_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let items = state.traffic_manager.list();
@@ -9936,9 +10071,8 @@ async fn get_traffic_samples(
 ///      measurement on a dedicated worker thread. The measurement
 ///      produces an `IperfMeasurement` whose warnings are folded into
 ///      the session via `record_measurement`.
-///   3. For UEs whose target does NOT resolve (mock mode, UE not
-///      REGISTERED+PDU-ACTIVE, …) the driver synthesises a sample at
-///      the requested rate so the live chart stays populated.
+///   3. Any unavailable target or failed measurement fails the session.
+///      Requested rate is never published as if it were observed traffic.
 ///
 /// The loop exits early as soon as the session leaves the RUNNING
 /// state (an operator-issued STOP flips it to STOPPED and the driver
@@ -9953,7 +10087,6 @@ fn spawn_traffic_driver(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let rate_bytes_per_tick: u64 = (u64::from(request.rate_mbps) * 1_000_000 / 8).max(1);
         let direction = request.direction;
         let total_ticks = u64::from(request.duration_s).max(1);
         let mut per_ue_bytes: BTreeMap<String, (u64, u64)> = request
@@ -9974,46 +10107,30 @@ fn spawn_traffic_driver(
                 _ => {}
             }
             let now = started_at.saturating_add(tick + 1);
-            let (bytes_ul_delta, bytes_dl_delta): (u64, u64) = match direction {
-                traffic_sessions::Direction::Ul => (rate_bytes_per_tick, 0),
-                traffic_sessions::Direction::Dl => (0, rate_bytes_per_tick),
-                traffic_sessions::Direction::Both => (rate_bytes_per_tick, rate_bytes_per_tick),
-            };
-            let (rate_ul_bps, rate_dl_bps): (Option<u64>, Option<u64>) = match direction {
-                traffic_sessions::Direction::Ul => {
-                    (Some(u64::from(request.rate_mbps) * 1_000_000), None)
-                }
-                traffic_sessions::Direction::Dl => {
-                    (None, Some(u64::from(request.rate_mbps) * 1_000_000))
-                }
-                traffic_sessions::Direction::Both => (
-                    Some(u64::from(request.rate_mbps) * 1_000_000),
-                    Some(u64::from(request.rate_mbps) * 1_000_000),
-                ),
-            };
             let mut cum_ul = 0u64;
             let mut cum_dl = 0u64;
             for ue_id in &request.ue_ids {
+                let measured =
+                    match measure_traffic_tick(&state, ue_id, direction, request.rate_mbps).await {
+                        Ok(measured) => measured,
+                        Err(code) => {
+                            let _ = state.traffic_manager.fail(&session_id, code);
+                            return;
+                        }
+                    };
                 let entry = per_ue_bytes.entry(ue_id.clone()).or_insert((0, 0));
-                entry.0 = entry.0.saturating_add(bytes_ul_delta);
-                entry.1 = entry.1.saturating_add(bytes_dl_delta);
+                entry.0 = entry.0.saturating_add(measured.bytes_ul);
+                entry.1 = entry.1.saturating_add(measured.bytes_dl);
                 cum_ul = cum_ul.saturating_add(entry.0);
                 cum_dl = cum_dl.saturating_add(entry.1);
-                let warnings = measure_or_synthesise(
-                    &state,
-                    ue_id,
-                    direction,
-                    bytes_ul_delta.saturating_add(bytes_dl_delta),
-                )
-                .await;
                 let _ = state.traffic_manager.record_measurement(
                     &session_id,
                     ue_id,
-                    bytes_ul_delta,
-                    bytes_dl_delta,
-                    rate_ul_bps,
-                    rate_dl_bps,
-                    warnings,
+                    measured.bytes_ul,
+                    measured.bytes_dl,
+                    None,
+                    None,
+                    measured.warnings,
                 );
             }
             let _ = state.traffic_manager.push_sample(
@@ -10022,8 +10139,8 @@ fn spawn_traffic_driver(
                     epoch_s: now,
                     bytes_ul_cum: cum_ul,
                     bytes_dl_cum: cum_dl,
-                    rate_ul_bps,
-                    rate_dl_bps,
+                    rate_ul_bps: None,
+                    rate_dl_bps: None,
                 },
             );
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -10032,48 +10149,67 @@ fn spawn_traffic_driver(
     });
 }
 
-/// Per-UE per-tick measurement step. Tries the real iperf3 driver via
-/// `UeRuntime`; on failure returns a well-defined warning string the
-/// manager will dedupe into the session. The 0.19.8 contract says
-/// warnings never fail the session — this helper is the enforcement
-/// point.
-async fn measure_or_synthesise(
+struct ObservedTrafficTick {
+    bytes_ul: u64,
+    bytes_dl: u64,
+    warnings: Vec<String>,
+}
+
+/// Per-UE real measurement step. No configured/requested value is accepted
+/// as accounting evidence; failures propagate to the session state.
+async fn measure_traffic_tick(
     state: &AppState,
     ue_id: &str,
     direction: traffic_sessions::Direction,
-    bytes_hint: u64,
-) -> Vec<String> {
-    // Build a lightweight job view to call `resolve_traffic_target`.
-    // When the UE registry has no owned job for this ue_id we skip the
-    // iperf3 attempt entirely and surface a warning rather than
-    // panicking the driver.
+    rate_mbps: u32,
+) -> Result<ObservedTrafficTick, String> {
     let job_opt = {
         let controller = state.multi_ue.lock().ok();
         controller.and_then(|guard| guard.snapshot().into_iter().find(|job| job.ue_id == ue_id))
     };
     let Some(job) = job_opt else {
-        return vec!["TRAFFIC_SESSION_UE_NOT_REGISTERED".into()];
+        return Err("TRAFFIC_SESSION_UE_NOT_REGISTERED".into());
     };
     let target = match state.ue_runtime.resolve_traffic_target(&job, "10.46.0.1") {
         Ok(target) => target,
-        Err(code) => return vec![code],
+        Err(code) => return Err(code),
     };
     let runtime = state.ue_runtime.clone();
     let sender = state.dl_sender.clone();
-    let bytes = bytes_hint.max(1);
-    let outcome = tokio::task::spawn_blocking(move || -> Result<IperfMeasurement, String> {
+    let bytes = (u64::from(rate_mbps) * 1_000_000 / 8).max(1);
+    let outcome = tokio::task::spawn_blocking(move || -> Result<ObservedTrafficTick, String> {
         match direction {
-            traffic_sessions::Direction::Ul | traffic_sessions::Direction::Both => {
-                runtime.execute_iperf_ul(&target, bytes, &sender)
+            traffic_sessions::Direction::Ul => {
+                let m = runtime.execute_iperf_ul(&target, bytes, &sender)?;
+                Ok(ObservedTrafficTick {
+                    bytes_ul: m.server_received_bytes,
+                    bytes_dl: 0,
+                    warnings: m.warning.into_iter().collect(),
+                })
             }
-            traffic_sessions::Direction::Dl => runtime.execute_iperf_dl(&target, bytes, &sender),
+            traffic_sessions::Direction::Dl => {
+                let m = runtime.execute_iperf_dl(&target, bytes, &sender)?;
+                Ok(ObservedTrafficTick {
+                    bytes_ul: 0,
+                    bytes_dl: m.server_received_bytes,
+                    warnings: m.warning.into_iter().collect(),
+                })
+            }
+            traffic_sessions::Direction::Both => {
+                let ul = runtime.execute_iperf_ul(&target, bytes, &sender)?;
+                let dl = runtime.execute_iperf_dl(&target, bytes, &sender)?;
+                Ok(ObservedTrafficTick {
+                    bytes_ul: ul.server_received_bytes,
+                    bytes_dl: dl.server_received_bytes,
+                    warnings: ul.warning.into_iter().chain(dl.warning).collect(),
+                })
+            }
         }
     })
     .await;
     match outcome {
-        Ok(Ok(measurement)) => measurement.warning.map(|w| vec![w]).unwrap_or_default(),
-        Ok(Err(code)) => vec![code],
-        Err(_) => vec!["IPERF3_WORKER_JOIN_FAILED".into()],
+        Ok(result) => result,
+        Err(_) => Err("IPERF3_WORKER_JOIN_FAILED".into()),
     }
 }
 
@@ -12890,6 +13026,35 @@ mod p0_tests {
     static TEST_ID: AtomicU64 = AtomicU64::new(1);
 
     #[test]
+    fn staging_read_only_allows_reads_and_local_auth_but_blocks_mutations() {
+        assert!(staging_request_allowed(&Method::GET, "/api/v1/ues"));
+        assert!(staging_request_allowed(&Method::HEAD, "/api/v1/version"));
+        assert!(staging_request_allowed(&Method::POST, "/api/v1/auth/login"));
+        assert!(staging_request_allowed(
+            &Method::POST,
+            "/api/v1/auth/logout"
+        ));
+        for path in [
+            "/api/v1/live/grant",
+            "/api/v1/lte/components/start",
+            "/api/v1/scenarios/start",
+            "/api/v1/traffic/sessions",
+            "/api/v1/subscribers",
+            "/api/v1/ue-profiles",
+        ] {
+            assert!(!staging_request_allowed(&Method::POST, path), "{path}");
+        }
+        assert!(!staging_request_allowed(
+            &Method::DELETE,
+            "/api/v1/traffic/sessions/id"
+        ));
+        assert!(!staging_request_allowed(
+            &Method::PATCH,
+            "/api/v1/lte/profiles/LTE-SRSUE-TEST-01"
+        ));
+    }
+
+    #[test]
     fn lab_network_function_catalog_is_complete_and_measured() {
         let names = LAB_NETWORK_FUNCTIONS
             .iter()
@@ -13672,6 +13837,20 @@ mod p0_tests {
             .await
             .unwrap();
         assert_eq!(read.status(), StatusCode::OK);
+        let read_body: Value =
+            serde_json::from_slice(&to_bytes(read.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(read_body["technology"], "LTE 4G");
+        assert_eq!(read_body["simulator"], "srsUE");
+        assert_eq!(read_body["serving_ran"], "ENB-01");
+        assert_eq!(read_body["serving_ran_type"], "srsENB");
+        assert_eq!(
+            read_body["evidence_schema"],
+            lte_orchestrator::EVIDENCE_SCHEMA
+        );
+        if read_body["last_observed_at_epoch_s"].is_null() {
+            assert_eq!(read_body["runtime_state"], "UNKNOWN");
+            assert_eq!(read_body["apn"], "NOT_AVAILABLE");
+        }
 
         let (operator_cookie, operator_csrf) =
             login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
@@ -18555,9 +18734,8 @@ mod p0_tests {
     //
     // Locks the five routes end-to-end against the real axum Router.
     // The test state uses `FakeLiveUeRuntime` whose
-    // `resolve_traffic_target` returns an error — so the driver loop
-    // falls back to synthesised samples, which is the 0.19.8
-    // "measurement never fails the session" contract at the HTTP layer.
+    // `resolve_traffic_target` returns an error. The driver must therefore
+    // fail closed and publish no requested-rate sample as measured traffic.
     // -----------------------------------------------------------
 
     fn install_live_grant_for(state: &AppState, ue_ids: &[&str]) {
@@ -18645,7 +18823,7 @@ mod p0_tests {
     }
 
     #[tokio::test]
-    async fn traffic_session_happy_path_posts_then_lists_then_gets_then_streams_samples() {
+    async fn traffic_session_unobservable_target_fails_without_synthetic_samples() {
         let test_state = state();
         install_live_grant_for(&test_state, &["UE-02"]);
         let application = app(test_state);
@@ -18709,6 +18887,10 @@ mod p0_tests {
             serde_json::from_slice(&to_bytes(detail.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(detail_body["session_id"], session_id);
+        assert_eq!(detail_body["state"], "FAILED");
+        assert!(detail_body["warnings"]
+            .as_array()
+            .is_some_and(|warnings| !warnings.is_empty()));
         let counters = detail_body["ue_counters"].as_array().unwrap();
         assert_eq!(counters.len(), 1);
         assert_eq!(counters[0]["ue_id"], "UE-02");
@@ -18730,16 +18912,14 @@ mod p0_tests {
                 .unwrap();
         let sample_array = samples_body["items"].as_array().unwrap();
         assert!(
-            !sample_array.is_empty(),
-            "expected at least one tick sample after 1.2s"
+            sample_array.is_empty(),
+            "unobserved traffic must not produce samples"
         );
         assert_eq!(
             samples_body["samples_ring_max"],
             Value::from(traffic_sessions::SAMPLES_RING_MAX),
         );
         assert_eq!(samples_body["session_id"], session_id);
-        assert!(sample_array[0]["rate_ul_bps"].is_u64());
-        assert!(sample_array[0]["rate_dl_bps"].is_null());
     }
 
     #[tokio::test]

@@ -5,18 +5,14 @@ import {
 } from '@/ui/EmptyErrorLoading';
 import {
   useLab,
+  useLabObserved,
   useNodes,
   useScenarioHistory,
   useScenarioRuntime,
   useUes,
 } from '@/data/queries';
 
-const CORE_VERSION = 'Open5GS 2.8.0';
-const PLMN = '001/01';
-const TAC = '200';
-const SNSSAI = '1/010203';
-const DNN = 'internet';
-const CORE_NF_COUNT = 10;
+const NOT_AVAILABLE = 'NOT_AVAILABLE';
 
 type ReadinessRow = {
   label: string;
@@ -94,6 +90,7 @@ function Stat({
 
 export function ConsolePage() {
   const lab = useLab();
+  const observedLab = useLabObserved();
   const ues = useUes();
   const nodes = useNodes();
   const runtime = useScenarioRuntime();
@@ -102,8 +99,11 @@ export function ConsolePage() {
   const loading = lab.isLoading && ues.isLoading && nodes.isLoading;
   const error = lab.error || ues.error;
 
-  // Core NFs — the mockup lab has 10 (AMF/SMF/UPF/NRF/AUSF/UDM/UDR/PCF/NSSF/BSF)
-  const coreFunctions = `${CORE_NF_COUNT} / ${CORE_NF_COUNT}`;
+  const nfValues = Object.values(observedLab.data?.observed?.nfs ?? {});
+  const observedNfs = nfValues.filter((nf) => nf.observed).length;
+  const healthyNfs = nfValues.filter((nf) =>
+    nf.observed && nf.process_state === 'running' && nf.health === 'healthy').length;
+  const coreFunctions = nfValues.length > 0 ? `${healthyNfs} / ${observedNfs}` : 'UNKNOWN';
 
   // gNodeBs — count ACTIVE (running) ones vs planned, from /nodes
   const nodeList = (nodes.data?.items ?? []).filter((n) =>
@@ -122,9 +122,9 @@ export function ConsolePage() {
   const missingSubscribers = lab.data?.missing_subscriber_profiles ?? 0;
   const readinessRows: ReadinessRow[] = [
     { label: 'Serving gNB is active', status: activeGnbs > 0 ? 'pass' : 'warn', detail: activeGnbs === 0 ? 'No active gNB' : undefined },
-    { label: `PLMN matches UE, gNB and AMF (${PLMN})`, status: 'pass' },
-    { label: `gNB TAC is in the AMF TAI list (${TAC})`, status: 'pass' },
-    { label: `UE S-NSSAI served by AMF and SMF (${SNSSAI})`, status: 'pass' },
+    { label: 'PLMN matches UE, gNB and AMF', status: 'warn', detail: NOT_AVAILABLE },
+    { label: 'gNB TAC is in the AMF TAI list', status: 'warn', detail: NOT_AVAILABLE },
+    { label: 'UE S-NSSAI served by AMF and SMF', status: 'warn', detail: NOT_AVAILABLE },
     {
       label: 'Subscriber provisioned in Open5GS',
       status: missingSubscribers === 0 ? 'pass' : 'warn',
@@ -179,7 +179,7 @@ export function ConsolePage() {
             <Stat
               label="Core functions"
               value={coreFunctions}
-              sub={`${CORE_VERSION} · healthy`}
+              sub="Open5GS · observed containers only"
             />
             <Stat
               label="gNodeBs"
@@ -194,7 +194,7 @@ export function ConsolePage() {
             <Stat
               label="PDU sessions"
               value={String(pdu)}
-              sub={`DNN ${DNN}`}
+              sub={`DNN ${NOT_AVAILABLE}`}
             />
           </div>
           <div className="grid gap-5 lg:grid-cols-2">

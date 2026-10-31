@@ -2,6 +2,14 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'node:path';
 
+const apiProxy = {
+  '/polaris-api': {
+    target: process.env.POLARIS_SIM_API_TARGET ?? 'http://127.0.0.1:7090',
+    changeOrigin: true,
+    rewrite: (requestPath: string) => requestPath.replace(/^\/polaris-api\/v1/, '/api/v1'),
+  },
+};
+
 export default defineConfig({
   // CI/audit runs can keep dependency metadata off a constrained system disk.
   cacheDir: process.env.POLARIS_SIM_VITE_CACHE_DIR,
@@ -19,15 +27,11 @@ export default defineConfig({
   server: {
     host: '127.0.0.1',
     port: 4330,
-    proxy: {
-      // POLARIS Control owns `/polaris-api/v1`. Dev proxy forwards to the
-      // local POLARIS backend.
-      '/polaris-api': {
-        target: 'http://127.0.0.1:7090',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/polaris-api\/v1/, '/api/v1'),
-      },
-    },
+    proxy: apiProxy,
+  },
+  preview: {
+    host: '127.0.0.1',
+    proxy: apiProxy,
   },
   build: {
     outDir: 'dist',

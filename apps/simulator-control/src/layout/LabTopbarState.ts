@@ -1,4 +1,4 @@
-import { useLab, useLabObserved, useUes } from '@/data/queries';
+import { useLab, useLabObserved, usePlmns, useUes } from '@/data/queries';
 
 export interface LabTopbarState {
   coreHealth: 'healthy' | 'degraded' | 'offline' | 'unknown';
@@ -7,9 +7,6 @@ export interface LabTopbarState {
   liveUes: number;
   maxUes: number;
 }
-
-const DEFAULT_PLMN = '001/01';
-const DEFAULT_TAC = '200';
 
 function toHealth(state: string | undefined): LabTopbarState['coreHealth'] {
   if (!state) return 'unknown';
@@ -24,6 +21,7 @@ export function useLabTopbarState(): LabTopbarState {
   const lab = useLab();
   const observed = useLabObserved();
   const ues = useUes();
+  const plmns = usePlmns();
 
   const open5gs = observed.data?.observed?.open5gs;
   let coreHealth: LabTopbarState['coreHealth'] = 'unknown';
@@ -39,10 +37,15 @@ export function useLabTopbarState(): LabTopbarState {
     coreHealth = toHealth(open5gs.process_state);
   }
 
+  const observedPlmns = ((plmns.data as { items?: unknown[] } | undefined)?.items ?? [])
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.replace('-', '/'));
+
   return {
     coreHealth,
-    plmn: DEFAULT_PLMN,
-    tac: DEFAULT_TAC,
+    plmn: observedPlmns.length > 0 ? observedPlmns.join(', ') : 'UNKNOWN',
+    // No read-only TAC evidence endpoint exists in the current API contract.
+    tac: 'UNKNOWN',
     liveUes: ues.data?.active_count ?? 0,
     maxUes: lab.data?.max_ues ?? ues.data?.configured_count ?? 0,
   };

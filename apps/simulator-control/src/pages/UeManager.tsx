@@ -27,6 +27,8 @@ import {
   useAuth,
   useDnns,
   useGenerateSubscribers,
+  useLteProfile,
+  useNodes,
   usePlmns,
   useScenarioRuntime,
   useStartScenario,
@@ -39,7 +41,7 @@ import {
 import { useAssignments } from '@/scenarios/store';
 import { useScenarioLibrary } from '@/scenarios/library';
 import { certifiedProfileFor, type Scenario } from '@/scenarios/model';
-import type { UeState } from '@/data/polarisTypes';
+import type { LteProfile, NodeItem, UeProfile as ConfiguredUeProfile, UeState } from '@/data/polarisTypes';
 import {
   parseCsv,
   toCsv,
@@ -95,11 +97,96 @@ export function nextFreeUeIdFrom(existing: string[]): string {
 interface MergedRow {
   profile: UeProfileRecord;
   backend?: UeState;
+  rat: UeRatAssociation;
+}
+
+export interface UeRatAssociation {
+  technology: '5G SA' | 'LTE 4G' | 'UNKNOWN';
+  simulator: 'UERANSIM' | 'srsUE' | 'UNKNOWN';
+  servingRan: string;
+  servingRanType: 'gNB' | 'srsENB' | 'UNKNOWN';
+  core: 'Open5GS 5GC' | 'Open5GS EPC' | 'UNKNOWN';
+}
+
+export function resolveUeRatAssociation(
+  profile: UeProfileRecord,
+  backend: UeState | undefined,
+  configured: ConfiguredUeProfile | undefined,
+  nodes: NodeItem[],
+  profileIsBackendEvidence = false,
+): UeRatAssociation {
+  const servingRan = backend?.serving_node
+    || configured?.serving_gnb
+    || (profileIsBackendEvidence ? profile.servingGnb : '')
+    || 'UNKNOWN';
+  const node = nodes.find((item) => item.id === servingRan);
+  const technologyEvidence = backend?.technology || node?.technology || '';
+  const technology = /LTE/i.test(technologyEvidence)
+    ? 'LTE 4G'
+    : /(5G|NR)/i.test(technologyEvidence)
+      ? '5G SA'
+      : 'UNKNOWN';
+  const simulatorEvidence = backend?.simulator || configured?.simulator || node?.simulator || '';
+  const simulator = /srs/i.test(simulatorEvidence)
+    ? 'srsUE'
+    : /UERANSIM/i.test(simulatorEvidence)
+      ? 'UERANSIM'
+      : 'UNKNOWN';
+  const servingRanType = node
+    ? (/LTE/i.test(node.technology) ? 'srsENB' : /(5G|NR)/i.test(node.technology) ? 'gNB' : 'UNKNOWN')
+    : technology === 'LTE 4G'
+      ? 'srsENB'
+      : technology === '5G SA'
+        ? 'gNB'
+        : 'UNKNOWN';
+  const observedState = (value: string | undefined) =>
+    Boolean(value && !/^(UNKNOWN|NOT_OBSERVED|NOT_AVAILABLE)$/i.test(value));
+  const coreLinked = technology === 'LTE 4G'
+    ? observedState(node?.s1_state) || observedState(node?.epc_state)
+    : observedState(node?.n2_state) || observedState(node?.n3_state);
+  const core = coreLinked && technology === 'LTE 4G'
+    ? 'Open5GS EPC'
+    : coreLinked && technology === '5G SA'
+      ? 'Open5GS 5GC'
+      : 'UNKNOWN';
+  return { technology, simulator, servingRan, servingRanType, core };
+}
+
+export function recordFromLteProfile(profile: LteProfile): UeProfileRecord {
+  const observedAt = (profile.last_observed_at_epoch_s ?? 0) * 1000;
+  return {
+    id: profile.profile_id,
+    owner: profile.owner,
+    servingGnb: profile.serving_ran,
+    apn: profile.apn,
+    createdAt: observedAt,
+    updatedAt: observedAt,
+    derived: true,
+    subscriptionStatus: 'PROTECTED',
+    scenarioId: profile.scenario_id,
+  };
+}
+
+export function isCanonicalLteProfile(value: unknown): value is LteProfile {
+  if (!value || typeof value !== 'object') return false;
+  const profile = value as Record<string, unknown>;
+  return profile.schema_version === 'polaris.lte-profile.v1'
+    && profile.profile_id === 'LTE-SRSUE-TEST-01'
+    && profile.technology === 'LTE 4G'
+    && profile.simulator === 'srsUE'
+    && typeof profile.serving_ran === 'string'
+    && profile.serving_ran_type === 'srsENB'
+    && profile.owner === 'POLARIS_CONTROLLER'
+    && (profile.last_observed_at_epoch_s === null
+      || typeof profile.last_observed_at_epoch_s === 'number')
+    && profile.evidence_schema === 'oiran-polaris.lte-e2e-evidence.v1';
 }
 
 export function UeManagerPage() {
   const auth = useAuth();
   const uesQuery = useUes();
+  const nodesQuery = useNodes();
+  const lteProfileQuery = useLteProfile();
   const library = useScenarioLibrary();
   const assignments = useAssignments();
   const runtime = useScenarioRuntime();
@@ -111,13 +198,25 @@ export function UeManagerPage() {
   const backendProfiles = useBackendProfiles();
   const profileBackend = backendProfiles.enabled;
   const localProfiles = useProfiles();
-  const profiles = profileBackend ? backendProfiles.profiles : localProfiles;
+  const sourceProfiles = profileBackend ? backendProfiles.profiles : localProfiles;
+  const canonicalLteProfile = isCanonicalLteProfile(lteProfileQuery.data)
+    ? lteProfileQuery.data
+    : undefined;
+  const profiles = useMemo(() => {
+    if (!profileBackend || !canonicalLteProfile) return sourceProfiles;
+    if (sourceProfiles.some((profile) => profile.id === canonicalLteProfile.profile_id)) {
+      return sourceProfiles;
+    }
+    return [...sourceProfiles, recordFromLteProfile(canonicalLteProfile)];
+  }, [profileBackend, sourceProfiles, canonicalLteProfile]);
   const scenarioBackend = useFeatureFlag('scenarioBackend');
   const startDefinitionRun = useStartScenarioRun();
 
   const [search, setSearch] = useState('');
   const [ownerFilter, setOwnerFilter] = useState('');
   const [gnbFilter, setGnbFilter] = useState('');
+  const [technologyFilter, setTechnologyFilter] = useState('');
+  const [simulatorFilter, setSimulatorFilter] = useState('');
   const [pageSize, setPageSize] = useState<number>(50);
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -174,7 +273,7 @@ export function UeManagerPage() {
   // Reset selection when the filter set changes.
   useEffect(() => {
     setSelected(new Set());
-  }, [search, ownerFilter, gnbFilter, profiles.length]);
+  }, [search, ownerFilter, gnbFilter, technologyFilter, simulatorFilter, profiles.length]);
 
   // Backend UE inventory indexed for O(1) lookup.
   const backendByProfileId = useMemo(() => {
@@ -184,6 +283,35 @@ export function UeManagerPage() {
     }
     return map;
   }, [uesQuery.data?.items]);
+
+  const configuredByProfileId = useMemo(
+    () => new Map((uesQuery.data?.configured_profiles ?? []).map((item) => [item.id, item])),
+    [uesQuery.data?.configured_profiles],
+  );
+  const nodeItems = useMemo(() => nodesQuery.data?.items ?? [], [nodesQuery.data?.items]);
+  const ratByProfileId = useMemo(
+    () => new Map(profiles.map((profile) => [
+      profile.id,
+      resolveUeRatAssociation(
+        profile,
+        backendByProfileId.get(profile.id),
+        configuredByProfileId.get(profile.id),
+        nodeItems,
+        profileBackend,
+      ),
+    ])),
+    [profiles, backendByProfileId, configuredByProfileId, nodeItems, profileBackend],
+  );
+
+  const ratFilteredProfiles = useMemo(
+    () => profiles.filter((profile) => {
+      const rat = ratByProfileId.get(profile.id);
+      if (technologyFilter && rat?.technology !== technologyFilter) return false;
+      if (simulatorFilter && rat?.simulator !== simulatorFilter) return false;
+      return true;
+    }),
+    [profiles, ratByProfileId, technologyFilter, simulatorFilter],
+  );
 
   const assignmentByUe = useMemo(() => {
     if (profileBackend) {
@@ -223,7 +351,7 @@ export function UeManagerPage() {
 
   const paged = useMemo(
     () =>
-      paginate(profiles, {
+      paginate(ratFilteredProfiles, {
         search,
         owner: ownerFilter,
         servingGnb: gnbFilter,
@@ -233,7 +361,7 @@ export function UeManagerPage() {
         sortDirection: 'asc',
         includeImsi: canOperate,
       }),
-    [profiles, search, ownerFilter, gnbFilter, page, pageSize, canOperate],
+    [ratFilteredProfiles, search, ownerFilter, gnbFilter, page, pageSize, canOperate],
   );
 
   // Clamp page if filter shrinks the result set.
@@ -246,13 +374,15 @@ export function UeManagerPage() {
       paged.items.map((profile) => ({
         profile,
         backend: backendByProfileId.get(profile.id),
+        rat: ratByProfileId.get(profile.id) ?? resolveUeRatAssociation(profile, undefined, undefined, []),
       })),
-    [paged.items, backendByProfileId],
+    [paged.items, backendByProfileId, ratByProfileId],
   );
 
   const selectedProfiles = useMemo(
-    () => profiles.filter((profile) => selected.has(profile.id)),
-    [profiles, selected],
+    () => profiles.filter((profile) =>
+      selected.has(profile.id) && profile.id !== canonicalLteProfile?.profile_id),
+    [profiles, selected, canonicalLteProfile?.profile_id],
   );
 
   const activeJob = runtime.data?.active_job;
@@ -557,7 +687,7 @@ export function UeManagerPage() {
       <PageHeader
         eyebrow="Simulation"
         title="UE Manager"
-        desc="UE profiles bound to a serving gNB and, ideally, to a provisioned subscriber slot. Identity is write-only."
+        desc="UE profiles bound to a serving RAN (gNB or srsENB). Technology and UE simulator come only from POLARIS evidence. Identity is write-only."
         actions={
           <div className="flex items-center gap-2 flex-wrap justify-end">
             <LiveGrantCountdown canRevoke={canOperate} />
@@ -617,8 +747,8 @@ export function UeManagerPage() {
               className="ep-input pl-7 w-64"
               placeholder={
                 canOperate
-                  ? 'Search id, owner, gNB, IMSI, UE IP…'
-                  : 'Search id, owner, gNB, UE IP…'
+                  ? 'Search id, owner, serving RAN, IMSI, UE IP…'
+                  : 'Search id, owner, serving RAN, UE IP…'
               }
               value={search}
               onChange={(event) => {
@@ -653,12 +783,40 @@ export function UeManagerPage() {
             }}
             data-testid="ue-filter-gnb"
           >
-            <option value="">All serving gNBs</option>
+            <option value="">All serving RANs</option>
             {gnbOptions.map((gnb) => (
               <option key={gnb} value={gnb}>
                 {gnb}
               </option>
             ))}
+          </select>
+          <select
+            className="ep-input"
+            value={technologyFilter}
+            onChange={(event) => {
+              setTechnologyFilter(event.target.value);
+              setPage(1);
+            }}
+            data-testid="ue-filter-technology"
+          >
+            <option value="">All technologies</option>
+            <option value="5G SA">5G SA</option>
+            <option value="LTE 4G">LTE 4G</option>
+            <option value="UNKNOWN">UNKNOWN</option>
+          </select>
+          <select
+            className="ep-input"
+            value={simulatorFilter}
+            onChange={(event) => {
+              setSimulatorFilter(event.target.value);
+              setPage(1);
+            }}
+            data-testid="ue-filter-simulator"
+          >
+            <option value="">All simulators</option>
+            <option value="UERANSIM">UERANSIM</option>
+            <option value="srsUE">srsUE</option>
+            <option value="UNKNOWN">UNKNOWN</option>
           </select>
 
           <div className="flex-1" />
@@ -763,7 +921,11 @@ export function UeManagerPage() {
               className="ep-button ep-button-sm"
               onClick={() => {
                 for (const profile of selectedProfiles) {
-                  const row: MergedRow = { profile, backend: backendByProfileId.get(profile.id) };
+                  const row: MergedRow = {
+                    profile,
+                    backend: backendByProfileId.get(profile.id),
+                    rat: ratByProfileId.get(profile.id) ?? resolveUeRatAssociation(profile, undefined, undefined, []),
+                  };
                   if (row.backend) void startBackendUe(row);
                 }
               }}
@@ -777,7 +939,11 @@ export function UeManagerPage() {
               className="ep-button ep-button-sm"
               onClick={() => {
                 for (const profile of selectedProfiles) {
-                  const row: MergedRow = { profile, backend: backendByProfileId.get(profile.id) };
+                  const row: MergedRow = {
+                    profile,
+                    backend: backendByProfileId.get(profile.id),
+                    rat: ratByProfileId.get(profile.id) ?? resolveUeRatAssociation(profile, undefined, undefined, []),
+                  };
                   if (row.backend) void stopBackendUe(row);
                 }
               }}
@@ -807,26 +973,24 @@ export function UeManagerPage() {
         )}
       </section>
 
-      <Card className="overflow-hidden">
+      <Card className="overflow-x-auto">
         <table
-          className="ep-table w-full table-fixed"
+          className="ep-table w-full min-w-[1280px] table-fixed"
           data-testid="ue-table"
         >
           <colgroup>
-            {/* 0.12.1 — Full mockup layout: 7 content columns
-                (UE / Serving gNB / Subscriber / Registration / PDU · IP /
-                Scenario / Actions) + one 2 rem checkbox prefix we keep for
-                bulk selection. IMSI + Owner fold into the UE sub-caption
-                so the Identity rule stays respected (operator sees the raw
-                IMSI, viewer stays on the solid mask). */}
+            {/* 0.17.0 — RAT-aware layout. The table scrolls inside its card
+                at narrow widths so Technology and Simulator remain readable. */}
             <col style={{ width: '2rem' }} />
-            <col style={{ width: '19%' }} />
+            <col style={{ width: '15%' }} />
             <col style={{ width: '10%' }} />
-            <col style={{ width: '13%' }} />
+            <col style={{ width: '9%' }} />
             <col style={{ width: '10%' }} />
-            <col style={{ width: '13%' }} />
-            <col style={{ width: '14%' }} />
-            <col style={{ width: '21%' }} />
+            <col style={{ width: '10%' }} />
+            <col style={{ width: '9%' }} />
+            <col style={{ width: '11%' }} />
+            <col style={{ width: '11%' }} />
+            <col style={{ width: '15%' }} />
           </colgroup>
           <thead>
             <tr className="text-left text-ep-xs uppercase tracking-wider text-mute border-b border-line">
@@ -834,12 +998,16 @@ export function UeManagerPage() {
                 <input
                   type="checkbox"
                   aria-label="Select all on page"
-                  checked={rows.length > 0 && rows.every((row) => selected.has(row.profile.id))}
+                  checked={rows.some((row) => row.profile.id !== canonicalLteProfile?.profile_id)
+                    && rows.filter((row) => row.profile.id !== canonicalLteProfile?.profile_id)
+                      .every((row) => selected.has(row.profile.id))}
                   onChange={(event) => {
                     setSelected((prev) => {
                       const next = new Set(prev);
                       if (event.target.checked) {
-                        for (const row of rows) next.add(row.profile.id);
+                        for (const row of rows) {
+                          if (row.profile.id !== canonicalLteProfile?.profile_id) next.add(row.profile.id);
+                        }
                       } else {
                         for (const row of rows) next.delete(row.profile.id);
                       }
@@ -850,10 +1018,12 @@ export function UeManagerPage() {
                 />
               </th>
               <th className="px-3 py-2.5 font-semibold">UE</th>
-              <th className="px-3 py-2.5 font-semibold">Serving gNB</th>
+              <th className="px-3 py-2.5 font-semibold">Technology</th>
+              <th className="px-3 py-2.5 font-semibold">Simulator</th>
+              <th className="px-3 py-2.5 font-semibold">Serving RAN</th>
               <th className="px-3 py-2.5 font-semibold">Subscriber</th>
-              <th className="px-3 py-2.5 font-semibold">Registration</th>
-              <th className="px-3 py-2.5 font-semibold">PDU · IP</th>
+              <th className="px-3 py-2.5 font-semibold">Attach / Registration</th>
+              <th className="px-3 py-2.5 font-semibold">Session · IP</th>
               <th className="px-3 py-2.5 font-semibold">Scenario</th>
               <th className="px-3 py-2.5 font-semibold text-right">Actions</th>
             </tr>
@@ -863,6 +1033,7 @@ export function UeManagerPage() {
               const assignment = assignmentByUe.get(row.profile.id);
               const scenario = assignment ? scenarioById.get(assignment.scenarioId) : undefined;
               const profile = scenario ? certifiedProfileFor(scenario) : null;
+              const isCanonicalLte = row.profile.id === canonicalLteProfile?.profile_id;
               const isShared = row.backend ? !row.backend.controller_owned : false;
               const backendId = row.backend?.internal_ue_id ?? row.backend?.id;
               const isActiveForUe =
@@ -906,12 +1077,14 @@ export function UeManagerPage() {
               const liveClosed = row.backend?.actions?.reason?.includes('423') ||
                 /LIVE_EXECUTION_NOT_AUTHORIZED/.test(row.backend?.actions?.reason ?? '');
               const startDisabled =
-                !canOperate ||
+                isCanonicalLte || !canOperate ||
                 isShared ||
                 notProvisioned ||
                 !backendCanStart ||
                 startUe.isPending;
-              const startReason = !canOperate
+              const startReason = isCanonicalLte
+                ? 'Profil LTE canonique : utiliser le contrôleur LTE sécurisé.'
+                : !canOperate
                 ? 'Rôle viewer : lecture seule.'
                 : isShared
                   ? 'UE partagée — protégée.'
@@ -925,12 +1098,14 @@ export function UeManagerPage() {
                           ? row.backend?.actions?.reason || 'Start indisponible.'
                           : null;
               const stopDisabled =
-                !canOperate ||
+                isCanonicalLte || !canOperate ||
                 isShared ||
                 notProvisioned ||
                 !(isActiveForUe || backendCanStop) ||
                 stopScenario.isPending;
-              const stopReason = !canOperate
+              const stopReason = isCanonicalLte
+                ? 'Profil LTE canonique : utiliser le contrôleur LTE sécurisé.'
+                : !canOperate
                 ? 'Rôle viewer : lecture seule.'
                 : isShared
                   ? 'UE partagée — protégée.'
@@ -940,12 +1115,14 @@ export function UeManagerPage() {
                       ? 'Aucune action Stop disponible côté backend.'
                       : null;
               const runDisabled =
-                !canOperate ||
+                isCanonicalLte || !canOperate ||
                 isShared ||
                 notProvisioned ||
                 !scenario ||
                 (!scenarioBackend && !profile);
-              const runReason = !canOperate
+              const runReason = isCanonicalLte
+                ? 'Le scénario LTE certifié est piloté par Grant V2.'
+                : !canOperate
                 ? 'Rôle viewer : lecture seule.'
                 : isShared
                   ? 'UE partagée — protégée.'
@@ -958,9 +1135,13 @@ export function UeManagerPage() {
                         : liveClosed
                           ? 'Live fermé (HTTP 423) — approbation requise.'
                           : null;
-              const editDisabled = !canOperate;
-              const editReason = !canOperate ? 'Rôle viewer : lecture seule.' : null;
-              const deleteReason = !canOperate ? 'Rôle viewer : lecture seule.' : null;
+              const editDisabled = !canOperate || isCanonicalLte;
+              const editReason = isCanonicalLte
+                ? 'Profil LTE canonique en lecture seule.'
+                : !canOperate ? 'Rôle viewer : lecture seule.' : null;
+              const deleteReason = isCanonicalLte
+                ? 'Profil LTE canonique en lecture seule.'
+                : !canOperate ? 'Rôle viewer : lecture seule.' : null;
 
               return (
                 <tr
@@ -973,6 +1154,7 @@ export function UeManagerPage() {
                       type="checkbox"
                       aria-label={`Select ${row.profile.id}`}
                       checked={selected.has(row.profile.id)}
+                      disabled={isCanonicalLte}
                       onChange={(event) => {
                         setSelected((prev) => {
                           const next = new Set(prev);
@@ -1013,16 +1195,27 @@ export function UeManagerPage() {
                       </span>
                     </div>
                   </td>
+                  <td className="px-3 py-3" data-testid={`ue-technology-${row.profile.id}`}>
+                    <Pill tone={row.rat.technology === 'UNKNOWN' ? 'mute' : 'brand'}>
+                      {row.rat.technology}
+                    </Pill>
+                    <p className="text-ep-xs text-mute mt-1">{row.rat.core}</p>
+                  </td>
+                  <td className="px-3 py-3" data-testid={`ue-simulator-${row.profile.id}`}>
+                    <span className="font-medium">{row.rat.simulator}</span>
+                  </td>
                   <td className="px-3 py-3 mono" data-testid={`ue-gnb-${row.profile.id}`}>
-                    {row.profile.servingGnb || '—'}
+                    <span className="font-sans text-ep-xs text-mute">{row.rat.servingRanType}</span>
+                    <br />
+                    {row.rat.servingRan}
                   </td>
                   <td className="px-3 py-3" data-testid={`ue-subscriber-${row.profile.id}`}>
-                    {row.backend ? (
-                      row.backend.controller_owned ? (
-                        <Pill tone="ok">Verified</Pill>
-                      ) : (
-                        <Pill tone="warn">Shared</Pill>
-                      )
+                    {isCanonicalLte ? (
+                      <Pill tone="mute">Canonical LTE</Pill>
+                    ) : row.backend && !row.backend.controller_owned ? (
+                      <Pill tone="warn">Shared</Pill>
+                    ) : row.profile.subscriptionStatus === 'VERIFIED' ? (
+                      <Pill tone="ok">Verified</Pill>
                     ) : (
                       <Pill tone="warn">Not provisioned</Pill>
                     )}
@@ -1032,7 +1225,7 @@ export function UeManagerPage() {
                         slot {row.backend.internal_ue_id}
                       </p>
                     ) : null}
-                    {profileBackend &&
+                    {profileBackend && !isCanonicalLte &&
                     row.profile.subscriptionStatus &&
                     row.profile.subscriptionStatus !== 'VERIFIED' ? (
                       <p
@@ -1060,7 +1253,7 @@ export function UeManagerPage() {
                     >
                       {renderPduCell(row.backend, isRuntimeIdle)}
                       <span className="mono text-ep-xs text-mute">
-                        {row.backend?.ue_ip ?? row.profile.ueIp ?? '—'}
+                        {row.backend?.ue_ip ?? 'UNKNOWN'}
                       </span>
                     </div>
                     <span
@@ -1093,7 +1286,7 @@ export function UeManagerPage() {
                             );
                           }
                         }}
-                        disabled={!canOperate || isShared}
+                        disabled={!canOperate || isShared || isCanonicalLte}
                         data-testid={`assign-select-${row.profile.id}`}
                       >
                         <option value="">— None —</option>
@@ -1179,6 +1372,10 @@ export function UeManagerPage() {
                               };
                               setFormState({ mode: 'clone', initial: next });
                             },
+                            disabled: isCanonicalLte,
+                            disabledReason: isCanonicalLte
+                              ? 'Profil LTE canonique en lecture seule.'
+                              : undefined,
                             testid: `ue-clone-${row.profile.id}`,
                           },
                           {
@@ -1187,7 +1384,7 @@ export function UeManagerPage() {
                             icon: <Trash2 width={12} height={12} aria-hidden="true" />,
                             tone: 'danger',
                             onSelect: () => setConfirmDelete([row.profile.id]),
-                            disabled: !canOperate,
+                            disabled: !canOperate || isCanonicalLte,
                             disabledReason: deleteReason ?? undefined,
                             testid: `ue-delete-${row.profile.id}`,
                           },
@@ -1200,7 +1397,7 @@ export function UeManagerPage() {
             })}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={8} className="text-center text-mute py-6">
+                <td colSpan={10} className="text-center text-mute py-6">
                   {profiles.length === 0
                     ? 'No UE profile yet. Add one, bulk-create or import CSV.'
                     : 'No profile matches the current filter.'}
@@ -1219,10 +1416,10 @@ export function UeManagerPage() {
           Showing <span className="mono">{paged.filteredTotal > 0 ? pageStart : 0}</span>–
           <span className="mono">{paged.filteredTotal > 0 ? pageEnd : 0}</span> of{' '}
           <span className="mono">{paged.filteredTotal.toLocaleString()}</span>
-          {paged.filteredTotal !== paged.total && (
+          {paged.filteredTotal !== profiles.length && (
             <>
               {' '}
-              (filtered from <span className="mono">{paged.total.toLocaleString()}</span>)
+              (filtered from <span className="mono">{profiles.length.toLocaleString()}</span>)
             </>
           )}
         </div>
@@ -1542,11 +1739,14 @@ function pad(n: number): string {
  */
 export function renderRegistrationCell(
   backend: UeState | undefined,
-  idle: boolean,
+  _idle: boolean,
 ): import('react').ReactNode {
-  const state = idle || !backend ? 'STOPPED' : (backend.registration_state ?? 'UNKNOWN').toUpperCase();
+  const observedState = backend?.technology?.toUpperCase().includes('LTE')
+    ? backend.attach_state || backend.registration_state
+    : backend?.registration_state;
+  const state = observedState?.trim() ? observedState.toUpperCase() : 'UNKNOWN';
   return (
-    <Pill tone={regTone(state)} dot={state === 'REGISTERED' ? 'live' : undefined}>
+    <Pill tone={regTone(state)} dot={['REGISTERED', 'ATTACHED'].includes(state) ? 'live' : undefined}>
       {state}
     </Pill>
   );
@@ -1559,12 +1759,13 @@ export function renderRegistrationCell(
  */
 export function renderPduCell(
   backend: UeState | undefined,
-  idle: boolean,
+  _idle: boolean,
 ): import('react').ReactNode {
-  if (idle || !backend) return <span className="text-mute">—</span>;
-  const pdu = (backend.pdu_session ?? '').toUpperCase();
+  if (!backend) return <Pill tone="mute">UNKNOWN</Pill>;
+  const pdu = (backend.pdu_session ?? '').trim().toUpperCase();
   if (pdu === 'ACTIVE') return <Pill tone="ok">ACTIVE</Pill>;
-  if (!pdu || pdu === 'UNKNOWN' || pdu === 'INACTIVE') return <span className="text-mute">—</span>;
+  if (!pdu || pdu === 'UNKNOWN') return <Pill tone="mute">UNKNOWN</Pill>;
+  if (pdu === 'INACTIVE') return <Pill tone="mute">INACTIVE</Pill>;
   return <Pill tone="mute">{pdu}</Pill>;
 }
 

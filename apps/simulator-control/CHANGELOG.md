@@ -1,46 +1,54 @@
 # @telecom/simulator-control — Changelog
 
-## 0.17.2 — 2026-10-31 — real-lab API-only operational views
+## 0.18.1 — 2026-10-31 — isolated real-lab staging
 
-- Makes UE profiles, scenarios, templates and provisioning strictly API-backed;
-  browser flags can no longer restore demo/localStorage data operationally.
-- Populates Traffic Generator targets only from the observed `/ues` inventory.
-- Filters unconfigured planned nodes from Topology and renders absent values as
-  `NOT_AVAILABLE` or `UNKNOWN` instead of lab constants.
-- Describes the actual Grant V2/RBAC gates instead of a mock LTE workflow.
+- Makes the loopback API proxy target configurable through
+  `POLARIS_SIM_API_TARGET` and applies the same proxy to `vite preview`.
+- Allows a production build to be exercised against an isolated API staging
+  port without exposing it publicly or changing the production reverse proxy.
 
-## 0.17.1 — 2026-10-31 — backend/frontend contract integration
+## 0.18.0 — 2026-10-31 — real laboratory sources only
 
-- Preserves the catalogue RAT, simulator, description, provenance and support
-  metadata after server-side clone and subsequent saves.
-- Retains fixed string and boolean step parameters such as `dnn` and
-  `protocol` verbatim instead of coercing them to numbers or dropping them.
-- Adds integration tests using the enriched definition and scalar parameter
-  shapes returned by POLARIS API 0.24.0.
+- Removes operational browser-local UE/scenario fallbacks; UE Manager,
+  Scenario Builder, Topology and Traffic Generator now require POLARIS APIs.
+- Joins the canonical srsUE profile with `/ues` runtime evidence and keeps
+  Attach, session and address `UNKNOWN` until the backend observes them.
+- Uses explicit N2/N3/S1/S1-U observations for topology link state and removes
+  hard-coded core addresses, versions, PLMN/TAC/slice and static PASS claims.
+- Sources the top-bar PLMN from `/plmns` and reports PLMN/TAC as `UNKNOWN`
+  when the API does not publish evidence instead of displaying lab defaults.
+- Selects Traffic Generator targets from the real inventory, accepts the
+  canonical LTE UE ID, and derives chart rates only from observed counters.
+- Consumes the backend-owned 13-template LTE/5G catalogue; no client fixture
+  is introduced into the operational build.
 
-## 0.17.0 — 2026-10-31 — default LTE/5G scenario templates
+## 0.17.0 — 2026-10-31 — UE RAT and simulator evidence
 
-- Integrates the finalized ANR1 `polaris.scenario-template-catalog.v1` contract:
-  thirteen immutable templates (six LTE 4G srsRAN, seven 5G SA UERANSIM).
-  Multi-UE remains an explicit empty filter because the backend contract does
-  not advertise a certified Multi-UE system template.
-- Adds RAT/category filters, full step/prerequisite metadata, bounded duration
-  and throughput, plus honest `SUPPORTED`, `BACKEND_REQUIRED` and
-  `CERTIFICATION_REQUIRED` badges supplied authoritatively by the catalogue.
-- `Use Template` and `Customize` load detached editable copies into the
-  existing Scenario Builder; backend saves use the authoritative clone route
-  before updating the mutable copy and never mutate the system template.
-- Separates definition persistence from live execution eligibility. Run stays
-  disabled until role, backend step support, LTE certification and Grant V2
-  gates are satisfied; no live state is fabricated.
-- Preserves the ANR2 UE Manager integration unchanged.
+- Adds Technology and Simulator columns to the existing UE Manager table and
+  renames Serving gNB to Serving RAN for both gNB and srsENB associations.
+- Resolves RAT/simulator strictly from `/ues`, configured backend profiles and
+  `/nodes`; missing associations remain `UNKNOWN` instead of being inferred
+  from an identifier or subscriber profile.
+- Adds Technology and Simulator filters while preserving RBAC, Grant V2,
+  actions and operator-only IMSI visibility.
+- Displays Attach/Registration, session and UE IP only from runtime evidence;
+  absent runtime observations are explicitly `UNKNOWN`.
+- Adds runtime-contract coverage for UE-01, UE-201 and
+  LTE-SRSUE-TEST-01 without adding subscriber secrets or live actions.
 
-## 0.16.0 — 2026-10-31 — LTE orchestration V2 progress
+## 0.16.0 — 2026-10-31 — LTE orchestration and dual-RAT topology
 
 - Polls the durable certified LTE run and displays each real phase state,
   reason and cleanup requirement.
 - Aligns the browser-issued Grant V2 UDP duration with the ten-second ANR1
   orchestration bound while preserving all existing 5G controls.
+- Keeps the existing `/network/topology` route and renders two visible chains
+  in the same topology: Open5GS 5GC → UERANSIM gNB → UERANSIM UE, and
+  Open5GS EPC → srsENB → srsUE.
+- Labels N2/NGAP, N3/GTP-U, S1-MME/S1AP and S1-U/GTP-U independently, using
+  `UNKNOWN` whenever the backend does not publish an endpoint or function.
+- Adds browser assertions which fail when either `srsENB` or `srsUE`
+  disappears from the topology.
 
 ## 0.15.1 — 2026-10-31 — final LTE Grant V2 safety contract
 

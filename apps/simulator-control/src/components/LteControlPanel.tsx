@@ -19,6 +19,7 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
     && data.live_enabled === true
     && data.safety_ready === true
     && profile.data?.enabled === true
+    && typeof profile.data.compose_model_sha256 === 'string'
     && data.grant_active !== true;
   const ownershipVerified = data?.ownership_verified === true;
   const ueRunning = data?.ue.process_state === 'running';
@@ -31,7 +32,7 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
         <div>
           <h2 className="text-ep-xl font-semibold">LTE 4G — srsRAN</h2>
           <p className="text-ep-sm text-mute">
-            POLARIS-controlled srsRAN runtime · live actions remain protected by Grant V2 and certification gates.
+            Existing POLARIS controller · live stays locked until ANR1 E2E certification.
           </p>
         </div>
         <div className="flex gap-2">
@@ -43,14 +44,14 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
       </header>
 
       <dl className={`grid gap-3 text-ep-md ${compact ? 'grid-cols-2 lg:grid-cols-4' : 'grid-cols-2 lg:grid-cols-5'}`}>
-        <div><dt className="text-ep-xs uppercase text-mute">UE</dt><dd className="mono">{data?.ue_id ?? 'NOT_AVAILABLE'}</dd></div>
-        <div><dt className="text-ep-xs uppercase text-mute">srsUE</dt><dd>{data?.ue.process_state ?? 'NOT_AVAILABLE'}</dd></div>
-        <div><dt className="text-ep-xs uppercase text-mute">srsENB</dt><dd>{data?.enb.process_state ?? 'NOT_AVAILABLE'}</dd></div>
-        <div><dt className="text-ep-xs uppercase text-mute">EPC / S1</dt><dd>{data?.epc.process_state ?? 'NOT_AVAILABLE'} / {data?.s1_state ?? 'NOT_AVAILABLE'}</dd></div>
-        <div><dt className="text-ep-xs uppercase text-mute">Attach</dt><dd>{data?.attach_state ?? 'UNKNOWN'}</dd></div>
-        <div><dt className="text-ep-xs uppercase text-mute">APN</dt><dd className="mono">{data?.apn ?? 'NOT_AVAILABLE'}</dd></div>
-        <div><dt className="text-ep-xs uppercase text-mute">UE IP</dt><dd className="mono">{data?.ue_ip ?? 'NOT_AVAILABLE'}</dd></div>
-        <div><dt className="text-ep-xs uppercase text-mute">Sessions</dt><dd>{data ? `${data.session_state} (${data.active_sessions})` : 'NOT_AVAILABLE'}</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">UE</dt><dd className="mono">{data?.ue_id ?? 'LTE-SRSUE-TEST-01'}</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">srsUE</dt><dd>{data?.ue.process_state ?? 'NOT OBSERVED'}</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">srsENB</dt><dd>{data?.enb.process_state ?? 'NOT OBSERVED'}</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">EPC / S1</dt><dd>{data?.epc.process_state ?? 'NOT OBSERVED'} / {data?.s1_state ?? 'NOT OBSERVED'}</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">Attach</dt><dd>{data?.attach_state ?? 'NOT OBSERVED'}</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">APN</dt><dd className="mono">{data?.apn ?? 'NOT AVAILABLE'}</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">UE IP</dt><dd className="mono">{data?.ue_ip ?? 'NOT OBSERVED'}</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">Sessions</dt><dd>{data?.session_state ?? 'UNKNOWN'} ({data?.active_sessions ?? 0})</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">Simulator</dt><dd>srsRAN</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">Technology</dt><dd>LTE 4G</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">Grant contract</dt><dd>{profile.data?.grant_required ? 'V2 REQUIRED' : 'NOT OBSERVED'}</dd></div>
@@ -63,7 +64,16 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
           disabled={!canOperate || !startGateReady || startRun.isPending}
           title={startGateReady ? 'Issues and consumes a one-time, five-minute LTE Grant V2.' : 'Requires ANR1 certification, enabled LTE profile, safety gates and no active LTE run.'}
           onClick={() => {
-            if (profile.data) startRun.mutate(profile.data);
+            if (profile.data?.compose_model_sha256) {
+              startRun.mutate({
+                revision: profile.data.revision,
+                configuration_sha256: profile.data.configuration_sha256,
+                compose_model_sha256: profile.data.compose_model_sha256,
+                scenario_id: profile.data.scenario_id,
+                scenario_revision: profile.data.scenario_revision,
+                scenario_sha256: profile.data.scenario_sha256,
+              });
+            }
           }}
           data-testid="lte-enb-start"
         >{startRun.isPending ? 'Starting certified run…' : 'Start LTE certified run'}</Btn>

@@ -22,7 +22,7 @@
 //     down       → bad   (red)
 //     unknown    → mute  (gray)
 
-import { useMemo } from 'react';
+import { useMemo, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { AlertTriangle, Antenna, Smartphone } from 'lucide-react';
 import { Card, PageHeader, Pill, regTone } from '@/components/mockup';
@@ -36,7 +36,7 @@ import {
 } from '@/data/queries';
 import type { NodeItem, UeState } from '@/data/polarisTypes';
 
-const CORE_NF_CATALOGUE: { nf: string; role: string }[] = [
+const FIVE_G_NF_CATALOGUE: { nf: string; role: string }[] = [
   { nf: 'AMF', role: 'Access & mobility' },
   { nf: 'SMF', role: 'Session management' },
   { nf: 'UPF', role: 'User plane' },
@@ -49,6 +49,14 @@ const CORE_NF_CATALOGUE: { nf: string; role: string }[] = [
   { nf: 'BSF', role: 'Binding support' },
 ];
 
+const LTE_NF_CATALOGUE: { nf: string; role: string }[] = [
+  { nf: 'MME', role: 'S1 mobility' },
+  { nf: 'SGWC', role: 'Session control' },
+  { nf: 'SGWU', role: 'S1-U user plane' },
+  { nf: 'HSS', role: 'Subscriber data' },
+  { nf: 'PCRF', role: 'Policy control' },
+];
+
 export type LinkState = 'configured' | 'down' | 'unknown';
 
 export function linkState(
@@ -58,6 +66,19 @@ export function linkState(
   if (!endpoint) return 'unknown';
   if ((processState ?? '').toLowerCase() !== 'running') return 'down';
   return 'configured';
+}
+
+export function observedLinkState(
+  processState: string | null | undefined,
+  observedState: string | null | undefined,
+): LinkState {
+  const process = (processState ?? '').toUpperCase();
+  const observed = (observedState ?? '').toUpperCase();
+  if (!observed || observed === 'UNKNOWN' || observed === 'NOT_OBSERVED' || observed === 'NOT_AVAILABLE') {
+    return 'unknown';
+  }
+  if (process !== 'RUNNING') return 'down';
+  return ['CONNECTED', 'READY', 'ACTIVE', 'UP'].includes(observed) ? 'configured' : 'down';
 }
 
 type NfPillTone = 'success' | 'warning' | 'danger' | 'neutral';
@@ -110,13 +131,16 @@ export function TopologyPage() {
   const loading = lab.isLoading || nodes.isLoading || ues.isLoading;
   const errored = lab.error || nodes.error || ues.error;
 
-  // Aggregate N2/N3 state across all configured 5G gNBs.
-  // Planned/unconfigured nodes are not part of the operational topology.
-  const nodeList = (nodes.data?.items ?? []).filter((node) => node.configured);
-  const anyLinkUp = nodeList.some(
-    (n) =>
-      linkState(n.process_state, n.n2_endpoint) === 'configured' ||
-      linkState(n.process_state, n.n3_endpoint) === 'configured',
+  const nodeList = nodes.data?.items ?? [];
+  const any5gLinkUp = nodeList.some(
+    (n) => n.technology.includes('5G') && (
+      observedLinkState(n.process_state, n.n2_state) === 'configured' ||
+      observedLinkState(n.process_state, n.n3_state) === 'configured'),
+  );
+  const anyLteLinkUp = nodeList.some(
+    (n) => /LTE/i.test(n.technology) && (
+      observedLinkState(n.process_state, n.s1_state) === 'configured' ||
+      observedLinkState(n.process_state, n.s1u_state) === 'configured'),
   );
 
   return (
@@ -127,10 +151,12 @@ export function TopologyPage() {
         desc="Core, radio and UEs as they are wired now. Links show the live state of each interface."
         actions={
           <div className="flex flex-wrap gap-2">
-            <Pill tone={anyLinkUp ? 'ok' : 'mute'} dot={anyLinkUp ? 'live' : undefined}>
-              {anyLinkUp ? 'N2 / N3 up' : 'N2 / N3 unknown'}
+            <Pill tone={any5gLinkUp ? 'ok' : 'mute'} dot={any5gLinkUp ? 'live' : undefined}>
+              {any5gLinkUp ? 'N2 / N3 configured' : 'N2 / N3 UNKNOWN'}
             </Pill>
-            <Pill tone="mute">No mobility (UERANSIM)</Pill>
+            <Pill tone={anyLteLinkUp ? 'ok' : 'mute'} dot={anyLteLinkUp ? 'live' : undefined}>
+              {anyLteLinkUp ? 'S1-MME / S1-U configured' : 'S1-MME / S1-U UNKNOWN'}
+            </Pill>
           </div>
         }
       />
@@ -152,8 +178,7 @@ export function TopologyPage() {
         <>
           <Card className="p-5 overflow-x-auto">
             <div className="min-w-[680px] flex flex-col items-center gap-0" data-testid="topology-view">
-              <CoreBlock observed={observed} coreLabel={coreTone.label} nodes={nodeList} />
-              <GnbTree nodes={nodeList} uesByNode={uesByNode} />
+              <AccessTopology nodes={nodeList} uesByNode={uesByNode} observed={observed} coreLabel={coreTone.label} />
             </div>
           </Card>
 
@@ -174,26 +199,31 @@ export function TopologyPage() {
 function CoreBlock({
   observed,
   coreLabel,
-  nodes,
+  title,
+  catalogue,
+  testId,
+  metadata,
 }: {
   observed: WireLabObserved | undefined;
   coreLabel: string;
-  nodes: NodeItem[];
+  title: string;
+  catalogue: { nf: string; role: string }[];
+  testId: string;
+  metadata: string;
 }) {
-  const observedPlmns = [...new Set(nodes.map((node) => node.plmn).filter((value) => value && !value.startsWith('NOT_')))];
   return (
-    <article className="w-full max-w-3xl rounded-2xl border border-line bg-canvas p-4" data-testid="topology-core-block">
+    <article className="w-full rounded-2xl border border-line bg-canvas p-4" data-testid={testId}>
       <header className="flex items-center justify-between gap-2 mb-3">
-        <p className="font-semibold">Core network · Open5GS</p>
+        <p className="font-semibold">{title}</p>
         <span className="mono text-ep-sm text-mute truncate">
-          PLMN {observedPlmns.length ? observedPlmns.join(', ') : 'NOT_AVAILABLE'} · S-NSSAI NOT_AVAILABLE · DNN NOT_AVAILABLE
+          {metadata}
         </span>
       </header>
       <p className="text-ep-xs text-mute mb-2" data-testid="topology-core-status">
         {coreLabel}
       </p>
       <div className="grid grid-cols-2 md:grid-cols-5 gap-2" data-testid="topology-nfs-grid">
-        {CORE_NF_CATALOGUE.map((entry) => {
+        {catalogue.map((entry) => {
           const pill = nfPillState(entry.nf, observed);
           return (
             <div
@@ -220,40 +250,67 @@ function CoreBlock({
   );
 }
 
-function GnbTree({
+function AccessTopology({
   nodes,
   uesByNode,
+  observed,
+  coreLabel,
 }: {
   nodes: NodeItem[];
   uesByNode: Map<string, UeState[]>;
+  observed: WireLabObserved | undefined;
+  coreLabel: string;
 }) {
-  if (nodes.length === 0) {
-    return (
-      <div className="mt-4 text-ep-sm text-mute">
-        No gNB reported by <code className="mono">/nodes</code>.
-      </div>
-    );
-  }
   return (
-    <div
-      className={`mt-2 grid gap-x-16 gap-y-4 w-full max-w-3xl ${
-        nodes.length === 1 ? 'grid-cols-1' : 'grid-cols-2'
-      }`}
-      data-testid="topology-gnb-tree"
-    >
-      {nodes.map((node) => (
-        <GnbColumn key={node.id} node={node} attachedUes={uesByNode.get(node.id) ?? []} />
-      ))}
+    <div className="grid w-full grid-cols-1 gap-5 lg:grid-cols-2" data-testid="topology-access-chains">
+      <AccessChain
+        label="5G SA — UERANSIM"
+        testId="topology-chain-5g"
+        core={<CoreBlock observed={observed} coreLabel={coreLabel} title="Open5GS 5GC · 5G SA" catalogue={FIVE_G_NF_CATALOGUE} testId="topology-core-5g" metadata="PLMN/S-NSSAI/DNN NOT_AVAILABLE" />}
+        nodes={nodes.filter((node) => node.technology.includes('5G'))}
+        uesByNode={uesByNode}
+      />
+      <AccessChain
+        label="LTE 4G — srsRAN"
+        testId="topology-chain-lte"
+        core={<CoreBlock observed={observed} coreLabel={catalogueCoreTone(LTE_NF_CATALOGUE, observed)} title="Open5GS EPC · LTE 4G" catalogue={LTE_NF_CATALOGUE} testId="topology-core-lte" metadata="PLMN/APN NOT_AVAILABLE" />}
+        nodes={nodes.filter((node) => /LTE/i.test(node.technology))}
+        uesByNode={uesByNode}
+      />
     </div>
   );
 }
 
+function AccessChain({ label, testId, core, nodes, uesByNode }: {
+  label: string;
+  testId: string;
+  core: ReactNode;
+  nodes: NodeItem[];
+  uesByNode: Map<string, UeState[]>;
+}) {
+  return (
+    <section className="flex min-w-0 flex-col items-center gap-2 rounded-2xl border border-line p-3" data-testid={testId}>
+      <h2 className="text-ep-lg font-semibold">{label}</h2>
+      {core}
+      {nodes.length === 0 ? (
+        <p className="rounded-md border border-dashed border-line p-3 text-ep-sm text-mute">Radio node UNKNOWN</p>
+      ) : nodes.map((node) => (
+        <GnbColumn key={node.id} node={node} attachedUes={uesByNode.get(node.id) ?? []} />
+      ))}
+    </section>
+  );
+}
+
 function GnbColumn({ node, attachedUes }: { node: NodeItem; attachedUes: UeState[] }) {
-  const isLte = node.technology === 'LTE';
+  const isLte = /LTE/i.test(node.technology);
   const controlLabel = isLte ? 'S1-MME · S1AP' : 'N2 · NGAP';
   const userLabel = isLte ? 'S1-U · GTP-U' : 'N3 · GTP-U';
-  const controlState = linkState(node.process_state, node.n2_endpoint);
-  const userState = linkState(node.process_state, node.n3_endpoint);
+  const controlState = isLte
+    ? observedLinkState(node.process_state, node.s1_state)
+    : observedLinkState(node.process_state, node.n2_state);
+  const userState = isLte
+    ? observedLinkState(node.process_state, node.s1u_state)
+    : observedLinkState(node.process_state, node.n3_state);
   const running = (node.process_state ?? '').toLowerCase() === 'running';
   const stateLabel = running ? 'ACTIVE' : node.configured ? node.process_state : 'PLANNED';
 
@@ -276,9 +333,9 @@ function GnbColumn({ node, attachedUes }: { node: NodeItem; attachedUes: UeState
               <Antenna width={16} height={16} aria-hidden />
             </span>
             <div className="min-w-0">
-              <p className="mono font-semibold truncate">{node.id}</p>
+              <p className="font-semibold truncate">{isLte ? 'srsENB' : 'UERANSIM gNB'} · <span className="mono">{node.id}</span></p>
               <p className="mono text-ep-xs text-mute truncate">
-                link {node.link_ip} · {isLte ? 'eUTRAN' : 'NR'}
+                {node.simulator} · link {node.link_ip} · {isLte ? 'LTE eUTRAN' : '5G NR'}
               </p>
             </div>
           </div>
@@ -321,7 +378,7 @@ function UeMiniCard({ ue }: { ue: UeState }) {
     >
       <div className="flex items-center gap-1.5">
         <Smartphone width={14} height={14} className="text-mute shrink-0" />
-        <span className="mono text-ep-sm font-medium truncate">{ue.id}</span>
+        <span className="text-ep-sm font-medium truncate">{ue.simulator === 'srsRAN' ? 'srsUE' : 'UERANSIM UE'} · <span className="mono">{ue.id}</span></span>
       </div>
       <div className="flex flex-wrap gap-1">
         <Pill tone={regTone(regState)}>
@@ -383,8 +440,9 @@ function toneDotClass(tone: NfPillTone): string {
 function topologyCoreTone(observed: WireLabObserved | undefined): { label: string } {
   const map = observed?.nfs;
   if (map && Object.keys(map).length > 0) {
-    const total = Object.keys(map).length;
-    const up = Object.values(map).filter(
+    const reported = FIVE_G_NF_CATALOGUE.map(({ nf }) => map[nf]).filter(Boolean);
+    const total = reported.length;
+    const up = reported.filter(
       (c) => c.process_state === 'running' && c.health === 'healthy',
     ).length;
     return {
@@ -394,4 +452,16 @@ function topologyCoreTone(observed: WireLabObserved | undefined): { label: strin
   const open = observed?.open5gs;
   if (!open) return { label: 'AMF container: not reported by /lab' };
   return { label: `AMF container: ${open.process_state}, ${open.health}` };
+}
+
+function catalogueCoreTone(
+  catalogue: { nf: string; role: string }[],
+  observed: WireLabObserved | undefined,
+): string {
+  const reported = catalogue.map(({ nf }) => observed?.nfs?.[nf]).filter(Boolean);
+  if (reported.length === 0) return 'EPC state: UNKNOWN — no per-function evidence from /lab.observed.nfs';
+  const healthy = reported.filter(
+    (item) => item?.process_state === 'running' && item.health === 'healthy',
+  ).length;
+  return `EPC functions: ${healthy}/${catalogue.length} running + healthy (${reported.length}/${catalogue.length} observed)`;
 }

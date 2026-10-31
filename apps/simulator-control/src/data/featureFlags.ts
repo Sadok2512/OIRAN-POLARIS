@@ -1,14 +1,14 @@
 // Minimal client-side feature-flag store.
 //
-// The four operational contracts are always enabled in production. A
-// test-only override keeps the legacy fixture branches executable by unit
-// tests without making them selectable by an operator.
+// Flags live in localStorage so an operator can opt in / out from the
+// Settings page without a redeploy. API-backed scenarios and templates are
+// enabled by default for the deployed API 0.13 contract; each remains
+// independently reversible from Settings.
 
 import { useCallback, useSyncExternalStore } from 'react';
 
 const LEGACY_FLAGS_KEY = 'polaris.featureFlags.v1';
 const FLAGS_KEY = 'polaris.featureFlags.v3';
-const ALLOW_TEST_OVERRIDE = import.meta.env.MODE === 'test';
 
 export interface FeatureFlags {
   /**
@@ -67,32 +67,32 @@ const DEFAULTS: FeatureFlags = {
 };
 
 function read(): FeatureFlags {
-  if (typeof localStorage === 'undefined') return DEFAULTS;
-  try {
-    const raw = localStorage.getItem(FLAGS_KEY);
-    if (!raw) {
-      // 0.9.2-hotfix: v1 allowed deployed backend features to remain OFF in
-      // upgraded browsers. The one-time v2 migration deliberately replaces
-      // those legacy values with the four enabled production defaults.
+  // 0.18.0 — operational builds are backend-only. Older releases allowed
+  // localStorage to switch UE/scenario pages to browser fixtures. Keeping the
+  // keys only lets us remove stale preferences without ever trusting them.
+  if (import.meta.env.MODE === 'test' && typeof localStorage !== 'undefined') {
+    try {
+      const raw = localStorage.getItem(FLAGS_KEY);
+      if (raw) return { ...DEFAULTS, ...(JSON.parse(raw) as Partial<FeatureFlags>) };
       if (localStorage.getItem(LEGACY_FLAGS_KEY) !== null) {
         localStorage.setItem(FLAGS_KEY, JSON.stringify(DEFAULTS));
       }
       return DEFAULTS;
+    } catch {
+      return DEFAULTS;
     }
-    // v3 is the real-lab contract: operational routes never fall back to
-    // browser fixtures/localStorage. Keep the persisted object only for
-    // forward-compatible non-operational flags.
-    const parsed = JSON.parse(raw) as Partial<FeatureFlags>;
-    if (ALLOW_TEST_OVERRIDE) return { ...DEFAULTS, ...parsed };
-    return DEFAULTS;
-  } catch {
-    return DEFAULTS;
   }
+  if (typeof localStorage !== 'undefined') {
+    localStorage.removeItem(FLAGS_KEY);
+    localStorage.removeItem(LEGACY_FLAGS_KEY);
+  }
+  return DEFAULTS;
 }
 
 function write(flags: FeatureFlags): void {
-  if (typeof localStorage === 'undefined') return;
-  localStorage.setItem(FLAGS_KEY, JSON.stringify(flags));
+  if (import.meta.env.MODE === 'test' && typeof localStorage !== 'undefined') {
+    localStorage.setItem(FLAGS_KEY, JSON.stringify(flags));
+  }
 }
 
 type Listener = () => void;
@@ -125,10 +125,9 @@ export function getFlags(): FeatureFlags {
 }
 
 export function setFlag<K extends keyof FeatureFlags>(key: K, value: FeatureFlags[K]): void {
-  // These four capabilities are backed by the deployed API contract. Turning
-  // one off previously re-enabled demo/localStorage data on operational pages.
-  // Preserve the API for Settings compatibility but fail closed to ON.
-  write({ ...cache, [key]: value === false && !ALLOW_TEST_OVERRIDE ? true : value });
+  // Kept as a source-compatible no-op for old components/tests. Real-lab
+  // mode cannot be downgraded to a browser-local catalogue.
+  write({ ...cache, [key]: value });
   notify();
 }
 

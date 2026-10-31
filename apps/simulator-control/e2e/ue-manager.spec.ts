@@ -1,5 +1,5 @@
-// UE Manager capture — fixed-width table, grouped Runtime columns, right-side
-// Actions. Mocked API; UEs render PROTECTED identity.
+// Offline observed-contract test for the RAT-aware UE Manager. Route stubs are
+// test-only and are never bundled into the operational application.
 
 import { test, expect, type Page } from '@playwright/test';
 
@@ -59,6 +59,8 @@ async function mockApi(page: Page) {
             profile_state: 'VERIFIED',
             subscription_status: 'VERIFIED',
             serving_node: 'GNB-01',
+            technology: '5G SA',
+            simulator: 'UERANSIM',
             process_state: 'running',
             registration_state: 'REGISTERED',
             pdu_session: 'ACTIVE',
@@ -73,7 +75,23 @@ async function mockApi(page: Page) {
         configured_count: 1,
         active_count: 1,
         registered_count: 1,
-        source: 'MOCK',
+        source: 'TEST_OBSERVED_CONTRACT',
+      }),
+    }),
+  );
+
+  await page.route('**/polaris-api/v1/nodes', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        items: [{
+          id: 'GNB-01', technology: '5G SA', simulator: 'UERANSIM',
+          configured: true, controller_owned: false, process_state: 'running',
+          n2_state: 'CONNECTED', n3_state: 'SOCKET_OBSERVED',
+          actions: { start: false, stop: false, reason: 'SHARED_NODE_PROTECTED' },
+        }],
+        source: 'TEST_OBSERVED_CONTRACT',
       }),
     }),
   );
@@ -95,18 +113,23 @@ test.describe('UE Manager', () => {
     });
   });
 
-  test('table has grouped Runtime header and fixed width', async ({ page }) => {
+  test('table shows RAT, simulator and observed runtime fields at fixed width', async ({ page }) => {
     await page.goto('./ues');
     const table = page.getByTestId('ue-table');
     await expect(table).toBeVisible();
-    await expect(table).toContainText('Runtime');
-    await expect(table).toContainText('Registration');
-    await expect(table).toContainText('PDU');
-    await expect(table).toContainText('RRC');
+    await expect(table).toContainText('Technology');
+    await expect(table).toContainText('Simulator');
+    await expect(table).toContainText('Serving RAN');
+    await expect(table).toContainText('Attach / Registration');
+    await expect(table).toContainText('Session · IP');
 
     const row = page.getByTestId('ue-row-UE-01');
     await expect(row).toBeVisible();
     await expect(row).toContainText('UE-01');
+    await expect(row).toContainText('5G SA');
+    await expect(row).toContainText('UERANSIM');
+    await expect(row).toContainText('REGISTERED');
+    await expect(row).toContainText('10.46.0.5');
 
     await page.screenshot({
       path: 'docs/screenshots/ue-manager-grouped-runtime.png',
