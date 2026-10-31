@@ -1,5 +1,11 @@
 //! Strictly owned, allowlisted live capture jobs for the OIRAN local vProbe.
 
+mod callflow_page;
+
+pub use callflow_page::{
+    read_callflow_page, DEFAULT_CALLFLOW_PAGE_EVENTS, MAX_CALLFLOW_PAGE_EVENTS,
+};
+
 use callflow_schema::{build_callflow, CallFlow, CorrelationEdge};
 use capture_helper::{
     CaptureHelperClient, CaptureSpec, HelperState, InterfaceId, IpcRequest, MAX_CAPTURE_PLANES,
@@ -12,6 +18,7 @@ use event_schema::{
 };
 use oiran_decode::{decode_capture_streaming, DecodeConfig, DecodeReport};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use session_engine::{discover_sessions, load_path, reconstruct, Association, ReconstructionHints};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -26,7 +33,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const VERSION: &str = "0.2.6";
+pub const VERSION: &str = "0.2.7";
 /// Bounded read-chunk size for streaming file I/O; chosen so SHA-256 and pcap
 /// record counting operate on ≤ 1 MiB in memory regardless of input file size.
 const STREAM_CHUNK_BYTES: usize = 1 << 20;
@@ -1175,6 +1182,14 @@ impl CaptureManager {
     }
 
     pub fn callflow(&self, dataset_id: &str, session_id: &str) -> Option<CallFlow> {
+        let path = self.callflow_path(dataset_id, session_id)?;
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    }
+
+    fn callflow_path(&self, dataset_id: &str, session_id: &str) -> Option<PathBuf> {
+        if !safe_identifier(session_id) {
+            return None;
+        }
         let dataset = self.dataset(dataset_id)?;
         let dataset_root = if dataset.dataset_id.starts_with("derived-") {
             self.root
@@ -1189,10 +1204,27 @@ impl CaptureManager {
         } else {
             self.root.join(&dataset.capture_id).join("dataset")
         };
-        let path = dataset_root
-            .join("callflows")
-            .join(format!("{session_id}.json"));
-        serde_json::from_slice(&fs::read(path).ok()?).ok()
+        Some(
+            dataset_root
+                .join("callflows")
+                .join(format!("{session_id}.json")),
+        )
+    }
+
+    pub fn callflow_page(
+        &self,
+        dataset_id: &str,
+        session_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Option<Value>, String> {
+        let Some(path) = self.callflow_path(dataset_id, session_id) else {
+            return Ok(None);
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        read_callflow_page(&path, cursor, limit).map(Some)
     }
 
     /// Validates and atomically registers a reviewed offline-derived dataset.

@@ -946,3 +946,13 @@ All notable OIRAN vProbe changes are recorded here. Versions follow Semantic Ver
 
 - No decoder, historical dataset, live capture service or external laboratory component was modified or started.
 
+## OIRAN API 2.5.4 / live-probe 0.2.7 - 2026-10-31
+
+- `GET /api/v1/sessions/:id/callflow` now returns at most 100 events by
+  default and accepts `limit` (1..256) plus an event-id `cursor`.
+- Persisted call-flow JSON is read with a streaming deserializer; only the
+  selected event page is retained, preventing large historical sessions from
+  multiplying their resident-memory cost during HTTP serialization.
+- Every response carries `pagination.{limit,cursor,next_cursor,returned_events,total_events}`;
+  invalid cursors fail explicitly and never replay the first page.
+

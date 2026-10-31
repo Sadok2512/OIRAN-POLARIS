@@ -15,7 +15,8 @@ use dataset_registry::{CaptureRecord, DatasetRecord, DatasetRegistry};
 use disk_safety::{assess, capture_budget, measure_path, rotation_plan, Policy};
 use event_schema::sha256_hex;
 use live_probe::{
-    CaptureManager, CaptureRequest, ContinuousImportConfig, DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+    read_callflow_page, CaptureManager, CaptureRequest, ContinuousImportConfig,
+    DEFAULT_CALLFLOW_PAGE_EVENTS, DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES, MAX_CALLFLOW_PAGE_EVENTS,
 };
 use probe_registry::{CreateError as ProbeCreateError, ProbeInput, ProbeRecord, ProbeRegistry};
 use serde::Deserialize;
@@ -35,8 +36,8 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.5.3";
-pub const PLATFORM_VERSION: &str = "2.5.3";
+pub const API_VERSION: &str = "2.5.4";
+pub const PLATFORM_VERSION: &str = "2.5.4";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -48,6 +49,7 @@ pub struct AppState {
 struct Inner {
     flows: BTreeMap<String, CallFlow>,
     flow_values: BTreeMap<String, Value>,
+    flow_paths: BTreeMap<String, PathBuf>,
     primary_session_id: String,
     manifest: Value,
     captures: Vec<Value>,
@@ -212,6 +214,7 @@ impl AppState {
         let captures = build_captures(&dataset_dir, &manifest)?;
         let mut flows = BTreeMap::from([(flow.session_id.clone(), flow)]);
         let mut flow_values = BTreeMap::from([(primary_session_id.clone(), flow_value)]);
+        let mut flow_paths = BTreeMap::from([(primary_session_id.clone(), callflow_json.clone())]);
         let callflow_dir = dataset_dir.join("callflows");
         if callflow_dir.is_dir() {
             let mut paths = fs::read_dir(&callflow_dir)
@@ -234,6 +237,7 @@ impl AppState {
                 {
                     return Err(format!("duplicate session id {}", candidate.session_id));
                 }
+                flow_paths.insert(candidate.session_id.clone(), path);
                 flow_values.insert(candidate.session_id, candidate_value);
             }
         }
@@ -337,6 +341,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 flows,
                 flow_values,
+                flow_paths,
                 primary_session_id,
                 manifest,
                 captures,
@@ -467,6 +472,10 @@ fn flow_for<'a>(state: &'a AppState, id: &str) -> Option<&'a CallFlow> {
 
 fn flow_value_for<'a>(state: &'a AppState, id: &str) -> Option<&'a Value> {
     state.inner.flow_values.get(id)
+}
+
+fn flow_path_for<'a>(state: &'a AppState, id: &str) -> Option<&'a FsPath> {
+    state.inner.flow_paths.get(id).map(PathBuf::as_path)
 }
 
 fn live_flow_for(state: &AppState, id: &str) -> Option<(String, CallFlow)> {
@@ -1168,6 +1177,12 @@ struct ListQuery {
     capture_id: Option<String>,
     event_id: Option<String>,
     packet_number: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct CallflowQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
 }
 
 fn dataset_values(state: &AppState) -> Vec<Value> {
@@ -2055,20 +2070,162 @@ async fn session_events(
     paginated(items, &query).into_response()
 }
 
-async fn session_callflow(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let mut value = if let Some(flow_value) = flow_value_for(&state, &id) {
-        flow_value.clone()
-    } else if let Some((_dataset, flow)) = live_flow_for(&state, &id) {
-        serde_json::to_value(flow).unwrap_or(Value::Null)
+fn callflow_page_from_value(
+    source: &Value,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<Value, String> {
+    if !(1..=MAX_CALLFLOW_PAGE_EVENTS).contains(&limit) {
+        return Err("CALLFLOW_LIMIT_INVALID".into());
+    }
+    let source_object = source.as_object().ok_or("CALLFLOW_READ_FAILED")?;
+    let source_events = source_object
+        .get("events")
+        .and_then(Value::as_array)
+        .ok_or("CALLFLOW_READ_FAILED")?;
+    let start = if let Some(cursor) = cursor {
+        source_events
+            .iter()
+            .position(|event| event["event_id"] == cursor)
+            .map(|index| index + 1)
+            .ok_or("CALLFLOW_CURSOR_INVALID")?
     } else {
-        return api_error(
+        0
+    };
+    let events = source_events
+        .iter()
+        .skip(start)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let has_more = start.saturating_add(events.len()) < source_events.len();
+    let next_cursor = has_more
+        .then(|| events.last().and_then(|event| event["event_id"].as_str()))
+        .flatten()
+        .map(str::to_owned);
+    let selected_ids = events
+        .iter()
+        .filter_map(|event| event["event_id"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut output = source_object
+        .iter()
+        .filter(|(key, _)| key.as_str() != "events")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    if let Some(procedures) = output.get_mut("procedures").and_then(Value::as_array_mut) {
+        for procedure in procedures.iter_mut() {
+            if let Some(ids) = procedure["event_ids"].as_array_mut() {
+                ids.retain(|id| id.as_str().is_some_and(|id| selected_ids.contains(id)));
+            }
+        }
+        procedures.retain(|procedure| {
+            procedure["event_ids"]
+                .as_array()
+                .is_some_and(|ids| !ids.is_empty())
+        });
+    }
+    if let Some(edges) = output
+        .get_mut("correlation_edges")
+        .and_then(Value::as_array_mut)
+    {
+        edges.retain(|edge| {
+            ["source_event_id", "target_event_id"].iter().any(|field| {
+                edge[*field]
+                    .as_str()
+                    .is_some_and(|id| selected_ids.contains(id))
+            })
+        });
+    }
+    let returned_events = events.len();
+    output.insert("events".into(), Value::Array(events));
+    output.insert(
+        "pagination".into(),
+        json!({
+            "limit": limit,
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "returned_events": returned_events,
+            "total_events": source_events.len(),
+        }),
+    );
+    Ok(Value::Object(output))
+}
+
+fn callflow_read_error(error: &str) -> Response {
+    match error {
+        "CALLFLOW_LIMIT_INVALID" => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            error,
+            "limit must be between 1 and 256 events",
+        ),
+        "CALLFLOW_CURSOR_INVALID" => api_error(
+            StatusCode::BAD_REQUEST,
+            error,
+            "cursor does not identify an event in this call flow",
+        ),
+        _ => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CALLFLOW_READ_FAILED",
+            "the persisted call flow could not be read safely",
+        ),
+    }
+}
+
+async fn session_callflow(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CallflowQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(DEFAULT_CALLFLOW_PAGE_EVENTS);
+    if !(1..=MAX_CALLFLOW_PAGE_EVENTS).contains(&limit) {
+        return callflow_read_error("CALLFLOW_LIMIT_INVALID");
+    }
+    let cursor = query.cursor.as_deref();
+    let result = if let Some(path) = flow_path_for(&state, &id) {
+        read_callflow_page(path, cursor, limit).map(Some)
+    } else if let Some(flow_value) = flow_value_for(&state, &id) {
+        callflow_page_from_value(flow_value, cursor, limit).map(Some)
+    } else {
+        let mut found = None;
+        for dataset in state.inner.capture_manager.datasets() {
+            if !dataset
+                .session_ids
+                .iter()
+                .any(|session_id| session_id == &id)
+            {
+                continue;
+            }
+            found = match state.inner.capture_manager.callflow_page(
+                &dataset.dataset_id,
+                &id,
+                cursor,
+                limit,
+            ) {
+                Ok(Some(value)) => Some(Ok(value)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            };
+            if found.is_some() {
+                break;
+            }
+        }
+        match found {
+            Some(result) => result.map(Some),
+            None => Ok(None),
+        }
+    };
+    match result {
+        Ok(Some(mut value)) => {
+            sanitize_value(&mut value);
+            ok(value).into_response()
+        }
+        Ok(None) => api_error(
             StatusCode::NOT_FOUND,
             "SESSION_NOT_FOUND",
             "unknown session id",
-        );
-    };
-    sanitize_value(&mut value);
-    ok(value).into_response()
+        ),
+        Err(error) => callflow_read_error(&error),
+    }
 }
 
 async fn session_correlations(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -3096,6 +3253,69 @@ mod tests {
         )
         .await;
         assert_eq!(flow["data"]["session_id"], "5g-UE-B-pdu-2");
+    }
+
+    #[tokio::test]
+    async fn callflow_route_pages_persisted_events_with_a_bounded_cursor_contract() {
+        let app = router(state(), None);
+        let first_response = app
+            .clone()
+            .oneshot(req("/api/v1/sessions/5g-UE-A-pdu-1/callflow?limit=7", true))
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first = json_body(first_response).await;
+        assert_eq!(first["data"]["events"].as_array().unwrap().len(), 7);
+        assert_eq!(first["data"]["pagination"]["limit"], 7);
+        assert_eq!(first["data"]["pagination"]["total_events"], 54);
+        let cursor = first["data"]["pagination"]["next_cursor"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let first_event = first["data"]["events"][0]["event_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let second = json_body(
+            app.clone()
+                .oneshot(req(
+                    &format!("/api/v1/sessions/5g-UE-A-pdu-1/callflow?limit=7&cursor={cursor}"),
+                    true,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(second["data"]["events"].as_array().unwrap().len(), 7);
+        assert_ne!(second["data"]["events"][0]["event_id"], first_event);
+
+        let invalid_cursor = app
+            .clone()
+            .oneshot(req(
+                "/api/v1/sessions/5g-UE-A-pdu-1/callflow?limit=7&cursor=missing-event",
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_cursor.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(invalid_cursor).await["error"]["code"],
+            "CALLFLOW_CURSOR_INVALID"
+        );
+
+        let oversized = app
+            .oneshot(req(
+                "/api/v1/sessions/5g-UE-A-pdu-1/callflow?limit=257",
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            json_body(oversized).await["error"]["code"],
+            "CALLFLOW_LIMIT_INVALID"
+        );
     }
 
     #[tokio::test]
