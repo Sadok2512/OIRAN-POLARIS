@@ -19,6 +19,7 @@ export interface LiveGrant {
   granted_at_epoch_ms: number;
   expires_at_epoch_ms: number;
   granted_by: string;
+  granted_to?: string;
   revoked: boolean;
 }
 
@@ -31,6 +32,13 @@ export interface LiveGrantList {
 export interface LiveGrantRequest {
   ue_ids: string[];
   duration_minutes: number;
+}
+
+function grantNonce(): string {
+  if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
 }
 
 export function useLiveGrants() {
@@ -49,7 +57,7 @@ export function useCreateLiveGrant() {
     mutationFn: (input: LiveGrantRequest) =>
       polarisApi<LiveGrant>('/live/grant', {
         method: 'POST',
-        body: JSON.stringify(input),
+        body: JSON.stringify({ ...input, request_nonce: grantNonce() }),
       }),
     onSettled: () => {
       void client.invalidateQueries({ queryKey: ['polaris', 'live-grants'] });

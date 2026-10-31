@@ -1,5 +1,15 @@
 # @telecom/simulator-control — Changelog
 
+## 0.14.1 — 2026-10-31 — LTE safety-state hardening
+
+- Replaces the unconditional LTE Traffic Generator lock with backend-derived
+  certification, grant, ownership, current Attach/IP/session and safety gates.
+- Displays `UNKNOWN` for unverified LTE state and exposes controller ownership;
+  lifecycle controls stay disabled for running unowned instances.
+- Keeps every 0.13.1 5G Traffic Generator and live-chart path unchanged.
+- Generates a cryptographically random request nonce for Live Grant V2; the
+  backend persists only its SHA-256 digest and rejects replay.
+
 ## 0.14.0 — 2026-10-31 — unified LTE 4G / 5G SA control surface
 
 - Adds one reusable technology selector (`5G SA — UERANSIM` / `LTE 4G —

@@ -108,7 +108,8 @@ describe('LiveGrantDialog (0.11.1)', () => {
     await user.click(screen.getByTestId('live-grant-submit'));
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith('grant-xyz'));
     const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/live/grant'));
-    expect(post?.body).toEqual({ ue_ids: ['UE-02', 'UE-03'], duration_minutes: 60 });
+    expect(post?.body).toMatchObject({ ue_ids: ['UE-02', 'UE-03'], duration_minutes: 60 });
+    expect((post?.body as Record<string, unknown>).request_nonce).toEqual(expect.any(String));
   });
 
   it('surfaces 422 LIVE_GRANT_DURATION_INVALID verbatim', async () => {

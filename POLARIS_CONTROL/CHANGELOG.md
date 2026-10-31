@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.21.1 (polaris-control-api) — 2026-10-31 — srsRAN LTE lifecycle hardening
+
+- Resolves the real `srsenb` and `srsue` Compose services by immutable Compose
+  labels and the authoritative `oiran-lab` configuration path; container names
+  are no longer assumed.
+- Adds an atomic mode-0600 ownership ledger. Start, Stop and traffic operate on
+  exact recorded container IDs and reject unowned or ambiguous instances.
+- Bounds Docker/Compose/exec operations with host-enforced TERM/KILL timeouts,
+  exact cleanup and start rollback. No shell or HTTP-supplied command is used.
+- Derives S1, Attach, UE IP and session from current structured observations;
+  unverifiable values are `UNKNOWN`, never inferred from stale logs.
+- Gates LTE traffic on certification, live mode, active non-expired grant,
+  verified ownership, current Attach/IP/session and disk/memory safety. LTE uses
+  bounded iperf3 results and never enters the legacy 5G synthetic-sample path.
+- Adds negative coverage for ownership, timeout classification, rollback and
+  the allowlisted LTE UE identifier while retaining existing RBAC/grant tests.
+- Hardens Live Grant V2 with per-request nonces, a persistent mode-0600
+  SHA-256 nonce journal across API restarts, random grant identifiers and
+  explicit operator ownership. Replays return `409 LIVE_GRANT_REPLAY_REJECTED`.
+
 ## 0.21.0 (polaris-control-api) — 2026-10-31 — bounded srsRAN LTE integration
 
 - Integrates LTE into the existing POLARIS API through `/lte/status`,

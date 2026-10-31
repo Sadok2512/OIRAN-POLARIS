@@ -11,7 +11,8 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
   const ueLogs = useLteLogs('LTE-UE-01');
   const data = status.data;
   const canOperate = auth.data?.can_start === true;
-  const liveReady = data?.certified === true && data.live_enabled === true;
+  const liveReady = data?.certified === true && data.live_enabled === true && data.grant_active === true && data.safety_ready === true;
+  const ownershipVerified = data?.ownership_verified === true;
   const ueRunning = data?.ue.process_state === 'running';
   const enbRunning = data?.enb.process_state === 'running';
   const error = start.error ?? stop.error;
@@ -41,7 +42,7 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
         <div><dt className="text-ep-xs uppercase text-mute">Attach</dt><dd>{data?.attach_state ?? 'NOT OBSERVED'}</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">APN</dt><dd className="mono">{data?.apn ?? 'internet'}</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">UE IP</dt><dd className="mono">{data?.ue_ip ?? 'NOT OBSERVED'}</dd></div>
-        <div><dt className="text-ep-xs uppercase text-mute">Sessions</dt><dd>{data?.active_sessions ?? 0}</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">Sessions</dt><dd>{data?.session_state ?? 'UNKNOWN'} ({data?.active_sessions ?? 0})</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">Simulator</dt><dd>srsRAN</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">Technology</dt><dd>LTE 4G</dd></div>
       </dl>
@@ -58,24 +59,25 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
           icon={Play}
           primary
           onClick={() => start.mutate('LTE-UE-01')}
-          disabled={!canOperate || !liveReady || !enbRunning || ueRunning || start.isPending}
+          disabled={!canOperate || !liveReady || !enbRunning || !data?.enb.controller_owned || ueRunning || start.isPending}
           title={!liveReady ? 'LTE E2E certification and a valid live grant are required.' : undefined}
           data-testid="lte-ue-start"
         >Start srsUE</Btn>
         <Btn
           icon={Square}
           onClick={() => stop.mutate('LTE-UE-01')}
-          disabled={!canOperate || !ueRunning || stop.isPending}
+          disabled={!canOperate || !ueRunning || !data?.ue.controller_owned || stop.isPending}
           data-testid="lte-ue-stop"
         >Stop srsUE</Btn>
         <Btn
           icon={Square}
           onClick={() => stop.mutate('ENB-01')}
-          disabled={!canOperate || !enbRunning || ueRunning || stop.isPending}
+          disabled={!canOperate || !enbRunning || !data?.enb.controller_owned || ueRunning || stop.isPending}
           title={ueRunning ? 'Stop srsUE before srsENB.' : undefined}
           data-testid="lte-enb-stop"
         >Stop srsENB</Btn>
       </div>
+      {!ownershipVerified && (enbRunning || ueRunning) ? <p className="text-ep-sm text-bad">Running srsRAN service is not controller-owned; lifecycle actions are locked.</p> : null}
 
       {error ? <p className="text-ep-sm text-bad">{(error as Error).message}</p> : null}
       {!compact ? (
