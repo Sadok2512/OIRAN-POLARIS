@@ -1,5 +1,11 @@
 # Changelog
 
+## OIRAN API 2.5.3 / live-probe 0.2.6 - 2026-10-31
+
+- Aggregate continuous N3 user-plane observations by TEID, direction, inner flow and QFI while decoding; packet and byte counters plus first/last provenance remain exact without retaining one event per G-PDU.
+- Bound N3 aggregate cardinality and fail an individual segment closed if the limit is exceeded; N2, N4 and SBI signalling remain individual normalized events.
+- Preserve the real packet count in continuous-import activity metrics while storing only first/last N3 packet references.
+
 ## OIRAN API 2.5.2 / live-probe 0.2.5 - 2026-10-30
 
 - Commit continuous-import checksums only after the rebuilt dataset generation

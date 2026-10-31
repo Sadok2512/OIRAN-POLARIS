@@ -35,8 +35,8 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.5.1";
-pub const PLATFORM_VERSION: &str = "2.5.1";
+pub const API_VERSION: &str = "2.5.3";
+pub const PLATFORM_VERSION: &str = "2.5.3";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 

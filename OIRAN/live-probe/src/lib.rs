@@ -6,7 +6,10 @@ use capture_helper::{
 };
 use correlation_engine::{correlate_cross_interface_evidence, correlate_discovered_tunnels};
 use disk_safety::{assess, capture_budget, measure_path, CaptureBudget, Decision, Policy};
-use event_schema::{sha256_hex, Sha256Hasher};
+use event_schema::{
+    sha256_hex, DecodeStatus, EvidenceReference, EvidenceState, InformationElement, NamedValue,
+    NormalizedEvent, Protocol, Sha256Hasher,
+};
 use oiran_decode::{decode_capture_streaming, DecodeConfig, DecodeReport};
 use serde::{Deserialize, Serialize};
 use session_engine::{discover_sessions, load_path, reconstruct, Association, ReconstructionHints};
@@ -23,13 +26,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const VERSION: &str = "0.2.4";
+pub const VERSION: &str = "0.2.6";
 /// Bounded read-chunk size for streaming file I/O; chosen so SHA-256 and pcap
 /// record counting operate on ≤ 1 MiB in memory regardless of input file size.
 const STREAM_CHUNK_BYTES: usize = 1 << 20;
 const PROBE_ID: &str = "oiran-vprobe-local-01";
 const MIN_CAPTURE_BYTES: u64 = 1024 * 1024;
 const MAX_CONTINUOUS_EVENTS: usize = 50_000;
+const MAX_N3_FLOW_AGGREGATES: usize = 4096;
 const MAX_CONTINUOUS_DERIVED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SOURCE_CANDIDATES: usize = 512;
 pub const DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -38,6 +42,192 @@ const ACTIVE_PACKET_WINDOW_MS: u64 = 60_000;
 pub const CONTINUOUS_CAPTURE_ID: &str = "continuous-lab-import";
 pub const CONTINUOUS_DATASET_ID: &str = "dataset-continuous-lab-import";
 const HISTORICAL_N2_BOOTSTRAP_PATH: &str = "/var/lib/docker/volumes/oiran_lab_pcap/_data/n2/n2_20261026T121214Z_00001_20261026121214.pcapng";
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct N3FlowKey {
+    message_type: u32,
+    teid: String,
+    direction: String,
+    source: String,
+    destination: String,
+    inner_source: String,
+    inner_destination: String,
+    ue_ip: String,
+    qfi: Option<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct N3FlowAggregate {
+    event: NormalizedEvent,
+    packet_count: u64,
+    wire_bytes: u64,
+    first_seen_ns: i128,
+    last_seen_ns: i128,
+    last_packet: Option<event_schema::PacketReference>,
+    qfi: Option<u8>,
+}
+
+#[derive(Default)]
+struct N3FlowAggregator {
+    flows: BTreeMap<N3FlowKey, N3FlowAggregate>,
+}
+
+impl N3FlowAggregator {
+    fn observe(&mut self, event: NormalizedEvent) -> Result<(), String> {
+        let identifier = |name: &str| {
+            event
+                .session_identifiers
+                .iter()
+                .find(|item| item.name == name)
+                .map(|item| item.value.clone())
+                .unwrap_or_default()
+        };
+        let qfi = event
+            .information_elements
+            .iter()
+            .find(|item| item.name == "PDU Session Container")
+            .and_then(|item| item.value.as_deref())
+            .and_then(parse_qfi);
+        let key = N3FlowKey {
+            message_type: event.message_type,
+            teid: identifier("teid"),
+            direction: event.direction.as_str().to_string(),
+            source: event.source_endpoint.address.clone(),
+            destination: event.destination_endpoint.address.clone(),
+            inner_source: identifier("inner_source_ip"),
+            inner_destination: identifier("inner_destination_ip"),
+            ue_ip: identifier("ue_ip"),
+            qfi,
+        };
+        let packet_count = event.packet_references.len() as u64;
+        let wire_bytes = event
+            .packet_references
+            .iter()
+            .map(|packet| u64::from(packet.original_length))
+            .sum::<u64>();
+        let timestamp_ns = event.timestamp.unix_nanoseconds().unwrap_or_default();
+        let last_packet = event.packet_references.last().cloned();
+        if let Some(flow) = self.flows.get_mut(&key) {
+            flow.packet_count = flow.packet_count.saturating_add(packet_count);
+            flow.wire_bytes = flow.wire_bytes.saturating_add(wire_bytes);
+            flow.last_seen_ns = timestamp_ns;
+            flow.last_packet = last_packet;
+            return Ok(());
+        }
+        if self.flows.len() >= MAX_N3_FLOW_AGGREGATES {
+            return Err("N3_FLOW_AGGREGATE_CARDINALITY_LIMIT".to_string());
+        }
+        self.flows.insert(
+            key,
+            N3FlowAggregate {
+                event,
+                packet_count,
+                wire_bytes,
+                first_seen_ns: timestamp_ns,
+                last_seen_ns: timestamp_ns,
+                last_packet,
+                qfi,
+            },
+        );
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<NormalizedEvent> {
+        self.flows
+            .into_values()
+            .map(|mut flow| {
+                let first_packet = flow.event.packet_references.first().cloned();
+                flow.event.packet_references.clear();
+                if let Some(packet) = first_packet {
+                    flow.event.packet_references.push(packet);
+                }
+                if let Some(packet) = flow.last_packet {
+                    if flow
+                        .event
+                        .packet_references
+                        .last()
+                        .map(|first| first.packet_number != packet.packet_number)
+                        .unwrap_or(true)
+                    {
+                        flow.event.packet_references.push(packet);
+                    }
+                }
+                flow.event
+                    .session_identifiers
+                    .retain(|item| item.name != "sequence_number");
+                if let Some(qfi) = flow.qfi {
+                    flow.event.session_identifiers.push(NamedValue {
+                        name: "qfi".into(),
+                        value: qfi.to_string(),
+                        pseudonymized: false,
+                    });
+                }
+                for (name, value) in [
+                    ("aggregate_packet_count", flow.packet_count.to_string()),
+                    ("aggregate_wire_bytes", flow.wire_bytes.to_string()),
+                    ("aggregate_first_seen_ns", flow.first_seen_ns.to_string()),
+                    ("aggregate_last_seen_ns", flow.last_seen_ns.to_string()),
+                ] {
+                    flow.event.information_elements.push(InformationElement {
+                        id: None,
+                        name: name.into(),
+                        length: 0,
+                        value: Some(value),
+                        raw_sha256: None,
+                        status: DecodeStatus::Decoded,
+                    });
+                }
+                let first_packet = flow
+                    .event
+                    .packet_references
+                    .first()
+                    .map(|packet| packet.packet_number)
+                    .unwrap_or_default();
+                let last_packet = flow
+                    .event
+                    .packet_references
+                    .last()
+                    .map(|packet| packet.packet_number)
+                    .unwrap_or(first_packet);
+                let teid = flow
+                    .event
+                    .session_identifiers
+                    .iter()
+                    .find(|item| item.name == "teid")
+                    .map(|item| item.value.as_str())
+                    .unwrap_or("unknown");
+                flow.event.raw_payload_reference = format!(
+                    "n3-flow-aggregate:{}:{}:{}-{}",
+                    flow.event.capture_id, teid, first_packet, last_packet
+                );
+                flow.event.evidence_references = flow
+                    .event
+                    .packet_references
+                    .iter()
+                    .map(|packet| EvidenceReference {
+                        state: EvidenceState::Exact,
+                        kind: "packet-provenance".into(),
+                        reference: format!(
+                            "{}#packet-{}",
+                            packet.source_file, packet.packet_number
+                        ),
+                    })
+                    .collect();
+                flow.event.decoder_name = "live-probe-n3-flow-aggregator".into();
+                flow.event.decoder_version = VERSION.into();
+                flow.event.assign_deterministic_id();
+                flow.event
+            })
+            .collect()
+    }
+}
+
+fn parse_qfi(value: &str) -> Option<u8> {
+    value
+        .split(',')
+        .find_map(|part| part.strip_prefix("qfi="))
+        .and_then(|value| value.parse().ok())
+}
 
 fn allowlisted_historical_n2_bootstrap(path: &Path) -> bool {
     path.is_absolute()
@@ -1758,11 +1948,7 @@ impl CaptureManager {
                         // Publication is the commit point. If persisting the
                         // marker fails, the checksum remains unseen and the
                         // next scan safely retries the segment.
-                        persist_published_checksums(
-                            &state_path,
-                            &mut state,
-                            &pending_publication,
-                        )?;
+                        persist_published_checksums(&state_path, &mut state, &pending_publication)?;
                         let packets = dataset
                             .decode_reports
                             .values()
@@ -2187,7 +2373,11 @@ impl CaptureManager {
                 // on its own, so we do not need to keep the bytes in memory.
                 let checksum = sha256_hex_file(&path)?;
                 let capture_hash = format!("sha256:{checksum}");
-                let report = decode_capture_streaming(
+                let aggregate_n3 = capture_id == CONTINUOUS_CAPTURE_ID
+                    && interface.interface.eq_ignore_ascii_case("N3");
+                let mut n3_aggregator = N3FlowAggregator::default();
+                let mut individual_events = 0usize;
+                let mut report = decode_capture_streaming(
                     &DecodeConfig {
                         input: path.clone(),
                         capture_id: capture_hash,
@@ -2195,12 +2385,26 @@ impl CaptureManager {
                         endpoints: endpoints.clone(),
                     },
                     |event| {
+                        if aggregate_n3 && event.protocol == Protocol::Gtpu {
+                            return n3_aggregator.observe(event);
+                        }
+                        individual_events = individual_events.saturating_add(1);
                         decoded_spool
                             .write_all(event.to_json().as_bytes())
                             .and_then(|_| decoded_spool.write_all(b"\n"))
                             .map_err(display_error)
                     },
                 )?;
+                if aggregate_n3 {
+                    let aggregates = n3_aggregator.finish();
+                    report.events = individual_events.saturating_add(aggregates.len());
+                    for event in aggregates {
+                        decoded_spool
+                            .write_all(event.to_json().as_bytes())
+                            .and_then(|_| decoded_spool.write_all(b"\n"))
+                            .map_err(display_error)?;
+                    }
+                }
                 let key = path
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -3674,7 +3878,20 @@ fn continuous_activity(
     let mut packet_count = 0u64;
     let mut gpdu_by_ip = BTreeMap::<String, Vec<&session_engine::EventRecord>>::new();
     for event in fresh {
-        packet_count = packet_count.saturating_add(event.packet_references.len() as u64);
+        let aggregate_packet_count = event
+            .information_elements
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("name").and_then(serde_json::Value::as_str)
+                        == Some("aggregate_packet_count")
+                })
+            })
+            .and_then(|item| item.get("value"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<u64>().ok());
+        packet_count = packet_count
+            .saturating_add(aggregate_packet_count.unwrap_or(event.packet_references.len() as u64));
         if event.protocol == "GTP-U" && event.message_name == "G-PDU" {
             for value in event.identifier_values("ue_ip") {
                 if matches!(value, "10.46.0.4" | "10.46.0.5" | "10.46.0.6") {
@@ -4473,6 +4690,93 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    /// O3 regression: N3 packet headers are aggregated while streaming, so a
+    /// segment's byte size and packet count cannot turn into a proportional
+    /// in-memory vector of NormalizedEvent objects.
+    #[test]
+    #[ignore]
+    fn continuous_n3_500_mib_aggregates_under_64_mib_live_allocation() {
+        if skip_if_disk_too_full("continuous_n3_500_mib_aggregates_under_64_mib_live_allocation") {
+            return;
+        }
+        const MIB: usize = 1024 * 1024;
+        let source = temporary_root("continuous-n3-500mib-source");
+        let root = temporary_root("continuous-n3-500mib-owned");
+        fs::create_dir_all(source.join("N3")).unwrap();
+        let path = source.join("N3/segment-n3-500mib.pcap");
+        let mut packet = gtpu_gpdu_frame(201, 0x0000_f68d);
+        packet.resize(60 * 1024, 0);
+        write_repeated_pcap_at_least(&path, &packet, 500 * MIB as u64);
+        let source_size = fs::metadata(&path).unwrap().len();
+        assert!(source_size >= 500 * MIB as u64);
+        thread::sleep(Duration::from_millis(500));
+
+        let guard = reset_allocation_peak();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source.clone(),
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                max_owned_bytes: 700 * MIB as u64,
+                max_segment_bytes: DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+                max_segments: 2,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+            })
+            .unwrap();
+        wait_for(|| {
+            manager
+                .get(CONTINUOUS_CAPTURE_ID)
+                .is_some_and(|job| job.metrics.segments_ingested == 1)
+        });
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+        let peak = allocation_peak();
+        stop_allocation_tracking();
+        drop(guard);
+
+        let events = load_path(
+            &root
+                .join(CONTINUOUS_CAPTURE_ID)
+                .join("dataset")
+                .join("oiran_events.jsonl"),
+        )
+        .unwrap();
+        let n3 = events
+            .iter()
+            .filter(|event| event.protocol == "GTP-U" && event.message_name == "G-PDU")
+            .collect::<Vec<_>>();
+        assert_eq!(n3.len(), 1, "one TEID/flow must produce one N3 aggregate");
+        assert_eq!(n3[0].first_identifier("teid"), Some("0x0000f68d"));
+        let aggregate_count = n3[0]
+            .information_elements
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("name").and_then(serde_json::Value::as_str)
+                        == Some("aggregate_packet_count")
+                })
+            })
+            .and_then(|item| item.get("value"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap();
+        assert!(aggregate_count > 8_000);
+        assert!(
+            peak < 64 * MIB,
+            "500 MiB N3 import peak {peak} bytes exceeded 64 MiB"
+        );
+        eprintln!(
+            "N3_500MIB_SOURCE_BYTES={source_size} AGGREGATES={} PACKETS={} PEAK_BYTES={peak} PEAK_MIB={} LIMIT_MIB=64",
+            n3.len(),
+            aggregate_count,
+            peak / MIB
+        );
+        fs::remove_dir_all(source).ok();
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn oversized_segment_is_persisted_individually_while_other_segment_imports() {
         if skip_if_disk_too_full(
@@ -4577,6 +4881,32 @@ mod tests {
             bytes.extend_from_slice(packet);
         }
         fs::write(path, bytes).unwrap();
+    }
+
+    fn write_repeated_pcap_at_least(path: &Path, packet: &[u8], minimum_bytes: u64) {
+        let file = fs::File::create(path).unwrap();
+        let mut writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, file);
+        writer
+            .write_all(&[
+                0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0,
+                0, 0,
+            ])
+            .unwrap();
+        let record_bytes = 16u64 + packet.len() as u64;
+        let records = minimum_bytes.saturating_sub(24).div_ceil(record_bytes);
+        for index in 0..records {
+            writer.write_all(&(index as u32 + 1).to_le_bytes()).unwrap();
+            writer.write_all(&0u32.to_le_bytes()).unwrap();
+            writer
+                .write_all(&(packet.len() as u32).to_le_bytes())
+                .unwrap();
+            writer
+                .write_all(&(packet.len() as u32).to_le_bytes())
+                .unwrap();
+            writer.write_all(packet).unwrap();
+        }
+        writer.flush().unwrap();
+        writer.get_ref().sync_all().unwrap();
     }
 
     fn gtpu_gpdu_frame(ue_octet: u8, teid: u32) -> Vec<u8> {
@@ -5672,12 +6002,8 @@ mod tests {
         assert!(!state_path.exists());
 
         fs::create_dir_all(state_path.parent().unwrap()).unwrap();
-        persist_published_checksums(
-            &state_path,
-            &mut state,
-            std::slice::from_ref(&checksum),
-        )
-        .unwrap();
+        persist_published_checksums(&state_path, &mut state, std::slice::from_ref(&checksum))
+            .unwrap();
         let persisted: ContinuousImportState =
             serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         assert!(state.seen_checksums.contains(&checksum));
