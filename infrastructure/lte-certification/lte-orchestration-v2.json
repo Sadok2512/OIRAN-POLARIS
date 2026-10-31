@@ -1,0 +1,40 @@
+{
+  "schema_version": "polaris.lte-orchestration.v2",
+  "profile_id": "LTE-SRSUE-TEST-01",
+  "scenario_id": "lte-e2e-certification-v1",
+  "global_deadline_seconds": 300,
+  "minimum_available_memory_bytes": 4294967296,
+  "maximum_disk_usage_percent_exclusive": 85,
+  "required_external_dumpcap_count": 12,
+  "states": ["IDLE", "ENB_STARTING", "S1_READY", "UE_STARTING", "ATTACHED", "IP_READY", "TRAFFIC_RUNNING", "STOPPING", "CLEAN"],
+  "phase_limits": {
+    "preflight": {"timeout_seconds": 15, "maximum_attempts": 1},
+    "enb_start": {"timeout_seconds": 30, "maximum_attempts": 2},
+    "s1_ready": {"timeout_seconds": 40, "maximum_attempts": 1},
+    "ue_start": {"timeout_seconds": 30, "maximum_attempts": 2},
+    "attach": {"timeout_seconds": 45, "maximum_attempts": 1},
+    "ip_ready": {"timeout_seconds": 20, "maximum_attempts": 1},
+    "traffic": {"timeout_seconds": 60, "maximum_attempts": 1},
+    "cleanup": {"timeout_seconds": 45, "maximum_attempts": 2}
+  },
+  "traffic_bounds": {
+    "ping_packets_per_direction": 5,
+    "udp_rate_bps_per_direction": 1000000,
+    "udp_duration_seconds_per_direction": 10,
+    "udp_payload_bytes_maximum": 1200,
+    "parallel_streams": 1
+  },
+  "runtime": {
+    "compose_project": "oiran-lab",
+    "compose_file": "/root/POLARIS/compose/docker-compose.oiran-lab.yml",
+    "enb_service": "srsenb",
+    "ue_service": "srsue",
+    "maximum_running_ues": 1
+  },
+  "required_planes": ["S1_MME", "S11", "S1_U"],
+  "plane_aliases": {"S1_MME": "S1-MME", "S11": "S11", "S1_U": "S1-U"},
+  "optional_plane_policy": "REJECT_UNSUPPORTED",
+  "evidence_schema": "oiran-polaris.lte-e2e-evidence.v1",
+  "cleanup_is_grant_exempt": true,
+  "resume_traffic_after_restart": false
+}
