@@ -6,11 +6,13 @@ pub use callflow_page::{
     read_callflow_page, DEFAULT_CALLFLOW_PAGE_EVENTS, MAX_CALLFLOW_PAGE_EVENTS,
 };
 
-use callflow_schema::{build_callflow, CallFlow, CorrelationEdge};
+use callflow_schema::{build_callflow, build_lte_callflow, CallFlow, CorrelationEdge};
 use capture_helper::{
     CaptureHelperClient, CaptureSpec, HelperState, InterfaceId, IpcRequest, MAX_CAPTURE_PLANES,
 };
-use correlation_engine::{correlate_cross_interface_evidence, correlate_discovered_tunnels};
+use correlation_engine::{
+    correlate_cross_interface_evidence, correlate_discovered_tunnels, correlate_lte_evidence,
+};
 use disk_safety::{assess, capture_budget, measure_path, CaptureBudget, Decision, Policy};
 use event_schema::{
     sha256_hex, DecodeStatus, EvidenceReference, EvidenceState, InformationElement, NamedValue,
@@ -19,7 +21,10 @@ use event_schema::{
 use oiran_decode::{decode_capture_streaming, DecodeConfig, DecodeReport};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use session_engine::{discover_sessions, load_path, reconstruct, Association, ReconstructionHints};
+use session_engine::{
+    discover_lte_sessions, discover_sessions, load_path, reconstruct, Association, EventRecord,
+    ReconstructionHints,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, OpenOptions},
@@ -33,7 +38,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const VERSION: &str = "0.2.7";
+pub const VERSION: &str = "0.3.0";
 /// Bounded read-chunk size for streaming file I/O; chosen so SHA-256 and pcap
 /// record counting operate on ≤ 1 MiB in memory regardless of input file size.
 const STREAM_CHUNK_BYTES: usize = 1 << 20;
@@ -43,12 +48,41 @@ const MAX_CONTINUOUS_EVENTS: usize = 50_000;
 const MAX_N3_FLOW_AGGREGATES: usize = 4096;
 const MAX_CONTINUOUS_DERIVED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SOURCE_CANDIDATES: usize = 512;
+pub const MAX_OFFLINE_LTE_SESSIONS: usize = 128;
 pub const DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONTINUOUS_SEEN: usize = 4096;
 const ACTIVE_PACKET_WINDOW_MS: u64 = 60_000;
 pub const CONTINUOUS_CAPTURE_ID: &str = "continuous-lab-import";
 pub const CONTINUOUS_DATASET_ID: &str = "dataset-continuous-lab-import";
 const HISTORICAL_N2_BOOTSTRAP_PATH: &str = "/var/lib/docker/volumes/oiran_lab_pcap/_data/n2/n2_20261026T121214Z_00001_20261026121214.pcapng";
+
+/// Materialises bounded LTE sessions from already-decoded evidence. This does
+/// not start a capture or expand the live-capture interface allowlist.
+pub fn offline_lte_callflows(events: &[EventRecord]) -> Result<Vec<CallFlow>, String> {
+    let sessions = discover_lte_sessions(events);
+    if sessions.len() > MAX_OFFLINE_LTE_SESSIONS {
+        return Err(format!(
+            "offline LTE session limit exceeded: {} > {}",
+            sessions.len(),
+            MAX_OFFLINE_LTE_SESSIONS
+        ));
+    }
+    let global_edges = correlate_lte_evidence(events);
+    Ok(sessions
+        .iter()
+        .map(|session| {
+            let ids = session.event_ids.iter().collect::<BTreeSet<_>>();
+            let edges = global_edges
+                .iter()
+                .filter(|edge| {
+                    ids.contains(&edge.source_event_id) && ids.contains(&edge.target_event_id)
+                })
+                .cloned()
+                .collect();
+            build_lte_callflow(session, events, edges)
+        })
+        .collect())
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct N3FlowKey {
@@ -2644,6 +2678,21 @@ impl CaptureManager {
             atomic_write(&html_path, html.as_bytes())?;
             session_ids.push(flow.session_id);
         }
+        for flow in offline_lte_callflows(&events)? {
+            let json_path = dataset_dir
+                .join("callflows")
+                .join(format!("{}.json", flow.session_id));
+            let html_path = dataset_dir
+                .join("callflows")
+                .join(format!("{}.html", flow.session_id));
+            atomic_write(
+                &json_path,
+                &serde_json::to_vec_pretty(&flow).map_err(|error| error.to_string())?,
+            )?;
+            let html = callflow_renderer::render(&flow).map_err(|error| error.to_string())?;
+            atomic_write(&html_path, html.as_bytes())?;
+            session_ids.push(flow.session_id);
+        }
         for active in &active_pdu_contexts {
             let flow = runtime_pdu_callflow(&events, active);
             let json_path = dataset_dir
@@ -4401,6 +4450,103 @@ fn display_error(error: std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lte_event(
+        id: &str,
+        interface: &str,
+        protocol: &str,
+        name: &str,
+        identifiers: &[(&str, &str)],
+        direction: &str,
+        packet: u64,
+    ) -> EventRecord {
+        serde_json::from_value(serde_json::json!({
+            "event_id": id,
+            "parent_event_id": null,
+            "capture_id": "sha256:synthetic-lte-offline",
+            "capture_point_id": interface,
+            "timestamp": format!("2026-10-31T12:00:00.{packet:09}Z"),
+            "timestamp_ns": 1_000_000_000_i128 + i128::from(packet),
+            "raw_ticks": 1_000_000_000_u64 + packet,
+            "interface": interface,
+            "protocol": protocol,
+            "message_name": name,
+            "source_address": "192.0.2.10",
+            "destination_address": "192.0.2.20",
+            "source_participant": if interface == "S1-MME" { "eNB" } else { "SGW" },
+            "destination_participant": if interface == "S1-MME" { "MME" } else { "eNB" },
+            "direction": direction,
+            "identifiers": identifiers,
+            "information_elements": [],
+            "decoding_status": "DECODED",
+            "decoder_name": protocol,
+            "decoder_version": "synthetic-test",
+            "raw_payload_reference": format!("sha256:{id}"),
+            "packet_references": [{
+                "source_file": "synthetic-offline.pcap",
+                "packet_number": packet,
+                "byte_offset": packet * 64,
+                "interface_id": 0,
+                "captured_length": 64,
+                "original_length": 64
+            }],
+            "errors": [],
+            "source_json": {}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn offline_lte_materialisation_is_bounded_and_correlates_planes() {
+        let events = vec![
+            lte_event(
+                "s1ap",
+                "S1-MME",
+                "S1AP",
+                "E-RABSetupResponse",
+                &[
+                    ("enb_ue_s1ap_id", "42"),
+                    ("mme_ue_s1ap_id", "84"),
+                    ("imsi_pseudonym", "lte-ue-anon-a"),
+                    ("eps_bearer_identity", "5"),
+                    ("erab_teid", "0x01020304"),
+                ],
+                "UPLINK",
+                1,
+            ),
+            lte_event(
+                "s11",
+                "S11",
+                "GTPv2-C",
+                "CreateSessionResponse",
+                &[
+                    ("imsi_pseudonym", "lte-ue-anon-a"),
+                    ("bearer_f_teid", "0x01020304"),
+                ],
+                "DOWNLINK",
+                2,
+            ),
+            lte_event(
+                "s1u",
+                "S1-U",
+                "GTP-U",
+                "G-PDU",
+                &[("teid", "0x01020304")],
+                "UPLINK",
+                3,
+            ),
+        ];
+        let flows = offline_lte_callflows(&events).unwrap();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].technology, "LTE");
+        assert_eq!(flows[0].accounting.session_events, 3);
+        assert_eq!(
+            flows[0].interfaces,
+            vec!["S1-MME".to_owned(), "S1-U".to_owned(), "S11".to_owned()]
+        );
+        assert_eq!(flows[0].correlation_status["E2E"], "STRONG");
+        assert!(!serde_json::to_string(&flows).unwrap().contains("001010"));
+    }
 
     #[test]
     fn session_evidence_expands_transitively_from_n2_through_n4_to_n3() {

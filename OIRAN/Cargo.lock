@@ -441,7 +441,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "live-probe"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "callflow-renderer",
  "callflow-schema",
@@ -530,12 +530,13 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.5.4"
+version = "2.6.0"
 dependencies = [
  "axum",
  "callflow-renderer",
  "callflow-schema",
  "capture-helper",
+ "correlation-engine",
  "dataset-registry",
  "disk-safety",
  "event-schema",
@@ -543,6 +544,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "live-probe",
+ "oiran-decode",
  "serde",
  "serde_json",
  "session-engine",
@@ -569,6 +571,7 @@ dependencies = [
  "capture-pcap",
  "decoder-gtpu",
  "decoder-gtpv2c",
+ "decoder-nas",
  "decoder-ngap",
  "decoder-pfcp",
  "decoder-s1ap",

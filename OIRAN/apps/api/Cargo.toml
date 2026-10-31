@@ -1,6 +1,6 @@
 [package]
 name = "oiran-api"
-version = "2.5.4"
+version = "2.6.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,8 @@ dataset-registry = { path = "../../dataset-registry" }
 disk-safety = { path = "../../disk-safety" }
 event-schema = { path = "../../event-schema" }
 live-probe = { path = "../../live-probe" }
+oiran-decode = { path = "../../oiran-decode" }
+correlation-engine = { path = "../../correlation-engine" }
 session-engine = { path = "../../session-engine" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
