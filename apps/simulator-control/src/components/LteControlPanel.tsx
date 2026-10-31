@@ -1,20 +1,28 @@
 import { Play, Square } from 'lucide-react';
 import { Btn, Card, Pill, regTone } from '@/components/mockup';
 import { useAuth, useLteAction, useLteLogs, useLteProfile, useLteStatus } from '@/data/queries';
+import { useStartLteCertifiedRun } from '@/data/liveGrantApi';
 
 export function LteControlPanel({ compact = false }: { compact?: boolean }) {
   const auth = useAuth();
   const status = useLteStatus();
   const stop = useLteAction('stop');
+  const startRun = useStartLteCertifiedRun();
   const profile = useLteProfile();
   const enbLogs = useLteLogs('ENB-01');
   const ueLogs = useLteLogs('LTE-SRSUE-TEST-01');
   const data = status.data;
   const canOperate = auth.data?.can_start === true;
-  const liveReady = data?.certified === true && data.live_enabled === true;
+  const liveReady = data?.certified === true && data.live_enabled === true && data.grant_active === true && data.safety_ready === true;
+  const startGateReady = data?.certified === true
+    && data.live_enabled === true
+    && data.safety_ready === true
+    && profile.data?.enabled === true
+    && data.grant_active !== true;
+  const ownershipVerified = data?.ownership_verified === true;
   const ueRunning = data?.ue.process_state === 'running';
   const enbRunning = data?.enb.process_state === 'running';
-  const error = stop.error;
+  const error = stop.error ?? startRun.error;
 
   return (
     <Card className="p-5 flex flex-col gap-4" data-testid="lte-control-panel">
@@ -41,7 +49,7 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
         <div><dt className="text-ep-xs uppercase text-mute">Attach</dt><dd>{data?.attach_state ?? 'NOT OBSERVED'}</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">APN</dt><dd className="mono">{data?.apn ?? 'internet'}</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">UE IP</dt><dd className="mono">{data?.ue_ip ?? 'NOT OBSERVED'}</dd></div>
-        <div><dt className="text-ep-xs uppercase text-mute">Sessions</dt><dd>{data?.active_sessions ?? 0}</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">Sessions</dt><dd>{data?.session_state ?? 'UNKNOWN'} ({data?.active_sessions ?? 0})</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">Simulator</dt><dd>srsRAN</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">Technology</dt><dd>LTE 4G</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">Grant contract</dt><dd>{profile.data?.grant_required ? 'V2 REQUIRED' : 'NOT OBSERVED'}</dd></div>
@@ -50,31 +58,29 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
       <div className="flex flex-wrap gap-2 border-t border-line pt-3">
         <Btn
           icon={Play}
-          disabled
-          title="Start is available only through a consumed LTE Grant V2 run."
-          data-testid="lte-enb-start"
-        >Start srsENB</Btn>
-        <Btn
-          icon={Play}
           primary
-          disabled
-          title="Start is available only through POST /api/v1/lte/runs with a one-time Grant V2 nonce."
-          data-testid="lte-ue-start"
-        >Start srsUE</Btn>
+          disabled={!canOperate || !startGateReady || startRun.isPending}
+          title={startGateReady ? 'Issues and consumes a one-time, five-minute LTE Grant V2.' : 'Requires ANR1 certification, enabled LTE profile, safety gates and no active LTE run.'}
+          onClick={() => {
+            if (profile.data) startRun.mutate(profile.data);
+          }}
+          data-testid="lte-enb-start"
+        >{startRun.isPending ? 'Starting certified run…' : 'Start LTE certified run'}</Btn>
         <Btn
           icon={Square}
           onClick={() => stop.mutate('LTE-SRSUE-TEST-01')}
-          disabled={!canOperate || !ueRunning || stop.isPending}
+          disabled={!canOperate || !ueRunning || !data?.ue.controller_owned || stop.isPending}
           data-testid="lte-ue-stop"
         >Stop srsUE</Btn>
         <Btn
           icon={Square}
           onClick={() => stop.mutate('ENB-01')}
-          disabled={!canOperate || !enbRunning || ueRunning || stop.isPending}
+          disabled={!canOperate || !enbRunning || !data?.enb.controller_owned || ueRunning || stop.isPending}
           title={ueRunning ? 'Stop srsUE before srsENB.' : undefined}
           data-testid="lte-enb-stop"
         >Stop srsENB</Btn>
       </div>
+      {!ownershipVerified && (enbRunning || ueRunning) ? <p className="text-ep-sm text-bad">Running srsRAN service is not controller-owned; lifecycle actions are locked.</p> : null}
 
       {error ? <p className="text-ep-sm text-bad">{(error as Error).message}</p> : null}
       {!compact ? (

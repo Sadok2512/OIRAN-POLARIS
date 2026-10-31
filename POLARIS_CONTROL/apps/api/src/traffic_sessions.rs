@@ -226,18 +226,16 @@ impl TrafficSessionManager {
             .lock()
             .unwrap()
             .insert(session_id.clone(), session.clone());
-        self.samples
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), VecDeque::with_capacity(SAMPLES_RING_MAX));
+        self.samples.lock().unwrap().insert(
+            session_id.clone(),
+            VecDeque::with_capacity(SAMPLES_RING_MAX),
+        );
         Ok(session)
     }
 
     pub fn transition_running(&self, session_id: &str) -> Result<(), &'static str> {
         let mut map = self.sessions.lock().unwrap();
-        let session = map
-            .get_mut(session_id)
-            .ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
+        let session = map.get_mut(session_id).ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
         if !matches!(session.state, SessionState::Requested) {
             return Err("TRAFFIC_SESSION_INVALID_TRANSITION");
         }
@@ -248,18 +246,35 @@ impl TrafficSessionManager {
     /// Stop a session. Always allowed, even on a Failed state (idempotent).
     pub fn stop(&self, session_id: &str) -> Result<TrafficSession, &'static str> {
         let mut map = self.sessions.lock().unwrap();
-        let session = map
-            .get_mut(session_id)
-            .ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
+        let session = map.get_mut(session_id).ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if matches!(session.state, SessionState::Running | SessionState::Requested) {
+        if matches!(
+            session.state,
+            SessionState::Running | SessionState::Requested
+        ) {
             session.state = SessionState::Stopped;
             session.ended_at_epoch_s = Some(now);
         }
         Ok(session.clone())
+    }
+
+    pub fn fail(&self, session_id: &str, error: String) -> Result<(), &'static str> {
+        let mut map = self.sessions.lock().unwrap();
+        let session = map.get_mut(session_id).ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
+        session.state = SessionState::Failed;
+        session.ended_at_epoch_s = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+        if !session.warnings.contains(&error) {
+            session.warnings.push(error);
+        }
+        Ok(())
     }
 
     /// Called by the per-UE iperf3 worker when the measurement window
@@ -277,9 +292,7 @@ impl TrafficSessionManager {
         warnings: Vec<String>,
     ) -> Result<(), &'static str> {
         let mut map = self.sessions.lock().unwrap();
-        let session = map
-            .get_mut(session_id)
-            .ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
+        let session = map.get_mut(session_id).ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
         let counters = session
             .ue_counters
             .iter_mut()
@@ -316,15 +329,9 @@ impl TrafficSessionManager {
     /// `SAMPLES_RING_MAX`; older ticks fall off the front. Returns an
     /// error only when the session_id is unknown (so the driver can log
     /// and keep going without panicking).
-    pub fn push_sample(
-        &self,
-        session_id: &str,
-        sample: TrafficSample,
-    ) -> Result<(), &'static str> {
+    pub fn push_sample(&self, session_id: &str, sample: TrafficSample) -> Result<(), &'static str> {
         let mut map = self.samples.lock().unwrap();
-        let ring = map
-            .get_mut(session_id)
-            .ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
+        let ring = map.get_mut(session_id).ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
         if ring.len() == SAMPLES_RING_MAX {
             ring.pop_front();
         }
@@ -346,9 +353,7 @@ impl TrafficSessionManager {
     /// if the session is already in a terminal state.
     pub fn complete(&self, session_id: &str) -> Result<(), &'static str> {
         let mut map = self.sessions.lock().unwrap();
-        let session = map
-            .get_mut(session_id)
-            .ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
+        let session = map.get_mut(session_id).ok_or("TRAFFIC_SESSION_NOT_FOUND")?;
         if matches!(
             session.state,
             SessionState::Completed | SessionState::Stopped | SessionState::Failed
@@ -366,6 +371,9 @@ impl TrafficSessionManager {
 }
 
 fn is_ue_id_valid(id: &str) -> bool {
+    if id == "LTE-SRSUE-TEST-01" {
+        return true;
+    }
     if !id.starts_with("UE-") {
         return false;
     }
@@ -402,6 +410,18 @@ mod tests {
         assert_eq!(
             TrafficSessionManager::validate(&r).unwrap_err(),
             "TRAFFIC_SESSION_UE_IDS_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_only_the_allowlisted_lte_ue_shape() {
+        let mut r = req();
+        r.ue_ids = vec!["LTE-SRSUE-TEST-01".into()];
+        assert_eq!(TrafficSessionManager::validate(&r), Ok(()));
+        r.ue_ids = vec!["LTE-UE-99".into()];
+        assert_eq!(
+            TrafficSessionManager::validate(&r),
+            Err("TRAFFIC_SESSION_UE_ID_INVALID")
         );
     }
 
@@ -519,9 +539,7 @@ mod tests {
         assert!(ue01
             .warnings
             .contains(&"IPERF3_SERVER_OUTPUT_MISSING".to_string()));
-        assert!(ue01
-            .warnings
-            .contains(&"IPERF3_RECEIVER_SHORT".to_string()));
+        assert!(ue01.warnings.contains(&"IPERF3_RECEIVER_SHORT".to_string()));
         // Session-level warnings dedupe too.
         assert_eq!(got.warnings.len(), 2);
     }
@@ -574,7 +592,10 @@ mod tests {
         }
         let got = mgr.samples(&s.session_id).unwrap();
         assert_eq!(got.len(), SAMPLES_RING_MAX);
-        assert_eq!(got.first().unwrap().epoch_s, 1_000_000 + (SAMPLES_RING_MAX / 2) as u64);
+        assert_eq!(
+            got.first().unwrap().epoch_s,
+            1_000_000 + (SAMPLES_RING_MAX / 2) as u64
+        );
         assert_eq!(
             got.last().unwrap().epoch_s,
             1_000_000 + (SAMPLES_RING_MAX + SAMPLES_RING_MAX / 2 - 1) as u64
@@ -610,7 +631,10 @@ mod tests {
         assert!(got.ended_at_epoch_s.is_some());
         // Idempotent — a second `complete` on an already-COMPLETED session is a no-op.
         mgr.complete(&s.session_id).unwrap();
-        assert_eq!(mgr.get(&s.session_id).unwrap().state, SessionState::Completed);
+        assert_eq!(
+            mgr.get(&s.session_id).unwrap().state,
+            SessionState::Completed
+        );
     }
 
     #[test]

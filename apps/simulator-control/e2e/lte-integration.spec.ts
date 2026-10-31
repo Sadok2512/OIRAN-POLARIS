@@ -42,8 +42,7 @@ test('LTE is integrated in UE Manager and remains certification-locked', async (
   await expect(panel).toBeVisible();
   await expect(panel).toContainText('LTE 4G — srsRAN');
   await expect(panel).toContainText('CERTIFICATION REQUIRED');
-  await expect(page.getByRole('button', { name: 'Start srsUE' })).toBeDisabled();
-  await expect(page.getByRole('button', { name: 'Start srsENB' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Start LTE certified run' })).toBeDisabled();
 
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
   expect(overflow).toBe(false);

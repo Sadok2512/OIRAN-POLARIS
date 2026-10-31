@@ -1,11 +1,18 @@
 # @telecom/simulator-control — Changelog
 
-## 0.15.0 — 2026-10-31 — LTE Grant V2 safety contract
+## 0.15.1 — 2026-10-31 — final LTE Grant V2 safety contract
 
 - Uses the canonical `LTE-SRSUE-TEST-01` profile exposed by POLARIS 0.22.0.
-- Shows the persistent profile/Grant V2 contract and removes direct LTE Start
-  affordances that cannot carry the one-time nonce and subject hashes.
+- Adds the explicit certified-run action that creates and atomically consumes
+  Grant V2 while keeping the one-time nonce only in browser memory.
 - Keeps grant-independent Operator Stop and all existing 5G controls intact.
+- Replaces the unconditional LTE Traffic Generator lock with backend-derived
+  certification, grant, ownership, current Attach/IP/session and safety gates.
+- Displays `UNKNOWN` for unverified LTE state and exposes controller ownership;
+  lifecycle controls stay disabled for running unowned instances.
+- Keeps every 0.13.1 5G Traffic Generator and live-chart path unchanged.
+- Applies the ANR1 LTE traffic bounds in the UI: UDP only, at most 1 Mbit/s
+  per direction and 30 seconds. TCP remains available for existing 5G UEs.
 
 ## 0.14.0 — 2026-10-31 — unified LTE 4G / 5G SA control surface
 
