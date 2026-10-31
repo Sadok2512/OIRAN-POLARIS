@@ -5083,9 +5083,19 @@ struct UeProfileListQuery {
 
 async fn list_ue_profiles(
     State(state): State<Arc<AppState>>,
-    Extension(_identity): Extension<EffectiveIdentity>,
+    Extension(identity): Extension<EffectiveIdentity>,
     Query(query): Query<UeProfileListQuery>,
 ) -> Json<Value> {
+    // 0.20.2 (#48 extension) — operators and administrators see the raw
+    // IMSI on each managed profile; everyone else keeps
+    // `subscriber_identity = "PROTECTED"`. K/OPc material stays
+    // `authentication_material = "PROTECTED"` for every role, forever.
+    let visibility =
+        subscriber_provisioning::SubscriberIdentityVisibility::for_role(&identity.role);
+    let identity_exposed = matches!(
+        visibility,
+        subscriber_provisioning::SubscriberIdentityVisibility::Imsi
+    );
     let registry = state.profile_registry.lock().unwrap();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(100).clamp(1, 500);
@@ -5120,7 +5130,15 @@ async fn list_ue_profiles(
                 });
         if matches_search && matches_scenario && matches_status {
             if total >= offset && items.len() < page_size {
-                items.push(managed_profile_json(record));
+                let mut row = managed_profile_json(record);
+                if identity_exposed {
+                    if let Ok(imsi) = state.profile_store.subscriber_imsi(record) {
+                        if let Some(object) = row.as_object_mut() {
+                            object.insert("subscriber_identity".into(), Value::String(imsi));
+                        }
+                    }
+                }
+                items.push(row);
             }
             total += 1;
         }
@@ -5132,7 +5150,8 @@ async fn list_ue_profiles(
         "page_size":page_size,
         "pages":if total == 0 { 0 } else { (total + page_size - 1) / page_size },
         "max":ueransim_adapter::MAX_CONFIGURABLE_UES,
-        "secrets_exposed":false
+        "secrets_exposed":false,
+        "subscriber_identity_exposed": identity_exposed,
     }))
 }
 
@@ -5600,8 +5619,20 @@ async fn create_ue_profile(
 
 async fn get_ue_profile(
     State(state): State<Arc<AppState>>,
+    Extension(effective_identity): Extension<EffectiveIdentity>,
     AxumPath(ue_id): AxumPath<String>,
 ) -> impl IntoResponse {
+    // 0.20.2 (#48 extension) — role-aware IMSI projection on the UE
+    // detail, mirroring /subscribers. Operators / admins see raw IMSI
+    // both on the top-level `subscriber_identity` field and on the
+    // nested `subscriber.subscriber_identity`. Viewers see "PROTECTED"
+    // on both. K/OPc stays "PROTECTED" for every role.
+    let visibility =
+        subscriber_provisioning::SubscriberIdentityVisibility::for_role(&effective_identity.role);
+    let identity_exposed = matches!(
+        visibility,
+        subscriber_provisioning::SubscriberIdentityVisibility::Imsi
+    );
     let record = {
         let registry = state.profile_registry.lock().unwrap();
         match registry
@@ -5619,9 +5650,9 @@ async fn get_ue_profile(
         Err(error) => return profile_mutation_error(error),
     };
     let backend = state.subscriber_backend.clone();
-    let identity = imsi.clone();
+    let imsi_for_lookup = imsi.clone();
     let subscriber = match tokio::task::spawn_blocking(move || {
-        backend.lookup_many(std::slice::from_ref(&identity))
+        backend.lookup_many(std::slice::from_ref(&imsi_for_lookup))
     })
     .await
     {
@@ -5651,9 +5682,23 @@ async fn get_ue_profile(
     };
     let mut value = managed_profile_json(&record);
     let object = value.as_object_mut().unwrap();
+    if identity_exposed {
+        object.insert("subscriber_identity".into(), Value::String(imsi.clone()));
+    }
+    object.insert("subscriber_identity_exposed".into(), Value::Bool(identity_exposed));
     object.insert("pdu_sessions".into(),json!([{"dnn":record.profile.dnn,"state":pdu_state,"source":"CURRENT_CONTROLLER_OBSERVATION"}]));
     object.insert("ims".into(),json!({"configured":subscriber.as_ref().is_some_and(|s|s.dnns.iter().any(|d|d=="ims")),"state":"NOT_OBSERVED"}));
-    object.insert("subscriber".into(),subscriber.as_ref().map(subscriber_provisioning::sanitize).map(|s|serde_json::to_value(s).unwrap()).unwrap_or_else(||json!({"state":"NOT_PROVISIONED","subscriber_identity":"PROTECTED","authentication_material":"PROTECTED"})));
+    object.insert(
+        "subscriber".into(),
+        subscriber
+            .as_ref()
+            .map(|sub| subscriber_provisioning::sanitize_for_role(sub, visibility))
+            .map(|s| serde_json::to_value(s).unwrap())
+            .unwrap_or_else(|| {
+                let identity_value = if identity_exposed { imsi.clone() } else { "PROTECTED".into() };
+                json!({"state":"NOT_PROVISIONED","subscriber_identity":identity_value,"authentication_material":"PROTECTED"})
+            }),
+    );
     object.insert("last_job".into(),json!({"bytes_ul":last_job.as_ref().and_then(|j|j["bytes_sent"].as_u64()),"bytes_dl":last_job.as_ref().and_then(|j|j["bytes_received"].as_u64()),"job_id":last_job.as_ref().and_then(|j|j["job_id"].as_str())}));
     (StatusCode::OK, Json(value))
 }
@@ -7082,6 +7127,32 @@ async fn ues(
             })
             .unwrap_or_default()
     };
+    // 0.20.2 (#48 extension) — role-aware IMSI projection on /ues.
+    // Operators / admins see raw IMSI per item; viewers stay
+    // "PROTECTED". We resolve the IMSI *once* up-front via
+    // `profile_store.subscriber_imsi(managed)` so the hot `items.map`
+    // below stays O(n) rather than reading the on-disk secret
+    // registry for every row.
+    let visibility =
+        subscriber_provisioning::SubscriberIdentityVisibility::for_role(&identity.role);
+    let identity_exposed = matches!(
+        visibility,
+        subscriber_provisioning::SubscriberIdentityVisibility::Imsi
+    );
+    let imsi_by_ue_id: BTreeMap<String, String> = if identity_exposed {
+        managed_profiles
+            .iter()
+            .filter_map(|(ue_id, record)| {
+                state
+                    .profile_store
+                    .subscriber_imsi(record)
+                    .ok()
+                    .map(|imsi| (ue_id.clone(), imsi))
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     let items = profile_specs
         .iter()
         .filter(|profile| profile.configured)
@@ -7179,6 +7250,15 @@ async fn ues(
             } else {
                 "UE_NOT_RUNNING"
             };
+            let subscriber_identity: Value = if identity_exposed {
+                imsi_by_ue_id
+                    .get(&profile.ue_id)
+                    .cloned()
+                    .map(Value::String)
+                    .unwrap_or_else(|| Value::String("PROTECTED".into()))
+            } else {
+                Value::String("PROTECTED".into())
+            };
             json!({
                 "id":profile.pseudonym,"internal_ue_id":profile.ue_id,"profile":profile.profile_name,
                 "profile_state":"CONFIGURED","subscription_status":subscription_status,
@@ -7190,6 +7270,8 @@ async fn ues(
                 "last_event":job.and_then(|value|value.last_error.clone()).map_or(Value::Null,Value::from),
                 "controller_owned":!shared,
                 "ownership":if shared {"SHARED_PROTECTED"} else {"POLARIS_CONTROLLER"},
+                "subscriber_identity": subscriber_identity,
+                "authentication_material": "PROTECTED",
                 "scenario_id":managed.and_then(|record|record.scenario_id.clone()),
                 "auto_run_scenario":managed.is_some_and(|record|record.auto_run_scenario),
                 "control_authorized":control_authorized,
@@ -7216,9 +7298,20 @@ async fn ues(
         // actions.start computed above and the Start / Run handlers.
         let control_authorized = control_authorized_ids.contains(&profile.ue_id)
             || grant_covered_ids.contains(&profile.ue_id);
+        let profile_identity: Value = if identity_exposed {
+            imsi_by_ue_id
+                .get(&profile.ue_id)
+                .cloned()
+                .map(Value::String)
+                .unwrap_or_else(|| Value::String("PROTECTED".into()))
+        } else {
+            Value::String("PROTECTED".into())
+        };
         json!({
             "id":profile.ue_id,"pseudonym":profile.pseudonym,"profile":profile.profile_name,"serving_gnb":profile.serving_gnb,"simulator":"UERANSIM",
             "state":state_label,"configured":profile.configured,"controller_owned":!shared,"ownership":if shared {"SHARED_PROTECTED"} else {"POLARIS_CONTROLLER"},"control_authorized":control_authorized,"subscription_status":if profile.subscription_verified {"VERIFIED"}else{"PROVISIONING_UNKNOWN"},
+            "subscriber_identity": profile_identity,
+            "authentication_material": "PROTECTED",
             "scenario_id":managed.and_then(|record|record.scenario_id.clone()),"auto_run_scenario":managed.is_some_and(|record|record.auto_run_scenario),
             "actions":{"authorize":reason == "READY" && !control_authorized && job.map_or(true, |value| value.process_handle.is_none()),"start":reason == "READY" && control_authorized && job.map_or(true, |value| value.process_handle.is_none()),"stop":job.is_some_and(|value|value.process_handle.is_some()),"traffic":false,"reason":if reason == "READY" && !control_authorized {"UE_CONTROL_VALIDATION_REQUIRED"} else {reason}}
         })
@@ -7241,7 +7334,7 @@ async fn ues(
         .filter(|job| job.pdu_session_state == "ACTIVE")
         .count();
     Json(
-        json!({"items":items,"configured_profiles":profiles,"configured_count":controller.configured_count(),"planned_count":controller_inventory.len(),"max_configurable":ueransim_adapter::MAX_CONFIGURABLE_UES,"active_count":usize::from(shared_observation.process_state == "RUNNING")+controller_active,"registered_count":usize::from(shared_observation.registration_state == "REGISTERED")+controller_registered,"pdu_session_count":usize::from(shared_observation.pdu_session_state == "ACTIVE")+controller_pdu,"observed_at_epoch_s":epoch_seconds(),"cache_version":state.ue_inventory_cache_version.load(Ordering::Acquire),"cache_fresh":cache_fresh,"source":"CURRENT_NAS_PDU_AND_CONTROLLER_REGISTRY"}),
+        json!({"items":items,"configured_profiles":profiles,"configured_count":controller.configured_count(),"planned_count":controller_inventory.len(),"max_configurable":ueransim_adapter::MAX_CONFIGURABLE_UES,"active_count":usize::from(shared_observation.process_state == "RUNNING")+controller_active,"registered_count":usize::from(shared_observation.registration_state == "REGISTERED")+controller_registered,"pdu_session_count":usize::from(shared_observation.pdu_session_state == "ACTIVE")+controller_pdu,"observed_at_epoch_s":epoch_seconds(),"cache_version":state.ue_inventory_cache_version.load(Ordering::Acquire),"cache_fresh":cache_fresh,"source":"CURRENT_NAS_PDU_AND_CONTROLLER_REGISTRY","subscriber_identity_exposed":identity_exposed}),
     )
 }
 
@@ -16630,6 +16723,260 @@ mod p0_tests {
             .await
             .unwrap();
         assert_eq!(again.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------
+    // 0.20.2 (#48 extension) — role-aware IMSI exposure on
+    // /ue-profiles (list + detail) and /ues. Mirrors the 0.19.7
+    // guarantee that already covers /subscribers:
+    //   * operator / administrator → raw IMSI, subscriber_identity_exposed = true
+    //   * anonymous viewer         → "PROTECTED", subscriber_identity_exposed = false
+    //   * K / OPc material         → NEVER on the wire, any role.
+    // -----------------------------------------------------------
+
+    const TEST_IMSI_FOR_UE_99: &str = "001010000099999";
+    const TEST_UE_ID: &str = "UE-99";
+
+    async fn provision_subscriber_and_profile(
+        application: &Router,
+        cookie: &str,
+        csrf: &str,
+    ) {
+        let payload = json!({
+            "imsi": format!("imsi-{TEST_IMSI_FOR_UE_99}"),
+            "k": "11".repeat(16),
+            "opc": "22".repeat(16),
+            "sst": 1,
+            "sd": "010203",
+            "dnns": ["internet", "ims"],
+            "ambr": {"uplink": 1_000_000, "downlink": 2_000_000},
+        });
+        let created = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/subscribers")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .header("x-csrf-token", csrf)
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        // Attach the subscriber to a brand-new UE-99 managed profile so
+        // `profile_store.subscriber_imsi(record)` can resolve.
+        let bind = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ue-profiles")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .header("x-csrf-token", csrf)
+                    .body(Body::from(
+                        json!({
+                            "ue_id": TEST_UE_ID,
+                            "name": TEST_UE_ID,
+                            "gnb_id": "GNB-01",
+                            "note": "role-aware IMSI test",
+                            "imsi": TEST_IMSI_FOR_UE_99,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bind.status(), StatusCode::CREATED);
+    }
+
+    async fn fetch_body(application: &Router, uri: &str, cookie: Option<&str>) -> (StatusCode, Value) {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(c) = cookie {
+            builder = builder.header(header::COOKIE, c);
+        }
+        let response = application
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn ue_profiles_list_exposes_raw_imsi_for_operator_and_protects_viewer() {
+        let backend = MemorySubscriberBackend::default();
+        let mut test_state = state();
+        test_state.subscriber_backend = Arc::new(backend);
+        let application = app(test_state);
+        let (cookie, csrf) =
+            login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        provision_subscriber_and_profile(&application, &cookie, &csrf).await;
+
+        let (operator_status, operator_body) =
+            fetch_body(&application, "/api/v1/ue-profiles", Some(&cookie)).await;
+        assert_eq!(operator_status, StatusCode::OK);
+        assert_eq!(operator_body["subscriber_identity_exposed"], Value::Bool(true));
+        let items = operator_body["items"].as_array().unwrap();
+        let ue02 = items
+            .iter()
+            .find(|i| i["ue_id"] == TEST_UE_ID)
+            .expect("test UE should be in the profiles list");
+        assert_eq!(ue02["subscriber_identity"], Value::String(TEST_IMSI_FOR_UE_99.into()));
+        assert_eq!(ue02["authentication_material"], Value::String("PROTECTED".into()));
+
+        let (viewer_status, viewer_body) =
+            fetch_body(&application, "/api/v1/ue-profiles", None).await;
+        assert_eq!(viewer_status, StatusCode::OK);
+        assert_eq!(viewer_body["subscriber_identity_exposed"], Value::Bool(false));
+        let items = viewer_body["items"].as_array().unwrap();
+        let ue02 = items.iter().find(|i| i["ue_id"] == TEST_UE_ID).unwrap();
+        assert_eq!(ue02["subscriber_identity"], Value::String("PROTECTED".into()));
+        // Viewer serialized body MUST NOT contain the raw IMSI anywhere.
+        let serialized = serde_json::to_string(&viewer_body).unwrap();
+        assert!(
+            !serialized.contains(TEST_IMSI_FOR_UE_99),
+            "viewer body leaked IMSI: {serialized}",
+        );
+    }
+
+    #[tokio::test]
+    async fn ue_profile_detail_exposes_raw_imsi_for_operator_and_protects_viewer() {
+        let backend = MemorySubscriberBackend::default();
+        let mut test_state = state();
+        test_state.subscriber_backend = Arc::new(backend);
+        let application = app(test_state);
+        let (cookie, csrf) =
+            login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        provision_subscriber_and_profile(&application, &cookie, &csrf).await;
+
+        let (op_status, op_body) =
+            fetch_body(&application, "/api/v1/ue-profiles/UE-99", Some(&cookie)).await;
+        assert_eq!(op_status, StatusCode::OK);
+        assert_eq!(op_body["subscriber_identity_exposed"], Value::Bool(true));
+        assert_eq!(op_body["subscriber_identity"], Value::String(TEST_IMSI_FOR_UE_99.into()));
+        assert_eq!(
+            op_body["subscriber"]["subscriber_identity"],
+            Value::String(TEST_IMSI_FOR_UE_99.into())
+        );
+        assert_eq!(
+            op_body["subscriber"]["authentication_material"],
+            Value::String("PROTECTED".into())
+        );
+
+        let (vi_status, vi_body) =
+            fetch_body(&application, "/api/v1/ue-profiles/UE-99", None).await;
+        assert_eq!(vi_status, StatusCode::OK);
+        assert_eq!(vi_body["subscriber_identity_exposed"], Value::Bool(false));
+        assert_ne!(vi_body["subscriber_identity"], Value::String(TEST_IMSI_FOR_UE_99.into()));
+        assert_eq!(
+            vi_body["subscriber"]["subscriber_identity"],
+            Value::String("PROTECTED".into())
+        );
+        let serialized = serde_json::to_string(&vi_body).unwrap();
+        assert!(
+            !serialized.contains(TEST_IMSI_FOR_UE_99),
+            "viewer detail leaked IMSI: {serialized}",
+        );
+    }
+
+    #[tokio::test]
+    async fn ues_list_tags_each_item_with_role_aware_subscriber_identity() {
+        let backend = MemorySubscriberBackend::default();
+        let mut test_state = state();
+        test_state.subscriber_backend = Arc::new(backend);
+        let application = app(test_state);
+        let (cookie, csrf) =
+            login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        provision_subscriber_and_profile(&application, &cookie, &csrf).await;
+
+        let (op_status, op_body) = fetch_body(&application, "/api/v1/ues", Some(&cookie)).await;
+        assert_eq!(op_status, StatusCode::OK);
+        assert_eq!(op_body["subscriber_identity_exposed"], Value::Bool(true));
+        let item = op_body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["internal_ue_id"] == TEST_UE_ID)
+            .expect("test UE should be in /ues items");
+        assert_eq!(item["subscriber_identity"], Value::String(TEST_IMSI_FOR_UE_99.into()));
+        assert_eq!(item["authentication_material"], Value::String("PROTECTED".into()));
+        let configured = op_body["configured_profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == TEST_UE_ID)
+            .unwrap();
+        assert_eq!(configured["subscriber_identity"], Value::String(TEST_IMSI_FOR_UE_99.into()));
+
+        let (vi_status, vi_body) = fetch_body(&application, "/api/v1/ues", None).await;
+        assert_eq!(vi_status, StatusCode::OK);
+        assert_eq!(vi_body["subscriber_identity_exposed"], Value::Bool(false));
+        let item = vi_body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["internal_ue_id"] == TEST_UE_ID)
+            .unwrap();
+        assert_eq!(item["subscriber_identity"], Value::String("PROTECTED".into()));
+        let serialized = serde_json::to_string(&vi_body).unwrap();
+        assert!(
+            !serialized.contains(TEST_IMSI_FOR_UE_99),
+            "viewer /ues leaked IMSI: {serialized}",
+        );
+        // K / OPc must not appear in any role.
+        let op_serialized = serde_json::to_string(&op_body).unwrap();
+        assert!(!op_serialized.contains(&"11".repeat(16)));
+        assert!(!op_serialized.contains(&"22".repeat(16)));
+    }
+
+    #[tokio::test]
+    async fn ue_profile_endpoints_reject_mutation_responses_from_leaking_imsi() {
+        // The three mutation handlers (POST / PUT / PATCH / clone /
+        // assign-scenario) deliberately keep `subscriber_identity =
+        // "PROTECTED"` in their JSON responses even for an operator.
+        // Only the two GET surfaces and /ues project the IMSI. Lock
+        // this so a future change does not silently flip a mutation
+        // output into an identity-leaking shape.
+        let backend = MemorySubscriberBackend::default();
+        let mut test_state = state();
+        test_state.subscriber_backend = Arc::new(backend);
+        let application = app(test_state);
+        let (cookie, csrf) =
+            login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        provision_subscriber_and_profile(&application, &cookie, &csrf).await;
+
+        // PATCH scenario → mutation response, should NOT carry IMSI.
+        let patched = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::PATCH)
+                    .uri("/api/v1/ue-profiles/UE-99/scenario")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(json!({"scenario_id":null}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if patched.status() == StatusCode::OK {
+            let body = String::from_utf8(
+                to_bytes(patched.into_body(), usize::MAX).await.unwrap().to_vec(),
+            )
+            .unwrap();
+            assert!(!body.contains(TEST_IMSI_FOR_UE_99), "mutation leaked IMSI: {body}");
+            assert!(body.contains("PROTECTED"));
+        }
     }
 
     #[tokio::test]

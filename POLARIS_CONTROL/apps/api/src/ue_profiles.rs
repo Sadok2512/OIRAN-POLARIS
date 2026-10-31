@@ -218,8 +218,11 @@ impl ProfileStore {
         &self.gnbs
     }
 
-    /// Internal-only lookup used to join a protected profile with its Open5GS subscription.
-    /// The returned identity must never be serialized, logged, or included in an API response.
+    /// Lookup used to join a protected profile with its Open5GS
+    /// subscription. The returned IMSI is **only** safe to serialize
+    /// behind the `SubscriberIdentityVisibility::for_role` gate (0.19.7
+    /// extended to /ue-profiles and /ues in 0.20.2). Every other caller
+    /// — audit log, mutation response, logging — must keep it internal.
     pub fn subscriber_imsi(&self, record: &ManagedUeProfile) -> Result<String, String> {
         let supi = self.read_existing_secrets(&record.profile.profile_name)?.0;
         supi.strip_prefix("imsi-")

@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.20.2 (polaris-control-api) — 2026-10-31 — role-aware IMSI on /ue-profiles and /ues
+
+Rebased on top of `29f8ef5` (0.20.1 — Traffic Generator HTTP surface +
+samples ring). `git merge-base --is-ancestor 29f8ef5 HEAD` → true.
+This bundles Traffic Generator **and** role-aware IMSI; it is the
+single POLARIS API deployment target going forward.
+
+### Routes gaining the 0.19.7 (#48) IMSI gate
+- `GET /api/v1/ue-profiles` — each item in `items[]` now carries a
+  role-projected `subscriber_identity`: raw IMSI for
+  `operator` / `administrator`, `"PROTECTED"` for every other role
+  (anonymous viewer, unauthenticated session). Response gains the
+  top-level `subscriber_identity_exposed: bool` flag so the UI can
+  render the correct chip without round-tripping to `/auth/me`.
+- `GET /api/v1/ue-profiles/:ue_id` — same projection on the top-level
+  `subscriber_identity`, on the nested
+  `subscriber.subscriber_identity` (via the new
+  `subscriber_provisioning::sanitize_for_role(record, visibility)` path),
+  and the response adds `subscriber_identity_exposed`.
+- `GET /api/v1/ues` — every entry in both `items[]` and
+  `configured_profiles[]` gains `subscriber_identity`
+  (role-projected) + `authentication_material: "PROTECTED"`. The
+  response adds `subscriber_identity_exposed`. IMSI per UE is resolved
+  **once** at the top of the handler into a `BTreeMap<ue_id, IMSI>` so
+  the hot per-row loop remains O(n).
+
+### What stays protected for every role
+- **K / OPc** material never leaves the API process. The
+  `authentication_material` field is hard-coded to `"PROTECTED"` on
+  every surface, independent of role (operator included).
+- The **mutation** responses (`POST`, `PUT`, `PATCH /scenario`, clone)
+  keep `subscriber_identity = "PROTECTED"` in their reply bodies even
+  for an operator. These are deliberate: only the two GET surfaces +
+  `/ues` project the IMSI. The test
+  `ue_profile_endpoints_reject_mutation_responses_from_leaking_imsi`
+  locks this invariant.
+
+### Reused infrastructure
+- `subscriber_provisioning::SubscriberIdentityVisibility::for_role` —
+  the exact helper 0.19.7 ships for `/subscribers`. No new vocabulary.
+- `subscriber_provisioning::sanitize_for_role(record, visibility)` —
+  same path 0.19.7 uses to project the nested subscriber record on
+  `/subscribers` detail. New call site: the nested `subscriber` object
+  on `/ue-profiles/:id`.
+- `profile_store.subscriber_imsi(record)` — internal join between a
+  managed profile and its Open5GS subscription. Docstring updated to
+  reflect that 0.19.7 / 0.20.2 allow this value through the
+  `SubscriberIdentityVisibility::for_role` gate (and nowhere else).
+
+### Tests (`cargo test -p polaris-control-api`)
+- `ue_profiles_list_exposes_raw_imsi_for_operator_and_protects_viewer`
+  — operator → IMSI + `subscriber_identity_exposed:true`; viewer →
+  "PROTECTED" + `subscriber_identity_exposed:false`; viewer body does
+  not contain the raw IMSI string anywhere.
+- `ue_profile_detail_exposes_raw_imsi_for_operator_and_protects_viewer`
+  — same, plus the nested `subscriber.subscriber_identity` is also
+  role-projected.
+- `ues_list_tags_each_item_with_role_aware_subscriber_identity` —
+  both `items[]` and `configured_profiles[]` tagged. K / OPc never
+  appear in the operator body.
+- `ue_profile_endpoints_reject_mutation_responses_from_leaking_imsi`
+  — PATCH scenario response keeps IMSI out even for an operator.
+- Full `cargo test -p polaris-control-api` → **195 passed · 0 failed
+  · 3 ignored** (ignored pre-existing). No regression on the 191
+  tests shipped at 0.20.1.
+
+### Deployment envelope
+0.20.2 is the single POLARIS API we deploy going forward: Traffic
+Generator (0.20.1) + role-aware IMSI (0.20.2) in one atomic release.
+
 ## 0.20.1 (polaris-control-api) — 2026-10-30 — Traffic Generator HTTP surface
 
 Rebased on top of `ebcf851` (0.20.0 — Traffic Generator state machine
