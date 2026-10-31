@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.25.2 (polaris-control-api) — 2026-10-31 — canonical LTE Compose model
+
+- Includes the `lte` profile explicitly in the fixed-argv canonical Compose
+  rendering so the digest covers the real `srsenb` and `srsue` service model.
+- Sorts every JSON object recursively before hashing, independently of the
+  `serde_json` map backend or the key order emitted by Docker Compose.
+- Keeps the immutable image reference check independent from the rendered-model
+  digest; neither mismatch can be used to authorize a runtime operation.
+- Adds a regression test proving that the canonical command cannot silently
+  omit profile-gated LTE services.
+
 ## 0.25.1 (polaris-control-api) — 2026-10-31 — isolated read-only staging
 
 - Adds `POLARIS_STAGING_READ_ONLY=true`, a router-level fail-closed gate that

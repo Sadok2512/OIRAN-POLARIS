@@ -12,6 +12,7 @@ pub const VERSION: &str = "0.2.1";
 pub const LTE_UE_ID: &str = "LTE-SRSUE-TEST-01";
 pub const ENB_ID: &str = "ENB-01";
 const PROJECT: &str = "oiran-lab";
+const LTE_PROFILE: &str = "lte";
 const COMPOSE: &str = "/root/POLARIS/compose/docker-compose.oiran-lab.yml";
 const ENV_FILE: &str = "/root/POLARIS/compose/versions.env";
 const UE_CONFIG: &str = "/root/POLARIS/runtime/srsran/ue.conf";
@@ -423,20 +424,30 @@ impl DockerSrsranRuntime {
         self.run(&["logs", "--tail", "400", &container.id], 5)
             .ok()
             .filter(|output| output.code == 0)
-            .map(|output| format!("{}{}", output.stdout, output.stderr)
-                .lines().filter_map(sanitize_log_line).collect())
+            .map(|output| {
+                format!("{}{}", output.stdout, output.stderr)
+                    .lines()
+                    .filter_map(sanitize_log_line)
+                    .collect()
+            })
             .unwrap_or_default()
     }
     fn attach_proof(&self, ue: Option<&Container>) -> bool {
-        let Some(ue) = ue.filter(|container| container.state == "running") else { return false; };
+        let Some(ue) = ue.filter(|container| container.state == "running") else {
+            return false;
+        };
         self.sanitized_logs(ue).iter().any(|line| {
             let lower = line.to_ascii_lowercase();
             lower.contains("network attach successful") || lower.contains("attach complete")
         })
     }
     fn epc_context_proof(&self) -> bool {
-        let Ok(Some(mme)) = self.resolve("mme") else { return false; };
-        if mme.state != "running" { return false; }
+        let Ok(Some(mme)) = self.resolve("mme") else {
+            return false;
+        };
+        if mme.state != "running" {
+            return false;
+        }
         self.sanitized_logs(&mme).iter().any(|line| {
             let lower = line.to_ascii_lowercase();
             lower.contains("initial context setup response")
@@ -551,21 +562,56 @@ pub fn profile_configuration_sha256() -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-pub fn compose_model_sha256() -> Result<String, String> {
-    fn canonical(value: &serde_json::Value) -> serde_json::Value {
-        match value {
-            serde_json::Value::Object(map) => serde_json::Value::Object(
-                map.iter().map(|(key,value)|(key.clone(),canonical(value))).collect()
-            ),
-            serde_json::Value::Array(values) => serde_json::Value::Array(values.iter().map(canonical).collect()),
-            other => other.clone(),
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut sorted = serde_json::Map::new();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_json(&map[key]));
+            }
+            serde_json::Value::Object(sorted)
         }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonical_json).collect())
+        }
+        other => other.clone(),
     }
-    let output=Command::new("/usr/bin/timeout").args(["10s","/usr/bin/docker","compose","--project-name",PROJECT,"--env-file",ENV_FILE,"-f",COMPOSE,"config","--format","json"]).output().map_err(|_|"LTE_COMPOSE_MODEL_UNAVAILABLE")?;
-    if !output.status.success(){return Err("LTE_COMPOSE_MODEL_UNAVAILABLE".into());}
-    let parsed:serde_json::Value=serde_json::from_slice(&output.stdout).map_err(|_|"LTE_COMPOSE_MODEL_INVALID")?;
-    let bytes=serde_json::to_vec(&canonical(&parsed)).map_err(|_|"LTE_COMPOSE_MODEL_INVALID")?;
-    Ok(format!("{:x}",Sha256::digest(bytes)))
+}
+
+pub fn compose_model_sha256() -> Result<String, String> {
+    let output = Command::new("/usr/bin/timeout")
+        .args(compose_config_args())
+        .output()
+        .map_err(|_| "LTE_COMPOSE_MODEL_UNAVAILABLE")?;
+    if !output.status.success() {
+        return Err("LTE_COMPOSE_MODEL_UNAVAILABLE".into());
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|_| "LTE_COMPOSE_MODEL_INVALID")?;
+    let bytes =
+        serde_json::to_vec(&canonical_json(&parsed)).map_err(|_| "LTE_COMPOSE_MODEL_INVALID")?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn compose_config_args() -> [&'static str; 14] {
+    [
+        "10s",
+        "/usr/bin/docker",
+        "compose",
+        "--project-name",
+        PROJECT,
+        "--profile",
+        LTE_PROFILE,
+        "--env-file",
+        ENV_FILE,
+        "-f",
+        COMPOSE,
+        "config",
+        "--format",
+        "json",
+    ]
 }
 
 impl SrsranRuntime for DockerSrsranRuntime {
@@ -755,17 +801,48 @@ impl SrsranRuntime for DockerSrsranRuntime {
         Ok(PingMeasurement { sent, received })
     }
     fn cleanup_run_sidecars(&self, run_id: &str) -> Result<bool, String> {
-        if run_id.len() > 64 || !run_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        if run_id.len() > 64
+            || !run_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
             return Err("LTE_RUN_ID_INVALID".into());
         }
         let label = format!("label=polaris.lte.run_id={run_id}");
-        let listed = Self::ok(self.run(&["ps", "-aq", "--filter", &label], 5)?, "LTE_SIDECAR_DISCOVERY_FAILED")?;
-        for id in listed.stdout.lines().map(str::trim).filter(|id| !id.is_empty()) {
-            let actual = Self::ok(self.run(&["inspect", "--format", "{{index .Config.Labels \"polaris.lte.run_id\"}}", id], 5)?, "LTE_SIDECAR_DISCOVERY_FAILED")?;
-            if actual.stdout.trim() != run_id { return Err("LTE_SIDECAR_OWNERSHIP_CONFLICT".into()); }
-            Self::ok(self.run(&["rm", "-f", id], 20)?, "LTE_SIDECAR_CLEANUP_FAILED")?;
+        let listed = Self::ok(
+            self.run(&["ps", "-aq", "--filter", &label], 5)?,
+            "LTE_SIDECAR_DISCOVERY_FAILED",
+        )?;
+        for id in listed
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            let actual = Self::ok(
+                self.run(
+                    &[
+                        "inspect",
+                        "--format",
+                        "{{index .Config.Labels \"polaris.lte.run_id\"}}",
+                        id,
+                    ],
+                    5,
+                )?,
+                "LTE_SIDECAR_DISCOVERY_FAILED",
+            )?;
+            if actual.stdout.trim() != run_id {
+                return Err("LTE_SIDECAR_OWNERSHIP_CONFLICT".into());
+            }
+            Self::ok(
+                self.run(&["rm", "-f", id], 20)?,
+                "LTE_SIDECAR_CLEANUP_FAILED",
+            )?;
         }
-        let remaining = Self::ok(self.run(&["ps", "-aq", "--filter", &label], 5)?, "LTE_SIDECAR_DISCOVERY_FAILED")?;
+        let remaining = Self::ok(
+            self.run(&["ps", "-aq", "--filter", &label], 5)?,
+            "LTE_SIDECAR_DISCOVERY_FAILED",
+        )?;
         Ok(remaining.stdout.lines().all(|line| line.trim().is_empty()))
     }
 }
@@ -948,9 +1025,9 @@ mod tests {
     }
     #[test]
     fn sidecar_cleanup_is_explicit_in_runtime_fixture() {
-        let runtime=MockSrsranRuntime::default();
+        let runtime = MockSrsranRuntime::default();
         assert!(runtime.cleanup_run_sidecars("lte-run-test").unwrap());
-        *runtime.sidecars_absent.lock().unwrap()=false;
+        *runtime.sidecars_absent.lock().unwrap() = false;
         assert!(!runtime.cleanup_run_sidecars("lte-run-test").unwrap());
     }
     #[test]
@@ -958,6 +1035,29 @@ mod tests {
         assert_eq!(classify_exit(124), Err("SRSRAN_COMMAND_TIMEOUT".into()));
         assert_eq!(classify_exit(137), Err("SRSRAN_COMMAND_TIMEOUT".into()));
         assert_eq!(classify_exit(1), Ok(()));
+    }
+    #[test]
+    fn canonical_compose_model_includes_the_lte_profile() {
+        let args = compose_config_args();
+        assert!(args.windows(2).any(|pair| pair == ["--profile", "lte"]));
+        assert!(args
+            .windows(3)
+            .any(|window| { window == ["config", "--format", "json"] }));
+    }
+    #[test]
+    fn canonical_compose_json_is_invariant_to_object_key_order() {
+        let left: serde_json::Value = serde_json::from_str(
+            r#"{"services":{"srsue":{"image":"sha256:test","profiles":["lte"]}},"name":"oiran-lab"}"#,
+        )
+        .unwrap();
+        let right: serde_json::Value = serde_json::from_str(
+            r#"{"name":"oiran-lab","services":{"srsue":{"profiles":["lte"],"image":"sha256:test"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&canonical_json(&left)).unwrap(),
+            serde_json::to_vec(&canonical_json(&right)).unwrap()
+        );
     }
     #[test]
     fn failed_new_container_start_removes_exact_id_and_clears_ownership() {

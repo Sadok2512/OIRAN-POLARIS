@@ -13,6 +13,10 @@ const apiProxy = {
 export default defineConfig({
   // CI/audit runs can keep dependency metadata off a constrained system disk.
   cacheDir: process.env.POLARIS_SIM_VITE_CACHE_DIR,
+  // Release builds contain only the API-backed application. The historical
+  // standalone mockup remains a test/design fixture in the source tree but is
+  // never copied into `dist` or exposed beside the operational UI.
+  publicDir: false,
   plugins: [react()],
   // The Simulator Control app is served behind the preview reverse proxy
   // at `/simulator/` (apps/portal links to that path).

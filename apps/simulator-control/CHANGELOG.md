@@ -1,5 +1,12 @@
 # @telecom/simulator-control — Changelog
 
+## 0.18.2 — 2026-10-31 — release artifact without mock UI
+
+- Excludes the historical standalone `polaris-mockup.html` design fixture from
+  production builds so the deployable bundle contains only the API-backed UI.
+- Keeps the fixture in the source tree for visual-history tests without making
+  its synthetic UE and runtime states reachable in a release.
+
 ## 0.18.1 — 2026-10-31 — isolated real-lab staging
 
 - Makes the loopback API proxy target configurable through
