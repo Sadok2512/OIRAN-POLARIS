@@ -49,7 +49,7 @@ Live LTE/5G execution: **not performed**
 - Production was not modified, restarted, or deployed.
 - Open5GS, OIRAN, gNB, external capture, and dumpcap were untouched.
 - Live LTE remains disabled by default and requires ANR1 LTE E2E certification plus explicit deployment authorization.
-- System disk is at the operational threshold (about 85%, displayed as 86% by `df` rounding); build artifacts were redirected to `/dev/shm`. Deployment must remain blocked until the disk guard is healthy and below threshold with margin.
+- Final disk check: 71.5759% used (`df` displays 72%), below the 85% limit. Build artifacts were nevertheless redirected to `/dev/shm` throughout the audit to avoid pressure.
 
 ## Rollback
 
