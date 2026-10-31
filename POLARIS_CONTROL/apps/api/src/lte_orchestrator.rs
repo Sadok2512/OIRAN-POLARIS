@@ -84,7 +84,8 @@ pub struct CaptureRef {
     pub first_frame: u64,
     pub last_frame: u64,
     pub decoder_version: String,
-    pub schema_version: String,
+    #[serde(alias = "schema_version")]
+    pub event_schema_version: String,
     pub sanitization_state: String,
 }
 
@@ -105,6 +106,8 @@ pub struct RunRecord {
     pub profile_id: String,
     pub scenario_id: String,
     pub state: RunState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intended_state: Option<RunState>,
     pub outcome: Option<RunOutcome>,
     pub started_at: String,
     pub ended_at: Option<String>,
@@ -132,6 +135,7 @@ impl RunRecord {
             "deadline_at_epoch_ms": self.hard_deadline_epoch_ms,
             "evidence_url": format!("/api/v1/lte/runs/{}", self.run_id),
             "state": self.state,
+            "intended_state": self.intended_state,
             "final_state": self.outcome,
             "cancel_requested": self.cancel_requested,
             "cleanup_required": self.cleanup_required,
@@ -184,6 +188,7 @@ impl RunStore {
                 run.cancel_requested = true;
                 run.cleanup_required = true;
                 run.operation_id = Some(format!("recovery-cleanup-{}", run.run_id));
+                run.intended_state = Some(RunState::Stopping);
                 changed = true;
             }
         }
@@ -224,6 +229,7 @@ impl RunStore {
             profile_id: PROFILE_ID.into(),
             scenario_id: SCENARIO_ID.into(),
             state: RunState::Idle,
+            intended_state: None,
             outcome: None,
             started_at: timestamp(now_ms),
             ended_at: None,
@@ -267,12 +273,23 @@ impl RunStore {
         now_ms: u64,
     ) -> Result<(), String> {
         let run = self.run_mut(run_id)?;
-        run.state = state;
+        run.intended_state = Some(state);
         run.operation_id = Some(operation_id);
         run.cleanup_required = state == RunState::Stopping;
         let item = run.steps.get_mut(step).ok_or("LTE_RUN_STEP_INVALID")?;
         item.state = StepState::Running;
         item.started_at.get_or_insert_with(|| timestamp(now_ms));
+        self.persist()
+    }
+
+    pub fn advance(&mut self, run_id: &str, state: RunState) -> Result<(), String> {
+        let run = self.run_mut(run_id)?;
+        if run.intended_state.as_ref() != Some(&state) {
+            return Err("LTE_RUN_STATE_PROOF_MISSING".into());
+        }
+        run.state = state;
+        run.intended_state = None;
+        run.operation_id = None;
         self.persist()
     }
 
@@ -291,7 +308,6 @@ impl RunStore {
         let item = run.steps.get_mut(step).ok_or("LTE_RUN_STEP_INVALID")?;
         item.state = StepState::Completed;
         item.ended_at = Some(timestamp(now_ms));
-        run.operation_id = None;
         self.persist()
     }
 
@@ -311,6 +327,7 @@ impl RunStore {
         run.outcome = Some(RunOutcome::Failed);
         run.cleanup_required = true;
         run.operation_id = None;
+        run.intended_state = None;
         self.persist()
     }
 
@@ -330,6 +347,7 @@ impl RunStore {
         run.cleanup = cleanup;
         run.ended_at = Some(timestamp(now_ms));
         run.operation_id = None;
+        run.intended_state = None;
         if clean {
             run.state = RunState::Clean;
             run.outcome = Some(outcome);
@@ -392,6 +410,8 @@ pub fn validate_capture_refs(refs: &[CaptureRef]) -> Result<(), String> {
                 .all(|b| b.is_ascii_hexdigit())
             || reference.first_frame == 0
             || reference.first_frame > reference.last_frame
+            || reference.decoder_version.trim().is_empty()
+            || reference.event_schema_version.trim().is_empty()
         {
             return Err("LTE_EVIDENCE_CAPTURE_REF_INVALID".into());
         }
@@ -499,7 +519,7 @@ mod tests {
             first_frame: 1,
             last_frame: 2,
             decoder_version: "test".into(),
-            schema_version: "v1".into(),
+            event_schema_version: "v1".into(),
             sanitization_state: "SANITIZED_APPROVED".into(),
         }
     }
@@ -570,6 +590,26 @@ mod tests {
         assert_eq!(r.state, RunState::Stopping);
         assert_eq!(r.outcome, Some(RunOutcome::RecoveryBlocked));
         assert!(r.cancel_requested && r.cleanup_required);
+        let _ = fs::remove_file(p);
+    }
+    #[test]
+    fn intent_never_publishes_state_before_observation_and_advance() {
+        let p = path("proof-before-state");
+        let _ = fs::remove_file(&p);
+        let mut store = RunStore::load(p.clone()).unwrap();
+        store.create("lte-run-12345678".into(),"g".into(),1,999999,"key-12345678").unwrap();
+        store.intent("lte-run-12345678",RunState::S1Ready,"s1-op".into(),2,2).unwrap();
+        assert_eq!(store.get("lte-run-12345678").unwrap().state,RunState::Idle);
+        assert_eq!(store.get("lte-run-12345678").unwrap().intended_state,Some(RunState::S1Ready));
+        store.observe("lte-run-12345678",2,Observation{
+            sequence:2, observed_at:"test".into(), source_kind:"synthetic_sctp".into(),
+            source_sha256:"a".repeat(64), validity:"VALID".into(),
+            sanitization_state:"SYNTHETIC_NO_IDENTITY".into(), measurements:serde_json::json!({"connected":true})
+        },3).unwrap();
+        assert_eq!(store.get("lte-run-12345678").unwrap().state,RunState::Idle);
+        store.advance("lte-run-12345678",RunState::S1Ready).unwrap();
+        assert_eq!(store.get("lte-run-12345678").unwrap().state,RunState::S1Ready);
+        assert_eq!(store.get("lte-run-12345678").unwrap().intended_state,None);
         let _ = fs::remove_file(p);
     }
     #[test]

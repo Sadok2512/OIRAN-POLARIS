@@ -4401,9 +4401,6 @@ async fn create_lte_run(
         let _=store.observe(&run.run_id,0,lte_observation(0,"polaris_preflight",json!({"result":"PASS"})),now);
         store.intent(&run.run_id,lte_orchestrator::RunState::EnbStarting,format!("enb-start-{}",run.run_id),1,now)
     });
-    let _ = state.lte_grants_v2.lock().map(|mut store| {
-        let _ = store.set_run_state(&run.run_id, "ENB_STARTING");
-    });
     let runtime = state.srsran_runtime.clone();
     let enb_start = tokio::task::spawn_blocking(move || {
         runtime.start(srsran_controller::Target::Enb)
@@ -4418,9 +4415,14 @@ async fn create_lte_run(
             let _ = store.set_run_state(&run.run_id, "FAILED");
         });
         audit(&state, &identity.role, "LTE_RUN_START", &error, Some(&run.run_id));
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":error,"run_id":run.run_id,"cleanup_required":true})));
+        let _ = cleanup_lte_run(&state, &run.run_id, lte_orchestrator::RunOutcome::Failed).await;
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":error,"run_id":run.run_id,"cleanup_required":false})));
     }
-    let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run.run_id,1,lte_observation(1,"docker_inspect",json!({"component":"ENB-01","state":"running"})),epoch_millis()));
+    let _=state.lte_runs_v2.lock().map(|mut store|{
+        store.observe(&run.run_id,1,lte_observation(1,"docker_inspect",json!({"component":"ENB-01","state":"running"})),epoch_millis())?;
+        store.advance(&run.run_id,lte_orchestrator::RunState::EnbStarting)
+    });
+    let _=state.lte_grants_v2.lock().map(|mut store|store.set_run_state(&run.run_id,"ENB_STARTING"));
     audit(&state, &identity.role, "LTE_RUN_START", "ENB_STARTING", Some(&run.run_id));
     tokio::spawn(orchestrate_lte_run(
         state.clone(),
@@ -4431,33 +4433,70 @@ async fn create_lte_run(
     (StatusCode::ACCEPTED, Json(body))
 }
 
+async fn cleanup_lte_run(
+    state: &Arc<AppState>,
+    run_id: &str,
+    outcome: lte_orchestrator::RunOutcome,
+) -> bool {
+    if state.lte_runs_v2.lock().ok().and_then(|store| store.get(run_id).cloned())
+        .is_some_and(|run| run.state == lte_orchestrator::RunState::Clean)
+    {
+        return true;
+    }
+    let _ = state.lte_runs_v2.lock().map(|mut store| {
+        let _ = store.request_cancel(run_id);
+        store.intent(run_id, lte_orchestrator::RunState::Stopping, format!("cleanup-{run_id}"), 10, epoch_millis())
+    });
+    let _ = state.lte_grants_v2.lock().map(|mut store| store.set_run_state(run_id, "CANCEL_REQUESTED"));
+    let runtime = state.srsran_runtime.clone();
+    let run = run_id.to_string();
+    let cleanup_result = tokio::task::spawn_blocking(move || {
+        let sidecars_removed = runtime.cleanup_run_sidecars(&run).unwrap_or(false);
+        let before = runtime.status(false, false).ok();
+        let ue_stop = if before.as_ref().is_some_and(|status| status.ue.observed && status.ue.process_state == "running") {
+            runtime.stop(srsran_controller::Target::Ue).is_ok()
+        } else { true };
+        let middle = runtime.status(false, false).ok();
+        let enb_stop = if middle.as_ref().is_some_and(|status| status.enb.observed && status.enb.process_state == "running") {
+            runtime.stop(srsran_controller::Target::Enb).is_ok()
+        } else { true };
+        let after = runtime.status(false, false).ok();
+        let ue_absent = after.as_ref().is_some_and(|status| !status.ue.observed || status.ue.process_state != "running");
+        let enb_absent = after.as_ref().is_some_and(|status| !status.enb.observed || status.enb.process_state != "running");
+        let epc_healthy = after.as_ref().is_some_and(|status| status.epc.process_state == "running");
+        (ue_stop && ue_absent, enb_stop && enb_absent, sidecars_removed, epc_healthy)
+    }).await;
+    let (srsue_stopped, srsenb_stopped, sidecars_removed, epc_healthy) =
+        cleanup_result.unwrap_or((false, false, false, false));
+    let cleanup = lte_orchestrator::CleanupEvidence {
+        srsue_stopped,
+        srsenb_stopped,
+        sidecars_removed,
+        epc_healthy,
+        dumpcaps_preserved: external_dumpcap_count() == 12,
+    };
+    let clean = cleanup.srsue_stopped && cleanup.srsenb_stopped && cleanup.sidecars_removed
+        && cleanup.epc_healthy && cleanup.dumpcaps_preserved;
+    let _ = state.lte_runs_v2.lock().map(|mut store| {
+        if clean {
+            let _ = store.observe(run_id, 10, lte_observation(10, "cleanup_observation", json!({
+                "srsue_absent": true, "srsenb_absent": true, "run_sidecars_absent": true,
+                "epc_healthy": true, "dumpcaps_preserved": true
+            })), epoch_millis());
+        }
+        store.finalize(run_id, outcome, cleanup, epoch_millis())
+    });
+    let _ = state.lte_grants_v2.lock().map(|mut store| {
+        store.set_run_state(run_id, if clean { "CLEAN" } else { "RECOVERY_BLOCKED" })
+    });
+    clean
+}
+
 async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_epoch_ms: u64) {
     async fn set_state(state: &AppState, run_id: &str, value: &str) {
         let _ = state.lte_grants_v2.lock().map(|mut store| {
             let _ = store.set_run_state(run_id, value);
         });
-    }
-    async fn cleanup(state: &AppState, run_id: &str, outcome: lte_orchestrator::RunOutcome) {
-        set_state(state, run_id, "CANCEL_REQUESTED").await;
-        let _=state.lte_runs_v2.lock().map(|mut store|store.intent(run_id,lte_orchestrator::RunState::Stopping,format!("cleanup-{run_id}"),10,epoch_millis()));
-        let runtime = state.srsran_runtime.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let normalize = |result: Result<(), String>| match result {
-                Err(error) if error == "SRSRAN_SERVICE_NOT_FOUND" => Ok(()),
-                other => other,
-            };
-            let ue = normalize(runtime.stop(srsran_controller::Target::Ue));
-            let enb = normalize(runtime.stop(srsran_controller::Target::Enb));
-            (ue, enb)
-        }).await;
-        let clean = matches!(result, Ok((Ok(()), Ok(()))));
-        let epc_healthy=state.srsran_runtime.status(state.lte_e2e_certified,state.srsran_live_enabled).ok().is_some_and(|status|status.epc.process_state=="running");
-        let cleanup=lte_orchestrator::CleanupEvidence{srsue_stopped:clean,srsenb_stopped:clean,sidecars_removed:clean,epc_healthy,dumpcaps_preserved:external_dumpcap_count()==12};
-        let _=state.lte_runs_v2.lock().map(|mut store|{
-            if clean {let _=store.observe(run_id,10,lte_observation(10,"cleanup_observation",json!({"clean":true})),epoch_millis());}
-            store.finalize(run_id,outcome,cleanup,epoch_millis())
-        });
-        set_state(state, run_id, if clean { "CLEAN" } else { "CLEANUP_FAILED" }).await;
     }
     async fn wait_for<F>(state: &AppState, run_id: &str, deadline_ms: u64, predicate: F) -> bool
     where
@@ -4482,7 +4521,6 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
     }
 
     let s1_deadline = epoch_millis().saturating_add(40_000).min(deadline_at_epoch_ms);
-    set_state(&state, &run_id, "S1_READY").await;
     let _=state.lte_runs_v2.lock().map(|mut store|store.intent(&run_id,lte_orchestrator::RunState::S1Ready,format!("s1-{run_id}"),2,epoch_millis()));
     if !wait_for(&state, &run_id, s1_deadline, |status| {
         status.enb.process_state == "running"
@@ -4490,67 +4528,103 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             && status.s1_state == "CONNECTED"
     }).await {
         if lte_run_is_terminal_or_cancelled(&state, &run_id) {
-            return;
+            let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Cancelled).await; return;
         }
         let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,2,"LTE_S1_SETUP_TIMEOUT",epoch_millis()));
-        cleanup(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
+        let _=cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
         return;
     }
-    let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run_id,2,lte_observation(2,"sctp_association",json!({"s1_setup":"success"})),epoch_millis()));
+    let _=state.lte_runs_v2.lock().map(|mut store|{
+        store.observe(&run_id,2,lte_observation(2,"sctp_association",json!({"s1_setup":"success"})),epoch_millis())?;
+        store.advance(&run_id,lte_orchestrator::RunState::S1Ready)
+    });
+    set_state(&state, &run_id, "S1_READY").await;
 
-    set_state(&state, &run_id, "UE_STARTING").await;
     let _=state.lte_runs_v2.lock().map(|mut store|store.intent(&run_id,lte_orchestrator::RunState::UeStarting,format!("ue-start-{run_id}"),3,epoch_millis()));
     let runtime = state.srsran_runtime.clone();
     let ue_start = tokio::task::spawn_blocking(move || runtime.start(srsran_controller::Target::Ue)).await;
     if !matches!(ue_start, Ok(Ok(()))) {
         let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,3,"LTE_UE_START_FAILED",epoch_millis()));
-        cleanup(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
+        let _=cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
         return;
     }
-    let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run_id,3,lte_observation(3,"docker_inspect",json!({"component":"LTE-SRSUE-TEST-01","running":true})),epoch_millis()));
+    let _=state.lte_runs_v2.lock().map(|mut store|{
+        store.observe(&run_id,3,lte_observation(3,"docker_inspect",json!({"component":"LTE-SRSUE-TEST-01","running":true})),epoch_millis())?;
+        store.advance(&run_id,lte_orchestrator::RunState::UeStarting)
+    });
+    set_state(&state, &run_id, "UE_STARTING").await;
 
-    set_state(&state, &run_id, "ATTACHED").await;
     let _=state.lte_runs_v2.lock().map(|mut store|store.intent(&run_id,lte_orchestrator::RunState::Attached,format!("attach-{run_id}"),4,epoch_millis()));
     let attach_deadline = epoch_millis().saturating_add(45_000).min(deadline_at_epoch_ms);
     if !wait_for(&state, &run_id, attach_deadline, |status| {
         status.attach_state == "ATTACHED"
+            && status.attach_success_observed
+            && status.epc_context_observed
             && status.session_state == "ACTIVE"
     }).await {
         if lte_run_is_terminal_or_cancelled(&state, &run_id) {
-            return;
+            let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Cancelled).await; return;
         }
         let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,4,"LTE_ATTACH_TIMEOUT",epoch_millis()));
-        cleanup(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
+        let _=cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
         return;
     }
-    let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run_id,4,lte_observation(4,"epc_context",json!({"attach":"success","identity_withheld":true})),epoch_millis()));
+    let _=state.lte_runs_v2.lock().map(|mut store|{
+        store.observe(&run_id,4,lte_observation(4,"epc_context",json!({"attach":"success","epc_context":true,"identity_withheld":true})),epoch_millis())?;
+        store.advance(&run_id,lte_orchestrator::RunState::Attached)
+    });
+    set_state(&state, &run_id, "ATTACHED").await;
 
     let _=state.lte_runs_v2.lock().map(|mut store|store.intent(&run_id,lte_orchestrator::RunState::IpReady,format!("ip-{run_id}"),5,epoch_millis()));
     let ip_deadline=epoch_millis().saturating_add(20_000).min(deadline_at_epoch_ms);
     if !wait_for(&state,&run_id,ip_deadline,|status|status.ue_ip.is_some()).await {
+        if lte_run_is_terminal_or_cancelled(&state, &run_id) {
+            let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Cancelled).await; return;
+        }
         let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,5,"LTE_IP_TIMEOUT",epoch_millis()));
-        cleanup(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await;return;
+        let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await;return;
     }
-    let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run_id,5,lte_observation(5,"ue_interface",json!({"ipv4":"observed","route":"proved","identity_withheld":true})),epoch_millis()));
-    if lte_start_resource_gate(&state).is_err() {cleanup(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await;return;}
-    set_state(&state,&run_id,"TRAFFIC_RUNNING").await;
+    let _=state.lte_runs_v2.lock().map(|mut store|{
+        store.observe(&run_id,5,lte_observation(5,"ue_interface",json!({"ipv4":"observed","route":"proved","identity_withheld":true})),epoch_millis())?;
+        store.advance(&run_id,lte_orchestrator::RunState::IpReady)
+    });
     for (step,direction) in [(6_usize,"ul"),(7_usize,"dl")] {
+        if lte_run_is_terminal_or_cancelled(&state,&run_id) || epoch_millis() >= deadline_at_epoch_ms {
+            let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Cancelled).await; return;
+        }
+        if let Err(reason)=lte_start_resource_gate(&state) {
+            let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,step,&reason,epoch_millis()));
+            let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await; return;
+        }
         let _=state.lte_runs_v2.lock().map(|mut store|store.intent(&run_id,lte_orchestrator::RunState::TrafficRunning,format!("ping-{direction}-{run_id}"),step,epoch_millis()));
+        if lte_run_is_terminal_or_cancelled(&state,&run_id) || epoch_millis() >= deadline_at_epoch_ms {
+            let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Cancelled).await; return;
+        }
         let runtime=state.srsran_runtime.clone();let dir=direction.to_string();
         match tokio::task::spawn_blocking(move||runtime.ping(&dir,5)).await {
-            Ok(Ok(value))=>{let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run_id,step,lte_observation(step as u64,"bounded_ping",json!({"direction":direction,"sent":value.sent,"received":value.received})),epoch_millis()));},
-            _=>{let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,step,"LTE_TRAFFIC_FAILED",epoch_millis()));cleanup(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await;return;}
+            Ok(Ok(value))=>{let _=state.lte_runs_v2.lock().map(|mut store|{store.observe(&run_id,step,lte_observation(step as u64,"bounded_ping",json!({"direction":direction,"sent":value.sent,"received":value.received})),epoch_millis())?;store.advance(&run_id,lte_orchestrator::RunState::TrafficRunning)});set_state(&state,&run_id,"TRAFFIC_RUNNING").await;},
+            _=>{let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,step,"LTE_TRAFFIC_FAILED",epoch_millis()));let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await;return;}
         }
     }
     for (step,direction) in [(8_usize,"ul"),(9_usize,"dl")] {
+        if lte_run_is_terminal_or_cancelled(&state,&run_id) || epoch_millis() >= deadline_at_epoch_ms {
+            let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Cancelled).await; return;
+        }
+        if let Err(reason)=lte_start_resource_gate(&state) {
+            let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,step,&reason,epoch_millis()));
+            let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await; return;
+        }
         let _=state.lte_runs_v2.lock().map(|mut store|store.intent(&run_id,lte_orchestrator::RunState::TrafficRunning,format!("udp-{direction}-{run_id}"),step,epoch_millis()));
+        if lte_run_is_terminal_or_cancelled(&state,&run_id) || epoch_millis() >= deadline_at_epoch_ms {
+            let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Cancelled).await; return;
+        }
         let runtime=state.srsran_runtime.clone();let dir=direction.to_string();
         match tokio::task::spawn_blocking(move||runtime.measure_traffic(&dir,"udp",1)).await {
-            Ok(Ok(value))=>{let _=state.lte_runs_v2.lock().map(|mut store|store.observe(&run_id,step,lte_observation(step as u64,"bounded_udp",json!({"direction":direction,"rate_limit_bps":1_000_000,"duration_limit_seconds":10,"payload_max_bytes":1200,"bytes_ul":value.bytes_ul,"bytes_dl":value.bytes_dl})),epoch_millis()));},
-            _=>{let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,step,"LTE_TRAFFIC_FAILED",epoch_millis()));cleanup(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await;return;}
+            Ok(Ok(value))=>{let _=state.lte_runs_v2.lock().map(|mut store|{store.observe(&run_id,step,lte_observation(step as u64,"bounded_udp",json!({"direction":direction,"rate_limit_bps":1_000_000,"duration_limit_seconds":10,"payload_max_bytes":1200,"bytes_ul":value.bytes_ul,"bytes_dl":value.bytes_dl})),epoch_millis())?;store.advance(&run_id,lte_orchestrator::RunState::TrafficRunning)});},
+            _=>{let _=state.lte_runs_v2.lock().map(|mut store|store.fail_step(&run_id,step,"LTE_TRAFFIC_FAILED",epoch_millis()));let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Failed).await;return;}
         }
     }
-    cleanup(&state,&run_id,lte_orchestrator::RunOutcome::Completed).await;
+    let _=cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Completed).await;
 }
 
 async fn get_lte_run(State(state): State<Arc<AppState>>, AxumPath(run_id): AxumPath<String>) -> impl IntoResponse {
@@ -4578,35 +4652,15 @@ async fn stop_lte_run(
     AxumPath(run_id): AxumPath<String>,
 ) -> impl IntoResponse {
     if let Err(error) = require_operator(&identity) { return error; }
-    let _=state.lte_runs_v2.lock().map(|mut store|store.request_cancel(&run_id));
-    let existing_state = state.lte_grants_v2.lock().ok().and_then(|store| store.records().iter()
-        .find(|grant| grant.run_id.as_deref() == Some(run_id.as_str()))
-        .and_then(|grant| grant.run_state.clone()));
-    if existing_state.is_none() { return (StatusCode::NOT_FOUND, Json(json!({"error":"LTE_RUN_NOT_FOUND"}))); }
-    if existing_state.as_deref() == Some("STOPPED") {
-        return (StatusCode::OK, Json(json!({"run_id":run_id,"state":"STOPPED","idempotent":true})));
-    }
-    let _ = state.lte_grants_v2.lock().map(|mut store| {
-        let _ = store.set_run_state(&run_id, "CANCEL_REQUESTED");
-    });
-    let ue = state.srsran_runtime.stop(srsran_controller::Target::Ue);
-    let enb = state.srsran_runtime.stop(srsran_controller::Target::Enb);
-    match (ue, enb) {
-        (Ok(()), Ok(())) => {
-            let _ = state.lte_grants_v2.lock().map(|mut store| {
-                let _ = store.set_run_state(&run_id, "STOPPED");
-            });
-            audit(&state, &identity.role, "LTE_RUN_STOP", "STOPPED", Some(&run_id));
-            (StatusCode::OK, Json(json!({"run_id":run_id,"state":"STOPPED","idempotent":false})))
-        }
-        (ue, enb) => {
-            let _ = state.lte_grants_v2.lock().map(|mut store| {
-                let _ = store.set_run_state(&run_id, "CLEANUP_FAILED");
-            });
-            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-                "error":"LTE_CLEANUP_FAILED", "ue_cleanup":ue.err(), "enb_cleanup":enb.err(), "run_id":run_id
-            })))
-        },
+    let existing = state.lte_runs_v2.lock().ok().and_then(|store| store.get(&run_id).cloned());
+    let Some(existing) = existing else { return (StatusCode::NOT_FOUND, Json(json!({"error":"LTE_RUN_NOT_FOUND"}))); };
+    let idempotent = existing.state == lte_orchestrator::RunState::Clean;
+    let clean = cleanup_lte_run(&state,&run_id,lte_orchestrator::RunOutcome::Cancelled).await;
+    audit(&state,&identity.role,"LTE_RUN_STOP",if clean{"CLEAN"}else{"RECOVERY_BLOCKED"},Some(&run_id));
+    if clean {
+        (StatusCode::OK,Json(json!({"run_id":run_id,"state":"CLEAN","idempotent":idempotent})))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE,Json(json!({"error":"LTE_RECOVERY_BLOCKED","run_id":run_id,"state":"RECOVERY_BLOCKED"})))
     }
 }
 
@@ -11615,24 +11669,7 @@ async fn revoke_live_grant(
     let v2 = state.lte_grants_v2.lock().ok().and_then(|mut store| store.revoke(&id).ok());
     if let Some(grant) = v2 {
         if let Some(run_id) = grant.run_id.as_deref() {
-            let _=state.lte_runs_v2.lock().map(|mut store|store.request_cancel(run_id));
-            let _ = state.lte_grants_v2.lock().map(|mut store| {
-                let _ = store.set_run_state(run_id, "CANCEL_REQUESTED");
-            });
-            let runtime = state.srsran_runtime.clone();
-            let cleanup = tokio::task::spawn_blocking(move || {
-                let ue = runtime.stop(srsran_controller::Target::Ue);
-                let enb = runtime.stop(srsran_controller::Target::Enb);
-                (ue, enb)
-            }).await;
-            let terminal = if matches!(cleanup, Ok((Ok(()), Ok(())))) {
-                "STOPPED"
-            } else {
-                "CLEANUP_FAILED"
-            };
-            let _ = state.lte_grants_v2.lock().map(|mut store| {
-                let _ = store.set_run_state(run_id, terminal);
-            });
+            let _ = cleanup_lte_run(&state,run_id,lte_orchestrator::RunOutcome::Cancelled).await;
         }
         audit(&state, &identity.role, "LTE_LIVE_GRANT_REVOKE", "REVOKED", Some(&id));
         return (StatusCode::OK, Json(grant.public_json()));

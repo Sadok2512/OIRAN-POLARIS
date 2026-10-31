@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.23.1 (polaris-control-api) — 2026-10-31 — proof-before-state and unified LTE cleanup
+
+- Separates durable operation intent from public LTE run state; S1, Attach,
+  EPC context, UE IP and traffic states advance only after current evidence.
+- Requires independent sanitized EPS Attach and EPC-context observations;
+  S1 connectivity plus a UE address can no longer imply `ATTACHED`.
+- Routes cancellation, expiry, revocation, Stop and start failures through one
+  idempotent cleanup path that explicitly removes/observes run-owned sidecars
+  and finalizes the journal as `CLEAN` or `RECOVERY_BLOCKED`.
+- Rechecks the hard deadline, cancellation and resource gate immediately
+  before every ping/UDP side effect and persists the precise gate failure.
+- Aligns capture references with the amended canonical evidence contract by
+  requiring `decoder_version` and `event_schema_version`.
+
 ## 0.23.0 (polaris-control-api) — 2026-10-31 — LTE orchestration V2
 
 - Adds the checksummed, atomic, mode-0600 LTE run journal, exclusive profile

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.2.1";
 pub const LTE_UE_ID: &str = "LTE-SRSUE-TEST-01";
 pub const ENB_ID: &str = "ENB-01";
 const PROJECT: &str = "oiran-lab";
@@ -127,6 +127,8 @@ pub struct LteStatus {
     pub ue: ProcessObservation,
     pub ue_id: &'static str,
     pub attach_state: String,
+    pub attach_success_observed: bool,
+    pub epc_context_observed: bool,
     pub apn: String,
     pub ue_ip: Option<String>,
     pub session_state: String,
@@ -162,6 +164,12 @@ pub trait SrsranRuntime: Send + Sync {
         rate_mbps: u32,
     ) -> Result<TrafficMeasurement, String>;
     fn ping(&self, direction: &str, packets: u32) -> Result<PingMeasurement, String>;
+    /// Remove only sidecars carrying the exact run label, then prove none remain.
+    fn cleanup_run_sidecars(&self, run_id: &str) -> Result<bool, String>;
+}
+
+fn attach_is_proven(s1_state: &str, attach_success: bool, epc_context: bool) -> bool {
+    s1_state == "CONNECTED" && attach_success && epc_context
 }
 
 #[derive(Clone)]
@@ -411,6 +419,31 @@ impl DockerSrsranRuntime {
                     })
             })
     }
+    fn sanitized_logs(&self, container: &Container) -> Vec<String> {
+        self.run(&["logs", "--tail", "400", &container.id], 5)
+            .ok()
+            .filter(|output| output.code == 0)
+            .map(|output| format!("{}{}", output.stdout, output.stderr)
+                .lines().filter_map(sanitize_log_line).collect())
+            .unwrap_or_default()
+    }
+    fn attach_proof(&self, ue: Option<&Container>) -> bool {
+        let Some(ue) = ue.filter(|container| container.state == "running") else { return false; };
+        self.sanitized_logs(ue).iter().any(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("network attach successful") || lower.contains("attach complete")
+        })
+    }
+    fn epc_context_proof(&self) -> bool {
+        let Ok(Some(mme)) = self.resolve("mme") else { return false; };
+        if mme.state != "running" { return false; }
+        self.sanitized_logs(&mme).iter().any(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("initial context setup response")
+                || lower.contains("create session response")
+                || lower.contains("emm-context") && lower.contains("registered")
+        })
+    }
     fn apn() -> String {
         fs::read_to_string(UE_CONFIG)
             .ok()
@@ -541,7 +574,9 @@ impl SrsranRuntime for DockerSrsranRuntime {
         let (ue, uc) = self.observe(Target::Ue)?;
         let s1 = self.s1(ec.as_ref());
         let ip = self.ue_ip(uc.as_ref());
-        let attached = s1 == "CONNECTED" && ip.is_some();
+        let attach_success_observed = self.attach_proof(uc.as_ref());
+        let epc_context_observed = self.epc_context_proof();
+        let attached = attach_is_proven(&s1, attach_success_observed, epc_context_observed);
         let ownership = enb.controller_owned && ue.controller_owned;
         let traffic_peer_configured = std::env::var("POLARIS_LTE_TRAFFIC_PEER_IP")
             .ok()
@@ -558,6 +593,8 @@ impl SrsranRuntime for DockerSrsranRuntime {
             ue,
             ue_id: LTE_UE_ID,
             attach_state: if attached { "ATTACHED" } else { "UNKNOWN" }.into(),
+            attach_success_observed,
+            epc_context_observed,
             apn: Self::apn(),
             ue_ip: ip,
             session_state: if attached { "ACTIVE" } else { "UNKNOWN" }.into(),
@@ -717,6 +754,20 @@ impl SrsranRuntime for DockerSrsranRuntime {
             .ok_or("LTE_PING_RESULT_INVALID")?;
         Ok(PingMeasurement { sent, received })
     }
+    fn cleanup_run_sidecars(&self, run_id: &str) -> Result<bool, String> {
+        if run_id.len() > 64 || !run_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err("LTE_RUN_ID_INVALID".into());
+        }
+        let label = format!("label=polaris.lte.run_id={run_id}");
+        let listed = Self::ok(self.run(&["ps", "-aq", "--filter", &label], 5)?, "LTE_SIDECAR_DISCOVERY_FAILED")?;
+        for id in listed.stdout.lines().map(str::trim).filter(|id| !id.is_empty()) {
+            let actual = Self::ok(self.run(&["inspect", "--format", "{{index .Config.Labels \"polaris.lte.run_id\"}}", id], 5)?, "LTE_SIDECAR_DISCOVERY_FAILED")?;
+            if actual.stdout.trim() != run_id { return Err("LTE_SIDECAR_OWNERSHIP_CONFLICT".into()); }
+            Self::ok(self.run(&["rm", "-f", id], 20)?, "LTE_SIDECAR_CLEANUP_FAILED")?;
+        }
+        let remaining = Self::ok(self.run(&["ps", "-aq", "--filter", &label], 5)?, "LTE_SIDECAR_DISCOVERY_FAILED")?;
+        Ok(remaining.stdout.lines().all(|line| line.trim().is_empty()))
+    }
 }
 
 fn sanitize_log_line(line: &str) -> Option<String> {
@@ -738,6 +789,7 @@ pub struct MockSrsranRuntime {
     pub ownership_verified: Arc<Mutex<bool>>,
     pub status_override: Arc<Mutex<Option<LteStatus>>>,
     pub start_error: Arc<Mutex<Option<String>>>,
+    pub sidecars_absent: Arc<Mutex<bool>>,
 }
 impl Default for MockSrsranRuntime {
     fn default() -> Self {
@@ -747,6 +799,7 @@ impl Default for MockSrsranRuntime {
             ownership_verified: Arc::new(Mutex::new(true)),
             status_override: Arc::new(Mutex::new(None)),
             start_error: Arc::new(Mutex::new(None)),
+            sidecars_absent: Arc::new(Mutex::new(true)),
         }
     }
 }
@@ -768,6 +821,8 @@ impl SrsranRuntime for MockSrsranRuntime {
             ue: ProcessObservation::unknown(),
             ue_id: LTE_UE_ID,
             attach_state: "UNKNOWN".into(),
+            attach_success_observed: false,
+            epc_context_observed: false,
             apn: "UNKNOWN".into(),
             ue_ip: None,
             session_state: "UNKNOWN".into(),
@@ -825,6 +880,9 @@ impl SrsranRuntime for MockSrsranRuntime {
             received: packets,
         })
     }
+    fn cleanup_run_sidecars(&self, _: &str) -> Result<bool, String> {
+        Ok(*self.sidecars_absent.lock().unwrap())
+    }
 }
 
 #[cfg(test)]
@@ -880,6 +938,20 @@ mod tests {
         *r.start_error.lock().unwrap() = Some("SRSRAN_ACTION_FAILED".into());
         assert!(r.start(Target::Enb).is_err());
         assert!(r.started.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn s1_and_ip_cannot_substitute_for_attach_and_epc_context_proof() {
+        assert!(!attach_is_proven("CONNECTED", false, false));
+        assert!(!attach_is_proven("CONNECTED", true, false));
+        assert!(!attach_is_proven("CONNECTED", false, true));
+        assert!(attach_is_proven("CONNECTED", true, true));
+    }
+    #[test]
+    fn sidecar_cleanup_is_explicit_in_runtime_fixture() {
+        let runtime=MockSrsranRuntime::default();
+        assert!(runtime.cleanup_run_sidecars("lte-run-test").unwrap());
+        *runtime.sidecars_absent.lock().unwrap()=false;
+        assert!(!runtime.cleanup_run_sidecars("lte-run-test").unwrap());
     }
     #[test]
     fn host_timeout_is_fail_closed() {
