@@ -16,8 +16,8 @@ const COMPOSE: &str = "/root/POLARIS/compose/docker-compose.oiran-lab.yml";
 const ENV_FILE: &str = "/root/POLARIS/compose/versions.env";
 const UE_CONFIG: &str = "/root/POLARIS/runtime/srsran/ue.conf";
 const LEDGER: &str = "/var/lib/polaris-control/srsran-ownership.json";
-const EXPECTED_IMAGE_DIGEST: &str =
-    "sha256:69e094349657cc6a062ce3717661d6b8a553a23ce571f821e33256beec753d43";
+const EXPECTED_IMAGE_REFERENCE: &str =
+    "oiran/srsran4g@sha256:69e094349657cc6a062ce3717661d6b8a553a23ce571f821e33256beec753d43";
 const PROFILE_CONFIGS: [&str; 5] = [
     "/root/POLARIS/runtime/srsran/ue.conf",
     "/root/POLARIS/config/srsran/enb.conf",
@@ -220,14 +220,14 @@ impl DockerSrsranRuntime {
         if ids.len() != 1 {
             return Err("SRSRAN_AMBIGUOUS_SERVICE_INSTANCE".into());
         }
-        let fmt = "{{.Id}}|{{index .Config.Labels \"com.docker.compose.project\"}}|{{index .Config.Labels \"com.docker.compose.service\"}}|{{index .Config.Labels \"com.docker.compose.project.config_files\"}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}not_available{{end}}|{{.State.Error}}|{{.Image}}";
+        let fmt = "{{.Id}}|{{index .Config.Labels \"com.docker.compose.project\"}}|{{index .Config.Labels \"com.docker.compose.service\"}}|{{index .Config.Labels \"com.docker.compose.project.config_files\"}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}not_available{{end}}|{{.State.Error}}|{{.Config.Image}}";
         let data = Self::ok(
             self.run(&["inspect", "--format", fmt, ids[0]], 5)?,
             "SRSRAN_DISCOVERY_FAILED",
         )?;
         let f = data.stdout.trim().splitn(8, '|').collect::<Vec<_>>();
         let digest_matches = !matches!(service, "srsenb" | "srsue")
-            || f.get(7).is_some_and(|digest| *digest == EXPECTED_IMAGE_DIGEST);
+            || f.get(7).is_some_and(|reference| *reference == EXPECTED_IMAGE_REFERENCE);
         if f.len() != 8
             || f[1] != PROJECT
             || f[2] != service
@@ -811,7 +811,7 @@ mod tests {
             output(
                 0,
                 &format!(
-                    "{id}|{PROJECT}|srsenb|{COMPOSE}|created|not_available||{EXPECTED_IMAGE_DIGEST}\n"
+                    "{id}|{PROJECT}|srsenb|{COMPOSE}|created|not_available||{EXPECTED_IMAGE_REFERENCE}\n"
                 ),
             ),
             output(1, ""),
