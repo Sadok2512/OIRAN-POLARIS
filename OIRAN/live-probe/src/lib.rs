@@ -2520,6 +2520,15 @@ impl CaptureManager {
             .map(|context| context.ue_ip.clone())
             .collect::<Vec<_>>();
         let discovery = discover_sessions(&mut events);
+        // Correlate over the complete retained evidence set before selecting
+        // an individual session. Restricting correlation to the initial N2
+        // session IDs made the exact N2→N4 edge impossible to discover and,
+        // consequently, prevented the exact N4→N3 TEID edge from entering the
+        // call flow even though all three observations were present.
+        let mut global_edges = correlate_discovered_tunnels(&events, &discovery);
+        global_edges.extend(correlate_cross_interface_evidence(&events));
+        global_edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+        global_edges.dedup_by(|left, right| left.edge_id == right.edge_id);
         let mut session_ids = Vec::new();
         for session in &discovery.pdu_sessions {
             let context = discovery
@@ -2530,15 +2539,19 @@ impl CaptureManager {
             if let Some(context) = context {
                 ids.extend(context.event_ids.iter().cloned());
             }
+            expand_session_evidence_ids(&mut ids, &global_edges);
             let selected = events
                 .iter()
                 .filter(|event| ids.contains(&event.event_id))
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut edges = correlate_discovered_tunnels(&selected, &discovery);
-            edges.extend(correlate_cross_interface_evidence(&selected));
-            edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
-            edges.dedup_by(|left, right| left.edge_id == right.edge_id);
+            let edges = global_edges
+                .iter()
+                .filter(|edge| {
+                    ids.contains(&edge.source_event_id) && ids.contains(&edge.target_event_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
             let mut reconstruction = reconstruct(
                 selected,
                 ReconstructionHints {
@@ -3789,6 +3802,23 @@ struct EventSpoolLocation {
     length: u64,
 }
 
+fn expand_session_evidence_ids(ids: &mut BTreeSet<String>, edges: &[CorrelationEdge]) {
+    loop {
+        let mut changed = false;
+        for edge in edges {
+            if ids.contains(&edge.source_event_id) {
+                changed |= ids.insert(edge.target_event_id.clone());
+            }
+            if ids.contains(&edge.target_event_id) {
+                changed |= ids.insert(edge.source_event_id.clone());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 fn index_event_stream<R: BufRead, W: Write>(
     mut reader: R,
     writer: &mut W,
@@ -4307,6 +4337,41 @@ fn display_error(error: std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_evidence_expands_transitively_from_n2_through_n4_to_n3() {
+        let edge = |id: &str, source: &str, target: &str| CorrelationEdge {
+            edge_id: id.into(),
+            source_event_id: source.into(),
+            target_event_id: target.into(),
+            source_interface: String::new(),
+            target_interface: String::new(),
+            matching_identifiers: Vec::new(),
+            rule_id: String::new(),
+            rule_version: String::new(),
+            evidence_description: String::new(),
+            packet_references: Vec::new(),
+            confidence: "EXACT".into(),
+            evidence_type: "EXACT_TUNNEL_MATCH".into(),
+            scope: "tunnel-only".into(),
+            limitations: Vec::new(),
+        };
+        let edges = vec![
+            edge("n2-n4", "n2-event", "n4-event"),
+            edge("n4-n3", "n4-event", "n3-event"),
+            edge("other", "other-a", "other-b"),
+        ];
+        let mut ids = BTreeSet::from(["n2-event".to_string()]);
+        expand_session_evidence_ids(&mut ids, &edges);
+        assert_eq!(
+            ids,
+            BTreeSet::from([
+                "n2-event".to_string(),
+                "n4-event".to_string(),
+                "n3-event".to_string(),
+            ])
+        );
+    }
 
     fn temporary_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("oiran-live-probe-{name}-{}", epoch_ms()));
