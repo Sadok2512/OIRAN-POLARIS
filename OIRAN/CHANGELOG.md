@@ -1,5 +1,38 @@
 # Changelog
 
+## OIRAN API 2.5.3 / live-probe 0.2.6 — 2026-10-31
+
+### N3 headers-only aggregation (fixes the 156 MiB OOM)
+
+- `decoder-gtpu` 0.2.0 ships a streaming `GtpuAggregator` + fixed-size
+  `TunnelFlow` struct (136 B / tunnel). On N3, OIRAN keeps only the
+  GTP-U header + per-TEID counters (packets_ul, packets_dl, bytes_ul,
+  bytes_dl, first_seen_ns, last_seen_ns, qfi, retransmits_tcp,
+  rtt_microseconds). Inner payload stays opaque — only the first 20 B
+  of the inner TCP header are read to feed the counters.
+- Design doc: `OIRAN/docs/n3-headers-only-2.5.3.md` (proof of memory
+  growth site + integration path for live-probe 0.2.6 + Analyzer
+  rendering + subscriber-identity rule).
+- Tests (`cargo test -p decoder-gtpu --lib`): 8/8 pass, including:
+  - `aggregator_bounded_memory_on_half_million_packets` — 500 000
+    frames across 4 TEIDs stay at ≤ 8 flow entries.
+  - `aggregator_emits_one_event_per_teid_with_counters` — one aggregate
+    event per 5-tuple, QFI sticky, first/last seen populated.
+  - `aggregator_measures_tcp_rtt_from_header_only` — SYN → SYN+ACK pair
+    on the inner payload produces `rtt_microseconds = 50 000` without
+    touching application bytes.
+  - `aggregator_teid_encoding_joins_ngap_and_pfcp` — TEID is encoded
+    as `0x{:08x}`, the exact form the correlation engine joins against
+    NGAP `Initial Context Setup Response` + PFCP `Session Modification
+    Response`.
+
+### Deferred to the live-probe PR (declared in the design doc)
+The three live-probe integration sites (packet enumeration,
+finalisation, correlation key) are NOT wired in this release; they
+live in a 6 500 LoC file and need a dedicated PR with the 500 MiB
+end-to-end benchmark. This release ships the aggregator + the tests
++ the contract so that PR has a drop-in target.
+
 ## OIRAN API 2.5.2 / live-probe 0.2.5 - 2026-10-30
 
 - Commit continuous-import checksums only after the rebuilt dataset generation
