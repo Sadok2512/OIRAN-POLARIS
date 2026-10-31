@@ -1,5 +1,522 @@
 # Changelog
 
+## LTE offline certification 1.0.0-offline.1 — 2026-10-31
+
+- Validate mandatory S1-MME/S11/S1-U fixture fields separately from ANR1
+  readiness, with a machine-readable schema and fail-closed real-fixture gate.
+- Partition LTE sessions by explicit S1AP context, exact pseudonym and S11
+  F-TEID; add multi-UE, timestamps, UL/DL counters and ambiguity regressions.
+- Add canonical LTE Call Flow generation and offline correlation rule version
+  `1.0.0-offline.1` without enabling capture or production ingestion.
+- Extend the synthetic decoder fixture with E-RAB procedure coverage and keep
+  the approved-PCAP requirement explicit.
+
+## LTE pipeline preparation 0.1.0 — 2026-10-31
+
+- Add explicit, non-aliased offline decoder routes for S1-MME/S1AP PPID 18,
+  S11/GTPv2-C UDP 2123 and S1-U/GTP-U UDP 2152 while retaining N2/N3/N4/SBI.
+- Add LTE session preparation with EPS bearer metadata and per-TEID UL/DL
+  packet/octet counters, without timestamp-only subscriber association.
+- Add ambiguity-safe S11-to-S1-U and prepared S1AP-to-S11 correlation rules.
+- Add Analyzer LTE filters marked synthetic-only and an ANR1-gated real-fixture
+  manifest template. No capture or production enablement is included.
+
+## OIRAN API 2.5.3 / live-probe 0.2.6 - 2026-10-31
+
+- Aggregate continuous N3 user-plane observations by TEID, direction, inner flow and QFI while decoding; packet and byte counters plus first/last provenance remain exact without retaining one event per G-PDU.
+- Bound N3 aggregate cardinality and fail an individual segment closed if the limit is exceeded; N2, N4 and SBI signalling remain individual normalized events.
+- Preserve the real packet count in continuous-import activity metrics while storing only first/last N3 packet references.
+- Normalize directional NGAP `tunnel_ip_{ul,dl}` / `gtp_teid_{ul,dl}` fields when building exact N2-to-N4 tunnel evidence (correlation-engine 0.3.1).
+
+## OIRAN API 2.5.2 / live-probe 0.2.5 - 2026-10-30
+
+- Commit continuous-import checksums only after the rebuilt dataset generation
+  has been published atomically. A failed marker write leaves the segment
+  retryable instead of reporting it imported without published events.
+- Add a regression test covering the atomic marker-write failure and retry.
+
+## OIRAN API 2.5.1 / live-probe 0.2.4 - 2026-10-30
+
+- Added `OIRAN_CONTINUOUS_MAX_SEGMENT_BYTES`, defaulting to 1 GiB, with
+  validation against the existing bounded disk policy.
+- Reworked PCAP/PCAPNG decoding to visit packets incrementally; discovery,
+  SHA-256, copy, packet parsing and decoding no longer materialise an entire
+  capture file.
+- Stream decoded events through an on-disk spool, finalize idle TCP/SBI
+  connections during packet visitation, and retain only event-ID/offset pairs
+  during continuous deduplication. This closes the production OOM found when
+  a finalized SBI segment expanded to many normalized events under a 256 MiB
+  service limit.
+- Preserve all fully decoded SBI transactions while keeping response-only
+  PARTIAL streams lacking decoded request identity as connection-level HPACK
+  evidence rather than synthetic transactions, restoring the pre-regression
+  event-count contract without hiding the capture limitation.
+- Compact session-engine source metadata to the schema, procedure and SBI
+  fields actually consumed after normalization instead of retaining a second
+  copy of every decoded IE tree during call-flow reconstruction.
+- Oversized finalized segments are now persisted individually with source
+  path, observed byte size, timestamp and
+  `CONTINUOUS_SOURCE_SEGMENT_TOO_LARGE`; they no longer fail the continuous
+  import job or prevent eligible siblings from being ingested.
+- Added regression coverage for a streaming 300 MiB import below 32 MiB live
+  allocation and for mixed accepted/rejected segments.
+
+## OIRAN API 2.5.0 / live-probe 0.2.3 / oiran-decode 0.4.5 - 2026-10-30
+
+- Integrated the persistent API 2.4 probe registry and its truthful heartbeat,
+  interface-role, CSRF, and download-policy routes with the memory-bounded
+  live-probe 0.2.3 continuous importer and oiran-decode 0.4.5 decoder release.
+- Preserved the mode-`0600` registry seeded with `oiran-vprobe-local-01` and
+  retained fail-closed liveness when no measured heartbeat exists.
+- Kept continuous checkpoint recovery, stable session/call-flow evidence, and
+  external-capture ownership boundaries unchanged.
+
+## OIRAN API 2.4.0-dev / live-probe 0.2.0-dev - 2026-10-28
+
+- Added an atomic, mode-`0600` probe registry seeded with
+  `oiran-vprobe-local-01` and an Operator-plus-CSRF `POST /api/v1/probes`
+  contract.
+- Added registry-backed capture-interface roles while keeping unregistered
+  roles explicitly `null`.
+- Derived probe liveness only from measured capture ingestion or packet
+  timestamps; probes without a real heartbeat remain `PENDING`.
+- Made missing live capture interface and size evidence explicitly `null` and
+  made raw PCAP download fail closed with `403 DOWNLOAD_POLICY_PENDING`.
+
+## live-probe v0.2.3 — pcap import streaming (copy_verified + write_jsonl_atomic)
+
+- `copy_verified` previously verified the freshly-copied temporary pcap by
+  calling `fs::read` on it and feeding the full byte vector to `sha256_hex`.
+  On a 512 MiB pcap import the live resident set spiked by ~512 MiB. 0.2.3
+  switches the integrity hash to `sha256_hex_file`, which is already the
+  streaming (`BufReader` of `STREAM_CHUNK_BYTES`) path used elsewhere in
+  the module. The post-copy integrity contract (`size`, `mtime`, `sha256`
+  all unchanged) is preserved; only the hashing memory footprint changes.
+- The second `fs::read`-into-`sha256_hex` leak at `continuous_source_dedup_ok`
+  was fixed with the same `sha256_hex_file` substitution.
+- Test (`copy_verified_streams_512_mib_import_under_32_mib_live_allocation`,
+  `#[ignore]`'d because the `#[global_allocator]` tracker is shared with
+  concurrent tests): materialises a 512 MiB source pcap on disk, computes
+  its expected SHA via the streaming hasher, builds a `SourceSegment` with
+  that checksum, resets the allocation peak, calls `copy_verified`, and
+  asserts the peak live allocation stays under 32 MiB. Measured on Back100:
+  `COPY_VERIFIED_512MIB_PEAK_BYTES=1048765 PEAK_MIB=1 LIMIT_MIB=32`. Full
+  live-probe suite: `cargo test -p live-probe` → 42 passed, 0 failed, 2
+  ignored. Reproduce:
+  `cargo test -p live-probe --release copy_verified_streams_512_mib_import_under_32_mib_live_allocation -- --ignored --test-threads=1 --nocapture`.
+
+## oiran-decode v0.4.5 — streaming-friendly write_jsonl_atomic signature
+
+- `write_jsonl_atomic` now accepts `IntoIterator<Item = &NormalizedEvent>`
+  instead of `&[NormalizedEvent]`. The function body was already streaming
+  through a bounded `BufWriter`; the API change lets a caller that produces
+  events lazily avoid materialising the full `Vec` before writing. Existing
+  callers (`live-probe/src/lib.rs:2197` with `&all_events` and
+  `oiran-decode/src/lib.rs:332` with `&[]`) compile unchanged because
+  `&Vec<T>` and `&[T]` both implement the new trait bound.
+
+## live-probe v0.2.2 — source_segments OOM fix, memory-bounded ingestion
+
+### live-probe v0.2.2 — bounded ingestion
+
+Codex measured 27 OOMs in 5 min with RSS up to 255 MiB in a 256 MiB cgroup
+on the OIRAN API, root-caused to `source_segments()` retaining up to 512
+candidates and `fs::read()`-ing each pcap in full BEFORE applying the
+`finalized_candidates_only` filter. The fix:
+
+- **Metadata-first finalized filter.** `source_segments()` now walks the
+  candidate pool as a cheap `SourceCandidateMeta { path, interface,
+  size_bytes, modified }` projection, applies the finalized filter on
+  that, THEN opens and stream-hashes only the kept candidates. The pcap
+  content is never materialised in RAM — SHA-256 streams through 1 MiB
+  `BufReader` chunks via `sha256_hex_file`, and packet counting uses the
+  existing streaming `count_pcap_records` (16-byte header + `io::copy`
+  into `io::sink`).
+- **Streaming per-candidate loop.** One pcap in flight at a time; the
+  candidate's `size_bytes` + `modified` are retained in metadata only.
+  No `Vec<u8>` of file contents is ever held across loop iterations.
+- **`events.clone()` dropped.** `session_engine::discover_sessions` was
+  taking `Vec<EventRecord>` by value and consuming it, forcing live-probe
+  (and three other callers) to `events.clone()` the full dataset so the
+  Vec could be used after discovery. Signature changed to
+  `discover_sessions(&mut Vec<EventRecord>)` — callers now pass a mutable
+  borrow and reuse the same Vec afterwards. 4 call sites updated
+  (live-probe, correlation-engine, apps/api, evidence-replay bin).
+- **600 × 2 MiB memory-bounded test.** New
+  `source_segments_memory_is_bounded_on_600_two_mib_pcaps` test uses a
+  tracking `GlobalAlloc` shim to assert that the peak live allocation
+  stays under 128 MiB when walking 600 synthetic 2 MiB pcaps. Measured
+  peak: **1 MiB** on 512 segments (vs. ~1 GiB upper bound in 0.2.1).
+  The test is `#[ignore]`'d because the global allocator counts
+  allocations from every parallel test thread, so it must run alone:
+  `cargo test --release -p live-probe
+   source_segments_memory_is_bounded -- --ignored --test-threads=1
+   --nocapture` → `source_segments peak live allocation = 1258536 B =
+   1 MiB (segments=512)` in 47 s.
+- **Pre-existing live-probe test failures proven as environmental.**
+  Three continuous-import tests
+  (`continuous_import_is_incremental_deduplicated_stoppable_and_restart_safe`,
+  `continuous_source_skips_active_truncation_and_rotates_owned_ring`,
+  `full_ring_ingests_three_interface_batches_across_rotations`) fail
+  when the test host's `/tmp` filesystem is at ≥ 85 % utilisation because
+  `disk_safety::capture_budget` returns `allowed=false` on
+  `SafetyState::StopNewCaptures`. The tests now call a
+  `skip_if_disk_too_full()` guard that emits a `SKIP ...` log line with
+  the detected safety state and returns early. On this host `df -h /tmp`
+  reports 87 % usage; on a host with free space the guard is a no-op and
+  the tests run normally.
+- The merge of `feat/oiran-live-probe-finalized-segments` (0.2.0,
+  SHA 0930c75) is now part of this branch: `finalized_candidates_only()`
+  and `record_ingestion_failure()` are available, plus the four
+  finalized-segments unit tests. Lineage proven by
+  `git merge-base --is-ancestor 0930c75 HEAD` returning 0 after the
+  merge commit `3e87af3`.
+
+### decoder-ngap v0.6.0 compatibility alias
+
+The 0.6.0 outer-list walker emitted `item_<i>_pdu_session_id` identifiers
+but `session_engine::discover_sessions` groups events by the historical
+`pdu_session_id` key. Fixed by also emitting a plain
+`pdu_session_id=<first-item-id>` for IE 74 and IE 75 so the session
+engine recognises PDU sessions decoded through the new walker. Fixes
+`completed_capture_registers_real_decoded_dataset_with_provenance`.
+
+## oiran-decode v0.4.5 / decoder-sbi v0.3.1 / live-probe v0.2.1 — SBI 0.4.2 regression + OOM fixes
+
+### decoder-sbi v0.3.1 — HPACK regression fix
+
+Codex measurement on inventory `aabbe5e9…` showed 0.4.2 regressed SBI
+throughput 70x: 57,532 DECODED / 6,164 PARTIAL (0.3.1) → 799 DECODED / 317,019
+PARTIAL (0.4.2). Two root causes were introduced in 0.4.2:
+- **Permanent direction poisoning**: a single HPACK failure flagged every
+  subsequent HEADERS block on the same direction as `hpack_unavailable`,
+  including blocks the HPACK decoder had accepted cleanly.
+- **Ghost events**: streams that in 0.3.1 would have been skipped (orphan
+  CONTINUATION, oversized HEADERS/CONTINUATION fragments, unflushed
+  continuations at end of capture) were promoted to synthetic events via
+  `hpack_unavailable=true`. This inflated the event count by ~5x on
+  well-formed captures.
+
+Fix:
+- HPACK failure now touches **only** the specific header block that failed.
+  The next block that decodes cleanly re-synchronises the direction
+  automatically — no permanent poisoning.
+- Frame-level framing errors (orphan CONTINUATION, oversized blocks,
+  unflushed continuations) are now **connection-level** entries in
+  `report.errors`. They do not touch any stream state, so they do not
+  fabricate events.
+- One normalised event per stream (unchanged structural invariant); the
+  stream is only promoted to an event when at least one direction's
+  decoded headers are non-empty — same contract as 0.3.1.
+
+Two new non-regression tests pin the contract:
+- `non_regression_well_formed_connection_emits_one_decoded_event_per_stream`
+  encodes 32 well-formed HTTP/2 request/response pairs with SETTINGS,
+  WINDOW_UPDATE and GOAWAY interleaved. The decoder emits exactly 32
+  DECODED events, zero HPACK_CONTEXT_UNAVAILABLE errors, zero ghost
+  events for the control frames.
+- `non_regression_hpack_failure_does_not_poison_subsequent_streams`
+  encodes a failing HEADERS on stream 1 followed by a well-formed POST
+  on stream 3. Stream 3 decodes cleanly, stream 1 surfaces the
+  HPACK_CONTEXT_UNAVAILABLE once, and the direction-level error is
+  logged exactly once in `report.errors` (not per frame).
+
+### live-probe v0.2.1 — memory-bounded streaming I/O
+
+Audit of live-probe 0.2.0 identified three unbounded-RAM sites that
+accounted for the API OOM Codex observed:
+1. **`fs::read(pcap_path)` for integrity verification**: every source
+   pcap was fully materialised in a `Vec<u8>` so `sha256_hex(&bytes)`
+   could run. On a multi-GB pcap this allocates the full file. Fixed by
+   introducing a streaming `Sha256Hasher` in event-schema and a
+   `sha256_hex_file(path)` + `verify_file_integrity(path, size, sha)`
+   helper that walks the file in 1 MiB chunks via `BufReader::fill_buf`.
+2. **Continuous events dedup rewrite**: the per-ingestion
+   `events.jsonl` rewrite read the entire prior file via
+   `fs::read_to_string`, held a `BTreeMap<String, serde_json::Value>` of
+   every event, and finally serialised the whole thing into a
+   `Vec<u8>` before `atomic_write`. On a long-running continuous
+   capture this is proportional to the number of events ever observed.
+   Fixed by streaming the prior file line-by-line, storing serialised
+   lines (not parsed values), applying a `MAX_IN_MEMORY_EVENT_IDS =
+   1_000_000` safety cap with FIFO eviction, and writing the output
+   through a `BufWriter` + atomic rename.
+3. **Recovery dataset integrity material**: `integrity_material` was
+   built by `fs::read(events.jsonl)` and `fs::read(dataset_manifest)`
+   concatenated into a single `Vec<u8>`, then hashed. Replaced by a
+   two-file streaming SHA-256 identical bit-for-bit to the previous
+   output.
+
+Bounded-memory tests pin the contract:
+- `streaming_sha256_matches_in_memory_sha256_on_large_synthetic_file`
+  materialises a 64 MiB file on disk and verifies that
+  `sha256_hex_file` returns the exact same hash as the full-buffer
+  oracle. The production code path only ever reads
+  `STREAM_CHUNK_BYTES = 1 MiB` at a time.
+- `verify_file_integrity_detects_size_and_hash_mismatches_without_full_read`
+  proves the integrity verifier catches size and SHA mismatches on a
+  4 MiB file without a full-read oracle.
+
+### event-schema
+
+- Added `Sha256Hasher` (streaming) with `new()`, `update(&[u8])`,
+  `finish_hex()`. `sha256_hex(bytes)` is now implemented on top of it,
+  byte-for-byte identical to the previous implementation (the
+  pre-existing `sha256_matches_standard_vector` test still passes).
+
+### Open regressions
+
+- 6 live-probe tests (`completed_capture_registers_real_decoded_dataset_with_provenance`,
+  `continuous_checkpoint_keeps_five_sessions_across_restart_and_republish`,
+  `continuous_import_is_incremental_deduplicated_stoppable_and_restart_safe`,
+  `continuous_source_skips_active_truncation_and_rotates_owned_ring`,
+  `failed_capture_recovery_is_atomic_registered_and_idempotent`,
+  `full_ring_ingests_three_interface_batches_across_rotations`) are
+  broken at the branch base `d85d29f` already; this release does not
+  change the pass/fail count — it only adds +2 bounded-memory tests
+  that both pass.
+
+## oiran-decode v0.4.4 — pycrate-grounded real TS 38.413 transfer decoders
+
+- `decoder-ngap v0.6.0`:
+  - **Real ASN.1 ground truth: pycrate.** Replaced the simplified asn1tools
+    schema (removed `tests/fixtures/aper-transfer.asn` and the asn1tools
+    generator) with pycrate (`pycrate_asn1dir.NGAP`), the only Python library
+    that compiles the full TS 38.413 3GPP ASN.1 module. Fixtures are now
+    pycrate `.to_aper()` outputs of real NGAP types.
+  - **Request transfer = ProtocolIE-Container.**
+    `decode_pdu_session_resource_setup_request_transfer` now walks the real
+    `SEQUENCE { protocolIEs ProtocolIE-Container {...} }` structure: outer
+    SEQUENCE ext + 1-bit, 2-octet container size, then per-item
+    `{ id, criticality, value OPEN TYPE }`. Decoded IEs:
+    `id-UL-NGU-UP-TNLInformation` (139), `id-PDUSessionType` (134),
+    `id-QosFlowSetupRequestList` (136),
+    `id-PDUSessionAggregateMaximumBitRate` (130). Unknown IEs are retained
+    with `{id, criticality, length}` on `unknown_protocol_ies` and named in
+    `errors`; the OPEN TYPE length determinant lets the walker skip them
+    cleanly instead of de-syncing.
+  - **Response transfer: 4 top-level OPTIONALs + extensions.** The response
+    SEQUENCE now reads the correct 5-bit preamble (ext + additional +
+    security + failed + iE-Ext) and parses the `iE-Extensions`
+    ProtocolExtensionContainer when present, extracting
+    `id-RedundantDLQosFlowPerTNLInformation` (id 196) into `redundant`;
+    other extensions are retained verbatim with their id/length.
+  - **IE 71 / IE 72 (Cxt-Req / Cxt-Res).**
+    `decode_pdu_session_resource_setup_list_cxt_req` and `_cxt_res` cover
+    `PDUSessionResourceSetupListCxtReq` / `CxtRes` from the
+    `InitialContextSetupRequest/Response` procedures (used by Open5GS to
+    mount the session via the Initial Context Setup path).
+  - **Correct extensibility on primitives.** Audited every INTEGER / ENUMERATED
+    / CHOICE in the real NGAP module and fixed the extension-marker handling:
+    `QosFlowIdentifier` is extensible (1 ext bit + 6-bit value, 7 bits total),
+    `PriorityLevelARP` is NOT extensible (4-bit bit-field),
+    `UPTransportLayerInformation` is NOT extensible (1-bit choice index for
+    gTPTunnel vs choice-Extensions),
+    `Cause` is NOT extensible (3-bit index for 6 root alternatives including
+    choice-Extensions). The old implementation was wrong on all four, which
+    is why the asn1tools-simplified fixtures looked self-consistent but
+    disagreed with real captures.
+  - **Guard-rail.** `tests/pycrate_fixtures.rs` includes an explicit guard
+    that encodes `TEID=0x11223344` and `QFI=5` with pycrate and asserts the
+    exact values round-trip through the decoder. Separate tests prove
+    mangled or truncated bytes return a NON-matching value AND surface
+    named `errors` entries — the decoder never silently fabricates a wrong
+    value.
+  - **8 new typed structs** exposed on the public API (`SNssai`,
+    `SetupItemSUReq`, `SetupItemSURes`, `ListSUReq`, `ListSURes`,
+    `UnknownProtocolIe`, `UpTransportLayerInformation::ChoiceExtensions`,
+    `QosCharacteristics::ChoiceExtensions`) plus `serde::Serialize` on
+    every public type so the `ngap-decode-hex` diagnostic CLI emits a
+    complete JSON tree.
+
+## oiran-decode v0.4.3 — real outer-list walker, ENUMERATED extension, diagnostic CLI
+
+- `decoder-ngap v0.5.1`:
+  - **Outer list walker, no more heuristic.** `decode_pdu_session_list` now
+    routes IE 74 and IE 75 through the new
+    `decode_pdu_session_resource_setup_list_su_req` /
+    `decode_pdu_session_resource_setup_list_su_res` entry points, which
+    implement the real X.691 ALIGNED PER encoding of
+    `PDUSessionResourceSetupListSUReq` and `PDUSessionResourceSetupListSURes`:
+    SIZE(1..256) size byte, per-item SEQUENCE preamble (ext +
+    optional-presence bits), `pDUSessionID` octet-aligned, `pDUSessionNAS-PDU`
+    with its APER length determinant, `S-NSSAI` SEQUENCE (`sST` as a SIZE(1)
+    bit-field, `sD` as SIZE(3) octet-aligned), and the transfer OCTET STRING
+    extracted via its own length determinant. The previous "canonical" byte
+    offset heuristic has been removed; non-canonical layouts surface their
+    specific failure in a per-item `errors` list and the `item_<i>_*` summary
+    keys name the exact field that did not decode.
+  - **`qosFlowMappingIndication` extension additions.** When the ENUMERATED
+    extension bit is set, the walker now reads the normally-small-non-negative
+    whole number for the extension index (X.691 Clause 10.6) and reports
+    `AssociatedQosFlowMapping::UnknownExtension(index)` instead of returning
+    `UnknownExtension(0)` for every extension value.
+  - **Diagnostic CLI.** New binary `ngap-decode-hex` (invoked as `cargo run
+    -p decoder-ngap --bin ngap-decode-hex`) reads a hex NGAP PDU from stdin
+    (whitespace and `0x` prefixes tolerated) and writes the decoded tree as
+    pretty-printed JSON on stdout. For IE 74 and IE 75 the embedded transfer
+    is decoded in the same JSON blob so operators can diff the result
+    side-by-side with `tshark -O ngap -J` on real captures.
+  - **New fixtures.** 7 additional asn1tools-generated ground-truth fixtures
+    cover the outer list envelope: 1 session SST-only, 1 session with NAS-PDU,
+    1 session with S-NSSAI SST+SD, 1 session with item iE-Extensions, 3
+    sessions mixed (NAS-PDU + SST/SD + iE-Ext), and SURes with/without
+    iE-Extensions on individual items. The hand-crafted bit-level fixture
+    `qos_flow_mapping_indication_extension_decodes_normally_small_number`
+    exercises the ENUMERATED extension path end-to-end.
+- Fixtures remain synthetic (PLMN 001/01 or TEST-NET addresses, NAS-PDU
+  stub 0x7e 00 44 6f = plain 5GMM Registration Reject). No real
+  SUPI/K/OPc/SUCI/GUTI/IMSI/IMEI material is present in test code,
+  fixtures, or decoders.
+
+## oiran-decode v0.4.2 — real X.691 APER walker, HPACK Huffman recovery
+
+- `decoder-ngap v0.5.0`: removed the one-octet-per-primitive canonical walker
+  and replaced it with a bit-accurate X.691 ALIGNED PER reader
+  (`aper::AperReader`) plus type-specific decoders for
+  `PDUSessionResourceSetupRequestTransfer` and
+  `PDUSessionResourceSetupResponseTransfer`
+  (`transfer::decode_pdu_session_resource_setup_{request,response}_transfer`).
+  The decoders are driven by 11 ground-truth fixtures generated with
+  `asn1tools` (Python, codec `per`) against the minimal TS 38.413 subset
+  shipped in `decoder-ngap/tests/fixtures/aper-transfer.asn`. Each fixture
+  round-trips value → bytes → decoder → value, so a byte-level drift fails
+  loudly. Optional fields covered end-to-end: `gBR-QosInformation`,
+  `dynamic5QI`, `reflectiveQoSAttribute`, `additionalDLQosFlowPerTNLInformation`
+  (multi-tunnel), `qosFlowFailedToSetupList` with Cause CHOICE, and
+  `SecurityResult`. Unsupported constructs (extension markers, choice
+  extensions, unknown Cause groups) are now **named** in a `errors` vector on
+  the returned structure instead of being silently dropped — the "canonical
+  only" rejection path has been removed.
+- `decoder-sbi v0.3.0`: `tolerant_literals` now decodes HPACK Huffman-encoded
+  literals via `hpack::huffman::HuffmanDecoder`. HTTP/2 header blocks that
+  only recovered static-name indexed-plain literals in 0.2.0 now also recover
+  the Huffman-encoded values that make up most SBI PATCH requests. Covered by
+  two unit tests: the RFC 7541 Appendix C.4.1 example for `:authority` =
+  `www.example.com` and a synthetic SBI `:path` = PATCH SM-context modify.
+- Fixtures remain synthetic (PLMN 001/01 or TEST-NET addresses). No real
+  SUPI/K/OPc/SUCI/GUTI/IMSI/IMEI/IMEISV material is present in test code,
+  fixtures, or decoders.
+
+## oiran-decode v0.4.1 — SBI HPACK context, NGAP QoS flow walker, EPS SMC decoding
+
+- `decoder-sbi v0.2.0`: HPACK decode failures (dynamic table state lost when the
+  capture starts mid-connection, orphan CONTINUATION, header block exceeding the
+  configured maximum size) are now surfaced as explicit
+  `HPACK_CONTEXT_UNAVAILABLE` errors on the normalized event instead of being
+  rolled into a generic PARTIAL. Once a direction's HPACK state is poisoned, any
+  subsequent HEADERS block on that direction is attributed to
+  `HPACK_CONTEXT_UNAVAILABLE` because the dynamic table indices can no longer be
+  verified against the sender. Streams whose request headers failed to decode
+  are still emitted so the response remains correlatable by HTTP/2 stream ID
+  (previously these were silently dropped as incomplete). The CONTINUATION
+  reassembler was audited: orphan CONTINUATION frames and over-sized blocks now
+  flag the stream explicitly instead of being discarded.
+- `decoder-ngap v0.4.1`: added a canonical APER walker for
+  `QoSFlowSetupRequestList` inside `PDUSessionResourceSetupRequestTransfer`
+  (IE 74) and `AssociatedQosFlowList` inside the first
+  `QoSFlowPerTNLInformation` of `PDUSessionResourceSetupResponseTransfer`
+  (IE 75). When the walker matches the "no-optionals, nonDynamic5QI, canonical
+  one-octet-per-primitive" layout it emits per-item `qfi_<i>`, `five_qi_<i>`,
+  `arp_priority_<i>`, `arp_capability_<i>`, `arp_vulnerability_<i>` session
+  identifiers. Non-canonical encodings (extensions, additional optional
+  subfields, dynamic5QI) fall back to the existing structural
+  `qos_flow_setup_list=present` marker so operators can tell "scanned but could
+  not decode" apart from "no QoS flow IE at all".
+- `decoder-nas v0.3.1`: EPS Security Mode Command (0x5C) now has a dedicated
+  per-TS 24.301 §8.5 decoder (previously the body was preserved only by
+  SHA-256). Mandatory fields emitted: Selected NAS security algorithms
+  (`ciphering=EEAn, integrity=EIAn`), NAS key set identifier (`nas_ksi`,
+  `tsc`), and Replayed UE security capabilities parsed as EEA / EIA / UEA /
+  UIA / GEA bitmaps per TS 24.301 §9.9.3.34.
+- Fixtures are synthetic (PLMN 001/01 or TEST-NET addresses). No real
+  identity, key, SUCI, GUTI, IMEI or IMSI material is present in test code.
+
+## oiran-decode v0.4.0 — N2 SM transfer typing, Diameter S6a base, Security Mode Command
+
+- `decoder-ngap v0.4.0`: PDUSessionResourceSetupListSUReq (IE 74) and
+  PDUSessionResourceSetupListSURes (IE 75) now expose direction-tagged tunnel
+  evidence from the nested PDU Session Resource Setup Request/Response Transfer.
+  IE 74 yields `tunnel_ip_ul` + `gtp_teid_ul`, IE 75 yields `tunnel_ip_dl` +
+  `gtp_teid_dl`. Structural scan also reports `pdu_session_type` (ipv4, ipv6,
+  ipv4v6, ethernet, unstructured) and the presence of a QoS Flow setup list. The
+  overall message status stays `PARTIAL` because QFI, QoS profile and secondary
+  fields remain SHA-256 provenance; the correlation keys needed for NGAP ↔ PFCP
+  ↔ GTP-U are now emitted explicitly instead of being hidden behind an
+  undirected `tunnel_endpoint_ip`/`gtp_teid` pair.
+- `decoder-nas v0.3.0` (TS 24.501):
+  - Registration Request now decodes the optional UE security capability
+    (IEI 0x2E = 46). The IE value is parsed into `nr_encryption`,
+    `nr_integrity`, and when present `eutra_encryption`/`eutra_integrity`.
+  - Security Mode Command (0x5D) now has a dedicated parser: Selected NAS
+    security algorithms (ciphering/integrity half-octets), ngKSI, Replayed UE
+    security capability (LV) and the optional Additional 5G security information
+    (IEI 0x36 = 54) which reports `rinmr` and `hdp`.
+- `decoder-diameter v0.2.0` (RFC 6733 + 3GPP TS 29.272): added base AVPs
+  Origin-State-Id (278), Session-Id (263), Auth-Session-State (277),
+  Vendor-Specific-Application-Id (260, grouped), Vendor-Id (266), Auth- and
+  Acct-Application-Id (258/259). These AVPs previously forced S6a messages to
+  `PARTIAL` because they were unsupported.
+- All new fixtures are synthetic (PLMN 001/01 or TEST-NET addresses). No real
+  identity, SUPI, K, OPc, SUCI, GUTI, IMEI or IMSI material is present in test
+  code.
+
+## live-probe v0.2.0 — finalized segments only + persistent failure log
+
+- Continuous import skips the still-live dumpcap target per interface. For
+  each interface the newest file is dropped from the candidate set whenever
+  its mtime is more recent than `2 × stable_age`; finalized files
+  (anything older) stay eligible. The pure helper
+  `finalized_candidates_only()` replaces the previous "stable-across-scans"
+  proxy at the discovery layer, so a running writer is never fed into
+  `copy_verified` and cannot trigger
+  `CONTINUOUS_SOURCE_CHANGED_DURING_IMPORT` as a hot-path error.
+- `ContinuousImportState` grows a bounded `failed_ingestions: VecDeque<
+  FailedIngestion>` persisted in `import_state.json`. Every ingestion
+  failure path (`CONTINUOUS_SEGMENT_NOT_FINALIZED` pre-copy / post-copy,
+  `CONTINUOUS_COPY_RETRYABLE`) now records `{source_path, error_code,
+  occurred_epoch_ms}` and writes the state atomically — the entry survives
+  probe restarts, so the operator can audit a 1 h window after the fact.
+  Bounded at `MAX_PERSISTED_INGESTION_FAILURES=256`, FIFO-evicted.
+- Pure helpers `record_ingestion_failure` and `finalized_candidates_only`
+  are exposed under tests; four new unit tests exercise FIFO eviction,
+  verbatim path/code/timestamp preservation, newest-per-interface skip
+  within the safety window and single-file acceptance after the window
+  has elapsed.
+- No live-probe behaviour change for successful imports; aggregate metrics
+  (`ingestion_failures`, `segments_ingested`, …) remain the same.
+
+## decoder-ngap v0.3.1 / oiran-decode v0.3.1 - NGAP status correction
+
+- Mark a structurally bounded NAS-PDU information element as decoded at the
+  NGAP layer; the nested NAS child event independently retains
+  `ENCRYPTED_OR_PROTECTED`, `PARTIAL` or `MALFORMED`.
+- Correct the NAS security-header nibble and accept the observed eight-octet
+  as well as schema forty-bit `UEAggregateMaximumBitRate` encodings.
+- Keep PDU Session Resource Setup list items `PARTIAL` while their nested N2
+  SM transfer remains opaque; no missing field is promoted to decoded.
+- Replayed the unchanged finalized N2 inventory identified by SHA-256
+  `aabbe5e942ede445fcd59b8ad37184f7dadc57a8b16aee935b30b99e9ecdc084`.
+
+## decoders-epc v1.0 - GTPv2-C, Diameter S6a, EPS NAS (TS 29.274 / RFC 6733 + TS 29.272 / TS 24.301)
+
+- `decoder-gtpv2c v0.1.0` (new crate, TS 29.274): Echo, Create/Modify/Delete Session, Create/Delete Bearer, Release Access Bearers. IEs IMSI, MSISDN, MEI are flagged identity (`pseudonymized: true`); F-TEID, Bearer Context (grouped), PAA, APN, AMBR, Serving Network (PLMN), EBI are decoded.
+- `decoder-diameter v0.1.0` (new crate, IETF RFC 6733 + 3GPP TS 29.272 S6a): ULR/ULA (316), AIR/AIA (318), PUR/PUA (321), CLR/CLA (317), NOR/NOA (323). AVPs User-Name (code 1) and MSISDN (code 701, vendor 10415) are flagged identity; Result-Code, Experimental-Result-Code, Visited-PLMN-Id, Origin-Host/Realm, Subscription-Data envelope and Authentication-Info envelope are decoded.
+- `decoder-nas v0.2.0` (extended, TS 24.301): added EPS EMM (Attach, TAU, Service Request, Detach, Authentication, Security Mode, Identity, EMM Status/Information, NAS Transport) and ESM (PDN Connectivity, Activate/Modify/Deactivate EPS Bearer Context, ESM Info, Status). EPS Mobile Identity (IMSI/IMEI/IMEISV/GUTI) is flagged identity.
+- `decoder-s1ap v0.2.0` (updated): NAS-PDU IE (id 26) now forwards to `decoder-nas` and emits a child `NormalizedEvent` with a parent link back to the S1AP event, mirroring NGAP → 5G NAS.
+- `event-schema`: added `Protocol::Gtpv2c`, `Protocol::Diameter`, `Protocol::NasEpsMm`, `Protocol::NasEpsSm` variants (`as_str` → `GTPv2-C`, `DIAMETER`, `NAS-EPS-MM`, `NAS-EPS-SM`).
+- All fixtures are synthetic (PLMN 001/01, synthetic BCD/digit material). No real identities are present in test code.
+
+## decoder-s1ap v0.1.0 - S1AP APER decoder (TS 36.413)
+
+- Added `OIRAN/decoder-s1ap` crate implementing the schema-independent S1AP-PDU/open-type envelope and ProtocolIE container, modelled on `decoder-ngap`.
+- Procedures recognised: S1 Setup (17), E-RAB Setup (5), E-RAB Release (7), Initial Context Setup (9), Paging (10), Downlink NAS Transport (11), Initial UE Message (12), Uplink NAS Transport (13), UE Context Release Request (18), UE Context Release Command / Complete (23).
+- Identity-bearing IEs (`S-TMSI`, `UEPagingID`, `GUMMEI-ID`, `SecurityKey`, `NAS-PDU`) are tagged `pseudonymized: true` so the Analyzer strips them before persistence.
+- Added `Protocol::S1ap` variant to the event-schema protocol enum.
+- Coverage: 10 unit tests on synthetic APER vectors built from TS 36.413 with synthetic PLMN `001/01` and synthetic identities only — no real IMSI/K/OPc material in fixtures.
+- Carried NAS-PDU is EPS NAS (TS 24.301) and preserved opaquely by SHA-256 + length; `decoder-nas` remains 5G-only (declared limitation).
+- Added `OIRAN/docs/PROTOCOL_AUDIT.md` with the static 12-plane coverage audit.
+
 ## Release consolidation V1.1 - lossless continuous checkpoint resume
 
 - Preserve evidence-backed session identifiers when live activity credit expires or a continuous import is finalized.
@@ -449,4 +966,14 @@ All notable OIRAN vProbe changes are recorded here. Versions follow Semantic Ver
 ### Safety
 
 - No decoder, historical dataset, live capture service or external laboratory component was modified or started.
+
+## OIRAN API 2.5.4 / live-probe 0.2.7 - 2026-10-31
+
+- `GET /api/v1/sessions/:id/callflow` now returns at most 100 events by
+  default and accepts `limit` (1..256) plus an event-id `cursor`.
+- Persisted call-flow JSON is read with a streaming deserializer; only the
+  selected event page is retained, preventing large historical sessions from
+  multiplying their resident-memory cost during HTTP serialization.
+- Every response carries `pagination.{limit,cursor,next_cursor,returned_events,total_events}`;
+  invalid cursors fail explicitly and never replay the first page.
 

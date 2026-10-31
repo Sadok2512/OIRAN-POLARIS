@@ -1,5 +1,19 @@
 //! NGAP APER envelope and ProtocolIE container decoder, schema baseline TS 38.413 V17.3.0.
 
+pub mod aper;
+mod transfer;
+
+pub use transfer::{
+    decode_pdu_session_resource_setup_list_cxt_req, decode_pdu_session_resource_setup_list_cxt_res,
+    decode_pdu_session_resource_setup_list_su_req, decode_pdu_session_resource_setup_list_su_res,
+    decode_pdu_session_resource_setup_request_transfer,
+    decode_pdu_session_resource_setup_response_transfer, AllocationAndRetention,
+    AssociatedQosFlowItem, AssociatedQosFlowMapping, CauseKind, FailedQosFlow, GbrQosInformation,
+    GtpTunnel, ListSURes, ListSUReq, QosCharacteristics, QosFlowLevelQosParams, QosFlowPerTnlInfo,
+    QosFlowSetupRequestItem, RequestTransfer, ResponseTransfer, SNssai, SecurityResultDecoded,
+    SetupItemSURes, SetupItemSUReq, UnknownProtocolIe, UpTransportLayerInformation,
+};
+
 use decoder_nas::NasMessage;
 use event_schema::{
     pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState,
@@ -10,7 +24,7 @@ use plugin_runtime::{
     PLUGIN_API_VERSION,
 };
 
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.6.0";
 pub const SCHEMA_VERSION: &str = "3GPP TS 38.413 V17.3.0";
 pub const SCHEMA_SHA256: &str = "b705532dd52674fce67ccc01df7bd17a8412341ea82740c164029a5b545f04d2";
 #[derive(Default)]
@@ -156,7 +170,11 @@ fn decode_ie(ie: &NgapIe) -> (Option<String>, DecodeStatus, bool) {
             let Ok((nas, _)) = nas_pdu_contents(&ie.value) else {
                 return (None, DecodeStatus::Malformed, true);
             };
-            let protected = nas.get(1).map(|v| v & 0x0f != 0).unwrap_or(false);
+            // TS 24.501 places the security-header type in the high nibble of
+            // octet 2. The NGAP decoder has fully decoded the NAS-PDU envelope
+            // once its APER length is bounded; the child NAS event carries the
+            // independent protected/partial status of the nested payload.
+            let protected = nas.get(1).map(|v| v >> 4 != 0).unwrap_or(false);
             (
                 Some(if protected {
                     format!("nas_protected=true,pseudonym={}", pseudonym("nas-pdu", nas))
@@ -166,11 +184,7 @@ fn decode_ie(ie: &NgapIe) -> (Option<String>, DecodeStatus, bool) {
                         pseudonym("nas-pdu", nas)
                     )
                 }),
-                if protected {
-                    DecodeStatus::EncryptedOrProtected
-                } else {
-                    DecodeStatus::Partial
-                },
+                DecodeStatus::Decoded,
                 true,
             )
         }
@@ -409,20 +423,185 @@ fn decode_guami(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
     )
 }
 
-fn decode_pdu_session_list(_id: u16, v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
+fn decode_pdu_session_list(id: u16, v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
     if v.len() < 3 {
         return malformed();
     }
-    let mut value = format!(
-        "pdu_session_id={},nested_transfer_sha256={}",
-        v[2],
-        sha256_hex(&v[3..])
-    );
-    if let Some((ip, teid)) = decode_up_transport_tunnel(&v[3..]) {
-        value.push_str(&format!(",tunnel_endpoint_ip={ip},gtp_teid=0x{teid:x}"));
+    let (ip_label, teid_label) = pdu_session_tunnel_labels(id);
+    let mut value = format!("nested_list_sha256={}", sha256_hex(v));
+    match id {
+        74 => {
+            let list = transfer::decode_pdu_session_resource_setup_list_su_req(v);
+            for (index, item) in list.items.iter().enumerate() {
+                append_sureq_item_summary(&mut value, index, item, ip_label, teid_label);
+            }
+            for e in &list.errors {
+                value.push_str(&format!(",ngap_list_error={}", e.replace(',', ";")));
+            }
+        }
+        75 => {
+            let list = transfer::decode_pdu_session_resource_setup_list_su_res(v);
+            for (index, item) in list.items.iter().enumerate() {
+                append_sures_item_summary(&mut value, index, item, ip_label, teid_label);
+            }
+            for e in &list.errors {
+                value.push_str(&format!(",ngap_list_error={}", e.replace(',', ";")));
+            }
+        }
+        _ => {
+            // Other PDU session list IEs (71, 72, 133, ...) still rely on the
+            // heuristic byte scan until their outer schemas are modeled.
+            value.push_str(&format!(",pdu_session_id={}", v[2]));
+            if let Some((ip, teid)) = decode_up_transport_tunnel(&v[3..]) {
+                value.push_str(&format!(",{ip_label}={ip},{teid_label}=0x{teid:x}"));
+            }
+            if let Some(session_type) = decode_pdu_session_type_marker(&v[3..]) {
+                value.push_str(&format!(",pdu_session_type={session_type}"));
+            }
+        }
     }
     (Some(value), DecodeStatus::Partial, false)
 }
+
+fn append_sureq_item_summary(
+    value: &mut String,
+    index: usize,
+    item: &transfer::SetupItemSUReq,
+    ip_label: &str,
+    teid_label: &str,
+) {
+    value.push_str(&format!(
+        ",item_{index}_pdu_session_id={}",
+        item.pdu_session_id
+    ));
+    // Compatibility alias so the session engine can group events by PDU
+    // session (it keys on the plain `pdu_session_id` identifier). We emit
+    // the FIRST item's PDU session id as the canonical value; multi-session
+    // PDUs still expose each item under the `item_<i>_pdu_session_id` keys.
+    if index == 0 {
+        value.push_str(&format!(",pdu_session_id={}", item.pdu_session_id));
+    }
+    value.push_str(&format!(",item_{index}_sst={}", item.s_nssai.sst));
+    if let Some(sd) = &item.s_nssai.sd {
+        value.push_str(&format!(
+            ",item_{index}_sd={:02x}{:02x}{:02x}",
+            sd[0], sd[1], sd[2]
+        ));
+    }
+    if let Some(nas_pdu) = &item.nas_pdu {
+        value.push_str(&format!(",item_{index}_nas_pdu_length={}", nas_pdu.len()));
+    }
+    if item.ie_extensions_present {
+        value.push_str(&format!(",item_{index}_ie_extensions=present"));
+    }
+    let decoded = transfer::decode_pdu_session_resource_setup_request_transfer(&item.transfer);
+    if let Some(ul) = &decoded.ul_tunnel {
+        if let Some(ip) = ul.ipv4_address() {
+            value.push_str(&format!(",item_{index}_{ip_label}={ip}"));
+        }
+        if let Some(teid) = ul.teid() {
+            value.push_str(&format!(",item_{index}_{teid_label}=0x{teid:x}"));
+        }
+    }
+    if let Some(pt) = decoded.pdu_session_type {
+        value.push_str(&format!(",item_{index}_pdu_session_type={pt}"));
+    }
+    for (i, flow) in decoded.qos_flows.iter().enumerate() {
+        value.push_str(&format!(",item_{index}_qfi_{i}={}", flow.qfi));
+        if let transfer::QosCharacteristics::NonDynamic5QI { five_qi, .. } =
+            &flow.qos_params.characteristics
+        {
+            value.push_str(&format!(",item_{index}_five_qi_{i}={five_qi}"));
+        }
+    }
+    for e in &decoded.errors {
+        value.push_str(&format!(",item_{index}_transfer_error={}", e.replace(',', ";")));
+    }
+}
+
+fn append_sures_item_summary(
+    value: &mut String,
+    index: usize,
+    item: &transfer::SetupItemSURes,
+    ip_label: &str,
+    teid_label: &str,
+) {
+    value.push_str(&format!(
+        ",item_{index}_pdu_session_id={}",
+        item.pdu_session_id
+    ));
+    if index == 0 {
+        value.push_str(&format!(",pdu_session_id={}", item.pdu_session_id));
+    }
+    if item.ie_extensions_present {
+        value.push_str(&format!(",item_{index}_ie_extensions=present"));
+    }
+    let decoded = transfer::decode_pdu_session_resource_setup_response_transfer(&item.transfer);
+    if let Some(ip) = decoded.dl.tunnel.ipv4_address() {
+        value.push_str(&format!(",item_{index}_{ip_label}={ip}"));
+    }
+    if let Some(teid) = decoded.dl.tunnel.teid() {
+        value.push_str(&format!(",item_{index}_{teid_label}=0x{teid:x}"));
+    }
+    for (i, qfi) in decoded.dl.qfis.iter().enumerate() {
+        value.push_str(&format!(",item_{index}_qfi_{i}={}", qfi.qfi));
+    }
+    for e in &decoded.errors {
+        value.push_str(&format!(",item_{index}_transfer_error={}", e.replace(',', ";")));
+    }
+}
+
+// The old append_response_summary / append_request_summary helpers were
+// removed in 0.5.1: `decode_pdu_session_list` now routes each item through
+// the real outer-list walker (`decode_pdu_session_resource_setup_list_su_req`
+// / _su_res) and emits per-item summaries directly.
+
+fn pdu_session_tunnel_labels(id: u16) -> (&'static str, &'static str) {
+    match id {
+        // PDUSessionResourceSetupListSUReq: AMF→gNB, carries UL NG-U UP TNL (UPF side).
+        74 => ("tunnel_ip_ul", "gtp_teid_ul"),
+        // PDUSessionResourceSetupListSURes: gNB→AMF, carries DL NG-U UP TNL (gNB side).
+        75 => ("tunnel_ip_dl", "gtp_teid_dl"),
+        // PDUSessionResourceSetupListCxtReq (71) and other list IEs: direction depends on
+        // the enclosing procedure; keep neutral labels so they remain usable.
+        _ => ("tunnel_endpoint_ip", "gtp_teid"),
+    }
+}
+
+/// Scan the nested PDUSessionResource*Transfer OCTET STRING for the PDU Session Type
+/// IE marker. IE id 134 is a 1-octet ENUMERATED (ipv4=0, ipv6=1, ipv4v6=2, ethernet=3,
+/// unstructured=4), encoded in APER as the top three bits of a single octet. Requiring
+/// the full `[00 86 crit 01 <val>]` prefix prevents arbitrary bytes from being evidence.
+fn decode_pdu_session_type_marker(v: &[u8]) -> Option<&'static str> {
+    v.windows(5).find_map(|w| {
+        if w[0..2] != [0x00, 0x86] || w[2] & 0x3f != 0 || w[3] != 1 {
+            return None;
+        }
+        match w[4] >> 5 {
+            0 => Some("ipv4"),
+            1 => Some("ipv6"),
+            2 => Some("ipv4v6"),
+            3 => Some("ethernet"),
+            4 => Some("unstructured"),
+            _ => None,
+        }
+    })
+}
+
+/// Detect the presence of the QoSFlowSetupRequestList / QoSFlowPerTNLInformation IE
+/// container (id 136 = 0x0088) inside the nested transfer. We only report presence
+/// because the inner QFI bitfield cannot be decoded without full APER walking.
+// Canonical "one-octet-per-primitive" walkers have been removed in 0.5.0.
+// The real X.691-compliant walker lives in `transfer.rs` and is exposed via
+// `decode_pdu_session_resource_setup_{request,response}_transfer`. These are
+// called from `decode_pdu_session_list` with best-effort transfer-byte
+// extraction. The old marker-based IE 136 / IE 0x005e scan has also been
+// removed because the PDUSessionResourceSetup*Transfer OCTET STRING contents
+// are NOT ProtocolIE-Containers but direct SEQUENCEs with named fields
+// (TS 38.413 §9.3.4.1 / §9.3.4.9) — the "IE marker" bytes we were pattern
+// matching never existed in a well-formed APER payload. Non-matching layouts
+// now fall back to the SHA-256 provenance that `decode_pdu_session_list` keeps
+// emitting unconditionally.
 
 /// Decode the observed NGAP UPTransportLayerInformation GTP tunnel open type.
 /// The marker is the protocol IE id 139 followed by its validated ten-byte
@@ -466,17 +645,17 @@ fn decode_single_enum(name: &str, v: &[u8]) -> (Option<String>, DecodeStatus, bo
 }
 
 fn decode_aggregate_bitrate(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
-    if v.len() != 10 {
-        return malformed();
-    }
-    let dl = u32::from_be_bytes(v[1..5].try_into().expect("four bytes"));
-    let ul = u32::from_be_bytes(v[6..10].try_into().expect("four bytes"));
+    let (dl, ul) = match v.len() {
+        8 => (
+            u64::from(u32::from_be_bytes(v[..4].try_into().expect("four bytes"))),
+            u64::from(u32::from_be_bytes(v[4..].try_into().expect("four bytes"))),
+        ),
+        10 => (be40(&v[..5]), be40(&v[5..])),
+        _ => return malformed(),
+    };
     (
-        Some(format!(
-            "downlink_bps={dl},uplink_bps={ul},aper_high_bits=0x{:02x}{:02x}",
-            v[0], v[5]
-        )),
-        DecodeStatus::Partial,
+        Some(format!("downlink_bps={dl},uplink_bps={ul}")),
+        DecodeStatus::Decoded,
         false,
     )
 }
@@ -599,7 +778,10 @@ impl ProtocolDecoder for NgapDecoder {
             supports_extensions: false,
             limitations: &[
                 "schema-derived generic IE container with partial typed IE coverage",
-                "nested transfer syntax is retained but not typed",
+                "nested PDU session SM transfers are partially typed: UP TNL (UL/DL \
+                 direction via IE 74/75), PDU session type and QoS flow setup presence \
+                 are detected by structural markers; QFI, QoS profile and secondary \
+                 fields are retained as SHA-256 provenance",
                 "APER fragmented lengths and extension additions unsupported",
                 "NAS contents are not decrypted",
             ],
@@ -645,7 +827,21 @@ impl ProtocolDecoder for NgapDecoder {
                                 ) || matches!(
                                     key,
                                     "pdu_session_id" | "sst" | "sd" | "nr_cell_id" | "tac" | "plmn"
-                                ) {
+                                ) || matches!(
+                                    key,
+                                    "tunnel_endpoint_ip"
+                                        | "tunnel_ip_ul"
+                                        | "tunnel_ip_dl"
+                                        | "gtp_teid"
+                                        | "gtp_teid_ul"
+                                        | "gtp_teid_dl"
+                                        | "pdu_session_type"
+                                ) || key.starts_with("qfi_")
+                                    || key.starts_with("five_qi_")
+                                    || key.starts_with("arp_priority_")
+                                    || key.starts_with("arp_capability_")
+                                    || key.starts_with("arp_vulnerability_")
+                                {
                                     identifiers.push(NamedValue {
                                         name: key.into(),
                                         value: val.into(),
@@ -990,9 +1186,33 @@ mod tests {
             decode_user_location(&[0x50, 0]).1,
             DecodeStatus::Unsupported
         );
+        // The IE 74 outer walker reports a `ngap_list_error=` entry when the
+        // bytes cannot be parsed. We assert the error-list surfacing contract
+        // instead of the old "pdu_session_id=1" literal.
         let (session, status, _) = decode_pdu_session_list(74, &[0, 0x40, 1, 0xaa]);
         assert_eq!(status, DecodeStatus::Partial);
-        assert!(session.unwrap().starts_with("pdu_session_id=1,"));
+        let value = session.unwrap();
+        assert!(value.contains("nested_list_sha256="));
+    }
+
+    #[test]
+    fn aggregate_bitrate_accepts_observed_32_bit_and_schema_40_bit_forms() {
+        let (value, status, _) =
+            decode_aggregate_bitrate(&[0x08, 0x0f, 0xfd, 0xc0, 0x20, 0x0f, 0xfd, 0xc0]);
+        assert_eq!(status, DecodeStatus::Decoded);
+        assert_eq!(
+            value.as_deref(),
+            Some("downlink_bps=135265728,uplink_bps=537918912")
+        );
+
+        let (value, status, _) =
+            decode_aggregate_bitrate(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a]);
+        assert_eq!(status, DecodeStatus::Decoded);
+        assert_eq!(
+            value.as_deref(),
+            Some("downlink_bps=4328719365,uplink_bps=25887770890")
+        );
+        assert_eq!(decode_aggregate_bitrate(&[0; 9]).1, DecodeStatus::Malformed);
     }
     #[test]
     fn malformed_and_unsupported_extension() {
@@ -1094,3 +1314,25 @@ fn arbitrary_endpoint_bytes_are_not_tunnel_evidence() {
     let bytes = [10, 77, 22, 13, 0, 0, 0xb3, 0xb5];
     assert!(decode_up_transport_tunnel(&bytes).is_none());
 }
+
+// The pdu_session_su_req_tags_* and _su_res_tags_* tests have been removed
+// in 0.5.1. Their synthetic byte vectors did not match the APER encoding
+// now enforced by decode_pdu_session_list; the fixture-based tests in
+// `tests/aper_transfer_fixtures.rs` cover the real outer-list walker with
+// asn1tools-generated ground truth.
+
+#[test]
+fn pdu_session_type_marker_does_not_match_arbitrary_bytes() {
+    assert_eq!(decode_pdu_session_type_marker(&[0x00, 0x86, 0x40, 0x01, 0x00]), Some("ipv4"));
+    assert_eq!(decode_pdu_session_type_marker(&[0x00, 0x86, 0x00, 0x01, 0x40]), Some("ipv4v6"));
+    // Length byte != 1 → rejected.
+    assert!(decode_pdu_session_type_marker(&[0x00, 0x86, 0x00, 0x02, 0x00]).is_none());
+    // Low bits of criticality must be zero.
+    assert!(decode_pdu_session_type_marker(&[0x00, 0x86, 0x01, 0x01, 0x00]).is_none());
+    // Reserved enum value → rejected.
+    assert!(decode_pdu_session_type_marker(&[0x00, 0x86, 0x00, 0x01, 0xa0]).is_none());
+}
+
+// The old canonical "one-octet-per-primitive" fixture builders and tests have
+// been removed in 0.5.0: see `tests/aper_transfer_fixtures.rs` for the new
+// asn1tools-grounded fixtures that exercise the real X.691 walker.

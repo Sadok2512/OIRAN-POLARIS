@@ -2,7 +2,7 @@ use oiran_decode::{decode_capture, write_jsonl, DecodeConfig};
 use std::{collections::HashMap, env, process};
 
 fn usage() {
-    eprintln!("usage: oiran-decode --input FILE --capture-id sha256:HEX --interface N2|N3|N4 --output FILE [--append] [--endpoint IP=FUNCTION]...");
+    eprintln!("usage: oiran-decode --input FILE --capture-id sha256:HEX --interface N2|N3|N4|SBI|S1-MME|S1-U|S11 --output FILE [--append] [--endpoint IP=FUNCTION]...");
 }
 fn main() {
     if let Err(e) = execute() {

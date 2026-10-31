@@ -1,0 +1,63 @@
+{
+  "schema_version": "1.0.0",
+  "certification_state": "SYNTHETIC_OFFLINE_PASS_CANDIDATE",
+  "fixture_id": "OIRAN-LTE-OFFLINE-CERT-V1-SYNTHETIC",
+  "technology": "LTE",
+  "capture_mode": "OFFLINE_SYNTHETIC_ONLY",
+  "real_capture": false,
+  "anonymization": {
+    "method": "SYNTHETIC_NO_REAL_IDENTITIES",
+    "reviewed_by": "ANR3-OFFLINE-TEST",
+    "clear_subscriber_identities_present": false,
+    "address_mapping": "RFC5737_DOCUMENTATION_PREFIXES",
+    "forbidden_fields": ["IMSI", "IMEI", "IMEISV", "MSISDN", "GUTI"]
+  },
+  "files": [
+    {
+      "interface": "S1-MME",
+      "protocol": "S1AP_SCTP_PPID_18",
+      "path": "synthetic/s1-mme.json",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "packet_count": 4,
+      "size_bytes": 2048,
+      "first_timestamp_utc": "2026-10-31T12:00:00.000000000Z",
+      "last_timestamp_utc": "2026-10-31T12:00:00.900000000Z"
+    },
+    {
+      "interface": "S11",
+      "protocol": "GTPV2_C_UDP_2123",
+      "path": "synthetic/s11.json",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "packet_count": 2,
+      "size_bytes": 1024,
+      "first_timestamp_utc": "2026-10-31T12:00:00.300000000Z",
+      "last_timestamp_utc": "2026-10-31T12:00:00.700000000Z"
+    },
+    {
+      "interface": "S1-U",
+      "protocol": "GTP_U_UDP_2152",
+      "path": "synthetic/s1-u.json",
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "packet_count": 2,
+      "size_bytes": 4096,
+      "first_timestamp_utc": "2026-10-31T12:00:00.500000000Z",
+      "last_timestamp_utc": "2026-10-31T12:00:00.800000000Z"
+    }
+  ],
+  "required_procedures": ["S1Setup", "Attach", "InitialContextSetup", "E-RABSetup", "CreateSession", "S1-U-G-PDU-UL", "S1-U-G-PDU-DL", "Detach"],
+  "expected": {
+    "ue_sessions": 2,
+    "eps_bearers": 2,
+    "distinct_s1u_teids": 2,
+    "uplink_packets": 1,
+    "downlink_packets": 1,
+    "correlation_edges": 4,
+    "first_timestamp_utc": "2026-10-31T12:00:00.000000000Z",
+    "last_timestamp_utc": "2026-10-31T12:00:00.900000000Z"
+  },
+  "approval": {
+    "anr1_reference": null,
+    "approved_at_utc": null,
+    "notes": "Synthetic offline fixture; not eligible for real certification."
+  }
+}

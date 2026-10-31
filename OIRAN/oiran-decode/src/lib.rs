@@ -1,10 +1,16 @@
 //! Reusable native decoder pipeline used by both the CLI and live capture service.
 
-use capture_pcap::{read_capture, transport_view, CapturePacket, TransportProtocol, TransportView};
+pub mod lte_fixture;
+
+use capture_pcap::{
+    transport_view, visit_capture, CapturePacket, TransportProtocol, TransportView,
+};
 use decoder_gtpu::GtpuDecoder;
+use decoder_gtpv2c::Gtpv2cDecoder;
 use decoder_ngap::NgapDecoder;
 use decoder_pfcp::PfcpDecoder;
-use decoder_sbi::decode_connections;
+use decoder_s1ap::S1apDecoder;
+use decoder_sbi::{decode_connections, SbiDecodeReport};
 use event_schema::{sha256_hex, Endpoint, NormalizedEvent, PacketReference};
 use plugin_runtime::{DecoderInput, ProtocolDecoder};
 use serde::{Deserialize, Serialize};
@@ -18,7 +24,34 @@ use std::{
 use transport_sctp::SctpReassembler;
 use transport_tcp::TcpReassembler;
 
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.6.0";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpRoute {
+    N3Gtpu,
+    N4Pfcp,
+    S1uGtpu,
+    S11Gtpv2c,
+}
+
+fn udp_route(interface: &str, source_port: u16, destination_port: u16) -> Option<UdpRoute> {
+    let has_port = |port| source_port == port || destination_port == port;
+    match interface {
+        "N3" if has_port(2152) => Some(UdpRoute::N3Gtpu),
+        "N4" if has_port(8805) => Some(UdpRoute::N4Pfcp),
+        "S1-U" if has_port(2152) => Some(UdpRoute::S1uGtpu),
+        "S11" if has_port(2123) => Some(UdpRoute::S11Gtpv2c),
+        _ => None,
+    }
+}
+
+fn sctp_route(interface: &str, ppid: u32) -> Option<&'static str> {
+    match (interface, ppid) {
+        ("N2", 60) => Some("N2"),
+        ("S1-MME", 18) => Some("S1-MME"),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DecodeConfig {
@@ -55,27 +88,64 @@ pub struct DecodeOutput {
 }
 
 pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
+    let mut events = Vec::new();
+    let report = decode_capture_streaming(config, |event| {
+        events.push(event);
+        Ok(())
+    })?;
+    events.sort_by_key(|event| {
+        (
+            event.timestamp.seconds,
+            event.timestamp.nanoseconds,
+            event
+                .packet_references
+                .first()
+                .map(|packet| packet.packet_number)
+                .unwrap_or(0),
+        )
+    });
+    Ok(DecodeOutput { events, report })
+}
+
+/// Decode a capture while transferring ownership of every normalized event to
+/// the caller as soon as its protocol context permits. UDP and SCTP events are
+/// emitted during packet visitation. Idle TCP connections are finalized and
+/// decoded during visitation, rather than being retained until capture EOF.
+/// The sink is therefore the only component deciding whether events are kept
+/// in memory, written to disk, or processed incrementally.
+pub fn decode_capture_streaming<F>(
+    config: &DecodeConfig,
+    mut sink: F,
+) -> Result<DecodeReport, String>
+where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
     validate_config(config)?;
-    let capture =
-        read_capture(&config.input, &config.capture_id).map_err(|error| error.to_string())?;
     let ngap = NgapDecoder;
+    let s1ap = S1apDecoder;
     let pfcp = PfcpDecoder;
     let gtpu = GtpuDecoder;
+    let gtpv2c = Gtpv2cDecoder;
     let mut sctp = SctpReassembler::new();
     let mut tcp = TcpReassembler::new();
-    let mut events = Vec::new();
+    let mut event_count = 0usize;
     let mut transport_errors = 0usize;
+    let mut sink_error = None;
+    let mut sbi_report = SbiDecodeReport::default();
 
-    for packet in &capture.packets {
+    let capture = visit_capture(&config.input, &config.capture_id, |packet| {
+        if sink_error.is_some() {
+            return;
+        }
         if packet.metadata.truncated {
             transport_errors += 1;
-            continue;
+            return;
         }
-        let view = match transport_view(packet) {
+        let view = match transport_view(&packet) {
             Ok(view) => view,
             Err(_) => {
                 transport_errors += 1;
-                continue;
+                return;
             }
         };
         match view.protocol {
@@ -84,17 +154,23 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
                     view.source_port.unwrap_or(0),
                     view.destination_port.unwrap_or(0),
                 );
-                if ports.0 == 8805 || ports.1 == 8805 {
-                    decode_udp(&pfcp, packet, &view, config, "N4", &mut events);
-                } else if ports.0 == 2152 || ports.1 == 2152 {
-                    decode_udp(&gtpu, packet, &view, config, "N3", &mut events);
+                if let Some(route) = udp_route(&config.interface, ports.0, ports.1) {
+                    let (decoder, interface): (&dyn ProtocolDecoder, &str) = match route {
+                        UdpRoute::N3Gtpu => (&gtpu, "N3"),
+                        UdpRoute::N4Pfcp => (&pfcp, "N4"),
+                        UdpRoute::S1uGtpu => (&gtpu, "S1-U"),
+                        UdpRoute::S11Gtpv2c => (&gtpv2c, "S11"),
+                    };
+                    let mut decoded = Vec::new();
+                    decode_udp(decoder, &packet, &view, config, interface, &mut decoded);
+                    emit_events(decoded, &mut sink, &mut event_count, &mut sink_error);
                 }
             }
             TransportProtocol::Sctp => {
-                for message in sctp.consume(packet, &view) {
-                    if message.ppid != 60 {
+                for message in sctp.consume(&packet, &view) {
+                    let Some(interface) = sctp_route(&config.interface, message.ppid) else {
                         continue;
-                    }
+                    };
                     let source = endpoint(
                         &message.source_ip,
                         Some(message.source_port),
@@ -110,59 +186,128 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
                         capture_id: &config.capture_id,
                         packet_references: &message.packet_references,
                         timestamp: &message.timestamp,
-                        interface: "N2",
+                        interface,
                         source_endpoint: source,
                         destination_endpoint: destination,
                         payload: &message.payload,
                         raw_payload_reference: &raw,
                     };
-                    events.extend(ngap.decode(&input).events);
+                    let decoded = if interface == "S1-MME" {
+                        s1ap.decode(&input).events
+                    } else {
+                        ngap.decode(&input).events
+                    };
+                    emit_events(
+                        decoded,
+                        &mut sink,
+                        &mut event_count,
+                        &mut sink_error,
+                    );
                 }
             }
-            TransportProtocol::Tcp => tcp.consume(packet, &view),
-            TransportProtocol::Other(_) => {}
+            TransportProtocol::Tcp if config.interface == "SBI" => {
+                tcp.consume(&packet, &view);
+                let finalized = tcp.take_finalized();
+                emit_sbi_connections(
+                    finalized,
+                    config,
+                    &mut sink,
+                    &mut event_count,
+                    &mut sink_error,
+                    &mut sbi_report,
+                );
+            }
+            TransportProtocol::Tcp | TransportProtocol::Other(_) => {}
         }
+    })
+    .map_err(|error| error.to_string())?;
+    if let Some(error) = sink_error.take() {
+        return Err(error);
     }
     let (sctp_errors, incomplete_sctp) = sctp.finish();
     let (connections, tcp_errors) = tcp.finish();
-    let (sbi_events, sbi_report) = decode_connections(
-        &connections,
-        &config.capture_id,
-        &config.interface,
-        &config.endpoints,
+    emit_sbi_connections(
+        connections,
+        config,
+        &mut sink,
+        &mut event_count,
+        &mut sink_error,
+        &mut sbi_report,
     );
-    events.extend(sbi_events);
-    events.sort_by_key(|event| {
-        (
-            event.timestamp.seconds,
-            event.timestamp.nanoseconds,
-            event
-                .packet_references
-                .first()
-                .map(|packet| packet.packet_number)
-                .unwrap_or(0),
-        )
-    });
-    if events.iter().any(|event| !event.has_complete_provenance()) {
-        return Err("decoder emitted an event without complete packet provenance".into());
+    if let Some(error) = sink_error {
+        return Err(error);
     }
-    Ok(DecodeOutput {
-        report: DecodeReport {
-            capture_format: format!("{:?}", capture.format),
-            packets: capture.packets.len(),
-            events: events.len(),
-            warnings: capture.warnings.len(),
-            transport_errors,
-            sctp_errors: sctp_errors.len(),
-            incomplete_sctp,
-            tcp_connections: sbi_report.tcp_connections,
-            tcp_errors: tcp_errors.len(),
-            http2_frames: sbi_report.http2_frames,
-            http2_streams: sbi_report.http2_streams,
-            sbi_transactions: sbi_report.sbi_transactions,
-        },
-        events,
+    Ok(DecodeReport {
+        capture_format: format!("{:?}", capture.format),
+        packets: capture.packets,
+        events: event_count,
+        warnings: capture.warnings.len(),
+        transport_errors,
+        sctp_errors: sctp_errors.len(),
+        incomplete_sctp,
+        tcp_connections: sbi_report.tcp_connections,
+        tcp_errors: tcp_errors.len(),
+        http2_frames: sbi_report.http2_frames,
+        http2_streams: sbi_report.http2_streams,
+        sbi_transactions: sbi_report.sbi_transactions,
     })
+}
+
+fn emit_events<F>(
+    events: impl IntoIterator<Item = NormalizedEvent>,
+    sink: &mut F,
+    event_count: &mut usize,
+    sink_error: &mut Option<String>,
+) where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
+    if sink_error.is_some() {
+        return;
+    }
+    for event in events {
+        if !event.has_complete_provenance() {
+            *sink_error =
+                Some("decoder emitted an event without complete packet provenance".into());
+            return;
+        }
+        if let Err(error) = sink(event) {
+            *sink_error = Some(error);
+            return;
+        }
+        *event_count += 1;
+    }
+}
+
+fn emit_sbi_connections<F>(
+    connections: Vec<transport_tcp::ReassembledConnection>,
+    config: &DecodeConfig,
+    sink: &mut F,
+    event_count: &mut usize,
+    sink_error: &mut Option<String>,
+    aggregate: &mut SbiDecodeReport,
+) where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
+    for connection in connections {
+        if sink_error.is_some() {
+            return;
+        }
+        let (events, report) = decode_connections(
+            std::slice::from_ref(&connection),
+            &config.capture_id,
+            &config.interface,
+            &config.endpoints,
+        );
+        aggregate.tcp_connections += report.tcp_connections;
+        aggregate.http2_frames += report.http2_frames;
+        aggregate.http2_streams += report.http2_streams;
+        aggregate.sbi_transactions += report.sbi_transactions;
+        aggregate.operations_decoded += report.operations_decoded;
+        aggregate.incomplete_streams += report.incomplete_streams;
+        aggregate.encrypted_connections += report.encrypted_connections;
+        aggregate.errors.extend(report.errors);
+        emit_events(events, sink, event_count, sink_error);
+    }
 }
 
 pub fn write_jsonl(path: &Path, events: &[NormalizedEvent], append: bool) -> Result<(), String> {
@@ -183,7 +328,17 @@ pub fn write_jsonl(path: &Path, events: &[NormalizedEvent], append: bool) -> Res
 /// Write a complete normalized-event stream without ever exposing a partial
 /// destination file. The caller must create and authorize the parent dataset
 /// directory before invoking this function.
-pub fn write_jsonl_atomic(path: &Path, events: &[NormalizedEvent]) -> Result<(), String> {
+///
+/// 0.4.5 — accepts any `IntoIterator<Item = &NormalizedEvent>` so a caller
+/// that produces events lazily does not have to materialise the full `Vec`
+/// before writing. The function still writes line-by-line through a bounded
+/// `BufWriter`; the public API change lifts the "collect first, write next"
+/// restriction that previously forced live-probe to hold the entire decoded
+/// stream in memory on top of the pcap bytes.
+pub fn write_jsonl_atomic<'a, I>(path: &Path, events: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = &'a NormalizedEvent>,
+{
     let parent = path
         .parent()
         .ok_or_else(|| format!("dataset output has no parent: {}", path.display()))?;
@@ -229,8 +384,11 @@ fn validate_config(config: &DecodeConfig) -> Result<(), String> {
     if !config.capture_id.starts_with("sha256:") || config.capture_id.len() != 71 {
         return Err("capture ID must be sha256: followed by 64 hex digits".into());
     }
-    if !matches!(config.interface.as_str(), "N2" | "N3" | "N4" | "SBI") {
-        return Err("interface must be N2, N3, N4 or SBI".into());
+    if !matches!(
+        config.interface.as_str(),
+        "N2" | "N3" | "N4" | "SBI" | "S1-MME" | "S1-U" | "S11"
+    ) {
+        return Err("interface must be N2, N3, N4, SBI, S1-MME, S1-U or S11".into());
     }
     Ok(())
 }
@@ -315,6 +473,32 @@ mod tests {
             endpoints: HashMap::new(),
         };
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn routes_lte_without_aliasing_five_g_planes() {
+        assert_eq!(sctp_route("S1-MME", 18), Some("S1-MME"));
+        assert_eq!(sctp_route("N2", 60), Some("N2"));
+        assert_eq!(sctp_route("S1-MME", 60), None);
+        assert_eq!(sctp_route("N2", 18), None);
+        assert_eq!(udp_route("S1-U", 2152, 9999), Some(UdpRoute::S1uGtpu));
+        assert_eq!(udp_route("N3", 2152, 9999), Some(UdpRoute::N3Gtpu));
+        assert_eq!(udp_route("S11", 2123, 9999), Some(UdpRoute::S11Gtpv2c));
+        assert_eq!(udp_route("N4", 8805, 9999), Some(UdpRoute::N4Pfcp));
+        assert_eq!(udp_route("S11", 2152, 9999), None);
+    }
+
+    #[test]
+    fn accepts_explicit_lte_interfaces() {
+        for interface in ["S1-MME", "S1-U", "S11"] {
+            let config = DecodeConfig {
+                input: "unused.pcap".into(),
+                capture_id: format!("sha256:{}", "0".repeat(64)),
+                interface: interface.into(),
+                endpoints: HashMap::new(),
+            };
+            assert!(validate_config(&config).is_ok(), "{interface}");
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{self, BufRead};
 
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.5.0";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PacketRef {
@@ -221,6 +221,214 @@ pub struct DiscoveryResult {
     pub event_accounting: BTreeMap<String, usize>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LteTunnelCounters {
+    pub teid: String,
+    pub uplink_packets: usize,
+    pub downlink_packets: usize,
+    pub unknown_direction_packets: usize,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LteSession {
+    pub session_id: String,
+    pub technology: String,
+    pub ue_pseudonym: String,
+    pub enb_ue_s1ap_id: Option<String>,
+    pub mme_ue_s1ap_id: Option<String>,
+    pub eps_bearer_ids: Vec<String>,
+    pub s11_f_teids: Vec<String>,
+    pub tunnels: Vec<LteTunnelCounters>,
+    pub procedures: Vec<String>,
+    pub interfaces: Vec<String>,
+    pub state: String,
+    pub start_timestamp_ns: i128,
+    pub end_timestamp_ns: i128,
+    pub duration_ns: i128,
+    pub event_ids: Vec<String>,
+    pub limitations: Vec<String>,
+}
+
+/// Builds a deterministic LTE preparation view from normalized S1AP/EPS NAS,
+/// S11 and S1-U events. It deliberately does not infer UE identity from timing
+/// and does not claim an S1AP/S11 bridge until an explicit bearer identifier is
+/// emitted by both decoders.
+pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
+    let mut lte = events
+        .iter()
+        .filter(|event| {
+            matches!(event.interface.as_str(), "S1-MME" | "S11" | "S1-U")
+                && matches!(
+                    event.protocol.as_str(),
+                    "S1AP" | "NAS-EPS-MM" | "NAS-EPS-SM" | "GTPv2-C" | "GTP-U"
+                )
+        })
+        .collect::<Vec<_>>();
+    lte.sort_by_key(|event| (event.timestamp_ns, event.packet_number(), &event.event_id));
+    let mut contexts = BTreeSet::new();
+    for event in lte.iter().filter(|event| event.protocol == "S1AP") {
+        let enb = event.first_identifier("enb_ue_s1ap_id").map(str::to_owned);
+        let mme = event.first_identifier("mme_ue_s1ap_id").map(str::to_owned);
+        if enb.is_some() || mme.is_some() {
+            contexts.insert((event.capture_id.clone(), enb, mme));
+        }
+    }
+    let mut sessions = Vec::new();
+    for (capture_id, enb, mme) in contexts {
+        let matches_context = |event: &&EventRecord| {
+            event.capture_id == capture_id
+                && event.interface == "S1-MME"
+                && enb.as_deref().map_or(true, |value| {
+                    event.first_identifier("enb_ue_s1ap_id") == Some(value)
+                })
+                && mme.as_deref().map_or(true, |value| {
+                    event.first_identifier("mme_ue_s1ap_id") == Some(value)
+                })
+        };
+        let mut associated = lte
+            .iter()
+            .copied()
+            .filter(matches_context)
+            .collect::<Vec<_>>();
+        let observed_pseudonym = associated
+            .iter()
+            .find_map(|event| event.first_identifier("imsi_pseudonym"))
+            .map(str::to_owned);
+        let ue_pseudonym = observed_pseudonym.clone().unwrap_or_else(|| {
+            stable_id(
+                "LTE-UE",
+                &format!("{capture_id}|{:?}|{:?}", enb, mme),
+            )
+        });
+        let s11 = observed_pseudonym
+            .as_deref()
+            .map(|pseudonym| {
+                lte.iter()
+                    .copied()
+                    .filter(|event| {
+                        event.capture_id == capture_id
+                            && event.interface == "S11"
+                            && event.first_identifier("imsi_pseudonym") == Some(pseudonym)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        associated.extend(s11.iter().copied());
+        let collect_ids = |source: &[&EventRecord], names: &[&str]| {
+            source
+                .iter()
+                .flat_map(|event| {
+                    event
+                        .identifiers
+                        .iter()
+                        .filter(|(name, _)| names.contains(&name.as_str()))
+                        .map(|(_, value)| value.clone())
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let eps_bearer_ids = collect_ids(
+            &associated,
+            &["eps_bearer_identity", "ebi", "bearer_ebi"],
+        );
+        let s11_f_teids = collect_ids(&s11, &["f_teid", "bearer_f_teid"]);
+        let s1u = lte
+            .iter()
+            .copied()
+            .filter(|event| {
+                event.capture_id == capture_id
+                    && event.interface == "S1-U"
+                    && event
+                        .first_identifier("teid")
+                        .is_some_and(|teid| s11_f_teids.iter().any(|value| value == teid))
+            })
+            .collect::<Vec<_>>();
+        associated.extend(s1u.iter().copied());
+        associated.sort_by_key(|event| (event.timestamp_ns, event.packet_number(), &event.event_id));
+        associated.dedup_by(|left, right| left.event_id == right.event_id);
+        let mut tunnel_map: BTreeMap<String, LteTunnelCounters> = BTreeMap::new();
+        for event in &s1u {
+            let teid = event.first_identifier("teid").unwrap();
+            let counters = tunnel_map.entry(teid.to_owned()).or_insert(LteTunnelCounters {
+                teid: teid.to_owned(),
+                uplink_packets: 0,
+                downlink_packets: 0,
+                unknown_direction_packets: 0,
+                bytes: 0,
+            });
+            match event.direction.as_str() {
+                "UPLINK" | "RAN_TO_CORE" => counters.uplink_packets += 1,
+                "DOWNLINK" | "CORE_TO_RAN" => counters.downlink_packets += 1,
+                _ => counters.unknown_direction_packets += 1,
+            }
+            counters.bytes += event
+                .packet_references
+                .first()
+                .map(|packet| u64::from(packet.captured_length))
+                .unwrap_or(0);
+        }
+        let procedures = associated
+            .iter()
+            .map(|event| event.message_name.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let interfaces = associated
+            .iter()
+            .map(|event| event.interface.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let released = procedures
+            .iter()
+            .any(|name| name.contains("Detach") || name == "UEContextReleaseComplete");
+        let bearer_ready = procedures
+            .iter()
+            .any(|name| name == "E-RABSetupResponse" || name == "InitialContextSetupResponse");
+        let state = if released {
+            "RELEASED"
+        } else if bearer_ready && !tunnel_map.is_empty() {
+            "ACTIVE_WITH_USER_PLANE"
+        } else {
+            "INCOMPLETE"
+        };
+        let start_timestamp_ns = associated.first().map(|event| event.timestamp_ns).unwrap_or(0);
+        let end_timestamp_ns = associated.last().map(|event| event.timestamp_ns).unwrap_or(0);
+        sessions.push(LteSession {
+            session_id: stable_id(
+                "lte-session",
+                &format!("{capture_id}|{ue_pseudonym}|{:?}|{:?}", enb, mme),
+            ),
+            technology: "LTE".into(),
+            ue_pseudonym,
+            enb_ue_s1ap_id: enb,
+            mme_ue_s1ap_id: mme,
+            eps_bearer_ids,
+            s11_f_teids,
+            tunnels: tunnel_map.into_values().collect(),
+            procedures,
+            interfaces,
+            state: state.into(),
+            start_timestamp_ns,
+            end_timestamp_ns,
+            duration_ns: end_timestamp_ns.saturating_sub(start_timestamp_ns),
+            event_ids: associated
+                .iter()
+                .map(|event| event.event_id.clone())
+                .collect(),
+            limitations: vec![
+                "Offline synthetic certification only; real LTE evidence requires ANR1".into(),
+                "S11 association requires an exact shared pseudonym; S1-U requires an exact S11 F-TEID".into(),
+                "No timestamp-only S1AP/S11/S1-U identity association is performed".into(),
+            ],
+        });
+    }
+    sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    sessions
+}
+
 pub fn load_jsonl<R: BufRead>(reader: R) -> Result<Vec<EventRecord>, String> {
     let mut events = Vec::new();
     for (line_no, line) in reader.lines().enumerate() {
@@ -307,6 +515,17 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
         .filter_map(Value::as_str)
         .map(ToOwned::to_owned)
         .collect();
+    // Keep only the top-level fields consumed after normalization. Retaining
+    // the complete source JSON duplicated the (potentially large)
+    // information-elements tree already stored on EventRecord and caused the
+    // continuous importer to exceed its 256 MiB service cgroup while building
+    // session/call-flow indexes.
+    let mut compact_source = serde_json::Map::new();
+    for key in ["schema_version", "procedure", "sbi"] {
+        if let Some(value) = v.get(key) {
+            compact_source.insert(key.to_string(), value.clone());
+        }
+    }
     Ok(EventRecord {
         event_id: string(&["event_id"])?,
         parent_event_id: v
@@ -341,7 +560,7 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
         raw_payload_reference: string(&["raw_payload_reference"])?,
         packet_references,
         errors,
-        source_json: v,
+        source_json: Value::Object(compact_source),
     })
 }
 
@@ -555,9 +774,9 @@ pub fn reconstruct(mut events: Vec<EventRecord>, hints: ReconstructionHints) -> 
 /// Discovers independently scoped UE, PDU, PFCP and GTP-U state without assuming
 /// a single subscriber or a single PDU session. The function is deterministic and
 /// side-effect free so repeated ingestion of the same observations is idempotent.
-pub fn discover_sessions(mut events: Vec<EventRecord>) -> DiscoveryResult {
-    deterministic_sort(&mut events);
-    let duplicate_observations = duplicate_observation_keys(&events);
+pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
+    deterministic_sort(events);
+    let duplicate_observations = duplicate_observation_keys(events);
     let mut seen = HashSet::new();
     events.retain(|event| seen.insert(observation_key(event)));
 
@@ -733,7 +952,7 @@ pub fn discover_sessions(mut events: Vec<EventRecord>) -> DiscoveryResult {
     let assigned: HashSet<_> = event_context.keys().cloned().collect();
     let mut background_event_ids = Vec::new();
     let mut unmatched_event_ids = Vec::new();
-    for event in &events {
+    for event in events.iter() {
         if assigned.contains(&event.event_id)
             || pfcp_sessions
                 .iter()
@@ -1010,7 +1229,7 @@ fn discover_pfcp_sessions(events: &[EventRecord]) -> Vec<DiscoveredPfcpSession> 
     sessions
         .into_iter()
         .map(|session| {
-            let events = session.events;
+            let mut events = session.events;
             let state = if events
                 .iter()
                 .any(|event| event.message_name.contains("Deletion Response"))
@@ -1255,7 +1474,7 @@ mod tests {
 
     #[test]
     fn reconstructs_ue_and_pdu_context() {
-        let events = vec![event(
+        let mut events = vec![event(
             "n",
             "NGAP",
             "PDUSessionResourceSetupResponse",
@@ -1279,7 +1498,7 @@ mod tests {
 
     #[test]
     fn reconstructs_pfcp_session() {
-        let events = vec![event(
+        let mut events = vec![event(
             "p",
             "PFCP",
             "PFCP Session Establishment Response",
@@ -1349,7 +1568,7 @@ mod tests {
             &[("ran_ue_ngap_id", "11"), ("amf_ue_ngap_id", "101")],
             98,
         );
-        let result = discover_sessions(vec![parent, unrelated, child]);
+        let result = discover_sessions(&mut vec![parent, unrelated, child]);
         assert_eq!(result.ue_contexts.len(), 2);
         assert_eq!(result.pdu_sessions.len(), 1);
         let session = &result.pdu_sessions[0];
@@ -1364,7 +1583,7 @@ mod tests {
 
     #[test]
     fn discovers_multiple_ues_and_multiple_pdu_sessions() {
-        let events = vec![
+        let mut events = vec![
             event(
                 "ue-a-1",
                 "NGAP",
@@ -1406,7 +1625,7 @@ mod tests {
                 4,
             ),
         ];
-        let result = discover_sessions(events);
+        let result = discover_sessions(&mut events);
         assert_eq!(result.ue_contexts.len(), 2);
         assert_eq!(result.pdu_sessions.len(), 3);
         assert_eq!(
@@ -1429,7 +1648,7 @@ mod tests {
 
     #[test]
     fn identifier_reuse_after_release_creates_new_lifecycle() {
-        let events = vec![
+        let mut events = vec![
             event(
                 "first",
                 "NGAP",
@@ -1452,7 +1671,7 @@ mod tests {
                 3,
             ),
         ];
-        let result = discover_sessions(events);
+        let result = discover_sessions(&mut events);
         assert_eq!(result.ue_contexts.len(), 2);
         assert_eq!(
             result
@@ -1477,8 +1696,8 @@ mod tests {
             ],
             1,
         );
-        let first = discover_sessions(vec![original.clone(), original.clone()]);
-        let second = discover_sessions(vec![original]);
+        let first = discover_sessions(&mut vec![original.clone(), original.clone()]);
+        let second = discover_sessions(&mut vec![original]);
         assert_eq!(first.duplicate_observations.len(), 1);
         assert_eq!(first.pdu_sessions.len(), 1);
         assert_eq!(
@@ -1512,8 +1731,8 @@ mod tests {
             ],
             2,
         );
-        let a = discover_sessions(vec![second.clone(), first.clone()]);
-        let b = discover_sessions(vec![first, second]);
+        let a = discover_sessions(&mut vec![second.clone(), first.clone()]);
+        let b = discover_sessions(&mut vec![first, second]);
         assert_eq!(a.pdu_sessions[0].session_id, b.pdu_sessions[0].session_id);
         assert_eq!(a.pdu_sessions[0].event_ids, b.pdu_sessions[0].event_ids);
     }
@@ -1559,7 +1778,7 @@ mod tests {
             ],
             20,
         ));
-        let result = discover_sessions(events);
+        let result = discover_sessions(&mut events);
         assert_eq!(result.ue_contexts.len(), 5);
         assert_eq!(result.pdu_sessions.len(), 6);
         assert_eq!(
@@ -1665,7 +1884,7 @@ mod tests {
             events.push(gtpu);
         }
 
-        let result = discover_sessions(events);
+        let result = discover_sessions(&mut events);
         assert_eq!(result.ue_contexts.len(), 3);
         assert_eq!(result.pdu_sessions.len(), 3);
         assert_eq!(result.pfcp_sessions.len(), 3);
@@ -1698,7 +1917,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl");
-        let result = discover_sessions(load_path(&path).unwrap());
+        let result = discover_sessions(&mut load_path(&path).unwrap());
         assert_eq!(result.event_accounting["source_events"], 54);
         assert_eq!(result.ue_contexts.len(), 2);
         assert_eq!(result.pdu_sessions.len(), 1);
@@ -1708,5 +1927,166 @@ mod tests {
             .gtpu_tunnels
             .iter()
             .all(|tunnel| tunnel.related_pfcp_session.is_some()));
+    }
+
+    #[test]
+    fn prepares_lte_session_and_s1u_counters_without_timing_identity_join() {
+        let mut s1ap = event(
+            "s1ap",
+            "S1AP",
+            "InitialContextSetupResponse",
+            &[("enb_ue_s1ap_id", "41"), ("mme_ue_s1ap_id", "7")],
+            1,
+        );
+        s1ap.interface = "S1-MME".into();
+        let mut nas = event(
+            "nas",
+            "NAS-EPS-MM",
+            "Attach Complete",
+            &[
+                ("enb_ue_s1ap_id", "41"),
+                ("mme_ue_s1ap_id", "7"),
+                ("imsi_pseudonym", "subscriber-opaque-a"),
+            ],
+            2,
+        );
+        nas.interface = "S1-MME".into();
+        let mut s11 = event(
+            "s11",
+            "GTPv2-C",
+            "CreateSessionResponse",
+            &[
+                ("imsi_pseudonym", "subscriber-opaque-a"),
+                ("bearer_ebi", "5"),
+                ("bearer_f_teid", "0x01020304"),
+            ],
+            3,
+        );
+        s11.interface = "S11".into();
+        let mut uplink = event(
+            "s1u-ul",
+            "GTP-U",
+            "G-PDU",
+            &[("teid", "0x01020304")],
+            4,
+        );
+        uplink.interface = "S1-U".into();
+        uplink.direction = "UPLINK".into();
+        uplink.packet_references[0].captured_length = 128;
+        let mut downlink = uplink.clone();
+        downlink.event_id = "s1u-dl".into();
+        downlink.direction = "DOWNLINK".into();
+        downlink.timestamp_ns = uplink.timestamp_ns + 1;
+        downlink.packet_references[0].packet_number = 5;
+        downlink.packet_references[0].captured_length = 256;
+
+        let sessions = discover_lte_sessions(&[s1ap, nas, s11, uplink, downlink]);
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.technology, "LTE");
+        assert_eq!(session.ue_pseudonym, "subscriber-opaque-a");
+        assert_eq!(session.state, "ACTIVE_WITH_USER_PLANE");
+        assert_eq!(session.eps_bearer_ids, vec!["5"]);
+        assert_eq!(session.s11_f_teids, vec!["0x01020304"]);
+        assert_eq!(session.tunnels[0].uplink_packets, 1);
+        assert_eq!(session.tunnels[0].downlink_packets, 1);
+        assert_eq!(session.tunnels[0].bytes, 384);
+        assert_eq!(session.start_timestamp_ns, 1_000_000_001);
+        assert_eq!(session.end_timestamp_ns, 1_000_000_005);
+        assert_eq!(session.duration_ns, 4);
+    }
+
+    #[test]
+    fn partitions_two_lte_ues_by_explicit_context_pseudonym_and_teid() {
+        let mut events = Vec::new();
+        for (ordinal, pseudonym, enb, mme, teid) in [
+            (1u64, "subscriber-opaque-a", "41", "7", "0x01020304"),
+            (2u64, "subscriber-opaque-b", "42", "8", "0x05060708"),
+        ] {
+            let mut s1ap = event(
+                &format!("s1ap-{ordinal}"),
+                "S1AP",
+                "InitialContextSetupResponse",
+                &[("enb_ue_s1ap_id", enb), ("mme_ue_s1ap_id", mme)],
+                ordinal * 10,
+            );
+            s1ap.interface = "S1-MME".into();
+            let mut nas = event(
+                &format!("nas-{ordinal}"),
+                "NAS-EPS-MM",
+                "Attach Complete",
+                &[
+                    ("enb_ue_s1ap_id", enb),
+                    ("mme_ue_s1ap_id", mme),
+                    ("imsi_pseudonym", pseudonym),
+                ],
+                ordinal * 10 + 1,
+            );
+            nas.interface = "S1-MME".into();
+            let mut s11 = event(
+                &format!("s11-{ordinal}"),
+                "GTPv2-C",
+                "CreateSessionResponse",
+                &[
+                    ("imsi_pseudonym", pseudonym),
+                    ("bearer_ebi", "5"),
+                    ("bearer_f_teid", teid),
+                ],
+                ordinal * 10 + 2,
+            );
+            s11.interface = "S11".into();
+            let mut s1u = event(
+                &format!("s1u-{ordinal}"),
+                "GTP-U",
+                "G-PDU",
+                &[("teid", teid)],
+                ordinal * 10 + 3,
+            );
+            s1u.interface = "S1-U".into();
+            s1u.direction = if ordinal == 1 { "UPLINK" } else { "DOWNLINK" }.into();
+            events.extend([s1ap, nas, s11, s1u]);
+        }
+        let sessions = discover_lte_sessions(&events);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.ue_pseudonym.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["subscriber-opaque-a", "subscriber-opaque-b"])
+        );
+        assert!(sessions.iter().all(|session| session.tunnels.len() == 1));
+        assert!(sessions.iter().all(|session| session.event_ids.len() == 4));
+        assert_ne!(sessions[0].tunnels[0].teid, sessions[1].tunnels[0].teid);
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/lte-offline-certification-synthetic-manifest.json"
+        ))
+        .unwrap();
+        let expected = &manifest["expected"];
+        assert_eq!(sessions.len() as u64, expected["ue_sessions"].as_u64().unwrap());
+        assert_eq!(
+            sessions.iter().map(|session| session.eps_bearer_ids.len()).sum::<usize>() as u64,
+            expected["eps_bearers"].as_u64().unwrap()
+        );
+        assert_eq!(
+            sessions.iter().map(|session| session.tunnels.len()).sum::<usize>() as u64,
+            expected["distinct_s1u_teids"].as_u64().unwrap()
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .flat_map(|session| &session.tunnels)
+                .map(|tunnel| tunnel.uplink_packets)
+                .sum::<usize>() as u64,
+            expected["uplink_packets"].as_u64().unwrap()
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .flat_map(|session| &session.tunnels)
+                .map(|tunnel| tunnel.downlink_packets)
+                .sum::<usize>() as u64,
+            expected["downlink_packets"].as_u64().unwrap()
+        );
     }
 }

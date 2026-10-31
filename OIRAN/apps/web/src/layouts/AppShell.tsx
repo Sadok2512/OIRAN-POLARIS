@@ -134,7 +134,7 @@ export function AppShell() {
             <input aria-label="Global search" placeholder="Search session or message" value={search} onChange={(event) => setSearch(event.target.value)} />
           </form>
           <select aria-label="Environment"><option>Certified Lab</option></select>
-          <select aria-label="Technology"><option>5G SA</option><option disabled>LTE · Not certified</option></select>
+          <select aria-label="Technology"><option>5G SA</option><option>LTE · Prepared (synthetic only)</option></select>
           <span className="connection"><i />vProbe connected</span>
           <div className="interface-indicators">
             {metrics.data?.interfaces.map((item) => <span key={item.interface}><i />{item.interface} REF</span>)}

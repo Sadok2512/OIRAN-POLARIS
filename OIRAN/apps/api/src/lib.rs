@@ -1,5 +1,7 @@
 //! Versioned, read-only HTTP adapter for certified OIRAN artifacts.
 
+mod probe_registry;
+
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -12,7 +14,11 @@ use callflow_schema::{build_callflow, CallFlow};
 use dataset_registry::{CaptureRecord, DatasetRecord, DatasetRegistry};
 use disk_safety::{assess, capture_budget, measure_path, rotation_plan, Policy};
 use event_schema::sha256_hex;
-use live_probe::{CaptureManager, CaptureRequest, ContinuousImportConfig};
+use live_probe::{
+    read_callflow_page, CaptureManager, CaptureRequest, ContinuousImportConfig,
+    DEFAULT_CALLFLOW_PAGE_EVENTS, DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES, MAX_CALLFLOW_PAGE_EVENTS,
+};
+use probe_registry::{CreateError as ProbeCreateError, ProbeInput, ProbeRecord, ProbeRegistry};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use session_engine::{
@@ -30,8 +36,10 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.3.0";
-pub const PLATFORM_VERSION: &str = "2.3.0-dev";
+pub const API_VERSION: &str = "2.5.4";
+pub const PLATFORM_VERSION: &str = "2.5.4";
+const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
+const CSRF_HEADER: &str = "x-csrf-token";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -41,6 +49,7 @@ pub struct AppState {
 struct Inner {
     flows: BTreeMap<String, CallFlow>,
     flow_values: BTreeMap<String, Value>,
+    flow_paths: BTreeMap<String, PathBuf>,
     primary_session_id: String,
     manifest: Value,
     captures: Vec<Value>,
@@ -49,6 +58,7 @@ struct Inner {
     storage_path: PathBuf,
     html_export: PathBuf,
     capture_manager: CaptureManager,
+    probe_registry: ProbeRegistry,
     derived_import_root: PathBuf,
     operator_token_sha256: Option<String>,
     administrator_token_sha256: Option<String>,
@@ -61,6 +71,7 @@ pub struct ApiConfig {
     pub callflow_json: PathBuf,
     pub callflow_html: PathBuf,
     pub capture_root: PathBuf,
+    pub probe_registry_path: PathBuf,
     pub derived_import_root: PathBuf,
     pub capture_execution_enabled: bool,
     pub operator_token_sha256: Option<String>,
@@ -69,6 +80,7 @@ pub struct ApiConfig {
     pub continuous_native_capture: bool,
     pub continuous_import_source: Option<PathBuf>,
     pub continuous_historical_n2_bootstrap: Option<PathBuf>,
+    pub continuous_max_segment_bytes: u64,
 }
 
 impl ApiConfig {
@@ -81,6 +93,9 @@ impl ApiConfig {
             capture_root: std::env::var_os("OIRAN_CAPTURE_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| workspace.join("runtime/live-captures")),
+            probe_registry_path: std::env::var_os("OIRAN_PROBE_REGISTRY_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| workspace.join("runtime/probe-registry.json")),
             derived_import_root: std::env::var_os("OIRAN_DERIVED_IMPORT_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| workspace.join("benchmarks/E2E_002")),
@@ -96,6 +111,10 @@ impl ApiConfig {
                 .map(PathBuf::from),
             continuous_historical_n2_bootstrap: std::env::var_os("OIRAN_CONTINUOUS_BOOTSTRAP_N2")
                 .map(PathBuf::from),
+            continuous_max_segment_bytes: std::env::var("OIRAN_CONTINUOUS_MAX_SEGMENT_BYTES")
+                .ok()
+                .map(|value| value.parse::<u64>().unwrap_or(0))
+                .unwrap_or(DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES),
         }
     }
 }
@@ -113,6 +132,12 @@ impl AppState {
             config.capture_root.clone(),
             config.capture_execution_enabled,
         )?;
+        if !config.probe_registry_path.starts_with(&workspace)
+            && !config.probe_registry_path.starts_with("/var/lib/oiran")
+            && !cfg!(test)
+        {
+            return Err("probe registry path escapes the allowlist".into());
+        }
         if config.continuous_import_enabled {
             if config.continuous_native_capture && config.continuous_import_source.is_some() {
                 return Err("native continuous capture cannot also import collector files".into());
@@ -138,6 +163,13 @@ impl AppState {
                 }
                 ContinuousImportConfig::bounded(source)
             };
+            let mut continuous = continuous;
+            continuous.max_segment_bytes = config.continuous_max_segment_bytes;
+            continuous.max_owned_bytes = continuous.max_owned_bytes.max(
+                config
+                    .continuous_max_segment_bytes
+                    .saturating_add(64 * 1024 * 1024),
+            );
             capture_manager.start_continuous_import(continuous)?;
         }
         Self::load_with_capture_manager(config, capture_manager)
@@ -152,6 +184,7 @@ impl AppState {
         let callflow_json = config.callflow_json.canonicalize().map_err(io_error)?;
         let html_export = config.callflow_html.canonicalize().map_err(io_error)?;
         let capture_root = config.capture_root;
+        let probe_registry = ProbeRegistry::load(config.probe_registry_path)?;
         let derived_import_root = config
             .derived_import_root
             .canonicalize()
@@ -181,6 +214,7 @@ impl AppState {
         let captures = build_captures(&dataset_dir, &manifest)?;
         let mut flows = BTreeMap::from([(flow.session_id.clone(), flow)]);
         let mut flow_values = BTreeMap::from([(primary_session_id.clone(), flow_value)]);
+        let mut flow_paths = BTreeMap::from([(primary_session_id.clone(), callflow_json.clone())]);
         let callflow_dir = dataset_dir.join("callflows");
         if callflow_dir.is_dir() {
             let mut paths = fs::read_dir(&callflow_dir)
@@ -203,11 +237,12 @@ impl AppState {
                 {
                     return Err(format!("duplicate session id {}", candidate.session_id));
                 }
+                flow_paths.insert(candidate.session_id.clone(), path);
                 flow_values.insert(candidate.session_id, candidate_value);
             }
         }
         let events = load_path(&dataset_dir.join("oiran_events.jsonl"))?;
-        let discovery = discover_sessions(events.clone());
+        let discovery = discover_sessions(&mut events.clone());
         for session in &discovery.pdu_sessions {
             let represented = flows.values().any(|flow| {
                 session
@@ -306,6 +341,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 flows,
                 flow_values,
+                flow_paths,
                 primary_session_id,
                 manifest,
                 captures,
@@ -314,6 +350,7 @@ impl AppState {
                 storage_path: workspace,
                 html_export,
                 capture_manager,
+                probe_registry,
                 derived_import_root,
                 operator_token_sha256: config.operator_token_sha256,
                 administrator_token_sha256: config.administrator_token_sha256,
@@ -365,7 +402,7 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/version", get(version))
         .route("/auth/me", get(auth_me))
         .route("/modules", get(modules))
-        .route("/probes", get(probes))
+        .route("/probes", get(probes).post(create_probe))
         .route("/probes/:id", get(probe))
         .route("/probes/:id/interfaces", get(probe_interfaces))
         .route("/interfaces", get(interfaces))
@@ -384,6 +421,7 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/captures/:id", get(capture))
         .route("/captures/:id/context", get(capture_context))
         .route("/captures/:id/metrics", get(capture_metrics))
+        .route("/captures/:id/download", get(capture_download_policy))
         .route("/captures/validate", post(validate_capture))
         .route("/captures/start", post(start_capture))
         .route("/captures/:id/stop", post(stop_capture))
@@ -434,6 +472,10 @@ fn flow_for<'a>(state: &'a AppState, id: &str) -> Option<&'a CallFlow> {
 
 fn flow_value_for<'a>(state: &'a AppState, id: &str) -> Option<&'a Value> {
     state.inner.flow_values.get(id)
+}
+
+fn flow_path_for<'a>(state: &'a AppState, id: &str) -> Option<&'a FsPath> {
+    state.inner.flow_paths.get(id).map(PathBuf::as_path)
 }
 
 fn live_flow_for(state: &AppState, id: &str) -> Option<(String, CallFlow)> {
@@ -539,6 +581,34 @@ fn require_operator(state: &AppState, headers: &HeaderMap) -> Result<Role, Respo
     }
 }
 
+fn require_operator_csrf(state: &AppState, headers: &HeaderMap) -> Result<Role, Response> {
+    let role = require_operator(state, headers)?;
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::FORBIDDEN,
+                "CSRF_REQUIRED",
+                "a valid CSRF proof header is required",
+            )
+        })?;
+    let expected = sha256_hex(format!("oiran-csrf-v1:{bearer}").as_bytes());
+    let supplied = headers
+        .get(CSRF_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if supplied != Some(expected.as_str()) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "CSRF_REQUIRED",
+            "a valid CSRF proof header is required",
+        ));
+    }
+    Ok(role)
+}
+
 async fn auth_me(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
     let role = role_from_headers(&state, &headers);
     let mut permissions = vec![
@@ -550,7 +620,12 @@ async fn auth_me(State(state): State<AppState>, headers: HeaderMap) -> Json<Valu
         "exports.read",
     ];
     if role.can_control() {
-        permissions.extend(["captures.validate", "captures.start", "captures.stop"]);
+        permissions.extend([
+            "captures.validate",
+            "captures.start",
+            "captures.stop",
+            "probes.create",
+        ]);
     }
     ok(json!({
         "authenticated":role != Role::Viewer,"role":role.name(),"permissions":permissions,
@@ -795,7 +870,31 @@ fn module<const N: usize>(
     json!({"module_id":id,"module_version":version,"compatible_core_api":"^2.0","required_capabilities":[],"route":route,"navigation":{"label":label,"section":section},"permissions":permissions,"feature_flags":{},"enabled":enabled})
 }
 
-fn probe_value(state: &AppState) -> Value {
+fn measured_local_heartbeat_epoch_s(state: &AppState) -> Option<u64> {
+    state
+        .inner
+        .capture_manager
+        .list()
+        .into_iter()
+        .filter_map(|job| {
+            job.metrics
+                .last_packet_epoch_ms
+                .into_iter()
+                .chain(job.metrics.last_ingested_epoch_ms)
+                .max()
+        })
+        .max()
+        .map(|epoch_ms| epoch_ms / 1_000)
+}
+
+fn probe_online(last_heartbeat_epoch_s: Option<u64>, now_epoch_s: u64) -> bool {
+    last_heartbeat_epoch_s.is_some_and(|heartbeat| {
+        now_epoch_s >= heartbeat
+            && now_epoch_s.saturating_sub(heartbeat) <= HEARTBEAT_ONLINE_WINDOW_SECONDS
+    })
+}
+
+fn probe_value(state: &AppState, record: &ProbeRecord) -> Value {
     let packets = state
         .inner
         .captures
@@ -803,49 +902,155 @@ fn probe_value(state: &AppState) -> Value {
         .filter_map(|capture| capture["packet_count"].as_u64())
         .sum::<u64>();
     let jobs = state.inner.capture_manager.list();
-    let active = jobs.iter().find(|job| job.state.active());
-    let discovered = state.inner.capture_manager.interfaces();
+    let local = record.probe_id == "oiran-vprobe-local-01";
+    let active = local
+        .then(|| jobs.iter().find(|job| job.state.active()))
+        .flatten();
+    let discovered = local
+        .then(|| capture_interfaces_with_roles(state, &record.probe_id))
+        .unwrap_or_default();
+    let measured = local
+        .then(|| measured_local_heartbeat_epoch_s(state))
+        .flatten();
+    let last_heartbeat_epoch_s = record.last_heartbeat_epoch_s.max(measured);
+    let online = probe_online(last_heartbeat_epoch_s, epoch_seconds());
+    let lifecycle = if last_heartbeat_epoch_s.is_none() {
+        "PENDING"
+    } else if online {
+        "ONLINE"
+    } else {
+        "DEGRADED"
+    };
     json!({
-        "probe_id":"oiran-vprobe-local-01","name":"OIRAN Local Rust vProbe","host":"localhost",
-        "probe_type":"Virtual","version":PLATFORM_VERSION,"health":if discovered.iter().all(|item|item.available){"ONLINE"}else{"DEGRADED"},"online":true,
-        "api_state":"API_CONNECTED","probe_state":"PROBE_ONLINE",
+        "probe_id":record.probe_id,"name":record.name,"host":record.host,"mgmt_ip":record.mgmt_ip,"site":record.site,
+        "probe_type":record.probe_type,"version":PLATFORM_VERSION,"health":lifecycle,"online":online,
+        "api_state":if online {"API_CONNECTED"} else {"API_DISCONNECTED"},"probe_state":format!("PROBE_{lifecycle}"),
         "connected_interfaces":discovered.iter().filter(|item|item.available).map(|item|item.interface.clone()).collect::<Vec<_>>(),
-        "capture_state":active.map(|job|format!("{:?}",job.state).to_ascii_uppercase()).unwrap_or_else(||"IDLE".into()),"last_heartbeat_epoch_s":epoch_seconds(),
+        "capture_state":active.map(|job|format!("{:?}",job.state).to_ascii_uppercase()).unwrap_or_else(||"IDLE".into()),"last_heartbeat_epoch_s":last_heartbeat_epoch_s,
         "packet_rate_pps":active.map(|job|job.metrics.packets_per_second),"decode_rate_eps":active.map(|job|job.metrics.decode_events_per_second),"packet_drops":active.and_then(|job|job.metrics.packet_drops),
         "cpu_usage_percent":Value::Null,"memory_usage_bytes":Value::Null,"disk_usage_percent":Value::Null,
-        "historical_packet_count":packets,"distributed":false,"telemetry_status":if active.is_some(){"LIVE"}else{"IDLE"},
-        "capture_control_available":state.inner.capture_manager.execution_enabled(),
-        "live_sessions_available":state.inner.capture_manager.datasets().iter().any(|dataset|!dataset.session_ids.is_empty())
+        "historical_packet_count":if local {Some(packets)} else {None},"distributed":!local,"telemetry_status":lifecycle,
+        "capture_control_available":local && state.inner.capture_manager.execution_enabled(),
+        "live_sessions_available":local && state.inner.capture_manager.datasets().iter().any(|dataset|!dataset.session_ids.is_empty())
     })
 }
 
 async fn probes(State(state): State<AppState>) -> Json<Value> {
-    ok(json!([probe_value(&state)]))
+    ok(json!(state
+        .inner
+        .probe_registry
+        .list()
+        .iter()
+        .map(|record| probe_value(&state, record))
+        .collect::<Vec<_>>()))
+}
+
+async fn create_probe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ProbeInput>,
+) -> Response {
+    if let Err(response) = require_operator_csrf(&state, &headers) {
+        return response;
+    }
+    match state.inner.probe_registry.create(input) {
+        Ok(record) => (StatusCode::CREATED, ok(probe_value(&state, &record))).into_response(),
+        Err(ProbeCreateError::Duplicate) => api_error(
+            StatusCode::CONFLICT,
+            "PROBE_ALREADY_EXISTS",
+            "probe_id already exists",
+        ),
+        Err(ProbeCreateError::Invalid) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_PROBE_SCHEMA",
+            "probe payload failed validation",
+        ),
+        Err(ProbeCreateError::Storage) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "PROBE_REGISTRY_WRITE_FAILED",
+            "probe registry could not be updated",
+        ),
+    }
 }
 
 async fn probe(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if id == "oiran-vprobe-local-01" {
-        ok(probe_value(&state)).into_response()
-    } else {
-        api_error(StatusCode::NOT_FOUND, "PROBE_NOT_FOUND", "unknown probe id")
-    }
+    state
+        .inner
+        .probe_registry
+        .get(&id)
+        .map(|record| ok(probe_value(&state, &record)).into_response())
+        .unwrap_or_else(|| api_error(StatusCode::NOT_FOUND, "PROBE_NOT_FOUND", "unknown probe id"))
 }
 
 async fn probe_interfaces(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if id != "oiran-vprobe-local-01" {
+    if state.inner.probe_registry.get(&id).is_none() {
         return api_error(StatusCode::NOT_FOUND, "PROBE_NOT_FOUND", "unknown probe id");
     }
-    ok(json!(state.inner.capture_manager.interfaces())).into_response()
+    ok(json!(capture_interfaces_with_roles(&state, &id))).into_response()
 }
 
 async fn interfaces(State(state): State<AppState>) -> Json<Value> {
-    let items = state.inner.capture_manager.interfaces().into_iter().map(|item| json!({
-        "interface":item.interface,"protocol":item.protocol,"capture_point":item.capture_point,
+    let items = capture_interfaces_with_roles(&state, "oiran-vprobe-local-01").into_iter().map(|item| json!({
+        "interface":item.interface,"role":item.role,"protocol":item.protocol,"capture_point":item.capture_point,
         "device":item.device,"source":"oiran-vprobe-local-01","status":if item.available{"AVAILABLE"}else{"UNAVAILABLE"},
         "packet_count":Value::Null,"file_size":Value::Null,"capture_start":Value::Null,"capture_end":Value::Null,
         "live_capture_available":item.available && state.inner.capture_manager.execution_enabled(),"reason":item.reason
     })).collect::<Vec<_>>();
     ok(json!(items))
+}
+
+fn capture_interfaces_with_roles(
+    state: &AppState,
+    probe_id: &str,
+) -> Vec<live_probe::CaptureInterface> {
+    let Some(record) = state.inner.probe_registry.get(probe_id) else {
+        return Vec::new();
+    };
+    if probe_id == "oiran-vprobe-local-01" {
+        return state
+            .inner
+            .capture_manager
+            .interfaces()
+            .into_iter()
+            .map(|mut interface| {
+                interface.role = record
+                    .interfaces
+                    .iter()
+                    .find(|registered| {
+                        registered.interface == interface.device
+                            || registered.interface == interface.interface
+                    })
+                    .map(|registered| registered.role.clone());
+                interface
+            })
+            .collect();
+    }
+    record
+        .interfaces
+        .into_iter()
+        .map(|interface| live_probe::CaptureInterface {
+            interface: interface.interface.clone(),
+            role: Some(interface.role.clone()),
+            device: interface.interface,
+            protocol: protocol_for_role(&interface.role).into(),
+            capture_point: format!("{} registry", record.site),
+            bpf_filter: interface.bpf_filter,
+            available: false,
+            operstate: "PENDING".into(),
+            reason: Some("HEARTBEAT_NOT_OBSERVED".into()),
+        })
+        .collect()
+}
+
+fn protocol_for_role(role: &str) -> &'static str {
+    match role {
+        "N2" => "NGAP / SCTP",
+        "N3" => "GTP-U / UDP",
+        "N4" => "PFCP / UDP",
+        "S1" => "S1AP / SCTP",
+        "N6" => "IP",
+        _ => "UNKNOWN",
+    }
 }
 
 fn parse_session_identity(session_id: &str) -> (String, String) {
@@ -974,6 +1179,12 @@ struct ListQuery {
     packet_number: Option<u64>,
 }
 
+#[derive(Deserialize, Default)]
+struct CallflowQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
 fn dataset_values(state: &AppState) -> Vec<Value> {
     let mut items = state
         .inner
@@ -1065,6 +1276,7 @@ fn dataset_values(state: &AppState) -> Vec<Value> {
                     .iter()
                     .filter(|session_id| !active_session_ids.contains(session_id))
                     .count();
+                let (interface_type, size_bytes) = capture_observation(job.as_ref());
                 Some(json!({
                     "dataset_id":dataset.dataset_id,
                     "display_name":dataset.dataset_id,
@@ -1072,7 +1284,7 @@ fn dataset_values(state: &AppState) -> Vec<Value> {
                     "source":if derived {"OFFLINE_DERIVED_REPLAY"} else if recovered {"OFFLINE_RECOVERY"} else {"LIVE_CAPTURE"},
                     "technology":"5G SA",
                     "capture_id":dataset.capture_id,
-                    "captures":[{"capture_id":dataset.capture_id,"probe_id":job.as_ref().map(|item|item.probe_id.as_str()).unwrap_or("oiran-vprobe-local-01"),"interface_type":job.as_ref().map(|item|item.interfaces.join(" + ")).unwrap_or_else(||"N2 + N3 + N4".into()),"packet_count":packet_count,"size_bytes":job.as_ref().map(|item|item.metrics.storage_bytes).unwrap_or(0)}],
+                    "captures":[{"capture_id":dataset.capture_id,"probe_id":job.as_ref().map(|item|item.probe_id.as_str()).unwrap_or("oiran-vprobe-local-01"),"interface_type":interface_type,"packet_count":packet_count,"size_bytes":size_bytes}],
                     "capture_start_timestamp":job.as_ref().and_then(|item|item.started_epoch_ms),
                     "capture_end_timestamp":job.as_ref().and_then(|item|item.ended_epoch_ms),
                     "ingestion_status":dataset.state,
@@ -1103,6 +1315,13 @@ fn dataset_values(state: &AppState) -> Vec<Value> {
             }),
     );
     items
+}
+
+fn capture_observation(job: Option<&live_probe::CaptureJob>) -> (Option<String>, Option<u64>) {
+    (
+        job.map(|item| item.interfaces.join(" + ")),
+        job.map(|item| item.metrics.storage_bytes),
+    )
 }
 
 fn dataset_for_capture(state: &AppState, capture_id: &str) -> Option<Value> {
@@ -1447,6 +1666,14 @@ async fn capture(State(state): State<AppState>, Path(id): Path<String>) -> Respo
                 "unknown capture id",
             )
         })
+}
+
+async fn capture_download_policy(Path(_id): Path<String>) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error":"DOWNLOAD_POLICY_PENDING"})),
+    )
+        .into_response()
 }
 
 async fn capture_context(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -1843,20 +2070,139 @@ async fn session_events(
     paginated(items, &query).into_response()
 }
 
-async fn session_callflow(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let mut value = if let Some(flow_value) = flow_value_for(&state, &id) {
-        flow_value.clone()
-    } else if let Some((_dataset, flow)) = live_flow_for(&state, &id) {
-        serde_json::to_value(flow).unwrap_or(Value::Null)
+fn callflow_page_from_value(
+    source: &Value,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<Value, String> {
+    if !(1..=MAX_CALLFLOW_PAGE_EVENTS).contains(&limit) {
+        return Err("CALLFLOW_LIMIT_INVALID".into());
+    }
+    let source_object = source.as_object().ok_or("CALLFLOW_READ_FAILED")?;
+    let source_events = source_object
+        .get("events")
+        .and_then(Value::as_array)
+        .ok_or("CALLFLOW_READ_FAILED")?;
+    let start = if let Some(cursor) = cursor {
+        source_events
+            .iter()
+            .position(|event| event["event_id"] == cursor)
+            .map(|index| index + 1)
+            .ok_or("CALLFLOW_CURSOR_INVALID")?
     } else {
-        return api_error(
+        0
+    };
+    let events = source_events
+        .iter()
+        .skip(start)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let has_more = start.saturating_add(events.len()) < source_events.len();
+    let next_cursor = has_more
+        .then(|| events.last().and_then(|event| event["event_id"].as_str()))
+        .flatten()
+        .map(str::to_owned);
+    let selected_ids = events
+        .iter()
+        .filter_map(|event| event["event_id"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut output = source_object
+        .iter()
+        .filter(|(key, _)| key.as_str() != "events")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    if let Some(procedures) = output.get_mut("procedures").and_then(Value::as_array_mut) {
+        for procedure in procedures.iter_mut() {
+            if let Some(ids) = procedure["event_ids"].as_array_mut() {
+                ids.retain(|id| id.as_str().is_some_and(|id| selected_ids.contains(id)));
+            }
+        }
+        procedures.retain(|procedure| {
+            procedure["event_ids"]
+                .as_array()
+                .is_some_and(|ids| !ids.is_empty())
+        });
+    }
+    if let Some(edges) = output
+        .get_mut("correlation_edges")
+        .and_then(Value::as_array_mut)
+    {
+        edges.retain(|edge| {
+            ["source_event_id", "target_event_id"].iter().any(|field| {
+                edge[*field]
+                    .as_str()
+                    .is_some_and(|id| selected_ids.contains(id))
+            })
+        });
+    }
+    let returned_events = events.len();
+    output.insert("events".into(), Value::Array(events));
+    output.insert(
+        "pagination".into(),
+        json!({
+            "limit": limit,
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "returned_events": returned_events,
+            "total_events": source_events.len(),
+        }),
+    );
+    Ok(Value::Object(output))
+}
+
+fn callflow_read_error(error: &str) -> Response {
+    match error {
+        "CALLFLOW_LIMIT_INVALID" => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            error,
+            "limit must be between 1 and 256 events",
+        ),
+        "CALLFLOW_CURSOR_INVALID" => api_error(
+            StatusCode::BAD_REQUEST,
+            error,
+            "cursor does not identify an event in this call flow",
+        ),
+        _ => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CALLFLOW_READ_FAILED",
+            "the persisted call flow could not be read safely",
+        ),
+    }
+}
+
+async fn session_callflow(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CallflowQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(DEFAULT_CALLFLOW_PAGE_EVENTS);
+    if !(1..=MAX_CALLFLOW_PAGE_EVENTS).contains(&limit) {
+        return callflow_read_error("CALLFLOW_LIMIT_INVALID");
+    }
+    let cursor = query.cursor.as_deref();
+    let result = if let Some(path) = flow_path_for(&state, &id) {
+        read_callflow_page(path, cursor, limit).map(Some)
+    } else if let Some(flow_value) = flow_value_for(&state, &id) {
+        callflow_page_from_value(flow_value, cursor, limit).map(Some)
+    } else {
+        state
+            .inner
+            .capture_manager
+            .callflow_page_by_session(&id, cursor, limit)
+    };
+    match result {
+        Ok(Some(mut value)) => {
+            sanitize_value(&mut value);
+            ok(value).into_response()
+        }
+        Ok(None) => api_error(
             StatusCode::NOT_FOUND,
             "SESSION_NOT_FOUND",
             "unknown session id",
-        );
-    };
-    sanitize_value(&mut value);
-    ok(value).into_response()
+        ),
+        Err(error) => callflow_read_error(&error),
+    }
 }
 
 async fn session_correlations(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -2220,6 +2566,7 @@ mod tests {
         InterfaceId, ServerConfig,
     };
     use http_body_util::BodyExt;
+    use std::os::unix::fs::PermissionsExt;
     use tower::ServiceExt;
     #[derive(Clone)]
     struct ValidationOnlyBackend;
@@ -2242,13 +2589,18 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         path
     }
+    fn test_config(root: &FsPath, label: &str) -> ApiConfig {
+        let mut config = ApiConfig::from_workspace(root);
+        config.probe_registry_path = temporary_directory(label).join("probe-registry.json");
+        config
+    }
     fn state() -> AppState {
         let root = FsPath::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .parent()
             .unwrap();
-        AppState::load(ApiConfig::from_workspace(root)).unwrap()
+        AppState::load(test_config(root, "registry-viewer")).unwrap()
     }
     fn operator_state() -> AppState {
         let root = FsPath::new(env!("CARGO_MANIFEST_DIR"))
@@ -2256,7 +2608,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let mut config = ApiConfig::from_workspace(root);
+        let mut config = test_config(root, "registry-operator");
         config.operator_token_sha256 = Some(sha256_hex(b"test-operator-token"));
         AppState::load(config).unwrap()
     }
@@ -2289,6 +2641,210 @@ mod tests {
         assert_eq!(v["data"]["capabilities"]["capture_control"], false)
     }
 
+    fn probe_payload(probe_id: &str) -> Value {
+        json!({
+            "probe_id": probe_id,
+            "probe_type": "virtual",
+            "name": "Lab probe",
+            "host": "probe-host",
+            "mgmt_ip": "192.0.2.10",
+            "site": "lab-a",
+            "interfaces": [{
+                "interface": "eth0",
+                "role": "N2",
+                "bpf_filter": "sctp port 38412"
+            }]
+        })
+    }
+
+    fn create_probe_request(payload: Value) -> Request<Body> {
+        let csrf = sha256_hex(b"oiran-csrf-v1:test-operator-token");
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/probes")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer test-operator-token")
+            .header(CSRF_HEADER, csrf)
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn probe_heartbeat_is_null_without_measured_liveness() {
+        let value = json_body(
+            router(state(), None)
+                .oneshot(req("/api/v1/probes", true))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(value["data"][0]["last_heartbeat_epoch_s"].is_null());
+    }
+
+    #[tokio::test]
+    async fn probe_online_is_false_without_a_real_heartbeat() {
+        let value = json_body(
+            router(state(), None)
+                .oneshot(req("/api/v1/probes", true))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(value["data"][0]["online"], false);
+        assert_eq!(value["data"][0]["probe_state"], "PROBE_PENDING");
+    }
+
+    #[test]
+    fn measured_heartbeat_outside_native_segment_window_is_not_online() {
+        assert!(probe_online(Some(100), 115));
+        assert!(!probe_online(Some(100), 116));
+    }
+
+    #[test]
+    fn absent_capture_observation_serializes_as_null_not_fabricated_defaults() {
+        let (interface_type, size_bytes) = capture_observation(None);
+        let value = json!({"interface_type":interface_type,"size_bytes":size_bytes});
+        assert!(value["interface_type"].is_null());
+        assert!(value["size_bytes"].is_null());
+    }
+
+    #[tokio::test]
+    async fn operator_can_create_a_persistent_pending_probe_in_a_private_registry() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let registry_root = temporary_directory("registry-persistence");
+        let registry_path = registry_root.join("probes.json");
+        let mut config = ApiConfig::from_workspace(workspace);
+        config.probe_registry_path = registry_path.clone();
+        config.operator_token_sha256 = Some(sha256_hex(b"test-operator-token"));
+        let state = AppState::load(config.clone()).unwrap();
+        let response = router(state, None)
+            .oneshot(create_probe_request(probe_payload("lab-probe-01")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let value = json_body(response).await;
+        assert_eq!(value["data"]["probe_state"], "PROBE_PENDING");
+        assert_eq!(value["data"]["online"], false);
+        assert_eq!(
+            fs::metadata(&registry_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let reloaded = AppState::load(config).unwrap();
+        assert!(reloaded.inner.probe_registry.get("lab-probe-01").is_some());
+    }
+
+    #[tokio::test]
+    async fn duplicate_probe_id_returns_conflict() {
+        let app = router(operator_state(), None);
+        assert_eq!(
+            app.clone()
+                .oneshot(create_probe_request(probe_payload("duplicate-probe")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            app.oneshot(create_probe_request(probe_payload("duplicate-probe")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_probe_schema_returns_unprocessable_entity() {
+        let response = router(operator_state(), None)
+            .oneshot(create_probe_request(probe_payload("UP")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn probe_creation_requires_csrf_proof() {
+        let response = router(operator_state(), None)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/probes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                    .body(Body::from(
+                        serde_json::to_vec(&probe_payload("csrf-probe")).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(response).await["error"]["code"], "CSRF_REQUIRED");
+    }
+
+    #[tokio::test]
+    async fn probe_creation_requires_operator_role() {
+        let response = router(state(), None)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/probes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&probe_payload("viewer-probe")).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "OPERATOR_REQUIRED"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_interfaces_expose_registry_role_or_null() {
+        let value = json_body(
+            router(state(), None)
+                .oneshot(req("/api/v1/interfaces", true))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let interfaces = value["data"].as_array().unwrap();
+        assert_eq!(
+            interfaces
+                .iter()
+                .find(|item| item["interface"] == "N2")
+                .unwrap()["role"],
+            "N2"
+        );
+        assert!(interfaces
+            .iter()
+            .find(|item| item["interface"] == "SBI")
+            .unwrap()["role"]
+            .is_null());
+    }
+
+    #[tokio::test]
+    async fn raw_capture_download_is_forbidden_by_pending_policy() {
+        let response = router(state(), None)
+            .oneshot(req("/api/v1/captures/any-id/download", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            json_body(response).await,
+            json!({"error":"DOWNLOAD_POLICY_PENDING"})
+        );
+    }
+
     #[tokio::test]
     async fn continuous_capture_state_and_incremental_sessions_are_truthful() {
         let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
@@ -2309,7 +2865,7 @@ mod tests {
             .unwrap();
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
-        let mut config = ApiConfig::from_workspace(workspace);
+        let mut config = test_config(workspace, "registry-continuous");
         config.capture_root = capture_root;
         let state = AppState::load(config).unwrap();
         state
@@ -2320,6 +2876,7 @@ mod tests {
                 scan_interval: std::time::Duration::from_millis(200),
                 stable_age: std::time::Duration::from_millis(200),
                 max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
                 max_segments: 8,
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
@@ -2350,6 +2907,15 @@ mod tests {
         assert_eq!(metrics["data"]["active_ue_ips"], json!([]));
         assert_eq!(metrics["data"]["segments_ingested"], 3);
         assert!(metrics["data"]["last_ingested_epoch_ms"].is_number());
+        let probes = json_body(
+            app.clone()
+                .oneshot(req("/api/v1/probes", true))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(probes["data"][0]["last_heartbeat_epoch_s"].is_number());
+        assert_eq!(probes["data"][0]["online"], true);
         let sessions = json_body(
             app.oneshot(req("/api/v1/sessions?dataset_kind=CAPTURED_LIVE", true))
                 .await
@@ -2667,6 +3233,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callflow_route_pages_persisted_events_with_a_bounded_cursor_contract() {
+        let app = router(state(), None);
+        let first_response = app
+            .clone()
+            .oneshot(req("/api/v1/sessions/5g-UE-A-pdu-1/callflow?limit=7", true))
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first = json_body(first_response).await;
+        assert_eq!(first["data"]["events"].as_array().unwrap().len(), 7);
+        assert_eq!(first["data"]["pagination"]["limit"], 7);
+        assert_eq!(first["data"]["pagination"]["total_events"], 54);
+        let cursor = first["data"]["pagination"]["next_cursor"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let first_event = first["data"]["events"][0]["event_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let second = json_body(
+            app.clone()
+                .oneshot(req(
+                    &format!("/api/v1/sessions/5g-UE-A-pdu-1/callflow?limit=7&cursor={cursor}"),
+                    true,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(second["data"]["events"].as_array().unwrap().len(), 7);
+        assert_ne!(second["data"]["events"][0]["event_id"], first_event);
+
+        let invalid_cursor = app
+            .clone()
+            .oneshot(req(
+                "/api/v1/sessions/5g-UE-A-pdu-1/callflow?limit=7&cursor=missing-event",
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_cursor.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(invalid_cursor).await["error"]["code"],
+            "CALLFLOW_CURSOR_INVALID"
+        );
+
+        let oversized = app
+            .oneshot(req(
+                "/api/v1/sessions/5g-UE-A-pdu-1/callflow?limit=257",
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            json_body(oversized).await["error"]["code"],
+            "CALLFLOW_LIMIT_INVALID"
+        );
+    }
+
+    #[tokio::test]
     async fn v2_metrics_are_truthful_about_live_telemetry() {
         let response = router(state(), None)
             .oneshot(req("/api/v1/metrics", true))
@@ -2806,7 +3435,7 @@ mod tests {
             interface_root,
         )
         .unwrap();
-        let mut config = ApiConfig::from_workspace(workspace);
+        let mut config = test_config(workspace, "registry-four-plane");
         config.capture_root = manager_root.clone();
         config.capture_execution_enabled = true;
         config.operator_token_sha256 = Some(sha256_hex(b"test-operator-token"));

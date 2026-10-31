@@ -1,0 +1,64 @@
+{
+  "fixture_id": "OIRAN-LTE-PIPELINE-SYNTHETIC-V1",
+  "classification": "SYNTHETIC_OFFLINE_NOT_REAL_CERTIFICATION",
+  "real_capture": false,
+  "clear_subscriber_identities_present": false,
+  "cases": [
+    {
+      "id": "s1-setup",
+      "decoder": "S1AP",
+      "interface": "S1-MME",
+      "source_role": "eNB",
+      "destination_role": "MME",
+      "payload_hex": "00110029000004003b00080000f11000001234003c4007454e422d53594e004000060000f11000010089400100",
+      "expected_event": "S1SetupRequest"
+    },
+    {
+      "id": "s11-create-session-response",
+      "decoder": "GTPv2-C",
+      "interface": "S11",
+      "source_role": "SGW-C",
+      "destination_role": "MME",
+      "payload_hex": "482100080000000100000100",
+      "expected_event": "CreateSessionResponse"
+    },
+    {
+      "id": "s1-erab-setup-response",
+      "decoder": "S1AP",
+      "interface": "S1-MME",
+      "source_role": "eNB",
+      "destination_role": "MME",
+      "payload_hex": "2005000f00000200000002000500080002002a",
+      "expected_event": "E-RABSetupResponse"
+    },
+    {
+      "id": "s1u-uplink",
+      "decoder": "GTP-U",
+      "interface": "S1-U",
+      "source_role": "eNB",
+      "destination_role": "SGW-U",
+      "payload_hex": "30ff001410203040450000140000000040110000c0000264c6336464",
+      "expected_event": "G-PDU",
+      "expected_direction": "UPLINK",
+      "expected_teid": "0x10203040"
+    },
+    {
+      "id": "s1u-downlink",
+      "decoder": "GTP-U",
+      "interface": "S1-U",
+      "source_role": "SGW-U",
+      "destination_role": "eNB",
+      "payload_hex": "30ff001450607080450000140000000040110000c6336464c0000264",
+      "expected_event": "G-PDU",
+      "expected_direction": "DOWNLINK",
+      "expected_teid": "0x50607080"
+    }
+  ],
+  "expected": {
+    "decoded_cases": 5,
+    "s1u_packets": 2,
+    "s1u_uplink_packets": 1,
+    "s1u_downlink_packets": 1,
+    "distinct_s1u_teids": 2
+  }
+}

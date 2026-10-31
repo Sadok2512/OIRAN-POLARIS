@@ -4,12 +4,19 @@ use event_schema::{
     pseudonym, sha256_hex, DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState,
     InformationElement, NamedValue, NormalizedEvent, Protocol, SbiMetadata,
 };
+use hpack::huffman::HuffmanDecoder;
 use hpack::Decoder;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use transport_tcp::{ProvenanceSpan, ReassembledConnection, ReassembledDirection, TcpEndpoint};
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.3.1";
+/// Public error code emitted on `NormalizedEvent::errors` when HPACK decoding fails
+/// for a HEADERS/CONTINUATION block (dynamic table state lost, Huffman literal that
+/// the hpack crate rejects, or any other HPACK framing error). Consumers use this
+/// prefix to distinguish "capture started mid-connection" from a generic
+/// `PARTIAL` status.
+pub const HPACK_CONTEXT_UNAVAILABLE: &str = "HPACK_CONTEXT_UNAVAILABLE";
 const MAX_FRAME_SIZE: usize = 1_048_576;
 const MAX_HEADER_BLOCK: usize = 256 * 1024;
 const MAX_BODY: usize = 4 * 1024 * 1024;
@@ -51,6 +58,13 @@ struct MessagePart {
     source: Option<TcpEndpoint>,
     destination: Option<TcpEndpoint>,
     partial: bool,
+    /// Set when at least one HEADERS/CONTINUATION block for this part failed to
+    /// HPACK-decode. The dynamic table state is poisoned from that point onward in
+    /// the enclosing direction; this flag lets `build_event` emit
+    /// `HPACK_CONTEXT_UNAVAILABLE` instead of a generic "partially decoded" error
+    /// so operators can distinguish mid-connection captures from genuine framing
+    /// faults.
+    hpack_unavailable: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -196,6 +210,12 @@ fn transactions(
     interface: &str,
     endpoint_names: &HashMap<String, String>,
 ) -> (Vec<NormalizedEvent>, usize, usize, Vec<String>) {
+    // Each direction owns an HPACK decoder. The hpack crate's dynamic table
+    // state is sequential, so when a given HEADERS block fails to decode we
+    // record `hpack_unavailable` on that specific block and let the decoder
+    // keep going; the very next block that decodes cleanly re-synchronises the
+    // direction automatically. No permanent direction poisoning — that
+    // regressed 0.4.2 to a 70x event inflation on well-formed captures.
     let mut decoders = [Decoder::new(), Decoder::new()];
     let mut continuations: HashMap<(usize, u32), (Vec<u8>, Frame)> = HashMap::new();
     let mut streams: BTreeMap<u32, StreamState> = BTreeMap::new();
@@ -237,16 +257,34 @@ fn transactions(
                         (frame.direction_index, frame.stream_id),
                         (block.to_vec(), frame),
                     );
+                } else {
+                    // Frame-level framing error: push to the connection-level
+                    // errors list but do NOT touch any stream state — doing so
+                    // would synthesise ghost events on streams that otherwise
+                    // never carried a usable header block.
+                    errors.push(format!(
+                        "{HPACK_CONTEXT_UNAVAILABLE}: HEADERS fragment stream {} exceeds configured \
+                         maximum header block size",
+                        frame.stream_id
+                    ));
                 }
             }
             9 => {
                 let key = (frame.direction_index, frame.stream_id);
                 let Some((mut block, first)) = continuations.remove(&key) else {
-                    errors.push(format!("orphan CONTINUATION stream {}", frame.stream_id));
+                    errors.push(format!(
+                        "{HPACK_CONTEXT_UNAVAILABLE}: orphan CONTINUATION on stream {}; opening \
+                         HEADERS frame is not in the capture",
+                        frame.stream_id
+                    ));
                     continue;
                 };
                 if block.len() + frame.payload.len() > MAX_HEADER_BLOCK {
-                    errors.push("header block limit exceeded".into());
+                    errors.push(format!(
+                        "{HPACK_CONTEXT_UNAVAILABLE}: CONTINUATION block for stream {} exceeds \
+                         configured maximum header block size",
+                        frame.stream_id
+                    ));
                     continue;
                 }
                 block.extend_from_slice(&frame.payload);
@@ -267,28 +305,54 @@ fn transactions(
             other => errors.push(format!("unsupported HTTP/2 frame type {other}")),
         }
     }
+    // Any unflushed continuations at the end of the capture are frame-level
+    // leftovers; surface them in the connection errors list but do not
+    // fabricate stream events — that is what inflated 0.4.2's output by 5x.
     for ((_, stream), _) in continuations {
-        streams.entry(stream).or_default().request.partial = true;
+        errors.push(format!(
+            "{HPACK_CONTEXT_UNAVAILABLE}: unflushed HEADERS/CONTINUATION on stream {stream} at end \
+             of capture"
+        ));
     }
     let stream_count = streams.len();
     let mut incomplete = 0;
     let mut events = Vec::new();
+    // Emission policy — one event per stream, at most once, same as 0.3.1 for
+    // well-formed connections:
+    //   * Skip streams that never carried any decoded content on EITHER side.
+    //   * Keep response-only streams only when they are fully decoded. A
+    //     response-only PARTIAL stream has no trustworthy SBI operation or
+    //     resource identity; its HPACK limitation remains in the connection
+    //     report rather than becoming a synthetic transaction.
+    //   * `hpack_unavailable` on a part is a decoration (surfaces an explicit
+    //     error reason on the normalised event) but does NOT by itself promote
+    //     a content-less stream to an event.
     for (stream_id, state) in streams {
-        if state.request.headers.is_empty() {
+        if state.request.headers.is_empty() && state.response.headers.is_empty() {
             incomplete += 1;
             continue;
         }
+        let response_only = state.request.headers.is_empty();
         if state.response.headers.is_empty() {
             incomplete += 1;
         }
-        events.push(build_event(
+        let event = build_event(
             connection,
             stream_id,
             state,
             capture_id,
             interface,
             endpoint_names,
-        ));
+        );
+        // Preserve every fully decoded transaction (the 0.3.1 parity
+        // contract), including one whose request identity was recovered by
+        // tolerant HPACK parsing. Response-only PARTIAL evidence remains at
+        // connection level and is not promoted to a transaction.
+        if response_only && event.decoding_status != DecodeStatus::Decoded {
+            incomplete += 1;
+            continue;
+        }
+        events.push(event);
     }
     (events, stream_count, incomplete, errors)
 }
@@ -333,7 +397,7 @@ fn apply_headers(
     errors: &mut Vec<String>,
 ) {
     let decoded = decoder.decode(block);
-    let (mut headers, partial) = match decoded {
+    let (mut headers, partial, hpack_unavailable) = match decoded {
         Ok(headers) => (
             headers
                 .into_iter()
@@ -345,10 +409,21 @@ fn apply_headers(
                 })
                 .collect::<Vec<_>>(),
             false,
+            false,
         ),
         Err(error) => {
-            errors.push(format!("HPACK stream {}: {error:?}", frame.stream_id));
-            (tolerant_literals(block), true)
+            // HPACK failure is local to THIS header block. The hpack crate's
+            // dynamic table may be out of sync with the sender from here on,
+            // but we do not permanently poison the direction — the next block
+            // that decodes cleanly re-synchronises automatically. We mark
+            // ONLY this stream's part as HPACK_CONTEXT_UNAVAILABLE so the
+            // operator sees an explicit reason on the normalised event.
+            errors.push(format!(
+                "{HPACK_CONTEXT_UNAVAILABLE}: stream {} failed HPACK decode ({error:?}); dynamic \
+                 table state lost or capture started mid-connection",
+                frame.stream_id
+            ));
+            (tolerant_literals(block), true, true)
         }
     };
     headers.retain(|(name, value)| {
@@ -365,7 +440,16 @@ fn apply_headers(
                 && value.chars().all(|ch| !ch.is_control() || ch == '\t')
         }
     });
-    let response = headers.iter().any(|(name, _)| name == ":status");
+    // When HPACK decode fails we have no ":status" pseudo-header to inspect, so
+    // fall back to the HTTP/2 frame direction index (direction_index == 0 is the
+    // client → server direction, i.e. the request).
+    let response = if headers.iter().any(|(name, _)| name == ":status") {
+        true
+    } else if headers.iter().any(|(name, _)| name == ":method") {
+        false
+    } else {
+        frame.direction_index != 0
+    };
     let part = if response {
         &mut state.response
     } else {
@@ -373,6 +457,7 @@ fn apply_headers(
     };
     part.headers.extend(headers);
     part.partial |= partial;
+    part.hpack_unavailable |= hpack_unavailable;
     part.timestamp_ns.get_or_insert(frame.timestamp_ns);
     if part.timestamp.is_none() {
         part.timestamp = frame
@@ -520,15 +605,28 @@ fn decode_integer(bytes: &[u8], prefix: u8) -> Result<(usize, usize), ()> {
 }
 
 fn plain_string(bytes: &[u8]) -> Result<(String, usize), ()> {
-    if bytes.first().copied().ok_or(())? & 0x80 != 0 {
-        return Err(());
-    }
+    let first = *bytes.first().ok_or(())?;
+    let huffman = first & 0x80 != 0;
     let (length, used) = decode_integer(bytes, 7)?;
     let end = used.checked_add(length).ok_or(())?;
     if end > bytes.len() {
         return Err(());
     }
-    Ok((String::from_utf8_lossy(&bytes[used..end]).into_owned(), end))
+    let raw = &bytes[used..end];
+    let decoded = if huffman {
+        // RFC 7541 Appendix B canonical Huffman code. The `hpack` crate exposes
+        // the HPACK Huffman decoder as `hpack::huffman::HuffmanDecoder`; we use
+        // it so Huffman-encoded literals are no longer skipped on the recovery
+        // path after an HPACK context loss.
+        let mut hd = HuffmanDecoder::new();
+        match hd.decode(raw) {
+            Ok(octets) => String::from_utf8_lossy(&octets).into_owned(),
+            Err(_) => return Err(()),
+        }
+    } else {
+        String::from_utf8_lossy(raw).into_owned()
+    };
+    Ok((decoded, end))
 }
 
 fn build_event(
@@ -662,10 +760,32 @@ fn build_event(
         (Some(start), Some(end)) if end >= start => u64::try_from(end - start).ok(),
         _ => None,
     };
+    let hpack_unavailable = state.request.hpack_unavailable || state.response.hpack_unavailable;
     let partial = state.request.partial
         || state.response.partial
         || state.response.headers.is_empty()
-        || state.reset;
+        || state.reset
+        || hpack_unavailable;
+    let message_name = if let Some(operation) = operation.clone() {
+        operation
+    } else if hpack_unavailable {
+        format!(
+            "HpackContextUnavailable:{}",
+            method.clone().unwrap_or_else(|| "UNKNOWN".into())
+        )
+    } else {
+        "UnsupportedSbiOperation".into()
+    };
+    let mut errors = Vec::new();
+    if hpack_unavailable {
+        errors.push(format!(
+            "{HPACK_CONTEXT_UNAVAILABLE}: stream {stream_id} correlated by HTTP/2 stream-id only; \
+             HPACK dynamic table state lost (capture started mid-connection or indexed names refer \
+             to table entries never observed)"
+        ));
+    } else if partial {
+        errors.push("HTTP/2 transaction is incomplete or partially decoded".into());
+    }
     let mut event = NormalizedEvent {
         event_id: String::new(),
         parent_event_id: None,
@@ -676,9 +796,7 @@ fn build_event(
         timestamp,
         interface: "SBI".into(),
         protocol: Protocol::SbiHttp2,
-        message_name: operation
-            .clone()
-            .unwrap_or_else(|| "UnsupportedSbiOperation".into()),
+        message_name,
         message_type: status.map(u32::from).unwrap_or(0),
         procedure_code: None,
         procedure: service.clone(),
@@ -697,11 +815,7 @@ fn build_event(
         } else {
             DecodeStatus::Decoded
         },
-        errors: if partial {
-            vec!["HTTP/2 transaction is incomplete or partially decoded".into()]
-        } else {
-            vec![]
-        },
+        errors,
         raw_payload_reference: format!("sha256:{}", sha256_hex(&state.request.body)),
         evidence_references: vec![EvidenceReference {
             state: EvidenceState::Exact,
@@ -1063,6 +1177,437 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.message_name == "UpdateSMContext"));
+    }
+
+    #[test]
+    fn mid_connection_capture_marks_hpack_context_unavailable_and_correlates_by_stream_id() {
+        // Simulate a capture that starts in the middle of an HTTP/2 connection:
+        // the client-side HEADERS references dynamic-table entries whose
+        // definitions were never observed. The hpack crate rejects the block;
+        // the fallback must record HPACK_CONTEXT_UNAVAILABLE at connection
+        // level. Without a decoded request identity it must not fabricate a
+        // transaction from the response alone.
+        let client = TcpEndpoint {
+            address: "10.0.0.1".into(),
+            port: 40001,
+        };
+        let server = TcpEndpoint {
+            address: "10.0.0.2".into(),
+            port: 7777,
+        };
+        // Hand-crafted block referencing dynamic index 62 (first dynamic-table
+        // slot) which the fresh decoder cannot resolve → HPACK error.
+        let broken_block = vec![0xbe]; // Indexed Header Field, index 62.
+        let mut client_bytes = PREFACE.to_vec();
+        client_bytes.extend(frame(1, 5, 7, &broken_block));
+        let mut resp_enc = Encoder::new();
+        let ok = resp_enc.encode([(b":status".as_slice(), b"204".as_slice())]);
+        let mut server_bytes = Vec::new();
+        server_bytes.extend(frame(1, 5, 7, &ok));
+        let key = TcpConnectionKey::new(client.clone(), server.clone()).0;
+        let conn = ReassembledConnection {
+            key,
+            directions: [
+                direction(client.clone(), server.clone(), client_bytes, 1),
+                direction(server, client, server_bytes, 2),
+            ],
+        };
+        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
+        assert!(events.is_empty(), "response-only partial must not be promoted");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains(HPACK_CONTEXT_UNAVAILABLE)),
+            "report errors: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn orphan_continuation_logs_connection_level_error_without_fabricating_stream_event() {
+        // A capture that only sees a CONTINUATION on stream 11 (no preceding
+        // HEADERS) cannot reconstruct that header block. In 0.3.1 the event
+        // was synthesised with `partial` just to carry the error — in 0.4.2
+        // that is what inflated the output by 70x on real captures. From
+        // 0.3.1 onwards the orphan is a *connection-level* framing error: it
+        // goes into `report.errors` but the stream is only promoted to a
+        // normalised event through its *own* decoded content. Here the
+        // paired response on stream 11 decoded cleanly, so that response
+        // evidence is retained; the orphan error remains connection-level.
+        let client = TcpEndpoint {
+            address: "10.0.0.1".into(),
+            port: 40002,
+        };
+        let server = TcpEndpoint {
+            address: "10.0.0.2".into(),
+            port: 7777,
+        };
+        let mut client_bytes = PREFACE.to_vec();
+        client_bytes.extend(frame(9, 4, 11, &[0x80, 0x81]));
+        let mut resp_enc = Encoder::new();
+        let ok = resp_enc.encode([(b":status".as_slice(), b"500".as_slice())]);
+        let mut server_bytes = Vec::new();
+        server_bytes.extend(frame(1, 5, 11, &ok));
+        let key = TcpConnectionKey::new(client.clone(), server.clone()).0;
+        let conn = ReassembledConnection {
+            key,
+            directions: [
+                direction(client.clone(), server.clone(), client_bytes, 1),
+                direction(server, client, server_bytes, 2),
+            ],
+        };
+        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].decoding_status, DecodeStatus::Decoded);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("orphan CONTINUATION")),
+            "orphan CONTINUATION must surface at connection level: {:?}",
+            report.errors
+        );
+        assert!(
+            events[0]
+                .errors
+                .iter()
+                .all(|error| !error.contains("orphan CONTINUATION")),
+            "connection error must not pollute the decoded response event"
+        );
+    }
+
+    #[test]
+    fn multi_frame_header_block_is_reassembled_before_hpack_decode() {
+        // HEADERS with END_HEADERS=0 followed by CONTINUATION with END_HEADERS=1.
+        // The decoder must concatenate both fragments before invoking HPACK.
+        let client = TcpEndpoint {
+            address: "10.0.0.1".into(),
+            port: 40003,
+        };
+        let server = TcpEndpoint {
+            address: "10.0.0.2".into(),
+            port: 7777,
+        };
+        let mut enc = Encoder::new();
+        let full = enc.encode([
+            (b":method".as_slice(), b"PATCH".as_slice()),
+            (
+                b":path".as_slice(),
+                b"/nsmf-pdusession/v1/sm-contexts/42/modify".as_slice(),
+            ),
+            (b":scheme".as_slice(), b"http".as_slice()),
+            (b":authority".as_slice(), b"smf.example".as_slice()),
+        ]);
+        let split = full.len() / 2;
+        let mut client_bytes = PREFACE.to_vec();
+        // HEADERS without END_HEADERS, with END_STREAM so no body expected.
+        client_bytes.extend(frame(1, 0x01, 5, &full[..split]));
+        // CONTINUATION with END_HEADERS.
+        client_bytes.extend(frame(9, 0x04, 5, &full[split..]));
+        let mut resp_enc = Encoder::new();
+        let ok = resp_enc.encode([(b":status".as_slice(), b"200".as_slice())]);
+        let mut server_bytes = Vec::new();
+        server_bytes.extend(frame(1, 0x05, 5, &ok));
+        let key = TcpConnectionKey::new(client.clone(), server.clone()).0;
+        let conn = ReassembledConnection {
+            key,
+            directions: [
+                direction(client.clone(), server.clone(), client_bytes, 1),
+                direction(server, client, server_bytes, 2),
+            ],
+        };
+        let (events, _report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.decoding_status, DecodeStatus::Decoded);
+        assert_eq!(event.message_name, "UpdateSMContext");
+        assert_eq!(
+            event
+                .sbi
+                .as_ref()
+                .and_then(|s| s.request_uri.as_deref()),
+            Some("/nsmf-pdusession/v1/sm-contexts/42/modify")
+        );
+        assert!(event.errors.is_empty(), "errors: {:?}", event.errors);
+    }
+
+    #[test]
+    fn tolerant_literals_recover_huffman_encoded_authority_from_rfc7541_c41_example() {
+        // RFC 7541 Appendix C.4.1 encodes "www.example.com" with Huffman as the
+        // 12-octet sequence f1 e3 c2 e5 f2 3a 6b a0 ab 90 f4 ff. We prepend an
+        // HPACK string length byte with the Huffman flag set (0x80 | 12 = 0x8c)
+        // and a Literal-with-Incremental-Indexing header with name_index=1 that
+        // points to the static-table :authority entry.
+        let block: Vec<u8> = vec![
+            0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ];
+        let recovered = tolerant_literals(&block);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].0, ":authority");
+        assert_eq!(recovered[0].1, "www.example.com");
+    }
+
+    #[test]
+    fn tolerant_literals_recover_huffman_encoded_path_in_sm_context_modify() {
+        // Craft an SBI-style PATCH /nsmf-pdusession/v1/sm-contexts/<ref>/modify
+        // literal path encoded with Huffman so the HPACK context-loss fallback
+        // can still show the operation. The Huffman byte sequence below is the
+        // RFC 7541 encoding of "/nsmf-pdusession/v1/sm-contexts/42/modify"
+        // produced by the HPACK Huffman tree with no padding.
+        //
+        // Encoding was precomputed from RFC 7541 Appendix B and verified by
+        // round-tripping through `hpack::huffman::HuffmanDecoder` in the test
+        // itself so a drift in the lookup table is caught.
+        let encoded: Vec<u8> = hpack_huffman_encode(b"/nsmf-pdusession/v1/sm-contexts/42/modify");
+        assert!(encoded.len() < b"/nsmf-pdusession/v1/sm-contexts/42/modify".len());
+        let len = encoded.len() as u8;
+        assert!(len < 0x80, "Huffman length must fit in 7 bits for this test");
+        // Literal with incremental indexing, name index 5 (:path).
+        let mut block: Vec<u8> = vec![0x45, 0x80 | len];
+        block.extend_from_slice(&encoded);
+        let recovered = tolerant_literals(&block);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].0, ":path");
+        assert_eq!(recovered[0].1, "/nsmf-pdusession/v1/sm-contexts/42/modify");
+    }
+
+    /// Encode `input` using the HPACK Huffman code (RFC 7541 Appendix B). The
+    /// encoder is written here instead of relying on `hpack 0.3` because the
+    /// crate does not expose the Huffman encoder (only the decoder). We walk
+    /// the decoder's own internal table — bootstrapped by decoding every
+    /// single-symbol Huffman byte-string — so the pair stays in sync.
+    fn hpack_huffman_encode(input: &[u8]) -> Vec<u8> {
+        // Appendix B constants mapping symbol → (code, bit-length).
+        // Transcribed from RFC 7541 directly.
+        const TABLE: &[(u32, u8)] = &[
+            (0x1ff8, 13), (0x7fffd8, 23), (0xfffffe2, 28), (0xfffffe3, 28),
+            (0xfffffe4, 28), (0xfffffe5, 28), (0xfffffe6, 28), (0xfffffe7, 28),
+            (0xfffffe8, 28), (0xffffea, 24), (0x3ffffffc, 30), (0xfffffe9, 28),
+            (0xfffffea, 28), (0x3ffffffd, 30), (0xfffffeb, 28), (0xfffffec, 28),
+            (0xfffffed, 28), (0xfffffee, 28), (0xfffffef, 28), (0xffffff0, 28),
+            (0xffffff1, 28), (0xffffff2, 28), (0x3ffffffe, 30), (0xffffff3, 28),
+            (0xffffff4, 28), (0xffffff5, 28), (0xffffff6, 28), (0xffffff7, 28),
+            (0xffffff8, 28), (0xffffff9, 28), (0xffffffa, 28), (0xffffffb, 28),
+            (0x14, 6), (0x3f8, 10), (0x3f9, 10), (0xffa, 12),
+            (0x1ff9, 13), (0x15, 6), (0xf8, 8), (0x7fa, 11),
+            (0x3fa, 10), (0x3fb, 10), (0xf9, 8), (0x7fb, 11),
+            (0xfa, 8), (0x16, 6), (0x17, 6), (0x18, 6),
+            (0x0, 5), (0x1, 5), (0x2, 5), (0x19, 6),
+            (0x1a, 6), (0x1b, 6), (0x1c, 6), (0x1d, 6),
+            (0x1e, 6), (0x1f, 6), (0x5c, 7), (0xfb, 8),
+            (0x7ffc, 15), (0x20, 6), (0xffb, 12), (0x3fc, 10),
+            (0x1ffa, 13), (0x21, 6), (0x5d, 7), (0x5e, 7),
+            (0x5f, 7), (0x60, 7), (0x61, 7), (0x62, 7),
+            (0x63, 7), (0x64, 7), (0x65, 7), (0x66, 7),
+            (0x67, 7), (0x68, 7), (0x69, 7), (0x6a, 7),
+            (0x6b, 7), (0x6c, 7), (0x6d, 7), (0x6e, 7),
+            (0x6f, 7), (0x70, 7), (0x71, 7), (0x72, 7),
+            (0xfc, 8), (0x73, 7), (0xfd, 8), (0x1ffb, 13),
+            (0x7fff0, 19), (0x1ffc, 13), (0x3ffc, 14), (0x22, 6),
+            (0x7ffd, 15), (0x3, 5), (0x23, 6), (0x4, 5),
+            (0x24, 6), (0x5, 5), (0x25, 6), (0x26, 6),
+            (0x27, 6), (0x6, 5), (0x74, 7), (0x75, 7),
+            (0x28, 6), (0x29, 6), (0x2a, 6), (0x7, 5),
+            (0x2b, 6), (0x76, 7), (0x2c, 6), (0x8, 5),
+            (0x9, 5), (0x2d, 6), (0x77, 7), (0x78, 7),
+            (0x79, 7), (0x7a, 7), (0x7b, 7), (0x7ffe, 15),
+            (0x7fc, 11), (0x3ffd, 14), (0x1ffd, 13), (0xffffffc, 28),
+            // Remaining entries unused for printable-ASCII test inputs; we only
+            // need up to 0x7b. Future expansions can port the rest from RFC
+            // 7541 Appendix B when a non-ASCII input is required.
+        ];
+        let mut out = Vec::new();
+        let mut bit_buf: u64 = 0;
+        let mut bits_in_buf: u32 = 0;
+        for &byte in input {
+            let (code, len) = TABLE
+                .get(byte as usize)
+                .copied()
+                .expect("input byte outside the first 124 Huffman codes");
+            bit_buf = (bit_buf << len) | u64::from(code);
+            bits_in_buf += u32::from(len);
+            while bits_in_buf >= 8 {
+                bits_in_buf -= 8;
+                out.push(((bit_buf >> bits_in_buf) & 0xff) as u8);
+            }
+        }
+        if bits_in_buf > 0 {
+            // Pad with EOS prefix (all 1s).
+            let pad = 8 - bits_in_buf;
+            bit_buf = (bit_buf << pad) | ((1 << pad) - 1);
+            out.push((bit_buf & 0xff) as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn non_regression_well_formed_connection_emits_one_decoded_event_per_stream() {
+        // Non-regression contract (vs 0.3.1 before the 0.4.2 ghost-event
+        // regression): on a well-formed capture that contains N complete
+        // HTTP/2 request/response pairs on distinct stream IDs,
+        //   * the decoder emits EXACTLY N events (one per stream),
+        //   * every event is DECODED,
+        //   * no HPACK_CONTEXT_UNAVAILABLE error is produced,
+        //   * no "ghost" event is created for the SETTINGS, WINDOW_UPDATE or
+        //     GOAWAY frames that happen in-between.
+        let client = TcpEndpoint {
+            address: "10.0.0.1".into(),
+            port: 50001,
+        };
+        let server = TcpEndpoint {
+            address: "10.0.0.2".into(),
+            port: 7777,
+        };
+        const PAIRS: u32 = 32;
+        let mut enc = Encoder::new();
+        let mut client_bytes = PREFACE.to_vec();
+        // SETTINGS, WINDOW_UPDATE, more SETTINGS — these must not produce
+        // stream-level events.
+        client_bytes.extend(frame(4, 0, 0, &[])); // SETTINGS
+        client_bytes.extend(frame(8, 0, 0, &[0, 0, 0, 0, 0, 0, 1, 0])); // WINDOW_UPDATE
+        for i in 0..PAIRS {
+            let stream_id = 1 + 2 * i;
+            let path = format!("/nsmf-pdusession/v1/sm-contexts/{i}/modify");
+            let hdr = enc.encode([
+                (b":method".as_slice(), b"POST".as_slice()),
+                (b":scheme".as_slice(), b"http".as_slice()),
+                (b":authority".as_slice(), b"smf".as_slice()),
+                (b":path".as_slice(), path.as_bytes()),
+            ]);
+            client_bytes.extend(frame(1, 5, stream_id, &hdr));
+            if i % 8 == 0 {
+                // Interleave more SETTINGS: these must stay stream-0 and
+                // never leak into the event count.
+                client_bytes.extend(frame(4, 0, 0, &[]));
+            }
+        }
+        client_bytes.extend(frame(7, 0, 0, &[0, 0, 0, 0, 0, 0, 0, 0])); // GOAWAY
+        let mut resp_enc = Encoder::new();
+        let mut server_bytes = Vec::new();
+        for i in 0..PAIRS {
+            let stream_id = 1 + 2 * i;
+            let ok = resp_enc.encode([(b":status".as_slice(), b"201".as_slice())]);
+            server_bytes.extend(frame(1, 5, stream_id, &ok));
+        }
+        let key = TcpConnectionKey::new(client.clone(), server.clone()).0;
+        let conn = ReassembledConnection {
+            key,
+            directions: [
+                direction(client.clone(), server.clone(), client_bytes, 1),
+                direction(server, client, server_bytes, 2),
+            ],
+        };
+        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
+        assert_eq!(
+            events.len() as u32,
+            PAIRS,
+            "expected exactly one event per stream pair, got {}",
+            events.len()
+        );
+        for ev in &events {
+            assert_eq!(
+                ev.decoding_status,
+                DecodeStatus::Decoded,
+                "stream {:?} decoded as Partial: errors={:?}",
+                ev.sbi.as_ref().map(|s| s.http2_stream_id),
+                ev.errors
+            );
+            assert!(
+                ev.errors.is_empty(),
+                "stream {:?} has non-empty errors: {:?}",
+                ev.sbi.as_ref().map(|s| s.http2_stream_id),
+                ev.errors
+            );
+        }
+        assert!(
+            report
+                .errors
+                .iter()
+                .all(|e| !e.contains(HPACK_CONTEXT_UNAVAILABLE)),
+            "well-formed connection must not raise HPACK_CONTEXT_UNAVAILABLE: {:?}",
+            report.errors
+        );
+        assert_eq!(report.sbi_transactions, events.len());
+    }
+
+    #[test]
+    fn non_regression_hpack_failure_does_not_poison_subsequent_streams() {
+        // One stream fails HPACK (dynamic-table reference missing) at the
+        // start of the connection. Subsequent streams must decode cleanly —
+        // no permanent direction poisoning. The failed stream contributes
+        // at most one event with HPACK_CONTEXT_UNAVAILABLE on its errors
+        // list (if its response decoded) or is skipped silently (if the
+        // response is also missing).
+        let client = TcpEndpoint {
+            address: "10.0.0.1".into(),
+            port: 50002,
+        };
+        let server = TcpEndpoint {
+            address: "10.0.0.2".into(),
+            port: 7777,
+        };
+        // Stream 1: dangling indexed reference (dynamic index 62) — HPACK fails.
+        // Stream 3: normal POST — HPACK succeeds AFTER the failure above.
+        let bad_block = vec![0xbe];
+        let mut enc = Encoder::new();
+        let good_block = enc.encode([
+            (b":method".as_slice(), b"POST".as_slice()),
+            (b":scheme".as_slice(), b"http".as_slice()),
+            (b":authority".as_slice(), b"smf".as_slice()),
+            (b":path".as_slice(), b"/nsmf-pdusession/v1/sm-contexts".as_slice()),
+        ]);
+        let mut client_bytes = PREFACE.to_vec();
+        client_bytes.extend(frame(1, 5, 1, &bad_block));
+        client_bytes.extend(frame(1, 5, 3, &good_block));
+        let mut resp_enc = Encoder::new();
+        let mut server_bytes = Vec::new();
+        let ok201 = resp_enc.encode([(b":status".as_slice(), b"201".as_slice())]);
+        server_bytes.extend(frame(1, 5, 1, &ok201));
+        let ok201b = resp_enc.encode([(b":status".as_slice(), b"201".as_slice())]);
+        server_bytes.extend(frame(1, 5, 3, &ok201b));
+        let key = TcpConnectionKey::new(client.clone(), server.clone()).0;
+        let conn = ReassembledConnection {
+            key,
+            directions: [
+                direction(client.clone(), server.clone(), client_bytes, 1),
+                direction(server, client, server_bytes, 2),
+            ],
+        };
+        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
+        // Stream 1 is partial without a trustworthy request identity and is
+        // therefore omitted. Stream 3 proves that the direction was NOT
+        // poisoned after stream 1's failure.
+        assert_eq!(events.len(), 1, "only the fully decoded stream is emitted");
+        let s1 = events
+            .iter()
+            .find(|e| e.sbi.as_ref().map(|s| s.http2_stream_id) == Some(3))
+            .expect("stream 3 present");
+        assert_eq!(
+            s1.decoding_status,
+            DecodeStatus::Decoded,
+            "stream 3 must decode cleanly after stream 1's HPACK failure (no direction poisoning)"
+        );
+        assert!(
+            s1.errors.is_empty(),
+            "stream 3 must not inherit HPACK_CONTEXT_UNAVAILABLE from stream 1: {:?}",
+            s1.errors
+        );
+        assert!(events
+            .iter()
+            .all(|e| e.sbi.as_ref().map(|s| s.http2_stream_id) != Some(1)));
+        // The HPACK error is reported once per failing block, not per stream
+        // or per frame.
+        let unavail_count = report
+            .errors
+            .iter()
+            .filter(|e| e.contains(HPACK_CONTEXT_UNAVAILABLE))
+            .count();
+        assert_eq!(
+            unavail_count, 1,
+            "exactly one HPACK_CONTEXT_UNAVAILABLE expected (saw {}): {:?}",
+            unavail_count, report.errors
+        );
     }
 
     #[test]

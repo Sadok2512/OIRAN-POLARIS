@@ -5,11 +5,12 @@ use serde::Deserialize;
 use session_engine::{component, Association, DiscoveryResult, EventRecord, Reconstruction};
 use std::collections::BTreeMap;
 
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.5.0";
 pub const RULE_VERSION: &str = "1.0.0";
 pub const DISCOVERY_RULE_VERSION: &str = "1.1.0";
 pub const SBI_RULE_VERSION: &str = "1.0.0";
 pub const E2E_EVIDENCE_RULE_VERSION: &str = "2.0.0";
+pub const LTE_RULE_VERSION: &str = "1.0.0-offline.1";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TunnelCorrelationKey {
@@ -177,6 +178,117 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
     edges
 }
 
+/// Prepares explicit LTE bearer edges without using timestamp proximity or
+/// subscriber identity. Real-world certification remains gated on an ANR1
+/// fixture; these rules only accept unique, same-capture TEID evidence.
+pub fn correlate_lte_evidence(events: &[EventRecord]) -> Vec<CorrelationEdge> {
+    let s1ap = events
+        .iter()
+        .filter(|event| event.interface == "S1-MME" && event.protocol == "S1AP")
+        .flat_map(|event| {
+            event
+                .identifier_values("erab_teid")
+                .into_iter()
+                .filter_map(normalize_teid)
+                .map(|teid| (event, teid))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let s11 = events
+        .iter()
+        .filter(|event| event.interface == "S11" && event.protocol == "GTPv2-C")
+        .flat_map(|event| {
+            ["bearer_f_teid", "f_teid"]
+                .into_iter()
+                .flat_map(|name| event.identifier_values(name))
+                .filter_map(normalize_teid)
+                .map(|teid| (event, teid))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let s1u = events
+        .iter()
+        .filter(|event| event.interface == "S1-U" && event.protocol == "GTP-U")
+        .filter_map(|event| {
+            normalize_teid(event.first_identifier("teid")?).map(|teid| (event, teid))
+        })
+        .collect::<Vec<_>>();
+    let mut edges = Vec::new();
+    for (control, teid) in &s11 {
+        let candidates = s1u
+            .iter()
+            .filter(|(user, candidate)| {
+                candidate == teid && capture_scope(user) == capture_scope(control)
+            })
+            .collect::<Vec<_>>();
+        let endpoint_pairs = candidates
+            .iter()
+            .map(|(event, _)| {
+                let mut endpoints = [
+                    event.source_address.as_str(),
+                    event.destination_address.as_str(),
+                ];
+                endpoints.sort();
+                format!("{}|{}", endpoints[0], endpoints[1])
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let controls = s11
+            .iter()
+            .filter(|(other, candidate)| {
+                candidate == teid && capture_scope(other) == capture_scope(control)
+            })
+            .count();
+        if controls == 1 && !candidates.is_empty() && endpoint_pairs.len() == 1 {
+            let mut found = edge(
+                control,
+                candidates[0].0,
+                vec![
+                    format!("teid={teid}"),
+                    format!("capture_scope={}", capture_scope(control)),
+                ],
+                "gtpv2c-s1u-unique-teid",
+                "EXACT",
+                "A unique S11 bearer F-TEID equals a unique S1-U GTP-U TEID in the same capture scope",
+            );
+            found.rule_version = LTE_RULE_VERSION.into();
+            found.evidence_type = "EXACT_TUNNEL_MATCH".into();
+            found.scope = "lte-bearer-tunnel-only".into();
+            found.limitations = vec![
+                "Synthetic preparation rule; real LTE evidence is not ANR1-certified".into(),
+                "The tunnel match does not independently prove subscriber identity".into(),
+            ];
+            edges.push(found);
+        }
+    }
+    for (radio, teid) in &s1ap {
+        let candidates = s11
+            .iter()
+            .filter(|(control, candidate)| {
+                candidate == teid && capture_scope(control) == capture_scope(radio)
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() == 1 {
+            let mut found = edge(
+                radio,
+                candidates[0].0,
+                vec![format!("erab_teid={teid}")],
+                "s1ap-gtpv2c-explicit-bearer-teid",
+                "STRONG",
+                "An explicit S1AP E-RAB TEID equals a unique S11 bearer F-TEID in the same capture scope",
+            );
+            found.rule_version = LTE_RULE_VERSION.into();
+            found.evidence_type = "STRONG_BEARER_ASSOCIATION".into();
+            found.scope = "lte-bearer-control-plane".into();
+            found.limitations = vec![
+                "Requires certified nested E-RAB TEID extraction before production use".into(),
+            ];
+            edges.push(found);
+        }
+    }
+    edges.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
+    edges
+}
+
 fn normalize_teid(value: &str) -> Option<String> {
     let raw = value
         .trim()
@@ -192,24 +304,64 @@ fn tunnel_key(event: &EventRecord) -> Option<TunnelCorrelationKey> {
     tunnel_keys(event).into_iter().next()
 }
 
+fn directional_tunnel_components(value: &str) -> Vec<(String, String)> {
+    let components = value
+        .split(',')
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            Some((key.trim().to_owned(), value.trim().to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut pairs = Vec::new();
+    for direction in ["ul", "dl"] {
+        let endpoint_suffix = format!("tunnel_ip_{direction}");
+        let teid_suffix = format!("gtp_teid_{direction}");
+        for (endpoint_key, endpoint) in components.iter().filter(|(key, _)| {
+            key.as_str() == endpoint_suffix || key.ends_with(&format!("_{endpoint_suffix}"))
+        }) {
+            let prefix = endpoint_key
+                .strip_suffix(&endpoint_suffix)
+                .unwrap_or_default();
+            let teid_key = format!("{prefix}{teid_suffix}");
+            if let Some(teid) = components.get(&teid_key).and_then(|value| normalize_teid(value)) {
+                pairs.push((endpoint.clone(), teid));
+            }
+        }
+    }
+    pairs
+}
+
 fn tunnel_keys(event: &EventRecord) -> Vec<TunnelCorrelationKey> {
     let mut keys = event
         .information_elements
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|ie| {
-            let value = ie.get("value")?.as_str()?;
-            let endpoint_ip =
-                component(value, "tunnel_endpoint_ip").or_else(|| component(value, "ipv4"))?;
-            let teid = component(value, "gtp_teid")
-                .or_else(|| component(value, "teid"))
-                .and_then(|value| normalize_teid(&value))?;
-            Some(TunnelCorrelationKey {
-                endpoint_ip,
-                teid,
-                capture_id: capture_scope(event),
+        .flat_map(|ie| {
+            let Some(value) = ie.get("value").and_then(serde_json::Value::as_str) else {
+                return Vec::new();
+            };
+            let mut components = [
+                ("tunnel_endpoint_ip", "gtp_teid"),
+                ("ipv4", "teid"),
+            ]
+            .into_iter()
+            .filter_map(|(endpoint_name, teid_name)| {
+                let endpoint_ip = component(value, endpoint_name)?;
+                let teid = component(value, teid_name)
+                    .and_then(|value| normalize_teid(&value))?;
+                Some((endpoint_ip, teid))
             })
+            .collect::<Vec<_>>();
+            components.extend(directional_tunnel_components(value));
+            components
+                .into_iter()
+                .map(|(endpoint_ip, teid)| TunnelCorrelationKey {
+                    endpoint_ip,
+                    teid,
+                    capture_id: capture_scope(event),
+                })
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
     keys.sort();
@@ -798,7 +950,7 @@ mod tests {
                 json!([]),
             ),
         ];
-        let discovery = discover_sessions(events.clone());
+        let discovery = discover_sessions(&mut events.clone());
         let edges = correlate_discovered_tunnels(&events, &discovery);
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].confidence, "EXACT");
@@ -838,7 +990,7 @@ mod tests {
                 json!([]),
             ),
         ];
-        let discovery = discover_sessions(events.clone());
+        let discovery = discover_sessions(&mut events.clone());
         assert!(discovery.gtpu_tunnels[0].related_pfcp_session.is_none());
         assert!(correlate_discovered_tunnels(&events, &discovery).is_empty());
     }
@@ -933,6 +1085,40 @@ mod tests {
     }
 
     #[test]
+    fn exact_tunnel_match_normalizes_directional_ngap_transfer_fields() {
+        let mut n2 = e(
+            "n2",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            801,
+            &[("pdu_session_id", "1")],
+            json!([{"value":"item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0xf68d"}]),
+        );
+        n2.packet_references[0].source_file =
+            "/var/lib/oiran/captures/continuous-lab-import/pcap/N2.pcap0".into();
+        let mut n4 = e(
+            "n4",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            803,
+            &[],
+            json!([{"value":"teid=0x0000f68d,v4=true,ipv4=10.77.22.13"}]),
+        );
+        n4.packet_references[0].source_file =
+            "/var/lib/oiran/captures/continuous-lab-import/pcap/N4.pcap0".into();
+
+        let edges = correlate_cross_interface_evidence(&[n2, n4]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].evidence_type, "EXACT_TUNNEL_MATCH");
+        assert!(edges[0]
+            .matching_identifiers
+            .iter()
+            .any(|identifier| identifier == "teid=0xf68d"));
+    }
+
+    #[test]
     fn reused_tunnel_tuple_is_rejected_as_ambiguous() {
         let mut events = Vec::new();
         for (id, packet) in [("n2-a", 1), ("n2-b", 2)] {
@@ -962,5 +1148,114 @@ mod tests {
             "/var/lib/oiran/captures/job-1/pcap/N4.pcap0".into();
         events.push(pfcp);
         assert!(correlate_cross_interface_evidence(&events).is_empty());
+    }
+
+    #[test]
+    fn lte_unique_s11_s1u_teid_builds_exact_edge() {
+        let s11 = e(
+            "s11",
+            "S11",
+            "GTPv2-C",
+            "CreateSessionResponse",
+            1,
+            &[("bearer_f_teid", "0x01020304")],
+            json!([]),
+        );
+        let s1u = e(
+            "s1u",
+            "S1-U",
+            "GTP-U",
+            "G-PDU",
+            2,
+            &[("teid", "0x01020304")],
+            json!([]),
+        );
+        let mut s1u_second_packet = s1u.clone();
+        s1u_second_packet.event_id = "s1u-second-packet".into();
+        s1u_second_packet.packet_references[0].packet_number = 3;
+        let edges = correlate_lte_evidence(&[s11, s1u, s1u_second_packet]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].confidence, "EXACT");
+        assert_eq!(edges[0].rule_version, LTE_RULE_VERSION);
+        assert_eq!(edges[0].source_interface, "S11");
+        assert_eq!(edges[0].target_interface, "S1-U");
+    }
+
+    #[test]
+    fn lte_reused_teid_does_not_force_edge() {
+        let s11a = e(
+            "s11-a",
+            "S11",
+            "GTPv2-C",
+            "CreateSessionResponse",
+            1,
+            &[("bearer_f_teid", "0x01020304")],
+            json!([]),
+        );
+        let mut s11b = s11a.clone();
+        s11b.event_id = "s11-b".into();
+        s11b.packet_references[0].packet_number = 2;
+        let s1u = e(
+            "s1u",
+            "S1-U",
+            "GTP-U",
+            "G-PDU",
+            3,
+            &[("teid", "0x01020304")],
+            json!([]),
+        );
+        assert!(correlate_lte_evidence(&[s11a, s11b, s1u]).is_empty());
+    }
+
+    #[test]
+    fn lte_two_ue_bearers_do_not_cross_correlate() {
+        let mut events = Vec::new();
+        for (ordinal, teid) in [(1u64, "0x01020304"), (2u64, "0x05060708")] {
+            events.push(e(
+                &format!("s1ap-{ordinal}"),
+                "S1-MME",
+                "S1AP",
+                "E-RABSetupResponse",
+                ordinal * 10,
+                &[("erab_teid", teid)],
+                json!([]),
+            ));
+            events.push(e(
+                &format!("s11-{ordinal}"),
+                "S11",
+                "GTPv2-C",
+                "CreateSessionResponse",
+                ordinal * 10 + 1,
+                &[("bearer_f_teid", teid)],
+                json!([]),
+            ));
+            events.push(e(
+                &format!("s1u-{ordinal}"),
+                "S1-U",
+                "GTP-U",
+                "G-PDU",
+                ordinal * 10 + 2,
+                &[("teid", teid)],
+                json!([]),
+            ));
+        }
+        let edges = correlate_lte_evidence(&events);
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/lte-offline-certification-synthetic-manifest.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            edges.len() as u64,
+            manifest["expected"]["correlation_edges"].as_u64().unwrap()
+        );
+        for teid in ["0x1020304", "0x5060708"] {
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|edge| edge.matching_identifiers.iter().any(|id| id.contains(teid)))
+                    .count(),
+                2
+            );
+        }
     }
 }

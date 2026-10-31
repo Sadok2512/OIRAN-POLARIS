@@ -25,9 +25,14 @@ impl DecodeStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Protocol {
     Ngap,
+    S1ap,
     Nas5gs,
     Nas5gmm,
     Nas5gsm,
+    NasEpsMm,
+    NasEpsSm,
+    Gtpv2c,
+    Diameter,
     Pfcp,
     Gtpu,
     Sctp,
@@ -38,9 +43,14 @@ impl Protocol {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Ngap => "NGAP",
+            Self::S1ap => "S1AP",
             Self::Nas5gs => "NAS-5GS",
             Self::Nas5gmm => "NAS-5GMM",
             Self::Nas5gsm => "NAS-5GSM",
+            Self::NasEpsMm => "NAS-EPS-MM",
+            Self::NasEpsSm => "NAS-EPS-SM",
+            Self::Gtpv2c => "GTPv2-C",
+            Self::Diameter => "DIAMETER",
             Self::Pfcp => "PFCP",
             Self::Gtpu => "GTP-U",
             Self::Sctp => "SCTP",
@@ -296,37 +306,92 @@ pub fn stable_hash(bytes: &[u8]) -> u64 {
     }
     h
 }
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut msg = bytes.to_vec();
-    let bit_len = (msg.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+/// Streaming SHA-256 hasher. Memory is bounded to a 64-byte block buffer and
+/// the 8-word running state (72 bytes total) regardless of input size — the
+/// convenience `sha256_hex(bytes)` is kept for backward compatibility and is
+/// now implemented on top of it.
+pub struct Sha256Hasher {
+    h: [u32; 8],
+    buffer: [u8; 64],
+    buffered: usize,
+    total_len: u64,
+}
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+    0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+    0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+    0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+    0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+    0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+    0xc67178f2,
+];
+
+impl Default for Sha256Hasher {
+    fn default() -> Self {
+        Self {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buffer: [0; 64],
+            buffered: 0,
+            total_len: 0,
+        }
     }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-    let mut h = [
-        0x6a09e667u32,
-        0xbb67ae85,
-        0x3c6ef372,
-        0xa54ff53a,
-        0x510e527f,
-        0x9b05688c,
-        0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    for chunk in msg.chunks_exact(64) {
+}
+
+impl Sha256Hasher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+        let mut data = data;
+        if self.buffered > 0 {
+            let needed = 64 - self.buffered;
+            let take = data.len().min(needed);
+            self.buffer[self.buffered..self.buffered + take].copy_from_slice(&data[..take]);
+            self.buffered += take;
+            data = &data[take..];
+            if self.buffered == 64 {
+                let block = self.buffer;
+                self.compress(&block);
+                self.buffered = 0;
+            }
+        }
+        while data.len() >= 64 {
+            let (chunk, rest) = data.split_at(64);
+            let mut block = [0u8; 64];
+            block.copy_from_slice(chunk);
+            self.compress(&block);
+            data = rest;
+        }
+        if !data.is_empty() {
+            self.buffer[..data.len()].copy_from_slice(data);
+            self.buffered = data.len();
+        }
+    }
+
+    pub fn finish_hex(mut self) -> String {
+        let bit_len = self.total_len.wrapping_mul(8);
+        // Append 0x80, pad zeros so remaining length (mod 64) == 56, append
+        // 8-byte big-endian bit length.
+        let mut tail = [0u8; 72]; // worst case: 0x80 + 63 zeros + 8 length bytes
+        tail[0] = 0x80;
+        let pad = (56 - ((self.buffered as isize + 1) % 64) + 64) as usize % 64;
+        let bit_len_bytes = bit_len.to_be_bytes();
+        tail[1 + pad..1 + pad + 8].copy_from_slice(&bit_len_bytes);
+        self.update(&tail[..1 + pad + 8]);
+        debug_assert_eq!(self.buffered, 0);
+        self.h.iter().map(|v| format!("{v:08x}")).collect()
+    }
+
+    fn compress(&mut self, chunk: &[u8; 64]) {
         let mut w = [0u32; 64];
         for (i, word) in w[..16].iter_mut().enumerate() {
             *word = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().expect("word"));
@@ -339,15 +404,16 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
                 .wrapping_add(w[i - 7])
                 .wrapping_add(s1);
         }
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
-            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) = (
+            self.h[0], self.h[1], self.h[2], self.h[3], self.h[4], self.h[5], self.h[6], self.h[7],
+        );
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ (!e & g);
             let t1 = hh
                 .wrapping_add(s1)
                 .wrapping_add(ch)
-                .wrapping_add(K[i])
+                .wrapping_add(SHA256_K[i])
                 .wrapping_add(w[i]);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
@@ -362,10 +428,15 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
             a = t1.wrapping_add(t2);
         }
         for (i, v) in [a, b, c, d, e, f, g, hh].iter().enumerate() {
-            h[i] = h[i].wrapping_add(*v);
+            self.h[i] = self.h[i].wrapping_add(*v);
         }
     }
-    h.iter().map(|v| format!("{v:08x}")).collect()
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(bytes);
+    hasher.finish_hex()
 }
 pub fn pseudonym(label: &str, bytes: &[u8]) -> String {
     let mut material = label.as_bytes().to_vec();

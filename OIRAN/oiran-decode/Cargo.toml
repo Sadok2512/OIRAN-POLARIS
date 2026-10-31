@@ -1,6 +1,6 @@
 [package]
 name = "oiran-decode"
-version = "0.3.0"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -10,12 +10,12 @@ capture-pcap = { path = "../capture-pcap" }
 transport-sctp = { path = "../transport-sctp" }
 transport-tcp = { path = "../transport-tcp" }
 decoder-ngap = { path = "../decoder-ngap" }
+decoder-s1ap = { path = "../decoder-s1ap" }
 decoder-pfcp = { path = "../decoder-pfcp" }
 decoder-gtpu = { path = "../decoder-gtpu" }
+decoder-gtpv2c = { path = "../decoder-gtpv2c" }
 decoder-sbi = { path = "../decoder-sbi" }
 event-schema = { path = "../event-schema" }
 plugin-runtime = { path = "../plugin-runtime" }
 serde = { version = "1.0", features = ["derive"] }
-
-[dev-dependencies]
 serde_json = "1.0"

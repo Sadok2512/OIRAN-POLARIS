@@ -1,0 +1,72 @@
+{
+  "schema_version": "1.0.0",
+  "certification_state": "ANR1_APPROVAL_REQUIRED",
+  "fixture_id": "REPLACE_WITH_OPAQUE_FIXTURE_ID",
+  "technology": "LTE",
+  "capture_mode": "OFFLINE_EXISTING_EVIDENCE_ONLY",
+  "real_capture": true,
+  "anonymization": {
+    "method": "REPLACE_WITH_APPROVED_METHOD",
+    "reviewed_by": "ANR1_REQUIRED",
+    "clear_subscriber_identities_present": false,
+    "address_mapping": "CONSISTENT_DOCUMENTATION_PREFIX_OR_APPROVED_TOKENIZATION",
+    "forbidden_fields": ["IMSI", "IMEI", "IMEISV", "MSISDN", "GUTI"]
+  },
+  "files": [
+    {
+      "interface": "S1-MME",
+      "protocol": "S1AP_SCTP_PPID_18",
+      "path": "REPLACE_WITH_SANITIZED_RELATIVE_PATH",
+      "sha256": "REPLACE_WITH_64_HEX",
+      "packet_count": null,
+      "size_bytes": null,
+      "first_timestamp_utc": null,
+      "last_timestamp_utc": null
+    },
+    {
+      "interface": "S11",
+      "protocol": "GTPV2_C_UDP_2123",
+      "path": "REPLACE_WITH_SANITIZED_RELATIVE_PATH",
+      "sha256": "REPLACE_WITH_64_HEX",
+      "packet_count": null,
+      "size_bytes": null,
+      "first_timestamp_utc": null,
+      "last_timestamp_utc": null
+    },
+    {
+      "interface": "S1-U",
+      "protocol": "GTP_U_UDP_2152",
+      "path": "REPLACE_WITH_SANITIZED_RELATIVE_PATH",
+      "sha256": "REPLACE_WITH_64_HEX",
+      "packet_count": null,
+      "size_bytes": null,
+      "first_timestamp_utc": null,
+      "last_timestamp_utc": null
+    }
+  ],
+  "required_procedures": [
+    "S1Setup",
+    "Attach",
+    "InitialContextSetup",
+    "E-RABSetup",
+    "CreateSession",
+    "S1-U-G-PDU-UL",
+    "S1-U-G-PDU-DL",
+    "Detach"
+  ],
+  "expected": {
+    "ue_sessions": null,
+    "eps_bearers": null,
+    "distinct_s1u_teids": null,
+    "uplink_packets": null,
+    "downlink_packets": null,
+    "correlation_edges": null,
+    "first_timestamp_utc": null,
+    "last_timestamp_utc": null
+  },
+  "approval": {
+    "anr1_reference": null,
+    "approved_at_utc": null,
+    "notes": "Do not populate or ingest before ANR1 certification."
+  }
+}

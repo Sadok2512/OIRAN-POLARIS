@@ -17,7 +17,7 @@ fn main() {
             }
         }
     }
-    let result = discover_sessions(events);
+    let result = discover_sessions(&mut events);
     println!(
         "{}",
         serde_json::to_string_pretty(&result).expect("serialize discovery result")

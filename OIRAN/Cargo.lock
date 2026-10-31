@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "callflow-schema"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -174,7 +174,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "correlation-engine"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "callflow-schema",
  "serde",
@@ -190,7 +190,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "decoder-diameter"
+version = "0.2.0"
+dependencies = [
+ "event-schema",
+ "plugin-runtime",
+]
+
+[[package]]
 name = "decoder-gtpu"
+version = "0.2.0"
+dependencies = [
+ "event-schema",
+ "plugin-runtime",
+]
+
+[[package]]
+name = "decoder-gtpv2c"
 version = "0.1.0"
 dependencies = [
  "event-schema",
@@ -199,18 +215,20 @@ dependencies = [
 
 [[package]]
 name = "decoder-nas"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "event-schema",
 ]
 
 [[package]]
 name = "decoder-ngap"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "decoder-nas",
  "event-schema",
  "plugin-runtime",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -222,8 +240,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "decoder-s1ap"
+version = "0.2.0"
+dependencies = [
+ "decoder-nas",
+ "event-schema",
+ "plugin-runtime",
+]
+
+[[package]]
 name = "decoder-sbi"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "event-schema",
  "hpack",
@@ -414,7 +441,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "live-probe"
-version = "0.1.0-dev"
+version = "0.2.7"
 dependencies = [
  "callflow-renderer",
  "callflow-schema",
@@ -503,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.3.0-dev"
+version = "2.5.4"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -537,12 +564,14 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "capture-pcap",
  "decoder-gtpu",
+ "decoder-gtpv2c",
  "decoder-ngap",
  "decoder-pfcp",
+ "decoder-s1ap",
  "decoder-sbi",
  "event-schema",
  "plugin-runtime",
@@ -686,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "session-engine"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
