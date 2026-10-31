@@ -227,12 +227,9 @@ impl DockerSrsranRuntime {
         )?;
         let f = data.stdout.trim().splitn(8, '|').collect::<Vec<_>>();
         let digest_matches = !matches!(service, "srsenb" | "srsue")
-            || f.get(7).is_some_and(|reference| *reference == EXPECTED_IMAGE_REFERENCE);
-        if f.len() != 8
-            || f[1] != PROJECT
-            || f[2] != service
-            || f[3] != COMPOSE
-            || !digest_matches
+            || f.get(7)
+                .is_some_and(|reference| *reference == EXPECTED_IMAGE_REFERENCE);
+        if f.len() != 8 || f[1] != PROJECT || f[2] != service || f[3] != COMPOSE || !digest_matches
         {
             return Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into());
         }
@@ -399,10 +396,12 @@ impl DockerSrsranRuntime {
             .find_map(|w| {
                 (w[0] == "inet")
                     .then(|| w[1].split('/').next().unwrap_or_default().to_string())
-                    .filter(|v| v.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| {
-                        let octets = ip.octets();
-                        octets[0] == 10 && octets[1] == 45
-                    }))
+                    .filter(|v| {
+                        v.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| {
+                            let octets = ip.octets();
+                            octets[0] == 10 && octets[1] == 45
+                        })
+                    })
             })
     }
     fn apn() -> String {

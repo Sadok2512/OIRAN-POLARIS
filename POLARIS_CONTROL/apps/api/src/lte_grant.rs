@@ -49,8 +49,8 @@ impl ProfileRegistry {
         };
         let mut registry = match fs::read(&path) {
             Ok(bytes) => {
-                let mut stored: LteProfileRecord = serde_json::from_slice(&bytes)
-                    .map_err(|_| "LTE_PROFILE_REGISTRY_INVALID")?;
+                let mut stored: LteProfileRecord =
+                    serde_json::from_slice(&bytes).map_err(|_| "LTE_PROFILE_REGISTRY_INVALID")?;
                 if stored.profile_id != PROFILE_ID
                     || stored.owner != "POLARIS_CONTROLLER"
                     || stored.compose_project != "oiran-lab"
@@ -61,7 +61,10 @@ impl ProfileRegistry {
                     return Err("LTE_PROFILE_REGISTRY_OWNERSHIP_CONFLICT".into());
                 }
                 stored.configuration_sha256 = expected.configuration_sha256;
-                Self { path, profile: stored }
+                Self {
+                    path,
+                    profile: stored,
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self {
                 path,
@@ -512,7 +515,9 @@ fn atomic_write_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::create_dir_all(parent).map_err(|_| "LTE_GRANT_STORE_WRITE_FAILED")?;
     let temp = parent.join(format!(
         ".{}.{}.tmp",
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("lte-store"),
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("lte-store"),
         std::process::id()
     ));
     let mut file = OpenOptions::new()
@@ -619,7 +624,14 @@ mod tests {
         let path = path("persistent");
         let mut store = GrantStore::load(path.clone()).unwrap();
         store
-            .create(request(), "grant-1".into(), 100, "operator", "session-a", "request-123")
+            .create(
+                request(),
+                "grant-1".into(),
+                100,
+                "operator",
+                "session-a",
+                "request-123",
+            )
             .unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains(&"n".repeat(43)));
@@ -637,7 +649,14 @@ mod tests {
         let path = path("consume");
         let mut store = GrantStore::load(path.clone()).unwrap();
         store
-            .create(request(), "grant-1".into(), 100, "operator", "session-a", "request-123")
+            .create(
+                request(),
+                "grant-1".into(),
+                100,
+                "operator",
+                "session-a",
+                "request-123",
+            )
             .unwrap();
         let run = RunRequest {
             grant_id: "grant-1".into(),
@@ -649,18 +668,42 @@ mod tests {
             scenario_sha256: SCENARIO_SHA256.into(),
         };
         assert!(store
-            .consume(&run, &"n".repeat(43), "run-request-1", "lte-run-1".into(), 101, "operator", "session-a")
+            .consume(
+                &run,
+                &"n".repeat(43),
+                "run-request-1",
+                "lte-run-1".into(),
+                101,
+                "operator",
+                "session-a"
+            )
             .is_ok());
         assert_eq!(
             store
-                .consume(&run, &"n".repeat(43), "run-request-1", "lte-run-ignored".into(), 102, "operator", "session-a")
+                .consume(
+                    &run,
+                    &"n".repeat(43),
+                    "run-request-1",
+                    "lte-run-ignored".into(),
+                    102,
+                    "operator",
+                    "session-a"
+                )
                 .unwrap()
                 .run_id,
             "lte-run-1"
         );
         assert_eq!(
             store
-                .consume(&run, &"n".repeat(43), "run-request-2", "lte-run-2".into(), 102, "operator", "session-a")
+                .consume(
+                    &run,
+                    &"n".repeat(43),
+                    "run-request-2",
+                    "lte-run-2".into(),
+                    102,
+                    "operator",
+                    "session-a"
+                )
                 .unwrap_err(),
             "LIVE_GRANT_REPLAYED"
         );
@@ -672,12 +715,26 @@ mod tests {
         let path = path("bounds");
         let mut store = GrantStore::load(path.clone()).unwrap();
         let first = store
-            .create(request(), "grant-1".into(), 100, "operator", "session-a", "request-123")
+            .create(
+                request(),
+                "grant-1".into(),
+                100,
+                "operator",
+                "session-a",
+                "request-123",
+            )
             .unwrap();
         assert!(!first.1);
         assert!(
             store
-                .create(request(), "grant-2".into(), 101, "operator", "session-a", "request-123")
+                .create(
+                    request(),
+                    "grant-2".into(),
+                    101,
+                    "operator",
+                    "session-a",
+                    "request-123"
+                )
                 .unwrap()
                 .1
         );
@@ -685,7 +742,14 @@ mod tests {
         changed.duration_seconds = 200;
         assert_eq!(
             store
-                .create(changed, "grant-3".into(), 101, "operator", "session-a", "request-123")
+                .create(
+                    changed,
+                    "grant-3".into(),
+                    101,
+                    "operator",
+                    "session-a",
+                    "request-123"
+                )
                 .unwrap_err(),
             "IDEMPOTENCY_KEY_CONFLICT"
         );
@@ -703,7 +767,14 @@ mod tests {
         let path = path("subject-binding");
         let mut store = GrantStore::load(path.clone()).unwrap();
         store
-            .create(request(), "grant-1".into(), 100, "operator", "session-a", "request-123")
+            .create(
+                request(),
+                "grant-1".into(),
+                100,
+                "operator",
+                "session-a",
+                "request-123",
+            )
             .unwrap();
         let run = RunRequest {
             grant_id: "grant-1".into(),
@@ -716,13 +787,29 @@ mod tests {
         };
         assert_eq!(
             store
-                .consume(&run, &"n".repeat(43), "run-request-1", "lte-run-1".into(), 101, "operator", "session-b")
+                .consume(
+                    &run,
+                    &"n".repeat(43),
+                    "run-request-1",
+                    "lte-run-1".into(),
+                    101,
+                    "operator",
+                    "session-b"
+                )
                 .unwrap_err(),
             "GRANT_SUBJECT_CHANGED"
         );
         assert_eq!(
             store
-                .consume(&run, &"n".repeat(43), "run-request-2", "lte-run-2".into(), 101, "administrator", "session-a")
+                .consume(
+                    &run,
+                    &"n".repeat(43),
+                    "run-request-2",
+                    "lte-run-2".into(),
+                    101,
+                    "administrator",
+                    "session-a"
+                )
                 .unwrap_err(),
             "GRANT_SUBJECT_CHANGED"
         );
@@ -744,18 +831,41 @@ mod tests {
         };
         let mut store = GrantStore::load(path.clone()).unwrap();
         store
-            .create(request(), "grant-1".into(), 100, "operator", "session-a", "request-123")
+            .create(
+                request(),
+                "grant-1".into(),
+                100,
+                "operator",
+                "session-a",
+                "request-123",
+            )
             .unwrap();
         assert_eq!(
             store
-                .consume(&run, &"x".repeat(43), "run-request-1", "lte-run-1".into(), 101, "operator", "session-a")
+                .consume(
+                    &run,
+                    &"x".repeat(43),
+                    "run-request-1",
+                    "lte-run-1".into(),
+                    101,
+                    "operator",
+                    "session-a"
+                )
                 .unwrap_err(),
             "LIVE_GRANT_NONCE_INVALID"
         );
         store.revoke("grant-1").unwrap();
         assert_eq!(
             store
-                .consume(&run, &"n".repeat(43), "run-request-2", "lte-run-2".into(), 102, "operator", "session-a")
+                .consume(
+                    &run,
+                    &"n".repeat(43),
+                    "run-request-2",
+                    "lte-run-2".into(),
+                    102,
+                    "operator",
+                    "session-a"
+                )
                 .unwrap_err(),
             "LIVE_GRANT_REPLAYED"
         );
@@ -763,13 +873,28 @@ mod tests {
         let mut expired_request = request();
         expired_request.duration_seconds = 1;
         store
-            .create(expired_request, "grant-2".into(), 100, "operator", "session-a", "request-456")
+            .create(
+                expired_request,
+                "grant-2".into(),
+                100,
+                "operator",
+                "session-a",
+                "request-456",
+            )
             .unwrap();
         let mut expired_run = run;
         expired_run.grant_id = "grant-2".into();
         assert_eq!(
             store
-                .consume(&expired_run, &"n".repeat(43), "run-request-3", "lte-run-3".into(), 1_100, "operator", "session-a")
+                .consume(
+                    &expired_run,
+                    &"n".repeat(43),
+                    "run-request-3",
+                    "lte-run-3".into(),
+                    1_100,
+                    "operator",
+                    "session-a"
+                )
                 .unwrap_err(),
             "LIVE_GRANT_INACTIVE"
         );
@@ -783,8 +908,12 @@ mod tests {
         let registry = ProfileRegistry::load_or_seed(path.clone(), "a".repeat(64)).unwrap();
         assert_eq!(registry.profile().profile_id, PROFILE_ID);
         assert!(!registry.profile().enabled);
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         value["ue_service"] = serde_json::json!("open5gs-amf");
         atomic_write_0600(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(
