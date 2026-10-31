@@ -5,6 +5,7 @@ Agent: ANR2
 Candidate received: `staging/polaris-real-lab-v1-anr2` at
 `15a6904f8167e22433937e4a1ebca0bf58e02b2b`  
 Preparation branch: `release/polaris-grant-v2-prep-anr2`  
+Implementation commit: `a772ac4522a17293c78cccd1404ecbdb9d2c281c`
 Verdict: **BLOCKED**
 
 No production file, service, grant, simulator, traffic generator, Open5GS
@@ -26,8 +27,9 @@ ANR1-certified image is `69e094...d43`. With the corrected canonical renderer,
 the current model digest is `66cdaf...04c`; the model rendered with the ANR1
 image would be `308053...a19`. The latter is a **proposed** Compose-model
 digest, not an ANR1-certified digest. It must be independently reproduced and
-co-signed by ANR1 before any release authorization. The final resource reading
-also crossed the RAM gate because of concurrent host workloads.
+co-signed by ANR1 before any release authorization. RAM briefly crossed the
+gate under concurrent host load, then passed on the final reading; it must be
+treated as an immediate preflight gate rather than an assumed capacity.
 
 ## Git lineage and isolation
 
@@ -207,12 +209,14 @@ filesystem /: 53%          (PASS < 85%)
 dumpcap processes: 12      (preserved)
 ```
 
-The final reading was `MemAvailable: 3,485,020 kB`, approximately 3.32 GiB,
-with approximately 16.21 GiB non-available out of 19.53 GiB. This fails both
-RAM release gates at that instant. The largest remaining processes belonged to
-shared host workloads; they were not killed because they are outside this
-mission and may belong to other agents. Disk remained 53% and all 12 dumpcap
-processes remained present.
+An intermediate post-test reading was `MemAvailable: 3,485,020 kB`,
+approximately 3.32 GiB, with approximately 16.21 GiB non-available out of
+19.53 GiB. It failed both RAM release gates at that instant. The largest
+remaining processes belonged to shared host workloads; they were not killed
+because they are outside this mission and may belong to other agents. The final
+reading recovered to `MemAvailable: 5,141,928 kB` (4.90 GiB) and
+15,705,247,744 non-available bytes (14.63 GiB): both RAM gates PASS. Disk
+remained 53% and all 12 dumpcap processes remained present.
 
 The production API stayed at 0.19.8 on `127.0.0.1:49153`; its process and the
 production frontend on loopback port 8021 were not restarted or modified.
@@ -253,8 +257,9 @@ production frontend on loopback port 8021 were not restarted or modified.
    certification alone is insufficient.
 2. The stale `9415af...b92` production pin must be replaced only in an
    authorized, backed-up release window.
-3. RAM must be rechecked and satisfy both `available >= 4 GiB` and
-   `used/non-available <= 16 GiB` immediately before build/activation/recipe.
+3. RAM currently passes but fluctuated below the gate; it must be rechecked and
+   satisfy both `available >= 4 GiB` and `used/non-available <= 16 GiB`
+   immediately before build/activation/recipe.
 4. Full-workspace Rust formatting drift should be resolved or explicitly
    accepted; the changed controller itself is formatted.
 5. Explicit deployment authorization is absent. No production action is
