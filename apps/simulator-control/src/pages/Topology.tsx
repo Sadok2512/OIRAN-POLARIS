@@ -36,8 +36,6 @@ import {
 } from '@/data/queries';
 import type { NodeItem, UeState } from '@/data/polarisTypes';
 
-const CORE_VERSION = 'Open5GS 2.8.0';
-
 const CORE_NF_CATALOGUE: { nf: string; role: string }[] = [
   { nf: 'AMF', role: 'Access & mobility' },
   { nf: 'SMF', role: 'Session management' },
@@ -113,7 +111,8 @@ export function TopologyPage() {
   const errored = lab.error || nodes.error || ues.error;
 
   // Aggregate N2/N3 state across all configured 5G gNBs.
-  const nodeList = nodes.data?.items ?? [];
+  // Planned/unconfigured nodes are not part of the operational topology.
+  const nodeList = (nodes.data?.items ?? []).filter((node) => node.configured);
   const anyLinkUp = nodeList.some(
     (n) =>
       linkState(n.process_state, n.n2_endpoint) === 'configured' ||
@@ -153,7 +152,7 @@ export function TopologyPage() {
         <>
           <Card className="p-5 overflow-x-auto">
             <div className="min-w-[680px] flex flex-col items-center gap-0" data-testid="topology-view">
-              <CoreBlock observed={observed} coreLabel={coreTone.label} />
+              <CoreBlock observed={observed} coreLabel={coreTone.label} nodes={nodeList} />
               <GnbTree nodes={nodeList} uesByNode={uesByNode} />
             </div>
           </Card>
@@ -175,16 +174,19 @@ export function TopologyPage() {
 function CoreBlock({
   observed,
   coreLabel,
+  nodes,
 }: {
   observed: WireLabObserved | undefined;
   coreLabel: string;
+  nodes: NodeItem[];
 }) {
+  const observedPlmns = [...new Set(nodes.map((node) => node.plmn).filter((value) => value && !value.startsWith('NOT_')))];
   return (
     <article className="w-full max-w-3xl rounded-2xl border border-line bg-canvas p-4" data-testid="topology-core-block">
       <header className="flex items-center justify-between gap-2 mb-3">
-        <p className="font-semibold">5G Core · {CORE_VERSION}</p>
+        <p className="font-semibold">Core network · Open5GS</p>
         <span className="mono text-ep-sm text-mute truncate">
-          PLMN 001/01 · S-NSSAI 1/010203 · DNN internet
+          PLMN {observedPlmns.length ? observedPlmns.join(', ') : 'NOT_AVAILABLE'} · S-NSSAI NOT_AVAILABLE · DNN NOT_AVAILABLE
         </span>
       </header>
       <p className="text-ep-xs text-mute mb-2" data-testid="topology-core-status">

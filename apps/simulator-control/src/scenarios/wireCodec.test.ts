@@ -41,6 +41,18 @@ describe('wireCodec — parameter shape (scenario_definitions.rs ParameterSpec)'
       max: 7,
     });
   });
+
+  it('preserves non-numeric fixed parameters without coercing them to NaN', () => {
+    const wire: WireScenarioStep = {
+      type: 'pdu_establish',
+      loop_count: 1,
+      parameters: { dnn: { fixed: 'internet' }, required: { fixed: true } },
+    };
+    const decoded = decodeStep(wire);
+    expect(decoded.params).toEqual({});
+    expect(decoded.preservedWireParameters).toEqual(wire.parameters);
+    expect(encodeStep(decoded)).toEqual(wire);
+  });
 });
 
 describe('wireCodec — step types (6-type whitelist)', () => {
@@ -112,6 +124,9 @@ describe('wireCodec — scenario loop (definition loop_count)', () => {
       id: 'scenario-contract',
       name: 'Contract scenario',
       loop_count: 2,
+      rat: '5G_SA',
+      simulator: 'UERANSIM',
+      description: '',
       steps: [{ type: 'wait', loop_count: 1, parameters: { duration_s: { fixed: 5 } } }],
     });
   });
@@ -144,5 +159,29 @@ describe('wireCodec — definition decoding (measured contract response)', () =>
   it('formats epoch seconds, not milliseconds', () => {
     expect(epochSecondsToLocal(1793186621)).toBe(new Date(1793186621 * 1000).toLocaleString());
     expect(epochSecondsToLocal(null)).toBe('—');
+  });
+
+  it('retains RAT, simulator, description, provenance and support across clone/edit encoding', () => {
+    const enriched: WireScenarioDefinition = {
+      ...measured,
+      rat: 'LTE',
+      simulator: 'srsRAN',
+      description: 'LTE Attach',
+      source_definition_id: 'tpl-lte-attach',
+      backend_support: 'CERTIFICATION_REQUIRED',
+    };
+    const decoded = decodeDefinition(enriched);
+    expect(decoded).toMatchObject({
+      technology: 'LTE',
+      simulator: 'srsRAN',
+      description: 'LTE Attach',
+      sourceDefinitionId: 'tpl-lte-attach',
+      backendSupport: 'CERTIFICATION_REQUIRED',
+    });
+    expect(encodeDefinition(decoded)).toMatchObject({
+      rat: 'LTE',
+      simulator: 'srsRAN',
+      description: 'LTE Attach',
+    });
   });
 });

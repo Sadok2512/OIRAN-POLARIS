@@ -243,7 +243,7 @@ describe('Topology view — mockup fidelity (0.7.0)', () => {
     expect(within(ue13).queryByTestId('topology-ue-UE-13-pdu')).toBeNull();
   });
 
-  it('draws GNB-02 dashed and ENB-01 with LTE labels; both connectors stay gray when no endpoint is reported', async () => {
+  it('does not render configured-only radio plans as observed topology nodes', async () => {
     globalThis.fetch = vi.fn(async (input) => {
       const url = String(input);
       if (url.includes('/auth/me')) return respond(200, { authenticated: false, role: 'viewer' });
@@ -279,16 +279,8 @@ describe('Topology view — mockup fidelity (0.7.0)', () => {
       return respond(200, {});
     }) as unknown as typeof fetch;
     renderPage();
-    await waitFor(() => expect(screen.getByTestId('topology-node-GNB-02')).toBeInTheDocument());
-    const gnb2 = screen.getByTestId('topology-node-GNB-02');
-    expect(within(gnb2).getByTestId('topology-node-card-GNB-02')).toHaveAttribute('data-dashed', 'true');
-    expect(within(gnb2).getByTestId('topology-link-N2 · NGAP')).toHaveAttribute('data-state', 'unknown');
-
-    const enb = screen.getByTestId('topology-node-ENB-01');
-    expect(within(enb).getByTestId('topology-link-S1-MME · S1AP')).toBeInTheDocument();
-    expect(within(enb).getByTestId('topology-link-S1-U · GTP-U')).toBeInTheDocument();
-    // No N2 / N3 labels on an eNB.
-    expect(within(enb).queryByTestId('topology-link-N2 · NGAP')).toBeNull();
-    expect(within(enb).queryByTestId('topology-link-N3 · GTP-U')).toBeNull();
+    await waitFor(() => expect(screen.getByTestId('topology-view')).toBeInTheDocument());
+    expect(screen.queryByTestId('topology-node-GNB-02')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('topology-node-ENB-01')).not.toBeInTheDocument();
   });
 });

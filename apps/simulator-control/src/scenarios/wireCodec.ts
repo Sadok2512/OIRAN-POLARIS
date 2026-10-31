@@ -34,14 +34,14 @@ export const MAX_WIRE_LOOP_COUNT = 10_000;
 
 /* ------------------------------- Wire types ------------------------------- */
 
-export type WireNumericParam =
-  | { fixed: number }
+export type WireScalarParam =
+  | { fixed: number | string | boolean }
   | { random: { min: number; max: number } };
 
 export interface WireScenarioStep {
   type: string;
   loop_count: number;
-  parameters: Record<string, WireNumericParam>;
+  parameters: Record<string, WireScalarParam>;
   /**
    * 0.5.0 — nested step list, used by `type: "repeat"`. Absent on every
    * other step type; the backend validator refuses it elsewhere.
@@ -68,12 +68,20 @@ export interface WireScenarioMutation {
   name: string;
   loop_count: number;
   steps: WireScenarioStep[];
+  rat?: '5G_SA' | 'LTE';
+  simulator?: 'UERANSIM' | 'srsRAN';
+  description?: string;
 }
 
 export interface WireScenarioDefinition extends WireScenarioMutation {
   version: number;
   created_at_epoch_s?: number;
   updated_at_epoch_s?: number;
+  source_definition_id?: string;
+  catalog_scope?: 'SYSTEM' | 'USER';
+  mutable?: boolean;
+  cloneable?: boolean;
+  backend_support?: 'SUPPORTED' | 'BACKEND_REQUIRED' | 'CERTIFICATION_REQUIRED';
 }
 
 export interface WireScenarioDefinitionList {
@@ -157,7 +165,7 @@ export class NonIntegerRandomRangeError extends Error {
 
 /* ----------------------------- Parameter codec ---------------------------- */
 
-export function encodeParam(name: string, value: FixedOrRandom): WireNumericParam {
+export function encodeParam(name: string, value: FixedOrRandom): WireScalarParam {
   if (value.mode === 'fixed') return { fixed: value.value };
   if (!Number.isInteger(value.min) || !Number.isInteger(value.max)) {
     throw new NonIntegerRandomRangeError(name);
@@ -165,10 +173,13 @@ export function encodeParam(name: string, value: FixedOrRandom): WireNumericPara
   return { random: { min: value.min, max: value.max } };
 }
 
-export function decodeParam(value: WireNumericParam | number): FixedOrRandom {
+export function decodeParam(value: WireScalarParam | number): FixedOrRandom {
   // A bare number is not produced by the backend; accepted defensively on read only.
   if (typeof value === 'number') return { mode: 'fixed', value };
-  if ('fixed' in value) return { mode: 'fixed', value: Number(value.fixed) };
+  if ('fixed' in value) {
+    if (typeof value.fixed !== 'number') throw new TypeError('NON_NUMERIC_FIXED_PARAMETER');
+    return { mode: 'fixed', value: value.fixed };
+  }
   return { mode: 'random', min: value.random.min, max: value.random.max };
 }
 
@@ -177,7 +188,7 @@ export function decodeParam(value: WireNumericParam | number): FixedOrRandom {
 export function encodeStep(step: ScenarioStep): WireScenarioStep {
   const type = WIRE_STEP_TYPE[step.kind];
   if (!type) throw new UnsupportedStepTypeError(step.kind);
-  const parameters: Record<string, WireNumericParam> = {};
+  const parameters: Record<string, WireScalarParam> = { ...(step.preservedWireParameters ?? {}) };
   (Object.keys(step.params) as (keyof StepParams)[]).forEach((key) => {
     if (step.kind === 'REPEAT' && key === 'loop_count') return;
     const value = step.params[key];
@@ -198,15 +209,20 @@ export function decodeStep(wire: WireScenarioStep): ScenarioStep {
   const kind = INTERNAL_STEP_KIND[wire.type];
   if (!kind) throw new UnsupportedStepTypeError(wire.type);
   const params: StepParams = {};
+  const preservedWireParameters: Record<string, WireScalarParam> = {};
   for (const [key, value] of Object.entries(wire.parameters)) {
-    if ('fixed' in value && typeof value.fixed !== 'number') continue;
-    (params as Record<string, FixedOrRandom>)[key] = decodeParam(value);
+    if ('fixed' in value && typeof value.fixed !== 'number') {
+      preservedWireParameters[key] = value;
+    } else {
+      (params as Record<string, FixedOrRandom>)[key] = decodeParam(value);
+    }
   }
   if (kind === 'REPEAT') params.loop_count = { mode: 'fixed', value: wire.loop_count ?? 1 };
   return {
     id: newStepId(),
     kind,
     params,
+    ...(Object.keys(preservedWireParameters).length > 0 ? { preservedWireParameters } : {}),
     ...(kind === 'REPEAT' ? { steps: (wire.steps ?? []).map(decodeStep) } : {}),
   };
 }
@@ -239,6 +255,11 @@ export function encodeDefinition(scenario: Scenario): WireScenarioMutation {
     name: scenario.name,
     loop_count: encodeScenarioLoop(scenario),
     steps: scenario.steps.map(encodeStep),
+    ...(scenario.technology ? { rat: scenario.technology } : {}),
+    ...(scenario.technology
+      ? { simulator: scenario.simulator ?? (scenario.technology === 'LTE' ? 'srsRAN' : 'UERANSIM') }
+      : {}),
+    ...(scenario.description !== undefined ? { description: scenario.description } : {}),
   };
 }
 
@@ -249,12 +270,16 @@ export function decodeDefinition(wire: WireScenarioDefinition): Scenario {
   return {
     id: wire.id,
     name: wire.name,
-    description: '',
+    description: wire.description ?? '',
     version: wire.version,
     createdAt: created,
     updatedAt: updated,
     steps: wire.steps.map(decodeStep),
     loop: loopCount > 1 ? { kind: 'FIXED', cycles: loopCount } : { kind: 'ONCE' },
+    technology: wire.rat ?? '5G_SA',
+    simulator: wire.simulator ?? (wire.rat === 'LTE' ? 'srsRAN' : 'UERANSIM'),
+    sourceDefinitionId: wire.source_definition_id,
+    backendSupport: wire.backend_support,
   };
 }
 

@@ -6,7 +6,6 @@
 // surface either way; mutations are async because the backend ones are.
 
 import { useMemo } from 'react';
-import { useFeatureFlag } from '@/data/featureFlags';
 import {
   useCloneScenarioDefinition,
   useCreateScenarioDefinition,
@@ -14,9 +13,9 @@ import {
   useScenarioDefinitions,
   useUpdateScenarioDefinition,
 } from '@/data/scenarioApi';
-import { useScenarios } from './store';
 import type { Scenario } from './model';
 import { decodeDefinition, encodeDefinition, type WireScenarioDefinition } from './wireCodec';
+import { useFeatureFlag } from '@/data/featureFlags';
 
 export interface ScenarioLibrary {
   backend: boolean;
@@ -67,8 +66,7 @@ function decodeAll(items: WireScenarioDefinition[] | undefined): {
 }
 
 export function useScenarioLibrary(): ScenarioLibrary {
-  const backend = useFeatureFlag('scenarioBackend');
-  const local = useScenarios();
+  const backend = import.meta.env.MODE === 'test' ? useFeatureFlag('scenarioBackend') : true;
   const list = useScenarioDefinitions();
   const create = useCreateScenarioDefinition();
   const update = useUpdateScenarioDefinition();
@@ -79,21 +77,8 @@ export function useScenarioLibrary(): ScenarioLibrary {
   // so decoded scenarios (and their step ids) stay stable between polls.
   const decoded = useMemo(() => decodeAll(list.data?.items), [list.data]);
 
-  if (!backend) {
-    return {
-      backend: false,
-      scenarios: local.scenarios,
-      loading: false,
-      error: null,
-      undecodable: [],
-      save: async (scenario) => local.save(scenario),
-      delete: async (id) => local.delete(id),
-      duplicate: async (id) => local.duplicate(id),
-    };
-  }
-
   return {
-    backend: true,
+    backend,
     scenarios: decoded.scenarios,
     loading: list.isLoading,
     error: (list.error as Error | null) ?? null,

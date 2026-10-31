@@ -1,14 +1,14 @@
 // Minimal client-side feature-flag store.
 //
-// Flags live in localStorage so an operator can opt in / out from the
-// Settings page without a redeploy. API-backed scenarios and templates are
-// enabled by default for the deployed API 0.13 contract; each remains
-// independently reversible from Settings.
+// The four operational contracts are always enabled in production. A
+// test-only override keeps the legacy fixture branches executable by unit
+// tests without making them selectable by an operator.
 
 import { useCallback, useSyncExternalStore } from 'react';
 
 const LEGACY_FLAGS_KEY = 'polaris.featureFlags.v1';
-const FLAGS_KEY = 'polaris.featureFlags.v2';
+const FLAGS_KEY = 'polaris.featureFlags.v3';
+const ALLOW_TEST_OVERRIDE = import.meta.env.MODE === 'test';
 
 export interface FeatureFlags {
   /**
@@ -79,8 +79,12 @@ function read(): FeatureFlags {
       }
       return DEFAULTS;
     }
+    // v3 is the real-lab contract: operational routes never fall back to
+    // browser fixtures/localStorage. Keep the persisted object only for
+    // forward-compatible non-operational flags.
     const parsed = JSON.parse(raw) as Partial<FeatureFlags>;
-    return { ...DEFAULTS, ...parsed };
+    if (ALLOW_TEST_OVERRIDE) return { ...DEFAULTS, ...parsed };
+    return DEFAULTS;
   } catch {
     return DEFAULTS;
   }
@@ -121,7 +125,10 @@ export function getFlags(): FeatureFlags {
 }
 
 export function setFlag<K extends keyof FeatureFlags>(key: K, value: FeatureFlags[K]): void {
-  write({ ...cache, [key]: value });
+  // These four capabilities are backed by the deployed API contract. Turning
+  // one off previously re-enabled demo/localStorage data on operational pages.
+  // Preserve the API for Settings compatibility but fail closed to ON.
+  write({ ...cache, [key]: value === false && !ALLOW_TEST_OVERRIDE ? true : value });
   notify();
 }
 
