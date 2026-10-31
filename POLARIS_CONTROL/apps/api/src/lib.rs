@@ -2,6 +2,7 @@ mod activity;
 mod cpu_safety;
 mod scenario_definitions;
 mod subscriber_provisioning;
+mod traffic_sessions;
 mod ue_profiles;
 
 use argon2::{
