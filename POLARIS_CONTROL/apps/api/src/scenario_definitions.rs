@@ -14,6 +14,29 @@ pub const MAX_RESOLVED_STEPS: usize = 10_000;
 pub const MAX_REPEAT_DEPTH: usize = 2;
 pub const MAX_TRAFFIC_BYTES: u64 = 200 * 1024 * 1024;
 pub const EXPORT_SCHEMA_VERSION: &str = "polaris.scenario-definition.v2";
+pub const TEMPLATE_CATALOG_SCHEMA_VERSION: &str = "polaris.scenario-template-catalog.v1";
+pub const DEFAULT_TEMPLATE_UE_COUNT: u64 = 1;
+pub const DEFAULT_TEMPLATE_RATE_BPS: u64 = 1_000_000;
+pub const DEFAULT_TEMPLATE_DURATION_SECONDS: u64 = 60;
+
+pub const SUPPORT_SUPPORTED: &str = "SUPPORTED";
+pub const SUPPORT_BACKEND_REQUIRED: &str = "BACKEND_REQUIRED";
+pub const SUPPORT_CERTIFICATION_REQUIRED: &str = "CERTIFICATION_REQUIRED";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ScenarioTemplateDescriptor {
+    pub template_id: String,
+    pub version: String,
+    pub rat: String,
+    pub simulator: String,
+    pub description: String,
+    pub steps: Vec<ScenarioStep>,
+    pub parameters: BTreeMap<String, Value>,
+    pub required_capabilities: Vec<String>,
+    pub backend_support: String,
+    pub certification_required: bool,
+    pub read_only: bool,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ScenarioCatalog {
@@ -40,6 +63,14 @@ pub struct ScenarioDefinition {
     pub steps: Vec<ScenarioStep>,
     pub created_at_epoch_s: u64,
     pub updated_at_epoch_s: u64,
+    #[serde(default = "default_definition_rat")]
+    pub rat: String,
+    #[serde(default = "default_definition_simulator")]
+    pub simulator: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_definition_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -49,6 +80,12 @@ pub struct ScenarioMutation {
     #[serde(default = "default_loop_count")]
     pub loop_count: u32,
     pub steps: Vec<ScenarioStep>,
+    #[serde(default)]
+    pub rat: Option<String>,
+    #[serde(default)]
+    pub simulator: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -116,9 +153,7 @@ impl ScenarioDefinitionStore {
     /// migration, persists if changed, and returns both the catalog
     /// and the migration report so the caller can audit each
     /// replaced builtin before the new one overwrites it.
-    pub fn load_with_report(
-        &self,
-    ) -> Result<(ScenarioCatalog, BuiltinMigrationReport), String> {
+    pub fn load_with_report(&self) -> Result<(ScenarioCatalog, BuiltinMigrationReport), String> {
         let mut catalog = match fs::read(&self.path) {
             Ok(bytes) => {
                 // 0.15.2 — Same portable-permissions pattern as the UE
@@ -195,6 +230,10 @@ impl ScenarioDefinitionStore {
             steps: input.steps,
             created_at_epoch_s: now,
             updated_at_epoch_s: now,
+            rat: input.rat.unwrap_or_else(default_definition_rat),
+            simulator: input.simulator.unwrap_or_else(default_definition_simulator),
+            description: input.description.unwrap_or_default(),
+            source_definition_id: None,
         };
         let original = catalog.clone();
         catalog.definitions.push(definition.clone());
@@ -233,6 +272,14 @@ impl ScenarioDefinitionStore {
             steps: input.steps,
             created_at_epoch_s: previous.created_at_epoch_s,
             updated_at_epoch_s: epoch_seconds(),
+            rat: input.rat.unwrap_or_else(|| previous.rat.clone()),
+            simulator: input
+                .simulator
+                .unwrap_or_else(|| previous.simulator.clone()),
+            description: input
+                .description
+                .unwrap_or_else(|| previous.description.clone()),
+            source_definition_id: previous.source_definition_id.clone(),
         };
         catalog.definitions[index] = updated.clone();
         if let Err(error) = self.persist(catalog) {
@@ -276,15 +323,49 @@ impl ScenarioDefinitionStore {
             .find(|item| item.id == source_id)
             .cloned()
             .ok_or("SCENARIO_DEFINITION_NOT_FOUND")?;
-        self.create(
-            catalog,
-            ScenarioMutation {
-                id: target_id.into(),
-                name: format!("{} (clone)", source.name),
-                loop_count: source.loop_count,
-                steps: source.steps,
-            },
-        )
+        let mutation = ScenarioMutation {
+            id: target_id.into(),
+            name: format!("{} (clone)", source.name),
+            loop_count: source.loop_count,
+            steps: source.steps,
+            rat: Some(source.rat.clone()),
+            simulator: Some(source.simulator.clone()),
+            description: Some(source.description.clone()),
+        };
+        validate_mutation(&mutation)?;
+        if template_id(&mutation.id) {
+            return Err("TEMPLATE_ID_RESERVED".into());
+        }
+        if catalog
+            .definitions
+            .iter()
+            .any(|item| item.id == mutation.id)
+        {
+            return Err("SCENARIO_DEFINITION_ALREADY_EXISTS".into());
+        }
+        let now = epoch_seconds();
+        let clone = ScenarioDefinition {
+            id: mutation.id,
+            name: mutation.name,
+            version: 1,
+            loop_count: mutation.loop_count,
+            steps: mutation.steps,
+            created_at_epoch_s: now,
+            updated_at_epoch_s: now,
+            rat: mutation.rat.unwrap_or_else(default_definition_rat),
+            simulator: mutation
+                .simulator
+                .unwrap_or_else(default_definition_simulator),
+            description: mutation.description.unwrap_or_default(),
+            source_definition_id: Some(source.id),
+        };
+        let original = catalog.clone();
+        catalog.definitions.push(clone.clone());
+        if let Err(error) = self.persist(catalog) {
+            *catalog = original;
+            return Err(error);
+        }
+        Ok(clone)
     }
 }
 
@@ -392,6 +473,9 @@ fn validate_definition(definition: &ScenarioDefinition) -> Result<(), String> {
         name: definition.name.clone(),
         loop_count: definition.loop_count,
         steps: definition.steps.clone(),
+        rat: Some(definition.rat.clone()),
+        simulator: Some(definition.simulator.clone()),
+        description: Some(definition.description.clone()),
     })
 }
 
@@ -404,6 +488,18 @@ fn validate_mutation(input: &ScenarioMutation) -> Result<(), String> {
     }
     if !(1..=MAX_LOOP_COUNT).contains(&input.loop_count) {
         return Err("SCENARIO_LOOP_COUNT_INVALID".into());
+    }
+    let rat = input.rat.as_deref().unwrap_or("5G_SA");
+    let simulator = input.simulator.as_deref().unwrap_or("UERANSIM");
+    if !matches!((rat, simulator), ("LTE", "srsRAN") | ("5G_SA", "UERANSIM")) {
+        return Err("SCENARIO_RAT_SIMULATOR_MISMATCH".into());
+    }
+    if input
+        .description
+        .as_ref()
+        .is_some_and(|value| value.len() > 512)
+    {
+        return Err("SCENARIO_DESCRIPTION_INVALID".into());
     }
     let resolved_step_count = validate_steps(&input.steps, 0)?
         .checked_mul(input.loop_count as usize)
@@ -495,6 +591,32 @@ fn validate_parameters(step: &ScenarioStep) -> Result<(), String> {
         if bytes == 0 || bytes > MAX_TRAFFIC_BYTES {
             return Err("TRAFFIC_BYTES_OUT_OF_RANGE".into());
         }
+        if let Some(protocol) = step.parameters.get("protocol") {
+            let protocol = match protocol {
+                ParameterSpec::Fixed { fixed } => fixed.as_str(),
+                ParameterSpec::Random { .. } => None,
+            }
+            .ok_or("TRAFFIC_PROTOCOL_INVALID")?;
+            if !matches!(protocol, "UDP" | "TCP") {
+                return Err("TRAFFIC_PROTOCOL_INVALID".into());
+            }
+            let tcp_authorized = step
+                .parameters
+                .get("tcp_authorized")
+                .and_then(|value| match value {
+                    ParameterSpec::Fixed { fixed } => fixed.as_bool(),
+                    ParameterSpec::Random { .. } => None,
+                })
+                .unwrap_or(false);
+            if protocol == "TCP" && !tcp_authorized {
+                return Err("TCP_EXPLICIT_AUTHORIZATION_REQUIRED".into());
+            }
+            let rate = parameter_max_u64(step, "rate_bps")?;
+            let duration = parameter_max_u64(step, "duration_seconds")?;
+            if rate == 0 || rate > 100_000_000 || duration == 0 || duration > 300 {
+                return Err("TRAFFIC_RATE_DURATION_OUT_OF_RANGE".into());
+            }
+        }
     }
     if matches!(step.step_type.as_str(), "idle" | "voice_call") {
         parameter_max_u64(step, "duration_ms")?;
@@ -564,7 +686,7 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
             .collect()
     };
     let dnn = |name: &str| BTreeMap::from([("dnn".into(), fixed(name))]);
-    vec![
+    let mut templates = vec![
         ScenarioDefinition {
             id: "tpl-voice-long".into(),
             name: "Voice long ×100".into(),
@@ -581,6 +703,10 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
             ],
             created_at_epoch_s: now,
             updated_at_epoch_s: now,
+            rat: "5G_SA".into(),
+            simulator: "UERANSIM".into(),
+            description: "Long IMS voice workload".into(),
+            source_definition_id: None,
         },
         ScenarioDefinition {
             id: "tpl-voice-short".into(),
@@ -602,6 +728,10 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
             ],
             created_at_epoch_s: now,
             updated_at_epoch_s: now,
+            rat: "5G_SA".into(),
+            simulator: "UERANSIM".into(),
+            description: "Short repeated IMS voice workload".into(),
+            source_definition_id: None,
         },
         // 0.19.2 — Small traffic now interleaves a 1 MiB SHA-256
         // transfer_verify BEFORE each iperf3 burst. The verify step
@@ -640,6 +770,10 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
             ],
             created_at_epoch_s: now,
             updated_at_epoch_s: now,
+            rat: "5G_SA".into(),
+            simulator: "UERANSIM".into(),
+            description: "Integrity-verified bounded traffic workload".into(),
+            source_definition_id: None,
         },
         ScenarioDefinition {
             id: "tpl-high-runner".into(),
@@ -656,8 +790,411 @@ pub fn builtin_templates() -> Vec<ScenarioDefinition> {
             ],
             created_at_epoch_s: now,
             updated_at_epoch_s: now,
+            rat: "5G_SA".into(),
+            simulator: "UERANSIM".into(),
+            description: "High-volume bounded runner".into(),
+            source_definition_id: None,
         },
-    ]
+    ];
+    templates.extend(
+        default_scenario_templates()
+            .into_iter()
+            .map(|template| ScenarioDefinition {
+                id: template.template_id.clone(),
+                name: template.description.clone(),
+                version: 1,
+                loop_count: 1,
+                steps: template.steps,
+                created_at_epoch_s: now,
+                updated_at_epoch_s: now,
+                rat: template.rat,
+                simulator: template.simulator,
+                description: template.description,
+                source_definition_id: None,
+            }),
+    );
+    templates
+}
+
+fn template_parameters() -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("ue_count".into(), Value::from(DEFAULT_TEMPLATE_UE_COUNT)),
+        ("execution".into(), Value::from("ONCE")),
+        ("transport".into(), Value::from("UDP")),
+        ("rate_bps".into(), Value::from(DEFAULT_TEMPLATE_RATE_BPS)),
+        (
+            "duration_seconds".into(),
+            Value::from(DEFAULT_TEMPLATE_DURATION_SECONDS),
+        ),
+        ("tcp_authorized".into(), Value::Bool(false)),
+        ("multi_ue".into(), Value::Bool(false)),
+    ])
+}
+
+fn bounded_udp_parameters() -> BTreeMap<String, ParameterSpec> {
+    BTreeMap::from([
+        ("bytes".into(), fixed(7_500_000_u64)),
+        ("protocol".into(), fixed("UDP")),
+        ("rate_bps".into(), fixed(DEFAULT_TEMPLATE_RATE_BPS)),
+        (
+            "duration_seconds".into(),
+            fixed(DEFAULT_TEMPLATE_DURATION_SECONDS),
+        ),
+        ("tcp_authorized".into(), fixed(false)),
+    ])
+}
+
+fn descriptor(
+    id: &str,
+    rat: &str,
+    simulator: &str,
+    description: &str,
+    steps: Vec<ScenarioStep>,
+    capabilities: &[&str],
+    backend_support: &str,
+    certification_required: bool,
+) -> ScenarioTemplateDescriptor {
+    ScenarioTemplateDescriptor {
+        template_id: id.into(),
+        version: "1.0.0".into(),
+        rat: rat.into(),
+        simulator: simulator.into(),
+        description: description.into(),
+        steps,
+        parameters: template_parameters(),
+        required_capabilities: capabilities.iter().map(|value| (*value).into()).collect(),
+        backend_support: backend_support.into(),
+        certification_required,
+        read_only: true,
+    }
+}
+
+/// Professional, immutable system catalogue. No multi-UE template is exposed:
+/// LTE is contractually limited to one UE and the bounded UDP rate/duration
+/// executor is not yet available for either RAT.
+pub fn default_scenario_templates() -> Vec<ScenarioTemplateDescriptor> {
+    let internet = || BTreeMap::from([("dnn".into(), fixed("internet"))]);
+    let data = bounded_udp_parameters;
+    let templates = vec![
+        descriptor(
+            "tpl-lte-attach",
+            "LTE",
+            "srsRAN",
+            "LTE Attach",
+            vec![step("lte_attach", BTreeMap::new())],
+            &["lte_orchestrator_v2", "s1_setup", "eps_attach"],
+            SUPPORT_CERTIFICATION_REQUIRED,
+            true,
+        ),
+        descriptor(
+            "tpl-lte-detach",
+            "LTE",
+            "srsRAN",
+            "LTE Detach",
+            vec![step("lte_detach", BTreeMap::new())],
+            &["lte_orchestrator_v2", "eps_detach"],
+            SUPPORT_CERTIFICATION_REQUIRED,
+            true,
+        ),
+        descriptor(
+            "tpl-lte-data-ul",
+            "LTE",
+            "srsRAN",
+            "LTE Data UL — UDP 1 Mbit/s for 60 seconds",
+            vec![
+                step("lte_attach", BTreeMap::new()),
+                step("lte_traffic_ul", data()),
+            ],
+            &["lte_orchestrator_v2", "udp_rate_duration_v1"],
+            SUPPORT_BACKEND_REQUIRED,
+            true,
+        ),
+        descriptor(
+            "tpl-lte-data-dl",
+            "LTE",
+            "srsRAN",
+            "LTE Data DL — UDP 1 Mbit/s for 60 seconds",
+            vec![
+                step("lte_attach", BTreeMap::new()),
+                step("lte_traffic_dl", data()),
+            ],
+            &["lte_orchestrator_v2", "udp_rate_duration_v1", "dn_sender"],
+            SUPPORT_BACKEND_REQUIRED,
+            true,
+        ),
+        descriptor(
+            "tpl-lte-attach-data",
+            "LTE",
+            "srsRAN",
+            "LTE Attach and bounded UDP UL/DL",
+            vec![
+                step("lte_attach", BTreeMap::new()),
+                step("lte_traffic_ul", data()),
+                step("lte_traffic_dl", data()),
+            ],
+            &["lte_orchestrator_v2", "udp_rate_duration_v1", "dn_sender"],
+            SUPPORT_BACKEND_REQUIRED,
+            true,
+        ),
+        descriptor(
+            "tpl-lte-full-session",
+            "LTE",
+            "srsRAN",
+            "LTE full session: Attach, bounded UDP UL/DL and Detach",
+            vec![
+                step("lte_attach", BTreeMap::new()),
+                step("lte_traffic_ul", data()),
+                step("lte_traffic_dl", data()),
+                step("lte_detach", BTreeMap::new()),
+            ],
+            &["lte_orchestrator_v2", "udp_rate_duration_v1", "dn_sender"],
+            SUPPORT_BACKEND_REQUIRED,
+            true,
+        ),
+        descriptor(
+            "tpl-5g-registration",
+            "5G_SA",
+            "UERANSIM",
+            "5G SA Registration",
+            vec![step("ue_start", BTreeMap::new())],
+            &["ueransim_lifecycle", "registration_observation"],
+            SUPPORT_SUPPORTED,
+            false,
+        ),
+        descriptor(
+            "tpl-5g-deregistration",
+            "5G_SA",
+            "UERANSIM",
+            "5G SA Deregistration",
+            vec![step("detach", BTreeMap::new())],
+            &["ueransim_lifecycle", "deregistration"],
+            SUPPORT_SUPPORTED,
+            false,
+        ),
+        descriptor(
+            "tpl-5g-pdu-session",
+            "5G_SA",
+            "UERANSIM",
+            "5G SA Registration and PDU Session establishment",
+            vec![
+                step("ue_start", BTreeMap::new()),
+                step("pdu_establish", internet()),
+            ],
+            &["ueransim_lifecycle", "pdu_session"],
+            SUPPORT_SUPPORTED,
+            false,
+        ),
+        descriptor(
+            "tpl-5g-data-ul",
+            "5G_SA",
+            "UERANSIM",
+            "5G SA Data UL — UDP 1 Mbit/s for 60 seconds",
+            vec![step("traffic_ul", data())],
+            &["pdu_session", "udp_rate_duration_v1"],
+            SUPPORT_BACKEND_REQUIRED,
+            false,
+        ),
+        descriptor(
+            "tpl-5g-data-dl",
+            "5G_SA",
+            "UERANSIM",
+            "5G SA Data DL — UDP 1 Mbit/s for 60 seconds",
+            vec![step("traffic_dl", data())],
+            &["pdu_session", "udp_rate_duration_v1", "dn_sender"],
+            SUPPORT_BACKEND_REQUIRED,
+            false,
+        ),
+        descriptor(
+            "tpl-5g-registration-pdu-data",
+            "5G_SA",
+            "UERANSIM",
+            "5G SA Registration, PDU Session and bounded UDP UL/DL",
+            vec![
+                step("ue_start", BTreeMap::new()),
+                step("pdu_establish", internet()),
+                step("traffic_ul", data()),
+                step("traffic_dl", data()),
+            ],
+            &[
+                "ueransim_lifecycle",
+                "pdu_session",
+                "udp_rate_duration_v1",
+                "dn_sender",
+            ],
+            SUPPORT_BACKEND_REQUIRED,
+            false,
+        ),
+        descriptor(
+            "tpl-5g-full-session",
+            "5G_SA",
+            "UERANSIM",
+            "5G SA full session: Registration, PDU, bounded UDP UL/DL and Deregistration",
+            vec![
+                step("ue_start", BTreeMap::new()),
+                step("pdu_establish", internet()),
+                step("traffic_ul", data()),
+                step("traffic_dl", data()),
+                step("detach", BTreeMap::new()),
+            ],
+            &[
+                "ueransim_lifecycle",
+                "pdu_session",
+                "udp_rate_duration_v1",
+                "dn_sender",
+            ],
+            SUPPORT_BACKEND_REQUIRED,
+            false,
+        ),
+    ];
+    debug_assert!(templates
+        .iter()
+        .all(|template| validate_template_descriptor(template).is_ok()));
+    templates
+}
+
+pub fn template_descriptor(id: &str) -> Option<ScenarioTemplateDescriptor> {
+    default_scenario_templates()
+        .into_iter()
+        .find(|template| template.template_id == id)
+}
+
+pub fn validate_template_descriptor(template: &ScenarioTemplateDescriptor) -> Result<(), String> {
+    if !template_id(&template.template_id)
+        || template.version != "1.0.0"
+        || template.description.trim().is_empty()
+        || template.required_capabilities.is_empty()
+        || !template.read_only
+    {
+        return Err("SCENARIO_TEMPLATE_INVALID".into());
+    }
+    if !matches!(
+        template.backend_support.as_str(),
+        SUPPORT_SUPPORTED | SUPPORT_BACKEND_REQUIRED | SUPPORT_CERTIFICATION_REQUIRED
+    ) {
+        return Err("SCENARIO_TEMPLATE_SUPPORT_INVALID".into());
+    }
+    if !matches!(
+        (template.rat.as_str(), template.simulator.as_str()),
+        ("LTE", "srsRAN") | ("5G_SA", "UERANSIM")
+    ) {
+        return Err("SCENARIO_TEMPLATE_RAT_SIMULATOR_MISMATCH".into());
+    }
+    if template.rat == "LTE" && !template.certification_required {
+        return Err("SCENARIO_TEMPLATE_CERTIFICATION_INVALID".into());
+    }
+    if template.parameters.get("ue_count").and_then(Value::as_u64)
+        != Some(DEFAULT_TEMPLATE_UE_COUNT)
+        || template.parameters.get("execution").and_then(Value::as_str) != Some("ONCE")
+        || template.parameters.get("transport").and_then(Value::as_str) != Some("UDP")
+        || template.parameters.get("rate_bps").and_then(Value::as_u64)
+            != Some(DEFAULT_TEMPLATE_RATE_BPS)
+        || template
+            .parameters
+            .get("duration_seconds")
+            .and_then(Value::as_u64)
+            != Some(DEFAULT_TEMPLATE_DURATION_SECONDS)
+        || template
+            .parameters
+            .get("tcp_authorized")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || template.parameters.get("multi_ue").and_then(Value::as_bool) != Some(false)
+    {
+        return Err("SCENARIO_TEMPLATE_DEFAULTS_INVALID".into());
+    }
+    validate_mutation(&ScenarioMutation {
+        id: template.template_id.clone(),
+        name: template.description.clone(),
+        loop_count: 1,
+        steps: template.steps.clone(),
+        rat: Some(template.rat.clone()),
+        simulator: Some(template.simulator.clone()),
+        description: Some(template.description.clone()),
+    })?;
+    let has_lte = template
+        .steps
+        .iter()
+        .any(|step| step.step_type.starts_with("lte_"));
+    if (template.rat == "LTE") != has_lte {
+        return Err("SCENARIO_TEMPLATE_RAT_STEP_MISMATCH".into());
+    }
+    let actual = template
+        .steps
+        .iter()
+        .map(|step| step.step_type.as_str())
+        .collect::<Vec<_>>();
+    let expected: &[&str] = match template.template_id.as_str() {
+        "tpl-lte-attach" => &["lte_attach"],
+        "tpl-lte-detach" => &["lte_detach"],
+        "tpl-lte-data-ul" => &["lte_attach", "lte_traffic_ul"],
+        "tpl-lte-data-dl" => &["lte_attach", "lte_traffic_dl"],
+        "tpl-lte-attach-data" => &["lte_attach", "lte_traffic_ul", "lte_traffic_dl"],
+        "tpl-lte-full-session" => &[
+            "lte_attach",
+            "lte_traffic_ul",
+            "lte_traffic_dl",
+            "lte_detach",
+        ],
+        "tpl-5g-registration" => &["ue_start"],
+        "tpl-5g-deregistration" => &["detach"],
+        "tpl-5g-pdu-session" => &["ue_start", "pdu_establish"],
+        "tpl-5g-data-ul" => &["traffic_ul"],
+        "tpl-5g-data-dl" => &["traffic_dl"],
+        "tpl-5g-registration-pdu-data" => {
+            &["ue_start", "pdu_establish", "traffic_ul", "traffic_dl"]
+        }
+        "tpl-5g-full-session" => &[
+            "ue_start",
+            "pdu_establish",
+            "traffic_ul",
+            "traffic_dl",
+            "detach",
+        ],
+        _ => return Err("SCENARIO_TEMPLATE_ID_UNKNOWN".into()),
+    };
+    if actual != expected {
+        return Err("SCENARIO_TEMPLATE_STEP_ORDER_INVALID".into());
+    }
+    Ok(())
+}
+
+pub fn definition_support_status(definition: &ScenarioDefinition) -> &'static str {
+    if let Some(template) = template_descriptor(&definition.id) {
+        return match template.backend_support.as_str() {
+            SUPPORT_SUPPORTED => SUPPORT_SUPPORTED,
+            SUPPORT_CERTIFICATION_REQUIRED => SUPPORT_CERTIFICATION_REQUIRED,
+            _ => SUPPORT_BACKEND_REQUIRED,
+        };
+    }
+    if definition
+        .steps
+        .iter()
+        .any(step_requires_udp_rate_duration_backend)
+    {
+        return SUPPORT_BACKEND_REQUIRED;
+    }
+    if definition
+        .steps
+        .iter()
+        .any(|step| step.step_type.starts_with("lte_"))
+    {
+        return SUPPORT_CERTIFICATION_REQUIRED;
+    }
+    SUPPORT_SUPPORTED
+}
+
+fn step_requires_udp_rate_duration_backend(step: &ScenarioStep) -> bool {
+    step.parameters
+        .get("protocol")
+        .and_then(|value| match value {
+            ParameterSpec::Fixed { fixed } => fixed.as_str(),
+            ParameterSpec::Random { .. } => None,
+        })
+        == Some("UDP")
+        || step
+            .steps
+            .iter()
+            .any(step_requires_udp_rate_duration_backend)
 }
 
 /// 0.19.3 — Report returned by [`migrate_builtin_templates`]. Lists the
@@ -721,10 +1258,7 @@ pub fn migrate_builtin_templates(
                     continue;
                 }
                 if stored.version < template.version {
-                    let old = std::mem::replace(
-                        &mut catalog.definitions[index],
-                        template,
-                    );
+                    let old = std::mem::replace(&mut catalog.definitions[index], template);
                     report.replaced.push(old);
                 }
                 // Equal or newer → leave alone (idempotence).
@@ -741,6 +1275,14 @@ fn seed_templates(catalog: &mut ScenarioCatalog) -> Result<BuiltinMigrationRepor
 
 const fn default_loop_count() -> u32 {
     1
+}
+
+fn default_definition_rat() -> String {
+    "5G_SA".into()
+}
+
+fn default_definition_simulator() -> String {
+    "UERANSIM".into()
 }
 
 fn safe_id(value: &str) -> bool {
@@ -792,6 +1334,7 @@ fn epoch_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn mutation(id: &str) -> ScenarioMutation {
         ScenarioMutation {
@@ -809,6 +1352,9 @@ mod tests {
                 )]),
                 steps: Vec::new(),
             }],
+            rat: None,
+            simulator: None,
+            description: None,
         }
     }
 
@@ -835,8 +1381,13 @@ mod tests {
         );
         store.delete(&mut catalog, "s1").unwrap();
         let recovered = store.load().unwrap();
-        assert_eq!(recovered.definitions.len(), 5);
-        assert!(recovered.definitions.iter().any(|item| item.id == "s2"));
+        assert_eq!(recovered.definitions.len(), builtin_templates().len() + 1);
+        let clone = recovered
+            .definitions
+            .iter()
+            .find(|item| item.id == "s2")
+            .unwrap();
+        assert_eq!(clone.source_definition_id.as_deref(), Some("s1"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -885,6 +1436,10 @@ mod tests {
             steps: mutation("s1").steps,
             created_at_epoch_s: 0,
             updated_at_epoch_s: 0,
+            rat: "5G_SA".into(),
+            simulator: "UERANSIM".into(),
+            description: "test".into(),
+            source_definition_id: None,
         };
         let resolved = resolve_steps(&definition).unwrap();
         assert_eq!(resolved.len(), 4);
@@ -916,21 +1471,30 @@ mod tests {
     }
 
     #[test]
-    fn four_templates_are_seeded_read_only_and_bounded() {
+    fn system_templates_are_seeded_read_only_and_bounded() {
         let templates = builtin_templates();
-        assert_eq!(templates.len(), 4);
-        assert_eq!(
-            templates
-                .iter()
-                .map(|item| item.id.as_str())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "tpl-voice-long",
-                "tpl-voice-short",
-                "tpl-small-traffic",
-                "tpl-high-runner"
-            ])
-        );
+        assert_eq!(templates.len(), 17);
+        let ids = templates
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<BTreeSet<_>>();
+        for required in [
+            "tpl-lte-attach",
+            "tpl-lte-detach",
+            "tpl-lte-data-ul",
+            "tpl-lte-data-dl",
+            "tpl-lte-attach-data",
+            "tpl-lte-full-session",
+            "tpl-5g-registration",
+            "tpl-5g-deregistration",
+            "tpl-5g-pdu-session",
+            "tpl-5g-data-ul",
+            "tpl-5g-data-dl",
+            "tpl-5g-registration-pdu-data",
+            "tpl-5g-full-session",
+        ] {
+            assert!(ids.contains(required), "missing {required}");
+        }
         for template in &templates {
             validate_definition(template).unwrap();
             assert!(resolve_steps(template).unwrap().len() <= MAX_RESOLVED_STEPS);
@@ -944,7 +1508,7 @@ mod tests {
                 .iter()
                 .filter(|item| template_id(&item.id))
                 .count(),
-            4
+            17
         );
         assert_eq!(
             store.delete(&mut catalog, "tpl-voice-long").unwrap_err(),
@@ -970,7 +1534,11 @@ mod tests {
                 loop_count: 1,
                 steps: valid.steps.clone(),
                 created_at_epoch_s: 0,
-                updated_at_epoch_s: 0
+                updated_at_epoch_s: 0,
+                rat: "5G_SA".into(),
+                simulator: "UERANSIM".into(),
+                description: "nested test".into(),
+                source_definition_id: None
             })
             .unwrap()
             .len(),
@@ -1014,6 +1582,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn professional_catalog_has_exact_defaults_honest_status_and_no_multi_ue() {
+        let templates = default_scenario_templates();
+        assert_eq!(templates.len(), 13);
+        assert!(templates
+            .iter()
+            .all(|item| validate_template_descriptor(item).is_ok()));
+        assert!(templates.iter().all(|item| {
+            item.parameters["ue_count"] == json!(1)
+                && item.parameters["execution"] == json!("ONCE")
+                && item.parameters["transport"] == json!("UDP")
+                && item.parameters["rate_bps"] == json!(1_000_000_u64)
+                && item.parameters["duration_seconds"] == json!(60)
+                && item.parameters["tcp_authorized"] == json!(false)
+                && item.parameters["multi_ue"] == json!(false)
+        }));
+        assert_eq!(
+            template_descriptor("tpl-lte-attach")
+                .unwrap()
+                .backend_support,
+            SUPPORT_CERTIFICATION_REQUIRED
+        );
+        assert_eq!(
+            template_descriptor("tpl-lte-data-ul")
+                .unwrap()
+                .backend_support,
+            SUPPORT_BACKEND_REQUIRED
+        );
+        assert_eq!(
+            template_descriptor("tpl-5g-registration")
+                .unwrap()
+                .backend_support,
+            SUPPORT_SUPPORTED
+        );
+        assert_eq!(
+            template_descriptor("tpl-5g-data-dl")
+                .unwrap()
+                .backend_support,
+            SUPPORT_BACKEND_REQUIRED
+        );
+    }
+
+    #[test]
+    fn udp_rate_templates_cannot_execute_as_implicit_tcp() {
+        let data = builtin_templates()
+            .into_iter()
+            .find(|definition| definition.id == "tpl-5g-data-ul")
+            .unwrap();
+        assert_eq!(definition_support_status(&data), SUPPORT_BACKEND_REQUIRED);
+        let mut mutation = mutation("tcp-without-approval");
+        mutation.steps = vec![step(
+            "traffic_ul",
+            BTreeMap::from([
+                ("bytes".into(), fixed(1024_u64)),
+                ("protocol".into(), fixed("TCP")),
+                ("rate_bps".into(), fixed(1_000_000_u64)),
+                ("duration_seconds".into(), fixed(60_u64)),
+            ]),
+        )];
+        assert_eq!(
+            validate_mutation(&mutation).unwrap_err(),
+            "TCP_EXPLICIT_AUTHORIZATION_REQUIRED"
+        );
+        mutation.steps[0]
+            .parameters
+            .insert("tcp_authorized".into(), fixed(true));
+        validate_mutation(&mutation).unwrap();
+    }
+
+    #[test]
+    fn legacy_catalog_deserializes_and_user_definition_survives_template_migration() {
+        let legacy = json!({
+            "schema_version": 1,
+            "definitions": [{
+                "id":"operator-scenario", "name":"Operator scenario", "version":3,
+                "loop_count":1, "steps":[{"type":"wait","loop_count":1,"parameters":{"duration_ms":{"fixed":10}}}],
+                "created_at_epoch_s":1, "updated_at_epoch_s":2
+            }]
+        });
+        let mut catalog: ScenarioCatalog = serde_json::from_value(legacy).unwrap();
+        let original = catalog.definitions[0].clone();
+        assert_eq!(original.source_definition_id, None);
+        let report = migrate_builtin_templates(&mut catalog).unwrap();
+        assert_eq!(report.added_ids.len(), 17);
+        assert_eq!(
+            catalog
+                .definitions
+                .iter()
+                .find(|item| item.id == "operator-scenario"),
+            Some(&original)
+        );
+    }
+
     /// 0.19.3 — Startup migration upgrades a stale builtin in place
     /// (same id, bumped version) and reports the previous definition
     /// so the caller can snapshot it in the audit log. Operator-cloned
@@ -1032,11 +1693,10 @@ mod tests {
             .unwrap();
         tpl_small_v1.version = 1;
         catalog.definitions.push(tpl_small_v1.clone());
-        for other_id in ["tpl-voice-long", "tpl-voice-short", "tpl-high-runner"] {
-            let template = builtin_templates()
-                .into_iter()
-                .find(|definition| definition.id == other_id)
-                .unwrap();
+        for template in builtin_templates()
+            .into_iter()
+            .filter(|definition| definition.id != "tpl-small-traffic")
+        {
             catalog.definitions.push(template);
         }
         let operator_clone = ScenarioDefinition {
@@ -1047,6 +1707,10 @@ mod tests {
             steps: vec![step("ue_start", BTreeMap::new())],
             created_at_epoch_s: 100,
             updated_at_epoch_s: 200,
+            rat: "5G_SA".into(),
+            simulator: "UERANSIM".into(),
+            description: "Ops smoke clone".into(),
+            source_definition_id: Some("tpl-small-traffic".into()),
         };
         catalog.definitions.push(operator_clone.clone());
 
@@ -1095,7 +1759,7 @@ mod tests {
         lab_hotfix.version = 9_999;
         catalog.definitions.push(lab_hotfix.clone());
         let report = migrate_builtin_templates(&mut catalog).unwrap();
-        // Three other builtins should be added, but tpl-small-traffic
+        // Other builtins should be added, but tpl-small-traffic
         // must stay at the lab-local 9_999.
         assert!(
             report.added_ids.contains(&"tpl-voice-long".into()),
@@ -1119,7 +1783,7 @@ mod tests {
 
     /// 0.19.3 — Running `load_with_report` twice back-to-back against a
     /// real filesystem catalog must be idempotent: first call seeds the
-    /// four builtins; second call reads them back unchanged.
+    /// all builtins; second call reads them back unchanged.
     #[test]
     fn builtin_migration_double_startup_is_idempotent_through_the_store() {
         let root = std::env::temp_dir().join(format!(
@@ -1130,7 +1794,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let store = ScenarioDefinitionStore::new(root.join("catalog.json"));
         let (first_catalog, first_report) = store.load_with_report().unwrap();
-        assert_eq!(first_report.added_ids.len(), 4);
+        assert_eq!(first_report.added_ids.len(), 17);
         assert!(first_report.replaced.is_empty());
         let (second_catalog, second_report) = store.load_with_report().unwrap();
         assert!(
