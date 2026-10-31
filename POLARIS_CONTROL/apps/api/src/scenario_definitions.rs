@@ -439,6 +439,11 @@ fn validate_steps(steps: &[ScenarioStep], depth: usize) -> Result<usize, String>
                 | "repeat"
                 | "ims_register"
                 | "voice_call"
+                | "lte_attach"
+                | "lte_detach"
+                | "lte_traffic_ul"
+                | "lte_traffic_dl"
+                | "lte_attach_data"
         );
         if !supported {
             return Err("SCENARIO_STEP_TYPE_UNSUPPORTED".into());
@@ -482,7 +487,10 @@ fn validate_parameters(step: &ScenarioStep) -> Result<(), String> {
             ParameterSpec::Random { .. } => return Err("SCENARIO_RANDOM_RANGE_INVALID".into()),
         }
     }
-    if matches!(step.step_type.as_str(), "traffic_dl" | "traffic_ul") {
+    if matches!(
+        step.step_type.as_str(),
+        "traffic_dl" | "traffic_ul" | "lte_traffic_dl" | "lte_traffic_ul" | "lte_attach_data"
+    ) {
         let bytes = parameter_max_u64(step, "bytes")?;
         if bytes == 0 || bytes > MAX_TRAFFIC_BYTES {
             return Err("TRAFFIC_BYTES_OUT_OF_RANGE".into());

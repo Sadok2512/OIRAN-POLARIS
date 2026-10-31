@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.21.0 (polaris-control-api) — 2026-10-31 — bounded srsRAN LTE integration
+
+- Integrates LTE into the existing POLARIS API through `/lte/status`,
+  `/lte/logs` and bounded `/lte/components/{start,stop}` actions; no second
+  control application is introduced.
+- Adds an injected srsRAN controller with an exact ENB-01 / LTE-UE-01
+  allowlist, real Docker observations, sanitized logs, idempotent Stop and
+  audit events. It never invokes a shell or accepts a command/path from HTTP.
+- Live Start is fail-closed behind Operator + CSRF, an active UE grant,
+  disk/memory safety, `POLARIS_SRSRAN_LIVE_ENABLED=true` and
+  `POLARIS_LTE_E2E_CERTIFIED=true`. Both flags default false. Stop stays
+  grant-exempt so an expired grant cannot trap a process.
+- Extends `/nodes`, `/ues`, `/capabilities` and `/version` with typed LTE,
+  srsENB/srsUE, EPC/S1 and controller-version fields. Unknown measurements
+  remain `NOT_OBSERVED`; no LTE state or UE IP is fabricated.
+- Adds catalog validation for LTE Attach, Detach, UL, DL and Attach + Data.
+  Mock/catalog flows are available, while live scenario execution returns
+  `423 LTE_E2E_CERTIFICATION_REQUIRED` pending ANR1 certification.
+- Subscriber authentication material remains `PROTECTED`; srsRAN log lines
+  containing identity/authentication markers are replaced with a redaction.
+
+
 ## 0.20.2 (polaris-control-api) — 2026-10-31 — role-aware IMSI on /ue-profiles and /ues
 
 Rebased on top of `29f8ef5` (0.20.1 — Traffic Generator HTTP surface +

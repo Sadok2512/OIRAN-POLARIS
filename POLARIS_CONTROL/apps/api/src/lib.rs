@@ -1,6 +1,7 @@
 mod activity;
 mod cpu_safety;
 mod scenario_definitions;
+mod srsran_controller;
 mod subscriber_provisioning;
 mod traffic_sessions;
 mod ue_profiles;
@@ -135,6 +136,12 @@ pub struct AppState {
     // charts in simulator-control 0.13.1. Measurement step is iperf3
     // via `UeRuntime::execute_iperf_*`; warnings never fail the session.
     traffic_manager: Arc<traffic_sessions::TrafficSessionManager>,
+    // 0.21.0 — LTE/srsRAN is integrated into this API, never a second
+    // application. Live process actions stay fail-closed behind both the
+    // deployment gate and the external LTE E2E certification gate.
+    srsran_runtime: Arc<dyn srsran_controller::SrsranRuntime>,
+    srsran_live_enabled: bool,
+    lte_e2e_certified: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -3220,6 +3227,11 @@ impl AppState {
             activity_events: Arc::new(activity::ActivityEventStore::new()),
             activity_rate_cache: Arc::new(Mutex::new(BTreeMap::new())),
             traffic_manager: Arc::new(traffic_sessions::TrafficSessionManager::new()),
+            srsran_runtime: Arc::new(srsran_controller::DockerSrsranRuntime),
+            srsran_live_enabled: std::env::var("POLARIS_SRSRAN_LIVE_ENABLED")
+                .is_ok_and(|value| value == "true"),
+            lte_e2e_certified: std::env::var("POLARIS_LTE_E2E_CERTIFIED")
+                .is_ok_and(|value| value == "true"),
         })
     }
 }
@@ -3592,11 +3604,18 @@ async fn health() -> Json<Value> {
 }
 async fn version() -> Json<Value> {
     Json(
-        json!({"platform":"3.2.1","api":VERSION,"scenario_engine":scenario_engine::VERSION,"safety_guard":safety_guard::VERSION,"ueransim_adapter":ueransim_adapter::VERSION,"multi_ue_controller":simulator_controller::VERSION}),
+        json!({"platform":"3.2.1","api":VERSION,"scenario_engine":scenario_engine::VERSION,"safety_guard":safety_guard::VERSION,"ueransim_adapter":ueransim_adapter::VERSION,"srsran_controller":srsran_controller::VERSION,"multi_ue_controller":simulator_controller::VERSION}),
     )
 }
 async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
     let ue_profile = Path::new("/root/POLARIS/runtime/ueransim/ue.yaml").exists();
+    let lte = state
+        .srsran_runtime
+        .status(state.lte_e2e_certified, state.srsran_live_enabled)
+        .ok();
+    let lte_available = lte.as_ref().is_some_and(|status| {
+        status.enb.observed || status.ue.observed || status.epc.observed
+    });
     let dl_sender = dl_sender_health(&state);
     let mut executable_steps = vec![
         "ue_start",
@@ -3631,6 +3650,29 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
             json!({"type":"transfer_verify","http_status":422,"reason":"TRANSFER_PEER_NOT_AVAILABLE"}),
         );
     }
+    if state.lte_e2e_certified && state.srsran_live_enabled {
+        executable_steps.extend([
+            "lte_attach",
+            "lte_detach",
+            "lte_traffic_ul",
+            "lte_traffic_dl",
+            "lte_attach_data",
+        ]);
+    } else if lte_available {
+        for step in [
+            "lte_attach",
+            "lte_detach",
+            "lte_traffic_ul",
+            "lte_traffic_dl",
+            "lte_attach_data",
+        ] {
+            unavailable_steps.push(json!({
+                "type":step,
+                "http_status":423,
+                "reason":"LTE_E2E_CERTIFICATION_REQUIRED"
+            }));
+        }
+    }
     Json(json!({
         "live_control":true,
         "approval_state":"OPERATOR_AUTHORIZATION_REQUIRED",
@@ -3656,7 +3698,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
         "profiles":ueransim_adapter::planned_profiles().into_iter().map(|profile|json!({"id":profile.ue_id,"name":profile.pseudonym,"available":profile.configured,"source":profile.profile_name,"subscription_verified":profile.subscription_verified})).collect::<Vec<_>>(),
         "technologies":[
             {"id":"5g-sa","name":"5G SA","simulator":"UERANSIM","available":ue_profile,"certified":true,"node_label":"gNB"},
-            {"id":"lte","name":"LTE","simulator":"srsRAN","available":false,"certified":false,"node_label":"eNB","reason":"LTE_ATTACH_NOT_CERTIFIED"}
+            {"id":"lte","name":"LTE 4G","simulator":"srsRAN","available":lte_available,"certified":state.lte_e2e_certified,"node_label":"eNB","reason":if state.lte_e2e_certified && state.srsran_live_enabled {Value::Null}else{json!("LTE_E2E_CERTIFICATION_REQUIRED")}}
         ],
         "services":[
             {"id":"registration","name":"Registration","supported":false,"implemented_scope":"BOUNDED_PROVISIONED_PROFILES_THROUGH_UE_10","reason":"LIVE_ACCEPTANCE_NOT_YET_COMPLETE"},
@@ -4144,18 +4186,231 @@ fn memory_stats() -> Value {
     json!({"total_bytes":total,"available_bytes":available,"used_bytes":total.zip(available).map(|(t,a)|t.saturating_sub(a))})
 }
 
+#[derive(Deserialize)]
+struct LteActionInput {
+    component: String,
+    ue_id: String,
+}
+
+#[derive(Deserialize)]
+struct LteLogsQuery {
+    component: String,
+}
+
+fn lte_status_value(state: &AppState) -> Result<Value, String> {
+    state
+        .srsran_runtime
+        .status(state.lte_e2e_certified, state.srsran_live_enabled)
+        .and_then(|status| serde_json::to_value(status).map_err(|_| "SRSRAN_STATUS_INVALID".into()))
+}
+
+async fn lte_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match lte_status_value(&state) {
+        Ok(status) => (StatusCode::OK, Json(status)),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":error})),
+        ),
+    }
+}
+
+async fn lte_logs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LteLogsQuery>,
+) -> impl IntoResponse {
+    let target = match srsran_controller::Target::parse(&query.component, None) {
+        Ok(target) => target,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":error}))),
+    };
+    match state.srsran_runtime.logs(target) {
+        Ok(lines) => (
+            StatusCode::OK,
+            Json(json!({"component":target.id(),"lines":lines,"redacted":true})),
+        ),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":error})),
+        ),
+    }
+}
+
+fn lte_action_target(input: &LteActionInput) -> Result<srsran_controller::Target, String> {
+    if input.ue_id != srsran_controller::LTE_UE_ID {
+        return Err("SRSRAN_UE_NOT_ALLOWLISTED".into());
+    }
+    let target_ue = (input.component == srsran_controller::LTE_UE_ID)
+        .then_some(input.ue_id.as_str());
+    srsran_controller::Target::parse(&input.component, target_ue)
+}
+
+fn lte_start_resource_gate(state: &AppState) -> Result<Value, String> {
+    if let Some(result) = state.resource_override.clone() {
+        return result.map(|_| json!({"test_override":true}));
+    }
+    let disk = measure(&state.storage_path).map_err(|_| "DISK_MONITOR_FAILURE".to_string())?;
+    let usage = disk.basis_points().unwrap_or(10_000);
+    if usage >= 8_500 {
+        return Err("DISK_STOP_THRESHOLD".into());
+    }
+    let memory = memory_stats();
+    if memory["available_bytes"].as_u64().unwrap_or(0) < 1_073_741_824 {
+        return Err("INSUFFICIENT_MEMORY".into());
+    }
+    Ok(json!({
+        "disk_usage_percent":f64::from(usage)/100.0,
+        "memory_available_bytes":memory["available_bytes"]
+    }))
+}
+
+async fn start_lte_component(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Json(input): Json<LteActionInput>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let target = match lte_action_target(&input) {
+        Ok(target) => target,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":error}))),
+    };
+    if state.execution_mode != "live"
+        || !state.srsran_live_enabled
+        || !state.lte_e2e_certified
+    {
+        audit(
+            &state,
+            &identity.role,
+            "SRSRAN_START",
+            "LTE_E2E_CERTIFICATION_REQUIRED",
+            Some(target.id()),
+        );
+        return (
+            StatusCode::LOCKED,
+            Json(json!({"error":"LTE_E2E_CERTIFICATION_REQUIRED"})),
+        );
+    }
+    if !active_grant_covers(&state, &[input.ue_id.clone()]) {
+        audit(
+            &state,
+            &identity.role,
+            "SRSRAN_START",
+            "LTE_LIVE_GRANT_REQUIRED",
+            Some(target.id()),
+        );
+        return (
+            StatusCode::LOCKED,
+            Json(json!({"error":"LTE_LIVE_GRANT_REQUIRED"})),
+        );
+    }
+    if let Err(error) = lte_start_resource_gate(&state) {
+        audit(&state, &identity.role, "SRSRAN_START", &error, Some(target.id()));
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":error})));
+    }
+    if target == srsran_controller::Target::Ue {
+        let dependencies_ready = state
+            .srsran_runtime
+            .status(state.lte_e2e_certified, state.srsran_live_enabled)
+            .is_ok_and(|status| {
+                status.enb.process_state == "running" && status.epc.process_state == "running"
+            });
+        if !dependencies_ready {
+            return (
+                StatusCode::LOCKED,
+                Json(json!({"error":"LTE_EPC_S1_DEPENDENCIES_NOT_READY"})),
+            );
+        }
+    }
+    match state.srsran_runtime.start(target) {
+        Ok(()) => {
+            audit(&state, &identity.role, "SRSRAN_START", "STARTED", Some(target.id()));
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({"component":target.id(),"state":"STARTING"})),
+            )
+        }
+        Err(error) => {
+            audit(&state, &identity.role, "SRSRAN_START", &error, Some(target.id()));
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":error})))
+        }
+    }
+}
+
+async fn stop_lte_component(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Json(input): Json<LteActionInput>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let target = match lte_action_target(&input) {
+        Ok(target) => target,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":error}))),
+    };
+    // Stop is deliberately grant-exempt: revocation/expiry must never trap
+    // a controller-owned LTE process in a running state.
+    let already_stopped = state
+        .srsran_runtime
+        .status(state.lte_e2e_certified, state.srsran_live_enabled)
+        .ok()
+        .map(|status| match target {
+            srsran_controller::Target::Enb => status.enb.process_state != "running",
+            srsran_controller::Target::Ue => status.ue.process_state != "running",
+        })
+        .unwrap_or(false);
+    if already_stopped {
+        audit(
+            &state,
+            &identity.role,
+            "SRSRAN_STOP",
+            "ALREADY_STOPPED",
+            Some(target.id()),
+        );
+        return (
+            StatusCode::OK,
+            Json(json!({"component":target.id(),"state":"STOPPED","idempotent":true})),
+        );
+    }
+    match state.srsran_runtime.stop(target) {
+        Ok(()) => {
+            audit(&state, &identity.role, "SRSRAN_STOP", "STOPPED", Some(target.id()));
+            (
+                StatusCode::OK,
+                Json(json!({"component":target.id(),"state":"STOPPED","idempotent":false})),
+            )
+        }
+        Err(error) => {
+            audit(&state, &identity.role, "SRSRAN_STOP", &error, Some(target.id()));
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":error})))
+        }
+    }
+}
+
 async fn nodes(State(state): State<Arc<AppState>>) -> Json<Value> {
     let gnb = container_status("oiran-lab-ueransim-gnb-1");
-    let enb = container_status("oiran-lab-srsenb-1");
+    let lte = state
+        .srsran_runtime
+        .status(state.lte_e2e_certified, state.srsran_live_enabled)
+        .ok();
+    let enb_state = lte
+        .as_ref()
+        .map(|status| status.enb.process_state.as_str())
+        .unwrap_or("NOT_OBSERVED");
+    let enb_health = lte
+        .as_ref()
+        .map(|status| status.enb.health.as_str())
+        .unwrap_or("unknown");
+    let lte_actions_enabled = state.lte_e2e_certified && state.srsran_live_enabled;
     let configured_gnbs = state.configuration.lock().unwrap().gnb_count;
     Json(json!({
         "items":[
             {"id":"GNB-01","name":"Primary gNB","technology":"5G SA","simulator":"UERANSIM","plmn":"001-01","cell_id":"0x000000010","link_ip":"10.77.0.20","n2_endpoint":"10.77.21.20","n3_endpoint":"10.77.22.20","process_state":gnb["process_state"],"health":gnb["health"],"configured":true,"controller_owned":false,"uptime_seconds":Value::Null,"actions":{"start":false,"stop":false,"reason":"SHARED_NODE_PROTECTED"}},
             {"id":"GNB-02","name":"Second gNB plan","technology":"5G SA","simulator":"UERANSIM","plmn":"001-01","cell_id":"UNASSIGNED","link_ip":"NOT_CONFIGURED","n2_endpoint":Value::Null,"n3_endpoint":Value::Null,"process_state":"NOT_DEPLOYED","health":"NOT_VALIDATED","configured":configured_gnbs==2,"controller_owned":false,"uptime_seconds":Value::Null,"actions":{"start":false,"stop":false,"reason":"LIVE_005_APPROVAL_REQUIRED"}},
-            {"id":"ENB-01","name":"LTE eNB profile","technology":"LTE","simulator":"srsRAN","plmn":"001-01","cell_id":"NOT_AVAILABLE","link_ip":"NOT_AVAILABLE","n2_endpoint":Value::Null,"n3_endpoint":Value::Null,"process_state":enb["process_state"],"health":enb["health"],"configured":false,"controller_owned":false,"uptime_seconds":Value::Null,"actions":{"start":false,"stop":false,"reason":"LTE_ATTACH_NOT_CERTIFIED"}}
+            {"id":"ENB-01","name":"LTE eNB","technology":"LTE 4G","simulator":"srsRAN","plmn":"001-01","cell_id":"NOT_OBSERVED","link_ip":"NOT_OBSERVED","n2_endpoint":Value::Null,"n3_endpoint":Value::Null,"s1_state":lte.as_ref().map(|status|status.s1_state.clone()).unwrap_or_else(||"NOT_OBSERVED".into()),"epc_state":lte.as_ref().map(|status|status.epc.process_state.clone()).unwrap_or_else(||"NOT_OBSERVED".into()),"process_state":enb_state,"health":enb_health,"configured":true,"controller_owned":true,"uptime_seconds":Value::Null,"actions":{"start":lte_actions_enabled && enb_state!="running","stop":enb_state=="running","reason":if lte_actions_enabled {"LIVE_GRANT_REQUIRED"}else{"LTE_E2E_CERTIFICATION_REQUIRED"}}}
         ],
-        "configured_count":configured_gnbs,
-        "running_count":usize::from(gnb["process_state"]=="running"),
+        "configured_count":configured_gnbs+1,
+        "running_count":usize::from(gnb["process_state"]=="running")+usize::from(enb_state=="running"),
         "observed_at_epoch_s":epoch_seconds(),
         "source":"READ_ONLY_LAB_STATE"
     }))
@@ -7153,7 +7408,7 @@ async fn ues(
     } else {
         BTreeMap::new()
     };
-    let items = profile_specs
+    let mut items = profile_specs
         .iter()
         .filter(|profile| profile.configured)
         .map(|profile| {
@@ -7280,7 +7535,60 @@ async fn ues(
             })
         })
         .collect::<Vec<_>>();
-    let profiles = profile_specs.iter().map(|profile| {
+    let lte_snapshot = state
+        .srsran_runtime
+        .status(state.lte_e2e_certified, state.srsran_live_enabled)
+        .ok()
+        // Preserve the existing 5G inventory when the bounded LTE runtime
+        // cannot observe any srsRAN/EPC component. `/lte/status` still
+        // exposes the honest NOT_OBSERVED state to the dedicated panel.
+        .filter(|status| status.enb.observed || status.ue.observed || status.epc.observed);
+    if let Some(lte) = lte_snapshot.as_ref() {
+        let lte_granted = grant_covered_ids.contains(srsran_controller::LTE_UE_ID);
+        let running = lte.ue.process_state == "running";
+        let attached = lte.attach_state == "ATTACHED";
+        items.push(json!({
+            "id":srsran_controller::LTE_UE_ID,
+            "internal_ue_id":srsran_controller::LTE_UE_ID,
+            "profile":"lte-ue-01.conf",
+            "profile_state":"CONFIGURED",
+            "subscription_status":"PROTECTED",
+            "serving_node":srsran_controller::ENB_ID,
+            "technology":"LTE 4G",
+            "simulator":"srsRAN",
+            "process_state":lte.ue.process_state,
+            "registration_state":lte.attach_state,
+            "attach_state":lte.attach_state,
+            "rrc_state":"NOT_APPLICABLE",
+            "pdu_session":if lte.active_sessions>0 {"ACTIVE"}else{"INACTIVE"},
+            "active_sessions":lte.active_sessions,
+            "access_point_name":lte.apn,
+            "dnn":Value::Null,
+            "ue_ip":lte.ue_ip,
+            "traffic_state":if running {"IDLE"}else{"STOPPED"},
+            "uptime_seconds":Value::Null,
+            "last_event":lte.ue.last_error,
+            "controller_owned":true,
+            "ownership":"POLARIS_CONTROLLER",
+            "subscriber_identity":if identity_exposed {"PROTECTED"}else{"PROTECTED"},
+            "authentication_material":"PROTECTED",
+            "control_authorized":lte_granted,
+            "traffic_target_verified":attached && lte.ue_ip.is_some(),
+            "actions":{
+                "authorize":state.lte_e2e_certified && state.srsran_live_enabled && !lte_granted,
+                "start":state.lte_e2e_certified && state.srsran_live_enabled && lte_granted && !running,
+                "start_reason":if !state.lte_e2e_certified {"LTE_E2E_CERTIFICATION_REQUIRED"}else if !state.srsran_live_enabled {"SRSRAN_LIVE_DISABLED"}else if !lte_granted {"LTE_LIVE_GRANT_REQUIRED"}else if running {"UE_ALREADY_RUNNING"}else{"READY"},
+                "stop":running,
+                "stop_reason":if running {"READY"}else{"UE_NOT_RUNNING"},
+                "pdu_start":false,
+                "pdu_stop":false,
+                "traffic":attached && lte.ue_ip.is_some(),
+                "traffic_reason":if attached && lte.ue_ip.is_some() {"READY"}else{"LTE_ATTACH_OR_IP_NOT_OBSERVED"},
+                "reason":if state.lte_e2e_certified && state.srsran_live_enabled {"LIVE_GRANT_REQUIRED"}else{"LTE_E2E_CERTIFICATION_REQUIRED"}
+            }
+        }));
+    }
+    let mut profiles = profile_specs.iter().map(|profile| {
         let managed = managed_profiles.get(&profile.ue_id);
         let job = controller_inventory.iter().find(|job| job.ue_id == profile.ue_id);
         let state_label = if !profile.configured {
@@ -7316,6 +7624,35 @@ async fn ues(
             "actions":{"authorize":reason == "READY" && !control_authorized && job.map_or(true, |value| value.process_handle.is_none()),"start":reason == "READY" && control_authorized && job.map_or(true, |value| value.process_handle.is_none()),"stop":job.is_some_and(|value|value.process_handle.is_some()),"traffic":false,"reason":if reason == "READY" && !control_authorized {"UE_CONTROL_VALIDATION_REQUIRED"} else {reason}}
         })
     }).collect::<Vec<_>>();
+    if let Some(lte) = lte_snapshot.as_ref() {
+        let running = lte.ue.process_state == "running";
+        let lte_granted = grant_covered_ids.contains(srsran_controller::LTE_UE_ID);
+        profiles.push(json!({
+            "id":srsran_controller::LTE_UE_ID,
+            "pseudonym":"LTE UE 01",
+            "profile":"lte-ue-01.conf",
+            "serving_gnb":srsran_controller::ENB_ID,
+            "technology":"LTE 4G",
+            "simulator":"srsRAN",
+            "state":if running {"RUNNING"}else{"CONFIGURED"},
+            "configured":true,
+            "controller_owned":true,
+            "ownership":"POLARIS_CONTROLLER",
+            "control_authorized":lte_granted,
+            "subscription_status":"PROTECTED",
+            "subscriber_identity":"PROTECTED",
+            "authentication_material":"PROTECTED",
+            "scenario_id":Value::Null,
+            "auto_run_scenario":false,
+            "actions":{
+                "authorize":state.lte_e2e_certified && state.srsran_live_enabled && !lte_granted,
+                "start":state.lte_e2e_certified && state.srsran_live_enabled && lte_granted && !running,
+                "stop":running,
+                "traffic":lte.attach_state=="ATTACHED" && lte.ue_ip.is_some(),
+                "reason":if state.lte_e2e_certified && state.srsran_live_enabled {"LIVE_GRANT_REQUIRED"}else{"LTE_E2E_CERTIFICATION_REQUIRED"}
+            }
+        }));
+    }
     let controller_active = controller_inventory
         .iter()
         .filter(|job| {
@@ -7334,7 +7671,7 @@ async fn ues(
         .filter(|job| job.pdu_session_state == "ACTIVE")
         .count();
     Json(
-        json!({"items":items,"configured_profiles":profiles,"configured_count":controller.configured_count(),"planned_count":controller_inventory.len(),"max_configurable":ueransim_adapter::MAX_CONFIGURABLE_UES,"active_count":usize::from(shared_observation.process_state == "RUNNING")+controller_active,"registered_count":usize::from(shared_observation.registration_state == "REGISTERED")+controller_registered,"pdu_session_count":usize::from(shared_observation.pdu_session_state == "ACTIVE")+controller_pdu,"observed_at_epoch_s":epoch_seconds(),"cache_version":state.ue_inventory_cache_version.load(Ordering::Acquire),"cache_fresh":cache_fresh,"source":"CURRENT_NAS_PDU_AND_CONTROLLER_REGISTRY","subscriber_identity_exposed":identity_exposed}),
+        json!({"items":items,"configured_profiles":profiles,"configured_count":controller.configured_count()+usize::from(lte_snapshot.is_some()),"planned_count":controller_inventory.len()+usize::from(lte_snapshot.is_some()),"max_configurable":ueransim_adapter::MAX_CONFIGURABLE_UES+usize::from(lte_snapshot.is_some()),"active_count":usize::from(shared_observation.process_state == "RUNNING")+controller_active+usize::from(lte_snapshot.as_ref().is_some_and(|lte|lte.ue.process_state=="running")),"registered_count":usize::from(shared_observation.registration_state == "REGISTERED")+controller_registered+usize::from(lte_snapshot.as_ref().is_some_and(|lte|lte.attach_state=="ATTACHED")),"pdu_session_count":usize::from(shared_observation.pdu_session_state == "ACTIVE")+controller_pdu+lte_snapshot.as_ref().map(|lte|usize::from(lte.active_sessions)).unwrap_or(0),"observed_at_epoch_s":epoch_seconds(),"cache_version":state.ue_inventory_cache_version.load(Ordering::Acquire),"cache_fresh":cache_fresh,"source":"CURRENT_NAS_PDU_AND_CONTROLLER_REGISTRY","subscriber_identity_exposed":identity_exposed}),
     )
 }
 
@@ -10071,6 +10408,24 @@ async fn start_scenario(
                 Json(json!({"error":"IMS_NOT_AVAILABLE"})),
             );
         }
+        let has_lte_steps = resolved.iter().any(|step| {
+            matches!(
+                step.step_type.as_str(),
+                "lte_attach"
+                    | "lte_detach"
+                    | "lte_traffic_ul"
+                    | "lte_traffic_dl"
+                    | "lte_attach_data"
+            )
+        });
+        if has_lte_steps && state.execution_mode != "mock" {
+            // The catalog and mock executor are delivered now, but live LTE
+            // remains closed until ANR1 certification and an explicit deploy.
+            return (
+                StatusCode::LOCKED,
+                Json(json!({"error":"LTE_E2E_CERTIFICATION_REQUIRED"})),
+            );
+        }
         if resolved.iter().any(|step| step.step_type == "traffic_dl") {
             if dl_sender_health(&state).is_err() {
                 return (
@@ -10887,6 +11242,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/system/cpu-decisions", get(cpu_decisions))
         .route("/lab", get(lab))
         .route("/nodes", get(nodes))
+        .route("/lte/status", get(lte_status))
+        .route("/lte/logs", get(lte_logs))
+        .route("/lte/components/start", post(start_lte_component))
+        .route("/lte/components/stop", post(stop_lte_component))
         .route("/ues", get(ues))
         .route("/gnbs", get(list_gnbs))
         .route("/owners", get(list_owners))
@@ -11584,6 +11943,9 @@ mod p0_tests {
             activity_events: Arc::new(activity::ActivityEventStore::new()),
             activity_rate_cache: Arc::new(Mutex::new(BTreeMap::new())),
             traffic_manager: Arc::new(traffic_sessions::TrafficSessionManager::new()),
+            srsran_runtime: Arc::new(srsran_controller::MockSrsranRuntime::default()),
+            srsran_live_enabled: false,
+            lte_e2e_certified: false,
         }
     }
 
@@ -11739,6 +12101,50 @@ mod p0_tests {
         );
         assert_eq!(body["scenario_step_limits"]["repeat_depth_max"], 2);
         assert_eq!(body["scenario_step_limits"]["resolved_steps_max"], 10_000);
+    }
+
+    #[tokio::test]
+    async fn lte_api_is_observable_but_start_stays_locked_without_certification() {
+        let runtime = srsran_controller::MockSrsranRuntime::default();
+        let mut test_state = state();
+        test_state.srsran_runtime = Arc::new(runtime.clone());
+        let application = app(test_state);
+
+        let status = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/lte/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status_body: Value =
+            serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(status_body["certified"], false);
+        assert_eq!(status_body["live_enabled"], false);
+
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let start = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/lte/components/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .header("x-csrf-token", csrf)
+                    .body(Body::from(
+                        json!({"component":"LTE-UE-01","ue_id":"LTE-UE-01"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::LOCKED);
+        assert!(runtime.started.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
