@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.28.3 (polaris-control-api) — 2026-11-01 — LTE Attach deadline reconciliation
+
+- Replaces unscoped srsUE/MME log matching with an Open5GS MME `Attach
+  Complete` proof carrying a verified RFC3339 event timestamp and explicit
+  provenance, bounded to the current srsUE start window.
+- Extends the Attach budget to a bounded 90 seconds, always clipped by the
+  Grant V2/global deadline, and adds a two-second observation reconciliation
+  window that accepts only events emitted no later than the protocol deadline.
+- Keeps IP assignment separate from Attach proof, rejects late events after
+  timeout, and revalidates the consumed Grant immediately before every ping or
+  UDP launch so expiration or revocation cannot restart traffic.
+
 ## 0.28.2 (polaris-control-api) — 2026-11-01 — srsENB Docker health handling
 
 - Parses the complete `docker inspect` JSON instead of dereferencing the

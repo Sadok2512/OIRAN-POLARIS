@@ -5332,6 +5332,55 @@ async fn cleanup_lte_run(
     clean
 }
 
+const LTE_ATTACH_TIMEOUT_MS: u64 = 90_000;
+const LTE_ATTACH_OBSERVATION_GRACE_MS: u64 = 2_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachEventDecision {
+    Accept,
+    Wait,
+    RejectLate,
+    Timeout,
+}
+
+fn attach_deadlines(started_at_epoch_ms: u64, grant_deadline_epoch_ms: u64) -> (u64, u64) {
+    let protocol_deadline = started_at_epoch_ms
+        .saturating_add(LTE_ATTACH_TIMEOUT_MS)
+        .min(grant_deadline_epoch_ms);
+    let reconciliation_deadline = protocol_deadline
+        .saturating_add(LTE_ATTACH_OBSERVATION_GRACE_MS)
+        .min(grant_deadline_epoch_ms);
+    (protocol_deadline, reconciliation_deadline)
+}
+
+fn classify_attach_event(
+    now_epoch_ms: u64,
+    protocol_deadline_epoch_ms: u64,
+    reconciliation_deadline_epoch_ms: u64,
+    event: Option<&srsran_controller::AttachProtocolEvidence>,
+) -> AttachEventDecision {
+    if let Some(event) = event {
+        if event.event_at_epoch_ms <= protocol_deadline_epoch_ms
+            && event.observed_at_epoch_ms <= reconciliation_deadline_epoch_ms
+            && now_epoch_ms <= reconciliation_deadline_epoch_ms
+        {
+            return AttachEventDecision::Accept;
+        }
+        if event.event_at_epoch_ms > protocol_deadline_epoch_ms {
+            return if now_epoch_ms >= reconciliation_deadline_epoch_ms {
+                AttachEventDecision::Timeout
+            } else {
+                AttachEventDecision::RejectLate
+            };
+        }
+    }
+    if now_epoch_ms >= reconciliation_deadline_epoch_ms {
+        AttachEventDecision::Timeout
+    } else {
+        AttachEventDecision::Wait
+    }
+}
+
 async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_epoch_ms: u64) {
     async fn set_state(state: &AppState, run_id: &str, value: &str) {
         let _ = state.lte_grants_v2.lock().map(|mut store| {
@@ -5438,6 +5487,10 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
         let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
         return;
     }
+    // Start the evidence window before invoking srsUE: an immediate MME
+    // Attach Complete must not be lost between `docker start` and the first
+    // polling iteration.
+    let attach_observation_not_before_epoch_ms = epoch_millis();
     let runtime = state.srsran_runtime.clone();
     let ue_start =
         tokio::task::spawn_blocking(move || runtime.start(srsran_controller::Target::Ue)).await;
@@ -5474,36 +5527,66 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             epoch_millis(),
         )
     });
-    let attach_deadline = epoch_millis()
-        .saturating_add(45_000)
-        .min(deadline_at_epoch_ms);
-    if !wait_for(&state, &run_id, attach_deadline, |status| {
-        status.attach_state == "ATTACHED"
-            && status.attach_success_observed
-            && status.epc_context_observed
-            && status.session_state == "ACTIVE"
-    })
-    .await
-    {
-        if lte_run_is_terminal_or_cancelled(&state, &run_id) {
+    let attach_started_at_epoch_ms = epoch_millis();
+    let (attach_deadline, attach_reconciliation_deadline) =
+        attach_deadlines(attach_started_at_epoch_ms, deadline_at_epoch_ms);
+    let attach_evidence = loop {
+        let now = epoch_millis();
+        if lte_run_is_terminal_or_cancelled(&state, &run_id)
+            || lte_run_execution_constraints(&state, &run_id, deadline_at_epoch_ms, now).is_err()
+        {
             let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Cancelled).await;
             return;
         }
-        let _ = state
-            .lte_runs_v2
-            .lock()
-            .map(|mut store| store.fail_step(&run_id, 4, "LTE_ATTACH_TIMEOUT", epoch_millis()));
-        let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
-        return;
-    }
+        let runtime = state.srsran_runtime.clone();
+        let evidence = tokio::task::spawn_blocking(move || {
+            runtime.attach_complete_event(
+                attach_observation_not_before_epoch_ms,
+                attach_deadline,
+            )
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+        match classify_attach_event(
+            now,
+            attach_deadline,
+            attach_reconciliation_deadline,
+            evidence.as_ref(),
+        ) {
+            AttachEventDecision::Accept => break evidence.expect("accepted attach evidence"),
+            AttachEventDecision::Wait | AttachEventDecision::RejectLate => {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            AttachEventDecision::Timeout => {
+                let _ = state.lte_runs_v2.lock().map(|mut store| {
+                    store.fail_step(&run_id, 4, "LTE_ATTACH_TIMEOUT", epoch_millis())
+                });
+                let _ = cleanup_lte_run(
+                    &state,
+                    &run_id,
+                    lte_orchestrator::RunOutcome::Failed,
+                )
+                .await;
+                return;
+            }
+        }
+    };
     let _ = state.lte_runs_v2.lock().map(|mut store| {
         store.observe(
             &run_id,
             4,
             lte_observation(
                 4,
-                "epc_context",
-                json!({"attach":"success","epc_context":true,"identity_withheld":true}),
+                "mme_attach_complete",
+                json!({
+                    "attach":"success",
+                    "event_at_epoch_ms":attach_evidence.event_at_epoch_ms,
+                    "observed_at_epoch_ms":attach_evidence.observed_at_epoch_ms,
+                    "provenance":attach_evidence.provenance,
+                    "identity_withheld":true
+                }),
             ),
             epoch_millis(),
         )?;
@@ -5582,6 +5665,22 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Cancelled).await;
             return;
         }
+        if lte_run_execution_constraints(
+            &state,
+            &run_id,
+            deadline_at_epoch_ms,
+            epoch_millis(),
+        )
+        .is_err()
+        {
+            let _ = cleanup_lte_run(
+                &state,
+                &run_id,
+                lte_orchestrator::RunOutcome::Cancelled,
+            )
+            .await;
+            return;
+        }
         let runtime = state.srsran_runtime.clone();
         let dir = direction.to_string();
         let packets = constraints.ping.max_packets_per_direction;
@@ -5628,6 +5727,22 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             || epoch_millis() >= deadline_at_epoch_ms
         {
             let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Cancelled).await;
+            return;
+        }
+        if lte_run_execution_constraints(
+            &state,
+            &run_id,
+            deadline_at_epoch_ms,
+            epoch_millis(),
+        )
+        .is_err()
+        {
+            let _ = cleanup_lte_run(
+                &state,
+                &run_id,
+                lte_orchestrator::RunOutcome::Cancelled,
+            )
+            .await;
             return;
         }
         let remaining_seconds = deadline_at_epoch_ms
@@ -14685,6 +14800,181 @@ mod p0_tests {
         assert_eq!(lte_operation_mode(&test_state), LteOperationMode::CertificationRun);
         test_state.lte_e2e_certified = true;
         assert_eq!(lte_operation_mode(&test_state), LteOperationMode::LiveOperational);
+    }
+
+    fn attach_event(event_at_epoch_ms: u64, observed_at_epoch_ms: u64) -> srsran_controller::AttachProtocolEvidence {
+        srsran_controller::AttachProtocolEvidence {
+            event_at_epoch_ms,
+            observed_at_epoch_ms,
+            provenance: "OPEN5GS_MME_DOCKER_LOG_RFC3339",
+        }
+    }
+
+    #[test]
+    fn attach_complete_before_at_and_after_deadline_is_deterministic() {
+        let deadline = 100_000;
+        let reconcile = 102_000;
+        let before = attach_event(99_000, 99_100);
+        let at_deadline_observed_late = attach_event(100_000, 101_447);
+        let after = attach_event(100_001, 100_100);
+        assert_eq!(
+            classify_attach_event(99_100, deadline, reconcile, Some(&before)),
+            AttachEventDecision::Accept
+        );
+        assert_eq!(
+            classify_attach_event(101_447, deadline, reconcile, Some(&at_deadline_observed_late)),
+            AttachEventDecision::Accept
+        );
+        assert_eq!(
+            classify_attach_event(100_100, deadline, reconcile, Some(&after)),
+            AttachEventDecision::RejectLate
+        );
+        assert_eq!(
+            classify_attach_event(102_000, deadline, reconcile, Some(&after)),
+            AttachEventDecision::Timeout
+        );
+    }
+
+    #[test]
+    fn attach_timeout_and_late_observation_never_resurrect_the_run() {
+        let deadline = 100_000;
+        let reconcile = 102_000;
+        let on_time_but_observed_too_late = attach_event(99_900, 102_001);
+        assert_eq!(
+            classify_attach_event(101_000, deadline, reconcile, None),
+            AttachEventDecision::Wait
+        );
+        assert_eq!(
+            classify_attach_event(102_000, deadline, reconcile, None),
+            AttachEventDecision::Timeout
+        );
+        assert_eq!(
+            classify_attach_event(
+                102_001,
+                deadline,
+                reconcile,
+                Some(&on_time_but_observed_too_late)
+            ),
+            AttachEventDecision::Timeout
+        );
+    }
+
+    #[test]
+    fn assigned_ip_is_never_attach_complete_evidence() {
+        let assigned_ip = Some("10.45.0.2");
+        assert!(assigned_ip.is_some());
+        assert_eq!(
+            classify_attach_event(99_000, 100_000, 102_000, None),
+            AttachEventDecision::Wait
+        );
+    }
+
+    #[test]
+    fn attach_deadline_is_bounded_by_grant_and_restart_cannot_extend_it() {
+        assert_eq!(attach_deadlines(10_000, 70_000), (70_000, 70_000));
+        let original = attach_deadlines(10_000, 200_000);
+        let recovered = attach_deadlines(10_000, 200_000);
+        assert_eq!(original, (100_000, 102_000));
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn revocation_and_expiration_block_traffic_relaunch() {
+        let mut test_state = state();
+        let path = std::env::temp_dir().join(format!(
+            "polaris-attach-race-grant-{}-{}.json",
+            std::process::id(),
+            epoch_millis()
+        ));
+        let mut grants = lte_grant::GrantStore::load(path.clone()).unwrap();
+        let request: lte_grant::GrantRequestV2 =
+            serde_json::from_value(certification_grant_body("CERTIFICATION_RUN")).unwrap();
+        grants
+            .create(
+                request,
+                "grant-attach-race".into(),
+                100,
+                "operator",
+                "session-a",
+                "request-attach-race",
+            )
+            .unwrap();
+        grants
+            .authorize_temporary_activation(
+                "grant-attach-race",
+                &"n".repeat(43),
+                "activation-attach-race",
+                101,
+                "operator",
+                "session-a",
+            )
+            .unwrap();
+        let run_request = lte_grant::RunRequest {
+            grant_id: "grant-attach-race".into(),
+            profile_id: lte_grant::PROFILE_ID.into(),
+            profile_revision: 1,
+            configuration_sha256: "a".repeat(64),
+            compose_model_sha256: "c".repeat(64),
+            scenario_id: lte_grant::SCENARIO_ID.into(),
+            scenario_revision: 1,
+            scenario_sha256: lte_grant::SCENARIO_SHA256.into(),
+        };
+        let consumed = grants
+            .consume(
+                &run_request,
+                &"n".repeat(43),
+                "run-attach-race",
+                "lte-run-attach-race".into(),
+                102,
+                "operator",
+                "session-a",
+            )
+            .unwrap();
+        test_state.lte_grants_v2 = Arc::new(Mutex::new(grants));
+        test_state
+            .lte_runs_v2
+            .lock()
+            .unwrap()
+            .create(
+                consumed.run_id.clone(),
+                consumed.grant_id.clone(),
+                102,
+                consumed.deadline_at_epoch_ms,
+                "run-attach-race-key",
+            )
+            .unwrap();
+        assert!(lte_run_execution_constraints(
+            &test_state,
+            &consumed.run_id,
+            consumed.deadline_at_epoch_ms,
+            103
+        )
+        .is_ok());
+        test_state
+            .lte_grants_v2
+            .lock()
+            .unwrap()
+            .revoke(&consumed.grant_id)
+            .unwrap();
+        assert_eq!(
+            lte_run_execution_constraints(
+                &test_state,
+                &consumed.run_id,
+                consumed.deadline_at_epoch_ms,
+                104
+            ),
+            Err("LTE_GRANT_INACTIVE".into())
+        );
+        assert_eq!(
+            lte_run_execution_constraints(
+                &test_state,
+                &consumed.run_id,
+                consumed.deadline_at_epoch_ms,
+                consumed.deadline_at_epoch_ms
+            ),
+            Err("LTE_GRANT_EXPIRED_BEFORE_START".into())
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]

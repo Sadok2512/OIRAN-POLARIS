@@ -7,8 +7,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const VERSION: &str = "0.2.2";
+pub const VERSION: &str = "0.2.3";
 pub const LTE_UE_ID: &str = "LTE-SRSUE-TEST-01";
 pub const ENB_ID: &str = "ENB-01";
 const PROJECT: &str = "oiran-lab";
@@ -156,12 +157,24 @@ pub struct PingMeasurement {
     pub received: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachProtocolEvidence {
+    pub event_at_epoch_ms: u64,
+    pub observed_at_epoch_ms: u64,
+    pub provenance: &'static str,
+}
+
 pub trait SrsranRuntime: Send + Sync {
     fn status(&self, certified: bool, live_enabled: bool) -> Result<LteStatus, String>;
     fn start(&self, target: Target) -> Result<(), String>;
     fn stop(&self, target: Target) -> Result<(), String>;
     fn logs(&self, target: Target) -> Result<Vec<String>, String>;
     fn verify_ownership(&self, target: Target) -> Result<(), String>;
+    fn attach_complete_event(
+        &self,
+        not_before_epoch_ms: u64,
+        not_after_epoch_ms: u64,
+    ) -> Result<Option<AttachProtocolEvidence>, String>;
     fn measure_traffic(
         &self,
         direction: &str,
@@ -182,6 +195,69 @@ pub trait SrsranRuntime: Send + Sync {
 
 fn attach_is_proven(s1_state: &str, attach_success: bool, epc_context: bool) -> bool {
     s1_state == "CONNECTED" && attach_success && epc_context
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
+}
+
+fn parse_rfc3339_utc_millis(value: &str) -> Option<u64> {
+    let value = value.strip_suffix('Z')?;
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.len() != 19
+        || whole.as_bytes().get(4) != Some(&b'-')
+        || whole.as_bytes().get(7) != Some(&b'-')
+        || whole.as_bytes().get(10) != Some(&b'T')
+        || whole.as_bytes().get(13) != Some(&b':')
+        || whole.as_bytes().get(16) != Some(&b':')
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let parse = |range: std::ops::Range<usize>| whole.get(range)?.parse::<u32>().ok();
+    let year = whole.get(0..4)?.parse::<i64>().ok()?;
+    let month = parse(5..7)?;
+    let day = parse(8..10)?;
+    let hour = parse(11..13)?;
+    let minute = parse(14..16)?;
+    let second = parse(17..19)?;
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let millis = fraction
+        .bytes()
+        .take(3)
+        .fold(0_u64, |value, byte| value * 10 + u64::from(byte - b'0'))
+        * match fraction.len().min(3) {
+            0 => 1_000,
+            1 => 100,
+            2 => 10,
+            _ => 1,
+        };
+    let days = days_from_civil(year, month, day)?;
+    if days < 0 {
+        return None;
+    }
+    u64::try_from(days)
+        .ok()?
+        .checked_mul(86_400_000)?
+        .checked_add(u64::from(hour) * 3_600_000)?
+        .checked_add(u64::from(minute) * 60_000)?
+        .checked_add(u64::from(second.min(59)) * 1_000)?
+        .checked_add(millis)
+}
+
+fn unix_millis_argument(value: u64) -> String {
+    format!("{}.{:03}", value / 1_000, value % 1_000)
 }
 
 pub fn s1_setup_is_proven(status: &LteStatus) -> bool {
@@ -878,6 +954,60 @@ impl SrsranRuntime for DockerSrsranRuntime {
     fn verify_ownership(&self, target: Target) -> Result<(), String> {
         self.owned(target).map(|_| ())
     }
+    fn attach_complete_event(
+        &self,
+        not_before_epoch_ms: u64,
+        not_after_epoch_ms: u64,
+    ) -> Result<Option<AttachProtocolEvidence>, String> {
+        if not_before_epoch_ms > not_after_epoch_ms {
+            return Err("LTE_ATTACH_EVIDENCE_WINDOW_INVALID".into());
+        }
+        let mme = self
+            .resolve("mme")?
+            .filter(|container| container.state == "running")
+            .ok_or("LTE_MME_NOT_RUNNING")?;
+        let since = unix_millis_argument(not_before_epoch_ms);
+        let until = unix_millis_argument(not_after_epoch_ms);
+        let output = Self::ok(
+            self.run(
+                &[
+                    "logs",
+                    "--timestamps",
+                    "--since",
+                    &since,
+                    "--until",
+                    &until,
+                    "--tail",
+                    "400",
+                    &mme.id,
+                ],
+                5,
+            )?,
+            "LTE_ATTACH_EVIDENCE_UNAVAILABLE",
+        )?;
+        let event_at_epoch_ms = format!("{}{}", output.stdout, output.stderr)
+            .lines()
+            .filter_map(|line| {
+                let (timestamp, message) = line.split_once(' ')?;
+                message
+                    .to_ascii_lowercase()
+                    .contains("attach complete")
+                    .then(|| parse_rfc3339_utc_millis(timestamp))
+                    .flatten()
+            })
+            .filter(|timestamp| {
+                *timestamp >= not_before_epoch_ms && *timestamp <= not_after_epoch_ms
+            })
+            .max();
+        Ok(event_at_epoch_ms.map(|event_at_epoch_ms| AttachProtocolEvidence {
+            event_at_epoch_ms,
+            observed_at_epoch_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            provenance: "OPEN5GS_MME_DOCKER_LOG_RFC3339",
+        }))
+    }
     fn measure_traffic(
         &self,
         direction: &str,
@@ -1081,6 +1211,7 @@ pub struct MockSrsranRuntime {
     pub status_override: Arc<Mutex<Option<LteStatus>>>,
     pub start_error: Arc<Mutex<Option<String>>>,
     pub sidecars_absent: Arc<Mutex<bool>>,
+    pub attach_evidence: Arc<Mutex<Option<AttachProtocolEvidence>>>,
 }
 impl Default for MockSrsranRuntime {
     fn default() -> Self {
@@ -1091,6 +1222,7 @@ impl Default for MockSrsranRuntime {
             status_override: Arc::new(Mutex::new(None)),
             start_error: Arc::new(Mutex::new(None)),
             sidecars_absent: Arc::new(Mutex::new(true)),
+            attach_evidence: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1142,6 +1274,21 @@ impl SrsranRuntime for MockSrsranRuntime {
         } else {
             Err("SRSRAN_CONTROLLER_OWNERSHIP_REQUIRED".into())
         }
+    }
+    fn attach_complete_event(
+        &self,
+        not_before_epoch_ms: u64,
+        not_after_epoch_ms: u64,
+    ) -> Result<Option<AttachProtocolEvidence>, String> {
+        Ok(self
+            .attach_evidence
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|evidence| {
+                evidence.event_at_epoch_ms >= not_before_epoch_ms
+                    && evidence.event_at_epoch_ms <= not_after_epoch_ms
+            }))
     }
     fn measure_traffic(
         &self,
@@ -1479,6 +1626,48 @@ mod tests {
             runtime.resolve("srsenb"),
             Err("SRSRAN_COMMAND_TIMEOUT".into())
         );
+    }
+    #[test]
+    fn docker_mme_attach_complete_has_bounded_timestamp_and_provenance() {
+        let executor = Arc::new(ScriptExecutor::default());
+        let id = "mme-container-id";
+        executor.outputs.lock().unwrap().extend([
+            output(0, &format!("{id}\n")),
+            output(
+                0,
+                &inspect_json(id, "mme", "running", TestHealth::Absent, ""),
+            ),
+            output(
+                0,
+                "2026-11-01T12:00:00.123456789Z MME Attach Complete received\n",
+            ),
+        ]);
+        let runtime = DockerSrsranRuntime {
+            executor: executor.clone(),
+            ledger: PathBuf::from("/unused-attach-evidence-test"),
+        };
+        let evidence = runtime
+            .attach_complete_event(1_793_534_400_000, 1_793_534_400_500)
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.event_at_epoch_ms, 1_793_534_400_123);
+        assert_eq!(evidence.provenance, "OPEN5GS_MME_DOCKER_LOG_RFC3339");
+        let calls = executor.calls.lock().unwrap();
+        assert!(calls[2].windows(2).any(|args| args == ["--timestamps", "--since"]));
+        assert!(calls[2].windows(2).any(|args| args == ["--until", "1793534400.500"]));
+    }
+    #[test]
+    fn docker_timestamp_parser_is_utc_and_millisecond_bounded() {
+        assert_eq!(
+            parse_rfc3339_utc_millis("2026-11-01T12:00:00.123456789Z"),
+            Some(1_793_534_400_123)
+        );
+        assert_eq!(
+            parse_rfc3339_utc_millis("2026-11-01T12:00:00Z"),
+            Some(1_793_534_400_000)
+        );
+        assert_eq!(parse_rfc3339_utc_millis("2026-11-01 12:00:00Z"), None);
+        assert_eq!(parse_rfc3339_utc_millis("2026-11-01T12:00:00+00:00"), None);
     }
     #[test]
     fn canonical_compose_model_includes_the_lte_profile() {
