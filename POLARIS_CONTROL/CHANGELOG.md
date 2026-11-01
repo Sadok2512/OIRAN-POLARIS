@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.28.2 (polaris-control-api) — 2026-11-01 — srsENB Docker health handling
+
+- Parses the complete `docker inspect` JSON instead of dereferencing the
+  optional `.State.Health` field in a Go template.
+- Classifies absent/null, starting, healthy and unhealthy health states while
+  treating a running process without a healthcheck only as startup evidence.
+- Keeps S1 readiness bound to an independently observed SCTP association and
+  fails closed on stopped, crashed, unhealthy or timed-out containers with
+  controller-owned rollback and cleanup preserved.
+
 ## 0.28.1 (polaris-control-api) — 2026-11-01 — evidence scope and replay binding
 
 - Binds every server-staged LTE evidence manifest to the exact run, controller

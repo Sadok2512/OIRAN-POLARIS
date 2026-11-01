@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-pub const VERSION: &str = "0.2.1";
+pub const VERSION: &str = "0.2.2";
 pub const LTE_UE_ID: &str = "LTE-SRSUE-TEST-01";
 pub const ENB_ID: &str = "ENB-01";
 const PROJECT: &str = "oiran-lab";
@@ -184,12 +184,106 @@ fn attach_is_proven(s1_state: &str, attach_success: bool, epc_context: bool) -> 
     s1_state == "CONNECTED" && attach_success && epc_context
 }
 
-#[derive(Clone)]
+pub fn s1_setup_is_proven(status: &LteStatus) -> bool {
+    status.enb.process_state == "running"
+        && status.epc.process_state == "running"
+        && status.s1_state == "CONNECTED"
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DockerHealth {
+    Absent,
+    Starting,
+    Healthy,
+    Unhealthy,
+    Unknown,
+}
+impl DockerHealth {
+    fn from_state(state: &serde_json::Value) -> Self {
+        match state.get("Health") {
+            None | Some(serde_json::Value::Null) => Self::Absent,
+            Some(health) => match health.get("Status").and_then(serde_json::Value::as_str) {
+                Some("starting") => Self::Starting,
+                Some("healthy") => Self::Healthy,
+                Some("unhealthy") => Self::Unhealthy,
+                _ => Self::Unknown,
+            },
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "not_available",
+            Self::Starting => "starting",
+            Self::Healthy => "healthy",
+            Self::Unhealthy => "unhealthy",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Container {
     id: String,
     state: String,
-    health: String,
+    health: DockerHealth,
     error: String,
+}
+impl Container {
+    /// Docker process state is only startup evidence. It never proves S1 Setup.
+    fn process_started(&self) -> bool {
+        self.state == "running"
+            && matches!(
+                self.health,
+                DockerHealth::Absent | DockerHealth::Starting | DockerHealth::Healthy
+            )
+    }
+}
+
+fn parse_container_inspect(data: &str, service: &str) -> Result<Container, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(data.trim()).map_err(|_| "SRSRAN_DISCOVERY_FAILED")?;
+    let id = value
+        .get("Id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("SRSRAN_DISCOVERY_FAILED")?;
+    let labels = value
+        .pointer("/Config/Labels")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("LTE_RUNTIME_OWNERSHIP_CONFLICT")?;
+    let label = |name: &str| labels.get(name).and_then(serde_json::Value::as_str);
+    let image = value
+        .pointer("/Config/Image")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("LTE_RUNTIME_OWNERSHIP_CONFLICT")?;
+    if label("com.docker.compose.project") != Some(PROJECT)
+        || label("com.docker.compose.service") != Some(service)
+        || label("com.docker.compose.project.config_files") != Some(COMPOSE)
+        || (matches!(service, "srsenb" | "srsue") && image != CERTIFIED_IMAGE_REFERENCE)
+    {
+        return Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into());
+    }
+    let state = value
+        .get("State")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("SRSRAN_DISCOVERY_FAILED")?;
+    let state_value = serde_json::Value::Object(state.clone());
+    let process_state = state
+        .get("Status")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("SRSRAN_DISCOVERY_FAILED")?;
+    let error = state
+        .get("Error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    Ok(Container {
+        id: id.into(),
+        state: process_state.into(),
+        health: DockerHealth::from_state(&state_value),
+        error: error.into(),
+    })
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Ownership {
@@ -247,25 +341,13 @@ impl DockerSrsranRuntime {
         if ids.len() != 1 {
             return Err("SRSRAN_AMBIGUOUS_SERVICE_INSTANCE".into());
         }
-        let fmt = "{{.Id}}|{{index .Config.Labels \"com.docker.compose.project\"}}|{{index .Config.Labels \"com.docker.compose.service\"}}|{{index .Config.Labels \"com.docker.compose.project.config_files\"}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}not_available{{end}}|{{.State.Error}}|{{.Config.Image}}";
+        // Inspect the complete JSON object. Accessing `.State.Health` in a Go
+        // template is not portable across containers that have no healthcheck.
         let data = Self::ok(
-            self.run(&["inspect", "--format", fmt, ids[0]], 5)?,
+            self.run(&["inspect", "--format", "{{json .}}", ids[0]], 5)?,
             "SRSRAN_DISCOVERY_FAILED",
         )?;
-        let f = data.stdout.trim().splitn(8, '|').collect::<Vec<_>>();
-        let digest_matches = !matches!(service, "srsenb" | "srsue")
-            || f.get(7)
-                .is_some_and(|reference| *reference == CERTIFIED_IMAGE_REFERENCE);
-        if f.len() != 8 || f[1] != PROJECT || f[2] != service || f[3] != COMPOSE || !digest_matches
-        {
-            return Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into());
-        }
-        Ok(Some(Container {
-            id: f[0].into(),
-            state: f[4].into(),
-            health: f[5].into(),
-            error: f[6].into(),
-        }))
+        parse_container_inspect(&data.stdout, service).map(Some)
     }
     fn load(&self) -> Result<Ownership, String> {
         let bytes = match fs::read(&self.ledger) {
@@ -354,7 +436,7 @@ impl DockerSrsranRuntime {
             .as_ref()
             .map_or_else(ProcessObservation::unknown, |c| ProcessObservation {
                 process_state: c.state.clone(),
-                health: c.health.clone(),
+                health: c.health.as_str().into(),
                 observed: true,
                 controller_owned: owned,
                 last_error: (!c.error.is_empty()).then(|| "CONTAINER_REPORTED_ERROR".into()),
@@ -367,7 +449,7 @@ impl DockerSrsranRuntime {
             .flatten()
             .map_or_else(ProcessObservation::unknown, |c| ProcessObservation {
                 process_state: c.state,
-                health: c.health,
+                health: c.health.as_str().into(),
                 observed: true,
                 controller_owned: false,
                 last_error: (!c.error.is_empty()).then(|| "CONTAINER_REPORTED_ERROR".into()),
@@ -741,6 +823,31 @@ impl SrsranRuntime for DockerSrsranRuntime {
             }
             return Err(error);
         }
+        let started = match self.resolve(target.service()) {
+            Ok(observed) => observed
+                .filter(|observed| observed.id == c.id)
+                .is_some_and(|observed| observed.process_started()),
+            Err(error) => {
+                if created {
+                    let cleanup = self.remove(&c.id, true);
+                    let _ = self.set_owned(target, None);
+                    if cleanup.is_err() {
+                        return Err("SRSRAN_START_FAILED_ROLLBACK_FAILED".into());
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if !started {
+            if created {
+                let cleanup = self.remove(&c.id, true);
+                let _ = self.set_owned(target, None);
+                if cleanup.is_err() {
+                    return Err("SRSRAN_START_FAILED_ROLLBACK_FAILED".into());
+                }
+            }
+            return Err("SRSRAN_PROCESS_NOT_RUNNING".into());
+        }
         Ok(())
     }
     fn stop(&self, target: Target) -> Result<(), String> {
@@ -1099,6 +1206,7 @@ impl SrsranRuntime for MockSrsranRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::collections::VecDeque;
     #[derive(Default)]
     struct ScriptExecutor {
@@ -1121,6 +1229,38 @@ mod tests {
             stdout: stdout.into(),
             stderr: String::new(),
         })
+    }
+    enum TestHealth<'a> {
+        Absent,
+        Null,
+        Status(&'a str),
+    }
+    fn inspect_json(
+        id: &str,
+        service: &str,
+        status: &str,
+        health: TestHealth<'_>,
+        error: &str,
+    ) -> String {
+        let mut state = json!({"Status":status,"Error":error});
+        match health {
+            TestHealth::Absent => {}
+            TestHealth::Null => state["Health"] = serde_json::Value::Null,
+            TestHealth::Status(value) => state["Health"] = json!({"Status":value}),
+        }
+        json!({
+            "Id":id,
+            "Config":{
+                "Labels":{
+                    "com.docker.compose.project":PROJECT,
+                    "com.docker.compose.service":service,
+                    "com.docker.compose.project.config_files":COMPOSE
+                },
+                "Image":CERTIFIED_IMAGE_REFERENCE
+            },
+            "State":state
+        })
+        .to_string()
     }
     #[test]
     fn allowlist() {
@@ -1156,6 +1296,107 @@ mod tests {
         assert!(!attach_is_proven("CONNECTED", true, false));
         assert!(!attach_is_proven("CONNECTED", false, true));
         assert!(attach_is_proven("CONNECTED", true, true));
+    }
+    #[test]
+    fn docker_health_absent_null_starting_healthy_and_unhealthy_are_explicit() {
+        let id = "0123456789abcdef";
+        let absent = parse_container_inspect(
+            &inspect_json(id, "srsenb", "created", TestHealth::Absent, ""),
+            "srsenb",
+        )
+        .unwrap();
+        let null = parse_container_inspect(
+            &inspect_json(id, "srsenb", "running", TestHealth::Null, ""),
+            "srsenb",
+        )
+        .unwrap();
+        let starting = parse_container_inspect(
+            &inspect_json(id, "srsenb", "running", TestHealth::Status("starting"), ""),
+            "srsenb",
+        )
+        .unwrap();
+        let healthy = parse_container_inspect(
+            &inspect_json(id, "srsenb", "running", TestHealth::Status("healthy"), ""),
+            "srsenb",
+        )
+        .unwrap();
+        let unhealthy = parse_container_inspect(
+            &inspect_json(id, "srsenb", "running", TestHealth::Status("unhealthy"), ""),
+            "srsenb",
+        )
+        .unwrap();
+        let unknown = parse_container_inspect(
+            &inspect_json(id, "srsenb", "running", TestHealth::Status("mystery"), ""),
+            "srsenb",
+        )
+        .unwrap();
+        assert_eq!(absent.health, DockerHealth::Absent);
+        assert_eq!(null.health, DockerHealth::Absent);
+        assert_eq!(starting.health, DockerHealth::Starting);
+        assert_eq!(healthy.health, DockerHealth::Healthy);
+        assert_eq!(unhealthy.health, DockerHealth::Unhealthy);
+        assert_eq!(unknown.health, DockerHealth::Unknown);
+        assert!(!absent.process_started());
+        assert!(null.process_started());
+        assert!(starting.process_started());
+        assert!(healthy.process_started());
+        assert!(!unhealthy.process_started());
+        assert!(!unknown.process_started());
+    }
+    #[test]
+    fn stopped_and_crashed_containers_are_not_started() {
+        let stopped = parse_container_inspect(
+            &inspect_json("stopped", "srsenb", "exited", TestHealth::Absent, ""),
+            "srsenb",
+        )
+        .unwrap();
+        let crashed = parse_container_inspect(
+            &inspect_json(
+                "crashed",
+                "srsenb",
+                "exited",
+                TestHealth::Absent,
+                "signal: killed",
+            ),
+            "srsenb",
+        )
+        .unwrap();
+        assert!(!stopped.process_started());
+        assert!(!crashed.process_started());
+        assert_eq!(crashed.error, "signal: killed");
+    }
+    #[test]
+    fn running_without_healthcheck_does_not_prove_s1_ready() {
+        let process = ProcessObservation {
+            process_state: "running".into(),
+            health: "not_available".into(),
+            observed: true,
+            controller_owned: true,
+            last_error: None,
+        };
+        let mut status = LteStatus {
+            technology: "LTE 4G",
+            simulator: "srsRAN",
+            certified: false,
+            live_enabled: true,
+            epc: process.clone(),
+            s1_state: "UNKNOWN".into(),
+            enb: process,
+            ue: ProcessObservation::unknown(),
+            ue_id: LTE_UE_ID,
+            attach_state: "UNKNOWN".into(),
+            attach_success_observed: false,
+            epc_context_observed: false,
+            apn: "UNKNOWN".into(),
+            ue_ip: None,
+            session_state: "UNKNOWN".into(),
+            active_sessions: 0,
+            ownership_verified: true,
+            traffic_ready: false,
+        };
+        assert!(!s1_setup_is_proven(&status));
+        status.s1_state = "CONNECTED".into();
+        assert!(s1_setup_is_proven(&status));
     }
     #[test]
     fn sidecar_cleanup_is_explicit_in_runtime_fixture() {
@@ -1198,7 +1439,7 @@ mod tests {
         let ue = Container {
             id: "owned-ue".into(),
             state: "running".into(),
-            health: "healthy".into(),
+            health: DockerHealth::Healthy,
             error: String::new(),
         };
         let previous_peer = std::env::var_os("POLARIS_LTE_TRAFFIC_PEER_IP");
@@ -1222,6 +1463,22 @@ mod tests {
         assert_eq!(classify_exit(124), Err("SRSRAN_COMMAND_TIMEOUT".into()));
         assert_eq!(classify_exit(137), Err("SRSRAN_COMMAND_TIMEOUT".into()));
         assert_eq!(classify_exit(1), Ok(()));
+    }
+    #[test]
+    fn docker_inspect_timeout_is_propagated() {
+        let executor = Arc::new(ScriptExecutor::default());
+        executor.outputs.lock().unwrap().extend([
+            output(0, "container-id\n"),
+            Err("SRSRAN_COMMAND_TIMEOUT".into()),
+        ]);
+        let runtime = DockerSrsranRuntime {
+            executor,
+            ledger: PathBuf::from("/unused-timeout-test"),
+        };
+        assert_eq!(
+            runtime.resolve("srsenb"),
+            Err("SRSRAN_COMMAND_TIMEOUT".into())
+        );
     }
     #[test]
     fn canonical_compose_model_includes_the_lte_profile() {
@@ -1275,9 +1532,7 @@ mod tests {
             output(0, &format!("{id}\n")),
             output(
                 0,
-                &format!(
-                    "{id}|{PROJECT}|srsenb|{COMPOSE}|created|not_available||{CERTIFIED_IMAGE_REFERENCE}\n"
-                ),
+                &inspect_json(id, "srsenb", "created", TestHealth::Absent, ""),
             ),
             output(1, ""),
             output(0, ""),
@@ -1300,6 +1555,75 @@ mod tests {
             .iter()
             .any(|args| args == &vec!["rm".to_string(), "-f".to_string(), id.to_string()]));
         assert!(runtime.load().unwrap().components.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn newly_created_container_without_healthcheck_is_accepted_as_started_only() {
+        let executor = Arc::new(ScriptExecutor::default());
+        let id = "fedcba9876543210";
+        executor.outputs.lock().unwrap().extend([
+            output(0, ""),
+            output(0, ""),
+            output(0, &format!("{id}\n")),
+            output(
+                0,
+                &inspect_json(id, "srsenb", "created", TestHealth::Absent, ""),
+            ),
+            output(0, ""),
+            output(0, &format!("{id}\n")),
+            output(
+                0,
+                &inspect_json(id, "srsenb", "running", TestHealth::Absent, ""),
+            ),
+        ]);
+        let root =
+            std::env::temp_dir().join(format!("polaris-srsran-no-health-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = DockerSrsranRuntime {
+            executor,
+            ledger: root.join("ledger.json"),
+        };
+        assert_eq!(runtime.start(Target::Enb), Ok(()));
+        assert!(runtime.load().unwrap().components.contains_key("srsenb"));
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn post_start_inspect_timeout_cleans_new_container_and_ownership() {
+        let executor = Arc::new(ScriptExecutor::default());
+        let id = "abcdef0123456789";
+        executor.outputs.lock().unwrap().extend([
+            output(0, ""),
+            output(0, ""),
+            output(0, &format!("{id}\n")),
+            output(
+                0,
+                &inspect_json(id, "srsenb", "created", TestHealth::Absent, ""),
+            ),
+            output(0, ""),
+            output(0, &format!("{id}\n")),
+            Err("SRSRAN_COMMAND_TIMEOUT".into()),
+            output(0, ""),
+        ]);
+        let root = std::env::temp_dir().join(format!(
+            "polaris-srsran-start-timeout-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = DockerSrsranRuntime {
+            executor: executor.clone(),
+            ledger: root.join("ledger.json"),
+        };
+        assert_eq!(
+            runtime.start(Target::Enb),
+            Err("SRSRAN_COMMAND_TIMEOUT".into())
+        );
+        assert!(runtime.load().unwrap().components.is_empty());
+        assert!(executor
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|args| args == &vec!["rm".to_string(), "-f".to_string(), id.to_string()]));
         let _ = fs::remove_dir_all(root);
     }
 }
