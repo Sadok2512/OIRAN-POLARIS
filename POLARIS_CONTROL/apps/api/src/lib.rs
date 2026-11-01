@@ -5386,11 +5386,12 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             epoch_millis(),
         )
     });
-    if !wait_for(&state, &run_id, s1_deadline, |status| {
-        status.enb.process_state == "running"
-            && status.epc.process_state == "running"
-            && status.s1_state == "CONNECTED"
-    })
+    if !wait_for(
+        &state,
+        &run_id,
+        s1_deadline,
+        srsran_controller::s1_setup_is_proven,
+    )
     .await
     {
         if lte_run_is_terminal_or_cancelled(&state, &run_id) {
