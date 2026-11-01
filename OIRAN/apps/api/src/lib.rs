@@ -19,8 +19,8 @@ use live_probe::{
         LteDatasetManifest, LteEvidenceError, LteEvidenceImportPayload, LteEvidenceStore,
     },
     offline_lte_callflows, read_callflow_page, CaptureManager, CaptureRequest,
-    ContinuousImportConfig,
-    DEFAULT_CALLFLOW_PAGE_EVENTS, DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES, MAX_CALLFLOW_PAGE_EVENTS,
+    ContinuousImportConfig, DEFAULT_CALLFLOW_PAGE_EVENTS, DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+    MAX_CALLFLOW_PAGE_EVENTS,
 };
 use probe_registry::{CreateError as ProbeCreateError, ProbeInput, ProbeRecord, ProbeRegistry};
 use serde::Deserialize;
@@ -42,7 +42,7 @@ use tower_http::{
 };
 
 pub const API_VERSION: &str = "2.7.2";
-pub const PLATFORM_VERSION: &str = "2.7.0";
+pub const PLATFORM_VERSION: &str = "2.7.2";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -133,8 +133,7 @@ impl ApiConfig {
                 .map(|value| value.parse::<u64>().unwrap_or(0))
                 .unwrap_or(DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES),
             reference_dataset_enabled: cfg!(test)
-                || std::env::var("OIRAN_REFERENCE_DATASET_ENABLED")
-                    .is_ok_and(|value| value == "1"),
+                || std::env::var("OIRAN_REFERENCE_DATASET_ENABLED").is_ok_and(|value| value == "1"),
         }
     }
 }
@@ -519,18 +518,12 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/datasets/import-derived", post(import_derived_dataset))
         .route("/lte/evidence/import", post(import_lte_evidence))
         .route("/lte/evidence/:run_id", get(lte_evidence_status))
-        .route(
-            "/lte/evidence/:run_id/sessions",
-            get(lte_evidence_sessions),
-        )
+        .route("/lte/evidence/:run_id/sessions", get(lte_evidence_sessions))
         .route(
             "/lte/evidence/:run_id/sessions/:session_id/callflow",
             get(lte_evidence_callflow),
         )
-        .route(
-            "/lte/evidence/:run_id/exports",
-            post(export_lte_evidence),
-        )
+        .route("/lte/evidence/:run_id/exports", post(export_lte_evidence))
         .route("/datasets/:id", get(dataset))
         .route("/datasets/:id/sessions", get(dataset_sessions))
         .route("/ues", get(ues))
@@ -638,7 +631,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 async fn version(State(state): State<AppState>) -> Json<Value> {
     let flow = primary_flow(&state);
     ok(json!({
-        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":"2.7.0",
+        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":"2.7.1",
         "event_schema":"1.2.0","callflow_schema":flow.map(|value|value.schema_version.as_str()).unwrap_or("UNKNOWN"),
         "session_engine":session_engine::VERSION,"correlation_engine":correlation_engine::VERSION,"dataset_registry":dataset_registry::VERSION,
         "disk_safety":disk_safety::VERSION,
@@ -1432,16 +1425,26 @@ fn dataset_values(state: &AppState) -> Vec<Value> {
             }),
     );
     if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
-        items.extend(catalog.into_iter().map(|manifest| lte_dataset_summary(&manifest)));
+        items.extend(
+            catalog
+                .into_iter()
+                .map(|manifest| lte_dataset_summary(&manifest)),
+        );
     }
     items
 }
 
 fn technology_from_interfaces<'a>(interfaces: impl Iterator<Item = &'a str>) -> &'static str {
     let observed = interfaces.collect::<Vec<_>>();
-    if observed.iter().any(|value| matches!(*value, "S1-MME" | "S11" | "S1-U")) {
+    if observed
+        .iter()
+        .any(|value| matches!(*value, "S1-MME" | "S11" | "S1-U"))
+    {
         "LTE"
-    } else if observed.iter().any(|value| matches!(*value, "N2" | "N3" | "N4" | "SBI")) {
+    } else if observed
+        .iter()
+        .any(|value| matches!(*value, "N2" | "N3" | "N4" | "SBI"))
+    {
         "5G SA"
     } else {
         "UNKNOWN"
@@ -1618,7 +1621,10 @@ async fn import_lte_evidence(
         Ok(request) => request,
         Err(error) => return lte_evidence_error(error),
     };
-    let bundle = state.inner.lte_evidence_bundle_root.join(&request.bundle_id);
+    let bundle = state
+        .inner
+        .lte_evidence_bundle_root
+        .join(&request.bundle_id);
     match state.inner.lte_evidence_store.ingest(&bundle, &request) {
         Ok(result) => {
             let status = if result.idempotent {
@@ -1652,7 +1658,12 @@ async fn lte_evidence_sessions(
         query.page.unwrap_or(1),
         query.page_size.unwrap_or(50),
     ) {
-        Ok(value) => Json(value).into_response(),
+        Ok(mut value) => {
+            // Keep the LTE pagination wire shape stable while enforcing the
+            // same recursive privacy boundary as every other read route.
+            sanitize_value(&mut value);
+            Json(value).into_response()
+        }
         Err(error) => lte_evidence_error(error),
     }
 }
@@ -1689,11 +1700,11 @@ async fn export_lte_evidence(
     if let Err(response) = require_operator_csrf(&state, &headers) {
         return response;
     }
-    match state
-        .inner
-        .lte_evidence_store
-        .export_pending_review(&run_id, &request.export_id, &request.transformation)
-    {
+    match state.inner.lte_evidence_store.export_pending_review(
+        &run_id,
+        &request.export_id,
+        &request.transformation,
+    ) {
         Ok(manifest) => (StatusCode::CREATED, ok(json!(manifest))).into_response(),
         Err(error) => lte_evidence_error(error),
     }
@@ -1736,12 +1747,16 @@ async fn dataset_sessions(
     Path(id): Path<String>,
     Query(mut query): Query<ListQuery>,
 ) -> Response {
-    let lte_exists = state.inner.lte_evidence_store.catalog().ok().is_some_and(|items| {
-        items.iter().any(|manifest| manifest.dataset_id == id)
-    });
+    let lte_exists = state
+        .inner
+        .lte_evidence_store
+        .catalog()
+        .ok()
+        .is_some_and(|items| items.iter().any(|manifest| manifest.dataset_id == id));
     if state.inner.registry.get(&id).is_none()
         && state.inner.capture_manager.dataset(&id).is_none()
-        && !lte_exists {
+        && !lte_exists
+    {
         return api_error(
             StatusCode::NOT_FOUND,
             "DATASET_NOT_FOUND",
@@ -2084,8 +2099,7 @@ fn session_summary(state: &AppState, flow: &CallFlow) -> Value {
             .unwrap_or(parsed_pdu)
     };
     let ue_pseudonym = if is_lte {
-        flow.session_id
-            .replacen("lte-session-", "LTE-UE-", 1)
+        flow.session_id.replacen("lte-session-", "LTE-UE-", 1)
     } else if parsed_ue == "UNKNOWN_UE" {
         context
             .map(|context| context.pseudonym.clone())
@@ -2241,9 +2255,13 @@ fn live_session_summary(dataset: &live_probe::LiveDataset, flow: &CallFlow) -> V
 }
 
 fn lte_session_summary(manifest: &LteDatasetManifest, session: &LteSession) -> Value {
-    let packet_count = session.tunnels.iter().map(|tunnel| {
-        tunnel.uplink_packets + tunnel.downlink_packets + tunnel.unknown_direction_packets
-    }).sum::<usize>();
+    let packet_count = session
+        .tunnels
+        .iter()
+        .map(|tunnel| {
+            tunnel.uplink_packets + tunnel.downlink_packets + tunnel.unknown_direction_packets
+        })
+        .sum::<usize>();
     json!({
         "session_id":session.session_id,"dataset_id":manifest.dataset_id,
         "ue_context_id":Value::Null,"dataset_kind":"EVIDENCE","technology":"LTE",
@@ -2282,11 +2300,18 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
     }
     if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
         for manifest in catalog {
-            if let Ok(page) = state.inner.lte_evidence_store.session_page(&manifest.run_id, 1, 100) {
+            if let Ok(page) = state
+                .inner
+                .lte_evidence_store
+                .session_page(&manifest.run_id, 1, 100)
+            {
                 if let Some(records) = page["data"].as_array() {
                     for record in records {
                         if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
-                            unique.insert(session.session_id.clone(), lte_session_summary(&manifest, &session));
+                            unique.insert(
+                                session.session_id.clone(),
+                                lte_session_summary(&manifest, &session),
+                            );
                         }
                     }
                 }
@@ -2346,7 +2371,9 @@ async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Respo
         let procedures = lte.procedures.iter().enumerate().map(|(index, name)| json!({
             "id":format!("lte-procedure-{index}"),"name":name,"event_ids":[],"status":"OBSERVED"
         })).collect::<Vec<_>>();
-        let capture_references = manifest.source_capture_sha256.keys()
+        let capture_references = manifest
+            .source_capture_sha256
+            .keys()
             .map(|plane| format!("capture:{plane}"))
             .collect::<Vec<_>>();
         let mut value = json!({
@@ -2372,9 +2399,15 @@ async fn session_procedures(State(state): State<AppState>, Path(id): Path<String
         return ok(json!(flow.procedures)).into_response();
     }
     if let Ok(Some((_manifest, lte))) = state.inner.lte_evidence_store.find_session(&id) {
-        return ok(json!(lte.procedures.iter().enumerate().map(|(index,name)| json!({
-            "id":format!("lte-procedure-{index}"),"name":name,"event_ids":[],"status":"OBSERVED"
-        })).collect::<Vec<_>>())).into_response();
+        return ok(json!(lte
+            .procedures
+            .iter()
+            .enumerate()
+            .map(|(index, name)| json!({
+                "id":format!("lte-procedure-{index}"),"name":name,"event_ids":[],"status":"OBSERVED"
+            }))
+            .collect::<Vec<_>>()))
+        .into_response();
     }
     api_error(
         StatusCode::NOT_FOUND,
@@ -2402,7 +2435,13 @@ async fn session_events(
             MAX_CALLFLOW_PAGE_EVENTS,
         ) {
             Ok(Some(value)) => value["events"].as_array().cloned().unwrap_or_default(),
-            Ok(None) => return api_error(StatusCode::NOT_FOUND,"SESSION_NOT_FOUND","unknown session id"),
+            Ok(None) => {
+                return api_error(
+                    StatusCode::NOT_FOUND,
+                    "SESSION_NOT_FOUND",
+                    "unknown session id",
+                )
+            }
             Err(error) => return lte_evidence_error(error),
         }
     };
@@ -2527,9 +2566,15 @@ async fn session_callflow(
     } else if let Some(flow_value) = flow_value_for(&state, &id) {
         callflow_page_from_value(flow_value, cursor, limit).map(Some)
     } else {
-        match state.inner.capture_manager.callflow_page_by_session(&id, cursor, limit) {
+        match state
+            .inner
+            .capture_manager
+            .callflow_page_by_session(&id, cursor, limit)
+        {
             Ok(Some(value)) => Ok(Some(value)),
-            Ok(None) => state.inner.lte_evidence_store
+            Ok(None) => state
+                .inner
+                .lte_evidence_store
                 .callflow_page_by_session(&id, cursor, limit)
                 .map_err(|error| error.to_string()),
             Err(error) => Err(error),
@@ -2556,7 +2601,9 @@ async fn session_correlations(State(state): State<AppState>, Path(id): Path<Stri
         flow
     } else {
         return match state.inner.lte_evidence_store.callflow_page_by_session(
-            &id, None, MAX_CALLFLOW_PAGE_EVENTS,
+            &id,
+            None,
+            MAX_CALLFLOW_PAGE_EVENTS,
         ) {
             Ok(Some(mut flow)) => {
                 let mut value = json!({
@@ -2566,7 +2613,11 @@ async fn session_correlations(State(state): State<AppState>, Path(id): Path<Stri
                 sanitize_value(&mut value);
                 ok(value).into_response()
             }
-            Ok(None) => api_error(StatusCode::NOT_FOUND,"SESSION_NOT_FOUND","unknown session id"),
+            Ok(None) => api_error(
+                StatusCode::NOT_FOUND,
+                "SESSION_NOT_FOUND",
+                "unknown session id",
+            ),
             Err(error) => lte_evidence_error(error),
         };
     };
@@ -2735,25 +2786,34 @@ async fn export_callflow(
     Path(id): Path<String>,
     Query(query): Query<ExportQuery>,
 ) -> Response {
-    let flow = if let Some(flow) = flow_for(&state, &id) {
-        flow.clone()
+    let mut value = if let Some(flow) = flow_for(&state, &id) {
+        flow_value_for(&state, &id)
+            .cloned()
+            .unwrap_or_else(|| serde_json::to_value(flow).unwrap_or(json!({})))
     } else if let Some((_dataset, flow)) = live_flow_for(&state, &id) {
-        flow
+        serde_json::to_value(flow).unwrap_or(json!({}))
     } else {
-        return api_error(
-            StatusCode::NOT_FOUND,
-            "SESSION_NOT_FOUND",
-            "unknown session id",
-        );
+        match state
+            .inner
+            .lte_evidence_store
+            .callflow_for_export_by_session(&id)
+        {
+            Ok(Some(flow)) => serde_json::to_value(flow).unwrap_or(json!({})),
+            Ok(None) => {
+                return api_error(
+                    StatusCode::NOT_FOUND,
+                    "SESSION_NOT_FOUND",
+                    "unknown session id",
+                )
+            }
+            Err(error) => return lte_evidence_error(error),
+        }
     };
     let format = query.format.as_deref().unwrap_or("json");
     eprintln!(
         "audit action=callflow_export session={} format={format}",
         id
     );
-    let mut value = flow_value_for(&state, &id)
-        .cloned()
-        .unwrap_or_else(|| serde_json::to_value(&flow).unwrap_or(json!({})));
     sanitize_value(&mut value);
     match format {
         "json" => {
@@ -2993,13 +3053,14 @@ fn json_error(error: serde_json::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use axum::http::{Request, StatusCode};
     use capture_helper::{
         CaptureBackend, CaptureHelperClient, CaptureService, CaptureSession, HelperFailure,
         InterfaceId, ServerConfig,
     };
     use http_body_util::BodyExt;
+    use live_probe::lte_evidence::LteEvidenceImportRequest;
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use tower::ServiceExt;
     #[derive(Clone)]
@@ -3142,7 +3203,10 @@ mod tests {
     #[tokio::test]
     async fn operational_mode_never_preloads_reference_sessions() {
         let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let mut config = test_config(workspace, "operational-real-only");
         config.reference_dataset_enabled = false;
         config.capture_root = temporary_directory("operational-captures");
@@ -3150,7 +3214,9 @@ mod tests {
         assert!(state.inner.flows.is_empty());
         assert!(state.inner.registry.list().is_empty());
         let response = router(state, None)
-            .oneshot(req("/api/v1/sessions", true)).await.unwrap();
+            .oneshot(req("/api/v1/sessions", true))
+            .await
+            .unwrap();
         let body = json_body(response).await;
         assert_eq!(body["meta"]["total"], 0);
         assert!(body["data"].as_array().unwrap().is_empty());
@@ -3309,7 +3375,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::FORBIDDEN);
-        assert_eq!(json_body(unauthenticated).await["error"]["code"], "OPERATOR_REQUIRED");
+        assert_eq!(
+            json_body(unauthenticated).await["error"]["code"],
+            "OPERATOR_REQUIRED"
+        );
 
         let missing_csrf = router(operator_state(), None)
             .oneshot(
@@ -3324,7 +3393,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
-        assert_eq!(json_body(missing_csrf).await["error"]["code"], "CSRF_REQUIRED");
+        assert_eq!(
+            json_body(missing_csrf).await["error"]["code"],
+            "CSRF_REQUIRED"
+        );
 
         let export_unauthenticated = router(state(), None)
             .oneshot(
@@ -3363,7 +3435,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(invalid_page.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(json_body(invalid_page).await["error"]["code"], "LTE_PAGINATION_INVALID");
+        assert_eq!(
+            json_body(invalid_page).await["error"]["code"],
+            "LTE_PAGINATION_INVALID"
+        );
     }
     #[tokio::test]
     async fn health_reports_real_dataset() {
@@ -3385,7 +3460,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let value = json_body(response).await;
-        assert_eq!(value["data"]["backend_api"], "2.7.1");
+        assert_eq!(value["data"]["backend_api"], "2.7.2");
         for protocol in [
             "S1AP",
             "NAS-EPS-MM",
@@ -3455,6 +3530,214 @@ mod tests {
             }],
             "errors": []
         })
+    }
+
+    fn ingest_lte_evidence_fixture(state: &AppState, bundle: &FsPath) -> (String, String) {
+        let planes = [
+            ("S1_MME", "S1-MME", "S1AP", "E-RABSetupResponse"),
+            ("S11", "S11", "GTPv2-C", "CreateSessionResponse"),
+            ("S1_U", "S1-U", "GTP-U", "G-PDU"),
+        ];
+        let mut capture_refs = Vec::new();
+        let mut capture_bindings = Vec::new();
+        let mut evidence_refs = Vec::new();
+        for (index, (plane, interface, protocol, message)) in planes.iter().enumerate() {
+            let source_file = format!("{}.pcapng", plane.to_ascii_lowercase());
+            let source_bytes = format!("approved synthetic {plane}").into_bytes();
+            fs::write(bundle.join(&source_file), &source_bytes).unwrap();
+            let source_sha256 = sha256_hex(&source_bytes);
+            let frame = (index + 1) as u64;
+            let identifiers = match *plane {
+                "S1_MME" => vec![
+                    ("enb_ue_s1ap_id", "42"),
+                    ("mme_ue_s1ap_id", "84"),
+                    ("imsi_pseudonym", "lte-ue-anon-export"),
+                    ("eps_bearer_identity", "5"),
+                    ("erab_teid", "0x01020304"),
+                ],
+                "S11" => vec![
+                    ("imsi_pseudonym", "lte-ue-anon-export"),
+                    ("bearer_f_teid", "0x01020304"),
+                ],
+                _ => vec![("teid", "0x01020304")],
+            };
+            let mut event = normalized_lte_event(
+                &format!("export-{plane}"),
+                interface,
+                protocol,
+                message,
+                &identifiers,
+                frame,
+            );
+            // The admission contract consumes the normalized session-engine
+            // EventRecord shape, not the richer public event-schema DTO used
+            // by other API fixtures.
+            event["parent_event_id"] = Value::Null;
+            event["timestamp"] = Value::String(format!("2026-10-31T12:00:00.{frame:09}Z"));
+            event["timestamp_ns"] = json!(1_793_448_000_000_000_000_u64 + frame);
+            event["raw_ticks"] = json!(1_793_448_000_000_000_000_u64 + frame);
+            event["source_address"] = Value::String("192.0.2.10".into());
+            event["destination_address"] = Value::String("192.0.2.20".into());
+            event["source_participant"] =
+                Value::String(if *plane == "S1_MME" { "eNB" } else { "SGW" }.into());
+            event["destination_participant"] =
+                Value::String(if *plane == "S1_MME" { "MME" } else { "eNB" }.into());
+            event["identifiers"] = json!(identifiers);
+            event["source_json"] = json!({"schema_version":"1.5.0"});
+            event["capture_id"] = Value::String(format!("sha256:{source_sha256}"));
+            event["decoder_name"] = Value::String((*protocol).into());
+            event["packet_references"][0]["source_file"] = Value::String(source_file.clone());
+            let events_file = format!("{}.events.jsonl", plane.to_ascii_lowercase());
+            let mut events_bytes = serde_json::to_vec(&event).unwrap();
+            events_bytes.push(b'\n');
+            fs::write(bundle.join(&events_file), &events_bytes).unwrap();
+            let evidence_ref = format!("capture:{plane}");
+            evidence_refs.push(evidence_ref.clone());
+            capture_refs.push(json!({
+                "plane":plane,
+                "source_file_sha256":source_sha256,
+                "decoder_version":"synthetic-test",
+                "event_schema_version":"1.5.0",
+                "first_frame":frame,
+                "last_frame":frame,
+                "sanitization_state":"SANITIZED_APPROVED"
+            }));
+            capture_bindings.push(json!({
+                "evidence_ref":evidence_ref,
+                "capture_ref_index":index,
+                "source_file":source_file,
+                "normalized_events_file":events_file,
+                "normalized_events_sha256":sha256_hex(&events_bytes),
+                "decoder_name":protocol,
+                "decoder_version":"synthetic-test",
+                "event_schema_version":"1.5.0",
+                "endpoint_roles":{"192.0.2.10":"RAN","192.0.2.20":"CORE"}
+            }));
+        }
+        let request: LteEvidenceImportRequest = serde_json::from_value(json!({
+            "schema_version":"oiran.lte-evidence-ingestion.v1",
+            "bundle_id":"bundle-api-export-01",
+            "evidence":{
+                "schema_version":"oiran-polaris.lte-e2e-evidence.v1",
+                "run_id":"lte-run-api-export-0001",
+                "profile_id":"LTE-SRSUE-TEST-01",
+                "scenario_id":"lte-e2e-certification-v1",
+                "started_at":"2026-10-31T12:00:00Z",
+                "ended_at":"2026-10-31T12:00:10Z",
+                "final_state":"COMPLETED",
+                "steps":[{
+                    "index":0,"type":"lte_attach","state":"COMPLETED",
+                    "started_at":"2026-10-31T12:00:00Z",
+                    "ended_at":"2026-10-31T12:00:10Z","reason_code":null,
+                    "evidence_refs":evidence_refs,"measurements":{}
+                }],
+                "capture_refs":capture_refs,
+                "cleanup":{"srsue_stopped":true,"srsenb_stopped":true,
+                    "sidecars_removed":true,"epc_healthy":true,"dumpcaps_preserved":true}
+            },
+            "capture_bindings":capture_bindings
+        }))
+        .unwrap();
+        let result = state
+            .inner
+            .lte_evidence_store
+            .ingest(bundle, &request)
+            .unwrap();
+        let page = state
+            .inner
+            .lte_evidence_store
+            .session_page(&request.evidence.run_id, 1, 10)
+            .unwrap();
+        (
+            result.dataset_id,
+            page["data"][0]["session_id"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn lte_evidence_sessions_and_callflow_exports_apply_privacy_boundary() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let config = test_config(workspace, "lte-export-privacy");
+        let store_root = config.lte_evidence_root.clone();
+        let state = AppState::load(config).unwrap();
+        let bundle = temporary_directory("lte-export-bundle");
+        let (dataset_id, session_id) = ingest_lte_evidence_fixture(&state, &bundle);
+
+        // Simulate defense in depth against an already persisted, malformed
+        // pseudonym. The read route must not rely only on admission-time checks.
+        let sessions_path = store_root
+            .join("datasets")
+            .join(&dataset_id)
+            .join("sessions.jsonl");
+        let mut session: Value =
+            serde_json::from_str(fs::read_to_string(&sessions_path).unwrap().trim()).unwrap();
+        session["ue_pseudonym"] = Value::String("suci-opaque".into());
+        fs::write(
+            &sessions_path,
+            format!("{}\n", serde_json::to_string(&session).unwrap()),
+        )
+        .unwrap();
+
+        let app = router(state, None);
+        let sessions = app
+            .clone()
+            .oneshot(req(
+                "/api/v1/lte/evidence/lte-run-api-export-0001/sessions?page=1&page_size=10",
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(sessions.status(), StatusCode::OK);
+        let sessions = json_body(sessions).await;
+        assert_no_identity_material(&sessions);
+        assert_eq!(sessions["data"][0]["ue_pseudonym"], "REDACTED");
+
+        let json_export = app
+            .clone()
+            .oneshot(req(
+                &format!("/api/v1/exports/callflow/{session_id}?format=json"),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(json_export.status(), StatusCode::OK);
+        let json_export = json_body(json_export).await;
+        assert_eq!(json_export["technology"], "LTE");
+        assert_no_identity_material(&json_export);
+
+        let html_export = app
+            .oneshot(req(
+                &format!("/api/v1/exports/callflow/{session_id}?format=html"),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(html_export.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            html_export
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let lower = html.to_ascii_lowercase();
+        assert!(html.contains("E-RABSetupResponse"));
+        for forbidden in ["suci-", "supi-", "guti", "tmsi", "imei", "opc"] {
+            assert!(
+                !lower.contains(forbidden),
+                "identity material in HTML: {forbidden}"
+            );
+        }
+
+        fs::remove_dir_all(bundle).unwrap();
+        fs::remove_dir_all(store_root.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]
@@ -4001,7 +4284,8 @@ mod tests {
     #[tokio::test]
     async fn packet_provenance_filters_resolve_one_exact_packet() {
         let fixture = state();
-        let event = primary_flow(&fixture).unwrap()
+        let event = primary_flow(&fixture)
+            .unwrap()
             .events
             .iter()
             .find(|event| event.protocol == "GTP-U")

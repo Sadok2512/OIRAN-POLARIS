@@ -1,51 +1,51 @@
 # OIRAN / POLARIS final release report
 
-POLARIS_VERSION = 0.28.0 candidate; production remains 0.26.0 / UI 0.19.0
+POLARIS_VERSION = API `0.28.1`, UI `0.20.0`; production remains API `0.26.0`, UI `0.19.0`.
 
-POLARIS_SHA = ac8748c1713cb039686ad42f6549ca0a55dff5ba
+POLARIS_SHA = `8cb356a7e4264b80fb82e2f1c90b9511f581df41` (release code; contained in remote report branch `release/oiran-polaris-final-p0-anr2-report`).
 
-OIRAN_VERSION = API 2.7.2, live-probe 0.4.1, Analyzer 2.7.0 candidate; production remains API 2.5.4
+OIRAN_VERSION = API/platform `2.7.2`, live-probe `0.4.1`, Analyzer `2.7.1`; production remains API `2.5.4`.
 
-OIRAN_SHA = 9ea4d1758cd7869f26bb598b43d5d29a4d581206
+OIRAN_SHA = recorded after the final merge commit on `release/anr3-oiran-final-p0`.
 
-GIT_LINEAGE = PASS; both candidates are real ancestors of integration merge f58c8b2 and descend from their production lines
+GIT_LINEAGE = PASS: POLARIS `70faacb5` is ancestor of `8cb356a7`; OIRAN candidate `92c1b08c` and provenance adapter `9ea4d175` are real ancestors of the final merge. No `merge -s ours`.
 
-CAPTURE_REFS = CODE PASS / REAL EVIDENCE NOT EXECUTED; only server-staged, re-hashed, SANITIZED_APPROVED S1_MME/S11/S1_U references are admitted
+CAPTURE_REFS = OFFLINE_PASS: POLARIS accepts only exact server-staged, rehashed, run-scoped S1_MME/S11/S1_U references; no real reference was invented or published.
 
-IMPORT_CONTRACT = PASS offline; direct OIRAN request and strict outer-envelope compatibility tested, Operator/CSRF route test 1/1 PASS
+IMPORT_CONTRACT = OFFLINE_PASS: direct `oiran.lte-evidence-ingestion.v1` is mutually compatible; OIRAN additionally validates `polaris-oiran.lte-import-envelope.v1`, capture IDs, timestamps, RAT, run/scenario and provenance equality.
 
-SECURITY = PASS offline for RBAC, CSRF, private-root confinement, hash verification, deduplication and fail-closed cleanup; LTE_E2E_CERTIFIED remains false
+SECURITY = OFFLINE_PASS: Grant V2 ownership/digest/RBAC/CSRF/expiry/revocation/anti-replay/cleanup regressions passed in POLARIS; no grant was created and `LTE_E2E_CERTIFIED` remains false.
 
-PRIVACY = PASS targeted; recursive API/export sanitization and filename hardening present, no approved real capture opened
+PRIVACY = OFFLINE_PASS: ingress plus datasets/sessions/events/packets/Call Flow JSON/HTML boundaries reject subscriber/equipment identities and secrets; no approved real capture was imported.
 
-RUST_TESTS = POLARIS 248 PASS / 0 FAIL / 3 ignored; OIRAN final-envelope 1 PASS and final route 1 PASS; full OIRAN final-tree replay NOT EXECUTED
+RUST_TESTS = POLARIS 249 passed, 0 failed, 3 ignored; OIRAN live-probe 56 passed, 0 failed, 4 ignored; OIRAN API 41 passed, 0 failed, 0 ignored. Initial post-merge fixture/import defects were corrected and full suites rerun green. OIRAN release binary SHA-256 `8c99a76d037d6dc731f6c16349505f1f1b26e1381874c70f12d9baff450a28e1`.
 
-FRONTEND_TESTS = POLARIS typecheck PASS and 235/235 Vitest PASS; OIRAN prior candidate 75/75 PASS; final builds/leak scan PASS
+FRONTEND_TESTS = POLARIS TypeScript PASS, Vitest 235/235, Vite build PASS; OIRAN TypeScript PASS, Vitest 77/77, Vite build PASS.
 
-PLAYWRIGHT = NOT EXECUTED against integrated staging
+PLAYWRIGHT = POLARIS 24/24 PASS at 1280/1440/1920 light/dark; OIRAN isolated read-only Session Explorer 3/3 PASS. No mutating production browser test.
 
-RAM = latest measured 16,333,783,040 bytes used / 4,636,798,976 bytes available; API release links crossed below 4 GiB and were stopped
+RAM = PASS at final build start: `4,931,432,448` bytes available, `16,039,149,568` used; all test/build starts respected >=4 GiB available and <=16 GiB used.
 
-DISK = 58%, 174,761,689,088 bytes available
+DISK = PASS, root `59%` (<80% warning, <85% stop).
 
-DUMPCAP = 12 present and never signalled; lossless hourly rotation continuity UNKNOWN
+DUMPCAP = 12 active and untouched. Supervisor rotated PIDs around 09:15 UTC; final PID/start snapshot `b6f5a7771f9b013b9052f7eaf810693523f62937fe9b61970355ecfddb0cb8b9`. Lossless continuity is NOT PROVEN.
 
-BACKUP = PLAN READY; fresh backup intentionally deferred until an authorized deployment window
+BACKUP = NOT EXECUTED because deployment is not authorized; fresh API/UI/config/state backups and hashes are mandatory inside the authorized window.
 
-ROLLBACK = PLAN READY; current running API hashes recorded; rollback artifacts not freshly captured
+ROLLBACK = PREPARED, NOT EXECUTED: atomic component restore, restart only deployed applications, then version/health/privacy/real-data/UI/resource/dumpcap checks; any FAIL requires rollback.
 
-DEPLOYMENT = NOT AUTHORIZED / NOT EXECUTED
+DEPLOYMENT = NOT AUTHORIZED / NOT PERFORMED. Production services and versions are unchanged.
 
-LTE_E2E = NOT CERTIFIED; no real LTE run or approved capture manifest used
+LTE_E2E = BLOCKED: no candidate deployment, no approved real LTE three-plane bundle/import, and no bounded live run was started.
 
-5G_E2E = EXISTING DATA ONLY / NOT RE-CERTIFIED; no new 5G live action authorized
+5G_E2E = PARTIAL: 11 historical 5G SA sessions exist; one inspected 54-event N2/N4/N3 Call Flow is strongly/exactly correlated. No new 5G live operation was authorized.
 
-CALLFLOW = synthetic approved LTE contract PASS; real LTE chronological Call Flow NOT PROVED
+CALLFLOW = OFFLINE_PASS for LTE fixtures and UI; historical 5G Call Flow observed read-only; real LTE Call Flow not certified.
 
-FINAL_VERDICT = BLOCKED
+FINAL_VERDICT = BLOCKED.
 
-BLOCKERS = API release builds and SHA-256 absent due RAM gate; full OIRAN final-tree suite absent; integrated Playwright absent; dumpcap lossless rotation unproved; real LTE evidence absent
+BLOCKERS = POLARIS final release binary/hash absent; explicit coordinated deployment authorization absent; fresh backups absent; dumpcap rotation continuity unproven; approved real LTE bundle/import and full LTE E2E Call Flow absent.
 
-NEXT_ACTION = provide a build host/window that preserves at least 4 GiB available during linking, build/hash both APIs, replay the remaining OIRAN and integrated Playwright suites, then request explicit deployment authorization naming the final SHAs
+NEXT_ACTION = Build/hash the POLARIS release binary above resource gates, then request explicit deployment authorization naming POLARIS `0.28.1`/`8cb356a7...` and the final OIRAN `2.7.2` SHA. After fresh backups, deploy coordinately with rollback-on-FAIL; only then execute the exact bounded LTE grant and certify the real import/Call Flow.
 
-— ANR1
+— ANR3

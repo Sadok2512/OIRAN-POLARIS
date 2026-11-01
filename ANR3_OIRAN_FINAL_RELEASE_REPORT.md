@@ -1,180 +1,50 @@
-# ANR3 — OIRAN final release review
+# ANR3 — OIRAN final release report
 
 Date: 2026-11-01 UTC
-Mode: offline only; production unchanged
+Branch: `release/anr3-oiran-final-p0`
+Base: `92c1b08cd63202272986b64702ee97a334f010a3`
 
-## Candidate and lineage
+## Release
 
-- Required base: `92c1b08cd63202272986b64702ee97a334f010a3`
-  (`origin/hermes/final-anr3-20261101`).
-- Review branch: `anr3/oiran-final-release-271`.
-- Production reports API/platform `2.5.4`; the exact source commit carrying those
-  constants is `e33515d551eae0f3de44b1b7d525a33a9365a478` and is an ancestor of the
-  candidate. Binary-to-source reproducibility is not proven by the version string
-  alone. Running binary SHA-256:
-  `7a9c5711ed1827dc9ed8fef1c34ff63816a86deccc70fadf4219643153cfd657`.
-- Reviewed target after hardening: API `2.7.2`, live-probe `0.4.1`, Analyzer
-  `2.7.0`.
+OIRAN API/platform `2.7.2`, live-probe `0.4.1` and Analyzer `2.7.1` integrate the strict POLARIS LTE envelope adapter, provenance/deduplication checks, S1AP/S11/S1-U session and Call Flow materialization, recursive API/export privacy, bounded pagination and LTE bridge rendering. N2/N3/N4 behavior is preserved. No dataset, counter, capture reference or state is fabricated.
 
-Commands:
+POLARIS `0.28.1` at `8cb356a7e4264b80fb82e2f1c90b9511f581df41` produces the direct `oiran.lte-evidence-ingestion.v1` body from server-staged, rehashed `SANITIZED_APPROVED` S1-MME/S11/S1-U artifacts. OIRAN accepts this body and the stricter `polaris-oiran.lte-import-envelope.v1` wrapper. Both paths fail closed on provenance drift. No real bundle was imported.
+
+Privacy admission and response boundaries reject IMSI/SUPI/SUCI/GUTI/TMSI, IMEI/IMEISV/PEI/MSISDN and K/OPc/authentication/subscriber/security keys. Canonical SHA-256 evidence identifiers remain accepted; opaque pseudonyms are not exposed as subscriber identities.
+
+## Manual validation
 
 ```text
-git fetch origin hermes/final-anr3-20261101
-git rev-parse origin/hermes/final-anr3-20261101
-# 92c1b08cd63202272986b64702ee97a334f010a3
-git merge-base --is-ancestor e33515d... 92c1b08...; echo $?
-# 0
-curl http://127.0.0.1:49152/api/v1/version
-# HTTP 200; backend_api/platform_core 2.5.4
-sha256sum /opt/oiran/bin/oiran-api /proc/1262927/exe
-# identical 7a9c5711...657
+CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_INCREMENTAL=false cargo test --locked -p live-probe --lib
+# 56 passed; 0 failed; 4 ignored
+CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_INCREMENTAL=false cargo test --locked -p oiran-api --lib
+# 41 passed; 0 failed; 0 ignored
+npm test
+# 77 passed; 0 failed
+npm run typecheck
+# PASS
+npm run build
+# PASS; JS 360.39 kB
+playwright test v2_3_session_explorer.spec.ts --grep 'dataset inventory|explicit scopes|historical selection'
+# 3 passed; isolated read-only preview
 ```
 
-## Exact POLARIS/OIRAN contract
+The first post-merge Rust run found one provenance fixture rejected earlier by the stronger privacy boundary; SHA-256 identifiers were explicitly exempted and the complete suite then passed. The first API compile exposed one missing test-only import after the envelope merge; it was restored and the complete API suite passed. Four ignored live-probe tests are documented high-volume memory tests. Repository-wide inherited `rustfmt` debt remains; both modified Rust packages and `git diff --check` pass.
 
-ANR2 confirmed that POLARIS 0.28.0 returns this outer envelope:
+Frontend artifact SHA-256: JS `a5604ec9da2b3b62ceeb570c6591d39f4e398d0674731c90727eec4719704538`, CSS `481e6c7cd2a0a229b3904b1c416f4177bd0e727da9756cff9bea3b492b8dd031`, HTML `ecd5a0129418abe86043b836276c29ceb65bdc0b3f654ca1f77fde6065b6de4e`. Final release API binary SHA-256: `8c99a76d037d6dc731f6c16349505f1f1b26e1381874c70f12d9baff450a28e1`.
 
-```text
-polaris-oiran.lte-import-envelope.v1
-  provenance
-  oiran_import:
-    oiran.lte-evidence-ingestion.v1
-      bundle_id
-      evidence: oiran-polaris.lte-e2e-evidence.v1
-      capture_bindings[]
-```
+## Laboratory and safety
 
-The existing `POST /api/v1/lte/evidence/import` now accepts either the nested
-direct request or that complete strict outer envelope. For the outer form it
-validates source/RAT/session-reference state, exact run/profile/scenario/time
-equality, unique planes and exact SHA256-derived capture IDs before opening any
-artifact. Unknown fields remain fail-closed.
+Read-only production observation found 11 historical 5G SA sessions. One selected session contained 54 chronological NGAP/PFCP/GTP-U events over N2/N4/N3 with `N2_N4=STRONG`, `N4_N3=EXACT`, `E2E=STRONG`. This is historical evidence, not a new 5G certification. No approved real LTE three-plane bundle was available, so LTE remains uncertified.
 
-The evidence is terminal `CLEAN`/`COMPLETED`; plans are exactly unique
-`S1_MME`, `S11`, `S1_U`; every reference is `SANITIZED_APPROVED`. Bindings carry
-relative artifact paths, source/event SHA-256, decoder and event-schema versions,
-endpoint roles and the capture-ref index. RAT/provenance/session references remain
-inside bounded step measurements. Unknown fields fail deserialization.
-
-OIRAN validates required planes, reference uniqueness/resolution, hashes, decoder
-metadata equality, frame ranges, event capture ID, packet source and range, event-ID
-deduplication, cleanup proof and identity absence before atomic publication. S5 and
-5G planes are intentionally rejected by this LTE endpoint. N2/N3/N4 remain on the
-existing CaptureManager atomic dataset path; the two sources merge only at the read
-model.
-
-Contract: `OIRAN/docs/LTE_EVIDENCE_INGESTION_CONTRACT.md`.
-
-## Changes in this review
-
-- API provenance filenames carrying an identity label or an identity-length digit
-  run are now returned as `capture://REDACTED.pcapng`.
-- Added fail-closed regressions for duplicate planes, duplicate event IDs, capture-ID
-  mismatch and packet-source mismatch.
-- Added exact POLARIS 0.28.0 outer-envelope admission with strict outer/nested
-  provenance equality and a POLARIS-shaped regression.
-- Updated SemVer/changelog and documented the exact adapter boundary. No
-  `deny_unknown_fields`, required-plane or approval check was weakened.
-
-## Privacy review
-
-The 2.7.1 tree removes identity-bearing keys and IE objects at the common JSON
-success/pagination boundaries and regenerates HTML from a sanitized CallFlow. The
-covered routes include datasets, sessions, events, packets, Call Flow, JSON export
-and HTML export for viewer and operator. Useful protocol events, technical TEIDs,
-accounting and sanitized capture provenance remain.
-
-No repository real capture has an explicit current `SANITIZED_APPROVED` release
-manifest suitable for this mission. Therefore no real PCAP was opened. Synthetic
-anonymized fixtures are the only approved test source; the real-capture gate remains
-closed.
-
-## Validation status
-
-Completed before the final envelope adjustment:
-
-```text
-CARGO_BUILD_JOBS=1 cargo check --offline -p oiran-api -p live-probe
-# PASS at the preceding hardening revision; API 2.7.2 and live-probe 0.4.1
-git diff --check
-# PASS after removal of one Markdown trailing space
-```
-
-Final-envelope targeted execution:
-
-```text
-CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo test --offline -p live-probe \
-  accepts_exact_polaris_outer_envelope_and_rejects_provenance_drift -- --nocapture
-# PASS: 1 passed, 0 failed
-```
-
-The matching API route/auth regression was started in a single worker, then
-interrupted when `MemAvailable` fell to `4,273,061,888` bytes, below the 4 GiB
-gate. It is **NOT EXECUTED** and the final API adjustment is therefore not
-claimed fully compiled/tested.
-
-The candidate's committed evidence records these prior commands/results on the exact
-92c1b08 tree:
-
-- integrated Rust/API suite: 136 passed, 0 failed, 4 ignored;
-- protocol decoders: 82 passed, 0 failed;
-- frontend: 75/75, typecheck/build/leak scan PASS;
-- bounded Call Flow: 8,192 events, 100-event cursor pages, peak RSS 12,595,200 B.
-
-The broader targeted replay was not completed because the resource gate crossed
-below 4 GiB twice while other single-worker builds were active. The new
-fail-closed provenance regression passed; the remaining API/privacy targeted
-tests and full suite remain **NOT EXECUTED** on the final tree. A release verdict
-cannot treat them as PASS.
-
-Ignored stress tests remain explicit:
-
-- continuous 300 MiB segment / 32 MiB allocation;
-- continuous N3 500 MiB / 64 MiB allocation;
-- verified 512 MiB copy / 32 MiB allocation;
-- 600 × 2 MiB source-segment bound (about 1.2 GiB input).
-
-Repository-wide `cargo fmt --all -- --check` debt is inherited (candidate report:
-1,463 proposed diff lines across unrelated crates). It was not bulk-applied or rerun
-under the resource stop.
-
-## Read-only resource and capture evidence
-
-```text
-df -h / /var/lib/oiran/captures
-# /dev/sda1 387G, 215G used, 172G available, 56% (later 57%)
-pgrep -x dumpcap | wc -l
-# 12
-systemctl show oiran-api.service -p MainPID -p MemoryCurrent -p MemoryPeak -p MemoryMax
-# MainPID=1262927, MemoryCurrent=61,321,216, MemoryPeak=268,435,456,
-# MemoryMax=268,435,456
-```
-
-The 12 dumpcap PIDs were inspected only; no process was signalled or interrupted.
-
-## Deployment and rollback recipe (not executed)
-
-1. Re-open the memory gate (stable `MemAvailable >= 4 GiB`), disk `<85%`, and record
-   all 12 dumpcap PIDs/start times.
-2. Execute the targeted tests plus the full locked single-worker suites and frontend
-   build/leak scan; generate SHA-256 manifest for API, decoder and web assets.
-3. Back up/hash the running API, web assets, systemd units/drop-ins, capture/dataset
-   registries and configuration. Do not copy or log secrets.
-4. Replace only reviewed OIRAN artifacts atomically; restart only `oiran-api` if
-   separately authorized. Capture Helper and external dumpcaps remain untouched.
-5. Verify `/health`, `/version`, auth, datasets/sessions/callflow, raw privacy routes,
-   bounded pagination, RSS below 256 MiB and unchanged dumpcap identities.
-6. On any failure, atomically restore the prior API/assets, restart only `oiran-api`,
-   verify running SHA `7a9c5711...657`, registry integrity and all dumpcap PIDs.
+The 12 external dumpcap processes were never signalled or reconfigured. Their supervisor rotated all PIDs around 09:15 UTC; the final PID/start snapshot is `b6f5a7771f9b013b9052f7eaf810693523f62937fe9b61970355ecfddb0cb8b9`. Packet-level continuity across that external rotation is not proven. Disk was 59%; all builds started above the 4 GiB available-RAM gate.
 
 ## Verdict
 
-`PARTIAL / RESOURCE-GATED`
-
-The live-probe contract implementation and exact POLARIS envelope test pass.
-Production remains unchanged. Promotion is blocked until the final API tree,
-remaining targeted tests and release artifact build/hash execute above the
-resource gate. Real LTE certification remains separately blocked by absence of an
-explicitly approved real-capture manifest.
+OIRAN_OFFLINE_RELEASE = READY_FOR_REVIEW.
+DEPLOYMENT = NOT AUTHORIZED / NOT PERFORMED.
+LTE_E2E = BLOCKED without approved real capture bundle and deployed releases.
+5G_E2E = PARTIAL historical evidence only.
+OVERALL = BLOCKED; no `FINAL_PASS` or `REAL_PASS` is claimed.
 
 — ANR3
