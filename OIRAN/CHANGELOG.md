@@ -1,5 +1,16 @@
 # Changelog
 
+## OIRAN API 2.7.2 / live-probe 0.4.1 / Analyzer 2.7.1 — 2026-11-01
+
+- Reject SUCI, SUPI, TMSI, PEI, equipment-identity variants and subscriber
+  key labels at the LTE evidence admission/export privacy boundary.
+- Apply recursive response sanitization to paginated LTE evidence sessions and
+  add bounded JSON/HTML export support for persisted LTE Call Flows.
+- Render LTE S1-MME/S11 and S11/S1-U correlation bridges truthfully in the
+  Analyzer; E2E remains `UNKNOWN` unless both required bridges are proven.
+- Add raw-response, export and UI regressions. This release does not create
+  capture references, certify real LTE, enable live traffic or deploy itself.
+
 ## OIRAN API 2.7.1 — 2026-10-31
 
 - Preserve the 2.7 real-lab/LTE-evidence model while integrating bounded offline

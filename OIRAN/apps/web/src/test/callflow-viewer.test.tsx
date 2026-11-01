@@ -32,6 +32,10 @@ describe('directional Call Flow viewer',()=>{
     expect(screen.getAllByText('gNB').length).toBeGreaterThan(0);
     expect(screen.queryByText('MME')).not.toBeInTheDocument();
     expect(screen.getByText(/DIRECTION UNRESOLVED/)).toBeVisible();
+    expect(screen.getByText('N2 ↔ SBI')).toBeVisible();
+    expect(screen.getByText('SBI ↔ N4')).toBeVisible();
+    expect(screen.getByText('N4 ↔ N3')).toBeVisible();
+    expect(screen.queryByText('S1-MME ↔ S11')).not.toBeInTheDocument();
   });
 
   it('synchronizes arrow and message-row selection with the inspector',async()=>{
@@ -65,6 +69,55 @@ describe('directional Call Flow viewer',()=>{
     expect(screen.getByText('Scope: tunnel-only')).toBeVisible();
     expect(screen.getByText(/Does not prove UE identity/)).toBeVisible();
     expect(screen.getAllByText('E2E UNKNOWN').length).toBeGreaterThan(0);
+  });
+
+  it('renders LTE S1-MME/S11/S1-U bridges and gates E2E on both observed links',async()=>{
+    const lteFlow={
+      ...flow,
+      session_id:'lte-s1',
+      technology:'LTE',
+      interfaces:['S1-MME','S11','S1-U'],
+      correlation_status:{
+        S1_MME_S11:'EXACT',S11_S1_U:'STRONG',E2E:'STRONG',
+      },
+    };
+    const lteSummary={...summary,session_id:'lte-s1',technology:'LTE',interfaces:['S1-MME','S11','S1-U']};
+    vi.mocked(api).mockImplementation(async(path?:string)=>{
+      if(path===undefined)return {data:[],meta:{}} as never;
+      if(path==='/sessions/lte-s1')return {data:{summary:lteSummary},meta:{}} as never;
+      if(path==='/sessions/lte-s1/callflow?limit=100')return {data:lteFlow,meta:{}} as never;
+      throw new Error(`unexpected path ${path}`);
+    });
+    const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/investigation/callflow/lte-s1?dataset_id=dataset-a']}><Routes><Route path="/investigation/callflow/:sessionId" element={<CallFlowViewer/>}/></Routes></MemoryRouter></QueryClientProvider>);
+    expect(await screen.findByText('S1-MME ↔ S11')).toBeVisible();
+    expect(screen.getByText('S11 ↔ S1-U')).toBeVisible();
+    expect(screen.queryByText('N2 ↔ SBI')).not.toBeInTheDocument();
+    expect(screen.getAllByText('E2E STRONG').length).toBeGreaterThan(0);
+  });
+
+  it('does not promote LTE E2E when one required bridge is unproven',async()=>{
+    const incompleteLteFlow={
+      ...flow,
+      session_id:'lte-incomplete',
+      technology:'LTE',
+      interfaces:['S1-MME','S11','S1-U'],
+      correlation_status:{
+        S1_MME_S11:'EXACT',S11_S1_U:'UNKNOWN',E2E:'EXACT',
+      },
+    };
+    const incompleteLteSummary={...summary,session_id:'lte-incomplete',technology:'LTE',interfaces:['S1-MME','S11','S1-U']};
+    vi.mocked(api).mockImplementation(async(path?:string)=>{
+      if(path===undefined)return {data:[],meta:{}} as never;
+      if(path==='/sessions/lte-incomplete')return {data:{summary:incompleteLteSummary},meta:{}} as never;
+      if(path==='/sessions/lte-incomplete/callflow?limit=100')return {data:incompleteLteFlow,meta:{}} as never;
+      throw new Error(`unexpected path ${path}`);
+    });
+    const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/investigation/callflow/lte-incomplete?dataset_id=dataset-a']}><Routes><Route path="/investigation/callflow/:sessionId" element={<CallFlowViewer/>}/></Routes></MemoryRouter></QueryClientProvider>);
+    expect(await screen.findByText('S1-MME ↔ S11')).toBeVisible();
+    expect(screen.getAllByText('E2E UNKNOWN').length).toBeGreaterThan(0);
+    expect(screen.queryByText('E2E EXACT')).not.toBeInTheDocument();
   });
 
   it('keeps Download frame and PCAP slice locked (LOT 3 — route not served yet)',async()=>{

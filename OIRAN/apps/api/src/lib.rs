@@ -41,8 +41,8 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.7.1";
-pub const PLATFORM_VERSION: &str = "2.7.0";
+pub const API_VERSION: &str = "2.7.2";
+pub const PLATFORM_VERSION: &str = "2.7.2";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -638,7 +638,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 async fn version(State(state): State<AppState>) -> Json<Value> {
     let flow = primary_flow(&state);
     ok(json!({
-        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":"2.7.0",
+        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":"2.7.1",
         "event_schema":"1.2.0","callflow_schema":flow.map(|value|value.schema_version.as_str()).unwrap_or("UNKNOWN"),
         "session_engine":session_engine::VERSION,"correlation_engine":correlation_engine::VERSION,"dataset_registry":dataset_registry::VERSION,
         "disk_safety":disk_safety::VERSION,
@@ -1648,7 +1648,12 @@ async fn lte_evidence_sessions(
         query.page.unwrap_or(1),
         query.page_size.unwrap_or(50),
     ) {
-        Ok(value) => Json(value).into_response(),
+        Ok(mut value) => {
+            // Keep the LTE pagination wire shape stable while enforcing the
+            // same recursive privacy boundary as every other read route.
+            sanitize_value(&mut value);
+            Json(value).into_response()
+        }
         Err(error) => lte_evidence_error(error),
     }
 }
@@ -2731,25 +2736,34 @@ async fn export_callflow(
     Path(id): Path<String>,
     Query(query): Query<ExportQuery>,
 ) -> Response {
-    let flow = if let Some(flow) = flow_for(&state, &id) {
-        flow.clone()
+    let mut value = if let Some(flow) = flow_for(&state, &id) {
+        flow_value_for(&state, &id)
+            .cloned()
+            .unwrap_or_else(|| serde_json::to_value(flow).unwrap_or(json!({})))
     } else if let Some((_dataset, flow)) = live_flow_for(&state, &id) {
-        flow
+        serde_json::to_value(flow).unwrap_or(json!({}))
     } else {
-        return api_error(
-            StatusCode::NOT_FOUND,
-            "SESSION_NOT_FOUND",
-            "unknown session id",
-        );
+        match state
+            .inner
+            .lte_evidence_store
+            .callflow_for_export_by_session(&id)
+        {
+            Ok(Some(flow)) => serde_json::to_value(flow).unwrap_or(json!({})),
+            Ok(None) => {
+                return api_error(
+                    StatusCode::NOT_FOUND,
+                    "SESSION_NOT_FOUND",
+                    "unknown session id",
+                )
+            }
+            Err(error) => return lte_evidence_error(error),
+        }
     };
     let format = query.format.as_deref().unwrap_or("json");
     eprintln!(
         "audit action=callflow_export session={} format={format}",
         id
     );
-    let mut value = flow_value_for(&state, &id)
-        .cloned()
-        .unwrap_or_else(|| serde_json::to_value(&flow).unwrap_or(json!({})));
     sanitize_value(&mut value);
     match format {
         "json" => {
@@ -3347,7 +3361,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let value = json_body(response).await;
-        assert_eq!(value["data"]["backend_api"], "2.7.1");
+        assert_eq!(value["data"]["backend_api"], "2.7.2");
         for protocol in [
             "S1AP",
             "NAS-EPS-MM",
@@ -3417,6 +3431,218 @@ mod tests {
             }],
             "errors": []
         })
+    }
+
+    fn ingest_lte_evidence_fixture(state: &AppState, bundle: &FsPath) -> (String, String) {
+        let planes = [
+            ("S1_MME", "S1-MME", "S1AP", "E-RABSetupResponse"),
+            ("S11", "S11", "GTPv2-C", "CreateSessionResponse"),
+            ("S1_U", "S1-U", "GTP-U", "G-PDU"),
+        ];
+        let mut capture_refs = Vec::new();
+        let mut capture_bindings = Vec::new();
+        let mut evidence_refs = Vec::new();
+        for (index, (plane, interface, protocol, message)) in planes.iter().enumerate() {
+            let source_file = format!("{}.pcapng", plane.to_ascii_lowercase());
+            let source_bytes = format!("approved synthetic {plane}").into_bytes();
+            fs::write(bundle.join(&source_file), &source_bytes).unwrap();
+            let source_sha256 = sha256_hex(&source_bytes);
+            let frame = (index + 1) as u64;
+            let identifiers = match *plane {
+                "S1_MME" => vec![
+                    ("enb_ue_s1ap_id", "42"),
+                    ("mme_ue_s1ap_id", "84"),
+                    ("imsi_pseudonym", "lte-ue-anon-export"),
+                    ("eps_bearer_identity", "5"),
+                    ("erab_teid", "0x01020304"),
+                ],
+                "S11" => vec![
+                    ("imsi_pseudonym", "lte-ue-anon-export"),
+                    ("bearer_f_teid", "0x01020304"),
+                ],
+                _ => vec![("teid", "0x01020304")],
+            };
+            let mut event = normalized_lte_event(
+                &format!("export-{plane}"),
+                interface,
+                protocol,
+                message,
+                &identifiers,
+                frame,
+            );
+            // The admission contract consumes the normalized session-engine
+            // EventRecord shape, not the richer public event-schema DTO used
+            // by other API fixtures.
+            event["parent_event_id"] = Value::Null;
+            event["timestamp"] = Value::String(format!(
+                "2026-10-31T12:00:00.{frame:09}Z"
+            ));
+            event["timestamp_ns"] = json!(1_793_448_000_000_000_000_u64 + frame);
+            event["raw_ticks"] = json!(1_793_448_000_000_000_000_u64 + frame);
+            event["source_address"] = Value::String("192.0.2.10".into());
+            event["destination_address"] = Value::String("192.0.2.20".into());
+            event["source_participant"] = Value::String(
+                if *plane == "S1_MME" { "eNB" } else { "SGW" }.into(),
+            );
+            event["destination_participant"] = Value::String(
+                if *plane == "S1_MME" { "MME" } else { "eNB" }.into(),
+            );
+            event["identifiers"] = json!(identifiers);
+            event["source_json"] = json!({"schema_version":"1.5.0"});
+            event["capture_id"] = Value::String(format!("sha256:{source_sha256}"));
+            event["decoder_name"] = Value::String((*protocol).into());
+            event["packet_references"][0]["source_file"] = Value::String(source_file.clone());
+            let events_file = format!("{}.events.jsonl", plane.to_ascii_lowercase());
+            let mut events_bytes = serde_json::to_vec(&event).unwrap();
+            events_bytes.push(b'\n');
+            fs::write(bundle.join(&events_file), &events_bytes).unwrap();
+            let evidence_ref = format!("capture:{plane}");
+            evidence_refs.push(evidence_ref.clone());
+            capture_refs.push(json!({
+                "plane":plane,
+                "source_file_sha256":source_sha256,
+                "decoder_version":"synthetic-test",
+                "event_schema_version":"1.5.0",
+                "first_frame":frame,
+                "last_frame":frame,
+                "sanitization_state":"SANITIZED_APPROVED"
+            }));
+            capture_bindings.push(json!({
+                "evidence_ref":evidence_ref,
+                "capture_ref_index":index,
+                "source_file":source_file,
+                "normalized_events_file":events_file,
+                "normalized_events_sha256":sha256_hex(&events_bytes),
+                "decoder_name":protocol,
+                "decoder_version":"synthetic-test",
+                "event_schema_version":"1.5.0",
+                "endpoint_roles":{"192.0.2.10":"RAN","192.0.2.20":"CORE"}
+            }));
+        }
+        let request: LteEvidenceImportRequest = serde_json::from_value(json!({
+            "schema_version":"oiran.lte-evidence-ingestion.v1",
+            "bundle_id":"bundle-api-export-01",
+            "evidence":{
+                "schema_version":"oiran-polaris.lte-e2e-evidence.v1",
+                "run_id":"lte-run-api-export-0001",
+                "profile_id":"LTE-SRSUE-TEST-01",
+                "scenario_id":"lte-e2e-certification-v1",
+                "started_at":"2026-10-31T12:00:00Z",
+                "ended_at":"2026-10-31T12:00:10Z",
+                "final_state":"COMPLETED",
+                "steps":[{
+                    "index":0,"type":"lte_attach","state":"COMPLETED",
+                    "started_at":"2026-10-31T12:00:00Z",
+                    "ended_at":"2026-10-31T12:00:10Z","reason_code":null,
+                    "evidence_refs":evidence_refs,"measurements":{}
+                }],
+                "capture_refs":capture_refs,
+                "cleanup":{"srsue_stopped":true,"srsenb_stopped":true,
+                    "sidecars_removed":true,"epc_healthy":true,"dumpcaps_preserved":true}
+            },
+            "capture_bindings":capture_bindings
+        }))
+        .unwrap();
+        let result = state
+            .inner
+            .lte_evidence_store
+            .ingest(bundle, &request)
+            .unwrap();
+        let page = state
+            .inner
+            .lte_evidence_store
+            .session_page(&request.evidence.run_id, 1, 10)
+            .unwrap();
+        (
+            result.dataset_id,
+            page["data"][0]["session_id"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn lte_evidence_sessions_and_callflow_exports_apply_privacy_boundary() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let config = test_config(workspace, "lte-export-privacy");
+        let store_root = config.lte_evidence_root.clone();
+        let state = AppState::load(config).unwrap();
+        let bundle = temporary_directory("lte-export-bundle");
+        let (dataset_id, session_id) = ingest_lte_evidence_fixture(&state, &bundle);
+
+        // Simulate defense in depth against an already persisted, malformed
+        // pseudonym. The read route must not rely only on admission-time checks.
+        let sessions_path = store_root
+            .join("datasets")
+            .join(&dataset_id)
+            .join("sessions.jsonl");
+        let mut session: Value =
+            serde_json::from_str(fs::read_to_string(&sessions_path).unwrap().trim()).unwrap();
+        session["ue_pseudonym"] = Value::String("suci-opaque".into());
+        fs::write(
+            &sessions_path,
+            format!("{}\n", serde_json::to_string(&session).unwrap()),
+        )
+        .unwrap();
+
+        let app = router(state, None);
+        let sessions = app
+            .clone()
+            .oneshot(req(
+                "/api/v1/lte/evidence/lte-run-api-export-0001/sessions?page=1&page_size=10",
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(sessions.status(), StatusCode::OK);
+        let sessions = json_body(sessions).await;
+        assert_no_identity_material(&sessions);
+        assert_eq!(sessions["data"][0]["ue_pseudonym"], "REDACTED");
+
+        let json_export = app
+            .clone()
+            .oneshot(req(
+                &format!("/api/v1/exports/callflow/{session_id}?format=json"),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(json_export.status(), StatusCode::OK);
+        let json_export = json_body(json_export).await;
+        assert_eq!(json_export["technology"], "LTE");
+        assert_no_identity_material(&json_export);
+
+        let html_export = app
+            .oneshot(req(
+                &format!("/api/v1/exports/callflow/{session_id}?format=html"),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(html_export.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            html_export
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let lower = html.to_ascii_lowercase();
+        assert!(html.contains("E-RABSetupResponse"));
+        for forbidden in ["suci-", "supi-", "guti", "tmsi", "imei", "opc"] {
+            assert!(
+                !lower.contains(forbidden),
+                "identity material in HTML: {forbidden}"
+            );
+        }
+
+        fs::remove_dir_all(bundle).unwrap();
+        fs::remove_dir_all(store_root.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]

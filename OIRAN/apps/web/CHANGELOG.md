@@ -2,6 +2,14 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.7.1 — 2026-11-01 (LTE Call Flow truthfulness)
+
+- Render the observed S1-MME/S11 and S11/S1-U correlation bridges for LTE
+  Call Flows while preserving the N2/SBI/N4/N3 presentation for 5G.
+- Keep LTE E2E at `UNKNOWN` whenever either mandatory LTE bridge is not
+  `EXACT` or `STRONG`; no live or synthetic state is inferred in the browser.
+- Add positive and negative LTE Call Flow regressions.
+
 ## 2.7.0-pre.1+real.lab.1 — 2026-10-31 (real-lab truthfulness)
 
 - Replace the hardcoded connected-vProbe and synthetic-only technology claims
