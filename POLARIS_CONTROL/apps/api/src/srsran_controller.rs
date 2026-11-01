@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const VERSION: &str = "0.2.3";
+pub const VERSION: &str = "0.2.4";
 pub const LTE_UE_ID: &str = "LTE-SRSUE-TEST-01";
 pub const ENB_ID: &str = "ENB-01";
 const PROJECT: &str = "oiran-lab";
@@ -166,6 +166,7 @@ pub struct AttachProtocolEvidence {
 
 pub trait SrsranRuntime: Send + Sync {
     fn status(&self, certified: bool, live_enabled: bool) -> Result<LteStatus, String>;
+    fn validate_traffic_configuration(&self) -> Result<(), String>;
     fn start(&self, target: Target) -> Result<(), String>;
     fn stop(&self, target: Target) -> Result<(), String>;
     fn logs(&self, target: Target) -> Result<Vec<String>, String>;
@@ -195,6 +196,30 @@ pub trait SrsranRuntime: Send + Sync {
 
 fn attach_is_proven(s1_state: &str, attach_success: bool, epc_context: bool) -> bool {
     s1_state == "CONNECTED" && attach_success && epc_context
+}
+
+fn validate_traffic_peer_values(
+    traffic_peer: Option<&str>,
+    dl_sender: Option<&str>,
+) -> Result<std::net::Ipv4Addr, String> {
+    let peer = traffic_peer.ok_or("LTE_TRAFFIC_PEER_NOT_CONFIGURED")?;
+    let peer = peer
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| "LTE_TRAFFIC_PEER_INVALID")?;
+    let sender = dl_sender.ok_or("LTE_DL_SENDER_NOT_CONFIGURED")?;
+    let sender = sender
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| "LTE_DL_SENDER_IP_INVALID")?;
+    if peer != sender {
+        return Err("LTE_TRAFFIC_PEER_MISMATCH".into());
+    }
+    Ok(peer)
+}
+
+fn configured_traffic_peer() -> Result<std::net::Ipv4Addr, String> {
+    let peer = std::env::var("POLARIS_LTE_TRAFFIC_PEER_IP").ok();
+    let sender = std::env::var("POLARIS_DL_SENDER_IP").ok();
+    validate_traffic_peer_values(peer.as_deref(), sender.as_deref())
 }
 
 fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
@@ -677,11 +702,7 @@ impl DockerSrsranRuntime {
         duration_seconds: u32,
         payload_bytes: u32,
     ) -> Result<(u64, u64), String> {
-        let peer = std::env::var("POLARIS_LTE_TRAFFIC_PEER_IP")
-            .map_err(|_| "LTE_TRAFFIC_PEER_NOT_CONFIGURED")?;
-        if peer.parse::<std::net::IpAddr>().is_err() {
-            return Err("LTE_TRAFFIC_PEER_INVALID".into());
-        }
+        let peer = configured_traffic_peer()?.to_string();
         let rate_arg = rate_bps.to_string();
         let duration_arg = duration_seconds.to_string();
         let payload_arg = payload_bytes.to_string();
@@ -837,10 +858,7 @@ impl SrsranRuntime for DockerSrsranRuntime {
         let epc_context_observed = self.epc_context_proof();
         let attached = attach_is_proven(&s1, attach_success_observed, epc_context_observed);
         let ownership = enb.controller_owned && ue.controller_owned;
-        let traffic_peer_configured = std::env::var("POLARIS_LTE_TRAFFIC_PEER_IP")
-            .ok()
-            .and_then(|value| value.parse::<std::net::IpAddr>().ok())
-            .is_some();
+        let traffic_peer_configured = configured_traffic_peer().is_ok();
         Ok(LteStatus {
             technology: "LTE 4G",
             simulator: "srsRAN",
@@ -865,6 +883,9 @@ impl SrsranRuntime for DockerSrsranRuntime {
                 && attached
                 && traffic_peer_configured,
         })
+    }
+    fn validate_traffic_configuration(&self) -> Result<(), String> {
+        configured_traffic_peer().map(|_| ())
     }
     fn start(&self, target: Target) -> Result<(), String> {
         let (c, created) = if let Some(c) = self.resolve(target.service())? {
@@ -1095,8 +1116,7 @@ impl SrsranRuntime for DockerSrsranRuntime {
         if ue.state != "running" {
             return Err("LTE_UE_NOT_RUNNING".into());
         }
-        let peer = std::env::var("POLARIS_LTE_TRAFFIC_PEER_IP")
-            .map_err(|_| "LTE_TRAFFIC_PEER_NOT_CONFIGURED")?;
+        let peer = configured_traffic_peer()?.to_string();
         let count = packets.to_string();
         let output = if direction == "ul" {
             Self::ok(
@@ -1212,6 +1232,7 @@ pub struct MockSrsranRuntime {
     pub start_error: Arc<Mutex<Option<String>>>,
     pub sidecars_absent: Arc<Mutex<bool>>,
     pub attach_evidence: Arc<Mutex<Option<AttachProtocolEvidence>>>,
+    pub traffic_configuration_error: Arc<Mutex<Option<String>>>,
 }
 impl Default for MockSrsranRuntime {
     fn default() -> Self {
@@ -1223,6 +1244,7 @@ impl Default for MockSrsranRuntime {
             start_error: Arc::new(Mutex::new(None)),
             sidecars_absent: Arc::new(Mutex::new(true)),
             attach_evidence: Arc::new(Mutex::new(None)),
+            traffic_configuration_error: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1253,6 +1275,12 @@ impl SrsranRuntime for MockSrsranRuntime {
             ownership_verified: *self.ownership_verified.lock().unwrap(),
             traffic_ready: false,
         })
+    }
+    fn validate_traffic_configuration(&self) -> Result<(), String> {
+        match self.traffic_configuration_error.lock().unwrap().clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
     fn start(&self, t: Target) -> Result<(), String> {
         if let Some(e) = self.start_error.lock().unwrap().clone() {
@@ -1590,12 +1618,18 @@ mod tests {
             error: String::new(),
         };
         let previous_peer = std::env::var_os("POLARIS_LTE_TRAFFIC_PEER_IP");
+        let previous_sender = std::env::var_os("POLARIS_DL_SENDER_IP");
         std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", "192.0.2.1");
+        std::env::set_var("POLARIS_DL_SENDER_IP", "192.0.2.1");
         let udp_result = runtime.iperf(&ue, false, "udp", 750_000, 7, 900);
         let tcp_result = runtime.iperf(&ue, false, "tcp", 1_000_000, 1, 1_200);
         match previous_peer {
             Some(value) => std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", value),
             None => std::env::remove_var("POLARIS_LTE_TRAFFIC_PEER_IP"),
+        }
+        match previous_sender {
+            Some(value) => std::env::set_var("POLARIS_DL_SENDER_IP", value),
+            None => std::env::remove_var("POLARIS_DL_SENDER_IP"),
         }
         udp_result.unwrap();
         tcp_result.unwrap();
@@ -1604,6 +1638,53 @@ mod tests {
         assert!(calls[0].windows(2).any(|args| args == ["-b", "750000"]));
         assert!(calls[0].windows(2).any(|args| args == ["-t", "7"]));
         assert!(!calls[1].iter().any(|arg| arg == "-u" || arg == "-l"));
+    }
+    #[test]
+    fn traffic_peer_requires_exact_validated_dl_sender_address() {
+        assert_eq!(
+            validate_traffic_peer_values(None, Some("10.77.24.30")),
+            Err("LTE_TRAFFIC_PEER_NOT_CONFIGURED".into())
+        );
+        assert_eq!(
+            validate_traffic_peer_values(Some("not-an-ip"), Some("10.77.24.30")),
+            Err("LTE_TRAFFIC_PEER_INVALID".into())
+        );
+        assert_eq!(
+            validate_traffic_peer_values(Some("10.77.24.30"), None),
+            Err("LTE_DL_SENDER_NOT_CONFIGURED".into())
+        );
+        assert_eq!(
+            validate_traffic_peer_values(Some("10.77.24.30"), Some("invalid")),
+            Err("LTE_DL_SENDER_IP_INVALID".into())
+        );
+        assert_eq!(
+            validate_traffic_peer_values(Some("10.77.24.31"), Some("10.77.24.30")),
+            Err("LTE_TRAFFIC_PEER_MISMATCH".into())
+        );
+        assert_eq!(
+            validate_traffic_peer_values(Some("10.77.24.30"), Some("10.77.24.30")),
+            Ok("10.77.24.30".parse().unwrap())
+        );
+    }
+    #[test]
+    fn traffic_preflight_failure_has_no_lifecycle_side_effect() {
+        let runtime = MockSrsranRuntime::default();
+        *runtime.traffic_configuration_error.lock().unwrap() =
+            Some("LTE_TRAFFIC_PEER_NOT_CONFIGURED".into());
+        assert_eq!(
+            runtime.validate_traffic_configuration(),
+            Err("LTE_TRAFFIC_PEER_NOT_CONFIGURED".into())
+        );
+        assert!(runtime.started.lock().unwrap().is_empty());
+        assert!(runtime.stopped.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn canonical_dn_sender_dropin_sets_the_exact_lte_peer() {
+        let dropin = include_str!(
+            "../../../deployment/dn-sender/polaris-control-dl-sender.conf"
+        );
+        assert!(dropin.contains("Environment=POLARIS_DL_SENDER_IP=10.77.24.30"));
+        assert!(dropin.contains("Environment=POLARIS_LTE_TRAFFIC_PEER_IP=10.77.24.30"));
     }
     #[test]
     fn host_timeout_is_fail_closed() {
