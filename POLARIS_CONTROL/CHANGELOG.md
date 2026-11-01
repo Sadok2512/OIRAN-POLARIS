@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.28.0 (polaris-control-api) — 2026-11-01 — fail-closed OIRAN LTE evidence bridge
+
+- Adds an Operator+CSRF protected evidence-envelope route for completed LTE
+  certification runs and emits the exact OIRAN 2.7.1 ingestion wrapper.
+- Publishes only three independently observed `SANITIZED_APPROVED` LTE capture
+  proofs (`S1_MME`, `S11`, `S1_U`), with lower-case SHA256, decoder/schema
+  versions, bounded frame ranges, provenance and pseudonymous session refs.
+- Rejects missing, duplicate, raw, unsupported/5G or unresolved evidence and
+  preserves `POLARIS_LTE_E2E_CERTIFIED=false`; evidence publication never
+  promotes operational certification.
+
 ## 0.27.1 (polaris-control-api) — 2026-11-01 — activation revocation hardening
 
 - Makes Administrator profile disable revoke the bound Certification Grant V2

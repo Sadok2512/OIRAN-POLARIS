@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -12,6 +12,7 @@ pub const EVIDENCE_SCHEMA: &str = "oiran-polaris.lte-e2e-evidence.v1";
 pub const PROFILE_ID: &str = "LTE-SRSUE-TEST-01";
 pub const SCENARIO_ID: &str = "lte-e2e-certification-v1";
 pub const MAX_RUN_MS: u64 = 300_000;
+pub const OIRAN_INGESTION_SCHEMA: &str = "oiran.lte-evidence-ingestion.v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -87,6 +88,67 @@ pub struct CaptureRef {
     #[serde(alias = "schema_version")]
     pub event_schema_version: String,
     pub sanitization_state: String,
+}
+
+/// Capture proof supplied by the trusted OIRAN finalization boundary.  It is
+/// deliberately richer than the public capture_ref: provenance is validated
+/// here and only the OIRAN 2.7.1 allowlisted fields are emitted.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedCaptureProof {
+    pub capture_ref: CaptureRef,
+    pub observed_at: String,
+    pub provenance: String,
+    pub rat: String,
+    #[serde(default)]
+    pub session_refs: Vec<String>,
+    pub source_file: String,
+    pub normalized_events_file: String,
+    pub normalized_events_sha256: String,
+    pub decoder_name: String,
+    pub endpoint_roles: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceEnvelopeInput {
+    pub bundle_id: String,
+    pub capture_proofs: Vec<ObservedCaptureProof>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct OiranCaptureBinding {
+    pub evidence_ref: String,
+    pub capture_ref_index: usize,
+    pub source_file: String,
+    pub normalized_events_file: String,
+    pub normalized_events_sha256: String,
+    pub decoder_name: String,
+    pub decoder_version: String,
+    pub event_schema_version: String,
+    pub endpoint_roles: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct CanonicalLteEvidence {
+    pub schema_version: String,
+    pub run_id: String,
+    pub profile_id: String,
+    pub scenario_id: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub final_state: String,
+    pub steps: Vec<StepEvidence>,
+    pub capture_refs: Vec<CaptureRef>,
+    pub cleanup: CleanupEvidence,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct OiranEvidenceEnvelope {
+    pub schema_version: String,
+    pub bundle_id: String,
+    pub evidence: CanonicalLteEvidence,
+    pub capture_bindings: Vec<OiranCaptureBinding>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
@@ -413,7 +475,9 @@ impl RunStore {
 }
 
 pub fn validate_capture_refs(refs: &[CaptureRef]) -> Result<(), String> {
-    let supported = ["S1_MME", "S11", "S1_U", "S5_C", "S5_U"];
+    // OIRAN 2.7.1 admits exactly the three mandatory LTE planes. Optional
+    // or 5G planes are rejected instead of being silently published.
+    let supported = ["S1_MME", "S11", "S1_U"];
     let required = ["S1_MME", "S11", "S1_U"];
     let mut planes = BTreeSet::new();
     for reference in refs {
@@ -427,7 +491,7 @@ pub fn validate_capture_refs(refs: &[CaptureRef]) -> Result<(), String> {
             || !reference
                 .source_file_sha256
                 .bytes()
-                .all(|b| b.is_ascii_hexdigit())
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             || reference.first_frame == 0
             || reference.first_frame > reference.last_frame
             || reference.decoder_version.trim().is_empty()
@@ -443,6 +507,164 @@ pub fn validate_capture_refs(refs: &[CaptureRef]) -> Result<(), String> {
         return Err("LTE_EVIDENCE_REQUIRED_PLANE_MISSING".into());
     }
     Ok(())
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn safe_relative_file(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.contains('\\')
+        && value.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn safe_id(value: &str) -> bool {
+    (3..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Build the exact OIRAN 2.7.1 wrapper from a terminal, clean run and three
+/// independently observed, sanitized capture proofs. No capture reference is
+/// synthesized from run state or timestamps.
+pub fn build_oiran_evidence_envelope(
+    run: &RunRecord,
+    input: EvidenceEnvelopeInput,
+) -> Result<OiranEvidenceEnvelope, String> {
+    if run.state != RunState::Clean
+        || run.outcome != Some(RunOutcome::Completed)
+        || run.cleanup_required
+        || run.ended_at.as_deref().map_or(true, str::is_empty)
+        || !run.cleanup.srsue_stopped
+        || !run.cleanup.srsenb_stopped
+        || !run.cleanup.sidecars_removed
+        || !run.cleanup.epc_healthy
+        || !run.cleanup.dumpcaps_preserved
+    {
+        return Err("LTE_EVIDENCE_RUN_NOT_ADMISSIBLE".into());
+    }
+    if !safe_id(&input.bundle_id) {
+        return Err("LTE_EVIDENCE_BUNDLE_ID_INVALID".into());
+    }
+
+    let capture_refs = input
+        .capture_proofs
+        .iter()
+        .map(|proof| proof.capture_ref.clone())
+        .collect::<Vec<_>>();
+    validate_capture_refs(&capture_refs)?;
+
+    let mut capture_bindings = Vec::with_capacity(input.capture_proofs.len());
+    let mut provenance = serde_json::Map::new();
+    let mut session_refs = BTreeSet::new();
+    for (index, proof) in input.capture_proofs.iter().enumerate() {
+        if proof.provenance != "OIRAN_SANITIZED_CAPTURE_MANIFEST"
+            || proof.rat != "LTE"
+            || !proof.observed_at.ends_with('Z')
+            || proof.observed_at.len() < 20
+            || !safe_relative_file(&proof.source_file)
+            || !safe_relative_file(&proof.normalized_events_file)
+            || !valid_sha256(&proof.normalized_events_sha256)
+            || proof.decoder_name.trim().is_empty()
+            || proof.capture_ref.event_schema_version != "1.5.0"
+            || proof.endpoint_roles.is_empty()
+        {
+            return Err("LTE_EVIDENCE_PROVENANCE_INVALID".into());
+        }
+        for session_ref in &proof.session_refs {
+            if !session_ref.starts_with("lte-session-") || !safe_id(session_ref) {
+                return Err("LTE_EVIDENCE_SESSION_REF_INVALID".into());
+            }
+            session_refs.insert(session_ref.clone());
+        }
+        let evidence_ref = format!("capture:{}", proof.capture_ref.plane);
+        provenance.insert(
+            evidence_ref.clone(),
+            serde_json::json!({
+                "observed_at": proof.observed_at,
+                "provenance": proof.provenance,
+                "rat": proof.rat,
+                "source_file_sha256": proof.capture_ref.source_file_sha256,
+                "normalized_events_sha256": proof.normalized_events_sha256,
+            }),
+        );
+        capture_bindings.push(OiranCaptureBinding {
+            evidence_ref,
+            capture_ref_index: index,
+            source_file: proof.source_file.clone(),
+            normalized_events_file: proof.normalized_events_file.clone(),
+            normalized_events_sha256: proof.normalized_events_sha256.clone(),
+            decoder_name: proof.decoder_name.clone(),
+            decoder_version: proof.capture_ref.decoder_version.clone(),
+            event_schema_version: proof.capture_ref.event_schema_version.clone(),
+            endpoint_roles: proof.endpoint_roles.clone(),
+        });
+    }
+
+    let mut steps = run.steps.clone();
+    for (step_index, plane) in [
+        (2_usize, "S1_MME"),
+        (4, "S1_MME"),
+        (8, "S1_U"),
+        (9, "S1_U"),
+        (10, "S11"),
+    ] {
+        if let Some(step) = steps.get_mut(step_index) {
+            let evidence_ref = format!("capture:{plane}");
+            if !step.evidence_refs.contains(&evidence_ref) {
+                step.evidence_refs.push(evidence_ref);
+            }
+        }
+    }
+    let metadata = serde_json::json!({
+        "rat": "LTE",
+        "capture_provenance": provenance,
+        "session_refs": session_refs.into_iter().collect::<Vec<_>>(),
+    });
+    let measurements = metadata
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "LTE_EVIDENCE_PROVENANCE_INVALID".to_string())?;
+    if let Some(preflight) = steps.first_mut() {
+        let current = preflight
+            .measurements
+            .as_object_mut()
+            .ok_or_else(|| "LTE_EVIDENCE_STEP_MEASUREMENTS_INVALID".to_string())?;
+        current.extend(measurements);
+    }
+    let valid_refs = capture_bindings
+        .iter()
+        .map(|binding| binding.evidence_ref.as_str())
+        .collect::<BTreeSet<_>>();
+    if steps.iter().flat_map(|step| &step.evidence_refs).any(|reference| {
+        reference.starts_with("capture:") && !valid_refs.contains(reference.as_str())
+    }) {
+        return Err("LTE_EVIDENCE_REF_UNRESOLVED".into());
+    }
+
+    Ok(OiranEvidenceEnvelope {
+        schema_version: OIRAN_INGESTION_SCHEMA.into(),
+        bundle_id: input.bundle_id,
+        evidence: CanonicalLteEvidence {
+            schema_version: EVIDENCE_SCHEMA.into(),
+            run_id: run.run_id.clone(),
+            profile_id: run.profile_id.clone(),
+            scenario_id: run.scenario_id.clone(),
+            started_at: run.started_at.clone(),
+            ended_at: run.ended_at.clone().unwrap_or_default(),
+            final_state: "COMPLETED".into(),
+            steps,
+            capture_refs,
+            cleanup: run.cleanup.clone(),
+        },
+        capture_bindings,
+    })
 }
 
 fn canonical_steps() -> Vec<StepEvidence> {
@@ -539,9 +761,100 @@ mod tests {
             first_frame: 1,
             last_frame: 2,
             decoder_version: "test".into(),
-            event_schema_version: "v1".into(),
+            event_schema_version: "1.5.0".into(),
             sanitization_state: "SANITIZED_APPROVED".into(),
         }
+    }
+    fn capture_proof(plane: &str) -> ObservedCaptureProof {
+        let mut endpoint_roles = BTreeMap::new();
+        endpoint_roles.insert("192.0.2.1".into(), "SOURCE".into());
+        endpoint_roles.insert("192.0.2.2".into(), "DESTINATION".into());
+        ObservedCaptureProof {
+            capture_ref: capture(plane),
+            observed_at: "2026-11-01T09:00:00Z".into(),
+            provenance: "OIRAN_SANITIZED_CAPTURE_MANIFEST".into(),
+            rat: "LTE".into(),
+            session_refs: vec!["lte-session-pseudonym-01".into()],
+            source_file: format!("{}.pcapng", plane.to_ascii_lowercase()),
+            normalized_events_file: format!("{}.events.jsonl", plane.to_ascii_lowercase()),
+            normalized_events_sha256: "b".repeat(64),
+            decoder_name: format!("decoder-{}", plane.to_ascii_lowercase()),
+            endpoint_roles,
+        }
+    }
+    fn completed_run(name: &str) -> RunRecord {
+        let p = path(name);
+        let _ = fs::remove_file(&p);
+        let mut store = RunStore::load(p.clone()).unwrap();
+        let run_id = format!("lte-run-{name}-12345678");
+        store
+            .create(run_id.clone(), "grant-test".into(), 1, 999_999, "idempotency-key-test")
+            .unwrap();
+        store
+            .finalize(
+                &run_id,
+                RunOutcome::Completed,
+                CleanupEvidence {
+                    srsue_stopped: true,
+                    srsenb_stopped: true,
+                    sidecars_removed: true,
+                    epc_healthy: true,
+                    dumpcaps_preserved: true,
+                },
+                2,
+            )
+            .unwrap();
+        let run = store.get(&run_id).unwrap().clone();
+        let _ = fs::remove_file(p);
+        run
+    }
+    #[test]
+    fn oiran_wrapper_is_exact_and_derived_only_from_approved_observations() {
+        let run = completed_run("envelope");
+        let envelope = build_oiran_evidence_envelope(
+            &run,
+            EvidenceEnvelopeInput {
+                bundle_id: "bundle-lte-approved-01".into(),
+                capture_proofs: vec![capture_proof("S1_MME"), capture_proof("S11"), capture_proof("S1_U")],
+            },
+        )
+        .unwrap();
+        assert_eq!(envelope.schema_version, OIRAN_INGESTION_SCHEMA);
+        assert_eq!(envelope.evidence.schema_version, EVIDENCE_SCHEMA);
+        assert_eq!(envelope.evidence.final_state, "COMPLETED");
+        assert_eq!(envelope.evidence.capture_refs.len(), 3);
+        for (index, binding) in envelope.capture_bindings.iter().enumerate() {
+            assert_eq!(binding.capture_ref_index, index);
+            assert_eq!(binding.decoder_version, envelope.evidence.capture_refs[index].decoder_version);
+            assert_eq!(binding.event_schema_version, "1.5.0");
+        }
+        let json = serde_json::to_value(envelope).unwrap();
+        assert!(json.get("rat").is_none());
+        assert!(json["evidence"].get("grant_id").is_none());
+        assert_eq!(json["evidence"]["steps"][0]["measurements"]["rat"], "LTE");
+    }
+    #[test]
+    fn oiran_wrapper_fails_closed_for_unproved_or_inadmissible_evidence() {
+        let good = || EvidenceEnvelopeInput {
+            bundle_id: "bundle-lte-approved-02".into(),
+            capture_proofs: vec![capture_proof("S1_MME"), capture_proof("S11"), capture_proof("S1_U")],
+        };
+        let mut failed = completed_run("negative");
+        failed.outcome = Some(RunOutcome::Failed);
+        assert_eq!(build_oiran_evidence_envelope(&failed, good()).unwrap_err(), "LTE_EVIDENCE_RUN_NOT_ADMISSIBLE");
+        let run = completed_run("negative-clean");
+        let mut missing = good();
+        missing.capture_proofs.pop();
+        assert_eq!(build_oiran_evidence_envelope(&run, missing).unwrap_err(), "LTE_EVIDENCE_REQUIRED_PLANE_MISSING");
+        let mut raw = good();
+        raw.capture_proofs[0].capture_ref.sanitization_state = "RAW".into();
+        assert_eq!(build_oiran_evidence_envelope(&run, raw).unwrap_err(), "LTE_EVIDENCE_NOT_APPROVED");
+        let mut five_g = good();
+        five_g.capture_proofs[0].capture_ref.plane = "N2".into();
+        assert_eq!(build_oiran_evidence_envelope(&run, five_g).unwrap_err(), "LTE_EVIDENCE_PLANE_UNSUPPORTED");
+        let mut identity = good();
+        identity.capture_proofs[0].session_refs = vec!["001010000000001".into()];
+        assert_eq!(build_oiran_evidence_envelope(&run, identity).unwrap_err(), "LTE_EVIDENCE_SESSION_REF_INVALID");
     }
     #[test]
     fn persistent_lease_and_idempotency() {
