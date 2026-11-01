@@ -10,6 +10,14 @@
   Analyzer; E2E remains `UNKNOWN` unless both required bridges are proven.
 - Add raw-response, export and UI regressions. This release does not create
   capture references, certify real LTE, enable live traffic or deploy itself.
+- Redact provenance filenames containing identity labels or identity-length digit
+  runs while retaining safe `capture://` basename provenance.
+- Add fail-closed envelope regressions for duplicate capture planes, duplicate event
+  IDs, capture-ID mismatch and packet source-file mismatch.
+- Document the exact POLARIS evidence-to-OIRAN binding boundary and preserve the
+  strict S1-MME/S11/S1-U required-plane set.
+- Accept the complete strict POLARIS 0.28.0 import envelope on the existing LTE
+  import route and reject outer/nested provenance drift before artifact access.
 
 ## OIRAN API 2.7.1 — 2026-10-31
 

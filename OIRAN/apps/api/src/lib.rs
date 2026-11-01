@@ -16,11 +16,11 @@ use disk_safety::{assess, capture_budget, measure_path, rotation_plan, Policy};
 use event_schema::sha256_hex;
 use live_probe::{
     lte_evidence::{
-        LteDatasetManifest, LteEvidenceError, LteEvidenceImportRequest, LteEvidenceStore,
+        LteDatasetManifest, LteEvidenceError, LteEvidenceImportPayload, LteEvidenceStore,
     },
     offline_lte_callflows, read_callflow_page, CaptureManager, CaptureRequest,
-    ContinuousImportConfig,
-    DEFAULT_CALLFLOW_PAGE_EVENTS, DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES, MAX_CALLFLOW_PAGE_EVENTS,
+    ContinuousImportConfig, DEFAULT_CALLFLOW_PAGE_EVENTS, DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+    MAX_CALLFLOW_PAGE_EVENTS,
 };
 use probe_registry::{CreateError as ProbeCreateError, ProbeInput, ProbeRecord, ProbeRegistry};
 use serde::Deserialize;
@@ -133,8 +133,7 @@ impl ApiConfig {
                 .map(|value| value.parse::<u64>().unwrap_or(0))
                 .unwrap_or(DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES),
             reference_dataset_enabled: cfg!(test)
-                || std::env::var("OIRAN_REFERENCE_DATASET_ENABLED")
-                    .is_ok_and(|value| value == "1"),
+                || std::env::var("OIRAN_REFERENCE_DATASET_ENABLED").is_ok_and(|value| value == "1"),
         }
     }
 }
@@ -519,18 +518,12 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/datasets/import-derived", post(import_derived_dataset))
         .route("/lte/evidence/import", post(import_lte_evidence))
         .route("/lte/evidence/:run_id", get(lte_evidence_status))
-        .route(
-            "/lte/evidence/:run_id/sessions",
-            get(lte_evidence_sessions),
-        )
+        .route("/lte/evidence/:run_id/sessions", get(lte_evidence_sessions))
         .route(
             "/lte/evidence/:run_id/sessions/:session_id/callflow",
             get(lte_evidence_callflow),
         )
-        .route(
-            "/lte/evidence/:run_id/exports",
-            post(export_lte_evidence),
-        )
+        .route("/lte/evidence/:run_id/exports", post(export_lte_evidence))
         .route("/datasets/:id", get(dataset))
         .route("/datasets/:id/sessions", get(dataset_sessions))
         .route("/ues", get(ues))
@@ -1432,16 +1425,26 @@ fn dataset_values(state: &AppState) -> Vec<Value> {
             }),
     );
     if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
-        items.extend(catalog.into_iter().map(|manifest| lte_dataset_summary(&manifest)));
+        items.extend(
+            catalog
+                .into_iter()
+                .map(|manifest| lte_dataset_summary(&manifest)),
+        );
     }
     items
 }
 
 fn technology_from_interfaces<'a>(interfaces: impl Iterator<Item = &'a str>) -> &'static str {
     let observed = interfaces.collect::<Vec<_>>();
-    if observed.iter().any(|value| matches!(*value, "S1-MME" | "S11" | "S1-U")) {
+    if observed
+        .iter()
+        .any(|value| matches!(*value, "S1-MME" | "S11" | "S1-U"))
+    {
         "LTE"
-    } else if observed.iter().any(|value| matches!(*value, "N2" | "N3" | "N4" | "SBI")) {
+    } else if observed
+        .iter()
+        .any(|value| matches!(*value, "N2" | "N3" | "N4" | "SBI"))
+    {
         "5G SA"
     } else {
         "UNKNOWN"
@@ -1609,12 +1612,19 @@ async fn import_derived_dataset(
 async fn import_lte_evidence(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<LteEvidenceImportRequest>,
+    Json(payload): Json<LteEvidenceImportPayload>,
 ) -> Response {
     if let Err(response) = require_operator_csrf(&state, &headers) {
         return response;
     }
-    let bundle = state.inner.lte_evidence_bundle_root.join(&request.bundle_id);
+    let request = match payload.into_request() {
+        Ok(request) => request,
+        Err(error) => return lte_evidence_error(error),
+    };
+    let bundle = state
+        .inner
+        .lte_evidence_bundle_root
+        .join(&request.bundle_id);
     match state.inner.lte_evidence_store.ingest(&bundle, &request) {
         Ok(result) => {
             let status = if result.idempotent {
@@ -1690,11 +1700,11 @@ async fn export_lte_evidence(
     if let Err(response) = require_operator_csrf(&state, &headers) {
         return response;
     }
-    match state
-        .inner
-        .lte_evidence_store
-        .export_pending_review(&run_id, &request.export_id, &request.transformation)
-    {
+    match state.inner.lte_evidence_store.export_pending_review(
+        &run_id,
+        &request.export_id,
+        &request.transformation,
+    ) {
         Ok(manifest) => (StatusCode::CREATED, ok(json!(manifest))).into_response(),
         Err(error) => lte_evidence_error(error),
     }
@@ -1737,12 +1747,16 @@ async fn dataset_sessions(
     Path(id): Path<String>,
     Query(mut query): Query<ListQuery>,
 ) -> Response {
-    let lte_exists = state.inner.lte_evidence_store.catalog().ok().is_some_and(|items| {
-        items.iter().any(|manifest| manifest.dataset_id == id)
-    });
+    let lte_exists = state
+        .inner
+        .lte_evidence_store
+        .catalog()
+        .ok()
+        .is_some_and(|items| items.iter().any(|manifest| manifest.dataset_id == id));
     if state.inner.registry.get(&id).is_none()
         && state.inner.capture_manager.dataset(&id).is_none()
-        && !lte_exists {
+        && !lte_exists
+    {
         return api_error(
             StatusCode::NOT_FOUND,
             "DATASET_NOT_FOUND",
@@ -2085,8 +2099,7 @@ fn session_summary(state: &AppState, flow: &CallFlow) -> Value {
             .unwrap_or(parsed_pdu)
     };
     let ue_pseudonym = if is_lte {
-        flow.session_id
-            .replacen("lte-session-", "LTE-UE-", 1)
+        flow.session_id.replacen("lte-session-", "LTE-UE-", 1)
     } else if parsed_ue == "UNKNOWN_UE" {
         context
             .map(|context| context.pseudonym.clone())
@@ -2242,9 +2255,13 @@ fn live_session_summary(dataset: &live_probe::LiveDataset, flow: &CallFlow) -> V
 }
 
 fn lte_session_summary(manifest: &LteDatasetManifest, session: &LteSession) -> Value {
-    let packet_count = session.tunnels.iter().map(|tunnel| {
-        tunnel.uplink_packets + tunnel.downlink_packets + tunnel.unknown_direction_packets
-    }).sum::<usize>();
+    let packet_count = session
+        .tunnels
+        .iter()
+        .map(|tunnel| {
+            tunnel.uplink_packets + tunnel.downlink_packets + tunnel.unknown_direction_packets
+        })
+        .sum::<usize>();
     json!({
         "session_id":session.session_id,"dataset_id":manifest.dataset_id,
         "ue_context_id":Value::Null,"dataset_kind":"EVIDENCE","technology":"LTE",
@@ -2283,11 +2300,18 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
     }
     if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
         for manifest in catalog {
-            if let Ok(page) = state.inner.lte_evidence_store.session_page(&manifest.run_id, 1, 100) {
+            if let Ok(page) = state
+                .inner
+                .lte_evidence_store
+                .session_page(&manifest.run_id, 1, 100)
+            {
                 if let Some(records) = page["data"].as_array() {
                     for record in records {
                         if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
-                            unique.insert(session.session_id.clone(), lte_session_summary(&manifest, &session));
+                            unique.insert(
+                                session.session_id.clone(),
+                                lte_session_summary(&manifest, &session),
+                            );
                         }
                     }
                 }
@@ -2347,7 +2371,9 @@ async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Respo
         let procedures = lte.procedures.iter().enumerate().map(|(index, name)| json!({
             "id":format!("lte-procedure-{index}"),"name":name,"event_ids":[],"status":"OBSERVED"
         })).collect::<Vec<_>>();
-        let capture_references = manifest.source_capture_sha256.keys()
+        let capture_references = manifest
+            .source_capture_sha256
+            .keys()
             .map(|plane| format!("capture:{plane}"))
             .collect::<Vec<_>>();
         let mut value = json!({
@@ -2373,9 +2399,15 @@ async fn session_procedures(State(state): State<AppState>, Path(id): Path<String
         return ok(json!(flow.procedures)).into_response();
     }
     if let Ok(Some((_manifest, lte))) = state.inner.lte_evidence_store.find_session(&id) {
-        return ok(json!(lte.procedures.iter().enumerate().map(|(index,name)| json!({
-            "id":format!("lte-procedure-{index}"),"name":name,"event_ids":[],"status":"OBSERVED"
-        })).collect::<Vec<_>>())).into_response();
+        return ok(json!(lte
+            .procedures
+            .iter()
+            .enumerate()
+            .map(|(index, name)| json!({
+                "id":format!("lte-procedure-{index}"),"name":name,"event_ids":[],"status":"OBSERVED"
+            }))
+            .collect::<Vec<_>>()))
+        .into_response();
     }
     api_error(
         StatusCode::NOT_FOUND,
@@ -2403,7 +2435,13 @@ async fn session_events(
             MAX_CALLFLOW_PAGE_EVENTS,
         ) {
             Ok(Some(value)) => value["events"].as_array().cloned().unwrap_or_default(),
-            Ok(None) => return api_error(StatusCode::NOT_FOUND,"SESSION_NOT_FOUND","unknown session id"),
+            Ok(None) => {
+                return api_error(
+                    StatusCode::NOT_FOUND,
+                    "SESSION_NOT_FOUND",
+                    "unknown session id",
+                )
+            }
             Err(error) => return lte_evidence_error(error),
         }
     };
@@ -2528,9 +2566,15 @@ async fn session_callflow(
     } else if let Some(flow_value) = flow_value_for(&state, &id) {
         callflow_page_from_value(flow_value, cursor, limit).map(Some)
     } else {
-        match state.inner.capture_manager.callflow_page_by_session(&id, cursor, limit) {
+        match state
+            .inner
+            .capture_manager
+            .callflow_page_by_session(&id, cursor, limit)
+        {
             Ok(Some(value)) => Ok(Some(value)),
-            Ok(None) => state.inner.lte_evidence_store
+            Ok(None) => state
+                .inner
+                .lte_evidence_store
                 .callflow_page_by_session(&id, cursor, limit)
                 .map_err(|error| error.to_string()),
             Err(error) => Err(error),
@@ -2557,7 +2601,9 @@ async fn session_correlations(State(state): State<AppState>, Path(id): Path<Stri
         flow
     } else {
         return match state.inner.lte_evidence_store.callflow_page_by_session(
-            &id, None, MAX_CALLFLOW_PAGE_EVENTS,
+            &id,
+            None,
+            MAX_CALLFLOW_PAGE_EVENTS,
         ) {
             Ok(Some(mut flow)) => {
                 let mut value = json!({
@@ -2567,7 +2613,11 @@ async fn session_correlations(State(state): State<AppState>, Path(id): Path<Stri
                 sanitize_value(&mut value);
                 ok(value).into_response()
             }
-            Ok(None) => api_error(StatusCode::NOT_FOUND,"SESSION_NOT_FOUND","unknown session id"),
+            Ok(None) => api_error(
+                StatusCode::NOT_FOUND,
+                "SESSION_NOT_FOUND",
+                "unknown session id",
+            ),
             Err(error) => lte_evidence_error(error),
         };
     };
@@ -2947,7 +2997,16 @@ fn sanitize_value(value: &mut Value) {
                             .file_name()
                             .and_then(|x| x.to_str())
                             .unwrap_or("capture.pcapng");
-                        *v = Value::String(format!("capture://{name}"));
+                        let safe_name = if is_identity_label(name)
+                            || name
+                                .split(|character: char| !character.is_ascii_digit())
+                                .any(|part| part.len() >= 14)
+                        {
+                            "REDACTED.pcapng"
+                        } else {
+                            name
+                        };
+                        *v = Value::String(format!("capture://{safe_name}"));
                     }
                 } else {
                     sanitize_value(v)
@@ -2994,13 +3053,14 @@ fn json_error(error: serde_json::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use axum::http::{Request, StatusCode};
     use capture_helper::{
         CaptureBackend, CaptureHelperClient, CaptureService, CaptureSession, HelperFailure,
         InterfaceId, ServerConfig,
     };
     use http_body_util::BodyExt;
+    use live_probe::lte_evidence::LteEvidenceImportRequest;
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use tower::ServiceExt;
     #[derive(Clone)]
@@ -3108,6 +3168,26 @@ mod tests {
             "capture_bindings":[]
         })
     }
+    fn lte_polaris_import_envelope() -> Value {
+        let oiran_import = lte_import_payload();
+        json!({
+            "schema_version":"polaris-oiran.lte-import-envelope.v1",
+            "provenance":{
+                "source":"POLARIS_SERVER_VERIFIED_BUNDLE",
+                "published_at_epoch_ms":1793448010000_u64,
+                "run_id":"lte-run-synthetic-0001",
+                "rat":"LTE",
+                "profile_id":"LTE-SRSUE-TEST-01",
+                "scenario_id":"lte-e2e-certification-v1",
+                "started_at":"2026-10-31T12:00:00Z",
+                "ended_at":"2026-10-31T12:00:10Z",
+                "capture_ids":[],
+                "session_references":[],
+                "session_reference_state":"NOT_AVAILABLE_UNTIL_OIRAN_INGESTION"
+            },
+            "oiran_import":oiran_import
+        })
+    }
     #[tokio::test]
     async fn unauthenticated_request_is_allowed_read_only() {
         assert_eq!(
@@ -3123,7 +3203,10 @@ mod tests {
     #[tokio::test]
     async fn operational_mode_never_preloads_reference_sessions() {
         let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let mut config = test_config(workspace, "operational-real-only");
         config.reference_dataset_enabled = false;
         config.capture_root = temporary_directory("operational-captures");
@@ -3131,7 +3214,9 @@ mod tests {
         assert!(state.inner.flows.is_empty());
         assert!(state.inner.registry.list().is_empty());
         let response = router(state, None)
-            .oneshot(req("/api/v1/sessions", true)).await.unwrap();
+            .oneshot(req("/api/v1/sessions", true))
+            .await
+            .unwrap();
         let body = json_body(response).await;
         assert_eq!(body["meta"]["total"], 0);
         assert!(body["data"].as_array().unwrap().is_empty());
@@ -3157,6 +3242,10 @@ mod tests {
         assert_eq!(value["information_elements"].as_array().unwrap().len(), 1);
         assert_eq!(value["information_elements"][0]["name"], "RAN-UE-NGAP-ID");
         assert!(!value.to_string().contains("IDENTITY_WITHHELD"));
+
+        let mut provenance = json!({"source_file":"/capture/capture-00000000000000.pcapng"});
+        sanitize_value(&mut provenance);
+        assert_eq!(provenance["source_file"], "capture://REDACTED.pcapng");
     }
 
     #[tokio::test]
@@ -3272,7 +3361,8 @@ mod tests {
     }
     #[tokio::test]
     async fn lte_evidence_import_requires_operator_and_csrf() {
-        let body = serde_json::to_vec(&lte_import_payload()).unwrap();
+        // Exercise the exact outer JSON shape returned by POLARIS 0.28.0.
+        let body = serde_json::to_vec(&lte_polaris_import_envelope()).unwrap();
         let unauthenticated = router(state(), None)
             .oneshot(
                 Request::builder()
@@ -3285,7 +3375,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::FORBIDDEN);
-        assert_eq!(json_body(unauthenticated).await["error"]["code"], "OPERATOR_REQUIRED");
+        assert_eq!(
+            json_body(unauthenticated).await["error"]["code"],
+            "OPERATOR_REQUIRED"
+        );
 
         let missing_csrf = router(operator_state(), None)
             .oneshot(
@@ -3300,7 +3393,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
-        assert_eq!(json_body(missing_csrf).await["error"]["code"], "CSRF_REQUIRED");
+        assert_eq!(
+            json_body(missing_csrf).await["error"]["code"],
+            "CSRF_REQUIRED"
+        );
 
         let export_unauthenticated = router(state(), None)
             .oneshot(
@@ -3339,7 +3435,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(invalid_page.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(json_body(invalid_page).await["error"]["code"], "LTE_PAGINATION_INVALID");
+        assert_eq!(
+            json_body(invalid_page).await["error"]["code"],
+            "LTE_PAGINATION_INVALID"
+        );
     }
     #[tokio::test]
     async fn health_reports_real_dataset() {
@@ -3474,19 +3573,15 @@ mod tests {
             // EventRecord shape, not the richer public event-schema DTO used
             // by other API fixtures.
             event["parent_event_id"] = Value::Null;
-            event["timestamp"] = Value::String(format!(
-                "2026-10-31T12:00:00.{frame:09}Z"
-            ));
+            event["timestamp"] = Value::String(format!("2026-10-31T12:00:00.{frame:09}Z"));
             event["timestamp_ns"] = json!(1_793_448_000_000_000_000_u64 + frame);
             event["raw_ticks"] = json!(1_793_448_000_000_000_000_u64 + frame);
             event["source_address"] = Value::String("192.0.2.10".into());
             event["destination_address"] = Value::String("192.0.2.20".into());
-            event["source_participant"] = Value::String(
-                if *plane == "S1_MME" { "eNB" } else { "SGW" }.into(),
-            );
-            event["destination_participant"] = Value::String(
-                if *plane == "S1_MME" { "MME" } else { "eNB" }.into(),
-            );
+            event["source_participant"] =
+                Value::String(if *plane == "S1_MME" { "eNB" } else { "SGW" }.into());
+            event["destination_participant"] =
+                Value::String(if *plane == "S1_MME" { "MME" } else { "eNB" }.into());
             event["identifiers"] = json!(identifiers);
             event["source_json"] = json!({"schema_version":"1.5.0"});
             event["capture_id"] = Value::String(format!("sha256:{source_sha256}"));
@@ -4189,7 +4284,8 @@ mod tests {
     #[tokio::test]
     async fn packet_provenance_filters_resolve_one_exact_packet() {
         let fixture = state();
-        let event = primary_flow(&fixture).unwrap()
+        let event = primary_flow(&fixture)
+            .unwrap()
             .events
             .iter()
             .find(|event| event.protocol == "GTP-U")

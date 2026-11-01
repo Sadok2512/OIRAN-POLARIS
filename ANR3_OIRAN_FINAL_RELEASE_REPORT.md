@@ -1,121 +1,50 @@
 # ANR3 — OIRAN final release report
 
-Date UTC: 2026-11-01  
-Base: `hermes/final-anr3-20261101` at `92c1b08cd63202272986b64702ee97a334f010a3`  
-Working branch: `release/anr3-oiran-final-p0`  
-Scope: offline development and read-only production observations. No deployment,
-capture action, grant, UE start, traffic generation, or service restart.
+Date: 2026-11-01 UTC
+Branch: `release/anr3-oiran-final-p0`
+Base: `92c1b08cd63202272986b64702ee97a334f010a3`
 
-## Release delta
+## Release
 
-Prepared versions:
+OIRAN API/platform `2.7.2`, live-probe `0.4.1` and Analyzer `2.7.1` integrate the strict POLARIS LTE envelope adapter, provenance/deduplication checks, S1AP/S11/S1-U session and Call Flow materialization, recursive API/export privacy, bounded pagination and LTE bridge rendering. N2/N3/N4 behavior is preserved. No dataset, counter, capture reference or state is fabricated.
 
-- OIRAN API/platform `2.7.2` (from candidate API `2.7.1`).
-- live-probe `0.4.1`.
-- Analyzer `2.7.1`.
+POLARIS `0.28.1` at `8cb356a7e4264b80fb82e2f1c90b9511f581df41` produces the direct `oiran.lte-evidence-ingestion.v1` body from server-staged, rehashed `SANITIZED_APPROVED` S1-MME/S11/S1-U artifacts. OIRAN accepts this body and the stricter `polaris-oiran.lte-import-envelope.v1` wrapper. Both paths fail closed on provenance drift. No real bundle was imported.
 
-Corrections:
+Privacy admission and response boundaries reject IMSI/SUPI/SUCI/GUTI/TMSI, IMEI/IMEISV/PEI/MSISDN and K/OPc/authentication/subscriber/security keys. Canonical SHA-256 evidence identifiers remain accepted; opaque pseudonyms are not exposed as subscriber identities.
 
-1. LTE evidence admission rejects SUCI, SUPI, GUTI/TMSI, PEI,
-   IMEI/IMEISV variants and subscriber/authentication/security key labels and
-   identity-shaped values. Opaque pseudonyms remain supported.
-2. The paginated LTE session response now crosses the common recursive privacy
-   boundary.
-3. Persisted LTE Call Flows can be exported through the existing JSON/HTML
-   route. Catalog/session resolution is fail-closed and the input artifact is
-   capped at 64 MiB before allocation.
-4. Analyzer renders `S1-MME ↔ S11` and `S11 ↔ S1-U`; LTE E2E remains
-   `UNKNOWN` unless both mandatory bridges are `EXACT` or `STRONG`. Existing
-   N2/SBI/N4/N3 rendering is preserved.
-
-No DEMO dataset, generated counter, capture reference, or live state was added.
-
-## Contract and real-evidence finding
-
-OIRAN provides `POST /api/v1/lte/evidence/import`, requires Operator plus CSRF,
-and validates:
-
-- envelope `oiran.lte-evidence-ingestion.v1`;
-- evidence `oiran-polaris.lte-e2e-evidence.v1`;
-- exactly `S1_MME`, `S11`, `S1_U`;
-- capture/event SHA-256, frame bounds, decoder/event versions and confined
-  bundle paths;
-- `SANITIZED_APPROVED`, event packet provenance, deduplicated event IDs,
-  idempotent request hash and atomic publication.
-
-The POLARIS `70faacb5...` candidate does **not** publish real capture references:
-the only `set_capture_refs` occurrence is its method definition and every new
-run starts with an empty vector. It also contains no OIRAN import client,
-`capture_bindings`, or versioned ingestion envelope. Therefore no real
-POLARIS-to-OIRAN import can be certified from the supplied candidates. No
-capture reference was invented to bypass this blocker.
-
-The shared canonical schema is byte-identical between the two candidate trees;
-SHA-256:
-`4eb2a8c124845e6ebfadc32b3ad5459142b24c523e86697178b7fb2395cc1e14`.
-Wire compatibility remains partial until POLARIS implements an explicit
-adapter which emits only canonical fields and OIRAN-owned bundle bindings.
-
-## Validation
-
-Completed before this delta, on the exact `92c1b08...` base:
-
-- 14 targeted Rust/API tests PASS: privacy, LTE import/materialization,
-  correlation, provenance, bounded pagination and fail-closed memory cases.
-- Large Call Flow test: 8,192 events, peak RSS `13,082,624` bytes, PASS.
-
-Completed after the frontend delta:
+## Manual validation
 
 ```text
-npm test -- src/test/callflow-viewer.test.tsx
-Test Files 1 passed; Tests 10 passed
-
+CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_INCREMENTAL=false cargo test --locked -p live-probe --lib
+# 56 passed; 0 failed; 4 ignored
+CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_INCREMENTAL=false cargo test --locked -p oiran-api --lib
+# 41 passed; 0 failed; 0 ignored
+npm test
+# 77 passed; 0 failed
 npm run typecheck
-PASS
-
-git diff --check
-PASS
+# PASS
+npm run build
+# PASS; JS 360.39 kB
+playwright test v2_3_session_explorer.spec.ts --grep 'dataset inventory|explicit scopes|historical selection'
+# 3 passed; isolated read-only preview
 ```
 
-Post-delta Rust/API, full frontend, build, Playwright and release artifact
-results are recorded in the final committed revision of this report after the
-resource-gated execution. A first Rust compilation attempt was stopped and is
-not counted because `MemAvailable` crossed below 4 GiB. Repository-wide
-`cargo fmt --all -- --check` still reports the documented pre-existing
-formatting debt; no mass reformat was performed.
+The first post-merge Rust run found one provenance fixture rejected earlier by the stronger privacy boundary; SHA-256 identifiers were explicitly exempted and the complete suite then passed. The first API compile exposed one missing test-only import after the envelope merge; it was restored and the complete API suite passed. Four ignored live-probe tests are documented high-volume memory tests. Repository-wide inherited `rustfmt` debt remains; both modified Rust packages and `git diff --check` pass.
 
-## Read-only laboratory evidence
+Frontend artifact SHA-256: JS `a5604ec9da2b3b62ceeb570c6591d39f4e398d0674731c90727eec4719704538`, CSS `481e6c7cd2a0a229b3904b1c416f4177bd0e727da9756cff9bea3b492b8dd031`, HTML `ecd5a0129418abe86043b836276c29ceb65bdc0b3f654ca1f77fde6065b6de4e`. Final release API binary SHA-256: `8c99a76d037d6dc731f6c16349505f1f1b26e1381874c70f12d9baff450a28e1`.
 
-Production remained OIRAN API `2.5.4`. Read-only requests observed:
+## Laboratory and safety
 
-- 11 datasets and 11 reconstructed sessions, all reported as 5G SA;
-- one selected historical session with 54 chronological events;
-- observed interfaces N2/N3/N4 and protocols NGAP/PFCP/GTP-U;
-- correlation `N2_N4=STRONG`, `N4_N3=EXACT`, `E2E=STRONG`.
+Read-only production observation found 11 historical 5G SA sessions. One selected session contained 54 chronological NGAP/PFCP/GTP-U events over N2/N4/N3 with `N2_N4=STRONG`, `N4_N3=EXACT`, `E2E=STRONG`. This is historical evidence, not a new 5G certification. No approved real LTE three-plane bundle was available, so LTE remains uncertified.
 
-This proves an existing historical 5G Call Flow in the current production data
-model. It does not prove candidate deployment, current live continuity, or LTE
-E2E. No new 5G operation was run.
-
-## Resource/capture safety
-
-Initial gate: RAM available `5,062,410,240` bytes, RAM used
-`15,908,171,776` bytes, disk `57%`, 12 dumpcap. Initial PID/start-time snapshot
-SHA-256: `4fe9f419d92e43bd68cdf78cf7e36d15e7fed415245bc36bff072f23084cf9e5`.
-
-All build/test starts are conditional on available RAM >=4 GiB, used RAM <=16
-GiB and disk <85%. The 12 external dumpcap processes were not signalled,
-reconfigured or restarted. A future deployment must compare PID/start-time and
-capture rotation manifests immediately before and after; this review cannot
-certify lossless continuity across an operation that has not happened.
+The 12 external dumpcap processes were never signalled or reconfigured. Their supervisor rotated all PIDs around 09:15 UTC; the final PID/start snapshot is `b6f5a7771f9b013b9052f7eaf810693523f62937fe9b61970355ecfddb0cb8b9`. Packet-level continuity across that external rotation is not proven. Disk was 59%; all builds started above the 4 GiB available-RAM gate.
 
 ## Verdict
 
-OIRAN_RELEASE = pending final post-delta test/build results.  
-REAL_LTE_IMPORT = BLOCKED.  
-LTE_E2E = BLOCKED — no approved real three-plane LTE bundle and no POLARIS
-capture-reference publisher.  
-5G_E2E = PARTIAL — existing historical read-only evidence, no new live test.  
-DEPLOYMENT = NOT_AUTHORIZED / NOT_PERFORMED.
+OIRAN_OFFLINE_RELEASE = READY_FOR_REVIEW.
+DEPLOYMENT = NOT AUTHORIZED / NOT PERFORMED.
+LTE_E2E = BLOCKED without approved real capture bundle and deployed releases.
+5G_E2E = PARTIAL historical evidence only.
+OVERALL = BLOCKED; no `FINAL_PASS` or `REAL_PASS` is claimed.
 
 — ANR3
