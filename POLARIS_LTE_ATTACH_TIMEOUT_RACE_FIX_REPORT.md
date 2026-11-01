@@ -11,7 +11,8 @@ Release: POLARIS API 0.28.3 / srsRAN controller 0.2.3
 `READY`
 
 Le correctif est validé hors production. Aucun grant réel, simulateur, trafic,
-déploiement, changement Open5GS ou changement de captureur n'a été exécuté.
+déploiement, changement Open5GS ou commande visant un captureur n'a été
+exécuté par ANR2.
 
 ## Cause racine
 
@@ -112,11 +113,16 @@ git merge-base --is-ancestor d22b24ffc0b4fea792310084dbc7b5020aafbbff 625712e056
 exit = 0
 ```
 
-Contrôles après build :
+Contrôles finaux :
 
-- mémoire disponible : 8 539 365 376 octets ;
+- mémoire disponible : 11 947 094 016 octets ;
 - disque `/` : 70 % ;
-- dumpcap : 12 processus actifs, non modifiés.
+- dumpcap : 12 processus actifs. Les PID observés avant le build
+  (`2163366,2163376,2163379,2163384,2163397,2163411,2163412,2163430,2163432,2163450,2163452,2163469`)
+  ont tous été remplacés avant le contrôle final
+  (`2343504,2343508,2343514,2343520,2343529,2343547,2343549,2343560,2343600,2343601,2343606,2343607`).
+  ANR2 n'a envoyé aucun signal ni commande à dumpcap. La cause de ce
+  remplacement externe et la continuité sans perte ne sont pas démontrées.
 
 ## Anomalies et limites
 
@@ -124,6 +130,9 @@ Contrôles après build :
   elles ne sont pas transformées en PASS.
 - La validation LTE E2E réelle reste hors de cette mission. Ce rapport ne
   déclare ni Attach réel certifié ni `REAL_PASS`.
+- Les 12 dumpcap sont actifs, mais leur remplacement externe pendant la
+  fenêtre doit être investigué séparément ; aucune continuité de capture n'est
+  revendiquée.
 - Le déploiement de 0.28.3 nécessite une autorisation distincte.
 
 ## Résumé obligatoire
@@ -135,7 +144,7 @@ TESTS = workspace 307 PASS / 0 FAIL / 3 ignored ; source final P0 136 PASS / 0 F
 SOURCE_SHA = 625712e0560ff242563960e11cfb036ee05178c2
 BINARY_SHA256 = 547edc985607c630fc53271cace1189ac02d4ebfa8b51a89e47702d4672d1348
 RELEASE_READY = YES
-BLOCKERS = aucun bloqueur code/build offline ; LTE E2E réel et déploiement non exécutés
+BLOCKERS = aucun bloqueur code/build offline ; remplacement externe des PID dumpcap à investiguer ; LTE E2E réel et déploiement non exécutés
 VERDICT = READY
 ```
 
