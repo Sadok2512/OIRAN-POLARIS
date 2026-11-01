@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.28.1 (polaris-control-api) — 2026-11-01 — evidence scope and replay binding
+
+- Binds every server-staged LTE evidence manifest to the exact run, controller
+  profile and certification scenario before any capture reference is published.
+- Persists the admitted bundle ID with the run, makes an exact retry idempotent,
+  and rejects changed bundle or capture metadata as a publication conflict.
+- Confines capture and normalized-event files after canonicalization so a nested
+  directory symlink cannot escape the private evidence bundle.
+
 ## 0.28.0 (polaris-control-api) — 2026-11-01 — fail-closed OIRAN LTE evidence bridge
 
 - Adds an Operator+CSRF protected evidence-envelope route for completed LTE
