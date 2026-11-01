@@ -31,6 +31,11 @@ versions, endpoint roles or capture references. The only caller-selected value
 is the opaque bundle id. Publication is therefore bound to measured files
 approved by the capture finalizer, not to operator-supplied metadata.
 
+The manifest is bound to the exact `run_id`, `profile_id` and `scenario_id`.
+POLARIS persists the admitted bundle ID with the run. Replaying the same bundle
+and references is idempotent; a different bundle or changed references returns
+HTTP 409 and cannot replace the original publication.
+
 ## HTTP request
 
 ```json
@@ -45,6 +50,9 @@ it is not accepted in the HTTP body:
 ```json
 {
   "schema_version": "polaris.oiran-observed-capture-proof.v1",
+  "run_id": "lte-run-...",
+  "profile_id": "LTE-SRSUE-TEST-01",
+  "scenario_id": "lte-e2e-certification-v1",
   "capture_proofs": [{
     "capture_ref": {
       "plane": "S1_MME",
@@ -69,8 +77,9 @@ it is not accepted in the HTTP body:
 ```
 
 A valid manifest contains three proofs. Paths are safe relative bundle paths;
-symlinks, traversal, missing files, hash mismatch and manifests larger than
-1 MiB fail closed.
+final files and every parent are confined after canonicalization. Symlinks,
+traversal, missing files, hash mismatch and manifests larger than 1 MiB fail
+closed.
 
 ## Response
 

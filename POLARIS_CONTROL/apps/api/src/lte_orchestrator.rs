@@ -126,6 +126,9 @@ pub struct EvidenceEnvelopeRequest {
 #[serde(deny_unknown_fields)]
 struct ObservedEvidenceManifest {
     schema_version: String,
+    run_id: String,
+    profile_id: String,
+    scenario_id: String,
     capture_proofs: Vec<ObservedCaptureProof>,
 }
 
@@ -195,6 +198,8 @@ pub struct RunRecord {
     pub steps: Vec<StepEvidence>,
     pub observations: Vec<Observation>,
     pub capture_refs: Vec<CaptureRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_bundle_id: Option<String>,
     pub cleanup: CleanupEvidence,
 }
 
@@ -216,6 +221,7 @@ impl RunRecord {
             "cleanup_required": self.cleanup_required,
             "steps": self.steps,
             "capture_refs": self.capture_refs,
+            "evidence_bundle_id": self.evidence_bundle_id,
             "cleanup": self.cleanup,
         })
     }
@@ -317,6 +323,7 @@ impl RunStore {
             steps: canonical_steps(),
             observations: vec![],
             capture_refs: vec![],
+            evidence_bundle_id: None,
             cleanup: CleanupEvidence::default(),
         };
         self.runs.push(run.clone());
@@ -455,17 +462,45 @@ impl RunStore {
         self.persist()
     }
 
-    pub fn set_capture_refs(&mut self, run_id: &str, refs: Vec<CaptureRef>) -> Result<(), String> {
+    pub fn publish_capture_refs(
+        &mut self,
+        run_id: &str,
+        bundle_id: &str,
+        refs: Vec<CaptureRef>,
+    ) -> Result<bool, String> {
         validate_capture_refs(&refs)?;
+        if !safe_id(bundle_id) {
+            return Err("LTE_EVIDENCE_BUNDLE_ID_INVALID".into());
+        }
         let run = self.run_mut(run_id)?;
+        if run.state != RunState::Clean || run.outcome != Some(RunOutcome::Completed) {
+            return Err("LTE_EVIDENCE_RUN_NOT_ADMISSIBLE".into());
+        }
+        if let Some(existing) = &run.evidence_bundle_id {
+            return if existing == bundle_id && run.capture_refs == refs {
+                Ok(true)
+            } else {
+                Err("LTE_EVIDENCE_PUBLICATION_CONFLICT".into())
+            };
+        }
         run.capture_refs = refs;
-        for (step, plane) in [(2_usize,"S1_MME"),(4,"S1_MME"),(8,"S1_U"),(9,"S1_U"),(10,"S11")] {
+        run.evidence_bundle_id = Some(bundle_id.into());
+        for (step, plane) in [
+            (2_usize, "S1_MME"),
+            (4, "S1_MME"),
+            (8, "S1_U"),
+            (9, "S1_U"),
+            (10, "S11"),
+        ] {
             let reference = format!("capture:{plane}");
             if let Some(item) = run.steps.get_mut(step) {
-                if !item.evidence_refs.contains(&reference) { item.evidence_refs.push(reference); }
+                if !item.evidence_refs.contains(&reference) {
+                    item.evidence_refs.push(reference);
+                }
             }
         }
-        self.persist()
+        self.persist()?;
+        Ok(false)
     }
 
     fn run_mut(&mut self, id: &str) -> Result<&mut RunRecord, String> {
@@ -563,12 +598,32 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn confined_regular_file(bundle: &Path, relative: &str) -> Result<PathBuf, String> {
+    if !safe_relative_file(relative) {
+        return Err("LTE_EVIDENCE_BUNDLE_PATH_REJECTED".into());
+    }
+    let candidate = bundle.join(relative);
+    let metadata = fs::symlink_metadata(&candidate)
+        .map_err(|_| "LTE_EVIDENCE_FILE_UNAVAILABLE")?;
+    if !metadata.file_type().is_file() {
+        return Err("LTE_EVIDENCE_FILE_UNSAFE".into());
+    }
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| "LTE_EVIDENCE_FILE_UNAVAILABLE")?;
+    if !canonical.starts_with(bundle) {
+        return Err("LTE_EVIDENCE_BUNDLE_PATH_REJECTED".into());
+    }
+    Ok(canonical)
+}
+
 /// Load a proof set staged by the OIRAN capture finalizer. The HTTP caller
 /// supplies only a bundle id; hashes and capture metadata come from a private,
 /// server-owned manifest and are re-measured against the staged files.
 pub fn load_observed_evidence_bundle(
     root: &Path,
     request: EvidenceEnvelopeRequest,
+    run: &RunRecord,
 ) -> Result<EvidenceEnvelopeInput, String> {
     if !safe_id(&request.bundle_id) {
         return Err("LTE_EVIDENCE_BUNDLE_ID_INVALID".into());
@@ -596,14 +651,20 @@ pub fn load_observed_evidence_bundle(
     if manifest.schema_version != "polaris.oiran-observed-capture-proof.v1" {
         return Err("LTE_EVIDENCE_MANIFEST_SCHEMA_UNSUPPORTED".into());
     }
+    if manifest.run_id != run.run_id
+        || manifest.profile_id != run.profile_id
+        || manifest.scenario_id != run.scenario_id
+    {
+        return Err("LTE_EVIDENCE_MANIFEST_SCOPE_MISMATCH".into());
+    }
     for proof in &manifest.capture_proofs {
         if !safe_relative_file(&proof.source_file)
             || !safe_relative_file(&proof.normalized_events_file)
         {
             return Err("LTE_EVIDENCE_BUNDLE_PATH_REJECTED".into());
         }
-        let source = canonical_bundle.join(&proof.source_file);
-        let events = canonical_bundle.join(&proof.normalized_events_file);
+        let source = confined_regular_file(&canonical_bundle, &proof.source_file)?;
+        let events = confined_regular_file(&canonical_bundle, &proof.normalized_events_file)?;
         if sha256_file(&source)? != proof.capture_ref.source_file_sha256
             || sha256_file(&events)? != proof.normalized_events_sha256
         {
@@ -966,6 +1027,9 @@ mod tests {
         }
         let manifest = ObservedEvidenceManifest {
             schema_version: "polaris.oiran-observed-capture-proof.v1".into(),
+            run_id: "lte-run-envelope-12345678".into(),
+            profile_id: PROFILE_ID.into(),
+            scenario_id: SCENARIO_ID.into(),
             capture_proofs: proofs,
         };
         fs::write(
@@ -977,8 +1041,9 @@ mod tests {
         let request = EvidenceEnvelopeRequest {
             bundle_id: bundle_id.into(),
         };
+        let run = completed_run("envelope");
         assert_eq!(
-            load_observed_evidence_bundle(&root, request.clone())
+            load_observed_evidence_bundle(&root, request.clone(), &run)
                 .unwrap()
                 .capture_proofs
                 .len(),
@@ -986,20 +1051,91 @@ mod tests {
         );
         fs::write(bundle.join("S11.pcapng"), b"post-approval mutation").unwrap();
         assert_eq!(
-            load_observed_evidence_bundle(&root, request).unwrap_err(),
+            load_observed_evidence_bundle(&root, request.clone(), &run).unwrap_err(),
             "LTE_EVIDENCE_FILE_HASH_MISMATCH"
+        );
+        fs::write(bundle.join("S11.pcapng"), b"sanitized-S11").unwrap();
+        let another_run = completed_run("different");
+        assert_eq!(
+            load_observed_evidence_bundle(&root, request, &another_run).unwrap_err(),
+            "LTE_EVIDENCE_MANIFEST_SCOPE_MISMATCH"
         );
         assert_eq!(
             load_observed_evidence_bundle(
                 &root,
                 EvidenceEnvelopeRequest {
                     bundle_id: "../escape".into()
-                }
+                },
+                &run,
             )
             .unwrap_err(),
             "LTE_EVIDENCE_BUNDLE_ID_INVALID"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capture_publication_is_persistently_idempotent_and_rejects_drift() {
+        let p = path("capture-publication");
+        let _ = fs::remove_file(&p);
+        let mut store = RunStore::load(p.clone()).unwrap();
+        store
+            .create(
+                "lte-run-publication".into(),
+                "grant-publication".into(),
+                1,
+                999_999,
+                "publication-key",
+            )
+            .unwrap();
+        let refs = vec![capture("S1_MME"), capture("S11"), capture("S1_U")];
+        assert_eq!(
+            store
+                .publish_capture_refs(
+                    "lte-run-publication",
+                    "bundle-publication-01",
+                    refs.clone(),
+                )
+                .unwrap_err(),
+            "LTE_EVIDENCE_RUN_NOT_ADMISSIBLE"
+        );
+        store
+            .finalize(
+                "lte-run-publication",
+                RunOutcome::Completed,
+                CleanupEvidence {
+                    srsue_stopped: true,
+                    srsenb_stopped: true,
+                    sidecars_removed: true,
+                    epc_healthy: true,
+                    dumpcaps_preserved: true,
+                },
+                2,
+            )
+            .unwrap();
+        assert!(!store
+            .publish_capture_refs("lte-run-publication", "bundle-publication-01", refs.clone())
+            .unwrap());
+        assert!(store
+            .publish_capture_refs("lte-run-publication", "bundle-publication-01", refs.clone())
+            .unwrap());
+        assert_eq!(
+            store
+                .publish_capture_refs("lte-run-publication", "bundle-publication-02", refs)
+                .unwrap_err(),
+            "LTE_EVIDENCE_PUBLICATION_CONFLICT"
+        );
+        drop(store);
+        let store = RunStore::load(p.clone()).unwrap();
+        assert_eq!(
+            store
+                .get("lte-run-publication")
+                .unwrap()
+                .evidence_bundle_id
+                .as_deref(),
+            Some("bundle-publication-01")
+        );
+        let _ = fs::remove_file(p);
     }
     #[test]
     fn persistent_lease_and_idempotency() {
