@@ -168,6 +168,13 @@ pub trait SrsranRuntime: Send + Sync {
         protocol: &str,
         rate_mbps: u32,
     ) -> Result<TrafficMeasurement, String>;
+    fn measure_bounded_udp(
+        &self,
+        direction: &str,
+        rate_bps: u64,
+        duration_seconds: u32,
+        payload_bytes: u32,
+    ) -> Result<TrafficMeasurement, String>;
     fn ping(&self, direction: &str, packets: u32) -> Result<PingMeasurement, String>;
     /// Remove only sidecars carrying the exact run label, then prove none remain.
     fn cleanup_run_sidecars(&self, run_id: &str) -> Result<bool, String>;
@@ -508,14 +515,18 @@ impl DockerSrsranRuntime {
         ue: &Container,
         reverse: bool,
         protocol: &str,
-        rate: u32,
+        rate_bps: u64,
+        duration_seconds: u32,
+        payload_bytes: u32,
     ) -> Result<(u64, u64), String> {
         let peer = std::env::var("POLARIS_LTE_TRAFFIC_PEER_IP")
             .map_err(|_| "LTE_TRAFFIC_PEER_NOT_CONFIGURED")?;
         if peer.parse::<std::net::IpAddr>().is_err() {
             return Err("LTE_TRAFFIC_PEER_INVALID".into());
         }
-        let rate_arg = format!("{rate}M");
+        let rate_arg = rate_bps.to_string();
+        let duration_arg = duration_seconds.to_string();
+        let payload_arg = payload_bytes.to_string();
         let mut args = vec![
             "exec",
             ue.id.as_str(),
@@ -523,16 +534,19 @@ impl DockerSrsranRuntime {
             "-c",
             peer.as_str(),
             "-t",
-            "1",
+            duration_arg.as_str(),
             "-J",
         ];
         if protocol == "udp" {
-            args.extend(["-u", "-b", rate_arg.as_str()]);
+            args.extend(["-u", "-b", rate_arg.as_str(), "-l", payload_arg.as_str()]);
         }
         if reverse {
             args.push("-R");
         }
-        let output = Self::ok(self.run(&args, 5)?, "LTE_TRAFFIC_COMMAND_FAILED")?;
+        let output = Self::ok(
+            self.run(&args, u64::from(duration_seconds).saturating_add(5))?,
+            "LTE_TRAFFIC_COMMAND_FAILED",
+        )?;
         let json: serde_json::Value =
             serde_json::from_str(&output.stdout).map_err(|_| "LTE_TRAFFIC_RESULT_INVALID")?;
         let summary = if reverse {
@@ -772,16 +786,68 @@ impl SrsranRuntime for DockerSrsranRuntime {
         }
         let mut m = TrafficMeasurement::default();
         if matches!(direction, "ul" | "both") {
-            let (v, b) = self.iperf(&ue, false, protocol, rate)?;
+            let (v, b) = self.iperf(
+                &ue,
+                false,
+                protocol,
+                u64::from(rate).saturating_mul(1_000_000),
+                1,
+                1_200,
+            )?;
             m.bytes_ul = v;
             m.rate_ul_bps = Some(b);
         }
         if matches!(direction, "dl" | "both") {
-            let (v, b) = self.iperf(&ue, true, protocol, rate)?;
+            let (v, b) = self.iperf(
+                &ue,
+                true,
+                protocol,
+                u64::from(rate).saturating_mul(1_000_000),
+                1,
+                1_200,
+            )?;
             m.bytes_dl = v;
             m.rate_dl_bps = Some(b);
         }
         Ok(m)
+    }
+
+    fn measure_bounded_udp(
+        &self,
+        direction: &str,
+        rate_bps: u64,
+        duration_seconds: u32,
+        payload_bytes: u32,
+    ) -> Result<TrafficMeasurement, String> {
+        if !matches!(direction, "ul" | "dl")
+            || rate_bps == 0
+            || rate_bps > 1_000_000
+            || duration_seconds == 0
+            || duration_seconds > 30
+            || payload_bytes == 0
+            || payload_bytes > 1_200
+        {
+            return Err("LTE_TRAFFIC_PARAMETERS_INVALID".into());
+        }
+        let ue = self.owned(Target::Ue)?;
+        if ue.state != "running" {
+            return Err("LTE_UE_NOT_RUNNING".into());
+        }
+        let reverse = direction == "dl";
+        let (bytes, bps) = self.iperf(
+            &ue,
+            reverse,
+            "udp",
+            rate_bps,
+            duration_seconds,
+            payload_bytes,
+        )?;
+        Ok(TrafficMeasurement {
+            bytes_ul: if reverse { 0 } else { bytes },
+            bytes_dl: if reverse { bytes } else { 0 },
+            rate_ul_bps: (!reverse).then_some(bps),
+            rate_dl_bps: reverse.then_some(bps),
+        })
     }
 
     fn ping(&self, direction: &str, packets: u32) -> Result<PingMeasurement, String> {
@@ -992,6 +1058,33 @@ impl SrsranRuntime for MockSrsranRuntime {
             rate_dl_bps: matches!(direction, "dl" | "both").then_some(u64::from(rate) * 1_000_000),
         })
     }
+    fn measure_bounded_udp(
+        &self,
+        direction: &str,
+        rate_bps: u64,
+        duration_seconds: u32,
+        payload_bytes: u32,
+    ) -> Result<TrafficMeasurement, String> {
+        if !matches!(direction, "ul" | "dl")
+            || rate_bps == 0
+            || rate_bps > 1_000_000
+            || duration_seconds == 0
+            || duration_seconds > 30
+            || payload_bytes == 0
+            || payload_bytes > 1_200
+        {
+            return Err("LTE_TRAFFIC_PARAMETERS_INVALID".into());
+        }
+        let bytes = rate_bps
+            .saturating_mul(u64::from(duration_seconds))
+            .saturating_div(8);
+        Ok(TrafficMeasurement {
+            bytes_ul: if direction == "ul" { bytes } else { 0 },
+            bytes_dl: if direction == "dl" { bytes } else { 0 },
+            rate_ul_bps: (direction == "ul").then_some(rate_bps),
+            rate_dl_bps: (direction == "dl").then_some(rate_bps),
+        })
+    }
     fn ping(&self, _direction: &str, packets: u32) -> Result<PingMeasurement, String> {
         Ok(PingMeasurement {
             sent: packets,
@@ -1070,6 +1163,59 @@ mod tests {
         assert!(runtime.cleanup_run_sidecars("lte-run-test").unwrap());
         *runtime.sidecars_absent.lock().unwrap() = false;
         assert!(!runtime.cleanup_run_sidecars("lte-run-test").unwrap());
+    }
+    #[test]
+    fn bounded_udp_rejects_any_value_above_certification_caps() {
+        let runtime = MockSrsranRuntime::default();
+        assert_eq!(
+            runtime.measure_bounded_udp("ul", 1_000_001, 1, 1_200),
+            Err("LTE_TRAFFIC_PARAMETERS_INVALID".into())
+        );
+        assert_eq!(
+            runtime.measure_bounded_udp("dl", 1_000_000, 31, 1_200),
+            Err("LTE_TRAFFIC_PARAMETERS_INVALID".into())
+        );
+        assert_eq!(
+            runtime.measure_bounded_udp("ul", 1_000_000, 1, 1_201),
+            Err("LTE_TRAFFIC_PARAMETERS_INVALID".into())
+        );
+    }
+    #[test]
+    fn udp_iperf_command_enforces_payload_block_length() {
+        let executor = Arc::new(ScriptExecutor::default());
+        executor.outputs.lock().unwrap().push_back(output(
+            0,
+            r#"{"end":{"sum_sent":{"bytes":125000,"bits_per_second":1000000}}}"#,
+        ));
+        executor.outputs.lock().unwrap().push_back(output(
+            0,
+            r#"{"end":{"sum_sent":{"bytes":125000,"bits_per_second":1000000}}}"#,
+        ));
+        let runtime = DockerSrsranRuntime {
+            executor: executor.clone(),
+            ledger: PathBuf::from("/unused-in-command-test"),
+        };
+        let ue = Container {
+            id: "owned-ue".into(),
+            state: "running".into(),
+            health: "healthy".into(),
+            error: String::new(),
+        };
+        let previous_peer = std::env::var_os("POLARIS_LTE_TRAFFIC_PEER_IP");
+        std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", "192.0.2.1");
+        let udp_result = runtime.iperf(&ue, false, "udp", 750_000, 7, 900);
+        let tcp_result = runtime.iperf(&ue, false, "tcp", 1_000_000, 1, 1_200);
+        match previous_peer {
+            Some(value) => std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", value),
+            None => std::env::remove_var("POLARIS_LTE_TRAFFIC_PEER_IP"),
+        }
+        udp_result.unwrap();
+        tcp_result.unwrap();
+        let calls = executor.calls.lock().unwrap();
+        assert!(calls[0].windows(2).any(|args| args == ["-l", "900"]));
+        assert!(calls[0].windows(2).any(|args| args == ["-b", "750000"]));
+        assert!(calls[0].windows(2).any(|args| args == ["-t", "7"]));
+        assert!(!calls[1].iter().any(|arg| arg == "-u" || arg == "-l"));
     }
     #[test]
     fn host_timeout_is_fail_closed() {

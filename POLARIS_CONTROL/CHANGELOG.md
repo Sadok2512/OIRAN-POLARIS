@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.27.1 (polaris-control-api) — 2026-11-01 — activation revocation hardening
+
+- Makes Administrator profile disable revoke the bound Certification Grant V2
+  before clearing temporary activation.
+- Rejects idempotent activation retries after grant revocation, preventing the
+  original Operator request from restoring an Administrator-disabled profile.
+- Serializes LTE start and cleanup, rechecks the consumed Grant immediately
+  before each process start, and fails closed when expiry or cancellation wins.
+- Applies the exact Grant V2 ping/UDP limits to runtime commands, including
+  rate, duration and payload bounds for both traffic directions.
+- Enforces both the 4 GiB available-memory reserve and the 16 GiB used-memory
+  ceiling before LTE starts, with explicit measurement errors.
+- Preserves the activation request/response schema, certification envelope,
+  grant-independent cleanup and existing UERANSIM/5G behavior.
+
 ## 0.27.0 (polaris-control-api) — 2026-11-01 — temporary Operator LTE activation
 
 - Adds a persisted, one-time temporary activation for only

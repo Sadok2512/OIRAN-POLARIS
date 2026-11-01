@@ -59,6 +59,7 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,
 };
+use tokio::sync::Mutex as AsyncMutex;
 use ue_profiles::{
     BulkProfileInput, ManagedUeProfile, ProfileMutationInput, ProfileStore, ScenarioAssignmentInput,
 };
@@ -130,6 +131,7 @@ pub struct AppState {
     lte_grants_v2: Arc<Mutex<lte_grant::GrantStore>>,
     lte_runs_v2: Arc<Mutex<lte_orchestrator::RunStore>>,
     lte_profile_registry: Arc<Mutex<lte_grant::ProfileRegistry>>,
+    lte_lifecycle: Arc<AsyncMutex<()>>,
     // 0.19.0 (#37) — per-UE ring buffer of the last 20 events (register,
     // PDU setup, transfer_verify, iperf3, detach, …). Exposed by the
     // Activity surface; read-only to consumers.
@@ -3287,6 +3289,7 @@ impl AppState {
             lte_grants_v2: Arc::new(Mutex::new(lte_grants_v2)),
             lte_runs_v2: Arc::new(Mutex::new(lte_runs_v2)),
             lte_profile_registry: Arc::new(Mutex::new(lte_profile_registry)),
+            lte_lifecycle: Arc::new(AsyncMutex::new(())),
             activity_events: Arc::new(activity::ActivityEventStore::new()),
             activity_rate_cache: Arc::new(Mutex::new(BTreeMap::new())),
             traffic_manager: Arc::new(traffic_sessions::TrafficSessionManager::new()),
@@ -4566,6 +4569,40 @@ fn lte_run_is_terminal_or_cancelled(state: &AppState, run_id: &str) -> bool {
         })
 }
 
+fn lte_run_execution_constraints(
+    state: &AppState,
+    run_id: &str,
+    deadline_at_epoch_ms: u64,
+    now_ms: u64,
+) -> Result<lte_grant::GrantConstraints, String> {
+    if now_ms >= deadline_at_epoch_ms {
+        return Err("LTE_GRANT_EXPIRED_BEFORE_START".into());
+    }
+    let run_is_cancelled = state
+        .lte_runs_v2
+        .lock()
+        .ok()
+        .and_then(|store| store.get(run_id).cloned())
+        .map(|run| run.cancel_requested || run.state.terminal())
+        .unwrap_or(true);
+    if run_is_cancelled {
+        return Err("LTE_RUN_CANCELLED_BEFORE_START".into());
+    }
+    state
+        .lte_grants_v2
+        .lock()
+        .map_err(|_| "LTE_GRANT_STORE_UNAVAILABLE".to_string())?
+        .records()
+        .iter()
+        .find(|grant| grant.run_id.as_deref() == Some(run_id))
+        .filter(|grant| {
+            grant.state == lte_grant::GrantState::Consumed
+                && now_ms < grant.expires_at_epoch_ms
+        })
+        .map(|grant| grant.constraints.clone())
+        .ok_or_else(|| "LTE_GRANT_INACTIVE".into())
+}
+
 async fn lte_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match lte_status_value(&state) {
         Ok(status) => (StatusCode::OK, Json(status)),
@@ -4663,6 +4700,39 @@ async fn update_lte_profile(
             StatusCode::NOT_FOUND,
             Json(json!({"error":"LTE_PROFILE_NOT_FOUND"})),
         );
+    }
+    if !input.enabled {
+        let activation_grant_id = state
+            .lte_profile_registry
+            .lock()
+            .ok()
+            .and_then(|registry| {
+                registry
+                    .profile()
+                    .temporary_activation
+                    .as_ref()
+                    .map(|activation| activation.grant_id.clone())
+            });
+        if let Some(grant_id) = activation_grant_id {
+            if let Err(error) = state
+                .lte_grants_v2
+                .lock()
+                .map_err(|_| "LTE_GRANT_STORE_UNAVAILABLE".to_string())
+                .and_then(|mut store| store.revoke(&grant_id))
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":error})),
+                );
+            }
+            audit(
+                &state,
+                &identity.role,
+                "LTE_TEMPORARY_ACTIVATION_REVOKE",
+                "ADMINISTRATOR_DISABLED",
+                Some(&grant_id),
+            );
+        }
     }
     let updated = state
         .lte_profile_registry
@@ -5036,6 +5106,24 @@ async fn create_lte_run(
             now,
         )
     });
+    let lifecycle_guard = state.lte_lifecycle.lock().await;
+    if let Err(error) = lte_run_execution_constraints(
+        &state,
+        &run.run_id,
+        run.deadline_at_epoch_ms,
+        epoch_millis(),
+    ) {
+        drop(lifecycle_guard);
+        let _ = state
+            .lte_runs_v2
+            .lock()
+            .map(|mut store| store.fail_step(&run.run_id, 1, &error, epoch_millis()));
+        let _ = cleanup_lte_run(&state, &run.run_id, lte_orchestrator::RunOutcome::Failed).await;
+        return (
+            StatusCode::GONE,
+            Json(json!({"error":error,"run_id":run.run_id,"cleanup_required":false})),
+        );
+    }
     let runtime = state.srsran_runtime.clone();
     let enb_start =
         tokio::task::spawn_blocking(move || runtime.start(srsran_controller::Target::Enb)).await;
@@ -5043,6 +5131,7 @@ async fn create_lte_run(
         Ok(result) => result,
         Err(_) => Err("SRSRAN_START_WORKER_FAILED".into()),
     };
+    drop(lifecycle_guard);
     if let Err(error) = enb_start {
         let _ = state.lte_runs_v2.lock().map(|mut store| {
             store.fail_step(&run.run_id, 1, "LTE_ENB_START_FAILED", epoch_millis())
@@ -5166,6 +5255,7 @@ async fn cleanup_lte_run(
         .lte_grants_v2
         .lock()
         .map(|mut store| store.set_run_state(run_id, "CANCEL_REQUESTED"));
+    let lifecycle_guard = state.lte_lifecycle.lock().await;
     let runtime = state.srsran_runtime.clone();
     let run = run_id.to_string();
     let cleanup_result = tokio::task::spawn_blocking(move || {
@@ -5206,6 +5296,7 @@ async fn cleanup_lte_run(
         )
     })
     .await;
+    drop(lifecycle_guard);
     let (srsue_stopped, srsenb_stopped, sidecars_removed, epc_healthy) =
         cleanup_result.unwrap_or((false, false, false, false));
     let cleanup = lte_orchestrator::CleanupEvidence {
@@ -5266,6 +5357,19 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
         }
     }
 
+    let constraints = match lte_run_execution_constraints(
+        &state,
+        &run_id,
+        deadline_at_epoch_ms,
+        epoch_millis(),
+    ) {
+        Ok(constraints) => constraints,
+        Err(_) => {
+            let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
+            return;
+        }
+    };
+
     let s1_deadline = epoch_millis()
         .saturating_add(40_000)
         .min(deadline_at_epoch_ms);
@@ -5316,9 +5420,23 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             epoch_millis(),
         )
     });
+    let lifecycle_guard = state.lte_lifecycle.lock().await;
+    if lte_run_execution_constraints(
+        &state,
+        &run_id,
+        deadline_at_epoch_ms,
+        epoch_millis(),
+    )
+    .is_err()
+    {
+        drop(lifecycle_guard);
+        let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
+        return;
+    }
     let runtime = state.srsran_runtime.clone();
     let ue_start =
         tokio::task::spawn_blocking(move || runtime.start(srsran_controller::Target::Ue)).await;
+    drop(lifecycle_guard);
     if !matches!(ue_start, Ok(Ok(()))) {
         let _ = state
             .lte_runs_v2
@@ -5461,7 +5579,8 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
         }
         let runtime = state.srsran_runtime.clone();
         let dir = direction.to_string();
-        match tokio::task::spawn_blocking(move || runtime.ping(&dir, 5)).await {
+        let packets = constraints.ping.max_packets_per_direction;
+        match tokio::task::spawn_blocking(move || runtime.ping(&dir, packets)).await {
             Ok(Ok(value)) => {
                 let _=state.lte_runs_v2.lock().map(|mut store|{store.observe(&run_id,step,lte_observation(step as u64,"bounded_ping",json!({"direction":direction,"sent":value.sent,"received":value.received})),epoch_millis())?;store.advance(&run_id,lte_orchestrator::RunState::TrafficRunning)});
                 set_state(&state, &run_id, "TRAFFIC_RUNNING").await;
@@ -5506,11 +5625,33 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Cancelled).await;
             return;
         }
+        let remaining_seconds = deadline_at_epoch_ms
+            .saturating_sub(epoch_millis())
+            .saturating_div(1_000)
+            .saturating_sub(5);
+        let duration_seconds = u64::from(
+            constraints.udp.max_duration_seconds_per_direction,
+        )
+        .min(remaining_seconds) as u32;
+        if duration_seconds == 0 {
+            let _ = state
+                .lte_runs_v2
+                .lock()
+                .map(|mut store| store.fail_step(&run_id, step, "LTE_GRANT_DEADLINE_EXHAUSTED", epoch_millis()));
+            let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
+            return;
+        }
         let runtime = state.srsran_runtime.clone();
         let dir = direction.to_string();
-        match tokio::task::spawn_blocking(move || runtime.measure_traffic(&dir, "udp", 1)).await {
+        let rate_bps = constraints.udp.max_rate_bps_per_direction;
+        let payload_bytes = constraints.udp.max_payload_bytes;
+        match tokio::task::spawn_blocking(move || {
+            runtime.measure_bounded_udp(&dir, rate_bps, duration_seconds, payload_bytes)
+        })
+        .await
+        {
             Ok(Ok(value)) => {
-                let _=state.lte_runs_v2.lock().map(|mut store|{store.observe(&run_id,step,lte_observation(step as u64,"bounded_udp",json!({"direction":direction,"rate_limit_bps":1_000_000,"duration_limit_seconds":10,"payload_max_bytes":1200,"bytes_ul":value.bytes_ul,"bytes_dl":value.bytes_dl})),epoch_millis())?;store.advance(&run_id,lte_orchestrator::RunState::TrafficRunning)});
+                let _=state.lte_runs_v2.lock().map(|mut store|{store.observe(&run_id,step,lte_observation(step as u64,"bounded_udp",json!({"direction":direction,"rate_limit_bps":rate_bps,"duration_limit_seconds":duration_seconds,"payload_max_bytes":payload_bytes,"bytes_ul":value.bytes_ul,"bytes_dl":value.bytes_dl})),epoch_millis())?;store.advance(&run_id,lte_orchestrator::RunState::TrafficRunning)});
             }
             _ => {
                 let _ = state.lte_runs_v2.lock().map(|mut store| {
@@ -5651,20 +5792,37 @@ fn lte_start_resource_gate(state: &AppState) -> Result<Value, String> {
         return Err("DISK_STOP_THRESHOLD".into());
     }
     let memory = memory_stats();
-    let available = memory["available_bytes"].as_u64().unwrap_or(0);
-    if available < 4_294_967_296 {
-        return Err("LTE_MEMORY_RESERVE_NOT_MET".into());
-    }
+    let (used, available) = validate_lte_memory(&memory)?;
     let dumpcaps = external_dumpcap_count();
     if dumpcaps != 12 {
         return Err("LTE_EXTERNAL_CAPTURE_SET_MISMATCH".into());
     }
     Ok(json!({
         "disk_usage_percent":f64::from(usage)/100.0,
+        "memory_used_bytes":used,
+        "memory_used_max_bytes":17_179_869_184_u64,
         "memory_available_bytes":available,
         "memory_required_bytes":4_294_967_296_u64,
         "external_dumpcap_count":dumpcaps
     }))
+}
+
+fn validate_lte_memory(memory: &Value) -> Result<(u64, u64), String> {
+    const MIN_AVAILABLE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    const MAX_USED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+    let used = memory["used_bytes"]
+        .as_u64()
+        .ok_or_else(|| "LTE_MEMORY_MEASUREMENT_UNAVAILABLE".to_string())?;
+    let available = memory["available_bytes"]
+        .as_u64()
+        .ok_or_else(|| "LTE_MEMORY_MEASUREMENT_UNAVAILABLE".to_string())?;
+    if available < MIN_AVAILABLE_BYTES {
+        return Err("LTE_MEMORY_RESERVE_NOT_MET".into());
+    }
+    if used > MAX_USED_BYTES {
+        return Err("LTE_MEMORY_USED_LIMIT_EXCEEDED".into());
+    }
+    Ok((used, available))
 }
 
 fn external_dumpcap_count() -> usize {
@@ -10257,6 +10415,8 @@ async fn post_traffic_session(
         .ue_ids
         .iter()
         .any(|id| id == srsran_controller::LTE_UE_ID);
+    let mut lte_constraints = None;
+    let mut lte_grant_id = None;
     if !lte_request && !active_grant_covers(&state, &request.ue_ids) {
         audit(
             &state,
@@ -10339,6 +10499,8 @@ async fn post_traffic_session(
                 Json(json!({"error":"LTE_TRAFFIC_OUTSIDE_GRANT_CONSTRAINTS"})),
             );
         }
+        lte_grant_id = Some(grant.grant_id.clone());
+        lte_constraints = Some(grant.constraints.clone());
     }
     let session = match state.traffic_manager.start(request.clone()) {
         Ok(session) => session,
@@ -10359,7 +10521,13 @@ async fn post_traffic_session(
         );
     }
     if lte_request {
-        spawn_lte_traffic_driver(state.clone(), session.session_id.clone(), request);
+        spawn_lte_traffic_driver(
+            state.clone(),
+            session.session_id.clone(),
+            request,
+            lte_grant_id.expect("validated LTE grant id"),
+            lte_constraints.expect("validated LTE grant constraints"),
+        );
     } else {
         spawn_traffic_driver(state.clone(), session.session_id.clone(), request);
     }
@@ -10380,6 +10548,8 @@ fn spawn_lte_traffic_driver(
     state: Arc<AppState>,
     session_id: String,
     request: traffic_sessions::SessionRequest,
+    grant_id: String,
+    constraints: lte_grant::GrantConstraints,
 ) {
     tokio::spawn(async move {
         let direction = match request.direction {
@@ -10394,6 +10564,29 @@ fn spawn_lte_traffic_driver(
         let mut cumulative_ul = 0u64;
         let mut cumulative_dl = 0u64;
         for _ in 0..request.duration_s.max(1) {
+            let now = epoch_millis();
+            let grant_active = state
+                .lte_grants_v2
+                .lock()
+                .ok()
+                .and_then(|store| {
+                    store
+                        .records()
+                        .iter()
+                        .find(|grant| grant.grant_id == grant_id)
+                        .map(|grant| {
+                            grant.state == lte_grant::GrantState::Consumed
+                                && now < grant.expires_at_epoch_ms
+                                && grant.constraints == constraints
+                        })
+                })
+                .unwrap_or(false);
+            if !grant_active {
+                let _ = state
+                    .traffic_manager
+                    .fail(&session_id, "LTE_GRANT_INACTIVE".into());
+                return;
+            }
             if !state
                 .traffic_manager
                 .get(&session_id)
@@ -10404,9 +10597,27 @@ fn spawn_lte_traffic_driver(
             let runtime = state.srsran_runtime.clone();
             let direction = direction.to_string();
             let protocol = protocol.to_string();
-            let rate = request.rate_mbps;
+            let rate_bps = u64::from(request.rate_mbps).saturating_mul(1_000_000);
+            let payload_bytes = constraints.udp.max_payload_bytes;
             let measured = tokio::task::spawn_blocking(move || {
-                runtime.measure_traffic(&direction, &protocol, rate)
+                if protocol == "udp" && direction == "both" {
+                    let ul = runtime.measure_bounded_udp("ul", rate_bps, 1, payload_bytes)?;
+                    let dl = runtime.measure_bounded_udp("dl", rate_bps, 1, payload_bytes)?;
+                    Ok(srsran_controller::TrafficMeasurement {
+                        bytes_ul: ul.bytes_ul,
+                        bytes_dl: dl.bytes_dl,
+                        rate_ul_bps: ul.rate_ul_bps,
+                        rate_dl_bps: dl.rate_dl_bps,
+                    })
+                } else if protocol == "udp" {
+                    runtime.measure_bounded_udp(&direction, rate_bps, 1, payload_bytes)
+                } else {
+                    runtime.measure_traffic(
+                        &direction,
+                        &protocol,
+                        u32::try_from(rate_bps / 1_000_000).unwrap_or(u32::MAX),
+                    )
+                }
             })
             .await;
             let measurement = match measured {
@@ -14073,6 +14284,7 @@ mod p0_tests {
                 )
                 .unwrap(),
             )),
+            lte_lifecycle: Arc::new(AsyncMutex::new(())),
             activity_events: Arc::new(activity::ActivityEventStore::new()),
             activity_rate_cache: Arc::new(Mutex::new(BTreeMap::new())),
             traffic_manager: Arc::new(traffic_sessions::TrafficSessionManager::new()),
@@ -14769,6 +14981,50 @@ mod p0_tests {
             .await
             .unwrap();
         assert_eq!(activated.status(), StatusCode::CREATED);
+        let (admin_cookie, admin_csrf) =
+            login_session(&application, "administrator-test", ADMIN_PASSWORD).await;
+        let disabled = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri("/api/v1/lte/profiles/LTE-SRSUE-TEST-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, admin_cookie)
+                    .header("x-csrf-token", admin_csrf)
+                    .body(Body::from(r#"{"enabled":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::OK);
+        assert_eq!(
+            test_state
+                .lte_grants_v2
+                .lock()
+                .unwrap()
+                .get(grant["grant_id"].as_str().unwrap())
+                .unwrap()
+                .state,
+            lte_grant::GrantState::Revoked
+        );
+        let disabled_replay = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(activation_uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .header("idempotency-key", "activation-security-1")
+                    .header("x-polaris-grant-nonce", "n".repeat(43))
+                    .body(Body::from(json!({"grant_id":grant["grant_id"]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled_replay.status(), StatusCode::CONFLICT);
         let replay = application
             .clone()
             .oneshot(
@@ -20291,5 +20547,36 @@ mod p0_tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["error"], "TRAFFIC_SESSION_NOT_FOUND");
+    }
+
+    #[test]
+    fn lte_memory_gate_enforces_reserve_and_used_ceiling() {
+        const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
+        const SIXTEEN_GIB: u64 = 16 * 1024 * 1024 * 1024;
+        assert_eq!(
+            validate_lte_memory(&json!({
+                "used_bytes": SIXTEEN_GIB,
+                "available_bytes": FOUR_GIB - 1
+            })),
+            Err("LTE_MEMORY_RESERVE_NOT_MET".into())
+        );
+        assert_eq!(
+            validate_lte_memory(&json!({
+                "used_bytes": SIXTEEN_GIB + 1,
+                "available_bytes": FOUR_GIB
+            })),
+            Err("LTE_MEMORY_USED_LIMIT_EXCEEDED".into())
+        );
+        assert_eq!(
+            validate_lte_memory(&json!({
+                "used_bytes": SIXTEEN_GIB,
+                "available_bytes": FOUR_GIB
+            })),
+            Ok((SIXTEEN_GIB, FOUR_GIB))
+        );
+        assert_eq!(
+            validate_lte_memory(&json!({"available_bytes": FOUR_GIB})),
+            Err("LTE_MEMORY_MEASUREMENT_UNAVAILABLE".into())
+        );
     }
 }

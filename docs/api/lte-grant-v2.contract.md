@@ -14,12 +14,42 @@ shape, but can never authorize LTE. Mixed V1/V2 request bodies return
 |---|---|---|---|---|
 | GET | `/api/v1/lte/profiles/LTE-SRSUE-TEST-01` | Viewer+ | no | Sanitized persistent profile and current configuration hash |
 | PATCH | `/api/v1/lte/profiles/LTE-SRSUE-TEST-01` | Administrator | yes | Enable/disable the profile; body `{ "enabled": boolean }` |
+| POST | `/api/v1/lte/profiles/LTE-SRSUE-TEST-01/certification-activation` | Operator+ | yes | Temporarily activate the exact Certification Grant V2; requires `Idempotency-Key` and `X-Polaris-Grant-Nonce` |
 | POST | `/api/v1/live/grant` | Operator+ | yes | Issue V1 or exact V2 grant; V2 requires `Idempotency-Key` |
 | GET | `/api/v1/live/grant` | Viewer+ | no | V1 `grants` plus sanitized V2 `lte_grants` |
 | DELETE | `/api/v1/live/grant/:grant_id` | Operator+ | yes | Durable revocation |
 | POST | `/api/v1/lte/runs` | Operator+ | yes | Atomically consume V2 grant; requires `Idempotency-Key` and `X-Polaris-Grant-Nonce` |
 | GET | `/api/v1/lte/runs/:run_id` | Viewer+ | no | Sanitized run/evidence state |
 | POST | `/api/v1/lte/runs/:run_id/stop` | Operator+ | yes | Idempotent cleanup, valid after expiry/revocation |
+| POST | `/api/v1/lte/runs/:run_id/emergency-stop` | Operator+ | yes | Alias of Stop for grant-independent emergency cleanup |
+
+## Certification activation schema
+
+The activation body is exactly:
+
+```json
+{"grant_id":"grant-<opaque>"}
+```
+
+It accepts only an unexpired `CERTIFICATION_RUN` grant bound to the same
+authenticated role/session, nonce, profile revision, scenario and certified
+configuration/Compose digests. A first success returns HTTP `201`; an
+idempotent retry while the grant remains active returns HTTP `200`:
+
+```json
+{
+  "profile_id":"LTE-SRSUE-TEST-01",
+  "state":"TEMPORARILY_ENABLED",
+  "grant_id":"grant-<opaque>",
+  "expires_at_epoch_ms":0,
+  "remaining_seconds":0,
+  "idempotent":false
+}
+```
+
+Administrator disable, grant revocation/expiry, Stop, cleanup, failure and API
+restart clear the activation. Administrator disable also revokes the bound
+grant; a prior idempotency key cannot restore the activation.
 
 The V2 request/response schemas and bounds are those in
 `/root/LTE_GRANT_CONTRACT.md`. Nonces are hashed before persistence and never

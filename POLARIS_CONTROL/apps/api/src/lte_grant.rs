@@ -610,6 +610,9 @@ impl GrantStore {
             return Err("LIVE_GRANT_NONCE_INVALID".into());
         }
         if let Some(existing) = grant.activation_idempotency_key_sha256.as_deref() {
+            if !matches!(grant.state, GrantState::Issued | GrantState::Consumed) {
+                return Err("LIVE_GRANT_REPLAYED".into());
+            }
             return if existing == key_hash {
                 Ok((grant.clone(), true))
             } else {
@@ -1175,6 +1178,20 @@ mod tests {
                     &"n".repeat(43),
                     "activation-request-2",
                     102,
+                    "operator",
+                    "session-a",
+                )
+                .unwrap_err(),
+            "LIVE_GRANT_REPLAYED"
+        );
+        store.revoke("grant-1").unwrap();
+        assert_eq!(
+            store
+                .authorize_temporary_activation(
+                    "grant-1",
+                    &"n".repeat(43),
+                    "activation-request-1",
+                    103,
                     "operator",
                     "session-a",
                 )
