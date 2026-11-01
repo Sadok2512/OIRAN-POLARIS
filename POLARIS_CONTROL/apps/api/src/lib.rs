@@ -130,6 +130,7 @@ pub struct AppState {
     live_grants: Arc<Mutex<Vec<LiveGrant>>>,
     lte_grants_v2: Arc<Mutex<lte_grant::GrantStore>>,
     lte_runs_v2: Arc<Mutex<lte_orchestrator::RunStore>>,
+    lte_evidence_release_root: PathBuf,
     lte_evidence_bundle_root: PathBuf,
     lte_profile_registry: Arc<Mutex<lte_grant::ProfileRegistry>>,
     lte_lifecycle: Arc<AsyncMutex<()>>,
@@ -3289,6 +3290,9 @@ impl AppState {
             live_grants: Arc::new(Mutex::new(Vec::new())),
             lte_grants_v2: Arc::new(Mutex::new(lte_grants_v2)),
             lte_runs_v2: Arc::new(Mutex::new(lte_runs_v2)),
+            lte_evidence_release_root: std::env::var("POLARIS_LTE_EVIDENCE_RELEASE_ROOT")
+                .unwrap_or_else(|_| "/var/lib/polaris-control/lte-evidence-releases".into())
+                .into(),
             lte_evidence_bundle_root: std::env::var("POLARIS_LTE_EVIDENCE_BUNDLE_ROOT")
                 .unwrap_or_else(|_| "/var/lib/polaris-control/lte-evidence-bundles".into())
                 .into(),
@@ -5887,6 +5891,79 @@ async fn publish_lte_evidence_envelope(
         } else {
             "APPROVED"
         },
+        Some(&run_id),
+    );
+    (StatusCode::OK, Json(serde_json::to_value(envelope).unwrap_or(Value::Null)))
+}
+
+async fn finalize_lte_evidence(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(run_id): AxumPath<String>,
+    Json(request): Json<lte_orchestrator::EvidenceFinalizeRequest>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let run = match state
+        .lte_runs_v2
+        .lock()
+        .ok()
+        .and_then(|store| store.get(&run_id).cloned())
+    {
+        Some(run) => run,
+        None => return (StatusCode::NOT_FOUND, Json(json!({"error":"LTE_RUN_NOT_FOUND"}))),
+    };
+    let input = match lte_orchestrator::finalize_authorized_evidence_release(
+        &state.lte_evidence_release_root,
+        &state.lte_evidence_bundle_root,
+        request,
+        &run,
+    ) {
+        Ok(input) => input,
+        Err(error) => {
+            audit(&state, &identity.role, "LTE_EVIDENCE_FINALIZE", &error, Some(&run_id));
+            let status = if error == "LTE_EVIDENCE_FINALIZATION_CONFLICT"
+                || error == "LTE_EVIDENCE_PUBLICATION_CONFLICT"
+            {
+                StatusCode::CONFLICT
+            } else if error.ends_with("ROOT_UNAVAILABLE") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            };
+            return (status, Json(json!({"error":error})));
+        }
+    };
+    let envelope = match lte_orchestrator::build_oiran_evidence_envelope(&run, input) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            audit(&state, &identity.role, "LTE_EVIDENCE_FINALIZE", &error, Some(&run_id));
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":error})));
+        }
+    };
+    let refs = envelope.evidence.capture_refs.clone();
+    let publication = state
+        .lte_runs_v2
+        .lock()
+        .map_err(|_| "LTE_RUN_STORE_UNAVAILABLE".to_string())
+        .and_then(|mut store| store.publish_capture_refs(&run_id, &envelope.bundle_id, refs));
+    let idempotent = match publication {
+        Ok(value) => value,
+        Err(error) => {
+            let status = if error == "LTE_EVIDENCE_PUBLICATION_CONFLICT" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return (status, Json(json!({"error":error})));
+        }
+    };
+    audit(
+        &state,
+        &identity.role,
+        "LTE_EVIDENCE_FINALIZE",
+        if idempotent { "IDEMPOTENT" } else { "APPROVED" },
         Some(&run_id),
     );
     (StatusCode::OK, Json(serde_json::to_value(envelope).unwrap_or(Value::Null)))
@@ -13695,6 +13772,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             "/lte/runs/:run_id/evidence-envelope",
             post(publish_lte_evidence_envelope),
         )
+        .route(
+            "/lte/runs/:run_id/evidence-finalize",
+            post(finalize_lte_evidence),
+        )
         .route("/lte/runs/:run_id/stop", post(stop_lte_run))
         .route("/lte/runs/:run_id/emergency-stop", post(stop_lte_run))
         .route("/lte/logs", get(lte_logs))
@@ -14468,6 +14549,7 @@ mod p0_tests {
             lte_runs_v2: Arc::new(Mutex::new(
                 lte_orchestrator::RunStore::load(root.join("lte-runs-v2.json")).unwrap(),
             )),
+            lte_evidence_release_root: root.join("lte-evidence-releases"),
             lte_evidence_bundle_root: root.join("lte-evidence-bundles"),
             lte_profile_registry: Arc::new(Mutex::new(
                 lte_grant::ProfileRegistry::load_or_seed(
@@ -20680,6 +20762,99 @@ mod p0_tests {
         assert_eq!(json["schema_version"], lte_orchestrator::OIRAN_INGESTION_SCHEMA);
         assert_eq!(json["evidence"]["schema_version"], lte_orchestrator::EVIDENCE_SCHEMA);
         assert_eq!(json["capture_bindings"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn lte_evidence_finalizer_requires_operator_csrf_and_returns_conflict_on_drift() {
+        let test_state = state();
+        let run_id = "lte-run-finalizer-http-01";
+        let run = {
+            let mut store = test_state.lte_runs_v2.lock().unwrap();
+            store
+                .create(run_id.into(), "grant-http".into(), 1, 999_999, "finalizer-http-key")
+                .unwrap();
+            store
+                .finalize(
+                    run_id,
+                    lte_orchestrator::RunOutcome::Completed,
+                    lte_orchestrator::CleanupEvidence {
+                        srsue_stopped: true,
+                        srsenb_stopped: true,
+                        sidecars_removed: true,
+                        epc_healthy: true,
+                        dumpcaps_preserved: true,
+                    },
+                    2,
+                )
+                .unwrap();
+            store.get(run_id).unwrap().clone()
+        };
+        let release_id = "release-http-approved-01";
+        let release = test_state.lte_evidence_release_root.join(release_id);
+        fs::create_dir_all(&release).unwrap();
+        let mut captures = Vec::new();
+        for plane in ["S1_MME", "S11", "S1_U"] {
+            let source_file = format!("{plane}.pcapng");
+            let events_file = format!("{plane}.events.jsonl");
+            let source_bytes = format!("synthetic sanitized capture {plane}").into_bytes();
+            let event_bytes = format!("{{\"plane\":\"{plane}\",\"teid\":42}}\n").into_bytes();
+            fs::write(release.join(&source_file), &source_bytes).unwrap();
+            fs::write(release.join(&events_file), &event_bytes).unwrap();
+            captures.push(json!({
+                "interface": plane,
+                "proof": {
+                    "capture_ref": {"plane":plane,"source_file_sha256":format!("{:x}",Sha256::digest(&source_bytes)),"first_frame":1,"last_frame":2,
+                        "decoder_version":"0.2.0","event_schema_version":"1.5.0","sanitization_state":"SANITIZED_APPROVED"},
+                    "observed_at":"2026-11-01T09:00:00Z","provenance":"OIRAN_SANITIZED_CAPTURE_MANIFEST","rat":"LTE",
+                    "session_refs":["lte-session-pseudonym-http"],"source_file":source_file,
+                    "normalized_events_file":events_file,"normalized_events_sha256":format!("{:x}",Sha256::digest(&event_bytes)),
+                    "decoder_name":"decoder-test","endpoint_roles":{"192.0.2.1":"SOURCE","192.0.2.2":"DESTINATION"}
+                }
+            }));
+        }
+        let mut manifest = json!({
+            "schema_version":lte_orchestrator::CAPTURE_RELEASE_SCHEMA,
+            "release_id":release_id,"run_id":run_id,
+            "profile_id":lte_orchestrator::PROFILE_ID,"scenario_id":lte_orchestrator::SCENARIO_ID,
+            "rat":"LTE","run_started_at":run.started_at,"run_ended_at":run.ended_at,
+            "final_state":"COMPLETED","authorization_state":"SANITIZED_APPROVED","captures":captures
+        });
+        let manifest_path = release.join("oiran-lte-capture-release.json");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+        let application = app(test_state);
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let body = json!({"release_id":release_id});
+        let no_csrf = application.clone().oneshot(
+            Request::builder().method(Method::POST)
+                .uri(format!("/api/v1/lte/runs/{run_id}/evidence-finalize"))
+                .header(header::COOKIE, &cookie).header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+        let response = application.clone().oneshot(
+            Request::builder().method(Method::POST)
+                .uri(format!("/api/v1/lte/runs/{run_id}/evidence-finalize"))
+                .header(header::COOKIE, &cookie).header("x-csrf-token", &csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX).await.unwrap()
+        ).unwrap();
+        assert_eq!(json["capture_bindings"].as_array().unwrap().len(), 3);
+
+        manifest["captures"][0]["proof"]["capture_ref"]["last_frame"] = Value::from(99);
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        let conflict = application.oneshot(
+            Request::builder().method(Method::POST)
+                .uri(format!("/api/v1/lte/runs/{run_id}/evidence-finalize"))
+                .header(header::COOKIE, cookie).header("x-csrf-token", csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
     }
 
     // -----------------------------------------------------------

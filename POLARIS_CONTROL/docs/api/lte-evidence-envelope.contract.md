@@ -1,8 +1,11 @@
 # POLARIS → OIRAN LTE evidence envelope
 
-API: POLARIS Control 0.28.3
+API: POLARIS Control 0.29.0
 OIRAN ingestion target: 2.7.4
-Route: `POST /api/v1/lte/runs/:run_id/evidence-envelope`
+Routes:
+
+- `POST /api/v1/lte/runs/:run_id/evidence-finalize` (production finalizer)
+- `POST /api/v1/lte/runs/:run_id/evidence-envelope` (existing bundle consumer)
 
 The route requires an authenticated `operator` or `administrator` session and
 a valid CSRF header. It never starts a capture and never reads subscriber
@@ -19,10 +22,35 @@ Raw evidence, 5G planes, duplicate planes, invalid frame ranges, non-lower-case
 SHA256, unapproved sanitization and non-pseudonymous session references fail
 closed with HTTP 422.
 
-## Staging ownership
+## Release and staging ownership
 
-The OIRAN capture finalizer owns staging. It writes an immutable private bundle
-under `POLARIS_LTE_EVIDENCE_BUNDLE_ROOT` (default
+An external capture release process may place only captures that are both
+available and explicitly authorized after anonymization under
+`POLARIS_LTE_EVIDENCE_RELEASE_ROOT` (default
+`/var/lib/polaris-control/lte-evidence-releases`). POLARIS never reads the
+collector paths directly. The finalizer caller supplies only an opaque
+`release_id`:
+
+```json
+{"release_id":"release-lte-approved-01"}
+```
+
+The private `oiran-lte-capture-release.json` is schema
+`polaris.oiran-lte-capture-release.v1` and binds `release_id`, `run_id`,
+`profile_id`, `scenario_id`, `rat`, `run_started_at`, `run_ended_at`, terminal
+`final_state`, `authorization_state=SANITIZED_APPROVED`, and a non-empty capture
+list. Each capture records its interface plus the proof below. The interface
+must exactly match the proof plane.
+
+POLARIS confines and re-hashes the approved source PCAP and normalized JSONL,
+privacy-scans JSONL, copies both with mode 0600 into a mode 0700 staging
+directory, writes the proof manifest, fsyncs it and atomically renames it under
+`POLARIS_LTE_EVIDENCE_BUNDLE_ROOT`. A deterministic run/release bundle ID makes
+an exact retry idempotent. Changed metadata or files after finalization produce
+HTTP 409 and cannot replace the immutable bundle.
+
+The resulting immutable private bundle is stored under
+`POLARIS_LTE_EVIDENCE_BUNDLE_ROOT` (default
 `/var/lib/polaris-control/lte-evidence-bundles`) containing the sanitized
 captures, normalized event streams and `polaris-evidence-proof.json`. POLARIS
 re-hashes every referenced file before constructing the request for OIRAN.

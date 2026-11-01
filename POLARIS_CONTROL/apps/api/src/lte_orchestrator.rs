@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
@@ -13,6 +13,7 @@ pub const PROFILE_ID: &str = "LTE-SRSUE-TEST-01";
 pub const SCENARIO_ID: &str = "lte-e2e-certification-v1";
 pub const MAX_RUN_MS: u64 = 300_000;
 pub const OIRAN_INGESTION_SCHEMA: &str = "oiran.lte-evidence-ingestion.v1";
+pub const CAPTURE_RELEASE_SCHEMA: &str = "polaris.oiran-lte-capture-release.v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -120,6 +121,35 @@ pub struct EvidenceEnvelopeInput {
 #[serde(deny_unknown_fields)]
 pub struct EvidenceEnvelopeRequest {
     pub bundle_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceFinalizeRequest {
+    pub release_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AuthorizedCaptureRelease {
+    interface: String,
+    proof: ObservedCaptureProof,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AuthorizedEvidenceRelease {
+    schema_version: String,
+    release_id: String,
+    run_id: String,
+    profile_id: String,
+    scenario_id: String,
+    rat: String,
+    run_started_at: String,
+    run_ended_at: String,
+    final_state: String,
+    authorization_state: String,
+    captures: Vec<AuthorizedCaptureRelease>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -638,6 +668,293 @@ fn confined_regular_file(bundle: &Path, relative: &str) -> Result<PathBuf, Strin
         return Err("LTE_EVIDENCE_BUNDLE_PATH_REJECTED".into());
     }
     Ok(canonical)
+}
+
+fn run_outcome_name(outcome: Option<RunOutcome>) -> Option<&'static str> {
+    match outcome {
+        Some(RunOutcome::Completed) => Some("COMPLETED"),
+        Some(RunOutcome::Failed) => Some("FAILED"),
+        Some(RunOutcome::Cancelled) => Some("CANCELLED"),
+        _ => None,
+    }
+}
+
+fn privacy_safe_value(value: &serde_json::Value) -> bool {
+    const FORBIDDEN: [&str; 10] = [
+        "imsi",
+        "suci",
+        "guti",
+        "tmsi",
+        "imei",
+        "imeisv",
+        "msisdn",
+        "opc",
+        "subscriber_id",
+        "subscriber_identity",
+    ];
+    match value {
+        serde_json::Value::Object(map) => map.iter().all(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            !FORBIDDEN.iter().any(|needle| key.contains(needle))
+                && !matches!(key.as_str(), "k" | "key" | "op" | "authentication_key")
+                && privacy_safe_value(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().all(privacy_safe_value),
+        serde_json::Value::String(value) => {
+            let value = value.to_ascii_lowercase();
+            let compact = value
+                .chars()
+                .filter(|character| character.is_ascii_hexdigit())
+                .count();
+            let decimal_identity = value.chars().all(|character| character.is_ascii_digit())
+                && (14..=16).contains(&value.len());
+            let secret_hex = compact == value.len() && value.len() == 32;
+            !FORBIDDEN.iter().any(|needle| value.contains(needle))
+                && !decimal_identity
+                && !secret_hex
+        }
+        serde_json::Value::Number(value) => {
+            let value = value.to_string();
+            !(value.chars().all(|character| character.is_ascii_digit())
+                && (14..=16).contains(&value.len()))
+        }
+        _ => true,
+    }
+}
+
+fn scan_normalized_events(path: &Path) -> Result<(), String> {
+    let file = fs::File::open(path).map_err(|_| "LTE_EVIDENCE_FILE_UNAVAILABLE")?;
+    let mut total = 0_u64;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|_| "LTE_EVIDENCE_FILE_READ_FAILED")?;
+        total = total.saturating_add(line.len() as u64);
+        if total > 64 * 1024 * 1024 {
+            return Err("LTE_EVIDENCE_EVENTS_TOO_LARGE".into());
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&line).map_err(|_| "LTE_EVIDENCE_EVENTS_INVALID")?;
+        if !privacy_safe_value(&value) {
+            return Err("LTE_EVIDENCE_PRIVACY_REJECTED".into());
+        }
+    }
+    Ok(())
+}
+
+fn copy_verified_file(source: &Path, destination: &Path) -> Result<(), String> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|_| "LTE_EVIDENCE_BUNDLE_WRITE_FAILED")?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .map_err(|_| "LTE_EVIDENCE_BUNDLE_WRITE_FAILED")?;
+    }
+    let mut input = fs::File::open(source).map_err(|_| "LTE_EVIDENCE_FILE_UNAVAILABLE")?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination)
+        .map_err(|_| "LTE_EVIDENCE_BUNDLE_WRITE_FAILED")?;
+    std::io::copy(&mut input, &mut output).map_err(|_| "LTE_EVIDENCE_BUNDLE_WRITE_FAILED")?;
+    output
+        .sync_all()
+        .map_err(|_| "LTE_EVIDENCE_BUNDLE_WRITE_FAILED".to_string())
+}
+
+fn existing_finalized_bundle(
+    bundle_root: &Path,
+    bundle_id: &str,
+    expected_manifest: &[u8],
+    run: &RunRecord,
+) -> Result<Option<EvidenceEnvelopeInput>, String> {
+    let bundle = bundle_root.join(bundle_id);
+    if !bundle.exists() {
+        return Ok(None);
+    }
+    let existing = fs::read(bundle.join("polaris-evidence-proof.json"))
+        .map_err(|_| "LTE_EVIDENCE_FINALIZATION_CONFLICT")?;
+    if existing != expected_manifest {
+        return Err("LTE_EVIDENCE_FINALIZATION_CONFLICT".into());
+    }
+    load_observed_evidence_bundle(
+        bundle_root,
+        EvidenceEnvelopeRequest {
+            bundle_id: bundle_id.into(),
+        },
+        run,
+    )
+    .map(Some)
+}
+
+/// Convert a server-owned, explicitly approved sanitized capture release into
+/// the immutable bundle consumed by the existing POLARIS -> OIRAN contract.
+/// The HTTP caller controls only an opaque release id; paths, hashes and proof
+/// metadata are re-read and verified below.
+pub fn finalize_authorized_evidence_release(
+    release_root: &Path,
+    bundle_root: &Path,
+    request: EvidenceFinalizeRequest,
+    run: &RunRecord,
+) -> Result<EvidenceEnvelopeInput, String> {
+    if !safe_id(&request.release_id) {
+        return Err("LTE_EVIDENCE_RELEASE_ID_INVALID".into());
+    }
+    let canonical_release_root = release_root
+        .canonicalize()
+        .map_err(|_| "LTE_EVIDENCE_RELEASE_ROOT_UNAVAILABLE")?;
+    let release_dir = canonical_release_root.join(&request.release_id);
+    let canonical_release_dir = release_dir
+        .canonicalize()
+        .map_err(|_| "LTE_EVIDENCE_RELEASE_UNAVAILABLE")?;
+    if !canonical_release_dir.starts_with(&canonical_release_root) {
+        return Err("LTE_EVIDENCE_RELEASE_PATH_REJECTED".into());
+    }
+    let release_path = canonical_release_dir.join("oiran-lte-capture-release.json");
+    let metadata = fs::symlink_metadata(&release_path)
+        .map_err(|_| "LTE_EVIDENCE_RELEASE_MANIFEST_UNAVAILABLE")?;
+    if !metadata.file_type().is_file() || metadata.len() > 1024 * 1024 {
+        return Err("LTE_EVIDENCE_RELEASE_MANIFEST_UNSAFE".into());
+    }
+    let release: AuthorizedEvidenceRelease = serde_json::from_slice(
+        &fs::read(&release_path).map_err(|_| "LTE_EVIDENCE_RELEASE_MANIFEST_UNAVAILABLE")?,
+    )
+    .map_err(|_| "LTE_EVIDENCE_RELEASE_MANIFEST_INVALID")?;
+    let ended_at = run
+        .ended_at
+        .as_deref()
+        .ok_or("LTE_EVIDENCE_RUN_NOT_ADMISSIBLE")?;
+    if release.schema_version != CAPTURE_RELEASE_SCHEMA
+        || release.release_id != request.release_id
+        || release.run_id != run.run_id
+        || release.profile_id != run.profile_id
+        || release.scenario_id != run.scenario_id
+        || release.rat != "LTE"
+        || release.run_started_at != run.started_at
+        || release.run_ended_at != ended_at
+        || Some(release.final_state.as_str()) != run_outcome_name(run.outcome)
+    {
+        return Err("LTE_EVIDENCE_RELEASE_SCOPE_MISMATCH".into());
+    }
+    if release.authorization_state != "SANITIZED_APPROVED" {
+        return Err("LTE_EVIDENCE_RELEASE_NOT_APPROVED".into());
+    }
+    if run.state != RunState::Clean || run.cleanup_required {
+        return Err("LTE_EVIDENCE_RUN_NOT_ADMISSIBLE".into());
+    }
+    let release_json =
+        serde_json::to_value(&release).map_err(|_| "LTE_EVIDENCE_RELEASE_MANIFEST_INVALID")?;
+    if !privacy_safe_value(&release_json) {
+        return Err("LTE_EVIDENCE_PRIVACY_REJECTED".into());
+    }
+
+    let mut proofs = Vec::with_capacity(release.captures.len());
+    let mut files = BTreeSet::new();
+    for capture in release.captures {
+        if capture.interface != capture.proof.capture_ref.plane {
+            return Err("LTE_EVIDENCE_INTERFACE_MISMATCH".into());
+        }
+        for relative in [
+            capture.proof.source_file.as_str(),
+            capture.proof.normalized_events_file.as_str(),
+        ] {
+            if !files.insert(relative.to_string()) {
+                return Err("LTE_EVIDENCE_FILE_DUPLICATE".into());
+            }
+        }
+        let source = confined_regular_file(&canonical_release_dir, &capture.proof.source_file)?;
+        let events = confined_regular_file(
+            &canonical_release_dir,
+            &capture.proof.normalized_events_file,
+        )?;
+        if sha256_file(&source)? != capture.proof.capture_ref.source_file_sha256
+            || sha256_file(&events)? != capture.proof.normalized_events_sha256
+        {
+            return Err("LTE_EVIDENCE_FILE_HASH_MISMATCH".into());
+        }
+        scan_normalized_events(&events)?;
+        proofs.push(capture.proof);
+    }
+    validate_capture_refs(
+        &proofs
+            .iter()
+            .map(|proof| proof.capture_ref.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    if run.outcome == Some(RunOutcome::Completed)
+        && !capture_refs_complete(
+            &proofs
+                .iter()
+                .map(|proof| proof.capture_ref.clone())
+                .collect::<Vec<_>>(),
+        )
+    {
+        return Err("LTE_EVIDENCE_REQUIRED_PLANE_MISSING".into());
+    }
+
+    fs::create_dir_all(bundle_root).map_err(|_| "LTE_EVIDENCE_BUNDLE_ROOT_UNAVAILABLE")?;
+    fs::set_permissions(bundle_root, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "LTE_EVIDENCE_BUNDLE_ROOT_UNAVAILABLE")?;
+    let canonical_bundle_root = bundle_root
+        .canonicalize()
+        .map_err(|_| "LTE_EVIDENCE_BUNDLE_ROOT_UNAVAILABLE")?;
+    let bundle_digest = hash(format!("{}:{}", run.run_id, request.release_id).as_bytes());
+    let bundle_id = format!("lte-bundle-{bundle_digest}");
+    let observed = ObservedEvidenceManifest {
+        schema_version: "polaris.oiran-observed-capture-proof.v1".into(),
+        run_id: run.run_id.clone(),
+        profile_id: run.profile_id.clone(),
+        scenario_id: run.scenario_id.clone(),
+        capture_proofs: proofs.clone(),
+    };
+    let manifest_bytes =
+        serde_json::to_vec_pretty(&observed).map_err(|_| "LTE_EVIDENCE_MANIFEST_INVALID")?;
+    if let Some(existing) =
+        existing_finalized_bundle(&canonical_bundle_root, &bundle_id, &manifest_bytes, run)?
+    {
+        return Ok(existing);
+    }
+
+    let staging =
+        canonical_bundle_root.join(format!(".{bundle_id}.staging-{}", std::process::id()));
+    if staging.exists() {
+        return Err("LTE_EVIDENCE_FINALIZATION_BUSY".into());
+    }
+    fs::create_dir(&staging).map_err(|_| "LTE_EVIDENCE_BUNDLE_WRITE_FAILED")?;
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "LTE_EVIDENCE_BUNDLE_WRITE_FAILED")?;
+    let result = (|| {
+        for proof in &proofs {
+            let source = confined_regular_file(&canonical_release_dir, &proof.source_file)?;
+            let events =
+                confined_regular_file(&canonical_release_dir, &proof.normalized_events_file)?;
+            copy_verified_file(&source, &staging.join(&proof.source_file))?;
+            copy_verified_file(&events, &staging.join(&proof.normalized_events_file))?;
+        }
+        atomic_write_0600(
+            &staging.join("polaris-evidence-proof.json"),
+            &manifest_bytes,
+        )?;
+        fs::File::open(&staging)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "LTE_EVIDENCE_BUNDLE_WRITE_FAILED")?;
+        fs::rename(&staging, canonical_bundle_root.join(&bundle_id))
+            .map_err(|_| "LTE_EVIDENCE_FINALIZATION_CONFLICT")?;
+        fs::File::open(&canonical_bundle_root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "LTE_EVIDENCE_BUNDLE_WRITE_FAILED")?;
+        load_observed_evidence_bundle(
+            &canonical_bundle_root,
+            EvidenceEnvelopeRequest {
+                bundle_id: bundle_id.clone(),
+            },
+            run,
+        )
+    })();
+    if result.is_err() && staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
 }
 
 /// Load a proof set staged by the OIRAN capture finalizer. The HTTP caller
@@ -1202,6 +1519,228 @@ mod tests {
             "LTE_EVIDENCE_BUNDLE_ID_INVALID"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_authorized_release(root: &Path, release_id: &str, run: &RunRecord, planes: &[&str]) {
+        let release_dir = root.join(release_id);
+        fs::create_dir_all(&release_dir).unwrap();
+        let captures = planes
+            .iter()
+            .map(|plane| {
+                let source_file = format!("{plane}.pcapng");
+                let events_file = format!("{plane}.events.jsonl");
+                let source = format!("synthetic-sanitized-{plane}").into_bytes();
+                let events = format!("{{\"plane\":\"{plane}\",\"teid\":42}}\n").into_bytes();
+                fs::write(release_dir.join(&source_file), &source).unwrap();
+                fs::write(release_dir.join(&events_file), &events).unwrap();
+                let mut proof = capture_proof(plane);
+                proof.source_file = source_file;
+                proof.normalized_events_file = events_file;
+                proof.capture_ref.source_file_sha256 = format!("{:x}", Sha256::digest(&source));
+                proof.normalized_events_sha256 = format!("{:x}", Sha256::digest(&events));
+                AuthorizedCaptureRelease {
+                    interface: (*plane).into(),
+                    proof,
+                }
+            })
+            .collect();
+        let release = AuthorizedEvidenceRelease {
+            schema_version: CAPTURE_RELEASE_SCHEMA.into(),
+            release_id: release_id.into(),
+            run_id: run.run_id.clone(),
+            profile_id: run.profile_id.clone(),
+            scenario_id: run.scenario_id.clone(),
+            rat: "LTE".into(),
+            run_started_at: run.started_at.clone(),
+            run_ended_at: run.ended_at.clone().unwrap(),
+            final_state: run_outcome_name(run.outcome).unwrap().into(),
+            authorization_state: "SANITIZED_APPROVED".into(),
+            captures,
+        };
+        fs::write(
+            release_dir.join("oiran-lte-capture-release.json"),
+            serde_json::to_vec_pretty(&release).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn real_finalizer_builds_an_immutable_complete_bundle_and_is_idempotent() {
+        let fixture = path("real-finalizer-complete");
+        let release_root = fixture.join("releases");
+        let bundle_root = fixture.join("bundles");
+        fs::create_dir_all(&release_root).unwrap();
+        let run = completed_run("real-finalizer-complete");
+        let release_id = "release-complete-01";
+        write_authorized_release(&release_root, release_id, &run, &["S1_MME", "S11", "S1_U"]);
+        let request = EvidenceFinalizeRequest {
+            release_id: release_id.into(),
+        };
+        let first = finalize_authorized_evidence_release(
+            &release_root,
+            &bundle_root,
+            request.clone(),
+            &run,
+        )
+        .unwrap();
+        let second =
+            finalize_authorized_evidence_release(&release_root, &bundle_root, request, &run)
+                .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.capture_proofs.len(), 3);
+        assert!(bundle_root
+            .join(&first.bundle_id)
+            .join("polaris-evidence-proof.json")
+            .is_file());
+        let _ = fs::remove_dir_all(fixture);
+    }
+
+    #[test]
+    fn real_finalizer_preserves_failed_and_cancelled_partial_evidence() {
+        for (name, outcome) in [
+            ("real-finalizer-failed", RunOutcome::Failed),
+            ("real-finalizer-cancelled", RunOutcome::Cancelled),
+        ] {
+            let fixture = path(name);
+            let release_root = fixture.join("releases");
+            let bundle_root = fixture.join("bundles");
+            fs::create_dir_all(&release_root).unwrap();
+            let run = terminal_run(name, outcome);
+            let release_id = format!("release-{name}");
+            write_authorized_release(&release_root, &release_id, &run, &["S1_MME"]);
+            let input = finalize_authorized_evidence_release(
+                &release_root,
+                &bundle_root,
+                EvidenceFinalizeRequest { release_id },
+                &run,
+            )
+            .unwrap();
+            let envelope = build_oiran_evidence_envelope(&run, input).unwrap();
+            assert_eq!(envelope.evidence.capture_refs.len(), 1);
+            assert_eq!(envelope.evidence.capture_refs[0].plane, "S1_MME");
+            let _ = fs::remove_dir_all(fixture);
+        }
+    }
+
+    #[test]
+    fn real_finalizer_rejects_empty_privacy_leaks_hash_drift_and_conflicts() {
+        assert!(!privacy_safe_value(&serde_json::json!({
+            "id": "0".repeat(15)
+        })));
+        assert!(!privacy_safe_value(&serde_json::json!({
+            "k": "00112233445566778899aabbccddeeff"
+        })));
+        let fixture = path("real-finalizer-negative");
+        let release_root = fixture.join("releases");
+        let bundle_root = fixture.join("bundles");
+        fs::create_dir_all(&release_root).unwrap();
+        let failed = terminal_run("real-finalizer-empty", RunOutcome::Failed);
+        write_authorized_release(&release_root, "release-empty", &failed, &[]);
+        assert_eq!(
+            finalize_authorized_evidence_release(
+                &release_root,
+                &bundle_root,
+                EvidenceFinalizeRequest {
+                    release_id: "release-empty".into()
+                },
+                &failed,
+            )
+            .unwrap_err(),
+            "LTE_EVIDENCE_NO_OBSERVED_CAPTURE"
+        );
+
+        let completed = completed_run("real-finalizer-negative");
+        let release_id = "release-negative";
+        write_authorized_release(
+            &release_root,
+            release_id,
+            &completed,
+            &["S1_MME", "S11", "S1_U"],
+        );
+        let release_dir = release_root.join(release_id);
+        fs::write(
+            release_dir.join("S11.events.jsonl"),
+            b"{\"imsi\":\"REDACTED\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            finalize_authorized_evidence_release(
+                &release_root,
+                &bundle_root,
+                EvidenceFinalizeRequest {
+                    release_id: release_id.into()
+                },
+                &completed,
+            )
+            .unwrap_err(),
+            "LTE_EVIDENCE_FILE_HASH_MISMATCH"
+        );
+        let privacy_id = "release-privacy";
+        write_authorized_release(
+            &release_root,
+            privacy_id,
+            &completed,
+            &["S1_MME", "S11", "S1_U"],
+        );
+        let privacy_dir = release_root.join(privacy_id);
+        let leaked = b"{\"imsi\":\"REDACTED\"}\n";
+        fs::write(privacy_dir.join("S11.events.jsonl"), leaked).unwrap();
+        let mut privacy_release: AuthorizedEvidenceRelease = serde_json::from_slice(
+            &fs::read(privacy_dir.join("oiran-lte-capture-release.json")).unwrap(),
+        )
+        .unwrap();
+        privacy_release.captures[1].proof.normalized_events_sha256 =
+            format!("{:x}", Sha256::digest(leaked));
+        fs::write(
+            privacy_dir.join("oiran-lte-capture-release.json"),
+            serde_json::to_vec_pretty(&privacy_release).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            finalize_authorized_evidence_release(
+                &release_root,
+                &bundle_root,
+                EvidenceFinalizeRequest {
+                    release_id: privacy_id.into()
+                },
+                &completed,
+            )
+            .unwrap_err(),
+            "LTE_EVIDENCE_PRIVACY_REJECTED"
+        );
+        write_authorized_release(
+            &release_root,
+            release_id,
+            &completed,
+            &["S1_MME", "S11", "S1_U"],
+        );
+        let request = EvidenceFinalizeRequest {
+            release_id: release_id.into(),
+        };
+        let finalized = finalize_authorized_evidence_release(
+            &release_root,
+            &bundle_root,
+            request.clone(),
+            &completed,
+        )
+        .unwrap();
+        let mut release: AuthorizedEvidenceRelease = serde_json::from_slice(
+            &fs::read(release_dir.join("oiran-lte-capture-release.json")).unwrap(),
+        )
+        .unwrap();
+        release.captures[0].proof.capture_ref.last_frame = 99;
+        fs::write(
+            release_dir.join("oiran-lte-capture-release.json"),
+            serde_json::to_vec_pretty(&release).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            finalize_authorized_evidence_release(&release_root, &bundle_root, request, &completed,)
+                .unwrap_err(),
+            "LTE_EVIDENCE_FINALIZATION_CONFLICT"
+        );
+        assert!(bundle_root.join(finalized.bundle_id).is_dir());
+        let _ = fs::remove_dir_all(fixture);
     }
 
     #[test]
