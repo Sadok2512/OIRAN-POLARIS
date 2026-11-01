@@ -4998,6 +4998,12 @@ async fn create_lte_run(
             Json(json!({"error":error})),
         );
     }
+    if let Err(error) = state.srsran_runtime.validate_traffic_configuration() {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({"error":error})),
+        );
+    }
     let Some(nonce) = headers
         .get("x-polaris-grant-nonce")
         .and_then(|v| v.to_str().ok())
@@ -5689,9 +5695,14 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
                 let _=state.lte_runs_v2.lock().map(|mut store|{store.observe(&run_id,step,lte_observation(step as u64,"bounded_ping",json!({"direction":direction,"sent":value.sent,"received":value.received})),epoch_millis())?;store.advance(&run_id,lte_orchestrator::RunState::TrafficRunning)});
                 set_state(&state, &run_id, "TRAFFIC_RUNNING").await;
             }
-            _ => {
+            result => {
+                let error = match result {
+                    Ok(Err(error)) => error,
+                    Err(_) => "LTE_TRAFFIC_WORKER_FAILED".into(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
                 let _ = state.lte_runs_v2.lock().map(|mut store| {
-                    store.fail_step(&run_id, step, "LTE_TRAFFIC_FAILED", epoch_millis())
+                    store.fail_step(&run_id, step, &error, epoch_millis())
                 });
                 let _ =
                     cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
@@ -5773,9 +5784,14 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             Ok(Ok(value)) => {
                 let _=state.lte_runs_v2.lock().map(|mut store|{store.observe(&run_id,step,lte_observation(step as u64,"bounded_udp",json!({"direction":direction,"rate_limit_bps":rate_bps,"duration_limit_seconds":duration_seconds,"payload_max_bytes":payload_bytes,"bytes_ul":value.bytes_ul,"bytes_dl":value.bytes_dl})),epoch_millis())?;store.advance(&run_id,lte_orchestrator::RunState::TrafficRunning)});
             }
-            _ => {
+            result => {
+                let error = match result {
+                    Ok(Err(error)) => error,
+                    Err(_) => "LTE_TRAFFIC_WORKER_FAILED".into(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
                 let _ = state.lte_runs_v2.lock().map(|mut store| {
-                    store.fail_step(&run_id, step, "LTE_TRAFFIC_FAILED", epoch_millis())
+                    store.fail_step(&run_id, step, &error, epoch_millis())
                 });
                 let _ =
                     cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;

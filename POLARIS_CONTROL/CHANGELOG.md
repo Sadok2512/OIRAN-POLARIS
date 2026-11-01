@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.28.4 (polaris-control-api) — 2026-11-01 — LTE traffic peer preflight
+
+- Fails the certification request before Grant consumption or simulator start
+  when the LTE traffic peer is absent, invalid, or differs from the validated
+  controller-managed DN sender address.
+- Adds the missing `POLARIS_LTE_TRAFFIC_PEER_IP=10.77.24.30` to the canonical
+  DN-sender deployment drop-in and documents the required exact match.
+- Retains the precise bounded ping/UDP failure code in run evidence instead of
+  collapsing every controller error into `LTE_TRAFFIC_FAILED`; cleanup,
+  expiration and revocation behavior is unchanged.
+
 ## 0.28.3 (polaris-control-api) — 2026-11-01 — LTE Attach deadline reconciliation
 
 - Replaces unscoped srsUE/MME log matching with an Open5GS MME `Attach
