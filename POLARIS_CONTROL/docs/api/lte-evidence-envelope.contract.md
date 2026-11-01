@@ -1,7 +1,7 @@
 # POLARIS → OIRAN LTE evidence envelope
 
-API: POLARIS Control 0.28.1
-OIRAN ingestion target: 2.7.2
+API: POLARIS Control 0.28.3
+OIRAN ingestion target: 2.7.4
 Route: `POST /api/v1/lte/runs/:run_id/evidence-envelope`
 
 The route requires an authenticated `operator` or `administrator` session and
@@ -10,13 +10,14 @@ identity material.
 
 ## Admission
 
-The referenced run must be `CLEAN`, have outcome `COMPLETED`, have no pending
-cleanup, and all five cleanup observations must be true. The private staged
-bundle must contain exactly one independently observed and approved proof for
-each plane:
-`S1_MME`, `S11`, `S1_U`. Raw evidence, 5G planes, duplicate/missing planes,
-invalid frame ranges, non-lower-case SHA256, unapproved sanitization and
-non-pseudonymous session references fail closed with HTTP 422.
+The referenced run must be `CLEAN`, have a terminal outcome (`COMPLETED`,
+`FAILED`, or `CANCELLED`), have no pending cleanup, and all five cleanup
+observations must be true. A completed run requires exactly one independently
+observed approved proof for each of `S1_MME`, `S11`, and `S1_U`. A failed or
+cancelled run may publish a non-empty subset containing only observed planes.
+Raw evidence, 5G planes, duplicate planes, invalid frame ranges, non-lower-case
+SHA256, unapproved sanitization and non-pseudonymous session references fail
+closed with HTTP 422.
 
 ## Staging ownership
 
@@ -76,7 +77,8 @@ it is not accepted in the HTTP body:
 }
 ```
 
-A valid manifest contains three proofs. Paths are safe relative bundle paths;
+A completed manifest contains three proofs; a terminal partial manifest contains
+only its observed planes. Paths are safe relative bundle paths;
 final files and every parent are confined after canonicalization. Symlinks,
 traversal, missing files, hash mismatch and manifests larger than 1 MiB fail
 closed.
@@ -106,7 +108,7 @@ HTTP 200 is the exact OIRAN request body:
 ```
 
 RAT, manifest provenance, observation timestamps and pseudonymous session refs
-are stored under the preflight step `measurements`, which OIRAN 2.7.2 accepts;
+are stored under the preflight step `measurements`, which OIRAN 2.7.4 accepts;
 no unknown top-level field is emitted. The route persists capture refs only
 after the complete wrapper validates. It does not set or infer
 `POLARIS_LTE_E2E_CERTIFIED`.

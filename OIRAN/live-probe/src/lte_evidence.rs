@@ -235,6 +235,10 @@ pub struct LteDatasetManifest {
     pub dataset_id: String,
     pub profile_id: String,
     pub scenario_id: String,
+    #[serde(default = "default_completed_state")]
+    pub final_state: String,
+    #[serde(default)]
+    pub capture_planes: Vec<String>,
     pub evidence_schema: String,
     pub evidence_sha256: String,
     pub request_sha256: String,
@@ -247,6 +251,10 @@ pub struct LteDatasetManifest {
     pub correlation_edge_count: usize,
     pub sanitization_state: String,
     pub artifacts: BTreeMap<String, String>,
+}
+
+fn default_completed_state() -> String {
+    "COMPLETED".into()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -503,6 +511,8 @@ impl LteEvidenceStore {
             dataset_id: dataset_id.into(),
             profile_id: request.evidence.profile_id.clone(),
             scenario_id: request.evidence.scenario_id.clone(),
+            final_state: request.evidence.final_state.clone(),
+            capture_planes: verified.iter().map(|item| item.plane.clone()).collect(),
             evidence_schema: request.evidence.schema_version.clone(),
             evidence_sha256: sha256_hex(&evidence_bytes),
             request_sha256: request_sha256.into(),
@@ -531,7 +541,12 @@ impl LteEvidenceStore {
             session_count: sessions.len(),
             correlation_edge_count: edges.len(),
             idempotent: false,
-            state: "IMPORTED".into(),
+            state: if request.evidence.final_state == "COMPLETED" {
+                "IMPORTED"
+            } else {
+                "IMPORTED_PARTIAL"
+            }
+            .into(),
         };
         write_atomic(
             &staging.join("ingestion_result.json"),
@@ -877,9 +892,12 @@ fn validate_request(request: &LteEvidenceImportRequest) -> Result<(), LteEvidenc
             "profile_id/scenario_id mismatch",
         ));
     }
-    if request.evidence.final_state != "COMPLETED" {
+    if !matches!(
+        request.evidence.final_state.as_str(),
+        "COMPLETED" | "FAILED" | "CANCELLED"
+    ) {
         return Err(LteEvidenceError::new(
-            "LTE_EVIDENCE_NOT_COMPLETED",
+            "LTE_EVIDENCE_FINAL_STATE_INVALID",
             &request.evidence.final_state,
         ));
     }
@@ -1003,7 +1021,15 @@ fn verify_bindings<'a>(
         }
         validate_sha256(&capture.source_file_sha256, "LTE_CAPTURE_SHA256_INVALID")?;
     }
-    if planes != REQUIRED_PLANES.into_iter().collect() {
+    if planes.is_empty() {
+        return Err(LteEvidenceError::new(
+            "LTE_NO_OBSERVED_CAPTURE",
+            "at least one approved LTE plane is required",
+        ));
+    }
+    if request.evidence.final_state == "COMPLETED"
+        && planes != REQUIRED_PLANES.into_iter().collect()
+    {
         return Err(LteEvidenceError::new(
             "LTE_REQUIRED_PLANE_MISSING",
             format!("observed={planes:?}"),
@@ -1783,6 +1809,62 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with('.')));
+        fs::remove_dir_all(bundle).unwrap();
+        fs::remove_dir_all(store_root).unwrap();
+    }
+
+    #[test]
+    fn imports_timeout_partial_evidence_without_inventing_missing_planes() {
+        let (bundle, mut request) = build_bundle();
+        request.evidence.run_id = "lte-run-timeout-partial-0001".into();
+        request.evidence.final_state = "FAILED".into();
+        request.evidence.capture_refs.truncate(1);
+        request.capture_bindings.truncate(1);
+        request.evidence.steps[0].state = "FAILED".into();
+        request.evidence.steps[0].reason_code = Some("LTE_GLOBAL_TIMEOUT".into());
+        request.evidence.steps[0].evidence_refs = vec!["capture:S1_MME".into()];
+
+        let store_root = temp_root("partial-timeout-store");
+        let store = LteEvidenceStore::new(store_root.clone()).unwrap();
+        let first = store.ingest(&bundle, &request).unwrap();
+        assert_eq!(first.state, "IMPORTED_PARTIAL");
+        assert_eq!(first.session_count, 1);
+        assert!(!first.idempotent);
+        assert!(store.ingest(&bundle, &request).unwrap().idempotent);
+
+        let catalog = store.catalog().unwrap();
+        let manifest = catalog
+            .iter()
+            .find(|item| item.run_id == request.evidence.run_id)
+            .unwrap();
+        assert_eq!(manifest.final_state, "FAILED");
+        assert_eq!(manifest.capture_planes, vec!["S1_MME"]);
+        assert_eq!(manifest.source_capture_sha256.len(), 1);
+        let sessions = store.session_page(&request.evidence.run_id, 1, 10).unwrap();
+        assert_eq!(sessions["data"].as_array().unwrap().len(), 1);
+        let session_id = sessions["data"][0]["session_id"].as_str().unwrap();
+        let flow = store
+            .callflow_page(&request.evidence.run_id, session_id, None, 100)
+            .unwrap();
+        assert_eq!(flow["interfaces"], json!(["S1-MME"]));
+        assert!(flow["correlation_edges"].as_array().unwrap().is_empty());
+
+        fs::remove_dir_all(bundle).unwrap();
+        fs::remove_dir_all(store_root).unwrap();
+    }
+
+    #[test]
+    fn failed_run_still_requires_completed_cleanup_proof() {
+        let (bundle, mut request) = build_bundle();
+        request.evidence.run_id = "lte-run-failed-cleanup-0001".into();
+        request.evidence.final_state = "FAILED".into();
+        request.evidence.cleanup.srsue_stopped = false;
+        let store_root = temp_root("failed-cleanup-store");
+        let store = LteEvidenceStore::new(store_root.clone()).unwrap();
+        assert_eq!(
+            store.ingest(&bundle, &request).unwrap_err().code,
+            "LTE_CLEANUP_NOT_PROVEN"
+        );
         fs::remove_dir_all(bundle).unwrap();
         fs::remove_dir_all(store_root).unwrap();
     }

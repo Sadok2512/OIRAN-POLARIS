@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.28.3 (polaris-control-api) — 2026-11-01 — terminal LTE evidence retention
+
+- Allows clean terminal `FAILED` and `CANCELLED` runs to publish only the
+  independently observed, approved LTE capture proofs that survived cleanup.
+- Keeps successful runs gated on the complete S1-MME/S11/S1-U proof set and
+  rejects empty, synthesized, unsupported, duplicate, raw, or changed refs.
+- Persists partial refs and bundle identity across restart/revocation while
+  retaining exact replay idempotence and conflict detection.
+
 ## 0.28.2 (polaris-control-api) — 2026-11-01 — srsENB Docker health handling
 
 - Parses the complete `docker inspect` JSON instead of dereferencing the

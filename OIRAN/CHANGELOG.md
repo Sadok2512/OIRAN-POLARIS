@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.7.4 / Live Probe 0.4.2 — 2026-11-01
+
+- Imports approved evidence from clean terminal failed/cancelled LTE runs as
+  `IMPORTED_PARTIAL`, preserving the observed plane set and original hashes.
+- Keeps `COMPLETED` evidence gated on all three S1-MME/S11/S1-U planes; partial
+  evidence cannot be promoted to a successful LTE certification.
+- Persists final state and capture planes in the dataset manifest and retains
+  idempotence, run conflict, privacy, cleanup, and correlation safety guards.
+
 ## OIRAN API 2.7.3 / session-engine 0.5.1 / correlation-engine 0.5.1 — 2026-11-01
 
 - Correlate LTE S1-MME, S11 and S1-U evidence across distinct per-file capture
