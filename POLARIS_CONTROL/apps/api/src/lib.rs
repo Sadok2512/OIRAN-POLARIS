@@ -3216,12 +3216,19 @@ impl AppState {
                 .unwrap_or_else(|_| "/var/lib/polaris-control/lte-runs-v2.json".into())
                 .into(),
         )?;
-        let lte_profile_registry = lte_grant::ProfileRegistry::load_or_seed(
+        let mut lte_profile_registry = lte_grant::ProfileRegistry::load_or_seed(
             std::env::var("POLARIS_LTE_PROFILE_REGISTRY_PATH")
                 .unwrap_or_else(|_| "/var/lib/polaris-control/lte-profiles-v1.json".into())
                 .into(),
             srsran_controller::profile_configuration_sha256()?,
         )?;
+        // A process restart revokes every unconsumed Grant V2 and moves every
+        // consumed grant into recovery-only. Temporary profile elevation must
+        // therefore never survive restart, while the recovery cleanup remains
+        // available independently of grant validity.
+        if lte_profile_registry.profile().temporary_activation.is_some() {
+            lte_profile_registry.clear_temporary_activation(None)?;
+        }
         Ok(Self {
             storage_path: std::env::var("POLARIS_STORAGE_PATH")
                 .unwrap_or_else(|_| "/root/POLARIS_CONTROL".into())
@@ -4400,6 +4407,73 @@ fn purpose_matches_mode(
     )
 }
 
+fn active_lte_temporary_activation(
+    state: &AppState,
+) -> Option<lte_grant::TemporaryActivation> {
+    let activation = state
+        .lte_profile_registry
+        .lock()
+        .ok()?
+        .profile()
+        .temporary_activation
+        .clone()?;
+    let now = epoch_millis();
+    let valid_grant = state.lte_grants_v2.lock().ok().is_some_and(|store| {
+        store.get(&activation.grant_id).is_some_and(|grant| {
+            grant.purpose.unwrap_or_default() == lte_grant::GrantPurpose::CertificationRun
+                && grant.activation_at_epoch_ms.is_some()
+                && matches!(
+                    grant.state,
+                    lte_grant::GrantState::Issued | lte_grant::GrantState::Consumed
+                )
+                && now < grant.expires_at_epoch_ms
+                && activation.expires_at_epoch_ms == grant.expires_at_epoch_ms
+        })
+    });
+    if now < activation.expires_at_epoch_ms && valid_grant {
+        return Some(activation);
+    }
+    let _ = state
+        .lte_profile_registry
+        .lock()
+        .map(|mut registry| registry.clear_temporary_activation(Some(&activation.grant_id)));
+    None
+}
+
+fn clear_lte_temporary_activation(state: &AppState, grant_id: Option<&str>) {
+    let _ = state
+        .lte_profile_registry
+        .lock()
+        .map(|mut registry| registry.clear_temporary_activation(grant_id));
+}
+
+fn schedule_lte_temporary_activation_expiry(
+    state: Arc<AppState>,
+    grant_id: String,
+    expires_at_epoch_ms: u64,
+) {
+    tokio::spawn(async move {
+        let wait_ms = expires_at_epoch_ms.saturating_sub(epoch_millis());
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        let expired = state
+            .lte_grants_v2
+            .lock()
+            .ok()
+            .and_then(|mut store| store.expire_if_due(&grant_id, epoch_millis()).ok());
+        clear_lte_temporary_activation(&state, Some(&grant_id));
+        if let Some(run_id) = expired.and_then(|grant| grant.run_id) {
+            let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
+        }
+        audit(
+            &state,
+            "system",
+            "LTE_TEMPORARY_ACTIVATION_EXPIRE",
+            "DISABLED",
+            Some(&grant_id),
+        );
+    });
+}
+
 fn lte_status_value(state: &AppState) -> Result<Value, String> {
     let mut value = state
         .srsran_runtime
@@ -4408,6 +4482,7 @@ fn lte_status_value(state: &AppState) -> Result<Value, String> {
             serde_json::to_value(status).map_err(|_| "SRSRAN_STATUS_INVALID".into())
         })?;
     let grant_active = active_lte_run_grant(state).is_some();
+    let temporary_activation = active_lte_temporary_activation(state);
     let safety_ready = lte_start_resource_gate(state).is_ok();
     if let Some(object) = value.as_object_mut() {
         object.insert(
@@ -4427,6 +4502,17 @@ fn lte_status_value(state: &AppState) -> Result<Value, String> {
             Value::Bool(!state.lte_e2e_certified),
         );
         object.insert("grant_active".into(), Value::Bool(grant_active));
+        object.insert(
+            "temporary_activation_active".into(),
+            Value::Bool(temporary_activation.is_some()),
+        );
+        object.insert(
+            "temporary_activation_expires_at_epoch_ms".into(),
+            temporary_activation
+                .as_ref()
+                .map(|activation| Value::from(activation.expires_at_epoch_ms))
+                .unwrap_or(Value::Null),
+        );
         object.insert("safety_ready".into(), Value::Bool(safety_ready));
         let runtime_ready = object
             .get("traffic_ready")
@@ -4500,6 +4586,7 @@ async fn lte_profile(
             Json(json!({"error":"LTE_PROFILE_NOT_FOUND"})),
         );
     }
+    let temporary_activation = active_lte_temporary_activation(&state);
     let registry = match state.lte_profile_registry.lock() {
         Ok(registry) => registry,
         Err(_) => {
@@ -4530,7 +4617,14 @@ async fn lte_profile(
                 "schema_version":"polaris.lte-profile.v1", "profile_id":lte_grant::PROFILE_ID,
                 "technology":"LTE 4G", "simulator":"srsUE",
                 "serving_ran":"ENB-01", "serving_ran_type":"srsENB",
-                "revision":profile.revision, "owner":profile.owner, "enabled":profile.enabled,
+                "revision":profile.revision, "owner":profile.owner,
+                "enabled":profile.enabled || temporary_activation.is_some(),
+                "permanent_enabled":profile.enabled,
+                "temporary_activation_active":temporary_activation.is_some(),
+                "temporary_activation_state":if temporary_activation.is_some() { "AUTHORIZED" } else { "INACTIVE" },
+                "temporary_activation_grant_id":temporary_activation.as_ref().map(|activation| activation.grant_id.as_str()),
+                "temporary_activation_expires_at_epoch_ms":temporary_activation.as_ref().map(|activation| activation.expires_at_epoch_ms),
+                "temporary_activation_remaining_seconds":temporary_activation.as_ref().map(|activation| activation.expires_at_epoch_ms.saturating_sub(epoch_millis()) / 1_000),
                 "runtime_state":runtime_state, "apn":apn, "max_running_ues":1,
                 "configuration_sha256":profile.configuration_sha256, "compose_model_sha256":compose_model_sha256, "grant_required":true,
                 "scenario_id":lte_grant::SCENARIO_ID,
@@ -4574,7 +4668,12 @@ async fn update_lte_profile(
         .lte_profile_registry
         .lock()
         .map_err(|_| "LTE_PROFILE_REGISTRY_UNAVAILABLE".to_string())
-        .and_then(|mut registry| registry.set_enabled(input.enabled));
+        .and_then(|mut registry| {
+            if !input.enabled {
+                registry.clear_temporary_activation(None)?;
+            }
+            registry.set_enabled(input.enabled)
+        });
     match updated {
         Ok(profile) => {
             audit(
@@ -4591,6 +4690,162 @@ async fn update_lte_profile(
             Json(json!({"error":error})),
         ),
     }
+}
+
+#[derive(Deserialize)]
+struct LteCertificationActivationRequest {
+    grant_id: String,
+}
+
+async fn activate_lte_profile_for_certification(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    AxumPath(profile_id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(input): Json<LteCertificationActivationRequest>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let Some(issuer_subject) = identity.session_id.as_deref() else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"AUTHENTICATED_SESSION_REQUIRED"})),
+        );
+    };
+    if profile_id != lte_grant::PROFILE_ID {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"LTE_PROFILE_NOT_FOUND"})),
+        );
+    }
+    if lte_operation_mode(&state) != LteOperationMode::CertificationRun {
+        return (
+            StatusCode::LOCKED,
+            Json(json!({"error":"LTE_CERTIFICATION_RUN_REQUIRED"})),
+        );
+    }
+    if let Err(error) = certified_release_subject_gate(&state) {
+        return (StatusCode::PRECONDITION_FAILED, Json(json!({"error":error})));
+    }
+    let Some(nonce) = headers
+        .get("x-polaris-grant-nonce")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"LIVE_GRANT_NONCE_REQUIRED"})),
+        );
+    };
+    let Some(idempotency_key) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"IDEMPOTENCY_KEY_REQUIRED"})),
+        );
+    };
+    let profile_valid = state.lte_profile_registry.lock().is_ok_and(|registry| {
+        let profile = registry.profile();
+        profile.profile_id == lte_grant::PROFILE_ID
+            && profile.owner == "POLARIS_CONTROLLER"
+            && profile.revision == 1
+            && profile.max_running_ues == 1
+    });
+    if !profile_valid {
+        return (
+            StatusCode::LOCKED,
+            Json(json!({"error":"LTE_PROFILE_OWNERSHIP_REQUIRED"})),
+        );
+    }
+    let now = epoch_millis();
+    let current_configuration = current_lte_profile_configuration_sha256(&state);
+    let current_compose = current_lte_compose_model_sha256(&state);
+    let subject_valid = state.lte_grants_v2.lock().ok().is_some_and(|store| {
+        store.get(&input.grant_id).is_some_and(|grant| {
+            current_configuration.as_ref().is_ok_and(|hash| {
+                hash == &grant.target.configuration_sha256
+            }) && current_compose.as_ref().is_ok_and(|hash| {
+                hash == &grant.target.compose_model_sha256
+            }) && grant.target.profile_id == lte_grant::PROFILE_ID
+                && grant.target.profile_revision == 1
+                && grant.scenario.scenario_id == lte_grant::SCENARIO_ID
+        })
+    });
+    if !subject_valid {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({"error":"GRANT_SUBJECT_CHANGED"})),
+        );
+    }
+    let authorization = state
+        .lte_grants_v2
+        .lock()
+        .map_err(|_| "LTE_GRANT_STORE_UNAVAILABLE".to_string())
+        .and_then(|mut store| {
+            store.authorize_temporary_activation(
+                &input.grant_id,
+                nonce,
+                idempotency_key,
+                now,
+                &identity.role,
+                issuer_subject,
+            )
+        });
+    let (grant, idempotent) = match authorization {
+        Ok(value) => value,
+        Err(error) => {
+            let status = match error.as_str() {
+                "LIVE_GRANT_NOT_FOUND" => StatusCode::NOT_FOUND,
+                "LIVE_GRANT_INACTIVE" => StatusCode::GONE,
+                "LIVE_GRANT_REPLAYED" | "IDEMPOTENCY_KEY_CONFLICT" => StatusCode::CONFLICT,
+                "GRANT_SUBJECT_CHANGED" => StatusCode::PRECONDITION_FAILED,
+                _ => StatusCode::UNPROCESSABLE_ENTITY,
+            };
+            return (status, Json(json!({"error":error})));
+        }
+    };
+    let activated = state
+        .lte_profile_registry
+        .lock()
+        .map_err(|_| "LTE_PROFILE_REGISTRY_UNAVAILABLE".to_string())
+        .and_then(|mut registry| {
+            registry.activate_temporarily(grant.grant_id.clone(), grant.expires_at_epoch_ms)
+        });
+    if let Err(error) = activated {
+        let _ = state
+            .lte_grants_v2
+            .lock()
+            .map(|mut store| store.revoke(&grant.grant_id));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":error})),
+        );
+    }
+    schedule_lte_temporary_activation_expiry(
+        state.clone(),
+        grant.grant_id.clone(),
+        grant.expires_at_epoch_ms,
+    );
+    audit(
+        &state,
+        &identity.role,
+        "LTE_TEMPORARY_ACTIVATION",
+        if idempotent { "IDEMPOTENT" } else { "AUTHORIZED" },
+        Some(&grant.grant_id),
+    );
+    (
+        if idempotent { StatusCode::OK } else { StatusCode::CREATED },
+        Json(json!({
+            "profile_id":lte_grant::PROFILE_ID,
+            "state":"TEMPORARILY_ENABLED",
+            "grant_id":grant.grant_id,
+            "expires_at_epoch_ms":grant.expires_at_epoch_ms,
+            "remaining_seconds":grant.expires_at_epoch_ms.saturating_sub(now) / 1_000,
+            "idempotent":idempotent
+        })),
+    )
 }
 
 async fn create_lte_run(
@@ -4642,9 +4897,17 @@ async fn create_lte_run(
             return (StatusCode::PRECONDITION_FAILED, Json(json!({"error":error})));
         }
     }
+    let now = epoch_millis();
     let profile_ready = state.lte_profile_registry.lock().is_ok_and(|registry| {
         let profile = registry.profile();
-        profile.enabled
+        let enabled_for_mode = match mode {
+            LteOperationMode::CertificationRun => {
+                registry.temporarily_active_for(&request.grant_id, now)
+            }
+            LteOperationMode::LiveOperational => profile.enabled,
+            LteOperationMode::Disabled => false,
+        };
+        enabled_for_mode
             && profile.owner == "POLARIS_CONTROLLER"
             && profile.revision == request.profile_revision
             && profile.profile_id == request.profile_id
@@ -4872,6 +5135,13 @@ async fn cleanup_lte_run(
     run_id: &str,
     outcome: lte_orchestrator::RunOutcome,
 ) -> bool {
+    let activation_grant_id = state.lte_grants_v2.lock().ok().and_then(|store| {
+        store
+            .records()
+            .iter()
+            .find(|grant| grant.run_id.as_deref() == Some(run_id))
+            .map(|grant| grant.grant_id.clone())
+    });
     if state
         .lte_runs_v2
         .lock()
@@ -4879,6 +5149,7 @@ async fn cleanup_lte_run(
         .and_then(|store| store.get(run_id).cloned())
         .is_some_and(|run| run.state == lte_orchestrator::RunState::Clean)
     {
+        clear_lte_temporary_activation(state, activation_grant_id.as_deref());
         return true;
     }
     let _ = state.lte_runs_v2.lock().map(|mut store| {
@@ -4962,6 +5233,7 @@ async fn cleanup_lte_run(
     let _ = state.lte_grants_v2.lock().map(|mut store| {
         store.set_run_state(run_id, if clean { "CLEAN" } else { "RECOVERY_BLOCKED" })
     });
+    clear_lte_temporary_activation(state, activation_grant_id.as_deref());
     clean
 }
 
@@ -5581,6 +5853,7 @@ async fn stop_lte_component(
         })
         .unwrap_or(false);
     if already_stopped {
+        clear_lte_temporary_activation(&state, None);
         audit(
             &state,
             &identity.role,
@@ -5593,8 +5866,12 @@ async fn stop_lte_component(
             Json(json!({"component":target.id(),"state":"STOPPED","idempotent":true})),
         );
     }
+    // The temporary elevation ends on every Stop attempt, including a stop
+    // error; cleanup remains callable without a valid grant.
+    clear_lte_temporary_activation(&state, None);
     match state.srsran_runtime.stop(target) {
         Ok(()) => {
+            clear_lte_temporary_activation(&state, None);
             audit(
                 &state,
                 &identity.role,
@@ -12543,14 +12820,26 @@ async fn create_live_grant(
                 Json(json!({"error":"IDEMPOTENCY_KEY_REQUIRED"})),
             );
         };
-        let enabled = state
+        let profile_ready = state
             .lte_profile_registry
             .lock()
-            .is_ok_and(|registry| registry.profile().enabled);
-        if !enabled {
+            .is_ok_and(|registry| {
+                let profile = registry.profile();
+                profile.profile_id == lte_grant::PROFILE_ID
+                    && profile.owner == "POLARIS_CONTROLLER"
+                    && profile.revision == request.target.profile_revision
+                    && profile.max_running_ues == 1
+                    && (request.purpose == lte_grant::GrantPurpose::CertificationRun
+                        || profile.enabled)
+            });
+        if !profile_ready {
             return (
                 StatusCode::LOCKED,
-                Json(json!({"error":"LTE_PROFILE_DISABLED"})),
+                Json(json!({"error":if request.purpose == lte_grant::GrantPurpose::CertificationRun {
+                    "LTE_PROFILE_OWNERSHIP_REQUIRED"
+                } else {
+                    "LTE_PROFILE_DISABLED"
+                }})),
             );
         }
         let current_hash = match current_lte_profile_configuration_sha256(&state) {
@@ -12749,6 +13038,7 @@ async fn revoke_live_grant(
         .ok()
         .and_then(|mut store| store.revoke(&id).ok());
     if let Some(grant) = v2 {
+        clear_lte_temporary_activation(&state, Some(&grant.grant_id));
         if let Some(run_id) = grant.run_id.as_deref() {
             let _ = cleanup_lte_run(&state, run_id, lte_orchestrator::RunOutcome::Cancelled).await;
         }
@@ -12996,6 +13286,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/lte/profiles/:profile_id",
             get(lte_profile).patch(update_lte_profile),
+        )
+        .route(
+            "/lte/profiles/:profile_id/certification-activation",
+            post(activate_lte_profile_for_certification),
         )
         .route("/lte/runs", post(create_lte_run))
         .route("/lte/runs/:run_id", get(get_lte_run))
@@ -14210,12 +14504,6 @@ mod p0_tests {
         test_state.srsran_live_enabled = true;
         test_state.lte_certification_run_enabled = true;
         test_state.lte_e2e_certified = false;
-        test_state
-            .lte_profile_registry
-            .lock()
-            .unwrap()
-            .set_enabled(true)
-            .unwrap();
         assert_eq!(lte_operation_mode(&test_state), LteOperationMode::CertificationRun);
         let application = app(test_state.clone());
         let pending = application
@@ -14257,6 +14545,38 @@ mod p0_tests {
             serde_json::from_slice(&to_bytes(grant.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(grant["purpose"], "CERTIFICATION_RUN");
+
+        let activation = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/lte/profiles/LTE-SRSUE-TEST-01/certification-activation")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .header("idempotency-key", "certification-activation-1")
+                    .header("x-polaris-grant-nonce", "n".repeat(43))
+                    .body(Body::from(json!({"grant_id":grant["grant_id"]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(activation.status(), StatusCode::CREATED);
+        let activation: Value = serde_json::from_slice(
+            &to_bytes(activation.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(activation["state"], "TEMPORARILY_ENABLED");
+        assert_eq!(
+            test_state
+                .lte_profile_registry
+                .lock()
+                .unwrap()
+                .profile()
+                .enabled,
+            false
+        );
 
         let run = application
             .clone()
@@ -14353,6 +14673,140 @@ mod p0_tests {
             .await
             .unwrap();
         assert_eq!(wrong_digest.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn temporary_activation_requires_operator_csrf_nonce_and_is_revoked_with_grant() {
+        let mut test_state = state();
+        test_state.execution_mode = "live".into();
+        test_state.srsran_live_enabled = true;
+        test_state.lte_certification_run_enabled = true;
+        test_state.lte_e2e_certified = false;
+        let application = app(test_state.clone());
+        let unauthenticated = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/lte/profiles/LTE-SRSUE-TEST-01/certification-activation")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"grant_id":"grant-absent"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::FORBIDDEN);
+
+        let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
+        let grant_response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/live/grant")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .header("idempotency-key", "activation-security-grant")
+                    .body(Body::from(certification_grant_body("CERTIFICATION_RUN").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::CREATED);
+        let grant: Value = serde_json::from_slice(
+            &to_bytes(grant_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        let activation_uri = "/api/v1/lte/profiles/LTE-SRSUE-TEST-01/certification-activation";
+        let no_csrf = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(activation_uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("idempotency-key", "activation-security-1")
+                    .header("x-polaris-grant-nonce", "n".repeat(43))
+                    .body(Body::from(json!({"grant_id":grant["grant_id"]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+        let wrong_nonce = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(activation_uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .header("idempotency-key", "activation-security-1")
+                    .header("x-polaris-grant-nonce", "x".repeat(43))
+                    .body(Body::from(json!({"grant_id":grant["grant_id"]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_nonce.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let activated = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(activation_uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .header("idempotency-key", "activation-security-1")
+                    .header("x-polaris-grant-nonce", "n".repeat(43))
+                    .body(Body::from(json!({"grant_id":grant["grant_id"]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(activated.status(), StatusCode::CREATED);
+        let replay = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(activation_uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .header("idempotency-key", "activation-security-2")
+                    .header("x-polaris-grant-nonce", "n".repeat(43))
+                    .body(Body::from(json!({"grant_id":grant["grant_id"]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        let revoked = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/v1/live/grant/{}", grant["grant_id"].as_str().unwrap()))
+                    .header(header::COOKIE, cookie)
+                    .header("x-csrf-token", csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::OK);
+        assert!(test_state
+            .lte_profile_registry
+            .lock()
+            .unwrap()
+            .profile()
+            .temporary_activation
+            .is_none());
+        assert!(!test_state.lte_e2e_certified);
     }
 
     #[tokio::test]

@@ -1,5 +1,15 @@
 # @telecom/simulator-control — Changelog
 
+## 0.20.0 — 2026-11-01 — temporary Operator LTE activation
+
+- Splits LTE certification into explicit Grant V2 preparation, temporary
+  Operator activation and bounded run start; the activation control remains
+  disabled until the exact in-memory grant and nonce are valid.
+- Displays the server-observed temporary activation state and countdown, and
+  keeps operational start dependent on permanent certification.
+- Polls the canonical profile for expiry, Stop, failure, revocation and
+  restart cleanup without persisting the execution nonce in browser storage.
+
 ## 0.19.0 — 2026-10-31 — LTE certification gate
 
 - Displays the distinct certification state and enables only a dedicated,

@@ -189,6 +189,8 @@ export interface LteStatus {
   ownership_verified: boolean;
   traffic_ready: boolean;
   grant_active: boolean;
+  temporary_activation_active: boolean;
+  temporary_activation_expires_at_epoch_ms: number | null;
   safety_ready: boolean;
   traffic_allowed: boolean;
 }
@@ -203,6 +205,12 @@ export interface LteProfile {
   revision: number;
   owner: 'POLARIS_CONTROLLER';
   enabled: boolean;
+  permanent_enabled: boolean;
+  temporary_activation_active: boolean;
+  temporary_activation_state: 'AUTHORIZED' | 'INACTIVE';
+  temporary_activation_grant_id: string | null;
+  temporary_activation_expires_at_epoch_ms: number | null;
+  temporary_activation_remaining_seconds: number | null;
   runtime_state: string;
   apn: string;
   max_running_ues: number;

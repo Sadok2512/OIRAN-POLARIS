@@ -1,12 +1,15 @@
+import { useEffect, useState } from 'react';
 import { Play, Square } from 'lucide-react';
 import { Btn, Card, Pill, regTone } from '@/components/mockup';
 import { useAuth, useLteAction, useLteLogs, useLteProfile, useLteStatus } from '@/data/queries';
-import { useEmergencyStopLteRun, useLteRun, useStartLteCertifiedRun } from '@/data/liveGrantApi';
+import { formatCountdown, useActivateLteCertification, useEmergencyStopLteRun, useLteRun, usePrepareLteCertificationGrant, useStartLteCertifiedRun } from '@/data/liveGrantApi';
 
 export function LteControlPanel({ compact = false }: { compact?: boolean }) {
   const auth = useAuth();
   const status = useLteStatus();
   const stop = useLteAction('stop');
+  const prepareGrant = usePrepareLteCertificationGrant();
+  const activateCertification = useActivateLteCertification();
   const startRun = useStartLteCertifiedRun();
   const run = useLteRun(startRun.data?.run_id);
   const emergencyStop = useEmergencyStopLteRun();
@@ -14,21 +17,51 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
   const enbLogs = useLteLogs('ENB-01');
   const ueLogs = useLteLogs('LTE-SRSUE-TEST-01');
   const data = status.data;
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const canOperate = auth.data?.can_start === true;
   const certificationMode = data?.operation_mode === 'CERTIFICATION_RUN';
   const operationalMode = data?.operation_mode === 'LIVE_OPERATIONAL';
-  const startGateReady = (certificationMode || operationalMode)
+  const baseGateReady = (certificationMode || operationalMode)
     && data.live_enabled === true
     && data.safety_ready === true
-    && profile.data?.enabled === true
-    && typeof profile.data.compose_model_sha256 === 'string'
+    && typeof profile.data?.compose_model_sha256 === 'string'
     && data.grant_active !== true;
+  const preparedGrantValid = Boolean(
+    prepareGrant.data
+    && prepareGrant.data.grant.purpose === 'CERTIFICATION_RUN'
+    && prepareGrant.data.grant.state === 'ISSUED'
+    && prepareGrant.data.grant.expires_at_epoch_ms > now,
+  );
+  const temporaryActivationValid = Boolean(
+    profile.data?.temporary_activation_active
+    && profile.data.temporary_activation_expires_at_epoch_ms
+    && profile.data.temporary_activation_expires_at_epoch_ms > now
+    && profile.data.temporary_activation_grant_id === prepareGrant.data?.grant.grant_id,
+  );
+  const startGateReady = baseGateReady && (certificationMode
+    ? temporaryActivationValid
+    : profile.data?.permanent_enabled === true);
   const ownershipVerified = data?.ownership_verified === true;
   const ueRunning = data?.ue.process_state === 'running';
   const enbRunning = data?.enb.process_state === 'running';
   const certificationState = data?.certification_state ?? 'CERTIFICATION_PENDING';
   const statusLabel = certificationState.replaceAll('_', ' ');
-  const error = stop.error ?? startRun.error ?? emergencyStop.error;
+  const activationExpiry = profile.data?.temporary_activation_expires_at_epoch_ms ?? null;
+  const activationCountdown = activationExpiry ? formatCountdown(activationExpiry, now) : '00:00';
+  const error = stop.error ?? prepareGrant.error ?? activateCertification.error ?? startRun.error ?? emergencyStop.error;
+  const binding = profile.data?.compose_model_sha256 ? {
+    purpose: certificationMode ? 'CERTIFICATION_RUN' as const : 'LIVE_OPERATIONAL' as const,
+    revision: profile.data.revision,
+    configuration_sha256: profile.data.configuration_sha256,
+    compose_model_sha256: profile.data.compose_model_sha256,
+    scenario_id: profile.data.scenario_id,
+    scenario_revision: profile.data.scenario_revision,
+    scenario_sha256: profile.data.scenario_sha256,
+  } : null;
 
   return (
     <Card className="p-5 flex flex-col gap-4" data-testid="lte-control-panel">
@@ -59,24 +92,35 @@ export function LteControlPanel({ compact = false }: { compact?: boolean }) {
         <div><dt className="text-ep-xs uppercase text-mute">Simulator</dt><dd>srsRAN</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">Technology</dt><dd>LTE 4G</dd></div>
         <div><dt className="text-ep-xs uppercase text-mute">Grant contract</dt><dd>{profile.data?.grant_required ? 'V2 REQUIRED' : 'NOT OBSERVED'}</dd></div>
+        <div><dt className="text-ep-xs uppercase text-mute">Activation Operator</dt><dd data-testid="lte-temp-activation-state">{profile.data?.temporary_activation_state ?? 'INACTIVE'} · {activationCountdown}</dd></div>
       </dl>
 
       <div className="flex flex-wrap gap-2 border-t border-line pt-3">
+        {certificationMode ? <>
+          <Btn
+            disabled={!canOperate || !baseGateReady || !binding || preparedGrantValid || prepareGrant.isPending || profile.data?.temporary_activation_active}
+            title="Crée un Grant V2 exact, borné à un UE et 300 secondes. Aucun simulateur n'est démarré."
+            onClick={() => { if (binding) prepareGrant.mutate(binding); }}
+            data-testid="lte-prepare-grant"
+          >{prepareGrant.isPending ? 'Préparation…' : 'Préparer Grant V2 LTE'}</Btn>
+          <Btn
+            primary
+            disabled={!canOperate || !preparedGrantValid || activateCertification.isPending || profile.data?.temporary_activation_active}
+            title={preparedGrantValid ? 'Activation temporaire liée au Grant V2 exact.' : 'Un Grant V2 Certification Run valide est requis.'}
+            onClick={() => { if (prepareGrant.data) activateCertification.mutate({ authorization: prepareGrant.data }); }}
+            data-testid="lte-authorize-certification"
+          >{activateCertification.isPending ? 'Autorisation…' : 'Autoriser certification LTE'}</Btn>
+        </> : null}
         <Btn
           icon={Play}
           primary
           disabled={!canOperate || !startGateReady || startRun.isPending}
-          title={startGateReady ? 'Issues and consumes a dedicated one-time, five-minute LTE Grant V2.' : 'Requires the exact certification or operational mode, enabled controller-owned profile, certified digests and safety gates.'}
+          title={startGateReady ? 'Consomme le Grant V2 lié à l’activation temporaire.' : 'Requires the exact mode, controller-owned profile, certified digests, safety gates and temporary Operator activation.'}
           onClick={() => {
-            if (profile.data?.compose_model_sha256) {
+            if (binding) {
               startRun.mutate({
-                purpose: certificationMode ? 'CERTIFICATION_RUN' : 'LIVE_OPERATIONAL',
-                revision: profile.data.revision,
-                configuration_sha256: profile.data.configuration_sha256,
-                compose_model_sha256: profile.data.compose_model_sha256,
-                scenario_id: profile.data.scenario_id,
-                scenario_revision: profile.data.scenario_revision,
-                scenario_sha256: profile.data.scenario_sha256,
+                profile: binding,
+                authorization: certificationMode ? prepareGrant.data : undefined,
               });
             }
           }}

@@ -61,6 +61,20 @@ export interface LteGrantProfileBinding {
   scenario_sha256: string;
 }
 
+export interface LtePreparedAuthorization {
+  grant: LteGrantV2;
+  executionNonce: string;
+}
+
+export interface LteTemporaryActivation {
+  profile_id: 'LTE-SRSUE-TEST-01';
+  state: 'TEMPORARILY_ENABLED';
+  grant_id: string;
+  expires_at_epoch_ms: number;
+  remaining_seconds: number;
+  idempotent: boolean;
+}
+
 function randomToken(bytes: number): string {
   const value = new Uint8Array(bytes);
   crypto.getRandomValues(value);
@@ -69,53 +83,94 @@ function randomToken(bytes: number): string {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
+async function createLteGrant(profile: LteGrantProfileBinding): Promise<LtePreparedAuthorization> {
+  const executionNonce = randomToken(32);
+  const grant = await polarisApi<LteGrantV2>('/live/grant', {
+    method: 'POST',
+    headers: { 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify({
+      schema_version: 'polaris.live-grant.v2',
+      purpose: profile.purpose,
+      target: {
+        kind: 'srsran_lte_profile',
+        profile_id: 'LTE-SRSUE-TEST-01',
+        profile_revision: profile.revision,
+        configuration_sha256: profile.configuration_sha256,
+        compose_model_sha256: profile.compose_model_sha256,
+      },
+      scenario: {
+        scenario_id: profile.scenario_id,
+        scenario_revision: profile.scenario_revision,
+        scenario_sha256: profile.scenario_sha256,
+      },
+      duration_seconds: 300,
+      constraints: {
+        max_ues: 1,
+        allowed_actions: ['s1_setup', 'lte_attach', 'ping_ul', 'ping_dl', 'udp_ul', 'udp_dl', 'cleanup'],
+        ping: { max_packets_per_direction: 5 },
+        udp: {
+          max_rate_bps_per_direction: 1_000_000,
+          max_duration_seconds_per_direction: 10,
+          max_payload_bytes: 1_200,
+          max_parallel_streams: 1,
+        },
+        hard_deadline_behavior: 'STOP_TRAFFIC_AND_CLEANUP',
+      },
+      execution_nonce: executionNonce,
+    }),
+  });
+  return { grant, executionNonce };
+}
+
+export function usePrepareLteCertificationGrant() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: createLteGrant,
+    onSettled: async () => {
+      await client.invalidateQueries({ queryKey: ['polaris', 'live-grants'] });
+    },
+  });
+}
+
+export function useActivateLteCertification() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ authorization }: { authorization: LtePreparedAuthorization }) =>
+      polarisApi<LteTemporaryActivation>('/lte/profiles/LTE-SRSUE-TEST-01/certification-activation', {
+        method: 'POST',
+        headers: {
+          'Idempotency-Key': crypto.randomUUID(),
+          'X-Polaris-Grant-Nonce': authorization.executionNonce,
+        },
+        body: JSON.stringify({ grant_id: authorization.grant.grant_id }),
+      }),
+    onSettled: async () => {
+      await client.invalidateQueries({ queryKey: ['polaris', 'live-grants'] });
+      await client.invalidateQueries({ queryKey: ['polaris', 'lte-profile', 'LTE-SRSUE-TEST-01'] });
+      await client.invalidateQueries({ queryKey: ['polaris', 'lte-status'] });
+    },
+  });
+}
+
 export function useStartLteCertifiedRun() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: async (profile: LteGrantProfileBinding) => {
-      const executionNonce = randomToken(32);
-      const grant = await polarisApi<LteGrantV2>('/live/grant', {
-        method: 'POST',
-        headers: { 'Idempotency-Key': crypto.randomUUID() },
-        body: JSON.stringify({
-          schema_version: 'polaris.live-grant.v2',
-          purpose: profile.purpose,
-          target: {
-            kind: 'srsran_lte_profile',
-            profile_id: 'LTE-SRSUE-TEST-01',
-            profile_revision: profile.revision,
-            configuration_sha256: profile.configuration_sha256,
-            compose_model_sha256: profile.compose_model_sha256,
-          },
-          scenario: {
-            scenario_id: profile.scenario_id,
-            scenario_revision: profile.scenario_revision,
-            scenario_sha256: profile.scenario_sha256,
-          },
-          duration_seconds: 300,
-          constraints: {
-            max_ues: 1,
-            allowed_actions: ['s1_setup', 'lte_attach', 'ping_ul', 'ping_dl', 'udp_ul', 'udp_dl', 'cleanup'],
-            ping: { max_packets_per_direction: 5 },
-            udp: {
-              max_rate_bps_per_direction: 1_000_000,
-              max_duration_seconds_per_direction: 10,
-              max_payload_bytes: 1_200,
-              max_parallel_streams: 1,
-            },
-            hard_deadline_behavior: 'STOP_TRAFFIC_AND_CLEANUP',
-          },
-          execution_nonce: executionNonce,
-        }),
-      });
+    mutationFn: async ({
+      profile,
+      authorization,
+    }: {
+      profile: LteGrantProfileBinding;
+      authorization?: LtePreparedAuthorization;
+    }) => {
+      const prepared = authorization ?? await createLteGrant(profile);
       return polarisApi<LteRun>('/lte/runs', {
         method: 'POST',
         headers: {
           'Idempotency-Key': crypto.randomUUID(),
-          'X-Polaris-Grant-Nonce': executionNonce,
+          'X-Polaris-Grant-Nonce': prepared.executionNonce,
         },
         body: JSON.stringify({
-          grant_id: grant.grant_id,
+          grant_id: prepared.grant.grant_id,
           profile_id: 'LTE-SRSUE-TEST-01',
           profile_revision: profile.revision,
           configuration_sha256: profile.configuration_sha256,

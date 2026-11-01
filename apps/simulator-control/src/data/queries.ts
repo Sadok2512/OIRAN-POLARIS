@@ -126,7 +126,8 @@ export function useLteProfile() {
   return useQuery({
     queryKey: ['polaris', 'lte-profile', 'LTE-SRSUE-TEST-01'],
     queryFn: () => polarisApi<LteProfile>('/lte/profiles/LTE-SRSUE-TEST-01'),
-    staleTime: 30_000,
+    refetchInterval: 1_000,
+    staleTime: 500,
     retry: false,
   });
 }

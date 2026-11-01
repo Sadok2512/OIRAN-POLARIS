@@ -7,6 +7,8 @@ const json = (body: unknown) => ({
 });
 
 async function mockPolaris(page: Page) {
+  let activated = false;
+  const expiresAt = Date.now() + 300_000;
   // Registered first because Playwright evaluates routes in reverse order.
   await page.route('**/polaris-api/v1/**', (route) => route.fulfill(json({ items: [] })));
   await page.route('**/polaris-api/v1/auth/me', (route) =>
@@ -24,6 +26,8 @@ async function mockPolaris(page: Page) {
       operation_mode: 'CERTIFICATION_RUN', certification_state: 'CERTIFICATION_PENDING',
       certification_run_enabled: true, manual_certification_required: true,
       safety_ready: true, grant_active: false, ownership_verified: true,
+      temporary_activation_active: activated,
+      temporary_activation_expires_at_epoch_ms: activated ? expiresAt : null,
       epc: { process_state: 'running', health: 'unknown', observed: true },
       s1_state: 'UNKNOWN',
       enb: { process_state: 'stopped', health: 'unknown', observed: true, controller_owned: true },
@@ -33,7 +37,12 @@ async function mockPolaris(page: Page) {
   );
   await page.route('**/polaris-api/v1/lte/profiles/LTE-SRSUE-TEST-01', (route) =>
     route.fulfill(json({
-      profile_id: 'LTE-SRSUE-TEST-01', revision: 1, enabled: true,
+      profile_id: 'LTE-SRSUE-TEST-01', revision: 1, enabled: activated,
+      permanent_enabled: false, temporary_activation_active: activated,
+      temporary_activation_state: activated ? 'AUTHORIZED' : 'INACTIVE',
+      temporary_activation_grant_id: activated ? 'grant-certification-1' : null,
+      temporary_activation_expires_at_epoch_ms: activated ? expiresAt : null,
+      temporary_activation_remaining_seconds: activated ? 300 : null,
       owner: 'POLARIS_CONTROLLER', grant_required: true,
       configuration_sha256: 'a'.repeat(64), compose_model_sha256: 'c'.repeat(64),
       scenario_id: 'lte-e2e-certification-v1', scenario_revision: 1,
@@ -43,6 +52,18 @@ async function mockPolaris(page: Page) {
   await page.route('**/polaris-api/v1/lte/logs**', (route) =>
     route.fulfill(json({ lines: ['S1 setup complete'], redacted: true })),
   );
+  await page.route('**/polaris-api/v1/live/grant', (route) => route.fulfill(json({
+    schema_version: 'polaris.live-grant.v2', purpose: 'CERTIFICATION_RUN',
+    grant_id: 'grant-certification-1', state: 'ISSUED', expires_at_epoch_ms: expiresAt,
+  })));
+  await page.route('**/polaris-api/v1/lte/profiles/LTE-SRSUE-TEST-01/certification-activation', (route) => {
+    activated = true;
+    return route.fulfill(json({
+      profile_id: 'LTE-SRSUE-TEST-01', state: 'TEMPORARILY_ENABLED',
+      grant_id: 'grant-certification-1', expires_at_epoch_ms: expiresAt,
+      remaining_seconds: 300, idempotent: false,
+    }));
+  });
 }
 
 test('LTE certification mode is visible, bounded and does not claim certification', async ({ page }) => {
@@ -55,7 +76,17 @@ test('LTE certification mode is visible, bounded and does not claim certificatio
   await expect(panel).toContainText('LTE 4G — srsRAN');
   await expect(panel).toContainText('CERTIFICATION PENDING');
   await expect(panel).toContainText('never promote themselves');
-  await expect(page.getByRole('button', { name: 'Start LTE certification run' })).toBeEnabled();
+  const prepare = page.getByRole('button', { name: 'Préparer Grant V2 LTE' });
+  const authorize = page.getByRole('button', { name: 'Autoriser certification LTE' });
+  const start = page.getByRole('button', { name: 'Start LTE certification run' });
+  await expect(prepare).toBeEnabled();
+  await expect(authorize).toBeDisabled();
+  await expect(start).toBeDisabled();
+  await prepare.click();
+  await expect(authorize).toBeEnabled();
+  await authorize.click();
+  await expect(page.getByTestId('lte-temp-activation-state')).toContainText('AUTHORIZED');
+  await expect(start).toBeEnabled();
 
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
   expect(overflow).toBe(false);

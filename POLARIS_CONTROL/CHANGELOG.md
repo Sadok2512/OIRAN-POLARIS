@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.27.0 (polaris-control-api) — 2026-11-01 — temporary Operator LTE activation
+
+- Adds a persisted, one-time temporary activation for only
+  `LTE-SRSUE-TEST-01`, bound to the authenticated Operator session and exact
+  Certification Grant V2 nonce, expiry, profile and certified digests.
+- Keeps permanent profile enablement administrator-only and keeps
+  `LIVE_OPERATIONAL` locked while `POLARIS_LTE_E2E_CERTIFIED=false`.
+- Revokes temporary activation on expiry, Stop, failure, grant revocation or
+  restart, while retaining grant-independent emergency cleanup.
+- Preserves the one-UE, 300-second, ping and bidirectional UDP <=1 Mbit/s
+  certification envelope and all existing UERANSIM paths.
+
 ## 0.26.0 (polaris-control-api) — 2026-10-31 — bounded LTE certification run
 
 - Separates the one-time `CERTIFICATION_RUN` bootstrap path from

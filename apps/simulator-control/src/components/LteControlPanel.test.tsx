@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { LteControlPanel } from './LteControlPanel';
 
 const startMutate = vi.fn();
+const prepareMutate = vi.fn();
+const activateMutate = vi.fn();
 const emergencyMutate = vi.fn();
 const stopMutate = vi.fn();
 
@@ -11,7 +13,13 @@ vi.mock('@/data/queries', () => ({
   useLteAction: () => ({ mutate: stopMutate, isPending: false, error: null }),
   useLteLogs: () => ({ data: { lines: [] } }),
   useLteProfile: () => ({ data: {
-    enabled: true,
+    enabled: false,
+    permanent_enabled: false,
+    temporary_activation_active: false,
+    temporary_activation_state: 'INACTIVE',
+    temporary_activation_grant_id: null,
+    temporary_activation_expires_at_epoch_ms: null,
+    temporary_activation_remaining_seconds: null,
     grant_required: true,
     revision: 1,
     configuration_sha256: 'a'.repeat(64),
@@ -43,6 +51,9 @@ vi.mock('@/data/queries', () => ({
 }));
 
 vi.mock('@/data/liveGrantApi', () => ({
+  formatCountdown: () => '00:00',
+  usePrepareLteCertificationGrant: () => ({ mutate: prepareMutate, isPending: false, error: null, data: undefined }),
+  useActivateLteCertification: () => ({ mutate: activateMutate, isPending: false, error: null, data: undefined }),
   useStartLteCertifiedRun: () => ({ mutate: startMutate, isPending: false, error: null, data: undefined }),
   useLteRun: () => ({ data: undefined }),
   useEmergencyStopLteRun: () => ({ mutate: emergencyMutate, isPending: false, error: null }),
@@ -51,14 +62,17 @@ vi.mock('@/data/liveGrantApi', () => ({
 describe('LTE certification gate control', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('shows the pending state and requests a dedicated certification grant', () => {
+  it('requires a prepared Grant V2 before Operator temporary activation', () => {
     render(<LteControlPanel compact />);
     expect(screen.getByTestId('lte-certification-state')).toHaveTextContent('CERTIFICATION PENDING');
+    const prepare = screen.getByTestId('lte-prepare-grant');
+    const authorize = screen.getByTestId('lte-authorize-certification');
     const start = screen.getByTestId('lte-enb-start');
-    expect(start).toBeEnabled();
-    expect(start).toHaveTextContent('Start LTE certification run');
-    fireEvent.click(start);
-    expect(startMutate).toHaveBeenCalledWith(expect.objectContaining({
+    expect(prepare).toBeEnabled();
+    expect(authorize).toBeDisabled();
+    expect(start).toBeDisabled();
+    fireEvent.click(prepare);
+    expect(prepareMutate).toHaveBeenCalledWith(expect.objectContaining({
       purpose: 'CERTIFICATION_RUN',
       revision: 1,
       scenario_id: 'lte-e2e-certification-v1',

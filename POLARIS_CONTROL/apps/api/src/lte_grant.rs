@@ -33,6 +33,14 @@ pub struct LteProfileRecord {
     pub enb_service: String,
     pub ue_service: String,
     pub max_running_ues: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporary_activation: Option<TemporaryActivation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TemporaryActivation {
+    pub grant_id: String,
+    pub expires_at_epoch_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +62,7 @@ impl ProfileRegistry {
             enb_service: "srsenb".into(),
             ue_service: "srsue".into(),
             max_running_ues: 1,
+            temporary_activation: None,
         };
         let mut registry = match fs::read(&path) {
             Ok(bytes) => {
@@ -92,6 +101,47 @@ impl ProfileRegistry {
         self.profile.enabled = enabled;
         self.persist()?;
         Ok(self.profile.clone())
+    }
+
+    pub fn activate_temporarily(
+        &mut self,
+        grant_id: String,
+        expires_at_epoch_ms: u64,
+    ) -> Result<LteProfileRecord, String> {
+        self.profile.temporary_activation = Some(TemporaryActivation {
+            grant_id,
+            expires_at_epoch_ms,
+        });
+        self.persist()?;
+        Ok(self.profile.clone())
+    }
+
+    pub fn clear_temporary_activation(
+        &mut self,
+        grant_id: Option<&str>,
+    ) -> Result<LteProfileRecord, String> {
+        let matches = match grant_id {
+            None => true,
+            Some(expected) => self
+                .profile
+                .temporary_activation
+                .as_ref()
+                .is_some_and(|activation| activation.grant_id == expected),
+        };
+        if matches {
+            self.profile.temporary_activation = None;
+            self.persist()?;
+        }
+        Ok(self.profile.clone())
+    }
+
+    pub fn temporarily_active_for(&self, grant_id: &str, now_ms: u64) -> bool {
+        self.profile
+            .temporary_activation
+            .as_ref()
+            .is_some_and(|activation| {
+                activation.grant_id == grant_id && now_ms < activation.expires_at_epoch_ms
+            })
     }
 
     fn persist(&mut self) -> Result<(), String> {
@@ -192,6 +242,10 @@ pub struct GrantRecord {
     pub run_idempotency_key_sha256: Option<String>,
     #[serde(default)]
     pub run_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_at_epoch_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_idempotency_key_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -322,6 +376,7 @@ impl GrantRecord {
             "constraints": self.constraints,
             "use_count": self.use_count,
             "run_id": self.run_id,
+            "activation_at_epoch_ms": self.activation_at_epoch_ms,
         })
     }
 }
@@ -421,6 +476,8 @@ impl GrantStore {
             run_request_sha256: None,
             run_idempotency_key_sha256: None,
             run_state: None,
+            activation_at_epoch_ms: None,
+            activation_idempotency_key_sha256: None,
         };
         self.grants.push(record.clone());
         self.persist()?;
@@ -472,6 +529,11 @@ impl GrantStore {
         if grant.state != GrantState::Issued {
             return Err("LIVE_GRANT_REPLAYED".into());
         }
+        if grant.purpose.unwrap_or_default() == GrantPurpose::CertificationRun
+            && grant.activation_at_epoch_ms.is_none()
+        {
+            return Err("LTE_TEMPORARY_ACTIVATION_REQUIRED".into());
+        }
         if hash_bytes(nonce.as_bytes()) != grant.nonce_sha256 {
             return Err("LIVE_GRANT_NONCE_INVALID".into());
         }
@@ -512,6 +574,75 @@ impl GrantStore {
         grant.state = GrantState::Revoked;
         let result = grant.clone();
         self.persist()?;
+        Ok(result)
+    }
+
+    pub fn authorize_temporary_activation(
+        &mut self,
+        grant_id: &str,
+        nonce: &str,
+        idempotency_key: &str,
+        now_ms: u64,
+        role: &str,
+        issuer_subject: &str,
+    ) -> Result<(GrantRecord, bool), String> {
+        validate_idempotency_key(idempotency_key)?;
+        let key_hash = hash_bytes(idempotency_key.as_bytes());
+        let grant = self
+            .grants
+            .iter_mut()
+            .find(|grant| grant.grant_id == grant_id)
+            .ok_or("LIVE_GRANT_NOT_FOUND")?;
+        if now_ms >= grant.expires_at_epoch_ms {
+            grant.state = GrantState::Expired;
+            self.persist()?;
+            return Err("LIVE_GRANT_INACTIVE".into());
+        }
+        if grant.purpose.unwrap_or_default() != GrantPurpose::CertificationRun {
+            return Err("LTE_GRANT_PURPOSE_MISMATCH".into());
+        }
+        if grant.role != role
+            || grant.issuer_subject_sha256 != hash_bytes(issuer_subject.as_bytes())
+        {
+            return Err("GRANT_SUBJECT_CHANGED".into());
+        }
+        if hash_bytes(nonce.as_bytes()) != grant.nonce_sha256 {
+            return Err("LIVE_GRANT_NONCE_INVALID".into());
+        }
+        if let Some(existing) = grant.activation_idempotency_key_sha256.as_deref() {
+            return if existing == key_hash {
+                Ok((grant.clone(), true))
+            } else {
+                Err("LIVE_GRANT_REPLAYED".into())
+            };
+        }
+        if grant.state != GrantState::Issued || grant.use_count != 0 {
+            return Err("LIVE_GRANT_REPLAYED".into());
+        }
+        grant.activation_at_epoch_ms = Some(now_ms);
+        grant.activation_idempotency_key_sha256 = Some(key_hash);
+        let result = grant.clone();
+        self.persist()?;
+        Ok((result, false))
+    }
+
+    pub fn expire_if_due(&mut self, grant_id: &str, now_ms: u64) -> Result<GrantRecord, String> {
+        let (result, changed) = {
+            let grant = self
+                .grants
+                .iter_mut()
+                .find(|grant| grant.grant_id == grant_id)
+                .ok_or("LIVE_GRANT_NOT_FOUND")?;
+            let changed = now_ms >= grant.expires_at_epoch_ms
+                && matches!(grant.state, GrantState::Issued | GrantState::Consumed);
+            if changed {
+                grant.state = GrantState::Expired;
+            }
+            (grant.clone(), changed)
+        };
+        if changed {
+            self.persist()?;
+        }
         Ok(result)
     }
 
@@ -662,6 +793,19 @@ mod tests {
         ))
     }
 
+    fn activate(store: &mut GrantStore, grant_id: &str) {
+        store
+            .authorize_temporary_activation(
+                grant_id,
+                &"n".repeat(43),
+                "activation-request-1",
+                101,
+                "operator",
+                "session-a",
+            )
+            .unwrap();
+    }
+
     #[test]
     fn grant_is_persistent_0600_and_nonce_is_never_plaintext() {
         let path = path("persistent");
@@ -701,6 +845,7 @@ mod tests {
                 "request-123",
             )
             .unwrap();
+        activate(&mut store, "grant-1");
         let run = RunRequest {
             grant_id: "grant-1".into(),
             profile_id: PROFILE_ID.into(),
@@ -911,6 +1056,7 @@ mod tests {
                 "request-123",
             )
             .unwrap();
+        activate(&mut store, "grant-1");
         assert_eq!(
             store
                 .consume(
@@ -970,6 +1116,114 @@ mod tests {
             "LIVE_GRANT_INACTIVE"
         );
         assert_eq!(store.records()[1].state, GrantState::Expired);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn temporary_activation_is_subject_bound_idempotent_and_replay_safe() {
+        let path = path("temporary-activation");
+        let mut store = GrantStore::load(path.clone()).unwrap();
+        store
+            .create(
+                request(),
+                "grant-1".into(),
+                100,
+                "operator",
+                "session-a",
+                "request-123",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .authorize_temporary_activation(
+                    "grant-1",
+                    &"n".repeat(43),
+                    "activation-request-1",
+                    101,
+                    "operator",
+                    "session-b",
+                )
+                .unwrap_err(),
+            "GRANT_SUBJECT_CHANGED"
+        );
+        let (_, idempotent) = store
+            .authorize_temporary_activation(
+                "grant-1",
+                &"n".repeat(43),
+                "activation-request-1",
+                101,
+                "operator",
+                "session-a",
+            )
+            .unwrap();
+        assert!(!idempotent);
+        assert!(store
+            .authorize_temporary_activation(
+                "grant-1",
+                &"n".repeat(43),
+                "activation-request-1",
+                102,
+                "operator",
+                "session-a",
+            )
+            .unwrap()
+            .1);
+        assert_eq!(
+            store
+                .authorize_temporary_activation(
+                    "grant-1",
+                    &"n".repeat(43),
+                    "activation-request-2",
+                    102,
+                    "operator",
+                    "session-a",
+                )
+                .unwrap_err(),
+            "LIVE_GRANT_REPLAYED"
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains(&"n".repeat(43)));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn certification_consumption_requires_temporary_activation() {
+        let path = path("activation-required");
+        let mut store = GrantStore::load(path.clone()).unwrap();
+        store
+            .create(
+                request(),
+                "grant-1".into(),
+                100,
+                "operator",
+                "session-a",
+                "request-123",
+            )
+            .unwrap();
+        let run = RunRequest {
+            grant_id: "grant-1".into(),
+            profile_id: PROFILE_ID.into(),
+            profile_revision: 1,
+            configuration_sha256: "a".repeat(64),
+            compose_model_sha256: "c".repeat(64),
+            scenario_id: SCENARIO_ID.into(),
+            scenario_revision: 1,
+            scenario_sha256: SCENARIO_SHA256.into(),
+        };
+        assert_eq!(
+            store
+                .consume(
+                    &run,
+                    &"n".repeat(43),
+                    "run-request-1",
+                    "lte-run-1".into(),
+                    101,
+                    "operator",
+                    "session-a",
+                )
+                .unwrap_err(),
+            "LTE_TEMPORARY_ACTIVATION_REQUIRED"
+        );
         let _ = fs::remove_file(path);
     }
 
