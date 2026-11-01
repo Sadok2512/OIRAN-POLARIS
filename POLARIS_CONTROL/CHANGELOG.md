@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.29.0 (polaris-control-api) — 2026-11-01 — real LTE evidence finalizer
+
+- Adds the Operator+CSRF protected `evidence-finalize` boundary that consumes
+  only server-owned `SANITIZED_APPROVED` releases and never trusts capture
+  paths, hashes, provenance, timestamps or session references from HTTP.
+- Binds releases to the exact run/profile/scenario, RAT, terminal outcome and
+  start/end timestamps; re-hashes every sanitized PCAP and normalized JSONL,
+  rejects identity-bearing events, then creates an immutable private bundle by
+  atomic rename before publishing any capture reference.
+- Preserves non-empty observed subsets for `FAILED` and `CANCELLED` runs,
+  requires S1-MME/S11/S1-U for `COMPLETED`, and keeps exact retries idempotent
+  while returning HTTP 409 for drift.
+- Does not read collector-owned paths, create captures, import production data,
+  synthesize events or promote LTE E2E certification.
+
 ## 0.28.4 (polaris-control-api) — 2026-11-01 — LTE traffic peer preflight
 
 - Fails the certification request before Grant consumption or simulator start
