@@ -11,6 +11,9 @@
 - Keeps IP assignment separate from Attach proof, rejects late events after
   timeout, and revalidates the consumed Grant immediately before every ping or
   UDP launch so expiration or revocation cannot restart traffic.
+- Retains clean terminal `FAILED` and `CANCELLED` evidence publication for the
+  independently observed LTE planes; successful publication remains gated on
+  the complete S1-MME/S11/S1-U proof set.
 
 ## 0.28.2 (polaris-control-api) — 2026-11-01 — srsENB Docker health handling
 

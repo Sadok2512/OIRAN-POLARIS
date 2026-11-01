@@ -2,7 +2,7 @@
 
 Status: `OFFLINE_ONLY`  
 OIRAN contract: `oiran.lte-evidence-ingestion.v1`  
-ANR1 contract commit: `05485194d857c56c73857100ec064c5e96de29a2`  
+ANR1 canonical schema reconciliation: `d22b1c169a` (descends `05485194d857c56c73857100ec064c5e96de29a2`)
 Canonical evidence: `oiran-polaris.lte-e2e-evidence.v1`
 
 This contract activates no capture, UE, traffic or deployment. It accepts only
@@ -16,7 +16,9 @@ server-staged, already-sanitized evidence. It is not a generic PCAP anonymizer.
 | `S11` | `S11` | `capture:S11` |
 | `S1_U` | `S1-U` | `capture:S1_U` |
 
-All three are mandatory and unique. Unsupported planes are rejected. Every
+All three are mandatory and unique for `COMPLETED` evidence. A clean terminal
+`FAILED` or `CANCELLED` run may retain a non-empty subset containing only the
+planes actually observed. Unsupported and duplicate planes are rejected. Every
 step reference resolves to one binding, and every binding identifies its
 canonical capture by zero-based `capture_ref_index`.
 
@@ -74,7 +76,40 @@ traversal are rejected.
 }
 ```
 
-The shortened example shows one binding; a valid request has three.
+The shortened example shows one binding. A completed request has three; a
+failed/cancelled partial request has one binding per observed plane and returns
+`IMPORTED_PARTIAL`.
+
+## POLARIS adapter boundary
+
+The import endpoint accepts either the direct OIRAN request or the complete,
+strict POLARIS 0.28.3 envelope with
+`schema_version=polaris-oiran.lte-import-envelope.v1`. For the latter, OIRAN
+requires the outer run/profile/scenario/time fields and every SHA256-derived
+capture ID to match the nested request before opening an artifact. Unknown
+outer, provenance, or nested fields are rejected. Partial evidence remains
+explicitly non-certified through its terminal `final_state` and manifest plane
+list.
+
+The nested evidence uses exact schema
+`oiran-polaris.lte-e2e-evidence.v1`. OIRAN does not accept a client-supplied file
+path. The operator-controlled staging publication adds only:
+
+- `schema_version=oiran.lte-evidence-ingestion.v1` and a safe `bundle_id`;
+- one server-resolved `capture_binding` per canonical `capture_ref`;
+- the normalized-event SHA-256, decoder name/version, event schema version and
+  endpoint-role map measured from the staged artifacts.
+
+The adapter must not alter the POLARIS `run_id`, scope, steps, cleanup proof or
+capture references. `deny_unknown_fields` remains active. Although POLARIS may
+model optional S5 planes, this version admits exactly `S1_MME`, `S11` and `S1_U`;
+S5 input fails with `LTE_OPTIONAL_PLANE_UNSUPPORTED` until a decoder/correlation
+contract is reviewed.
+
+5G N2/N3/N4 evidence does not pass through this LTE route. It is finalized by the
+existing CaptureManager pipeline, which verifies source checksums and publishes
+its dataset generation atomically. Session Explorer merges those persisted 5G
+datasets with admitted LTE datasets without fabricating a missing plane or counter.
 
 ## Responses and errors
 
@@ -90,7 +125,7 @@ Errors use `{"error":{"code":"CODE","message":"detail"}}`.
 - `409 LTE_INGESTION_CONFLICT`, `LTE_EXPORT_CONFLICT`;
 - `413 LTE_EVENT_LIMIT_EXCEEDED`, `LTE_EVENT_LINE_TOO_LARGE`;
 - `422 LTE_EVIDENCE_SCHEMA_UNSUPPORTED`, `LTE_EVIDENCE_SCOPE_MISMATCH`,
-  `LTE_EVIDENCE_NOT_COMPLETED`, `LTE_CLEANUP_NOT_PROVEN`;
+  `LTE_EVIDENCE_FINAL_STATE_INVALID`, `LTE_CLEANUP_NOT_PROVEN`;
 - `422 LTE_REQUIRED_PLANE_MISSING`, `LTE_OPTIONAL_PLANE_UNSUPPORTED`,
   `LTE_CAPTURE_PLANE_DUPLICATE`, `LTE_CAPTURE_FRAME_RANGE_INVALID`;
 - `422 LTE_EVIDENCE_NOT_APPROVED`, `LTE_EVIDENCE_REF_UNRESOLVED`,

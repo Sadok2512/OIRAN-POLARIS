@@ -11,6 +11,7 @@ transport-sctp = { path = "../transport-sctp" }
 transport-tcp = { path = "../transport-tcp" }
 decoder-ngap = { path = "../decoder-ngap" }
 decoder-s1ap = { path = "../decoder-s1ap" }
+decoder-nas = { path = "../decoder-nas" }
 decoder-pfcp = { path = "../decoder-pfcp" }
 decoder-gtpu = { path = "../decoder-gtpu" }
 decoder-gtpv2c = { path = "../decoder-gtpv2c" }

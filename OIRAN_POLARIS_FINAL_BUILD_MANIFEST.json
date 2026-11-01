@@ -1,0 +1,115 @@
+{
+  "schema_version": "oiran-polaris.final-release-gate.v2",
+  "generated_at": "2026-11-01T11:33:00Z",
+  "deployment_authorized": false,
+  "integration": {
+    "branch": "release/oiran-polaris-final-p0",
+    "merge_strategy": "normal_git_merge",
+    "merge_s_ours_used": false
+  },
+  "polaris": {
+    "version": "0.28.1",
+    "source_commit": "8cb356a7e4264b80fb82e2f1c90b9511f581df41",
+    "api_binary": {
+      "status": "BUILT_OFFLINE_VERIFIED",
+      "path": "/root/ANR2_POLARIS_FINAL_BUILD/POLARIS_CONTROL/target-no-keep-memory/release/polaris-control-api",
+      "size_bytes": 21273992,
+      "sha256": "3294fc65dbb7b5b28a734dc0d92e621c99fd0d9501b3e837ed7fdc05d8d7d450",
+      "build_id": "45f776983b4678d536bfbd26c1055a6c1aa4212e",
+      "elf": "ELF64 x86-64 PIE System V",
+      "maximum_glibc_symbol": "2.34"
+    },
+    "ui": {
+      "version": "0.20.0",
+      "deterministic_tar_sha256": "bd749ab68cd57803d21f43b73baaf0693b3c0487686238d595dde870703cb06d",
+      "index_sha256": "ecf682d7648f509501d841bb57b5f9e02d4117b4e0f86ec5aeaeeae1cf81af3a",
+      "javascript_sha256": "cf47551a5f75efcce0c6bbf243e74f6c46acba41da7480bc34234d5daf4ba484",
+      "css_sha256": "83ee901539c019a9db5d4366e884edf665a0acd95e26ca708c532ca5b9c6a472"
+    },
+    "tests": {
+      "rust_passed": 249,
+      "rust_failed": 0,
+      "rust_ignored_manual": 3,
+      "vitest_passed": 235,
+      "playwright_read_only_passed": 24,
+      "playwright_lte_variants_passed": 6
+    }
+  },
+  "oiran": {
+    "version": "2.7.3",
+    "source_commit": "724e6a0c93fdc09c28dfe9fb255ef64d8a5563bd",
+    "api_binary": {
+      "status": "BUILT_OFFLINE_VERIFIED",
+      "path": "/root/ANR3_LTE_CORRELATION_FIX/OIRAN/target/release/oiran-api",
+      "size_bytes": 13562040,
+      "sha256": "bbb7ca640794d17654540c4b80f23c17cd5afb0cacb401337e96fae4e23c0845",
+      "build_id": "3fbe643951d7dbf88c64633f5c6d743c42714256",
+      "elf": "ELF64 x86-64 PIE System V",
+      "maximum_glibc_symbol": "2.34"
+    },
+    "live_probe_version": "0.4.1",
+    "ui": {
+      "version": "2.7.1",
+      "deterministic_tar_sha256": "09b7a94bf7dd597c07c3503ab51557987854003605f4dadd14b50fb815037b37",
+      "index_sha256": "ecd5a0129418abe86043b836276c29ceb65bdc0b3f654ca1f77fde6065b6de4e",
+      "javascript_sha256": "a5604ec9da2b3b62ceeb570c6591d39f4e398d0674731c90727eec4719704538",
+      "css_sha256": "481e6c7cd2a0a229b3904b1c416f4177bd0e727da9756cff9bea3b492b8dd031"
+    },
+    "tests": {
+      "session_engine_passed": 18,
+      "correlation_callflow_passed": 18,
+      "api_passed": 41,
+      "live_probe_passed": 56,
+      "live_probe_failed": 0,
+      "live_probe_ignored_high_memory": 4,
+      "vitest_passed": 77
+    }
+  },
+  "abi": {
+    "host_glibc": "2.39",
+    "resolved_dependencies": [
+      "libgcc_s.so.1",
+      "libm.so.6",
+      "libc.so.6",
+      "ld-linux-x86-64.so.2"
+    ]
+  },
+  "offline_http_integration": {
+    "status": "PASS",
+    "source_events": 3,
+    "session_events": 3,
+    "unmatched_events": 0,
+    "duplicate_events": 0,
+    "lte_sessions": 1,
+    "correlation_edges": 2,
+    "s1_mme_s11": "STRONG",
+    "s11_s1_u": "EXACT",
+    "e2e": "STRONG"
+  },
+  "resource_gate": {
+    "observed_at": "2026-11-01T11:31:38Z",
+    "memory_used_bytes": 16013324288,
+    "memory_available_bytes": 4957257728,
+    "root_disk_used_percent": 60,
+    "external_dumpcap_processes": 12,
+    "dumpcap_rotation_continuity_certified": false
+  },
+  "backup_rollback": {
+    "status": "READY",
+    "directory": "/root/release-gate-backups/20261101T113300Z",
+    "polaris_archive_sha256": "c5fc2129ece78c0999a9d389516ded164eed43c77932dbcd556bd631fc9c6dff",
+    "oiran_archive_sha256": "73b9e390883693ecd33dc285058f30cafd8de7775868ef5f2ac167193e2071ec",
+    "polaris_rollback_version": "0.26.0",
+    "polaris_rollback_binary_sha256": "5d042aa4620f4d92c05f5d73ef316dfc1df18940d78a58a7eb4ab5ee43f27fc8",
+    "oiran_rollback_version": "2.5.4",
+    "oiran_rollback_binary_sha256": "7a9c5711ed1827dc9ed8fef1c34ff63816a86deccc70fadf4219643153cfd657"
+  },
+  "release_ready": true,
+  "blockers": [],
+  "caveats": [
+    "DUMPCAP_ROTATION_CONTINUITY_NOT_CERTIFIED",
+    "LTE_REAL_PASS_NOT_CLAIMED",
+    "THREE_POLARIS_MANUAL_BENCHMARK_TESTS_IGNORED",
+    "FOUR_OIRAN_HIGH_MEMORY_TESTS_IGNORED"
+  ]
+}

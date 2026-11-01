@@ -1,5 +1,58 @@
 # Changelog
 
+## OIRAN API 2.7.4 / Live Probe 0.4.2 — 2026-11-01
+
+- Imports approved evidence from clean terminal failed/cancelled LTE runs as
+  `IMPORTED_PARTIAL`, preserving the observed plane set and original hashes.
+- Keeps `COMPLETED` evidence gated on all three S1-MME/S11/S1-U planes; partial
+  evidence cannot be promoted to a successful LTE certification.
+- Persists final state and capture planes in the dataset manifest and retains
+  idempotence, run conflict, privacy, cleanup, and correlation safety guards.
+
+## OIRAN API 2.7.3 / session-engine 0.5.1 / correlation-engine 0.5.1 — 2026-11-01
+
+- Correlate LTE S1-MME, S11 and S1-U evidence across distinct per-file capture
+  hashes while retaining every original `capture_id` as provenance.
+- Require a unique S1 context, opaque pseudonym and E-RAB/F-TEID chain before
+  admitting S11 evidence; admit S1-U only when its TEID has one established
+  session owner inside the bounded 300-second evidence window.
+- Keep reused or ambiguous TEIDs, partial captures and insufficient evidence
+  unmatched rather than joining by time or TEID alone; add multi-PCAP,
+  multi-UE, reused-TEID, partial and out-of-order regressions.
+- This is an offline correlation fix only. It does not certify real LTE,
+  modify capture processes, generate traffic or deploy production services.
+
+## OIRAN API 2.7.2 / live-probe 0.4.1 / Analyzer 2.7.1 — 2026-11-01
+
+- Reject SUCI, SUPI, TMSI, PEI, equipment-identity variants and subscriber
+  key labels at the LTE evidence admission/export privacy boundary.
+- Apply recursive response sanitization to paginated LTE evidence sessions and
+  add bounded JSON/HTML export support for persisted LTE Call Flows.
+- Render LTE S1-MME/S11 and S11/S1-U correlation bridges truthfully in the
+  Analyzer; E2E remains `UNKNOWN` unless both required bridges are proven.
+- Add raw-response, export and UI regressions. This release does not create
+  capture references, certify real LTE, enable live traffic or deploy itself.
+- Redact provenance filenames containing identity labels or identity-length digit
+  runs while retaining safe `capture://` basename provenance.
+- Add fail-closed envelope regressions for duplicate capture planes, duplicate event
+  IDs, capture-ID mismatch and packet source-file mismatch.
+- Document the exact POLARIS evidence-to-OIRAN binding boundary and preserve the
+  strict S1-MME/S11/S1-U required-plane set.
+- Accept the complete strict POLARIS 0.28.0 import envelope on the existing LTE
+  import route and reject outer/nested provenance drift before artifact access.
+
+## OIRAN API 2.7.1 — 2026-10-31
+
+- Preserve the 2.7 real-lab/LTE-evidence model while integrating bounded offline
+  LTE session materialization and the complete installed LTE+5G decoder inventory;
+  live capture allowlists and execution gates remain unchanged.
+- Remove subscriber and equipment identity fields and identity-bearing decoded
+  information elements from raw API responses instead of returning masked labels.
+- Apply response sanitization at the common success and pagination boundaries for
+  datasets, sessions, events, packets, Call Flow and future read handlers.
+- Add raw JSON regressions for unauthenticated/viewer and operator reads while
+  preserving protocol events, accounting counters and capture provenance.
+
 ## Real-lab read model / API 2.7.0 / live-probe 0.4.0 / Analyzer 2.7.0 — 2026-10-31
 
 - Disable bundled reference dataset loading by default; operational Session Explorer,
@@ -1001,3 +1054,11 @@ All notable OIRAN vProbe changes are recorded here. Versions follow Semantic Ver
 - Every response carries `pagination.{limit,cursor,next_cursor,returned_events,total_events}`;
   invalid cursors fail explicitly and never replay the first page.
 
+## OIRAN API 2.6.0 / live-probe 0.3.0 - 2026-10-31
+
+- Materialise bounded LTE S1-MME/S11/S1-U sessions and correlated Call Flows
+  from already-decoded offline evidence during dataset finalisation and API load.
+- Expose the installed decoder inventory and LTE capture protocol labels through
+  the version and capture APIs.
+- Keep live LTE capture disabled: no capture interface allowlist was expanded.
+- Limit offline LTE materialisation to 128 sessions per dataset to bound memory.

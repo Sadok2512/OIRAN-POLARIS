@@ -21,6 +21,7 @@ use std::{
 
 pub const INGESTION_SCHEMA: &str = "oiran.lte-evidence-ingestion.v1";
 pub const EVIDENCE_SCHEMA: &str = "oiran-polaris.lte-e2e-evidence.v1";
+pub const POLARIS_ENVELOPE_SCHEMA: &str = "polaris-oiran.lte-import-envelope.v1";
 pub const EXPORT_SCHEMA: &str = "oiran.lte-anonymized-export.v1";
 pub const MAX_INGEST_EVENTS: usize = 50_000;
 pub const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
@@ -39,6 +40,110 @@ pub struct LteEvidenceImportRequest {
     pub bundle_id: String,
     pub evidence: LteE2eEvidence,
     pub capture_bindings: Vec<LteCaptureBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum LteEvidenceImportPayload {
+    Direct(LteEvidenceImportRequest),
+    Polaris(PolarisLteImportEnvelope),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolarisLteImportEnvelope {
+    pub schema_version: String,
+    pub provenance: PolarisLteProvenance,
+    pub oiran_import: LteEvidenceImportRequest,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolarisLteProvenance {
+    pub source: String,
+    pub published_at_epoch_ms: u64,
+    pub run_id: String,
+    pub rat: String,
+    pub profile_id: String,
+    pub scenario_id: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub capture_ids: Vec<PolarisCaptureId>,
+    pub session_references: Vec<String>,
+    pub session_reference_state: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolarisCaptureId {
+    pub plane: String,
+    pub capture_id: String,
+}
+
+impl LteEvidenceImportPayload {
+    pub fn into_request(self) -> Result<LteEvidenceImportRequest, LteEvidenceError> {
+        match self {
+            Self::Direct(request) => Ok(request),
+            Self::Polaris(envelope) => envelope.into_request(),
+        }
+    }
+}
+
+impl PolarisLteImportEnvelope {
+    fn into_request(self) -> Result<LteEvidenceImportRequest, LteEvidenceError> {
+        if self.schema_version != POLARIS_ENVELOPE_SCHEMA
+            || self.provenance.source != "POLARIS_SERVER_VERIFIED_BUNDLE"
+            || self.provenance.rat != "LTE"
+            || self.provenance.session_reference_state != "NOT_AVAILABLE_UNTIL_OIRAN_INGESTION"
+            || !self.provenance.session_references.is_empty()
+        {
+            return Err(LteEvidenceError::new(
+                "LTE_POLARIS_PROVENANCE_INVALID",
+                "outer envelope discriminator or provenance state mismatch",
+            ));
+        }
+        let evidence = &self.oiran_import.evidence;
+        if self.provenance.run_id != evidence.run_id
+            || self.provenance.profile_id != evidence.profile_id
+            || self.provenance.scenario_id != evidence.scenario_id
+            || self.provenance.started_at != evidence.started_at
+            || self.provenance.ended_at != evidence.ended_at
+        {
+            return Err(LteEvidenceError::new(
+                "LTE_POLARIS_PROVENANCE_MISMATCH",
+                "outer provenance does not match nested evidence",
+            ));
+        }
+        let expected = evidence
+            .capture_refs
+            .iter()
+            .map(|capture| {
+                (
+                    capture.plane.as_str(),
+                    format!("sha256:{}", capture.source_file_sha256),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut observed = BTreeMap::new();
+        for capture in &self.provenance.capture_ids {
+            if observed
+                .insert(capture.plane.as_str(), capture.capture_id.clone())
+                .is_some()
+            {
+                return Err(LteEvidenceError::new(
+                    "LTE_POLARIS_CAPTURE_PROVENANCE_MISMATCH",
+                    "duplicate outer capture plane",
+                ));
+            }
+        }
+        if observed != expected {
+            return Err(LteEvidenceError::new(
+                "LTE_POLARIS_CAPTURE_PROVENANCE_MISMATCH",
+                "outer capture identifiers do not match nested capture_refs",
+            ));
+        }
+        Ok(self.oiran_import)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -130,6 +235,10 @@ pub struct LteDatasetManifest {
     pub dataset_id: String,
     pub profile_id: String,
     pub scenario_id: String,
+    #[serde(default = "default_completed_state")]
+    pub final_state: String,
+    #[serde(default)]
+    pub capture_planes: Vec<String>,
     pub evidence_schema: String,
     pub evidence_sha256: String,
     pub request_sha256: String,
@@ -142,6 +251,10 @@ pub struct LteDatasetManifest {
     pub correlation_edge_count: usize,
     pub sanitization_state: String,
     pub artifacts: BTreeMap<String, String>,
+}
+
+fn default_completed_state() -> String {
+    "COMPLETED".into()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -398,6 +511,8 @@ impl LteEvidenceStore {
             dataset_id: dataset_id.into(),
             profile_id: request.evidence.profile_id.clone(),
             scenario_id: request.evidence.scenario_id.clone(),
+            final_state: request.evidence.final_state.clone(),
+            capture_planes: verified.iter().map(|item| item.plane.clone()).collect(),
             evidence_schema: request.evidence.schema_version.clone(),
             evidence_sha256: sha256_hex(&evidence_bytes),
             request_sha256: request_sha256.into(),
@@ -426,7 +541,12 @@ impl LteEvidenceStore {
             session_count: sessions.len(),
             correlation_edge_count: edges.len(),
             idempotent: false,
-            state: "IMPORTED".into(),
+            state: if request.evidence.final_state == "COMPLETED" {
+                "IMPORTED"
+            } else {
+                "IMPORTED_PARTIAL"
+            }
+            .into(),
         };
         write_atomic(
             &staging.join("ingestion_result.json"),
@@ -466,7 +586,10 @@ impl LteEvidenceStore {
         if paths.len() > MAX_CATALOG_DATASETS {
             return Err(LteEvidenceError::new(
                 "LTE_CATALOG_LIMIT_EXCEEDED",
-                format!("{} finalized datasets exceeds {MAX_CATALOG_DATASETS}", paths.len()),
+                format!(
+                    "{} finalized datasets exceeds {MAX_CATALOG_DATASETS}",
+                    paths.len()
+                ),
             ));
         }
         paths
@@ -493,9 +616,8 @@ impl LteEvidenceStore {
                 .join("datasets")
                 .join(&manifest.dataset_id)
                 .join("sessions.jsonl");
-            let reader = BufReader::new(
-                File::open(path).map_err(io_error("LTE_ARTIFACT_UNAVAILABLE"))?,
-            );
+            let reader =
+                BufReader::new(File::open(path).map_err(io_error("LTE_ARTIFACT_UNAVAILABLE"))?);
             for line in reader.lines() {
                 let line = line.map_err(io_error("LTE_ARTIFACT_INVALID"))?;
                 if line.len() > MAX_EVENT_LINE_BYTES {
@@ -530,6 +652,35 @@ impl LteEvidenceStore {
         };
         self.callflow_page(&manifest.run_id, session_id, cursor, limit)
             .map(Some)
+    }
+
+    /// Loads a finalized LTE Call Flow for the existing API export route.
+    /// The artifact is selected only through the finalized catalog and its
+    /// size is capped before allocation; callers must still apply their
+    /// response privacy sanitizer before serializing JSON or HTML.
+    pub fn callflow_for_export_by_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<CallFlow>, LteEvidenceError> {
+        let Some((manifest, _)) = self.find_session(session_id)? else {
+            return Ok(None);
+        };
+        let path = self
+            .root
+            .join("datasets")
+            .join(&manifest.dataset_id)
+            .join("callflows")
+            .join(format!("{session_id}.json"));
+        let length = fs::metadata(&path)
+            .map_err(io_error("LTE_ARTIFACT_UNAVAILABLE"))?
+            .len();
+        if length > MAX_RETAINED_EVENT_BYTES as u64 {
+            return Err(LteEvidenceError::new(
+                "LTE_CALLFLOW_EXPORT_TOO_LARGE",
+                length.to_string(),
+            ));
+        }
+        read_json(&path).map(Some)
     }
 
     pub fn session_page(
@@ -741,9 +892,12 @@ fn validate_request(request: &LteEvidenceImportRequest) -> Result<(), LteEvidenc
             "profile_id/scenario_id mismatch",
         ));
     }
-    if request.evidence.final_state != "COMPLETED" {
+    if !matches!(
+        request.evidence.final_state.as_str(),
+        "COMPLETED" | "FAILED" | "CANCELLED"
+    ) {
         return Err(LteEvidenceError::new(
-            "LTE_EVIDENCE_NOT_COMPLETED",
+            "LTE_EVIDENCE_FINAL_STATE_INVALID",
             &request.evidence.final_state,
         ));
     }
@@ -867,7 +1021,15 @@ fn verify_bindings<'a>(
         }
         validate_sha256(&capture.source_file_sha256, "LTE_CAPTURE_SHA256_INVALID")?;
     }
-    if planes != REQUIRED_PLANES.into_iter().collect() {
+    if planes.is_empty() {
+        return Err(LteEvidenceError::new(
+            "LTE_NO_OBSERVED_CAPTURE",
+            "at least one approved LTE plane is required",
+        ));
+    }
+    if request.evidence.final_state == "COMPLETED"
+        && planes != REQUIRED_PLANES.into_iter().collect()
+    {
         return Err(LteEvidenceError::new(
             "LTE_REQUIRED_PLANE_MISSING",
             format!("observed={planes:?}"),
@@ -1165,19 +1327,78 @@ fn confined_regular_file(root: &Path, relative: &str) -> Result<PathBuf, LteEvid
     Ok(canonical)
 }
 
+fn normalized_identity_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_forbidden_identity_label(value: &str) -> bool {
+    let normalized = normalized_identity_label(value);
+    matches!(
+        normalized.as_str(),
+        "imsi"
+            | "supi"
+            | "suci"
+            | "guti"
+            | "tmsi"
+            | "5gtmsi"
+            | "imei"
+            | "imeisv"
+            | "maskedimeisv"
+            | "msisdn"
+            | "pei"
+            | "k"
+            | "opc"
+            | "authenticationkey"
+            | "subscriberkey"
+            | "securitykey"
+            | "permanentequipmentidentifier"
+    ) || normalized.contains("imeisv")
+        || normalized.ends_with("tmsi")
+        || normalized.contains("mobileidentity")
+        || normalized.contains("subscriberidentity")
+}
+
 fn contains_forbidden_identity(value: &Value) -> bool {
     match value {
         Value::Object(map) => map.iter().any(|(key, value)| {
-            let normalized = key.to_ascii_lowercase().replace(['-', ' '], "_");
-            matches!(
-                normalized.as_str(),
-                "imsi" | "imei" | "imeisv" | "msisdn" | "guti" | "k" | "opc"
-            ) || contains_forbidden_identity(value)
+            is_forbidden_identity_label(key)
+                || (["name", "type", "field", "key"].contains(&key.as_str())
+                    && value.as_str().is_some_and(is_forbidden_identity_label))
+                || contains_forbidden_identity(value)
         }),
         Value::Array(items) => items.iter().any(contains_forbidden_identity),
-        Value::String(text) => has_long_digit_run(text, 14),
+        Value::String(text) => {
+            let lower = text.to_ascii_lowercase();
+            (has_long_digit_run(text, 14) && !is_sha256_value(text))
+                || [
+                    "imsi-",
+                    "supi-",
+                    "suci-",
+                    "5g-guti-",
+                    "5g-tmsi-",
+                    "imei-",
+                    "imeisv=",
+                    "msisdn=",
+                    "pei=",
+                    "opc=",
+                    "authentication_key=",
+                    "subscriber_key=",
+                    "security_key=",
+                ]
+                .iter()
+                .any(|marker| lower.contains(marker))
+        }
         _ => false,
     }
+}
+
+fn is_sha256_value(value: &str) -> bool {
+    let digest = value.strip_prefix("sha256:").unwrap_or(value);
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn has_long_digit_run(value: &str, threshold: usize) -> bool {
@@ -1569,6 +1790,16 @@ mod tests {
             .callflow_page_by_session(session_id, None, 2)
             .unwrap()
             .is_some());
+        let export_flow = store
+            .callflow_for_export_by_session(session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(export_flow.session_id, session_id);
+        assert_eq!(export_flow.technology, "LTE");
+        assert_eq!(
+            export_flow.events.len() as u64,
+            flow["pagination"]["total_events"].as_u64().unwrap()
+        );
         assert!(!store_root
             .join("datasets")
             .read_dir()
@@ -1580,6 +1811,106 @@ mod tests {
                 .starts_with('.')));
         fs::remove_dir_all(bundle).unwrap();
         fs::remove_dir_all(store_root).unwrap();
+    }
+
+    #[test]
+    fn imports_timeout_partial_evidence_without_inventing_missing_planes() {
+        let (bundle, mut request) = build_bundle();
+        request.evidence.run_id = "lte-run-timeout-partial-0001".into();
+        request.evidence.final_state = "FAILED".into();
+        request.evidence.capture_refs.truncate(1);
+        request.capture_bindings.truncate(1);
+        request.evidence.steps[0].state = "FAILED".into();
+        request.evidence.steps[0].reason_code = Some("LTE_GLOBAL_TIMEOUT".into());
+        request.evidence.steps[0].evidence_refs = vec!["capture:S1_MME".into()];
+
+        let store_root = temp_root("partial-timeout-store");
+        let store = LteEvidenceStore::new(store_root.clone()).unwrap();
+        let first = store.ingest(&bundle, &request).unwrap();
+        assert_eq!(first.state, "IMPORTED_PARTIAL");
+        assert_eq!(first.session_count, 1);
+        assert!(!first.idempotent);
+        assert!(store.ingest(&bundle, &request).unwrap().idempotent);
+
+        let catalog = store.catalog().unwrap();
+        let manifest = catalog
+            .iter()
+            .find(|item| item.run_id == request.evidence.run_id)
+            .unwrap();
+        assert_eq!(manifest.final_state, "FAILED");
+        assert_eq!(manifest.capture_planes, vec!["S1_MME"]);
+        assert_eq!(manifest.source_capture_sha256.len(), 1);
+        let sessions = store.session_page(&request.evidence.run_id, 1, 10).unwrap();
+        assert_eq!(sessions["data"].as_array().unwrap().len(), 1);
+        let session_id = sessions["data"][0]["session_id"].as_str().unwrap();
+        let flow = store
+            .callflow_page(&request.evidence.run_id, session_id, None, 100)
+            .unwrap();
+        assert_eq!(flow["interfaces"], json!(["S1-MME"]));
+        assert!(flow["correlation_edges"].as_array().unwrap().is_empty());
+
+        fs::remove_dir_all(bundle).unwrap();
+        fs::remove_dir_all(store_root).unwrap();
+    }
+
+    #[test]
+    fn failed_run_still_requires_completed_cleanup_proof() {
+        let (bundle, mut request) = build_bundle();
+        request.evidence.run_id = "lte-run-failed-cleanup-0001".into();
+        request.evidence.final_state = "FAILED".into();
+        request.evidence.cleanup.srsue_stopped = false;
+        let store_root = temp_root("failed-cleanup-store");
+        let store = LteEvidenceStore::new(store_root.clone()).unwrap();
+        assert_eq!(
+            store.ingest(&bundle, &request).unwrap_err().code,
+            "LTE_CLEANUP_NOT_PROVEN"
+        );
+        fs::remove_dir_all(bundle).unwrap();
+        fs::remove_dir_all(store_root).unwrap();
+    }
+
+    #[test]
+    fn accepts_exact_polaris_outer_envelope_and_rejects_provenance_drift() {
+        let (_bundle, request) = build_bundle();
+        let capture_ids = request
+            .evidence
+            .capture_refs
+            .iter()
+            .map(|capture| PolarisCaptureId {
+                plane: capture.plane.clone(),
+                capture_id: format!("sha256:{}", capture.source_file_sha256),
+            })
+            .collect();
+        let envelope = PolarisLteImportEnvelope {
+            schema_version: POLARIS_ENVELOPE_SCHEMA.into(),
+            provenance: PolarisLteProvenance {
+                source: "POLARIS_SERVER_VERIFIED_BUNDLE".into(),
+                published_at_epoch_ms: 1_793_448_010_000,
+                run_id: request.evidence.run_id.clone(),
+                rat: "LTE".into(),
+                profile_id: request.evidence.profile_id.clone(),
+                scenario_id: request.evidence.scenario_id.clone(),
+                started_at: request.evidence.started_at.clone(),
+                ended_at: request.evidence.ended_at.clone(),
+                capture_ids,
+                session_references: vec![],
+                session_reference_state: "NOT_AVAILABLE_UNTIL_OIRAN_INGESTION".into(),
+            },
+            oiran_import: request.clone(),
+        };
+        let decoded: LteEvidenceImportPayload =
+            serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
+        assert_eq!(
+            decoded.into_request().unwrap().evidence.run_id,
+            request.evidence.run_id
+        );
+
+        let mut drifted = envelope;
+        drifted.provenance.scenario_id = "different-scenario".into();
+        let error = LteEvidenceImportPayload::Polaris(drifted)
+            .into_request()
+            .unwrap_err();
+        assert_eq!(error.code, "LTE_POLARIS_PROVENANCE_MISMATCH");
     }
 
     #[test]
@@ -1623,6 +1954,63 @@ mod tests {
             store.ingest(&bundle, &request).unwrap_err().code,
             "LTE_EVIDENCE_REF_UNRESOLVED"
         );
+        fs::remove_dir_all(store_root).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_planes_events_and_mismatched_event_provenance() {
+        let store_root = temp_root("provenance-reject-store");
+        let store = LteEvidenceStore::new(store_root.clone()).unwrap();
+
+        let (bundle, mut request) = build_bundle();
+        request.evidence.capture_refs[1].plane = "S1_MME".into();
+        assert_eq!(
+            store.ingest(&bundle, &request).unwrap_err().code,
+            "LTE_CAPTURE_PLANE_DUPLICATE"
+        );
+        fs::remove_dir_all(bundle).unwrap();
+
+        let (bundle, mut request) = build_bundle();
+        let events_path = bundle.join(&request.capture_bindings[1].normalized_events_file);
+        let mut event: EventRecord =
+            serde_json::from_str(fs::read_to_string(&events_path).unwrap().trim()).unwrap();
+        event.event_id = "evt-S1_MME".into();
+        let bytes = jsonl_bytes(&[event]).unwrap();
+        fs::write(&events_path, &bytes).unwrap();
+        request.capture_bindings[1].normalized_events_sha256 = sha256_hex(&bytes);
+        assert_eq!(
+            store.ingest(&bundle, &request).unwrap_err().code,
+            "LTE_EVENT_ID_DUPLICATE"
+        );
+        fs::remove_dir_all(bundle).unwrap();
+
+        let (bundle, mut request) = build_bundle();
+        let events_path = bundle.join(&request.capture_bindings[0].normalized_events_file);
+        let mut event: EventRecord =
+            serde_json::from_str(fs::read_to_string(&events_path).unwrap().trim()).unwrap();
+        event.capture_id = format!("sha256:{}", "0".repeat(64));
+        let bytes = jsonl_bytes(&[event]).unwrap();
+        fs::write(&events_path, &bytes).unwrap();
+        request.capture_bindings[0].normalized_events_sha256 = sha256_hex(&bytes);
+        assert_eq!(
+            store.ingest(&bundle, &request).unwrap_err().code,
+            "LTE_EVENT_PROVENANCE_MISMATCH"
+        );
+        fs::remove_dir_all(bundle).unwrap();
+
+        let (bundle, mut request) = build_bundle();
+        let events_path = bundle.join(&request.capture_bindings[2].normalized_events_file);
+        let mut event: EventRecord =
+            serde_json::from_str(fs::read_to_string(&events_path).unwrap().trim()).unwrap();
+        event.packet_references[0].source_file = "different-source.pcapng".into();
+        let bytes = jsonl_bytes(&[event]).unwrap();
+        fs::write(&events_path, &bytes).unwrap();
+        request.capture_bindings[2].normalized_events_sha256 = sha256_hex(&bytes);
+        assert_eq!(
+            store.ingest(&bundle, &request).unwrap_err().code,
+            "LTE_PACKET_REFERENCE_INVALID"
+        );
+        fs::remove_dir_all(bundle).unwrap();
         fs::remove_dir_all(store_root).unwrap();
     }
 
@@ -1705,7 +2093,7 @@ mod tests {
         let (bundle, mut request) = build_bundle();
         request.evidence.steps[0]
             .measurements
-            .insert("imsi".into(), Value::String("001010000000001".into()));
+            .insert("imsi".into(), Value::String("synthetic-identity".into()));
         let store_root = temp_root("privacy-store");
         let store = LteEvidenceStore::new(store_root.clone()).unwrap();
         assert_eq!(
@@ -1719,5 +2107,57 @@ mod tests {
         fs::remove_dir_all(bundle).unwrap();
         fs::remove_dir_all(bundle2).unwrap();
         fs::remove_dir_all(store_root).unwrap();
+    }
+
+    #[test]
+    fn privacy_predicate_rejects_all_prohibited_identity_labels_and_values() {
+        for label in [
+            "imsi",
+            "SUPI",
+            "suci",
+            "GUTI",
+            "5G-TMSI",
+            "imei",
+            "MaskedIMEISV",
+            "MSISDN",
+            "PEI",
+            "K",
+            "OPc",
+            "authentication_key",
+            "subscriber-key",
+            "Security Key",
+            "PermanentEquipmentIdentifier",
+        ] {
+            assert!(
+                contains_forbidden_identity(&json!({(label):"opaque"})),
+                "identity-bearing key was accepted: {label}"
+            );
+            assert!(
+                contains_forbidden_identity(&json!({"information_elements":[
+                    {"name":label,"value":"opaque"}
+                ]})),
+                "identity IE label was accepted: {label}"
+            );
+        }
+        for value in [
+            "suci-opaque",
+            "supi-opaque",
+            "5g-tmsi-opaque",
+            "pei=opaque",
+            "authentication_key=opaque",
+            "subscriber_key=opaque",
+            "security_key=opaque",
+        ] {
+            assert!(
+                contains_forbidden_identity(&json!({"value":value})),
+                "identity-shaped value was accepted: {value}"
+            );
+        }
+        assert!(!contains_forbidden_identity(&json!({
+            "imsi_pseudonym":"SUB-opaque-a",
+            "message_name":"InitialContextSetupResponse",
+            "teid":"0x1001",
+            "capture_id":format!("sha256:{}", "0".repeat(64))
+        })));
     }
 }

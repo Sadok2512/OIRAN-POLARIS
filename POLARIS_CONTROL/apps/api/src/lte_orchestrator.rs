@@ -420,7 +420,11 @@ impl RunStore {
         now_ms: u64,
     ) -> Result<(), String> {
         let run = self.run_mut(run_id)?;
-        if let Some(item) = run.steps.iter_mut().find(|item| item.state == StepState::Running) {
+        if let Some(item) = run
+            .steps
+            .iter_mut()
+            .find(|item| item.state == StepState::Running)
+        {
             item.state = StepState::Failed;
             item.reason_code = Some(reason.into());
             item.ended_at = Some(timestamp(now_ms));
@@ -473,8 +477,16 @@ impl RunStore {
             return Err("LTE_EVIDENCE_BUNDLE_ID_INVALID".into());
         }
         let run = self.run_mut(run_id)?;
-        if run.state != RunState::Clean || run.outcome != Some(RunOutcome::Completed) {
+        if run.state != RunState::Clean
+            || !matches!(
+                run.outcome,
+                Some(RunOutcome::Completed | RunOutcome::Failed | RunOutcome::Cancelled)
+            )
+        {
             return Err("LTE_EVIDENCE_RUN_NOT_ADMISSIBLE".into());
+        }
+        if run.outcome == Some(RunOutcome::Completed) && !capture_refs_complete(&refs) {
+            return Err("LTE_EVIDENCE_REQUIRED_PLANE_MISSING".into());
         }
         if let Some(existing) = &run.evidence_bundle_id {
             return if existing == bundle_id && run.capture_refs == refs {
@@ -523,10 +535,13 @@ impl RunStore {
 }
 
 pub fn validate_capture_refs(refs: &[CaptureRef]) -> Result<(), String> {
-    // OIRAN 2.7.1 admits exactly the three mandatory LTE planes. Optional
-    // or 5G planes are rejected instead of being silently published.
+    // A failed/cancelled run may legitimately have only the planes observed
+    // before cleanup. Empty, duplicate, unsupported or unapproved evidence is
+    // still rejected; a successful run separately requires all three planes.
     let supported = ["S1_MME", "S11", "S1_U"];
-    let required = ["S1_MME", "S11", "S1_U"];
+    if refs.is_empty() {
+        return Err("LTE_EVIDENCE_NO_OBSERVED_CAPTURE".into());
+    }
     let mut planes = BTreeSet::new();
     for reference in refs {
         if !supported.contains(&reference.plane.as_str()) {
@@ -551,10 +566,17 @@ pub fn validate_capture_refs(refs: &[CaptureRef]) -> Result<(), String> {
             return Err("LTE_EVIDENCE_NOT_APPROVED".into());
         }
     }
-    if required.iter().any(|plane| !planes.contains(plane)) {
-        return Err("LTE_EVIDENCE_REQUIRED_PLANE_MISSING".into());
-    }
     Ok(())
+}
+
+fn capture_refs_complete(refs: &[CaptureRef]) -> bool {
+    let planes = refs
+        .iter()
+        .map(|reference| reference.plane.as_str())
+        .collect::<BTreeSet<_>>();
+    ["S1_MME", "S11", "S1_U"]
+        .into_iter()
+        .all(|plane| planes.contains(plane))
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -568,7 +590,9 @@ fn safe_relative_file(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('/')
         && !value.contains('\\')
-        && value.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 fn safe_id(value: &str) -> bool {
@@ -603,8 +627,7 @@ fn confined_regular_file(bundle: &Path, relative: &str) -> Result<PathBuf, Strin
         return Err("LTE_EVIDENCE_BUNDLE_PATH_REJECTED".into());
     }
     let candidate = bundle.join(relative);
-    let metadata = fs::symlink_metadata(&candidate)
-        .map_err(|_| "LTE_EVIDENCE_FILE_UNAVAILABLE")?;
+    let metadata = fs::symlink_metadata(&candidate).map_err(|_| "LTE_EVIDENCE_FILE_UNAVAILABLE")?;
     if !metadata.file_type().is_file() {
         return Err("LTE_EVIDENCE_FILE_UNSAFE".into());
     }
@@ -639,8 +662,8 @@ pub fn load_observed_evidence_bundle(
         return Err("LTE_EVIDENCE_BUNDLE_PATH_REJECTED".into());
     }
     let manifest_path = canonical_bundle.join("polaris-evidence-proof.json");
-    let metadata = fs::symlink_metadata(&manifest_path)
-        .map_err(|_| "LTE_EVIDENCE_MANIFEST_UNAVAILABLE")?;
+    let metadata =
+        fs::symlink_metadata(&manifest_path).map_err(|_| "LTE_EVIDENCE_MANIFEST_UNAVAILABLE")?;
     if !metadata.file_type().is_file() || metadata.len() > 1024 * 1024 {
         return Err("LTE_EVIDENCE_MANIFEST_UNSAFE".into());
     }
@@ -677,15 +700,19 @@ pub fn load_observed_evidence_bundle(
     })
 }
 
-/// Build the exact OIRAN 2.7.1 wrapper from a terminal, clean run and three
-/// independently observed, sanitized capture proofs. No capture reference is
-/// synthesized from run state or timestamps.
+/// Build the OIRAN wrapper from a terminal, clean run and independently
+/// observed, sanitized capture proofs. Failed/cancelled runs retain only the
+/// planes actually observed; no capture reference is synthesized from state
+/// or timestamps and only completed runs may claim a complete proof set.
 pub fn build_oiran_evidence_envelope(
     run: &RunRecord,
     input: EvidenceEnvelopeInput,
 ) -> Result<OiranEvidenceEnvelope, String> {
     if run.state != RunState::Clean
-        || run.outcome != Some(RunOutcome::Completed)
+        || !matches!(
+            run.outcome,
+            Some(RunOutcome::Completed | RunOutcome::Failed | RunOutcome::Cancelled)
+        )
         || run.cleanup_required
         || run.ended_at.as_deref().map_or(true, str::is_empty)
         || !run.cleanup.srsue_stopped
@@ -706,6 +733,9 @@ pub fn build_oiran_evidence_envelope(
         .map(|proof| proof.capture_ref.clone())
         .collect::<Vec<_>>();
     validate_capture_refs(&capture_refs)?;
+    if run.outcome == Some(RunOutcome::Completed) && !capture_refs_complete(&capture_refs) {
+        return Err("LTE_EVIDENCE_REQUIRED_PLANE_MISSING".into());
+    }
 
     let mut capture_bindings = Vec::with_capacity(input.capture_proofs.len());
     let mut provenance = serde_json::Map::new();
@@ -754,6 +784,10 @@ pub fn build_oiran_evidence_envelope(
         });
     }
 
+    let available_planes = capture_refs
+        .iter()
+        .map(|reference| reference.plane.as_str())
+        .collect::<BTreeSet<_>>();
     let mut steps = run.steps.clone();
     for (step_index, plane) in [
         (2_usize, "S1_MME"),
@@ -762,6 +796,9 @@ pub fn build_oiran_evidence_envelope(
         (9, "S1_U"),
         (10, "S11"),
     ] {
+        if !available_planes.contains(plane) {
+            continue;
+        }
         if let Some(step) = steps.get_mut(step_index) {
             let evidence_ref = format!("capture:{plane}");
             if !step.evidence_refs.contains(&evidence_ref) {
@@ -789,9 +826,13 @@ pub fn build_oiran_evidence_envelope(
         .iter()
         .map(|binding| binding.evidence_ref.as_str())
         .collect::<BTreeSet<_>>();
-    if steps.iter().flat_map(|step| &step.evidence_refs).any(|reference| {
-        reference.starts_with("capture:") && !valid_refs.contains(reference.as_str())
-    }) {
+    if steps
+        .iter()
+        .flat_map(|step| &step.evidence_refs)
+        .any(|reference| {
+            reference.starts_with("capture:") && !valid_refs.contains(reference.as_str())
+        })
+    {
         return Err("LTE_EVIDENCE_REF_UNRESOLVED".into());
     }
 
@@ -805,7 +846,13 @@ pub fn build_oiran_evidence_envelope(
             scenario_id: run.scenario_id.clone(),
             started_at: run.started_at.clone(),
             ended_at: run.ended_at.clone().unwrap_or_default(),
-            final_state: "COMPLETED".into(),
+            final_state: match run.outcome {
+                Some(RunOutcome::Completed) => "COMPLETED",
+                Some(RunOutcome::Failed) => "FAILED",
+                Some(RunOutcome::Cancelled) => "CANCELLED",
+                _ => return Err("LTE_EVIDENCE_RUN_NOT_ADMISSIBLE".into()),
+            }
+            .into(),
             steps,
             capture_refs,
             cleanup: run.cleanup.clone(),
@@ -930,17 +977,26 @@ mod tests {
         }
     }
     fn completed_run(name: &str) -> RunRecord {
+        terminal_run(name, RunOutcome::Completed)
+    }
+    fn terminal_run(name: &str, outcome: RunOutcome) -> RunRecord {
         let p = path(name);
         let _ = fs::remove_file(&p);
         let mut store = RunStore::load(p.clone()).unwrap();
         let run_id = format!("lte-run-{name}-12345678");
         store
-            .create(run_id.clone(), "grant-test".into(), 1, 999_999, "idempotency-key-test")
+            .create(
+                run_id.clone(),
+                "grant-test".into(),
+                1,
+                999_999,
+                "idempotency-key-test",
+            )
             .unwrap();
         store
             .finalize(
                 &run_id,
-                RunOutcome::Completed,
+                outcome,
                 CleanupEvidence {
                     srsue_stopped: true,
                     srsenb_stopped: true,
@@ -962,7 +1018,11 @@ mod tests {
             &run,
             EvidenceEnvelopeInput {
                 bundle_id: "bundle-lte-approved-01".into(),
-                capture_proofs: vec![capture_proof("S1_MME"), capture_proof("S11"), capture_proof("S1_U")],
+                capture_proofs: vec![
+                    capture_proof("S1_MME"),
+                    capture_proof("S11"),
+                    capture_proof("S1_U"),
+                ],
             },
         )
         .unwrap();
@@ -972,7 +1032,10 @@ mod tests {
         assert_eq!(envelope.evidence.capture_refs.len(), 3);
         for (index, binding) in envelope.capture_bindings.iter().enumerate() {
             assert_eq!(binding.capture_ref_index, index);
-            assert_eq!(binding.decoder_version, envelope.evidence.capture_refs[index].decoder_version);
+            assert_eq!(
+                binding.decoder_version,
+                envelope.evidence.capture_refs[index].decoder_version
+            );
             assert_eq!(binding.event_schema_version, "1.5.0");
         }
         let json = serde_json::to_value(envelope).unwrap();
@@ -984,24 +1047,73 @@ mod tests {
     fn oiran_wrapper_fails_closed_for_unproved_or_inadmissible_evidence() {
         let good = || EvidenceEnvelopeInput {
             bundle_id: "bundle-lte-approved-02".into(),
-            capture_proofs: vec![capture_proof("S1_MME"), capture_proof("S11"), capture_proof("S1_U")],
+            capture_proofs: vec![
+                capture_proof("S1_MME"),
+                capture_proof("S11"),
+                capture_proof("S1_U"),
+            ],
         };
-        let mut failed = completed_run("negative");
-        failed.outcome = Some(RunOutcome::Failed);
-        assert_eq!(build_oiran_evidence_envelope(&failed, good()).unwrap_err(), "LTE_EVIDENCE_RUN_NOT_ADMISSIBLE");
         let run = completed_run("negative-clean");
         let mut missing = good();
         missing.capture_proofs.pop();
-        assert_eq!(build_oiran_evidence_envelope(&run, missing).unwrap_err(), "LTE_EVIDENCE_REQUIRED_PLANE_MISSING");
+        assert_eq!(
+            build_oiran_evidence_envelope(&run, missing).unwrap_err(),
+            "LTE_EVIDENCE_REQUIRED_PLANE_MISSING"
+        );
         let mut raw = good();
         raw.capture_proofs[0].capture_ref.sanitization_state = "RAW".into();
-        assert_eq!(build_oiran_evidence_envelope(&run, raw).unwrap_err(), "LTE_EVIDENCE_NOT_APPROVED");
+        assert_eq!(
+            build_oiran_evidence_envelope(&run, raw).unwrap_err(),
+            "LTE_EVIDENCE_NOT_APPROVED"
+        );
         let mut five_g = good();
         five_g.capture_proofs[0].capture_ref.plane = "N2".into();
-        assert_eq!(build_oiran_evidence_envelope(&run, five_g).unwrap_err(), "LTE_EVIDENCE_PLANE_UNSUPPORTED");
+        assert_eq!(
+            build_oiran_evidence_envelope(&run, five_g).unwrap_err(),
+            "LTE_EVIDENCE_PLANE_UNSUPPORTED"
+        );
         let mut identity = good();
         identity.capture_proofs[0].session_refs = vec!["001010000000001".into()];
-        assert_eq!(build_oiran_evidence_envelope(&run, identity).unwrap_err(), "LTE_EVIDENCE_SESSION_REF_INVALID");
+        assert_eq!(
+            build_oiran_evidence_envelope(&run, identity).unwrap_err(),
+            "LTE_EVIDENCE_SESSION_REF_INVALID"
+        );
+    }
+    #[test]
+    fn terminal_failed_and_cancelled_runs_publish_only_observed_planes() {
+        for (name, outcome, final_state) in [
+            ("timeout-proof", RunOutcome::Failed, "FAILED"),
+            ("cancelled-proof", RunOutcome::Cancelled, "CANCELLED"),
+        ] {
+            let run = terminal_run(name, outcome);
+            let envelope = build_oiran_evidence_envelope(
+                &run,
+                EvidenceEnvelopeInput {
+                    bundle_id: format!("bundle-{name}"),
+                    capture_proofs: vec![capture_proof("S1_MME")],
+                },
+            )
+            .unwrap();
+            assert_eq!(envelope.evidence.final_state, final_state);
+            assert_eq!(envelope.evidence.capture_refs.len(), 1);
+            assert_eq!(envelope.evidence.capture_refs[0].plane, "S1_MME");
+        }
+    }
+
+    #[test]
+    fn completed_run_still_requires_all_three_planes() {
+        let run = completed_run("complete-needs-three");
+        assert_eq!(
+            build_oiran_evidence_envelope(
+                &run,
+                EvidenceEnvelopeInput {
+                    bundle_id: "bundle-complete-needs-three".into(),
+                    capture_proofs: vec![capture_proof("S1_MME")],
+                },
+            )
+            .unwrap_err(),
+            "LTE_EVIDENCE_REQUIRED_PLANE_MISSING"
+        );
     }
     #[test]
     fn staged_bundle_is_rehashed_and_operator_metadata_cannot_bypass_it() {
@@ -1091,11 +1203,7 @@ mod tests {
         let refs = vec![capture("S1_MME"), capture("S11"), capture("S1_U")];
         assert_eq!(
             store
-                .publish_capture_refs(
-                    "lte-run-publication",
-                    "bundle-publication-01",
-                    refs.clone(),
-                )
+                .publish_capture_refs("lte-run-publication", "bundle-publication-01", refs.clone(),)
                 .unwrap_err(),
             "LTE_EVIDENCE_RUN_NOT_ADMISSIBLE"
         );
@@ -1134,6 +1242,56 @@ mod tests {
                 .evidence_bundle_id
                 .as_deref(),
             Some("bundle-publication-01")
+        );
+        let _ = fs::remove_file(p);
+    }
+    #[test]
+    fn timeout_cleanup_keeps_observed_capture_refs_publishable_after_reload() {
+        let p = path("timeout-publication");
+        let _ = fs::remove_file(&p);
+        let run_id = "lte-run-timeout-publication";
+        let mut store = RunStore::load(p.clone()).unwrap();
+        store
+            .create(
+                run_id.into(),
+                "grant-timeout-publication".into(),
+                1,
+                999_999,
+                "timeout-publication-key",
+            )
+            .unwrap();
+        store
+            .fail_active_step(run_id, "LTE_GLOBAL_TIMEOUT", 2)
+            .unwrap();
+        store
+            .finalize(
+                run_id,
+                RunOutcome::Failed,
+                CleanupEvidence {
+                    srsue_stopped: true,
+                    srsenb_stopped: true,
+                    sidecars_removed: true,
+                    epc_healthy: true,
+                    dumpcaps_preserved: true,
+                },
+                3,
+            )
+            .unwrap();
+        assert!(!store
+            .publish_capture_refs(
+                run_id,
+                "bundle-timeout-publication",
+                vec![capture("S1_MME")]
+            )
+            .unwrap());
+        drop(store);
+        let store = RunStore::load(p.clone()).unwrap();
+        let run = store.get(run_id).unwrap();
+        assert_eq!(run.outcome, Some(RunOutcome::Failed));
+        assert_eq!(run.capture_refs.len(), 1);
+        assert_eq!(
+            run.evidence_bundle_id.as_deref(),
+            Some("bundle-timeout-publication")
         );
         let _ = fs::remove_file(p);
     }
@@ -1211,19 +1369,48 @@ mod tests {
         let p = path("proof-before-state");
         let _ = fs::remove_file(&p);
         let mut store = RunStore::load(p.clone()).unwrap();
-        store.create("lte-run-12345678".into(),"g".into(),1,999999,"key-12345678").unwrap();
-        store.intent("lte-run-12345678",RunState::S1Ready,"s1-op".into(),2,2).unwrap();
-        assert_eq!(store.get("lte-run-12345678").unwrap().state,RunState::Idle);
-        assert_eq!(store.get("lte-run-12345678").unwrap().intended_state,Some(RunState::S1Ready));
-        store.observe("lte-run-12345678",2,Observation{
-            sequence:2, observed_at:"test".into(), source_kind:"synthetic_sctp".into(),
-            source_sha256:"a".repeat(64), validity:"VALID".into(),
-            sanitization_state:"SYNTHETIC_NO_IDENTITY".into(), measurements:serde_json::json!({"connected":true})
-        },3).unwrap();
-        assert_eq!(store.get("lte-run-12345678").unwrap().state,RunState::Idle);
-        store.advance("lte-run-12345678",RunState::S1Ready).unwrap();
-        assert_eq!(store.get("lte-run-12345678").unwrap().state,RunState::S1Ready);
-        assert_eq!(store.get("lte-run-12345678").unwrap().intended_state,None);
+        store
+            .create(
+                "lte-run-12345678".into(),
+                "g".into(),
+                1,
+                999999,
+                "key-12345678",
+            )
+            .unwrap();
+        store
+            .intent("lte-run-12345678", RunState::S1Ready, "s1-op".into(), 2, 2)
+            .unwrap();
+        assert_eq!(store.get("lte-run-12345678").unwrap().state, RunState::Idle);
+        assert_eq!(
+            store.get("lte-run-12345678").unwrap().intended_state,
+            Some(RunState::S1Ready)
+        );
+        store
+            .observe(
+                "lte-run-12345678",
+                2,
+                Observation {
+                    sequence: 2,
+                    observed_at: "test".into(),
+                    source_kind: "synthetic_sctp".into(),
+                    source_sha256: "a".repeat(64),
+                    validity: "VALID".into(),
+                    sanitization_state: "SYNTHETIC_NO_IDENTITY".into(),
+                    measurements: serde_json::json!({"connected":true}),
+                },
+                3,
+            )
+            .unwrap();
+        assert_eq!(store.get("lte-run-12345678").unwrap().state, RunState::Idle);
+        store
+            .advance("lte-run-12345678", RunState::S1Ready)
+            .unwrap();
+        assert_eq!(
+            store.get("lte-run-12345678").unwrap().state,
+            RunState::S1Ready
+        );
+        assert_eq!(store.get("lte-run-12345678").unwrap().intended_state, None);
         let _ = fs::remove_file(p);
     }
     #[test]
@@ -1256,7 +1443,7 @@ mod tests {
         let _ = fs::remove_file(p);
     }
     #[test]
-    fn capture_refs_require_unique_approved_mandatory_planes() {
+    fn capture_refs_require_nonempty_unique_approved_observed_planes() {
         let good = vec![capture("S1_MME"), capture("S11"), capture("S1_U")];
         assert!(validate_capture_refs(&good).is_ok());
         let mut bad = good.clone();
@@ -1265,9 +1452,10 @@ mod tests {
             validate_capture_refs(&bad).unwrap_err(),
             "LTE_EVIDENCE_NOT_APPROVED"
         );
+        assert!(validate_capture_refs(&good[..2]).is_ok());
         assert_eq!(
-            validate_capture_refs(&good[..2]).unwrap_err(),
-            "LTE_EVIDENCE_REQUIRED_PLANE_MISSING"
+            validate_capture_refs(&[]).unwrap_err(),
+            "LTE_EVIDENCE_NO_OBSERVED_CAPTURE"
         );
         let mut unsupported = good;
         unsupported.push(capture("N2"));
@@ -1366,7 +1554,10 @@ mod tests {
         assert_eq!(run.state, RunState::Stopping);
         assert_eq!(run.outcome, Some(RunOutcome::Failed));
         assert!(run.cleanup_required);
-        assert_eq!(run.steps[2].reason_code.as_deref(), Some("LTE_GLOBAL_TIMEOUT"));
+        assert_eq!(
+            run.steps[2].reason_code.as_deref(),
+            Some("LTE_GLOBAL_TIMEOUT")
+        );
         let _ = fs::remove_file(p);
     }
     #[test]
