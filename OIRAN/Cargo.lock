@@ -174,7 +174,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "correlation-engine"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "callflow-schema",
  "serde",
@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.7.2"
+version = "2.7.3"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "session-engine"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
  "serde_json",

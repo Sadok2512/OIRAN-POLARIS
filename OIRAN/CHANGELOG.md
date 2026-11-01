@@ -1,5 +1,18 @@
 # Changelog
 
+## OIRAN API 2.7.3 / session-engine 0.5.1 / correlation-engine 0.5.1 — 2026-11-01
+
+- Correlate LTE S1-MME, S11 and S1-U evidence across distinct per-file capture
+  hashes while retaining every original `capture_id` as provenance.
+- Require a unique S1 context, opaque pseudonym and E-RAB/F-TEID chain before
+  admitting S11 evidence; admit S1-U only when its TEID has one established
+  session owner inside the bounded 300-second evidence window.
+- Keep reused or ambiguous TEIDs, partial captures and insufficient evidence
+  unmatched rather than joining by time or TEID alone; add multi-PCAP,
+  multi-UE, reused-TEID, partial and out-of-order regressions.
+- This is an offline correlation fix only. It does not certify real LTE,
+  modify capture processes, generate traffic or deploy production services.
+
 ## OIRAN API 2.7.2 / live-probe 0.4.1 / Analyzer 2.7.1 — 2026-11-01
 
 - Reject SUCI, SUPI, TMSI, PEI, equipment-identity variants and subscriber
