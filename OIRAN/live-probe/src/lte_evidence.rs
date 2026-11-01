@@ -94,8 +94,7 @@ impl PolarisLteImportEnvelope {
         if self.schema_version != POLARIS_ENVELOPE_SCHEMA
             || self.provenance.source != "POLARIS_SERVER_VERIFIED_BUNDLE"
             || self.provenance.rat != "LTE"
-            || self.provenance.session_reference_state
-                != "NOT_AVAILABLE_UNTIL_OIRAN_INGESTION"
+            || self.provenance.session_reference_state != "NOT_AVAILABLE_UNTIL_OIRAN_INGESTION"
             || !self.provenance.session_references.is_empty()
         {
             return Err(LteEvidenceError::new(
@@ -572,7 +571,10 @@ impl LteEvidenceStore {
         if paths.len() > MAX_CATALOG_DATASETS {
             return Err(LteEvidenceError::new(
                 "LTE_CATALOG_LIMIT_EXCEEDED",
-                format!("{} finalized datasets exceeds {MAX_CATALOG_DATASETS}", paths.len()),
+                format!(
+                    "{} finalized datasets exceeds {MAX_CATALOG_DATASETS}",
+                    paths.len()
+                ),
             ));
         }
         paths
@@ -599,9 +601,8 @@ impl LteEvidenceStore {
                 .join("datasets")
                 .join(&manifest.dataset_id)
                 .join("sessions.jsonl");
-            let reader = BufReader::new(
-                File::open(path).map_err(io_error("LTE_ARTIFACT_UNAVAILABLE"))?,
-            );
+            let reader =
+                BufReader::new(File::open(path).map_err(io_error("LTE_ARTIFACT_UNAVAILABLE"))?);
             for line in reader.lines() {
                 let line = line.map_err(io_error("LTE_ARTIFACT_INVALID"))?;
                 if line.len() > MAX_EVENT_LINE_BYTES {
@@ -636,6 +637,35 @@ impl LteEvidenceStore {
         };
         self.callflow_page(&manifest.run_id, session_id, cursor, limit)
             .map(Some)
+    }
+
+    /// Loads a finalized LTE Call Flow for the existing API export route.
+    /// The artifact is selected only through the finalized catalog and its
+    /// size is capped before allocation; callers must still apply their
+    /// response privacy sanitizer before serializing JSON or HTML.
+    pub fn callflow_for_export_by_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<CallFlow>, LteEvidenceError> {
+        let Some((manifest, _)) = self.find_session(session_id)? else {
+            return Ok(None);
+        };
+        let path = self
+            .root
+            .join("datasets")
+            .join(&manifest.dataset_id)
+            .join("callflows")
+            .join(format!("{session_id}.json"));
+        let length = fs::metadata(&path)
+            .map_err(io_error("LTE_ARTIFACT_UNAVAILABLE"))?
+            .len();
+        if length > MAX_RETAINED_EVENT_BYTES as u64 {
+            return Err(LteEvidenceError::new(
+                "LTE_CALLFLOW_EXPORT_TOO_LARGE",
+                length.to_string(),
+            ));
+        }
+        read_json(&path).map(Some)
     }
 
     pub fn session_page(
@@ -1271,19 +1301,78 @@ fn confined_regular_file(root: &Path, relative: &str) -> Result<PathBuf, LteEvid
     Ok(canonical)
 }
 
+fn normalized_identity_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_forbidden_identity_label(value: &str) -> bool {
+    let normalized = normalized_identity_label(value);
+    matches!(
+        normalized.as_str(),
+        "imsi"
+            | "supi"
+            | "suci"
+            | "guti"
+            | "tmsi"
+            | "5gtmsi"
+            | "imei"
+            | "imeisv"
+            | "maskedimeisv"
+            | "msisdn"
+            | "pei"
+            | "k"
+            | "opc"
+            | "authenticationkey"
+            | "subscriberkey"
+            | "securitykey"
+            | "permanentequipmentidentifier"
+    ) || normalized.contains("imeisv")
+        || normalized.ends_with("tmsi")
+        || normalized.contains("mobileidentity")
+        || normalized.contains("subscriberidentity")
+}
+
 fn contains_forbidden_identity(value: &Value) -> bool {
     match value {
         Value::Object(map) => map.iter().any(|(key, value)| {
-            let normalized = key.to_ascii_lowercase().replace(['-', ' '], "_");
-            matches!(
-                normalized.as_str(),
-                "imsi" | "imei" | "imeisv" | "msisdn" | "guti" | "k" | "opc"
-            ) || contains_forbidden_identity(value)
+            is_forbidden_identity_label(key)
+                || (["name", "type", "field", "key"].contains(&key.as_str())
+                    && value.as_str().is_some_and(is_forbidden_identity_label))
+                || contains_forbidden_identity(value)
         }),
         Value::Array(items) => items.iter().any(contains_forbidden_identity),
-        Value::String(text) => has_long_digit_run(text, 14),
+        Value::String(text) => {
+            let lower = text.to_ascii_lowercase();
+            (has_long_digit_run(text, 14) && !is_sha256_value(text))
+                || [
+                    "imsi-",
+                    "supi-",
+                    "suci-",
+                    "5g-guti-",
+                    "5g-tmsi-",
+                    "imei-",
+                    "imeisv=",
+                    "msisdn=",
+                    "pei=",
+                    "opc=",
+                    "authentication_key=",
+                    "subscriber_key=",
+                    "security_key=",
+                ]
+                .iter()
+                .any(|marker| lower.contains(marker))
+        }
         _ => false,
     }
+}
+
+fn is_sha256_value(value: &str) -> bool {
+    let digest = value.strip_prefix("sha256:").unwrap_or(value);
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn has_long_digit_run(value: &str, threshold: usize) -> bool {
@@ -1675,6 +1764,16 @@ mod tests {
             .callflow_page_by_session(session_id, None, 2)
             .unwrap()
             .is_some());
+        let export_flow = store
+            .callflow_for_export_by_session(session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(export_flow.session_id, session_id);
+        assert_eq!(export_flow.technology, "LTE");
+        assert_eq!(
+            export_flow.events.len() as u64,
+            flow["pagination"]["total_events"].as_u64().unwrap()
+        );
         assert!(!store_root
             .join("datasets")
             .read_dir()
@@ -1791,9 +1890,8 @@ mod tests {
 
         let (bundle, mut request) = build_bundle();
         let events_path = bundle.join(&request.capture_bindings[1].normalized_events_file);
-        let mut event: EventRecord = serde_json::from_str(
-            fs::read_to_string(&events_path).unwrap().trim(),
-        ).unwrap();
+        let mut event: EventRecord =
+            serde_json::from_str(fs::read_to_string(&events_path).unwrap().trim()).unwrap();
         event.event_id = "evt-S1_MME".into();
         let bytes = jsonl_bytes(&[event]).unwrap();
         fs::write(&events_path, &bytes).unwrap();
@@ -1806,9 +1904,8 @@ mod tests {
 
         let (bundle, mut request) = build_bundle();
         let events_path = bundle.join(&request.capture_bindings[0].normalized_events_file);
-        let mut event: EventRecord = serde_json::from_str(
-            fs::read_to_string(&events_path).unwrap().trim(),
-        ).unwrap();
+        let mut event: EventRecord =
+            serde_json::from_str(fs::read_to_string(&events_path).unwrap().trim()).unwrap();
         event.capture_id = format!("sha256:{}", "0".repeat(64));
         let bytes = jsonl_bytes(&[event]).unwrap();
         fs::write(&events_path, &bytes).unwrap();
@@ -1821,9 +1918,8 @@ mod tests {
 
         let (bundle, mut request) = build_bundle();
         let events_path = bundle.join(&request.capture_bindings[2].normalized_events_file);
-        let mut event: EventRecord = serde_json::from_str(
-            fs::read_to_string(&events_path).unwrap().trim(),
-        ).unwrap();
+        let mut event: EventRecord =
+            serde_json::from_str(fs::read_to_string(&events_path).unwrap().trim()).unwrap();
         event.packet_references[0].source_file = "different-source.pcapng".into();
         let bytes = jsonl_bytes(&[event]).unwrap();
         fs::write(&events_path, &bytes).unwrap();
@@ -1929,5 +2025,57 @@ mod tests {
         fs::remove_dir_all(bundle).unwrap();
         fs::remove_dir_all(bundle2).unwrap();
         fs::remove_dir_all(store_root).unwrap();
+    }
+
+    #[test]
+    fn privacy_predicate_rejects_all_prohibited_identity_labels_and_values() {
+        for label in [
+            "imsi",
+            "SUPI",
+            "suci",
+            "GUTI",
+            "5G-TMSI",
+            "imei",
+            "MaskedIMEISV",
+            "MSISDN",
+            "PEI",
+            "K",
+            "OPc",
+            "authentication_key",
+            "subscriber-key",
+            "Security Key",
+            "PermanentEquipmentIdentifier",
+        ] {
+            assert!(
+                contains_forbidden_identity(&json!({(label):"opaque"})),
+                "identity-bearing key was accepted: {label}"
+            );
+            assert!(
+                contains_forbidden_identity(&json!({"information_elements":[
+                    {"name":label,"value":"opaque"}
+                ]})),
+                "identity IE label was accepted: {label}"
+            );
+        }
+        for value in [
+            "suci-opaque",
+            "supi-opaque",
+            "5g-tmsi-opaque",
+            "pei=opaque",
+            "authentication_key=opaque",
+            "subscriber_key=opaque",
+            "security_key=opaque",
+        ] {
+            assert!(
+                contains_forbidden_identity(&json!({"value":value})),
+                "identity-shaped value was accepted: {value}"
+            );
+        }
+        assert!(!contains_forbidden_identity(&json!({
+            "imsi_pseudonym":"SUB-opaque-a",
+            "message_name":"InitialContextSetupResponse",
+            "teid":"0x1001",
+            "capture_id":format!("sha256:{}", "0".repeat(64))
+        })));
     }
 }
