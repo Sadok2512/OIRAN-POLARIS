@@ -15,7 +15,7 @@ Versions: POLARIS API `0.27.0`, POLARIS UI `0.20.0`
   restarted. No real grant, LTE session or traffic was created.
 - `POLARIS_LTE_E2E_CERTIFIED` is never written by this implementation and
   remains `false` until an independently reviewed real E2E certification.
-- The 12 external dumpcap processes remained present with unchanged PIDs:
+- The 12 external dumpcap processes were present at the test checkpoint with PIDs:
   `3691817,3691819,3691835,3691841,3691851,3691867,3691868,3691894,3691899,3691902,3691904,3691905`.
 
 ## Initial evidence
@@ -164,6 +164,15 @@ dumpcap count              12
 
 The requested thresholds were satisfied: available RAM >=4 GiB, used RAM
 <=16 GiB, disk <85%.
+
+At the final check (`2026-11-01T00:15:59Z`), the dumpcap count was still
+exactly 12, but all PIDs had changed to
+`3880345,3880351,3880365,3880367,3880374,3880444,3880457,3880462,3880478,3880479,3880587,3880588`.
+`ps` records their common start at `00:14:52–00:14:53Z`. ANR2 executed no
+signal, stop, restart, container, systemd or process mutation command against
+dumpcap; the replacement occurred externally while the offline tests were
+running. This does not invalidate the code review, but it blocks any assertion
+that the laboratory capture stream was uninterrupted during this window.
 
 ## Remaining boundaries
 
