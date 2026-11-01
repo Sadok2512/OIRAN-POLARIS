@@ -79,7 +79,7 @@ The shortened example shows one binding; a valid request has three.
 ## POLARIS adapter boundary
 
 The import endpoint accepts either the direct OIRAN request or the complete,
-strict POLARIS 0.28.0 envelope with
+strict POLARIS 0.28.1 envelope with
 `schema_version=polaris-oiran.lte-import-envelope.v1`. For the latter, OIRAN
 requires the outer run/profile/scenario/time fields and every SHA256-derived
 capture ID to match the nested request before opening an artifact. Unknown

@@ -3361,7 +3361,8 @@ mod tests {
     }
     #[tokio::test]
     async fn lte_evidence_import_requires_operator_and_csrf() {
-        // Exercise the exact outer JSON shape returned by POLARIS 0.28.0.
+        // Exercise the strict outer adapter shape supported alongside the
+        // direct request returned by POLARIS 0.28.1.
         let body = serde_json::to_vec(&lte_polaris_import_envelope()).unwrap();
         let unauthenticated = router(state(), None)
             .oneshot(

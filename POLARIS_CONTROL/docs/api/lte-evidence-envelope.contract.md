@@ -1,7 +1,7 @@
 # POLARIS → OIRAN LTE evidence envelope
 
-API: POLARIS Control 0.28.0  
-OIRAN ingestion target: 2.7.1  
+API: POLARIS Control 0.28.1
+OIRAN ingestion target: 2.7.2
 Route: `POST /api/v1/lte/runs/:run_id/evidence-envelope`
 
 The route requires an authenticated `operator` or `administrator` session and
@@ -106,7 +106,7 @@ HTTP 200 is the exact OIRAN request body:
 ```
 
 RAT, manifest provenance, observation timestamps and pseudonymous session refs
-are stored under the preflight step `measurements`, which OIRAN 2.7.1 accepts;
+are stored under the preflight step `measurements`, which OIRAN 2.7.2 accepts;
 no unknown top-level field is emitted. The route persists capture refs only
 after the complete wrapper validates. It does not set or infer
 `POLARIS_LTE_E2E_CERTIFIED`.
