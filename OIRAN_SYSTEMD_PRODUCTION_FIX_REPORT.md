@@ -7,8 +7,9 @@ application binary deployment was performed.
 SYSTEMD_FIX = **PASS**. `systemd-analyze verify
 /etc/systemd/system/oiran-api.service` exited 0. The effective unit contains
 the two requested environment variables and only the two new LTE paths on the
-new `ReadWritePaths` directive. OIRAN API 2.5.4 was restarted once for this
-configuration recipe and remains healthy.
+new `ReadWritePaths` directive. OIRAN API 2.5.4 remains healthy. The ANR3
+controlled restart occurred at 11:46:56 UTC; a second concurrent clean restart
+was observed at 11:47:37 UTC and is reported rather than hidden.
 
 PATHS =
 
@@ -46,9 +47,9 @@ SERVICE_HEALTH = PASS. Final executable remains OIRAN API 2.5.4 with file and
 `/proc/<pid>/exe` SHA-256
 `7a9c5711ed1827dc9ed8fef1c34ff63816a86deccc70fadf4219643153cfd657`.
 `/api/v1/version` returned 2.5.4 and `/api/v1/health` returned HTTP 200,
-`status=healthy`, 54 source events and one session. Journal after the
-controlled restart contains the listening message and zero `Read-only file
-system`, `permission denied` or `error=` entries.
+`status=healthy`, 54 source events and one session. Both restart sequences in
+the journal are clean and contain the listening message, with zero `Read-only
+file system`, `permission denied` or `error=` entries.
 
 SANDBOX = PASS. A transient oneshot with the service identity and equivalent
 `ProtectSystem`, `ProtectHome`, `ReadOnlyPaths` and `ReadWritePaths` wrote one
