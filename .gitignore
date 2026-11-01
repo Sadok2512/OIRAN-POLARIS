@@ -34,6 +34,11 @@ credentials/
 target/
 **/target/
 
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
 # JavaScript / TypeScript
 node_modules/
 **/node_modules/

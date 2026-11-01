@@ -1,0 +1,33 @@
+[Unit]
+Description=Codex GitHub Issue dispatcher (single manual poll)
+Documentation=https://github.com/Sadok2512/OIRAN-POLARIS/issues/10
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=codex-github-dispatcher
+StateDirectoryMode=0700
+LoadCredential=github_token
+Environment=CODEX_GITHUB_TOKEN_FILE=%d/github_token
+ExecStart=/usr/bin/python3 /usr/local/libexec/codex_github_dispatcher.py --config /etc/codex-github-dispatcher/config.json poll --once
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+# Deliberately no [Install] section and no timer: the service cannot be enabled
+# as a permanent poller. Run a single poll manually only after channel approval.
