@@ -945,9 +945,27 @@ fn atomic_write_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
+
     fn path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("polaris-lte-run-{name}-{}", std::process::id()))
+        let fixture_id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "polaris-lte-run-{name}-{}-{fixture_id}",
+            std::process::id()
+        ))
     }
+
+    #[test]
+    fn fixture_paths_are_unique_for_same_named_parallel_tests() {
+        let first = path("envelope");
+        let second = path("envelope");
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(std::env::temp_dir().as_path()));
+        assert_eq!(second.parent(), Some(std::env::temp_dir().as_path()));
+    }
+
     fn capture(plane: &str) -> CaptureRef {
         CaptureRef {
             plane: plane.into(),
