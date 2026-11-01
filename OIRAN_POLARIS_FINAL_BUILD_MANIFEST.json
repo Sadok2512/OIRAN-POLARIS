@@ -1,0 +1,66 @@
+{
+  "schema_version": "oiran-polaris.final-build-manifest.v1",
+  "generated_at": "2026-11-01T10:36:21Z",
+  "deployment_authorized": false,
+  "integration": {
+    "branch": "release/oiran-polaris-final-p0",
+    "source_commit_before_manifest": "51f932be41f353e7e7cb3a7983dda81bd970cacd"
+  },
+  "polaris": {
+    "version": "0.28.1",
+    "source_commit": "8cb356a7e4264b80fb82e2f1c90b9511f581df41",
+    "api_binary": {
+      "status": "MISSING_RESOURCE_GATE",
+      "sha256": null,
+      "build_flags": [
+        "--offline",
+        "--locked",
+        "--release",
+        "CARGO_BUILD_JOBS=1",
+        "CARGO_INCREMENTAL=0",
+        "-C link-arg=-Wl,--no-keep-memory"
+      ],
+      "minimum_observed_mem_available_bytes": 4294705152
+    },
+    "ui": {
+      "version": "0.20.0",
+      "deterministic_tar_sha256": "bd749ab68cd57803d21f43b73baaf0693b3c0487686238d595dde870703cb06d",
+      "index_sha256": "ecf682d7648f509501d841bb57b5f9e02d4117b4e0f86ec5aeaeeae1cf81af3a",
+      "javascript_sha256": "cf47551a5f75efcce0c6bbf243e74f6c46acba41da7480bc34234d5daf4ba484",
+      "css_sha256": "83ee901539c019a9db5d4366e884edf665a0acd95e26ca708c532ca5b9c6a472"
+    }
+  },
+  "oiran": {
+    "version": "2.7.2",
+    "requested_base_commit": "9ea4d1758cd7869f26bb598b43d5d29a4d581206",
+    "final_source_commit": "430a09454f36b92a5ddef40aabc29b305bb3c90d",
+    "source_tree": "bbe48c382f05d52c8c692ae148a12062bca94aeb",
+    "build_commit": "18291753bb440b091e7a4685b5730ad1839b127e",
+    "build_source_tree": "bbe48c382f05d52c8c692ae148a12062bca94aeb",
+    "api_binary": {
+      "status": "BUILT_OFFLINE",
+      "size_bytes": 13544688,
+      "sha256": "8c99a76d037d6dc731f6c16349505f1f1b26e1381874c70f12d9baff450a28e1"
+    },
+    "ui": {
+      "version": "2.7.1",
+      "deterministic_tar_sha256": "09b7a94bf7dd597c07c3503ab51557987854003605f4dadd14b50fb815037b37",
+      "index_sha256": "ecd5a0129418abe86043b836276c29ceb65bdc0b3f654ca1f77fde6065b6de4e",
+      "javascript_sha256": "a5604ec9da2b3b62ceeb570c6591d39f4e398d0674731c90727eec4719704538",
+      "css_sha256": "481e6c7cd2a0a229b3904b1c416f4177bd0e727da9756cff9bea3b492b8dd031"
+    }
+  },
+  "production_rollback_reference": {
+    "polaris_version": "0.26.0",
+    "polaris_api_sha256": "5d042aa4620f4d92c05f5d73ef316dfc1df18940d78a58a7eb4ab5ee43f27fc8",
+    "oiran_version": "2.5.4",
+    "oiran_api_sha256": "7a9c5711ed1827dc9ed8fef1c34ff63816a86deccc70fadf4219643153cfd657",
+    "fresh_backup_status": "DEFERRED_UNTIL_AUTHORIZED_DEPLOYMENT_WINDOW"
+  },
+  "release_ready": false,
+  "blockers": [
+    "POLARIS_0_28_1_RELEASE_BINARY_MISSING",
+    "DIRECT_POLARIS_RESPONSE_TO_OIRAN_HTTP_SUCCESS_FIXTURE_MISSING",
+    "DUMPCAP_ROTATION_CONTINUITY_UNPROVEN"
+  ]
+}

@@ -5,7 +5,7 @@ Mode: offline only; no deployment, grant, traffic or service restart
 
 POLARIS_SOURCE_SHA = `8cb356a7e4264b80fb82e2f1c90b9511f581df41` (API 0.28.1; exact POLARIS tree `812dfe946d9466d43e2235154a091ee0c1f8afc7`)
 
-POLARIS_BINARY_SHA256 = **MISSING**. Two sequential mono-job attempts were stopped when available RAM fell below 4 GiB. A concurrent attempt was also stopped; a later 512 MiB systemd memory-limit attempt was rejected because it repeated the previously unsafe constrained-build strategy. No partial binary is certified.
+POLARIS_BINARY_SHA256 = **MISSING**. The normal mono-job release build produced no artifact. One distinct GNU ld mitigation was then attempted with a fresh target, `CARGO_BUILD_JOBS=1`, `CARGO_INCREMENTAL=0`, offline/locked source and `RUSTFLAGS='-C link-arg=-Wl,--no-keep-memory'`. Its monitor stopped the process group at `MemAvailable=4,294,705,152` bytes, 262,144 bytes below the mandatory 4 GiB reserve. It produced no artifact and was not retried. No partial binary is certified.
 
 OIRAN_SOURCE_SHA = `430a094` (API 2.7.2, live-probe 0.4.1, Analyzer 2.7.1; exact OIRAN tree `bbe48c382f05d52c8c692ae148a12062bca94aeb`); candidate `9ea4d1758cd7869f26bb598b43d5d29a4d581206` is an ancestor.
 
@@ -27,7 +27,7 @@ IMPORT = PARTIAL. OIRAN exact final tests prove atomic import, exact replay dedu
 
 PRIVACY = OFFLINE PASS on the final OIRAN tree: ingress rejects prohibited identity labels/values; API JSON and HTML route tests remove subscriber/equipment identities; export remains pending review. No real approved capture was opened and no subscriber secret was printed.
 
-RAM = final sample: 4,550,475,776 bytes available and 16,420,106,240 bytes used. Concurrent builds drove available RAM to 4,215,840,768 bytes and were stopped. The controlled release build was stopped at 4,150,685,696 bytes. The mandatory reserve was therefore enforced, but the POLARIS artifact could not be completed on this host.
+RAM = final controlled-build evidence: the mitigated POLARIS build was stopped at 4,294,705,152 bytes available, 262,144 bytes below the 4 GiB reserve. Memory recovered above the gate afterward. The mandatory reserve was enforced, but the POLARIS artifact could not be completed on this host.
 
 DISK = 59%, below warning/stop limits.
 
@@ -44,10 +44,12 @@ git merge --no-ff 8cb356a7...       # merged as fde5712
 git merge --no-ff 430a094...        # merged as 4921b85
 git merge-base --is-ancestor ...    # all five bases exit 0
 
-CARGO_BUILD_JOBS=1 CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_INCREMENTAL=0 \
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
+  RUSTFLAGS='-C link-arg=-Wl,--no-keep-memory' \
+  CARGO_TARGET_DIR=target-no-keep-memory \
   cargo build --offline --locked --release -p polaris-control-api \
   --bin polaris-control-api
-# stopped by resource monitor at MemAvailable=4,150,685,696; no artifact
+# stopped by resource monitor at MemAvailable=4,294,705,152; no artifact
 
 polaris_control_api-0e958ab... <three exact evidence tests>
 # 3 executed, 3 passed, 0 failed
