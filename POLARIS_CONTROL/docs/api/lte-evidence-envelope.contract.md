@@ -11,17 +11,40 @@ identity material.
 ## Admission
 
 The referenced run must be `CLEAN`, have outcome `COMPLETED`, have no pending
-cleanup, and all five cleanup observations must be true. The request must carry
-exactly one independently observed and approved proof for each plane:
+cleanup, and all five cleanup observations must be true. The private staged
+bundle must contain exactly one independently observed and approved proof for
+each plane:
 `S1_MME`, `S11`, `S1_U`. Raw evidence, 5G planes, duplicate/missing planes,
 invalid frame ranges, non-lower-case SHA256, unapproved sanitization and
 non-pseudonymous session references fail closed with HTTP 422.
 
-## Request
+## Staging ownership
+
+The OIRAN capture finalizer owns staging. It writes an immutable private bundle
+under `POLARIS_LTE_EVIDENCE_BUNDLE_ROOT` (default
+`/var/lib/polaris-control/lte-evidence-bundles`) containing the sanitized
+captures, normalized event streams and `polaris-evidence-proof.json`. POLARIS
+re-hashes every referenced file before constructing the request for OIRAN.
+
+The Operator cannot submit hashes, paths, provenance, frame ranges, decoder
+versions, endpoint roles or capture references. The only caller-selected value
+is the opaque bundle id. Publication is therefore bound to measured files
+approved by the capture finalizer, not to operator-supplied metadata.
+
+## HTTP request
 
 ```json
 {
-  "bundle_id": "bundle-lte-approved-01",
+  "bundle_id": "bundle-lte-approved-01"
+}
+```
+
+The staged `polaris-evidence-proof.json` uses this private filesystem contract;
+it is not accepted in the HTTP body:
+
+```json
+{
+  "schema_version": "polaris.oiran-observed-capture-proof.v1",
   "capture_proofs": [{
     "capture_ref": {
       "plane": "S1_MME",
@@ -45,7 +68,9 @@ non-pseudonymous session references fail closed with HTTP 422.
 }
 ```
 
-A valid request contains three proofs. Paths are relative bundle paths.
+A valid manifest contains three proofs. Paths are safe relative bundle paths;
+symlinks, traversal, missing files, hash mismatch and manifests larger than
+1 MiB fail closed.
 
 ## Response
 

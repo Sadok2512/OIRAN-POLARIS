@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
@@ -114,6 +114,19 @@ pub struct ObservedCaptureProof {
 pub struct EvidenceEnvelopeInput {
     pub bundle_id: String,
     pub capture_proofs: Vec<ObservedCaptureProof>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceEnvelopeRequest {
+    pub bundle_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ObservedEvidenceManifest {
+    schema_version: String,
+    capture_proofs: Vec<ObservedCaptureProof>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -530,6 +543,79 @@ fn safe_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "LTE_EVIDENCE_FILE_UNAVAILABLE")?;
+    if !metadata.file_type().is_file() {
+        return Err("LTE_EVIDENCE_FILE_UNSAFE".into());
+    }
+    let mut file = fs::File::open(path).map_err(|_| "LTE_EVIDENCE_FILE_UNAVAILABLE")?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| "LTE_EVIDENCE_FILE_READ_FAILED")?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Load a proof set staged by the OIRAN capture finalizer. The HTTP caller
+/// supplies only a bundle id; hashes and capture metadata come from a private,
+/// server-owned manifest and are re-measured against the staged files.
+pub fn load_observed_evidence_bundle(
+    root: &Path,
+    request: EvidenceEnvelopeRequest,
+) -> Result<EvidenceEnvelopeInput, String> {
+    if !safe_id(&request.bundle_id) {
+        return Err("LTE_EVIDENCE_BUNDLE_ID_INVALID".into());
+    }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| "LTE_EVIDENCE_BUNDLE_ROOT_UNAVAILABLE")?;
+    let bundle = canonical_root.join(&request.bundle_id);
+    let canonical_bundle = bundle
+        .canonicalize()
+        .map_err(|_| "LTE_EVIDENCE_BUNDLE_UNAVAILABLE")?;
+    if !canonical_bundle.starts_with(&canonical_root) {
+        return Err("LTE_EVIDENCE_BUNDLE_PATH_REJECTED".into());
+    }
+    let manifest_path = canonical_bundle.join("polaris-evidence-proof.json");
+    let metadata = fs::symlink_metadata(&manifest_path)
+        .map_err(|_| "LTE_EVIDENCE_MANIFEST_UNAVAILABLE")?;
+    if !metadata.file_type().is_file() || metadata.len() > 1024 * 1024 {
+        return Err("LTE_EVIDENCE_MANIFEST_UNSAFE".into());
+    }
+    let manifest: ObservedEvidenceManifest = serde_json::from_slice(
+        &fs::read(&manifest_path).map_err(|_| "LTE_EVIDENCE_MANIFEST_UNAVAILABLE")?,
+    )
+    .map_err(|_| "LTE_EVIDENCE_MANIFEST_INVALID")?;
+    if manifest.schema_version != "polaris.oiran-observed-capture-proof.v1" {
+        return Err("LTE_EVIDENCE_MANIFEST_SCHEMA_UNSUPPORTED".into());
+    }
+    for proof in &manifest.capture_proofs {
+        if !safe_relative_file(&proof.source_file)
+            || !safe_relative_file(&proof.normalized_events_file)
+        {
+            return Err("LTE_EVIDENCE_BUNDLE_PATH_REJECTED".into());
+        }
+        let source = canonical_bundle.join(&proof.source_file);
+        let events = canonical_bundle.join(&proof.normalized_events_file);
+        if sha256_file(&source)? != proof.capture_ref.source_file_sha256
+            || sha256_file(&events)? != proof.normalized_events_sha256
+        {
+            return Err("LTE_EVIDENCE_FILE_HASH_MISMATCH".into());
+        }
+    }
+    Ok(EvidenceEnvelopeInput {
+        bundle_id: request.bundle_id,
+        capture_proofs: manifest.capture_proofs,
+    })
+}
+
 /// Build the exact OIRAN 2.7.1 wrapper from a terminal, clean run and three
 /// independently observed, sanitized capture proofs. No capture reference is
 /// synthesized from run state or timestamps.
@@ -855,6 +941,65 @@ mod tests {
         let mut identity = good();
         identity.capture_proofs[0].session_refs = vec!["001010000000001".into()];
         assert_eq!(build_oiran_evidence_envelope(&run, identity).unwrap_err(), "LTE_EVIDENCE_SESSION_REF_INVALID");
+    }
+    #[test]
+    fn staged_bundle_is_rehashed_and_operator_metadata_cannot_bypass_it() {
+        let root = path("observed-bundle-root");
+        let _ = fs::remove_dir_all(&root);
+        let bundle_id = "bundle-server-observed-01";
+        let bundle = root.join(bundle_id);
+        fs::create_dir_all(&bundle).unwrap();
+        let mut proofs = Vec::new();
+        for plane in ["S1_MME", "S11", "S1_U"] {
+            let source_file = format!("{plane}.pcapng");
+            let events_file = format!("{plane}.events.jsonl");
+            let source = format!("sanitized-{plane}").into_bytes();
+            let events = format!("{{\"plane\":\"{plane}\"}}\n").into_bytes();
+            fs::write(bundle.join(&source_file), &source).unwrap();
+            fs::write(bundle.join(&events_file), &events).unwrap();
+            let mut proof = capture_proof(plane);
+            proof.source_file = source_file;
+            proof.normalized_events_file = events_file;
+            proof.capture_ref.source_file_sha256 = format!("{:x}", Sha256::digest(&source));
+            proof.normalized_events_sha256 = format!("{:x}", Sha256::digest(&events));
+            proofs.push(proof);
+        }
+        let manifest = ObservedEvidenceManifest {
+            schema_version: "polaris.oiran-observed-capture-proof.v1".into(),
+            capture_proofs: proofs,
+        };
+        fs::write(
+            bundle.join("polaris-evidence-proof.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let request = EvidenceEnvelopeRequest {
+            bundle_id: bundle_id.into(),
+        };
+        assert_eq!(
+            load_observed_evidence_bundle(&root, request.clone())
+                .unwrap()
+                .capture_proofs
+                .len(),
+            3
+        );
+        fs::write(bundle.join("S11.pcapng"), b"post-approval mutation").unwrap();
+        assert_eq!(
+            load_observed_evidence_bundle(&root, request).unwrap_err(),
+            "LTE_EVIDENCE_FILE_HASH_MISMATCH"
+        );
+        assert_eq!(
+            load_observed_evidence_bundle(
+                &root,
+                EvidenceEnvelopeRequest {
+                    bundle_id: "../escape".into()
+                }
+            )
+            .unwrap_err(),
+            "LTE_EVIDENCE_BUNDLE_ID_INVALID"
+        );
+        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn persistent_lease_and_idempotency() {

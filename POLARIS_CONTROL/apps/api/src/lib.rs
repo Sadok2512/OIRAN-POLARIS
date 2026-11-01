@@ -130,6 +130,7 @@ pub struct AppState {
     live_grants: Arc<Mutex<Vec<LiveGrant>>>,
     lte_grants_v2: Arc<Mutex<lte_grant::GrantStore>>,
     lte_runs_v2: Arc<Mutex<lte_orchestrator::RunStore>>,
+    lte_evidence_bundle_root: PathBuf,
     lte_profile_registry: Arc<Mutex<lte_grant::ProfileRegistry>>,
     lte_lifecycle: Arc<AsyncMutex<()>>,
     // 0.19.0 (#37) — per-UE ring buffer of the last 20 events (register,
@@ -3288,6 +3289,9 @@ impl AppState {
             live_grants: Arc::new(Mutex::new(Vec::new())),
             lte_grants_v2: Arc::new(Mutex::new(lte_grants_v2)),
             lte_runs_v2: Arc::new(Mutex::new(lte_runs_v2)),
+            lte_evidence_bundle_root: std::env::var("POLARIS_LTE_EVIDENCE_BUNDLE_ROOT")
+                .unwrap_or_else(|_| "/var/lib/polaris-control/lte-evidence-bundles".into())
+                .into(),
             lte_profile_registry: Arc::new(Mutex::new(lte_profile_registry)),
             lte_lifecycle: Arc::new(AsyncMutex::new(())),
             activity_events: Arc::new(activity::ActivityEventStore::new()),
@@ -5709,7 +5713,7 @@ async fn publish_lte_evidence_envelope(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
     AxumPath(run_id): AxumPath<String>,
-    Json(input): Json<lte_orchestrator::EvidenceEnvelopeInput>,
+    Json(request): Json<lte_orchestrator::EvidenceEnvelopeRequest>,
 ) -> impl IntoResponse {
     if let Err(error) = require_operator(&identity) {
         return error;
@@ -5722,6 +5726,16 @@ async fn publish_lte_evidence_envelope(
     {
         Some(run) => run,
         None => return (StatusCode::NOT_FOUND, Json(json!({"error":"LTE_RUN_NOT_FOUND"}))),
+    };
+    let input = match lte_orchestrator::load_observed_evidence_bundle(
+        &state.lte_evidence_bundle_root,
+        request,
+    ) {
+        Ok(input) => input,
+        Err(error) => {
+            audit(&state, &identity.role, "LTE_EVIDENCE_PUBLISH", &error, Some(&run_id));
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":error})));
+        }
     };
     let envelope = match lte_orchestrator::build_oiran_evidence_envelope(&run, input) {
         Ok(envelope) => envelope,
@@ -14319,6 +14333,7 @@ mod p0_tests {
             lte_runs_v2: Arc::new(Mutex::new(
                 lte_orchestrator::RunStore::load(root.join("lte-runs-v2.json")).unwrap(),
             )),
+            lte_evidence_bundle_root: root.join("lte-evidence-bundles"),
             lte_profile_registry: Arc::new(Mutex::new(
                 lte_grant::ProfileRegistry::load_or_seed(
                     root.join("lte-profiles-v1.json"),
@@ -18064,7 +18079,7 @@ mod p0_tests {
 
     #[tokio::test]
     async fn ue_inventory_reuses_fresh_runtime_observation_without_blocking_navigation() {
-        let test_state = state();
+        let test_state = Arc::new(state());
         let viewer = || {
             Extension(EffectiveIdentity {
                 role: "viewer".into(),
@@ -20281,7 +20296,7 @@ mod p0_tests {
 
     #[tokio::test]
     async fn lte_evidence_envelope_requires_operator_csrf_and_publishes_exact_wrapper() {
-        let test_state = Arc::new(state());
+        let test_state = state();
         let run_id = "lte-run-envelope-http-01";
         {
             let mut store = test_state.lte_runs_v2.lock().unwrap();
@@ -20303,17 +20318,36 @@ mod p0_tests {
                 )
                 .unwrap();
         }
+        let bundle_id = "bundle-http-approved-01";
+        let bundle = test_state.lte_evidence_bundle_root.join(bundle_id);
+        fs::create_dir_all(&bundle).unwrap();
+        let mut proofs = Vec::new();
+        for plane in ["S1_MME", "S11", "S1_U"] {
+            let source_file = format!("{plane}.pcapng");
+            let events_file = format!("{plane}.events.jsonl");
+            let source_bytes = format!("sanitized capture {plane}").into_bytes();
+            let event_bytes = format!("{{\"plane\":\"{plane}\"}}\n").into_bytes();
+            fs::write(bundle.join(&source_file), &source_bytes).unwrap();
+            fs::write(bundle.join(&events_file), &event_bytes).unwrap();
+            proofs.push(json!({
+                "capture_ref": {"plane":plane,"source_file_sha256":format!("{:x}",Sha256::digest(&source_bytes)),"first_frame":1,"last_frame":2,
+                    "decoder_version":"0.2.0","event_schema_version":"1.5.0","sanitization_state":"SANITIZED_APPROVED"},
+                "observed_at":"2026-11-01T09:00:00Z","provenance":"OIRAN_SANITIZED_CAPTURE_MANIFEST","rat":"LTE",
+                "session_refs":["lte-session-pseudonym-http"],"source_file":source_file,
+                "normalized_events_file":events_file,"normalized_events_sha256":format!("{:x}",Sha256::digest(&event_bytes)),
+                "decoder_name":"decoder-test","endpoint_roles":{"192.0.2.1":"SOURCE","192.0.2.2":"DESTINATION"}
+            }));
+        }
+        fs::write(
+            bundle.join("polaris-evidence-proof.json"),
+            serde_json::to_vec(&json!({
+                "schema_version":"polaris.oiran-observed-capture-proof.v1",
+                "capture_proofs":proofs
+            })).unwrap(),
+        ).unwrap();
         let application = app(test_state);
         let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
-        let proof = |plane: &str| json!({
-            "capture_ref": {"plane":plane,"source_file_sha256":"a".repeat(64),"first_frame":1,"last_frame":2,
-                "decoder_version":"0.2.0","event_schema_version":"1.5.0","sanitization_state":"SANITIZED_APPROVED"},
-            "observed_at":"2026-11-01T09:00:00Z","provenance":"OIRAN_SANITIZED_CAPTURE_MANIFEST","rat":"LTE",
-            "session_refs":["lte-session-pseudonym-http"],"source_file":format!("{plane}.pcapng"),
-            "normalized_events_file":format!("{plane}.events.jsonl"),"normalized_events_sha256":"b".repeat(64),
-            "decoder_name":"decoder-test","endpoint_roles":{"192.0.2.1":"SOURCE","192.0.2.2":"DESTINATION"}
-        });
-        let body = json!({"bundle_id":"bundle-http-approved-01","capture_proofs":[proof("S1_MME"),proof("S11"),proof("S1_U")]});
+        let body = json!({"bundle_id":bundle_id});
         let no_csrf = application.clone().oneshot(
             Request::builder().method(Method::POST)
                 .uri(format!("/api/v1/lte/runs/{run_id}/evidence-envelope"))

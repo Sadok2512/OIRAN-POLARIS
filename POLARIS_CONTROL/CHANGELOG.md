@@ -10,6 +10,10 @@
 - Rejects missing, duplicate, raw, unsupported/5G or unresolved evidence and
   preserves `POLARIS_LTE_E2E_CERTIFIED=false`; evidence publication never
   promotes operational certification.
+- Accepts only a bundle id over HTTP. The OIRAN capture finalizer stages a
+  private proof manifest and sanitized files; POLARIS streams and re-hashes
+  every referenced capture/event file before emitting the direct OIRAN 2.7.1
+  ingestion wrapper.
 
 ## 0.27.1 (polaris-control-api) — 2026-11-01 — activation revocation hardening
 
