@@ -1,10 +1,10 @@
 # ANR3 — OIRAN API Privacy Fix P0
 
-Date: 2026-10-31  
-Verdict: **PASS (offline, non déployé)**  
-Base vérifiée: `integ/polaris-real-lab-live-v1` / `7f84c4963c36b80c582f7572000596a2ab7c57d9`  
-Branche isolée: `fix/anr3-oiran-api-privacy-p0`  
-Commit du correctif: `d02d57f`  
+Date: 2026-10-31
+Verdict: **PASS (offline, non déployé)**
+Base vérifiée: `integ/polaris-real-lab-live-v1` / `7f84c4963c36b80c582f7572000596a2ab7c57d9`
+Branche isolée: `fix/anr3-oiran-api-privacy-p0`
+Commit du correctif: `d02d57f`
 Version: OIRAN API `2.7.1` (Platform inchangée `2.7.0`)
 
 ## Route et cause
