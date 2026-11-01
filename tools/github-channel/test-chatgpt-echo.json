@@ -1,0 +1,7 @@
+[
+  {
+    "id": 6564903456,
+    "user": {"login": "Sadok2512"},
+    "body": "```chatgpt→codex\nMISSION_ID: MIS-20261101-2235-codex-echo\nBASE_SHA: -\nOBJECTIVE: ECHO channel handshake verification\nSCOPE: ACK then DONE in Issue #10; no code execution\nACCEPTANCE_CRITERIA: two visible comments ACK and DONE with same MISSION_ID; rerun produces no duplicate\nSAFETY_CONSTRAINTS: no deployment, no grant, no LTE/5G traffic, no Open5GS or dumpcap changes, no secrets\n```\n\nTest de canal uniquement. Vérifier auteur GitHub autorisé avant traitement. Ne pas démarrer le polling permanent."
+  }
+]

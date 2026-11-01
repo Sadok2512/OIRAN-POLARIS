@@ -13,18 +13,19 @@ Base: `b5213e060fddeccef995ac96638cd2820b503181` (`origin/main`)
 ## Required report
 
 ```text
-GITHUB_AUTH = BLOCKED — gh 2.45.0 installed, but `gh auth status` reports no authenticated GitHub host; GH_TOKEN/GITHUB_TOKEN and hosts.yml are absent.
-HANDSHAKE = NOT_POSTED — Issue #10 is publicly readable, but authenticated write access cannot be tested or used without credentials.
-DISPATCHER = PASS OFFLINE — secure Python 3 transport prepared; mission content is persisted for manual review and never executed.
-DRY_RUN = PASS — ECHO/ACK/DONE, unauthorized author rejection, active-mission exclusion and structured reports verified locally.
+GITHUB_AUTH = PASS — gh 2.45.0 authenticated as Sadok2512 under root@OIRAN with repository write/admin permission.
+HANDSHAKE = POSTED — comment 6564899743 was written and read back through the GitHub API.
+DISPATCHER = PASS SINGLE-SHOT — secure Python 3 transport accepted the real fenced ChatGPT ECHO; mission content was persisted for manual review and never executed.
+DRY_RUN = PASS — ECHO/ACK/DONE, unauthorized author rejection, active-mission exclusion and structured reports verified locally before the live channel test.
 ANTI_REPLAY = PASS — canonical UUID, unique comment ID, persistent SQLite ledger, body SHA256 and exclusive flock verified.
 SYSTEMD = PASS PREPARED — hardened oneshot unit passes systemd-analyze; not installed, not enabled, no timer/persistent polling.
-CHANNEL_READY = NO
-BLOCKERS = Authenticate gh with an account permitted to comment on Issue #10, then publish the handshake and complete a real GitHub ECHO round-trip.
+CHANNEL_READY = YES
+BLOCKERS = NONE
 ```
 
-No `READY` claim is made because the required real GitHub round-trip has not
-occurred.
+The real GitHub round-trip completed with mission
+`MIS-20261101-2235-codex-echo`: ACK comment `6564923731`, DONE comment
+`6564925975`, then an exact replay produced no new comment.
 
 ## GitHub access evidence
 
@@ -37,34 +38,23 @@ gh auth status
 ```
 
 ```text
-You are not logged into any GitHub hosts.
+Logged in to github.com account Sadok2512
+Active account: true
+Git operations protocol: https
+Token value: not recorded
 ```
 
-Credential-presence checks, without reading values:
+Authenticated GitHub API evidence:
 
 ```text
-GH_TOKEN = absent
-GITHUB_TOKEN = absent
-/root/.config/gh/hosts.yml = absent
+repository = Sadok2512/OIRAN-POLARIS
+permissions.admin = true
+permissions.push = true
+issue = 10 OPEN
 ```
 
-Git SSH access is functional for repository fetch/push, but SSH repository
-authentication does not provide GitHub Issues API authorization.
-
-Public, read-only GitHub API evidence:
-
-```json
-{
-  "author": "Sadok2512",
-  "comments": 0,
-  "number": 10,
-  "state": "open",
-  "title": "[COORDINATION] ChatGPT ↔ Codex (serveur OIRAN) — missions et rapports"
-}
-```
-
-Authenticated read/write access remains unverified. The requested handshake
-was deliberately not fabricated:
+The following handshake was posted as comment `6564899743` and read back by
+ID:
 
 ```text
 CODEX = CONNECTED
@@ -85,8 +75,8 @@ Files:
 Controls implemented:
 
 1. Exact allowlist of GitHub `author.login`; default: `Sadok2512`.
-2. Canonical UUID `MISSION_ID`, unique comment ID and SHA256-bound persistent
-   replay ledger.
+2. Canonical UUID or allowlisted `MIS-...` `MISSION_ID`, unique comment ID and
+   SHA256-bound persistent replay ledger.
 3. Non-blocking exclusive `flock`; only one dispatcher instance can operate.
 4. Only one mission may remain ACK/active; another receives `REJECTED_BUSY`.
 5. Mission payload is bounded and written to a mode 0600 inbox inside a mode
@@ -156,6 +146,27 @@ second dispatcher = DISPATCHER_ALREADY_ACTIVE
 exit code = 2
 ```
 
+## Real GitHub ECHO round-trip
+
+```text
+MISSION_ID = MIS-20261101-2235-codex-echo
+mission comment = 6564903456
+validated author = Sadok2512
+dispatcher mode = poll --once
+ACK comment = 6564923731
+DONE comment = 6564925975
+DONE status = PASS
+exact replay outcome = IGNORED_IDEMPOTENT_REPLAY
+comments before replay = 5
+comments after replay = 5
+comment IDs unchanged = YES
+```
+
+The initial single-shot exposed a compatibility defect with Ubuntu `gh` 2.45,
+which lacks `gh api --slurp`. It failed before claiming the mission or posting
+an ACK. Pagination was replaced with explicit bounded REST pages, tested
+offline, then the real single-shot succeeded.
+
 ## systemd state
 
 ```bash
@@ -188,19 +199,12 @@ disk = 81% (<85% stop threshold)
 subscriber identity exposure = none
 ```
 
-## Required next action
+## Operating state
 
-An administrator must authenticate `gh` using a dedicated least-privilege
-GitHub account/token allowed to read and comment on Issue #10. After
-`gh auth status` succeeds, the next validation must:
-
-1. verify authenticated Issue #10 read access;
-2. publish the exact handshake;
-3. post an authorized ECHO mission with a fresh UUID;
-4. execute one manual `poll --once`;
-5. observe the ECHO response on GitHub;
-6. leave permanent polling disabled.
-
-Only then may `CHANNEL_READY=YES` be reported.
+The channel is ready for manually triggered `poll --once` operations. The
+systemd unit remains uninstalled and there is no timer or background
+dispatcher. Any future mission still requires independent scope and safety
+review; GitHub comments remain transport only and grant no production
+authority.
 
 — ANR3

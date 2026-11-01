@@ -29,6 +29,7 @@ MISSION_HEADER = "CODEX_MISSION_V1"
 MAX_COMMENT_BYTES = 64 * 1024
 SAFE_REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SAFE_LOGIN = re.compile(r"^[A-Za-z0-9-]{1,39}$")
+SAFE_CHANNEL_MISSION_ID = re.compile(r"^MIS-[A-Za-z0-9][A-Za-z0-9.-]{7,119}$")
 SECRET_PATTERNS = (
     re.compile(r"github_pat_[A-Za-z0-9_]+"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
@@ -105,13 +106,16 @@ def exclusive_state(state_directory: Path) -> Iterator[tuple[sqlite3.Connection,
     os.chmod(state_directory, 0o700)
     lock_path = state_directory / "dispatcher.lock"
     lock_file = lock_path.open("a+", encoding="utf-8")
+    os.chmod(lock_path, 0o600)
     database: sqlite3.Connection | None = None
     try:
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise DispatchError("DISPATCHER_ALREADY_ACTIVE") from error
-        database = sqlite3.connect(state_directory / "anti-replay.sqlite3")
+        database_path = state_directory / "anti-replay.sqlite3"
+        database = sqlite3.connect(database_path)
+        os.chmod(database_path, 0o600)
         database.execute("PRAGMA journal_mode=WAL")
         database.execute("PRAGMA synchronous=FULL")
         database.execute(
@@ -138,10 +142,65 @@ def exclusive_state(state_directory: Path) -> Iterator[tuple[sqlite3.Connection,
         lock_file.close()
 
 
+def canonical_mission_id(value: str) -> str:
+    try:
+        parsed_uuid = uuid.UUID(value)
+    except ValueError:
+        if SAFE_CHANNEL_MISSION_ID.fullmatch(value):
+            return value
+        raise DispatchError("MISSION_ID_INVALID") from None
+    if str(parsed_uuid) != value.lower():
+        raise DispatchError("MISSION_ID_NOT_CANONICAL")
+    return str(parsed_uuid)
+
+
+def parse_fenced_mission(lines: list[str]) -> dict[str, str] | None:
+    if not lines or lines[0].strip() != "```chatgpt→codex":
+        return None
+    try:
+        closing_fence = next(
+            index for index, line in enumerate(lines[1:], start=1) if line.strip() == "```"
+        )
+    except StopIteration:
+        raise DispatchError("MISSION_FENCE_INVALID")
+    allowed = {
+        "MISSION_ID",
+        "BASE_SHA",
+        "OBJECTIVE",
+        "SCOPE",
+        "ACCEPTANCE_CRITERIA",
+        "SAFETY_CONSTRAINTS",
+    }
+    fields: dict[str, str] = {}
+    for line in lines[1:closing_fence]:
+        if not line.strip():
+            continue
+        if ":" not in line:
+            raise DispatchError("MISSION_FORMAT_INVALID")
+        key, value = (part.strip() for part in line.split(":", 1))
+        if key not in allowed or key in fields or not value:
+            raise DispatchError("MISSION_FIELDS_INVALID")
+        fields[key] = value
+    if set(fields) != allowed:
+        raise DispatchError("MISSION_FIELDS_INVALID")
+    mission_id = canonical_mission_id(fields["MISSION_ID"])
+    payload_fields = dict(fields)
+    trailing_note = "\n".join(lines[closing_fence + 1 :]).strip()
+    if trailing_note:
+        payload_fields["TRAILING_NOTE"] = trailing_note
+    payload = json.dumps(
+        payload_fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return {"MISSION_ID": mission_id, "MESSAGE": "MISSION", "PAYLOAD": payload}
+
+
 def parse_mission(body: str) -> dict[str, str] | None:
     if len(body.encode("utf-8")) > MAX_COMMENT_BYTES:
         raise DispatchError("COMMENT_TOO_LARGE")
     lines = body.splitlines()
+    fenced = parse_fenced_mission(lines)
+    if fenced is not None:
+        return fenced
     if not lines or lines[0].strip() != MISSION_HEADER:
         return None
     fields: dict[str, str] = {}
@@ -156,12 +215,7 @@ def parse_mission(body: str) -> dict[str, str] | None:
         fields[key] = value
     if set(fields) != {"MISSION_ID", "MESSAGE", "PAYLOAD"}:
         raise DispatchError("MISSION_FIELDS_INVALID")
-    try:
-        parsed_uuid = uuid.UUID(fields["MISSION_ID"])
-    except ValueError as error:
-        raise DispatchError("MISSION_ID_INVALID") from error
-    if str(parsed_uuid) != fields["MISSION_ID"].lower():
-        raise DispatchError("MISSION_ID_NOT_CANONICAL")
+    fields["MISSION_ID"] = canonical_mission_id(fields["MISSION_ID"])
     if fields["MESSAGE"] not in {"ECHO", "MISSION"}:
         raise DispatchError("MISSION_MESSAGE_INVALID")
     if not fields["PAYLOAD"] or len(fields["PAYLOAD"].encode("utf-8")) > 32 * 1024:
@@ -201,15 +255,17 @@ def assert_safe_outbound(body: str) -> None:
 
 def fetch_comments(config: dict[str, Any]) -> list[dict[str, Any]]:
     endpoint = f"repos/{config['repository']}/issues/{config['issue']}/comments"
-    pages = json.loads(run_gh(["api", endpoint, "--paginate", "--slurp"]))
-    if not isinstance(pages, list):
-        raise DispatchError("GITHUB_RESPONSE_INVALID")
     comments: list[dict[str, Any]] = []
-    for page in pages:
+    for page_number in range(1, 101):
+        page = json.loads(
+            run_gh(["api", f"{endpoint}?per_page=100&page={page_number}"])
+        )
         if not isinstance(page, list):
             raise DispatchError("GITHUB_RESPONSE_INVALID")
         comments.extend(page)
-    return comments
+        if len(page) < 100:
+            return comments
+    raise DispatchError("GITHUB_PAGINATION_LIMIT")
 
 
 def store_inbox(state_directory: Path, mission: dict[str, str], comment: dict[str, Any]) -> None:
@@ -339,8 +395,8 @@ def poll(config: dict[str, Any], fixture: Path | None, dry_run: bool) -> list[st
 def report_done(
     config: dict[str, Any], mission_id: str, report_path: Path, result: str, dry_run: bool
 ) -> None:
-    canonical_id = str(uuid.UUID(mission_id))
-    if canonical_id != mission_id.lower() or result not in {"PASS", "FAIL", "BLOCKED"}:
+    canonical_id = canonical_mission_id(mission_id)
+    if result not in {"PASS", "FAIL", "BLOCKED"}:
         raise DispatchError("DONE_ARGUMENT_INVALID")
     report = report_path.read_text(encoding="utf-8")
     assert_safe_outbound(report)

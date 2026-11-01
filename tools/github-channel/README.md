@@ -21,6 +21,12 @@ returns ECHO. `MISSION` persists a 0600 inbox document and returns ACK with
 `MANUAL_REVIEW_REQUIRED`. A second active mission is rejected. Exact replay is
 ignored; changed replay fails closed.
 
+The dispatcher also accepts the channel's fenced transport form with an
+allowlisted `MIS-...` identifier and exactly these fields: `MISSION_ID`,
+`BASE_SHA`, `OBJECTIVE`, `SCOPE`, `ACCEPTANCE_CRITERIA` and
+`SAFETY_CONSTRAINTS`. It is always treated as a mission requiring manual
+review, never as executable input.
+
 DONE is a separate manual command after independently authorized work:
 
 ```bash
