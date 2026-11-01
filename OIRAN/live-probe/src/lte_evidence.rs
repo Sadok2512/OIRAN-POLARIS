@@ -21,6 +21,7 @@ use std::{
 
 pub const INGESTION_SCHEMA: &str = "oiran.lte-evidence-ingestion.v1";
 pub const EVIDENCE_SCHEMA: &str = "oiran-polaris.lte-e2e-evidence.v1";
+pub const POLARIS_ENVELOPE_SCHEMA: &str = "polaris-oiran.lte-import-envelope.v1";
 pub const EXPORT_SCHEMA: &str = "oiran.lte-anonymized-export.v1";
 pub const MAX_INGEST_EVENTS: usize = 50_000;
 pub const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
@@ -39,6 +40,111 @@ pub struct LteEvidenceImportRequest {
     pub bundle_id: String,
     pub evidence: LteE2eEvidence,
     pub capture_bindings: Vec<LteCaptureBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum LteEvidenceImportPayload {
+    Direct(LteEvidenceImportRequest),
+    Polaris(PolarisLteImportEnvelope),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolarisLteImportEnvelope {
+    pub schema_version: String,
+    pub provenance: PolarisLteProvenance,
+    pub oiran_import: LteEvidenceImportRequest,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolarisLteProvenance {
+    pub source: String,
+    pub published_at_epoch_ms: u64,
+    pub run_id: String,
+    pub rat: String,
+    pub profile_id: String,
+    pub scenario_id: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub capture_ids: Vec<PolarisCaptureId>,
+    pub session_references: Vec<String>,
+    pub session_reference_state: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolarisCaptureId {
+    pub plane: String,
+    pub capture_id: String,
+}
+
+impl LteEvidenceImportPayload {
+    pub fn into_request(self) -> Result<LteEvidenceImportRequest, LteEvidenceError> {
+        match self {
+            Self::Direct(request) => Ok(request),
+            Self::Polaris(envelope) => envelope.into_request(),
+        }
+    }
+}
+
+impl PolarisLteImportEnvelope {
+    fn into_request(self) -> Result<LteEvidenceImportRequest, LteEvidenceError> {
+        if self.schema_version != POLARIS_ENVELOPE_SCHEMA
+            || self.provenance.source != "POLARIS_SERVER_VERIFIED_BUNDLE"
+            || self.provenance.rat != "LTE"
+            || self.provenance.session_reference_state
+                != "NOT_AVAILABLE_UNTIL_OIRAN_INGESTION"
+            || !self.provenance.session_references.is_empty()
+        {
+            return Err(LteEvidenceError::new(
+                "LTE_POLARIS_PROVENANCE_INVALID",
+                "outer envelope discriminator or provenance state mismatch",
+            ));
+        }
+        let evidence = &self.oiran_import.evidence;
+        if self.provenance.run_id != evidence.run_id
+            || self.provenance.profile_id != evidence.profile_id
+            || self.provenance.scenario_id != evidence.scenario_id
+            || self.provenance.started_at != evidence.started_at
+            || self.provenance.ended_at != evidence.ended_at
+        {
+            return Err(LteEvidenceError::new(
+                "LTE_POLARIS_PROVENANCE_MISMATCH",
+                "outer provenance does not match nested evidence",
+            ));
+        }
+        let expected = evidence
+            .capture_refs
+            .iter()
+            .map(|capture| {
+                (
+                    capture.plane.as_str(),
+                    format!("sha256:{}", capture.source_file_sha256),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut observed = BTreeMap::new();
+        for capture in &self.provenance.capture_ids {
+            if observed
+                .insert(capture.plane.as_str(), capture.capture_id.clone())
+                .is_some()
+            {
+                return Err(LteEvidenceError::new(
+                    "LTE_POLARIS_CAPTURE_PROVENANCE_MISMATCH",
+                    "duplicate outer capture plane",
+                ));
+            }
+        }
+        if observed != expected {
+            return Err(LteEvidenceError::new(
+                "LTE_POLARIS_CAPTURE_PROVENANCE_MISMATCH",
+                "outer capture identifiers do not match nested capture_refs",
+            ));
+        }
+        Ok(self.oiran_import)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1583,6 +1689,50 @@ mod tests {
     }
 
     #[test]
+    fn accepts_exact_polaris_outer_envelope_and_rejects_provenance_drift() {
+        let (_bundle, request) = build_bundle();
+        let capture_ids = request
+            .evidence
+            .capture_refs
+            .iter()
+            .map(|capture| PolarisCaptureId {
+                plane: capture.plane.clone(),
+                capture_id: format!("sha256:{}", capture.source_file_sha256),
+            })
+            .collect();
+        let envelope = PolarisLteImportEnvelope {
+            schema_version: POLARIS_ENVELOPE_SCHEMA.into(),
+            provenance: PolarisLteProvenance {
+                source: "POLARIS_SERVER_VERIFIED_BUNDLE".into(),
+                published_at_epoch_ms: 1_793_448_010_000,
+                run_id: request.evidence.run_id.clone(),
+                rat: "LTE".into(),
+                profile_id: request.evidence.profile_id.clone(),
+                scenario_id: request.evidence.scenario_id.clone(),
+                started_at: request.evidence.started_at.clone(),
+                ended_at: request.evidence.ended_at.clone(),
+                capture_ids,
+                session_references: vec![],
+                session_reference_state: "NOT_AVAILABLE_UNTIL_OIRAN_INGESTION".into(),
+            },
+            oiran_import: request.clone(),
+        };
+        let decoded: LteEvidenceImportPayload =
+            serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
+        assert_eq!(
+            decoded.into_request().unwrap().evidence.run_id,
+            request.evidence.run_id
+        );
+
+        let mut drifted = envelope;
+        drifted.provenance.scenario_id = "different-scenario".into();
+        let error = LteEvidenceImportPayload::Polaris(drifted)
+            .into_request()
+            .unwrap_err();
+        assert_eq!(error.code, "LTE_POLARIS_PROVENANCE_MISMATCH");
+    }
+
+    #[test]
     fn rejects_missing_plane_unapproved_hash_mismatch_and_unresolved_reference() {
         let (bundle, mut request) = build_bundle();
         request.evidence.capture_refs.pop();
@@ -1623,6 +1773,66 @@ mod tests {
             store.ingest(&bundle, &request).unwrap_err().code,
             "LTE_EVIDENCE_REF_UNRESOLVED"
         );
+        fs::remove_dir_all(store_root).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_planes_events_and_mismatched_event_provenance() {
+        let store_root = temp_root("provenance-reject-store");
+        let store = LteEvidenceStore::new(store_root.clone()).unwrap();
+
+        let (bundle, mut request) = build_bundle();
+        request.evidence.capture_refs[1].plane = "S1_MME".into();
+        assert_eq!(
+            store.ingest(&bundle, &request).unwrap_err().code,
+            "LTE_CAPTURE_PLANE_DUPLICATE"
+        );
+        fs::remove_dir_all(bundle).unwrap();
+
+        let (bundle, mut request) = build_bundle();
+        let events_path = bundle.join(&request.capture_bindings[1].normalized_events_file);
+        let mut event: EventRecord = serde_json::from_str(
+            fs::read_to_string(&events_path).unwrap().trim(),
+        ).unwrap();
+        event.event_id = "evt-S1_MME".into();
+        let bytes = jsonl_bytes(&[event]).unwrap();
+        fs::write(&events_path, &bytes).unwrap();
+        request.capture_bindings[1].normalized_events_sha256 = sha256_hex(&bytes);
+        assert_eq!(
+            store.ingest(&bundle, &request).unwrap_err().code,
+            "LTE_EVENT_ID_DUPLICATE"
+        );
+        fs::remove_dir_all(bundle).unwrap();
+
+        let (bundle, mut request) = build_bundle();
+        let events_path = bundle.join(&request.capture_bindings[0].normalized_events_file);
+        let mut event: EventRecord = serde_json::from_str(
+            fs::read_to_string(&events_path).unwrap().trim(),
+        ).unwrap();
+        event.capture_id = format!("sha256:{}", "0".repeat(64));
+        let bytes = jsonl_bytes(&[event]).unwrap();
+        fs::write(&events_path, &bytes).unwrap();
+        request.capture_bindings[0].normalized_events_sha256 = sha256_hex(&bytes);
+        assert_eq!(
+            store.ingest(&bundle, &request).unwrap_err().code,
+            "LTE_EVENT_PROVENANCE_MISMATCH"
+        );
+        fs::remove_dir_all(bundle).unwrap();
+
+        let (bundle, mut request) = build_bundle();
+        let events_path = bundle.join(&request.capture_bindings[2].normalized_events_file);
+        let mut event: EventRecord = serde_json::from_str(
+            fs::read_to_string(&events_path).unwrap().trim(),
+        ).unwrap();
+        event.packet_references[0].source_file = "different-source.pcapng".into();
+        let bytes = jsonl_bytes(&[event]).unwrap();
+        fs::write(&events_path, &bytes).unwrap();
+        request.capture_bindings[2].normalized_events_sha256 = sha256_hex(&bytes);
+        assert_eq!(
+            store.ingest(&bundle, &request).unwrap_err().code,
+            "LTE_PACKET_REFERENCE_INVALID"
+        );
+        fs::remove_dir_all(bundle).unwrap();
         fs::remove_dir_all(store_root).unwrap();
     }
 
@@ -1705,7 +1915,7 @@ mod tests {
         let (bundle, mut request) = build_bundle();
         request.evidence.steps[0]
             .measurements
-            .insert("imsi".into(), Value::String("001010000000001".into()));
+            .insert("imsi".into(), Value::String("synthetic-identity".into()));
         let store_root = temp_root("privacy-store");
         let store = LteEvidenceStore::new(store_root.clone()).unwrap();
         assert_eq!(

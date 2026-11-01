@@ -1,5 +1,16 @@
 # Changelog
 
+## OIRAN API 2.7.2 / live-probe 0.4.1 — 2026-11-01
+
+- Redact provenance filenames containing identity labels or identity-length digit
+  runs while retaining safe `capture://` basename provenance.
+- Add fail-closed envelope regressions for duplicate capture planes, duplicate event
+  IDs, capture-ID mismatch and packet source-file mismatch.
+- Document the exact POLARIS evidence-to-OIRAN binding boundary and preserve the
+  strict S1-MME/S11/S1-U required-plane set.
+- Accept the complete strict POLARIS 0.28.0 import envelope on the existing LTE
+  import route and reject outer/nested provenance drift before artifact access.
+
 ## OIRAN API 2.7.1 — 2026-10-31
 
 - Preserve the 2.7 real-lab/LTE-evidence model while integrating bounded offline

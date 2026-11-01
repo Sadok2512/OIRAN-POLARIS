@@ -16,7 +16,7 @@ use disk_safety::{assess, capture_budget, measure_path, rotation_plan, Policy};
 use event_schema::sha256_hex;
 use live_probe::{
     lte_evidence::{
-        LteDatasetManifest, LteEvidenceError, LteEvidenceImportRequest, LteEvidenceStore,
+        LteDatasetManifest, LteEvidenceError, LteEvidenceImportPayload, LteEvidenceStore,
     },
     offline_lte_callflows, read_callflow_page, CaptureManager, CaptureRequest,
     ContinuousImportConfig,
@@ -41,7 +41,7 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.7.1";
+pub const API_VERSION: &str = "2.7.2";
 pub const PLATFORM_VERSION: &str = "2.7.0";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
@@ -1609,11 +1609,15 @@ async fn import_derived_dataset(
 async fn import_lte_evidence(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<LteEvidenceImportRequest>,
+    Json(payload): Json<LteEvidenceImportPayload>,
 ) -> Response {
     if let Err(response) = require_operator_csrf(&state, &headers) {
         return response;
     }
+    let request = match payload.into_request() {
+        Ok(request) => request,
+        Err(error) => return lte_evidence_error(error),
+    };
     let bundle = state.inner.lte_evidence_bundle_root.join(&request.bundle_id);
     match state.inner.lte_evidence_store.ingest(&bundle, &request) {
         Ok(result) => {
@@ -2933,7 +2937,16 @@ fn sanitize_value(value: &mut Value) {
                             .file_name()
                             .and_then(|x| x.to_str())
                             .unwrap_or("capture.pcapng");
-                        *v = Value::String(format!("capture://{name}"));
+                        let safe_name = if is_identity_label(name)
+                            || name
+                                .split(|character: char| !character.is_ascii_digit())
+                                .any(|part| part.len() >= 14)
+                        {
+                            "REDACTED.pcapng"
+                        } else {
+                            name
+                        };
+                        *v = Value::String(format!("capture://{safe_name}"));
                     }
                 } else {
                     sanitize_value(v)
@@ -3094,6 +3107,26 @@ mod tests {
             "capture_bindings":[]
         })
     }
+    fn lte_polaris_import_envelope() -> Value {
+        let oiran_import = lte_import_payload();
+        json!({
+            "schema_version":"polaris-oiran.lte-import-envelope.v1",
+            "provenance":{
+                "source":"POLARIS_SERVER_VERIFIED_BUNDLE",
+                "published_at_epoch_ms":1793448010000_u64,
+                "run_id":"lte-run-synthetic-0001",
+                "rat":"LTE",
+                "profile_id":"LTE-SRSUE-TEST-01",
+                "scenario_id":"lte-e2e-certification-v1",
+                "started_at":"2026-10-31T12:00:00Z",
+                "ended_at":"2026-10-31T12:00:10Z",
+                "capture_ids":[],
+                "session_references":[],
+                "session_reference_state":"NOT_AVAILABLE_UNTIL_OIRAN_INGESTION"
+            },
+            "oiran_import":oiran_import
+        })
+    }
     #[tokio::test]
     async fn unauthenticated_request_is_allowed_read_only() {
         assert_eq!(
@@ -3143,6 +3176,10 @@ mod tests {
         assert_eq!(value["information_elements"].as_array().unwrap().len(), 1);
         assert_eq!(value["information_elements"][0]["name"], "RAN-UE-NGAP-ID");
         assert!(!value.to_string().contains("IDENTITY_WITHHELD"));
+
+        let mut provenance = json!({"source_file":"/capture/capture-00000000000000.pcapng"});
+        sanitize_value(&mut provenance);
+        assert_eq!(provenance["source_file"], "capture://REDACTED.pcapng");
     }
 
     #[tokio::test]
@@ -3258,7 +3295,8 @@ mod tests {
     }
     #[tokio::test]
     async fn lte_evidence_import_requires_operator_and_csrf() {
-        let body = serde_json::to_vec(&lte_import_payload()).unwrap();
+        // Exercise the exact outer JSON shape returned by POLARIS 0.28.0.
+        let body = serde_json::to_vec(&lte_polaris_import_envelope()).unwrap();
         let unauthenticated = router(state(), None)
             .oneshot(
                 Request::builder()
