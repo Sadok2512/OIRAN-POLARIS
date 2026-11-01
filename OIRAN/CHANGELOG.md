@@ -2,6 +2,9 @@
 
 ## OIRAN API 2.7.1 — 2026-10-31
 
+- Preserve the 2.7 real-lab/LTE-evidence model while integrating bounded offline
+  LTE session materialization and the complete installed LTE+5G decoder inventory;
+  live capture allowlists and execution gates remain unchanged.
 - Remove subscriber and equipment identity fields and identity-bearing decoded
   information elements from raw API responses instead of returning masked labels.
 - Apply response sanitization at the common success and pagination boundaries for
@@ -1010,3 +1013,11 @@ All notable OIRAN vProbe changes are recorded here. Versions follow Semantic Ver
 - Every response carries `pagination.{limit,cursor,next_cursor,returned_events,total_events}`;
   invalid cursors fail explicitly and never replay the first page.
 
+## OIRAN API 2.6.0 / live-probe 0.3.0 - 2026-10-31
+
+- Materialise bounded LTE S1-MME/S11/S1-U sessions and correlated Call Flows
+  from already-decoded offline evidence during dataset finalisation and API load.
+- Expose the installed decoder inventory and LTE capture protocol labels through
+  the version and capture APIs.
+- Keep live LTE capture disabled: no capture interface allowlist was expanded.
+- Limit offline LTE materialisation to 128 sessions per dataset to bound memory.
