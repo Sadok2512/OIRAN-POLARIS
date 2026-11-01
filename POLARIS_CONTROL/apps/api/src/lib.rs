@@ -5730,6 +5730,7 @@ async fn publish_lte_evidence_envelope(
     let input = match lte_orchestrator::load_observed_evidence_bundle(
         &state.lte_evidence_bundle_root,
         request,
+        &run,
     ) {
         Ok(input) => input,
         Err(error) => {
@@ -5745,15 +5746,33 @@ async fn publish_lte_evidence_envelope(
         }
     };
     let refs = envelope.evidence.capture_refs.clone();
-    if let Err(error) = state
+    let publication = state
         .lte_runs_v2
         .lock()
         .map_err(|_| "LTE_RUN_STORE_UNAVAILABLE".to_string())
-        .and_then(|mut store| store.set_capture_refs(&run_id, refs))
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":error})));
-    }
-    audit(&state, &identity.role, "LTE_EVIDENCE_PUBLISH", "APPROVED", Some(&run_id));
+        .and_then(|mut store| store.publish_capture_refs(&run_id, &envelope.bundle_id, refs));
+    let idempotent = match publication {
+        Ok(value) => value,
+        Err(error) => {
+            let status = if error == "LTE_EVIDENCE_PUBLICATION_CONFLICT" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return (status, Json(json!({"error":error})));
+        }
+    };
+    audit(
+        &state,
+        &identity.role,
+        "LTE_EVIDENCE_PUBLISH",
+        if idempotent {
+            "IDEMPOTENT"
+        } else {
+            "APPROVED"
+        },
+        Some(&run_id),
+    );
     (StatusCode::OK, Json(serde_json::to_value(envelope).unwrap_or(Value::Null)))
 }
 
@@ -20342,6 +20361,9 @@ mod p0_tests {
             bundle.join("polaris-evidence-proof.json"),
             serde_json::to_vec(&json!({
                 "schema_version":"polaris.oiran-observed-capture-proof.v1",
+                "run_id":run_id,
+                "profile_id":lte_orchestrator::PROFILE_ID,
+                "scenario_id":lte_orchestrator::SCENARIO_ID,
                 "capture_proofs":proofs
             })).unwrap(),
         ).unwrap();
