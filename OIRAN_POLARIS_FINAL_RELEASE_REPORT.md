@@ -6,7 +6,7 @@ POLARIS_SHA = `8cb356a7e4264b80fb82e2f1c90b9511f581df41` (release code; containe
 
 OIRAN_VERSION = API/platform `2.7.2`, live-probe `0.4.1`, Analyzer `2.7.1`; production remains API `2.5.4`.
 
-OIRAN_SHA = recorded after the final merge commit on `release/anr3-oiran-final-p0`.
+OIRAN_SHA = release code merge `430a09454f36b92a5ddef40aabc29b305bb3c90d`; the following branch-head commit changes reports only.
 
 GIT_LINEAGE = PASS: POLARIS `70faacb5` is ancestor of `8cb356a7`; OIRAN candidate `92c1b08c` and provenance adapter `9ea4d175` are real ancestors of the final merge. No `merge -s ours`.
 

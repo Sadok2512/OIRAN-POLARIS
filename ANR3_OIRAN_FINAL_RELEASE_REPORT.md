@@ -3,10 +3,11 @@
 Date: 2026-11-01 UTC
 Branch: `release/anr3-oiran-final-p0`
 Base: `92c1b08cd63202272986b64702ee97a334f010a3`
+Release code merge: `430a09454f36b92a5ddef40aabc29b305bb3c90d`
 
 ## Release
 
-OIRAN API/platform `2.7.2`, live-probe `0.4.1` and Analyzer `2.7.1` integrate the strict POLARIS LTE envelope adapter, provenance/deduplication checks, S1AP/S11/S1-U session and Call Flow materialization, recursive API/export privacy, bounded pagination and LTE bridge rendering. N2/N3/N4 behavior is preserved. No dataset, counter, capture reference or state is fabricated.
+OIRAN API/platform `2.7.2`, live-probe `0.4.1` and Analyzer `2.7.1` at release code merge `430a09454f36b92a5ddef40aabc29b305bb3c90d` integrate the strict POLARIS LTE envelope adapter, provenance/deduplication checks, S1AP/S11/S1-U session and Call Flow materialization, recursive API/export privacy, bounded pagination and LTE bridge rendering. N2/N3/N4 behavior is preserved. No dataset, counter, capture reference or state is fabricated.
 
 POLARIS `0.28.1` at `8cb356a7e4264b80fb82e2f1c90b9511f581df41` produces the direct `oiran.lte-evidence-ingestion.v1` body from server-staged, rehashed `SANITIZED_APPROVED` S1-MME/S11/S1-U artifacts. OIRAN accepts this body and the stricter `polaris-oiran.lte-import-envelope.v1` wrapper. Both paths fail closed on provenance drift. No real bundle was imported.
 
