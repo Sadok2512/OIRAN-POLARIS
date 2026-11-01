@@ -41,8 +41,8 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.7.2";
-pub const PLATFORM_VERSION: &str = "2.7.2";
+pub const API_VERSION: &str = "2.7.3";
+pub const PLATFORM_VERSION: &str = "2.7.3";
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -3461,7 +3461,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let value = json_body(response).await;
-        assert_eq!(value["data"]["backend_api"], "2.7.2");
+        assert_eq!(value["data"]["backend_api"], "2.7.3");
         for protocol in [
             "S1AP",
             "NAS-EPS-MM",
