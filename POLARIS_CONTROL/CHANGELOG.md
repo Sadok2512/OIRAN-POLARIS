@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.29.4 (polaris-control-api) — 2026-11-02 — LTE UE UL route installation
+
+- Adds a fail-closed `/32` route installation to the configured LTE SGi peer
+  through `tun_srsue` after UE IP readiness and before any UL traffic probe.
+  Installation failures surface as `LTE_UL_ROUTE_INSTALL_FAILED`.
+- Verifies `ip`, `ping`, and `iperf3` in a disposable, network-disabled UE
+  image container before issuing a certification Grant V2; missing tooling
+  surfaces as `LTE_UE_TOOLING_MISSING`.
+- Persists bounded (512-character), subscriber-sanitized exit code, stdout and
+  stderr diagnostics for UL and DL route probes in each step evidence record.
+- Adds a UE tooling image derived from the exact certified srsRAN4G digest,
+  adding only pinned `iperf3=3.16-1build2`; the `srsue` binary remains
+  byte-identical and is verified during the offline release gate.
+- Preserves SGi/N6 separation, Grant V2, cleanup, evidence finalization,
+  Open5GS configuration and external dumpcap ownership.
+
 ## 0.29.3 (polaris-control-api) — 2026-11-02 — LTE SGi dedicated DN + hardened preflight
 
 - Requires an explicit LTE DN sender container

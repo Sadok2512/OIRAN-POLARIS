@@ -157,6 +157,26 @@ pub struct PingMeasurement {
     pub received: u32,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+pub struct CommandDiagnostic {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+pub struct RouteOperation {
+    pub diagnostic: CommandDiagnostic,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+impl RouteOperation {
+    pub fn succeeded(&self) -> bool {
+        self.error_code.is_none()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttachProtocolEvidence {
     pub event_at_epoch_ms: u64,
@@ -167,6 +187,12 @@ pub struct AttachProtocolEvidence {
 pub trait SrsranRuntime: Send + Sync {
     fn status(&self, certified: bool, live_enabled: bool) -> Result<LteStatus, String>;
     fn validate_traffic_configuration(&self) -> Result<(), String>;
+    fn install_lte_ul_route(&self) -> RouteOperation {
+        RouteOperation::default()
+    }
+    fn probe_traffic_route(&self, _direction: &str) -> RouteOperation {
+        RouteOperation::default()
+    }
     fn start(&self, target: Target) -> Result<(), String>;
     fn stop(&self, target: Target) -> Result<(), String>;
     fn logs(&self, target: Target) -> Result<Vec<String>, String>;
@@ -233,6 +259,59 @@ fn configured_traffic_peer() -> Result<std::net::Ipv4Addr, String> {
         }
     }
     Ok(peer)
+}
+
+fn bounded_diagnostic(output: &Output) -> CommandDiagnostic {
+    fn bounded(value: &str) -> String {
+        value
+            .lines()
+            .filter_map(sanitize_log_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .take(512)
+            .collect()
+    }
+    CommandDiagnostic {
+        exit_code: output.code,
+        stdout: bounded(&output.stdout),
+        stderr: bounded(&output.stderr),
+    }
+}
+
+fn lte_ul_route_install_args(container_id: &str, peer: std::net::Ipv4Addr) -> Vec<String> {
+    vec![
+        "exec".into(),
+        container_id.into(),
+        "ip".into(),
+        "route".into(),
+        "replace".into(),
+        format!("{peer}/32"),
+        "dev".into(),
+        LTE_UE_TUN.into(),
+    ]
+}
+
+fn classify_route_install(output: &Output) -> RouteOperation {
+    RouteOperation {
+        diagnostic: bounded_diagnostic(output),
+        error_code: (output.code != 0).then(|| "LTE_UL_ROUTE_INSTALL_FAILED".into()),
+    }
+}
+
+fn ue_tooling_check_args(image_reference: &str) -> Vec<String> {
+    vec![
+        "run".into(),
+        "--rm".into(),
+        "--network".into(),
+        "none".into(),
+        "--entrypoint".into(),
+        "/bin/sh".into(),
+        image_reference.into(),
+        "-ec".into(),
+        "command -v ip >/dev/null && command -v ping >/dev/null && command -v iperf3 >/dev/null"
+            .into(),
+    ]
 }
 
 /// 0.29.3: LTE DN sender container name is deployment-specified and must NOT
@@ -1006,6 +1085,15 @@ pub fn verify_certified_release_subject() -> Result<(), String> {
     if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != CERTIFIED_IMAGE_ID {
         return Err("LTE_CERTIFIED_IMAGE_UNAVAILABLE".into());
     }
+    let tooling = Command::new("/usr/bin/timeout")
+        .arg("15s")
+        .arg("/usr/bin/docker")
+        .args(ue_tooling_check_args(image_reference))
+        .output()
+        .map_err(|_| "LTE_UE_TOOLING_MISSING".to_string())?;
+    if !tooling.status.success() {
+        return Err("LTE_UE_TOOLING_MISSING".into());
+    }
     Ok(())
 }
 
@@ -1066,6 +1154,118 @@ impl SrsranRuntime for DockerSrsranRuntime {
     }
     fn validate_traffic_configuration(&self) -> Result<(), String> {
         configured_traffic_peer().map(|_| ())
+    }
+    fn install_lte_ul_route(&self) -> RouteOperation {
+        let peer = match configured_traffic_peer() {
+            Ok(peer) => peer,
+            Err(error) => {
+                return RouteOperation {
+                    error_code: Some(error),
+                    ..RouteOperation::default()
+                }
+            }
+        };
+        let ue = match self.owned(Target::Ue) {
+            Ok(ue) if ue.state == "running" => ue,
+            Ok(_) => {
+                return RouteOperation {
+                    error_code: Some("LTE_UE_NOT_RUNNING".into()),
+                    ..RouteOperation::default()
+                }
+            }
+            Err(error) => {
+                return RouteOperation {
+                    error_code: Some(error),
+                    ..RouteOperation::default()
+                }
+            }
+        };
+        let args = lte_ul_route_install_args(&ue.id, peer);
+        match self.executor.run(&args, 3) {
+            Ok(output) => classify_route_install(&output),
+            Err(_) => RouteOperation {
+                error_code: Some("LTE_UL_ROUTE_INSTALL_FAILED".into()),
+                ..RouteOperation::default()
+            },
+        }
+    }
+    fn probe_traffic_route(&self, direction: &str) -> RouteOperation {
+        let ue = match self.owned(Target::Ue) {
+            Ok(ue) if ue.state == "running" => ue,
+            _ => {
+                return RouteOperation {
+                    error_code: Some("LTE_UE_NOT_RUNNING".into()),
+                    ..RouteOperation::default()
+                }
+            }
+        };
+        if direction == "dl" {
+            let ue_ip = match self.ue_ip(Some(&ue)) {
+                Some(ip) => ip,
+                None => {
+                    return RouteOperation {
+                        error_code: Some("LTE_UE_IP_NOT_READY".into()),
+                        ..RouteOperation::default()
+                    }
+                }
+            };
+            let dn = match configured_lte_dn_sender_container() {
+                Ok(value) => value,
+                Err(error) => {
+                    return RouteOperation {
+                        error_code: Some(error),
+                        ..RouteOperation::default()
+                    }
+                }
+            };
+            return match self.run(&["exec", &dn, "ip", "route", "get", &ue_ip], 3) {
+                Ok(output) => {
+                    let code = if output.code == 0 {
+                        configured_lte_dl_return_policy()
+                            .and_then(|policy| evaluate_lte_dl_return_route(&output.stdout, &ue_ip, &policy))
+                            .err()
+                    } else {
+                        Some("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())
+                    };
+                    RouteOperation { diagnostic: bounded_diagnostic(&output), error_code: code }
+                }
+                Err(_) => RouteOperation {
+                    error_code: Some("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into()),
+                    ..RouteOperation::default()
+                },
+            };
+        }
+        if direction != "ul" {
+            return RouteOperation {
+                error_code: Some("LTE_TRAFFIC_PARAMETERS_INVALID".into()),
+                ..RouteOperation::default()
+            };
+        }
+        let peer = match configured_traffic_peer() {
+            Ok(peer) => peer.to_string(),
+            Err(error) => {
+                return RouteOperation {
+                    error_code: Some(error),
+                    ..RouteOperation::default()
+                }
+            }
+        };
+        match self.run(&["exec", &ue.id, "ip", "route", "get", &peer], 3) {
+            Ok(output) => {
+                let mut code = (output.code != 0).then(|| "LTE_UL_ROUTE_PROBE_FAILED".to_string());
+                if code.is_none() {
+                    let preflight = evaluate_lte_ul_route(&output.stdout, &peer);
+                    if !preflight.ok {
+                        code = Some(preflight.code.unwrap_or_else(|| "LTE_UL_ROUTE_NOT_VIA_UE_TUN".into()));
+                    }
+                }
+                RouteOperation { diagnostic: bounded_diagnostic(&output), error_code: code }
+            }
+            Err(_) => RouteOperation {
+                error_code: Some("LTE_UL_ROUTE_PROBE_FAILED".into()),
+                ..RouteOperation::default()
+            },
+        }
     }
     fn start(&self, target: Target) -> Result<(), String> {
         let (c, created) = if let Some(c) = self.resolve(target.service())? {
@@ -2154,6 +2354,47 @@ mod tests {
         match prev_sender {
             Some(value) => std::env::set_var("POLARIS_DL_SENDER_IP", value),
             None => std::env::remove_var("POLARIS_DL_SENDER_IP"),
+        }
+    }
+
+    #[test]
+    fn lte_ul_route_install_command_is_exact_and_host_scoped() {
+        assert_eq!(
+            lte_ul_route_install_args("owned-ue", "10.77.16.30".parse().unwrap()),
+            vec![
+                "exec",
+                "owned-ue",
+                "ip",
+                "route",
+                "replace",
+                "10.77.16.30/32",
+                "dev",
+                "tun_srsue",
+            ]
+        );
+    }
+
+    #[test]
+    fn route_install_failure_has_dedicated_code_and_bounded_private_diagnostics() {
+        let output = Output {
+            code: 2,
+            stdout: "x".repeat(700),
+            stderr: "IMSI=001010123456789".into(),
+        };
+        let operation = classify_route_install(&output);
+        assert_eq!(operation.error_code.as_deref(), Some("LTE_UL_ROUTE_INSTALL_FAILED"));
+        assert_eq!(operation.diagnostic.exit_code, 2);
+        assert!(operation.diagnostic.stdout.chars().count() <= 512);
+        assert_eq!(operation.diagnostic.stderr, "[REDACTED_SUBSCRIBER_MATERIAL]");
+    }
+
+    #[test]
+    fn ue_tooling_preflight_is_disposable_and_checks_all_three_tools() {
+        let args = ue_tooling_check_args("example.invalid/srsran@sha256:abc");
+        assert_eq!(&args[..6], ["run", "--rm", "--network", "none", "--entrypoint", "/bin/sh"]);
+        let script = args.last().unwrap();
+        for tool in ["ip", "ping", "iperf3"] {
+            assert!(script.contains(&format!("command -v {tool}")));
         }
     }
 

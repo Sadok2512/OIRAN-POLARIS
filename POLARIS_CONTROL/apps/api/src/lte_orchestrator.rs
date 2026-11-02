@@ -416,10 +416,36 @@ impl RunStore {
         if run.observations.len() >= 128 {
             return Err("LTE_EVIDENCE_LIMIT_REACHED".into());
         }
+        let source_kind = observation.source_kind.clone();
+        let measurements = observation.measurements.clone();
         run.observations.push(observation);
         let item = run.steps.get_mut(step).ok_or("LTE_RUN_STEP_INVALID")?;
+        if let Some(values) = item.measurements.as_object_mut() {
+            values.insert(source_kind, measurements);
+        }
         item.state = StepState::Completed;
         item.ended_at = Some(timestamp(now_ms));
+        self.persist()
+    }
+
+    pub fn record_step_diagnostic(
+        &mut self,
+        run_id: &str,
+        step: usize,
+        observation: Observation,
+    ) -> Result<(), String> {
+        let run = self.run_mut(run_id)?;
+        if run.observations.len() >= 128 {
+            return Err("LTE_EVIDENCE_LIMIT_REACHED".into());
+        }
+        let source_kind = observation.source_kind.clone();
+        let measurements = observation.measurements.clone();
+        run.observations.push(observation);
+        let item = run.steps.get_mut(step).ok_or("LTE_RUN_STEP_INVALID")?;
+        item.measurements
+            .as_object_mut()
+            .ok_or("LTE_EVIDENCE_STEP_MEASUREMENTS_INVALID")?
+            .insert(source_kind, measurements);
         self.persist()
     }
 
@@ -1281,6 +1307,41 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.parent(), Some(std::env::temp_dir().as_path()));
         assert_eq!(second.parent(), Some(std::env::temp_dir().as_path()));
+    }
+
+    #[test]
+    fn route_diagnostic_persists_before_a_failed_step() {
+        let p = path("route-diagnostic");
+        let mut store = RunStore::load(p.clone()).unwrap();
+        let run_id = "lte-run-route-diagnostic-12345678";
+        store
+            .create(run_id.into(), "grant-test".into(), 1, 999_999, "idem")
+            .unwrap();
+        store
+            .record_step_diagnostic(
+                run_id,
+                6,
+                Observation {
+                    sequence: 6,
+                    observed_at: timestamp(2),
+                    source_kind: "route_probe".into(),
+                    source_sha256: "a".repeat(64),
+                    validity: "VALID".into(),
+                    sanitization_state: "SANITIZED".into(),
+                    measurements: serde_json::json!({
+                        "diagnostic":{"exit_code":2,"stdout":"","stderr":"Network is unreachable"},
+                        "error_code":"LTE_UL_ROUTE_PROBE_FAILED"
+                    }),
+                },
+            )
+            .unwrap();
+        store
+            .fail_step(run_id, 6, "LTE_UL_ROUTE_PROBE_FAILED", 3)
+            .unwrap();
+        let run = store.get(run_id).unwrap();
+        assert_eq!(run.steps[6].reason_code.as_deref(), Some("LTE_UL_ROUTE_PROBE_FAILED"));
+        assert_eq!(run.steps[6].measurements["route_probe"]["diagnostic"]["exit_code"], 2);
+        let _ = fs::remove_file(p);
     }
 
     fn capture(plane: &str) -> CaptureRef {

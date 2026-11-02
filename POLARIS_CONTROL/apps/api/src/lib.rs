@@ -5632,6 +5632,34 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
         let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
         return;
     }
+    let runtime = state.srsran_runtime.clone();
+    let route_install = tokio::task::spawn_blocking(move || runtime.install_lte_ul_route())
+        .await
+        .unwrap_or_else(|_| srsran_controller::RouteOperation {
+            error_code: Some("LTE_UL_ROUTE_INSTALL_FAILED".into()),
+            ..srsran_controller::RouteOperation::default()
+        });
+    let install_evidence = serde_json::to_value(&route_install)
+        .unwrap_or_else(|_| json!({"error_code":"LTE_EVIDENCE_SERIALIZATION_FAILED"}));
+    let _ = state.lte_runs_v2.lock().map(|mut store| {
+        store.record_step_diagnostic(
+            &run_id,
+            5,
+            lte_observation(5, "lte_ul_route_install", install_evidence),
+        )
+    });
+    if !route_install.succeeded() {
+        let reason = route_install
+            .error_code
+            .as_deref()
+            .unwrap_or("LTE_UL_ROUTE_INSTALL_FAILED");
+        let _ = state
+            .lte_runs_v2
+            .lock()
+            .map(|mut store| store.fail_step(&run_id, 5, reason, epoch_millis()));
+        let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
+        return;
+    }
     let _ = state.lte_runs_v2.lock().map(|mut store| {
         store.observe(
             &run_id,
@@ -5689,6 +5717,35 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
                 lte_orchestrator::RunOutcome::Cancelled,
             )
             .await;
+            return;
+        }
+        let runtime = state.srsran_runtime.clone();
+        let dir = direction.to_string();
+        let route_probe = tokio::task::spawn_blocking(move || runtime.probe_traffic_route(&dir))
+            .await
+            .unwrap_or_else(|_| srsran_controller::RouteOperation {
+                error_code: Some("LTE_TRAFFIC_WORKER_FAILED".into()),
+                ..srsran_controller::RouteOperation::default()
+            });
+        let probe_evidence = serde_json::to_value(&route_probe)
+            .unwrap_or_else(|_| json!({"error_code":"LTE_EVIDENCE_SERIALIZATION_FAILED"}));
+        let _ = state.lte_runs_v2.lock().map(|mut store| {
+            store.record_step_diagnostic(
+                &run_id,
+                step,
+                lte_observation(step as u64, "route_probe", probe_evidence),
+            )
+        });
+        if !route_probe.succeeded() {
+            let reason = route_probe
+                .error_code
+                .as_deref()
+                .unwrap_or("LTE_TRAFFIC_ROUTE_PROBE_FAILED");
+            let _ = state
+                .lte_runs_v2
+                .lock()
+                .map(|mut store| store.fail_step(&run_id, step, reason, epoch_millis()));
+            let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
             return;
         }
         let runtime = state.srsran_runtime.clone();
@@ -5758,6 +5815,35 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
                 lte_orchestrator::RunOutcome::Cancelled,
             )
             .await;
+            return;
+        }
+        let runtime = state.srsran_runtime.clone();
+        let dir = direction.to_string();
+        let route_probe = tokio::task::spawn_blocking(move || runtime.probe_traffic_route(&dir))
+            .await
+            .unwrap_or_else(|_| srsran_controller::RouteOperation {
+                error_code: Some("LTE_TRAFFIC_WORKER_FAILED".into()),
+                ..srsran_controller::RouteOperation::default()
+            });
+        let probe_evidence = serde_json::to_value(&route_probe)
+            .unwrap_or_else(|_| json!({"error_code":"LTE_EVIDENCE_SERIALIZATION_FAILED"}));
+        let _ = state.lte_runs_v2.lock().map(|mut store| {
+            store.record_step_diagnostic(
+                &run_id,
+                step,
+                lte_observation(step as u64, "route_probe", probe_evidence),
+            )
+        });
+        if !route_probe.succeeded() {
+            let reason = route_probe
+                .error_code
+                .as_deref()
+                .unwrap_or("LTE_TRAFFIC_ROUTE_PROBE_FAILED");
+            let _ = state
+                .lte_runs_v2
+                .lock()
+                .map(|mut store| store.fail_step(&run_id, step, reason, epoch_millis()));
+            let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
             return;
         }
         let remaining_seconds = deadline_at_epoch_ms
