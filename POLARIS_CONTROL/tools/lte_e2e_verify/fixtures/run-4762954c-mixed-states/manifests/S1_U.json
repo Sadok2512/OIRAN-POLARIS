@@ -1,0 +1,11 @@
+{
+  "plane": "S1_U",
+  "packet_count": 0,
+  "first_packet_at": null,
+  "last_packet_at": null,
+  "source_sha256": "4762954cbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2",
+  "gtpu": {
+    "teid": null,
+    "octets": 0
+  }
+}

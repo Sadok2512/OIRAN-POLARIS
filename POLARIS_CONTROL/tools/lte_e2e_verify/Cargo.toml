@@ -5,7 +5,7 @@
 
 [package]
 name = "lte-e2e-verify"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "Proprietary"
 rust-version = "1.75"

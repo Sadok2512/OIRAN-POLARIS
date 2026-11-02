@@ -1,0 +1,15 @@
+{
+  "plane": "S1_MME",
+  "packet_count": 48,
+  "first_packet_at": "2026-11-02T22:08:38.646Z",
+  "last_packet_at": "2026-11-02T22:09:59.446Z",
+  "source_sha256": "4762954c76b6b76b6b76b6b76b6b76b6b76b6b76b6b76b6b76b6b76b6b76b6b7",
+  "s1ap_procedures": [
+    {"procedure": 17, "sctp_ppid": 18},
+    {"procedure": 17, "sctp_ppid": 18}
+  ],
+  "nas_eps": [
+    {"message_type": "0x41", "role": "attach_request"},
+    {"message_type": "0x43", "role": "attach_complete"}
+  ]
+}

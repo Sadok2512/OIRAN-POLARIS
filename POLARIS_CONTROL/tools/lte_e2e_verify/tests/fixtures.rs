@@ -158,6 +158,85 @@ fn verifier_0_1_2_exposes_enb_link_counters_for_s1u_and_zmq() {
 }
 
 #[test]
+fn run_4762954c_shows_proven_not_proven_and_open_states_together() {
+    // 0.1.3: the run `lte-run-4762954cf008935038162a0b8289dc67` reported by
+    // Codex on Issue #10 comment 6589742429 is the canonical example of the
+    // three state() values coexisting:
+    //
+    // - PROVEN                   : S1_SETUP, ATTACH, UE_IP, CLEANUP,
+    //                              GRANT_REVOKED, DUMPCAP (all observed)
+    // - NOT_PROVEN               : EPS_BEARER, PING_UL, S1U_GTPU
+    //                              (evidence was expected but missing/wrong)
+    // - OPEN                     : PING_DL, UDP_UL, UDP_DL
+    //                              (orchestrator skipped the step after
+    //                               PING_UL failed; nothing was observed)
+    //
+    // EPS_BEARER is NOT_PROVEN (not OPEN) because the gate had the chance to
+    // observe S11 CSReq/CSRsp + E-RAB during the attach window; those never
+    // materialised. The verifier must mark that as NOT_PROVEN, not OPEN.
+    let report = lte_e2e_verify::verify(&fixture("run-4762954c-mixed-states")).expect("verify");
+    assert_eq!(report.run_id, "lte-run-4762954cf008935038162a0b8289dc67");
+
+    let state = |name: &str| -> &'static str {
+        report
+            .gates
+            .iter()
+            .find(|(gate, _)| *gate == name)
+            .map(|(_, verdict)| verdict.state())
+            .unwrap_or("MISSING")
+    };
+
+    // PROVEN
+    assert_eq!(state("S1_SETUP"), "PROVEN");
+    assert_eq!(state("ATTACH"), "PROVEN");
+    assert_eq!(state("CLEANUP"), "PROVEN");
+    assert_eq!(state("GRANT_REVOKED"), "PROVEN");
+    assert_eq!(state("DUMPCAP"), "PROVEN");
+
+    // NOT_PROVEN
+    assert_eq!(state("EPS_BEARER"), "NOT_PROVEN");
+    assert_eq!(state("PING_UL"), "NOT_PROVEN");
+    assert_eq!(state("S1U_GTPU"), "NOT_PROVEN");
+
+    // OPEN — orchestrator skipped these steps after PING_UL failed.
+    assert_eq!(state("PING_DL"), "OPEN");
+    assert_eq!(state("UDP_UL"), "OPEN");
+    assert_eq!(state("UDP_DL"), "OPEN");
+
+    // The rendered label stays FAIL for Open so e0497's contract still holds.
+    let label = |name: &str| -> String {
+        report
+            .gates
+            .iter()
+            .find(|(gate, _)| *gate == name)
+            .map(|(_, verdict)| verdict.label())
+            .unwrap_or_default()
+    };
+    assert_eq!(label("PING_DL"), "FAIL");
+
+    // Overall verdict still NOT a REAL_PASS.
+    assert_eq!(report.final_verdict(), "NO_LTE_E2E_REAL_PASS");
+    assert!(report.blockers().contains(&"PING_DL"));
+    assert!(report.blockers().contains(&"EPS_BEARER"));
+}
+
+#[test]
+fn eps_bearer_degrades_to_proven_cp_only_when_cp_proven_but_s1u_empty() {
+    // 0.1.3: when S11 CSReq/CSRsp + E-RAB are observed AND S1-U is empty
+    // (packet_count=0), EPS_BEARER must emit PASS_CONTROL_PLANE_ONLY with
+    // state() == PROVEN_CONTROL_PLANE_ONLY. The existing e0497 fixture is
+    // the canonical case.
+    let report = lte_e2e_verify::verify(&fixture("e0497")).expect("verify");
+    let eps_bearer = report
+        .gates
+        .iter()
+        .find(|(gate, _)| *gate == "EPS_BEARER")
+        .map(|(_, verdict)| verdict.state())
+        .expect("EPS_BEARER gate");
+    assert_eq!(eps_bearer, "PROVEN_CONTROL_PLANE_ONLY");
+}
+
+#[test]
 fn missing_grant_section_fails_grant_revoked_gate() {
     // The missing-field fixture drops the `grant` section entirely from the
     // control proof. The verifier must fail that gate with its code and must

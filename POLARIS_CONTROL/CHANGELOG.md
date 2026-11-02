@@ -1,5 +1,20 @@
 # Changelog
 
+## tools/lte-e2e-verify 0.1.3 — 2026-11-02 — Verdict::Open + state() audit label
+
+- Adds `Verdict::Open(gate)` for phases skipped by the orchestrator after an
+  upstream failure. The rendered label stays `FAIL` for backward compat with
+  the e0497 contract; the new `Verdict::state()` method returns one of
+  `PROVEN`, `PROVEN_CONTROL_PLANE_ONLY`, `NOT_PROVEN`, `OPEN`.
+- `verdict_ping` / `verdict_udp` detect `state: SKIPPED` on the matching step
+  and emit `Open` so the operator sees that P3/P4 never ran (vs. a probe that
+  actively produced zero packets).
+- EPS_BEARER remains `PROVEN_CONTROL_PLANE_ONLY` whenever S11 CSReq/CSRsp +
+  E-RAB are proven even if S1-U is empty.
+- Adds `run-4762954c-mixed-states` fixture + test documenting the three
+  states coexisting in Codex's lte-run-4762954cf008935038162a0b8289dc67
+  report (Issue #10 comment 6589742429).
+
 ## tools/lte-e2e-verify 0.1.2 — 2026-11-02 — read POLARIS 0.29.5 enb_link_counters
 
 - Extends `Step` with an `enb_link_counters()` accessor that returns the

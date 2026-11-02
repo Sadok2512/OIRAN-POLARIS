@@ -1,0 +1,41 @@
+{
+  "run_id": "lte-run-4762954cf008935038162a0b8289dc67",
+  "started_at": "2026-11-02T22:08:38.646Z",
+  "ended_at": "2026-11-02T22:09:59.446Z",
+  "final_state": "FAILED",
+  "state": "CLEAN",
+  "steps": [
+    {"index": 2, "name": "s1_setup", "state": "COMPLETED"},
+    {"index": 4, "name": "lte_attach", "state": "COMPLETED"},
+    {"index": 5, "name": "ue_ip", "state": "COMPLETED"},
+    {"index": 6, "name": "ping_ul", "state": "FAILED", "reason_code": "LTE_PING_FAILED"},
+    {"index": 7, "name": "ping_dl", "state": "SKIPPED"},
+    {"index": 8, "name": "udp_ul", "state": "SKIPPED"},
+    {"index": 9, "name": "udp_dl", "state": "SKIPPED"},
+    {"index": 10, "name": "cleanup", "state": "COMPLETED"}
+  ],
+  "ping": {
+    "ul": {"tx": 1, "rx": 0},
+    "dl": null
+  },
+  "udp": {
+    "ul": null,
+    "dl": null
+  },
+  "cleanup": {
+    "srsue_stopped": true,
+    "srsenb_stopped": true,
+    "sidecars_removed": true,
+    "epc_healthy": true,
+    "dumpcaps_preserved": true
+  },
+  "grant": {
+    "state": "REVOKED",
+    "use_count": 1,
+    "run_state": "CLEAN"
+  },
+  "dumpcap": {
+    "before_pids": [4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009, 4010, 4011, 4012],
+    "after_pids":  [4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009, 4010, 4011, 4012]
+  }
+}

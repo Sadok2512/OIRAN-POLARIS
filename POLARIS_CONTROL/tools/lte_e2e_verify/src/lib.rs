@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-pub const VERSION: &str = "0.1.2";
+pub const VERSION: &str = "0.1.3";
 
 const UDP_RATE_CAP_BPS: u64 = 1_000_000;
 const DUMPCAP_EXPECTED: usize = 12;
@@ -57,6 +57,12 @@ pub enum Verdict {
     Pass,
     PassControlPlaneOnly,
     Fail(String),
+    /// 0.1.3: the gate's phase was skipped by the orchestrator because an
+    /// upstream step failed. The rendered label stays `FAIL` for backward
+    /// compatibility with the e0497 contract, but `state()` returns `OPEN`
+    /// so a reader can distinguish a probe that actively failed from one
+    /// that was never performed.
+    Open(String),
 }
 
 impl Verdict {
@@ -64,7 +70,42 @@ impl Verdict {
         match self {
             Verdict::Pass => "PASS".to_string(),
             Verdict::PassControlPlaneOnly => "PASS_CONTROL_PLANE_ONLY".to_string(),
-            Verdict::Fail(_) => "FAIL".to_string(),
+            Verdict::Fail(_) | Verdict::Open(_) => "FAIL".to_string(),
+        }
+    }
+
+    /// 0.1.3: audit-grade state label distinct from the rendered verdict.
+    ///
+    /// - `PROVEN` : the gate observed every piece of evidence it requires.
+    /// - `PROVEN_CONTROL_PLANE_ONLY` : control-plane evidence complete but
+    ///   the user-plane phase did not produce traffic. Returned by
+    ///   `EPS_BEARER` when S11 32/33 + E-RAB are proven even if P3 (traffic)
+    ///   never ran.
+    /// - `NOT_PROVEN` : the gate's required evidence is missing or
+    ///   contradictory — something was observed and it was wrong.
+    /// - `OPEN` : the gate's phase was skipped by the orchestrator because
+    ///   an upstream step failed; nothing was observed. Still contributes
+    ///   to `BLOCKERS` (no `REAL_PASS`), but distinct from `NOT_PROVEN`
+    ///   because the root cause lives upstream.
+    ///
+    /// For run `lte-run-4762954cf008935038162a0b8289dc67` (Codex report on
+    /// Issue #10 comment `6589742429`), the three states appear together:
+    ///
+    /// | Gate              | State                      | Why |
+    /// |-------------------|----------------------------|-----|
+    /// | S1_SETUP          | PROVEN                     | S1AP procedure 17 observed on SCTP PPID 18 |
+    /// | ATTACH            | PROVEN                     | NAS Attach Request + Complete observed |
+    /// | EPS_BEARER        | NOT_PROVEN                 | P3 never ran so no S11 CSReq/CSRsp, no E-RAB — CP absent |
+    /// | PING_UL           | NOT_PROVEN                 | ping exited 255 "operation not permitted" |
+    /// | PING_DL / UDP_*   | OPEN                       | orchestrator skipped them (P3=BLOCKED_BY_P2_FAIL) |
+    /// | S1U_GTPU          | NOT_PROVEN                 | S1-U `packet_count=0` |
+    /// | CLEANUP / GRANT_REVOKED / DUMPCAP | PROVEN     | all explicit cleanup observations true |
+    pub fn state(&self) -> &'static str {
+        match self {
+            Verdict::Pass => "PROVEN",
+            Verdict::PassControlPlaneOnly => "PROVEN_CONTROL_PLANE_ONLY",
+            Verdict::Fail(_) => "NOT_PROVEN",
+            Verdict::Open(_) => "OPEN",
         }
     }
 
@@ -442,7 +483,19 @@ fn normalize_teid(value: &str) -> String {
     stripped.trim_start_matches('0').to_ascii_lowercase()
 }
 
-/// PING: both tx and rx > 0 in the requested direction.
+fn step_state_for(control: &ControlProof, step_name: &str) -> Option<String> {
+    control
+        .steps
+        .iter()
+        .find(|step| step.name == step_name)
+        .map(|step| step.state.clone())
+}
+
+/// PING: both tx and rx > 0 in the requested direction. If the step's
+/// control-plane record carries `state: SKIPPED` and no counters were
+/// recorded, the gate degrades to `Open` so the operator sees that the
+/// phase did not run (OPEN) rather than that it produced zero packets
+/// (NOT_PROVEN).
 pub fn verdict_ping(control: &ControlProof, direction: &str) -> Verdict {
     let section = control.ping.as_ref().and_then(|section| {
         if direction == "ul" {
@@ -452,14 +505,22 @@ pub fn verdict_ping(control: &ControlProof, direction: &str) -> Verdict {
         }
     });
     let gate = format!("PING_{}", direction.to_ascii_uppercase());
-    match section {
-        Some(c) if c.tx > 0 && c.rx > 0 => Verdict::Pass,
-        _ => Verdict::Fail(gate),
+    if let Some(c) = section {
+        if c.tx > 0 && c.rx > 0 {
+            return Verdict::Pass;
+        }
     }
+    let step_name = format!("ping_{direction}");
+    if section.is_none() && step_state_for(control, &step_name).as_deref() == Some("SKIPPED") {
+        return Verdict::Open(gate);
+    }
+    Verdict::Fail(gate)
 }
 
 /// UDP: bytes > 0 AND rate ≤ 1 Mbit/s (Grant V2 cap) in the requested
-/// direction. Missing rate is treated as unknown and fails closed.
+/// direction. Missing rate is treated as unknown and fails closed. If the
+/// step is `SKIPPED` and no counters were recorded, the gate degrades to
+/// `Open`.
 pub fn verdict_udp(control: &ControlProof, direction: &str) -> Verdict {
     let section = control.udp.as_ref().and_then(|section| {
         if direction == "ul" {
@@ -469,16 +530,19 @@ pub fn verdict_udp(control: &ControlProof, direction: &str) -> Verdict {
         }
     });
     let gate = format!("UDP_{}", direction.to_ascii_uppercase());
-    match section {
-        Some(c)
-            if c.bytes > 0
-                && c.rate_bps.is_some()
-                && c.rate_bps.unwrap() <= UDP_RATE_CAP_BPS =>
+    if let Some(c) = section {
+        if c.bytes > 0
+            && c.rate_bps.is_some()
+            && c.rate_bps.unwrap() <= UDP_RATE_CAP_BPS
         {
-            Verdict::Pass
+            return Verdict::Pass;
         }
-        _ => Verdict::Fail(gate),
     }
+    let step_name = format!("udp_{direction}");
+    if section.is_none() && step_state_for(control, &step_name).as_deref() == Some("SKIPPED") {
+        return Verdict::Open(gate);
+    }
+    Verdict::Fail(gate)
 }
 
 /// CLEANUP: all five explicit observations are true.
