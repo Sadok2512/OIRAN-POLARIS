@@ -2,6 +2,9 @@
 
 ## 0.29.5 (polaris-control-api) — 2026-11-02 — LTE ping failure evidence retention
 
+- Review corrections retain the filtered final 512 UTF-8 bytes of srsUE/srsENB
+  logs, capture S1-U/ZMQ eNB link counters, and restore fail-closed DL sender
+  tooling classification on the ping result.
 - Persists bounded, subscriber-sanitized ping stdout/stderr/exit status before
   `fail_step` and before cleanup, so terminal run evidence retains the exact
   `LTE_PING_FAILED` cause.

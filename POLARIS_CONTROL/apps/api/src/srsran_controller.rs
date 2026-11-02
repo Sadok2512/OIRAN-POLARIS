@@ -168,6 +168,7 @@ pub struct PingRuntimeEvidence {
     pub ping: CommandDiagnostic, pub ue_link: CommandDiagnostic,
     pub ue_routes: CommandDiagnostic, pub srsue_log_tail: CommandDiagnostic,
     pub srsenb_log_tail: CommandDiagnostic, pub enb: EnbRuntimeEvidence,
+    pub enb_link_counters: BTreeMap<String, CommandDiagnostic>,
     pub container_image_ids: BTreeMap<String, String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
@@ -296,7 +297,7 @@ fn bounded_diagnostic(output: &Output) -> CommandDiagnostic {
             .filter_map(sanitize_log_line)
             .collect::<Vec<_>>()
             .join("\n");
-        truncate_utf8_bytes(&sanitized, 512)
+        truncate_utf8_tail(&sanitized, 512)
     }
     CommandDiagnostic {
         exit_code: output.code,
@@ -308,6 +309,36 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes { return value.to_string(); }
     let mut end = max_bytes; while !value.is_char_boundary(end) { end -= 1; }
     value[..end].to_string()
+}
+fn truncate_utf8_tail(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes { return value.to_string(); }
+    let mut start = value.len() - max_bytes;
+    while !value.is_char_boundary(start) { start += 1; }
+    value[start..].to_string()
+}
+fn useful_lte_log_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    ["gtpu", "gtp", "rlc", "pdcp", "rrc", "error", "warn", "drop", "bitrate", "tun"]
+        .iter().any(|marker| lower.contains(marker))
+}
+fn bounded_filtered_log_diagnostic(output: &Output) -> CommandDiagnostic {
+    let filter = |value: &str| {
+        let useful = value.lines().filter_map(sanitize_log_line)
+            .filter(|line| useful_lte_log_line(line)).collect::<Vec<_>>().join("\n");
+        truncate_utf8_tail(&useful, 512)
+    };
+    CommandDiagnostic { exit_code: output.code, stdout: filter(&output.stdout), stderr: filter(&output.stderr) }
+}
+fn interface_for_ipv4(output: &str, address: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let inet = fields.iter().position(|field| *field == "inet")?;
+        let observed = fields.get(inet + 1)?.split('/').next()?;
+        if observed == address { fields.get(1).map(|field| field.trim_end_matches(':').to_string()) } else { None }
+    })
+}
+fn classify_ping_output(direction: &str, output: &Output) -> Result<(), String> {
+    if direction == "dl" { classify_dn_container_exit(output.code, &output.stderr) } else { Ok(()) }
 }
 fn failed_diagnostic(error: &str) -> CommandDiagnostic { CommandDiagnostic { exit_code: 125, stdout: String::new(), stderr: truncate_utf8_bytes(error, 512) } }
 fn parse_enb_bind_config(contents: &str) -> (Option<String>, Option<String>) {
@@ -916,18 +947,36 @@ impl DockerSrsranRuntime {
     fn collect_ping_evidence(&self, ue: &Container, ping: CommandDiagnostic) -> PingRuntimeEvidence {
         let ue_link = self.diagnostic(&["exec", &ue.id, "ip", "-s", "link", "show", LTE_UE_TUN], 3);
         let ue_routes = self.diagnostic(&["exec", &ue.id, "ip", "route"], 3);
-        let srsue_log_tail = self.diagnostic(&["logs", "--tail", "200", &ue.id], 5);
+        let srsue_log_tail = match self.run(&["logs", "--tail", "200", &ue.id], 5) {
+            Ok(output) => bounded_filtered_log_diagnostic(&output),
+            Err(error) => failed_diagnostic(&error),
+        };
         let mut evidence = PingRuntimeEvidence { ping, ue_link, ue_routes, srsue_log_tail, ..PingRuntimeEvidence::default() };
         let Ok(Some(enb)) = self.resolve("srsenb") else { return evidence; };
         let (srsenb_log_tail, ul_bitrate, dl_bitrate) = match self.run(&["logs", "--tail", "200", &enb.id], 5) {
-            Ok(output) => { let (ul, dl) = parse_enb_bitrates(&format!("{}\n{}", output.stdout, output.stderr)); (bounded_diagnostic(&output), ul, dl) },
+            Ok(output) => { let (ul, dl) = parse_enb_bitrates(&format!("{}\n{}", output.stdout, output.stderr)); (bounded_filtered_log_diagnostic(&output), ul, dl) },
             Err(error) => (failed_diagnostic(&error), None, None),
         };
         evidence.srsenb_log_tail = srsenb_log_tail;
         let (gtp_bind_addr, s1c_bind_addr) = fs::read_to_string(ENB_CONFIG).ok().map(|contents| parse_enb_bind_config(&contents)).unwrap_or_default();
-        let networks = parse_docker_networks(&self.diagnostic(&["inspect", "--format", "{{json .NetworkSettings.Networks}}", &enb.id], 3).stdout);
+        let networks = self.run(&["inspect", "--format", "{{json .NetworkSettings.Networks}}", &enb.id], 3)
+            .ok().filter(|output| output.code == 0).map(|output| parse_docker_networks(&output.stdout)).unwrap_or_default();
         let s1u_network_present = gtp_bind_addr.as_ref().is_some_and(|address| networks.values().any(|value| value == address));
+        let enb_addresses = self.run(&["exec", &enb.id, "ip", "-o", "-4", "addr", "show"], 3);
+        let mut enb_link_counters = BTreeMap::new();
+        let zmq_address = networks.iter().find(|(name, _)| name.to_ascii_lowercase().contains("zmq")).map(|(_, address)| address);
+        for (role, address) in [("s1u", gtp_bind_addr.as_ref()), ("zmq", zmq_address)] {
+            let counters = match (&enb_addresses, address) {
+                (Ok(output), Some(address)) if output.code == 0 => interface_for_ipv4(&output.stdout, address)
+                    .map(|interface| self.diagnostic(&["exec", &enb.id, "ip", "-s", "link", "show", "dev", &interface], 3))
+                    .unwrap_or_else(|| failed_diagnostic("LTE_ENB_LINK_INTERFACE_NOT_FOUND")),
+                (Err(error), _) => failed_diagnostic(error),
+                _ => failed_diagnostic("LTE_ENB_LINK_INTERFACE_NOT_FOUND"),
+            };
+            enb_link_counters.insert(role.to_string(), counters);
+        }
         evidence.enb = EnbRuntimeEvidence { gtp_bind_addr, s1c_bind_addr, networks, s1u_network_present, ul_bitrate, dl_bitrate };
+        evidence.enb_link_counters = enb_link_counters;
         for (component, container) in [("srsue", ue), ("srsenb", &enb)] { let image = self.diagnostic(&["inspect", "--format", "{{.Image}}", &container.id], 3); let value = image.stdout.trim(); if image.exit_code == 0 && value.starts_with("sha256:") && value.len() == 71 { evidence.container_image_ids.insert(component.into(), value.into()); } }
         evidence
     }
@@ -949,7 +998,9 @@ impl DockerSrsranRuntime {
             self.run(&["exec", dn.as_str(), "ping", "-n", "-c", &count, "-W", "1", &ue_ip], 10)
         };
         let output = match ping_output { Ok(output) => output, Err(error) => return PingOperation { evidence: self.collect_ping_evidence(&ue, failed_diagnostic(&error)), error_code: Some("LTE_PING_FAILED".into()), ..PingOperation::default() } };
-        let evidence = self.collect_ping_evidence(&ue, bounded_diagnostic(&output)); if output.code != 0 { return PingOperation { evidence, error_code: Some("LTE_PING_FAILED".into()), ..PingOperation::default() }; }
+        let evidence = self.collect_ping_evidence(&ue, bounded_diagnostic(&output));
+        if let Err(error_code) = classify_ping_output(direction, &output) { return PingOperation { evidence, error_code: Some(error_code), ..PingOperation::default() }; }
+        if output.code != 0 { return PingOperation { evidence, error_code: Some("LTE_PING_FAILED".into()), ..PingOperation::default() }; }
         match parse_ping_measurement(&output.stdout) { Some(measurement) => PingOperation { measurement: Some(measurement), evidence, error_code: None }, None => PingOperation { evidence, error_code: Some("LTE_PING_RESULT_INVALID".into()), ..PingOperation::default() } }
     }
     fn attach_proof(&self, ue: Option<&Container>) -> bool {
@@ -1872,15 +1923,40 @@ mod tests {
     fn ping_evidence_diagnostics_are_complete_private_and_byte_bounded() {
         let diagnostic = bounded_diagnostic(&Output { code: 1, stdout: format!("IMEISV secret\n{}", "é".repeat(400)), stderr: "x".repeat(700) });
         assert!(diagnostic.stdout.len() <= 512 && diagnostic.stderr.len() <= 512);
-        assert!(diagnostic.stdout.contains("[REDACTED_SUBSCRIBER_MATERIAL]") && !diagnostic.stdout.contains("secret"));
+        assert!(!diagnostic.stdout.contains("secret") && !diagnostic.stdout.to_ascii_lowercase().contains("imeisv"));
         let (gtp, s1c) = parse_enb_bind_config("gtp_bind_addr=10.77.11.20\ns1c_bind_addr=10.77.10.20");
         let networks = parse_docker_networks(r#"{"oiran-lab-s1u":{"IPAddress":"10.77.11.20"}}"#);
         let (ul, dl) = parse_enb_bitrates("UL bitrate=812000 bps\nDL bitrate=991000 bps");
         assert_eq!(gtp.as_deref(), Some("10.77.11.20")); assert_eq!(s1c.as_deref(), Some("10.77.10.20")); assert!(ul.is_some() && dl.is_some());
         let value = serde_json::to_value(PingRuntimeEvidence { ping: diagnostic.clone(), ue_link: diagnostic.clone(), ue_routes: diagnostic.clone(), srsue_log_tail: diagnostic.clone(), srsenb_log_tail: diagnostic,
             enb: EnbRuntimeEvidence { gtp_bind_addr: gtp, s1c_bind_addr: s1c, networks, s1u_network_present: true, ul_bitrate: ul, dl_bitrate: dl },
+            enb_link_counters: BTreeMap::new(),
             container_image_ids: BTreeMap::from([("srsue".into(), format!("sha256:{}", "a".repeat(64)))]) }).unwrap();
-        for key in ["ping", "ue_link", "ue_routes", "srsue_log_tail", "srsenb_log_tail", "enb", "container_image_ids"] { assert!(value.get(key).is_some(), "missing {key}"); }
+        for key in ["ping", "ue_link", "ue_routes", "srsue_log_tail", "srsenb_log_tail", "enb", "enb_link_counters", "container_image_ids"] { assert!(value.get(key).is_some(), "missing {key}"); }
+    }
+    #[test]
+    fn filtered_log_evidence_keeps_the_end_not_the_beginning() {
+        let output = Output { code: 1, stdout: format!("RRC FIRST_MARKER {}\nGTPU LAST_MARKER", "x".repeat(700)), stderr: String::new() };
+        let diagnostic = bounded_filtered_log_diagnostic(&output);
+        assert!(diagnostic.stdout.as_bytes().len() <= 512);
+        assert!(diagnostic.stdout.contains("GTPU LAST_MARKER"));
+        assert!(!diagnostic.stdout.contains("FIRST_MARKER"));
+    }
+    #[test]
+    fn enb_link_counter_interface_and_tail_are_preserved() {
+        let addresses = "2: eth0    inet 10.77.11.20/24 brd 10.77.11.255 scope global eth0\n3: eth1    inet 10.77.17.20/24 brd 10.77.17.255 scope global eth1";
+        assert_eq!(interface_for_ipv4(addresses, "10.77.11.20").as_deref(), Some("eth0"));
+        assert_eq!(interface_for_ipv4(addresses, "10.77.17.20").as_deref(), Some("eth1"));
+        let counters = bounded_diagnostic(&Output { code: 0, stdout: format!("RX OLD {}\nTX FINAL packets 42 bytes 4096", "x".repeat(700)), stderr: String::new() });
+        assert!(counters.stdout.as_bytes().len() <= 512);
+        assert!(counters.stdout.contains("TX FINAL packets 42 bytes 4096"));
+        assert!(!counters.stdout.contains("RX OLD"));
+    }
+    #[test]
+    fn dl_ping_restores_missing_tooling_classification() {
+        let output = Output { code: 127, stdout: String::new(), stderr: "ping: command not found".into() };
+        assert_eq!(classify_ping_output("dl", &output), Err("LTE_DN_SENDER_TOOLING_MISSING".into()));
+        assert_eq!(classify_ping_output("ul", &output), Ok(()));
     }
     #[test]
     fn ownership_is_independent() {
