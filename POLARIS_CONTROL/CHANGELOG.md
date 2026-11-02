@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.29.6 (polaris-control-api) — 2026-11-02 — pinned 0.29.6-rc1 image + exec preflight
+
+- Pins the certified UE tooling image reference to
+  `oiran/srsran4g-ue-tools:0.29.6-rc1` and the image ID to
+  `sha256:aab719ffdfa518777ed3d197ffe02cdcef02f78f578095d9abb1da9f327db2a5`.
+  The previous 0.29.4-rc1 reference / `sha256:218e848b…4d04` is explicitly
+  rejected with `LTE_CERTIFIED_IMAGE_MISMATCH` so an operator pointing at a
+  stale image gets a precise diagnostic.
+- Adds an exec preflight before every Grant V2 issuance: a disposable
+  container is spawned from the certified image with the *same* cap_drop /
+  cap_add / user / `read_only` / `no-new-privileges` as the live service
+  (`UE_SERVICE_EXEC_SPEC` and `DN_SGI_SERVICE_EXEC_SPEC`), `--network none`,
+  running `ping -c1 -W1 127.0.0.1 && iperf3 --version`. A non-zero exit
+  surfaces `LTE_UE_TOOLING_NOT_EXECUTABLE` or `LTE_DN_TOOLING_NOT_EXECUTABLE`
+  with a bounded tail-preserving diagnostic.
+- Preserves every 0.29.5 safeguard (SGi/N6 safeguards, Grant V2, finalizer,
+  dumpcap ownership, Open5GS). Workspace behaviour unchanged on the data
+  plane.
+
 ## 0.29.6-rc1 (srsran4g-ue-tools) — 2026-11-02 — unprivileged ping execution
 
 - Derives only from the certified 0.29.4 UE tooling image and removes the

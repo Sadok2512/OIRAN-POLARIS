@@ -20,9 +20,9 @@ const UE_CONFIG: &str = "/root/POLARIS/runtime/srsran/ue.conf";
 const ENB_CONFIG: &str = "/root/POLARIS/config/srsran/enb.conf";
 const LEDGER: &str = "/var/lib/polaris-control/srsran-ownership.json";
 pub const CERTIFIED_IMAGE_REFERENCE: &str =
-    "oiran/srsran4g-ue-tools:0.29.4-rc1";
+    "oiran/srsran4g-ue-tools:0.29.6-rc1";
 pub const CERTIFIED_IMAGE_ID: &str =
-    "sha256:218e848bd8cb59532d8cce9dcef8d6370944abd35b9b25aea9041671681e4d04";
+    "sha256:aab719ffdfa518777ed3d197ffe02cdcef02f78f578095d9abb1da9f327db2a5";
 pub const CERTIFIED_COMPOSE_MODEL_SHA256: &str =
     "d0c80ea193272fc85b9afc8abc78d521ffc08e5581cf49894160c5bf78935f5d";
 const PROFILE_CONFIGS: [&str; 5] = [
@@ -377,19 +377,103 @@ fn classify_route_install(output: &Output) -> RouteOperation {
     }
 }
 
-fn ue_tooling_check_args(image_reference: &str) -> Vec<String> {
-    vec![
-        "run".into(),
-        "--rm".into(),
-        "--network".into(),
-        "none".into(),
+/// 0.29.6: the Grant-time exec preflight runs the UE and the DN SGi
+/// containers with the exact capability sets, user, filesystem mode and
+/// `--security-opt no-new-privileges:true` declared by the live service. If
+/// a cap_drop that applies in production is missing from the preflight the
+/// gate is theatre; if the preflight uses extra caps it masks real failures.
+pub struct ContainerExecSpec {
+    pub role: &'static str,
+    pub cap_drop: &'static [&'static str],
+    pub cap_add: &'static [&'static str],
+    pub user: &'static str,
+    pub read_only: bool,
+    pub no_new_privileges: bool,
+}
+
+/// Mirrors the UE service capability profile documented in the 0.29.6-rc1
+/// srsran4g-ue-tools CHANGELOG entry:
+/// `cap_drop: ALL`, `cap_add: [NET_ADMIN, SYS_NICE]`, read-only root FS,
+/// no-new-privileges, running as root (uid 0:0) because `tun_srsue` creation
+/// still requires it.
+pub const UE_SERVICE_EXEC_SPEC: ContainerExecSpec = ContainerExecSpec {
+    role: "ue",
+    cap_drop: &["ALL"],
+    cap_add: &["NET_ADMIN", "SYS_NICE"],
+    user: "0:0",
+    read_only: true,
+    no_new_privileges: true,
+};
+
+/// Mirrors the LTE SGi DN sidecar `compose.yaml` under
+/// `deployment/dn-sender/lte-sgi/`: `cap_drop: ALL`, no cap_add, non-root
+/// user `65532:65532`, read-only root FS, no-new-privileges.
+pub const DN_SGI_SERVICE_EXEC_SPEC: ContainerExecSpec = ContainerExecSpec {
+    role: "dn",
+    cap_drop: &["ALL"],
+    cap_add: &[],
+    user: "65532:65532",
+    read_only: true,
+    no_new_privileges: true,
+};
+
+/// Script the exec preflight runs inside the disposable container. The
+/// unprivileged loopback ping proves the tooling + capability combination
+/// is sufficient; `iperf3 --version` proves the binary is present and
+/// executable under the exact security policy.
+pub const EXEC_PREFLIGHT_SCRIPT: &str = "ping -c1 -W1 127.0.0.1 && iperf3 --version";
+
+pub fn ue_tooling_exec_args(image_reference: &str, spec: &ContainerExecSpec) -> Vec<String> {
+    let mut args: Vec<String> = vec!["run".into(), "--rm".into(), "--network".into(), "none".into()];
+    if spec.no_new_privileges {
+        args.extend([
+            "--security-opt".into(),
+            "no-new-privileges:true".into(),
+        ]);
+    }
+    if spec.read_only {
+        args.push("--read-only".into());
+    }
+    args.extend(["--user".into(), spec.user.into()]);
+    for cap in spec.cap_drop {
+        args.extend(["--cap-drop".into(), (*cap).into()]);
+    }
+    for cap in spec.cap_add {
+        args.extend(["--cap-add".into(), (*cap).into()]);
+    }
+    args.extend([
         "--entrypoint".into(),
         "/bin/sh".into(),
         image_reference.into(),
         "-ec".into(),
-        "command -v ip >/dev/null && command -v ping >/dev/null && command -v iperf3 >/dev/null"
-            .into(),
-    ]
+        EXEC_PREFLIGHT_SCRIPT.into(),
+    ]);
+    args
+}
+
+/// Classifier for the exec preflight output. The caller provides the role
+/// (`"ue"` or `"dn"`) and the observed exit code / stdout / stderr. Returns
+/// `Ok(())` on exit 0 and `Err((code, diagnostic))` otherwise, where
+/// `diagnostic` is bounded tail-512 and sanitized.
+pub fn classify_tooling_exec(
+    role: &str,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), (String, CommandDiagnostic)> {
+    let diag = CommandDiagnostic {
+        exit_code,
+        stdout: truncate_utf8_tail(stdout, 512),
+        stderr: truncate_utf8_tail(stderr, 512),
+    };
+    if exit_code == 0 {
+        return Ok(());
+    }
+    let error_code = match role {
+        "dn" => "LTE_DN_TOOLING_NOT_EXECUTABLE",
+        _ => "LTE_UE_TOOLING_NOT_EXECUTABLE",
+    };
+    Err((error_code.into(), diag))
 }
 
 /// 0.29.3: LTE DN sender container name is deployment-specified and must NOT
@@ -1223,16 +1307,39 @@ pub fn verify_certified_release_subject() -> Result<(), String> {
     if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != CERTIFIED_IMAGE_ID {
         return Err("LTE_CERTIFIED_IMAGE_UNAVAILABLE".into());
     }
-    let tooling = Command::new("/usr/bin/timeout")
+    // 0.29.6: exec preflight now runs the UE service spec in a disposable
+    // container. Non-zero exit surfaces LTE_UE_TOOLING_NOT_EXECUTABLE with a
+    // bounded tail-preserving diagnostic. The DN SGi preflight has a
+    // matching path; see verify_dn_tooling_executable.
+    verify_ue_tooling_executable(image_reference)
+}
+
+fn run_tooling_exec_preflight(
+    image_reference: &str,
+    spec: &ContainerExecSpec,
+) -> Result<(), String> {
+    let args = ue_tooling_exec_args(image_reference, spec);
+    let output = Command::new("/usr/bin/timeout")
         .arg("15s")
         .arg("/usr/bin/docker")
-        .args(ue_tooling_check_args(image_reference))
+        .args(args.iter().map(String::as_str))
         .output()
-        .map_err(|_| "LTE_UE_TOOLING_MISSING".to_string())?;
-    if !tooling.status.success() {
-        return Err("LTE_UE_TOOLING_MISSING".into());
-    }
-    Ok(())
+        .map_err(|_| match spec.role {
+            "dn" => "LTE_DN_TOOLING_NOT_EXECUTABLE".to_string(),
+            _ => "LTE_UE_TOOLING_NOT_EXECUTABLE".to_string(),
+        })?;
+    let exit = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    classify_tooling_exec(spec.role, exit, &stdout, &stderr).map_err(|(code, _diag)| code)
+}
+
+pub fn verify_ue_tooling_executable(image_reference: &str) -> Result<(), String> {
+    run_tooling_exec_preflight(image_reference, &UE_SERVICE_EXEC_SPEC)
+}
+
+pub fn verify_dn_tooling_executable(image_reference: &str) -> Result<(), String> {
+    run_tooling_exec_preflight(image_reference, &DN_SGI_SERVICE_EXEC_SPEC)
 }
 
 fn compose_config_args() -> [&'static str; 14] {
@@ -2480,13 +2587,82 @@ mod tests {
     }
 
     #[test]
-    fn ue_tooling_preflight_is_disposable_and_checks_all_three_tools() {
-        let args = ue_tooling_check_args("example.invalid/srsran@sha256:abc");
-        assert_eq!(&args[..6], ["run", "--rm", "--network", "none", "--entrypoint", "/bin/sh"]);
+    fn ue_tooling_exec_args_mirror_service_capabilities_and_run_real_binaries() {
+        // 0.29.6: args carry --security-opt no-new-privileges + --read-only +
+        // --user matching the service, cap_drop before cap_add, and the real
+        // execution script (not just command -v).
+        let args = ue_tooling_exec_args("example.invalid/srsran@sha256:abc", &UE_SERVICE_EXEC_SPEC);
+        assert_eq!(&args[..4], ["run", "--rm", "--network", "none"]);
+        assert!(args.windows(2).any(|w| w == ["--security-opt", "no-new-privileges:true"]));
+        assert!(args.iter().any(|a| a == "--read-only"));
+        assert!(args.windows(2).any(|w| w == ["--user", "0:0"]));
+        assert!(args.windows(2).any(|w| w == ["--cap-drop", "ALL"]));
+        assert!(args.windows(2).any(|w| w == ["--cap-add", "NET_ADMIN"]));
+        assert!(args.windows(2).any(|w| w == ["--cap-add", "SYS_NICE"]));
+        assert!(args.windows(2).any(|w| w == ["--entrypoint", "/bin/sh"]));
         let script = args.last().unwrap();
-        for tool in ["ip", "ping", "iperf3"] {
-            assert!(script.contains(&format!("command -v {tool}")));
+        assert_eq!(script, EXEC_PREFLIGHT_SCRIPT);
+        assert!(script.contains("ping -c1 -W1 127.0.0.1"));
+        assert!(script.contains("iperf3 --version"));
+    }
+
+    #[test]
+    fn dn_tooling_exec_args_mirror_sgi_sidecar_hardening() {
+        // DN SGi sidecar runs non-root 65532:65532, cap_drop ALL, no cap_add,
+        // read-only, no-new-privileges. The preflight must copy that exactly.
+        let args = ue_tooling_exec_args("example.invalid/srsran@sha256:abc", &DN_SGI_SERVICE_EXEC_SPEC);
+        assert!(args.windows(2).any(|w| w == ["--user", "65532:65532"]));
+        assert!(args.windows(2).any(|w| w == ["--cap-drop", "ALL"]));
+        assert!(!args.iter().any(|a| a == "--cap-add"));
+        assert!(args.iter().any(|a| a == "--read-only"));
+        assert!(args.windows(2).any(|w| w == ["--security-opt", "no-new-privileges:true"]));
+    }
+
+    #[test]
+    fn tooling_exec_preflight_passes_on_exit_zero_and_fails_otherwise() {
+        // Exit 0 → PASS.
+        assert_eq!(classify_tooling_exec("ue", 0, "iperf 3.17.1\n", ""), Ok(()));
+        assert_eq!(classify_tooling_exec("dn", 0, "", ""), Ok(()));
+
+        // EPERM scenario (ping fails because capabilities insufficient).
+        let eperm_err = classify_tooling_exec(
+            "ue",
+            1,
+            "",
+            "ping: socket: Operation not permitted\n",
+        )
+        .unwrap_err();
+        assert_eq!(eperm_err.0, "LTE_UE_TOOLING_NOT_EXECUTABLE");
+        assert!(eperm_err.1.stderr.contains("Operation not permitted"));
+        assert!(eperm_err.1.stderr.len() <= 512);
+
+        // Missing binary (shell exit 127).
+        let missing_err = classify_tooling_exec(
+            "dn",
+            127,
+            "",
+            "/bin/sh: iperf3: not found\n",
+        )
+        .unwrap_err();
+        assert_eq!(missing_err.0, "LTE_DN_TOOLING_NOT_EXECUTABLE");
+        assert!(missing_err.1.stderr.contains("not found"));
+    }
+
+    #[test]
+    fn tooling_exec_preflight_diagnostic_preserves_the_end_not_the_beginning() {
+        // Stderr longer than 512 bytes: tail-512 must retain the final cause.
+        let mut stderr = String::new();
+        stderr.push_str("FIRST_MARKER unused warm-up noise\n");
+        for _ in 0..40 {
+            stderr.push_str("filler ping output line here\n");
         }
+        stderr.push_str("LAST_MARKER_CAUSE Operation not permitted\n");
+        assert!(stderr.len() > 512);
+        let (code, diag) = classify_tooling_exec("ue", 1, "", &stderr).unwrap_err();
+        assert_eq!(code, "LTE_UE_TOOLING_NOT_EXECUTABLE");
+        assert!(diag.stderr.len() <= 512);
+        assert!(diag.stderr.contains("LAST_MARKER_CAUSE"));
+        assert!(!diag.stderr.contains("FIRST_MARKER"));
     }
 
     #[test]
@@ -2707,6 +2883,28 @@ mod tests {
             validate_certified_release_subject(CERTIFIED_IMAGE_REFERENCE, &"f".repeat(64)),
             Err("LTE_CERTIFIED_COMPOSE_MODEL_MISMATCH".into())
         );
+    }
+
+    #[test]
+    fn certification_subject_rejects_previous_image_id_after_0296_pin() {
+        // 0.29.6: the certified image ID was rotated from 218e848b…4d04 to
+        // aab719ff…db2a5 after ANR3 removed the ping file capability. The
+        // previous ID must now fail-closed with LTE_CERTIFIED_IMAGE_MISMATCH
+        // via the pinned CERTIFIED_IMAGE_REFERENCE, so an operator pointing
+        // at the stale image gets a precise diagnostic.
+        let previous = "oiran/srsran4g-ue-tools:0.29.4-rc1";
+        assert_ne!(previous, CERTIFIED_IMAGE_REFERENCE);
+        assert_eq!(
+            validate_certified_release_subject(previous, CERTIFIED_COMPOSE_MODEL_SHA256),
+            Err("LTE_CERTIFIED_IMAGE_MISMATCH".into())
+        );
+        // Pinned constants carry the real 0.29.6-rc1 reference + full 64-hex ID.
+        assert_eq!(CERTIFIED_IMAGE_REFERENCE, "oiran/srsran4g-ue-tools:0.29.6-rc1");
+        assert_eq!(
+            CERTIFIED_IMAGE_ID,
+            "sha256:aab719ffdfa518777ed3d197ffe02cdcef02f78f578095d9abb1da9f327db2a5"
+        );
+        assert_eq!(CERTIFIED_IMAGE_ID.len(), 7 + 64, "sha256: prefix + 64 hex");
     }
     #[test]
     fn failed_new_container_start_removes_exact_id_and_clears_ownership() {
