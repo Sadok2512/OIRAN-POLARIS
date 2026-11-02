@@ -5751,17 +5751,18 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
         let runtime = state.srsran_runtime.clone();
         let dir = direction.to_string();
         let packets = constraints.ping.max_packets_per_direction;
-        match tokio::task::spawn_blocking(move || runtime.ping(&dir, packets)).await {
-            Ok(Ok(value)) => {
+        let ping_operation = tokio::task::spawn_blocking(move || runtime.ping_with_evidence(&dir, packets)).await
+            .unwrap_or_else(|_| srsran_controller::PingOperation { error_code: Some("LTE_TRAFFIC_WORKER_FAILED".into()), ..srsran_controller::PingOperation::default() });
+        let ping_evidence = serde_json::to_value(&ping_operation).unwrap_or_else(|_| json!({"error_code":"LTE_EVIDENCE_SERIALIZATION_FAILED"}));
+        let _ = state.lte_runs_v2.lock().map(|mut store| store.record_step_diagnostic(&run_id, step,
+            lte_observation(step as u64, "ping_runtime_diagnostic", ping_evidence)));
+        match ping_operation.measurement.clone() {
+            Some(value) if ping_operation.succeeded() => {
                 let _=state.lte_runs_v2.lock().map(|mut store|{store.observe(&run_id,step,lte_observation(step as u64,"bounded_ping",json!({"direction":direction,"sent":value.sent,"received":value.received})),epoch_millis())?;store.advance(&run_id,lte_orchestrator::RunState::TrafficRunning)});
                 set_state(&state, &run_id, "TRAFFIC_RUNNING").await;
             }
-            result => {
-                let error = match result {
-                    Ok(Err(error)) => error,
-                    Err(_) => "LTE_TRAFFIC_WORKER_FAILED".into(),
-                    Ok(Ok(_)) => unreachable!(),
-                };
+            _ => {
+                let error = ping_operation.error_code.unwrap_or_else(|| "LTE_PING_FAILED".into());
                 let _ = state.lte_runs_v2.lock().map(|mut store| {
                     store.fail_step(&run_id, step, &error, epoch_millis())
                 });

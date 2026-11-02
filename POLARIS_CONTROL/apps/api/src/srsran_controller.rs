@@ -17,6 +17,7 @@ const LTE_PROFILE: &str = "lte";
 const COMPOSE: &str = "/root/POLARIS/compose/docker-compose.oiran-lab.yml";
 const ENV_FILE: &str = "/root/POLARIS/compose/versions.env";
 const UE_CONFIG: &str = "/root/POLARIS/runtime/srsran/ue.conf";
+const ENB_CONFIG: &str = "/root/POLARIS/config/srsran/enb.conf";
 const LEDGER: &str = "/var/lib/polaris-control/srsran-ownership.json";
 pub const CERTIFIED_IMAGE_REFERENCE: &str =
     "oiran/srsran4g-ue-tools:0.29.4-rc1";
@@ -151,11 +152,32 @@ pub struct TrafficMeasurement {
     pub rate_dl_bps: Option<u64>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
 pub struct PingMeasurement {
     pub sent: u32,
     pub received: u32,
 }
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+pub struct EnbRuntimeEvidence {
+    pub gtp_bind_addr: Option<String>, pub s1c_bind_addr: Option<String>,
+    pub networks: BTreeMap<String, String>, pub s1u_network_present: bool,
+    pub ul_bitrate: Option<String>, pub dl_bitrate: Option<String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+pub struct PingRuntimeEvidence {
+    pub ping: CommandDiagnostic, pub ue_link: CommandDiagnostic,
+    pub ue_routes: CommandDiagnostic, pub srsue_log_tail: CommandDiagnostic,
+    pub srsenb_log_tail: CommandDiagnostic, pub enb: EnbRuntimeEvidence,
+    pub container_image_ids: BTreeMap<String, String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+pub struct PingOperation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<PingMeasurement>, pub evidence: PingRuntimeEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+impl PingOperation { pub fn succeeded(&self) -> bool { self.error_code.is_none() && self.measurement.is_some() } }
 
 #[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
 pub struct CommandDiagnostic {
@@ -216,6 +238,12 @@ pub trait SrsranRuntime: Send + Sync {
         payload_bytes: u32,
     ) -> Result<TrafficMeasurement, String>;
     fn ping(&self, direction: &str, packets: u32) -> Result<PingMeasurement, String>;
+    fn ping_with_evidence(&self, direction: &str, packets: u32) -> PingOperation {
+        match self.ping(direction, packets) {
+            Ok(measurement) => PingOperation { measurement: Some(measurement), ..PingOperation::default() },
+            Err(error_code) => PingOperation { error_code: Some(error_code), ..PingOperation::default() },
+        }
+    }
     /// Remove only sidecars carrying the exact run label, then prove none remain.
     fn cleanup_run_sidecars(&self, run_id: &str) -> Result<bool, String>;
 }
@@ -263,20 +291,39 @@ fn configured_traffic_peer() -> Result<std::net::Ipv4Addr, String> {
 
 fn bounded_diagnostic(output: &Output) -> CommandDiagnostic {
     fn bounded(value: &str) -> String {
-        value
+        let sanitized = value
             .lines()
             .filter_map(sanitize_log_line)
             .collect::<Vec<_>>()
-            .join("\n")
-            .chars()
-            .take(512)
-            .collect()
+            .join("\n");
+        truncate_utf8_bytes(&sanitized, 512)
     }
     CommandDiagnostic {
         exit_code: output.code,
         stdout: bounded(&output.stdout),
         stderr: bounded(&output.stderr),
     }
+}
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes { return value.to_string(); }
+    let mut end = max_bytes; while !value.is_char_boundary(end) { end -= 1; }
+    value[..end].to_string()
+}
+fn failed_diagnostic(error: &str) -> CommandDiagnostic { CommandDiagnostic { exit_code: 125, stdout: String::new(), stderr: truncate_utf8_bytes(error, 512) } }
+fn parse_enb_bind_config(contents: &str) -> (Option<String>, Option<String>) {
+    let value = |key: &str| contents.lines().find_map(|line| { let line = line.split('#').next()?.trim(); let (name, value) = line.split_once('=')?; (name.trim() == key).then(|| value.trim().trim_matches('"').to_string()).filter(|value| value.parse::<std::net::Ipv4Addr>().is_ok()) });
+    (value("gtp_bind_addr"), value("s1c_bind_addr"))
+}
+fn parse_docker_networks(contents: &str) -> BTreeMap<String, String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(contents.trim()) else { return BTreeMap::new(); };
+    value.as_object().into_iter().flat_map(|networks| networks.iter()).filter_map(|(name, config)| { let address = config.get("IPAddress")?.as_str()?; address.parse::<std::net::Ipv4Addr>().ok().map(|_| (name.clone(), address.to_string())) }).collect()
+}
+fn parse_enb_bitrates(logs: &str) -> (Option<String>, Option<String>) {
+    let (mut ul, mut dl) = (None, None); for line in logs.lines().filter_map(sanitize_log_line) { let lower = line.to_ascii_lowercase(); if lower.contains("bitrate") || lower.contains("bit/s") || lower.contains("bps") { if lower.contains("ul") { ul = Some(truncate_utf8_bytes(&line, 512)); } if lower.contains("dl") { dl = Some(truncate_utf8_bytes(&line, 512)); } } } (ul, dl)
+}
+fn parse_ping_measurement(stdout: &str) -> Option<PingMeasurement> {
+    let values = stdout.lines().find(|line| line.contains("packets transmitted"))?.split(',').collect::<Vec<_>>();
+    Some(PingMeasurement { sent: values.first()?.split_whitespace().next()?.parse().ok()?, received: values.get(1)?.split_whitespace().next()?.parse().ok()? })
 }
 
 fn lte_ul_route_install_args(container_id: &str, peer: std::net::Ipv4Addr) -> Vec<String> {
@@ -864,6 +911,46 @@ impl DockerSrsranRuntime {
                     .collect()
             })
             .unwrap_or_default()
+    }
+    fn diagnostic(&self, args: &[&str], seconds: u64) -> CommandDiagnostic { match self.run(args, seconds) { Ok(output) => bounded_diagnostic(&output), Err(error) => failed_diagnostic(&error) } }
+    fn collect_ping_evidence(&self, ue: &Container, ping: CommandDiagnostic) -> PingRuntimeEvidence {
+        let ue_link = self.diagnostic(&["exec", &ue.id, "ip", "-s", "link", "show", LTE_UE_TUN], 3);
+        let ue_routes = self.diagnostic(&["exec", &ue.id, "ip", "route"], 3);
+        let srsue_log_tail = self.diagnostic(&["logs", "--tail", "200", &ue.id], 5);
+        let mut evidence = PingRuntimeEvidence { ping, ue_link, ue_routes, srsue_log_tail, ..PingRuntimeEvidence::default() };
+        let Ok(Some(enb)) = self.resolve("srsenb") else { return evidence; };
+        let (srsenb_log_tail, ul_bitrate, dl_bitrate) = match self.run(&["logs", "--tail", "200", &enb.id], 5) {
+            Ok(output) => { let (ul, dl) = parse_enb_bitrates(&format!("{}\n{}", output.stdout, output.stderr)); (bounded_diagnostic(&output), ul, dl) },
+            Err(error) => (failed_diagnostic(&error), None, None),
+        };
+        evidence.srsenb_log_tail = srsenb_log_tail;
+        let (gtp_bind_addr, s1c_bind_addr) = fs::read_to_string(ENB_CONFIG).ok().map(|contents| parse_enb_bind_config(&contents)).unwrap_or_default();
+        let networks = parse_docker_networks(&self.diagnostic(&["inspect", "--format", "{{json .NetworkSettings.Networks}}", &enb.id], 3).stdout);
+        let s1u_network_present = gtp_bind_addr.as_ref().is_some_and(|address| networks.values().any(|value| value == address));
+        evidence.enb = EnbRuntimeEvidence { gtp_bind_addr, s1c_bind_addr, networks, s1u_network_present, ul_bitrate, dl_bitrate };
+        for (component, container) in [("srsue", ue), ("srsenb", &enb)] { let image = self.diagnostic(&["inspect", "--format", "{{.Image}}", &container.id], 3); let value = image.stdout.trim(); if image.exit_code == 0 && value.starts_with("sha256:") && value.len() == 71 { evidence.container_image_ids.insert(component.into(), value.into()); } }
+        evidence
+    }
+    fn execute_ping_with_evidence(&self, direction: &str, packets: u32) -> PingOperation {
+        let fail = |error_code: &str| PingOperation { error_code: Some(error_code.into()), ..PingOperation::default() };
+        if !matches!(direction, "ul" | "dl") || packets == 0 || packets > 5 { return fail("LTE_PING_PARAMETERS_INVALID"); }
+        let ue = match self.owned(Target::Ue) { Ok(ue) if ue.state == "running" => ue, Ok(_) => return fail("LTE_UE_NOT_RUNNING"), Err(error) => return fail(&error) };
+        let peer = match configured_traffic_peer() { Ok(peer) => peer.to_string(), Err(error) => return fail(&error) }; let count = packets.to_string();
+        let ping_output = if direction == "ul" {
+            let route = match self.run(&["exec", &ue.id, "ip", "route", "get", &peer], 3) { Ok(output) => output, Err(error) => return PingOperation { evidence: self.collect_ping_evidence(&ue, failed_diagnostic(&error)), error_code: Some("LTE_UL_ROUTE_PROBE_FAILED".into()), ..PingOperation::default() } };
+            let preflight = evaluate_lte_ul_route(&route.stdout, &peer); if route.code != 0 || !preflight.ok { return PingOperation { evidence: self.collect_ping_evidence(&ue, bounded_diagnostic(&route)), error_code: Some(preflight.code.unwrap_or_else(|| "LTE_UL_ROUTE_PROBE_FAILED".into())), ..PingOperation::default() }; }
+            self.run(&["exec", &ue.id, "ping", "-n", "-I", LTE_UE_TUN, "-c", &count, "-W", "1", &peer], 10)
+        } else {
+            let ue_ip = match self.ue_ip(Some(&ue)) { Some(value) => value, None => return PingOperation { evidence: self.collect_ping_evidence(&ue, failed_diagnostic("LTE_UE_IP_NOT_READY")), error_code: Some("LTE_UE_IP_NOT_READY".into()), ..PingOperation::default() } };
+            let dn = match configured_lte_dn_sender_container() { Ok(value) => value, Err(error) => return fail(&error) }; let policy = match configured_lte_dl_return_policy() { Ok(value) => value, Err(error) => return fail(&error) };
+            let route = match self.run(&["exec", dn.as_str(), "ip", "route", "get", &ue_ip], 3) { Ok(output) => output, Err(error) => return PingOperation { evidence: self.collect_ping_evidence(&ue, failed_diagnostic(&error)), error_code: Some("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into()), ..PingOperation::default() } };
+            let route_error = classify_dn_container_exit(route.code, &route.stderr).and_then(|_| (route.code == 0).then_some(()).ok_or_else(|| "LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())).and_then(|_| evaluate_lte_dl_return_route(&route.stdout, &ue_ip, &policy));
+            if let Err(error_code) = route_error { return PingOperation { evidence: self.collect_ping_evidence(&ue, bounded_diagnostic(&route)), error_code: Some(error_code), ..PingOperation::default() }; }
+            self.run(&["exec", dn.as_str(), "ping", "-n", "-c", &count, "-W", "1", &ue_ip], 10)
+        };
+        let output = match ping_output { Ok(output) => output, Err(error) => return PingOperation { evidence: self.collect_ping_evidence(&ue, failed_diagnostic(&error)), error_code: Some("LTE_PING_FAILED".into()), ..PingOperation::default() } };
+        let evidence = self.collect_ping_evidence(&ue, bounded_diagnostic(&output)); if output.code != 0 { return PingOperation { evidence, error_code: Some("LTE_PING_FAILED".into()), ..PingOperation::default() }; }
+        match parse_ping_measurement(&output.stdout) { Some(measurement) => PingOperation { measurement: Some(measurement), evidence, error_code: None }, None => PingOperation { evidence, error_code: Some("LTE_PING_RESULT_INVALID".into()), ..PingOperation::default() } }
     }
     fn attach_proof(&self, ue: Option<&Container>) -> bool {
         let Some(ue) = ue.filter(|container| container.state == "running") else {
@@ -1489,98 +1576,11 @@ impl SrsranRuntime for DockerSrsranRuntime {
     }
 
     fn ping(&self, direction: &str, packets: u32) -> Result<PingMeasurement, String> {
-        if !matches!(direction, "ul" | "dl") || packets == 0 || packets > 5 {
-            return Err("LTE_PING_PARAMETERS_INVALID".into());
-        }
-        let ue = self.owned(Target::Ue)?;
-        if ue.state != "running" {
-            return Err("LTE_UE_NOT_RUNNING".into());
-        }
-        let peer = configured_traffic_peer()?.to_string();
-        let count = packets.to_string();
-        let output = if direction == "ul" {
-            // 0.29.2: preflight UE SGi route via tun_srsue before any ping.
-            let route = self
-                .run(&["exec", &ue.id, "ip", "route", "get", &peer], 3)
-                .map_err(|_| "LTE_UL_ROUTE_PROBE_FAILED".to_string())?;
-            if route.code != 0 {
-                return Err("LTE_UL_ROUTE_PROBE_FAILED".into());
-            }
-            let preflight = evaluate_lte_ul_route(&route.stdout, &peer);
-            if !preflight.ok {
-                return Err(preflight
-                    .code
-                    .unwrap_or_else(|| "LTE_UL_ROUTE_NOT_VIA_UE_TUN".into()));
-            }
-            Self::ok(
-                self.run(
-                    &[
-                        "exec", &ue.id, "ping", "-n", "-I", LTE_UE_TUN, "-c", &count, "-W", "1",
-                        &peer,
-                    ],
-                    10,
-                )?,
-                "LTE_PING_FAILED",
-            )?
-        } else {
-            let ue_ip = self.ue_ip(Some(&ue)).ok_or("LTE_UE_IP_NOT_READY")?;
-            // 0.29.3: DN container is env-driven and must not silently fall
-            // back to the 5G N6 sender. Policy for the return route is also
-            // env-driven (next-hop, UE subnet, forbidden devs).
-            let dn_container = configured_lte_dn_sender_container()?;
-            let dl_policy = configured_lte_dl_return_policy()?;
-            let route = self
-                .run(
-                    &[
-                        "exec",
-                        dn_container.as_str(),
-                        "ip",
-                        "route",
-                        "get",
-                        &ue_ip,
-                    ],
-                    3,
-                )
-                .map_err(|_| "LTE_DL_RETURN_ROUTE_UNAVAILABLE".to_string())?;
-            classify_dn_container_exit(route.code, &route.stderr)?;
-            if route.code != 0 {
-                return Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into());
-            }
-            evaluate_lte_dl_return_route(&route.stdout, &ue_ip, &dl_policy)?;
-            let ping_output = self.run(
-                &[
-                    "exec",
-                    dn_container.as_str(),
-                    "ping",
-                    "-n",
-                    "-c",
-                    &count,
-                    "-W",
-                    "1",
-                    &ue_ip,
-                ],
-                10,
-            )?;
-            classify_dn_container_exit(ping_output.code, &ping_output.stderr)?;
-            Self::ok(ping_output, "LTE_PING_FAILED")?
-        };
-        let summary = output
-            .stdout
-            .lines()
-            .find(|line| line.contains("packets transmitted"))
-            .ok_or("LTE_PING_RESULT_INVALID")?;
-        let values = summary.split(',').collect::<Vec<_>>();
-        let sent = values
-            .first()
-            .and_then(|v| v.split_whitespace().next())
-            .and_then(|v| v.parse().ok())
-            .ok_or("LTE_PING_RESULT_INVALID")?;
-        let received = values
-            .get(1)
-            .and_then(|v| v.split_whitespace().next())
-            .and_then(|v| v.parse().ok())
-            .ok_or("LTE_PING_RESULT_INVALID")?;
-        Ok(PingMeasurement { sent, received })
+        let operation = self.execute_ping_with_evidence(direction, packets);
+        operation.measurement.ok_or_else(|| operation.error_code.unwrap_or_else(|| "LTE_PING_FAILED".into()))
+    }
+    fn ping_with_evidence(&self, direction: &str, packets: u32) -> PingOperation {
+        self.execute_ping_with_evidence(direction, packets)
     }
     fn cleanup_run_sidecars(&self, run_id: &str) -> Result<bool, String> {
         if run_id.len() > 64
@@ -1631,7 +1631,8 @@ impl SrsranRuntime for DockerSrsranRuntime {
 
 fn sanitize_log_line(line: &str) -> Option<String> {
     let lower = line.to_ascii_lowercase();
-    if ["imsi", "supi", "opc", "auth key", "subscriber key", " ki="]
+    if ["imsi", "supi", "suci", "guti", "tmsi", "imei", "imeisv", "msisdn",
+        "opc", "auth key", "subscriber key", " ki="]
         .iter()
         .any(|m| lower.contains(m))
     {
@@ -1866,6 +1867,20 @@ mod tests {
             sanitize_log_line("IMSI 001 attach"),
             Some("[REDACTED_SUBSCRIBER_MATERIAL]".into())
         );
+    }
+    #[test]
+    fn ping_evidence_diagnostics_are_complete_private_and_byte_bounded() {
+        let diagnostic = bounded_diagnostic(&Output { code: 1, stdout: format!("IMEISV secret\n{}", "é".repeat(400)), stderr: "x".repeat(700) });
+        assert!(diagnostic.stdout.len() <= 512 && diagnostic.stderr.len() <= 512);
+        assert!(diagnostic.stdout.contains("[REDACTED_SUBSCRIBER_MATERIAL]") && !diagnostic.stdout.contains("secret"));
+        let (gtp, s1c) = parse_enb_bind_config("gtp_bind_addr=10.77.11.20\ns1c_bind_addr=10.77.10.20");
+        let networks = parse_docker_networks(r#"{"oiran-lab-s1u":{"IPAddress":"10.77.11.20"}}"#);
+        let (ul, dl) = parse_enb_bitrates("UL bitrate=812000 bps\nDL bitrate=991000 bps");
+        assert_eq!(gtp.as_deref(), Some("10.77.11.20")); assert_eq!(s1c.as_deref(), Some("10.77.10.20")); assert!(ul.is_some() && dl.is_some());
+        let value = serde_json::to_value(PingRuntimeEvidence { ping: diagnostic.clone(), ue_link: diagnostic.clone(), ue_routes: diagnostic.clone(), srsue_log_tail: diagnostic.clone(), srsenb_log_tail: diagnostic,
+            enb: EnbRuntimeEvidence { gtp_bind_addr: gtp, s1c_bind_addr: s1c, networks, s1u_network_present: true, ul_bitrate: ul, dl_bitrate: dl },
+            container_image_ids: BTreeMap::from([("srsue".into(), format!("sha256:{}", "a".repeat(64)))]) }).unwrap();
+        for key in ["ping", "ue_link", "ue_routes", "srsue_log_tail", "srsenb_log_tail", "enb", "container_image_ids"] { assert!(value.get(key).is_some(), "missing {key}"); }
     }
     #[test]
     fn ownership_is_independent() {

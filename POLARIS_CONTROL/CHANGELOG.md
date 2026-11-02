@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.29.5 (polaris-control-api) — 2026-11-02 — LTE ping failure evidence retention
+
+- Persists bounded, subscriber-sanitized ping stdout/stderr/exit status before
+  `fail_step` and before cleanup, so terminal run evidence retains the exact
+  `LTE_PING_FAILED` cause.
+- Preserves read-only UE interface counters and routes, filtered 200-line
+  srsUE/srsENB log tails, eNB UL/DL bitrate lines, effective S1-C/S1-U bind
+  addresses, attached eNB networks and running container image IDs.
+- Bounds every diagnostic stream to 512 UTF-8 bytes and expands subscriber
+  material filtering to SUCI/GUTI/TMSI/IMEI/IMEISV/MSISDN markers.
+- Adds unit coverage for each diagnostic field and for persistence across the
+  failed-step/cleanup transition. No live, Grant, deployment or capture change.
+
 ## 0.29.4 (polaris-control-api) — 2026-11-02 — LTE UE UL route installation
 
 - Adds a fail-closed `/32` route installation to the configured LTE SGi peer
