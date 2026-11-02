@@ -5,7 +5,7 @@
 # This file is a proposal. Codex is responsible for:
 #   1. Reserving the SGi network and IP (proposed 10.77.16.30/24,
 #      next-hop 10.77.16.15).
-#   2. Pinning the image by digest (SIDE_CAR_IMAGE_DIGEST=PENDING).
+#   2. Promoting the offline-certified image without changing its digest.
 #      The image MUST include iproute2, iputils-ping and iperf3; if a
 #      required tool is missing the POLARIS runtime surfaces
 #      LTE_DN_SENDER_TOOLING_MISSING at preflight.
@@ -19,13 +19,13 @@
 
 services:
   polaris-lte-sgi-dn:
-    # SIDE_CAR_IMAGE_DIGEST=PENDING — Codex must set the digest before activation.
-    # Expected form: registry.example.invalid/polaris-lte-sgi-dn@sha256:<digest>
-    image: registry.example.invalid/polaris-lte-sgi-dn:pending@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    # Offline-certified local image. A registry promotion must preserve this digest.
+    image: polaris-lte-sgi-dn@sha256:e60eb72bf7619fd049f6bbbc45cf06927eb73ed7c613446678644f6742af31f3
     container_name: polaris-lte-sgi-dn
     restart: unless-stopped
     networks:
       oiran-lab-sgi:
+        interface_name: sgi_lte
         ipv4_address: 10.77.16.30
     cap_drop:
       - ALL
@@ -50,7 +50,7 @@ services:
       retries: 3
     labels:
       - polaris.sidecar.purpose=lte-sgi-dn
-      - polaris.sidecar.image_digest_state=PENDING
+      - polaris.sidecar.image_digest_state=OFFLINE_VERIFIED
 
 networks:
   oiran-lab-sgi:

@@ -1,0 +1,18 @@
+[Unit]
+Description=POLARIS dedicated LTE SGi DN sidecar
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/polaris-control/lte-sgi
+ExecStart=/usr/bin/docker compose -f /opt/polaris-control/lte-sgi/compose.yaml up -d
+ExecStartPost=/opt/polaris-control/lte-sgi/configure-route.sh
+ExecStop=/usr/bin/docker compose -f /opt/polaris-control/lte-sgi/compose.yaml down
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -2222,43 +2222,38 @@ mod tests {
     }
 
     #[test]
-    fn candidate_lte_sgi_dropin_is_fail_closed_until_codex_confirms() {
+    fn certified_lte_sgi_dropin_sets_exact_confirmed_values() {
         let dropin = include_str!(
             "../../../deployment/dn-sender/lte-sgi/polaris-control-lte-sgi.conf"
         );
         for required in [
-            "POLARIS_LTE_DN_SENDER_CONTAINER",
-            "POLARIS_LTE_TRAFFIC_PEER_IP",
-            "POLARIS_LTE_PGW_U_NEXT_HOP",
-            "POLARIS_LTE_UE_SUBNET",
+            "Environment=POLARIS_LTE_DN_SENDER_CONTAINER=polaris-lte-sgi-dn",
+            "Environment=POLARIS_LTE_TRAFFIC_PEER_IP=10.77.16.30",
+            "Environment=POLARIS_LTE_PGW_U_NEXT_HOP=10.77.16.15",
+            "Environment=POLARIS_LTE_UE_SUBNET=10.45.0.0/16",
+            "Environment=POLARIS_LTE_FORBIDDEN_RETURN_DEVS=lo,null0,blackhole,eth0,oiran-lab-n6",
         ] {
-            // Each required variable must be mentioned in a COMMENT, not an
-            // active Environment= line, so an operator cannot deploy this
-            // file verbatim.
-            let active = format!("Environment={required}=");
             assert!(
-                !dropin
-                    .lines()
-                    .any(|line| line.trim_start().starts_with(&active)),
-                "{required} must stay commented in the candidate drop-in"
-            );
-            let commented = format!("# Environment={required}=");
-            assert!(
-                dropin.contains(&commented),
-                "{required} must be shown as a commented example"
+                dropin.lines().any(|line| line.trim() == required),
+                "certified SGi drop-in must set {required} exactly"
             );
         }
     }
 
     #[test]
-    fn candidate_lte_sgi_sidecar_pins_image_digest_placeholder_and_hardens_pod() {
+    fn candidate_lte_sgi_sidecar_pins_verified_image_digest_and_hardens_pod() {
         let compose = include_str!(
             "../../../deployment/dn-sender/lte-sgi/compose.yaml"
         );
-        // Image is pinned by @sha256 but the digest is a placeholder; Codex
-        // must replace it before activation.
-        assert!(compose.contains("@sha256:"));
-        assert!(compose.contains("SIDE_CAR_IMAGE_DIGEST=PENDING"));
+        // The release gate replaces the placeholder with the exact offline
+        // image digest. A zero or pending digest must never pass packaging.
+        assert!(compose.contains(
+            "polaris-lte-sgi-dn@sha256:e60eb72bf7619fd049f6bbbc45cf06927eb73ed7c613446678644f6742af31f3"
+        ));
+        assert!(!compose.contains("SIDE_CAR_IMAGE_DIGEST=PENDING"));
+        assert!(!compose.contains(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        ));
         // Hardening gates — any removal of these breaks the test.
         for marker in [
             "cap_drop:",
@@ -2266,7 +2261,8 @@ mod tests {
             "no-new-privileges:true",
             "read_only: true",
             "user: \"65532:65532\"",
-            "polaris.sidecar.image_digest_state=PENDING",
+            "interface_name: sgi_lte",
+            "polaris.sidecar.image_digest_state=OFFLINE_VERIFIED",
         ] {
             assert!(
                 compose.contains(marker),
