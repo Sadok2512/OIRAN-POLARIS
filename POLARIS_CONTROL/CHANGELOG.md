@@ -8,6 +8,10 @@
   The previous 0.29.4-rc1 reference / `sha256:218e848b…4d04` is explicitly
   rejected with `LTE_CERTIFIED_IMAGE_MISMATCH` so an operator pointing at a
   stale image gets a precise diagnostic.
+- Pins `CERTIFIED_COMPOSE_MODEL_SHA256` and `SRSRAN4G_COMPOSE_MODEL_SHA256`
+  to `1e93feba4b3511f1c46ee27e63175c0ce5be2125f9b11af65c27f670f24b3ed1`
+  (0.29.6-rc1 compose render); the previous `d0c80ea1…35f5d` is rejected
+  with `LTE_CERTIFIED_COMPOSE_MODEL_MISMATCH`.
 - Adds an exec preflight before every Grant V2 issuance: a disposable
   container is spawned from the certified image with the *same* cap_drop /
   cap_add / user / `read_only` / `no-new-privileges` as the live service

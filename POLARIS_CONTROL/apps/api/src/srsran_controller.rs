@@ -24,7 +24,7 @@ pub const CERTIFIED_IMAGE_REFERENCE: &str =
 pub const CERTIFIED_IMAGE_ID: &str =
     "sha256:aab719ffdfa518777ed3d197ffe02cdcef02f78f578095d9abb1da9f327db2a5";
 pub const CERTIFIED_COMPOSE_MODEL_SHA256: &str =
-    "d0c80ea193272fc85b9afc8abc78d521ffc08e5581cf49894160c5bf78935f5d";
+    "1e93feba4b3511f1c46ee27e63175c0ce5be2125f9b11af65c27f670f24b3ed1";
 const PROFILE_CONFIGS: [&str; 5] = [
     "/root/POLARIS/runtime/srsran/ue.conf",
     "/root/POLARIS/config/srsran/enb.conf",
@@ -2906,6 +2906,29 @@ mod tests {
         );
         assert_eq!(CERTIFIED_IMAGE_ID.len(), 7 + 64, "sha256: prefix + 64 hex");
     }
+
+    #[test]
+    fn certification_subject_rejects_previous_compose_model_after_0296_pin() {
+        // 0.29.6 (second compose-pin fix): the certified compose model digest
+        // was rotated from the 0.29.4 image value `d0c80ea1…35f5d` to the
+        // 0.29.6-rc1 image value `1e93feba…3ed1`. Combining the current
+        // pinned image reference with the stale compose model must now
+        // fail-closed with LTE_CERTIFIED_COMPOSE_MODEL_MISMATCH so an
+        // operator who kept an old compose render gets a precise diagnostic.
+        let previous_model = "d0c80ea193272fc85b9afc8abc78d521ffc08e5581cf49894160c5bf78935f5d";
+        assert_ne!(previous_model, CERTIFIED_COMPOSE_MODEL_SHA256);
+        assert_eq!(
+            validate_certified_release_subject(CERTIFIED_IMAGE_REFERENCE, previous_model),
+            Err("LTE_CERTIFIED_COMPOSE_MODEL_MISMATCH".into())
+        );
+        // The pinned constant carries the new 64-hex compose model digest.
+        assert_eq!(
+            CERTIFIED_COMPOSE_MODEL_SHA256,
+            "1e93feba4b3511f1c46ee27e63175c0ce5be2125f9b11af65c27f670f24b3ed1"
+        );
+        assert_eq!(CERTIFIED_COMPOSE_MODEL_SHA256.len(), 64);
+    }
+
     #[test]
     fn failed_new_container_start_removes_exact_id_and_clears_ownership() {
         let executor = Arc::new(ScriptExecutor::default());
