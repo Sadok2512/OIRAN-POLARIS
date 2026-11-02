@@ -1,0 +1,16 @@
+{
+  "plane": "S1_MME",
+  "packet_count": 50,
+  "first_packet_at": "2026-11-02T20:10:00.000000000Z",
+  "last_packet_at": "2026-11-02T20:12:00.000000000Z",
+  "source_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "s1ap_procedures": [
+    {"procedure": 17, "sctp_ppid": 18},
+    {"procedure": 17, "sctp_ppid": 18},
+    {"procedure": 9, "e_rab_id": 5, "s1_u_teid": "0xdeadbeef", "s1_u_endpoint": "10.77.11.13"}
+  ],
+  "nas_eps": [
+    {"message_type": "0x41", "role": "attach_request"},
+    {"message_type": "0x43", "role": "attach_complete"}
+  ]
+}

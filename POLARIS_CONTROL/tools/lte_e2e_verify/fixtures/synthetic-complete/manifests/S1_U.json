@@ -1,0 +1,11 @@
+{
+  "plane": "S1_U",
+  "packet_count": 420,
+  "first_packet_at": "2026-11-02T20:01:00.000000000Z",
+  "last_packet_at": "2026-11-02T20:03:30.000000000Z",
+  "source_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "gtpu": {
+    "teid": "0x12345678",
+    "octets": 1458000
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "run_id": "lte-run-missing-field-0001",
+  "started_at": "2026-11-02T20:20:00.000Z",
+  "ended_at": "2026-11-02T20:22:30.000Z",
+  "final_state": "COMPLETED",
+  "state": "CLEAN",
+  "steps": [
+    {"index": 2, "name": "s1_setup", "state": "COMPLETED"},
+    {"index": 4, "name": "lte_attach", "state": "COMPLETED"},
+    {"index": 5, "name": "ue_ip", "state": "COMPLETED"},
+    {"index": 6, "name": "ping_ul", "state": "COMPLETED"},
+    {"index": 7, "name": "ping_dl", "state": "COMPLETED"},
+    {"index": 8, "name": "udp_ul", "state": "COMPLETED"},
+    {"index": 9, "name": "udp_dl", "state": "COMPLETED"},
+    {"index": 10, "name": "cleanup", "state": "COMPLETED"}
+  ],
+  "ping": {
+    "ul": {"tx": 5, "rx": 5},
+    "dl": {"tx": 5, "rx": 5}
+  },
+  "udp": {
+    "ul": {"bytes": 3600000, "rate_bps": 960000},
+    "dl": {"bytes": 3600000, "rate_bps": 960000}
+  },
+  "cleanup": {
+    "srsue_stopped": true,
+    "srsenb_stopped": true,
+    "sidecars_removed": true,
+    "epc_healthy": true,
+    "dumpcaps_preserved": true
+  },
+  "dumpcap": {
+    "before_pids": [3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 3010, 3011, 3012],
+    "after_pids":  [3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 3010, 3011, 3012]
+  }
+}

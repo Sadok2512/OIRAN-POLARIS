@@ -1,0 +1,41 @@
+{
+  "run_id": "lte-run-synthetic-complete-0001",
+  "started_at": "2026-11-02T20:00:00.000Z",
+  "ended_at": "2026-11-02T20:04:30.000Z",
+  "final_state": "COMPLETED",
+  "state": "CLEAN",
+  "steps": [
+    {"index": 2, "name": "s1_setup", "state": "COMPLETED"},
+    {"index": 4, "name": "lte_attach", "state": "COMPLETED"},
+    {"index": 5, "name": "ue_ip", "state": "COMPLETED"},
+    {"index": 6, "name": "ping_ul", "state": "COMPLETED"},
+    {"index": 7, "name": "ping_dl", "state": "COMPLETED"},
+    {"index": 8, "name": "udp_ul", "state": "COMPLETED"},
+    {"index": 9, "name": "udp_dl", "state": "COMPLETED"},
+    {"index": 10, "name": "cleanup", "state": "COMPLETED"}
+  ],
+  "ping": {
+    "ul": {"tx": 5, "rx": 5},
+    "dl": {"tx": 5, "rx": 5}
+  },
+  "udp": {
+    "ul": {"bytes": 3600000, "rate_bps": 960000},
+    "dl": {"bytes": 3600000, "rate_bps": 960000}
+  },
+  "cleanup": {
+    "srsue_stopped": true,
+    "srsenb_stopped": true,
+    "sidecars_removed": true,
+    "epc_healthy": true,
+    "dumpcaps_preserved": true
+  },
+  "grant": {
+    "state": "REVOKED",
+    "use_count": 1,
+    "run_state": "CLEAN"
+  },
+  "dumpcap": {
+    "before_pids": [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012],
+    "after_pids":  [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012]
+  }
+}

@@ -1,0 +1,162 @@
+//! Fixture-driven tests. Each fixture exercises the full `verify()` pipeline
+//! and asserts the exact gate verdicts + final verdict + blockers.
+
+use std::path::PathBuf;
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(name)
+}
+
+#[test]
+fn e0497_reproduces_no_lte_e2e_real_pass_with_exact_blockers() {
+    let report = lte_e2e_verify::verify(&fixture("e0497")).expect("verify");
+    assert_eq!(report.run_id, "lte-run-e0497fd986d8429e03c642cc7fae3de9");
+
+    let gate = |name: &str| {
+        report
+            .gates
+            .iter()
+            .find(|(gate, _)| *gate == name)
+            .map(|(_, verdict)| verdict.label())
+            .unwrap_or_default()
+    };
+    assert_eq!(gate("S1_SETUP"), "PASS");
+    assert_eq!(gate("ATTACH"), "PASS");
+    assert_eq!(gate("EPS_BEARER"), "PASS_CONTROL_PLANE_ONLY");
+    assert_eq!(gate("S1U_GTPU"), "FAIL");
+    assert_eq!(gate("PING_UL"), "FAIL");
+    assert_eq!(gate("PING_DL"), "FAIL");
+    assert_eq!(gate("UDP_UL"), "FAIL");
+    assert_eq!(gate("UDP_DL"), "FAIL");
+    assert_eq!(gate("CLEANUP"), "PASS");
+    assert_eq!(gate("GRANT_REVOKED"), "PASS");
+    assert_eq!(gate("DUMPCAP"), "PASS");
+
+    assert_eq!(
+        report.blockers(),
+        vec!["PING_UL", "S1U_GTPU", "PING_DL", "UDP_UL", "UDP_DL"]
+    );
+    assert_eq!(report.final_verdict(), "NO_LTE_E2E_REAL_PASS");
+
+    // The rendered report must contain the mission header and the exact
+    // blocker string so Codex and ANR3 can grep for them.
+    let rendered = report.render();
+    assert!(rendered.starts_with("MISSION=LTE_E2E_NORTH_STAR\n"));
+    assert!(rendered.contains("\nBLOCKERS=PING_UL,S1U_GTPU,PING_DL,UDP_UL,UDP_DL\n"));
+    assert!(rendered.ends_with("\nFINAL_VERDICT=NO_LTE_E2E_REAL_PASS\n"));
+}
+
+#[test]
+fn synthetic_complete_run_emits_real_pass() {
+    let report = lte_e2e_verify::verify(&fixture("synthetic-complete")).expect("verify");
+    assert_eq!(report.run_id, "lte-run-synthetic-complete-0001");
+    assert!(report.blockers().is_empty());
+    assert_eq!(report.final_verdict(), "REAL_PASS");
+    assert!(report
+        .gates
+        .iter()
+        .all(|(_, verdict)| verdict.passed()));
+    assert!(report.render().contains("\nFINAL_VERDICT=REAL_PASS\n"));
+}
+
+#[test]
+fn teid_mismatch_fails_s1u_gtpu_only() {
+    let report = lte_e2e_verify::verify(&fixture("teid-mismatch")).expect("verify");
+    assert_eq!(report.run_id, "lte-run-teid-mismatch-0001");
+    // Every other gate passes; S1U_GTPU is the only blocker.
+    assert_eq!(report.blockers(), vec!["S1U_GTPU"]);
+    assert_eq!(report.final_verdict(), "NO_LTE_E2E_REAL_PASS");
+}
+
+#[test]
+fn missing_grant_section_fails_grant_revoked_gate() {
+    // The missing-field fixture drops the `grant` section entirely from the
+    // control proof. The verifier must fail that gate with its code and must
+    // not degrade to PASS.
+    let report = lte_e2e_verify::verify(&fixture("missing-field")).expect("verify");
+    assert_eq!(report.run_id, "lte-run-missing-field-0001");
+    assert_eq!(report.blockers(), vec!["GRANT_REVOKED"]);
+    assert_eq!(report.final_verdict(), "NO_LTE_E2E_REAL_PASS");
+}
+
+// -------- Pure unit tests on the verdict functions --------
+
+#[test]
+fn s1_setup_requires_sctp_ppid_18() {
+    use lte_e2e_verify::{verdict_s1_setup, Manifest, S1apEvent, Verdict};
+    let manifest = Manifest {
+        plane: "S1_MME".into(),
+        packet_count: 2,
+        first_packet_at: None,
+        last_packet_at: None,
+        source_sha256: None,
+        s1ap_procedures: vec![S1apEvent {
+            procedure: 17,
+            sctp_ppid: Some(99),
+            e_rab_id: None,
+            s1_u_teid: None,
+            s1_u_endpoint: None,
+        }],
+        nas_eps: vec![],
+        gtpv2c: vec![],
+        gtpu: None,
+    };
+    assert_eq!(verdict_s1_setup(&manifest), Verdict::Fail("S1_SETUP".into()));
+}
+
+#[test]
+fn udp_rate_above_cap_fails_closed() {
+    use lte_e2e_verify::{
+        verdict_udp, ControlProof, UdpCounters, UdpSection, Verdict,
+    };
+    let control = ControlProof {
+        run_id: "x".into(),
+        started_at: None,
+        ended_at: None,
+        final_state: None,
+        state: None,
+        steps: vec![],
+        ping: None,
+        udp: Some(UdpSection {
+            ul: Some(UdpCounters {
+                bytes: 10,
+                rate_bps: Some(1_500_000),
+            }),
+            dl: None,
+        }),
+        cleanup: None,
+        grant: None,
+        dumpcap: None,
+    };
+    assert_eq!(verdict_udp(&control, "ul"), Verdict::Fail("UDP_UL".into()));
+}
+
+#[test]
+fn dumpcap_pid_change_fails_closed() {
+    use lte_e2e_verify::{verdict_dumpcap, ControlProof, DumpcapSection, Verdict};
+    let before: Vec<u32> = (1..=12).collect();
+    let mut after = before.clone();
+    after[0] = 999;
+    let control = ControlProof {
+        run_id: "x".into(),
+        started_at: None,
+        ended_at: None,
+        final_state: None,
+        state: None,
+        steps: vec![],
+        ping: None,
+        udp: None,
+        cleanup: None,
+        grant: None,
+        dumpcap: Some(DumpcapSection {
+            before_pids: before,
+            after_pids: after,
+        }),
+    };
+    assert_eq!(
+        verdict_dumpcap(&control),
+        Verdict::Fail("DUMPCAP".into())
+    );
+}

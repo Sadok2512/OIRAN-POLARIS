@@ -1,0 +1,20 @@
+# Standalone cargo project. The crate is deliberately NOT part of the POLARIS
+# workspace at ../../Cargo.toml — it has its own Cargo.lock so it never
+# touches the files modified by fix/polaris-0.29.4-lte-ul-route.
+[workspace]
+
+[package]
+name = "lte-e2e-verify"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+rust-version = "1.75"
+description = "LTE E2E North Star mechanical verifier (offline, Git only)"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[[bin]]
+name = "lte-e2e-verify"
+path = "src/main.rs"

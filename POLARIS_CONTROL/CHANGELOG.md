@@ -1,5 +1,15 @@
 # Changelog
 
+## tools/lte-e2e-verify 0.1.0 — 2026-11-02 — LTE E2E North Star mechanical verifier
+
+- New standalone offline tool at `tools/lte_e2e_verify/` (own `Cargo.lock`, not part
+  of the POLARIS workspace, no change to `srsran_controller.rs`, LTE compose or
+  srsRAN UE image). Reads a `pending-evidence/` bundle and emits
+  `MISSION=LTE_E2E_NORTH_STAR … FINAL_VERDICT`. A `REAL_PASS` is produced only
+  when each gate's proof is present; any missing field is a `FAIL` with the gate
+  code. Four fixtures: `e0497`, `synthetic-complete`, `teid-mismatch`,
+  `missing-field`. Launch commands: see `tools/lte_e2e_verify/README.md`.
+
 ## 0.29.3 (polaris-control-api) — 2026-11-02 — LTE SGi dedicated DN + hardened preflight
 
 - Requires an explicit LTE DN sender container

@@ -1,0 +1,11 @@
+{
+  "plane": "S11",
+  "packet_count": 4,
+  "first_packet_at": "2026-11-02T18:52:07.305362434Z",
+  "last_packet_at": "2026-11-02T18:52:21.528863628Z",
+  "source_sha256": "64f43959046478baf4cd9120d149572d846b9e47f435bd94c317aae95119647e",
+  "gtpv2c": [
+    {"message_type": 32, "role": "create_session_request", "ebi": 5},
+    {"message_type": 33, "role": "create_session_response", "cause": 16, "ebi": 5, "s1u_f_teid": "0x18a9"}
+  ]
+}
