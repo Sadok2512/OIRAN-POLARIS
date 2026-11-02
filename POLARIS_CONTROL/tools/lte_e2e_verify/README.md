@@ -1,8 +1,18 @@
-# lte-e2e-verify 0.1.0
+# lte-e2e-verify 0.1.1
 
 Mechanical, offline, Git-only verifier for the LTE E2E North Star gate.
 A `REAL_PASS` is produced if — and only if — every gate's proof is present
 in the input bundle. Any absent field becomes a `FAIL` with its gate code.
+
+## Changelog
+
+- **0.1.1** — reads the `ping_runtime_diagnostic` observation persisted by
+  POLARIS 0.29.5 (`fix/polaris-0.29.5-lte-ping-evidence`): bounded, sanitized
+  stdout/stderr/exit for ping / UE link / UE routes / srsUE / srsENB log
+  tails, eNB UL/DL bitrates, S1-C and S1-U bind addresses, attached eNB
+  networks, and running container image IDs. Verdict rules unchanged;
+  diagnostic is exposed opaquely for post-mortem via `Step::ping_runtime_diagnostic()`.
+- **0.1.0** — initial release (NS-20261102-CLAUDE-LTE-E2E-VERIFIER-01).
 
 ## Layout
 
@@ -13,12 +23,13 @@ POLARIS_CONTROL/tools/lte_e2e_verify/
 │   ├── lib.rs           # pure verdict functions + schema
 │   └── main.rs          # CLI
 ├── tests/
-│   └── fixtures.rs      # 4 fixture tests + 3 unit tests
+│   └── fixtures.rs      # 5 fixture tests + 3 unit tests
 ├── fixtures/
-│   ├── e0497/                       # reproduces lte-run-e0497fd986d8429e03c642cc7fae3de9
-│   ├── synthetic-complete/          # expected FINAL_VERDICT=REAL_PASS
-│   ├── teid-mismatch/               # expected FINAL_VERDICT=NO_LTE_E2E_REAL_PASS (S1U_GTPU)
-│   └── missing-field/               # expected FINAL_VERDICT=NO_LTE_E2E_REAL_PASS (GRANT_REVOKED)
+│   ├── e0497/                        # reproduces lte-run-e0497fd986d8429e03c642cc7fae3de9 (POLARIS 0.29.3 shape)
+│   ├── e0497-with-0295-diagnostics/  # same run under POLARIS 0.29.5 with ping_runtime_diagnostic
+│   ├── synthetic-complete/           # expected FINAL_VERDICT=REAL_PASS
+│   ├── teid-mismatch/                # expected FINAL_VERDICT=NO_LTE_E2E_REAL_PASS (S1U_GTPU)
+│   └── missing-field/                # expected FINAL_VERDICT=NO_LTE_E2E_REAL_PASS (GRANT_REVOKED)
 └── README.md
 ```
 

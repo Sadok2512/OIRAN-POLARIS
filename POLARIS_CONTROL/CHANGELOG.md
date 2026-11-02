@@ -1,5 +1,17 @@
 # Changelog
 
+## tools/lte-e2e-verify 0.1.1 — 2026-11-02 — read POLARIS 0.29.5 ping runtime diagnostic
+
+- Extends the step schema to accept the `ping_runtime_diagnostic` observation
+  persisted by `fix/polaris-0.29.5-lte-ping-evidence` on failed LTE steps:
+  bounded, sanitized ping/UE-link/UE-routes/srsUE-logtail/srsENB-logtail/eNB
+  bitrates/S1-C+S1-U bind addresses/networks/container-image-ids. Exposes a
+  `Step::ping_runtime_diagnostic()` accessor for post-mortem callers.
+- Adds the `e0497-with-0295-diagnostics` fixture + a test asserting the
+  blocker list is unchanged and that no raw IMSI/IMEI/MSISDN/K/OPc strings
+  surface in the persisted diagnostic.
+- No gate verdict rule changed.
+
 ## tools/lte-e2e-verify 0.1.0 — 2026-11-02 — LTE E2E North Star mechanical verifier
 
 - New standalone offline tool at `tools/lte_e2e_verify/` (own `Cargo.lock`, not part

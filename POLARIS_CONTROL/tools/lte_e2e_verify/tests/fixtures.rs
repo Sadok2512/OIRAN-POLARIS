@@ -71,6 +71,58 @@ fn teid_mismatch_fails_s1u_gtpu_only() {
 }
 
 #[test]
+fn e0497_with_0295_diagnostics_keeps_identical_blockers_and_exposes_runtime_diagnostic() {
+    // 0.1.1: the same e0497 run, re-emitted by POLARIS 0.29.5 with the new
+    // ping_runtime_diagnostic persisted on the failed step, must yield the
+    // same verdict + the same blocker list AND let the caller introspect
+    // the diagnostic without parsing the raw JSON itself.
+    let report =
+        lte_e2e_verify::verify(&fixture("e0497-with-0295-diagnostics")).expect("verify");
+    assert_eq!(
+        report.blockers(),
+        vec!["PING_UL", "S1U_GTPU", "PING_DL", "UDP_UL", "UDP_DL"]
+    );
+    assert_eq!(report.final_verdict(), "NO_LTE_E2E_REAL_PASS");
+
+    // Re-load the control proof separately via the public types to prove the
+    // new accessor returns the persisted sub-document.
+    let path = fixture("e0497-with-0295-diagnostics")
+        .join("sanitized-summaries/RUN.control-proof.json");
+    let bytes = std::fs::read(&path).unwrap();
+    let control: lte_e2e_verify::ControlProof = serde_json::from_slice(&bytes).unwrap();
+    let step = control
+        .steps
+        .iter()
+        .find(|step| step.index == 6)
+        .expect("ping_ul step");
+    let diagnostic = step
+        .ping_runtime_diagnostic()
+        .expect("ping_runtime_diagnostic persisted");
+    let evidence = diagnostic.get("evidence").expect("evidence sub-document");
+    for key in [
+        "ping",
+        "ue_link",
+        "ue_routes",
+        "srsue_log_tail",
+        "srsenb_log_tail",
+        "enb",
+        "container_image_ids",
+    ] {
+        assert!(evidence.get(key).is_some(), "missing persisted key {key}");
+    }
+    // Sanitizer must have redacted any subscriber material. The fixture
+    // contains "[REDACTED_SUBSCRIBER_MATERIAL]" tokens; the verifier must
+    // never see raw IMSI/IMEI/MSISDN/K/OPc strings.
+    let serialized = serde_json::to_string(diagnostic).unwrap();
+    for forbidden in ["IMSI=", "IMEI=", "IMEISV=", "MSISDN=", "OPC=", "Ki="] {
+        assert!(
+            !serialized.contains(forbidden),
+            "diagnostic unexpectedly contains {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn missing_grant_section_fails_grant_revoked_gate() {
     // The missing-field fixture drops the `grant` section entirely from the
     // control proof. The verifier must fail that gate with its code and must

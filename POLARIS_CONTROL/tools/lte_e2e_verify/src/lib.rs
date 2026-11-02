@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.1.1";
 
 const UDP_RATE_CAP_BPS: u64 = 1_000_000;
 const DUMPCAP_EXPECTED: usize = 12;
@@ -256,6 +256,26 @@ pub struct Step {
     pub state: String,
     #[serde(default)]
     pub reason_code: Option<String>,
+    /// 0.1.1: step measurements. The 0.29.5 POLARIS release persists a
+    /// `ping_runtime_diagnostic` observation here with bounded, subscriber-
+    /// sanitized stdout/stderr for ping, the UE tun link, UE routes, srsUE/
+    /// srsENB log tails, eNB bitrates, S1-C/S1-U bind addresses, attached
+    /// eNB networks and running container image IDs. The verifier reads
+    /// these fields opaquely — they do not alter the gate verdicts, but they
+    /// are available to callers for post-mortem analysis.
+    #[serde(default)]
+    pub measurements: serde_json::Value,
+}
+
+impl Step {
+    /// Returns the `ping_runtime_diagnostic` sub-document if the 0.29.5
+    /// POLARIS release persisted one in this step's measurements.
+    pub fn ping_runtime_diagnostic(&self) -> Option<&serde_json::Value> {
+        match &self.measurements {
+            serde_json::Value::Null => None,
+            value => value.get("ping_runtime_diagnostic"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
