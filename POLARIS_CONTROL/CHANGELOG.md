@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.29.6-rc1 (srsran4g-ue-tools) — 2026-11-02 — unprivileged ping execution
+
+- Derives only from the certified 0.29.4 UE tooling image and removes the
+  `cap_net_raw=ep` file capability from `/usr/bin/ping`; no container
+  capability is added. With the production-equivalent `cap_drop: ALL`,
+  `NET_ADMIN`, `SYS_NICE`, read-only filesystem and no-new-privileges policy,
+  the network-isolated loopback ping now exits successfully.
+- Keeps `srsue` and `srsenb` byte-identical to the certified base image.
+
 ## 0.29.5 (polaris-control-api) — 2026-11-02 — LTE ping failure evidence retention
 
 - Review corrections retain the filtered final 512 UTF-8 bytes of srsUE/srsENB
