@@ -198,28 +198,57 @@ fn attach_is_proven(s1_state: &str, attach_success: bool, epc_context: bool) -> 
     s1_state == "CONNECTED" && attach_success && epc_context
 }
 
+// 0.29.2: LTE SGi peer is a distinct DN from the 5G N6 sender.
+// The previous ANR2 fix required `POLARIS_LTE_TRAFFIC_PEER_IP ==
+// POLARIS_DL_SENDER_IP`, which was wrong: the LTE SGi path has its own DN
+// endpoint and its own return route to the UE subnet (10.45.0.0/16). The two
+// values may legitimately differ; the real correctness condition is a routing
+// one, not an equality one. Route-level enforcement is performed by the UL
+// (`evaluate_lte_ul_route`) and DL (`evaluate_lte_dl_return_route`) preflights
+// invoked from `ping()` and `iperf()`.
+pub const LTE_UE_TUN: &str = "tun_srsue";
+pub const LTE_DN_SENDER_CONTAINER: &str = "polaris-dn-sender";
+
 fn validate_traffic_peer_values(
     traffic_peer: Option<&str>,
-    dl_sender: Option<&str>,
+    _dl_sender: Option<&str>,
 ) -> Result<std::net::Ipv4Addr, String> {
     let peer = traffic_peer.ok_or("LTE_TRAFFIC_PEER_NOT_CONFIGURED")?;
-    let peer = peer
-        .parse::<std::net::Ipv4Addr>()
-        .map_err(|_| "LTE_TRAFFIC_PEER_INVALID")?;
-    let sender = dl_sender.ok_or("LTE_DL_SENDER_NOT_CONFIGURED")?;
-    let sender = sender
-        .parse::<std::net::Ipv4Addr>()
-        .map_err(|_| "LTE_DL_SENDER_IP_INVALID")?;
-    if peer != sender {
-        return Err("LTE_TRAFFIC_PEER_MISMATCH".into());
-    }
-    Ok(peer)
+    peer.parse::<std::net::Ipv4Addr>()
+        .map_err(|_| "LTE_TRAFFIC_PEER_INVALID".into())
 }
 
 fn configured_traffic_peer() -> Result<std::net::Ipv4Addr, String> {
     let peer = std::env::var("POLARIS_LTE_TRAFFIC_PEER_IP").ok();
     let sender = std::env::var("POLARIS_DL_SENDER_IP").ok();
     validate_traffic_peer_values(peer.as_deref(), sender.as_deref())
+}
+
+/// LTE SGi UL route preflight. Wraps the shared `evaluate_ue_route_preflight`
+/// with the LTE-specific device (`tun_srsue`) and error code.
+pub fn evaluate_lte_ul_route(raw: &str, peer: &str) -> crate::UeRoutePreflight {
+    crate::evaluate_ue_route_preflight(raw, peer, LTE_UE_TUN, "LTE_UL_ROUTE_NOT_VIA_UE_TUN")
+}
+
+/// LTE SGi DL return-route preflight. Validates that the DN sender has a
+/// usable route back to the UE subnet. Rejects explicit `unreachable` markers,
+/// absent `dev` fields, and routes that would exit through forbidden interfaces
+/// (loopback/null) which signal a missing SGi return. Returns
+/// `LTE_DL_RETURN_ROUTE_UNAVAILABLE` on any such failure.
+pub fn evaluate_lte_dl_return_route(raw: &str, ue_ip: &str) -> Result<(), String> {
+    let bounded: String = raw.chars().take(1024).collect();
+    let line = bounded.lines().next().unwrap_or("");
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("unreachable") || lower.contains("network is unreachable") {
+        return Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into());
+    }
+    let (dev, _) = crate::parse_ip_route_get(line);
+    let dev = dev.ok_or("LTE_DL_RETURN_ROUTE_UNAVAILABLE".to_string())?;
+    if matches!(dev.as_str(), "lo" | "null0" | "blackhole") {
+        return Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into());
+    }
+    let _ = ue_ip; // reserved for future subnet correlation; current impl trusts caller input
+    Ok(())
 }
 
 fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
@@ -706,12 +735,32 @@ impl DockerSrsranRuntime {
         let rate_arg = rate_bps.to_string();
         let duration_arg = duration_seconds.to_string();
         let payload_arg = payload_bytes.to_string();
+        // 0.29.2: preflight UE SGi route to the peer before iperf3 is spawned.
+        // The UE must reach the SGi DN via `tun_srsue`; any other outbound
+        // interface is rejected fail-closed.
+        let route = self
+            .run(&["exec", &ue.id, "ip", "route", "get", &peer], 3)
+            .map_err(|_| "LTE_UL_ROUTE_PROBE_FAILED".to_string())?;
+        if route.code != 0 {
+            return Err("LTE_UL_ROUTE_PROBE_FAILED".into());
+        }
+        let preflight = evaluate_lte_ul_route(&route.stdout, &peer);
+        if !preflight.ok {
+            return Err(preflight
+                .code
+                .unwrap_or_else(|| "LTE_UL_ROUTE_NOT_VIA_UE_TUN".into()));
+        }
+        // 0.29.2: bind iperf3 source to the UE tun IP so the stack cannot pick
+        // a bridge interface even if the UE container has one.
+        let ue_source = self.ue_ip(Some(ue)).ok_or("LTE_UE_IP_NOT_READY")?;
         let mut args = vec![
             "exec",
             ue.id.as_str(),
             "iperf3",
             "-c",
             peer.as_str(),
+            "-B",
+            ue_source.as_str(),
             "-t",
             duration_arg.as_str(),
             "-J",
@@ -1119,20 +1168,56 @@ impl SrsranRuntime for DockerSrsranRuntime {
         let peer = configured_traffic_peer()?.to_string();
         let count = packets.to_string();
         let output = if direction == "ul" {
+            // 0.29.2: preflight UE SGi route via tun_srsue before any ping.
+            let route = self
+                .run(&["exec", &ue.id, "ip", "route", "get", &peer], 3)
+                .map_err(|_| "LTE_UL_ROUTE_PROBE_FAILED".to_string())?;
+            if route.code != 0 {
+                return Err("LTE_UL_ROUTE_PROBE_FAILED".into());
+            }
+            let preflight = evaluate_lte_ul_route(&route.stdout, &peer);
+            if !preflight.ok {
+                return Err(preflight
+                    .code
+                    .unwrap_or_else(|| "LTE_UL_ROUTE_NOT_VIA_UE_TUN".into()));
+            }
             Self::ok(
                 self.run(
-                    &["exec", &ue.id, "ping", "-n", "-c", &count, "-W", "1", &peer],
+                    &[
+                        "exec", &ue.id, "ping", "-n", "-I", LTE_UE_TUN, "-c", &count, "-W", "1",
+                        &peer,
+                    ],
                     10,
                 )?,
                 "LTE_PING_FAILED",
             )?
         } else {
             let ue_ip = self.ue_ip(Some(&ue)).ok_or("LTE_UE_IP_NOT_READY")?;
+            // 0.29.2: preflight DN return route to the UE subnet before any
+            // reverse-direction probe. Rejects an N6-only DN that lacks a SGi
+            // return path.
+            let route = self
+                .run(
+                    &[
+                        "exec",
+                        LTE_DN_SENDER_CONTAINER,
+                        "ip",
+                        "route",
+                        "get",
+                        &ue_ip,
+                    ],
+                    3,
+                )
+                .map_err(|_| "LTE_DL_RETURN_ROUTE_UNAVAILABLE".to_string())?;
+            if route.code != 0 {
+                return Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into());
+            }
+            evaluate_lte_dl_return_route(&route.stdout, &ue_ip)?;
             Self::ok(
                 self.run(
                     &[
                         "exec",
-                        "polaris-dn-sender",
+                        LTE_DN_SENDER_CONTAINER,
                         "ping",
                         "-n",
                         "-c",
@@ -1597,16 +1682,31 @@ mod tests {
         );
     }
     #[test]
-    fn udp_iperf_command_enforces_payload_block_length() {
+    fn udp_iperf_command_enforces_payload_block_length_and_binds_ue_tun() {
+        // Each iperf call now consumes 3 docker exec outputs:
+        //   1. preflight: `ip route get PEER`
+        //   2. ue_ip:     `ip -o -4 addr show dev tun_srsue`
+        //   3. iperf3:    the actual measurement
+        let route_ok = "192.0.2.1 dev tun_srsue src 10.45.0.5 uid 0\n";
+        let ue_ip_line = "1: tun_srsue    inet 10.45.0.5/24 scope global tun_srsue\n";
         let executor = Arc::new(ScriptExecutor::default());
-        executor.outputs.lock().unwrap().push_back(output(
-            0,
-            r#"{"end":{"sum_sent":{"bytes":125000,"bits_per_second":1000000}}}"#,
-        ));
-        executor.outputs.lock().unwrap().push_back(output(
-            0,
-            r#"{"end":{"sum_sent":{"bytes":125000,"bits_per_second":1000000}}}"#,
-        ));
+        {
+            let mut outputs = executor.outputs.lock().unwrap();
+            // UDP call
+            outputs.push_back(output(0, route_ok));
+            outputs.push_back(output(0, ue_ip_line));
+            outputs.push_back(output(
+                0,
+                r#"{"end":{"sum_sent":{"bytes":125000,"bits_per_second":1000000}}}"#,
+            ));
+            // TCP call
+            outputs.push_back(output(0, route_ok));
+            outputs.push_back(output(0, ue_ip_line));
+            outputs.push_back(output(
+                0,
+                r#"{"end":{"sum_sent":{"bytes":125000,"bits_per_second":1000000}}}"#,
+            ));
+        }
         let runtime = DockerSrsranRuntime {
             executor: executor.clone(),
             ledger: PathBuf::from("/unused-in-command-test"),
@@ -1618,52 +1718,158 @@ mod tests {
             error: String::new(),
         };
         let previous_peer = std::env::var_os("POLARIS_LTE_TRAFFIC_PEER_IP");
-        let previous_sender = std::env::var_os("POLARIS_DL_SENDER_IP");
         std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", "192.0.2.1");
-        std::env::set_var("POLARIS_DL_SENDER_IP", "192.0.2.1");
+        // 0.29.2: do NOT set POLARIS_DL_SENDER_IP — proves the LTE path no
+        // longer requires it to be defined.
+        std::env::remove_var("POLARIS_DL_SENDER_IP");
         let udp_result = runtime.iperf(&ue, false, "udp", 750_000, 7, 900);
         let tcp_result = runtime.iperf(&ue, false, "tcp", 1_000_000, 1, 1_200);
         match previous_peer {
             Some(value) => std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", value),
             None => std::env::remove_var("POLARIS_LTE_TRAFFIC_PEER_IP"),
         }
-        match previous_sender {
-            Some(value) => std::env::set_var("POLARIS_DL_SENDER_IP", value),
-            None => std::env::remove_var("POLARIS_DL_SENDER_IP"),
-        }
         udp_result.unwrap();
         tcp_result.unwrap();
         let calls = executor.calls.lock().unwrap();
-        assert!(calls[0].windows(2).any(|args| args == ["-l", "900"]));
-        assert!(calls[0].windows(2).any(|args| args == ["-b", "750000"]));
-        assert!(calls[0].windows(2).any(|args| args == ["-t", "7"]));
-        assert!(!calls[1].iter().any(|arg| arg == "-u" || arg == "-l"));
+        // UDP iperf call is the third call (index 2).
+        let udp = &calls[2];
+        assert!(udp.windows(2).any(|args| args == ["-l", "900"]));
+        assert!(udp.windows(2).any(|args| args == ["-b", "750000"]));
+        assert!(udp.windows(2).any(|args| args == ["-t", "7"]));
+        assert!(
+            udp.windows(2).any(|args| args == ["-B", "10.45.0.5"]),
+            "iperf3 UL must bind source to the UE tun IP: {:?}",
+            udp
+        );
+        // TCP iperf call is the sixth call (index 5).
+        let tcp = &calls[5];
+        assert!(!tcp.iter().any(|arg| arg == "-u" || arg == "-l"));
+        assert!(
+            tcp.windows(2).any(|args| args == ["-B", "10.45.0.5"]),
+            "iperf3 UL TCP must also bind source to the UE tun IP: {:?}",
+            tcp
+        );
+    }
+
+    #[test]
+    fn iperf_ul_fails_closed_when_route_bypasses_tun_srsue() {
+        let executor = Arc::new(ScriptExecutor::default());
+        // Route output: default via eth0 (NOT via tun_srsue) → preflight rejects.
+        executor.outputs.lock().unwrap().push_back(output(
+            0,
+            "192.0.2.1 via 10.0.2.2 dev eth0 src 10.0.2.15 uid 0\n",
+        ));
+        let runtime = DockerSrsranRuntime {
+            executor: executor.clone(),
+            ledger: PathBuf::from("/unused-route-reject-test"),
+        };
+        let ue = Container {
+            id: "owned-ue".into(),
+            state: "running".into(),
+            health: DockerHealth::Healthy,
+            error: String::new(),
+        };
+        let previous_peer = std::env::var_os("POLARIS_LTE_TRAFFIC_PEER_IP");
+        std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", "192.0.2.1");
+        let result = runtime.iperf(&ue, false, "udp", 750_000, 5, 900);
+        match previous_peer {
+            Some(value) => std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", value),
+            None => std::env::remove_var("POLARIS_LTE_TRAFFIC_PEER_IP"),
+        }
+        assert_eq!(result, Err("LTE_UL_ROUTE_NOT_VIA_UE_TUN".into()));
+        // Only the probe ran; no iperf3 spawn, no ue_ip query.
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].iter().any(|arg| arg == "route"));
     }
     #[test]
-    fn traffic_peer_requires_exact_validated_dl_sender_address() {
+    fn lte_sgi_peer_is_decoupled_from_n6_dl_sender() {
+        // Missing peer still fails fail-closed with the exact code.
         assert_eq!(
             validate_traffic_peer_values(None, Some("10.77.24.30")),
             Err("LTE_TRAFFIC_PEER_NOT_CONFIGURED".into())
         );
+        // Invalid IPv4 remains fail-closed.
         assert_eq!(
             validate_traffic_peer_values(Some("not-an-ip"), Some("10.77.24.30")),
             Err("LTE_TRAFFIC_PEER_INVALID".into())
         );
+        // 0.29.2: a missing or distinct POLARIS_DL_SENDER_IP no longer rejects
+        // the LTE SGi peer. The SGi DN is a separate endpoint from the 5G N6
+        // sender; equality is not required and must not be enforced.
         assert_eq!(
             validate_traffic_peer_values(Some("10.77.24.30"), None),
-            Err("LTE_DL_SENDER_NOT_CONFIGURED".into())
+            Ok("10.77.24.30".parse().unwrap())
         );
         assert_eq!(
-            validate_traffic_peer_values(Some("10.77.24.30"), Some("invalid")),
-            Err("LTE_DL_SENDER_IP_INVALID".into())
+            validate_traffic_peer_values(Some("10.77.16.30"), Some("10.77.24.30")),
+            Ok("10.77.16.30".parse().unwrap())
         );
-        assert_eq!(
-            validate_traffic_peer_values(Some("10.77.24.31"), Some("10.77.24.30")),
-            Err("LTE_TRAFFIC_PEER_MISMATCH".into())
-        );
+        // Equal values are still accepted (back-compat for the current drop-in).
         assert_eq!(
             validate_traffic_peer_values(Some("10.77.24.30"), Some("10.77.24.30")),
             Ok("10.77.24.30".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn lte_ul_route_preflight_requires_tun_srsue() {
+        // Happy path: kernel resolved via tun_srsue → ok.
+        let raw = "10.77.16.30 dev tun_srsue src 10.45.0.5 uid 0";
+        let evidence = evaluate_lte_ul_route(raw, "10.77.16.30");
+        assert!(evidence.ok);
+        assert_eq!(evidence.expected_dev, "tun_srsue");
+        assert_eq!(evidence.actual_dev.as_deref(), Some("tun_srsue"));
+        assert_eq!(evidence.code, None);
+
+        // Bridge default route → rejected with the LTE-specific code.
+        let bridge = "10.77.16.30 via 10.0.2.2 dev eth0 src 10.0.2.15 uid 0";
+        let evidence = evaluate_lte_ul_route(bridge, "10.77.16.30");
+        assert!(!evidence.ok);
+        assert_eq!(evidence.code.as_deref(), Some("LTE_UL_ROUTE_NOT_VIA_UE_TUN"));
+        assert_eq!(evidence.actual_dev.as_deref(), Some("eth0"));
+
+        // 5G uesimtun0 is not a valid LTE SGi outbound (keeps LTE vs 5G separate).
+        let five_g = "10.77.16.30 dev uesimtun0 src 10.46.0.5 uid 0";
+        let evidence = evaluate_lte_ul_route(five_g, "10.77.16.30");
+        assert!(!evidence.ok);
+        assert_eq!(evidence.code.as_deref(), Some("LTE_UL_ROUTE_NOT_VIA_UE_TUN"));
+    }
+
+    #[test]
+    fn lte_dl_return_route_preflight_rejects_missing_sgi() {
+        // Happy path: DN has a usable dev to reach the UE subnet.
+        assert_eq!(
+            evaluate_lte_dl_return_route(
+                "10.45.0.2 via 10.77.16.15 dev sgi_lte src 10.77.16.30 uid 0",
+                "10.45.0.2",
+            ),
+            Ok(())
+        );
+
+        // ip route get prints "network is unreachable" when no SGi path exists.
+        assert_eq!(
+            evaluate_lte_dl_return_route(
+                "RTNETLINK answers: Network is unreachable",
+                "10.45.0.2",
+            ),
+            Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())
+        );
+
+        // No dev field (unparseable) is treated as unavailable.
+        assert_eq!(
+            evaluate_lte_dl_return_route("??? garbage ???", "10.45.0.2"),
+            Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())
+        );
+
+        // Loopback / blackhole dev means no SGi path exists.
+        assert_eq!(
+            evaluate_lte_dl_return_route("10.45.0.2 dev lo src 127.0.0.1", "10.45.0.2"),
+            Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())
+        );
+        assert_eq!(
+            evaluate_lte_dl_return_route("blackhole 10.45.0.2 dev blackhole", "10.45.0.2"),
+            Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())
         );
     }
     #[test]

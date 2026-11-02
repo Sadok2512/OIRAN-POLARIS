@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.29.2 (polaris-control-api) — 2026-11-02 — LTE SGi / N6 topology separation
+
+- Removes the ANR2 strict-equality requirement
+  `POLARIS_LTE_TRAFFIC_PEER_IP == POLARIS_DL_SENDER_IP`. The LTE SGi peer
+  is a dedicated DN endpoint distinct from the 5G N6 sender; the two values
+  may legitimately differ and the LTE path no longer requires
+  `POLARIS_DL_SENDER_IP` to be defined.
+- Adds fail-closed LTE SGi preflights before every ping and iperf3 call:
+  - UL preflight runs `docker exec UE ip route get <peer>` inside the UE
+    container and rejects any resolution that does not use `tun_srsue`.
+    Error code: `LTE_UL_ROUTE_NOT_VIA_UE_TUN`.
+  - DL preflight runs `docker exec polaris-dn-sender ip route get <ue_ip>`
+    and rejects `unreachable`, loopback/blackhole exits, or an unparseable
+    resolution. Error code: `LTE_DL_RETURN_ROUTE_UNAVAILABLE`.
+- Binds UL traffic to the UE tun interface and source IP:
+  - `ping -I tun_srsue -c <count> <peer>` from the UE container.
+  - `iperf3 -c <peer> -B <ue_ip> ...` from the UE container.
+  - Guarantees the Linux stack cannot pick a bridge interface even if one is
+    reachable from the UE container.
+- Preserves bounded error codes and sanitized counters: the preflight returns
+  explicit codes with the raw `ip route get` line included in the step
+  evidence; no raw stderr, no secret, no subscriber material leaks.
+- Does not change Grant V2, cleanup, finalizer, OIRAN compatibility (2.7.5),
+  12-dumpcap ownership or Open5GS. Disk policy 98% / 8 GiB reserve unchanged.
+
 ## 0.29.1 (polaris-control-api) / safety-guard 0.2.0 / web 3.2.3 — 2026-11-02 — 98% disk ceiling
 
 - Replaces the legacy 80/85/90 percentage blockers with 95% information,
