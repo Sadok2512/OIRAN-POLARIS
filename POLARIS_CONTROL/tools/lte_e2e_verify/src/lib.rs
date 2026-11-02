@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-pub const VERSION: &str = "0.1.1";
+pub const VERSION: &str = "0.1.2";
 
 const UDP_RATE_CAP_BPS: u64 = 1_000_000;
 const DUMPCAP_EXPECTED: usize = 12;
@@ -275,6 +275,17 @@ impl Step {
             serde_json::Value::Null => None,
             value => value.get("ping_runtime_diagnostic"),
         }
+    }
+
+    /// 0.1.2: returns the `enb_link_counters` sub-document introduced by the
+    /// POLARIS 0.29.5 commit `c5f191f` (ANR3). Each entry (`s1u`, `zmq`)
+    /// maps to the sanitized `ip -s link show dev <interface>` output for
+    /// the eNB interface carrying `gtp_bind_addr` or whose docker network
+    /// name contains "zmq". Bounded to the LAST 512 UTF-8 bytes.
+    pub fn enb_link_counters(&self) -> Option<&serde_json::Value> {
+        self.ping_runtime_diagnostic()
+            .and_then(|value| value.get("evidence"))
+            .and_then(|value| value.get("enb_link_counters"))
     }
 }
 

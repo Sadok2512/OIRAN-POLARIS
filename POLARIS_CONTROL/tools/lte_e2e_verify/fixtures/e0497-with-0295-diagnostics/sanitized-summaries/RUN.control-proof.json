@@ -32,6 +32,18 @@
             "container_image_ids": {
               "srsue": "sha256:218e848bd8cb59532d8cce9dcef8d6370944abd35b9b25aea9041671681e4d04",
               "srsenb": "sha256:218e848bd8cb59532d8cce9dcef8d6370944abd35b9b25aea9041671681e4d04"
+            },
+            "enb_link_counters": {
+              "s1u": {
+                "exit_code": 0,
+                "stdout": "4: eth1@if12: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP\\n    link/ether 02:42:0a:4d:0b:14 brd ff:ff:ff:ff:ff:ff\\n    RX: bytes packets errors dropped overrun mcast\\n    0 0 0 0 0 0\\n    TX: bytes packets errors dropped carrier collsns\\n    0 0 0 0 0 0",
+                "stderr": ""
+              },
+              "zmq": {
+                "exit_code": 0,
+                "stdout": "5: eth2@if14: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP\\n    link/ether 02:42:0a:4d:0f:14 brd ff:ff:ff:ff:ff:ff\\n    RX: bytes packets errors dropped overrun mcast\\n    7324 42 0 0 0 0\\n    TX: bytes packets errors dropped carrier collsns\\n    6218 41 0 0 0 0",
+                "stderr": ""
+              }
             }
           },
           "error_code": "LTE_UL_ROUTE_PROBE_FAILED"

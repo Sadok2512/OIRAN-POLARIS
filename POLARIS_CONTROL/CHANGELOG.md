@@ -1,5 +1,15 @@
 # Changelog
 
+## tools/lte-e2e-verify 0.1.2 — 2026-11-02 — read POLARIS 0.29.5 enb_link_counters
+
+- Extends `Step` with an `enb_link_counters()` accessor that returns the
+  `s1u` / `zmq` sub-documents persisted by the POLARIS 0.29.5 fix commit
+  `c5f191f` (ANR3): sanitized `ip -s link show dev <iface>` dumps for the
+  eNB interface carrying `gtp_bind_addr` and the one on the ZMQ network.
+- Updates the `e0497-with-0295-diagnostics` fixture to carry the new field,
+  plus a dedicated test `verifier_0_1_2_exposes_enb_link_counters_for_s1u_and_zmq`.
+- No gate verdict rule changed; the field is informational.
+
 ## tools/lte-e2e-verify 0.1.1 — 2026-11-02 — read POLARIS 0.29.5 ping runtime diagnostic
 
 - Extends the step schema to accept the `ping_runtime_diagnostic` observation

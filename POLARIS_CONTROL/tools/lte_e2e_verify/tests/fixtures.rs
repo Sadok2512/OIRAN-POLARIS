@@ -106,6 +106,7 @@ fn e0497_with_0295_diagnostics_keeps_identical_blockers_and_exposes_runtime_diag
         "srsue_log_tail",
         "srsenb_log_tail",
         "enb",
+        "enb_link_counters",
         "container_image_ids",
     ] {
         assert!(evidence.get(key).is_some(), "missing persisted key {key}");
@@ -119,6 +120,40 @@ fn e0497_with_0295_diagnostics_keeps_identical_blockers_and_exposes_runtime_diag
             !serialized.contains(forbidden),
             "diagnostic unexpectedly contains {forbidden}"
         );
+    }
+}
+
+#[test]
+fn verifier_0_1_2_exposes_enb_link_counters_for_s1u_and_zmq() {
+    // 0.1.2: the POLARIS fix commit c5f191f adds `enb_link_counters` with the
+    // s1u and zmq roles. The verifier must expose this sub-document via
+    // `Step::enb_link_counters()` so Codex can introspect the UL/DL byte and
+    // drop counters without re-parsing the raw JSON.
+    let path = fixture("e0497-with-0295-diagnostics")
+        .join("sanitized-summaries/RUN.control-proof.json");
+    let bytes = std::fs::read(&path).unwrap();
+    let control: lte_e2e_verify::ControlProof = serde_json::from_slice(&bytes).unwrap();
+    let step = control
+        .steps
+        .iter()
+        .find(|step| step.index == 6)
+        .expect("ping_ul step");
+    let counters = step
+        .enb_link_counters()
+        .expect("enb_link_counters sub-document");
+    let s1u = counters.get("s1u").expect("s1u role");
+    let zmq = counters.get("zmq").expect("zmq role");
+    for role in [s1u, zmq] {
+        assert_eq!(role.get("exit_code").and_then(|v| v.as_i64()), Some(0));
+        let stdout = role
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .expect("stdout string");
+        // The dump must mention the UTF-8 bounded ip -s link counters header.
+        assert!(stdout.contains("RX:") && stdout.contains("TX:"));
+        // Payload must be ≤ 512 bytes (sanity on the fixture, not a
+        // verifier-enforced invariant).
+        assert!(stdout.len() <= 512);
     }
 }
 
