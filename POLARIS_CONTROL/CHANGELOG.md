@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.29.3 (polaris-control-api) — 2026-11-02 — LTE SGi dedicated DN + hardened preflight
+
+- Requires an explicit LTE DN sender container
+  (`POLARIS_LTE_DN_SENDER_CONTAINER`); refuses silent fallback to the 5G N6
+  `polaris-dn-sender`. Rejects empty names, invalid characters, and verbatim
+  collision with the N6 container (`LTE_DN_SENDER_COLLIDES_WITH_N6`).
+- Requires a configured PGW-U LTE next-hop
+  (`POLARIS_LTE_PGW_U_NEXT_HOP`) and a UE subnet
+  (`POLARIS_LTE_UE_SUBNET`, defaults to `10.45.0.0/16`); missing or
+  malformed values fail-closed before any traffic is spawned.
+- Hardens `evaluate_lte_dl_return_route`:
+  - rejects UE addresses outside the configured subnet
+    (`LTE_UE_IP_OUTSIDE_SUBNET`);
+  - rejects `unreachable` resolutions and unparseable `dev` fields
+    (`LTE_DL_RETURN_ROUTE_UNAVAILABLE`);
+  - rejects outbound devices listed in
+    `POLARIS_LTE_FORBIDDEN_RETURN_DEVS`
+    (`LTE_DL_RETURN_ROUTE_VIA_FORBIDDEN_DEV` — default list rejects `lo`,
+    `null0`, `blackhole`, `eth0`, and the N6 bridge `oiran-lab-n6`);
+  - requires an explicit `via <PGW-U LTE>` next-hop matching
+    `POLARIS_LTE_PGW_U_NEXT_HOP` (`LTE_DL_RETURN_ROUTE_MISSING_VIA`
+    and `LTE_DL_RETURN_ROUTE_WRONG_NEXT_HOP`).
+- Rejects explicit SGi/N6 IP collision at `configured_traffic_peer`
+  (`LTE_SGI_COLLIDES_WITH_N6`).
+- Classifies DN container exec exit codes 126/127 and
+  `command not found` stderr as `LTE_DN_SENDER_TOOLING_MISSING`
+  without leaking raw stderr.
+- Removes the active `Environment=POLARIS_LTE_TRAFFIC_PEER_IP=10.77.24.30`
+  line from the N6 drop-in; the LTE path now reads a dedicated candidate
+  drop-in `deployment/dn-sender/lte-sgi/polaris-control-lte-sgi.conf`
+  whose four required variables stay commented until Codex confirms
+  addresses and image digest.
+- Ships a candidate SGi sidecar compose definition
+  (`deployment/dn-sender/lte-sgi/compose.yaml`) with `cap_drop: [ALL]`,
+  `no-new-privileges`, `read_only`, non-root user, pid/mem/cpu limits
+  and `SIDE_CAR_IMAGE_DIGEST=PENDING`.
+- Preserves Grant V2, cleanup, finalizer, 12-dumpcap ownership, disk
+  policy 98% / 8 GiB reserve, and OIRAN 2.7.5 compatibility.
+
 ## 0.29.2 (polaris-control-api) — 2026-11-02 — LTE SGi / N6 topology separation
 
 - Removes the ANR2 strict-equality requirement

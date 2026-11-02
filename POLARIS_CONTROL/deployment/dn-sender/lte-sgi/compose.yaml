@@ -1,0 +1,58 @@
+# ===================================================================
+# LTE SGi DN sidecar — CANDIDATE DEFINITION. DO NOT docker-compose up.
+# ===================================================================
+#
+# This file is a proposal. Codex is responsible for:
+#   1. Reserving the SGi network and IP (proposed 10.77.16.30/24,
+#      next-hop 10.77.16.15).
+#   2. Pinning the image by digest (SIDE_CAR_IMAGE_DIGEST=PENDING).
+#      The image MUST include iproute2, iputils-ping and iperf3; if a
+#      required tool is missing the POLARIS runtime surfaces
+#      LTE_DN_SENDER_TOOLING_MISSING at preflight.
+#   3. Installing the 10.45.0.0/16 return route into the oiran-lab-sgi
+#      bridge; the sidecar does not configure routing by itself.
+#
+# Until these three items are confirmed, the matching drop-in
+# (lte-sgi/polaris-control-lte-sgi.conf) stays commented and every
+# LTE traffic step fails closed at preflight.
+# ===================================================================
+
+services:
+  polaris-lte-sgi-dn:
+    # SIDE_CAR_IMAGE_DIGEST=PENDING — Codex must set the digest before activation.
+    # Expected form: registry.example.invalid/polaris-lte-sgi-dn@sha256:<digest>
+    image: registry.example.invalid/polaris-lte-sgi-dn:pending@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    container_name: polaris-lte-sgi-dn
+    restart: unless-stopped
+    networks:
+      oiran-lab-sgi:
+        ipv4_address: 10.77.16.30
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1700
+      - /run:size=4m
+    user: "65532:65532"
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: "0.25"
+    # No volumes mounted. No host network. No raw PCAP access.
+    # The sidecar is strictly ping/iperf3 target + return-route endpoint.
+    environment:
+      - LANG=C.UTF-8
+    healthcheck:
+      test: ["CMD", "ip", "-4", "route", "show", "10.45.0.0/16"]
+      interval: 30s
+      timeout: 2s
+      retries: 3
+    labels:
+      - polaris.sidecar.purpose=lte-sgi-dn
+      - polaris.sidecar.image_digest_state=PENDING
+
+networks:
+  oiran-lab-sgi:
+    external: true
+    name: oiran-lab-sgi

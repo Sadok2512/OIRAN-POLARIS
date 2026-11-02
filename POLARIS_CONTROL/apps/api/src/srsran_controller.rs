@@ -198,16 +198,17 @@ fn attach_is_proven(s1_state: &str, attach_success: bool, epc_context: bool) -> 
     s1_state == "CONNECTED" && attach_success && epc_context
 }
 
-// 0.29.2: LTE SGi peer is a distinct DN from the 5G N6 sender.
-// The previous ANR2 fix required `POLARIS_LTE_TRAFFIC_PEER_IP ==
-// POLARIS_DL_SENDER_IP`, which was wrong: the LTE SGi path has its own DN
-// endpoint and its own return route to the UE subnet (10.45.0.0/16). The two
-// values may legitimately differ; the real correctness condition is a routing
-// one, not an equality one. Route-level enforcement is performed by the UL
-// (`evaluate_lte_ul_route`) and DL (`evaluate_lte_dl_return_route`) preflights
-// invoked from `ping()` and `iperf()`.
+// 0.29.3: LTE SGi path uses a dedicated DN sender container, pinned by env.
+// No silent fallback to the 5G N6 container is tolerated. The DL preflight is
+// policy-driven (required next-hop PGW-U LTE, required UE subnet, forbidden
+// outbound devices such as the N6 bridge/loopback/blackhole). Missing tools in
+// the DN container (`iperf3`, `ping`, `ip`) surface as
+// `LTE_DN_SENDER_TOOLING_MISSING` instead of a generic ping failure.
+//
+// 0.29.2 history: LTE SGi peer decoupled from `POLARIS_DL_SENDER_IP`; UL route
+// preflight requires `tun_srsue`.
 pub const LTE_UE_TUN: &str = "tun_srsue";
-pub const LTE_DN_SENDER_CONTAINER: &str = "polaris-dn-sender";
+pub const LTE_UE_SUBNET_DEFAULT: &str = "10.45.0.0/16";
 
 fn validate_traffic_peer_values(
     traffic_peer: Option<&str>,
@@ -221,7 +222,79 @@ fn validate_traffic_peer_values(
 fn configured_traffic_peer() -> Result<std::net::Ipv4Addr, String> {
     let peer = std::env::var("POLARIS_LTE_TRAFFIC_PEER_IP").ok();
     let sender = std::env::var("POLARIS_DL_SENDER_IP").ok();
-    validate_traffic_peer_values(peer.as_deref(), sender.as_deref())
+    let peer = validate_traffic_peer_values(peer.as_deref(), sender.as_deref())?;
+    // 0.29.3: an operator pointing the LTE SGi peer at the 5G N6 sender is
+    // explicitly rejected now — the two DNs must be distinct in prod.
+    if let Some(n6) = sender {
+        if let Ok(n6_ip) = n6.parse::<std::net::Ipv4Addr>() {
+            if n6_ip == peer {
+                return Err("LTE_SGI_COLLIDES_WITH_N6".into());
+            }
+        }
+    }
+    Ok(peer)
+}
+
+/// 0.29.3: LTE DN sender container name is deployment-specified and must NOT
+/// silently fall back to the 5G N6 `polaris-dn-sender`. Operators must set
+/// `POLARIS_LTE_DN_SENDER_CONTAINER` explicitly.
+fn configured_lte_dn_sender_container() -> Result<String, String> {
+    let name = std::env::var("POLARIS_LTE_DN_SENDER_CONTAINER")
+        .map_err(|_| "LTE_DN_SENDER_NOT_CONFIGURED".to_string())?;
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("LTE_DN_SENDER_NOT_CONFIGURED".into());
+    }
+    // Forbid the N6 container name verbatim to make the "no silent fallback"
+    // rule explicit at the configuration boundary.
+    if trimmed == "polaris-dn-sender" {
+        return Err("LTE_DN_SENDER_COLLIDES_WITH_N6".into());
+    }
+    if trimmed.len() > 64
+        || !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err("LTE_DN_SENDER_NAME_INVALID".into());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Policy consumed by `evaluate_lte_dl_return_route`. All three fields are
+/// deployment-specified. The policy makes the N6-vs-SGi distinction explicit:
+/// `forbidden_devs` names outbound interfaces that would route the UE traffic
+/// through the 5G DN rather than the SGi fabric.
+#[derive(Clone, Debug)]
+pub struct SgiReturnRoutePolicy {
+    pub required_next_hop: String,
+    pub required_ue_subnet: String,
+    pub forbidden_devs: Vec<String>,
+}
+
+/// 0.29.3: Build a policy from env. All vars are required; missing values
+/// fail-closed to prevent silent degradation to 5G N6 routing. Returns the
+/// specific error code the caller surfaces in the step record.
+pub fn configured_lte_dl_return_policy() -> Result<SgiReturnRoutePolicy, String> {
+    let required_next_hop = std::env::var("POLARIS_LTE_PGW_U_NEXT_HOP")
+        .map_err(|_| "LTE_PGW_U_NEXT_HOP_NOT_CONFIGURED".to_string())?;
+    required_next_hop
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| "LTE_PGW_U_NEXT_HOP_INVALID".to_string())?;
+    let required_ue_subnet = std::env::var("POLARIS_LTE_UE_SUBNET")
+        .unwrap_or_else(|_| LTE_UE_SUBNET_DEFAULT.to_string());
+    parse_cidr_v4(&required_ue_subnet).map_err(|_| "LTE_UE_SUBNET_INVALID".to_string())?;
+    let forbidden_devs = std::env::var("POLARIS_LTE_FORBIDDEN_RETURN_DEVS")
+        .unwrap_or_else(|_| "lo,null0,blackhole,eth0,oiran-lab-n6".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(SgiReturnRoutePolicy {
+        required_next_hop,
+        required_ue_subnet,
+        forbidden_devs,
+    })
 }
 
 /// LTE SGi UL route preflight. Wraps the shared `evaluate_ue_route_preflight`
@@ -230,24 +303,82 @@ pub fn evaluate_lte_ul_route(raw: &str, peer: &str) -> crate::UeRoutePreflight {
     crate::evaluate_ue_route_preflight(raw, peer, LTE_UE_TUN, "LTE_UL_ROUTE_NOT_VIA_UE_TUN")
 }
 
-/// LTE SGi DL return-route preflight. Validates that the DN sender has a
-/// usable route back to the UE subnet. Rejects explicit `unreachable` markers,
-/// absent `dev` fields, and routes that would exit through forbidden interfaces
-/// (loopback/null) which signal a missing SGi return. Returns
-/// `LTE_DL_RETURN_ROUTE_UNAVAILABLE` on any such failure.
-pub fn evaluate_lte_dl_return_route(raw: &str, ue_ip: &str) -> Result<(), String> {
+fn after_token(line: &str, key: &str) -> Option<String> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    fields
+        .iter()
+        .position(|value| *value == key)
+        .and_then(|index| fields.get(index + 1).copied())
+        .map(str::to_string)
+}
+
+fn parse_cidr_v4(cidr: &str) -> Result<(std::net::Ipv4Addr, u32), String> {
+    let (net, prefix) = cidr.split_once('/').ok_or("missing /")?;
+    let net = net.parse::<std::net::Ipv4Addr>().map_err(|e| e.to_string())?;
+    let prefix: u32 = prefix.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    if prefix > 32 {
+        return Err("prefix >32".into());
+    }
+    Ok((net, prefix))
+}
+
+fn ip_in_v4_cidr(ip: &str, cidr: &str) -> bool {
+    let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let Ok((net, prefix)) = parse_cidr_v4(cidr) else {
+        return false;
+    };
+    let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    (u32::from(addr) & mask) == (u32::from(net) & mask)
+}
+
+/// LTE SGi DL return-route preflight — hardened. Validates:
+/// - the UE address falls inside the configured UE subnet,
+/// - the raw `ip route get` resolution is not `unreachable`,
+/// - a `dev` field is parseable and is NOT in `forbidden_devs`,
+/// - a `via` next-hop is present and matches `required_next_hop`.
+///
+/// Returns a specific error code on each failure so the step evidence tells
+/// operators exactly which gate rejected the run.
+pub fn evaluate_lte_dl_return_route(
+    raw: &str,
+    ue_ip: &str,
+    policy: &SgiReturnRoutePolicy,
+) -> Result<(), String> {
+    if !ip_in_v4_cidr(ue_ip, &policy.required_ue_subnet) {
+        return Err("LTE_UE_IP_OUTSIDE_SUBNET".into());
+    }
     let bounded: String = raw.chars().take(1024).collect();
     let line = bounded.lines().next().unwrap_or("");
     let lower = line.to_ascii_lowercase();
     if lower.contains("unreachable") || lower.contains("network is unreachable") {
         return Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into());
     }
-    let (dev, _) = crate::parse_ip_route_get(line);
-    let dev = dev.ok_or("LTE_DL_RETURN_ROUTE_UNAVAILABLE".to_string())?;
-    if matches!(dev.as_str(), "lo" | "null0" | "blackhole") {
-        return Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into());
+    let dev = after_token(line, "dev").ok_or("LTE_DL_RETURN_ROUTE_UNAVAILABLE".to_string())?;
+    if policy.forbidden_devs.iter().any(|forbidden| forbidden == &dev) {
+        return Err("LTE_DL_RETURN_ROUTE_VIA_FORBIDDEN_DEV".into());
     }
-    let _ = ue_ip; // reserved for future subnet correlation; current impl trusts caller input
+    let via = after_token(line, "via").ok_or("LTE_DL_RETURN_ROUTE_MISSING_VIA".to_string())?;
+    if via != policy.required_next_hop {
+        return Err("LTE_DL_RETURN_ROUTE_WRONG_NEXT_HOP".into());
+    }
+    Ok(())
+}
+
+/// 0.29.3: classifier for DN container exec exit codes. 126 and 127 are
+/// shell's "cannot execute" / "command not found" conventions; sanitized
+/// stderr snippets containing the same phrasing are also treated as a
+/// tooling gap so operators get a precise diagnostic without raw stderr
+/// leaking.
+pub fn classify_dn_container_exit(code: i32, stderr: &str) -> Result<(), String> {
+    if code == 126 || code == 127 {
+        return Err("LTE_DN_SENDER_TOOLING_MISSING".into());
+    }
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("command not found") || lower.contains("executable file not found") {
+        return Err("LTE_DN_SENDER_TOOLING_MISSING".into());
+    }
     Ok(())
 }
 
@@ -1193,14 +1324,16 @@ impl SrsranRuntime for DockerSrsranRuntime {
             )?
         } else {
             let ue_ip = self.ue_ip(Some(&ue)).ok_or("LTE_UE_IP_NOT_READY")?;
-            // 0.29.2: preflight DN return route to the UE subnet before any
-            // reverse-direction probe. Rejects an N6-only DN that lacks a SGi
-            // return path.
+            // 0.29.3: DN container is env-driven and must not silently fall
+            // back to the 5G N6 sender. Policy for the return route is also
+            // env-driven (next-hop, UE subnet, forbidden devs).
+            let dn_container = configured_lte_dn_sender_container()?;
+            let dl_policy = configured_lte_dl_return_policy()?;
             let route = self
                 .run(
                     &[
                         "exec",
-                        LTE_DN_SENDER_CONTAINER,
+                        dn_container.as_str(),
                         "ip",
                         "route",
                         "get",
@@ -1209,27 +1342,27 @@ impl SrsranRuntime for DockerSrsranRuntime {
                     3,
                 )
                 .map_err(|_| "LTE_DL_RETURN_ROUTE_UNAVAILABLE".to_string())?;
+            classify_dn_container_exit(route.code, &route.stderr)?;
             if route.code != 0 {
                 return Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into());
             }
-            evaluate_lte_dl_return_route(&route.stdout, &ue_ip)?;
-            Self::ok(
-                self.run(
-                    &[
-                        "exec",
-                        LTE_DN_SENDER_CONTAINER,
-                        "ping",
-                        "-n",
-                        "-c",
-                        &count,
-                        "-W",
-                        "1",
-                        &ue_ip,
-                    ],
-                    10,
-                )?,
-                "LTE_PING_FAILED",
-            )?
+            evaluate_lte_dl_return_route(&route.stdout, &ue_ip, &dl_policy)?;
+            let ping_output = self.run(
+                &[
+                    "exec",
+                    dn_container.as_str(),
+                    "ping",
+                    "-n",
+                    "-c",
+                    &count,
+                    "-W",
+                    "1",
+                    &ue_ip,
+                ],
+                10,
+            )?;
+            classify_dn_container_exit(ping_output.code, &ping_output.stderr)?;
+            Self::ok(ping_output, "LTE_PING_FAILED")?
         };
         let summary = output
             .stdout
@@ -1836,41 +1969,228 @@ mod tests {
         assert_eq!(evidence.code.as_deref(), Some("LTE_UL_ROUTE_NOT_VIA_UE_TUN"));
     }
 
+    fn policy() -> SgiReturnRoutePolicy {
+        SgiReturnRoutePolicy {
+            required_next_hop: "10.77.16.15".into(),
+            required_ue_subnet: "10.45.0.0/16".into(),
+            forbidden_devs: vec![
+                "lo".into(),
+                "null0".into(),
+                "blackhole".into(),
+                "eth0".into(),
+                "oiran-lab-n6".into(),
+            ],
+        }
+    }
+
     #[test]
-    fn lte_dl_return_route_preflight_rejects_missing_sgi() {
-        // Happy path: DN has a usable dev to reach the UE subnet.
+    fn lte_dl_return_route_preflight_requires_next_hop_subnet_and_device() {
+        // Happy path: correct next-hop + usable dev + UE in subnet.
         assert_eq!(
             evaluate_lte_dl_return_route(
                 "10.45.0.2 via 10.77.16.15 dev sgi_lte src 10.77.16.30 uid 0",
                 "10.45.0.2",
+                &policy(),
             ),
             Ok(())
         );
 
-        // ip route get prints "network is unreachable" when no SGi path exists.
+        // UE IP outside the configured subnet is rejected first.
+        assert_eq!(
+            evaluate_lte_dl_return_route(
+                "10.9.9.2 via 10.77.16.15 dev sgi_lte src 10.77.16.30 uid 0",
+                "10.9.9.2",
+                &policy(),
+            ),
+            Err("LTE_UE_IP_OUTSIDE_SUBNET".into())
+        );
+
+        // Network unreachable.
         assert_eq!(
             evaluate_lte_dl_return_route(
                 "RTNETLINK answers: Network is unreachable",
                 "10.45.0.2",
+                &policy(),
             ),
             Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())
         );
 
-        // No dev field (unparseable) is treated as unavailable.
+        // No dev field.
         assert_eq!(
-            evaluate_lte_dl_return_route("??? garbage ???", "10.45.0.2"),
+            evaluate_lte_dl_return_route("??? garbage ???", "10.45.0.2", &policy()),
             Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())
         );
 
-        // Loopback / blackhole dev means no SGi path exists.
+        // Loopback/blackhole (in forbidden list).
         assert_eq!(
-            evaluate_lte_dl_return_route("10.45.0.2 dev lo src 127.0.0.1", "10.45.0.2"),
-            Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())
+            evaluate_lte_dl_return_route(
+                "10.45.0.2 dev lo src 127.0.0.1",
+                "10.45.0.2",
+                &policy()
+            ),
+            Err("LTE_DL_RETURN_ROUTE_VIA_FORBIDDEN_DEV".into())
         );
         assert_eq!(
-            evaluate_lte_dl_return_route("blackhole 10.45.0.2 dev blackhole", "10.45.0.2"),
-            Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())
+            evaluate_lte_dl_return_route(
+                "blackhole 10.45.0.2 dev blackhole",
+                "10.45.0.2",
+                &policy()
+            ),
+            Err("LTE_DL_RETURN_ROUTE_VIA_FORBIDDEN_DEV".into())
         );
+
+        // Route out via N6 bridge is explicitly forbidden.
+        assert_eq!(
+            evaluate_lte_dl_return_route(
+                "10.45.0.2 via 10.77.24.1 dev eth0 src 10.77.24.30 uid 0",
+                "10.45.0.2",
+                &policy(),
+            ),
+            Err("LTE_DL_RETURN_ROUTE_VIA_FORBIDDEN_DEV".into())
+        );
+        assert_eq!(
+            evaluate_lte_dl_return_route(
+                "10.45.0.2 via 10.77.24.1 dev oiran-lab-n6 src 10.77.24.30 uid 0",
+                "10.45.0.2",
+                &policy(),
+            ),
+            Err("LTE_DL_RETURN_ROUTE_VIA_FORBIDDEN_DEV".into())
+        );
+
+        // Missing via (direct route is wrong — SGi must traverse PGW-U).
+        assert_eq!(
+            evaluate_lte_dl_return_route(
+                "10.45.0.2 dev sgi_lte src 10.77.16.30 uid 0",
+                "10.45.0.2",
+                &policy(),
+            ),
+            Err("LTE_DL_RETURN_ROUTE_MISSING_VIA".into())
+        );
+
+        // Wrong next-hop (not the configured PGW-U LTE).
+        assert_eq!(
+            evaluate_lte_dl_return_route(
+                "10.45.0.2 via 10.77.24.1 dev sgi_lte src 10.77.16.30 uid 0",
+                "10.45.0.2",
+                &policy(),
+            ),
+            Err("LTE_DL_RETURN_ROUTE_WRONG_NEXT_HOP".into())
+        );
+    }
+
+    #[test]
+    fn configured_lte_dn_sender_container_requires_explicit_setting() {
+        let prev = std::env::var_os("POLARIS_LTE_DN_SENDER_CONTAINER");
+        std::env::remove_var("POLARIS_LTE_DN_SENDER_CONTAINER");
+        assert_eq!(
+            configured_lte_dn_sender_container(),
+            Err("LTE_DN_SENDER_NOT_CONFIGURED".into())
+        );
+        std::env::set_var("POLARIS_LTE_DN_SENDER_CONTAINER", "   ");
+        assert_eq!(
+            configured_lte_dn_sender_container(),
+            Err("LTE_DN_SENDER_NOT_CONFIGURED".into())
+        );
+        std::env::set_var("POLARIS_LTE_DN_SENDER_CONTAINER", "polaris-dn-sender");
+        assert_eq!(
+            configured_lte_dn_sender_container(),
+            Err("LTE_DN_SENDER_COLLIDES_WITH_N6".into())
+        );
+        std::env::set_var("POLARIS_LTE_DN_SENDER_CONTAINER", "polaris-lte-sgi-dn ");
+        assert_eq!(
+            configured_lte_dn_sender_container(),
+            Ok("polaris-lte-sgi-dn".to_string())
+        );
+        std::env::set_var("POLARIS_LTE_DN_SENDER_CONTAINER", "bad name!");
+        assert_eq!(
+            configured_lte_dn_sender_container(),
+            Err("LTE_DN_SENDER_NAME_INVALID".into())
+        );
+        match prev {
+            Some(value) => std::env::set_var("POLARIS_LTE_DN_SENDER_CONTAINER", value),
+            None => std::env::remove_var("POLARIS_LTE_DN_SENDER_CONTAINER"),
+        }
+    }
+
+    #[test]
+    fn classify_dn_container_exit_detects_missing_tooling() {
+        assert_eq!(classify_dn_container_exit(0, ""), Ok(()));
+        assert_eq!(classify_dn_container_exit(1, ""), Ok(()));
+        assert_eq!(
+            classify_dn_container_exit(127, ""),
+            Err("LTE_DN_SENDER_TOOLING_MISSING".into())
+        );
+        assert_eq!(
+            classify_dn_container_exit(126, ""),
+            Err("LTE_DN_SENDER_TOOLING_MISSING".into())
+        );
+        assert_eq!(
+            classify_dn_container_exit(2, "ping: command not found\n"),
+            Err("LTE_DN_SENDER_TOOLING_MISSING".into())
+        );
+        assert_eq!(
+            classify_dn_container_exit(2, "exec: \"iperf3\": executable file not found in $PATH"),
+            Err("LTE_DN_SENDER_TOOLING_MISSING".into())
+        );
+    }
+
+    #[test]
+    fn configured_traffic_peer_rejects_collision_with_n6_sender() {
+        let prev_peer = std::env::var_os("POLARIS_LTE_TRAFFIC_PEER_IP");
+        let prev_sender = std::env::var_os("POLARIS_DL_SENDER_IP");
+        std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", "10.77.24.30");
+        std::env::set_var("POLARIS_DL_SENDER_IP", "10.77.24.30");
+        assert_eq!(
+            configured_traffic_peer(),
+            Err("LTE_SGI_COLLIDES_WITH_N6".into())
+        );
+        std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", "10.77.16.30");
+        std::env::set_var("POLARIS_DL_SENDER_IP", "10.77.24.30");
+        assert_eq!(configured_traffic_peer(), Ok("10.77.16.30".parse().unwrap()));
+        match prev_peer {
+            Some(value) => std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", value),
+            None => std::env::remove_var("POLARIS_LTE_TRAFFIC_PEER_IP"),
+        }
+        match prev_sender {
+            Some(value) => std::env::set_var("POLARIS_DL_SENDER_IP", value),
+            None => std::env::remove_var("POLARIS_DL_SENDER_IP"),
+        }
+    }
+
+    #[test]
+    fn configured_lte_dl_return_policy_requires_pgw_u_next_hop() {
+        let prev_hop = std::env::var_os("POLARIS_LTE_PGW_U_NEXT_HOP");
+        let prev_subnet = std::env::var_os("POLARIS_LTE_UE_SUBNET");
+        std::env::remove_var("POLARIS_LTE_PGW_U_NEXT_HOP");
+        assert_eq!(
+            configured_lte_dl_return_policy().err(),
+            Some("LTE_PGW_U_NEXT_HOP_NOT_CONFIGURED".into())
+        );
+        std::env::set_var("POLARIS_LTE_PGW_U_NEXT_HOP", "not-an-ip");
+        assert_eq!(
+            configured_lte_dl_return_policy().err(),
+            Some("LTE_PGW_U_NEXT_HOP_INVALID".into())
+        );
+        std::env::set_var("POLARIS_LTE_PGW_U_NEXT_HOP", "10.77.16.15");
+        std::env::set_var("POLARIS_LTE_UE_SUBNET", "not-a-cidr");
+        assert_eq!(
+            configured_lte_dl_return_policy().err(),
+            Some("LTE_UE_SUBNET_INVALID".into())
+        );
+        std::env::remove_var("POLARIS_LTE_UE_SUBNET"); // use default
+        let built = configured_lte_dl_return_policy().unwrap();
+        assert_eq!(built.required_next_hop, "10.77.16.15");
+        assert_eq!(built.required_ue_subnet, "10.45.0.0/16");
+        assert!(built.forbidden_devs.contains(&"oiran-lab-n6".to_string()));
+        assert!(built.forbidden_devs.contains(&"lo".to_string()));
+        match prev_hop {
+            Some(value) => std::env::set_var("POLARIS_LTE_PGW_U_NEXT_HOP", value),
+            None => std::env::remove_var("POLARIS_LTE_PGW_U_NEXT_HOP"),
+        }
+        match prev_subnet {
+            Some(value) => std::env::set_var("POLARIS_LTE_UE_SUBNET", value),
+            None => std::env::remove_var("POLARIS_LTE_UE_SUBNET"),
+        }
     }
     #[test]
     fn traffic_preflight_failure_has_no_lifecycle_side_effect() {
@@ -1885,12 +2205,74 @@ mod tests {
         assert!(runtime.stopped.lock().unwrap().is_empty());
     }
     #[test]
-    fn canonical_dn_sender_dropin_sets_the_exact_lte_peer() {
+    fn canonical_n6_dropin_sets_only_n6_variables() {
         let dropin = include_str!(
             "../../../deployment/dn-sender/polaris-control-dl-sender.conf"
         );
         assert!(dropin.contains("Environment=POLARIS_DL_SENDER_IP=10.77.24.30"));
-        assert!(dropin.contains("Environment=POLARIS_LTE_TRAFFIC_PEER_IP=10.77.24.30"));
+        // 0.29.3: the N6 drop-in no longer sets any LTE variable; those live
+        // in lte-sgi/polaris-control-lte-sgi.conf and are activated only
+        // after Codex confirms addressing and image digest.
+        assert!(
+            !dropin
+                .lines()
+                .any(|line| line.trim_start().starts_with("Environment=POLARIS_LTE_")),
+            "N6 drop-in must not set any POLARIS_LTE_* variable"
+        );
+    }
+
+    #[test]
+    fn candidate_lte_sgi_dropin_is_fail_closed_until_codex_confirms() {
+        let dropin = include_str!(
+            "../../../deployment/dn-sender/lte-sgi/polaris-control-lte-sgi.conf"
+        );
+        for required in [
+            "POLARIS_LTE_DN_SENDER_CONTAINER",
+            "POLARIS_LTE_TRAFFIC_PEER_IP",
+            "POLARIS_LTE_PGW_U_NEXT_HOP",
+            "POLARIS_LTE_UE_SUBNET",
+        ] {
+            // Each required variable must be mentioned in a COMMENT, not an
+            // active Environment= line, so an operator cannot deploy this
+            // file verbatim.
+            let active = format!("Environment={required}=");
+            assert!(
+                !dropin
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&active)),
+                "{required} must stay commented in the candidate drop-in"
+            );
+            let commented = format!("# Environment={required}=");
+            assert!(
+                dropin.contains(&commented),
+                "{required} must be shown as a commented example"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_lte_sgi_sidecar_pins_image_digest_placeholder_and_hardens_pod() {
+        let compose = include_str!(
+            "../../../deployment/dn-sender/lte-sgi/compose.yaml"
+        );
+        // Image is pinned by @sha256 but the digest is a placeholder; Codex
+        // must replace it before activation.
+        assert!(compose.contains("@sha256:"));
+        assert!(compose.contains("SIDE_CAR_IMAGE_DIGEST=PENDING"));
+        // Hardening gates — any removal of these breaks the test.
+        for marker in [
+            "cap_drop:",
+            "- ALL",
+            "no-new-privileges:true",
+            "read_only: true",
+            "user: \"65532:65532\"",
+            "polaris.sidecar.image_digest_state=PENDING",
+        ] {
+            assert!(
+                compose.contains(marker),
+                "candidate sidecar must retain hardening marker {marker}"
+            );
+        }
     }
     #[test]
     fn host_timeout_is_fail_closed() {
