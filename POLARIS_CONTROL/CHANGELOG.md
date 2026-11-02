@@ -28,14 +28,20 @@
   `command not found` stderr as `LTE_DN_SENDER_TOOLING_MISSING`
   without leaking raw stderr.
 - Removes the active `Environment=POLARIS_LTE_TRAFFIC_PEER_IP=10.77.24.30`
-  line from the N6 drop-in; the LTE path now reads a dedicated candidate
-  drop-in `deployment/dn-sender/lte-sgi/polaris-control-lte-sgi.conf`
-  whose four required variables stay commented until Codex confirms
-  addresses and image digest.
-- Ships a candidate SGi sidecar compose definition
+  line from the N6 drop-in; the LTE path now reads the dedicated SGi drop-in
+  `deployment/dn-sender/lte-sgi/polaris-control-lte-sgi.conf`, with the
+  offline-validated container, peer, next-hop, UE subnet and forbidden-device
+  policy. Production activation remains separately gated.
+- Ships the offline-certified SGi sidecar definition
   (`deployment/dn-sender/lte-sgi/compose.yaml`) with `cap_drop: [ALL]`,
   `no-new-privileges`, `read_only`, non-root user, pid/mem/cpu limits
-  and `SIDE_CAR_IMAGE_DIGEST=PENDING`.
+  and immutable image digest
+  `sha256:e60eb72bf7619fd049f6bbbc45cf06927eb73ed7c613446678644f6742af31f3`.
+- Adds a digest- and ownership-bound route installer plus a systemd unit;
+  the SGi interface is named `sgi_lte` and the return route is required to be
+  `10.45.0.0/16 via 10.77.16.15 src 10.77.16.30`.
+- Synchronizes `VERSION_MANIFEST.toml` with API 0.29.3, web 3.2.3,
+  UERANSIM adapter 0.5.1 and safety-guard 0.2.0.
 - Preserves Grant V2, cleanup, finalizer, 12-dumpcap ownership, disk
   policy 98% / 8 GiB reserve, and OIRAN 2.7.5 compatibility.
 

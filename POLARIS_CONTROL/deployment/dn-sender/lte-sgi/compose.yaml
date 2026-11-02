@@ -1,9 +1,9 @@
 # ===================================================================
-# LTE SGi DN sidecar — CANDIDATE DEFINITION. DO NOT docker-compose up.
+# LTE SGi DN sidecar — OFFLINE-CERTIFIED RELEASE CANDIDATE.
 # ===================================================================
 #
-# This file is a proposal. Codex is responsible for:
-#   1. Reserving the SGi network and IP (proposed 10.77.16.30/24,
+# Production activation requires a distinct authorization covering:
+#   1. Reserving the SGi network and IP (10.77.16.30/24,
 #      next-hop 10.77.16.15).
 #   2. Promoting the offline-certified image without changing its digest.
 #      The image MUST include iproute2, iputils-ping and iperf3; if a
@@ -12,9 +12,9 @@
 #   3. Installing the 10.45.0.0/16 return route into the oiran-lab-sgi
 #      bridge; the sidecar does not configure routing by itself.
 #
-# Until these three items are confirmed, the matching drop-in
-# (lte-sgi/polaris-control-lte-sgi.conf) stays commented and every
-# LTE traffic step fails closed at preflight.
+# The matching drop-in contains the offline-validated values but is not
+# installed by this release candidate. Until an authorized installation,
+# production remains unchanged and LTE traffic preflight stays fail-closed.
 # ===================================================================
 
 services:

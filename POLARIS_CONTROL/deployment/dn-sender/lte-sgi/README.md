@@ -1,7 +1,8 @@
-# LTE SGi DN sidecar — candidate definition
+# LTE SGi DN sidecar — offline-certified release candidate
 
-This directory contains **candidate** artifacts for the dedicated LTE SGi DN
-sender. Nothing in this directory may be deployed verbatim.
+This directory contains the offline-certified artifacts for the dedicated LTE
+SGi DN sender. Production activation still requires an explicit authorization,
+fresh backups and the documented rollback checks.
 
 ## Scope
 
@@ -34,8 +35,11 @@ so the sidecar can be prepared without any production impact.
 
 | File | Purpose |
 | --- | --- |
-| `compose.yaml` | Compose service definition for the SGi DN sidecar. **Image is `pending@sha256:0…0`** — Codex must pin the real digest before activation. |
-| `polaris-control-lte-sgi.conf` | systemd drop-in with the four required env vars for the LTE path, **all commented out**. Codex un-comments and sets after reservation. |
+| `Dockerfile` | Reproducible minimal image recipe with pinned base and package versions. |
+| `compose.yaml` | Digest-pinned SGi-only sidecar definition with interface `sgi_lte`. |
+| `configure-route.sh` | Verifies container identity/digest and installs the exact return route. |
+| `polaris-control-lte-sgi.conf` | Staging drop-in with the validated LTE SGi values. |
+| `polaris-lte-sgi.service` | Bounded lifecycle and rollback unit for the sidecar. |
 
 ## Hardening
 
@@ -45,17 +49,15 @@ so the sidecar can be prepared without any production impact.
 - No volume mounts; no host network; no raw PCAP access.
 - Healthcheck verifies the 10.45.0.0/16 return route is installed.
 
-## Codex checklist before activation
+## Checklist before authorized activation
 
 1. Reserve the SGi network `oiran-lab-sgi` and the IP `10.77.16.30/24` (or
    alternative — update `POLARIS_LTE_TRAFFIC_PEER_IP` and the compose network
    accordingly).
 2. Confirm/replace the PGW-U LTE next-hop `10.77.16.15` for the
    `10.45.0.0/16` return route.
-3. Build or receive a dedicated LTE SGi DN image containing `iproute2`,
-   `iputils-ping`, `iperf3`, and nothing extraneous. Pin its digest. Record
-   it as `SIDE_CAR_IMAGE_DIGEST` in the next mission report.
-4. Un-comment the four `Environment=` lines in
-   `polaris-control-lte-sgi.conf` with the confirmed values.
+3. Load or promote the certified image without changing digest
+   `sha256:e60eb72bf7619fd049f6bbbc45cf06927eb73ed7c613446678644f6742af31f3`.
+4. Verify the staged drop-in against the authorized release manifest.
 5. Deploy under a separate maintenance window; this is **not** performed by
    the POLARIS release itself.
