@@ -229,8 +229,11 @@ test('S4.2 Probe Manager displays measured fail-closed disk safety', async ({ pa
   const response = await page.request.get('/api/v1/storage/safety');
   const body = await response.json();
   await expect(page.getByText('Capture engine').locator('..').getByText(body.data.capture_job.state, { exact: true })).toBeVisible();
-  expect(body.data.policy.stop_percent).toBe(85);
-  expect(body.data.policy.hard_limit_percent).toBe(90);
+  expect(body.data.policy.information_percent).toBe(95);
+  expect(body.data.policy.warning_percent).toBe(97);
+  expect(body.data.policy.stop_percent).toBe(98);
+  expect(body.data.policy.hard_limit_percent).toBe(98);
+  expect(body.data.policy.reserve_bytes).toBe(8 * 1024 * 1024 * 1024);
   expect(typeof body.data.capture_job.writes_enabled).toBe('boolean');
 });
 

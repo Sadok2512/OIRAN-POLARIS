@@ -5232,7 +5232,7 @@ mod tests {
     }
 
     /// The continuous-import pipeline refuses new captures when the host
-    /// filesystem is at or above the 85% utilisation threshold (disk-safety
+    /// filesystem cannot fit the bounded write below the 98% ceiling and 8 GiB reserve (disk-safety
     /// `StopNewCaptures` state). Tests that drive a real
     /// `start_continuous_import` therefore need the test host to be under
     /// that threshold; `TMPDIR` and `/tmp` sitting on a near-full `/` is a

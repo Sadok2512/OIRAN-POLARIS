@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.29.1 (polaris-control-api) / safety-guard 0.2.0 / web 3.2.3 — 2026-11-02 — 98% disk ceiling
+
+- Replaces the legacy 80/85/90 percentage blockers with 95% information,
+  97% warning and a fail-closed 98% hard ceiling.
+- Preserves an 8 GiB absolute free-space reserve and rejects an operation when
+  its projected write budget cannot fit below both the ceiling and reserve.
+- Keeps measurement failure, inode exhaustion, ENOSPC and unexpected growth
+  fail-closed while leaving Stop, cleanup and read-only inspection available.
+- Applies the same budget decision to LTE and generic scenario start gates and
+  reports the estimate, maximum admitted budget and reserve in gate evidence.
+
 ## 0.29.0 (polaris-control-api) — 2026-11-01 — real LTE evidence finalizer
 
 - Adds the Operator+CSRF protected `evidence-finalize` boundary that consumes

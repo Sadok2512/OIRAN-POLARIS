@@ -4321,8 +4321,11 @@ mod tests {
         assert!(value["data"]["filesystem"]["total_bytes"].as_u64().unwrap() > 0);
         assert_eq!(value["data"]["capture_job"]["active"], false);
         assert_eq!(value["data"]["capture_job"]["writes_enabled"], false);
-        assert_eq!(value["data"]["policy"]["stop_percent"], 85);
-        assert_eq!(value["data"]["policy"]["hard_limit_percent"], 90);
+        assert_eq!(value["data"]["policy"]["information_percent"], 95);
+        assert_eq!(value["data"]["policy"]["warning_percent"], 97);
+        assert_eq!(value["data"]["policy"]["stop_percent"], 98);
+        assert_eq!(value["data"]["policy"]["hard_limit_percent"], 98);
+        assert_eq!(value["data"]["policy"]["reserve_bytes"], 8 * 1024 * 1024 * 1024_u64);
     }
 
     #[tokio::test]

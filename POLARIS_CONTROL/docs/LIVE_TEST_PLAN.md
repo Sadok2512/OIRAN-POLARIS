@@ -9,4 +9,4 @@
 7. Gracefully stop only the exact owned UE handle with a timeout.
 8. Record audit history and revalidate all protected services.
 
-Maximum intended duration: 5 minutes. Abort on disk monitor failure, >=85% affected filesystem use, memory/CPU pressure, lifecycle ambiguity, or any protected-service degradation. Rollback stops only the registered owned process; it never uses broad process matching.
+Maximum intended duration: 5 minutes. Abort on disk monitor failure, a projected write that could reach 98% or consume the 8 GiB reserve, inode/ENOSPC pressure, memory/CPU pressure, lifecycle ambiguity, or any protected-service degradation. Rollback stops only the registered owned process; it never uses broad process matching.

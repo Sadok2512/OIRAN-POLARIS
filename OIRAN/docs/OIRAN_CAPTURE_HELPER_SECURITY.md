@@ -14,7 +14,7 @@ The API drop-in explicitly clears ambient and bounding capabilities. Neither ser
 
 - Helper writes are confined to `/var/lib/oiran/captures`.
 - API access is through membership in the dedicated `oiran-capture` group.
-- PCAP files use a global reserved budget, bounded rotation, duration limit, and continuous 75/80/85/90 disk policy.
+- PCAP files use a global reserved budget, bounded rotation, duration limit, continuous 95/97/98 monitoring, and an 8 GiB absolute free-space reserve.
 - PCAP manifests are finalized with an atomic rename and contain SHA-256 checksums.
 - Certified historical datasets remain outside the helper write path.
 - There is no automatic cleanup.

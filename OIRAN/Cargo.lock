@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "disk-safety"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "serde",
@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.7.4"
+version = "2.7.5"
 dependencies = [
  "axum",
  "callflow-renderer",

@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::{ffi::CString, path::Path};
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Policy {
@@ -17,11 +18,11 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            information: 75,
-            warning: 80,
-            stop: 85,
-            hard: 90,
-            reserve_bytes: 32 * MIB,
+            information: 95,
+            warning: 97,
+            stop: 98,
+            hard: 98,
+            reserve_bytes: 8 * GIB,
             max_scenario_bytes: 2 * 1024 * MIB,
             poll_ms: 1_000,
         }
@@ -144,10 +145,10 @@ mod tests {
             max_scenario_bytes: 100 * MIB,
             ..Policy::default()
         };
-        assert_eq!(evaluate(at(75), p).state, State::Information);
-        assert_eq!(evaluate(at(80), p).state, State::Warning);
-        assert_eq!(evaluate(at(85), p).state, State::StopNewWrites);
-        assert_eq!(evaluate(at(90), p).state, State::HardLimit)
+        assert_eq!(evaluate(at(94), p).state, State::Normal);
+        assert_eq!(evaluate(at(95), p).state, State::Information);
+        assert_eq!(evaluate(at(97), p).state, State::Warning);
+        assert_eq!(evaluate(at(98), p).state, State::HardLimit)
     }
     #[test]
     fn monitor_failure_is_closed() {
@@ -162,6 +163,41 @@ mod tests {
             max_scenario_bytes: 50 * MIB,
             ..Policy::default()
         };
-        assert_eq!(evaluate(at(80), p).maximum_budget_bytes, 3 * MIB)
+        assert_eq!(evaluate(at(90), p).maximum_budget_bytes, 6 * MIB)
+    }
+
+    #[test]
+    fn legacy_thresholds_do_not_block_when_budget_and_reserve_fit() {
+        let p = Policy {
+            reserve_bytes: MIB,
+            max_scenario_bytes: 10 * MIB,
+            ..Policy::default()
+        };
+        for used_percent in [80, 85, 90] {
+            let decision = evaluate(at(used_percent), p);
+            assert!(decision.writes_allowed, "{used_percent}% must not block");
+            assert_eq!(decision.state, State::Normal);
+        }
+    }
+
+    #[test]
+    fn projected_budget_and_absolute_reserve_fail_closed_before_98_percent() {
+        let p = Policy {
+            reserve_bytes: 2 * MIB,
+            max_scenario_bytes: 50 * MIB,
+            ..Policy::default()
+        };
+        let decision = evaluate(at(97), p);
+        assert_eq!(decision.state, State::Warning);
+        assert!(!decision.writes_allowed);
+        assert_eq!(decision.maximum_budget_bytes, 0);
+    }
+
+    #[test]
+    fn inode_exhaustion_and_measurement_failure_remain_closed() {
+        let mut sample = at(50).unwrap();
+        sample.available_inodes = 16;
+        assert!(!evaluate(Ok(sample), Policy::default()).writes_allowed);
+        assert!(!evaluate(Err("ENOSPC".into()), Policy::default()).writes_allowed);
     }
 }

@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::path::Path;
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Policy {
@@ -24,16 +25,16 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            information_percent: 75,
-            warning_percent: 80,
-            stop_percent: 85,
-            hard_limit_percent: 90,
+            information_percent: 95,
+            warning_percent: 97,
+            stop_percent: 98,
+            hard_limit_percent: 98,
             max_file_bytes: 256 * MIB,
             max_files: 8,
             max_job_seconds: 15 * 60,
             max_concurrent_jobs: 1,
             polling_interval_ms: 1_000,
-            reserve_bytes: 32 * MIB,
+            reserve_bytes: 8 * GIB,
         }
     }
 }
@@ -135,11 +136,17 @@ impl CaptureGuard {
         if !self.active {
             return Err("capture guard is finalized".into());
         }
-        let decision = assess(sample, self.policy);
-        if !decision.new_capture_allowed || bytes > self.remaining_budget_bytes {
+        let decision = assess(sample.clone(), self.policy);
+        let current_budget = capture_budget(sample, bytes, self.policy);
+        if !decision.new_capture_allowed
+            || !current_budget.allowed
+            || bytes > self.remaining_budget_bytes
+        {
             self.active = false;
             self.final_reason = Some(if bytes > self.remaining_budget_bytes {
                 "reserved write budget exhausted".into()
+            } else if !current_budget.allowed {
+                current_budget.reason
             } else {
                 decision.reason
             });
@@ -238,7 +245,7 @@ pub fn capture_budget(
         headroom_to_stop_bytes: headroom,
         reserved_bytes: policy.reserve_bytes,
         reason: if allowed {
-            "bounded write budget accepted below the 85% stop threshold".into()
+            "bounded write budget accepted below the 98% hard ceiling with reserve".into()
         } else {
             "capture rejected: threshold, inode, or reserved-budget requirement not met".into()
         },
@@ -291,11 +298,10 @@ mod tests {
     #[test]
     fn thresholds_are_exact_and_fail_closed() {
         let policy = Policy::default();
-        assert_eq!(assess(at(74), policy).state, SafetyState::Normal);
-        assert_eq!(assess(at(75), policy).state, SafetyState::Information);
-        assert_eq!(assess(at(80), policy).state, SafetyState::Warning);
-        assert_eq!(assess(at(85), policy).state, SafetyState::StopNewCaptures);
-        assert_eq!(assess(at(90), policy).state, SafetyState::DiskHardLimit);
+        assert_eq!(assess(at(94), policy).state, SafetyState::Normal);
+        assert_eq!(assess(at(95), policy).state, SafetyState::Information);
+        assert_eq!(assess(at(97), policy).state, SafetyState::Warning);
+        assert_eq!(assess(at(98), policy).state, SafetyState::DiskHardLimit);
         let failed = assess(Err("monitor failed".into()), policy);
         assert_eq!(failed.state, SafetyState::MeasurementFailed);
         assert!(!failed.new_capture_allowed);
@@ -311,8 +317,23 @@ mod tests {
             ..Policy::default()
         };
         assert!(capture_budget(at(70), 10 * MIB, policy).allowed);
-        assert!(!capture_budget(at(84), MIB, policy).allowed);
+        assert!(!capture_budget(at(97), MIB, policy).allowed);
         assert!(!capture_budget(at(70), 21 * MIB, policy).allowed);
+    }
+
+    #[test]
+    fn legacy_thresholds_do_not_block_bounded_captures() {
+        let policy = Policy {
+            reserve_bytes: MIB,
+            max_file_bytes: 10 * MIB,
+            max_files: 2,
+            ..Policy::default()
+        };
+        for used_percent in [80, 85, 90] {
+            let decision = assess(at(used_percent), policy);
+            assert_eq!(decision.state, SafetyState::Normal);
+            assert!(capture_budget(at(used_percent), MIB, policy).allowed);
+        }
     }
 
     #[test]
@@ -323,7 +344,11 @@ mod tests {
             total_inodes: 100,
             available_inodes: 2,
         };
-        assert!(!capture_budget(Ok(sample), MIB, Policy::default()).allowed);
+        let policy = Policy {
+            reserve_bytes: 0,
+            ..Policy::default()
+        };
+        assert!(!capture_budget(Ok(sample), MIB, policy).allowed);
     }
 
     #[test]
@@ -336,11 +361,9 @@ mod tests {
 
     #[test]
     fn stop_and_hard_limit_preserve_read_only_analysis() {
-        for percent in [85, 90] {
-            let decision = assess(at(percent), Policy::default());
-            assert!(decision.active_capture_must_finalize);
-            assert!(decision.read_only_analysis_allowed);
-        }
+        let decision = assess(at(98), Policy::default());
+        assert!(decision.active_capture_must_finalize);
+        assert!(decision.read_only_analysis_allowed);
     }
 
     #[test]
@@ -352,8 +375,8 @@ mod tests {
             ..Policy::default()
         };
         let mut guard = CaptureGuard::start(at(70), 10 * MIB, policy).unwrap();
-        guard.authorize_write(MIB, at(80)).unwrap();
-        assert!(guard.authorize_write(MIB, at(85)).is_err());
+        guard.authorize_write(MIB, at(90)).unwrap();
+        assert!(guard.authorize_write(MIB, at(98)).is_err());
         assert!(!guard.is_active());
         let mut guard = CaptureGuard::start(at(70), 10 * MIB, policy).unwrap();
         assert!(guard

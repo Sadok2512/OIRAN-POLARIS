@@ -6068,7 +6068,11 @@ fn lte_start_resource_gate(state: &AppState) -> Result<Value, String> {
     }
     let disk = measure(&state.storage_path).map_err(|_| "DISK_MONITOR_FAILURE".to_string())?;
     let usage = disk.basis_points().unwrap_or(10_000);
-    if usage >= 8_500 {
+    let disk_decision = evaluate(Ok(disk), Policy::default());
+    const LTE_ESTIMATED_WRITE_BYTES: u64 = 256 * 1024 * 1024;
+    if !disk_decision.writes_allowed
+        || disk_decision.maximum_budget_bytes < LTE_ESTIMATED_WRITE_BYTES
+    {
         return Err("DISK_STOP_THRESHOLD".into());
     }
     let memory = memory_stats();
@@ -6079,6 +6083,9 @@ fn lte_start_resource_gate(state: &AppState) -> Result<Value, String> {
     }
     Ok(json!({
         "disk_usage_percent":f64::from(usage)/100.0,
+        "disk_estimated_write_bytes":LTE_ESTIMATED_WRITE_BYTES,
+        "disk_maximum_budget_bytes":disk_decision.maximum_budget_bytes,
+        "disk_reserve_bytes":Policy::default().reserve_bytes,
         "memory_used_bytes":used,
         "memory_used_max_bytes":17_179_869_184_u64,
         "memory_available_bytes":available,
@@ -11188,7 +11195,11 @@ fn resource_gate_for_budget(
     }
     let disk = measure(&state.storage_path).map_err(|_| "DISK_MONITOR_FAILURE".to_string())?;
     let usage = disk.basis_points().unwrap_or(10_000);
-    if usage >= 8_500 {
+    let disk_decision = evaluate(Ok(disk), Policy::default());
+    let estimated_write_bytes = budget.storage_bytes.max(1);
+    if !disk_decision.writes_allowed
+        || disk_decision.maximum_budget_bytes < estimated_write_bytes
+    {
         return Err("DISK_STOP_THRESHOLD".into());
     }
     let memory = memory_stats();
@@ -11224,7 +11235,7 @@ fn resource_gate_for_budget(
         }
     }
     Ok(
-        json!({"disk_usage_percent":f64::from(usage)/100.0,"memory_available_bytes":memory["available_bytes"],"cpu_safety":cpu}),
+        json!({"disk_usage_percent":f64::from(usage)/100.0,"disk_estimated_write_bytes":estimated_write_bytes,"disk_maximum_budget_bytes":disk_decision.maximum_budget_bytes,"disk_reserve_bytes":Policy::default().reserve_bytes,"memory_available_bytes":memory["available_bytes"],"cpu_safety":cpu}),
     )
 }
 

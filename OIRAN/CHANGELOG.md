@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.7.5 / disk-safety 0.2.0 — 2026-11-02
+
+- Replaces the legacy 75/80/85/90 capture policy with 95% information, 97%
+  warning and a fail-closed 98% hard ceiling.
+- Requires every projected capture budget to fit below the ceiling while
+  retaining an 8 GiB absolute free-space reserve.
+- Retains inode, measurement, ENOSPC, rotation and unexpected-growth guards;
+  Stop, cleanup and read-only analysis remain available at the ceiling.
+
 ## OIRAN API 2.7.4 / Live Probe 0.4.2 — 2026-11-01
 
 - Imports approved evidence from clean terminal failed/cancelled LTE runs as
