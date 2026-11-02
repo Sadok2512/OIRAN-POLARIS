@@ -19,11 +19,11 @@ const ENV_FILE: &str = "/root/POLARIS/compose/versions.env";
 const UE_CONFIG: &str = "/root/POLARIS/runtime/srsran/ue.conf";
 const LEDGER: &str = "/var/lib/polaris-control/srsran-ownership.json";
 pub const CERTIFIED_IMAGE_REFERENCE: &str =
-    "oiran/srsran4g@sha256:69e094349657cc6a062ce3717661d6b8a553a23ce571f821e33256beec753d43";
+    "oiran/srsran4g-ue-tools:0.29.4-rc1";
 pub const CERTIFIED_IMAGE_ID: &str =
-    "sha256:69e094349657cc6a062ce3717661d6b8a553a23ce571f821e33256beec753d43";
+    "sha256:218e848bd8cb59532d8cce9dcef8d6370944abd35b9b25aea9041671681e4d04";
 pub const CERTIFIED_COMPOSE_MODEL_SHA256: &str =
-    "308053a274844259c16da7751708b39e6559cfec2b8d958dc4fcafebecd0da19";
+    "d0c80ea193272fc85b9afc8abc78d521ffc08e5581cf49894160c5bf78935f5d";
 const PROFILE_CONFIGS: [&str; 5] = [
     "/root/POLARIS/runtime/srsran/ue.conf",
     "/root/POLARIS/config/srsran/enb.conf",
