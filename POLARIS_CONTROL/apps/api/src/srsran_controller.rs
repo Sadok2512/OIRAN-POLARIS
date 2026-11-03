@@ -16,20 +16,23 @@ const PROJECT: &str = "oiran-lab";
 const LTE_PROFILE: &str = "lte";
 const COMPOSE: &str = "/root/POLARIS/compose/docker-compose.oiran-lab.yml";
 const ENV_FILE: &str = "/root/POLARIS/compose/versions.env";
+const COMPOSE_0298_OVERRIDE: &str = "/root/POLARIS/compose/docker-compose.polaris-0.29.8.yml";
 const UE_CONFIG: &str = "/root/POLARIS/runtime/srsran/ue.conf";
 const ENB_CONFIG: &str = "/root/POLARIS/config/srsran/enb.conf";
 const LEDGER: &str = "/var/lib/polaris-control/srsran-ownership.json";
-pub const CERTIFIED_IMAGE_REFERENCE: &str =
-    "oiran/srsran4g-ue-tools:0.29.6-rc1";
+pub const CERTIFIED_IMAGE_REFERENCE: &str = "oiran/srsran4g-ue-tools:0.29.6-rc1";
 pub const CERTIFIED_IMAGE_ID: &str =
     "sha256:aab719ffdfa518777ed3d197ffe02cdcef02f78f578095d9abb1da9f327db2a5";
+pub const CERTIFIED_DN_IMAGE_REFERENCE: &str =
+    "polaris-lte-sgi-dn@sha256:e60eb72bf7619fd049f6bbbc45cf06927eb73ed7c613446678644f6742af31f3";
 pub const CERTIFIED_COMPOSE_MODEL_SHA256: &str =
-    "1e93feba4b3511f1c46ee27e63175c0ce5be2125f9b11af65c27f670f24b3ed1";
-const PROFILE_CONFIGS: [&str; 5] = [
+    "fe1c35f7c4c306241fd56ff9e26a3d00f85db717e44e12f5b6cf90b608a97dd0";
+const PROFILE_CONFIGS: [&str; 6] = [
     "/root/POLARIS/runtime/srsran/ue.conf",
     "/root/POLARIS/config/srsran/enb.conf",
     "/root/POLARIS/config/srsran/rr.conf",
     COMPOSE,
+    COMPOSE_0298_OVERRIDE,
     ENV_FILE,
 ];
 
@@ -159,26 +162,37 @@ pub struct PingMeasurement {
 }
 #[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
 pub struct EnbRuntimeEvidence {
-    pub gtp_bind_addr: Option<String>, pub s1c_bind_addr: Option<String>,
-    pub networks: BTreeMap<String, String>, pub s1u_network_present: bool,
-    pub ul_bitrate: Option<String>, pub dl_bitrate: Option<String>,
+    pub gtp_bind_addr: Option<String>,
+    pub s1c_bind_addr: Option<String>,
+    pub networks: BTreeMap<String, String>,
+    pub s1u_network_present: bool,
+    pub ul_bitrate: Option<String>,
+    pub dl_bitrate: Option<String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
 pub struct PingRuntimeEvidence {
-    pub ping: CommandDiagnostic, pub ue_link: CommandDiagnostic,
-    pub ue_routes: CommandDiagnostic, pub srsue_log_tail: CommandDiagnostic,
-    pub srsenb_log_tail: CommandDiagnostic, pub enb: EnbRuntimeEvidence,
+    pub ping: CommandDiagnostic,
+    pub ue_link: CommandDiagnostic,
+    pub ue_routes: CommandDiagnostic,
+    pub srsue_log_tail: CommandDiagnostic,
+    pub srsenb_log_tail: CommandDiagnostic,
+    pub enb: EnbRuntimeEvidence,
     pub enb_link_counters: BTreeMap<String, CommandDiagnostic>,
     pub container_image_ids: BTreeMap<String, String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
 pub struct PingOperation {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub measurement: Option<PingMeasurement>, pub evidence: PingRuntimeEvidence,
+    pub measurement: Option<PingMeasurement>,
+    pub evidence: PingRuntimeEvidence,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
 }
-impl PingOperation { pub fn succeeded(&self) -> bool { self.error_code.is_none() && self.measurement.is_some() } }
+impl PingOperation {
+    pub fn succeeded(&self) -> bool {
+        self.error_code.is_none() && self.measurement.is_some()
+    }
+}
 
 /// 0.29.7: metadata about the full sanitized `docker logs` of one container
 /// persisted on the host **before** the cleanup drops the container. The
@@ -193,7 +207,12 @@ pub struct FullLogRecord {
     pub sha256: String,
     /// Sanitized tail (last 512 UTF-8 bytes, same bound as the other
     /// evidence streams). The full stream lives in the file.
+    #[serde(skip)]
     pub sanitized_tail: String,
+    /// Private RRC/PDCP/RLC extract, bounded to the final 4096 UTF-8 bytes.
+    pub rrc_path: String,
+    pub rrc_bytes: u64,
+    pub rrc_sha256: String,
     pub persisted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
@@ -312,8 +331,14 @@ pub trait SrsranRuntime: Send + Sync {
     fn ping(&self, direction: &str, packets: u32) -> Result<PingMeasurement, String>;
     fn ping_with_evidence(&self, direction: &str, packets: u32) -> PingOperation {
         match self.ping(direction, packets) {
-            Ok(measurement) => PingOperation { measurement: Some(measurement), ..PingOperation::default() },
-            Err(error_code) => PingOperation { error_code: Some(error_code), ..PingOperation::default() },
+            Ok(measurement) => PingOperation {
+                measurement: Some(measurement),
+                ..PingOperation::default()
+            },
+            Err(error_code) => PingOperation {
+                error_code: Some(error_code),
+                ..PingOperation::default()
+            },
         }
     }
     /// Remove only sidecars carrying the exact run label, then prove none remain.
@@ -377,55 +402,131 @@ fn bounded_diagnostic(output: &Output) -> CommandDiagnostic {
     }
 }
 fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes { return value.to_string(); }
-    let mut end = max_bytes; while !value.is_char_boundary(end) { end -= 1; }
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
     value[..end].to_string()
 }
 fn truncate_utf8_tail(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes { return value.to_string(); }
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
     let mut start = value.len() - max_bytes;
-    while !value.is_char_boundary(start) { start += 1; }
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
     value[start..].to_string()
 }
 fn useful_lte_log_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    ["gtpu", "gtp", "rlc", "pdcp", "rrc", "error", "warn", "drop", "bitrate", "tun"]
-        .iter().any(|marker| lower.contains(marker))
+    [
+        "gtpu", "gtp", "rlc", "pdcp", "rrc", "error", "warn", "drop", "bitrate", "tun",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 fn bounded_filtered_log_diagnostic(output: &Output) -> CommandDiagnostic {
     let filter = |value: &str| {
-        let useful = value.lines().filter_map(sanitize_log_line)
-            .filter(|line| useful_lte_log_line(line)).collect::<Vec<_>>().join("\n");
+        let useful = value
+            .lines()
+            .filter_map(sanitize_log_line)
+            .filter(|line| useful_lte_log_line(line))
+            .collect::<Vec<_>>()
+            .join("\n");
         truncate_utf8_tail(&useful, 512)
     };
-    CommandDiagnostic { exit_code: output.code, stdout: filter(&output.stdout), stderr: filter(&output.stderr) }
+    CommandDiagnostic {
+        exit_code: output.code,
+        stdout: filter(&output.stdout),
+        stderr: filter(&output.stderr),
+    }
 }
 fn interface_for_ipv4(output: &str, address: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let fields = line.split_whitespace().collect::<Vec<_>>();
         let inet = fields.iter().position(|field| *field == "inet")?;
         let observed = fields.get(inet + 1)?.split('/').next()?;
-        if observed == address { fields.get(1).map(|field| field.trim_end_matches(':').to_string()) } else { None }
+        if observed == address {
+            fields
+                .get(1)
+                .map(|field| field.trim_end_matches(':').to_string())
+        } else {
+            None
+        }
     })
 }
 fn classify_ping_output(direction: &str, output: &Output) -> Result<(), String> {
-    if direction == "dl" { classify_dn_container_exit(output.code, &output.stderr) } else { Ok(()) }
+    if direction == "dl" {
+        classify_dn_container_exit(output.code, &output.stderr)
+    } else {
+        Ok(())
+    }
 }
-fn failed_diagnostic(error: &str) -> CommandDiagnostic { CommandDiagnostic { exit_code: 125, stdout: String::new(), stderr: truncate_utf8_bytes(error, 512) } }
+fn failed_diagnostic(error: &str) -> CommandDiagnostic {
+    CommandDiagnostic {
+        exit_code: 125,
+        stdout: String::new(),
+        stderr: truncate_utf8_bytes(error, 512),
+    }
+}
 fn parse_enb_bind_config(contents: &str) -> (Option<String>, Option<String>) {
-    let value = |key: &str| contents.lines().find_map(|line| { let line = line.split('#').next()?.trim(); let (name, value) = line.split_once('=')?; (name.trim() == key).then(|| value.trim().trim_matches('"').to_string()).filter(|value| value.parse::<std::net::Ipv4Addr>().is_ok()) });
+    let value = |key: &str| {
+        contents.lines().find_map(|line| {
+            let line = line.split('#').next()?.trim();
+            let (name, value) = line.split_once('=')?;
+            (name.trim() == key)
+                .then(|| value.trim().trim_matches('"').to_string())
+                .filter(|value| value.parse::<std::net::Ipv4Addr>().is_ok())
+        })
+    };
     (value("gtp_bind_addr"), value("s1c_bind_addr"))
 }
 fn parse_docker_networks(contents: &str) -> BTreeMap<String, String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(contents.trim()) else { return BTreeMap::new(); };
-    value.as_object().into_iter().flat_map(|networks| networks.iter()).filter_map(|(name, config)| { let address = config.get("IPAddress")?.as_str()?; address.parse::<std::net::Ipv4Addr>().ok().map(|_| (name.clone(), address.to_string())) }).collect()
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(contents.trim()) else {
+        return BTreeMap::new();
+    };
+    value
+        .as_object()
+        .into_iter()
+        .flat_map(|networks| networks.iter())
+        .filter_map(|(name, config)| {
+            let address = config.get("IPAddress")?.as_str()?;
+            address
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+                .map(|_| (name.clone(), address.to_string()))
+        })
+        .collect()
 }
 fn parse_enb_bitrates(logs: &str) -> (Option<String>, Option<String>) {
-    let (mut ul, mut dl) = (None, None); for line in logs.lines().filter_map(sanitize_log_line) { let lower = line.to_ascii_lowercase(); if lower.contains("bitrate") || lower.contains("bit/s") || lower.contains("bps") { if lower.contains("ul") { ul = Some(truncate_utf8_bytes(&line, 512)); } if lower.contains("dl") { dl = Some(truncate_utf8_bytes(&line, 512)); } } } (ul, dl)
+    let (mut ul, mut dl) = (None, None);
+    for line in logs.lines().filter_map(sanitize_log_line) {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("bitrate") || lower.contains("bit/s") || lower.contains("bps") {
+            if lower.contains("ul") {
+                ul = Some(truncate_utf8_bytes(&line, 512));
+            }
+            if lower.contains("dl") {
+                dl = Some(truncate_utf8_bytes(&line, 512));
+            }
+        }
+    }
+    (ul, dl)
 }
 fn parse_ping_measurement(stdout: &str) -> Option<PingMeasurement> {
-    let values = stdout.lines().find(|line| line.contains("packets transmitted"))?.split(',').collect::<Vec<_>>();
-    Some(PingMeasurement { sent: values.first()?.split_whitespace().next()?.parse().ok()?, received: values.get(1)?.split_whitespace().next()?.parse().ok()? })
+    let values = stdout
+        .lines()
+        .find(|line| line.contains("packets transmitted"))?
+        .split(',')
+        .collect::<Vec<_>>();
+    Some(PingMeasurement {
+        sent: values.first()?.split_whitespace().next()?.parse().ok()?,
+        received: values.get(1)?.split_whitespace().next()?.parse().ok()?,
+    })
 }
 
 fn lte_ul_route_install_args(container_id: &str, peer: std::net::Ipv4Addr) -> Vec<String> {
@@ -495,12 +596,14 @@ pub const DN_SGI_SERVICE_EXEC_SPEC: ContainerExecSpec = ContainerExecSpec {
 pub const EXEC_PREFLIGHT_SCRIPT: &str = "ping -c1 -W1 127.0.0.1 && iperf3 --version";
 
 pub fn ue_tooling_exec_args(image_reference: &str, spec: &ContainerExecSpec) -> Vec<String> {
-    let mut args: Vec<String> = vec!["run".into(), "--rm".into(), "--network".into(), "none".into()];
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "--network".into(),
+        "none".into(),
+    ];
     if spec.no_new_privileges {
-        args.extend([
-            "--security-opt".into(),
-            "no-new-privileges:true".into(),
-        ]);
+        args.extend(["--security-opt".into(), "no-new-privileges:true".into()]);
     }
     if spec.read_only {
         args.push("--read-only".into());
@@ -552,25 +655,13 @@ pub fn classify_tooling_exec(
 // ---------------------------------------------------------------------------
 
 /// Markers the eNB stdout emits when it finishes the Initial Context Setup
-/// procedure (S1AP procedure 9 successfulOutcome). We accept several
-/// alternative spellings because logging formats vary between versions.
-const ICS_RESPONSE_LOG_MARKERS: &[&str] = &[
-    "initialcontextsetupresponse",
-    "initial context setup response",
-    "ics response",
-    "e-rab setup response",
-    "erab setup response",
-    "e_rab setup response",
-];
+/// procedure (S1AP procedure 9 successfulOutcome). This exact string is
+/// emitted by srsRAN 25.10 `s1ap.cc` through `sctp_send_s1ap_pdu`.
+const ICS_RESPONSE_LOG_MARKERS: &[&str] = &["tx s1ap sdu, initialcontextsetupresponse"];
 
-/// Markers the MME emits for the S11 Modify Bearer Response (GTPv2 type 35).
-const MODIFY_BEARER_RESPONSE_MARKERS: &[&str] = &[
-    "modify bearer response",
-    "modifybearerresponse",
-    "mbr response",
-    "gtpv2 message type 35",
-    "message type 35",
-];
+/// Exact info-level marker emitted by Open5GS SGW-C `s5c-handler.c` after
+/// receiving the S11/S5-C Modify Bearer Response. The MME is not the source.
+const MODIFY_BEARER_RESPONSE_MARKERS: &[&str] = &["modify bearer response"];
 
 /// Count occurrences of any of `markers` across the sanitized log lines.
 fn count_markers(logs: &str, markers: &[&str]) -> u32 {
@@ -592,7 +683,7 @@ fn count_markers(logs: &str, markers: &[&str]) -> u32 {
 /// - at least one srsENB-side marker that an Initial Context Setup Response
 ///   (S1AP procedure 9 successfulOutcome, E-RAB id 5 in the certified
 ///   profile) was emitted;
-/// - at least one MME-side marker that a Modify Bearer Response (S11
+/// - at least one SGW-C-side marker that a Modify Bearer Response (S11
 ///   GTPv2-C type 35) was emitted.
 ///
 /// Returns `Ok(evidence)` on success, `Err(("LTE_ERAB_NOT_ESTABLISHED",
@@ -600,10 +691,10 @@ fn count_markers(logs: &str, markers: &[&str]) -> u32 {
 /// bounded.
 pub fn evaluate_erab_establishment(
     srsenb_logs: &str,
-    mme_logs: &str,
+    sgwc_logs: &str,
 ) -> Result<ErabEstablishmentEvidence, (String, ErabEstablishmentEvidence)> {
     let ics_markers = count_markers(srsenb_logs, ICS_RESPONSE_LOG_MARKERS);
-    let mbr_markers = count_markers(mme_logs, MODIFY_BEARER_RESPONSE_MARKERS);
+    let mbr_markers = count_markers(sgwc_logs, MODIFY_BEARER_RESPONSE_MARKERS);
     let ics_ok = ics_markers > 0;
     let mbr_ok = mbr_markers > 0;
     let summary = truncate_utf8_tail(
@@ -655,16 +746,8 @@ pub fn ip_s_link_args(container_id: &str) -> Vec<String> {
 /// `sanitize_log_line` before being considered for the bounded tail. The
 /// SHA256 is computed over the sanitised stream so the digest matches what
 /// the host writes to disk.
-pub fn build_full_log_record(
-    component: &str,
-    path: &str,
-    raw_logs: &str,
-) -> FullLogRecord {
-    let sanitized = raw_logs
-        .lines()
-        .filter_map(sanitize_log_line)
-        .collect::<Vec<_>>()
-        .join("\n");
+pub fn build_full_log_record(component: &str, path: &str, raw_logs: &str) -> FullLogRecord {
+    let sanitized = sanitize_log_stream(raw_logs);
     let sanitized_tail = truncate_utf8_tail(&sanitized, 512);
     let bytes = sanitized.len() as u64;
     let sha256 = format!("{:x}", Sha256::digest(sanitized.as_bytes()));
@@ -674,9 +757,32 @@ pub fn build_full_log_record(
         bytes,
         sha256,
         sanitized_tail,
+        rrc_path: format!("{path}.rrc"),
+        rrc_bytes: 0,
+        rrc_sha256: String::new(),
         persisted: false,
         error_code: None,
     }
+}
+
+fn bounded_sanitized_log(raw: &str) -> String {
+    truncate_utf8_tail(&sanitize_log_stream(raw), 5 * 1024 * 1024 - 1)
+}
+
+fn build_rrc_extract(sanitized: &str) -> String {
+    truncate_utf8_tail(
+        &sanitized
+            .lines()
+            .filter(|line| {
+                let lower = line.to_ascii_lowercase();
+                ["[rrc", "[pdcp", "[rlc", "srb1", "s1ap"]
+                    .iter()
+                    .any(|marker| lower.contains(marker))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        4096,
+    )
 }
 
 /// 0.29.3: LTE DN sender container name is deployment-specified and must NOT
@@ -758,8 +864,12 @@ fn after_token(line: &str, key: &str) -> Option<String> {
 
 fn parse_cidr_v4(cidr: &str) -> Result<(std::net::Ipv4Addr, u32), String> {
     let (net, prefix) = cidr.split_once('/').ok_or("missing /")?;
-    let net = net.parse::<std::net::Ipv4Addr>().map_err(|e| e.to_string())?;
-    let prefix: u32 = prefix.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    let net = net
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|e| e.to_string())?;
+    let prefix: u32 = prefix
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
     if prefix > 32 {
         return Err("prefix >32".into());
     }
@@ -773,7 +883,11 @@ fn ip_in_v4_cidr(ip: &str, cidr: &str) -> bool {
     let Ok((net, prefix)) = parse_cidr_v4(cidr) else {
         return false;
     };
-    let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     (u32::from(addr) & mask) == (u32::from(net) & mask)
 }
 
@@ -800,7 +914,11 @@ pub fn evaluate_lte_dl_return_route(
         return Err("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into());
     }
     let dev = after_token(line, "dev").ok_or("LTE_DL_RETURN_ROUTE_UNAVAILABLE".to_string())?;
-    if policy.forbidden_devs.iter().any(|forbidden| forbidden == &dev) {
+    if policy
+        .forbidden_devs
+        .iter()
+        .any(|forbidden| forbidden == &dev)
+    {
         return Err("LTE_DL_RETURN_ROUTE_VIA_FORBIDDEN_DEV".into());
     }
     let via = after_token(line, "via").ok_or("LTE_DL_RETURN_ROUTE_MISSING_VIA".to_string())?;
@@ -1230,65 +1348,252 @@ impl DockerSrsranRuntime {
             })
             .unwrap_or_default()
     }
-    fn diagnostic(&self, args: &[&str], seconds: u64) -> CommandDiagnostic { match self.run(args, seconds) { Ok(output) => bounded_diagnostic(&output), Err(error) => failed_diagnostic(&error) } }
-    fn collect_ping_evidence(&self, ue: &Container, ping: CommandDiagnostic) -> PingRuntimeEvidence {
+    fn diagnostic(&self, args: &[&str], seconds: u64) -> CommandDiagnostic {
+        match self.run(args, seconds) {
+            Ok(output) => bounded_diagnostic(&output),
+            Err(error) => failed_diagnostic(&error),
+        }
+    }
+    fn collect_ping_evidence(
+        &self,
+        ue: &Container,
+        ping: CommandDiagnostic,
+    ) -> PingRuntimeEvidence {
         let ue_link = self.diagnostic(&["exec", &ue.id, "ip", "-s", "link", "show", LTE_UE_TUN], 3);
         let ue_routes = self.diagnostic(&["exec", &ue.id, "ip", "route"], 3);
         let srsue_log_tail = match self.run(&["logs", "--tail", "200", &ue.id], 5) {
             Ok(output) => bounded_filtered_log_diagnostic(&output),
             Err(error) => failed_diagnostic(&error),
         };
-        let mut evidence = PingRuntimeEvidence { ping, ue_link, ue_routes, srsue_log_tail, ..PingRuntimeEvidence::default() };
-        let Ok(Some(enb)) = self.resolve("srsenb") else { return evidence; };
-        let (srsenb_log_tail, ul_bitrate, dl_bitrate) = match self.run(&["logs", "--tail", "200", &enb.id], 5) {
-            Ok(output) => { let (ul, dl) = parse_enb_bitrates(&format!("{}\n{}", output.stdout, output.stderr)); (bounded_filtered_log_diagnostic(&output), ul, dl) },
+        let mut evidence = PingRuntimeEvidence {
+            ping,
+            ue_link,
+            ue_routes,
+            srsue_log_tail,
+            ..PingRuntimeEvidence::default()
+        };
+        let Ok(Some(enb)) = self.resolve("srsenb") else {
+            return evidence;
+        };
+        let (srsenb_log_tail, ul_bitrate, dl_bitrate) = match self
+            .run(&["logs", "--tail", "200", &enb.id], 5)
+        {
+            Ok(output) => {
+                let (ul, dl) = parse_enb_bitrates(&format!("{}\n{}", output.stdout, output.stderr));
+                (bounded_filtered_log_diagnostic(&output), ul, dl)
+            }
             Err(error) => (failed_diagnostic(&error), None, None),
         };
         evidence.srsenb_log_tail = srsenb_log_tail;
-        let (gtp_bind_addr, s1c_bind_addr) = fs::read_to_string(ENB_CONFIG).ok().map(|contents| parse_enb_bind_config(&contents)).unwrap_or_default();
-        let networks = self.run(&["inspect", "--format", "{{json .NetworkSettings.Networks}}", &enb.id], 3)
-            .ok().filter(|output| output.code == 0).map(|output| parse_docker_networks(&output.stdout)).unwrap_or_default();
-        let s1u_network_present = gtp_bind_addr.as_ref().is_some_and(|address| networks.values().any(|value| value == address));
+        let (gtp_bind_addr, s1c_bind_addr) = fs::read_to_string(ENB_CONFIG)
+            .ok()
+            .map(|contents| parse_enb_bind_config(&contents))
+            .unwrap_or_default();
+        let networks = self
+            .run(
+                &[
+                    "inspect",
+                    "--format",
+                    "{{json .NetworkSettings.Networks}}",
+                    &enb.id,
+                ],
+                3,
+            )
+            .ok()
+            .filter(|output| output.code == 0)
+            .map(|output| parse_docker_networks(&output.stdout))
+            .unwrap_or_default();
+        let s1u_network_present = gtp_bind_addr
+            .as_ref()
+            .is_some_and(|address| networks.values().any(|value| value == address));
         let enb_addresses = self.run(&["exec", &enb.id, "ip", "-o", "-4", "addr", "show"], 3);
         let mut enb_link_counters = BTreeMap::new();
-        let zmq_address = networks.iter().find(|(name, _)| name.to_ascii_lowercase().contains("zmq")).map(|(_, address)| address);
+        let zmq_address = networks
+            .iter()
+            .find(|(name, _)| name.to_ascii_lowercase().contains("zmq"))
+            .map(|(_, address)| address);
         for (role, address) in [("s1u", gtp_bind_addr.as_ref()), ("zmq", zmq_address)] {
             let counters = match (&enb_addresses, address) {
-                (Ok(output), Some(address)) if output.code == 0 => interface_for_ipv4(&output.stdout, address)
-                    .map(|interface| self.diagnostic(&["exec", &enb.id, "ip", "-s", "link", "show", "dev", &interface], 3))
-                    .unwrap_or_else(|| failed_diagnostic("LTE_ENB_LINK_INTERFACE_NOT_FOUND")),
+                (Ok(output), Some(address)) if output.code == 0 => {
+                    interface_for_ipv4(&output.stdout, address)
+                        .map(|interface| {
+                            self.diagnostic(
+                                &[
+                                    "exec", &enb.id, "ip", "-s", "link", "show", "dev", &interface,
+                                ],
+                                3,
+                            )
+                        })
+                        .unwrap_or_else(|| failed_diagnostic("LTE_ENB_LINK_INTERFACE_NOT_FOUND"))
+                }
                 (Err(error), _) => failed_diagnostic(error),
                 _ => failed_diagnostic("LTE_ENB_LINK_INTERFACE_NOT_FOUND"),
             };
             enb_link_counters.insert(role.to_string(), counters);
         }
-        evidence.enb = EnbRuntimeEvidence { gtp_bind_addr, s1c_bind_addr, networks, s1u_network_present, ul_bitrate, dl_bitrate };
+        evidence.enb = EnbRuntimeEvidence {
+            gtp_bind_addr,
+            s1c_bind_addr,
+            networks,
+            s1u_network_present,
+            ul_bitrate,
+            dl_bitrate,
+        };
         evidence.enb_link_counters = enb_link_counters;
-        for (component, container) in [("srsue", ue), ("srsenb", &enb)] { let image = self.diagnostic(&["inspect", "--format", "{{.Image}}", &container.id], 3); let value = image.stdout.trim(); if image.exit_code == 0 && value.starts_with("sha256:") && value.len() == 71 { evidence.container_image_ids.insert(component.into(), value.into()); } }
+        for (component, container) in [("srsue", ue), ("srsenb", &enb)] {
+            let image = self.diagnostic(&["inspect", "--format", "{{.Image}}", &container.id], 3);
+            let value = image.stdout.trim();
+            if image.exit_code == 0 && value.starts_with("sha256:") && value.len() == 71 {
+                evidence
+                    .container_image_ids
+                    .insert(component.into(), value.into());
+            }
+        }
         evidence
     }
     fn execute_ping_with_evidence(&self, direction: &str, packets: u32) -> PingOperation {
-        let fail = |error_code: &str| PingOperation { error_code: Some(error_code.into()), ..PingOperation::default() };
-        if !matches!(direction, "ul" | "dl") || packets == 0 || packets > 5 { return fail("LTE_PING_PARAMETERS_INVALID"); }
-        let ue = match self.owned(Target::Ue) { Ok(ue) if ue.state == "running" => ue, Ok(_) => return fail("LTE_UE_NOT_RUNNING"), Err(error) => return fail(&error) };
-        let peer = match configured_traffic_peer() { Ok(peer) => peer.to_string(), Err(error) => return fail(&error) }; let count = packets.to_string();
-        let ping_output = if direction == "ul" {
-            let route = match self.run(&["exec", &ue.id, "ip", "route", "get", &peer], 3) { Ok(output) => output, Err(error) => return PingOperation { evidence: self.collect_ping_evidence(&ue, failed_diagnostic(&error)), error_code: Some("LTE_UL_ROUTE_PROBE_FAILED".into()), ..PingOperation::default() } };
-            let preflight = evaluate_lte_ul_route(&route.stdout, &peer); if route.code != 0 || !preflight.ok { return PingOperation { evidence: self.collect_ping_evidence(&ue, bounded_diagnostic(&route)), error_code: Some(preflight.code.unwrap_or_else(|| "LTE_UL_ROUTE_PROBE_FAILED".into())), ..PingOperation::default() }; }
-            self.run(&["exec", &ue.id, "ping", "-n", "-I", LTE_UE_TUN, "-c", &count, "-W", "1", &peer], 10)
-        } else {
-            let ue_ip = match self.ue_ip(Some(&ue)) { Some(value) => value, None => return PingOperation { evidence: self.collect_ping_evidence(&ue, failed_diagnostic("LTE_UE_IP_NOT_READY")), error_code: Some("LTE_UE_IP_NOT_READY".into()), ..PingOperation::default() } };
-            let dn = match configured_lte_dn_sender_container() { Ok(value) => value, Err(error) => return fail(&error) }; let policy = match configured_lte_dl_return_policy() { Ok(value) => value, Err(error) => return fail(&error) };
-            let route = match self.run(&["exec", dn.as_str(), "ip", "route", "get", &ue_ip], 3) { Ok(output) => output, Err(error) => return PingOperation { evidence: self.collect_ping_evidence(&ue, failed_diagnostic(&error)), error_code: Some("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into()), ..PingOperation::default() } };
-            let route_error = classify_dn_container_exit(route.code, &route.stderr).and_then(|_| (route.code == 0).then_some(()).ok_or_else(|| "LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())).and_then(|_| evaluate_lte_dl_return_route(&route.stdout, &ue_ip, &policy));
-            if let Err(error_code) = route_error { return PingOperation { evidence: self.collect_ping_evidence(&ue, bounded_diagnostic(&route)), error_code: Some(error_code), ..PingOperation::default() }; }
-            self.run(&["exec", dn.as_str(), "ping", "-n", "-c", &count, "-W", "1", &ue_ip], 10)
+        let fail = |error_code: &str| PingOperation {
+            error_code: Some(error_code.into()),
+            ..PingOperation::default()
         };
-        let output = match ping_output { Ok(output) => output, Err(error) => return PingOperation { evidence: self.collect_ping_evidence(&ue, failed_diagnostic(&error)), error_code: Some("LTE_PING_FAILED".into()), ..PingOperation::default() } };
+        if !matches!(direction, "ul" | "dl") || packets == 0 || packets > 5 {
+            return fail("LTE_PING_PARAMETERS_INVALID");
+        }
+        let ue = match self.owned(Target::Ue) {
+            Ok(ue) if ue.state == "running" => ue,
+            Ok(_) => return fail("LTE_UE_NOT_RUNNING"),
+            Err(error) => return fail(&error),
+        };
+        let peer = match configured_traffic_peer() {
+            Ok(peer) => peer.to_string(),
+            Err(error) => return fail(&error),
+        };
+        let count = packets.to_string();
+        let ping_output = if direction == "ul" {
+            let route = match self.run(&["exec", &ue.id, "ip", "route", "get", &peer], 3) {
+                Ok(output) => output,
+                Err(error) => {
+                    return PingOperation {
+                        evidence: self.collect_ping_evidence(&ue, failed_diagnostic(&error)),
+                        error_code: Some("LTE_UL_ROUTE_PROBE_FAILED".into()),
+                        ..PingOperation::default()
+                    }
+                }
+            };
+            let preflight = evaluate_lte_ul_route(&route.stdout, &peer);
+            if route.code != 0 || !preflight.ok {
+                return PingOperation {
+                    evidence: self.collect_ping_evidence(&ue, bounded_diagnostic(&route)),
+                    error_code: Some(
+                        preflight
+                            .code
+                            .unwrap_or_else(|| "LTE_UL_ROUTE_PROBE_FAILED".into()),
+                    ),
+                    ..PingOperation::default()
+                };
+            }
+            self.run(
+                &[
+                    "exec", &ue.id, "ping", "-n", "-I", LTE_UE_TUN, "-c", &count, "-W", "1", &peer,
+                ],
+                10,
+            )
+        } else {
+            let ue_ip = match self.ue_ip(Some(&ue)) {
+                Some(value) => value,
+                None => {
+                    return PingOperation {
+                        evidence: self
+                            .collect_ping_evidence(&ue, failed_diagnostic("LTE_UE_IP_NOT_READY")),
+                        error_code: Some("LTE_UE_IP_NOT_READY".into()),
+                        ..PingOperation::default()
+                    }
+                }
+            };
+            let dn = match configured_lte_dn_sender_container() {
+                Ok(value) => value,
+                Err(error) => return fail(&error),
+            };
+            let policy = match configured_lte_dl_return_policy() {
+                Ok(value) => value,
+                Err(error) => return fail(&error),
+            };
+            let route = match self.run(&["exec", dn.as_str(), "ip", "route", "get", &ue_ip], 3) {
+                Ok(output) => output,
+                Err(error) => {
+                    return PingOperation {
+                        evidence: self.collect_ping_evidence(&ue, failed_diagnostic(&error)),
+                        error_code: Some("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into()),
+                        ..PingOperation::default()
+                    }
+                }
+            };
+            let route_error = classify_dn_container_exit(route.code, &route.stderr)
+                .and_then(|_| {
+                    (route.code == 0)
+                        .then_some(())
+                        .ok_or_else(|| "LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())
+                })
+                .and_then(|_| evaluate_lte_dl_return_route(&route.stdout, &ue_ip, &policy));
+            if let Err(error_code) = route_error {
+                return PingOperation {
+                    evidence: self.collect_ping_evidence(&ue, bounded_diagnostic(&route)),
+                    error_code: Some(error_code),
+                    ..PingOperation::default()
+                };
+            }
+            self.run(
+                &[
+                    "exec",
+                    dn.as_str(),
+                    "ping",
+                    "-n",
+                    "-c",
+                    &count,
+                    "-W",
+                    "1",
+                    &ue_ip,
+                ],
+                10,
+            )
+        };
+        let output = match ping_output {
+            Ok(output) => output,
+            Err(error) => {
+                return PingOperation {
+                    evidence: self.collect_ping_evidence(&ue, failed_diagnostic(&error)),
+                    error_code: Some("LTE_PING_FAILED".into()),
+                    ..PingOperation::default()
+                }
+            }
+        };
         let evidence = self.collect_ping_evidence(&ue, bounded_diagnostic(&output));
-        if let Err(error_code) = classify_ping_output(direction, &output) { return PingOperation { evidence, error_code: Some(error_code), ..PingOperation::default() }; }
-        if output.code != 0 { return PingOperation { evidence, error_code: Some("LTE_PING_FAILED".into()), ..PingOperation::default() }; }
-        match parse_ping_measurement(&output.stdout) { Some(measurement) => PingOperation { measurement: Some(measurement), evidence, error_code: None }, None => PingOperation { evidence, error_code: Some("LTE_PING_RESULT_INVALID".into()), ..PingOperation::default() } }
+        if let Err(error_code) = classify_ping_output(direction, &output) {
+            return PingOperation {
+                evidence,
+                error_code: Some(error_code),
+                ..PingOperation::default()
+            };
+        }
+        if output.code != 0 {
+            return PingOperation {
+                evidence,
+                error_code: Some("LTE_PING_FAILED".into()),
+                ..PingOperation::default()
+            };
+        }
+        match parse_ping_measurement(&output.stdout) {
+            Some(measurement) => PingOperation {
+                measurement: Some(measurement),
+                evidence,
+                error_code: None,
+            },
+            None => PingOperation {
+                evidence,
+                error_code: Some("LTE_PING_RESULT_INVALID".into()),
+                ..PingOperation::default()
+            },
+        }
     }
     fn attach_proof(&self, ue: Option<&Container>) -> bool {
         let Some(ue) = ue.filter(|container| container.state == "running") else {
@@ -1476,7 +1781,10 @@ pub fn compose_model_sha256() -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn validate_certified_release_subject(image_reference: &str, compose_model: &str) -> Result<(), String> {
+fn validate_certified_release_subject(
+    image_reference: &str,
+    compose_model: &str,
+) -> Result<(), String> {
     if image_reference != CERTIFIED_IMAGE_REFERENCE {
         return Err("LTE_CERTIFIED_IMAGE_MISMATCH".into());
     }
@@ -1487,8 +1795,7 @@ fn validate_certified_release_subject(image_reference: &str, compose_model: &str
 }
 
 pub fn verify_certified_release_subject() -> Result<(), String> {
-    let versions =
-        fs::read_to_string(ENV_FILE).map_err(|_| "LTE_CERTIFIED_IMAGE_UNAVAILABLE")?;
+    let versions = fs::read_to_string(ENV_FILE).map_err(|_| "LTE_CERTIFIED_IMAGE_UNAVAILABLE")?;
     let image_reference = versions
         .lines()
         .find_map(|line| line.strip_prefix("SRSRAN4G_IMAGE="))
@@ -1507,14 +1814,27 @@ pub fn verify_certified_release_subject() -> Result<(), String> {
         ])
         .output()
         .map_err(|_| "LTE_CERTIFIED_IMAGE_UNAVAILABLE")?;
-    if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != CERTIFIED_IMAGE_ID {
+    if !output.status.success()
+        || String::from_utf8_lossy(&output.stdout).trim() != CERTIFIED_IMAGE_ID
+    {
         return Err("LTE_CERTIFIED_IMAGE_UNAVAILABLE".into());
     }
     // 0.29.6: exec preflight now runs the UE service spec in a disposable
     // container. Non-zero exit surfaces LTE_UE_TOOLING_NOT_EXECUTABLE with a
     // bounded tail-preserving diagnostic. The DN SGi preflight has a
     // matching path; see verify_dn_tooling_executable.
-    verify_ue_tooling_executable(image_reference)
+    let [ue, dn] = certified_tooling_subjects(image_reference);
+    verify_ue_tooling_executable(ue.0)?;
+    verify_dn_tooling_executable(dn.0)
+}
+
+fn certified_tooling_subjects<'a>(
+    ue_image_reference: &'a str,
+) -> [(&'a str, &'static ContainerExecSpec); 2] {
+    [
+        (ue_image_reference, &UE_SERVICE_EXEC_SPEC),
+        (CERTIFIED_DN_IMAGE_REFERENCE, &DN_SGI_SERVICE_EXEC_SPEC),
+    ]
 }
 
 fn run_tooling_exec_preflight(
@@ -1545,7 +1865,7 @@ pub fn verify_dn_tooling_executable(image_reference: &str) -> Result<(), String>
     run_tooling_exec_preflight(image_reference, &DN_SGI_SERVICE_EXEC_SPEC)
 }
 
-fn compose_config_args() -> [&'static str; 14] {
+fn compose_config_args() -> [&'static str; 16] {
     [
         "10s",
         "/usr/bin/docker",
@@ -1558,6 +1878,8 @@ fn compose_config_args() -> [&'static str; 14] {
         ENV_FILE,
         "-f",
         COMPOSE,
+        "-f",
+        COMPOSE_0298_OVERRIDE,
         "config",
         "--format",
         "json",
@@ -1606,7 +1928,7 @@ impl SrsranRuntime for DockerSrsranRuntime {
     fn verify_erab_established(
         &self,
     ) -> Result<ErabEstablishmentEvidence, (String, ErabEstablishmentEvidence)> {
-        // Read full stdout+stderr for srsENB and the MME; delegate to the
+        // Read full stdout+stderr for srsENB and SGW-C; delegate to the
         // pure classifier so unit tests exercise the exact same logic.
         let srsenb = self
             .resolve("srsenb")
@@ -1615,14 +1937,14 @@ impl SrsranRuntime for DockerSrsranRuntime {
             .and_then(|c| self.run(&["logs", &c.id], 5).ok())
             .map(|out| format!("{}{}", out.stdout, out.stderr))
             .unwrap_or_default();
-        let mme = self
-            .resolve("mme")
+        let sgwc = self
+            .resolve("sgwc")
             .ok()
             .flatten()
             .and_then(|c| self.run(&["logs", &c.id], 5).ok())
             .map(|out| format!("{}{}", out.stdout, out.stderr))
             .unwrap_or_default();
-        evaluate_erab_establishment(&srsenb, &mme)
+        evaluate_erab_establishment(&srsenb, &sgwc)
     }
     fn collect_terminal_evidence(
         &self,
@@ -1638,7 +1960,18 @@ impl SrsranRuntime for DockerSrsranRuntime {
                     ..FullLogRecord::default()
                 };
             };
-            let raw = match self.run(&["logs", &container.id], 5) {
+            let file_name = format!("/var/log/oiran/{component}.log");
+            let read_script = format!(
+                "for file in {file_name}*; do test -f \"$file\" && cat \"$file\"; done"
+            );
+            let direct = self
+                .run(&["exec", &container.id, "/bin/sh", "-ec", &read_script], 5)
+                .and_then(|output| {
+                    (output.code == 0)
+                        .then_some(output)
+                        .ok_or_else(|| "LTE_DIRECT_LOG_READ_FAILED".into())
+                });
+            let raw = match direct.or_else(|_| self.run(&["logs", &container.id], 5)) {
                 Ok(output) => format!("{}{}", output.stdout, output.stderr),
                 Err(error) => {
                     return FullLogRecord {
@@ -1648,17 +1981,12 @@ impl SrsranRuntime for DockerSrsranRuntime {
                     };
                 }
             };
+            let sanitized_full = bounded_sanitized_log(&raw);
             let path = run_dir.join(format!("{component}.log"));
-            let mut record = build_full_log_record(
-                component,
-                &path.display().to_string(),
-                &raw,
-            );
-            let sanitized_full = raw
-                .lines()
-                .filter_map(sanitize_log_line)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let mut record =
+                build_full_log_record(component, &path.display().to_string(), &sanitized_full);
+            let rrc_extract = build_rrc_extract(&sanitized_full);
+            let rrc_path = run_dir.join(format!("{component}-rrc.log"));
             let open_result = OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -1668,6 +1996,21 @@ impl SrsranRuntime for DockerSrsranRuntime {
             match open_result.and_then(|mut file| file.write_all(sanitized_full.as_bytes())) {
                 Ok(()) => {
                     record.persisted = true;
+                    if OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&rrc_path)
+                        .and_then(|mut file| file.write_all(rrc_extract.as_bytes()))
+                        .is_ok()
+                    {
+                        record.rrc_path = rrc_path.display().to_string();
+                        record.rrc_bytes = rrc_extract.len() as u64;
+                        record.rrc_sha256 = format!("{:x}", Sha256::digest(rrc_extract.as_bytes()));
+                    } else {
+                        record.error_code = Some("LTE_RRC_EXTRACT_WRITE_FAILED".into());
+                    }
                 }
                 Err(error) => {
                     record.error_code = Some(format!("LTE_TERMINAL_LOG_WRITE_FAILED:{error}"));
@@ -1680,15 +2023,33 @@ impl SrsranRuntime for DockerSrsranRuntime {
         let enb_network = {
             let enb = self.resolve("srsenb").ok().flatten();
             let enb_neigh = match &enb {
-                Some(c) => self.diagnostic(&ip_neigh_args(&c.id).iter().map(String::as_str).collect::<Vec<_>>(), 3),
+                Some(c) => self.diagnostic(
+                    &ip_neigh_args(&c.id)
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    3,
+                ),
                 None => failed_diagnostic("LTE_TERMINAL_LOG_CONTAINER_ABSENT"),
             };
             let enb_link = match &enb {
-                Some(c) => self.diagnostic(&ip_s_link_args(&c.id).iter().map(String::as_str).collect::<Vec<_>>(), 3),
+                Some(c) => self.diagnostic(
+                    &ip_s_link_args(&c.id)
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    3,
+                ),
                 None => failed_diagnostic("LTE_TERMINAL_LOG_CONTAINER_ABSENT"),
             };
             let sgw_neigh = match self.resolve("sgwu").ok().flatten() {
-                Some(c) => self.diagnostic(&ip_neigh_args(&c.id).iter().map(String::as_str).collect::<Vec<_>>(), 3),
+                Some(c) => self.diagnostic(
+                    &ip_neigh_args(&c.id)
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    3,
+                ),
                 None => failed_diagnostic("LTE_TERMINAL_SGWU_ABSENT"),
             };
             EnbNetworkDiagnostics {
@@ -1770,12 +2131,17 @@ impl SrsranRuntime for DockerSrsranRuntime {
                 Ok(output) => {
                     let code = if output.code == 0 {
                         configured_lte_dl_return_policy()
-                            .and_then(|policy| evaluate_lte_dl_return_route(&output.stdout, &ue_ip, &policy))
+                            .and_then(|policy| {
+                                evaluate_lte_dl_return_route(&output.stdout, &ue_ip, &policy)
+                            })
                             .err()
                     } else {
                         Some("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into())
                     };
-                    RouteOperation { diagnostic: bounded_diagnostic(&output), error_code: code }
+                    RouteOperation {
+                        diagnostic: bounded_diagnostic(&output),
+                        error_code: code,
+                    }
                 }
                 Err(_) => RouteOperation {
                     error_code: Some("LTE_DL_RETURN_ROUTE_UNAVAILABLE".into()),
@@ -1804,10 +2170,17 @@ impl SrsranRuntime for DockerSrsranRuntime {
                 if code.is_none() {
                     let preflight = evaluate_lte_ul_route(&output.stdout, &peer);
                     if !preflight.ok {
-                        code = Some(preflight.code.unwrap_or_else(|| "LTE_UL_ROUTE_NOT_VIA_UE_TUN".into()));
+                        code = Some(
+                            preflight
+                                .code
+                                .unwrap_or_else(|| "LTE_UL_ROUTE_NOT_VIA_UE_TUN".into()),
+                        );
                     }
                 }
-                RouteOperation { diagnostic: bounded_diagnostic(&output), error_code: code }
+                RouteOperation {
+                    diagnostic: bounded_diagnostic(&output),
+                    error_code: code,
+                }
             }
             Err(_) => RouteOperation {
                 error_code: Some("LTE_UL_ROUTE_PROBE_FAILED".into()),
@@ -1948,14 +2321,16 @@ impl SrsranRuntime for DockerSrsranRuntime {
                 *timestamp >= not_before_epoch_ms && *timestamp <= not_after_epoch_ms
             })
             .max();
-        Ok(event_at_epoch_ms.map(|event_at_epoch_ms| AttachProtocolEvidence {
-            event_at_epoch_ms,
-            observed_at_epoch_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            provenance: "OPEN5GS_MME_DOCKER_LOG_RFC3339",
-        }))
+        Ok(
+            event_at_epoch_ms.map(|event_at_epoch_ms| AttachProtocolEvidence {
+                event_at_epoch_ms,
+                observed_at_epoch_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                provenance: "OPEN5GS_MME_DOCKER_LOG_RFC3339",
+            }),
+        )
     }
     fn measure_traffic(
         &self,
@@ -2038,7 +2413,11 @@ impl SrsranRuntime for DockerSrsranRuntime {
 
     fn ping(&self, direction: &str, packets: u32) -> Result<PingMeasurement, String> {
         let operation = self.execute_ping_with_evidence(direction, packets);
-        operation.measurement.ok_or_else(|| operation.error_code.unwrap_or_else(|| "LTE_PING_FAILED".into()))
+        operation.measurement.ok_or_else(|| {
+            operation
+                .error_code
+                .unwrap_or_else(|| "LTE_PING_FAILED".into())
+        })
     }
     fn ping_with_evidence(&self, direction: &str, packets: u32) -> PingOperation {
         self.execute_ping_with_evidence(direction, packets)
@@ -2092,15 +2471,40 @@ impl SrsranRuntime for DockerSrsranRuntime {
 
 fn sanitize_log_line(line: &str) -> Option<String> {
     let lower = line.to_ascii_lowercase();
-    if ["imsi", "supi", "suci", "guti", "tmsi", "imei", "imeisv", "msisdn",
-        "opc", "auth key", "subscriber key", " ki="]
-        .iter()
-        .any(|m| lower.contains(m))
+    if [
+        "imsi",
+        "supi",
+        "suci",
+        "guti",
+        "tmsi",
+        "imei",
+        "imeisv",
+        "msisdn",
+        "opc",
+        "auth key",
+        "subscriber key",
+        " ki=",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
     {
         return Some("[REDACTED_SUBSCRIBER_MATERIAL]".into());
     }
     let value = line.trim();
+    if value.len() >= 5
+        && value.as_bytes().get(4) == Some(&b':')
+        && value.as_bytes()[..4].iter().all(u8::is_ascii_hexdigit)
+    {
+        return None;
+    }
     (!value.is_empty()).then(|| value.chars().take(500).collect())
+}
+
+fn sanitize_log_stream(raw: &str) -> String {
+    raw.lines()
+        .filter_map(sanitize_log_line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Clone)]
@@ -2117,7 +2521,8 @@ pub struct MockSrsranRuntime {
     /// `Some(Err((code, ev)))` → gate FAIL with the exact code; `None` →
     /// default pass with empty evidence.
     #[allow(clippy::type_complexity)]
-    pub erab_gate_override: Arc<Mutex<Option<Result<ErabEstablishmentEvidence, (String, ErabEstablishmentEvidence)>>>>,
+    pub erab_gate_override:
+        Arc<Mutex<Option<Result<ErabEstablishmentEvidence, (String, ErabEstablishmentEvidence)>>>>,
     /// 0.29.7: injectable terminal evidence returned by the mock.
     pub terminal_evidence_override: Arc<Mutex<Option<TerminalEvidence>>>,
 }
@@ -2360,22 +2765,64 @@ mod tests {
     }
     #[test]
     fn ping_evidence_diagnostics_are_complete_private_and_byte_bounded() {
-        let diagnostic = bounded_diagnostic(&Output { code: 1, stdout: format!("IMEISV secret\n{}", "é".repeat(400)), stderr: "x".repeat(700) });
+        let diagnostic = bounded_diagnostic(&Output {
+            code: 1,
+            stdout: format!("IMEISV secret\n{}", "é".repeat(400)),
+            stderr: "x".repeat(700),
+        });
         assert!(diagnostic.stdout.len() <= 512 && diagnostic.stderr.len() <= 512);
-        assert!(!diagnostic.stdout.contains("secret") && !diagnostic.stdout.to_ascii_lowercase().contains("imeisv"));
-        let (gtp, s1c) = parse_enb_bind_config("gtp_bind_addr=10.77.11.20\ns1c_bind_addr=10.77.10.20");
+        assert!(
+            !diagnostic.stdout.contains("secret")
+                && !diagnostic.stdout.to_ascii_lowercase().contains("imeisv")
+        );
+        let (gtp, s1c) =
+            parse_enb_bind_config("gtp_bind_addr=10.77.11.20\ns1c_bind_addr=10.77.10.20");
         let networks = parse_docker_networks(r#"{"oiran-lab-s1u":{"IPAddress":"10.77.11.20"}}"#);
         let (ul, dl) = parse_enb_bitrates("UL bitrate=812000 bps\nDL bitrate=991000 bps");
-        assert_eq!(gtp.as_deref(), Some("10.77.11.20")); assert_eq!(s1c.as_deref(), Some("10.77.10.20")); assert!(ul.is_some() && dl.is_some());
-        let value = serde_json::to_value(PingRuntimeEvidence { ping: diagnostic.clone(), ue_link: diagnostic.clone(), ue_routes: diagnostic.clone(), srsue_log_tail: diagnostic.clone(), srsenb_log_tail: diagnostic,
-            enb: EnbRuntimeEvidence { gtp_bind_addr: gtp, s1c_bind_addr: s1c, networks, s1u_network_present: true, ul_bitrate: ul, dl_bitrate: dl },
+        assert_eq!(gtp.as_deref(), Some("10.77.11.20"));
+        assert_eq!(s1c.as_deref(), Some("10.77.10.20"));
+        assert!(ul.is_some() && dl.is_some());
+        let value = serde_json::to_value(PingRuntimeEvidence {
+            ping: diagnostic.clone(),
+            ue_link: diagnostic.clone(),
+            ue_routes: diagnostic.clone(),
+            srsue_log_tail: diagnostic.clone(),
+            srsenb_log_tail: diagnostic,
+            enb: EnbRuntimeEvidence {
+                gtp_bind_addr: gtp,
+                s1c_bind_addr: s1c,
+                networks,
+                s1u_network_present: true,
+                ul_bitrate: ul,
+                dl_bitrate: dl,
+            },
             enb_link_counters: BTreeMap::new(),
-            container_image_ids: BTreeMap::from([("srsue".into(), format!("sha256:{}", "a".repeat(64)))]) }).unwrap();
-        for key in ["ping", "ue_link", "ue_routes", "srsue_log_tail", "srsenb_log_tail", "enb", "enb_link_counters", "container_image_ids"] { assert!(value.get(key).is_some(), "missing {key}"); }
+            container_image_ids: BTreeMap::from([(
+                "srsue".into(),
+                format!("sha256:{}", "a".repeat(64)),
+            )]),
+        })
+        .unwrap();
+        for key in [
+            "ping",
+            "ue_link",
+            "ue_routes",
+            "srsue_log_tail",
+            "srsenb_log_tail",
+            "enb",
+            "enb_link_counters",
+            "container_image_ids",
+        ] {
+            assert!(value.get(key).is_some(), "missing {key}");
+        }
     }
     #[test]
     fn filtered_log_evidence_keeps_the_end_not_the_beginning() {
-        let output = Output { code: 1, stdout: format!("RRC FIRST_MARKER {}\nGTPU LAST_MARKER", "x".repeat(700)), stderr: String::new() };
+        let output = Output {
+            code: 1,
+            stdout: format!("RRC FIRST_MARKER {}\nGTPU LAST_MARKER", "x".repeat(700)),
+            stderr: String::new(),
+        };
         let diagnostic = bounded_filtered_log_diagnostic(&output);
         assert!(diagnostic.stdout.as_bytes().len() <= 512);
         assert!(diagnostic.stdout.contains("GTPU LAST_MARKER"));
@@ -2384,17 +2831,34 @@ mod tests {
     #[test]
     fn enb_link_counter_interface_and_tail_are_preserved() {
         let addresses = "2: eth0    inet 10.77.11.20/24 brd 10.77.11.255 scope global eth0\n3: eth1    inet 10.77.17.20/24 brd 10.77.17.255 scope global eth1";
-        assert_eq!(interface_for_ipv4(addresses, "10.77.11.20").as_deref(), Some("eth0"));
-        assert_eq!(interface_for_ipv4(addresses, "10.77.17.20").as_deref(), Some("eth1"));
-        let counters = bounded_diagnostic(&Output { code: 0, stdout: format!("RX OLD {}\nTX FINAL packets 42 bytes 4096", "x".repeat(700)), stderr: String::new() });
+        assert_eq!(
+            interface_for_ipv4(addresses, "10.77.11.20").as_deref(),
+            Some("eth0")
+        );
+        assert_eq!(
+            interface_for_ipv4(addresses, "10.77.17.20").as_deref(),
+            Some("eth1")
+        );
+        let counters = bounded_diagnostic(&Output {
+            code: 0,
+            stdout: format!("RX OLD {}\nTX FINAL packets 42 bytes 4096", "x".repeat(700)),
+            stderr: String::new(),
+        });
         assert!(counters.stdout.as_bytes().len() <= 512);
         assert!(counters.stdout.contains("TX FINAL packets 42 bytes 4096"));
         assert!(!counters.stdout.contains("RX OLD"));
     }
     #[test]
     fn dl_ping_restores_missing_tooling_classification() {
-        let output = Output { code: 127, stdout: String::new(), stderr: "ping: command not found".into() };
-        assert_eq!(classify_ping_output("dl", &output), Err("LTE_DN_SENDER_TOOLING_MISSING".into()));
+        let output = Output {
+            code: 127,
+            stdout: String::new(),
+            stderr: "ping: command not found".into(),
+        };
+        assert_eq!(
+            classify_ping_output("dl", &output),
+            Err("LTE_DN_SENDER_TOOLING_MISSING".into())
+        );
         assert_eq!(classify_ping_output("ul", &output), Ok(()));
     }
     #[test]
@@ -2689,14 +3153,20 @@ mod tests {
         let bridge = "10.77.16.30 via 10.0.2.2 dev eth0 src 10.0.2.15 uid 0";
         let evidence = evaluate_lte_ul_route(bridge, "10.77.16.30");
         assert!(!evidence.ok);
-        assert_eq!(evidence.code.as_deref(), Some("LTE_UL_ROUTE_NOT_VIA_UE_TUN"));
+        assert_eq!(
+            evidence.code.as_deref(),
+            Some("LTE_UL_ROUTE_NOT_VIA_UE_TUN")
+        );
         assert_eq!(evidence.actual_dev.as_deref(), Some("eth0"));
 
         // 5G uesimtun0 is not a valid LTE SGi outbound (keeps LTE vs 5G separate).
         let five_g = "10.77.16.30 dev uesimtun0 src 10.46.0.5 uid 0";
         let evidence = evaluate_lte_ul_route(five_g, "10.77.16.30");
         assert!(!evidence.ok);
-        assert_eq!(evidence.code.as_deref(), Some("LTE_UL_ROUTE_NOT_VIA_UE_TUN"));
+        assert_eq!(
+            evidence.code.as_deref(),
+            Some("LTE_UL_ROUTE_NOT_VIA_UE_TUN")
+        );
     }
 
     fn policy() -> SgiReturnRoutePolicy {
@@ -2753,11 +3223,7 @@ mod tests {
 
         // Loopback/blackhole (in forbidden list).
         assert_eq!(
-            evaluate_lte_dl_return_route(
-                "10.45.0.2 dev lo src 127.0.0.1",
-                "10.45.0.2",
-                &policy()
-            ),
+            evaluate_lte_dl_return_route("10.45.0.2 dev lo src 127.0.0.1", "10.45.0.2", &policy()),
             Err("LTE_DL_RETURN_ROUTE_VIA_FORBIDDEN_DEV".into())
         );
         assert_eq!(
@@ -2876,7 +3342,10 @@ mod tests {
         );
         std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", "10.77.16.30");
         std::env::set_var("POLARIS_DL_SENDER_IP", "10.77.24.30");
-        assert_eq!(configured_traffic_peer(), Ok("10.77.16.30".parse().unwrap()));
+        assert_eq!(
+            configured_traffic_peer(),
+            Ok("10.77.16.30".parse().unwrap())
+        );
         match prev_peer {
             Some(value) => std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", value),
             None => std::env::remove_var("POLARIS_LTE_TRAFFIC_PEER_IP"),
@@ -2912,10 +3381,16 @@ mod tests {
             stderr: "IMSI=001010123456789".into(),
         };
         let operation = classify_route_install(&output);
-        assert_eq!(operation.error_code.as_deref(), Some("LTE_UL_ROUTE_INSTALL_FAILED"));
+        assert_eq!(
+            operation.error_code.as_deref(),
+            Some("LTE_UL_ROUTE_INSTALL_FAILED")
+        );
         assert_eq!(operation.diagnostic.exit_code, 2);
         assert!(operation.diagnostic.stdout.chars().count() <= 512);
-        assert_eq!(operation.diagnostic.stderr, "[REDACTED_SUBSCRIBER_MATERIAL]");
+        assert_eq!(
+            operation.diagnostic.stderr,
+            "[REDACTED_SUBSCRIBER_MATERIAL]"
+        );
     }
 
     #[test]
@@ -2925,7 +3400,9 @@ mod tests {
         // execution script (not just command -v).
         let args = ue_tooling_exec_args("example.invalid/srsran@sha256:abc", &UE_SERVICE_EXEC_SPEC);
         assert_eq!(&args[..4], ["run", "--rm", "--network", "none"]);
-        assert!(args.windows(2).any(|w| w == ["--security-opt", "no-new-privileges:true"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--security-opt", "no-new-privileges:true"]));
         assert!(args.iter().any(|a| a == "--read-only"));
         assert!(args.windows(2).any(|w| w == ["--user", "0:0"]));
         assert!(args.windows(2).any(|w| w == ["--cap-drop", "ALL"]));
@@ -2942,12 +3419,67 @@ mod tests {
     fn dn_tooling_exec_args_mirror_sgi_sidecar_hardening() {
         // DN SGi sidecar runs non-root 65532:65532, cap_drop ALL, no cap_add,
         // read-only, no-new-privileges. The preflight must copy that exactly.
-        let args = ue_tooling_exec_args("example.invalid/srsran@sha256:abc", &DN_SGI_SERVICE_EXEC_SPEC);
+        let args = ue_tooling_exec_args(
+            "example.invalid/srsran@sha256:abc",
+            &DN_SGI_SERVICE_EXEC_SPEC,
+        );
         assert!(args.windows(2).any(|w| w == ["--user", "65532:65532"]));
         assert!(args.windows(2).any(|w| w == ["--cap-drop", "ALL"]));
         assert!(!args.iter().any(|a| a == "--cap-add"));
         assert!(args.iter().any(|a| a == "--read-only"));
-        assert!(args.windows(2).any(|w| w == ["--security-opt", "no-new-privileges:true"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--security-opt", "no-new-privileges:true"]));
+    }
+
+    #[test]
+    fn certified_preflight_contains_both_ue_and_dn_before_activation() {
+        let subjects = certified_tooling_subjects(CERTIFIED_IMAGE_REFERENCE);
+        assert_eq!(subjects.len(), 2);
+        assert_eq!(subjects[0].0, CERTIFIED_IMAGE_REFERENCE);
+        assert_eq!(subjects[0].1.role, "ue");
+        assert_eq!(subjects[1].0, CERTIFIED_DN_IMAGE_REFERENCE);
+        assert_eq!(subjects[1].1.role, "dn");
+    }
+
+    #[test]
+    fn lte_0298_overlay_has_rt_limits_without_cpu_quota() {
+        let overlay = include_str!(
+            "../../../deployment/srsran-lte-0298/docker-compose.polaris-0.29.8.yml"
+        );
+        assert_eq!(overlay.matches("rtprio: 99").count(), 2);
+        assert_eq!(overlay.matches("memlock: -1").count(), 2);
+        assert_eq!(overlay.matches("cpus: null").count(), 2);
+        assert!(overlay.contains("cap_add: [\"SYS_NICE\"]"));
+        assert!(!overlay.contains("open5gs"));
+        assert!(!overlay.contains("capture:"));
+    }
+
+    #[test]
+    fn lte_0298_log_fragments_are_bounded_and_diagnostic() {
+        let ue = include_str!(
+            "../../../deployment/srsran-lte-0298/ue-log.conf.fragment"
+        );
+        let enb = include_str!(
+            "../../../deployment/srsran-lte-0298/enb-log.conf.fragment"
+        );
+        for (component, fragment) in [("srsue", ue), ("srsenb", enb)] {
+            for setting in [
+                "phy_lib_level = none",
+                "phy_level = warning",
+                "rrc_level = debug",
+                "pdcp_level = debug",
+                "rlc_level = debug",
+                "mac_level = info",
+                "all_hex_limit = 64",
+                "file_max_size = 4999",
+            ] {
+                assert!(fragment.contains(setting), "{component}: {setting}");
+            }
+            assert!(fragment.contains(&format!("filename = /var/log/oiran/{component}.log")));
+        }
+        assert!(ue.contains("nas_level = debug"));
+        assert!(!enb.contains("nas_level"));
     }
 
     #[test]
@@ -2957,25 +3489,16 @@ mod tests {
         assert_eq!(classify_tooling_exec("dn", 0, "", ""), Ok(()));
 
         // EPERM scenario (ping fails because capabilities insufficient).
-        let eperm_err = classify_tooling_exec(
-            "ue",
-            1,
-            "",
-            "ping: socket: Operation not permitted\n",
-        )
-        .unwrap_err();
+        let eperm_err =
+            classify_tooling_exec("ue", 1, "", "ping: socket: Operation not permitted\n")
+                .unwrap_err();
         assert_eq!(eperm_err.0, "LTE_UE_TOOLING_NOT_EXECUTABLE");
         assert!(eperm_err.1.stderr.contains("Operation not permitted"));
         assert!(eperm_err.1.stderr.len() <= 512);
 
         // Missing binary (shell exit 127).
-        let missing_err = classify_tooling_exec(
-            "dn",
-            127,
-            "",
-            "/bin/sh: iperf3: not found\n",
-        )
-        .unwrap_err();
+        let missing_err =
+            classify_tooling_exec("dn", 127, "", "/bin/sh: iperf3: not found\n").unwrap_err();
         assert_eq!(missing_err.0, "LTE_DN_TOOLING_NOT_EXECUTABLE");
         assert!(missing_err.1.stderr.contains("not found"));
     }
@@ -3046,9 +3569,7 @@ mod tests {
     }
     #[test]
     fn canonical_n6_dropin_sets_only_n6_variables() {
-        let dropin = include_str!(
-            "../../../deployment/dn-sender/polaris-control-dl-sender.conf"
-        );
+        let dropin = include_str!("../../../deployment/dn-sender/polaris-control-dl-sender.conf");
         assert!(dropin.contains("Environment=POLARIS_DL_SENDER_IP=10.77.24.30"));
         // 0.29.3: the N6 drop-in no longer sets any LTE variable; those live
         // in lte-sgi/polaris-control-lte-sgi.conf and are activated only
@@ -3063,9 +3584,8 @@ mod tests {
 
     #[test]
     fn certified_lte_sgi_dropin_sets_exact_confirmed_values() {
-        let dropin = include_str!(
-            "../../../deployment/dn-sender/lte-sgi/polaris-control-lte-sgi.conf"
-        );
+        let dropin =
+            include_str!("../../../deployment/dn-sender/lte-sgi/polaris-control-lte-sgi.conf");
         for required in [
             "Environment=POLARIS_LTE_DN_SENDER_CONTAINER=polaris-lte-sgi-dn",
             "Environment=POLARIS_LTE_TRAFFIC_PEER_IP=10.77.16.30",
@@ -3082,18 +3602,15 @@ mod tests {
 
     #[test]
     fn candidate_lte_sgi_sidecar_pins_verified_image_digest_and_hardens_pod() {
-        let compose = include_str!(
-            "../../../deployment/dn-sender/lte-sgi/compose.yaml"
-        );
+        let compose = include_str!("../../../deployment/dn-sender/lte-sgi/compose.yaml");
         // The release gate replaces the placeholder with the exact offline
         // image digest. A zero or pending digest must never pass packaging.
         assert!(compose.contains(
             "polaris-lte-sgi-dn@sha256:e60eb72bf7619fd049f6bbbc45cf06927eb73ed7c613446678644f6742af31f3"
         ));
         assert!(!compose.contains("SIDE_CAR_IMAGE_DIGEST=PENDING"));
-        assert!(!compose.contains(
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-        ));
+        assert!(!compose
+            .contains("sha256:0000000000000000000000000000000000000000000000000000000000000000"));
         // Hardening gates — any removal of these breaks the test.
         for marker in [
             "cap_drop:",
@@ -3158,8 +3675,12 @@ mod tests {
         assert_eq!(evidence.event_at_epoch_ms, 1_793_534_400_123);
         assert_eq!(evidence.provenance, "OPEN5GS_MME_DOCKER_LOG_RFC3339");
         let calls = executor.calls.lock().unwrap();
-        assert!(calls[2].windows(2).any(|args| args == ["--timestamps", "--since"]));
-        assert!(calls[2].windows(2).any(|args| args == ["--until", "1793534400.500"]));
+        assert!(calls[2]
+            .windows(2)
+            .any(|args| args == ["--timestamps", "--since"]));
+        assert!(calls[2]
+            .windows(2)
+            .any(|args| args == ["--until", "1793534400.500"]));
     }
     #[test]
     fn docker_timestamp_parser_is_utc_and_millisecond_bounded() {
@@ -3231,7 +3752,10 @@ mod tests {
             Err("LTE_CERTIFIED_IMAGE_MISMATCH".into())
         );
         // Pinned constants carry the real 0.29.6-rc1 reference + full 64-hex ID.
-        assert_eq!(CERTIFIED_IMAGE_REFERENCE, "oiran/srsran4g-ue-tools:0.29.6-rc1");
+        assert_eq!(
+            CERTIFIED_IMAGE_REFERENCE,
+            "oiran/srsran4g-ue-tools:0.29.6-rc1"
+        );
         assert_eq!(
             CERTIFIED_IMAGE_ID,
             "sha256:aab719ffdfa518777ed3d197ffe02cdcef02f78f578095d9abb1da9f327db2a5"
@@ -3241,11 +3765,11 @@ mod tests {
 
     #[test]
     fn evaluate_erab_establishment_requires_both_ics_response_and_modify_bearer_response() {
-        // Happy path: eNB emitted ICS Response + MME emitted Modify Bearer
+        // Real srsRAN 25.10 + Open5GS SGW-C excerpts.
         // Response → evidence collected, Ok.
-        let srsenb = "RRC: SetupComplete\nS1AP: InitialContextSetupResponse E-RAB=5\nRLC: idle";
-        let mme = "GTPv2 Create Session Response cause=16\nModify Bearer Response EBI=5";
-        let ok = evaluate_erab_establishment(srsenb, mme).expect("both markers present");
+        let srsenb = "[S1AP] Tx S1AP SDU, InitialContextSetupResponse, rnti=0x46";
+        let sgwc = "[sgwc] INFO: Modify Bearer Response";
+        let ok = evaluate_erab_establishment(srsenb, sgwc).expect("both markers present");
         assert!(ok.ics_response_observed);
         assert!(ok.modify_bearer_response_observed);
         assert!(ok.ics_response_e_rab_markers >= 1);
@@ -3254,17 +3778,23 @@ mod tests {
         // The exact d62245de pathology: eNB got ICS Request, never emitted
         // ICS Response; MME never sent Modify Bearer. Gate must fail with
         // LTE_ERAB_NOT_ESTABLISHED and the evidence must show what was seen.
-        let srsenb_d62245de = "RRC: SetupComplete\nS1AP: InitialContextSetupRequest E-RAB=5\nUE context release";
-        let mme_d62245de = "GTPv2 Create Session Response cause=16\nUE Context Release Command Cause=NAS Detach";
-        let err = evaluate_erab_establishment(srsenb_d62245de, mme_d62245de).expect_err("gate must fail");
+        let srsenb_d62245de =
+            "RRC: SetupComplete\nS1AP: InitialContextSetupRequest E-RAB=5\nUE context release";
+        let mme_d62245de =
+            "GTPv2 Create Session Response cause=16\nUE Context Release Command Cause=NAS Detach";
+        let err =
+            evaluate_erab_establishment(srsenb_d62245de, mme_d62245de).expect_err("gate must fail");
         assert_eq!(err.0, "LTE_ERAB_NOT_ESTABLISHED");
         assert!(!err.1.ics_response_observed);
         assert!(!err.1.modify_bearer_response_observed);
         assert!(err.1.summary.contains("ics_response_observed=false"));
-        assert!(err.1.summary.contains("modify_bearer_response_observed=false"));
+        assert!(err
+            .1
+            .summary
+            .contains("modify_bearer_response_observed=false"));
 
         // Partial: ICS Response observed but MBR missing → still FAIL.
-        let srsenb_partial = "InitialContextSetupResponse E-RAB=5";
+        let srsenb_partial = "Tx S1AP SDU, InitialContextSetupResponse, rnti=0x46";
         let mme_partial = "nothing relevant";
         let err = evaluate_erab_establishment(srsenb_partial, mme_partial).expect_err("partial");
         assert_eq!(err.0, "LTE_ERAB_NOT_ESTABLISHED");
@@ -3274,10 +3804,19 @@ mod tests {
         // Subscriber material in logs must be redacted by sanitize_log_line
         // before marker counting; the marker still fires if the token is on
         // another line.
-        let srsenb_with_imsi = "IMSI=001010123456789\nInitialContextSetupResponse E-RAB=5";
+        let srsenb_with_imsi =
+            "IMSI=001010123456789\nTx S1AP SDU, InitialContextSetupResponse, rnti=0x46";
         let mme_with_tmsi = "TMSI=0xdeadbeef\nModify Bearer Response EBI=5";
         let ok = evaluate_erab_establishment(srsenb_with_imsi, mme_with_tmsi).expect("sanitised");
         assert!(ok.ics_response_observed && ok.modify_bearer_response_observed);
+
+        // Approximate legacy strings must not create a false PASS.
+        let legacy = evaluate_erab_establishment(
+            "S1AP: InitialContextSetupResponse E-RAB=5",
+            "MME GTPv2 message type 35",
+        )
+        .expect_err("unvalidated legacy markers rejected");
+        assert_eq!(legacy.0, "LTE_ERAB_NOT_ESTABLISHED");
     }
 
     #[test]
@@ -3306,7 +3845,8 @@ mod tests {
             raw.push_str("RRC: Measurement report ok\n");
         }
         raw.push_str("LAST_LINE_MARKER erab setup response\n");
-        let record = build_full_log_record("srsenb", "/var/lib/polaris-control/runs/x/srsenb.log", &raw);
+        let record =
+            build_full_log_record("srsenb", "/var/lib/polaris-control/runs/x/srsenb.log", &raw);
         assert_eq!(record.component, "srsenb");
         assert_eq!(record.path, "/var/lib/polaris-control/runs/x/srsenb.log");
         // Tail bounded ≤ 512 UTF-8 bytes.
@@ -3323,10 +3863,26 @@ mod tests {
     }
 
     #[test]
+    fn private_log_bounds_and_rrc_extract_keep_tail_without_hex_material() {
+        let mut raw = String::from("subscriber key follows\n0000: aa bb cc dd\n");
+        for index in 0..300 {
+            raw.push_str(&format!("[RRC] message-{index:03} {}\n", "x".repeat(20)));
+        }
+        raw.push_str("[RRC] LAST_RRC_MARKER\n");
+        let bounded = bounded_sanitized_log(&raw);
+        assert!(bounded.len() < 5 * 1024 * 1024);
+        assert!(!bounded.contains("aa bb cc dd"));
+        assert!(!bounded.to_ascii_lowercase().contains("subscriber key"));
+        let extract = build_rrc_extract(&bounded);
+        assert!(extract.len() <= 4096);
+        assert!(extract.contains("LAST_RRC_MARKER"));
+        assert!(!extract.contains("message-000"));
+    }
+
+    #[test]
     fn certification_subject_rejects_previous_compose_model_after_0296_pin() {
-        // 0.29.6 (second compose-pin fix): the certified compose model digest
-        // was rotated from the 0.29.4 image value `d0c80ea1…35f5d` to the
-        // 0.29.6-rc1 image value `1e93feba…3ed1`. Combining the current
+        // 0.29.8 rotates the compose model after adding the LTE-only
+        // real-time overlay. Combining the current
         // pinned image reference with the stale compose model must now
         // fail-closed with LTE_CERTIFIED_COMPOSE_MODEL_MISMATCH so an
         // operator who kept an old compose render gets a precise diagnostic.
@@ -3339,7 +3895,7 @@ mod tests {
         // The pinned constant carries the new 64-hex compose model digest.
         assert_eq!(
             CERTIFIED_COMPOSE_MODEL_SHA256,
-            "1e93feba4b3511f1c46ee27e63175c0ce5be2125f9b11af65c27f670f24b3ed1"
+            "fe1c35f7c4c306241fd56ff9e26a3d00f85db717e44e12f5b6cf90b608a97dd0"
         );
         assert_eq!(CERTIFIED_COMPOSE_MODEL_SHA256.len(), 64);
     }

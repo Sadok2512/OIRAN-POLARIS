@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.29.8 (polaris-control-api) — 2026-11-03 — bounded LTE diagnostics + deterministic bearer gates
+
+- Writes bounded srsUE/srsENB logs to root-only per-run files, disables the
+  PHY-library flood, raises only RRC/NAS/PDCP/RLC to debug, and persists a
+  private final-4-KiB RRC extract. Hex-dump continuation lines are removed by
+  the subscriber-material sanitizer.
+- Applies real-time/memlock limits only to srsUE and srsENB, removes their CPU
+  quotas, preserves `SYS_NICE`, and pins the resulting canonical compose model.
+- Requires the exact srsRAN 25.10 `Tx S1AP SDU,
+  InitialContextSetupResponse` marker and the Open5GS SGW-C `Modify Bearer
+  Response` marker; approximate legacy strings no longer produce a PASS.
+- Executes both UE and LTE DN tooling checks in the certified-release gate
+  before profile activation/Grant consumption.
+- Removes percentage-based disk gates. Writes remain fail-closed on
+  insufficient free bytes, exhausted inodes, or ENOSPC.
+
 ## 0.29.7 (polaris-control-api) — 2026-11-03 — ERAB gate + terminal evidence persistence
 
 - Adds a fail-closed `LTE_ERAB_NOT_ESTABLISHED` gate run **before every ping

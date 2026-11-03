@@ -1,0 +1,13 @@
+[log]
+all_level = info
+phy_lib_level = none
+phy_level = warning
+rrc_level = debug
+pdcp_level = debug
+rlc_level = debug
+mac_level = info
+s1ap_level = debug
+gtpu_level = debug
+all_hex_limit = 64
+filename = /var/log/oiran/srsenb.log
+file_max_size = 4999
