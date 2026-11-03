@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.29.10 (polaris-control-api) — 2026-11-03 — pin the runtime canonical Compose digest
+
+- Pins the certified LTE Compose model to the digest produced by the API's
+  actual `serde_json` canonicalization path. POLARIS 0.29.9 incorrectly pinned
+  the output of `jq -cS`; numeric rendering differs, so the runtime model was
+  rejected before Grant consumption. The preflight remains fail-closed and no
+  live run was started with the mismatched release.
+
 ## 0.29.9 (polaris-control-api) / safety-guard 0.2.1 — 2026-11-03 — restore the 98% disk ceiling + 8 GiB reserve removed in 0.29.8
 
 - Restores observable srsENB/srsUE runtime logs: the LTE overlay no longer

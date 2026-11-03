@@ -26,7 +26,7 @@ pub const CERTIFIED_IMAGE_ID: &str =
 pub const CERTIFIED_DN_IMAGE_REFERENCE: &str =
     "polaris-lte-sgi-dn@sha256:e60eb72bf7619fd049f6bbbc45cf06927eb73ed7c613446678644f6742af31f3";
 pub const CERTIFIED_COMPOSE_MODEL_SHA256: &str =
-    "b25bc0137713697140aa96cb8e4964c844ce84754a1deb998387c2ed9595e560";
+    "2cd1864dca9a380449fd333233a396dd190f108893afd7693bb5b02f00444578";
 const PROFILE_CONFIGS: [&str; 6] = [
     "/root/POLARIS/runtime/srsran/ue.conf",
     "/root/POLARIS/config/srsran/enb.conf",
@@ -4220,7 +4220,7 @@ some_option = 1
         // The pinned constant carries the new 64-hex compose model digest.
         assert_eq!(
             CERTIFIED_COMPOSE_MODEL_SHA256,
-            "b25bc0137713697140aa96cb8e4964c844ce84754a1deb998387c2ed9595e560"
+            "2cd1864dca9a380449fd333233a396dd190f108893afd7693bb5b02f00444578"
         );
         assert_eq!(CERTIFIED_COMPOSE_MODEL_SHA256.len(), 64);
     }
