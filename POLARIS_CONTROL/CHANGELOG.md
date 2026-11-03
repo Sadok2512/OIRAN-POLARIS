@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.29.8 (polaris-control-api) — 2026-11-03 — ue.conf [log] generation + RRC extract
+
+- Writes a fixed `[log]` section into `/root/POLARIS/runtime/srsran/ue.conf`
+  **before every** `runtime.start(Target::Ue)` with
+  `phy_lib_level=none`, `phy_level=warning`, `mac_level=info`,
+  `rlc_level=debug`, `pdcp_level=debug`, `rrc_level=debug`,
+  `nas_level=debug`, `usim_level=warning`, `all_hex_limit=64`. The patch
+  is section-aware: it replaces only the `[log]` body (or appends it if
+  missing) — every other section stays byte-identical. Addresses the
+  15730a0f pathology where 99.77 % of 156 328 srsUE log lines were
+  PHY_LIB/I noise and the RRC window vanished with Docker log rotation.
+  Expected total log volume per run < 5 MiB with these levels.
+- POLARIS does **not** currently generate a per-run `enb.conf`; the file
+  at `ENB_CONFIG` stays untouched. `RUN_ENB_LOG_SECTION_PLACEHOLDER`
+  documents the four levels to inject if that generation is ever added.
+- Terminal evidence now carries an `rrc_extracts: BTreeMap<String, String>`
+  with the sanitized `[RRC]` lines of srsUE and srsENB, bounded 4 KiB
+  tail per component. The private evidence remains in the root-only run
+  store (`/var/lib/polaris-control/lte-runs-v2/<run_id>.json`), never in
+  a public HTTP body.
+- New primitives (pure functions): `inject_log_section`,
+  `extract_rrc_lines`, and the constant `RUN_UE_LOG_SECTION`.
+- New runtime trait method `apply_run_ue_log_section()` with safe Mock
+  default + injectable `ue_log_section_override`. Wired into the
+  orchestrator just before enb/ue `start`, recorded under step 1.
+
 ## 0.29.7 (polaris-control-api) — 2026-11-03 — ERAB gate + terminal evidence persistence
 
 - Adds a fail-closed `LTE_ERAB_NOT_ESTABLISHED` gate run **before every ping
