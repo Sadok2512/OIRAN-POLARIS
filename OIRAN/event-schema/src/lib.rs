@@ -474,10 +474,100 @@ impl PseudonymKey {
         Ok(Self(key))
     }
 
+    /// Default OS path for the deployment-wide pseudonym key. Operators may
+    /// override it with the `OIRAN_PSEUDONYM_KEY_PATH` environment variable
+    /// (or by calling [`load_or_generate`] with an explicit path).
+    pub const DEFAULT_KEY_PATH: &'static str = "/var/lib/oiran/pseudonym.key";
+
+    /// Reads the per-deployment key from `path`. Behaviour:
+    /// - File exists with mode `0o600` owner-only → load its 32 bytes.
+    /// - File exists with wider permissions → fail `OIRAN_PSEUDONYM_KEY_INSECURE`.
+    /// - File exists and is unreadable or malformed → fail
+    ///   `OIRAN_PSEUDONYM_KEY_UNAVAILABLE`.
+    /// - File is absent → generate a fresh key via [`generate`], create the
+    ///   parent directory (mode `0o700`), write the key atomically with mode
+    ///   `0o600`, and return it. Any write-side failure maps to
+    ///   `OIRAN_PSEUDONYM_KEY_UNAVAILABLE`.
+    ///
+    /// The key bytes are never logged, never exported via the API, never
+    /// persisted in any dataset bundle. They only leave this struct through
+    /// [`pseudonym`] as an HMAC output.
+    pub fn load_or_generate(path: &std::path::Path) -> Result<Self, &'static str> {
+        use std::io::Read;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                if !metadata.is_file()
+                    || metadata.permissions().mode() & 0o077 != 0
+                {
+                    return Err("OIRAN_PSEUDONYM_KEY_INSECURE");
+                }
+                let mut file = std::fs::File::open(path)
+                    .map_err(|_| "OIRAN_PSEUDONYM_KEY_UNAVAILABLE")?;
+                let mut key = [0u8; 32];
+                file.read_exact(&mut key)
+                    .map_err(|_| "OIRAN_PSEUDONYM_KEY_UNAVAILABLE")?;
+                let mut tail = [0u8; 1];
+                if file.read(&mut tail).map_err(|_| "OIRAN_PSEUDONYM_KEY_UNAVAILABLE")? != 0 {
+                    // File longer than 32 bytes — refuse rather than guess.
+                    for byte in &mut key {
+                        unsafe { std::ptr::write_volatile(byte, 0) };
+                    }
+                    return Err("OIRAN_PSEUDONYM_KEY_UNAVAILABLE");
+                }
+                if key.iter().all(|b| *b == 0) {
+                    return Err("OIRAN_PSEUDONYM_KEY_UNAVAILABLE");
+                }
+                Ok(Self(key))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let key = Self::generate()?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|_| "OIRAN_PSEUDONYM_KEY_UNAVAILABLE")?;
+                    let _ = std::fs::set_permissions(
+                        parent,
+                        std::fs::Permissions::from_mode(0o700),
+                    );
+                }
+                let tmp = path.with_extension("key.tmp");
+                let write_result = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&tmp)
+                    .and_then(|mut file| {
+                        use std::io::Write;
+                        file.write_all(&key.0)?;
+                        file.sync_all()
+                    });
+                if write_result.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err("OIRAN_PSEUDONYM_KEY_UNAVAILABLE");
+                }
+                if std::fs::rename(&tmp, path).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err("OIRAN_PSEUDONYM_KEY_UNAVAILABLE");
+                }
+                Ok(key)
+            }
+            Err(_) => Err("OIRAN_PSEUDONYM_KEY_UNAVAILABLE"),
+        }
+    }
+
+    /// Resolves the effective key path: the `OIRAN_PSEUDONYM_KEY_PATH`
+    /// environment variable if set, otherwise [`DEFAULT_KEY_PATH`].
+    pub fn resolve_default_path() -> std::path::PathBuf {
+        std::env::var_os("OIRAN_PSEUDONYM_KEY_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(Self::DEFAULT_KEY_PATH))
+    }
+
     /// Constructor reserved for fixtures. Production imports MUST call
-    /// [`generate`] so the key is a fresh random secret; `from_bytes` only
-    /// exists to let tests pin a deterministic value and assert invariants
-    /// (same key → same pseudonym, different key → different pseudonym).
+    /// [`load_or_generate`] so the key is a fresh random secret; `from_bytes`
+    /// only exists to let tests pin a deterministic value and assert
+    /// invariants (same key → same pseudonym, different key → different
+    /// pseudonym).
     #[doc(hidden)]
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -799,5 +889,112 @@ mod tests {
         assert_ne!(a.as_slice(), b.as_slice());
         assert!(a.as_slice().iter().any(|byte| *byte != 0));
         assert!(b.as_slice().iter().any(|byte| *byte != 0));
+    }
+
+    fn deployment_key_path(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "oiran-pseudonym-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("pseudonym.key")
+    }
+
+    #[test]
+    fn load_or_generate_creates_the_key_on_first_call_and_reloads_it_on_second() {
+        // 2.7.6 adjusted: per-deployment key generated once, re-read on
+        // subsequent calls. Two consecutive calls from different "processes"
+        // (two separate load_or_generate invocations against the same path)
+        // must yield the exact same key — that is what makes continuous
+        // import dedup survive a probe restart.
+        let path = deployment_key_path("first-then-reload");
+        let a = PseudonymKey::load_or_generate(&path).expect("first call generates");
+        let b = PseudonymKey::load_or_generate(&path).expect("second call reloads");
+        assert_eq!(a.as_slice(), b.as_slice());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn load_or_generate_writes_the_key_file_with_mode_0600_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = deployment_key_path("mode-check");
+        let _ = PseudonymKey::load_or_generate(&path).expect("generates");
+        let metadata = std::fs::metadata(&path).expect("file was created");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn load_or_generate_rejects_a_wider_permission_set_fail_closed() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = deployment_key_path("insecure-perms");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&path)
+            .unwrap();
+        file.write_all(&[0x11; 32]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert_eq!(
+            PseudonymKey::load_or_generate(&path).err(),
+            Some("OIRAN_PSEUDONYM_KEY_INSECURE"),
+            "a world-readable key file must not be accepted"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn load_or_generate_rejects_a_truncated_or_oversized_key_file() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let short = deployment_key_path("short-key");
+        std::fs::create_dir_all(short.parent().unwrap()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&short)
+            .unwrap();
+        file.write_all(&[0x11; 16]).unwrap();
+        drop(file);
+        assert_eq!(
+            PseudonymKey::load_or_generate(&short).err(),
+            Some("OIRAN_PSEUDONYM_KEY_UNAVAILABLE")
+        );
+        let _ = std::fs::remove_dir_all(short.parent().unwrap());
+
+        let long = deployment_key_path("long-key");
+        std::fs::create_dir_all(long.parent().unwrap()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&long)
+            .unwrap();
+        file.write_all(&[0x22; 48]).unwrap();
+        drop(file);
+        assert_eq!(
+            PseudonymKey::load_or_generate(&long).err(),
+            Some("OIRAN_PSEUDONYM_KEY_UNAVAILABLE")
+        );
+        let _ = std::fs::remove_dir_all(long.parent().unwrap());
+    }
+
+    #[test]
+    fn resolve_default_path_honours_the_environment_variable_and_falls_back_otherwise() {
+        // We cannot flip the global env safely under cargo test's threaded
+        // harness, so we test the pure helper in both branches via a single
+        // observation per process state.
+        let resolved = PseudonymKey::resolve_default_path();
+        if let Some(explicit) = std::env::var_os("OIRAN_PSEUDONYM_KEY_PATH") {
+            assert_eq!(resolved, std::path::PathBuf::from(explicit));
+        } else {
+            assert_eq!(resolved, std::path::PathBuf::from(PseudonymKey::DEFAULT_KEY_PATH));
+        }
     }
 }

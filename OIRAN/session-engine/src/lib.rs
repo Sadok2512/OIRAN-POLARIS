@@ -351,22 +351,34 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
         })
         .collect::<Vec<_>>();
 
-    // An S11 event crosses capture provenance only when its opaque pseudonym
-    // and bearer TEID identify exactly one S1 context inside the bounded run.
+    // An S11 event crosses capture provenance when its bearer TEID set
+    // uniquely matches one S1 context's E-RAB TEIDs inside the cross-plane
+    // window. The opaque subscriber pseudonym, when present on both sides,
+    // must agree; when either side has no subscriber identifier the TEID
+    // match alone is the bridge (2.7.6: imports can run without any IMSI
+    // anywhere in the trace, so correlation MUST fall back to structural
+    // keys — see `s1_s11_s1u_correlate_by_teid_without_any_subscriber_identifier`).
     for event in lte.iter().copied().filter(|event| event.interface == "S11") {
-        let Some(pseudonym) = lte_subscriber_pseudonym(event) else {
-            continue;
-        };
         let event_teids = ["f_teid", "bearer_f_teid"]
             .into_iter()
             .flat_map(|name| event.identifier_values(name))
             .filter_map(normalized_lte_teid)
             .collect::<BTreeSet<_>>();
+        if event_teids.is_empty() {
+            continue;
+        }
+        let event_pseudonym = lte_subscriber_pseudonym(event);
         let owners = lte_contexts
             .iter()
             .enumerate()
             .filter(|(_, context)| {
-                context.pseudonym.as_deref() == Some(pseudonym)
+                let pseudonyms_agree = match (context.pseudonym.as_deref(), event_pseudonym) {
+                    (Some(context_pseudonym), Some(event_pseudonym)) => {
+                        context_pseudonym == event_pseudonym
+                    }
+                    _ => true,
+                };
+                pseudonyms_agree
                     && !context.erab_teids.is_disjoint(&event_teids)
                     && within_lte_window(event, &context.s1_events)
             })
@@ -2098,6 +2110,93 @@ mod tests {
         assert_eq!(session.start_timestamp_ns, 1_000_000_001);
         assert_eq!(session.end_timestamp_ns, 1_000_000_005);
         assert_eq!(session.duration_ns, 4);
+    }
+
+    #[test]
+    fn s1_s11_s1u_correlate_by_teid_without_any_subscriber_identifier() {
+        // 2.7.6: imports can run with no IMSI anywhere in the trace (the
+        // decoders may legitimately see sessions that never carried an
+        // identity IE). The LTE session discovery must still stitch the
+        // planes using the structural keys: MME/eNB-UE-S1AP-ID on S1-MME,
+        // the F-TEID on S11, and the matching TEID on S1-U. No
+        // `subscriber_pseudonym`, `imsi_pseudonym`, `msisdn_pseudonym` or
+        // `mei_pseudonym` is present on ANY event.
+        let mut s1ap = event(
+            "s1ap",
+            "S1AP",
+            "InitialContextSetupResponse",
+            &[
+                ("enb_ue_s1ap_id", "41"),
+                ("mme_ue_s1ap_id", "7"),
+                ("erab_teid", "0x01020304"),
+            ],
+            1,
+        );
+        s1ap.interface = "S1-MME".into();
+        let mut s11 = event(
+            "s11",
+            "GTPv2-C",
+            "CreateSessionResponse",
+            &[("bearer_ebi", "5"), ("bearer_f_teid", "0x01020304")],
+            2,
+        );
+        s11.interface = "S11".into();
+        s11.capture_id = "capture-s11".into();
+        let mut uplink = event("s1u-ul", "GTP-U", "G-PDU", &[("teid", "0x01020304")], 3);
+        uplink.interface = "S1-U".into();
+        uplink.capture_id = "capture-s1u".into();
+        uplink.direction = "UPLINK".into();
+        uplink.packet_references[0].captured_length = 128;
+        let mut downlink = uplink.clone();
+        downlink.event_id = "s1u-dl".into();
+        downlink.direction = "DOWNLINK".into();
+        downlink.timestamp_ns = uplink.timestamp_ns + 1;
+        downlink.packet_references[0].packet_number = 4;
+        downlink.packet_references[0].captured_length = 256;
+
+        // Precondition: no event carries any subscriber-identity label.
+        let all_events = [&s1ap, &s11, &uplink, &downlink];
+        for e in &all_events {
+            for (name, _) in &e.identifiers {
+                assert!(
+                    ![
+                        "subscriber_pseudonym",
+                        "imsi_pseudonym",
+                        "msisdn_pseudonym",
+                        "mei_pseudonym",
+                        "ue_identity_pseudonym",
+                        "supi",
+                        "imsi",
+                        "msisdn",
+                        "pei",
+                    ]
+                    .contains(&name.as_str()),
+                    "test precondition broken: subscriber identifier {name} leaked into fixture"
+                );
+            }
+        }
+
+        let sessions = discover_lte_sessions(&[s1ap, s11, uplink, downlink]);
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.technology, "LTE");
+        // The S1-MME context carried neither NAS pseudonym nor subscriber id,
+        // so the session falls back to a stable synthetic UE identifier
+        // derived from (capture_id, enb_ue_s1ap_id, mme_ue_s1ap_id).
+        assert!(
+            session.ue_pseudonym.starts_with("LTE-UE-"),
+            "expected stable LTE-UE identifier, got {}",
+            session.ue_pseudonym
+        );
+        // The three planes must all be tied to the single session.
+        assert_eq!(session.state, "ACTIVE_WITH_USER_PLANE");
+        assert_eq!(session.eps_bearer_ids, vec!["5"]);
+        assert_eq!(session.s11_f_teids, vec!["0x01020304"]);
+        assert_eq!(session.tunnels.len(), 1);
+        assert_eq!(session.tunnels[0].teid, "0x01020304");
+        assert_eq!(session.tunnels[0].uplink_packets, 1);
+        assert_eq!(session.tunnels[0].downlink_packets, 1);
+        assert_eq!(session.tunnels[0].bytes, 384);
     }
 
     #[test]
