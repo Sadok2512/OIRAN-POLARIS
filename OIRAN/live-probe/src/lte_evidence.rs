@@ -1626,11 +1626,11 @@ mod tests {
             "S1_MME" => vec![
                 ("enb_ue_s1ap_id".into(), "ctx-enb-a".into()),
                 ("mme_ue_s1ap_id".into(), "ctx-mme-a".into()),
-                ("imsi_pseudonym".into(), "SUB-opaque-a".into()),
+                ("subscriber_pseudonym".into(), "SUB-opaque-a".into()),
                 ("erab_teid".into(), "0x00001001".into()),
             ],
             "S11" => vec![
-                ("imsi_pseudonym".into(), "SUB-opaque-a".into()),
+                ("subscriber_pseudonym".into(), "SUB-opaque-a".into()),
                 ("eps_bearer_identity".into(), "5".into()),
                 ("bearer_f_teid".into(), "0x00001001".into()),
             ],

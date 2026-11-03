@@ -78,6 +78,12 @@ impl EventRecord {
     }
 }
 
+fn lte_subscriber_pseudonym(event: &EventRecord) -> Option<&str> {
+    event
+        .first_identifier("subscriber_pseudonym")
+        .or_else(|| event.first_identifier("imsi_pseudonym"))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UeContext {
     pub pseudonym: String,
@@ -325,7 +331,7 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
                 .collect::<Vec<_>>();
             let pseudonym = s1_events
                 .iter()
-                .find_map(|event| event.first_identifier("imsi_pseudonym"))
+                .find_map(|event| lte_subscriber_pseudonym(event))
                 .map(str::to_owned);
             let erab_teids = s1_events
                 .iter()
@@ -348,7 +354,7 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
     // An S11 event crosses capture provenance only when its opaque pseudonym
     // and bearer TEID identify exactly one S1 context inside the bounded run.
     for event in lte.iter().copied().filter(|event| event.interface == "S11") {
-        let Some(pseudonym) = event.first_identifier("imsi_pseudonym") else {
+        let Some(pseudonym) = lte_subscriber_pseudonym(event) else {
             continue;
         };
         let event_teids = ["f_teid", "bearer_f_teid"]
@@ -2048,7 +2054,7 @@ mod tests {
             &[
                 ("enb_ue_s1ap_id", "41"),
                 ("mme_ue_s1ap_id", "7"),
-                ("imsi_pseudonym", "subscriber-opaque-a"),
+                ("subscriber_pseudonym", "subscriber-opaque-a"),
             ],
             2,
         );
@@ -2058,7 +2064,7 @@ mod tests {
             "GTPv2-C",
             "CreateSessionResponse",
             &[
-                ("imsi_pseudonym", "subscriber-opaque-a"),
+                ("subscriber_pseudonym", "subscriber-opaque-a"),
                 ("bearer_ebi", "5"),
                 ("bearer_f_teid", "0x01020304"),
             ],

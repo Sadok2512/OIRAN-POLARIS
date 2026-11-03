@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.7.6 — 2026-11-03
+
+- Uses the privacy-safe `subscriber_pseudonym` identifier for decoded LTE
+  S11 evidence while retaining read compatibility with legacy
+  `imsi_pseudonym` events.
+- Correlates S1-MME, S11 and S1-U with the privacy-safe opaque pseudonym so
+  POLARIS finalization and OIRAN session reconstruction share one admissible
+  contract.
+
 ## OIRAN API 2.7.5 / disk-safety 0.2.0 — 2026-11-02
 
 - Replaces the legacy 75/80/85/90 capture policy with 95% information, 97%

@@ -114,7 +114,10 @@ fn decode_ie(ie: &Gtpv2cIe) -> (Option<String>, DecodeStatus, bool, Option<&'sta
     let name = ie_name(ie.ie_type);
     match ie.ie_type {
         1 => (
-            Some(format!("imsi_pseudonym={}", pseudonym("imsi", &ie.value))),
+            Some(format!(
+                "subscriber_pseudonym={}",
+                pseudonym("subscriber", &ie.value)
+            )),
             DecodeStatus::Decoded,
             true,
             name,
@@ -447,7 +450,7 @@ fn emit_event(msg: Gtpv2cMessage, input: &DecoderInput<'_>) -> DecoderOutput {
                 if let Some((key, val)) = pair.split_once('=') {
                     if matches!(
                         key,
-                        "imsi_pseudonym"
+                        "subscriber_pseudonym"
                             | "msisdn_pseudonym"
                             | "mei_pseudonym"
                             | "apn"
@@ -711,7 +714,7 @@ mod tests {
         let imsi = ev
             .session_identifiers
             .iter()
-            .find(|v| v.name == "imsi_pseudonym")
+            .find(|v| v.name == "subscriber_pseudonym")
             .expect("imsi identifier");
         assert!(imsi.pseudonymized);
         assert!(imsi.value.starts_with("psn-"));
