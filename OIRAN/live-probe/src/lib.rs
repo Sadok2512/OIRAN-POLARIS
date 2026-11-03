@@ -17,7 +17,7 @@ use correlation_engine::{
 use disk_safety::{assess, capture_budget, measure_path, CaptureBudget, Decision, Policy};
 use event_schema::{
     sha256_hex, DecodeStatus, EvidenceReference, EvidenceState, InformationElement, NamedValue,
-    NormalizedEvent, Protocol, Sha256Hasher,
+    NormalizedEvent, Protocol, PseudonymKey, Sha256Hasher,
 };
 use oiran_decode::{decode_capture_streaming, DecodeConfig, DecodeReport};
 use serde::{Deserialize, Serialize};
@@ -1671,6 +1671,15 @@ impl CaptureManager {
     }
 
     fn run_continuous_import_inner(&self, config: &ContinuousImportConfig) -> Result<(), String> {
+        // 2.7.6: one HMAC-SHA256 pseudonym key per continuous-import lifecycle.
+        // It lives on this stack, is reused for every segment decode so
+        // overlapping snapshots dedupe by identical event_id, and is zeroised
+        // when this function returns. A probe restart re-enters this function
+        // and generates a fresh key, meaning cross-restart pseudonyms differ —
+        // that is the correct privacy posture; correlation across restarts is
+        // only possible via the deterministic structural session_ids computed
+        // downstream (teid, SCTP stream, 5G-GUTI, …).
+        let pseudonym_key = PseudonymKey::generate()?;
         let base = self.root.join(CONTINUOUS_CAPTURE_ID);
         let state_path = base.join("import_state.json");
         let mut state = if state_path.is_file() {
@@ -1901,6 +1910,7 @@ impl CaptureManager {
                         interface: candidate.interface.clone(),
                         endpoints: endpoint_map(),
                     },
+                    &pseudonym_key,
                     |_| Ok(()),
                 ) {
                     self.update(CONTINUOUS_CAPTURE_ID, |job| {
@@ -2000,6 +2010,7 @@ impl CaptureManager {
                         interface: candidate.interface.clone(),
                         endpoints: endpoint_map(),
                     },
+                    &pseudonym_key,
                     |_| Ok(()),
                 ) {
                     let _ = fs::remove_file(&destination);
@@ -2425,6 +2436,11 @@ impl CaptureManager {
         dataset_path: String,
         interfaces: &[CaptureInterface],
     ) -> Result<LiveDataset, String> {
+        // One pseudonym key per capture-processing call. Covers every
+        // interface file in this import pass so subscriber identities are
+        // correlatable across S1-MME / S11 / S1-U within the same dataset
+        // build, but not between separate datasets or probe restarts.
+        let pseudonym_key = PseudonymKey::generate()?;
         let prior_continuous = if capture_id == CONTINUOUS_CAPTURE_ID {
             if let Some(parent) = dataset_dir.parent() {
                 let current = parent.join("dataset");
@@ -2483,6 +2499,7 @@ impl CaptureManager {
                         interface: interface.interface.clone(),
                         endpoints: endpoints.clone(),
                     },
+                    &pseudonym_key,
                     |event| {
                         if aggregate_n3 && event.protocol == Protocol::Gtpu {
                             return n3_aggregator.observe(event);

@@ -10,7 +10,7 @@
 
 use decoder_nas::NasMessage;
 use event_schema::{
-    pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState,
+    pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState, PseudonymKey,
     InformationElement, NamedValue, NormalizedEvent, Protocol,
 };
 use plugin_runtime::{
@@ -150,7 +150,7 @@ fn nas_pdu_contents(value: &[u8]) -> Result<(&[u8], usize), String> {
     Ok((&value[octets..end], octets))
 }
 
-fn decode_ie(ie: &S1apIe) -> (Option<String>, DecodeStatus, bool) {
+fn decode_ie(ie: &S1apIe, pseudonym_key: &PseudonymKey) -> (Option<String>, DecodeStatus, bool) {
     match ie.id {
         0 => decode_s1ap_id("mme_ue_s1ap_id", &ie.value),
         8 => decode_s1ap_id("enb_ue_s1ap_id", &ie.value),
@@ -167,7 +167,7 @@ fn decode_ie(ie: &S1apIe) -> (Option<String>, DecodeStatus, bool) {
         43 => (
             Some(format!(
                 "ue_paging_id_pseudonym={}",
-                pseudonym("ue-paging-id", &ie.value)
+                pseudonym(pseudonym_key, "ue-paging-id", &ie.value)
             )),
             DecodeStatus::Partial,
             true,
@@ -188,7 +188,7 @@ fn decode_ie(ie: &S1apIe) -> (Option<String>, DecodeStatus, bool) {
         96 => (
             Some(format!(
                 "s_tmsi_pseudonym={}",
-                pseudonym("s1ap-s-tmsi", &ie.value)
+                pseudonym(pseudonym_key, "s1ap-s-tmsi", &ie.value)
             )),
             DecodeStatus::Decoded,
             true,
@@ -459,13 +459,16 @@ impl ProtocolDecoder for S1apDecoder {
                     if ie.id == 26 {
                         match nas_pdu_contents(&ie.value) {
                             Ok((nas, offset)) => {
-                                nas_messages
-                                    .push(decoder_nas::decode_with_offset(nas, offset));
+                                nas_messages.push(decoder_nas::decode_with_offset(
+                                    nas,
+                                    offset,
+                                    input.pseudonym_key,
+                                ));
                             }
                             Err(error) => errors.push(error),
                         }
                     }
-                    let (value, ie_status, sensitive) = decode_ie(ie);
+                    let (value, ie_status, sensitive) = decode_ie(ie, input.pseudonym_key);
                     if matches!(
                         ie_status,
                         DecodeStatus::Unsupported
@@ -725,6 +728,7 @@ mod tests {
         bytes: &'a [u8],
         packets: &'a [PacketReference],
         timestamp: &'a ExactTimestamp,
+        key: &'a PseudonymKey,
         src: &'static str,
         dst: &'static str,
     ) -> DecoderInput<'a> {
@@ -745,6 +749,7 @@ mod tests {
             },
             payload: bytes,
             raw_payload_reference: "sha256:synthetic",
+            pseudonym_key: key,
         }
     }
 
@@ -827,7 +832,8 @@ mod tests {
             ],
         );
         let (packets, timestamp) = fixtures();
-        let input = synthetic_input(&bytes, &packets, &timestamp, "eNB", "MME");
+        let key = PseudonymKey::from_bytes([0x11; 32]);
+        let input = synthetic_input(&bytes, &packets, &timestamp, &key, "eNB", "MME");
         let out = S1apDecoder.decode(&input);
         assert_eq!(out.events.len(), 2);
         let event = &out.events[0];
@@ -924,7 +930,8 @@ mod tests {
             ],
         );
         let (packets, timestamp) = fixtures();
-        let input = synthetic_input(&bytes, &packets, &timestamp, "MME", "eNB");
+        let key = PseudonymKey::from_bytes([0x11; 32]);
+        let input = synthetic_input(&bytes, &packets, &timestamp, &key, "MME", "eNB");
         let out = S1apDecoder.decode(&input);
         assert_eq!(out.events.len(), 1);
         let event = &out.events[0];
@@ -960,7 +967,8 @@ mod tests {
     fn unknown_ie_is_preserved_by_sha256_and_length() {
         let bytes = pdu(0, 17, &[(65000, 1, &[0xaa, 0xbb, 0xcc])]);
         let (packets, timestamp) = fixtures();
-        let input = synthetic_input(&bytes, &packets, &timestamp, "eNB", "MME");
+        let key = PseudonymKey::from_bytes([0x11; 32]);
+        let input = synthetic_input(&bytes, &packets, &timestamp, &key, "eNB", "MME");
         let out = S1apDecoder.decode(&input);
         let event = &out.events[0];
         assert_eq!(event.information_elements.len(), 1);

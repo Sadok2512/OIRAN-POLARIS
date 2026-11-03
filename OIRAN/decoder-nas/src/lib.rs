@@ -1,7 +1,7 @@
 //! Native, bounded 5G and EPS NAS envelope and observed-message decoder.
 //! Specification baseline: 3GPP TS 24.501 Release 17 (5G); TS 24.301 (EPS).
 
-use event_schema::{pseudonym, sha256_hex, DecodeStatus, InformationElement, NamedValue};
+use event_schema::{pseudonym, sha256_hex, DecodeStatus, InformationElement, NamedValue, PseudonymKey};
 
 pub const VERSION: &str = "0.3.1";
 pub const SPECIFICATION: &str = "3GPP TS 24.501 Release 17 + 3GPP TS 24.301";
@@ -50,15 +50,24 @@ pub struct NasMessage {
     pub inner: Vec<NasMessage>,
 }
 
-pub fn decode(payload: &[u8]) -> NasMessage {
-    decode_at(payload, 0, 0)
+pub fn decode(payload: &[u8], pseudonym_key: &PseudonymKey) -> NasMessage {
+    decode_at(payload, 0, 0, pseudonym_key)
 }
 
-pub fn decode_with_offset(payload: &[u8], source_offset: usize) -> NasMessage {
-    decode_at(payload, source_offset, 0)
+pub fn decode_with_offset(
+    payload: &[u8],
+    source_offset: usize,
+    pseudonym_key: &PseudonymKey,
+) -> NasMessage {
+    decode_at(payload, source_offset, 0, pseudonym_key)
 }
 
-fn decode_at(payload: &[u8], source_offset: usize, depth: u8) -> NasMessage {
+fn decode_at(
+    payload: &[u8],
+    source_offset: usize,
+    depth: u8,
+    pseudonym_key: &PseudonymKey,
+) -> NasMessage {
     if depth > 4 {
         return malformed(
             payload,
@@ -70,9 +79,9 @@ fn decode_at(payload: &[u8], source_offset: usize, depth: u8) -> NasMessage {
         return malformed(payload, source_offset, "NAS payload is empty");
     };
     match epd {
-        EPD_5GMM => decode_5gmm(payload, source_offset, depth),
+        EPD_5GMM => decode_5gmm(payload, source_offset, depth, pseudonym_key),
         EPD_5GSM => decode_5gsm(payload, source_offset),
-        _ if epd & 0x0f == EPD_EPS_MM => decode_eps_mm(payload, source_offset, depth),
+        _ if epd & 0x0f == EPD_EPS_MM => decode_eps_mm(payload, source_offset, depth, pseudonym_key),
         _ if epd & 0x0f == EPD_EPS_SM => decode_eps_sm(payload, source_offset),
         _ => NasMessage {
             epd,
@@ -103,7 +112,12 @@ fn decode_at(payload: &[u8], source_offset: usize, depth: u8) -> NasMessage {
     }
 }
 
-fn decode_5gmm(payload: &[u8], source_offset: usize, depth: u8) -> NasMessage {
+fn decode_5gmm(
+    payload: &[u8],
+    source_offset: usize,
+    depth: u8,
+    pseudonym_key: &PseudonymKey,
+) -> NasMessage {
     if payload.len() < 2 {
         return malformed(payload, source_offset, "5GMM security header is truncated");
     }
@@ -159,7 +173,7 @@ fn decode_5gmm(payload: &[u8], source_offset: usize, depth: u8) -> NasMessage {
                 inner: Vec::new(),
             };
         }
-        let mut inner = decode_at(&payload[7..], source_offset + 7, depth + 1);
+        let mut inner = decode_at(&payload[7..], source_offset + 7, depth + 1, pseudonym_key);
         inner.security_header_type = security_header_type;
         inner.security_state = security_state;
         inner.information_elements.splice(0..0, ies);
@@ -198,11 +212,16 @@ fn decode_5gmm(payload: &[u8], source_offset: usize, depth: u8) -> NasMessage {
         source_offset,
         inner: Vec::new(),
     };
-    parse_5gmm_body(&mut msg, payload, depth);
+    parse_5gmm_body(&mut msg, payload, depth, pseudonym_key);
     msg
 }
 
-fn parse_5gmm_body(msg: &mut NasMessage, payload: &[u8], depth: u8) {
+fn parse_5gmm_body(
+    msg: &mut NasMessage,
+    payload: &[u8],
+    depth: u8,
+    pseudonym_key: &PseudonymKey,
+) {
     let mt = msg.message_type.unwrap_or_default();
     match mt {
         0x41 => {
@@ -228,13 +247,13 @@ fn parse_5gmm_body(msg: &mut NasMessage, payload: &[u8], depth: u8) {
                 &payload[6..6 + len],
                 Some(format!(
                     "pseudonym={}",
-                    pseudonym("nas-5gs-mobile-identity", &payload[6..6 + len])
+                    pseudonym(pseudonym_key, "nas-5gs-mobile-identity", &payload[6..6 + len])
                 )),
                 DecodeStatus::Decoded,
             ));
             msg.identifiers.push(NamedValue {
                 name: "ue_identity_pseudonym".into(),
-                value: pseudonym("nas-5gs-mobile-identity", &payload[6..6 + len]),
+                value: pseudonym(pseudonym_key, "nas-5gs-mobile-identity", &payload[6..6 + len]),
                 pseudonymized: true,
             });
             parse_optional_tlvs(msg, &payload[6 + len..], 6 + len);
@@ -339,6 +358,7 @@ fn parse_5gmm_body(msg: &mut NasMessage, payload: &[u8], depth: u8) {
                     &payload[6..6 + len],
                     msg.source_offset + 6,
                     depth + 1,
+                    pseudonym_key,
                 ));
             }
             parse_optional_tlvs(msg, &payload[6 + len..], 6 + len);
@@ -792,7 +812,12 @@ fn malformed(raw: &[u8], source_offset: usize, error: &str) -> NasMessage {
     }
 }
 
-fn decode_eps_mm(payload: &[u8], source_offset: usize, depth: u8) -> NasMessage {
+fn decode_eps_mm(
+    payload: &[u8],
+    source_offset: usize,
+    depth: u8,
+    pseudonym_key: &PseudonymKey,
+) -> NasMessage {
     if payload.len() < 2 {
         return malformed(payload, source_offset, "EPS EMM header is truncated");
     }
@@ -873,7 +898,7 @@ fn decode_eps_mm(payload: &[u8], source_offset: usize, depth: u8) -> NasMessage 
                 inner: Vec::new(),
             };
         }
-        let mut inner = decode_at(&payload[6..], source_offset + 6, depth + 1);
+        let mut inner = decode_at(&payload[6..], source_offset + 6, depth + 1, pseudonym_key);
         inner.security_header_type = security_header_type;
         inner.security_state = security_state;
         inner.information_elements.splice(0..0, ies);
@@ -910,11 +935,11 @@ fn decode_eps_mm(payload: &[u8], source_offset: usize, depth: u8) -> NasMessage 
         source_offset,
         inner: Vec::new(),
     };
-    parse_eps_mm_body(&mut msg, payload);
+    parse_eps_mm_body(&mut msg, payload, pseudonym_key);
     msg
 }
 
-fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8]) {
+fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8], pseudonym_key: &PseudonymKey) {
     // payload[0] = PD byte, payload[1] = message type.
     let body = &payload[2..];
     match msg.message_type.unwrap_or_default() {
@@ -937,7 +962,7 @@ fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8]) {
             if 2 + len > body.len() {
                 return mark_truncated(msg, "EPS mobile identity");
             }
-            attach_eps_mobile_identity(msg, &body[2..2 + len]);
+            attach_eps_mobile_identity(msg, &body[2..2 + len], pseudonym_key);
         }
         0x48 => {
             // TAU Request: EPS update type/NAS-KSI (1 byte), old GUTI LV.
@@ -958,7 +983,7 @@ fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8]) {
             if 2 + len > body.len() {
                 return mark_truncated(msg, "Old GUTI");
             }
-            attach_eps_mobile_identity(msg, &body[2..2 + len]);
+            attach_eps_mobile_identity(msg, &body[2..2 + len], pseudonym_key);
         }
         0x45 => {
             // Detach Request: Detach type (1 byte), EPS mobile identity LV.
@@ -979,7 +1004,7 @@ fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8]) {
             if 2 + len > body.len() {
                 return mark_truncated(msg, "EPS mobile identity");
             }
-            attach_eps_mobile_identity(msg, &body[2..2 + len]);
+            attach_eps_mobile_identity(msg, &body[2..2 + len], pseudonym_key);
         }
         0x57 => {
             // Identity Response: Mobile identity LV (variable).
@@ -990,7 +1015,7 @@ fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8]) {
             if 1 + len > body.len() {
                 return mark_truncated(msg, "Mobile identity");
             }
-            attach_eps_mobile_identity(msg, &body[1..1 + len]);
+            attach_eps_mobile_identity(msg, &body[1..1 + len], pseudonym_key);
         }
         0x52 => {
             // Authentication Request: NAS-KSI (1), RAND (16), AUTN LV.
@@ -1088,7 +1113,11 @@ fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8]) {
     }
 }
 
-fn attach_eps_mobile_identity(msg: &mut NasMessage, value: &[u8]) {
+fn attach_eps_mobile_identity(
+    msg: &mut NasMessage,
+    value: &[u8],
+    pseudonym_key: &PseudonymKey,
+) {
     let identity_type = value.first().map(|b| b & 0x07).unwrap_or(0);
     let identity_name = match identity_type {
         1 => "IMSI",
@@ -1097,7 +1126,7 @@ fn attach_eps_mobile_identity(msg: &mut NasMessage, value: &[u8]) {
         6 => "GUTI",
         _ => "Unknown EPS mobile identity",
     };
-    let pseudo = pseudonym("nas-eps-mobile-identity", value);
+    let pseudo = pseudonym(pseudonym_key, "nas-eps-mobile-identity", value);
     msg.information_elements.push(InformationElement {
         id: None,
         name: "EPS mobile identity".into(),
@@ -1270,6 +1299,14 @@ fn sm_eps_name(mt: u8) -> (&'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_key() -> PseudonymKey {
+        PseudonymKey::from_bytes([0xcc; 32])
+    }
+
+    fn decode(payload: &[u8]) -> NasMessage {
+        super::decode(payload, &test_key())
+    }
 
     #[test]
     fn dispatches_observed_plain_5gmm() {

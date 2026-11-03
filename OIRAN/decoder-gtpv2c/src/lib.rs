@@ -9,7 +9,7 @@
 
 use event_schema::{
     pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState,
-    InformationElement, NamedValue, NormalizedEvent, Protocol,
+    InformationElement, NamedValue, NormalizedEvent, Protocol, PseudonymKey,
 };
 use plugin_runtime::{
     DecoderCapabilities, DecoderInput, DecoderManifest, DecoderOutput, ProtocolDecoder,
@@ -110,20 +110,26 @@ fn parse_ies(mut data: &[u8], depth: usize) -> Result<Vec<Gtpv2cIe>, String> {
     Ok(ies)
 }
 
-fn decode_ie(ie: &Gtpv2cIe) -> (Option<String>, DecodeStatus, bool, Option<&'static str>) {
+fn decode_ie(
+    ie: &Gtpv2cIe,
+    pseudonym_key: &PseudonymKey,
+) -> (Option<String>, DecodeStatus, bool, Option<&'static str>) {
     let name = ie_name(ie.ie_type);
     match ie.ie_type {
         1 => (
             Some(format!(
                 "subscriber_pseudonym={}",
-                pseudonym("subscriber", &ie.value)
+                pseudonym(pseudonym_key, "subscriber", &ie.value)
             )),
             DecodeStatus::Decoded,
             true,
             name,
         ),
         75 => (
-            Some(format!("mei_pseudonym={}", pseudonym("mei", &ie.value))),
+            Some(format!(
+                "mei_pseudonym={}",
+                pseudonym(pseudonym_key, "mei", &ie.value)
+            )),
             DecodeStatus::Decoded,
             true,
             name,
@@ -131,7 +137,7 @@ fn decode_ie(ie: &Gtpv2cIe) -> (Option<String>, DecodeStatus, bool, Option<&'sta
         76 => (
             Some(format!(
                 "msisdn_pseudonym={}",
-                pseudonym("msisdn", &ie.value)
+                pseudonym(pseudonym_key, "msisdn", &ie.value)
             )),
             DecodeStatus::Decoded,
             true,
@@ -434,7 +440,7 @@ fn emit_event(msg: Gtpv2cMessage, input: &DecoderInput<'_>) -> DecoderOutput {
         pseudonymized: false,
     });
     for ie in &msg.ies {
-        let (value, ie_status, sensitive, name) = decode_ie(ie);
+        let (value, ie_status, sensitive, name) = decode_ie(ie, input.pseudonym_key);
         if matches!(
             ie_status,
             DecodeStatus::Unsupported | DecodeStatus::Partial
@@ -484,7 +490,7 @@ fn emit_event(msg: Gtpv2cMessage, input: &DecoderInput<'_>) -> DecoderOutput {
             status: ie_status,
         });
         for child in &ie.children {
-            let (cv, cs, csens, cname) = decode_ie(child);
+            let (cv, cs, csens, cname) = decode_ie(child, input.pseudonym_key);
             if let Some(v) = &cv {
                 for pair in v.split(',') {
                     if let Some((key, val)) = pair.split_once('=') {
@@ -646,6 +652,7 @@ mod tests {
         bytes: &'a [u8],
         p: &'a [PacketReference],
         t: &'a ExactTimestamp,
+        key: &'a PseudonymKey,
         src: &'static str,
         dst: &'static str,
     ) -> DecoderInput<'a> {
@@ -666,6 +673,7 @@ mod tests {
             },
             payload: bytes,
             raw_payload_reference: "sha256:synthetic".into(),
+            pseudonym_key: key,
         }
     }
 
@@ -705,7 +713,8 @@ mod tests {
 
         let bytes = msg(32, Some(0), 7, &body);
         let (p, t) = fixtures();
-        let in_ = input(&bytes, &p, &t, "MME", "SGW");
+        let key = PseudonymKey::from_bytes([0x11; 32]);
+        let in_ = input(&bytes, &p, &t, &key, "MME", "SGW");
         let out = Gtpv2cDecoder.decode(&in_);
         assert_eq!(out.events.len(), 1);
         let ev = &out.events[0];
@@ -746,6 +755,85 @@ mod tests {
     }
 
     #[test]
+    fn export_of_a_full_session_contains_no_raw_imsi_imei_or_msisdn() {
+        // Build a Create Session Request carrying synthetic BCD-encoded
+        // IMSI/IMEI/MSISDN bytes, serialise the normalised event to JSON
+        // (the shape the probe writes to oiran_events.jsonl), and assert
+        // none of the raw hex digits survive. 2.7.6 pseudonymization must
+        // mask the subscriber identity even inside the exported stream.
+        let synthetic_imsi = &[0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12];
+        let synthetic_msisdn = &[0x00, 0x10, 0x00, 0x00, 0x00, 0x12];
+        let synthetic_mei = &[0x30, 0x53, 0x01, 0x80, 0x12, 0x34, 0x56, 0x78];
+        let apn = &[8, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't'];
+        let serving_plmn = &[0x00, 0xf1, 0x10];
+        let ebi = &[5];
+        let fteid = &[0x81, 0x00, 0x00, 0x00, 0x05, 10, 10, 10, 10];
+        let mut body = Vec::new();
+        body.extend_from_slice(&ie(1, 0, synthetic_imsi));
+        body.extend_from_slice(&ie(76, 0, synthetic_msisdn));
+        body.extend_from_slice(&ie(75, 0, synthetic_mei));
+        body.extend_from_slice(&ie(71, 0, apn));
+        body.extend_from_slice(&ie(83, 0, serving_plmn));
+        body.extend_from_slice(&ie(73, 0, ebi));
+        body.extend_from_slice(&ie(87, 0, fteid));
+        let bytes = msg(32, Some(0), 7, &body);
+        let (p, t) = fixtures();
+        let key = PseudonymKey::from_bytes([0xee; 32]);
+        let in_ = input(&bytes, &p, &t, &key, "MME", "SGW");
+        let out = Gtpv2cDecoder.decode(&in_);
+        let event_json = out.events[0].to_json();
+        // Raw hex representations of the identity bytes must not appear.
+        assert!(!event_json.contains("00100000000012"));
+        assert!(!event_json.contains("001000000012"));
+        assert!(!event_json.contains("30530180"));
+        // The pseudonym is present and marked as such.
+        assert!(event_json.contains("subscriber_pseudonym"));
+        assert!(event_json.contains("psn-"));
+        assert!(event_json.contains("\"pseudonymized\":true"));
+    }
+
+    #[test]
+    fn same_imsi_within_one_import_produces_the_same_pseudonym_on_s11_and_s1u() {
+        // Correlation within one import: the S11 Create Session Request and
+        // a hypothetical second GTPv2-C exchange carrying the same IMSI
+        // under the same key must share the exact same pseudonym. This is
+        // what allows the Analyzer to stitch the subscriber-level view.
+        let synthetic_imsi = &[0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12];
+        let apn = &[8, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't'];
+        let serving_plmn = &[0x00, 0xf1, 0x10];
+        let ebi = &[5];
+        let fteid = &[0x81, 0x00, 0x00, 0x00, 0x05, 10, 10, 10, 10];
+        let build = |teid: u32| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&ie(1, 0, synthetic_imsi));
+            body.extend_from_slice(&ie(71, 0, apn));
+            body.extend_from_slice(&ie(83, 0, serving_plmn));
+            body.extend_from_slice(&ie(73, 0, ebi));
+            body.extend_from_slice(&ie(87, 0, fteid));
+            msg(32, Some(teid), 7, &body)
+        };
+        let (p, t) = fixtures();
+        let key = PseudonymKey::from_bytes([0x5c; 32]);
+        let first = build(0x1111_1111);
+        let second = build(0x2222_2222);
+        let first_input = input(&first, &p, &t, &key, "MME", "SGW");
+        let second_input = input(&second, &p, &t, &key, "MME", "SGW");
+        let subscriber = |out: DecoderOutput| {
+            out.events[0]
+                .session_identifiers
+                .iter()
+                .find(|v| v.name == "subscriber_pseudonym")
+                .expect("subscriber identifier")
+                .value
+                .clone()
+        };
+        assert_eq!(
+            subscriber(Gtpv2cDecoder.decode(&first_input)),
+            subscriber(Gtpv2cDecoder.decode(&second_input))
+        );
+    }
+
+    #[test]
     fn create_session_response_decodes_paa_and_fteid() {
         let cause = &[16, 0]; // Request accepted
         let paa = &[0x01, 10, 46, 0, 1];
@@ -756,7 +844,8 @@ mod tests {
         body.extend_from_slice(&ie(87, 0, fteid));
         let bytes = msg(33, Some(0xdeadbeef), 7, &body);
         let (p, t) = fixtures();
-        let in_ = input(&bytes, &p, &t, "SGW", "MME");
+        let key = PseudonymKey::from_bytes([0x22; 32]);
+        let in_ = input(&bytes, &p, &t, &key, "SGW", "MME");
         let out = Gtpv2cDecoder.decode(&in_);
         let ev = &out.events[0];
         assert_eq!(ev.message_name, "CreateSessionResponse");
@@ -798,7 +887,8 @@ mod tests {
         let body = ie(93, 0, &inner);
         let bytes = msg(32, Some(0), 1, &body);
         let (p, tts) = fixtures();
-        let in_ = input(&bytes, &p, &tts, "MME", "SGW");
+        let key = PseudonymKey::from_bytes([0x33; 32]);
+        let in_ = input(&bytes, &p, &tts, &key, "MME", "SGW");
         let out = Gtpv2cDecoder.decode(&in_);
         let ev = &out.events[0];
         assert!(ev
@@ -816,7 +906,8 @@ mod tests {
         let body = ie(220, 0, &[0xaa, 0xbb]);
         let bytes = msg(32, Some(0), 1, &body);
         let (p, t) = fixtures();
-        let in_ = input(&bytes, &p, &t, "MME", "SGW");
+        let key = PseudonymKey::from_bytes([0x11; 32]);
+        let in_ = input(&bytes, &p, &t, &key, "MME", "SGW");
         let out = Gtpv2cDecoder.decode(&in_);
         let ev = &out.events[0];
         let ie = ev

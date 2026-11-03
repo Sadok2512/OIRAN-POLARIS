@@ -17,7 +17,7 @@ pub use transfer::{
 use decoder_nas::NasMessage;
 use event_schema::{
     pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState,
-    InformationElement, NamedValue, NormalizedEvent, Protocol,
+    InformationElement, NamedValue, NormalizedEvent, Protocol, PseudonymKey,
 };
 use plugin_runtime::{
     DecoderCapabilities, DecoderInput, DecoderManifest, DecoderOutput, ProtocolDecoder,
@@ -140,7 +140,7 @@ fn aper_length(data: &[u8]) -> Result<(usize, usize), String> {
         Err("APER fragmented length determinant unsupported".into())
     }
 }
-fn decode_ie(ie: &NgapIe) -> (Option<String>, DecodeStatus, bool) {
+fn decode_ie(ie: &NgapIe, pseudonym_key: &PseudonymKey) -> (Option<String>, DecodeStatus, bool) {
     match ie.id {
         0 => decode_allowed_nssai(&ie.value),
         1 => decode_printable("amf_name", &ie.value),
@@ -177,11 +177,14 @@ fn decode_ie(ie: &NgapIe) -> (Option<String>, DecodeStatus, bool) {
             let protected = nas.get(1).map(|v| v >> 4 != 0).unwrap_or(false);
             (
                 Some(if protected {
-                    format!("nas_protected=true,pseudonym={}", pseudonym("nas-pdu", nas))
+                    format!(
+                        "nas_protected=true,pseudonym={}",
+                        pseudonym(pseudonym_key, "nas-pdu", nas)
+                    )
                 } else {
                     format!(
                         "nas_protected=false,pseudonym={}",
-                        pseudonym("nas-pdu", nas)
+                        pseudonym(pseudonym_key, "nas-pdu", nas)
                     )
                 }),
                 DecodeStatus::Decoded,
@@ -191,7 +194,7 @@ fn decode_ie(ie: &NgapIe) -> (Option<String>, DecodeStatus, bool) {
         26 => (
             Some(format!(
                 "five_g_s_tmsi={}",
-                pseudonym("five-g-s-tmsi", &ie.value)
+                pseudonym(pseudonym_key, "five-g-s-tmsi", &ie.value)
             )),
             DecodeStatus::Decoded,
             true,
@@ -203,7 +206,7 @@ fn decode_ie(ie: &NgapIe) -> (Option<String>, DecodeStatus, bool) {
         34 => (
             Some(format!(
                 "masked_imeisv={}",
-                pseudonym("masked-imeisv", &ie.value)
+                pseudonym(pseudonym_key, "masked-imeisv", &ie.value)
             )),
             DecodeStatus::Decoded,
             true,
@@ -799,14 +802,14 @@ impl ProtocolDecoder for NgapDecoder {
                     if ie.id == 38 {
                         match nas_pdu_contents(&ie.value) {
                             Ok((nas, offset)) => {
-                                nas_messages.push(decoder_nas::decode_with_offset(nas, offset))
+                                nas_messages.push(decoder_nas::decode_with_offset(nas, offset, input.pseudonym_key))
                             }
                             Err(error) => errors.push(error),
                         }
                     } else if let Some((nas, offset)) = pdu_session_nas_contents(ie) {
-                        nas_messages.push(decoder_nas::decode_with_offset(nas, offset));
+                        nas_messages.push(decoder_nas::decode_with_offset(nas, offset, input.pseudonym_key));
                     }
-                    let (value, ie_status, sensitive) = decode_ie(ie);
+                    let (value, ie_status, sensitive) = decode_ie(ie, input.pseudonym_key);
                     if matches!(
                         ie_status,
                         DecodeStatus::Unsupported
@@ -1146,7 +1149,11 @@ mod tests {
         let p = parse(&b).unwrap();
         assert_eq!(p.message_name, "InitialUEMessage");
         assert_eq!(p.ies.len(), 3);
-        assert_eq!(decode_ie(&p.ies[0]).0.as_deref(), Some("ran_ue_ngap_id=4"));
+        let key = PseudonymKey::from_bytes([0x66; 32]);
+        assert_eq!(
+            decode_ie(&p.ies[0], &key).0.as_deref(),
+            Some("ran_ue_ngap_id=4")
+        );
     }
     #[test]
     fn unknown_ie_is_preserved() {
@@ -1254,6 +1261,7 @@ mod tests {
             resolution_base: 10,
             resolution_exponent: 9,
         };
+        let key = PseudonymKey::from_bytes([0x99; 32]);
         let input = DecoderInput {
             capture_id: "cap",
             packet_references: &packets,
@@ -1271,6 +1279,7 @@ mod tests {
             },
             payload: &bytes,
             raw_payload_reference: "sha256:packet",
+            pseudonym_key: &key,
         };
         let output = NgapDecoder.decode(&input);
         assert_eq!(output.events.len(), 2);

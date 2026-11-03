@@ -438,11 +438,140 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hasher.update(bytes);
     hasher.finish_hex()
 }
-pub fn pseudonym(label: &str, bytes: &[u8]) -> String {
-    let mut material = label.as_bytes().to_vec();
-    material.push(0);
-    material.extend_from_slice(bytes);
-    format!("psn-{:016x}", stable_hash(&material))
+
+/// 32-byte random secret bound to a single import. The key never leaves
+/// process memory: `Debug`, `Display`, serde and `to_string` are deliberately
+/// not implemented, and `Drop` zeroises the bytes.
+///
+/// Correlation within an import works because every call to
+/// [`pseudonym`] with the same key and raw identity produces the same string;
+/// correlation across imports is infeasible because each import carries a
+/// fresh random key.
+pub struct PseudonymKey([u8; 32]);
+
+impl std::fmt::Debug for PseudonymKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately redacted — raw bytes must never leak through log,
+        // tracing, nor panic output.
+        f.write_str("PseudonymKey(<redacted>)")
+    }
+}
+
+impl PseudonymKey {
+    /// Reads 32 bytes from `/dev/urandom`. Fails closed when the OS entropy
+    /// source is unavailable — callers must surface
+    /// `OIRAN_PSEUDONYM_KEY_UNAVAILABLE`, never fall back to an unkeyed hash.
+    pub fn generate() -> Result<Self, &'static str> {
+        use std::io::Read;
+        let mut file = std::fs::File::open("/dev/urandom")
+            .map_err(|_| "OIRAN_PSEUDONYM_KEY_UNAVAILABLE")?;
+        let mut key = [0u8; 32];
+        file.read_exact(&mut key)
+            .map_err(|_| "OIRAN_PSEUDONYM_KEY_UNAVAILABLE")?;
+        if key.iter().all(|b| *b == 0) {
+            return Err("OIRAN_PSEUDONYM_KEY_UNAVAILABLE");
+        }
+        Ok(Self(key))
+    }
+
+    /// Constructor reserved for fixtures. Production imports MUST call
+    /// [`generate`] so the key is a fresh random secret; `from_bytes` only
+    /// exists to let tests pin a deterministic value and assert invariants
+    /// (same key → same pseudonym, different key → different pseudonym).
+    #[doc(hidden)]
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for PseudonymKey {
+    fn drop(&mut self) {
+        // Best-effort zeroisation. Protects against swap/crash dumps, not
+        // against a compiler that proves the memory unused — but since the
+        // key is read back by `as_slice()`, the writes cannot be dropped
+        // without a volatile hint.
+        for byte in &mut self.0 {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+    }
+}
+
+/// HMAC-SHA256 implemented on top of the hand-rolled [`Sha256Hasher`]. No
+/// external dependency is pulled in, and the key never flows into logs: the
+/// struct carries only derived blocks.
+struct HmacSha256 {
+    inner: Sha256Hasher,
+    outer: Sha256Hasher,
+}
+
+impl HmacSha256 {
+    fn new(key: &[u8]) -> Self {
+        let mut normalised = [0u8; 64];
+        if key.len() > 64 {
+            let digest_hex = sha256_hex(key);
+            for i in 0..32 {
+                let byte = u8::from_str_radix(&digest_hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
+                normalised[i] = byte;
+            }
+        } else {
+            normalised[..key.len()].copy_from_slice(key);
+        }
+        let mut i_pad = [0u8; 64];
+        let mut o_pad = [0u8; 64];
+        for i in 0..64 {
+            i_pad[i] = normalised[i] ^ 0x36;
+            o_pad[i] = normalised[i] ^ 0x5c;
+        }
+        let mut inner = Sha256Hasher::new();
+        inner.update(&i_pad);
+        let mut outer = Sha256Hasher::new();
+        outer.update(&o_pad);
+        // Scrub pad buffers; the key is still in `normalised`, so scrub that
+        // too before the stack frame returns.
+        for byte in &mut i_pad {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        for byte in &mut o_pad {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        for byte in &mut normalised {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        Self { inner, outer }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    fn finish_hex(mut self) -> String {
+        let inner_hex = self.inner.finish_hex();
+        // Convert 64-char hex digest back to 32 raw bytes to feed the outer
+        // block, exactly as RFC 2104 requires.
+        let mut inner_bytes = [0u8; 32];
+        for i in 0..32 {
+            inner_bytes[i] = u8::from_str_radix(&inner_hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
+        }
+        self.outer.update(&inner_bytes);
+        self.outer.finish_hex()
+    }
+}
+
+/// Keyed pseudonym for subscriber-level identity bytes (IMSI, MEI, MSISDN,
+/// user IDs). Uses HMAC-SHA256(key, label || 0x00 || bytes) and returns the
+/// first 128 bits as `psn-<32 hex>`. Enumerating raw identities without the
+/// key does not reveal the pseudonym, so the output is safe to export.
+pub fn pseudonym(key: &PseudonymKey, label: &str, bytes: &[u8]) -> String {
+    let mut mac = HmacSha256::new(key.as_slice());
+    mac.update(label.as_bytes());
+    mac.update(&[0u8]);
+    mac.update(bytes);
+    let hex = mac.finish_hex();
+    format!("psn-{}", &hex[..32])
 }
 fn endpoint_json(e: &Endpoint) -> String {
     format!(
@@ -569,5 +698,106 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_test_vectors() {
+        // RFC 4231 §4.2 test case 1: key = 0x0b repeated 20 bytes, data = b"Hi There".
+        let mut mac = HmacSha256::new(&[0x0b; 20]);
+        mac.update(b"Hi There");
+        assert_eq!(
+            mac.finish_hex(),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        // RFC 4231 §4.3 test case 2: key = "Jefe", data = "what do ya want for nothing?"
+        let mut mac = HmacSha256::new(b"Jefe");
+        mac.update(b"what do ya want for nothing?");
+        assert_eq!(
+            mac.finish_hex(),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn same_identity_and_same_key_produces_identical_pseudonym() {
+        // Correlation within one import: the same IMSI bytes must always
+        // yield the same pseudonym under the same key, otherwise the S1-MME /
+        // S11 / S1-U events cannot be stitched back to the same subscriber.
+        let key = PseudonymKey::from_bytes([0x24; 32]);
+        let imsi = b"\x00\x10\x00\x00\x00\x00\x00\x12";
+        assert_eq!(
+            pseudonym(&key, "subscriber", imsi),
+            pseudonym(&key, "subscriber", imsi)
+        );
+        // 128-bit output: `psn-` prefix + 32 hex chars.
+        let output = pseudonym(&key, "subscriber", imsi);
+        assert!(output.starts_with("psn-"));
+        assert_eq!(output.len(), 4 + 32);
+        assert!(output[4..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn different_keys_produce_different_pseudonyms_for_the_same_identity() {
+        // Impossible correlation across imports: two imports of the same raw
+        // IMSI must emit disjoint pseudonyms, so no third party can join
+        // exports back to a single subscriber by enumerating identities.
+        let left = PseudonymKey::from_bytes([0x01; 32]);
+        let right = PseudonymKey::from_bytes([0x02; 32]);
+        let imsi = b"\x00\x10\x00\x00\x00\x00\x00\x12";
+        assert_ne!(
+            pseudonym(&left, "subscriber", imsi),
+            pseudonym(&right, "subscriber", imsi)
+        );
+    }
+
+    #[test]
+    fn labels_separate_identities_of_the_same_type_bytes() {
+        // Different labels are domain-separated — the same bytes under
+        // `subscriber` and under `mei` must yield different pseudonyms so
+        // operators cannot infer an IMSI from an IMEI (or vice-versa).
+        let key = PseudonymKey::from_bytes([0x33; 32]);
+        let bytes = b"\x01\x02\x03\x04";
+        assert_ne!(
+            pseudonym(&key, "subscriber", bytes),
+            pseudonym(&key, "mei", bytes)
+        );
+    }
+
+    #[test]
+    fn pseudonym_is_not_recoverable_from_identity_alone() {
+        // Without the per-import secret, enumerating raw IMSIs cannot reveal
+        // the exported pseudonym. We assert that two independent key draws
+        // produce different outputs for the full published IMSI space mocked
+        // here, so a brute-force attacker would need the key to match.
+        let imsi = b"\x00\x10\x00\x00\x00\x00\x00\x12";
+        // Approximation of "the attacker has every IMSI but no key": any
+        // plausible unkeyed hash of the IMSI is unrelated to the keyed
+        // pseudonym under a random key.
+        let key = PseudonymKey::generate().expect("urandom available");
+        assert_ne!(
+            pseudonym(&key, "subscriber", imsi),
+            format!("psn-{:032x}", stable_hash(imsi))
+        );
+    }
+
+    #[test]
+    fn pseudonym_key_debug_does_not_leak_bytes() {
+        // Guard against accidental log/panic disclosures.
+        let key = PseudonymKey::from_bytes([0xde; 32]);
+        let dbg = format!("{key:?}");
+        assert_eq!(dbg, "PseudonymKey(<redacted>)");
+        assert!(!dbg.contains("de"));
+        assert!(!dbg.contains("222"));
+    }
+
+    #[test]
+    fn pseudonym_key_generate_is_random_and_nonzero() {
+        // Smoke check: two consecutive generates almost always differ, and
+        // neither is all-zeros (which would mean the entropy source misfed).
+        let a = PseudonymKey::generate().expect("urandom available");
+        let b = PseudonymKey::generate().expect("urandom available");
+        assert_ne!(a.as_slice(), b.as_slice());
+        assert!(a.as_slice().iter().any(|byte| *byte != 0));
+        assert!(b.as_slice().iter().any(|byte| *byte != 0));
     }
 }

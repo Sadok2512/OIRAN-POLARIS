@@ -8,7 +8,7 @@
 //! are decoded.
 
 use event_schema::{
-    pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState,
+    pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState, PseudonymKey,
     InformationElement, NamedValue, NormalizedEvent, Protocol,
 };
 use plugin_runtime::{
@@ -149,13 +149,14 @@ fn is_grouped_avp(code: u32, vendor_id: Option<u32>) -> bool {
 
 fn decode_avp(
     avp: &DiameterAvp,
+    pseudonym_key: &PseudonymKey,
 ) -> (Option<String>, DecodeStatus, bool, Option<&'static str>) {
     let name = avp_name(avp.code, avp.vendor_id);
     match (avp.code, avp.vendor_id) {
         (1, None) => (
             Some(format!(
                 "user_name_pseudonym={}",
-                pseudonym("diameter-user-name", &avp.value)
+                pseudonym(pseudonym_key, "diameter-user-name", &avp.value)
             )),
             DecodeStatus::Decoded,
             true,
@@ -164,7 +165,7 @@ fn decode_avp(
         (701, Some(10415)) => (
             Some(format!(
                 "msisdn_pseudonym={}",
-                pseudonym("msisdn", &avp.value)
+                pseudonym(pseudonym_key, "msisdn", &avp.value)
             )),
             DecodeStatus::Decoded,
             true,
@@ -396,7 +397,14 @@ fn emit_event(msg: DiameterMessage, input: &DecoderInput<'_>) -> DecoderOutput {
         pseudonymized: false,
     });
     for avp in &msg.avps {
-        emit_avp(avp, &mut elements, &mut identifiers, &mut status, &mut errors);
+        emit_avp(
+            avp,
+            &mut elements,
+            &mut identifiers,
+            &mut status,
+            &mut errors,
+            input.pseudonym_key,
+        );
     }
     let mut event = NormalizedEvent {
         event_id: String::new(),
@@ -446,8 +454,9 @@ fn emit_avp(
     identifiers: &mut Vec<NamedValue>,
     status: &mut DecodeStatus,
     errors: &mut Vec<String>,
+    pseudonym_key: &PseudonymKey,
 ) {
-    let (value, avp_status, sensitive, name) = decode_avp(avp);
+    let (value, avp_status, sensitive, name) = decode_avp(avp, pseudonym_key);
     if matches!(
         avp_status,
         DecodeStatus::Unsupported | DecodeStatus::Partial
@@ -500,7 +509,7 @@ fn emit_avp(
         status: avp_status,
     });
     for child in &avp.children {
-        emit_avp(child, elements, identifiers, status, errors);
+        emit_avp(child, elements, identifiers, status, errors, pseudonym_key);
     }
 }
 
@@ -607,6 +616,7 @@ mod tests {
         bytes: &'a [u8],
         p: &'a [PacketReference],
         t: &'a ExactTimestamp,
+        key: &'a PseudonymKey,
         src: &'static str,
         dst: &'static str,
     ) -> DecoderInput<'a> {
@@ -627,6 +637,7 @@ mod tests {
             },
             payload: bytes,
             raw_payload_reference: "sha256:synthetic".into(),
+            pseudonym_key: key,
         }
     }
 
@@ -642,7 +653,8 @@ mod tests {
         body.extend_from_slice(&avp(1407, Some(10415), 0x40, visited_plmn));
         let bytes = message(316, true, 16777251, &body);
         let (p, t) = fixtures();
-        let in_ = input(&bytes, &p, &t, "MME", "HSS");
+        let key = PseudonymKey::from_bytes([0xbb; 32]);
+        let in_ = input(&bytes, &p, &t, &key, "MME", "HSS");
         let out = DiameterDecoder.decode(&in_);
         assert_eq!(out.events.len(), 1);
         let ev = &out.events[0];
@@ -674,7 +686,8 @@ mod tests {
         body.extend_from_slice(&avp(1400, Some(10415), 0x40, &subscription_data_inner));
         let bytes = message(316, false, 16777251, &body);
         let (p, t) = fixtures();
-        let in_ = input(&bytes, &p, &t, "HSS", "MME");
+        let key = PseudonymKey::from_bytes([0xbb; 32]);
+        let in_ = input(&bytes, &p, &t, &key, "HSS", "MME");
         let out = DiameterDecoder.decode(&in_);
         let ev = &out.events[0];
         assert_eq!(ev.message_name, "Update-Location-Answer");
@@ -719,7 +732,8 @@ mod tests {
         let body = avp(65535, None, 0x40, &[1, 2, 3]);
         let bytes = message(316, true, 16777251, &body);
         let (p, t) = fixtures();
-        let in_ = input(&bytes, &p, &t, "MME", "HSS");
+        let key = PseudonymKey::from_bytes([0xbb; 32]);
+        let in_ = input(&bytes, &p, &t, &key, "MME", "HSS");
         let out = DiameterDecoder.decode(&in_);
         let ev = &out.events[0];
         let unknown = ev
@@ -773,7 +787,8 @@ mod tests {
         body.extend_from_slice(&avp(1407, Some(10415), 0x40, &[0x00, 0xf1, 0x10]));
         let bytes = message(316, true, 16777251, &body);
         let (p, t) = fixtures();
-        let in_ = input(&bytes, &p, &t, "MME", "HSS");
+        let key = PseudonymKey::from_bytes([0xbb; 32]);
+        let in_ = input(&bytes, &p, &t, &key, "MME", "HSS");
         let out = DiameterDecoder.decode(&in_);
         assert_eq!(out.status, DecodeStatus::Decoded, "status: {:?}", out.status);
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);

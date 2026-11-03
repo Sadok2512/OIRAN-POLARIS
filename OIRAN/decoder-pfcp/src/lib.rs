@@ -2,7 +2,7 @@
 
 use event_schema::{
     pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState,
-    InformationElement, NamedValue, NormalizedEvent, Protocol,
+    InformationElement, NamedValue, NormalizedEvent, Protocol, PseudonymKey,
 };
 use plugin_runtime::{
     DecoderCapabilities, DecoderInput, DecoderManifest, DecoderOutput, ProtocolDecoder,
@@ -31,7 +31,7 @@ pub struct PfcpIe {
     pub status: DecodeStatus,
 }
 
-pub fn parse(payload: &[u8]) -> Result<PfcpMessage, String> {
+pub fn parse(payload: &[u8], pseudonym_key: &PseudonymKey) -> Result<PfcpMessage, String> {
     if payload.len() < 8 {
         return Err("PFCP header truncated".into());
     }
@@ -62,7 +62,7 @@ pub fn parse(payload: &[u8]) -> Result<PfcpMessage, String> {
     } else {
         None
     };
-    let (mut ies, unknown) = parse_ies(&payload[header..total], 0)?;
+    let (mut ies, unknown) = parse_ies(&payload[header..total], 0, pseudonym_key)?;
     Ok(PfcpMessage {
         message_type: payload[1],
         seid,
@@ -75,7 +75,11 @@ pub fn parse(payload: &[u8]) -> Result<PfcpMessage, String> {
         unknown_count: unknown,
     })
 }
-fn parse_ies(mut data: &[u8], depth: usize) -> Result<(Vec<PfcpIe>, usize), String> {
+fn parse_ies(
+    mut data: &[u8],
+    depth: usize,
+    pseudonym_key: &PseudonymKey,
+) -> Result<(Vec<PfcpIe>, usize), String> {
     if depth > 8 {
         return Err("PFCP grouped IE nesting exceeds 8".into());
     }
@@ -94,7 +98,7 @@ fn parse_ies(mut data: &[u8], depth: usize) -> Result<(Vec<PfcpIe>, usize), Stri
         let known = ie_name(t);
         let grouped = is_grouped(t);
         let (children, child_unknown) = if grouped {
-            parse_ies(value, depth + 1)?
+            parse_ies(value, depth + 1, pseudonym_key)?
         } else {
             (Vec::new(), 0)
         };
@@ -102,7 +106,7 @@ fn parse_ies(mut data: &[u8], depth: usize) -> Result<(Vec<PfcpIe>, usize), Stri
         let decoded = if grouped {
             None
         } else {
-            decode_value(t, value)?
+            decode_value(t, value, pseudonym_key)?
         };
         let status = if grouped {
             if child_unknown == 0 {
@@ -132,7 +136,11 @@ fn parse_ies(mut data: &[u8], depth: usize) -> Result<(Vec<PfcpIe>, usize), Stri
     }
     Ok((out, unknown))
 }
-fn decode_value(t: u16, v: &[u8]) -> Result<Option<String>, String> {
+fn decode_value(
+    t: u16,
+    v: &[u8],
+    pseudonym_key: &PseudonymKey,
+) -> Result<Option<String>, String> {
     let short = |need: usize| {
         Err(format!(
             "PFCP IE {t} requires at least {need} byte(s), got {}",
@@ -257,7 +265,7 @@ fn decode_value(t: u16, v: &[u8]) -> Result<Option<String>, String> {
             *v.first().ok_or_else(|| format!("PFCP IE {t} is empty"))?
         )),
         89 => Some(format!("cp_function_features=0x{}", hex(v))),
-        93 => Some(format!("ue_ip={}", pseudonym("pfcp-ue-ip", v))),
+        93 => Some(format!("ue_ip={}", pseudonym(pseudonym_key, "pfcp-ue-ip", v))),
         95 => Some(format!(
             "outer_header_removal={}",
             *v.first().ok_or_else(|| format!("PFCP IE {t} is empty"))?
@@ -278,7 +286,7 @@ fn decode_value(t: u16, v: &[u8]) -> Result<Option<String>, String> {
             "qfi={}",
             *v.first().ok_or_else(|| format!("PFCP IE {t} is empty"))? & 0x3f
         )),
-        141 => Some(format!("user_id={}", pseudonym("pfcp-user-id", v))),
+        141 => Some(format!("user_id={}", pseudonym(pseudonym_key, "pfcp-user-id", v))),
         159 => Some(format!("apn_dnn={}", decode_apn(v)?)),
         160 => Some(format!(
             "interface_type={}",
@@ -430,7 +438,7 @@ impl ProtocolDecoder for PfcpDecoder {
         }
     }
     fn decode(&self, input: &DecoderInput<'_>) -> DecoderOutput {
-        match parse(input.payload) {
+        match parse(input.payload, input.pseudonym_key) {
             Ok(message) => {
                 let mut ids = vec![NamedValue {
                     name: "pfcp_sequence".into(),
@@ -649,37 +657,44 @@ mod tests {
         x.extend_from_slice(v);
         x
     }
+    fn test_key() -> PseudonymKey {
+        PseudonymKey::from_bytes([0x42; 32])
+    }
     #[test]
     fn valid_header_with_and_without_seid() {
-        let a = parse(&header(1, None, &[])).unwrap();
+        let k = test_key();
+        let a = parse(&header(1, None, &[]), &k).unwrap();
         assert_eq!(a.seid, None);
-        let b = parse(&header(50, Some(9), &[])).unwrap();
+        let b = parse(&header(50, Some(9), &[]), &k).unwrap();
         assert_eq!(b.seid, Some(9));
         assert_eq!(b.sequence_number, 7);
     }
     #[test]
     fn grouped_and_unknown_ie() {
+        let k = test_key();
         let child = ie(56, &3u16.to_be_bytes());
         let mut all = ie(1, &child);
         all.extend_from_slice(&ie(65000, &[1, 2]));
-        let p = parse(&header(50, Some(1), &all)).unwrap();
+        let p = parse(&header(50, Some(1), &all), &k).unwrap();
         assert_eq!(p.ies[0].children[0].decoded.as_deref(), Some("pdr_id=3"));
         assert_eq!(p.unknown_count, 1);
     }
     #[test]
     fn invalid_length() {
+        let k = test_key();
         let mut p = header(1, None, &[]);
         p[2..4].copy_from_slice(&100u16.to_be_bytes());
-        assert!(parse(&p).is_err());
+        assert!(parse(&p, &k).is_err());
         let broken = header(1, None, &[0, 1, 0, 9, 1]);
-        assert!(parse(&broken).is_err());
+        assert!(parse(&broken, &k).is_err());
     }
     #[test]
     fn nested_group_and_observed_fields_are_typed() {
+        let k = test_key();
         let mut pdi = ie(20, &[1]);
         pdi.extend_from_slice(&ie(21, &[1, 0, 0, 0, 3, 10, 77, 22, 13]));
         let nested = ie(1, &ie(2, &pdi));
-        let parsed = parse(&header(50, Some(1), &nested)).unwrap();
+        let parsed = parse(&header(50, Some(1), &nested), &k).unwrap();
         let pdi = &parsed.ies[0].children[0];
         assert_eq!(
             pdi.children[0].decoded.as_deref(),
@@ -694,17 +709,18 @@ mod tests {
     }
     #[test]
     fn field_level_values_match_reference_representation() {
+        let k = test_key();
         assert_eq!(
-            decode_value(29, &[0, 0, 0xff, 0xff]).unwrap().as_deref(),
+            decode_value(29, &[0, 0, 0xff, 0xff], &k).unwrap().as_deref(),
             Some("precedence=65535")
         );
         assert_eq!(
-            decode_value(42, &[3]).unwrap().as_deref(),
+            decode_value(42, &[3], &k).unwrap().as_deref(),
             Some("destination_interface=3")
         );
-        assert_eq!(decode_value(124, &[9]).unwrap().as_deref(), Some("qfi=9"));
+        assert_eq!(decode_value(124, &[9], &k).unwrap().as_deref(), Some("qfi=9"));
         assert_eq!(
-            decode_value(159, &[8, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't'])
+            decode_value(159, &[8, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't'], &k)
                 .unwrap()
                 .as_deref(),
             Some("apn_dnn=internet")
@@ -712,7 +728,8 @@ mod tests {
     }
     #[test]
     fn invalid_typed_ie_length_is_rejected() {
+        let k = test_key();
         let bad = header(50, Some(1), &ie(29, &[1, 2]));
-        assert!(parse(&bad).is_err());
+        assert!(parse(&bad, &k).is_err());
     }
 }
