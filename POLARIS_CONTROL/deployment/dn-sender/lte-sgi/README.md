@@ -40,6 +40,7 @@ so the sidecar can be prepared without any production impact.
 | `configure-route.sh` | Verifies container identity/digest and installs the exact return route. |
 | `polaris-control-lte-sgi.conf` | Staging drop-in with the validated LTE SGi values. |
 | `polaris-lte-sgi.service` | Bounded lifecycle and rollback unit for the sidecar. |
+| `manifest.sha256` | Release hashes for every executable/configuration sidecar artifact. |
 
 ## Hardening
 

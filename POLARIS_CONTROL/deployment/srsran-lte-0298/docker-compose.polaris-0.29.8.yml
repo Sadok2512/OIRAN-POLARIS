@@ -9,6 +9,8 @@ services:
   srsue:
     command: ["/bin/sh", "-ec", "umask 077; exec srsue /run/secrets/ue.conf"]
     cpus: 0.0
+    tmpfs: !override
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
     ulimits:
       rtprio: 99
       memlock: -1

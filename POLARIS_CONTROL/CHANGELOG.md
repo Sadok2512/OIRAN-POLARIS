@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.29.12 (polaris-control-api) — 2026-11-03 — writable confined iperf3 runtime
+
+- Gives both LTE iperf3 endpoints a bounded 16 MiB `/tmp` tmpfs with
+  `noexec,nosuid,nodev` and mode 1777. The previous SGi DN sidecar used mode
+  1700 while running as uid 65532, so iperf3 could accept its control
+  connection but could not create the UDP stream.
+- Runs the pre-Grant UE/DN tooling checks with the same read-only rootfs and
+  writable confined `/tmp` used by the live services.
+- Persists the final 512 UTF-8 bytes of iperf3 stdout and stderr plus its exit
+  code before a failed traffic step is cleaned up.
+
 ## 0.29.11 (polaris-control-api) — 2026-11-03 — validate the real Initial Attach Modify Bearer completion
 
 - Fixes the fail-closed E-RAB gate for the Open5GS Initial Attach path. SGW-C

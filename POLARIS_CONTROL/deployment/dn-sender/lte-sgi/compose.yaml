@@ -33,7 +33,7 @@ services:
       - no-new-privileges:true
     read_only: true
     tmpfs:
-      - /tmp:size=16m,mode=1700
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
       - /run:size=4m
     user: "65532:65532"
     pids_limit: 64

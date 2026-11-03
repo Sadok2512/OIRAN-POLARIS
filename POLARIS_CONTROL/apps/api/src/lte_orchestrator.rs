@@ -1353,6 +1353,53 @@ mod tests {
         let _ = fs::remove_file(p);
     }
 
+    #[test]
+    fn iperf_diagnostic_persists_before_failure_and_cleanup() {
+        let p = path("iperf-diagnostic");
+        let mut store = RunStore::load(p.clone()).unwrap();
+        let run_id = "lte-run-iperf-diagnostic-12345678";
+        store
+            .create(run_id.into(), "grant-test".into(), 1, 999_999, "idem")
+            .unwrap();
+        store
+            .record_step_diagnostic(
+                run_id,
+                8,
+                Observation {
+                    sequence: 8,
+                    observed_at: timestamp(2),
+                    source_kind: "iperf_runtime_diagnostic".into(),
+                    source_sha256: "c".repeat(64),
+                    validity: "VALID".into(),
+                    sanitization_state: "SANITIZED".into(),
+                    measurements: serde_json::json!({
+                        "diagnostic": {
+                            "exit_code": 1,
+                            "stdout": "unable to create a new stream",
+                            "stderr": "Read-only file system"
+                        },
+                        "error_code": "LTE_TRAFFIC_COMMAND_FAILED"
+                    }),
+                },
+            )
+            .unwrap();
+        store
+            .fail_step(run_id, 8, "LTE_TRAFFIC_COMMAND_FAILED", 3)
+            .unwrap();
+        let run = store.get(run_id).unwrap();
+        assert!(run.cleanup_required);
+        assert_eq!(
+            run.steps[8].measurements["iperf_runtime_diagnostic"]["diagnostic"]
+                ["exit_code"],
+            1
+        );
+        assert_eq!(
+            run.steps[8].measurements["iperf_runtime_diagnostic"]["diagnostic"]["stderr"],
+            "Read-only file system"
+        );
+        let _ = fs::remove_file(p);
+    }
+
     fn capture(plane: &str) -> CaptureRef {
         CaptureRef {
             plane: plane.into(),

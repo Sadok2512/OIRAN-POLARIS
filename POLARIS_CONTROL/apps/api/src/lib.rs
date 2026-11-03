@@ -5954,20 +5954,37 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
         let dir = direction.to_string();
         let rate_bps = constraints.udp.max_rate_bps_per_direction;
         let payload_bytes = constraints.udp.max_payload_bytes;
-        match tokio::task::spawn_blocking(move || {
-            runtime.measure_bounded_udp(&dir, rate_bps, duration_seconds, payload_bytes)
+        let traffic_operation = tokio::task::spawn_blocking(move || {
+            runtime.measure_bounded_udp_with_evidence(
+                &dir,
+                rate_bps,
+                duration_seconds,
+                payload_bytes,
+            )
         })
         .await
-        {
-            Ok(Ok(value)) => {
+        .unwrap_or_else(|_| srsran_controller::TrafficOperation {
+            error_code: Some("LTE_TRAFFIC_WORKER_FAILED".into()),
+            ..srsran_controller::TrafficOperation::default()
+        });
+        let traffic_evidence = serde_json::to_value(&traffic_operation)
+            .unwrap_or_else(|_| json!({"error_code":"LTE_EVIDENCE_SERIALIZATION_FAILED"}));
+        let _ = state.lte_runs_v2.lock().map(|mut store| {
+            store.record_step_diagnostic(
+                &run_id,
+                step,
+                lte_observation(step as u64, "iperf_runtime_diagnostic", traffic_evidence),
+            )
+        });
+        let traffic_succeeded = traffic_operation.succeeded();
+        match traffic_operation.measurement {
+            Some(value) if traffic_succeeded => {
                 let _=state.lte_runs_v2.lock().map(|mut store|{store.observe(&run_id,step,lte_observation(step as u64,"bounded_udp",json!({"direction":direction,"rate_limit_bps":rate_bps,"duration_limit_seconds":duration_seconds,"payload_max_bytes":payload_bytes,"bytes_ul":value.bytes_ul,"bytes_dl":value.bytes_dl})),epoch_millis())?;store.advance(&run_id,lte_orchestrator::RunState::TrafficRunning)});
             }
-            result => {
-                let error = match result {
-                    Ok(Err(error)) => error,
-                    Err(_) => "LTE_TRAFFIC_WORKER_FAILED".into(),
-                    Ok(Ok(_)) => unreachable!(),
-                };
+            _ => {
+                let error = traffic_operation
+                    .error_code
+                    .unwrap_or_else(|| "LTE_TRAFFIC_COMMAND_FAILED".into());
                 let _ = state.lte_runs_v2.lock().map(|mut store| {
                     store.fail_step(&run_id, step, &error, epoch_millis())
                 });

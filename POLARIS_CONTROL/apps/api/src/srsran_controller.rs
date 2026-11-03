@@ -26,7 +26,7 @@ pub const CERTIFIED_IMAGE_ID: &str =
 pub const CERTIFIED_DN_IMAGE_REFERENCE: &str =
     "polaris-lte-sgi-dn@sha256:e60eb72bf7619fd049f6bbbc45cf06927eb73ed7c613446678644f6742af31f3";
 pub const CERTIFIED_COMPOSE_MODEL_SHA256: &str =
-    "2cd1864dca9a380449fd333233a396dd190f108893afd7693bb5b02f00444578";
+    "fa7fe0c168bf6139b9c67f2b9b129ae3b7a0370d94f7dac70f9858dc380121fc";
 const PROFILE_CONFIGS: [&str; 6] = [
     "/root/POLARIS/runtime/srsran/ue.conf",
     "/root/POLARIS/config/srsran/enb.conf",
@@ -147,12 +147,26 @@ pub struct LteStatus {
     pub traffic_ready: bool,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
 pub struct TrafficMeasurement {
     pub bytes_ul: u64,
     pub bytes_dl: u64,
     pub rate_ul_bps: Option<u64>,
     pub rate_dl_bps: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+pub struct TrafficOperation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<TrafficMeasurement>,
+    pub diagnostic: CommandDiagnostic,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+impl TrafficOperation {
+    pub fn succeeded(&self) -> bool {
+        self.error_code.is_none() && self.measurement.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
@@ -468,6 +482,24 @@ pub trait SrsranRuntime: Send + Sync {
         duration_seconds: u32,
         payload_bytes: u32,
     ) -> Result<TrafficMeasurement, String>;
+    fn measure_bounded_udp_with_evidence(
+        &self,
+        direction: &str,
+        rate_bps: u64,
+        duration_seconds: u32,
+        payload_bytes: u32,
+    ) -> TrafficOperation {
+        match self.measure_bounded_udp(direction, rate_bps, duration_seconds, payload_bytes) {
+            Ok(measurement) => TrafficOperation {
+                measurement: Some(measurement),
+                ..TrafficOperation::default()
+            },
+            Err(error_code) => TrafficOperation {
+                error_code: Some(error_code),
+                ..TrafficOperation::default()
+            },
+        }
+    }
     fn ping(&self, direction: &str, packets: u32) -> Result<PingMeasurement, String>;
     fn ping_with_evidence(&self, direction: &str, packets: u32) -> PingOperation {
         match self.ping(direction, packets) {
@@ -530,7 +562,7 @@ fn bounded_diagnostic(output: &Output) -> CommandDiagnostic {
     fn bounded(value: &str) -> String {
         let sanitized = value
             .lines()
-            .filter_map(sanitize_log_line)
+            .filter_map(sanitize_log_line_unbounded)
             .collect::<Vec<_>>()
             .join("\n");
         truncate_utf8_tail(&sanitized, 512)
@@ -747,6 +779,10 @@ pub fn ue_tooling_exec_args(image_reference: &str, spec: &ContainerExecSpec) -> 
     }
     if spec.read_only {
         args.push("--read-only".into());
+        args.extend([
+            "--tmpfs".into(),
+            "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777".into(),
+        ]);
     }
     args.extend(["--user".into(), spec.user.into()]);
     for cap in spec.cap_drop {
@@ -1843,8 +1879,10 @@ impl DockerSrsranRuntime {
         rate_bps: u64,
         duration_seconds: u32,
         payload_bytes: u32,
-    ) -> Result<(u64, u64), String> {
-        let peer = configured_traffic_peer()?.to_string();
+    ) -> Result<((u64, u64), CommandDiagnostic), (String, CommandDiagnostic)> {
+        let peer = configured_traffic_peer()
+            .map_err(|error| (error, CommandDiagnostic::default()))?
+            .to_string();
         let rate_arg = rate_bps.to_string();
         let duration_arg = duration_seconds.to_string();
         let payload_arg = payload_bytes.to_string();
@@ -1853,19 +1891,32 @@ impl DockerSrsranRuntime {
         // interface is rejected fail-closed.
         let route = self
             .run(&["exec", &ue.id, "ip", "route", "get", &peer], 3)
-            .map_err(|_| "LTE_UL_ROUTE_PROBE_FAILED".to_string())?;
+            .map_err(|error| {
+                (
+                    "LTE_UL_ROUTE_PROBE_FAILED".to_string(),
+                    failed_diagnostic(&error),
+                )
+            })?;
         if route.code != 0 {
-            return Err("LTE_UL_ROUTE_PROBE_FAILED".into());
+            return Err((
+                "LTE_UL_ROUTE_PROBE_FAILED".into(),
+                bounded_diagnostic(&route),
+            ));
         }
         let preflight = evaluate_lte_ul_route(&route.stdout, &peer);
         if !preflight.ok {
-            return Err(preflight
-                .code
-                .unwrap_or_else(|| "LTE_UL_ROUTE_NOT_VIA_UE_TUN".into()));
+            return Err((
+                preflight
+                    .code
+                    .unwrap_or_else(|| "LTE_UL_ROUTE_NOT_VIA_UE_TUN".into()),
+                bounded_diagnostic(&route),
+            ));
         }
         // 0.29.2: bind iperf3 source to the UE tun IP so the stack cannot pick
         // a bridge interface even if the UE container has one.
-        let ue_source = self.ue_ip(Some(ue)).ok_or("LTE_UE_IP_NOT_READY")?;
+        let ue_source = self
+            .ue_ip(Some(ue))
+            .ok_or_else(|| ("LTE_UE_IP_NOT_READY".into(), CommandDiagnostic::default()))?;
         let mut args = vec![
             "exec",
             ue.id.as_str(),
@@ -1884,29 +1935,37 @@ impl DockerSrsranRuntime {
         if reverse {
             args.push("-R");
         }
-        let output = Self::ok(
-            self.run(&args, u64::from(duration_seconds).saturating_add(5))?,
-            "LTE_TRAFFIC_COMMAND_FAILED",
-        )?;
-        let json: serde_json::Value =
-            serde_json::from_str(&output.stdout).map_err(|_| "LTE_TRAFFIC_RESULT_INVALID")?;
+        let output = self
+            .run(&args, u64::from(duration_seconds).saturating_add(5))
+            .map_err(|error| {
+                (
+                    "LTE_TRAFFIC_COMMAND_FAILED".into(),
+                    failed_diagnostic(&error),
+                )
+            })?;
+        let diagnostic = bounded_diagnostic(&output);
+        if output.code != 0 {
+            return Err(("LTE_TRAFFIC_COMMAND_FAILED".into(), diagnostic));
+        }
+        let json: serde_json::Value = serde_json::from_str(&output.stdout)
+            .map_err(|_| ("LTE_TRAFFIC_RESULT_INVALID".into(), diagnostic.clone()))?;
         let summary = if reverse {
             json.pointer("/end/sum_received")
         } else {
             json.pointer("/end/sum_sent")
         }
-        .ok_or("LTE_TRAFFIC_RESULT_INVALID")?;
+        .ok_or_else(|| ("LTE_TRAFFIC_RESULT_INVALID".into(), diagnostic.clone()))?;
         let bytes = summary
             .get("bytes")
             .and_then(|v| v.as_u64())
-            .ok_or("LTE_TRAFFIC_RESULT_INVALID")?;
+            .ok_or_else(|| ("LTE_TRAFFIC_RESULT_INVALID".into(), diagnostic.clone()))?;
         let bps = summary
             .get("bits_per_second")
             .and_then(|v| v.as_f64())
             .filter(|v| v.is_finite() && *v >= 0.0)
             .map(|v| v as u64)
-            .ok_or("LTE_TRAFFIC_RESULT_INVALID")?;
-        Ok((bytes, bps))
+            .ok_or_else(|| ("LTE_TRAFFIC_RESULT_INVALID".into(), diagnostic.clone()))?;
+        Ok(((bytes, bps), diagnostic))
     }
 }
 
@@ -2562,26 +2621,26 @@ impl SrsranRuntime for DockerSrsranRuntime {
         }
         let mut m = TrafficMeasurement::default();
         if matches!(direction, "ul" | "both") {
-            let (v, b) = self.iperf(
+            let ((v, b), _) = self.iperf(
                 &ue,
                 false,
                 protocol,
                 u64::from(rate).saturating_mul(1_000_000),
                 1,
                 1_200,
-            )?;
+            ).map_err(|(error, _)| error)?;
             m.bytes_ul = v;
             m.rate_ul_bps = Some(b);
         }
         if matches!(direction, "dl" | "both") {
-            let (v, b) = self.iperf(
+            let ((v, b), _) = self.iperf(
                 &ue,
                 true,
                 protocol,
                 u64::from(rate).saturating_mul(1_000_000),
                 1,
                 1_200,
-            )?;
+            ).map_err(|(error, _)| error)?;
             m.bytes_dl = v;
             m.rate_dl_bps = Some(b);
         }
@@ -2610,20 +2669,82 @@ impl SrsranRuntime for DockerSrsranRuntime {
             return Err("LTE_UE_NOT_RUNNING".into());
         }
         let reverse = direction == "dl";
-        let (bytes, bps) = self.iperf(
+        let ((bytes, bps), _) = self.iperf(
             &ue,
             reverse,
             "udp",
             rate_bps,
             duration_seconds,
             payload_bytes,
-        )?;
+        ).map_err(|(error, _)| error)?;
         Ok(TrafficMeasurement {
             bytes_ul: if reverse { 0 } else { bytes },
             bytes_dl: if reverse { bytes } else { 0 },
             rate_ul_bps: (!reverse).then_some(bps),
             rate_dl_bps: reverse.then_some(bps),
         })
+    }
+
+    fn measure_bounded_udp_with_evidence(
+        &self,
+        direction: &str,
+        rate_bps: u64,
+        duration_seconds: u32,
+        payload_bytes: u32,
+    ) -> TrafficOperation {
+        if !matches!(direction, "ul" | "dl")
+            || rate_bps == 0
+            || rate_bps > 1_000_000
+            || duration_seconds == 0
+            || duration_seconds > 30
+            || payload_bytes == 0
+            || payload_bytes > 1_200
+        {
+            return TrafficOperation {
+                error_code: Some("LTE_TRAFFIC_PARAMETERS_INVALID".into()),
+                ..TrafficOperation::default()
+            };
+        }
+        let ue = match self.owned(Target::Ue) {
+            Ok(ue) if ue.state == "running" => ue,
+            Ok(_) => {
+                return TrafficOperation {
+                    error_code: Some("LTE_UE_NOT_RUNNING".into()),
+                    ..TrafficOperation::default()
+                }
+            }
+            Err(error_code) => {
+                return TrafficOperation {
+                    error_code: Some(error_code),
+                    ..TrafficOperation::default()
+                }
+            }
+        };
+        let reverse = direction == "dl";
+        match self.iperf(
+            &ue,
+            reverse,
+            "udp",
+            rate_bps,
+            duration_seconds,
+            payload_bytes,
+        ) {
+            Ok(((bytes, bps), diagnostic)) => TrafficOperation {
+                measurement: Some(TrafficMeasurement {
+                    bytes_ul: if reverse { 0 } else { bytes },
+                    bytes_dl: if reverse { bytes } else { 0 },
+                    rate_ul_bps: (!reverse).then_some(bps),
+                    rate_dl_bps: reverse.then_some(bps),
+                }),
+                diagnostic,
+                error_code: None,
+            },
+            Err((error_code, diagnostic)) => TrafficOperation {
+                measurement: None,
+                diagnostic,
+                error_code: Some(error_code),
+            },
+        }
     }
 
     fn ping(&self, direction: &str, packets: u32) -> Result<PingMeasurement, String> {
@@ -2684,7 +2805,7 @@ impl SrsranRuntime for DockerSrsranRuntime {
     }
 }
 
-fn sanitize_log_line(line: &str) -> Option<String> {
+fn sanitize_log_line_unbounded(line: &str) -> Option<String> {
     let lower = line.to_ascii_lowercase();
     if [
         "imsi",
@@ -2712,7 +2833,11 @@ fn sanitize_log_line(line: &str) -> Option<String> {
     {
         return None;
     }
-    (!value.is_empty()).then(|| value.chars().take(500).collect())
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn sanitize_log_line(line: &str) -> Option<String> {
+    sanitize_log_line_unbounded(line).map(|value| value.chars().take(500).collect())
 }
 
 fn sanitize_log_stream(raw: &str) -> String {
@@ -3332,7 +3457,10 @@ mod tests {
             Some(value) => std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", value),
             None => std::env::remove_var("POLARIS_LTE_TRAFFIC_PEER_IP"),
         }
-        assert_eq!(result, Err("LTE_UL_ROUTE_NOT_VIA_UE_TUN".into()));
+        assert_eq!(
+            result.unwrap_err().0,
+            "LTE_UL_ROUTE_NOT_VIA_UE_TUN"
+        );
         // Only the probe ran; no iperf3 spawn, no ue_ip query.
         let calls = executor.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -3633,6 +3761,12 @@ mod tests {
             .windows(2)
             .any(|w| w == ["--security-opt", "no-new-privileges:true"]));
         assert!(args.iter().any(|a| a == "--read-only"));
+        assert!(args.windows(2).any(|w| {
+            w == [
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777",
+            ]
+        }));
         assert!(args.windows(2).any(|w| w == ["--user", "0:0"]));
         assert!(args.windows(2).any(|w| w == ["--cap-drop", "ALL"]));
         assert!(args.windows(2).any(|w| w == ["--cap-add", "NET_ADMIN"]));
@@ -3656,6 +3790,12 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--cap-drop", "ALL"]));
         assert!(!args.iter().any(|a| a == "--cap-add"));
         assert!(args.iter().any(|a| a == "--read-only"));
+        assert!(args.windows(2).any(|w| {
+            w == [
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777",
+            ]
+        }));
         assert!(args
             .windows(2)
             .any(|w| w == ["--security-opt", "no-new-privileges:true"]));
@@ -3680,9 +3820,35 @@ mod tests {
         assert_eq!(overlay.matches("memlock: -1").count(), 2);
         assert_eq!(overlay.matches("cpus: 0.0").count(), 2);
         assert!(overlay.contains("cap_add: [\"SYS_NICE\"]"));
+        assert!(overlay.contains("/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777"));
         assert!(!overlay.contains("driver: \"none\""));
         assert!(!overlay.contains("open5gs"));
         assert!(!overlay.contains("capture:"));
+    }
+
+    #[test]
+    fn lte_sgi_sidecar_tmpfs_is_writable_by_its_non_root_user() {
+        let compose = include_str!("../../../deployment/dn-sender/lte-sgi/compose.yaml");
+        assert!(compose.contains("/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777"));
+        assert!(!compose.contains("mode=1700"));
+        assert!(compose.contains("user: \"65532:65532\""));
+    }
+
+    #[test]
+    fn iperf_diagnostic_preserves_the_final_512_utf8_bytes() {
+        let output = Output {
+            code: 1,
+            stdout: format!("FIRST_MARKER{}FINAL_MARKER", "x".repeat(700)),
+            stderr: format!("FIRST_ERROR{}FINAL_ERROR", "y".repeat(700)),
+        };
+        let diagnostic = bounded_diagnostic(&output);
+        assert_eq!(diagnostic.exit_code, 1);
+        assert!(!diagnostic.stdout.contains("FIRST_MARKER"));
+        assert!(diagnostic.stdout.ends_with("FINAL_MARKER"));
+        assert!(!diagnostic.stderr.contains("FIRST_ERROR"));
+        assert!(diagnostic.stderr.ends_with("FINAL_ERROR"));
+        assert!(diagnostic.stdout.len() <= 512);
+        assert!(diagnostic.stderr.len() <= 512);
     }
 
     #[test]
@@ -4274,7 +4440,7 @@ some_option = 1
         // The pinned constant carries the new 64-hex compose model digest.
         assert_eq!(
             CERTIFIED_COMPOSE_MODEL_SHA256,
-            "2cd1864dca9a380449fd333233a396dd190f108893afd7693bb5b02f00444578"
+            "fa7fe0c168bf6139b9c67f2b9b129ae3b7a0370d94f7dac70f9858dc380121fc"
         );
         assert_eq!(CERTIFIED_COMPOSE_MODEL_SHA256.len(), 64);
     }
