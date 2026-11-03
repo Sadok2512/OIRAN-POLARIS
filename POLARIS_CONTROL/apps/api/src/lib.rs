@@ -5272,6 +5272,27 @@ async fn cleanup_lte_run(
     let lifecycle_guard = state.lte_lifecycle.lock().await;
     let runtime = state.srsran_runtime.clone();
     let run = run_id.to_string();
+    let terminal_runtime = runtime.clone();
+    let terminal_run = run.clone();
+    let terminal_evidence = tokio::task::spawn_blocking(move || {
+        // 0.29.7: persist srsENB + srsUE FULL docker logs + eNB/SGW-U
+        // network diagnostics BEFORE any container is stopped. The function
+        // writes to a root-only file under /var/lib/polaris-control/runs/
+        // and returns only metadata (path + sha256 + bounded tail).
+        let dir = std::path::PathBuf::from("/var/lib/polaris-control/runs").join(&terminal_run);
+        terminal_runtime.collect_terminal_evidence(&terminal_run, &dir)
+    })
+    .await
+    .unwrap_or_default();
+    let terminal_json = serde_json::to_value(&terminal_evidence)
+        .unwrap_or_else(|_| json!({"error":"serialization_failed"}));
+    let _ = state.lte_runs_v2.lock().map(|mut store| {
+        store.record_step_diagnostic(
+            run_id,
+            10,
+            lte_observation(10, "terminal_log_persistence", terminal_json),
+        )
+    });
     let cleanup_result = tokio::task::spawn_blocking(move || {
         let sidecars_removed = runtime.cleanup_run_sidecars(&run).unwrap_or(false);
         let before = runtime.status(false, false).ok();
@@ -5673,6 +5694,37 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
         )?;
         store.advance(&run_id, lte_orchestrator::RunState::IpReady)
     });
+    // 0.29.7: fail-closed ERAB gate before any ping/UDP step. We check once
+    // right before the per-direction loop; the gate reads srsENB + MME logs
+    // via the runtime trait. Mock in tests injects via `erab_gate_override`.
+    {
+        let runtime = state.srsran_runtime.clone();
+        let erab = tokio::task::spawn_blocking(move || runtime.verify_erab_established())
+            .await
+            .unwrap_or_else(|_| {
+                Err((
+                    "LTE_TRAFFIC_WORKER_FAILED".into(),
+                    srsran_controller::ErabEstablishmentEvidence::default(),
+                ))
+            });
+        if let Err((error_code, evidence)) = erab {
+            let evidence_json = serde_json::to_value(&evidence)
+                .unwrap_or_else(|_| json!({"error":"serialization_failed"}));
+            let _ = state.lte_runs_v2.lock().map(|mut store| {
+                store.record_step_diagnostic(
+                    &run_id,
+                    6,
+                    lte_observation(6, "erab_establishment_gate", evidence_json),
+                )
+            });
+            let _ = state
+                .lte_runs_v2
+                .lock()
+                .map(|mut store| store.fail_step(&run_id, 6, &error_code, epoch_millis()));
+            let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
+            return;
+        }
+    }
     for (step, direction) in [(6_usize, "ul"), (7_usize, "dl")] {
         if lte_run_is_terminal_or_cancelled(&state, &run_id)
             || epoch_millis() >= deadline_at_epoch_ms

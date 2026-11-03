@@ -180,6 +180,58 @@ pub struct PingOperation {
 }
 impl PingOperation { pub fn succeeded(&self) -> bool { self.error_code.is_none() && self.measurement.is_some() } }
 
+/// 0.29.7: metadata about the full sanitized `docker logs` of one container
+/// persisted on the host **before** the cleanup drops the container. The
+/// public API returns only the metadata (path + sha256 + byte count +
+/// bounded tail), never the raw contents.
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+pub struct FullLogRecord {
+    pub component: String,
+    /// Host-side absolute path (root-only, mode 0o600).
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: String,
+    /// Sanitized tail (last 512 UTF-8 bytes, same bound as the other
+    /// evidence streams). The full stream lives in the file.
+    pub sanitized_tail: String,
+    pub persisted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+/// 0.29.7: eNB + SGW-U read-only network diagnostics collected before
+/// cleanup to catch an ARP/neighbor regression on the S1-U fabric.
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+pub struct EnbNetworkDiagnostics {
+    pub enb_ip_neigh: CommandDiagnostic,
+    pub enb_ip_s_link: CommandDiagnostic,
+    pub sgw_u_ip_neigh: CommandDiagnostic,
+}
+
+/// 0.29.7: terminal evidence collected before cleanup. Full sanitized
+/// logs are persisted on disk; the public struct only carries their
+/// metadata (path + SHA256 + bounded tail) plus the eNB/SGW-U network
+/// diagnostics. Nothing in this struct exposes raw log contents to the
+/// public API.
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+pub struct TerminalEvidence {
+    pub srsue_log: FullLogRecord,
+    pub srsenb_log: FullLogRecord,
+    pub enb_network: EnbNetworkDiagnostics,
+}
+
+/// 0.29.7: evidence that the EPS bearer control plane completed before
+/// user plane traffic is attempted. Both markers are mandatory.
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+pub struct ErabEstablishmentEvidence {
+    pub ics_response_observed: bool,
+    pub ics_response_e_rab_markers: u32,
+    pub modify_bearer_response_observed: bool,
+    pub modify_bearer_response_markers: u32,
+    /// Sanitized summary of what was seen vs. expected. Bounded 512.
+    pub summary: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
 pub struct CommandDiagnostic {
     pub exit_code: i32,
@@ -215,6 +267,25 @@ pub trait SrsranRuntime: Send + Sync {
     }
     fn probe_traffic_route(&self, _direction: &str) -> RouteOperation {
         RouteOperation::default()
+    }
+    /// 0.29.7: fail-closed EPS bearer gate run **before** any ping/UDP.
+    /// Default returns `Ok(default)` (used by the Mock); the Docker runtime
+    /// reads srsENB + MME logs and delegates to `evaluate_erab_establishment`.
+    fn verify_erab_established(
+        &self,
+    ) -> Result<ErabEstablishmentEvidence, (String, ErabEstablishmentEvidence)> {
+        Ok(ErabEstablishmentEvidence::default())
+    }
+    /// 0.29.7: persist the FULL `docker logs` of srsENB + srsUE (and
+    /// collect eNB + SGW-U network diagnostics) **before** cleanup. The
+    /// default returns empty records so Mock-based tests do not force disk
+    /// writes.
+    fn collect_terminal_evidence(
+        &self,
+        _run_id: &str,
+        _run_dir: &std::path::Path,
+    ) -> TerminalEvidence {
+        TerminalEvidence::default()
     }
     fn start(&self, target: Target) -> Result<(), String>;
     fn stop(&self, target: Target) -> Result<(), String>;
@@ -474,6 +545,138 @@ pub fn classify_tooling_exec(
         _ => "LTE_UE_TOOLING_NOT_EXECUTABLE",
     };
     Err((error_code.into(), diag))
+}
+
+// ---------------------------------------------------------------------------
+// 0.29.7 ERAB gate + terminal evidence (pure functions, offline testable).
+// ---------------------------------------------------------------------------
+
+/// Markers the eNB stdout emits when it finishes the Initial Context Setup
+/// procedure (S1AP procedure 9 successfulOutcome). We accept several
+/// alternative spellings because logging formats vary between versions.
+const ICS_RESPONSE_LOG_MARKERS: &[&str] = &[
+    "initialcontextsetupresponse",
+    "initial context setup response",
+    "ics response",
+    "e-rab setup response",
+    "erab setup response",
+    "e_rab setup response",
+];
+
+/// Markers the MME emits for the S11 Modify Bearer Response (GTPv2 type 35).
+const MODIFY_BEARER_RESPONSE_MARKERS: &[&str] = &[
+    "modify bearer response",
+    "modifybearerresponse",
+    "mbr response",
+    "gtpv2 message type 35",
+    "message type 35",
+];
+
+/// Count occurrences of any of `markers` across the sanitized log lines.
+fn count_markers(logs: &str, markers: &[&str]) -> u32 {
+    let mut count: u32 = 0;
+    for line in logs.lines() {
+        if let Some(sanitized) = sanitize_log_line(line) {
+            let lower = sanitized.to_ascii_lowercase();
+            if markers.iter().any(|m| lower.contains(m)) {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    count
+}
+
+/// 0.29.7: fail-closed EPS bearer establishment gate. Must be called by the
+/// orchestrator **before** any ping / UDP step. The gate requires:
+///
+/// - at least one srsENB-side marker that an Initial Context Setup Response
+///   (S1AP procedure 9 successfulOutcome, E-RAB id 5 in the certified
+///   profile) was emitted;
+/// - at least one MME-side marker that a Modify Bearer Response (S11
+///   GTPv2-C type 35) was emitted.
+///
+/// Returns `Ok(evidence)` on success, `Err(("LTE_ERAB_NOT_ESTABLISHED",
+/// evidence))` otherwise. The returned evidence is JSON-serialisable and
+/// bounded.
+pub fn evaluate_erab_establishment(
+    srsenb_logs: &str,
+    mme_logs: &str,
+) -> Result<ErabEstablishmentEvidence, (String, ErabEstablishmentEvidence)> {
+    let ics_markers = count_markers(srsenb_logs, ICS_RESPONSE_LOG_MARKERS);
+    let mbr_markers = count_markers(mme_logs, MODIFY_BEARER_RESPONSE_MARKERS);
+    let ics_ok = ics_markers > 0;
+    let mbr_ok = mbr_markers > 0;
+    let summary = truncate_utf8_tail(
+        &format!(
+            "ics_response_markers={ics_markers} mbr_response_markers={mbr_markers} \
+             ics_response_observed={ics_ok} modify_bearer_response_observed={mbr_ok}"
+        ),
+        512,
+    );
+    let evidence = ErabEstablishmentEvidence {
+        ics_response_observed: ics_ok,
+        ics_response_e_rab_markers: ics_markers,
+        modify_bearer_response_observed: mbr_ok,
+        modify_bearer_response_markers: mbr_markers,
+        summary,
+    };
+    if ics_ok && mbr_ok {
+        Ok(evidence)
+    } else {
+        Err(("LTE_ERAB_NOT_ESTABLISHED".into(), evidence))
+    }
+}
+
+/// Docker arg generator for `docker exec <container> ip neigh`.
+pub fn ip_neigh_args(container_id: &str) -> Vec<String> {
+    vec![
+        "exec".into(),
+        container_id.into(),
+        "ip".into(),
+        "neigh".into(),
+    ]
+}
+
+/// Docker arg generator for `docker exec <container> ip -s link`.
+pub fn ip_s_link_args(container_id: &str) -> Vec<String> {
+    vec![
+        "exec".into(),
+        container_id.into(),
+        "ip".into(),
+        "-s".into(),
+        "link".into(),
+    ]
+}
+
+/// Build a `FullLogRecord` from raw container logs + the on-disk persistence
+/// result. Pure function: no filesystem writes, no stdout capture.
+///
+/// `raw_logs` is the unsanitised docker stdout+stderr; it is fed to
+/// `sanitize_log_line` before being considered for the bounded tail. The
+/// SHA256 is computed over the sanitised stream so the digest matches what
+/// the host writes to disk.
+pub fn build_full_log_record(
+    component: &str,
+    path: &str,
+    raw_logs: &str,
+) -> FullLogRecord {
+    let sanitized = raw_logs
+        .lines()
+        .filter_map(sanitize_log_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sanitized_tail = truncate_utf8_tail(&sanitized, 512);
+    let bytes = sanitized.len() as u64;
+    let sha256 = format!("{:x}", Sha256::digest(sanitized.as_bytes()));
+    FullLogRecord {
+        component: component.to_string(),
+        path: path.to_string(),
+        bytes,
+        sha256,
+        sanitized_tail,
+        persisted: false,
+        error_code: None,
+    }
 }
 
 /// 0.29.3: LTE DN sender container name is deployment-specified and must NOT
@@ -1400,6 +1603,106 @@ impl SrsranRuntime for DockerSrsranRuntime {
     fn validate_traffic_configuration(&self) -> Result<(), String> {
         configured_traffic_peer().map(|_| ())
     }
+    fn verify_erab_established(
+        &self,
+    ) -> Result<ErabEstablishmentEvidence, (String, ErabEstablishmentEvidence)> {
+        // Read full stdout+stderr for srsENB and the MME; delegate to the
+        // pure classifier so unit tests exercise the exact same logic.
+        let srsenb = self
+            .resolve("srsenb")
+            .ok()
+            .flatten()
+            .and_then(|c| self.run(&["logs", &c.id], 5).ok())
+            .map(|out| format!("{}{}", out.stdout, out.stderr))
+            .unwrap_or_default();
+        let mme = self
+            .resolve("mme")
+            .ok()
+            .flatten()
+            .and_then(|c| self.run(&["logs", &c.id], 5).ok())
+            .map(|out| format!("{}{}", out.stdout, out.stderr))
+            .unwrap_or_default();
+        evaluate_erab_establishment(&srsenb, &mme)
+    }
+    fn collect_terminal_evidence(
+        &self,
+        _run_id: &str,
+        run_dir: &std::path::Path,
+    ) -> TerminalEvidence {
+        let _ = fs::create_dir_all(run_dir);
+        let persist = |component: &'static str, container_name: &str| -> FullLogRecord {
+            let Ok(Some(container)) = self.resolve(container_name) else {
+                return FullLogRecord {
+                    component: component.into(),
+                    error_code: Some("LTE_TERMINAL_LOG_CONTAINER_ABSENT".into()),
+                    ..FullLogRecord::default()
+                };
+            };
+            let raw = match self.run(&["logs", &container.id], 5) {
+                Ok(output) => format!("{}{}", output.stdout, output.stderr),
+                Err(error) => {
+                    return FullLogRecord {
+                        component: component.into(),
+                        error_code: Some(format!("LTE_TERMINAL_LOG_READ_FAILED:{error}")),
+                        ..FullLogRecord::default()
+                    };
+                }
+            };
+            let path = run_dir.join(format!("{component}.log"));
+            let mut record = build_full_log_record(
+                component,
+                &path.display().to_string(),
+                &raw,
+            );
+            let sanitized_full = raw
+                .lines()
+                .filter_map(sanitize_log_line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let open_result = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path);
+            match open_result.and_then(|mut file| file.write_all(sanitized_full.as_bytes())) {
+                Ok(()) => {
+                    record.persisted = true;
+                }
+                Err(error) => {
+                    record.error_code = Some(format!("LTE_TERMINAL_LOG_WRITE_FAILED:{error}"));
+                }
+            }
+            record
+        };
+        let srsue_log = persist("srsue", "srsue");
+        let srsenb_log = persist("srsenb", "srsenb");
+        let enb_network = {
+            let enb = self.resolve("srsenb").ok().flatten();
+            let enb_neigh = match &enb {
+                Some(c) => self.diagnostic(&ip_neigh_args(&c.id).iter().map(String::as_str).collect::<Vec<_>>(), 3),
+                None => failed_diagnostic("LTE_TERMINAL_LOG_CONTAINER_ABSENT"),
+            };
+            let enb_link = match &enb {
+                Some(c) => self.diagnostic(&ip_s_link_args(&c.id).iter().map(String::as_str).collect::<Vec<_>>(), 3),
+                None => failed_diagnostic("LTE_TERMINAL_LOG_CONTAINER_ABSENT"),
+            };
+            let sgw_neigh = match self.resolve("sgwu").ok().flatten() {
+                Some(c) => self.diagnostic(&ip_neigh_args(&c.id).iter().map(String::as_str).collect::<Vec<_>>(), 3),
+                None => failed_diagnostic("LTE_TERMINAL_SGWU_ABSENT"),
+            };
+            EnbNetworkDiagnostics {
+                enb_ip_neigh: enb_neigh,
+                enb_ip_s_link: enb_link,
+                sgw_u_ip_neigh: sgw_neigh,
+            }
+        };
+        TerminalEvidence {
+            srsue_log,
+            srsenb_log,
+            enb_network,
+        }
+    }
     fn install_lte_ul_route(&self) -> RouteOperation {
         let peer = match configured_traffic_peer() {
             Ok(peer) => peer,
@@ -1810,6 +2113,13 @@ pub struct MockSrsranRuntime {
     pub sidecars_absent: Arc<Mutex<bool>>,
     pub attach_evidence: Arc<Mutex<Option<AttachProtocolEvidence>>>,
     pub traffic_configuration_error: Arc<Mutex<Option<String>>>,
+    /// 0.29.7: injectable ERAB gate result. `Some(Ok(ev))` → gate PASS;
+    /// `Some(Err((code, ev)))` → gate FAIL with the exact code; `None` →
+    /// default pass with empty evidence.
+    #[allow(clippy::type_complexity)]
+    pub erab_gate_override: Arc<Mutex<Option<Result<ErabEstablishmentEvidence, (String, ErabEstablishmentEvidence)>>>>,
+    /// 0.29.7: injectable terminal evidence returned by the mock.
+    pub terminal_evidence_override: Arc<Mutex<Option<TerminalEvidence>>>,
 }
 impl Default for MockSrsranRuntime {
     fn default() -> Self {
@@ -1822,6 +2132,8 @@ impl Default for MockSrsranRuntime {
             sidecars_absent: Arc::new(Mutex::new(true)),
             attach_evidence: Arc::new(Mutex::new(None)),
             traffic_configuration_error: Arc::new(Mutex::new(None)),
+            erab_gate_override: Arc::new(Mutex::new(None)),
+            terminal_evidence_override: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1858,6 +2170,26 @@ impl SrsranRuntime for MockSrsranRuntime {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+    fn verify_erab_established(
+        &self,
+    ) -> Result<ErabEstablishmentEvidence, (String, ErabEstablishmentEvidence)> {
+        self.erab_gate_override
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Ok(ErabEstablishmentEvidence::default()))
+    }
+    fn collect_terminal_evidence(
+        &self,
+        _run_id: &str,
+        _run_dir: &std::path::Path,
+    ) -> TerminalEvidence {
+        self.terminal_evidence_override
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default()
     }
     fn start(&self, t: Target) -> Result<(), String> {
         if let Some(e) = self.start_error.lock().unwrap().clone() {
@@ -2905,6 +3237,89 @@ mod tests {
             "sha256:aab719ffdfa518777ed3d197ffe02cdcef02f78f578095d9abb1da9f327db2a5"
         );
         assert_eq!(CERTIFIED_IMAGE_ID.len(), 7 + 64, "sha256: prefix + 64 hex");
+    }
+
+    #[test]
+    fn evaluate_erab_establishment_requires_both_ics_response_and_modify_bearer_response() {
+        // Happy path: eNB emitted ICS Response + MME emitted Modify Bearer
+        // Response → evidence collected, Ok.
+        let srsenb = "RRC: SetupComplete\nS1AP: InitialContextSetupResponse E-RAB=5\nRLC: idle";
+        let mme = "GTPv2 Create Session Response cause=16\nModify Bearer Response EBI=5";
+        let ok = evaluate_erab_establishment(srsenb, mme).expect("both markers present");
+        assert!(ok.ics_response_observed);
+        assert!(ok.modify_bearer_response_observed);
+        assert!(ok.ics_response_e_rab_markers >= 1);
+        assert!(ok.modify_bearer_response_markers >= 1);
+
+        // The exact d62245de pathology: eNB got ICS Request, never emitted
+        // ICS Response; MME never sent Modify Bearer. Gate must fail with
+        // LTE_ERAB_NOT_ESTABLISHED and the evidence must show what was seen.
+        let srsenb_d62245de = "RRC: SetupComplete\nS1AP: InitialContextSetupRequest E-RAB=5\nUE context release";
+        let mme_d62245de = "GTPv2 Create Session Response cause=16\nUE Context Release Command Cause=NAS Detach";
+        let err = evaluate_erab_establishment(srsenb_d62245de, mme_d62245de).expect_err("gate must fail");
+        assert_eq!(err.0, "LTE_ERAB_NOT_ESTABLISHED");
+        assert!(!err.1.ics_response_observed);
+        assert!(!err.1.modify_bearer_response_observed);
+        assert!(err.1.summary.contains("ics_response_observed=false"));
+        assert!(err.1.summary.contains("modify_bearer_response_observed=false"));
+
+        // Partial: ICS Response observed but MBR missing → still FAIL.
+        let srsenb_partial = "InitialContextSetupResponse E-RAB=5";
+        let mme_partial = "nothing relevant";
+        let err = evaluate_erab_establishment(srsenb_partial, mme_partial).expect_err("partial");
+        assert_eq!(err.0, "LTE_ERAB_NOT_ESTABLISHED");
+        assert!(err.1.ics_response_observed);
+        assert!(!err.1.modify_bearer_response_observed);
+
+        // Subscriber material in logs must be redacted by sanitize_log_line
+        // before marker counting; the marker still fires if the token is on
+        // another line.
+        let srsenb_with_imsi = "IMSI=001010123456789\nInitialContextSetupResponse E-RAB=5";
+        let mme_with_tmsi = "TMSI=0xdeadbeef\nModify Bearer Response EBI=5";
+        let ok = evaluate_erab_establishment(srsenb_with_imsi, mme_with_tmsi).expect("sanitised");
+        assert!(ok.ics_response_observed && ok.modify_bearer_response_observed);
+    }
+
+    #[test]
+    fn enb_network_diagnostic_args_mirror_ip_neigh_and_ip_s_link() {
+        let neigh = ip_neigh_args("srsenb-id");
+        assert_eq!(neigh, vec!["exec", "srsenb-id", "ip", "neigh"]);
+
+        let link = ip_s_link_args("srsenb-id");
+        assert_eq!(link, vec!["exec", "srsenb-id", "ip", "-s", "link"]);
+
+        // Same args shape for the SGW-U sibling (read-only, no Open5GS
+        // mutation implied by the command).
+        let sgw_neigh = ip_neigh_args("sgwu-id");
+        assert_eq!(sgw_neigh, vec!["exec", "sgwu-id", "ip", "neigh"]);
+    }
+
+    #[test]
+    fn full_log_record_sanitises_and_bounds_tail_but_keeps_full_bytes_in_sha() {
+        // Raw logs with subscriber material in the first line + 2000 bytes of
+        // benign log content. The sanitised stream drops the IMSI line, the
+        // tail is bounded 512, but the SHA256 covers the entire sanitised
+        // stream (not the bounded tail).
+        let mut raw = String::new();
+        raw.push_str("IMSI=001010123456789 attach\n");
+        for _ in 0..100 {
+            raw.push_str("RRC: Measurement report ok\n");
+        }
+        raw.push_str("LAST_LINE_MARKER erab setup response\n");
+        let record = build_full_log_record("srsenb", "/var/lib/polaris-control/runs/x/srsenb.log", &raw);
+        assert_eq!(record.component, "srsenb");
+        assert_eq!(record.path, "/var/lib/polaris-control/runs/x/srsenb.log");
+        // Tail bounded ≤ 512 UTF-8 bytes.
+        assert!(record.sanitized_tail.len() <= 512);
+        // The LAST line survived the tail.
+        assert!(record.sanitized_tail.contains("LAST_LINE_MARKER"));
+        // The IMSI line was redacted (never surfaces).
+        assert!(!record.sanitized_tail.contains("IMSI="));
+        // SHA256 is 64 lowercase hex.
+        assert_eq!(record.sha256.len(), 64);
+        assert!(record.sha256.chars().all(|c| c.is_ascii_hexdigit()));
+        // Bytes = length of sanitised stream (> 512 because many lines passed).
+        assert!(record.bytes > 512);
     }
 
     #[test]

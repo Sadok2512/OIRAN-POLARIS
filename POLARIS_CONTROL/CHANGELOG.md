@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.29.7 (polaris-control-api) — 2026-11-03 — ERAB gate + terminal evidence persistence
+
+- Adds a fail-closed `LTE_ERAB_NOT_ESTABLISHED` gate run **before every ping
+  or UDP step**. The gate reads srsENB and MME logs via the runtime and
+  requires at least one Initial Context Setup Response marker (S1AP
+  procedure 9 successfulOutcome, E-RAB id 5) on srsENB **and** at least one
+  Modify Bearer Response marker (GTPv2 type 35) on the MME. Returns the
+  observed marker counts in the sanitized evidence so an operator can see
+  exactly what was and was not emitted. Addresses the d62245de pathology
+  (ICS Request arrived, ICS Response never sent, Modify Bearer absent,
+  S1-U 0 trames).
+- Persists the FULL sanitized `docker logs` of srsENB and srsUE
+  **before cleanup** to a root-only file (`/var/lib/polaris-control/runs/
+  <run_id>/<component>.log`, mode `0o600`). The public evidence contains
+  only path + SHA256 + byte count + bounded last-512 tail, never the raw
+  contents. srsRAN container stdout is no longer lost at cleanup.
+- Collects read-only `ip neigh` and `ip -s link` in srsENB and
+  `ip neigh` in the SGW-U container before cleanup. No Open5GS mutation.
+- Introduces `TerminalEvidence`, `FullLogRecord`, `EnbNetworkDiagnostics`
+  and `ErabEstablishmentEvidence` as JSON-serialisable structs; the
+  runtime trait gains `verify_erab_established()` and
+  `collect_terminal_evidence()` with safe Mock defaults + injectable
+  overrides for tests.
+
 ## 0.29.6 (polaris-control-api) — 2026-11-02 — pinned 0.29.6-rc1 image + exec preflight
 
 - Pins the certified UE tooling image reference to
