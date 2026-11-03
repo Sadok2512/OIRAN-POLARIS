@@ -28,10 +28,26 @@ const COMPOSE_FILE_ARGS: [&str; 4] = ["-f", COMPOSE_FILES[0], "-f", COMPOSE_FILE
 // 0.29.14: Docker writes `com.docker.compose.project.config_files` as the
 // comma-joined list of `-f` files in the exact order they were passed. ANR3
 // observed `base,overlay` on the real srsENB created by 0.29.13 — see issue
-// #10 comment 6613958815. The ownership validator and the ledger both pin
-// this exact value, built from the same COMPOSE_FILES used by create().
+// #10 comment 6613958815. The srsRAN ownership ledger pins this exact value,
+// built from the same COMPOSE_FILES used by create().
 fn compose_config_files_label() -> String {
     COMPOSE_FILES.join(",")
+}
+
+// 0.29.15: only srsRAN LTE services (srsenb, srsue) are created from the
+// overlay by `create()` and therefore carry the `base,overlay` config_files
+// label. Open5GS core services (mme, sgwc, sgwu, …) are created from the
+// base compose file alone and carry the single-file label — see ANR3 run
+// evidence on issue #10 comment 6614961920 (0.29.14 rejected the healthy
+// MME as an ownership conflict and converted a real S1 Setup into a
+// `LTE_S1_SETUP_TIMEOUT` false negative). The ownership validator must
+// therefore expect a different label per service; the ownership ledger
+// itself (srsRAN-only) stays on `base,overlay`.
+fn expected_config_files(service: &str) -> String {
+    match service {
+        "srsenb" | "srsue" => compose_config_files_label(),
+        _ => COMPOSE.into(),
+    }
 }
 const UE_CONFIG: &str = "/root/POLARIS/runtime/srsran/ue.conf";
 const ENB_CONFIG: &str = "/root/POLARIS/config/srsran/enb.conf";
@@ -1305,7 +1321,7 @@ fn parse_container_inspect(data: &str, service: &str) -> Result<Container, Strin
         .pointer("/Config/Image")
         .and_then(serde_json::Value::as_str)
         .ok_or("LTE_RUNTIME_OWNERSHIP_CONFLICT")?;
-    let expected_config_files = compose_config_files_label();
+    let expected_config_files = expected_config_files(service);
     if label("com.docker.compose.project") != Some(PROJECT)
         || label("com.docker.compose.service") != Some(service)
         || label("com.docker.compose.project.config_files") != Some(expected_config_files.as_str())
@@ -3111,7 +3127,7 @@ mod tests {
                 "Labels":{
                     "com.docker.compose.project":PROJECT,
                     "com.docker.compose.service":service,
-                    "com.docker.compose.project.config_files":compose_config_files_label()
+                    "com.docker.compose.project.config_files":expected_config_files(service)
                 },
                 "Image":CERTIFIED_IMAGE_REFERENCE
             },
@@ -4247,6 +4263,90 @@ mod tests {
         );
         assert_eq!(
             parse_container_inspect(&raw, "srsenb"),
+            Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into())
+        );
+    }
+
+    #[test]
+    fn expected_config_files_is_base_overlay_only_for_srsran_services() {
+        // Only the LTE srsRAN services are created with the overlay. Everything
+        // else is Open5GS core (mme/sgwc/sgwu/…) created from the base compose
+        // file alone.
+        assert_eq!(expected_config_files("srsenb"), compose_config_files_label());
+        assert_eq!(expected_config_files("srsue"), compose_config_files_label());
+        for base_only in ["mme", "sgwc", "sgwu", "upf", "hss", "pcrf"] {
+            assert_eq!(expected_config_files(base_only), COMPOSE);
+        }
+    }
+
+    #[test]
+    fn parse_container_inspect_accepts_base_only_label_for_open5gs_core_services() {
+        // ANR3 captured these real labels on the running EPC during the 0.29.14
+        // rollback evidence (issue #10 comment 6614961920):
+        //   service=mme, service=sgwu
+        //   com.docker.compose.project.config_files=<base only>
+        // Every one of these must pass the ownership validator; 0.29.14
+        // converted a healthy MME into LTE_RUNTIME_OWNERSHIP_CONFLICT and
+        // turned a real S1 Setup into LTE_S1_SETUP_TIMEOUT.
+        for service in ["mme", "sgwc", "sgwu"] {
+            let raw = inspect_json_with_labels(
+                "0123456789abcdef",
+                service,
+                COMPOSE,
+                PROJECT,
+            );
+            let container = parse_container_inspect(&raw, service).unwrap_or_else(|e| {
+                panic!("{service} should be accepted with base-only label, got {e}")
+            });
+            assert_eq!(container.id, "0123456789abcdef");
+        }
+    }
+
+    #[test]
+    fn parse_container_inspect_rejects_an_open5gs_core_container_with_the_overlay_label() {
+        // Symmetrical safeguard: MME/SGW-U must carry the base-only label; an
+        // Open5GS container showing `base,overlay` means the EPC was mis-deployed
+        // (someone layered the LTE overlay onto Open5GS) and the validator must
+        // refuse it instead of silently accepting a non-certified EPC runtime.
+        let raw = inspect_json_with_labels(
+            "0123456789abcdef",
+            "mme",
+            &compose_config_files_label(),
+            PROJECT,
+        );
+        assert_eq!(
+            parse_container_inspect(&raw, "mme"),
+            Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into())
+        );
+    }
+
+    #[test]
+    fn parse_container_inspect_rejects_srsue_with_base_only_label() {
+        // srsUE must carry the overlay label — a base-only one means create()
+        // was called without `-f COMPOSE_0298_OVERRIDE` (0.29.12 bug). The
+        // validator rejects the container to stop the LTE run before it starts.
+        let raw = inspect_json_with_labels(
+            "0123456789abcdef",
+            "srsue",
+            COMPOSE,
+            PROJECT,
+        );
+        assert_eq!(
+            parse_container_inspect(&raw, "srsue"),
+            Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into())
+        );
+    }
+
+    #[test]
+    fn parse_container_inspect_rejects_open5gs_core_container_from_a_different_project() {
+        let raw = inspect_json_with_labels(
+            "0123456789abcdef",
+            "mme",
+            COMPOSE,
+            "other-project",
+        );
+        assert_eq!(
+            parse_container_inspect(&raw, "mme"),
             Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into())
         );
     }

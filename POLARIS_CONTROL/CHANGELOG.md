@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.29.15 (polaris-control-api) — 2026-11-03 — service-scope the `config_files` label expectation
+
+- `parse_container_inspect()` now expects the `config_files` label per
+  service: only `srsenb` and `srsue` must carry the comma-joined
+  `base,overlay` value; every other service (Open5GS core: mme, sgwc, sgwu…)
+  is expected to carry the base compose file alone. 0.29.14 applied the
+  `base,overlay` expectation to every discovered service and therefore
+  rejected the healthy MME/SGW-U as ownership conflicts, converting a real
+  S1 Setup into a `LTE_S1_SETUP_TIMEOUT` false negative — see ANR3 run
+  evidence on issue #10 comment 6614961920.
+- Introduces `expected_config_files(service: &str) -> String` as the single
+  source of truth for the per-service label. It returns
+  `compose_config_files_label()` for srsRAN LTE services and `COMPOSE` for
+  everything else.
+- The srsRAN ownership ledger (which only tracks srsenb/srsue) continues to
+  record `compose_config_files_label()` (`base,overlay`). The dedicated
+  `SRSRAN_OWNERSHIP_LEDGER_OBSOLETE_COMPOSE_LABEL` migration code is
+  preserved.
+- New regression tests exercising the EXACT real-run labels published by
+  ANR3:
+  - `expected_config_files_is_base_overlay_only_for_srsran_services`
+  - `parse_container_inspect_accepts_base_only_label_for_open5gs_core_services`
+    (mme / sgwc / sgwu)
+  - `parse_container_inspect_rejects_an_open5gs_core_container_with_the_overlay_label`
+  - `parse_container_inspect_rejects_srsue_with_base_only_label`
+  - `parse_container_inspect_rejects_open5gs_core_container_from_a_different_project`
+- No change to compose files, image digests, safety-guard behaviour, or
+  `CERTIFIED_COMPOSE_MODEL_SHA256`
+  (`fa7fe0c168bf6139b9c67f2b9b129ae3b7a0370d94f7dac70f9858dc380121fc`).
+
 ## 0.29.14 (polaris-control-api) — 2026-11-03 — accept the `base,overlay` compose label
 
 - `parse_container_inspect()` and the srsRAN ownership ledger now compare
