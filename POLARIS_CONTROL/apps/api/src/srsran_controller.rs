@@ -17,12 +17,22 @@ const LTE_PROFILE: &str = "lte";
 const COMPOSE: &str = "/root/POLARIS/compose/docker-compose.oiran-lab.yml";
 const ENV_FILE: &str = "/root/POLARIS/compose/versions.env";
 const COMPOSE_0298_OVERRIDE: &str = "/root/POLARIS/compose/docker-compose.polaris-0.29.8.yml";
-// 0.29.13: single source of truth for the `-f` compose file arguments passed
-// to every `docker compose` subcommand in this module. 0.29.12 spawned srsUE
-// via `docker compose create` with only `-f COMPOSE` (no overlay), so the LTE
-// hardening (tmpfs 16m, SYS_NICE, rtprio, memlock) silently diverged from the
-// certified compose model whose SHA covers both files.
-const COMPOSE_FILE_ARGS: [&str; 4] = ["-f", COMPOSE, "-f", COMPOSE_0298_OVERRIDE];
+// 0.29.13: single source of truth for the compose files passed to every
+// `docker compose` subcommand in this module. 0.29.12 spawned srsUE via
+// `docker compose create` with only the base file, so the LTE hardening
+// (tmpfs 16m, SYS_NICE, rtprio, memlock) silently diverged from the certified
+// compose model whose SHA covers both files.
+const COMPOSE_FILES: [&str; 2] = [COMPOSE, COMPOSE_0298_OVERRIDE];
+const COMPOSE_FILE_ARGS: [&str; 4] = ["-f", COMPOSE_FILES[0], "-f", COMPOSE_FILES[1]];
+
+// 0.29.14: Docker writes `com.docker.compose.project.config_files` as the
+// comma-joined list of `-f` files in the exact order they were passed. ANR3
+// observed `base,overlay` on the real srsENB created by 0.29.13 — see issue
+// #10 comment 6613958815. The ownership validator and the ledger both pin
+// this exact value, built from the same COMPOSE_FILES used by create().
+fn compose_config_files_label() -> String {
+    COMPOSE_FILES.join(",")
+}
 const UE_CONFIG: &str = "/root/POLARIS/runtime/srsran/ue.conf";
 const ENB_CONFIG: &str = "/root/POLARIS/config/srsran/enb.conf";
 const LEDGER: &str = "/var/lib/polaris-control/srsran-ownership.json";
@@ -1295,9 +1305,10 @@ fn parse_container_inspect(data: &str, service: &str) -> Result<Container, Strin
         .pointer("/Config/Image")
         .and_then(serde_json::Value::as_str)
         .ok_or("LTE_RUNTIME_OWNERSHIP_CONFLICT")?;
+    let expected_config_files = compose_config_files_label();
     if label("com.docker.compose.project") != Some(PROJECT)
         || label("com.docker.compose.service") != Some(service)
-        || label("com.docker.compose.project.config_files") != Some(COMPOSE)
+        || label("com.docker.compose.project.config_files") != Some(expected_config_files.as_str())
         || (matches!(service, "srsenb" | "srsue") && image != CERTIFIED_IMAGE_REFERENCE)
     {
         return Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into());
@@ -1388,13 +1399,14 @@ impl DockerSrsranRuntime {
         parse_container_inspect(&data.stdout, service).map(Some)
     }
     fn load(&self) -> Result<Ownership, String> {
+        let expected_compose = compose_config_files_label();
         let bytes = match fs::read(&self.ledger) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Ownership {
                     schema: 1,
                     project: PROJECT.into(),
-                    compose: COMPOSE.into(),
+                    compose: expected_compose,
                     components: BTreeMap::new(),
                 })
             }
@@ -1407,7 +1419,17 @@ impl DockerSrsranRuntime {
         }
         let value: Ownership =
             serde_json::from_slice(&bytes).map_err(|_| "SRSRAN_OWNERSHIP_LEDGER_INVALID")?;
-        if value.schema != 1 || value.project != PROJECT || value.compose != COMPOSE {
+        if value.schema != 1 || value.project != PROJECT {
+            return Err("SRSRAN_OWNERSHIP_LEDGER_INVALID".into());
+        }
+        // 0.29.14: a ledger written by 0.29.13 or earlier records only the
+        // base compose file. It must be rejected fail-closed with a dedicated
+        // code so an operator never silently inherits an ownership claim
+        // that was taken on a container built from a stale `-f` set.
+        if value.compose == COMPOSE && expected_compose != COMPOSE {
+            return Err("SRSRAN_OWNERSHIP_LEDGER_OBSOLETE_COMPOSE_LABEL".into());
+        }
+        if value.compose != expected_compose {
             return Err("SRSRAN_OWNERSHIP_LEDGER_INVALID".into());
         }
         Ok(value)
@@ -3089,11 +3111,32 @@ mod tests {
                 "Labels":{
                     "com.docker.compose.project":PROJECT,
                     "com.docker.compose.service":service,
-                    "com.docker.compose.project.config_files":COMPOSE
+                    "com.docker.compose.project.config_files":compose_config_files_label()
                 },
                 "Image":CERTIFIED_IMAGE_REFERENCE
             },
             "State":state
+        })
+        .to_string()
+    }
+
+    fn inspect_json_with_labels(
+        id: &str,
+        service: &str,
+        config_files: &str,
+        project: &str,
+    ) -> String {
+        json!({
+            "Id":id,
+            "Config":{
+                "Labels":{
+                    "com.docker.compose.project":project,
+                    "com.docker.compose.service":service,
+                    "com.docker.compose.project.config_files":config_files
+                },
+                "Image":CERTIFIED_IMAGE_REFERENCE
+            },
+            "State":json!({"Status":"created","Error":""})
         })
         .to_string()
     }
@@ -4153,6 +4196,135 @@ mod tests {
             "fa7fe0c168bf6139b9c67f2b9b129ae3b7a0370d94f7dac70f9858dc380121fc"
         );
     }
+
+    #[test]
+    fn compose_config_files_label_is_the_exact_base_overlay_value_docker_emits() {
+        // ANR3 captured this exact value on the real srsENB created by
+        // 0.29.13 — issue #10 comment 6613958815. Docker joins the `-f`
+        // files with `,` in declaration order. Any drift from this value
+        // means create() and the ownership validator no longer agree and
+        // every run fails with LTE_RUNTIME_OWNERSHIP_CONFLICT.
+        assert_eq!(
+            compose_config_files_label(),
+            "/root/POLARIS/compose/docker-compose.oiran-lab.yml,/root/POLARIS/compose/docker-compose.polaris-0.29.8.yml"
+        );
+    }
+
+    #[test]
+    fn parse_container_inspect_accepts_the_base_overlay_config_files_label() {
+        // 0.29.14 regression: a container created by the 0.29.13 `create()`
+        // carries `base,overlay` in config_files. The validator must accept
+        // it; the pre-0.29.13 single-file value is a no-go.
+        let id = "0123456789abcdef";
+        let raw = inspect_json_with_labels(
+            id,
+            "srsenb",
+            &compose_config_files_label(),
+            PROJECT,
+        );
+        let container = parse_container_inspect(&raw, "srsenb").unwrap();
+        assert_eq!(container.id, id);
+    }
+
+    #[test]
+    fn parse_container_inspect_rejects_the_base_only_config_files_label() {
+        let id = "0123456789abcdef";
+        let raw = inspect_json_with_labels(id, "srsenb", COMPOSE, PROJECT);
+        assert_eq!(
+            parse_container_inspect(&raw, "srsenb"),
+            Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into())
+        );
+    }
+
+    #[test]
+    fn parse_container_inspect_rejects_a_label_from_a_different_project() {
+        let id = "0123456789abcdef";
+        let raw = inspect_json_with_labels(
+            id,
+            "srsenb",
+            &compose_config_files_label(),
+            "other-project",
+        );
+        assert_eq!(
+            parse_container_inspect(&raw, "srsenb"),
+            Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into())
+        );
+    }
+
+    #[test]
+    fn ownership_ledger_rejects_a_pre_0_29_14_base_only_compose_entry() {
+        // An operator who upgrades from 0.29.13 or earlier may still have a
+        // ledger on disk recording `compose: COMPOSE` (base only). The
+        // validator must surface that mismatch with a dedicated code; any
+        // silent acceptance would let the controller reuse an ownership
+        // claim taken on a container that was never built from the overlay.
+        let tmp = tempdir_path("srsran-ownership-obsolete");
+        let ledger = tmp.join("srsran-ownership.json");
+        let payload = serde_json::json!({
+            "schema": 1,
+            "project": PROJECT,
+            "compose": COMPOSE,
+            "components": {},
+        });
+        write_mode_0600(&ledger, &payload.to_string());
+        let runtime = DockerSrsranRuntime {
+            executor: Arc::new(ScriptExecutor::default()),
+            ledger: ledger.clone(),
+        };
+        assert_eq!(
+            runtime.load().map(|_| ()),
+            Err("SRSRAN_OWNERSHIP_LEDGER_OBSOLETE_COMPOSE_LABEL".into())
+        );
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn ownership_ledger_accepts_the_base_overlay_compose_entry() {
+        let tmp = tempdir_path("srsran-ownership-current");
+        let ledger = tmp.join("srsran-ownership.json");
+        let payload = serde_json::json!({
+            "schema": 1,
+            "project": PROJECT,
+            "compose": compose_config_files_label(),
+            "components": {},
+        });
+        write_mode_0600(&ledger, &payload.to_string());
+        let runtime = DockerSrsranRuntime {
+            executor: Arc::new(ScriptExecutor::default()),
+            ledger: ledger.clone(),
+        };
+        assert!(runtime.load().is_ok());
+        cleanup(&tmp);
+    }
+
+    fn tempdir_path(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "polaris-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            UNIQUE_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    fn write_mode_0600(path: &std::path::Path, payload: &str) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(payload.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = fs::remove_dir_all(path);
+    }
+
+    static UNIQUE_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     #[test]
     fn canonical_compose_json_is_invariant_to_object_key_order() {
         let left: serde_json::Value = serde_json::from_str(

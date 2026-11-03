@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.29.14 (polaris-control-api) — 2026-11-03 — accept the `base,overlay` compose label
+
+- `parse_container_inspect()` and the srsRAN ownership ledger now compare
+  `com.docker.compose.project.config_files` to the comma-joined list of
+  `COMPOSE_FILES`, in Docker declaration order. 0.29.13 kept comparing to the
+  base file alone, so every srsENB/srsUE that create() spawned (with both
+  `-f` files) was immediately rejected with `LTE_RUNTIME_OWNERSHIP_CONFLICT`
+  and no S1 setup could occur. The expected value was validated by ANR3 on a
+  real run — see issue #10 comment 6613958815.
+- Introduces `compose_config_files_label()` as the single source of truth for
+  that string, built from `COMPOSE_FILES: [&str; 2]`; `COMPOSE_FILE_ARGS` also
+  references `COMPOSE_FILES`. Every ownership check and ledger access reads
+  from the same constant.
+- Migrates the ownership ledger validation: an existing ledger that still
+  records `compose: COMPOSE` (base only, written by 0.29.13 or earlier) is
+  rejected fail-closed with the dedicated code
+  `SRSRAN_OWNERSHIP_LEDGER_OBSOLETE_COMPOSE_LABEL`. No silent upgrade path.
+- Audit of the whole workspace for any `/root/POLARIS/compose/` or
+  `config_files` reference: the three legacy UE-01 migration call sites in
+  `apps/api/src/lib.rs` read the base compose file directly and are not part
+  of the LTE ownership path; left untouched.
+- Adds six regression tests: the exact `base,overlay` label value, accept /
+  reject container labels, reject label from a different project, legacy
+  ledger rejection with the dedicated error code, and new-ledger acceptance.
+- No change to `CERTIFIED_COMPOSE_MODEL_SHA256`
+  (`fa7fe0c168bf6139b9c67f2b9b129ae3b7a0370d94f7dac70f9858dc380121fc`), the
+  overlay content, compose files, image digests, or safety-guard behaviour.
+
 ## 0.29.13 (polaris-control-api) — 2026-11-03 — unify LTE `docker compose` file list
 
 - `DockerSrsranRuntime::create()` now passes the same `-f` compose files as the
