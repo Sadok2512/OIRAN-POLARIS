@@ -5138,6 +5138,37 @@ async fn create_lte_run(
             Json(json!({"error":error,"run_id":run.run_id,"cleanup_required":false})),
         );
     }
+    // 0.29.7 (RRC-debug complement): apply the per-run log overlay for
+    // srsENB and srsUE BEFORE any `runtime.start(...)`. The overlay sets
+    // rrc_level=debug / s1ap_level=debug / gtpu_level=debug /
+    // pdcp_level=info / rlc_level=info only for this run, via a drop-in
+    // file under /var/lib/polaris-control/runs/<run_id>/<component>.log-overlay.conf.
+    // enb.conf and ue.conf on disk stay unchanged.
+    {
+        let runtime = state.srsran_runtime.clone();
+        let run_id = run.run_id.clone();
+        let overlays = tokio::task::spawn_blocking(move || {
+            let dir = std::path::PathBuf::from("/var/lib/polaris-control/runs").join(&run_id);
+            let enb = runtime.apply_run_log_overlay(&run_id, &dir, "srsenb");
+            let ue = runtime.apply_run_log_overlay(&run_id, &dir, "srsue");
+            (enb, ue)
+        })
+        .await
+        .ok();
+        if let Some((enb_overlay, ue_overlay)) = overlays {
+            let evidence = json!({
+                "srsenb": enb_overlay,
+                "srsue": ue_overlay,
+            });
+            let _ = state.lte_runs_v2.lock().map(|mut store| {
+                store.record_step_diagnostic(
+                    &run.run_id,
+                    1,
+                    lte_observation(1, "run_log_level_overlay", evidence),
+                )
+            });
+        }
+    }
     let runtime = state.srsran_runtime.clone();
     let enb_start =
         tokio::task::spawn_blocking(move || runtime.start(srsran_controller::Target::Enb)).await;
@@ -5293,6 +5324,27 @@ async fn cleanup_lte_run(
             lte_observation(10, "terminal_log_persistence", terminal_json),
         )
     });
+    // 0.29.7 (RRC-debug complement): remove the per-run log overlay for
+    // srsENB and srsUE so the next run uses the committed defaults again.
+    // Idempotent: the restore path tolerates a missing file.
+    {
+        let restore_runtime = state.srsran_runtime.clone();
+        let restore_run = run_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            let dir = std::path::PathBuf::from("/var/lib/polaris-control/runs").join(&restore_run);
+            for component in ["srsenb", "srsue"] {
+                let overlay = srsran_controller::LogLevelOverlay {
+                    component: component.to_string(),
+                    overlay_path: srsran_controller::run_log_overlay_path(&dir, component)
+                        .display()
+                        .to_string(),
+                    ..srsran_controller::LogLevelOverlay::default()
+                };
+                let _ = restore_runtime.restore_log_levels(&restore_run, &overlay);
+            }
+        })
+        .await;
+    }
     let cleanup_result = tokio::task::spawn_blocking(move || {
         let sidecars_removed = runtime.cleanup_run_sidecars(&run).unwrap_or(false);
         let before = runtime.status(false, false).ok();

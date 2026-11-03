@@ -2,6 +2,21 @@
 
 ## 0.29.7 (polaris-control-api) — 2026-11-03 — ERAB gate + terminal evidence persistence
 
+- Applies a per-run log level overlay before `runtime.start(...)` so srsENB
+  and srsUE run with `rrc_level=debug`, `s1ap_level=debug`,
+  `gtpu_level=debug`, `pdcp_level=info`, `rlc_level=info` for the duration
+  of a certification run. The overlay is a drop-in file under
+  `/var/lib/polaris-control/runs/<run_id>/<component>.log-overlay.conf`
+  (mode `0o600`); `enb.conf` and `ue.conf` on disk are never mutated. The
+  overlay is removed at cleanup via `restore_log_levels`, so the next run
+  uses the committed defaults. Addresses the Codex d62245de RCA which
+  needed full RRC debug to see the missing ICS Response and the first,
+  unacknowledged RRC Reconfiguration (Attach Accept + DRB).
+- Full-run coverage of the persisted log file is explicit: the Docker
+  implementation of `collect_terminal_evidence` calls `docker logs` without
+  `--tail`, so the capture spans the complete lifetime of each container
+  from `runtime.start(...)` to the moment `cleanup_lte_run` fires — before
+  any `runtime.stop(...)`.
 - Adds a fail-closed `LTE_ERAB_NOT_ESTABLISHED` gate run **before every ping
   or UDP step**. The gate reads srsENB and MME logs via the runtime and
   requires at least one Initial Context Setup Response marker (S1AP

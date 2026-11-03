@@ -213,11 +213,63 @@ pub struct EnbNetworkDiagnostics {
 /// metadata (path + SHA256 + bounded tail) plus the eNB/SGW-U network
 /// diagnostics. Nothing in this struct exposes raw log contents to the
 /// public API.
+///
+/// The full log capture uses `docker logs <container>` without `--tail`,
+/// so the persisted stream covers the **entire run** from srsENB/srsUE
+/// container start until the moment `collect_terminal_evidence` runs —
+/// which the orchestrator calls at the very beginning of `cleanup_lte_run`,
+/// before any `runtime.stop(...)`.
 #[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
 pub struct TerminalEvidence {
     pub srsue_log: FullLogRecord,
     pub srsenb_log: FullLogRecord,
     pub enb_network: EnbNetworkDiagnostics,
+}
+
+/// 0.29.7 (RRC-debug complement): per-run log level overlay. The map is
+/// *frozen*: increasing srsRAN verbosity for a different stack belongs to a
+/// separate, authorised mission.
+pub const RUN_LOG_LEVELS: &[(&str, &str)] = &[
+    ("rrc_level", "debug"),
+    ("s1ap_level", "debug"),
+    ("gtpu_level", "debug"),
+    ("pdcp_level", "info"),
+    ("rlc_level", "info"),
+];
+
+/// Renders a drop-in srsRAN overlay that overrides only the five log levels
+/// above. srsenb/srsue consume this via `--log.*` CLI args emitted by the
+/// start wrapper — `enb.conf` / `ue.conf` on disk are never mutated.
+pub fn render_run_log_level_overlay() -> String {
+    let mut out = String::from("[log]\n");
+    for (key, value) in RUN_LOG_LEVELS {
+        out.push_str(&format!("{key} = {value}\n"));
+    }
+    out
+}
+
+/// Path to the per-run log overlay file under the run directory.
+pub fn run_log_overlay_path(
+    run_dir: &std::path::Path,
+    component: &str,
+) -> std::path::PathBuf {
+    run_dir.join(format!("{component}.log-overlay.conf"))
+}
+
+/// 0.29.7: per-run log level overlay record. `applied == true` means the
+/// overlay file was persisted on the host and the start wrapper will pick
+/// it up. `previous_overlay_present` captures whether a previous overlay
+/// still existed on disk when apply ran, so restore can detect drift.
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+pub struct LogLevelOverlay {
+    pub component: String,
+    pub overlay_path: String,
+    pub overlay_sha256: String,
+    pub overlay_bytes: u64,
+    pub applied: bool,
+    pub previous_overlay_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 /// 0.29.7: evidence that the EPS bearer control plane completed before
@@ -286,6 +338,33 @@ pub trait SrsranRuntime: Send + Sync {
         _run_dir: &std::path::Path,
     ) -> TerminalEvidence {
         TerminalEvidence::default()
+    }
+    /// 0.29.7 (RRC-debug complement): render the per-run log overlay for
+    /// `component` ("srsenb" | "srsue"), persist it under `run_dir`, and
+    /// return the overlay record. The orchestrator calls this **before**
+    /// `runtime.start(target)` so the start wrapper picks up the overlay
+    /// via `--log.*` CLI arguments; `enb.conf` / `ue.conf` on disk stay
+    /// unchanged. Default returns an empty record for Mock-based tests.
+    fn apply_run_log_overlay(
+        &self,
+        _run_id: &str,
+        _run_dir: &std::path::Path,
+        component: &str,
+    ) -> LogLevelOverlay {
+        LogLevelOverlay {
+            component: component.to_string(),
+            ..LogLevelOverlay::default()
+        }
+    }
+    /// 0.29.7 (RRC-debug complement): remove the per-run log overlay so the
+    /// next run uses the committed defaults again. Called from the terminal
+    /// path of `cleanup_lte_run`. Default is a no-op for Mock-based tests.
+    fn restore_log_levels(
+        &self,
+        _run_id: &str,
+        _overlay: &LogLevelOverlay,
+    ) -> Result<(), String> {
+        Ok(())
     }
     fn start(&self, target: Target) -> Result<(), String>;
     fn stop(&self, target: Target) -> Result<(), String>;
@@ -1703,6 +1782,57 @@ impl SrsranRuntime for DockerSrsranRuntime {
             enb_network,
         }
     }
+    fn apply_run_log_overlay(
+        &self,
+        _run_id: &str,
+        run_dir: &std::path::Path,
+        component: &str,
+    ) -> LogLevelOverlay {
+        let overlay = render_run_log_level_overlay();
+        let path = run_log_overlay_path(run_dir, component);
+        let mut record = LogLevelOverlay {
+            component: component.to_string(),
+            overlay_path: path.display().to_string(),
+            overlay_sha256: format!("{:x}", Sha256::digest(overlay.as_bytes())),
+            overlay_bytes: overlay.len() as u64,
+            applied: false,
+            previous_overlay_present: path.exists(),
+            error_code: None,
+        };
+        if let Err(error) = fs::create_dir_all(run_dir) {
+            record.error_code = Some(format!("LTE_LOG_OVERLAY_CREATE_FAILED:{error}"));
+            return record;
+        }
+        let write_result = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut file| file.write_all(overlay.as_bytes()));
+        match write_result {
+            Ok(()) => record.applied = true,
+            Err(error) => {
+                record.error_code = Some(format!("LTE_LOG_OVERLAY_WRITE_FAILED:{error}"));
+            }
+        }
+        record
+    }
+    fn restore_log_levels(
+        &self,
+        _run_id: &str,
+        overlay: &LogLevelOverlay,
+    ) -> Result<(), String> {
+        if overlay.overlay_path.is_empty() {
+            return Ok(());
+        }
+        let path = std::path::Path::new(&overlay.overlay_path);
+        if path.exists() {
+            fs::remove_file(path)
+                .map_err(|error| format!("LTE_LOG_OVERLAY_RESTORE_FAILED:{error}"))?;
+        }
+        Ok(())
+    }
     fn install_lte_ul_route(&self) -> RouteOperation {
         let peer = match configured_traffic_peer() {
             Ok(peer) => peer,
@@ -2120,6 +2250,12 @@ pub struct MockSrsranRuntime {
     pub erab_gate_override: Arc<Mutex<Option<Result<ErabEstablishmentEvidence, (String, ErabEstablishmentEvidence)>>>>,
     /// 0.29.7: injectable terminal evidence returned by the mock.
     pub terminal_evidence_override: Arc<Mutex<Option<TerminalEvidence>>>,
+    /// 0.29.7 (RRC-debug complement): recorded `(component, applied)`
+    /// tuples for every `apply_run_log_overlay` call, so tests can assert
+    /// that the overlay was requested for both srsENB and srsUE before any
+    /// start, and that it was torn down at cleanup.
+    pub log_overlay_calls: Arc<Mutex<Vec<(String, bool)>>>,
+    pub log_overlay_restored: Arc<Mutex<Vec<String>>>,
 }
 impl Default for MockSrsranRuntime {
     fn default() -> Self {
@@ -2134,6 +2270,8 @@ impl Default for MockSrsranRuntime {
             traffic_configuration_error: Arc::new(Mutex::new(None)),
             erab_gate_override: Arc::new(Mutex::new(None)),
             terminal_evidence_override: Arc::new(Mutex::new(None)),
+            log_overlay_calls: Arc::new(Mutex::new(vec![])),
+            log_overlay_restored: Arc::new(Mutex::new(vec![])),
         }
     }
 }
@@ -2190,6 +2328,42 @@ impl SrsranRuntime for MockSrsranRuntime {
             .unwrap()
             .clone()
             .unwrap_or_default()
+    }
+    fn apply_run_log_overlay(
+        &self,
+        _run_id: &str,
+        run_dir: &std::path::Path,
+        component: &str,
+    ) -> LogLevelOverlay {
+        self.log_overlay_calls
+            .lock()
+            .unwrap()
+            .push((component.to_string(), true));
+        LogLevelOverlay {
+            component: component.to_string(),
+            overlay_path: run_log_overlay_path(run_dir, component)
+                .display()
+                .to_string(),
+            overlay_sha256: format!(
+                "{:x}",
+                Sha256::digest(render_run_log_level_overlay().as_bytes())
+            ),
+            overlay_bytes: render_run_log_level_overlay().len() as u64,
+            applied: true,
+            previous_overlay_present: false,
+            error_code: None,
+        }
+    }
+    fn restore_log_levels(
+        &self,
+        _run_id: &str,
+        overlay: &LogLevelOverlay,
+    ) -> Result<(), String> {
+        self.log_overlay_restored
+            .lock()
+            .unwrap()
+            .push(overlay.component.clone());
+        Ok(())
     }
     fn start(&self, t: Target) -> Result<(), String> {
         if let Some(e) = self.start_error.lock().unwrap().clone() {
@@ -3278,6 +3452,74 @@ mod tests {
         let mme_with_tmsi = "TMSI=0xdeadbeef\nModify Bearer Response EBI=5";
         let ok = evaluate_erab_establishment(srsenb_with_imsi, mme_with_tmsi).expect("sanitised");
         assert!(ok.ics_response_observed && ok.modify_bearer_response_observed);
+    }
+
+    #[test]
+    fn run_log_level_overlay_sets_exact_five_levels_and_is_root_only_targeted() {
+        // The frozen map carries exactly the five levels the mission asks
+        // for, in the required verbosity. srsRAN's config.file.overlay
+        // mechanism consumes a [log] section with these keys.
+        let overlay = render_run_log_level_overlay();
+        assert!(overlay.starts_with("[log]\n"));
+        for (expected, value) in [
+            ("rrc_level", "debug"),
+            ("s1ap_level", "debug"),
+            ("gtpu_level", "debug"),
+            ("pdcp_level", "info"),
+            ("rlc_level", "info"),
+        ] {
+            let line = format!("{expected} = {value}");
+            assert!(
+                overlay.contains(&line),
+                "overlay must include `{line}`: {overlay:?}"
+            );
+        }
+        // No sixth level sneaks in.
+        let keys = overlay
+            .lines()
+            .filter(|line| line.contains('='))
+            .count();
+        assert_eq!(keys, 5, "overlay must set exactly five levels");
+
+        // Overlay path lives under the run dir, named per component.
+        let dir = std::path::Path::new("/tmp/polaris-run-x");
+        assert_eq!(
+            run_log_overlay_path(dir, "srsenb").display().to_string(),
+            "/tmp/polaris-run-x/srsenb.log-overlay.conf"
+        );
+        assert_eq!(
+            run_log_overlay_path(dir, "srsue").display().to_string(),
+            "/tmp/polaris-run-x/srsue.log-overlay.conf"
+        );
+    }
+
+    #[test]
+    fn mock_runtime_records_overlay_apply_before_start_and_restore_at_cleanup() {
+        // Simulate the orchestrator sequence: apply overlay for both
+        // components → start → cleanup → restore. The mock records both
+        // calls so a wiring test can assert ordering.
+        let runtime = MockSrsranRuntime::default();
+        let dir = std::path::PathBuf::from("/tmp/polaris-run-mock");
+        let srsenb_overlay = runtime.apply_run_log_overlay("run-x", &dir, "srsenb");
+        let srsue_overlay = runtime.apply_run_log_overlay("run-x", &dir, "srsue");
+        assert!(srsenb_overlay.applied);
+        assert!(srsue_overlay.applied);
+        assert_eq!(srsenb_overlay.overlay_sha256.len(), 64);
+        assert_eq!(srsue_overlay.overlay_sha256.len(), 64);
+        assert_eq!(srsenb_overlay.component, "srsenb");
+        assert_eq!(srsue_overlay.component, "srsue");
+
+        let calls = runtime.log_overlay_calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![("srsenb".to_string(), true), ("srsue".to_string(), true)]
+        );
+        assert!(runtime
+            .restore_log_levels("run-x", &srsenb_overlay)
+            .is_ok());
+        assert!(runtime.restore_log_levels("run-x", &srsue_overlay).is_ok());
+        let restored = runtime.log_overlay_restored.lock().unwrap().clone();
+        assert_eq!(restored, vec!["srsenb".to_string(), "srsue".to_string()]);
     }
 
     #[test]
