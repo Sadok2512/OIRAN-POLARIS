@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::{ffi::CString, path::Path};
 
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.2.1";
 const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Policy {
@@ -17,13 +18,11 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            // Percentage thresholds are retained for wire compatibility only.
-            // 0.29.8 does not use them to reject writes.
-            information: 100,
-            warning: 100,
-            stop: 100,
-            hard: 100,
-            reserve_bytes: 0,
+            information: 95,
+            warning: 97,
+            stop: 98,
+            hard: 98,
+            reserve_bytes: 8 * GIB,
             max_scenario_bytes: 2 * 1024 * MIB,
             poll_ms: 1_000,
         }
@@ -78,23 +77,33 @@ pub fn evaluate(sample: Result<Sample, String>, policy: Policy) -> Decision {
             maximum_budget_bytes: 0,
         };
     };
-    let Some(_bp) = sample.basis_points() else {
+    let Some(bp) = sample.basis_points() else {
         return evaluate(Err("invalid filesystem".into()), policy);
     };
-    let state = State::Normal;
-    let maximum_budget_bytes = sample
-        .available_bytes
+    let t = |value: u8| u16::from(value) * 100;
+    let state = if bp >= t(policy.hard) {
+        State::HardLimit
+    } else if bp >= t(policy.stop) {
+        State::StopNewWrites
+    } else if bp >= t(policy.warning) {
+        State::Warning
+    } else if bp >= t(policy.information) {
+        State::Information
+    } else {
+        State::Normal
+    };
+    let stop_used = (u128::from(sample.total_bytes) * u128::from(policy.stop) / 100) as u64;
+    let maximum_budget_bytes = stop_used
+        .saturating_sub(sample.used_bytes())
         .saturating_sub(policy.reserve_bytes)
         .min(policy.max_scenario_bytes);
-    let writes_allowed = maximum_budget_bytes > 0 && sample.available_inodes > 0;
+    let writes_allowed =
+        state < State::StopNewWrites && maximum_budget_bytes > 0 && sample.available_inodes > 16;
     Decision {
         state,
         writes_allowed,
-        finalize_owned_writes: !writes_allowed,
-        reason: format!(
-            "available_bytes={} available_inodes={}",
-            sample.available_bytes, sample.available_inodes
-        ),
+        finalize_owned_writes: state >= State::StopNewWrites,
+        reason: format!("usage {:.2}%", f64::from(bp) / 100.0),
         maximum_budget_bytes,
     }
 }
@@ -130,17 +139,16 @@ mod tests {
         })
     }
     #[test]
-    fn percentages_never_block_writes() {
+    fn exact_thresholds() {
         let p = Policy {
             reserve_bytes: 0,
             max_scenario_bytes: 100 * MIB,
             ..Policy::default()
         };
-        for used_percent in [80, 85, 90, 98, 99] {
-            let decision = evaluate(at(used_percent), p);
-            assert_eq!(decision.state, State::Normal);
-            assert!(decision.writes_allowed);
-        }
+        assert_eq!(evaluate(at(94), p).state, State::Normal);
+        assert_eq!(evaluate(at(95), p).state, State::Information);
+        assert_eq!(evaluate(at(97), p).state, State::Warning);
+        assert_eq!(evaluate(at(98), p).state, State::HardLimit)
     }
     #[test]
     fn monitor_failure_is_closed() {
@@ -155,7 +163,7 @@ mod tests {
             max_scenario_bytes: 50 * MIB,
             ..Policy::default()
         };
-        assert_eq!(evaluate(at(90), p).maximum_budget_bytes, 8 * MIB)
+        assert_eq!(evaluate(at(90), p).maximum_budget_bytes, 6 * MIB)
     }
 
     #[test]
@@ -173,22 +181,22 @@ mod tests {
     }
 
     #[test]
-    fn projected_budget_and_absolute_reserve_use_free_bytes_only() {
+    fn projected_budget_and_absolute_reserve_fail_closed_before_98_percent() {
         let p = Policy {
             reserve_bytes: 2 * MIB,
             max_scenario_bytes: 50 * MIB,
             ..Policy::default()
         };
         let decision = evaluate(at(97), p);
-        assert_eq!(decision.state, State::Normal);
-        assert!(decision.writes_allowed);
-        assert_eq!(decision.maximum_budget_bytes, MIB);
+        assert_eq!(decision.state, State::Warning);
+        assert!(!decision.writes_allowed);
+        assert_eq!(decision.maximum_budget_bytes, 0);
     }
 
     #[test]
     fn inode_exhaustion_and_measurement_failure_remain_closed() {
         let mut sample = at(50).unwrap();
-        sample.available_inodes = 0;
+        sample.available_inodes = 16;
         assert!(!evaluate(Ok(sample), Policy::default()).writes_allowed);
         assert!(!evaluate(Err("ENOSPC".into()), Policy::default()).writes_allowed);
     }

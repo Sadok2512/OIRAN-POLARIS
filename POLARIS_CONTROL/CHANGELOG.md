@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.29.9 (polaris-control-api) / safety-guard 0.2.1 — 2026-11-03 — restore the 98% disk ceiling + 8 GiB reserve removed in 0.29.8
+
+- Restores `crates/safety-guard/src/lib.rs` byte-identical to the 7a256ac0
+  state (POLARIS 0.29.8 pre-merge of commits 34f0c6d / 99dce07). The
+  original `Policy` defaults are back:
+  `information: 95, warning: 97, stop: 98, hard: 98, reserve_bytes: 8 GiB`.
+  Evaluation enforces the percentage thresholds + absolute reserve +
+  `available_inodes > 16`, as mandated by the project policy that bans
+  disabling the 98 % ceiling. The original tests are back as well
+  (`exact_thresholds`,
+   `projected_budget_and_absolute_reserve_fail_closed_before_98_percent`,
+   `inode_exhaustion_and_measurement_failure_remain_closed`,
+   `reserve_caps_budget`, `monitor_failure_is_closed`,
+   `legacy_thresholds_do_not_block_when_budget_and_reserve_fit`).
+- Bumps `safety-guard` from `0.2.0` to `0.2.1` with the same change
+  recorded in its `VERSION` constant and `Cargo.toml`. Clients tracking
+  the crate's VERSION will see the bump even though the behaviour is
+  "back to the 0.29.7 default" — this is the project's safety-guard
+  guarantee being restored, not a new regression.
+
 ## 0.29.8 (polaris-control-api) — 2026-11-03 — bounded LTE diagnostics + deterministic bearer gates
 
 - Writes bounded srsUE/srsENB logs to root-only per-run files, disables the
