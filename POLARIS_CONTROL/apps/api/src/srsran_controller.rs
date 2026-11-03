@@ -799,9 +799,17 @@ pub fn classify_tooling_exec(
 /// emitted by srsRAN 25.10 `s1ap.cc` through `sctp_send_s1ap_pdu`.
 const ICS_RESPONSE_LOG_MARKERS: &[&str] = &["tx s1ap sdu, initialcontextsetupresponse"];
 
-/// Exact info-level marker emitted by Open5GS SGW-C `s5c-handler.c` after
-/// receiving the S11/S5-C Modify Bearer Response. The MME is not the source.
+/// Direct info-level marker emitted by Open5GS SGW-C `s5c-handler.c` when the
+/// S5-C handover path receives a Modify Bearer Response.
 const MODIFY_BEARER_RESPONSE_MARKERS: &[&str] = &["modify bearer response"];
+
+/// Initial Attach does not traverse `s5c-handler.c`: after SGW-C logs the S11
+/// request, a successful PFCP Session Modification Response causes
+/// `sxa-handler.c` to build and commit the S11 Modify Bearer Response without
+/// logging that GTPv2-C response by name. Require the two real markers in
+/// order; a Session Modification Response from Create Session must not count.
+const MODIFY_BEARER_REQUEST_MARKERS: &[&str] = &["modify bearer request"];
+const PFCP_MODIFICATION_RESPONSE_MARKERS: &[&str] = &["session modification response"];
 
 /// Count occurrences of any of `markers` across the sanitized log lines.
 fn count_markers(logs: &str, markers: &[&str]) -> u32 {
@@ -817,14 +825,34 @@ fn count_markers(logs: &str, markers: &[&str]) -> u32 {
     count
 }
 
+fn count_ordered_marker_pairs(logs: &str, starts: &[&str], completions: &[&str]) -> u32 {
+    let mut pending: u32 = 0;
+    let mut completed: u32 = 0;
+    for line in logs.lines() {
+        if let Some(sanitized) = sanitize_log_line(line) {
+            let lower = sanitized.to_ascii_lowercase();
+            if starts.iter().any(|marker| lower.contains(marker)) {
+                pending = pending.saturating_add(1);
+            }
+            if pending > 0 && completions.iter().any(|marker| lower.contains(marker)) {
+                pending -= 1;
+                completed = completed.saturating_add(1);
+            }
+        }
+    }
+    completed
+}
+
 /// 0.29.7: fail-closed EPS bearer establishment gate. Must be called by the
 /// orchestrator **before** any ping / UDP step. The gate requires:
 ///
 /// - at least one srsENB-side marker that an Initial Context Setup Response
 ///   (S1AP procedure 9 successfulOutcome, E-RAB id 5 in the certified
 ///   profile) was emitted;
-/// - at least one SGW-C-side marker that a Modify Bearer Response (S11
-///   GTPv2-C type 35) was emitted.
+/// - at least one SGW-C-side proof that a Modify Bearer Response (S11 GTPv2-C
+///   type 35) was emitted: either the direct S5-C response marker or the
+///   ordered Initial Attach pair `Modify Bearer Request` followed by a PFCP
+///   `Session Modification Response`.
 ///
 /// Returns `Ok(evidence)` on success, `Err(("LTE_ERAB_NOT_ESTABLISHED",
 /// evidence))` otherwise. The returned evidence is JSON-serialisable and
@@ -834,7 +862,12 @@ pub fn evaluate_erab_establishment(
     sgwc_logs: &str,
 ) -> Result<ErabEstablishmentEvidence, (String, ErabEstablishmentEvidence)> {
     let ics_markers = count_markers(srsenb_logs, ICS_RESPONSE_LOG_MARKERS);
-    let mbr_markers = count_markers(sgwc_logs, MODIFY_BEARER_RESPONSE_MARKERS);
+    let mbr_markers = count_markers(sgwc_logs, MODIFY_BEARER_RESPONSE_MARKERS)
+        + count_ordered_marker_pairs(
+            sgwc_logs,
+            MODIFY_BEARER_REQUEST_MARKERS,
+            PFCP_MODIFICATION_RESPONSE_MARKERS,
+        );
     let ics_ok = ics_markers > 0;
     let mbr_ok = mbr_markers > 0;
     let summary = truncate_utf8_tail(
@@ -4091,15 +4124,35 @@ some_option = 1
 
     #[test]
     fn evaluate_erab_establishment_requires_both_ics_response_and_modify_bearer_response() {
-        // Real srsRAN 25.10 + Open5GS SGW-C excerpts.
+        // Real srsRAN 25.10 + Open5GS SGW-C Initial Attach excerpts. The
+        // first PFCP response belongs to Create Session and must not count;
+        // only the response after Modify Bearer Request completes the pair.
         // Response → evidence collected, Ok.
         let srsenb = "[S1AP] Tx S1AP SDU, InitialContextSetupResponse, rnti=0x46";
-        let sgwc = "[sgwc] INFO: Modify Bearer Response";
+        let sgwc = "[sgwc] INFO: Session Modification Response\n\
+                    [sgwc] INFO: Modify Bearer Request\n\
+                    [sgwc] INFO: Session Modification Response";
         let ok = evaluate_erab_establishment(srsenb, sgwc).expect("both markers present");
         assert!(ok.ics_response_observed);
         assert!(ok.modify_bearer_response_observed);
         assert!(ok.ics_response_e_rab_markers >= 1);
         assert!(ok.modify_bearer_response_markers >= 1);
+
+        // The direct S5-C response path remains valid.
+        let direct = evaluate_erab_establishment(srsenb, "[sgwc] INFO: Modify Bearer Response")
+            .expect("direct response marker");
+        assert_eq!(direct.modify_bearer_response_markers, 1);
+
+        // Reversed or incomplete pairs cannot create a false PASS.
+        for invalid in [
+            "[sgwc] INFO: Session Modification Response\n[sgwc] INFO: Modify Bearer Request",
+            "[sgwc] INFO: Modify Bearer Request",
+            "[sgwc] INFO: Session Modification Response",
+        ] {
+            let err =
+                evaluate_erab_establishment(srsenb, invalid).expect_err("ordered pair required");
+            assert!(!err.1.modify_bearer_response_observed);
+        }
 
         // The exact d62245de pathology: eNB got ICS Request, never emitted
         // ICS Response; MME never sent Modify Bearer. Gate must fail with

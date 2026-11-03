@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.29.11 (polaris-control-api) — 2026-11-03 — validate the real Initial Attach Modify Bearer completion
+
+- Fixes the fail-closed E-RAB gate for the Open5GS Initial Attach path. SGW-C
+  does not log a literal `Modify Bearer Response` on this path: after
+  `Modify Bearer Request`, the successful PFCP `Session Modification Response`
+  causes `sxa-handler.c` to build and commit the S11 response without naming it
+  in the log. The gate now accepts that ordered pair while rejecting reversed,
+  incomplete, or unrelated PFCP responses; the direct S5-C response marker
+  remains supported.
+
 ## 0.29.10 (polaris-control-api) — 2026-11-03 — pin the runtime canonical Compose digest
 
 - Pins the certified LTE Compose model to the digest produced by the API's
