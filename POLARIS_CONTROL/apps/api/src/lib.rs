@@ -5138,6 +5138,41 @@ async fn create_lte_run(
             Json(json!({"error":error,"run_id":run.run_id,"cleanup_required":false})),
         );
     }
+    // 0.29.8: fail closed unless the deployment-installed UE `[log]`
+    // section is exact. The API sandbox has ReadOnlyPaths=/root/POLARIS,
+    // therefore it validates rather than mutates production configuration.
+    let patch_runtime = state.srsran_runtime.clone();
+    let patch = tokio::task::spawn_blocking(move || patch_runtime.apply_run_ue_log_section())
+        .await
+        .unwrap_or_else(|_| srsran_controller::LogSectionPatch {
+            error_code: Some("LTE_UE_LOG_CONFIG_WORKER_FAILED".into()),
+            ..srsran_controller::LogSectionPatch::default()
+        });
+    let patch_json = serde_json::to_value(&patch)
+        .unwrap_or_else(|_| json!({"error":"serialization_failed"}));
+    let _ = state.lte_runs_v2.lock().map(|mut store| {
+        store.record_step_diagnostic(
+            &run.run_id,
+            1,
+            lte_observation(1, "ue_conf_log_section_patch", patch_json),
+        )
+    });
+    if !patch.applied {
+        let error = patch
+            .error_code
+            .as_deref()
+            .unwrap_or("LTE_UE_LOG_CONFIG_INVALID");
+        let _ = state
+            .lte_runs_v2
+            .lock()
+            .map(|mut store| store.fail_step(&run.run_id, 1, error, epoch_millis()));
+        drop(lifecycle_guard);
+        let _ = cleanup_lte_run(&state, &run.run_id, lte_orchestrator::RunOutcome::Failed).await;
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({"error":error,"run_id":run.run_id,"cleanup_required":false})),
+        );
+    }
     let runtime = state.srsran_runtime.clone();
     let enb_start =
         tokio::task::spawn_blocking(move || runtime.start(srsran_controller::Target::Enb)).await;

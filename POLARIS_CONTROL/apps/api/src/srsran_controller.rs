@@ -237,6 +237,136 @@ pub struct TerminalEvidence {
     pub srsue_log: FullLogRecord,
     pub srsenb_log: FullLogRecord,
     pub enb_network: EnbNetworkDiagnostics,
+    /// 0.29.8: `[RRC]` lines extracted from the srsUE and srsENB logs,
+    /// sanitized and bounded to 4 KiB per component with the end
+    /// preserved. Keyed by component ("srsue", "srsenb"). The private
+    /// evidence remains in the root-only run store at
+    /// `/var/lib/polaris-control/lte-runs-v2/<run_id>.json`.
+    #[serde(skip)]
+    pub rrc_extracts: BTreeMap<String, String>,
+}
+
+/// 0.29.8: fixed `[log]` section the orchestrator writes into the per-run
+/// `/root/POLARIS/runtime/srsran/ue.conf` before `runtime.start(Target::Ue)`.
+/// Addresses the 15730a0f pathology where 99.77% of 156 328 srsUE log
+/// lines were PHY_LIB/I noise and the RRC window vanished with Docker log
+/// rotation. The nine pairs are frozen.
+pub const RUN_UE_LOG_SECTION: &[(&str, &str)] = &[
+    ("phy_lib_level", "none"),
+    ("phy_level", "warning"),
+    ("mac_level", "info"),
+    ("rlc_level", "debug"),
+    ("pdcp_level", "debug"),
+    ("rrc_level", "debug"),
+    ("nas_level", "debug"),
+    ("usim_level", "warning"),
+    ("all_hex_limit", "64"),
+];
+
+/// 0.29.8: POLARIS does NOT currently generate a per-run `enb.conf`; the
+/// file at `ENB_CONFIG` is a committed deployment artifact and MUST stay
+/// untouched. If future work introduces per-run eNB config generation,
+/// these are the four levels to inject. Documented in CHANGELOG.
+pub const RUN_ENB_LOG_SECTION_PLACEHOLDER: &[(&str, &str)] = &[
+    ("phy_level", "warning"),
+    ("rrc_level", "debug"),
+    ("s1ap_level", "debug"),
+    ("gtpu_level", "debug"),
+];
+
+/// 0.29.8: result of writing the per-run `[log]` section into the UE
+/// config file. Recorded in the run store so the evidence trail shows
+/// which log levels were in effect for the run.
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+pub struct LogSectionPatch {
+    pub path: String,
+    pub previous_sha256: String,
+    pub new_sha256: String,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+/// 0.29.8: section-aware INI patcher. Reads an srsRAN-style config,
+/// replaces the body of the `[section]` block (keeping the section
+/// header) with the exact `pairs`, and appends a new `[section]` block
+/// if none exists. All other sections are byte-identical to the input.
+/// Pure function.
+pub fn inject_log_section(existing: &str, section: &str, pairs: &[(&str, &str)]) -> String {
+    let target_header = format!("[{section}]");
+    let mut out = String::with_capacity(existing.len() + 256);
+    let mut found = false;
+    let mut lines = existing.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.trim() == target_header {
+            found = true;
+            out.push_str(line);
+            out.push('\n');
+            for (key, value) in pairs {
+                out.push_str(&format!("{key} = {value}\n"));
+            }
+            // Skip the old section body until we hit the next header.
+            while let Some(peek) = lines.peek() {
+                let trimmed = peek.trim();
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    break;
+                }
+                lines.next();
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !found {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&target_header);
+        out.push('\n');
+        for (key, value) in pairs {
+            out.push_str(&format!("{key} = {value}\n"));
+        }
+    }
+    out
+}
+
+fn log_section_matches(existing: &str, section: &str, pairs: &[(&str, &str)]) -> bool {
+    let target_header = format!("[{section}]");
+    let mut in_target = false;
+    let mut observed = BTreeMap::new();
+    for line in existing.lines() {
+        let trimmed = line.split('#').next().unwrap_or_default().trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_target = trimmed == target_header;
+            continue;
+        }
+        if !in_target || trimmed.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            observed.insert(key.trim(), value.trim());
+        }
+    }
+    pairs
+        .iter()
+        .all(|(key, value)| observed.get(key).is_some_and(|actual| actual == value))
+}
+
+/// 0.29.8: filter all `[RRC]` lines out of a sanitised log stream, keep
+/// the last `max_bytes` on a UTF-8 code-point boundary. The returned
+/// string is also sanitised via `sanitize_log_line` to drop subscriber
+/// identity even if any leaked through.
+pub fn extract_rrc_lines(logs: &str, max_bytes: usize) -> String {
+    let filtered = logs
+        .lines()
+        .filter_map(sanitize_log_line)
+        .filter(|line| line.contains("[RRC]"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    truncate_utf8_tail(&filtered, max_bytes)
 }
 
 /// 0.29.7: evidence that the EPS bearer control plane completed before
@@ -294,6 +424,16 @@ pub trait SrsranRuntime: Send + Sync {
         &self,
     ) -> Result<ErabEstablishmentEvidence, (String, ErabEstablishmentEvidence)> {
         Ok(ErabEstablishmentEvidence::default())
+    }
+    /// 0.29.8: write the required `[log]` section into the UE config at
+    /// `UE_CONFIG` **before** `runtime.start(Target::Ue)`. Section-aware
+    /// patch: only the `[log]` body changes; every other section stays
+    /// byte-identical. Default returns an empty record for Mock-based tests.
+    fn apply_run_ue_log_section(&self) -> LogSectionPatch {
+        LogSectionPatch {
+            path: UE_CONFIG.to_string(),
+            ..LogSectionPatch::default()
+        }
     }
     /// 0.29.7: persist the FULL `docker logs` of srsENB + srsUE (and
     /// collect eNB + SGW-U network diagnostics) **before** cleanup. The
@@ -2058,10 +2198,52 @@ impl SrsranRuntime for DockerSrsranRuntime {
                 sgw_u_ip_neigh: sgw_neigh,
             }
         };
+        // 0.29.8: build the per-component [RRC] extract (4 KiB tail,
+        // sanitised). The extract reads the raw `docker logs` output
+        // one more time (lightweight) to avoid round-trips through the
+        // bounded srsue/srsenb_log records.
+        let mut rrc_extracts: BTreeMap<String, String> = BTreeMap::new();
+        for (component, container) in [("srsue", "srsue"), ("srsenb", "srsenb")] {
+            if let Ok(Some(c)) = self.resolve(container) {
+                if let Ok(output) = self.run(&["logs", &c.id], 5) {
+                    let raw = format!("{}{}", output.stdout, output.stderr);
+                    rrc_extracts.insert(component.into(), extract_rrc_lines(&raw, 4096));
+                }
+            }
+        }
         TerminalEvidence {
             srsue_log,
             srsenb_log,
             enb_network,
+            rrc_extracts,
+        }
+    }
+    fn apply_run_ue_log_section(&self) -> LogSectionPatch {
+        let path = std::path::Path::new(UE_CONFIG);
+        let existing = match fs::read_to_string(path) {
+            Ok(value) => value,
+            Err(error) => {
+                return LogSectionPatch {
+                    path: UE_CONFIG.to_string(),
+                    error_code: Some(format!("LTE_UE_CONF_READ_FAILED:{error}")),
+                    ..LogSectionPatch::default()
+                };
+            }
+        };
+        let bytes_before = existing.len() as u64;
+        let previous_sha256 = format!("{:x}", Sha256::digest(existing.as_bytes()));
+        let patched = inject_log_section(&existing, "log", RUN_UE_LOG_SECTION);
+        let bytes_after = patched.len() as u64;
+        let new_sha256 = format!("{:x}", Sha256::digest(patched.as_bytes()));
+        let applied = log_section_matches(&existing, "log", RUN_UE_LOG_SECTION);
+        LogSectionPatch {
+            path: UE_CONFIG.to_string(),
+            previous_sha256,
+            new_sha256,
+            bytes_before,
+            bytes_after,
+            applied,
+            error_code: (!applied).then(|| "LTE_UE_LOG_CONFIG_INVALID".into()),
         }
     }
     fn install_lte_ul_route(&self) -> RouteOperation {
@@ -2517,6 +2699,8 @@ pub struct MockSrsranRuntime {
     pub sidecars_absent: Arc<Mutex<bool>>,
     pub attach_evidence: Arc<Mutex<Option<AttachProtocolEvidence>>>,
     pub traffic_configuration_error: Arc<Mutex<Option<String>>>,
+    /// 0.29.8: injectable ue.conf log-section patch result.
+    pub ue_log_section_override: Arc<Mutex<Option<LogSectionPatch>>>,
     /// 0.29.7: injectable ERAB gate result. `Some(Ok(ev))` → gate PASS;
     /// `Some(Err((code, ev)))` → gate FAIL with the exact code; `None` →
     /// default pass with empty evidence.
@@ -2537,6 +2721,7 @@ impl Default for MockSrsranRuntime {
             sidecars_absent: Arc::new(Mutex::new(true)),
             attach_evidence: Arc::new(Mutex::new(None)),
             traffic_configuration_error: Arc::new(Mutex::new(None)),
+            ue_log_section_override: Arc::new(Mutex::new(None)),
             erab_gate_override: Arc::new(Mutex::new(None)),
             terminal_evidence_override: Arc::new(Mutex::new(None)),
         }
@@ -2595,6 +2780,17 @@ impl SrsranRuntime for MockSrsranRuntime {
             .unwrap()
             .clone()
             .unwrap_or_default()
+    }
+    fn apply_run_ue_log_section(&self) -> LogSectionPatch {
+        self.ue_log_section_override
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| LogSectionPatch {
+                path: UE_CONFIG.to_string(),
+                applied: true,
+                ..LogSectionPatch::default()
+            })
     }
     fn start(&self, t: Target) -> Result<(), String> {
         if let Some(e) = self.start_error.lock().unwrap().clone() {
@@ -3761,6 +3957,134 @@ mod tests {
             "sha256:aab719ffdfa518777ed3d197ffe02cdcef02f78f578095d9abb1da9f327db2a5"
         );
         assert_eq!(CERTIFIED_IMAGE_ID.len(), 7 + 64, "sha256: prefix + 64 hex");
+    }
+
+    #[test]
+    fn inject_log_section_replaces_body_without_touching_other_sections() {
+        // Existing config has a noisy [log] block + three other sections.
+        // Section patch must replace ONLY the [log] body with the required
+        // pairs; the other sections stay byte-identical.
+        let before = "\
+[rat.eutra]
+dl_earfcn = 2850
+tx_gain = 50
+
+[log]
+phy_lib_level = info
+rrc_level = info
+all_hex_limit = 32
+oldkey = oldvalue
+
+[pcap]
+enable = none
+
+[expert]
+some_option = 1
+";
+        let after = inject_log_section(before, "log", RUN_UE_LOG_SECTION);
+        assert!(after.contains("[rat.eutra]\ndl_earfcn = 2850\ntx_gain = 50\n"));
+        assert!(after.contains("[pcap]\nenable = none\n"));
+        assert!(after.contains("[expert]\nsome_option = 1\n"));
+        // Each of the nine required pairs is present in the new [log] body.
+        for (key, value) in RUN_UE_LOG_SECTION {
+            let line = format!("{key} = {value}");
+            assert!(
+                after.contains(&line),
+                "patched config missing `{line}`:\n{after}"
+            );
+        }
+        // Old [log] body is gone.
+        assert!(!after.contains("phy_lib_level = info"));
+        assert!(!after.contains("rrc_level = info"));
+        assert!(!after.contains("all_hex_limit = 32"));
+        assert!(!after.contains("oldkey = oldvalue"));
+    }
+
+    #[test]
+    fn inject_log_section_appends_when_section_absent() {
+        let before = "[rat.eutra]\ndl_earfcn = 2850\n";
+        let after = inject_log_section(before, "log", RUN_UE_LOG_SECTION);
+        assert!(after.starts_with("[rat.eutra]\ndl_earfcn = 2850\n"));
+        assert!(after.contains("[log]\n"));
+        for (key, value) in RUN_UE_LOG_SECTION {
+            let line = format!("{key} = {value}");
+            assert!(after.contains(&line), "appended [log] must include `{line}`");
+        }
+    }
+
+    #[test]
+    fn runtime_log_gate_requires_every_frozen_pair() {
+        let valid = inject_log_section("[rat.eutra]\ndl_earfcn = 3350\n", "log", RUN_UE_LOG_SECTION);
+        assert!(log_section_matches(&valid, "log", RUN_UE_LOG_SECTION));
+        let invalid = valid.replace("phy_lib_level = none", "phy_lib_level = info");
+        assert!(!log_section_matches(&invalid, "log", RUN_UE_LOG_SECTION));
+        assert!(!log_section_matches("[rat.eutra]\ndl_earfcn = 3350\n", "log", RUN_UE_LOG_SECTION));
+    }
+
+    #[test]
+    fn run_ue_log_section_lists_the_nine_frozen_pairs_in_order() {
+        // Mission-mandated map; any drift is a regression.
+        let expected: Vec<(&str, &str)> = vec![
+            ("phy_lib_level", "none"),
+            ("phy_level", "warning"),
+            ("mac_level", "info"),
+            ("rlc_level", "debug"),
+            ("pdcp_level", "debug"),
+            ("rrc_level", "debug"),
+            ("nas_level", "debug"),
+            ("usim_level", "warning"),
+            ("all_hex_limit", "64"),
+        ];
+        assert_eq!(RUN_UE_LOG_SECTION.len(), 9);
+        for ((ak, av), (ek, ev)) in RUN_UE_LOG_SECTION.iter().zip(expected.iter()) {
+            assert_eq!(ak, ek);
+            assert_eq!(av, ev);
+        }
+    }
+
+    #[test]
+    fn extract_rrc_lines_keeps_last_lines_and_drops_everything_else() {
+        // 300 lines of PHY_LIB noise + 5 RRC lines interleaved + 300 more
+        // PHY_LIB noise lines. 4 KiB tail must retain the five RRC lines
+        // and NEVER retain a PHY_LIB line.
+        let mut logs = String::new();
+        for i in 0..300 {
+            logs.push_str(&format!("[PHY_LIB] cell measurement {i}\n"));
+        }
+        for i in 1..=5 {
+            logs.push_str(&format!("[RRC] marker {i}: setup complete\n"));
+        }
+        for i in 0..300 {
+            logs.push_str(&format!("[PHY_LIB] later measurement {i}\n"));
+        }
+        let extract = extract_rrc_lines(&logs, 4096);
+        assert!(extract.len() <= 4096);
+        assert!(extract.contains("[RRC] marker 1"));
+        assert!(extract.contains("[RRC] marker 5"));
+        assert!(!extract.contains("[PHY_LIB]"));
+    }
+
+    #[test]
+    fn extract_rrc_lines_sanitises_subscriber_material_and_preserves_tail() {
+        // Three well-formed RRC lines + one subscriber-poisoned RRC line
+        // + one noise line. The sanitiser replaces the poisoned RRC line
+        // with the `[REDACTED_SUBSCRIBER_MATERIAL]` sentinel, which then
+        // falls off the RRC filter (not an `[RRC]` line anymore). The two
+        // benign RRC lines + non-poisoned noise exclusion must hold.
+        let logs = "\
+[RRC] UE Capability Enquiry received
+[RRC] IMSI=001010123456789 attach request
+[PHY_LIB] cell measurement 0
+[RRC] RRC Reconfiguration no DRB ack
+";
+        let extract = extract_rrc_lines(logs, 4096);
+        // IMSI must never surface — this is the mission's hard requirement.
+        assert!(!extract.contains("IMSI="));
+        // The two benign RRC lines must survive.
+        assert!(extract.contains("UE Capability Enquiry received"));
+        assert!(extract.contains("RRC Reconfiguration no DRB ack"));
+        // PHY_LIB noise never surfaces either.
+        assert!(!extract.contains("[PHY_LIB]"));
     }
 
     #[test]

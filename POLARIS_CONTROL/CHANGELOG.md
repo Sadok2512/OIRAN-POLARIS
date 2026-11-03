@@ -15,6 +15,26 @@
   before profile activation/Grant consumption.
 - Removes percentage-based disk gates. Writes remain fail-closed on
   insufficient free bytes, exhausted inodes, or ENOSPC.
+- Installs and validates a fixed `[log]` section in
+  `/root/POLARIS/runtime/srsran/ue.conf` before every run, with
+  `phy_lib_level=none`, `phy_level=warning`, `mac_level=info`,
+  `rlc_level=debug`, `pdcp_level=debug`, `rrc_level=debug`,
+  `nas_level=debug`, `usim_level=warning`, `all_hex_limit=64`. The patch
+  is section-aware and every other section stays byte-identical. Addresses the
+  15730a0f pathology where 99.77 % of 156 328 srsUE log lines were
+  PHY_LIB/I noise and the RRC window vanished with Docker log rotation.
+  Expected total log volume per run < 5 MiB with these levels.
+- The release deployment assets install the matching eNB log section outside
+  the sandboxed API process, with backup and rollback.
+- Terminal evidence now carries an `rrc_extracts: BTreeMap<String, String>`
+  with the sanitized `[RRC]` lines of srsUE and srsENB, bounded 4 KiB
+  tail per component. The private evidence remains in the root-only run
+  store (`/var/lib/polaris-control/lte-runs-v2/<run_id>.json`), never in
+  a public HTTP body.
+- New primitives (pure functions): `inject_log_section`,
+  `extract_rrc_lines`, and the constant `RUN_UE_LOG_SECTION`.
+- The runtime gate verifies the installed UE log section before starting
+  srsRAN and fails closed if it is absent or altered.
 
 ## 0.29.7 (polaris-control-api) — 2026-11-03 — ERAB gate + terminal evidence persistence
 
