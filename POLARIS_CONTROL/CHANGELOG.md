@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.29.13 (polaris-control-api) — 2026-11-03 — unify LTE `docker compose` file list
+
+- `DockerSrsranRuntime::create()` now passes the same `-f` compose files as the
+  certified compose model render (`compose_config_args()`): both the base
+  `docker-compose.oiran-lab.yml` and the LTE overlay
+  `docker-compose.polaris-0.29.8.yml`. 0.29.12 shipped `create()` with only the
+  base file, so srsUE was spawned without the overlay (/tmp = 64 MiB default
+  instead of the certified 16 MiB, and no SYS_NICE / rtprio / memlock), while
+  the SHA256 of the certified compose model kept covering both files.
+- Introduces `COMPOSE_FILE_ARGS: [&str; 4]` as the single source of truth for
+  the `-f` list, used by `create()` and `compose_config_args()`. Any new
+  `docker compose` subcommand added later must reuse it.
+- Adds three regression tests: the `-f` pairs of `create()` are strictly
+  identical to those of the certified model, every compose call includes the
+  overlay, and `CERTIFIED_COMPOSE_MODEL_SHA256` is unchanged
+  (`fa7fe0c168bf6139b9c67f2b9b129ae3b7a0370d94f7dac70f9858dc380121fc`).
+- No change to the compose model, the overlay content, image digests, log
+  fragments, or safety-guard behaviour.
+
 ## 0.29.12 (polaris-control-api) — 2026-11-03 — writable confined iperf3 runtime
 
 - Gives both LTE iperf3 endpoints a bounded 16 MiB `/tmp` tmpfs with

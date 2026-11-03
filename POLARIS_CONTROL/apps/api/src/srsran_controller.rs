@@ -17,6 +17,12 @@ const LTE_PROFILE: &str = "lte";
 const COMPOSE: &str = "/root/POLARIS/compose/docker-compose.oiran-lab.yml";
 const ENV_FILE: &str = "/root/POLARIS/compose/versions.env";
 const COMPOSE_0298_OVERRIDE: &str = "/root/POLARIS/compose/docker-compose.polaris-0.29.8.yml";
+// 0.29.13: single source of truth for the `-f` compose file arguments passed
+// to every `docker compose` subcommand in this module. 0.29.12 spawned srsUE
+// via `docker compose create` with only `-f COMPOSE` (no overlay), so the LTE
+// hardening (tmpfs 16m, SYS_NICE, rtprio, memlock) silently diverged from the
+// certified compose model whose SHA covers both files.
+const COMPOSE_FILE_ARGS: [&str; 4] = ["-f", COMPOSE, "-f", COMPOSE_0298_OVERRIDE];
 const UE_CONFIG: &str = "/root/POLARIS/runtime/srsran/ue.conf";
 const ENB_CONFIG: &str = "/root/POLARIS/config/srsran/enb.conf";
 const LEDGER: &str = "/var/lib/polaris-control/srsran-ownership.json";
@@ -1842,26 +1848,16 @@ impl DockerSrsranRuntime {
             .unwrap_or_else(|| "UNKNOWN".into())
     }
     fn create(&self, target: Target) -> Result<(), String> {
-        Self::ok(
-            self.run(
-                &[
-                    "compose",
-                    "--project-name",
-                    PROJECT,
-                    "--env-file",
-                    ENV_FILE,
-                    "-f",
-                    COMPOSE,
-                    "--profile",
-                    "lte",
-                    "create",
-                    target.service(),
-                ],
-                60,
-            )?,
-            "SRSRAN_CREATE_FAILED",
-        )
-        .map(|_| ())
+        let mut args: Vec<&str> = vec![
+            "compose",
+            "--project-name",
+            PROJECT,
+            "--env-file",
+            ENV_FILE,
+        ];
+        args.extend_from_slice(&COMPOSE_FILE_ARGS);
+        args.extend_from_slice(&["--profile", LTE_PROFILE, "create", target.service()]);
+        Self::ok(self.run(&args, 60)?, "SRSRAN_CREATE_FAILED").map(|_| ())
     }
     fn remove(&self, id: &str, force: bool) -> Result<(), String> {
         let args = if force {
@@ -2097,8 +2093,8 @@ pub fn verify_dn_tooling_executable(image_reference: &str) -> Result<(), String>
     run_tooling_exec_preflight(image_reference, &DN_SGI_SERVICE_EXEC_SPEC)
 }
 
-fn compose_config_args() -> [&'static str; 16] {
-    [
+fn compose_config_args() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = vec![
         "10s",
         "/usr/bin/docker",
         "compose",
@@ -2108,14 +2104,10 @@ fn compose_config_args() -> [&'static str; 16] {
         LTE_PROFILE,
         "--env-file",
         ENV_FILE,
-        "-f",
-        COMPOSE,
-        "-f",
-        COMPOSE_0298_OVERRIDE,
-        "config",
-        "--format",
-        "json",
-    ]
+    ];
+    v.extend_from_slice(&COMPOSE_FILE_ARGS);
+    v.extend_from_slice(&["config", "--format", "json"]);
+    v
 }
 
 impl SrsranRuntime for DockerSrsranRuntime {
@@ -4099,6 +4091,67 @@ mod tests {
         assert!(args
             .windows(3)
             .any(|window| { window == ["config", "--format", "json"] }));
+    }
+
+    fn compose_file_pairs<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
+        args.windows(2)
+            .filter(|w| w[0] == "-f")
+            .map(|w| w[1])
+            .collect()
+    }
+
+    #[test]
+    fn compose_file_args_pin_the_base_and_the_lte_overlay() {
+        assert_eq!(
+            compose_file_pairs(&COMPOSE_FILE_ARGS),
+            vec![COMPOSE, COMPOSE_0298_OVERRIDE]
+        );
+    }
+
+    #[test]
+    fn canonical_compose_model_passes_the_lte_overlay() {
+        // Any `docker compose` invocation emitted by this module must include
+        // the LTE overlay. The certified model render is the reference for all
+        // other call sites.
+        let args = compose_config_args();
+        assert_eq!(
+            compose_file_pairs(&args),
+            vec![COMPOSE, COMPOSE_0298_OVERRIDE]
+        );
+    }
+
+    #[test]
+    fn create_passes_the_same_compose_files_as_the_certified_model() {
+        // 0.29.12 regression: `create()` passed only `-f COMPOSE`, so srsUE
+        // was spawned without the LTE overlay (/tmp = 64m instead of 16m).
+        // The create() builder must render the same `-f` pairs as the
+        // certified compose model, which the SHA256 digest covers.
+        let executor = Arc::new(ScriptExecutor::default());
+        executor.outputs.lock().unwrap().push_back(output(0, ""));
+        let runtime = DockerSrsranRuntime {
+            executor: executor.clone(),
+            ledger: PathBuf::from("/unused-compose-create-test"),
+        };
+        runtime.create(Target::Ue).unwrap();
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let call: Vec<&str> = calls[0].iter().map(String::as_str).collect();
+        assert_eq!(call[0], "compose");
+        let model = compose_config_args();
+        assert_eq!(compose_file_pairs(&call), compose_file_pairs(&model));
+        assert!(call.contains(&COMPOSE_0298_OVERRIDE));
+    }
+
+    #[test]
+    fn certified_compose_model_sha_is_unchanged_in_0_29_13() {
+        // 0.29.13 only unifies the `-f` compose file list between create()
+        // and the certified model render. It MUST NOT touch the overlay nor
+        // the base compose file, so the pinned canonical SHA256 stays the
+        // 0.29.11 value fa7fe0c1…21fc.
+        assert_eq!(
+            CERTIFIED_COMPOSE_MODEL_SHA256,
+            "fa7fe0c168bf6139b9c67f2b9b129ae3b7a0370d94f7dac70f9858dc380121fc"
+        );
     }
     #[test]
     fn canonical_compose_json_is_invariant_to_object_key_order() {

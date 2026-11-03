@@ -1,6 +1,6 @@
 platform = "3.2.1"
 web = "3.2.3"
-api = "0.29.12"
+api = "0.29.13"
 simulator_controller = "0.3.0"
 ueransim_adapter = "0.5.1"
 traffic_engine = "0.1.0"
