@@ -26,7 +26,7 @@ pub const CERTIFIED_IMAGE_ID: &str =
 pub const CERTIFIED_DN_IMAGE_REFERENCE: &str =
     "polaris-lte-sgi-dn@sha256:e60eb72bf7619fd049f6bbbc45cf06927eb73ed7c613446678644f6742af31f3";
 pub const CERTIFIED_COMPOSE_MODEL_SHA256: &str =
-    "fe1c35f7c4c306241fd56ff9e26a3d00f85db717e44e12f5b6cf90b608a97dd0";
+    "5d38bf2a13029b27c0a25e775ed4389449504837b314738e511da8c251fabe7a";
 const PROFILE_CONFIGS: [&str; 6] = [
     "/root/POLARIS/runtime/srsran/ue.conf",
     "/root/POLARIS/config/srsran/enb.conf",
@@ -3645,7 +3645,7 @@ mod tests {
         );
         assert_eq!(overlay.matches("rtprio: 99").count(), 2);
         assert_eq!(overlay.matches("memlock: -1").count(), 2);
-        assert_eq!(overlay.matches("cpus: null").count(), 2);
+        assert_eq!(overlay.matches("cpus: 0.0").count(), 2);
         assert!(overlay.contains("cap_add: [\"SYS_NICE\"]"));
         assert!(!overlay.contains("open5gs"));
         assert!(!overlay.contains("capture:"));
@@ -4219,7 +4219,7 @@ some_option = 1
         // The pinned constant carries the new 64-hex compose model digest.
         assert_eq!(
             CERTIFIED_COMPOSE_MODEL_SHA256,
-            "fe1c35f7c4c306241fd56ff9e26a3d00f85db717e44e12f5b6cf90b608a97dd0"
+            "5d38bf2a13029b27c0a25e775ed4389449504837b314738e511da8c251fabe7a"
         );
         assert_eq!(CERTIFIED_COMPOSE_MODEL_SHA256.len(), 64);
     }

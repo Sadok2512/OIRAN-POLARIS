@@ -2,7 +2,7 @@ services:
   srsenb:
     command: ["/bin/sh", "-ec", "umask 077; exec srsenb /etc/srsran/enb.conf"]
     cap_add: ["SYS_NICE"]
-    cpus: null
+    cpus: 0.0
     ulimits:
       rtprio: 99
       memlock: -1
@@ -10,7 +10,7 @@ services:
       driver: "none"
   srsue:
     command: ["/bin/sh", "-ec", "umask 077; exec srsue /run/secrets/ue.conf"]
-    cpus: null
+    cpus: 0.0
     ulimits:
       rtprio: 99
       memlock: -1
