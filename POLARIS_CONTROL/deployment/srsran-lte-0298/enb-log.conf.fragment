@@ -9,5 +9,4 @@ mac_level = info
 s1ap_level = debug
 gtpu_level = debug
 all_hex_limit = 64
-filename = /var/log/oiran/srsenb.log
-file_max_size = 4999
+filename = stdout

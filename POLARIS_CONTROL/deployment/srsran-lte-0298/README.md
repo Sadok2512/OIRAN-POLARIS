@@ -10,12 +10,12 @@ pins the canonical JSON SHA-256 in `srsran_controller.rs`.
 
 The matching runtime log configuration is:
 
-- `filename=/var/log/oiran/srsue.log` or `srsenb.log`;
-- `file_max_size=4999` KiB;
+- `filename=stdout`, so the API's `docker logs` gates and terminal evidence
+  collection observe the same stream;
 - `all_hex_limit=64`;
 - PHY library disabled, PHY warning, RRC/NAS/PDCP/RLC debug, MAC info.
 
 The deployment procedure must back up the base compose file and both runtime
 configuration files before installing the override or changing log settings.
-No percentage-based disk gate is part of this release. Before a write, the
-operator still verifies available bytes and inodes; ENOSPC is fail-closed.
+The safety guard enforces the 98% ceiling, the 8 GiB free-space reserve and
+the inode/ENOSPC protections restored in POLARIS 0.29.9.

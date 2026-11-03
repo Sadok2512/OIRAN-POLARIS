@@ -26,7 +26,7 @@ pub const CERTIFIED_IMAGE_ID: &str =
 pub const CERTIFIED_DN_IMAGE_REFERENCE: &str =
     "polaris-lte-sgi-dn@sha256:e60eb72bf7619fd049f6bbbc45cf06927eb73ed7c613446678644f6742af31f3";
 pub const CERTIFIED_COMPOSE_MODEL_SHA256: &str =
-    "5d38bf2a13029b27c0a25e775ed4389449504837b314738e511da8c251fabe7a";
+    "b25bc0137713697140aa96cb8e4964c844ce84754a1deb998387c2ed9595e560";
 const PROFILE_CONFIGS: [&str; 6] = [
     "/root/POLARIS/runtime/srsran/ue.conf",
     "/root/POLARIS/config/srsran/enb.conf",
@@ -3647,6 +3647,7 @@ mod tests {
         assert_eq!(overlay.matches("memlock: -1").count(), 2);
         assert_eq!(overlay.matches("cpus: 0.0").count(), 2);
         assert!(overlay.contains("cap_add: [\"SYS_NICE\"]"));
+        assert!(!overlay.contains("driver: \"none\""));
         assert!(!overlay.contains("open5gs"));
         assert!(!overlay.contains("capture:"));
     }
@@ -3668,11 +3669,11 @@ mod tests {
                 "rlc_level = debug",
                 "mac_level = info",
                 "all_hex_limit = 64",
-                "file_max_size = 4999",
             ] {
                 assert!(fragment.contains(setting), "{component}: {setting}");
             }
-            assert!(fragment.contains(&format!("filename = /var/log/oiran/{component}.log")));
+            assert!(fragment.contains("filename = stdout"), "{component}: stdout");
+            assert!(!fragment.contains("file_max_size"), "{component}: no file bound on stdout");
         }
         assert!(ue.contains("nas_level = debug"));
         assert!(!enb.contains("nas_level"));
@@ -4219,7 +4220,7 @@ some_option = 1
         // The pinned constant carries the new 64-hex compose model digest.
         assert_eq!(
             CERTIFIED_COMPOSE_MODEL_SHA256,
-            "5d38bf2a13029b27c0a25e775ed4389449504837b314738e511da8c251fabe7a"
+            "b25bc0137713697140aa96cb8e4964c844ce84754a1deb998387c2ed9595e560"
         );
         assert_eq!(CERTIFIED_COMPOSE_MODEL_SHA256.len(), 64);
     }

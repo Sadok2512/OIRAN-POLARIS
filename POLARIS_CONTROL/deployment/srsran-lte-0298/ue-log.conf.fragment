@@ -8,5 +8,4 @@ pdcp_level = debug
 rlc_level = debug
 mac_level = info
 all_hex_limit = 64
-filename = /var/log/oiran/srsue.log
-file_max_size = 4999
+filename = stdout

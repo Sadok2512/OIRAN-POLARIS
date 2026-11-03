@@ -2,6 +2,11 @@
 
 ## 0.29.9 (polaris-control-api) / safety-guard 0.2.1 — 2026-11-03 — restore the 98% disk ceiling + 8 GiB reserve removed in 0.29.8
 
+- Restores observable srsENB/srsUE runtime logs: the LTE overlay no longer
+  selects Docker's `none` logging driver and both runtime fragments emit to
+  stdout. This keeps `docker logs`, the exact ICS/MBR gates and terminal
+  evidence collection on the same stream without changing the LTE real-time,
+  CPU, capability or command settings.
 - Restores `crates/safety-guard/src/lib.rs` byte-identical to the 7a256ac0
   state (POLARIS 0.29.8 pre-merge of commits 34f0c6d / 99dce07). The
   original `Policy` defaults are back:

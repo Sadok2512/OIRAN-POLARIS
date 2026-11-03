@@ -6,13 +6,9 @@ services:
     ulimits:
       rtprio: 99
       memlock: -1
-    logging:
-      driver: "none"
   srsue:
     command: ["/bin/sh", "-ec", "umask 077; exec srsue /run/secrets/ue.conf"]
     cpus: 0.0
     ulimits:
       rtprio: 99
       memlock: -1
-    logging:
-      driver: "none"
