@@ -13,7 +13,7 @@ The matching runtime log configuration is:
 - `filename=stdout`, so the API's `docker logs` gates and terminal evidence
   collection observe the same stream;
 - `all_hex_limit=64`;
-- PHY library disabled, PHY warning, RRC/NAS/PDCP/RLC debug, MAC info.
+- PHY library disabled, PHY and USIM warning, RRC/NAS/PDCP/RLC debug, MAC info.
 
 The deployment procedure must back up the base compose file and both runtime
 configuration files before installing the override or changing log settings.

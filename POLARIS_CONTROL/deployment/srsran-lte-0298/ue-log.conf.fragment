@@ -4,6 +4,7 @@ phy_lib_level = none
 phy_level = warning
 rrc_level = debug
 nas_level = debug
+usim_level = warning
 pdcp_level = debug
 rlc_level = debug
 mac_level = info

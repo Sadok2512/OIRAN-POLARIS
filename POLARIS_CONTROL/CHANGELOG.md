@@ -7,6 +7,11 @@
   the output of `jq -cS`; numeric rendering differs, so the runtime model was
   rejected before Grant consumption. The preflight remains fail-closed and no
   live run was started with the mismatched release.
+- Aligns the deployed UE log fragment with the controller's nine frozen
+  runtime log pairs by adding `usim_level = warning`. The previous fragment
+  omitted that pair, so the fail-closed log gate rejected run creation before
+  srsENB/srsUE startup. This is a configuration-only correction and does not
+  require a POLARIS service restart.
 
 ## 0.29.9 (polaris-control-api) / safety-guard 0.2.1 — 2026-11-03 — restore the 98% disk ceiling + 8 GiB reserve removed in 0.29.8
 

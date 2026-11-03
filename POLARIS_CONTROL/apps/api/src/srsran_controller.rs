@@ -3676,6 +3676,7 @@ mod tests {
             assert!(!fragment.contains("file_max_size"), "{component}: no file bound on stdout");
         }
         assert!(ue.contains("nas_level = debug"));
+        assert!(ue.contains("usim_level = warning"));
         assert!(!enb.contains("nas_level"));
     }
 
