@@ -1985,13 +1985,29 @@ impl CaptureManager {
                         .saturating_add(MAX_CONTINUOUS_DERIVED_BYTES)
                         > config.max_owned_bytes
                 {
-                    let Some(oldest) = state
+                    // 2.7.18: two-pass eviction.
+                    //   Pass 1 — the oldest non-historical segment.
+                    //   Pass 2 — if non-historical pool is exhausted and we
+                    //            still need bytes, evict the oldest segment
+                    //            of ANY kind (the historical N2 bootstrap can
+                    //            be rediscovered from the allowlisted source
+                    //            root on the next worker start, so evicting
+                    //            it loses only a cached copy, never
+                    //            provenance).
+                    let oldest = state
                         .segments
                         .iter()
                         .filter(|(_, item)| !item.historical_context)
                         .min_by_key(|(_, item)| item.imported_epoch_ms)
                         .map(|(checksum, item)| (checksum.clone(), item.clone()))
-                    else {
+                        .or_else(|| {
+                            state
+                                .segments
+                                .iter()
+                                .min_by_key(|(_, item)| item.imported_epoch_ms)
+                                .map(|(checksum, item)| (checksum.clone(), item.clone()))
+                        });
+                    let Some(oldest) = oldest else {
                         break;
                     };
                     let owned = base.join("pcap").join(&oldest.1.owned_file);
@@ -2616,6 +2632,27 @@ impl CaptureManager {
             );
             let mut normalized_offset = 0u64;
             let mut indexed: BTreeMap<String, EventSpoolLocation> = BTreeMap::new();
+            // 2.7.18 (issue #9 part 1): events from the prior dataset are
+            // only kept when their capture_id still matches a pcap file
+            // currently in `state.segments` (we rebuild `checksums` on
+            // every pass). Before this filter, evicting a pcap left its
+            // events in the derived `oiran_events.jsonl` forever, and the
+            // artifact grew past `MAX_CONTINUOUS_DERIVED_BYTES` until
+            // `directory_size(&base) > config.max_owned_bytes` tripped
+            // CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT on *every* new
+            // candidate — the queue of 222 reported in the lab could
+            // never drain because eviction only reclaimed pcap bytes.
+            let current_capture_ids: std::collections::BTreeSet<String> = checksums
+                .values()
+                .map(|sha| format!("sha256:{sha}"))
+                .collect();
+            let keep_prior = |value: &serde_json::Value| -> bool {
+                value
+                    .get("capture_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|cid| current_capture_ids.contains(cid))
+                    .unwrap_or(false)
+            };
             if let Some((prior_dir, _)) = &prior_continuous {
                 let prior_events_file =
                     fs::File::open(prior_dir.join("oiran_events.jsonl")).map_err(display_error)?;
@@ -2625,6 +2662,7 @@ impl CaptureManager {
                     &mut normalized_writer,
                     &mut normalized_offset,
                     &mut indexed,
+                    keep_prior,
                 )?;
             }
             let decoded_reader = BufReader::with_capacity(
@@ -2636,6 +2674,7 @@ impl CaptureManager {
                 &mut normalized_writer,
                 &mut normalized_offset,
                 &mut indexed,
+                |_| true,
             )?;
             normalized_writer.flush().map_err(display_error)?;
             normalized_writer
@@ -4040,12 +4079,18 @@ fn expand_session_evidence_ids(ids: &mut BTreeSet<String>, edges: &[CorrelationE
     }
 }
 
-fn index_event_stream<R: BufRead, W: Write>(
+fn index_event_stream<R, W, F>(
     mut reader: R,
     writer: &mut W,
     output_offset: &mut u64,
     indexed: &mut BTreeMap<String, EventSpoolLocation>,
-) -> Result<(), String> {
+    mut keep: F,
+) -> Result<(), String>
+where
+    R: BufRead,
+    W: Write,
+    F: FnMut(&serde_json::Value) -> bool,
+{
     let mut line = String::new();
     loop {
         line.clear();
@@ -4057,6 +4102,9 @@ fn index_event_stream<R: BufRead, W: Write>(
         }
         let mut value: serde_json::Value =
             serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        if !keep(&value) {
+            continue;
+        }
         let id = continuous_observation_id(&value)?;
         value["event_id"] = serde_json::Value::String(id.clone());
         let serialized = serde_json::to_string(&value).map_err(|error| error.to_string())?;
@@ -5496,6 +5544,94 @@ mod tests {
         assert_eq!(recovered.metrics.segments_ingested, 4);
         assert_eq!(recovered.session_ids, first.session_ids);
         restarted.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+    }
+
+    /// 2.7.18 (issue #9 part 1): 250 valid pcap segments arrive in the
+    /// source directory at once. With the 2.7.16 pure-batch cap each scan
+    /// bounded ingestion to 32, but if `directory_size(&base)` was dominated
+    /// by the derived `oiran_events.jsonl` artifact (which inherited every
+    /// evicted segment's events through the `prior_continuous` spool merge)
+    /// the `BOUNDED_STORAGE_FULL` guard tripped on candidate #1 and zero
+    /// segments entered state for the next scan — the queue never drained.
+    /// With the 2.7.18 filter (prior events keep only when their capture_id
+    /// is in the current pcap set) plus the two-pass eviction fallback,
+    /// every one of the 250 checksums must end up in `seen_checksums`.
+    #[test]
+    fn continuous_import_drains_a_burst_of_250_segments_without_blocking() {
+        if skip_if_disk_too_full(
+            "continuous_import_drains_a_burst_of_250_segments_without_blocking",
+        ) {
+            return;
+        }
+        let source = temporary_root("continuous-250-source");
+        let root = temporary_root("continuous-250-owned");
+        fs::create_dir_all(source.join("N3")).unwrap();
+        // 250 tiny N3 pcaps, each with ONE G-PDU bearing a distinct TEID so
+        // the per-file SHA-256 is distinct too. Payload is minimal (packet
+        // header + 14-byte Ethernet + 1-byte stub) which keeps the full
+        // corpus under 100 KiB on disk.
+        let seconds = (epoch_ms() / 1000) as u32;
+        for index in 0..250_u32 {
+            let path = source.join(format!("N3/segment-{index:04}.pcap"));
+            let teid = 0x9000_u32 + index;
+            write_pcap_at(&path, seconds, &[gtpu_gpdu_frame(index as u8, teid)]);
+        }
+        thread::sleep(Duration::from_millis(500));
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source.clone(),
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                // Storage just big enough to hold ~8 live segments + the
+                // derived reserve (64 MiB); the max_segments=8 count-based
+                // eviction fires on every batch, not the byte-based one.
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 256 * 1024,
+                max_segments: 8,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+            })
+            .unwrap();
+        // Up to 120 s to drain 250 segments in batches of 32 (~8 batches,
+        // with scan_interval=100 ms + decode time per batch).
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while Instant::now() < deadline {
+            if let Some(job) = manager.get(CONTINUOUS_CAPTURE_ID) {
+                if job.metrics.segments_ingested >= 250 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        let final_job = manager.get(CONTINUOUS_CAPTURE_ID).expect("worker alive");
+        assert!(
+            final_job.metrics.segments_ingested >= 250,
+            "250 pending segments → segments_ingested={} (job.state={:?}, error={:?})",
+            final_job.metrics.segments_ingested,
+            final_job.state,
+            final_job.error,
+        );
+        assert_ne!(
+            final_job.state,
+            CaptureState::Blocked,
+            "worker must not be BLOCKED after drain; error={:?}",
+            final_job.error
+        );
+        // The retained state.segments ring respects the configured
+        // max_segments bound; 250 ingested >> 8 kept on disk at any time.
+        let final_pending = final_job.metrics.pending_segments;
+        assert_eq!(
+            final_pending, 0,
+            "pending_segments must reach 0; got {final_pending}"
+        );
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
     }
 
     #[test]

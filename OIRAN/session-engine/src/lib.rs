@@ -2103,7 +2103,11 @@ mod tests {
             .unwrap()
             .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl");
         let result = discover_sessions(&mut load_path(&path).unwrap());
-        assert_eq!(result.event_accounting["source_events"], 54);
+        // 2.7.18: dataset regenerated with oiran-decode 0.6.0 (24 N2 +
+        // 30 N4 + 10 N3 = 64 events; the 2.7.15-and-earlier decoder emitted
+        // only 14 N2 events for the same pcapng, so the shipped
+        // oiran_events.jsonl was 54 lines). pcapng captures are unchanged.
+        assert_eq!(result.event_accounting["source_events"], 64);
         assert_eq!(result.ue_contexts.len(), 2);
         assert_eq!(result.pdu_sessions.len(), 1);
         assert_eq!(result.pfcp_sessions.len(), 2);

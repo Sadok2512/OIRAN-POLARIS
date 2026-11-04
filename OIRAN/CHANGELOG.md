@@ -1,5 +1,74 @@
 # Changelog
 
+## OIRAN API 2.7.18 — 2026-11-04 — bound derived artifacts + N2↔N4 via regenerated dataset
+
+- Root cause of the lab-reproduced 222-segment deadlock (ANR2, issue #9):
+  `process_capture_into` merges the previous dataset's events into the
+  new `oiran_events.jsonl` through `index_event_stream` at
+  `live-probe/src/lib.rs:2619-2639`. Before this patch the merge kept
+  **every** prior event, including events from pcap segments that had
+  already been evicted by the ring. The derived `oiran_events.jsonl`
+  therefore accreted monotonically; `directory_size(&base)` was
+  dominated by the events artifact, not by the live pcap ring; and the
+  backpressure guard at `live-probe/src/lib.rs:1961-2013` tripped
+  because the only thing eviction could reclaim was the pcap pool. A
+  freshly-arrived 212 th segment couldn't fit even though the live
+  pcap directory was well under budget, and every scan failed on
+  candidate #1. The 2.7.16 batch-of-32 did not help because the FIRST
+  candidate in every scan tripped the guard — no segment ever entered
+  `pending_publication`.
+- 2.7.18 fix (filter prior events by the current pcap set):
+  `index_event_stream` now takes a `keep: FnMut(&Value) -> bool`
+  predicate. The prior-events caller passes
+  `|v| current_capture_ids.contains(v.capture_id)` where
+  `current_capture_ids` is derived from the `checksums` map built in
+  the per-pcap decode loop. Evicted pcap → their events drop from the
+  next published dataset. The derived artifact is therefore bounded by
+  what the ring currently holds (≤ `max_segments` pcap × their events),
+  and can no longer starve the ring.
+- 2.7.18 fix (two-pass eviction): the eviction loop at
+  `live-probe/src/lib.rs:1982-2002` now falls back to evicting the
+  oldest segment **of any kind** (including the N2 historical
+  bootstrap) when the non-historical pool is exhausted. The historical
+  pcap is on the allowlisted `/var/lib/docker/volumes/oiran_lab_pcap/_data`
+  source, so evicting its owned cached copy only loses the on-disk
+  mirror; the worker can re-bootstrap on the next start.
+- 2.7.18 fix (dataset regenerated with the current decoder):
+  `datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl` was
+  regenerated with `oiran-decode 0.6.0`, which emits structured tunnel
+  IE components (`item_<i>_tunnel_ip_ul`, `item_<i>_gtp_teid_ul`,
+  `item_<i>_tunnel_ip_dl`, `item_<i>_gtp_teid_dl`) on NGAP IE 74/75
+  instead of the old `nested_transfer_sha256`-only placeholder. The
+  pcapng captures themselves are untouched. As a result the existing
+  `ngap-pfcp-exact-tunnel` rule in
+  `correlation-engine::correlate_cross_interface_evidence` finds the
+  byte-identical `(ipv4=10.77.22.13, teid=0x96a8)` on N2 and N4 and
+  emits an EXACT edge (plus the mirror downlink
+  `(10.77.22.20, 0x3)`). The full 5G SA chain is now certified by the
+  engine itself, not just by the audit oracle.
+- Regression tests (run with
+  `cargo test --workspace --locked --release`):
+  * `live_probe::tests::continuous_import_drains_a_burst_of_250_segments_without_blocking`
+    writes 250 valid N3 pcaps with distinct TEIDs into the source root
+    under `max_owned_bytes = 128 MiB` / `max_segments = 8`, starts the
+    import, and asserts `segments_ingested >= 250`, `state != Blocked`
+    and `pending_segments == 0` within 120 s (empirically ~3 s).
+  * `correlation_engine::tests::audit_dataset_produces_the_full_n2_n4_n3_chain`
+    loads the regenerated dataset events, runs
+    `correlate_cross_interface_evidence`, and asserts exactly two
+    `ngap-pfcp-exact-tunnel` EXACT edges and two
+    `pfcp-outer-header-matches-gtpu-tunnel` EXACT edges, each carrying
+    the known `(endpoint_ip, teid)` anchor.
+  * Four existing API tests were updated to reflect the new on-wire
+    event count (24 N2 + 30 N4 + 10 N3 = 64 events, 76 flow-accounting
+    sum, 2 session callflows). The pcapng packet count is unchanged
+    (same captures).
+- Replay of `AUDIT_E2E_CERT_001_scripts/02-negative-tests.py`: the 9-case
+  truth table is unchanged — no false positive, fail-closed on
+  duplicate TEIDs / multiple candidates / partial captures / duplicate
+  events, time-independent on clock skew / reversed order.
+- Versions: `apps/api` 2.7.17 → 2.7.18; `live-probe` 0.4.3 → 0.4.4.
+
 ## OIRAN API 2.7.17 — 2026-11-04 — remove every hardcoded version; measure continuous RSS
 
 - `apps/api/src/lib.rs:44-45` previously pinned `API_VERSION` and
