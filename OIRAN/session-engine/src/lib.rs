@@ -310,26 +310,75 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
     // 2.7.13: canonical (capture_id, seq, event_id). ts never influences
     // a session-discovery decision.
     lte.sort_by(|a, b| canonical_sort_key(a).cmp(&canonical_sort_key(b)));
-    let mut contexts = BTreeSet::new();
+    // 2.7.15: consolidate S1AP contexts by the structural eNB UE S1AP
+    // identity. The pre-2.7.15 code (session-engine/src/lib.rs:313-319)
+    // inserted every observed `(capture_id, enb, mme)` triple, so an
+    // `InitialUEMessage` event (which carries `enb_ue_s1ap_id` but no
+    // `mme_ue_s1ap_id` — the MME has not yet allocated one) created a
+    // distinct context from the rest of the exchange. ANR3 observed
+    // this on a real P4 import (issue #10 comment 6636015016): a single
+    // Attach→Detach flow produced one 24-event session (matching the
+    // `(enb, None)` context) and a second 22-event session missing both
+    // `InitialUEMessage` and the NAS `Attach Request` child, matching
+    // `(enb, Some(mme))`. The consolidation groups S1AP events by
+    // `(capture_id, enb)`, resolves the canonical set of `mme` values
+    // observed on that enb, and emits one context per `(enb, mme)` only
+    // when the mme is actually assigned. A context with `mme=None` is
+    // retained only when NO S1AP event on that enb ever carried a mme
+    // identifier (fully anonymous exchange). Two distinct UEs — with
+    // distinct `enb_ue_s1ap_id` values — still yield two contexts.
+    let mut mme_by_enb: BTreeMap<(String, Option<String>), BTreeSet<String>> = BTreeMap::new();
     for event in lte.iter().filter(|event| event.protocol == "S1AP") {
         let enb = event.first_identifier("enb_ue_s1ap_id").map(str::to_owned);
         let mme = event.first_identifier("mme_ue_s1ap_id").map(str::to_owned);
-        if enb.is_some() || mme.is_some() {
-            contexts.insert((event.capture_id.clone(), enb, mme));
+        if enb.is_none() && mme.is_none() {
+            continue;
+        }
+        let entry = mme_by_enb
+            .entry((event.capture_id.clone(), enb))
+            .or_default();
+        if let Some(value) = mme {
+            entry.insert(value);
+        }
+    }
+    let mut contexts: BTreeSet<(String, Option<String>, Option<String>)> = BTreeSet::new();
+    for ((capture_id, enb), mme_values) in mme_by_enb {
+        if mme_values.is_empty() {
+            contexts.insert((capture_id, enb, None));
+        } else {
+            for mme in mme_values {
+                contexts.insert((capture_id.clone(), enb.clone(), Some(mme)));
+            }
         }
     }
     let mut lte_contexts = contexts
         .into_iter()
         .map(|(capture_id, enb, mme)| {
+            // 2.7.15: structural match. The enb check is strict. The mme
+            // check accepts an event with no `mme_ue_s1ap_id` (e.g. the
+            // InitialUEMessage and the NAS Attach Request child it
+            // envelopes, which the MME has not yet assigned a mme id to)
+            // as long as the enb matches; otherwise the mme values must
+            // be equal. If the enclosing context was built with mme=None
+            // (no mme was ever observed for that enb), any event sharing
+            // the enb is admitted.
             let matches_context = |event: &&EventRecord| {
-                event.capture_id == capture_id
-                    && event.interface == "S1-MME"
-                    && enb.as_deref().map_or(true, |value| {
-                        event.first_identifier("enb_ue_s1ap_id") == Some(value)
-                    })
-                    && mme.as_deref().map_or(true, |value| {
-                        event.first_identifier("mme_ue_s1ap_id") == Some(value)
-                    })
+                if event.capture_id != capture_id || event.interface != "S1-MME" {
+                    return false;
+                }
+                let enb_ok = match (enb.as_deref(), event.first_identifier("enb_ue_s1ap_id")) {
+                    (Some(ctx_enb), Some(evt_enb)) => ctx_enb == evt_enb,
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                };
+                if !enb_ok {
+                    return false;
+                }
+                match (mme.as_deref(), event.first_identifier("mme_ue_s1ap_id")) {
+                    (Some(ctx_mme), Some(evt_mme)) => ctx_mme == evt_mme,
+                    (Some(_), None) => true,
+                    (None, _) => true,
+                }
             };
             let s1_events = lte
                 .iter()
@@ -2513,5 +2562,193 @@ mod tests {
         assert_eq!(sessions_canonical[0].eps_bearer_ids, vec!["7"]);
         assert_eq!(sessions_canonical[0].tunnels.len(), 1);
         assert_eq!(sessions_canonical[0].tunnels[0].teid, "0x00ab00cd");
+    }
+
+    #[test]
+    fn anr3_attach_to_detach_flow_consolidates_into_a_single_session() {
+        // 2.7.15: ANR3 field evidence (issue #10 comment 6636015016)
+        // showed a single Attach→Detach exchange producing two sessions,
+        // one of which was `RELEASED` with 22 events missing both
+        // `InitialUEMessage` and the NAS `Attach Request` child. Root
+        // cause (file:line): session-engine/src/lib.rs:313-319 inserted
+        // `(capture_id, enb, None)` for the InitialUEMessage AND
+        // `(capture_id, enb, Some(mme))` for the rest of the exchange,
+        // producing two contexts for the same UE. 2.7.15 consolidates
+        // contexts on the structural `(capture_id, enb_ue_s1ap_id)`
+        // key.
+        let capture = "cap-s1mme";
+        let enb_id = "77";
+        let mme_id = "11";
+        let make = |suffix: &str, name: &str, seq: u64, ids: &[(&str, &str)]| {
+            let mut e = event(suffix, "S1AP", name, ids, seq);
+            e.interface = "S1-MME".into();
+            e.capture_id = capture.into();
+            e
+        };
+        // Seven S1AP envelopes: InitialUEMessage (enb only), then six
+        // messages that all carry `mme_ue_s1ap_id`.
+        let initial = make(
+            "ue-init",
+            "InitialUEMessage",
+            1,
+            &[("enb_ue_s1ap_id", enb_id)],
+        );
+        let auth = make(
+            "dl-auth",
+            "DownlinkNASTransport",
+            2,
+            &[("enb_ue_s1ap_id", enb_id), ("mme_ue_s1ap_id", mme_id)],
+        );
+        let smc = make(
+            "dl-smc",
+            "DownlinkNASTransport",
+            3,
+            &[("enb_ue_s1ap_id", enb_id), ("mme_ue_s1ap_id", mme_id)],
+        );
+        let ics_req = make(
+            "ics-req",
+            "InitialContextSetupRequest",
+            4,
+            &[
+                ("enb_ue_s1ap_id", enb_id),
+                ("mme_ue_s1ap_id", mme_id),
+                ("erab_teid", "0x01020304"),
+            ],
+        );
+        let ics_rsp = make(
+            "ics-rsp",
+            "InitialContextSetupResponse",
+            5,
+            &[
+                ("enb_ue_s1ap_id", enb_id),
+                ("mme_ue_s1ap_id", mme_id),
+                ("erab_teid", "0x01020304"),
+            ],
+        );
+        let detach = make(
+            "detach",
+            "DownlinkNASTransport",
+            6,
+            &[("enb_ue_s1ap_id", enb_id), ("mme_ue_s1ap_id", mme_id)],
+        );
+        let release = make(
+            "release",
+            "UEContextReleaseComplete",
+            7,
+            &[("enb_ue_s1ap_id", enb_id), ("mme_ue_s1ap_id", mme_id)],
+        );
+        // One NAS child inherits the InitialUEMessage identifiers (enb
+        // only, no mme). Pre-2.7.15 this event fell into the
+        // `(enb, None)` context only.
+        let mut nas_attach = event(
+            "nas-attach",
+            "NAS-EPS-MM",
+            "Attach Request",
+            &[("enb_ue_s1ap_id", enb_id)],
+            1,
+        );
+        nas_attach.interface = "S1-MME".into();
+        nas_attach.capture_id = capture.into();
+        nas_attach.parent_event_id = Some("ue-init".into());
+
+        let mut s11 = event(
+            "s11-create-rsp",
+            "GTPv2-C",
+            "CreateSessionResponse",
+            &[("bearer_ebi", "5"), ("bearer_f_teid", "0x01020304")],
+            1,
+        );
+        s11.interface = "S11".into();
+        s11.capture_id = "cap-s11".into();
+
+        let mut s1u = event("s1u-ul", "GTP-U", "G-PDU", &[("teid", "0x01020304")], 1);
+        s1u.interface = "S1-U".into();
+        s1u.capture_id = "cap-s1u".into();
+        s1u.direction = "UPLINK".into();
+        s1u.packet_references[0].captured_length = 128;
+
+        let events = vec![
+            initial, nas_attach, auth, smc, ics_req, ics_rsp, detach, release, s11, s1u,
+        ];
+        let sessions = discover_lte_sessions(&events);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a single Attach→Detach flow must produce ONE session (got {})",
+            sessions.len()
+        );
+        let session = &sessions[0];
+        assert_eq!(session.technology, "LTE");
+        // The single consolidated session must include BOTH the
+        // InitialUEMessage and its NAS Attach Request child, which were
+        // dropped from the `(enb, Some(mme))` context before 2.7.15.
+        assert!(session.event_ids.contains(&"ue-init".to_string()));
+        assert!(session.event_ids.contains(&"nas-attach".to_string()));
+        assert!(session.event_ids.contains(&"release".to_string()));
+    }
+
+    #[test]
+    fn two_distinct_ues_each_get_their_own_session_after_consolidation() {
+        // Mirror guard for 2.7.15: the consolidation must not merge
+        // two UEs. Distinct `enb_ue_s1ap_id` values keep distinct
+        // contexts even when their `mme_ue_s1ap_id` or TEID values
+        // coincide.
+        let capture = "cap-s1mme";
+        let make = |suffix: &str, enb: &str, mme: &str, teid: &str, seq: u64, name: &str| {
+            let mut e = event(
+                suffix,
+                "S1AP",
+                name,
+                &[
+                    ("enb_ue_s1ap_id", enb),
+                    ("mme_ue_s1ap_id", mme),
+                    ("erab_teid", teid),
+                ],
+                seq,
+            );
+            e.interface = "S1-MME".into();
+            e.capture_id = capture.into();
+            e
+        };
+        let ue1_a = make("a1", "77", "11", "0x1111", 1, "InitialContextSetupResponse");
+        let ue1_b = make("b1", "77", "11", "0x1111", 2, "UEContextReleaseComplete");
+        let ue2_a = make("a2", "88", "22", "0x2222", 3, "InitialContextSetupResponse");
+        let ue2_b = make("b2", "88", "22", "0x2222", 4, "UEContextReleaseComplete");
+        let mut s11_1 = event(
+            "s11-1",
+            "GTPv2-C",
+            "CreateSessionResponse",
+            &[("bearer_ebi", "5"), ("bearer_f_teid", "0x1111")],
+            1,
+        );
+        s11_1.interface = "S11".into();
+        s11_1.capture_id = "cap-s11".into();
+        let mut s11_2 = event(
+            "s11-2",
+            "GTPv2-C",
+            "CreateSessionResponse",
+            &[("bearer_ebi", "6"), ("bearer_f_teid", "0x2222")],
+            2,
+        );
+        s11_2.interface = "S11".into();
+        s11_2.capture_id = "cap-s11".into();
+        let sessions = discover_lte_sessions(&[ue1_a, ue1_b, ue2_a, ue2_b, s11_1, s11_2]);
+        assert_eq!(
+            sessions.len(),
+            2,
+            "two distinct UEs must still yield two sessions after consolidation"
+        );
+        let teids: std::collections::BTreeSet<String> = sessions
+            .iter()
+            .flat_map(|s| s.s11_f_teids.iter().cloned())
+            .collect();
+        assert!(
+            teids.contains("0x1111"),
+            "session TEIDs should contain the UE1 bearer, got {teids:?}"
+        );
+        assert!(
+            teids.contains("0x2222"),
+            "session TEIDs should contain the UE2 bearer, got {teids:?}"
+        );
     }
 }

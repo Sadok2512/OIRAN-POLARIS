@@ -1,5 +1,51 @@
 # Changelog
 
+## OIRAN API 2.7.15 — 2026-11-04 — session consolidation + typed packet counters
+
+- `session-engine::discover_lte_sessions` now consolidates S1AP
+  contexts by the structural `(capture_id, enb_ue_s1ap_id)` key before
+  it enumerates sessions. The pre-2.7.15 code
+  (`session-engine/src/lib.rs:313-319`) inserted every observed
+  `(capture_id, enb, mme)` triple, so an `InitialUEMessage` event
+  (which carries `enb_ue_s1ap_id` but no `mme_ue_s1ap_id` — the MME
+  has not yet allocated one) was treated as a separate context from
+  the rest of the exchange and produced a parallel
+  `RELEASED`-but-incomplete session missing `InitialUEMessage` and the
+  NAS Attach Request child (ANR3 final report, issue #10 comment
+  6636015016). The consolidation keeps structural separation: two
+  UEs with distinct `enb_ue_s1ap_id` values still yield two sessions,
+  and two UEs that reuse the same `enb_ue_s1ap_id` across different
+  `mme_ue_s1ap_id` values still yield two sessions. No timestamp
+  comparison is used.
+- The per-context match relaxes the `mme_ue_s1ap_id` check: an event
+  with no mme (InitialUEMessage, the NAS Attach Request child that
+  inherits the parent's identifiers, …) is admitted into the
+  canonical context when the `enb` matches. The mme equality check
+  stays strict for events that DO carry a mme identifier.
+- `rotation-watcher.sh` emits `packets_captured` and `packets_dropped`
+  as typed metrics. `packets_captured` is read from capinfos and
+  `packets_dropped` is computed as a delta on the bridge's kernel
+  `/sys/class/net/<iface>/statistics/rx_dropped` counter, seeded on
+  the watcher's first visit. Every failure path produces an explicit
+  `"UNKNOWN:<reason>"` JSON string (`capinfos-missing`,
+  `capinfos-no-count`, `no-baseline-yet`, `counter-rolled-back`,
+  `sysfs-<iface>-unavailable`, `stat-failed`, `file-not-readable`) —
+  the field is never `null`. ANR3 observed 24 `packets_dropped:null`
+  records before this patch.
+- Regression tests:
+  * `session_engine::tests::anr3_attach_to_detach_flow_consolidates_into_a_single_session`
+    replays the shape reported by ANR3 (InitialUEMessage + NAS Attach
+    + 5 subsequent S1AP events + S11 + S1-U) and asserts a single
+    session that contains both `InitialUEMessage` and
+    `Attach Request`.
+  * `session_engine::tests::two_distinct_ues_each_get_their_own_session_after_consolidation`
+    guards the mirror case: distinct eNB UE IDs → two sessions.
+  * `infrastructure/capture/tests/test-rotation-drops.sh` — four
+    rotations driving the four failure modes (`no-baseline-yet`,
+    numeric delta, `sysfs-...-unavailable`, `capinfos-missing`) and a
+    final sweep over the JSONL asserting no `"packets_captured":null`
+    or `"packets_dropped":null` line remains.
+
 ## OIRAN API 2.7.14 — 2026-11-04 — technical-field exemption in privacy predicate
 
 - `live-probe::lte_evidence::contains_forbidden_identity` no longer
