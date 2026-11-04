@@ -3474,7 +3474,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let value = json_body(response).await;
-        assert_eq!(value["data"]["backend_api"], "2.7.6");
+        assert_eq!(value["data"]["backend_api"], "2.7.7");
         for protocol in [
             "S1AP",
             "NAS-EPS-MM",
