@@ -1129,6 +1129,91 @@ fn verify_bindings<'a>(
     Ok(verified)
 }
 
+/// Explicit allowlist of (plane, protocol, decoder_name) triples. The plane
+/// binding decoder always carries the event's primary protocol; a nested
+/// NAS event is accepted on S1-MME when its decoder is the current
+/// decoder-nas and it carries a `parent_event_id` resolvable to a previously
+/// seen S1AP event inside the same plane. Every other combination is a
+/// fail-closed `LTE_EVENT_DECODER_MISMATCH`.
+///
+/// 2.7.10: the nested-NAS exception is the only structural relaxation. The
+/// list is explicit — a new plane or a new child decoder cannot be added
+/// implicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventKind {
+    /// Event matches the plane binding's declared decoder (name + version +
+    /// schema version); accepted as a primary (potential-parent) event.
+    PlaneBinding,
+    /// Event is an EPS NAS child of an S1AP event on S1-MME. Must carry
+    /// `parent_event_id`, which must resolve to a S1AP `PlaneBinding` event
+    /// in the same plane.
+    NestedEpsNas,
+}
+
+const NESTED_NAS_DECODER: &str = "decoder-nas";
+const NESTED_NAS_VERSION: &str = "0.3.1";
+
+fn classify_event(
+    plane: &str,
+    event: &EventRecord,
+    binding: &LteCaptureBinding,
+) -> Result<EventKind, LteEvidenceError> {
+    let schema_version = event
+        .source_json
+        .get("schema_version")
+        .and_then(Value::as_str);
+    let is_plane_binding = event.decoder_name == binding.decoder_name
+        && event.decoder_version == binding.decoder_version
+        && schema_version == Some(binding.event_schema_version.as_str());
+
+    if is_plane_binding {
+        // The binding decoder's primary protocol is constrained per plane.
+        let primary_protocol_ok = match plane {
+            "S1_MME" => event.protocol == "S1AP",
+            "S11" => event.protocol == "GTPv2-C",
+            "S1_U" => event.protocol == "GTP-U",
+            _ => false,
+        };
+        if !primary_protocol_ok {
+            return Err(LteEvidenceError::new(
+                "LTE_EVENT_DECODER_MISMATCH",
+                format!(
+                    "event {}: decoder {} declared plane {plane}, but protocol {} is not the \
+                     plane-binding protocol",
+                    event.event_id, event.decoder_name, event.protocol
+                ),
+            ));
+        }
+        return Ok(EventKind::PlaneBinding);
+    }
+
+    let nested_eps_nas_candidate = plane == "S1_MME"
+        && matches!(event.protocol.as_str(), "NAS-EPS-MM" | "NAS-EPS-SM")
+        && event.decoder_name == NESTED_NAS_DECODER
+        && event.decoder_version == NESTED_NAS_VERSION;
+    if nested_eps_nas_candidate {
+        return Ok(EventKind::NestedEpsNas);
+    }
+
+    Err(LteEvidenceError::new(
+        "LTE_EVENT_DECODER_MISMATCH",
+        format!(
+            "event {}: decoder {}/{} protocol {} parent {:?} does not match any allowed \
+             (plane, protocol, decoder) tuple on plane {plane}; expected plane binding \
+             {}/{} or the nested EPS NAS decoder {}/{} for NAS-EPS-MM|NAS-EPS-SM on S1_MME",
+            event.event_id,
+            event.decoder_name,
+            event.decoder_version,
+            event.protocol,
+            event.parent_event_id,
+            binding.decoder_name,
+            binding.decoder_version,
+            NESTED_NAS_DECODER,
+            NESTED_NAS_VERSION,
+        ),
+    ))
+}
+
 fn read_events_bounded(
     verified: &VerifiedBinding<'_>,
     events: &mut Vec<EventRecord>,
@@ -1139,6 +1224,16 @@ fn read_events_bounded(
     let reader = BufReader::new(file);
     let alias = plane_alias(&verified.plane)?;
     let expected_capture_id = format!("sha256:{}", verified.capture.source_file_sha256);
+    // Per-plane tracking: S1AP event ids seen in this JSONL stream, and the
+    // indices (into the outer `events` buffer) of nested NAS children whose
+    // parent has not been observed yet. The post-pass resolves every
+    // pending child against the final S1AP set — streaming emission does
+    // not guarantee a parent-before-child ordering once oiran-decode has
+    // sorted events by timestamp.
+    let mut plane_s1ap_event_ids: BTreeSet<String> = BTreeSet::new();
+    let mut pending_nested_nas: Vec<usize> = Vec::new();
+    let plane_event_start = events.len();
+
     for (line_index, line) in reader.lines().enumerate() {
         let line = line.map_err(io_error("LTE_EVENT_READ_FAILED"))?;
         if line.len() > MAX_EVENT_LINE_BYTES {
@@ -1196,19 +1291,7 @@ fn read_events_bounded(
                 &event.event_id,
             ));
         }
-        if event.decoder_name != verified.binding.decoder_name
-            || event.decoder_version != verified.binding.decoder_version
-            || event
-                .source_json
-                .get("schema_version")
-                .and_then(Value::as_str)
-                != Some(verified.binding.event_schema_version.as_str())
-        {
-            return Err(LteEvidenceError::new(
-                "LTE_EVENT_DECODER_MISMATCH",
-                &event.event_id,
-            ));
-        }
+        let kind = classify_event(&verified.plane, &event, verified.binding)?;
         if event.packet_references.is_empty()
             || event.packet_references.iter().any(|packet| {
                 packet.packet_number < verified.capture.first_frame
@@ -1227,8 +1310,56 @@ fn read_events_bounded(
                 &event.event_id,
             ));
         }
+        match kind {
+            EventKind::PlaneBinding => {
+                if event.protocol == "S1AP" {
+                    plane_s1ap_event_ids.insert(event.event_id.clone());
+                }
+            }
+            EventKind::NestedEpsNas => {
+                if event.parent_event_id.is_none() {
+                    return Err(LteEvidenceError::new(
+                        "LTE_EVENT_NESTED_NAS_WITHOUT_PARENT",
+                        format!(
+                            "event {}: nested EPS NAS decoded by {}/{} carries no \
+                             parent_event_id on plane S1_MME",
+                            event.event_id, event.decoder_name, event.decoder_version
+                        ),
+                    ));
+                }
+                pending_nested_nas.push(events.len());
+            }
+        }
         events.push(event);
     }
+
+    // Post-pass: every nested NAS child must resolve to a S1AP parent seen
+    // in the same plane. A child whose parent is missing (e.g., a NAS
+    // event synthesised without its S1AP envelope) fails closed.
+    for idx in pending_nested_nas {
+        let event = &events[idx];
+        let parent = event
+            .parent_event_id
+            .as_deref()
+            .expect("NestedEpsNas is checked to have parent_event_id before pending push");
+        if !plane_s1ap_event_ids.contains(parent) {
+            return Err(LteEvidenceError::new(
+                "LTE_EVENT_NESTED_NAS_WITHOUT_PARENT",
+                format!(
+                    "event {}: nested NAS parent {} not observed as an S1AP event in the \
+                     same S1-MME plane (decoder {}/{}, protocol {})",
+                    event.event_id,
+                    parent,
+                    event.decoder_name,
+                    event.decoder_version,
+                    event.protocol,
+                ),
+            ));
+        }
+    }
+    // plane_event_start is reserved for future cross-event invariants and
+    // keeps the per-plane range explicit in the code flow.
+    let _ = plane_event_start;
     Ok(())
 }
 
@@ -2286,5 +2417,234 @@ mod tests {
                 &[]
             ));
         }
+    }
+
+    // 2.7.10: nested EPS NAS events decoded by decoder-nas/0.3.1 must be
+    // accepted on S1-MME when their parent_event_id resolves to an S1AP
+    // event seen in the same plane. The ANR3 field evidence (issue #10
+    // comment 6628829729) was blocked by the stricter prior contract.
+
+    fn s1_mme_nested_nas_bundle(child_count: usize) -> (PathBuf, LteEvidenceImportRequest) {
+        let (bundle, mut request) = build_bundle();
+        let binding_index = request
+            .capture_bindings
+            .iter()
+            .position(|binding| binding.evidence_ref == "capture:S1_MME")
+            .expect("S1_MME binding present");
+        let binding = request.capture_bindings[binding_index].clone();
+        let capture_sha = request.evidence.capture_refs[binding_index]
+            .source_file_sha256
+            .clone();
+        let parent_id = "evt-s1ap-parent-0001";
+        let mut parent = event(
+            "S1_MME",
+            &capture_sha,
+            &binding.source_file,
+            1,
+            parent_id,
+        );
+        parent.decoder_name = binding.decoder_name.clone();
+        parent.decoder_version = binding.decoder_version.clone();
+        let mut children: Vec<EventRecord> = (0..child_count)
+            .map(|i| {
+                let mut child = event(
+                    "S1_MME",
+                    &capture_sha,
+                    &binding.source_file,
+                    1,
+                    &format!("evt-nas-child-{i:04}"),
+                );
+                child.protocol = "NAS-EPS-MM".into();
+                child.decoder_name = NESTED_NAS_DECODER.into();
+                child.decoder_version = NESTED_NAS_VERSION.into();
+                child.parent_event_id = Some(parent_id.into());
+                child.message_name = "Attach Request".into();
+                child
+            })
+            .collect();
+        let mut all = vec![parent];
+        all.append(&mut children);
+        let events_bytes = jsonl_bytes(&all).unwrap();
+        let events_path = bundle.join(&binding.normalized_events_file);
+        fs::write(&events_path, &events_bytes).unwrap();
+        request.capture_bindings[binding_index].normalized_events_sha256 = sha256_hex(&events_bytes);
+        (bundle, request)
+    }
+
+    #[test]
+    fn accepts_ten_nas_children_decoded_by_the_eps_nas_decoder_on_s1_mme() {
+        // Reproduces the ANR3 field case (issue #10 comment 6628829729):
+        // one S1AP envelope on S1-MME + ten EPS NAS children decoded by
+        // decoder-nas/0.3.1 with parent_event_id set.
+        let (bundle, request) = s1_mme_nested_nas_bundle(10);
+        let store = LteEvidenceStore::new(temp_root("nested-nas-accept-store")).unwrap();
+        let result = store.ingest(&bundle, &request).expect("accepted");
+        assert!(
+            matches!(result.state.as_str(), "COMPLETED" | "IMPORTED" | "IMPORTED_PARTIAL"),
+            "unexpected state: {}",
+            result.state
+        );
+        // Idempotency still holds after accepting the ten children.
+        let second = store.ingest(&bundle, &request).unwrap();
+        assert!(second.idempotent);
+        fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn rejects_nested_nas_without_s1ap_parent_on_s1_mme() {
+        let (bundle, mut request) = s1_mme_nested_nas_bundle(1);
+        let binding_index = request
+            .capture_bindings
+            .iter()
+            .position(|binding| binding.evidence_ref == "capture:S1_MME")
+            .unwrap();
+        let binding = request.capture_bindings[binding_index].clone();
+        let capture_sha = request.evidence.capture_refs[binding_index]
+            .source_file_sha256
+            .clone();
+        // Rewrite the JSONL to remove the S1AP parent — the lone child
+        // has a `parent_event_id` that will not resolve to any S1AP event
+        // present in the stream.
+        let mut orphan = event(
+            "S1_MME",
+            &capture_sha,
+            &binding.source_file,
+            1,
+            "evt-nas-orphan-0001",
+        );
+        orphan.protocol = "NAS-EPS-MM".into();
+        orphan.decoder_name = NESTED_NAS_DECODER.into();
+        orphan.decoder_version = NESTED_NAS_VERSION.into();
+        orphan.parent_event_id = Some("evt-s1ap-missing".into());
+        let bytes = jsonl_bytes(&[orphan]).unwrap();
+        fs::write(bundle.join(&binding.normalized_events_file), &bytes).unwrap();
+        request.capture_bindings[binding_index].normalized_events_sha256 = sha256_hex(&bytes);
+        let store = LteEvidenceStore::new(temp_root("nested-nas-orphan-store")).unwrap();
+        let error = store.ingest(&bundle, &request).unwrap_err();
+        assert_eq!(error.code, "LTE_EVENT_NESTED_NAS_WITHOUT_PARENT");
+        fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn rejects_nested_nas_without_any_parent_event_id_on_s1_mme() {
+        let (bundle, mut request) = s1_mme_nested_nas_bundle(1);
+        let binding_index = request
+            .capture_bindings
+            .iter()
+            .position(|binding| binding.evidence_ref == "capture:S1_MME")
+            .unwrap();
+        let binding = request.capture_bindings[binding_index].clone();
+        let capture_sha = request.evidence.capture_refs[binding_index]
+            .source_file_sha256
+            .clone();
+        let mut child = event(
+            "S1_MME",
+            &capture_sha,
+            &binding.source_file,
+            1,
+            "evt-nas-no-parent-0001",
+        );
+        child.protocol = "NAS-EPS-MM".into();
+        child.decoder_name = NESTED_NAS_DECODER.into();
+        child.decoder_version = NESTED_NAS_VERSION.into();
+        child.parent_event_id = None;
+        let bytes = jsonl_bytes(&[child]).unwrap();
+        fs::write(bundle.join(&binding.normalized_events_file), &bytes).unwrap();
+        request.capture_bindings[binding_index].normalized_events_sha256 = sha256_hex(&bytes);
+        let store = LteEvidenceStore::new(temp_root("nested-nas-none-store")).unwrap();
+        let error = store.ingest(&bundle, &request).unwrap_err();
+        assert_eq!(error.code, "LTE_EVENT_NESTED_NAS_WITHOUT_PARENT");
+        fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_decoder_on_s1_mme() {
+        let (bundle, mut request) = build_bundle();
+        let binding_index = request
+            .capture_bindings
+            .iter()
+            .position(|binding| binding.evidence_ref == "capture:S1_MME")
+            .unwrap();
+        let binding = request.capture_bindings[binding_index].clone();
+        let capture_sha = request.evidence.capture_refs[binding_index]
+            .source_file_sha256
+            .clone();
+        let mut rogue = event(
+            "S1_MME",
+            &capture_sha,
+            &binding.source_file,
+            1,
+            "evt-rogue-decoder",
+        );
+        rogue.decoder_name = "decoder-unknown".into();
+        rogue.decoder_version = "9.9.9".into();
+        let bytes = jsonl_bytes(&[rogue]).unwrap();
+        fs::write(bundle.join(&binding.normalized_events_file), &bytes).unwrap();
+        request.capture_bindings[binding_index].normalized_events_sha256 = sha256_hex(&bytes);
+        let store = LteEvidenceStore::new(temp_root("rogue-decoder-store")).unwrap();
+        let error = store.ingest(&bundle, &request).unwrap_err();
+        assert_eq!(error.code, "LTE_EVENT_DECODER_MISMATCH");
+        // The detail must identify the offending decoder, protocol and parent.
+        assert!(
+            error.detail.contains("decoder-unknown/9.9.9"),
+            "error detail should name the rogue decoder, got: {}",
+            error.detail
+        );
+        assert!(
+            error.detail.contains("S1AP"),
+            "error detail should name the protocol, got: {}",
+            error.detail
+        );
+        assert!(
+            error.detail.contains("parent"),
+            "error detail should surface the parent context, got: {}",
+            error.detail
+        );
+        fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn rejects_wrong_decoder_version_for_nested_eps_nas() {
+        // The nested NAS exception is pinned to decoder-nas/0.3.1. A NAS
+        // event claiming a different version must be refused to prevent
+        // silent decoder drift.
+        let (bundle, mut request) = s1_mme_nested_nas_bundle(1);
+        let binding_index = request
+            .capture_bindings
+            .iter()
+            .position(|binding| binding.evidence_ref == "capture:S1_MME")
+            .unwrap();
+        let binding = request.capture_bindings[binding_index].clone();
+        let capture_sha = request.evidence.capture_refs[binding_index]
+            .source_file_sha256
+            .clone();
+        let parent_id = "evt-s1ap-parent-drift";
+        let mut parent = event(
+            "S1_MME",
+            &capture_sha,
+            &binding.source_file,
+            1,
+            parent_id,
+        );
+        parent.decoder_name = binding.decoder_name.clone();
+        parent.decoder_version = binding.decoder_version.clone();
+        let mut drifted_child = event(
+            "S1_MME",
+            &capture_sha,
+            &binding.source_file,
+            1,
+            "evt-nas-drift-0001",
+        );
+        drifted_child.protocol = "NAS-EPS-MM".into();
+        drifted_child.decoder_name = NESTED_NAS_DECODER.into();
+        drifted_child.decoder_version = "0.4.0".into();
+        drifted_child.parent_event_id = Some(parent_id.into());
+        let bytes = jsonl_bytes(&[parent, drifted_child]).unwrap();
+        fs::write(bundle.join(&binding.normalized_events_file), &bytes).unwrap();
+        request.capture_bindings[binding_index].normalized_events_sha256 = sha256_hex(&bytes);
+        let store = LteEvidenceStore::new(temp_root("drifted-nas-store")).unwrap();
+        let error = store.ingest(&bundle, &request).unwrap_err();
+        assert_eq!(error.code, "LTE_EVENT_DECODER_MISMATCH");
+        fs::remove_dir_all(bundle).unwrap();
     }
 }

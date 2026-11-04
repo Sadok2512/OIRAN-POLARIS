@@ -1,5 +1,26 @@
 # Changelog
 
+## OIRAN API 2.7.10 — 2026-11-04 — explicit decoder-vs-protocol binding for nested EPS NAS
+
+- `live-probe::lte_evidence::read_events_bounded()` now classifies each
+  normalised event with an explicit allowlist of `(plane, protocol,
+  decoder)` tuples. An S1-MME event with the plane's declared binding
+  decoder stays a plane-binding primary; an S1-MME event with protocol
+  `NAS-EPS-MM` or `NAS-EPS-SM` is accepted only when it is decoded by
+  `decoder-nas/0.3.1` AND carries a `parent_event_id` resolvable to an
+  S1AP event seen in the same plane. Any other combination fails closed
+  with `LTE_EVENT_DECODER_MISMATCH` (detail: decoder, protocol, parent),
+  and a nested NAS event without a valid parent fails
+  `LTE_EVENT_NESTED_NAS_WITHOUT_PARENT`. The S11 and S1-U plane bindings
+  stay strict. The N2 / NGAP / NAS-5G path is untouched (non-regression).
+- Regression tests:
+  `accepts_ten_nas_children_decoded_by_the_eps_nas_decoder_on_s1_mme`
+  (ANR3 field case),
+  `rejects_nested_nas_without_s1ap_parent_on_s1_mme`,
+  `rejects_nested_nas_without_any_parent_event_id_on_s1_mme`,
+  `rejects_unknown_decoder_on_s1_mme`,
+  `rejects_wrong_decoder_version_for_nested_eps_nas`.
+
 ## OIRAN API 2.7.9 — 2026-11-04 — bounded LTE runtime-diagnostic privacy predicate
 
 - Removes only the envelope's exact strict `lte-run-<32 lowercase hex>` value
