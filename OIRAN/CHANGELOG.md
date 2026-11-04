@@ -7,7 +7,10 @@
   API and platform version `2.7.15`, so its production deployment was
   rejected and rolled back before certification.
 - No capture, import, correlation or privacy behavior changes relative to
-  2.7.16.
+  2.7.16, except that operational `/health` now selects the canonical
+  continuous dataset instead of summing historical live/derived manifests.
+  This keeps its event/session counters equal to the on-disk continuous
+  `dataset_manifest.json` when older datasets remain under the capture root.
 
 ## OIRAN API 2.7.16 — 2026-11-04 — API continuous projection + bounded-batch backpressure drain
 

@@ -621,6 +621,15 @@ fn live_flow_for(state: &AppState, id: &str) -> Option<(String, CallFlow)> {
         })
 }
 
+fn operational_health_dataset(
+    datasets: &[live_probe::LiveDataset],
+) -> Option<&live_probe::LiveDataset> {
+    datasets
+        .iter()
+        .find(|dataset| dataset.dataset_id == live_probe::CONTINUOUS_DATASET_ID)
+        .or_else(|| (datasets.len() == 1).then(|| &datasets[0]))
+}
+
 async fn health(State(state): State<AppState>) -> Json<Value> {
     // Reference mode populates `Inner.flows / Inner.manifest / Inner.discovery`
     // at startup. Operational mode leaves them empty by design and projects
@@ -628,8 +637,11 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
     // reported `dataset=null, source_events=0, session_count=0` for a
     // continuous dataset whose disk already held 25 537 events and 8
     // sessions (issue #9 part 1, ANR2 diagnostic). We project the manager's
-    // LiveDataset summaries (not the events) into the health response, so
-    // /health and /sessions agree with dataset_manifest.json on disk.
+    // canonical continuous LiveDataset summary (not its events) into the
+    // health response, so /health agrees with that dataset_manifest.json on
+    // disk. Historical live/derived datasets must not inflate this liveness
+    // projection. A single non-continuous dataset remains a safe fallback;
+    // multiple datasets without the canonical one fail closed.
     let mut source_events = state
         .inner
         .flows
@@ -640,16 +652,14 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
     let mut ue_context_count = state.inner.discovery.ue_contexts.len();
     let mut dataset = state.inner.manifest.get("scenario_id").cloned();
     if session_count == 0 {
-        for live in state.inner.capture_manager.datasets() {
-            source_events = source_events.saturating_add(live.event_count);
-            session_count = session_count.saturating_add(live.session_ids.len());
+        let live_datasets = state.inner.capture_manager.datasets();
+        if let Some(live) = operational_health_dataset(&live_datasets) {
+            source_events = live.event_count;
+            session_count = live.session_ids.len();
             if let Some(discovery) = &live.discovery {
-                ue_context_count =
-                    ue_context_count.saturating_add(discovery.ue_contexts.len());
+                ue_context_count = discovery.ue_contexts.len();
             }
-            if dataset.is_none() {
-                dataset = Some(Value::String(live.dataset_id.clone()));
-            }
+            dataset = Some(Value::String(live.dataset_id.clone()));
         }
     }
     ok(json!({
@@ -3488,6 +3498,37 @@ mod tests {
         assert_eq!(v["data"]["source_events"], 54);
         assert_eq!(v["data"]["capabilities"]["live_capture"], true);
         assert_eq!(v["data"]["capabilities"]["capture_control"], false)
+    }
+
+    #[test]
+    fn operational_health_prefers_canonical_continuous_dataset() {
+        fn dataset(id: &str, events: usize, sessions: usize) -> live_probe::LiveDataset {
+            live_probe::LiveDataset {
+                dataset_id: id.into(),
+                capture_id: id.into(),
+                path: format!("/tmp/{id}"),
+                event_count: events,
+                session_ids: (0..sessions).map(|index| format!("{id}-{index}")).collect(),
+                decode_reports: BTreeMap::new(),
+                checksums: BTreeMap::new(),
+                state: "READY".into(),
+                discovery: None,
+                capture_started_epoch_ms: None,
+                last_packet_epoch_ms: None,
+                fresh_packet_count: 0,
+                active_ue_ips: Vec::new(),
+                active_pdu_contexts: Vec::new(),
+            }
+        }
+
+        let datasets = vec![
+            dataset("old-live", 402, 2),
+            dataset(live_probe::CONTINUOUS_DATASET_ID, 25_537, 8),
+        ];
+        let selected = operational_health_dataset(&datasets).unwrap();
+        assert_eq!(selected.dataset_id, live_probe::CONTINUOUS_DATASET_ID);
+        assert_eq!(selected.event_count, 25_537);
+        assert_eq!(selected.session_ids.len(), 8);
     }
 
     #[tokio::test]
