@@ -165,10 +165,7 @@ fn decode_ie(ie: &S1apIe, pseudonym_key: &PseudonymKey) -> (Option<String>, Deco
             true,
         ),
         43 => (
-            Some(format!(
-                "subscriber_pseudonym={}",
-                pseudonym(pseudonym_key, "ue-paging-id", &ie.value)
-            )),
+            Some(pseudonym(pseudonym_key, "ue-paging-id", &ie.value)),
             DecodeStatus::Partial,
             true,
         ),
@@ -186,10 +183,7 @@ fn decode_ie(ie: &S1apIe, pseudonym_key: &PseudonymKey) -> (Option<String>, Deco
             true,
         ),
         96 => (
-            Some(format!(
-                "subscriber_pseudonym={}",
-                pseudonym(pseudonym_key, "s1ap-s-tmsi", &ie.value)
-            )),
+            Some(pseudonym(pseudonym_key, "s1ap-s-tmsi", &ie.value)),
             DecodeStatus::Decoded,
             true,
         ),
@@ -486,6 +480,13 @@ impl ProtocolDecoder for S1apDecoder {
                         status = DecodeStatus::Malformed;
                     }
                     if let Some(v) = &value {
+                        if matches!(ie.known_name, Some("identity_pseudonym")) {
+                            identifiers.push(NamedValue {
+                                name: "subscriber_pseudonym".into(),
+                                value: v.clone(),
+                                pseudonymized: true,
+                            });
+                        }
                         for pair in v.split(',') {
                             if let Some((key, val)) = pair.split_once('=') {
                                 if matches!(
@@ -712,6 +713,12 @@ fn infer_direction(i: &DecoderInput<'_>, procedure: u8) -> Direction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_psn_32(value: &str) -> bool {
+        value.len() == 36
+            && value.starts_with("psn-")
+            && value[4..].bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
     use event_schema::{Endpoint, ExactTimestamp, PacketReference};
 
     fn pdu(kind: u8, proc: u8, ies: &[(u16, u8, &[u8])]) -> Vec<u8> {
@@ -849,6 +856,11 @@ mod tests {
             .find(|ie| ie.name == "identity_pseudonym")
             .expect("identity_pseudonym IE");
         assert_eq!(identity_ie.status, DecodeStatus::Decoded);
+        assert!(identity_ie
+            .value
+            .as_deref()
+            .map(is_psn_32)
+            .unwrap_or(false));
         let subscriber = event
             .session_identifiers
             .iter()

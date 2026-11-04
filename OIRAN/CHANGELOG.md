@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.7.8 — 2026-11-04 — scalar pseudonym IE contract
+
+- Serializes every GTPv2-C, S1AP and EPS NAS information element named
+  `subscriber_pseudonym` or `identity_pseudonym` as the bare deployment-keyed
+  HMAC value `psn-<32 hex>`, without a key/value prefix or concatenation.
+- Exports the EPS mobile type code separately as the numeric-only
+  `eps_mobile_type_code`, preserving correlation while satisfying the strict
+  POLARIS 0.29.16 privacy contract.
+
 ## OIRAN API 2.7.7 — 2026-11-04 — unified `subscriber_pseudonym` / `identity_pseudonym` emission contract
 
 - Every identity-derived identifier (IMSI, IMEI, MSISDN, GUTI/TMSI/5G-S-TMSI,

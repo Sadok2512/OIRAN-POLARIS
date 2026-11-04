@@ -117,28 +117,19 @@ fn decode_ie(
     let name = ie_name(ie.ie_type);
     match ie.ie_type {
         1 => (
-            Some(format!(
-                "subscriber_pseudonym={}",
-                pseudonym(pseudonym_key, "subscriber", &ie.value)
-            )),
+            Some(pseudonym(pseudonym_key, "subscriber", &ie.value)),
             DecodeStatus::Decoded,
             true,
             name,
         ),
         75 => (
-            Some(format!(
-                "identity_pseudonym={}",
-                pseudonym(pseudonym_key, "mei", &ie.value)
-            )),
+            Some(pseudonym(pseudonym_key, "mei", &ie.value)),
             DecodeStatus::Decoded,
             true,
             name,
         ),
         76 => (
-            Some(format!(
-                "identity_pseudonym={}",
-                pseudonym(pseudonym_key, "msisdn", &ie.value)
-            )),
+            Some(pseudonym(pseudonym_key, "msisdn", &ie.value)),
             DecodeStatus::Decoded,
             true,
             name,
@@ -456,6 +447,13 @@ fn emit_event(msg: Gtpv2cMessage, input: &DecoderInput<'_>) -> DecoderOutput {
             status = DecodeStatus::Malformed;
         }
         if let Some(v) = &value {
+            if matches!(name, Some("identity_pseudonym")) {
+                identifiers.push(NamedValue {
+                    name: "subscriber_pseudonym".into(),
+                    value: v.clone(),
+                    pseudonymized: true,
+                });
+            }
             for pair in v.split(',') {
                 if let Some((key, val)) = pair.split_once('=') {
                     if matches!(
@@ -469,20 +467,8 @@ fn emit_event(msg: Gtpv2cMessage, input: &DecoderInput<'_>) -> DecoderOutput {
                             | "ue_ipv6"
                             | "ebi"
                     ) {
-                        // All identity-derived identifiers converge on the
-                        // `subscriber_pseudonym` contract. The GTPv2-C IE 1
-                        // path keeps `subscriber_pseudonym`; IE 75 (MEI) and
-                        // 76 (MSISDN) also emit `identity_pseudonym` from
-                        // decode_ie — route both to `subscriber_pseudonym`
-                        // in the session_identifiers array so S1-MME / S11
-                        // / S1-U share one name.
-                        let emitted_name = if key == "identity_pseudonym" {
-                            "subscriber_pseudonym"
-                        } else {
-                            key
-                        };
                         identifiers.push(NamedValue {
-                            name: emitted_name.into(),
+                            name: key.into(),
                             value: val.into(),
                             pseudonymized: sensitive,
                         });
@@ -606,6 +592,12 @@ fn infer_direction(input: &DecoderInput<'_>, message_type: u8) -> Direction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_psn_32(value: &str) -> bool {
+        value.len() == 36
+            && value.starts_with("psn-")
+            && value[4..].bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
     use event_schema::{Endpoint, ExactTimestamp, PacketReference};
 
     fn ie(ie_type: u8, instance: u8, value: &[u8]) -> Vec<u8> {
@@ -755,6 +747,15 @@ mod tests {
             pseudo_count, 3,
             "IMSI, MSISDN and MEI must all surface as subscriber_pseudonym"
         );
+        let identity_ies: Vec<_> = ev
+            .information_elements
+            .iter()
+            .filter(|ie| matches!(ie.name.as_str(), "subscriber_pseudonym" | "identity_pseudonym"))
+            .collect();
+        assert_eq!(identity_ies.len(), 3);
+        assert!(identity_ies.iter().all(|ie| {
+            ie.value.as_deref().map(is_psn_32).unwrap_or(false)
+        }));
         let apn = ev
             .session_identifiers
             .iter()

@@ -1118,7 +1118,7 @@ fn attach_eps_mobile_identity(
     value: &[u8],
     pseudonym_key: &PseudonymKey,
 ) {
-    // Identity-type code goes out as a numeric tag only. The 3GPP mnemonics
+    // The mobile-type code goes out as a numeric tag only. The 3GPP mnemonics
     // ("IMSI"/"IMEI"/"IMEISV"/"GUTI") would both leak the identity nature and
     // trip the POLARIS finalizer's privacy allowlist, so we export the TS
     // 24.301 §9.9.3.12 type code numerically and let the Analyzer resolve
@@ -1129,9 +1129,7 @@ fn attach_eps_mobile_identity(
         id: None,
         name: "identity_pseudonym".into(),
         length: value.len() as u32,
-        value: Some(format!(
-            "identity_type_code={identity_type_code},pseudonym={pseudo}"
-        )),
+        value: Some(pseudo.clone()),
         raw_sha256: Some(sha256_hex(value)),
         status: DecodeStatus::Decoded,
     });
@@ -1141,7 +1139,7 @@ fn attach_eps_mobile_identity(
         pseudonymized: true,
     });
     msg.identifiers.push(NamedValue {
-        name: "eps_mobile_identity_type_code".into(),
+        name: "eps_mobile_type_code".into(),
         value: identity_type_code.to_string(),
         pseudonymized: false,
     });
@@ -1297,6 +1295,12 @@ fn sm_eps_name(mt: u8) -> (&'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_psn_32(value: &str) -> bool {
+        value.len() == 36
+            && value.starts_with("psn-")
+            && value[4..].bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
 
     fn test_key() -> PseudonymKey {
         PseudonymKey::from_bytes([0xcc; 32])
@@ -1523,14 +1527,25 @@ mod tests {
             .find(|v| v.name == "subscriber_pseudonym")
             .expect("subscriber_pseudonym");
         assert!(identity.pseudonymized);
-        assert!(identity.value.starts_with("psn-"));
+        assert!(is_psn_32(&identity.value));
+        let identity_ie = r
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "identity_pseudonym")
+            .expect("identity_pseudonym IE");
+        assert!(identity_ie
+            .value
+            .as_deref()
+            .map(is_psn_32)
+            .unwrap_or(false));
         let identity_type = r
             .identifiers
             .iter()
-            .find(|v| v.name == "eps_mobile_identity_type_code")
-            .expect("eps_mobile_identity_type_code");
+            .find(|v| v.name == "eps_mobile_type_code")
+            .expect("eps_mobile_type_code");
         // TS 24.301 §9.9.3.12 identity type 1 = subscriber-level identity.
         assert_eq!(identity_type.value, "1");
+        assert!(identity_type.value.bytes().all(|byte| byte.is_ascii_digit()));
     }
 
     #[test]
@@ -1548,8 +1563,8 @@ mod tests {
         let identity_type = r
             .identifiers
             .iter()
-            .find(|v| v.name == "eps_mobile_identity_type_code")
-            .expect("eps_mobile_identity_type_code");
+            .find(|v| v.name == "eps_mobile_type_code")
+            .expect("eps_mobile_type_code");
         assert_eq!(identity_type.value, "6");
     }
 
