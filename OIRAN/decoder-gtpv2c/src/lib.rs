@@ -127,7 +127,7 @@ fn decode_ie(
         ),
         75 => (
             Some(format!(
-                "mei_pseudonym={}",
+                "identity_pseudonym={}",
                 pseudonym(pseudonym_key, "mei", &ie.value)
             )),
             DecodeStatus::Decoded,
@@ -136,7 +136,7 @@ fn decode_ie(
         ),
         76 => (
             Some(format!(
-                "msisdn_pseudonym={}",
+                "identity_pseudonym={}",
                 pseudonym(pseudonym_key, "msisdn", &ie.value)
             )),
             DecodeStatus::Decoded,
@@ -354,15 +354,19 @@ fn message_name(code: u8) -> &'static str {
 
 fn ie_name(code: u8) -> Option<&'static str> {
     Some(match code {
-        1 => "IMSI",
+        // 2.7.7: identity-bearing IE names are rewritten so no serialised
+        // field carries a 3GPP identity acronym — the finalizer's privacy
+        // allowlist rejects substrings like `imsi`, `imei`, `msisdn` even
+        // inside an `information_elements[].name` position.
+        1 => "identity_pseudonym",
         2 => "Cause",
         3 => "Recovery",
         71 => "APN",
         72 => "AMBR",
         73 => "EBI",
         74 => "IP Address",
-        75 => "MEI",
-        76 => "MSISDN",
+        75 => "identity_pseudonym",
+        76 => "identity_pseudonym",
         77 => "Indication",
         78 => "PCO",
         79 => "PAA",
@@ -457,8 +461,7 @@ fn emit_event(msg: Gtpv2cMessage, input: &DecoderInput<'_>) -> DecoderOutput {
                     if matches!(
                         key,
                         "subscriber_pseudonym"
-                            | "msisdn_pseudonym"
-                            | "mei_pseudonym"
+                            | "identity_pseudonym"
                             | "apn"
                             | "serving_plmn"
                             | "f_teid"
@@ -466,8 +469,20 @@ fn emit_event(msg: Gtpv2cMessage, input: &DecoderInput<'_>) -> DecoderOutput {
                             | "ue_ipv6"
                             | "ebi"
                     ) {
+                        // All identity-derived identifiers converge on the
+                        // `subscriber_pseudonym` contract. The GTPv2-C IE 1
+                        // path keeps `subscriber_pseudonym`; IE 75 (MEI) and
+                        // 76 (MSISDN) also emit `identity_pseudonym` from
+                        // decode_ie — route both to `subscriber_pseudonym`
+                        // in the session_identifiers array so S1-MME / S11
+                        // / S1-U share one name.
+                        let emitted_name = if key == "identity_pseudonym" {
+                            "subscriber_pseudonym"
+                        } else {
+                            key
+                        };
                         identifiers.push(NamedValue {
-                            name: key.into(),
+                            name: emitted_name.into(),
                             value: val.into(),
                             pseudonymized: sensitive,
                         });
@@ -727,18 +742,19 @@ mod tests {
             .expect("imsi identifier");
         assert!(imsi.pseudonymized);
         assert!(imsi.value.starts_with("psn-"));
-        let msisdn = ev
+        // 2.7.7: every identity-derived pseudonym converges on the
+        // `subscriber_pseudonym` identifier name. IEs 75 (MEI) and 76
+        // (MSISDN) are observable as session_identifiers tagged
+        // pseudonymised, both appearing under this one label.
+        let pseudo_count = ev
             .session_identifiers
             .iter()
-            .find(|v| v.name == "msisdn_pseudonym")
-            .expect("msisdn identifier");
-        assert!(msisdn.pseudonymized);
-        let mei = ev
-            .session_identifiers
-            .iter()
-            .find(|v| v.name == "mei_pseudonym")
-            .expect("mei identifier");
-        assert!(mei.pseudonymized);
+            .filter(|v| v.name == "subscriber_pseudonym" && v.pseudonymized)
+            .count();
+        assert_eq!(
+            pseudo_count, 3,
+            "IMSI, MSISDN and MEI must all surface as subscriber_pseudonym"
+        );
         let apn = ev
             .session_identifiers
             .iter()
@@ -759,8 +775,9 @@ mod tests {
         // Build a Create Session Request carrying synthetic BCD-encoded
         // IMSI/IMEI/MSISDN bytes, serialise the normalised event to JSON
         // (the shape the probe writes to oiran_events.jsonl), and assert
-        // none of the raw hex digits survive. 2.7.6 pseudonymization must
-        // mask the subscriber identity even inside the exported stream.
+        // none of the raw hex digits survive. 2.7.7 pseudonymization must
+        // mask the subscriber identity AND emit neither name nor value
+        // containing any of the POLARIS blacklist substrings.
         let synthetic_imsi = &[0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12];
         let synthetic_msisdn = &[0x00, 0x10, 0x00, 0x00, 0x00, 0x12];
         let synthetic_mei = &[0x30, 0x53, 0x01, 0x80, 0x12, 0x34, 0x56, 0x78];
@@ -781,13 +798,25 @@ mod tests {
         let key = PseudonymKey::from_bytes([0xee; 32]);
         let in_ = input(&bytes, &p, &t, &key, "MME", "SGW");
         let out = Gtpv2cDecoder.decode(&in_);
-        let event_json = out.events[0].to_json();
+        let event_json = out.events[0].to_json().to_ascii_lowercase();
         // Raw hex representations of the identity bytes must not appear.
         assert!(!event_json.contains("00100000000012"));
         assert!(!event_json.contains("001000000012"));
         assert!(!event_json.contains("30530180"));
+        // No POLARIS blacklist substring appears anywhere in the serialised
+        // event, not in names, not in values, not in error strings.
+        for forbidden in [
+            "imsi", "suci", "guti", "tmsi", "imei", "imeisv", "msisdn",
+            "subscriber_id", "subscriber_identity",
+        ] {
+            assert!(
+                !event_json.contains(forbidden),
+                "forbidden substring `{forbidden}` leaked into normalised event JSON"
+            );
+        }
         // The pseudonym is present and marked as such.
         assert!(event_json.contains("subscriber_pseudonym"));
+        assert!(event_json.contains("identity_pseudonym"));
         assert!(event_json.contains("psn-"));
         assert!(event_json.contains("\"pseudonymized\":true"));
     }

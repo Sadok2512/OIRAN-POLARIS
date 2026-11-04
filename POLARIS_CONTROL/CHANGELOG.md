@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.29.16 (polaris-control-api) — 2026-11-04 — privacy contract lock-down for `subscriber_pseudonym` / `identity_pseudonym`
+
+- `privacy_safe_value()` adds a single lock-down exception agreed with
+  OIRAN 2.7.7: any JSON object carrying a key literally named
+  `subscriber_pseudonym` or `identity_pseudonym`, or any object whose `name`
+  field equals one of these, is accepted ONLY when its value (or sibling
+  `value` field) matches `^psn-[0-9a-f]{32}$`. Every other blacklist rule
+  (imsi/suci/guti/tmsi/imei/imeisv/msisdn/opc/subscriber_id/subscriber_identity
+  substrings, decimal identities, bare 32-hex secrets) stays in force.
+
 ## 0.29.15 (polaris-control-api) — 2026-11-03 — service-scope the `config_files` label expectation
 
 - `parse_container_inspect()` now expects the `config_files` label per

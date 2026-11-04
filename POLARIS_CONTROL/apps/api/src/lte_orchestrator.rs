@@ -718,13 +718,57 @@ fn privacy_safe_value(value: &serde_json::Value) -> bool {
         "subscriber_id",
         "subscriber_identity",
     ];
+    // 0.29.16: single lock-down exception for the privacy contract agreed
+    // with OIRAN 2.7.7. A field whose JSON key is literally
+    // `subscriber_pseudonym` is accepted ONLY when its value matches the
+    // HMAC output format `psn-` + 32 lowercase hex characters. An object
+    // whose `name` field equals `subscriber_pseudonym` or
+    // `identity_pseudonym` (OIRAN NamedValue / InformationElement shape)
+    // must likewise carry a `value` field matching the same regex. Every
+    // other blacklist rule stays in force.
+    fn is_valid_psn(text: &str) -> bool {
+        if text.len() != 36 {
+            return false;
+        }
+        let Some(suffix) = text.strip_prefix("psn-") else {
+            return false;
+        };
+        suffix.len() == 32
+            && suffix
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    }
+    const PSEUDONYM_NAMES: [&str; 2] = ["subscriber_pseudonym", "identity_pseudonym"];
     match value {
-        serde_json::Value::Object(map) => map.iter().all(|(key, value)| {
-            let key = key.to_ascii_lowercase();
-            !FORBIDDEN.iter().any(|needle| key.contains(needle))
-                && !matches!(key.as_str(), "k" | "key" | "op" | "authentication_key")
-                && privacy_safe_value(value)
-        }),
+        serde_json::Value::Object(map) => {
+            // NamedValue / InformationElement shape: when `name` labels this
+            // record as a pseudonym, the sibling `value` must match the
+            // locked format or the whole record is rejected.
+            if let Some(name_str) = map.get("name").and_then(serde_json::Value::as_str) {
+                if PSEUDONYM_NAMES.contains(&name_str) {
+                    let Some(serde_json::Value::String(v)) = map.get("value") else {
+                        return false;
+                    };
+                    if !is_valid_psn(v) {
+                        return false;
+                    }
+                }
+            }
+            map.iter().all(|(key, value)| {
+                let lower = key.to_ascii_lowercase();
+                if PSEUDONYM_NAMES.contains(&lower.as_str()) {
+                    // Direct `{"subscriber_pseudonym": "psn-..."}` or
+                    // `{"identity_pseudonym": "psn-..."}` shape: the value
+                    // must be a string matching the regex. No recursion
+                    // beyond that, since the string carries no nested
+                    // material.
+                    return matches!(value, serde_json::Value::String(v) if is_valid_psn(v));
+                }
+                !FORBIDDEN.iter().any(|needle| lower.contains(needle))
+                    && !matches!(lower.as_str(), "k" | "key" | "op" | "authentication_key")
+                    && privacy_safe_value(value)
+            })
+        }
         serde_json::Value::Array(values) => values.iter().all(privacy_safe_value),
         serde_json::Value::String(value) => {
             let value = value.to_ascii_lowercase();
@@ -1737,6 +1781,65 @@ mod tests {
             assert_eq!(envelope.evidence.capture_refs[0].plane, "S1_MME");
             let _ = fs::remove_dir_all(fixture);
         }
+    }
+
+    #[test]
+    fn privacy_contract_subscriber_pseudonym_accepts_only_psn_32_hex() {
+        // 0.29.16 contract with OIRAN 2.7.7. A key literally named
+        // `subscriber_pseudonym` (or `identity_pseudonym`) is accepted only
+        // when its value matches ^psn-[0-9a-f]{32}$.
+        let valid_psn = "psn-0123456789abcdef0123456789abcdef";
+        assert!(privacy_safe_value(&serde_json::json!({
+            "subscriber_pseudonym": valid_psn
+        })));
+        assert!(privacy_safe_value(&serde_json::json!({
+            "identity_pseudonym": valid_psn
+        })));
+        // Shorter hex tail — rejected.
+        assert!(!privacy_safe_value(&serde_json::json!({
+            "subscriber_pseudonym": "psn-0123456789abcdef"
+        })));
+        // Longer hex tail — rejected.
+        assert!(!privacy_safe_value(&serde_json::json!({
+            "subscriber_pseudonym": "psn-0123456789abcdef0123456789abcdef00"
+        })));
+        // Uppercase hex — rejected.
+        assert!(!privacy_safe_value(&serde_json::json!({
+            "subscriber_pseudonym": "psn-0123456789ABCDEF0123456789ABCDEF"
+        })));
+        // Decimal IMSI stuffed under the pseudonym name — rejected.
+        assert!(!privacy_safe_value(&serde_json::json!({
+            "subscriber_pseudonym": "001011234567890"
+        })));
+        // Forbidden key name — still rejected.
+        assert!(!privacy_safe_value(&serde_json::json!({
+            "imsi": "REDACTED"
+        })));
+        // Bare 32-hex secret under an unrelated key — still rejected.
+        assert!(!privacy_safe_value(&serde_json::json!({
+            "material": "00112233445566778899aabbccddeeff"
+        })));
+        // NamedValue / InformationElement shape: `name == subscriber_pseudonym`
+        // forces the sibling `value` to match the psn regex.
+        assert!(privacy_safe_value(&serde_json::json!({
+            "name": "subscriber_pseudonym",
+            "value": valid_psn,
+            "pseudonymized": true
+        })));
+        assert!(!privacy_safe_value(&serde_json::json!({
+            "name": "subscriber_pseudonym",
+            "value": "001011234567890",
+            "pseudonymized": true
+        })));
+        // Same rule on `identity_pseudonym` InformationElement entries.
+        assert!(privacy_safe_value(&serde_json::json!({
+            "name": "identity_pseudonym",
+            "value": valid_psn
+        })));
+        assert!(!privacy_safe_value(&serde_json::json!({
+            "name": "identity_pseudonym",
+            "value": "psn-0123456789ABCDEF0123456789ABCDEF"
+        })));
     }
 
     #[test]

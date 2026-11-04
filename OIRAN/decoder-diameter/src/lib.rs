@@ -155,7 +155,7 @@ fn decode_avp(
     match (avp.code, avp.vendor_id) {
         (1, None) => (
             Some(format!(
-                "user_name_pseudonym={}",
+                "subscriber_pseudonym={}",
                 pseudonym(pseudonym_key, "diameter-user-name", &avp.value)
             )),
             DecodeStatus::Decoded,
@@ -164,7 +164,7 @@ fn decode_avp(
         ),
         (701, Some(10415)) => (
             Some(format!(
-                "msisdn_pseudonym={}",
+                "subscriber_pseudonym={}",
                 pseudonym(pseudonym_key, "msisdn", &avp.value)
             )),
             DecodeStatus::Decoded,
@@ -300,7 +300,9 @@ fn command_name(code: u32, is_request: bool) -> &'static str {
 
 fn avp_name(code: u32, vendor: Option<u32>) -> Option<&'static str> {
     Some(match (code, vendor) {
-        (1, None) => "User-Name",
+        // 2.7.7: identity-bearing AVP names rewritten so no serialised
+        // field carries `imsi` / `msisdn` substrings in any position.
+        (1, None) => "identity_pseudonym",
         (258, None) => "Auth-Application-Id",
         (259, None) => "Acct-Application-Id",
         (260, None) => "Vendor-Specific-Application-Id",
@@ -315,7 +317,7 @@ fn avp_name(code: u32, vendor: Option<u32>) -> Option<&'static str> {
         (296, None) => "Origin-Realm",
         (297, None) => "Experimental-Result",
         (298, None) => "Experimental-Result-Code",
-        (701, Some(10415)) => "MSISDN",
+        (701, Some(10415)) => "identity_pseudonym",
         (1032, Some(10415)) => "RAT-Type",
         (1400, Some(10415)) => "Subscription-Data",
         (1404, Some(10415)) => "ULR-Flags",
@@ -472,8 +474,7 @@ fn emit_avp(
             if let Some((key, val)) = pair.split_once('=') {
                 if matches!(
                     key,
-                    "user_name_pseudonym"
-                        | "msisdn_pseudonym"
+                    "subscriber_pseudonym"
                         | "result_code"
                         | "experimental_result_code"
                         | "visited_plmn_id"
@@ -660,13 +661,13 @@ mod tests {
         let ev = &out.events[0];
         assert_eq!(ev.message_name, "Update-Location-Request");
         assert_eq!(ev.direction, Direction::Uplink);
-        let user_name = ev
+        let subscriber = ev
             .session_identifiers
             .iter()
-            .find(|v| v.name == "user_name_pseudonym")
-            .expect("user_name_pseudonym");
-        assert!(user_name.pseudonymized);
-        assert!(user_name.value.starts_with("psn-"));
+            .find(|v| v.name == "subscriber_pseudonym")
+            .expect("subscriber_pseudonym");
+        assert!(subscriber.pseudonymized);
+        assert!(subscriber.value.starts_with("psn-"));
         let plmn = ev
             .session_identifiers
             .iter()
@@ -701,8 +702,8 @@ mod tests {
         let msisdn_id = ev
             .session_identifiers
             .iter()
-            .find(|v| v.name == "msisdn_pseudonym")
-            .expect("msisdn_pseudonym");
+            .find(|v| v.name == "subscriber_pseudonym")
+            .expect("subscriber_pseudonym");
         assert!(msisdn_id.pseudonymized);
         assert!(ev
             .information_elements

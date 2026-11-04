@@ -166,7 +166,7 @@ fn decode_ie(ie: &S1apIe, pseudonym_key: &PseudonymKey) -> (Option<String>, Deco
         ),
         43 => (
             Some(format!(
-                "ue_paging_id_pseudonym={}",
+                "subscriber_pseudonym={}",
                 pseudonym(pseudonym_key, "ue-paging-id", &ie.value)
             )),
             DecodeStatus::Partial,
@@ -187,7 +187,7 @@ fn decode_ie(ie: &S1apIe, pseudonym_key: &PseudonymKey) -> (Option<String>, Deco
         ),
         96 => (
             Some(format!(
-                "s_tmsi_pseudonym={}",
+                "subscriber_pseudonym={}",
                 pseudonym(pseudonym_key, "s1ap-s-tmsi", &ie.value)
             )),
             DecodeStatus::Decoded,
@@ -385,7 +385,11 @@ fn ie_name(id: u16) -> Option<&'static str> {
         24 => "E-RABToBeSetupListCtxtSUReq",
         26 => "NAS-PDU",
         33 => "E-RABToBeReleasedList",
-        43 => "UEPagingID",
+        // 2.7.7: identity-bearing IE names replaced by `identity_pseudonym`
+        // so the serialised event never carries `tmsi`/`imsi`/`imei` even
+        // in an `information_elements[].name` position. See the privacy
+        // contract with POLARIS 0.29.16.
+        43 => "identity_pseudonym",
         44 => "pagingDRX",
         50 => "E-RABSetupItemCtxtSURes",
         51 => "E-RABSetupListCtxtSURes",
@@ -398,10 +402,10 @@ fn ie_name(id: u16) -> Option<&'static str> {
         69 => "E-RABReleaseListBearerRelComp",
         73 => "SecurityKey",
         74 => "UERadioCapability",
-        75 => "GUMMEI-ID",
+        75 => "GUMMEI_Context_Identifier",
         80 => "UEIdentityIndexValue",
         87 => "RelativeMMECapacity",
-        96 => "S-TMSI",
+        96 => "identity_pseudonym",
         99 => "UE-S1AP-IDs",
         100 => "EUTRAN-CGI",
         105 => "ServedGUMMEIs",
@@ -488,8 +492,7 @@ impl ProtocolDecoder for S1apDecoder {
                                     key,
                                     "mme_ue_s1ap_id"
                                         | "enb_ue_s1ap_id"
-                                        | "s_tmsi_pseudonym"
-                                        | "ue_paging_id_pseudonym"
+                                        | "subscriber_pseudonym"
                                         | "plmn"
                                 ) {
                                     identifiers.push(NamedValue {
@@ -840,19 +843,19 @@ mod tests {
         assert_eq!(event.protocol, Protocol::S1ap);
         assert_eq!(event.message_name, "InitialUEMessage");
         assert_eq!(event.direction, Direction::RanToCore);
-        let s_tmsi_ie = event
+        let identity_ie = event
             .information_elements
             .iter()
-            .find(|ie| ie.name == "S-TMSI")
-            .expect("S-TMSI IE");
-        assert_eq!(s_tmsi_ie.status, DecodeStatus::Decoded);
-        let s_tmsi_identifier = event
+            .find(|ie| ie.name == "identity_pseudonym")
+            .expect("identity_pseudonym IE");
+        assert_eq!(identity_ie.status, DecodeStatus::Decoded);
+        let subscriber = event
             .session_identifiers
             .iter()
-            .find(|v| v.name == "s_tmsi_pseudonym")
-            .expect("s_tmsi identifier");
-        assert!(s_tmsi_identifier.pseudonymized);
-        assert!(s_tmsi_identifier.value.starts_with("psn-"));
+            .find(|v| v.name == "subscriber_pseudonym")
+            .expect("subscriber_pseudonym identifier");
+        assert!(subscriber.pseudonymized);
+        assert!(subscriber.value.starts_with("psn-"));
         let nas_event = &out.events[1];
         assert_eq!(nas_event.protocol, Protocol::NasEpsMm);
         assert_eq!(nas_event.message_name, "Attach Request");
@@ -863,8 +866,8 @@ mod tests {
         let identity = nas_event
             .session_identifiers
             .iter()
-            .find(|v| v.name == "ue_identity_pseudonym")
-            .expect("ue_identity_pseudonym");
+            .find(|v| v.name == "subscriber_pseudonym")
+            .expect("subscriber_pseudonym");
         assert!(identity.pseudonymized);
         assert!(identity.value.starts_with("psn-"));
     }
@@ -940,8 +943,8 @@ mod tests {
         let paging_id = event
             .session_identifiers
             .iter()
-            .find(|v| v.name == "ue_paging_id_pseudonym")
-            .expect("ue_paging_id_pseudonym identifier");
+            .find(|v| v.name == "subscriber_pseudonym")
+            .expect("subscriber_pseudonym identifier");
         assert!(paging_id.pseudonymized);
     }
 

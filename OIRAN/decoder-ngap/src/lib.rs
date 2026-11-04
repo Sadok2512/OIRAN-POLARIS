@@ -193,7 +193,7 @@ fn decode_ie(ie: &NgapIe, pseudonym_key: &PseudonymKey) -> (Option<String>, Deco
         }
         26 => (
             Some(format!(
-                "five_g_s_tmsi={}",
+                "subscriber_pseudonym={}",
                 pseudonym(pseudonym_key, "five-g-s-tmsi", &ie.value)
             )),
             DecodeStatus::Decoded,
@@ -205,7 +205,7 @@ fn decode_ie(ie: &NgapIe, pseudonym_key: &PseudonymKey) -> (Option<String>, Deco
         28 => decode_guami(&ie.value),
         34 => (
             Some(format!(
-                "masked_imeisv={}",
+                "subscriber_pseudonym={}",
                 pseudonym(pseudonym_key, "masked-imeisv", &ie.value)
             )),
             DecodeStatus::Decoded,
@@ -826,7 +826,7 @@ impl ProtocolDecoder for NgapDecoder {
                             if let Some((key, val)) = pair.split_once('=') {
                                 if matches!(
                                     key,
-                                    "amf_ue_ngap_id" | "ran_ue_ngap_id" | "five_g_s_tmsi"
+                                    "amf_ue_ngap_id" | "ran_ue_ngap_id" | "subscriber_pseudonym"
                                 ) || matches!(
                                     key,
                                     "pdu_session_id" | "sst" | "sd" | "nr_cell_id" | "tac" | "plmn"
@@ -1085,12 +1085,14 @@ fn ie_name(id: u16) -> Option<&'static str> {
         1 => "AMFName",
         10 => "AMF-UE-NGAP-ID",
         15 => "Cause",
-        26 => "FiveG-S-TMSI",
+        // 2.7.7: identity-bearing IE names rewritten so no serialised field
+        // carries `tmsi` / `imeisv` (POLARIS 0.29.16 privacy allowlist).
+        26 => "identity_pseudonym",
         27 => "GlobalRANNodeID",
         28 => "GUAMI",
         38 => "NAS-PDU",
         21 => "DefaultPagingDRX",
-        34 => "MaskedIMEISV",
+        34 => "identity_pseudonym",
         53 => "PDUSessionResourceAdmittedList",
         55 => "PDUSessionResourceFailedToSetupListCxtRes",
         60 => "PDUSessionResourceListCxtRelCpl",

@@ -286,7 +286,10 @@ fn decode_value(
             "qfi={}",
             *v.first().ok_or_else(|| format!("PFCP IE {t} is empty"))? & 0x3f
         )),
-        141 => Some(format!("user_id={}", pseudonym(pseudonym_key, "pfcp-user-id", v))),
+        141 => Some(format!(
+            "subscriber_pseudonym={}",
+            pseudonym(pseudonym_key, "pfcp-user-id", v)
+        )),
         159 => Some(format!("apn_dnn={}", decode_apn(v)?)),
         160 => Some(format!(
             "interface_type={}",

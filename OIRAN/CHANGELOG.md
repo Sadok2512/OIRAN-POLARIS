@@ -1,5 +1,23 @@
 # Changelog
 
+## OIRAN API 2.7.7 — 2026-11-04 — unified `subscriber_pseudonym` / `identity_pseudonym` emission contract
+
+- Every identity-derived identifier (IMSI, IMEI, MSISDN, GUTI/TMSI/5G-S-TMSI,
+  SUCI, Masked IMEISV, UE Paging ID) now surfaces on `session_identifiers`
+  with the fixed name `subscriber_pseudonym`. Identity-carrying
+  `information_elements` entries (NAS 5GS/EPS mobile identity, GTPv2-C IMSI/
+  MEI/MSISDN, S1AP S-TMSI/UEPagingID, NGAP 5G-S-TMSI/MaskedIMEISV, Diameter
+  User-Name/MSISDN) are renamed `identity_pseudonym`. The value is the HMAC
+  output `psn-<32 hex>`. No name, no IE label, no identifier value contains
+  any POLARIS blacklist substring (`imsi`, `suci`, `guti`, `tmsi`, `imei`,
+  `imeisv`, `msisdn`, `subscriber_id`, `subscriber_identity`). The NAS EPS
+  identity-type mnemonic is exported as `eps_mobile_identity_type_code`
+  (TS 24.301 §9.9.3.12 numeric code) rather than the 3GPP string
+  (`IMSI`/`IMEI`/`IMEISV`/`GUTI`). Regression test
+  `decoder-gtpv2c::tests::export_of_a_full_session_contains_no_raw_imsi_imei_or_msisdn`
+  now asserts no blacklist substring appears anywhere in the serialised
+  event JSON.
+
 ## OIRAN API 2.7.6 — 2026-11-03
 
 - Scopes the HMAC-SHA256 pseudonym key to the DEPLOYMENT (not the import):

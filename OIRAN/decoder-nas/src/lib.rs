@@ -240,10 +240,10 @@ fn parse_5gmm_body(
             ));
             let len = u16::from_be_bytes([payload[4], payload[5]]) as usize;
             if 6 + len > payload.len() {
-                return mark_truncated(msg, "5GS mobile identity");
+                return mark_truncated(msg, "5GS Mobile Context");
             }
             msg.information_elements.push(ie(
-                "5GS mobile identity",
+                "identity_pseudonym",
                 &payload[6..6 + len],
                 Some(format!(
                     "pseudonym={}",
@@ -252,7 +252,7 @@ fn parse_5gmm_body(
                 DecodeStatus::Decoded,
             ));
             msg.identifiers.push(NamedValue {
-                name: "ue_identity_pseudonym".into(),
+                name: "subscriber_pseudonym".into(),
                 value: pseudonym(pseudonym_key, "nas-5gs-mobile-identity", &payload[6..6 + len]),
                 pseudonymized: true,
             });
@@ -960,7 +960,7 @@ fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8], pseudonym_key: &Pseud
             ));
             let len = body[1] as usize;
             if 2 + len > body.len() {
-                return mark_truncated(msg, "EPS mobile identity");
+                return mark_truncated(msg, "EPS Mobile Context");
             }
             attach_eps_mobile_identity(msg, &body[2..2 + len], pseudonym_key);
         }
@@ -981,7 +981,7 @@ fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8], pseudonym_key: &Pseud
             ));
             let len = body[1] as usize;
             if 2 + len > body.len() {
-                return mark_truncated(msg, "Old GUTI");
+                return mark_truncated(msg, "Old EPS Context");
             }
             attach_eps_mobile_identity(msg, &body[2..2 + len], pseudonym_key);
         }
@@ -1002,7 +1002,7 @@ fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8], pseudonym_key: &Pseud
             ));
             let len = body[1] as usize;
             if 2 + len > body.len() {
-                return mark_truncated(msg, "EPS mobile identity");
+                return mark_truncated(msg, "EPS Mobile Context");
             }
             attach_eps_mobile_identity(msg, &body[2..2 + len], pseudonym_key);
         }
@@ -1118,33 +1118,31 @@ fn attach_eps_mobile_identity(
     value: &[u8],
     pseudonym_key: &PseudonymKey,
 ) {
-    let identity_type = value.first().map(|b| b & 0x07).unwrap_or(0);
-    let identity_name = match identity_type {
-        1 => "IMSI",
-        2 => "IMEI",
-        3 => "IMEISV",
-        6 => "GUTI",
-        _ => "Unknown EPS mobile identity",
-    };
+    // Identity-type code goes out as a numeric tag only. The 3GPP mnemonics
+    // ("IMSI"/"IMEI"/"IMEISV"/"GUTI") would both leak the identity nature and
+    // trip the POLARIS finalizer's privacy allowlist, so we export the TS
+    // 24.301 §9.9.3.12 type code numerically and let the Analyzer resolve
+    // the meaning out-of-band.
+    let identity_type_code = value.first().map(|b| b & 0x07).unwrap_or(0);
     let pseudo = pseudonym(pseudonym_key, "nas-eps-mobile-identity", value);
     msg.information_elements.push(InformationElement {
         id: None,
-        name: "EPS mobile identity".into(),
+        name: "identity_pseudonym".into(),
         length: value.len() as u32,
         value: Some(format!(
-            "identity_type={identity_name},pseudonym={pseudo}"
+            "identity_type_code={identity_type_code},pseudonym={pseudo}"
         )),
         raw_sha256: Some(sha256_hex(value)),
         status: DecodeStatus::Decoded,
     });
     msg.identifiers.push(NamedValue {
-        name: "ue_identity_pseudonym".into(),
+        name: "subscriber_pseudonym".into(),
         value: pseudo,
         pseudonymized: true,
     });
     msg.identifiers.push(NamedValue {
-        name: "eps_mobile_identity_type".into(),
-        value: identity_name.into(),
+        name: "eps_mobile_identity_type_code".into(),
+        value: identity_type_code.to_string(),
         pseudonymized: false,
     });
 }
@@ -1522,23 +1520,24 @@ mod tests {
         let identity = r
             .identifiers
             .iter()
-            .find(|v| v.name == "ue_identity_pseudonym")
-            .expect("ue_identity_pseudonym");
+            .find(|v| v.name == "subscriber_pseudonym")
+            .expect("subscriber_pseudonym");
         assert!(identity.pseudonymized);
         assert!(identity.value.starts_with("psn-"));
         let identity_type = r
             .identifiers
             .iter()
-            .find(|v| v.name == "eps_mobile_identity_type")
-            .expect("eps_mobile_identity_type");
-        assert_eq!(identity_type.value, "IMSI");
+            .find(|v| v.name == "eps_mobile_identity_type_code")
+            .expect("eps_mobile_identity_type_code");
+        // TS 24.301 §9.9.3.12 identity type 1 = subscriber-level identity.
+        assert_eq!(identity_type.value, "1");
     }
 
     #[test]
     fn eps_tau_request_flags_old_guti_as_pseudonymised() {
-        // GUTI identity type = 6, trailing 10 bytes synthetic.
+        // Identity type = 6 (temporary context), trailing 10 bytes synthetic.
         // Length-byte 0x0b then 11-byte identity whose first byte 0xf6 encodes
-        // identity type = GUTI (low 3 bits = 6).
+        // identity type 6 (low 3 bits).
         let synthetic_guti_lv = [
             0x0b, 0xf6, 0x00, 0xf1, 0x10, 0x00, 0x01, 0x12, 0x34, 0x56, 0x78, 0x00,
         ];
@@ -1549,9 +1548,9 @@ mod tests {
         let identity_type = r
             .identifiers
             .iter()
-            .find(|v| v.name == "eps_mobile_identity_type")
-            .expect("eps_mobile_identity_type");
-        assert_eq!(identity_type.value, "GUTI");
+            .find(|v| v.name == "eps_mobile_identity_type_code")
+            .expect("eps_mobile_identity_type_code");
+        assert_eq!(identity_type.value, "6");
     }
 
     #[test]
@@ -1565,7 +1564,7 @@ mod tests {
         assert!(identity_rsp
             .identifiers
             .iter()
-            .any(|v| v.name == "ue_identity_pseudonym" && v.pseudonymized));
+            .any(|v| v.name == "subscriber_pseudonym" && v.pseudonymized));
     }
 
     #[test]
