@@ -257,6 +257,13 @@ pub fn build_lte_callflow(
         .iter()
         .filter(|event| selected.contains(&event.event_id))
         .collect::<Vec<_>>();
+    // 2.7.13 PRESENTATION ORDER (ladder display only). The canonical
+    // processing order is `(capture_id, seq, event_id)` (see
+    // `session_engine::canonical_sort_key`); the ladder reorders those
+    // already-decided events by `timestamp_ns` purely as a human view.
+    // No session / correlation / dedup decision depends on this order:
+    // the records have already been selected into `session.event_ids`
+    // upstream.
     records.sort_by_key(|event| (event.timestamp_ns, event.packet_number(), &event.event_id));
     let mut participants: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut interfaces = BTreeSet::new();

@@ -115,37 +115,25 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
         events.push(event);
         Ok(())
     })?;
-    // 2.7.12: fully deterministic sort — the primary key is the exact
-    // packet time, the first tiebreak is the capture provenance
-    // (`capture_id`), the second is the per-capture packet sequence
-    // (`packet_number`), and the final tiebreak is the deterministic
-    // `event_id`. This removes the previous reliance on `sort_by_key`'s
-    // stable guarantee for parent/child events that share one SCTP
-    // packet and lets cross-capture merges in live-probe inherit an
-    // identical ordering contract.
-    events.sort_by(|left, right| {
-        let left_key = (
-            left.timestamp.seconds,
-            left.timestamp.nanoseconds,
-            left.capture_id.as_str(),
-            left.packet_references
+    // 2.7.13: canonical processing order is (capture_id, seq, event_id).
+    // The timestamp never participates in a processing sort — it may only
+    // be used as presentation when rendering the call-flow ladder in
+    // `callflow-schema`. Within one `decode_capture()` call every event
+    // carries the same `capture_id`, so the effective key becomes
+    // `(packet_number, event_id)`, which maps to the order events are
+    // emitted by the per-packet decoder (parent S1AP before NAS child).
+    let sort_key = |event: &NormalizedEvent| {
+        (
+            event.capture_id.clone(),
+            event
+                .packet_references
                 .first()
                 .map(|packet| packet.packet_number)
                 .unwrap_or(0),
-            left.event_id.as_str(),
-        );
-        let right_key = (
-            right.timestamp.seconds,
-            right.timestamp.nanoseconds,
-            right.capture_id.as_str(),
-            right.packet_references
-                .first()
-                .map(|packet| packet.packet_number)
-                .unwrap_or(0),
-            right.event_id.as_str(),
-        );
-        left_key.cmp(&right_key)
-    });
+            event.event_id.clone(),
+        )
+    };
+    events.sort_by(|left, right| sort_key(left).cmp(&sort_key(right)));
     Ok(DecodeOutput { events, report })
 }
 

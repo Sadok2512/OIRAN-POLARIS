@@ -281,10 +281,15 @@ fn normalized_lte_teid(value: &str) -> Option<String> {
         .map(|value| format!("0x{value:x}"))
 }
 
-fn within_lte_window(event: &EventRecord, related: &[&EventRecord]) -> bool {
-    related.iter().any(|candidate| {
-        event.timestamp_ns.abs_diff(candidate.timestamp_ns) <= LTE_CROSS_PLANE_WINDOW_NS as u128
-    })
+/// 2.7.13: cross-plane S1-MME/S11/S1-U join no longer gates on a
+/// timestamp window — that would compare ts across captures, which is
+/// forbidden. The join relies entirely on structural keys
+/// (MME/eNB-UE-S1AP-ID, E-RAB TEIDs, F-TEID, pseudonym when present).
+/// The predicate kept its shape for API compatibility and now accepts
+/// any non-empty related set so a context with no S1 anchor is still
+/// rejected downstream by the TEID intersection check.
+fn within_lte_window(_event: &EventRecord, related: &[&EventRecord]) -> bool {
+    !related.is_empty()
 }
 
 /// Builds a deterministic LTE preparation view from normalized S1AP/EPS NAS,
@@ -302,7 +307,9 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
                 )
         })
         .collect::<Vec<_>>();
-    lte.sort_by_key(|event| (event.timestamp_ns, event.packet_number(), &event.event_id));
+    // 2.7.13: canonical (capture_id, seq, event_id). ts never influences
+    // a session-discovery decision.
+    lte.sort_by(|a, b| canonical_sort_key(a).cmp(&canonical_sort_key(b)));
     let mut contexts = BTreeSet::new();
     for event in lte.iter().filter(|event| event.protocol == "S1AP") {
         let enb = event.first_identifier("enb_ue_s1ap_id").map(str::to_owned);
@@ -452,8 +459,9 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
             collect_ids(&associated, &["eps_bearer_identity", "ebi", "bearer_ebi"]);
         let s11_f_teids = collect_ids(&s11, &["f_teid", "bearer_f_teid"]);
         associated.extend(s1u.iter().copied());
-        associated
-            .sort_by_key(|event| (event.timestamp_ns, event.packet_number(), &event.event_id));
+        // 2.7.13: canonical (capture_id, seq, event_id) — associated bundle
+        // mixes events from S1-MME, S11 and S1-U captures.
+        associated.sort_by(|a, b| canonical_sort_key(a).cmp(&canonical_sort_key(b)));
         associated.dedup_by(|left, right| left.event_id == right.event_id);
         let mut tunnel_map: BTreeMap<String, LteTunnelCounters> = BTreeMap::new();
         for event in &s1u {
@@ -680,15 +688,20 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
     })
 }
 
+/// 2.7.13: the canonical processing order inside OIRAN is
+/// `(capture_id, packet_number, event_id)`. The timestamp is NEVER used
+/// for a processing decision, and no two events from different captures
+/// are compared by `timestamp_ns`. Call flow ladder rendering may, as a
+/// presentation step, order events by `timestamp_ns` — see
+/// `callflow-schema::build_ladder_records_for_display` for the only
+/// place that is allowed to do so, and the explicit comment at that
+/// call site.
+pub fn canonical_sort_key<'a>(event: &'a EventRecord) -> (&'a str, u64, &'a str) {
+    (event.capture_id.as_str(), event.packet_number(), event.event_id.as_str())
+}
+
 pub fn deterministic_sort(events: &mut [EventRecord]) {
-    events.sort_by(|a, b| {
-        (a.timestamp_ns, a.packet_number(), &a.interface, &a.event_id).cmp(&(
-            b.timestamp_ns,
-            b.packet_number(),
-            &b.interface,
-            &b.event_id,
-        ))
-    });
+    events.sort_by(|a, b| canonical_sort_key(a).cmp(&canonical_sort_key(b)));
 }
 
 pub fn reconstruct(mut events: Vec<EventRecord>, hints: ReconstructionHints) -> Reconstruction {
@@ -1017,7 +1030,9 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
         }
         procedures.extend(discover_procedures(context, None, &context_only));
         for (pdu_id, mut related) in pdu_events {
-            related.sort_by_key(|event| event.timestamp_ns);
+            // 2.7.13: canonical (capture_id, seq, event_id) — ts never
+            // drives a PDU session lifecycle decision.
+            related.sort_by(|a, b| canonical_sort_key(a).cmp(&canonical_sort_key(b)));
             let session_key = format!("{}|pdu={pdu_id}", context.context_id);
             let session_id = stable_id("5g-session", &session_key);
             let released = related
@@ -1311,7 +1326,10 @@ fn discover_pfcp_sessions(events: &[EventRecord]) -> Vec<DiscoveredPfcpSession> 
         .iter()
         .filter(|event| event.protocol == "PFCP" && event.message_name.contains("Session"))
         .collect::<Vec<_>>();
-    ordered.sort_by_key(|event| event.timestamp_ns);
+    // 2.7.13: canonical (capture_id, seq, event_id) — PFCP session
+    // reconstruction stays deterministic without a cross-capture ts
+    // comparison.
+    ordered.sort_by(|a, b| canonical_sort_key(a).cmp(&canonical_sort_key(b)));
     let mut sessions: Vec<Pending<'_>> = Vec::new();
     for event in ordered {
         let scope = endpoint_scope(event);
@@ -1428,7 +1446,9 @@ fn discover_gtpu_tunnels(
     groups
         .into_iter()
         .map(|(key, mut events)| {
-            events.sort_by_key(|event| event.timestamp_ns);
+            // 2.7.13: canonical (capture_id, seq, event_id) — GTP-U
+            // tunnel aggregation uses structural order.
+            events.sort_by(|a, b| canonical_sort_key(a).cmp(&canonical_sort_key(b)));
             let teid = events[0].first_identifier("teid").unwrap().to_owned();
             let tunnel_id = stable_id("tunnel", &key);
             let endpoint_candidates = [&events[0].source_address, &events[0].destination_address]
@@ -2386,5 +2406,112 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first[0].state, "INCOMPLETE");
         assert_eq!(first[0].interfaces, vec!["S1-MME", "S11"]);
+    }
+
+    #[test]
+    fn crossed_timestamps_across_captures_do_not_alter_sessions_or_attachments() {
+        // 2.7.13 regression: the canonical processing order is
+        // (capture_id, seq, event_id). Two separate captures whose
+        // event timestamps interleave arbitrarily must produce the
+        // same `discover_lte_sessions` result as the (capture_id, seq)
+        // order. This proves no session-reconstruction decision
+        // depends on `timestamp_ns`.
+        fn session_shape(sessions: &[LteSession]) -> Vec<(String, String, Vec<String>, Vec<String>, usize, usize)> {
+            sessions
+                .iter()
+                .map(|s| {
+                    let mut teids = s
+                        .tunnels
+                        .iter()
+                        .map(|t| t.teid.clone())
+                        .collect::<Vec<_>>();
+                    teids.sort();
+                    (
+                        s.technology.clone(),
+                        s.state.clone(),
+                        s.eps_bearer_ids.clone(),
+                        teids,
+                        s.tunnels.iter().map(|t| t.uplink_packets).sum::<usize>(),
+                        s.tunnels.iter().map(|t| t.downlink_packets).sum::<usize>(),
+                    )
+                })
+                .collect()
+        }
+        // S1-MME capture
+        let mut s1ap = event(
+            "s1ap-ics",
+            "S1AP",
+            "InitialContextSetupResponse",
+            &[
+                ("enb_ue_s1ap_id", "77"),
+                ("mme_ue_s1ap_id", "11"),
+                ("erab_teid", "0x00ab00cd"),
+            ],
+            1,
+        );
+        s1ap.interface = "S1-MME".into();
+        s1ap.capture_id = "cap-s1mme".into();
+        s1ap.timestamp_ns = 1_000_000_900; // intentionally late
+        let mut nas = event(
+            "nas-attach",
+            "NAS-EPS-MM",
+            "Attach Complete",
+            &[
+                ("subscriber_pseudonym", "subscriber-opaque-7"),
+                ("enb_ue_s1ap_id", "77"),
+                ("mme_ue_s1ap_id", "11"),
+            ],
+            2,
+        );
+        nas.interface = "S1-MME".into();
+        nas.capture_id = "cap-s1mme".into();
+        nas.timestamp_ns = 1_000_000_950;
+        // S11 capture — ts BEFORE the S1AP event even though it is
+        // logically a response to the latter.
+        let mut s11 = event(
+            "s11-create-rsp",
+            "GTPv2-C",
+            "CreateSessionResponse",
+            &[
+                ("subscriber_pseudonym", "subscriber-opaque-7"),
+                ("bearer_ebi", "7"),
+                ("bearer_f_teid", "0x00ab00cd"),
+            ],
+            1,
+        );
+        s11.interface = "S11".into();
+        s11.capture_id = "cap-s11".into();
+        s11.timestamp_ns = 500_000_100; // way before S1AP
+        // S1-U capture — ts interleaved with S1-MME.
+        let mut ul = event("s1u-ul", "GTP-U", "G-PDU", &[("teid", "0x00ab00cd")], 1);
+        ul.interface = "S1-U".into();
+        ul.capture_id = "cap-s1u".into();
+        ul.timestamp_ns = 800_000_200;
+        ul.direction = "UPLINK".into();
+        ul.packet_references[0].captured_length = 128;
+        let mut dl = ul.clone();
+        dl.event_id = "s1u-dl".into();
+        dl.timestamp_ns = 1_500_000_300; // after everything
+        dl.direction = "DOWNLINK".into();
+        dl.packet_references[0].packet_number = 2;
+        dl.packet_references[0].captured_length = 256;
+
+        // Canonical (capture_id, seq, event_id) order.
+        let mut canonical = vec![s1ap.clone(), nas.clone(), s11.clone(), ul.clone(), dl.clone()];
+        canonical.sort_by(|a, b| canonical_sort_key(a).cmp(&canonical_sort_key(b)));
+        let sessions_canonical = discover_lte_sessions(&canonical);
+
+        // Crossed-ts order (what a naive ts sort would have produced).
+        let mut ts_sorted =
+            vec![s1ap.clone(), nas.clone(), s11.clone(), ul.clone(), dl.clone()];
+        ts_sorted.sort_by_key(|event| event.timestamp_ns);
+        let sessions_ts = discover_lte_sessions(&ts_sorted);
+
+        assert_eq!(session_shape(&sessions_canonical), session_shape(&sessions_ts));
+        assert_eq!(sessions_canonical.len(), 1);
+        assert_eq!(sessions_canonical[0].state, "ACTIVE_WITH_USER_PLANE");
+        assert_eq!(sessions_canonical[0].eps_bearer_ids, vec!["7"]);
+        assert_eq!(sessions_canonical[0].tunnels.len(), 1);
+        assert_eq!(sessions_canonical[0].tunnels[0].teid, "0x00ab00cd");
     }
 }

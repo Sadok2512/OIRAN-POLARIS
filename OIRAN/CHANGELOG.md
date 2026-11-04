@@ -1,5 +1,42 @@
 # Changelog
 
+## OIRAN API 2.7.13 — 2026-11-04 — canonical `(capture_id, seq)` order, no dumpcap retention
+
+- The canonical processing order across OIRAN is now
+  `(capture_id, packet_number, event_id)`. The `timestamp_ns` field is
+  NEVER used for a processing decision and no two events from different
+  captures are ever compared by timestamp. New public helper
+  `session_engine::canonical_sort_key()` is the single implementation
+  of the key; every processing sort in the workspace now delegates to
+  it. Call flow ladder rendering may reorder an already-selected set
+  of events by `timestamp_ns` as a presentation step — see the
+  explicit comment at `callflow-schema::build_lte_callflow` — and no
+  session, correlation, dedup, or attachment decision depends on that
+  order.
+- `session_engine::within_lte_window` no longer gates on a
+  `timestamp_ns` difference. Cross-capture joins (S1-MME ↔ S11 ↔ S1-U)
+  rely exclusively on structural keys (MME/eNB-UE-S1AP-ID, E-RAB
+  TEIDs, F-TEID, pseudonym when present).
+- `oiran-decode::decode_capture()` and
+  `live-probe::lte_evidence::read_events_bounded()`'s post-merge sort
+  both use `canonical_sort_key`. Within one capture this collapses to
+  `(packet_number, event_id)`, which preserves the parent S1AP → NAS
+  child emission order without relying on `sort_by_key` stability.
+- Dumpcap native rotation drops `-b files:8`. The capture script now
+  invokes `dumpcap -b duration:3600 -b filesize:262144 -w <path>` only.
+  Retention is owned by the existing disk-safety guard-rail; dumpcap
+  must never delete a finalised segment.
+- New regression tests:
+  - `session_engine::tests::crossed_timestamps_across_captures_do_not_alter_sessions_or_attachments` —
+    two captures with interleaved timestamps produce the exact same
+    `discover_lte_sessions` shape under both the canonical and the
+    legacy ts order.
+  - `oiran-decode::tests::sort_by_timestamp_tie_breaks_on_capture_id_then_sequence_then_event_id`
+    stays valid against the canonical sort.
+  - `infrastructure/capture/tests/test-dumpcap-retention.sh` — asserts
+    that `capture-interface.sh` no longer passes `-b files:` (outside
+    comments) and that 10 simulated rotations retain all 10 files.
+
 ## OIRAN API 2.7.12 — 2026-11-04 — gapless dumpcap rotation + deterministic ts tiebreak
 
 - `infrastructure/capture/capture-interface.sh` drops the

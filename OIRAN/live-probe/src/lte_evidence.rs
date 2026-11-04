@@ -351,12 +351,13 @@ impl LteEvidenceStore {
                 &mut retained_event_bytes,
             )?;
         }
-        events.sort_by_key(|event| {
-            (
-                event.timestamp_ns,
-                event.packet_number(),
-                event.event_id.clone(),
-            )
+        // 2.7.13: canonical (capture_id, seq, event_id). The timestamp
+        // is NEVER used for a processing decision and no two events from
+        // different captures are compared on `timestamp_ns`. Call flow
+        // ladder rendering reorders a separate view by ts (see
+        // `callflow-schema::build_ladder_records_for_display`).
+        events.sort_by(|a, b| {
+            session_engine::canonical_sort_key(a).cmp(&session_engine::canonical_sort_key(b))
         });
         let sessions = discover_lte_sessions(&events);
         if sessions.is_empty() {

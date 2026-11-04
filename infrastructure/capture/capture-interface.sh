@@ -12,8 +12,13 @@ set -euo pipefail
 #                     seconds, without stopping the process.
 #   -b filesize:<k>   secondary cap (KiB) that forces earlier rotation when
 #                     a bursty interface overruns the duration budget.
-#   -b files:<n>      retention ring per label (oldest files pruned by
-#                     dumpcap itself).
+#
+# 2.7.13: `-b files:<n>` is DELIBERATELY NOT PASSED. dumpcap must not
+# prune segments on its own — ANR3 observed that the previous
+# `-b files:8` ring silently dropped older segments, breaking any
+# offline replay beyond the 8-file window. Retention is now entirely
+# owned by the disk safety guard-rail (disk-safety crate), which is the
+# only component with the authority to delete finalised capture files.
 #
 # Output naming: dumpcap inserts "_NNNNN_YYYYMMDDHHMMSS" between the
 # supplied prefix and the suffix, so each finalised segment keeps a UTC
@@ -39,14 +44,11 @@ command -v dumpcap >/dev/null 2>&1 || {
 
 duration=${OIRAN_CAPTURE_DURATION_S:-3600}
 filesize_kib=${OIRAN_CAPTURE_FILESIZE_KIB:-262144}
-ring_files=${OIRAN_CAPTURE_RING_FILES:-8}
 
 case "$duration" in ''|*[!0-9]*) echo "REFUSED: invalid duration: $duration" >&2; exit 65 ;; esac
 case "$filesize_kib" in ''|*[!0-9]*) echo "REFUSED: invalid filesize: $filesize_kib" >&2; exit 65 ;; esac
-case "$ring_files" in ''|*[!0-9]*) echo "REFUSED: invalid ring size: $ring_files" >&2; exit 65 ;; esac
 
 exec dumpcap -q -i "$iface" -f "$filter" \
   -b duration:"$duration" \
   -b filesize:"$filesize_kib" \
-  -b files:"$ring_files" \
   -w "$out_dir/$label/${label}_${stamp}.pcapng"
