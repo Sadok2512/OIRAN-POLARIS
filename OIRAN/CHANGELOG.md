@@ -1,5 +1,88 @@
 # Changelog
 
+## OIRAN API 2.7.16 — 2026-11-04 — API continuous projection + bounded-batch backpressure drain
+
+- `live-probe::CaptureManager::start_continuous_import` now recovers a
+  previously-published continuous dataset from
+  `<capture_root>/continuous-lab-import/dataset/dataset_manifest.json` into
+  the in-RAM `datasets` map before the import worker is spawned (new
+  `recover_continuous_dataset_from_disk`). Prior to this fix the API
+  process restarted with an empty `datasets` map, so `/sessions`,
+  `/datasets` and `/health` reported zero sessions for a continuous dataset
+  whose disk already held 25 537 events and 8 sessions (issue #9 part 1,
+  ANR2 diagnostic). The recovery reads only the manifest JSON (a few KiB);
+  `oiran_events.jsonl` and callflows stay on disk and are never pulled into
+  memory, preserving the 256 MiB continuous-import ceiling.
+- `apps/api::health` projects `capture_manager.datasets()` into the
+  response fields (`dataset`, `source_events`, `session_count`,
+  `ue_context_count`) when `Inner.flows` is empty (operational mode).
+  Reference mode still wins — the projection is a fallback, not an
+  override. The projection accumulates integer counters only, so a dataset
+  with 25 537 events adds a `usize` to the sum and nothing else.
+- `live-probe::run_continuous_import_inner` drains the pending-segment
+  queue in bounded batches of at most `MAX_INGESTED_SEGMENTS_PER_SCAN = 32`
+  (`live-probe/src/lib.rs:62`). Before this patch the per-candidate loop
+  tried to admit every candidate before publishing, so a burst of 212
+  segments observed in the lab (issue #9 part 2) could exhaust the eviction
+  budget at `live-probe/src/lib.rs:1961-1992`, trip
+  `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT`, set `terminal_error`, and
+  `return Ok(())` from the worker — leaving the pending-segments counter
+  stuck at 212 forever. The patch:
+  * bounds the per-scan ingestion count so each outer-loop iteration
+    publishes what it has and sleeps before taking the next batch;
+  * stops treating `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT` as a terminal
+    error — the worker now records `CaptureState::Blocked` with the
+    stop_reason set but continues the outer loop, so eviction+publish on
+    the next scan drains the queue. Non-recoverable terminals
+    (`CONTINUOUS_IMPORT_DISK_POLICY_STOP` et al.) still end the worker.
+  * no segment is lost: the tripped candidate's checksum is never added
+    to `seen_checksums` (commit point is `persist_published_checksums`
+    after a successful publish), so the next scan re-discovers it.
+- `correlation-engine` now emits an explicit N4↔N3 `CorrelationEdge` via
+  the new `pfcp-outer-header-matches-gtpu-tunnel` rule. The rule matches a
+  PFCP F-TEID or Update-FAR outer-header-creation `(ipv4, teid)` tuple
+  against the destination endpoint + `teid` identifier of N3 GTP-U events
+  in the same capture scope. Uniqueness is enforced on the N4 side
+  (reused F-TEID → no edge); the N3 side aggregates all G-PDUs sharing
+  the tuple into one edge with `gtpu_frame_count=<n>` and selects the
+  deterministic representative via the canonical
+  `(capture_id, packet_number, event_id)` sort key — never a timestamp.
+  Covers DSN-ENGINE-002 from the independent audit
+  (`AUDIT_E2E_CERT_001` / `FINAL_CERTIFICATION_REPORT.md`).
+- `correlation-engine::capture_scope` now falls back to the parent
+  directory of `source_file` when the `/captures/<scope>/` marker is
+  absent, so a dataset rooted under `datasets/<scope>/*.pcapng` unifies
+  N2, N3 and N4 under a single scope. Previously the fallback keyed on the
+  per-file `capture_id` SHA-256, which was always distinct across planes
+  and forbade any cross-interface match on a fixture dataset. Covers
+  DSN-SCOPE-001 from the audit.
+- Regression tests (all green under `cargo test --workspace --locked
+  --release`, 364 passed / 0 failed / 4 ignored):
+  * `correlation_engine::tests::n4_n3_rule_publishes_one_exact_edge_per_matching_tunnel`
+    — single N4 F-TEID + 3 N3 G-PDUs → one EXACT edge with
+    `gtpu_frame_count=3` and `capture_scope=AUDIT`.
+  * `correlation_engine::tests::n4_n3_rule_is_fail_closed_when_the_pfcp_teid_is_reused`
+    — ambiguous N4 F-TEID across two PFCP responses → no edge.
+  * `correlation_engine::tests::capture_scope_fallback_unifies_planes_under_dataset_directory`
+    — `datasets/<X>/N3.pcapng` → `<X>`; `/var/lib/oiran/captures/<Y>/N3.pcapng` → `<Y>`.
+- Replay of the audit's negative-test harness
+  (`AUDIT_E2E_CERT_001_scripts/02-negative-tests.py`) confirms the 9-case
+  truth table is unchanged: no false positives, fail-closed on duplicate
+  TEIDs / multiple candidates / partial captures / duplicate events, and
+  still time-independent on clock skew / reversed order.
+- Replay of `evidence-replay` on
+  `datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl` now yields
+  **2 EXACT N4↔N3 edges** (uplink `0x96a8 @ 10.77.22.13` and downlink
+  `0x3 @ 10.77.22.20`), up from 0 in 2.7.15. The N2↔N4 bridge still
+  requires the dataset events to be regenerated with the current
+  decoder-ngap (which already emits `item_0_tunnel_ip_ul` /
+  `item_0_gtp_teid_ul`, see `decoder-ngap/src/lib.rs:500-507` and
+  `:542-548`); the shipped jsonl predates that decoder and only carries
+  `nested_transfer_sha256`. DSN-ENGINE-001 therefore becomes a fixture
+  regeneration chore, not a code gap.
+- Versions: `apps/api` 2.7.15 → 2.7.16; `live-probe` 0.4.2 → 0.4.3;
+  `correlation-engine` 0.5.1 → 0.5.2.
+
 ## OIRAN API 2.7.15 — 2026-11-04 — session consolidation + typed packet counters
 
 - `session-engine::discover_lte_sessions` now consolidates S1AP

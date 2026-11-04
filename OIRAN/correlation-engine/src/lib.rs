@@ -7,11 +7,15 @@ use session_engine::{
 };
 use std::collections::BTreeMap;
 
-pub const VERSION: &str = "0.5.1";
+pub const VERSION: &str = "0.5.2";
 pub const RULE_VERSION: &str = "1.0.0";
 pub const DISCOVERY_RULE_VERSION: &str = "1.1.0";
 pub const SBI_RULE_VERSION: &str = "1.0.0";
 pub const E2E_EVIDENCE_RULE_VERSION: &str = "2.0.0";
+/// 2.7.16 — N4↔N3 edge rule publishes the PFCP F-TEID / outer-header-creation
+/// evidence that was previously hidden inside session-engine's gtpu_tunnels
+/// discovery. See DSN-ENGINE-002 in AUDIT_E2E_CERT_001.
+pub const N4_N3_RULE_VERSION: &str = "1.0.0";
 pub const LTE_RULE_VERSION: &str = "1.1.0-offline.1";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -22,14 +26,28 @@ struct TunnelCorrelationKey {
 }
 
 fn capture_scope(event: &EventRecord) -> String {
+    // 2.7.16 (DSN-SCOPE-001): when `source_file` carries the live-probe
+    // convention `/captures/<scope>/<pcapng>`, extract <scope>. Fall back
+    // to the parent-directory segment of the source file (works for
+    // dataset fixtures rooted under `datasets/<scope>/<pcapng>`), and
+    // finally to the per-file capture_id — which only unifies within a
+    // single plane and is therefore a last resort. Prior to this fix a
+    // continuous or fixture dataset whose planes each carried their own
+    // pcapng SHA-256 would never match across N2/N4/N3 because the
+    // fallback keyed on the sha. See AUDIT_E2E_CERT_001.
     event
         .packet_references
         .first()
         .and_then(|packet| {
-            let marker = "/captures/";
-            let start = packet.source_file.find(marker)? + marker.len();
-            let rest = &packet.source_file[start..];
-            Some(rest.split('/').next()?.to_owned())
+            if let Some(start) = packet.source_file.find("/captures/") {
+                let rest = &packet.source_file[start + "/captures/".len()..];
+                return rest.split('/').next().map(str::to_owned);
+            }
+            let path = std::path::Path::new(&packet.source_file);
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
         })
         .unwrap_or_else(|| event.capture_id.clone())
 }
@@ -176,6 +194,94 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
             edges.push(found);
         }
     }
+
+    // 2.7.16 (DSN-ENGINE-002): publish the N4↔N3 edge that session-engine
+    // already knew about via gtpu_tunnels but never emitted as a
+    // CorrelationEdge. For every N4 PFCP event that exposes a (ipv4, teid)
+    // F-TEID pair, find the N3 GTP-U events whose destination endpoint IP
+    // and teid session identifier match byte-perfectly within the same
+    // capture scope. The N3 side is anchored on `destination_address`
+    // (where the tunnel terminates — the owner of the F-TEID), not on any
+    // timestamp. Multi-match → fail-closed, no edge.
+    let n4_tunnels = events
+        .iter()
+        .filter(|event| event.interface == "N4" && event.protocol == "PFCP")
+        .flat_map(|event| {
+            tunnel_keys(event)
+                .into_iter()
+                .map(move |key| (event, key))
+        })
+        .collect::<Vec<_>>();
+    let n3_tunnels = events
+        .iter()
+        .filter(|event| event.interface == "N3" && event.protocol == "GTP-U")
+        .filter_map(|event| {
+            let teid = event.first_identifier("teid").and_then(normalize_teid)?;
+            Some((
+                event,
+                TunnelCorrelationKey {
+                    endpoint_ip: event.destination_address.clone(),
+                    teid,
+                    capture_id: capture_scope(event),
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    // Deduplicate N3 keys so a 10-packet uplink flow does not look like
+    // 10 ambiguous candidates against the single N4 F-TEID.
+    let mut n3_by_key = BTreeMap::<TunnelCorrelationKey, Vec<&EventRecord>>::new();
+    for (event, key) in &n3_tunnels {
+        n3_by_key.entry(key.clone()).or_default().push(*event);
+    }
+    for (n4, key) in &n4_tunnels {
+        let Some(n3_group) = n3_by_key.get(key) else {
+            continue;
+        };
+        let n4_duplicates = n4_tunnels
+            .iter()
+            .filter(|(_, candidate)| candidate == key)
+            .count();
+        if n4_duplicates != 1 {
+            continue;
+        }
+        // The deterministic representative is the first N3 event ordered
+        // by (capture_id, packet_number, event_id) — canonical sort key.
+        let mut representative = n3_group.clone();
+        representative.sort_by(|a, b| {
+            (
+                a.capture_id.as_str(),
+                a.packet_number(),
+                a.event_id.as_str(),
+            )
+                .cmp(&(
+                    b.capture_id.as_str(),
+                    b.packet_number(),
+                    b.event_id.as_str(),
+                ))
+        });
+        let n3 = representative[0];
+        let mut found = edge(
+            n4,
+            n3,
+            vec![
+                format!("endpoint_ip={}", key.endpoint_ip),
+                format!("teid={}", key.teid),
+                format!("capture_scope={}", key.capture_id),
+                format!("gtpu_frame_count={}", n3_group.len()),
+            ],
+            "pfcp-outer-header-matches-gtpu-tunnel",
+            "EXACT",
+            "A unique PFCP F-TEID or Update-FAR outer-header-creation (endpoint_ip, teid) equals the N3 GTP-U tunnel terminus in the same capture scope",
+        );
+        found.rule_version = N4_N3_RULE_VERSION.into();
+        found.evidence_type = "EXACT_TUNNEL_MATCH".into();
+        found.scope = "tunnel-only".into();
+        found.limitations = vec![
+            "The tunnel match confirms the user-plane carrier but does not by itself prove UE identity".into(),
+        ];
+        edges.push(found);
+    }
+
     edges.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
     edges
 }
@@ -1281,5 +1387,132 @@ mod tests {
                 2
             );
         }
+    }
+
+    // --- 2.7.16: DSN-ENGINE-002 and DSN-SCOPE-001 regression coverage ---
+
+    /// Builds an EventRecord whose packet_references[0].source_file is rooted
+    /// under `datasets/<scope>/` so capture_scope() falls back to the
+    /// parent-directory segment and unifies N2, N3 and N4 under one scope.
+    fn scoped(
+        id: &str,
+        iface: &str,
+        protocol: &str,
+        name: &str,
+        packet: u64,
+        ids: &[(&str, &str)],
+        ie: serde_json::Value,
+        destination: &str,
+        scope: &str,
+    ) -> EventRecord {
+        let mut event = e(id, iface, protocol, name, packet, ids, ie);
+        event.destination_address = destination.into();
+        event.packet_references[0].source_file = format!("datasets/{scope}/{iface}.pcapng");
+        event.capture_id = format!("sha256:{iface}-per-plane-{scope}");
+        event
+    }
+
+    #[test]
+    fn n4_n3_rule_publishes_one_exact_edge_per_matching_tunnel() {
+        // One UPF F-TEID on N4 → 3 G-PDUs on N3 at the same (endpoint, TEID).
+        let n4 = scoped(
+            "n4-up",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            10,
+            &[("pfcp_sequence", "93"), ("f_seid", "0x1a8")],
+            json!([
+                {"value":"f_seid=0x35e,v4=true,v6=false,ipv4=10.77.23.13"},
+                {"value":"teid=0x000096a8,v4=true,v6=false,ipv4=10.77.22.13"}
+            ]),
+            "10.77.23.12",
+            "AUDIT",
+        );
+        let n3a = scoped(
+            "n3-1", "N3", "GTP-U", "G-PDU", 1, &[("teid", "0x000096a8")],
+            json!([]), "10.77.22.13", "AUDIT",
+        );
+        let n3b = scoped(
+            "n3-2", "N3", "GTP-U", "G-PDU", 2, &[("teid", "0x000096a8")],
+            json!([]), "10.77.22.13", "AUDIT",
+        );
+        let n3c = scoped(
+            "n3-3", "N3", "GTP-U", "G-PDU", 3, &[("teid", "0x000096a8")],
+            json!([]), "10.77.22.13", "AUDIT",
+        );
+        let edges = correlate_cross_interface_evidence(&[n4, n3a, n3b, n3c]);
+        let n4_n3 = edges
+            .iter()
+            .filter(|e| e.rule_id == "pfcp-outer-header-matches-gtpu-tunnel")
+            .collect::<Vec<_>>();
+        assert_eq!(n4_n3.len(), 1, "exactly one N4↔N3 edge");
+        assert_eq!(n4_n3[0].confidence, "EXACT");
+        assert_eq!(n4_n3[0].rule_version, N4_N3_RULE_VERSION);
+        assert!(n4_n3[0]
+            .matching_identifiers
+            .iter()
+            .any(|id| id == "capture_scope=AUDIT"));
+        assert!(n4_n3[0]
+            .matching_identifiers
+            .iter()
+            .any(|id| id == "gtpu_frame_count=3"));
+        assert_eq!(n4_n3[0].source_event_id, "n4-up");
+        // First representative by canonical (capture_id, packet_number, event_id).
+        assert_eq!(n4_n3[0].target_event_id, "n3-1");
+    }
+
+    #[test]
+    fn n4_n3_rule_is_fail_closed_when_the_pfcp_teid_is_reused() {
+        let n4_a = scoped(
+            "n4-a",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            1,
+            &[("pfcp_sequence", "1")],
+            json!([{"value":"teid=0x000096a8,v4=true,v6=false,ipv4=10.77.22.13"}]),
+            "10.77.23.12",
+            "DUP",
+        );
+        let n4_b = scoped(
+            "n4-b",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            2,
+            &[("pfcp_sequence", "2")],
+            json!([{"value":"teid=0x000096a8,v4=true,v6=false,ipv4=10.77.22.13"}]),
+            "10.77.23.12",
+            "DUP",
+        );
+        let n3 = scoped(
+            "n3-1", "N3", "GTP-U", "G-PDU", 3, &[("teid", "0x000096a8")],
+            json!([]), "10.77.22.13", "DUP",
+        );
+        let edges = correlate_cross_interface_evidence(&[n4_a, n4_b, n3]);
+        assert!(
+            edges
+                .iter()
+                .all(|e| e.rule_id != "pfcp-outer-header-matches-gtpu-tunnel"),
+            "ambiguous N4 F-TEID must not produce an edge",
+        );
+    }
+
+    #[test]
+    fn capture_scope_fallback_unifies_planes_under_dataset_directory() {
+        // Each plane has its own per-file capture_id; only the parent dir is
+        // shared. Prior to 2.7.16 this disjoint SHA fallback prevented any
+        // cross-interface match. The fix: fall back to the parent-dir name.
+        let event = scoped(
+            "p", "N3", "GTP-U", "G-PDU", 1, &[("teid", "0x1")],
+            json!([]), "10.0.0.1", "OIRAN_5G_PDU_SESSION_DATA_V1",
+        );
+        assert_eq!(capture_scope(&event), "OIRAN_5G_PDU_SESSION_DATA_V1");
+        // Backwards-compat: the `/captures/<scope>/` convention still wins.
+        let mut live = event.clone();
+        live.packet_references[0].source_file =
+            "/var/lib/oiran/captures/continuous-lab-import/N3.pcapng".into();
+        assert_eq!(capture_scope(&live), "continuous-lab-import");
     }
 }

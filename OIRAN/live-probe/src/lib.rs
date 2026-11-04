@@ -39,7 +39,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const VERSION: &str = "0.4.2";
+pub const VERSION: &str = "0.4.3";
 /// Bounded read-chunk size for streaming file I/O; chosen so SHA-256 and pcap
 /// record counting operate on ≤ 1 MiB in memory regardless of input file size.
 const STREAM_CHUNK_BYTES: usize = 1 << 20;
@@ -49,6 +49,14 @@ const MAX_CONTINUOUS_EVENTS: usize = 50_000;
 const MAX_N3_FLOW_AGGREGATES: usize = 4096;
 const MAX_CONTINUOUS_DERIVED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SOURCE_CANDIDATES: usize = 512;
+/// 2.7.16: per-scan ingestion ceiling. The lab collector can land tens or
+/// hundreds of segments in a single rotation window. Prior to this ceiling
+/// the import worker tried to admit every candidate in one iteration, so a
+/// single backpressure trip at the end of the batch would exit the worker
+/// via `terminal_error` and the queue stayed full (issue #9: 212 segments
+/// pending). The ceiling forces periodic publish+sleep so pending_segments
+/// drains monotonically even under burst.
+const MAX_INGESTED_SEGMENTS_PER_SCAN: usize = 32;
 pub const MAX_OFFLINE_LTE_SESSIONS: usize = 128;
 pub const DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONTINUOUS_SEEN: usize = 4096;
@@ -941,6 +949,15 @@ impl CaptureManager {
         fs::create_dir_all(base.join("pcap")).map_err(display_error)?;
         self.continuous_stop.store(false, Ordering::Release);
         *self.continuous_runtime_evidence.lock().unwrap() = config.runtime_pdu_evidence.clone();
+        // 2.7.16 (issue #9 part 1): a previous worker may have published a
+        // dataset to disk at `base/dataset/dataset_manifest.json`. The import
+        // state tracks seen_checksums (so no segment is re-ingested), but the
+        // in-RAM `datasets` map is empty on process restart. Without this
+        // pre-seed, /health and /sessions report zero events until a NEW
+        // segment lands and the worker re-publishes — stale datasets on disk
+        // are invisible to the API. Recover them synchronously here so the
+        // API projection sees the right numbers immediately.
+        self.recover_continuous_dataset_from_disk(&base)?;
         let job = CaptureJob {
             capture_id: CONTINUOUS_CAPTURE_ID.into(),
             probe_id: PROBE_ID.into(),
@@ -1918,6 +1935,10 @@ impl CaptureManager {
             let mut changed = !pending_publication.is_empty();
             let prior_state = state.clone();
             let mut terminal_error = None;
+            // 2.7.16: track ingestions since the last publish so we force a
+            // bounded-batch commit even under burst. See
+            // MAX_INGESTED_SEGMENTS_PER_SCAN.
+            let mut ingested_this_scan: usize = 0;
             for candidate in candidates {
                 if state.seen_checksums.contains(&candidate.checksum) {
                     continue;
@@ -2070,6 +2091,16 @@ impl CaptureManager {
                 );
                 pending_publication.push(candidate.checksum);
                 changed = true;
+                ingested_this_scan = ingested_this_scan.saturating_add(1);
+                // 2.7.16: force a publish+sleep every MAX_INGESTED_SEGMENTS_PER_SCAN
+                // candidates so the queue drains monotonically. Remaining
+                // candidates will be re-discovered on the next scan because
+                // their checksums have not yet been persisted into
+                // seen_checksums (that happens only after a successful
+                // publish at persist_published_checksums below).
+                if ingested_this_scan >= MAX_INGESTED_SEGMENTS_PER_SCAN {
+                    break;
+                }
             }
             let mut published = !changed;
             if changed {
@@ -2149,13 +2180,23 @@ impl CaptureManager {
                 return Ok(());
             }
             if let Some((error, reason)) = terminal_error {
+                // 2.7.16: backpressure is recoverable. The candidate that
+                // tripped the limit is not in seen_checksums yet (we only
+                // commit after publish), so the next scan will re-discover
+                // it once eviction frees space. Only DISK_SAFETY_POLICY and
+                // other non-recoverable terminals exit the worker.
+                let recoverable = error == "CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT";
                 self.update(CONTINUOUS_CAPTURE_ID, |job| {
                     job.state = CaptureState::Blocked;
                     job.error = Some(error.into());
                     job.stop_reason = Some(reason.into());
-                    job.ended_epoch_ms = Some(epoch_ms());
+                    if !recoverable {
+                        job.ended_epoch_ms = Some(epoch_ms());
+                    }
                 })?;
-                return Ok(());
+                if !recoverable {
+                    return Ok(());
+                }
             }
             thread::sleep(config.scan_interval.min(Duration::from_secs(30)));
         }
@@ -2850,6 +2891,30 @@ impl CaptureManager {
             .lock()
             .unwrap()
             .insert(dataset.dataset_id.clone(), dataset);
+        Ok(())
+    }
+
+    /// 2.7.16 (issue #9 part 1): rehydrate `datasets[CONTINUOUS_DATASET_ID]`
+    /// from the persisted `dataset_manifest.json` written by a prior worker.
+    /// Reads only the manifest file (a few KiB of JSON) — events.jsonl and
+    /// callflows stay on disk and are never materialised into memory, so the
+    /// 256 MiB memory ceiling is preserved. Missing manifest → no-op.
+    fn recover_continuous_dataset_from_disk(&self, base: &Path) -> Result<(), String> {
+        let dataset_dir = base.join("dataset");
+        let manifest_path = dataset_dir.join("dataset_manifest.json");
+        if !manifest_path.is_file() {
+            return Ok(());
+        }
+        let bytes = fs::read(&manifest_path).map_err(display_error)?;
+        let dataset: LiveDataset =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if dataset.dataset_id != CONTINUOUS_DATASET_ID {
+            return Err("CONTINUOUS_DATASET_IDENTIFIER_MISMATCH".into());
+        }
+        // validate_dataset_artifacts re-checks that events.jsonl and every
+        // referenced callflow is on disk under `dataset_dir` with the recorded
+        // SHA-256. Any drift → refuse to publish a stale projection.
+        self.upsert_dataset(dataset, &dataset_dir)?;
         Ok(())
     }
 

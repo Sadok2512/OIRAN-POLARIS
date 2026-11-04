@@ -174,7 +174,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "correlation-engine"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "callflow-schema",
  "serde",
@@ -441,7 +441,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "live-probe"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "callflow-renderer",
  "callflow-schema",
@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.7.15"
+version = "2.7.16"
 dependencies = [
  "axum",
  "callflow-renderer",

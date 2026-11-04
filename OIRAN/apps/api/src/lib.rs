@@ -622,19 +622,43 @@ fn live_flow_for(state: &AppState, id: &str) -> Option<(String, CallFlow)> {
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
-    let source_events = state
+    // Reference mode populates `Inner.flows / Inner.manifest / Inner.discovery`
+    // at startup. Operational mode leaves them empty by design and projects
+    // its liveness via `capture_manager.datasets()`; without 2.7.16 the API
+    // reported `dataset=null, source_events=0, session_count=0` for a
+    // continuous dataset whose disk already held 25 537 events and 8
+    // sessions (issue #9 part 1, ANR2 diagnostic). We project the manager's
+    // LiveDataset summaries (not the events) into the health response, so
+    // /health and /sessions agree with dataset_manifest.json on disk.
+    let mut source_events = state
         .inner
         .flows
         .values()
         .map(|flow| flow.accounting.source_events)
         .sum::<usize>();
+    let mut session_count = state.inner.flows.len();
+    let mut ue_context_count = state.inner.discovery.ue_contexts.len();
+    let mut dataset = state.inner.manifest.get("scenario_id").cloned();
+    if session_count == 0 {
+        for live in state.inner.capture_manager.datasets() {
+            source_events = source_events.saturating_add(live.event_count);
+            session_count = session_count.saturating_add(live.session_ids.len());
+            if let Some(discovery) = &live.discovery {
+                ue_context_count =
+                    ue_context_count.saturating_add(discovery.ue_contexts.len());
+            }
+            if dataset.is_none() {
+                dataset = Some(Value::String(live.dataset_id.clone()));
+            }
+        }
+    }
     ok(json!({
         "status":"healthy",
         "mode":"LIVE_CAPTURE_CAPABLE_EXECUTION_GATED",
-        "dataset":state.inner.manifest.get("scenario_id"),
+        "dataset":dataset,
         "source_events":source_events,
-        "session_count":state.inner.flows.len(),
-        "ue_context_count":state.inner.discovery.ue_contexts.len(),
+        "session_count":session_count,
+        "ue_context_count":ue_context_count,
         "capabilities":{"live_capture":true,"capture_control":state.inner.capture_manager.execution_enabled(),"session_analysis":true,"multi_session":true,"dataset_registry":true,"packet_analysis":true,"exports":true,"future_sse":false}
     }))
 }
