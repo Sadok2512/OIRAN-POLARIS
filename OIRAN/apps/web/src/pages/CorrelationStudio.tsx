@@ -4,15 +4,14 @@ import { useNavigate, useParams } from 'react-router-dom';
 import type { ColumnDef } from '@tanstack/react-table';
 import { Braces, GitMerge, Link2, Network } from 'lucide-react';
 import { api } from '../services/api';
-import type { CallFlow, CorrelationEdge, Dataset, Session, UeContext } from '../types/api';
+import type { CallFlow, CorrelationEdge, Dataset, Session, SessionCorrelations, UeContext } from '../types/api';
 import { LoadingState, ErrorState, EmptyState } from '../components/AsyncState';
 import { MetricStrip } from '../components/MetricStrip';
 import { DataTable } from '../components/DataTable';
 import { StatusBadge } from '../components/StatusBadge';
+import { assessCorrelations } from '../correlation/statusMapping';
 
 type Rule={rule_id:string;version:string;classification:string;read_only:boolean;description:string};
-type Correlations={status:CallFlow['correlation_status'];edges:CorrelationEdge[]};
-
 export function CorrelationStudio(){
   const navigate=useNavigate(),{sessionId}=useParams();
   const [selected,setSelected]=useState<CorrelationEdge>(),[tab,setTab]=useState('correlated'),[dataset,setDataset]=useState(''),[ue,setUe]=useState(''),[iface,setIface]=useState('');
@@ -22,7 +21,7 @@ export function CorrelationStudio(){
   const sessions=useQuery({queryKey:['correlation-sessions',sessionParams.toString()],queryFn:()=>api<Session[]>(`/sessions?${sessionParams}`).then(x=>x.data)});
   const activeSession=sessionId??sessions.data?.[0]?.session_id;
   const flow=useQuery({queryKey:['callflow',activeSession],queryFn:()=>api<CallFlow>(`/sessions/${activeSession}/callflow`).then(x=>x.data),enabled:!!activeSession});
-  const correlations=useQuery({queryKey:['session-correlations',activeSession],queryFn:()=>api<Correlations>(`/sessions/${activeSession}/correlations`).then(x=>x.data),enabled:!!activeSession});
+  const correlations=useQuery({queryKey:['session-correlations',activeSession],queryFn:()=>api<SessionCorrelations>(`/sessions/${activeSession}/correlations`).then(x=>x.data),enabled:!!activeSession,staleTime:0,refetchOnMount:'always'});
   const rules=useQuery({queryKey:['rules'],queryFn:()=>api<Rule[]>('/correlation/rules').then(x=>x.data)});
   const edgeData=(correlations.data?.edges??[]).filter(edge=>!iface||edge.source_interface===iface||edge.target_interface===iface);
   const columns=useMemo<ColumnDef<CorrelationEdge>[]>(()=>[
@@ -37,8 +36,9 @@ export function CorrelationStudio(){
   const error=datasets.error||ues.error||sessions.error||flow.error||correlations.error||rules.error;if(error)return <ErrorState error={error as Error} retry={()=>{void datasets.refetch();void ues.refetch();void sessions.refetch();void flow.refetch();void correlations.refetch();void rules.refetch()}}/>;
   if(!activeSession)return <EmptyState title="No reconstructed sessions">Select another dataset or UE context.</EmptyState>;
   const exact=edgeData.filter(edge=>edge.confidence==='EXACT').length,strong=edgeData.filter(edge=>edge.confidence==='STRONG').length,possible=edgeData.filter(edge=>edge.confidence==='POSSIBLE'||edge.confidence==='UNKNOWN').length;
+  const e2eAssessment=flow.data&&correlations.data?assessCorrelations(flow.data.technology,flow.data.interfaces,correlations.data.status,correlations.data.edges).find(item=>item.key==='E2E'):undefined;
   return <div className="page-stack">
-    <section className="page-intro"><div><p className="eyebrow">INVESTIGATION</p><h1>Correlation Studio</h1><p>Session-scoped evidence generated exclusively by the Rust correlation engine.</p></div><StatusBadge value={`E2E_${flow.data?.correlation_status.E2E}`}/></section>
+    <section className="page-intro"><div><p className="eyebrow">INVESTIGATION</p><h1>Correlation Studio</h1><p>Session-scoped evidence generated exclusively by the Rust correlation engine.</p></div><StatusBadge value={`E2E_${e2eAssessment?.status??'NOT_EVALUATED'}`}/></section>
     <section className="filterbar"><select aria-label="Correlation dataset" value={dataset} onChange={event=>{setDataset(event.target.value);setSelected(undefined)}}><option value="">All datasets</option>{datasets.data?.map(item=><option value={item.dataset_id} key={item.dataset_id}>{item.display_name}</option>)}</select><select aria-label="Correlation UE" value={ue} onChange={event=>{setUe(event.target.value);setSelected(undefined)}}><option value="">All UE contexts</option>{ues.data?.map(item=><option value={item.ue_context_id} key={item.ue_context_id}>{item.ue_pseudonym}</option>)}</select><select aria-label="Correlation session" value={activeSession} onChange={event=>{navigate(`/investigation/correlation/${event.target.value}`);setSelected(undefined)}}>{sessions.data?.map(item=><option value={item.session_id} key={item.session_id}>{item.session_id} · PDU {item.pdu_session_id}</option>)}</select><select aria-label="Correlation interface" value={iface} onChange={event=>setIface(event.target.value)}><option value="">All interfaces</option><option>N2</option><option>N4</option><option>N3</option><option>S1-MME</option><option>S11</option><option>S1-U</option></select></section>
     <MetricStrip items={[{label:'Reconstructed sessions',value:sessions.data?.length??0},{label:'Correlation edges',value:edgeData.length},{label:'Exact links',value:exact,tone:'good'},{label:'Strong links',value:strong},{label:'Possible / Unknown',value:possible}]}/>
     <section className="correlation-grid"><div className="panel graph-panel"><div className="panel-head"><div><h2>Cross-interface graph</h2><p>Graph for <span className="mono">{activeSession}</span>.</p></div><Network/></div><CorrelationGraph edges={edgeData} selected={selected?.edge_id} onSelect={setSelected}/></div><div className="panel evidence-panel"><div className="panel-head"><div><h2>Evidence Inspector</h2><p>Rule-backed packet evidence.</p></div><GitMerge/></div>{selected?<EdgeInspector edge={selected}/>:<EmptyState title="Select a graph or table edge"/>}</div></section>
