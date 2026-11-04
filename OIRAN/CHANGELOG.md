@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.7.17 — 2026-11-04 — release identity correction
+
+- Align the API package version, `/api/v1/version` response and version
+  regression test on `2.7.17`. The 2.7.16 source package still exposed
+  API and platform version `2.7.15`, so its production deployment was
+  rejected and rolled back before certification.
+- No capture, import, correlation or privacy behavior changes relative to
+  2.7.16.
+
 ## OIRAN API 2.7.16 — 2026-11-04 — API continuous projection + bounded-batch backpressure drain
 
 - `live-probe::CaptureManager::start_continuous_import` now recovers a
