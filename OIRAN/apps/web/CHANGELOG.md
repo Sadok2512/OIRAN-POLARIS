@@ -2,6 +2,18 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.7.2 — 2026-11-04 (correlation API/UI parity)
+
+- Read bridge evidence from the session correlation endpoint instead of the
+  intentionally edge-free paginated Call Flow response.
+- Map engine evidence conservatively to `CORRELATED`, `NOT_CORRELATED`,
+  `NO_DATA`, `MISSING_KEY`, `AMBIGUOUS`, `NOT_EVALUATED`, or `UNSUPPORTED`;
+  no missing value is promoted to a pass.
+- Show the exact mapping reason, engine status, evidence/event identifiers,
+  matching keys, and immutable Data Source Node packet references.
+- Force a fresh correlation read on mount so a browser reload cannot retain a
+  stale bridge assessment.
+
 ## 2.7.1 — 2026-11-01 (LTE Call Flow truthfulness)
 
 - Render the observed S1-MME/S11 and S11/S1-U correlation bridges for LTE

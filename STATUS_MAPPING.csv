@@ -1,0 +1,8 @@
+ui_status,engine_condition,evidence_condition,interface_condition,reason_policy
+CORRELATED,EXACT or STRONG,At least one matching EXACT or STRONG edge,All required interfaces observed,Show raw confidence edge count evidence IDs DSN and matching keys
+NOT_CORRELATED,Explicit NOT_CORRELATED,None required,All required interfaces observed,Never inferred from absence
+NO_DATA,Any,Any,At least one required interface absent,List missing interfaces
+MISSING_KEY,UNKNOWN or null,Edge diagnostic explicitly names a missing or unresolved correlation key,All required interfaces observed,Show the engine diagnostic and evidence IDs
+AMBIGUOUS,POSSIBLE,At least one POSSIBLE edge,All required interfaces observed,Explain that association is not unique
+NOT_EVALUATED,UNKNOWN null or positive without matching edge,No conclusive matching edge,All required interfaces observed,Explain that the engine did not provide conclusive evidence
+UNSUPPORTED,Any,Any,Technology does not support the bridge,Name the unsupported technology contract

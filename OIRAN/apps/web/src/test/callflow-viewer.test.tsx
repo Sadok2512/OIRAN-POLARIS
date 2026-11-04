@@ -19,6 +19,7 @@ describe('directional Call Flow viewer',()=>{
     if(path===undefined)return {data:[],meta:{}} as never;
     if(path==='/sessions/s1')return {data:{summary},meta:{}} as never;
     if(path==='/sessions/s1/callflow?limit=100')return {data:flow,meta:{}} as never;
+    if(path==='/sessions/s1/correlations')return {data:{status:flow.correlation_status,edges:flow.correlation_edges},meta:{}} as never;
     throw new Error(`unexpected path ${path}`);
   }));
   const renderFlow=()=>{const client=new QueryClient({defaultOptions:{queries:{retry:false}}});return render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/investigation/callflow/s1?dataset_id=dataset-a&capture_id=cap-certified&probe_id=probe-a']}><Routes><Route path="/investigation/callflow/:sessionId" element={<CallFlowViewer/>}/></Routes></MemoryRouter></QueryClientProvider>)};
@@ -32,9 +33,9 @@ describe('directional Call Flow viewer',()=>{
     expect(screen.getAllByText('gNB').length).toBeGreaterThan(0);
     expect(screen.queryByText('MME')).not.toBeInTheDocument();
     expect(screen.getByText(/DIRECTION UNRESOLVED/)).toBeVisible();
-    expect(screen.getByText('N2 ↔ SBI')).toBeVisible();
-    expect(screen.getByText('SBI ↔ N4')).toBeVisible();
-    expect(screen.getByText('N4 ↔ N3')).toBeVisible();
+    expect(screen.getAllByText('N2 ↔ SBI')[0]).toBeVisible();
+    expect(screen.getAllByText('SBI ↔ N4')[0]).toBeVisible();
+    expect(screen.getAllByText('N4 ↔ N3')[0]).toBeVisible();
     expect(screen.queryByText('S1-MME ↔ S11')).not.toBeInTheDocument();
   });
 
@@ -68,7 +69,7 @@ describe('directional Call Flow viewer',()=>{
     expect(screen.getByText(/EXACT_TUNNEL_MATCH/)).toBeVisible();
     expect(screen.getByText('Scope: tunnel-only')).toBeVisible();
     expect(screen.getByText(/Does not prove UE identity/)).toBeVisible();
-    expect(screen.getAllByText('E2E UNKNOWN').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('E2E NO DATA').length).toBeGreaterThan(0);
   });
 
   it('renders LTE S1-MME/S11/S1-U bridges and gates E2E on both observed links',async()=>{
@@ -86,14 +87,15 @@ describe('directional Call Flow viewer',()=>{
       if(path===undefined)return {data:[],meta:{}} as never;
       if(path==='/sessions/lte-s1')return {data:{summary:lteSummary},meta:{}} as never;
       if(path==='/sessions/lte-s1/callflow?limit=100')return {data:lteFlow,meta:{}} as never;
+      if(path==='/sessions/lte-s1/correlations')return {data:{status:lteFlow.correlation_status,edges:[]},meta:{}} as never;
       throw new Error(`unexpected path ${path}`);
     });
     const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
     render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/investigation/callflow/lte-s1?dataset_id=dataset-a']}><Routes><Route path="/investigation/callflow/:sessionId" element={<CallFlowViewer/>}/></Routes></MemoryRouter></QueryClientProvider>);
-    expect(await screen.findByText('S1-MME ↔ S11')).toBeVisible();
-    expect(screen.getByText('S11 ↔ S1-U')).toBeVisible();
+    expect((await screen.findAllByText('S1-MME ↔ S11'))[0]).toBeVisible();
+    expect(screen.getAllByText('S11 ↔ S1-U')[0]).toBeVisible();
     expect(screen.queryByText('N2 ↔ SBI')).not.toBeInTheDocument();
-    expect(screen.getAllByText('E2E STRONG').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('E2E NOT EVALUATED').length).toBeGreaterThan(0);
   });
 
   it('does not promote LTE E2E when one required bridge is unproven',async()=>{
@@ -111,13 +113,39 @@ describe('directional Call Flow viewer',()=>{
       if(path===undefined)return {data:[],meta:{}} as never;
       if(path==='/sessions/lte-incomplete')return {data:{summary:incompleteLteSummary},meta:{}} as never;
       if(path==='/sessions/lte-incomplete/callflow?limit=100')return {data:incompleteLteFlow,meta:{}} as never;
+      if(path==='/sessions/lte-incomplete/correlations')return {data:{status:incompleteLteFlow.correlation_status,edges:[]},meta:{}} as never;
       throw new Error(`unexpected path ${path}`);
     });
     const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
     render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/investigation/callflow/lte-incomplete?dataset_id=dataset-a']}><Routes><Route path="/investigation/callflow/:sessionId" element={<CallFlowViewer/>}/></Routes></MemoryRouter></QueryClientProvider>);
-    expect(await screen.findByText('S1-MME ↔ S11')).toBeVisible();
-    expect(screen.getAllByText('E2E UNKNOWN').length).toBeGreaterThan(0);
+    expect((await screen.findAllByText('S1-MME ↔ S11'))[0]).toBeVisible();
+    expect(screen.getAllByText('E2E NOT EVALUATED').length).toBeGreaterThan(0);
     expect(screen.queryByText('E2E EXACT')).not.toBeInTheDocument();
+  });
+
+  it('renders API correlation edges, exact reasons, evidence IDs and DSN for a real-shaped 5G session',async()=>{
+    const realFlow={...flow,session_id:'real-5g',interfaces:['N2','SBI','N4'],correlation_edges:[],correlation_status:{N2_N4:'EXACT',N2_SBI:'STRONG',SBI_N4:'STRONG',N4_N3:'UNKNOWN',E2E:'UNKNOWN'}};
+    const realSummary={...summary,session_id:'real-5g',interfaces:['N2','SBI','N4']};
+    const n2sbi={...flow.correlation_edges[0],edge_id:'edge-n2-sbi',source_interface:'N2',target_interface:'SBI',source_event_id:'ng-up',target_event_id:'sbi-create',matching_identifiers:['pdu_session_id=1'],packet_references:[{...packet,source_file:'capture://n2-real.pcapng',packet_number:31}],confidence:'STRONG'};
+    const sbin4={...flow.correlation_edges[0],edge_id:'edge-sbi-n4',source_interface:'SBI',target_interface:'N4',source_event_id:'sbi-create',target_event_id:'pfcp',matching_identifiers:['sm_context=ctx-1','seid=0x1234'],packet_references:[{...packet,source_file:'capture://n4-real.pcapng',packet_number:44}],confidence:'STRONG'};
+    vi.mocked(api).mockImplementation(async(path?:string)=>{
+      if(path===undefined)return {data:[],meta:{}} as never;
+      if(path==='/sessions/real-5g')return {data:{summary:realSummary},meta:{}} as never;
+      if(path==='/sessions/real-5g/callflow?limit=100')return {data:realFlow,meta:{}} as never;
+      if(path==='/sessions/real-5g/correlations')return {data:{status:realFlow.correlation_status,edges:[n2sbi,sbin4]},meta:{}} as never;
+      throw new Error(`unexpected path ${path}`);
+    });
+    const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/investigation/callflow/real-5g?dataset_id=dataset-a']}><Routes><Route path="/investigation/callflow/:sessionId" element={<CallFlowViewer/>}/></Routes></MemoryRouter></QueryClientProvider>);
+    expect((await screen.findAllByText('CORRELATED')).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText('NO DATA').length).toBeGreaterThanOrEqual(1);
+    const details=screen.getAllByText('N2 ↔ SBI')[1].closest('summary');
+    expect(details).not.toBeNull();
+    await userEvent.click(details!);
+    expect(screen.getAllByText(/Engine reported STRONG/)[0]).toBeVisible();
+    expect(screen.getAllByText(/edge-n2-sbi/)[0]).toBeVisible();
+    expect(screen.getAllByText(/capture:\/\/n2-real\.pcapng#31/)[0]).toBeVisible();
+    expect(screen.getAllByText(/pdu_session_id=1/)[0]).toBeVisible();
   });
 
   it('keeps Download frame and PCAP slice locked (LOT 3 — route not served yet)',async()=>{
@@ -138,6 +166,7 @@ describe('directional Call Flow viewer',()=>{
       if(path==='/sessions/s1')return {data:{summary},meta:{}} as never;
       if(path==='/sessions/s1/callflow?limit=100')return {data:pagedFlow,meta:{}} as never;
       if(path==='/sessions/s1/callflow?limit=100&cursor=ng-down')return {data:secondPage,meta:{}} as never;
+      if(path==='/sessions/s1/correlations')return {data:{status:flow.correlation_status,edges:flow.correlation_edges},meta:{}} as never;
       throw new Error(`unexpected path ${path}`);
     });
     renderFlow();
@@ -184,6 +213,7 @@ describe('Call Flow viewer — identity IEs withheld (LOT 3)',()=>{
     if(path===undefined)return {data:[],meta:{}} as never;
     if(path==='/sessions/identity')return {data:{summary:identitySummary},meta:{}} as never;
     if(path==='/sessions/identity/callflow?limit=100')return {data:identityFlow,meta:{}} as never;
+    if(path==='/sessions/identity/correlations')return {data:{status:identityFlow.correlation_status,edges:[]},meta:{}} as never;
     throw new Error(`unexpected path ${path}`);
   }));
 

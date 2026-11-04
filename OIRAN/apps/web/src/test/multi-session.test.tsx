@@ -31,6 +31,7 @@ describe('multi-session navigation fixture', () => {
       if (path.startsWith('/sessions?')) return { data: [session('s1', 'UE-1', '1'), session('s2', 'UE-1', '2')], meta: {} } as never;
       if (path === '/sessions/s2') return { data: { summary: session('s2', 'UE-1', '2') }, meta: {} } as never;
       if (path === '/sessions/s2/callflow?limit=100') return { data: flow('s2'), meta: {} } as never;
+      if (path === '/sessions/s2/correlations') return { data: { status: flow('s2').correlation_status, edges: [] }, meta: {} } as never;
       throw new Error(`unexpected path ${path}`);
     });
   });
