@@ -1,5 +1,36 @@
 # Changelog
 
+## OIRAN API 2.7.12 — 2026-11-04 — gapless dumpcap rotation + deterministic ts tiebreak
+
+- `infrastructure/capture/capture-interface.sh` drops the
+  `timeout --signal=INT 3600 dumpcap ...` wrapper in favour of native
+  dumpcap rotation (`-b duration:3600 -b filesize:262144 -b files:8`).
+  dumpcap no longer exits between hourly segments, so the capture
+  container stays up continuously (ANR3 measured 2.5–3.2 s of capture
+  loss per interface per hour and a restart_count of 256 with the
+  previous wrapper).
+- New `infrastructure/capture/rotation-watcher.sh` keeps the
+  `capture-rotation.jsonl` contract from a40e110 alive: it polls each
+  per-label output directory and emits one JSONL record the moment
+  dumpcap finalises a segment (i.e. the moment a newer file appears
+  beside it), with `interface`, `plane`, `file`, `file_bytes`,
+  `packets_captured`, `packets_dropped` fields. Idempotent across
+  watcher restarts via a per-label seen list.
+- `infrastructure/capture/capture-all.sh` orchestrates one
+  `capture-interface.sh` + one `rotation-watcher.sh` per approved
+  bridge; the shutdown trap stops both cleanly.
+- `infrastructure/capture/tests/test-rotation-watcher.sh` simulates two
+  dumpcap rotations and asserts the two JSONL records are emitted in
+  order, carry all expected fields, and that the watcher is idempotent
+  (no gap, no duplicate).
+- `oiran-decode::decode_capture()` replaces the previous stable
+  `sort_by_key((ts.s, ts.ns, packet_number))` with an explicit
+  `sort_by` on `(ts.s, ts.ns, capture_id, packet_number, event_id)`.
+  Live-probe's cross-plane merge sort already carried `event_id` as the
+  final tiebreak; this patch brings oiran-decode to the same full
+  determinism without relying on `sort_by_key`'s stability guarantee.
+  New `oiran-decode::tests::sort_by_timestamp_tie_breaks_on_capture_id_then_sequence_then_event_id`.
+
 ## OIRAN API 2.7.11 — 2026-11-04 — SecurityKey material withheld at decode
 
 - `event-schema` exposes `InformationElement::withheld(id, length)`, the

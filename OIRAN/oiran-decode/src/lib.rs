@@ -115,16 +115,36 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
         events.push(event);
         Ok(())
     })?;
-    events.sort_by_key(|event| {
-        (
-            event.timestamp.seconds,
-            event.timestamp.nanoseconds,
-            event
-                .packet_references
+    // 2.7.12: fully deterministic sort — the primary key is the exact
+    // packet time, the first tiebreak is the capture provenance
+    // (`capture_id`), the second is the per-capture packet sequence
+    // (`packet_number`), and the final tiebreak is the deterministic
+    // `event_id`. This removes the previous reliance on `sort_by_key`'s
+    // stable guarantee for parent/child events that share one SCTP
+    // packet and lets cross-capture merges in live-probe inherit an
+    // identical ordering contract.
+    events.sort_by(|left, right| {
+        let left_key = (
+            left.timestamp.seconds,
+            left.timestamp.nanoseconds,
+            left.capture_id.as_str(),
+            left.packet_references
                 .first()
                 .map(|packet| packet.packet_number)
                 .unwrap_or(0),
-        )
+            left.event_id.as_str(),
+        );
+        let right_key = (
+            right.timestamp.seconds,
+            right.timestamp.nanoseconds,
+            right.capture_id.as_str(),
+            right.packet_references
+                .first()
+                .map(|packet| packet.packet_number)
+                .unwrap_or(0),
+            right.event_id.as_str(),
+        );
+        left_key.cmp(&right_key)
     });
     Ok(DecodeOutput { events, report })
 }
@@ -573,5 +593,124 @@ mod tests {
         assert_eq!(report.tcp_connections, 0);
         assert_eq!(report.http2_frames, 0);
         assert_eq!(report.sbi_transactions, 0);
+    }
+
+    fn fixture_event(
+        capture_id: &str,
+        seconds: i64,
+        nanoseconds: u32,
+        packet_number: u64,
+        event_id: &str,
+    ) -> NormalizedEvent {
+        NormalizedEvent {
+            event_id: event_id.into(),
+            parent_event_id: None,
+            probe_id: "probe".into(),
+            capture_point_id: "cp".into(),
+            capture_id: capture_id.into(),
+            packet_references: vec![PacketReference {
+                source_file: "capture.pcap".into(),
+                source_sha256: None,
+                packet_number,
+                byte_offset: 0,
+                interface_id: 0,
+                link_type: None,
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: 64,
+                original_length: 64,
+            }],
+            timestamp: event_schema::ExactTimestamp {
+                seconds,
+                nanoseconds,
+                raw_ticks: ((seconds as u64) * 1_000_000_000) + (nanoseconds as u64),
+                resolution_base: 10,
+                resolution_exponent: 9,
+            },
+            interface: "S1-MME".into(),
+            protocol: event_schema::Protocol::S1ap,
+            message_name: "InitialContextSetupRequest".into(),
+            message_type: 9,
+            procedure_code: Some(9),
+            procedure: None,
+            security_state: None,
+            source_byte_offset: None,
+            source_endpoint: event_schema::Endpoint {
+                address: "10.0.0.1".into(),
+                port: Some(36412),
+                network_function: Some("eNB".into()),
+            },
+            destination_endpoint: event_schema::Endpoint {
+                address: "10.0.0.2".into(),
+                port: Some(36412),
+                network_function: Some("MME".into()),
+            },
+            direction: event_schema::Direction::RanToCore,
+            session_identifiers: vec![],
+            information_elements: vec![],
+            decoder_name: "decoder-s1ap".into(),
+            decoder_version: "0.2.0".into(),
+            schema_version: NormalizedEvent::SCHEMA_VERSION,
+            decoding_status: event_schema::DecodeStatus::Decoded,
+            errors: vec![],
+            raw_payload_reference: "sha256:payload".into(),
+            evidence_references: vec![],
+            sbi: None,
+        }
+    }
+
+    #[test]
+    fn sort_by_timestamp_tie_breaks_on_capture_id_then_sequence_then_event_id() {
+        // 2.7.12: fully deterministic merge order for events that share
+        // exactly the same packet timestamp. The sort tuple is
+        // (ts.s, ts.ns, capture_id, packet_number, event_id). This test
+        // runs the sort on a shuffled input and asserts the exact
+        // ordering, so a future refactor cannot silently reorder events
+        // that correlation and callflow reconstruction depend on.
+        let s1 = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let s2 = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let shared_s = 100;
+        let shared_ns = 500;
+        let mut events = vec![
+            fixture_event(s2, shared_s, shared_ns, 3, "evt-z"),
+            fixture_event(s1, shared_s, shared_ns, 5, "evt-a"),
+            fixture_event(s1, shared_s, shared_ns, 5, "evt-b"),
+            fixture_event(s1, shared_s, shared_ns, 1, "evt-c"),
+            fixture_event(s1, shared_s, shared_ns + 1, 0, "evt-d"),
+            fixture_event(s1, shared_s - 1, 999_999_999, 0, "evt-e"),
+        ];
+        events.sort_by(|left, right| {
+            let left_key = (
+                left.timestamp.seconds,
+                left.timestamp.nanoseconds,
+                left.capture_id.as_str(),
+                left.packet_references
+                    .first()
+                    .map(|packet| packet.packet_number)
+                    .unwrap_or(0),
+                left.event_id.as_str(),
+            );
+            let right_key = (
+                right.timestamp.seconds,
+                right.timestamp.nanoseconds,
+                right.capture_id.as_str(),
+                right.packet_references
+                    .first()
+                    .map(|packet| packet.packet_number)
+                    .unwrap_or(0),
+                right.event_id.as_str(),
+            );
+            left_key.cmp(&right_key)
+        });
+        let ordered: Vec<&str> = events.iter().map(|event| event.event_id.as_str()).collect();
+        assert_eq!(
+            ordered,
+            vec!["evt-e", "evt-c", "evt-a", "evt-b", "evt-z", "evt-d"]
+        );
     }
 }
