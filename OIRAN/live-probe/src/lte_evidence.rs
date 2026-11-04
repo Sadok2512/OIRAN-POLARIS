@@ -2647,4 +2647,126 @@ mod tests {
         assert_eq!(error.code, "LTE_EVENT_DECODER_MISMATCH");
         fs::remove_dir_all(bundle).unwrap();
     }
+
+    // 2.7.11: SecurityKey IEs must be withheld at decode time. The
+    // normalised event may carry the IE's id/length + `WITHHELD` marker
+    // but never the raw bytes nor any hash, and the finalizer keeps
+    // refusing any residual key material that reaches the exported stream.
+
+    fn s1_mme_ics_bundle_with_withheld_security_key() -> (PathBuf, LteEvidenceImportRequest) {
+        let (bundle, mut request) = build_bundle();
+        let binding_index = request
+            .capture_bindings
+            .iter()
+            .position(|binding| binding.evidence_ref == "capture:S1_MME")
+            .unwrap();
+        let binding = request.capture_bindings[binding_index].clone();
+        let capture_sha = request.evidence.capture_refs[binding_index]
+            .source_file_sha256
+            .clone();
+        let mut ics = event(
+            "S1_MME",
+            &capture_sha,
+            &binding.source_file,
+            1,
+            "evt-s1ap-ics-0001",
+        );
+        ics.decoder_name = binding.decoder_name.clone();
+        ics.decoder_version = binding.decoder_version.clone();
+        ics.message_name = "InitialContextSetupRequest".into();
+        // 2.7.11 contract: SecurityKey emitted only by length and WITHHELD
+        // marker. This is what a correctly behaving decoder outputs.
+        ics.information_elements = json!([
+            {
+                "id": 73,
+                "name": "key_material_withheld",
+                "length": 32,
+                "value": "WITHHELD",
+                "raw_sha256": null,
+                "status": "DECODED"
+            }
+        ]);
+        let bytes = jsonl_bytes(&[ics]).unwrap();
+        fs::write(bundle.join(&binding.normalized_events_file), &bytes).unwrap();
+        request.capture_bindings[binding_index].normalized_events_sha256 = sha256_hex(&bytes);
+        (bundle, request)
+    }
+
+    #[test]
+    fn imports_ics_with_withheld_security_key_without_privacy_rejection() {
+        // Reproduces the ANR3 ICS case (issue #10 comment 6628829729,
+        // SecurityKey at line 17 of s1-mme.events.jsonl): the event with
+        // the withheld IE is accepted and no raw key material appears in
+        // the persisted copy.
+        let (bundle, request) = s1_mme_ics_bundle_with_withheld_security_key();
+        let store = LteEvidenceStore::new(temp_root("ics-withheld-key-store")).unwrap();
+        let result = store.ingest(&bundle, &request).expect("accepted");
+        assert!(
+            matches!(result.state.as_str(), "COMPLETED" | "IMPORTED" | "IMPORTED_PARTIAL"),
+            "unexpected state: {}",
+            result.state
+        );
+        fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn rejects_raw_security_key_leaked_into_the_published_stream() {
+        // Symmetric guard: if any serialiser skips the withhold path and
+        // lets a raw SecurityKey (or its sha256) escape under the original
+        // IE name, the privacy predicate still refuses it fail-closed.
+        for leak in [
+            json!([{
+                "id": 73,
+                "name": "SecurityKey",
+                "length": 32,
+                "value": "4b654e42" ,
+                "raw_sha256": "4b654e42000000000000000000000000000000000000000000000000000000ff",
+                "status": "DECODED"
+            }]),
+            json!([{
+                "id": 73,
+                "name": "key_material_withheld",
+                "length": 32,
+                "value": "security_key=4b654e42...",
+                "raw_sha256": null,
+                "status": "DECODED"
+            }]),
+        ] {
+            let (bundle, mut request) = build_bundle();
+            let binding_index = request
+                .capture_bindings
+                .iter()
+                .position(|binding| binding.evidence_ref == "capture:S1_MME")
+                .unwrap();
+            let binding = request.capture_bindings[binding_index].clone();
+            let capture_sha = request.evidence.capture_refs[binding_index]
+                .source_file_sha256
+                .clone();
+            let mut rogue = event(
+                "S1_MME",
+                &capture_sha,
+                &binding.source_file,
+                1,
+                "evt-s1ap-key-leak",
+            );
+            rogue.decoder_name = binding.decoder_name.clone();
+            rogue.decoder_version = binding.decoder_version.clone();
+            rogue.message_name = "InitialContextSetupRequest".into();
+            rogue.information_elements = leak.clone();
+            let bytes = jsonl_bytes(&[rogue]).unwrap();
+            fs::write(bundle.join(&binding.normalized_events_file), &bytes).unwrap();
+            request.capture_bindings[binding_index].normalized_events_sha256 =
+                sha256_hex(&bytes);
+            let store = LteEvidenceStore::new(temp_root("rogue-security-key-store")).unwrap();
+            let error = store
+                .ingest(&bundle, &request)
+                .expect_err("leaked key material must be refused");
+            assert_eq!(
+                error.code, "LTE_IDENTITY_DISCLOSURE_REJECTED",
+                "unexpected error for leak {}: {:?}",
+                leak, error
+            );
+            fs::remove_dir_all(bundle).unwrap();
+        }
+    }
 }

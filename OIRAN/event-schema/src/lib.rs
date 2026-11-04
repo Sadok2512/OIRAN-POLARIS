@@ -177,6 +177,55 @@ pub struct InformationElement {
     pub status: DecodeStatus,
 }
 
+/// 2.7.11: canonical identity of IEs whose payload is pure key material
+/// (SecurityKey carrying KeNB*/KgNB*, Next-Hop key NH, NextHopChainingCount,
+/// NAS keys). Decoders MUST emit such IEs via [`InformationElement::withheld`]
+/// — the length is preserved, the body bytes and any hash of the body never
+/// reach the normalised event. Callers wanting to know whether an
+/// upstream `(decoder, ie_id)` falls in this bucket consult
+/// [`is_withheld_key_material`] below so the list stays identical between
+/// S1AP and NGAP.
+pub const KEY_MATERIAL_WITHHELD_IE_NAME: &str = "key_material_withheld";
+pub const KEY_MATERIAL_WITHHELD_IE_VALUE: &str = "WITHHELD";
+
+/// Is this `(decoder, protocol-IE-id)` bearing raw key material that must
+/// be withheld at decode time? The list is explicit and identical between
+/// S1AP (TS 36.413) and NGAP (TS 38.413).
+///
+/// S1AP: IE 73 (SecurityKey).
+/// NGAP: IE 94 (SecurityKey).
+///
+/// Next-Hop (NH) / NextHopChainingCount material is embedded inside the
+/// SecurityKey octet-string in both specifications, so withholding the
+/// SecurityKey IE withholds the entire key chain at once. Adding an IE to
+/// this allowlist is an explicit code change; there is no catch-all.
+pub fn is_withheld_key_material(decoder: &str, ie_id: u16) -> bool {
+    match (decoder, ie_id) {
+        ("decoder-s1ap", 73) => true,
+        ("decoder-ngap", 94) => true,
+        _ => false,
+    }
+}
+
+impl InformationElement {
+    /// Emit an IE whose raw bytes must stay inside the decoder: length is
+    /// preserved for provenance, the body is collapsed to the sentinel
+    /// `WITHHELD`, the raw SHA-256 is cleared. This is the only path a
+    /// decoder is allowed to take for key material; raw bytes escaping to
+    /// the normalised event would trip `LTE_IDENTITY_DISCLOSURE_REJECTED`
+    /// at the POLARIS finalizer.
+    pub fn withheld(id: Option<u16>, length: u32) -> Self {
+        Self {
+            id,
+            name: KEY_MATERIAL_WITHHELD_IE_NAME.into(),
+            length,
+            value: Some(KEY_MATERIAL_WITHHELD_IE_VALUE.into()),
+            raw_sha256: None,
+            status: DecodeStatus::Decoded,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SbiMetadata {
     pub tcp_connection_id: String,

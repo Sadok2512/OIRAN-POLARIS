@@ -16,8 +16,8 @@ pub use transfer::{
 
 use decoder_nas::NasMessage;
 use event_schema::{
-    pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState,
-    InformationElement, NamedValue, NormalizedEvent, Protocol, PseudonymKey,
+    is_withheld_key_material, pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference,
+    EvidenceState, InformationElement, NamedValue, NormalizedEvent, Protocol, PseudonymKey,
 };
 use plugin_runtime::{
     DecoderCapabilities, DecoderInput, DecoderManifest, DecoderOutput, ProtocolDecoder,
@@ -223,11 +223,11 @@ fn decode_ie(ie: &NgapIe, pseudonym_key: &PseudonymKey) -> (Option<String>, Deco
         82 => decode_printable("ran_node_name", &ie.value),
         86 => decode_single_enum("relative_amf_capacity", &ie.value),
         90 => decode_rrc_establishment_cause(&ie.value),
-        94 => (
-            Some(format!("security_key_sha256={}", sha256_hex(&ie.value))),
-            DecodeStatus::Decoded,
-            true,
-        ),
+        // 2.7.11: NGAP SecurityKey carries KgNB*/NH/NCC material. The raw
+        // bytes stay inside the decoder — no fragment, no hash, no length
+        // prefix. The IE is rebuilt by `InformationElement::withheld(id, len)`
+        // at emission.
+        94 => (None, DecodeStatus::Decoded, true),
         96 => (
             Some(format!(
                 "served_guami_list_sha256={}",
@@ -860,14 +860,21 @@ impl ProtocolDecoder for NgapDecoder {
                             ie.id
                         ));
                     }
-                    elements.push(InformationElement {
-                        id: Some(ie.id),
-                        name: ie.known_name.unwrap_or("Unknown IE").into(),
-                        length: ie.value.len() as u32,
-                        value,
-                        raw_sha256: Some(sha256_hex(&ie.value)),
-                        status: ie_status,
-                    });
+                    if is_withheld_key_material("decoder-ngap", ie.id) {
+                        elements.push(InformationElement::withheld(
+                            Some(ie.id),
+                            ie.value.len() as u32,
+                        ));
+                    } else {
+                        elements.push(InformationElement {
+                            id: Some(ie.id),
+                            name: ie.known_name.unwrap_or("Unknown IE").into(),
+                            length: ie.value.len() as u32,
+                            value,
+                            raw_sha256: Some(sha256_hex(&ie.value)),
+                            status: ie_status,
+                        });
+                    }
                 }
                 let mut event = NormalizedEvent {
                     event_id: String::new(),
@@ -1308,6 +1315,93 @@ mod tests {
         let (nas, offset) = pdu_session_nas_contents(&ie).unwrap();
         assert_eq!(offset, 4);
         assert_eq!(nas, [0x7e, 0x00, 0x44, 0x6f]);
+    }
+
+    #[test]
+    fn initial_context_setup_request_withholds_ngap_security_key_payload() {
+        // 2.7.11 NGAP mirror of the S1AP SecurityKey withhold contract:
+        // IE 94 (KgNB*/NH/NCC) is emitted only as a length + `WITHHELD`
+        // marker. No fragment of the raw key, no sha256, no sibling
+        // identifier.
+        let amf_ue = &[0, 1];
+        let ran_ue = &[0, 2];
+        let security_key = [0x4b, 0x67, 0x4e, 0x42, 0x2a, 0x53, 0x59, 0x4e, 0x54, 0x48, 0x45,
+            0x54, 0x49, 0x43, 0x4b, 0x67, 0x4e, 0x42, 0x2a, 0x3a, 0x33, 0x32, 0x62, 0x79, 0x74,
+            0x65, 0x73, 0x2d, 0x6b, 0x65, 0x79, 0x3e];
+        // NGAP InitialContextSetupRequest = procedureCode 14.
+        let bytes = pdu(0, 14, &[(10, 0, amf_ue), (85, 0, ran_ue), (94, 0, &security_key)]);
+        let packets = vec![PacketReference {
+            source_file: "fixture.pcap".into(),
+            source_sha256: Some("abc".into()),
+            packet_number: 7,
+            byte_offset: 20,
+            interface_id: 0,
+            link_type: Some(276),
+            sll2_protocol_type: Some(0x0800),
+            sll2_reserved: Some(0),
+            sll2_interface_index: Some(2),
+            sll2_arphrd_type: Some(1),
+            sll2_packet_type: Some(0),
+            sll2_address_length: Some(6),
+            sll2_address: Some("000000000000".into()),
+            captured_length: 90,
+            original_length: 90,
+        }];
+        let timestamp = ExactTimestamp {
+            seconds: 1,
+            nanoseconds: 2,
+            raw_ticks: 1_000_000_002,
+            resolution_base: 10,
+            resolution_exponent: 9,
+        };
+        let key = PseudonymKey::from_bytes([0xa5; 32]);
+        let input = DecoderInput {
+            capture_id: "cap",
+            packet_references: &packets,
+            timestamp: &timestamp,
+            interface: "N2",
+            source_endpoint: Endpoint {
+                address: "10.0.0.1".into(),
+                port: Some(38412),
+                network_function: Some("AMF".into()),
+            },
+            destination_endpoint: Endpoint {
+                address: "10.0.0.2".into(),
+                port: Some(38412),
+                network_function: Some("gNB".into()),
+            },
+            payload: &bytes,
+            raw_payload_reference: "sha256:packet-sec-key".into(),
+            pseudonym_key: &key,
+        };
+        let output = NgapDecoder.decode(&input);
+        let ngap_event = output
+            .events
+            .iter()
+            .find(|event| event.protocol == Protocol::Ngap)
+            .expect("NGAP event");
+        let security_ie = ngap_event
+            .information_elements
+            .iter()
+            .find(|ie| ie.id == Some(94))
+            .expect("SecurityKey IE preserved by length");
+        assert_eq!(security_ie.name, "key_material_withheld");
+        assert_eq!(security_ie.length, security_key.len() as u32);
+        assert_eq!(security_ie.value.as_deref(), Some("WITHHELD"));
+        assert_eq!(security_ie.raw_sha256, None);
+        let serialised = ngap_event.to_json();
+        let hex = security_key
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert!(!serialised.contains(&hex));
+        assert!(!serialised.contains("security_key_sha256"));
+        let sha256 = {
+            let mut h = event_schema::Sha256Hasher::new();
+            h.update(&security_key);
+            h.finish_hex()
+        };
+        assert!(!serialised.contains(&sha256));
     }
 }
 #[test]

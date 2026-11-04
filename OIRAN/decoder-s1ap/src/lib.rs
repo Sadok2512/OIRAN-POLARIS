@@ -10,8 +10,8 @@
 
 use decoder_nas::NasMessage;
 use event_schema::{
-    pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState, PseudonymKey,
-    InformationElement, NamedValue, NormalizedEvent, Protocol,
+    is_withheld_key_material, pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference,
+    EvidenceState, InformationElement, NamedValue, NormalizedEvent, Protocol, PseudonymKey,
 };
 use plugin_runtime::{
     DecoderCapabilities, DecoderInput, DecoderManifest, DecoderOutput, ProtocolDecoder,
@@ -169,11 +169,11 @@ fn decode_ie(ie: &S1apIe, pseudonym_key: &PseudonymKey) -> (Option<String>, Deco
             DecodeStatus::Partial,
             true,
         ),
-        73 => (
-            Some(format!("security_key_sha256={}", sha256_hex(&ie.value))),
-            DecodeStatus::Decoded,
-            true,
-        ),
+        // 2.7.11: SecurityKey carries KeNB*/NH/NCC material. The decoder
+        // emits nothing from the raw bytes — no hash, no fragment, no
+        // length-prefixed view. The IE is rebuilt downstream by
+        // `InformationElement::withheld(ie.id, ie.value.len())`.
+        73 => (None, DecodeStatus::Decoded, true),
         75 => (
             Some(format!(
                 "gummei_id_sha256={}",
@@ -511,14 +511,21 @@ impl ProtocolDecoder for S1apDecoder {
                             ie.id
                         ));
                     }
-                    elements.push(InformationElement {
-                        id: Some(ie.id),
-                        name: ie.known_name.unwrap_or("Unknown IE").into(),
-                        length: ie.value.len() as u32,
-                        value,
-                        raw_sha256: Some(sha256_hex(&ie.value)),
-                        status: ie_status,
-                    });
+                    if is_withheld_key_material("decoder-s1ap", ie.id) {
+                        elements.push(InformationElement::withheld(
+                            Some(ie.id),
+                            ie.value.len() as u32,
+                        ));
+                    } else {
+                        elements.push(InformationElement {
+                            id: Some(ie.id),
+                            name: ie.known_name.unwrap_or("Unknown IE").into(),
+                            length: ie.value.len() as u32,
+                            value,
+                            raw_sha256: Some(sha256_hex(&ie.value)),
+                            status: ie_status,
+                        });
+                    }
                 }
                 let mut event = NormalizedEvent {
                     event_id: String::new(),
@@ -1000,5 +1007,67 @@ mod tests {
         assert_eq!(m.protocol, Protocol::S1ap);
         assert_eq!(m.decoder_name, "decoder-s1ap");
         plugin_runtime::validate_manifest(&m).expect("valid manifest");
+    }
+
+    #[test]
+    fn initial_context_setup_request_withholds_security_key_payload() {
+        // 2.7.11: SecurityKey (S1AP IE 73) carries KeNB*/NH/NCC. The
+        // normalised event must keep the IE's length but surface no bytes,
+        // no hash and no sibling identifier. Synthetic 32-byte value stands
+        // in for KeNB* — the raw bytes are a pattern 0x4B, 0x65...; the
+        // test proves they do not reach the exported event.
+        let mme_ue = &[0x00, 0x01];
+        let security_key = [0x4b, 0x65, 0x4e, 0x42, 0x2a, 0x53, 0x59, 0x4e, 0x54, 0x48, 0x45,
+            0x54, 0x49, 0x43, 0x4b, 0x65, 0x59, 0x4d, 0x41, 0x54, 0x45, 0x52, 0x49, 0x41, 0x4c,
+            0x33, 0x32, 0x62, 0x79, 0x74, 0x65, 0x73];
+        let bytes = pdu(0, 9, &[(0, 0, mme_ue), (73, 0, &security_key)]);
+        let (packets, timestamp) = fixtures();
+        let key = PseudonymKey::from_bytes([0x11; 32]);
+        let input = synthetic_input(&bytes, &packets, &timestamp, &key, "MME", "eNB");
+        let out = S1apDecoder.decode(&input);
+        assert_eq!(out.events.len(), 1);
+        let event = &out.events[0];
+        assert_eq!(event.message_name, "InitialContextSetupRequest");
+        let security_ie = event
+            .information_elements
+            .iter()
+            .find(|ie| ie.id == Some(73))
+            .expect("SecurityKey IE preserved by length");
+        assert_eq!(security_ie.name, "key_material_withheld");
+        assert_eq!(security_ie.length, security_key.len() as u32);
+        assert_eq!(security_ie.value.as_deref(), Some("WITHHELD"));
+        assert_eq!(security_ie.raw_sha256, None);
+        assert_eq!(security_ie.status, DecodeStatus::Decoded);
+        // No session identifier carries the key or its hash.
+        for sid in &event.session_identifiers {
+            assert!(
+                !sid.name.contains("security_key") && !sid.value.contains("security_key"),
+                "session identifier leaks security_key: {sid:?}"
+            );
+            assert!(
+                !sid.value.contains("4b654e42"),
+                "session identifier leaks raw key bytes: {sid:?}"
+            );
+        }
+        // Serialised event contains no fragment of the raw key bytes and
+        // no digest of them.
+        let serialised = event.to_json();
+        assert!(!serialised.contains("4b654e42"));
+        assert!(!serialised.contains("security_key_sha256"));
+        // The hex representation of the raw key must not appear anywhere.
+        let hex = security_key
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert!(!serialised.contains(&hex));
+        let sha256 = {
+            let mut h = event_schema::Sha256Hasher::new();
+            h.update(&security_key);
+            h.finish_hex()
+        };
+        assert!(
+            !serialised.contains(&sha256),
+            "serialised event contains the sha256 of the raw SecurityKey"
+        );
     }
 }

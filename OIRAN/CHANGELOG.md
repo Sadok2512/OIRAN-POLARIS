@@ -1,5 +1,28 @@
 # Changelog
 
+## OIRAN API 2.7.11 — 2026-11-04 — SecurityKey material withheld at decode
+
+- `event-schema` exposes `InformationElement::withheld(id, length)`, the
+  shared constants `KEY_MATERIAL_WITHHELD_IE_NAME` / `..._VALUE`, and the
+  explicit allowlist `is_withheld_key_material(decoder, ie_id)` covering
+  S1AP IE 73 (SecurityKey, KeNB*/NH/NCC) and NGAP IE 94 (SecurityKey,
+  KgNB*/NH/NCC). Both decoders must emit matching IEs via this path so no
+  raw key material and no hash of it ever reaches a NormalizedEvent.
+- `decoder-s1ap` and `decoder-ngap` build the SecurityKey IE through the
+  withheld constructor: id and length are preserved for provenance, `name`
+  is `"key_material_withheld"`, `value` is the sentinel `"WITHHELD"`, and
+  `raw_sha256` is `None`. The previous `security_key_sha256=...` identifier
+  emission is removed.
+- `live-probe` fail-closed `LTE_IDENTITY_DISCLOSURE_REJECTED` remains
+  active: any residual key material that still reaches the published
+  stream (raw bytes under `name: "SecurityKey"`, `security_key=` substring,
+  or a sha256 under the original IE name) is refused.
+- Regression tests:
+  - `decoder-s1ap::tests::initial_context_setup_request_withholds_security_key_payload`
+  - `decoder-ngap::tests::initial_context_setup_request_withholds_ngap_security_key_payload`
+  - `live-probe::lte_evidence::tests::imports_ics_with_withheld_security_key_without_privacy_rejection`
+  - `live-probe::lte_evidence::tests::rejects_raw_security_key_leaked_into_the_published_stream`
+
 ## OIRAN API 2.7.10 — 2026-11-04 — explicit decoder-vs-protocol binding for nested EPS NAS
 
 - `live-probe::lte_evidence::read_events_bounded()` now classifies each
