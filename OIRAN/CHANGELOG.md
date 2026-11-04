@@ -1,5 +1,41 @@
 # Changelog
 
+## OIRAN API 2.7.14 — 2026-11-04 — technical-field exemption in privacy predicate
+
+- `live-probe::lte_evidence::contains_forbidden_identity` no longer
+  rejects the ANR3 event id `evt-78165221727737b8` (issue #10 comment
+  6632047981): the previous rule applied the 14-consecutive-decimal
+  heuristic to every JSON string, so a canonical event id whose 16-hex
+  suffix happened to contain 14 digits in a row was treated as a raw
+  IMSI.
+- New `is_valid_technical_field(key, value)` predicate is the single
+  place that lists the technical field names exempted from the
+  long-digit-run heuristic and declares their exact format:
+  * `event_id`, `parent_event_id` → `^evt-[0-9a-f]{16}$`
+  * `capture_id` → `^sha256:[0-9a-f]{64}$`
+  * `raw_payload_reference` → sha256: head, optional `#…` suffix
+  * `raw_sha256`, `source_sha256`, `normalized_events_sha256`,
+    `derived_manifest_sha256`, `event_artifact_sha256`,
+    `correlation_artifact_sha256`, `source_file_sha256` → `[0-9a-f]{64}`
+  * `dataset_id` → `dataset-` or `dataset-live-` + `[0-9a-f]{32}` or
+    `[0-9a-f]{64}`.
+  A value whose format does not match falls through to the strict scan,
+  so an IMSI stuffed under `event_id`, `capture_id`, `raw_sha256` or
+  `dataset_id` is still refused with
+  `LTE_IDENTITY_DISCLOSURE_REJECTED`.
+- `contains_forbidden_identity_marker` runs BEFORE the exemption, so a
+  value like `imsi-001010123456789` stored under `event_id` stays
+  rejected.
+- The scan stays strict on IE contents, decoded values, session
+  identifiers, and any field not listed above.
+- Regression tests:
+  * `anr3_exact_event_id_from_the_report_is_not_flagged_as_identity`
+    (passes on the exact `evt-78165221727737b8` value),
+  * `technical_fields_accept_their_declared_formats`,
+  * `imsi_inside_an_information_element_value_stays_rejected`,
+  * `imsi_stuffed_into_a_technical_field_is_rejected_by_format_invalidation`,
+  * `whitelisted_names_do_not_exempt_other_marker_shapes`.
+
 ## OIRAN API 2.7.13 — 2026-11-04 — canonical `(capture_id, seq)` order, no dumpcap retention
 
 - The canonical processing order across OIRAN is now

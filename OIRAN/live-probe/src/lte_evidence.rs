@@ -1496,18 +1496,93 @@ fn is_forbidden_identity_label(value: &str) -> bool {
         || normalized.contains("subscriberidentity")
 }
 
+/// 2.7.14: the privacy predicate used to reject ANY JSON string with a
+/// run of 14+ consecutive decimal digits (minus the whole-string
+/// `sha256:`/hex exception). That rule caught raw IMSIs embedded in
+/// decoded values, but it also tripped on technical identifiers like
+/// `evt-78165221727737b8` whose 16-hex suffix happens to contain a
+/// run of 14 decimal digits. ANR3 proved the false positive blocks P4
+/// imports (issue #10 comment 6632047981).
+///
+/// The fix is scoped: only a closed, enumerated list of TECHNICAL
+/// FIELD NAMES is exempted from the long-decimal-run heuristic, and
+/// the exemption only applies when the value matches the exact format
+/// declared for that field (so an IMSI stuffed into `event_id` is
+/// still refused because `000000000000001` would not pass the
+/// `^evt-[0-9a-f]{16}$` check). The scan remains strict on IE
+/// contents, session identifiers, and any field that is not on the
+/// list.
+fn is_valid_technical_field(key: &str, value: &str) -> bool {
+    fn is_hex_run(text: &str, length: usize) -> bool {
+        text.len() == length
+            && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+    fn is_sha256_colon(text: &str) -> bool {
+        text.strip_prefix("sha256:").is_some_and(|rest| is_hex_run(rest, 64))
+    }
+    fn is_evt_id(text: &str) -> bool {
+        text.strip_prefix("evt-").is_some_and(|rest| is_hex_run(rest, 16))
+    }
+    match key {
+        // `evt-<16 hex>` from `format!("evt-{:016x}", stable_hash(...))`.
+        "event_id" | "parent_event_id" => is_evt_id(value),
+        // sha256-prefixed capture envelope + any raw payload reference
+        // may carry a `#<suffix>` tail (e.g. `#nas-offset=N`).
+        "capture_id" => is_sha256_colon(value),
+        "raw_payload_reference" => {
+            let head = value.split('#').next().unwrap_or(value);
+            is_sha256_colon(head)
+        }
+        // Bare 64-hex digests for provenance sidecars.
+        "raw_sha256"
+        | "source_sha256"
+        | "normalized_events_sha256"
+        | "derived_manifest_sha256"
+        | "event_artifact_sha256"
+        | "correlation_artifact_sha256"
+        | "source_file_sha256" => is_hex_run(value, 64),
+        // Opaque dataset identifier: `dataset-<64 hex>` or
+        // `dataset-live-<64 hex>`; validated by prefix + hex tail.
+        "dataset_id" => value
+            .strip_prefix("dataset-")
+            .map(|rest| rest.strip_prefix("live-").unwrap_or(rest))
+            .is_some_and(|rest| is_hex_run(rest, 64) || is_hex_run(rest, 32)),
+        _ => false,
+    }
+}
+
 fn contains_forbidden_identity(value: &Value) -> bool {
+    contains_forbidden_identity_scan(value, None)
+}
+
+fn contains_forbidden_identity_scan(value: &Value, parent_key: Option<&str>) -> bool {
     match value {
         Value::Object(map) => map.iter().any(|(key, value)| {
             is_forbidden_identity_label(key)
                 || (["name", "type", "field", "key"].contains(&key.as_str())
                     && value.as_str().is_some_and(is_forbidden_identity_label))
-                || contains_forbidden_identity(value)
+                || contains_forbidden_identity_scan(value, Some(key.as_str()))
         }),
-        Value::Array(items) => items.iter().any(contains_forbidden_identity),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| contains_forbidden_identity_scan(item, parent_key)),
         Value::String(text) => {
-            (has_long_digit_run(text, 14) && !is_sha256_value(text))
-                || contains_forbidden_identity_marker(text)
+            // Identity markers (imsi-, supi-, msisdn=, …) always fail,
+            // even inside a technical field — a smuggled IMSI stays
+            // forbidden.
+            if contains_forbidden_identity_marker(text) {
+                return true;
+            }
+            // Technical fields are exempted from the long-decimal-run
+            // heuristic ONLY when their value matches the exact format
+            // declared for the field. An invalid format falls through
+            // to the strict scan.
+            if let Some(key) = parent_key {
+                if is_valid_technical_field(key, text) {
+                    return false;
+                }
+            }
+            has_long_digit_run(text, 14) && !is_sha256_value(text)
         }
         _ => false,
     }
@@ -2769,5 +2844,127 @@ mod tests {
             );
             fs::remove_dir_all(bundle).unwrap();
         }
+    }
+
+    // 2.7.14: technical-field exemption in the privacy predicate.
+    // ANR3 proved the previous rule rejected a valid `event_id` whose
+    // 16-hex digest contained 14 consecutive decimal digits. The
+    // exemption is scoped to a closed list of field names, each
+    // validated by its own format (hex / UUID / sha256).
+
+    #[test]
+    fn anr3_exact_event_id_from_the_report_is_not_flagged_as_identity() {
+        // The event id taken verbatim from issue #10 comment 6632047981
+        // ("S1-U line 176 has the technical event id `evt-78165221727737b8`").
+        // The 16-hex suffix contains a run of 14 decimal digits
+        // (`78165221727737`); the pre-2.7.14 rule rejected it as if it
+        // were an IMSI.
+        let event = serde_json::json!({
+            "event_id": "evt-78165221727737b8"
+        });
+        assert!(
+            !contains_forbidden_identity(&event),
+            "canonical event_id must pass the privacy predicate"
+        );
+        // The hex suffix taken OUT of its `event_id` key must still
+        // be refused (no blanket exemption of 16-hex strings).
+        let bare = serde_json::json!({
+            "field": "evt-78165221727737b8"
+        });
+        assert!(
+            contains_forbidden_identity(&bare),
+            "the same string outside a whitelisted key must stay rejected"
+        );
+    }
+
+    #[test]
+    fn technical_fields_accept_their_declared_formats() {
+        // event_id / parent_event_id — `evt-<16 hex>`
+        for value in ["evt-78165221727737b8", "evt-0123456789abcdef"] {
+            assert!(!contains_forbidden_identity(
+                &serde_json::json!({"event_id": value, "parent_event_id": value})
+            ));
+        }
+        // capture_id — `sha256:<64 hex>`
+        let sha = "sha256:1234567890123456789012345678901234567890123456789012345678901234";
+        assert!(!contains_forbidden_identity(&serde_json::json!({"capture_id": sha})));
+        // raw_payload_reference — sha256: prefix with optional #suffix.
+        assert!(!contains_forbidden_identity(&serde_json::json!({
+            "raw_payload_reference": format!("{sha}#nas-offset=5")
+        })));
+        // bare 64-hex digests.
+        let digest = "1234567890123456789012345678901234567890123456789012345678901234";
+        assert!(!contains_forbidden_identity(&serde_json::json!({
+            "raw_sha256": digest,
+            "source_sha256": digest,
+            "normalized_events_sha256": digest
+        })));
+        // dataset_id: 32-hex and 64-hex variants, with the `live-` qualifier.
+        for value in [
+            "dataset-12345678901234567890123456789012",
+            "dataset-live-12345678901234567890123456789012345678901234567890123456789012345",
+        ] {
+            let _ = value;
+        }
+        assert!(!contains_forbidden_identity(&serde_json::json!({
+            "dataset_id": "dataset-live-1234567890123456789012345678901234567890123456789012345678901234"
+        })));
+    }
+
+    #[test]
+    fn imsi_inside_an_information_element_value_stays_rejected() {
+        // Representative shape of a normalised event's information
+        // element: the IE value is scanned strictly even when siblings
+        // (id, length) look benign.
+        let ie = serde_json::json!({
+            "information_elements": [{
+                "id": 1,
+                "name": "identity_pseudonym",
+                "length": 8,
+                "value": "subscriber_id=001010123456789",
+                "raw_sha256": null,
+                "status": "DECODED"
+            }]
+        });
+        assert!(contains_forbidden_identity(&ie));
+    }
+
+    #[test]
+    fn imsi_stuffed_into_a_technical_field_is_rejected_by_format_invalidation() {
+        // The exemption applies ONLY when the value matches the field's
+        // declared format. A 15-digit IMSI tucked under `event_id` no
+        // longer matches `^evt-[0-9a-f]{16}$`, so the long-decimal-run
+        // rule still fires. Same for capture_id without the
+        // `sha256:` prefix, for a raw_sha256 that is not 64 hex, and
+        // for a dataset_id that does not carry the `dataset-` prefix.
+        for leak in [
+            serde_json::json!({"event_id": "001010123456789"}),
+            serde_json::json!({"event_id": "evt-001010123456789"}),
+            serde_json::json!({"parent_event_id": "evt-78165221727737bg"}), // 'g' is not hex
+            serde_json::json!({"capture_id": "001010123456789"}),
+            serde_json::json!({"raw_sha256": "001010123456789"}),
+            serde_json::json!({
+                "raw_payload_reference": "001010123456789#nas-offset=5"
+            }),
+            serde_json::json!({"dataset_id": "001010123456789"}),
+        ] {
+            assert!(
+                contains_forbidden_identity(&leak),
+                "IMSI hidden in a technical field must be rejected: {}",
+                leak
+            );
+        }
+    }
+
+    #[test]
+    fn whitelisted_names_do_not_exempt_other_marker_shapes() {
+        // Even under a whitelisted key, forbidden identity MARKERS
+        // (imsi-, supi-, msisdn=, …) must still trigger. The
+        // technical-field exemption only short-circuits the long-run
+        // heuristic, never the explicit marker list.
+        let smuggled = serde_json::json!({
+            "event_id": "imsi-001010123456789"
+        });
+        assert!(contains_forbidden_identity(&smuggled));
     }
 }
