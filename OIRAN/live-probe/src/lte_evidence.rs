@@ -948,8 +948,10 @@ fn validate_request(request: &LteEvidenceImportRequest) -> Result<(), LteEvidenc
                 step.index.to_string(),
             ));
         }
-        if contains_forbidden_identity(
+        if contains_forbidden_step_measurement(
             &serde_json::to_value(&step.measurements).unwrap_or(Value::Null),
+            &request.evidence.run_id,
+            &[],
         ) {
             return Err(LteEvidenceError::new(
                 "LTE_IDENTITY_DISCLOSURE_REJECTED",
@@ -1372,25 +1374,92 @@ fn contains_forbidden_identity(value: &Value) -> bool {
         }),
         Value::Array(items) => items.iter().any(contains_forbidden_identity),
         Value::String(text) => {
-            let lower = text.to_ascii_lowercase();
             (has_long_digit_run(text, 14) && !is_sha256_value(text))
-                || [
-                    "imsi-",
-                    "supi-",
-                    "suci-",
-                    "5g-guti-",
-                    "5g-tmsi-",
-                    "imei-",
-                    "imeisv=",
-                    "msisdn=",
-                    "pei=",
-                    "opc=",
-                    "authentication_key=",
-                    "subscriber_key=",
-                    "security_key=",
+                || contains_forbidden_identity_marker(text)
+        }
+        _ => false,
+    }
+}
+
+fn contains_forbidden_identity_marker(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "imsi-",
+        "supi-",
+        "suci-",
+        "5g-guti-",
+        "5g-tmsi-",
+        "imei-",
+        "imeisv=",
+        "msisdn=",
+        "pei=",
+        "opc=",
+        "authentication_key=",
+        "subscriber_key=",
+        "security_key=",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn strict_lte_run_id(value: &str) -> bool {
+    value.len() == "lte-run-".len() + 32
+        && value.strip_prefix("lte-run-").is_some_and(|suffix| {
+            suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn is_iperf_runtime_output(path: &[&str]) -> bool {
+    matches!(
+        path,
+        ["iperf_runtime_diagnostic", "diagnostic", "stdout"]
+            | ["iperf_runtime_diagnostic", "diagnostic", "stderr"]
+    )
+}
+
+fn contains_forbidden_step_measurement(
+    value: &Value,
+    declared_run_id: &str,
+    path: &[&str],
+) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, value)| {
+            if is_forbidden_identity_label(key)
+                || (["name", "type", "field", "key"].contains(&key.as_str())
+                    && value.as_str().is_some_and(is_forbidden_identity_label))
+            {
+                return true;
+            }
+            let mut child_path = path.to_vec();
+            child_path.push(key);
+            contains_forbidden_step_measurement(value, declared_run_id, &child_path)
+        }),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| contains_forbidden_step_measurement(item, declared_run_id, path)),
+        Value::String(text) => {
+            let without_declared_run_id = if strict_lte_run_id(declared_run_id) {
+                text.replace(declared_run_id, "")
+            } else {
+                text.clone()
+            };
+            if without_declared_run_id.contains("lte-run-")
+                || contains_forbidden_identity_marker(&without_declared_run_id)
+            {
+                return true;
+            }
+            if is_iperf_runtime_output(path) {
+                let lower = without_declared_run_id.to_ascii_lowercase();
+                return [
+                    "imsi", "imei", "imeisv", "msisdn", "guti", "tmsi", "suci", "supi",
                 ]
                 .iter()
-                .any(|marker| lower.contains(marker))
+                .any(|marker| lower.contains(marker));
+            }
+            has_long_digit_run(&without_declared_run_id, 14)
+                && !is_sha256_value(&without_declared_run_id)
         }
         _ => false,
     }
@@ -2159,5 +2228,63 @@ mod tests {
             "teid":"0x1001",
             "capture_id":format!("sha256:{}", "0".repeat(64))
         })));
+    }
+
+    #[test]
+    fn step_privacy_allows_only_declared_run_id_and_iperf_numeric_diagnostics() {
+        let run_id = "lte-run-09913806240271269bd9d7e0d4d07eb2";
+        let measurements = json!({
+            "terminal_log_persistence": {"path": format!("/runs/{run_id}/srsue.log")},
+            "iperf_runtime_diagnostic": {
+                "diagnostic": {
+                    "stdout": "1700000000000000 1000000 120000000000000",
+                    "stderr": ""
+                }
+            }
+        });
+        assert!(!contains_forbidden_step_measurement(
+            &measurements,
+            run_id,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn step_privacy_rejects_long_identity_outside_iperf_output() {
+        let run_id = "lte-run-09913806240271269bd9d7e0d4d07eb2";
+        assert!(contains_forbidden_step_measurement(
+            &json!({"other_diagnostic":{"stdout":"001010123456789"}}),
+            run_id,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn step_privacy_keeps_identity_markers_active_in_iperf_output() {
+        let run_id = "lte-run-09913806240271269bd9d7e0d4d07eb2";
+        assert!(contains_forbidden_step_measurement(
+            &json!({"iperf_runtime_diagnostic":{"diagnostic":{
+                "stdout":"imsi 001010123456789"
+            }}}),
+            run_id,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn step_privacy_rejects_mismatched_or_malformed_run_ids() {
+        let run_id = "lte-run-09913806240271269bd9d7e0d4d07eb2";
+        for embedded in [
+            "lte-run-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "lte-run-111111111111111",
+        ] {
+            assert!(contains_forbidden_step_measurement(
+                &json!({"iperf_runtime_diagnostic":{"diagnostic":{
+                    "stdout":embedded
+                }}}),
+                run_id,
+                &[]
+            ));
+        }
     }
 }

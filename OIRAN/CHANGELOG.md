@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.7.9 — 2026-11-04 — bounded LTE runtime-diagnostic privacy predicate
+
+- Removes only the envelope's exact strict `lte-run-<32 lowercase hex>` value
+  before applying the long-digit privacy rule to LTE step measurements; any
+  other or malformed run identifier remains rejected fail-closed.
+- Exempts only the numeric-run heuristic for the exact iperf runtime diagnostic
+  stdout/stderr fields while retaining all subscriber and equipment identity
+  markers everywhere.
+
 ## OIRAN API 2.7.8 — 2026-11-04 — scalar pseudonym IE contract
 
 - Serializes every GTPv2-C, S1AP and EPS NAS information element named
