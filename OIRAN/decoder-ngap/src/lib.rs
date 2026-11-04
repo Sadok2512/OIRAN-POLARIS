@@ -24,7 +24,7 @@ use plugin_runtime::{
     PLUGIN_API_VERSION,
 };
 
-pub const VERSION: &str = "0.6.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SCHEMA_VERSION: &str = "3GPP TS 38.413 V17.3.0";
 pub const SCHEMA_SHA256: &str = "b705532dd52674fce67ccc01df7bd17a8412341ea82740c164029a5b545f04d2";
 #[derive(Default)]

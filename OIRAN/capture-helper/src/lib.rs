@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const VERSION: &str = "0.1.0-dev";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_CAPTURE_PLANES: usize = 4;
 const MAX_IPC_BYTES: u64 = 64 * 1024;

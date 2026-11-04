@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use transport_tcp::{ProvenanceSpan, ReassembledConnection, ReassembledDirection, TcpEndpoint};
 
-pub const VERSION: &str = "0.3.1";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Public error code emitted on `NormalizedEvent::errors` when HPACK decoding fails
 /// for a HEADERS/CONTINUATION block (dynamic table state lost, Huffman literal that
 /// the hpack crate rejects, or any other HPACK framing error). Consumers use this

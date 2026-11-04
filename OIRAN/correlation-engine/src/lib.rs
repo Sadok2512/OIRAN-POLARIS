@@ -7,7 +7,7 @@ use session_engine::{
 };
 use std::collections::BTreeMap;
 
-pub const VERSION: &str = "0.5.2";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RULE_VERSION: &str = "1.0.0";
 pub const DISCOVERY_RULE_VERSION: &str = "1.1.0";
 pub const SBI_RULE_VERSION: &str = "1.0.0";

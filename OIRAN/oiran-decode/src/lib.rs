@@ -24,7 +24,7 @@ use std::{
 use transport_sctp::SctpReassembler;
 use transport_tcp::TcpReassembler;
 
-pub const VERSION: &str = "0.6.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn installed_decoder_versions() -> BTreeMap<String, String> {
     [

@@ -2,7 +2,7 @@
 
 use callflow_schema::CallFlow;
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn render(flow: &CallFlow) -> Result<String, serde_json::Error> {
     let json = serde_json::to_string(flow)?;

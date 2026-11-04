@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{self, BufRead};
 
-pub const VERSION: &str = "0.5.1";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const LTE_CROSS_PLANE_WINDOW_NS: i128 = 300_000_000_000;
 

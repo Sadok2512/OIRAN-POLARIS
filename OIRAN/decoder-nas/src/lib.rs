@@ -3,7 +3,7 @@
 
 use event_schema::{pseudonym, sha256_hex, DecodeStatus, InformationElement, NamedValue, PseudonymKey};
 
-pub const VERSION: &str = "0.3.1";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SPECIFICATION: &str = "3GPP TS 24.501 Release 17 + 3GPP TS 24.301";
 pub const EPD_5GMM: u8 = 0x7e;
 pub const EPD_5GSM: u8 = 0x2e;

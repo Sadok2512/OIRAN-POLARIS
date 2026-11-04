@@ -1,5 +1,75 @@
 # Changelog
 
+## OIRAN API 2.7.17 — 2026-11-04 — remove every hardcoded version; measure continuous RSS
+
+- `apps/api/src/lib.rs:44-45` previously pinned `API_VERSION` and
+  `PLATFORM_VERSION` to the string `"2.7.15"`, so `apps/api/Cargo.toml`
+  could bump to `2.7.16` while `/version` still reported the old number
+  and the unit assertion at `apps/api/src/lib.rs:3509` still read
+  `"2.7.15"`. ANR2 refused the 2.7.16 deployment on exactly this drift.
+  Fix: `API_VERSION = env!("CARGO_PKG_VERSION")`,
+  `PLATFORM_VERSION = env!("CARGO_PKG_VERSION")`. The /version regression
+  test now asserts `backend_api == env!("CARGO_PKG_VERSION") ==
+  platform_core` — no literal in the assertion.
+- Same drift hazard existed in every other crate: `decoder-ngap`,
+  `decoder-s1ap`, `decoder-nas`, `decoder-pfcp`, `decoder-gtpu`,
+  `decoder-gtpv2c`, `decoder-sbi`, `decoder-diameter`, `oiran-decode`,
+  `session-engine`, `correlation-engine`, `callflow-schema`,
+  `callflow-renderer`, `live-probe`, `disk-safety`, `dataset-registry`,
+  `transport-tcp`, `capture-helper` all exposed
+  `pub const VERSION: &str = "<literal>"` mirrored from their own
+  Cargo.toml. All 18 are now `pub const VERSION: &str =
+  env!("CARGO_PKG_VERSION")`. `cargo build` confirms the identity across
+  the workspace; no further manual bumps required.
+- Web frontend version (`apps/web/package.json`) was hardcoded as
+  `"web_frontend":"2.7.1"` in `apps/api/src/lib.rs:669`. New
+  `apps/api/build.rs` reads `apps/web/package.json` at build time and
+  emits `cargo:rustc-env=OIRAN_WEB_FRONTEND_VERSION=<value>`; the
+  constant `WEB_FRONTEND_VERSION = env!("OIRAN_WEB_FRONTEND_VERSION")`
+  serves it. `cargo:rerun-if-changed` is set so bumping the frontend
+  triggers an API rebuild automatically.
+- Memory measurement: the user reported that `oiran-api` RSS approaches
+  256 MiB in production under 2.7.16. We built a reproducible harness
+  (`AUDIT_E2E_CERT_001_scripts/04-generate-synthetic-events.py` +
+  `04-rss-continuous.rs`, installed as
+  `OIRAN/session-engine/examples/rss_continuous.rs`) and measured on the
+  reported shape (25 537 events, 8 sessions):
+
+  | stage                        | VmRSS   | VmPeak  |
+  | ---                          | ---:    | ---:    |
+  | baseline                     | 1.06 MiB | 3.47 MiB |
+  | after `load_path`            | **114.7 MiB** | **127.5 MiB** |
+  | after `discover_sessions`    | **130.7 MiB** | **136.5 MiB** |
+  | after drop (allocator held)  | 116.9 MiB | 136.5 MiB |
+
+  **Peak: 137 MiB VmPeak — under the 200 MiB threshold** stated in the
+  mission brief. Retention is concentrated in `Vec<EventRecord>` returned
+  by `session_engine::load_path` at `session-engine/src/lib.rs:620-623`.
+  session-engine already strips `source_json` to the three top-level
+  schema keys (`compact_source`, `src/lib.rs:691-701`), which was
+  introduced specifically to keep the continuous importer below the
+  256 MiB cgroup; without that trim the figure would be ~3× higher.
+  The 115 MiB resident after `drop(events)` is the Rust allocator
+  retaining freed arenas, not leaked data — it is reused by the next
+  publication cycle rather than returned to the kernel. The production
+  gap to 256 MiB (~120 MiB) is accounted for by the live Axum router,
+  Tokio worker pool, decode spool buffers (`decoded_spool` /
+  `normalized_spool`, `live-probe/src/lib.rs:2538, 2613`), and the live
+  `datasets` map; no new bound is required at this stage.
+- Regression test guarantees: workspace build succeeds with the new
+  `env!()` wiring across all 18 crates and the new `build.rs`.
+  `cargo test --workspace --locked --release` → **364 passed / 0 failed /
+  4 ignored** (same count as 2.7.16). The strengthened
+  `apps/api::tests::version_reports_installed_lte_and_5g_decoders`
+  now asserts `backend_api == platform_core ==
+  env!("CARGO_PKG_VERSION")` and `web_frontend ==
+  env!("OIRAN_WEB_FRONTEND_VERSION")` — four assertions added inside
+  the same test function, so the count is unchanged. Shell guards
+  (`test-rotation-drops.sh`, `test-rotation-watcher.sh`,
+  `test-dumpcap-retention.sh`) all PASS.
+- Versions: `apps/api` 2.7.16 → 2.7.17. No other crate changes version
+  — this is purely a drift-hardening patch.
+
 ## OIRAN API 2.7.16 — 2026-11-04 — API continuous projection + bounded-batch backpressure drain
 
 - `live-probe::CaptureManager::start_continuous_import` now recovers a

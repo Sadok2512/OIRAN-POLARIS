@@ -41,8 +41,16 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
-pub const API_VERSION: &str = "2.7.15";
-pub const PLATFORM_VERSION: &str = "2.7.15";
+// 2.7.17 — both version constants are now derived from CARGO_PKG_VERSION so
+// the binary, the /version response and the test assertion can never drift
+// from the package manifest (ANR2 refused 2.7.16 because API_VERSION was
+// hardcoded to "2.7.15" while apps/api/Cargo.toml was already at 2.7.16).
+pub const API_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const PLATFORM_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 2.7.17 — the web frontend's version is read from `apps/web/package.json`
+/// at build time via `build.rs` (`cargo:rustc-env=OIRAN_WEB_FRONTEND_VERSION`),
+/// so bumping the frontend never requires editing this crate again.
+pub const WEB_FRONTEND_VERSION: &str = env!("OIRAN_WEB_FRONTEND_VERSION");
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -666,7 +674,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 async fn version(State(state): State<AppState>) -> Json<Value> {
     let flow = primary_flow(&state);
     ok(json!({
-        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":"2.7.1",
+        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":WEB_FRONTEND_VERSION,
         "event_schema":"1.2.0","callflow_schema":flow.map(|value|value.schema_version.as_str()).unwrap_or("UNKNOWN"),
         "session_engine":session_engine::VERSION,"correlation_engine":correlation_engine::VERSION,"dataset_registry":dataset_registry::VERSION,
         "disk_safety":disk_safety::VERSION,
@@ -3498,7 +3506,13 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let value = json_body(response).await;
-        assert_eq!(value["data"]["backend_api"], "2.7.15");
+        // 2.7.17: verify the binary reports exactly the Cargo-declared
+        // version. No literal here — ANR2 refused 2.7.16 because this
+        // assertion still read "2.7.15" after the package bump.
+        assert_eq!(value["data"]["backend_api"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["data"]["platform_core"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["data"]["backend_api"], value["data"]["platform_core"]);
+        assert_eq!(value["data"]["web_frontend"], env!("OIRAN_WEB_FRONTEND_VERSION"));
         for protocol in [
             "S1AP",
             "NAS-EPS-MM",

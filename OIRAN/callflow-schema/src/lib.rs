@@ -5,7 +5,7 @@ use serde_json::Value;
 use session_engine::{Association, EventRecord, LteSession, PacketRef, Reconstruction};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const VERSION: &str = "1.2.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Participant {

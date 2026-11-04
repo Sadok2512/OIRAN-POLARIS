@@ -4,7 +4,7 @@ use capture_pcap::{CapturePacket, TransportProtocol, TransportView};
 use event_schema::{ExactTimestamp, PacketReference};
 use std::collections::{BTreeMap, HashMap};
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_CONNECTIONS: usize = 4096;
 const MAX_DIRECTION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_SEGMENTS: usize = 4096;

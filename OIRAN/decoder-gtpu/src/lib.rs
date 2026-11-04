@@ -9,7 +9,7 @@ use plugin_runtime::{
     PLUGIN_API_VERSION,
 };
 
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Default)]
 pub struct GtpuDecoder;
 #[derive(Clone, Debug, Eq, PartialEq)]

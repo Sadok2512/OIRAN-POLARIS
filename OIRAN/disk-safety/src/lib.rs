@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::path::Path;
 
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
