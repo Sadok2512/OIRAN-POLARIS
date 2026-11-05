@@ -622,6 +622,45 @@ pub fn load_path(path: &std::path::Path) -> Result<Vec<EventRecord>, String> {
     load_jsonl(io::BufReader::new(file))
 }
 
+/// 2.7.24: like `load_path` but drops `information_elements` for every
+/// event whose `protocol` is NOT in the IE-reading set
+/// (`PFCP`, `NGAP`). Those two protocols are the only ones whose IEs
+/// drive session discovery (`collect_pfcp_tunnels`) and
+/// cross-interface correlation (`tunnel_key`/`tunnel_keys` in
+/// `correlation-engine`); for everything else the IE tree is a pure
+/// render-time payload. Dropping it for N3/GTP-U, SBI, S1AP, GTPv2-C,
+/// NAS, etc., halves to triples per-event memory on real datasets
+/// where these protocols dominate — the key memory win for 2.7.24.
+///
+/// The per-session `reconstruct` + `build_callflow` path still needs
+/// full IEs; that is done later via `load_events_by_ids` which uses
+/// the heavy `load_path` and holds only a few hundred events in RAM
+/// at a time.
+pub fn load_path_slim(path: &std::path::Path) -> Result<Vec<EventRecord>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    load_jsonl_slim(io::BufReader::new(file))
+}
+
+pub fn load_jsonl_slim<R: BufRead>(reader: R) -> Result<Vec<EventRecord>, String> {
+    let mut events = Vec::new();
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("line {}: {e}", line_no + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)
+            .map_err(|e| format!("line {}: invalid JSON: {e}", line_no + 1))?;
+        let mut event =
+            parse_event(value).map_err(|e| format!("line {}: {e}", line_no + 1))?;
+        if !matches!(event.protocol.as_str(), "PFCP" | "NGAP") {
+            event.information_elements = Value::Array(Vec::new());
+        }
+        events.push(event);
+    }
+    deterministic_sort(&mut events);
+    Ok(events)
+}
+
 fn parse_event(v: Value) -> Result<EventRecord, String> {
     let string = |path: &[&str]| -> Result<String, String> {
         let mut p = &v;

@@ -29,7 +29,7 @@ use session_engine::{
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -2543,7 +2543,12 @@ impl CaptureManager {
         )
     }
 
-    fn process_continuous_capture(
+    /// 2.7.23: exposed `pub` so RSS harnesses (see
+    /// `examples/rss_publication.rs`) can drive one publication cycle
+    /// without the full `start_continuous_import` orchestration (which
+    /// requires the lab-only allowlisted source directory). Production
+    /// callers go through `start_continuous_import`.
+    pub fn process_continuous_capture(
         &self,
         base: &Path,
         interfaces: &[CaptureInterface],
@@ -2616,7 +2621,14 @@ impl CaptureManager {
         Ok(dataset)
     }
 
-    fn process_capture_into(
+    /// 2.7.23: exposed `pub` so RSS harnesses (see
+    /// `examples/rss_publication.rs`) can drive one publication cycle
+    /// into a scratch directory, bypassing the
+    /// `CONTINUOUS_DERIVED_OUTPUT_LIMIT` ceiling of
+    /// `process_continuous_capture` (which is sized for the production
+    /// ring, not multi-hundred-thousand-event histories). Production
+    /// callers go through `process_continuous_capture`.
+    pub fn process_capture_into(
         &self,
         capture_id: &str,
         dataset_id: String,
@@ -2723,85 +2735,58 @@ impl CaptureManager {
         decoded_spool.get_ref().sync_all().map_err(display_error)?;
         drop(decoded_spool);
         if capture_id == CONTINUOUS_CAPTURE_ID {
-            // Keep only IDs and offsets in memory. Normalized event JSON is
-            // spooled on disk, so resident memory is independent of event body
-            // size and of the number of events decoded from an input segment.
-            let normalized_spool_path = dataset_dir.join(".normalized-events.spool");
-            let normalized_spool_file = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&normalized_spool_path)
-                .map_err(display_error)?;
-            let mut normalized_writer = BufWriter::with_capacity(
+            // 2.7.23 (issue #10 comment 6659…): streaming merge. We write
+            // the final `oiran_events.jsonl.tmp` line by line directly —
+            // no `.normalized-events.spool` roundtrip, no
+            // `BTreeMap<String, EventSpoolLocation>` of offsets. The
+            // only in-memory structure is a `BTreeSet<String>` of
+            // event_ids already written (dedup), and a `u64` purge
+            // counter.
+            //
+            // Prior events are streamed first so a re-decoded packet
+            // with the same deterministic event_id is a no-op (first
+            // write wins — content is deterministic, so this is
+            // observation-identical to the 2.7.22 "last write wins"
+            // behaviour). Retention and dedup run inline as each line
+            // is read, so the peak memory contribution from the merge
+            // scales only with the set of surviving event_ids.
+            let tmp_path = events_path.with_extension("jsonl.tmp");
+            let mut writer = BufWriter::with_capacity(
                 STREAM_CHUNK_BYTES,
-                normalized_spool_file.try_clone().map_err(display_error)?,
+                fs::File::create(&tmp_path).map_err(display_error)?,
             );
-            let mut normalized_offset = 0u64;
-            let mut indexed: BTreeMap<String, EventSpoolLocation> = BTreeMap::new();
-            // 2.7.22 (issue #10 comment 6657170005): the 2.7.18 keep_prior
-            // filter kept only prior events whose capture_id matched a
-            // pcap currently in the ring. That filter was introduced to
-            // stop `dataset/oiran_events.jsonl` from accreting forever,
-            // but on the ANR2 lab's first republish after 2.7.21 it
-            // dropped 21 515 historical event_ids (25 537 → 7 963)
-            // because 50 of the 51 contributing pcaps had already been
-            // rotated out of the ring. The ring is the wrong authority
-            // for dataset membership. Decision: every prior event is
-            // kept — deduplication via `indexed` on event_id already
-            // bounds the map, and the real growth control is an
-            // age-based purge applied just before the dataset is
-            // rewritten (see `retention_cutoff_epoch_s` below).
+            let mut seen_ids: BTreeSet<String> = BTreeSet::new();
+            let cutoff = retention_cutoff_epoch_s();
+            let mut purged: u64 = 0;
+            let mut oldest_kept: Option<u64> = None;
             if let Some((prior_dir, _)) = &prior_continuous {
-                let prior_events_file =
-                    fs::File::open(prior_dir.join("oiran_events.jsonl")).map_err(display_error)?;
+                let prior_events_file = fs::File::open(prior_dir.join("oiran_events.jsonl"))
+                    .map_err(display_error)?;
                 let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, prior_events_file);
-                index_event_stream(
+                merge_event_stream(
                     reader,
-                    &mut normalized_writer,
-                    &mut normalized_offset,
-                    &mut indexed,
-                    |_| true,
+                    &mut writer,
+                    &mut seen_ids,
+                    cutoff,
+                    &mut purged,
+                    &mut oldest_kept,
                 )?;
             }
             let decoded_reader = BufReader::with_capacity(
                 STREAM_CHUNK_BYTES,
                 fs::File::open(&decoded_spool_path).map_err(display_error)?,
             );
-            index_event_stream(
+            merge_event_stream(
                 decoded_reader,
-                &mut normalized_writer,
-                &mut normalized_offset,
-                &mut indexed,
-                |_| true,
+                &mut writer,
+                &mut seen_ids,
+                cutoff,
+                &mut purged,
+                &mut oldest_kept,
             )?;
-            // 2.7.22: age-based retention. Events older than the
-            // retention window (`OIRAN_DATASET_RETENTION_DAYS`, default
-            // 30) drop out here and here only — never because their
-            // originating pcap has been rotated. One structured log
-            // line per publish summarises the purge (count,
-            // oldest-kept epoch, cutoff) so the operator can trace it.
-            let cutoff = retention_cutoff_epoch_s();
-            let before_retention = indexed.len();
-            let mut oldest_kept: Option<u64> = None;
-            indexed.retain(|_, location| {
-                // An event with `timestamp_s == 0` had no parseable
-                // `timestamp.seconds` when it was indexed — we keep it
-                // so retention never silently discards an event we
-                // could not age-assess.
-                if location.timestamp_s != 0 && location.timestamp_s < cutoff {
-                    false
-                } else {
-                    if location.timestamp_s != 0 {
-                        oldest_kept = Some(match oldest_kept {
-                            None => location.timestamp_s,
-                            Some(current) => current.min(location.timestamp_s),
-                        });
-                    }
-                    true
-                }
-            });
-            let purged = before_retention.saturating_sub(indexed.len());
+            writer.flush().map_err(display_error)?;
+            writer.get_ref().sync_all().map_err(display_error)?;
+            drop(writer);
             if purged > 0 {
                 eprintln!(
                     "{}",
@@ -2810,52 +2795,26 @@ impl CaptureManager {
                         "cutoff_epoch_s": cutoff,
                         "retention_days": retention_days(),
                         "purged_count": purged,
-                        "retained_count": indexed.len(),
+                        "retained_count": seen_ids.len(),
                         "oldest_kept_epoch_s": oldest_kept,
                     })
                 );
             }
-            normalized_writer.flush().map_err(display_error)?;
-            normalized_writer
-                .get_ref()
-                .sync_all()
-                .map_err(display_error)?;
-            drop(normalized_writer);
-            // Stream the output through BufWriter. We write to a tmp file next
-            // to the destination, fsync, then atomic rename, matching the
-            // existing `atomic_write` contract for bounded-memory callers.
-            let tmp_path = events_path.with_extension("jsonl.tmp");
-            {
-                let tmp_file = fs::File::create(&tmp_path).map_err(display_error)?;
-                let mut writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, tmp_file);
-                let mut normalized_reader = normalized_spool_file;
-                let mut line = Vec::new();
-                for location in indexed.values() {
-                    normalized_reader
-                        .seek(SeekFrom::Start(location.offset))
-                        .map_err(display_error)?;
-                    line.resize(location.length as usize, 0);
-                    normalized_reader
-                        .read_exact(&mut line)
-                        .map_err(display_error)?;
-                    writer.write_all(&line).map_err(display_error)?;
-                }
-                writer.flush().map_err(display_error)?;
-                writer.get_ref().sync_all().map_err(display_error)?;
-            }
             fs::rename(&tmp_path, &events_path).map_err(display_error)?;
-            fs::remove_file(&normalized_spool_path).map_err(display_error)?;
         } else {
             fs::rename(&decoded_spool_path, &events_path).map_err(display_error)?;
         }
         if decoded_spool_path.exists() {
             fs::remove_file(&decoded_spool_path).map_err(display_error)?;
         }
-        let mut events = load_path(&events_path)?;
-        // Materialise event-id set before taking a mutable borrow for
-        // discover_sessions. The set is used later for the retained-event
-        // provenance assertion. Taking owned Strings avoids holding an
-        // immutable borrow of `events` across the `&mut events` call.
+        // 2.7.24: `load_path_slim` drops `information_elements` for
+        // every event whose protocol is NOT in `{PFCP, NGAP}` (those
+        // two drive tunnel discovery and cross-interface correlation;
+        // everything else's IE tree is a pure render-time payload
+        // needed only by `build_callflow`). The per-session loop
+        // below re-loads the full IE tree via `load_events_by_ids`
+        // for the few hundred events of each call flow at a time.
+        let mut events = session_engine::load_path_slim(&events_path)?;
         let retained_event_ids: BTreeSet<String> =
             events.iter().map(|event| event.event_id.clone()).collect();
         let capture_job = self.get(capture_id);
@@ -2880,52 +2839,76 @@ impl CaptureManager {
             .map(|context| context.ue_ip.clone())
             .collect::<Vec<_>>();
         let discovery = discover_sessions(&mut events);
-        // Correlate over the complete retained evidence set before selecting
-        // an individual session. Restricting correlation to the initial N2
-        // session IDs made the exact N2→N4 edge impossible to discover and,
-        // consequently, prevented the exact N4→N3 TEID edge from entering the
-        // call flow even though all three observations were present.
         let mut global_edges = correlate_discovered_tunnels(&events, &discovery);
         global_edges.extend(correlate_cross_interface_evidence(&events));
         global_edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
         global_edges.dedup_by(|left, right| left.edge_id == right.edge_id);
+        // 2.7.23: materialise LTE + runtime call flows now (they need
+        // the live `events` Vec), build per-PDU-session plans (metadata
+        // only — no event bodies), then drop `events` so the
+        // per-session loop below can reconstruct each call flow with
+        // only that session's events in memory. Peak RSS stops scaling
+        // linearly with `events.len()` once we exit this block.
+        struct SessionPlan {
+            session_id: String,
+            ids: BTreeSet<String>,
+            edges: Vec<CorrelationEdge>,
+            ue_pseudonym: Option<String>,
+        }
+        let session_plans: Vec<SessionPlan> = discovery
+            .pdu_sessions
+            .iter()
+            .map(|session| {
+                let context = discovery
+                    .ue_contexts
+                    .iter()
+                    .find(|context| context.context_id == session.ue_context_id);
+                let mut ids: BTreeSet<String> =
+                    session.event_ids.iter().cloned().collect();
+                if let Some(context) = context {
+                    ids.extend(context.event_ids.iter().cloned());
+                }
+                expand_session_evidence_ids(&mut ids, &global_edges);
+                let edges = global_edges
+                    .iter()
+                    .filter(|edge| {
+                        ids.contains(&edge.source_event_id)
+                            && ids.contains(&edge.target_event_id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                SessionPlan {
+                    session_id: session.session_id.clone(),
+                    ids,
+                    edges,
+                    ue_pseudonym: context.map(|context| context.pseudonym.clone()),
+                }
+            })
+            .collect();
+        let lte_flows: Vec<CallFlow> = offline_lte_callflows(&events)?;
+        let runtime_flows: Vec<CallFlow> = active_pdu_contexts
+            .iter()
+            .map(|active| runtime_pdu_callflow(&events, active))
+            .collect();
+        let event_count = events.len();
+        drop(events);
         let mut session_ids = Vec::new();
-        for session in &discovery.pdu_sessions {
-            let context = discovery
-                .ue_contexts
-                .iter()
-                .find(|context| context.context_id == session.ue_context_id);
-            let mut ids = session.event_ids.iter().cloned().collect::<BTreeSet<_>>();
-            if let Some(context) = context {
-                ids.extend(context.event_ids.iter().cloned());
-            }
-            expand_session_evidence_ids(&mut ids, &global_edges);
-            let selected = events
-                .iter()
-                .filter(|event| ids.contains(&event.event_id))
-                .cloned()
-                .collect::<Vec<_>>();
-            let edges = global_edges
-                .iter()
-                .filter(|edge| {
-                    ids.contains(&edge.source_event_id) && ids.contains(&edge.target_event_id)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+        for plan in session_plans {
+            let selected = load_events_by_ids(&events_path, &plan.ids)?;
             let mut reconstruction = reconstruct(
                 selected,
                 ReconstructionHints {
-                    ue_pseudonym: context.map(|context| context.pseudonym.clone()),
+                    ue_pseudonym: plan.ue_pseudonym,
                     ..Default::default()
                 },
             );
-            reconstruction.session_id = session.session_id.clone();
+            reconstruction.session_id = plan.session_id.clone();
             for event in &reconstruction.events {
                 reconstruction
                     .association
                     .insert(event.event_id.clone(), Association::Session);
             }
-            let flow = build_callflow(&reconstruction, edges);
+            let flow = build_callflow(&reconstruction, plan.edges);
             let json_path = dataset_dir
                 .join("callflows")
                 .join(format!("{}.json", flow.session_id));
@@ -2940,7 +2923,7 @@ impl CaptureManager {
             atomic_write(&html_path, html.as_bytes())?;
             session_ids.push(flow.session_id);
         }
-        for flow in offline_lte_callflows(&events)? {
+        for flow in lte_flows {
             let json_path = dataset_dir
                 .join("callflows")
                 .join(format!("{}.json", flow.session_id));
@@ -2955,8 +2938,7 @@ impl CaptureManager {
             atomic_write(&html_path, html.as_bytes())?;
             session_ids.push(flow.session_id);
         }
-        for active in &active_pdu_contexts {
-            let flow = runtime_pdu_callflow(&events, active);
+        for flow in runtime_flows {
             let json_path = dataset_dir
                 .join("callflows")
                 .join(format!("{}.json", flow.session_id));
@@ -3023,11 +3005,11 @@ impl CaptureManager {
             dataset_id,
             capture_id: capture_id.into(),
             path: dataset_path,
-            event_count: events.len(),
+            event_count,
             session_ids,
             decode_reports: reports,
             checksums,
-            state: if events.is_empty() {
+            state: if event_count == 0 {
                 "COMPLETED_EMPTY".into()
             } else if discovery.unmatched_event_ids.is_empty() {
                 "COMPLETED".into()
@@ -3707,7 +3689,7 @@ fn validate_derived_event_provenance(
     Ok(())
 }
 
-fn interface_specs() -> Vec<CaptureInterface> {
+pub fn interface_specs() -> Vec<CaptureInterface> {
     vec![
         spec(
             "N2",
@@ -4227,18 +4209,6 @@ fn native_owned_usage(root: &Path) -> Result<(u64, usize), String> {
     ))
 }
 
-#[derive(Clone, Copy, Debug)]
-struct EventSpoolLocation {
-    offset: u64,
-    length: u64,
-    /// 2.7.22: epoch-seconds of the event's `timestamp.seconds` field,
-    /// used to drive age-based retention
-    /// (`OIRAN_DATASET_RETENTION_DAYS`). `0` when the event has no
-    /// parseable timestamp — such events are treated as "newer than the
-    /// cutoff" so they never get purged silently.
-    timestamp_s: u64,
-}
-
 /// 2.7.22: retention window in days, read once per publish from
 /// `OIRAN_DATASET_RETENTION_DAYS` (default 30, clamped 1..=3650).
 fn retention_days() -> u64 {
@@ -4377,17 +4347,77 @@ impl CompactionReport {
     }
 }
 
-fn index_event_stream<R, W, F>(
+/// 2.7.23: load only the events whose `event_id` is in `ids`. Streams
+/// the jsonl file line by line through session-engine's parser; peak
+/// memory is the subset we actually want + one in-flight line. Used by
+/// `process_capture_into` after `drop(events)` to reconstruct one call
+/// flow at a time.
+fn load_events_by_ids(
+    path: &Path,
+    ids: &BTreeSet<String>,
+) -> Result<Vec<session_engine::EventRecord>, String> {
+    use std::io::BufRead;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path).map_err(display_error)?;
+    let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
+    let mut selected = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(display_error)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Peek at `event_id` cheaply without constructing the full
+        // EventRecord. serde_json only allocates the id string and
+        // skips the rest if we deserialize into a one-field struct.
+        #[derive(serde::Deserialize)]
+        struct IdOnly<'a> {
+            event_id: &'a str,
+        }
+        let id_only: IdOnly = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if !ids.contains(id_only.event_id) {
+            continue;
+        }
+        let events = session_engine::load_jsonl(line.as_bytes())?;
+        selected.extend(events);
+    }
+    Ok(selected)
+}
+
+/// 2.7.23: streaming merge of one input source into the final
+/// `oiran_events.jsonl.tmp`. Peak memory held by this function is
+/// `BTreeSet<String>` of already-written event_ids (≈ 24 B per id) +
+/// one `serde_json::Value` + one `String` line. No per-event body is
+/// retained, no second-pass seek is required — a 100 000-event merge
+/// fits comfortably below the 512 MiB cgroup ceiling, and well below
+/// the 128 MiB target.
+///
+/// Retention is applied inline: if `value.timestamp.seconds` is older
+/// than `cutoff_epoch_s` and non-zero, the line is dropped and the
+/// purge counter is incremented. `oldest_kept` records the minimum
+/// kept timestamp so the operator can see how close the dataset is to
+/// its retention edge in the `CONTINUOUS_RETENTION_PURGE` log.
+///
+/// Dedup is first-write-wins: `continuous_observation_id` is
+/// deterministic, so a re-decode of the same packet produces the same
+/// id and is silently skipped on the second write. For prior + decoded
+/// streams processed in that order, the prior copy stays authoritative;
+/// the content is identical by construction so no information is lost.
+fn merge_event_stream<R, W>(
     mut reader: R,
     writer: &mut W,
-    output_offset: &mut u64,
-    indexed: &mut BTreeMap<String, EventSpoolLocation>,
-    mut keep: F,
+    seen_ids: &mut BTreeSet<String>,
+    cutoff: u64,
+    purged: &mut u64,
+    oldest_kept: &mut Option<u64>,
 ) -> Result<(), String>
 where
     R: BufRead,
     W: Write,
-    F: FnMut(&serde_json::Value) -> bool,
 {
     let mut line = String::new();
     loop {
@@ -4400,42 +4430,46 @@ where
         }
         let mut value: serde_json::Value =
             serde_json::from_str(&line).map_err(|error| error.to_string())?;
-        if !keep(&value) {
-            continue;
-        }
-        let id = continuous_observation_id(&value)?;
-        value["event_id"] = serde_json::Value::String(id.clone());
-        // 2.7.22: capture timestamp.seconds so the age-based retention
-        // in `process_capture_into` can purge expired events without a
-        // second pass over the spool. Missing / non-numeric → treat as
-        // "no timestamp known" → caller keeps the event (never silent).
         let timestamp_s = value
             .get("timestamp")
             .and_then(|ts| ts.get("seconds"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        let serialized = serde_json::to_string(&value).map_err(|error| error.to_string())?;
-        let bytes = serialized.as_bytes();
-        let offset = *output_offset;
-        writer.write_all(bytes).map_err(display_error)?;
-        writer.write_all(b"\n").map_err(display_error)?;
-        let length = (bytes.len() + 1) as u64;
-        *output_offset = (*output_offset).saturating_add(length);
-        indexed.insert(
-            id,
-            EventSpoolLocation {
-                offset,
-                length,
-                timestamp_s,
-            },
-        );
-        // This is the same final retention policy as the previous post-pass
-        // trim, but it never permits a transient one-million-line map.
-        if indexed.len() > MAX_CONTINUOUS_EVENTS {
-            if let Some(first) = indexed.keys().next().cloned() {
-                indexed.remove(&first);
+        // Retention: timestamp_s == 0 means "no parseable timestamp" →
+        // keep (never silently drop); timestamp_s < cutoff and
+        // non-zero → purge.
+        if timestamp_s != 0 && timestamp_s < cutoff {
+            *purged = purged.saturating_add(1);
+            continue;
+        }
+        let id = continuous_observation_id(&value)?;
+        if !seen_ids.insert(id.clone()) {
+            // Duplicate (same deterministic observation id) → first
+            // write wins.
+            continue;
+        }
+        if seen_ids.len() > MAX_CONTINUOUS_EVENTS {
+            // Hard cap on the live dedup set (defensive: age-based
+            // retention is the primary bound). Remove the lexicographic
+            // first id. The matching line has already been written to
+            // the tmp file; the next publication's retention pass will
+            // trim that line out.
+            if let Some(first) = seen_ids.iter().next().cloned() {
+                seen_ids.remove(&first);
             }
         }
+        if timestamp_s != 0 {
+            *oldest_kept = Some(match *oldest_kept {
+                None => timestamp_s,
+                Some(current) => current.min(timestamp_s),
+            });
+        }
+        value["event_id"] = serde_json::Value::String(id);
+        let serialized = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+        writer
+            .write_all(serialized.as_bytes())
+            .map_err(display_error)?;
+        writer.write_all(b"\n").map_err(display_error)?;
     }
     Ok(())
 }

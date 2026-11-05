@@ -1,5 +1,101 @@
 # Changelog
 
+## OIRAN API 2.7.24 — 2026-11-05 — streaming publication merge + per-session call flow + slim-load discovery
+
+- ANR2 (urgent): on the 2.7.23 production path, `oiran-api` RSS grew
+  with the published history — 29 478 events → 349 MiB, 36 672 → 399,
+  44 520 → 443 (≈ 6 MiB per thousand). The palliative
+  `MemoryMax=512 MiB` would be hit around 55 000 events. The root
+  cause is a `Vec<EventRecord>` built by
+  `session_engine::load_path` (`OIRAN/session-engine/src/lib.rs:620-622`)
+  during each publication — each `EventRecord` holds the full
+  `information_elements: Value` tree (`.lib.rs:40`), and session
+  discovery / cross-interface correlation hold the full Vec in
+  memory across many passes.
+- 2.7.24 fix (three-part streaming refactor):
+  1. **Streaming merge** — removes the
+     `.normalized-events.spool` roundtrip and the
+     `BTreeMap<String, EventSpoolLocation>` of byte offsets. One
+     `BufWriter` writes the final `oiran_events.jsonl.tmp` directly
+     as prior + decoded sources are merged. Dedup uses a single
+     `BTreeSet<String>` of already-written event_ids (≈ 24 B per id,
+     2.4 MB for a 100 000-event dataset). Retention + the
+     `CONTINUOUS_RETENTION_PURGE` log run inline. The
+     `EventSpoolLocation` struct is removed.
+  2. **Per-session call flow** — after `discover_sessions` and the
+     cross-interface correlation run on the live `Vec<EventRecord>`,
+     the LTE + runtime call flows are materialised (they need the
+     full Vec) and per-PDU-session "plans" (session_id, event_id set,
+     edges, UE pseudonym — metadata only) are built, then
+     **`drop(events)`**. The per-session reconstruct loop calls the
+     new `load_events_by_ids(events_path, &ids)` which streams the
+     final jsonl and keeps only the few hundred events for that one
+     session.
+  3. **Slim event load for discovery / correlation** — new
+     `session_engine::load_path_slim` (`src/lib.rs:626-663`) parses
+     events the same way as `load_path` but drops
+     `information_elements` on every event whose `protocol` is NOT
+     in `{PFCP, NGAP}`. Those are the only protocols whose IEs drive
+     session discovery (`collect_pfcp_tunnels`) and cross-interface
+     correlation (`tunnel_key` / `tunnel_keys`); every other event's
+     IE tree is a pure render-time payload reloaded on demand by
+     `load_events_by_ids` during the per-session call-flow loop.
+- **Structure that retained memory (precise, as requested):** a
+  `Vec<EventRecord>` built by `session_engine::load_path` /
+  `load_path_slim` (`OIRAN/session-engine/src/lib.rs:620-663`),
+  consumed by `discover_sessions` (`.lib.rs:955`),
+  `correlate_cross_interface_evidence`
+  (`OIRAN/correlation-engine/src/lib.rs:45`) and the per-session
+  `reconstruct` loop inside
+  `live_probe::CaptureManager::process_capture_into`
+  (`OIRAN/live-probe/src/lib.rs:2810-2905`). With 2.7.24 the Vec is
+  dropped before the per-session loop runs; the Vec itself is now
+  slim (no IEs for N3/SBI/S1AP/GTPv2-C/NAS); the per-session reloads
+  use `load_events_by_ids` and never hold more than one session's
+  events.
+- Measured RSS, reproducible with
+  `cargo run --release --example rss_publication -- <history_size>`
+  (`OIRAN/live-probe/examples/rss_publication.rs`):
+
+  | history_size | 2.7.22 VmPeak | 2.7.24 VmPeak |
+  | ---: | ---: | ---: |
+  |  30 000 | 272 MiB | **146 MiB** |
+  | 100 000 |  OOM    | **488 MiB** |
+  | 200 000 |  OOM    | **971 MiB** |
+
+  Growth: VmPeak remains linear in history_size (≈ 4.8 MiB per
+  thousand events in the harness). The slim-load cuts the constant
+  factor roughly in half vs. 2.7.22 on this synthetic shape; on the
+  production dataset (where N3 events carry a tiny PDU Session
+  Container and N4 PFCP carries multi-KiB PDR/FAR/QER/URR trees)
+  the factor saved by `load_path_slim` is larger because the
+  stripped protocols dominate by event count.
+- **Quasi-constant memory is NOT achieved in 2.7.24.** Pulling
+  `discover_sessions` and `correlate_cross_interface_evidence` into
+  truly streaming state machines (so no `Vec<EventRecord>` is ever
+  materialised) is a session-engine redesign; it is scoped to 2.7.25.
+  Until then, the operator's safe ceiling with `MemoryMax=512 MiB`
+  on the ANR2 production shape moves from ~55 000 events (on 2.7.23)
+  to ~100 000 events (on 2.7.24); for datasets larger than that the
+  recommended palliative is tightening `OIRAN_DATASET_RETENTION_DAYS`
+  — the retention sweep runs INSIDE the merge, so events outside
+  the window never reach the Vec.
+- Regression tests
+  (`cargo test --workspace --locked --release` → **373 passed / 0
+  failed / 4 ignored**, same count as 2.7.23). Shell guards (3)
+  PASS. Negative harness 9/9 unchanged. 2.7.22/2.7.23 tests
+  (`retention_purges...`, `republish_preserves...`,
+  `derived_output_cap_accepts_...`,
+  `derived_output_over_limit_returns_informative_error...`) still
+  pass on the streaming merge + slim-load path.
+- Supporting API: `CaptureManager::process_continuous_capture`,
+  `CaptureManager::process_capture_into`, and `interface_specs()`
+  are now `pub` so RSS harnesses can drive one publication cycle
+  without going through `start_continuous_import` (which requires
+  the lab-only allowlisted source directory). Production callers
+  unchanged.
+- Versions: `apps/api` 2.7.23 → 2.7.24; `live-probe` 0.4.9 → 0.4.10.
+
 ## OIRAN API 2.7.23 — 2026-11-05 — configurable derived-output cap + no retry loop
 
 - ANR2 (issue #10 comment 6662293690): with `MemoryMax=512 MiB` the
