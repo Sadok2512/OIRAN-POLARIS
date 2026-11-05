@@ -7,7 +7,9 @@ pub use callflow_page::{
     read_callflow_page, DEFAULT_CALLFLOW_PAGE_EVENTS, MAX_CALLFLOW_PAGE_EVENTS,
 };
 
-use callflow_schema::{build_callflow, build_lte_callflow, CallFlow, CorrelationEdge};
+use callflow_schema::{
+    build_callflow, build_lte_callflow, fold_overlapping_edges, CallFlow, CorrelationEdge,
+};
 use capture_helper::{
     CaptureHelperClient, CaptureSpec, HelperState, InterfaceId, IpcRequest, MAX_CAPTURE_PLANES,
 };
@@ -1586,8 +1588,8 @@ impl CaptureManager {
                 .collect::<Vec<_>>();
             let mut edges = correlate_discovered_tunnels(&selected, &discovery);
             edges.extend(correlate_cross_interface_evidence(&selected));
-            edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
-            edges.dedup_by(|left, right| left.edge_id == right.edge_id);
+            // 2.7.26: same canonical-key fold as the global path.
+            edges = fold_overlapping_edges(edges);
             let mut reconstruction = reconstruct(
                 selected,
                 ReconstructionHints {
@@ -2847,8 +2849,24 @@ impl CaptureManager {
             .insert("publication_index_events".into(), events.len());
         let mut global_edges = correlate_discovered_tunnels(&events, &discovery);
         global_edges.extend(correlate_cross_interface_evidence(&events));
-        global_edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
-        global_edges.dedup_by(|left, right| left.edge_id == right.edge_id);
+        // 2.7.26 (ANR2 production rollback): two orthogonal rules can
+        // compute the same N4↔N3 (or any other) pair from independent
+        // evidence paths — in production the audit observed both
+        // `n4-n3-discovered-teid-endpoint` (from `correlate_discovered_tunnels`,
+        // which fires when `discovery.gtpu_tunnels[].related_pfcp_session`
+        // is `Some(..)`, i.e. the session-engine managed to bind the
+        // tunnel to a PFCP session) AND
+        // `pfcp-outer-header-matches-gtpu-tunnel` (from
+        // `correlate_cross_interface_evidence`, which fires on
+        // byte-identical tunnel keys regardless of session binding)
+        // on every N4↔N3 pair → 4 links instead of 2. The 2.7.25
+        // dedup compared `edge_id` only, but the builder bakes
+        // `rule_id` INTO `edge_id`, so two rules on the same pair
+        // emerged as two distinct edges. 2.7.26 folds by the
+        // canonical key `(min/max event_id, interfaces in matching
+        // order, evidence_type)` and collapses the matching rule_ids
+        // into `matched_rules` without losing a single distinct link.
+        global_edges = fold_overlapping_edges(global_edges);
         trace_publication_rss("after-correlation", Some(events.len()));
         // 2.7.23: materialise LTE + runtime call flows now (they need
         // the live `events` Vec), build per-PDU-session plans (metadata
@@ -5168,6 +5186,7 @@ mod tests {
             evidence_type: "EXACT_TUNNEL_MATCH".into(),
             scope: "tunnel-only".into(),
             limitations: Vec::new(),
+            matched_rules: Vec::new(),
         };
         let edges = vec![
             edge("n2-n4", "n2-event", "n4-event"),

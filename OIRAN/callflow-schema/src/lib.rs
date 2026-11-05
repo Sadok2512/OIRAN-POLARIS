@@ -59,10 +59,144 @@ pub struct CorrelationEdge {
     pub scope: String,
     #[serde(default)]
     pub limitations: Vec<String>,
+    /// 2.7.26: deterministic, sorted list of every `rule_id` that
+    /// derived this edge for the same canonical pair. When two rules
+    /// (e.g. `pfcp-outer-header-matches-gtpu-tunnel` and
+    /// `n4-n3-discovered-teid-endpoint`) compute the same N4↔N3 link
+    /// from independent evidence paths, the edge is published once
+    /// with both names here instead of twice. Empty on edges built by
+    /// legacy code paths that have not yet been routed through
+    /// `fold_overlapping_edges`; the `rule_id` field is always set
+    /// and always reproduced in this list.
+    #[serde(default)]
+    pub matched_rules: Vec<String>,
 }
 
 fn unknown_evidence_type() -> String {
     "UNKNOWN".into()
+}
+
+/// 2.7.26: canonical-key dedup. Collapses every edge sharing
+/// `(min(source_event_id, target_event_id), max(…), interfaces in
+/// matching order, evidence_type)` into a single edge whose
+/// `matched_rules` lists every contributing `rule_id` (sorted,
+/// deterministic). The primary `rule_id` is the alphabetically-first
+/// contributor so the publication output is byte-identical across
+/// runs. Confidence is lifted to the highest of the overlapping
+/// rules (`EXACT > STRONG > POSSIBLE > WEAK`). Matching identifiers
+/// are union-ed and sorted.
+///
+/// The dedup never relies on timestamps: the canonical key is built
+/// from `(event_id, interface, evidence_type)` only, matching the
+/// `canonical_sort_key = (capture_id, packet_number, event_id)`
+/// invariant used by `session_engine::deterministic_sort`.
+pub fn fold_overlapping_edges(mut edges: Vec<CorrelationEdge>) -> Vec<CorrelationEdge> {
+    for edge in &mut edges {
+        if !edge.matched_rules.iter().any(|rule| rule == &edge.rule_id) {
+            edge.matched_rules.push(edge.rule_id.clone());
+        }
+        edge.matched_rules.sort();
+        edge.matched_rules.dedup();
+    }
+    edges.sort_by(|left, right| canonical_edge_key(left).cmp(&canonical_edge_key(right)));
+    let mut folded: Vec<CorrelationEdge> = Vec::with_capacity(edges.len());
+    for edge in edges {
+        if let Some(last) = folded.last_mut() {
+            if canonical_edge_key(last) == canonical_edge_key(&edge) {
+                for rule in &edge.matched_rules {
+                    if !last.matched_rules.iter().any(|existing| existing == rule) {
+                        last.matched_rules.push(rule.clone());
+                    }
+                }
+                last.matched_rules.sort();
+                last.matched_rules.dedup();
+                for id in &edge.matching_identifiers {
+                    if !last.matching_identifiers.iter().any(|existing| existing == id) {
+                        last.matching_identifiers.push(id.clone());
+                    }
+                }
+                last.matching_identifiers.sort();
+                last.matching_identifiers.dedup();
+                for limitation in &edge.limitations {
+                    if !last
+                        .limitations
+                        .iter()
+                        .any(|existing| existing == limitation)
+                    {
+                        last.limitations.push(limitation.clone());
+                    }
+                }
+                if confidence_rank(&edge.confidence) > confidence_rank(&last.confidence) {
+                    last.confidence = edge.confidence.clone();
+                    last.evidence_type = edge.evidence_type.clone();
+                    last.evidence_description = edge.evidence_description.clone();
+                    last.scope = edge.scope.clone();
+                    last.rule_id = edge.rule_id.clone();
+                    last.rule_version = edge.rule_version.clone();
+                }
+                let primary = last
+                    .matched_rules
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| last.rule_id.clone());
+                last.rule_id = primary;
+                last.edge_id = format!(
+                    "edge-{}-{}-{}",
+                    last.rule_id, last.source_event_id, last.target_event_id
+                );
+                continue;
+            }
+        }
+        let mut edge = edge;
+        let primary = edge
+            .matched_rules
+            .first()
+            .cloned()
+            .unwrap_or_else(|| edge.rule_id.clone());
+        edge.rule_id = primary;
+        edge.edge_id = format!(
+            "edge-{}-{}-{}",
+            edge.rule_id, edge.source_event_id, edge.target_event_id
+        );
+        folded.push(edge);
+    }
+    folded.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+    folded
+}
+
+/// 2.7.26: "link type" in the canonical key is the plane pair
+/// (`N4↔N3`, `N2↔N4`, …), not the `evidence_type` detail class
+/// (`EXACT_TUNNEL_MATCH` vs `EXACT_CONTEXT_MATCH`). Two rules that
+/// describe the same event pair from different evidence paths must
+/// fold into one edge with `matched_rules` listing both — the
+/// evidence_type / description of the primary rule wins
+/// deterministically, and `fold_overlapping_edges` keeps the union
+/// of `matching_identifiers`.
+fn canonical_edge_key(edge: &CorrelationEdge) -> (String, String, String, String) {
+    if edge.source_event_id <= edge.target_event_id {
+        (
+            edge.source_event_id.clone(),
+            edge.target_event_id.clone(),
+            edge.source_interface.clone(),
+            edge.target_interface.clone(),
+        )
+    } else {
+        (
+            edge.target_event_id.clone(),
+            edge.source_event_id.clone(),
+            edge.target_interface.clone(),
+            edge.source_interface.clone(),
+        )
+    }
+}
+
+fn confidence_rank(value: &str) -> u8 {
+    match value {
+        "EXACT" => 3,
+        "STRONG" => 2,
+        "POSSIBLE" => 1,
+        _ => 0,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -7,8 +7,9 @@
 //! `item_<i>_tunnel_ip_ul` / `item_<i>_gtp_teid_ul` instead of the old
 //! `nested_transfer_sha256`-only placeholder.
 
-use correlation_engine::correlate_cross_interface_evidence;
-use session_engine::load_path;
+use callflow_schema::fold_overlapping_edges;
+use correlation_engine::{correlate_cross_interface_evidence, correlate_discovered_tunnels};
+use session_engine::{discover_sessions, load_path};
 use std::path::PathBuf;
 
 fn dataset_events() -> PathBuf {
@@ -68,4 +69,154 @@ fn audit_dataset_produces_the_full_n2_n4_n3_chain() {
                 .any(|id| id == "endpoint_ip=10.77.22.20")
     });
     assert!(dl_anchor, "downlink TEID 0x3 @ 10.77.22.20 must appear");
+}
+
+/// 2.7.26 regression: the full publication correlation (both
+/// `correlate_discovered_tunnels` AND `correlate_cross_interface_evidence`,
+/// as the live-probe worker runs them) must fold overlapping-rule
+/// edges to exactly 2 N2↔N4 + 2 N4↔N3 on the audit dataset — the
+/// same pair-count the production 2.7.15 operator saw before the
+/// 2.7.25 streaming refactor exposed the double-count regression.
+#[test]
+fn full_publication_correlation_folds_overlapping_rules_to_four_edges() {
+    let mut events = load_path(&dataset_events()).expect("load");
+    let discovery = discover_sessions(&mut events);
+    let mut edges = correlate_discovered_tunnels(&events, &discovery);
+    edges.extend(correlate_cross_interface_evidence(&events));
+    let edges = fold_overlapping_edges(edges);
+    let n2_n4 = edges
+        .iter()
+        .filter(|edge| edge.source_interface == "N2" && edge.target_interface == "N4")
+        .count();
+    let n4_n3 = edges
+        .iter()
+        .filter(|edge| edge.source_interface == "N4" && edge.target_interface == "N3")
+        .count();
+    assert_eq!(
+        n2_n4, 2,
+        "exactly 2 N2↔N4 EXACT edges expected post-fold; got total={}",
+        edges.len()
+    );
+    assert_eq!(
+        n4_n3, 2,
+        "exactly 2 N4↔N3 EXACT edges expected post-fold; got total={}",
+        edges.len()
+    );
+    assert_eq!(edges.len(), 4, "no duplicate pair survives the fold");
+    for edge in &edges {
+        assert_eq!(edge.confidence, "EXACT");
+        assert!(
+            !edge.matched_rules.is_empty(),
+            "every published edge must list at least its own rule in matched_rules"
+        );
+        assert!(
+            edge.matched_rules.windows(2).all(|window| window[0] <= window[1]),
+            "matched_rules must be sorted (deterministic): {:?}",
+            edge.matched_rules
+        );
+    }
+    let overlapping = edges
+        .iter()
+        .filter(|edge| {
+            edge.source_interface == "N4"
+                && edge.target_interface == "N3"
+                && edge.matched_rules.len() == 2
+                && edge
+                    .matched_rules
+                    .iter()
+                    .any(|rule| rule == "n4-n3-discovered-teid-endpoint")
+                && edge
+                    .matched_rules
+                    .iter()
+                    .any(|rule| rule == "pfcp-outer-header-matches-gtpu-tunnel")
+        })
+        .count();
+    assert_eq!(
+        overlapping, 2,
+        "both N4↔N3 pairs must carry matched_rules of length 2 with the two overlapping rule ids"
+    );
+}
+
+/// 2.7.26 unit: synthetic fixture where two rules match the same
+/// N4↔N3 pair → `fold_overlapping_edges` emits ONE edge with a
+/// matched_rules list of length 2 (sorted, deterministic). No distinct
+/// pair is lost by the fold.
+#[test]
+fn fold_overlapping_rules_emits_one_edge_with_matched_rules_length_two() {
+    use callflow_schema::CorrelationEdge;
+    let make = |rule: &str, evidence_type: &str, identifier: &str| CorrelationEdge {
+        edge_id: format!("edge-{rule}-src-tgt"),
+        source_event_id: "src".into(),
+        target_event_id: "tgt".into(),
+        source_interface: "N4".into(),
+        target_interface: "N3".into(),
+        matching_identifiers: vec![identifier.into()],
+        rule_id: rule.into(),
+        rule_version: "1".into(),
+        evidence_description: format!("via {rule}"),
+        packet_references: vec![],
+        confidence: "EXACT".into(),
+        evidence_type: evidence_type.into(),
+        scope: String::new(),
+        limitations: vec![],
+        matched_rules: vec![],
+    };
+    let edges = vec![
+        make("pfcp-outer-header-matches-gtpu-tunnel", "EXACT_TUNNEL_MATCH", "teid=0x96a8"),
+        make("n4-n3-discovered-teid-endpoint", "EXACT_CONTEXT_MATCH", "teid=0x000096a8"),
+    ];
+    let folded = fold_overlapping_edges(edges);
+    assert_eq!(folded.len(), 1, "same canonical pair must fold");
+    let edge = &folded[0];
+    assert_eq!(edge.matched_rules.len(), 2);
+    assert_eq!(edge.matched_rules[0], "n4-n3-discovered-teid-endpoint");
+    assert_eq!(edge.matched_rules[1], "pfcp-outer-header-matches-gtpu-tunnel");
+    assert!(edge.matching_identifiers.contains(&"teid=0x96a8".to_string()));
+    assert!(edge
+        .matching_identifiers
+        .contains(&"teid=0x000096a8".to_string()));
+}
+
+/// 2.7.26: distinct N4↔N3 pairs (different G-PDU targets) must NOT
+/// fold — the dedup only collapses rules that agree on the same
+/// canonical event pair, never on heuristic "same tunnel but
+/// different events".
+#[test]
+fn fold_overlapping_rules_keeps_distinct_pairs_distinct() {
+    use callflow_schema::CorrelationEdge;
+    let make = |rule: &str, src: &str, tgt: &str| CorrelationEdge {
+        edge_id: format!("edge-{rule}-{src}-{tgt}"),
+        source_event_id: src.into(),
+        target_event_id: tgt.into(),
+        source_interface: "N4".into(),
+        target_interface: "N3".into(),
+        matching_identifiers: vec!["teid=0x1".into()],
+        rule_id: rule.into(),
+        rule_version: "1".into(),
+        evidence_description: format!("via {rule}"),
+        packet_references: vec![],
+        confidence: "EXACT".into(),
+        evidence_type: "EXACT_TUNNEL_MATCH".into(),
+        scope: String::new(),
+        limitations: vec![],
+        matched_rules: vec![],
+    };
+    let folded = fold_overlapping_edges(vec![
+        make("rule-a", "src-1", "tgt-1"),
+        make("rule-a", "src-1", "tgt-2"),
+        make("rule-b", "src-1", "tgt-1"), // fold with first
+    ]);
+    assert_eq!(folded.len(), 2);
+    let two_rules = folded
+        .iter()
+        .filter(|edge| edge.target_event_id == "tgt-1")
+        .collect::<Vec<_>>();
+    assert_eq!(two_rules.len(), 1);
+    assert_eq!(two_rules[0].matched_rules, vec!["rule-a", "rule-b"]);
+    let singleton = folded
+        .iter()
+        .filter(|edge| edge.target_event_id == "tgt-2")
+        .collect::<Vec<_>>();
+    assert_eq!(singleton.len(), 1);
+    assert_eq!(singleton[0].matched_rules, vec!["rule-a"]);
 }

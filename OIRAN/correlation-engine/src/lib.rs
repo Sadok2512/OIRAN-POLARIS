@@ -698,27 +698,53 @@ pub fn correlate_discovered_tunnels(
         if candidates.len() != 1 {
             continue;
         }
-        for event_id in &tunnel.event_ids {
-            let Some(gtpu) = by_id.get(event_id.as_str()).copied() else {
-                continue;
-            };
-            let mut correlation = edge(
-                candidates[0],
-                gtpu,
-                vec![
-                    format!("teid={}", tunnel.teid),
-                    format!(
-                        "endpoints={}<->{}",
-                        tunnel.source_endpoint, tunnel.destination_endpoint
-                    ),
-                ],
-                "n4-n3-discovered-teid-endpoint",
-                "EXACT",
-                "A unique PFCP F-TEID endpoint matches the directional GTP-U tunnel",
-            );
-            correlation.rule_version = DISCOVERY_RULE_VERSION.into();
-            edges.push(correlation);
-        }
+        // 2.7.26: emit ONE edge per tunnel (not one per G-PDU). The
+        // rule's claim is "this PFCP TEID matches this tunnel", which
+        // is a tunnel-level statement — not a per-packet one. A
+        // tunnel with N G-PDUs previously produced N identical edges
+        // and made `fold_overlapping_edges` unable to collapse them
+        // with `pfcp-outer-header-matches-gtpu-tunnel` (which already
+        // picked a canonical representative). We pick the same
+        // deterministic representative here: the G-PDU with the
+        // smallest canonical key `(capture_id, packet_number,
+        // event_id)` — never a timestamp.
+        let mut tunnel_gtpu_events: Vec<&EventRecord> = tunnel
+            .event_ids
+            .iter()
+            .filter_map(|id| by_id.get(id.as_str()).copied())
+            .collect();
+        tunnel_gtpu_events.sort_by(|a, b| {
+            (
+                a.capture_id.as_str(),
+                a.packet_number(),
+                a.event_id.as_str(),
+            )
+                .cmp(&(
+                    b.capture_id.as_str(),
+                    b.packet_number(),
+                    b.event_id.as_str(),
+                ))
+        });
+        let Some(&representative) = tunnel_gtpu_events.first() else {
+            continue;
+        };
+        let mut correlation = edge(
+            candidates[0],
+            representative,
+            vec![
+                format!("teid={}", tunnel.teid),
+                format!(
+                    "endpoints={}<->{}",
+                    tunnel.source_endpoint, tunnel.destination_endpoint
+                ),
+                format!("gtpu_frame_count={}", tunnel_gtpu_events.len()),
+            ],
+            "n4-n3-discovered-teid-endpoint",
+            "EXACT",
+            "A unique PFCP F-TEID endpoint matches the directional GTP-U tunnel",
+        );
+        correlation.rule_version = DISCOVERY_RULE_VERSION.into();
+        edges.push(correlation);
     }
     edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
     edges
@@ -797,6 +823,7 @@ fn edge(
             _ => "UNKNOWN",
         }
         .into(),
+        matched_rules: Vec::new(),
         scope: String::new(),
         limitations: Vec::new(),
     }

@@ -1,4 +1,5 @@
-use correlation_engine::correlate_cross_interface_evidence;
+use callflow_schema::fold_overlapping_edges;
+use correlation_engine::{correlate_cross_interface_evidence, correlate_discovered_tunnels};
 use session_engine::{discover_sessions, load_path};
 use std::{env, fs, path::PathBuf};
 
@@ -18,7 +19,14 @@ fn run() -> Result<(), String> {
     }
     let events = load_path(&input)?;
     let discovery = discover_sessions(&mut events.clone());
-    let edges = correlate_cross_interface_evidence(&events);
+    // 2.7.26: replay the full publication correlation set (discovered
+    // tunnels + cross-interface evidence) and fold overlapping-rule
+    // edges into one per canonical pair. This matches the live-probe
+    // publication path so operators can reproduce prod call-flow
+    // output by hand without the 2.7.25 double-counting.
+    let mut edges = correlate_discovered_tunnels(&events, &discovery);
+    edges.extend(correlate_cross_interface_evidence(&events));
+    let edges = fold_overlapping_edges(edges);
     let value = serde_json::json!({
         "source_events": events.len(),
         "ue_contexts": discovery.ue_contexts.len(),

@@ -1,5 +1,111 @@
 # Changelog
 
+## OIRAN API 2.7.26 — 2026-11-05 — dedup overlapping correlation rules by canonical pair
+
+- ANR2 production rollback: each N4↔N3 pair was published twice —
+  once by `n4-n3-discovered-teid-endpoint`
+  (`OIRAN/correlation-engine/src/lib.rs:715`, inside
+  `correlate_discovered_tunnels`, fires when
+  `discovery.gtpu_tunnels[].related_pfcp_session.is_some()`), and once
+  by `pfcp-outer-header-matches-gtpu-tunnel`
+  (`OIRAN/correlation-engine/src/lib.rs:272`, inside
+  `correlate_cross_interface_evidence`, fires on byte-identical
+  tunnel keys regardless of session binding). Both ran from
+  `CaptureManager::process_capture_into`
+  (`OIRAN/live-probe/src/lib.rs:2850-2851`); the 2.7.25 dedup
+  compared `edge_id` only and the builder bakes `rule_id` INTO
+  `edge_id`, so two rules on the same event pair emerged as two
+  distinct edges → 4 N4↔N3 links instead of 2. The offline audit
+  dataset did not reproduce the bug because
+  `discovery.gtpu_tunnels[].related_pfcp_session` was `None` there,
+  so `correlate_discovered_tunnels` stayed silent.
+- 2.7.26 fix (canonical-key dedup, N2↔N4 and every other overlapping
+  rule couple included):
+  * New `callflow_schema::fold_overlapping_edges(edges)` folds every
+    `CorrelationEdge` sharing the same canonical pair
+    `(min(source_event_id, target_event_id), max(…), interfaces in
+    matching order)` into a single published edge. The primary
+    `rule_id` is the alphabetically-first matched rule; all
+    overlapping `rule_id`s land in the new
+    `matched_rules: Vec<String>` field on `CorrelationEdge`
+    (`OIRAN/callflow-schema/src/lib.rs:61-71`), sorted and
+    deterministic. `matching_identifiers` are union-ed and sorted;
+    confidence is promoted to the highest among the matched rules
+    (`EXACT > STRONG > POSSIBLE > WEAK`).
+  * Order is strictly structural: the canonical pair is derived
+    from `event_id` values, NEVER from `timestamp_ns` or `raw_ticks`;
+    the final edge list is sorted by `edge_id` for stable JSON
+    output. This matches session-engine's
+    `canonical_sort_key = (capture_id, packet_number, event_id)`
+    invariant (`OIRAN/session-engine/src/lib.rs:943`).
+  * `correlate_discovered_tunnels` now emits ONE edge per tunnel
+    (deterministic representative = first G-PDU by
+    `(capture_id, packet_number, event_id)`), not one per G-PDU.
+    The rule's claim is tunnel-level ("this PFCP TEID matches this
+    tunnel"), not packet-level; emitting N edges for a tunnel with
+    N G-PDUs was a per-packet proliferation that `fold_overlapping_edges`
+    could not collapse with `pfcp-outer-header-matches-gtpu-tunnel`
+    (which already picked a canonical representative). The new
+    `gtpu_frame_count=<n>` identifier preserves the cardinality for
+    reviewers.
+  * Call sites updated: `CaptureManager::process_capture_into` global
+    path (`OIRAN/live-probe/src/lib.rs:2869`) and per-session path
+    (`OIRAN/live-probe/src/lib.rs:1591`) replace
+    `global_edges.dedup_by(|l, r| l.edge_id == r.edge_id)` with
+    `fold_overlapping_edges(global_edges)`. `evidence-replay`
+    (`OIRAN/correlation-engine/src/bin/evidence-replay.rs`) does
+    the same — the operator reproduces prod call-flow output with
+    the same fold.
+- Audit replay (reproducible):
+
+      cargo build --offline --release -p correlation-engine --bin evidence-replay
+      OIRAN/target/release/evidence-replay \
+          OIRAN/datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl \
+          AUDIT_E2E_CERT_001_scripts/out/evidence_replay_2.7.26.json
+
+  Result: **4 edges — exactly 2 N2↔N4 + 2 N4↔N3 EXACT**. Both
+  N4↔N3 edges carry
+  `matched_rules = ["n4-n3-discovered-teid-endpoint",
+  "pfcp-outer-header-matches-gtpu-tunnel"]`; both N2↔N4 edges carry
+  `matched_rules = ["ngap-pfcp-exact-tunnel"]` (single rule, no
+  overlap).
+- Regression tests (new):
+  * `correlation_engine::tests::full_publication_correlation_folds_overlapping_rules_to_four_edges`
+    replays the audit dataset through BOTH correlation entries
+    (`correlate_discovered_tunnels` + `correlate_cross_interface_evidence`)
+    + fold; asserts exactly `2 N2↔N4 + 2 N4↔N3` EXACT, both N4↔N3
+    pairs carry `matched_rules.len() == 2` with the two overlapping
+    rule ids present and sorted.
+  * `correlation_engine::tests::fold_overlapping_rules_emits_one_edge_with_matched_rules_length_two`
+    is the unit-level synthetic fixture: two rules on the same
+    pair → 1 edge, matched_rules of length 2.
+  * `correlation_engine::tests::fold_overlapping_rules_keeps_distinct_pairs_distinct`
+    guards the inverse: distinct (src, tgt) pairs never fold, even
+    when one is overlapping and the other is not.
+- `cargo test --workspace --locked --release` → **377 passed / 0
+  failed / 4 ignored** (was 374 on 2.7.25). Shell guards
+  (`test-rotation-drops.sh`, `test-rotation-watcher.sh`,
+  `test-dumpcap-retention.sh`) PASS. Negative harness 9/9 unchanged.
+- Memory invariant preserved (same harness as 2.7.25, RSS unchanged
+  to the kilobyte):
+
+  | history_size | 2.7.25 VmPeak | 2.7.26 VmPeak |
+  | ---: | ---: | ---: |
+  |  30 000 |  9.14 MiB |  9.59 MiB |
+  | 100 000 | 15.48 MiB | 15.93 MiB |
+  | 200 000 | 24.84 MiB | 25.29 MiB |
+
+  The fold is a bounded sort + single pass over the edge list; the
+  edge set is O(sessions), not O(events), so memory is unchanged.
+- Backwards compatibility: `matched_rules` is `#[serde(default)]` so
+  any previously-serialised `CorrelationEdge` (callflows on disk,
+  historical call-flow JSON exports) deserialises cleanly — the
+  field defaults to an empty vector, and `fold_overlapping_edges`
+  rebuilds it before every publication.
+- Versions: `apps/api` 2.7.25 → 2.7.26; `live-probe` 0.4.11 →
+  0.4.12; `correlation-engine` 0.5.2 → 0.5.3; `callflow-schema`
+  1.2.0 → 1.3.0.
+
 ## OIRAN API 2.7.25 — 2026-11-05 — bounded streaming publication (ANR2 handoff, reviewed and integrated)
 
 - 2.7.24 shipped a constant-factor reduction on top of the streaming
