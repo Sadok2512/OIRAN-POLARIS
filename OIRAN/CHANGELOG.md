@@ -1,5 +1,76 @@
 # Changelog
 
+## OIRAN API 2.7.19 — 2026-11-05 — startup spool compaction + single-source /health coherence
+
+- Follow-up on the ANR2 lab reproduction (issue #10, comment
+  6646981831): even on a 2.7.18 binary the lab worker landed with two
+  `oiran_events.jsonl` spools on disk — the live one at 744 239 083
+  bytes and `.dataset-previous/oiran_events.jsonl` (crash rollback) at
+  761 937 920 bytes, total 1 506 177 003 bytes, already **above**
+  `max_owned_bytes = 1 140 850 688`. 2.7.18 prevents further growth but
+  cannot shrink the pre-existing artifacts, so the FIRST
+  `directory_size(&base)` read in `run_continuous_import_inner` tripped
+  `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT` on the FIRST candidate of the
+  first scan and the queue stayed at 222 pending.
+- 2.7.19 fix (startup compaction): new helper
+  `compact_continuous_spools(base, current_capture_ids)` at
+  `live-probe/src/lib.rs`. Called from the top of
+  `run_continuous_import_inner` right after `state.segments` has been
+  resolved, BEFORE any guard reads `directory_size(&base)` or the
+  historical-bootstrap pcap is copied. The helper streams
+  `base/dataset/oiran_events.jsonl` line by line via a 1 MiB
+  `BufReader`, parses each line as `serde_json::Value`, keeps only
+  events whose `capture_id` is in `current_capture_ids`
+  (i.e. `{"sha256:<sha>"}` for every pcap in `state.segments`), writes
+  to `oiran_events.jsonl.compact-tmp` and atomically renames. If any
+  line was dropped the published manifest and callflows are stale by
+  construction (they reference event ids that no longer exist), so the
+  helper removes `dataset_manifest.json` + `callflows/`. The next
+  successful publication rebuilds a coherent dataset. `.dataset-previous/`
+  is always a rollback artifact and is removed unconditionally.
+  Memory ceiling: 2 MiB (reader + writer) + one `serde_json::Value` at
+  a time — no 1.5 GiB in-RAM materialisation.
+- 2.7.19 fix (single-source `/health` coherence): the ANR2 lab also
+  observed `/health = 25 939 events / 10 sessions` while
+  `dataset_manifest.json` on disk reported `25 537 / 8`. Root cause:
+  `apps/api::health` (2.7.17) summed across every entry of
+  `capture_manager.datasets()`, so a residual recovered-failed dataset
+  (`402` events / `2` sessions) was added on top of the continuous one.
+  Fix: in operational mode `/health` now reads exactly
+  `capture_manager.dataset(CONTINUOUS_DATASET_ID)` and projects only
+  that dataset's `event_count` / `session_ids`. Because the in-RAM
+  `LiveDataset` and the on-disk `dataset_manifest.json` are the same
+  struct (serialized atomically in `process_capture_into` and upserted
+  in the same publication), `/health` and the manifest are now
+  identical by construction.
+- `CaptureManager::recover_continuous_dataset_from_disk(base)` is now
+  `pub` so tests and non-worker code paths can hydrate the manifest
+  without spawning the production-only import worker.
+- Regression tests
+  (`cargo test --workspace --locked --release` → **368 passed / 0
+  failed / 4 ignored**, was 366 on 2.7.18):
+  * `live_probe::tests::compact_continuous_spools_prunes_orphan_events_and_rollback_directory`
+    seeds a 5 MiB spool with 2 500 "stale" events (`capture_id="sha256:stale"`)
+    + 2 500 "live" events, plus a `.dataset-previous/` directory and a
+    stub manifest + callflow. After `compact_continuous_spools(base,
+    {"sha256:live"})` the rollback directory is gone, the manifest +
+    callflows are removed (events were dropped), and the compacted spool
+    contains exactly the 2 500 live events. A second idempotent call
+    with the same keep-set leaves a freshly-written manifest untouched.
+  * `live_probe::tests::continuous_import_drains_a_burst_of_250_segments_without_blocking`
+    (from 2.7.18) still passes with the new startup compaction added
+    in the critical path.
+  * `oiran_api::tests::health_counters_mirror_the_continuous_manifest_exclusively`
+    seeds a `dataset_manifest.json` with 24 events / 8 sessions,
+    hydrates the manager, hits `/api/v1/health`, and asserts
+    `data.source_events == manifest.event_count` and
+    `data.session_count == manifest.session_ids.len()`.
+- Audit negative harness
+  (`AUDIT_E2E_CERT_001_scripts/02-negative-tests.py`): 9/9 scenarios
+  still match the expected verdict.
+- Shell guards all PASS.
+- Versions: `apps/api` 2.7.18 → 2.7.19; `live-probe` 0.4.4 → 0.4.5.
+
 ## OIRAN API 2.7.18 — 2026-11-04 — bound derived artifacts + N2↔N4 via regenerated dataset
 
 - Root cause of the lab-reproduced 222-segment deadlock (ANR2, issue #9):

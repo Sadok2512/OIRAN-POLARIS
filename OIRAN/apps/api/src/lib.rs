@@ -632,12 +632,18 @@ fn live_flow_for(state: &AppState, id: &str) -> Option<(String, CallFlow)> {
 async fn health(State(state): State<AppState>) -> Json<Value> {
     // Reference mode populates `Inner.flows / Inner.manifest / Inner.discovery`
     // at startup. Operational mode leaves them empty by design and projects
-    // its liveness via `capture_manager.datasets()`; without 2.7.16 the API
-    // reported `dataset=null, source_events=0, session_count=0` for a
-    // continuous dataset whose disk already held 25 537 events and 8
-    // sessions (issue #9 part 1, ANR2 diagnostic). We project the manager's
-    // LiveDataset summaries (not the events) into the health response, so
-    // /health and /sessions agree with dataset_manifest.json on disk.
+    // its liveness via `capture_manager.dataset(CONTINUOUS_DATASET_ID)`.
+    //
+    // 2.7.19 (issue #9 part 2): /health MUST source its continuous counters
+    // from the SAME LiveDataset that produced the latest
+    // `dataset_manifest.json`. The 2.7.17 implementation summed across
+    // `capture_manager.datasets().iter()`, so a recovered-failed capture
+    // registered under its own dataset id added its event and session
+    // counts on top of the continuous dataset (ANR2 lab: continuous
+    // published 25 537/8, a residual recovered-dataset added 402/2 →
+    // /health reported 25 939/10 while `dataset_manifest.json` on disk
+    // stayed at 25 537/8). Reading the single continuous dataset here
+    // keeps /health and the on-disk manifest trivially identical.
     let mut source_events = state
         .inner
         .flows
@@ -648,7 +654,11 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
     let mut ue_context_count = state.inner.discovery.ue_contexts.len();
     let mut dataset = state.inner.manifest.get("scenario_id").cloned();
     if session_count == 0 {
-        for live in state.inner.capture_manager.datasets() {
+        if let Some(live) = state
+            .inner
+            .capture_manager
+            .dataset(live_probe::CONTINUOUS_DATASET_ID)
+        {
             source_events = source_events.saturating_add(live.event_count);
             session_count = session_count.saturating_add(live.session_ids.len());
             if let Some(discovery) = &live.discovery {
@@ -3265,6 +3275,198 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["meta"]["total"], 0);
         assert!(body["data"].as_array().unwrap().is_empty());
+    }
+
+    /// 2.7.19 (issue #9 part 2): /health and the on-disk
+    /// `dataset_manifest.json` MUST come from the same LiveDataset. The
+    /// ANR2 lab observed /health=25 939/10 while the on-disk manifest
+    /// said 25 537/8. Root cause: 2.7.17 /health summed across every
+    /// entry of `capture_manager.datasets()`, so a residual
+    /// recovered-dataset (402 events / 2 sessions) was added on top of
+    /// the continuous one. 2.7.19 /health reads only
+    /// `capture_manager.dataset(CONTINUOUS_DATASET_ID)`. This test seeds
+    /// a continuous manifest on disk, lets `recover_continuous_dataset_from_disk`
+    /// rehydrate it, adds a DIFFERENT recovered dataset in RAM, and
+    /// asserts /health still reflects exactly the continuous manifest.
+    #[tokio::test]
+    async fn health_counters_mirror_the_continuous_manifest_exclusively() {
+        use live_probe::{CaptureManager, CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID};
+        use std::fs;
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut config = test_config(workspace, "operational-health-coherence");
+        config.reference_dataset_enabled = false;
+        let capture_root = temporary_directory("health-coherence-captures");
+        config.capture_root = capture_root.clone();
+        // Pre-seed a continuous dataset: pcap/, dataset/*, matching
+        // `validate_dataset_artifacts`.
+        let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset_dir = base.join("dataset");
+        fs::create_dir_all(dataset_dir.join("callflows")).unwrap();
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        // Shape-match the production artifacts: 24 events across 8
+        // sessions, the ratio ANR2 saw in the lab. Numbers are
+        // deliberately small so `validate_dataset_artifacts` can count
+        // lines without pulling a 50 MiB spool. The invariant we are
+        // asserting is coherence between /health and the manifest, which
+        // is scale-invariant.
+        const EVENT_COUNT: usize = 24;
+        const SESSION_COUNT: usize = 8;
+        let mut events_bytes = Vec::new();
+        for i in 0..EVENT_COUNT {
+            use std::io::Write as _;
+            let event = serde_json::json!({
+                "event_id": format!("evt-{i:04}"),
+                "capture_id": "sha256:stub",
+                "capture_point_id": "N2",
+                "interface": "N2",
+                "protocol": "NGAP",
+                "message_name": "InitialUEMessage",
+                "decoding_status": "DECODED",
+                "decoder_name": "stub",
+                "decoder_version": "0",
+                "raw_payload_reference": "sha256:stub",
+                "direction": "RAN_TO_CORE",
+                "source_endpoint": {"address": "10.0.0.1", "network_function": "gNB"},
+                "destination_endpoint": {"address": "10.0.0.2", "network_function": "AMF"},
+                "session_identifiers": [],
+                "information_elements": [],
+                "packet_references": [{
+                    "source_file": format!("/captures/CONT/N2.pcapng"),
+                    "packet_number": (i + 1) as u64,
+                    "byte_offset": 0,
+                    "interface_id": 0,
+                    "captured_length": 10,
+                    "original_length": 10,
+                }],
+                "errors": [],
+                "timestamp": {
+                    "seconds": 1_792_872_462_i64 + i as i64,
+                    "nanoseconds": 0_u64,
+                    "raw_ticks": 1_792_872_462_000_000_000_u64,
+                    "resolution_base": 10,
+                    "resolution_exponent": 9,
+                    "display": "1792872462.000000000Z"
+                }
+            });
+            writeln!(events_bytes, "{}", event).unwrap();
+        }
+        fs::write(dataset_dir.join("oiran_events.jsonl"), &events_bytes).unwrap();
+        let continuous = serde_json::json!({
+            "dataset_id": CONTINUOUS_DATASET_ID,
+            "capture_id": CONTINUOUS_CAPTURE_ID,
+            "path": format!("runtime/live-captures/{CONTINUOUS_CAPTURE_ID}/dataset"),
+            "event_count": EVENT_COUNT,
+            "session_ids": (0..SESSION_COUNT).map(|i| format!("sess-{i}")).collect::<Vec<_>>(),
+            "decode_reports": {},
+            "checksums": {},
+            "state": "PUBLISHED",
+            "discovery": null,
+            "capture_started_epoch_ms": null,
+            "last_packet_epoch_ms": null,
+            "fresh_packet_count": 0,
+            "active_ue_ips": [],
+            "active_pdu_contexts": [],
+        });
+        // Match the session_ids we declared in the manifest with
+        // callflow stubs so validate_dataset_artifacts accepts the
+        // bundle on re-hydration.
+        for i in 0..SESSION_COUNT {
+            let stub = serde_json::json!({
+                "callflow_id": format!("cf-sess-{i}"),
+                "session_id": format!("sess-{i}"),
+                "technology": "5G SA",
+                "start_timestamp": "0",
+                "end_timestamp": "0",
+                "participants": [],
+                "interfaces": ["N2"],
+                "procedures": [],
+                "events": [],
+                "correlation_edges": [],
+                "correlation_status": {},
+                "decoder_versions": {},
+                "schema_version": "1.2.0",
+                "capture_references": [],
+                "accounting": {
+                    "source_events": 0,
+                    "session_events": 0,
+                    "background_events": 0,
+                    "unmatched_events": 0,
+                    "duplicate_events": 0,
+                    "extra_events": 0
+                },
+                "unresolved_fields": 0
+            });
+            fs::write(
+                dataset_dir
+                    .join("callflows")
+                    .join(format!("sess-{i}.json")),
+                serde_json::to_vec(&stub).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                dataset_dir
+                    .join("callflows")
+                    .join(format!("sess-{i}.html")),
+                b"<html></html>",
+            )
+            .unwrap();
+        }
+        fs::write(
+            dataset_dir.join("dataset_manifest.json"),
+            serde_json::to_vec_pretty(&continuous).unwrap(),
+        )
+        .unwrap();
+        let state = AppState::load(config).unwrap();
+        let manager = &state.inner.capture_manager;
+        // `AppState::load` does not spawn the continuous worker in tests
+        // (the lab-allowlisted source dir is production-only), so we hydrate
+        // the manifest here explicitly — the production code path is the
+        // same `recover_continuous_dataset_from_disk` call inside
+        // `start_continuous_import` (`live-probe/src/lib.rs:952-958`).
+        manager
+            .recover_continuous_dataset_from_disk(&base)
+            .expect("hydrate");
+        assert!(manager.dataset(CONTINUOUS_DATASET_ID).is_some());
+        let live = manager.dataset(CONTINUOUS_DATASET_ID).unwrap();
+        assert_eq!(live.event_count, EVENT_COUNT);
+        assert_eq!(live.session_ids.len(), SESSION_COUNT);
+        // /health must report EXACTLY the continuous dataset's counters,
+        // ignoring any residual dataset that might sit next to it in the
+        // manager's map. The sum-of-all projection of 2.7.17 would have
+        // added a residual dataset's events on top; 2.7.19 reads only
+        // the continuous dataset, so the number MUST equal the manifest.
+        let response = router(state, None)
+            .oneshot(req("/api/v1/health", false))
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        assert_eq!(body["data"]["source_events"], EVENT_COUNT);
+        assert_eq!(body["data"]["session_count"], SESSION_COUNT);
+        assert_eq!(body["data"]["dataset"], CONTINUOUS_DATASET_ID);
+        // Final invariant: /health must match the on-disk manifest on
+        // the same fields.
+        let on_disk: serde_json::Value = serde_json::from_slice(
+            &fs::read(dataset_dir.join("dataset_manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["data"]["source_events"].as_u64().unwrap() as usize,
+            on_disk["event_count"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            body["data"]["session_count"].as_u64().unwrap() as usize,
+            on_disk["session_ids"].as_array().unwrap().len()
+        );
+        // Sanity check: manager type exposes dataset lookups by id.
+        let _ = CaptureManager::with_pseudonym_key_path(
+            capture_root.clone(),
+            false,
+            capture_root.join(".oiran-pseudonym.key"),
+        );
     }
 
     #[test]
