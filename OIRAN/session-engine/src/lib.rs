@@ -622,6 +622,162 @@ pub fn load_path(path: &std::path::Path) -> Result<Vec<EventRecord>, String> {
     load_jsonl(io::BufReader::new(file))
 }
 
+/// Bounded publication-time index. The complete event bodies remain in the
+/// JSONL file; RAM contains only the set of event ids plus the latest compact
+/// state-changing/correlation observation for each semantic key.
+pub struct StreamingEventIndex {
+    pub events: Vec<EventRecord>,
+    pub event_ids: BTreeSet<String>,
+    pub source_event_count: usize,
+}
+
+/// Streams a published JSONL without ever materialising the dataset as a
+/// `Vec<EventRecord>`. This is the input used by continuous publication for
+/// session discovery. Repeated observations with the same protocol state,
+/// endpoints and stable identifiers replace one another, leaving one compact
+/// representative; full records are reloaded from disk by event id when the
+/// corresponding session call flow is written.
+pub fn load_path_streaming_index(path: &std::path::Path) -> Result<StreamingEventIndex, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let reader = io::BufReader::new(file);
+    let mut event_ids = BTreeSet::new();
+    let mut representatives = BTreeMap::<String, EventRecord>::new();
+    let mut source_event_count = 0usize;
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("line {}: {e}", line_no + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)
+            .map_err(|e| format!("line {}: invalid JSON: {e}", line_no + 1))?;
+        let mut event = parse_event(value).map_err(|e| format!("line {}: {e}", line_no + 1))?;
+        source_event_count = source_event_count.saturating_add(1);
+        if !event_ids.insert(event.event_id.clone()) {
+            continue;
+        }
+        compact_publication_event(&mut event);
+        let key = publication_semantic_key(&event);
+        representatives.insert(key, event);
+    }
+    let mut events = representatives.into_values().collect::<Vec<_>>();
+    deterministic_sort(&mut events);
+    Ok(StreamingEventIndex {
+        events,
+        event_ids,
+        source_event_count,
+    })
+}
+
+fn compact_publication_event(event: &mut EventRecord) {
+    const STABLE_IDENTIFIERS: &[&str] = &[
+        "ran_ue_ngap_id",
+        "amf_ue_ngap_id",
+        "pdu_session_id",
+        "dnn",
+        "network_instance",
+        "snssai",
+        "s_nssai",
+        "seid",
+        "f_seid",
+        "pdr_id",
+        "far_id",
+        "qer_id",
+        "teid",
+        "ue_ip",
+        "inner_source_ip",
+        "inner_destination_ip",
+        "qfi",
+        "sm_context_reference",
+        "subscriber_pseudonym",
+        "imsi_pseudonym",
+    ];
+    event
+        .identifiers
+        .retain(|(name, _)| STABLE_IDENTIFIERS.contains(&name.as_str()));
+    event.identifiers.sort();
+    if matches!(event.protocol.as_str(), "PFCP" | "NGAP") {
+        if let Some(items) = event.information_elements.as_array_mut() {
+            items.retain(|item| {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let value = item
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                [
+                    "teid",
+                    "ipv4",
+                    "seid",
+                    "pdr",
+                    "far",
+                    "qer",
+                    "network_instance",
+                    "dnn",
+                    "snssai",
+                    "s_nssai",
+                ]
+                .iter()
+                .any(|needle| name.contains(needle) || value.contains(needle))
+            });
+        }
+    } else {
+        event.information_elements = Value::Array(Vec::new());
+    }
+    if event.packet_references.len() > 2 {
+        let last = event.packet_references.last().cloned();
+        event.packet_references.truncate(1);
+        if let Some(last) = last {
+            if event
+                .packet_references
+                .first()
+                .map_or(true, |first| first.packet_number != last.packet_number)
+            {
+                event.packet_references.push(last);
+            }
+        }
+    }
+    event.timestamp.clear();
+    event.decoding_status.clear();
+    event.decoder_name.clear();
+    event.decoder_version.clear();
+    event.raw_payload_reference.clear();
+    event.errors.clear();
+}
+
+fn publication_semantic_key(event: &EventRecord) -> String {
+    let identifiers = event
+        .identifiers
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let tunnel_material = event
+        .information_elements
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("value").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        event.capture_point_id,
+        event.interface,
+        event.protocol,
+        event.message_name,
+        event.source_address,
+        event.destination_address,
+        event.direction,
+        event.parent_event_id.as_deref().unwrap_or(""),
+        identifiers,
+        tunnel_material,
+    )
+}
+
 /// 2.7.24: like `load_path` but drops `information_elements` for every
 /// event whose `protocol` is NOT in the IE-reading set
 /// (`PFCP`, `NGAP`). Those two protocols are the only ones whose IEs
@@ -1677,6 +1833,71 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_index_retains_only_ids_and_compact_semantic_representatives() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "oiran-streaming-index-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        for packet in 1..=2 {
+            let record = serde_json::json!({
+                "event_id": format!("event-{packet}"),
+                "capture_id": "cap",
+                "capture_point_id": "N2",
+                "timestamp": {"seconds":1,"nanoseconds":packet,"raw_ticks":packet,"display":"1Z"},
+                "interface": "N2",
+                "protocol": "NGAP",
+                "message_name": "PDUSessionResourceSetupResponse",
+                "source_endpoint": {"address":"a","network_function":"gNB"},
+                "destination_endpoint": {"address":"b","network_function":"AMF"},
+                "direction": "RAN_TO_CORE",
+                "session_identifiers": [
+                    {"name":"ran_ue_ngap_id","value":"41","pseudonymized":false},
+                    {"name":"amf_ue_ngap_id","value":"73","pseudonymized":false},
+                    {"name":"pdu_session_id","value":"1","pseudonymized":false}
+                ],
+                "information_elements": [
+                    {"name":"TEID","value":"0x01020304"},
+                    {"name":"large-render-only-payload","value":"x".repeat(16_384)}
+                ],
+                "decoding_status": "DECODED",
+                "decoder_name": "test",
+                "decoder_version": "1",
+                "raw_payload_reference": "sha256:test",
+                "packet_references": [{"source_file":"x","packet_number":packet,"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}],
+                "errors": []
+            });
+            writeln!(writer, "{record}").unwrap();
+        }
+        writer.flush().unwrap();
+
+        let index = load_path_streaming_index(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(index.source_event_count, 2);
+        assert_eq!(index.event_ids.len(), 2);
+        assert!(index.event_ids.contains("event-1"));
+        assert!(index.event_ids.contains("event-2"));
+        assert_eq!(index.events.len(), 1, "one semantic state is retained");
+        let representative = &index.events[0];
+        assert_eq!(
+            representative.event_id, "event-2",
+            "latest observation wins"
+        );
+        assert!(representative.timestamp.is_empty());
+        assert!(representative.raw_payload_reference.is_empty());
+        assert!(representative
+            .information_elements
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|value| value["name"] != "large-render-only-payload"));
+    }
 
     fn event(
         id: &str,

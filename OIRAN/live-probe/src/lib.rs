@@ -45,7 +45,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STREAM_CHUNK_BYTES: usize = 1 << 20;
 const PROBE_ID: &str = "oiran-vprobe-local-01";
 const MIN_CAPTURE_BYTES: u64 = 1024 * 1024;
-const MAX_CONTINUOUS_EVENTS: usize = 50_000;
 const MAX_N3_FLOW_AGGREGATES: usize = 4096;
 /// Reserve kept free during the per-candidate eviction / budget guards so
 /// a staging publication can briefly double-write the derived artifact.
@@ -2807,16 +2806,16 @@ impl CaptureManager {
         if decoded_spool_path.exists() {
             fs::remove_file(&decoded_spool_path).map_err(display_error)?;
         }
-        // 2.7.24: `load_path_slim` drops `information_elements` for
-        // every event whose protocol is NOT in `{PFCP, NGAP}` (those
-        // two drive tunnel discovery and cross-interface correlation;
-        // everything else's IE tree is a pure render-time payload
-        // needed only by `build_callflow`). The per-session loop
-        // below re-loads the full IE tree via `load_events_by_ids`
-        // for the few hundred events of each call flow at a time.
-        let mut events = session_engine::load_path_slim(&events_path)?;
-        let retained_event_ids: BTreeSet<String> =
-            events.iter().map(|event| event.event_id.clone()).collect();
+        release_unused_heap_pages();
+        trace_publication_rss("after-streaming-merge", None);
+        // 2.7.24: stream the JSONL into an ids-only retention set plus
+        // compact semantic representatives. The full dataset is never a
+        // Vec<EventRecord>; full event bodies are reloaded per session below.
+        let index = session_engine::load_path_streaming_index(&events_path)?;
+        let retained_event_ids = index.event_ids;
+        let event_count = index.source_event_count;
+        let mut events = index.events;
+        trace_publication_rss("after-streaming-index", Some(events.len()));
         let capture_job = self.get(capture_id);
         let capture_started_epoch_ms = capture_job.as_ref().and_then(|job| job.started_epoch_ms);
         let activity_started_epoch_ms = capture_job
@@ -2838,11 +2837,19 @@ impl CaptureManager {
             .iter()
             .map(|context| context.ue_ip.clone())
             .collect::<Vec<_>>();
-        let discovery = discover_sessions(&mut events);
+        let mut discovery = discover_sessions(&mut events);
+        trace_publication_rss("after-session-discovery", Some(events.len()));
+        discovery
+            .event_accounting
+            .insert("source_events".into(), event_count);
+        discovery
+            .event_accounting
+            .insert("publication_index_events".into(), events.len());
         let mut global_edges = correlate_discovered_tunnels(&events, &discovery);
         global_edges.extend(correlate_cross_interface_evidence(&events));
         global_edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
         global_edges.dedup_by(|left, right| left.edge_id == right.edge_id);
+        trace_publication_rss("after-correlation", Some(events.len()));
         // 2.7.23: materialise LTE + runtime call flows now (they need
         // the live `events` Vec), build per-PDU-session plans (metadata
         // only — no event bodies), then drop `events` so the
@@ -2890,8 +2897,10 @@ impl CaptureManager {
             .iter()
             .map(|active| runtime_pdu_callflow(&events, active))
             .collect();
-        let event_count = events.len();
+        trace_publication_rss("after-session-plans", Some(events.len()));
         drop(events);
+        release_unused_heap_pages();
+        trace_publication_rss("after-event-index-drop", None);
         let mut session_ids = Vec::new();
         for plan in session_plans {
             let selected = load_events_by_ids(&events_path, &plan.ids)?;
@@ -2922,6 +2931,10 @@ impl CaptureManager {
             let html = callflow_renderer::render(&flow).map_err(|error| error.to_string())?;
             atomic_write(&html_path, html.as_bytes())?;
             session_ids.push(flow.session_id);
+            // The full event bodies selected for this session have gone out
+            // of scope at the end of the iteration. Return their pages now so
+            // hundreds of sequential sessions do not become retained RSS.
+            release_unused_heap_pages();
         }
         for flow in lte_flows {
             let json_path = dataset_dir
@@ -3028,6 +3041,8 @@ impl CaptureManager {
             &serde_json::to_vec_pretty(&dataset).map_err(|error| error.to_string())?,
         )?;
         validate_dataset_artifacts(&dataset, dataset_dir)?;
+        release_unused_heap_pages();
+        trace_publication_rss("after-callflows", None);
         Ok(dataset)
     }
 
@@ -3536,8 +3551,8 @@ fn validate_dataset_artifacts(dataset: &LiveDataset, dataset_dir: &Path) -> Resu
     {
         return Err("DATASET_REGISTRATION_ARTIFACT_MISSING".into());
     }
-    let events = load_path(&events_path)?;
-    if events.len() != dataset.event_count {
+    let event_count = count_valid_event_records(&events_path)?;
+    if event_count != dataset.event_count {
         return Err("DATASET_REGISTRATION_EVENT_COUNT_MISMATCH".into());
     }
     let persisted: LiveDataset =
@@ -3564,6 +3579,36 @@ fn validate_dataset_artifacts(dataset: &LiveDataset, dataset_dir: &Path) -> Resu
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// Validate a persisted event artifact without rebuilding the complete
+/// dataset in memory. Registration runs both before and after continuous
+/// publication, so using `load_path` here used to retain one full
+/// `Vec<EventRecord>` and made RSS proportional to history size.
+fn count_valid_event_records(path: &Path) -> Result<usize, String> {
+    let file = fs::File::open(path).map_err(display_error)?;
+    let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
+    let mut count = 0usize;
+    for (line_number, line) in reader.lines().enumerate() {
+        let line = line.map_err(display_error)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed = session_engine::load_jsonl(line.as_bytes())
+            .map_err(|error| format!("line {}: {error}", line_number + 1))?;
+        if parsed.len() != 1 {
+            return Err(format!(
+                "DATASET_REGISTRATION_EVENT_INVALID line {}",
+                line_number + 1
+            ));
+        }
+        count = count.saturating_add(1);
+        if count % 1024 == 0 {
+            release_unused_heap_pages();
+        }
+    }
+    release_unused_heap_pages();
+    Ok(count)
 }
 
 fn safe_identifier(value: &str) -> bool {
@@ -4356,7 +4401,6 @@ fn load_events_by_ids(
     path: &Path,
     ids: &BTreeSet<String>,
 ) -> Result<Vec<session_engine::EventRecord>, String> {
-    use std::io::BufRead;
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -4386,6 +4430,38 @@ fn load_events_by_ids(
         selected.extend(events);
     }
     Ok(selected)
+}
+
+/// Rust drops each per-session allocation before the next session starts, but
+/// glibc normally keeps the freed arenas mapped in the process. Continuous
+/// publication is a batch boundary: returning those pages prevents the API's
+/// resident set from inheriting the largest historical publication forever.
+fn release_unused_heap_pages() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) {
+    if std::env::var_os("OIRAN_PUBLICATION_RSS_TRACE").is_none() {
+        return;
+    }
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let value = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}:")))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    eprintln!(
+        "PUBLICATION_RSS phase={phase} indexed_events={} vmrss_kb={} vmhwm_kb={}",
+        indexed_events.unwrap_or(0),
+        value("VmRSS"),
+        value("VmHWM"),
+    );
 }
 
 /// 2.7.23: streaming merge of one input source into the final
@@ -4420,6 +4496,7 @@ where
     W: Write,
 {
     let mut line = String::new();
+    let mut processed = 0usize;
     loop {
         line.clear();
         if reader.read_line(&mut line).map_err(display_error)? == 0 {
@@ -4428,6 +4505,7 @@ where
         if line.trim().is_empty() {
             continue;
         }
+        processed = processed.saturating_add(1);
         let mut value: serde_json::Value =
             serde_json::from_str(&line).map_err(|error| error.to_string())?;
         let timestamp_s = value
@@ -4440,23 +4518,21 @@ where
         // non-zero → purge.
         if timestamp_s != 0 && timestamp_s < cutoff {
             *purged = purged.saturating_add(1);
+            drop(value);
+            if processed % 1024 == 0 {
+                release_unused_heap_pages();
+            }
             continue;
         }
         let id = continuous_observation_id(&value)?;
         if !seen_ids.insert(id.clone()) {
             // Duplicate (same deterministic observation id) → first
             // write wins.
-            continue;
-        }
-        if seen_ids.len() > MAX_CONTINUOUS_EVENTS {
-            // Hard cap on the live dedup set (defensive: age-based
-            // retention is the primary bound). Remove the lexicographic
-            // first id. The matching line has already been written to
-            // the tmp file; the next publication's retention pass will
-            // trim that line out.
-            if let Some(first) = seen_ids.iter().next().cloned() {
-                seen_ids.remove(&first);
+            drop(value);
+            if processed % 1024 == 0 {
+                release_unused_heap_pages();
             }
+            continue;
         }
         if timestamp_s != 0 {
             *oldest_kept = Some(match *oldest_kept {
@@ -4470,6 +4546,14 @@ where
             .write_all(serialized.as_bytes())
             .map_err(display_error)?;
         writer.write_all(b"\n").map_err(display_error)?;
+        drop(serialized);
+        drop(value);
+        if processed % 1024 == 0 {
+            // serde_json creates many short-lived strings and maps while a
+            // line is normalised. Return the freed pages periodically rather
+            // than letting the allocator retain one arena per history chunk.
+            release_unused_heap_pages();
+        }
     }
     Ok(())
 }
