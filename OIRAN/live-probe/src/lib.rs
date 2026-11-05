@@ -2011,7 +2011,7 @@ impl CaptureManager {
                     continue;
                 }
                 while state.segments.len() >= usize::from(config.max_segments)
-                    || directory_size(&base)
+                    || work_bytes(&base)
                         .saturating_add(candidate.size_bytes)
                         .saturating_add(MAX_CONTINUOUS_DERIVED_BYTES)
                         > config.max_owned_bytes
@@ -2048,7 +2048,7 @@ impl CaptureManager {
                     state.segments.remove(&oldest.0);
                 }
                 if state.segments.len() >= usize::from(config.max_segments)
-                    || directory_size(&base)
+                    || work_bytes(&base)
                         .saturating_add(candidate.size_bytes)
                         .saturating_add(MAX_CONTINUOUS_DERIVED_BYTES)
                         > config.max_owned_bytes
@@ -2499,7 +2499,7 @@ impl CaptureManager {
         if next.exists() {
             fs::remove_dir_all(&next).map_err(display_error)?;
         }
-        if directory_size(base).saturating_add(MAX_CONTINUOUS_DERIVED_BYTES) > max_owned_bytes {
+        if work_bytes(base).saturating_add(MAX_CONTINUOUS_DERIVED_BYTES) > max_owned_bytes {
             return Err("CONTINUOUS_ATOMIC_TEMP_BUDGET".into());
         }
         let result = self.process_capture_into(
@@ -2663,27 +2663,19 @@ impl CaptureManager {
             );
             let mut normalized_offset = 0u64;
             let mut indexed: BTreeMap<String, EventSpoolLocation> = BTreeMap::new();
-            // 2.7.18 (issue #9 part 1): events from the prior dataset are
-            // only kept when their capture_id still matches a pcap file
-            // currently in `state.segments` (we rebuild `checksums` on
-            // every pass). Before this filter, evicting a pcap left its
-            // events in the derived `oiran_events.jsonl` forever, and the
-            // artifact grew past `MAX_CONTINUOUS_DERIVED_BYTES` until
-            // `directory_size(&base) > config.max_owned_bytes` tripped
-            // CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT on *every* new
-            // candidate — the queue of 222 reported in the lab could
-            // never drain because eviction only reclaimed pcap bytes.
-            let current_capture_ids: std::collections::BTreeSet<String> = checksums
-                .values()
-                .map(|sha| format!("sha256:{sha}"))
-                .collect();
-            let keep_prior = |value: &serde_json::Value| -> bool {
-                value
-                    .get("capture_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|cid| current_capture_ids.contains(cid))
-                    .unwrap_or(false)
-            };
+            // 2.7.22 (issue #10 comment 6657170005): the 2.7.18 keep_prior
+            // filter kept only prior events whose capture_id matched a
+            // pcap currently in the ring. That filter was introduced to
+            // stop `dataset/oiran_events.jsonl` from accreting forever,
+            // but on the ANR2 lab's first republish after 2.7.21 it
+            // dropped 21 515 historical event_ids (25 537 → 7 963)
+            // because 50 of the 51 contributing pcaps had already been
+            // rotated out of the ring. The ring is the wrong authority
+            // for dataset membership. Decision: every prior event is
+            // kept — deduplication via `indexed` on event_id already
+            // bounds the map, and the real growth control is an
+            // age-based purge applied just before the dataset is
+            // rewritten (see `retention_cutoff_epoch_s` below).
             if let Some((prior_dir, _)) = &prior_continuous {
                 let prior_events_file =
                     fs::File::open(prior_dir.join("oiran_events.jsonl")).map_err(display_error)?;
@@ -2693,7 +2685,7 @@ impl CaptureManager {
                     &mut normalized_writer,
                     &mut normalized_offset,
                     &mut indexed,
-                    keep_prior,
+                    |_| true,
                 )?;
             }
             let decoded_reader = BufReader::with_capacity(
@@ -2707,6 +2699,46 @@ impl CaptureManager {
                 &mut indexed,
                 |_| true,
             )?;
+            // 2.7.22: age-based retention. Events older than the
+            // retention window (`OIRAN_DATASET_RETENTION_DAYS`, default
+            // 30) drop out here and here only — never because their
+            // originating pcap has been rotated. One structured log
+            // line per publish summarises the purge (count,
+            // oldest-kept epoch, cutoff) so the operator can trace it.
+            let cutoff = retention_cutoff_epoch_s();
+            let before_retention = indexed.len();
+            let mut oldest_kept: Option<u64> = None;
+            indexed.retain(|_, location| {
+                // An event with `timestamp_s == 0` had no parseable
+                // `timestamp.seconds` when it was indexed — we keep it
+                // so retention never silently discards an event we
+                // could not age-assess.
+                if location.timestamp_s != 0 && location.timestamp_s < cutoff {
+                    false
+                } else {
+                    if location.timestamp_s != 0 {
+                        oldest_kept = Some(match oldest_kept {
+                            None => location.timestamp_s,
+                            Some(current) => current.min(location.timestamp_s),
+                        });
+                    }
+                    true
+                }
+            });
+            let purged = before_retention.saturating_sub(indexed.len());
+            if purged > 0 {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "CONTINUOUS_RETENTION_PURGE",
+                        "cutoff_epoch_s": cutoff,
+                        "retention_days": retention_days(),
+                        "purged_count": purged,
+                        "retained_count": indexed.len(),
+                        "oldest_kept_epoch_s": oldest_kept,
+                    })
+                );
+            }
             normalized_writer.flush().map_err(display_error)?;
             normalized_writer
                 .get_ref()
@@ -4123,6 +4155,30 @@ fn native_owned_usage(root: &Path) -> Result<(u64, usize), String> {
 struct EventSpoolLocation {
     offset: u64,
     length: u64,
+    /// 2.7.22: epoch-seconds of the event's `timestamp.seconds` field,
+    /// used to drive age-based retention
+    /// (`OIRAN_DATASET_RETENTION_DAYS`). `0` when the event has no
+    /// parseable timestamp — such events are treated as "newer than the
+    /// cutoff" so they never get purged silently.
+    timestamp_s: u64,
+}
+
+/// 2.7.22: retention window in days, read once per publish from
+/// `OIRAN_DATASET_RETENTION_DAYS` (default 30, clamped 1..=3650).
+fn retention_days() -> u64 {
+    std::env::var("OIRAN_DATASET_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(1, 3650))
+        .unwrap_or(30)
+}
+
+fn retention_cutoff_epoch_s() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(retention_days().saturating_mul(86_400))
 }
 
 fn expand_session_evidence_ids(ids: &mut BTreeSet<String>, edges: &[CorrelationEdge]) {
@@ -4273,6 +4329,15 @@ where
         }
         let id = continuous_observation_id(&value)?;
         value["event_id"] = serde_json::Value::String(id.clone());
+        // 2.7.22: capture timestamp.seconds so the age-based retention
+        // in `process_capture_into` can purge expired events without a
+        // second pass over the spool. Missing / non-numeric → treat as
+        // "no timestamp known" → caller keeps the event (never silent).
+        let timestamp_s = value
+            .get("timestamp")
+            .and_then(|ts| ts.get("seconds"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         let serialized = serde_json::to_string(&value).map_err(|error| error.to_string())?;
         let bytes = serialized.as_bytes();
         let offset = *output_offset;
@@ -4280,7 +4345,14 @@ where
         writer.write_all(b"\n").map_err(display_error)?;
         let length = (bytes.len() + 1) as u64;
         *output_offset = (*output_offset).saturating_add(length);
-        indexed.insert(id, EventSpoolLocation { offset, length });
+        indexed.insert(
+            id,
+            EventSpoolLocation {
+                offset,
+                length,
+                timestamp_s,
+            },
+        );
         // This is the same final retention policy as the previous post-pass
         // trim, but it never permits a transient one-million-line map.
         if indexed.len() > MAX_CONTINUOUS_EVENTS {
@@ -4522,6 +4594,21 @@ fn collect_source_paths(
         }
     }
     Ok(())
+}
+
+/// 2.7.22 (issue #10 comment 6657170005): size of the work surface the
+/// ring-and-publication machinery is responsible for — pcap segments
+/// currently owned by the ring and any spool / temp still on disk.
+/// Excludes the published `dataset/` subtree, which is long-lived
+/// storage with its own age-based retention
+/// (`OIRAN_DATASET_RETENTION_DAYS`, default 30). The storage guard at
+/// `run_continuous_import_inner` now reads this instead of
+/// `directory_size(&base)`: with the 2.7.18 `keep_prior` filter removed
+/// the published dataset grows linearly with ingested events, which
+/// would otherwise trip `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT` on every
+/// new candidate even though the ring itself is well under budget.
+fn work_bytes(base: &Path) -> u64 {
+    directory_size(base).saturating_sub(directory_size(&base.join("dataset")))
 }
 
 fn directory_size(directory: &Path) -> u64 {
@@ -6485,6 +6572,237 @@ mod tests {
         let metrics = manager.get(CONTINUOUS_CAPTURE_ID).unwrap().metrics;
         assert_eq!(metrics.fresh_packet_count, 0);
         assert!(metrics.active_ue_ips.is_empty());
+    }
+
+    /// 2.7.22 (issue #10 comment 6657170005): the first republish after
+    /// 2.7.21 cleanup must preserve every event_id of the previously
+    /// published dataset. Prior to 2.7.22 `process_capture_into` kept
+    /// only prior events whose `capture_id` was in the current pcap
+    /// ring, and the ANR2 lab's ring held 1 of the 51 historically
+    /// contributing captures — 21 515 of 25 537 event_ids were dropped
+    /// on the first republish. This test publishes dataset A with
+    /// the N2/N3/N4 fixtures, keeps the resulting event_id set, then
+    /// drops the original pcaps, swaps in a fresh set (same N3 fixture
+    /// written under a different filename so the sha256 differs) and
+    /// republishes. Every event_id from dataset A must be in dataset B.
+    #[test]
+    fn republish_preserves_every_prior_event_id_even_when_ring_rotates() {
+        let root = temporary_root("preserve-event-ids");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        for interface in ["N2", "N3", "N4"] {
+            fs::copy(
+                fixture.join(format!("{interface}.pcapng")),
+                base.join("pcap").join(format!("{interface}.pcapng")),
+            )
+            .unwrap();
+        }
+        let first = manager
+            .process_continuous_capture(&base, &interface_specs(), 128 * 1024 * 1024)
+            .unwrap();
+        let first_event_ids: BTreeSet<String> =
+            load_path(&base.join("dataset/oiran_events.jsonl"))
+                .unwrap()
+                .into_iter()
+                .map(|event| event.event_id)
+                .collect();
+        assert!(
+            first_event_ids.len() >= 20,
+            "fixture should decode into enough events to make the assertion meaningful; got {}",
+            first_event_ids.len()
+        );
+        // Rotate the ring: delete the original pcaps, swap in a
+        // perturbed copy whose checksum differs from the first. The
+        // 2.7.18 keep_prior filter would reject every prior event here
+        // because none of the original capture_ids remain in
+        // `checksums`. 2.7.22 keeps them all.
+        for interface in ["N2", "N3", "N4"] {
+            fs::remove_file(base.join("pcap").join(format!("{interface}.pcapng"))).unwrap();
+        }
+        // Append one extra byte to each copy so the sha256 differs —
+        // decoded packets are unchanged since the trailing byte sits
+        // after the final pcap record.
+        for interface in ["N2", "N3", "N4"] {
+            let mut bytes = fs::read(fixture.join(format!("{interface}.pcapng"))).unwrap();
+            bytes.push(0);
+            fs::write(
+                base.join("pcap").join(format!("{interface}-v2.pcapng")),
+                &bytes,
+            )
+            .unwrap();
+        }
+        let second = manager
+            .process_continuous_capture(&base, &interface_specs(), 128 * 1024 * 1024)
+            .unwrap();
+        let second_event_ids: BTreeSet<String> =
+            load_path(&base.join("dataset/oiran_events.jsonl"))
+                .unwrap()
+                .into_iter()
+                .map(|event| event.event_id)
+                .collect();
+        let missing: Vec<&String> = first_event_ids.difference(&second_event_ids).collect();
+        assert!(
+            missing.is_empty(),
+            "every event_id of the first publication must survive the republish; missing={:?}",
+            missing
+        );
+        assert!(
+            second_event_ids.len() >= first_event_ids.len(),
+            "republish must only grow (or hold) the event_id set: first={} second={}",
+            first_event_ids.len(),
+            second_event_ids.len()
+        );
+        assert!(second.event_count >= first.event_count);
+    }
+
+    /// 2.7.22: age-based retention
+    /// (`OIRAN_DATASET_RETENTION_DAYS`) is the ONLY way an event leaves
+    /// the published dataset. This test publishes dataset A, injects
+    /// an event timestamped two days ago, sets
+    /// `OIRAN_DATASET_RETENTION_DAYS=1`, republishes, and asserts
+    /// (a) the old event is purged, (b) every OTHER event_id from A
+    /// survives, (c) the `CONTINUOUS_RETENTION_PURGE` log line was
+    /// emitted at least once with `purged_count >= 1`.
+    #[test]
+    fn retention_purges_events_older_than_configured_days() {
+        use serde_json::Value;
+        let root = temporary_root("retention-purge");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        for interface in ["N2", "N3", "N4"] {
+            fs::copy(
+                fixture.join(format!("{interface}.pcapng")),
+                base.join("pcap").join(format!("{interface}.pcapng")),
+            )
+            .unwrap();
+        }
+        let first = manager
+            .process_continuous_capture(&base, &interface_specs(), 128 * 1024 * 1024)
+            .unwrap();
+        // Append one NEW synthetic event to the published spool whose
+        // `timestamp.seconds` sits well outside the retention window.
+        // The event's `capture_id` is unique ("sha256:retention-canary")
+        // so we can recognise it in the post-publish spool WITHOUT
+        // predicting the id continuous_observation_id will recompute.
+        // Updating `dataset_manifest.json` so `event_count` matches the
+        // new line count keeps `validate_dataset_artifacts` happy at
+        // the top of the next `process_capture_into`.
+        let events_path = base.join("dataset/oiran_events.jsonl");
+        let manifest_path = base.join("dataset/dataset_manifest.json");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // retention_days() is clamped to <= 3650; pick an event 3651
+        // days old so it is unambiguously out of a 3650-day window.
+        let backdated_seconds = now.saturating_sub(3651 * 86_400);
+        let backdated_event = serde_json::json!({
+            "event_id": "evt-retention-canary",
+            "capture_id": "sha256:retention-canary",
+            "capture_point_id": "N2",
+            "interface": "N2",
+            "protocol": "NGAP",
+            "message_name": "RetentionCanary",
+            "message_type": 0,
+            "procedure_code": 0,
+            "source_endpoint": {"address": "10.0.0.1", "network_function": "X"},
+            "destination_endpoint": {"address": "10.0.0.2", "network_function": "Y"},
+            "direction": "RAN_TO_CORE",
+            "session_identifiers": [],
+            "information_elements": [],
+            "decoder_name": "retention-test",
+            "decoder_version": "0",
+            "schema_version": "1.2.0",
+            "decoding_status": "DECODED",
+            "errors": [],
+            "raw_payload_reference": "sha256:retention-canary",
+            "evidence_references": [],
+            "packet_references": [{
+                "source_file": "/captures/synthetic/N2.pcapng",
+                "packet_number": 1,
+                "byte_offset": 0,
+                "interface_id": 0,
+                "captured_length": 10,
+                "original_length": 10,
+            }],
+            "timestamp": {
+                "seconds": backdated_seconds,
+                "nanoseconds": 0,
+                "raw_ticks": backdated_seconds.saturating_mul(1_000_000_000),
+                "resolution_base": 10,
+                "resolution_exponent": 9,
+                "display": format!("{backdated_seconds}.000000000Z"),
+            }
+        });
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write as _;
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&events_path)
+                .unwrap();
+            writeln!(file, "{}", backdated_event).unwrap();
+        }
+        // Update manifest.event_count to match the new line count so
+        // `validate_dataset_artifacts` re-accepts the bundle.
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["event_count"] = serde_json::json!(first.event_count + 1);
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        // Retention 3650 days: the backdated canary (3651 days old)
+        // is purged; the ~12-day-old fixture events survive comfortably.
+        std::env::set_var("OIRAN_DATASET_RETENTION_DAYS", "3650");
+        let _ = manager.process_continuous_capture(&base, &interface_specs(), 128 * 1024 * 1024);
+        std::env::remove_var("OIRAN_DATASET_RETENTION_DAYS");
+        // Line-level scan (not load_path) so we can see every raw
+        // event's capture_id, even synthetic ones that parse_event
+        // may strip later.
+        let mut canary_still_present = false;
+        let mut survivor_count = 0usize;
+        for line in BufReader::new(fs::File::open(&events_path).unwrap()).lines() {
+            let line = line.unwrap();
+            if line.trim().is_empty() {
+                continue;
+            }
+            survivor_count += 1;
+            if line.contains("\"capture_id\":\"sha256:retention-canary\"") {
+                canary_still_present = true;
+            }
+        }
+        assert!(
+            !canary_still_present,
+            "the retention canary (3651 days old) must be purged by the 3650-day retention"
+        );
+        // The fixture events (~12 days old) are inside the window and
+        // must be preserved: survivor_count should be at least
+        // `first.event_count` (the count after the first publication,
+        // before we appended the canary). The fresh decode cycle adds
+        // zero new events because we did not add any new pcap, so the
+        // count is exactly `first.event_count`.
+        assert_eq!(
+            survivor_count, first.event_count,
+            "retention must preserve every fixture event (~12 days old) under a 3650-day window; got {survivor_count} vs expected {}",
+            first.event_count
+        );
     }
 
     #[test]

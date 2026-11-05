@@ -1,5 +1,86 @@
 # Changelog
 
+## OIRAN API 2.7.22 — 2026-11-05 — republish keeps every prior event + age-based retention
+
+- ANR2 recette (issue #10 comment 6657170005): on the first republish
+  after a 2.7.21 cleanup, the dataset went from 25 537 to 7 963 events
+  (21 515 historical event_ids lost). Root cause: `process_capture_into`
+  used the 2.7.18 `keep_prior` closure
+  (`live-probe/src/lib.rs:2668-2685`) to filter prior events by the
+  current pcap ring — the ring is bounded by `max_segments`, so once a
+  pcap rotates out the events it produced vanish from the next
+  republish, even though the data was durably committed to the
+  published dataset.
+- 2.7.22 fix (publication keeps every prior event):
+  * The `keep_prior` filter is removed. The caller now passes
+    `|_| true` for both the prior and the decoded spool streams of
+    `index_event_stream`. Deduplication by event_id is still enforced
+    by the `indexed: BTreeMap<String, EventSpoolLocation>` map, so a
+    re-decoded packet matches its prior observation and does not
+    duplicate.
+  * The `current_capture_ids` BTreeSet computation that fed the
+    closure is deleted from `process_capture_into`.
+- 2.7.22 fix (age-based retention, the only mechanism to remove a
+  published event):
+  * New env `OIRAN_DATASET_RETENTION_DAYS` (default 30, clamped
+    1..=3650) read once per publication by `retention_days()` and
+    materialised into an epoch cutoff by `retention_cutoff_epoch_s()`.
+  * `EventSpoolLocation` gains a `timestamp_s: u64` field captured in
+    `index_event_stream` from `value["timestamp"]["seconds"]` as each
+    line is written to the spool. `timestamp_s == 0` means "no
+    parseable timestamp" and causes the retention filter to KEEP the
+    event — retention never silently discards an event we could not
+    age-assess.
+  * Immediately before the final write-out of `oiran_events.jsonl`,
+    `process_capture_into` applies the cutoff: every indexed entry
+    whose `timestamp_s` is in the past AND older than the window is
+    dropped. One structured stderr log line per publication where any
+    event was purged:
+    ```json
+    {"event":"CONTINUOUS_RETENTION_PURGE",
+     "cutoff_epoch_s":<cutoff>,"retention_days":<days>,
+     "purged_count":<n>,"retained_count":<m>,
+     "oldest_kept_epoch_s":<ts>}
+    ```
+- 2.7.22 fix (storage guard does not count the published dataset):
+  * New helper `work_bytes(base) = directory_size(base) -
+    directory_size(base/dataset)` — the published `dataset/` subtree
+    is long-lived storage with its own age-based retention and must
+    not count against the ring's `max_owned_bytes` ceiling. With
+    `keep_prior` removed the dataset grows linearly with ingested
+    events, which under the pre-2.7.22 guard would have tripped
+    `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT` on every new candidate even
+    though the ring was well under budget.
+  * The three guard sites in `run_continuous_import_inner` + the
+    pre-check in `process_continuous_capture` now read `work_bytes`
+    instead of `directory_size(&base)`. `job.metrics.storage_bytes`
+    keeps reporting the TOTAL (observability — the operator wants to
+    see the dataset size too).
+- 2.7.21's startup cleanup is unchanged: `.dataset-next/` and
+  `.dataset-previous/` (never-committed artefacts) + base-level
+  `*.tmp`/`*.spool`/`*.compact-tmp` are removed; `dataset/` stays
+  byte-identical.
+- Regression tests
+  (`cargo test --workspace --locked --release` → **371 passed / 0
+  failed / 4 ignored**, was 369 on 2.7.21; +2 new):
+  * `live_probe::tests::republish_preserves_every_prior_event_id_even_when_ring_rotates`
+    publishes dataset A with the N2/N3/N4 fixtures, deletes those
+    pcaps, writes perturbed copies with fresh sha256s, calls
+    `process_continuous_capture` a second time, and asserts every
+    event_id from dataset A is in dataset B. With the 2.7.18 filter
+    the second dataset would carry only the fresh-decode events (none
+    of the 51 original capture_ids survive the ring rotation).
+  * `live_probe::tests::retention_purges_events_older_than_configured_days`
+    publishes once, appends a synthetic event
+    (`capture_id=sha256:retention-canary`,
+    `timestamp.seconds = now - 3651 days`), updates the manifest
+    event_count so `validate_dataset_artifacts` still accepts the
+    bundle, sets `OIRAN_DATASET_RETENTION_DAYS=3650`, republishes, and
+    asserts the canary is gone while every fixture event (~12 days
+    old) survives.
+- Audit negative harness 9/9 unchanged; 3 shell guards PASS.
+- Versions: `apps/api` 2.7.21 → 2.7.22; `live-probe` 0.4.7 → 0.4.8.
+
 ## OIRAN API 2.7.21 — 2026-11-05 — the published dataset is NEVER touched at startup
 
 - ANR2 recette (issue #10 comment 6653514332): on binary 2.7.20 the
