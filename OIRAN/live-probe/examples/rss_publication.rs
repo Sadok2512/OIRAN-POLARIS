@@ -22,8 +22,9 @@ fn read_status(key: &str) -> u64 {
 
 fn report(stage: &str) {
     println!(
-        "stage={stage} vmrss_kb={} vmpeak_kb={}",
+        "stage={stage} vmrss_kb={} vmhwm_kb={} vmpeak_kb={}",
         read_status("VmRSS"),
+        read_status("VmHWM"),
         read_status("VmPeak"),
     );
 }
