@@ -1,5 +1,92 @@
 # Changelog
 
+## OIRAN API 2.7.20 — 2026-11-05 — startup cleanup covers .dataset-next + size-before/after log
+
+- ANR2 arborescence (issue #10 comment 6652125653): the real oversized
+  spools in the lab were under `.dataset-next/`, not under `dataset/`.
+  `.dataset-next/` is the mid-publish staging tree used by
+  `process_capture_into`: when a publication crashes between
+  `atomic_write(dataset_next/dataset_manifest.json)` and the final
+  `rename(.dataset-next → dataset)`, `.dataset-next/` persists with its
+  own ~700 MiB `oiran_events.jsonl`, `.decoded-events.spool`,
+  `.normalized-events.spool` and `oiran_events.jsonl.tmp`. The 2.7.19
+  startup compaction only touched `dataset/oiran_events.jsonl`, so the
+  worker still arrived with 744 MiB (`dataset/`) + 762 MiB
+  (`.dataset-next/`) = 1 506 177 003 B > `max_owned_bytes =
+  1 140 850 688 B`, the storage guard tripped on candidate #1, and the
+  file stayed BLOCKED.
+- 2.7.20 fix: `compact_continuous_spools` has been generalised into
+  `clean_continuous_import_root(base, current_capture_ids) ->
+  CompactionReport`. Scope:
+  * `.dataset-previous/` → removed unconditionally (rollback artifact).
+  * `.dataset-next/` → removed unconditionally (mid-publish staging
+    tree, never holds committed data; `process_capture_into`
+    `live-probe/src/lib.rs:2462` already blanket-removes it before
+    rebuilding, so pre-cleaning at worker start is safe).
+  * `dataset/oiran_events.jsonl` → stream-compact in place
+    (`stream_compact_events`), keep only events whose `capture_id` is
+    in `current_capture_ids = {"sha256:<sha>" | sha in
+    state.segments.keys()}`. If any line was dropped, the (now stale)
+    `dataset_manifest.json` + `callflows/` are removed too — the next
+    publish rebuilds a coherent bundle atomically.
+  * `dataset/.decoded-events.spool`, `.normalized-events.spool`,
+    `*.tmp`, `*.compact-tmp` → removed (temp spools from a crashed
+    publication cycle).
+  * Base-level `*.tmp` / `*.compact-tmp` → removed (orphan
+    `atomic_write` partials).
+- Memory ceiling unchanged: 1 MiB `BufReader` + 1 MiB `BufWriter` +
+  one `serde_json::Value` at a time — no multi-GiB spool is
+  materialised in RAM. The compaction is sequential and single-threaded
+  so peak RSS during cleanup stays below the baseline footprint.
+- Startup log: `run_continuous_import_inner` now emits a single
+  structured line on stderr after cleanup finishes:
+  ```json
+  {
+    "event": "CONTINUOUS_IMPORT_STARTUP_CLEAN",
+    "base": "/var/lib/oiran/captures/continuous-lab-import",
+    "capture_ids_retained": 8,
+    "total_before_bytes": 1506177003,
+    "total_after_bytes": 65432108,
+    "entries": [
+      {"path": "...dataset-previous", "before_bytes": 180000000, "after_bytes": 0, "action": "removed-rollback-or-crash-artifact"},
+      {"path": "...dataset-next",     "before_bytes": 761937920, "after_bytes": 0, "action": "removed-rollback-or-crash-artifact"},
+      {"path": "...dataset/oiran_events.jsonl", "before_bytes": 744239083, "after_bytes": 65432108, "action": "compacted"},
+      ...
+    ]
+  }
+  ```
+  The "recette" (deployment checklist) can `grep CONTINUOUS_IMPORT_STARTUP_CLEAN
+  /var/log/oiran-api/stderr.log` to verify the shrink happened; each
+  entry lists its `before_bytes` / `after_bytes` / `action`.
+- `recover_continuous_dataset_from_disk` now tolerates a malformed or
+  drifted manifest the same way it tolerates a missing one. The worker
+  thread's cleanup runs AFTER `recover_continuous_dataset_from_disk`
+  returns to `start_continuous_import`, so a prior-run bogus manifest
+  must not crash the worker before cleanup can delete it; a
+  `CONTINUOUS_DATASET_RECOVER_SKIPPED` log line records the skip.
+- Regression tests (new):
+  * `live_probe::tests::anr2_layout_startup_cleanup_shrinks_below_cap_then_drains_250_segments`
+    reproduces the EXACT ANR2 lab directory tree: `dataset/`
+    (`oiran_events.jsonl` 60 000 × ~1 KiB = ~60 MiB with stale
+    capture_ids, `dataset_manifest.json`, `callflows/`), `.dataset-next/`
+    (its own 60 MiB `oiran_events.jsonl`, 2 MiB `.decoded-events.spool`,
+    2 MiB `.normalized-events.spool`, 2 MiB `oiran_events.jsonl.tmp`,
+    manifest + callflows), `.dataset-previous/` (20 MiB spool). Total
+    pre-cleanup > 128 MiB cap. The worker starts, the test waits for
+    the three observable terminal conditions (`.dataset-next` gone,
+    `.dataset-previous` gone, `dataset/oiran_events.jsonl` size == 0),
+    asserts `directory_size(&base) < cap`, and then 250 N3 segments
+    are drained to `segments_ingested >= 250`, `state != Blocked`.
+  * The 2.7.19 `compact_continuous_spools_prunes_orphan_events_and_rollback_directory`
+    was renamed to call `clean_continuous_import_root` via the new
+    entry point and retains full coverage of the rollback-removal +
+    stale-manifest-removal invariants.
+- Workspace: `cargo test --workspace --locked --release` → **369
+  passed / 0 failed / 4 ignored** (was 368 on 2.7.19; +1 for the ANR2
+  layout test). Shell guards (3) PASS. Negative harness 9/9
+  unchanged.
+- Versions: `apps/api` 2.7.19 → 2.7.20; `live-probe` 0.4.5 → 0.4.6.
+
 ## OIRAN API 2.7.19 — 2026-11-05 — startup spool compaction + single-source /health coherence
 
 - Follow-up on the ANR2 lab reproduction (issue #10, comment

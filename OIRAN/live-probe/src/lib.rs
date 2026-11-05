@@ -1739,32 +1739,37 @@ impl CaptureManager {
                 .seen_order
                 .extend(state.seen_checksums.iter().cloned());
         }
-        // 2.7.19 (issue #9 part 1, ANR2 lab reproduction): prior-generation
-        // spools persist from before the 2.7.18 filter. In the lab the two
-        // oiran_events.jsonl copies (current + .dataset-previous rollback)
-        // held 744 239 083 + 761 937 920 = 1 506 177 003 bytes, already
-        // above max_owned_bytes (1 140 850 688). 2.7.18 stops the growth
-        // but does not reduce the on-disk footprint, so
-        // directory_size(&base) tripped CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT
-        // on the FIRST candidate of the first scan — the queue never
-        // drained. Compact here, BEFORE anything else reads
-        // `directory_size(&base)`: stream-rewrite each spool, keep only
-        // the events whose capture_id matches a pcap still in
-        // state.segments (the ground truth for "currently retained"),
-        // write to <spool>.tmp and atomically rename. Memory is bounded
-        // by STREAM_CHUNK_BYTES (1 MiB) per reader/writer + one JSON
-        // value at a time. If any line was dropped, the published
-        // callflows and manifest are stale by construction, so we remove
-        // the manifest + callflow bundle; the next publication rebuilds
-        // them consistently (no "25 939 via /health, 25 537 via manifest"
-        // divergence after a compaction). The .dataset-previous rollback
-        // directory is a crash artifact and is always safe to drop.
+        // 2.7.20 (issue #10 comment 6652125653): walk every derived
+        // artifact under `<base>` and either compact (events of still-live
+        // capture_ids) or remove (orphan temp, stale rollback, mid-publish
+        // artifact) BEFORE any guard reads `directory_size(&base)`. The
+        // 2.7.19 version only compacted `dataset/oiran_events.jsonl`, so
+        // a prior-run `.dataset-next/` at 762 MiB (ANR2 lab reproduction:
+        // 744 239 083 + 761 937 920 = 1 506 177 003 B above the
+        // 1 140 850 688 B ceiling) kept the backpressure guard tripped on
+        // candidate #1 forever. See `clean_continuous_import_root`.
         let current_capture_ids: BTreeSet<String> = state
             .segments
             .keys()
             .map(|sha| format!("sha256:{sha}"))
             .collect();
-        compact_continuous_spools(&base, &current_capture_ids)?;
+        let compaction = clean_continuous_import_root(&base, &current_capture_ids)?;
+        // Structured stderr log so operators can diff size-before /
+        // size-after without parsing the Rust stack.
+        let log = serde_json::json!({
+            "event": "CONTINUOUS_IMPORT_STARTUP_CLEAN",
+            "base": base.display().to_string(),
+            "capture_ids_retained": current_capture_ids.len(),
+            "total_before_bytes": compaction.total_before(),
+            "total_after_bytes": compaction.total_after(),
+            "entries": compaction.entries.iter().map(|entry| serde_json::json!({
+                "path": entry.path,
+                "before_bytes": entry.before_bytes,
+                "after_bytes": entry.after_bytes,
+                "action": entry.action,
+            })).collect::<Vec<_>>(),
+        });
+        eprintln!("{log}");
         let recovered_dataset = self.dataset(CONTINUOUS_DATASET_ID);
         let mut observed = BTreeMap::<PathBuf, (u64, SystemTime)>::new();
         let mut bootstrap_pending = Vec::new();
@@ -2968,22 +2973,50 @@ impl CaptureManager {
     /// 2.7.19: made `pub` so the apps/api process can rehydrate without
     /// having to spawn the import worker (which requires the lab-only
     /// allowlisted source). Tests use it the same way.
+    ///
+    /// 2.7.20: tolerate a malformed or drifted manifest the same way we
+    /// tolerate a missing one. The worker's startup cleanup
+    /// (`clean_continuous_import_root`) deletes any stale manifest + its
+    /// callflows if its events.jsonl was partially compacted away; between
+    /// `start_continuous_import` calling this function and the worker
+    /// thread running its cleanup there is a narrow window where the
+    /// manifest on disk cannot be deserialised, and we must not crash the
+    /// worker then. A log line records the skip so the operator can trace
+    /// it from the audit stream.
     pub fn recover_continuous_dataset_from_disk(&self, base: &Path) -> Result<(), String> {
         let dataset_dir = base.join("dataset");
         let manifest_path = dataset_dir.join("dataset_manifest.json");
         if !manifest_path.is_file() {
             return Ok(());
         }
-        let bytes = fs::read(&manifest_path).map_err(display_error)?;
-        let dataset: LiveDataset =
-            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let Ok(bytes) = fs::read(&manifest_path) else {
+            return Ok(());
+        };
+        let Ok(dataset) = serde_json::from_slice::<LiveDataset>(&bytes) else {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "CONTINUOUS_DATASET_RECOVER_SKIPPED",
+                    "reason": "manifest-malformed",
+                    "path": manifest_path.display().to_string(),
+                })
+            );
+            return Ok(());
+        };
         if dataset.dataset_id != CONTINUOUS_DATASET_ID {
             return Err("CONTINUOUS_DATASET_IDENTIFIER_MISMATCH".into());
         }
-        // validate_dataset_artifacts re-checks that events.jsonl and every
-        // referenced callflow is on disk under `dataset_dir` with the recorded
-        // SHA-256. Any drift → refuse to publish a stale projection.
-        self.upsert_dataset(dataset, &dataset_dir)?;
+        if let Err(error) = self.upsert_dataset(dataset, &dataset_dir) {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "CONTINUOUS_DATASET_RECOVER_SKIPPED",
+                    "reason": "artifact-drift",
+                    "error": error,
+                    "path": manifest_path.display().to_string(),
+                })
+            );
+        }
         Ok(())
     }
 
@@ -4109,47 +4142,148 @@ fn expand_session_evidence_ids(ids: &mut BTreeSet<String>, edges: &[CorrelationE
     }
 }
 
-/// 2.7.19: at worker startup, stream-rewrite each surviving
-/// `oiran_events.jsonl` spool so only the events of currently-retained
-/// pcap segments (identified by their `sha256:…` capture_id) remain.
-/// Called from `run_continuous_import_inner` before any guard reads
-/// `directory_size(&base)`. Memory is bounded by STREAM_CHUNK_BYTES per
-/// reader/writer and by one `serde_json::Value` at a time.
+/// 2.7.20 (issue #10 comment 6652125653): at worker startup, walk every
+/// derived artifact under `<base>` and either compact it (keep events of
+/// currently-retained pcap segments) or remove it (orphan temp, stale
+/// rollback, mid-publish artifact). Called from
+/// `run_continuous_import_inner` BEFORE any guard reads
+/// `directory_size(&base)`, so a prior-run `.dataset-next/` of 762 MiB
+/// (ANR2 lab reproduction) cannot keep the backpressure guard tripped on
+/// candidate #1 forever.
 ///
-/// If any event is dropped by the filter, the previously-published
-/// dataset is semantically stale (its callflows reference event ids that
-/// may no longer exist), so this helper also removes the manifest and
-/// callflow artifacts. The next successful publication atomically
-/// rewrites them, which keeps `/health` and `dataset_manifest.json`
-/// trivially aligned (issue #9 part 2).
+/// Scope (the live-probe owns everything under `<base>` except the pcap
+/// ring and the state file):
+///   * `.dataset-previous/` — rollback artifact of a rename that crashed
+///     mid-way; the atomic commit point is the final rename to
+///     `dataset/`, so previous can always be dropped.
+///   * `.dataset-next/` — mid-publish artifact; ditto. `process_capture_into`
+///     cleans this before writing anyway (see `live-probe/src/lib.rs:2462`),
+///     so pre-cleaning at worker startup is safe.
+///   * `dataset/oiran_events.jsonl` — stream-filter in place, keep only
+///     events whose `capture_id` is in `current_capture_ids`. If any line
+///     was dropped, remove the (now stale) `dataset_manifest.json` and
+///     `callflows/` as well — the next publish rebuilds them atomically.
+///   * `dataset/.decoded-events.spool`, `.normalized-events.spool`,
+///     `*.tmp`, `*.compact-tmp` — temp spools from a crashed publish; remove.
+///   * Base-level `*.tmp` and `*.compact-tmp` — orphan atomic_write partials.
 ///
-/// `.dataset-previous/` is always a rollback artifact of a rename that
-/// crashed mid-way; removing it has no observable effect on the
-/// committed dataset under `.dataset-current/`.
-fn compact_continuous_spools(
+/// Memory is bounded by `STREAM_CHUNK_BYTES` (1 MiB) per reader/writer and
+/// one `serde_json::Value` at a time — no 1.5 GiB in-RAM materialisation.
+/// Returns a `CompactionReport` listing every file touched with its size
+/// before / after so the operator can verify the cleanup from the log line
+/// emitted by `run_continuous_import_inner`.
+fn clean_continuous_import_root(
     base: &Path,
     current_capture_ids: &BTreeSet<String>,
-) -> Result<(), String> {
-    let previous = base.join(".dataset-previous");
-    if previous.exists() {
-        fs::remove_dir_all(&previous).map_err(display_error)?;
+) -> Result<CompactionReport, String> {
+    let mut report = CompactionReport::default();
+    for name in [".dataset-previous", ".dataset-next"] {
+        let path = base.join(name);
+        if path.exists() {
+            let size = directory_size(&path);
+            fs::remove_dir_all(&path).map_err(display_error)?;
+            report.push(&path, size, 0, "removed-rollback-or-crash-artifact");
+        }
+    }
+    // Base-level orphan atomic_write partials.
+    if let Ok(entries) = fs::read_dir(base) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with(".tmp") || name.ends_with(".compact-tmp") {
+                let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                fs::remove_file(&path).map_err(display_error)?;
+                report.push(&path, size, 0, "removed-orphan-temp");
+            }
+        }
     }
     let dataset_dir = base.join("dataset");
-    if !dataset_dir.is_dir() {
-        return Ok(());
+    if dataset_dir.is_dir() {
+        compact_dataset_in_place(&dataset_dir, current_capture_ids, &mut report)?;
+    }
+    Ok(report)
+}
+
+fn compact_dataset_in_place(
+    dataset_dir: &Path,
+    current_capture_ids: &BTreeSet<String>,
+    report: &mut CompactionReport,
+) -> Result<(), String> {
+    // Spool / tmp files from a crashed publication cycle.
+    if let Ok(entries) = fs::read_dir(dataset_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name == ".decoded-events.spool"
+                || name == ".normalized-events.spool"
+                || name.ends_with(".tmp")
+                || name.ends_with(".compact-tmp")
+            {
+                let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                fs::remove_file(&path).map_err(display_error)?;
+                report.push(&path, size, 0, "removed-spool-or-tmp");
+            }
+        }
     }
     let events_path = dataset_dir.join("oiran_events.jsonl");
     if !events_path.is_file() {
         return Ok(());
     }
+    let before_bytes = fs::metadata(&events_path).map(|m| m.len()).unwrap_or(0);
     let tmp = dataset_dir.join("oiran_events.jsonl.compact-tmp");
+    let (total_before, total_after) =
+        stream_compact_events(&events_path, &tmp, current_capture_ids)?;
+    let after_bytes = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    fs::rename(&tmp, &events_path).map_err(display_error)?;
+    report.push(
+        &events_path,
+        before_bytes,
+        after_bytes,
+        if total_after == total_before {
+            "compacted-no-op"
+        } else {
+            "compacted"
+        },
+    );
+    if total_after < total_before {
+        let manifest = dataset_dir.join("dataset_manifest.json");
+        if manifest.is_file() {
+            let size = fs::metadata(&manifest).map(|m| m.len()).unwrap_or(0);
+            fs::remove_file(&manifest).map_err(display_error)?;
+            report.push(&manifest, size, 0, "removed-stale-manifest");
+        }
+        let callflows = dataset_dir.join("callflows");
+        if callflows.is_dir() {
+            let size = directory_size(&callflows);
+            fs::remove_dir_all(&callflows).map_err(display_error)?;
+            report.push(&callflows, size, 0, "removed-stale-callflows");
+        }
+    }
+    Ok(())
+}
+
+fn stream_compact_events(
+    src: &Path,
+    dst: &Path,
+    keep: &BTreeSet<String>,
+) -> Result<(u64, u64), String> {
     let reader = BufReader::with_capacity(
         STREAM_CHUNK_BYTES,
-        fs::File::open(&events_path).map_err(display_error)?,
+        fs::File::open(src).map_err(display_error)?,
     );
     let mut writer = BufWriter::with_capacity(
         STREAM_CHUNK_BYTES,
-        fs::File::create(&tmp).map_err(display_error)?,
+        fs::File::create(dst).map_err(display_error)?,
     );
     let mut total_before: u64 = 0;
     let mut total_after: u64 = 0;
@@ -4161,12 +4295,12 @@ fn compact_continuous_spools(
         total_before = total_before.saturating_add(1);
         let value: serde_json::Value =
             serde_json::from_str(&line).map_err(|error| error.to_string())?;
-        let keep = value
+        let keep_line = value
             .get("capture_id")
             .and_then(serde_json::Value::as_str)
-            .map(|cid| current_capture_ids.contains(cid))
+            .map(|cid| keep.contains(cid))
             .unwrap_or(false);
-        if !keep {
+        if !keep_line {
             continue;
         }
         writer.write_all(line.as_bytes()).map_err(display_error)?;
@@ -4175,24 +4309,37 @@ fn compact_continuous_spools(
     }
     writer.flush().map_err(display_error)?;
     writer.get_ref().sync_all().map_err(display_error)?;
-    drop(writer);
-    fs::rename(&tmp, &events_path).map_err(display_error)?;
-    if total_after < total_before {
-        // Stale manifest + callflow bundle. Remove them so the next
-        // publication rebuilds a coherent dataset. We keep the compacted
-        // `oiran_events.jsonl`: the next publish will feed it through
-        // `index_event_stream` as the `prior_continuous` source, so
-        // nothing is lost that still had a pcap on disk.
-        let manifest = dataset_dir.join("dataset_manifest.json");
-        if manifest.is_file() {
-            fs::remove_file(&manifest).map_err(display_error)?;
-        }
-        let callflows = dataset_dir.join("callflows");
-        if callflows.is_dir() {
-            fs::remove_dir_all(&callflows).map_err(display_error)?;
-        }
+    Ok((total_before, total_after))
+}
+
+#[derive(Debug, Default)]
+struct CompactionReport {
+    entries: Vec<CompactionEntry>,
+}
+
+#[derive(Debug)]
+struct CompactionEntry {
+    path: String,
+    before_bytes: u64,
+    after_bytes: u64,
+    action: &'static str,
+}
+
+impl CompactionReport {
+    fn push(&mut self, path: &Path, before: u64, after: u64, action: &'static str) {
+        self.entries.push(CompactionEntry {
+            path: path.display().to_string(),
+            before_bytes: before,
+            after_bytes: after,
+            action,
+        });
     }
-    Ok(())
+    fn total_before(&self) -> u64 {
+        self.entries.iter().map(|e| e.before_bytes).sum()
+    }
+    fn total_after(&self) -> u64 {
+        self.entries.iter().map(|e| e.after_bytes).sum()
+    }
 }
 
 fn index_event_stream<R, W, F>(
@@ -5713,7 +5860,7 @@ mod tests {
         fs::write(dataset_dir.join("callflows/stale.json"), b"{}").unwrap();
         let mut kept = BTreeSet::new();
         kept.insert("sha256:live".to_string());
-        compact_continuous_spools(&base, &kept).unwrap();
+        clean_continuous_import_root(&base, &kept).unwrap();
         assert!(!base.join(".dataset-previous").exists());
         assert!(!manifest_path.exists());
         assert!(!dataset_dir.join("callflows").exists());
@@ -5736,8 +5883,174 @@ mod tests {
         // (total_after == total_before, so the stale-manifest branch is
         // not taken and no file is removed).
         fs::write(&manifest_path, b"{\"rebuild\":true}").unwrap();
-        compact_continuous_spools(&base, &kept).unwrap();
+        clean_continuous_import_root(&base, &kept).unwrap();
         assert!(manifest_path.exists());
+    }
+
+    /// 2.7.20 (issue #10 comment 6652125653, ANR2 arborescence): reproduce
+    /// the EXACT lab layout — `dataset/`, `.dataset-next/`,
+    /// `.dataset-previous/`, `pcap/` — with the oversized files in
+    /// `.dataset-next/` (the real culprit 2.7.19 missed). Pre-cleanup
+    /// total > 128 MiB cap; after `clean_continuous_import_root` the
+    /// footprint falls well below the cap AND the 250-segment drain
+    /// completes. Mémoire bornée: the stream-compactor allocates a single
+    /// 1 MiB BufReader + 1 MiB BufWriter + one `serde_json::Value` at a
+    /// time, regardless of the spool size.
+    #[test]
+    fn anr2_layout_startup_cleanup_shrinks_below_cap_then_drains_250_segments() {
+        if skip_if_disk_too_full(
+            "anr2_layout_startup_cleanup_shrinks_below_cap_then_drains_250_segments",
+        ) {
+            return;
+        }
+        use serde_json::json;
+        let source = temporary_root("anr2-source");
+        let root = temporary_root("anr2-owned");
+        fs::create_dir_all(source.join("N3")).unwrap();
+        // --- Reproduce the ANR2 lab arborescence ---------------------
+        //   <base>/pcap/
+        //   <base>/dataset/{oiran_events.jsonl, dataset_manifest.json, callflows/}
+        //   <base>/.dataset-next/{oiran_events.jsonl, .decoded-events.spool,
+        //                        .normalized-events.spool, oiran_events.jsonl.tmp,
+        //                        dataset_manifest.json, callflows/}
+        //   <base>/.dataset-previous/{oiran_events.jsonl, dataset_manifest.json}
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset_dir = base.join("dataset");
+        let next_dir = base.join(".dataset-next");
+        let previous_dir = base.join(".dataset-previous");
+        fs::create_dir_all(dataset_dir.join("callflows")).unwrap();
+        fs::create_dir_all(next_dir.join("callflows")).unwrap();
+        fs::create_dir_all(previous_dir.join("callflows")).unwrap();
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        // ~1 KiB of padding per line → 60 000 lines ≈ 60 MiB per file.
+        // Two files + a smaller previous → 60 + 60 + 20 = 140 MiB, over
+        // the 128 MiB test cap.
+        let padding = "x".repeat(900);
+        let write_spool = |path: &std::path::Path, lines: usize, tag: &str| {
+            let mut writer = BufWriter::with_capacity(
+                STREAM_CHUNK_BYTES,
+                fs::File::create(path).unwrap(),
+            );
+            for i in 0..lines {
+                let event = json!({
+                    "event_id": format!("evt-{tag}-{i:08}"),
+                    "capture_id": format!("sha256:stale-{tag}"),
+                    "pad": padding,
+                });
+                writeln!(writer, "{}", event).unwrap();
+            }
+            writer.flush().unwrap();
+        };
+        write_spool(&dataset_dir.join("oiran_events.jsonl"), 60_000, "current");
+        write_spool(&next_dir.join("oiran_events.jsonl"), 60_000, "next");
+        write_spool(&previous_dir.join("oiran_events.jsonl"), 20_000, "previous");
+        // Spool-tier temporaries that a crashed publication can leave
+        // inside `.dataset-next/`.
+        fs::write(next_dir.join(".decoded-events.spool"), vec![0u8; 2_000_000]).unwrap();
+        fs::write(
+            next_dir.join(".normalized-events.spool"),
+            vec![0u8; 2_000_000],
+        )
+        .unwrap();
+        fs::write(
+            next_dir.join("oiran_events.jsonl.tmp"),
+            vec![0u8; 2_000_000],
+        )
+        .unwrap();
+        // Manifest + callflow stubs in every subtree.
+        for d in [&dataset_dir, &next_dir, &previous_dir] {
+            fs::write(d.join("dataset_manifest.json"), b"{\"stale\":true}").unwrap();
+            fs::write(d.join("callflows/stub.json"), b"{}").unwrap();
+            fs::write(d.join("callflows/stub.html"), b"<html></html>").unwrap();
+        }
+        let before = directory_size(&base);
+        assert!(
+            before > 128 * 1024 * 1024,
+            "ANR2 fixture must exceed 128 MiB cap before cleanup; got {} B",
+            before
+        );
+        // --- Start the worker -----------------------------------------
+        // state.segments is empty at startup → NO capture_id is retained
+        // → every stale event is dropped from the spools; everything in
+        // the derived tree must go.
+        let seconds = (epoch_ms() / 1000) as u32;
+        for index in 0..250_u32 {
+            let path = source.join(format!("N3/segment-{index:04}.pcap"));
+            let teid = 0x9000_u32 + index;
+            write_pcap_at(&path, seconds, &[gtpu_gpdu_frame(index as u8, teid)]);
+        }
+        thread::sleep(Duration::from_millis(500));
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source.clone(),
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 256 * 1024,
+                max_segments: 8,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+            })
+            .unwrap();
+        // The worker's first act is `clean_continuous_import_root`; by
+        // the time `start_continuous_import` returns the thread has been
+        // spawned but may still be mid-cleanup. We wait for the three
+        // observable outcomes of the cleanup in one go:
+        //   - .dataset-next removed
+        //   - .dataset-previous removed
+        //   - dataset/oiran_events.jsonl compacted to empty (no retained
+        //     capture_id survives, `state.segments` is empty at startup).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let next_gone = !next_dir.exists();
+            let prev_gone = !previous_dir.exists();
+            let current_len = fs::metadata(dataset_dir.join("oiran_events.jsonl"))
+                .map(|m| m.len())
+                .unwrap_or(u64::MAX);
+            if next_gone && prev_gone && current_len == 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "cleanup did not reach terminal state: next={} prev={} current={}",
+                    next_gone, prev_gone, current_len
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let after_cleanup = directory_size(&base);
+        assert!(
+            after_cleanup < 128 * 1024 * 1024,
+            "post-cleanup directory_size must fall below the cap; got {} B",
+            after_cleanup
+        );
+        // --- Drain 250 segments ---------------------------------------
+        let drain_deadline = Instant::now() + Duration::from_secs(120);
+        while Instant::now() < drain_deadline {
+            if let Some(job) = manager.get(CONTINUOUS_CAPTURE_ID) {
+                if job.metrics.segments_ingested >= 250 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        let final_job = manager.get(CONTINUOUS_CAPTURE_ID).expect("worker alive");
+        assert!(
+            final_job.metrics.segments_ingested >= 250,
+            "post-cleanup 250 segments → segments_ingested={} (state={:?}, error={:?})",
+            final_job.metrics.segments_ingested,
+            final_job.state,
+            final_job.error,
+        );
+        assert_ne!(final_job.state, CaptureState::Blocked);
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
     }
 
     /// 2.7.18 (issue #9 part 1): 250 valid pcap segments arrive in the
