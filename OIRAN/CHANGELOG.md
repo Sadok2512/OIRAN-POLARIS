@@ -1,5 +1,63 @@
 # Changelog
 
+## OIRAN API 2.7.23 — 2026-11-05 — configurable derived-output cap + no retry loop
+
+- ANR2 (issue #10 comment 6662293690): with `MemoryMax=512 MiB` the
+  2.7.22 publication finishes without OOM (RSS 349 MiB), but every
+  commit fails with `CONTINUOUS_DERIVED_OUTPUT_LIMIT`: the derived
+  publication is 72 332 673 B against a hardcoded 67 108 864 B (=
+  `MAX_CONTINUOUS_DERIVED_BYTES = 64 MiB`) and the worker loops on
+  `CONTINUOUS_DECODE_RETRYABLE` indefinitely. The hard cap was sized
+  for the 2.7.21 "shrink on publish" era; since 2.7.22 keeps every
+  prior event by design, 64 MiB is no longer realistic.
+- 2.7.23 fix (configurable cap):
+  * New env `OIRAN_CONTINUOUS_DERIVED_OUTPUT_MAX_BYTES`, default
+    `536 870 912` (512 MiB). Read once per publication via
+    `derived_output_hard_limit_bytes()`. No clamp, so operators can
+    tighten the cap for forced-retry scenarios or raise it when the
+    dataset outgrows the default.
+  * `MAX_CONTINUOUS_DERIVED_BYTES = 64 MiB` stays as the **staging
+    reserve** (per-candidate budget + eviction guards) because the
+    semantics there are different: short-lived doublewrite space, not
+    the long-lived published dataset ceiling. The docstring now spells
+    out the distinction.
+  * The `CONTINUOUS_DERIVED_OUTPUT_LIMIT` error message now embeds the
+    observed `next_bytes`, the configured cap and the current
+    `OIRAN_DATASET_RETENTION_DAYS` value, so the operator can decide
+    between shortening the retention window and raising the cap
+    without re-reading the source.
+- 2.7.23 fix (one attempt, then Blocked — no retry loop):
+  * The handler in `run_continuous_import_inner` recognises the
+    `CONTINUOUS_DERIVED_OUTPUT_LIMIT` prefix and marks the capture
+    `CaptureState::Blocked` with
+    `stop_reason = "DERIVED_OUTPUT_EXCEEDS_LIMIT"` and
+    `ended_epoch_ms = Some(…)`, then `return Ok(())` to exit the
+    worker thread. Every other error (decode, I/O) keeps the
+    historical `CONTINUOUS_DECODE_RETRYABLE` retry semantics.
+  * The retention sweep inside `process_capture_into` runs
+    unconditionally before this check — the error is only raised when
+    the dataset is already pruned down to its current retention
+    window and STILL overflows the configured cap.
+- Regression tests
+  (`cargo test --workspace --locked --release` → **373 passed / 0
+  failed / 4 ignored**, was 371 on 2.7.22; +2 new):
+  * `live_probe::tests::derived_output_cap_accepts_small_publication_under_default_limit`
+    publishes the three OIRAN_5G_PDU_SESSION_DATA_V1 fixtures with
+    the default 512 MiB cap and asserts the publication succeeds
+    (events.jsonl + manifest both present).
+  * `live_probe::tests::derived_output_over_limit_returns_informative_error_and_is_not_retryable`
+    sets `OIRAN_CONTINUOUS_DERIVED_OUTPUT_MAX_BYTES=1`, publishes the
+    same fixtures, asserts `process_continuous_capture` returns `Err`
+    whose message starts with `CONTINUOUS_DERIVED_OUTPUT_LIMIT` and
+    contains the observed size, the cap, and the retention guidance.
+    The non-retryable handler keys on the same prefix.
+- Streaming RSS reduction (target: peak < 128 MiB for 30 000 events)
+  deferred to 2.7.24. Under the palliative 512 MiB `MemoryMax` the
+  2.7.22 publication completes; 2.7.23 removes the retry loop that
+  would otherwise keep the queue blocked forever.
+- Audit negative harness 9/9 unchanged; 3 shell guards PASS.
+- Versions: `apps/api` 2.7.22 → 2.7.23; `live-probe` 0.4.8 → 0.4.9.
+
 ## OIRAN API 2.7.22 — 2026-11-05 — republish keeps every prior event + age-based retention
 
 - ANR2 recette (issue #10 comment 6657170005): on the first republish
