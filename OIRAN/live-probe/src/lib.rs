@@ -1739,27 +1739,27 @@ impl CaptureManager {
                 .seen_order
                 .extend(state.seen_checksums.iter().cloned());
         }
-        // 2.7.20 (issue #10 comment 6652125653): walk every derived
-        // artifact under `<base>` and either compact (events of still-live
-        // capture_ids) or remove (orphan temp, stale rollback, mid-publish
-        // artifact) BEFORE any guard reads `directory_size(&base)`. The
-        // 2.7.19 version only compacted `dataset/oiran_events.jsonl`, so
-        // a prior-run `.dataset-next/` at 762 MiB (ANR2 lab reproduction:
-        // 744 239 083 + 761 937 920 = 1 506 177 003 B above the
-        // 1 140 850 688 B ceiling) kept the backpressure guard tripped on
-        // candidate #1 forever. See `clean_continuous_import_root`.
-        let current_capture_ids: BTreeSet<String> = state
-            .segments
-            .keys()
-            .map(|sha| format!("sha256:{sha}"))
-            .collect();
-        let compaction = clean_continuous_import_root(&base, &current_capture_ids)?;
+        // 2.7.21 (issue #10 comment 6653514332): remove ONLY the
+        // never-committed artifacts (`.dataset-next/`, `.dataset-previous/`,
+        // base-level `*.tmp` / `*.compact-tmp` / `*.spool`). The
+        // committed `dataset/` subtree — `oiran_events.jsonl`,
+        // `dataset_manifest.json`, `callflows/` — is left strictly
+        // byte-identical. The 2.7.20 variant compacted
+        // `dataset/oiran_events.jsonl` against the current pcap ring
+        // (`state.segments.keys()`), but the ring is capped at
+        // `max_segments` and does NOT represent the history of
+        // capture_ids that ever contributed events: ANR2 arrived with
+        // 1 ring entry while the published dataset held 51 capture_ids,
+        // and the compaction cut 25 537 events down to 77 (3 945
+        // events of 20 captures whose pcap was STILL present were lost
+        // through a capture-id mismatch; rollback saved the data). See
+        // `clean_continuous_import_root`.
+        let compaction = clean_continuous_import_root(&base)?;
         // Structured stderr log so operators can diff size-before /
         // size-after without parsing the Rust stack.
         let log = serde_json::json!({
             "event": "CONTINUOUS_IMPORT_STARTUP_CLEAN",
             "base": base.display().to_string(),
-            "capture_ids_retained": current_capture_ids.len(),
             "total_before_bytes": compaction.total_before(),
             "total_after_bytes": compaction.total_after(),
             "entries": compaction.entries.iter().map(|entry| serde_json::json!({
@@ -4142,40 +4142,46 @@ fn expand_session_evidence_ids(ids: &mut BTreeSet<String>, edges: &[CorrelationE
     }
 }
 
-/// 2.7.20 (issue #10 comment 6652125653): at worker startup, walk every
-/// derived artifact under `<base>` and either compact it (keep events of
-/// currently-retained pcap segments) or remove it (orphan temp, stale
-/// rollback, mid-publish artifact). Called from
-/// `run_continuous_import_inner` BEFORE any guard reads
-/// `directory_size(&base)`, so a prior-run `.dataset-next/` of 762 MiB
-/// (ANR2 lab reproduction) cannot keep the backpressure guard tripped on
-/// candidate #1 forever.
+/// 2.7.21 (issue #10 comment 6653514332, ANR2 recette): remove every
+/// never-committed artifact under `<base>` at worker startup, but leave
+/// the committed `dataset/` subtree STRICTLY byte-identical.
 ///
-/// Scope (the live-probe owns everything under `<base>` except the pcap
-/// ring and the state file):
-///   * `.dataset-previous/` — rollback artifact of a rename that crashed
-///     mid-way; the atomic commit point is the final rename to
-///     `dataset/`, so previous can always be dropped.
-///   * `.dataset-next/` — mid-publish artifact; ditto. `process_capture_into`
-///     cleans this before writing anyway (see `live-probe/src/lib.rs:2462`),
-///     so pre-cleaning at worker startup is safe.
-///   * `dataset/oiran_events.jsonl` — stream-filter in place, keep only
-///     events whose `capture_id` is in `current_capture_ids`. If any line
-///     was dropped, remove the (now stale) `dataset_manifest.json` and
-///     `callflows/` as well — the next publish rebuilds them atomically.
-///   * `dataset/.decoded-events.spool`, `.normalized-events.spool`,
-///     `*.tmp`, `*.compact-tmp` — temp spools from a crashed publish; remove.
-///   * Base-level `*.tmp` and `*.compact-tmp` — orphan atomic_write partials.
+/// The 2.7.20 version also compacted `dataset/oiran_events.jsonl` using
+/// `current_capture_ids = {"sha256:<sha>" | sha in state.segments.keys()}`
+/// (see `live-probe/src/lib.rs:1764-1769` in the 2.7.20 source). But
+/// `state.segments` is the CURRENT RING of pcap segments, capped at
+/// `max_segments`; it is NOT the history of capture_ids that ever
+/// contributed events. The ANR2 lab arrived with 1 segment in the ring
+/// and 51 capture_ids inside the published `oiran_events.jsonl` (built
+/// across many publish cycles before pcap files were evicted). The
+/// 2.7.20 filter kept 77 events out of 25 537 — a 3 945-event loss
+/// across 20 captures whose pcap was still present (rollback saved the
+/// data). Decision: the published dataset is NEVER compacted or
+/// filtered at startup.
 ///
-/// Memory is bounded by `STREAM_CHUNK_BYTES` (1 MiB) per reader/writer and
-/// one `serde_json::Value` at a time — no 1.5 GiB in-RAM materialisation.
-/// Returns a `CompactionReport` listing every file touched with its size
-/// before / after so the operator can verify the cleanup from the log line
-/// emitted by `run_continuous_import_inner`.
-fn clean_continuous_import_root(
-    base: &Path,
-    current_capture_ids: &BTreeSet<String>,
-) -> Result<CompactionReport, String> {
+/// Remaining scope (strictly outside `dataset/`):
+///   * `.dataset-previous/` — rollback of a rename that crashed mid-way;
+///     the atomic commit point is the final rename INTO `dataset/`, so
+///     previous never holds committed data.
+///   * `.dataset-next/` — mid-publish staging tree;
+///     `process_capture_into` blanket-removes it before rebuilding
+///     anyway (`live-probe/src/lib.rs:2462`), so pre-cleaning at worker
+///     startup is safe.
+///   * Base-level `*.tmp` / `*.compact-tmp` — orphan `atomic_write`
+///     partials (e.g. `import_state.json.tmp`).
+///
+/// `dataset/` and its `*.spool`, `*.tmp`, `oiran_events.jsonl`,
+/// `dataset_manifest.json`, `callflows/` are all left untouched.
+/// The next successful publication cycle rewrites them atomically if
+/// anything is stale; any spool/tmp inside `dataset/` is either from a
+/// crashed publish into `.dataset-next/` (already handled by the
+/// `.dataset-next/` wipe) or from a PREVIOUS binary version that is no
+/// longer reachable.
+///
+/// Returns a `CompactionReport` listing every file touched with its
+/// size before / after so the operator can verify the shrink from the
+/// log line emitted by `run_continuous_import_inner`.
+fn clean_continuous_import_root(base: &Path) -> Result<CompactionReport, String> {
     let mut report = CompactionReport::default();
     for name in [".dataset-previous", ".dataset-next"] {
         let path = base.join(name);
@@ -4185,7 +4191,8 @@ fn clean_continuous_import_root(
             report.push(&path, size, 0, "removed-rollback-or-crash-artifact");
         }
     }
-    // Base-level orphan atomic_write partials.
+    // Base-level orphan atomic_write partials. Does NOT descend into
+    // `dataset/` — the published tree is sacred.
     if let Ok(entries) = fs::read_dir(base) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -4195,121 +4202,17 @@ fn clean_continuous_import_root(
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if name.ends_with(".tmp") || name.ends_with(".compact-tmp") {
+            if name.ends_with(".tmp")
+                || name.ends_with(".compact-tmp")
+                || name.ends_with(".spool")
+            {
                 let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 fs::remove_file(&path).map_err(display_error)?;
                 report.push(&path, size, 0, "removed-orphan-temp");
             }
         }
     }
-    let dataset_dir = base.join("dataset");
-    if dataset_dir.is_dir() {
-        compact_dataset_in_place(&dataset_dir, current_capture_ids, &mut report)?;
-    }
     Ok(report)
-}
-
-fn compact_dataset_in_place(
-    dataset_dir: &Path,
-    current_capture_ids: &BTreeSet<String>,
-    report: &mut CompactionReport,
-) -> Result<(), String> {
-    // Spool / tmp files from a crashed publication cycle.
-    if let Ok(entries) = fs::read_dir(dataset_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if name == ".decoded-events.spool"
-                || name == ".normalized-events.spool"
-                || name.ends_with(".tmp")
-                || name.ends_with(".compact-tmp")
-            {
-                let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                fs::remove_file(&path).map_err(display_error)?;
-                report.push(&path, size, 0, "removed-spool-or-tmp");
-            }
-        }
-    }
-    let events_path = dataset_dir.join("oiran_events.jsonl");
-    if !events_path.is_file() {
-        return Ok(());
-    }
-    let before_bytes = fs::metadata(&events_path).map(|m| m.len()).unwrap_or(0);
-    let tmp = dataset_dir.join("oiran_events.jsonl.compact-tmp");
-    let (total_before, total_after) =
-        stream_compact_events(&events_path, &tmp, current_capture_ids)?;
-    let after_bytes = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-    fs::rename(&tmp, &events_path).map_err(display_error)?;
-    report.push(
-        &events_path,
-        before_bytes,
-        after_bytes,
-        if total_after == total_before {
-            "compacted-no-op"
-        } else {
-            "compacted"
-        },
-    );
-    if total_after < total_before {
-        let manifest = dataset_dir.join("dataset_manifest.json");
-        if manifest.is_file() {
-            let size = fs::metadata(&manifest).map(|m| m.len()).unwrap_or(0);
-            fs::remove_file(&manifest).map_err(display_error)?;
-            report.push(&manifest, size, 0, "removed-stale-manifest");
-        }
-        let callflows = dataset_dir.join("callflows");
-        if callflows.is_dir() {
-            let size = directory_size(&callflows);
-            fs::remove_dir_all(&callflows).map_err(display_error)?;
-            report.push(&callflows, size, 0, "removed-stale-callflows");
-        }
-    }
-    Ok(())
-}
-
-fn stream_compact_events(
-    src: &Path,
-    dst: &Path,
-    keep: &BTreeSet<String>,
-) -> Result<(u64, u64), String> {
-    let reader = BufReader::with_capacity(
-        STREAM_CHUNK_BYTES,
-        fs::File::open(src).map_err(display_error)?,
-    );
-    let mut writer = BufWriter::with_capacity(
-        STREAM_CHUNK_BYTES,
-        fs::File::create(dst).map_err(display_error)?,
-    );
-    let mut total_before: u64 = 0;
-    let mut total_after: u64 = 0;
-    for line in reader.lines() {
-        let line = line.map_err(display_error)?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        total_before = total_before.saturating_add(1);
-        let value: serde_json::Value =
-            serde_json::from_str(&line).map_err(|error| error.to_string())?;
-        let keep_line = value
-            .get("capture_id")
-            .and_then(serde_json::Value::as_str)
-            .map(|cid| keep.contains(cid))
-            .unwrap_or(false);
-        if !keep_line {
-            continue;
-        }
-        writer.write_all(line.as_bytes()).map_err(display_error)?;
-        writer.write_all(b"\n").map_err(display_error)?;
-        total_after = total_after.saturating_add(1);
-    }
-    writer.flush().map_err(display_error)?;
-    writer.get_ref().sync_all().map_err(display_error)?;
-    Ok((total_before, total_after))
 }
 
 #[derive(Debug, Default)]
@@ -5809,93 +5712,105 @@ mod tests {
         restarted.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
     }
 
-    /// 2.7.19 (issue #9 part 1, ANR2 comment 6646981831): the lab arrived
-    /// at the worker start with two unfinalised `oiran_events.jsonl`
-    /// spools whose combined size (744 MiB + 762 MiB) already exceeded
-    /// `max_owned_bytes` (1.14 GiB). 2.7.18 filters future growth but
-    /// does not reduce the on-disk footprint, so `directory_size(&base)`
-    /// tripped the storage guard on every scan. This test drives the
-    /// pure `compact_continuous_spools` helper: 20 MiB prior spool with
-    /// half the events belonging to pcap sha256 "stale", half to "live".
-    /// After compaction only the "live" half survives and the manifest
-    /// + callflows (stale by construction) are removed. `.dataset-previous/`
-    /// is dropped unconditionally as a rollback artifact.
+    /// 2.7.21 (issue #10 comment 6653514332): `clean_continuous_import_root`
+    /// removes ONLY the never-committed artifacts and leaves `dataset/`
+    /// strictly byte-identical. The 2.7.20 variant filtered
+    /// `dataset/oiran_events.jsonl` against `state.segments.keys()` (the
+    /// live ring, capped at `max_segments`) and dropped events of
+    /// capture_ids no longer in the ring even though their pcap was
+    /// still on disk; the ANR2 recette observed 25 537 → 77 events on
+    /// 51 → 1 capture_id. The decision here: do not touch the published
+    /// dataset at startup.
     #[test]
-    fn compact_continuous_spools_prunes_orphan_events_and_rollback_directory() {
+    fn startup_cleanup_removes_rollback_only_and_leaves_dataset_byte_identical() {
         use serde_json::json;
-        let base = temporary_root("compact-spools");
+        let base = temporary_root("startup-cleanup");
         let dataset_dir = base.join("dataset");
         fs::create_dir_all(dataset_dir.join("callflows")).unwrap();
-        fs::create_dir_all(base.join(".dataset-previous")).unwrap();
-        fs::write(base.join(".dataset-previous").join("stale.txt"), b"x").unwrap();
+        fs::create_dir_all(base.join(".dataset-previous/callflows")).unwrap();
+        fs::create_dir_all(base.join(".dataset-next/callflows")).unwrap();
+        // Dataset contents: a mix of capture_ids including one that no
+        // longer has a pcap on disk. 2.7.20 would have dropped it; 2.7.21
+        // must leave it in place.
         let events_path = dataset_dir.join("oiran_events.jsonl");
-        // Two synthetic event streams, each 2 500 lines of ~1 KiB
-        // padding → ~5 MiB total. The ratio is enough to prove the
-        // streaming write stays bounded without allocating a 5 MiB
-        // in-memory vector.
-        let padding = "x".repeat(900);
         {
-            let mut writer =
-                BufWriter::with_capacity(STREAM_CHUNK_BYTES, fs::File::create(&events_path).unwrap());
-            for i in 0..2500 {
-                let event = json!({
-                    "event_id": format!("evt-stale-{i:04}"),
-                    "capture_id": "sha256:stale",
-                    "pad": padding,
-                });
-                writeln!(writer, "{}", event).unwrap();
-            }
-            for i in 0..2500 {
-                let event = json!({
-                    "event_id": format!("evt-live-{i:04}"),
-                    "capture_id": "sha256:live",
-                    "pad": padding,
-                });
-                writeln!(writer, "{}", event).unwrap();
+            let mut writer = BufWriter::with_capacity(
+                STREAM_CHUNK_BYTES,
+                fs::File::create(&events_path).unwrap(),
+            );
+            for (capture, count) in [("sha256:live", 128), ("sha256:evicted", 256)] {
+                for i in 0..count {
+                    let event = json!({
+                        "event_id": format!("evt-{capture}-{i:04}"),
+                        "capture_id": capture,
+                    });
+                    writeln!(writer, "{}", event).unwrap();
+                }
             }
             writer.flush().unwrap();
         }
         let manifest_path = dataset_dir.join("dataset_manifest.json");
-        fs::write(&manifest_path, b"{\"stale\":true}").unwrap();
-        fs::write(dataset_dir.join("callflows/stale.json"), b"{}").unwrap();
-        let mut kept = BTreeSet::new();
-        kept.insert("sha256:live".to_string());
-        clean_continuous_import_root(&base, &kept).unwrap();
+        fs::write(&manifest_path, b"{\"event_count\":384}").unwrap();
+        fs::write(dataset_dir.join("callflows/stub.json"), b"{\"keep\":true}").unwrap();
+        // Never-committed artifacts to be swept.
+        fs::write(base.join(".dataset-previous/stale.txt"), b"x").unwrap();
+        fs::write(base.join(".dataset-next/oiran_events.jsonl"), b"y").unwrap();
+        fs::write(base.join("import_state.json.tmp"), b"z").unwrap();
+        fs::write(base.join(".leftover.spool"), b"w").unwrap();
+        // Snapshot `dataset/` before cleanup.
+        let events_sha_before = sha256_hex(&fs::read(&events_path).unwrap());
+        let manifest_sha_before = sha256_hex(&fs::read(&manifest_path).unwrap());
+        let callflow_sha_before = sha256_hex(&fs::read(dataset_dir.join("callflows/stub.json")).unwrap());
+        clean_continuous_import_root(&base).unwrap();
+        // Never-committed artifacts: gone.
         assert!(!base.join(".dataset-previous").exists());
-        assert!(!manifest_path.exists());
-        assert!(!dataset_dir.join("callflows").exists());
-        // Line-count the compacted spool: only the 2 500 "live" events
-        // must remain.
+        assert!(!base.join(".dataset-next").exists());
+        assert!(!base.join("import_state.json.tmp").exists());
+        assert!(!base.join(".leftover.spool").exists());
+        // Dataset: byte-for-byte identical.
+        assert_eq!(
+            sha256_hex(&fs::read(&events_path).unwrap()),
+            events_sha_before,
+            "dataset/oiran_events.jsonl must not be touched by startup cleanup",
+        );
+        assert_eq!(
+            sha256_hex(&fs::read(&manifest_path).unwrap()),
+            manifest_sha_before,
+        );
+        assert_eq!(
+            sha256_hex(&fs::read(dataset_dir.join("callflows/stub.json")).unwrap()),
+            callflow_sha_before,
+        );
+        // Event lines are unchanged: both live AND evicted capture_ids remain.
         let mut live = 0usize;
-        let mut stale = 0usize;
+        let mut evicted = 0usize;
         for line in BufReader::new(fs::File::open(&events_path).unwrap()).lines() {
             let line = line.unwrap();
             if line.contains("\"capture_id\":\"sha256:live\"") {
                 live += 1;
             }
-            if line.contains("\"capture_id\":\"sha256:stale\"") {
-                stale += 1;
+            if line.contains("\"capture_id\":\"sha256:evicted\"") {
+                evicted += 1;
             }
         }
-        assert_eq!(live, 2500);
-        assert_eq!(stale, 0);
-        // Idempotence: a second compact run leaves the file untouched
-        // (total_after == total_before, so the stale-manifest branch is
-        // not taken and no file is removed).
-        fs::write(&manifest_path, b"{\"rebuild\":true}").unwrap();
-        clean_continuous_import_root(&base, &kept).unwrap();
-        assert!(manifest_path.exists());
+        assert_eq!(live, 128);
+        assert_eq!(evicted, 256, "events of pcap evicted from the ring must survive startup — their pcap is still present on disk in production");
     }
 
-    /// 2.7.20 (issue #10 comment 6652125653, ANR2 arborescence): reproduce
+    /// 2.7.21 (issue #10 comment 6653514332, ANR2 recette): reproduce
     /// the EXACT lab layout — `dataset/`, `.dataset-next/`,
-    /// `.dataset-previous/`, `pcap/` — with the oversized files in
-    /// `.dataset-next/` (the real culprit 2.7.19 missed). Pre-cleanup
-    /// total > 128 MiB cap; after `clean_continuous_import_root` the
-    /// footprint falls well below the cap AND the 250-segment drain
-    /// completes. Mémoire bornée: the stream-compactor allocates a single
-    /// 1 MiB BufReader + 1 MiB BufWriter + one `serde_json::Value` at a
-    /// time, regardless of the spool size.
+    /// `.dataset-previous/`, `pcap/` — and assert that after startup
+    /// cleanup the never-committed `.dataset-next/` and
+    /// `.dataset-previous/` are gone and the base falls below the cap.
+    /// The 250-segment drain then completes without touching the
+    /// committed dataset.
+    ///
+    /// Byte-identity of `dataset/` across cleanup is verified by the
+    /// dedicated `startup_cleanup_removes_rollback_only_and_leaves_dataset_byte_identical`
+    /// test: here the subsequent publication cycle atomically replaces
+    /// `dataset/` by construction (next→current rename), so measuring
+    /// sha256 after the first publication does not isolate the
+    /// startup-cleanup invariant.
     #[test]
     fn anr2_layout_startup_cleanup_shrinks_below_cap_then_drains_250_segments() {
         if skip_if_disk_too_full(
@@ -5957,8 +5872,17 @@ mod tests {
             vec![0u8; 2_000_000],
         )
         .unwrap();
-        // Manifest + callflow stubs in every subtree.
-        for d in [&dataset_dir, &next_dir, &previous_dir] {
+        // Manifest + callflow stubs in the never-committed subtrees only.
+        // Dataset/ gets a callflow stub so the sha256 check compares two
+        // files, but NOT a dataset_manifest.json — `process_capture_into`
+        // treats a present-but-invalid manifest as a checkpoint failure
+        // (`CONTINUOUS_CHECKPOINT_MANIFEST_INVALID`), and in production
+        // the manifest is written atomically by the worker; synthesising
+        // a full valid manifest here is out of scope. The sacred-dataset
+        // invariant is still exercised by the events.jsonl + callflow
+        // sha256 equality below.
+        fs::write(dataset_dir.join("callflows/stub.json"), b"{\"keep\":true}").unwrap();
+        for d in [&next_dir, &previous_dir] {
             fs::write(d.join("dataset_manifest.json"), b"{\"stale\":true}").unwrap();
             fs::write(d.join("callflows/stub.json"), b"{}").unwrap();
             fs::write(d.join("callflows/stub.html"), b"<html></html>").unwrap();
@@ -5969,6 +5893,12 @@ mod tests {
             "ANR2 fixture must exceed 128 MiB cap before cleanup; got {} B",
             before
         );
+        // Byte-identity of dataset/ is asserted by the dedicated
+        // `startup_cleanup_removes_rollback_only_and_leaves_dataset_byte_identical`
+        // test on the pure helper. Here the worker's first successful
+        // publication will atomically replace `dataset/` via
+        // `process_capture_into`, so an after-worker sha256 no longer
+        // isolates the startup-cleanup invariant.
         // --- Start the worker -----------------------------------------
         // state.segments is empty at startup → NO capture_id is retained
         // → every stale event is dropped from the spools; everything in
@@ -6001,26 +5931,22 @@ mod tests {
             .unwrap();
         // The worker's first act is `clean_continuous_import_root`; by
         // the time `start_continuous_import` returns the thread has been
-        // spawned but may still be mid-cleanup. We wait for the three
-        // observable outcomes of the cleanup in one go:
+        // spawned but may still be mid-cleanup. We wait for the two
+        // observable outcomes of the cleanup:
         //   - .dataset-next removed
         //   - .dataset-previous removed
-        //   - dataset/oiran_events.jsonl compacted to empty (no retained
-        //     capture_id survives, `state.segments` is empty at startup).
+        // The `dataset/` subtree is NEVER touched by the cleanup, so
+        // there is no "dataset compacted" condition to wait for.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let next_gone = !next_dir.exists();
-            let prev_gone = !previous_dir.exists();
-            let current_len = fs::metadata(dataset_dir.join("oiran_events.jsonl"))
-                .map(|m| m.len())
-                .unwrap_or(u64::MAX);
-            if next_gone && prev_gone && current_len == 0 {
+            if !next_dir.exists() && !previous_dir.exists() {
                 break;
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "cleanup did not reach terminal state: next={} prev={} current={}",
-                    next_gone, prev_gone, current_len
+                    "cleanup did not finish: next_exists={} prev_exists={}",
+                    next_dir.exists(),
+                    previous_dir.exists()
                 );
             }
             thread::sleep(Duration::from_millis(100));

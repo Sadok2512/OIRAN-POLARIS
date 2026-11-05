@@ -1,5 +1,85 @@
 # Changelog
 
+## OIRAN API 2.7.21 — 2026-11-05 — the published dataset is NEVER touched at startup
+
+- ANR2 recette (issue #10 comment 6653514332): on binary 2.7.20 the
+  cleanup of `.dataset-next/` worked (1 506 177 003 → 0 B, base
+  footprint fell to 46 751 842 B), but the compaction of
+  `dataset/oiran_events.jsonl` collapsed the published event set from
+  25 537 to 77 entries, keeping 1 capture_id instead of the 51 present
+  on disk. 3 945 events belonging to 20 captures **whose pcap was
+  still on disk** were dropped before rollback saved the data.
+- Root cause (file:line of the bad computation): the 2.7.20 worker ran
+  at startup
+
+      // live-probe/src/lib.rs (2.7.20) lines 1764-1769
+      let current_capture_ids: BTreeSet<String> = state
+          .segments
+          .keys()
+          .map(|sha| format!("sha256:{sha}"))
+          .collect();
+
+  and passed that set to `compact_dataset_in_place` to filter the
+  published `oiran_events.jsonl`. `state.segments` is the CURRENT PCAP
+  RING, capped at `max_segments`; it is NOT the history of capture_ids
+  that ever contributed events to the dataset. The ANR2 lab arrived
+  with 1 pcap in the ring (fresh binary start, or the ring had just
+  rotated after a crash) while the published `oiran_events.jsonl` held
+  51 distinct capture_ids accumulated across many publication cycles
+  before those pcaps were evicted. Filtering the dataset against the
+  ring therefore dropped every event whose pcap had been rotated out
+  — which is most of the historical dataset by construction.
+- Decision: **the published dataset is NEVER compacted or filtered at
+  startup.** `clean_continuous_import_root` is reduced to the
+  never-committed artefacts only. The `current_capture_ids`
+  computation is removed from `run_continuous_import_inner`; it is no
+  longer used to delete data at startup.
+- Remaining startup cleanup scope (strictly outside `dataset/`):
+  * `.dataset-previous/` → removed unconditionally (rollback artefact).
+  * `.dataset-next/` → removed unconditionally (mid-publish staging
+    tree, never holds committed data; `process_capture_into` at
+    `live-probe/src/lib.rs:2462` already wipes it before each rebuild).
+  * Base-level `*.tmp` / `*.compact-tmp` / `*.spool` → removed (orphan
+    `atomic_write` / spool partials).
+  * `dataset/` and its `*.spool`, `*.tmp`, `oiran_events.jsonl`,
+    `dataset_manifest.json`, `callflows/` are **not inspected and not
+    rewritten**.
+- The `CONTINUOUS_IMPORT_STARTUP_CLEAN` log line is retained, now
+  reporting only the artefacts actually touched (two directories, a
+  handful of orphan temp files on first start after a crash, zero
+  entries on a clean restart). The ANR2 recette's "before 1 506 177 003
+  B / after 46 751 842 B" shape is reproducible because the 1.5 GiB
+  were all under `.dataset-next/`.
+- `recover_continuous_dataset_from_disk` keeps its 2.7.20 tolerance of a
+  missing / malformed / drifted manifest: it logs
+  `CONTINUOUS_DATASET_RECOVER_SKIPPED` and returns `Ok`, so a partial
+  prior-generation manifest does not crash the worker before its
+  normal publication cycle can rebuild a coherent manifest atomically.
+- Regression tests (new + updated):
+  * `live_probe::tests::startup_cleanup_removes_rollback_only_and_leaves_dataset_byte_identical`
+    (NEW) drives the pure `clean_continuous_import_root(base)` helper
+    and asserts (a) `.dataset-next/`, `.dataset-previous/`,
+    `base/*.tmp`, `base/*.spool` are gone and (b)
+    `dataset/oiran_events.jsonl` is **byte-identical** (sha256 before ==
+    sha256 after), with events of BOTH live AND evicted capture_ids
+    preserved. The call site drops the `current_capture_ids` parameter.
+  * `live_probe::tests::anr2_layout_startup_cleanup_shrinks_below_cap_then_drains_250_segments`
+    (UPDATED) still reproduces the exact ANR2 lab tree and asserts
+    `.dataset-next` + `.dataset-previous` are gone, base footprint
+    below 128 MiB cap, and 250 N3 segments drain to
+    `segments_ingested >= 250` with `state != Blocked`. Byte-identity
+    of `dataset/` across cleanup is now proven by the dedicated test
+    above, since here the subsequent publication cycle atomically
+    replaces `dataset/` by design.
+  * The 2.7.20 `compact_continuous_spools_prunes_orphan_events_and_rollback_directory`
+    test is **removed**: compaction of published events is no longer a
+    supported operation.
+- Workspace: `cargo test --workspace --locked --release` →
+  **369 passed / 0 failed / 4 ignored** (same count as 2.7.20 — one
+  test added, one removed). Shell guards (3) PASS. Negative harness
+  9/9 unchanged.
+- Versions: `apps/api` 2.7.20 → 2.7.21; `live-probe` 0.4.6 → 0.4.7.
+
 ## OIRAN API 2.7.20 — 2026-11-05 — startup cleanup covers .dataset-next + size-before/after log
 
 - ANR2 arborescence (issue #10 comment 6652125653): the real oversized
