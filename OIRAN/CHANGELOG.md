@@ -1,5 +1,89 @@
 # Changelog
 
+## OIRAN API 2.8.2 — 2026-11-06 — no-eviction seen index + dir-mtime gate (rollback of 2.8.1, #10 comment 6687323881)
+
+- ANR2 rolled back 2.8.1 in production (#10 comment 6687323881):
+  `oiran-api` averaged 92.85 % CPU over the mandatory 60-s recipe,
+  rotation watchers 16.31 % cumulative, and `pending_segments=1`
+  was never drained. Root cause: `MAX_CONTINUOUS_SEEN=4096` evicted
+  the oldest checksum once the source retained more than 4 096
+  finalized segments, so a still-present source segment was
+  re-discovered as pending every scan (`live-probe/src/lib.rs:105`
+  + eviction at `:4475-4479`), which kept backoff reset and the
+  worker spinning. The 2.8.1 fallback watcher continued to
+  enumerate + sort every PCAP every 5 s even when the directory
+  had not changed.
+- Audit (file:line):
+  * `OIRAN/live-probe/src/lib.rs:105` `MAX_CONTINUOUS_SEEN = 4096`
+    (now removed).
+  * `OIRAN/live-probe/src/lib.rs:4475-4479` `remember_checksum`
+    popped the oldest entry once the index exceeded the cap. This
+    is the eviction ANR2 proved broke retained segments.
+  * Pending-segment re-selection: `:2017` worker inner loop
+    `state.seen_checksums.contains(&candidate.checksum)` would
+    fail after eviction → candidate re-ingested every scan.
+  * `infrastructure/capture/rotation-watcher.sh:208-212` fallback
+    poll re-enumerated + sorted every `*.pcapng` every tick.
+- Fix (`OIRAN/live-probe`):
+  * **No cap on `seen_checksums`.** `remember_checksum` only
+    inserts; the index grows with the real on-disk file population
+    plus any segment held in `state.segments`. Memory at 20 000
+    entries: ~2.5 MiB (64-byte hex × 2 containers + BTree
+    overhead), well under the 256 MiB MemoryMax ceiling.
+  * `purge_missing_source_fingerprints(state, live_paths)` drops
+    fingerprints whose source file has vanished AND whose checksum
+    is not held in `state.segments`. O(N + M) — pre-2.8.2's
+    `.values().any(|v| ...)` per discarded path was O(N × M) and
+    would have been 95 M comparisons at 10 000 live files.
+    Native-mode and empty disk scans explicitly skip purge.
+  * `SourceDiscovery.all_discovered_paths` surfaces the full
+    disk-scan set BEFORE the `MAX_SOURCE_CANDIDATES=512` cap, so
+    purge no longer evicts entries beyond the cap.
+  * **Dir-mtime gate** (`source_tree_mutated`) stats the source
+    root AND every subdirectory down to depth 3. A scan runs only
+    when at least one watched directory has mutated since the
+    previous tick, or there are pending finalization/stability/
+    unseen/characterisation signals. New-file writes always update
+    the containing directory's mtime, so no segment is missed.
+  * **Cheap file-mtime drift check** (`source_cache_mtime_drift`,
+    bounded to caches ≤ 1 024 entries) covers the in-place-append
+    pattern (dumpcap overlapping-append) where the directory
+    mtime does not move. At scale (> 1 024 entries) the dir-mtime
+    gate is sufficient because dumpcap rotation creates new files.
+  * `SourceSegmentsCache` short-circuit now also persists the
+    cache entries ONLY when `source_segments` actually mutated
+    them, not on every quiet tick (ANR2 measured the pre-2.8.2
+    unconditional 10 000-entry BTreeMap compare + full JSON
+    serialize + atomic write).
+- Fix (`infrastructure/capture/rotation-watcher.sh`):
+  * Fallback poll loop stats the watched directory once per tick
+    and calls `scan_once` ONLY when `stat -c %Y "$dir"` differs
+    from the previous tick. A finalised rotation always updates
+    the containing directory's mtime (dumpcap creates / closes a
+    file inside it), so no segment can slip past; a quiet
+    directory produces one `stat` per tick (~0 % CPU) — the 2.8.1
+    O(1) seen-set keeps its role but the poll no longer re-enumerates.
+- Tests (release, locked, offline):
+  * `cargo test --workspace --locked --release --offline` →
+    **393 passed, 0 failed** (unchanged count, cap-removal test
+    swapped for the new no-cap-no-purge semantic).
+  * `OIRAN/target/release/examples/idle_cpu_bench 120 10000`
+    (10 000 pre-populated segments > old 4 096 cap, state
+    pre-seeded, 120-s window) → `cpu_percent = 0.53` (vs ANR2
+    production 2.8.1 = **92.85 %**). Gate `< 2 %` **PASS**.
+  * `OIRAN/target/release/examples/idle_cpu_bench 60`
+    (empty source tree, 60-s window) → `cpu_percent = 0.01`.
+    Gate `< 2 %` **PASS**.
+  * `OIRAN/target/release/evidence-replay` → 4 edges, 2 N2↔N4
+    EXACT + 2 N4↔N3 EXACT. Unchanged from 2.8.1.
+  * `rss_publication N=30 000 / 200 000` → 7.7 / 23.1 MiB
+    vmhwm. Unchanged.
+  * `bash infrastructure/capture/tests/test-rotation-drops.sh`
+    → PASS. `…/test-rotation-watcher.sh` → PASS.
+    `…/test-dumpcap-retention.sh` → PASS.
+- SemVer: `apps/api` 2.8.1 → **2.8.2**, `live-probe` 0.4.15 →
+  **0.4.16**.
+
 ## OIRAN API 2.8.1 — 2026-11-06 — continuous worker idle CPU + rotation-watcher backoff (#9, ANR2 perf proof)
 
 - ANR2 reported (`#9` comment `6685322833`): thread `continuous-lab-`

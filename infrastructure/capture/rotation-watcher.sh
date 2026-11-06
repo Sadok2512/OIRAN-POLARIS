@@ -255,8 +255,22 @@ if (( use_inotify == 1 )); then
     scan_once
   done < <(inotifywait -m -q -e close_write,moved_to --format '%f' -- "$dir")
 else
+  # 2.8.2 (#10 comment 6687323881): ANR2 proved the previous fallback
+  # re-enumerated and sorted every PCAP on every tick even when the
+  # directory had not changed (16.31% cumulative CPU across 12
+  # watchers in production). The fix: dir-mtime gate. `scan_once`
+  # runs only when `stat -c %Y "$dir"` differs from the previous
+  # tick. A finalised rotation always updates the directory mtime
+  # (dumpcap creates / closes a file inside), so no segment is
+  # missed; a quiet directory produces one `stat` per tick (~0% CPU).
+  scan_once
+  prev_mtime=$(stat -c %Y "$dir" 2>/dev/null || echo "")
   while :; do
-    scan_once
     sleep "$poll_s"
+    current_mtime=$(stat -c %Y "$dir" 2>/dev/null || echo "")
+    if [[ -n $current_mtime && "$current_mtime" != "$prev_mtime" ]]; then
+      scan_once
+      prev_mtime=$current_mtime
+    fi
   done
 fi

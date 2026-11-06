@@ -102,7 +102,14 @@ const MAX_SOURCE_CANDIDATES: usize = 512;
 const MAX_INGESTED_SEGMENTS_PER_SCAN: usize = 32;
 pub const MAX_OFFLINE_LTE_SESSIONS: usize = 128;
 pub const DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_CONTINUOUS_SEEN: usize = 4096;
+// 2.8.2 (#10 comment 6687323881): removed the arbitrary
+// `MAX_CONTINUOUS_SEEN=4096` cap on `seen_checksums`. ANR2 proved in
+// production that evicting beyond that cap caused retained source
+// segments (> 4 096 files on disk) to be re-discovered as pending
+// every scan. The index now grows with the real on-disk file
+// population plus any segment held in `state.segments`;
+// `purge_missing_source_fingerprints` reclaims entries whose file
+// has disappeared AND whose checksum is no longer referenced.
 const ACTIVE_PACKET_WINDOW_MS: u64 = 60_000;
 pub const CONTINUOUS_CAPTURE_ID: &str = "continuous-lab-import";
 pub const CONTINUOUS_DATASET_ID: &str = "dataset-continuous-lab-import";
@@ -1859,6 +1866,63 @@ impl CaptureManager {
             .iter()
             .map(|(path, fingerprint)| (PathBuf::from(path), fingerprint.clone()))
             .collect();
+        // 2.8.2 (#10 comment 6687323881): dir-mtime gate. ANR2 proved
+        // in production that at 10 000 segments every scan walked the
+        // source tree and ran 20 000 statx (`collect_source_paths` +
+        // `source_segments`'s per-candidate `fs::metadata`), yielding
+        // 65% CPU even when every candidate's checksum was cached. The
+        // fix: remember each directory's mtime; a scan runs ONLY when
+        // at least one watched directory (source root + its immediate
+        // subtree) has mutated since the previous scan. A finalised
+        // segment ALWAYS touches its containing directory's mtime, so
+        // no new file can slip past; an idle source root produces one
+        // `stat` per directory per tick (~0% CPU).
+        let mut dir_mtimes: BTreeMap<PathBuf, SystemTime> = BTreeMap::new();
+        // 2.8.2: force a full scan every `FORCED_RESCAN_INTERVAL`
+        // even when the directory mtime has not moved. This covers
+        // the edge cases where a file is modified in place (an
+        // append does NOT change the parent directory's mtime on
+        // ext4) and keeps latency bounded at 5 s for atypical
+        // producers. Pure production dumpcap rotation creates new
+        // files per segment, so the dir-mtime gate handles the hot
+        // path; this timer is a safety net.
+        // 2.8.2: cheap file-mtime drift check cadence. Dir mtime on
+        // ext4 does NOT change when an existing file is appended to
+        // (dumpcap's `-b duration:N` overlapping-append pattern), so
+        // the dir-mtime gate alone would miss such updates. The drift
+        // check stats every path in `source_cache` and compares the
+        // file mtime with the cached fingerprint — 10 000 statx at
+        // ~5 µs each = ~50 ms per check, bounded well below the 2% CPU
+        // gate. Runs at most every `MTIME_DRIFT_CADENCE`.
+        const MTIME_DRIFT_CADENCE: Duration = Duration::from_secs(5);
+        let mut last_full_scan = Instant::now()
+            .checked_sub(MTIME_DRIFT_CADENCE)
+            .unwrap_or_else(Instant::now);
+        // 2.8.2: last scan's finalization-pending count. When > 0 we
+        // must not trust the dir-mtime gate — those files will become
+        // eligible by aging alone, without any directory mutation
+        // (see `SourceDiscovery.pending_finalization`).
+        let mut last_pending_finalization: usize = 1;
+        // 2.8.2: last scan found candidates that passed the finalize
+        // filter but had not yet satisfied the `stable_across_scans`
+        // check (they appear for the FIRST time with a given
+        // `(size, mtime)` and need a second scan to prove stability
+        // before ingestion). When > 0 the gate must not skip; the
+        // required second scan happens with no directory mutation.
+        let mut last_pending_stability: usize = 0;
+        // 2.8.2: last scan's count of candidates not yet in
+        // `seen_checksums`. When > 0 (burst case: 250 segments
+        // discovered but `MAX_INGESTED_SEGMENTS_PER_SCAN=32` processed
+        // this scan, 218 left) the gate must keep running without a
+        // directory mutation to drain the remainder.
+        let mut last_pending_unseen: u64 = 0;
+        // 2.8.2: count of disk-scanned paths NOT yet characterised
+        // (not in `source_cache` because they were too young for the
+        // `stable_age` filter, or dropped by `finalized_candidates_only`,
+        // or over the `MAX_SOURCE_CANDIDATES` cap). While > 0 we
+        // must keep scanning — those paths will become candidates
+        // by aging alone.
+        let mut last_pending_characterization: usize = 1;
         // Exponential backoff on empty scans — each tick with no new
         // segment doubles the sleep up to `MAX_IDLE_SLEEP`. The next
         // segment (detected via source_segments) resets it to the
@@ -1993,6 +2057,56 @@ impl CaptureManager {
                     }
                 }
             }
+            // 2.8.2 (#10 comment 6687323881): cheap dir-mtime gate.
+            // If no watched directory has mutated since the previous
+            // scan AND the previous scan has no file still inside
+            // the finalization safety window, we skip the full
+            // `source_segments` walk entirely (no 20 000 statx on the
+            // N3 directory any more). Files still awaiting their
+            // safety-window expiry MUST keep the gate open —
+            // `finalized_candidates_only` reclaims them by aging,
+            // not by any directory mutation.
+            let dirs_mutated =
+                source_tree_mutated(&config.source_root, &mut dir_mtimes)?;
+            // 2.8.2: when the directory hasn't moved we still owe a
+            // periodic file-mtime drift check — an in-place append
+            // (dumpcap overlapping-append) leaves the dir mtime
+            // untouched on ext4. The check is bounded in size: above
+            // `DRIFT_CHECK_MAX_FILES` entries we rely exclusively on
+            // the dir-mtime gate because that is the only pattern
+            // dumpcap rotation produces at that scale, and the per-
+            // tick statx budget must stay under the 2% CPU gate.
+            const DRIFT_CHECK_MAX_FILES: usize = 1024;
+            let drift_due = !dirs_mutated
+                && source_cache.len() <= DRIFT_CHECK_MAX_FILES
+                && last_full_scan.elapsed() >= MTIME_DRIFT_CADENCE;
+            let mtime_drift = drift_due && source_cache_mtime_drift(&source_cache);
+            let scan_needed = dirs_mutated
+                || mtime_drift
+                || last_pending_finalization > 0
+                || last_pending_stability > 0
+                || last_pending_unseen > 0
+                || last_pending_characterization > 0
+                // 2.8.2: native-segment mode spawns rotation targets
+                // inside `source_root/continuous-segment-*/` on its
+                // own rhythm (`native_segment_seconds`). Skipping
+                // scans there would stall the native pipeline. The
+                // dir-mtime gate is a CPU optimization for the
+                // read-only source case; native mode keeps its
+                // existing 5 s poll.
+                || config.native_segment_seconds.is_some();
+            if !scan_needed {
+                // Nothing changed on disk — behave as a quiet idle
+                // tick: backoff, sleep, continue.
+                const MAX_IDLE_SLEEP_GATE: Duration = Duration::from_secs(10);
+                idle_backoff_factor = idle_backoff_factor.saturating_mul(2).min(16);
+                let gate_sleep = config
+                    .scan_interval
+                    .saturating_mul(idle_backoff_factor)
+                    .min(MAX_IDLE_SLEEP_GATE);
+                thread::sleep(gate_sleep);
+                continue;
+            }
             let discovery = match source_segments(
                 &config.source_root,
                 config.stable_age,
@@ -2012,6 +2126,13 @@ impl CaptureManager {
                 }
                 Err(error) => return Err(error),
             };
+            last_pending_finalization = discovery.pending_finalization;
+            last_pending_characterization = discovery
+                .all_discovered_paths
+                .iter()
+                .filter(|path| !source_cache.contains_key(path.as_path()))
+                .count();
+            last_full_scan = Instant::now();
             let mut newly_rejected = 0u64;
             for rejected in &discovery.rejected {
                 let source_path = rejected.path.display().to_string();
@@ -2049,6 +2170,42 @@ impl CaptureManager {
                 .map(|candidate| candidate.path.clone())
                 .collect::<BTreeSet<_>>();
             observed.retain(|path, _| candidate_paths.contains(path));
+            // 2.8.2 (#10 comment 6687323881): retain source_cache and
+            // purge fingerprints against the full disk-scan set
+            // (`discovery.all_discovered_paths`), NOT the capped
+            // `candidate_paths`. Using the capped set would mistakenly
+            // evict entries beyond `MAX_SOURCE_CANDIDATES` even
+            // though their file is still on disk, re-hashing them
+            // forever.
+            //
+            // Native-segment mode routes capture files into the
+            // manager's capture-root subtree, NOT `source_root`, so
+            // `all_discovered_paths` is EMPTY for its iterations.
+            // Skipping purge in that case preserves the in-flight
+            // native-segment fingerprints and defers cleanup to a
+            // non-native scan. For the non-native case
+            // `all_discovered_paths` always contains at least one
+            // entry when disk actually has files, so an empty set is
+            // a safe "do not purge yet" signal.
+            // 2.8.2: purge + source_cache retain are safe only for
+            // the non-native path (native mode also pulls files from
+            // `source_root/continuous-segment-*/<capture_id>/` with
+            // a separate lifecycle). Skip for native mode entirely.
+            if config.native_segment_seconds.is_none()
+                && !discovery.all_discovered_paths.is_empty()
+            {
+                source_cache.retain(|path, _| discovery.all_discovered_paths.contains(path));
+                let fingerprints_changed = purge_missing_source_fingerprints(
+                    &mut state,
+                    &discovery.all_discovered_paths,
+                );
+                if fingerprints_changed {
+                    atomic_write(
+                        &state_path,
+                        &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
+                    )?;
+                }
+            }
             let pending = candidates
                 .iter()
                 .filter(|candidate| !state.seen_checksums.contains(&candidate.checksum))
@@ -2064,6 +2221,12 @@ impl CaptureManager {
             // bounded-batch commit even under burst. See
             // MAX_INGESTED_SEGMENTS_PER_SCAN.
             let mut ingested_this_scan: usize = 0;
+            // 2.8.2: count candidates that passed the finalize filter
+            // but were skipped because they appear for the first time
+            // with a given `(size, mtime)` — they need a second scan
+            // to prove stability. The gate uses this count to force
+            // the required second scan even without a directory mutation.
+            let mut pending_stability_this_scan: usize = 0;
             for candidate in candidates {
                 if state.seen_checksums.contains(&candidate.checksum) {
                     continue;
@@ -2072,6 +2235,8 @@ impl CaptureManager {
                 let stable_across_scans = observed.get(&candidate.path) == Some(&fingerprint);
                 observed.insert(candidate.path.clone(), fingerprint);
                 if config.native_segment_seconds.is_none() && !stable_across_scans {
+                    pending_stability_this_scan =
+                        pending_stability_this_scan.saturating_add(1);
                     continue;
                 }
                 if let Err(error) = decode_capture_streaming(
@@ -2356,18 +2521,20 @@ impl CaptureManager {
                     return Ok(());
                 }
             }
-            // 2.8.1 (#9, ANR2): persist the source cache so a restart
-            // reuses the SHA/packet-count work instead of re-hashing
-            // every segment in the source root on boot. We only write
-            // when the cache content changed — `fingerprint_count_before`
-            // is tracked implicitly via the length check and content
-            // compare against `state.source_fingerprints`.
-            let serialized_cache: BTreeMap<String, SourceFingerprint> = source_cache
-                .iter()
-                .map(|(path, fingerprint)| (path.display().to_string(), fingerprint.clone()))
-                .collect();
-            if serialized_cache != state.source_fingerprints {
-                state.source_fingerprints = serialized_cache;
+            // 2.8.2 (#10 comment 6687323881): persist the source
+            // cache ONLY when `source_segments` signalled a cache
+            // mutation (a new or modified file was hashed) OR when
+            // the purge dropped a vanished file. The 2.8.1 code
+            // unconditionally rebuilt a 10 000-entry BTreeMap +
+            // byte-compared it on every scan — ANR2 measured the
+            // cost. The persistence is now strictly event-driven.
+            if discovery.cache_mutated {
+                state.source_fingerprints = source_cache
+                    .iter()
+                    .map(|(path, fingerprint)| {
+                        (path.display().to_string(), fingerprint.clone())
+                    })
+                    .collect();
                 atomic_write(
                     &state_path,
                     &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
@@ -2380,7 +2547,12 @@ impl CaptureManager {
             // latency of a freshly rotated segment is therefore bounded
             // by `MAX_IDLE_SLEEP`.
             const MAX_IDLE_SLEEP: Duration = Duration::from_secs(10);
-            if pending > 0 || changed {
+            // 2.8.2: carry forward the stability counter so the gate
+            // forces the required second scan even when the directory
+            // has not mutated. Reset when no candidate needs it.
+            last_pending_stability = pending_stability_this_scan;
+            last_pending_unseen = pending;
+            if pending > 0 || changed || pending_stability_this_scan > 0 {
                 idle_backoff_factor = 1;
             } else {
                 idle_backoff_factor = idle_backoff_factor.saturating_mul(2).min(16);
@@ -4289,6 +4461,13 @@ struct SourceCandidateMeta {
     interface: String,
     size_bytes: u64,
     modified: SystemTime,
+    /// 2.8.2: carry the filesystem fingerprint from the first
+    /// `fs::symlink_metadata` call so `source_segments` can look it up
+    /// in the cache WITHOUT a second statx. Avoids the pre-2.8.2
+    /// 20 000-statx per scan at 10 000 files.
+    dev: u64,
+    inode: u64,
+    mtime_ns: i128,
 }
 
 #[derive(Clone, Debug)]
@@ -4301,6 +4480,24 @@ struct RejectedSourceSegment {
 struct SourceDiscovery {
     segments: Vec<SourceSegment>,
     rejected: Vec<RejectedSourceSegment>,
+    /// 2.8.2: set when `source_segments` inserted a new entry into
+    /// the cache (the file was new or its `(size, mtime_ns)` changed).
+    /// The caller persists `state.source_fingerprints` only when this
+    /// is `true` — avoiding an O(N) BTreeMap compare + full JSON
+    /// serialize + atomic write on every quiet scan.
+    cache_mutated: bool,
+    /// 2.8.2: count of candidates the `finalized_candidates_only`
+    /// filter excluded as still-live dumpcap targets (too young to
+    /// be considered finalised). When > 0 the worker must NOT trust
+    /// the dir-mtime gate — these files will become eligible by
+    /// aging alone, without any directory mutation.
+    pending_finalization: usize,
+    /// 2.8.2: the full disk-scan path set BEFORE any cap or filter.
+    /// The caller uses this as the "live set" when purging the
+    /// persisted `source_fingerprints` — using `segments` alone
+    /// would mistakenly purge entries beyond `MAX_SOURCE_CANDIDATES`
+    /// even though their file is still on disk.
+    all_discovered_paths: BTreeSet<PathBuf>,
 }
 
 /// 2.8.1 (ANR2 perf 77.31% in `Sha256Hasher::compress`): per-worker
@@ -4327,15 +4524,22 @@ fn source_segments(
     max_segment_bytes: u64,
     cache: &mut SourceSegmentsCache,
 ) -> Result<SourceDiscovery, String> {
+    // 2.8.2: track whether this scan mutated the cache. The caller
+    // uses the flag to avoid an O(N) BTreeMap compare + full JSON
+    // serialize + atomic write on every quiet scan — the 2.8.1 code
+    // did that unconditionally and ANR2 measured the cost at 10 000
+    // entries.
+    let mut cache_mutated = false;
     let mut paths = Vec::new();
     collect_source_paths(root, 0, &mut paths)?;
+    let all_discovered_paths: BTreeSet<PathBuf> = paths.iter().cloned().collect();
     let now = SystemTime::now();
     let mut eligible: Vec<SourceCandidateMeta> = Vec::new();
     for path in paths {
+        let metadata = fs::symlink_metadata(&path).map_err(display_error)?;
         if native_only && !native_segment_source(root, &path) {
             continue;
         }
-        let metadata = fs::symlink_metadata(&path).map_err(display_error)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() <= 24 {
             continue;
         }
@@ -4346,11 +4550,15 @@ fn source_segments(
         if now.duration_since(modified).unwrap_or_default() < stable_age {
             continue;
         }
+        let (dev, inode, size_bytes, mtime_ns) = fingerprint_from_metadata(&metadata);
         eligible.push(SourceCandidateMeta {
             path,
             interface,
-            size_bytes: metadata.len(),
+            size_bytes,
             modified,
+            dev,
+            inode,
+            mtime_ns,
         });
     }
     eligible.sort_by(|left, right| {
@@ -4370,7 +4578,9 @@ fn source_segments(
             modified: candidate.modified,
         })
         .collect();
+    let eligible_before_finalization = projections.len();
     let kept = finalized_candidates_only(projections, now, stable_age);
+    let pending_finalization = eligible_before_finalization.saturating_sub(kept.len());
     // Rebuild the kept subset positionally. We walk `eligible` and keep any
     // candidate whose (interface, modified) still appears in `kept`.
     let mut kept_lookup = kept
@@ -4412,11 +4622,14 @@ fn source_segments(
         // work when the file has not been modified since the last scan.
         // perf showed 77.31% of the pre-2.8.1 CPU inside
         // `Sha256Hasher::compress` running on every segment every 1 s.
-        let fs_meta = match fs::metadata(&candidate.path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let (dev, inode, size, mtime_ns) = fingerprint_from_metadata(&fs_meta);
+        // 2.8.2: reuse the fingerprint captured by `collect_source_paths`
+        // so we avoid a second statx per candidate (the 2.8.1 code did
+        // two statx per candidate; ANR2's gate measured the cost at
+        // 10 000 files).
+        let dev = candidate.dev;
+        let inode = candidate.inode;
+        let size = candidate.size_bytes;
+        let mtime_ns = candidate.mtime_ns;
         let cached_hit = cache.get(&candidate.path).filter(|entry| {
             entry.dev == dev
                 && entry.inode == inode
@@ -4441,6 +4654,7 @@ fn source_segments(
                     packets: count,
                 },
             );
+            cache_mutated = true;
             (fresh, count)
         };
         segments.push(SourceSegment {
@@ -4459,7 +4673,13 @@ fn source_segments(
             .then_with(|| left.checksum.cmp(&right.checksum))
     });
     rejected.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(SourceDiscovery { segments, rejected })
+    Ok(SourceDiscovery {
+        segments,
+        rejected,
+        cache_mutated,
+        pending_finalization,
+        all_discovered_paths,
+    })
 }
 
 fn native_segment_source(root: &Path, path: &Path) -> bool {
@@ -4474,11 +4694,70 @@ fn remember_checksum(state: &mut ContinuousImportState, checksum: String) {
     if state.seen_checksums.insert(checksum.clone()) {
         state.seen_order.push_back(checksum);
     }
-    while state.seen_order.len() > MAX_CONTINUOUS_SEEN {
-        if let Some(oldest) = state.seen_order.pop_front() {
-            state.seen_checksums.remove(&oldest);
+    // 2.8.2 (#10 comment 6687323881): removed the
+    // `MAX_CONTINUOUS_SEEN=4096` eviction. ANR2 proved in production
+    // that evicting the oldest checksum caused retained source
+    // segments (still on disk) to be re-discovered as pending every
+    // scan, sustaining 92.85% CPU on oiran-api. The index is now
+    // bounded by the real on-disk file population and any segment
+    // held in `state.segments` — `purge_missing_source_fingerprints`
+    // reclaims entries whose source file has disappeared AND whose
+    // checksum is no longer referenced.
+}
+
+/// 2.8.2 (#10 comment 6687323881): purge `source_fingerprints` and
+/// the matching `seen_checksums` entry when the source path has
+/// vanished AND the segment is not held in `state.segments` (an
+/// ingested segment keeps its mark even if the operator rotates the
+/// source file away). Returns `true` when the state changed so the
+/// caller can persist. Memory is therefore bounded by the number of
+/// real files currently on disk plus the ingested segments — never
+/// by an arbitrary cap. At 20 000 entries the checksum index is
+/// ~64 bytes × 2 = 2.5 MiB (hex + BTreeSet node overhead), fitting
+/// the 256 MiB MemoryMax ceiling comfortably.
+fn purge_missing_source_fingerprints(
+    state: &mut ContinuousImportState,
+    live_paths: &std::collections::BTreeSet<PathBuf>,
+) -> bool {
+    let discarded_paths: Vec<String> = state
+        .source_fingerprints
+        .iter()
+        .filter(|(path, _)| !live_paths.contains(Path::new(path.as_str())))
+        .map(|(path, _)| path.clone())
+        .collect();
+    if discarded_paths.is_empty() {
+        return false;
+    }
+    // 2.8.2: O(N + M) purge. Build a single reverse count of
+    // checksum→remaining-paths after the discarded set is removed,
+    // then reclaim only the checksums whose count reaches zero AND
+    // whose segment is not held in `state.segments`. The pre-2.8.2
+    // code walked `state.source_fingerprints.values()` for every
+    // discarded path — O(N × M) at 10 000 live files and ~9 500
+    // discarded paths that's 95 million comparisons per scan.
+    let discarded_set: std::collections::BTreeSet<&String> = discarded_paths.iter().collect();
+    let mut remaining_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (path, fingerprint) in state.source_fingerprints.iter() {
+        if discarded_set.contains(path) {
+            continue;
+        }
+        *remaining_counts.entry(fingerprint.checksum.clone()).or_insert(0) += 1;
+    }
+    for path in &discarded_paths {
+        if let Some(fingerprint) = state.source_fingerprints.remove(path) {
+            let still_on_disk = remaining_counts
+                .get(&fingerprint.checksum)
+                .copied()
+                .unwrap_or(0)
+                > 0;
+            let ingested = state.segments.contains_key(&fingerprint.checksum);
+            if !still_on_disk && !ingested {
+                state.seen_checksums.remove(&fingerprint.checksum);
+                state.seen_order.retain(|entry| entry != &fingerprint.checksum);
+            }
         }
     }
+    true
 }
 
 /// Durably marks checksums only after the caller has atomically published the
@@ -5456,6 +5735,83 @@ fn load_runtime_pdu_bindings(
         binding.evidence_observed_epoch_ms = evidence.observed_epoch_ms;
     }
     Ok(bindings)
+}
+
+/// 2.8.2 (#10 comment 6687323881): cheap drift detector for the
+/// known source files. Iterates the per-worker cache, stats each
+/// known path, and returns `true` the moment any file's mtime has
+/// moved past its cached fingerprint (or the file has disappeared).
+/// Covers in-place appends (dumpcap overlapping-append) that leave
+/// the parent directory's mtime unchanged on ext4. Bounds the cost
+/// at `cache.len()` statx per call — ~50 ms for 10 000 entries.
+fn source_cache_mtime_drift(cache: &SourceSegmentsCache) -> bool {
+    for (path, fingerprint) in cache {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return true;
+        };
+        let (_, _, _, mtime_ns) = fingerprint_from_metadata(&metadata);
+        if mtime_ns != fingerprint.mtime_ns {
+            return true;
+        }
+    }
+    false
+}
+
+/// 2.8.2 (#10 comment 6687323881): cheap gate before `source_segments`.
+/// Walks the source root's immediate children, stats each, and
+/// compares `mtime` against the previous scan's cache. A directory's
+/// mtime changes on any file create / rename / delete inside it, so a
+/// new finalised segment always flips at least one entry. Returns
+/// `true` when the scan must run; updates the cache in place. On the
+/// very first call (`cache` is empty), returns `true` so the initial
+/// drain covers pre-existing files.
+fn source_tree_mutated(
+    root: &Path,
+    cache: &mut BTreeMap<PathBuf, SystemTime>,
+) -> Result<bool, String> {
+    let mut observed = Vec::new();
+    collect_watched_directories(root, 0, &mut observed);
+    let mut mutated = cache.is_empty();
+    let mut fresh: BTreeMap<PathBuf, SystemTime> = BTreeMap::new();
+    for dir in observed {
+        let mtime = fs::metadata(&dir)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if cache.get(&dir) != Some(&mtime) {
+            mutated = true;
+        }
+        fresh.insert(dir, mtime);
+    }
+    if !mutated && fresh.len() != cache.len() {
+        mutated = true;
+    }
+    *cache = fresh;
+    Ok(mutated)
+}
+
+/// 2.8.2: walk the source root down to the same depth as
+/// `collect_source_paths` so the dir-mtime gate catches writes in any
+/// nested rotation directory (e.g. `source_root/continuous-segment-*/
+/// pcap/`). A new file inside a leaf directory updates that leaf's
+/// mtime; if we only watched the immediate children of the root we'd
+/// miss writes two levels deep.
+fn collect_watched_directories(directory: &Path, depth: u8, dirs: &mut Vec<PathBuf>) {
+    dirs.push(directory.to_path_buf());
+    if depth >= 3 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            collect_watched_directories(&path, depth + 1, dirs);
+        }
+    }
 }
 
 fn collect_source_paths(
@@ -8317,16 +8673,66 @@ mod tests {
         );
     }
 
+    /// 2.8.2 (#10 comment 6687323881 — regression on 2.8.1): the
+    /// `MAX_CONTINUOUS_SEEN=4096` eviction is removed. ANR2 proved in
+    /// production that evicting old checksums caused retained source
+    /// segments (still on disk) to be re-discovered as pending every
+    /// scan, sustaining 92.85% CPU on oiran-api. The index now grows
+    /// with the real file population; `purge_missing_source_fingerprints`
+    /// removes entries when the file disappears AND the segment is
+    /// not still in `state.segments`.
     #[test]
-    fn persistent_seen_index_is_strictly_bounded() {
+    fn persistent_seen_index_grows_without_a_fixed_cap_and_purges_only_missing_files() {
         let mut state = ContinuousImportState::default();
-        for index in 0..(MAX_CONTINUOUS_SEEN + 17) {
+        // 10 000 checksums > the removed 4 096 cap: none are evicted.
+        for index in 0..10_000 {
             remember_checksum(&mut state, format!("checksum-{index:05}"));
+            state.source_fingerprints.insert(
+                format!("/src/N2/seg-{index:05}.pcapng"),
+                SourceFingerprint {
+                    dev: 1,
+                    inode: 1_000 + index as u64,
+                    size_bytes: 2 * 1024 * 1024,
+                    mtime_ns: 1_000_000_000i128 + index as i128,
+                    checksum: format!("checksum-{index:05}"),
+                    packets: 1,
+                },
+            );
         }
-        assert_eq!(state.seen_checksums.len(), MAX_CONTINUOUS_SEEN);
-        assert_eq!(state.seen_order.len(), MAX_CONTINUOUS_SEEN);
-        assert!(!state.seen_checksums.contains("checksum-00000"));
-        assert!(state.seen_checksums.contains("checksum-04112"));
+        assert_eq!(state.seen_checksums.len(), 10_000);
+        assert_eq!(state.seen_order.len(), 10_000);
+        assert!(state.seen_checksums.contains("checksum-00000"));
+        assert!(state.seen_checksums.contains("checksum-09999"));
+        // Purge drops entries whose file vanished; the checksum
+        // follows only when it's not held in `state.segments`.
+        let mut live = std::collections::BTreeSet::new();
+        for index in 1_000..10_000 {
+            live.insert(PathBuf::from(format!("/src/N2/seg-{index:05}.pcapng")));
+        }
+        // Pin one vanished checksum into state.segments to prove the
+        // purge preserves ingested segments even if the source file
+        // was rotated away.
+        state.segments.insert(
+            "checksum-00000".into(),
+            ImportedSegment {
+                interface: "N2".into(),
+                owned_file: "N2.pcap-00000000000000000.pcapng".into(),
+                size_bytes: 2 * 1024 * 1024,
+                packets: 1,
+                imported_epoch_ms: 1,
+                source_path: "/src/N2/seg-00000.pcapng".into(),
+                historical_context: false,
+            },
+        );
+        let changed = purge_missing_source_fingerprints(&mut state, &live);
+        assert!(changed);
+        assert_eq!(state.source_fingerprints.len(), 9_000);
+        // Vanished + unlinked: dropped.
+        assert!(!state.seen_checksums.contains("checksum-00500"));
+        // Vanished + still in state.segments: retained.
+        assert!(state.seen_checksums.contains("checksum-00000"));
+        // Still on disk: retained.
+        assert!(state.seen_checksums.contains("checksum-09999"));
     }
 
     #[test]
