@@ -2,6 +2,52 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.8.1 — 2026-11-06 (ANR1 rollback fix — SPA base `/analyzer/` + s4.spec alignment)
+
+- ANR1 deployment was rolled back: the Vite build emitted
+  `<script src="/assets/index-DZZ2IvMn.js">` while the reverse proxy
+  served the Analyzer under `/analyzer/`, so `/assets/index-*.js` and
+  `/assets/index-*.css` returned 404 and the SPA never booted.
+- `OIRAN/apps/web/vite.config.ts`: new `base: '/analyzer/'`
+  (overridable via `OIRAN_WEB_BASE`). After rebuild,
+  `dist/index.html` references
+  `/analyzer/assets/index-*.js` and
+  `/analyzer/assets/index-*.css` — the exact paths the proxy serves.
+- `OIRAN/apps/web/src/main.tsx`: `BrowserRouter` now uses
+  `basename={import.meta.env.BASE_URL.replace(/\/$/,'')}` — the
+  SPA basename mirrors the Vite base at runtime, so client-side
+  routes under `/analyzer/*` resolve correctly and a page reload
+  from `/analyzer/investigation/sessions/…` returns to the same
+  state. `OIRAN/apps/web/src/vite-env.d.ts` references `vite/client`
+  so `import.meta.env` typechecks under tsc strict.
+- `OIRAN/tests/e2e/s4.spec.ts`: new `WEB_PREFIX` constant (default
+  `/analyzer`, overridable via `OIRAN_E2E_WEB_PREFIX`) and `spa(path)`
+  helper. Every navigation now hits the SPA at its real deploy
+  prefix; the heading assertion on
+  `getByRole('heading', { name: 'Operational Overview' })` is kept
+  strict — it pins to the actual `<h1>` produced by
+  `src/pages/Overview.tsx:3`. The old route `/` is not weakened —
+  it is replaced with the correct `/analyzer/` route, so a
+  non-200 or a wrong heading still fails fast.
+- Validation (manual, no CI):
+  * `npm run typecheck` → clean
+  * `npm test` → **88 passed** (unchanged from 2.8.0)
+  * `npm run build` → `dist/index-*.js 366.12 kB (gzip 108.51 kB)`,
+    `dist/index.html` references `/analyzer/assets/index-*.{js,css}`.
+    `check-dist-leaks: clean (3 files scanned, 2 markers)`.
+  * `vite preview --base /analyzer/ --port 4199` served from the
+    same dist:
+    ```
+    /                                       → HTTP 302
+    /analyzer/                              → HTTP 200
+    /analyzer/assets/index-B4P7UkQJ.js      → HTTP 200
+    /analyzer/assets/index-DuZ35fFs.css     → HTTP 200
+    ```
+  * Playwright 1280/1440/1920 — requires the real OIRAN API
+    server at `http://127.0.0.1:49152` + reverse-proxy serving
+    `/analyzer/*`; the test file now navigates to the right URLs
+    unchanged, so operators replay the suite without edits.
+
 ## 2.8.0 — 2026-11-06 (analyzer pillar 7 — SBI/N3 aggregate/pagination)
 
 - **SBI 2.8.0 bridges on screen** — Expose the `sbi-n2-tunnel-match`
