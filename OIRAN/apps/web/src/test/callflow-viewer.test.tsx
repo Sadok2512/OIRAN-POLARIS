@@ -119,7 +119,11 @@ describe('directional Call Flow viewer',()=>{
     const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
     render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/investigation/callflow/lte-incomplete?dataset_id=dataset-a']}><Routes><Route path="/investigation/callflow/:sessionId" element={<CallFlowViewer/>}/></Routes></MemoryRouter></QueryClientProvider>);
     expect((await screen.findAllByText('S1-MME ↔ S11'))[0]).toBeVisible();
-    expect(screen.getAllByText('E2E NOT EVALUATED').length).toBeGreaterThan(0);
+    // 2.8.0: S11_S1_U rawStatus=UNKNOWN with no edge is OPEN — the
+    // UI surfaces the open link with its reason. E2E inherits OPEN
+    // as the blocker, which is still visibly unproven and strictly
+    // not promoted to the engine's EXACT promise.
+    expect(screen.getAllByText('E2E OPEN').length).toBeGreaterThan(0);
     expect(screen.queryByText('E2E EXACT')).not.toBeInTheDocument();
   });
 

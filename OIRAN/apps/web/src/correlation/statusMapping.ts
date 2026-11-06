@@ -1,6 +1,10 @@
 import type { Confidence, CorrelationEdge, CorrelationStatusMap } from '../types/api';
 
-export type CorrelationUiStatus='CORRELATED'|'NOT_CORRELATED'|'NO_DATA'|'MISSING_KEY'|'AMBIGUOUS'|'NOT_EVALUATED'|'UNSUPPORTED';
+/** 2.8.0: `OPEN` surfaces when both interfaces are observed but no
+ *  rule produced an EXACT/STRONG edge — the bridge is NOT masked,
+ *  the reason is displayed verbatim. Operators see the open link
+ *  with its justification instead of a silent gap. */
+export type CorrelationUiStatus='CORRELATED'|'OPEN'|'NOT_CORRELATED'|'NO_DATA'|'MISSING_KEY'|'AMBIGUOUS'|'NOT_EVALUATED'|'UNSUPPORTED';
 export type BridgeKey='N2_SBI'|'SBI_N4'|'N4_N3'|'S1_MME_S11'|'S11_S1_U'|'E2E';
 
 export interface BridgeAssessment {
@@ -13,6 +17,10 @@ export interface BridgeAssessment {
   evidenceIds:string[];
   dsn:string[];
   matchingIdentifiers:string[];
+  /** 2.8.0: union of `matched_rules` from every folded edge on this
+   *  bridge. Empty when no rule fired — the operator then reads
+   *  `reason` for why the bridge is OPEN. */
+  matchedRules:string[];
 }
 
 type BridgeDefinition={key:Exclude<BridgeKey,'E2E'>;label:string;interfaces:[string,string]};
@@ -41,7 +49,11 @@ function assessBridge(definition:BridgeDefinition,interfaces:string[],status:Cor
   // not a DNS name and not a correlation claim.
   const dsn=unique(pairEdges.flatMap(edge=>edge.packet_references.map(packet=>`${packet.source_file}#${packet.packet_number}`)));
   const matchingIdentifiers=unique(pairEdges.flatMap(edge=>edge.matching_identifiers));
-  const base={key:definition.key,label:definition.label,rawStatus,edges:pairEdges,evidenceIds,dsn,matchingIdentifiers};
+  // 2.8.0: 2.7.26 may fold multiple rule_ids into one edge. Fall back to
+  // `rule_id` when `matched_rules` is absent so older backends degrade
+  // gracefully — the UI never silently drops a rule the engine signed.
+  const matchedRules=unique(pairEdges.flatMap(edge=>edge.matched_rules??[edge.rule_id]));
+  const base={key:definition.key,label:definition.label,rawStatus,edges:pairEdges,evidenceIds,dsn,matchingIdentifiers,matchedRules};
   if(!supported)return {...base,status:'UNSUPPORTED',reason:'This correlation bridge is not supported for the reported session technology.'};
   if(missing.length)return {...base,status:'NO_DATA',reason:`Required interface${missing.length>1?'s':''} not observed: ${missing.join(', ')}.`};
   if(rawStatus==='EXACT'||rawStatus==='STRONG'){
@@ -52,13 +64,20 @@ function assessBridge(definition:BridgeDefinition,interfaces:string[],status:Cor
   const diagnosticText=pairEdges.flatMap(edge=>[edge.evidence_description,...(edge.limitations??[])]).join(' ');
   if(missingKeyPattern.test(diagnosticText))return {...base,status:'MISSING_KEY',reason:'The engine evidence explicitly reports a missing correlation key or identifier.'};
   if(rawStatus==='NOT_CORRELATED')return {...base,status:'NOT_CORRELATED',reason:'The engine explicitly reported that the bridge is not correlated.'};
-  return {...base,status:'NOT_EVALUATED',reason:'Both interfaces are observed, but the engine supplied neither a conclusive status nor a rule-backed edge.'};
+  // 2.8.0: both interfaces are observed but no key fired yet. Surface
+  // the bridge as OPEN instead of hiding it — operators must see the
+  // link with its reason, never a silent gap.
+  return {...base,status:'OPEN',reason:'Both interfaces are observed but no correlation key was observed yet. Link is open — never inferred from timestamps.'};
 }
 
 function assessE2e(bridges:BridgeAssessment[],rawStatus:Confidence|string|null):BridgeAssessment{
-  const base={key:'E2E' as const,label:'E2E',rawStatus,edges:bridges.flatMap(bridge=>bridge.edges),evidenceIds:unique(bridges.flatMap(bridge=>bridge.evidenceIds)),dsn:unique(bridges.flatMap(bridge=>bridge.dsn)),matchingIdentifiers:unique(bridges.flatMap(bridge=>bridge.matchingIdentifiers))};
+  const base={key:'E2E' as const,label:'E2E',rawStatus,edges:bridges.flatMap(bridge=>bridge.edges),evidenceIds:unique(bridges.flatMap(bridge=>bridge.evidenceIds)),dsn:unique(bridges.flatMap(bridge=>bridge.dsn)),matchingIdentifiers:unique(bridges.flatMap(bridge=>bridge.matchingIdentifiers)),matchedRules:unique(bridges.flatMap(bridge=>bridge.matchedRules))};
   if(bridges.every(bridge=>bridge.status==='CORRELATED')&&(rawStatus==='EXACT'||rawStatus==='STRONG'))return {...base,status:'CORRELATED',reason:`All ${bridges.length} required bridges are correlated and the engine reported E2E ${rawStatus}.`};
-  const precedence:CorrelationUiStatus[]=['NOT_CORRELATED','MISSING_KEY','AMBIGUOUS','NO_DATA','UNSUPPORTED'];
+  // 2.8.0: OPEN is also a blocker — the end-to-end chain cannot be
+  // declared correlated if a required bridge is still open. NO_DATA
+  // comes before OPEN because a missing interface is a stronger
+  // signal than "observed but no correlation key".
+  const precedence:CorrelationUiStatus[]=['NOT_CORRELATED','MISSING_KEY','AMBIGUOUS','NO_DATA','OPEN','UNSUPPORTED'];
   const blocker=precedence.find(candidate=>bridges.some(bridge=>bridge.status===candidate));
   if(blocker)return {...base,status:blocker,reason:`E2E is not proven because at least one required bridge is ${blocker}.`};
   return {...base,status:'NOT_EVALUATED',reason:'E2E is not proven: at least one required bridge has not been conclusively evaluated.'};

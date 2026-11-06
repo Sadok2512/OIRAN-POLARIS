@@ -2,6 +2,66 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.8.0 — 2026-11-06 (analyzer pillar 7 — SBI/N3 aggregate/pagination)
+
+- **SBI 2.8.0 bridges on screen** — Expose the `sbi-n2-tunnel-match`
+  and `sbi-n4-tunnel-match` EXACT edges correlation-engine 0.6.0
+  emits. `CorrelationEdge.matched_rules` is wired through
+  `src/types/api.ts:22`, exposed per bridge in
+  `BridgeAssessment.matchedRules`
+  (`src/correlation/statusMapping.ts`), and rendered as a dedicated
+  "Matched rules" row in the Call Flow Viewer evidence panel
+  (`src/pages/CallFlowViewer.tsx` BridgeEvidence block). The
+  `N2→SBI→N4→N3` chain is built by the existing `FIVE_G_BRIDGES`
+  definitions; the E2E assessment unions `matched_rules` from every
+  observed bridge.
+- **OPEN link status** — A new `CorrelationUiStatus='OPEN'` surfaces
+  when both interfaces are observed but no correlation edge has
+  fired (`rawStatus` neither EXACT/STRONG, no POSSIBLE match, no
+  `MISSING_KEY` pattern, no `NOT_CORRELATED`). OPEN links are
+  **never hidden**: the BridgeEvidence block renders the status
+  badge, the engine's raw status, every matched rule and an
+  explicit reason. The E2E precedence orders `NO_DATA` before
+  `OPEN` so a missing interface still wins (stronger signal), but
+  an open bridge keeps the chain visibly unproven.
+- **N3 aggregate row** — When `decoder_name ===
+  'live-probe-n3-flow-aggregator'`, the Call Flow Viewer renders
+  ONE row per TEID carrying `gtpu_frame_count` (from
+  `aggregate_packet_count` IE), the (TEID, IP) tuple, and the
+  first/last `packet_references[*].packet_number` in canonical
+  `(capture_id, packet_number, event_id)` order. The arrow label,
+  the message index row (with `data-testid="flow-event-n3-aggregate"`)
+  and the Message Inspector Overview tab all expose the same
+  summary. One G-PDU stream → one aggregate row, never N rows.
+- **Fixture `s4.spec.ts` alignment** — The `V2.2 mandatory visual
+  evidence` test now hits the paginated API contract explicitly:
+  `GET /sessions/5g-UE-A-pdu-1/callflow?limit=100`, strict `status
+  === 200`, strict `Array.isArray(body.data.events)`, strict
+  `events.length > 0`, strict `find(InitialUEMessage) !==
+  undefined`. The assertion is NOT weakened — missing data now
+  produces a typed test error instead of a cryptic "Cannot read
+  properties of undefined", and the real API contract is cited
+  at the point of use (`OIRAN/apps/api/src/lib.rs:2607`,
+  `:2636`, `:2972`).
+- **1280 px anti-overlap** — New `WEB-024a 1280px anti-overlap and
+  screenshots` Playwright test asserts
+  `document.documentElement.scrollWidth <= clientWidth` across the
+  7 primary routes (overview, probe-manager, session-explorer,
+  callflow-viewer, correlation-studio, packet-analyzer,
+  live-monitoring) × 2 themes, and captures full screenshots to
+  `OIRAN_V2_2_UI_SCREENSHOTS/${name}-${theme}-1280x800.png`.
+  Existing 1440 and 1920 px tests are unchanged.
+- **Callflow pagination contract** — No code change (the cursor
+  path is already canonical per `OIRAN/live-probe/src/callflow_page.rs:94`
+  and `OIRAN/apps/api/src/lib.rs:2528-2535`), BUT a new
+  `callflow pagination keeps canonical (capture_id, seq, event_id)
+  order` vitest asserts: cursor progression hits
+  `?cursor=<last.event_id>`, no duplicate across pages, no event
+  lost, "Previous" restores page 1, pagination text matches
+  "1–2 of 4" → "3–4 of 4".
+- Vitest: 88 passed (83 pre-existing + 5 new in
+  `src/test/analyzer-pillar-7.test.tsx`).
+
 ## 2.7.2 — 2026-11-04 (correlation API/UI parity)
 
 - Read bridge evidence from the session correlation endpoint instead of the
