@@ -1,12 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:oiran:lte-fixture-manifest:1.0.0",
+  "$id": "urn:oiran:lte-fixture-manifest:1.1.0",
   "title": "OIRAN LTE offline fixture manifest",
+  "description": "BC3 audit #9 (comment 6696746387) — 1.1.0 closes drifts D-1..D-5 against infrastructure/lte-certification/lte-evidence-schema.json. D-4 (decoder_version + event_schema_version per file) is mandatory and fail-closed at the validator layer.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "certification_state", "fixture_id", "technology", "capture_mode", "real_capture", "anonymization", "files", "required_procedures", "expected", "approval"],
   "properties": {
-    "schema_version": {"const": "1.0.0"},
+    "schema_version": {"const": "1.1.0"},
     "certification_state": {"type": "string", "minLength": 1},
     "fixture_id": {"type": "string", "minLength": 1},
     "technology": {"const": "LTE"},
@@ -31,16 +32,35 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["interface", "protocol", "path", "sha256", "packet_count", "size_bytes", "first_timestamp_utc", "last_timestamp_utc"],
+        "required": [
+          "interface",
+          "protocol",
+          "path",
+          "sha256",
+          "packet_count",
+          "size_bytes",
+          "first_frame",
+          "last_frame",
+          "first_timestamp_utc",
+          "last_timestamp_utc",
+          "decoder_version",
+          "event_schema_version",
+          "sanitization_state"
+        ],
         "properties": {
           "interface": {"enum": ["S1-MME", "S11", "S1-U"]},
           "protocol": {"enum": ["S1AP_SCTP_PPID_18", "GTPV2_C_UDP_2123", "GTP_U_UDP_2152"]},
           "path": {"type": "string"},
-          "sha256": {"type": "string"},
+          "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
           "packet_count": {"type": ["integer", "null"], "minimum": 1},
           "size_bytes": {"type": ["integer", "null"], "minimum": 1},
+          "first_frame": {"type": ["integer", "null"], "minimum": 1},
+          "last_frame": {"type": ["integer", "null"], "minimum": 1},
           "first_timestamp_utc": {"type": ["string", "null"]},
-          "last_timestamp_utc": {"type": ["string", "null"]}
+          "last_timestamp_utc": {"type": ["string", "null"]},
+          "decoder_version": {"type": ["string", "null"]},
+          "event_schema_version": {"type": ["string", "null"]},
+          "sanitization_state": {"enum": ["RAW_PROTECTED", "SANITIZED_PENDING_REVIEW", "SANITIZED_APPROVED"]}
         }
       }
     },

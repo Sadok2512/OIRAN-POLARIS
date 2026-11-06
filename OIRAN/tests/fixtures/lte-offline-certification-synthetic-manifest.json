@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "certification_state": "SYNTHETIC_OFFLINE_PASS_CANDIDATE",
   "fixture_id": "OIRAN-LTE-OFFLINE-CERT-V1-SYNTHETIC",
   "technology": "LTE",
@@ -20,8 +20,13 @@
       "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
       "packet_count": 4,
       "size_bytes": 2048,
+      "first_frame": 1,
+      "last_frame": 4,
       "first_timestamp_utc": "2026-10-31T12:00:00.000000000Z",
-      "last_timestamp_utc": "2026-10-31T12:00:00.900000000Z"
+      "last_timestamp_utc": "2026-10-31T12:00:00.900000000Z",
+      "decoder_version": "0.6.0",
+      "event_schema_version": "0.1.0",
+      "sanitization_state": "SANITIZED_APPROVED"
     },
     {
       "interface": "S11",
@@ -30,8 +35,13 @@
       "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
       "packet_count": 2,
       "size_bytes": 1024,
+      "first_frame": 1,
+      "last_frame": 2,
       "first_timestamp_utc": "2026-10-31T12:00:00.300000000Z",
-      "last_timestamp_utc": "2026-10-31T12:00:00.700000000Z"
+      "last_timestamp_utc": "2026-10-31T12:00:00.700000000Z",
+      "decoder_version": "0.6.0",
+      "event_schema_version": "0.1.0",
+      "sanitization_state": "SANITIZED_APPROVED"
     },
     {
       "interface": "S1-U",
@@ -40,8 +50,13 @@
       "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
       "packet_count": 2,
       "size_bytes": 4096,
+      "first_frame": 1,
+      "last_frame": 2,
       "first_timestamp_utc": "2026-10-31T12:00:00.500000000Z",
-      "last_timestamp_utc": "2026-10-31T12:00:00.800000000Z"
+      "last_timestamp_utc": "2026-10-31T12:00:00.800000000Z",
+      "decoder_version": "0.6.0",
+      "event_schema_version": "0.1.0",
+      "sanitization_state": "SANITIZED_APPROVED"
     }
   ],
   "required_procedures": ["S1Setup", "Attach", "InitialContextSetup", "E-RABSetup", "CreateSession", "S1-U-G-PDU-UL", "S1-U-G-PDU-DL", "Detach"],

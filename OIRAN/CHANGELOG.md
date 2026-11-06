@@ -1,5 +1,35 @@
 # Changelog
 
+## oiran-decode 0.7.0 — 2026-11-06 — LTE fixture contract 1.1.0 (BC3 audit #9, closes D-2/D-3/D-4/D-5)
+
+- `OIRAN/tests/fixtures/lte-fixture-manifest.schema.json` bumps to
+  `urn:oiran:lte-fixture-manifest:1.1.0`. Each `files[]` entry now
+  REQUIRES `first_frame`, `last_frame`, `decoder_version`,
+  `event_schema_version` and `sanitization_state`. The `sha256` field
+  carries a strict `^[a-f0-9]{64}$` pattern. The `interface` enum keeps
+  the hyphenated `S1-MME`/`S1-U` convention.
+- `OIRAN/oiran-decode/src/lte_fixture.rs` validator (same version):
+  * D-2 — stub/non-hex `sha256` now surfaces as a structural error.
+    An all-zero but syntactically valid SHA-256 stays a readiness
+    blocker (it is the template's placeholder).
+  * D-3 — missing `first_frame`/`last_frame` is a readiness blocker;
+    reversed bounds are a structural error.
+  * D-4 — missing `decoder_version` or `event_schema_version` from the
+    JSON structure is a per-file structural error caught before
+    deserialization (`FILE_REQUIRED_POINTERS`). Null/empty surfaces as
+    a readiness blocker.
+  * D-5 — `sanitization_state` must be one of `RAW_PROTECTED`,
+    `SANITIZED_PENDING_REVIEW`, `SANITIZED_APPROVED`; any other value
+    is a structural error.
+- `OIRAN/tests/fixtures/lte-offline-certification-synthetic-manifest.json`
+  and `lte-real-anonymized-manifest-template.json` updated to carry
+  the 1.1.0 shape. The template now uses a 64-hex all-zero placeholder
+  for `sha256` so it remains structurally valid.
+- Four new unit tests inside `lte_fixture.rs`:
+  `d2_stub_sha256_is_fail_closed`, `d3_frame_bounds_reversed_is_fail_closed`,
+  `d4_missing_decoder_version_or_event_schema_version_is_fail_closed`,
+  `d5_sanitization_state_outside_enum_is_fail_closed`. All pass.
+
 ## OIRAN API 2.8.2 — 2026-11-06 — no-eviction seen index + dir-mtime gate (rollback of 2.8.1, #10 comment 6687323881)
 
 - ANR2 rolled back 2.8.1 in production (#10 comment 6687323881):

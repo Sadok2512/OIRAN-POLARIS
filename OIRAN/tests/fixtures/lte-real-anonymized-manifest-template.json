@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "certification_state": "ANR1_APPROVAL_REQUIRED",
   "fixture_id": "REPLACE_WITH_OPAQUE_FIXTURE_ID",
   "technology": "LTE",
@@ -17,31 +17,46 @@
       "interface": "S1-MME",
       "protocol": "S1AP_SCTP_PPID_18",
       "path": "REPLACE_WITH_SANITIZED_RELATIVE_PATH",
-      "sha256": "REPLACE_WITH_64_HEX",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "packet_count": null,
       "size_bytes": null,
+      "first_frame": null,
+      "last_frame": null,
       "first_timestamp_utc": null,
-      "last_timestamp_utc": null
+      "last_timestamp_utc": null,
+      "decoder_version": null,
+      "event_schema_version": null,
+      "sanitization_state": "RAW_PROTECTED"
     },
     {
       "interface": "S11",
       "protocol": "GTPV2_C_UDP_2123",
       "path": "REPLACE_WITH_SANITIZED_RELATIVE_PATH",
-      "sha256": "REPLACE_WITH_64_HEX",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "packet_count": null,
       "size_bytes": null,
+      "first_frame": null,
+      "last_frame": null,
       "first_timestamp_utc": null,
-      "last_timestamp_utc": null
+      "last_timestamp_utc": null,
+      "decoder_version": null,
+      "event_schema_version": null,
+      "sanitization_state": "RAW_PROTECTED"
     },
     {
       "interface": "S1-U",
       "protocol": "GTP_U_UDP_2152",
       "path": "REPLACE_WITH_SANITIZED_RELATIVE_PATH",
-      "sha256": "REPLACE_WITH_64_HEX",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "packet_count": null,
       "size_bytes": null,
+      "first_frame": null,
+      "last_frame": null,
       "first_timestamp_utc": null,
-      "last_timestamp_utc": null
+      "last_timestamp_utc": null,
+      "decoder_version": null,
+      "event_schema_version": null,
+      "sanitization_state": "RAW_PROTECTED"
     }
   ],
   "required_procedures": [

@@ -31,8 +31,8 @@
     "ue_service": "srsue",
     "maximum_running_ues": 1
   },
-  "required_planes": ["S1_MME", "S11", "S1_U"],
-  "plane_aliases": {"S1_MME": "S1-MME", "S11": "S11", "S1_U": "S1-U"},
+  "required_planes": ["S1-MME", "S11", "S1-U"],
+  "plane_aliases": {"S1-MME": "S1-MME", "S11": "S11", "S1-U": "S1-U"},
   "optional_plane_policy": "REJECT_UNSUPPORTED",
   "evidence_schema": "oiran-polaris.lte-e2e-evidence.v1",
   "capture_ref_required_fields": ["plane", "source_file_sha256", "first_frame", "last_frame", "decoder_version", "event_schema_version", "sanitization_state"],

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0 — 2026-11-06
+
+- `tests/lte_contract_drifts.rs` — new file.
+- `d1_infra_schema_plane_enum_is_hyphenated` asserts that
+  `infrastructure/lte-certification/lte-evidence-schema.json` 1.1.2 carries
+  hyphenated plane identifiers (`S1-MME`, `S1-U`, `S5-C`, `S5-U`) that
+  match the OIRAN runtime. BC3 audit #9 (comment 6696746387), drift D-1.
+- D-2/D-3/D-4/D-5 tests ship with `oiran-decode` 0.7.0 validator unit
+  tests (`OIRAN/oiran-decode/src/lte_fixture.rs`).
+
 ## 0.1.0 — 2026-11-06
 
 - BC3 audit of `cert/anr3-oiran-lte-offline-v1` (issue #9).
