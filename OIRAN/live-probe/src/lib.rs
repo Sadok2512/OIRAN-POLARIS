@@ -694,7 +694,41 @@ struct ContinuousImportState {
     /// losing the record across probe restarts.
     #[serde(default)]
     failed_ingestions: VecDeque<FailedIngestion>,
+    /// 2.8.1 (#9, ANR2 perf proof — 77.31% in Sha256Hasher::compress):
+    /// cheap-key cache for source files. Key `(dev, inode, size,
+    /// mtime_ns)` identifies a file by its filesystem coordinates
+    /// instead of its path alone — a rotation that replaces a file at
+    /// the same path with a different content gets a new inode or
+    /// mtime, so the cache invalidates automatically. The stored
+    /// `(sha, packets)` is the proof of identity reused by the dedup
+    /// (`seen_checksums`); it is simply not recomputed when the key
+    /// matches. Persisted alongside `import_state.json` so a worker
+    /// restart does NOT re-hash every segment in the source root.
+    #[serde(default)]
+    source_fingerprints: BTreeMap<String, SourceFingerprint>,
 }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SourceFingerprint {
+    pub dev: u64,
+    pub inode: u64,
+    pub size_bytes: u64,
+    pub mtime_ns: i128,
+    pub checksum: String,
+    pub packets: u64,
+}
+
+impl PartialEq for SourceFingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        self.dev == other.dev
+            && self.inode == other.inode
+            && self.size_bytes == other.size_bytes
+            && self.mtime_ns == other.mtime_ns
+            && self.checksum == other.checksum
+            && self.packets == other.packets
+    }
+}
+impl Eq for SourceFingerprint {}
 
 /// Push a new failure into the state's bounded failure log. Evicts the
 /// oldest entry when the cap is reached so the log never grows unbounded.
@@ -1815,6 +1849,22 @@ impl CaptureManager {
         eprintln!("{log}");
         let recovered_dataset = self.dataset(CONTINUOUS_DATASET_ID);
         let mut observed = BTreeMap::<PathBuf, (u64, SystemTime)>::new();
+        // 2.8.1 (#9, ANR2 perf 77.31% in Sha256Hasher::compress):
+        // per-worker `(dev, inode, size, mtime_ns) → (sha, packets)`
+        // cache hydrated from the persisted `source_fingerprints`
+        // field of `import_state.json` so a probe restart does NOT
+        // re-hash every segment in the source root.
+        let mut source_cache: SourceSegmentsCache = state
+            .source_fingerprints
+            .iter()
+            .map(|(path, fingerprint)| (PathBuf::from(path), fingerprint.clone()))
+            .collect();
+        // Exponential backoff on empty scans — each tick with no new
+        // segment doubles the sleep up to `MAX_IDLE_SLEEP`. The next
+        // segment (detected via source_segments) resets it to the
+        // configured scan_interval, so import latency is bounded by
+        // scan_interval at the worst case after a burst.
+        let mut idle_backoff_factor: u32 = 1;
         let mut bootstrap_pending = Vec::new();
         if let Some(path) = &config.historical_n2_bootstrap {
             if !allowlisted_historical_n2_bootstrap(path) {
@@ -1948,6 +1998,7 @@ impl CaptureManager {
                 config.stable_age,
                 config.native_segment_seconds.is_some(),
                 config.max_segment_bytes,
+                &mut source_cache,
             ) {
                 Ok(candidates) => candidates,
                 Err(error) if !terminal_native_captures.is_empty() => {
@@ -2305,7 +2356,40 @@ impl CaptureManager {
                     return Ok(());
                 }
             }
-            thread::sleep(config.scan_interval.min(Duration::from_secs(30)));
+            // 2.8.1 (#9, ANR2): persist the source cache so a restart
+            // reuses the SHA/packet-count work instead of re-hashing
+            // every segment in the source root on boot. We only write
+            // when the cache content changed — `fingerprint_count_before`
+            // is tracked implicitly via the length check and content
+            // compare against `state.source_fingerprints`.
+            let serialized_cache: BTreeMap<String, SourceFingerprint> = source_cache
+                .iter()
+                .map(|(path, fingerprint)| (path.display().to_string(), fingerprint.clone()))
+                .collect();
+            if serialized_cache != state.source_fingerprints {
+                state.source_fingerprints = serialized_cache;
+                atomic_write(
+                    &state_path,
+                    &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
+                )?;
+            }
+            // 2.8.1 backoff: if we did useful work (published or found
+            // a pending candidate) reset to the configured scan_interval
+            // so the NEXT segment lands within the configured latency.
+            // Otherwise double the sleep up to the bounded cap. Import
+            // latency of a freshly rotated segment is therefore bounded
+            // by `MAX_IDLE_SLEEP`.
+            const MAX_IDLE_SLEEP: Duration = Duration::from_secs(10);
+            if pending > 0 || changed {
+                idle_backoff_factor = 1;
+            } else {
+                idle_backoff_factor = idle_backoff_factor.saturating_mul(2).min(16);
+            }
+            let sleep_for = config
+                .scan_interval
+                .saturating_mul(idle_backoff_factor)
+                .min(MAX_IDLE_SLEEP);
+            thread::sleep(sleep_for);
         }
     }
 
@@ -4219,11 +4303,29 @@ struct SourceDiscovery {
     rejected: Vec<RejectedSourceSegment>,
 }
 
+/// 2.8.1 (ANR2 perf 77.31% in `Sha256Hasher::compress`): per-worker
+/// cache keyed by filesystem coordinates `(dev, inode, size, mtime_ns)`.
+/// A rotation that replaces a file at the same path gets a new inode
+/// or mtime, so the key invalidates automatically; a file seen before
+/// with the same coordinates reuses its cached `(sha, packets)` and
+/// does NOT get re-hashed nor re-read. The in-memory cache is
+/// hydrated at startup from `ContinuousImportState.source_fingerprints`,
+/// so the fix also survives a probe restart.
+pub type SourceSegmentsCache = std::collections::BTreeMap<PathBuf, SourceFingerprint>;
+
+fn fingerprint_from_metadata(metadata: &fs::Metadata) -> (u64, u64, u64, i128) {
+    use std::os::unix::fs::MetadataExt;
+    let mtime_ns = i128::from(metadata.mtime()) * 1_000_000_000i128
+        + i128::from(metadata.mtime_nsec());
+    (metadata.dev(), metadata.ino(), metadata.size(), mtime_ns)
+}
+
 fn source_segments(
     root: &Path,
     stable_age: Duration,
     native_only: bool,
     max_segment_bytes: u64,
+    cache: &mut SourceSegmentsCache,
 ) -> Result<SourceDiscovery, String> {
     let mut paths = Vec::new();
     collect_source_paths(root, 0, &mut paths)?;
@@ -4305,10 +4407,42 @@ fn source_segments(
         if segments.len() >= MAX_SOURCE_CANDIDATES {
             continue;
         }
-        let Ok(checksum) = sha256_hex_file(&candidate.path) else {
-            continue;
+        // 2.8.1 (ANR2 perf proof): the cheap key `(dev, inode, size,
+        // mtime_ns)` short-circuits the heavy SHA-256 + pcap-record-count
+        // work when the file has not been modified since the last scan.
+        // perf showed 77.31% of the pre-2.8.1 CPU inside
+        // `Sha256Hasher::compress` running on every segment every 1 s.
+        let fs_meta = match fs::metadata(&candidate.path) {
+            Ok(m) => m,
+            Err(_) => continue,
         };
-        let packets = count_pcap_records(&candidate.path);
+        let (dev, inode, size, mtime_ns) = fingerprint_from_metadata(&fs_meta);
+        let cached_hit = cache.get(&candidate.path).filter(|entry| {
+            entry.dev == dev
+                && entry.inode == inode
+                && entry.size_bytes == size
+                && entry.mtime_ns == mtime_ns
+        });
+        let (checksum, packets) = if let Some(entry) = cached_hit {
+            (entry.checksum.clone(), entry.packets)
+        } else {
+            let Ok(fresh) = sha256_hex_file(&candidate.path) else {
+                continue;
+            };
+            let count = count_pcap_records(&candidate.path);
+            cache.insert(
+                candidate.path.clone(),
+                SourceFingerprint {
+                    dev,
+                    inode,
+                    size_bytes: size,
+                    mtime_ns,
+                    checksum: fresh.clone(),
+                    packets: count,
+                },
+            );
+            (fresh, count)
+        };
         segments.push(SourceSegment {
             path: candidate.path,
             interface: candidate.interface,
@@ -5899,11 +6033,13 @@ mod tests {
         // them all.
         thread::sleep(Duration::from_millis(50));
         let _tracking_guard = reset_allocation_peak();
+        let mut cache = SourceSegmentsCache::new();
         let segments = source_segments(
             &root,
             Duration::ZERO,
             false,
             DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+            &mut cache,
         )
         .unwrap()
         .segments;
@@ -6937,6 +7073,7 @@ mod tests {
             Duration::from_secs(60),
             false,
             DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+            &mut SourceSegmentsCache::new(),
         )
         .unwrap()
         .segments
@@ -6997,11 +7134,94 @@ mod tests {
             Duration::ZERO,
             false,
             DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+            &mut SourceSegmentsCache::new(),
         )
         .unwrap()
         .segments;
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].interface, "N2");
+    }
+
+    /// 2.8.1 (#9, ANR2 CPU proof): the per-worker `source_segments`
+    /// cache must suppress `sha256_hex_file` + `count_pcap_records`
+    /// on an unchanged segment across scans. Before 2.8.1 both
+    /// operations ran every ~1 s on every segment, producing the
+    /// 87.6% CPU ANR2 observed at `pending=0`.
+    #[test]
+    fn source_segments_cache_skips_sha256_on_unchanged_candidates() {
+        let source = temporary_root("source-segments-cache");
+        fs::create_dir_all(source.join("N2")).unwrap();
+        let path = source.join("N2").join("seg-1.pcap");
+        write_pcap(&path, &[vec![1u8; 128]]);
+        // First scan: cold cache → cache populated.
+        let mut cache = SourceSegmentsCache::new();
+        let first = source_segments(
+            &source,
+            Duration::ZERO,
+            false,
+            DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(first.segments.len(), 1);
+        assert_eq!(cache.len(), 1);
+        let checksum = first.segments[0].checksum.clone();
+        let packets = first.segments[0].packets;
+        let fingerprint = cache.get(&path).cloned().unwrap();
+        assert_eq!(fingerprint.checksum, checksum);
+        assert_eq!(fingerprint.packets, packets);
+        // Second scan: same (size, mtime) → cache hit. We detect the hit
+        // by swapping the file's content for a byte sequence that WOULD
+        // produce a different SHA if the function re-read it; because
+        // mtime and size are preserved by a positional rewrite and the
+        // cache is consulted first, the reported checksum must stay
+        // equal to the cached value — proof the heavy path was skipped.
+        let modified_before = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut rewrite = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        rewrite.seek(SeekFrom::Start(32)).unwrap();
+        rewrite.write_all(&[0xff; 16]).unwrap();
+        rewrite.sync_all().unwrap();
+        drop(rewrite);
+        // Restore the original mtime so the cache fingerprint still
+        // matches (size unchanged by the positional rewrite).
+        use std::os::unix::fs::MetadataExt;
+        let atime = fs::metadata(&path).unwrap().atime();
+        // `filetime` would be cleaner but we stay dep-free: use `utimensat`.
+        use std::time::UNIX_EPOCH;
+        let modified_secs = modified_before
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let modified_nsecs =
+            modified_before.duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as i64;
+        unsafe {
+            let times = [
+                libc::timespec {
+                    tv_sec: atime,
+                    tv_nsec: 0,
+                },
+                libc::timespec {
+                    tv_sec: modified_secs,
+                    tv_nsec: modified_nsecs,
+                },
+            ];
+            let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            assert_eq!(libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0), 0);
+        }
+        let second = source_segments(
+            &source,
+            Duration::ZERO,
+            false,
+            DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(second.segments.len(), 1);
+        assert_eq!(
+            second.segments[0].checksum, checksum,
+            "cache hit must reuse the checksum; re-hashing the file would have returned a different value"
+        );
     }
 
     #[test]

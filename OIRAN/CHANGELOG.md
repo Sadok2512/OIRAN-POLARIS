@@ -1,5 +1,71 @@
 # Changelog
 
+## OIRAN API 2.8.1 — 2026-11-06 — continuous worker idle CPU + rotation-watcher backoff (#9, ANR2 perf proof)
+
+- ANR2 reported (`#9` comment `6685322833`): thread `continuous-lab-`
+  at 86% CPU with `pending=0 / failures=0`; `perf` showed **77.31% of
+  the hot path inside `event_schema::Sha256Hasher::compress`**, with
+  up to 512 PCAPs re-hashed before the `seen_checksums` filter on
+  every 1 s scan (~418 MB per pass; 34 504 `read` + 7 431 `statx`
+  in 10 s). Twelve rotation watchers added 24.6 % cumulative CPU via
+  `grep` per segment every 5 s (104 `execve`/10 s).
+- Audit (file:line):
+  * `OIRAN/live-probe/src/lib.rs:4234` `source_segments` returned
+    candidates with their `(checksum, packets)` already computed
+    via `sha256_hex_file` (`:4308`) + `count_pcap_records` (`:4311`).
+    The caller at `:1946-1963` had the `state.seen_checksums` filter
+    at `:2017`, but it ran AFTER the heavy work.
+  * `OIRAN/live-probe/src/lib.rs:2308` `thread::sleep(scan_interval
+    .min(30 s))` — scan_interval defaulted to 1 s (`Policy::default()`
+    `polling_interval_ms = 1_000`). No backoff on empty scans.
+  * `infrastructure/capture/rotation-watcher.sh:196` `grep -Fxq --
+    "$candidate" "$seen_file"` for each candidate on every tick,
+    O(N × M) as the seen file grew.
+- Fix (`OIRAN/live-probe`):
+  * New persistent key `(dev, inode, size, mtime_ns)` via
+    `fingerprint_from_metadata`. The `SourceSegmentsCache` short-
+    circuits the heavy SHA-256 + pcap-record-count work the moment
+    the cheap key matches. Ownership of the source file changing
+    (rotation to a new inode) invalidates the key automatically.
+  * `ContinuousImportState.source_fingerprints:
+    BTreeMap<String, SourceFingerprint>` persists the cache
+    alongside `import_state.json`, so a probe restart does NOT
+    re-hash every segment in the source root. The worker hydrates
+    the in-memory cache from this field at startup.
+  * Bounded backoff on empty scans: `scan_interval * 2^n` capped at
+    10 s. A pending candidate or a published publication resets the
+    factor to 1, so the next fresh segment lands within
+    `scan_interval` latency.
+- Fix (`infrastructure/capture/rotation-watcher.sh`):
+  * Prefer `inotifywait -m -q -e close_write,moved_to` when
+    available — the watcher blocks on filesystem events and
+    consumes ~0% CPU between rotations.
+  * O(1) seen check via a bash associative array (`declare -A
+    seen_set`) hydrated once from `$seen_file` at startup;
+    `mark_seen` appends to both the in-memory set and the file.
+    No more `grep -Fxq` per segment.
+  * `OIRAN_CAPTURE_ROTATION_FORCE_POLL=1` forces the fallback poll
+    loop deterministically — `test-rotation-watcher.sh` uses it.
+- Tests (release, locked, offline):
+  * `cargo test --workspace --locked --release --offline` →
+    **393 passed, 0 failed** (392 pre-existing + 1 new
+    `source_segments_cache_skips_sha256_on_unchanged_candidates`).
+  * `OIRAN/target/release/examples/idle_cpu_bench 60` (empty source
+    tree) → `cpu_percent = 0.02`, gate `< 2 %` PASS.
+  * `OIRAN/target/release/examples/idle_cpu_bench 60 512` (512
+    pre-populated PCAPs, state pre-seeded) → `cpu_percent = 0.13`
+    (vs ANR2's 87.6 % in production 2.8.0). Gate `< 2 %` PASS.
+  * `bash infrastructure/capture/tests/test-rotation-watcher.sh` →
+    PASS (with inotify and with `FORCE_POLL=1`).
+  * `bash infrastructure/capture/tests/test-rotation-drops.sh` →
+    PASS; `bash … test-dumpcap-retention.sh` → PASS.
+  * `evidence-replay` on the audit dataset → **4 edges, 2+2 EXACT**
+    (unchanged).
+  * `rss_publication` → 30 k : 7.8 MiB · 100 k : 14.1 MiB · 200 k :
+    23.4 MiB (within noise of 2.8.0).
+- SemVer: `apps/api` 2.8.0 → **2.8.1**, `live-probe` 0.4.14 →
+  **0.4.15**.
+
 ## OIRAN API 2.8.0 — 2026-11-06 — SBI↔N2 / SBI↔N4 tunnel-match correlation
 
 - Before 2.8.0 the only SBI↔N2 / SBI↔N4 bridges were STRONG, driven

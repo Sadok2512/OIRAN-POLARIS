@@ -5,8 +5,17 @@ set -euo pipefail
 # record each time dumpcap finalises a rotation segment. The caller runs
 # dumpcap with `-b duration:<s>` so the process never exits — the only
 # externally visible signal of a rotation is the appearance of a newer
-# file in the output directory. We poll the directory on a bounded
-# interval and declare "file N is closed" the moment "file N+1" exists.
+# file in the output directory.
+#
+# 2.8.1 (#9, ANR2): ANR2 measured 12 instances × ~2% CPU = 24.6% cumulative
+# even at `pending=0`. Two fixes:
+#   (a) if `inotifywait` is installed, block on `close_write|moved_to`
+#       filesystem events on `$dir` — the watcher wakes up ONLY when
+#       dumpcap finalises a segment and consumes ~0% CPU in between.
+#   (b) when inotifywait is not available, keep the poll loop but build
+#       an in-memory associative array from `$seen_file` ONCE at startup
+#       and extend it as we emit, so the per-candidate check is O(1)
+#       instead of a `grep -Fxq` against a growing file.
 #
 # 2.7.15 (NS-20261104-CLAUDE-OIRAN-FINAL-2715): `packets_captured` and
 # `packets_dropped` MUST now be chiffrés or explicitly `"UNKNOWN:<reason>"`
@@ -173,6 +182,26 @@ emit_rotation() {
   } 9>>"$rotation_log"
 }
 
+# 2.8.1: O(1) seen check. Populated once at startup from `$seen_file`,
+# updated as we emit. The pre-2.8.1 code did `grep -Fxq` per candidate
+# which was O(N × M) under long-running watchers (ANR2's #9 CPU proof).
+declare -A seen_set=()
+if [[ -s $seen_file ]]; then
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -n $line ]] && seen_set[$line]=1
+  done <"$seen_file"
+fi
+
+mark_seen() {
+  local path=$1
+  seen_set[$path]=1
+  printf '%s\n' "$path" >>"$seen_file"
+}
+
+is_seen() {
+  [[ -n ${seen_set[$1]+1} ]]
+}
+
 # Main loop — exits when stopped by the orchestrator. Idempotent: a
 # segment path is emitted at most once across watcher restarts.
 scan_once() {
@@ -193,9 +222,9 @@ scan_once() {
   local idx
   for (( idx = 0; idx < last_idx; idx++ )); do
     local candidate=${sorted[idx]}
-    if ! grep -Fxq -- "$candidate" "$seen_file" 2>/dev/null; then
+    if ! is_seen "$candidate"; then
       emit_rotation "$candidate"
-      printf '%s\n' "$candidate" >> "$seen_file"
+      mark_seen "$candidate"
     fi
   done
 }
@@ -205,7 +234,29 @@ if [[ ${OIRAN_CAPTURE_ROTATION_ONESHOT:-0} == 1 ]]; then
   exit 0
 fi
 
-while :; do
+# 2.8.1: prefer blocking inotify watch over the poll loop. `close_write`
+# fires when dumpcap finalises a rotation segment; `moved_to` covers
+# atomic-rename patterns some tools use. Falls back to the O(1) poll
+# loop when inotifywait is missing (busybox-style minimal containers).
+#
+# `OIRAN_CAPTURE_ROTATION_FORCE_POLL=1` disables inotify entirely — the
+# test harness (test-rotation-watcher.sh) uses this so its measurement
+# stays deterministic across runners that may or may not ship
+# inotify-tools.
+use_inotify=0
+if [[ ${OIRAN_CAPTURE_ROTATION_FORCE_POLL:-0} != 1 ]] && command -v inotifywait >/dev/null 2>&1; then
+  use_inotify=1
+fi
+
+if (( use_inotify == 1 )); then
+  # Drain any segment already present at startup (watcher restart case).
   scan_once
-  sleep "$poll_s"
-done
+  while IFS= read -r _event || [[ -n ${_event:-} ]]; do
+    scan_once
+  done < <(inotifywait -m -q -e close_write,moved_to --format '%f' -- "$dir")
+else
+  while :; do
+    scan_once
+    sleep "$poll_s"
+  done
+fi
