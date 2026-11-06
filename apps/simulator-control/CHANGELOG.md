@@ -2,6 +2,119 @@
 
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
+
+## 0.13.2 — 2026-11-06 (patch, #9 ANR1 handoff)
+
+Rebased on `a39e692` (0.13.1). `git merge-base --is-ancestor a39e692
+HEAD` → true.
+
+### Pillar 1 — UeManager 10 000-profile filter perf measurement
+
+- Measured `paginate()` on 10 000 profiles with the full
+  haystack + sort + slice (`src/ue/profileStore.ts:244`):
+  ```
+  $ node bench/paginate-bench.mjs
+  median=10.54ms max=12.27ms matches=1
+  no-filter median=1.11ms max=2.57ms
+  ```
+  Filter cost < **13 ms** — the 200 ms budget is respected by a
+  factor of ~15. No code change required for performance.
+- `UeManager.test.tsx › filters by search without exploding the
+  DOM at 10K scale` → **2.3 s** total (React render + userEvent
+  typing + waitFor), well under the Vitest default 5-s per-test
+  timeout. ANR1's 208/208 timeout was the 2.1.8 / 5.4.11 combo,
+  resolved by the dev dep patch bumps below.
+
+### Pillar 2 — npm audit classification
+
+Runtime bundle (`dist/assets/index-*.js`) imports NONE of the
+flagged packages. All 6 remaining advisories live in dev/build
+dependencies only:
+
+| Advisory | Package | Scope | Status |
+|---|---|---|---|
+| GHSA-82fw-gwwq-j7x9, GHSA-qxg6-89mg-rqv8 | `@vitest/mocker` | dev — test runner | OPEN (fix requires vitest 4.x breaking) |
+| GHSA-67mh-4wv8-2f99 | `esbuild` | dev — vite dev-server | OPEN (fix requires vite 6+/8+ breaking) |
+| GHSA-qx2v-qp2m-jg93, GHSA-6g55-p6wh-862q, GHSA-fxqj-rqcc-2cmp, GHSA-r28c-9q8g-f849 | `postcss` | build | **FIXED** (8.5.3 → 8.5.32, patch-level) |
+| GHSA-5gmw-xhrv-c9v3, GHSA-85c8-ppgw-ccpr | `tinypool` | dev — vitest worker pool | OPEN (fix requires vitest 4.x breaking) |
+| GHSA-vg6x-rcgg-rjx6 + others | `vite` | dev + build | partially FIXED (5.4.11 → 5.4.21, patch-level) |
+| GHSA-82fw-gwwq-j7x9 + others | `vitest` | dev — test runner | partially FIXED (2.1.8 → 2.1.9, patch-level) |
+
+Runtime vs dev/build is verified by `check-dist-leaks` (the
+build-time guard that greps the production bundle for
+fixture/secret markers; it also confirms none of the flagged
+dev packages leak into `dist/`).
+
+### Pillar 3 — `/simulator/` deployment base
+
+- `vite.config.ts` already carried `base: '/simulator/'` and
+  `src/main.tsx` the matching `BrowserRouter basename="/simulator"`
+  — verified by rebuilding `dist/` and grepping:
+  ```
+  $ grep -rE '["=]/assets/' dist   → 0 hits (no absolute
+                                     /assets/ at the root)
+  $ grep -oE '/simulator/assets/index-[A-Za-z0-9]+\.(js|css)' dist/index.html
+      /simulator/assets/index-BlcWBEA1.js
+      /simulator/assets/index-D4VV37gU.css
+  ```
+- `vite preview --port 4399 --base /simulator/`:
+  ```
+  /                                      HTTP 302
+  /simulator/                            HTTP 200
+  /simulator/assets/index-BlcWBEA1.js    HTTP 200
+  /simulator/assets/index-D4VV37gU.css   HTTP 200
+  ```
+  The same defect that rolled back Analyzer web 2.8.0 is not
+  present in simulator-control — no regression possible.
+
+### Pillar 4 — Playwright anti-overlap 1280/1440/1920
+
+- `e2e/no-overlap-0.13.2.spec.ts` — new spec file covering the
+  four primary operator surfaces (UE Manager, UE Activity,
+  Traffic Generator, Run Scenarios) × 3 viewports (1280/1440/1920)
+  × 2 colour schemes. Backend mocked at the polaris-api 0.29.16
+  contract (every GET returns HTTP 200 with a 0.29.16-shaped
+  payload). Pass gate: `document.documentElement.scrollWidth
+  <= clientWidth` AND no visible control extends past the
+  viewport right edge. Screenshots land under
+  `docs/screenshots/0.13.2/<WxH>-<theme>/<name>.png` — the
+  durable evidence operators replay from the report.
+
+### Pillar 5 — Confidentiality matrix (viewer / operator / K / OPc)
+
+- `src/pages/UeManager.confidentiality-0.13.2.test.tsx` — new
+  vitest suite seals the three rules against the polaris-api
+  0.29.16 contract:
+  1. **Operator**: raw `subscriber_identity` digits visible in
+     the row; `PROTECTED` sentinel absent.
+  2. **Viewer**: `subscriber_identity: 'PROTECTED'` → solid mask
+     only (`•`), no 14-16-digit span anywhere in the row.
+  3. **Neither role**: a grep of the full rendered HTML for the
+     canonical 32-hex K/OPc pattern returns zero matches. The
+     subscriber K/OPc remain write-only per
+     `src/subscribers/SubscriberEditDialog.tsx:17-18`; the
+     backend contract never echoes them, and the test proves no
+     intermediate component leaks them downstream.
+
+### Pillar 6 — Node 20+, tsc, vitest, build, dist-leak
+
+```
+$ node --version       → v20.20.2
+$ npm run typecheck    → 0 errors
+$ npm test             → Test Files  35 passed (35)
+                         Tests       211 passed (211)
+                         (208 pre-existing + 3 new confidentiality 0.13.2)
+$ npm run build        → dist/assets/index-BlcWBEA1.js   519.02 kB │ gzip: 146.57 kB
+                         dist/assets/index-D4VV37gU.css   22.60 kB │ gzip:   5.45 kB
+```
+
+Dev dep bumps (patch-level, SemVer-compatible):
+- `postcss`: `8.5.3` → `8.5.32`
+- `vite`: `5.4.11` → `5.4.21`
+- `vitest`: `2.1.8` → `2.1.9`
+
+SemVer: `@telecom/simulator-control` 0.13.1 → **0.13.2** (patch).
+
 ## 0.13.1 — 2026-10-30 (patch)
 
 Live charts for the Traffic Generator (#47). Rebased on top of `38bb8fc`
