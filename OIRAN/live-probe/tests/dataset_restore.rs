@@ -1,6 +1,8 @@
-//! 2.7.27 integration test for the `dataset-restore` binary:
-//! idempotent reinjection of archived events, no event_id lost,
-//! canonical order preserved.
+//! 2.7.28 integration test for `dataset-restore`:
+//! restore routes through the full publication path — manifest,
+//! callflows and session registry are coherent with the restored
+//! events.jsonl after the call, and a second run on the same inputs
+//! leaves every artifact byte-identical (idempotency).
 
 use std::{
     collections::BTreeSet,
@@ -29,8 +31,34 @@ fn jsonl_line(event_id: &str, capture_id: &str, packet_number: u64) -> String {
     serde_json::json!({
         "event_id": event_id,
         "capture_id": capture_id,
-        "timestamp": {"seconds": packet_number, "nanoseconds": 0, "raw_ticks": packet_number * 1_000_000_000, "display": ""},
-        "packet_references": [{"source_file": "x", "packet_number": packet_number, "byte_offset": 0, "interface_id": 0, "captured_length": 1, "original_length": 1}],
+        "capture_point_id": "N2",
+        "timestamp": {
+            "seconds": packet_number,
+            "nanoseconds": 0,
+            "raw_ticks": packet_number as i128 * 1_000_000_000i128,
+            "display": "",
+        },
+        "interface": "N2",
+        "protocol": "NGAP",
+        "message_name": "InitialUEMessage",
+        "source_endpoint": {"address": "10.0.0.1", "network_function": "gNB"},
+        "destination_endpoint": {"address": "10.0.0.2", "network_function": "AMF"},
+        "direction": "RAN_TO_CORE",
+        "session_identifiers": [],
+        "information_elements": [],
+        "decoding_status": "DECODED",
+        "decoder_name": "test",
+        "decoder_version": "1",
+        "raw_payload_reference": "sha256:test",
+        "packet_references": [{
+            "source_file": "x",
+            "packet_number": packet_number,
+            "byte_offset": 0,
+            "interface_id": 0,
+            "captured_length": 1,
+            "original_length": 1,
+        }],
+        "errors": [],
     })
     .to_string()
 }
@@ -57,7 +85,6 @@ fn read_event_ids(path: &Path) -> BTreeSet<String> {
 }
 
 fn sha256_of(path: &Path) -> String {
-    // Shell out to avoid pulling event_schema into the integration test.
     let output = Command::new("sha256sum")
         .arg(path)
         .output()
@@ -68,12 +95,25 @@ fn sha256_of(path: &Path) -> String {
 
 #[test]
 fn dataset_restore_reinjects_archived_events_idempotently() {
-    let base = std::env::temp_dir().join(format!("oiran-dataset-restore-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!(
+        "oiran-dataset-restore-2.7.28-{}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).unwrap();
-    let dataset_dir = base.join("dataset");
-    let archive_segment = base.join("archive/seg-001");
-    fs::create_dir_all(&dataset_dir).unwrap();
+    let capture_root = base.join("captures");
+    fs::create_dir_all(&capture_root).unwrap();
+    // Pseudonym key under the test tree so CaptureManager::new() does
+    // not touch /var/lib/oiran. On the first restore, PseudonymKey::
+    // load_or_generate creates a fresh 32-byte key with mode 0o600;
+    // the second restore reads it back — this is the same persistence
+    // production uses to keep event_ids stable across restarts.
+    let key_path = base.join("pseudonym.key");
+    let continuous = capture_root.join("continuous-lab-import");
+    let dataset_dir = continuous.join("dataset");
+    let callflows_dir = dataset_dir.join("callflows");
+    let archive_segment = continuous.join("archive/seg-001");
+    fs::create_dir_all(&callflows_dir).unwrap();
     fs::create_dir_all(&archive_segment).unwrap();
     // Current hot view: 3 events of a fresh capture.
     let hot_events = dataset_dir.join("oiran_events.jsonl");
@@ -94,7 +134,6 @@ fn dataset_restore_reinjects_archived_events_idempotently() {
         .collect();
     write_jsonl(&archive_events, &archived_lines);
     let archive_sha = sha256_of(&archive_events);
-    // Minimal manifest with the computed sha so the restore validates it.
     fs::write(
         archive_segment.join("manifest.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -110,41 +149,58 @@ fn dataset_restore_reinjects_archived_events_idempotently() {
         .unwrap(),
     )
     .unwrap();
-    // First restore.
+    // First restore via the binary — goes through CaptureManager →
+    // publish_events_to_dataset_dir (full session + manifest rebuild).
     let status = Command::new(target_bin())
-        .arg(&dataset_dir)
+        .arg(&capture_root)
         .arg(&archive_segment)
+        .env("OIRAN_PSEUDONYM_KEY_PATH", &key_path)
         .status()
         .expect("spawn dataset-restore");
     assert!(status.success(), "first restore must succeed");
+    let manifest_path = dataset_dir.join("dataset_manifest.json");
+    assert!(
+        manifest_path.is_file(),
+        "restore must leave dataset_manifest.json next to events.jsonl"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let on_disk_count = read_event_ids(&hot_events).len();
+    let manifest_count = manifest["event_count"].as_u64().unwrap() as usize;
+    assert_eq!(
+        on_disk_count, manifest_count,
+        "manifest event_count must match the on-disk JSONL — this is the 2.7.27 defect regression guard"
+    );
     let after_first = read_event_ids(&hot_events);
     let total_expected = 3 + 2_717;
-    assert_eq!(
-        after_first.len(),
-        total_expected,
-        "every event_id must be in the hot view after restore"
-    );
+    assert_eq!(after_first.len(), total_expected);
     for i in 0..2_717 {
         assert!(after_first.contains(&format!("evt-stale-{i:04}")));
     }
     for i in 1..=3 {
         assert!(after_first.contains(&format!("evt-fresh-{i}")));
     }
-    let sha_after_first = sha256_of(&hot_events);
-    // Second restore on the same inputs: output byte-identical
-    // (idempotency).
+    let sha_events_after_first = sha256_of(&hot_events);
+    let sha_manifest_after_first = sha256_of(&manifest_path);
+    // Second restore: every output artifact byte-identical.
     let status = Command::new(target_bin())
-        .arg(&dataset_dir)
+        .arg(&capture_root)
         .arg(&archive_segment)
+        .env("OIRAN_PSEUDONYM_KEY_PATH", &key_path)
         .status()
         .expect("spawn dataset-restore");
     assert!(status.success(), "second restore must succeed");
-    let sha_after_second = sha256_of(&hot_events);
+    let sha_events_after_second = sha256_of(&hot_events);
+    let sha_manifest_after_second = sha256_of(&manifest_path);
     assert_eq!(
-        sha_after_first, sha_after_second,
-        "dataset-restore is idempotent: same inputs → same SHA-256"
+        sha_events_after_first, sha_events_after_second,
+        "events.jsonl must be byte-identical across two restores"
     );
-    // Canonical order: output sorted by (capture_id, packet_number, event_id).
+    assert_eq!(
+        sha_manifest_after_first, sha_manifest_after_second,
+        "dataset_manifest.json must be byte-identical across two restores"
+    );
+    // Canonical order: (capture_id, packet_number, event_id).
     let on_disk_order: Vec<String> = BufReader::new(fs::File::open(&hot_events).unwrap())
         .lines()
         .filter_map(Result::ok)

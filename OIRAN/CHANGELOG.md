@@ -1,5 +1,93 @@
 # Changelog
 
+## OIRAN API 2.7.28 — 2026-11-06 — `dataset-restore` goes through the full publication path
+
+- ANR2 production verdict on 2.7.27 (issue #10): the restore binary
+  canonically dedup-merged `archive/<seg>/events.jsonl` into
+  `dataset/oiran_events.jsonl` (47 326 + 2 717 − 54 overlap = 49 989
+  event_ids, canonical order PASS, two runs identical SHA-256) but
+  wrote ONLY the JSONL — `dataset_manifest.json`, `callflows/` and the
+  dataset registry entry stayed at the pre-restore 47 326 / 5
+  sessions. On the next publication cycle
+  `recover_continuous_dataset_from_disk`
+  (`OIRAN/live-probe/src/lib.rs:3133-3168`) validated the stale
+  manifest against the new JSONL via
+  `validate_dataset_artifacts` / `count_valid_event_records`
+  (`:3589-3624` / `:3630-3654`), reported
+  `DATASET_REGISTRATION_EVENT_COUNT_MISMATCH` and emitted
+  `CONTINUOUS_DATASET_RECOVER_SKIPPED {reason:"artifact-drift"}`. 3
+  of the 7 historical sessions whose events lived ONLY in the
+  archive remained absent from `/health`; the other 4 were already
+  present via the 54 overlapping event_ids. ANR2 rolled back to
+  2.7.26 with retention 3650.
+- 2.7.28 contract: **the restore binary never writes
+  `oiran_events.jsonl` directly**. It routes through the SAME
+  publication path the continuous import worker uses — `.dataset-next`
+  → events + session discovery + correlation + folded edges +
+  callflows + manifest → atomic swap — under the SAME `flock`
+  advisory lock on `<base>/.publication.lock` so the worker and
+  `dataset-restore` cannot race. Choice documented: if the worker
+  holds the lock, the restore refuses fast with
+  `RESTORE_REQUIRES_PUBLICATION_LOCK` rather than queueing. Operators
+  stop `oiran-api.service` before running `dataset-restore`.
+- Changes in `OIRAN/live-probe/src/lib.rs`:
+  * Extracted the "events on disk → sessions + callflows + manifest"
+    tail of `process_capture_into` into a new private method
+    `publish_events_to_dataset_dir`. The worker still reaches it
+    after its PCAP-decode + merge prefix; the restore method reaches
+    it after a canonical dedup-merge. No behaviour drift — the 2.7.26
+    correlation fold, 2.7.24 streaming memory, and 2.7.23 call-flow
+    RSS budget all still apply.
+  * New `PublicationLock` (POSIX `flock` wrapper) acquired blocking
+    by `process_continuous_capture` and non-blocking
+    (`LOCK_EX | LOCK_NB`) by `restore_from_archive_segment`.
+    `EWOULDBLOCK` surfaces as `RESTORE_REQUIRES_PUBLICATION_LOCK`;
+    the fd is held through the atomic swap and released on process
+    exit (crashes can't leave a stale lock).
+  * New `pub fn restore_from_archive_segment(&self,
+    archive_segment_dir) -> Result<DatasetRestoreReport, String>`:
+    validates `manifest.events_sha256`
+    (`RESTORE_ARCHIVE_TAMPERED` on mismatch), canonically merges
+    `current + archive` into `.dataset-next/oiran_events.jsonl`
+    (dedup by event_id, sorted by
+    `(capture_id, packet_number, event_id)` — never by timestamp),
+    invokes `publish_events_to_dataset_dir`, swaps
+    `.dataset-next` ↔ `dataset` via `.dataset-previous`, and calls
+    `upsert_dataset` so `/health` observes the rebuilt view
+    immediately.
+  * New `DatasetRestoreReport { event_count_before,
+    archive_event_count, overlap_event_count, overlap_event_ids,
+    event_count_after, session_ids, events_sha256, … }` — the
+    overlap list makes the `before + archive − overlap = after`
+    identity ANR2 validated reproducible and auditable per restore.
+- `OIRAN/live-probe/src/bin/dataset-restore.rs` rewritten: now a
+  thin wrapper that builds `CaptureManager::new(capture-root, false)`
+  and calls `restore_from_archive_segment`. CLI is
+  `dataset-restore <capture-root> <archive-segment-dir>` (mirrors
+  `oiran-recover`'s positional form).
+- Regression tests (new, all passing):
+  * `tests::restore_rebuilds_a_manifest_coherent_with_the_restored_events`
+    — direct 2.7.27 defect regression guard: after restore, the
+    manifest's `event_count` matches the on-disk JSONL count
+    exactly, and `callflows/` exists.
+  * `tests::restore_refuses_when_the_publication_lock_is_held` —
+    holding `PublicationLock::acquire_blocking` externally makes
+    `restore_from_archive_segment` return
+    `RESTORE_REQUIRES_PUBLICATION_LOCK`.
+  * `tests::restore_reports_overlap_event_ids_between_hot_view_and_archive`
+    — `(evt-b)` present in both inputs: report shows
+    `overlap_event_count = 1`, `overlap_event_ids = ["evt-b"]`,
+    `event_count_after = 2 + 2 − 1 = 3`.
+  * `tests::restore_followed_by_an_empty_publish_leaves_registration_valid`
+    — after restore, the NEXT `process_capture_into` call (empty
+    pcap directory) validates the restored manifest as its
+    `prior_continuous` checkpoint and publishes successfully. The
+    ANR2 symptom cannot reappear.
+  * Updated `tests/dataset_restore.rs` integration test: 3 fresh +
+    2 717 archived event_ids, two runs produce byte-identical
+    `events.jsonl` AND byte-identical `dataset_manifest.json`,
+    manifest `event_count` matches the JSONL — the full contract.
+
 ## OIRAN API 2.7.27 — 2026-11-06 — archive-based retention + `dataset-restore`
 
 - ANR2 defect (issue #10): the 7-day retention was *deleting*

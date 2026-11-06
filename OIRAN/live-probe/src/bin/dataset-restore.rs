@@ -1,44 +1,39 @@
-//! 2.7.27 `dataset-restore` — re-inject previously archived events
-//! back into the live dataset.
+//! 2.7.28 `dataset-restore` — re-inject previously archived events
+//! back into the live dataset through the SAME publication path the
+//! continuous import worker uses (dataset-next → sessions +
+//! correlation + callflows + manifest + registration → atomic swap),
+//! under the same `flock` publication lock. Never writes
+//! `oiran_events.jsonl` directly.
 //!
 //! Semantics
 //!
-//! - **Dedup by `event_id`**: the archive segment and the current
-//!   `oiran_events.jsonl` can overlap (the archive was written from
-//!   events that were ALSO still in the dataset at the time of
-//!   archiving, and the dataset may already have been re-ingested
-//!   since). Only the first occurrence of each `event_id` is kept.
+//! - **Dedup by `event_id`**: the archive segment and the current hot
+//!   view can overlap. First occurrence from the current view wins.
+//!   Overlap `event_id`s are returned in the report.
 //! - **Canonical order**: output is sorted by
 //!   `(capture_id, packet_number, event_id)` — session-engine's
 //!   `canonical_sort_key` — never by timestamp.
-//! - **Idempotent**: a second run on the same inputs produces an
-//!   identical `oiran_events.jsonl` (same SHA-256).
-//! - **Session rediscovery** happens on the NEXT continuous
-//!   publication cycle: the worker reads the restored jsonl through
-//!   `load_path_streaming_index` and rebuilds sessions + callflows
-//!   without reloading the entire history into RAM. This binary does
-//!   NOT regenerate callflows itself.
+//! - **Publication lock**: `flock(LOCK_EX | LOCK_NB)` on
+//!   `<capture-root>/<continuous-capture-id>/.publication.lock`. If
+//!   the import worker holds the lock the call fails with
+//!   `RESTORE_REQUIRES_PUBLICATION_LOCK` — stop the service first.
+//! - **Idempotent**: two runs on the same inputs produce an identical
+//!   `oiran_events.jsonl` (same SHA-256) and therefore identical
+//!   downstream artifacts.
 //!
 //! Usage
 //!
-//!     dataset-restore <dataset-dir> <archive-segment-dir> [--dry-run]
+//!     dataset-restore <capture-root> <archive-segment-dir>
 //!
-//! `<dataset-dir>` is the `continuous-lab-import/dataset/` directory
-//! containing `oiran_events.jsonl`.
-//! `<archive-segment-dir>` is one `<archive>/<id>/` directory
-//! produced by `archive_stale_captures` and MUST contain
-//! `events.jsonl` + `manifest.json`.
+//! `<capture-root>` is `/var/lib/oiran/captures` in the production
+//! deployment — the `CaptureManager` root, parent of the
+//! `continuous-lab-import/` directory that owns the hot dataset.
+//! `<archive-segment-dir>` is one `<archive>/<id>/` directory produced
+//! by `archive_stale_captures` and MUST contain `events.jsonl` +
+//! `manifest.json`.
 
-use event_schema::{sha256_hex, Sha256Hasher};
-use std::{
-    collections::BTreeSet,
-    env, fs,
-    io::{BufRead, BufReader, BufWriter, Write},
-    path::PathBuf,
-    process::ExitCode,
-};
-
-const STREAM_CHUNK_BYTES: usize = 1 << 20;
+use live_probe::CaptureManager;
+use std::{env, path::PathBuf, process::ExitCode};
 
 fn main() -> ExitCode {
     match run() {
@@ -61,125 +56,32 @@ fn main() -> ExitCode {
 
 fn run() -> Result<String, String> {
     let mut args = env::args().skip(1);
-    let dataset_dir = args
+    let capture_root = args
         .next()
-        .ok_or("usage: dataset-restore <dataset-dir> <archive-segment-dir> [--dry-run]")?;
-    let archive_dir = args
+        .ok_or("usage: dataset-restore <capture-root> <archive-segment-dir>")?;
+    let archive_segment_dir = args
         .next()
-        .ok_or("usage: dataset-restore <dataset-dir> <archive-segment-dir> [--dry-run]")?;
-    let dry_run = args.any(|arg| arg == "--dry-run");
-    let dataset_dir = PathBuf::from(dataset_dir);
-    let archive_dir = PathBuf::from(archive_dir);
-    let events_path = dataset_dir.join("oiran_events.jsonl");
-    let archive_events = archive_dir.join("events.jsonl");
-    let archive_manifest = archive_dir.join("manifest.json");
-    if !events_path.is_file() {
-        return Err(format!(
-            "DATASET_RESTORE_MISSING: {}",
-            events_path.display()
-        ));
+        .ok_or("usage: dataset-restore <capture-root> <archive-segment-dir>")?;
+    if args.next().is_some() {
+        return Err("usage: dataset-restore <capture-root> <archive-segment-dir>".into());
     }
-    if !archive_events.is_file() {
-        return Err(format!(
-            "DATASET_RESTORE_MISSING: {}",
-            archive_events.display()
-        ));
-    }
-    // Validate the archive segment: manifest.events_sha256 must match
-    // the on-disk events.jsonl.
-    if archive_manifest.is_file() {
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&fs::read(&archive_manifest).map_err(stringify)?)
-                .map_err(stringify)?;
-        if let Some(expected) = manifest
-            .get("events_sha256")
-            .and_then(serde_json::Value::as_str)
-        {
-            let actual = sha256_hex(&fs::read(&archive_events).map_err(stringify)?);
-            if actual != expected {
-                return Err(format!(
-                    "DATASET_RESTORE_ARCHIVE_TAMPERED: manifest sha {expected} != actual {actual}"
-                ));
-            }
-        }
-    }
-    // Pass 1: collect every (sort_key, event_id, raw_line) across the
-    // archive + live dataset. Dedup by event_id (first occurrence
-    // wins), sort by canonical key. Memory peak = O(events in the
-    // restored union), which is itself bounded by the on-disk file.
-    let mut records: Vec<(String, u64, String, String)> = Vec::new(); // (capture_id, packet_number, event_id, raw_line)
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    for source in [&events_path, &archive_events] {
-        let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, fs::File::open(source).map_err(stringify)?);
-        for line in reader.lines() {
-            let line = line.map_err(stringify)?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let value: serde_json::Value = serde_json::from_str(&line).map_err(stringify)?;
-            let event_id = value
-                .get("event_id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("DATASET_RESTORE_MALFORMED: missing event_id in {}", source.display()))?
-                .to_string();
-            if !seen.insert(event_id.clone()) {
-                continue;
-            }
-            let capture_id = value
-                .get("capture_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let packet_number = value
-                .get("packet_references")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|refs| refs.first())
-                .and_then(|r| r.get("packet_number"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            records.push((capture_id, packet_number, event_id, line));
-        }
-    }
-    // Canonical sort: (capture_id, packet_number, event_id).
-    records.sort_by(|a, b| (a.0.as_str(), a.1, a.2.as_str()).cmp(&(b.0.as_str(), b.1, b.2.as_str())));
-    let event_count = records.len();
-    if dry_run {
-        return Ok(serde_json::json!({
-            "event": "DATASET_RESTORE_DRY_RUN",
-            "dataset_dir": dataset_dir.display().to_string(),
-            "archive_segment": archive_dir.display().to_string(),
-            "event_count": event_count,
-        })
-        .to_string());
-    }
-    // Write the restored jsonl atomically and compute its SHA-256 for
-    // the idempotency guarantee.
-    let tmp = events_path.with_extension("jsonl.restore-tmp");
-    let mut hasher = Sha256Hasher::new();
-    {
-        let file = fs::File::create(&tmp).map_err(stringify)?;
-        let mut writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, file);
-        for (_, _, _, line) in &records {
-            writer.write_all(line.as_bytes()).map_err(stringify)?;
-            writer.write_all(b"\n").map_err(stringify)?;
-            hasher.update(line.as_bytes());
-            hasher.update(b"\n");
-        }
-        writer.flush().map_err(stringify)?;
-        writer.get_ref().sync_all().map_err(stringify)?;
-    }
-    fs::rename(&tmp, &events_path).map_err(stringify)?;
-    let restored_sha256 = hasher.finish_hex();
-    Ok(serde_json::json!({
+    let capture_root = PathBuf::from(capture_root);
+    let archive_segment_dir = PathBuf::from(archive_segment_dir);
+    let manager = CaptureManager::new(capture_root, false)
+        .map_err(|error| format!("MANAGER_INIT: {error}"))?;
+    let report = manager.restore_from_archive_segment(&archive_segment_dir)?;
+    let payload = serde_json::json!({
         "event": "DATASET_RESTORE_COMPLETED",
-        "dataset_dir": dataset_dir.display().to_string(),
-        "archive_segment": archive_dir.display().to_string(),
-        "event_count": event_count,
-        "events_sha256": restored_sha256,
-    })
-    .to_string())
-}
-
-fn stringify<E: std::fmt::Display>(error: E) -> String {
-    format!("{error}")
+        "schema_version": report.schema_version,
+        "dataset_dir": report.dataset_dir,
+        "archive_segment": report.archive_segment_dir,
+        "event_count_before": report.event_count_before,
+        "archive_event_count": report.archive_event_count,
+        "overlap_event_count": report.overlap_event_count,
+        "overlap_event_ids": report.overlap_event_ids,
+        "event_count_after": report.event_count_after,
+        "session_ids": report.session_ids,
+        "events_sha256": report.events_sha256,
+    });
+    Ok(payload.to_string())
 }

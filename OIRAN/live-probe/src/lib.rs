@@ -2555,6 +2555,11 @@ impl CaptureManager {
         interfaces: &[CaptureInterface],
         max_owned_bytes: u64,
     ) -> Result<LiveDataset, String> {
+        // 2.7.28: cross-process advisory lock (flock) held through the
+        // entire dataset-next → dataset swap. `dataset-restore` takes
+        // the same lock with `LOCK_NB` and refuses with
+        // `RESTORE_REQUIRES_PUBLICATION_LOCK` when the worker holds it.
+        let _publication_lock = PublicationLock::acquire_blocking(base)?;
         let current = base.join("dataset");
         let next = base.join(".dataset-next");
         let previous = base.join(".dataset-previous");
@@ -2622,6 +2627,154 @@ impl CaptureManager {
             fs::remove_dir_all(&previous).map_err(display_error)?;
         }
         Ok(dataset)
+    }
+
+    /// 2.7.28 (issue #10, ANR2 defect on 2.7.27): atomic restore from a
+    /// `archive_stale_captures` segment. The hot view is never written
+    /// directly — the operator stops the import worker (which would
+    /// otherwise hold the publication lock) and invokes this, which:
+    ///
+    /// 1. Acquires the same `flock` publication lock as the worker.
+    ///    Contention → `RESTORE_REQUIRES_PUBLICATION_LOCK`. The
+    ///    operator stops `oiran-api.service` before running
+    ///    `dataset-restore`; the worker cannot run concurrently.
+    /// 2. Validates the archive segment's `manifest.events_sha256`
+    ///    against the on-disk `events.jsonl`. Mismatch →
+    ///    `RESTORE_ARCHIVE_TAMPERED`.
+    /// 3. Reads the current `dataset_manifest.json` (if any) and keeps
+    ///    it as the `prior_continuous` checkpoint — operator-written
+    ///    `decode_reports` and `checksums` survive restore unchanged.
+    /// 4. Prepares `<base>/.dataset-next/` (wipe + recreate) and writes
+    ///    `oiran_events.jsonl` by streaming the union of the current
+    ///    hot view and the archive segment through a `BTreeSet<event_id>`
+    ///    dedup (first occurrence wins), then sorting canonically by
+    ///    `(capture_id, packet_number, event_id)` — session-engine's
+    ///    `canonical_sort_key` — never by timestamp.
+    /// 5. Invokes `publish_events_to_dataset_dir` — the same helper
+    ///    `process_capture_into` uses after its PCAP decode — so
+    ///    sessions, correlation, callflows and manifest are rebuilt
+    ///    through the identical publication path.
+    /// 6. Atomically swaps `.dataset-next/` ↔ `dataset/` via
+    ///    `.dataset-previous/` and registers the fresh manifest in the
+    ///    `datasets` map so `/health` observes the restored view
+    ///    immediately.
+    ///
+    /// Idempotent by construction: two restores on the same inputs
+    /// produce byte-identical `oiran_events.jsonl` (dedup+sort is
+    /// deterministic) and therefore byte-identical downstream
+    /// artifacts.
+    pub fn restore_from_archive_segment(
+        &self,
+        archive_segment_dir: &Path,
+    ) -> Result<DatasetRestoreReport, String> {
+        let base = self.root.join(CONTINUOUS_CAPTURE_ID);
+        let _publication_lock = PublicationLock::try_acquire(&base)?;
+        let current = base.join("dataset");
+        let next = base.join(".dataset-next");
+        let previous = base.join(".dataset-previous");
+        if previous.is_dir() && !current.is_dir() {
+            fs::rename(&previous, &current).map_err(display_error)?;
+        }
+        if next.exists() {
+            fs::remove_dir_all(&next).map_err(display_error)?;
+        }
+        let current_events = current.join("oiran_events.jsonl");
+        if !current_events.is_file() {
+            return Err(format!(
+                "RESTORE_MISSING_HOT_VIEW: {}",
+                current_events.display()
+            ));
+        }
+        let archive_events = archive_segment_dir.join("events.jsonl");
+        if !archive_events.is_file() {
+            return Err(format!(
+                "RESTORE_MISSING_ARCHIVE_EVENTS: {}",
+                archive_events.display()
+            ));
+        }
+        let archive_manifest_path = archive_segment_dir.join("manifest.json");
+        if archive_manifest_path.is_file() {
+            let manifest: Value =
+                serde_json::from_slice(&fs::read(&archive_manifest_path).map_err(display_error)?)
+                    .map_err(|error| error.to_string())?;
+            if let Some(expected) = manifest.get("events_sha256").and_then(Value::as_str) {
+                let actual = sha256_hex_file(&archive_events)?;
+                if actual != expected {
+                    return Err(format!(
+                        "RESTORE_ARCHIVE_TAMPERED: manifest sha {expected} != actual {actual}"
+                    ));
+                }
+            }
+        }
+        // Prior continuous checkpoint: the restore carries over
+        // operator-written `decode_reports` + `checksums` from the
+        // current manifest if it exists AND validates against its
+        // JSONL. A drifted manifest (ANR2's 2.7.27 symptom) is NOT
+        // reused — the restore is also the recovery path, so we treat
+        // it the same way 2.7.20 tolerates a missing manifest and
+        // rebuild from the events alone.
+        let prior_continuous: Option<(PathBuf, LiveDataset)> = if current
+            .join("dataset_manifest.json")
+            .is_file()
+        {
+            let bytes = fs::read(current.join("dataset_manifest.json")).map_err(display_error)?;
+            if let Ok(dataset) = serde_json::from_slice::<LiveDataset>(&bytes) {
+                if validate_dataset_artifacts(&dataset, &current).is_ok() {
+                    Some((current.clone(), dataset))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let event_count_before = count_valid_event_records(&current_events)?;
+        let archive_event_count = count_valid_event_records(&archive_events)?;
+        prepare_dataset_directory(&next)?;
+        let next_events = next.join("oiran_events.jsonl");
+        let (overlap_event_ids, events_sha256) =
+            canonical_dedup_merge(&current_events, &archive_events, &next_events)?;
+        let event_count_after = count_valid_event_records(&next_events)?;
+        let dataset = self.publish_events_to_dataset_dir(
+            CONTINUOUS_CAPTURE_ID,
+            CONTINUOUS_DATASET_ID.into(),
+            &next,
+            format!("runtime/live-captures/{CONTINUOUS_CAPTURE_ID}/dataset"),
+            prior_continuous,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )?;
+        // Atomic swap next ↔ current via previous.
+        if previous.exists() {
+            fs::remove_dir_all(&previous).map_err(display_error)?;
+        }
+        if current.exists() {
+            fs::rename(&current, &previous).map_err(display_error)?;
+        }
+        if let Err(error) = fs::rename(&next, &current) {
+            if previous.is_dir() {
+                let _ = fs::rename(&previous, &current);
+            }
+            return Err(display_error(error));
+        }
+        if previous.exists() {
+            fs::remove_dir_all(&previous).map_err(display_error)?;
+        }
+        self.upsert_dataset(dataset.clone(), &current)?;
+        Ok(DatasetRestoreReport {
+            schema_version: "2.7.28",
+            archive_segment_dir: archive_segment_dir.display().to_string(),
+            dataset_dir: current.display().to_string(),
+            event_count_before,
+            archive_event_count,
+            overlap_event_count: overlap_event_ids.len(),
+            overlap_event_ids,
+            event_count_after,
+            session_ids: dataset.session_ids.clone(),
+            events_sha256,
+        })
     }
 
     /// 2.7.23: exposed `pub` so RSS harnesses (see
@@ -2784,6 +2937,37 @@ impl CaptureManager {
         if decoded_spool_path.exists() {
             fs::remove_file(&decoded_spool_path).map_err(display_error)?;
         }
+        self.publish_events_to_dataset_dir(
+            capture_id,
+            dataset_id,
+            dataset_dir,
+            dataset_path,
+            prior_continuous,
+            reports,
+            checksums,
+        )
+    }
+
+    /// 2.7.28: "events on disk → sessions + callflows + manifest". The
+    /// tail of `process_capture_into` from 2.7.23/2.7.24/2.7.26, lifted
+    /// out so both the continuous import worker and `dataset-restore`
+    /// go through the exact same publication path. The caller must
+    /// have already written `dataset_dir/oiran_events.jsonl` (atomic
+    /// rename) before invoking this helper — the import worker does so
+    /// after merging decoded events against the prior dataset; the
+    /// restore flow does so after canonically dedup-merging the hot
+    /// view with an archive segment.
+    fn publish_events_to_dataset_dir(
+        &self,
+        capture_id: &str,
+        dataset_id: String,
+        dataset_dir: &Path,
+        dataset_path: String,
+        prior_continuous: Option<(PathBuf, LiveDataset)>,
+        mut reports: BTreeMap<String, DecodeReport>,
+        mut checksums: BTreeMap<String, String>,
+    ) -> Result<LiveDataset, String> {
+        let events_path = dataset_dir.join("oiran_events.jsonl");
         release_unused_heap_pages();
         trace_publication_rss("after-streaming-merge", None);
         // 2.7.24: stream the JSONL into an ids-only retention set plus
@@ -2795,7 +2979,19 @@ impl CaptureManager {
         let mut events = index.events;
         trace_publication_rss("after-streaming-index", Some(events.len()));
         let capture_job = self.get(capture_id);
-        let capture_started_epoch_ms = capture_job.as_ref().and_then(|job| job.started_epoch_ms);
+        // 2.7.28: when restore runs in a manager that never saw the
+        // continuous worker start, `capture_job` is None. Fall back to
+        // the prior manifest's `capture_started_epoch_ms` so the
+        // restored manifest is not stripped of its original capture
+        // start time.
+        let capture_started_epoch_ms = capture_job
+            .as_ref()
+            .and_then(|job| job.started_epoch_ms)
+            .or_else(|| {
+                prior_continuous
+                    .as_ref()
+                    .and_then(|(_, dataset)| dataset.capture_started_epoch_ms)
+            });
         let activity_started_epoch_ms = capture_job
             .as_ref()
             .filter(|job| {
@@ -4515,6 +4711,89 @@ fn archive_split_stream(
     Ok((archived, retained, archive_hash.finish_hex()))
 }
 
+/// 2.7.28: write the canonical union of two jsonl event streams to
+/// `out`. Dedup by `event_id` (first occurrence from `current` wins;
+/// archive duplicates are collected into the returned overlap list and
+/// skipped). Output is sorted by
+/// `(capture_id, packet_number, event_id)` — session-engine's
+/// `canonical_sort_key`, never by timestamp. Returns the overlap
+/// `event_id` list (sorted) and the streaming SHA-256 of the output
+/// bytes for the `DatasetRestoreReport`.
+fn canonical_dedup_merge(
+    current: &Path,
+    archive: &Path,
+    out: &Path,
+) -> Result<(Vec<String>, String), String> {
+    let mut records: Vec<(String, u64, String, String)> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut current_ids: BTreeSet<String> = BTreeSet::new();
+    let mut overlap: Vec<String> = Vec::new();
+    for (source, is_archive) in [(current, false), (archive, true)] {
+        let reader = BufReader::with_capacity(
+            STREAM_CHUNK_BYTES,
+            fs::File::open(source).map_err(display_error)?,
+        );
+        for line in reader.lines() {
+            let line = line.map_err(display_error)?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value =
+                serde_json::from_str(&line).map_err(|error| error.to_string())?;
+            let event_id = value
+                .get("event_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "RESTORE_MALFORMED: missing event_id in {}",
+                        source.display()
+                    )
+                })?
+                .to_string();
+            if !is_archive {
+                current_ids.insert(event_id.clone());
+            } else if current_ids.contains(&event_id) {
+                overlap.push(event_id.clone());
+            }
+            if !seen.insert(event_id.clone()) {
+                continue;
+            }
+            let capture_id = value
+                .get("capture_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let packet_number = value
+                .get("packet_references")
+                .and_then(Value::as_array)
+                .and_then(|refs| refs.first())
+                .and_then(|r| r.get("packet_number"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            records.push((capture_id, packet_number, event_id, line));
+        }
+    }
+    records.sort_by(|a, b| {
+        (a.0.as_str(), a.1, a.2.as_str()).cmp(&(b.0.as_str(), b.1, b.2.as_str()))
+    });
+    overlap.sort();
+    overlap.dedup();
+    let mut hasher = Sha256Hasher::new();
+    {
+        let file = fs::File::create(out).map_err(display_error)?;
+        let mut writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, file);
+        for (_, _, _, line) in &records {
+            writer.write_all(line.as_bytes()).map_err(display_error)?;
+            writer.write_all(b"\n").map_err(display_error)?;
+            hasher.update(line.as_bytes());
+            hasher.update(b"\n");
+        }
+        writer.flush().map_err(display_error)?;
+        writer.get_ref().sync_all().map_err(display_error)?;
+    }
+    Ok((overlap, hasher.finish_hex()))
+}
+
 
 fn expand_session_evidence_ids(ids: &mut BTreeSet<String>, edges: &[CorrelationEdge]) {
     loop {
@@ -4685,6 +4964,72 @@ fn release_unused_heap_pages() {
     unsafe {
         libc::malloc_trim(0);
     }
+}
+
+/// 2.7.28 (issue #10, ANR2 defect on 2.7.27): cross-process advisory
+/// publication lock. `process_continuous_capture` and
+/// `restore_from_archive_segment` both route their dataset-next → dataset
+/// swap through this lock so an `oiran-api` import worker and a
+/// `dataset-restore` invocation can never concurrently rewrite the hot
+/// view. The lock is a POSIX `flock(LOCK_EX)` on
+/// `<capture-root>/<continuous-capture-id>/.publication.lock`; it is
+/// released automatically on process exit, so a crash cannot leave a
+/// stale lock behind.
+struct PublicationLock {
+    _file: fs::File,
+}
+
+impl PublicationLock {
+    fn acquire_blocking(base: &Path) -> Result<Self, String> {
+        Self::acquire(base, libc::LOCK_EX)
+    }
+
+    fn try_acquire(base: &Path) -> Result<Self, String> {
+        Self::acquire(base, libc::LOCK_EX | libc::LOCK_NB)
+    }
+
+    fn acquire(base: &Path, mode: libc::c_int) -> Result<Self, String> {
+        fs::create_dir_all(base).map_err(|error| {
+            format!("PUBLICATION_LOCK_BASE_INIT {}: {error}", base.display())
+        })?;
+        let lock_path = base.join(".publication.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| {
+                format!("PUBLICATION_LOCK_OPEN {}: {error}", lock_path.display())
+            })?;
+        use std::os::unix::io::AsRawFd;
+        let result = unsafe { libc::flock(file.as_raw_fd(), mode) };
+        if result != 0 {
+            let err = std::io::Error::last_os_error();
+            if (mode & libc::LOCK_NB) != 0
+                && matches!(err.raw_os_error(), Some(libc::EWOULDBLOCK))
+            {
+                return Err("RESTORE_REQUIRES_PUBLICATION_LOCK".into());
+            }
+            return Err(format!("PUBLICATION_LOCK_FLOCK: {err}"));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+/// 2.7.28: structured report returned by `restore_from_archive_segment`.
+/// Serialized to JSON by the `dataset-restore` binary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetRestoreReport {
+    pub schema_version: &'static str,
+    pub archive_segment_dir: String,
+    pub dataset_dir: String,
+    pub event_count_before: usize,
+    pub archive_event_count: usize,
+    pub overlap_event_count: usize,
+    pub overlap_event_ids: Vec<String>,
+    pub event_count_after: usize,
+    pub session_ids: Vec<String>,
+    pub events_sha256: String,
 }
 
 fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) {
@@ -8766,6 +9111,255 @@ mod tests {
         let after_sha = sha256_hex(&fs::read(&events_path).unwrap());
         assert_eq!(before_sha, after_sha);
         assert!(!archive_root.exists() || fs::read_dir(&archive_root).unwrap().count() == 0);
+    }
+
+    // --- 2.7.28 restore regression tests ---------------------------
+
+    /// Full-event JSONL line (source_endpoint, destination_endpoint,
+    /// session_identifiers, decoding_status, …) needed by
+    /// `session_engine::load_jsonl` / `publish_events_to_dataset_dir`.
+    /// The archive-retention tests above use a minimal fixture because
+    /// archive code only reads `event_id`, `capture_id`, `timestamp`
+    /// and `packet_references[0].packet_number`.
+    fn restore_test_line(event_id: &str, capture_id: &str, packet: u64) -> String {
+        serde_json::json!({
+            "event_id": event_id,
+            "capture_id": capture_id,
+            "capture_point_id": "N2",
+            "timestamp": {
+                "seconds": packet,
+                "nanoseconds": 0,
+                "raw_ticks": packet as i128 * 1_000_000_000i128,
+                "display": "",
+            },
+            "interface": "N2",
+            "protocol": "NGAP",
+            "message_name": "InitialUEMessage",
+            "source_endpoint": {"address": "10.0.0.1", "network_function": "gNB"},
+            "destination_endpoint": {"address": "10.0.0.2", "network_function": "AMF"},
+            "direction": "RAN_TO_CORE",
+            "session_identifiers": [],
+            "information_elements": [],
+            "decoding_status": "DECODED",
+            "decoder_name": "test",
+            "decoder_version": "1",
+            "raw_payload_reference": "sha256:test",
+            "packet_references": [{
+                "source_file": "x",
+                "packet_number": packet,
+                "byte_offset": 0,
+                "interface_id": 0,
+                "captured_length": 1,
+                "original_length": 1,
+            }],
+            "errors": [],
+        })
+        .to_string()
+    }
+
+    fn make_restore_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let continuous = root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset = continuous.join("dataset");
+        let callflows = dataset.join("callflows");
+        let segment = continuous.join("archive/seg-001");
+        fs::create_dir_all(&callflows).unwrap();
+        fs::create_dir_all(&segment).unwrap();
+        (dataset, segment, continuous)
+    }
+
+    fn fresh_manager_for_restore(root: &Path) -> CaptureManager {
+        let key_path = root.join("pseudonym.key");
+        let helper = CaptureHelperClient::new(root.join("helper.sock"), 0);
+        CaptureManager::with_helper_and_interface_root(
+            root.to_path_buf(),
+            false,
+            helper,
+            PathBuf::from("/sys/class/net"),
+            key_path,
+        )
+        .unwrap()
+    }
+
+    /// 2.7.28 (ANR2 defect on 2.7.27): the restore path rebuilds the
+    /// manifest + session + callflow registry — `event_count` in
+    /// `dataset_manifest.json` matches the restored JSONL exactly,
+    /// which is the precondition `validate_dataset_artifacts` /
+    /// `recover_continuous_dataset_from_disk` enforce at next
+    /// startup. Before 2.7.28 the restore wrote only
+    /// `oiran_events.jsonl` and the stale manifest caused
+    /// `DATASET_REGISTRATION_EVENT_COUNT_MISMATCH` →
+    /// `CONTINUOUS_DATASET_RECOVER_SKIPPED artifact-drift`.
+    #[test]
+    fn restore_rebuilds_a_manifest_coherent_with_the_restored_events() {
+        let base = temporary_root("restore-manifest-coherent");
+        let (dataset, segment, _) = make_restore_fixture(&base);
+        write_jsonl(
+            &dataset.join("oiran_events.jsonl"),
+            &[restore_test_line("evt-fresh-1", "sha256:fresh", 100)],
+        );
+        write_jsonl(
+            &segment.join("events.jsonl"),
+            &[
+                restore_test_line("evt-stale-1", "sha256:stale", 10),
+                restore_test_line("evt-stale-2", "sha256:stale", 11),
+            ],
+        );
+        let archive_sha = sha256_hex(&fs::read(&segment.join("events.jsonl")).unwrap());
+        fs::write(
+            segment.join("manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "events_sha256": archive_sha,
+                "event_count": 2,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let manager = fresh_manager_for_restore(&base);
+        let report = manager.restore_from_archive_segment(&segment).unwrap();
+        assert_eq!(report.event_count_before, 1);
+        assert_eq!(report.archive_event_count, 2);
+        assert_eq!(report.overlap_event_count, 0);
+        assert_eq!(report.event_count_after, 3);
+        let manifest: LiveDataset = serde_json::from_slice(
+            &fs::read(dataset.join("dataset_manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let on_disk_count =
+            count_valid_event_records(&dataset.join("oiran_events.jsonl")).unwrap();
+        assert_eq!(
+            on_disk_count, manifest.event_count,
+            "manifest event_count must match the on-disk JSONL"
+        );
+        assert!(
+            dataset.join("callflows").is_dir(),
+            "callflows directory must exist after restore"
+        );
+    }
+
+    /// 2.7.28: `restore_from_archive_segment` acquires the same
+    /// `flock` the continuous worker uses. When a writer holds the
+    /// lock the restore fails fast with
+    /// `RESTORE_REQUIRES_PUBLICATION_LOCK` instead of racing a
+    /// concurrent publish.
+    #[test]
+    fn restore_refuses_when_the_publication_lock_is_held() {
+        let base = temporary_root("restore-publication-lock");
+        let (dataset, segment, continuous) = make_restore_fixture(&base);
+        write_jsonl(
+            &dataset.join("oiran_events.jsonl"),
+            &[restore_test_line("evt-fresh-1", "sha256:fresh", 1)],
+        );
+        write_jsonl(
+            &segment.join("events.jsonl"),
+            &[restore_test_line("evt-stale-1", "sha256:stale", 2)],
+        );
+        let archive_sha = sha256_hex(&fs::read(&segment.join("events.jsonl")).unwrap());
+        fs::write(
+            segment.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({"events_sha256": archive_sha}))
+                .unwrap(),
+        )
+        .unwrap();
+        let manager = fresh_manager_for_restore(&base);
+        let _held = PublicationLock::acquire_blocking(&continuous).unwrap();
+        let error = manager
+            .restore_from_archive_segment(&segment)
+            .expect_err("lock contention must fail fast");
+        assert_eq!(error, "RESTORE_REQUIRES_PUBLICATION_LOCK");
+    }
+
+    /// 2.7.28: `event_id`s that appear in BOTH the current hot view
+    /// and the archive segment are reported in the restore report's
+    /// `overlap_event_ids` so the operator can account for the
+    /// `before + archive - overlap = after` identity ANR2 verified in
+    /// the 2.7.27 field test.
+    #[test]
+    fn restore_reports_overlap_event_ids_between_hot_view_and_archive() {
+        let base = temporary_root("restore-overlap");
+        let (dataset, segment, _) = make_restore_fixture(&base);
+        write_jsonl(
+            &dataset.join("oiran_events.jsonl"),
+            &[
+                restore_test_line("evt-a", "sha256:cap", 1),
+                restore_test_line("evt-b", "sha256:cap", 2),
+            ],
+        );
+        write_jsonl(
+            &segment.join("events.jsonl"),
+            &[
+                restore_test_line("evt-b", "sha256:cap", 2), // overlap
+                restore_test_line("evt-c", "sha256:cap", 3),
+            ],
+        );
+        let archive_sha = sha256_hex(&fs::read(&segment.join("events.jsonl")).unwrap());
+        fs::write(
+            segment.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({"events_sha256": archive_sha}))
+                .unwrap(),
+        )
+        .unwrap();
+        let manager = fresh_manager_for_restore(&base);
+        let report = manager.restore_from_archive_segment(&segment).unwrap();
+        assert_eq!(report.overlap_event_count, 1);
+        assert_eq!(report.overlap_event_ids, vec!["evt-b".to_string()]);
+        assert_eq!(report.event_count_before, 2);
+        assert_eq!(report.archive_event_count, 2);
+        assert_eq!(
+            report.event_count_after,
+            report.event_count_before + report.archive_event_count - report.overlap_event_count,
+            "before + archive - overlap = after"
+        );
+    }
+
+    /// 2.7.28: once the restore has swapped `.dataset-next` in, the
+    /// NEXT continuous publication (simulated here by calling
+    /// `process_capture_into` with an empty pcap tree and no new
+    /// interfaces) re-reads the restored events as its `prior_continuous`
+    /// checkpoint and the registration validates — the ANR2 symptom
+    /// (`DATASET_REGISTRATION_EVENT_COUNT_MISMATCH` on the next
+    /// publish) must not reappear.
+    #[test]
+    fn restore_followed_by_an_empty_publish_leaves_registration_valid() {
+        let base = temporary_root("restore-then-publish");
+        let (dataset, segment, continuous) = make_restore_fixture(&base);
+        write_jsonl(
+            &dataset.join("oiran_events.jsonl"),
+            &[restore_test_line("evt-fresh-1", "sha256:fresh", 100)],
+        );
+        write_jsonl(
+            &segment.join("events.jsonl"),
+            &[restore_test_line("evt-stale-1", "sha256:stale", 10)],
+        );
+        let archive_sha = sha256_hex(&fs::read(&segment.join("events.jsonl")).unwrap());
+        fs::write(
+            segment.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({"events_sha256": archive_sha}))
+                .unwrap(),
+        )
+        .unwrap();
+        let manager = fresh_manager_for_restore(&base);
+        manager.restore_from_archive_segment(&segment).unwrap();
+        // Simulate the next publish: empty pcap dir, no interfaces.
+        // process_capture_into reads the restored manifest as its
+        // `prior_continuous` checkpoint via `validate_dataset_artifacts`.
+        let pcap_dir = continuous.join("pcap");
+        fs::create_dir_all(&pcap_dir).unwrap();
+        let next = continuous.join(".dataset-next");
+        let _ = fs::remove_dir_all(&next);
+        let published = manager
+            .process_capture_into(
+                CONTINUOUS_CAPTURE_ID,
+                CONTINUOUS_DATASET_ID.into(),
+                &pcap_dir,
+                &next,
+                format!("runtime/live-captures/{CONTINUOUS_CAPTURE_ID}/dataset"),
+                &[],
+            )
+            .expect("next publish after restore must succeed");
+        assert_eq!(
+            published.event_count, 2,
+            "next publish carries the restored events through as its checkpoint"
+        );
     }
 
     /// 2.7.27: the capture-level age is computed per capture_id, not
