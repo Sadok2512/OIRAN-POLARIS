@@ -1,5 +1,95 @@
 # Changelog
 
+## OIRAN API 2.7.27 — 2026-11-06 — archive-based retention + `dataset-restore`
+
+- ANR2 defect (issue #10): the 7-day retention was *deleting*
+  events from the published JSONL. The old code path:
+  `retention_cutoff_epoch_s()` (`OIRAN/live-probe/src/lib.rs:4275-4290`
+  in 2.7.26), per-event `oldest_kept_ts` purge inside
+  `merge_event_stream` (`:4529-4543`), atomic rename
+  (`:2804`) and session rediscovery (`:2813-2843`) worked
+  together to drop 2 717 `event_id`s and 7 sessions on an operator
+  dataset older than the rolling window. The published hot view is
+  **evidence**: it must never be filtered or shortened by any
+  background sweep.
+- 2.7.27 rule: **retention never erases**. Aged captures are moved
+  to an immutable archive segment BEFORE being removed from the
+  hot view, and every `event_id` is accounted for. Default is
+  **disabled** — operators opt in explicitly.
+- Changes in `OIRAN/live-probe/src/lib.rs`:
+  * `retention_days()` now returns `Option<u64>` (default `None`).
+    `OIRAN_DATASET_RETENTION_DAYS` unset or `0` disables retention
+    entirely. Any opted-in value is clamped to `[1, 3650]` days.
+  * `merge_event_stream(reader, writer, seen_ids)` is pure dedup
+    by `event_id` — the per-event timestamp purge is gone. The
+    two call sites in `CaptureManager::process_capture_into`
+    no longer pass a cutoff. The hot view is a strict union with
+    dedup, never a truncation.
+  * New `scan_capture_ends(events_path) -> BTreeMap<capture_id, max_ts>`
+    streams `oiran_events.jsonl` once and records, per capture,
+    the **maximum** `timestamp.seconds` observed. Age is measured
+    at the end of the capture, never per-event; a capture is never
+    sliced in half.
+  * New `archive_stale_captures(events_path, archive_root, cutoff)`
+    runs only on the continuous capture, only when retention is
+    opted in. Sequence (fail-closed):
+      1. compute capture ends and the set of stale capture_ids
+         (`max_ts < cutoff`);
+      2. single streaming pass `archive_split_stream` writes
+         stale events into `archive/<segment_id>/events.jsonl`
+         and fresh events into `oiran_events.jsonl.hot-tmp`;
+      3. `fsync` both tmp files; write
+         `archive/<segment_id>/manifest.json` (archive_id,
+         created_epoch_s, cutoff_epoch_s, retention_days,
+         captures, event_count, `events_sha256`,
+         schema_version `"2.7.27"`);
+      4. only then rename `hot-tmp` → `oiran_events.jsonl`.
+    Any failure at any step leaves the hot view untouched and
+    emits `CONTINUOUS_ARCHIVE_FAILED {reason}`. Success emits
+    `CONTINUOUS_CAPTURE_ARCHIVE {segment_id, archived_event_ids,
+    archived_capture_ids, events_sha256}`.
+- New binary `OIRAN/live-probe/src/bin/dataset-restore.rs`:
+      dataset-restore <dataset-dir> <archive-segment-dir> [--dry-run]
+  Validates `manifest.events_sha256` against the on-disk
+  `events.jsonl` (`DATASET_RESTORE_ARCHIVE_TAMPERED` on mismatch),
+  then streams both the archive segment and the current hot view
+  through a `BTreeSet<event_id>` dedup (first occurrence wins) and
+  sorts canonically by `(capture_id, packet_number, event_id)` —
+  the same `canonical_sort_key` as session-engine
+  (`OIRAN/session-engine/src/lib.rs:943`), never by timestamp.
+  Output is written to `oiran_events.jsonl.restore-tmp`, hashed on
+  the fly with `event_schema::Sha256Hasher`, fsynced, then renamed
+  atomically. **Session rediscovery happens on the next continuous
+  publication cycle** — this binary does not regenerate callflows
+  itself; it rebuilds the evidence, and `load_path_streaming_index`
+  rebuilds sessions + callflows without reloading history into RAM.
+  Idempotent: a second run on the same inputs produces a
+  byte-identical `oiran_events.jsonl` (same SHA-256).
+- Regression tests (new):
+  * `live_probe::tests::archive_moves_stale_captures_without_losing_any_event_id`
+    — two captures (stale end=1 000, fresh end=9 000), cutoff
+    5 000; after archive: hot keeps every fresh event_id, archive
+    holds every stale event_id, `hot ∪ archive == original set`,
+    `manifest.events_sha256 == sha256(events.jsonl)`.
+  * `live_probe::tests::archive_write_failure_leaves_hot_view_untouched`
+    — archive root `chmod 0o500`; the archive write fails; the
+    on-disk `oiran_events.jsonl` SHA-256 is identical before and
+    after (fail-closed).
+  * `live_probe::tests::archive_is_a_no_op_when_every_capture_is_fresh`
+    — no capture ages past the cutoff → no archive segment, hot
+    view SHA-256 unchanged.
+  * `live_probe::tests::capture_level_age_never_slices_inside_a_capture`
+    — a single capture mixing old and fresh events, `max_ts`
+    fresh; capture-level age keeps the whole capture rather than
+    slicing the stale events out.
+  * `live_probe` integration test
+    (`OIRAN/live-probe/tests/dataset_restore.rs`,
+    `dataset_restore_reinjects_archived_events_idempotently`): 3
+    fresh + 2 717 archived events; two runs of the release binary
+    produce byte-identical SHA-256; output ordered by
+    `(capture_id, packet_number, event_id)`; all 2 720 `event_id`s
+    present.
+
 ## OIRAN API 2.7.26 — 2026-11-05 — dedup overlapping correlation rules by canonical pair
 
 - ANR2 production rollback: each N4↔N3 pair was published twice —

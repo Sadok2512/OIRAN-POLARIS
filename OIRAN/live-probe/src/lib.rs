@@ -2596,12 +2596,14 @@ impl CaptureManager {
             // treats this as non-retryable (see the handler in
             // `run_continuous_import_inner`): one attempt, then
             // `Blocked`, no retry loop.
+            let retention_label = retention_days()
+                .map(|days| days.to_string())
+                .unwrap_or_else(|| "disabled".to_string());
             return Err(format!(
                 "CONTINUOUS_DERIVED_OUTPUT_LIMIT: derived output {next_bytes} B exceeds \
                  OIRAN_CONTINUOUS_DERIVED_OUTPUT_MAX_BYTES={derived_limit} B after \
-                 age-based retention (OIRAN_DATASET_RETENTION_DAYS={retention_days} days); \
+                 age-based retention (OIRAN_DATASET_RETENTION_DAYS={retention_label}); \
                  shorten the retention window or raise the limit",
-                retention_days = retention_days(),
             ));
         }
         if previous.exists() {
@@ -2736,74 +2738,48 @@ impl CaptureManager {
         decoded_spool.get_ref().sync_all().map_err(display_error)?;
         drop(decoded_spool);
         if capture_id == CONTINUOUS_CAPTURE_ID {
-            // 2.7.23 (issue #10 comment 6659…): streaming merge. We write
-            // the final `oiran_events.jsonl.tmp` line by line directly —
-            // no `.normalized-events.spool` roundtrip, no
-            // `BTreeMap<String, EventSpoolLocation>` of offsets. The
-            // only in-memory structure is a `BTreeSet<String>` of
-            // event_ids already written (dedup), and a `u64` purge
-            // counter.
-            //
-            // Prior events are streamed first so a re-decoded packet
-            // with the same deterministic event_id is a no-op (first
-            // write wins — content is deterministic, so this is
-            // observation-identical to the 2.7.22 "last write wins"
-            // behaviour). Retention and dedup run inline as each line
-            // is read, so the peak memory contribution from the merge
-            // scales only with the set of surviving event_ids.
+            // 2.7.23: streaming merge, write directly to tmp.
+            // 2.7.27: NO retention / purge during merge. Every event
+            // passes through — the published dataset is never
+            // filtered. Capture-level archive (which NEVER deletes)
+            // runs after the rename below.
             let tmp_path = events_path.with_extension("jsonl.tmp");
             let mut writer = BufWriter::with_capacity(
                 STREAM_CHUNK_BYTES,
                 fs::File::create(&tmp_path).map_err(display_error)?,
             );
             let mut seen_ids: BTreeSet<String> = BTreeSet::new();
-            let cutoff = retention_cutoff_epoch_s();
-            let mut purged: u64 = 0;
-            let mut oldest_kept: Option<u64> = None;
             if let Some((prior_dir, _)) = &prior_continuous {
                 let prior_events_file = fs::File::open(prior_dir.join("oiran_events.jsonl"))
                     .map_err(display_error)?;
                 let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, prior_events_file);
-                merge_event_stream(
-                    reader,
-                    &mut writer,
-                    &mut seen_ids,
-                    cutoff,
-                    &mut purged,
-                    &mut oldest_kept,
-                )?;
+                merge_event_stream(reader, &mut writer, &mut seen_ids)?;
             }
             let decoded_reader = BufReader::with_capacity(
                 STREAM_CHUNK_BYTES,
                 fs::File::open(&decoded_spool_path).map_err(display_error)?,
             );
-            merge_event_stream(
-                decoded_reader,
-                &mut writer,
-                &mut seen_ids,
-                cutoff,
-                &mut purged,
-                &mut oldest_kept,
-            )?;
+            merge_event_stream(decoded_reader, &mut writer, &mut seen_ids)?;
             writer.flush().map_err(display_error)?;
             writer.get_ref().sync_all().map_err(display_error)?;
             drop(writer);
-            if purged > 0 {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "CONTINUOUS_RETENTION_PURGE",
-                        "cutoff_epoch_s": cutoff,
-                        "retention_days": retention_days(),
-                        "purged_count": purged,
-                        "retained_count": seen_ids.len(),
-                        "oldest_kept_epoch_s": oldest_kept,
-                    })
-                );
-            }
             fs::rename(&tmp_path, &events_path).map_err(display_error)?;
         } else {
             fs::rename(&decoded_spool_path, &events_path).map_err(display_error)?;
+        }
+        // 2.7.27 (issue #10, ANR2): capture-level age retention. Runs
+        // ONLY when `OIRAN_DATASET_RETENTION_DAYS` is explicitly set to
+        // a positive value. Moves whole captures (never slices inside)
+        // to an immutable archive segment; on any archive-write error
+        // the hot view is left untouched (fail-closed).
+        if capture_id == CONTINUOUS_CAPTURE_ID {
+            if let Some(cutoff) = retention_cutoff_epoch_s() {
+                let archive_root = dataset_dir
+                    .parent()
+                    .map(|p| p.join("archive"))
+                    .unwrap_or_else(|| dataset_dir.join("archive"));
+                archive_stale_captures(&events_path, &archive_root, cutoff)?;
+            }
         }
         if decoded_spool_path.exists() {
             fs::remove_file(&decoded_spool_path).map_err(display_error)?;
@@ -4272,23 +4248,273 @@ fn native_owned_usage(root: &Path) -> Result<(u64, usize), String> {
     ))
 }
 
-/// 2.7.22: retention window in days, read once per publish from
-/// `OIRAN_DATASET_RETENTION_DAYS` (default 30, clamped 1..=3650).
-fn retention_days() -> u64 {
-    std::env::var("OIRAN_DATASET_RETENTION_DAYS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|value| value.clamp(1, 3650))
-        .unwrap_or(30)
+/// 2.7.27 (issue #10, ANR2 production rollback): retention is
+/// DISABLED by default. The 2.7.22 policy of a 30-day in-merge purge
+/// was a silent-delete on the published dataset — ANR2 observed
+/// 2 717 event_id and 7 sessions lost on a 7-day setting because the
+/// per-event cutoff cut *inside* a capture. The published dataset is
+/// NEVER filtered in 2.7.27: retention is now a capture-level
+/// age-check that MOVES whole captures to an immutable archive
+/// (never deletes); see `plan_capture_retention` and
+/// `archive_stale_captures` below.
+///
+/// Semantics of `OIRAN_DATASET_RETENTION_DAYS`:
+///   unset | 0  → retention disabled (nothing is archived)
+///   > 0        → window in days, clamped 1..=3650
+fn retention_days() -> Option<u64> {
+    let value = std::env::var("OIRAN_DATASET_RETENTION_DAYS").ok()?;
+    let days = value.parse::<u64>().ok()?;
+    if days == 0 {
+        return None;
+    }
+    Some(days.clamp(1, 3650))
 }
 
-fn retention_cutoff_epoch_s() -> u64 {
+fn retention_cutoff_epoch_s() -> Option<u64> {
+    let days = retention_days()?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs())
         .unwrap_or(0);
-    now.saturating_sub(retention_days().saturating_mul(86_400))
+    Some(now.saturating_sub(days.saturating_mul(86_400)))
 }
+
+/// 2.7.27: scan `events_path` and compute, for every `capture_id`,
+/// the maximum `timestamp.seconds` across all events of that
+/// capture. "Capture end" = max over its events. Never compared
+/// per-event: the age decision is made per capture.
+fn scan_capture_ends(events_path: &Path) -> Result<BTreeMap<String, u64>, String> {
+    let file = fs::File::open(events_path).map_err(display_error)?;
+    let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
+    let mut capture_end: BTreeMap<String, u64> = BTreeMap::new();
+    let mut processed = 0usize;
+    for line in reader.lines() {
+        let line = line.map_err(display_error)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        processed = processed.saturating_add(1);
+        let value: serde_json::Value =
+            serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        let Some(cid) = value.get("capture_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let ts = value
+            .get("timestamp")
+            .and_then(|ts| ts.get("seconds"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let entry = capture_end.entry(cid.to_owned()).or_insert(0);
+        if ts > *entry {
+            *entry = ts;
+        }
+        if processed % 1024 == 0 {
+            release_unused_heap_pages();
+        }
+    }
+    Ok(capture_end)
+}
+
+/// 2.7.27 (issue #10, ANR2 production rollback): capture-level
+/// age-based archive. The published `oiran_events.jsonl` is NEVER
+/// filtered mid-capture. A capture is archived only when its
+/// `capture_end` (= max event timestamp inside that capture) is
+/// older than `cutoff`. All events of a stale capture move to an
+/// immutable archive segment (`<archive_root>/<timestamp>-<sha16>/`)
+/// containing `events.jsonl` and `manifest.json` (SHA-256 of
+/// events.jsonl + the list of captures + the event count). If any
+/// archive-write step fails, the hot view (`oiran_events.jsonl`)
+/// is left **untouched** — fail-closed. One `CONTINUOUS_CAPTURE_ARCHIVE`
+/// stderr line records every archive commit, with the same shape
+/// `evidence_type / archive_id / capture_count / event_count` the
+/// `dataset-restore` binary reads.
+///
+/// Memory is bounded by `BTreeMap<String, u64>` of capture_id →
+/// end-timestamp (≈ 100 B per capture; a 10 000-capture dataset
+/// fits in ≤ 1 MiB) plus the streaming reader/writer buffers.
+fn archive_stale_captures(
+    events_path: &Path,
+    archive_root: &Path,
+    cutoff: u64,
+) -> Result<(), String> {
+    if !events_path.is_file() {
+        return Ok(());
+    }
+    let capture_end = scan_capture_ends(events_path)?;
+    let stale: BTreeSet<String> = capture_end
+        .iter()
+        .filter_map(|(cid, end)| (*end != 0 && *end < cutoff).then(|| cid.clone()))
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    // Build archive id = yyyymmddTHHMMSSZ + short sha of the sorted
+    // capture_id list. Deterministic for the same stale set.
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let capture_list_bytes = stale.iter().cloned().collect::<Vec<_>>().join("\n");
+    let capture_list_sha = sha256_hex(capture_list_bytes.as_bytes());
+    let archive_id = format!("{now_s}-{}", &capture_list_sha[..16]);
+    let segment_dir = archive_root.join(&archive_id);
+    let segment_events = segment_dir.join("events.jsonl");
+    let segment_manifest = segment_dir.join("manifest.json");
+    let hot_tmp = events_path.with_extension("jsonl.hot-tmp");
+    // Create archive dir. Any IO failure here means "fail-closed":
+    // the hot view is untouched by construction (we haven't written
+    // anything yet).
+    fs::create_dir_all(&segment_dir)
+        .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: mkdir: {error}"))?;
+    // Stream events.jsonl once, splitting into archive vs. hot. The
+    // archive file is finalised FIRST (fsync + manifest) before the
+    // hot file replaces the published jsonl — if anything fails
+    // above the rename step, we wipe the half-written archive and
+    // the hot tmp, and the published jsonl stays byte-identical to
+    // what it was on entry.
+    let outcome = archive_split_stream(events_path, &segment_events, &hot_tmp, &stale);
+    let (archived_count, retained_count, archive_sha256) = match outcome {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = fs::remove_file(&segment_events);
+            let _ = fs::remove_file(&hot_tmp);
+            let _ = fs::remove_dir(&segment_dir);
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "CONTINUOUS_ARCHIVE_FAILED",
+                    "reason": error,
+                    "archive_id": archive_id,
+                    "cutoff_epoch_s": cutoff,
+                })
+            );
+            return Err(error);
+        }
+    };
+    // Write the manifest. If this fails, roll back the archive and
+    // keep the hot view untouched.
+    let manifest = serde_json::json!({
+        "archive_id": archive_id,
+        "created_epoch_s": now_s,
+        "cutoff_epoch_s": cutoff,
+        "retention_days": retention_days(),
+        "captures": stale.iter().collect::<Vec<_>>(),
+        "event_count": archived_count,
+        "events_sha256": archive_sha256,
+        "schema_version": "2.7.27",
+    });
+    if let Err(error) = fs::write(
+        &segment_manifest,
+        serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?,
+    ) {
+        let _ = fs::remove_file(&segment_events);
+        let _ = fs::remove_file(&hot_tmp);
+        let _ = fs::remove_dir(&segment_dir);
+        let error = format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: manifest: {error}");
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "CONTINUOUS_ARCHIVE_FAILED",
+                "reason": error,
+                "archive_id": archive_id,
+                "cutoff_epoch_s": cutoff,
+            })
+        );
+        return Err(error);
+    }
+    // Commit the hot view only AFTER the archive segment + manifest
+    // are durable.
+    fs::rename(&hot_tmp, events_path)
+        .map_err(|error| format!("CONTINUOUS_ARCHIVE_COMMIT_FAILED: {error}"))?;
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "event": "CONTINUOUS_CAPTURE_ARCHIVE",
+            "archive_id": archive_id,
+            "cutoff_epoch_s": cutoff,
+            "retention_days": retention_days(),
+            "capture_count": stale.len(),
+            "event_count_archived": archived_count,
+            "event_count_retained": retained_count,
+            "archive_path": segment_dir.display().to_string(),
+            "archive_sha256": archive_sha256,
+        })
+    );
+    Ok(())
+}
+
+fn archive_split_stream(
+    events_path: &Path,
+    segment_events: &Path,
+    hot_tmp: &Path,
+    stale: &BTreeSet<String>,
+) -> Result<(u64, u64, String), String> {
+    let hot_file = fs::File::create(hot_tmp)
+        .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: hot: {error}"))?;
+    let mut hot_writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, hot_file);
+    let archive_file = fs::File::create(segment_events)
+        .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: segment: {error}"))?;
+    let mut archive_writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, archive_file);
+    let mut archive_hash = Sha256Hasher::new();
+    let reader = BufReader::with_capacity(
+        STREAM_CHUNK_BYTES,
+        fs::File::open(events_path).map_err(display_error)?,
+    );
+    let mut archived = 0u64;
+    let mut retained = 0u64;
+    let mut processed = 0usize;
+    for line in reader.lines() {
+        let line = line.map_err(display_error)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        processed = processed.saturating_add(1);
+        let value: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| format!("CONTINUOUS_ARCHIVE_PARSE_FAILED: {error}"))?;
+        let cid = value
+            .get("capture_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if stale.contains(cid) {
+            archive_writer
+                .write_all(line.as_bytes())
+                .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: body: {error}"))?;
+            archive_writer
+                .write_all(b"\n")
+                .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: newline: {error}"))?;
+            archive_hash.update(line.as_bytes());
+            archive_hash.update(b"\n");
+            archived = archived.saturating_add(1);
+        } else {
+            hot_writer
+                .write_all(line.as_bytes())
+                .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: hot body: {error}"))?;
+            hot_writer
+                .write_all(b"\n")
+                .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: hot nl: {error}"))?;
+            retained = retained.saturating_add(1);
+        }
+        if processed % 1024 == 0 {
+            release_unused_heap_pages();
+        }
+    }
+    hot_writer
+        .flush()
+        .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: hot flush: {error}"))?;
+    hot_writer
+        .get_ref()
+        .sync_all()
+        .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: hot sync: {error}"))?;
+    archive_writer
+        .flush()
+        .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: segment flush: {error}"))?;
+    archive_writer
+        .get_ref()
+        .sync_all()
+        .map_err(|error| format!("CONTINUOUS_ARCHIVE_WRITE_FAILED: segment sync: {error}"))?;
+    Ok((archived, retained, archive_hash.finish_hex()))
+}
+
 
 fn expand_session_evidence_ids(ids: &mut BTreeSet<String>, edges: &[CorrelationEdge]) {
     loop {
@@ -4482,32 +4708,31 @@ fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) {
     );
 }
 
-/// 2.7.23: streaming merge of one input source into the final
-/// `oiran_events.jsonl.tmp`. Peak memory held by this function is
-/// `BTreeSet<String>` of already-written event_ids (≈ 24 B per id) +
-/// one `serde_json::Value` + one `String` line. No per-event body is
-/// retained, no second-pass seek is required — a 100 000-event merge
-/// fits comfortably below the 512 MiB cgroup ceiling, and well below
-/// the 128 MiB target.
+/// 2.7.23 + 2.7.27: streaming merge of one input source into the
+/// final `oiran_events.jsonl.tmp`. Peak memory held by this function
+/// is `BTreeSet<String>` of already-written event_ids (≈ 24 B per id)
+/// + one `serde_json::Value` + one `String` line. No per-event body
+/// is retained, no second-pass seek is required.
 ///
-/// Retention is applied inline: if `value.timestamp.seconds` is older
-/// than `cutoff_epoch_s` and non-zero, the line is dropped and the
-/// purge counter is incremented. `oldest_kept` records the minimum
-/// kept timestamp so the operator can see how close the dataset is to
-/// its retention edge in the `CONTINUOUS_RETENTION_PURGE` log.
+/// 2.7.27: NO retention / purge is applied here anymore. The 2.7.22
+/// per-event cutoff deleted events whose `timestamp.seconds` was
+/// older than the window — ANR2 observed 2 717 event_id and 7
+/// sessions lost on a 7-day setting because the cut sliced *inside*
+/// a capture. Retention is now a capture-level archive step
+/// (`plan_capture_retention` + `archive_stale_captures`) applied
+/// AFTER the merge, and MOVES whole captures to an immutable archive
+/// — it never deletes.
 ///
 /// Dedup is first-write-wins: `continuous_observation_id` is
-/// deterministic, so a re-decode of the same packet produces the same
-/// id and is silently skipped on the second write. For prior + decoded
-/// streams processed in that order, the prior copy stays authoritative;
-/// the content is identical by construction so no information is lost.
+/// deterministic, so a re-decode of the same packet produces the
+/// same id and is silently skipped on the second write. For prior +
+/// decoded streams processed in that order, the prior copy stays
+/// authoritative; the content is identical by construction so no
+/// information is lost.
 fn merge_event_stream<R, W>(
     mut reader: R,
     writer: &mut W,
     seen_ids: &mut BTreeSet<String>,
-    cutoff: u64,
-    purged: &mut u64,
-    oldest_kept: &mut Option<u64>,
 ) -> Result<(), String>
 where
     R: BufRead,
@@ -4526,22 +4751,6 @@ where
         processed = processed.saturating_add(1);
         let mut value: serde_json::Value =
             serde_json::from_str(&line).map_err(|error| error.to_string())?;
-        let timestamp_s = value
-            .get("timestamp")
-            .and_then(|ts| ts.get("seconds"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        // Retention: timestamp_s == 0 means "no parseable timestamp" →
-        // keep (never silently drop); timestamp_s < cutoff and
-        // non-zero → purge.
-        if timestamp_s != 0 && timestamp_s < cutoff {
-            *purged = purged.saturating_add(1);
-            drop(value);
-            if processed % 1024 == 0 {
-                release_unused_heap_pages();
-            }
-            continue;
-        }
         let id = continuous_observation_id(&value)?;
         if !seen_ids.insert(id.clone()) {
             // Duplicate (same deterministic observation id) → first
@@ -4551,12 +4760,6 @@ where
                 release_unused_heap_pages();
             }
             continue;
-        }
-        if timestamp_s != 0 {
-            *oldest_kept = Some(match *oldest_kept {
-                None => timestamp_s,
-                Some(current) => current.min(timestamp_s),
-            });
         }
         value["event_id"] = serde_json::Value::String(id);
         let serialized = serde_json::to_string(&value).map_err(|error| error.to_string())?;
@@ -8412,5 +8615,184 @@ mod tests {
         // rotation observed, but mtime is well past the writer's cadence.
         let kept = finalized_candidates_only(vec![old_enough.clone()], now, stable_age);
         assert_eq!(kept, vec![old_enough]);
+    }
+
+    // --- 2.7.27 archive-based retention regression tests -----------
+
+    /// Writes a jsonl line matching the fields `scan_capture_ends` /
+    /// `archive_split_stream` look at. Minimal — no decoder fields.
+    fn archive_test_line(
+        event_id: &str,
+        capture_id: &str,
+        ts_seconds: u64,
+        packet_number: u64,
+    ) -> String {
+        serde_json::json!({
+            "event_id": event_id,
+            "capture_id": capture_id,
+            "timestamp": {"seconds": ts_seconds, "nanoseconds": 0, "raw_ticks": ts_seconds * 1_000_000_000, "display": ""},
+            "packet_references": [{"source_file": "x", "packet_number": packet_number, "byte_offset": 0, "interface_id": 0, "captured_length": 1, "original_length": 1}],
+        })
+        .to_string()
+    }
+
+    fn write_jsonl(path: &Path, lines: &[String]) {
+        let mut writer = BufWriter::new(fs::File::create(path).unwrap());
+        for line in lines {
+            writer.write_all(line.as_bytes()).unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+        writer.flush().unwrap();
+    }
+
+    fn read_event_ids(path: &Path) -> BTreeSet<String> {
+        BufReader::new(fs::File::open(path).unwrap())
+            .lines()
+            .filter_map(Result::ok)
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                v["event_id"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    /// 2.7.27: a capture whose end_ts < cutoff is moved to an archive
+    /// segment. The hot view loses those events; the archive keeps
+    /// them. Union = original set, so **no event_id is lost**.
+    #[test]
+    fn archive_moves_stale_captures_without_losing_any_event_id() {
+        let base = temporary_root("archive-retention");
+        let dataset_dir = base.join("dataset");
+        fs::create_dir_all(&dataset_dir).unwrap();
+        let events_path = dataset_dir.join("oiran_events.jsonl");
+        // Two captures: STALE ends at ts=1000, FRESH ends at ts=9000.
+        // Cutoff = 5000 → STALE is archived, FRESH stays.
+        write_jsonl(
+            &events_path,
+            &[
+                archive_test_line("evt-stale-1", "sha256:stale", 900, 1),
+                archive_test_line("evt-stale-2", "sha256:stale", 1000, 2),
+                archive_test_line("evt-fresh-1", "sha256:fresh", 8000, 3),
+                archive_test_line("evt-fresh-2", "sha256:fresh", 9000, 4),
+            ],
+        );
+        let before_total = read_event_ids(&events_path);
+        assert_eq!(before_total.len(), 4);
+        let archive_root = base.join("archive");
+        archive_stale_captures(&events_path, &archive_root, 5000).unwrap();
+        let after_hot = read_event_ids(&events_path);
+        assert_eq!(after_hot.len(), 2);
+        assert!(after_hot.contains("evt-fresh-1"));
+        assert!(after_hot.contains("evt-fresh-2"));
+        // Find the archive segment.
+        let segment_dir = fs::read_dir(&archive_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_dir())
+            .expect("archive segment created");
+        let archived = read_event_ids(&segment_dir.join("events.jsonl"));
+        assert_eq!(archived.len(), 2);
+        assert!(archived.contains("evt-stale-1"));
+        assert!(archived.contains("evt-stale-2"));
+        // Hot ∪ archived MUST equal the input set — zero event_id is lost.
+        let union: BTreeSet<_> = after_hot.union(&archived).cloned().collect();
+        assert_eq!(union, before_total, "no event_id lost by archive");
+        // Manifest sha256 MUST match the archived events.jsonl contents.
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(segment_dir.join("manifest.json")).unwrap()).unwrap();
+        let actual_sha = sha256_hex(&fs::read(segment_dir.join("events.jsonl")).unwrap());
+        assert_eq!(manifest["events_sha256"].as_str().unwrap(), actual_sha);
+        assert_eq!(manifest["event_count"].as_u64().unwrap(), 2);
+        assert_eq!(
+            manifest["captures"].as_array().unwrap(),
+            &vec![serde_json::json!("sha256:stale")]
+        );
+    }
+
+    /// 2.7.27: when the archive write fails (e.g. the archive root
+    /// is a read-only directory), the hot view MUST be left
+    /// byte-identical. Fail-closed invariant.
+    #[test]
+    fn archive_write_failure_leaves_hot_view_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = temporary_root("archive-fail-closed");
+        let dataset_dir = base.join("dataset");
+        fs::create_dir_all(&dataset_dir).unwrap();
+        let events_path = dataset_dir.join("oiran_events.jsonl");
+        write_jsonl(
+            &events_path,
+            &[
+                archive_test_line("evt-stale-1", "sha256:stale", 900, 1),
+                archive_test_line("evt-fresh-1", "sha256:fresh", 9000, 2),
+            ],
+        );
+        let before_sha = sha256_hex(&fs::read(&events_path).unwrap());
+        // Pre-create a read-only archive root. mkdir inside it fails →
+        // the helper bails BEFORE touching the hot view.
+        let archive_root = base.join("archive-ro");
+        fs::create_dir_all(&archive_root).unwrap();
+        fs::set_permissions(&archive_root, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = archive_stale_captures(&events_path, &archive_root, 5000);
+        // Restore permissions so temporary_root cleanup works.
+        fs::set_permissions(&archive_root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "write failure must propagate as Err");
+        let after_sha = sha256_hex(&fs::read(&events_path).unwrap());
+        assert_eq!(
+            before_sha, after_sha,
+            "hot view MUST be byte-identical after a failed archive"
+        );
+    }
+
+    /// 2.7.27: if no capture is older than the cutoff, the hot view
+    /// is left byte-identical and no archive segment is created.
+    #[test]
+    fn archive_is_a_no_op_when_every_capture_is_fresh() {
+        let base = temporary_root("archive-no-op");
+        let dataset_dir = base.join("dataset");
+        fs::create_dir_all(&dataset_dir).unwrap();
+        let events_path = dataset_dir.join("oiran_events.jsonl");
+        write_jsonl(
+            &events_path,
+            &[
+                archive_test_line("evt-fresh-1", "sha256:fresh", 9000, 1),
+                archive_test_line("evt-fresh-2", "sha256:fresh", 9500, 2),
+            ],
+        );
+        let before_sha = sha256_hex(&fs::read(&events_path).unwrap());
+        let archive_root = base.join("archive");
+        archive_stale_captures(&events_path, &archive_root, 5000).unwrap();
+        let after_sha = sha256_hex(&fs::read(&events_path).unwrap());
+        assert_eq!(before_sha, after_sha);
+        assert!(!archive_root.exists() || fs::read_dir(&archive_root).unwrap().count() == 0);
+    }
+
+    /// 2.7.27: the capture-level age is computed per capture_id, not
+    /// per event. A capture with ONE very old event plus ONE very
+    /// fresh event stays in the hot view: the capture's end_ts
+    /// (= max event ts in the capture) is fresh.
+    #[test]
+    fn capture_level_age_never_slices_inside_a_capture() {
+        let base = temporary_root("archive-per-capture");
+        let dataset_dir = base.join("dataset");
+        fs::create_dir_all(&dataset_dir).unwrap();
+        let events_path = dataset_dir.join("oiran_events.jsonl");
+        // Single capture with both old and fresh events. Per-event
+        // retention (the 2.7.22 bug) would have dropped the first;
+        // capture-level retention keeps both because max_ts = 9000
+        // ≥ cutoff.
+        write_jsonl(
+            &events_path,
+            &[
+                archive_test_line("evt-old", "sha256:mixed", 100, 1),
+                archive_test_line("evt-fresh", "sha256:mixed", 9000, 2),
+            ],
+        );
+        let before_ids = read_event_ids(&events_path);
+        let archive_root = base.join("archive");
+        archive_stale_captures(&events_path, &archive_root, 5000).unwrap();
+        let after_ids = read_event_ids(&events_path);
+        assert_eq!(after_ids, before_ids, "mixed-age capture is kept whole");
     }
 }
