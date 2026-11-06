@@ -1,5 +1,99 @@
 # Changelog
 
+## OIRAN API 2.8.0 — 2026-11-06 — SBI↔N2 / SBI↔N4 tunnel-match correlation
+
+- Before 2.8.0 the only SBI↔N2 / SBI↔N4 bridges were STRONG, driven
+  by shared PDU Session ID or shared DNN
+  (`OIRAN/correlation-engine/src/lib.rs:138` `ngap-sbi-context-association`,
+  `:189` `sbi-pfcp-context-association`). The SBI decoder treated
+  every HTTP/2 body as JSON only
+  (`OIRAN/decoder-sbi/src/lib.rs:953-975` extract the first `{…}`
+  substring, `:977-1006` harvests `pduSessionId`, `dnn`, `sst`, …).
+  The N1N2MessageTransfer body is `multipart/related`: the JSON part
+  carries control fields and the binary `n2SmInfo` part carries the
+  NGAP `PDUSessionResourceSetupRequestTransfer` containing the UL
+  NG-U UP TNL Information (TEID + IP) — the EXACT same F-TEID the
+  N2 `PDUSessionResourceSetupRequest` IE and the N4 PFCP Created-PDR
+  F-TEID expose. The decoder never looked inside that part, so
+  SBI↔N2 and SBI↔N4 stayed one confidence rank below N2↔N4
+  (EXACT) and N4↔N3 (EXACT) even though the primary 5G identifier
+  for user-plane setup — the F-TEID — is physically present in all
+  three messages.
+- 2.8.0 contract: extract the F-TEID from the SBI n2SmInfo and
+  correlate byte-perfectly, same policy as every other tunnel-match
+  rule — no key → no edge (open link, NEVER inferred by timestamp),
+  multi-match → fail-closed, single match → EXACT. The 2.7.26
+  canonical-pair fold already deduplicates edges that overlap with
+  `ngap-sbi-context-association`; `matched_rules` surfaces both
+  rule ids when they fire on the same canonical pair.
+- `OIRAN/decoder-sbi/src/lib.rs`:
+  * New `decompose_body(content_type, body)` parses a
+    `multipart/related; boundary=X` envelope into a `Vec<BodyPart>`
+    with each part's own `content-type`. Non-multipart bodies
+    produce a single part carrying the container's content-type,
+    so CreateSMContext / UpdateSMContext / ReleaseSMContext (plain
+    `application/json`) reach `collect_json` exactly as before.
+  * New `is_n2_sm_info(content_type)` recognises
+    `application/vnd.3gpp.ngap` and the `vnd.3gpp.n2` / `ngap`
+    variants operators emit. The match is deliberately narrow — a
+    wrong dispatch would run the NGAP decoder on NAS or JSON bytes
+    and emit a tunnel key that never matches anything.
+  * `build_event` now dispatches each part: JSON → existing field
+    extraction; NGAP binary → `decoder_ngap::
+    decode_pdu_session_resource_setup_request_transfer`. On
+    success and when `ul_tunnel` resolves to an IPv4 GtpTunnel,
+    the SBI event picks up two identifiers (`tunnel_endpoint_ip`,
+    `gtp_teid`) and two IEs (`N2 UL NG-U UP TNL Information` with
+    the composed `tunnel_endpoint_ip=<ip>,gtp_teid=0x<hex>` value
+    that `correlation_engine::tunnel_keys` consumes verbatim, and
+    `n2SmInfo sha256` for byte-identical bind-back by operators).
+    SUPI / SUCI / NAI remain pseudonymized through the existing
+    JSON path — the decoder exposes NO subscriber identity in
+    clear.
+- `OIRAN/correlation-engine/src/lib.rs` — two new rules at the end
+  of `correlate_cross_interface_evidence`:
+  * **`sbi-n2-tunnel-match`** EXACT (`EXACT_TUNNEL_MATCH`,
+    `tunnel-only`): SBI N1N2MessageTransfer whose (ipv4, teid)
+    equals a unique N2 PDUSessionResourceSetupRequest's
+    (ipv4, teid) in the same capture scope. Fail-closed on
+    duplicate SBI keys or duplicate N2 keys.
+  * **`sbi-n4-tunnel-match`** EXACT (`EXACT_TUNNEL_MATCH`,
+    `tunnel-only`): same key against a unique N4 PFCP F-TEID in
+    the same capture scope. Fail-closed on duplicate SBI or N4
+    keys.
+- Regression tests (new, all passing):
+  * `correlation_engine::tests::sbi_n2_and_sbi_n4_tunnel_matches_are_exact`
+    — SBI + matching N2 + matching N4 → exactly 3 EXACT edges
+    (ngap-pfcp-exact-tunnel preserved, sbi-n2-tunnel-match and
+    sbi-n4-tunnel-match added).
+  * `correlation_engine::tests::sbi_tunnel_match_stays_open_when_teid_differs`
+    — SBI carries a different TEID than the N2/N4 pair: 0 SBI
+    edges (open link, never inferred by ts).
+  * `correlation_engine::tests::sbi_tunnel_match_fails_closed_on_duplicate_sbi_tunnel_keys`
+    — two SBI events share the same (ipv4, teid): no edge.
+  * `decoder_sbi::tests::decompose_body_splits_multipart_related_with_boundary`
+    — multipart envelope splits into parts with each part's own
+    content-type.
+  * `decoder_sbi::tests::is_n2_sm_info_accepts_ngap_and_vnd_3gpp_variants`
+    — content-type dispatch is narrow (`application/vnd.3gpp.ngap`,
+    `.n2`, `application/ngap`) and refuses JSON / NAS.
+  * `decoder_sbi::tests::n1n2_message_transfer_multipart_extracts_ul_ngu_tunnel_from_n2_sm_info`
+    — end-to-end from an HTTP/2 POST on
+    `/namf-comm/.../n1-n2-messages` carrying a real-shape multipart
+    body whose n2SmInfo is the pycrate ground-truth
+    `REQUEST_TRANSFER_MINIMAL` (IP=192.0.2.1, TEID=0x11223344). The
+    produced SBI event exposes `tunnel_endpoint_ip=192.0.2.1`,
+    `gtp_teid=0x11223344`, `pdu_session_id=1`, carries
+    `N2 UL NG-U UP TNL Information` and `n2SmInfo sha256` IEs, and
+    leaks no `imsi-…` in any identifier or IE value.
+- SemVer:
+  * `OIRAN/decoder-sbi/Cargo.toml` — `0.3.1` → **`0.4.0`** (public
+    extraction surface changed: SBI events now carry tunnel
+    identifiers + N2 UL NG-U IE).
+  * `OIRAN/correlation-engine/Cargo.toml` — `0.5.3` → **`0.6.0`**
+    (two new public rules).
+  * `OIRAN/apps/api/Cargo.toml` — `2.7.28` → **`2.8.0`** (minor).
+
 ## OIRAN API 2.7.28 — 2026-11-06 — `dataset-restore` goes through the full publication path
 
 - ANR2 production verdict on 2.7.27 (issue #10): the restore binary

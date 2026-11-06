@@ -727,22 +727,79 @@ fn build_event(
         raw_sha256: None,
         status: DecodeStatus::Decoded,
     });
-    for (name, value) in json_fields(&state.request.body, pseudonym_key) {
-        if name == "pdu_session_id" || name == "subscriber_pseudonym" {
-            identifiers.push(NamedValue {
-                name: name.clone(),
-                value: value.clone(),
-                pseudonymized: name == "subscriber_pseudonym",
+    // 2.8.0 (issue #9): N1N2MessageTransfer carries a multipart/related
+    // body with a JSON part AND one or more binary parts. The n2SmInfo
+    // part is NGAP APER-encoded `PDUSessionResourceSetupRequestTransfer`
+    // and carries the UL NG-U UP TNL Information (TEID + IP), which is
+    // the exact F-TEID the PFCP N4 session will install. We parse the
+    // multipart envelope and dispatch each part to its decoder here;
+    // request_content_type drives the dispatch so a plain
+    // application/json body (CreateSMContext etc.) still goes through
+    // the existing JSON path.
+    let request_content_type = header(&state.request.headers, "content-type");
+    let request_parts =
+        decompose_body(request_content_type.as_deref(), &state.request.body);
+    for part in &request_parts {
+        if part.content_type.starts_with("application/json") {
+            for (name, value) in json_fields(&part.body, pseudonym_key) {
+                if name == "pdu_session_id" || name == "subscriber_pseudonym" {
+                    identifiers.push(NamedValue {
+                        name: name.clone(),
+                        value: value.clone(),
+                        pseudonymized: name == "subscriber_pseudonym",
+                    });
+                }
+                ies.push(InformationElement {
+                    id: None,
+                    name,
+                    length: value.len() as u32,
+                    value: Some(value),
+                    raw_sha256: None,
+                    status: DecodeStatus::Decoded,
+                });
+            }
+        } else if is_n2_sm_info(&part.content_type) {
+            let transfer =
+                decoder_ngap::decode_pdu_session_resource_setup_request_transfer(&part.body);
+            // Byte-identical match surface: SHA-256 of the n2SmInfo
+            // octets — the SBI event can be bound to the N2 event by
+            // this hash when operators cross-check the transfer
+            // without running the APER decoder a second time.
+            let n2sm_sha = sha256_hex(&part.body);
+            ies.push(InformationElement {
+                id: None,
+                name: "n2SmInfo sha256".into(),
+                length: n2sm_sha.len() as u32,
+                value: Some(n2sm_sha.clone()),
+                raw_sha256: None,
+                status: DecodeStatus::Decoded,
             });
+            if let Some(ul_tunnel) = transfer.ul_tunnel.as_ref() {
+                if let (Some(ip), Some(teid)) = (ul_tunnel.ipv4_address(), ul_tunnel.teid()) {
+                    let composed = format!(
+                        "tunnel_endpoint_ip={ip},gtp_teid=0x{teid:x}"
+                    );
+                    identifiers.push(NamedValue {
+                        name: "tunnel_endpoint_ip".into(),
+                        value: ip.to_string(),
+                        pseudonymized: false,
+                    });
+                    identifiers.push(NamedValue {
+                        name: "gtp_teid".into(),
+                        value: format!("0x{teid:x}"),
+                        pseudonymized: false,
+                    });
+                    ies.push(InformationElement {
+                        id: None,
+                        name: "N2 UL NG-U UP TNL Information".into(),
+                        length: composed.len() as u32,
+                        value: Some(composed),
+                        raw_sha256: None,
+                        status: DecodeStatus::Decoded,
+                    });
+                }
+            }
         }
-        ies.push(InformationElement {
-            id: None,
-            name,
-            length: value.len() as u32,
-            value: Some(value),
-            raw_sha256: None,
-            status: DecodeStatus::Decoded,
-        });
     }
     if let Some(value) = target.as_deref() {
         ies.push(InformationElement {
@@ -960,6 +1017,147 @@ fn json_fields(body: &[u8], pseudonym_key: &PseudonymKey) -> Vec<(String, String
     let mut fields = Vec::new();
     collect_json(&value, &mut fields, pseudonym_key);
     fields
+}
+
+/// 2.8.0: one decomposed chunk of an HTTP/2 SBI body. Non-multipart
+/// bodies produce a single `BodyPart` carrying the raw bytes with the
+/// container's content-type; multipart bodies produce one `BodyPart`
+/// per boundary section with each section's own content-type.
+#[derive(Debug)]
+struct BodyPart {
+    content_type: String,
+    body: Vec<u8>,
+}
+
+/// 2.8.0: detect `multipart/related` (and any other `multipart/*`
+/// RFC 2046 compound body) and split it into its parts. A missing or
+/// unparseable content-type falls through to a single part carrying
+/// the raw body with an empty content-type, so JSON-only operations
+/// (CreateSMContext, UpdateSMContext…) reach `collect_json` exactly
+/// as before.
+fn decompose_body(content_type: Option<&str>, body: &[u8]) -> Vec<BodyPart> {
+    if let Some(ct) = content_type {
+        let lower = ct.to_ascii_lowercase();
+        if lower.starts_with("multipart/") {
+            if let Some(boundary) = extract_boundary(ct) {
+                return split_multipart(&boundary, body);
+            }
+        }
+    }
+    vec![BodyPart {
+        content_type: content_type.unwrap_or("").to_ascii_lowercase(),
+        body: body.to_vec(),
+    }]
+}
+
+fn extract_boundary(content_type: &str) -> Option<String> {
+    for part in content_type.split(';').skip(1) {
+        let trimmed = part.trim();
+        if let Some(rest) = trimmed
+            .strip_prefix("boundary=")
+            .or_else(|| trimmed.strip_prefix("BOUNDARY="))
+        {
+            let value = rest.trim_matches('"').to_string();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn split_multipart(boundary: &str, body: &[u8]) -> Vec<BodyPart> {
+    let delim = format!("--{boundary}");
+    let delim_bytes = delim.as_bytes();
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i + delim_bytes.len() <= body.len() {
+        if &body[i..i + delim_bytes.len()] == delim_bytes {
+            i += delim_bytes.len();
+            if body.get(i..i + 2) == Some(b"--") {
+                break; // closing delimiter
+            }
+            // Skip optional transport padding to CRLF.
+            while i < body.len() && body[i] != b'\n' {
+                i += 1;
+            }
+            if i < body.len() {
+                i += 1;
+            }
+            // Parse part headers until a blank line.
+            let mut headers = Vec::new();
+            while i < body.len() {
+                let line_end = body[i..]
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map(|p| i + p)
+                    .unwrap_or(body.len());
+                let line = &body[i..line_end];
+                let trimmed_end = line
+                    .iter()
+                    .rposition(|b| *b != b'\r' && *b != b'\n')
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                i = line_end.saturating_add(1);
+                if trimmed_end == 0 {
+                    break;
+                }
+                headers.push(&line[..trimmed_end]);
+            }
+            let content_type = headers
+                .iter()
+                .find_map(|line| {
+                    let text = std::str::from_utf8(line).ok()?;
+                    let (name, value) = text.split_once(':')?;
+                    (name.trim().eq_ignore_ascii_case("content-type"))
+                        .then(|| value.trim().to_ascii_lowercase())
+                })
+                .unwrap_or_default();
+            // Find the next --boundary.
+            let mut body_end = body.len();
+            let mut j = i;
+            while j + delim_bytes.len() <= body.len() {
+                if &body[j..j + delim_bytes.len()] == delim_bytes
+                    && (j == 0 || body[j - 1] == b'\n')
+                {
+                    body_end = j;
+                    break;
+                }
+                j += 1;
+            }
+            // Trim the CRLF separating body from boundary.
+            let trimmed_end = body[i..body_end]
+                .iter()
+                .rposition(|b| *b != b'\r' && *b != b'\n')
+                .map(|p| p + 1 + i)
+                .unwrap_or(i);
+            let part_body = body[i..trimmed_end].to_vec();
+            parts.push(BodyPart {
+                content_type,
+                body: part_body,
+            });
+            i = body_end;
+        } else {
+            i += 1;
+        }
+    }
+    parts
+}
+
+fn is_n2_sm_info(content_type: &str) -> bool {
+    // TS 29.502 clause 6.1.6.4.3: n2SmInfo is carried as
+    // application/vnd.3gpp.ngap (sometimes with 5g- prefix). Operators
+    // also encounter application/vnd.3gpp.n2 and the broader
+    // application/ngap labels; the contract is "binary NGAP transfer
+    // part", not a single canonical name. The decoder refuses any
+    // part it cannot plausibly identify (JSON, nas, unknown) so this
+    // match is deliberately narrow — a wrong dispatch would run the
+    // NGAP decoder on NAS bytes and emit a tunnel key that never
+    // matches anything.
+    let ct = content_type.to_ascii_lowercase();
+    ct.starts_with("application/vnd.3gpp.ngap")
+        || ct.starts_with("application/vnd.3gpp.n2")
+        || ct == "application/ngap"
 }
 
 fn extract_json(body: &[u8]) -> Option<&[u8]> {
@@ -1627,6 +1825,170 @@ mod tests {
             "exactly one HPACK_CONTEXT_UNAVAILABLE expected (saw {}): {:?}",
             unavail_count, report.errors
         );
+    }
+
+    // --- 2.8.0 SBI multipart / n2SmInfo tests ---------------------
+
+    /// `decompose_body` splits a multipart/related envelope into its
+    /// parts and surfaces each part's own Content-Type so the caller
+    /// can dispatch (JSON → `collect_json`, NGAP binary → NGAP
+    /// decoder). Minimal "two-part" scheme matching TS 29.502.
+    #[test]
+    fn decompose_body_splits_multipart_related_with_boundary() {
+        let body = concat!(
+            "--boundary123\r\n",
+            "Content-Type: application/json\r\n",
+            "Content-Id: json-part\r\n",
+            "\r\n",
+            "{\"pduSessionId\":1}\r\n",
+            "--boundary123\r\n",
+            "Content-Type: application/vnd.3gpp.ngap\r\n",
+            "Content-Id: n2SmInfo\r\n",
+            "\r\n",
+            "BINARY-BODY-BYTES\r\n",
+            "--boundary123--\r\n",
+        )
+        .as_bytes();
+        let parts = decompose_body(
+            Some("multipart/related; boundary=boundary123"),
+            body,
+        );
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].content_type, "application/json");
+        assert_eq!(parts[0].body, b"{\"pduSessionId\":1}");
+        assert!(parts[1].content_type.starts_with("application/vnd.3gpp.ngap"));
+        assert_eq!(parts[1].body, b"BINARY-BODY-BYTES");
+    }
+
+    #[test]
+    fn is_n2_sm_info_accepts_ngap_and_vnd_3gpp_variants() {
+        assert!(is_n2_sm_info("application/vnd.3gpp.ngap"));
+        assert!(is_n2_sm_info("application/vnd.3gpp.ngap;version=1"));
+        assert!(is_n2_sm_info("application/vnd.3gpp.n2+hex"));
+        assert!(is_n2_sm_info("application/ngap"));
+        assert!(!is_n2_sm_info("application/json"));
+        assert!(!is_n2_sm_info("application/vnd.3gpp.5gnas"));
+    }
+
+    /// End-to-end: a POST on `/namf-comm/.../n1-n2-messages` with a
+    /// `multipart/related` body whose n2SmInfo part is the pycrate
+    /// ground-truth `REQUEST_TRANSFER_MINIMAL` fixture produces an
+    /// SBI event carrying:
+    ///   * identifier `pdu_session_id` from the JSON part,
+    ///   * identifiers `tunnel_endpoint_ip`=192.0.2.1 and
+    ///     `gtp_teid`=0x11223344 from the decoded n2SmInfo,
+    ///   * IE `N2 UL NG-U UP TNL Information` carrying the composed
+    ///     `tunnel_endpoint_ip=192.0.2.1,gtp_teid=0x11223344` value
+    ///     correlation-engine's `tunnel_keys` consumes verbatim,
+    ///   * IE `n2SmInfo sha256` for byte-identical bind-back.
+    /// No subscriber identity is present in clear.
+    #[test]
+    fn n1n2_message_transfer_multipart_extracts_ul_ngu_tunnel_from_n2_sm_info() {
+        let request_transfer_hex =
+            "000003008b000a01f0c00002011122334400860001000088000700050000091900";
+        let n2_sm_info: Vec<u8> = (0..request_transfer_hex.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&request_transfer_hex[i..i + 2], 16).unwrap()
+            })
+            .collect();
+        let boundary = "oiran280";
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Type: application/json\r\n\r\n");
+        body.extend_from_slice(b"{\"pduSessionId\":1,\"supi\":\"imsi-208930000000001\"}\r\n");
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Type: application/vnd.3gpp.ngap\r\nContent-Id: n2SmInfo\r\n\r\n");
+        body.extend_from_slice(&n2_sm_info);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let client = TcpEndpoint {
+            address: "10.0.0.1".into(),
+            port: 51001,
+        };
+        let server = TcpEndpoint {
+            address: "10.0.0.2".into(),
+            port: 7778,
+        };
+        let mut enc = Encoder::new();
+        let mut client_bytes = PREFACE.to_vec();
+        let content_type_header =
+            format!("multipart/related; boundary={boundary}");
+        let hdr = enc.encode([
+            (b":method".as_slice(), b"POST".as_slice()),
+            (b":scheme".as_slice(), b"http".as_slice()),
+            (b":authority".as_slice(), b"amf".as_slice()),
+            (
+                b":path".as_slice(),
+                b"/namf-comm/v1/ue-contexts/42/n1-n2-messages".as_slice(),
+            ),
+            (b"content-type".as_slice(), content_type_header.as_bytes()),
+        ]);
+        client_bytes.extend(frame(1, 4, 1, &hdr)); // HEADERS, END_HEADERS
+        client_bytes.extend(frame(0, 1, 1, &body)); // DATA, END_STREAM
+        let mut server_bytes = Vec::new();
+        let mut resp_enc = Encoder::new();
+        let ok = resp_enc.encode([(b":status".as_slice(), b"200".as_slice())]);
+        server_bytes.extend(frame(1, 5, 1, &ok));
+        let key = TcpConnectionKey::new(client.clone(), server.clone()).0;
+        let conn = ReassembledConnection {
+            key,
+            directions: [
+                direction(client.clone(), server.clone(), client_bytes, 1),
+                direction(server, client, server_bytes, 2),
+            ],
+        };
+        let (events, _report) = decode_connections(
+            &[conn],
+            "sha256:test",
+            "SBI",
+            &HashMap::new(),
+            &test_key(),
+        );
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.message_name, "N1N2MessageTransfer");
+        assert_eq!(event.decoding_status, DecodeStatus::Decoded);
+        let identifiers: std::collections::BTreeMap<String, String> = event
+            .session_identifiers
+            .iter()
+            .map(|id| (id.name.clone(), id.value.clone()))
+            .collect();
+        assert_eq!(identifiers.get("pdu_session_id").map(String::as_str), Some("1"));
+        assert_eq!(
+            identifiers.get("tunnel_endpoint_ip").map(String::as_str),
+            Some("192.0.2.1")
+        );
+        assert_eq!(
+            identifiers.get("gtp_teid").map(String::as_str),
+            Some("0x11223344")
+        );
+        let ies: std::collections::BTreeMap<String, String> = event
+            .information_elements
+            .iter()
+            .filter_map(|ie| ie.value.clone().map(|value| (ie.name.clone(), value)))
+            .collect();
+        assert_eq!(
+            ies.get("N2 UL NG-U UP TNL Information").map(String::as_str),
+            Some("tunnel_endpoint_ip=192.0.2.1,gtp_teid=0x11223344")
+        );
+        assert!(ies.contains_key("n2SmInfo sha256"));
+        // No identity in clear: the only reference to imsi-* in the JSON
+        // input is pseudonymized through the existing `supi`/`subscriber_pseudonym`
+        // path (see `collect_json`).
+        for value in event.information_elements.iter().filter_map(|ie| ie.value.as_deref()) {
+            assert!(
+                !value.contains("imsi-208930000000001"),
+                "raw SUPI leaked into IE value: {value}"
+            );
+        }
+        for id in &event.session_identifiers {
+            assert!(
+                !id.value.contains("imsi-208930000000001"),
+                "raw SUPI leaked into identifier: {id:?}"
+            );
+        }
     }
 
     #[test]

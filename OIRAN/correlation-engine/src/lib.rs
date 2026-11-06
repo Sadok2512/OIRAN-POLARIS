@@ -282,6 +282,90 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
         edges.push(found);
     }
 
+    // 2.8.0 (issue #9): SBI N1N2MessageTransfer (SMF→AMF) carries the
+    // n2SmInfo multipart part = NGAP PDUSessionResourceSetupRequest-
+    // Transfer, whose UL NG-U UP TNL Information is the SAME F-TEID
+    // the matching N2 PDUSessionResourceSetupRequest and the matching
+    // N4 PFCP Session Establishment see. The decoder-sbi 0.4.0
+    // multipart dispatcher surfaces that (ipv4, teid) as a tunnel_key
+    // IE on the SBI event; here we match it byte-perfectly against
+    // the N2 and N4 sides. No key → no edge (open link, never
+    // inferred by ts); multi-match → fail-closed; one match on each
+    // side → EXACT. The 2.7.26 fold handles overlap with
+    // `ngap-sbi-context-association` on the same pair.
+    let sbi_tunnels = events
+        .iter()
+        .filter(|event| {
+            event.interface == "SBI"
+                && event.protocol == "SBI-HTTP2"
+                && event.message_name == "N1N2MessageTransfer"
+        })
+        .flat_map(|event| {
+            tunnel_keys(event)
+                .into_iter()
+                .map(move |key| (event, key))
+        })
+        .collect::<Vec<_>>();
+    for (sbi, key) in &sbi_tunnels {
+        let sbi_duplicates = sbi_tunnels
+            .iter()
+            .filter(|(_, candidate)| candidate == key)
+            .count();
+        if sbi_duplicates != 1 {
+            continue;
+        }
+        let n2_matches = ngap
+            .iter()
+            .filter(|(_, candidate)| candidate == key)
+            .collect::<Vec<_>>();
+        if n2_matches.len() == 1 {
+            let mut found = edge(
+                sbi,
+                n2_matches[0].0,
+                vec![
+                    format!("endpoint_ip={}", key.endpoint_ip),
+                    format!("teid={}", key.teid),
+                    format!("capture_scope={}", key.capture_id),
+                ],
+                "sbi-n2-tunnel-match",
+                "EXACT",
+                "The SBI N1N2MessageTransfer carries an n2SmInfo PDUSessionResourceSetupRequestTransfer whose UL NG-U UP TNL Information equals the N2 PDUSessionResourceSetupRequest tunnel in the same capture scope",
+            );
+            found.rule_version = E2E_EVIDENCE_RULE_VERSION.into();
+            found.evidence_type = "EXACT_TUNNEL_MATCH".into();
+            found.scope = "tunnel-only".into();
+            found.limitations = vec![
+                "The tunnel match binds the SBI operation to the N2 setup it triggered; it does not by itself prove UE identity".into(),
+            ];
+            edges.push(found);
+        }
+        let n4_matches = pfcp
+            .iter()
+            .filter(|(_, candidate)| candidate == key)
+            .collect::<Vec<_>>();
+        if n4_matches.len() == 1 {
+            let mut found = edge(
+                sbi,
+                n4_matches[0].0,
+                vec![
+                    format!("endpoint_ip={}", key.endpoint_ip),
+                    format!("teid={}", key.teid),
+                    format!("capture_scope={}", key.capture_id),
+                ],
+                "sbi-n4-tunnel-match",
+                "EXACT",
+                "The SBI N1N2MessageTransfer carries an n2SmInfo PDUSessionResourceSetupRequestTransfer whose UL NG-U UP TNL Information equals the PFCP Created-PDR F-TEID in the same capture scope",
+            );
+            found.rule_version = E2E_EVIDENCE_RULE_VERSION.into();
+            found.evidence_type = "EXACT_TUNNEL_MATCH".into();
+            found.scope = "tunnel-only".into();
+            found.limitations = vec![
+                "The tunnel match binds the SBI operation to the PFCP session the SMF created; it does not by itself prove UE identity".into(),
+            ];
+            edges.push(found);
+        }
+    }
+
     edges.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
     edges
 }
@@ -1523,6 +1607,170 @@ mod tests {
                 .iter()
                 .all(|e| e.rule_id != "pfcp-outer-header-matches-gtpu-tunnel"),
             "ambiguous N4 F-TEID must not produce an edge",
+        );
+    }
+
+    // --- 2.8.0 SBI↔N2 / SBI↔N4 tunnel-match rules -----------------
+
+    /// Positive fixture: SBI N1N2MessageTransfer with the SAME tunnel
+    /// (ipv4, teid) as the N2 PDUSessionResourceSetupRequest and the
+    /// N4 PFCP Session Establishment. Expect EXACT edges on both
+    /// pairs. The pre-existing N2↔N4 EXACT is preserved.
+    #[test]
+    fn sbi_n2_and_sbi_n4_tunnel_matches_are_exact() {
+        let tunnel_ie = json!([
+            {
+                "name": "N2 UL NG-U UP TNL Information",
+                "value": "tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xb3b5",
+            }
+        ]);
+        let ngap = e(
+            "ngap",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            1,
+            &[("ran_ue_ngap_id", "4"), ("pdu_session_id", "1")],
+            json!([{"value":"pdu_session_id=1,tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xb3b5"}]),
+        );
+        let pfcp = e(
+            "pfcp",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Request",
+            2,
+            &[("f_seid", "1")],
+            json!([{"value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xb3b5"}]),
+        );
+        let sbi = e(
+            "sbi",
+            "SBI",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            3,
+            &[("pdu_session_id", "1")],
+            tunnel_ie,
+        );
+        let edges = correlate_cross_interface_evidence(&[ngap, pfcp, sbi]);
+        let rules: Vec<_> = edges.iter().map(|e| e.rule_id.as_str()).collect();
+        assert!(
+            rules.contains(&"sbi-n2-tunnel-match"),
+            "SBI↔N2 tunnel match must emit an edge; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"sbi-n4-tunnel-match"),
+            "SBI↔N4 tunnel match must emit an edge; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"ngap-pfcp-exact-tunnel"),
+            "pre-existing N2↔N4 EXACT must be preserved; rules={rules:?}"
+        );
+        let sbi_n2 = edges
+            .iter()
+            .find(|e| e.rule_id == "sbi-n2-tunnel-match")
+            .unwrap();
+        assert_eq!(sbi_n2.confidence, "EXACT");
+        assert_eq!(sbi_n2.evidence_type, "EXACT_TUNNEL_MATCH");
+        let sbi_n4 = edges
+            .iter()
+            .find(|e| e.rule_id == "sbi-n4-tunnel-match")
+            .unwrap();
+        assert_eq!(sbi_n4.confidence, "EXACT");
+        assert_eq!(sbi_n4.evidence_type, "EXACT_TUNNEL_MATCH");
+    }
+
+    /// Negative fixture: SBI carries a DIFFERENT TEID than the N2 /
+    /// N4 pair. No tunnel match → no SBI edge is emitted. The link
+    /// stays "open" as the user asked — never inferred by timestamps
+    /// or by partial fields.
+    #[test]
+    fn sbi_tunnel_match_stays_open_when_teid_differs() {
+        let ngap = e(
+            "ngap",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            1,
+            &[],
+            json!([{"value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xb3b5"}]),
+        );
+        let pfcp = e(
+            "pfcp",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Request",
+            2,
+            &[],
+            json!([{"value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xb3b5"}]),
+        );
+        let sbi = e(
+            "sbi",
+            "SBI",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            3,
+            &[],
+            json!([{"name":"N2 UL NG-U UP TNL Information","value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xdeadbeef"}]),
+        );
+        let edges = correlate_cross_interface_evidence(&[ngap, pfcp, sbi]);
+        assert!(
+            edges
+                .iter()
+                .all(|e| e.rule_id != "sbi-n2-tunnel-match"
+                    && e.rule_id != "sbi-n4-tunnel-match"),
+            "SBI with a non-matching TEID must not produce any tunnel-match edge"
+        );
+    }
+
+    /// If two SBI N1N2MessageTransfer events share the same (ipv4,
+    /// teid), neither is uniquely bound to the N2/N4 pair and no edge
+    /// is emitted. Fail-closed mirrors the ngap-pfcp-exact-tunnel
+    /// policy.
+    #[test]
+    fn sbi_tunnel_match_fails_closed_on_duplicate_sbi_tunnel_keys() {
+        let ngap = e(
+            "ngap",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            1,
+            &[],
+            json!([{"value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xb3b5"}]),
+        );
+        let pfcp = e(
+            "pfcp",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Request",
+            2,
+            &[],
+            json!([{"value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xb3b5"}]),
+        );
+        let sbi_a = e(
+            "sbi-a",
+            "SBI",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            3,
+            &[],
+            json!([{"name":"N2 UL NG-U UP TNL Information","value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xb3b5"}]),
+        );
+        let sbi_b = e(
+            "sbi-b",
+            "SBI",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            4,
+            &[],
+            json!([{"name":"N2 UL NG-U UP TNL Information","value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xb3b5"}]),
+        );
+        let edges = correlate_cross_interface_evidence(&[ngap, pfcp, sbi_a, sbi_b]);
+        assert!(
+            edges
+                .iter()
+                .all(|e| e.rule_id != "sbi-n2-tunnel-match"
+                    && e.rule_id != "sbi-n4-tunnel-match"),
+            "duplicate SBI tunnel keys must fail-closed"
         );
     }
 
