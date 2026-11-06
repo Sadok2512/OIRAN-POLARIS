@@ -155,6 +155,27 @@ test('WEB-023 live capture remains safely gated for Viewer', async ({ page }) =>
   await expect(page.getByText(/Operator permission required/)).toBeVisible();
 });
 
+test('WEB-024a 1280px anti-overlap and screenshots', async ({ page }) => {
+  // 2.8.0: 1280px is the 7-inch-landscape baseline for the analyzer.
+  // Anti-overlap (`scrollWidth <= clientWidth`) is asserted at the
+  // smallest supported viewport so that no SBI bridge, N3 aggregate
+  // row or paginated callflow pushes content beyond the frame.
+  await fs.mkdir(screenshots, { recursive: true });
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await authenticate(page);
+  const routes = [['overview', '/overview'], ['probe-manager', '/operations/probes'], ['session-explorer', '/investigation/sessions/5g-UE-A-pdu-1'], ['callflow-viewer', '/investigation/callflow/5g-UE-A-pdu-1'], ['correlation-studio', '/investigation/correlation/5g-UE-A-pdu-1'], ['packet-analyzer', '/analysis/packets'], ['live-monitoring', '/reports/monitoring']] as const;
+  for (const theme of ['dark', 'light'] as const) {
+    await page.evaluate((value) => localStorage.setItem('oiran.theme', value), theme);
+    for (const [name, route] of routes) {
+      await page.goto(route);
+      await page.waitForLoadState('networkidle');
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+      expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe(theme);
+      await page.screenshot({ path: path.join(screenshots, `${name}-${theme}-1280x800.png`), fullPage: false });
+    }
+  }
+});
+
 test('WEB-024 1440px visual QA and screenshots', async ({ page }) => {
   await fs.mkdir(screenshots, { recursive: true });
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -315,9 +336,23 @@ test('V2.2 directional Call Flow synchronizes arrows, rows and provenance', asyn
 
 test('V2.2 mandatory visual evidence covers inspector, zero-session and filtering', async ({ page }) => {
   await fs.mkdir(screenshots,{recursive:true});
-  const response=await page.request.get('/api/v1/sessions/5g-UE-A-pdu-1/callflow');
+  // 2.8.0: align the fixture on the real paginated API contract.
+  //   OIRAN/apps/api/src/lib.rs:2607 session_callflow
+  //   OIRAN/apps/api/src/lib.rs:2636 ok(value)   // {data:{...events:[...], pagination:{...}}, meta:{...}}
+  //   OIRAN/apps/api/src/lib.rs:2972 ok() envelope
+  // The explicit ?limit=100 locks the pagination window; the strict
+  // assertions still fail-closed — an absent events array, an empty
+  // array, or a missing InitialUEMessage each surface a typed error
+  // instead of a cryptic "Cannot read properties of undefined".
+  const response=await page.request.get('/api/v1/sessions/5g-UE-A-pdu-1/callflow?limit=100');
+  expect(response.status(),`callflow HTTP status ${response.status()}`).toBe(200);
   const body=await response.json();
-  const selected=body.data.events.find((event:{message_name:string})=>event.message_name==='InitialUEMessage').event_id;
+  const events=body?.data?.events as Array<{message_name:string;event_id:string}>|undefined;
+  expect(Array.isArray(events),'callflow response must carry data.events as an array').toBe(true);
+  expect((events as Array<{event_id:string}>).length,'callflow events array must not be empty').toBeGreaterThan(0);
+  const match=(events as Array<{message_name:string;event_id:string}>).find(event=>event.message_name==='InitialUEMessage');
+  expect(match,'session 5g-UE-A-pdu-1 must expose an InitialUEMessage').toBeDefined();
+  const selected=(match as {event_id:string}).event_id;
   for(const [width,height] of [[1440,900],[1920,1080]] as const){
     await page.setViewportSize({width,height});
     for(const theme of ['dark','light'] as const){

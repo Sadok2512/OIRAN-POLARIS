@@ -19,6 +19,53 @@ const DOWNLOAD_LOCKED_REASON = 'GET /captures/:id/download is not served yet (40
 const participantPriority=['UE','gNB','eNB','AMF','SCP','MME','SGW','SMF','UPF','PGW'];
 const queryString=(params:URLSearchParams)=>{const value=params.toString();return value?`?${value}`:''};
 
+// 2.8.0: extract the N3 flow aggregate information produced by
+// live-probe-n3-flow-aggregator. The aggregator collapses an uplink
+// or downlink G-PDU stream into ONE event carrying `aggregate_packet_count`
+// (gtpu_frame_count), the (ipv4, teid) tuple, and the first/last packet
+// in canonical `(capture_id, packet_number, event_id)` order via
+// `packet_references[0]` and `packet_references.at(-1)`.
+// A classic single-G-PDU event (no aggregator) returns null and the UI
+// falls back to the per-packet display.
+export interface N3Aggregate {
+  teid:string|null;
+  endpointIp:string|null;
+  qfi:string|null;
+  gtpuFrameCount:number|null;
+  firstPacket:number|null;
+  lastPacket:number|null;
+}
+function findIeValue(event:CallFlowEvent,name:string):string|null{
+  const needle=name.toLowerCase();
+  for(const ie of event.decoded_ie_tree){
+    if(ie.name.toLowerCase()===needle&&ie.value!=null)return ie.value;
+  }
+  return null;
+}
+export function n3Aggregate(event:CallFlowEvent):N3Aggregate|null{
+  if(event.protocol!=='GTP-U'||event.decoder_name!=='live-probe-n3-flow-aggregator')return null;
+  const packetCountRaw=findIeValue(event,'aggregate_packet_count');
+  const gtpuFrameCount=packetCountRaw!==null?Number.parseInt(packetCountRaw,10):null;
+  const first=event.packet_references[0]?.packet_number??null;
+  const last=event.packet_references.at(-1)?.packet_number??first;
+  // The composed value lives either in a dedicated IE or is decomposed
+  // into `teid` / `endpoint_ip` lookup keys. Keep this tolerant.
+  const teid=findIeValue(event,'teid')??findIeValue(event,'gtp_teid');
+  const endpointIp=findIeValue(event,'tunnel_endpoint_ip')??findIeValue(event,'endpoint_ip');
+  const qfi=findIeValue(event,'qfi');
+  return {teid,endpointIp,qfi,gtpuFrameCount:Number.isFinite(gtpuFrameCount)?gtpuFrameCount:null,firstPacket:first,lastPacket:last};
+}
+export function n3AggregateLabel(agg:N3Aggregate):string{
+  const parts:string[]=[];
+  if(agg.gtpuFrameCount!=null)parts.push(`${agg.gtpuFrameCount} frames`);
+  if(agg.firstPacket!=null&&agg.lastPacket!=null){
+    parts.push(agg.firstPacket===agg.lastPacket?`#${agg.firstPacket}`:`#${agg.firstPacket}→#${agg.lastPacket}`);
+  }
+  if(agg.teid)parts.push(`TEID=${agg.teid}`);
+  if(agg.endpointIp)parts.push(agg.endpointIp);
+  return parts.join(' · ');
+}
+
 export function CallFlowViewer(){
   const {sessionId}=useParams();
   const [params,setParams]=useSearchParams();
@@ -67,7 +114,7 @@ export function CallFlowViewer(){
     <section className="callflow-toolbar"><label className="search-box"><Search/><input aria-label="Search messages" value={search} onChange={event=>setParam('search',event.target.value)} placeholder="Search message"/></label><select aria-label="Interface filter" value={iface} onChange={event=>setParam('interface',event.target.value)}><option value="">All interfaces</option>{data.interfaces.map(value=><option key={value}>{value}</option>)}</select><select aria-label="Protocol filter" value={protocol} onChange={event=>setParam('protocol',event.target.value)}><option value="">All protocols</option>{[...new Set(data.events.map(event=>event.protocol))].map(value=><option key={value}>{value}</option>)}</select><label className="toggle"><input type="checkbox" checked={allEvents} onChange={event=>setParam('scope',event.target.checked?'all':'')}/><span/>All capture events</label>{data.pagination&&<div className="callflow-pagination" data-testid="callflow-pagination"><button className="btn small" disabled={!cursorHistory.length} onClick={()=>setCursorHistory(current=>current.slice(0,-1))}>Previous</button><span>{pageStart}–{pageEnd} of {data.pagination.total_events} observed</span><button className="btn small" disabled={!data.pagination.next_cursor} onClick={()=>{if(data.pagination?.next_cursor)setCursorHistory(current=>[...current,data.pagination!.next_cursor!])}}>Next</button></div>}<button className="icon-btn" aria-label="Fit to width" onClick={()=>setZoom(1)}><Maximize2/></button><button className="icon-btn" aria-label="Zoom out" onClick={()=>setZoom(value=>Math.max(.7,value-.1))}><ZoomOut/></button><span className="zoom-value">{Math.round(zoom*100)}%</span><button className="icon-btn" aria-label="Zoom in" onClick={()=>setZoom(value=>Math.min(1.7,value+.1))}><ZoomIn/></button></section>
     <div className="analysis-layout" style={{gridTemplateColumns:`${leftWidth}px 5px minmax(580px,1fr) 5px ${rightWidth}px`}}><aside className="analysis-left"><div className="analysis-title"><Filter/>Procedures</div><button className={!procedure?'tree active':'tree'} onClick={()=>setParam('procedure','')}><span>All observed procedures</span><b>{allEvents?data.events.length:data.accounting.session_events}</b></button>{procedureMeta.filter(item=>allEvents||item.name!=='Background / Lifecycle').map(item=><div className="procedure-node" key={item.id}><button className="collapse-procedure" aria-label={`${collapsed.has(item.name)?'Expand':'Collapse'} ${item.name}`} onClick={()=>setCollapsed(current=>{const next=new Set(current);next.has(item.name)?next.delete(item.name):next.add(item.name);return next})}>{collapsed.has(item.name)?<ChevronRight/>:<ChevronDown/>}</button><button className={procedure===item.name?'tree active':'tree'} onClick={()=>setParam('procedure',procedure===item.name?'':item.name)}><span>{item.name}<small>{item.start?formatTimestampUtc(item.start):'No timestamp'}<br/>{item.interfaces.join(' · ')}</small></span><b>{item.count}</b></button></div>)}<div className="procedure-actions"><button onClick={()=>setCollapsed(new Set())}>Expand all</button><button onClick={()=>setCollapsed(new Set(procedureMeta.map(item=>item.name)))}>Collapse all</button></div><BridgeEvidence assessments={correlationAssessments}/></aside>
       <button className="resize-handle" aria-label="Resize procedure panel" onPointerDown={beginResize('left')}/>
-      <main className="flow-canvas"><div className="actor-bar" style={{gridTemplateColumns:`repeat(${Math.max(1,participants.length)},1fr)`}}>{participants.map(participant=><div key={participant.id}><b>{participant.role}</b><small>{participant.addresses.join(' · ')||'Observed endpoint'}</small></div>)}</div>{events.length?<><div className="svg-scroll"><svg aria-label="Directional signaling call flow" viewBox={`0 0 ${viewWidth} ${Math.max(330,events.length*62+38)}`} style={{width:`${zoom*100}%`,minWidth:viewWidth}}><defs>{['n2','sbi','n3','n4','neutral','failure','partial'].map(color=><marker key={color} id={`arrow-${color}`} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z"/></marker>)}</defs>{participants.map(participant=><line className="lifeline" key={participant.id} x1={xByRole.get(participant.role)} x2={xByRole.get(participant.role)} y1="0" y2={events.length*62+38}/>)}{events.map((event,index)=><FlowArrow key={event.event_id} event={event} index={index} viewWidth={viewWidth} xByRole={xByRole} selected={event.event_id===selectedId} showProcedure={index===0||events[index-1]?.procedure_group!==event.procedure_group} onSelect={()=>setParam('event_id',event.event_id)}/>)}</svg></div><div className="message-index"><div className="message-index-head"><span>UTC timestamp</span><span>Message</span><span>Path</span><span>Status</span></div>{events.map(event=><button key={event.event_id} className={event.event_id===selectedId?'selected':''} onClick={()=>setParam('event_id',event.event_id)}><time>{formatTimestampUtc(event.timestamp)}</time><span><b>{event.message_name}</b><small>{event.protocol} · {event.interface}{event.protocol==='GTP-U'?' · DATA FLOW':''}</small></span><span>{event.source_participant} → {event.destination_participant}</span><StatusBadge value={event.decoding_status}/></button>)}</div></>:<EmptyState title="No events match the active filters"/>}</main>
+      <main className="flow-canvas"><div className="actor-bar" style={{gridTemplateColumns:`repeat(${Math.max(1,participants.length)},1fr)`}}>{participants.map(participant=><div key={participant.id}><b>{participant.role}</b><small>{participant.addresses.join(' · ')||'Observed endpoint'}</small></div>)}</div>{events.length?<><div className="svg-scroll"><svg aria-label="Directional signaling call flow" viewBox={`0 0 ${viewWidth} ${Math.max(330,events.length*62+38)}`} style={{width:`${zoom*100}%`,minWidth:viewWidth}}><defs>{['n2','sbi','n3','n4','neutral','failure','partial'].map(color=><marker key={color} id={`arrow-${color}`} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z"/></marker>)}</defs>{participants.map(participant=><line className="lifeline" key={participant.id} x1={xByRole.get(participant.role)} x2={xByRole.get(participant.role)} y1="0" y2={events.length*62+38}/>)}{events.map((event,index)=><FlowArrow key={event.event_id} event={event} index={index} viewWidth={viewWidth} xByRole={xByRole} selected={event.event_id===selectedId} showProcedure={index===0||events[index-1]?.procedure_group!==event.procedure_group} onSelect={()=>setParam('event_id',event.event_id)}/>)}</svg></div><div className="message-index"><div className="message-index-head"><span>UTC timestamp</span><span>Message</span><span>Path</span><span>Status</span></div>{events.map(event=>{const agg=n3Aggregate(event);return <button key={event.event_id} className={event.event_id===selectedId?'selected':''} data-testid={agg?'flow-event-n3-aggregate':undefined} onClick={()=>setParam('event_id',event.event_id)}><time>{formatTimestampUtc(event.timestamp)}</time><span><b>{event.message_name}</b><small>{event.protocol} · {event.interface}{agg?` · ${n3AggregateLabel(agg)}`:event.protocol==='GTP-U'?' · DATA FLOW':''}</small></span><span>{event.source_participant} → {event.destination_participant}</span><StatusBadge value={event.decoding_status}/></button>})}</div></>:<EmptyState title="No events match the active filters"/>}</main>
       <button className="resize-handle" aria-label="Resize message inspector" onPointerDown={beginResize('right')}/>
       <aside className="analysis-right"><MessageInspector event={selected} edges={correlationEdges.filter(edge=>edge.source_event_id===selectedId||edge.target_event_id===selectedId)} datasetId={datasetId||session.data?.summary.dataset_id} probeId={probeId}/></aside>
     </div>
@@ -75,13 +122,15 @@ export function CallFlowViewer(){
 }
 
 function BridgeEvidence({assessments}:{assessments:BridgeAssessment[]}){
-  return <div className="mini-evidence" data-testid="bridge-evidence"><h3>Correlation bridges</h3><dl>{assessments.flatMap(assessment=>[<dt key={`${assessment.key}-label`}>{assessment.label}</dt>,<dd key={`${assessment.key}-status`}><StatusBadge value={assessment.status}/></dd>])}</dl><div className="bridge-details">{assessments.map(assessment=><details key={assessment.key}><summary><span>{assessment.label}</span><StatusBadge value={assessment.status}/></summary><p>{assessment.reason}</p><dl><dt>Engine status</dt><dd>{assessment.rawStatus??'NOT PROVIDED'}</dd><dt>Evidence IDs</dt><dd className="mono break">{assessment.evidenceIds.join(' · ')||'NONE'}</dd><dt>DSN</dt><dd className="mono break">{assessment.dsn.join(' · ')||'NONE'}</dd><dt>Matching keys</dt><dd className="mono break">{assessment.matchingIdentifiers.join(' · ')||'NONE'}</dd></dl></details>)}</div></div>;
+  return <div className="mini-evidence" data-testid="bridge-evidence"><h3>Correlation bridges</h3><dl>{assessments.flatMap(assessment=>[<dt key={`${assessment.key}-label`}>{assessment.label}</dt>,<dd key={`${assessment.key}-status`}><StatusBadge value={assessment.status}/></dd>])}</dl><div className="bridge-details">{assessments.map(assessment=><details key={assessment.key} data-testid={`bridge-${assessment.key}`} data-status={assessment.status}><summary><span>{assessment.label}</span><StatusBadge value={assessment.status}/></summary><p>{assessment.reason}</p><dl><dt>Engine status</dt><dd>{assessment.rawStatus??'NOT PROVIDED'}</dd><dt>Matched rules</dt><dd className="mono break" data-testid={`bridge-${assessment.key}-rules`}>{assessment.matchedRules.join(' · ')||'NONE'}</dd><dt>Evidence IDs</dt><dd className="mono break">{assessment.evidenceIds.join(' · ')||'NONE'}</dd><dt>DSN</dt><dd className="mono break">{assessment.dsn.join(' · ')||'NONE'}</dd><dt>Matching keys</dt><dd className="mono break">{assessment.matchingIdentifiers.join(' · ')||'NONE'}</dd></dl></details>)}</div></div>;
 }
 
 function FlowArrow({event,index,viewWidth,xByRole,selected,showProcedure,onSelect}:{event:CallFlowEvent;index:number;viewWidth:number;xByRole:Map<string,number>;selected:boolean;showProcedure:boolean;onSelect:()=>void}){
   const y=index*62+46,x1=xByRole.get(event.source_participant),x2=xByRole.get(event.destination_participant),known=x1!==undefined&&x2!==undefined&&x1!==x2;
   const interfaceTone=event.interface.toLowerCase(),statusTone=event.semantic_status==='FAILURE'?'failure':event.decoding_status==='PARTIAL'?'partial':['n2','sbi','n3','n4'].includes(interfaceTone)?interfaceTone:'neutral';
-  const middle=known?((x1 as number)+(x2 as number))/2:viewWidth/2,label=event.protocol==='GTP-U'?`DATA · ${event.message_name}`:event.message_name;
+  const agg=n3Aggregate(event);
+  const middle=known?((x1 as number)+(x2 as number))/2:viewWidth/2;
+  const label=agg?`DATA · ${event.message_name} · ${n3AggregateLabel(agg)}`:event.protocol==='GTP-U'?`DATA · ${event.message_name}`:event.message_name;
   return <g className={`flow-event ${statusTone} ${event.protocol==='GTP-U'?'data-flow':''} ${known?'':'unresolved'} ${selected?'selected':''}`} role="button" tabIndex={0} aria-label={`${event.message_name}, ${event.protocol}, ${event.source_participant} to ${event.destination_participant}`} onClick={onSelect} onKeyDown={key=>{if(key.key==='Enter'||key.key===' ')onSelect()}}>{showProcedure&&<><rect className="procedure-band" x="0" y={y-34} width={viewWidth} height="18"/><text className="procedure-band-label" x="10" y={y-21}>{event.procedure_group}</text></>}<rect className="row-hit" x="0" y={y-16} width={viewWidth} height="46"/>{known?<><line className="message-line" x1={x1} x2={x2} y1={y+12} y2={y+12} markerEnd={`url(#arrow-${statusTone})`}/><circle className="endpoint-dot" cx={x1} cy={y+12} r="2.5"/></>:<line className="message-line unresolved-line" x1={middle-72} x2={middle+72} y1={y+12} y2={y+12}/>}<text className="message-label" x={middle} y={y} textAnchor="middle">{label}</text><text className="message-meta" x={middle} y={y+10} textAnchor="middle">{formatTimestampUtc(event.timestamp)} · {event.interface}{known?'':' · DIRECTION UNRESOLVED'}</text>{event.association==='BACKGROUND'&&<text className="background-tag" x="8" y={y+15}>BACKGROUND</text>}</g>;
 }
 
@@ -95,8 +144,9 @@ function MessageInspector({event,edges,datasetId,probeId}:{event?:CallFlowEvent;
   const withheldBanner=withheldCount>0
     ?<div className="withheld-banner" data-testid="identity-withheld-banner" role="status"><ShieldAlert size={14}/><span><b>{withheldCount} identity {withheldCount===1?'IE':'IEs'} withheld.</b> Mobile identities are never displayed, and this message is shown without raw bytes.</span></div>
     :null;
+  const agg=n3Aggregate(event);
   return <div className="inspector"><div className="inspector-head"><div><p className="eyebrow">MESSAGE INSPECTOR</p><h2>{event.message_name}</h2><span>{event.protocol} · {event.interface}</span></div><StatusBadge value={event.decoding_status}/></div><InspectorTabs tabs={[
-    {id:'overview',label:'Overview',content:<dl className="detail-list"><dt>Timestamp</dt><dd className="mono">{formatTimestampUtc(event.timestamp)}</dd><dt>Path</dt><dd>{event.source_participant} → {event.destination_participant}</dd><dt>Direction</dt><dd>{event.direction||'UNKNOWN'}</dd><dt>Procedure</dt><dd>{event.procedure_group}</dd><dt>Association</dt><dd>{event.association}</dd><dt>Decoder</dt><dd>{event.decoder_name} {event.decoder_version}</dd>{event.errors.length>0&&<><dt>Unresolved</dt><dd>{event.errors.join(' · ')}</dd></>}</dl>},
+    {id:'overview',label:'Overview',content:<dl className="detail-list"><dt>Timestamp</dt><dd className="mono">{formatTimestampUtc(event.timestamp)}</dd><dt>Path</dt><dd>{event.source_participant} → {event.destination_participant}</dd><dt>Direction</dt><dd>{event.direction||'UNKNOWN'}</dd><dt>Procedure</dt><dd>{event.procedure_group}</dd><dt>Association</dt><dd>{event.association}</dd><dt>Decoder</dt><dd>{event.decoder_name} {event.decoder_version}</dd>{agg&&<><dt>N3 flow aggregate</dt><dd className="mono" data-testid="n3-aggregate-summary">{n3AggregateLabel(agg)||'empty'}</dd></>}{agg&&agg.firstPacket!=null&&agg.lastPacket!=null&&<><dt>Canonical packet range</dt><dd className="mono">#{agg.firstPacket} → #{agg.lastPacket}</dd></>}{event.errors.length>0&&<><dt>Unresolved</dt><dd>{event.errors.join(' · ')}</dd></>}</dl>},
     {id:'fields',label:`Decoded Fields (${safeIeTree.length})`,content:<>{withheldBanner}<IeTree ies={safeIeTree}/></>},
     {id:'asn1',label:event.protocol==='NGAP'?'ASN.1 Tree':'Protocol Tree',content:<>{withheldBanner}{event.protocol==='NGAP'?<IeTree ies={safeIeTree}/>:<div><p className="protocol-tree-label">{event.protocol} uses its native protocol field hierarchy, not ASN.1.</p><IeTree ies={safeIeTree}/></div>}</>},
     {id:'raw',label:'Raw Hex',content:<div className="masked-raw"><b>Raw bytes not available in this event model</b><p>No packet bytes are exposed, so OIRAN does not synthesize a hex dump or byte ranges.{withheldCount>0?' Identity IEs are withheld; this message is shown without hex.':''}</p><code>{event.raw_payload_reference}</code></div>},
