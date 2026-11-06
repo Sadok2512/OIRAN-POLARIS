@@ -1,0 +1,16 @@
+[package]
+name = "lte-offline-anti-regression"
+version = "0.1.0"
+description = "Offline anti-regression tests for the ANR3 LTE correlation rules (BC3 audit, issue #9)."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+serde_json = "1.0"
+correlation-engine = { path = "../correlation-engine" }
+callflow-schema = { path = "../callflow-schema" }
+session-engine = { path = "../session-engine" }

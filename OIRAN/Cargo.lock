@@ -473,6 +473,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "lte-offline-anti-regression"
+version = "0.1.0"
+dependencies = [
+ "callflow-schema",
+ "correlation-engine",
+ "serde_json",
+ "session-engine",
+]
+
+[[package]]
 name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
