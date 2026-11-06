@@ -5,14 +5,28 @@ import * as path from 'node:path';
 const ROOT = path.resolve(process.cwd(), '../..');
 const screenshots = path.join(ROOT, 'OIRAN_V2_2_UI_SCREENSHOTS');
 
+// 2.8.1 (ANR1 rollback on #9): the Analyzer is served under the
+// `/analyzer/` prefix in production (vite.config.ts `base`,
+// `main.tsx` `BrowserRouter basename`). The deploy test prefix is
+// mirrored here so a test navigation hits the SPA at its real URL.
+// Override via `OIRAN_E2E_WEB_PREFIX=''` when running against a
+// zero-prefix dev build.
+const runtimeEnv=(globalThis as {process?:{env?:Record<string,string|undefined>}}).process?.env;
+const WEB_PREFIX=(runtimeEnv?.OIRAN_E2E_WEB_PREFIX??'/analyzer').replace(/\/$/,'');
+const spa=(subpath:string)=>`${WEB_PREFIX}${subpath.startsWith('/')?subpath:`/${subpath}`}`;
+
 async function authenticate(page: Page) {
-  await page.goto('/');
+  // 2.8.1: hit the SPA at its real deploy prefix. The assertion on
+  // the heading is kept strict — the page must render the actual
+  // `<h1>Operational Overview</h1>` the Overview component produces
+  // (OIRAN/apps/web/src/pages/Overview.tsx:3).
+  await page.goto(`${WEB_PREFIX}/`);
   await expect(page.getByRole('heading', { name: 'Operational Overview' })).toBeVisible();
 }
 
 async function callflow(page: Page) {
   await authenticate(page);
-  await page.goto('/investigation/callflow/5g-UE-A-pdu-1');
+  await page.goto(spa('/investigation/callflow/5g-UE-A-pdu-1'));
   await expect(page.getByRole('heading', { name: 'Call Flow Viewer' })).toBeVisible();
 }
 
@@ -31,7 +45,7 @@ test('WEB-002 navigates between four pages without errors', async ({ page }) => 
 
 test('WEB-003 Probe Manager shows real capture metadata', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/operations/probes');
+  await page.goto(spa('/operations/probes'));
   await expect(page.getByText('N2.pcapng', { exact: true })).toBeVisible();
   const response = await page.request.get('/api/v1/captures?page_size=100');
   const body = await response.json();
@@ -41,21 +55,21 @@ test('WEB-003 Probe Manager shows real capture metadata', async ({ page }) => {
 
 test('WEB-004 capture selection reveals checksum', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/operations/probes');
+  await page.goto(spa('/operations/probes'));
   await page.getByText('N3.pcapng', { exact: true }).click();
   await expect(page.getByText('806a4ae1eb758a1b2c08ae10d7b7f54881c5e571c7f80ed047f564cb222cb35a')).toBeVisible();
 });
 
 test('WEB-005 Session Explorer shows actual session', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/investigation/sessions');
+  await page.goto(spa('/investigation/sessions'));
   await expect(page.getByText('5g-UE-A-pdu-1').first()).toBeVisible();
   await expect(page.getByText('26', { exact: true }).first()).toBeVisible();
 });
 
 test('WEB-006 session selection shows certified accounting', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/investigation/sessions/5g-UE-A-pdu-1');
+  await page.goto(spa('/investigation/sessions/5g-UE-A-pdu-1'));
   await expect(page.getByText('28', { exact: true }).first()).toBeVisible();
 });
 
@@ -104,20 +118,20 @@ test('WEB-014 background events are separate and available', async ({ page }) =>
 
 test('WEB-015 Correlation Studio shows actual links', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/investigation/correlation/5g-UE-A-pdu-1');
+  await page.goto(spa('/investigation/correlation/5g-UE-A-pdu-1'));
   await expect(page.locator('tbody tr')).toHaveCount(12);
 });
 
 test('WEB-016 N2/N4 link preserves STRONG evidence', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/investigation/correlation/5g-UE-A-pdu-1');
+  await page.goto(spa('/investigation/correlation/5g-UE-A-pdu-1'));
   await page.locator('tbody tr').filter({ hasText: 'N2' }).first().click();
   await expect(page.locator('.edge-inspector').getByText('STRONG')).toBeVisible();
 });
 
 test('WEB-017 N4/N3 link preserves EXACT evidence', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/investigation/correlation/5g-UE-A-pdu-1');
+  await page.goto(spa('/investigation/correlation/5g-UE-A-pdu-1'));
   await page.locator('tbody tr').filter({ hasText: 'N4' }).filter({ hasText: 'N3' }).first().click();
   await expect(page.locator('.edge-inspector').getByText('EXACT')).toBeVisible();
 });
@@ -133,7 +147,7 @@ for (const [id, format] of [['WEB-018', 'HTML'], ['WEB-019', 'JSON']] as const) 
 
 test('WEB-020 selected session URL survives reload', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/investigation/sessions/5g-UE-A-pdu-1');
+  await page.goto(spa('/investigation/sessions/5g-UE-A-pdu-1'));
   await page.reload();
   await expect(page.getByRole('heading', { name: '5g-UE-A-pdu-1' })).toBeVisible();
 });
@@ -150,7 +164,7 @@ test('WEB-022 invalid session ID returns controlled error', async ({ request }) 
 
 test('WEB-023 live capture remains safely gated for Viewer', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/operations/probes');
+  await page.goto(spa('/operations/probes'));
   await expect(page.getByRole('button', { name: 'Start capture' })).toBeDisabled();
   await expect(page.getByText(/Operator permission required/)).toBeVisible();
 });
@@ -167,7 +181,7 @@ test('WEB-024a 1280px anti-overlap and screenshots', async ({ page }) => {
   for (const theme of ['dark', 'light'] as const) {
     await page.evaluate((value) => localStorage.setItem('oiran.theme', value), theme);
     for (const [name, route] of routes) {
-      await page.goto(route);
+      await page.goto(spa(route));
       await page.waitForLoadState('networkidle');
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
       expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe(theme);
@@ -184,7 +198,7 @@ test('WEB-024 1440px visual QA and screenshots', async ({ page }) => {
   for (const theme of ['dark', 'light'] as const) {
     await page.evaluate((value) => localStorage.setItem('oiran.theme', value), theme);
     for (const [name, route] of routes) {
-      await page.goto(route);
+      await page.goto(spa(route));
       await page.waitForLoadState('networkidle');
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
       expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe(theme);
@@ -201,7 +215,7 @@ test('WEB-025 1920px visual QA and screenshots', async ({ page }) => {
   for (const theme of ['dark', 'light'] as const) {
     await page.evaluate((value) => localStorage.setItem('oiran.theme', value), theme);
     for (const [name, route] of routes) {
-      await page.goto(route);
+      await page.goto(spa(route));
       await page.waitForLoadState('networkidle');
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
       expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe(theme);
@@ -226,7 +240,7 @@ test('S4.1 dataset and UE discovery endpoints are public and paginated', async (
 
 test('S4.1 Session Explorer preserves dataset and interface filters in URL', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/investigation/sessions');
+  await page.goto(spa('/investigation/sessions'));
   await page.getByLabel('Dataset filter').selectOption('OIRAN_5G_PDU_SESSION_DATA_V1');
   await page.getByLabel('Interface filter').selectOption('N3');
   await expect(page).toHaveURL(/dataset_id=OIRAN_5G_PDU_SESSION_DATA_V1/);
@@ -236,7 +250,7 @@ test('S4.1 Session Explorer preserves dataset and interface filters in URL', asy
 
 test('S4.1 Call Flow selector resolves the chosen session', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/investigation/callflow');
+  await page.goto(spa('/investigation/callflow'));
   await page.getByRole('link', { name: /5g-UE-A-pdu-1/ }).click();
   await expect(page).toHaveURL(/callflow\/5g-UE-A-pdu-1/);
   await expect(page.locator('.flow-event')).toHaveCount(26);
@@ -244,7 +258,7 @@ test('S4.1 Call Flow selector resolves the chosen session', async ({ page }) => 
 
 test('S4.2 Probe Manager displays measured fail-closed disk safety', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/operations/probes');
+  await page.goto(spa('/operations/probes'));
   await expect(page.getByRole('heading', { name: 'Mandatory disk safety' })).toBeVisible();
   await expect(page.getByText('256.0 MiB')).toBeVisible();
   const response = await page.request.get('/api/v1/storage/safety');
@@ -271,7 +285,7 @@ test('V2 overview separates historical evidence from live telemetry', async ({ p
 
 test('V2 Packet Analyzer exposes real provenance and restricted raw bytes', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/analysis/packets');
+  await page.goto(spa('/analysis/packets'));
   await expect(page.getByRole('heading', { name: 'Packet Analyzer' })).toBeVisible();
   await page.getByRole('row').nth(1).click();
   await expect(page.getByRole('tab', { name: 'Raw Hex' })).toBeVisible();
@@ -292,7 +306,7 @@ test('Live V1 capture lifecycle API enforces Operator authorization', async ({ r
 });
 
 test('P0 selected capture and library use the same authoritative state', async ({ page }) => {
-  await page.goto('/operations/probes');
+  await page.goto(spa('/operations/probes'));
   const row=page.locator('tr').filter({hasText:'live-1792964646320-0003'});
   await expect(row.getByText('FAILED',{exact:true})).toBeVisible();
   await row.click();
@@ -315,7 +329,7 @@ test('V2 Call Flow inspector preserves partial decode and actual JSON', async ({
 
 test('V2.2 capture navigation resolves the exact dataset without fallback', async ({ page }) => {
   await authenticate(page);
-  await page.goto('/operations/probes');
+  await page.goto(spa('/operations/probes'));
   const row=page.locator('tr').filter({hasText:'live-1792966547779-0001'});
   await row.getByRole('button',{name:'Open dataset'}).click();
   await expect(page).toHaveURL(/capture_id=live-1792966547779-0001/);
@@ -356,7 +370,7 @@ test('V2.2 mandatory visual evidence covers inspector, zero-session and filterin
   for(const [width,height] of [[1440,900],[1920,1080]] as const){
     await page.setViewportSize({width,height});
     for(const theme of ['dark','light'] as const){
-      await page.goto('/');
+      await page.goto(spa('/'));
       await page.evaluate(value=>localStorage.setItem('oiran.theme',value),theme);
       const cases=[
         ['selected-message',`/investigation/callflow/5g-UE-A-pdu-1?dataset_id=OIRAN_5G_PDU_SESSION_DATA_V1&event_id=${encodeURIComponent(selected)}`],
@@ -364,7 +378,7 @@ test('V2.2 mandatory visual evidence covers inspector, zero-session and filterin
         ['multi-interface-filter','/investigation/callflow/5g-UE-A-pdu-1?dataset_id=OIRAN_5G_PDU_SESSION_DATA_V1&interface=N4']
       ] as const;
       for(const [name,route] of cases){
-        await page.goto(route);
+        await page.goto(spa(route));
         await page.waitForLoadState('networkidle');
         if(name==='selected-message')await page.getByRole('tab',{name:/Decoded Fields/}).click();
         expect(await page.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth)).toBe(true);
