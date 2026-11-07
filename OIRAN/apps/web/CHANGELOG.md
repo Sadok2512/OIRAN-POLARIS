@@ -2,6 +2,124 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.8.1 — 2026-11-06 (ANR1 rollback fix — SPA base `/analyzer/` + s4.spec alignment)
+
+- ANR1 deployment was rolled back: the Vite build emitted
+  `<script src="/assets/index-DZZ2IvMn.js">` while the reverse proxy
+  served the Analyzer under `/analyzer/`, so `/assets/index-*.js` and
+  `/assets/index-*.css` returned 404 and the SPA never booted.
+- `OIRAN/apps/web/vite.config.ts`: new `base: '/analyzer/'`
+  (overridable via `OIRAN_WEB_BASE`). After rebuild,
+  `dist/index.html` references
+  `/analyzer/assets/index-*.js` and
+  `/analyzer/assets/index-*.css` — the exact paths the proxy serves.
+- `OIRAN/apps/web/src/main.tsx`: `BrowserRouter` now uses
+  `basename={import.meta.env.BASE_URL.replace(/\/$/,'')}` — the
+  SPA basename mirrors the Vite base at runtime, so client-side
+  routes under `/analyzer/*` resolve correctly and a page reload
+  from `/analyzer/investigation/sessions/…` returns to the same
+  state. `OIRAN/apps/web/src/vite-env.d.ts` references `vite/client`
+  so `import.meta.env` typechecks under tsc strict.
+- `OIRAN/tests/e2e/s4.spec.ts`: new `WEB_PREFIX` constant (default
+  `/analyzer`, overridable via `OIRAN_E2E_WEB_PREFIX`) and `spa(path)`
+  helper. Every navigation now hits the SPA at its real deploy
+  prefix; the heading assertion on
+  `getByRole('heading', { name: 'Operational Overview' })` is kept
+  strict — it pins to the actual `<h1>` produced by
+  `src/pages/Overview.tsx:3`. The old route `/` is not weakened —
+  it is replaced with the correct `/analyzer/` route, so a
+  non-200 or a wrong heading still fails fast.
+- Validation (manual, no CI):
+  * `npm run typecheck` → clean
+  * `npm test` → **88 passed** (unchanged from 2.8.0)
+  * `npm run build` → `dist/index-*.js 366.12 kB (gzip 108.51 kB)`,
+    `dist/index.html` references `/analyzer/assets/index-*.{js,css}`.
+    `check-dist-leaks: clean (3 files scanned, 2 markers)`.
+  * `vite preview --base /analyzer/ --port 4199` served from the
+    same dist:
+    ```
+    /                                       → HTTP 302
+    /analyzer/                              → HTTP 200
+    /analyzer/assets/index-B4P7UkQJ.js      → HTTP 200
+    /analyzer/assets/index-DuZ35fFs.css     → HTTP 200
+    ```
+  * Playwright 1280/1440/1920 — requires the real OIRAN API
+    server at `http://127.0.0.1:49152` + reverse-proxy serving
+    `/analyzer/*`; the test file now navigates to the right URLs
+    unchanged, so operators replay the suite without edits.
+
+## 2.8.0 — 2026-11-06 (analyzer pillar 7 — SBI/N3 aggregate/pagination)
+
+- **SBI 2.8.0 bridges on screen** — Expose the `sbi-n2-tunnel-match`
+  and `sbi-n4-tunnel-match` EXACT edges correlation-engine 0.6.0
+  emits. `CorrelationEdge.matched_rules` is wired through
+  `src/types/api.ts:22`, exposed per bridge in
+  `BridgeAssessment.matchedRules`
+  (`src/correlation/statusMapping.ts`), and rendered as a dedicated
+  "Matched rules" row in the Call Flow Viewer evidence panel
+  (`src/pages/CallFlowViewer.tsx` BridgeEvidence block). The
+  `N2→SBI→N4→N3` chain is built by the existing `FIVE_G_BRIDGES`
+  definitions; the E2E assessment unions `matched_rules` from every
+  observed bridge.
+- **OPEN link status** — A new `CorrelationUiStatus='OPEN'` surfaces
+  when both interfaces are observed but no correlation edge has
+  fired (`rawStatus` neither EXACT/STRONG, no POSSIBLE match, no
+  `MISSING_KEY` pattern, no `NOT_CORRELATED`). OPEN links are
+  **never hidden**: the BridgeEvidence block renders the status
+  badge, the engine's raw status, every matched rule and an
+  explicit reason. The E2E precedence orders `NO_DATA` before
+  `OPEN` so a missing interface still wins (stronger signal), but
+  an open bridge keeps the chain visibly unproven.
+- **N3 aggregate row** — When `decoder_name ===
+  'live-probe-n3-flow-aggregator'`, the Call Flow Viewer renders
+  ONE row per TEID carrying `gtpu_frame_count` (from
+  `aggregate_packet_count` IE), the (TEID, IP) tuple, and the
+  first/last `packet_references[*].packet_number` in canonical
+  `(capture_id, packet_number, event_id)` order. The arrow label,
+  the message index row (with `data-testid="flow-event-n3-aggregate"`)
+  and the Message Inspector Overview tab all expose the same
+  summary. One G-PDU stream → one aggregate row, never N rows.
+- **Fixture `s4.spec.ts` alignment** — The `V2.2 mandatory visual
+  evidence` test now hits the paginated API contract explicitly:
+  `GET /sessions/5g-UE-A-pdu-1/callflow?limit=100`, strict `status
+  === 200`, strict `Array.isArray(body.data.events)`, strict
+  `events.length > 0`, strict `find(InitialUEMessage) !==
+  undefined`. The assertion is NOT weakened — missing data now
+  produces a typed test error instead of a cryptic "Cannot read
+  properties of undefined", and the real API contract is cited
+  at the point of use (`OIRAN/apps/api/src/lib.rs:2607`,
+  `:2636`, `:2972`).
+- **1280 px anti-overlap** — New `WEB-024a 1280px anti-overlap and
+  screenshots` Playwright test asserts
+  `document.documentElement.scrollWidth <= clientWidth` across the
+  7 primary routes (overview, probe-manager, session-explorer,
+  callflow-viewer, correlation-studio, packet-analyzer,
+  live-monitoring) × 2 themes, and captures full screenshots to
+  `OIRAN_V2_2_UI_SCREENSHOTS/${name}-${theme}-1280x800.png`.
+  Existing 1440 and 1920 px tests are unchanged.
+- **Callflow pagination contract** — No code change (the cursor
+  path is already canonical per `OIRAN/live-probe/src/callflow_page.rs:94`
+  and `OIRAN/apps/api/src/lib.rs:2528-2535`), BUT a new
+  `callflow pagination keeps canonical (capture_id, seq, event_id)
+  order` vitest asserts: cursor progression hits
+  `?cursor=<last.event_id>`, no duplicate across pages, no event
+  lost, "Previous" restores page 1, pagination text matches
+  "1–2 of 4" → "3–4 of 4".
+- Vitest: 88 passed (83 pre-existing + 5 new in
+  `src/test/analyzer-pillar-7.test.tsx`).
+
+## 2.7.2 — 2026-11-04 (correlation API/UI parity)
+
+- Read bridge evidence from the session correlation endpoint instead of the
+  intentionally edge-free paginated Call Flow response.
+- Map engine evidence conservatively to `CORRELATED`, `NOT_CORRELATED`,
+  `NO_DATA`, `MISSING_KEY`, `AMBIGUOUS`, `NOT_EVALUATED`, or `UNSUPPORTED`;
+  no missing value is promoted to a pass.
+- Show the exact mapping reason, engine status, evidence/event identifiers,
+  matching keys, and immutable Data Source Node packet references.
+- Force a fresh correlation read on mount so a browser reload cannot retain a
+  stale bridge assessment.
+
 ## 2.7.1 — 2026-11-01 (LTE Call Flow truthfulness)
 
 - Render the observed S1-MME/S11 and S11/S1-U correlation bridges for LTE
