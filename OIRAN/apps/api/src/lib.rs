@@ -4307,6 +4307,21 @@ mod tests {
             )
             .unwrap();
         }
+        // 2.8.3 (#9 comment 6696366882): a lone segment per interface is
+        // the still-live dumpcap target under the closed-proof contract.
+        // Prove closure via the rotation-watcher JSONL so the three
+        // test segments become eligible.
+        {
+            use std::io::Write as _;
+            let mut file = fs::File::create(source.join("capture-rotation.jsonl")).unwrap();
+            for plane in ["n2", "n3", "n4"] {
+                writeln!(
+                    file,
+                    r#"{{"timestamp":"2026-11-07T00:00:00Z","interface":"br-oiran-{plane}","plane":"{plane}","exit_code":0,"packets_captured":0,"packets_dropped":0}}"#
+                )
+                .unwrap();
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(250));
         let mut config = test_config(workspace, "registry-continuous");
         config.capture_root = capture_root;
