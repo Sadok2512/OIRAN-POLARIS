@@ -98,14 +98,37 @@ export function AppShell() {
   // "operations" (Probe Manager) is excluded on purpose — see sections map.
   const ordered = ['overview', 'investigation', 'analysis', 'reports', 'platform'];
   const onlineProbes = probes.data?.filter((probe) => probe.online) ?? [];
+  // 2.9.2 (#9 Analyzer T5): "vProbe not connected" is the correct label when
+  // no probe reports `online=true` (ANR2 observed health=DEGRADED,
+  // telemetry_status=IDLE). Keep the label and add the reason so the user
+  // sees WHY the probe is not connected (health + telemetry).
+  const firstProbe = probes.data?.[0];
+  const probeReason = firstProbe
+    ? [firstProbe.health, firstProbe.telemetry_status]
+        .filter((value) => value && value !== 'UNKNOWN')
+        .join(' · ')
+    : '';
   const probeLabel = probes.isError
     ? 'vProbe UNKNOWN'
     : onlineProbes.length > 0
       ? `${onlineProbes.length} vProbe connected`
       : probes.data?.length
-        ? 'vProbe not connected'
+        ? probeReason
+          ? `vProbe not connected · ${probeReason}`
+          : 'vProbe not connected'
         : 'vProbe UNKNOWN';
-  const observedTechnologies = [...new Set(datasets.data?.map((item) => item.technology).filter(Boolean) ?? [])];
+  // 2.9.2 (#9 Analyzer T5): the aggregate used to show "Observed: UNKNOWN /
+  // LTE" because `dataset-continuous-lab-import` reported technology=UNKNOWN
+  // before any decoded plane landed. Backend now derives technology from the
+  // capture job profile as a fallback; here we also drop the UNKNOWN sentinel
+  // from the display so the top-bar names only technologies actually observed.
+  const observedTechnologies = [
+    ...new Set(
+      datasets.data
+        ?.map((item) => item.technology)
+        .filter((value): value is string => Boolean(value) && value !== 'UNKNOWN') ?? [],
+    ),
+  ];
 
   function submit(event: React.FormEvent) {
     event.preventDefault();

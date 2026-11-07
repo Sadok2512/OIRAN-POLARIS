@@ -1774,6 +1774,76 @@ mod tests {
         );
     }
 
+    /// 2.9.2 — ANR2 #9 comment 6712678520. Real production shape:
+    ///   * N2 NGAP emits `tunnel_endpoint_ip=10.77.22.13,gtp_teid=0x12a6`.
+    ///   * N4 PFCP emits `teid=0x000012a6,v4=true,v6=false,ipv4=10.77.22.13`
+    ///     — PADDING 8 hex digits + `ipv4=`/`teid=` naming (decoder-pfcp).
+    ///   * SBI N1N2MessageTransfer emits
+    ///     `tunnel_endpoint_ip=10.77.22.13,gtp_teid=0x12a6` as the
+    ///     composed `N2 UL NG-U UP TNL Information` IE (decoder-sbi).
+    ///   * Same `(ip, teid)` as a u32: 0x12a6. The shared
+    ///     `normalize_teid` MUST collapse them.
+    /// ANR2 observed EXACT on N2↔N4 but UNKNOWN on SBI↔N2 and SBI↔N4;
+    /// this test fails BEFORE the 2.9.2 fix and passes AFTER.
+    #[test]
+    fn sbi_tunnel_match_links_production_event_shapes_from_anr2_6712678520() {
+        let n2 = e(
+            "evt-a608157cbcd0940b",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            1,
+            &[],
+            json!([
+                {"name":"UL NG-U UP TNL Information",
+                 "value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0x12a6"}
+            ]),
+        );
+        let n4 = e(
+            "evt-ee7c9b46059e58e6",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            2,
+            &[],
+            json!([
+                {"name":"F-TEID",
+                 "value":"teid=0x000012a6,v4=true,v6=false,ipv4=10.77.22.13"}
+            ]),
+        );
+        let sbi = e(
+            "evt-0555068f3e89d755",
+            "SBI",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            3,
+            &[
+                ("tunnel_endpoint_ip", "10.77.22.13"),
+                ("gtp_teid", "0x12a6"),
+            ],
+            json!([
+                {"name":"N2 UL NG-U UP TNL Information",
+                 "value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0x12a6"},
+                {"name":"n2SmInfo sha256",
+                 "value":"2aebc25884ad9dd4e43995cc7f1075dc1be24459c5f0a2c04d23624f45d5f389"}
+            ]),
+        );
+        let edges = correlate_cross_interface_evidence(&[n2, n4, sbi]);
+        let rules: Vec<&str> = edges.iter().map(|e| e.rule_id.as_str()).collect();
+        assert!(
+            rules.contains(&"ngap-pfcp-exact-tunnel"),
+            "N2↔N4 EXACT must hold with real N4 padding format; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"sbi-n2-tunnel-match"),
+            "SBI↔N2 must emit EXACT on real ANR2 shapes; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"sbi-n4-tunnel-match"),
+            "SBI↔N4 must emit EXACT on real ANR2 shapes; rules={rules:?}"
+        );
+    }
+
     #[test]
     fn capture_scope_fallback_unifies_planes_under_dataset_directory() {
         // Each plane has its own per-file capture_id; only the parent dir is

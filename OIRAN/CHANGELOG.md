@@ -1,5 +1,140 @@
 # Changelog
 
+## OIRAN API 2.9.2 follow-up #2 — 2026-11-07 — SBI pair confidence + Analyzer technology fallback + vProbe reason (#9 comment 6712678520)
+
+### Proven cause — N2_SBI stuck at UNKNOWN despite an EXACT tunnel match
+
+ANR2 on `tpl-small-traffic-e2bea97912f9` observed
+`{"N2_N4":"EXACT","N2_SBI":"UNKNOWN","N4_N3":"EXACT","SBI_N4":"UNKNOWN"}`
+with the same `(tunnel_endpoint_ip=10.77.22.13, gtp_teid=0x12a6)` on
+N2, SBI and N4. The shared TEID/IP normalisation path is correct:
+
+- `OIRAN/correlation-engine/src/lib.rs:475` (`normalize_teid`) parses
+  as `u32` — collapses `0x12a6` (N2/SBI, no padding) and `0x000012a6`
+  (N4, 8-digit padding emitted by `decoder-pfcp` at
+  `decoder-pfcp/src/lib.rs:173` and `:251`) to the same value.
+- `OIRAN/correlation-engine/src/lib.rs:520` (`tunnel_keys`) tries BOTH
+  `(tunnel_endpoint_ip, gtp_teid)` and `(ipv4, teid)` IE patterns, so
+  `decoder-ngap` (N2), `decoder-sbi` (N1N2MessageTransfer, line 791
+  — composed `N2 UL NG-U UP TNL Information` IE) and `decoder-pfcp`
+  (F-TEID IE) all feed the same canonical key.
+
+The defect is one level below: `OIRAN/callflow-schema/src/lib.rs:541`
+(`confidence_for`) compared `edge.source_interface == a &&
+edge.target_interface == b` STRICTLY. `sbi-n2-tunnel-match` emits its
+edge as `(source=SBI, target=N2)` while `ngap-sbi-context-association`
+emits `(source=N2, target=SBI)`; the strict comparison hid the
+former from the `N2_SBI` status key — so an EXACT SBI↔N2 tunnel match
+stayed invisible in production. The fold's `canonical_edge_key`
+(`callflow-schema/src/lib.rs:175`) was already bidirectional, so the
+edge survived the fold intact; only the status aggregation ignored it.
+
+### Fix (`OIRAN/callflow-schema` 1.3.0 → 1.3.1, `OIRAN/apps/web` 2.9.0 → 2.9.1)
+
+- **`confidence_for` is interface-order agnostic.** Both `(a, b)` and
+  `(b, a)` edges are now accepted for the `A_B` status key. Status
+  precedence (`EXACT > STRONG > POSSIBLE`) is unchanged. No other
+  caller relies on the directional strictness.
+- **Analyzer top-bar technology fallback (`OIRAN/apps/api`).** The
+  `/datasets` enumeration used to call
+  `technology_from_interfaces(decode_reports.keys())` — which
+  returned `UNKNOWN` for `dataset-continuous-lab-import` during the
+  cold window between dataset creation and the first decoded plane.
+  2.9.2-fu2 adds `technology_for_live_fallback` (`apps/api/src/lib.rs`):
+  when the plane-based inference is `UNKNOWN`, the capture job's
+  declared profile (`POLARIS_5G_SA_*` → `5G SA`,
+  `POLARIS_LTE_*` → `LTE`) is used instead. Unrecognised profile stays
+  `UNKNOWN` — never invented.
+- **Analyzer header filtering (`OIRAN/apps/web/src/layouts/AppShell.tsx`).**
+  `observedTechnologies` drops the `UNKNOWN` sentinel so the top-bar
+  names only the technologies actually observed. ANR2 will see
+  `Observed: 5G SA` instead of `Observed: UNKNOWN / LTE`.
+- **vProbe not-connected reason.** The `vProbe not connected` label
+  is kept (accurate when no probe reports `online=true`) but now
+  appends `· <health> · <telemetry_status>` so the user sees WHY
+  (ANR2 example: `vProbe not connected · DEGRADED · IDLE`).
+
+### Open — SBI_N4 stays UNKNOWN on `tpl-small-traffic-e2bea97912f9`
+
+With the bidirectional `confidence_for`, N2_SBI reaches EXACT as soon
+as `sbi-n2-tunnel-match` fires. SBI_N4 still reports UNKNOWN on ANR2's
+run even though the edge direction `(SBI, N4)` matches the status key
+directly. Code reading does not prove a second defect; the remaining
+candidates require the raw dataset:
+
+- `decoder-sbi` may not emit the composed IE on these specific
+  transfers (`transfer.ul_tunnel.as_ref()` or
+  `ul_tunnel.ipv4_address() / teid()` returning `None`).
+- The SBI event may be absent from the per-session `selected` list
+  used at `live-probe/src/lib.rs:1722` — `ngap-sbi-context-association`
+  only fires on `CreateSMContext`, so a session with only
+  `N1N2MessageTransfer` SBI events would never pull SBI into the
+  session scope via that association; the tunnel-match path should
+  still cover it, but a deeper trace is needed.
+
+Both require the SBI event's raw `information_elements` JSON from
+`dataset/oiran_events.jsonl` on the ANR2 run. Per the project rule
+("un écart se ferme ou se déclare OUVERT, jamais expliqué par
+hypothèse"), **SBI_N4 remains OPEN pending that evidence**.
+
+### Open — POLARIS run_id searchable in Session Explorer
+
+`tpl-small-traffic-e2bea97912f9` is a POLARIS-side identifier. OIRAN's
+`CaptureJob` and `LiveDataset` do not store it today. `/sessions?search=`
+(`apps/api/src/lib.rs:2472`) is a substring match over the session
+summary JSON — so making the run_id searchable only requires it to
+appear in that JSON. Introducing an `external_run_id` field on
+`CaptureJob` (populated when POLARIS triggers the continuous-lab-import
+job) is the minimal change but **requires coordination with POLARIS**
+to pass the run_id through its POST body; it is **OPEN for the next
+2.9.x patch, not in scope for 2.9.2**.
+
+### Tests
+
+- `cargo test --workspace --locked --release --offline --no-fail-fast`
+  → **407 passed, 0 failed, 4 ignored** (baseline 404 — one new
+  callflow-schema test, one new correlation-engine test, one new
+  oiran-api test).
+- `sbi_tunnel_match_links_production_event_shapes_from_anr2_6712678520`
+  — reproduces the ANR2 shapes byte-for-byte:
+  * N2 IE `tunnel_endpoint_ip=10.77.22.13,gtp_teid=0x12a6`,
+  * N4 IE `teid=0x000012a6,v4=true,v6=false,ipv4=10.77.22.13`
+    (production `decoder-pfcp` format),
+  * SBI IE `N2 UL NG-U UP TNL Information` with the composed value,
+  * asserts both `sbi-n2-tunnel-match` and `sbi-n4-tunnel-match`
+    fire, and `ngap-pfcp-exact-tunnel` still holds. Proves
+    `tunnel_keys` + `normalize_teid` are correct on real formats.
+- `confidence_for_pair_is_interface_order_agnostic` — constructs a
+  `(SBI, N2)` edge and asserts `confidence_for("N2","SBI")` returns
+  EXACT (previously: `UNKNOWN`). Closes the N2_SBI defect.
+- `technology_for_live_fallback_prefers_planes_then_profile_then_unknown`
+  — observed planes win; cold dataset drops to profile; unknown
+  profile stays UNKNOWN (never invented).
+- Frontend `vitest run` — **93 passed / 14 files** (one new
+  `app-shell-live-state` scenario covering UNKNOWN filtering and the
+  probe-not-connected reason; `version-footer` updated for the
+  2.9.1 web bundle / 2.9.2 API).
+- Frontend `tsc -b --pretty false` — clean.
+
+### SemVer
+
+| Component | Before | After |
+|---|---|---|
+| `OIRAN/callflow-schema` | 1.3.0 | **1.3.1** |
+| `OIRAN/apps/web` | 2.9.0 | **2.9.1** |
+| `OIRAN/apps/api` | 2.9.2 | 2.9.2 (same 2.9.2 patch bundle as 87c2784 + 471ebde) |
+| `OIRAN/live-probe` | 0.4.20 | 0.4.20 |
+
+### Compat
+
+- Compiles under `rustc 1.75` (workspace minimum) and `rustc 1.83`
+  (server toolchain). No nightly / unstable feature used.
+- Backwards compatible: `confidence_for` is private to
+  `callflow-schema`; its new behavior is a pure relaxation (accepts
+  a superset of inputs). Frontend `AppShell` continues to render
+  the same fields; only the filtering changes.
+
+
 ## OIRAN API 2.9.2 — 2026-11-07 — prefix-SHA repair grouping + derived continuous interfaces + LTE publication (#9 comments 6708784283 + 6710853974)
 
 ### Follow-up fix — LTE planes imported but zero events published (ANR2 #9 comment 6710853974)

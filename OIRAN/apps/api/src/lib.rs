@@ -1476,7 +1476,7 @@ fn dataset_values(state: &AppState) -> Vec<Value> {
                     "display_name":dataset.dataset_id,
                     "dataset_kind":if derived {"DERIVED"} else if recovered {"RECOVERED"} else {"CAPTURED_LIVE"},
                     "source":if derived {"OFFLINE_DERIVED_REPLAY"} else if recovered {"OFFLINE_RECOVERY"} else {"LIVE_CAPTURE"},
-                    "technology":technology_from_interfaces(dataset.decode_reports.keys().map(String::as_str)),
+                    "technology":technology_for_live_dataset(&dataset, job.as_ref()),
                     "capture_id":dataset.capture_id,
                     "captures":[{"capture_id":dataset.capture_id,"probe_id":job.as_ref().map(|item|item.probe_id.as_str()).unwrap_or("oiran-vprobe-local-01"),"interface_type":interface_type,"packet_count":packet_count,"size_bytes":size_bytes}],
                     "capture_start_timestamp":job.as_ref().and_then(|item|item.started_epoch_ms),
@@ -1561,6 +1561,38 @@ fn technology_from_interfaces<'a>(interfaces: impl Iterator<Item = &'a str>) -> 
         "5G SA"
     } else {
         "UNKNOWN"
+    }
+}
+
+// 2.9.2 (#9 Analyzer T5): dataset-continuous-lab-import used to report
+// `technology: UNKNOWN` until `decode_reports` had its first plane entry
+// — so the Analyzer top-bar aggregated "UNKNOWN / LTE" while the open
+// session was already 5G SA. Prefer the plane-observed inference, then
+// fall back to the declared capture job profile (`POLARIS_5G_SA_*` →
+// 5G SA, `POLARIS_LTE_*` → LTE). Never claim 5G or LTE without a signal
+// from one of these two sources.
+fn technology_for_live_dataset(
+    dataset: &live_probe::LiveDataset,
+    job: Option<&live_probe::CaptureJob>,
+) -> &'static str {
+    technology_for_live_fallback(
+        dataset.decode_reports.keys().map(String::as_str),
+        job.map(|item| item.profile.as_str()),
+    )
+}
+
+fn technology_for_live_fallback<'a>(
+    planes: impl Iterator<Item = &'a str>,
+    profile: Option<&str>,
+) -> &'static str {
+    let inferred = technology_from_interfaces(planes);
+    if inferred != "UNKNOWN" {
+        return inferred;
+    }
+    match profile {
+        Some(profile) if profile.contains("5G_SA") => "5G SA",
+        Some(profile) if profile.contains("LTE") => "LTE",
+        _ => "UNKNOWN",
     }
 }
 
@@ -5158,6 +5190,56 @@ mod tests {
         helper_thread.join().unwrap();
         let _ = fs::remove_dir_all(manager_root);
         let _ = fs::remove_dir_all(helper_root);
+    }
+
+    /// 2.9.2 (#9 Analyzer T5 — comment 6712678520). The continuous lab
+    /// import's live dataset reported `technology: UNKNOWN` to the
+    /// Analyzer top-bar until a decoded plane landed, so ANR2 saw
+    /// "Observed: UNKNOWN / LTE" while the open session was already
+    /// 5G SA. The fallback prefers plane-observed inference and only
+    /// drops to the declared capture job profile when no plane has been
+    /// decoded yet; it must NEVER invent a technology without one of
+    /// these two signals.
+    #[test]
+    fn technology_for_live_fallback_prefers_planes_then_profile_then_unknown() {
+        let planes = ["N2", "N4"];
+        assert_eq!(
+            technology_for_live_fallback(
+                planes.iter().copied(),
+                Some("POLARIS_LTE_CONTINUOUS_IMPORT"),
+            ),
+            "5G SA",
+            "observed 5G planes outrank the LTE profile fallback"
+        );
+        assert_eq!(
+            technology_for_live_fallback(
+                std::iter::empty(),
+                Some("POLARIS_5G_SA_CONTINUOUS_IMPORT"),
+            ),
+            "5G SA",
+            "cold dataset derives from the 5G SA profile"
+        );
+        assert_eq!(
+            technology_for_live_fallback(
+                std::iter::empty(),
+                Some("POLARIS_LTE_E2E_SMALL_TRAFFIC"),
+            ),
+            "LTE",
+            "cold dataset derives from the LTE profile"
+        );
+        assert_eq!(
+            technology_for_live_fallback(std::iter::empty(), None),
+            "UNKNOWN",
+            "no plane and no profile → UNKNOWN (never invented)"
+        );
+        assert_eq!(
+            technology_for_live_fallback(
+                std::iter::empty(),
+                Some("CUSTOM_OPERATOR_PROFILE_42"),
+            ),
+            "UNKNOWN",
+            "unrecognised profile → UNKNOWN (never invented)"
+        );
     }
 
     #[tokio::test]

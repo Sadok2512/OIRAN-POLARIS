@@ -538,10 +538,22 @@ fn lte_procedure_group(protocol: &str, name: &str) -> String {
     }
 }
 
+// 2.9.2 (#9 comment 6712678520): the pair confidence is interface-order
+// agnostic. The fold's `canonical_edge_key` already compares pairs
+// bidirectionally, but this helper used to require
+// `edge.source_interface == a && edge.target_interface == b` strictly.
+// `sbi-n2-tunnel-match` emits edges as (SBI, N2) while
+// `ngap-sbi-context-association` emits them as (N2, SBI); the strict
+// comparison hid the former from the "N2_SBI" status key so ANR2 saw
+// `N2_SBI: UNKNOWN` even with an EXACT SBI↔N2 tunnel-match edge present.
 fn confidence_for(edges: &[CorrelationEdge], a: &str, b: &str) -> String {
     let mut value = "UNKNOWN";
     for edge in edges {
-        if edge.source_interface == a && edge.target_interface == b {
+        let matches_forward =
+            edge.source_interface == a && edge.target_interface == b;
+        let matches_reverse =
+            edge.source_interface == b && edge.target_interface == a;
+        if matches_forward || matches_reverse {
             value = match (value, edge.confidence.as_str()) {
                 (_, "EXACT") => "EXACT",
                 ("UNKNOWN", "STRONG") => "STRONG",
@@ -727,5 +739,39 @@ mod tests {
         assert_eq!(flow.end_timestamp, "2026-10-31T12:00:00.000000030Z");
         assert_eq!(flow.accounting.session_events, 3);
         assert_eq!(flow.correlation_status["E2E"], "UNKNOWN");
+    }
+
+    /// 2.9.2 — ANR2 #9 comment 6712678520. `sbi-n2-tunnel-match`
+    /// emits its edge as `(source=SBI, target=N2)` while the
+    /// `ngap-sbi-context-association` sibling emits
+    /// `(source=N2, target=SBI)`. The status key is `N2_SBI` and
+    /// `confidence_for("N2","SBI")` must now accept BOTH directions —
+    /// otherwise an EXACT SBI↔N2 tunnel match stays hidden behind
+    /// `N2_SBI: UNKNOWN` as ANR2 observed on
+    /// `tpl-small-traffic-e2bea97912f9`.
+    #[test]
+    fn confidence_for_pair_is_interface_order_agnostic() {
+        let edge = CorrelationEdge {
+            edge_id: "edge-sbi-n2".into(),
+            source_event_id: "evt-sbi".into(),
+            target_event_id: "evt-n2".into(),
+            source_interface: "SBI".into(),
+            target_interface: "N2".into(),
+            matching_identifiers: vec![
+                "endpoint_ip=10.77.22.13".into(),
+                "teid=0x12a6".into(),
+            ],
+            rule_id: "sbi-n2-tunnel-match".into(),
+            rule_version: "2.0.0".into(),
+            evidence_description: "SBI↔N2 tunnel match".into(),
+            packet_references: vec![],
+            confidence: "EXACT".into(),
+            evidence_type: "EXACT_TUNNEL_MATCH".into(),
+            scope: "tunnel-only".into(),
+            limitations: vec![],
+            matched_rules: vec!["sbi-n2-tunnel-match".into()],
+        };
+        assert_eq!(confidence_for(&[edge.clone()], "N2", "SBI"), "EXACT");
+        assert_eq!(confidence_for(&[edge], "SBI", "N2"), "EXACT");
     }
 }

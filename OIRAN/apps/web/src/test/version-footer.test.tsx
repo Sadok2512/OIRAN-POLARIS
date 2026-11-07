@@ -39,11 +39,11 @@ beforeEach(() => {
     if (path === '/version') {
       return {
         data: {
-          platform_core: '2.9.0',
-          backend_api: '2.9.0',
-          web_frontend: '2.9.0',
+          platform_core: '2.9.2',
+          backend_api: '2.9.2',
+          web_frontend: '2.9.1',
           event_schema: '1.5.0',
-          callflow_schema: '1.3.0',
+          callflow_schema: '1.3.1',
           session_engine: '0.6.0',
           correlation_engine: '0.6.0',
           decoders: {},
@@ -60,21 +60,21 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-describe('Analyzer version footer (2.9.0)', () => {
+describe('Analyzer version footer (2.9.2 follow-up #2)', () => {
   it('shows BOTH the web bundle version and the backend API version', async () => {
     renderFooter();
     const footer = screen.getByTestId('version-footer');
     expect(footer).toBeInTheDocument();
     await waitFor(() =>
-      expect(screen.getByTestId('web-version').textContent).toBe('2.9.0'),
+      expect(screen.getByTestId('web-version').textContent).toBe('2.9.1'),
     );
     await waitFor(() =>
-      expect(screen.getByTestId('api-version').textContent).toBe('2.9.0'),
+      expect(screen.getByTestId('api-version').textContent).toBe('2.9.2'),
     );
   });
 
   it('pins the vite.config.ts VITE_WEB_VERSION to apps/web/package.json', () => {
-    expect(pkg.version).toBe('2.9.0');
+    expect(pkg.version).toBe('2.9.1');
     expect(import.meta.env.VITE_WEB_VERSION).toBe(pkg.version);
   });
 });
