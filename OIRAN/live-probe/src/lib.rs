@@ -447,6 +447,14 @@ pub struct CaptureMetrics {
     pub fresh_packet_count: u64,
     #[serde(default)]
     pub active_ue_ips: Vec<String>,
+    /// 2.9.1 (#9): count of pcap files the source scan observed per
+    /// plane. Covers the 12 production interfaces
+    /// (`N2`/`N3`/`N4`/`N6`/`S11`/`S1-MME`/`S1-U`/`S5-C`/`S5-U`/`S6a`/`SBI`/`Sxab`)
+    /// plus the sentinel `UNKNOWN` for directories outside the
+    /// convention. Entries only appear once at least one file has
+    /// been observed for the plane.
+    #[serde(default)]
+    pub plane_counts: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2007,6 +2015,10 @@ impl CaptureManager {
         // must keep scanning — those paths will become candidates
         // by aging alone.
         let mut last_pending_characterization: usize = 1;
+        // 2.9.1 (#9): paths the worker has already logged under
+        // `CONTINUOUS_PLANE_NOT_ALLOWLISTED`. The set is in-memory per
+        // worker lifetime — restart ⇒ one log per path per start.
+        let mut logged_unknown_planes: BTreeSet<PathBuf> = BTreeSet::new();
         // Exponential backoff on empty scans — each tick with no new
         // segment doubles the sleep up to `MAX_IDLE_SLEEP`. The next
         // segment (detected via source_segments) resets it to the
@@ -2228,6 +2240,34 @@ impl CaptureManager {
                         && !discovery.known_active_paths.contains(path.as_path())
                 })
                 .count();
+            // 2.9.1 (#9): publish the per-plane census to
+            // `CaptureMetrics.plane_counts` so operators see the full
+            // 12-interface landing. Log every unknown / no-decoder
+            // path ONCE per worker lifetime.
+            {
+                let plane_counts = discovery.plane_counts.clone();
+                let mut to_log: Vec<PathBuf> = Vec::new();
+                for path in &discovery.unknown_plane_paths {
+                    if logged_unknown_planes.insert(path.clone()) {
+                        to_log.push(path.clone());
+                    }
+                }
+                self.update(CONTINUOUS_CAPTURE_ID, |job| {
+                    job.metrics.plane_counts = plane_counts;
+                })?;
+                for path in to_log {
+                    let plane = source_interface(&config.source_root, &path)
+                        .unwrap_or_else(|| "UNKNOWN".into());
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_PLANE_NOT_ALLOWLISTED",
+                            "path": path.display().to_string(),
+                            "plane": plane,
+                        })
+                    );
+                }
+            }
             last_full_scan = Instant::now();
             let mut newly_rejected = 0u64;
             for rejected in &discovery.rejected {
@@ -5079,6 +5119,17 @@ struct SourceDiscovery {
     /// `last_pending_characterization` so a quiet active file does not
     /// force endless rescans.
     known_active_paths: BTreeSet<PathBuf>,
+    /// 2.9.1 (#9): count of .pcap files observed per plane by
+    /// `collect_source_paths`, keyed on the canonical interface string
+    /// (`N2`/`N3`/…/`Sxab`) or `UNKNOWN` for unrecognised directories.
+    /// Independent from the `segments` list so planes without a
+    /// decoder (`N6`) are still surfaced.
+    plane_counts: BTreeMap<String, u64>,
+    /// 2.9.1: paths outside the canonical 12-plane allowlist, as seen
+    /// in the latest scan. The worker logs each path ONCE per worker
+    /// lifetime as `CONTINUOUS_PLANE_NOT_ALLOWLISTED`, never silently
+    /// skipping it.
+    unknown_plane_paths: Vec<PathBuf>,
 }
 
 /// 2.8.1 (ANR2 perf 77.31% in `Sha256Hasher::compress`): per-worker
@@ -5120,6 +5171,8 @@ fn source_segments(
     // `last_pending_characterization`; otherwise the gate at :2098
     // never idles on a tree with non-allowlisted directories.
     let mut all_discovered_paths: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut plane_counts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut unknown_plane_paths: Vec<PathBuf> = Vec::new();
     let mut eligible: Vec<SourceCandidateMeta> = Vec::new();
     for path in paths {
         let metadata = fs::symlink_metadata(&path).map_err(display_error)?;
@@ -5129,9 +5182,27 @@ fn source_segments(
         if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() <= 24 {
             continue;
         }
-        let Some(interface) = source_interface(root, &path) else {
-            continue;
+        let interface = match source_interface(root, &path) {
+            Some(value) => value,
+            None => {
+                // 2.9.1 (#9): unknown plane directory → counted as
+                // "UNKNOWN" and surfaced via `unknown_plane_paths`.
+                // The worker logs `CONTINUOUS_PLANE_NOT_ALLOWLISTED`
+                // once per path.
+                *plane_counts.entry("UNKNOWN".to_string()).or_insert(0) += 1;
+                unknown_plane_paths.push(path);
+                continue;
+            }
         };
+        // 2.9.1: per-plane counter covers every allowlisted plane,
+        // including those without a decoder (N6 → counted, no event
+        // ever emitted downstream — same `CONTINUOUS_PLANE_NOT_ALLOWLISTED`
+        // log channel as fully-unknown directories).
+        *plane_counts.entry(interface.clone()).or_insert(0) += 1;
+        if !interface_has_decoder(&interface) {
+            unknown_plane_paths.push(path);
+            continue;
+        }
         all_discovered_paths.insert(path.clone());
         let modified = metadata.modified().map_err(display_error)?;
         // 2.8.3 (#9 comment 6696366882): the stable_age gate is gone.
@@ -5279,6 +5350,8 @@ fn source_segments(
         pending_finalization,
         all_discovered_paths,
         known_active_paths,
+        plane_counts,
+        unknown_plane_paths,
     })
 }
 
@@ -6554,21 +6627,103 @@ fn directory_size(directory: &Path) -> u64 {
         .sum()
 }
 
+/// 2.9.1 (#9): the production source tree lays plane directories out
+/// lowercase (`infrastructure/capture/capture-interface.sh:30-31`
+/// builds `$out_dir/$label/…`, and ANR2's inventory shows the live
+/// tree with these 12 labels: `n2 n3 n4 n6 s11 s1mme s1u s5c s5u s6a
+/// sbi sxab`). `source_interface` returns the canonical interface
+/// string the decoders expect
+/// (`DecodeConfig::interface` allowlist at
+/// `oiran-decode/src/lib.rs:455-470`). Unknown directories yield
+/// `None` and surface in the worker log as
+/// `CONTINUOUS_PLANE_NOT_ALLOWLISTED` plus the
+/// `CaptureMetrics.plane_counts["UNKNOWN"]` counter — never a silent
+/// skip.
+///
+/// Mapping ANR2 label → OIRAN canonical:
+///   * `n2`      → `N2`
+///   * `n3`      → `N3`
+///   * `n4`      → `N4`
+///   * `n6`      → `N6`      (no decoder today; counted, 0 events)
+///   * `s11`     → `S11`
+///   * `s1mme`   → `S1-MME`
+///   * `s1u`     → `S1-U`
+///   * `s5c`     → `S5-C`
+///   * `s5u`     → `S5-U`
+///   * `s6a`     → `S6a`
+///   * `sbi`     → `SBI`
+///   * `sxab`    → `Sxab`
+/// 2.9.1: the canonical interface strings with an OIRAN decoder on
+/// the import pipeline today. Must stay in sync with
+/// `validate_config` at `oiran-decode/src/lib.rs:455-470`.
+/// `N6` is deliberately excluded — it carries user-plane data only
+/// and the OIRAN stack emits no events from it. The live-probe
+/// counts it, logs `CONTINUOUS_PLANE_NOT_ALLOWLISTED {path, plane}`
+/// once per path, and skips ingestion.
+fn interface_has_decoder(interface: &str) -> bool {
+    matches!(
+        interface,
+        "N2" | "N3" | "N4" | "SBI" | "S1-MME" | "S1-U" | "S11" | "S5-C" | "S5-U" | "S6a" | "Sxab"
+    )
+}
+
+fn canonical_interface_for_plane(plane: &str) -> Option<&'static str> {
+    match plane.to_ascii_lowercase().as_str() {
+        "n2" => Some("N2"),
+        "n3" => Some("N3"),
+        "n4" => Some("N4"),
+        "n6" => Some("N6"),
+        "s11" => Some("S11"),
+        "s1mme" | "s1-mme" | "s1m" => Some("S1-MME"),
+        "s1u" | "s1-u" => Some("S1-U"),
+        "s5c" | "s5-c" => Some("S5-C"),
+        "s5u" | "s5-u" => Some("S5-U"),
+        "s6a" => Some("S6a"),
+        "sbi" => Some("SBI"),
+        "sxab" => Some("Sxab"),
+        _ => None,
+    }
+}
+
 fn source_interface(root: &Path, path: &Path) -> Option<String> {
-    path.strip_prefix(root)
-        .ok()?
-        .components()
-        .find_map(|component| {
-            let upper = component.as_os_str().to_str()?.to_ascii_uppercase();
-            ["N2", "N3", "N4"]
-                .into_iter()
-                .find(|name| {
-                    upper == *name
-                        || upper.starts_with(&format!("{name}."))
-                        || upper.starts_with(&format!("{name}_"))
-                })
-                .map(str::to_owned)
-        })
+    let relative = path.strip_prefix(root).ok()?;
+    for component in relative.components() {
+        let raw = component.as_os_str().to_str()?;
+        let (name, _ext) = raw.split_once('.').unwrap_or((raw, ""));
+        let name_or_prefix = name.split('_').next().unwrap_or(raw);
+        if let Some(canonical) = canonical_interface_for_plane(name_or_prefix) {
+            return Some(canonical.to_owned());
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
+fn plane_for_canonical(interface: &str) -> &'static str {
+    match interface {
+        "N2" => "N2",
+        "N3" => "N3",
+        "N4" => "N4",
+        "N6" => "N6",
+        "S11" => "S11",
+        "S1-MME" => "S1-MME",
+        "S1-U" => "S1-U",
+        "S5-C" => "S5-C",
+        "S5-U" => "S5-U",
+        "S6a" => "S6a",
+        "SBI" => "SBI",
+        "Sxab" => "Sxab",
+        _ => "UNKNOWN",
+    }
+}
+
+fn _retired_source_interface_2_9_0(root: &Path, path: &Path) -> Option<String> {
+    // Historical 2.8.x/2.9.0 scope: only the 5G-SA core-stack
+    // directories (`N2`, `N3`, `N4`). Superseded by
+    // `canonical_interface_for_plane` in 2.9.1. Kept for grep-ability
+    // and never called.
+    let _ = (root, path);
+    None
 }
 
 fn copy_verified(segment: &SourceSegment, destination: &Path) -> Result<(), String> {
@@ -10358,6 +10513,115 @@ mod tests {
             "both the formerly-active segment and its rotation sibling must import exactly once"
         );
         manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+    }
+
+    /// 2.9.1 (#9): the production source tree carries 12 plane
+    /// directories (ANR2's inventory: `n2 n3 n4 n6 s11 s1mme s1u s5c
+    /// s5u s6a sbi sxab`). `source_interface` must map every single
+    /// one to a canonical OIRAN interface string, and the full
+    /// allowlist must round-trip through the discovery path's
+    /// `plane_counts` so operators observe the entire landing — no
+    /// silent skip ever.
+    #[test]
+    fn source_interface_maps_every_production_plane_directory_to_a_canonical_interface() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("n2", Some("N2")),
+            ("n3", Some("N3")),
+            ("n4", Some("N4")),
+            ("n6", Some("N6")),
+            ("s11", Some("S11")),
+            ("s1mme", Some("S1-MME")),
+            ("s1u", Some("S1-U")),
+            ("s5c", Some("S5-C")),
+            ("s5u", Some("S5-U")),
+            ("s6a", Some("S6a")),
+            ("sbi", Some("SBI")),
+            ("sxab", Some("Sxab")),
+            // Unknown or out-of-allowlist directory.
+            ("unknown", None),
+            ("other-plane", None),
+        ];
+        let root = temporary_root("source-interface-mapping");
+        for (dir, expected) in cases {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            let path = root.join(dir).join("segment.pcapng");
+            fs::write(&path, b"stub").unwrap();
+            let observed = source_interface(&root, &path);
+            assert_eq!(
+                observed.as_deref(),
+                *expected,
+                "directory `{dir}` must map to {expected:?}"
+            );
+        }
+    }
+
+    /// 2.9.1 (#9): `source_segments` publishes a per-plane census for
+    /// all 12 interfaces plus the `UNKNOWN` sentinel. Planes without
+    /// an OIRAN decoder (N6 today) and fully-unknown directories are
+    /// surfaced via `unknown_plane_paths` so the worker logs
+    /// `CONTINUOUS_PLANE_NOT_ALLOWLISTED` once per path.
+    #[test]
+    fn source_segments_counts_every_plane_and_surfaces_undecoded_paths() {
+        let root = temporary_root("source-segments-plane-counts");
+        for plane in ["n2", "n3", "n4", "n6", "s11", "s1mme", "s1u", "s5c", "s5u", "s6a", "sbi", "sxab", "unknown-plane"] {
+            fs::create_dir_all(root.join(plane)).unwrap();
+            // write_pcap writes a valid 24-byte pcap header plus
+            // one 16+N record; enough to pass the `metadata.len() > 24`
+            // gate in `source_segments`.
+            write_pcap(&root.join(plane).join("segment.pcapng"), &[vec![0u8; 32]]);
+        }
+        // 2.9.1: synthetic one-file-per-plane requires closure proof
+        // (2.8.3 contract). Write one rotation record per plane with
+        // a decoder; the test is not concerned with eligibility for
+        // the undecoded ones.
+        for plane in ["N2", "N3", "N4", "S11", "S1-MME", "S1-U", "S5-C", "S5-U", "S6a", "SBI", "Sxab"] {
+            write_rotation_closures(&root, plane, 1);
+        }
+        let mut cache = SourceSegmentsCache::new();
+        let discovery = source_segments(
+            &root,
+            Duration::ZERO,
+            false,
+            DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+            &mut cache,
+        )
+        .unwrap();
+        // 11 decoder-backed planes + N6 + UNKNOWN = 13 entries.
+        for plane in [
+            "N2", "N3", "N4", "N6", "S11", "S1-MME", "S1-U", "S5-C", "S5-U", "S6a", "SBI", "Sxab",
+            "UNKNOWN",
+        ] {
+            assert_eq!(
+                discovery.plane_counts.get(plane).copied().unwrap_or(0),
+                1,
+                "plane {plane} must appear in plane_counts"
+            );
+        }
+        // N6 and the unknown directory are surfaced for the worker's
+        // once-per-lifetime log.
+        let unknown_dirs: BTreeSet<String> = discovery
+            .unknown_plane_paths
+            .iter()
+            .map(|path| {
+                path.parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect();
+        assert!(unknown_dirs.contains("n6"), "N6 must surface as unknown: {unknown_dirs:?}");
+        assert!(
+            unknown_dirs.contains("unknown-plane"),
+            "fully-unknown directory must surface: {unknown_dirs:?}"
+        );
+        // Decoder-backed planes do NOT appear in unknown_plane_paths.
+        for decoded in ["n2", "n3", "n4", "s11", "s1mme", "s1u", "s5c", "s5u", "s6a", "sbi", "sxab"] {
+            assert!(
+                !unknown_dirs.contains(decoded),
+                "decoded plane {decoded} must NOT be in unknown_plane_paths"
+            );
+        }
     }
 
     #[test]

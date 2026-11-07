@@ -1,5 +1,66 @@
 # Changelog
 
+## OIRAN API 2.9.1 — 2026-11-07 — 12-plane allowlist + Diameter/GTP routing + `CONTINUOUS_PLANE_NOT_ALLOWLISTED` log (#9 silent-skip audit)
+
+### Proven cause (BC3 audit on #9, follow-up to ANR2's allowlist question)
+
+- `source_interface` (`OIRAN/live-probe/src/lib.rs:6565-6581` pre-2.9.1)
+  matched only `N2`/`N3`/`N4`. The 12 production plane directories
+  (`n2 n3 n4 n6 s11 s1mme s1u s5c s5u s6a sbi sxab` per ANR2's
+  inventory) emitted SBI / S1-MME / S1-U / S11 / S5-C / S5-U / S6a /
+  Sxab / N6 PCAPs that landed on disk and were SILENTLY skipped at
+  `source_segments :4704` (`let Some(interface) = … else continue;`).
+  No log, no counter, no `failed_ingestions` entry — zero
+  observability.
+
+### Fix (`OIRAN/live-probe` 0.4.18 → 0.4.19, `oiran-decode` 0.6.0 → 0.6.1, API 2.9.0 → 2.9.1)
+
+- **12-plane allowlist.** `canonical_interface_for_plane` maps every
+  ANR2 directory name to the canonical interface string OIRAN
+  decoders expect
+  (`n2` → `N2`, …, `sxab` → `Sxab`). `source_interface` reuses it.
+- **All existing decoders routed.** `oiran-decode` extended:
+  * UDP: `S5-U`→GTP-U (port 2152), `S5-C`→GTPv2-C (2123),
+    `Sxab`→PFCP (8805) — same wire protocols as their 5G siblings,
+    distinct interface tag downstream.
+  * SCTP: `S6a` → Diameter decoder (IETF DIAMETER_PPID=46, RFC
+    6733). New dependency `decoder-diameter` wired into
+    `decode_capture_streaming`.
+  * SBI/TCP, S1-MME/SCTP (S1AP+NAS), N2/SCTP, N3/N4/S1-U/S11/UDP:
+    unchanged.
+  * `validate_config` allowlist expanded to the 11 decoder-backed
+    interfaces.
+- **No more silent skip.** `source_segments` now publishes
+  `plane_counts: BTreeMap<String, u64>` on every scan (`N2`, `N3`,
+  …, `Sxab`, plus `UNKNOWN` for directories outside the convention)
+  and lists non-decoded paths in `SourceDiscovery.unknown_plane_paths`.
+  The worker:
+  * Updates `CaptureMetrics.plane_counts` after every discovery.
+  * Emits `CONTINUOUS_PLANE_NOT_ALLOWLISTED {path, plane}` on stderr
+    ONCE per path per worker lifetime (dedup set
+    `logged_unknown_planes`). Target planes today: `N6` (counted,
+    no OIRAN decoder) and anything unrecognised.
+
+### SemVer
+
+| Component | Before | After |
+|---|---|---|
+| `OIRAN/oiran-decode` | 0.6.0 | **0.6.1** |
+| `OIRAN/live-probe` | 0.4.18 | **0.4.19** |
+| `OIRAN/apps/api` | 2.9.0 | **2.9.1** |
+
+### Tests
+
+- `cargo test --workspace --locked --release --offline --no-fail-fast`
+  → **402 passed, 0 failed, 4 ignored**.
+- `source_interface_maps_every_production_plane_directory_to_a_canonical_interface`
+  — 12 ANR2 directories + 2 unknown exercises; every canonical
+  mapping asserted.
+- `source_segments_counts_every_plane_and_surfaces_undecoded_paths`
+  — 13-plane tree (12 ANR2 + `unknown-plane`), asserts every entry
+  appears in `plane_counts`, N6 + unknown surface in
+  `unknown_plane_paths`, 11 decoded planes do not.
+
 ## OIRAN API 2.9.0 — 2026-11-07 — lightweight `/datasets` + ETag/304 + per-path Cache-Control + content compression (#9 ANR2 bandwidth)
 
 ### Proven cause (ANR2)

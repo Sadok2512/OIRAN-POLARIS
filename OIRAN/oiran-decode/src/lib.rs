@@ -5,6 +5,7 @@ pub mod lte_fixture;
 use capture_pcap::{
     transport_view, visit_capture, CapturePacket, TransportProtocol, TransportView,
 };
+use decoder_diameter::DiameterDecoder;
 use decoder_gtpu::GtpuDecoder;
 use decoder_gtpv2c::Gtpv2cDecoder;
 use decoder_ngap::NgapDecoder;
@@ -37,6 +38,7 @@ pub fn installed_decoder_versions() -> BTreeMap<String, String> {
         ("NGAP", decoder_ngap::VERSION),
         ("PFCP", decoder_pfcp::VERSION),
         ("S1AP", decoder_s1ap::VERSION),
+        ("Diameter", decoder_diameter::VERSION),
         ("SBI-HTTP2", decoder_sbi::VERSION),
     ]
     .into_iter()
@@ -50,6 +52,10 @@ enum UdpRoute {
     N4Pfcp,
     S1uGtpu,
     S11Gtpv2c,
+    // 2.9.1 (#9): new LTE planes routed by port on their own interface.
+    S5uGtpu,
+    S5cGtpv2c,
+    SxabPfcp,
 }
 
 fn udp_route(interface: &str, source_port: u16, destination_port: u16) -> Option<UdpRoute> {
@@ -59,6 +65,12 @@ fn udp_route(interface: &str, source_port: u16, destination_port: u16) -> Option
         "N4" if has_port(8805) => Some(UdpRoute::N4Pfcp),
         "S1-U" if has_port(2152) => Some(UdpRoute::S1uGtpu),
         "S11" if has_port(2123) => Some(UdpRoute::S11Gtpv2c),
+        // 2.9.1: LTE core planes — same wire protocols, different
+        // interface tag so downstream session/correlation engines keep
+        // them separated per plane.
+        "S5-U" if has_port(2152) => Some(UdpRoute::S5uGtpu),
+        "S5-C" if has_port(2123) => Some(UdpRoute::S5cGtpv2c),
+        "Sxab" if has_port(8805) => Some(UdpRoute::SxabPfcp),
         _ => None,
     }
 }
@@ -67,6 +79,9 @@ fn sctp_route(interface: &str, ppid: u32) -> Option<&'static str> {
     match (interface, ppid) {
         ("N2", 60) => Some("N2"),
         ("S1-MME", 18) => Some("S1-MME"),
+        // 2.9.1 (#9): S6a carries Diameter over SCTP with the IETF
+        // DIAMETER_PPID=46 (RFC 6733 §2.1).
+        ("S6a", 46) => Some("S6a"),
         _ => None,
     }
 }
@@ -162,6 +177,7 @@ where
     let pfcp = PfcpDecoder;
     let gtpu = GtpuDecoder;
     let gtpv2c = Gtpv2cDecoder;
+    let diameter = DiameterDecoder;
     let mut sctp = SctpReassembler::new();
     let mut tcp = TcpReassembler::new();
     let mut event_count = 0usize;
@@ -196,6 +212,9 @@ where
                         UdpRoute::N4Pfcp => (&pfcp, "N4"),
                         UdpRoute::S1uGtpu => (&gtpu, "S1-U"),
                         UdpRoute::S11Gtpv2c => (&gtpv2c, "S11"),
+                        UdpRoute::S5uGtpu => (&gtpu, "S5-U"),
+                        UdpRoute::S5cGtpv2c => (&gtpv2c, "S5-C"),
+                        UdpRoute::SxabPfcp => (&pfcp, "Sxab"),
                     };
                     let mut decoded = Vec::new();
                     decode_udp(
@@ -237,10 +256,10 @@ where
                         raw_payload_reference: &raw,
                         pseudonym_key: &pseudonym_key,
                     };
-                    let decoded = if interface == "S1-MME" {
-                        s1ap.decode(&input).events
-                    } else {
-                        ngap.decode(&input).events
+                    let decoded = match interface {
+                        "S1-MME" => s1ap.decode(&input).events,
+                        "S6a" => diameter.decode(&input).events,
+                        _ => ngap.decode(&input).events,
                     };
                     emit_events(
                         decoded,
@@ -435,9 +454,18 @@ fn validate_config(config: &DecodeConfig) -> Result<(), String> {
     }
     if !matches!(
         config.interface.as_str(),
+        // 2.9.1 (#9): the LTE core planes join the 5G-SA allowlist so
+        // `decode_capture_streaming` routes them to the existing
+        // decoders (GTP-U, GTPv2-C, PFCP, Diameter). N6 remains out —
+        // it carries user-data only and no OIRAN decoder emits events
+        // from it today; the live-probe counts it separately
+        // (`CONTINUOUS_PLANE_COUNTED_NO_DECODER`).
         "N2" | "N3" | "N4" | "SBI" | "S1-MME" | "S1-U" | "S11"
+            | "S5-C" | "S5-U" | "S6a" | "Sxab"
     ) {
-        return Err("interface must be N2, N3, N4, SBI, S1-MME, S1-U or S11".into());
+        return Err(
+            "interface must be N2, N3, N4, SBI, S1-MME, S1-U, S11, S5-C, S5-U, S6a or Sxab".into(),
+        );
     }
     Ok(())
 }

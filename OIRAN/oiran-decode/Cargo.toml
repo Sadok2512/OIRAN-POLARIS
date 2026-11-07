@@ -1,6 +1,6 @@
 [package]
 name = "oiran-decode"
-version = "0.6.0"
+version = "0.6.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,7 @@ decoder-pfcp = { path = "../decoder-pfcp" }
 decoder-gtpu = { path = "../decoder-gtpu" }
 decoder-gtpv2c = { path = "../decoder-gtpv2c" }
 decoder-sbi = { path = "../decoder-sbi" }
+decoder-diameter = { path = "../decoder-diameter" }
 event-schema = { path = "../event-schema" }
 plugin-runtime = { path = "../plugin-runtime" }
 serde = { version = "1.0", features = ["derive"] }
