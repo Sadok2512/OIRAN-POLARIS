@@ -91,7 +91,12 @@ fn derived_output_hard_limit_bytes() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_CONTINUOUS_DERIVED_OUTPUT_MAX_BYTES)
 }
-const MAX_SOURCE_CANDIDATES: usize = 512;
+// 2.8.3 (#9 comment 6696366882): the `MAX_SOURCE_CANDIDATES = 512` cap
+// was removed. ANR2 proved the cap left ~3 292 paths outside the
+// fingerprint cache forever on a 3 805-PCAP tree, so
+// `last_pending_characterization` stayed non-zero and every tick forced
+// a full rescan (92 000 statx / 30 s, 93.07 % CPU). The import queue
+// remains bounded by `MAX_INGESTED_SEGMENTS_PER_SCAN` just below.
 /// 2.7.16: per-scan ingestion ceiling. The lab collector can land tens or
 /// hundreds of segments in a single rotation window. Prior to this ceiling
 /// the import worker tried to admit every candidate in one iteration, so a
@@ -774,51 +779,130 @@ pub fn record_ingestion_failure_with_size(
 /// we never trigger `CONTINUOUS_SOURCE_CHANGED_DURING_IMPORT` because of a
 /// still-live writer.
 ///
-/// The rule is: for each interface, drop the single newest candidate if
-/// its mtime is more recent than `2 × stable_age`. Finalized files (older
-/// than that window) are always eligible, even when they are the newest
-/// for their interface — the next rotation simply did not happen yet.
+/// 2.8.3 (#9 comment 6696366882): a segment is eligible ONLY when its
+/// closure is proven, and closure is NEVER inferred from mtime age.
+/// Two independent proofs are accepted, either suffices:
+///
+/// 1. **Sequence proof.** Dumpcap names each rotation segment
+///    `<label>_<startStamp>_<NNNNN>_<rotationStamp>.pcapng`
+///    (`infrastructure/capture/capture-interface.sh:54`). For a given
+///    interface, every segment whose filename is lexicographically less
+///    than the greatest observed filename is closed — dumpcap has moved
+///    on to a later file. The lex-greatest filename for each interface
+///    is the ACTIVE segment and is never included.
+///
+/// 2. **Rotation-watcher JSONL proof.** `capture-rotation.jsonl` grows
+///    by one record per clean segment close
+///    (`infrastructure/capture/rotation-watcher.sh`). When the number
+///    of records for a plane is ≥ the total number of discovered
+///    segments for that plane, the dumpcap lifecycle has closed every
+///    one — including the lex-greatest — and all are eligible. This
+///    unblocks crash-recovery of a dumpcap that exited after its last
+///    rotation.
+///
+/// Neither proof uses mtime age or mtime "stability". The 2.8.2 behavior
+/// (active segment becoming eligible after `2 × stable_age`) imported a
+/// still-live file three times while it grew; ANR2 reproduced the N4
+/// 9 860 → 10 780 → 12 436 byte sequence.
 pub fn finalized_candidates_only(
-    mut candidates: Vec<FinalizationCandidate>,
-    now: SystemTime,
-    stable_age: Duration,
+    candidates: Vec<FinalizationCandidate>,
+    rotation_record_counts: &BTreeMap<String, usize>,
 ) -> Vec<FinalizationCandidate> {
-    let safety_window = stable_age.saturating_mul(2);
-    let mut newest_by_interface: BTreeMap<String, usize> = BTreeMap::new();
-    for (index, candidate) in candidates.iter().enumerate() {
-        let is_newer = match newest_by_interface.get(&candidate.interface) {
-            Some(&prev) => candidate.modified > candidates[prev].modified,
-            None => true,
-        };
-        if is_newer {
-            newest_by_interface.insert(candidate.interface.clone(), index);
+    let mut max_filename_by_interface: BTreeMap<String, String> = BTreeMap::new();
+    let mut total_by_interface: BTreeMap<String, usize> = BTreeMap::new();
+    for candidate in &candidates {
+        total_by_interface
+            .entry(candidate.interface.clone())
+            .and_modify(|value| *value = value.saturating_add(1))
+            .or_insert(1);
+        match max_filename_by_interface.get_mut(&candidate.interface) {
+            Some(existing) => {
+                if candidate.filename > *existing {
+                    *existing = candidate.filename.clone();
+                }
+            }
+            None => {
+                max_filename_by_interface
+                    .insert(candidate.interface.clone(), candidate.filename.clone());
+            }
         }
     }
-    let active_indexes: BTreeSet<usize> = newest_by_interface
-        .values()
-        .copied()
-        .filter(|index| {
-            now.duration_since(candidates[*index].modified)
-                .map(|age| age < safety_window)
-                .unwrap_or(true)
-        })
-        .collect();
-    let mut index = 0usize;
-    candidates.retain(|_| {
-        let keep = !active_indexes.contains(&index);
-        index += 1;
-        keep
-    });
     candidates
+        .into_iter()
+        .filter(|candidate| {
+            let max_for_iface = max_filename_by_interface.get(&candidate.interface);
+            if max_for_iface != Some(&candidate.filename) {
+                // Sequence proof: a later filename exists for this interface.
+                return true;
+            }
+            // Lex-greatest for its interface. Admit only if the rotation
+            // watcher has recorded at least as many closures as there are
+            // segments — proof the dumpcap lifecycle closed cleanly.
+            let total = total_by_interface
+                .get(&candidate.interface)
+                .copied()
+                .unwrap_or(1);
+            rotation_record_counts
+                .get(&candidate.interface)
+                .map(|&count| count >= total)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// 2.8.3: read `capture-rotation.jsonl` (optional sibling under the source
+/// root) and return `plane -> count of close records`. Each line is a JSON
+/// object with at least `{"plane":"<label>","exit_code":<int>}`. Only
+/// records with `exit_code == 0` count as clean closures.
+///
+/// A missing file is not an error; it simply means no JSONL proof is
+/// available and `finalized_candidates_only` will rely on the sequence
+/// rule alone.
+pub fn load_rotation_record_counts(root: &Path) -> BTreeMap<String, usize> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let Ok(file) = fs::File::open(root.join("capture-rotation.jsonl")) else {
+        return counts;
+    };
+    let reader = BufReader::new(file);
+    for line in reader.lines().flatten() {
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(plane) = record.get("plane").and_then(Value::as_str) else {
+            continue;
+        };
+        let exit_ok = record
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .map(|code| code == 0)
+            .unwrap_or(false);
+        if !exit_ok {
+            continue;
+        }
+        // Keys are normalised to the same case as `source_interface`
+        // returns (upper-case plane name) so `finalized_candidates_only`
+        // can compare directly without a per-call conversion.
+        counts
+            .entry(plane.to_ascii_uppercase())
+            .and_modify(|value| *value = value.saturating_add(1))
+            .or_insert(1);
+    }
+    counts
 }
 
 /// Minimal shape consumed by `finalized_candidates_only`. Decoupled from
 /// `SourceSegment` so the pure function can be unit-tested without reading
 /// pcap bytes.
+///
+/// 2.8.3 (#9 comment 6696366882): `filename` carries the lexicographically
+/// comparable segment name. The closed-proof relies on it, never on
+/// `modified`, so the `modified` field is kept for persistence callers but
+/// no longer influences eligibility.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalizationCandidate {
     pub interface: String,
     pub modified: SystemTime,
+    pub filename: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2127,10 +2211,22 @@ impl CaptureManager {
                 Err(error) => return Err(error),
             };
             last_pending_finalization = discovery.pending_finalization;
+            // 2.8.3 (#9 comment 6696366882): a KNOWN-ACTIVE segment
+            // (lex-greatest filename per interface, no JSONL closure
+            // proof) is EXPECTED to be absent from the fingerprint
+            // cache. Excluding it here lets this counter reach zero on
+            // a stable tree, so the dir-mtime gate at :2098 can short-
+            // circuit idle ticks without a full scan. The 2.8.2
+            // formula counted every path absent from the capped cache
+            // as pending, so with 3 805 PCAPs and a 512 cap the
+            // counter was ~3 292 and the loop never idled.
             last_pending_characterization = discovery
                 .all_discovered_paths
                 .iter()
-                .filter(|path| !source_cache.contains_key(path.as_path()))
+                .filter(|path| {
+                    !source_cache.contains_key(path.as_path())
+                        && !discovery.known_active_paths.contains(path.as_path())
+                })
                 .count();
             last_full_scan = Instant::now();
             let mut newly_rejected = 0u64;
@@ -3030,6 +3126,267 @@ impl CaptureManager {
             event_count_after,
             session_ids: dataset.session_ids.clone(),
             events_sha256,
+        })
+    }
+
+    /// 2.8.3 (#9 comment 6704872754): historical repair for datasets
+    /// that imported an active dumpcap segment multiple times at
+    /// different sizes — the same `source_path` appears in
+    /// `state.segments` with several distinct checksums. Keeps only the
+    /// events whose `packet_references[0].source_file` matches the
+    /// FINAL owned file of each group (largest `size_bytes`, tie-
+    /// broken by latest `imported_epoch_ms`). Output is sorted in the
+    /// canonical `(capture_id, packet_number, event_id)` order the
+    /// `dataset-restore` path uses — never by timestamp.
+    ///
+    /// Idempotent: a second run on the same inputs produces an
+    /// identical `oiran_events.jsonl` (same SHA-256). `--dry-run` mode
+    /// reports what WOULD be removed without writing anything; the
+    /// computed `events_sha256` matches the one a subsequent non-dry
+    /// run would produce.
+    ///
+    /// Semantics preserved vs. `restore_from_archive_segment`:
+    ///   * `flock(LOCK_EX|LOCK_NB)` on
+    ///     `<capture-root>/<continuous-capture-id>/.publication.lock`.
+    ///     The import worker must be stopped.
+    ///   * The hot `dataset/oiran_events.jsonl` is NEVER written
+    ///     directly; everything goes through `.dataset-next` + atomic
+    ///     swap via `.dataset-previous`.
+    ///   * `dataset_manifest.json` and `callflows/` are regenerated
+    ///     from the pruned events — the manifest's `event_count`
+    ///     equals the number of JSONL lines written.
+    pub fn repair_partial_imports(
+        &self,
+        dry_run: bool,
+    ) -> Result<DatasetRepairReport, String> {
+        let base = self.root.join(CONTINUOUS_CAPTURE_ID);
+        let _publication_lock = PublicationLock::try_acquire(&base)?;
+        let current = base.join("dataset");
+        let next = base.join(".dataset-next");
+        let previous = base.join(".dataset-previous");
+        if previous.is_dir() && !current.is_dir() {
+            fs::rename(&previous, &current).map_err(display_error)?;
+        }
+        if next.exists() {
+            fs::remove_dir_all(&next).map_err(display_error)?;
+        }
+        let current_events = current.join("oiran_events.jsonl");
+        if !current_events.is_file() {
+            return Err(format!(
+                "REPAIR_MISSING_HOT_VIEW: {}",
+                current_events.display()
+            ));
+        }
+        let state_path = base.join("import_state.json");
+        if !state_path.is_file() {
+            return Err(format!(
+                "REPAIR_MISSING_IMPORT_STATE: {}",
+                state_path.display()
+            ));
+        }
+        let state: ContinuousImportState = serde_json::from_slice(
+            &fs::read(&state_path).map_err(display_error)?,
+        )
+        .map_err(|error| format!("REPAIR_STATE_INVALID: {error}"))?;
+
+        let mut by_source: BTreeMap<String, Vec<&ImportedSegment>> = BTreeMap::new();
+        for segment in state.segments.values() {
+            by_source
+                .entry(segment.source_path.clone())
+                .or_default()
+                .push(segment);
+        }
+        let mut partial_groups: Vec<PartialImportGroup> = Vec::new();
+        let mut partial_owned: BTreeSet<String> = BTreeSet::new();
+        for (source_path, segments) in &by_source {
+            if segments.len() <= 1 {
+                continue;
+            }
+            let final_segment = segments
+                .iter()
+                .max_by_key(|segment| (segment.size_bytes, segment.imported_epoch_ms))
+                .copied()
+                .unwrap();
+            let mut members = Vec::with_capacity(segments.len());
+            for segment in segments {
+                members.push(PartialImportMember {
+                    owned_file: segment.owned_file.clone(),
+                    size_bytes: segment.size_bytes,
+                    imported_epoch_ms: segment.imported_epoch_ms,
+                });
+                if segment.owned_file != final_segment.owned_file {
+                    partial_owned.insert(segment.owned_file.clone());
+                }
+            }
+            partial_groups.push(PartialImportGroup {
+                source_path: source_path.clone(),
+                partial_owned_files: members,
+                final_owned_file: final_segment.owned_file.clone(),
+                final_size_bytes: final_segment.size_bytes,
+            });
+        }
+        let mut final_by_partial: BTreeMap<String, String> = BTreeMap::new();
+        for group in &partial_groups {
+            for member in &group.partial_owned_files {
+                if member.owned_file != group.final_owned_file {
+                    final_by_partial
+                        .insert(member.owned_file.clone(), group.final_owned_file.clone());
+                }
+            }
+        }
+
+        let event_count_before = count_valid_event_records(&current_events)?;
+        let mut removed: Vec<RepairRemovedEvent> = Vec::new();
+        let mut kept: Vec<(String, u64, String, String)> = Vec::new();
+        if !partial_groups.is_empty() {
+            let reader = BufReader::new(fs::File::open(&current_events).map_err(display_error)?);
+            for line in reader.lines() {
+                let line = line.map_err(display_error)?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value: Value = match serde_json::from_str(&line) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let source_file = value
+                    .pointer("/packet_references/0/source_file")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let source_file_name = std::path::Path::new(source_file)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                if partial_owned.contains(&source_file_name) {
+                    let event_id = value
+                        .get("event_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let supersede = final_by_partial
+                        .get(&source_file_name)
+                        .cloned()
+                        .unwrap_or_default();
+                    removed.push(RepairRemovedEvent {
+                        event_id,
+                        source_file: source_file.to_owned(),
+                        reason: format!(
+                            "partial-import-superseded-by-final-owned-file={supersede}"
+                        ),
+                    });
+                    continue;
+                }
+                let capture_id = value
+                    .get("capture_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let packet_number = value
+                    .pointer("/packet_references/0/packet_number")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let event_id = value
+                    .get("event_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                kept.push((capture_id, packet_number, event_id, line));
+            }
+            kept.sort_by(|a, b| (&a.0, a.1, &a.2).cmp(&(&b.0, b.1, &b.2)));
+        }
+
+        let computed_sha_hex = if partial_groups.is_empty() {
+            sha256_hex_file(&current_events)?
+        } else {
+            let mut events_sha = Sha256Hasher::new();
+            for (_, _, _, line) in &kept {
+                events_sha.update(line.as_bytes());
+                events_sha.update(b"\n");
+            }
+            events_sha.finish_hex()
+        };
+        let event_count_after = if partial_groups.is_empty() {
+            event_count_before
+        } else {
+            kept.len()
+        };
+
+        if dry_run || partial_groups.is_empty() {
+            return Ok(DatasetRepairReport {
+                schema_version: "2.8.3",
+                dataset_dir: current.display().to_string(),
+                dry_run,
+                event_count_before,
+                event_count_after,
+                partial_import_groups: partial_groups,
+                removed_events: removed,
+                events_sha256: computed_sha_hex,
+            });
+        }
+
+        let prior_continuous: Option<(PathBuf, LiveDataset)> = if current
+            .join("dataset_manifest.json")
+            .is_file()
+        {
+            let bytes = fs::read(current.join("dataset_manifest.json")).map_err(display_error)?;
+            if let Ok(dataset) = serde_json::from_slice::<LiveDataset>(&bytes) {
+                if validate_dataset_artifacts(&dataset, &current).is_ok() {
+                    Some((current.clone(), dataset))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        prepare_dataset_directory(&next)?;
+        let next_events = next.join("oiran_events.jsonl");
+        {
+            let file = fs::File::create(&next_events).map_err(display_error)?;
+            let mut writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, file);
+            for (_, _, _, line) in &kept {
+                writer.write_all(line.as_bytes()).map_err(display_error)?;
+                writer.write_all(b"\n").map_err(display_error)?;
+            }
+            writer.flush().map_err(display_error)?;
+        }
+        let dataset = self.publish_events_to_dataset_dir(
+            CONTINUOUS_CAPTURE_ID,
+            CONTINUOUS_DATASET_ID.into(),
+            &next,
+            format!("runtime/live-captures/{CONTINUOUS_CAPTURE_ID}/dataset"),
+            prior_continuous,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )?;
+        if previous.exists() {
+            fs::remove_dir_all(&previous).map_err(display_error)?;
+        }
+        if current.exists() {
+            fs::rename(&current, &previous).map_err(display_error)?;
+        }
+        if let Err(error) = fs::rename(&next, &current) {
+            if previous.is_dir() {
+                let _ = fs::rename(&previous, &current);
+            }
+            return Err(display_error(error));
+        }
+        if previous.exists() {
+            fs::remove_dir_all(&previous).map_err(display_error)?;
+        }
+        self.upsert_dataset(dataset, &current)?;
+        Ok(DatasetRepairReport {
+            schema_version: "2.8.3",
+            dataset_dir: current.display().to_string(),
+            dry_run: false,
+            event_count_before,
+            event_count_after,
+            partial_import_groups: partial_groups,
+            removed_events: removed,
+            events_sha256: computed_sha_hex,
         })
     }
 
@@ -4468,6 +4825,10 @@ struct SourceCandidateMeta {
     dev: u64,
     inode: u64,
     mtime_ns: i128,
+    /// 2.8.3: the lexicographically comparable filename
+    /// (`path.file_name()`). Closed-proof uses it to decide which
+    /// candidate is the still-live writer per interface.
+    filename: String,
 }
 
 #[derive(Clone, Debug)]
@@ -4494,10 +4855,14 @@ struct SourceDiscovery {
     pending_finalization: usize,
     /// 2.8.2: the full disk-scan path set BEFORE any cap or filter.
     /// The caller uses this as the "live set" when purging the
-    /// persisted `source_fingerprints` — using `segments` alone
-    /// would mistakenly purge entries beyond `MAX_SOURCE_CANDIDATES`
-    /// even though their file is still on disk.
+    /// persisted `source_fingerprints`.
     all_discovered_paths: BTreeSet<PathBuf>,
+    /// 2.8.3: the paths that `finalized_candidates_only` identified as
+    /// the still-live dumpcap target per interface (sequence proof
+    /// failed, JSONL proof absent). The worker subtracts this set from
+    /// `last_pending_characterization` so a quiet active file does not
+    /// force endless rescans.
+    known_active_paths: BTreeSet<PathBuf>,
 }
 
 /// 2.8.1 (ANR2 perf 77.31% in `Sha256Hasher::compress`): per-worker
@@ -4519,7 +4884,7 @@ fn fingerprint_from_metadata(metadata: &fs::Metadata) -> (u64, u64, u64, i128) {
 
 fn source_segments(
     root: &Path,
-    stable_age: Duration,
+    _stable_age: Duration,
     native_only: bool,
     max_segment_bytes: u64,
     cache: &mut SourceSegmentsCache,
@@ -4532,8 +4897,13 @@ fn source_segments(
     let mut cache_mutated = false;
     let mut paths = Vec::new();
     collect_source_paths(root, 0, &mut paths)?;
-    let all_discovered_paths: BTreeSet<PathBuf> = paths.iter().cloned().collect();
-    let now = SystemTime::now();
+    // 2.8.3 (#9 comment 6696366882): `all_discovered_paths` records
+    // only paths the worker WILL consider — a known interface, not a
+    // symlink, a real file, > 24 B. Files below these filters are
+    // silently ignored by the worker, so they must not count towards
+    // `last_pending_characterization`; otherwise the gate at :2098
+    // never idles on a tree with non-allowlisted directories.
+    let mut all_discovered_paths: BTreeSet<PathBuf> = BTreeSet::new();
     let mut eligible: Vec<SourceCandidateMeta> = Vec::new();
     for path in paths {
         let metadata = fs::symlink_metadata(&path).map_err(display_error)?;
@@ -4546,11 +4916,18 @@ fn source_segments(
         let Some(interface) = source_interface(root, &path) else {
             continue;
         };
+        all_discovered_paths.insert(path.clone());
         let modified = metadata.modified().map_err(display_error)?;
-        if now.duration_since(modified).unwrap_or_default() < stable_age {
-            continue;
-        }
+        // 2.8.3 (#9 comment 6696366882): the stable_age gate is gone.
+        // Dumpcap lifecycle, not wall-clock age, decides eligibility.
+        // Short-lived segments would otherwise re-enter the eligible
+        // pool every scan until they aged, costing a statx per file.
         let (dev, inode, size_bytes, mtime_ns) = fingerprint_from_metadata(&metadata);
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
         eligible.push(SourceCandidateMeta {
             path,
             interface,
@@ -4559,6 +4936,7 @@ fn source_segments(
             dev,
             inode,
             mtime_ns,
+            filename,
         });
     }
     eligible.sort_by(|left, right| {
@@ -4567,34 +4945,34 @@ fn source_segments(
             .cmp(&left.modified)
             .then_with(|| left.path.cmp(&right.path))
     });
-    // Apply the "drop the still-live dumpcap target per interface" filter on
-    // the cheap metadata projection BEFORE any file content is read. The
-    // previous order (fs::read for every candidate, THEN filter) made the
-    // worst-case transient RSS proportional to the candidate pool.
+    // 2.8.3: apply the sequence-based closed-proof + optional JSONL
+    // promotion on the cheap metadata projection. The active segment
+    // per interface is identified and preserved in `known_active_paths`
+    // so the worker loop can exclude it from
+    // `last_pending_characterization` (never a full rescan reason).
+    let rotation_counts = load_rotation_record_counts(root);
     let projections: Vec<FinalizationCandidate> = eligible
         .iter()
         .map(|candidate| FinalizationCandidate {
             interface: candidate.interface.clone(),
             modified: candidate.modified,
+            filename: candidate.filename.clone(),
         })
         .collect();
     let eligible_before_finalization = projections.len();
-    let kept = finalized_candidates_only(projections, now, stable_age);
+    let kept = finalized_candidates_only(projections, &rotation_counts);
     let pending_finalization = eligible_before_finalization.saturating_sub(kept.len());
-    // Rebuild the kept subset positionally. We walk `eligible` and keep any
-    // candidate whose (interface, modified) still appears in `kept`.
-    let mut kept_lookup = kept
-        .into_iter()
-        .map(|p| (p.interface, p.modified))
-        .collect::<Vec<_>>();
+    let kept_key_set: BTreeSet<(String, String)> = kept
+        .iter()
+        .map(|p| (p.interface.clone(), p.filename.clone()))
+        .collect();
+    let mut known_active_paths: BTreeSet<PathBuf> = BTreeSet::new();
     let mut kept_meta: Vec<SourceCandidateMeta> = Vec::new();
     for candidate in eligible {
-        if let Some(position) = kept_lookup
-            .iter()
-            .position(|(iface, m)| iface == &candidate.interface && *m == candidate.modified)
-        {
-            kept_lookup.swap_remove(position);
+        if kept_key_set.contains(&(candidate.interface.clone(), candidate.filename.clone())) {
             kept_meta.push(candidate);
+        } else {
+            known_active_paths.insert(candidate.path);
         }
     }
     // Stream-hash and stream-count packets for each kept candidate, one at a
@@ -4614,9 +4992,14 @@ fn source_segments(
             }
             continue;
         }
-        if segments.len() >= MAX_SOURCE_CANDIDATES {
-            continue;
-        }
+        // 2.8.3 (#9 comment 6696366882): the 512 cap on `segments` is
+        // gone. ANR2 proved that at 3 805 PCAPs the cap left ~3 292 paths
+        // outside the fingerprint cache forever, so
+        // `last_pending_characterization` stayed non-zero and every tick
+        // forced a full rescan (92 000 statx / 30 s). The fingerprint
+        // cache now covers every CLOSED segment on disk; the import
+        // queue remains bounded by `MAX_INGESTED_SEGMENTS_PER_SCAN = 32`
+        // one level up, so the per-scan work budget is unaffected.
         // 2.8.1 (ANR2 perf proof): the cheap key `(dev, inode, size,
         // mtime_ns)` short-circuits the heavy SHA-256 + pcap-record-count
         // work when the file has not been modified since the last scan.
@@ -4679,6 +5062,7 @@ fn source_segments(
         cache_mutated,
         pending_finalization,
         all_discovered_paths,
+        known_active_paths,
     })
 }
 
@@ -5427,6 +5811,45 @@ impl PublicationLock {
         }
         Ok(Self { _file: file })
     }
+}
+
+/// 2.8.3 (#9 comment 6704872754): one historical partial-import group
+/// (same `source_path`, several distinct `owned_file`s / checksums).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartialImportGroup {
+    pub source_path: String,
+    pub partial_owned_files: Vec<PartialImportMember>,
+    pub final_owned_file: String,
+    pub final_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartialImportMember {
+    pub owned_file: String,
+    pub size_bytes: u64,
+    pub imported_epoch_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairRemovedEvent {
+    pub event_id: String,
+    pub source_file: String,
+    pub reason: String,
+}
+
+/// 2.8.3: structured report returned by
+/// `repair_partial_imports`. Serialized to JSON by the
+/// `dataset-repair-partial-imports` binary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetRepairReport {
+    pub schema_version: &'static str,
+    pub dataset_dir: String,
+    pub dry_run: bool,
+    pub event_count_before: usize,
+    pub event_count_after: usize,
+    pub partial_import_groups: Vec<PartialImportGroup>,
+    pub removed_events: Vec<RepairRemovedEvent>,
+    pub events_sha256: String,
 }
 
 /// 2.7.28: structured report returned by `restore_from_archive_segment`.
@@ -6729,6 +7152,10 @@ mod tests {
         let accepted = source.join("N4/accepted.pcap");
         write_pcap(&rejected, &[vec![0; 128]]);
         write_pcap(&accepted, &[vec![0; 16]]);
+        // 2.8.3: synthetic single-segment-per-interface tests use the
+        // rotation JSONL promotion path to avoid the active-file skip.
+        write_rotation_closures(&source, "N2", 1);
+        write_rotation_closures(&source, "N4", 1);
         let rejected_size = fs::metadata(&rejected).unwrap().len();
         assert!(rejected_size > 100);
         assert!(fs::metadata(&accepted).unwrap().len() <= 100);
@@ -6901,6 +7328,32 @@ mod tests {
     /// skip-with-reason instead of silently timing out at the 30 s wait_for
     /// deadline, so the operator can distinguish an environmental skip from
     /// a code bug.
+    /// 2.8.3: appends `count` synthetic "clean close" records to
+    /// `capture-rotation.jsonl` under `root`, keyed on `plane` (matching
+    /// the upper-case convention `source_interface` returns). Tests that
+    /// create a fixed set of synthetic pcaps call this to prove — the
+    /// way a real rotation watcher would — that every segment is closed
+    /// and should therefore be eligible. See
+    /// `finalized_candidates_only` 2.8.3 contract.
+    fn write_rotation_closures(root: &Path, plane: &str, count: usize) {
+        use std::io::Write;
+        let path = root.join("capture-rotation.jsonl");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        for sequence in 0..count {
+            writeln!(
+                file,
+                r#"{{"timestamp":"2026-11-06T00:00:0{suffix}Z","interface":"br-oiran-{low}","plane":"{low}","exit_code":0,"packets_captured":0,"packets_dropped":0}}"#,
+                suffix = sequence % 10,
+                low = plane.to_ascii_lowercase()
+            )
+            .unwrap();
+        }
+    }
+
     fn skip_if_disk_too_full(reason: &str) -> bool {
         use disk_safety::{assess, measure_path, Policy, SafetyState};
         let sample = measure_path(Path::new("/tmp"));
@@ -6962,6 +7415,8 @@ mod tests {
                 directory.join("segment-0001.pcapng"),
             )
             .unwrap();
+            // 2.8.3: single-segment-per-interface — JSONL promotion.
+            write_rotation_closures(&source, interface, 1);
         }
         let bootstrap_root = temporary_root("continuous-bootstrap");
         let bootstrap = bootstrap_root.join("n2_20261026T121214Z_00001_20261026121214.pcapng");
@@ -6994,43 +7449,37 @@ mod tests {
         assert!(first.metrics.active_ue_ips.is_empty());
         let first_event_count = first.metrics.decoded_events;
 
-        let growing = source.join("N2/segment-0001.pcapng");
-        let overlap = fs::read(&growing).unwrap();
-        OpenOptions::new()
-            .append(true)
-            .open(&growing)
-            .unwrap()
-            .write_all(&overlap)
-            .unwrap();
-        wait_for(|| {
-            manager
-                .get(CONTINUOUS_CAPTURE_ID)
-                .is_some_and(|job| job.metrics.segments_ingested == 4)
-        });
-        assert_eq!(
-            manager
-                .get(CONTINUOUS_CAPTURE_ID)
-                .unwrap()
-                .metrics
-                .decoded_events,
-            first_event_count,
-            "overlapping append snapshot must not duplicate prior events"
-        );
-
+        // 2.8.3 (#9 comment 6696366882): the 2.8.2 "overlapping append"
+        // scenario reproduced the ANR2 phantom (importing a growing
+        // active segment three times). Under the 2.8.3 closed-proof
+        // contract we never re-read a segment whose size changed under
+        // us — dumpcap owns its active file and the rotation watcher
+        // only signals closure on a clean exit. The regression is
+        // pinned by `active_segment_is_never_imported_at_any_size` in
+        // `tests/lte_live_bench.rs`; here we assert the simpler
+        // invariant: a byte-identical replay of a closed segment is
+        // deduplicated via `(dev, inode, size, mtime_ns)` → checksum
+        // cache, so segments_ingested stays at 3 and decoded_events at
+        // the first-pass count.
         fs::copy(
             source.join("N2/segment-0001.pcapng"),
             source.join("N2/replayed-overlap.pcapng"),
         )
         .unwrap();
-        thread::sleep(Duration::from_millis(600));
+        // Add a rotation closure so the N2 plane now has JSONL >= segment
+        // count (2 records for 2 files) and both are promoted.
+        write_rotation_closures(&source, "N2", 1);
+        thread::sleep(Duration::from_millis(800));
+        let after_replay = manager.get(CONTINUOUS_CAPTURE_ID).unwrap();
         assert_eq!(
-            manager
-                .get(CONTINUOUS_CAPTURE_ID)
-                .unwrap()
-                .metrics
-                .segments_ingested,
-            4
+            after_replay.metrics.segments_ingested, 3,
+            "a byte-identical replay must not re-ingest"
         );
+        assert_eq!(
+            after_replay.metrics.decoded_events, first_event_count,
+            "a byte-identical replay must not duplicate decoded events"
+        );
+
         manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
         wait_for(|| {
             manager
@@ -7047,7 +7496,7 @@ mod tests {
                 .is_some_and(|job| job.state == CaptureState::Capturing)
         });
         let recovered = restarted.get(CONTINUOUS_CAPTURE_ID).unwrap();
-        assert_eq!(recovered.metrics.segments_ingested, 4);
+        assert_eq!(recovered.metrics.segments_ingested, 3);
         assert_eq!(recovered.session_ids, first.session_ids);
         restarted.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
     }
@@ -7249,6 +7698,9 @@ mod tests {
             let teid = 0x9000_u32 + index;
             write_pcap_at(&path, seconds, &[gtpu_gpdu_frame(index as u8, teid)]);
         }
+        // 2.8.3: promote the 250 synthetic N3 segments to CLOSED via the
+        // rotation-watcher JSONL contract.
+        write_rotation_closures(&source, "N3", 250);
         thread::sleep(Duration::from_millis(500));
         let manager = CaptureManager::with_pseudonym_key_path(
             root.clone(),
@@ -7349,6 +7801,10 @@ mod tests {
             let teid = 0x9000_u32 + index;
             write_pcap_at(&path, seconds, &[gtpu_gpdu_frame(index as u8, teid)]);
         }
+        // 2.8.3: tests promote all 250 synthetic N3 segments to CLOSED via
+        // the rotation-watcher JSONL (the production `finalized_candidates_only`
+        // rule requires closure proof, no mtime age).
+        write_rotation_closures(&source, "N3", 250);
         thread::sleep(Duration::from_millis(500));
         let manager = CaptureManager::with_pseudonym_key_path(
             root.clone(),
@@ -7440,9 +7896,18 @@ mod tests {
             .parent()
             .unwrap()
             .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        // 2.8.3: the 25-byte truncation stub was the SUBJECT of the
+        // first `source_segments` assertion above (0 segments). It has
+        // served its purpose; remove it before the real-ingestion half
+        // of the test so the per-plane single-file JSONL promotion
+        // cleanly exposes the lex-greatest final-*.pcapng in each plane.
+        fs::remove_file(&truncated).unwrap();
         fs::copy(fixture.join("N2.pcapng"), source.join("N2/final-1.pcapng")).unwrap();
         fs::create_dir_all(source.join("N4")).unwrap();
         fs::copy(fixture.join("N4.pcapng"), source.join("N4/final-2.pcapng")).unwrap();
+        // 2.8.3: single-segment-per-interface — JSONL promotion.
+        write_rotation_closures(&source, "N2", 1);
+        write_rotation_closures(&source, "N4", 1);
         thread::sleep(Duration::from_millis(250));
         let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
         manager
@@ -7485,6 +7950,8 @@ mod tests {
         }
         fs::create_dir_all(source.join("N2")).unwrap();
         write_pcap(&source.join("N2/allowed.pcap"), &[vec![0; 64]]);
+        // 2.8.3: single-segment-per-interface — prove closure via JSONL.
+        write_rotation_closures(&source, "N2", 1);
         let segments = source_segments(
             &source,
             Duration::ZERO,
@@ -7509,6 +7976,8 @@ mod tests {
         fs::create_dir_all(source.join("N2")).unwrap();
         let path = source.join("N2").join("seg-1.pcap");
         write_pcap(&path, &[vec![1u8; 128]]);
+        // 2.8.3: single-segment-per-interface — prove closure via JSONL.
+        write_rotation_closures(&source, "N2", 1);
         // First scan: cold cache → cache populated.
         let mut cache = SourceSegmentsCache::new();
         let first = source_segments(
@@ -8513,6 +8982,9 @@ mod tests {
                 &[vec![index; 64]],
             );
         }
+        // 2.8.3: the 8 synthetic N2 segments are promoted to CLOSED via
+        // the rotation JSONL contract.
+        write_rotation_closures(&source, "N2", 8);
         let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
@@ -8555,6 +9027,12 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
             write_pcap(&pcap.join("N2.pcap"), &[vec![rotation as u8 + 20; 64]]);
             write_pcap(&pcap.join("N4.pcap"), &[vec![rotation as u8 + 40; 64]]);
+            // 2.8.3: each rotation adds one new segment per plane; append
+            // one JSONL closure per plane so the promotion gate stays
+            // above the per-plane segment total.
+            write_rotation_closures(&source, "N2", 1);
+            write_rotation_closures(&source, "N3", 1);
+            write_rotation_closures(&source, "N4", 1);
 
             let expected = 11 + u64::from(rotation) * 3;
             wait_for(|| {
@@ -9539,53 +10017,160 @@ mod tests {
         assert_eq!(entry.occurred_epoch_ms, 1_730_000_000_001);
     }
 
+    /// 2.8.3 (#9 comment 6696366882, item 4): the ANR2 phantom imported
+    /// an active N4 segment three times while it grew (9 860 → 10 780 →
+    /// 12 436 B). Each snapshot had a different SHA-256, therefore a
+    /// different `capture_id`, therefore a different `event_id` for the
+    /// same packets (`event_id = "evt-{stable_hash(capture_id | proto |
+    /// msg_type | raw_ticks | raw_payload_ref | packet_refs):016x}"` at
+    /// `OIRAN/event-schema/src/lib.rs:278`). Three snapshots of the same
+    /// 100 packets therefore published 300 event_ids — the dataset-level
+    /// phantom. The 2.8.3 closed-proof gate forbids reading the active
+    /// segment at any size, so no partial import is possible; a complete
+    /// segment imported later has a single stable SHA and therefore a
+    /// single stable event_id per packet.
+    ///
+    /// This test drives a growing file for 10 writes and asserts
+    /// `segments_ingested` stays at zero across every tick.
     #[test]
-    fn finalized_candidates_only_drops_the_still_live_dumpcap_target_per_interface() {
+    fn active_segment_is_never_imported_at_any_size_under_2_8_3() {
+        if skip_if_disk_too_full("active_segment_is_never_imported_at_any_size_under_2_8_3") {
+            return;
+        }
+        let source = temporary_root("partial-import-integrity");
+        let root = temporary_root("partial-import-owned");
+        fs::create_dir_all(source.join("N3")).unwrap();
+        // Single N3 segment, no JSONL proof → ACTIVE → must never be
+        // read. Repeated appends mirror the ANR2 growth sequence.
+        let growing = source.join("N3/active-segment.pcap");
+        write_pcap(&growing, &[vec![0x11u8; 128]]);
+        thread::sleep(Duration::from_millis(250));
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source.clone(),
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
+                max_segments: 8,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+            })
+            .unwrap();
+        // Three scan cycles with no JSONL and no sibling: the active
+        // segment is excluded from `last_pending_characterization`
+        // (`known_active_paths`) so the worker idles after the first
+        // eligibility pass. Every tick must observe `segments_ingested == 0`.
+        for round in 0..3u32 {
+            thread::sleep(Duration::from_millis(500));
+            let job = manager.get(CONTINUOUS_CAPTURE_ID).unwrap();
+            assert_eq!(
+                job.metrics.segments_ingested, 0,
+                "active segment must never be imported; round={round}"
+            );
+        }
+        // Now rotate: create a lex-greater sibling. The formerly active
+        // segment becomes CLOSED by sequence proof; the lex-greatest
+        // (rotation-sibling.pcap) is itself promoted to closed via the
+        // JSONL lifecycle record (count ≥ total). One scan later both
+        // must import exactly once.
+        write_pcap(&source.join("N3/rotation-sibling.pcap"), &[vec![0u8; 64]]);
+        write_rotation_closures(&source, "N3", 2);
+        wait_for(|| {
+            manager
+                .get(CONTINUOUS_CAPTURE_ID)
+                .is_some_and(|job| job.metrics.segments_ingested >= 2)
+        });
+        let final_job = manager.get(CONTINUOUS_CAPTURE_ID).unwrap();
+        assert_eq!(
+            final_job.metrics.segments_ingested, 2,
+            "both the formerly-active segment and its rotation sibling must import exactly once"
+        );
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+    }
+
+    #[test]
+    fn finalized_candidates_only_drops_the_lex_greatest_per_interface() {
+        // 2.8.3: no stable_age / mtime gate. The lex-greatest filename
+        // per interface is the active dumpcap target and is NEVER kept.
         let now = UNIX_EPOCH + Duration::from_secs(1_730_000_300);
-        let stable_age = Duration::from_secs(10);
         let candidates = vec![
-            // Finalized files per interface:
+            FinalizationCandidate {
+                interface: "N2".into(),
+                modified: now - Duration::from_secs(300),
+                filename: "n2_20261104T100000Z_00001_20261104100000.pcapng".into(),
+            },
             FinalizationCandidate {
                 interface: "N2".into(),
                 modified: now - Duration::from_secs(120),
+                filename: "n2_20261104T100000Z_00002_20261104110000.pcapng".into(),
             },
             FinalizationCandidate {
                 interface: "N3".into(),
                 modified: now - Duration::from_secs(300),
+                filename: "n3_20261104T100000Z_00001_20261104100000.pcapng".into(),
             },
-            // Still-live writer on N2 (newest, < 2 × stable_age ago):
-            FinalizationCandidate {
-                interface: "N2".into(),
-                modified: now - Duration::from_secs(5),
-            },
-            // Still-live writer on N3 (newest, mtime inside the safety window):
             FinalizationCandidate {
                 interface: "N3".into(),
-                modified: now - Duration::from_secs(15),
+                modified: now - Duration::from_secs(150),
+                filename: "n3_20261104T100000Z_00002_20261104110000.pcapng".into(),
             },
         ];
-        let kept = finalized_candidates_only(candidates, now, stable_age);
+        let rotation = BTreeMap::new();
+        let kept = finalized_candidates_only(candidates, &rotation);
         assert_eq!(kept.len(), 2);
+        for candidate in &kept {
+            assert!(
+                candidate.filename.contains("_00001_"),
+                "the lex-greatest (00002) per interface must be dropped as active, got {}",
+                candidate.filename
+            );
+        }
+    }
+
+    #[test]
+    fn finalized_candidates_only_never_uses_mtime_age_as_closed_proof() {
+        // 2.8.3: a single segment per interface — no higher-sequence
+        // sibling and no rotation JSONL — stays ACTIVE regardless of
+        // how old its mtime is. The 2.8.2 behaviour (admit after
+        // 2 × stable_age) imported a still-live dumpcap file three
+        // times while it grew (ANR2 N4 9 860 → 10 780 → 12 436 bytes).
+        let now = UNIX_EPOCH + Duration::from_secs(2_000);
+        let ancient = FinalizationCandidate {
+            interface: "N2".into(),
+            modified: now - Duration::from_secs(24 * 3600),
+            filename: "n2_20261103T100000Z_00001_20261103100000.pcapng".into(),
+        };
+        let rotation = BTreeMap::new();
+        let kept = finalized_candidates_only(vec![ancient], &rotation);
         assert!(
-            kept.iter()
-                .all(|candidate| now.duration_since(candidate.modified).unwrap()
-                    >= Duration::from_secs(60)),
-            "the two newest-per-interface files were dropped as potentially active"
+            kept.is_empty(),
+            "a lone segment per interface stays active even when mtime is ancient"
         );
     }
 
     #[test]
-    fn finalized_candidates_only_keeps_the_single_file_when_safety_window_has_elapsed() {
+    fn finalized_candidates_only_promotes_lone_segment_when_jsonl_proves_closure() {
+        // 2.8.3: if the rotation watcher recorded at least one close
+        // for the plane, a lone segment is proven closed (dumpcap
+        // exited cleanly after its last rotation).
         let now = UNIX_EPOCH + Duration::from_secs(2_000);
-        let stable_age = Duration::from_secs(5);
-        let old_enough = FinalizationCandidate {
+        let lone = FinalizationCandidate {
             interface: "N2".into(),
-            modified: now - Duration::from_secs(120),
+            modified: now - Duration::from_secs(300),
+            filename: "n2_20261103T100000Z_00001_20261103100000.pcapng".into(),
         };
-        // A single file older than 2 * stable_age is finalized — no newer
-        // rotation observed, but mtime is well past the writer's cadence.
-        let kept = finalized_candidates_only(vec![old_enough.clone()], now, stable_age);
-        assert_eq!(kept, vec![old_enough]);
+        let mut rotation = BTreeMap::new();
+        rotation.insert("N2".to_string(), 1usize);
+        let kept = finalized_candidates_only(vec![lone.clone()], &rotation);
+        assert_eq!(kept, vec![lone]);
     }
 
     // --- 2.7.27 archive-based retention regression tests -----------
@@ -9892,6 +10477,217 @@ mod tests {
             .restore_from_archive_segment(&segment)
             .expect_err("lock contention must fail fast");
         assert_eq!(error, "RESTORE_REQUIRES_PUBLICATION_LOCK");
+    }
+
+    /// 2.8.3 (#9 comment 6704872754): a published dataset that imported
+    /// an active segment 7 times at growing sizes carries 7 distinct
+    /// `event_id` sequences for the SAME packets (different `capture_id`
+    /// per snapshot). `repair_partial_imports` keeps only the events
+    /// anchored on the FINAL (closed) snapshot; the first 6 are removed
+    /// with their reason, and the resulting JSONL is sorted canonically.
+    /// A second invocation is idempotent — identical SHA-256.
+    #[test]
+    fn repair_partial_imports_keeps_only_final_owned_file_for_a_segment_imported_seven_times() {
+        let base = temporary_root("repair-partial-imports-7x");
+        let continuous = base.join(CONTINUOUS_CAPTURE_ID);
+        let dataset = continuous.join("dataset");
+        fs::create_dir_all(dataset.join("callflows")).unwrap();
+        let source_path = "/var/lib/docker/volumes/oiran_lab_pcap/_data/n4/n4_20261104T142333Z_00056_20261106212341.pcapng";
+        let owned_files = [
+            ("owned-aaaa.pcapng", "sha256:aaaa", 9_860u64, 1u64),
+            ("owned-bbbb.pcapng", "sha256:bbbb", 10_780, 2),
+            ("owned-cccc.pcapng", "sha256:cccc", 11_540, 3),
+            ("owned-dddd.pcapng", "sha256:dddd", 11_980, 4),
+            ("owned-eeee.pcapng", "sha256:eeee", 12_120, 5),
+            ("owned-ffff.pcapng", "sha256:ffff", 12_300, 6),
+            ("owned-gggg.pcapng", "sha256:gggg", 12_436, 7),
+        ];
+        let mut lines = Vec::new();
+        let mut segments_map = serde_json::Map::new();
+        let mut partial_event_ids: BTreeSet<String> = BTreeSet::new();
+        let mut final_event_ids: BTreeSet<String> = BTreeSet::new();
+        for (owned, capture_id, size_bytes, imported_ms) in owned_files {
+            let segment = serde_json::json!({
+                "interface": "N4",
+                "owned_file": owned,
+                "size_bytes": size_bytes,
+                "packets": 3u64,
+                "imported_epoch_ms": imported_ms,
+                "source_path": source_path,
+                "historical_context": false,
+            });
+            let checksum = capture_id.strip_prefix("sha256:").unwrap().to_owned();
+            segments_map.insert(checksum, segment);
+            // Three events per snapshot — packets 1, 2, 3. Each snapshot
+            // emits DIFFERENT event_ids because capture_id differs.
+            for packet in 1..=3u64 {
+                let event_id = format!("evt-{}-p{packet}", owned.trim_end_matches(".pcapng"));
+                let owned_full = continuous.join("pcap").join(owned);
+                let line = serde_json::json!({
+                    "event_id": event_id,
+                    "capture_id": capture_id,
+                    "capture_point_id": "N4",
+                    "timestamp": {
+                        "seconds": packet,
+                        "nanoseconds": 0,
+                        "raw_ticks": packet as i128 * 1_000_000_000i128,
+                        "display": "",
+                    },
+                    "interface": "N4",
+                    "protocol": "PFCP",
+                    "message_name": "SessionEstablishmentRequest",
+                    "source_endpoint": {"address": "10.0.0.1", "network_function": "SMF"},
+                    "destination_endpoint": {"address": "10.0.0.2", "network_function": "UPF"},
+                    "direction": "CORE_TO_RAN",
+                    "session_identifiers": [],
+                    "information_elements": [],
+                    "decoding_status": "DECODED",
+                    "decoder_name": "test",
+                    "decoder_version": "1",
+                    "raw_payload_reference": capture_id,
+                    "packet_references": [{
+                        "source_file": owned_full.display().to_string(),
+                        "packet_number": packet,
+                        "byte_offset": 0,
+                        "interface_id": 0,
+                        "captured_length": 1,
+                        "original_length": 1,
+                    }],
+                    "errors": [],
+                })
+                .to_string();
+                lines.push(line);
+                if owned == "owned-gggg.pcapng" {
+                    final_event_ids.insert(event_id);
+                } else {
+                    partial_event_ids.insert(event_id);
+                }
+            }
+        }
+        // Scramble the input order so the canonical sort has to do
+        // something. The input has 7 × 3 = 21 events.
+        lines.reverse();
+        write_jsonl(&dataset.join("oiran_events.jsonl"), &lines);
+        let state = serde_json::json!({
+            "segments": serde_json::Value::Object(segments_map),
+            "seen_checksums": [],
+            "seen_order": [],
+            "failed_ingestions": [],
+            "source_fingerprints": {},
+        });
+        fs::write(
+            continuous.join("import_state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let manager = fresh_manager_for_restore(&base);
+        // Dry run: computes the would-be SHA + removed list without
+        // writing anything.
+        let dry_report = manager.repair_partial_imports(true).unwrap();
+        assert!(dry_report.dry_run);
+        assert_eq!(dry_report.event_count_before, 21);
+        assert_eq!(dry_report.event_count_after, 3);
+        assert_eq!(dry_report.partial_import_groups.len(), 1);
+        assert_eq!(
+            dry_report.partial_import_groups[0].final_owned_file,
+            "owned-gggg.pcapng"
+        );
+        assert_eq!(dry_report.removed_events.len(), 18);
+        for removed in &dry_report.removed_events {
+            assert!(
+                removed
+                    .reason
+                    .contains("partial-import-superseded-by-final-owned-file=owned-gggg.pcapng"),
+                "removed event must carry a precise reason, got {}",
+                removed.reason
+            );
+        }
+        // Real run.
+        let report = manager.repair_partial_imports(false).unwrap();
+        assert!(!report.dry_run);
+        assert_eq!(report.event_count_after, 3);
+        assert_eq!(report.events_sha256, dry_report.events_sha256);
+        let on_disk = read_event_ids(&dataset.join("oiran_events.jsonl"));
+        assert_eq!(
+            on_disk, final_event_ids,
+            "only events anchored on the final owned_file must remain; got {:?}",
+            on_disk
+        );
+        // Every removed event must correspond to a now-absent event_id.
+        for partial in &partial_event_ids {
+            assert!(
+                !on_disk.contains(partial),
+                "partial-import event {partial} must be removed"
+            );
+        }
+        // Manifest coherence: event_count == on-disk JSONL lines.
+        let manifest: LiveDataset = serde_json::from_slice(
+            &fs::read(dataset.join("dataset_manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.event_count, 3,
+            "manifest event_count must match the pruned JSONL"
+        );
+        // Idempotence: a second pass finds no partial groups (the
+        // state.segments still has 7 entries, but the events referencing
+        // the 6 partial owned files are gone, so repair will compute
+        // the same SHA as the input — i.e., no-op repair).
+        let second = manager.repair_partial_imports(false).unwrap();
+        assert_eq!(second.event_count_after, 3);
+        assert_eq!(
+            second.events_sha256, report.events_sha256,
+            "second repair must be byte-identical (idempotent)"
+        );
+    }
+
+    /// 2.8.3: repair is a strict no-op on a healthy dataset — no
+    /// partial groups, no removed events, events_sha256 unchanged.
+    #[test]
+    fn repair_partial_imports_is_noop_on_a_healthy_dataset() {
+        let base = temporary_root("repair-partial-imports-healthy");
+        let continuous = base.join(CONTINUOUS_CAPTURE_ID);
+        let dataset = continuous.join("dataset");
+        fs::create_dir_all(dataset.join("callflows")).unwrap();
+        write_jsonl(
+            &dataset.join("oiran_events.jsonl"),
+            &[
+                restore_test_line("evt-1", "sha256:healthy", 1),
+                restore_test_line("evt-2", "sha256:healthy", 2),
+            ],
+        );
+        let segments = serde_json::json!({
+            "healthy": {
+                "interface": "N2",
+                "owned_file": "healthy.pcap",
+                "size_bytes": 4096u64,
+                "packets": 2u64,
+                "imported_epoch_ms": 1u64,
+                "source_path": "/captures/n2/final.pcapng",
+                "historical_context": false,
+            }
+        });
+        let state = serde_json::json!({
+            "segments": segments,
+            "seen_checksums": [],
+            "seen_order": [],
+            "failed_ingestions": [],
+            "source_fingerprints": {},
+        });
+        fs::write(
+            continuous.join("import_state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        let original_sha = sha256_hex(&fs::read(&dataset.join("oiran_events.jsonl")).unwrap());
+        let manager = fresh_manager_for_restore(&base);
+        let report = manager.repair_partial_imports(false).unwrap();
+        assert!(report.partial_import_groups.is_empty());
+        assert!(report.removed_events.is_empty());
+        assert_eq!(report.event_count_before, 2);
+        assert_eq!(report.event_count_after, 2);
+        assert_eq!(report.events_sha256, original_sha);
     }
 
     /// 2.7.28: `event_id`s that appear in BOTH the current hot view

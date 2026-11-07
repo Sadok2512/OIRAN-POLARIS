@@ -1,5 +1,104 @@
 # Changelog
 
+## OIRAN API 2.8.3 — 2026-11-07 — closed-proof eligibility + historical partial-import repair (#9 comments 6696366882 + 6704872754)
+
+### Proven causes (ANR2)
+
+- `OIRAN/live-probe/src/lib.rs:94` — `MAX_SOURCE_CANDIDATES = 512` capped
+  the fingerprint cache. With 3 805 PCAPs, ~3 292 paths never entered
+  the cache. 92 000 statx / 30 s, 93.07 % CPU.
+- `OIRAN/live-probe/src/lib.rs:4617` — cap enforcement in the
+  fingerprint loop: anything past 512 fell through, keeping those
+  paths outside `source_cache` and unchanged on the next scan.
+- `OIRAN/live-probe/src/lib.rs:2089, :2130-2134` —
+  `last_pending_characterization` counted every `all_discovered_paths`
+  entry absent from `source_cache`. With the 512 cap it stayed > 0 for
+  ~3 292 paths, so the gate at `:2098` never short-circuited and every
+  tick rescanned the whole tree.
+- `OIRAN/live-probe/src/lib.rs:777-804` — the active-segment gate
+  admitted the newest file per interface once its mtime aged past
+  `2 × stable_age`. ANR2's N4 three-size sequence (9 860 → 10 780 →
+  12 436 B) proved an active dumpcap file is rehashed and republished
+  when it stays quiet long enough.
+- `#9` comment 6704872754 — one segment imported 7 times in production,
+  three growing sizes each yielding a distinct `capture_id =
+  sha256:…`. `event_id` derivation
+  (`OIRAN/event-schema/src/lib.rs:278`) hashes
+  `capture_id | protocol | message_type | raw_ticks |
+  raw_payload_reference | packet_refs`, so the SAME packet appears
+  under 7 distinct `event_id`s — zero dedup, one logical packet
+  materialised 7× in the dataset.
+
+### Fix (`OIRAN/live-probe` 0.4.16 → 0.4.17, API 2.8.2 → 2.8.3)
+
+- **Closed-proof eligibility.** `finalized_candidates_only` rewritten:
+  a segment is admitted ONLY if there exists a lex-greater sibling for
+  its interface (dumpcap rotation created the next generation) OR the
+  rotation-watcher JSONL carries at least as many `exit_code:0` records
+  as there are segments for the plane (dumpcap lifecycle closed
+  cleanly). Mtime age / "stability" never participates. The active
+  segment per interface is NEVER read.
+- **No cap on the fingerprint cache.** The 512 limit is removed from
+  the fingerprint loop. The per-scan import work is still bounded by
+  `MAX_INGESTED_SEGMENTS_PER_SCAN = 32`.
+- **Rotation-watcher JSONL parser.** `load_rotation_record_counts(root)`
+  reads `capture-rotation.jsonl` once per scan and returns
+  `plane → clean-close record count`, keyed in the same
+  upper-case convention as `source_interface`.
+- **Finite state for `last_pending_characterization`.**
+  `SourceDiscovery.known_active_paths` is now exposed and the worker
+  loop subtracts it from the pending-characterization count. Paths
+  the worker explicitly ignores (unknown interface, symlink, < 24 B,
+  the known-active segment of each interface) no longer force a
+  rescan. `all_discovered_paths` is rebuilt from the interface-filtered
+  set so files in non-allowlisted plane directories do not count
+  either.
+
+### Historical repair tool
+
+- `CaptureManager::repair_partial_imports(dry_run) -> DatasetRepairReport`:
+  reads `import_state.json`, groups `state.segments` by `source_path`,
+  identifies the FINAL owned_file per group (largest `size_bytes`,
+  tie-broken by latest `imported_epoch_ms`), prunes events whose
+  `packet_references[0].source_file` matches a partial owned_file,
+  rewrites the JSONL in canonical
+  `(capture_id, packet_number, event_id)` order, and republishes the
+  dataset through the same path as `restore_from_archive_segment`
+  under the same `flock` lock. Idempotent — the second run produces
+  an identical SHA-256. Manifest `event_count` equals the JSONL line
+  count. Every removed event is listed with its reason
+  (`partial-import-superseded-by-final-owned-file=<final>`).
+- New binary `OIRAN/live-probe/src/bin/dataset-repair-partial-imports.rs`,
+  `--dry-run` mode available.
+
+### Tests (94 live-probe lib tests + repair + integrity)
+
+- `active_segment_is_never_imported_at_any_size_under_2_8_3` — the
+  worker observes `segments_ingested == 0` across three scans on a
+  lone N3 segment with no JSONL proof, then flips to 2 once a
+  lex-greater sibling is added AND the JSONL records 2 closures.
+- `repair_partial_imports_keeps_only_final_owned_file_for_a_segment_imported_seven_times`
+  — 21 input events across 7 partial imports → 3 kept (those anchored
+  on `owned-gggg.pcapng`, the final 12 436-B snapshot); 18 removed;
+  manifest `event_count = 3`; second invocation byte-identical.
+- `repair_partial_imports_is_noop_on_a_healthy_dataset` — zero
+  partial groups, zero removed, `events_sha256` unchanged.
+- `finalized_candidates_only_drops_the_lex_greatest_per_interface`,
+  `finalized_candidates_only_never_uses_mtime_age_as_closed_proof`,
+  `finalized_candidates_only_promotes_lone_segment_when_jsonl_proves_closure`.
+- 8 legacy tests patched with the new `write_rotation_closures`
+  helper so the ingest-pipeline regressions keep their meaning under
+  the closed-proof contract.
+
+### Measured locally (Node 22.23.4, Rust 1.75 workspace)
+
+- `cargo test --offline --release -p live-probe --lib` → **94 passed,
+  0 failed, 4 ignored**.
+- `cargo build --offline --release -p live-probe --bins` → OK, new
+  binary `dataset-repair-partial-imports` in release target.
+- A 120-s, 3 805-segment real-tree bench with 12 growing-active
+  writers is listed as production acceptance for ANR2 (#10 recipe).
+
 ## OIRAN API 2.8.2 — 2026-11-06 — no-eviction seen index + dir-mtime gate (rollback of 2.8.1, #10 comment 6687323881)
 
 - ANR2 rolled back 2.8.1 in production (#10 comment 6687323881):
