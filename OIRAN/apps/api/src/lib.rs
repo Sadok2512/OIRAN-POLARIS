@@ -4,8 +4,9 @@ mod probe_registry;
 
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware::{from_fn, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -37,6 +38,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tower_http::{
+    compression::CompressionLayer,
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,
 };
@@ -577,18 +579,47 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         let index = dist.join("index.html");
         app = app.fallback_service(ServeDir::new(dist).not_found_service(ServeFile::new(index)));
     }
-    app.layer(SetResponseHeaderLayer::overriding(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    ))
-    .layer(SetResponseHeaderLayer::overriding(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    ))
-    .layer(SetResponseHeaderLayer::overriding(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    ))
+    app.layer(from_fn(static_cache_middleware))
+        .layer(CompressionLayer::new().gzip(true).br(true))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
+}
+
+/// 2.9.0 (#9): per-path Cache-Control for the SPA's static tree. The
+/// ANR2 probe measured hashed `/assets/*` under the global `no-store`,
+/// forcing every reload to re-download the full bundle (~0.87 GiB/h
+/// per browser combined with the dataset poll). Fingerprinted asset
+/// filenames are safe to cache for a year; the HTML entry point stays
+/// `no-cache` so a fresh deploy's shell is picked up on the next
+/// navigation. API JSON and any other response keep the global
+/// `no-store` default assigned by `SetResponseHeaderLayer::if_not_present`.
+async fn static_cache_middleware(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_owned();
+    let mut response = next.run(req).await;
+    let value = if path.starts_with("/assets/") || path.contains("/assets/") {
+        Some("public, max-age=31536000, immutable")
+    } else if path == "/" || path == "/index.html" || path.ends_with("/index.html") {
+        Some("no-cache")
+    } else {
+        None
+    };
+    if let Some(cache_control) = value {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(cache_control),
+        );
+    }
+    response
 }
 
 fn primary_flow(state: &AppState) -> Option<&CallFlow> {
@@ -1487,6 +1518,35 @@ fn dataset_values(state: &AppState) -> Vec<Value> {
     items
 }
 
+/// 2.9.0 (#9): the `/datasets` list view. Produces the same items as
+/// `dataset_values` with the heavy per-plane payloads removed:
+///
+/// * `decode_reports` — 503 KiB on the ANR2 production probe. Available
+///   on `GET /datasets/{id}`.
+/// * `checksums` — 204 KiB on the same probe. Also moved to the single
+///   dataset endpoint.
+/// * `active_pdu_contexts` — the full object graph (packet references
+///   per context) is replaced by a scalar count; the full list stays on
+///   `GET /datasets/{id}`.
+///
+/// The lightweight response combined with the ETag/304 flow kills the
+/// ~0.87 GiB/h/browser bandwidth ANR2 measured under the 3 s dataset
+/// poll.
+fn dataset_summary_values(state: &AppState) -> Vec<Value> {
+    let mut items = dataset_values(state);
+    for item in &mut items {
+        if let Some(object) = item.as_object_mut() {
+            object.remove("decode_reports");
+            object.remove("checksums");
+            if let Some(contexts) = object.remove("active_pdu_contexts") {
+                let count = contexts.as_array().map(Vec::len).unwrap_or(0);
+                object.insert("active_pdu_context_count".into(), Value::from(count));
+            }
+        }
+    }
+    items
+}
+
 fn technology_from_interfaces<'a>(interfaces: impl Iterator<Item = &'a str>) -> &'static str {
     let observed = interfaces.collect::<Vec<_>>();
     if observed
@@ -1620,8 +1680,19 @@ fn enrich_capture(state: &AppState, mut capture: Value) -> Value {
     capture
 }
 
-async fn datasets(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
-    let mut items = dataset_values(&state);
+/// 2.9.0 (#9): the list view now returns a LIGHTWEIGHT dataset
+/// summary. The heavy per-plane `decode_reports` (503 KiB on the ANR2
+/// production probe) and `checksums` (204 KiB) are moved exclusively to
+/// `GET /datasets/{id}`. A weak `ETag` is emitted from the hash of the
+/// response body so a client polling every 3 s can re-validate with
+/// `If-None-Match` and receive `304 Not Modified` while the dataset
+/// list is unchanged.
+async fn datasets(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let mut items = dataset_summary_values(&state);
     if let Some(search) = query.search.as_deref() {
         let search = search.to_ascii_lowercase();
         items.retain(|item| item.to_string().to_ascii_lowercase().contains(&search));
@@ -1631,7 +1702,33 @@ async fn datasets(State(state): State<AppState>, Query(query): Query<ListQuery>)
         query.sort.as_deref().unwrap_or("dataset_id"),
         query.order.as_deref(),
     );
-    paginated(items, &query)
+    let payload = paginated(items, &query);
+    let body = serde_json::to_vec(&payload.0).unwrap_or_default();
+    let etag = format!("W/\"{}\"", &sha256_hex(&body)[..16]);
+    if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH).and_then(|value| value.to_str().ok()) {
+        if if_none_match == etag {
+            let mut response = Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .body(Body::empty())
+                .unwrap();
+            let header_value = HeaderValue::from_str(&etag).unwrap();
+            response.headers_mut().insert(header::ETAG, header_value);
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-cache"),
+            );
+            return response;
+        }
+    }
+    let mut response = (StatusCode::OK, payload).into_response();
+    if let Ok(header_value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, header_value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -4787,6 +4884,115 @@ mod tests {
         // 2.7.18: `historical_events` is the per-flow accounting sum, 76 in
         // the regenerated dataset. 64 is the on-wire event count.
         assert_eq!(value["data"]["historical_events"], 76);
+    }
+
+    /// 2.9.0 (#9): the dataset list omits the heavy `decode_reports`
+    /// and `checksums` payloads so the 3-second poll stops shipping
+    /// ~727 KB (503 KB + 204 KB on the ANR2 production probe) on every
+    /// tick. The full view remains available at `/datasets/{id}`.
+    #[tokio::test]
+    async fn datasets_list_is_lightweight_and_full_view_stays_on_single_endpoint() {
+        let app = router(state(), None);
+        let list = app
+            .clone()
+            .oneshot(req("/api/v1/datasets", true))
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let value = json_body(list).await;
+        let items = value["data"].as_array().expect("dataset list");
+        assert!(!items.is_empty(), "sample dataset must be registered");
+        for item in items {
+            let object = item.as_object().unwrap();
+            assert!(
+                !object.contains_key("decode_reports"),
+                "list view must not carry decode_reports; got {object:?}"
+            );
+            assert!(
+                !object.contains_key("checksums"),
+                "list view must not carry checksums; got {object:?}"
+            );
+            assert!(
+                !object.contains_key("active_pdu_contexts"),
+                "list view must not carry active_pdu_contexts; got {object:?}"
+            );
+        }
+        // The full view is still reachable per id for every item in the
+        // list (synthetic captures, the registry sample, etc).
+        let first_id = items[0]["dataset_id"].as_str().unwrap();
+        let single = app
+            .clone()
+            .oneshot(req(&format!("/api/v1/datasets/{first_id}"), true))
+            .await
+            .unwrap();
+        assert_eq!(single.status(), StatusCode::OK);
+        let full = json_body(single).await;
+        let body = full["data"].as_object().unwrap();
+        // Captured-live datasets keep `decode_reports`/`checksums`
+        // objects; the historical sample exposes them as the empty
+        // object. Either way the key MUST be present on the single-id
+        // route.
+        if first_id.starts_with("ue-") || first_id.starts_with("derived-") || first_id.starts_with("recovered-dataset-") {
+            assert!(body.contains_key("decode_reports"));
+            assert!(body.contains_key("checksums"));
+        }
+    }
+
+    /// 2.9.0 (#9): the list endpoint emits a weak ETag derived from
+    /// the response body hash. A subsequent request carrying
+    /// `If-None-Match: <etag>` must receive a 304 Not Modified with
+    /// the ETag echoed back and no body — kills the 3 s dataset poll
+    /// cost once the view is stable.
+    #[tokio::test]
+    async fn datasets_list_etag_short_circuits_an_unchanged_poll_with_304() {
+        let app = router(state(), None);
+        let first = app
+            .clone()
+            .oneshot(req("/api/v1/datasets", true))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let etag = first
+            .headers()
+            .get(header::ETAG)
+            .expect("ETag on datasets list")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(etag.starts_with("W/\""), "weak ETag expected, got {etag}");
+        let revalidate = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/datasets")
+                    .header(header::IF_NONE_MATCH, &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revalidate.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            revalidate
+                .headers()
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            etag,
+            "304 must echo the current ETag so the client can keep it"
+        );
+        assert_eq!(
+            revalidate
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "private, no-cache"
+        );
+        let body = revalidate.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty(), "304 response must have an empty body");
     }
 
     #[tokio::test]

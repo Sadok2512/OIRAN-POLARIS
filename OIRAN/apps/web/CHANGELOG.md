@@ -2,6 +2,37 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.9.0 — 2026-11-07 (ANR2 bandwidth — ETag/304 polling + version footer)
+
+- `services/api.ts` now caches `ETag` per GET URL and sends
+  `If-None-Match` on subsequent requests. A `304 Not Modified`
+  returns the SAME cached envelope (same object identity), so
+  React Query consumers downstream of this helper receive stable
+  references and never re-render on an unchanged poll.
+- `recommendedPollInterval(path, baseMs)` grows the polling cadence
+  when the server keeps replying `304`: factor 1× for the first
+  three 304s, +1× every three 304s after that, capped at 10×.
+  `resetPollInterval` is called implicitly on every 200 response.
+- `VersionFooter` (new, exported from `layouts/AppShell`) shows
+  `web <X.Y.Z>` (injected by Vite from `package.json` at build
+  time) and `API <X.Y.Z>` (read from `/api/v1/version` under the
+  ETag flow). Rendered at the bottom of every Analyzer page.
+- `vite.config.ts` defines `import.meta.env.VITE_WEB_VERSION` so
+  the footer stays in sync with the published bundle.
+- New vitest files `test/api.test.ts` (ETag + backoff) and
+  `test/version-footer.test.tsx` (web + API versions on screen,
+  package.json pinned).
+
+### Tests (14 files, 92 cases)
+
+- `tsc -b --pretty false` → clean.
+- `vitest run` → **92 passed, 0 failed**.
+- `vite build` → 367.28 KiB JS / 108.83 KiB gzip; `check-dist-leaks`
+  clean (3 files scanned, 2 markers).
+- `s4.spec.ts` compiles under the local Playwright (9 cases listed);
+  live execution requires the preview+API stack (deferred to the
+  ANR2 recipe).
+
 ## 2.8.1 — 2026-11-06 (ANR1 rollback fix — SPA base `/analyzer/` + s4.spec alignment)
 
 - ANR1 deployment was rolled back: the Vite build emitted

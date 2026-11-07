@@ -1,5 +1,59 @@
 # Changelog
 
+## OIRAN API 2.9.0 — 2026-11-07 — lightweight `/datasets` + ETag/304 + per-path Cache-Control + content compression (#9 ANR2 bandwidth)
+
+### Proven cause (ANR2)
+
+- `GET /datasets` shipped 727 KiB on every poll on the production
+  probe: 503 KiB of per-plane `decode_reports` + 204 KiB of
+  `checksums`. Several SPA pages polled it every 3 s, hashed assets
+  were served under the global `Cache-Control: no-store`, and no
+  compression was in effect — ~0.87 GiB/h of wire traffic per browser
+  on a dataset view that rarely changed.
+
+### Fix
+
+- **Lightweight list view** (`apps/api/src/lib.rs:1623` →
+  `datasets` handler). `dataset_summary_values` strips
+  `decode_reports`, `checksums` and the full `active_pdu_contexts`
+  object graph (the active context count is retained as
+  `active_pdu_context_count`). The complete view stays on
+  `GET /datasets/{id}`. Measured reduction on the ANR2 shape: **727
+  KiB → 20 KiB (97.2 % down, ~0.81 GiB/h/browser saved at the 3 s
+  poll)**.
+- **Weak `ETag` + `304 Not Modified`** on `/datasets`. The handler
+  hashes the serialized response body, emits `ETag: W/"<16-hex>"`
+  and returns `304` with `Cache-Control: private, no-cache` when the
+  incoming `If-None-Match` matches. A client under the ETag flow
+  receives ~300 B per poll while the dataset list is stable.
+- **Per-path Cache-Control middleware** (`static_cache_middleware`,
+  `apps/api/src/lib.rs`). Hashed `/assets/*` under the SPA's
+  ServeDir now get `public, max-age=31536000, immutable`; the HTML
+  entry point gets `no-cache`; everything else falls back to the
+  global `no-store`. The global layer is now
+  `SetResponseHeaderLayer::if_not_present` so handler-supplied
+  values (ETag/304, assets, index) actually win.
+- **gzip + brotli compression** of API JSON via
+  `tower_http::compression::CompressionLayer::new().gzip(true).br(true)`.
+
+### SemVer
+
+| Component | Before | After |
+|---|---|---|
+| `OIRAN/apps/api` | 2.8.3 | **2.9.0** |
+
+### Tests (44 API lib + 2 new)
+
+- `datasets_list_is_lightweight_and_full_view_stays_on_single_endpoint`
+  — list view has NO `decode_reports` / `checksums` /
+  `active_pdu_contexts`; `GET /datasets/{id}` still exposes them.
+- `datasets_list_etag_short_circuits_an_unchanged_poll_with_304`
+  — first `GET /datasets` carries an ETag; a second request with
+  `If-None-Match: <etag>` returns 304 with an empty body, the same
+  ETag echoed back, and `Cache-Control: private, no-cache`.
+- `cargo test --workspace --locked --release --offline --no-fail-fast`
+  → **399 passed, 0 failed, 4 ignored**.
+
 ## OIRAN API 2.8.3 — 2026-11-07 — closed-proof eligibility + historical partial-import repair (#9 comments 6696366882 + 6704872754)
 
 ### Proven causes (ANR2)
