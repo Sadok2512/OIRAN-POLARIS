@@ -7,7 +7,7 @@ import {
   Settings, Waypoints,
 } from 'lucide-react';
 import { api } from '../services/api';
-import type { AuthState, Dataset, Metrics, Module, Probe } from '../types/api';
+import type { AuthState, Dataset, Metrics, Module, Probe, VersionInfo } from '../types/api';
 
 type Theme = 'light' | 'dark' | 'system';
 
@@ -185,7 +185,34 @@ export function AppShell() {
           <div className="user"><CircleUserRound /><span>{auth.data?.role === 'viewer' ? 'Public viewer' : auth.data?.role ?? 'Unknown'}</span></div>
         </header>
         <main className="page"><Outlet /></main>
+        <VersionFooter />
       </section>
     </div>
+  );
+}
+
+// 2.9.0 (#9): the Analyzer footer now exposes BOTH versions on screen.
+// The web bundle's `__WEB_VERSION__` is injected by Vite at build time
+// so it survives a cache-busted rebuild; the API version is fetched
+// from `/api/v1/version` under the ETag flow so the panel re-renders
+// only after a backend bump.
+export function VersionFooter() {
+  const versions = useQuery({
+    queryKey: ['version'],
+    queryFn: () => api<VersionInfo>('/version').then((value) => value.data),
+    staleTime: 60_000,
+  });
+  const web = (import.meta.env.VITE_WEB_VERSION as string | undefined) ?? '0.0.0';
+  const api_version = versions.data?.backend_api ?? '…';
+  return (
+    <footer className="app-footer" data-testid="version-footer">
+      <span>OIRAN Analyzer</span>
+      <span>
+        web <b data-testid="web-version">{web}</b>
+      </span>
+      <span>
+        API <b data-testid="api-version">{api_version}</b>
+      </span>
+    </footer>
   );
 }

@@ -11,8 +11,17 @@ const apiTarget=runtimeEnv?.OIRAN_DEV_API_TARGET??'http://127.0.0.1:49152';
 // without a patch; the default matches the production reverse proxy.
 const basePath=runtimeEnv?.OIRAN_WEB_BASE??'/analyzer/';
 
+// 2.9.0 (#9): surface the web bundle's own version at runtime so the
+// Analyzer footer can show `web <X.Y.Z>` alongside the backend API
+// version. The value is pinned here and asserted against
+// `apps/web/package.json` by `src/test/version-footer.test.tsx` — a
+// desync fails the vitest build so a bump can never ship without
+// touching this file.
+const WEB_VERSION = '2.9.0';
+
 export default defineConfig({
   base: basePath,
+  define: { 'import.meta.env.VITE_WEB_VERSION': JSON.stringify(WEB_VERSION) },
   plugins: [react()],
   server: { host: '127.0.0.1', port: 4173, proxy: { '/api': apiTarget } },
   preview: { host: '127.0.0.1', port: 4173, proxy: { '/api': apiTarget } },
