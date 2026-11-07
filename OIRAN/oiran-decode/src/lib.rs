@@ -11,7 +11,7 @@ use decoder_ngap::NgapDecoder;
 use decoder_pfcp::PfcpDecoder;
 use decoder_s1ap::S1apDecoder;
 use decoder_sbi::{decode_connections, SbiDecodeReport};
-use event_schema::{sha256_hex, Endpoint, NormalizedEvent, PacketReference, PseudonymKey};
+use event_schema::{sha256_hex, Endpoint, NormalizedEvent, PacketReference};
 use plugin_runtime::{DecoderInput, ProtocolDecoder};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -106,12 +106,8 @@ pub struct DecodeOutput {
 }
 
 pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
-    // Single-shot decode: generate one key, used only for this call. No way
-    // to correlate against another decode_capture() invocation — exactly what
-    // the mission mandates for a fresh import.
-    let pseudonym_key = PseudonymKey::generate()?;
     let mut events = Vec::new();
-    let report = decode_capture_streaming(config, &pseudonym_key, |event| {
+    let report = decode_capture_streaming(config, |event| {
         events.push(event);
         Ok(())
     })?;
@@ -137,18 +133,12 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
 /// in memory, written to disk, or processed incrementally.
 pub fn decode_capture_streaming<F>(
     config: &DecodeConfig,
-    pseudonym_key: &PseudonymKey,
     mut sink: F,
 ) -> Result<DecodeReport, String>
 where
     F: FnMut(NormalizedEvent) -> Result<(), String>,
 {
     validate_config(config)?;
-    // 2.7.6: the caller owns the pseudonym key. One key per logical import —
-    // standalone decode_capture() generates its own; live-probe continuous
-    // imports hold a job-scoped key and reuse it across every segment so
-    // overlapping snapshots dedupe by identical event_id. The key never
-    // leaves the owning stack frame; this borrow carries only a reference.
     let ngap = NgapDecoder;
     let s1ap = S1apDecoder;
     let pfcp = PfcpDecoder;
@@ -190,15 +180,7 @@ where
                         UdpRoute::S11Gtpv2c => (&gtpv2c, "S11"),
                     };
                     let mut decoded = Vec::new();
-                    decode_udp(
-                        decoder,
-                        &packet,
-                        &view,
-                        config,
-                        interface,
-                        &pseudonym_key,
-                        &mut decoded,
-                    );
+                    decode_udp(decoder, &packet, &view, config, interface, &mut decoded);
                     emit_events(decoded, &mut sink, &mut event_count, &mut sink_error);
                 }
             }
@@ -227,7 +209,6 @@ where
                         destination_endpoint: destination,
                         payload: &message.payload,
                         raw_payload_reference: &raw,
-                        pseudonym_key: &pseudonym_key,
                     };
                     let decoded = if interface == "S1-MME" {
                         s1ap.decode(&input).events
@@ -248,7 +229,6 @@ where
                 emit_sbi_connections(
                     finalized,
                     config,
-                    &pseudonym_key,
                     &mut sink,
                     &mut event_count,
                     &mut sink_error,
@@ -267,7 +247,6 @@ where
     emit_sbi_connections(
         connections,
         config,
-        &pseudonym_key,
         &mut sink,
         &mut event_count,
         &mut sink_error,
@@ -320,7 +299,6 @@ fn emit_events<F>(
 fn emit_sbi_connections<F>(
     connections: Vec<transport_tcp::ReassembledConnection>,
     config: &DecodeConfig,
-    pseudonym_key: &PseudonymKey,
     sink: &mut F,
     event_count: &mut usize,
     sink_error: &mut Option<String>,
@@ -337,7 +315,6 @@ fn emit_sbi_connections<F>(
             &config.capture_id,
             &config.interface,
             &config.endpoints,
-            pseudonym_key,
         );
         aggregate.tcp_connections += report.tcp_connections;
         aggregate.http2_frames += report.http2_frames;
@@ -440,7 +417,6 @@ fn decode_udp(
     view: &TransportView,
     config: &DecodeConfig,
     interface: &str,
-    pseudonym_key: &PseudonymKey,
     events: &mut Vec<NormalizedEvent>,
 ) {
     let payload = &packet.data[view.payload_offset..view.payload_offset + view.payload_length];
@@ -459,7 +435,6 @@ fn decode_udp(
         ),
         payload,
         raw_payload_reference: &raw,
-        pseudonym_key,
     };
     events.extend(decoder.decode(&input).events);
 }

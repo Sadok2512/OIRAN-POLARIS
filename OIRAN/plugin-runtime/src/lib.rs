@@ -2,7 +2,6 @@
 
 use event_schema::{
     DecodeStatus, Endpoint, ExactTimestamp, NormalizedEvent, PacketReference, Protocol,
-    PseudonymKey,
 };
 
 pub const PLUGIN_API_VERSION: &str = "1.1.0";
@@ -33,10 +32,6 @@ pub struct DecoderInput<'a> {
     pub destination_endpoint: Endpoint,
     pub payload: &'a [u8],
     pub raw_payload_reference: &'a str,
-    /// 2.7.6: per-import secret used by decoders to derive HMAC-SHA256-based
-    /// pseudonyms for subscriber identity bytes. Decoders MUST NOT log or
-    /// serialise this key — it only transits the stack through this borrow.
-    pub pseudonym_key: &'a PseudonymKey,
 }
 #[derive(Clone, Debug)]
 pub struct DecoderOutput {

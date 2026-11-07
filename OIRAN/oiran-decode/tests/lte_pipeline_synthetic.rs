@@ -1,7 +1,7 @@
 use decoder_gtpu::GtpuDecoder;
 use decoder_gtpv2c::Gtpv2cDecoder;
 use decoder_s1ap::S1apDecoder;
-use event_schema::{Direction, Endpoint, ExactTimestamp, PacketReference, PseudonymKey};
+use event_schema::{Direction, Endpoint, ExactTimestamp, PacketReference};
 use plugin_runtime::{DecoderInput, ProtocolDecoder};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -56,7 +56,6 @@ fn synthetic_lte_decoders_preserve_planes_direction_and_privacy() {
     let mut uplink = 0usize;
     let mut downlink = 0usize;
     let mut teids = BTreeSet::new();
-    let pseudonym_key = PseudonymKey::from_bytes([0x77; 32]);
     for case in fixture["cases"].as_array().expect("cases") {
         let payload = bytes(case["payload_hex"].as_str().expect("hex"));
         let input = DecoderInput {
@@ -76,7 +75,6 @@ fn synthetic_lte_decoders_preserve_planes_direction_and_privacy() {
             },
             payload: &payload,
             raw_payload_reference: "sha256:synthetic-offline",
-            pseudonym_key: &pseudonym_key,
         };
         let output = match case["decoder"].as_str().unwrap() {
             "S1AP" => S1apDecoder.decode(&input),

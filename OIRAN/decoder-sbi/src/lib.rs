@@ -2,7 +2,7 @@
 
 use event_schema::{
     pseudonym, sha256_hex, DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState,
-    InformationElement, NamedValue, NormalizedEvent, Protocol, PseudonymKey, SbiMetadata,
+    InformationElement, NamedValue, NormalizedEvent, Protocol, SbiMetadata,
 };
 use hpack::huffman::HuffmanDecoder;
 use hpack::Decoder;
@@ -79,7 +79,6 @@ pub fn decode_connections(
     capture_id: &str,
     interface: &str,
     endpoint_names: &HashMap<String, String>,
-    pseudonym_key: &PseudonymKey,
 ) -> (Vec<NormalizedEvent>, SbiDecodeReport) {
     let mut events = Vec::new();
     let mut report = SbiDecodeReport {
@@ -104,14 +103,8 @@ pub fn decode_connections(
             report.errors.append(&mut errors);
         }
         frames.sort_by_key(|frame| (frame.timestamp_ns, frame.direction_index, frame.offset));
-        let (decoded, streams, incomplete, errors) = transactions(
-            connection,
-            frames,
-            capture_id,
-            interface,
-            endpoint_names,
-            pseudonym_key,
-        );
+        let (decoded, streams, incomplete, errors) =
+            transactions(connection, frames, capture_id, interface, endpoint_names);
         report.http2_streams += streams;
         report.incomplete_streams += incomplete;
         report.sbi_transactions += decoded.len();
@@ -216,7 +209,6 @@ fn transactions(
     capture_id: &str,
     interface: &str,
     endpoint_names: &HashMap<String, String>,
-    pseudonym_key: &PseudonymKey,
 ) -> (Vec<NormalizedEvent>, usize, usize, Vec<String>) {
     // Each direction owns an HPACK decoder. The hpack crate's dynamic table
     // state is sequential, so when a given HEADERS block fails to decode we
@@ -351,7 +343,6 @@ fn transactions(
             capture_id,
             interface,
             endpoint_names,
-            pseudonym_key,
         );
         // Preserve every fully decoded transaction (the 0.3.1 parity
         // contract), including one whose request identity was recovered by
@@ -645,11 +636,10 @@ fn build_event(
     capture_id: &str,
     interface: &str,
     endpoint_names: &HashMap<String, String>,
-    pseudonym_key: &PseudonymKey,
 ) -> NormalizedEvent {
     let method = header(&state.request.headers, ":method");
     let raw_path = header(&state.request.headers, ":path");
-    let path = raw_path.as_deref().map(|value| sanitize_uri(value, pseudonym_key));
+    let path = raw_path.as_deref().map(sanitize_uri);
     let status: Option<u16> =
         header(&state.response.headers, ":status").and_then(|value| value.parse().ok());
     let (service, operation) = classify(path.as_deref(), method.as_deref());
@@ -727,7 +717,7 @@ fn build_event(
         raw_sha256: None,
         status: DecodeStatus::Decoded,
     });
-    for (name, value) in json_fields(&state.request.body, pseudonym_key) {
+    for (name, value) in json_fields(&state.request.body) {
         if name == "pdu_session_id" || name == "subscriber_pseudonym" {
             identifiers.push(NamedValue {
                 name: name.clone(),
@@ -749,7 +739,7 @@ fn build_event(
             id: None,
             name: "3gpp-sbi-target-apiroot".into(),
             length: value.len() as u32,
-            value: Some(sanitize_uri(value, pseudonym_key)),
+            value: Some(sanitize_uri(value)),
             raw_sha256: None,
             status: DecodeStatus::Decoded,
         });
@@ -925,7 +915,7 @@ fn nf_from_target(value: &str) -> Option<String> {
     }
 }
 
-fn sanitize_uri(value: &str, pseudonym_key: &PseudonymKey) -> String {
+fn sanitize_uri(value: &str) -> String {
     value
         .split('/')
         .map(|part| {
@@ -939,7 +929,7 @@ fn sanitize_uri(value: &str, pseudonym_key: &PseudonymKey) -> String {
             {
                 format!(
                     "subscriber-{}{}",
-                    pseudonym(pseudonym_key, "supi", identity.as_bytes()),
+                    pseudonym("supi", identity.as_bytes()),
                     suffix
                 )
             } else {
@@ -950,7 +940,7 @@ fn sanitize_uri(value: &str, pseudonym_key: &PseudonymKey) -> String {
         .join("/")
 }
 
-fn json_fields(body: &[u8], pseudonym_key: &PseudonymKey) -> Vec<(String, String)> {
+fn json_fields(body: &[u8]) -> Vec<(String, String)> {
     let Some(json) = extract_json(body) else {
         return Vec::new();
     };
@@ -958,7 +948,7 @@ fn json_fields(body: &[u8], pseudonym_key: &PseudonymKey) -> Vec<(String, String
         return Vec::new();
     };
     let mut fields = Vec::new();
-    collect_json(&value, &mut fields, pseudonym_key);
+    collect_json(&value, &mut fields);
     fields
 }
 
@@ -974,14 +964,14 @@ fn extract_json(body: &[u8]) -> Option<&[u8]> {
     None
 }
 
-fn collect_json(value: &Value, fields: &mut Vec<(String, String)>, pseudonym_key: &PseudonymKey) {
+fn collect_json(value: &Value, fields: &mut Vec<(String, String)>) {
     let Value::Object(map) = value else { return };
     for (key, value) in map {
         if matches!(key.as_str(), "supi" | "suci" | "pei") {
             if let Some(text) = scalar(value) {
                 fields.push((
                     "subscriber_pseudonym".into(),
-                    pseudonym(pseudonym_key, "subscriber", text.as_bytes()),
+                    pseudonym("subscriber", text.as_bytes()),
                 ));
             }
         } else {
@@ -1001,7 +991,7 @@ fn collect_json(value: &Value, fields: &mut Vec<(String, String)>, pseudonym_key
                 }
             }
         }
-        collect_json(value, fields, pseudonym_key);
+        collect_json(value, fields);
     }
 }
 
@@ -1098,24 +1088,15 @@ mod tests {
             Some("CreateSMContext")
         );
     }
-    fn test_key() -> PseudonymKey {
-        PseudonymKey::from_bytes([0x55; 32])
-    }
     #[test]
     fn redacts_subscriber_paths() {
-        let value = sanitize_uri(
-            "/ue-contexts/imsi-001011234567895/n1-n2-messages",
-            &test_key(),
-        );
+        let value = sanitize_uri("/ue-contexts/imsi-001011234567895/n1-n2-messages");
         assert!(!value.contains("001011234567895"));
         assert!(value.contains("subscriber-psn-"));
     }
     #[test]
     fn extracts_supported_json_without_secrets() {
-        let fields = json_fields(
-            br#"{"pduSessionId":3,"dnn":"internet","supi":"imsi-secret"}"#,
-            &test_key(),
-        );
+        let fields = json_fields(br#"{"pduSessionId":3,"dnn":"internet","supi":"imsi-secret"}"#);
         assert!(fields.contains(&("pdu_session_id".into(), "3".into())));
         assert!(!fields
             .iter()
@@ -1187,7 +1168,7 @@ mod tests {
                 direction(server, client, s, 2),
             ],
         };
-        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new(), &test_key());
+        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
         assert_eq!(events.len(), 2);
         assert_eq!(report.http2_streams, 2);
         assert!(events
@@ -1231,7 +1212,7 @@ mod tests {
                 direction(server, client, server_bytes, 2),
             ],
         };
-        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new(), &test_key());
+        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
         assert!(events.is_empty(), "response-only partial must not be promoted");
         assert!(
             report
@@ -1276,7 +1257,7 @@ mod tests {
                 direction(server, client, server_bytes, 2),
             ],
         };
-        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new(), &test_key());
+        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].decoding_status, DecodeStatus::Decoded);
         assert!(
@@ -1336,7 +1317,7 @@ mod tests {
                 direction(server, client, server_bytes, 2),
             ],
         };
-        let (events, _report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new(), &test_key());
+        let (events, _report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.decoding_status, DecodeStatus::Decoded);
@@ -1517,7 +1498,7 @@ mod tests {
                 direction(server, client, server_bytes, 2),
             ],
         };
-        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new(), &test_key());
+        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
         assert_eq!(
             events.len() as u32,
             PAIRS,
@@ -1593,7 +1574,7 @@ mod tests {
                 direction(server, client, server_bytes, 2),
             ],
         };
-        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new(), &test_key());
+        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
         // Stream 1 is partial without a trustworthy request identity and is
         // therefore omitted. Stream 3 proves that the direction was NOT
         // poisoned after stream 1's failure.
@@ -1647,7 +1628,7 @@ mod tests {
                 direction(b, a, vec![], 2),
             ],
         };
-        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new(), &test_key());
+        let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new());
         assert!(events.is_empty());
         assert_eq!(report.encrypted_connections, 1);
     }

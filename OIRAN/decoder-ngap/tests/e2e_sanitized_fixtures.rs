@@ -1,5 +1,5 @@
 use decoder_ngap::NgapDecoder;
-use event_schema::{DecodeStatus, Endpoint, ExactTimestamp, PacketReference, PseudonymKey};
+use event_schema::{DecodeStatus, Endpoint, ExactTimestamp, PacketReference};
 use plugin_runtime::{DecoderInput, ProtocolDecoder};
 use serde::Deserialize;
 
@@ -32,7 +32,6 @@ fn sanitized_e2e_frames_preserve_decoder_status_without_subscriber_material() {
         resolution_base: 10,
         resolution_exponent: 9,
     };
-    let pseudonym_key = PseudonymKey::from_bytes([0x88; 32]);
     for (index, fixture) in fixtures.iter().enumerate() {
         assert_eq!(fixture.fixture_version, 1);
         assert!(!fixture.expected_reason.is_empty());
@@ -71,7 +70,6 @@ fn sanitized_e2e_frames_preserve_decoder_status_without_subscriber_material() {
             },
             payload: &payload,
             raw_payload_reference: "sanitized",
-            pseudonym_key: &pseudonym_key,
         };
         let output = NgapDecoder.decode(&input);
         let expected = match fixture.expected_status.as_str() {

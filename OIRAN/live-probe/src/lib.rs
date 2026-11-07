@@ -17,7 +17,7 @@ use correlation_engine::{
 use disk_safety::{assess, capture_budget, measure_path, CaptureBudget, Decision, Policy};
 use event_schema::{
     sha256_hex, DecodeStatus, EvidenceReference, EvidenceState, InformationElement, NamedValue,
-    NormalizedEvent, Protocol, PseudonymKey, Sha256Hasher,
+    NormalizedEvent, Protocol, Sha256Hasher,
 };
 use oiran_decode::{decode_capture_streaming, DecodeConfig, DecodeReport};
 use serde::{Deserialize, Serialize};
@@ -831,32 +831,10 @@ pub struct CaptureManager {
     sequence: Arc<AtomicU64>,
     continuous_stop: Arc<AtomicBool>,
     continuous_runtime_evidence: Arc<Mutex<Option<PathBuf>>>,
-    // 2.7.6: per-deployment HMAC-SHA256 secret. Loaded once from a root-only
-    // 0600 file at startup and shared by every import this manager runs,
-    // including after a probe restart against the same key path. Wrapped in
-    // Arc so the struct stays Clone (handles only, no key copies).
-    pseudonym_key: Arc<PseudonymKey>,
 }
 
 impl CaptureManager {
     pub fn new(root: PathBuf, execution_enabled: bool) -> Result<Self, String> {
-        Self::with_pseudonym_key_path(
-            root,
-            execution_enabled,
-            PseudonymKey::resolve_default_path(),
-        )
-    }
-
-    /// Explicit per-deployment key path. Primary constructor used by
-    /// production entry points (which pass
-    /// `PseudonymKey::resolve_default_path()`) and by tests (which pass a
-    /// test-scoped path under the temporary root so parallel tests do not
-    /// contend for `/var/lib/oiran/pseudonym.key`).
-    pub fn with_pseudonym_key_path(
-        root: PathBuf,
-        execution_enabled: bool,
-        pseudonym_key_path: PathBuf,
-    ) -> Result<Self, String> {
         let socket = std::env::var_os("OIRAN_CAPTURE_HELPER_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/run/oiran/capture-helper.sock"));
@@ -864,12 +842,10 @@ impl CaptureManager {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(107);
-        Self::with_helper_and_interface_root(
+        Self::with_helper(
             root,
             execution_enabled,
             CaptureHelperClient::new(socket, expected_uid),
-            PathBuf::from("/sys/class/net"),
-            pseudonym_key_path,
         )
     }
 
@@ -883,7 +859,6 @@ impl CaptureManager {
             execution_enabled,
             helper,
             PathBuf::from("/sys/class/net"),
-            PseudonymKey::resolve_default_path(),
         )
     }
 
@@ -892,14 +867,11 @@ impl CaptureManager {
         execution_enabled: bool,
         helper: CaptureHelperClient,
         interface_root: PathBuf,
-        pseudonym_key_path: PathBuf,
     ) -> Result<Self, String> {
         if !interface_root.is_absolute() {
             return Err("interface root must be absolute".into());
         }
         fs::create_dir_all(&root).map_err(display_error)?;
-        let pseudonym_key = PseudonymKey::load_or_generate(&pseudonym_key_path)
-            .map_err(|code| code.to_string())?;
         let manager = Self {
             root,
             interface_root,
@@ -911,7 +883,6 @@ impl CaptureManager {
             sequence: Arc::new(AtomicU64::new(1)),
             continuous_stop: Arc::new(AtomicBool::new(false)),
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
-            pseudonym_key: Arc::new(pseudonym_key),
         };
         manager.recover_registry()?;
         manager.load_recovery_registry()?;
@@ -1700,11 +1671,6 @@ impl CaptureManager {
     }
 
     fn run_continuous_import_inner(&self, config: &ContinuousImportConfig) -> Result<(), String> {
-        // 2.7.6 (adjusted): the HMAC-SHA256 key is owned by this manager and
-        // stays stable across probe restarts against the same key path, so
-        // overlapping-append snapshots and restart-recovery datasets dedupe
-        // by identical event_id.
-        let pseudonym_key = self.pseudonym_key.as_ref();
         let base = self.root.join(CONTINUOUS_CAPTURE_ID);
         let state_path = base.join("import_state.json");
         let mut state = if state_path.is_file() {
@@ -1935,7 +1901,6 @@ impl CaptureManager {
                         interface: candidate.interface.clone(),
                         endpoints: endpoint_map(),
                     },
-                    &pseudonym_key,
                     |_| Ok(()),
                 ) {
                     self.update(CONTINUOUS_CAPTURE_ID, |job| {
@@ -2035,7 +2000,6 @@ impl CaptureManager {
                         interface: candidate.interface.clone(),
                         endpoints: endpoint_map(),
                     },
-                    &pseudonym_key,
                     |_| Ok(()),
                 ) {
                     let _ = fs::remove_file(&destination);
@@ -2461,11 +2425,6 @@ impl CaptureManager {
         dataset_path: String,
         interfaces: &[CaptureInterface],
     ) -> Result<LiveDataset, String> {
-        // 2.7.6 (adjusted): the per-deployment key is owned by the manager
-        // and shared across every capture processed by this binary — so a
-        // probe restart that rebuilds the same dataset reuses the same key
-        // and its event_ids remain stable.
-        let pseudonym_key = self.pseudonym_key.as_ref();
         let prior_continuous = if capture_id == CONTINUOUS_CAPTURE_ID {
             if let Some(parent) = dataset_dir.parent() {
                 let current = parent.join("dataset");
@@ -2524,7 +2483,6 @@ impl CaptureManager {
                         interface: interface.interface.clone(),
                         endpoints: endpoints.clone(),
                     },
-                    &pseudonym_key,
                     |event| {
                         if aggregate_n3 && event.protocol == Protocol::Gtpu {
                             return n3_aggregator.observe(event);
@@ -4973,7 +4931,7 @@ mod tests {
         assert!(fs::metadata(&path).unwrap().len() >= 300 * MIB as u64);
         thread::sleep(Duration::from_millis(500));
         let guard = reset_allocation_peak();
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
                 source_root: source.clone(),
@@ -5030,7 +4988,7 @@ mod tests {
         thread::sleep(Duration::from_millis(500));
 
         let guard = reset_allocation_peak();
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
                 source_root: source.clone(),
@@ -5114,7 +5072,7 @@ mod tests {
         assert!(rejected_size > 100);
         assert!(fs::metadata(&accepted).unwrap().len() <= 100);
         thread::sleep(Duration::from_millis(500));
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
                 source_root: source.clone(),
@@ -5359,7 +5317,7 @@ mod tests {
             historical_n2_bootstrap: Some(bootstrap),
             runtime_pdu_evidence: None,
         };
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         manager.start_continuous_import(config.clone()).unwrap();
         wait_for(|| {
             manager
@@ -5420,7 +5378,7 @@ mod tests {
         });
         drop(manager);
 
-        let restarted = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let restarted = CaptureManager::new(root, false).unwrap();
         restarted.start_continuous_import(config).unwrap();
         wait_for(|| {
             restarted
@@ -5469,7 +5427,7 @@ mod tests {
         fs::create_dir_all(source.join("N4")).unwrap();
         fs::copy(fixture.join("N4.pcapng"), source.join("N4/final-2.pcapng")).unwrap();
         thread::sleep(Duration::from_millis(250));
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root, false).unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
                 source_root: source,
@@ -5722,7 +5680,7 @@ mod tests {
     #[test]
     fn aged_cached_activity_is_not_reported_without_new_ingestion() {
         let root = temporary_root("aged-cached-activity");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root, false).unwrap();
         let observed = 100_000;
         let aged = observed + ACTIVE_PACKET_WINDOW_MS + 1;
         let runtime_ids = (1..=3)
@@ -5856,7 +5814,7 @@ mod tests {
     #[test]
     fn continuous_checkpoint_keeps_five_sessions_across_restart_and_republish() {
         let root = temporary_root("continuous-five-session-checkpoint");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let base = root.join(CONTINUOUS_CAPTURE_ID);
         fs::create_dir_all(base.join("pcap")).unwrap();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5916,7 +5874,7 @@ mod tests {
         assert_eq!(checkpoint.session_ids.len(), 5);
 
         drop(manager);
-        let restarted = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let restarted = CaptureManager::new(root.clone(), false).unwrap();
         let resumed = restarted
             .process_continuous_capture(&base, &interface_specs(), 128 * 1024 * 1024)
             .unwrap();
@@ -5973,7 +5931,7 @@ mod tests {
     #[test]
     fn production_pipeline_decodes_three_pcap_gpdus_into_three_bound_pdu_callflows() {
         let root = temporary_root("runtime-pcap-e2e");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let base = root.join(CONTINUOUS_CAPTURE_ID);
         fs::create_dir_all(base.join("pcap")).unwrap();
         let seconds = (epoch_ms() / 1000) as u32;
@@ -6117,7 +6075,7 @@ mod tests {
                 &[vec![index; 64]],
             );
         }
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root, false).unwrap();
         manager
             .start_continuous_import(ContinuousImportConfig {
                 source_root: source.clone(),
@@ -6332,7 +6290,7 @@ mod tests {
     #[test]
     fn atomic_temp_budget_failure_preserves_previous_dataset() {
         let root = temporary_root("continuous-atomic-budget");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let base = root.join(CONTINUOUS_CAPTURE_ID);
         fs::create_dir_all(base.join("pcap")).unwrap();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -6359,7 +6317,7 @@ mod tests {
 
     #[test]
     fn real_interface_discovery_is_allowlisted() {
-        let manager = { let tmp = temporary_root("interfaces"); CaptureManager::with_pseudonym_key_path(tmp.clone(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
+        let manager = CaptureManager::new(temporary_root("interfaces"), false).unwrap();
         let interfaces = manager.interfaces();
         assert_eq!(interfaces.len(), 4);
         assert_eq!(
@@ -6376,7 +6334,7 @@ mod tests {
 
     #[test]
     fn validation_rejects_custom_device_filter_and_unbounded_values() {
-        let manager = { let tmp = temporary_root("validation"); CaptureManager::with_pseudonym_key_path(tmp.clone(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
+        let manager = CaptureManager::new(temporary_root("validation"), false).unwrap();
         let mut request = CaptureRequest::default();
         request.interfaces = vec!["eth0".into()];
         request.duration_seconds = 901;
@@ -6448,7 +6406,7 @@ mod tests {
 
     #[test]
     fn execution_is_fail_closed_until_deployment_enables_it() {
-        let manager = { let tmp = temporary_root("locked"); CaptureManager::with_pseudonym_key_path(tmp.clone(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
+        let manager = CaptureManager::new(temporary_root("locked"), false).unwrap();
         assert!(manager
             .start(CaptureRequest::default(), "operator")
             .is_err());
@@ -6457,7 +6415,7 @@ mod tests {
 
     #[test]
     fn stop_enforces_exact_owner_and_is_idempotent_after_completion() {
-        let manager = { let tmp = temporary_root("ownership"); CaptureManager::with_pseudonym_key_path(tmp.clone(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
+        let manager = CaptureManager::new(temporary_root("ownership"), false).unwrap();
         let id = "live-owned-0001".to_string();
         let job = CaptureJob {
             capture_id: id.clone(),
@@ -6511,7 +6469,7 @@ mod tests {
     #[test]
     fn completed_capture_registers_real_decoded_dataset_with_provenance() {
         let root = temporary_root("pipeline");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let capture_id = "live-pipeline-fixture";
         let pcap_dir = root.join(capture_id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -6539,7 +6497,7 @@ mod tests {
     #[test]
     fn empty_capture_is_explicit_and_never_fabricates_a_session() {
         let root = temporary_root("empty");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let capture_id = "live-empty-fixture";
         let pcap_dir = root.join(capture_id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -6560,7 +6518,7 @@ mod tests {
     #[test]
     fn finalized_capture_with_empty_interface_creates_derived_dataset_layout() {
         let root = temporary_root("partial-interface-pipeline");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let capture_id = "live-partial-interface-fixture";
         let pcap_dir = root.join(capture_id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -6594,7 +6552,7 @@ mod tests {
     #[test]
     fn recoverable_failed_capture_is_not_promoted_during_registry_recovery() {
         let root = temporary_root("recoverable-failed");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let id = "live-recoverable-failed";
         let pcap_dir = root.join(id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -6631,7 +6589,7 @@ mod tests {
         };
         manager.persist_job(&job).unwrap();
 
-        let recovered = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap().get(id).unwrap();
+        let recovered = CaptureManager::new(root, false).unwrap().get(id).unwrap();
         assert_eq!(recovered.state, CaptureState::Failed);
         assert!(recovered.dataset_id.is_none());
         assert_eq!(
@@ -6643,7 +6601,7 @@ mod tests {
     #[test]
     fn valid_capture_with_no_supported_messages_is_registered_empty() {
         let root = temporary_root("unsupported-packets");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let id = "live-unsupported-packets";
         let pcap_dir = root.join(id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -6667,7 +6625,7 @@ mod tests {
     #[test]
     fn decoder_failure_does_not_finalize_or_register_dataset() {
         let root = temporary_root("decoder-failure");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let id = "live-decoder-failure";
         let pcap_dir = root.join(id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -6684,7 +6642,7 @@ mod tests {
     #[test]
     fn dataset_registration_rejects_missing_final_manifest() {
         let root = temporary_root("registration-failure");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let id = "live-registration-failure";
         let pcap_dir = root.join(id).join("pcap");
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -6746,7 +6704,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let job = CaptureJob {
             capture_id: id.into(),
             probe_id: PROBE_ID.into(),
@@ -6772,7 +6730,7 @@ mod tests {
         };
         manager.persist_job(&job).unwrap();
         drop(manager);
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let original_job = fs::read(root.join(id).join("job.json")).unwrap();
         let original_hashes = source_files
             .iter()
@@ -6820,7 +6778,7 @@ mod tests {
     #[test]
     fn registry_recovery_reclassifies_legacy_helper_exit_as_failed() {
         let root = temporary_root("legacy-failure");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let id = "live-legacy-failure";
         let job = CaptureJob {
             capture_id: id.into(),
@@ -6847,7 +6805,7 @@ mod tests {
         };
         fs::create_dir_all(root.join(id).join("pcap")).unwrap();
         manager.persist_job(&job).unwrap();
-        let recovered = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap().get(id).unwrap();
+        let recovered = CaptureManager::new(root, false).unwrap().get(id).unwrap();
         assert_eq!(recovered.state, CaptureState::Failed);
         assert_eq!(
             recovered.error.as_deref(),
@@ -6859,7 +6817,7 @@ mod tests {
     #[test]
     fn lifecycle_persists_starting_capturing_and_terminal_states() {
         let root = temporary_root("lifecycle");
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root, false).unwrap();
         let id = "live-lifecycle";
         let mut job = CaptureJob {
             capture_id: id.into(),
@@ -7017,7 +6975,7 @@ mod tests {
         )
         .unwrap();
 
-        let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let manager = CaptureManager::new(root.clone(), false).unwrap();
         let first = manager
             .import_derived_dataset(&import_root, dataset_id, "operator")
             .unwrap();

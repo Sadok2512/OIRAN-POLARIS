@@ -92,12 +92,6 @@ pub struct ApiConfig {
     /// Explicit test/reference mode. Operational startup must only expose
     /// datasets recovered by CaptureManager or admitted by LteEvidenceStore.
     pub reference_dataset_enabled: bool,
-    /// Per-deployment pseudonym key path. `None` means
-    /// `PseudonymKey::resolve_default_path()` (env `OIRAN_PSEUDONYM_KEY_PATH`
-    /// or `/var/lib/oiran/pseudonym.key`). Tests set it to a path under their
-    /// capture root so they neither touch the real filesystem nor collide
-    /// with parallel tests.
-    pub pseudonym_key_path: Option<PathBuf>,
 }
 
 impl ApiConfig {
@@ -140,7 +134,6 @@ impl ApiConfig {
                 .unwrap_or(DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES),
             reference_dataset_enabled: cfg!(test)
                 || std::env::var("OIRAN_REFERENCE_DATASET_ENABLED").is_ok_and(|value| value == "1"),
-            pseudonym_key_path: None,
         }
     }
 }
@@ -154,13 +147,9 @@ impl AppState {
         {
             return Err("capture root escapes workspace".into());
         }
-        let capture_manager = CaptureManager::with_pseudonym_key_path(
+        let capture_manager = CaptureManager::new(
             config.capture_root.clone(),
             config.capture_execution_enabled,
-            config
-                .pseudonym_key_path
-                .clone()
-                .unwrap_or_else(event_schema::PseudonymKey::resolve_default_path),
         )?;
         if !config.probe_registry_path.starts_with(&workspace)
             && !config.probe_registry_path.starts_with("/var/lib/oiran")
@@ -3101,8 +3090,6 @@ mod tests {
         let evidence = temporary_directory(&format!("{label}-lte-evidence"));
         config.lte_evidence_root = evidence.join("store");
         config.lte_evidence_bundle_root = evidence.join("inbox");
-        let key_dir = temporary_directory(&format!("{label}-pseudonym"));
-        config.pseudonym_key_path = Some(key_dir.join("pseudonym.key"));
         config
     }
     fn state() -> AppState {
@@ -3918,8 +3905,6 @@ mod tests {
         let mut config = ApiConfig::from_workspace(workspace);
         config.probe_registry_path = registry_path.clone();
         config.operator_token_sha256 = Some(sha256_hex(b"test-operator-token"));
-        config.pseudonym_key_path =
-            Some(temporary_directory("registry-persistence-pseudonym").join("pseudonym.key"));
         let state = AppState::load(config.clone()).unwrap();
         let response = router(state, None)
             .oneshot(create_probe_request(probe_payload("lab-probe-01")))
@@ -4637,7 +4622,6 @@ mod tests {
             true,
             helper,
             interface_root,
-            manager_root.join(".oiran-pseudonym.key"),
         )
         .unwrap();
         let mut config = test_config(workspace, "registry-four-plane");

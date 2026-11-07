@@ -2,36 +2,6 @@
 
 ## OIRAN API 2.7.6 — 2026-11-03
 
-- Scopes the HMAC-SHA256 pseudonym key to the DEPLOYMENT (not the import):
-  generated once at a root-only 0600 file (default
-  `/var/lib/oiran/pseudonym.key`, configurable via `OIRAN_PSEUDONYM_KEY_PATH`
-  or `ApiConfig.pseudonym_key_path`), reloaded at every probe restart from
-  the same path. Wider permissions on the file fail-closed with
-  `OIRAN_PSEUDONYM_KEY_INSECURE`; missing or malformed file fails-closed
-  `OIRAN_PSEUDONYM_KEY_UNAVAILABLE` (except on the first-generation path).
-  The two live-probe continuous-import tests now pass again without being
-  weakened. `session-engine::discover_lte_sessions` falls back to the
-  structural keys (MME/eNB-UE-S1AP-ID + F-TEID S11 ↔ E-RAB TEID S1-U) when
-  no subscriber identifier is present on any event — new regression test
-  `s1_s11_s1u_correlate_by_teid_without_any_subscriber_identifier`.
-- Replaces the FNV-1a unkeyed 64-bit `pseudonym()` (reversible by enumerating
-  the ~10⁹ IMSI space) with HMAC-SHA256 keyed by a 32-byte secret generated
-  per import, output `psn-<32 hex>` (128 bits). The secret is OS-sourced from
-  `/dev/urandom`, lives in the import's stack frame only, is zeroised on drop
-  and never serialised, logged, or committed. Missing entropy source fails
-  closed with `OIRAN_PSEUDONYM_KEY_UNAVAILABLE` — no silent fallback to an
-  unkeyed hash. Debug impl is deliberately redacted. New RFC 4231 HMAC
-  regression tests + mission tests (same-key stable, different-key disjoint,
-  domain-separated labels, `PseudonymKey::generate` randomness, no raw
-  IMSI/IMEI/MSISDN in gtpv2c exports, S11-level correlation of the same IMSI
-  under one import).
-- Threads the per-import key through `DecoderInput`, `decode_capture`,
-  `decode_capture_streaming`, all S1AP/NGAP/NAS/PFCP/SBI/GTPv2-C/Diameter
-  decoders, and the live-probe continuous import (one key per
-  `run_continuous_import_inner` and per `process_capture_into` invocation).
-  Within one import, S1-MME / S11 / S1-U events carrying the same IMSI share
-  the exact same pseudonym; across imports, the same IMSI emits disjoint
-  pseudonyms.
 - Uses the privacy-safe `subscriber_pseudonym` identifier for decoded LTE
   S11 evidence while retaining read compatibility with legacy
   `imsi_pseudonym` events.

@@ -348,7 +348,6 @@ mod tests {
             resolution_exponent: 9,
         };
         let payload = [0x30, 0xff, 0, 0, 0, 0, 0, 1];
-        let key = event_schema::PseudonymKey::from_bytes([0xaa; 32]);
         let make = |source: &str, destination: &str| DecoderInput {
             capture_id: "sha256:synthetic",
             packet_references: &packets,
@@ -366,7 +365,6 @@ mod tests {
             },
             payload: &payload,
             raw_payload_reference: "sha256:synthetic",
-            pseudonym_key: &key,
         };
         assert_eq!(infer_direction(&make("eNB", "SGW-U")), Direction::Uplink);
         assert_eq!(infer_direction(&make("SGW-U", "eNB")), Direction::Downlink);
