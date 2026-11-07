@@ -1,5 +1,80 @@
 # Changelog
 
+## OIRAN API 2.8.4 — 2026-11-07 — content-based repair + no more `state.segments` eviction (#9 comment 6705466743)
+
+### Proven cause (ANR2)
+
+- The 2.8.3 `repair_partial_imports` grouped by `state.segments`,
+  but `state.segments` evicts entries at `config.max_segments`.
+  ANR2 reproduced the dry-run finding 6 snapshots of `_00068`
+  instead of the 7 historical snapshots of `_00067` because the
+  older entries had been evicted before the repair ran.
+
+### Fix (`OIRAN/live-probe` 0.4.17 → 0.4.18, API 2.8.3 → 2.8.4)
+
+- **Content-based grouping.** `repair_partial_imports` now scans
+  `dataset/oiran_events.jsonl` directly. Each snapshot is
+  identified by its `capture_id`; the segment identity is
+  reconstructed from the smallest
+  `(timestamp.raw_ticks, packet_references[0].packet_number,
+  packet_references[0].byte_offset)` tuple observed across the
+  snapshot's events — two snapshots of the same growing dumpcap
+  file share that "first packet" bit-for-bit. The reconstructed
+  key is surfaced in the report
+  (`reconstruction_key = interface=…|first_raw_ticks=…|first_packet_number=…|first_byte_offset=…`),
+  never guessed silently.
+- **Final-snapshot resolution is content-based.** When the repair
+  is invoked with `--source-root <path>`, every closed segment
+  under `<source-root>/<interface-lowercase>/` is SHA-256-hashed
+  (the 2.8.3 sequence rule excludes the lex-greatest sibling — the
+  active dumpcap target). A snapshot whose `capture_id` matches an
+  on-disk SHA is the FINAL. Without `--source-root`, the repair
+  falls back to `state.segments`-largest; 2.8.4 removes the
+  eviction so the fallback is reliable for every import going
+  forward.
+- **Unresolved groups** (no on-disk match, no `state.segments`
+  entry) are LISTED in `DatasetRepairReport.unresolved_groups` and
+  their events are left untouched — the repair never guesses.
+- **No more count/byte eviction on `state.segments`.** The 2.7.18
+  two-pass eviction loop is deleted; only the `max_owned_bytes`
+  ceiling remains and is treated as a terminal error
+  (`CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT`), never a silent history
+  loss. The startup
+  `state.segments.retain(|_, segment| ...is_file())` continues to
+  purge entries whose owned file no longer exists on disk.
+
+### SemVer
+
+| Component | Before | After |
+|---|---|---|
+| `OIRAN/live-probe` | 0.4.17 | **0.4.18** |
+| `OIRAN/apps/api` | 2.8.3 | **2.8.4** |
+
+### Tests
+
+- `cargo test --workspace --locked --release --offline --no-fail-fast`
+  → **398 passed, 0 failed, 4 ignored**.
+- `repair_partial_imports_rebuilds_full_history_when_state_segments_was_evicted`
+  — reproduces the ANR2 defect: `state.segments` carries ONLY the
+  latest snapshot, `oiran_events.jsonl` carries 21 events (3 per
+  snapshot × 7 snapshots). `--source-root` points at a tree whose
+  `_00067`-equivalent closed file matches the 7th snapshot's
+  `capture_id`. The repair recovers all 7 snapshots from content,
+  keeps 3 events, removes 18, and reports
+  `final_source = ON_DISK_SHA256_MATCH`.
+- `repair_partial_imports_keeps_only_final_owned_file_for_a_segment_imported_seven_times`
+  updated: when `state.segments` carries every snapshot (no
+  eviction), the fallback `STATE_SEGMENTS_LARGEST` is still
+  correct; the test exercises it with `source_root = None`.
+- `repair_partial_imports_is_noop_on_a_healthy_dataset` updated.
+- Two legacy tests updated to drop the count-based pcap-ring
+  expectation
+  (`continuous_source_skips_active_truncation_and_rotates_owned_ring`,
+  `full_ring_ingests_three_interface_batches_across_rotations`):
+  under the 2.8.4 contract the ring accumulates owned pcap copies
+  up to `max_owned_bytes`, there is no silent count-based
+  eviction.
+
 ## OIRAN API 2.8.3 — 2026-11-07 — closed-proof eligibility + historical partial-import repair (#9 comments 6696366882 + 6704872754)
 
 ### Proven causes (ANR2)

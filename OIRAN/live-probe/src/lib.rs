@@ -2365,48 +2365,22 @@ impl CaptureManager {
                     )?;
                     continue;
                 }
-                while state.segments.len() >= usize::from(config.max_segments)
-                    || work_bytes(&base)
-                        .saturating_add(candidate.size_bytes)
-                        .saturating_add(MAX_CONTINUOUS_DERIVED_BYTES)
-                        > config.max_owned_bytes
-                {
-                    // 2.7.18: two-pass eviction.
-                    //   Pass 1 — the oldest non-historical segment.
-                    //   Pass 2 — if non-historical pool is exhausted and we
-                    //            still need bytes, evict the oldest segment
-                    //            of ANY kind (the historical N2 bootstrap can
-                    //            be rediscovered from the allowlisted source
-                    //            root on the next worker start, so evicting
-                    //            it loses only a cached copy, never
-                    //            provenance).
-                    let oldest = state
-                        .segments
-                        .iter()
-                        .filter(|(_, item)| !item.historical_context)
-                        .min_by_key(|(_, item)| item.imported_epoch_ms)
-                        .map(|(checksum, item)| (checksum.clone(), item.clone()))
-                        .or_else(|| {
-                            state
-                                .segments
-                                .iter()
-                                .min_by_key(|(_, item)| item.imported_epoch_ms)
-                                .map(|(checksum, item)| (checksum.clone(), item.clone()))
-                        });
-                    let Some(oldest) = oldest else {
-                        break;
-                    };
-                    let owned = base.join("pcap").join(&oldest.1.owned_file);
-                    if owned.is_file() {
-                        fs::remove_file(&owned).map_err(display_error)?;
-                    }
-                    state.segments.remove(&oldest.0);
-                }
-                if state.segments.len() >= usize::from(config.max_segments)
-                    || work_bytes(&base)
-                        .saturating_add(candidate.size_bytes)
-                        .saturating_add(MAX_CONTINUOUS_DERIVED_BYTES)
-                        > config.max_owned_bytes
+                // 2.8.4 (#9 comment 6705466743): the count-based eviction
+                // on `state.segments` is removed. ANR2 proved that at the
+                // historic cap (production ring held < 32 slots at the
+                // time), the repair tool's `state.segments` view saw only
+                // the latest 6 snapshots of `_00068` instead of the 7
+                // proven `_00067` snapshots. The repair tool now relies on
+                // the dataset JSONL for history, and `state.segments`
+                // grows with every import; `state.segments.retain(...)` on
+                // startup (`:1903`) purges entries whose owned_file no
+                // longer exists on disk. The byte-level `max_owned_bytes`
+                // gate is kept — breaching it is a terminal error, no
+                // silent eviction of historical context.
+                if work_bytes(&base)
+                    .saturating_add(candidate.size_bytes)
+                    .saturating_add(MAX_CONTINUOUS_DERIVED_BYTES)
+                    > config.max_owned_bytes
                 {
                     terminal_error = Some((
                         "CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT",
@@ -3129,35 +3103,57 @@ impl CaptureManager {
         })
     }
 
-    /// 2.8.3 (#9 comment 6704872754): historical repair for datasets
-    /// that imported an active dumpcap segment multiple times at
-    /// different sizes — the same `source_path` appears in
-    /// `state.segments` with several distinct checksums. Keeps only the
-    /// events whose `packet_references[0].source_file` matches the
-    /// FINAL owned file of each group (largest `size_bytes`, tie-
-    /// broken by latest `imported_epoch_ms`). Output is sorted in the
-    /// canonical `(capture_id, packet_number, event_id)` order the
-    /// `dataset-restore` path uses — never by timestamp.
+    /// 2.8.4 (#9 comment 6705466743): historical repair driven by the
+    /// CONTENT of the published dataset. ANR2 showed that
+    /// `state.segments` can evict history on busy production
+    /// deployments, so the repair tool no longer trusts it as the
+    /// grouping source. Instead the dataset's `oiran_events.jsonl` is
+    /// scanned once; every event is anchored on:
     ///
-    /// Idempotent: a second run on the same inputs produces an
-    /// identical `oiran_events.jsonl` (same SHA-256). `--dry-run` mode
-    /// reports what WOULD be removed without writing anything; the
-    /// computed `events_sha256` matches the one a subsequent non-dry
-    /// run would produce.
+    ///   * `capture_id = "sha256:<hex>"` — the SNAPSHOT identity (the
+    ///     SHA-256 of the pcap file bytes at the moment of import).
+    ///     Events from the same snapshot share this.
+    ///   * `packet_references[0].source_file` — the owned-file basename
+    ///     carries `{interface}.pcap-{sha16}.{ext}` and reveals the
+    ///     interface without any lookup.
+    ///   * `(interface, first_packet_raw_ticks, first_packet_number,
+    ///     first_packet_byte_offset)` — the SEGMENT identity. Two
+    ///     snapshots of the same growing dumpcap file share packet 1
+    ///     bit-for-bit, so they share this tuple. This is the
+    ///     `reconstruction_key` surfaced in the report.
+    ///
+    /// For each group with more than one snapshot:
+    ///
+    ///   * If `source_root` is provided, every `<source_root>/<interface_lc>/*.pcapng`
+    ///     is SHA-256-hashed (the 2.8.3 sequence rule already identified
+    ///     closed files, so the lex-greatest sibling — the active dumpcap
+    ///     target — is excluded). The snapshot whose `capture_id` equals
+    ///     one of those SHAs is the FINAL. Its events are kept; the other
+    ///     snapshots are removed with
+    ///     `partial-import-superseded-by-final-capture-id=sha256:…`.
+    ///   * If `source_root` is absent AND `state.segments` carries all
+    ///     snapshots of the group, the final falls back to the snapshot
+    ///     with the largest `size_bytes`. 2.8.4 removes the
+    ///     count/byte eviction on `state.segments`, so every import
+    ///     going forward is captured and the fallback is safe.
+    ///   * Otherwise the group is reported as unresolved and NONE of
+    ///     its events are touched.
     ///
     /// Semantics preserved vs. `restore_from_archive_segment`:
     ///   * `flock(LOCK_EX|LOCK_NB)` on
     ///     `<capture-root>/<continuous-capture-id>/.publication.lock`.
-    ///     The import worker must be stopped.
     ///   * The hot `dataset/oiran_events.jsonl` is NEVER written
     ///     directly; everything goes through `.dataset-next` + atomic
     ///     swap via `.dataset-previous`.
-    ///   * `dataset_manifest.json` and `callflows/` are regenerated
-    ///     from the pruned events — the manifest's `event_count`
-    ///     equals the number of JSONL lines written.
+    ///   * Output sorted canonically by
+    ///     `(capture_id, packet_number, event_id)`.
+    ///   * Manifest `event_count` equals the number of written lines.
+    ///   * Idempotent: the second run on the same inputs produces an
+    ///     identical `oiran_events.jsonl` (same SHA-256).
     pub fn repair_partial_imports(
         &self,
         dry_run: bool,
+        source_root: Option<&Path>,
     ) -> Result<DatasetRepairReport, String> {
         let base = self.root.join(CONTINUOUS_CAPTURE_ID);
         let _publication_lock = PublicationLock::try_acquire(&base)?;
@@ -3177,111 +3173,329 @@ impl CaptureManager {
                 current_events.display()
             ));
         }
+        // 2.8.4: `state.segments` is consulted ONLY as a fallback
+        // when `source_root` is absent. Missing or invalid state.json
+        // is not fatal — the content-based grouping still works.
         let state_path = base.join("import_state.json");
-        if !state_path.is_file() {
-            return Err(format!(
-                "REPAIR_MISSING_IMPORT_STATE: {}",
-                state_path.display()
-            ));
-        }
-        let state: ContinuousImportState = serde_json::from_slice(
-            &fs::read(&state_path).map_err(display_error)?,
-        )
-        .map_err(|error| format!("REPAIR_STATE_INVALID: {error}"))?;
+        let state = if state_path.is_file() {
+            serde_json::from_slice::<ContinuousImportState>(
+                &fs::read(&state_path).map_err(display_error)?,
+            )
+            .unwrap_or_default()
+        } else {
+            ContinuousImportState::default()
+        };
 
-        let mut by_source: BTreeMap<String, Vec<&ImportedSegment>> = BTreeMap::new();
-        for segment in state.segments.values() {
-            by_source
-                .entry(segment.source_path.clone())
-                .or_default()
-                .push(segment);
+        // Phase 1 — walk the JSONL once and build the snapshot index.
+        struct SnapshotScan {
+            capture_id: String,
+            owned_file: String,
+            interface: String,
+            first_raw_ticks: i128,
+            first_packet_number: u64,
+            first_byte_offset: u64,
+            max_packet_number: u64,
+            event_count: usize,
         }
-        let mut partial_groups: Vec<PartialImportGroup> = Vec::new();
-        let mut partial_owned: BTreeSet<String> = BTreeSet::new();
-        for (source_path, segments) in &by_source {
-            if segments.len() <= 1 {
-                continue;
-            }
-            let final_segment = segments
-                .iter()
-                .max_by_key(|segment| (segment.size_bytes, segment.imported_epoch_ms))
-                .copied()
-                .unwrap();
-            let mut members = Vec::with_capacity(segments.len());
-            for segment in segments {
-                members.push(PartialImportMember {
-                    owned_file: segment.owned_file.clone(),
-                    size_bytes: segment.size_bytes,
-                    imported_epoch_ms: segment.imported_epoch_ms,
-                });
-                if segment.owned_file != final_segment.owned_file {
-                    partial_owned.insert(segment.owned_file.clone());
-                }
-            }
-            partial_groups.push(PartialImportGroup {
-                source_path: source_path.clone(),
-                partial_owned_files: members,
-                final_owned_file: final_segment.owned_file.clone(),
-                final_size_bytes: final_segment.size_bytes,
-            });
-        }
-        let mut final_by_partial: BTreeMap<String, String> = BTreeMap::new();
-        for group in &partial_groups {
-            for member in &group.partial_owned_files {
-                if member.owned_file != group.final_owned_file {
-                    final_by_partial
-                        .insert(member.owned_file.clone(), group.final_owned_file.clone());
-                }
-            }
-        }
-
+        let mut snapshots: BTreeMap<String, SnapshotScan> = BTreeMap::new();
         let event_count_before = count_valid_event_records(&current_events)?;
-        let mut removed: Vec<RepairRemovedEvent> = Vec::new();
-        let mut kept: Vec<(String, u64, String, String)> = Vec::new();
-        if !partial_groups.is_empty() {
+        {
             let reader = BufReader::new(fs::File::open(&current_events).map_err(display_error)?);
             for line in reader.lines() {
                 let line = line.map_err(display_error)?;
                 if line.trim().is_empty() {
                     continue;
                 }
-                let value: Value = match serde_json::from_str(&line) {
-                    Ok(value) => value,
-                    Err(_) => continue,
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let Some(capture_id) = value.get("capture_id").and_then(Value::as_str) else {
+                    continue;
                 };
                 let source_file = value
                     .pointer("/packet_references/0/source_file")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let source_file_name = std::path::Path::new(source_file)
+                let owned_file = std::path::Path::new(source_file)
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("")
                     .to_owned();
-                if partial_owned.contains(&source_file_name) {
-                    let event_id = value
-                        .get("event_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned();
-                    let supersede = final_by_partial
-                        .get(&source_file_name)
-                        .cloned()
-                        .unwrap_or_default();
-                    removed.push(RepairRemovedEvent {
-                        event_id,
-                        source_file: source_file.to_owned(),
-                        reason: format!(
-                            "partial-import-superseded-by-final-owned-file={supersede}"
-                        ),
+                let interface = value
+                    .get("interface")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        owned_file
+                            .split_once(".pcap-")
+                            .map(|(prefix, _)| prefix)
+                            .unwrap_or("")
+                    })
+                    .to_owned();
+                let raw_ticks = value
+                    .pointer("/timestamp/raw_ticks")
+                    .and_then(|value| value.as_i64().map(i128::from).or_else(|| value.as_str().and_then(|s| s.parse::<i128>().ok())))
+                    .unwrap_or(0);
+                let packet_number = value
+                    .pointer("/packet_references/0/packet_number")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let byte_offset = value
+                    .pointer("/packet_references/0/byte_offset")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let entry = snapshots
+                    .entry(capture_id.to_owned())
+                    .or_insert(SnapshotScan {
+                        capture_id: capture_id.to_owned(),
+                        owned_file: owned_file.clone(),
+                        interface: interface.clone(),
+                        first_raw_ticks: raw_ticks,
+                        first_packet_number: packet_number,
+                        first_byte_offset: byte_offset,
+                        max_packet_number: packet_number,
+                        event_count: 0,
                     });
+                if entry.owned_file.is_empty() {
+                    entry.owned_file = owned_file;
+                }
+                if entry.interface.is_empty() {
+                    entry.interface = interface;
+                }
+                // Anchor on the event with the SMALLEST
+                // (raw_ticks, packet_number, byte_offset) tuple — that is
+                // the first packet of this snapshot. Two snapshots of
+                // the same growing file share that packet bit-for-bit.
+                if (raw_ticks, packet_number, byte_offset)
+                    < (
+                        entry.first_raw_ticks,
+                        entry.first_packet_number,
+                        entry.first_byte_offset,
+                    )
+                {
+                    entry.first_raw_ticks = raw_ticks;
+                    entry.first_packet_number = packet_number;
+                    entry.first_byte_offset = byte_offset;
+                }
+                if packet_number > entry.max_packet_number {
+                    entry.max_packet_number = packet_number;
+                }
+                entry.event_count = entry.event_count.saturating_add(1);
+            }
+        }
+
+        // Phase 2 — group snapshots by reconstructed segment identity.
+        type GroupKey = (String, i128, u64, u64);
+        let mut groups: BTreeMap<GroupKey, Vec<SnapshotScan>> = BTreeMap::new();
+        for (_, scan) in snapshots {
+            let key = (
+                scan.interface.clone(),
+                scan.first_raw_ticks,
+                scan.first_packet_number,
+                scan.first_byte_offset,
+            );
+            groups.entry(key).or_default().push(scan);
+        }
+
+        // Phase 3 — determine the final capture_id per group.
+        // Optional: enumerate closed segments under source_root and SHA
+        // each one so the match is content-based, not metadata-based.
+        let mut on_disk_sha_by_interface: BTreeMap<String, Vec<(String, PathBuf)>> =
+            BTreeMap::new();
+        if let Some(root) = source_root {
+            if root.is_dir() {
+                for entry in fs::read_dir(root).map_err(display_error)?.flatten() {
+                    let dir = entry.path();
+                    if !dir.is_dir() {
+                        continue;
+                    }
+                    let Some(plane) = dir.file_name().and_then(|value| value.to_str()) else {
+                        continue;
+                    };
+                    let interface = plane.to_ascii_uppercase();
+                    let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+                        .map_err(display_error)?
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| {
+                            path.is_file()
+                                && path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .is_some_and(|name| name.to_ascii_lowercase().contains(".pcap"))
+                        })
+                        .collect();
+                    files.sort();
+                    // 2.8.3 sequence rule: the lex-greatest sibling per
+                    // interface is the active dumpcap target. Exclude it.
+                    let active = files.pop();
+                    for path in files {
+                        let Ok(checksum) = sha256_hex_file(&path) else {
+                            continue;
+                        };
+                        on_disk_sha_by_interface
+                            .entry(interface.clone())
+                            .or_default()
+                            .push((checksum, path));
+                    }
+                    if let Some(active_path) = active {
+                        let _ = active_path; // surface in the report only if needed later
+                    }
+                }
+            }
+        }
+
+        let mut partial_groups: Vec<PartialImportGroup> = Vec::new();
+        let mut unresolved_groups: Vec<PartialImportGroup> = Vec::new();
+        let mut capture_id_to_final: BTreeMap<String, String> = BTreeMap::new();
+        // capture_ids we must DROP → reason template.
+        let mut drop_reason: BTreeMap<String, String> = BTreeMap::new();
+
+        for ((interface, first_raw_ticks, first_pkt, first_off), mut scans) in groups {
+            if scans.len() <= 1 {
+                continue;
+            }
+            scans.sort_by(|a, b| a.capture_id.cmp(&b.capture_id));
+            let reconstruction_key = format!(
+                "interface={interface}|first_raw_ticks={first_raw_ticks}|first_packet_number={first_pkt}|first_byte_offset={first_off}"
+            );
+            let (final_capture_id, final_source, final_on_disk_path) =
+                if let Some(matches) = on_disk_sha_by_interface.get(&interface) {
+                    let mut best: Option<(String, PathBuf)> = None;
+                    for scan in &scans {
+                        if let Some(hex) = scan.capture_id.strip_prefix("sha256:") {
+                            if let Some((_, path)) = matches
+                                .iter()
+                                .find(|(sha, _)| sha.eq_ignore_ascii_case(hex))
+                            {
+                                best = Some((scan.capture_id.clone(), path.clone()));
+                                break;
+                            }
+                        }
+                    }
+                    match best {
+                        Some((capture, path)) => (
+                            Some(capture),
+                            PartialImportFinalSource::OnDiskSha256Match,
+                            Some(path.display().to_string()),
+                        ),
+                        None => (None, PartialImportFinalSource::UnresolvedNoEvidence, None),
+                    }
+                } else {
+                    // Fallback: state.segments-based "largest size" rule.
+                    let mut best: Option<(String, u64, u64)> = None;
+                    for scan in &scans {
+                        let hex = scan.capture_id.strip_prefix("sha256:").unwrap_or("");
+                        if let Some(entry) = state.segments.get(hex) {
+                            let candidate = (
+                                scan.capture_id.clone(),
+                                entry.size_bytes,
+                                entry.imported_epoch_ms,
+                            );
+                            match &best {
+                                None => best = Some(candidate),
+                                Some((_, existing_size, existing_epoch)) => {
+                                    if (candidate.1, candidate.2) > (*existing_size, *existing_epoch) {
+                                        best = Some(candidate);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    match best {
+                        Some((capture, _, _)) => (
+                            Some(capture),
+                            PartialImportFinalSource::StateSegmentsLargest,
+                            None,
+                        ),
+                        None => (None, PartialImportFinalSource::UnresolvedNoEvidence, None),
+                    }
+                };
+
+            let snapshot_records: Vec<PartialImportSnapshot> = scans
+                .iter()
+                .map(|scan| {
+                    let hex = scan.capture_id.strip_prefix("sha256:").unwrap_or("");
+                    let state_entry = state.segments.get(hex);
+                    PartialImportSnapshot {
+                        capture_id: scan.capture_id.clone(),
+                        owned_file: scan.owned_file.clone(),
+                        event_count: scan.event_count,
+                        max_packet_number: scan.max_packet_number,
+                        state_size_bytes: state_entry.map(|entry| entry.size_bytes),
+                        state_imported_epoch_ms: state_entry.map(|entry| entry.imported_epoch_ms),
+                    }
+                })
+                .collect();
+
+            let group = PartialImportGroup {
+                reconstruction_key,
+                interface: interface.clone(),
+                first_packet_raw_ticks: first_raw_ticks,
+                first_packet_number: first_pkt,
+                first_packet_byte_offset: first_off,
+                snapshots: snapshot_records,
+                final_capture_id: final_capture_id.clone(),
+                final_source,
+                final_on_disk_path,
+                needs_fresh_import: matches!(final_source, PartialImportFinalSource::UnresolvedNoEvidence),
+            };
+
+            if let Some(final_capture) = &final_capture_id {
+                capture_id_to_final
+                    .insert(final_capture.clone(), final_capture.clone());
+                for scan in &scans {
+                    if &scan.capture_id != final_capture {
+                        drop_reason.insert(
+                            scan.capture_id.clone(),
+                            format!(
+                                "partial-import-superseded-by-final-capture-id={final_capture}"
+                            ),
+                        );
+                    }
+                }
+                partial_groups.push(group);
+            } else {
+                unresolved_groups.push(group);
+            }
+        }
+
+        // Phase 4 — stream the JSONL again, split kept vs removed.
+        let mut removed: Vec<RepairRemovedEvent> = Vec::new();
+        let mut kept: Vec<(String, u64, String, String)> = Vec::new();
+        {
+            let reader = BufReader::new(fs::File::open(&current_events).map_err(display_error)?);
+            for line in reader.lines() {
+                let line = line.map_err(display_error)?;
+                if line.trim().is_empty() {
                     continue;
                 }
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
                 let capture_id = value
                     .get("capture_id")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
+                if let Some(reason) = drop_reason.get(&capture_id) {
+                    let event_id = value
+                        .get("event_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let source_file = value
+                        .pointer("/packet_references/0/source_file")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    removed.push(RepairRemovedEvent {
+                        event_id,
+                        source_file,
+                        capture_id: capture_id.clone(),
+                        reason: reason.clone(),
+                    });
+                    continue;
+                }
                 let packet_number = value
                     .pointer("/packet_references/0/packet_number")
                     .and_then(Value::as_u64)
@@ -3296,7 +3510,7 @@ impl CaptureManager {
             kept.sort_by(|a, b| (&a.0, a.1, &a.2).cmp(&(&b.0, b.1, &b.2)));
         }
 
-        let computed_sha_hex = if partial_groups.is_empty() {
+        let computed_sha_hex = if removed.is_empty() {
             sha256_hex_file(&current_events)?
         } else {
             let mut events_sha = Sha256Hasher::new();
@@ -3306,20 +3520,21 @@ impl CaptureManager {
             }
             events_sha.finish_hex()
         };
-        let event_count_after = if partial_groups.is_empty() {
+        let event_count_after = if removed.is_empty() {
             event_count_before
         } else {
             kept.len()
         };
 
-        if dry_run || partial_groups.is_empty() {
+        if dry_run || removed.is_empty() {
             return Ok(DatasetRepairReport {
-                schema_version: "2.8.3",
+                schema_version: "2.8.4",
                 dataset_dir: current.display().to_string(),
                 dry_run,
                 event_count_before,
                 event_count_after,
                 partial_import_groups: partial_groups,
+                unresolved_groups,
                 removed_events: removed,
                 events_sha256: computed_sha_hex,
             });
@@ -3379,12 +3594,13 @@ impl CaptureManager {
         }
         self.upsert_dataset(dataset, &current)?;
         Ok(DatasetRepairReport {
-            schema_version: "2.8.3",
+            schema_version: "2.8.4",
             dataset_dir: current.display().to_string(),
             dry_run: false,
             event_count_before,
             event_count_after,
             partial_import_groups: partial_groups,
+            unresolved_groups,
             removed_events: removed,
             events_sha256: computed_sha_hex,
         })
@@ -5813,31 +6029,68 @@ impl PublicationLock {
     }
 }
 
-/// 2.8.3 (#9 comment 6704872754): one historical partial-import group
-/// (same `source_path`, several distinct `owned_file`s / checksums).
+/// 2.8.4 (#9 comment 6705466743): one historical partial-import group
+/// REBUILT from the dataset's events (not from `state.segments`,
+/// which may have evicted history). The group identity is the
+/// `(interface, first_packet_raw_ticks, first_packet_number,
+/// first_packet_byte_offset)` tuple — the only segment-level key
+/// events carry in common across partial snapshots of the SAME
+/// growing dumpcap file. If the identity ever has to change, the
+/// `reconstruction_key` field names it explicitly instead of letting
+/// callers guess.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartialImportGroup {
-    pub source_path: String,
-    pub partial_owned_files: Vec<PartialImportMember>,
-    pub final_owned_file: String,
-    pub final_size_bytes: u64,
+    pub reconstruction_key: String,
+    pub interface: String,
+    pub first_packet_raw_ticks: i128,
+    pub first_packet_number: u64,
+    pub first_packet_byte_offset: u64,
+    pub snapshots: Vec<PartialImportSnapshot>,
+    pub final_capture_id: Option<String>,
+    pub final_source: PartialImportFinalSource,
+    pub final_on_disk_path: Option<String>,
+    pub needs_fresh_import: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartialImportMember {
+pub struct PartialImportSnapshot {
+    pub capture_id: String,
     pub owned_file: String,
-    pub size_bytes: u64,
-    pub imported_epoch_ms: u64,
+    pub event_count: usize,
+    pub max_packet_number: u64,
+    pub state_size_bytes: Option<u64>,
+    pub state_imported_epoch_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PartialImportFinalSource {
+    /// `source_root/<interface>/*.pcapng` was inspected; the final
+    /// snapshot is the one whose `capture_id` equals the SHA-256 of a
+    /// closed file (the lex-greatest sibling is excluded — it's the
+    /// still-live dumpcap target per 2.8.3).
+    OnDiskSha256Match,
+    /// No `source_root` provided. The repair falls back to
+    /// `state.segments`: the snapshot with the largest `size_bytes`
+    /// (tie-broken by latest `imported_epoch_ms`) is treated as the
+    /// final. Only correct when `state.segments` carries the full
+    /// history — i.e., when no eviction happened (2.8.4 guarantees
+    /// this for every import from 2.8.4 onwards).
+    StateSegmentsLargest,
+    /// Neither evidence available. The repair leaves the snapshots
+    /// untouched and lists the group as unresolved.
+    UnresolvedNoEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepairRemovedEvent {
     pub event_id: String,
     pub source_file: String,
+    pub capture_id: String,
     pub reason: String,
 }
 
-/// 2.8.3: structured report returned by
+/// 2.8.3/2.8.4: structured report returned by
 /// `repair_partial_imports`. Serialized to JSON by the
 /// `dataset-repair-partial-imports` binary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5848,6 +6101,7 @@ pub struct DatasetRepairReport {
     pub event_count_before: usize,
     pub event_count_after: usize,
     pub partial_import_groups: Vec<PartialImportGroup>,
+    pub unresolved_groups: Vec<PartialImportGroup>,
     pub removed_events: Vec<RepairRemovedEvent>,
     pub events_sha256: String,
 }
@@ -7928,9 +8182,14 @@ mod tests {
                 .get(CONTINUOUS_CAPTURE_ID)
                 .is_some_and(|job| job.metrics.segments_ingested >= 2)
         });
+        // 2.8.4 (#9 comment 6705466743): `max_segments` no longer
+        // evicts owned pcap copies by count. Both N2 and N4 remain
+        // on disk under the ring; the only cleanup is for files
+        // whose source was externally removed (handled by the
+        // startup `state.segments.retain(...)` at :1903).
         assert_eq!(
             capture_files(&manager.root.join(CONTINUOUS_CAPTURE_ID).join("pcap")).len(),
-            1
+            2
         );
         let job = manager.get(CONTINUOUS_CAPTURE_ID).unwrap();
         assert_eq!(job.state, CaptureState::Capturing);
@@ -9043,9 +9302,14 @@ mod tests {
             let dataset = manager.dataset(CONTINUOUS_DATASET_ID).unwrap();
             assert_eq!(dataset.active_pdu_contexts.len(), 3);
             assert_eq!(dataset.active_ue_ips.len(), 3);
+            // 2.8.4 (#9 comment 6705466743): the pcap ring no longer
+            // evicts entries by count. After rotation N the ring
+            // holds the 8 bootstrap N2 files plus 3·(N+1) rotation
+            // outputs (one per plane) — the total grows monotonically
+            // until `max_owned_bytes` is reached.
             assert_eq!(
                 capture_files(&manager.root.join(CONTINUOUS_CAPTURE_ID).join("pcap")).len(),
-                8
+                (expected as usize),
             );
             if rotation == 1 {
                 assert!(dataset
@@ -10583,63 +10847,220 @@ mod tests {
 
         let manager = fresh_manager_for_restore(&base);
         // Dry run: computes the would-be SHA + removed list without
-        // writing anything.
-        let dry_report = manager.repair_partial_imports(true).unwrap();
+        // writing anything. 2.8.4: no source_root → falls back to
+        // state.segments-based "largest size" rule, which still works
+        // here because state.segments carries all 7 entries.
+        let dry_report = manager.repair_partial_imports(true, None).unwrap();
         assert!(dry_report.dry_run);
         assert_eq!(dry_report.event_count_before, 21);
         assert_eq!(dry_report.event_count_after, 3);
         assert_eq!(dry_report.partial_import_groups.len(), 1);
         assert_eq!(
-            dry_report.partial_import_groups[0].final_owned_file,
-            "owned-gggg.pcapng"
+            dry_report.partial_import_groups[0].final_capture_id.as_deref(),
+            Some("sha256:gggg")
+        );
+        assert_eq!(dry_report.partial_import_groups[0].snapshots.len(), 7);
+        assert_eq!(
+            dry_report.partial_import_groups[0].final_source,
+            PartialImportFinalSource::StateSegmentsLargest
         );
         assert_eq!(dry_report.removed_events.len(), 18);
         for removed in &dry_report.removed_events {
             assert!(
                 removed
                     .reason
-                    .contains("partial-import-superseded-by-final-owned-file=owned-gggg.pcapng"),
+                    .contains("partial-import-superseded-by-final-capture-id=sha256:gggg"),
                 "removed event must carry a precise reason, got {}",
                 removed.reason
             );
         }
         // Real run.
-        let report = manager.repair_partial_imports(false).unwrap();
+        let report = manager.repair_partial_imports(false, None).unwrap();
         assert!(!report.dry_run);
         assert_eq!(report.event_count_after, 3);
         assert_eq!(report.events_sha256, dry_report.events_sha256);
         let on_disk = read_event_ids(&dataset.join("oiran_events.jsonl"));
         assert_eq!(
             on_disk, final_event_ids,
-            "only events anchored on the final owned_file must remain; got {:?}",
+            "only events anchored on the final capture_id must remain; got {:?}",
             on_disk
         );
-        // Every removed event must correspond to a now-absent event_id.
         for partial in &partial_event_ids {
             assert!(
                 !on_disk.contains(partial),
                 "partial-import event {partial} must be removed"
             );
         }
-        // Manifest coherence: event_count == on-disk JSONL lines.
         let manifest: LiveDataset = serde_json::from_slice(
             &fs::read(dataset.join("dataset_manifest.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            manifest.event_count, 3,
-            "manifest event_count must match the pruned JSONL"
-        );
-        // Idempotence: a second pass finds no partial groups (the
-        // state.segments still has 7 entries, but the events referencing
-        // the 6 partial owned files are gone, so repair will compute
-        // the same SHA as the input — i.e., no-op repair).
-        let second = manager.repair_partial_imports(false).unwrap();
+        assert_eq!(manifest.event_count, 3);
+        // Idempotence: a second pass is a strict no-op.
+        let second = manager.repair_partial_imports(false, None).unwrap();
         assert_eq!(second.event_count_after, 3);
+        assert_eq!(second.events_sha256, report.events_sha256);
+    }
+
+    /// 2.8.4 (#9 comment 6705466743): ANR2 proved the repair dry-run
+    /// missed 1 of 7 snapshots because `state.segments` evicted the
+    /// oldest at its count cap. The 2.8.4 contract gets the grouping
+    /// from the dataset's JSONL content so an EMPTY `state.segments`
+    /// still produces the full 7-snapshot history. The final is then
+    /// resolved from the on-disk closed file under `--source-root`.
+    #[test]
+    fn repair_partial_imports_rebuilds_full_history_when_state_segments_was_evicted() {
+        let base = temporary_root("repair-content-based-7x");
+        let continuous = base.join(CONTINUOUS_CAPTURE_ID);
+        let dataset = continuous.join("dataset");
+        fs::create_dir_all(dataset.join("callflows")).unwrap();
+        // Simulate the production source tree: the 2.8.3 sequence rule
+        // leaves the lex-greatest sibling (the active dumpcap target)
+        // as "still live"; the one before it is the CLOSED final file
+        // whose SHA the repair matches against the snapshots.
+        let source_root = base.join("source");
+        fs::create_dir_all(source_root.join("n4")).unwrap();
+        // Write the closed FINAL file. Its SHA-256 must match the
+        // "gggg" snapshot's capture_id.
+        let final_bytes = {
+            // Choose a payload that SHA-256-hashes to a known value we
+            // reuse below as capture_id.
+            vec![0xaa_u8; 512]
+        };
+        let final_sha = sha256_hex(&final_bytes);
+        let final_path = source_root
+            .join("n4")
+            .join("n4_20261104T142333Z_00067_20261106211341.pcapng");
+        fs::write(&final_path, &final_bytes).unwrap();
+        // Active sibling (lex-greater) — excluded by the 2.8.3
+        // sequence rule.
+        let active_path = source_root
+            .join("n4")
+            .join("n4_20261104T142333Z_00068_20261106211342.pcapng");
+        fs::write(&active_path, vec![0xbb_u8; 256]).unwrap();
+
+        // 7 synthetic snapshots of the same growing file; capture_id
+        // of the 7th equals the closed file's SHA-256.
+        let snapshots: Vec<(String, u64)> = (1u32..=7).map(|index| {
+            if index == 7 {
+                (format!("sha256:{final_sha}"), index as u64)
+            } else {
+                (format!("sha256:{:064x}", index), index as u64)
+            }
+        }).collect();
+
+        let mut lines = Vec::new();
+        let mut final_event_ids: BTreeSet<String> = BTreeSet::new();
+        for (snap_idx, (capture_id, imported_ms)) in snapshots.iter().enumerate() {
+            let owned = format!("N4.pcap-{:016x}.pcapng", imported_ms);
+            for packet in 1..=3u64 {
+                let event_id = format!("evt-snap{}-p{packet}", snap_idx + 1);
+                let owned_full = continuous.join("pcap").join(&owned);
+                let line = serde_json::json!({
+                    "event_id": event_id,
+                    "capture_id": capture_id,
+                    "capture_point_id": "N4",
+                    "timestamp": {
+                        "seconds": packet,
+                        "nanoseconds": 0,
+                        "raw_ticks": packet as i128 * 1_000_000_000i128,
+                        "display": "",
+                    },
+                    "interface": "N4",
+                    "protocol": "PFCP",
+                    "message_name": "SessionEstablishmentRequest",
+                    "source_endpoint": {"address": "10.0.0.1", "network_function": "SMF"},
+                    "destination_endpoint": {"address": "10.0.0.2", "network_function": "UPF"},
+                    "direction": "CORE_TO_RAN",
+                    "session_identifiers": [],
+                    "information_elements": [],
+                    "decoding_status": "DECODED",
+                    "decoder_name": "test",
+                    "decoder_version": "1",
+                    "raw_payload_reference": capture_id.clone(),
+                    "packet_references": [{
+                        "source_file": owned_full.display().to_string(),
+                        "packet_number": packet,
+                        "byte_offset": 0,
+                        "interface_id": 0,
+                        "captured_length": 1,
+                        "original_length": 1,
+                    }],
+                    "errors": [],
+                })
+                .to_string();
+                lines.push(line);
+                if snap_idx == 6 {
+                    final_event_ids.insert(event_id);
+                }
+            }
+        }
+        write_jsonl(&dataset.join("oiran_events.jsonl"), &lines);
+        // EVICTED state.segments: only the latest entry survives. This
+        // reproduces the ANR2 failure where the 2.8.3 repair found 6
+        // of _00068 instead of the 7 historical snapshots of _00067.
+        let last = snapshots.last().unwrap();
+        let only_checksum = last.0.strip_prefix("sha256:").unwrap().to_owned();
+        let state = serde_json::json!({
+            "segments": {
+                only_checksum.clone(): {
+                    "interface": "N4",
+                    "owned_file": format!("N4.pcap-{:016x}.pcapng", last.1),
+                    "size_bytes": 12_436u64,
+                    "packets": 3u64,
+                    "imported_epoch_ms": last.1,
+                    "source_path": final_path.display().to_string(),
+                    "historical_context": false,
+                }
+            },
+            "seen_checksums": [],
+            "seen_order": [],
+            "failed_ingestions": [],
+            "source_fingerprints": {},
+        });
+        fs::write(
+            continuous.join("import_state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let manager = fresh_manager_for_restore(&base);
+        // --source-root provided → on-disk SHA match path.
+        let dry_report = manager
+            .repair_partial_imports(true, Some(source_root.as_path()))
+            .unwrap();
+        assert_eq!(dry_report.partial_import_groups.len(), 1);
+        let group = &dry_report.partial_import_groups[0];
         assert_eq!(
-            second.events_sha256, report.events_sha256,
-            "second repair must be byte-identical (idempotent)"
+            group.snapshots.len(),
+            7,
+            "content-based grouping must recover ALL 7 snapshots even though state.segments only has the latest: {group:#?}"
         );
+        assert_eq!(
+            group.final_source,
+            PartialImportFinalSource::OnDiskSha256Match
+        );
+        assert_eq!(
+            group.final_capture_id.as_deref(),
+            Some(format!("sha256:{final_sha}").as_str())
+        );
+        assert_eq!(dry_report.event_count_before, 21);
+        assert_eq!(dry_report.event_count_after, 3);
+        assert_eq!(dry_report.removed_events.len(), 18);
+
+        // Real run — writes the pruned JSONL.
+        let report = manager
+            .repair_partial_imports(false, Some(source_root.as_path()))
+            .unwrap();
+        assert_eq!(report.event_count_after, 3);
+        let on_disk = read_event_ids(&dataset.join("oiran_events.jsonl"));
+        assert_eq!(on_disk, final_event_ids);
+        // Idempotent — second pass is a strict no-op.
+        let second = manager
+            .repair_partial_imports(false, Some(source_root.as_path()))
+            .unwrap();
+        assert_eq!(second.event_count_after, 3);
+        assert_eq!(second.events_sha256, report.events_sha256);
     }
 
     /// 2.8.3: repair is a strict no-op on a healthy dataset — no
@@ -10682,7 +11103,7 @@ mod tests {
         .unwrap();
         let original_sha = sha256_hex(&fs::read(&dataset.join("oiran_events.jsonl")).unwrap());
         let manager = fresh_manager_for_restore(&base);
-        let report = manager.repair_partial_imports(false).unwrap();
+        let report = manager.repair_partial_imports(false, None).unwrap();
         assert!(report.partial_import_groups.is_empty());
         assert!(report.removed_events.is_empty());
         assert_eq!(report.event_count_before, 2);
