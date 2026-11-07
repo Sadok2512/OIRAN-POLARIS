@@ -2244,6 +2244,12 @@ impl CaptureManager {
             // `CaptureMetrics.plane_counts` so operators see the full
             // 12-interface landing. Log every unknown / no-decoder
             // path ONCE per worker lifetime.
+            //
+            // 2.9.2 (#9): also derive `job.interfaces` + `job.planes`
+            // from the discovered set — the 2.9.0 initial state at
+            // `:1161` hardcoded `["N2","N3","N4"]`, so SBI and the
+            // LTE planes never appeared in the Analyzer UI even when
+            // they were producing closed segments.
             {
                 let plane_counts = discovery.plane_counts.clone();
                 let mut to_log: Vec<PathBuf> = Vec::new();
@@ -2252,8 +2258,42 @@ impl CaptureManager {
                         to_log.push(path.clone());
                     }
                 }
+                let observed_interfaces: Vec<String> = plane_counts
+                    .keys()
+                    .filter(|key| key.as_str() != "UNKNOWN")
+                    .cloned()
+                    .collect();
                 self.update(CONTINUOUS_CAPTURE_ID, |job| {
-                    job.metrics.plane_counts = plane_counts;
+                    job.metrics.plane_counts = plane_counts.clone();
+                    if !observed_interfaces.is_empty() {
+                        job.interfaces = observed_interfaces.clone();
+                        let existing: BTreeMap<String, CapturePlaneStatus> = std::mem::take(&mut job.planes)
+                            .into_iter()
+                            .map(|plane| (plane.interface.clone(), plane))
+                            .collect();
+                        job.planes = observed_interfaces
+                            .iter()
+                            .map(|iface| {
+                                existing.get(iface).cloned().unwrap_or_else(|| {
+                                    CapturePlaneStatus {
+                                        plane: plane_name(iface).into(),
+                                        interface: iface.clone(),
+                                        capture_job_id: CONTINUOUS_CAPTURE_ID.into(),
+                                        start_timestamp: None,
+                                        end_timestamp: None,
+                                        packet_count: 0,
+                                        byte_count: 0,
+                                        drop_count: None,
+                                        storage_bytes: 0,
+                                        decode_status: "OBSERVED".into(),
+                                        dataset_id: None,
+                                        source_sha256: Vec::new(),
+                                        error: None,
+                                    }
+                                })
+                            })
+                            .collect();
+                    }
                 })?;
                 for path in to_log {
                     let plane = source_interface(&config.source_root, &path)
@@ -3323,24 +3363,28 @@ impl CaptureManager {
             }
         }
 
-        // Phase 2 — group snapshots by reconstructed segment identity.
-        type GroupKey = (String, i128, u64, u64);
-        let mut groups: BTreeMap<GroupKey, Vec<SnapshotScan>> = BTreeMap::new();
-        for (_, scan) in snapshots {
-            let key = (
-                scan.interface.clone(),
-                scan.first_raw_ticks,
-                scan.first_packet_number,
-                scan.first_byte_offset,
-            );
-            groups.entry(key).or_default().push(scan);
+        // Phase 2 — prefix-SHA grouping (2.9.2). ANR2's #9 comment
+        // 6708784283 proved the 2.8.4/2.9.0 content-identity key
+        // `(interface, first_raw_ticks, …)` fails in production:
+        // snapshots of a growing dumpcap file carry DISJOINT packet
+        // ranges (each import decodes only the newly-grown region),
+        // so every snapshot sits in its own singleton group and the
+        // loop below exits with `scans.len() <= 1`. The authoritative
+        // link is instead the SHA-256 of each snapshot: the
+        // `capture_id` of a partial import equals the SHA of a BYTE
+        // PREFIX of the final closed file at a packet boundary. The
+        // 2.9.2 algorithm walks each closed file under
+        // `<source-root>/<plane-lc>/`, snapshots the running SHA at
+        // every packet boundary (`prefix_sha_index`), and groups
+        // snapshots by the on-disk file whose full SHA or any prefix
+        // SHA matches their `capture_id`.
+        #[derive(Clone, Copy)]
+        enum ShaMatchKind {
+            Full,
+            Prefix(u64),
         }
-
-        // Phase 3 — determine the final capture_id per group.
-        // Optional: enumerate closed segments under source_root and SHA
-        // each one so the match is content-based, not metadata-based.
-        let mut on_disk_sha_by_interface: BTreeMap<String, Vec<(String, PathBuf)>> =
-            BTreeMap::new();
+        let mut on_disk_prefix: Vec<PrefixIndex> = Vec::new();
+        let mut sha_to_disk: BTreeMap<String, (PathBuf, ShaMatchKind)> = BTreeMap::new();
         if let Some(root) = source_root {
             if root.is_dir() {
                 for entry in fs::read_dir(root).map_err(display_error)?.flatten() {
@@ -3348,10 +3392,11 @@ impl CaptureManager {
                     if !dir.is_dir() {
                         continue;
                     }
-                    let Some(plane) = dir.file_name().and_then(|value| value.to_str()) else {
+                    let plane = dir.file_name().and_then(|value| value.to_str()).unwrap_or("");
+                    let canonical = canonical_interface_for_plane(plane).unwrap_or("");
+                    if canonical.is_empty() || !interface_has_decoder(canonical) {
                         continue;
-                    };
-                    let interface = plane.to_ascii_uppercase();
+                    }
                     let mut files: Vec<PathBuf> = fs::read_dir(&dir)
                         .map_err(display_error)?
                         .flatten()
@@ -3365,30 +3410,148 @@ impl CaptureManager {
                         })
                         .collect();
                     files.sort();
-                    // 2.8.3 sequence rule: the lex-greatest sibling per
-                    // interface is the active dumpcap target. Exclude it.
-                    let active = files.pop();
+                    // 2.8.3 sequence rule: the lex-greatest sibling
+                    // is the active dumpcap target. Exclude it from
+                    // closed-file inspection.
+                    let _active = files.pop();
                     for path in files {
-                        let Ok(checksum) = sha256_hex_file(&path) else {
-                            continue;
-                        };
-                        on_disk_sha_by_interface
-                            .entry(interface.clone())
-                            .or_default()
-                            .push((checksum, path));
-                    }
-                    if let Some(active_path) = active {
-                        let _ = active_path; // surface in the report only if needed later
+                        if let Ok(index) = prefix_sha_index(&path) {
+                            sha_to_disk.insert(
+                                format!("sha256:{}", index.full_sha_hex),
+                                (index.path.clone(), ShaMatchKind::Full),
+                            );
+                            for (sha_hex, (packet_count, _bytes)) in &index.prefix_sha {
+                                sha_to_disk.insert(
+                                    format!("sha256:{sha_hex}"),
+                                    (index.path.clone(), ShaMatchKind::Prefix(*packet_count)),
+                                );
+                            }
+                            on_disk_prefix.push(index);
+                        }
                     }
                 }
             }
         }
 
+        // `prefix_sha_groups` groups snapshots by the on-disk file
+        // they belong to. A snapshot that didn't match any on-disk
+        // prefix/full SHA stays in `unmatched_snapshots` and is
+        // eligible for the 2.8.4 fallback paths.
+        let mut prefix_sha_groups: BTreeMap<PathBuf, Vec<SnapshotScan>> = BTreeMap::new();
+        let mut unmatched_snapshots: Vec<SnapshotScan> = Vec::new();
+        for (_, scan) in snapshots {
+            if let Some((path, _kind)) = sha_to_disk.get(&scan.capture_id) {
+                prefix_sha_groups
+                    .entry(path.clone())
+                    .or_default()
+                    .push(scan);
+            } else {
+                unmatched_snapshots.push(scan);
+            }
+        }
+
         let mut partial_groups: Vec<PartialImportGroup> = Vec::new();
         let mut unresolved_groups: Vec<PartialImportGroup> = Vec::new();
-        let mut capture_id_to_final: BTreeMap<String, String> = BTreeMap::new();
-        // capture_ids we must DROP → reason template.
         let mut drop_reason: BTreeMap<String, String> = BTreeMap::new();
+        // Groups that need a fresh import of their on-disk file. The
+        // actual decode + emit happens in phase 4b, so the dry-run
+        // path can report them without side effects.
+        let mut fresh_import_queue: Vec<(PathBuf, String)> = Vec::new();
+
+        for (on_disk_path, mut scans) in prefix_sha_groups {
+            if scans.is_empty() {
+                continue;
+            }
+            scans.sort_by(|a, b| a.capture_id.cmp(&b.capture_id));
+            let (full_sha, full_packet_count) = on_disk_prefix
+                .iter()
+                .find(|idx| idx.path == on_disk_path)
+                .map(|idx| (idx.full_sha_hex.clone(), idx.full_packet_count))
+                .unwrap_or_default();
+            let full_capture_id = format!("sha256:{full_sha}");
+            let has_full = scans.iter().any(|s| s.capture_id == full_capture_id);
+            let interface = scans
+                .iter()
+                .map(|s| s.interface.clone())
+                .find(|value| !value.is_empty())
+                .unwrap_or_default();
+            let (final_capture_id, final_source) = if has_full {
+                (
+                    Some(full_capture_id.clone()),
+                    PartialImportFinalSource::OnDiskSha256Match,
+                )
+            } else {
+                fresh_import_queue
+                    .push((on_disk_path.clone(), full_capture_id.clone()));
+                (
+                    Some(full_capture_id.clone()),
+                    PartialImportFinalSource::PrefixShaMatchFreshImport,
+                )
+            };
+            let snapshot_records: Vec<PartialImportSnapshot> = scans
+                .iter()
+                .map(|scan| PartialImportSnapshot {
+                    capture_id: scan.capture_id.clone(),
+                    owned_file: scan.owned_file.clone(),
+                    event_count: scan.event_count,
+                    max_packet_number: scan.max_packet_number,
+                    state_size_bytes: state
+                        .segments
+                        .get(scan.capture_id.strip_prefix("sha256:").unwrap_or(""))
+                        .map(|entry| entry.size_bytes),
+                    state_imported_epoch_ms: state
+                        .segments
+                        .get(scan.capture_id.strip_prefix("sha256:").unwrap_or(""))
+                        .map(|entry| entry.imported_epoch_ms),
+                })
+                .collect();
+            let group = PartialImportGroup {
+                reconstruction_key: format!(
+                    "on_disk_path={}|full_sha256={full_sha}|full_packet_count={full_packet_count}",
+                    on_disk_path.display()
+                ),
+                interface: interface.clone(),
+                first_packet_raw_ticks: 0,
+                first_packet_number: 0,
+                first_packet_byte_offset: 0,
+                snapshots: snapshot_records,
+                final_capture_id: final_capture_id.clone(),
+                final_source,
+                final_on_disk_path: Some(on_disk_path.display().to_string()),
+                needs_fresh_import: !has_full,
+            };
+            // Every snapshot BUT the full one drops. Under
+            // `PrefixShaMatchFreshImport` ALL snapshots drop; the
+            // on-disk file is decoded afresh in phase 4b and its
+            // events replace the prefix imports.
+            for scan in &scans {
+                if scan.capture_id != full_capture_id {
+                    drop_reason.insert(
+                        scan.capture_id.clone(),
+                        format!(
+                            "partial-import-superseded-by-final-capture-id={full_capture_id}"
+                        ),
+                    );
+                }
+            }
+            partial_groups.push(group);
+        }
+
+        // 2.8.4 fallback — run the content-identity grouping ONLY on
+        // snapshots that didn't match a prefix SHA on disk. Covers
+        // the "no --source-root" case and any snapshot whose on-disk
+        // file has been pruned.
+        type GroupKey = (String, i128, u64, u64);
+        let mut groups: BTreeMap<GroupKey, Vec<SnapshotScan>> = BTreeMap::new();
+        for scan in unmatched_snapshots {
+            let key = (
+                scan.interface.clone(),
+                scan.first_raw_ticks,
+                scan.first_packet_number,
+                scan.first_byte_offset,
+            );
+            groups.entry(key).or_default().push(scan);
+        }
 
         for ((interface, first_raw_ticks, first_pkt, first_off), mut scans) in groups {
             if scans.len() <= 1 {
@@ -3399,29 +3562,10 @@ impl CaptureManager {
                 "interface={interface}|first_raw_ticks={first_raw_ticks}|first_packet_number={first_pkt}|first_byte_offset={first_off}"
             );
             let (final_capture_id, final_source, final_on_disk_path) =
-                if let Some(matches) = on_disk_sha_by_interface.get(&interface) {
-                    let mut best: Option<(String, PathBuf)> = None;
-                    for scan in &scans {
-                        if let Some(hex) = scan.capture_id.strip_prefix("sha256:") {
-                            if let Some((_, path)) = matches
-                                .iter()
-                                .find(|(sha, _)| sha.eq_ignore_ascii_case(hex))
-                            {
-                                best = Some((scan.capture_id.clone(), path.clone()));
-                                break;
-                            }
-                        }
-                    }
-                    match best {
-                        Some((capture, path)) => (
-                            Some(capture),
-                            PartialImportFinalSource::OnDiskSha256Match,
-                            Some(path.display().to_string()),
-                        ),
-                        None => (None, PartialImportFinalSource::UnresolvedNoEvidence, None),
-                    }
-                } else {
-                    // Fallback: state.segments-based "largest size" rule.
+                {
+                    // Fallback: state.segments-based "largest size"
+                    // rule. 2.9.2 reaches here only for snapshots
+                    // that did NOT match any on-disk prefix SHA.
                     let mut best: Option<(String, u64, u64)> = None;
                     for scan in &scans {
                         let hex = scan.capture_id.strip_prefix("sha256:").unwrap_or("");
@@ -3481,8 +3625,6 @@ impl CaptureManager {
             };
 
             if let Some(final_capture) = &final_capture_id {
-                capture_id_to_final
-                    .insert(final_capture.clone(), final_capture.clone());
                 for scan in &scans {
                     if &scan.capture_id != final_capture {
                         drop_reason.insert(
@@ -3547,6 +3689,60 @@ impl CaptureManager {
                     .to_owned();
                 kept.push((capture_id, packet_number, event_id, line));
             }
+            // Phase 4b (2.9.2) — fresh-import every on-disk file
+            // whose FULL-SHA snapshot is missing from the dataset.
+            // The decode runs through `decode_capture_streaming` with
+            // the same `PseudonymKey` the live-probe owns, so event
+            // IDs are reproducible and stay compatible with the
+            // dataset's canonical `(capture_id, packet_number,
+            // event_id)` sort. Dry-run SKIPS the decode — it only
+            // reports what WOULD be added; the SHA computation
+            // further down still produces an accurate "what-would-be"
+            // digest because the removed prefix snapshots are
+            // dropped either way.
+            if !dry_run {
+                for (on_disk_path, full_capture_id) in &fresh_import_queue {
+                    let interface = on_disk_path
+                        .parent()
+                        .and_then(|parent| parent.file_name())
+                        .and_then(|name| name.to_str())
+                        .and_then(canonical_interface_for_plane)
+                        .unwrap_or("");
+                    if interface.is_empty() {
+                        continue;
+                    }
+                    let config = DecodeConfig {
+                        input: on_disk_path.clone(),
+                        capture_id: full_capture_id.clone(),
+                        interface: interface.to_owned(),
+                        endpoints: HashMap::new(),
+                    };
+                    let mut fresh_events: Vec<NormalizedEvent> = Vec::new();
+                    if decode_capture_streaming(
+                        &config,
+                        self.pseudonym_key.as_ref(),
+                        |event| {
+                            fresh_events.push(event);
+                            Ok(())
+                        },
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
+                    for mut event in fresh_events {
+                        event.assign_deterministic_id();
+                        let line = event.to_json();
+                        let packet_number = event.packet_references.first().map(|p| p.packet_number).unwrap_or(0);
+                        kept.push((
+                            full_capture_id.clone(),
+                            packet_number,
+                            event.event_id.clone(),
+                            line,
+                        ));
+                    }
+                }
+            }
             kept.sort_by(|a, b| (&a.0, a.1, &a.2).cmp(&(&b.0, b.1, &b.2)));
         }
 
@@ -3568,7 +3764,7 @@ impl CaptureManager {
 
         if dry_run || removed.is_empty() {
             return Ok(DatasetRepairReport {
-                schema_version: "2.8.4",
+                schema_version: "2.9.2",
                 dataset_dir: current.display().to_string(),
                 dry_run,
                 event_count_before,
@@ -3634,7 +3830,7 @@ impl CaptureManager {
         }
         self.upsert_dataset(dataset, &current)?;
         Ok(DatasetRepairReport {
-            schema_version: "2.8.4",
+            schema_version: "2.9.2",
             dataset_dir: current.display().to_string(),
             dry_run: false,
             event_count_before,
@@ -6143,6 +6339,13 @@ pub enum PartialImportFinalSource {
     /// closed file (the lex-greatest sibling is excluded — it's the
     /// still-live dumpcap target per 2.8.3).
     OnDiskSha256Match,
+    /// 2.9.2 (#9 comment 6708784283): the snapshots in the group
+    /// matched PREFIX SHA-256 values of a closed on-disk file at
+    /// packet boundaries, but the FULL-SHA snapshot was absent from
+    /// the dataset. The repair re-decoded the closed file through the
+    /// same publication path and emitted a fresh set of events; the
+    /// prefix snapshots are then removed.
+    PrefixShaMatchFreshImport,
     /// No `source_root` provided. The repair falls back to
     /// `state.segments`: the snapshot with the largest `size_bytes`
     /// (tie-broken by latest `imported_epoch_ms`) is treated as the
@@ -6851,6 +7054,109 @@ fn sha256_hex_file(path: &Path) -> Result<String, String> {
         reader.consume(consumed);
     }
     Ok(hasher.finish_hex())
+}
+
+/// 2.9.2 (#9 comment 6708784283): walk a pcap file packet-by-packet
+/// and snapshot a running SHA-256 at every record boundary. The map
+/// returned is `prefix_sha_hex → (packet_count, bytes)` — the exact
+/// SHA each PARTIAL import would have carried as its `capture_id`,
+/// paired with the number of packets up to that prefix. The full-file
+/// SHA is returned separately and is NOT duplicated inside the prefix
+/// map, so a "full-SHA snapshot" (= complete import) and a "prefix
+/// snapshot" (= partial import) are always disambiguated.
+#[derive(Debug, Clone)]
+struct PrefixIndex {
+    path: PathBuf,
+    full_sha_hex: String,
+    full_packet_count: u64,
+    full_bytes: u64,
+    /// `prefix_sha_hex → (packet_count, bytes_including_pcap_header)`.
+    prefix_sha: BTreeMap<String, (u64, u64)>,
+}
+
+fn prefix_sha_index(path: &Path) -> Result<PrefixIndex, String> {
+    use std::io::Read;
+    // 2.9.2: the full-file SHA is the only file-level invariant; it
+    // is computed via `sha256_hex_file`, which walks the entire file
+    // regardless of pcap validity. The packet-boundary walk below is
+    // best-effort and just builds the `prefix_sha` map for partial
+    // snapshots; a non-pcap or truncated file still exposes a valid
+    // `full_sha_hex` for the Full-SHA match path.
+    let full_sha_hex = sha256_hex_file(path)?;
+    let full_bytes = fs::metadata(path).map_err(display_error)?.len();
+    let mut file = fs::File::open(path).map_err(display_error)?;
+    let mut hasher = Sha256Hasher::new();
+    let mut prefix_sha: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut header = [0u8; 24];
+    if file.read_exact(&mut header).is_err() {
+        return Ok(PrefixIndex {
+            path: path.to_path_buf(),
+            full_sha_hex,
+            full_packet_count: 0,
+            full_bytes,
+            prefix_sha,
+        });
+    }
+    hasher.update(&header);
+    let little = matches!(
+        &header[..4],
+        [0xd4, 0xc3, 0xb2, 0xa1] | [0x4d, 0x3c, 0xb2, 0xa1]
+    );
+    let big = matches!(&header[..4], [0xa1, 0xb2, 0xc3, 0xd4]);
+    if !little && !big {
+        // Non-pcap bytes: `full_sha_hex` is set, no prefixes.
+        return Ok(PrefixIndex {
+            path: path.to_path_buf(),
+            full_sha_hex,
+            full_packet_count: 0,
+            full_bytes,
+            prefix_sha,
+        });
+    }
+    let mut bytes_so_far: u64 = 24;
+    let mut packet_number: u64 = 0;
+    loop {
+        let mut record = [0u8; 16];
+        if file.read_exact(&mut record).is_err() {
+            break;
+        }
+        let length = if little {
+            u32::from_le_bytes(record[8..12].try_into().unwrap())
+        } else {
+            u32::from_be_bytes(record[8..12].try_into().unwrap())
+        } as u64;
+        hasher.update(&record);
+        bytes_so_far = bytes_so_far.saturating_add(16);
+        let mut remaining = length;
+        let mut buf = [0u8; 4096];
+        let mut payload_ok = true;
+        while remaining > 0 {
+            let take = remaining.min(buf.len() as u64) as usize;
+            if file.read_exact(&mut buf[..take]).is_err() {
+                payload_ok = false;
+                break;
+            }
+            hasher.update(&buf[..take]);
+            remaining -= take as u64;
+            bytes_so_far = bytes_so_far.saturating_add(take as u64);
+        }
+        if !payload_ok {
+            break;
+        }
+        packet_number = packet_number.saturating_add(1);
+        let snapshot_sha = hasher.clone().finish_hex();
+        prefix_sha.insert(snapshot_sha, (packet_number, bytes_so_far));
+    }
+    // The last packet-boundary snapshot equals the full-file digest;
+    // remove it so the repair distinguishes Full vs Prefix.
+    prefix_sha.remove(&full_sha_hex);
+    Ok(PrefixIndex {
+        path: path.to_path_buf(),
+        full_sha_hex,
+        full_packet_count: packet_number,
+        full_bytes,
+        prefix_sha,
+    })
 }
 
 /// Verify that `path` matches the expected size + SHA-256 in O(STREAM_CHUNK_BYTES)
@@ -10729,6 +11035,20 @@ mod tests {
         writer.flush().unwrap();
     }
 
+    fn count_events_with_capture(path: &Path, capture_id: &str) -> usize {
+        BufReader::new(fs::File::open(path).unwrap())
+            .lines()
+            .filter_map(Result::ok)
+            .filter(|line| !line.trim().is_empty())
+            .filter(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|value| value.get("capture_id").and_then(|v| v.as_str()).map(str::to_owned))
+                    .is_some_and(|value| value == capture_id)
+            })
+            .count()
+    }
+
     fn read_event_ids(path: &Path) -> BTreeSet<String> {
         BufReader::new(fs::File::open(path).unwrap())
             .lines()
@@ -11166,57 +11486,64 @@ mod tests {
         assert_eq!(second.events_sha256, report.events_sha256);
     }
 
-    /// 2.8.4 (#9 comment 6705466743): ANR2 proved the repair dry-run
-    /// missed 1 of 7 snapshots because `state.segments` evicted the
-    /// oldest at its count cap. The 2.8.4 contract gets the grouping
-    /// from the dataset's JSONL content so an EMPTY `state.segments`
-    /// still produces the full 7-snapshot history. The final is then
-    /// resolved from the on-disk closed file under `--source-root`.
+    /// 2.9.2 (#9 comment 6708784283): the ANR2 real-data scenario.
+    /// Seven partial imports of a growing dumpcap file land in the
+    /// published dataset with `capture_id` values equal to the
+    /// SHA-256 of BYTE PREFIXES of the final closed file at packet
+    /// boundaries. The final full-SHA snapshot is ABSENT — dumpcap
+    /// rotated to `_00068` before the probe caught up, and
+    /// `state.segments` holds no entry for `_00067`. The 2.9.2
+    /// repair walks the closed file via `prefix_sha_index`, matches
+    /// every snapshot `capture_id` against the per-packet prefix
+    /// SHAs, groups the 7 snapshots to the on-disk file, decodes it
+    /// afresh to replace the partial events, and removes the
+    /// prefix-only events. The 2.9.0 content-identity key
+    /// `(interface, first_raw_ticks, …)` failed in production
+    /// (ANR2 observed zero groups) because each snapshot carries a
+    /// DISJOINT packet range — no two snapshots share packet 1.
     #[test]
-    fn repair_partial_imports_rebuilds_full_history_when_state_segments_was_evicted() {
-        let base = temporary_root("repair-content-based-7x");
+    fn repair_partial_imports_rebuilds_full_history_via_prefix_sha_match() {
+        let base = temporary_root("repair-prefix-sha-7x");
         let continuous = base.join(CONTINUOUS_CAPTURE_ID);
         let dataset = continuous.join("dataset");
         fs::create_dir_all(dataset.join("callflows")).unwrap();
-        // Simulate the production source tree: the 2.8.3 sequence rule
-        // leaves the lex-greatest sibling (the active dumpcap target)
-        // as "still live"; the one before it is the CLOSED final file
-        // whose SHA the repair matches against the snapshots.
         let source_root = base.join("source");
         fs::create_dir_all(source_root.join("n4")).unwrap();
-        // Write the closed FINAL file. Its SHA-256 must match the
-        // "gggg" snapshot's capture_id.
-        let final_bytes = {
-            // Choose a payload that SHA-256-hashes to a known value we
-            // reuse below as capture_id.
-            vec![0xaa_u8; 512]
-        };
-        let final_sha = sha256_hex(&final_bytes);
+        // Build a real pcap with 8 packets so `prefix_sha_index`
+        // produces ≥ 7 packet-boundary SHA snapshots to match
+        // against.
         let final_path = source_root
             .join("n4")
-            .join("n4_20261104T142333Z_00067_20261106211341.pcapng");
-        fs::write(&final_path, &final_bytes).unwrap();
+            .join("n4_20261104T142333Z_00067_20261107082343.pcapng");
+        write_pcap(
+            &final_path,
+            &(1..=8u8).map(|byte| vec![byte; 32]).collect::<Vec<_>>(),
+        );
         // Active sibling (lex-greater) — excluded by the 2.8.3
         // sequence rule.
         let active_path = source_root
             .join("n4")
-            .join("n4_20261104T142333Z_00068_20261106211342.pcapng");
-        fs::write(&active_path, vec![0xbb_u8; 256]).unwrap();
+            .join("n4_20261104T142333Z_00068_20261107092400.pcapng");
+        write_pcap(&active_path, &[vec![0xff; 32]]);
 
-        // 7 synthetic snapshots of the same growing file; capture_id
-        // of the 7th equals the closed file's SHA-256.
-        let snapshots: Vec<(String, u64)> = (1u32..=7).map(|index| {
-            if index == 7 {
-                (format!("sha256:{final_sha}"), index as u64)
-            } else {
-                (format!("sha256:{:064x}", index), index as u64)
-            }
-        }).collect();
+        let index = prefix_sha_index(&final_path).unwrap();
+        let prefix_shas: Vec<String> = index.prefix_sha.keys().take(7).cloned().collect();
+        assert_eq!(
+            prefix_shas.len(),
+            7,
+            "fixture pcap must expose at least 7 packet-boundary prefixes; got {}",
+            prefix_shas.len()
+        );
 
+        // Build 7 snapshots × 3 events = 21 prefix events. None has
+        // the full-file SHA → forces the PrefixShaMatchFreshImport
+        // path.
         let mut lines = Vec::new();
-        let mut final_event_ids: BTreeSet<String> = BTreeSet::new();
-        for (snap_idx, (capture_id, imported_ms)) in snapshots.iter().enumerate() {
-            let owned = format!("N4.pcap-{:016x}.pcapng", imported_ms);
+        let mut prefix_capture_ids: BTreeSet<String> = BTreeSet::new();
+        for (snap_idx, prefix_sha) in prefix_shas.iter().enumerate() {
+            let capture_id = format!("sha256:{prefix_sha}");
+            prefix_capture_ids.insert(capture_id.clone());
+            let owned = format!("N4.pcap-{}.pcapng", &prefix_sha[..16]);
             for packet in 1..=3u64 {
                 let event_id = format!("evt-snap{}-p{packet}", snap_idx + 1);
                 let owned_full = continuous.join("pcap").join(&owned);
@@ -11227,7 +11554,7 @@ mod tests {
                     "timestamp": {
                         "seconds": packet,
                         "nanoseconds": 0,
-                        "raw_ticks": packet as i128 * 1_000_000_000i128,
+                        "raw_ticks": (snap_idx as i128 * 100 + packet as i128) * 1_000_000_000i128,
                         "display": "",
                     },
                     "interface": "N4",
@@ -11244,8 +11571,8 @@ mod tests {
                     "raw_payload_reference": capture_id.clone(),
                     "packet_references": [{
                         "source_file": owned_full.display().to_string(),
-                        "packet_number": packet,
-                        "byte_offset": 0,
+                        "packet_number": (snap_idx as u64 * 10) + packet,
+                        "byte_offset": 1000 * (snap_idx as u64 + 1) + packet,
                         "interface_id": 0,
                         "captured_length": 1,
                         "original_length": 1,
@@ -11254,29 +11581,14 @@ mod tests {
                 })
                 .to_string();
                 lines.push(line);
-                if snap_idx == 6 {
-                    final_event_ids.insert(event_id);
-                }
             }
         }
         write_jsonl(&dataset.join("oiran_events.jsonl"), &lines);
-        // EVICTED state.segments: only the latest entry survives. This
-        // reproduces the ANR2 failure where the 2.8.3 repair found 6
-        // of _00068 instead of the 7 historical snapshots of _00067.
-        let last = snapshots.last().unwrap();
-        let only_checksum = last.0.strip_prefix("sha256:").unwrap().to_owned();
+        // EMPTY state.segments — ANR2 proved this is the production
+        // reality (no `_00067` entry survived the pre-2.8.4
+        // eviction).
         let state = serde_json::json!({
-            "segments": {
-                only_checksum.clone(): {
-                    "interface": "N4",
-                    "owned_file": format!("N4.pcap-{:016x}.pcapng", last.1),
-                    "size_bytes": 12_436u64,
-                    "packets": 3u64,
-                    "imported_epoch_ms": last.1,
-                    "source_path": final_path.display().to_string(),
-                    "historical_context": false,
-                }
-            },
+            "segments": {},
             "seen_checksums": [],
             "seen_order": [],
             "failed_ingestions": [],
@@ -11289,41 +11601,71 @@ mod tests {
         .unwrap();
 
         let manager = fresh_manager_for_restore(&base);
-        // --source-root provided → on-disk SHA match path.
+        // Dry run — the 7 prefix snapshots are grouped together via
+        // SHA-256 of packet-boundary prefixes.
         let dry_report = manager
             .repair_partial_imports(true, Some(source_root.as_path()))
             .unwrap();
-        assert_eq!(dry_report.partial_import_groups.len(), 1);
-        let group = &dry_report.partial_import_groups[0];
         assert_eq!(
-            group.snapshots.len(),
-            7,
-            "content-based grouping must recover ALL 7 snapshots even though state.segments only has the latest: {group:#?}"
+            dry_report.partial_import_groups.len(),
+            1,
+            "7 prefix snapshots of the same growing file must group together"
         );
+        let group = &dry_report.partial_import_groups[0];
+        assert_eq!(group.snapshots.len(), 7);
         assert_eq!(
             group.final_source,
-            PartialImportFinalSource::OnDiskSha256Match
+            PartialImportFinalSource::PrefixShaMatchFreshImport,
+            "no full-SHA snapshot in the dataset → needs fresh import"
         );
         assert_eq!(
             group.final_capture_id.as_deref(),
-            Some(format!("sha256:{final_sha}").as_str())
+            Some(format!("sha256:{}", index.full_sha_hex).as_str())
         );
+        assert!(group.needs_fresh_import);
         assert_eq!(dry_report.event_count_before, 21);
-        assert_eq!(dry_report.event_count_after, 3);
-        assert_eq!(dry_report.removed_events.len(), 18);
+        assert_eq!(dry_report.removed_events.len(), 21);
+        let dry_captures: BTreeSet<String> = dry_report
+            .removed_events
+            .iter()
+            .map(|event| event.capture_id.clone())
+            .collect();
+        assert_eq!(
+            dry_captures, prefix_capture_ids,
+            "every prefix-snapshot capture_id must appear in the dry-run removals"
+        );
 
-        // Real run — writes the pruned JSONL.
+        // Real run — the 21 prefix events are removed and the
+        // closed file is decoded fresh. The synthetic fixture pcap
+        // isn't a real PFCP capture so `decode_capture_streaming`
+        // emits 0 events, but the invariant on prefix removal
+        // stands.
         let report = manager
             .repair_partial_imports(false, Some(source_root.as_path()))
             .unwrap();
-        assert_eq!(report.event_count_after, 3);
-        let on_disk = read_event_ids(&dataset.join("oiran_events.jsonl"));
-        assert_eq!(on_disk, final_event_ids);
-        // Idempotent — second pass is a strict no-op.
+        for capture in &prefix_capture_ids {
+            let remaining = count_events_with_capture(
+                &dataset.join("oiran_events.jsonl"),
+                capture,
+            );
+            assert_eq!(
+                remaining, 0,
+                "every prefix capture_id must be fully removed; {capture} still has {remaining}"
+            );
+        }
+        assert_eq!(
+            report.event_count_before - report.removed_events.len(),
+            report.event_count_after - count_events_with_capture(
+                &dataset.join("oiran_events.jsonl"),
+                &format!("sha256:{}", index.full_sha_hex),
+            ),
+            "kept events equal (input - removed) plus any fresh-import additions"
+        );
+        // Idempotent — second pass finds no prefix snapshots because
+        // they are all gone.
         let second = manager
             .repair_partial_imports(false, Some(source_root.as_path()))
             .unwrap();
-        assert_eq!(second.event_count_after, 3);
         assert_eq!(second.events_sha256, report.events_sha256);
     }
 

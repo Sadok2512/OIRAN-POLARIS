@@ -528,7 +528,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "live-probe"
-version = "0.4.19"
+version = "0.4.20"
 dependencies = [
  "callflow-renderer",
  "callflow-schema",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.9.1"
+version = "2.9.2"
 dependencies = [
  "axum",
  "callflow-renderer",

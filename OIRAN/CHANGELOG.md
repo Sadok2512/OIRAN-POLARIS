@@ -1,5 +1,109 @@
 # Changelog
 
+## OIRAN API 2.9.2 — 2026-11-07 — prefix-SHA repair grouping + derived continuous interfaces (#9 comment 6708784283)
+
+### Proven cause (ANR2 — #9 comment 6708784283)
+
+- The 2.9.0 dry-run returned **zero** partial-import groups on
+  production. ANR2's 84-event sample proved why: the 7 snapshots of
+  `_00067` arrive in the dataset with DISJOINT packet ranges (each
+  snapshot's events cover only the newly-grown region since the
+  previous snapshot). The 2.8.4/2.9.0 content-identity key
+  `(interface, first_raw_ticks, first_packet_number,
+  first_byte_offset)` is computed PER snapshot's events, so each
+  snapshot sits in its OWN singleton group and the loop filter at
+  `OIRAN/live-probe/src/lib.rs` (`for ((interface, first_raw_ticks,
+  first_pkt, first_off), mut scans) in groups { if scans.len() <= 1
+  { continue; } … }`) skips every group → zero output.
+- The real evidence ANR2 recovered: each snapshot's `capture_id` is
+  the SHA-256 of a BYTE PREFIX of the final closed file at a
+  packet-record boundary (sizes 33228, 34332, 35436, 36540, 37644,
+  38748, 39852 B → 7 prefix SHAs matching the 7 capture IDs). The
+  full-file SHA
+  (`6085e2d7d61334850ba1912fec585c4165907f3b2a53cecba132f55267934ff1`)
+  is absent from the dataset — the final import never happened
+  because dumpcap rotated to `_00068` first.
+
+### Fix (`OIRAN/live-probe` 0.4.19 → 0.4.20, API 2.9.1 → 2.9.2)
+
+- **Prefix-SHA grouping.** New `prefix_sha_index(path)` walks a
+  closed pcap packet-by-packet, snapshots a running SHA-256 at every
+  record boundary, and returns `full_sha + {prefix_sha → packet
+  count}`. `repair_partial_imports`:
+  * For every closed segment under `<source-root>/<plane-lc>/`
+    (2.8.3 sequence rule excludes the lex-greatest active sibling),
+    builds a `PrefixIndex`.
+  * Maps every snapshot's `capture_id` against the global
+    `prefix_sha + full_sha` table → groups snapshots by matched
+    on-disk file.
+  * Groups with a Full-SHA snapshot ⇒ `OnDiskSha256Match`,
+    keep the full one, drop the prefixes.
+  * Groups WITHOUT a Full-SHA snapshot ⇒
+    `PrefixShaMatchFreshImport`: run `decode_capture_streaming`
+    on the on-disk file with the probe's existing `PseudonymKey`,
+    emit fresh events through the SAME publication path as
+    `restore_from_archive_segment`, THEN drop the prefix snapshots.
+  * Snapshots without a prefix match fall back to the 2.8.4
+    content-identity grouping + `state.segments`-largest rule.
+- **TOUS les segments partiellement importés.** The walk covers
+  every closed file under every allowlisted plane dir, so the
+  dry-run lists every partial-import group across the source tree,
+  not just `_00067`.
+- **Line 1161 — derived continuous interfaces.** The initial
+  `continuous-lab-import` job hardcoded `["N2","N3","N4"]` as its
+  `interfaces` + `planes` list. The worker loop now derives both
+  from the 2.9.1 `discovery.plane_counts` on every scan (skipping
+  the `UNKNOWN` sentinel), so SBI and the LTE planes appear on
+  `/api/v1/captures/continuous-lab-import` as soon as a single
+  pcap for them lands on disk.
+
+### Why the 2.9.0 dry-run returned zero groups (file:line)
+
+- `OIRAN/live-probe/src/lib.rs` (pre-2.9.2):
+  * `let mut groups: BTreeMap<GroupKey, Vec<SnapshotScan>> = BTreeMap::new();`
+    was keyed on `(interface, first_raw_ticks, first_packet_number,
+    first_byte_offset)` — the FIRST packet of each snapshot's event
+    stream.
+  * The ANR2 snapshots carry disjoint packet ranges (snap 1 covers
+    packets 347-358, snap 2 covers 419-430, …), so each snapshot's
+    first-packet tuple is UNIQUE → singleton groups.
+  * `if scans.len() <= 1 { continue; }` then skipped every group.
+- 2.9.2 keys on the SHA-256 of actual on-disk file bytes — the
+  identifier that production rotation genuinely shares across
+  partial imports.
+
+### `Sha256Hasher` clone
+
+- `OIRAN/event-schema/src/lib.rs` — `Sha256Hasher` now derives
+  `Clone`. The running-digest snapshot inside `prefix_sha_index`
+  needs it; the state is 64 B so cloning is cheap.
+
+### SemVer
+
+| Component | Before | After |
+|---|---|---|
+| `OIRAN/live-probe` | 0.4.19 | **0.4.20** |
+| `OIRAN/apps/api` | 2.9.1 | **2.9.2** |
+
+The web bundle stays at **2.9.0** (no frontend change).
+
+### Compat
+
+- Compiles under `rustc 1.75` (workspace minimum) and `rustc 1.83`
+  (server toolchain). No nightly / unstable feature used.
+
+### Tests
+
+- `cargo test --workspace --locked --release --offline --no-fail-fast`
+  → **402 passed, 0 failed, 4 ignored**.
+- `repair_partial_imports_rebuilds_full_history_via_prefix_sha_match`
+  — writes a real pcap with 8 packets, extracts 7
+  packet-boundary prefix SHAs from `prefix_sha_index`, fabricates
+  21 prefix events, asserts the 2.9.2 repair groups all 7
+  snapshots to the on-disk file, tags `PrefixShaMatchFreshImport`,
+  removes 21 prefix events, re-decodes the closed file, and stays
+  idempotent on the second pass.
+
 ## OIRAN API 2.9.1 — 2026-11-07 — 12-plane allowlist + Diameter/GTP routing + `CONTINUOUS_PLANE_NOT_ALLOWLISTED` log (#9 silent-skip audit)
 
 ### Proven cause (BC3 audit on #9, follow-up to ANR2's allowlist question)

@@ -359,6 +359,7 @@ pub fn stable_hash(bytes: &[u8]) -> u64 {
 /// the 8-word running state (72 bytes total) regardless of input size — the
 /// convenience `sha256_hex(bytes)` is kept for backward compatibility and is
 /// now implemented on top of it.
+#[derive(Clone)]
 pub struct Sha256Hasher {
     h: [u32; 8],
     buffer: [u8; 64],
