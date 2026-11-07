@@ -1,6 +1,59 @@
 # Changelog
 
-## OIRAN API 2.9.2 — 2026-11-07 — prefix-SHA repair grouping + derived continuous interfaces (#9 comment 6708784283)
+## OIRAN API 2.9.2 — 2026-11-07 — prefix-SHA repair grouping + derived continuous interfaces + LTE publication (#9 comments 6708784283 + 6710853974)
+
+### Follow-up fix — LTE planes imported but zero events published (ANR2 #9 comment 6710853974)
+
+ANR2 proved on OIRAN API 2.9.1 that every LTE plane
+(S1-MME, S11, S1-U, S5-C, S5-U, S6a, Sxab) imported closed segments
+with non-zero protocol frames yet produced **zero published events**:
+
+| interface | protocol frames | published events | checksum |
+|---|---:|---:|---|
+| S1-MME | 16 | 0 | `094c28f7…` |
+| S11 | 3 | 0 | `08c4976b…` |
+| S1-U | 5 | 0 | `0c7b6417…` |
+| S5-C | 4 | 0 | `010862db…` |
+| S5-U | 39 | 0 | `7adf6061…` |
+| S6a | 490 | 0 | `00308cf8…` |
+| Sxab | 2626 | 0 | `00920e6a…` |
+
+**Root cause (file:line)** —
+`OIRAN/live-probe/src/lib.rs:4992-5023` (`interface_specs`)
+returned ONLY `[N2, SBI, N4, N3]`. The publication loop at
+`OIRAN/live-probe/src/lib.rs:3898-3935`
+(`for interface in interfaces { capture_files_for(pcap_dir,
+&interface.interface) … decode_capture_streaming … }`) iterates
+that list, so the LTE owned files (`S1-MME.pcap-*.pcapng`,
+`S11.pcap-*`, …) under `base/pcap/` were never visited and no
+decode call was issued for them. 2.9.1 enabled the LTE routes
+inside `oiran-decode` but 2.9.1 forgot to extend this registry →
+the fix is below the route boundary ANR2 pointed at.
+
+**Fix** — `interface_specs()` grows from 4 to 11 entries
+(N2 / N3 / N4 / SBI + 7 LTE planes), each with the production
+device name (`br-oiran-s1m`, `br-oiran-s1u`, `br-oiran-s11`,
+`br-oiran-s5c`, `br-oiran-s5u`, `br-oiran-s6a`, `br-oiran-sxab`)
+and BPF filter (SCTP 36412, UDP 2152/2123/8805, SCTP 3868). `N6`
+stays out — no OIRAN decoder today, already counted via
+`CONTINUOUS_PLANE_NOT_ALLOWLISTED`.
+
+**Tests**:
+- `interface_specs_covers_every_decoder_backed_plane` — asserts
+  the 11-interface set and that every returned interface has a
+  decoder.
+- `process_capture_into_visits_every_lte_plane_owned_file` —
+  writes one minimal owned pcap per LTE plane
+  (`{interface}.pcap-stub{interface}.pcapng`), calls
+  `process_capture_into`, and asserts
+  `decode_reports` carries an entry starting with each LTE
+  interface — proving the file was VISITED (not silently
+  skipped).
+- `real_interface_discovery_is_allowlisted` and
+  `four_plane_validate_traverses_http_api_and_unix_ipc_without_acquisition`
+  updated to the 11-interface baseline.
+
+
 
 ### Proven cause (ANR2 — #9 comment 6708784283)
 

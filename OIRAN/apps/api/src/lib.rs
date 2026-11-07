@@ -5146,12 +5146,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
         assert_eq!(body["data"]["validation"]["valid"], true);
+        // 2.9.2 (#9 comment 6710853974): the allowlist carries 11
+        // decoder-backed planes (N2/N3/N4/SBI + 7 LTE core planes).
         assert_eq!(
             body["data"]["validation"]["interfaces"]
                 .as_array()
                 .unwrap()
                 .len(),
-            4
+            11
         );
         helper_thread.join().unwrap();
         let _ = fs::remove_dir_all(manager_root);

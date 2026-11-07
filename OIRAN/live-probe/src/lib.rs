@@ -4990,6 +4990,22 @@ fn validate_derived_event_provenance(
 }
 
 pub fn interface_specs() -> Vec<CaptureInterface> {
+    // 2.9.2 (#9 comment 6710853974): ANR2 proved that `_00067` and
+    // the other LTE closed segments were ingested with non-zero
+    // protocol-frame counts (S1AP/GTP/GTPv2/Diameter/PFCP) but
+    // published zero events. Root cause: this list ONLY returned
+    // N2/SBI/N4/N3, and `process_capture_into` iterates
+    // `for interface in interfaces { capture_files_for(pcap_dir,
+    // &interface.interface) … decode_capture_streaming … }` at
+    // `OIRAN/live-probe/src/lib.rs:3898-3935`. Owned LTE pcaps
+    // (`S1-MME.pcap-*.pcapng`, `S11.pcap-*`, …) never made it
+    // through the per-interface loop → no decode call → no
+    // `oiran_events.jsonl` line → the symptom
+    // `rg -c 'sha256:<checksum>' dataset/oiran_events.jsonl == 0`
+    // on every LTE checksum of the import state. Returning the full
+    // 11-decoder-backed set fixes the symptom at the root. N6 stays
+    // out because no decoder handles it (2.9.1 already counts it in
+    // `plane_counts` and logs `CONTINUOUS_PLANE_NOT_ALLOWLISTED`).
     vec![
         spec(
             "N2",
@@ -5018,6 +5034,55 @@ pub fn interface_specs() -> Vec<CaptureInterface> {
             "GTP-U / UDP",
             "POLARIS N3 Docker bridge",
             "udp port 2152",
+        ),
+        spec(
+            "S1-MME",
+            "br-oiran-s1m",
+            "S1AP / SCTP + NAS-EPS",
+            "POLARIS S1-MME Docker bridge",
+            "sctp and port 36412",
+        ),
+        spec(
+            "S1-U",
+            "br-oiran-s1u",
+            "GTP-U / UDP",
+            "POLARIS S1-U Docker bridge",
+            "udp port 2152",
+        ),
+        spec(
+            "S11",
+            "br-oiran-s11",
+            "GTPv2-C / UDP",
+            "POLARIS S11 Docker bridge",
+            "udp port 2123",
+        ),
+        spec(
+            "S5-C",
+            "br-oiran-s5c",
+            "GTPv2-C / UDP",
+            "POLARIS S5-C Docker bridge",
+            "udp port 2123",
+        ),
+        spec(
+            "S5-U",
+            "br-oiran-s5u",
+            "GTP-U / UDP",
+            "POLARIS S5-U Docker bridge",
+            "udp port 2152",
+        ),
+        spec(
+            "S6a",
+            "br-oiran-s6a",
+            "Diameter / SCTP (DIAMETER_PPID=46)",
+            "POLARIS S6a Docker bridge",
+            "sctp and port 3868",
+        ),
+        spec(
+            "Sxab",
+            "br-oiran-sxab",
+            "PFCP / UDP",
+            "POLARIS Sxa/Sxb Docker bridge",
+            "udp port 8805",
         ),
     ]
 }
@@ -10008,16 +10073,23 @@ mod tests {
 
     #[test]
     fn real_interface_discovery_is_allowlisted() {
+        // 2.9.2 (#9 comment 6710853974): the registry now returns
+        // every decoder-backed plane (11 interfaces, N6 excluded —
+        // see `interface_specs_covers_every_decoder_backed_plane`).
         let manager = { let tmp = temporary_root("interfaces"); CaptureManager::with_pseudonym_key_path(tmp.clone(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
         let interfaces = manager.interfaces();
-        assert_eq!(interfaces.len(), 4);
-        assert_eq!(
-            interfaces
-                .iter()
-                .map(|item| item.interface.as_str())
-                .collect::<Vec<_>>(),
-            vec!["N2", "SBI", "N4", "N3"]
-        );
+        assert_eq!(interfaces.len(), 11);
+        let observed: BTreeSet<String> = interfaces
+            .iter()
+            .map(|item| item.interface.clone())
+            .collect();
+        let expected: BTreeSet<String> = [
+            "N2", "N3", "N4", "SBI", "S1-MME", "S1-U", "S11", "S5-C", "S5-U", "S6a", "Sxab",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(observed, expected);
         assert!(interfaces
             .iter()
             .all(|item| item.device.starts_with("br-oiran-")));
@@ -10819,6 +10891,85 @@ mod tests {
             "both the formerly-active segment and its rotation sibling must import exactly once"
         );
         manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+    }
+
+    /// 2.9.2 (#9 comment 6710853974): `interface_specs()` must
+    /// return the full set of decoder-backed interfaces that OIRAN
+    /// understands. ANR2 proved that `_00067` and the other LTE
+    /// closed segments were ingested with non-zero protocol frames
+    /// but published ZERO events: the pre-2.9.2 list returned only
+    /// N2/SBI/N4/N3, so `process_capture_into`'s `for interface in
+    /// interfaces` loop never visited the LTE pcap copies on disk
+    /// and no decode call was made.
+    #[test]
+    fn interface_specs_covers_every_decoder_backed_plane() {
+        let specs = interface_specs();
+        let returned: BTreeSet<String> = specs
+            .iter()
+            .map(|spec| spec.interface.clone())
+            .collect();
+        let expected: BTreeSet<String> = [
+            "N2", "N3", "N4", "SBI", "S1-MME", "S1-U", "S11", "S5-C", "S5-U", "S6a", "Sxab",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(
+            returned, expected,
+            "interface_specs() must enumerate every decoder-backed plane; got {returned:?}"
+        );
+        // Every returned interface has a decoder today — `N6` is
+        // intentionally absent and surfaced via
+        // `CONTINUOUS_PLANE_NOT_ALLOWLISTED` instead.
+        for interface in &returned {
+            assert!(
+                interface_has_decoder(interface),
+                "interface_specs() returned {interface} without an OIRAN decoder"
+            );
+        }
+    }
+
+    /// 2.9.2: `process_capture_into` iterates every entry of
+    /// `interface_specs()` and calls `decode_capture_streaming`
+    /// per plane. The 5G baseline (N2/N3/N4/SBI) worked; the LTE
+    /// planes were silently skipped under 2.9.1. This test writes a
+    /// minimal pcap per LTE plane with the owned-file naming
+    /// convention
+    /// (`{interface}.pcap-{sha16}.pcapng`) and asserts the resulting
+    /// `decode_reports` names every LTE plane (even when the
+    /// synthetic payload produces 0 events — the invariant is "the
+    /// file was VISITED by the decode loop").
+    #[test]
+    fn process_capture_into_visits_every_lte_plane_owned_file() {
+        if skip_if_disk_too_full("process_capture_into_visits_every_lte_plane_owned_file") {
+            return;
+        }
+        let base = temporary_root("process-capture-lte-planes");
+        let pcap_dir = base.join("pcap");
+        let dataset_dir = base.join("dataset");
+        fs::create_dir_all(&pcap_dir).unwrap();
+        for interface in ["S1-MME", "S1-U", "S11", "S5-C", "S5-U", "S6a", "Sxab"] {
+            let path = pcap_dir.join(format!("{interface}.pcap-stub{interface}.pcapng"));
+            write_pcap(&path, &[vec![0u8; 64]]);
+        }
+        let manager = fresh_manager_for_restore(&base);
+        let dataset = manager
+            .process_capture_into(
+                CONTINUOUS_CAPTURE_ID,
+                CONTINUOUS_DATASET_ID.into(),
+                &pcap_dir,
+                &dataset_dir,
+                "runtime/live-captures/continuous-lab-import/dataset".into(),
+                &interface_specs(),
+            )
+            .unwrap();
+        for interface in ["S1-MME", "S1-U", "S11", "S5-C", "S5-U", "S6a", "Sxab"] {
+            assert!(
+                dataset.decode_reports.keys().any(|key| key.starts_with(&format!("{interface}.pcap"))),
+                "process_capture_into must visit the {interface} plane; decode_reports keys: {:?}",
+                dataset.decode_reports.keys().collect::<Vec<_>>()
+            );
+        }
     }
 
     /// 2.9.1 (#9): the production source tree carries 12 plane
