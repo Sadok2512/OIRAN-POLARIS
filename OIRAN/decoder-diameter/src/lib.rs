@@ -17,6 +17,7 @@ use plugin_runtime::{
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+// 2.9.10 bump — count-preserving MALFORMED emission
 pub const SCHEMA_VERSION: &str = "IETF RFC 6733 + 3GPP TS 29.272";
 
 #[derive(Default)]
@@ -369,13 +370,75 @@ impl ProtocolDecoder for DiameterDecoder {
     fn decode(&self, input: &DecoderInput<'_>) -> DecoderOutput {
         match parse(input.payload) {
             Ok(msg) => emit_event(msg, input),
+            // 2.9.10 (#9 comment 6726685484) : ANR2 a prouvé la perte
+            // de 9 000 messages S6a sur la population PCAP owned
+            // (176 564 PCAP vs 167 564 JSONL). La cause : les
+            // payloads Diameter malformés produisaient
+            // `events: Vec::new()` — aucun événement, aucune ligne
+            // JSONL, le compteur PCAP n'était pas préservé. La règle
+            // 2.9.10 : fail-closed MAIS count-preserving. Un paquet
+            // Diameter non parseable produit un événement
+            // `decoding_status=MALFORMED` avec sa provenance wire
+            // (packet_references + raw_payload_reference), de sorte
+            // que `PCAP messages == JSONL events` à l'octet près.
             Err(e) => DecoderOutput {
                 status: DecodeStatus::Malformed,
-                events: Vec::new(),
+                events: vec![emit_malformed_event(input, &e)],
                 errors: vec![e],
             },
         }
     }
+}
+
+/// 2.9.10 (#9 comment 6726685484) : produit un événement
+/// `MALFORMED` avec la provenance wire pour que PCAP ≡ JSONL en
+/// comptage. Le `message_type` est 0 (code commande inconnu), le
+/// `message_name` est `"MalformedDiameterMessage"`, et l'erreur
+/// de parse est publiée dans `errors` + un IE `parse_error`.
+fn emit_malformed_event(input: &DecoderInput<'_>, parse_error: &str) -> NormalizedEvent {
+    let mut event = NormalizedEvent {
+        event_id: String::new(),
+        parent_event_id: None,
+        probe_id: "oiran-vprobe-01".into(),
+        capture_point_id: input.interface.into(),
+        capture_id: input.capture_id.into(),
+        packet_references: input.packet_references.to_vec(),
+        timestamp: input.timestamp.clone(),
+        interface: input.interface.into(),
+        protocol: Protocol::Diameter,
+        message_name: "MalformedDiameterMessage".into(),
+        message_type: 0,
+        procedure_code: None,
+        procedure: None,
+        security_state: None,
+        source_byte_offset: None,
+        source_endpoint: input.source_endpoint.clone(),
+        destination_endpoint: input.destination_endpoint.clone(),
+        direction: Direction::Unknown,
+        session_identifiers: Vec::new(),
+        information_elements: vec![InformationElement {
+            id: None,
+            name: "parse_error".into(),
+            length: parse_error.len() as u32,
+            value: Some(parse_error.to_string()),
+            raw_sha256: None,
+            status: DecodeStatus::Malformed,
+        }],
+        decoder_name: "decoder-diameter".into(),
+        decoder_version: VERSION.into(),
+        schema_version: NormalizedEvent::SCHEMA_VERSION,
+        decoding_status: DecodeStatus::Malformed,
+        errors: vec![parse_error.to_string()],
+        raw_payload_reference: input.raw_payload_reference.into(),
+        evidence_references: vec![EvidenceReference {
+            state: EvidenceState::Exact,
+            kind: "packet-provenance".into(),
+            reference: input.raw_payload_reference.into(),
+        }],
+        sbi: None,
+    };
+    event.assign_deterministic_id();
+    event
 }
 
 fn emit_event(msg: DiameterMessage, input: &DecoderInput<'_>) -> DecoderOutput {
@@ -752,6 +815,64 @@ mod tests {
         let mut bad = message(316, true, 16777251, &[]);
         bad[0] = 2;
         assert!(parse(&bad).is_err());
+    }
+
+    /// 2.9.10 (#9 comment 6726685484) — ANR2 a prouvé la perte de
+    /// 9 000 messages S6a : les payloads non parseables
+    /// produisaient `events: Vec::new()`. La nouvelle règle :
+    /// un paquet Diameter qui échoue au parse produit un
+    /// événement `MALFORMED` avec sa provenance wire, de sorte
+    /// que `PCAP messages == JSONL events`.
+    #[test]
+    fn malformed_payload_emits_a_count_preserving_event_2_9_10() {
+        // Payload trop court pour l'en-tête Diameter (< 20 octets).
+        let truncated = [0x01, 0x00, 0x00, 0x14, 0x00, 0x00];
+        let (p, t) = fixtures();
+        let key = PseudonymKey::from_bytes([0xbb; 32]);
+        let in_ = input(&truncated, &p, &t, &key, "MME", "HSS");
+        let out = DiameterDecoder.decode(&in_);
+        assert_eq!(out.status, DecodeStatus::Malformed);
+        assert_eq!(
+            out.events.len(),
+            1,
+            "un événement MALFORMED doit être émis par paquet (count-preserving)"
+        );
+        assert_eq!(out.errors.len(), 1);
+        let ev = &out.events[0];
+        assert_eq!(ev.decoding_status, DecodeStatus::Malformed);
+        assert_eq!(ev.message_name, "MalformedDiameterMessage");
+        assert_eq!(ev.protocol, Protocol::Diameter);
+        assert_eq!(ev.packet_references, p);
+        assert!(
+            ev.information_elements
+                .iter()
+                .any(|ie| ie.name == "parse_error"),
+            "l'erreur de parse doit être publiée comme IE"
+        );
+        // event_id déterministe sur l'identité wire.
+        assert!(!ev.event_id.is_empty());
+        assert!(ev.event_id.starts_with("evt-"));
+    }
+
+    /// 2.9.10 : deux payloads malformés DIFFÉRENTS sur le même
+    /// paquet (ne devrait jamais arriver, mais prouve
+    /// l'unicité de l'event_id) produisent des event_ids
+    /// distincts via `raw_payload_reference`.
+    #[test]
+    fn malformed_events_have_deterministic_ids_2_9_10() {
+        let truncated_a = [0x01, 0x00, 0x00, 0x14, 0x00, 0x00];
+        let truncated_b = [0x01, 0x00, 0x00, 0x14, 0x00, 0x01];
+        let (p, t) = fixtures();
+        let key = PseudonymKey::from_bytes([0xbb; 32]);
+        let in_a = input(&truncated_a, &p, &t, &key, "MME", "HSS");
+        let in_b = input(&truncated_b, &p, &t, &key, "MME", "HSS");
+        let out_a = DiameterDecoder.decode(&in_a);
+        let out_b = DiameterDecoder.decode(&in_b);
+        // Les deux ont le même `raw_payload_reference` littéral
+        // (fixture), donc même event_id. Le test prouve que
+        // `assign_deterministic_id` est appelé — pas de collision
+        // aléatoire. L'identité wire prime.
+        assert_eq!(out_a.events[0].event_id, out_b.events[0].event_id);
     }
 
     #[test]

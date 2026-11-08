@@ -1,5 +1,134 @@
 # Changelog
 
+## OIRAN API 2.9.10 — 2026-11-08 — Dedup wire-identity + Diameter MALFORMED count-preserving (devmat, ANR2 #9 comment 6726685484)
+
+### Contexte — FAIL recette 2.9.9 prouvée par ANR2
+
+ANR2 a publié sur #9 comment 6726685484 deux défauts bloquants
+contre la 2.9.9 :
+
+1. **Perte S6a : 9 000 messages absents du JSONL.**
+   - PCAP owned : 176 564 Diameter messages (DWR + DWA + autres S6a).
+   - JSONL : 167 564 = 86 394 agrégats watchdog + 81 170 individuels.
+   - Écart : 9 000 disparus silencieusement, aucune ligne
+     `CONTINUOUS_*` ne les cite.
+2. **24 doublons réels** sur
+   `(capture_id, packet_number, byte_offset, protocol, message_name)` :
+   un même paquet wire apparaît DEUX fois dans le JSONL avec DEUX
+   `event_id` différents (3 exemples complets ANR2 : `evt-50e7a11f…`
+   + `evt-b89b4f8a…`, `evt-83151568…` + `evt-c5cfdf6a…`, etc.).
+
+### T1 — Cause fichier:ligne (doublons)
+
+`live-probe/src/lib.rs::continuous_observation_id` (pré-2.9.10,
+`:7096-7123`) hachait :
+
+- `timestamp` (variable selon la précision de parse du décodeur),
+- `session_identifiers` NON triés (l'ordre varie entre deux
+  invocations si le décodeur réordonne ses IEs),
+- `source_endpoint` / `destination_endpoint`,
+
+mais **pas** `packet_references`. Deux décodages d'un même paquet
+wire avec un timestamp légèrement différent (round-trip `µs` vs
+`ns`) ou un ordre d'identifiers inversé produisaient donc deux
+`continuous_observation_id` distincts → `merge_event_stream`
+n'absorbait pas le doublon.
+
+### T1 — Cause fichier:ligne (perte S6a)
+
+`decoder-diameter/src/lib.rs::DiameterDecoder::decode`
+(pré-2.9.10, `:369-378`) renvoyait, sur erreur de parse :
+
+```rust
+Err(e) => DecoderOutput {
+    status: DecodeStatus::Malformed,
+    events: Vec::new(),  // ← aucun événement émis
+    errors: vec![e],
+}
+```
+
+Zéro événement émis ⇒ aucune ligne JSONL ⇒ la valeur
+`decoder_errors` du manifeste augmente d'1 mais le compteur
+`PCAP messages` diverge silencieusement de `JSONL events` par 1.
+À l'échelle d'un segment S6a, 9 000 paquets partiellement
+reconstruits par SCTP (chunks tronqués, AVP mal formés, length
+inconsistant) produisaient 9 000 trous. ANR2 l'a mesuré
+exactement.
+
+### T2 — Fix dedup : wire-identity
+
+`live-probe::continuous_observation_id` (`:7096-7161`) réécrit sur
+l'**identité wire** :
+
+- `capture_id` — immuable pour un fichier donné.
+- `packet_references[*]` triés sur
+  `(source_file, packet_number, byte_offset, interface_id)` —
+  coordonnée physique du paquet.
+- `protocol` + `message_type` — un décodeur peut émettre
+  plusieurs événements pour un même paquet (NGAP + NAS enfant) ;
+  chacun garde son identité distincte.
+- `raw_payload_reference` — SHA-256 du payload décodé ; deux
+  décodages du même paquet produisent le même hash.
+
+Rien de temporel ; rien d'ordre-dépendant. Deux décodages d'un
+paquet wire produisent désormais le **même**
+`continuous_observation_id` ⇒ `merge_event_stream` le dédoublonne
+first-write-wins.
+
+Test `continuous_observation_id_is_wire_identity_and_dedupes_duplicates_2_9_10` :
+
+- Timestamps différents (µs vs ns) + ordre d'identifiers inversé
+  + event_id différent → **même** `continuous_observation_id`.
+- `packet_number` différent → identité wire différente.
+- `capture_id` différent (fichier rotaté) → identité wire
+  différente.
+- `protocol` ou `message_type` différent (NGAP + NAS enfant) →
+  deux observations distinctes (comportement attendu).
+
+### T3 — Fix perte S6a : MALFORMED count-preserving
+
+`decoder-diameter::DiameterDecoder::decode` (`:369-391`) + nouveau
+`emit_malformed_event` (`:397-441`) : sur erreur de parse, émet
+désormais UN événement avec :
+
+- `decoding_status = Malformed`,
+- `message_name = "MalformedDiameterMessage"`,
+- `packet_references` copiées depuis `DecoderInput` (provenance
+  wire conservée),
+- `raw_payload_reference` littéral,
+- `errors = [parse_error]`,
+- un IE `parse_error` avec la chaîne d'erreur.
+
+**Fail-closed ET count-preserving** : `PCAP messages == JSONL
+events` à l'octet près. L'opérateur voit les paquets malformés
+avec leur `packet_number` + `byte_offset` et peut auditer la
+cause (SCTP chunk truncation, AVP length drift, etc.).
+
+Tests :
+- `malformed_payload_emits_a_count_preserving_event_2_9_10` :
+  payload tronqué (6 octets, < 20 requis) → 1 événement
+  MALFORMED avec `packet_references` + IE `parse_error`.
+- `malformed_events_have_deterministic_ids_2_9_10` : l'event_id
+  déterministe se dérive du `raw_payload_reference` + wire
+  identity.
+
+### T4 — Tests
+
+**431 PASS**, 0 FAIL, 4 ignored (+2 vs 2.9.9). Tous les tests
+2.9.7 (round-trip), 2.9.8 (orphan purge, work_bytes ring, BLOCKED
+expose), 2.9.9 (TEID/IP normalisation, SBI attach, SBI↔N2/SBI↔N4
+EXACT) restent VERT. Un ancien test
+`semantic_observation_id_survives_append_snapshot_capture_hash_changes`
+qui supposait l'ancienne règle (dedup survive aux `capture_id`
+différents) a été remplacé par la nouvelle règle wire-identity.
+
+### Versions
+
+- `live-probe` 0.4.23 → 0.4.24 (`continuous_observation_id`
+  wire-identity)
+- `decoder-diameter` 0.2.0 → 0.2.1 (MALFORMED count-preserving)
+- `oiran-api` 2.9.9 → 2.9.10
+
 ## OIRAN API 2.9.9 — 2026-11-08 — Rattachement et liens SBI exacts (TEID/IP/pseudo) (devmat, ANR2 #9 comment 6725858177)
 
 ### Contexte — preuve ANR2 sur `5g-session-5e3fc8ce83936ea0`

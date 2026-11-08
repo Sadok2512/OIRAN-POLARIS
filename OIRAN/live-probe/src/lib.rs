@@ -7094,28 +7094,60 @@ where
 }
 
 fn continuous_observation_id(value: &serde_json::Value) -> Result<String, String> {
-    let stable_session_identifiers = value
-        .get("session_identifiers")
+    // 2.9.10 (#9 comment 6726685484) : ANR2 a prouvé 24 doublons
+    // réels sur `(capture_id, packet_number, byte_offset, protocol,
+    // message_name)`. L'ancienne clé incluait `timestamp` +
+    // `session_identifiers` NON-triés + `source_endpoint` +
+    // `destination_endpoint` — un décodage qui varie la précision
+    // du timestamp ou l'ordre des identifiers produisait deux
+    // evt-ids différents pour un même paquet wire. La nouvelle
+    // clé est l'**identité wire** :
+    //   * `capture_id` — immuable pour un fichier donné.
+    //   * `packet_references[*]` triés sur
+    //     `(source_file, packet_number, byte_offset, interface_id)` —
+    //     coordonnée physique du paquet dans le PCAP.
+    //   * `protocol` + `message_type` — le décodeur peut émettre
+    //     plusieurs événements pour un même paquet (p. ex. NGAP +
+    //     NAS enfant), chacun garde son identité distincte.
+    //   * `raw_payload_reference` — SHA-256 du payload décodé ;
+    //     deux événements qui parsent le même paquet produisent
+    //     le même payload hash.
+    // Rien de temporel ; rien d'ordre-dépendant.
+    let mut packet_refs: Vec<serde_json::Value> = value
+        .get("packet_references")
         .and_then(serde_json::Value::as_array)
-        .map(|identifiers| {
-            identifiers
-                .iter()
-                .filter(|identifier| {
-                    !identifier
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|name| name.ends_with("_event_id"))
+        .map(|refs| {
+            refs.iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "source_file": p.get("source_file").cloned().unwrap_or(serde_json::Value::Null),
+                        "packet_number": p.get("packet_number").cloned().unwrap_or(serde_json::Value::Null),
+                        "byte_offset": p.get("byte_offset").cloned().unwrap_or(serde_json::Value::Null),
+                        "interface_id": p.get("interface_id").cloned().unwrap_or(serde_json::Value::Null),
+                    })
                 })
-                .collect::<Vec<_>>()
-        });
+                .collect()
+        })
+        .unwrap_or_default();
+    packet_refs.sort_by(|a, b| {
+        let key = |v: &serde_json::Value| {
+            (
+                v.get("source_file")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                v.get("packet_number").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                v.get("byte_offset").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                v.get("interface_id").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
     let material = serde_json::to_vec(&serde_json::json!({
-        "timestamp": value.get("timestamp"),
-        "interface": value.get("interface"),
+        "capture_id": value.get("capture_id"),
+        "packet_references": packet_refs,
         "protocol": value.get("protocol"),
         "message_type": value.get("message_type"),
-        "source_endpoint": value.get("source_endpoint"),
-        "destination_endpoint": value.get("destination_endpoint"),
-        "session_identifiers": stable_session_identifiers,
         "raw_payload_reference": value.get("raw_payload_reference"),
     }))
     .map_err(|error| error.to_string())?;
@@ -10824,37 +10856,81 @@ mod tests {
         assert_eq!(directory_size(&root), 0);
     }
 
+    /// 2.9.10 (#9 comment 6726685484) — ANR2 a prouvé 24 doublons
+    /// réels sur `(capture_id, packet_number, byte_offset, protocol,
+    /// message_name)`. L'ancien `continuous_observation_id` hachait
+    /// `timestamp` + `session_identifiers` NON-triés et ignorait
+    /// `packet_references` ; un décodeur qui changeait la précision
+    /// du ts ou l'ordre des identifiers produisait deux evt-ids
+    /// distincts pour un même paquet wire. La nouvelle clé est
+    /// l'**identité wire** : `capture_id` + `packet_references`
+    /// triés + `protocol` + `message_type` + `raw_payload_reference`.
     #[test]
-    fn semantic_observation_id_survives_append_snapshot_capture_hash_changes() {
-        let mut first = event_json(
-            "first",
-            "sha256:first",
+    fn continuous_observation_id_is_wire_identity_and_dedupes_duplicates_2_9_10() {
+        let base = event_json(
+            "fixture",
+            "sha256:01a70bdb74b0b",
             10_001,
-            "GTP-U",
-            "G-PDU",
-            Some("10.46.0.4"),
+            "NGAP",
+            "UplinkNASTransport",
+            None,
         );
-        let mut second = first.clone();
-        second["capture_id"] = serde_json::Value::String("sha256:second".into());
-        second["packet_references"][0]["source_file"] =
-            serde_json::Value::String("rolled-N3.pcap".into());
-        second["packet_references"][0]["packet_number"] = serde_json::Value::from(99);
-        first["session_identifiers"] = serde_json::json!([
+        // Deux décodages du même paquet wire : timestamps
+        // légèrement différents (précision µs vs ns), ordre
+        // d'identifiers inversé, event_id différent. Même
+        // identité wire ⇒ même continuous_observation_id ⇒
+        // dedup actif.
+        let mut a = base.clone();
+        let mut b = base.clone();
+        a["event_id"] = serde_json::Value::String("evt-50e7a11f02dd0644".into());
+        b["event_id"] = serde_json::Value::String("evt-b89b4f8aefc5af40".into());
+        a["timestamp"]["nanoseconds"] = serde_json::Value::from(1_000_000u64);
+        b["timestamp"]["nanoseconds"] = serde_json::Value::from(1_000_001u64);
+        a["session_identifiers"] = serde_json::json!([
             {"name":"ran_ue_ngap_id","value":"4","pseudonymized":false},
-            {"name":"parent_ngap_event_id","value":"evt-old","pseudonymized":false}
+            {"name":"amf_ue_ngap_id","value":"73","pseudonymized":false}
         ]);
-        second["session_identifiers"] = serde_json::json!([
-            {"name":"ran_ue_ngap_id","value":"4","pseudonymized":false},
-            {"name":"parent_ngap_event_id","value":"evt-new","pseudonymized":false}
+        b["session_identifiers"] = serde_json::json!([
+            {"name":"amf_ue_ngap_id","value":"73","pseudonymized":false},
+            {"name":"ran_ue_ngap_id","value":"4","pseudonymized":false}
         ]);
         assert_eq!(
-            continuous_observation_id(&first).unwrap(),
-            continuous_observation_id(&second).unwrap()
+            continuous_observation_id(&a).unwrap(),
+            continuous_observation_id(&b).unwrap(),
+            "deux décodages du même paquet wire doivent partager le même continuous_observation_id"
         );
-        first["timestamp"]["nanoseconds"] = serde_json::Value::from(2_000_000u64);
+
+        // Un paquet wire DIFFÉRENT (packet_number différent) doit
+        // produire une autre identité — même protocole, même
+        // raw_payload_reference, timestamp identique.
+        let mut other_packet = a.clone();
+        other_packet["packet_references"][0]["packet_number"] =
+            serde_json::Value::from(99u64);
         assert_ne!(
-            continuous_observation_id(&first).unwrap(),
-            continuous_observation_id(&second).unwrap()
+            continuous_observation_id(&a).unwrap(),
+            continuous_observation_id(&other_packet).unwrap(),
+            "un paquet avec packet_number différent est une autre observation wire"
+        );
+
+        // Un `capture_id` différent (file rotated) = autre identité
+        // wire — les deux captures sont distinctes à la source.
+        let mut other_capture = a.clone();
+        other_capture["capture_id"] = serde_json::Value::String("sha256:other".into());
+        assert_ne!(
+            continuous_observation_id(&a).unwrap(),
+            continuous_observation_id(&other_capture).unwrap(),
+            "capture_id ≠ ⇒ identité wire distincte"
+        );
+
+        // Un `protocol` ou `message_type` différent sur le même
+        // paquet (NGAP + NAS enfant) sont deux observations distinctes.
+        let mut nas_child = a.clone();
+        nas_child["protocol"] = serde_json::Value::String("NAS-5GMM".into());
+        nas_child["message_type"] = serde_json::Value::from(42u64);
+        assert_ne!(
+            continuous_observation_id(&a).unwrap(),
+            continuous_observation_id(&nas_child).unwrap(),
+            "NGAP et NAS enfant sur le même paquet sont deux observations"
         );
     }
 
