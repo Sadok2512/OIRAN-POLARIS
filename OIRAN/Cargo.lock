@@ -354,7 +354,10 @@ dependencies = [
 
 [[package]]
 name = "event-schema"
-version = "1.5.0-dev"
+version = "1.5.1-dev"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "flate2"
@@ -627,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.9.3"
+version = "2.9.4"
 dependencies = [
  "axum",
  "callflow-renderer",

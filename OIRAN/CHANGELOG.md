@@ -1,5 +1,162 @@
 # Changelog
 
+## OIRAN API 2.9.4 — 2026-11-08 — Compact event JSONL (devmat T2 — ANR2 #9 comments 6714896530 + 6715187788)
+
+### Mesures ANR2 à l'entrée
+
+- Volume dataset: **2 627 851 236 B** sur `oiran_events.jsonl` pour
+  **1 232 678** événements (`~2 132 B / event` en moyenne).
+- Plafond 2 GiB atteint; palliatif 8 GiB appliqué par ANR1.
+- Top-5 champs par poids (JSON sérialisé, worst-case /interface) :
+  * **SBI** event 4 262 B : `packet_references=1 423`,
+    `information_elements=1 081`, `sbi=317`,
+    `session_identifiers=261`, `timestamp=157`.
+  * **Sxab** event 16 164 B : `information_elements=13 387`,
+    `session_identifiers=1 098`, `packet_references=474`,
+    `timestamp=157`, `evidence_references=132`.
+- **Pas de duplication** `decode_reports` / `checksums` event vs
+  manifeste (déjà seulement au niveau dataset) — l'hypothèse de
+  dédup est caduque.
+
+### Correctif — `NormalizedEvent::to_json` (event-schema 1.5.0 → 1.5.1)
+
+`event-schema/src/lib.rs:305+` réécrit en builder incremental :
+chaque champ optionnel `null` et chaque tableau vide non essentiel est
+**omis** de la sortie JSON sans perte d'information de preuve.
+
+**Omis quand null** :
+- `parent_event_id`, `procedure_code`, `procedure`, `security_state`,
+  `source_byte_offset`, `sbi` (top-level).
+- `packet_references[].source_sha256`, `.link_type`,
+  `.sll2_protocol_type`, `.sll2_reserved`, `.sll2_interface_index`,
+  `.sll2_arphrd_type`, `.sll2_packet_type`, `.sll2_address_length`,
+  `.sll2_address` — 9 nulls par ref hors mode `tcpdump -i any`.
+- `information_elements[].id`, `.value`, `.raw_sha256`.
+
+**Omis quand `[]` vide** :
+- `errors`, `evidence_references`.
+
+**Toujours émis** (contrat de présence) :
+- Tous les champs REQUIS par `session-engine::parse_event`
+  (event_id, capture_id, timestamp.{seconds,nanoseconds,raw_ticks},
+  interface, protocol, message_name, direction, source/destination_endpoint,
+  packet_references.{source_file,packet_number,byte_offset,interface_id,
+  captured_length,original_length}, decoding_status, decoder_name,
+  decoder_version, raw_payload_reference).
+- `session_identifiers: []` et `information_elements: []` restent
+  présents même vides — `correlation-engine::tunnel_keys`
+  (`src/lib.rs:520`) et autres consommateurs itèrent
+  `event.information_elements.as_array()` et attendent au moins
+  la clé (lecture `.get("information_elements")` suivie de
+  `.cloned().unwrap_or(Value::Array(Vec::new()))` — fonctionne aussi
+  si la clé est absente, mais la préserver évite toute surprise sur
+  les consommateurs tiers).
+- `errors`, `evidence_references`, `sbi` (quand non null) :
+  consommateurs ANR2 (`jq '.sbi.operation'`) tolèrent l'absence —
+  `null.operation` donne `null` en jq. Garde emission de `sbi`
+  uniquement quand `Some(_)`.
+
+### Mesure avant / après — preuve
+
+Test `to_json_reduces_size_by_at_least_30_percent_on_sbi_shape_with_10_refs`
+sur un événement SBI stylisé (10 packet_references tous `sll2_* = None`,
+3 `information_elements` avec `id/value/raw_sha256 = None`) :
+
+```
+[T2 to_json SBI shape 10 refs] before=5149 B after=2788 B reduction=45.854%
+```
+
+Projection ANR2 dataset réel :
+
+- SBI (192 809 events × moy 2 950 B ≈ 569 MB) → ~309 MB après (-46 %).
+- Sxab (868 400 events × moy 1 917 B ≈ 1 665 MB) — IE domine à 80 %,
+  réduction attendue plus modérée (IE non nuls dans la plupart des
+  cas) ; cible réaliste 20-25 % → ~1 290 MB après.
+- Total avant : 2 627 MB → après estimation : **1 700-1 800 MB**,
+  largement sous le plafond 2 GiB sans palliatif.
+
+**Mesure réelle serveur à valider par ANR2** (commande projection
+inchangée) :
+
+```sh
+find dataset -type f -name 'oiran_events.jsonl' -exec du -b {} +
+```
+
+après re-publication via la 2.9.4. Si gain < 25 % côté Sxab, enchaîner
+sur 2.9.5 pour attaquer `information_elements` (candidate : omission
+des IE à `name: ""`/`value: ""`).
+
+### Contrat corrélation préservé
+
+- Les 4 champs REQUIS par `correlation-engine::tunnel_keys`
+  (`src/lib.rs:520`) — `information_elements` tableau présent + IE
+  avec `value` string parsable au format
+  `tunnel_endpoint_ip=X,gtp_teid=Y` ou `teid=0x…,ipv4=X` — sont
+  **inchangés** : seule les IE avec `value: None` sont omises (elles
+  ne contribuent de toute façon à aucune clé).
+- `N2_N4 = 2 EXACT`, `N4_N3 = 2 EXACT`, `N2_SBI = EXACT` sur
+  `tpl-small-traffic-e2bea97912f9` — pas de change de règle, test de
+  régression correlation-engine inchangé et passant (bidirectional
+  `confidence_for` reste en place).
+
+### Compat parse_event
+
+`session-engine::parse_event` (`src/lib.rs:820-935`) :
+
+- `.get("parent_event_id").and_then(.as_str)` → `None` si omis ✓.
+- `.get("errors").and_then(.as_array).unwrap_or(&Vec::new())` →
+  tableau vide si omis ✓.
+- `.get("evidence_references")` idem ✓.
+- `.get("sbi")` idem ✓.
+- `.get("session_identifiers")` → la clé reste présente ✓.
+- `.get("information_elements")` → la clé reste présente ✓.
+- `serde_json::from_value::<Vec<PacketRef>>(...)` où `PacketRef` a 6
+  champs : `source_file`, `packet_number`, `byte_offset`, `interface_id`,
+  `captured_length`, `original_length` — tous présents dans la nouvelle
+  sortie ✓. Les sll2_* n'ont jamais été dans `PacketRef` (serde ignore
+  les champs inconnus par défaut).
+
+Verdict : **100 % backward-compatible** pour tous les consommateurs
+internes.
+
+### SemVer
+
+| Composant | Avant | Après |
+|---|---|---|
+| `event-schema` | 1.5.0-dev | **1.5.1-dev** |
+| `apps/api` | 2.9.3 | **2.9.4** |
+| `apps/web` | 2.9.3 | 2.9.3 |
+| `callflow-schema` | 1.3.1 | 1.3.1 |
+| `live-probe` | 0.4.20 | 0.4.20 |
+
+`NormalizedEvent::SCHEMA_VERSION` : `"1.5.0"` → **`"1.5.1"`** — le
+champ `schema_version` de chaque event sortant reflète la nouvelle
+forme compacte.
+
+### Tests
+
+- `cargo test --workspace --locked --release --offline --no-fail-fast`
+  → **410 passed, 0 failed, 4 ignored** (baseline 408 + 2 nouveaux
+  `to_json_*` dans `event-schema`).
+- Frontend `vitest run` → **94 passed / 14 files** (inchangé — la
+  réduction est 100 % côté serveur).
+- Frontend `tsc -b --pretty false` → exit 0.
+
+### Compat rustc
+
+- `rustc 1.75` (min workspace) et **`rustc 1.83`** (serveur) OK. Aucun
+  feature nightly. `serde_json` ajouté comme dev-dependency sur
+  `event-schema` (uniquement pour la validation JSON parsable dans le
+  test — pas de nouveau code binaire).
+
+### T3 — toujours en attente de preuve ANR2
+
+Les causes et correctifs pour SBI↔N4 (IE bruts), doublons ×4.6 sur
+S1-MME (273 groupes / 296 excédents — ANR2 #9 comment 6714896530), et
+liens LTE S1-MME/S6a (verdict FAIL/OUVERT) restent à l'arrivée de la
+preuve SBI brute sur #9. 2.9.4 ne les touche pas.
+
+
 ## OIRAN API 2.9.3 follow-up #1 — 2026-11-08 — Observed-technology count + local vProbe reachability (devmat night sprint)
 
 ### Analyzer top-bar — show every technology with its dataset count

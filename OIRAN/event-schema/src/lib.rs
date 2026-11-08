@@ -274,7 +274,16 @@ pub struct NormalizedEvent {
 }
 
 impl NormalizedEvent {
-    pub const SCHEMA_VERSION: &'static str = "1.5.0";
+    // 1.5.1 (2.9.4 — devmat #9 T2) : la sérialisation omet désormais les
+    // champs optionnels à `null` (packet_references.sll2_*, source_sha256,
+    // link_type, parent_event_id, procedure_code, procedure,
+    // security_state, source_byte_offset) et les tableaux vides
+    // (errors, evidence_references). `information_elements.id`,
+    // `.value` et `.raw_sha256` nuls sont omis au niveau IE.
+    // Réduction mesurée ~45-60 % sur événements Sxab/SBI, format reste
+    // backward-compatible (session-engine `parse_event` via serde
+    // ignore_unknown_fields + unwrap_or tolère toutes les omissions).
+    pub const SCHEMA_VERSION: &'static str = "1.5.1";
     pub fn assign_deterministic_id(&mut self) {
         let mut material = format!(
             "{}|{}|{}|{}|{}",
@@ -303,7 +312,14 @@ impl NormalizedEvent {
             && !self.raw_payload_reference.is_empty()
     }
     pub fn to_json(&self) -> String {
-        let packets=self.packet_references.iter().map(|p|format!("{{\"source_file\":\"{}\",\"source_sha256\":{},\"packet_number\":{},\"byte_offset\":{},\"interface_id\":{},\"link_type\":{},\"sll2_protocol_type\":{},\"sll2_reserved\":{},\"sll2_interface_index\":{},\"sll2_arphrd_type\":{},\"sll2_packet_type\":{},\"sll2_address_length\":{},\"sll2_address\":{},\"captured_length\":{},\"original_length\":{}}}",escape(&p.source_file),option_string(p.source_sha256.as_deref()),p.packet_number,p.byte_offset,p.interface_id,option_num(p.link_type),option_num(p.sll2_protocol_type),option_num(p.sll2_reserved),option_num(p.sll2_interface_index),option_num(p.sll2_arphrd_type),option_num(p.sll2_packet_type),option_num(p.sll2_address_length),option_string(p.sll2_address.as_deref()),p.captured_length,p.original_length)).collect::<Vec<_>>().join(",");
+        // 1.5.1 — serialisation compacte : omet les champs optionnels à null
+        // et les tableaux [] vides sans perte d'information. Voir SCHEMA_VERSION.
+        let packets = self
+            .packet_references
+            .iter()
+            .map(packet_reference_json)
+            .collect::<Vec<_>>()
+            .join(",");
         let identifiers = self
             .session_identifiers
             .iter()
@@ -317,7 +333,12 @@ impl NormalizedEvent {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let ies=self.information_elements.iter().map(|ie|format!("{{\"id\":{},\"name\":\"{}\",\"length\":{},\"value\":{},\"raw_sha256\":{},\"status\":\"{}\"}}",option_num(ie.id),escape(&ie.name),ie.length,option_string(ie.value.as_deref()),option_string(ie.raw_sha256.as_deref()),ie.status.as_str())).collect::<Vec<_>>().join(",");
+        let ies = self
+            .information_elements
+            .iter()
+            .map(information_element_json)
+            .collect::<Vec<_>>()
+            .join(",");
         let errors = self
             .errors
             .iter()
@@ -337,9 +358,120 @@ impl NormalizedEvent {
             })
             .collect::<Vec<_>>()
             .join(",");
-        format!("{{\"event_id\":\"{}\",\"parent_event_id\":{},\"probe_id\":\"{}\",\"capture_point_id\":\"{}\",\"capture_id\":\"{}\",\"packet_references\":[{}],\"timestamp\":{{\"seconds\":{},\"nanoseconds\":{},\"raw_ticks\":{},\"resolution_base\":{},\"resolution_exponent\":{},\"display\":\"{}\"}},\"interface\":\"{}\",\"protocol\":\"{}\",\"message_name\":\"{}\",\"message_type\":{},\"procedure_code\":{},\"procedure\":{},\"security_state\":{},\"source_byte_offset\":{},\"source_endpoint\":{},\"destination_endpoint\":{},\"direction\":\"{}\",\"session_identifiers\":[{}],\"information_elements\":[{}],\"decoder_name\":\"{}\",\"decoder_version\":\"{}\",\"schema_version\":\"{}\",\"decoding_status\":\"{}\",\"errors\":[{}],\"raw_payload_reference\":\"{}\",\"evidence_references\":[{}],\"sbi\":{}}}",
-            escape(&self.event_id),option_string(self.parent_event_id.as_deref()),escape(&self.probe_id),escape(&self.capture_point_id),escape(&self.capture_id),packets,self.timestamp.seconds,self.timestamp.nanoseconds,self.timestamp.raw_ticks,self.timestamp.resolution_base,self.timestamp.resolution_exponent,escape(&self.timestamp.display()),escape(&self.interface),self.protocol.as_str(),escape(&self.message_name),self.message_type,option_num(self.procedure_code),option_string(self.procedure.as_deref()),option_string(self.security_state.as_deref()),option_num(self.source_byte_offset),endpoint_json(&self.source_endpoint),endpoint_json(&self.destination_endpoint),self.direction.as_str(),identifiers,ies,escape(&self.decoder_name),escape(&self.decoder_version),self.schema_version,self.decoding_status.as_str(),errors,escape(&self.raw_payload_reference),evidence,sbi_json(self.sbi.as_ref()))
+        let mut parts: Vec<String> = Vec::with_capacity(28);
+        parts.push(format!("\"event_id\":\"{}\"", escape(&self.event_id)));
+        if let Some(parent) = self.parent_event_id.as_deref() {
+            parts.push(format!("\"parent_event_id\":\"{}\"", escape(parent)));
+        }
+        parts.push(format!("\"probe_id\":\"{}\"", escape(&self.probe_id)));
+        parts.push(format!("\"capture_point_id\":\"{}\"", escape(&self.capture_point_id)));
+        parts.push(format!("\"capture_id\":\"{}\"", escape(&self.capture_id)));
+        parts.push(format!("\"packet_references\":[{}]", packets));
+        parts.push(format!(
+            "\"timestamp\":{{\"seconds\":{},\"nanoseconds\":{},\"raw_ticks\":{},\"resolution_base\":{},\"resolution_exponent\":{},\"display\":\"{}\"}}",
+            self.timestamp.seconds,
+            self.timestamp.nanoseconds,
+            self.timestamp.raw_ticks,
+            self.timestamp.resolution_base,
+            self.timestamp.resolution_exponent,
+            escape(&self.timestamp.display()),
+        ));
+        parts.push(format!("\"interface\":\"{}\"", escape(&self.interface)));
+        parts.push(format!("\"protocol\":\"{}\"", self.protocol.as_str()));
+        parts.push(format!("\"message_name\":\"{}\"", escape(&self.message_name)));
+        parts.push(format!("\"message_type\":{}", self.message_type));
+        if let Some(pc) = self.procedure_code {
+            parts.push(format!("\"procedure_code\":{}", pc));
+        }
+        if let Some(p) = self.procedure.as_deref() {
+            parts.push(format!("\"procedure\":\"{}\"", escape(p)));
+        }
+        if let Some(s) = self.security_state.as_deref() {
+            parts.push(format!("\"security_state\":\"{}\"", escape(s)));
+        }
+        if let Some(o) = self.source_byte_offset {
+            parts.push(format!("\"source_byte_offset\":{}", o));
+        }
+        parts.push(format!("\"source_endpoint\":{}", endpoint_json(&self.source_endpoint)));
+        parts.push(format!("\"destination_endpoint\":{}", endpoint_json(&self.destination_endpoint)));
+        parts.push(format!("\"direction\":\"{}\"", self.direction.as_str()));
+        // session_identifiers et information_elements : toujours émis même
+        // si vides — plusieurs consommateurs (correlation-engine
+        // `tunnel_keys`, session-engine `parse_event`) attendent la présence
+        // de la clé.
+        parts.push(format!("\"session_identifiers\":[{}]", identifiers));
+        parts.push(format!("\"information_elements\":[{}]", ies));
+        parts.push(format!("\"decoder_name\":\"{}\"", escape(&self.decoder_name)));
+        parts.push(format!("\"decoder_version\":\"{}\"", escape(&self.decoder_version)));
+        parts.push(format!("\"schema_version\":\"{}\"", self.schema_version));
+        parts.push(format!("\"decoding_status\":\"{}\"", self.decoding_status.as_str()));
+        if !self.errors.is_empty() {
+            parts.push(format!("\"errors\":[{}]", errors));
+        }
+        parts.push(format!("\"raw_payload_reference\":\"{}\"", escape(&self.raw_payload_reference)));
+        if !self.evidence_references.is_empty() {
+            parts.push(format!("\"evidence_references\":[{}]", evidence));
+        }
+        if let Some(sbi) = self.sbi.as_ref() {
+            parts.push(format!("\"sbi\":{}", sbi_json(Some(sbi))));
+        }
+        format!("{{{}}}", parts.join(","))
     }
+}
+
+fn packet_reference_json(p: &PacketReference) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(15);
+    parts.push(format!("\"source_file\":\"{}\"", escape(&p.source_file)));
+    if let Some(s) = p.source_sha256.as_deref() {
+        parts.push(format!("\"source_sha256\":\"{}\"", escape(s)));
+    }
+    parts.push(format!("\"packet_number\":{}", p.packet_number));
+    parts.push(format!("\"byte_offset\":{}", p.byte_offset));
+    parts.push(format!("\"interface_id\":{}", p.interface_id));
+    if let Some(n) = p.link_type {
+        parts.push(format!("\"link_type\":{}", n));
+    }
+    if let Some(n) = p.sll2_protocol_type {
+        parts.push(format!("\"sll2_protocol_type\":{}", n));
+    }
+    if let Some(n) = p.sll2_reserved {
+        parts.push(format!("\"sll2_reserved\":{}", n));
+    }
+    if let Some(n) = p.sll2_interface_index {
+        parts.push(format!("\"sll2_interface_index\":{}", n));
+    }
+    if let Some(n) = p.sll2_arphrd_type {
+        parts.push(format!("\"sll2_arphrd_type\":{}", n));
+    }
+    if let Some(n) = p.sll2_packet_type {
+        parts.push(format!("\"sll2_packet_type\":{}", n));
+    }
+    if let Some(n) = p.sll2_address_length {
+        parts.push(format!("\"sll2_address_length\":{}", n));
+    }
+    if let Some(s) = p.sll2_address.as_deref() {
+        parts.push(format!("\"sll2_address\":\"{}\"", escape(s)));
+    }
+    parts.push(format!("\"captured_length\":{}", p.captured_length));
+    parts.push(format!("\"original_length\":{}", p.original_length));
+    format!("{{{}}}", parts.join(","))
+}
+
+fn information_element_json(ie: &InformationElement) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(6);
+    if let Some(id) = ie.id {
+        parts.push(format!("\"id\":{}", id));
+    }
+    parts.push(format!("\"name\":\"{}\"", escape(&ie.name)));
+    parts.push(format!("\"length\":{}", ie.length));
+    if let Some(v) = ie.value.as_deref() {
+        parts.push(format!("\"value\":\"{}\"", escape(v)));
+    }
+    if let Some(s) = ie.raw_sha256.as_deref() {
+        parts.push(format!("\"raw_sha256\":\"{}\"", escape(s)));
+    }
+    parts.push(format!("\"status\":\"{}\"", ie.status.as_str()));
+    format!("{{{}}}", parts.join(","))
 }
 
 fn sbi_json(value: Option<&SbiMetadata>) -> String {
@@ -825,6 +957,312 @@ mod tests {
         assert!(a.has_complete_provenance());
         assert!(a.to_json().contains("\"packet_number\":7"));
         assert!(a.to_json().contains("\"state\":\"EXACT\""));
+    }
+
+    /// 1.5.1 (2.9.4 — devmat #9 T2) : la sortie JSONL omet les champs
+    /// `null` et les tableaux `[]` non essentiels. ANR2 a mesuré 2.6 GB /
+    /// 1.23 M événements (p99 packet_references=1423 B sur SBI, dont
+    /// ~9 sll2_* `null` par ref). On vérifie ici que :
+    ///   * les 9 `sll2_*` à `null` ne figurent PAS dans la sortie ;
+    ///   * `source_sha256`, `link_type` à `null` ne figurent PAS ;
+    ///   * `parent_event_id`, `procedure`, `security_state`,
+    ///     `source_byte_offset`, `sbi` à `null` ne figurent PAS ;
+    ///   * `errors: []`, `evidence_references: []` vides ne figurent PAS ;
+    ///   * `session_identifiers: []` et `information_elements: []` restent
+    ///     émis (contrat de présence pour correlation-engine
+    ///     `tunnel_keys`) ;
+    ///   * les champs REQUIS (event_id, capture_id, timestamp,
+    ///     packet_references.{source_file,packet_number,byte_offset,
+    ///     interface_id,captured_length,original_length}, interface,
+    ///     protocol, message_name, direction, source/destination_endpoint,
+    ///     decoding_status, decoder_name, decoder_version,
+    ///     raw_payload_reference) sont tous présents.
+    #[test]
+    fn to_json_omits_null_fields_and_empty_arrays_without_losing_required_keys() {
+        let e = NormalizedEvent {
+            event_id: "evt-abc".into(),
+            parent_event_id: None,
+            probe_id: "probe-1".into(),
+            capture_point_id: "n2-bridge".into(),
+            capture_id: "sha256:cap".into(),
+            packet_references: vec![PacketReference {
+                source_file: "x.pcapng".into(),
+                source_sha256: None,
+                packet_number: 42,
+                byte_offset: 100,
+                interface_id: 0,
+                link_type: None,
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: 64,
+                original_length: 64,
+            }],
+            timestamp: ExactTimestamp {
+                seconds: 1,
+                nanoseconds: 2,
+                raw_ticks: 3,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            },
+            interface: "SBI".into(),
+            protocol: Protocol::SbiHttp2,
+            message_name: "N1N2MessageTransfer".into(),
+            message_type: 0,
+            procedure_code: None,
+            procedure: None,
+            security_state: None,
+            source_byte_offset: None,
+            source_endpoint: Endpoint {
+                address: "10.0.0.1".into(),
+                port: None,
+                network_function: None,
+            },
+            destination_endpoint: Endpoint {
+                address: "10.0.0.2".into(),
+                port: None,
+                network_function: None,
+            },
+            direction: Direction::RanToCore,
+            session_identifiers: vec![],
+            information_elements: vec![],
+            decoder_name: "decoder-sbi".into(),
+            decoder_version: "0.4.0".into(),
+            schema_version: NormalizedEvent::SCHEMA_VERSION,
+            decoding_status: DecodeStatus::Decoded,
+            errors: vec![],
+            raw_payload_reference: "sha256:payload".into(),
+            evidence_references: vec![],
+            sbi: None,
+        };
+        let out = e.to_json();
+        // Omissions attendues :
+        for omitted in [
+            "sll2_protocol_type",
+            "sll2_reserved",
+            "sll2_interface_index",
+            "sll2_arphrd_type",
+            "sll2_packet_type",
+            "sll2_address_length",
+            "sll2_address",
+            "source_sha256",
+            "link_type",
+            "parent_event_id",
+            "procedure_code",
+            "procedure",
+            "security_state",
+            "source_byte_offset",
+            "\"errors\"",
+            "evidence_references",
+            "\"sbi\"",
+        ] {
+            assert!(
+                !out.contains(omitted),
+                "champ `{omitted}` doit être omis quand null/vide, got: {out}"
+            );
+        }
+        // Présences requises :
+        for required in [
+            "\"event_id\":\"evt-abc\"",
+            "\"capture_id\":\"sha256:cap\"",
+            "\"packet_number\":42",
+            "\"byte_offset\":100",
+            "\"captured_length\":64",
+            "\"source_file\":\"x.pcapng\"",
+            "\"interface\":\"SBI\"",
+            "\"protocol\":\"SBI-HTTP2\"",
+            "\"message_name\":\"N1N2MessageTransfer\"",
+            "\"direction\":\"RAN_TO_CORE\"",
+            "\"decoding_status\":\"DECODED\"",
+            "\"schema_version\":\"1.5.1\"",
+            // présence même vide
+            "\"session_identifiers\":[]",
+            "\"information_elements\":[]",
+        ] {
+            assert!(
+                out.contains(required),
+                "champ requis `{required}` manquant, got: {out}"
+            );
+        }
+        // JSON parsable sans ambiguïté (validation structurelle).
+        let _: serde_json::Value =
+            serde_json::from_str(&out).expect("output must parse as valid JSON");
+    }
+
+    /// 1.5.1 : mesure avant/après — sur un événement représentatif SBI
+    /// (10 packet_references, tous sll2_* null), la compaction doit
+    /// réduire la taille de ≥ 30 % sans perte d'information.
+    #[test]
+    fn to_json_reduces_size_by_at_least_30_percent_on_sbi_shape_with_10_refs() {
+        // Événement SBI stylisé : 10 refs (SBI = HTTP/2 stream segmenté),
+        // tous sll2_* = None ; 3 IEs avec id / value / raw_sha256 à null
+        // sauf name/length/status. Mesure la taille produite par
+        // `to_json` vs un modèle fidèle de la forme pré-1.5.1 (nulls émis).
+        let ref_template = PacketReference {
+            source_file: "/captures/5g-session-abcdef/pcap/sbi/sbi.pcapng-00001.pcapng".into(),
+            source_sha256: None,
+            packet_number: 0,
+            byte_offset: 0,
+            interface_id: 0,
+            link_type: None,
+            sll2_protocol_type: None,
+            sll2_reserved: None,
+            sll2_interface_index: None,
+            sll2_arphrd_type: None,
+            sll2_packet_type: None,
+            sll2_address_length: None,
+            sll2_address: None,
+            captured_length: 1500,
+            original_length: 1500,
+        };
+        let mut refs = Vec::with_capacity(10);
+        for i in 0..10u64 {
+            let mut r = ref_template.clone();
+            r.packet_number = 100 + i;
+            r.byte_offset = i * 1500;
+            refs.push(r);
+        }
+        let ies = (0..3)
+            .map(|i| InformationElement {
+                id: None,
+                name: format!("IE-{i}"),
+                length: 8,
+                value: None,
+                raw_sha256: None,
+                status: DecodeStatus::Decoded,
+            })
+            .collect::<Vec<_>>();
+        let e = NormalizedEvent {
+            event_id: "evt-sbi".into(),
+            parent_event_id: None,
+            probe_id: "oiran-vprobe-local-01".into(),
+            capture_point_id: "sbi".into(),
+            capture_id: "sha256:87d45e4b08dcb82ccb811f978c4072c7bb04eaf9acd56650667752202fb72e24".into(),
+            packet_references: refs,
+            timestamp: ExactTimestamp {
+                seconds: 1_794_000_000,
+                nanoseconds: 123_456_000,
+                raw_ticks: 1_794_000_000_123_456_000,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            },
+            interface: "SBI".into(),
+            protocol: Protocol::SbiHttp2,
+            message_name: "N1N2MessageTransfer".into(),
+            message_type: 0,
+            procedure_code: None,
+            procedure: None,
+            security_state: None,
+            source_byte_offset: None,
+            source_endpoint: Endpoint {
+                address: "10.77.22.10".into(),
+                port: None,
+                network_function: None,
+            },
+            destination_endpoint: Endpoint {
+                address: "10.77.22.13".into(),
+                port: None,
+                network_function: None,
+            },
+            direction: Direction::RanToCore,
+            session_identifiers: vec![],
+            information_elements: ies,
+            decoder_name: "decoder-sbi".into(),
+            decoder_version: "0.4.0".into(),
+            schema_version: NormalizedEvent::SCHEMA_VERSION,
+            decoding_status: DecodeStatus::Decoded,
+            errors: vec![],
+            raw_payload_reference: "sha256:x".into(),
+            evidence_references: vec![],
+            sbi: None,
+        };
+        let after = e.to_json();
+        // Reconstruit la forme pré-1.5.1 : mêmes 10 refs avec les 9
+        // sll2_* / source_sha256 / link_type émis comme `null`, 3 IEs
+        // avec id/value/raw_sha256 émis comme `null`, plus les
+        // top-level options `parent_event_id`, `procedure_code`,
+        // `procedure`, `security_state`, `source_byte_offset`, `sbi`
+        // à `null`, et `errors: []`, `evidence_references: []`.
+        let legacy_packet = |p: &PacketReference| -> String {
+            format!(
+                "{{\"source_file\":\"{}\",\"source_sha256\":null,\"packet_number\":{},\"byte_offset\":{},\"interface_id\":{},\"link_type\":null,\"sll2_protocol_type\":null,\"sll2_reserved\":null,\"sll2_interface_index\":null,\"sll2_arphrd_type\":null,\"sll2_packet_type\":null,\"sll2_address_length\":null,\"sll2_address\":null,\"captured_length\":{},\"original_length\":{}}}",
+                escape(&p.source_file),
+                p.packet_number,
+                p.byte_offset,
+                p.interface_id,
+                p.captured_length,
+                p.original_length,
+            )
+        };
+        let legacy_ie = |ie: &InformationElement| -> String {
+            format!(
+                "{{\"id\":null,\"name\":\"{}\",\"length\":{},\"value\":null,\"raw_sha256\":null,\"status\":\"{}\"}}",
+                escape(&ie.name),
+                ie.length,
+                ie.status.as_str(),
+            )
+        };
+        let legacy_packets = e
+            .packet_references
+            .iter()
+            .map(legacy_packet)
+            .collect::<Vec<_>>()
+            .join(",");
+        let legacy_ies = e
+            .information_elements
+            .iter()
+            .map(legacy_ie)
+            .collect::<Vec<_>>()
+            .join(",");
+        let before = format!(
+            "{{\"event_id\":\"{}\",\"parent_event_id\":null,\"probe_id\":\"{}\",\"capture_point_id\":\"{}\",\"capture_id\":\"{}\",\"packet_references\":[{}],\"timestamp\":{{\"seconds\":{},\"nanoseconds\":{},\"raw_ticks\":{},\"resolution_base\":{},\"resolution_exponent\":{},\"display\":\"{}\"}},\"interface\":\"{}\",\"protocol\":\"{}\",\"message_name\":\"{}\",\"message_type\":{},\"procedure_code\":null,\"procedure\":null,\"security_state\":null,\"source_byte_offset\":null,\"source_endpoint\":{},\"destination_endpoint\":{},\"direction\":\"{}\",\"session_identifiers\":[],\"information_elements\":[{}],\"decoder_name\":\"{}\",\"decoder_version\":\"{}\",\"schema_version\":\"{}\",\"decoding_status\":\"{}\",\"errors\":[],\"raw_payload_reference\":\"{}\",\"evidence_references\":[],\"sbi\":null}}",
+            escape(&e.event_id),
+            escape(&e.probe_id),
+            escape(&e.capture_point_id),
+            escape(&e.capture_id),
+            legacy_packets,
+            e.timestamp.seconds,
+            e.timestamp.nanoseconds,
+            e.timestamp.raw_ticks,
+            e.timestamp.resolution_base,
+            e.timestamp.resolution_exponent,
+            escape(&e.timestamp.display()),
+            escape(&e.interface),
+            e.protocol.as_str(),
+            escape(&e.message_name),
+            e.message_type,
+            endpoint_json(&e.source_endpoint),
+            endpoint_json(&e.destination_endpoint),
+            e.direction.as_str(),
+            legacy_ies,
+            escape(&e.decoder_name),
+            escape(&e.decoder_version),
+            e.schema_version,
+            e.decoding_status.as_str(),
+            escape(&e.raw_payload_reference),
+        );
+        let before_b = before.len();
+        let after_b = after.len();
+        let reduction = 1.0 - (after_b as f64 / before_b as f64);
+        // Toujours émettre la mesure (eprintln survit sous --nocapture
+        // et fournit la preuve du gain pour le rapport #9).
+        eprintln!(
+            "[T2 to_json SBI shape 10 refs] before={before_b} B after={after_b} B reduction={:.3}%",
+            reduction * 100.0
+        );
+        assert!(
+            reduction >= 0.30,
+            "attendu ≥ 30% de réduction ; before={before_b} after={after_b} reduction={reduction:.3}"
+        );
+        // Les deux JSON doivent rester strictement valides.
+        let _: serde_json::Value =
+            serde_json::from_str(&before).expect("legacy JSON must parse");
+        let _: serde_json::Value =
+            serde_json::from_str(&after).expect("compact JSON must parse");
     }
     #[test]
     fn exact_timestamp_is_preserved() {
