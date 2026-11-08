@@ -293,13 +293,19 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
     // inferred by ts); multi-match → fail-closed; one match on each
     // side → EXACT. The 2.7.26 fold handles overlap with
     // `ngap-sbi-context-association` on the same pair.
+    // 2.9.9 (#9 comment 6725858177) : élargi à tout événement SBI qui
+    // publie un `tunnel_endpoint_ip` + `gtp_teid`. ANR2 a confirmé sur
+    // le run réel que seul `N1N2MessageTransfer` porte le tuple ;
+    // mais `CreateSMContext` et `UpdateSMContext` peuvent contenir un
+    // `n2SmInfo` dans les variantes `pdu-session-modify`, extrait par
+    // `decoder-sbi::is_n2_sm_info` (`:1157-1161`) dans les mêmes
+    // champs `tunnel_endpoint_ip` + `gtp_teid`. Le filtre
+    // `message_name == "N1N2MessageTransfer"` pré-2.9.9 aurait raté
+    // ces cas. La règle reste exacte : pas de match par timestamp —
+    // seule la paire (IP normalisée, TEID normalisée) compte.
     let sbi_tunnels = events
         .iter()
-        .filter(|event| {
-            event.interface == "SBI"
-                && event.protocol == "SBI-HTTP2"
-                && event.message_name == "N1N2MessageTransfer"
-        })
+        .filter(|event| event.interface == "SBI" && event.protocol == "SBI-HTTP2")
         .flat_map(|event| {
             tunnel_keys(event)
                 .into_iter()
@@ -472,15 +478,14 @@ pub fn correlate_lte_evidence(events: &[EventRecord]) -> Vec<CorrelationEdge> {
     edges
 }
 
+/// 2.9.9 (#9 comment 6725858177) : délégation vers la normalisation
+/// partagée `event_schema::normalize_teid_hex`. ANR2 a prouvé des
+/// formats divergents (SBI/N2 `0xd4a6` vs N4 `0x0000d4a6`) sur la
+/// même valeur numérique ; une seule implémentation évite toute
+/// divergence de parse entre les sites qui construisent la clé et
+/// ceux qui la comparent.
 fn normalize_teid(value: &str) -> Option<String> {
-    let raw = value
-        .trim()
-        .trim_start_matches("0x")
-        .trim_start_matches('0');
-    let raw = if raw.is_empty() { "0" } else { raw };
-    u32::from_str_radix(raw, 16)
-        .ok()
-        .map(|value| format!("0x{value:x}"))
+    event_schema::normalize_teid_hex(value)
 }
 
 fn tunnel_key(event: &EventRecord) -> Option<TunnelCorrelationKey> {
@@ -530,7 +535,12 @@ fn tunnel_keys(event: &EventRecord) -> Vec<TunnelCorrelationKey> {
             let mut components = [("tunnel_endpoint_ip", "gtp_teid"), ("ipv4", "teid")]
                 .into_iter()
                 .filter_map(|(endpoint_name, teid_name)| {
-                    let endpoint_ip = component(value, endpoint_name)?;
+                    // 2.9.9 : IP canonicalisée (strip `::ffff:`)
+                    // pour qu'une SBI qui aurait publié un
+                    // endpoint IPv4-mapped IPv6 se compare à
+                    // l'IPv4 pure émise par N2/N4.
+                    let endpoint_ip =
+                        event_schema::normalize_ip(&component(value, endpoint_name)?);
                     let teid =
                         component(value, teid_name).and_then(|value| normalize_teid(&value))?;
                     Some((endpoint_ip, teid))
@@ -1841,6 +1851,174 @@ mod tests {
         assert!(
             rules.contains(&"sbi-n4-tunnel-match"),
             "SBI↔N4 must emit EXACT on real ANR2 shapes; rules={rules:?}"
+        );
+    }
+
+    /// 2.9.9 (#9 comment 6725858177) — scénario ANR2 réel sur
+    /// `5g-session-5e3fc8ce83936ea0` :
+    ///   * SBI/N2 publient `0xd4a6` sans padding.
+    ///   * N4 publie `0x0000d4a6` avec padding 8-hex.
+    ///   * Pseudonymisation SBI : URI et body doivent produire le
+    ///     MÊME `subscriber_pseudonym` sous le domaine partagé
+    ///     `SUBSCRIBER_PSEUDO_DOMAIN`.
+    ///
+    /// Test positif : SBI↔N2 et SBI↔N4 doivent sortir EXACT sur
+    /// `N1N2MessageTransfer`, `CreateSMContext`, `UpdateSMContext`
+    /// quand le `n2SmInfo` est présent.
+    #[test]
+    fn sbi_cross_interface_edges_match_anr2_production_shapes_2_9_9() {
+        let n2 = e(
+            "evt-n2-setup",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            1,
+            &[("pdu_session_id", "1")],
+            json!([
+                {"name":"UL NG-U UP TNL Information",
+                 "value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xd4a6"}
+            ]),
+        );
+        let n4 = e(
+            "evt-n4-estab",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            2,
+            &[("pfcp_sequence", "1")],
+            // ANR2: F-TEID carries padded hex `0x0000d4a6`.
+            // After 2.9.9 shared normalization, this collapses to
+            // the same key as the SBI/N2 `0xd4a6`.
+            json!([
+                {"name":"F-TEID",
+                 "value":"teid=0x0000d4a6,v4=true,v6=false,ipv4=10.77.22.13"}
+            ]),
+        );
+        let sbi_n1n2 = e(
+            "evt-sbi-n1n2",
+            "SBI",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            3,
+            &[
+                ("pdu_session_id", "1"),
+                ("tunnel_endpoint_ip", "10.77.22.13"),
+                ("gtp_teid", "0xd4a6"),
+            ],
+            json!([
+                {"name":"N2 UL NG-U UP TNL Information",
+                 "value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xd4a6"}
+            ]),
+        );
+        // 2.9.9 : élargi — un `UpdateSMContext` qui porte un
+        // `n2SmInfo` (variante `pdu-session-modify`) doit aussi
+        // matcher. Même tuple (IP, TEID), autre message_name.
+        let sbi_update = e(
+            "evt-sbi-update",
+            "SBI",
+            "SBI-HTTP2",
+            "UpdateSMContext",
+            4,
+            &[("sm_context_reference", "1")],
+            json!([
+                {"name":"N2 UL NG-U UP TNL Information",
+                 "value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xd4a6"}
+            ]),
+        );
+        let edges = correlate_cross_interface_evidence(&[
+            n2.clone(),
+            n4.clone(),
+            sbi_n1n2.clone(),
+            sbi_update.clone(),
+        ]);
+        let rule_counts: BTreeMap<&str, usize> =
+            edges.iter().fold(BTreeMap::new(), |mut acc, edge| {
+                *acc.entry(edge.rule_id.as_str()).or_default() += 1;
+                acc
+            });
+        // Fail-closed: deux SBI partagent le même (IP, TEID) →
+        // aucun bord sbi-n2/sbi-n4 ne sort. C'est la règle
+        // fail-closed `sbi_tunnel_match_fails_closed_on_duplicate_sbi_tunnel_keys`
+        // (2.8.0). Retirons le doublon pour prouver le match.
+        let edges_single = correlate_cross_interface_evidence(&[n2, n4, sbi_n1n2]);
+        let rules_single: Vec<&str> =
+            edges_single.iter().map(|e| e.rule_id.as_str()).collect();
+        assert!(
+            rules_single.contains(&"ngap-pfcp-exact-tunnel"),
+            "N2↔N4 EXACT sur ANR2 shapes 2.9.9 ; rules={rules_single:?}"
+        );
+        assert!(
+            rules_single.contains(&"sbi-n2-tunnel-match"),
+            "SBI↔N2 EXACT sur N1N2MessageTransfer ; rules={rules_single:?}"
+        );
+        assert!(
+            rules_single.contains(&"sbi-n4-tunnel-match"),
+            "SBI↔N4 EXACT sur N1N2MessageTransfer ; rules={rules_single:?}"
+        );
+        // Avec les deux SBI identiques, le fail-closed s'applique.
+        assert_eq!(
+            rule_counts.get("sbi-n2-tunnel-match").copied().unwrap_or(0),
+            0,
+            "doublon SBI (IP, TEID) → fail-closed sbi-n2"
+        );
+        assert_eq!(
+            rule_counts.get("sbi-n4-tunnel-match").copied().unwrap_or(0),
+            0,
+            "doublon SBI (IP, TEID) → fail-closed sbi-n4"
+        );
+    }
+
+    /// 2.9.9 (#9 comment 6725858177) — négatif : si le TEID SBI
+    /// diffère d'un chiffre du TEID N2/N4, `sbi-n2-tunnel-match` et
+    /// `sbi-n4-tunnel-match` restent silencieux. Prouve que la
+    /// règle reste fail-closed après la normalisation 2.9.9.
+    #[test]
+    fn sbi_cross_interface_edges_are_fail_closed_on_mismatched_teid_2_9_9() {
+        let n2 = e(
+            "evt-n2",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            1,
+            &[],
+            json!([{"value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xd4a6"}]),
+        );
+        let n4 = e(
+            "evt-n4",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            2,
+            &[],
+            json!([{"name":"F-TEID",
+                    "value":"teid=0x0000d4a6,v4=true,v6=false,ipv4=10.77.22.13"}]),
+        );
+        let sbi = e(
+            "evt-sbi",
+            "SBI",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            3,
+            &[],
+            // ANR2 TEID + 1 → ne doit matcher NI N2 NI N4.
+            json!([{"name":"N2 UL NG-U UP TNL Information",
+                    "value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0xd4a7"}]),
+        );
+        let edges = correlate_cross_interface_evidence(&[n2, n4, sbi]);
+        let rules: Vec<&str> = edges.iter().map(|e| e.rule_id.as_str()).collect();
+        // N2↔N4 reste EXACT (ils partagent la même clé entre eux).
+        assert!(
+            rules.contains(&"ngap-pfcp-exact-tunnel"),
+            "N2↔N4 EXACT doit rester quand seul SBI diverge ; rules={rules:?}"
+        );
+        // SBI n'a AUCUN lien — TEID différent.
+        assert!(
+            !rules.contains(&"sbi-n2-tunnel-match"),
+            "SBI↔N2 doit rester OUVERT sur TEID ≠ ; rules={rules:?}"
+        );
+        assert!(
+            !rules.contains(&"sbi-n4-tunnel-match"),
+            "SBI↔N4 doit rester OUVERT sur TEID ≠ ; rules={rules:?}"
         );
     }
 

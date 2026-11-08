@@ -1,8 +1,9 @@
 //! Native bounded HTTP/2 and 5G SBI transaction decoder.
 
 use event_schema::{
-    pseudonym, sha256_hex, DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState,
-    InformationElement, NamedValue, NormalizedEvent, Protocol, PseudonymKey, SbiMetadata,
+    normalize_ip, normalize_teid_hex, pseudonym, sha256_hex, DecodeStatus, Direction, Endpoint,
+    EvidenceReference, EvidenceState, InformationElement, NamedValue, NormalizedEvent, Protocol,
+    PseudonymKey, SbiMetadata, SUBSCRIBER_PSEUDO_DOMAIN,
 };
 use hpack::huffman::HuffmanDecoder;
 use hpack::Decoder;
@@ -776,17 +777,30 @@ fn build_event(
             });
             if let Some(ul_tunnel) = transfer.ul_tunnel.as_ref() {
                 if let (Some(ip), Some(teid)) = (ul_tunnel.ipv4_address(), ul_tunnel.teid()) {
-                    let composed = format!(
-                        "tunnel_endpoint_ip={ip},gtp_teid=0x{teid:x}"
-                    );
+                    // 2.9.9 (#9 comment 6725858177) : canonicalise
+                    // IP via `event_schema::normalize_ip` (strip
+                    // `::ffff:`). Le TEID est déjà un `u32` ici —
+                    // on sort directement en `0x{teid:x}` (forme
+                    // canonique partagée par N2 et N4 après que
+                    // `correlation-engine::normalize_teid` ait
+                    // déplié les paddings `0x0000….`). Pas de
+                    // round-trip `normalize_teid_hex` : sur une
+                    // chaîne purement hex sans préfixe `0x` et
+                    // sans lettre a-f (ex. `"11223344"`), la règle
+                    // de désambiguïsation la lit en décimal — ici
+                    // la valeur est déjà typée.
+                    let ip_norm = normalize_ip(&ip.to_string());
+                    let teid_norm = format!("0x{teid:x}");
+                    let composed =
+                        format!("tunnel_endpoint_ip={ip_norm},gtp_teid={teid_norm}");
                     identifiers.push(NamedValue {
                         name: "tunnel_endpoint_ip".into(),
-                        value: ip.to_string(),
+                        value: ip_norm.clone(),
                         pseudonymized: false,
                     });
                     identifiers.push(NamedValue {
                         name: "gtp_teid".into(),
-                        value: format!("0x{teid:x}"),
+                        value: teid_norm.clone(),
                         pseudonymized: false,
                     });
                     ies.push(InformationElement {
@@ -994,9 +1008,18 @@ fn sanitize_uri(value: &str, pseudonym_key: &PseudonymKey) -> String {
                 || identity.starts_with("suci-")
                 || identity.starts_with("nai-")
             {
+                // 2.9.9 (#9 comment 6725858177) : was "supi".
+                // ANR2 proved the URI pseudonym and the body
+                // `subscriber_pseudonym` could never match
+                // because the two sites used different domain
+                // labels. Both now derive from
+                // `SUBSCRIBER_PSEUDO_DOMAIN`, so a SUPI observed
+                // on an SBI URI equals the same SUPI observed on
+                // an SBI JSON body — rattachement abonné SBI
+                // interne cohérent.
                 format!(
                     "subscriber-{}{}",
-                    pseudonym(pseudonym_key, "supi", identity.as_bytes()),
+                    pseudonym(pseudonym_key, SUBSCRIBER_PSEUDO_DOMAIN, identity.as_bytes()),
                     suffix
                 )
             } else {
@@ -1177,9 +1200,15 @@ fn collect_json(value: &Value, fields: &mut Vec<(String, String)>, pseudonym_key
     for (key, value) in map {
         if matches!(key.as_str(), "supi" | "suci" | "pei") {
             if let Some(text) = scalar(value) {
+                // 2.9.9 (#9 comment 6725858177) : was the literal
+                // string `"subscriber"`. Pulled through the shared
+                // `SUBSCRIBER_PSEUDO_DOMAIN` constant — any decoder
+                // that wants to surface the subscriber identity
+                // uses this one label, otherwise cross-site
+                // pseudonyms diverge.
                 fields.push((
                     "subscriber_pseudonym".into(),
-                    pseudonym(pseudonym_key, "subscriber", text.as_bytes()),
+                    pseudonym(pseudonym_key, SUBSCRIBER_PSEUDO_DOMAIN, text.as_bytes()),
                 ));
             }
         } else {

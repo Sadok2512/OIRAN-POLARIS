@@ -1,5 +1,154 @@
 # Changelog
 
+## OIRAN API 2.9.9 — 2026-11-08 — Rattachement et liens SBI exacts (TEID/IP/pseudo) (devmat, ANR2 #9 comment 6725858177)
+
+### Contexte — preuve ANR2 sur `5g-session-5e3fc8ce83936ea0`
+
+Capture SBI `sha256:1cb1c30c…fc864` : 982 événements, 25 SBI dans la
+fenêtre callflow `1794158356.919997466..1794158357.245764688`, aucun
+rattaché à la session. ANR2 publie sur #9 (désidentifié) :
+
+- **Clé commune prouvée** : PDU session `1`, IP `10.77.22.13`,
+  TEID numérique `d4a6`.
+- **Format TEID divergent** : SBI/N2 `0xd4a6`, N4 `0x0000d4a6`.
+- **Domaine de pseudonymisation divergent dans le code** :
+  `decoder-sbi/src/lib.rs:999` utilise `"supi"` (URI) alors que
+  `decoder-sbi/src/lib.rs:1182` utilise `"subscriber"` (JSON body).
+  Deux domaines distincts ⇒ même SUPI rendue sous deux pseudos
+  différents, rattachement par abonné impossible par construction.
+
+### T1 — Normalisation TEID/IP partagée
+
+Nouveau module partagé dans `event-schema/src/lib.rs` (`:849-923`) :
+
+- `SUBSCRIBER_PSEUDO_DOMAIN: &str = "subscriber"` — la SEULE
+  constante autorisée pour dériver un pseudonyme d'abonné (SBI/N2/N4
+  doivent tous l'utiliser pour qu'un même SUPI produise un même
+  pseudo).
+- `normalize_teid_u32(&str) -> Option<u32>` — accepte
+  `"d4a6"`, `"D4A6"`, `"0xd4a6"`, `"0x0000D4A6"`, `"11223344"`
+  (hex sans préfixe), `"0d54438"` (décimal explicite). Règle de
+  désambiguïsation : `0x`/`0X` → hex ; `0d`/`0D` → décimal ;
+  sinon → hex (convention télécom). Un round-trip
+  `format!("{teid:x}")` → `normalize_teid_u32` est donc stable.
+- `normalize_teid_hex(&str) -> Option<String>` — même fonction
+  avec la forme canonique `"0x{teid:x}"` en sortie (jamais
+  zero-padded, lower-case).
+- `normalize_ip(&str) -> String` — strip `::ffff:` (IPv4-mapped
+  IPv6 → IPv4) ; strip `%<zone>` (scope-id RFC 4007).
+
+Tests :
+- `normalize_teid_accepts_every_format_anr2_observed_plus_decimal` —
+  ANR2 shapes + hex sans préfixe + `0d` décimal.
+- `normalize_ip_strips_ipv4_mapped_prefix_and_scope_id`.
+- `subscriber_pseudo_domain_is_the_single_shared_label` — prouve que
+  deux dérivations via `SUBSCRIBER_PSEUDO_DOMAIN` sur la même SUPI
+  donnent le même pseudo ; diverge explicitement de l'ancien
+  domaine `"supi"`.
+
+### T2 — Unification des sites
+
+- `decoder-sbi::sanitize_uri` (`:999`) : `"supi"` → `SUBSCRIBER_PSEUDO_DOMAIN`.
+- `decoder-sbi::collect_json` (`:1182`) : littéral `"subscriber"` → constante partagée.
+- `decoder-sbi` extraction UL NG-U depuis `n2SmInfo` (`:778-813`) :
+  IP normalisée via `normalize_ip`. Le TEID (déjà `u32`) sort en
+  `"0x{teid:x}"` canonique.
+- `correlation-engine::normalize_teid` (`:475-483`) : délégation
+  pure à `event_schema::normalize_teid_hex`. Supprime la
+  duplication locale (strip `0x` + strip leading zeros + parse
+  hex) qui ne gérait pas le décimal.
+- `correlation-engine::tunnel_keys` : l'`endpoint_ip` passe par
+  `event_schema::normalize_ip` ; une SBI IPv4-mapped
+  (`::ffff:10.77.22.13`) s'égale désormais à N2/N4 (`10.77.22.13`).
+
+### T3 — Rattachement SBI par clé exacte
+
+Nouvelle fonction `session-engine::attach_sbi_to_sessions`
+(`:1374-1470`), appelée dans `discover_sessions` juste après
+`discover_gtpu_tunnels` (`:1343-1358`). Pour chaque PDU session
+discovered, construit deux index exacts :
+
+1. `(subscriber_pseudonym, pdu_session_id)` → session_index.
+2. `(tunnel_endpoint_ip_norm, gtp_teid_norm)` → session_index.
+
+Puis walk les événements SBI :
+- `(pseudo, pduSessionId)` match → rattachement.
+- Sinon, `(tunnel_endpoint_ip, gtp_teid)` normalisés match →
+  rattachement.
+- Sinon, SBI reste en `unmatched` (fail-closed).
+
+Jamais de match par timestamp. Le SBI rattaché est ajouté à
+`session.event_ids` + `session.interfaces` (trié) + `event_context`
+(sous le `ue_context_id` de la session).
+
+Test `sbi_attach_rules_match_anr2_production_shapes_2_9_9`
+(`session-engine`) — reproduit la forme ANR2 :
+- Deux événements NGAP (Request + Response, PDU 1, pseudo + tunnel).
+- Un SBI `CreateSMContext` avec le MÊME pseudo + PDU 1 (règle 1).
+- Un SBI `N1N2MessageTransfer` avec un pseudo URI DIVERGENT mais
+  le MÊME `(0xd4a6, 10.77.22.13)` extrait du `n2SmInfo` (règle 2).
+- Un SBI "outsider" avec un pseudo différent ET un TEID différent
+  (`0xd4a7`) — doit rester en `unmatched`.
+- Assertions : les deux SBI valides sont rattachés ; l'outsider
+  n'est pas rattaché même avec le ts le plus récent.
+
+### T4 — Règle SBI↔N2 et SBI↔N4 étendue
+
+`correlation-engine::correlate_cross_interface_evidence`
+(`:296-308`) : filtrage `message_name == "N1N2MessageTransfer"`
+retiré. Tout événement SBI qui porte un `(tunnel_endpoint_ip,
+gtp_teid)` est candidat. Couvre `CreateSMContext`,
+`UpdateSMContext`, `N1N2MessageTransfer` quand ils embarquent un
+`n2SmInfo` (`decoder-sbi::is_n2_sm_info` au `:1157-1161`).
+
+Tests :
+- `sbi_cross_interface_edges_match_anr2_production_shapes_2_9_9` —
+  N2 `0xd4a6`, N4 `0x0000d4a6`, SBI `0xd4a6` → `ngap-pfcp-exact-tunnel`
+  + `sbi-n2-tunnel-match` + `sbi-n4-tunnel-match` tous EXACT.
+  Vérifie aussi le fail-closed quand deux SBI partagent le même
+  `(IP, TEID)`.
+- `sbi_cross_interface_edges_are_fail_closed_on_mismatched_teid_2_9_9`
+  — SBI `0xd4a7` (TEID différent) → aucun bord SBI↔N2/SBI↔N4,
+  N2↔N4 reste EXACT entre eux.
+
+### T5 — Preuve de divergence (fichier:ligne)
+
+Les sites mis à jour en 2.9.9 pour que SBI/N2/N4 convergent vers
+le même pseudo d'abonné :
+
+- `decoder-sbi/src/lib.rs:999` — était `"supi"` (URI).
+- `decoder-sbi/src/lib.rs:1182` — était `"subscriber"` (body).
+
+Pour N2 (`decoder-ngap`) et N4 (`decoder-pfcp`), ANR2 a prouvé
+que l'identité d'abonné arrive sous des IEs de wire très
+différentes (NAS-PDU, 5G-S-TMSI, masked-IMEISV côté NGAP ;
+PFCP UE-IP, User-ID côté PFCP). La normalisation d'identité
+canonique entre ces IEs demande un décodage spécifique à chaque
+protocole et sort du périmètre 2.9.9 (travail NSPlus-N2 2.10.x).
+La règle 2.9.9 s'appuie donc sur le tuple `(TEID, IP)` du
+`n2SmInfo` pour SBI↔N2 et SBI↔N4 (clé exacte, pas d'abonné
+nécessaire).
+
+### T6 — Tests
+
+**429 PASS**, 0 FAIL, 4 ignored (+6 vs 2.9.8). Les 2.9.8 orphan
+purge + /metrics BLOCKED + work_bytes-ring + round-trip 2.9.6/2.9.7
+restent VERT. Le test `n1n2_message_transfer_multipart_extracts_ul_ngu_tunnel_from_n2_sm_info`
+(decoder-sbi) continue de passer avec la forme canonique
+`0x11223344` (pas de round-trip ambigu grâce à la règle "hex par
+défaut").
+
+### Versions
+
+- `event-schema` 1.5.1-dev → 1.5.2 (`SUBSCRIBER_PSEUDO_DOMAIN`,
+  `normalize_teid_u32` / `_hex`, `normalize_ip`)
+- `decoder-sbi` 0.4.0 → 0.4.1 (sanitize_uri + collect_json
+  convergent, UL NG-U IP/TEID normalisés)
+- `session-engine` 0.5.1 → 0.5.2 (`attach_sbi_to_sessions`)
+- `correlation-engine` 0.6.1 → 0.6.2 (délégation normalisation,
+  filtre SBI étendu)
+- `oiran-api` 2.9.8 → 2.9.9
+
 ## OIRAN API 2.9.8 — 2026-11-08 — Backpressure sur ring importé + BLOCKED masqué sur /metrics (devmat, ANR2 #9 comment 6725097122)
 
 ### Contexte — ANR2 a prouvé la cause exacte

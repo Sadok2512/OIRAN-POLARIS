@@ -1324,6 +1324,26 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
 
     let pfcp_sessions = discover_pfcp_sessions(&events);
     let gtpu_tunnels = discover_gtpu_tunnels(&events, &pfcp_sessions);
+
+    // 2.9.9 (#9 comment 6725858177) : attachment SBI à la session.
+    // ANR2 a prouvé que les 25 événements SBI de la fenêtre callflow
+    // de `5g-session-5e3fc8ce83936ea0` n'étaient rattachés à aucune
+    // session. La règle : clé exacte, jamais par `ts`.
+    //
+    // Clés acceptées, dans l'ordre :
+    //   1. `(subscriber_pseudonym, pdu_session_id)` — SBI JSON body
+    //      publie SUPI/PEI pseudonymisé + pduSessionId ; la session
+    //      5G le porte via ses événements NGAP+NAS.
+    //   2. `(tunnel_endpoint_ip, gtp_teid)` normalisés — SBI
+    //      `n2SmInfo` carry la UL NG-U TNL Information ; la session
+    //      N2 publie le même couple sur son
+    //      `PDUSessionResourceSetupRequest`.
+    //
+    // La règle est fail-closed : un SBI qui n'a ni (pseudonyme,
+    // pduSessionId) ni (TEID, IP) reste non rattaché et compte en
+    // `unmatched`. Aucun critère temporel n'est utilisé.
+    attach_sbi_to_sessions(&events, &mut pdu_sessions, &mut event_context);
+
     let assigned: HashSet<_> = event_context.keys().cloned().collect();
     let mut background_event_ids = Vec::new();
     let mut unmatched_event_ids = Vec::new();
@@ -1368,6 +1388,104 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
         unmatched_event_ids,
         duplicate_observations,
         event_accounting,
+    }
+}
+
+/// 2.9.9 (#9 comment 6725858177) : règle de rattachement SBI →
+/// session par clé exacte. Jamais par timestamp.
+///
+/// Pour chaque session PDU, on prépare deux index :
+///   * `pseudo_pdu`   → (`subscriber_pseudonym`, `pdu_session_id`).
+///     Scan des events de la session (NGAP + NAS) ; si l'un porte
+///     un `subscriber_pseudonym`, il devient une clé de rattachement
+///     pour un SBI qui publie le même pseudo + le même pduSessionId.
+///   * `tunnel`       → (`tunnel_endpoint_ip`, `gtp_teid`)
+///     normalisés via `event_schema`. SBI `CreateSMContext` /
+///     `UpdateSMContext` / `N1N2MessageTransfer` carry la UL NG-U
+///     TNL Information extraite du `n2SmInfo` ; la session N2
+///     publie le même couple sur son `PDUSessionResourceSetupRequest`.
+///
+/// Un SBI qui match par l'une des deux clés est ajouté à
+/// `session.event_ids` + inscrit dans `event_context` sous le
+/// `ue_context_id` de la session. Les deux index étant construits
+/// sur des IE strictement présentes (pseudonyme OU tuple tunnel),
+/// l'attache est **exacte** — un timing n'intervient à aucun moment.
+fn attach_sbi_to_sessions(
+    events: &[EventRecord],
+    pdu_sessions: &mut Vec<DiscoveredPduSession>,
+    event_context: &mut BTreeMap<String, String>,
+) {
+    if pdu_sessions.is_empty() {
+        return;
+    }
+    // Snapshot de lookup event_id → &EventRecord.
+    let event_by_id: BTreeMap<_, _> = events
+        .iter()
+        .map(|event| (event.event_id.clone(), event))
+        .collect();
+
+    // Index (pseudo, pdu_session_id) → session_index.
+    let mut pseudo_pdu: BTreeMap<(String, String), usize> = BTreeMap::new();
+    // Index (tunnel_endpoint_ip_norm, gtp_teid_norm) → session_index.
+    let mut tunnel_idx: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for (idx, session) in pdu_sessions.iter().enumerate() {
+        let pdu_id = session.pdu_session_id.clone();
+        for event_id in &session.event_ids {
+            let Some(event) = event_by_id.get(event_id).copied() else {
+                continue;
+            };
+            if let Some(pseudo) = event.first_identifier("subscriber_pseudonym") {
+                pseudo_pdu
+                    .entry((pseudo.to_owned(), pdu_id.clone()))
+                    .or_insert(idx);
+            }
+            let ip_raw = event.first_identifier("tunnel_endpoint_ip");
+            let teid_raw = event.first_identifier("gtp_teid");
+            if let (Some(ip), Some(teid)) = (ip_raw, teid_raw) {
+                let ip_norm = event_schema::normalize_ip(ip);
+                if let Some(teid_norm) = event_schema::normalize_teid_hex(teid) {
+                    tunnel_idx.entry((ip_norm, teid_norm)).or_insert(idx);
+                }
+            }
+        }
+    }
+
+    for event in events.iter().filter(|event| event.protocol == "SBI-HTTP2") {
+        if event_context.contains_key(&event.event_id) {
+            continue;
+        }
+        let pdu_id = event.first_identifier("pdu_session_id").map(str::to_owned);
+        let pseudo = event
+            .first_identifier("subscriber_pseudonym")
+            .map(str::to_owned);
+        let mut target_idx: Option<usize> = None;
+        if let (Some(pseudo), Some(pdu_id)) = (&pseudo, &pdu_id) {
+            if let Some(&idx) = pseudo_pdu.get(&(pseudo.clone(), pdu_id.clone())) {
+                target_idx = Some(idx);
+            }
+        }
+        if target_idx.is_none() {
+            let ip = event
+                .first_identifier("tunnel_endpoint_ip")
+                .map(event_schema::normalize_ip);
+            let teid = event
+                .first_identifier("gtp_teid")
+                .and_then(event_schema::normalize_teid_hex);
+            if let (Some(ip), Some(teid)) = (ip, teid) {
+                if let Some(&idx) = tunnel_idx.get(&(ip, teid)) {
+                    target_idx = Some(idx);
+                }
+            }
+        }
+        if let Some(idx) = target_idx {
+            let session = &mut pdu_sessions[idx];
+            session.event_ids.push(event.event_id.clone());
+            if !session.interfaces.iter().any(|iface| iface == &event.interface) {
+                session.interfaces.push(event.interface.clone());
+                session.interfaces.sort();
+            }
+            event_context.insert(event.event_id.clone(), session.ue_context_id.clone());
+        }
     }
 }
 
@@ -1915,6 +2033,121 @@ mod tests {
             .map(|(a, b)| ((*a).into(), (*b).into()))
             .collect();
         e
+    }
+
+    /// 2.9.9 (#9 comment 6725858177) — `attach_sbi_to_sessions`
+    /// rattache un SBI à sa PDU session par clé exacte. ANR2 a
+    /// publié sur le run `5g-session-5e3fc8ce83936ea0` :
+    ///   * NGAP `PDUSessionResourceSetupRequest` : PDU 1,
+    ///     `subscriber_pseudonym=psn-aaa…` (ex. valeur ANR2 pour
+    ///     N2), tunnel UL `0xd4a6` / `10.77.22.13`.
+    ///   * NGAP `PDUSessionResourceSetupResponse` : PDU 1.
+    ///   * SBI `CreateSMContext` : PDU 1,
+    ///     `subscriber_pseudonym` SBI body — doit MATCHER le N2
+    ///     via `(pseudo, pdu_session_id)`.
+    ///   * SBI `N1N2MessageTransfer` : PDU 1 + tunnel `0xd4a6` /
+    ///     `10.77.22.13` — doit MATCHER par TEID/IP même si le
+    ///     `subscriber_pseudonym` SBI diffère (cas réel ANR2).
+    ///
+    /// Négatif : SBI avec TEID ≠ `0xd4a7` + pseudo différent → non
+    /// rattaché, reste dans `unmatched`.
+    #[test]
+    fn sbi_attach_rules_match_anr2_production_shapes_2_9_9() {
+        let shared_pseudo = "psn-fakeanr2n2sbi0000000000000000";
+        let n2_request = event(
+            "evt-n2-req",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            &[
+                ("ran_ue_ngap_id", "4"),
+                ("amf_ue_ngap_id", "73"),
+                ("pdu_session_id", "1"),
+                ("subscriber_pseudonym", shared_pseudo),
+                ("tunnel_endpoint_ip", "10.77.22.13"),
+                ("gtp_teid", "0xd4a6"),
+            ],
+            1,
+        );
+        let n2_response = event(
+            "evt-n2-resp",
+            "NGAP",
+            "PDUSessionResourceSetupResponse",
+            &[
+                ("ran_ue_ngap_id", "4"),
+                ("amf_ue_ngap_id", "73"),
+                ("pdu_session_id", "1"),
+            ],
+            2,
+        );
+        let sbi_create = event(
+            "evt-sbi-create",
+            "SBI-HTTP2",
+            "CreateSMContext",
+            &[
+                ("pdu_session_id", "1"),
+                ("subscriber_pseudonym", shared_pseudo),
+            ],
+            3,
+        );
+        // ANR2 réel : URI SBI porte un pseudo DIFFÉRENT du pseudo
+        // body (dérivation sur IE différentes), mais le tuple
+        // (IP, TEID) extrait du `n2SmInfo` est le même que N2.
+        let sbi_n1n2 = event(
+            "evt-sbi-n1n2",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            &[
+                ("pdu_session_id", "1"),
+                ("subscriber_pseudonym", "psn-sbi-uri-divergent-dddddddddddd"),
+                ("tunnel_endpoint_ip", "10.77.22.13"),
+                // 2.9.9 : forme non-paddée. La normalisation
+                // partagée l'égalise avec le N4 0x0000d4a6.
+                ("gtp_teid", "0xd4a6"),
+            ],
+            4,
+        );
+        // Négatif : TEID différent + pseudo différent → non rattaché.
+        let sbi_outsider = event(
+            "evt-sbi-outsider",
+            "SBI-HTTP2",
+            "CreateSMContext",
+            &[
+                ("pdu_session_id", "1"),
+                ("subscriber_pseudonym", "psn-another-subscriber-00000000"),
+                ("tunnel_endpoint_ip", "10.77.22.13"),
+                ("gtp_teid", "0xd4a7"),
+            ],
+            5,
+        );
+
+        let events = vec![n2_request, n2_response, sbi_create, sbi_n1n2, sbi_outsider];
+        let discovery = discover_sessions(&mut events.clone());
+        assert_eq!(discovery.pdu_sessions.len(), 1, "une seule PDU session");
+        let session = &discovery.pdu_sessions[0];
+        assert_eq!(session.pdu_session_id, "1");
+        // Les deux SBI valides sont rattachés via respectivement
+        // (pseudo, pduSessionId) et (TEID, IP).
+        assert!(
+            session.event_ids.iter().any(|id| id == "evt-sbi-create"),
+            "SBI CreateSMContext doit être rattaché par (pseudo, pduSessionId)"
+        );
+        assert!(
+            session.event_ids.iter().any(|id| id == "evt-sbi-n1n2"),
+            "SBI N1N2MessageTransfer doit être rattaché par (TEID, IP)"
+        );
+        // Le SBI avec TEID ≠ et pseudo différent reste non rattaché.
+        assert!(
+            !session.event_ids.iter().any(|id| id == "evt-sbi-outsider"),
+            "SBI avec TEID ≠ et pseudo différent ne doit PAS être rattaché"
+        );
+        assert!(
+            discovery.unmatched_event_ids.contains(&"evt-sbi-outsider".to_string())
+                || discovery.background_event_ids.contains(&"evt-sbi-outsider".to_string()),
+            "SBI outsider doit tomber en unmatched/background"
+        );
+        // Prouve la règle : aucun critère temporel. Le SBI
+        // outsider a le TS le plus élevé, pourtant il n'est PAS
+        // rattaché — l'attache n'est jamais faite par ts.
     }
 
     #[test]

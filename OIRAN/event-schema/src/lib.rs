@@ -845,6 +845,88 @@ pub fn pseudonym(key: &PseudonymKey, label: &str, bytes: &[u8]) -> String {
     let hex = mac.finish_hex();
     format!("psn-{}", &hex[..32])
 }
+
+/// 2.9.9 (#9 comment 6725858177) : domaine unique de
+/// pseudonymisation d'abonné partagé par SBI / N2 / N4. ANR2 a
+/// prouvé que `decoder-sbi::sanitize_uri` utilisait le label `supi`
+/// alors que `decoder-sbi::collect_json` utilisait `subscriber`,
+/// rendant impossible l'égalité URI ↔ body au sein du SBI. Tous les
+/// décodeurs qui veulent surfacer l'identité d'abonné DOIVENT
+/// utiliser ce label — ne jamais le passer en dur.
+pub const SUBSCRIBER_PSEUDO_DOMAIN: &str = "subscriber";
+
+/// 2.9.9 (#9 comment 6725858177) : normalisation TEID partagée par
+/// SBI / N2 / N4. ANR2 a prouvé des formats divergents sur le même
+/// TEID numérique : SBI/N2 `0xd4a6`, N4 `0x0000d4a6`. La fonction
+/// accepte `"d4a6"`, `"D4A6"`, `"0xd4a6"`, `"0x0000D4A6"`, et
+/// `"0d54438"` (décimal explicite). Elle produit systématiquement un
+/// `u32` ; la forme canonique lisible est `format!("0x{teid:x}")`.
+/// Jamais de zero-padding dans la sortie — la comparaison égale deux
+/// chaînes quelle que soit la largeur d'origine.
+///
+/// Règle de désambiguïsation décimal / hexa, strictement explicite
+/// (la convention télécom par défaut est l'hexadécimal) :
+///   * préfixe `0x` ou `0X` → hex.
+///   * préfixe `0d` ou `0D` → décimal explicite.
+///   * sinon → hex.
+///
+/// Note : une chaîne purement numérique sans préfixe (par exemple
+/// `"11223344"`) est lue en **hex** (0x11223344), pas en décimal.
+/// C'est le choix qu'imposent les traces réelles : SBI/N2/N4
+/// publient toujours des TEIDs hex, parfois sans le préfixe `0x`.
+/// Un producteur qui veut injecter du décimal doit préfixer `0d`.
+pub fn normalize_teid_u32(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (body, radix) = if let Some(stripped) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        (stripped, 16)
+    } else if let Some(stripped) = trimmed
+        .strip_prefix("0d")
+        .or_else(|| trimmed.strip_prefix("0D"))
+    {
+        (stripped, 10)
+    } else {
+        (trimmed, 16)
+    };
+    u32::from_str_radix(body, radix).ok()
+}
+
+/// 2.9.9 : même règle que `normalize_teid_u32` mais rend la forme
+/// canonique `"0x{teid:x}"`. Pratique quand on compare des clés
+/// dérivées de IEs sérialisées sous forme chaîne.
+pub fn normalize_teid_hex(value: &str) -> Option<String> {
+    normalize_teid_u32(value).map(|teid| format!("0x{teid:x}"))
+}
+
+/// 2.9.9 (#9 comment 6725858177) : normalisation IP partagée.
+/// `::ffff:a.b.c.d` → `a.b.c.d`. `::1` reste `::1`. Un host-spec
+/// `[2001:db8::1]:8080` est renvoyé entre crochets sans port
+/// (callers trimment le port avant de normaliser). Trim complet des
+/// zones scope `%eth0` au-delà de la lettre `%`.
+pub fn normalize_ip(value: &str) -> String {
+    let trimmed = value.trim();
+    // Drop scope-id (RFC 4007 "%<zone>").
+    let stripped = trimmed.split('%').next().unwrap_or(trimmed);
+    // IPv4-mapped IPv6 → IPv4.
+    if let Some(suffix) = stripped
+        .strip_prefix("::ffff:")
+        .or_else(|| stripped.strip_prefix("::FFFF:"))
+    {
+        if suffix
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.')
+            && suffix.split('.').count() == 4
+        {
+            return suffix.to_string();
+        }
+    }
+    stripped.to_string()
+}
 fn endpoint_json(e: &Endpoint) -> String {
     format!(
         "{{\"address\":\"{}\",\"port\":{},\"network_function\":{}}}",
@@ -1377,6 +1459,77 @@ mod tests {
         assert_ne!(a.as_slice(), b.as_slice());
         assert!(a.as_slice().iter().any(|byte| *byte != 0));
         assert!(b.as_slice().iter().any(|byte| *byte != 0));
+    }
+
+    /// 2.9.9 (#9 comment 6725858177) : ANR2 a prouvé que le même TEID
+    /// numérique apparaît sous `0xd4a6` (SBI, N2) et `0x0000d4a6` (N4).
+    /// La normalisation partagée doit égaler les deux écritures.
+    #[test]
+    fn normalize_teid_accepts_every_format_anr2_observed_plus_decimal() {
+        // ANR2 production shapes: SBI / N2 `0xd4a6`, N4 `0x0000d4a6`.
+        assert_eq!(normalize_teid_u32("0xd4a6"), Some(0xd4a6));
+        assert_eq!(normalize_teid_u32("0x0000d4a6"), Some(0xd4a6));
+        assert_eq!(normalize_teid_u32("0xD4A6"), Some(0xd4a6));
+        assert_eq!(normalize_teid_u32("0X0000D4A6"), Some(0xd4a6));
+        // Without 0x prefix : hex by default (télécom convention).
+        assert_eq!(normalize_teid_u32("d4a6"), Some(0xd4a6));
+        assert_eq!(normalize_teid_u32("D4A6"), Some(0xd4a6));
+        // 2.9.9 : une chaîne sans préfixe est hex, même quand elle
+        // ne contient que des chiffres — sinon `0x11223344` round-
+        // trip sur `format!("{teid:x}")` serait relu en décimal
+        // (= 0xab4130). Convention : hex partout, décimal
+        // explicite via `0d`.
+        assert_eq!(normalize_teid_u32("11223344"), Some(0x11223344));
+        assert_eq!(normalize_teid_u32("0d54438"), Some(54438));
+        assert_eq!(normalize_teid_u32("0D54438"), Some(54438));
+        // Canonical hex form: never zero-padded, lower-case.
+        assert_eq!(normalize_teid_hex("0x0000d4a6"), Some("0xd4a6".into()));
+        assert_eq!(normalize_teid_hex("0xd4a6"), Some("0xd4a6".into()));
+        assert_eq!(normalize_teid_hex("d4a6"), Some("0xd4a6".into()));
+        assert_eq!(normalize_teid_hex("D4A6"), Some("0xd4a6".into()));
+        assert_eq!(normalize_teid_hex("0d54438"), Some("0xd4a6".into()));
+        // Garbage → None.
+        assert_eq!(normalize_teid_u32(""), None);
+        assert_eq!(normalize_teid_u32("not-a-teid"), None);
+        assert_eq!(normalize_teid_u32("0xGGG"), None);
+    }
+
+    /// 2.9.9 (#9 comment 6725858177) : SBI porte des endpoints en
+    /// IPv4-mapped IPv6 (`::ffff:10.77.22.13`) sur certaines
+    /// implémentations ; la clé commune cross-plane doit égaler la
+    /// forme IPv4 pure utilisée par N2 et N4.
+    #[test]
+    fn normalize_ip_strips_ipv4_mapped_prefix_and_scope_id() {
+        assert_eq!(normalize_ip("10.77.22.13"), "10.77.22.13");
+        assert_eq!(normalize_ip("::ffff:10.77.22.13"), "10.77.22.13");
+        assert_eq!(normalize_ip("::FFFF:10.77.22.13"), "10.77.22.13");
+        // Pure IPv6 unchanged.
+        assert_eq!(normalize_ip("2001:db8::1"), "2001:db8::1");
+        assert_eq!(normalize_ip("::1"), "::1");
+        // Scope id dropped.
+        assert_eq!(normalize_ip("fe80::1%eth0"), "fe80::1");
+    }
+
+    /// 2.9.9 (#9 comment 6725858177) : `sanitize_uri` utilisait
+    /// `"supi"` et `collect_json` `"subscriber"`. Même SUPI, deux
+    /// pseudos différents — rattachement abonné impossible. Le
+    /// nouveau `SUBSCRIBER_PSEUDO_DOMAIN` est la seule constante
+    /// autorisée côté SBI (URI + body).
+    #[test]
+    fn subscriber_pseudo_domain_is_the_single_shared_label() {
+        assert_eq!(SUBSCRIBER_PSEUDO_DOMAIN, "subscriber");
+        let key = PseudonymKey::from_bytes([0x24; 32]);
+        let supi = b"imsi-208934000000001";
+        // Two calls with the shared domain must produce the same
+        // pseudonym — prouvant qu'un URI pseudonymisé et un body
+        // pseudonymisé se comparent à l'identique.
+        let uri_side = pseudonym(&key, SUBSCRIBER_PSEUDO_DOMAIN, supi);
+        let body_side = pseudonym(&key, SUBSCRIBER_PSEUDO_DOMAIN, supi);
+        assert_eq!(uri_side, body_side);
+        // Appeler l'ancien domaine `"supi"` doit diverger — c'est
+        // exactement le défaut 2.9.8 qu'ANR2 a mis en évidence.
+        let legacy_uri = pseudonym(&key, "supi", supi);
+        assert_ne!(legacy_uri, body_side);
     }
 
     fn deployment_key_path(label: &str) -> std::path::PathBuf {
