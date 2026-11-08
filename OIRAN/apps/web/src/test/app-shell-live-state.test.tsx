@@ -76,11 +76,11 @@ it('renders observed backend state and never claims a pending probe is connected
   expect(screen.getByText('N2 REFERENCE_ONLY')).toBeVisible();
 });
 
-// 2.9.2 (#9 Analyzer T5): ANR2 saw "Observed: UNKNOWN / LTE" on a run whose
-// open session was 5G SA. The sentinel "UNKNOWN" is dropped from the
-// aggregate; the label also surfaces the probe health/telemetry_status so
-// the user sees WHY the probe is not connected.
-it('drops UNKNOWN from observed technologies and surfaces the probe not-connected reason', async () => {
+// 2.9.3-fu1 (#9 devmat): revient sur 2.9.2-fu2 — ne masque plus UNKNOWN.
+// Affiche chaque technologie avec son compte de datasets (UNKNOWN inclus)
+// pour que l'utilisateur voie combien de datasets restent non classifiés.
+// Les technologies réelles passent en premier, UNKNOWN en fin.
+it('shows every observed technology with its dataset count (UNKNOWN last)', async () => {
   vi.mocked(api).mockImplementation(async (path?: string) => {
     if (path === '/modules') return { data: [], meta: {} } as never;
     if (path === '/metrics') return { data: BASE_METRICS, meta: {} } as never;
@@ -98,16 +98,53 @@ it('drops UNKNOWN from observed technologies and surfaces the probe not-connecte
     if (path === '/datasets?page_size=100')
       return {
         data: [
-          { technology: 'UNKNOWN' },
           { technology: '5G SA' },
-          { technology: 'LTE' },
+          { technology: 'UNKNOWN' },
         ],
         meta: {},
       } as never;
     throw new Error(`unexpected path ${path}`);
   });
   renderShell();
-  await waitFor(() => expect(screen.getByTestId('observed-technologies')).toHaveTextContent('Observed: 5G SA / LTE'));
-  expect(screen.getByTestId('observed-technologies')).not.toHaveTextContent('UNKNOWN');
-  await waitFor(() => expect(screen.getByTestId('probe-connection')).toHaveTextContent('vProbe not connected · DEGRADED · IDLE'));
+  // Single 5G SA dataset + single UNKNOWN dataset — format devmat.
+  await waitFor(() =>
+    expect(screen.getByTestId('observed-technologies')).toHaveTextContent(
+      'Observed: 5G SA · 1 dataset UNKNOWN',
+    ),
+  );
+  await waitFor(() =>
+    expect(screen.getByTestId('probe-connection')).toHaveTextContent(
+      'vProbe not connected · DEGRADED · IDLE',
+    ),
+  );
+});
+
+// 2.9.3-fu1 : compte plural + plusieurs technologies.
+it('pluralises UNKNOWN count and aggregates per-technology counts', async () => {
+  vi.mocked(api).mockImplementation(async (path?: string) => {
+    if (path === '/modules') return { data: [], meta: {} } as never;
+    if (path === '/metrics') return { data: BASE_METRICS, meta: {} } as never;
+    if (path === '/auth/me') return { data: { role: 'viewer' }, meta: {} } as never;
+    if (path === '/probes')
+      return { data: [{ probe_id: 'probe-1', online: false }], meta: {} } as never;
+    if (path === '/datasets?page_size=100')
+      return {
+        data: [
+          { technology: '5G SA' },
+          { technology: '5G SA' },
+          { technology: 'LTE' },
+          { technology: 'UNKNOWN' },
+          { technology: 'UNKNOWN' },
+          { technology: 'UNKNOWN' },
+        ],
+        meta: {},
+      } as never;
+    throw new Error(`unexpected path ${path}`);
+  });
+  renderShell();
+  await waitFor(() =>
+    expect(screen.getByTestId('observed-technologies')).toHaveTextContent(
+      'Observed: 5G SA (2) · LTE · 3 datasets UNKNOWN',
+    ),
+  );
 });

@@ -117,18 +117,28 @@ export function AppShell() {
           ? `vProbe not connected · ${probeReason}`
           : 'vProbe not connected'
         : 'vProbe UNKNOWN';
-  // 2.9.2 (#9 Analyzer T5): the aggregate used to show "Observed: UNKNOWN /
-  // LTE" because `dataset-continuous-lab-import` reported technology=UNKNOWN
-  // before any decoded plane landed. Backend now derives technology from the
-  // capture job profile as a fallback; here we also drop the UNKNOWN sentinel
-  // from the display so the top-bar names only technologies actually observed.
-  const observedTechnologies = [
-    ...new Set(
-      datasets.data
-        ?.map((item) => item.technology)
-        .filter((value): value is string => Boolean(value) && value !== 'UNKNOWN') ?? [],
-    ),
-  ];
+  // 2.9.3-fu1 (devmat #9) : afficher les technologies observées AVEC leur
+  // compte de datasets, UNKNOWN inclus. Rien de caché : le top-bar liste
+  // chaque technologie (5G SA, LTE, UNKNOWN) suivie du nombre de datasets
+  // concernés. UNKNOWN est placé en fin pour la lisibilité. 2.9.2-fu2
+  // masquait UNKNOWN ; l'utilisateur veut la visibilité pour pouvoir voir
+  // combien de datasets restent non classifiés.
+  const techCounts = (datasets.data ?? []).reduce<Record<string, number>>(
+    (acc, item) => {
+      const tech = item.technology && item.technology.length > 0 ? item.technology : 'UNKNOWN';
+      acc[tech] = (acc[tech] ?? 0) + 1;
+      return acc;
+    },
+    {},
+  );
+  const observedParts = Object.entries(techCounts)
+    .sort(([a], [b]) => (a === 'UNKNOWN' ? 1 : 0) - (b === 'UNKNOWN' ? 1 : 0))
+    .map(([tech, count]) => {
+      if (tech === 'UNKNOWN') {
+        return `${count} dataset${count === 1 ? '' : 's'} UNKNOWN`;
+      }
+      return count === 1 ? tech : `${tech} (${count})`;
+    });
 
   function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -186,7 +196,7 @@ export function AppShell() {
           </form>
           <select aria-label="Environment"><option>Certified Lab</option></select>
           <span className="observed-technology" data-testid="observed-technologies">
-            {observedTechnologies.length ? `Observed: ${observedTechnologies.join(' / ')}` : 'Technology UNKNOWN'}
+            {observedParts.length ? `Observed: ${observedParts.join(' · ')}` : 'Technology UNKNOWN'}
           </span>
           <span className={`connection ${onlineProbes.length ? '' : 'connection-unknown'}`} data-testid="probe-connection"><i />{probeLabel}</span>
           <div className="interface-indicators">

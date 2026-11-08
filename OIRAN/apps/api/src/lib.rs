@@ -1088,6 +1088,24 @@ fn probe_online(last_heartbeat_epoch_s: Option<u64>, now_epoch_s: u64) -> bool {
     })
 }
 
+/// 2.9.3-fu1 (devmat #9) : porte unifiée. Le vProbe local EST le
+/// processus API — pas de battement HTTP indépendant. Si une capture
+/// est active côté local, l'online est vrai par définition (l'API
+/// répond donc la sonde est joignable). Les sondes distantes passent
+/// par la porte battement 15 s inchangée.
+fn probe_is_reachable(
+    local: bool,
+    active_capture: bool,
+    last_heartbeat_epoch_s: Option<u64>,
+    now_epoch_s: u64,
+) -> bool {
+    if local && active_capture {
+        true
+    } else {
+        probe_online(last_heartbeat_epoch_s, now_epoch_s)
+    }
+}
+
 fn probe_value(state: &AppState, record: &ProbeRecord) -> Value {
     let packets = state
         .inner
@@ -1107,8 +1125,17 @@ fn probe_value(state: &AppState, record: &ProbeRecord) -> Value {
         .then(|| measured_local_heartbeat_epoch_s(state))
         .flatten();
     let last_heartbeat_epoch_s = record.last_heartbeat_epoch_s.max(measured);
-    let online = probe_online(last_heartbeat_epoch_s, epoch_seconds());
-    let lifecycle = if last_heartbeat_epoch_s.is_none() {
+    // 2.9.3-fu1 (devmat #9) : porte unifiée via probe_is_reachable —
+    // voir doc sur la fonction. Pour le local, `active.state.active()`
+    // suffit à affirmer que la sonde répond.
+    let active_capture = active.map(|job| job.state.active()).unwrap_or(false);
+    let online = probe_is_reachable(
+        local,
+        active_capture,
+        last_heartbeat_epoch_s,
+        epoch_seconds(),
+    );
+    let lifecycle = if last_heartbeat_epoch_s.is_none() && !online {
         "PENDING"
     } else if online {
         "ONLINE"
@@ -4249,6 +4276,27 @@ mod tests {
         )
         .await;
         assert!(value["data"][0]["last_heartbeat_epoch_s"].is_null());
+    }
+
+    /// 2.9.3-fu1 (devmat #9) : le local vProbe était reporté `online=false`
+    /// alors que `capture_state=CAPTURING` — parce que le calcul ne lisait
+    /// que `last_heartbeat_epoch_s`, et sur un flux lent `last_packet_epoch_ms`
+    /// peut dépasser la fenêtre 15 s. Avec `probe_is_reachable`, le local +
+    /// capture active implique `online=true` par définition.
+    #[test]
+    fn probe_is_reachable_asserts_local_capturing_probe_online_regardless_of_heartbeat() {
+        // local + active → online even with no heartbeat at all
+        assert!(probe_is_reachable(true, true, None, 1000));
+        // local + active → online even when the last heartbeat is ancient
+        assert!(probe_is_reachable(true, true, Some(0), 1000));
+        // local + inactive → fall back to heartbeat window (same as before)
+        assert!(!probe_is_reachable(true, false, None, 1000));
+        assert!(!probe_is_reachable(true, false, Some(0), 1000));
+        assert!(probe_is_reachable(true, false, Some(990), 1000));
+        // distant probe NEVER gets the local short-circuit — heartbeat only
+        assert!(!probe_is_reachable(false, true, None, 1000));
+        assert!(!probe_is_reachable(false, true, Some(0), 1000));
+        assert!(probe_is_reachable(false, false, Some(990), 1000));
     }
 
     #[tokio::test]

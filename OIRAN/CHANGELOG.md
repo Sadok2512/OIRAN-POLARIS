@@ -1,5 +1,96 @@
 # Changelog
 
+## OIRAN API 2.9.3 follow-up #1 — 2026-11-08 — Observed-technology count + local vProbe reachability (devmat night sprint)
+
+### Analyzer top-bar — show every technology with its dataset count
+
+2.9.2-fu2 hid `UNKNOWN` from the top-bar aggregate; devmat reverses :
+rien de caché, chaque technologie observée est affichée avec son compte
+de datasets. UNKNOWN passe en fin pour la lisibilité.
+
+- **`apps/web/src/layouts/AppShell.tsx`** : nouveau `techCounts` dérivé
+  des datasets, puis `observedParts` triés (UNKNOWN last) et formatés :
+  * 1 dataset d'une tech → `"5G SA"`.
+  * N ≥ 2 datasets → `"5G SA (N)"`.
+  * UNKNOWN → `"N dataset UNKNOWN"` (singulier) ou `"N datasets UNKNOWN"`.
+- Séparateur ` · ` (middot) remplace ` / ` (barre oblique) pour aligner
+  avec le libellé `vProbe not connected · <health> · <telemetry>`.
+- Exemple ANR2 : `Observed: 5G SA · 1 dataset UNKNOWN`.
+
+### Backend — local vProbe online quand une capture tourne
+
+ANR2 observait `online=false` + `capture_state=CAPTURING` sur
+`oiran-vprobe-local-01`. Cause prouvée :
+
+- `apps/api/src/lib.rs:1084-1089` (`probe_online`) teste uniquement
+  `last_heartbeat_epoch_s` contre une fenêtre 15 s.
+- Pour le local, `last_heartbeat_epoch_s = record.last_heartbeat_epoch_s
+  .max(measured)` où `measured = measured_local_heartbeat_epoch_s(state)`
+  tire son chiffre de `job.metrics.last_packet_epoch_ms` /
+  `last_ingested_epoch_ms`.
+- Sur un flux lent (ex : premières secondes d'une capture, inter-trame
+  > 15 s), `measured` sort de la fenêtre et `online=false` — alors
+  même que le binaire répond à `GET /probes` à l'instant même.
+
+**Fix** — nouvelle fonction pure `probe_is_reachable(local,
+active_capture, last_heartbeat_epoch_s, now_epoch_s)` (lib.rs:1092) :
+
+```
+if local && active_capture {
+    true   // le local vProbe EST le processus API — il répond,
+           // donc il est joignable par définition
+} else {
+    probe_online(last_heartbeat_epoch_s, now_epoch_s)  // inchangé
+}
+```
+
+Le local court-circuit n'est accordé QUE si `active.state.active()`
+(`Starting | Capturing | Stopping | Processing`). Sondes distantes :
+porte battement 15 s inchangée. Le `lifecycle` passe de `PENDING`
+quand `last_heartbeat.is_none()` ET `!online` (pré-correction : seul
+`.is_none()` suffisait, cassant la cohérence avec la nouvelle règle).
+
+**Test** — `probe_is_reachable_asserts_local_capturing_probe_online_regardless_of_heartbeat`
+(8 assertions couvrant local+active ± heartbeat, local+inactive,
+distant+active, distant+inactive).
+
+### T2 — toujours OUVERT en attente ANR2
+
+Mesures attendues sur #9 pour la version 2.9.4 : taille par interface,
+champs les plus lourds, doublons `decode_reports`/`checksums` event vs
+dataset. Aucun code T2 ici.
+
+### Tests
+
+- `cargo test --workspace --locked --release --offline --no-fail-fast`
+  → **408 passed, 0 failed, 4 ignored** (baseline 407 + 1 nouveau test
+  `probe_is_reachable_asserts_local_capturing_probe_online_regardless_of_heartbeat`).
+- `vitest run` — **94 passed / 14 files** (baseline 93 + 1 nouveau test
+  `pluralises UNKNOWN count and aggregates per-technology counts` ;
+  le scénario UNKNOWN-filter précédent est reformulé pour le nouveau
+  comportement).
+- `tsc -b --pretty false` → exit 0.
+- `vite build` → `dist/assets/*.js` contient `2.9.3` (byte-sync
+  avec package.json).
+
+### SemVer
+
+| Composant | Avant | Après |
+|---|---|---|
+| `apps/web` | 2.9.2 | **2.9.3** |
+| `apps/api` | 2.9.3 | 2.9.3 (même bundle que `8d7dfd3`) |
+| `callflow-schema` | 1.3.1 | 1.3.1 |
+| `live-probe` | 0.4.20 | 0.4.20 |
+
+### Compat
+
+- `rustc 1.75` (min workspace) et `rustc 1.83` (serveur) OK. Aucun
+  feature nightly.
+- `probe_online` conserve sa signature publique inchangée — le fix est
+  additif via `probe_is_reachable`. Tout consommateur externe (s'il
+  existait) continue de fonctionner.
+
+
 ## OIRAN API 2.9.3 — 2026-11-07 — Analyzer footer version read from package.json (devmat T1)
 
 ### Proven cause — `web 2.9.0` on an otherwise 2.9.1 Analyzer bundle

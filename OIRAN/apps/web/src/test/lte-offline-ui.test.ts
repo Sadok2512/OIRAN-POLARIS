@@ -7,7 +7,10 @@ describe('LTE offline Analyzer contract', () => {
   it('keeps LTE availability evidence-driven and exposes all offline planes', () => {
     expect(sessionExplorer).toContain("hasObservedLte?'LTE · observed dataset':'LTE · no observed dataset'");
     expect(sessionExplorer).not.toContain('LTE · Prepared (synthetic only)');
-    expect(appShell).toContain('observedTechnologies');
+    // 2.9.3-fu1 : `observedTechnologies` → `observedParts` + `techCounts`
+    // (format par-tech count-aware, UNKNOWN affiché en fin).
+    expect(appShell).toContain('observedParts');
+    expect(appShell).toContain('techCounts');
     expect(appShell).not.toContain('LTE · Prepared (synthetic only)');
     for (const plane of ['S1-MME', 'S11', 'S1-U']) expect(sessionExplorer).toContain(plane);
   });

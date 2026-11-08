@@ -63,7 +63,7 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-describe('Analyzer version footer (2.9.3)', () => {
+describe('Analyzer version footer (2.9.3 follow-up #1)', () => {
   it('shows BOTH the web bundle version and the backend API version', async () => {
     renderFooter();
     const footer = screen.getByTestId('version-footer');
