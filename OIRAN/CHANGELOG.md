@@ -1,5 +1,95 @@
 # Changelog
 
+## OIRAN API 2.9.13 — 2026-11-08 — Replay ANR2 réel + wire-identity dedup strict + repair wire-dupes (devmat, ANR2 #9 comments 6727624063 + 6727243545)
+
+### Contexte — deux défauts à fermer sur preuves réelles
+
+**A.** ANR2 #9 comment 6727624063 : sur le run POLARIS
+`tpl-small-traffic-d64ae14da40f`, session
+`5g-session-5c8583f0ec45a402`, SBI↔N2 et SBI↔N4 OUVERT malgré tuple
+exact `(PDU 1, IP 10.77.22.13, TEID 0x855a)` dans SBI, N2 et N4.
+
+**B.** ANR2 #9 comment 6727243545 : 24 doublons wire-réels (dont 8
+post-2.8.3) persistent. Le `--dry-run` du repair retire 10 804
+événements mais ne couvre que 10 des 48 event_ids.
+
+### T1 — A : rejet fichier:ligne + replay événements réels
+
+Cause en 2.9.11 : `correlation-engine/src/lib.rs::tunnel_keys`
+(`:525-558` pré-2.9.12) itérait UNIQUEMENT sur
+`event.information_elements`. L'événement SBI
+`evt-e3ba85330bd40ee8` publie son tuple sous
+`session_identifiers` (pas d'IE composée). `sbi_tunnels` → vide
+→ loop `:316` ne traverse jamais la clé → aucun
+`sbi-n2-tunnel-match` / `sbi-n4-tunnel-match` produit.
+
+Le fallback 2.9.12 (`tunnel_keys:570-594`) lit les
+`session_identifiers` ; 2.9.13 ajoute le **test de replay** avec
+les event_ids RÉELS publiés par ANR2 :
+`replay_anr2_run_5c8583f0_sbi_n2_n4_exact_2_9_13`
+(`correlation-engine/src/lib.rs`) rejoue
+`evt-e7a10f2d4f63afc1` (N2), `evt-4f185dfa624f2b78` (N4),
+`evt-e3ba85330bd40ee8` (SBI IE vide, identifiers seuls) →
+SBI↔N2 + SBI↔N4 + N2↔N4 tous **EXACT**.
+
+### T2 — B : chemin d'émission fichier:ligne
+
+Cause TODAY (post-2.9.10) : `continuous_observation_id`
+(`live-probe/src/lib.rs:7096-7161` pré-2.9.13) incluait
+`raw_payload_reference` + `message_type` dans la clé wire. ANR2
+a prouvé que :
+
+- `raw_payload_reference` est un SHA du payload DÉCODÉ ; deux
+  décodes du même paquet wire peuvent produire des slices
+  subtilement différents (padding AVP, longueur optionnelle) →
+  SHA différent → clés divergentes → dupe non fusionné.
+- `is_duplicate` (`live-probe/src/lib.rs:634-644`), défini en
+  2.9.5 avec la règle ANR2 EXACTE `(capture_id, packet_number,
+  byte_offset, protocol, message_name)`, n'était appelé QUE par
+  les tests — aucun usage production.
+
+2.9.13 réécrit `continuous_observation_id` (`:7096-7165`) sur
+l'identité wire ANR2 pure :
+- `capture_id`
+- Premier `packet_reference` trié (`source_file, packet_number,
+  byte_offset, interface_id`)
+- `protocol` + `message_name` (string, pas `message_type`)
+- Discriminant agrégat (keepalive, N3-flow) pour éviter toute
+  collision entre agrégats et individuels sur le même paquet-ancre.
+
+Test `continuous_observation_id_dedupes_anr2_24_wire_duplicates_2_9_13`
+(`live-probe/src/lib.rs`) :
+- Deux décodes du même paquet wire avec
+  `raw_payload_reference` DIFFÉRENTS → **même**
+  `continuous_observation_id`.
+- NGAP + NAS-5GMM enfant sur même paquet → deux identités
+  distinctes (comportement attendu).
+
+### T3 — B : repair tool wire-dupes
+
+Nouvelle phase dans
+`CaptureManager::repair_partial_imports`
+(`live-probe/src/lib.rs:4246-4310`) : après la passe
+partial-import + sort canonique, dedup strict par identité wire
+ANR2. First-write-wins ; les suivants rejoignent `removed` avec
+reason `wire-duplicate-superseded`.
+
+Test `repair_partial_imports_removes_wire_duplicates_anr2_2_9_13`
+(`live-probe/src/lib.rs`) : réplique deux groupes réels ANR2
+(NGAP UplinkNASTransport + NAS-5GMM Protected 5GMM message,
+packet 23, offset 3908) + témoin sur paquet 24. Résultat :
+`event_count_before=5, event_count_after=3, wire-duplicate-superseded×2`.
+
+### T4 — Tests
+
+**437 PASS**, 0 FAIL, 4 ignored (+3 vs 2.9.12). Tous les tests
+2.9.7..2.9.12 restent VERT.
+
+### Versions
+
+- `live-probe` 0.4.24 → 0.4.25
+- `oiran-api` 2.9.12 → 2.9.13
+
 ## OIRAN API 2.9.12 — 2026-11-08 — tunnel_keys fallback session_identifiers (devmat, ANR2 #9 comment 6727624063)
 
 ### Contexte — SBI encore OUVERT sur run réel 2.9.9

@@ -1878,6 +1878,91 @@ mod tests {
         );
     }
 
+    /// 2.9.13 (#9 comment 6727624063) — Replay exact ANR2 des
+    /// événements publiés sur le run POLARIS
+    /// `tpl-small-traffic-d64ae14da40f`, session
+    /// `5g-session-5c8583f0ec45a402`. Avant 2.9.12, le chemin
+    /// rejeté était `correlation-engine/src/lib.rs:526-530` :
+    /// `tunnel_keys` itérait uniquement sur
+    /// `event.information_elements`. L'événement SBI publie son
+    /// tuple sous `session_identifiers` (`:68-69` session-engine
+    /// parse-event) ; `information_elements[*].value` ne portait
+    /// pas la forme composée `tunnel_endpoint_ip=…,gtp_teid=…`.
+    /// → `sbi_tunnels` vide → `sbi-n2-tunnel-match` jamais produit
+    /// (loop `:316` entre dans le `for` avec `sbi_tunnels.is_empty()`).
+    ///
+    /// Le fallback 2.9.12 (tunnel_keys :570-586) lit les
+    /// `session_identifiers` ; le test ci-dessous rejoue les IDs
+    /// RÉELS publiés par ANR2 (`evt-e3ba85330bd40ee8`,
+    /// `evt-e7a10f2d4f63afc1`, `evt-4f185dfa624f2b78`) et prouve
+    /// SBI↔N2 + SBI↔N4 EXACT.
+    #[test]
+    fn replay_anr2_run_5c8583f0_sbi_n2_n4_exact_2_9_13() {
+        // N2 PDUSessionResourceSetupRequest — fields recopiés de
+        // ANR2 #9 6727624063. L'IE N2 porte tunnel_ip_ul +
+        // gtp_teid_ul (pattern directional handled by
+        // directional_tunnel_components :490-519).
+        let n2 = e(
+            "evt-e7a10f2d4f63afc1",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            1,
+            &[("pdu_session_id", "1")],
+            json!([
+                {"name":"UL NG-U UP TNL Information",
+                 "value":"tunnel_ip_ul=10.77.22.13,gtp_teid_ul=0x855a"}
+            ]),
+        );
+        // N4 PFCP Session Establishment Response — F-TEID padding
+        // 8 hex digits (`0x0000855a`). normalize_teid déplie via
+        // event_schema::normalize_teid_hex.
+        let n4 = e(
+            "evt-4f185dfa624f2b78",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            2,
+            &[("pfcp_sequence", "1")],
+            json!([
+                {"name":"F-TEID",
+                 "value":"teid=0x0000855a,v4=true,v6=false,ipv4=10.77.22.13"}
+            ]),
+        );
+        // SBI N1N2MessageTransfer — IE vide. Tuple TEID/IP
+        // UNIQUEMENT dans session_identifiers. Ce shape est
+        // exactement ce qu'ANR2 a mesuré en production.
+        let sbi = e(
+            "evt-e3ba85330bd40ee8",
+            "SBI",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            3,
+            &[
+                ("pdu_session_id", "1"),
+                ("tunnel_endpoint_ip", "10.77.22.13"),
+                ("gtp_teid", "0x855a"),
+            ],
+            // Aucune IE composée. Prouve que le fallback 2.9.12
+            // via session_identifiers est le seul chemin viable.
+            json!([]),
+        );
+        let edges = correlate_cross_interface_evidence(&[n2, n4, sbi]);
+        let rules: Vec<&str> = edges.iter().map(|e| e.rule_id.as_str()).collect();
+        assert!(
+            rules.contains(&"ngap-pfcp-exact-tunnel"),
+            "N2↔N4 EXACT sur fields réels ANR2 ; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"sbi-n2-tunnel-match"),
+            "SBI↔N2 EXACT sur `evt-e3ba85330bd40ee8` via fallback session_identifiers ; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"sbi-n4-tunnel-match"),
+            "SBI↔N4 EXACT sur `evt-e3ba85330bd40ee8` via fallback session_identifiers ; rules={rules:?}"
+        );
+    }
+
     /// 2.9.12 (#9 comment 6727624063) — ANR2 a prouvé sur le run
     /// POLARIS `tpl-small-traffic-d64ae14da40f` que le SBI
     /// `N1N2MessageTransfer` publie son tuple `(tunnel_endpoint_ip,
