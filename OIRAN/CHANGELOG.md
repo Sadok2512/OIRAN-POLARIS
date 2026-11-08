@@ -1,5 +1,69 @@
 # Changelog
 
+## OIRAN API 2.9.12 — 2026-11-08 — tunnel_keys fallback session_identifiers (devmat, ANR2 #9 comment 6727624063)
+
+### Contexte — SBI encore OUVERT sur run réel 2.9.9
+
+ANR2 a publié sur #9 comment 6727624063 une preuve matérielle
+sur le run POLARIS `tpl-small-traffic-d64ae14da40f` (63/63 PASS),
+session OIRAN `5g-session-5c8583f0ec45a402` :
+
+- N2↔N4 : **EXACT ×2**
+- N4↔N3 : **EXACT ×2**
+- SBI↔N2 : **OUVERT**
+- SBI↔N4 : **OUVERT**
+
+Pourtant le tuple (PDU 1, IP 10.77.22.13, TEID 0x855a) est
+présent EXACTEMENT dans les trois événements :
+
+- SBI `N1N2MessageTransfer evt-e3ba85330bd40ee8` :
+  `pdu_session_id=1, tunnel_endpoint_ip=10.77.22.13, gtp_teid=0x855a`.
+- N2 `PDUSessionResourceSetupRequest evt-e7a10f2d4f63afc1` :
+  `pdu_session_id=1, tunnel_ip_ul=10.77.22.13, gtp_teid_ul=0x855a`.
+- N4 `PFCP Session Establishment Response evt-4f185dfa624f2b78` :
+  F-TEID `0x0000855a` / IPv4 `10.77.22.13`.
+
+### T1 — Cause fichier:ligne
+
+`correlation-engine/src/lib.rs::tunnel_keys` 2.9.9 lisait
+UNIQUEMENT `event.information_elements[*].value`. Pour le run
+ANR2, l'événement SBI publie son tuple TEID/IP comme
+**session_identifiers** (visibles dans `.session_identifiers[]`),
+pas comme IE composée. La clé n'était donc jamais extraite côté
+SBI → `sbi-n2-tunnel-match` / `sbi-n4-tunnel-match` jamais
+produits. Les règles N2↔N4 fonctionnaient car les deux plans
+publient le tuple dans leurs IEs composées.
+
+### T2 — Fix : fallback session_identifiers
+
+`correlation-engine/src/lib.rs::tunnel_keys` 2.9.12 (`:525-586`) :
+après l'extraction depuis les IEs, si `event.first_identifier(
+"tunnel_endpoint_ip")` + `event.first_identifier("gtp_teid")`
+existent, dériver une clé supplémentaire avec la même
+normalisation `event_schema::normalize_ip` +
+`event_schema::normalize_teid_hex`. `keys.dedup()` élimine toute
+duplication si l'IE ET les identifiers portaient déjà le même
+tuple.
+
+### T3 — Tests
+
+- `sbi_tunnel_match_reads_session_identifiers_shape_anr2_6727624063` :
+  reproduit le shape ANR2 exact. SBI event avec
+  `session_identifiers` seuls (pas d'IE `N2 UL NG-U UP TNL
+  Information`) + N2 avec IE `tunnel_ip_ul=10.77.22.13,gtp_teid_ul=0x855a`
+  + N4 avec F-TEID `0x0000855a` → SBI↔N2 EXACT + SBI↔N4 EXACT.
+- `sbi_tunnel_match_fail_closed_when_session_identifiers_teid_differs_2_9_12` :
+  SBI identifiers avec TEID `0x855b` (≠ `0x855a`) → 0 arête SBI,
+  N2↔N4 reste EXACT (fail-closed préservé).
+
+**434 PASS**, 0 FAIL, 4 ignored (+2 vs 2.9.11). Tous les tests
+2.9.7/2.9.8/2.9.9/2.9.10/2.9.11 restent VERT.
+
+### Versions
+
+- `correlation-engine` 0.6.2 → 0.6.3 (fallback session_identifiers)
+- `oiran-api` 2.9.11 → 2.9.12
+
 ## OIRAN API 2.9.11 — 2026-11-08 — SCTP retransmit count-preserving (devmat, ANR2 #9 comment 6727243545)
 
 ### Contexte — ANR2 a quantifié la perte segmentaire

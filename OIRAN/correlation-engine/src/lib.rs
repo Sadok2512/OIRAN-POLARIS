@@ -523,7 +523,7 @@ fn directional_tunnel_components(value: &str) -> Vec<(String, String)> {
 }
 
 fn tunnel_keys(event: &EventRecord) -> Vec<TunnelCorrelationKey> {
-    let mut keys = event
+    let mut keys: Vec<TunnelCorrelationKey> = event
         .information_elements
         .as_array()
         .into_iter()
@@ -556,7 +556,31 @@ fn tunnel_keys(event: &EventRecord) -> Vec<TunnelCorrelationKey> {
                 })
                 .collect::<Vec<_>>()
         })
-        .collect::<Vec<_>>();
+        .collect();
+
+    // 2.9.12 (#9 comment 6727624063) : ANR2 a prouvé sur le run
+    // `tpl-small-traffic-d64ae14da40f` que le SBI publie
+    // `tunnel_endpoint_ip` et `gtp_teid` comme
+    // **session_identifiers** (pas comme IE composée). L'extraction
+    // IE-only manquait donc la clé pour SBI même avec normalisation
+    // TEID/IP 2.9.9 appliquée. Fallback : si `session_identifiers`
+    // porte le tuple (`tunnel_endpoint_ip`, `gtp_teid`), on en
+    // dérive directement une clé — même règle de normalisation IP
+    // + TEID.
+    let session_ip = event
+        .first_identifier("tunnel_endpoint_ip")
+        .map(event_schema::normalize_ip);
+    let session_teid = event
+        .first_identifier("gtp_teid")
+        .and_then(normalize_teid);
+    if let (Some(ip), Some(teid)) = (session_ip, session_teid) {
+        keys.push(TunnelCorrelationKey {
+            endpoint_ip: ip,
+            teid,
+            capture_id: capture_scope(event),
+        });
+    }
+
     keys.sort();
     keys.dedup();
     keys
@@ -1852,6 +1876,125 @@ mod tests {
             rules.contains(&"sbi-n4-tunnel-match"),
             "SBI↔N4 must emit EXACT on real ANR2 shapes; rules={rules:?}"
         );
+    }
+
+    /// 2.9.12 (#9 comment 6727624063) — ANR2 a prouvé sur le run
+    /// POLARIS `tpl-small-traffic-d64ae14da40f` que le SBI
+    /// `N1N2MessageTransfer` publie son tuple `(tunnel_endpoint_ip,
+    /// gtp_teid)` uniquement comme **session_identifiers**
+    /// (`pdu_session_id=1, tunnel_endpoint_ip=10.77.22.13,
+    /// gtp_teid=0x855a`). `tunnel_keys` 2.9.9 ne lisait que les IEs
+    /// composées ⇒ l'extraction échouait sur ce shape réel.
+    ///
+    /// Fallback 2.9.12 : si les `session_identifiers` portent
+    /// `tunnel_endpoint_ip` + `gtp_teid`, ils dérivent une clé avec
+    /// la même normalisation IP/TEID. Test prouve SBI↔N2 +
+    /// SBI↔N4 EXACT sur ce shape, et le fail-closed sur TEID ≠.
+    #[test]
+    fn sbi_tunnel_match_reads_session_identifiers_shape_anr2_6727624063() {
+        let n2 = e(
+            "evt-e7a10f2d4f63afc1",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            1,
+            &[
+                ("pdu_session_id", "1"),
+                ("tunnel_endpoint_ip", "10.77.22.13"),
+                ("gtp_teid", "0x855a"),
+            ],
+            json!([
+                {"name":"UL NG-U UP TNL Information",
+                 "value":"tunnel_ip_ul=10.77.22.13,gtp_teid_ul=0x855a"}
+            ]),
+        );
+        let n4 = e(
+            "evt-4f185dfa624f2b78",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            2,
+            &[("pfcp_sequence", "1")],
+            // ANR2 réel : F-TEID padding 8 hex, pattern 2.9.9
+            // handled by shared `normalize_teid`.
+            json!([
+                {"name":"F-TEID",
+                 "value":"teid=0x0000855a,v4=true,v6=false,ipv4=10.77.22.13"}
+            ]),
+        );
+        let sbi = e(
+            "evt-e3ba85330bd40ee8",
+            "SBI",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            3,
+            // 2.9.12 — tuple carried ONLY as session_identifiers.
+            // Pas d'IE composée `N2 UL NG-U UP TNL Information`
+            // dans ce shape : prouve que le fallback 2.9.12 trouve
+            // la clé via `session_identifiers`.
+            &[
+                ("pdu_session_id", "1"),
+                ("tunnel_endpoint_ip", "10.77.22.13"),
+                ("gtp_teid", "0x855a"),
+            ],
+            json!([]),
+        );
+        let edges = correlate_cross_interface_evidence(&[n2, n4, sbi]);
+        let rules: Vec<&str> = edges.iter().map(|e| e.rule_id.as_str()).collect();
+        assert!(
+            rules.contains(&"ngap-pfcp-exact-tunnel"),
+            "N2↔N4 EXACT (shape 2.9.12) ; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"sbi-n2-tunnel-match"),
+            "SBI↔N2 EXACT via session_identifiers fallback ; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"sbi-n4-tunnel-match"),
+            "SBI↔N4 EXACT via session_identifiers fallback ; rules={rules:?}"
+        );
+    }
+
+    /// 2.9.12 — négatif : SBI session_identifiers avec TEID ≠
+    /// doit rester fail-closed (0 arête SBI↔N*).
+    #[test]
+    fn sbi_tunnel_match_fail_closed_when_session_identifiers_teid_differs_2_9_12() {
+        let n2 = e(
+            "evt-n2",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            1,
+            &[],
+            json!([{"value":"tunnel_endpoint_ip=10.77.22.13,gtp_teid=0x855a"}]),
+        );
+        let n4 = e(
+            "evt-n4",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            2,
+            &[],
+            json!([{"name":"F-TEID",
+                    "value":"teid=0x0000855a,v4=true,v6=false,ipv4=10.77.22.13"}]),
+        );
+        let sbi = e(
+            "evt-sbi",
+            "SBI",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            3,
+            &[
+                ("tunnel_endpoint_ip", "10.77.22.13"),
+                ("gtp_teid", "0x855b"),  // TEID + 1
+            ],
+            json!([]),
+        );
+        let edges = correlate_cross_interface_evidence(&[n2, n4, sbi]);
+        let rules: Vec<&str> = edges.iter().map(|e| e.rule_id.as_str()).collect();
+        assert!(rules.contains(&"ngap-pfcp-exact-tunnel"));
+        assert!(!rules.contains(&"sbi-n2-tunnel-match"));
+        assert!(!rules.contains(&"sbi-n4-tunnel-match"));
     }
 
     /// 2.9.9 (#9 comment 6725858177) — scénario ANR2 réel sur
