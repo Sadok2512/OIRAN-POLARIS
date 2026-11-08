@@ -1,5 +1,212 @@
 # Changelog
 
+## OIRAN API 2.9.6 — 2026-11-08 — Réparation pcapng + cause S6a (devmat T1/T2 — ANR2 #10 comment 6724120812, #9 comment 6724013622)
+
+### T1 — Cause prouvée : `prefix_sha_index` ignorait pcapng
+
+**Preuve ANR2** (`#10` comment 6724120812) :
+
+```
+/opt/oiran/bin/dataset-repair-partial-imports /var/lib/oiran/captures \
+  --dry-run --source-root /var/lib/docker/volumes/oiran_lab_pcap/_data
+
+event_count_before=1275902
+event_count_after=1275902
+partial_import_groups=1075
+unresolved_groups=6
+removed_events=0
+```
+
+- `0` groupes résolus avec plusieurs snapshots.
+- `_00067` : **3 singletons seulement** (N4, SBI, Sxa/Sxb), pas ×7.
+- 6 groupes N4 restent `UNRESOLVED_NO_EVIDENCE`.
+
+**Cause fichier:ligne** — `live-probe/src/lib.rs:7489-7504` (pré-2.9.6) :
+
+```rust
+let little = matches!(
+    &header[..4],
+    [0xd4, 0xc3, 0xb2, 0xa1] | [0x4d, 0x3c, 0xb2, 0xa1]
+);
+let big = matches!(&header[..4], [0xa1, 0xb2, 0xc3, 0xd4]);
+if !little && !big {
+    // Non-pcap bytes: `full_sha_hex` is set, no prefixes.
+    return Ok(PrefixIndex { ..., prefix_sha: BTreeMap::new() });
+}
+```
+
+`prefix_sha_index` ne reconnaissait que **pcap classique** (magic
+`D4 C3 B2 A1` / `4D 3C B2 A1` / `A1 B2 C3 D4`). Sur **pcapng** (magic
+`0A 0D 0D 0A`), la fonction tombait dans la branche `!little && !big`,
+retournait `prefix_sha = {}` (vide), et aucun snapshot ne pouvait
+matcher par préfixe. Les 7 snapshots de `_00067` ingérés en 2.9.2 ne
+pouvaient jamais être regroupés → tous en singletons, puis
+`UNRESOLVED_NO_EVIDENCE` sur les 6 groupes sans `state.segments`
+fallback.
+
+Dumpcap de production écrit en pcapng (confirmé par `grep -l '^.pcap$'`
+→ aucun, tous les segments sont `.pcapng`). Le test existant
+`repair_partial_imports_rebuilds_full_history_via_prefix_sha_match`
+utilise un pcap classique fabriqué — il passait, masquant le bug.
+
+**Correctif** — `live-probe/src/lib.rs:7466-7553+` :
+
+- `prefix_sha_index` détecte désormais le magic pcapng
+  `[0x0a, 0x0d, 0x0d, 0x0a]` et dispatch vers
+  `prefix_sha_index_pcapng` (nouvelle fonction).
+- `prefix_sha_index_pcapng` lit l'endianness via le Byte-Order Magic
+  dans le SHB (`0x1A 0x2B 0x3C 0x4D` big-endian /
+  `0x4D 0x3C 0x2B 0x1A` little-endian).
+- Walk des blocks pcapng (type + total_length + body + trailer).
+  Snapshot SHA à la fin de chaque **Enhanced Packet Block (type
+  `0x00000006`)** et **Simple Packet Block (type `0x00000003`)**.
+- Comportement inchangé pour pcap classique.
+
+**Test** — `prefix_sha_index_walks_pcapng_enhanced_packet_blocks`
+(`live-probe/src/lib.rs:tests`) : fabrique un pcapng minimal
+(SHB + IDB + 2 EPBs), vérifie :
+
+- `full_packet_count == 2` ;
+- `full_bytes == 120` (28 + 20 + 36 + 36) ;
+- `prefix_sha.len() == 1` (SHA après EPB1 ; SHA après EPB2 == full,
+  retiré par convention) ;
+- entrée `(packet_count=1, bytes_at_snapshot=84)`.
+
+Projection production : après déploiement 2.9.6, le --dry-run sur le
+même `/var/lib/oiran/captures` doit retrouver les 7 snapshots de
+`_00067` groupés par préfixe-SHA (`PrefixShaMatchFreshImport`).
+Attendu `partial_import_groups` ≈ 1075 − 7×3 + 3 (= 1057) avec les
+3 groupes `_00067` couvrant 7 snapshots chacun. `removed_events`
+non-zéro.
+
+**Mesure à valider par ANR2** après déploiement :
+
+```sh
+/opt/oiran/bin/dataset-repair-partial-imports /var/lib/oiran/captures \
+  --dry-run --source-root /var/lib/docker/volumes/oiran_lab_pcap/_data
+# attendu : partial_import_groups résolus > 0, unresolved_groups = 0,
+# _00067 groupé en PrefixShaMatchFreshImport ×3 (N4 / SBI / Sxab).
+```
+
+### T2 — Écart S6a 3502 messages : cause prouvée partielle
+
+**Preuve ANR2** (`#9` comment 6724013622 + `#10` comment 6724120812) :
+
+- Sur les **181** segments avec aggregates 2.9.5 :
+  - PCAP : **88 000** messages = 44 002 DWR + 43 998 DWA.
+  - Aggregates : **84 498** messages = 42 239 req + 42 259 resp.
+  - **Écart : 3 502 messages** sur 180 segments.
+- **177** segments historiques (ingérés pré-2.9.5) ne contiennent
+  AUCUN aggregate 2.9.5 et portent **86 600** messages individuels
+  dans le JSONL (écart avec PCAP = 5 430).
+
+**Cause prouvée partielle** — triple contribution :
+
+1. **Segments historiques pré-2.9.5 non ré-agrégés** (177 segments,
+   86 600 msg) : ingérés AVANT le déploiement du `KeepaliveAggregator`
+   de 2.9.5. Leurs events keepalive sont dans le JSONL en
+   individuels. Attendu — l'aggregator n'ingère pas rétroactivement.
+   Correctif : `dataset-repair-partial-imports --rewrite-keepalives`
+   est un chantier futur ; pas inclus dans 2.9.6 (hors scope).
+2. **Sur les 181 segments 2.9.5** : 3 502 messages dans PCAP absents
+   des aggregates. Deux candidates non-prouvables sans
+   `decode_reports` par segment :
+   - **Rejets SCTP** sur transitions d'association (INIT, COOKIE_ECHO)
+     qui incrémentent `incomplete_sctp` sans événement. Visible via
+     `jq '.decode_reports[].sctp_errors + .decode_reports[].incomplete_sctp'`.
+   - **Fenêtre d'agrégat split cross-segment** : un DWR à la fin du
+     segment N et son DWA au début de N+1 se retrouvent dans deux
+     aggregates différents (2 paires `request_count=1,
+     response_count=0` + `request_count=0, response_count=1`
+     respectivement). Le `aggregate_failure_count` capture le
+     déséquilibre, mais l'IE `message_count` ne compte pas les
+     réponses « tardives » du segment N comme requêtes.
+3. **Non-DWR/DWA Diameter** (ex : CER/CEA, DPR/DPA) : 148 msg sur
+   S6a total (174 742 diameter − 174 594 watchdog). Ces messages
+   passent à travers `classify_keepalive` → individuels. Attendu.
+
+**Clé d'agrégat inchangée** `(interface, kind, pair_low, pair_high)` :
+preuve conservée. Les 2 paires observées sur chaque segment S6a
+(`69c65c:68f82c` et `51896f:3f5587` SHA-tronqués) reflètent deux
+associations Diameter distinctes du serveur S6a — pas un défaut
+d'agrégation.
+
+**Pas de correctif 2.9.6** sur T2 — la cause est documentée et
+structurelle (cross-segment boundary). Un éventuel correctif
+nécessiterait un aggregator qui survive à la frontière entre segments
+(carry-over state entre `decode_capture_streaming` calls), ce qui
+casserait la propriété « 1 aggregate par segment / fail-closed »
+conservée depuis `N3FlowAggregator`. **OUVERT** : si ANR2 juge
+l'écart inacceptable, 2.9.7 peut implémenter un `DatasetKeepaliveRollup`
+en post-traitement.
+
+**Mesure diagnostique attendue d'ANR2** :
+
+```sh
+# Sur les 180 segments en écart, extraire SctpError + incomplete_sctp
+jq '.decode_reports | to_entries[] |
+   select(.key|test("^S6a\\.pcap-"; "i")) |
+   {segment: .key, incomplete_sctp: .value.incomplete_sctp,
+    sctp_errors: (.value.sctp_errors|length? // .value.sctp_errors)}' \
+  /var/lib/oiran/captures/continuous-lab-import/dataset/dataset_manifest.json |
+jq -s 'map(select(.incomplete_sctp > 0 or .sctp_errors > 0)) | length'
+# attendu > 0 si le candidat (rejet SCTP) est dominant
+```
+
+### Aucune régression
+
+- `correlation-engine` INCHANGÉ. `N2_N4 = 2 EXACT`, `N4_N3 = 2 EXACT`,
+  `N2_SBI = EXACT` sur `tpl-small-traffic-e2bea97912f9` — règles non
+  touchées.
+- `prefix_sha_index_pcapng` est un **chemin additif** : le pcap
+  classique conserve son code byte-for-byte, le test existant
+  `repair_partial_imports_rebuilds_full_history_via_prefix_sha_match`
+  passe inchangé (confirmé — même SHA des 7 prefix).
+- Aucune identité en clair. L'algorithme opère sur des SHA de bytes
+  bruts du fichier PCAP, jamais sur contenu subscriber.
+- Mémoire : O(packet_count) pour `prefix_sha` BTreeMap — même borne
+  qu'avant. Un pcapng de 1 M paquets coûte ~65 MB (clé 64-char +
+  valeur 16 B × 1M). Pas de régression vs pcap classique.
+- CPU : parcours linéaire 1×. Aucune accélération ni ralentissement.
+
+### SemVer
+
+| Composant | Avant | Après |
+|---|---|---|
+| `apps/api` | 2.9.5 | **2.9.6** |
+| `live-probe` | 0.4.21 | **0.4.22** |
+| `transport-sctp` | 0.1.0 | 0.1.0 |
+| `event-schema` | 1.5.1-dev | 1.5.1-dev |
+| `apps/web` | 2.9.3 | 2.9.3 |
+| `callflow-schema` | 1.3.1 | 1.3.1 |
+
+### Compat rustc
+
+- `rustc 1.75` (min workspace) et **`rustc 1.83`** (serveur) OK.
+- Aucun feature nightly, aucune nouvelle dependency.
+
+### Tests
+
+- `cargo test --workspace --locked --release --offline --no-fail-fast`
+  → **417 passed, 0 failed, 4 ignored** (baseline 416 + 1 nouveau
+  test pcapng).
+
+### Encore OUVERT
+
+- **T2 S6a 3 502 msg écart** : causes documentées (segments
+  pré-2.9.5 + cross-segment boundary + non-watchdog Diameter). Pas
+  de correctif 2.9.6. Diag ANR2 sollicité ; 2.9.7 possible si ANR2
+  juge inacceptable.
+- **SBI↔N4** : attend IE bruts d'un event SBI réel (#9 comment
+  6712678520). Le dernier run ANR2 (6724107216) n'a pas eu de PDU
+  établi — pas de trafic SBI exploitable.
+- **Doublons 22 collisions NGAP / NAS-5GMM** (#9 comment 6719453085) :
+  11 groupes `UplinkNASTransport`, 3 `InitialContextSetupRequest`,
+  8 `Protected 5GMM message`. Non prouvable sans le dataset brut ;
+  attend `event_id`s réels pour trancher si vrais doublons ou re-
+  décodage légitime.
+
+
 ## OIRAN API 2.9.5 — 2026-11-08 — Keepalive aggregation + duplicate rule + S1-MME fragmentation note (devmat T1/T2/T3 — ANR2 #9 comment 6714896530)
 
 ### Mesure ANR2 à l'entrée

@@ -7471,13 +7471,23 @@ fn prefix_sha_index(path: &Path) -> Result<PrefixIndex, String> {
     // best-effort and just builds the `prefix_sha` map for partial
     // snapshots; a non-pcap or truncated file still exposes a valid
     // `full_sha_hex` for the Full-SHA match path.
+    //
+    // 2.9.6 (devmat #9 T1 — ANR2 #10 comment 6724120812) : dumpcap de
+    // production écrit en **pcapng** (magic `0A 0D 0D 0A`), pas en
+    // pcap classique (`D4 C3 B2 A1`). Avant 2.9.6 cette fonction ne
+    // reconnaissait que pcap classique et retournait `prefix_sha = {}`
+    // sur tout fichier pcapng → les 7 snapshots de `_00067` n'étaient
+    // pas regroupés (0 matches, tous en singletons `unresolved`). On
+    // ajoute ici une branche pcapng dédiée qui marche les Blocks
+    // (SHB / IDB / EPB / SPB / …) et snapshote le SHA à la fin de
+    // chaque Enhanced/Simple Packet Block.
     let full_sha_hex = sha256_hex_file(path)?;
     let full_bytes = fs::metadata(path).map_err(display_error)?.len();
     let mut file = fs::File::open(path).map_err(display_error)?;
     let mut hasher = Sha256Hasher::new();
     let mut prefix_sha: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-    let mut header = [0u8; 24];
-    if file.read_exact(&mut header).is_err() {
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_err() {
         return Ok(PrefixIndex {
             path: path.to_path_buf(),
             full_sha_hex,
@@ -7486,14 +7496,26 @@ fn prefix_sha_index(path: &Path) -> Result<PrefixIndex, String> {
             prefix_sha,
         });
     }
-    hasher.update(&header);
-    let little = matches!(
-        &header[..4],
-        [0xd4, 0xc3, 0xb2, 0xa1] | [0x4d, 0x3c, 0xb2, 0xa1]
-    );
-    let big = matches!(&header[..4], [0xa1, 0xb2, 0xc3, 0xd4]);
+    hasher.update(&magic);
+    // pcapng : Section Header Block type == 0x0A 0x0D 0x0D 0x0A
+    // (byte pattern invariant across endianness — c'est une
+    // signature, pas un champ numérique).
+    if magic == [0x0a, 0x0d, 0x0d, 0x0a] {
+        return prefix_sha_index_pcapng(
+            path,
+            file,
+            hasher,
+            full_sha_hex,
+            full_bytes,
+            prefix_sha,
+        );
+    }
+    // pcap classique : magic 0xd4c3b2a1 (LE) / 0x4d3cb2a1 (nano LE)
+    // ou 0xa1b2c3d4 (BE).
+    let little =
+        matches!(&magic, [0xd4, 0xc3, 0xb2, 0xa1] | [0x4d, 0x3c, 0xb2, 0xa1]);
+    let big = matches!(&magic, [0xa1, 0xb2, 0xc3, 0xd4]);
     if !little && !big {
-        // Non-pcap bytes: `full_sha_hex` is set, no prefixes.
         return Ok(PrefixIndex {
             path: path.to_path_buf(),
             full_sha_hex,
@@ -7502,6 +7524,18 @@ fn prefix_sha_index(path: &Path) -> Result<PrefixIndex, String> {
             prefix_sha,
         });
     }
+    // Finir de lire le reste du header pcap (20 octets après le magic).
+    let mut rest_header = [0u8; 20];
+    if file.read_exact(&mut rest_header).is_err() {
+        return Ok(PrefixIndex {
+            path: path.to_path_buf(),
+            full_sha_hex,
+            full_packet_count: 0,
+            full_bytes,
+            prefix_sha,
+        });
+    }
+    hasher.update(&rest_header);
     let mut bytes_so_far: u64 = 24;
     let mut packet_number: u64 = 0;
     loop {
@@ -7538,6 +7572,159 @@ fn prefix_sha_index(path: &Path) -> Result<PrefixIndex, String> {
     }
     // The last packet-boundary snapshot equals the full-file digest;
     // remove it so the repair distinguishes Full vs Prefix.
+    prefix_sha.remove(&full_sha_hex);
+    Ok(PrefixIndex {
+        path: path.to_path_buf(),
+        full_sha_hex,
+        full_packet_count: packet_number,
+        full_bytes,
+        prefix_sha,
+    })
+}
+
+/// 2.9.6 (devmat #9 T1) : marche d'un pcapng pour construire
+/// `prefix_sha` à la fin de chaque Enhanced Packet Block (type
+/// `0x00000006`) et Simple Packet Block (type `0x00000003`).
+///
+/// Structure pcapng (RFC draft `pcap-ng-common`, section 3) :
+///
+/// ```text
+/// Section Header Block (SHB) :
+///   0-3   Block Type         = 0x0A 0x0D 0x0D 0x0A  (signature)
+///   4-7   Block Total Length (endianness dans le reste)
+///   8-11  Byte-Order Magic   = 0x1A 0x2B 0x3C 0x4D (BE) / 0x4D 0x3C 0x2B 0x1A (LE)
+///   12-13 Major Version      (= 1)
+///   14-15 Minor Version      (= 0)
+///   16-23 Section Length     (i64, -1 si inconnu)
+///   24+   Options
+///   end   Block Total Length (répété pour parcours inverse)
+///
+/// Chaque bloc après SHB :
+///   0-3   Block Type
+///   4-7   Block Total Length (multiple de 4, inclut header + trailer)
+///   8..   Body
+///   end-4..end  Block Total Length (répété)
+/// ```
+///
+/// Les 4 premiers octets (type SHB) ont déjà été lus et hashés par
+/// l'appelant.
+fn prefix_sha_index_pcapng(
+    path: &Path,
+    mut file: fs::File,
+    mut hasher: Sha256Hasher,
+    full_sha_hex: String,
+    full_bytes: u64,
+    mut prefix_sha: BTreeMap<String, (u64, u64)>,
+) -> Result<PrefixIndex, String> {
+    use std::io::Read;
+    // Lire les 8 octets suivants (Block Total Length + Byte-Order Magic)
+    // pour déterminer l'endianness, puis finir de lire le SHB.
+    let mut shb_rest = [0u8; 8];
+    if file.read_exact(&mut shb_rest).is_err() {
+        return Ok(PrefixIndex {
+            path: path.to_path_buf(),
+            full_sha_hex,
+            full_packet_count: 0,
+            full_bytes,
+            prefix_sha,
+        });
+    }
+    hasher.update(&shb_rest);
+    let byte_order_magic = &shb_rest[4..8];
+    let little = matches!(byte_order_magic, [0x4d, 0x3c, 0x2b, 0x1a]);
+    let big = matches!(byte_order_magic, [0x1a, 0x2b, 0x3c, 0x4d]);
+    if !little && !big {
+        return Ok(PrefixIndex {
+            path: path.to_path_buf(),
+            full_sha_hex,
+            full_packet_count: 0,
+            full_bytes,
+            prefix_sha,
+        });
+    }
+    let read_u32 = |bytes: &[u8; 4]| -> u32 {
+        if little {
+            u32::from_le_bytes(*bytes)
+        } else {
+            u32::from_be_bytes(*bytes)
+        }
+    };
+    let shb_total_length = read_u32(shb_rest[0..4].try_into().unwrap()) as u64;
+    // Garde défensive : 12 octets mini (type 4 + length 4 + trailer 4).
+    // SHB inclut au moins byte-order magic 4 + versions 4 + section_length 8
+    // = 16 octets de body + 12 = 28 octets min, aligné à 4.
+    if shb_total_length < 28 || shb_total_length % 4 != 0 {
+        return Ok(PrefixIndex {
+            path: path.to_path_buf(),
+            full_sha_hex,
+            full_packet_count: 0,
+            full_bytes,
+            prefix_sha,
+        });
+    }
+    // On a déjà lu 12 octets du SHB (magic + length + byte-order).
+    // Reste à lire `shb_total_length - 12` octets pour finir le bloc.
+    let mut shb_remaining = (shb_total_length - 12) as usize;
+    let mut chunk = [0u8; 4096];
+    while shb_remaining > 0 {
+        let take = shb_remaining.min(chunk.len());
+        if file.read_exact(&mut chunk[..take]).is_err() {
+            return Ok(PrefixIndex {
+                path: path.to_path_buf(),
+                full_sha_hex,
+                full_packet_count: 0,
+                full_bytes,
+                prefix_sha,
+            });
+        }
+        hasher.update(&chunk[..take]);
+        shb_remaining -= take;
+    }
+    let mut bytes_so_far: u64 = shb_total_length;
+    let mut packet_number: u64 = 0;
+    // Enhanced Packet Block = 0x00000006, Simple Packet Block = 0x00000003.
+    const BLOCK_TYPE_EPB: u32 = 0x00000006;
+    const BLOCK_TYPE_SPB: u32 = 0x00000003;
+    loop {
+        let mut header = [0u8; 8];
+        if file.read_exact(&mut header).is_err() {
+            break;
+        }
+        hasher.update(&header);
+        let block_type = read_u32(header[0..4].try_into().unwrap());
+        let block_total_length = read_u32(header[4..8].try_into().unwrap()) as u64;
+        if block_total_length < 12 || block_total_length % 4 != 0 {
+            break;
+        }
+        // Body = block_total_length - 8 (header) - 4 (trailer).
+        let mut body_remaining = (block_total_length - 12) as usize;
+        let mut body_ok = true;
+        while body_remaining > 0 {
+            let take = body_remaining.min(chunk.len());
+            if file.read_exact(&mut chunk[..take]).is_err() {
+                body_ok = false;
+                break;
+            }
+            hasher.update(&chunk[..take]);
+            body_remaining -= take;
+        }
+        if !body_ok {
+            break;
+        }
+        let mut trailer = [0u8; 4];
+        if file.read_exact(&mut trailer).is_err() {
+            break;
+        }
+        hasher.update(&trailer);
+        bytes_so_far = bytes_so_far.saturating_add(block_total_length);
+        if block_type == BLOCK_TYPE_EPB || block_type == BLOCK_TYPE_SPB {
+            packet_number = packet_number.saturating_add(1);
+            let snapshot_sha = hasher.clone().finish_hex();
+            prefix_sha.insert(snapshot_sha, (packet_number, bytes_so_far));
+        }
+    }
+    // Dernier snapshot = SHA total du fichier → retiré pour que la
+    // réparation distingue Full-SHA de Prefix-SHA.
     prefix_sha.remove(&full_sha_hex);
     Ok(PrefixIndex {
         path: path.to_path_buf(),
@@ -12607,5 +12794,108 @@ mod tests {
         s1ap_other_offset.packet_references[0].byte_offset = 42 * 64 + 1; // même packet_number mais byte_offset différent (impossible en pratique, test de rigueur)
         assert!(!is_duplicate(&s1ap, &s1ap_other_offset),
             "byte_offset différent = pas un doublon");
+    }
+
+    /// 2.9.6 (devmat #9 T1 — ANR2 #10 comment 6724120812) : avant ce
+    /// correctif, `prefix_sha_index` ne reconnaissait que le pcap
+    /// classique (magic `D4 C3 B2 A1` / reversed) et retournait
+    /// `prefix_sha = {}` sur pcapng. Conséquence en production : les
+    /// 7 snapshots de `_00067` n'étaient pas regroupés (1075 groupes
+    /// tous singletons, 6 `UNRESOLVED_NO_EVIDENCE`), le --dry-run
+    /// annonçait 0 événement à retirer. Ce test construit un pcapng
+    /// minimal de 2 Enhanced Packet Blocks et vérifie que la sortie
+    /// `prefix_sha` isole le SHA après le 1er paquet (le SHA après le
+    /// 2e paquet == `full_sha_hex`, retiré par convention pour
+    /// distinguer Full-SHA de Prefix-SHA).
+    #[test]
+    fn prefix_sha_index_walks_pcapng_enhanced_packet_blocks() {
+        // SHB little-endian, 28 octets.
+        let shb: [u8; 28] = [
+            0x0a, 0x0d, 0x0d, 0x0a, // block type (signature)
+            0x1c, 0x00, 0x00, 0x00, // block total length = 28 (LE)
+            0x4d, 0x3c, 0x2b, 0x1a, // byte-order magic (LE)
+            0x01, 0x00, // major version
+            0x00, 0x00, // minor version
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // section length = -1
+            0x1c, 0x00, 0x00, 0x00, // trailer length = 28
+        ];
+        // IDB (Interface Description Block), 20 octets.
+        let idb: [u8; 20] = [
+            0x01, 0x00, 0x00, 0x00, // block type 1
+            0x14, 0x00, 0x00, 0x00, // block total length = 20
+            0x01, 0x00, // link_type = 1 (Ethernet)
+            0x00, 0x00, // reserved
+            0x00, 0x00, 0x04, 0x00, // snaplen = 262144 (LE)
+            0x14, 0x00, 0x00, 0x00, // trailer length = 20
+        ];
+        // EPB1, 36 octets avec 4 octets de données paquet.
+        let epb1: [u8; 36] = [
+            0x06, 0x00, 0x00, 0x00, // block type 6 (EPB)
+            0x24, 0x00, 0x00, 0x00, // block total length = 36
+            0x00, 0x00, 0x00, 0x00, // interface_id = 0
+            0x00, 0x00, 0x00, 0x00, // ts high
+            0x00, 0x00, 0x00, 0x00, // ts low
+            0x04, 0x00, 0x00, 0x00, // captured_len = 4
+            0x04, 0x00, 0x00, 0x00, // original_len = 4
+            0xaa, 0xbb, 0xcc, 0xdd, // packet data (aligné à 4)
+            0x24, 0x00, 0x00, 0x00, // trailer length
+        ];
+        // EPB2, même structure, données différentes pour que le SHA
+        // du 2nd paquet soit distinct.
+        let epb2: [u8; 36] = [
+            0x06, 0x00, 0x00, 0x00, // block type 6 (EPB)
+            0x24, 0x00, 0x00, 0x00, // block total length = 36
+            0x00, 0x00, 0x00, 0x00, // interface_id = 0
+            0x00, 0x00, 0x00, 0x00, // ts high
+            0x01, 0x00, 0x00, 0x00, // ts low
+            0x04, 0x00, 0x00, 0x00, // captured_len = 4
+            0x04, 0x00, 0x00, 0x00, // original_len = 4
+            0x11, 0x22, 0x33, 0x44, // packet data distincte
+            0x24, 0x00, 0x00, 0x00, // trailer length
+        ];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&shb);
+        bytes.extend_from_slice(&idb);
+        bytes.extend_from_slice(&epb1);
+        bytes.extend_from_slice(&epb2);
+        let dir = tempdir();
+        let path = dir.join("fixture.pcapng");
+        fs::write(&path, &bytes).unwrap();
+
+        let index = prefix_sha_index(&path).expect("pcapng doit être parsé");
+        assert_eq!(index.full_packet_count, 2, "2 EPB = 2 paquets comptés");
+        assert_eq!(index.full_bytes, bytes.len() as u64);
+        // Le SHA du fichier entier doit égaler le full_sha_hex calculé
+        // par sha256_hex_file.
+        assert_eq!(index.full_sha_hex.len(), 64);
+        // prefix_sha doit contenir exactement 1 entrée : le SHA après le
+        // 1er EPB. Le SHA après le 2e EPB == full_sha, retiré par
+        // convention pour que la réparation distingue Full de Prefix.
+        assert_eq!(
+            index.prefix_sha.len(),
+            1,
+            "attendu 1 prefix SHA (packet 1) ; SHA après packet 2 est le full retiré ; got {:?}",
+            index.prefix_sha
+        );
+        let (packet_count, bytes_at_snapshot) = index
+            .prefix_sha
+            .values()
+            .next()
+            .expect("prefix_sha a 1 entrée")
+            .clone();
+        assert_eq!(packet_count, 1);
+        // Après SHB(28) + IDB(20) + EPB1(36) = 84 octets.
+        assert_eq!(bytes_at_snapshot, 84);
+    }
+
+    fn tempdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "oiran-prefix-sha-pcapng-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
