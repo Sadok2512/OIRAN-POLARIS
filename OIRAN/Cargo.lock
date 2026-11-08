@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.9.10"
+version = "2.9.11"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "transport-sctp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "capture-pcap",
  "event-schema",

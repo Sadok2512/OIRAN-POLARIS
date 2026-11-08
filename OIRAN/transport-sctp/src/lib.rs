@@ -137,13 +137,35 @@ impl SctpReassembler {
                         let ssn = be16(&chunk[10..12]);
                         let ppid = be32(&chunk[12..16]);
                         let seen_key = (association.clone(), generation, direction.clone(), tsn);
-                        if !self.seen.insert(seen_key) {
+                        let is_retransmission = !self.seen.insert(seen_key);
+                        if is_retransmission {
+                            // 2.9.11 (#9 comment 6727243545) : ANR2 a
+                            // prouvé 16 messages S6a manquants par
+                            // segment fermé = retransmissions SCTP
+                            // silencieusement supprimées ici. tshark
+                            // compte les retransmissions comme des
+                            // `diameter.cmd.code` distincts (une ligne
+                            // par copie wire). Pré-2.9.11 nous ne
+                            // produisions qu'un seul SctpMessage →
+                            // `PCAP != JSONL` à l'unité près.
+                            //
+                            // 2.9.11 : émettre AUSSI les retransmissions
+                            // comme SctpMessages normaux. Chacune
+                            // atteint le décodeur Diameter et produit
+                            // un événement complet. Le dedup aval en
+                            // 2.9.10 (wire-identity sur capture_id +
+                            // packet_number + byte_offset) distingue
+                            // bien les copies : même TSN, packet_number
+                            // différent ⇒ deux événements distincts.
+                            // L'erreur `Duplicate` reste publiée pour
+                            // l'audit ; le count PCAP est préservé.
                             self.error(
                                 SctpErrorKind::Duplicate,
                                 packet,
                                 format!("duplicate/retransmitted DATA TSN {tsn}"),
                             );
-                        } else {
+                        }
+                        {
                             let begin = flags & 0x02 != 0;
                             let end = flags & 0x01 != 0;
                             let unordered = flags & 0x04 != 0;
@@ -491,6 +513,53 @@ mod tests {
             .collect();
         assert_eq!(numbers, vec![1001, 1002, 1003],
             "packet_references doit énumérer tous les fragments; got {numbers:?}");
+    }
+
+    /// 2.9.11 (#9 comment 6727243545) — ANR2 a prouvé 16 messages
+    /// S6a manquants par segment fermé. Cause : le reassembler
+    /// pré-2.9.11 supprimait silencieusement toute DATA chunk
+    /// avec un TSN déjà vu (retransmission SCTP). tshark compte
+    /// bien chaque copie wire comme un `diameter.cmd.code`
+    /// distinct → `PCAP == N`, `JSONL == N - retransmissions`.
+    ///
+    /// Post-2.9.11 : le même TSN sur deux paquets wire distincts
+    /// produit DEUX SctpMessages (chacun atteint le décodeur
+    /// Diameter et génère un événement). Le dedup wire-identity
+    /// 2.9.10 les distingue par `packet_number`.
+    #[test]
+    fn retransmitted_be_data_emits_two_messages_2_9_11() {
+        // Message auto-contenu (B+E) à TSN=100 envoyé packet #1,
+        // puis **retransmis à l'identique** packet #2.
+        let (p1, v1) = packet(1, &data(3, 100, 7, 2, 60, b"hello"));
+        let (p2, v2) = packet(2, &data(3, 100, 7, 2, 60, b"hello"));
+        let mut r = SctpReassembler::new();
+
+        let m1 = r.consume(&p1, &v1);
+        assert_eq!(m1.len(), 1, "première occurrence → 1 message");
+        assert_eq!(m1[0].payload, b"hello");
+        assert_eq!(m1[0].first_tsn, 100);
+        assert_eq!(m1[0].packet_references[0].packet_number, 1);
+
+        let m2 = r.consume(&p2, &v2);
+        assert_eq!(
+            m2.len(),
+            1,
+            "retransmission B+E → DOIT aussi émettre (count-preserving)"
+        );
+        assert_eq!(m2[0].payload, b"hello");
+        assert_eq!(m2[0].first_tsn, 100, "même TSN 100 que l'original");
+        assert_eq!(
+            m2[0].packet_references[0].packet_number, 2,
+            "packet_number différent ⇒ dedup wire aval les distingue"
+        );
+
+        // L'erreur Duplicate reste publiée pour l'audit.
+        assert!(
+            r.errors()
+                .iter()
+                .any(|e| e.kind == SctpErrorKind::Duplicate),
+            "l'erreur Duplicate reste tracée côté audit"
+        );
     }
 
     #[test]

@@ -1,5 +1,75 @@
 # Changelog
 
+## OIRAN API 2.9.11 — 2026-11-08 — SCTP retransmit count-preserving (devmat, ANR2 #9 comment 6727243545)
+
+### Contexte — ANR2 a quantifié la perte segmentaire
+
+ANR2 a publié sur #9 comment 6727243545 un pattern déterministe :
+**16 messages S6a manquants par segment fermé importé sous 2.9.5+**
+(20 pour `_00021`). 12 segments successifs, tous avec `PCAP - 16 ==
+JSONL`. Un parse error aléatoire aurait produit un écart variable ;
+cette constance pointe vers une règle systémique.
+
+### T1 — Cause fichier:ligne
+
+`transport-sctp/src/lib.rs::SctpReassembler::consume` (`:139-146`
+pré-2.9.11) :
+
+```rust
+let seen_key = (association.clone(), generation, direction.clone(), tsn);
+if !self.seen.insert(seen_key) {
+    self.error(SctpErrorKind::Duplicate, packet, …);
+} else {
+    // … émet SctpMessage
+}
+```
+
+Toute DATA chunk avec un TSN déjà observé est silencieusement
+supprimée — comportement correct pour un décodeur de protocole
+(une retransmission est la MÊME information), mais qui ne
+préserve PAS le compte wire. ANR2 utilise `tshark -T fields -e
+diameter.cmd.code` qui compte chaque copie décodable comme une
+ligne. Le taux de retransmission SCTP typique en production
+(~3 %) correspond exactement aux 16 messages/heure manquants sur
+492 messages/heure.
+
+### T2 — Fix : count-preserving retransmission
+
+`transport-sctp/src/lib.rs::SctpReassembler::consume` (`:139-167`
+post-2.9.11) :
+
+- Le `seen.insert` reste pour détecter les retransmissions.
+- L'erreur `Duplicate` continue d'être publiée pour l'audit.
+- Le **chemin d'émission** passe maintenant aussi pour les
+  retransmissions : chaque copie B+E atteint le décodeur
+  Diameter et produit un événement normal.
+- Le dedup aval 2.9.10 (wire-identity sur `capture_id` +
+  `packet_number` + `byte_offset`) les distingue : même TSN,
+  `packet_number` différent ⇒ deux événements wire distincts.
+  `PCAP == JSONL` à l'octet près.
+
+Test `retransmitted_be_data_emits_two_messages_2_9_11` :
+retransmission B+E d'un TSN=100 sur packets 1 et 2 → DEUX
+`SctpMessages`, l'erreur `Duplicate` tracée pour l'audit.
+
+### T3 — Tests
+
+**432 PASS**, 0 FAIL, 4 ignored (+1 vs 2.9.10). Les tests
+`fragments_and_retransmission`,
+`reassembled_message_preserves_every_fragment_packet_reference`
+(2.9.5), `malformed_payload_emits_a_count_preserving_event_2_9_10`
+(decoder-diameter), `continuous_observation_id_is_wire_identity_…_2_9_10`
+(live-probe) restent VERT. Le dedup wire-identity 2.9.10 absorbe
+proprement les retransmissions au niveau événement Diameter —
+une retransmission B+E d'un petit DWR produit deux événements
+Diameter distincts par `packet_number`, correspondant au count
+PCAP tshark.
+
+### Versions
+
+- `transport-sctp` 0.1.0 → 0.1.1 (retransmit emission)
+- `oiran-api` 2.9.10 → 2.9.11
+
 ## OIRAN API 2.9.10 — 2026-11-08 — Dedup wire-identity + Diameter MALFORMED count-preserving (devmat, ANR2 #9 comment 6726685484)
 
 ### Contexte — FAIL recette 2.9.9 prouvée par ANR2
