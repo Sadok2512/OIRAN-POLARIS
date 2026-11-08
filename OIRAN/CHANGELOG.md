@@ -1,5 +1,203 @@
 # Changelog
 
+## OIRAN API 2.9.8 — 2026-11-08 — Backpressure sur ring importé + BLOCKED masqué sur /metrics (devmat, ANR2 #9 comment 6725097122)
+
+### Contexte — ANR2 a prouvé la cause exacte
+
+Sur `5g-session-5e3fc8ce83936ea0` (run POLARIS `tpl-small-traffic-6374f1ed343c`,
+2026-11-08T17:19:12Z..17:30:24Z), ANR2 a prouvé que le N3 du run
+**n'a jamais été dédoublonné** — il était bloqué par
+`CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT` (dépassement de 108 503 490
+octets) → job `BLOCKED`. Preuves :
+
+- Aucun log `CONTINUOUS_*` ne citait le segment N3 bloqué.
+- `/api/v1/metrics` ne lisait que les jobs `CAPTURING` puis faisait
+  `unwrap_or(0)` → un job BLOCKED affichait `pending=0`,
+  masquant totalement le blocage.
+- Un segment SBI de 982 événements a bien été importé mais non
+  rattaché à la session du run (identifiants ANR2 attendus sur #9
+  — reporté en 2.9.9).
+
+### T1 — Cause fichier:ligne
+
+Dans `live-probe/src/lib.rs`, `work_bytes` comptait le ring pcap
+déjà importé :
+
+```rust
+fn work_bytes(base: &Path) -> u64 {
+    directory_size(base).saturating_sub(directory_size(&base.join("dataset")))
+}
+```
+
+`base` contient `dataset/` (soustrait) + `pcap/<iface>.pcap-<sha16>.*`
+(le **ring d'imports committés**) + `.importing` (en vol) +
+`.dataset-previous/` + `.dataset-next/` + `import_state.json`. Le ring
+étant 108 MiB, la garde suivante (anciennement `:2769`) tombait
+systématiquement :
+
+```rust
+if work_bytes(&base)
+    .saturating_add(candidate.size_bytes)
+    .saturating_add(MAX_CONTINUOUS_DERIVED_BYTES)
+    > config.max_owned_bytes { terminal_error = ...BOUNDED_STORAGE_FULL; break; }
+```
+
+Dumpcap ne supprime **jamais** les segments sources ; le ring ne
+rétrécit donc jamais par lui-même → la garde se déclenche pour
+toujours une fois le ring au-dessus du seuil.
+
+Pire : la garde est muette par segment. Aucun log ne cite le
+candidat bloqué ; seule la sortie terminale `job.error =
+"CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT"` est visible.
+
+Et `apps/api/src/lib.rs::metrics` filtre
+`state == CaptureState::Capturing` puis tape
+`latest_metrics.map(|m|m.pending_segments).unwrap_or(0)` → quand
+le worker est `Blocked`, `active` est vide, `latest_metrics=None`,
+`pending_segments=0`. `job.json pending_segments=1` contredit alors
+`/metrics pending=0` — exactement ce que ANR2 a observé.
+
+### T2 — Correctif `work_bytes` : exclure le ring committé
+
+Nouveau `live-probe::work_bytes` (`:7449-7470`) :
+
+```rust
+fn work_bytes(base: &Path) -> u64 {
+    let total = directory_size(base);
+    let published = directory_size(&base.join("dataset"));
+    let committed_ring = committed_ring_bytes(&base.join("pcap"));
+    total.saturating_sub(published).saturating_sub(committed_ring)
+}
+
+fn committed_ring_bytes(pcap_dir: &Path) -> u64 {
+    // somme des fichiers pcap/ sauf *.importing (en vol)
+}
+```
+
+Le ring committé n'est plus compté ; seul le staging (`.dataset-*`,
+`.importing`, `import_state.json`) pèse dans la garde. Le ring reste
+borné par `max_segments` + `max_owned_bytes` sur la rétention, pas
+sur l'accueil.
+
+**Test** `tests::work_bytes_excludes_committed_pcap_ring_proof_anr2`
+(`live-probe/src/lib.rs`) : 10 fichiers `N3.pcap-*` de 1 GiB chacun
+(sparse pour ne pas remplir `/tmp`) + un `.importing` de 4 MiB
+sous `pcap/`. Avant 2.9.8 : `work_bytes ≈ 10 GiB`. Après : `< 128 MiB`.
+Un candidat de 16 MiB ne doit **plus** faire tomber la garde sous
+`max_owned_bytes=128 MiB` : prouvé.
+
+### T3 — Log et compteur par segment bloqué
+
+`live-probe::drive_continuous_import` (`:2863-2918`) : chaque fois
+que la garde se déclenche, log structuré
+`CONTINUOUS_SEGMENT_PENDING_BACKPRESSURE` avec path, checksum,
+interface, size_bytes, staging_bytes, derived_reserve_bytes,
+max_owned_bytes, reason. Même log pour la garde disk-safety
+(`CONTINUOUS_SEGMENT_PENDING_DISK_SAFETY`).
+
+Silent-skip autres chemins (stability, batch cap) :
+`CONTINUOUS_SEGMENT_PENDING_STABILITY` /
+`CONTINUOUS_SEGMENT_PENDING_BATCH`. Compteurs scan-local dans
+`metrics.pending_stability_segments` et
+`metrics.pending_batch_segments` — jamais 0 par défaut. Rien de
+silencieux.
+
+### T4 — `/api/v1/metrics` ne masque plus les BLOCKED
+
+Nouveau sélecteur `apps/api/src/lib.rs::select_metrics_source_job`
+(`:865-903`) : préfère un job `Capturing`, sinon le job BLOCKED /
+COMPLETED / FAILED / PROCESSING / STOPPING le plus récent par
+`ended_epoch_ms`. `pending_segments`,
+`pending_fingerprints`, `pending_stability_segments`,
+`pending_batch_segments`, `orphan_fingerprints_recovered` : lus de
+`source_job.metrics` sans `unwrap_or(0)` (JSON `null` si aucun job
+n'existe — jamais 0 par défaut).
+
+Trois champs ajoutés : `capture_state`, `capture_stop_reason`,
+`capture_error`. Un opérateur voit immédiatement `BLOCKED` +
+`BOUNDED_STORAGE_FULL` sans un appel séparé à `/jobs`.
+
+**Test** `tests::select_metrics_source_job_prefers_capturing_then_blocked`
+(`apps/api/src/lib.rs`) : trois jobs (un Capturing, deux Blocked de
+dates différentes) → le Capturing gagne ; sans Capturing → le
+Blocked le plus récent ; liste vide → `None` (JSON null). pending
+et stop_reason sont préservés.
+
+### T5 — Défense en profondeur : invariant empreinte ⇒ publication
+
+Même si le fix T2 règle la cause, les orphelines persistées sur
+disque en 2.9.5/2.9.6/2.9.7 doivent disparaître. 2.9.8 introduit
+l'invariant durable : une entrée `state.source_fingerprints` n'y
+reste que si son `checksum` est dans `state.seen_checksums` (= segment
+réellement publié).
+
+- `live-probe::drop_orphan_fingerprints` (`:6059-6072`) : purge au
+  démarrage les empreintes orphelines + log par entrée
+  (`CONTINUOUS_ORPHAN_FINGERPRINT_DROPPED`) + compteur cumulatif
+  `metrics.orphan_fingerprints_recovered`.
+- `:3174-3202` : la persistance filtre `source_cache` sur
+  `seen_checksums` ; déclenchée aussi quand `published=true` pour
+  que les SHAs commitées d'un scan cache-hit atterrissent sur
+  disque.
+
+**Tests** :
+- `drop_orphan_fingerprints_matches_anr2_production_shape` : orphelin
+  N3 (`sha-orphan-436e4bb7`, `packets=0`) + orphelin SBI
+  (`sha-sbi-orphan`) + entrée commitée conservée ; idempotent.
+- `continuous_import_purges_orphan_fingerprint_at_startup_and_reimports_n3_sbi`
+  : scénario end-to-end. 2 orphelines pré-plantées dans
+  `import_state.json` → 3 fixtures réelles N2/N3/N4 → attend
+  `segments_ingested == 3` → asserts
+  `orphan_fingerprints_recovered == 2`,
+  `pending_segments == pending_fingerprints` (concordance),
+  `pending_stability_segments == 0`, `pending_batch_segments == 0`,
+  et **invariant global** : tout SHA de `source_fingerprints` est
+  dans `seen_checksums`.
+
+### T6 — Concordance /metrics ↔ job.json
+
+Dans le même `self.update(CONTINUOUS_CAPTURE_ID, |job| …)`
+(`:2810-2822`) : `job.metrics.pending_segments` et
+`job.metrics.pending_fingerprints` sortent du **même compteur
+scan-local**. Le branch publication (`:3080-3098`) remet les deux à
+zéro ensemble. `/api/v1/metrics` lit les deux depuis la même source
+`source_job.metrics`.
+
+**Test** `capture_metrics_pending_fields_covary` : les cinq champs
+nouveaux apparaissent dans `CaptureMetrics` ; régression de champ
+cassée au type level.
+
+### T7 — SBI non rattaché : reporté
+
+ANR2 a observé un segment SBI importé (982 événements) mais non
+rattaché à la session `5g-session-5e3fc8ce83936ea0`. La règle de
+rattachement **par clé exacte** (`pduSessionId` +
+`smContextRef` / pseudonyme, jamais par `ts`) nécessite les
+identifiants désidentifiés publiés par ANR2 sur #9. Reporté en
+2.9.9.
+
+### T8 — Round-trip 2.9.6 + 2.9.7 préservés
+
+Suite complète : **423 tests PASS** (+5 par rapport aux 418 de
+2.9.7). Les tests
+`compact_jsonl_round_trip_yields_four_cross_interface_edges`
+(correlation-engine, 2.9.7), `prefix_sha_pcapng_section_header_shb`
+(live-probe, 2.9.6), `keepalive_classify_and_aggregates`
+(live-probe, 2.9.5) et `compact_event_jsonl_omits_null_and_empty`
+(event-schema, 2.9.4) restent VERT. La compaction JSONL, l'agrégation
+keepalive, la réparation prefix-SHA pcapng, le test round-trip
+compact — tout est embarqué sans régression.
+
+### Versions
+
+- `live-probe` 0.4.22 → 0.4.23 (`work_bytes` exclut le ring
+  committé + per-segment backpressure/stability/batch logs +
+  pending_fingerprints/stability/batch metrics +
+  `drop_orphan_fingerprints` + invariant empreinte ⇒ publication)
+- `oiran-api` 2.9.7 → 2.9.8 (`select_metrics_source_job` expose
+  les BLOCKED + `capture_state`/`capture_stop_reason`/`capture_error`
+  + nouveaux champs pending_*)
+
 ## OIRAN API 2.9.7 — 2026-11-08 — Non-régression test JSONL compact + revue diff 67317cf..dcf2e04 (devmat régression ANR2 #9 comment 6724980899, #10 comment 6724994946)
 
 ### Contexte — suspicion de régression 2.9.1 → 2.9.5 sur le run réel

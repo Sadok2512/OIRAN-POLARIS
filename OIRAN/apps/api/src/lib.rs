@@ -862,6 +862,46 @@ fn epoch_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// 2.9.8 (#9 comment 6725097122): choose which `CaptureJob` feeds
+/// `/metrics` pending/state fields. ANR2 observed in production that
+/// the pre-2.9.8 handler filtered to `CaptureState::Capturing`
+/// alone, so a BLOCKED continuous-import job (backpressure trip)
+/// silently collapsed to `pending_segments=0` even though
+/// `job.json` still reported the real backlog. This selector keeps
+/// the same "prefer the active job" behaviour as the pre-2.9.8
+/// path and falls back to the most recent BLOCKED / COMPLETED /
+/// FAILED job — every state that legitimately carries a final
+/// `metrics.pending_segments` number. Pure function so the
+/// behaviour is unit-testable.
+pub fn select_metrics_source_job<'a>(
+    jobs: &'a [live_probe::CaptureJob],
+) -> Option<&'a live_probe::CaptureJob> {
+    if let Some(active) = jobs
+        .iter()
+        .filter(|job| job.state == live_probe::CaptureState::Capturing)
+        .max_by_key(|job| job.started_epoch_ms.unwrap_or(job.created_epoch_ms))
+    {
+        return Some(active);
+    }
+    jobs.iter()
+        .filter(|job| {
+            matches!(
+                job.state,
+                live_probe::CaptureState::Blocked
+                    | live_probe::CaptureState::Completed
+                    | live_probe::CaptureState::CompletedEmpty
+                    | live_probe::CaptureState::Failed
+                    | live_probe::CaptureState::Processing
+                    | live_probe::CaptureState::Stopping
+            )
+        })
+        .max_by_key(|job| {
+            job.ended_epoch_ms
+                .or(job.started_epoch_ms)
+                .unwrap_or(job.created_epoch_ms)
+        })
+}
+
 fn host_memory() -> Value {
     let mut total = None;
     let mut available = None;
@@ -914,7 +954,33 @@ async fn metrics(State(state): State<AppState>) -> Json<Value> {
         .iter()
         .filter(|job| job.state == live_probe::CaptureState::Capturing)
         .collect::<Vec<_>>();
-    let latest_metrics = active.last().map(|job| &job.metrics);
+    // 2.9.8 (#9 comment 6725097122): a BLOCKED continuous-import
+    // job (backpressure, disk-safety, derived-output limit) must
+    // surface its pending work and stop reason on `/metrics` — not
+    // silently fall back to 0 because `Capturing` is empty. ANR2
+    // observed this exact masking: `/metrics pending=0` while
+    // `job.json pending=1` on a BLOCKED job. We prefer the active
+    // job when one exists (same shape as pre-2.9.8) and fall back
+    // to the most recent BLOCKED/COMPLETED job so pending/failure
+    // numbers remain visible. The `source_job` carries both the
+    // metrics and the state label for the client.
+    let source_job = select_metrics_source_job(&jobs);
+    let latest_metrics = source_job.map(|job| &job.metrics);
+    let capture_state_label = source_job.map(|job| match job.state {
+        live_probe::CaptureState::Created => "CREATED",
+        live_probe::CaptureState::Validating => "VALIDATING",
+        live_probe::CaptureState::Ready => "READY",
+        live_probe::CaptureState::Starting => "STARTING",
+        live_probe::CaptureState::Capturing => "CAPTURING",
+        live_probe::CaptureState::Stopping => "STOPPING",
+        live_probe::CaptureState::Processing => "PROCESSING",
+        live_probe::CaptureState::Completed => "COMPLETED",
+        live_probe::CaptureState::CompletedEmpty => "COMPLETED_EMPTY",
+        live_probe::CaptureState::Failed => "FAILED",
+        live_probe::CaptureState::Blocked => "BLOCKED",
+    });
+    let capture_stop_reason = source_job.and_then(|job| job.stop_reason.clone());
+    let capture_error = source_job.and_then(|job| job.error.clone());
     let live_datasets = state.inner.capture_manager.datasets();
     let active_ue_ips = live_datasets
         .iter()
@@ -939,7 +1005,20 @@ async fn metrics(State(state): State<AppState>) -> Json<Value> {
         "historical_events":source_events,"live_events":live_events,"decode_errors":decode_errors,
         "last_ingested_epoch_ms":latest_metrics.and_then(|m|m.last_ingested_epoch_ms),
         "segments_ingested":latest_metrics.map(|m|m.segments_ingested).unwrap_or(0),
-        "pending_segments":latest_metrics.map(|m|m.pending_segments).unwrap_or(0),
+        // 2.9.8 (#9 comment 6725097122): read pending_* off
+        // `source_job` — active first, else the most recent
+        // BLOCKED/Completed job — so a BLOCKED continuous-import
+        // worker never silently reports 0. `capture_state` and
+        // `capture_stop_reason` make the state explicit; the client
+        // can diagnose the stall without a separate `/jobs` call.
+        "pending_segments":latest_metrics.map(|m|m.pending_segments),
+        "pending_fingerprints":latest_metrics.map(|m|m.pending_fingerprints),
+        "pending_stability_segments":latest_metrics.map(|m|m.pending_stability_segments),
+        "pending_batch_segments":latest_metrics.map(|m|m.pending_batch_segments),
+        "orphan_fingerprints_recovered":latest_metrics.map(|m|m.orphan_fingerprints_recovered),
+        "capture_state":capture_state_label,
+        "capture_stop_reason":capture_stop_reason,
+        "capture_error":capture_error,
         "ingestion_failures":latest_metrics.map(|m|m.ingestion_failures).unwrap_or(0),
         "last_packet_epoch_ms":latest_metrics.and_then(|m|m.last_packet_epoch_ms),
         "fresh_packet_count":latest_metrics.map(|m|m.fresh_packet_count).unwrap_or(0),
@@ -5300,5 +5379,91 @@ mod tests {
         assert_eq!(value["data"]["role"], "viewer");
         assert_eq!(value["data"]["capture_control"], false);
         assert_eq!(value["data"]["reason"], "PUBLIC_VIEWER_OR_INVALID_TOKEN");
+    }
+
+    fn capture_job_in_state(
+        capture_id: &str,
+        state: live_probe::CaptureState,
+        started: Option<u64>,
+        ended: Option<u64>,
+        pending: u64,
+        stop_reason: Option<&str>,
+    ) -> live_probe::CaptureJob {
+        let mut metrics = live_probe::CaptureMetrics::default();
+        metrics.pending_segments = pending;
+        metrics.pending_fingerprints = pending;
+        live_probe::CaptureJob {
+            capture_id: capture_id.into(),
+            probe_id: "probe-local".into(),
+            name: capture_id.into(),
+            profile: "continuous".into(),
+            interfaces: vec!["N2".into(), "N3".into(), "N4".into()],
+            state,
+            created_epoch_ms: 1_000,
+            started_epoch_ms: started,
+            ended_epoch_ms: ended,
+            owner: "operator".into(),
+            metrics,
+            output_directory: "/var/lib/oiran/captures".into(),
+            dataset_id: None,
+            session_ids: vec![],
+            error: None,
+            stop_reason: stop_reason.map(str::to_string),
+            process_ids: vec![],
+            helper_results: vec![],
+            capture_group_id: None,
+            scenario_id: None,
+            planes: vec![],
+        }
+    }
+
+    /// 2.9.8 (#9 comment 6725097122): `select_metrics_source_job`
+    /// must prefer a `Capturing` job but fall back to the most
+    /// recent BLOCKED job so `/metrics pending_segments` reflects
+    /// the ANR2 production state (continuous-import worker in
+    /// `Blocked` with `pending=1` on `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT`).
+    #[test]
+    fn select_metrics_source_job_prefers_capturing_then_blocked() {
+        let active = capture_job_in_state(
+            "continuous-lab-import",
+            live_probe::CaptureState::Capturing,
+            Some(3_000),
+            None,
+            0,
+            None,
+        );
+        let older_blocked = capture_job_in_state(
+            "continuous-lab-import-old",
+            live_probe::CaptureState::Blocked,
+            Some(1_000),
+            Some(1_500),
+            7,
+            Some("BOUNDED_STORAGE_FULL"),
+        );
+        let newer_blocked = capture_job_in_state(
+            "continuous-lab-import-newer",
+            live_probe::CaptureState::Blocked,
+            Some(2_000),
+            Some(2_500),
+            1,
+            Some("BOUNDED_STORAGE_FULL"),
+        );
+
+        let jobs = vec![older_blocked.clone(), newer_blocked.clone(), active.clone()];
+        let chosen = select_metrics_source_job(&jobs).unwrap();
+        assert_eq!(chosen.capture_id, "continuous-lab-import");
+        assert_eq!(chosen.state, live_probe::CaptureState::Capturing);
+
+        // No Capturing job → fall back to the most recent BLOCKED.
+        let jobs_no_active = vec![older_blocked.clone(), newer_blocked.clone()];
+        let chosen = select_metrics_source_job(&jobs_no_active).unwrap();
+        assert_eq!(chosen.capture_id, "continuous-lab-import-newer");
+        assert_eq!(chosen.state, live_probe::CaptureState::Blocked);
+        // pending AND stop_reason are exposed — never masked.
+        assert_eq!(chosen.metrics.pending_segments, 1);
+        assert_eq!(chosen.stop_reason.as_deref(), Some("BOUNDED_STORAGE_FULL"));
+
+        // Empty list: None (handler already encodes as JSON null).
+        assert!(select_metrics_source_job(&[]).is_none());
     }
 }

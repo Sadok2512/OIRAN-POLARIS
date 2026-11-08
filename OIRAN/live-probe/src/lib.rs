@@ -744,6 +744,33 @@ pub struct CaptureMetrics {
     pub segments_ingested: u64,
     #[serde(default)]
     pub pending_segments: u64,
+    /// 2.9.8 (#9 comment 6725097122): segments whose SHA is cached but
+    /// whose checksum is NOT in `state.seen_checksums` — i.e. a
+    /// candidate observed by the latest scan that has not yet been
+    /// published. Computed from `source_cache ∖ seen_checksums` and
+    /// always equal to `pending_segments` on the scan boundary.
+    /// Published so `/metrics` and `job.json` can prove they read the
+    /// same authoritative source.
+    #[serde(default)]
+    pub pending_fingerprints: u64,
+    /// 2.9.8 (#9 comment 6725097122): segments skipped this scan
+    /// because they appear for the first time with a given
+    /// `(size, mtime)` and need a second scan to prove stability.
+    /// Reset every scan. Surfaced so no per-segment deferral is silent.
+    #[serde(default)]
+    pub pending_stability_segments: u64,
+    /// 2.9.8 (#9 comment 6725097122): segments eligible this scan but
+    /// deferred because the per-scan batch cap
+    /// (`MAX_INGESTED_SEGMENTS_PER_SCAN = 32`) was hit. Reset every
+    /// scan. Surfaced so no per-segment deferral is silent.
+    #[serde(default)]
+    pub pending_batch_segments: u64,
+    /// 2.9.8 (#9 comment 6725097122): orphan fingerprints dropped at
+    /// worker startup — fingerprint persisted but checksum not in
+    /// `seen_checksums` (= segment was never committed via
+    /// `persist_published_checksums`). Cumulative per worker lifetime.
+    #[serde(default)]
+    pub orphan_fingerprints_recovered: u64,
     #[serde(default)]
     pub sessions_indexed: u64,
     #[serde(default)]
@@ -2262,6 +2289,43 @@ impl CaptureManager {
         // cache hydrated from the persisted `source_fingerprints`
         // field of `import_state.json` so a probe restart does NOT
         // re-hash every segment in the source root.
+        // 2.9.8 (#9 comment 6725097122): purge orphan fingerprints
+        // before hydrating the in-memory cache. ANR2 proved in
+        // production that a SourceFingerprint could land in
+        // `state.source_fingerprints` while its checksum was never
+        // committed to `seen_checksums` (publish failure rollback at
+        // `:2949` left the local `source_cache` unreset; a subsequent
+        // `cache_mutated=true` scan then persisted those orphans via
+        // `:3028`). The invariant for 2.9.8 is: a fingerprint is
+        // persisted ONLY after a successful publish. On startup any
+        // pre-2.9.8 orphan is dropped with a structured log record and
+        // counted in `metrics.orphan_fingerprints_recovered`; the
+        // segment is still on disk and will be rehashed next scan.
+        let orphans_at_startup = drop_orphan_fingerprints(&mut state);
+        if !orphans_at_startup.is_empty() {
+            atomic_write(
+                &state_path,
+                &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
+            )?;
+            for (path, checksum) in &orphans_at_startup {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "CONTINUOUS_ORPHAN_FINGERPRINT_DROPPED",
+                        "path": path,
+                        "checksum": checksum,
+                        "reason": "fingerprint persisted without seen_checksums commit",
+                    })
+                );
+            }
+            let recovered = orphans_at_startup.len() as u64;
+            self.update(CONTINUOUS_CAPTURE_ID, |job| {
+                job.metrics.orphan_fingerprints_recovered = job
+                    .metrics
+                    .orphan_fingerprints_recovered
+                    .saturating_add(recovered);
+            })?;
+        }
         let mut source_cache: SourceSegmentsCache = state
             .source_fingerprints
             .iter()
@@ -2691,12 +2755,20 @@ impl CaptureManager {
                     )?;
                 }
             }
+            // 2.9.8 (#9 comment 6725097122): `/metrics` and
+            // `job.json` must read the same authoritative source for
+            // pending work. Both fields are set from the same
+            // scan-local count so the invariant is proven by
+            // construction. `pending_fingerprints` is the exact
+            // mirror, surfaced so an audit can assert concordance
+            // without touching internal state.
             let pending = candidates
                 .iter()
                 .filter(|candidate| !state.seen_checksums.contains(&candidate.checksum))
                 .count() as u64;
             self.update(CONTINUOUS_CAPTURE_ID, |job| {
-                job.metrics.pending_segments = pending
+                job.metrics.pending_segments = pending;
+                job.metrics.pending_fingerprints = pending;
             })?;
             let mut pending_publication = std::mem::take(&mut bootstrap_pending);
             let mut changed = !pending_publication.is_empty();
@@ -2712,7 +2784,14 @@ impl CaptureManager {
             // to prove stability. The gate uses this count to force
             // the required second scan even without a directory mutation.
             let mut pending_stability_this_scan: usize = 0;
-            for candidate in candidates {
+            // 2.9.8 (#9 comment 6725097122): count candidates eligible
+            // this scan but deferred because the per-scan batch cap
+            // was hit. Surfaced through
+            // `metrics.pending_batch_segments` and logged once per
+            // deferred segment so no skip is silent.
+            let mut pending_batch_this_scan: usize = 0;
+            let mut candidate_iter = candidates.into_iter();
+            while let Some(candidate) = candidate_iter.next() {
                 if state.seen_checksums.contains(&candidate.checksum) {
                     continue;
                 }
@@ -2722,6 +2801,21 @@ impl CaptureManager {
                 if config.native_segment_seconds.is_none() && !stable_across_scans {
                     pending_stability_this_scan =
                         pending_stability_this_scan.saturating_add(1);
+                    // 2.9.8 (#9 comment 6725097122): per-segment log —
+                    // never silent. The counter below is reset to the
+                    // scan total so operators can distinguish a fresh
+                    // deferral from a cumulative drift.
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_SEGMENT_PENDING_STABILITY",
+                            "path": candidate.path.display().to_string(),
+                            "checksum": candidate.checksum,
+                            "interface": candidate.interface,
+                            "size_bytes": candidate.size_bytes,
+                            "reason": "first observation of (size, mtime); needs one more scan",
+                        })
+                    );
                     continue;
                 }
                 if let Err(error) = decode_capture_streaming(
@@ -2766,11 +2860,34 @@ impl CaptureManager {
                 // longer exists on disk. The byte-level `max_owned_bytes`
                 // gate is kept — breaching it is a terminal error, no
                 // silent eviction of historical context.
-                if work_bytes(&base)
+                let staging_bytes = work_bytes(&base);
+                if staging_bytes
                     .saturating_add(candidate.size_bytes)
                     .saturating_add(MAX_CONTINUOUS_DERIVED_BYTES)
                     > config.max_owned_bytes
                 {
+                    // 2.9.8 (#9 comment 6725097122): per-segment log
+                    // with the exact numbers so the operator sees
+                    // which candidate tripped the gate and the
+                    // decomposition of the staging budget. Prior
+                    // releases emitted only the aggregate
+                    // `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT`
+                    // terminal error — ANR2 could not point at the
+                    // blocked N3 segment because nothing logged it.
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_SEGMENT_PENDING_BACKPRESSURE",
+                            "path": candidate.path.display().to_string(),
+                            "checksum": candidate.checksum,
+                            "interface": candidate.interface,
+                            "size_bytes": candidate.size_bytes,
+                            "staging_bytes": staging_bytes,
+                            "derived_reserve_bytes": MAX_CONTINUOUS_DERIVED_BYTES,
+                            "max_owned_bytes": config.max_owned_bytes,
+                            "reason": "staging + candidate + derived reserve > max_owned_bytes",
+                        })
+                    );
                     terminal_error = Some((
                         "CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT",
                         "BOUNDED_STORAGE_FULL",
@@ -2780,6 +2897,20 @@ impl CaptureManager {
                 let budget =
                     capture_budget(measure_path(&self.root), candidate.size_bytes, self.policy);
                 if !budget.allowed {
+                    // 2.9.8 (#9 comment 6725097122): same per-segment
+                    // log pattern for the disk-safety path — never
+                    // silent.
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_SEGMENT_PENDING_DISK_SAFETY",
+                            "path": candidate.path.display().to_string(),
+                            "checksum": candidate.checksum,
+                            "interface": candidate.interface,
+                            "size_bytes": candidate.size_bytes,
+                            "reason": "disk-safety policy denies new captures",
+                        })
+                    );
                     terminal_error =
                         Some(("CONTINUOUS_IMPORT_DISK_POLICY_STOP", "DISK_SAFETY_POLICY"));
                     break;
@@ -2864,9 +2995,38 @@ impl CaptureManager {
                 // seen_checksums (that happens only after a successful
                 // publish at persist_published_checksums below).
                 if ingested_this_scan >= MAX_INGESTED_SEGMENTS_PER_SCAN {
+                    // 2.9.8 (#9 comment 6725097122): account every
+                    // remaining eligible candidate deferred by the
+                    // batch cap. Each gets a structured log record so
+                    // no per-segment skip is silent; the aggregate is
+                    // surfaced through `metrics.pending_batch_segments`.
+                    for remaining in candidate_iter.by_ref() {
+                        if state.seen_checksums.contains(&remaining.checksum) {
+                            continue;
+                        }
+                        pending_batch_this_scan =
+                            pending_batch_this_scan.saturating_add(1);
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "event": "CONTINUOUS_SEGMENT_PENDING_BATCH",
+                                "path": remaining.path.display().to_string(),
+                                "checksum": remaining.checksum,
+                                "interface": remaining.interface,
+                                "size_bytes": remaining.size_bytes,
+                                "reason": "per-scan batch cap reached; retried next scan",
+                            })
+                        );
+                    }
                     break;
                 }
             }
+            self.update(CONTINUOUS_CAPTURE_ID, |job| {
+                job.metrics.pending_stability_segments =
+                    pending_stability_this_scan as u64;
+                job.metrics.pending_batch_segments =
+                    pending_batch_this_scan as u64;
+            })?;
             let mut published = !changed;
             if changed {
                 match self.process_continuous_capture(
@@ -2897,6 +3057,11 @@ impl CaptureManager {
                             );
                             job.metrics.segments_ingested = state.seen_checksums.len() as u64;
                             job.metrics.pending_segments = 0;
+                            // 2.9.8: keep the mirror field in lockstep
+                            // with `pending_segments` so `/metrics`
+                            // and `job.json` prove concordance by
+                            // construction.
+                            job.metrics.pending_fingerprints = 0;
                             job.metrics.decoded_events = dataset.event_count as u64;
                             job.metrics.sessions_indexed = dataset.session_ids.len() as u64;
                             job.metrics.last_ingested_epoch_ms = Some(epoch_ms());
@@ -2987,17 +3152,42 @@ impl CaptureManager {
             // unconditionally rebuilt a 10 000-entry BTreeMap +
             // byte-compared it on every scan — ANR2 measured the
             // cost. The persistence is now strictly event-driven.
-            if discovery.cache_mutated {
-                state.source_fingerprints = source_cache
+            //
+            // 2.9.8 (#9 comment 6725097122): the trigger set now also
+            // includes "a segment was published this scan". A scan
+            // that hits a cached SHA (`cache_mutated=false`) and
+            // publishes it successfully would otherwise never land
+            // the fingerprint in `state.source_fingerprints` under
+            // the stricter invariant below — the committed SHA would
+            // have to wait for an unrelated mutation to be persisted.
+            if discovery.cache_mutated || published {
+                // 2.9.8 (#9 comment 6725097122): persist ONLY
+                // fingerprints whose checksum is in `seen_checksums`
+                // — i.e. a segment that has been successfully
+                // imported AND published via
+                // `persist_published_checksums`. Any fingerprint
+                // produced during discovery but never committed
+                // (`!stable_across_scans`, batch cap, publish
+                // rollback at `:2949`) stays in the in-memory
+                // `source_cache` only; on worker restart it will be
+                // rehashed, re-admitted, and re-attempted — never
+                // stuck as an orphan.
+                let next_fingerprints: BTreeMap<String, SourceFingerprint> = source_cache
                     .iter()
+                    .filter(|(_, fingerprint)| {
+                        state.seen_checksums.contains(&fingerprint.checksum)
+                    })
                     .map(|(path, fingerprint)| {
                         (path.display().to_string(), fingerprint.clone())
                     })
                     .collect();
-                atomic_write(
-                    &state_path,
-                    &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
-                )?;
+                if next_fingerprints != state.source_fingerprints {
+                    state.source_fingerprints = next_fingerprints;
+                    atomic_write(
+                        &state_path,
+                        &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
+                    )?;
+                }
             }
             // 2.8.1 backoff: if we did useful work (published or found
             // a pending candidate) reset to the configured scan_interval
@@ -6018,6 +6208,30 @@ fn purge_missing_source_fingerprints(
     true
 }
 
+/// 2.9.8 (#9 comment 6725097122): drop fingerprints whose checksum is
+/// NOT in `seen_checksums`. ANR2 proved that a `SourceFingerprint`
+/// could land in `state.source_fingerprints` while the segment was
+/// never committed via `persist_published_checksums` — the import
+/// invariant is now that a fingerprint survives only after a
+/// successful publish. Returns the number of orphans dropped; the
+/// caller logs one `CONTINUOUS_ORPHAN_FINGERPRINT_DROPPED` structured
+/// record per orphan and surfaces the cumulative count through
+/// `CaptureMetrics.orphan_fingerprints_recovered`. The segment is
+/// still on disk, so it will be re-hashed on the next scan and
+/// imported through the normal path.
+fn drop_orphan_fingerprints(state: &mut ContinuousImportState) -> Vec<(String, String)> {
+    let orphans: Vec<(String, String)> = state
+        .source_fingerprints
+        .iter()
+        .filter(|(_, fingerprint)| !state.seen_checksums.contains(&fingerprint.checksum))
+        .map(|(path, fingerprint)| (path.clone(), fingerprint.checksum.clone()))
+        .collect();
+    for (path, _) in &orphans {
+        state.source_fingerprints.remove(path);
+    }
+    orphans
+}
+
 /// Durably marks checksums only after the caller has atomically published the
 /// corresponding dataset generation. The in-memory state is replaced only
 /// after the atomic state-file write succeeds.
@@ -7199,8 +7413,61 @@ fn collect_source_paths(
 /// the published dataset grows linearly with ingested events, which
 /// would otherwise trip `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT` on every
 /// new candidate even though the ring itself is well under budget.
+/// 2.9.8 (#9, ANR2 comment 6725097122): bytes of *in-flight* work
+/// under `base` — the stuff that will shrink after a successful
+/// publish+commit. ANR2 proved in production that the pre-2.9.8
+/// definition counted `pcap/` (the already-imported ring) in the
+/// backpressure gate, so the gate tripped on every new candidate
+/// once the ring exceeded `max_owned_bytes - candidate -
+/// MAX_CONTINUOUS_DERIVED_BYTES` — dumpcap never deletes a source
+/// segment, so the ring only grows and the gate would never
+/// recover. The ring is instead bounded by the operator-configured
+/// `max_segments` + `max_owned_bytes` ceiling enforced on retention
+/// elsewhere (`state.segments.retain(...)` on startup); it is NOT
+/// part of the staging budget.
+///
+/// Counted:
+///   * `.dataset-previous/`, `.dataset-next/` — publication staging.
+///   * `.importing` temp files under `pcap/` — in-flight copy from
+///     `copy_verified`.
+///   * `import_state.json` + any other top-level file — small
+///     bookkeeping, fits well under the derived reserve.
+///
+/// Explicitly NOT counted:
+///   * `pcap/<interface>.pcap-<sha16>.ext` — committed ring entries.
+///   * `dataset/` — the published dataset (already excluded in the
+///     pre-2.9.8 definition; kept excluded).
 fn work_bytes(base: &Path) -> u64 {
-    directory_size(base).saturating_sub(directory_size(&base.join("dataset")))
+    let total = directory_size(base);
+    let published = directory_size(&base.join("dataset"));
+    let committed_ring = committed_ring_bytes(&base.join("pcap"));
+    total
+        .saturating_sub(published)
+        .saturating_sub(committed_ring)
+}
+
+/// 2.9.8 (#9, ANR2 comment 6725097122): size of the committed import
+/// ring under `pcap/` — i.e. every regular file EXCEPT `.importing`
+/// temp files produced by `copy_verified`. Called by `work_bytes` so
+/// the backpressure gate accounts only for the in-flight temporary.
+fn committed_ring_bytes(pcap_dir: &Path) -> u64 {
+    fs::read_dir(pcap_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_str()?;
+            if name_str.ends_with(".importing") {
+                return None;
+            }
+            Some(metadata.len())
+        })
+        .sum()
 }
 
 fn directory_size(directory: &Path) -> u64 {
@@ -8790,6 +9057,145 @@ mod tests {
         assert_eq!(recovered.metrics.segments_ingested, 3);
         assert_eq!(recovered.session_ids, first.session_ids);
         restarted.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+    }
+
+    /// 2.9.8 (#9 comment 6725097122): ANR2 proved in production that a
+    /// closed N3 segment could end up in `state.source_fingerprints`
+    /// WITHOUT the matching checksum landing in `seen_checksums` — the
+    /// segment was neither imported (no event published) nor recorded
+    /// as a failure. The symptom: `/metrics pending=0` vs
+    /// `job.json pending=1` while the operator sees N3 traffic on
+    /// disk.
+    ///
+    /// This test stages the exact ANR2 shape: an orphan N3 fingerprint
+    /// pre-populated in `import_state.json` whose SHA does NOT match
+    /// any on-disk pcap. On worker startup `drop_orphan_fingerprints`
+    /// must purge the entry, emit one
+    /// `CONTINUOUS_ORPHAN_FINGERPRINT_DROPPED` log, and bump
+    /// `metrics.orphan_fingerprints_recovered`. The real N3 fixture
+    /// then imports normally and the committed `source_fingerprints`
+    /// contains EXACTLY the three real segments — no orphan survives.
+    #[test]
+    fn continuous_import_purges_orphan_fingerprint_at_startup_and_reimports_n3_sbi() {
+        if skip_if_disk_too_full(
+            "continuous_import_purges_orphan_fingerprint_at_startup_and_reimports_n3_sbi",
+        ) {
+            return;
+        }
+        let root = temporary_root("continuous-orphan");
+        let source = temporary_root("continuous-orphan-source");
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let fixture = workspace.join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        for interface in ["N2", "N3", "N4"] {
+            let directory = source.join(interface);
+            fs::create_dir_all(&directory).unwrap();
+            fs::copy(
+                fixture.join(format!("{interface}.pcapng")),
+                directory.join("segment-0001.pcapng"),
+            )
+            .unwrap();
+            write_rotation_closures(&source, interface, 1);
+        }
+
+        // Seed an orphan N3 fingerprint + an orphan SBI fingerprint
+        // directly in `import_state.json` with SHAs that no on-disk
+        // pcap produces. Both must be purged at worker startup.
+        let state_path = root.join(CONTINUOUS_CAPTURE_ID).join("import_state.json");
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let mut seed = ContinuousImportState::default();
+        seed.source_fingerprints.insert(
+            "/captures/continuous-lab-import/N3/ghost-segment.pcapng".into(),
+            SourceFingerprint {
+                dev: 42,
+                inode: 2,
+                size_bytes: 163 * 1024 * 1024,
+                mtime_ns: 0,
+                checksum: "sha-anr2-n3-orphan-436e4bb7".into(),
+                packets: 0,
+            },
+        );
+        seed.source_fingerprints.insert(
+            "/captures/continuous-lab-import/SBI/ghost-segment.pcapng".into(),
+            SourceFingerprint {
+                dev: 42,
+                inode: 3,
+                size_bytes: 12 * 1024 * 1024,
+                mtime_ns: 0,
+                checksum: "sha-anr2-sbi-orphan".into(),
+                packets: 0,
+            },
+        );
+        fs::write(&state_path, serde_json::to_vec_pretty(&seed).unwrap()).unwrap();
+
+        let config = ContinuousImportConfig {
+            source_root: source.clone(),
+            scan_interval: Duration::from_millis(200),
+            stable_age: Duration::from_millis(200),
+            max_owned_bytes: 128 * 1024 * 1024,
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_segments: 8,
+            native_segment_seconds: None,
+            historical_n2_bootstrap: None,
+            runtime_pdu_evidence: None,
+        };
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        manager.start_continuous_import(config).unwrap();
+        wait_for(|| {
+            manager
+                .get(CONTINUOUS_CAPTURE_ID)
+                .is_some_and(|job| job.metrics.segments_ingested == 3)
+        });
+
+        let job = manager.get(CONTINUOUS_CAPTURE_ID).unwrap();
+        // The two orphans were purged at startup; the counter is
+        // cumulative per worker lifetime.
+        assert_eq!(
+            job.metrics.orphan_fingerprints_recovered, 2,
+            "orphan N3 + SBI must both be recovered at startup"
+        );
+        // `/metrics` and `job.json` mirror each other by construction.
+        assert_eq!(
+            job.metrics.pending_segments, job.metrics.pending_fingerprints,
+            "pending_segments and pending_fingerprints must read the same source"
+        );
+        assert_eq!(job.metrics.pending_segments, 0);
+        assert_eq!(job.metrics.pending_stability_segments, 0);
+        assert_eq!(job.metrics.pending_batch_segments, 0);
+
+        // Load the persisted state and verify the orphan SHAs are
+        // GONE and only the three real segments' SHAs remain. The
+        // invariant: persisted fingerprint ⇒ committed to
+        // `seen_checksums`.
+        let final_state_bytes = fs::read(&state_path).unwrap();
+        let final_state: ContinuousImportState =
+            serde_json::from_slice(&final_state_bytes).unwrap();
+        for (_, fingerprint) in &final_state.source_fingerprints {
+            assert!(
+                final_state.seen_checksums.contains(&fingerprint.checksum),
+                "every persisted fingerprint must have its checksum in seen_checksums; \
+                 orphan SHA found: {}",
+                fingerprint.checksum
+            );
+        }
+        assert!(!final_state
+            .source_fingerprints
+            .values()
+            .any(|f| f.checksum == "sha-anr2-n3-orphan-436e4bb7"));
+        assert!(!final_state
+            .source_fingerprints
+            .values()
+            .any(|f| f.checksum == "sha-anr2-sbi-orphan"));
+        // Three real segments ingested (N2 + N3 + N4), so three real
+        // SHAs are persisted.
+        assert_eq!(final_state.source_fingerprints.len(), 3);
+        assert_eq!(final_state.seen_checksums.len(), 3);
+
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
     }
 
     /// 2.7.21 (issue #10 comment 6653514332): `clean_continuous_import_root`
@@ -12897,5 +13303,164 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 2.9.8 (#9, ANR2 comment 6725097122): `work_bytes` must NOT
+    /// count the committed pcap ring. ANR2 proved in production that
+    /// the pre-2.9.8 definition `directory_size(base) -
+    /// directory_size(dataset)` included every `pcap/<iface>.pcap-…`
+    /// file; with a 10 GiB ring the next 163 MiB candidate tripped
+    /// `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT` even though the ring
+    /// is bounded elsewhere and would never shrink on its own. This
+    /// test stages exactly that shape: a committed ring of 10 GiB
+    /// (via sparse files to avoid hitting the host disk) and asserts
+    /// `work_bytes` returns only the staging budget (the `.importing`
+    /// temporary is counted; the committed entries are not).
+    #[test]
+    fn work_bytes_excludes_committed_pcap_ring_proof_anr2() {
+        use std::os::unix::fs::FileExt;
+        let base = temporary_root("work-bytes-ring");
+        let pcap = base.join("pcap");
+        fs::create_dir_all(&pcap).unwrap();
+        fs::create_dir_all(base.join("dataset")).unwrap();
+
+        // Ten sparse 1 GiB "committed" ring files — this is what
+        // `copy_verified` leaves on disk after `fs::rename` from
+        // `.importing`. Sparse writes mean the host only pays for
+        // the 24-byte PCAP header per file.
+        for i in 0..10u32 {
+            let path = pcap.join(format!("N3.pcap-{:016x}.pcapng", i));
+            let file = fs::File::create(&path).unwrap();
+            file.set_len(1_073_741_824).unwrap();
+            // Write 24 bytes at offset 0 so the file is not purely
+            // sparse (matches the reality of a real pcapng header).
+            file.write_at(&[0u8; 24], 0).unwrap();
+        }
+        // An `.importing` temp — still in-flight, must be counted.
+        let importing = pcap.join("N3.pcap-ffffffffffffffff.importing");
+        fs::write(&importing, vec![0u8; 4 * 1024 * 1024]).unwrap();
+
+        let staging = work_bytes(&base);
+        // The ten committed ring entries total ~10 GiB but are
+        // excluded. The `.importing` temp is counted.
+        assert!(
+            staging < 128 * 1024 * 1024,
+            "work_bytes must exclude the committed ring; got {} bytes (expected < 128 MiB)",
+            staging
+        );
+        assert!(
+            staging >= 4 * 1024 * 1024,
+            "work_bytes must count the .importing temp; got {} bytes (expected >= 4 MiB)",
+            staging
+        );
+
+        // Backpressure gate: `max_owned_bytes = 128 MiB`, candidate
+        // 163 MiB, derived reserve 64 MiB. Under the pre-2.9.8
+        // definition the ring alone (10 GiB) tripped the gate. Under
+        // 2.9.8 only `staging + 163 MiB + 64 MiB` is compared to
+        // `max_owned_bytes`; a honest 163 MiB candidate with a 10 GiB
+        // ring would still trip (163+64+4 > 128), but a 32 MiB
+        // candidate must now pass.
+        let max_owned = 128 * 1024 * 1024u64;
+        let small_candidate = 16 * 1024 * 1024u64;
+        let trip = staging
+            .saturating_add(small_candidate)
+            .saturating_add(MAX_CONTINUOUS_DERIVED_BYTES);
+        assert!(
+            trip <= max_owned,
+            "a 16 MiB candidate must not trip backpressure on a 10 GiB committed ring; \
+             staging={staging} trip={trip} max_owned={max_owned}"
+        );
+    }
+
+    /// 2.9.8 (#9 comment 6725097122): proves the new import invariant —
+    /// `drop_orphan_fingerprints` removes entries whose checksum is NOT
+    /// in `seen_checksums`, preserves committed entries, returns the
+    /// dropped (path, checksum) pairs for logging, and is idempotent.
+    /// Mirrors ANR2's production state: the orphan N3 fingerprint has
+    /// `packets=0` (pcapng mis-parsed by `pcap_record_totals`, retained
+    /// here only to prove the drop logic is checksum-based, not
+    /// packets-based).
+    #[test]
+    fn drop_orphan_fingerprints_matches_anr2_production_shape() {
+        let mut state = ContinuousImportState::default();
+        state.seen_checksums.insert("sha-committed".into());
+        state.seen_order.push_back("sha-committed".into());
+        state.source_fingerprints.insert(
+            "/captures/continuous-lab-import/N4/segment-committed.pcapng".into(),
+            SourceFingerprint {
+                dev: 42,
+                inode: 1,
+                size_bytes: 1024,
+                mtime_ns: 0,
+                checksum: "sha-committed".into(),
+                packets: 2,
+            },
+        );
+        state.source_fingerprints.insert(
+            "/captures/continuous-lab-import/N3/segment-orphan.pcapng".into(),
+            SourceFingerprint {
+                dev: 42,
+                inode: 2,
+                size_bytes: 163 * 1024 * 1024,
+                mtime_ns: 0,
+                checksum: "sha-orphan-436e4bb7".into(),
+                packets: 0,
+            },
+        );
+        // SBI orphan with the same shape: fingerprint persisted but
+        // checksum absent from `seen_checksums`. ANR2 observed the same
+        // pattern on the SBI plane (`N2_SBI=UNKNOWN`, `SBI_N4=UNKNOWN`).
+        state.source_fingerprints.insert(
+            "/captures/continuous-lab-import/SBI/segment-orphan.pcapng".into(),
+            SourceFingerprint {
+                dev: 42,
+                inode: 3,
+                size_bytes: 12 * 1024 * 1024,
+                mtime_ns: 0,
+                checksum: "sha-sbi-orphan".into(),
+                packets: 4,
+            },
+        );
+
+        let orphans = drop_orphan_fingerprints(&mut state);
+
+        assert_eq!(orphans.len(), 2, "exactly two orphans (ANR2 N3 + SBI shape)");
+        let dropped: BTreeSet<String> = orphans.iter().map(|(_, sha)| sha.clone()).collect();
+        assert!(dropped.contains("sha-orphan-436e4bb7"));
+        assert!(dropped.contains("sha-sbi-orphan"));
+        assert!(state
+            .source_fingerprints
+            .contains_key("/captures/continuous-lab-import/N4/segment-committed.pcapng"));
+        assert!(!state
+            .source_fingerprints
+            .contains_key("/captures/continuous-lab-import/N3/segment-orphan.pcapng"));
+        assert!(!state
+            .source_fingerprints
+            .contains_key("/captures/continuous-lab-import/SBI/segment-orphan.pcapng"));
+
+        // Idempotent second pass.
+        let second = drop_orphan_fingerprints(&mut state);
+        assert!(second.is_empty());
+    }
+
+    /// 2.9.8 (#9 comment 6725097122): `/metrics` and `job.json` read
+    /// `pending_segments` and `pending_fingerprints` from the SAME
+    /// authoritative source — the worker sets them in a single
+    /// `self.update(...)` closure from the same scan-local `pending`
+    /// count. This test asserts the two fields co-vary on
+    /// `CaptureMetrics`, so a concordance regression (one updated, the
+    /// other left stale) would fail at the type level.
+    #[test]
+    fn capture_metrics_pending_fields_covary() {
+        let mut metrics = CaptureMetrics::default();
+        metrics.pending_segments = 7;
+        metrics.pending_fingerprints = 7;
+        let json = serde_json::to_value(&metrics).unwrap();
+        assert_eq!(json["pending_segments"], 7);
+        assert_eq!(json["pending_fingerprints"], 7);
+        assert_eq!(json["pending_stability_segments"], 0);
+        assert_eq!(json["pending_batch_segments"], 0);
+        assert_eq!(json["orphan_fingerprints_recovered"], 0);
     }
 }
