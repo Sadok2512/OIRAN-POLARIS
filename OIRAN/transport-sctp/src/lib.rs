@@ -462,6 +462,37 @@ mod tests {
         let (_, incomplete) = r.finish();
         assert_eq!(incomplete, 1);
     }
+    /// 2.9.5 (devmat #9 T2) : ANR2 preuve 6714896530 — S1-MME 991
+    /// paquets PCAP / 424 événements / **254 paquets uniques publiés**
+    /// = FAIL/OUVERT. Un S1AP fragmenté sur N paquets SCTP produit UN
+    /// message avec `packet_references.len() == N`. Si une mesure
+    /// n'énumère que `packet_references[0]`, elle voit 254 au lieu
+    /// de 991. Ce test assure que la liste complète est préservée —
+    /// pas de perte interne de provenance côté reassembler.
+    #[test]
+    fn reassembled_message_preserves_every_fragment_packet_reference() {
+        let (p1, v1) = packet(1001, &data(2, 10, 4, 1, 60, b"ab")); // BEGIN
+        let (p2, v2) = packet(1002, &data(0, 11, 4, 1, 60, b"cd")); // MIDDLE
+        let (p3, v3) = packet(1003, &data(1, 12, 4, 1, 60, b"ef")); // END
+        let mut r = SctpReassembler::new();
+        assert!(r.consume(&p1, &v1).is_empty());
+        assert!(r.consume(&p2, &v2).is_empty());
+        let m = r.consume(&p3, &v3);
+        assert_eq!(m.len(), 1, "3 fragments → 1 message réassemblé");
+        assert_eq!(m[0].payload, b"abcdef");
+        // Le cœur de la régression : les 3 paquets physiques doivent
+        // tous apparaître dans packet_references, dans l'ordre BEGIN,
+        // MIDDLE, END. ANR2 doit mesurer la provenance via la liste
+        // entière, pas seulement `[0]`.
+        let numbers: Vec<u64> = m[0]
+            .packet_references
+            .iter()
+            .map(|r| r.packet_number)
+            .collect();
+        assert_eq!(numbers, vec![1001, 1002, 1003],
+            "packet_references doit énumérer tous les fragments; got {numbers:?}");
+    }
+
     #[test]
     fn idata_is_explicitly_unsupported() {
         let chunk = vec![64, 0, 0, 4];

@@ -334,6 +334,315 @@ fn parse_qfi(value: &str) -> Option<u8> {
         .and_then(|value| value.parse().ok())
 }
 
+// 2.9.5 (devmat #9 T1) : agrégation des messages keepalive par
+// (interface, paire de nœuds, type). ANR2 preuve 6714896530 : sur le
+// dataset de 1.23 M événements, Sxab 868 123 PFCP Heartbeats + S6a
+// 76 890 Diameter Device-Watchdog = 944 013 événements ≈ 76,6 % du
+// volume. Agréger comme GTP-U : compte, first/last packet_number en
+// ordre canonique (capture_id, packet_number), compteur d'échecs
+// (requête sans réponse), jamais ts. Pair de nœuds canonicalisée
+// (min, max) pour fusionner les deux directions req/resp.
+
+const MAX_KEEPALIVE_AGGREGATES: usize = 4096;
+
+/// Type de keepalive détecté sur un événement. `None` = message de
+/// session, conservé tel quel.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum KeepaliveKind {
+    PfcpHeartbeat,
+    DiameterWatchdog,
+    Gtpv2Echo,
+    GtpuEcho,
+}
+
+impl KeepaliveKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::PfcpHeartbeat => "PFCP_HEARTBEAT",
+            Self::DiameterWatchdog => "DIAMETER_DEVICE_WATCHDOG",
+            Self::Gtpv2Echo => "GTPV2_ECHO",
+            Self::GtpuEcho => "GTPU_ECHO",
+        }
+    }
+
+    fn aggregated_message_name(&self) -> &'static str {
+        match self {
+            Self::PfcpHeartbeat => "PFCP Heartbeat (aggregated)",
+            Self::DiameterWatchdog => "Device-Watchdog (aggregated)",
+            Self::Gtpv2Echo => "GTPv2 Echo (aggregated)",
+            Self::GtpuEcho => "GTP-U Echo (aggregated)",
+        }
+    }
+}
+
+/// Classification keepalive d'un événement. `is_request` est toujours
+/// `Some(true)` pour une requête et `Some(false)` pour une réponse.
+/// Un décodeur pourrait un jour émettre un message de type
+/// « Notification » mono-directionnel : alors `is_request = None` et
+/// il est compté comme requête (comportement par défaut).
+fn classify_keepalive(event: &NormalizedEvent) -> Option<(KeepaliveKind, bool)> {
+    let name = event.message_name.as_str();
+    match event.protocol {
+        Protocol::Pfcp => match name {
+            "PFCP Heartbeat Request" => Some((KeepaliveKind::PfcpHeartbeat, true)),
+            "PFCP Heartbeat Response" => Some((KeepaliveKind::PfcpHeartbeat, false)),
+            _ => None,
+        },
+        Protocol::Diameter => match name {
+            "Device-Watchdog-Request" => Some((KeepaliveKind::DiameterWatchdog, true)),
+            "Device-Watchdog-Answer" => Some((KeepaliveKind::DiameterWatchdog, false)),
+            _ => None,
+        },
+        Protocol::Gtpv2c => match name {
+            "Echo Request" => Some((KeepaliveKind::Gtpv2Echo, true)),
+            "Echo Response" => Some((KeepaliveKind::Gtpv2Echo, false)),
+            _ => None,
+        },
+        Protocol::Gtpu => match name {
+            "Echo Request" => Some((KeepaliveKind::GtpuEcho, true)),
+            "Echo Response" => Some((KeepaliveKind::GtpuEcho, false)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct KeepaliveKey {
+    interface: String,
+    kind: KeepaliveKind,
+    // Paire de nœuds canonicalisée (min, max) pour fusionner les deux
+    // directions requête/réponse sur un même échange.
+    pair_low: String,
+    pair_high: String,
+}
+
+#[derive(Clone, Debug)]
+struct KeepaliveAggregate {
+    event: NormalizedEvent,
+    request_count: u64,
+    response_count: u64,
+    first_capture_id: String,
+    first_packet_number: u64,
+    first_event_id: String,
+    last_capture_id: String,
+    last_packet_number: u64,
+    last_event_id: String,
+    first_packet: Option<event_schema::PacketReference>,
+    last_packet: Option<event_schema::PacketReference>,
+}
+
+#[derive(Default)]
+struct KeepaliveAggregator {
+    flows: BTreeMap<KeepaliveKey, KeepaliveAggregate>,
+}
+
+impl KeepaliveAggregator {
+    fn observe(&mut self, event: NormalizedEvent) -> Result<Option<NormalizedEvent>, String> {
+        let Some((kind, is_request)) = classify_keepalive(&event) else {
+            return Ok(Some(event));
+        };
+        let src = event.source_endpoint.address.clone();
+        let dst = event.destination_endpoint.address.clone();
+        let (pair_low, pair_high) = if src <= dst {
+            (src, dst)
+        } else {
+            (dst, src)
+        };
+        let key = KeepaliveKey {
+            interface: event.interface.clone(),
+            kind,
+            pair_low,
+            pair_high,
+        };
+        let packet_number = event
+            .packet_references
+            .first()
+            .map(|p| p.packet_number)
+            .unwrap_or_default();
+        let first_packet = event.packet_references.first().cloned();
+        let last_packet = event.packet_references.last().cloned();
+        if let Some(flow) = self.flows.get_mut(&key) {
+            if is_request {
+                flow.request_count = flow.request_count.saturating_add(1);
+            } else {
+                flow.response_count = flow.response_count.saturating_add(1);
+            }
+            // Ordre canonique (capture_id, packet_number, event_id) —
+            // jamais ts. On met à jour first/last si la clé ordonnée
+            // courante dépasse / précède celle enregistrée.
+            let cur_key = (
+                event.capture_id.as_str(),
+                packet_number,
+                event.event_id.as_str(),
+            );
+            if cur_key
+                < (
+                    flow.first_capture_id.as_str(),
+                    flow.first_packet_number,
+                    flow.first_event_id.as_str(),
+                )
+            {
+                flow.first_capture_id = event.capture_id.clone();
+                flow.first_packet_number = packet_number;
+                flow.first_event_id = event.event_id.clone();
+                flow.first_packet = first_packet;
+            }
+            if cur_key
+                > (
+                    flow.last_capture_id.as_str(),
+                    flow.last_packet_number,
+                    flow.last_event_id.as_str(),
+                )
+            {
+                flow.last_capture_id = event.capture_id.clone();
+                flow.last_packet_number = packet_number;
+                flow.last_event_id = event.event_id.clone();
+                flow.last_packet = last_packet;
+            }
+            return Ok(None);
+        }
+        if self.flows.len() >= MAX_KEEPALIVE_AGGREGATES {
+            return Err("KEEPALIVE_AGGREGATE_CARDINALITY_LIMIT".to_string());
+        }
+        let first_cap = event.capture_id.clone();
+        let first_pn = packet_number;
+        let first_evt = event.event_id.clone();
+        let request_count = if is_request { 1 } else { 0 };
+        let response_count = if is_request { 0 } else { 1 };
+        self.flows.insert(
+            key,
+            KeepaliveAggregate {
+                event,
+                request_count,
+                response_count,
+                first_capture_id: first_cap.clone(),
+                first_packet_number: first_pn,
+                first_event_id: first_evt.clone(),
+                last_capture_id: first_cap,
+                last_packet_number: first_pn,
+                last_event_id: first_evt,
+                first_packet: first_packet.clone(),
+                last_packet: last_packet.or(first_packet),
+            },
+        );
+        Ok(None)
+    }
+
+    fn finish(self) -> Vec<NormalizedEvent> {
+        self.flows
+            .into_iter()
+            .map(|(key, mut flow)| {
+                let message_count = flow.request_count.saturating_add(flow.response_count);
+                let failure_count = flow.request_count.saturating_sub(flow.response_count);
+                let first_packet = flow.first_packet.clone();
+                let last_packet = flow.last_packet.clone();
+                flow.event.packet_references.clear();
+                if let Some(packet) = first_packet {
+                    flow.event.packet_references.push(packet);
+                }
+                if let Some(packet) = last_packet {
+                    if flow
+                        .event
+                        .packet_references
+                        .last()
+                        .map(|first| first.packet_number != packet.packet_number)
+                        .unwrap_or(true)
+                    {
+                        flow.event.packet_references.push(packet);
+                    }
+                }
+                flow.event.message_name = key.kind.aggregated_message_name().into();
+                // Retire les identifiers volatils pour un aggregate.
+                flow.event
+                    .session_identifiers
+                    .retain(|item| item.name != "sequence_number" && item.name != "fseid_seid");
+                // Libère les IEs individuelles — on expose l'évidence
+                // statistique à la place.
+                flow.event.information_elements.clear();
+                for (name, value) in [
+                    ("aggregate_keepalive_kind", key.kind.as_str().to_string()),
+                    ("aggregate_node_pair_low", key.pair_low.clone()),
+                    ("aggregate_node_pair_high", key.pair_high.clone()),
+                    ("aggregate_request_count", flow.request_count.to_string()),
+                    ("aggregate_response_count", flow.response_count.to_string()),
+                    ("aggregate_message_count", message_count.to_string()),
+                    ("aggregate_failure_count", failure_count.to_string()),
+                    (
+                        "aggregate_first_capture_id",
+                        flow.first_capture_id.clone(),
+                    ),
+                    (
+                        "aggregate_first_packet_number",
+                        flow.first_packet_number.to_string(),
+                    ),
+                    ("aggregate_first_event_id", flow.first_event_id.clone()),
+                    ("aggregate_last_capture_id", flow.last_capture_id.clone()),
+                    (
+                        "aggregate_last_packet_number",
+                        flow.last_packet_number.to_string(),
+                    ),
+                    ("aggregate_last_event_id", flow.last_event_id.clone()),
+                ] {
+                    flow.event.information_elements.push(InformationElement {
+                        id: None,
+                        name: name.into(),
+                        length: value.len() as u32,
+                        value: Some(value),
+                        raw_sha256: None,
+                        status: DecodeStatus::Decoded,
+                    });
+                }
+                flow.event.raw_payload_reference = format!(
+                    "keepalive-aggregate:{}:{}:{}-{}:{}-{}",
+                    key.interface,
+                    key.kind.as_str(),
+                    key.pair_low,
+                    key.pair_high,
+                    flow.first_packet_number,
+                    flow.last_packet_number,
+                );
+                flow.event.evidence_references = flow
+                    .event
+                    .packet_references
+                    .iter()
+                    .map(|packet| EvidenceReference {
+                        state: EvidenceState::Exact,
+                        kind: "packet-provenance".into(),
+                        reference: format!(
+                            "{}#packet-{}",
+                            packet.source_file, packet.packet_number
+                        ),
+                    })
+                    .collect();
+                flow.event.decoder_name =
+                    "live-probe-keepalive-aggregator".into();
+                flow.event.decoder_version = VERSION.into();
+                flow.event.assign_deterministic_id();
+                flow.event
+            })
+            .collect()
+    }
+}
+
+// 2.9.5 (devmat #9 T3) : règle de doublon documentée. Un doublon =
+// même paquet (capture_id, packet_number, byte_offset) ET même
+// protocole ET même message_name. S1AP + NAS-EPS-MM du même paquet
+// sont deux message_names DIFFÉRENTS → deux événements légitimes, pas
+// un doublon. Deux S1AP InitialContextSetupRequest sur le même paquet
+// = doublon.
+fn is_duplicate(a: &NormalizedEvent, b: &NormalizedEvent) -> bool {
+    if a.protocol != b.protocol || a.message_name != b.message_name {
+        return false;
+    }
+    let (Some(ar), Some(br)) = (a.packet_references.first(), b.packet_references.first()) else {
+        return false;
+    };
+    a.capture_id == b.capture_id
+        && ar.packet_number == br.packet_number
+        && ar.byte_offset == br.byte_offset
+}
+
 fn allowlisted_historical_n2_bootstrap(path: &Path) -> bool {
     path.is_absolute()
         && path.is_file()
@@ -3913,6 +4222,7 @@ impl CaptureManager {
                 let aggregate_n3 = capture_id == CONTINUOUS_CAPTURE_ID
                     && interface.interface.eq_ignore_ascii_case("N3");
                 let mut n3_aggregator = N3FlowAggregator::default();
+                let mut keepalive_aggregator = KeepaliveAggregator::default();
                 let mut individual_events = 0usize;
                 let mut report = decode_capture_streaming(
                     &DecodeConfig {
@@ -3923,6 +4233,15 @@ impl CaptureManager {
                     },
                     &pseudonym_key,
                     |event| {
+                        // 2.9.5 (devmat #9 T1) : les keepalives (PFCP HB,
+                        // Diameter Device-Watchdog, GTPv2 Echo, GTP-U Echo)
+                        // sont toujours agrégés par (interface, paire de
+                        // nœuds, kind) — ANR2 preuve 6714896530 montre
+                        // qu'ils dominent >75 % du volume.
+                        let event = match keepalive_aggregator.observe(event)? {
+                            None => return Ok(()),
+                            Some(event) => event,
+                        };
                         if aggregate_n3 && event.protocol == Protocol::Gtpu {
                             return n3_aggregator.observe(event);
                         }
@@ -3933,15 +4252,20 @@ impl CaptureManager {
                             .map_err(display_error)
                     },
                 )?;
-                if aggregate_n3 {
-                    let aggregates = n3_aggregator.finish();
-                    report.events = individual_events.saturating_add(aggregates.len());
-                    for event in aggregates {
-                        decoded_spool
-                            .write_all(event.to_json().as_bytes())
-                            .and_then(|_| decoded_spool.write_all(b"\n"))
-                            .map_err(display_error)?;
-                    }
+                let n3_aggregates = if aggregate_n3 {
+                    n3_aggregator.finish()
+                } else {
+                    Vec::new()
+                };
+                let keepalive_aggregates = keepalive_aggregator.finish();
+                report.events = individual_events
+                    .saturating_add(n3_aggregates.len())
+                    .saturating_add(keepalive_aggregates.len());
+                for event in n3_aggregates.into_iter().chain(keepalive_aggregates) {
+                    decoded_spool
+                        .write_all(event.to_json().as_bytes())
+                        .and_then(|_| decoded_spool.write_all(b"\n"))
+                        .map_err(display_error)?;
                 }
                 let key = path
                     .file_name()
@@ -11988,5 +12312,300 @@ mod tests {
         archive_stale_captures(&events_path, &archive_root, 5000).unwrap();
         let after_ids = read_event_ids(&events_path);
         assert_eq!(after_ids, before_ids, "mixed-age capture is kept whole");
+    }
+
+    // 2.9.5 (devmat #9 T1 + T3) : tests du KeepaliveAggregator et de
+    // la règle de doublon. Volume ANR2 preuve 6714896530 : Sxa/Sxb
+    // 868 123 heartbeats PFCP + S6a 76 890 watchdogs Diameter >75 %.
+
+    fn keepalive_event(
+        id: &str,
+        interface: &str,
+        protocol: Protocol,
+        message_name: &str,
+        source: &str,
+        destination: &str,
+        capture_id: &str,
+        packet_number: u64,
+    ) -> NormalizedEvent {
+        NormalizedEvent {
+            event_id: id.into(),
+            parent_event_id: None,
+            probe_id: "oiran-vprobe-local-01".into(),
+            capture_point_id: interface.into(),
+            capture_id: capture_id.into(),
+            packet_references: vec![event_schema::PacketReference {
+                source_file: "x.pcapng".into(),
+                source_sha256: None,
+                packet_number,
+                byte_offset: packet_number * 64,
+                interface_id: 0,
+                link_type: None,
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: 64,
+                original_length: 64,
+            }],
+            timestamp: event_schema::ExactTimestamp {
+                seconds: 1,
+                nanoseconds: packet_number as u32,
+                raw_ticks: 1_000_000_000 + packet_number,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            },
+            interface: interface.into(),
+            protocol,
+            message_name: message_name.into(),
+            message_type: 0,
+            procedure_code: None,
+            procedure: None,
+            security_state: None,
+            source_byte_offset: None,
+            source_endpoint: event_schema::Endpoint {
+                address: source.into(),
+                port: None,
+                network_function: None,
+            },
+            destination_endpoint: event_schema::Endpoint {
+                address: destination.into(),
+                port: None,
+                network_function: None,
+            },
+            direction: event_schema::Direction::RanToCore,
+            session_identifiers: vec![],
+            information_elements: vec![],
+            decoder_name: "test".into(),
+            decoder_version: "0".into(),
+            schema_version: NormalizedEvent::SCHEMA_VERSION,
+            decoding_status: event_schema::DecodeStatus::Decoded,
+            errors: vec![],
+            raw_payload_reference: format!("sha256:{id}"),
+            evidence_references: vec![],
+            sbi: None,
+        }
+    }
+
+    /// 1000 PFCP Heartbeat Requests + 1000 Responses du même couple de
+    /// nœuds collapsent en 1 aggregate avec request_count=1000,
+    /// response_count=1000, failure_count=0, et la paire canonique
+    /// (min, max) des adresses.
+    #[test]
+    fn keepalive_aggregator_collapses_pfcp_heartbeats_with_paired_request_response() {
+        let mut agg = KeepaliveAggregator::default();
+        for i in 1..=1000 {
+            let req = keepalive_event(
+                &format!("req-{i}"),
+                "Sxab",
+                Protocol::Pfcp,
+                "PFCP Heartbeat Request",
+                "10.0.0.1",
+                "10.0.0.2",
+                "sha256:cap-sxab",
+                i,
+            );
+            let resp = keepalive_event(
+                &format!("resp-{i}"),
+                "Sxab",
+                Protocol::Pfcp,
+                "PFCP Heartbeat Response",
+                "10.0.0.2",
+                "10.0.0.1",
+                "sha256:cap-sxab",
+                i + 10_000,
+            );
+            assert!(matches!(agg.observe(req), Ok(None)));
+            assert!(matches!(agg.observe(resp), Ok(None)));
+        }
+        let out = agg.finish();
+        assert_eq!(out.len(), 1, "une seule paire de nœuds → 1 aggregate");
+        let agg_event = &out[0];
+        assert_eq!(agg_event.message_name, "PFCP Heartbeat (aggregated)");
+        let find = |name: &str| {
+            agg_event
+                .information_elements
+                .iter()
+                .find(|ie| ie.name == name)
+                .and_then(|ie| ie.value.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(find("aggregate_request_count"), "1000");
+        assert_eq!(find("aggregate_response_count"), "1000");
+        assert_eq!(find("aggregate_message_count"), "2000");
+        assert_eq!(find("aggregate_failure_count"), "0");
+        assert_eq!(find("aggregate_node_pair_low"), "10.0.0.1");
+        assert_eq!(find("aggregate_node_pair_high"), "10.0.0.2");
+        assert_eq!(find("aggregate_first_packet_number"), "1");
+        // last = 10_000 + 1000 = 11_000 (dernière response)
+        assert_eq!(find("aggregate_last_packet_number"), "11000");
+    }
+
+    /// Un couple avec requêtes non appariées produit un
+    /// `aggregate_failure_count` > 0 (jamais masqué).
+    #[test]
+    fn keepalive_aggregator_counts_unmatched_requests_as_failures() {
+        let mut agg = KeepaliveAggregator::default();
+        // 100 DWR, 42 DWA → 58 failures.
+        for i in 1..=100 {
+            let req = keepalive_event(
+                &format!("dwr-{i}"),
+                "S6a",
+                Protocol::Diameter,
+                "Device-Watchdog-Request",
+                "10.0.1.1",
+                "10.0.1.2",
+                "sha256:cap-s6a",
+                i,
+            );
+            assert!(matches!(agg.observe(req), Ok(None)));
+        }
+        for i in 1..=42 {
+            let resp = keepalive_event(
+                &format!("dwa-{i}"),
+                "S6a",
+                Protocol::Diameter,
+                "Device-Watchdog-Answer",
+                "10.0.1.2",
+                "10.0.1.1",
+                "sha256:cap-s6a",
+                i + 500,
+            );
+            assert!(matches!(agg.observe(resp), Ok(None)));
+        }
+        let out = agg.finish();
+        assert_eq!(out.len(), 1);
+        let find = |name: &str| {
+            out[0]
+                .information_elements
+                .iter()
+                .find(|ie| ie.name == name)
+                .and_then(|ie| ie.value.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(find("aggregate_request_count"), "100");
+        assert_eq!(find("aggregate_response_count"), "42");
+        assert_eq!(find("aggregate_failure_count"), "58");
+        assert_eq!(out[0].message_name, "Device-Watchdog (aggregated)");
+    }
+
+    /// Les messages de session (non-keepalive) passent à travers
+    /// l'aggregator sans être absorbés.
+    #[test]
+    fn keepalive_aggregator_passes_through_non_keepalive_session_events() {
+        let mut agg = KeepaliveAggregator::default();
+        let session = keepalive_event(
+            "evt-session-1",
+            "N4",
+            Protocol::Pfcp,
+            "PFCP Session Establishment Request",
+            "10.0.0.1",
+            "10.0.0.2",
+            "sha256:cap-n4",
+            7,
+        );
+        match agg.observe(session).expect("ok") {
+            Some(evt) => assert_eq!(evt.message_name, "PFCP Session Establishment Request"),
+            None => panic!("session messages must pass through, not be absorbed"),
+        }
+        assert_eq!(agg.finish().len(), 0, "no keepalive observed → no aggregate");
+    }
+
+    /// GTP-U Echo et GTPv2 Echo génèrent chacun leur aggregate séparé
+    /// même sur le même capture_id (protocoles distincts).
+    #[test]
+    fn keepalive_aggregator_separates_gtpu_echo_from_gtpv2_echo() {
+        let mut agg = KeepaliveAggregator::default();
+        for i in 1..=5 {
+            agg.observe(keepalive_event(
+                &format!("gu-{i}"),
+                "N3",
+                Protocol::Gtpu,
+                "Echo Request",
+                "10.0.0.1",
+                "10.0.0.2",
+                "sha256:cap",
+                i,
+            ))
+            .unwrap();
+        }
+        for i in 1..=3 {
+            agg.observe(keepalive_event(
+                &format!("gv-{i}"),
+                "N4",
+                Protocol::Gtpv2c,
+                "Echo Request",
+                "10.0.0.1",
+                "10.0.0.2",
+                "sha256:cap",
+                100 + i,
+            ))
+            .unwrap();
+        }
+        let out = agg.finish();
+        assert_eq!(out.len(), 2, "GTP-U Echo et GTPv2 Echo = 2 aggregates distincts");
+        let mut by_kind = std::collections::BTreeMap::new();
+        for e in &out {
+            let kind = e
+                .information_elements
+                .iter()
+                .find(|ie| ie.name == "aggregate_keepalive_kind")
+                .and_then(|ie| ie.value.clone())
+                .unwrap();
+            by_kind.insert(kind, e.clone());
+        }
+        assert!(by_kind.contains_key("GTPU_ECHO"));
+        assert!(by_kind.contains_key("GTPV2_ECHO"));
+    }
+
+    /// 2.9.5 T3 : la règle de doublon documentée. Même paquet
+    /// (capture_id, packet_number, byte_offset) + même protocole +
+    /// même message_name = doublon. S1AP et NAS-EPS-MM du même paquet
+    /// = PAS un doublon (message_name différents). Deux S1AP du même
+    /// paquet avec le même message_name = doublon.
+    #[test]
+    fn is_duplicate_rule_separates_s1ap_from_nas_eps_mm_on_same_packet() {
+        let s1ap = keepalive_event(
+            "evt-s1ap",
+            "S1-MME",
+            Protocol::S1ap,
+            "InitialContextSetupRequest",
+            "10.0.0.1",
+            "10.0.0.2",
+            "sha256:cap-s1mme",
+            42,
+        );
+        let mut nas = s1ap.clone();
+        nas.event_id = "evt-nas".into();
+        nas.protocol = Protocol::NasEpsMm;
+        nas.message_name = "Attach Accept".into();
+        // S1AP et NAS-EPS-MM du même paquet (même capture_id, même
+        // packet_number, même byte_offset) — protocoles ET
+        // message_names différents → PAS un doublon.
+        assert!(!is_duplicate(&s1ap, &nas),
+            "S1AP + NAS-EPS-MM du même paquet sont deux événements légitimes");
+
+        let mut s1ap_bis = s1ap.clone();
+        s1ap_bis.event_id = "evt-s1ap-dup".into();
+        // Même protocole, même message_name, même paquet → doublon.
+        assert!(is_duplicate(&s1ap, &s1ap_bis),
+            "deux S1AP InitialContextSetupRequest sur le même paquet = doublon");
+
+        let mut s1ap_other_packet = s1ap.clone();
+        s1ap_other_packet.event_id = "evt-s1ap-other".into();
+        s1ap_other_packet.packet_references[0].packet_number = 99;
+        s1ap_other_packet.packet_references[0].byte_offset = 99 * 64;
+        // Même protocole + message_name mais paquet différent → PAS un doublon.
+        assert!(!is_duplicate(&s1ap, &s1ap_other_packet),
+            "deux S1AP du même type mais paquets différents = deux événements");
+
+        let mut s1ap_other_offset = s1ap.clone();
+        s1ap_other_offset.event_id = "evt-s1ap-off".into();
+        s1ap_other_offset.packet_references[0].byte_offset = 42 * 64 + 1; // même packet_number mais byte_offset différent (impossible en pratique, test de rigueur)
+        assert!(!is_duplicate(&s1ap, &s1ap_other_offset),
+            "byte_offset différent = pas un doublon");
     }
 }

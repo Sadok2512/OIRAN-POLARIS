@@ -1,5 +1,233 @@
 # Changelog
 
+## OIRAN API 2.9.5 — 2026-11-08 — Keepalive aggregation + duplicate rule + S1-MME fragmentation note (devmat T1/T2/T3 — ANR2 #9 comment 6714896530)
+
+### Mesure ANR2 à l'entrée
+
+Sur le dataset 1 232 678 événements :
+
+- **Sxa/Sxb** 868 123 heartbeats PFCP + **S6a** 76 890 watchdogs
+  Diameter = **944 013 keepalives = 76,58 %** du volume d'événements.
+- **S1-MME** 991 paquets PCAP → 424 événements → 254 paquets uniques
+  publiés (verdict FAIL / OUVERT côté ANR2).
+- Doublons S1AP + NAS du même paquet : 273 groupes / 296 excédents
+  (dont 166 nouveaux S1AP transport/contexte + NAS-EPS-MM) — règle
+  quantitative demandée : FAIL dès > 0, mais SANS définition
+  explicite de ce qu'est un doublon.
+
+### T1 — Agrégation keepalive (live-probe 0.4.20 → 0.4.21)
+
+Nouveau `KeepaliveAggregator` (`live-probe/src/lib.rs:347-592`) sur
+le même patron que `N3FlowAggregator` :
+
+**Reconnaissance** — `classify_keepalive(event)` (`:383`) retourne
+`Some((kind, is_request))` pour :
+
+- `Protocol::Pfcp` + `"PFCP Heartbeat Request"` / `Response` → `PfcpHeartbeat`.
+- `Protocol::Diameter` + `"Device-Watchdog-Request"` / `-Answer` → `DiameterWatchdog`.
+- `Protocol::Gtpv2c` + `"Echo Request"` / `Response` → `Gtpv2Echo`.
+- `Protocol::Gtpu` + `"Echo Request"` / `Response` → `GtpuEcho`.
+
+Messages de session (`PFCP Session Establishment Request`,
+`CreateSessionRequest`, `G-PDU`, …) : **passent à travers** sans
+agrégation (`observe` retourne `Ok(Some(event))`).
+
+**Clé d'agrégation** — `(interface, keepalive_kind, pair_low, pair_high)`
+où `pair_low = min(src.address, dst.address)` et
+`pair_high = max(src.address, dst.address)`. **Fusionne les deux
+directions req/resp** sur une même paire de nœuds en un seul
+aggregate, comme demandé par devmat.
+
+**Évidence émise** (`:555-594`, IEs du NormalizedEvent agrégé) :
+
+- `aggregate_keepalive_kind` ∈ `PFCP_HEARTBEAT | DIAMETER_DEVICE_WATCHDOG |
+  GTPV2_ECHO | GTPU_ECHO`.
+- `aggregate_node_pair_low`, `aggregate_node_pair_high`.
+- `aggregate_request_count`, `aggregate_response_count`,
+  `aggregate_message_count`.
+- `aggregate_failure_count = max(0, request_count - response_count)` —
+  **compteur d'échecs, jamais masqué** (devmat rule).
+- `aggregate_first_capture_id`, `aggregate_first_packet_number`,
+  `aggregate_first_event_id`,
+  `aggregate_last_capture_id`, `aggregate_last_packet_number`,
+  `aggregate_last_event_id` — ordre **canonique** `(capture_id,
+  packet_number, event_id)` jamais ts.
+
+**Provenance packet_references** : premier et dernier paquet de la
+fenêtre canonique, `raw_payload_reference = keepalive-aggregate:
+<interface>:<kind>:<pair>:<first_pn>-<last_pn>`,
+`evidence_references` dérivées des mêmes paquets. `event_id` est
+réassigné déterministiquement via `assign_deterministic_id`.
+
+**Message de session restent 1 événement chacun** — confirmé par test
+`keepalive_aggregator_passes_through_non_keepalive_session_events`.
+
+**Intégration** (`live-probe/src/lib.rs:4234-4271`, closure de
+`decode_capture_streaming`) : les événements passent d'abord par
+`keepalive_aggregator.observe` ; s'ils sont absorbés (keepalive), on
+sort immédiatement ; s'ils passent à travers, l'ancien aiguillage
+`aggregate_n3 && Protocol::Gtpu → n3_aggregator` s'applique. Les deux
+collecteurs sont flushés en fin de boucle par segment.
+
+**Borne** : `MAX_KEEPALIVE_AGGREGATES = 4096` — fail-closed par
+segment.
+
+**Projection sur le dataset ANR2** (chaque chiffre a sa commande) :
+
+| Interface | Événements avant | Kind | Aggregates après |
+|---|---:|---|---:|
+| Sxa/Sxb | 868 123 | PFCP_HEARTBEAT | ≤ 4 096 (en pratique ~1-10 par paire) |
+| S6a | 76 890 | DIAMETER_DEVICE_WATCHDOG | ≤ 4 096 |
+| N3 / S1-U / S5-U | 0 Echo observés | — | 0 |
+
+Réduction attendue sur les 944 013 keepalives : **>99 %** en nombre
+d'événements. Sur taille jsonl : extrapolation ~944 k × 2 kB ≈ **1,88 GB
+économisés** → repasse largement sous 1 GB au total (avant même
+2.9.4 compact JSON).
+
+### T2 — S1-MME 991 PCAP → 424 événements → 254 paquets uniques : analyse (**OUVERT**)
+
+La cause **n'est pas une perte dans le reassembler**. Lecture code :
+
+- `transport-sctp/src/lib.rs:177-215` — `SctpReassembler` accumule
+  `refs: Vec<PacketReference>` à chaque chunk DATA (BEGIN + MIDDLE
+  + END). Fragments préservés.
+- `decoder-s1ap/src/lib.rs:536` et `:623` — les deux events
+  (parent S1AP + child NAS) copient `input.packet_references.to_vec()`.
+- `oiran-decode/src/lib.rs:238-240` — `DecoderInput.packet_references`
+  passe la liste complète du `SctpMessage.packet_references`.
+
+**Hypothèse principale (non prouvable sans run réel)** : un S1AP de
+3-4 KB est fragmenté en 4 paquets SCTP (MTU ≈ 1 500 B). `tshark -Y
+'s1ap'` matche les 4 paquets (il reassemble puis tague TOUS les
+paquets contributeurs). 991 / 4 ≈ 248 messages, ce qui cadre avec
+les **254 paquets uniques** ANR2 si la mesure n'énumère que
+`packet_references[0]` (le BEGIN fragment, souvent 1ᵉʳ ref).
+
+Ratio événements/paquet : 424 / 254 = 1,67 — cohérent avec
+« ~2 événements S1AP+NAS par paquet BEGIN en moyenne ».
+
+**Nouveau test** — `transport-sctp` :
+`reassembled_message_preserves_every_fragment_packet_reference`
+(`transport-sctp/src/lib.rs:466+`) : un message S1AP de 3 fragments
+(BEGIN packet 1001, MIDDLE 1002, END 1003) doit produire 1
+`SctpMessage` avec
+`packet_references.iter().map(|r| r.packet_number).collect::<Vec<_>>()
+== vec![1001, 1002, 1003]`.
+
+**Demande ANR2** pour clôturer : refaire la mesure avec la liste
+complète :
+
+```sh
+jq -r '.packet_references[].packet_number' oiran_events.jsonl |
+  awk -v cap="$(jq -r '.capture_id' oiran_events.jsonl | head -1)" '{print cap":"$1}' |
+  sort -u | wc -l
+```
+
+Si ce chiffre vaut ≈ 991, le défaut initial était une **choix de
+mesure** et non une perte. Si < 991, un fragment END-seul sans
+BEGIN doit exister côté capture : alors cause dans
+`transport-sctp:224-229` (`non-beginning DATA fragment has no
+assembly`, incrémente `SctpErrorKind::Incomplete` mais **ne
+produit pas d'event**). Ces cas seraient visibles dans
+`DecodeReport.incomplete_sctp` sur le run.
+
+**T2 reste OUVERT** jusqu'à publication par ANR2 de :
+
+1. `jq -r '.packet_references[].packet_number'` sur une capture
+   S1-MME fermée (compte uniques par capture_id).
+2. `decode_reports["<s1mme.pcapng>"].incomplete_sctp` et
+   `.sctp_errors`.
+
+### T3 — Règle de doublon documentée + test (live-probe 0.4.21)
+
+Nouvelle fonction pure `is_duplicate(a, b)` (`live-probe/src/lib.rs:634`) :
+
+> Deux événements sont des **doublons** ssi ils ont **le même
+> `protocol`** ET **le même `message_name`** ET **le même paquet**
+> `(capture_id, packet_number, byte_offset)`.
+
+**S1AP + NAS-EPS-MM** du même paquet = `protocol` différent (`S1AP`
+vs `NAS-EPS-MM`) → **PAS un doublon**. C'est deux événements
+légitimes, un par protocole dissecté dans la même PDU.
+
+**Deux S1AP InitialContextSetupRequest** sur le même paquet =
+même `protocol` + même `message_name` + même paquet → **doublon**.
+
+Test `is_duplicate_rule_separates_s1ap_from_nas_eps_mm_on_same_packet`
+(`live-probe/src/lib.rs:tests`) couvre 4 cas : paire légitime
+S1AP+NAS, vrai doublon même type, paquets différents, byte_offset
+différent.
+
+### Aucune régression
+
+- **Corrélation** : `correlation-engine` inchangé. `N2_N4 = 2 EXACT`,
+  `N4_N3 = 2 EXACT`, `N2_SBI = EXACT` sur
+  `tpl-small-traffic-e2bea97912f9` — règles non touchées. À valider
+  par ANR2 post-déploiement.
+- **Identité en clair** : aucune. Le `KeepaliveAggregator` ne touche
+  à aucun identifier subscriber (il efface même `sequence_number` et
+  `fseid_seid` pour cohérence agrégée) ; les adresses de nœuds sont
+  des IP de NF, pas des IMSI/SUPI.
+- **Mémoire** : `BTreeMap` borné à `MAX_KEEPALIVE_AGGREGATES=4096`,
+  même patron que `MAX_N3_FLOW_AGGREGATES=4096`. Pas de croissance
+  linéaire avec le nombre d'événements traités (c'est justement
+  l'objet de l'agrégation).
+- **CPU** : ajoute une passe O(1) amortie par événement via
+  `BTreeMap::get_mut` + `insert`. Négligeable.
+
+### SemVer
+
+| Composant | Avant | Après |
+|---|---|---|
+| `apps/api` | 2.9.4 | **2.9.5** |
+| `live-probe` | 0.4.20 | **0.4.21** |
+| `transport-sctp` | 0.1.0 | 0.1.0 (ajout test, pas d'API) |
+| `event-schema` | 1.5.1-dev | 1.5.1-dev (inchangé) |
+| `apps/web` | 2.9.3 | 2.9.3 (inchangé) |
+| `callflow-schema` | 1.3.1 | 1.3.1 |
+
+### Compat rustc
+
+- `rustc 1.75` (min workspace) et **`rustc 1.83`** (serveur) OK.
+  Aucun feature nightly. `KeepaliveAggregator` et `is_duplicate` sont
+  des structures et fonctions pures sans dépendance externe.
+
+### Tests
+
+- `cargo test --workspace --locked --release --offline --no-fail-fast`
+  → **416 passed, 0 failed, 4 ignored** (baseline 410 + 6 nouveaux
+  tests : 4 keepalive + 1 duplicate + 1 SCTP packet_references).
+- Nouveaux tests clés :
+  * `keepalive_aggregator_collapses_pfcp_heartbeats_with_paired_request_response`
+    — 1000 req + 1000 resp → 1 aggregate, request_count=1000,
+    response_count=1000, failure_count=0.
+  * `keepalive_aggregator_counts_unmatched_requests_as_failures` —
+    100 DWR + 42 DWA → failure_count=58 (jamais masqué).
+  * `keepalive_aggregator_passes_through_non_keepalive_session_events`
+    — PFCP Session Establishment Request passe à travers.
+  * `keepalive_aggregator_separates_gtpu_echo_from_gtpv2_echo` — 2
+    aggregates distincts sur protocoles différents.
+  * `is_duplicate_rule_separates_s1ap_from_nas_eps_mm_on_same_packet`
+    — règle quantitative T3.
+  * `reassembled_message_preserves_every_fragment_packet_reference`
+    — provenance de 3 fragments préservée dans
+    `SctpMessage.packet_references`.
+
+### Encore OUVERT
+
+- **T2 S1-MME 991 → 254** : attend mesure complète ANR2 (voir
+  « Demande ANR2 pour clôturer » ci-dessus).
+- **Taille dérivée réelle post-2.9.5** : à mesurer par ANR2 sur run
+  réel après déploiement. Attendu : < 1 GB (vs 2.6 GB avant), pas
+  de palliatif 8 GiB nécessaire.
+- **SBI↔N4** : attend IE bruts d'un event SBI réel (comment ANR2
+  #9 comment 6712678520).
+- **LTE S1-MME / S6a** : attend verdict ANR2 post-reduction des
+  keepalives (expected: S6a 868 727 PCAP → ~4096 aggregates +
+  quelques dizaines de session events, cohérent).
+
+
 ## OIRAN API 2.9.4 — 2026-11-08 — Compact event JSONL (devmat T2 — ANR2 #9 comments 6714896530 + 6715187788)
 
 ### Mesures ANR2 à l'entrée
