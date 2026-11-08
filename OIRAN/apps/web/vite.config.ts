@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import pkg from './package.json';
 
 const runtimeEnv=(globalThis as {process?:{env?:Record<string,string|undefined>}}).process?.env;
 const apiTarget=runtimeEnv?.OIRAN_DEV_API_TARGET??'http://127.0.0.1:49152';
@@ -11,13 +12,15 @@ const apiTarget=runtimeEnv?.OIRAN_DEV_API_TARGET??'http://127.0.0.1:49152';
 // without a patch; the default matches the production reverse proxy.
 const basePath=runtimeEnv?.OIRAN_WEB_BASE??'/analyzer/';
 
-// 2.9.0 (#9): surface the web bundle's own version at runtime so the
-// Analyzer footer can show `web <X.Y.Z>` alongside the backend API
-// version. The value is pinned here and asserted against
-// `apps/web/package.json` by `src/test/version-footer.test.tsx` — a
-// desync fails the vitest build so a bump can never ship without
-// touching this file.
-const WEB_VERSION = '2.9.0';
+// 2.9.3 (#9): the web bundle version is read from `apps/web/package.json`
+// at build time — SINGLE source of truth. The 2.9.2 follow-up #2 bumped
+// package.json 2.9.0 → 2.9.1 but left the previous hardcoded literal
+// `'2.9.0'` here, so the Analyzer footer still showed `web 2.9.0` on an
+// otherwise 2.9.1 bundle. `tsconfig.node.json` enables
+// `resolveJsonModule` + `esModuleInterop` so this import is typed
+// without `@types/node`; `src/test/version-footer.test.tsx` enforces
+// `import.meta.env.VITE_WEB_VERSION === pkg.version` on every vitest run.
+const WEB_VERSION = pkg.version;
 
 export default defineConfig({
   base: basePath,

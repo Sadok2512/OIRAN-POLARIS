@@ -1,5 +1,94 @@
 # Changelog
 
+## OIRAN API 2.9.3 — 2026-11-07 — Analyzer footer version read from package.json (devmat T1)
+
+### Proven cause — `web 2.9.0` on an otherwise 2.9.1 Analyzer bundle
+
+The 2.9.2 follow-up #2 bumped `apps/web/package.json` 2.9.0 → 2.9.1 and
+updated the vitest assertion to `'2.9.1'`. It did NOT update the literal
+in `apps/web/vite.config.ts:20` — which was `const WEB_VERSION =
+'2.9.0';`. Vite's `define` injects that literal into
+`import.meta.env.VITE_WEB_VERSION` at build time, so the Analyzer footer
+shipped `web 2.9.0` on a 2.9.1 bundle. The vitest `version-footer`
+assertion still passed because its stub re-assigned
+`VITE_WEB_VERSION` to `pkg.version` in the test harness — hiding the
+production desync behind test-only state.
+
+### Fix (`apps/web` 2.9.1 → 2.9.2, `apps/api` 2.9.2 → 2.9.3)
+
+- **`apps/web/vite.config.ts`** reads `apps/web/package.json` at build
+  via `fs.readFileSync` + `JSON.parse`, NOT a hardcoded literal.
+  `__dirname` is derived from `import.meta.url`, no ESM JSON import
+  attribute (`assert` vs `with` disagrees between Vite 5 and Node 20
+  toolchains — fs avoids both). `apps/api/build.rs` already reads the
+  same `package.json` for `OIRAN_WEB_FRONTEND_VERSION` since 2.7.17, so
+  front and back now derive from the SAME source byte-for-byte.
+- **`apps/web/src/test/version-footer.test.tsx`** drops the literal
+  `expect(pkg.version).toBe('2.9.1')` pin. The surviving invariant is
+  `expect(import.meta.env.VITE_WEB_VERSION).toBe(pkg.version)` — a
+  tautological pin becomes a real end-to-end check once
+  `VITE_WEB_VERSION` is actually defined by vite.config.ts (same source
+  as `pkg.version`). The displayed `web-version` DOM assertion compares
+  to `pkg.version` dynamically, so a future bump touching ONLY
+  `package.json` passes without a test edit. The `/version` mock's
+  `web_frontend` field is also `pkg.version` dynamic.
+- **`apps/api` 2.9.3**: no behavior change in the API; `build.rs` picks
+  up the new `apps/web/package.json` value automatically so the
+  reported `web_frontend` in `GET /version` matches the deployed
+  bundle.
+
+### Open — T2: derived output 10 KB / event
+
+ANR2 observed 2.6 GB of derived output for ~266 000 events (≈ 10 KB
+each), hitting the 2 GiB cap (palliative ceiling raised to 8 GiB).
+Candidates for reduction without proof-information loss :
+
+- No full payload/body duplicated into every event — reference by
+  `(source_file, byte_offset, captured_length, sha256_hex)` only.
+- `decode_reports` and `checksums` moved out of events, into the
+  dataset manifest once.
+- Empty fields omitted (`serde` `skip_serializing_if = Option::is_none`
+  and friends).
+
+**OPEN pending ANR2's per-interface size / heaviest-field measurement
+on #9.** No code change is attempted here — any shape change must
+preserve `N2_N4 = 2 EXACT`, `N4_N3 = 2 EXACT`, `N2_SBI = EXACT` on the
+`tpl-small-traffic-e2bea97912f9` run.
+
+### Tests
+
+- `cargo test --workspace --locked --release --offline --no-fail-fast`
+  → **407 passed, 0 failed, 4 ignored** (baseline unchanged — this
+  patch only touches `apps/api/Cargo.toml` version bump and
+  `apps/web/*` which does not impact Rust tests).
+- Frontend `vitest run` — **93 passed / 14 files**. `version-footer`
+  updated: `web-version` DOM assertion now compares to
+  `pkg.version` dynamically (`'2.9.2'` today), api assertion to
+  `'2.9.3'`. The invariant `VITE_WEB_VERSION === pkg.version` is now a
+  real build-side cross-check.
+- Frontend `tsc -b --pretty false` — clean.
+
+### SemVer
+
+| Component | Before | After |
+|---|---|---|
+| `apps/web` | 2.9.1 | **2.9.2** |
+| `apps/api` | 2.9.2 | **2.9.3** |
+| `callflow-schema` | 1.3.1 | 1.3.1 |
+| `live-probe` | 0.4.20 | 0.4.20 |
+
+### Compat
+
+- Compiles under `rustc 1.75` (workspace minimum) and `rustc 1.83`
+  (server toolchain). No nightly / unstable feature used.
+- `DatasetRepairReport.schema_version` stays frozen at `"2.9.2"` —
+  it is a *schema* identifier (namespaced by the API version at
+  schema-emission time), not the product version; bumping it would
+  require coordinated consumer migration which is out of scope.
+- `fs.readFileSync` in `vite.config.ts` executes at build time only,
+  no runtime cost. No SPA bundle size change expected.
+
+
 ## OIRAN API 2.9.2 follow-up #2 — 2026-11-07 — SBI pair confidence + Analyzer technology fallback + vProbe reason (#9 comment 6712678520)
 
 ### Proven cause — N2_SBI stuck at UNKNOWN despite an EXACT tunnel match

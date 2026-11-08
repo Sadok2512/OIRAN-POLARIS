@@ -39,9 +39,12 @@ beforeEach(() => {
     if (path === '/version') {
       return {
         data: {
-          platform_core: '2.9.2',
-          backend_api: '2.9.2',
-          web_frontend: '2.9.1',
+          platform_core: '2.9.3',
+          backend_api: '2.9.3',
+          // Web frontend version MUST stay byte-synced with package.json
+          // (vite.config.ts reads pkg.version at build time — single source
+          // of truth, no literal here).
+          web_frontend: pkg.version,
           event_schema: '1.5.0',
           callflow_schema: '1.3.1',
           session_engine: '0.6.0',
@@ -60,21 +63,26 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-describe('Analyzer version footer (2.9.2 follow-up #2)', () => {
+describe('Analyzer version footer (2.9.3)', () => {
   it('shows BOTH the web bundle version and the backend API version', async () => {
     renderFooter();
     const footer = screen.getByTestId('version-footer');
     expect(footer).toBeInTheDocument();
+    // 2.9.3: the web-version assertion compares to `package.json` — the
+    // SINGLE source of truth. The previous assertion pinned a literal
+    // `'2.9.1'` while vite.config.ts hardcoded `'2.9.0'`, so the test
+    // passed but the Analyzer footer still shipped `web 2.9.0`.
     await waitFor(() =>
-      expect(screen.getByTestId('web-version').textContent).toBe('2.9.1'),
+      expect(screen.getByTestId('web-version').textContent).toBe(pkg.version),
     );
     await waitFor(() =>
-      expect(screen.getByTestId('api-version').textContent).toBe('2.9.2'),
+      expect(screen.getByTestId('api-version').textContent).toBe('2.9.3'),
     );
   });
 
   it('pins the vite.config.ts VITE_WEB_VERSION to apps/web/package.json', () => {
-    expect(pkg.version).toBe('2.9.1');
+    // No literal — just the invariant that vite.config.ts and
+    // package.json stay in sync at build time.
     expect(import.meta.env.VITE_WEB_VERSION).toBe(pkg.version);
   });
 });

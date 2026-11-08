@@ -4,7 +4,10 @@
     "skipLibCheck": true,
     "noEmit": true,
     "module": "ESNext",
-    "moduleResolution": "Bundler"
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true
   },
   "include": ["vite.config.ts", "vitest.config.ts", "playwright.config.ts"]
 }
