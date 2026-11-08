@@ -392,10 +392,68 @@ impl ProtocolDecoder for DiameterDecoder {
 
 /// 2.9.10 (#9 comment 6726685484) : produit un événement
 /// `MALFORMED` avec la provenance wire pour que PCAP ≡ JSONL en
-/// comptage. Le `message_type` est 0 (code commande inconnu), le
-/// `message_name` est `"MalformedDiameterMessage"`, et l'erreur
-/// de parse est publiée dans `errors` + un IE `parse_error`.
+/// comptage.
+///
+/// 2.9.14 (#9 comment 6728398325) : préserve `message_type`,
+/// `message_name` et `is_request` quand l'en-tête Diameter est
+/// lisible (≥ 20 octets avec version=1 valide). ANR2 a prouvé
+/// que 16 messages S6a par segment échappaient au compte via
+/// `tshark diameter.cmd.code==280` parce que les MALFORMED
+/// pré-2.9.14 publiaient `message_type=0, message_name="MalformedDiameterMessage"`.
+/// Avec le code préservé, la clé `message_type==280` capture
+/// bien tous les 492 messages.
 fn emit_malformed_event(input: &DecoderInput<'_>, parse_error: &str) -> NormalizedEvent {
+    let header = peel_diameter_header(input.payload);
+    let (message_name, message_type, procedure_code, procedure, direction) =
+        if let Some(h) = header.as_ref() {
+            let name = command_name(h.command_code, h.is_request);
+            let full_name = if name == "UnknownDiameterCommand" {
+                format!("MalformedDiameterMessage(code={})", h.command_code)
+            } else {
+                format!("Malformed{name}")
+            };
+            (
+                full_name,
+                h.command_code,
+                Some(h.command_code),
+                Some(if h.is_request { "REQUEST".into() } else { "ANSWER".into() }),
+                infer_direction(input, h.is_request),
+            )
+        } else {
+            (
+                "MalformedDiameterMessage".into(),
+                0u32,
+                None,
+                None,
+                Direction::Unknown,
+            )
+        };
+    let mut ies = vec![InformationElement {
+        id: None,
+        name: "parse_error".into(),
+        length: parse_error.len() as u32,
+        value: Some(parse_error.to_string()),
+        raw_sha256: None,
+        status: DecodeStatus::Malformed,
+    }];
+    if let Some(h) = header.as_ref() {
+        ies.push(InformationElement {
+            id: None,
+            name: "Diameter command code".into(),
+            length: 4,
+            value: Some(h.command_code.to_string()),
+            raw_sha256: None,
+            status: DecodeStatus::Decoded,
+        });
+        ies.push(InformationElement {
+            id: None,
+            name: "Diameter application id".into(),
+            length: 4,
+            value: Some(h.application_id.to_string()),
+            raw_sha256: None,
+            status: DecodeStatus::Decoded,
+        });
+    }
     let mut event = NormalizedEvent {
         event_id: String::new(),
         parent_event_id: None,
@@ -406,24 +464,17 @@ fn emit_malformed_event(input: &DecoderInput<'_>, parse_error: &str) -> Normaliz
         timestamp: input.timestamp.clone(),
         interface: input.interface.into(),
         protocol: Protocol::Diameter,
-        message_name: "MalformedDiameterMessage".into(),
-        message_type: 0,
-        procedure_code: None,
-        procedure: None,
+        message_name,
+        message_type,
+        procedure_code,
+        procedure,
         security_state: None,
         source_byte_offset: None,
         source_endpoint: input.source_endpoint.clone(),
         destination_endpoint: input.destination_endpoint.clone(),
-        direction: Direction::Unknown,
+        direction,
         session_identifiers: Vec::new(),
-        information_elements: vec![InformationElement {
-            id: None,
-            name: "parse_error".into(),
-            length: parse_error.len() as u32,
-            value: Some(parse_error.to_string()),
-            raw_sha256: None,
-            status: DecodeStatus::Malformed,
-        }],
+        information_elements: ies,
         decoder_name: "decoder-diameter".into(),
         decoder_version: VERSION.into(),
         schema_version: NormalizedEvent::SCHEMA_VERSION,
@@ -439,6 +490,38 @@ fn emit_malformed_event(input: &DecoderInput<'_>, parse_error: &str) -> Normaliz
     };
     event.assign_deterministic_id();
     event
+}
+
+/// 2.9.14 : extrait l'en-tête Diameter (20 octets) sans faire
+/// confiance au corps. Retourne `None` si trop court, version ≠ 1
+/// ou length inconsistant. Utilisé par `emit_malformed_event` pour
+/// préserver `command_code` + `is_request` même quand les AVPs
+/// échouent au parse.
+struct DiameterHeader {
+    command_code: u32,
+    application_id: u32,
+    is_request: bool,
+}
+
+fn peel_diameter_header(payload: &[u8]) -> Option<DiameterHeader> {
+    if payload.len() < 20 || payload[0] != 1 {
+        return None;
+    }
+    let length = ((payload[1] as usize) << 16)
+        | ((payload[2] as usize) << 8)
+        | payload[3] as usize;
+    if length < 20 {
+        return None;
+    }
+    let flags = payload[4];
+    let command_code =
+        ((payload[5] as u32) << 16) | ((payload[6] as u32) << 8) | payload[7] as u32;
+    let application_id = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    Some(DiameterHeader {
+        command_code,
+        application_id,
+        is_request: flags & 0x80 != 0,
+    })
 }
 
 fn emit_event(msg: DiameterMessage, input: &DecoderInput<'_>) -> DecoderOutput {
@@ -852,6 +935,73 @@ mod tests {
         // event_id déterministe sur l'identité wire.
         assert!(!ev.event_id.is_empty());
         assert!(ev.event_id.starts_with("evt-"));
+    }
+
+    /// 2.9.14 (#9 comment 6728398325) — ANR2 a prouvé que 16
+    /// messages S6a par segment étaient invisibles au comptage
+    /// `tshark diameter.cmd.code==280` parce que les événements
+    /// MALFORMED pré-2.9.14 portaient `message_type=0, message_name=
+    /// "MalformedDiameterMessage"`. Avec un en-tête Diameter
+    /// valide + AVPs cassés, on préserve désormais `command_code=280`
+    /// et `message_name="MalformedDevice-Watchdog-Request"` →
+    /// filtre `message_type==280` capture ces messages.
+    #[test]
+    fn malformed_preserves_command_code_when_header_ok_2_9_14() {
+        // En-tête valide : version=1, length=20, flags=0x80 (request),
+        // command_code=280 (DWR), application_id=0 (base).
+        // Pas d'AVPs → parse_avps() OK sur data vide. Il faut un
+        // AVP corrompu pour échouer.
+        let mut bytes = Vec::new();
+        bytes.push(0x01);                              // version
+        bytes.extend_from_slice(&[0x00, 0x00, 0x1c]);  // length = 28
+        bytes.push(0x80);                              // flags: request
+        bytes.extend_from_slice(&[0x00, 0x01, 0x18]);  // command_code = 280
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);  // application_id = 0
+        bytes.extend_from_slice(&[0, 0, 0, 1]);        // hop-by-hop
+        bytes.extend_from_slice(&[0, 0, 0, 2]);        // end-to-end
+        // AVP tronqué (seulement 4 octets au lieu de 8 minimum).
+        bytes.extend_from_slice(&[0, 0, 0, 1]);
+
+        let (p, t) = fixtures();
+        let key = PseudonymKey::from_bytes([0xbb; 32]);
+        let in_ = input(&bytes, &p, &t, &key, "MME", "HSS");
+        let out = DiameterDecoder.decode(&in_);
+        assert_eq!(out.status, DecodeStatus::Malformed);
+        assert_eq!(out.events.len(), 1);
+        let ev = &out.events[0];
+        assert_eq!(
+            ev.message_type, 280,
+            "command_code 280 doit être préservé depuis l'en-tête"
+        );
+        assert_eq!(
+            ev.message_name, "MalformedDevice-Watchdog-Request",
+            "le nom standard préfixé de Malformed doit être conservé"
+        );
+        assert_eq!(ev.procedure_code, Some(280));
+        assert_eq!(ev.procedure.as_deref(), Some("REQUEST"));
+        // IEs attendues : parse_error + command code + application id.
+        assert!(ev.information_elements.iter().any(|ie| ie.name == "parse_error"));
+        assert!(ev
+            .information_elements
+            .iter()
+            .any(|ie| ie.name == "Diameter command code"
+                && ie.value.as_deref() == Some("280")));
+    }
+
+    /// 2.9.14 : en-tête trop court (< 20 octets) → fallback
+    /// MALFORMED générique (pas de command_code).
+    #[test]
+    fn malformed_short_header_falls_back_to_generic_2_9_14() {
+        let truncated = [0x01, 0x00, 0x00, 0x14, 0x80, 0x00];
+        let (p, t) = fixtures();
+        let key = PseudonymKey::from_bytes([0xbb; 32]);
+        let in_ = input(&truncated, &p, &t, &key, "MME", "HSS");
+        let out = DiameterDecoder.decode(&in_);
+        assert_eq!(out.status, DecodeStatus::Malformed);
+        let ev = &out.events[0];
+        assert_eq!(ev.message_type, 0, "trop court → pas de command_code");
+        assert_eq!(ev.message_name, "MalformedDiameterMessage");
+        assert_eq!(ev.procedure_code, None);
     }
 
     /// 2.9.10 : deux payloads malformés DIFFÉRENTS sur le même

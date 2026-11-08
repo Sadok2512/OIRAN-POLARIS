@@ -1,5 +1,91 @@
 # Changelog
 
+## OIRAN API 2.9.14 — 2026-11-08 — Diameter MALFORMED header-aware + repair uncovered closed files (devmat, ANR2 #9 comment 6728398325)
+
+### Contexte — deux défauts 2.9.13 prouvés par ANR2
+
+1. **S6a `_00025` : perte 16 messages persiste** malgré 2.9.11
+   SCTP-retransmit. Segment PCAP = 492 (DWR 246 + DWA 246).
+   JSONL = 476 (`aggregate_message_count` sommés). Écart = 16
+   messages sur segment fermé importé par 2.9.13.
+2. **Repair `_00067` incomplet** : 12 fichiers sources, 5 non
+   vides. Le plan ne couvre que N4, SBI, Sxab. N2 + S6a manquent
+   (0 événement final-SHA).
+
+### T1 — S6a : MALFORMED préserve le command_code
+
+Cause : mon `emit_malformed_event` 2.9.10
+(`decoder-diameter/src/lib.rs:397-443` pré-2.9.14) fixait
+`message_type=0, message_name="MalformedDiameterMessage"` pour
+TOUS les payloads mal parsés. ANR2 compte via `tshark
+diameter.cmd.code==280` → les 16 MALFORMED avec `message_type=0`
+étaient invisibles.
+
+2.9.14 : `peel_diameter_header` (`:456-476`) extrait les 20
+premiers octets (version=1, length ≥ 20, flags, command_code,
+application_id) **sans toucher aux AVPs**. Quand l'en-tête est
+lisible mais les AVPs échouent, l'événement MALFORMED porte :
+- `message_type = command_code` (280 pour un DWR/DWA),
+- `message_name = format!("Malformed{command_name}")`
+  (ex. `MalformedDevice-Watchdog-Request`),
+- `procedure_code = Some(command_code)`,
+- `procedure = Some("REQUEST"|"ANSWER")`,
+- `direction` inférée par `infer_direction`,
+- IEs `Diameter command code` + `Diameter application id`.
+
+Le filtre ANR2 `message_type==280` capture désormais les 492
+messages à l'unité près. L'en-tête < 20 octets retombe sur le
+fallback générique 2.9.10.
+
+Tests :
+- `malformed_preserves_command_code_when_header_ok_2_9_14` :
+  en-tête valide + AVP tronqué → `message_type=280`,
+  `message_name="MalformedDevice-Watchdog-Request"`.
+- `malformed_short_header_falls_back_to_generic_2_9_14` :
+  `< 20 octets` → `message_type=0`, nom générique.
+
+### T2 — Repair : fresh-import des fichiers fermés non couverts
+
+Cause : `repair_partial_imports` (`live-probe/src/lib.rs:3960-4037`
+pré-2.9.14) construisait `fresh_import_queue` UNIQUEMENT depuis
+`prefix_sha_groups` (fichiers dont ≥ 1 événement dataset matche
+un prefix-SHA). Les planes `N2` + `S6a` de `_00067` n'avaient
+AUCUN événement dataset avec leur capture_id → `prefix_sha_groups`
+vide → jamais réparés.
+
+2.9.14 (`live-probe/src/lib.rs:4039-4104`) : après la boucle
+principale, balaye `on_disk_prefix` (tous les fichiers fermés
+découverts via `prefix_sha_index`). Pour chaque fichier dont ni
+le full-SHA ni aucun prefix-SHA n'apparaît dans
+`dataset_capture_ids`, pousser une fresh-import "pure" :
+`PartialImportGroup { reconstruction_key:
+"…uncovered_closed_file", snapshots: [], needs_fresh_import: true,
+final_source: PrefixShaMatchFreshImport }`.
+
+Les 5 planes `_00067` non vides — y compris N2 + S6a — sont
+désormais tous décodés par la phase 4b du repair (quand
+`!dry_run`), avec la même clé de pseudonymisation que la
+live-probe.
+
+Test :
+`repair_covers_uncovered_closed_file_fresh_import_2_9_14` :
+fichier S6a fermé sur disque, dataset vide pour ce plan →
+`partial_import_groups` contient un groupe `uncovered_closed_file`
+avec `interface="S6a"`, `snapshots=[]`,
+`needs_fresh_import=true`. Le sibling actif lex-greatest
+(`_00026`) est correctement exclu par la règle sequence.
+
+### T3 — Tests
+
+**440 PASS**, 0 FAIL, 4 ignored (+3 vs 2.9.13). Round-trip
+2.9.6/2.9.7/2.9.8/2.9.9/2.9.10/2.9.11/2.9.12/2.9.13 préservé.
+
+### Versions
+
+- `decoder-diameter` 0.2.1 → 0.2.2
+- `live-probe` 0.4.25 → 0.4.26
+- `oiran-api` 2.9.13 → 2.9.14
+
 ## OIRAN API 2.9.13 — 2026-11-08 — Replay ANR2 réel + wire-identity dedup strict + repair wire-dupes (devmat, ANR2 #9 comments 6727624063 + 6727243545)
 
 ### Contexte — deux défauts à fermer sur preuves réelles

@@ -4036,6 +4036,79 @@ impl CaptureManager {
             partial_groups.push(group);
         }
 
+        // 2.9.14 (#9 comment 6728398325) — ANR2 a prouvé que le
+        // plan `_00067` couvrait seulement 3 des 5 planes non
+        // vides (`N4`, `SBI`, `Sxab` matchés via prefix-SHA) et
+        // manquait `N2` + `S6a` qui n'avaient ZÉRO événement dans
+        // le dataset. Un fichier fermé sur disque sans aucun
+        // `capture_id` matchant (ni full ni prefix) n'était pas
+        // réparé. Correctif : pour chaque PrefixIndex découvert
+        // dont le `full_sha_hex` n'est PAS déjà dans
+        // `fresh_import_queue` ET n'apparaît dans AUCUN
+        // `capture_id` dataset, pousser une fresh-import "pure".
+        let dataset_capture_ids: BTreeSet<String> = {
+            let mut set = BTreeSet::new();
+            let reader = BufReader::new(fs::File::open(&current_events).map_err(display_error)?);
+            for line in reader.lines() {
+                let line = line.map_err(display_error)?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    if let Some(cap) = value.get("capture_id").and_then(Value::as_str) {
+                        set.insert(cap.to_owned());
+                    }
+                }
+            }
+            set
+        };
+        let already_queued: BTreeSet<String> = fresh_import_queue
+            .iter()
+            .map(|(_, capture)| capture.clone())
+            .collect();
+        for index in &on_disk_prefix {
+            let full_capture_id = format!("sha256:{}", index.full_sha_hex);
+            if already_queued.contains(&full_capture_id) {
+                continue;
+            }
+            if dataset_capture_ids.contains(&full_capture_id) {
+                continue;
+            }
+            let prefix_touched = index
+                .prefix_sha
+                .keys()
+                .any(|hex| dataset_capture_ids.contains(&format!("sha256:{hex}")));
+            if prefix_touched {
+                continue;
+            }
+            let interface = index
+                .path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .and_then(canonical_interface_for_plane)
+                .map(str::to_owned)
+                .unwrap_or_default();
+            fresh_import_queue.push((index.path.clone(), full_capture_id.clone()));
+            partial_groups.push(PartialImportGroup {
+                reconstruction_key: format!(
+                    "on_disk_path={}|full_sha256={}|full_packet_count={}|uncovered_closed_file",
+                    index.path.display(),
+                    index.full_sha_hex,
+                    index.full_packet_count
+                ),
+                interface,
+                first_packet_raw_ticks: 0,
+                first_packet_number: 0,
+                first_packet_byte_offset: 0,
+                snapshots: Vec::new(),
+                final_capture_id: Some(full_capture_id),
+                final_source: PartialImportFinalSource::PrefixShaMatchFreshImport,
+                final_on_disk_path: Some(index.path.display().to_string()),
+                needs_fresh_import: true,
+            });
+        }
+
         // 2.8.4 fallback — run the content-identity grouping ONLY on
         // snapshots that didn't match a prefix SHA on disk. Covers
         // the "no --source-root" case and any snapshot whose on-disk
@@ -12905,6 +12978,127 @@ mod tests {
                 || removed_ids.contains("evt-83151568d66288d0"),
             "un des deux event_ids du groupe NGAP doit être retiré"
         );
+    }
+
+    /// 2.9.14 (#9 comment 6728398325) — ANR2 a prouvé que le
+    /// plan repair ne couvrait que 3 des 5 fichiers `_00067` non
+    /// vides parce que les planes N2 + S6a avaient ZÉRO événement
+    /// dans le dataset — leur `capture_id` (prefix OU full) n'était
+    /// jamais dans un IE. Le repair ne les trouvait donc pas via
+    /// `prefix_sha_groups`.
+    ///
+    /// 2.9.14 : balaye `on_disk_prefix` après la boucle principale
+    /// et pousse chaque fichier fermé dont le full-SHA n'est pas
+    /// dans `dataset_capture_ids` vers `fresh_import_queue`. Un
+    /// groupe `uncovered_closed_file` est ajouté à
+    /// `partial_import_groups` avec `snapshots: []` et
+    /// `needs_fresh_import=true`.
+    #[test]
+    fn repair_covers_uncovered_closed_file_fresh_import_2_9_14() {
+        let base = temporary_root("repair-uncovered-closed");
+        let continuous = base.join(CONTINUOUS_CAPTURE_ID);
+        let dataset = continuous.join("dataset");
+        fs::create_dir_all(dataset.join("callflows")).unwrap();
+        let source_root = base.join("source");
+        fs::create_dir_all(source_root.join("s6a")).unwrap();
+        // Fichier S6a fermé sur disque : 4 paquets Diameter
+        // minimum. prefix_sha_index produira ≥ 3 prefix SHAs
+        // plus un full SHA ; aucun n'apparaît dans le dataset.
+        let closed_path = source_root
+            .join("s6a")
+            .join("s6a_20261107T213849Z_00025_20261108213852.pcapng");
+        write_pcap(
+            &closed_path,
+            &(1..=4u8).map(|byte| vec![byte; 32]).collect::<Vec<_>>(),
+        );
+        // Sibling actif (lex-greater) — exclu par la règle sequence.
+        let active_path = source_root
+            .join("s6a")
+            .join("s6a_20261107T213849Z_00026_20261108223852.pcapng");
+        write_pcap(&active_path, &[vec![9u8; 16]]);
+
+        // Dataset VIDE : aucun événement sur le plan S6a. Juste
+        // des événements sur un autre plan pour prouver que le
+        // repair ne touche QUE le plan S6a nouveau.
+        let unrelated = serde_json::json!({
+            "event_id": "evt-unrelated",
+            "capture_id": "sha256:other",
+            "capture_point_id": "N2",
+            "timestamp": {"seconds":1,"nanoseconds":0,"raw_ticks":0,"display":""},
+            "interface": "N2",
+            "protocol": "NGAP",
+            "message_name": "NGSetupRequest",
+            "source_endpoint": {"address":"a","network_function":"gNB"},
+            "destination_endpoint": {"address":"b","network_function":"AMF"},
+            "direction": "RAN_TO_CORE",
+            "session_identifiers": [],
+            "information_elements": [],
+            "decoding_status": "DECODED",
+            "decoder_name": "test",
+            "decoder_version": "1",
+            "raw_payload_reference": "sha256:other",
+            "packet_references": [{
+                "source_file":"other.pcap","packet_number":1,"byte_offset":0,
+                "interface_id":0,"captured_length":1,"original_length":1
+            }],
+            "errors": []
+        });
+        write_jsonl(&dataset.join("oiran_events.jsonl"), &[unrelated.to_string()]);
+        let state = serde_json::json!({
+            "segments": {},
+            "seen_checksums": [],
+            "seen_order": [],
+            "failed_ingestions": [],
+            "source_fingerprints": {},
+        });
+        fs::write(
+            continuous.join("import_state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let manager = fresh_manager_for_restore(&base);
+        let dry = manager
+            .repair_partial_imports(true, Some(&source_root))
+            .unwrap();
+        // Un groupe "uncovered_closed_file" pour s6a_00025.
+        let uncovered: Vec<_> = dry
+            .partial_import_groups
+            .iter()
+            .filter(|g| g.reconstruction_key.contains("uncovered_closed_file"))
+            .collect();
+        assert_eq!(
+            uncovered.len(),
+            1,
+            "un fichier S6a fermé non couvert doit déclencher un fresh-import"
+        );
+        assert_eq!(uncovered[0].interface, "S6a");
+        assert!(
+            uncovered[0].needs_fresh_import,
+            "le groupe uncovered doit porter needs_fresh_import=true"
+        );
+        assert!(
+            uncovered[0]
+                .final_on_disk_path
+                .as_deref()
+                .is_some_and(|path| path.contains("s6a_20261107T213849Z_00025")),
+            "final_on_disk_path doit pointer sur le fichier S6a fermé"
+        );
+        assert_eq!(
+            uncovered[0].snapshots.len(),
+            0,
+            "pas de snapshots (zéro événement dataset) : fresh import pur"
+        );
+        // Le fichier actif (`_00026`) est exclu par la sequence
+        // rule et ne doit PAS apparaître.
+        for group in &dry.partial_import_groups {
+            if let Some(p) = group.final_on_disk_path.as_deref() {
+                assert!(
+                    !p.contains("_00026_"),
+                    "le fichier actif lex-greatest ne doit pas apparaître"
+                );
+            }
+        }
     }
 
     /// 2.9.2 (#9 comment 6708784283): the ANR2 real-data scenario.
