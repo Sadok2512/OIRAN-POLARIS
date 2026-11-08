@@ -1,5 +1,214 @@
 # Changelog
 
+## OIRAN API 2.9.7 — 2026-11-08 — Non-régression test JSONL compact + revue diff 67317cf..dcf2e04 (devmat régression ANR2 #9 comment 6724980899, #10 comment 6724994946)
+
+### Contexte — suspicion de régression 2.9.1 → 2.9.5 sur le run réel
+
+ANR2 observe sur `5g-session-5e3fc8ce83936ea0` (run POLARIS
+`tpl-small-traffic-6374f1ed343c`, 2026-11-08T17:19:12Z..17:30:24Z) :
+
+- **N2↔N4** : EXACT, 2 arêtes EXACT ✓.
+- **N4↔N3** : OUVERT (`N4_N3=UNKNOWN`) — 147 662 paquets GTP dans la
+  fenêtre pourtant.
+- **SBI↔N2** : OUVERT (`N2_SBI=UNKNOWN`) malgré correctif
+  bidirectionnel 2.9.2 follow-up #2.
+- **SBI↔N4** : OUVERT (`SBI_N4=UNKNOWN`).
+
+Référence 2.9.1 sur `tpl-small-traffic-e2bea97912f9` avait N4↔N3
+EXACT ×2. Run différents → données différentes, mais l'absence de
+N4↔N3 malgré 147 k paquets GTP demande une revue infra.
+
+### T1 — Revue diff 67317cf..dcf2e04 : AUCUN risque infra prouvé
+
+Audit systématique de tous les composants susceptibles d'affecter la
+corrélation tunnel entre 2.9.1 (`67317cf`) et 2.9.6 (`dcf2e04`) :
+
+**1. `event-schema` compaction JSONL (2.9.4, `event-schema/src/lib.rs:305+`).**
+`to_json` devient builder incrémental qui omet les champs `null`
+et les tableaux `[]` non essentiels. Impact sur corrélation :
+
+- `packet_references[]` : `source_file`, `packet_number`,
+  `byte_offset`, `interface_id`, `captured_length`, `original_length`
+  **toujours émis** (champs REQUIS par `parse_event`). Les `sll2_*`,
+  `source_sha256`, `link_type` omis quand `null` — non consommés par
+  `tunnel_keys` ni `capture_scope`. **SAFE**.
+- `information_elements[]` : `name`, `length`, `status` toujours
+  émis. `id`, `value`, `raw_sha256` omis quand `null`. `tunnel_keys`
+  (`correlation-engine:520`) lit `ie.get("value").and_then(.as_str)` :
+  si `value: Some(_)`, préservé ; si `value: None`, IE ne contribuait
+  à aucune clé de toute façon. **SAFE**.
+- Top-level : `sbi`, `parent_event_id`, `procedure_code`, `procedure`,
+  `security_state`, `source_byte_offset` omis quand `null`. Aucun
+  consommé par la chaîne de corrélation. **SAFE**.
+- `session_identifiers: []` et `information_elements: []` **toujours
+  émis** même vides (contrat de présence).
+
+Verdict : **pas de régression possible** sur les champs tunnel
+(`gtp_teid`, `tunnel_endpoint_ip`, teid identifier) via la compaction.
+
+**2. `KeepaliveAggregator` (2.9.5, `live-probe/src/lib.rs:347-592`).**
+`classify_keepalive` filtre par `(Protocol, message_name)` exact :
+
+- `Protocol::Gtpu` + `"Echo Request" | "Echo Response"` → absorbé.
+- `Protocol::Gtpu` + `"G-PDU"` → **None → pass-through** vers
+  `n3_aggregator`. **Pas d'absorption du user-plane**.
+- `Protocol::Pfcp` + `"PFCP Heartbeat Request/Response"` → absorbé ;
+  Session Establishment/Modification/Deletion → pass-through.
+- `Protocol::Diameter` + `"Device-Watchdog-Request/Answer"` → absorbé.
+- `Protocol::SbiHttp2` + tout → **None → pass-through** (SBI pas
+  soumis à classify_keepalive).
+
+Verdict : **G-PDU et SBI ne sont jamais avalés**. L'ordre dans la
+closure (`live-probe:4234-4271`) est keepalive → N3 flow aggregator →
+individuel, confirmé par lecture ligne par ligne. **SAFE**.
+
+**3. `N3FlowAggregator::finish()` (`live-probe:240-328`).** L'agrégat
+préserve :
+- `packet_references[0]` = premier paquet observé (full path →
+  `capture_scope` == "continuous-lab-import").
+- `session_identifiers` = base event minus `sequence_number`, plus
+  `qfi`. **`teid` préservé** (lu par correlation
+  `event.first_identifier("teid")`).
+- `interface`, `protocol`, `destination_endpoint.address` =
+  préservés du base event. `destination_address` de l'EventRecord
+  recréé par `parse_event` sort de `destination_endpoint.address`.
+- `information_elements` : les IEs d'origine sont **conservées**, les
+  aggregate_* sont **ajoutées**.
+
+Verdict : **tous les champs consommés par N3 correlation preservés**.
+
+**4. `tunnel_keys` + `capture_scope` (`correlation-engine:475-553`).**
+Inchangés entre 2.9.1 et 2.9.6. `capture_scope` sur le chemin
+production `/var/lib/oiran/captures/continuous-lab-import/pcap/*` :
+`/captures/` trouvé, extrait `"continuous-lab-import"` identique pour
+tous les plans. **SAFE**.
+
+**5. `prefix_sha_index` pcapng (2.9.6).** N'intervient que dans
+`repair_partial_imports`, pas dans la chaîne de corrélation live.
+**N/A**.
+
+**Conclusion T1** : aucun RISQUE INFRA identifié dans la diff. Toute
+régression observée sur un run spécifique est **data-dependent**
+(contenu du PCAP, fail-closed sur multi-match).
+
+### T2 — Nouveau test non-régression round-trip
+
+`correlation-engine::tests::compact_jsonl_round_trip_yields_four_cross_interface_edges`
+(`correlation-engine/src/lib.rs`) — **test qui manquait avant
+cette session**. Pipeline complet :
+
+1. 4 `NormalizedEvent` construits via `event-schema` (N2 NGAP, N4 PFCP,
+   N3 GTP-U, SBI N1N2MessageTransfer) avec les formats IE/identifiers
+   exacts émis par decoder-ngap / decoder-pfcp / decoder-gtpu /
+   decoder-sbi en production — hétérogénéité de padding TEID conservée
+   (`0xd4a6` sans padding côté NGAP/SBI, `0x0000d4a6` 8-char côté
+   PFCP/GTP-U).
+2. Sérialisation via `NormalizedEvent::to_json()` (format compact
+   2.9.4) → bytes JSONL.
+3. Désérialisation via `session-engine::load_jsonl(Cursor::new(..))`
+   → `Vec<EventRecord>`.
+4. `correlation-engine::correlate_cross_interface_evidence(&events)`.
+5. Assertion : les **4 edges attendues** sont présentes :
+   - `ngap-pfcp-exact-tunnel` (N2↔N4) EXACT ;
+   - `pfcp-outer-header-matches-gtpu-tunnel` (N4↔N3) EXACT ;
+   - `sbi-n2-tunnel-match` (SBI↔N2) EXACT ;
+   - `sbi-n4-tunnel-match` (SBI↔N4) EXACT.
+
+**Résultat** : test **PASSE** → l'infra round-trip JSONL compact
+→ parse_event → correlate est **intacte** sur l'échantillon réaliste.
+L'écart ANR2 ne provient donc PAS d'une régression infra 2.9.1→2.9.6.
+
+### T3 — Causes candidates du N4↔N3 OUVERT sur ce run
+
+Sans accès au JSONL brut de `5g-session-5e3fc8ce83936ea0`, les causes
+plausibles data-dependent sont :
+
+1. **N4 F-TEID duplicates** : `correlate_cross_interface_evidence`
+   lignes 236-247 exige `n4_duplicates == 1` sur la clé
+   `(ipv4, teid)`. ANR2 montre 3 F-TEIDs
+   (`0xd4a6`, `0xe782`, `0xd4a6`) — si deux partagent la même
+   `(ipv4, teid)`, fail-closed. Le run 2.9.1 n'avait peut-être pas
+   cette collision.
+2. **N3 destination_address différente** : si l'aggregator N3 retient
+   un paquet DOWNLINK comme premier (`destination = gNB IP`), le
+   `endpoint_ip` du tunnel-key N3 ne matche pas l'`ipv4` du F-TEID
+   N4 (= UPF IP). Les Uplink et Downlink sont des aggregates séparés
+   par `N3FlowKey.direction`, donc en principe l'Uplink aggregate
+   existe et match. À vérifier sur le JSONL réel.
+3. **N3 TEID absent des session_identifiers** : si decoder-gtpu a
+   échoué à extraire `teid` sur certaines trames (edge-case
+   fragmenté), l'aggregate base event peut manquer de `teid`. Pas
+   observé dans le code mais à confirmer sur le run.
+
+Pour SBI↔N2 / SBI↔N4 : ANR2 montre que le trafic SBI du run est
+exclusivement **CreateSMContext + UpdateSMContext** (POST
+`/nsmf-pdusession/v1/sm-contexts[/.../modify]`). **AUCUN
+N1N2MessageTransfer**. Les règles `sbi-n2-tunnel-match` et
+`sbi-n4-tunnel-match` (`correlation-engine:299-367`) filtrent sur
+`message_name == "N1N2MessageTransfer"`. Donc elles ne peuvent pas
+firer. Attendu, pas une régression. La bridge alternative
+`sbi-pfcp-context-association` fire sur `CreateSMContext + PFCP
+Session Establishment Request + DNN match`. Si DNN ne match pas (ou
+si SBI event n'est pas émis), STRONG edge absent.
+
+**Correctif applicable** : aucun côté infra. Le véritable correctif
+nécessite les IE brutes de l'event SBI CreateSMContext et du N4 PFCP
+Session Establishment du run réel (encore OUVERT). Si le CreateSMContext
+porte un `n2SmInfo` multipart décodable, ajouter une règle SBI tunnel
+match depuis `CreateSMContext` serait un chantier 2.9.8+ ; pour l'instant
+l'OUVERT est déclaré sans correctif.
+
+### Aucune régression infra
+
+- `correlation-engine` : règles **inchangées** ; test de round-trip
+  prouve que la chaîne **compact JSONL → parse_event → correlate**
+  reste intacte pour l'échantillon réaliste 4-interfaces.
+- `event-schema` compact : omission uniquement sur `null`/`[]` non
+  critiques — tous les champs consommés par `tunnel_keys`, `parse_event`,
+  et le chemin tunnel N3/N4 préservés byte-exact.
+- `KeepaliveAggregator` : jamais d'absorption G-PDU ni SBI.
+- Tests 2.9.6 (417) + 1 nouveau round-trip = **418** sans régression.
+
+### SemVer
+
+| Composant | Avant | Après |
+|---|---|---|
+| `apps/api` | 2.9.6 | **2.9.7** |
+| `correlation-engine` | 0.6.0 | **0.6.1** (ajout dev-dep event-schema + test round-trip) |
+| `live-probe` | 0.4.22 | 0.4.22 |
+| `event-schema` | 1.5.1-dev | 1.5.1-dev |
+| `apps/web` | 2.9.3 | 2.9.3 |
+| `callflow-schema` | 1.3.1 | 1.3.1 |
+
+### Compat rustc
+
+- `rustc 1.75` (min workspace) et **`rustc 1.83`** (serveur) OK.
+- Aucun feature nightly, `event-schema` ajouté seulement comme
+  dev-dependency de `correlation-engine` (pas d'impact binaire).
+
+### Tests
+
+```sh
+cargo test --workspace --locked --release --offline --no-fail-fast
+# → 418 passed, 0 failed, 4 ignored (baseline 417 + 1 round-trip).
+```
+
+### Encore OUVERT
+
+- **N4↔N3 UNKNOWN sur `5g-session-5e3fc8ce83936ea0`** : attend ANR2
+  JSONL brut (session_identifiers N3 teid + destination_address,
+  F-TEIDs N4) pour localiser la cause data-specific.
+- **SBI↔N2 / SBI↔N4 UNKNOWN sur ce run** : le trafic SBI est
+  exclusivement CreateSMContext + UpdateSMContext (pas de
+  N1N2MessageTransfer). Les rules tunnel-match 2.8.0 nécessitent
+  N1N2MessageTransfer. Chantier 2.9.8+ possible : ajouter une
+  règle SBI tunnel match depuis CreateSMContext quand un
+  `n2SmInfo` multipart est présent et décodable.
+- **T2 S6a 3 502 msg** : causes documentées en 2.9.6 (segments
+  pré-2.9.5 + cross-segment boundary), correctif structurel possible
+  en 2.9.8+ (DatasetKeepaliveRollup post-process).
+
+
 ## OIRAN API 2.9.6 — 2026-11-08 — Réparation pcapng + cause S6a (devmat T1/T2 — ANR2 #10 comment 6724120812, #9 comment 6724013622)
 
 ### T1 — Cause prouvée : `prefix_sha_index` ignorait pcapng

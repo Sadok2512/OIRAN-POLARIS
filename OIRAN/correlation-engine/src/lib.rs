@@ -1860,4 +1860,250 @@ mod tests {
             "/var/lib/oiran/captures/continuous-lab-import/N3.pcapng".into();
         assert_eq!(capture_scope(&live), "continuous-lab-import");
     }
+
+    /// 2.9.7 (devmat #9 — régression 2.9.1 → 2.9.5) : round-trip de
+    /// non-régression — events N2+N4+N3+SBI construits via
+    /// `event-schema::NormalizedEvent::to_json()` (format JSONL
+    /// COMPACTÉ de production 2.9.4+), désérialisés via
+    /// `session-engine::load_jsonl`, puis passés à
+    /// `correlate_cross_interface_evidence`. On attend **4 edges** :
+    ///
+    /// 1. `ngap-pfcp-exact-tunnel` (N2↔N4) EXACT ;
+    /// 2. `pfcp-outer-header-matches-gtpu-tunnel` (N4↔N3) EXACT ;
+    /// 3. `sbi-n2-tunnel-match` (SBI↔N2) EXACT ;
+    /// 4. `sbi-n4-tunnel-match` (SBI↔N4) EXACT.
+    ///
+    /// Toutes les chaînes IE / identifiers / adresses reflètent les
+    /// formats réels produits par decoder-ngap / decoder-pfcp /
+    /// decoder-gtpu / decoder-sbi — pas la forme synthétique des tests
+    /// SBI précédents qui bypassait `parse_event`.
+    #[test]
+    fn compact_jsonl_round_trip_yields_four_cross_interface_edges() {
+        use event_schema::{
+            Direction, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            InformationElement, NamedValue, NormalizedEvent, PacketReference,
+            Protocol,
+        };
+        use session_engine::load_jsonl;
+        use std::io::Cursor;
+
+        fn make_event(
+            event_id: &str,
+            interface: &str,
+            protocol: Protocol,
+            message_name: &str,
+            source_addr: &str,
+            destination_addr: &str,
+            packet_number: u64,
+            identifiers: Vec<NamedValue>,
+            ies: Vec<InformationElement>,
+        ) -> NormalizedEvent {
+            NormalizedEvent {
+                event_id: event_id.into(),
+                parent_event_id: None,
+                probe_id: "oiran-vprobe-local-01".into(),
+                capture_point_id: interface.into(),
+                capture_id: format!("sha256:cap-{interface}"),
+                packet_references: vec![PacketReference {
+                    source_file: format!(
+                        "/var/lib/oiran/captures/continuous-lab-import/pcap/{interface}.pcap-abc.pcapng"
+                    ),
+                    source_sha256: None,
+                    packet_number,
+                    byte_offset: packet_number * 64,
+                    interface_id: 0,
+                    link_type: None,
+                    sll2_protocol_type: None,
+                    sll2_reserved: None,
+                    sll2_interface_index: None,
+                    sll2_arphrd_type: None,
+                    sll2_packet_type: None,
+                    sll2_address_length: None,
+                    sll2_address: None,
+                    captured_length: 1500,
+                    original_length: 1500,
+                }],
+                timestamp: ExactTimestamp {
+                    seconds: 1_794_158_352,
+                    nanoseconds: packet_number as u32 * 1_000_000,
+                    raw_ticks: 1_794_158_352_000_000_000 + packet_number * 1_000_000,
+                    resolution_base: 10,
+                    resolution_exponent: 9,
+                },
+                interface: interface.into(),
+                protocol,
+                message_name: message_name.into(),
+                message_type: 0,
+                procedure_code: None,
+                procedure: None,
+                security_state: None,
+                source_byte_offset: None,
+                source_endpoint: Endpoint {
+                    address: source_addr.into(),
+                    port: None,
+                    network_function: None,
+                },
+                destination_endpoint: Endpoint {
+                    address: destination_addr.into(),
+                    port: None,
+                    network_function: None,
+                },
+                direction: Direction::RanToCore,
+                session_identifiers: identifiers,
+                information_elements: ies,
+                decoder_name: "test".into(),
+                decoder_version: "0".into(),
+                schema_version: NormalizedEvent::SCHEMA_VERSION,
+                decoding_status: event_schema::DecodeStatus::Decoded,
+                errors: vec![],
+                raw_payload_reference: format!("sha256:{event_id}"),
+                evidence_references: vec![EvidenceReference {
+                    state: EvidenceState::Exact,
+                    kind: "packet-provenance".into(),
+                    reference: format!("sha256:{event_id}"),
+                }],
+                sbi: None,
+            }
+        }
+
+        let upf_n3_ip = "10.77.33.22";
+        let teid_hex_padded = "0x0000d4a6"; // decoder-pfcp emits 8-char padding
+        let teid_hex_plain = "0xd4a6"; // decoder-sbi + decoder-ngap emit unpadded
+
+        // N2 NGAP — decoder-ngap composed IE value for UL tunnel.
+        let n2 = make_event(
+            "evt-n2",
+            "N2",
+            Protocol::Ngap,
+            "PDUSessionResourceSetupRequest",
+            "10.77.21.10",
+            "10.77.21.11",
+            1,
+            vec![NamedValue {
+                name: "pdu_session_id".into(),
+                value: "1".into(),
+                pseudonymized: false,
+            }],
+            vec![InformationElement {
+                id: Some(74),
+                name: "UL NG-U UP TNL Information".into(),
+                length: 50,
+                value: Some(format!(
+                    "tunnel_endpoint_ip={upf_n3_ip},gtp_teid={teid_hex_plain}"
+                )),
+                raw_sha256: None,
+                status: event_schema::DecodeStatus::Decoded,
+            }],
+        );
+
+        // N4 PFCP — decoder-pfcp F-TEID IE : `teid=0x..,v4=..,ipv4=X`.
+        let n4 = make_event(
+            "evt-n4",
+            "N4",
+            Protocol::Pfcp,
+            "PFCP Session Establishment Request",
+            "10.77.22.1",
+            "10.77.22.13",
+            2,
+            vec![NamedValue {
+                name: "f_seid".into(),
+                value: "0x0000000000000f8c".into(),
+                pseudonymized: false,
+            }],
+            vec![InformationElement {
+                id: Some(21),
+                name: "F-TEID".into(),
+                length: 50,
+                value: Some(format!(
+                    "teid={teid_hex_padded},v4=true,v6=false,ipv4={upf_n3_ip}"
+                )),
+                raw_sha256: None,
+                status: event_schema::DecodeStatus::Decoded,
+            }],
+        );
+
+        // N3 GTP-U — decoder-gtpu : `teid` identifier + destination =
+        // UPF N3 IP (uplink G-PDU).
+        let n3 = make_event(
+            "evt-n3",
+            "N3",
+            Protocol::Gtpu,
+            "G-PDU",
+            "10.77.33.10",
+            upf_n3_ip,
+            3,
+            vec![NamedValue {
+                name: "teid".into(),
+                value: format!("{teid_hex_padded}"), // decoder-gtpu emits 8-char padding
+                pseudonymized: false,
+            }],
+            vec![],
+        );
+
+        // SBI N1N2MessageTransfer — decoder-sbi composed IE for n2SmInfo.
+        let sbi = make_event(
+            "evt-sbi",
+            "SBI",
+            Protocol::SbiHttp2,
+            "N1N2MessageTransfer",
+            "10.77.44.10",
+            "10.77.44.20",
+            4,
+            vec![NamedValue {
+                name: "pdu_session_id".into(),
+                value: "1".into(),
+                pseudonymized: false,
+            }],
+            vec![InformationElement {
+                id: None,
+                name: "N2 UL NG-U UP TNL Information".into(),
+                length: 50,
+                value: Some(format!(
+                    "tunnel_endpoint_ip={upf_n3_ip},gtp_teid={teid_hex_plain}"
+                )),
+                raw_sha256: None,
+                status: event_schema::DecodeStatus::Decoded,
+            }],
+        );
+
+        // Compact JSONL round-trip exactly like production :
+        //   decoder → NormalizedEvent::to_json() → write line → read line
+        //   → session_engine::parse_event → EventRecord → correlate.
+        let mut jsonl = Vec::new();
+        for event in [&n2, &n4, &n3, &sbi] {
+            jsonl.extend_from_slice(event.to_json().as_bytes());
+            jsonl.push(b'\n');
+        }
+        let events = load_jsonl(Cursor::new(&jsonl)).expect("JSONL compact doit parser");
+        assert_eq!(events.len(), 4, "les 4 events compacts doivent se re-lire");
+
+        let edges = correlate_cross_interface_evidence(&events);
+        let rules: Vec<&str> = edges.iter().map(|e| e.rule_id.as_str()).collect();
+
+        // Les 4 edges attendues sur un échantillon de session complet.
+        assert!(
+            rules.contains(&"ngap-pfcp-exact-tunnel"),
+            "N2↔N4 EXACT attendu ; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"pfcp-outer-header-matches-gtpu-tunnel"),
+            "N4↔N3 EXACT attendu ; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"sbi-n2-tunnel-match"),
+            "SBI↔N2 EXACT attendu ; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"sbi-n4-tunnel-match"),
+            "SBI↔N4 EXACT attendu ; rules={rules:?}"
+        );
+        assert!(
+            edges.iter().all(|e| e.confidence == "EXACT" || e.confidence == "STRONG"),
+            "toutes les arêtes doivent être EXACT ou STRONG ; got {:?}",
+            edges
+                .iter()
+                .map(|e| (e.rule_id.clone(), e.confidence.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
 }
