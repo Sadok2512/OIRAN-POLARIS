@@ -1439,12 +1439,66 @@ fn attach_sbi_to_sessions(
                     .entry((pseudo.to_owned(), pdu_id.clone()))
                     .or_insert(idx);
             }
-            let ip_raw = event.first_identifier("tunnel_endpoint_ip");
-            let teid_raw = event.first_identifier("gtp_teid");
-            if let (Some(ip), Some(teid)) = (ip_raw, teid_raw) {
-                let ip_norm = event_schema::normalize_ip(ip);
-                if let Some(teid_norm) = event_schema::normalize_teid_hex(teid) {
-                    tunnel_idx.entry((ip_norm, teid_norm)).or_insert(idx);
+            // 2.9.15 (#9 comment 6728928219) : ANR2 a prouvé que le
+            // N2 `PDUSessionResourceSetupRequest` publie son tuple
+            // sous des noms `item_0_tunnel_ip_ul` +
+            // `item_0_gtp_teid_ul` (préfixe `item_0_`, suffixe
+            // directional `_ul` / `_dl`), pas sous
+            // `tunnel_endpoint_ip` / `gtp_teid` plats. La lecture
+            // pré-2.9.15 ne trouvait rien côté N2 → `tunnel_idx`
+            // vide → SBI jamais rattaché par tunnel. Correctif :
+            // scanner TOUS les identifiers du N2 pour les paires
+            // `*tunnel_(ip|endpoint_ip)_(ul|dl)?` ↔
+            // `*gtp_teid_(ul|dl)?` avec le MÊME préfixe.
+            //
+            // Règle : pour chaque identifier dont le nom se
+            // termine par `tunnel_endpoint_ip`, `tunnel_ip_ul`,
+            // `tunnel_ip_dl` ou `tunnel_ip`, chercher un pair
+            // teid avec le MÊME préfixe + suffixe teid (adapté
+            // depuis `correlation-engine::directional_tunnel_components`
+            // pour la cohérence inter-modules).
+            //
+            // `event.identifiers` est un `Vec<(String, String)>` ;
+            // on construit une BTreeMap `name → value` locale
+            // (peu d'entrées par événement) pour chercher les
+            // paires.
+            use std::collections::BTreeMap;
+            let named: BTreeMap<&str, &str> = event
+                .identifiers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            for (name, value) in named.iter() {
+                let (prefix, ip_norm) = if let Some(prefix) =
+                    name.strip_suffix("tunnel_endpoint_ip")
+                {
+                    (prefix, event_schema::normalize_ip(value))
+                } else if let Some(prefix) = name.strip_suffix("tunnel_ip_ul") {
+                    (prefix, event_schema::normalize_ip(value))
+                } else if let Some(prefix) = name.strip_suffix("tunnel_ip_dl") {
+                    (prefix, event_schema::normalize_ip(value))
+                } else if let Some(prefix) = name.strip_suffix("tunnel_ip") {
+                    (prefix, event_schema::normalize_ip(value))
+                } else {
+                    continue;
+                };
+                // Chercher le teid-partenaire avec le même préfixe.
+                let teid_candidates: [String; 4] = [
+                    format!("{prefix}gtp_teid"),
+                    format!("{prefix}gtp_teid_ul"),
+                    format!("{prefix}gtp_teid_dl"),
+                    format!("{prefix}teid"),
+                ];
+                for teid_name in &teid_candidates {
+                    if let Some(teid_raw) = named.get(teid_name.as_str()) {
+                        if let Some(teid_norm) =
+                            event_schema::normalize_teid_hex(teid_raw)
+                        {
+                            tunnel_idx
+                                .entry((ip_norm.clone(), teid_norm))
+                                .or_insert(idx);
+                        }
+                    }
                 }
             }
         }
@@ -2051,6 +2105,81 @@ mod tests {
     ///
     /// Négatif : SBI avec TEID ≠ `0xd4a7` + pseudo différent → non
     /// rattaché, reste dans `unmatched`.
+    /// 2.9.15 (#9 comment 6728928219) — ANR2 a prouvé que
+    /// `attach_sbi_to_sessions` 2.9.9 ne rattachait toujours pas
+    /// le SBI à la session sur le run réel
+    /// `tpl-small-traffic-276467540950` /
+    /// `5g-session-5f3245de7580dee3`. La clé est présente et
+    /// identique dans les trois événements (TEID 0x25fb, IP
+    /// 10.77.22.13), mais le N2 publie son tuple sous
+    /// `item_0_tunnel_ip_ul` + `item_0_gtp_teid_ul` (préfixe +
+    /// suffixe directionnel) et non pas comme `tunnel_endpoint_ip`
+    /// plat. La lecture pré-2.9.15 ne trouvait rien côté session
+    /// → `tunnel_idx` vide → SBI jamais rattaché.
+    ///
+    /// 2.9.15 : `attach_sbi_to_sessions` scanne désormais TOUS
+    /// les identifiers N2/NAS pour les paires
+    /// `*tunnel_(endpoint_ip|ip_ul|ip_dl|ip)` ↔ `*gtp_teid(_ul|_dl)?`
+    /// avec le MÊME préfixe. Les shapes `item_0_…` produites par
+    /// l'ANR2 déclenchent désormais l'indexation.
+    #[test]
+    fn sbi_attach_matches_item_0_directional_tunnel_names_anr2_6728928219() {
+        // N2 PDUSessionResourceSetupRequest avec les noms
+        // RÉELS publiés par ANR2 sur le run du 2026-11-08 :
+        //   item_0_tunnel_ip_ul = 10.77.22.13
+        //   item_0_gtp_teid_ul  = 0x25fb
+        let n2 = event(
+            "evt-1e27eff0f6589f86",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            &[
+                ("ran_ue_ngap_id", "4"),
+                ("amf_ue_ngap_id", "73"),
+                ("pdu_session_id", "1"),
+                ("item_0_tunnel_ip_ul", "10.77.22.13"),
+                ("item_0_gtp_teid_ul", "0x25fb"),
+            ],
+            1,
+        );
+        let n2_resp = event(
+            "evt-n2-resp",
+            "NGAP",
+            "PDUSessionResourceSetupResponse",
+            &[
+                ("ran_ue_ngap_id", "4"),
+                ("amf_ue_ngap_id", "73"),
+                ("pdu_session_id", "1"),
+            ],
+            2,
+        );
+        // SBI N1N2MessageTransfer publie le tuple sous les noms
+        // PLATS `tunnel_endpoint_ip` / `gtp_teid`.
+        let sbi = event(
+            "evt-45eedbe889db2938",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            &[
+                ("pdu_session_id", "1"),
+                ("tunnel_endpoint_ip", "10.77.22.13"),
+                ("gtp_teid", "0x25fb"),
+            ],
+            3,
+        );
+        let events = vec![n2, n2_resp, sbi];
+        let discovery = discover_sessions(&mut events.clone());
+        assert_eq!(discovery.pdu_sessions.len(), 1);
+        let session = &discovery.pdu_sessions[0];
+        assert!(
+            session.event_ids.iter().any(|id| id == "evt-45eedbe889db2938"),
+            "SBI evt-45eedbe889db2938 doit être rattaché par (item_0_tunnel_ip_ul, item_0_gtp_teid_ul) normalisés ; event_ids={:?}",
+            session.event_ids
+        );
+        assert!(
+            session.interfaces.iter().any(|i| i == "SBI-HTTP2"),
+            "SBI-HTTP2 doit apparaître dans session.interfaces"
+        );
+    }
+
     #[test]
     fn sbi_attach_rules_match_anr2_production_shapes_2_9_9() {
         let shared_pseudo = "psn-fakeanr2n2sbi0000000000000000";

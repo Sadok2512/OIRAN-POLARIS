@@ -1,5 +1,75 @@
 # Changelog
 
+## OIRAN API 2.9.15 — 2026-11-08 — SBI attach lit noms directionnels + préfixés (devmat, ANR2 #9 comment 6728928219)
+
+### Contexte — SBI absent de la session malgré clé exacte (run réel)
+
+ANR2 a publié sur #9 comment 6728928219 une preuve sur le run
+POLARIS `tpl-small-traffic-276467540950` / session OIRAN
+`5g-session-5f3245de7580dee3` :
+
+- N2↔N4 **EXACT**, N4↔N3 **EXACT**.
+- SBI↔N2 **OUVERT**, SBI↔N4 **OUVERT**.
+- Clé commune présente : `PDU 1, IP 10.77.22.13, TEID 0x25fb`.
+- SBI `evt-45eedbe889db2938` existe dans le JSONL, dans la
+  fenêtre du run, mais n'appartient PAS aux 18 événements remis
+  au call flow (seulement N2, N3, N4).
+
+### T1 — Cause fichier:ligne
+
+`session-engine/src/lib.rs::attach_sbi_to_sessions`
+(`:1442-1449` pré-2.9.15) indexait `tunnel_idx` en lisant :
+
+```rust
+let ip_raw = event.first_identifier("tunnel_endpoint_ip");
+let teid_raw = event.first_identifier("gtp_teid");
+```
+
+Le N2 publie son tuple sous les noms RÉELS :
+```
+item_0_tunnel_ip_ul = 10.77.22.13
+item_0_gtp_teid_ul  = 0x25fb
+```
+
+Préfixe `item_0_` + suffixe directional `_ul` → la lecture plate
+retournait `None` → `tunnel_idx` vide → SBI (qui publie
+`tunnel_endpoint_ip` plat) ne pouvait pas matcher.
+
+Le fallback `tunnel_keys` 2.9.12 fonctionne côté
+`correlation-engine` (via `directional_tunnel_components` qui
+suffixe `_ul`/`_dl`), mais l'**attache de session** 2.9.9 était
+indépendante et plus stricte.
+
+### T2 — Fix : scan directional + préfixé
+
+`attach_sbi_to_sessions` (`:1442-1510` post-2.9.15) itère
+désormais sur TOUS les identifiers de l'événement N2 et détecte
+les paires :
+
+- `*tunnel_endpoint_ip` ↔ `*gtp_teid` (shape SBI-like)
+- `*tunnel_ip_ul` ↔ `*gtp_teid_ul` (N2 UL)
+- `*tunnel_ip_dl` ↔ `*gtp_teid_dl` (N2 DL)
+- `*tunnel_ip` ↔ `*teid` (shape PFCP-like)
+
+Avec le MÊME préfixe (ex. `item_0_`). Normalisation partagée
+via `event_schema::normalize_ip` + `normalize_teid_hex`.
+
+Test `sbi_attach_matches_item_0_directional_tunnel_names_anr2_6728928219`
+(`session-engine/src/lib.rs`) : N2 `evt-1e27eff0f6589f86` avec
+noms RÉELS d'ANR2 (`item_0_tunnel_ip_ul`, `item_0_gtp_teid_ul`)
++ SBI `evt-45eedbe889db2938` (noms plats) → SBI rattaché à la
+session, `interfaces` inclut `SBI-HTTP2`.
+
+### T3 — Tests
+
+**441 PASS**, 0 FAIL, 4 ignored (+1 vs 2.9.14). Tous les tests
+2.9.6..2.9.14 restent VERT.
+
+### Versions
+
+- `session-engine` 0.5.2 → 0.5.3
+- `oiran-api` 2.9.14 → 2.9.15
+
 ## OIRAN API 2.9.14 — 2026-11-08 — Diameter MALFORMED header-aware + repair uncovered closed files (devmat, ANR2 #9 comment 6728398325)
 
 ### Contexte — deux défauts 2.9.13 prouvés par ANR2
