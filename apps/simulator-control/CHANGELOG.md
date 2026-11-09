@@ -3,6 +3,51 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.13.3 — 2026-11-09 (patch) — Core health séparé de l'IMS
+
+Rebased on `18b6392` (0.13.2). `git merge-base --is-ancestor 18b6392
+HEAD` → true.
+
+ANR1 a prouvé sur #9 comment 6737560904 et #10 comment 6737561274
+que le topbar affichait « Core offline » alors que les 10 NFs 5GC
+étaient `running/healthy` ; les seules fonctions `exited` étaient
+Kamailio + RTPengine (IMS optionnel).
+
+### Correctif
+
+- `src/layout/LabTopbarState.ts` : la santé du cœur est désormais
+  calculée **uniquement** sur les 10 NFs 5GC canoniques (AMF,
+  SMF, UPF, NRF, AUSF, UDM, UDR, PCF, NSSF, BSF) ; les autres
+  entrées `observed.nfs[*]` (Kamailio, RTPengine, SMSF à venir)
+  contribuent à un nouvel état `imsHealth` séparé.
+- Helpers exportés `splitCoreAndIms`, `aggregate`, `toHealth`,
+  `CORE_5GC_NFS` — fonctions pures testables sans react-query.
+- `src/layout/AppShell.tsx` : affiche une seconde pastille
+  « IMS up / IMS degraded / IMS arrêté » à côté de celle du
+  cœur. L'IMS n'est jamais confondu avec le cœur 5G.
+
+### Test
+
+`src/layout/LabTopbarState.test.ts` (13 tests) couvre :
+- Mapping `toHealth` sur tous les états de `process_state`.
+- Agrégation `aggregate` avec les 4 cas canoniques (vide,
+  all-healthy, any-offline, degraded).
+- `CORE_5GC_NFS` = exactement les 10 NFs 3GPP TS 23.501 ;
+  Kamailio/RTPengine EXCLUS.
+- `splitCoreAndIms` avec la **forme réelle** publiée par
+  ANR1 (10 NFs 5GC `running` + Kamailio/RTPengine `exited`)
+  → `core=healthy`, `ims=offline`. Pré-0.13.3 : `core=offline`.
+- Insensibilité à la casse des noms (`amf` == `AMF`).
+- `ims=unknown` quand aucune NF IMS n'est observée.
+
+### Build + base `/simulator/` préservée
+
+Le `base: '/simulator/'` du 0.13.2 (Pillar 3) reste inchangé —
+aucune modification de `vite.config.ts` dans ce commit. Build
+rebuilt and verified: `dist/index.html` → `/simulator/assets/`.
+
+Suite vitest complète : **224 PASS** (211 de 0.13.2 + 13 nouveaux).
+
 ## 0.13.2 — 2026-11-06 (patch, #9 ANR1 handoff)
 
 Rebased on `a39e692` (0.13.1). `git merge-base --is-ancestor a39e692

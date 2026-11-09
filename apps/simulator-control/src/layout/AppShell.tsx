@@ -22,6 +22,17 @@ const HEALTH_LABEL: Record<string, string> = {
   unknown: 'Core status unknown',
 };
 
+// 0.13.3 (#9 6737560904) : label IMS séparé du label cœur 5G.
+// ANR1 a prouvé que Kamailio + RTPengine arrêtés produisaient à
+// tort « Core offline » ; l'IMS a désormais son propre indicateur.
+// Les deux pastilles réutilisent HEALTH_TONE.
+const IMS_LABEL: Record<string, string> = {
+  healthy: 'IMS up',
+  degraded: 'IMS degraded',
+  offline: 'IMS arrêté',
+  unknown: 'IMS n/a',
+};
+
 export function AppShell() {
   const [collapsed, setCollapsed] = useState(false);
   const theme = useTheme();
@@ -101,6 +112,17 @@ export function AppShell() {
               />
               <span className="text-ink">{HEALTH_LABEL[lab.coreHealth]}</span>
             </span>
+            {lab.imsHealth !== 'unknown' && (
+              <span className="inline-flex items-center gap-1.5" data-testid="ims-health">
+                <span
+                  className={clsx(
+                    'h-2 w-2 rounded-full',
+                    HEALTH_TONE[lab.imsHealth].split(' ')[0],
+                  )}
+                />
+                <span className="text-ink">{IMS_LABEL[lab.imsHealth]}</span>
+              </span>
+            )}
             <span className="num" data-testid="plmn-tac">
               PLMN {lab.plmn} · TAC {lab.tac}
             </span>
