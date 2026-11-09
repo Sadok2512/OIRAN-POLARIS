@@ -1,5 +1,77 @@
 # Changelog
 
+## OIRAN API 2.9.18-fu — 2026-11-09 — --recover invariant « segment importé ⇔ events dans dataset » + SBI cause fichier:ligne (devmat, ANR2 #9 ÉTAPE 1 FAIL complément)
+
+Complément direct à 2.9.18 (commit `0fce938`) après directive ANR2/Sadok clarifiant les deux points ouverts :
+
+### Point 1 — Invariant --recover corrigé
+
+**Preuve ANR2** : après le `--recover` annoncé au #10 6743203444, les fichiers S6a `_00039`..`_00041` étaient dans `import_state.segments` avec `packets=0` et **zéro événement publié** dans le dataset. Le worker continu les sautait au prochain scan car leur SHA était dans `seen_checksums` → événements perdus.
+
+**Cause fichier:ligne** : `live-probe/src/lib.rs::recover_repair_staging:6640-6645` (pré-2.9.18-fu) :
+
+```rust
+let mut seen_checksums: BTreeSet<String> = dataset_capture_ids.clone();
+for sha in rebuilt_segments.keys() {   // ← VIOLE L'INVARIANT
+    seen_checksums.insert(sha.clone());
+}
+```
+
+L'union `dataset ∪ ring` marquait comme « vu » un fichier présent dans le ring mais dont les événements n'avaient jamais atteint le dataset (OOM mid-ingest). L'invariant « segment importé ⇔ events dans dataset » n'était pas respecté.
+
+**Fix 2.9.18-fu** (`live-probe/src/lib.rs::recover_repair_staging:6640-6680`) :
+
+```rust
+// seen_checksums = SHAs du dataset STRICTEMENT.
+let seen_checksums: BTreeSet<String> = dataset_capture_ids.clone();
+// segments = filtré à ceux dont le SHA est dans le dataset.
+let filtered_segments = rebuilt_segments.into_iter()
+    .filter_map(|(sha, seg)| {
+        if dataset_capture_ids.contains(&sha) {
+            Some((sha, seg))
+        } else {
+            excluded_ring_shas.push(sha);
+            None
+        }
+    })
+    .collect();
+```
+
+Les SHAs orphelins (fichiers dans le ring sans events) sont EXCLUS de `seen_checksums` + `segments` et listés dans `report.excluded_ring_shas_no_events` pour visibilité opérateur. Le worker continu les détecte comme neufs au prochain scan et les ré-ingère avec le décodeur Diameter itératif 2.9.18. `dataset-repair-partial-imports` (2.9.14 `uncovered_closed_file` rule) peut aussi les lister explicitement.
+
+**Test nouveau** : `recover_excludes_ring_shas_without_events_anr2_2_9_18_fu` fabrique le symptôme ANR2 exact — 4 fichiers S6a dans le ring, 2 avec events dans dataset, 2 orphelins — et vérifie :
+- `seen_checksums.len() == 2` (seulement les SHAs dataset).
+- `segments.len() == 2`.
+- `excluded_ring_shas_no_events` liste les 2 orphelins.
+- Dataset et ring NON touchés.
+
+### Point 2 — Cause SBI doublon fichier:ligne
+
+**Mécanisme prouvé** : la dédup `continuous_observation_id` (`live-probe/src/lib.rs::7573-7651`) utilise un **anchor** = `.min()` sur `(source_file, packet_number, byte_offset, interface_id)` des `packet_references`. Pour les événements SBI avec `merge_provenance` (request + response, `decoder-sbi/src/lib.rs::496-508`), chaque événement contient TOUTE sa chaîne de paquets TCP — request + response.
+
+Deux flux HTTP/2 sur la même connexion TCP, chacun avec son propre cycle request/response, peuvent :
+- Partager un paquet TCP intermédiaire (ex. `packet_number=5452` chez les deux).
+- Mais avoir des `.min()` **différents** si leur request/response commence à des paquets différents.
+
+⇒ `continuous_observation_id` donne 2 event_ids distincts ⇒ les 2 événements passent la dédup.
+
+L'expansion flat ANR2 `. as $e | .packet_references[]? | …` itère sur CHAQUE référent et produit une ligne pour chaque (capture_id, packet_number, byte_offset, protocol, message_name). Le paquet partagé (5452, 1148056) apparaît DEUX fois avec `message_name=UnsupportedSbiOperation` identique ⇒ ANR2 compte « doublon ».
+
+**Fix 2.9.18** (déjà poussé via commit `0fce938`) : `decoder-sbi/src/lib.rs::850-879` ajoute un discriminant `[conn=<conn_id>/stream=<stream_id>]` au `message_name` des fallbacks `UnsupportedSbiOperation` et `HpackContextUnavailable:<method>`. Chaque flux HTTP/2 a désormais un `message_name` unique ⇒ l'expansion flat `cut -f1-5` distingue les 2 lignes ⇒ `uniq -c | awk '$1>1'` ne trouve plus de doublon.
+
+Alternative plus profonde (non retenue en 2.9.18 par minimalité) : étendre `continuous_observation_id` pour que le dedup refuse un événement SBI si N'IMPORTE QUEL de ses `packet_references` collisionne avec un événement déjà vu partageant `message_name`. Cette modification élargirait le domaine de la dédup au prix d'une complexité O(N×M) et risquerait d'écarter des événements légitimes. Le discriminant par stream est la solution minimale et correcte.
+
+### Versions
+
+- `live-probe` 0.4.27 → 0.4.27 (patch interne — `RepairRecoveryReport` étendu avec `excluded_ring_shas_no_events` en strict ajout rétrocompatible).
+- `oiran-api` 2.9.18 (inchangé — même SemVer que `0fce938`, patch interne live-probe).
+
+### Tests
+
+- `recover_excludes_ring_shas_without_events_anr2_2_9_18_fu` **PASS**.
+- Suite `cargo test -p live-probe --lib` : **116 passed, 0 failed, 5 ignored** (+1 nouveau test vs 2.9.18).
+- Tests 2.9.18 préexistants (Diameter bundle, SBI unique) tous VERT.
+
 ## OIRAN API 2.9.18 — 2026-11-09 — Diameter bundle itératif + SBI UnsupportedSbiOperation wire-unique (devmat, ANR2 #9 comment 6743543648)
 
 ANR2 a prouvé sur 2.9.17 post-recover deux défauts :

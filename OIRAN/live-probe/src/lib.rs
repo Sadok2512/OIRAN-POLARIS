@@ -6494,6 +6494,15 @@ pub struct RepairRecoveryReport {
     /// Compteur des `failed_ingestions` préservés.
     #[serde(default)]
     pub preserved_failed_ingestions: u64,
+    /// 2.9.18-fu (#9 ANR2 2.9.17-fu post-recover) : liste des
+    /// SHAs du ring `pcap/` EXCLUS de `seen_checksums`/`segments`
+    /// car leurs événements ne sont pas dans le dataset publié.
+    /// Invariant 2.9.18-fu : segment importé ⇔ événements dans
+    /// le dataset. Ces fichiers seront re-ingérés au prochain
+    /// scan OU listés `uncovered_closed_file` par
+    /// `dataset-repair-partial-imports`.
+    #[serde(default)]
+    pub excluded_ring_shas_no_events: Vec<String>,
 }
 
 /// 2.9.17 (#9 comment 6739207609) — Reprise après crash d'une
@@ -6637,12 +6646,37 @@ pub fn recover_repair_staging(capture_root: &Path) -> Result<RepairRecoveryRepor
             );
         }
     }
-    // L'union garantit que les SHAs présents côté dataset ET
-    // côté ring sont dans seen_checksums (invariant 2.9.8).
-    let mut seen_checksums: BTreeSet<String> = dataset_capture_ids.clone();
-    for sha in rebuilt_segments.keys() {
-        seen_checksums.insert(sha.clone());
-    }
+    // 2.9.18-fu (#9 comment devmat 6744xxxxxx) — ANR2 a prouvé que
+    // le --recover 2.9.17-fu violait l'invariant « segment
+    // importé ⇔ événements dans dataset ». Ancien code (union
+    // dataset ∪ ring) marquait les fichiers S6a `_00039..41`
+    // comme vus (packets=0, 0 événement) → le worker continu les
+    // SAUTAIT au prochain scan. Les événements étaient
+    // perdus.
+    //
+    // Règle 2.9.18-fu : seen_checksums = dataset_capture_ids
+    // STRICTEMENT. Un fichier présent dans le ring mais absent
+    // du dataset est EXCLU. Le worker continu le détectera au
+    // prochain scan ET/OU `dataset-repair-partial-imports` le
+    // listera en `uncovered_closed_file` (règle 2.9.14) → fresh
+    // re-ingest avec le décodeur Diameter itératif 2.9.18.
+    let seen_checksums: BTreeSet<String> = dataset_capture_ids.clone();
+    // De même, `segments` ne garde que les SHAs présents dans
+    // le dataset. Les ring-SHAs orphelins sont comptés pour le
+    // rapport opérateur (visibilité) mais n'entrent pas dans
+    // state.segments → le worker les voit comme neufs.
+    let mut excluded_ring_shas: Vec<String> = Vec::new();
+    let filtered_segments: BTreeMap<String, ImportedSegment> = rebuilt_segments
+        .into_iter()
+        .filter_map(|(sha, seg)| {
+            if dataset_capture_ids.contains(&sha) {
+                Some((sha, seg))
+            } else {
+                excluded_ring_shas.push(sha);
+                None
+            }
+        })
+        .collect();
     // 2.c. seen_order canonique = SHAs triés lexico. Reproductible
     // sur une nouvelle recovery → idempotent.
     let seen_order: std::collections::VecDeque<String> = seen_checksums.iter().cloned().collect();
@@ -6659,7 +6693,7 @@ pub fn recover_repair_staging(capture_root: &Path) -> Result<RepairRecoveryRepor
         .collect();
 
     let rebuilt = ContinuousImportState {
-        segments: rebuilt_segments,
+        segments: filtered_segments,
         seen_checksums,
         seen_order,
         failed_ingestions: previous_state.failed_ingestions,
@@ -6667,6 +6701,7 @@ pub fn recover_repair_staging(capture_root: &Path) -> Result<RepairRecoveryRepor
     };
     report.rebuilt_seen_checksums = rebuilt.seen_checksums.len() as u64;
     report.rebuilt_segments = rebuilt.segments.len() as u64;
+    report.excluded_ring_shas_no_events = excluded_ring_shas;
     report.preserved_source_fingerprints = preserved_source_fingerprints;
     report.preserved_failed_ingestions = preserved_failed_ingestions;
 
@@ -13312,10 +13347,17 @@ mod tests {
         );
     }
 
-    /// 2.9.17-fu (#9 comment 6740035832) — Cas ANR2 réel :
-    /// sauvegarde 2.9.16 SANS `import_state.json`. Prouve que
-    /// `--recover` reconstruit un state cohérent depuis le dataset
-    /// publié + le ring `pcap/` et débloque l'import.
+    /// 2.9.17-fu (#9 comment 6740035832) + 2.9.18-fu (#9 ANR2
+    /// 2.9.17-fu post-recover) — Cas ANR2 réel : sauvegarde 2.9.16
+    /// SANS `import_state.json`. Prouve que `--recover` reconstruit
+    /// un state cohérent depuis le dataset publié uniquement.
+    ///
+    /// INVARIANT 2.9.18-fu : segment importé ⇔ événements dans le
+    /// dataset publié. Un fichier présent dans le ring mais absent
+    /// du dataset (crash OOM en cours d'ingest) est EXCLU de
+    /// `seen_checksums`/`segments` ⇒ le worker continu le détecte
+    /// comme neuf au prochain scan et le re-ingère avec le
+    /// décodeur Diameter itératif 2.9.18.
     #[test]
     fn recover_repair_staging_rebuilds_import_state_from_dataset_2_9_17_fu() {
         let root = temporary_root("repair-recover-2-9-17-fu");
@@ -13325,20 +13367,23 @@ mod tests {
         fs::create_dir_all(dataset.join("callflows")).unwrap();
         fs::create_dir_all(&pcap_dir).unwrap();
 
-        // Dataset publié : trois capture_id distincts.
-        let published_jsonl = concat!(
-            "{\"event_id\":\"evt-1\",\"capture_id\":\"sha256:aaaaaaaaaaaaaaaa\",\"packet_number\":1}\n",
-            "{\"event_id\":\"evt-2\",\"capture_id\":\"sha256:bbbbbbbbbbbbbbbb\",\"packet_number\":2}\n",
-            "{\"event_id\":\"evt-3\",\"capture_id\":\"sha256:cccccccccccccccc\",\"packet_number\":3}\n",
-        );
-        fs::write(dataset.join("oiran_events.jsonl"), published_jsonl).unwrap();
-
-        // Ring pcap/ : 2 fichiers propriétaires. Leurs SHA réels
-        // iront dans le `segments` reconstruit.
+        // Ring pcap/ : 2 fichiers propriétaires dont les événements
+        // doivent apparaître dans le dataset.
         let seg_a = pcap_dir.join("n2.pcap-aa.pcapng");
         let seg_b = pcap_dir.join("n4.pcap-bb.pcapng");
         fs::write(&seg_a, b"PCAP-SEGMENT-A").unwrap();
         fs::write(&seg_b, b"PCAP-SEGMENT-B").unwrap();
+        let sha_a = sha256_hex_file(&seg_a).unwrap();
+        let sha_b = sha256_hex_file(&seg_b).unwrap();
+
+        // Dataset publié : 3 capture_id — 2 correspondent aux
+        // fichiers du ring, 1 est historique (fichier déjà purgé).
+        let published_jsonl = format!(
+            "{{\"event_id\":\"evt-1\",\"capture_id\":\"sha256:{sha_a}\",\"packet_number\":1}}\n\
+             {{\"event_id\":\"evt-2\",\"capture_id\":\"sha256:{sha_b}\",\"packet_number\":2}}\n\
+             {{\"event_id\":\"evt-3\",\"capture_id\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"packet_number\":3}}\n",
+        );
+        fs::write(dataset.join("oiran_events.jsonl"), &published_jsonl).unwrap();
 
         // PAS de `import_state.json` — cas ANR2.
         assert!(!base.join("import_state.json").exists());
@@ -13348,22 +13393,25 @@ mod tests {
         // Pas de pre-recover (il n'y avait rien à sauvegarder).
         assert!(!base.join("import_state.json.pre-recover").exists());
 
-        // Nouveau state cohérent.
+        // Nouveau state cohérent : seen_checksums = dataset SHAs
+        // uniquement (invariant 2.9.18-fu).
         let rebuilt_state: ContinuousImportState = serde_json::from_slice(
             &fs::read(base.join("import_state.json")).unwrap(),
         )
         .unwrap();
-        // 3 SHAs du dataset + 2 SHAs du ring (distincts) = 5.
         assert_eq!(
             rebuilt_state.seen_checksums.len(),
-            5,
-            "seen_checksums doit couvrir dataset + ring ; got {:?}",
-            rebuilt_state.seen_checksums,
+            3,
+            "seen_checksums = SHAs du dataset uniquement (invariant 2.9.18-fu)"
         );
-        assert!(rebuilt_state.seen_checksums.contains("aaaaaaaaaaaaaaaa"));
-        assert!(rebuilt_state.seen_checksums.contains("bbbbbbbbbbbbbbbb"));
-        assert!(rebuilt_state.seen_checksums.contains("cccccccccccccccc"));
-        // 2 segments du ring sont enregistrés avec leur interface.
+        assert!(rebuilt_state.seen_checksums.contains(&sha_a));
+        assert!(rebuilt_state.seen_checksums.contains(&sha_b));
+        assert!(rebuilt_state
+            .seen_checksums
+            .contains(&"c".repeat(64)));
+        // 2 segments du ring sont enregistrés (leur SHA est dans le
+        // dataset). L'entrée historique `c…` n'a pas de fichier
+        // physique donc pas dans segments.
         assert_eq!(rebuilt_state.segments.len(), 2);
         let interfaces: BTreeSet<String> = rebuilt_state
             .segments
@@ -13374,9 +13422,13 @@ mod tests {
         assert!(interfaces.contains("n4"));
         // Report compteurs.
         assert_eq!(report.rebuilt_segments, 2);
-        assert_eq!(report.rebuilt_seen_checksums, 5);
+        assert_eq!(report.rebuilt_seen_checksums, 3);
         assert_eq!(report.preserved_source_fingerprints, 0);
         assert_eq!(report.preserved_failed_ingestions, 0);
+        assert!(
+            report.excluded_ring_shas_no_events.is_empty(),
+            "pas de ring SHA orphelin dans ce scénario"
+        );
 
         // Dataset NON touché.
         assert_eq!(
@@ -13386,6 +13438,130 @@ mod tests {
         // Ring NON touché.
         assert_eq!(fs::read(&seg_a).unwrap(), b"PCAP-SEGMENT-A");
         assert_eq!(fs::read(&seg_b).unwrap(), b"PCAP-SEGMENT-B");
+    }
+
+    /// 2.9.18-fu (#9 ANR2 2.9.17-fu post-recover) — Preuve de la
+    /// règle « segment importé ⇔ événements dans dataset ». ANR2
+    /// a prouvé que les fichiers S6a `_00039`..`_00041` étaient
+    /// dans `import_state.segments` (packets=0) mais ZERO
+    /// événement publié dans le dataset. Le --recover 2.9.17-fu
+    /// les marquait comme vus → le worker continu les sautait au
+    /// prochain scan → événements perdus.
+    ///
+    /// 2.9.18-fu : les SHAs ring non représentés dans le dataset
+    /// sont EXCLUS de seen_checksums + segments, et listés dans
+    /// `report.excluded_ring_shas_no_events` pour visibilité
+    /// opérateur. Le worker continu les détectera comme neufs et
+    /// les re-ingérera avec le décodeur Diameter 2.9.18 itératif.
+    #[test]
+    fn recover_excludes_ring_shas_without_events_anr2_2_9_18_fu() {
+        let root = temporary_root("repair-recover-anr2-no-events");
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset = base.join("dataset");
+        let pcap_dir = base.join("pcap");
+        fs::create_dir_all(dataset.join("callflows")).unwrap();
+        fs::create_dir_all(&pcap_dir).unwrap();
+
+        // Ring pcap/ : 4 fichiers S6a.
+        // _00035 et _00037 : dans le dataset (events).
+        // _00039 et _00040 : dans le ring mais 0 événement.
+        let seg_35 = pcap_dir.join("s6a.pcap-35.pcapng");
+        let seg_37 = pcap_dir.join("s6a.pcap-37.pcapng");
+        let seg_39 = pcap_dir.join("s6a.pcap-39.pcapng");
+        let seg_40 = pcap_dir.join("s6a.pcap-40.pcapng");
+        fs::write(&seg_35, b"S6A-35").unwrap();
+        fs::write(&seg_37, b"S6A-37").unwrap();
+        fs::write(&seg_39, b"S6A-39").unwrap();
+        fs::write(&seg_40, b"S6A-40").unwrap();
+        let sha_35 = sha256_hex_file(&seg_35).unwrap();
+        let sha_37 = sha256_hex_file(&seg_37).unwrap();
+        let sha_39 = sha256_hex_file(&seg_39).unwrap();
+        let sha_40 = sha256_hex_file(&seg_40).unwrap();
+
+        // Dataset publié : seulement _00035 et _00037 ont des events
+        // (symptôme ANR2 réel : OOM a interrompu l'ingest de 39/40).
+        let published_jsonl = format!(
+            "{{\"event_id\":\"evt-35\",\"capture_id\":\"sha256:{sha_35}\",\"packet_number\":1}}\n\
+             {{\"event_id\":\"evt-37\",\"capture_id\":\"sha256:{sha_37}\",\"packet_number\":1}}\n",
+        );
+        fs::write(dataset.join("oiran_events.jsonl"), &published_jsonl).unwrap();
+
+        // État pré-existant simulant 2.9.17-fu bogué : 4 segments,
+        // 4 seen_checksums (dont 39/40 orphelins).
+        let mut state = ContinuousImportState::default();
+        for sha in &[&sha_35, &sha_37, &sha_39, &sha_40] {
+            state.seen_checksums.insert((*sha).clone());
+            state.seen_order.push_back((*sha).clone());
+            state.segments.insert(
+                (*sha).clone(),
+                ImportedSegment {
+                    interface: "s6a".into(),
+                    owned_file: format!("s6a.pcap-{sha}.pcapng"),
+                    size_bytes: 6,
+                    packets: 0,
+                    imported_epoch_ms: 1_000,
+                    source_path: String::new(),
+                    historical_context: false,
+                },
+            );
+        }
+        fs::write(
+            base.join("import_state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let report = recover_repair_staging(&root).unwrap();
+
+        // seen_checksums = SHAs dataset UNIQUEMENT (invariant).
+        let rebuilt: ContinuousImportState = serde_json::from_slice(
+            &fs::read(base.join("import_state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rebuilt.seen_checksums.len(),
+            2,
+            "seen_checksums doit contenir 2 SHAs (ceux représentés dans le dataset) ; \
+             les 2 orphelins (39/40) sont exclus"
+        );
+        assert!(rebuilt.seen_checksums.contains(&sha_35));
+        assert!(rebuilt.seen_checksums.contains(&sha_37));
+        assert!(
+            !rebuilt.seen_checksums.contains(&sha_39),
+            "sha_39 orphelin NE DOIT PAS être dans seen_checksums"
+        );
+        assert!(
+            !rebuilt.seen_checksums.contains(&sha_40),
+            "sha_40 orphelin NE DOIT PAS être dans seen_checksums"
+        );
+        // state.segments : 2 segments, ceux avec events.
+        assert_eq!(rebuilt.segments.len(), 2);
+        assert!(rebuilt.segments.contains_key(&sha_35));
+        assert!(rebuilt.segments.contains_key(&sha_37));
+
+        // Report liste les SHAs exclus pour visibilité opérateur.
+        let excluded: BTreeSet<String> = report
+            .excluded_ring_shas_no_events
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(
+            excluded.len(),
+            2,
+            "excluded_ring_shas_no_events doit lister les 2 orphelins ; got {:?}",
+            excluded
+        );
+        assert!(excluded.contains(&sha_39));
+        assert!(excluded.contains(&sha_40));
+
+        // Dataset NON touché.
+        assert_eq!(
+            fs::read(dataset.join("oiran_events.jsonl")).unwrap(),
+            published_jsonl.as_bytes(),
+        );
+        // Ring NON touché.
+        assert_eq!(fs::read(&seg_39).unwrap(), b"S6A-39");
+        assert_eq!(fs::read(&seg_40).unwrap(), b"S6A-40");
     }
 
     /// 2.9.17 (#9 comment 6739207609) — Preuve d'atomicité :

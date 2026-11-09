@@ -112,6 +112,11 @@ fn run() -> Result<String, String> {
             "rebuilt_segments": report.rebuilt_segments,
             "preserved_source_fingerprints": report.preserved_source_fingerprints,
             "preserved_failed_ingestions": report.preserved_failed_ingestions,
+            // 2.9.18-fu : SHAs du ring exclus de seen_checksums
+            // car leurs événements ne sont pas dans le dataset
+            // publié (invariant : segment importé ⇔ events
+            // dans dataset). Seront re-ingérés au prochain scan.
+            "excluded_ring_shas_no_events": report.excluded_ring_shas_no_events,
             "pre_recover_backup": "<capture_root>/continuous-lab-import/import_state.json.pre-recover",
         })
         .to_string());
