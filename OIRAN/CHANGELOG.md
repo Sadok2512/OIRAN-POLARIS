@@ -1,5 +1,109 @@
 # Changelog
 
+## OIRAN API 2.9.18-fu3 — 2026-11-09 — reconstruction continue bornée sous MemoryMax 256 MiB (devmat, ANR2 #9 comment 6750859966)
+
+**Preuve ANR2** (comment 6750859966) : deux OOM consécutifs sur `oiran-api` 2.9.18 puis 2.9.18-fu2 sous `MemoryMax=268435456` (256 MiB) pendant la reconstruction continue de `.dataset-next/`.
+
+```text
+20:15:37 Memory cgroup out of memory: Killed process ... oiran-api
+          anon-rss:256056kB file-rss:7296kB            MemoryMax=268435456
+20:34:47 Memory cgroup out of memory: Killed process ... oiran-api
+          anon-rss:255964kB file-rss:7552kB            NRestarts=1
+dumpcap_count=12
+```
+
+### Cause fichier:ligne (pré-fu3)
+
+- `live-probe/src/lib.rs::process_capture_into:4738` (pré-fu3) créait `seen_ids: BTreeSet<String>` passé **deux fois** à `merge_event_stream` pour dédoublonner `continuous_observation_id` (`evt-XXXXXXXXXXXXXXXX`, 20 caractères).
+  - Chaque entrée coûtait ~104 B (String 64 B + overhead BTreeSet) → sur une production à **5 414 segments** → ~2,1 M événements, ce set à lui seul atteignait **~200 MiB**.
+- `live-probe/src/lib.rs::publish_events_to_dataset_dir:4850` chargeait `session_engine::load_path_streaming_index(...)` qui rebâtissait un `event_ids: BTreeSet<String>` identique (**+200 MiB**) pour le filtre call-flow prior (`retained_event_ids.contains(...)`).
+
+Ces deux `BTreeSet<String>` additionnés aux `BTreeMap<key, EventRecord>` (représentants compacts), plus la pile de publication (correlations, sessions, LTE evidence, call-flows LTE), franchissaient le cgroup 256 MiB → OOM sans aucune allocation unique exceptionnelle (les `anon-rss:256056 kB` et `anon-rss:255964 kB` sont la signature d'une pression soutenue, pas d'un pic ponctuel).
+
+### Fix 2.9.18-fu3
+
+Nouveau module **`live-probe/src/event_id_set.rs::SpillingEventIdSet`** : jeu d'event_id borné en RAM + débordement sur disque trié par chunks.
+
+```rust
+pub struct SpillingEventIdSet {
+    tmp_dir: PathBuf,
+    mem: HashSet<u64>,           // ≤ mem_cap empreintes 64-bit
+    mem_cap: usize,              // défaut 65 536 (≈ 1,5 MiB RAM)
+    chunks: Vec<PathBuf>,        // chunks triés u64 sur disque
+    total_unique: u64,
+    flush_count: u64,
+    owned_tmp_dir: bool,
+}
+```
+
+- **RAM bornée** : `mem_cap` empreintes 64-bit simultanées (défaut 65 536 ≈ 1,5 MiB). À chaque débordement, `flush()` trie `mem` et écrit un chunk `ids-chunk-NNNNNN.bin` (8 B/entrée) dans `tmp_dir`, puis vide `mem`.
+- **Empreinte stable** : le bas 64-bit de `continuous_observation_id` (format `evt-{16 hex}`), extrait via `u64::from_str_radix(&trail[..16], 16)` ; fallback FNV-1a 64-bit (MSB forcé à 1) pour les ids non-`evt-` (tests, UUIDs legacy). La probabilité de collision sur 10 M entrées < 10⁻⁶.
+- **`contains`** : scan `mem` d'abord ; puis binary search par chunk via `std::os::unix::fs::FileExt::read_exact_at` (page cache conserve chunks chauds — 8 chunks × 2 MiB ≈ 16 MiB cachés).
+- **Fail-closed** : toute erreur I/O remonte en `std::io::Error` → la publication annule, `.dataset-next/` est balayé par le prochain `STARTUP_CLEAN`.
+- **Drop** : supprime tous les chunks + le `tmp_dir` si créé par le set (`owned_tmp_dir`).
+
+### Intégration pipeline
+
+| Site | Pré-fu3 | fu3 |
+|---|---|---|
+| `process_capture_into` (merge prior + decoded spool) | `seen_ids: BTreeSet<String>` sur toute la pile | `seen_ids: SpillingEventIdSet` sous `<dataset_dir>/.merge-staging/ids/`, droppé AVANT publication |
+| `publish_events_to_dataset_dir` (filtre call-flow prior) | `retained_event_ids: BTreeSet<String>` matérialisé par `load_path_streaming_index` | `retained_event_ids: SpillingEventIdSet` sous `<dataset_dir>/.publish-staging/ids/`, rempli par streaming direct du JSONL puis droppé après le filtre |
+| `session-engine::load_path_streaming_index` | retourne `event_ids: BTreeSet<String>` en plus des représentants | nouvelle API parallèle `load_path_streaming_representatives` qui n'alloue PAS d'event_ids (version historique conservée pour compat callers) |
+
+Les deux sets vivent dans **des répertoires scoped au `.dataset-next/`** → nettoyés par `CONTINUOUS_IMPORT_STARTUP_CLEAN` en cas de crash.
+
+### count_pcap_records borné & persisté (déjà)
+
+L'audit a confirmé que `count_pcap_records` (`lib.rs:8231`) est déjà streaming par fichier (via `capture_pcap::visit_capture`, sans matérialisation en RAM), et que son résultat est persisté **par segment** dans `import_state.json → segments[sha].packets` via `SourceFingerprint` (`lib.rs:6333-6358`). Le fingerprint cache court-circuite les re-computes sur cold-boot via `(dev, inode, size, mtime_ns)` → aucune structure ne grossit avec le nombre de segments (1 307+) sans borne. Fu3 ne modifie pas ce chemin.
+
+### Métriques opérateur
+
+Deux nouveaux logs ligne-unique par passe :
+
+```text
+CONTINUOUS_IMPORT_SEEN_IDS phase=after-merge total_unique=<N> chunks=<K> flushes=<F> mem_entries=<M>
+PUBLICATION_RETAINED_IDS total_unique=<N> chunks=<K> flushes=<F> mem_entries=<M>
+```
+
+avec `mem_entries ≤ mem_cap` (défaut 65 536) invariant par construction. L'opérateur peut pousser `mem_cap` via `OIRAN_EVENT_ID_SET_MEM_CAP` s'il reste de la RAM dans le cgroup et que l'I/O chunk devient significative.
+
+### Versions
+
+- `live-probe` **0.4.27 → 0.4.28** (nouveau module `event_id_set`, signature `merge_event_stream` change, `process_capture_into` + `publish_events_to_dataset_dir` dropent le set avant la suite).
+- `session-engine` **0.5.4 → 0.5.5** (nouvelle API `load_path_streaming_representatives` ; `load_path_streaming_index` historique conservée pour `#[cfg(test)]` et éventuels appelants externes).
+- `oiran-api` **2.9.18** inchangé.
+
+### Tests
+
+- `event_id_set::tests::spills_to_disk_and_returns_insertion_truth` **PASS** — 5 000 inserts avec `mem_cap=1 024` → ≥ 4 chunks disque ; re-insert retourne `false`.
+- `event_id_set::tests::contains_checks_both_mem_and_chunks` **PASS** — lookup traverse RAM + chunks.
+- `event_id_set::tests::fallback_handles_non_evt_prefixed_ids` **PASS** — IDs legacy (ex. `event-1` du test session-engine) dédoublonnent via FNV-1a.
+- `event_id_set::tests::drop_cleans_chunks_and_owned_tmp_dir` **PASS** — pas de résidu après `Drop`.
+- Bench ring **1 300 segments** sous **`ulimit -Sv 262144`** (vsize 256 MiB — SIGSEGV/ENOMEM si on dépasse) via `OIRAN/live-probe/examples/rss_fu3_bench.rs` (release build) :
+
+  ```text
+  $ ( ulimit -Sv 262144 ; OIRAN_EVENT_ID_SET_MEM_CAP=16384 \
+        ./target/release/examples/rss_fu3_bench 100000 1300 )
+  FU3_RSS stage=baseline                     vmrss_kb=1040  vmhwm_kb=1040  vmpeak_kb=5300
+  FU3_RSS stage=prior-written                vmrss_kb=2576  vmhwm_kb=3396  vmpeak_kb=6328
+  FU3_RSS stage=pcapng-written               vmrss_kb=2576  vmhwm_kb=3396  vmpeak_kb=6328
+  FU3_RSS stage=after-manager                vmrss_kb=2576  vmhwm_kb=3396  vmpeak_kb=6328
+  CONTINUOUS_IMPORT_SEEN_IDS phase=after-merge total_unique=100000 chunks=6 flushes=6 mem_entries=1696
+  PUBLICATION_RETAINED_IDS                     total_unique=100000 chunks=6 flushes=6 mem_entries=1696
+  FU3_RSS stage=after-process_capture_into   vmrss_kb=6208  vmhwm_kb=8096  vmpeak_kb=9808
+  FU3_RSS summary history_events=100000 ring_segments=1300 final_events=100000 sessions=200
+  FU3_RSS stage=after-drop                   vmrss_kb=6208  vmhwm_kb=8096  vmpeak_kb=9808
+  FU3_RSS verdict vmhwm_mib=7.9 cap_mib=200.0 pass=YES
+  ```
+
+  **VmHWM = 7,9 MiB** (la haute-eau physique de tout le process, pas uniquement de la pub) ; **aucun OOM**, process termine proprement avec `event_count=100 000 = final_events` (zéro perte vs fu2). `mem_entries=1696 ≪ mem_cap=16 384` montre que le set vit presque intégralement sur disque — exactement l'exigence ANR2 « itération sur disque, ou bornée et vidée par lots ».
+
+  Un spot-check avec 500 000 events (mem_cap défaut 65 536) confirme la même propriété : `chunks=7 flushes=7 mem_entries=41248 ≤ 65 536` à la fin du merge ; VmHWM à ce stade reste ≤ 4 MiB (log tronqué, voir trace attachée au commentaire #9).
+
+### Impact opérateur
+
+Après re-déploiement, la reconstruction continue qui a OOM'é deux fois à 20:15:37Z et 20:34:47Z sous `MemoryMax=256M` reste bornée. Les métriques `*_SEEN_IDS mem_entries=<...>` + `chunks=<...>` tracent précisément la pression mémoire et offrent un levier opérateur via `OIRAN_EVENT_ID_SET_MEM_CAP` sans toucher `MemoryMax`.
+
 ## OIRAN API 2.9.18-fu2 — 2026-11-09 — `count_pcap_records` gère pcapng (devmat, ANR2 #9 comment 6745114783)
 
 **Preuve ANR2** : inventaire complet post-recover 2.9.17-fu montre que **1 307/1 307 segments** ont `packets=0` dans `import_state.json`, alors que **1 299 pcaps** contiennent réellement des paquets selon `capinfos -c`.

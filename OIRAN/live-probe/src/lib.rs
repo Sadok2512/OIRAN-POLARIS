@@ -1,7 +1,10 @@
 //! Strictly owned, allowlisted live capture jobs for the OIRAN local vProbe.
 
 mod callflow_page;
+pub mod event_id_set;
 pub mod lte_evidence;
+
+pub use event_id_set::{SpillingEventIdSet, DEFAULT_MEM_CAP as EVENT_ID_SET_DEFAULT_MEM_CAP};
 
 pub use callflow_page::{
     read_callflow_page, DEFAULT_CALLFLOW_PAGE_EVENTS, MAX_CALLFLOW_PAGE_EVENTS,
@@ -90,6 +93,20 @@ fn derived_output_hard_limit_bytes() -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_CONTINUOUS_DERIVED_OUTPUT_MAX_BYTES)
+}
+
+/// 2.9.18-fu3 (ANR2 #9 comment 6750859966) : capacité RAM du
+/// `SpillingEventIdSet` partagé `seen_ids` + `retained_event_ids`.
+/// Le défaut (65 536 empreintes u64 ≈ 1,5 MiB) est volontairement
+/// bas — toute pression mémoire additionnelle est déportée vers
+/// des chunks triés sur disque. L'opérateur peut remonter la cap
+/// via `OIRAN_EVENT_ID_SET_MEM_CAP` si l'I/O chunk devient
+/// significative et qu'il reste de la RAM dans le cgroup.
+fn event_id_set_mem_cap() -> usize {
+    std::env::var("OIRAN_EVENT_ID_SET_MEM_CAP")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(EVENT_ID_SET_DEFAULT_MEM_CAP)
 }
 // 2.8.3 (#9 comment 6696366882): the `MAX_SOURCE_CANDIDATES = 512` cap
 // was removed. ANR2 proved the cap left ~3 292 paths outside the
@@ -4724,6 +4741,16 @@ impl CaptureManager {
         decoded_spool.flush().map_err(display_error)?;
         decoded_spool.get_ref().sync_all().map_err(display_error)?;
         drop(decoded_spool);
+        // 2.9.18-fu3 (ANR2 #9 comment 6750859966) : `seen_ids`
+        // persiste sur disque sous `.dataset-next/.merge-staging/ids/`
+        // via `SpillingEventIdSet` — au plus 1,5 MiB en RAM, le
+        // reste en chunks triés u64 relus en binary search.
+        let merge_staging = dataset_dir.join(".merge-staging").join("ids");
+        let mut seen_ids = SpillingEventIdSet::new(
+            &merge_staging,
+            event_id_set_mem_cap(),
+        )
+        .map_err(display_error)?;
         if capture_id == CONTINUOUS_CAPTURE_ID {
             // 2.7.23: streaming merge, write directly to tmp.
             // 2.7.27: NO retention / purge during merge. Every event
@@ -4735,7 +4762,6 @@ impl CaptureManager {
                 STREAM_CHUNK_BYTES,
                 fs::File::create(&tmp_path).map_err(display_error)?,
             );
-            let mut seen_ids: BTreeSet<String> = BTreeSet::new();
             if let Some((prior_dir, _)) = &prior_continuous {
                 let prior_events_file = fs::File::open(prior_dir.join("oiran_events.jsonl"))
                     .map_err(display_error)?;
@@ -4751,9 +4777,23 @@ impl CaptureManager {
             writer.get_ref().sync_all().map_err(display_error)?;
             drop(writer);
             fs::rename(&tmp_path, &events_path).map_err(display_error)?;
+            // Log opérateur : empreinte mémoire du set.
+            eprintln!(
+                "CONTINUOUS_IMPORT_SEEN_IDS phase=after-merge total_unique={} chunks={} flushes={} mem_entries={}",
+                seen_ids.len_hint(),
+                seen_ids.chunk_count(),
+                seen_ids.flush_count(),
+                seen_ids.mem_len(),
+            );
         } else {
             fs::rename(&decoded_spool_path, &events_path).map_err(display_error)?;
         }
+        // Le set n'est plus nécessaire à partir d'ici ; son `Drop`
+        // supprime chunks + répertoire `.merge-staging/ids/`. On le
+        // relâche explicitement avant la publication pour rendre la
+        // RAM mesurable et déterministe.
+        drop(seen_ids);
+        let _ = fs::remove_dir(dataset_dir.join(".merge-staging"));
         // 2.7.27 (issue #10, ANR2): capture-level age retention. Runs
         // ONLY when `OIRAN_DATASET_RETENTION_DAYS` is explicitly set to
         // a positive value. Moves whole captures (never slices inside)
@@ -4804,13 +4844,47 @@ impl CaptureManager {
         let events_path = dataset_dir.join("oiran_events.jsonl");
         release_unused_heap_pages();
         trace_publication_rss("after-streaming-merge", None);
-        // 2.7.24: stream the JSONL into an ids-only retention set plus
-        // compact semantic representatives. The full dataset is never a
-        // Vec<EventRecord>; full event bodies are reloaded per session below.
-        let index = session_engine::load_path_streaming_index(&events_path)?;
-        let retained_event_ids = index.event_ids;
+        // 2.7.24 + 2.9.18-fu3: stream the JSONL into compact
+        // semantic representatives + a disk-spilling event-id set.
+        // The pré-fu3 `BTreeSet<String>` d'event_ids retenus
+        // retombait ~104 B/entrée × 2 M lignes = ~200 MiB en RAM
+        // juste pour la sélection des call-flows prior à recopier
+        // (filtre `retained_event_ids.contains(...)` ci-dessous).
+        // `SpillingEventIdSet` borne cette empreinte à l'ordre de
+        // la MiB.
+        let index = session_engine::load_path_streaming_representatives(&events_path)?;
         let event_count = index.source_event_count;
         let mut events = index.events;
+        let retention_staging = dataset_dir.join(".publish-staging").join("ids");
+        let mut retained_event_ids =
+            SpillingEventIdSet::new(&retention_staging, event_id_set_mem_cap())
+                .map_err(display_error)?;
+        {
+            let file = fs::File::open(&events_path).map_err(display_error)?;
+            let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
+            for line in reader.lines() {
+                let line = line.map_err(display_error)?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                if let Some(event_id) = value.get("event_id").and_then(serde_json::Value::as_str) {
+                    retained_event_ids
+                        .insert(event_id)
+                        .map_err(display_error)?;
+                }
+            }
+        }
+        eprintln!(
+            "PUBLICATION_RETAINED_IDS total_unique={} chunks={} flushes={} mem_entries={}",
+            retained_event_ids.len_hint(),
+            retained_event_ids.chunk_count(),
+            retained_event_ids.flush_count(),
+            retained_event_ids.mem_len(),
+        );
         trace_publication_rss("after-streaming-index", Some(events.len()));
         let capture_job = self.get(capture_id);
         // 2.7.28: when restore runs in a manager that never saw the
@@ -5014,11 +5088,17 @@ impl CaptureManager {
                 let flow: CallFlow =
                     serde_json::from_slice(&fs::read(&prior_json).map_err(display_error)?)
                         .map_err(|error| error.to_string())?;
-                if !flow
-                    .events
-                    .iter()
-                    .all(|event| retained_event_ids.contains(&event.event_id))
-                {
+                let mut all_present = true;
+                for event in &flow.events {
+                    if !retained_event_ids
+                        .contains(&event.event_id)
+                        .map_err(display_error)?
+                    {
+                        all_present = false;
+                        break;
+                    }
+                }
+                if !all_present {
                     continue;
                 }
                 atomic_write(
@@ -5038,6 +5118,11 @@ impl CaptureManager {
         }
         session_ids.sort();
         session_ids.dedup();
+        // 2.9.18-fu3 : relâche le set disk-backed dès que le filtre
+        // call-flow prior est consommé — les chunks + le staging
+        // sont supprimés avant qu'on sérialise le manifeste.
+        drop(retained_event_ids);
+        let _ = fs::remove_dir(dataset_dir.join(".publish-staging"));
         let dataset = LiveDataset {
             dataset_id,
             capture_id: capture_id.into(),
@@ -7534,11 +7619,20 @@ fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) {
     );
 }
 
-/// 2.7.23 + 2.7.27: streaming merge of one input source into the
+/// 2.7.23 + 2.7.27 + 2.9.18-fu3: streaming merge of one input source into the
 /// final `oiran_events.jsonl.tmp`. Peak memory held by this function
-/// is `BTreeSet<String>` of already-written event_ids (≈ 24 B per id)
-/// + one `serde_json::Value` + one `String` line. No per-event body
-/// is retained, no second-pass seek is required.
+/// is the `SpillingEventIdSet` (RAM ≤ 65 536 empreintes u64 ≈ 1,5 MiB,
+/// le reste débordé en chunks triés sur disque — voir
+/// `event_id_set.rs`) + one `serde_json::Value` + one `String` line.
+/// No per-event body is retained, no second-pass seek is required.
+///
+/// 2.9.18-fu3 (ANR2 #9 comment 6750859966) : la version pré-fu3
+/// retenait `seen_ids: BTreeSet<String>` qui atteignait ~200 MiB
+/// sur une production à 5 414 segments → 2 OOM sous le cgroup
+/// 256 MiB. Le `SpillingEventIdSet` borne la RAM à l'empreinte
+/// 64-bit d'au plus `mem_cap` ids simultanés, chaque surplus étant
+/// vidé en un chunk trié sur disque (binary search via
+/// `read_exact_at` pour les lookups).
 ///
 /// 2.7.27: NO retention / purge is applied here anymore. The 2.7.22
 /// per-event cutoff deleted events whose `timestamp.seconds` was
@@ -7558,7 +7652,7 @@ fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) {
 fn merge_event_stream<R, W>(
     mut reader: R,
     writer: &mut W,
-    seen_ids: &mut BTreeSet<String>,
+    seen_ids: &mut SpillingEventIdSet,
 ) -> Result<(), String>
 where
     R: BufRead,
@@ -7578,7 +7672,7 @@ where
         let mut value: serde_json::Value =
             serde_json::from_str(&line).map_err(|error| error.to_string())?;
         let id = continuous_observation_id(&value)?;
-        if !seen_ids.insert(id.clone()) {
+        if !seen_ids.insert(&id).map_err(display_error)? {
             // Duplicate (same deterministic observation id) → first
             // write wins.
             drop(value);

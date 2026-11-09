@@ -668,6 +668,50 @@ pub fn load_path_streaming_index(path: &std::path::Path) -> Result<StreamingEven
     })
 }
 
+/// 2.9.18-fu3 (devmat, ANR2 #9 comment 6750859966) : variante
+/// `BTreeSet<String>`-less pour le pipeline de publication continu.
+/// ANR2 a prouvé que `event_ids` à 2 M entrées (≈ 200 MiB) sous
+/// `MemoryMax=256 MiB` conduisait à l'OOM. Le caller construit
+/// désormais un `SpillingEventIdSet` disk-backed en parallèle de
+/// cette fonction.
+///
+/// Garanties mémoire : identique à `load_path_streaming_index`
+/// moins le set d'event_ids ; les représentants compacts
+/// (`BTreeMap<key, EventRecord>`) sont les seuls états scalant
+/// avec le nombre d'événements sémantiquement uniques.
+pub struct StreamingRepresentativesIndex {
+    pub events: Vec<EventRecord>,
+    pub source_event_count: usize,
+}
+
+pub fn load_path_streaming_representatives(
+    path: &std::path::Path,
+) -> Result<StreamingRepresentativesIndex, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let reader = io::BufReader::new(file);
+    let mut representatives = BTreeMap::<String, EventRecord>::new();
+    let mut source_event_count = 0usize;
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("line {}: {e}", line_no + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)
+            .map_err(|e| format!("line {}: invalid JSON: {e}", line_no + 1))?;
+        let mut event = parse_event(value).map_err(|e| format!("line {}: {e}", line_no + 1))?;
+        source_event_count = source_event_count.saturating_add(1);
+        compact_publication_event(&mut event);
+        let key = publication_semantic_key(&event);
+        representatives.entry(key).or_insert(event);
+    }
+    let mut events = representatives.into_values().collect::<Vec<_>>();
+    deterministic_sort(&mut events);
+    Ok(StreamingRepresentativesIndex {
+        events,
+        source_event_count,
+    })
+}
+
 fn compact_publication_event(event: &mut EventRecord) {
     const STABLE_IDENTIFIERS: &[&str] = &[
         "ran_ue_ngap_id",
