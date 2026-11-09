@@ -8215,8 +8215,28 @@ fn pcap_totals(files: &[PathBuf]) -> (u64, u64) {
     (packets, bytes)
 }
 
+/// 2.9.18-fu (#9 comment ANR2 6745114783) — ANR2 a prouvé que
+/// le `--recover` 2.9.17-fu écrivait `packets=0` sur TOUS les
+/// 1 307 segments alors que 1 299 pcaps non vides contenaient
+/// des paquets selon `capinfos -c`. Cause : la version pré-2.9.18-fu
+/// ne gérait QUE le format pcap classique (magic `0xd4c3b2a1` /
+/// `0x4d3cb2a1`) et retournait (0,0) pour pcapng (Section Header
+/// Block `0x0A0D0D0A`). OIRAN utilise pcapng partout → compteur
+/// toujours 0.
+///
+/// 2.9.18-fu : délègue à `capture_pcap::visit_capture` qui détecte
+/// le format via la magie et parcourt les blocs pcapng (Enhanced
+/// Packet Block, Simple Packet Block, Packet Block déprécié).
+/// Retourne 0 fail-closed si le fichier est illisible ou corrompu.
 fn count_pcap_records(path: &Path) -> u64 {
-    pcap_record_totals(path).0
+    let mut packet_count: u64 = 0;
+    let summary = capture_pcap::visit_capture(path, "recover-count", |_packet| {
+        packet_count = packet_count.saturating_add(1);
+    });
+    match summary {
+        Ok(_) => packet_count,
+        Err(_) => 0,
+    }
 }
 
 fn pcap_record_totals(path: &Path) -> (u64, u64) {
@@ -13562,6 +13582,51 @@ mod tests {
         // Ring NON touché.
         assert_eq!(fs::read(&seg_39).unwrap(), b"S6A-39");
         assert_eq!(fs::read(&seg_40).unwrap(), b"S6A-40");
+    }
+
+    /// 2.9.18-fu (#9 comment ANR2 6745114783) — Preuve que
+    /// `count_pcap_records` gère le format **pcapng** (SHB magic
+    /// `0x0A 0x0D 0x0D 0x0A`), pas uniquement le pcap classique.
+    /// ANR2 a prouvé que tous les 1 307 segments post-recover
+    /// avaient `packets=0` alors que 1 299 pcaps contenaient
+    /// des paquets selon `capinfos -c`. Cause : la version
+    /// pré-2.9.18-fu ne reconnaissait que le magic pcap
+    /// classique (`0xd4c3b2a1`) et retournait 0 sur pcapng.
+    #[test]
+    fn count_pcap_records_handles_pcapng_anr2_2_9_18_fu() {
+        let dir = tempdir();
+        // SHB little-endian (28o) + IDB (20o) + 3 × EPB (36o chacun).
+        let shb: [u8; 28] = [
+            0x0a, 0x0d, 0x0d, 0x0a, 0x1c, 0x00, 0x00, 0x00, 0x4d, 0x3c, 0x2b, 0x1a,
+            0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x1c, 0x00, 0x00, 0x00,
+        ];
+        let idb: [u8; 20] = [
+            0x01, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x04, 0x00, 0x14, 0x00, 0x00, 0x00,
+        ];
+        let make_epb = |ts_low: u8| -> [u8; 36] {
+            [
+                0x06, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, ts_low, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+                0x04, 0x00, 0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0x24, 0x00, 0x00, 0x00,
+            ]
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&shb);
+        bytes.extend_from_slice(&idb);
+        bytes.extend_from_slice(&make_epb(0));
+        bytes.extend_from_slice(&make_epb(1));
+        bytes.extend_from_slice(&make_epb(2));
+        let path = dir.join("pcapng-count.pcapng");
+        fs::write(&path, &bytes).unwrap();
+
+        let count = count_pcap_records(&path);
+        assert_eq!(
+            count, 3,
+            "count_pcap_records doit retourner 3 pour un pcapng \
+             avec 3 EPB ; pré-2.9.18-fu retournait 0 (symptôme ANR2)"
+        );
     }
 
     /// 2.9.17 (#9 comment 6739207609) — Preuve d'atomicité :

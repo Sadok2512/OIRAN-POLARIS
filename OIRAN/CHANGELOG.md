@@ -1,5 +1,44 @@
 # Changelog
 
+## OIRAN API 2.9.18-fu2 — 2026-11-09 — `count_pcap_records` gère pcapng (devmat, ANR2 #9 comment 6745114783)
+
+**Preuve ANR2** : inventaire complet post-recover 2.9.17-fu montre que **1 307/1 307 segments** ont `packets=0` dans `import_state.json`, alors que **1 299 pcaps** contiennent réellement des paquets selon `capinfos -c`.
+
+**Cause fichier:ligne** : `live-probe/src/lib.rs::count_pcap_records:8218-8259` (pré-2.9.18-fu2) ne reconnaissait que le magic **pcap classique** (`0xd4c3b2a1` / `0x4d3cb2a1` + variantes BE). Les fichiers OIRAN sont tous en **pcapng** (Section Header Block magic `0x0A 0x0D 0x0D 0x0A`) ⇒ la fonction retournait (0, 0) sur tous les pcapng → `packets=0` écrit dans state.segments pour chaque recover.
+
+**Fix 2.9.18-fu2** (`live-probe/src/lib.rs::count_pcap_records:8218-8233`) : délègue à `capture_pcap::visit_capture` qui détecte le format via la magie et parcourt les blocs pcapng (EPB, SPB, PB déprécié). Le visitor incrémente un compteur local par appel ; retourne 0 fail-closed si le fichier est illisible.
+
+```rust
+fn count_pcap_records(path: &Path) -> u64 {
+    let mut packet_count: u64 = 0;
+    let summary = capture_pcap::visit_capture(path, "recover-count", |_packet| {
+        packet_count = packet_count.saturating_add(1);
+    });
+    match summary {
+        Ok(_) => packet_count,
+        Err(_) => 0,
+    }
+}
+```
+
+**Test nouveau** (`live-probe/src/lib.rs::count_pcap_records_handles_pcapng_anr2_2_9_18_fu`) : fabrique un pcapng synthétique (SHB + IDB + 3 × EPB) et vérifie `count_pcap_records == 3` ; pré-2.9.18-fu2 retournait 0.
+
+**Nouvelle dépendance** : `live-probe` → `capture-pcap` (path local, déjà présent dans le workspace).
+
+### Versions
+
+- `live-probe` 0.4.27 inchangé (patch interne + ajout de dépendance workspace locale).
+- `oiran-api` 2.9.18 inchangé.
+
+### Tests
+
+- `count_pcap_records_handles_pcapng_anr2_2_9_18_fu` **PASS**.
+- Suite `cargo test -p live-probe --lib` : **117 passed, 0 failed, 5 ignored** (+1 vs 2.9.18-fu).
+
+### Impact opérateur
+
+Après re-déploiement + nouveau `--recover`, les 1 299 segments avec paquets réels auront la bonne valeur `packets` dans `state.segments`. Les 8 pcaps réellement vides restent à `packets=0` (correct). Les 217 capture_ids absents du JSONL (fichiers dans le ring sans events) seront exclus de `seen_checksums` par l'invariant 2.9.18-fu et re-ingérés au prochain scan.
+
 ## OIRAN API 2.9.18-fu — 2026-11-09 — --recover invariant « segment importé ⇔ events dans dataset » + SBI cause fichier:ligne (devmat, ANR2 #9 ÉTAPE 1 FAIL complément)
 
 Complément direct à 2.9.18 (commit `0fce938`) après directive ANR2/Sadok clarifiant les deux points ouverts :

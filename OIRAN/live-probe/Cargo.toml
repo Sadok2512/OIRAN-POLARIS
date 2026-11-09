@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 capture-helper = { path = "../capture-helper" }
+capture-pcap = { path = "../capture-pcap" }
 callflow-renderer = { path = "../callflow-renderer" }
 callflow-schema = { path = "../callflow-schema" }
 correlation-engine = { path = "../correlation-engine" }

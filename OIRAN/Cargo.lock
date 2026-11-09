@@ -537,6 +537,7 @@ dependencies = [
  "callflow-renderer",
  "callflow-schema",
  "capture-helper",
+ "capture-pcap",
  "correlation-engine",
  "disk-safety",
  "event-schema",
