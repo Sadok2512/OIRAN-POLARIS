@@ -1,5 +1,151 @@
 # Changelog
 
+## OIRAN API 2.9.17 — 2026-11-09 — URGENT : repair streaming + atomic + --recover + SBI attach IE (devmat, ANR2 #9 6739207609 + BILAN #10 6739221109 + #10 6738246907)
+
+### Contexte — FAIL 2.9.16 : OOM repair + état incohérent + SBI absent
+
+ANR2 (#9 6739207609, BILAN #10 6739221109) a prouvé :
+
+1. **OOM repair ×2**. Dry-run OK, passes réelles tuées à
+   14,2–14,9 GiB RSS (`Out of memory: Killed process ...
+   total-vm:14882816kB, anon-rss:14215400kB`). Cause : le
+   `kept: Vec<(String, u64, String, String)>` chargeait tous les
+   événements retenus (~1,3 M lignes × ~2,2 KiB) avant sort+dedup.
+2. **État partiel laissé**. Après OOM : `.dataset-next/` de 6,1 GiB
+   orphelin + `import_state.json` modifié par le worker concurrent
+   → `work_bytes` dépasse `max_owned_bytes` → import BLOCKED
+   `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT/BOUNDED_STORAGE_FULL`.
+3. **SBI toujours OUVERT** (#10 6738246907) sur le run
+   `5g-session-936f7625b33cbfd1` malgré 2.9.16 : SBI absent de la
+   session (N2=16, N3=1, N4=4 = 21 events, SBI=0).
+
+### T1 — Repair streaming + atomique
+
+`live-probe/src/lib.rs::repair_partial_imports` (`:4179-4555`
+post-2.9.17) :
+
+- Plus de `kept: Vec<...>`. Chaque ligne retenue est écrite dans
+  un **scratch** sous `.dataset-next/.repair-staging/kept-events.jsonl`
+  pendant le scan de `current_events.jsonl`.
+- Deux structures en mémoire :
+  * `sort_index: BTreeMap<(capture_id, packet_number, event_id),
+    (u64 offset, u32 len)>` — permet d'itérer en ordre canonique
+    sans Vec<lignes>. Pour 1,3 M events, ~200 B par entrée
+    ⇒ ~260 MB.
+  * `wire_seen: BTreeSet<(capture_id, pkt, byte_offset, protocol,
+    message_name)>` — dedup wire 2.9.13 appliqué **inline** lors
+    de l'écriture, évite tout accumulate-then-dedup.
+- Phase 4b (fresh-import) écrit AUSSI directement dans le scratch
+  via la closure `decode_capture_streaming(callback)`. Les
+  événements frais sont déjà canoniques (event_id déterministe),
+  dedup wire inline sur la même BTreeSet.
+- SHA et fichier final : seconde passe via
+  `scratch.seek(SeekFrom::Start(offset))` + `read_exact(len)` →
+  écriture canonique vers `.dataset-next/oiran_events.jsonl`.
+
+**Atomicité**. `dataset/` et `import_state.json` ne changent QUE
+par le `fs::rename(next → current)` final. Un kill -9 mid-run
+laisse `.dataset-next/.repair-staging/` → récupérable par
+`--recover` (voir T3).
+
+Attendu : RSS peak < 512 MiB sur 1,5 M events (contrainte ANR2),
+down de ~15 GiB → ~0,4 GiB (×30 économies).
+
+### T2 — Nouveau `dataset-repair-partial-imports --recover`
+
+`live-probe/src/lib.rs::recover_repair_staging` (`:5991-6041`) +
+`live-probe/src/bin/dataset-repair-partial-imports.rs` (CLI).
+
+- Détecte `.dataset-next/` et `.dataset-previous/` orphelins.
+- Supprime UNIQUEMENT ces deux chemins ; **laisse strictement
+  intacts** `dataset/`, `pcap/`, `import_state.json`.
+- Mesure la taille AVANT suppression, retourne la liste des
+  chemins et le total en octets — aucune suppression silencieuse.
+- Mutuellement exclusif avec `--dry-run`.
+
+Test `recover_repair_staging_removes_orphan_dataset_next_leaves_state_intact_2_9_17`
+fabrique l'état exact d'ANR2 (`dataset/` sain, `.dataset-next/`
+scratch orphelin, `import_state.json` « frais ») et vérifie :
+
+- `.dataset-next/` et `.repair-staging/` supprimés.
+- `removed_paths`/`removed_bytes` publiés.
+- `dataset/oiran_events.jsonl` mtime + taille inchangés.
+- `import_state.json` mtime + contenu (`seen_order`,
+  `seen_checksums`) inchangés.
+
+### T3 — Procédure de reprise opérateur
+
+État constaté par ANR2 au 2026-11-09T11:42Z :
+
+- `.dataset-next/oiran_events.jsonl` = 6 148 382 217 octets
+  (orphelin).
+- `job.json state=BLOCKED`, `stop_reason=BOUNDED_STORAGE_FULL`,
+  `pending_segments=5`.
+- `dataset/oiran_events.jsonl` = 2 784 256 148 octets (sain).
+- `import_state.json`: `seen_order=5377`, `segments=1275` (sain).
+
+Commandes (à exécuter sur le serveur, APRÈS avoir stoppé la
+réparation) :
+
+```bash
+# 1. Preuve AVANT (lecture seule)
+du -sb /var/lib/oiran/captures/continuous-lab-import/.dataset-next 2>/dev/null
+curl -sS http://127.0.0.1:49152/api/v1/metrics | jq '.data.pending_segments, .data.state'
+# 2. Récupération (2.9.17)
+nice -n 19 /opt/oiran/bin/dataset-repair-partial-imports \
+  /var/lib/oiran/captures --recover
+# → sortie JSON: {removed_paths, removed_bytes, dataset_untouched: true, ...}
+# 3. Preuve APRÈS
+test ! -e /var/lib/oiran/captures/continuous-lab-import/.dataset-next
+# 4. L'import worker réévalue work_bytes au scan suivant (max ~10 s)
+# et sort de BLOCKED automatiquement.
+```
+
+Aucune relance du repair à chaud après `--recover` ; attendre que
+l'import worker digère ses 5 pending avant de reprendre la
+réparation en 2.9.17 (memory-bounded).
+
+### T4 — SBI attach lit information_elements composites
+
+`session-engine/src/lib.rs::attach_sbi_to_sessions` (`:1413-1515`
++ helper `index_tunnel_names` `:1545-1588`) :
+
+ANR2 (#10 6738246907) a prouvé que `decoder-ngap` n'ajoute dans
+`session_identifiers` que les bare keys (`tunnel_ip_ul`,
+`gtp_teid_ul`). Les clés préfixées `item_0_tunnel_ip_ul` /
+`item_0_gtp_teid_ul` vivent uniquement dans la chaîne value d'une
+InformationElement (ex. « UL NG-U UP TNL Information »).
+
+2.9.17 : parse chaque IE value `k=v,k=v,...` du N2/NAS et indexe
+les paires directional au MÊME préfixe, exactement comme
+`correlation-engine::directional_tunnel_components`. Mutualisé
+avec le scan de `session_identifiers` dans
+`index_tunnel_names(named, idx, &mut tunnel_idx)`.
+
+Test
+`sbi_attach_reads_tunnel_from_information_elements_anr2_6738246907_2_9_17`
+rejoue `5g-session-936f7625b33cbfd1` : N2 avec IE value
+`item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0x9ab3,...`
+(session_identifiers n'a que `pdu_session_id`) + SBI plat →
+SBI rattaché à la session.
+
+### Tests
+
+Critiques (tous VERT) :
+- `repair_partial_imports_is_noop_on_a_healthy_dataset`
+- `repair_partial_imports_keeps_only_final_owned_file_for_a_segment_imported_seven_times`
+- `repair_partial_imports_rebuilds_full_history_via_prefix_sha_match`
+- `repair_partial_imports_removes_wire_duplicates_anr2_2_9_13`
+- `recover_repair_staging_removes_orphan_dataset_next_leaves_state_intact_2_9_17`
+- `sbi_attach_reads_tunnel_from_information_elements_anr2_6738246907_2_9_17`
+- 2.9.12..2.9.16 SBI tests : tous préservés.
+
+### Versions
+
+- `live-probe` 0.4.26 → 0.4.27 (repair streaming + `recover_repair_staging` + CLI `--recover`)
+- `session-engine` 0.5.3 → 0.5.4 (`index_tunnel_names` + IE parse)
+- `oiran-api` 2.9.16 → 2.9.17
+
 ## OIRAN API 2.9.16 — 2026-11-09 — Bout-en-bout ANR2 run réel + motif S6a 16-msg prouvé (devmat, ANR2 #9 comments 6728928219 + 6728398325 + BILAN #10 6728936739)
 
 ### Contexte — fermeture des trois défauts ouverts sur le BILAN 2.9.13

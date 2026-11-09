@@ -1468,37 +1468,36 @@ fn attach_sbi_to_sessions(
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str()))
                 .collect();
-            for (name, value) in named.iter() {
-                let (prefix, ip_norm) = if let Some(prefix) =
-                    name.strip_suffix("tunnel_endpoint_ip")
-                {
-                    (prefix, event_schema::normalize_ip(value))
-                } else if let Some(prefix) = name.strip_suffix("tunnel_ip_ul") {
-                    (prefix, event_schema::normalize_ip(value))
-                } else if let Some(prefix) = name.strip_suffix("tunnel_ip_dl") {
-                    (prefix, event_schema::normalize_ip(value))
-                } else if let Some(prefix) = name.strip_suffix("tunnel_ip") {
-                    (prefix, event_schema::normalize_ip(value))
-                } else {
-                    continue;
-                };
-                // Chercher le teid-partenaire avec le même préfixe.
-                let teid_candidates: [String; 4] = [
-                    format!("{prefix}gtp_teid"),
-                    format!("{prefix}gtp_teid_ul"),
-                    format!("{prefix}gtp_teid_dl"),
-                    format!("{prefix}teid"),
-                ];
-                for teid_name in &teid_candidates {
-                    if let Some(teid_raw) = named.get(teid_name.as_str()) {
-                        if let Some(teid_norm) =
-                            event_schema::normalize_teid_hex(teid_raw)
-                        {
-                            tunnel_idx
-                                .entry((ip_norm.clone(), teid_norm))
-                                .or_insert(idx);
-                        }
-                    }
+            index_tunnel_names(&named, idx, &mut tunnel_idx);
+
+            // 2.9.17 (#9 comment 6738246907) : ANR2 a prouvé que
+            // sur le run `5g-session-936f7625b33cbfd1` la 2.9.16
+            // laissait toujours SBI OUVERT. Cause : decoder-ngap
+            // n'exporte PAS `item_0_tunnel_ip_ul` /
+            // `item_0_gtp_teid_ul` dans `session_identifiers` —
+            // l'enum de bare-keys au `decoder-ngap:834-847`
+            // n'inclut que `tunnel_ip_ul`, `gtp_teid_ul` bruts et
+            // `item_0_*` ne matche pas (deux clés différentes).
+            // Les valeurs vivent alors uniquement dans la chaîne
+            // composite d'une InformationElement (ex. « UL NG-U
+            // UP TNL Information ») :
+            //   `item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0x25fb,...`
+            //
+            // Correctif : parser chaque `information_elements[*]
+            // .value` du N2/NAS, extraire les mêmes paires
+            // directional (préfixe commun + suffix
+            // tunnel_ip_ul/gtp_teid_ul), et indexer.
+            if let Some(ies) = event.information_elements.as_array() {
+                for ie in ies {
+                    let Some(value) = ie.get("value").and_then(serde_json::Value::as_str) else {
+                        continue;
+                    };
+                    let parsed: BTreeMap<&str, &str> = value
+                        .split(',')
+                        .filter_map(|pair| pair.split_once('='))
+                        .map(|(k, v)| (k.trim(), v.trim()))
+                        .collect();
+                    index_tunnel_names(&parsed, idx, &mut tunnel_idx);
                 }
             }
         }
@@ -1539,6 +1538,48 @@ fn attach_sbi_to_sessions(
                 session.interfaces.sort();
             }
             event_context.insert(event.event_id.clone(), session.ue_context_id.clone());
+        }
+    }
+}
+
+/// 2.9.17 (#9 comment 6738246907) : scanne une map name→value
+/// pour les paires directional
+/// `*tunnel_(endpoint_ip|ip_ul|ip_dl|ip)` ↔
+/// `*gtp_teid(_ul|_dl)?` avec le MÊME préfixe. Mutualisé entre
+/// `session_identifiers` (bare keys) et le parse des IE
+/// composites (`decoder-ngap` emits `item_0_tunnel_ip_ul=…,
+/// item_0_gtp_teid_ul=…` dans une seule chaîne value).
+fn index_tunnel_names(
+    named: &std::collections::BTreeMap<&str, &str>,
+    session_idx: usize,
+    tunnel_idx: &mut std::collections::BTreeMap<(String, String), usize>,
+) {
+    for (name, value) in named.iter() {
+        let (prefix, ip_norm) = if let Some(prefix) = name.strip_suffix("tunnel_endpoint_ip") {
+            (prefix, event_schema::normalize_ip(value))
+        } else if let Some(prefix) = name.strip_suffix("tunnel_ip_ul") {
+            (prefix, event_schema::normalize_ip(value))
+        } else if let Some(prefix) = name.strip_suffix("tunnel_ip_dl") {
+            (prefix, event_schema::normalize_ip(value))
+        } else if let Some(prefix) = name.strip_suffix("tunnel_ip") {
+            (prefix, event_schema::normalize_ip(value))
+        } else {
+            continue;
+        };
+        let teid_candidates: [String; 4] = [
+            format!("{prefix}gtp_teid"),
+            format!("{prefix}gtp_teid_ul"),
+            format!("{prefix}gtp_teid_dl"),
+            format!("{prefix}teid"),
+        ];
+        for teid_name in &teid_candidates {
+            if let Some(teid_raw) = named.get(teid_name.as_str()) {
+                if let Some(teid_norm) = event_schema::normalize_teid_hex(teid_raw) {
+                    tunnel_idx
+                        .entry((ip_norm.clone(), teid_norm))
+                        .or_insert(session_idx);
+                }
+            }
         }
     }
 }
@@ -2177,6 +2218,97 @@ mod tests {
         assert!(
             session.interfaces.iter().any(|i| i == "SBI-HTTP2"),
             "SBI-HTTP2 doit apparaître dans session.interfaces"
+        );
+    }
+
+    /// 2.9.17 (#9 comment 6738246907) — Rejoue le run réel
+    /// `5g-session-936f7625b33cbfd1`. ANR2 a prouvé que 2.9.16
+    /// laissait toujours SBI OUVERT parce que
+    /// `decoder-ngap:834-847` n'ajoute dans `session_identifiers`
+    /// que les bare keys (`tunnel_ip_ul`, `gtp_teid_ul`), pas les
+    /// préfixées `item_0_tunnel_ip_ul` qu'il produit dans la chaîne
+    /// composite d'une IE (ex. « UL NG-U UP TNL Information »).
+    ///
+    /// 2.9.17 étend `attach_sbi_to_sessions` pour parser aussi les
+    /// IE composites. Le test insère les event_id réels d'ANR2 et
+    /// place le tuple TEID/IP dans un IE value, PAS dans
+    /// session_identifiers — la forme exacte produite par
+    /// `decoder-ngap::append_sureq_item_summary`.
+    #[test]
+    fn sbi_attach_reads_tunnel_from_information_elements_anr2_6738246907_2_9_17() {
+        // Helper inline : construit un event avec IE composite.
+        fn event_with_ie_value(
+            id: &str,
+            protocol: &str,
+            name: &str,
+            ids: &[(&str, &str)],
+            ie_value: &str,
+            packet: u64,
+        ) -> EventRecord {
+            let mut e = event(id, protocol, name, ids, packet);
+            e.information_elements = serde_json::json!([
+                {
+                    "id": 74,
+                    "name": "UL NG-U UP TNL Information",
+                    "value": ie_value,
+                    "length": ie_value.len() as u64,
+                }
+            ]);
+            e
+        }
+
+        // N2 PDUSessionResourceSetupRequest : session_identifiers
+        // ne porte QUE pdu_session_id (bare) ; le tuple TEID/IP
+        // est dans la chaîne value d'une IE sous forme
+        // `item_0_tunnel_ip_ul=…,item_0_gtp_teid_ul=…`.
+        let n2_req = event_with_ie_value(
+            "evt-n2-936f7625",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            &[
+                ("ran_ue_ngap_id", "4"),
+                ("amf_ue_ngap_id", "73"),
+                ("pdu_session_id", "1"),
+            ],
+            "item_0_pdu_session_id=1,item_0_sst=1,item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0x9ab3,item_0_pdu_session_type=IPv4",
+            1,
+        );
+        let n2_resp = event(
+            "evt-n2-resp-936f7625",
+            "NGAP",
+            "PDUSessionResourceSetupResponse",
+            &[
+                ("ran_ue_ngap_id", "4"),
+                ("amf_ue_ngap_id", "73"),
+                ("pdu_session_id", "1"),
+            ],
+            2,
+        );
+        // SBI N1N2MessageTransfer : tuple plat dans
+        // session_identifiers (décodeur SBI 2.9.9+ fait les deux).
+        let sbi = event(
+            "evt-sbi-936f7625",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            &[
+                ("pdu_session_id", "1"),
+                ("tunnel_endpoint_ip", "10.77.22.13"),
+                ("gtp_teid", "0x9ab3"),
+            ],
+            3,
+        );
+        let events = vec![n2_req, n2_resp, sbi];
+        let discovery = discover_sessions(&mut events.clone());
+        assert_eq!(discovery.pdu_sessions.len(), 1, "une PDU session");
+        let session = &discovery.pdu_sessions[0];
+        assert!(
+            session.event_ids.iter().any(|id| id == "evt-sbi-936f7625"),
+            "SBI doit être rattaché via le tuple extrait de l'IE composite ; event_ids={:?}",
+            session.event_ids
+        );
+        assert!(
+            session.interfaces.iter().any(|i| i == "SBI-HTTP2"),
+            "interfaces doit inclure SBI-HTTP2"
         );
     }
 

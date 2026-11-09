@@ -4213,10 +4213,39 @@ impl CaptureManager {
             }
         }
 
-        // Phase 4 — stream the JSONL again, split kept vs removed.
+        // Phase 4 — stream the JSONL AGAIN and split kept vs
+        // removed. 2.9.17 (#9 comment 6739207609, BILAN #10
+        // 6739221109) : ANR2 a prouvé que la version pré-2.9.17
+        // chargeait TOUT le JSONL retenu dans un
+        // `Vec<(String, u64, String, String)>`, consommant
+        // ~14 GiB RSS sur 1.3M événements et déclenchant
+        // l'OOM-killer deux fois (exit 137). 2.9.17 écrit chaque
+        // ligne retenue dans un fichier scratch sous
+        // `.dataset-next/.repair-staging/` et ne garde en mémoire
+        // qu'un `BTreeMap<sort_key, (offset, len)>` + un
+        // `BTreeSet<wire_key>` — total ~400 MB pour 1.3M.
+        //
+        // ATOMICITÉ (2.9.17 règle ANR2) : import_state.json et
+        // dataset/ ne changent QU'au renommage atomique final.
+        // Un kill -9 à ce stade laisse `.dataset-next/` intact et
+        // nettoyable par `--recover`.
+        prepare_dataset_directory(&next)?;
+        let repair_staging_dir = next.join(".repair-staging");
+        fs::create_dir_all(&repair_staging_dir).map_err(display_error)?;
+        let scratch_path = repair_staging_dir.join("kept-events.jsonl");
         let mut removed: Vec<RepairRemovedEvent> = Vec::new();
-        let mut kept: Vec<(String, u64, String, String)> = Vec::new();
+        // Clé de tri = `(capture_id, packet_number, event_id)` —
+        // itération en ordre canonique sans Vec en mémoire.
+        let mut sort_index: BTreeMap<(String, u64, String), (u64, u32)> = BTreeMap::new();
+        // Dedup wire 2.9.13 — appliqué pendant l'écriture ET
+        // pendant le fresh-import (évite d'écrire deux fois le
+        // même tuple wire).
+        let mut wire_seen: BTreeSet<(String, u64, u64, String, String)> = BTreeSet::new();
+        let mut scratch_offset: u64 = 0;
+        let mut kept_event_count: usize = 0;
         {
+            let scratch = fs::File::create(&scratch_path).map_err(display_error)?;
+            let mut scratch_writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, scratch);
             let reader = BufReader::new(fs::File::open(&current_events).map_err(display_error)?);
             for line in reader.lines() {
                 let line = line.map_err(display_error)?;
@@ -4259,8 +4288,60 @@ impl CaptureManager {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
-                kept.push((capture_id, packet_number, event_id, line));
+                // 2.9.17 : dedup wire INLINE (2.9.13 règle,
+                // dépliée ici pour éviter l'accumulation en Vec).
+                let byte_offset = value
+                    .pointer("/packet_references/0/byte_offset")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let protocol = value
+                    .get("protocol")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let message_name = value
+                    .get("message_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let wire_key = (
+                    capture_id.clone(),
+                    packet_number,
+                    byte_offset,
+                    protocol,
+                    message_name,
+                );
+                if !wire_seen.insert(wire_key) {
+                    let source_file = value
+                        .pointer("/packet_references/0/source_file")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    removed.push(RepairRemovedEvent {
+                        event_id: event_id.clone(),
+                        source_file,
+                        capture_id: capture_id.clone(),
+                        reason: "wire-duplicate-superseded".into(),
+                    });
+                    continue;
+                }
+                drop(value);
+                // Append line + newline to scratch ; stocker
+                // offset + longueur pour relecture canonique.
+                let payload = line.as_bytes();
+                scratch_writer.write_all(payload).map_err(display_error)?;
+                scratch_writer.write_all(b"\n").map_err(display_error)?;
+                let len = (payload.len() + 1) as u32;
+                sort_index.insert(
+                    (capture_id, packet_number, event_id),
+                    (scratch_offset, len),
+                );
+                scratch_offset = scratch_offset.saturating_add(len as u64);
+                kept_event_count = kept_event_count.saturating_add(1);
             }
+            scratch_writer.flush().map_err(display_error)?;
+            scratch_writer.get_ref().sync_all().map_err(display_error)?;
+            drop(scratch_writer);
             // Phase 4b (2.9.2) — fresh-import every on-disk file
             // whose FULL-SHA snapshot is missing from the dataset.
             // The decode runs through `decode_capture_streaming` with
@@ -4272,7 +4353,14 @@ impl CaptureManager {
             // further down still produces an accurate "what-would-be"
             // digest because the removed prefix snapshots are
             // dropped either way.
+            // 2.9.17 : fresh-import écrit DIRECTEMENT au scratch
+            // avec dedup wire inline, pas d'accumulation en Vec.
             if !dry_run {
+                let scratch_append = OpenOptions::new()
+                    .append(true)
+                    .open(&scratch_path)
+                    .map_err(display_error)?;
+                let mut scratch_writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, scratch_append);
                 for (on_disk_path, full_capture_id) in &fresh_import_queue {
                     let interface = on_disk_path
                         .parent()
@@ -4289,12 +4377,61 @@ impl CaptureManager {
                         interface: interface.to_owned(),
                         endpoints: HashMap::new(),
                     };
-                    let mut fresh_events: Vec<NormalizedEvent> = Vec::new();
+                    let capture_id_clone = full_capture_id.clone();
+                    let scratch_writer_ref = &mut scratch_writer;
+                    let scratch_offset_ref = &mut scratch_offset;
+                    let kept_event_count_ref = &mut kept_event_count;
+                    let sort_index_ref = &mut sort_index;
+                    let wire_seen_ref = &mut wire_seen;
+                    let removed_ref = &mut removed;
                     if decode_capture_streaming(
                         &config,
                         self.pseudonym_key.as_ref(),
-                        |event| {
-                            fresh_events.push(event);
+                        |mut event| {
+                            event.assign_deterministic_id();
+                            let packet_number = event
+                                .packet_references
+                                .first()
+                                .map(|p| p.packet_number)
+                                .unwrap_or(0);
+                            let byte_offset = event
+                                .packet_references
+                                .first()
+                                .map(|p| p.byte_offset)
+                                .unwrap_or(0);
+                            let source_file = event
+                                .packet_references
+                                .first()
+                                .map(|p| p.source_file.clone())
+                                .unwrap_or_default();
+                            let event_id = event.event_id.clone();
+                            let wire_key = (
+                                capture_id_clone.clone(),
+                                packet_number,
+                                byte_offset,
+                                event.protocol.as_str().to_owned(),
+                                event.message_name.clone(),
+                            );
+                            if !wire_seen_ref.insert(wire_key) {
+                                removed_ref.push(RepairRemovedEvent {
+                                    event_id,
+                                    source_file,
+                                    capture_id: capture_id_clone.clone(),
+                                    reason: "wire-duplicate-superseded".into(),
+                                });
+                                return Ok(());
+                            }
+                            let line = event.to_json();
+                            let payload = line.as_bytes();
+                            scratch_writer_ref.write_all(payload).map_err(display_error)?;
+                            scratch_writer_ref.write_all(b"\n").map_err(display_error)?;
+                            let len = (payload.len() + 1) as u32;
+                            sort_index_ref.insert(
+                                (capture_id_clone.clone(), packet_number, event_id),
+                                (*scratch_offset_ref, len),
+                            );
+                            *scratch_offset_ref = scratch_offset_ref.saturating_add(len as u64);
+                            *kept_event_count_ref = kept_event_count_ref.saturating_add(1);
                             Ok(())
                         },
                     )
@@ -4302,108 +4439,47 @@ impl CaptureManager {
                     {
                         continue;
                     }
-                    for mut event in fresh_events {
-                        event.assign_deterministic_id();
-                        let line = event.to_json();
-                        let packet_number = event.packet_references.first().map(|p| p.packet_number).unwrap_or(0);
-                        kept.push((
-                            full_capture_id.clone(),
-                            packet_number,
-                            event.event_id.clone(),
-                            line,
-                        ));
-                    }
                 }
+                scratch_writer.flush().map_err(display_error)?;
+                scratch_writer.get_ref().sync_all().map_err(display_error)?;
+                drop(scratch_writer);
             }
-            kept.sort_by(|a, b| (&a.0, a.1, &a.2).cmp(&(&b.0, b.1, &b.2)));
-
-            // 2.9.13 (#9 comment 6727243545) — ANR2 a prouvé 24
-            // doublons wire-réels (dont 8 post-2.8.3) que la passe
-            // partial-import n'adressait pas : deux événements
-            // partagent `(capture_id, packet_number, byte_offset,
-            // protocol, message_name)` mais ne sont PAS des
-            // snapshots d'une même file (prefix-SHA != final-SHA).
-            // Phase supplémentaire : after sort canonique,
-            // dedup strict sur l'identité wire ANR2. First-write-wins
-            // par `(capture_id, packet_number, byte_offset, protocol,
-            // message_name)`. Les survivors sont retenus ; les
-            // suivants sont ajoutés à `removed` avec reason
-            // `wire-duplicate-superseded-by-{kept_event_id}`.
-            let mut wire_seen: BTreeSet<(String, u64, u64, String, String)> = BTreeSet::new();
-            let mut deduped_kept: Vec<(String, u64, String, String)> =
-                Vec::with_capacity(kept.len());
-            for entry in kept.drain(..) {
-                let (capture_id, _packet_number, event_id, line) = &entry;
-                let value: Value = match serde_json::from_str(line) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        deduped_kept.push(entry);
-                        continue;
-                    }
-                };
-                let packet_number = value
-                    .pointer("/packet_references/0/packet_number")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let byte_offset = value
-                    .pointer("/packet_references/0/byte_offset")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let protocol = value
-                    .get("protocol")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let message_name = value
-                    .get("message_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let key = (
-                    capture_id.clone(),
-                    packet_number,
-                    byte_offset,
-                    protocol,
-                    message_name,
-                );
-                if wire_seen.insert(key) {
-                    deduped_kept.push(entry);
-                } else {
-                    let source_file = value
-                        .pointer("/packet_references/0/source_file")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned();
-                    removed.push(RepairRemovedEvent {
-                        event_id: event_id.clone(),
-                        source_file,
-                        capture_id: capture_id.clone(),
-                        reason: "wire-duplicate-superseded".into(),
-                    });
-                }
-            }
-            kept = deduped_kept;
         }
 
+        // 2.9.17 : SHA canonique calculé en lisant le scratch
+        // dans l'ordre `sort_index`, pas depuis un Vec en mémoire.
+        // Si `removed.is_empty()`, `current_events` est déjà
+        // canoniquement sortie (ou on retourne un rapport dry-run
+        // qui ne modifiera rien).
+        let event_count_after = if removed.is_empty() && dry_run {
+            event_count_before
+        } else {
+            kept_event_count
+        };
         let computed_sha_hex = if removed.is_empty() {
             sha256_hex_file(&current_events)?
         } else {
+            // Stream read du scratch, hash via le `sort_index`.
             let mut events_sha = Sha256Hasher::new();
-            for (_, _, _, line) in &kept {
-                events_sha.update(line.as_bytes());
-                events_sha.update(b"\n");
+            use std::io::{Read, Seek, SeekFrom};
+            let mut scratch = fs::File::open(&scratch_path).map_err(display_error)?;
+            let mut buffer = Vec::new();
+            for (_, (offset, len)) in sort_index.iter() {
+                scratch.seek(SeekFrom::Start(*offset)).map_err(display_error)?;
+                buffer.resize(*len as usize, 0u8);
+                scratch.read_exact(&mut buffer).map_err(display_error)?;
+                events_sha.update(&buffer);
             }
             events_sha.finish_hex()
         };
-        let event_count_after = if removed.is_empty() {
-            event_count_before
-        } else {
-            kept.len()
-        };
 
         if dry_run || removed.is_empty() {
+            // 2.9.17 : cleanup du scratch — on n'écrit RIEN dans
+            // `.dataset-next/` au-delà du staging. La prochaine
+            // passe réelle (!dry_run) reconstruit depuis zéro.
+            let _ = fs::remove_dir_all(&next);
             return Ok(DatasetRepairReport {
-                schema_version: "2.9.2",
+                schema_version: "2.9.17",
                 dataset_dir: current.display().to_string(),
                 dry_run,
                 event_count_before,
@@ -4432,17 +4508,34 @@ impl CaptureManager {
         } else {
             None
         };
-        prepare_dataset_directory(&next)?;
         let next_events = next.join("oiran_events.jsonl");
+        // 2.9.17 : le scratch contient déjà toutes les lignes
+        // retenues, mais dans l'ordre d'écriture (pas canonique).
+        // Relecture via `sort_index` pour produire le fichier
+        // final canonique en streaming, SANS matérialiser le tout
+        // en RAM. Hash se recalculerait identiquement à
+        // `computed_sha_hex` plus haut si on l'avait écrit en
+        // même temps ; on le fait exprès pour que `events_sha256`
+        // du rapport reste byte-identique au contenu renommé.
         {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut scratch = fs::File::open(&scratch_path).map_err(display_error)?;
             let file = fs::File::create(&next_events).map_err(display_error)?;
             let mut writer = BufWriter::with_capacity(STREAM_CHUNK_BYTES, file);
-            for (_, _, _, line) in &kept {
-                writer.write_all(line.as_bytes()).map_err(display_error)?;
-                writer.write_all(b"\n").map_err(display_error)?;
+            let mut buffer = Vec::new();
+            for (_, (offset, len)) in sort_index.iter() {
+                scratch.seek(SeekFrom::Start(*offset)).map_err(display_error)?;
+                buffer.resize(*len as usize, 0u8);
+                scratch.read_exact(&mut buffer).map_err(display_error)?;
+                writer.write_all(&buffer).map_err(display_error)?;
             }
             writer.flush().map_err(display_error)?;
+            writer.get_ref().sync_all().map_err(display_error)?;
         }
+        // 2.9.17 : staging terminé. Suppression du scratch
+        // avant publish_events_to_dataset_dir (qui balaie le
+        // dataset_dir pour le manifest).
+        let _ = fs::remove_dir_all(&repair_staging_dir);
         let dataset = self.publish_events_to_dataset_dir(
             CONTINUOUS_CAPTURE_ID,
             CONTINUOUS_DATASET_ID.into(),
@@ -4469,7 +4562,7 @@ impl CaptureManager {
         }
         self.upsert_dataset(dataset, &current)?;
         Ok(DatasetRepairReport {
-            schema_version: "2.9.2",
+            schema_version: "2.9.17",
             dataset_dir: current.display().to_string(),
             dry_run: false,
             event_count_before,
@@ -6346,6 +6439,60 @@ fn purge_missing_source_fingerprints(
         }
     }
     true
+}
+
+/// 2.9.17 (#9 comment 6739207609) — report retourné par
+/// `recover_repair_staging`. Liste chaque chemin supprimé avec
+/// la taille qu'il occupait, pour que l'opérateur ait la preuve
+/// de l'action AVANT/APRÈS.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RepairRecoveryReport {
+    pub removed_paths: Vec<String>,
+    pub removed_bytes: u64,
+}
+
+/// 2.9.17 (#9 comment 6739207609) — Reprise après crash d'une
+/// passe réelle `repair_partial_imports`. ANR2 a prouvé qu'un
+/// OOM (exit 137) pouvait laisser `.dataset-next/` (6,1 Go sur
+/// le run réel) dans le worktree, poussant `work_bytes` au-dessus
+/// de `max_owned_bytes` et bloquant l'import en
+/// `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT`.
+///
+/// Garanties :
+///   * `dataset/` NON touché.
+///   * `import_state.json` NON touché.
+///   * `pcap/` NON touché.
+///   * Supprime UNIQUEMENT `.dataset-next/` et son
+///     `.repair-staging/` orphelin.
+///   * Retourne la liste des chemins supprimés et le total en
+///     octets — AUCUNE suppression silencieuse.
+pub fn recover_repair_staging(capture_root: &Path) -> Result<RepairRecoveryReport, String> {
+    let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
+    if !base.is_dir() {
+        return Err(format!(
+            "RECOVERY_BASE_MISSING: {}",
+            base.display()
+        ));
+    }
+    let candidates = [base.join(".dataset-next"), base.join(".dataset-previous")];
+    let mut report = RepairRecoveryReport::default();
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
+        }
+        // Mesure AVANT suppression — preuve pour l'opérateur.
+        let size = directory_size(&candidate);
+        report.removed_bytes = report.removed_bytes.saturating_add(size);
+        report.removed_paths.push(candidate.display().to_string());
+        fs::remove_dir_all(&candidate).map_err(|error| {
+            format!(
+                "RECOVERY_REMOVE_FAILED: {} ({})",
+                candidate.display(),
+                error
+            )
+        })?;
+    }
+    Ok(report)
 }
 
 /// 2.9.8 (#9 comment 6725097122): drop fingerprints whose checksum is
@@ -12856,6 +13003,108 @@ mod tests {
         let second = manager.repair_partial_imports(false, None).unwrap();
         assert_eq!(second.event_count_after, 3);
         assert_eq!(second.events_sha256, report.events_sha256);
+    }
+
+    /// 2.9.17 (#9 comment 6739207609) — Preuve de reprise sûre
+    /// après l'OOM d'une passe réelle. Fabrique l'état observé
+    /// par ANR2 : `dataset/` publié (intact), `import_state.json`
+    /// avec des `seen_order` récents, `.dataset-next/` de 6 GiB
+    /// laissé par le crash. `recover_repair_staging` doit retirer
+    /// `.dataset-next/` mais ne pas toucher `dataset/` ni
+    /// `import_state.json`.
+    #[test]
+    fn recover_repair_staging_removes_orphan_dataset_next_leaves_state_intact_2_9_17() {
+        let root = temporary_root("repair-recover-2-9-17");
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset = base.join("dataset");
+        let dataset_next = base.join(".dataset-next");
+        let callflows = dataset.join("callflows");
+        fs::create_dir_all(&callflows).unwrap();
+        fs::create_dir_all(dataset_next.join("callflows")).unwrap();
+        // Dataset publié sain avec event canonique.
+        let published_jsonl = "{\"event_id\":\"evt-published\",\"capture_id\":\"sha256:a\"}\n";
+        fs::write(dataset.join("oiran_events.jsonl"), published_jsonl).unwrap();
+        fs::write(dataset.join("dataset_manifest.json"), "{\"event_count\":1}").unwrap();
+        let published_size = fs::metadata(dataset.join("oiran_events.jsonl"))
+            .unwrap()
+            .len();
+        // `.dataset-next/` = 1 MiB d'un scratch orphelin typique
+        // de l'OOM (en production : 6,1 GiB). Taille minimale
+        // suffisante pour la preuve de suppression.
+        let scratch_bytes = vec![b'x'; 1024 * 1024];
+        fs::write(dataset_next.join("oiran_events.jsonl"), &scratch_bytes).unwrap();
+        let repair_staging = dataset_next.join(".repair-staging");
+        fs::create_dir_all(&repair_staging).unwrap();
+        fs::write(repair_staging.join("kept-events.jsonl"), &scratch_bytes).unwrap();
+        // `import_state.json` avec un état « frais » — la
+        // reprise ne doit PAS y toucher.
+        let mut state = ContinuousImportState::default();
+        state.seen_order.push_back("checksum-a".into());
+        state.seen_checksums.insert("checksum-a".into());
+        fs::write(
+            base.join("import_state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        let state_mtime_before = fs::metadata(base.join("import_state.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let dataset_mtime_before = fs::metadata(dataset.join("oiran_events.jsonl"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let report = recover_repair_staging(&root).unwrap();
+
+        // `.dataset-next/` supprimé, chemins listés avec taille.
+        assert!(!dataset_next.exists());
+        assert!(
+            report
+                .removed_paths
+                .iter()
+                .any(|p| p.ends_with(".dataset-next")),
+            "removed_paths doit lister .dataset-next ; got {:?}",
+            report.removed_paths
+        );
+        assert!(
+            report.removed_bytes >= 2 * 1024 * 1024,
+            "removed_bytes doit refléter la taille du scratch ; got {}",
+            report.removed_bytes
+        );
+
+        // `dataset/` strictement intact.
+        assert!(dataset.join("oiran_events.jsonl").is_file());
+        assert_eq!(
+            fs::metadata(dataset.join("oiran_events.jsonl"))
+                .unwrap()
+                .len(),
+            published_size,
+            "dataset/oiran_events.jsonl ne doit pas être touché"
+        );
+        assert_eq!(
+            fs::metadata(dataset.join("oiran_events.jsonl"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            dataset_mtime_before,
+            "dataset mtime ne doit pas changer"
+        );
+        // `import_state.json` strictement intact.
+        assert_eq!(
+            fs::metadata(base.join("import_state.json"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            state_mtime_before,
+            "import_state mtime ne doit pas changer"
+        );
+        let restored_state: ContinuousImportState = serde_json::from_slice(
+            &fs::read(base.join("import_state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored_state.seen_order.len(), 1);
+        assert!(restored_state.seen_checksums.contains("checksum-a"));
     }
 
     /// 2.9.13 (#9 comment 6727243545) — ANR2 a prouvé 24 doublons

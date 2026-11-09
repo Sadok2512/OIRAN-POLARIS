@@ -39,7 +39,7 @@
 //!   * unresolved groups (no `--source-root`, no `state.segments`
 //!     history) are LISTED without touching their events.
 
-use live_probe::CaptureManager;
+use live_probe::{CaptureManager, recover_repair_staging};
 use std::{env, path::PathBuf, process::ExitCode};
 
 fn main() -> ExitCode {
@@ -65,24 +65,49 @@ fn run() -> Result<String, String> {
     let mut args = env::args().skip(1);
     let capture_root = args
         .next()
-        .ok_or("usage: dataset-repair-partial-imports <capture-root> [--dry-run] [--source-root <path>]")?;
+        .ok_or("usage: dataset-repair-partial-imports <capture-root> [--dry-run|--recover] [--source-root <path>]")?;
     let mut dry_run = false;
+    let mut recover = false;
     let mut source_root: Option<PathBuf> = None;
     while let Some(extra) = args.next() {
         match extra.as_str() {
             "--dry-run" => dry_run = true,
+            // 2.9.17 (#9 comment 6739207609) : mode de reprise
+            // après OOM. Supprime `.dataset-next/` et son
+            // staging `.repair-staging/` orphelin, laisse
+            // `dataset/` et `import_state.json` strictement
+            // inchangés. Sans suppression sans preuve : log les
+            // chemins et tailles supprimées.
+            "--recover" => recover = true,
             "--source-root" => {
                 let value = args.next().ok_or(
-                    "usage: dataset-repair-partial-imports <capture-root> [--dry-run] [--source-root <path>] (missing --source-root value)",
+                    "usage: dataset-repair-partial-imports <capture-root> [--dry-run|--recover] [--source-root <path>] (missing --source-root value)",
                 )?;
                 source_root = Some(PathBuf::from(value));
             }
             other => {
                 return Err(format!(
-                    "usage: dataset-repair-partial-imports <capture-root> [--dry-run] [--source-root <path>] (unknown arg {other})"
+                    "usage: dataset-repair-partial-imports <capture-root> [--dry-run|--recover] [--source-root <path>] (unknown arg {other})"
                 ));
             }
         }
+    }
+    if recover {
+        if dry_run {
+            return Err("--recover and --dry-run are mutually exclusive".into());
+        }
+        let capture_root = PathBuf::from(&capture_root);
+        let report = recover_repair_staging(&capture_root)?;
+        return Ok(serde_json::json!({
+            "event": "DATASET_REPAIR_RECOVERY_COMPLETED",
+            "schema_version": "2.9.17",
+            "capture_root": capture_root.display().to_string(),
+            "removed_paths": report.removed_paths,
+            "removed_bytes": report.removed_bytes,
+            "dataset_untouched": true,
+            "import_state_untouched": true,
+        })
+        .to_string());
     }
     let capture_root = PathBuf::from(capture_root);
     let manager = CaptureManager::new(capture_root, false)
