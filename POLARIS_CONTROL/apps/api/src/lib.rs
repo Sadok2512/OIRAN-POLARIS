@@ -4775,6 +4775,151 @@ struct LteCertificationActivationRequest {
     grant_id: String,
 }
 
+/// 0.30.0 (ANR1 #10 6737561274) : contrat d'autorisation de run
+/// de certification LTE. Opérateur + CSRF obligatoires via
+/// `require_operator`. L'endpoint ne prend AUCUN paramètre
+/// sensible (pas d'IMSI, pas de K/OPc, pas de token) — toutes les
+/// valeurs sensibles vivent déjà dans la base ou le profil.
+#[derive(Default, Deserialize)]
+struct LteCertificationRunRequest {
+    /// Optionnel — identifiant opérateur du run (si absent, on en
+    /// génère un). Doit respecter `^lte-certif-[A-Za-z0-9._-]{1,48}$`.
+    run_id: Option<String>,
+}
+
+/// 0.30.0 : réponse synchrone de l'autorisation. Opérateur peut
+/// enchaîner `POST /lte/runs` et les routes `lte_attach` / … sous
+/// couvert de cette autorisation.
+#[derive(Serialize)]
+struct LteCertificationRunResponse {
+    run_id: String,
+    state: &'static str,
+    operation_mode: LteOperationMode,
+    srsran_live_enabled: bool,
+    execution_mode: String,
+    authorized_steps: [&'static str; 4],
+    /// Adresse IPv4 du DN LTE SGi lue depuis
+    /// `configured_traffic_peer()` (env `POLARIS_LTE_TRAFFIC_PEER_IP`
+    /// → fallback 0.30.0 `LTE_SGI_DN_DEFAULT_PEER_IP = 10.77.16.30`).
+    /// Aucune valeur en dur côté réponse.
+    target_dn_ip: String,
+    /// Horodatage epoch-seconds de l'autorisation (pas de ns pour
+    /// éviter toute clé horaire fine côté audit).
+    authorized_at_epoch_s: u64,
+}
+
+/// 0.30.0 : POST `/polaris-api/v1/lte/certification-run`.
+///
+/// Opérateur + CSRF (`require_operator`) ; refuse viewer avec 403.
+/// Exige `POLARIS_LTE_CERTIFICATION_RUN_ENABLED=1` **et**
+/// `execution_mode=live` **et** `srsran_live_enabled=true` ; sinon
+/// retourne 423 `LTE_CERTIFICATION_RUN_REQUIRED` avec l'état
+/// courant pour que l'opérateur voie la raison.
+///
+/// Si validé : écrit une ligne d'audit
+/// `LTE_CERTIFICATION_RUN_AUTHORIZED` et retourne le `run_id` que
+/// l'opérateur place dans ses appels suivants (header optionnel
+/// `X-Polaris-Certification-Run-Id`). Les routes `lte_attach` /
+/// `lte_detach` / `lte_traffic_ul` / `lte_traffic_dl`
+/// (`:12961-12979` et `:10911-10921`) acceptent maintenant le mode
+/// `CertificationRun` en plus de `LiveOperational`. Le démarrage
+/// effectif de srsENB + srsUE reste orchestré par les routes
+/// existantes `POST /lte/runs` et `POST /lte/components/start` qui
+/// exécutent `docker compose --profile lte` via
+/// `COMPOSE_FILE_ARGS` (0.29.13).
+///
+/// Aucun secret dans la réponse ni dans l'audit. L'identité de
+/// l'opérateur est **pseudonymisée** (tronquage SHA-256 du
+/// `session_id`) — jamais le username ou l'IMSI.
+async fn authorize_lte_certification_run(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<EffectiveIdentity>,
+    Json(input): Json<LteCertificationRunRequest>,
+) -> impl IntoResponse {
+    if let Err(error) = require_operator(&identity) {
+        return error;
+    }
+    let mode = lte_operation_mode(&state);
+    if state.execution_mode != "live" || !state.srsran_live_enabled {
+        return (
+            StatusCode::LOCKED,
+            Json(json!({
+                "error":"LTE_CERTIFICATION_RUN_REQUIRED",
+                "operation_mode":mode,
+                "execution_mode":state.execution_mode,
+                "srsran_live_enabled":state.srsran_live_enabled,
+            })),
+        );
+    }
+    if mode == LteOperationMode::Disabled {
+        return (
+            StatusCode::LOCKED,
+            Json(json!({
+                "error":"LTE_CERTIFICATION_RUN_REQUIRED",
+                "operation_mode":mode,
+                "hint":"set POLARIS_LTE_CERTIFICATION_RUN_ENABLED=1 before invoking",
+            })),
+        );
+    }
+    let run_id = match input.run_id.as_deref() {
+        Some(candidate) => {
+            if !lte_certification_run_id_is_valid(candidate) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error":"LTE_CERTIFICATION_RUN_ID_INVALID"})),
+                );
+            }
+            candidate.to_string()
+        }
+        None => format!("lte-certif-{}", random_hex(16)),
+    };
+    let target_dn_ip = match srsran_controller::configured_traffic_peer_public() {
+        Ok(ip) => ip.to_string(),
+        Err(error) => {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                Json(json!({"error":error})),
+            );
+        }
+    };
+    audit(
+        &state,
+        &identity.role,
+        "LTE_CERTIFICATION_RUN_AUTHORIZED",
+        "AUTHORIZED",
+        Some(&run_id),
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(LteCertificationRunResponse {
+            run_id,
+            state: "AUTHORIZED",
+            operation_mode: mode,
+            srsran_live_enabled: state.srsran_live_enabled,
+            execution_mode: state.execution_mode.clone(),
+            authorized_steps: ["lte_attach", "lte_detach", "lte_traffic_ul", "lte_traffic_dl"],
+            target_dn_ip,
+            authorized_at_epoch_s: epoch_seconds(),
+        }).unwrap_or(json!({}))),
+    )
+}
+
+/// 0.30.0 : format `run_id` strict côté serveur — pas de slash, pas
+/// de caractère shell, longueur ≤ 48. Protection contre un
+/// path traversal naïf si on persistait le run_id sur disque plus
+/// tard.
+fn lte_certification_run_id_is_valid(candidate: &str) -> bool {
+    if !candidate.starts_with("lte-certif-") {
+        return false;
+    }
+    let tail = &candidate["lte-certif-".len()..];
+    !tail.is_empty()
+        && tail.len() <= 48
+        && tail
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 async fn activate_lte_profile_for_certification(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
@@ -10909,10 +11054,13 @@ async fn post_traffic_session(
         );
     }
     if lte_request {
+        // 0.30.0 (ANR1 #10 6737561274) : même règle que le gate
+        // des steps — accepte `CertificationRun` en plus de
+        // `LiveOperational`.
         if request.ue_ids.len() != 1
             || state.execution_mode != "live"
-            || !state.lte_e2e_certified
             || !state.srsran_live_enabled
+            || lte_operation_mode(&state) == LteOperationMode::Disabled
         {
             return (
                 StatusCode::LOCKED,
@@ -12959,9 +13107,18 @@ async fn start_scenario(
             )
         });
         if has_lte_steps && state.execution_mode != "mock" {
+            // 0.30.0 (ANR1 #10 6737561274) : la 423
+            // `LTE_E2E_CERTIFICATION_REQUIRED` est désormais levée
+            // en mode `CertificationRun` (env
+            // `POLARIS_LTE_CERTIFICATION_RUN_ENABLED=1` + srsran
+            // live). Impasse fermée : le run peut enfin exécuter
+            // `lte_attach`/`lte_detach`/`lte_traffic_ul`/
+            // `lte_traffic_dl` sous audit opérateur sans attendre
+            // une certification préalable que SEUL ce run peut
+            // produire.
             if state.execution_mode != "live"
-                || !state.lte_e2e_certified
                 || !state.srsran_live_enabled
+                || lte_operation_mode(&state) == LteOperationMode::Disabled
             {
                 return (
                     StatusCode::LOCKED,
@@ -13983,6 +14140,12 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/lte/profiles/:profile_id/certification-activation",
             post(activate_lte_profile_for_certification),
+        )
+        // 0.30.0 (ANR1 #10 6737561274) : autorise un run de
+        // certification LTE (operator + CSRF, audit tracé).
+        .route(
+            "/lte/certification-run",
+            post(authorize_lte_certification_run),
         )
         .route("/lte/runs", post(create_lte_run))
         .route("/lte/runs/:run_id", get(get_lte_run))
@@ -21416,5 +21579,76 @@ mod p0_tests {
             validate_lte_memory(&json!({"available_bytes": FOUR_GIB})),
             Err("LTE_MEMORY_MEASUREMENT_UNAVAILABLE".into())
         );
+    }
+
+    /// 0.30.0 (ANR1 #10 6737561274) : règle de validation stricte
+    /// pour les run_id de certification. Prévient path traversal
+    /// et injections shell si la valeur est un jour persistée.
+    #[test]
+    fn lte_certification_run_id_validates_safe_identifier_only_0_30_0() {
+        assert!(lte_certification_run_id_is_valid("lte-certif-20261109T1200Z"));
+        assert!(lte_certification_run_id_is_valid("lte-certif-a1b2c3d4e5f60718"));
+        assert!(lte_certification_run_id_is_valid("lte-certif-run.001-v2_a"));
+        // Doit refuser les préfixes incorrects.
+        assert!(!lte_certification_run_id_is_valid("certif-run-x"));
+        assert!(!lte_certification_run_id_is_valid("lte-certif-"));
+        // Shell-unsafe caractères rejetés.
+        assert!(!lte_certification_run_id_is_valid("lte-certif-a/b"));
+        assert!(!lte_certification_run_id_is_valid("lte-certif-a b"));
+        assert!(!lte_certification_run_id_is_valid("lte-certif-a;rm"));
+        assert!(!lte_certification_run_id_is_valid("lte-certif-$RUN"));
+        // Longueur limitée.
+        let long_tail = "x".repeat(49);
+        assert!(!lte_certification_run_id_is_valid(&format!(
+            "lte-certif-{long_tail}"
+        )));
+        // 48 octets exactement : OK.
+        let max_tail = "x".repeat(48);
+        assert!(lte_certification_run_id_is_valid(&format!(
+            "lte-certif-{max_tail}"
+        )));
+    }
+
+    /// 0.30.0 : les quatre steps autorisés par le mode
+    /// `CertificationRun` sont exactement
+    /// `lte_attach`/`lte_detach`/`lte_traffic_ul`/`lte_traffic_dl`.
+    /// Protection contre un ajout silencieux d'un step privilégié
+    /// sans revue.
+    #[test]
+    fn lte_certification_response_authorizes_only_the_four_canonical_steps_0_30_0() {
+        let response = LteCertificationRunResponse {
+            run_id: "lte-certif-test".into(),
+            state: "AUTHORIZED",
+            operation_mode: LteOperationMode::CertificationRun,
+            srsran_live_enabled: true,
+            execution_mode: "live".into(),
+            authorized_steps: ["lte_attach", "lte_detach", "lte_traffic_ul", "lte_traffic_dl"],
+            target_dn_ip: "10.77.16.30".into(),
+            authorized_at_epoch_s: 0,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        let steps = json["authorized_steps"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(steps.len(), 4);
+        for canonical in ["lte_attach", "lte_detach", "lte_traffic_ul", "lte_traffic_dl"] {
+            assert!(
+                steps.contains(canonical),
+                "le step {canonical} doit faire partie de authorized_steps"
+            );
+        }
+        // Ne liste PAS `lte_attach_data` — c'est un step haute-traffic
+        // qui n'est pas dans le périmètre de la cert run 0.30.0.
+        assert!(!steps.contains("lte_attach_data"));
+        // La réponse ne contient aucun secret.
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(!encoded.contains("IMSI"));
+        assert!(!encoded.contains("IMEI"));
+        assert!(!encoded.contains("K="));
+        assert!(!encoded.contains("OPc="));
+        assert!(!encoded.contains("password"));
     }
 }

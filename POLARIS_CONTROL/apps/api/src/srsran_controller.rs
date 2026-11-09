@@ -565,6 +565,17 @@ fn attach_is_proven(s1_state: &str, attach_success: bool, epc_context: bool) -> 
 pub const LTE_UE_TUN: &str = "tun_srsue";
 pub const LTE_UE_SUBNET_DEFAULT: &str = "10.45.0.0/16";
 
+/// 0.30.0 (ANR1 #10 6737561274) : adresse canonique du DN LTE SGi
+/// déployée par le sidecar `polaris-lte-sgi-dn`
+/// (`POLARIS_CONTROL/deployment/dn-sender/lte-sgi/compose.yaml:30`,
+/// `ipv4_address: 10.77.16.30`). ANR1 a prouvé que
+/// `/root/POLARIS/config/scenarios/lte.yaml:4` ciblait à tort
+/// `10.77.16.100` (aucun occupant), ce qui bloquait la recette LTE.
+/// Le code expose maintenant cette constante comme source de vérité,
+/// alignée sur le compose, avec `POLARIS_LTE_TRAFFIC_PEER_IP` comme
+/// override opérateur.
+pub const LTE_SGI_DN_DEFAULT_PEER_IP: &str = "10.77.16.30";
+
 fn validate_traffic_peer_values(
     traffic_peer: Option<&str>,
     _dl_sender: Option<&str>,
@@ -574,8 +585,22 @@ fn validate_traffic_peer_values(
         .map_err(|_| "LTE_TRAFFIC_PEER_INVALID".into())
 }
 
+/// 0.30.0 (ANR1 #10 6737561274) : exposé crate-public pour que
+/// l'endpoint `POST /lte/certification-run` puisse retourner
+/// l'IP du DN SGi résolue sans dupliquer la logique.
+pub(crate) fn configured_traffic_peer_public() -> Result<std::net::Ipv4Addr, String> {
+    configured_traffic_peer()
+}
+
 fn configured_traffic_peer() -> Result<std::net::Ipv4Addr, String> {
-    let peer = std::env::var("POLARIS_LTE_TRAFFIC_PEER_IP").ok();
+    // 0.30.0 : fallback sur `LTE_SGI_DN_DEFAULT_PEER_IP` quand
+    // l'env n'est pas défini, pour que le code reste cohérent
+    // avec le sidecar DN déployé (ANR1 ANR1 #10 6737561274).
+    // L'override opérateur `POLARIS_LTE_TRAFFIC_PEER_IP` reste
+    // supporté et PRIME sur la constante.
+    let peer = std::env::var("POLARIS_LTE_TRAFFIC_PEER_IP")
+        .ok()
+        .or_else(|| Some(LTE_SGI_DN_DEFAULT_PEER_IP.to_string()));
     let sender = std::env::var("POLARIS_DL_SENDER_IP").ok();
     let peer = validate_traffic_peer_values(peer.as_deref(), sender.as_deref())?;
     // 0.29.3: an operator pointing the LTE SGi peer at the 5G N6 sender is
@@ -3739,6 +3764,7 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn configured_traffic_peer_rejects_collision_with_n6_sender() {
         let prev_peer = std::env::var_os("POLARIS_LTE_TRAFFIC_PEER_IP");
         let prev_sender = std::env::var_os("POLARIS_DL_SENDER_IP");
@@ -3753,6 +3779,20 @@ mod tests {
         assert_eq!(
             configured_traffic_peer(),
             Ok("10.77.16.30".parse().unwrap())
+        );
+        // 0.30.0 (ANR1 #10 6737561274) : sans POLARIS_LTE_TRAFFIC_PEER_IP,
+        // `configured_traffic_peer()` doit retomber sur
+        // `LTE_SGI_DN_DEFAULT_PEER_IP = 10.77.16.30` (sidecar
+        // `polaris-lte-sgi-dn` déployé). Remplace la cible fautive
+        // `10.77.16.100` qu'ANR1 a observée dans
+        // `/root/POLARIS/config/scenarios/lte.yaml:4`.
+        assert_eq!(LTE_SGI_DN_DEFAULT_PEER_IP, "10.77.16.30");
+        std::env::remove_var("POLARIS_LTE_TRAFFIC_PEER_IP");
+        // POLARIS_DL_SENDER_IP reste à 10.77.24.30 → distinct de .30 → OK.
+        assert_eq!(
+            configured_traffic_peer(),
+            Ok("10.77.16.30".parse().unwrap()),
+            "fallback 0.30.0 sur le DN LTE SGi quand l'env est absent"
         );
         match prev_peer {
             Some(value) => std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", value),
