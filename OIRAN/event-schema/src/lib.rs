@@ -573,6 +573,27 @@ impl Sha256Hasher {
         self.h.iter().map(|v| format!("{v:08x}")).collect()
     }
 
+    /// 2.9.17 (#9 comment 6739207609) — Variante bornée mémoire :
+    /// renvoie le digest brut 32 octets sans passer par l'hex
+    /// (deux fois plus compact qu'un `String` hex). Utilisé par
+    /// `repair_partial_imports` pour la dédup wire sur 1,5 M
+    /// événements (budget RSS < 512 MiB).
+    pub fn finish_bytes(mut self) -> [u8; 32] {
+        let bit_len = self.total_len.wrapping_mul(8);
+        let mut tail = [0u8; 72];
+        tail[0] = 0x80;
+        let pad = (56 - ((self.buffered as isize + 1) % 64) + 64) as usize % 64;
+        let bit_len_bytes = bit_len.to_be_bytes();
+        tail[1 + pad..1 + pad + 8].copy_from_slice(&bit_len_bytes);
+        self.update(&tail[..1 + pad + 8]);
+        debug_assert_eq!(self.buffered, 0);
+        let mut out = [0u8; 32];
+        for (i, word) in self.h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
     fn compress(&mut self, chunk: &[u8; 64]) {
         let mut w = [0u32; 64];
         for (i, word) in w[..16].iter_mut().enumerate() {

@@ -29,7 +29,7 @@ use session_engine::{
     ReconstructionHints,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -4234,13 +4234,20 @@ impl CaptureManager {
         fs::create_dir_all(&repair_staging_dir).map_err(display_error)?;
         let scratch_path = repair_staging_dir.join("kept-events.jsonl");
         let mut removed: Vec<RepairRemovedEvent> = Vec::new();
-        // Clé de tri = `(capture_id, packet_number, event_id)` —
+        // 2.9.17-fu (#9 comment 6739207609, bench 1,5 M) : interning
+        // des `capture_id` pour la clé de tri. Il y a typiquement
+        // < 100 capture_ids distincts pour 1,5 M lignes ;
+        // sans interning, 71 B × 1,5 M = ~107 MB rien que pour la
+        // duplication de la chaîne SHA.
+        let mut capture_id_intern: HashMap<String, Arc<str>> = HashMap::new();
+        // Clé de tri = `(capture_id_arc, packet_number, event_id)` —
         // itération en ordre canonique sans Vec en mémoire.
-        let mut sort_index: BTreeMap<(String, u64, String), (u64, u32)> = BTreeMap::new();
-        // Dedup wire 2.9.13 — appliqué pendant l'écriture ET
-        // pendant le fresh-import (évite d'écrire deux fois le
-        // même tuple wire).
-        let mut wire_seen: BTreeSet<(String, u64, u64, String, String)> = BTreeSet::new();
+        let mut sort_index: BTreeMap<(Arc<str>, u64, String), (u64, u32)> = BTreeMap::new();
+        // Dedup wire 2.9.13 (clé compacte 2.9.17-fu) — chaque tuple
+        // wire est hashé SHA256 et stocké sous forme `[u8; 32]`.
+        // HashSet<[u8;32]> ≈ 56 B/entrée × 1,5 M ≈ 84 MB, versus
+        // ~230 MB pour `BTreeSet<(String, u64, u64, String, String)>`.
+        let mut wire_seen: HashSet<[u8; 32]> = HashSet::new();
         let mut scratch_offset: u64 = 0;
         let mut kept_event_count: usize = 0;
         {
@@ -4297,20 +4304,22 @@ impl CaptureManager {
                 let protocol = value
                     .get("protocol")
                     .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
+                    .unwrap_or("");
                 let message_name = value
                     .get("message_name")
                     .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let wire_key = (
-                    capture_id.clone(),
-                    packet_number,
-                    byte_offset,
-                    protocol,
-                    message_name,
-                );
+                    .unwrap_or("");
+                // 2.9.17-fu : clé wire compacte — SHA256 des 5
+                // champs concaténés avec séparateurs non-ambigus.
+                let mut wire_h = Sha256Hasher::new();
+                wire_h.update(capture_id.as_bytes());
+                wire_h.update(&[0u8]);
+                wire_h.update(&packet_number.to_le_bytes());
+                wire_h.update(&byte_offset.to_le_bytes());
+                wire_h.update(protocol.as_bytes());
+                wire_h.update(&[0u8]);
+                wire_h.update(message_name.as_bytes());
+                let wire_key = wire_h.finish_bytes();
                 if !wire_seen.insert(wire_key) {
                     let source_file = value
                         .pointer("/packet_references/0/source_file")
@@ -4326,6 +4335,11 @@ impl CaptureManager {
                     continue;
                 }
                 drop(value);
+                // 2.9.17-fu : intern du capture_id pour la clé de tri.
+                let capture_id_arc = capture_id_intern
+                    .entry(capture_id.clone())
+                    .or_insert_with(|| Arc::from(capture_id.as_str()))
+                    .clone();
                 // Append line + newline to scratch ; stocker
                 // offset + longueur pour relecture canonique.
                 let payload = line.as_bytes();
@@ -4333,7 +4347,7 @@ impl CaptureManager {
                 scratch_writer.write_all(b"\n").map_err(display_error)?;
                 let len = (payload.len() + 1) as u32;
                 sort_index.insert(
-                    (capture_id, packet_number, event_id),
+                    (capture_id_arc, packet_number, event_id),
                     (scratch_offset, len),
                 );
                 scratch_offset = scratch_offset.saturating_add(len as u64);
@@ -4378,6 +4392,12 @@ impl CaptureManager {
                         endpoints: HashMap::new(),
                     };
                     let capture_id_clone = full_capture_id.clone();
+                    // 2.9.17-fu : intern du capture_id du
+                    // fresh-import (une fois par décodage).
+                    let capture_id_arc = capture_id_intern
+                        .entry(capture_id_clone.clone())
+                        .or_insert_with(|| Arc::from(capture_id_clone.as_str()))
+                        .clone();
                     let scratch_writer_ref = &mut scratch_writer;
                     let scratch_offset_ref = &mut scratch_offset;
                     let kept_event_count_ref = &mut kept_event_count;
@@ -4405,13 +4425,15 @@ impl CaptureManager {
                                 .map(|p| p.source_file.clone())
                                 .unwrap_or_default();
                             let event_id = event.event_id.clone();
-                            let wire_key = (
-                                capture_id_clone.clone(),
-                                packet_number,
-                                byte_offset,
-                                event.protocol.as_str().to_owned(),
-                                event.message_name.clone(),
-                            );
+                            let mut wire_h = Sha256Hasher::new();
+                            wire_h.update(capture_id_clone.as_bytes());
+                            wire_h.update(&[0u8]);
+                            wire_h.update(&packet_number.to_le_bytes());
+                            wire_h.update(&byte_offset.to_le_bytes());
+                            wire_h.update(event.protocol.as_str().as_bytes());
+                            wire_h.update(&[0u8]);
+                            wire_h.update(event.message_name.as_bytes());
+                            let wire_key = wire_h.finish_bytes();
                             if !wire_seen_ref.insert(wire_key) {
                                 removed_ref.push(RepairRemovedEvent {
                                     event_id,
@@ -4427,7 +4449,7 @@ impl CaptureManager {
                             scratch_writer_ref.write_all(b"\n").map_err(display_error)?;
                             let len = (payload.len() + 1) as u32;
                             sort_index_ref.insert(
-                                (capture_id_clone.clone(), packet_number, event_id),
+                                (capture_id_arc.clone(), packet_number, event_id),
                                 (*scratch_offset_ref, len),
                             );
                             *scratch_offset_ref = scratch_offset_ref.saturating_add(len as u64);
@@ -6445,10 +6467,33 @@ fn purge_missing_source_fingerprints(
 /// `recover_repair_staging`. Liste chaque chemin supprimé avec
 /// la taille qu'il occupait, pour que l'opérateur ait la preuve
 /// de l'action AVANT/APRÈS.
+///
+/// 2.9.17-fu (#9 comment 6740035832) : étendu pour couvrir le
+/// cas ANR2 où la sauvegarde 2.9.16 ne contient PAS
+/// `import_state.json`. Le `--recover` reconstruit l'état depuis
+/// le dataset publié + le ring pcap/ et expose les
+/// enregistrements créés/préservés.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RepairRecoveryReport {
     pub removed_paths: Vec<String>,
     pub removed_bytes: u64,
+    /// 2.9.17-fu : chemin `import_state.json` reconstruit (si
+    /// applicable). Vide quand on a préservé l'état existant.
+    #[serde(default)]
+    pub rebuilt_import_state_path: Option<String>,
+    /// Compteur des `capture_id` extraits du dataset publié.
+    #[serde(default)]
+    pub rebuilt_seen_checksums: u64,
+    /// Compteur des segments découverts dans `pcap/` ring.
+    #[serde(default)]
+    pub rebuilt_segments: u64,
+    /// Compteur des `source_fingerprints` préservés depuis
+    /// l'ancien état (si l'état précédent était lisible).
+    #[serde(default)]
+    pub preserved_source_fingerprints: u64,
+    /// Compteur des `failed_ingestions` préservés.
+    #[serde(default)]
+    pub preserved_failed_ingestions: u64,
 }
 
 /// 2.9.17 (#9 comment 6739207609) — Reprise après crash d'une
@@ -6458,14 +6503,24 @@ pub struct RepairRecoveryReport {
 /// de `max_owned_bytes` et bloquant l'import en
 /// `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT`.
 ///
+/// 2.9.17-fu (#9 comment 6740035832) — ANR2 a aussi prouvé que
+/// la sauvegarde de déploiement 2.9.16 ne contient PAS
+/// `import_state.json`. `--recover` RECONSTRUIT un état cohérent
+/// à partir du dataset publié et du ring `pcap/` ; les champs
+/// `source_fingerprints` et `failed_ingestions` sont PRÉSERVÉS
+/// depuis l'ancien état quand il est lisible (sinon vides —
+/// fail-closed).
+///
 /// Garanties :
 ///   * `dataset/` NON touché.
-///   * `import_state.json` NON touché.
 ///   * `pcap/` NON touché.
-///   * Supprime UNIQUEMENT `.dataset-next/` et son
-///     `.repair-staging/` orphelin.
-///   * Retourne la liste des chemins supprimés et le total en
-///     octets — AUCUNE suppression silencieuse.
+///   * `import_state.json` RÉÉCRIT atomiquement avec un état
+///     dérivé déterministement du dataset + ring. L'ancien
+///     fichier est préservé sous `import_state.json.pre-recover`
+///     pour audit.
+///   * Supprime `.dataset-next/` et `.dataset-previous/` orphelins.
+///   * Retourne les compteurs reconstruits + préservés — AUCUNE
+///     suppression silencieuse.
 pub fn recover_repair_staging(capture_root: &Path) -> Result<RepairRecoveryReport, String> {
     let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
     if !base.is_dir() {
@@ -6474,13 +6529,14 @@ pub fn recover_repair_staging(capture_root: &Path) -> Result<RepairRecoveryRepor
             base.display()
         ));
     }
-    let candidates = [base.join(".dataset-next"), base.join(".dataset-previous")];
     let mut report = RepairRecoveryReport::default();
+
+    // 1. Nettoyage du staging orphelin (OOM précédent).
+    let candidates = [base.join(".dataset-next"), base.join(".dataset-previous")];
     for candidate in candidates {
         if !candidate.exists() {
             continue;
         }
-        // Mesure AVANT suppression — preuve pour l'opérateur.
         let size = directory_size(&candidate);
         report.removed_bytes = report.removed_bytes.saturating_add(size);
         report.removed_paths.push(candidate.display().to_string());
@@ -6492,6 +6548,140 @@ pub fn recover_repair_staging(capture_root: &Path) -> Result<RepairRecoveryRepor
             )
         })?;
     }
+
+    // 2. Reconstruction de l'import_state depuis le dataset + le ring.
+    let dataset_events = base.join("dataset").join("oiran_events.jsonl");
+    if !dataset_events.is_file() {
+        // Rien à reconstruire sans dataset publié ; on laisse
+        // l'état existant intact.
+        return Ok(report);
+    }
+    // Préserver `source_fingerprints` + `failed_ingestions` si
+    // possible (lecture best-effort — un fichier manquant ou
+    // mal formé = champs vides, fail-closed).
+    let state_path = base.join("import_state.json");
+    let previous_state: ContinuousImportState = if state_path.is_file() {
+        serde_json::from_slice(&fs::read(&state_path).map_err(display_error)?)
+            .unwrap_or_default()
+    } else {
+        ContinuousImportState::default()
+    };
+
+    // 2.a. Scan streaming du dataset — extrait tous les
+    // `capture_id` uniques (= `seen_checksums` canoniques).
+    // Mémoire : BTreeSet<String> ~5000 SHAs × ~80 B = ~400 KB.
+    // Jamais chargé en RAM entier.
+    let mut dataset_capture_ids: BTreeSet<String> = BTreeSet::new();
+    {
+        let file = fs::File::open(&dataset_events).map_err(display_error)?;
+        let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
+        for line in reader.lines() {
+            let line = line.map_err(display_error)?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if let Some(cap) = value.get("capture_id").and_then(Value::as_str) {
+                    if let Some(hex) = cap.strip_prefix("sha256:") {
+                        dataset_capture_ids.insert(hex.to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2.b. Scan du ring `pcap/` — pour chaque fichier, SHA + size.
+    // On RE-UTILISE les fingerprints de l'ancien état quand les
+    // coordonnées fs match (optimisation 2.8.1).
+    let pcap_dir = base.join("pcap");
+    let mut rebuilt_segments: BTreeMap<String, ImportedSegment> = BTreeMap::new();
+    if pcap_dir.is_dir() {
+        for entry in fs::read_dir(&pcap_dir).map_err(display_error)?.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else { continue; };
+            if !metadata.is_file() {
+                continue;
+            }
+            let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if filename.ends_with(".importing") || !filename.contains(".pcap") {
+                continue;
+            }
+            // Nom convention `<interface>.pcap-<sha16>.<ext>` ou
+            // `<interface>.pcap-bootstrap-<sha16>.<ext>` ; on en
+            // dérive l'interface, le reste du SHA sera calculé.
+            let interface = filename.split('.').next().unwrap_or("").to_string();
+            let sha_hex = sha256_hex_file(&path)?;
+            let size_bytes = metadata.len();
+            let packets = count_pcap_records(&path);
+            let imported_epoch_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|time| {
+                    time.duration_since(std::time::UNIX_EPOCH).ok()
+                })
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            rebuilt_segments.insert(
+                sha_hex.clone(),
+                ImportedSegment {
+                    interface,
+                    owned_file: filename.to_owned(),
+                    size_bytes,
+                    packets,
+                    imported_epoch_ms,
+                    source_path: String::new(),
+                    historical_context: filename.contains("bootstrap"),
+                },
+            );
+        }
+    }
+    // L'union garantit que les SHAs présents côté dataset ET
+    // côté ring sont dans seen_checksums (invariant 2.9.8).
+    let mut seen_checksums: BTreeSet<String> = dataset_capture_ids.clone();
+    for sha in rebuilt_segments.keys() {
+        seen_checksums.insert(sha.clone());
+    }
+    // 2.c. seen_order canonique = SHAs triés lexico. Reproductible
+    // sur une nouvelle recovery → idempotent.
+    let seen_order: std::collections::VecDeque<String> = seen_checksums.iter().cloned().collect();
+
+    // Préserver source_fingerprints + failed_ingestions.
+    let preserved_source_fingerprints = previous_state.source_fingerprints.len() as u64;
+    let preserved_failed_ingestions = previous_state.failed_ingestions.len() as u64;
+    // Filtrer source_fingerprints pour ne garder que ceux dont
+    // le checksum est dans seen_checksums (invariant 2.9.8).
+    let filtered_source_fingerprints: BTreeMap<String, SourceFingerprint> = previous_state
+        .source_fingerprints
+        .into_iter()
+        .filter(|(_, fp)| seen_checksums.contains(&fp.checksum))
+        .collect();
+
+    let rebuilt = ContinuousImportState {
+        segments: rebuilt_segments,
+        seen_checksums,
+        seen_order,
+        failed_ingestions: previous_state.failed_ingestions,
+        source_fingerprints: filtered_source_fingerprints,
+    };
+    report.rebuilt_seen_checksums = rebuilt.seen_checksums.len() as u64;
+    report.rebuilt_segments = rebuilt.segments.len() as u64;
+    report.preserved_source_fingerprints = preserved_source_fingerprints;
+    report.preserved_failed_ingestions = preserved_failed_ingestions;
+
+    // 3. Préserver l'ancien fichier (audit) puis écrire le neuf.
+    if state_path.is_file() {
+        let backup = base.join("import_state.json.pre-recover");
+        let _ = fs::remove_file(&backup);
+        fs::rename(&state_path, &backup).map_err(display_error)?;
+    }
+    atomic_write(
+        &state_path,
+        &serde_json::to_vec_pretty(&rebuilt).map_err(|e| e.to_string())?,
+    )?;
+    report.rebuilt_import_state_path = Some(state_path.display().to_string());
+
     Ok(report)
 }
 
@@ -13005,15 +13195,20 @@ mod tests {
         assert_eq!(second.events_sha256, report.events_sha256);
     }
 
-    /// 2.9.17 (#9 comment 6739207609) — Preuve de reprise sûre
-    /// après l'OOM d'une passe réelle. Fabrique l'état observé
-    /// par ANR2 : `dataset/` publié (intact), `import_state.json`
-    /// avec des `seen_order` récents, `.dataset-next/` de 6 GiB
-    /// laissé par le crash. `recover_repair_staging` doit retirer
-    /// `.dataset-next/` mais ne pas toucher `dataset/` ni
-    /// `import_state.json`.
+    /// 2.9.17 (#9 comment 6739207609) + 2.9.17-fu (#9 comment
+    /// 6740035832) — Preuve de reprise sûre après l'OOM d'une
+    /// passe réelle ET reconstruction de l'import_state à partir
+    /// du dataset publié. Fabrique l'état observé par ANR2 :
+    /// `dataset/` publié (intact), `import_state.json` présent
+    /// mais potentiellement désaligné, `.dataset-next/` de 6 GiB
+    /// laissé par le crash. `recover_repair_staging` doit :
+    ///   * retirer `.dataset-next/`,
+    ///   * préserver `dataset/` strictement intact,
+    ///   * sauvegarder `import_state.json` → `.pre-recover`,
+    ///   * réécrire un state cohérent (seen_checksums = SHAs
+    ///     extraits du dataset, segments = fichiers du ring).
     #[test]
-    fn recover_repair_staging_removes_orphan_dataset_next_leaves_state_intact_2_9_17() {
+    fn recover_repair_staging_removes_orphan_and_rebuilds_state_2_9_17() {
         let root = temporary_root("repair-recover-2-9-17");
         let base = root.join(CONTINUOUS_CAPTURE_ID);
         let dataset = base.join("dataset");
@@ -13036,20 +13231,13 @@ mod tests {
         let repair_staging = dataset_next.join(".repair-staging");
         fs::create_dir_all(&repair_staging).unwrap();
         fs::write(repair_staging.join("kept-events.jsonl"), &scratch_bytes).unwrap();
-        // `import_state.json` avec un état « frais » — la
-        // reprise ne doit PAS y toucher.
+        // `import_state.json` avec un ancien état (désaligné du
+        // dataset) — sera sauvegardé en `.pre-recover` puis réécrit.
         let mut state = ContinuousImportState::default();
         state.seen_order.push_back("checksum-a".into());
         state.seen_checksums.insert("checksum-a".into());
-        fs::write(
-            base.join("import_state.json"),
-            serde_json::to_vec_pretty(&state).unwrap(),
-        )
-        .unwrap();
-        let state_mtime_before = fs::metadata(base.join("import_state.json"))
-            .unwrap()
-            .modified()
-            .unwrap();
+        let state_bytes_before = serde_json::to_vec_pretty(&state).unwrap();
+        fs::write(base.join("import_state.json"), &state_bytes_before).unwrap();
         let dataset_mtime_before = fs::metadata(dataset.join("oiran_events.jsonl"))
             .unwrap()
             .modified()
@@ -13073,7 +13261,7 @@ mod tests {
             report.removed_bytes
         );
 
-        // `dataset/` strictement intact.
+        // `dataset/` strictement intact (byte + mtime).
         assert!(dataset.join("oiran_events.jsonl").is_file());
         assert_eq!(
             fs::metadata(dataset.join("oiran_events.jsonl"))
@@ -13090,21 +13278,340 @@ mod tests {
             dataset_mtime_before,
             "dataset mtime ne doit pas changer"
         );
-        // `import_state.json` strictement intact.
-        assert_eq!(
-            fs::metadata(base.join("import_state.json"))
-                .unwrap()
-                .modified()
-                .unwrap(),
-            state_mtime_before,
-            "import_state mtime ne doit pas changer"
+        // L'ancien `import_state.json` est préservé en
+        // `.pre-recover` pour audit.
+        let pre_recover = base.join("import_state.json.pre-recover");
+        assert!(
+            pre_recover.is_file(),
+            "import_state.json.pre-recover doit exister"
         );
-        let restored_state: ContinuousImportState = serde_json::from_slice(
+        assert_eq!(
+            fs::read(&pre_recover).unwrap(),
+            state_bytes_before,
+            "pre-recover doit être byte-pour-byte l'ancien état"
+        );
+        // Le nouvel `import_state.json` est reconstruit depuis
+        // le dataset : capture_id `sha256:a` ⇒ seen_checksums={"a"}.
+        let rebuilt_state: ContinuousImportState = serde_json::from_slice(
             &fs::read(base.join("import_state.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(restored_state.seen_order.len(), 1);
-        assert!(restored_state.seen_checksums.contains("checksum-a"));
+        assert!(
+            rebuilt_state.seen_checksums.contains("a"),
+            "seen_checksums doit contenir le SHA 'a' extrait du dataset ; got {:?}",
+            rebuilt_state.seen_checksums
+        );
+        assert!(
+            !rebuilt_state.seen_checksums.contains("checksum-a"),
+            "l'ancien seen_checksums désaligné doit être écarté"
+        );
+        assert_eq!(report.rebuilt_seen_checksums, 1);
+        assert_eq!(
+            report.rebuilt_import_state_path,
+            Some(base.join("import_state.json").display().to_string()),
+        );
+    }
+
+    /// 2.9.17-fu (#9 comment 6740035832) — Cas ANR2 réel :
+    /// sauvegarde 2.9.16 SANS `import_state.json`. Prouve que
+    /// `--recover` reconstruit un state cohérent depuis le dataset
+    /// publié + le ring `pcap/` et débloque l'import.
+    #[test]
+    fn recover_repair_staging_rebuilds_import_state_from_dataset_2_9_17_fu() {
+        let root = temporary_root("repair-recover-2-9-17-fu");
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset = base.join("dataset");
+        let pcap_dir = base.join("pcap");
+        fs::create_dir_all(dataset.join("callflows")).unwrap();
+        fs::create_dir_all(&pcap_dir).unwrap();
+
+        // Dataset publié : trois capture_id distincts.
+        let published_jsonl = concat!(
+            "{\"event_id\":\"evt-1\",\"capture_id\":\"sha256:aaaaaaaaaaaaaaaa\",\"packet_number\":1}\n",
+            "{\"event_id\":\"evt-2\",\"capture_id\":\"sha256:bbbbbbbbbbbbbbbb\",\"packet_number\":2}\n",
+            "{\"event_id\":\"evt-3\",\"capture_id\":\"sha256:cccccccccccccccc\",\"packet_number\":3}\n",
+        );
+        fs::write(dataset.join("oiran_events.jsonl"), published_jsonl).unwrap();
+
+        // Ring pcap/ : 2 fichiers propriétaires. Leurs SHA réels
+        // iront dans le `segments` reconstruit.
+        let seg_a = pcap_dir.join("n2.pcap-aa.pcapng");
+        let seg_b = pcap_dir.join("n4.pcap-bb.pcapng");
+        fs::write(&seg_a, b"PCAP-SEGMENT-A").unwrap();
+        fs::write(&seg_b, b"PCAP-SEGMENT-B").unwrap();
+
+        // PAS de `import_state.json` — cas ANR2.
+        assert!(!base.join("import_state.json").exists());
+
+        let report = recover_repair_staging(&root).unwrap();
+
+        // Pas de pre-recover (il n'y avait rien à sauvegarder).
+        assert!(!base.join("import_state.json.pre-recover").exists());
+
+        // Nouveau state cohérent.
+        let rebuilt_state: ContinuousImportState = serde_json::from_slice(
+            &fs::read(base.join("import_state.json")).unwrap(),
+        )
+        .unwrap();
+        // 3 SHAs du dataset + 2 SHAs du ring (distincts) = 5.
+        assert_eq!(
+            rebuilt_state.seen_checksums.len(),
+            5,
+            "seen_checksums doit couvrir dataset + ring ; got {:?}",
+            rebuilt_state.seen_checksums,
+        );
+        assert!(rebuilt_state.seen_checksums.contains("aaaaaaaaaaaaaaaa"));
+        assert!(rebuilt_state.seen_checksums.contains("bbbbbbbbbbbbbbbb"));
+        assert!(rebuilt_state.seen_checksums.contains("cccccccccccccccc"));
+        // 2 segments du ring sont enregistrés avec leur interface.
+        assert_eq!(rebuilt_state.segments.len(), 2);
+        let interfaces: BTreeSet<String> = rebuilt_state
+            .segments
+            .values()
+            .map(|seg| seg.interface.clone())
+            .collect();
+        assert!(interfaces.contains("n2"));
+        assert!(interfaces.contains("n4"));
+        // Report compteurs.
+        assert_eq!(report.rebuilt_segments, 2);
+        assert_eq!(report.rebuilt_seen_checksums, 5);
+        assert_eq!(report.preserved_source_fingerprints, 0);
+        assert_eq!(report.preserved_failed_ingestions, 0);
+
+        // Dataset NON touché.
+        assert_eq!(
+            fs::read(dataset.join("oiran_events.jsonl")).unwrap(),
+            published_jsonl.as_bytes(),
+        );
+        // Ring NON touché.
+        assert_eq!(fs::read(&seg_a).unwrap(), b"PCAP-SEGMENT-A");
+        assert_eq!(fs::read(&seg_b).unwrap(), b"PCAP-SEGMENT-B");
+    }
+
+    /// 2.9.17 (#9 comment 6739207609) — Preuve d'atomicité :
+    /// `repair_partial_imports` ne touche à `import_state.json`
+    /// à AUCUN moment, même sur une passe réelle complète.
+    /// L'écriture ne porte que sur `.dataset-next/` puis commit
+    /// atomique via `rename(.dataset-next, dataset)`. Un kill -9
+    /// à n'importe quel moment avant ce rename laisse donc
+    /// `import_state.json` byte-identique à l'avant.
+    ///
+    /// Test : setup un dataset avec doublons wire + state connu,
+    /// exécute une passe réelle, vérifie que `import_state.json`
+    /// a exactement les mêmes octets qu'avant l'appel.
+    #[test]
+    fn repair_partial_imports_never_touches_import_state_2_9_17() {
+        let base = temporary_root("repair-atomic-state");
+        let continuous = base.join(CONTINUOUS_CAPTURE_ID);
+        let dataset = continuous.join("dataset");
+        fs::create_dir_all(dataset.join("callflows")).unwrap();
+        let capture_id = "sha256:01a70bdb74b0b";
+        let owned_full = continuous.join("pcap").join("owned-01a70bdb.pcapng");
+        let make_event = |event_id: &str, protocol: &str, message_name: &str| {
+            serde_json::json!({
+                "event_id": event_id,
+                "capture_id": capture_id,
+                "capture_point_id": "N2",
+                "timestamp": {
+                    "seconds": 23u64,
+                    "nanoseconds": 0,
+                    "raw_ticks": 23_000_000_000i128,
+                    "display": "",
+                },
+                "interface": "N2",
+                "protocol": protocol,
+                "message_name": message_name,
+                "source_endpoint": {"address": "10.0.0.1", "network_function": "gNB"},
+                "destination_endpoint": {"address": "10.0.0.2", "network_function": "AMF"},
+                "direction": "RAN_TO_CORE",
+                "session_identifiers": [],
+                "information_elements": [],
+                "decoding_status": "DECODED",
+                "decoder_name": "test",
+                "decoder_version": "1",
+                "raw_payload_reference": format!("sha256:payload-{event_id}"),
+                "packet_references": [{
+                    "source_file": owned_full.display().to_string(),
+                    "packet_number": 23u64,
+                    "byte_offset": 3908u64,
+                    "interface_id": 0,
+                    "captured_length": 1,
+                    "original_length": 1,
+                }],
+                "errors": [],
+            })
+            .to_string()
+        };
+        let lines = vec![
+            make_event("evt-dup-a", "NGAP", "UplinkNASTransport"),
+            make_event("evt-dup-b", "NGAP", "UplinkNASTransport"),
+        ];
+        write_jsonl(&dataset.join("oiran_events.jsonl"), &lines);
+        let state = serde_json::json!({
+            "segments": {
+                "01a70bdb74b0b": {
+                    "interface": "N2",
+                    "owned_file": "owned-01a70bdb.pcapng",
+                    "size_bytes": 1024u64,
+                    "packets": 23u64,
+                    "imported_epoch_ms": 42u64,
+                    "source_path": "",
+                    "historical_context": false,
+                }
+            },
+            "seen_checksums": ["01a70bdb74b0b"],
+            "seen_order": ["01a70bdb74b0b"],
+            "failed_ingestions": [],
+            "source_fingerprints": {},
+        });
+        let state_bytes = serde_json::to_vec_pretty(&state).unwrap();
+        let state_path = continuous.join("import_state.json");
+        fs::write(&state_path, &state_bytes).unwrap();
+        let state_sha_before = sha256_hex(&state_bytes);
+
+        let manager = fresh_manager_for_restore(&base);
+        let report = manager.repair_partial_imports(false, None).unwrap();
+        // La passe a bien retiré 1 doublon wire.
+        assert_eq!(report.event_count_before, 2);
+        assert_eq!(report.event_count_after, 1);
+        // INVARIANT 2.9.17 : import_state.json byte-identique.
+        let state_bytes_after = fs::read(&state_path).unwrap();
+        assert_eq!(
+            sha256_hex(&state_bytes_after),
+            state_sha_before,
+            "repair_partial_imports NE DOIT PAS modifier import_state.json ; \
+             un kill -9 avant le rename atomique laisserait donc l'état intact"
+        );
+        assert_eq!(
+            state_bytes_after, state_bytes,
+            "import_state.json strictement byte-identique"
+        );
+        // Le staging `.dataset-next/` a été consommé par le commit.
+        assert!(
+            !continuous.join(".dataset-next").exists(),
+            ".dataset-next/ doit être renommé en dataset/ au commit"
+        );
+    }
+
+    /// 2.9.17 (#9 comment 6739207609) — Bench de borne mémoire :
+    /// 1,5 M lignes de dataset en entrée, la passe réelle doit
+    /// terminer en < 512 MiB de RSS incrémental. ANR2 a prouvé
+    /// que la version pré-2.9.17 consommait 14,2 à 14,9 GiB RSS
+    /// (exit 137 ×2) sur ~1,3 M événements, en accumulant tout
+    /// le JSONL retenu dans un `Vec<(String, u64, String,
+    /// String)>`.
+    ///
+    /// Le test lit `/proc/self/status` VmRSS avant et après,
+    /// stocke la valeur pour la réponse ANR2 (#9 « 2.9.17
+    /// POUSSÉE »), et échoue si la différence dépasse 512 MiB.
+    ///
+    /// Ignoré par défaut : coûte ~500 MB disque + ~1 min CPU.
+    /// Lancer explicitement avec :
+    ///
+    ///     cargo test --package live-probe --release \
+    ///         repair_partial_imports_rss_bench_1_5m_2_9_17 \
+    ///         -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn repair_partial_imports_rss_bench_1_5m_2_9_17() {
+        fn vm_rss_kib() -> u64 {
+            let text = fs::read_to_string("/proc/self/status").unwrap_or_default();
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    let value = rest.trim().split_whitespace().next().unwrap_or("0");
+                    return value.parse::<u64>().unwrap_or(0);
+                }
+            }
+            0
+        }
+        const EVENT_COUNT: u64 = 1_500_000;
+        const RSS_BUDGET_MIB: u64 = 512;
+        let base = temporary_root("repair-rss-bench-2-9-17");
+        let continuous = base.join(CONTINUOUS_CAPTURE_ID);
+        let dataset = continuous.join("dataset");
+        fs::create_dir_all(dataset.join("callflows")).unwrap();
+        let owned_full = continuous
+            .join("pcap")
+            .join("owned-bench.pcapng")
+            .display()
+            .to_string();
+        let capture_id = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        // Écriture streaming du JSONL d'entrée.
+        {
+            let file = fs::File::create(dataset.join("oiran_events.jsonl")).unwrap();
+            let mut writer = BufWriter::with_capacity(1 << 20, file);
+            for i in 0..EVENT_COUNT {
+                let line = serde_json::json!({
+                    "event_id": format!("evt-bench-{i:07}"),
+                    "capture_id": capture_id,
+                    "capture_point_id": "N2",
+                    "timestamp": {
+                        "seconds": i,
+                        "nanoseconds": 0,
+                        "raw_ticks": i as i128 * 1_000_000_000,
+                        "display": "",
+                    },
+                    "interface": "N2",
+                    "protocol": "NGAP",
+                    "message_name": "UplinkNASTransport",
+                    "source_endpoint": {"address": "10.0.0.1", "network_function": "gNB"},
+                    "destination_endpoint": {"address": "10.0.0.2", "network_function": "AMF"},
+                    "direction": "RAN_TO_CORE",
+                    "session_identifiers": [],
+                    "information_elements": [],
+                    "decoding_status": "DECODED",
+                    "decoder_name": "test",
+                    "decoder_version": "1",
+                    "raw_payload_reference": format!("sha256:payload-{i}"),
+                    "packet_references": [{
+                        "source_file": owned_full,
+                        // (packet_number, byte_offset) distincts
+                        // par ligne ⇒ aucune wire-dupe.
+                        "packet_number": i,
+                        "byte_offset": i,
+                        "interface_id": 0,
+                        "captured_length": 1,
+                        "original_length": 1,
+                    }],
+                    "errors": [],
+                });
+                writer.write_all(line.to_string().as_bytes()).unwrap();
+                writer.write_all(b"\n").unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        let state = serde_json::json!({
+            "segments": {},
+            "seen_checksums": [],
+            "seen_order": [],
+            "failed_ingestions": [],
+            "source_fingerprints": {},
+        });
+        fs::write(
+            continuous.join("import_state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let manager = fresh_manager_for_restore(&base);
+        let rss_before_kib = vm_rss_kib();
+        // Dry-run : parcourt le pipeline complet (scan + index +
+        // scratch + SHA) sans réécrire le dataset final. C'est le
+        // chemin où 2.9.16 écroulait l'hôte à 14 GiB.
+        let report = manager.repair_partial_imports(true, None).unwrap();
+        let rss_after_kib = vm_rss_kib();
+        let rss_delta_kib = rss_after_kib.saturating_sub(rss_before_kib);
+        let rss_delta_mib = rss_delta_kib / 1024;
+        eprintln!(
+            "RSS_BENCH_2_9_17 events={EVENT_COUNT} before_kib={rss_before_kib} \
+             after_kib={rss_after_kib} delta_mib={rss_delta_mib}",
+        );
+        assert_eq!(report.event_count_before as u64, EVENT_COUNT);
+        assert!(
+            rss_delta_mib < RSS_BUDGET_MIB,
+            "RSS incrémental {rss_delta_mib} MiB dépasse la borne {RSS_BUDGET_MIB} MiB ANR2 \
+             (régression du bug OOM 2.9.16 : 14 GiB sur 1,3 M événements)"
+        );
     }
 
     /// 2.9.13 (#9 comment 6727243545) — ANR2 a prouvé 24 doublons

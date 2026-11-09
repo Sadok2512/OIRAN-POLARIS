@@ -1,5 +1,167 @@
 # Changelog
 
+## OIRAN API 2.9.17-fu — 2026-11-09 — Reconstruction `import_state` + atomicité prouvée + RSS mesuré (devmat, ANR2 #9 comment 6740035832)
+
+Follow-up à 2.9.17 (commit d7cb885) qui laissait trois points
+ouverts prouvés par ANR2 :
+
+1. **Sauvegarde 2.9.16 sans `import_state.json`** — la rotation
+   déployée n'a pas inclus le state. `--recover` (2.9.17 de base)
+   ne faisait que supprimer `.dataset-next/` ; il restait un
+   dataset orphelin sans state.
+2. **Borne mémoire non mesurée** — la valeur « 512 MiB » du cahier
+   des charges ANR2 n'avait pas de bench.
+3. **Invariant atomicité non testé** — la règle « `import_state`
+   et `dataset` ne changent QU'au commit atomique final » reposait
+   sur l'inspection du code, pas sur un test.
+
+### T1 — `--recover` reconstruit `import_state.json`
+
+`live-probe/src/lib.rs::recover_repair_staging` (`:6502-6663`) :
+
+- Si `dataset/oiran_events.jsonl` présent après le nettoyage du
+  staging, le state est **reconstruit** depuis les sources
+  autoritatives :
+  * `seen_checksums` ← union des `capture_id` SHA extraits en
+    streaming du dataset + SHA des fichiers du ring `pcap/`.
+  * `seen_order` ← SHAs triés lexico (idempotent, reproductible).
+  * `segments` ← scan du ring `pcap/` avec SHA256 + `size_bytes`
+    + `packets` (via `count_pcap_records`) + mtime pour chaque
+    fichier propriétaire ; interface dérivée du préfixe du nom.
+  * `source_fingerprints` ← filtrés depuis l'ancien state (si
+    lisible) pour ne garder que ceux dont le checksum est dans
+    `seen_checksums` (invariant 2.9.8).
+  * `failed_ingestions` ← préservés tels quels.
+- L'ancien `import_state.json` est sauvegardé sous
+  `import_state.json.pre-recover` AVANT la réécriture atomique,
+  pour audit (`fs::rename`, pas de perte).
+- `RepairRecoveryReport` expose `rebuilt_import_state_path`,
+  `rebuilt_seen_checksums`, `rebuilt_segments`,
+  `preserved_source_fingerprints`, `preserved_failed_ingestions`.
+- CLI JSON étendu (`bin/dataset-repair-partial-imports.rs`) :
+  mêmes champs + `pre_recover_backup` path hint.
+
+Tests :
+- `recover_repair_staging_removes_orphan_and_rebuilds_state_2_9_17` :
+  state présent mais désaligné ⇒ backup `.pre-recover` +
+  state reconstruit depuis dataset.
+- `recover_repair_staging_rebuilds_import_state_from_dataset_2_9_17_fu` :
+  **cas ANR2 exact** — PAS d'`import_state.json`, 3 SHAs dans le
+  dataset + 2 fichiers ring ⇒ `seen_checksums=5`, `segments=2`
+  avec interfaces `n2`+`n4`, `preserved_*=0`, dataset+ring intacts.
+
+### T2 — Bench RSS mesuré sur 1,5 M événements
+
+Optimisations mémoire sur `repair_partial_imports`
+(`live-probe/src/lib.rs::4236-4260`) :
+
+- **Interning `capture_id`** via `HashMap<String, Arc<str>>` →
+  la clé de tri `BTreeMap<(Arc<str>, u64, String), ...>` partage
+  un seul alloc par capture_id (typiquement < 100 distincts pour
+  1,5 M lignes). Économie ~100 MB sur 1,5 M.
+- **`wire_seen` compact** : `BTreeSet<(String, u64, u64, String,
+  String)>` → `HashSet<[u8; 32]>` avec clé SHA256 des 5 champs
+  concaténés. Économie ~150 MB sur 1,5 M.
+- Nouveau `Sha256Hasher::finish_bytes() -> [u8; 32]`
+  (`event-schema/src/lib.rs::576-595`) — digest brut sans
+  détour par l'hex.
+
+Bench `repair_partial_imports_rss_bench_1_5m_2_9_17`
+(`#[ignore]`, lancer avec `-- --ignored`) :
+
+- 1 500 000 événements synthétisés en JSONL, chaque wire
+  `(capture_id, packet_number, byte_offset, protocol,
+  message_name)` distinct.
+- Lecture de `/proc/self/status` VmRSS avant/après la passe.
+- **Mesure réelle 2026-11-09** : `delta_mib=226` (budget ANR2 :
+  < 512 MiB). Pre-2.9.17 : ~14 GiB. Gain ×60.
+
+### T3 — Invariant atomicité prouvé
+
+Nouveau test `repair_partial_imports_never_touches_import_state_2_9_17`
+(`live-probe/src/lib.rs::13385-13472`) :
+
+- Setup : dataset avec 2 doublons wire + `import_state.json`
+  avec bytes connus.
+- Exécute une passe réelle (non dry-run) — la dédup wire
+  déclenche bien la réécriture du dataset.
+- **Assertion** : `sha256(import_state.json.bytes_before) ==
+  sha256(import_state.json.bytes_after)` ET l'égalité stricte
+  byte-pour-byte.
+- Preuve structurelle : si `repair_partial_imports` ne modifie
+  JAMAIS `import_state.json` sur un run complet qui a commité,
+  alors un kill -9 à n'importe quel moment avant le
+  `fs::rename(.dataset-next, dataset)` laisse aussi le fichier
+  intact. Le staging orphelin est récupéré par `--recover`
+  (T1 ci-dessus).
+
+### Procédure opérateur `--recover` (step-by-step)
+
+État ANR2 au 2026-11-09 : `.dataset-next` = 6,1 GB orphelin,
+`dataset/oiran_events.jsonl` = 2,78 GB sain,
+`import_state.json` **ABSENT** (rotation déploiement 2.9.16).
+
+```bash
+# Hôte de prod : /var/lib/oiran/captures avec sous-arbre
+# continuous-lab-import/{dataset/, pcap/, .dataset-next/}.
+
+# 0. Pré-vol (lecture seule) — mesure l'état avant action.
+cap_root=/var/lib/oiran/captures
+cont=$cap_root/continuous-lab-import
+du -sb $cont/.dataset-next 2>/dev/null || echo "pas de staging orphelin"
+ls -la $cont/import_state.json 2>/dev/null || echo "import_state ABSENT"
+du -sb $cont/dataset/oiran_events.jsonl
+du -sb $cont/pcap
+
+# 1. Arrêter l'import worker si tournant.
+systemctl stop oiran-live-probe || true
+
+# 2. Lancer la récupération 2.9.17-fu.
+nice -n 19 /opt/oiran/bin/dataset-repair-partial-imports \
+  $cap_root --recover | tee /tmp/recover.json
+
+# Sortie JSON attendue :
+#   event: DATASET_REPAIR_RECOVERY_COMPLETED
+#   schema_version: "2.9.17"
+#   removed_paths: ["$cont/.dataset-next"]
+#   removed_bytes: ~6_100_000_000
+#   rebuilt_import_state_path: "$cont/import_state.json"
+#   rebuilt_seen_checksums: <nb de SHAs du dataset + ring>
+#   rebuilt_segments: <nb de fichiers pcap/>
+#   preserved_source_fingerprints: 0  # (pas de state préalable)
+#   preserved_failed_ingestions: 0
+#   pre_recover_backup: "$cont/import_state.json.pre-recover"
+#   dataset_untouched: true
+
+# 3. Preuve APRÈS :
+test ! -e $cont/.dataset-next
+test -f $cont/import_state.json
+# Dataset BYTE-IDENTIQUE à l'avant (vérifiable par SHA).
+
+# 4. Redémarrer l'import.
+systemctl start oiran-live-probe
+# Dans les ~10 s le worker ré-évalue work_bytes et sort de
+# CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT (le staging a disparu).
+
+# 5. (Optionnel) re-lancer la passe de dédup avec la nouvelle
+# version memory-bounded :
+/opt/oiran/bin/dataset-repair-partial-imports $cap_root --dry-run
+# RSS attendu << 512 MiB (bench prouvé sur 1,5 M events = 226 MiB).
+```
+
+Aucune suppression sans preuve : chaque chemin et chaque octet
+retiré est listé dans la sortie JSON.
+
+### Versions
+
+- `live-probe` 0.4.27 → 0.4.27 (patch interne, pas de bump majeur
+  — la surface API `recover_repair_staging` reste identique, seuls
+  les champs du `RepairRecoveryReport` sont étendus)
+- `event-schema` : ajout `Sha256Hasher::finish_bytes()` (pas de
+  bump — strict addition compatible)
+- `oiran-api` 2.9.17 → 2.9.17-fu (patch cosmétique sans impact
+  schéma, pas de bump SemVer)
+
 ## OIRAN API 2.9.17 — 2026-11-09 — URGENT : repair streaming + atomic + --recover + SBI attach IE (devmat, ANR2 #9 6739207609 + BILAN #10 6739221109 + #10 6738246907)
 
 ### Contexte — FAIL 2.9.16 : OOM repair + état incohérent + SBI absent

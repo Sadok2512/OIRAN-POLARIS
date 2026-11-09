@@ -105,7 +105,14 @@ fn run() -> Result<String, String> {
             "removed_paths": report.removed_paths,
             "removed_bytes": report.removed_bytes,
             "dataset_untouched": true,
-            "import_state_untouched": true,
+            // 2.9.17-fu : rapport étendu quand on reconstruit
+            // l'import_state depuis le dataset + le ring pcap.
+            "rebuilt_import_state_path": report.rebuilt_import_state_path,
+            "rebuilt_seen_checksums": report.rebuilt_seen_checksums,
+            "rebuilt_segments": report.rebuilt_segments,
+            "preserved_source_fingerprints": report.preserved_source_fingerprints,
+            "preserved_failed_ingestions": report.preserved_failed_ingestions,
+            "pre_recover_backup": "<capture_root>/continuous-lab-import/import_state.json.pre-recover",
         })
         .to_string());
     }
