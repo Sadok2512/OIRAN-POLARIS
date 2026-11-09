@@ -847,15 +847,34 @@ fn build_event(
         || state.response.headers.is_empty()
         || state.reset
         || hpack_unavailable;
+    // 2.9.18 (#9 comment 6743543648) — ANR2 a prouvé qu'un
+    // user message TCP SBI porteur de PLUSIEURS flux HTTP/2
+    // non classifiés produisait 2 événements avec identité wire
+    // `(capture_id, packet_number, byte_offset, SBI-HTTP2,
+    // UnsupportedSbiOperation)` identique — flat-expansion ANR2
+    // signalait un « doublon réel ». Même problème pour les flux
+    // avec HPACK indisponible : deux flux sur le même paquet
+    // produisent deux `HpackContextUnavailable:<method>`.
+    //
+    // 2.9.18 : préserve le préfixe classifiable (grep-able) mais
+    // suffixe avec le discriminant HTTP/2 stream pour que chaque
+    // flux d'un même paquet TCP ait un `message_name` unique. La
+    // dédup ANR2 compte désormais chaque flux comme événement
+    // wire distinct (pas un doublon).
+    let stream_discriminant = format!(
+        " [conn={}/stream={}]",
+        connection.key.id(),
+        stream_id
+    );
     let message_name = if let Some(operation) = operation.clone() {
         operation
     } else if hpack_unavailable {
         format!(
-            "HpackContextUnavailable:{}",
+            "HpackContextUnavailable:{}{stream_discriminant}",
             method.clone().unwrap_or_else(|| "UNKNOWN".into())
         )
     } else {
-        "UnsupportedSbiOperation".into()
+        format!("UnsupportedSbiOperation{stream_discriminant}")
     };
     let mut errors = Vec::new();
     if hpack_unavailable {

@@ -4501,7 +4501,7 @@ impl CaptureManager {
             // passe réelle (!dry_run) reconstruit depuis zéro.
             let _ = fs::remove_dir_all(&next);
             return Ok(DatasetRepairReport {
-                schema_version: "2.9.17",
+                schema_version: "2.9.18",
                 dataset_dir: current.display().to_string(),
                 dry_run,
                 event_count_before,
@@ -4584,7 +4584,7 @@ impl CaptureManager {
         }
         self.upsert_dataset(dataset, &current)?;
         Ok(DatasetRepairReport {
-            schema_version: "2.9.17",
+            schema_version: "2.9.18",
             dataset_dir: current.display().to_string(),
             dry_run: false,
             event_count_before,

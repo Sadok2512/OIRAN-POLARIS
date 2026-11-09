@@ -1,5 +1,57 @@
 # Changelog
 
+## OIRAN API 2.9.18 — 2026-11-09 — Diameter bundle itératif + SBI UnsupportedSbiOperation wire-unique (devmat, ANR2 #9 comment 6743543648)
+
+ANR2 a prouvé sur 2.9.17 post-recover deux défauts :
+
+1. **1 doublon wire réel** : (capture_id, pkt=5452, byte_offset=1148056, SBI-HTTP2, UnsupportedSbiOperation) ⇒ deux event_ids. Cause : deux flux HTTP/2 non classifiables sur le même paquet TCP partageaient `message_name="UnsupportedSbiOperation"` ⇒ identité wire identique dans l'expansion flat.
+2. **S6a incomplet 7/7** : `_00035-37` perdent 16 msg/file, `_00038` perd 209, `_00039-41` perdent 492-498 (0 événements). Cause : décodeur Diameter n'appelait `parse(payload)` qu'une fois alors qu'Open5GS peut bundler plusieurs messages Diameter (DWR+DWA = 40 octets) dans un seul user message SCTP.
+
+### T1 — Décodeur Diameter itère sur les bundles
+
+`decoder-diameter/src/lib.rs::decode` (`:370-430` post-2.9.18) :
+
+- Boucle `while cursor < payload.len()` qui parse message par message jusqu'à consommation complète du payload.
+- Chaque message Diameter produit son propre `NormalizedEvent` avec `packet_references[0].byte_offset += cursor`, préservant l'identité wire ANR2 `(capture_id, packet_number, byte_offset, protocol, message_name)` unique.
+- Reliquat non parseable (header tronqué, length inconsistant) : émet 1 événement MALFORMED pour ce reliquat avec provenance wire, préserve fail-closed count-preserving (règle 2.9.10).
+- Payload vide : 1 événement MALFORMED (count-preserving).
+
+Nouveau helper privé `adjust_packet_references(refs, sub_offset)` qui clone `packet_references` et décale `byte_offset` du premier référent — identité wire unique par sous-message.
+
+Tests nouveaux (`decoder-diameter/src/lib.rs::tests` section bundling 2.9.18) :
+- `bundled_sctp_payload_emits_one_event_per_diameter_message_2_9_18` : payload = DWR (20o) + DWA (20o) ⇒ 2 événements avec byte_offset {0, 20}, event_ids distincts.
+- `bundled_payload_with_trailing_garbage_emits_decoded_plus_malformed_2_9_18` : DWR (20o) + garbage (version=2) ⇒ 1 DECODED (offset 0) + 1 MALFORMED (offset 20).
+
+14/14 tests decoder-diameter VERT (12 préexistants + 2 nouveaux).
+
+### T2 — SBI UnsupportedSbiOperation wire-unique
+
+`decoder-sbi/src/lib.rs::emit_event` (`:850-879` post-2.9.18) :
+
+- Un flux HTTP/2 non classifiable (ni method+path reconnus, ni HPACK disponible) produisait toujours `message_name="UnsupportedSbiOperation"`. Deux flux parallèles sur le même paquet TCP (2 streams HTTP/2 multiplexés) partageaient donc l'identité wire ANR2 ⇒ flat-expansion `cut -f1-5 | uniq -c | awk '$1>1'` les trouvait comme « doublon ».
+- 2.9.18 : suffixe discriminant `[conn=<conn_id>/stream=<stream_id>]` dans `message_name`. Préfixe `UnsupportedSbiOperation` reste grep-able, mais chaque flux a un `message_name` unique ⇒ identité wire distincte, dédup ANR2 passe. Même traitement pour `HpackContextUnavailable:<method>[conn=.../stream=...]`.
+
+16/16 tests decoder-sbi préexistants VERT (aucune assertion ne liait le libellé exact).
+
+### Versions
+
+- `decoder-diameter` 0.2.3 → 0.2.4 (iterator sur bundles)
+- `decoder-sbi` 0.4.1 → 0.4.2 (message_name wire-unique)
+- `oiran-api` 2.9.17 → 2.9.18
+- `live-probe::DatasetRepairReport.schema_version` 2.9.17 → 2.9.18
+
+### Note opérateur
+
+Les événements **déjà** dans `dataset/oiran_events.jsonl` ne changent pas rétroactivement — les deux défauts sont verrouillés dans les anciens segments. Les fichiers déjà en `seen_checksums` ne seront pas re-ingérés. Pour re-ingérer les fichiers S6a `_00039-41` (0 événements) :
+
+```bash
+# OPTIONNEL — purge sélective de seen_checksums pour forcer re-import
+# Nécessite une passe `--recover` ciblée OU une édition manuelle de
+# import_state.json pour retirer les SHAs concernés.
+```
+
+Cette purge n'est pas automatisée en 2.9.18 (demande d'extension à cadrer ultérieurement). Les nouveaux segments S6a ingérés post-2.9.18 bénéficient immédiatement du fix.
+
 ## OIRAN API 2.9.17-fu — 2026-11-09 — Reconstruction `import_state` + atomicité prouvée + RSS mesuré (devmat, ANR2 #9 comment 6740035832)
 
 Follow-up à 2.9.17 (commit d7cb885) qui laissait trois points

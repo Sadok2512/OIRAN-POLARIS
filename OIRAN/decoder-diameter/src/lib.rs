@@ -368,24 +368,79 @@ impl ProtocolDecoder for DiameterDecoder {
         }
     }
     fn decode(&self, input: &DecoderInput<'_>) -> DecoderOutput {
-        match parse(input.payload) {
-            Ok(msg) => emit_event(msg, input),
-            // 2.9.10 (#9 comment 6726685484) : ANR2 a prouvé la perte
-            // de 9 000 messages S6a sur la population PCAP owned
-            // (176 564 PCAP vs 167 564 JSONL). La cause : les
-            // payloads Diameter malformés produisaient
-            // `events: Vec::new()` — aucun événement, aucune ligne
-            // JSONL, le compteur PCAP n'était pas préservé. La règle
-            // 2.9.10 : fail-closed MAIS count-preserving. Un paquet
-            // Diameter non parseable produit un événement
-            // `decoding_status=MALFORMED` avec sa provenance wire
-            // (packet_references + raw_payload_reference), de sorte
-            // que `PCAP messages == JSONL events` à l'octet près.
-            Err(e) => DecoderOutput {
-                status: DecodeStatus::Malformed,
-                events: vec![emit_malformed_event(input, &e)],
-                errors: vec![e],
-            },
+        // 2.9.18 (#9 comment 6743543648) — ANR2 a prouvé 16 msg S6a
+        // manquants sur `_00035..37`, 209 sur `_00038`, et jusqu'à
+        // 498 sur `_00039..41`. Cause : Open5GS peut bundler
+        // plusieurs messages Diameter dans un même user message
+        // SCTP (en particulier les DWR/DWA Device-Watchdog, 20
+        // octets chacun). La version pré-2.9.18 appelait `parse`
+        // UNE fois sur `input.payload` et émettait un seul événement
+        // — tout message sous-séquent dans le même user message
+        // était perdu, violant l'invariant count-preserving.
+        //
+        // 2.9.18 : itère `parse(slice)` jusqu'à consommation
+        // complète du payload. Chaque message Diameter produit son
+        // événement propre, avec `packet_references[0].byte_offset`
+        // décalé par la position cumulative du sous-message pour
+        // garantir l'identité wire unique par (capture_id,
+        // packet_number, byte_offset, protocol, message_name).
+        //
+        // Si une tentative de parse échoue en cours d'itération
+        // (header tronqué, length inconsistant), on émet UN
+        // événement MALFORMED pour le reliquat et on arrête —
+        // préserver fail-closed + count-preserving.
+        let mut events = Vec::new();
+        let mut errors = Vec::new();
+        let mut overall_status = DecodeStatus::Decoded;
+        let mut cursor: usize = 0;
+        while cursor < input.payload.len() {
+            let slice = &input.payload[cursor..];
+            match parse(slice) {
+                Ok(msg) => {
+                    let msg_len = if slice.len() >= 4 {
+                        (((slice[1] as usize) << 16)
+                            | ((slice[2] as usize) << 8)
+                            | slice[3] as usize)
+                            .max(20)
+                    } else {
+                        slice.len()
+                    };
+                    let out = emit_event(msg, input, cursor as u64);
+                    events.extend(out.events);
+                    errors.extend(out.errors);
+                    match out.status {
+                        DecodeStatus::Malformed => overall_status = DecodeStatus::Malformed,
+                        DecodeStatus::Partial if overall_status == DecodeStatus::Decoded => {
+                            overall_status = DecodeStatus::Partial
+                        }
+                        _ => {}
+                    }
+                    cursor = cursor.saturating_add(msg_len);
+                }
+                Err(e) => {
+                    // 2.9.10 règle count-preserving : un reliquat
+                    // non parseable produit toujours un événement
+                    // MALFORMED avec provenance wire. Le décalage
+                    // `cursor` sert d'offset wire sous-message.
+                    events.push(emit_malformed_event(input, &e, cursor as u64));
+                    errors.push(e);
+                    overall_status = DecodeStatus::Malformed;
+                    break;
+                }
+            }
+        }
+        if events.is_empty() {
+            // Payload vide : contrat count-preserving — un
+            // événement MALFORMED par paquet.
+            let reason = "empty Diameter payload";
+            events.push(emit_malformed_event(input, reason, 0));
+            errors.push(reason.into());
+            overall_status = DecodeStatus::Malformed;
+        }
+        DecoderOutput {
+            status: overall_status,
+            events,
+            errors,
         }
     }
 }
@@ -402,7 +457,30 @@ impl ProtocolDecoder for DiameterDecoder {
 /// pré-2.9.14 publiaient `message_type=0, message_name="MalformedDiameterMessage"`.
 /// Avec le code préservé, la clé `message_type==280` capture
 /// bien tous les 492 messages.
-fn emit_malformed_event(input: &DecoderInput<'_>, parse_error: &str) -> NormalizedEvent {
+/// 2.9.18 (#9 comment 6743543648) — Clone les `packet_references` et
+/// ajoute `sub_offset` au `byte_offset` du premier référent. Garantit
+/// que des messages Diameter multiples issus du MÊME user message
+/// SCTP ont des identités wire distinctes
+/// `(capture_id, packet_number, byte_offset, protocol, message_name)`.
+/// `sub_offset=0` ⇒ comportement identique à pré-2.9.18.
+fn adjust_packet_references(
+    refs: &[event_schema::PacketReference],
+    sub_offset: u64,
+) -> Vec<event_schema::PacketReference> {
+    let mut out: Vec<event_schema::PacketReference> = refs.to_vec();
+    if sub_offset > 0 {
+        if let Some(first) = out.first_mut() {
+            first.byte_offset = first.byte_offset.saturating_add(sub_offset);
+        }
+    }
+    out
+}
+
+fn emit_malformed_event(
+    input: &DecoderInput<'_>,
+    parse_error: &str,
+    sub_offset: u64,
+) -> NormalizedEvent {
     let header = peel_diameter_header(input.payload);
     let (message_name, message_type, procedure_code, procedure, direction) =
         if let Some(h) = header.as_ref() {
@@ -460,7 +538,7 @@ fn emit_malformed_event(input: &DecoderInput<'_>, parse_error: &str) -> Normaliz
         probe_id: "oiran-vprobe-01".into(),
         capture_point_id: input.interface.into(),
         capture_id: input.capture_id.into(),
-        packet_references: input.packet_references.to_vec(),
+        packet_references: adjust_packet_references(input.packet_references, sub_offset),
         timestamp: input.timestamp.clone(),
         interface: input.interface.into(),
         protocol: Protocol::Diameter,
@@ -524,7 +602,11 @@ fn peel_diameter_header(payload: &[u8]) -> Option<DiameterHeader> {
     })
 }
 
-fn emit_event(msg: DiameterMessage, input: &DecoderInput<'_>) -> DecoderOutput {
+fn emit_event(
+    msg: DiameterMessage,
+    input: &DecoderInput<'_>,
+    sub_offset: u64,
+) -> DecoderOutput {
     let mut identifiers = Vec::new();
     let mut elements = Vec::new();
     let mut errors = Vec::new();
@@ -560,7 +642,7 @@ fn emit_event(msg: DiameterMessage, input: &DecoderInput<'_>) -> DecoderOutput {
         probe_id: "oiran-vprobe-01".into(),
         capture_point_id: input.interface.into(),
         capture_id: input.capture_id.into(),
-        packet_references: input.packet_references.to_vec(),
+        packet_references: adjust_packet_references(input.packet_references, sub_offset),
         timestamp: input.timestamp.clone(),
         interface: input.interface.into(),
         protocol: Protocol::Diameter,
@@ -1065,6 +1147,115 @@ mod tests {
             "Post-2.9.14 : le filtre ANR2 doit capturer 492 ({clean_count} bien parsés + {malformed_count} malformed avec header valide). \
              Pré-2.9.14, les {malformed_count} malformed portaient message_type=0 et étaient perdus par le filtre → 476."
         );
+    }
+
+    /// 2.9.18 (#9 comment 6743543648) — ANR2 a prouvé que
+    /// `_00039`..`_00041` perdaient 492-498 messages Diameter
+    /// (0 événement émis pour un fichier bien peuplé en pcap).
+    /// Et `_00035`..`_00037` perdaient 16 msg/file. Cause prouvée :
+    /// Open5GS peut bundler PLUSIEURS messages Diameter dans un
+    /// même user message SCTP (DWR+DWA concaténés = 40 octets) ;
+    /// le décodeur pré-2.9.18 appelait `parse(payload)` UNE fois
+    /// et perdait les messages suivants.
+    ///
+    /// Le test construit un payload = DWR (20o) + DWA (20o) et
+    /// vérifie que `decode()` émet DEUX événements, chacun avec
+    /// un `byte_offset` distinct (0 et 20) ⇒ identité wire
+    /// unique pour la dédup ANR2 `(capture_id, packet_number,
+    /// byte_offset, protocol, message_name)`.
+    #[test]
+    fn bundled_sctp_payload_emits_one_event_per_diameter_message_2_9_18() {
+        let (p, t) = fixtures();
+        let key = PseudonymKey::from_bytes([0xbb; 32]);
+
+        // Fabrique DWR (flags=0x80) + DWA (flags=0x00) concaténés.
+        let dwr: Vec<u8> = {
+            let mut bytes = Vec::with_capacity(20);
+            bytes.push(0x01);
+            bytes.extend_from_slice(&[0x00, 0x00, 0x14]);
+            bytes.push(0x80); // Request
+            bytes.extend_from_slice(&[0x00, 0x01, 0x18]); // code 280
+            bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            bytes.extend_from_slice(&[0, 0, 0, 0x11]); // h2h
+            bytes.extend_from_slice(&[0, 0, 0, 0x22]); // e2e
+            bytes
+        };
+        let dwa: Vec<u8> = {
+            let mut bytes = Vec::with_capacity(20);
+            bytes.push(0x01);
+            bytes.extend_from_slice(&[0x00, 0x00, 0x14]);
+            bytes.push(0x00); // Answer
+            bytes.extend_from_slice(&[0x00, 0x01, 0x18]); // code 280
+            bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            bytes.extend_from_slice(&[0, 0, 0, 0x11]); // h2h
+            bytes.extend_from_slice(&[0, 0, 0, 0x22]); // e2e
+            bytes
+        };
+        let mut bundled = Vec::with_capacity(40);
+        bundled.extend_from_slice(&dwr);
+        bundled.extend_from_slice(&dwa);
+
+        let in_ = input(&bundled, &p, &t, &key, "MME", "HSS");
+        let out = DiameterDecoder.decode(&in_);
+
+        assert_eq!(out.status, DecodeStatus::Decoded);
+        assert_eq!(
+            out.events.len(),
+            2,
+            "2.9.18 : un bundle DWR+DWA (40o SCTP) doit produire 2 événements ; \
+             pré-2.9.18 en produisait 1."
+        );
+        assert_eq!(out.events[0].message_name, "Device-Watchdog-Request");
+        assert_eq!(out.events[1].message_name, "Device-Watchdog-Answer");
+
+        // byte_offset doit être DISTINCT entre les deux événements
+        // pour que l'identité wire ANR2 soit unique.
+        let bo_0 = out.events[0].packet_references[0].byte_offset;
+        let bo_1 = out.events[1].packet_references[0].byte_offset;
+        assert_eq!(bo_0, 0, "premier message = byte_offset d'origine");
+        assert_eq!(
+            bo_1, 20,
+            "second message = offset d'origine + taille du premier Diameter (20o)"
+        );
+
+        // event_ids déterministes et distincts.
+        assert_ne!(out.events[0].event_id, out.events[1].event_id);
+    }
+
+    /// 2.9.18 — Bundle Diameter avec un reliquat invalide après
+    /// un premier message correct. Prouve la garantie fail-closed
+    /// count-preserving sur le reliquat : 1 DECODED + 1 MALFORMED.
+    #[test]
+    fn bundled_payload_with_trailing_garbage_emits_decoded_plus_malformed_2_9_18() {
+        let (p, t) = fixtures();
+        let key = PseudonymKey::from_bytes([0xbb; 32]);
+
+        let dwr: Vec<u8> = {
+            let mut bytes = Vec::with_capacity(20);
+            bytes.push(0x01);
+            bytes.extend_from_slice(&[0x00, 0x00, 0x14]);
+            bytes.push(0x80);
+            bytes.extend_from_slice(&[0x00, 0x01, 0x18]);
+            bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            bytes.extend_from_slice(&[0, 0, 0, 0x33]);
+            bytes.extend_from_slice(&[0, 0, 0, 0x44]);
+            bytes
+        };
+        let garbage: Vec<u8> = vec![0x02, 0x00, 0x00, 0x14, 0, 0, 0, 0]; // version=2 → invalide
+
+        let mut bytes = Vec::with_capacity(28);
+        bytes.extend_from_slice(&dwr);
+        bytes.extend_from_slice(&garbage);
+
+        let in_ = input(&bytes, &p, &t, &key, "MME", "HSS");
+        let out = DiameterDecoder.decode(&in_);
+
+        assert_eq!(out.status, DecodeStatus::Malformed);
+        assert_eq!(out.events.len(), 2);
+        assert_eq!(out.events[0].decoding_status, DecodeStatus::Decoded);
+        assert_eq!(out.events[1].decoding_status, DecodeStatus::Malformed);
+        assert_eq!(out.events[0].packet_references[0].byte_offset, 0);
+        assert_eq!(out.events[1].packet_references[0].byte_offset, 20);
     }
 
     /// 2.9.14 : en-tête trop court (< 20 octets) → fallback
