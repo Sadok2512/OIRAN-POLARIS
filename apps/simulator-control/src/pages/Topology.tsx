@@ -69,7 +69,23 @@ export function nfPillState(
   nfKey: string,
   observed: WireLabObserved | undefined,
 ): NfPillState {
-  const explicit = observed?.nfs?.[nfKey];
+  // 0.13.4 (ANR1 #10 6740653880) : accepte la forme TABLEAU
+  // publiée par polaris-control-api 0.29.16/0.30.0 ainsi que
+  // la forme MAP historique.
+  const nfs = observed?.nfs;
+  let explicit: WireContainerStatus | undefined;
+  if (Array.isArray(nfs)) {
+    const entry = nfs.find((e) => e.nf === nfKey);
+    if (entry && entry.process_state && entry.health) {
+      explicit = {
+        process_state: entry.process_state,
+        health: entry.health,
+        observed: entry.observed ?? false,
+      };
+    }
+  } else if (nfs) {
+    explicit = nfs[nfKey];
+  }
   const aggregate = observed?.open5gs;
   const container: WireContainerStatus | undefined =
     explicit ?? (nfKey === 'AMF' ? aggregate : undefined);

@@ -67,13 +67,40 @@ export function aggregate(states: HealthState[]): HealthState {
  * 0.13.3 : scinde une map `observed.nfs` en deux agrégats
  * `(core, ims)`. Fonction pure, testable sans react-query —
  * utilisée par `useLabTopbarState` et par les tests unitaires.
+ *
+ * 0.13.4 (ANR1 #10 6740653880) : accepte DEUX formes de wire :
+ *   * **Tableau** `WireNfObservation[]` — forme émise par
+ *     polaris-control-api 0.29.16/0.30.0 en production
+ *     (`apps/api/src/lib.rs::network_function_observation`).
+ *     Chaque entrée porte son `nf` (AMF, SMF, …, Kamailio,
+ *     RTPengine), utilisé pour router vers `core` ou `ims`.
+ *   * **Map** `Record<name, status>` — forme historique 0.7.0,
+ *     conservée pour tolérance aux backends anciens ou simulés.
+ *
+ * ANR1 a prouvé que le passage array→map en 0.13.3 cassait le
+ * routage : `Object.entries` renvoyait des clés `"0".."11"`
+ * (indices de tableau) → `CORE_5GC_NFS.has("0".toUpperCase())`
+ * jamais vrai → tout tombait en `imsHealth` et coreHealth
+ * restait `unknown`.
  */
 export function splitCoreAndIms(
-  nfs: Record<string, { process_state?: string }>,
+  nfs:
+    | Record<string, { process_state?: string }>
+    | ReadonlyArray<{ nf?: string; process_state?: string }>,
 ): { core: HealthState; ims: HealthState } {
   const coreStates: HealthState[] = [];
   const imsStates: HealthState[] = [];
-  for (const [name, status] of Object.entries(nfs)) {
+  const entries: Array<[string, { process_state?: string }]> = Array.isArray(nfs)
+    ? nfs.map((entry) => [entry.nf ?? '', entry])
+    : Object.entries(nfs);
+  for (const [name, status] of entries) {
+    if (!name) {
+      // Ligne sans `nf` : impossible de router. On la place en
+      // IMS par défaut (fail-closed sur le cœur 5G — on ne
+      // marque PAS le cœur "offline" sur une entrée anonyme).
+      imsStates.push(toHealth(status.process_state));
+      continue;
+    }
     const state = toHealth(status.process_state);
     if (CORE_5GC_NFS.has(name.toUpperCase())) {
       coreStates.push(state);
@@ -94,7 +121,12 @@ export function useLabTopbarState(): LabTopbarState {
 
   let coreHealth: HealthState = 'unknown';
   let imsHealth: HealthState = 'unknown';
-  if (nfs) {
+  const hasNfs = nfs
+    ? Array.isArray(nfs)
+      ? nfs.length > 0
+      : Object.keys(nfs).length > 0
+    : false;
+  if (hasNfs && nfs) {
     const split = splitCoreAndIms(nfs);
     coreHealth = split.core;
     imsHealth = split.ims;

@@ -63,6 +63,25 @@ export interface WireContainerStatus {
   health: string;
   observed: boolean;
 }
+
+/**
+ * 0.13.4 (ANR1 #10 6740653880) — forme réelle du tableau
+ * `observed.nfs` publié par polaris-control-api 0.29.16/0.30.0
+ * (`apps/api/src/lib.rs::network_function_observation`). Chaque
+ * entrée carry son nom canonique dans `nf` (AMF, SMF, …,
+ * Kamailio, RTPengine). La 0.13.3 présupposait une MAP
+ * `Record<name, status>` et perdait les noms via les clés `"0"
+ * ... "11"` quand l'API émettait un tableau → `coreHealth=unknown`.
+ */
+export interface WireNfObservation {
+  nf: string;
+  container?: string;
+  process_state?: string;
+  health?: string;
+  observed_at?: number;
+  observed?: boolean;
+}
+
 export interface WireLabObserved {
   ueransim_ue_profile?: boolean;
   ueransim_profile?: string;
@@ -73,8 +92,14 @@ export interface WireLabObserved {
    * same WireContainerStatus shape as `open5gs`. When the backend omits
    * it, the Topology page falls back to the aggregated `open5gs`
    * container and marks every other NF as "not exposed".
+   *
+   * 0.13.4 : accepte DÉSORMAIS aussi la forme réelle en tableau
+   * (`WireNfObservation[]`) que l'API 0.29.16/0.30.0 sérialise
+   * côté production. Le splitter `splitCoreAndIms` normalise les
+   * deux formes vers un Map `(nf-name → process_state)` avant
+   * agrégation.
    */
-  nfs?: Record<string, WireContainerStatus>;
+  nfs?: Record<string, WireContainerStatus> | WireNfObservation[];
   ueransim_gnb?: WireContainerStatus;
   ueransim_ue?: WireContainerStatus;
   srsran_enb?: WireContainerStatus;

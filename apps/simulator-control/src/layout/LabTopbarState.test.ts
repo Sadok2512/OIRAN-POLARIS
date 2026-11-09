@@ -114,3 +114,64 @@ describe('splitCoreAndIms — ANR1 #9 6737560904 real shape', () => {
     expect(ims).toBe('unknown');
   });
 });
+
+// 0.13.4 (ANR1 #10 6740653880) — forme TABLEAU émise par
+// polaris-control-api 0.29.16 et 0.30.0 en production.
+// `apps/api/src/lib.rs::network_function_observation` sérialise
+// chaque NF comme un objet `{nf, container, process_state, …}`
+// et `GET /lab` publie `observed.nfs: Array<...>`. La 0.13.3
+// présupposait une MAP ; `Object.entries` ne lui livrait que des
+// clés `"0".."11"` → coreHealth=unknown systématique.
+import realApiLabResponse from './fixtures/polaris-api-0.29.16-lab-real-array.json';
+import type { WireNfObservation } from '@/data/queries';
+
+describe('splitCoreAndIms — forme ARRAY réelle API 0.29.16/0.30.0', () => {
+  it('route les 10 NFs 5GC vers core et Kamailio/RTPengine vers ims sur le payload RÉEL ANR1', () => {
+    const nfs = realApiLabResponse.observed.nfs as unknown as WireNfObservation[];
+    // Prouve que c'est bien un tableau à l'ingestion (prévient
+    // tout drift silencieux de la fixture).
+    expect(Array.isArray(nfs)).toBe(true);
+    expect(nfs.length).toBe(12);
+    // Prouve que Object.entries sur un tableau donnait bien
+    // `"0".."11"` — c'est la cause racine ANR1.
+    const naiveKeys = Object.entries(nfs).map(([k]) => k);
+    expect(naiveKeys).toEqual([
+      '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11',
+    ]);
+
+    // Résultat attendu par ANR1 : core=healthy, ims=offline.
+    const { core, ims } = splitCoreAndIms(nfs);
+    expect(core).toBe('healthy');
+    expect(ims).toBe('offline');
+  });
+
+  it('accepte aussi la forme MAP historique (tolérance arrière)', () => {
+    const map: Record<string, { process_state: string }> = {};
+    for (const entry of realApiLabResponse.observed.nfs as unknown as WireNfObservation[]) {
+      map[entry.nf as string] = { process_state: entry.process_state as string };
+    }
+    const { core, ims } = splitCoreAndIms(map);
+    expect(core).toBe('healthy');
+    expect(ims).toBe('offline');
+  });
+
+  it('ligne sans nf tombe en IMS sans faire basculer le cœur', () => {
+    const nfs: WireNfObservation[] = [
+      { nf: 'AMF', process_state: 'running' },
+      { nf: 'SMF', process_state: 'running' },
+      { nf: 'UPF', process_state: 'running' },
+      { nf: 'NRF', process_state: 'running' },
+      { nf: 'AUSF', process_state: 'running' },
+      { nf: 'UDM', process_state: 'running' },
+      { nf: 'UDR', process_state: 'running' },
+      { nf: 'PCF', process_state: 'running' },
+      { nf: 'NSSF', process_state: 'running' },
+      { nf: 'BSF', process_state: 'running' },
+      // entrée anonyme — ne doit PAS marquer le cœur offline.
+      { process_state: 'exited' } as WireNfObservation,
+    ];
+    const { core, ims } = splitCoreAndIms(nfs);
+    expect(core).toBe('healthy');
+    expect(ims).toBe('offline');
+  });
+});

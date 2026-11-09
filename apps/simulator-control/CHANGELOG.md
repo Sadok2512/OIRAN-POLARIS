@@ -3,6 +3,63 @@
 Format: SemVer. Pre-1.0 releases are allowed to introduce backward-incompatible
 UI-level changes between minor versions.
 
+## 0.13.4 — 2026-11-09 (patch) — nfs peut être un TABLEAU (forme réelle API 0.29.16/0.30.0)
+
+Rebased on `518b649` (0.13.3). `git merge-base --is-ancestor 518b649
+HEAD` → true.
+
+ANR1 (#10 comment 6740653880) a prouvé au pré-vol que la 0.13.3
+produisait `coreHealth=unknown` sur l'API 0.29.16 / 0.30.0 :
+`apps/api/src/lib.rs::network_function_observation` sérialise
+`observed.nfs` comme **tableau** `Array<{nf, container,
+process_state, health, observed_at, observed}>`, pas comme
+map. Avec `Object.entries` sur un tableau, les clés étaient
+`"0"..."11"` (indices) → `CORE_5GC_NFS.has("0".toUpperCase())`
+systématiquement faux → tous les NFs tombaient en IMS et
+coreHealth restait `unknown`.
+
+### Correctif
+
+- `src/data/queries.ts` : nouvelle interface `WireNfObservation`
+  décrit la forme réelle du tableau. `WireLabObserved.nfs`
+  accepte désormais `Record<string, WireContainerStatus> |
+  WireNfObservation[]`.
+- `src/layout/LabTopbarState.ts::splitCoreAndIms` : normalise
+  en interne les deux formes vers une liste `[name, status][]`.
+  Pour un tableau, `name = entry.nf`. Les entrées sans `nf` (cas
+  dégénéré) tombent en IMS sans faire basculer le cœur
+  `offline` — fail-closed sur le signal cœur.
+- `useLabTopbarState` : fallback sur `open5gs` quand `nfs` est
+  un tableau VIDE OU une map vide (`hasNfs` test des deux
+  formes).
+- `src/pages/CoreOpen5gs.tsx::pickContainer` et
+  `src/pages/Topology.tsx::nfPillState` : lookups par
+  `entry.nf` sur tableau, par clé sur map. Compatibilité
+  arrière préservée.
+
+### Test avec fixture RÉELLE
+
+`src/layout/fixtures/polaris-api-0.29.16-lab-real-array.json` —
+capture désidentifiée de `GET /polaris-api/v1/lab` produite
+exactement comme `network_function_observation` les sérialise
+(12 NFs incluant les 10 5GC `running/healthy` + Kamailio +
+RTPengine `exited/not_available`).
+
+3 nouveaux tests dans `LabTopbarState.test.ts` :
+- **Fixture réelle** : parse le tableau, assert
+  `core=healthy, ims=offline`. Prouve aussi que `Object.entries`
+  naïf sur ce tableau produisait les clés `"0".."11"` — la
+  cause racine ANR1.
+- **Forme MAP historique** : rebuilt depuis la même fixture,
+  `core=healthy, ims=offline` identique (tolérance arrière).
+- **Entrée anonyme** (`nf` absent) : tombe en IMS, cœur
+  préservé.
+
+### Build + `/simulator/` préservée
+
+Base `/simulator/` inchangée depuis 0.13.2 (Pillar 3). Build
+OK, 227 tests PASS (224 précédents + 3 nouveaux 0.13.4).
+
 ## 0.13.3 — 2026-11-09 (patch) — Core health séparé de l'IMS
 
 Rebased on `18b6392` (0.13.2). `git merge-base --is-ancestor 18b6392

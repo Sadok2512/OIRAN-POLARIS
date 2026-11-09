@@ -1,0 +1,133 @@
+{
+  "source": "READ_ONLY_HOST_AUDIT",
+  "configuration_changed": false,
+  "observed": {
+    "ueransim_ue_profile": true,
+    "ueransim_profile": "ue.yaml",
+    "open5gs": {
+      "process_state": "running",
+      "health": "healthy",
+      "observed": true
+    },
+    "ueransim_gnb": {
+      "process_state": "running",
+      "health": "healthy",
+      "observed": true
+    },
+    "ueransim_ue": {
+      "process_state": "running",
+      "health": "healthy",
+      "observed": true
+    },
+    "srsran_enb": {
+      "process_state": "not_running",
+      "health": "not_available",
+      "observed": false
+    },
+    "srsran_ue": {
+      "process_state": "not_running",
+      "health": "not_available",
+      "observed": false
+    },
+    "nfs": [
+      {
+        "nf": "AMF",
+        "container": "oiran-lab-amf-1",
+        "process_state": "running",
+        "health": "healthy",
+        "observed_at": 1794213600,
+        "observed": true
+      },
+      {
+        "nf": "SMF",
+        "container": "oiran-lab-smf-1",
+        "process_state": "running",
+        "health": "healthy",
+        "observed_at": 1794213600,
+        "observed": true
+      },
+      {
+        "nf": "UPF",
+        "container": "oiran-lab-upf-1",
+        "process_state": "running",
+        "health": "healthy",
+        "observed_at": 1794213600,
+        "observed": true
+      },
+      {
+        "nf": "NRF",
+        "container": "oiran-lab-nrf-1",
+        "process_state": "running",
+        "health": "healthy",
+        "observed_at": 1794213600,
+        "observed": true
+      },
+      {
+        "nf": "AUSF",
+        "container": "oiran-lab-ausf-1",
+        "process_state": "running",
+        "health": "healthy",
+        "observed_at": 1794213600,
+        "observed": true
+      },
+      {
+        "nf": "UDM",
+        "container": "oiran-lab-udm-1",
+        "process_state": "running",
+        "health": "healthy",
+        "observed_at": 1794213600,
+        "observed": true
+      },
+      {
+        "nf": "UDR",
+        "container": "oiran-lab-udr-1",
+        "process_state": "running",
+        "health": "healthy",
+        "observed_at": 1794213600,
+        "observed": true
+      },
+      {
+        "nf": "PCF",
+        "container": "oiran-lab-pcf-1",
+        "process_state": "running",
+        "health": "healthy",
+        "observed_at": 1794213600,
+        "observed": true
+      },
+      {
+        "nf": "NSSF",
+        "container": "oiran-lab-nssf-1",
+        "process_state": "running",
+        "health": "healthy",
+        "observed_at": 1794213600,
+        "observed": true
+      },
+      {
+        "nf": "BSF",
+        "container": "oiran-lab-bsf-1",
+        "process_state": "running",
+        "health": "healthy",
+        "observed_at": 1794213600,
+        "observed": true
+      },
+      {
+        "nf": "Kamailio",
+        "container": "oiran-ims-lite-ims-lite-proxy-1",
+        "process_state": "exited",
+        "health": "not_available",
+        "observed_at": 1794213600,
+        "observed": true
+      },
+      {
+        "nf": "RTPengine",
+        "container": "oiran-ims-lite-rtpengine-1",
+        "process_state": "exited",
+        "health": "not_available",
+        "observed_at": 1794213600,
+        "observed": true
+      }
+    ],
+    "lte_attach": "UNKNOWN",
+    "controller_owned_active_jobs": 0
+  }
+}

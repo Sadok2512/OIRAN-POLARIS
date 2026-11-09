@@ -356,7 +356,25 @@ function pickContainer(
   nfKey: string,
   observed: WireLabObserved | undefined,
 ): WireContainerStatus | undefined {
-  const explicit = observed?.nfs?.[nfKey];
+  // 0.13.4 (ANR1 #10 6740653880) : `observed.nfs` peut être
+  // soit un tableau (forme API 0.29.16/0.30.0), soit une map
+  // (forme historique). Les deux sont indexées par le nom
+  // canonique du NF ; en array, c'est le champ `nf` de chaque
+  // entrée.
+  const nfs = observed?.nfs;
+  let explicit: WireContainerStatus | undefined;
+  if (Array.isArray(nfs)) {
+    const entry = nfs.find((e) => e.nf === nfKey);
+    if (entry && entry.process_state && entry.health) {
+      explicit = {
+        process_state: entry.process_state,
+        health: entry.health,
+        observed: entry.observed ?? false,
+      };
+    }
+  } else if (nfs) {
+    explicit = nfs[nfKey];
+  }
   if (explicit) return explicit;
   if (nfKey === 'AMF') return observed?.open5gs;
   return undefined;
