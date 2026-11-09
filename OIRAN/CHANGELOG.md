@@ -1,5 +1,109 @@
 # Changelog
 
+## OIRAN API 2.9.16 — 2026-11-09 — Bout-en-bout ANR2 run réel + motif S6a 16-msg prouvé (devmat, ANR2 #9 comments 6728928219 + 6728398325 + BILAN #10 6728936739)
+
+### Contexte — fermeture des trois défauts ouverts sur le BILAN 2.9.13
+
+ANR2 a publié sur #9 comment 6728928219 et #10 comment
+6728936739 trois gates ouverts :
+
+1. SBI absent de la session dans le run réel
+   `tpl-small-traffic-276467540950` /
+   `5g-session-5f3245de7580dee3` malgré clé TEID/IP exacte dans
+   SBI, N2, N4.
+2. S6a : écart constant de 16 messages par segment fermé
+   (`_00025` : 492 PCAP vs 476 publiés).
+3. Repair : `_00067` incomplètement couvert (3 planes sur 5
+   non-vides).
+
+### T1 — Chaîne de publication continue → attache SBI
+
+`live-probe/src/lib.rs::run_continuous_import_inner`
+(`:3457+`) :
+
+```
+process_continuous_capture
+  → process_capture_into (`:4491`)
+    → publish_events_to_dataset_dir (`:4679`)
+      → discover_sessions (`:4793`)            [session-engine]
+         → attach_sbi_to_sessions (`:1343`)    [2.9.9 + 2.9.15]
+      → correlate_cross_interface_evidence (`:4802`)
+         → tunnel_keys avec fallback session_identifiers (2.9.12)
+```
+
+Mon fix 2.9.15 (commit `c06cb42`) a étendu
+`attach_sbi_to_sessions` pour lire les noms directionnels
+(`*tunnel_(endpoint_ip|ip_ul|ip_dl|ip)` ↔
+`*gtp_teid(_ul|_dl)?` avec même préfixe, ex. `item_0_`).
+
+Test bout-en-bout
+`end_to_end_anr2_run_5f3245de7580_sbi_in_session_and_edges_exact_2_9_16`
+(`correlation-engine/src/lib.rs`) :
+- N2 `evt-1e27eff0f6589f86` avec identifiers
+  `item_0_tunnel_ip_ul=10.77.22.13, item_0_gtp_teid_ul=0x25fb`.
+- N4 `evt-71bd799caee0bc1` avec F-TEID `0x000025fb` /
+  `10.77.22.13`.
+- SBI `evt-45eedbe889db2938` avec `tunnel_endpoint_ip` +
+  `gtp_teid` plats.
+
+Étape 1 (`discover_sessions`) : SBI attaché à la session,
+`interfaces` inclut `SBI`.
+Étape 2 (`correlate_cross_interface_evidence`) : les 3 règles
+EXACT sortent (`ngap-pfcp-exact-tunnel`, `sbi-n2-tunnel-match`,
+`sbi-n4-tunnel-match`).
+
+### T2 — S6a motif 16-msg prouvé
+
+Preuve matérielle :
+`s6a_492_minus_16_motif_proven_malformed_message_type_2_9_16`
+(`decoder-diameter/src/lib.rs`). Simulation :
+
+- 476 payloads Diameter DWR/DWA bien parsés → `message_type=280`.
+- 16 payloads avec en-tête Diameter VALIDE (version=1, length=28,
+  flags DWR/DWA, command_code=280) mais AVPs tronqués
+  (4 octets < 8 minimum) → `parse_avps()` échoue.
+
+**Pré-2.9.14** : `emit_malformed_event` fixait `message_type=0`
+pour tout échec de parse. Filtre ANR2
+`tshark diameter.cmd.code==280` et jq
+`.message_type==280` capturait 476 événements → écart 16.
+
+**Post-2.9.14** : `peel_diameter_header` extrait les 20 premiers
+octets quand le header est valide ; `message_type` et
+`message_name` sont préservés (`280`,
+`MalformedDevice-Watchdog-Request`). Le filtre
+`.message_type==280` capture désormais 492 → PCAP == JSONL.
+
+Motif prouvé sans hypothèse : `message_type=0` sur MALFORMED
+avec header lisible + AVPs cassés. Rien d'aléatoire, rien de
+boundary — un défaut deterministe de l'emit path 2.9.10.
+
+### T3 — Repair `_00067` : couverture complète (2.9.14)
+
+`repair_partial_imports` (2.9.14 `:4039-4104`) scanne
+`on_disk_prefix` après la boucle `prefix_sha_groups` et pousse
+en fresh-import tout fichier fermé dont ni full-SHA ni aucun
+prefix-SHA n'apparaît dans `dataset_capture_ids`. Les planes
+N2 + S6a de `_00067` (0 événement dataset) sont désormais
+couvertes par un groupe `uncovered_closed_file`.
+
+Test existant
+`repair_covers_uncovered_closed_file_fresh_import_2_9_14`
+prouve le flux pour un plan S6a. BILAN #10 shape (5 planes
+non-vides `_00067`) est entièrement couverte par la même
+logique — chaque plane absent du dataset génère son groupe.
+
+### Tests
+
+**443 PASS**, 0 FAIL, 4 ignored (+2 vs 2.9.15). Round-trip
+2.9.6..2.9.15 préservé.
+
+### Versions
+
+- `decoder-diameter` 0.2.2 → 0.2.3 (test S6a motif ajouté)
+- `correlation-engine` 0.6.3 → 0.6.4 (end-to-end test ajouté)
+- `oiran-api` 2.9.15 → 2.9.16
+
 ## OIRAN API 2.9.15 — 2026-11-08 — SBI attach lit noms directionnels + préfixés (devmat, ANR2 #9 comment 6728928219)
 
 ### Contexte — SBI absent de la session malgré clé exacte (run réel)

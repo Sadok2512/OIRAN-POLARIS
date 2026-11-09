@@ -1963,6 +1963,121 @@ mod tests {
         );
     }
 
+    /// 2.9.16 (#9 comment 6728928219) — Replay bout-en-bout sur le
+    /// run ANR2 `tpl-small-traffic-276467540950` / session
+    /// `5g-session-5f3245de7580dee3`. Prouve que les deux étapes
+    /// du chemin continu de publication fonctionnent :
+    ///   1. `session-engine::discover_sessions` (appelée par
+    ///      `live-probe::publish_events_to_dataset_dir` au
+    ///      `:4793`) invoque `attach_sbi_to_sessions`
+    ///      (`session-engine:1343`) qui lit les `item_0_*`
+    ///      directional et rattache le SBI à la bonne PDU
+    ///      session.
+    ///   2. `correlate_cross_interface_evidence` (invoquée
+    ///      également dans `publish_events_to_dataset_dir`
+    ///      au `:4802`) extrait la clé TEID/IP depuis les
+    ///      session_identifiers SBI via le fallback 2.9.12
+    ///      (`tunnel_keys :570-594`), et émet SBI↔N2 +
+    ///      SBI↔N4 EXACT.
+    ///
+    /// Test construit avec les event_ids RÉELS d'ANR2 :
+    /// `evt-45eedbe889db2938` (SBI), `evt-1e27eff0f6589f86` (N2),
+    /// `evt-71bd799caee0bc1` (N4). Le N2 publie son tuple sous
+    /// `item_0_tunnel_ip_ul` + `item_0_gtp_teid_ul` (préfixe
+    /// item_0_ + suffixe directional) — shape wire-réel.
+    #[test]
+    fn end_to_end_anr2_run_5f3245de7580_sbi_in_session_and_edges_exact_2_9_16() {
+        // N2 avec les noms RÉELS ANR2.
+        let n2 = e(
+            "evt-1e27eff0f6589f86",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            1,
+            &[
+                ("ran_ue_ngap_id", "4"),
+                ("amf_ue_ngap_id", "73"),
+                ("pdu_session_id", "1"),
+                ("item_0_tunnel_ip_ul", "10.77.22.13"),
+                ("item_0_gtp_teid_ul", "0x25fb"),
+            ],
+            json!([
+                {"name":"UL NG-U UP TNL Information",
+                 "value":"item_0_tunnel_ip_ul=10.77.22.13,item_0_gtp_teid_ul=0x25fb"}
+            ]),
+        );
+        let n2_resp = e(
+            "evt-n2-resp",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupResponse",
+            2,
+            &[
+                ("ran_ue_ngap_id", "4"),
+                ("amf_ue_ngap_id", "73"),
+                ("pdu_session_id", "1"),
+            ],
+            json!([]),
+        );
+        let n4 = e(
+            "evt-71bd799caee0bc1",
+            "N4",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            3,
+            &[("pfcp_sequence", "1")],
+            json!([
+                {"name":"F-TEID",
+                 "value":"teid=0x000025fb,v4=true,v6=false,ipv4=10.77.22.13"}
+            ]),
+        );
+        let sbi = e(
+            "evt-45eedbe889db2938",
+            "SBI",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            4,
+            &[
+                ("pdu_session_id", "1"),
+                ("tunnel_endpoint_ip", "10.77.22.13"),
+                ("gtp_teid", "0x25fb"),
+            ],
+            json!([]),
+        );
+
+        // ÉTAPE 1 : discover_sessions attache le SBI à la PDU session.
+        let events = vec![n2.clone(), n2_resp.clone(), n4.clone(), sbi.clone()];
+        let discovery = discover_sessions(&mut events.clone());
+        assert_eq!(discovery.pdu_sessions.len(), 1, "une PDU session");
+        let session = &discovery.pdu_sessions[0];
+        assert!(
+            session.event_ids.iter().any(|id| id == "evt-45eedbe889db2938"),
+            "SBI evt-45eedbe889db2938 doit être attaché via item_0_* ; event_ids={:?}",
+            session.event_ids
+        );
+        assert!(
+            session.interfaces.iter().any(|i| i == "SBI"),
+            "SBI doit apparaître dans session.interfaces ; got={:?}",
+            session.interfaces
+        );
+
+        // ÉTAPE 2 : correlate_cross_interface_evidence émet les bords.
+        let edges = correlate_cross_interface_evidence(&events);
+        let rules: Vec<&str> = edges.iter().map(|e| e.rule_id.as_str()).collect();
+        assert!(
+            rules.contains(&"ngap-pfcp-exact-tunnel"),
+            "N2↔N4 EXACT ; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"sbi-n2-tunnel-match"),
+            "SBI↔N2 EXACT ; rules={rules:?}"
+        );
+        assert!(
+            rules.contains(&"sbi-n4-tunnel-match"),
+            "SBI↔N4 EXACT ; rules={rules:?}"
+        );
+    }
+
     /// 2.9.12 (#9 comment 6727624063) — ANR2 a prouvé sur le run
     /// POLARIS `tpl-small-traffic-d64ae14da40f` que le SBI
     /// `N1N2MessageTransfer` publie son tuple `(tunnel_endpoint_ip,

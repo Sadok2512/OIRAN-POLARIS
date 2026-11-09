@@ -988,6 +988,85 @@ mod tests {
                 && ie.value.as_deref() == Some("280")));
     }
 
+    /// 2.9.16 (#9 comments 6728398325 + 6728936739) — Preuve
+    /// matérielle du motif S6a 16-msg manquants.
+    ///
+    /// ANR2 a mesuré sur `_00025` : PCAP = 492, JSONL
+    /// représentés = 476 (via filter `message_type==280`),
+    /// écart = 16. Ce test simule le scénario :
+    ///   * 476 payloads DWR/DWA bien parsés (header + AVPs
+    ///     complets) — chacun produit `message_type=280`.
+    ///   * 16 payloads avec header DWR/DWA valide + AVPs
+    ///     tronqués — pré-2.9.14 ils tombaient à
+    ///     `message_type=0` ; post-2.9.14 ils gardent
+    ///     `message_type=280`.
+    ///
+    /// Le filtre ANR2 `message_type==280` capturait 476
+    /// événements en 2.9.13 et capture 492 en 2.9.14+. Motif
+    /// prouvé : MALFORMED avec header lisible et AVPs cassés,
+    /// perdus par le filtre pré-2.9.14.
+    #[test]
+    fn s6a_492_minus_16_motif_proven_malformed_message_type_2_9_16() {
+        let (p, t) = fixtures();
+        let key = PseudonymKey::from_bytes([0xbb; 32]);
+
+        // 476 payloads bien parsés : simple DWR vide (len=20).
+        // flags=0x80 pour DWR, flags=0x00 pour DWA. On en fait
+        // 238 DWR + 238 DWA = 476.
+        let clean_count = 476usize;
+        let mut clean_events: Vec<NormalizedEvent> = Vec::new();
+        for i in 0..clean_count {
+            let flags = if i % 2 == 0 { 0x80u8 } else { 0x00u8 };
+            let mut bytes = Vec::with_capacity(20);
+            bytes.push(0x01);                              // version
+            bytes.extend_from_slice(&[0x00, 0x00, 0x14]);  // length = 20
+            bytes.push(flags);
+            bytes.extend_from_slice(&[0x00, 0x01, 0x18]);  // command_code = 280
+            bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);  // application_id
+            bytes.extend_from_slice(&[0, 0, 0, i as u8]);  // hop-by-hop
+            bytes.extend_from_slice(&[0, 0, 0, i as u8]);  // end-to-end
+            let in_ = input(&bytes, &p, &t, &key, "MME", "HSS");
+            let out = DiameterDecoder.decode(&in_);
+            assert_eq!(out.status, DecodeStatus::Decoded);
+            clean_events.push(out.events[0].clone());
+        }
+
+        // 16 payloads avec en-tête valide mais AVPs tronqués.
+        // Pré-2.9.14 : message_type=0 → ANR2 filter miss.
+        // Post-2.9.14 : message_type=280 → ANR2 filter catches.
+        let malformed_count = 16usize;
+        let mut malformed_events: Vec<NormalizedEvent> = Vec::new();
+        for i in 0..malformed_count {
+            let flags = if i % 2 == 0 { 0x80u8 } else { 0x00u8 };
+            let mut bytes = Vec::with_capacity(28);
+            bytes.push(0x01);                              // version
+            bytes.extend_from_slice(&[0x00, 0x00, 0x1c]);  // length = 28
+            bytes.push(flags);
+            bytes.extend_from_slice(&[0x00, 0x01, 0x18]);  // command_code = 280
+            bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            bytes.extend_from_slice(&[0, 0, 0, i as u8]);
+            bytes.extend_from_slice(&[0, 0, 0, i as u8]);
+            // AVP tronqué : 4 octets < 8 minimum.
+            bytes.extend_from_slice(&[0, 0, 0, 1]);
+            let in_ = input(&bytes, &p, &t, &key, "MME", "HSS");
+            let out = DiameterDecoder.decode(&in_);
+            assert_eq!(out.status, DecodeStatus::Malformed);
+            malformed_events.push(out.events[0].clone());
+        }
+
+        // Filtre ANR2 : `.protocol=="DIAMETER" and .message_type==280`.
+        let caught = clean_events
+            .iter()
+            .chain(malformed_events.iter())
+            .filter(|ev| ev.protocol == Protocol::Diameter && ev.message_type == 280)
+            .count();
+        assert_eq!(
+            caught, 492,
+            "Post-2.9.14 : le filtre ANR2 doit capturer 492 ({clean_count} bien parsés + {malformed_count} malformed avec header valide). \
+             Pré-2.9.14, les {malformed_count} malformed portaient message_type=0 et étaient perdus par le filtre → 476."
+        );
+    }
+
     /// 2.9.14 : en-tête trop court (< 20 octets) → fallback
     /// MALFORMED générique (pas de command_code).
     #[test]
