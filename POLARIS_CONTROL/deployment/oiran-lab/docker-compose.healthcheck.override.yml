@@ -1,0 +1,62 @@
+# POLARIS deployment overlay — SCTP readiness healthchecks + startup ordering.
+#
+# ANR1 preuve (#10 comment 6737561274, 2026-11-09T10:16Z) :
+#   compose/docker-compose.oiran-lab.yml:3-15 applique `restart:
+#   unless-stopped` mais le healthcheck commun est `kill -0 1`, qui
+#   ne prouve PAS la disponibilité du socket SCTP NGAP/S1AP. Au
+#   boot 2026-11-07 le gNB a tenté SCTP à 21:38:51.372Z et reçu
+#   `Connection refused` à 21:38:51.435Z, l'AMF n'écoutant 38412
+#   qu'à 21:38:51.495Z. UERANSIM ne retente pas (task.cpp:211-219).
+#
+# Overlay 0.13.3 (# POLARIS B, aucune application serveur) :
+#   * AMF  — healthcheck readiness SCTP 38412 via `ss -S -H -l -n`.
+#   * MME  — même règle sur 36412.
+#   * gNB  — `depends_on: amf (service_healthy)`.
+#   * srsENB — `depends_on: mme (service_healthy)`.
+#
+# Déploiement :
+#   docker compose \
+#     -f /root/POLARIS/compose/docker-compose.oiran-lab.yml \
+#     -f /root/POLARIS/compose/docker-compose.healthcheck.override.yml \
+#     up -d
+#
+# Pas de redémarrage automatique sur le serveur — l'opérateur
+# applique l'overlay après validation.
+services:
+  amf:
+    healthcheck:
+      # SCTP readiness: bind + listen sur 38412 détecté dans l'espace
+      # réseau du conteneur. `ss -S -H -l -n` liste les sockets SCTP
+      # listening sans en-tête ni résolution DNS ; `grep -qE`
+      # retourne 0 iff une ligne contient `:38412\b`.
+      test:
+        - "CMD-SHELL"
+        - "ss -S -H -l -n 2>/dev/null | grep -qE ':38412\\b'"
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+  mme:
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "ss -S -H -l -n 2>/dev/null | grep -qE ':36412\\b'"
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+  gnb:
+    # ANR1 preuve : sans ce depends_on, UERANSIM lance NG Setup
+    # avant que l'AMF ait bind 38412 et perd l'association sans
+    # retry. Avec `service_healthy`, Docker Compose attend que le
+    # healthcheck AMF ci-dessus passe avant de démarrer le gNB.
+    depends_on:
+      amf:
+        condition: service_healthy
+
+  srsenb:
+    depends_on:
+      mme:
+        condition: service_healthy
