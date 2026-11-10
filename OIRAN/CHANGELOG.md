@@ -1,5 +1,126 @@
 # Changelog
 
+## OIRAN API 2.10.2 — 2026-11-10 — instrumentation anon-RSS par phase + publication bornée (devmat, ANR2 #9 comments 6765365357 + 6765466589)
+
+Patch ciblant **la cause OOM localisée par ANR2** : la mémoire fautive est **anonyme**, pas cache fichier, et surgit **après** l'écriture du JSONL (`CONTINUOUS_IMPORT_SEEN_IDS phase=after-merge`) et **avant** le manifeste. Cible : la sous-étape à l'intérieur de `publish_events_to_dataset_dir` — redécouverte des sessions, corrélation, construction des plans de session, génération des call-flows.
+
+### 1. Instrumentation anon-RSS par phase (toujours activée)
+
+- `trace_publication_rss(phase, indexed_events)` **n'est plus gated** derrière `OIRAN_PUBLICATION_RSS_TRACE`. ANR2 n'a plus besoin de setter l'env var pour voir la ventilation : les traces sortent sur `stderr` à chaque passe, dans le journal systemd par défaut.
+- Nouveau format de ligne unique :
+  ```text
+  PUBLICATION_RSS_TRACE phase=<NN-name> indexed_events=<N>
+    anon_kb=<N> file_kb=<N> vmrss_kb=<N> vmhwm_kb=<N> vmpeak_kb=<N>
+  ```
+- `RssAnon` + `RssFile` viennent de `/proc/self/status` — ce sont **exactement** les compteurs que le noyau publie dans `memory.stat` au moment de l'OOM, donc directement comparables aux traces cgroup.
+- Phases numérotées pour agrégation canonique ANR2 :
+
+  | N | phase | mesure attendue sur 1,5 M events |
+  |---|---|---|
+  | 00 | `after-streaming-merge` | anon ≈ 0 (JSONL seulement écrit) |
+  | 01 | `after-streaming-representatives` | anon = représentants compacts (cost dominant si `source_json` non trimé) |
+  | 02 | `after-continuous-activity` | +0 |
+  | 03 | `after-discover-sessions` | +discovery (pdu_sessions + ue_contexts + tunnels) |
+  | 04 | `after-correlate-discovered-tunnels` | +global_edges initiales |
+  | 05 | `after-correlate-cross-interface` | +cross-plane edges |
+  | 06 | `after-fold-overlapping-edges` | ≤ 04+05 (fold dédoublonne) |
+  | 07 | `after-lte-flows-built` | +lte_flows |
+  | 08 | `after-runtime-flows-built` | +runtime_flows |
+  | 09 | `after-events-dropped` | drop(events) → baisse |
+  | 10 | `session-callflow-batch-<i>` | ~constante — 1 session à la fois |
+  | 10a | `after-session-callflows` | fin boucle |
+  | 11 | `after-callflows-loop` | avant manifest |
+  | 12 | `after-manifest-written` | +manifest sérialisé |
+  | 13 | `after-release-pages` | après `malloc_trim` |
+
+### 2. Publication bornée par session (anon O(1) vs sessions)
+
+**Problème pré-2.10.2** (trace locale confirmée sur 200 K events / 400 sessions) : à la phase 10 (`after-session-plans-built`), `anon` montait à **~61 MB** parce que :
+
+- `session_plans: Vec<SessionPlan>` matérialisait **toutes** les sessions simultanément.
+- Chaque `SessionPlan` clonait `Vec<CorrelationEdge>` filtrées pour cette session.
+- Chaque `SessionPlan.ids` était un `BTreeSet<String>` en RAM — la version intermédiaire disk-backed consommait encore `mem_cap` × N sessions en peak car N `SpillingEventIdSet` co-existaient.
+
+**Correction 2.10.2** :
+
+- **Suppression du `Vec<SessionPlan>`** : la boucle de publication construit UNE `SpillingEventIdSet` par session, matérialise la reconstruction+call-flow immédiatement, puis `drop(ids)` **avant** la session suivante. Peak = 1 set × `mem_cap` ≈ 1,5 MiB, pas N sessions × `mem_cap`.
+- **Suppression de `SessionPlan.edges: Vec<CorrelationEdge>`** : les edges pertinentes sont re-filtrées à la volée depuis `global_edges` (CPU O(|edges|) par session, nul en mémoire). Pas de clone global_edges × sessions.
+- **`drop(events)` plus tôt** : juste après `08-after-runtime-flows-built` et AVANT le début de la boucle session. L'ancienne version dropait après la construction des plans, donc `events` + tous les plans co-existaient.
+- **`SpillingEventIdSet` pour les ids de session** : disk-backed via le même primitif que fu3 (`mem_cap` empreintes u64 en RAM, chunks triés sur disque). Chemin : `<dataset_dir>/.publish-staging/session-ids/<idx>/`.
+- Nouveau helper `load_events_by_ids_spilling` : relit le JSONL une fois par session, teste la présence via `SpillingEventIdSet.contains`.
+
+**Bench synthétique après fix** (`./target/release/examples/rss_fu3_bench 200000 500`, vsize 512 MiB) :
+
+```text
+PUBLICATION_RSS_TRACE phase=00-after-streaming-merge                 anon_kb=508   file_kb=3200
+PUBLICATION_RSS_TRACE phase=01-after-streaming-representatives       anon_kb=7360  file_kb=3264
+PUBLICATION_RSS_TRACE phase=02-after-continuous-activity             anon_kb=7360  file_kb=3264
+PUBLICATION_RSS_TRACE phase=03-after-discover-sessions               anon_kb=7360  file_kb=3264
+PUBLICATION_RSS_TRACE phase=04-after-correlate-discovered-tunnels    anon_kb=7360  file_kb=3264
+PUBLICATION_RSS_TRACE phase=05-after-correlate-cross-interface       anon_kb=7360  file_kb=3264
+PUBLICATION_RSS_TRACE phase=06-after-fold-overlapping-edges          anon_kb=7360  file_kb=3264
+PUBLICATION_RSS_TRACE phase=07-after-lte-flows-built                 anon_kb=7360  file_kb=3264
+PUBLICATION_RSS_TRACE phase=08-after-runtime-flows-built             anon_kb=7360  file_kb=3264
+PUBLICATION_RSS_TRACE phase=09-after-events-dropped                  anon_kb=4984  file_kb=3456
+PUBLICATION_RSS_TRACE phase=10-session-callflow-batch-0              anon_kb=4960  file_kb=3460
+PUBLICATION_RSS_TRACE phase=10-session-callflow-batch-1              anon_kb=4960  file_kb=3460
+PUBLICATION_RSS_TRACE phase=10-session-callflow-batch-2              anon_kb=4968  file_kb=3460
+PUBLICATION_RSS_TRACE phase=10-session-callflow-batch-3              anon_kb=4968  file_kb=3460
+PUBLICATION_RSS_TRACE phase=10a-after-session-callflows              anon_kb=4968  file_kb=3460
+PUBLICATION_RSS_TRACE phase=11-after-callflows-loop                  anon_kb=3812  file_kb=3460
+PUBLICATION_RSS_TRACE phase=12-after-manifest-written                anon_kb=5128  file_kb=3460
+PUBLICATION_RSS_TRACE phase=13-after-release-pages                   anon_kb=3792  file_kb=3524
+FU3_RSS verdict vmhwm_mib=10.4 cap_mib=200.0 pass=YES
+```
+
+**VmHWM = 10,4 MiB** sur 200 K events / 400 sessions — **invariance de la boucle session** confirmée (anon ne grimpe pas avec le numéro de batch). Pic reste la phase 01 (représentants compacts) à 7,36 MiB.
+
+### 3. Ce qui reste OUVERT — rollout bloqué jusqu'à preuve en vrai cgroup sur données réelles
+
+**Le bench synthétique n'est PAS une preuve production.** Il prouve que :
+- Le compteur de phase est utilisable par ANR2.
+- La boucle de session est O(1) en sessions (invariance mesurée sur synthetic).
+- Les helpers disk-backed fonctionnent sous tests unit.
+
+**Il ne prouve PAS que** le pic phase 01 (représentants) ou phase 03-05 (discovery+correlation) reste < 1 GB sur une production **1,5 M events / 10 000+ sessions / correlation dense**. Les structures suivantes sont **encore globales** et peuvent exploser hors bench :
+
+- `events: Vec<EventRecord>` (représentants compacts) — scale avec N_unique_semantic_keys.
+- `discovery: DiscoveryResult` (pdu_sessions + ue_contexts + tunnels + unmatched_event_ids).
+- `global_edges: Vec<CorrelationEdge>` — scale avec N_pairs cross-interface.
+
+**Rollout plan** :
+
+1. **2.10.2 lands** le binaire instrumenté. Vérifier les SHA via `sha256sum target/release/oiran-api target/release/examples/rss_fu3_bench`.
+2. **ANR2 relance le fantôme** `systemd-run -p MemoryMax=512M` (ou 1G) avec ce binaire sur le dataset réel 1,5 M events (copie RO comme dans comment 6765466589). **Journaliser `PUBLICATION_RSS_TRACE`** côté `journalctl -u <unit>` tous les phases.
+3. **Si la publication complète** (phases 00→13) — on sait que fu3 + 2.10.2 tiennent. Ajuster `OIRAN_EVENT_ID_SET_MEM_CAP` si besoin.
+4. **Si OOM en phase 01-08** (avant drop events) — c'est la représentation globale qui est le vrai suspect. La 2.10.3+ devra sharder `discover_sessions` / `correlate_*` **par capture** ou par fenêtre de segments, et faire tourner `events` en streaming (pas en Vec).
+5. **Aucune revendication de non-régression RSS production** dans 2.10.2. La cause est localisée ; la mesure fine est maintenant possible ; le prochain correctif se décide sur les traces réelles, pas sur une hypothèse.
+
+### Versions
+
+| crate / package | 2.10.1 | 2.10.2 |
+|---|---|---|
+| `oiran-api` | 2.10.1 | **2.10.2** (patch) |
+| `live-probe` | 0.4.29 | **0.4.30** (patch — trace unconditionnelle + publication session-stream + helpers disk-backed) |
+| `@oiran/web` | 2.10.1 | **2.10.2** (patch — version bump de synchronisation) |
+| `session-engine` | 0.5.5 | 0.5.5 (inchangé) |
+
+### Tests
+
+- `cargo test -p live-probe --lib` : **121 PASS, 0 fail, 5 ignored** — inclut une variante du test de propagation transitive (`session_evidence_expands_transitively_from_n2_through_n4_to_n3`) rejouée sur `SpillingEventIdSet`.
+- `cargo test -p oiran-api --lib` : **63 PASS, 0 fail**.
+- Bench `./target/release/examples/rss_fu3_bench 200000 500` : verdict `vmhwm_mib=10.4 cap_mib=200.0 pass=YES` (synthetic, voir §3 pour les limites).
+
+### Fichiers
+
+- `live-probe/src/lib.rs` :
+  - `trace_publication_rss` : trace unconditionnelle avec `RssAnon` + `RssFile`.
+  - `publish_events_to_dataset_dir` : refactor — drop(events) plus tôt, suppression du `Vec<SessionPlan>` global, boucle session construit+matérialise+drop immédiatement.
+  - `expand_session_evidence_ids_disk` + `load_events_by_ids_spilling` : nouveaux helpers disk-backed. Les anciennes variantes `BTreeSet<String>` + `Vec<EventRecord>` sont supprimées.
+  - 14 nouvelles traces de phase (`00` → `13` + `10-session-callflow-batch-<i>` + `10a-after-session-callflows`).
+
+---
+
 ## OIRAN API 2.10.1 — 2026-11-10 — pagination canonique sans `ts` + retrait du claim mémoire non prouvé (devmat, revue ANR2)
 
 Patch qui corrige **deux points de revue** sur 2.10.0 (`997cabe`). Aucun changement de contrat utilisateur côté UI (le panneau Advanced filters reste identique).

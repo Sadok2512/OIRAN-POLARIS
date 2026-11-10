@@ -4854,7 +4854,7 @@ impl CaptureManager {
     ) -> Result<LiveDataset, String> {
         let events_path = dataset_dir.join("oiran_events.jsonl");
         release_unused_heap_pages();
-        trace_publication_rss("after-streaming-merge", None);
+        trace_publication_rss("00-after-streaming-merge", None);
         // 2.7.24 + 2.9.18-fu3: stream the JSONL into compact
         // semantic representatives + a disk-spilling event-id set.
         // The pré-fu3 `BTreeSet<String>` d'event_ids retenus
@@ -4896,7 +4896,7 @@ impl CaptureManager {
             retained_event_ids.flush_count(),
             retained_event_ids.mem_len(),
         );
-        trace_publication_rss("after-streaming-index", Some(events.len()));
+        trace_publication_rss("01-after-streaming-representatives", Some(events.len()));
         let capture_job = self.get(capture_id);
         // 2.7.28: when restore runs in a manager that never saw the
         // continuous worker start, `capture_job` is None. Fall back to
@@ -4926,12 +4926,13 @@ impl CaptureManager {
             epoch_ms(),
             runtime_evidence.as_deref(),
         );
+        trace_publication_rss("02-after-continuous-activity", Some(events.len()));
         let active_ue_ips = active_pdu_contexts
             .iter()
             .map(|context| context.ue_ip.clone())
             .collect::<Vec<_>>();
         let mut discovery = discover_sessions(&mut events);
-        trace_publication_rss("after-session-discovery", Some(events.len()));
+        trace_publication_rss("03-after-discover-sessions", Some(events.len()));
         discovery
             .event_accounting
             .insert("source_events".into(), event_count);
@@ -4939,7 +4940,9 @@ impl CaptureManager {
             .event_accounting
             .insert("publication_index_events".into(), events.len());
         let mut global_edges = correlate_discovered_tunnels(&events, &discovery);
+        trace_publication_rss("04-after-correlate-discovered-tunnels", Some(events.len()));
         global_edges.extend(correlate_cross_interface_evidence(&events));
+        trace_publication_rss("05-after-correlate-cross-interface", Some(events.len()));
         // 2.7.26 (ANR2 production rollback): two orthogonal rules can
         // compute the same N4↔N3 (or any other) pair from independent
         // evidence paths — in production the audit observed both
@@ -4958,75 +4961,102 @@ impl CaptureManager {
         // order, evidence_type)` and collapses the matching rule_ids
         // into `matched_rules` without losing a single distinct link.
         global_edges = fold_overlapping_edges(global_edges);
-        trace_publication_rss("after-correlation", Some(events.len()));
-        // 2.7.23: materialise LTE + runtime call flows now (they need
-        // the live `events` Vec), build per-PDU-session plans (metadata
-        // only — no event bodies), then drop `events` so the
-        // per-session loop below can reconstruct each call flow with
-        // only that session's events in memory. Peak RSS stops scaling
-        // linearly with `events.len()` once we exit this block.
-        struct SessionPlan {
-            session_id: String,
-            ids: BTreeSet<String>,
-            edges: Vec<CorrelationEdge>,
-            ue_pseudonym: Option<String>,
-        }
-        let session_plans: Vec<SessionPlan> = discovery
-            .pdu_sessions
-            .iter()
-            .map(|session| {
-                let context = discovery
-                    .ue_contexts
-                    .iter()
-                    .find(|context| context.context_id == session.ue_context_id);
-                let mut ids: BTreeSet<String> =
-                    session.event_ids.iter().cloned().collect();
-                if let Some(context) = context {
-                    ids.extend(context.event_ids.iter().cloned());
-                }
-                expand_session_evidence_ids(&mut ids, &global_edges);
-                let edges = global_edges
-                    .iter()
-                    .filter(|edge| {
-                        ids.contains(&edge.source_event_id)
-                            && ids.contains(&edge.target_event_id)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                SessionPlan {
-                    session_id: session.session_id.clone(),
-                    ids,
-                    edges,
-                    ue_pseudonym: context.map(|context| context.pseudonym.clone()),
-                }
-            })
-            .collect();
+        trace_publication_rss("06-after-fold-overlapping-edges", Some(events.len()));
+        // 2.10.2 (devmat, ANR2 #9 comments 6765365357 + 6765466589) :
+        // avant 2.10.2, le pipeline construisait `Vec<SessionPlan>` où chaque
+        // `SessionPlan` clonait `Vec<CorrelationEdge>` + `BTreeSet<String>`
+        // d'event_ids transitifs. Sur 1,5 M events + N sessions × M edges,
+        // ce pic additionnel surimposé à `events` + `discovery` +
+        // `global_edges` + `lte_flows` + `runtime_flows` suffit à dépasser
+        // 1 GB d'anonyme (ANR2 fantôme long : 1,06 GB anon avant
+        // manifeste). Fix 2.10.2 :
+        //   * LTE + runtime flows construits d'abord (ont encore besoin
+        //     de `events`).
+        //   * `drop(events)` AVANT la construction des session plans.
+        //   * `SessionPlan.ids` → `SpillingEventIdSet` disk-backed
+        //     (~1,5 MiB RAM max par session, le reste sur disque sous
+        //     `.publish-staging/session-ids/<idx>/`).
+        //   * `SessionPlan.edges` supprimé : les edges pertinentes sont
+        //     re-filtrées depuis `global_edges` au moment de la boucle
+        //     par session (petit coût CPU, gros gain mémoire).
         let lte_flows: Vec<CallFlow> = offline_lte_callflows(&events)?;
+        trace_publication_rss("07-after-lte-flows-built", Some(events.len()));
         let runtime_flows: Vec<CallFlow> = active_pdu_contexts
             .iter()
             .map(|active| runtime_pdu_callflow(&events, active))
             .collect();
-        trace_publication_rss("after-session-plans", Some(events.len()));
+        trace_publication_rss("08-after-runtime-flows-built", Some(events.len()));
+        let indexed_events_count = events.len();
         drop(events);
         release_unused_heap_pages();
-        trace_publication_rss("after-event-index-drop", None);
+        trace_publication_rss("09-after-events-dropped", None);
+
+        // 2.10.2 : boucle unique qui construit le plan de session,
+        // le matérialise (load events + reconstruct + write
+        // callflow), puis drop IMMÉDIATEMENT la SpillingEventIdSet
+        // avant la prochaine itération. Peak mémoire = 1 seule
+        // SpillingEventIdSet × mem_cap ≈ 1,5 MiB, pas
+        // sessions.len() × mem_cap comme dans la version
+        // intermédiaire pre-review.
+        let session_ids_staging_root = dataset_dir
+            .join(".publish-staging")
+            .join("session-ids");
         let mut session_ids = Vec::new();
-        for plan in session_plans {
-            let selected = load_events_by_ids(&events_path, &plan.ids)?;
+        for (idx, session) in discovery.pdu_sessions.iter().enumerate() {
+            let context = discovery
+                .ue_contexts
+                .iter()
+                .find(|context| context.context_id == session.ue_context_id);
+            let session_ids_tmp = session_ids_staging_root.join(format!("{idx:06}"));
+            let mut ids = SpillingEventIdSet::new(
+                &session_ids_tmp,
+                event_id_set_mem_cap(),
+            )
+            .map_err(display_error)?;
+            for event_id in &session.event_ids {
+                ids.insert(event_id).map_err(display_error)?;
+            }
+            if let Some(context) = context {
+                for event_id in &context.event_ids {
+                    ids.insert(event_id).map_err(display_error)?;
+                }
+            }
+            expand_session_evidence_ids_disk(&mut ids, &global_edges)
+                .map_err(display_error)?;
+            let plan_session_id = session.session_id.clone();
+            let plan_ue_pseudonym =
+                context.map(|context| context.pseudonym.clone());
+
+            let selected = load_events_by_ids_spilling(&events_path, &ids)?;
+            drop(ids); // libère les chunks disque + tmp_dir
+            // 2.10.2 : edges re-filtrées à la volée depuis
+            // `global_edges`. Pas de clone global_edges.len() × sessions.
+            let selected_ids: std::collections::BTreeSet<String> = selected
+                .iter()
+                .map(|event| event.event_id.clone())
+                .collect();
+            let plan_edges: Vec<CorrelationEdge> = global_edges
+                .iter()
+                .filter(|edge| {
+                    selected_ids.contains(&edge.source_event_id)
+                        && selected_ids.contains(&edge.target_event_id)
+                })
+                .cloned()
+                .collect();
             let mut reconstruction = reconstruct(
                 selected,
                 ReconstructionHints {
-                    ue_pseudonym: plan.ue_pseudonym,
+                    ue_pseudonym: plan_ue_pseudonym,
                     ..Default::default()
                 },
             );
-            reconstruction.session_id = plan.session_id.clone();
+            reconstruction.session_id = plan_session_id;
             for event in &reconstruction.events {
                 reconstruction
                     .association
                     .insert(event.event_id.clone(), Association::Session);
             }
-            let flow = build_callflow(&reconstruction, plan.edges);
+            let flow = build_callflow(&reconstruction, plan_edges);
             let json_path = dataset_dir
                 .join("callflows")
                 .join(format!("{}.json", flow.session_id));
@@ -5044,7 +5074,20 @@ impl CaptureManager {
             // of scope at the end of the iteration. Return their pages now so
             // hundreds of sequential sessions do not become retained RSS.
             release_unused_heap_pages();
+            // 2.10.2 : log RSS tous les 100 sessions pour qu'ANR2
+            // puisse observer l'évolution sur une production ~10K
+            // sessions sans spammer le journal.
+            if idx % 100 == 99 {
+                trace_publication_rss(
+                    &format!("10-session-callflow-batch-{}", idx / 100),
+                    Some(indexed_events_count),
+                );
+            }
         }
+        trace_publication_rss(
+            "10a-after-session-callflows",
+            Some(indexed_events_count),
+        );
         for flow in lte_flows {
             let json_path = dataset_dir
                 .join("callflows")
@@ -5156,13 +5199,15 @@ impl CaptureManager {
             active_ue_ips,
             active_pdu_contexts,
         };
+        trace_publication_rss("11-after-callflows-loop", None);
         atomic_write(
             &dataset_dir.join("dataset_manifest.json"),
             &serde_json::to_vec_pretty(&dataset).map_err(|error| error.to_string())?,
         )?;
+        trace_publication_rss("12-after-manifest-written", None);
         validate_dataset_artifacts(&dataset, dataset_dir)?;
         release_unused_heap_pages();
-        trace_publication_rss("after-callflows", None);
+        trace_publication_rss("13-after-release-pages", None);
         Ok(dataset)
     }
 
@@ -7288,21 +7333,72 @@ fn canonical_dedup_merge(
 }
 
 
-fn expand_session_evidence_ids(ids: &mut BTreeSet<String>, edges: &[CorrelationEdge]) {
+/// 2.10.2 (devmat, ANR2 #9 comments 6765365357 + 6765466589) :
+/// variante disk-backed de `expand_session_evidence_ids` pour la
+/// construction des SessionPlan. Expansion transitive via les edges
+/// — convergence garantie car `edges.len()` est fini. Chaque
+/// itération est O(|edges| × contains_cost) ; `SpillingEventIdSet`
+/// borne la RAM (voir `event_id_set.rs`).
+fn expand_session_evidence_ids_disk(
+    ids: &mut SpillingEventIdSet,
+    edges: &[CorrelationEdge],
+) -> std::io::Result<()> {
     loop {
         let mut changed = false;
         for edge in edges {
-            if ids.contains(&edge.source_event_id) {
-                changed |= ids.insert(edge.target_event_id.clone());
+            if ids.contains(&edge.source_event_id)? {
+                if ids.insert(&edge.target_event_id)? {
+                    changed = true;
+                }
             }
-            if ids.contains(&edge.target_event_id) {
-                changed |= ids.insert(edge.source_event_id.clone());
+            if ids.contains(&edge.target_event_id)? {
+                if ids.insert(&edge.source_event_id)? {
+                    changed = true;
+                }
             }
         }
         if !changed {
             break;
         }
     }
+    Ok(())
+}
+
+/// 2.10.2 (devmat) : variante de `load_events_by_ids` qui prend
+/// une `SpillingEventIdSet` en entrée. Évite de matérialiser
+/// `BTreeSet<String>` d'event_ids en RAM pour les sessions
+/// larges (1 session = jusqu'à toute la pile prod si le graph
+/// de corrélation est très connecté).
+fn load_events_by_ids_spilling(
+    path: &Path,
+    ids: &SpillingEventIdSet,
+) -> Result<Vec<session_engine::EventRecord>, String> {
+    if ids.len_hint() == 0 {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path).map_err(display_error)?;
+    let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
+    let mut selected = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(display_error)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        #[derive(serde::Deserialize)]
+        struct IdOnly<'a> {
+            event_id: &'a str,
+        }
+        let id_only: IdOnly = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if !ids.contains(id_only.event_id).map_err(display_error)? {
+            continue;
+        }
+        let events = session_engine::load_jsonl(line.as_bytes())?;
+        selected.extend(events);
+    }
+    Ok(selected)
 }
 
 /// 2.7.21 (issue #10 comment 6653514332, ANR2 recette): remove every
@@ -7413,41 +7509,6 @@ impl CompactionReport {
 /// memory is the subset we actually want + one in-flight line. Used by
 /// `process_capture_into` after `drop(events)` to reconstruct one call
 /// flow at a time.
-fn load_events_by_ids(
-    path: &Path,
-    ids: &BTreeSet<String>,
-) -> Result<Vec<session_engine::EventRecord>, String> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let file = fs::File::open(path).map_err(display_error)?;
-    let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
-    let mut selected = Vec::new();
-    for line in reader.lines() {
-        let line = line.map_err(display_error)?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Peek at `event_id` cheaply without constructing the full
-        // EventRecord. serde_json only allocates the id string and
-        // skips the rest if we deserialize into a one-field struct.
-        #[derive(serde::Deserialize)]
-        struct IdOnly<'a> {
-            event_id: &'a str,
-        }
-        let id_only: IdOnly = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if !ids.contains(id_only.event_id) {
-            continue;
-        }
-        let events = session_engine::load_jsonl(line.as_bytes())?;
-        selected.extend(events);
-    }
-    Ok(selected)
-}
-
 /// Rust drops each per-session allocation before the next session starts, but
 /// glibc normally keeps the freed arenas mapped in the process. Continuous
 /// publication is a batch boundary: returning those pages prevents the API's
@@ -7609,10 +7670,21 @@ pub struct DatasetRestoreReport {
     pub events_sha256: String,
 }
 
-fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) {
-    if std::env::var_os("OIRAN_PUBLICATION_RSS_TRACE").is_none() {
-        return;
-    }
+/// 2.10.2 (devmat, ANR2 #9 comments 6765365357 + 6765466589) :
+/// trace RSS **toujours activée** (plus de gate sur
+/// `OIRAN_PUBLICATION_RSS_TRACE`), avec séparation anon / file
+/// car l'OOM production prouvé par ANR2 est en mémoire ANONYME
+/// (anon ≈ 1,06 GB alors que file retombait à 4 KB au kill).
+///
+/// Format ligne unique parsable par ANR2 :
+/// `PUBLICATION_RSS_TRACE phase=<name> indexed_events=<N>
+///   anon_kb=<N> file_kb=<N> vmrss_kb=<N> vmhwm_kb=<N>
+///   vmpeak_kb=<N>`
+///
+/// `RssAnon` + `RssFile` viennent de `/proc/self/status` — ces
+/// deux compteurs sont exactement ceux que le noyau publie dans
+/// `memory.stat` du cgroup au moment de l'OOM.
+pub(crate) fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) {
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     let value = |name: &str| {
         status
@@ -7623,10 +7695,13 @@ fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) {
             .unwrap_or(0)
     };
     eprintln!(
-        "PUBLICATION_RSS phase={phase} indexed_events={} vmrss_kb={} vmhwm_kb={}",
+        "PUBLICATION_RSS_TRACE phase={phase} indexed_events={} anon_kb={} file_kb={} vmrss_kb={} vmhwm_kb={} vmpeak_kb={}",
         indexed_events.unwrap_or(0),
+        value("RssAnon"),
+        value("RssFile"),
         value("VmRSS"),
         value("VmHWM"),
+        value("VmPeak"),
     );
 }
 
@@ -8901,16 +8976,20 @@ mod tests {
             edge("n4-n3", "n4-event", "n3-event"),
             edge("other", "other-a", "other-b"),
         ];
-        let mut ids = BTreeSet::from(["n2-event".to_string()]);
-        expand_session_evidence_ids(&mut ids, &edges);
-        assert_eq!(
-            ids,
-            BTreeSet::from([
-                "n2-event".to_string(),
-                "n4-event".to_string(),
-                "n3-event".to_string(),
-            ])
-        );
+        // 2.10.2 : variante disk-backed utilisée dans le pipeline
+        // de publication. On rejoue la même assertion sur un
+        // SpillingEventIdSet pour prouver que le comportement
+        // transitif est identique.
+        let tmp_dir = temporary_root("expand-session-evidence-ids-disk")
+            .join("ids");
+        let mut ids = SpillingEventIdSet::new(&tmp_dir, 1024).unwrap();
+        ids.insert("n2-event").unwrap();
+        expand_session_evidence_ids_disk(&mut ids, &edges).unwrap();
+        assert!(ids.contains("n2-event").unwrap());
+        assert!(ids.contains("n4-event").unwrap());
+        assert!(ids.contains("n3-event").unwrap());
+        assert!(!ids.contains("other-a").unwrap());
+        assert!(!ids.contains("other-b").unwrap());
     }
 
     fn temporary_root(name: &str) -> PathBuf {
