@@ -108,6 +108,22 @@ fn event_id_set_mem_cap() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(EVENT_ID_SET_DEFAULT_MEM_CAP)
 }
+
+/// 2.10.3 (devmat) : taille de batch de la boucle de publication
+/// de session. Default 32 → 32 × `mem_cap` ≈ 48 MiB RAM max pour
+/// l'ensemble des SpillingEventIdSets d'un batch (sous la ligne
+/// 2.10.2). Opérateur peut remonter via
+/// `OIRAN_SESSION_PUBLICATION_BATCH_SIZE` si la mémoire du
+/// cgroup l'autorise et si le nombre de scans JSONL par
+/// publication (= ceil(sessions / K)) devient significatif.
+const SESSION_PUBLICATION_BATCH_SIZE_DEFAULT: usize = 32;
+fn session_publication_batch_size() -> usize {
+    std::env::var("OIRAN_SESSION_PUBLICATION_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(SESSION_PUBLICATION_BATCH_SIZE_DEFAULT)
+}
 // 2.8.3 (#9 comment 6696366882): the `MAX_SOURCE_CANDIDATES = 512` cap
 // was removed. ANR2 proved the cap left ~3 292 paths outside the
 // fingerprint cache forever on a 3 805-PCAP tree, so
@@ -782,6 +798,35 @@ pub struct CaptureMetrics {
     /// scan. Surfaced so no per-segment deferral is silent.
     #[serde(default)]
     pub pending_batch_segments: u64,
+    /// 2.10.3 (devmat, ANR2 #9 comment post-2.10.2 15:38Z) : segments
+    /// identifiés comme **lex-greatest filename** par interface SANS
+    /// preuve de clôture (ni filename plus récent, ni record dans
+    /// `capture-rotation.jsonl`). Autrement dit : segments encore
+    /// ouverts par dumpcap. Sortis de `pending_segments` pour que le
+    /// comptage « closé mais pas ingéré » (le vrai pending) soit
+    /// strictement positif seulement quand il y a un défaut.
+    #[serde(default)]
+    pub open_segments: u64,
+    /// 2.10.3 (devmat) : liste des chemins pcap encore ouverts
+    /// (`open_segments`) — bornée à 16 entrées pour le logging
+    /// opérateur. Ne contient pas d'identifiants d'abonnés.
+    #[serde(default)]
+    pub open_segment_paths: Vec<String>,
+    /// 2.10.3 (devmat) : liste des chemins pcap **fermés mais
+    /// pas encore ingérés** (= vrai pending). Bornée à 16 entrées.
+    #[serde(default)]
+    pub pending_segment_paths: Vec<String>,
+    /// 2.10.3 (devmat, ANR2 #9 comment 15:38Z) : segments INGÉRÉS
+    /// (dans `seen_checksums`) mais pour lesquels AUCUN événement
+    /// n'a été produit dans `oiran_events.jsonl`. Révèle un défaut
+    /// silencieux du décodeur sur un segment donné (cas S6a
+    /// `_00064`/`_00065` observés en production 2.10.2). Compteur
+    /// cumulatif côté worker ; la liste `zero_event_segment_paths`
+    /// borne les 16 derniers chemins pour audit.
+    #[serde(default)]
+    pub zero_event_segments: u64,
+    #[serde(default)]
+    pub zero_event_segment_paths: Vec<String>,
     /// 2.9.8 (#9 comment 6725097122): orphan fingerprints dropped at
     /// worker startup — fingerprint persisted but checksum not in
     /// `seen_checksums` (= segment was never committed via
@@ -903,6 +948,15 @@ pub struct LiveDataset {
     pub active_ue_ips: Vec<String>,
     #[serde(default)]
     pub active_pdu_contexts: Vec<ActivePduContext>,
+    /// 2.10.3 (devmat, ANR2 #9 comment post-2.10.2 15:38Z) : liste
+    /// de `sha256:...` capture_ids pour lesquels le décodeur a
+    /// produit 0 événement malgré la présence de paquets dans le
+    /// pcap source. Révèle un défaut silencieux (cas S6a `_00064`,
+    /// `_00065` observés en production : 490 + 492 trames Diameter
+    /// chacun, 0 events dans le JSONL). Toujours vide quand le
+    /// décodeur produit au moins 1 event par segment ingéré.
+    #[serde(default)]
+    pub zero_event_captures: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2150,6 +2204,7 @@ impl CaptureManager {
             fresh_packet_count: 0,
             active_ue_ips: Vec::new(),
             active_pdu_contexts: Vec::new(),
+            zero_event_captures: Vec::new(),
         };
         atomic_write(
             &dataset_dir.join("dataset_manifest.json"),
@@ -2794,9 +2849,43 @@ impl CaptureManager {
                 .iter()
                 .filter(|candidate| !state.seen_checksums.contains(&candidate.checksum))
                 .count() as u64;
+            // 2.10.3 (devmat, revue 2.10.2 ANR2) : inventaire
+            // explicite des segments pending + open. ANR2 a vu
+            // `pending_segments=5` figés 1h+ sans savoir lesquels ;
+            // on publie les chemins (bornés à 16) pour permettre à
+            // l'opérateur de prouver « open par dumpcap » vs
+            // « fermé mais pas ingéré ».
+            let mut pending_paths: Vec<String> = candidates
+                .iter()
+                .filter(|candidate| !state.seen_checksums.contains(&candidate.checksum))
+                .map(|candidate| candidate.path.display().to_string())
+                .collect();
+            pending_paths.truncate(16);
+            let open_count = discovery.known_active_paths.len() as u64;
+            let mut open_paths: Vec<String> = discovery
+                .known_active_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            open_paths.truncate(16);
+            // Log structuré ligne unique par scan — ANR2 parse
+            // directement via `journalctl -u oiran-api`.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "CONTINUOUS_PENDING_INVENTORY",
+                    "pending_segments": pending,
+                    "pending_paths": pending_paths,
+                    "open_segments": open_count,
+                    "open_paths": open_paths,
+                })
+            );
             self.update(CONTINUOUS_CAPTURE_ID, |job| {
                 job.metrics.pending_segments = pending;
                 job.metrics.pending_fingerprints = pending;
+                job.metrics.open_segments = open_count;
+                job.metrics.open_segment_paths = open_paths.clone();
+                job.metrics.pending_segment_paths = pending_paths.clone();
             })?;
             let mut pending_publication = std::mem::take(&mut bootstrap_pending);
             let mut changed = !pending_publication.is_empty();
@@ -3090,6 +3179,34 @@ impl CaptureManager {
                             // and `job.json` prove concordance by
                             // construction.
                             job.metrics.pending_fingerprints = 0;
+                            // 2.10.3 : effacer aussi la liste ;
+                            // open_segments / open_segment_paths
+                            // reflètent les segments ouverts et
+                            // conservent leur valeur courante.
+                            job.metrics.pending_segment_paths = Vec::new();
+                            // 2.10.3 : surfacer les segments
+                            // ingérés qui n'ont produit AUCUN
+                            // événement (défaut silencieux du
+                            // décodeur — cas S6a `_00064`/`_00065`
+                            // observé en production 2.10.2).
+                            // Cumul lifetime worker ; liste bornée à
+                            // 16 chemins.
+                            if !dataset.zero_event_captures.is_empty() {
+                                job.metrics.zero_event_segments = job
+                                    .metrics
+                                    .zero_event_segments
+                                    .saturating_add(
+                                        dataset.zero_event_captures.len() as u64,
+                                    );
+                                let mut combined: Vec<String> = std::mem::take(
+                                    &mut job.metrics.zero_event_segment_paths,
+                                );
+                                combined.extend(dataset.zero_event_captures.iter().cloned());
+                                let combined_len = combined.len();
+                                let skip = combined_len.saturating_sub(16);
+                                job.metrics.zero_event_segment_paths =
+                                    combined.into_iter().skip(skip).collect();
+                            }
                             job.metrics.decoded_events = dataset.event_count as u64;
                             job.metrics.sessions_indexed = dataset.session_ids.len() as u64;
                             job.metrics.last_ingested_epoch_ms = Some(epoch_ms());
@@ -3678,6 +3795,7 @@ impl CaptureManager {
             prior_continuous,
             BTreeMap::new(),
             BTreeMap::new(),
+            Vec::new(),
         )?;
         // Atomic swap next ↔ current via previous.
         if previous.exists() {
@@ -4594,6 +4712,7 @@ impl CaptureManager {
             prior_continuous,
             BTreeMap::new(),
             BTreeMap::new(),
+            Vec::new(),
         )?;
         if previous.exists() {
             fs::remove_dir_all(&previous).map_err(display_error)?;
@@ -4676,6 +4795,10 @@ impl CaptureManager {
         let mut decoded_spool = BufWriter::with_capacity(STREAM_CHUNK_BYTES, decoded_spool_file);
         let mut reports = BTreeMap::new();
         let mut checksums = BTreeMap::new();
+        // 2.10.3 (devmat, ANR2 #9 comment 15:38Z) : captures
+        // ingérés mais 0 events produits — surfacé dans
+        // `LiveDataset.zero_event_captures`.
+        let mut zero_event_captures: Vec<String> = Vec::new();
         let endpoints = endpoint_map();
         for interface in interfaces {
             let mut files = capture_files_for(pcap_dir, &interface.interface);
@@ -4745,6 +4868,22 @@ impl CaptureManager {
                     .and_then(|name| name.to_str())
                     .unwrap_or("capture.pcap")
                     .to_string();
+                // 2.10.3 : si 0 events produits, loguer + surfacer
+                // dans LiveDataset.zero_event_captures. Jamais
+                // d'identité abonné dans ce log (chemin + SHA + 0).
+                if report.events == 0 {
+                    let capture_sha = format!("sha256:{}", &checksum);
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_SEGMENT_ZERO_EVENTS",
+                            "path": path.display().to_string(),
+                            "capture_id": capture_sha,
+                            "interface": interface.interface,
+                        })
+                    );
+                    zero_event_captures.push(capture_sha);
+                }
                 checksums.insert(key.clone(), checksum);
                 reports.insert(key, report);
             }
@@ -4830,6 +4969,7 @@ impl CaptureManager {
             prior_continuous,
             reports,
             checksums,
+            zero_event_captures,
         )
     }
 
@@ -4851,26 +4991,37 @@ impl CaptureManager {
         prior_continuous: Option<(PathBuf, LiveDataset)>,
         mut reports: BTreeMap<String, DecodeReport>,
         mut checksums: BTreeMap<String, String>,
+        zero_event_captures: Vec<String>,
     ) -> Result<LiveDataset, String> {
         let events_path = dataset_dir.join("oiran_events.jsonl");
         release_unused_heap_pages();
+        trace_publication_rss_reset();
         trace_publication_rss("00-after-streaming-merge", None);
-        // 2.7.24 + 2.9.18-fu3: stream the JSONL into compact
-        // semantic representatives + a disk-spilling event-id set.
-        // The pré-fu3 `BTreeSet<String>` d'event_ids retenus
-        // retombait ~104 B/entrée × 2 M lignes = ~200 MiB en RAM
-        // juste pour la sélection des call-flows prior à recopier
-        // (filtre `retained_event_ids.contains(...)` ci-dessous).
-        // `SpillingEventIdSet` borne cette empreinte à l'ordre de
-        // la MiB.
+        // 2.7.24 + 2.9.18-fu3 + 2.10.3 : stream the JSONL into
+        // compact semantic representatives. Pré-2.10.3 on faisait
+        // AUSSI une 2ᵉ passe streaming pour alimenter un
+        // `SpillingEventIdSet retained_event_ids` servant à
+        // filtrer les call-flows prior à recopier. Cette 2ᵉ
+        // passe était redondante quand aucune politique de
+        // rétention n'est active (`OIRAN_DATASET_RETENTION_DAYS`
+        // absent) — la merge preserve par construction tous les
+        // event_ids prior dans le JSONL courant. 2.10.3 skippe
+        // cette passe hors rétention, économisant un full-scan
+        // de `oiran_events.jsonl` (environ 2,7 Go → ~30 s en prod).
+        // Quand la rétention est active, la passe est conservée
+        // (archive_stale_captures peut supprimer des captures
+        // entières du hot view).
         let index = session_engine::load_path_streaming_representatives(&events_path)?;
         let event_count = index.source_event_count;
         let mut events = index.events;
+        let retention_active = retention_cutoff_epoch_s().is_some();
         let retention_staging = dataset_dir.join(".publish-staging").join("ids");
-        let mut retained_event_ids =
-            SpillingEventIdSet::new(&retention_staging, event_id_set_mem_cap())
-                .map_err(display_error)?;
-        {
+        let mut retained_event_ids = SpillingEventIdSet::new(
+            &retention_staging,
+            event_id_set_mem_cap(),
+        )
+        .map_err(display_error)?;
+        if retention_active {
             let file = fs::File::open(&events_path).map_err(display_error)?;
             let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
             for line in reader.lines() {
@@ -4890,7 +5041,8 @@ impl CaptureManager {
             }
         }
         eprintln!(
-            "PUBLICATION_RETAINED_IDS total_unique={} chunks={} flushes={} mem_entries={}",
+            "PUBLICATION_RETAINED_IDS retention_active={} total_unique={} chunks={} flushes={} mem_entries={}",
+            retention_active,
             retained_event_ids.len_hint(),
             retained_event_ids.chunk_count(),
             retained_event_ids.flush_count(),
@@ -4991,98 +5143,191 @@ impl CaptureManager {
         release_unused_heap_pages();
         trace_publication_rss("09-after-events-dropped", None);
 
-        // 2.10.2 : boucle unique qui construit le plan de session,
-        // le matérialise (load events + reconstruct + write
-        // callflow), puis drop IMMÉDIATEMENT la SpillingEventIdSet
-        // avant la prochaine itération. Peak mémoire = 1 seule
-        // SpillingEventIdSet × mem_cap ≈ 1,5 MiB, pas
-        // sessions.len() × mem_cap comme dans la version
-        // intermédiaire pre-review.
+        // 2.10.3 (devmat, revue 2.10.2 point 2) : boucle de session
+        // BATCHÉE. La 2.10.2 faisait 1 full JSONL scan PAR SESSION
+        // (via `load_events_by_ids_spilling`). Bench 200K events/400
+        // sessions : ~97 sec / 100 sessions = ~1 sec/session (phase
+        // 10-batch-* elapsed_ms). Prod 1,5 M events × 500 sessions
+        // dominait le 22 min / cycle.
+        //
+        // 2.10.3 regroupe `SESSION_PUBLICATION_BATCH_SIZE` sessions
+        // par passe :
+        //   1. Construire K SpillingEventIdSets (K × mem_cap ≈
+        //      K × 1,5 MiB en RAM — K=32 → 48 MiB max, sous la
+        //      ligne 2.10.2).
+        //   2. ONE JSONL scan, dispatch chaque event aux scratch
+        //      files per-session dont l'ids_set contient
+        //      l'event_id.
+        //   3. Per session : lire son scratch, reconstruct, write
+        //      call-flow, drop set+scratch.
+        //   4. Batch suivant.
+        //
+        // Scans totaux = ceil(sessions / K). Pour 500 sessions /
+        // K=32 = 16 scans vs 500 à l'ancien. Réduction ~31×.
         let session_ids_staging_root = dataset_dir
             .join(".publish-staging")
             .join("session-ids");
+        let session_scratch_staging_root = dataset_dir
+            .join(".publish-staging")
+            .join("session-scratch");
         let mut session_ids = Vec::new();
-        for (idx, session) in discovery.pdu_sessions.iter().enumerate() {
-            let context = discovery
-                .ue_contexts
-                .iter()
-                .find(|context| context.context_id == session.ue_context_id);
-            let session_ids_tmp = session_ids_staging_root.join(format!("{idx:06}"));
-            let mut ids = SpillingEventIdSet::new(
-                &session_ids_tmp,
-                event_id_set_mem_cap(),
-            )
-            .map_err(display_error)?;
-            for event_id in &session.event_ids {
-                ids.insert(event_id).map_err(display_error)?;
+        let batch_size = session_publication_batch_size();
+        let pdu_sessions_len = discovery.pdu_sessions.len();
+        for (batch_idx, chunk) in discovery
+            .pdu_sessions
+            .chunks(batch_size)
+            .enumerate()
+        {
+            // Préparer K SpillingEventIdSets + paramétrage par session.
+            struct BatchEntry {
+                session_id: String,
+                ue_pseudonym: Option<String>,
+                ids: SpillingEventIdSet,
+                scratch_path: PathBuf,
             }
-            if let Some(context) = context {
-                for event_id in &context.event_ids {
+            let mut entries: Vec<BatchEntry> = Vec::with_capacity(chunk.len());
+            for (within_batch_idx, session) in chunk.iter().enumerate() {
+                let context = discovery
+                    .ue_contexts
+                    .iter()
+                    .find(|context| context.context_id == session.ue_context_id);
+                let global_idx = batch_idx * batch_size + within_batch_idx;
+                let session_ids_tmp =
+                    session_ids_staging_root.join(format!("{global_idx:06}"));
+                let mut ids = SpillingEventIdSet::new(
+                    &session_ids_tmp,
+                    event_id_set_mem_cap(),
+                )
+                .map_err(display_error)?;
+                for event_id in &session.event_ids {
                     ids.insert(event_id).map_err(display_error)?;
                 }
+                if let Some(context) = context {
+                    for event_id in &context.event_ids {
+                        ids.insert(event_id).map_err(display_error)?;
+                    }
+                }
+                expand_session_evidence_ids_disk(&mut ids, &global_edges)
+                    .map_err(display_error)?;
+                let scratch_path =
+                    session_scratch_staging_root.join(format!("{global_idx:06}.jsonl"));
+                fs::create_dir_all(&session_scratch_staging_root).map_err(display_error)?;
+                entries.push(BatchEntry {
+                    session_id: session.session_id.clone(),
+                    ue_pseudonym: context.map(|context| context.pseudonym.clone()),
+                    ids,
+                    scratch_path,
+                });
             }
-            expand_session_evidence_ids_disk(&mut ids, &global_edges)
-                .map_err(display_error)?;
-            let plan_session_id = session.session_id.clone();
-            let plan_ue_pseudonym =
-                context.map(|context| context.pseudonym.clone());
 
-            let selected = load_events_by_ids_spilling(&events_path, &ids)?;
-            drop(ids); // libère les chunks disque + tmp_dir
-            // 2.10.2 : edges re-filtrées à la volée depuis
-            // `global_edges`. Pas de clone global_edges.len() × sessions.
-            let selected_ids: std::collections::BTreeSet<String> = selected
-                .iter()
-                .map(|event| event.event_id.clone())
-                .collect();
-            let plan_edges: Vec<CorrelationEdge> = global_edges
-                .iter()
-                .filter(|edge| {
-                    selected_ids.contains(&edge.source_event_id)
-                        && selected_ids.contains(&edge.target_event_id)
-                })
-                .cloned()
-                .collect();
-            let mut reconstruction = reconstruct(
-                selected,
-                ReconstructionHints {
+            // Un seul full-scan JSONL : dispatch chaque event aux
+            // scratchs dont la SpillingEventIdSet le contient.
+            // La passe ne parse pas tout l'event, juste `event_id`
+            // (clone du cheap-peek 2.9.17 depuis `load_events_by_ids`).
+            {
+                let mut scratch_writers: Vec<BufWriter<fs::File>> = entries
+                    .iter()
+                    .map(|entry| {
+                        fs::File::create(&entry.scratch_path)
+                            .map(|f| BufWriter::with_capacity(STREAM_CHUNK_BYTES, f))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(display_error)?;
+                let file = fs::File::open(&events_path).map_err(display_error)?;
+                let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
+                for line in reader.lines() {
+                    let line = line.map_err(display_error)?;
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    #[derive(serde::Deserialize)]
+                    struct IdOnly<'a> {
+                        event_id: &'a str,
+                    }
+                    let id_only: IdOnly = match serde_json::from_str(&line) {
+                        Ok(value) => value,
+                        Err(_) => continue,
+                    };
+                    for (idx, entry) in entries.iter().enumerate() {
+                        if entry.ids.contains(id_only.event_id).map_err(display_error)? {
+                            scratch_writers[idx]
+                                .write_all(line.as_bytes())
+                                .map_err(display_error)?;
+                            scratch_writers[idx]
+                                .write_all(b"\n")
+                                .map_err(display_error)?;
+                        }
+                    }
+                }
+                for mut writer in scratch_writers {
+                    writer.flush().map_err(display_error)?;
+                }
+            }
+
+            // Per-session : reconstruct depuis scratch, write
+            // callflow, drop. Le scan global n'a été fait qu'une
+            // fois pour tout le batch.
+            for entry in entries {
+                let BatchEntry {
+                    session_id: plan_session_id,
                     ue_pseudonym: plan_ue_pseudonym,
-                    ..Default::default()
-                },
-            );
-            reconstruction.session_id = plan_session_id;
-            for event in &reconstruction.events {
-                reconstruction
-                    .association
-                    .insert(event.event_id.clone(), Association::Session);
-            }
-            let flow = build_callflow(&reconstruction, plan_edges);
-            let json_path = dataset_dir
-                .join("callflows")
-                .join(format!("{}.json", flow.session_id));
-            let html_path = dataset_dir
-                .join("callflows")
-                .join(format!("{}.html", flow.session_id));
-            atomic_write(
-                &json_path,
-                &serde_json::to_vec_pretty(&flow).map_err(|error| error.to_string())?,
-            )?;
-            let html = callflow_renderer::render(&flow).map_err(|error| error.to_string())?;
-            atomic_write(&html_path, html.as_bytes())?;
-            session_ids.push(flow.session_id);
-            // The full event bodies selected for this session have gone out
-            // of scope at the end of the iteration. Return their pages now so
-            // hundreds of sequential sessions do not become retained RSS.
-            release_unused_heap_pages();
-            // 2.10.2 : log RSS tous les 100 sessions pour qu'ANR2
-            // puisse observer l'évolution sur une production ~10K
-            // sessions sans spammer le journal.
-            if idx % 100 == 99 {
-                trace_publication_rss(
-                    &format!("10-session-callflow-batch-{}", idx / 100),
-                    Some(indexed_events_count),
+                    ids,
+                    scratch_path,
+                } = entry;
+                drop(ids); // libère chunks + tmp_dir avant le reconstruct.
+                let scratch_bytes =
+                    fs::read(&scratch_path).map_err(display_error)?;
+                let _ = fs::remove_file(&scratch_path);
+                let selected = session_engine::load_jsonl(&scratch_bytes[..])?;
+                let selected_ids: std::collections::BTreeSet<String> = selected
+                    .iter()
+                    .map(|event| event.event_id.clone())
+                    .collect();
+                let plan_edges: Vec<CorrelationEdge> = global_edges
+                    .iter()
+                    .filter(|edge| {
+                        selected_ids.contains(&edge.source_event_id)
+                            && selected_ids.contains(&edge.target_event_id)
+                    })
+                    .cloned()
+                    .collect();
+                let mut reconstruction = reconstruct(
+                    selected,
+                    ReconstructionHints {
+                        ue_pseudonym: plan_ue_pseudonym,
+                        ..Default::default()
+                    },
                 );
+                reconstruction.session_id = plan_session_id;
+                for event in &reconstruction.events {
+                    reconstruction
+                        .association
+                        .insert(event.event_id.clone(), Association::Session);
+                }
+                let flow = build_callflow(&reconstruction, plan_edges);
+                let json_path = dataset_dir
+                    .join("callflows")
+                    .join(format!("{}.json", flow.session_id));
+                let html_path = dataset_dir
+                    .join("callflows")
+                    .join(format!("{}.html", flow.session_id));
+                atomic_write(
+                    &json_path,
+                    &serde_json::to_vec_pretty(&flow).map_err(|error| error.to_string())?,
+                )?;
+                let html = callflow_renderer::render(&flow).map_err(|error| error.to_string())?;
+                atomic_write(&html_path, html.as_bytes())?;
+                session_ids.push(flow.session_id);
             }
+            release_unused_heap_pages();
+            trace_publication_rss(
+                &format!(
+                    "10-session-batch-{}-of-{}",
+                    batch_idx + 1,
+                    pdu_sessions_len.div_ceil(batch_size)
+                ),
+                Some(indexed_events_count),
+            );
         }
         trace_publication_rss(
             "10a-after-session-callflows",
@@ -5142,14 +5387,20 @@ impl CaptureManager {
                 let flow: CallFlow =
                     serde_json::from_slice(&fs::read(&prior_json).map_err(display_error)?)
                         .map_err(|error| error.to_string())?;
+                // 2.10.3 : hors rétention, l'invariant de merge
+                // garantit que tous les event_ids prior sont dans
+                // le JSONL courant → filter always-true, skip.
+                // Sous rétention, re-check via retained_event_ids.
                 let mut all_present = true;
-                for event in &flow.events {
-                    if !retained_event_ids
-                        .contains(&event.event_id)
-                        .map_err(display_error)?
-                    {
-                        all_present = false;
-                        break;
+                if retention_active {
+                    for event in &flow.events {
+                        if !retained_event_ids
+                            .contains(&event.event_id)
+                            .map_err(display_error)?
+                        {
+                            all_present = false;
+                            break;
+                        }
                     }
                 }
                 if !all_present {
@@ -5177,6 +5428,45 @@ impl CaptureManager {
         // sont supprimés avant qu'on sérialise le manifeste.
         drop(retained_event_ids);
         let _ = fs::remove_dir(dataset_dir.join(".publish-staging"));
+        // 2.10.3 (devmat, revue 2.10.2 point 3) : `state=PARTIAL`
+        // signifie PRÉCISÉMENT `discovery.unmatched_event_ids ≠ ∅` —
+        // des événements wire-identiques ont été publiés mais le
+        // session-engine n'a pas pu les rattacher à une session N2
+        // (contexte UE non reconstruit — F-TEID / NAS inaccessible),
+        // à une session LTE (S1-MME context absent) ou à un tunnel
+        // GTP-U orphelin. Ce n'est PAS un défaut — c'est la lecture
+        // honnête des événements pour lesquels la corrélation
+        // n'était pas démontrable à l'instant de la publication.
+        // COMPLETED = `unmatched_event_ids ∩ dataset = ∅`.
+        // COMPLETED_EMPTY = `event_count == 0`.
+        let dataset_state: &str = if event_count == 0 {
+            "COMPLETED_EMPTY"
+        } else if discovery.unmatched_event_ids.is_empty() {
+            "COMPLETED"
+        } else {
+            "PARTIAL"
+        };
+        let partial_reason: Option<String> = if dataset_state == "PARTIAL" {
+            Some(format!(
+                "{} unmatched event(s) — session-engine could not bind to an N2 UE context, an S1-MME context, nor a GTP-U tunnel at publish time",
+                discovery.unmatched_event_ids.len()
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = partial_reason.as_deref() {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "CONTINUOUS_PUBLICATION_PARTIAL",
+                    "state": dataset_state,
+                    "reason": reason,
+                    "unmatched_event_count": discovery.unmatched_event_ids.len(),
+                    "event_count": event_count,
+                    "zero_event_captures": zero_event_captures.len(),
+                })
+            );
+        }
         let dataset = LiveDataset {
             dataset_id,
             capture_id: capture_id.into(),
@@ -5185,19 +5475,14 @@ impl CaptureManager {
             session_ids,
             decode_reports: reports,
             checksums,
-            state: if event_count == 0 {
-                "COMPLETED_EMPTY".into()
-            } else if discovery.unmatched_event_ids.is_empty() {
-                "COMPLETED".into()
-            } else {
-                "PARTIAL".into()
-            },
+            state: dataset_state.to_string(),
             discovery: Some(discovery),
             capture_started_epoch_ms,
             last_packet_epoch_ms,
             fresh_packet_count,
             active_ue_ips,
             active_pdu_contexts,
+            zero_event_captures,
         };
         trace_publication_rss("11-after-callflows-loop", None);
         atomic_write(
@@ -7364,43 +7649,6 @@ fn expand_session_evidence_ids_disk(
     Ok(())
 }
 
-/// 2.10.2 (devmat) : variante de `load_events_by_ids` qui prend
-/// une `SpillingEventIdSet` en entrée. Évite de matérialiser
-/// `BTreeSet<String>` d'event_ids en RAM pour les sessions
-/// larges (1 session = jusqu'à toute la pile prod si le graph
-/// de corrélation est très connecté).
-fn load_events_by_ids_spilling(
-    path: &Path,
-    ids: &SpillingEventIdSet,
-) -> Result<Vec<session_engine::EventRecord>, String> {
-    if ids.len_hint() == 0 {
-        return Ok(Vec::new());
-    }
-    let file = fs::File::open(path).map_err(display_error)?;
-    let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
-    let mut selected = Vec::new();
-    for line in reader.lines() {
-        let line = line.map_err(display_error)?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        #[derive(serde::Deserialize)]
-        struct IdOnly<'a> {
-            event_id: &'a str,
-        }
-        let id_only: IdOnly = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if !ids.contains(id_only.event_id).map_err(display_error)? {
-            continue;
-        }
-        let events = session_engine::load_jsonl(line.as_bytes())?;
-        selected.extend(events);
-    }
-    Ok(selected)
-}
-
 /// 2.7.21 (issue #10 comment 6653514332, ANR2 recette): remove every
 /// never-committed artifact under `<base>` at worker startup, but leave
 /// the committed `dataset/` subtree STRICTLY byte-identical.
@@ -7684,6 +7932,25 @@ pub struct DatasetRestoreReport {
 /// `RssAnon` + `RssFile` viennent de `/proc/self/status` — ces
 /// deux compteurs sont exactement ceux que le noyau publie dans
 /// `memory.stat` du cgroup au moment de l'OOM.
+/// 2.10.3 (devmat, revue 2.10.2 point 2) : horodatage de la
+/// première trace de chaque publication. ANR2 peut maintenant
+/// calculer `elapsed_ms` par phase — c'est la métrique nécessaire
+/// pour savoir laquelle des phases eat le cycle 22 min observé en
+/// prod.
+///
+/// Utilisation : au tout début de `publish_events_to_dataset_dir`,
+/// le compteur est réinitialisé via `trace_publication_rss_reset`
+/// pour qu'`elapsed_ms` commence à 0.
+static PUBLICATION_RSS_START_UNIX_MS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn trace_publication_rss_reset() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    PUBLICATION_RSS_START_UNIX_MS.store(now_ms, Ordering::Relaxed);
+}
+
 pub(crate) fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) {
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     let value = |name: &str| {
@@ -7694,8 +7961,18 @@ pub(crate) fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) 
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0)
     };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let start_ms = PUBLICATION_RSS_START_UNIX_MS.load(Ordering::Relaxed);
+    let elapsed_ms = if start_ms == 0 || now_ms < start_ms {
+        0u64
+    } else {
+        now_ms - start_ms
+    };
     eprintln!(
-        "PUBLICATION_RSS_TRACE phase={phase} indexed_events={} anon_kb={} file_kb={} vmrss_kb={} vmhwm_kb={} vmpeak_kb={}",
+        "PUBLICATION_RSS_TRACE phase={phase} elapsed_ms={elapsed_ms} indexed_events={} anon_kb={} file_kb={} vmrss_kb={} vmhwm_kb={} vmpeak_kb={}",
         indexed_events.unwrap_or(0),
         value("RssAnon"),
         value("RssFile"),
@@ -10761,6 +11038,7 @@ mod tests {
                     .map(|context| context.ue_ip.clone())
                     .collect(),
                 active_pdu_contexts: contexts,
+                zero_event_captures: Vec::new(),
             },
         );
         manager.jobs.lock().unwrap().insert(
@@ -12489,6 +12767,7 @@ mod tests {
             fresh_packet_count: 0,
             active_ue_ips: Vec::new(),
             active_pdu_contexts: Vec::new(),
+            zero_event_captures: Vec::new(),
         };
         fs::write(source.join("dataset/oiran_events.jsonl"), b"").unwrap();
         fs::write(

@@ -1,5 +1,154 @@
 # Changelog
 
+## OIRAN API 2.10.3 — 2026-11-10 — pending vs open, zero-event surface, state=PARTIAL documenté, publication batchée × 13 (devmat, revue 2.10.2 prod ANR2 #10 + #9 15:38Z)
+
+Patch qui ferme les points ouverts remontés sur la 2.10.2 déployée (ANR1 14:31Z + ANR2 15:11Z/15:29Z — 0 OOM, anon max ~1,2 GiB sous `MemoryMax=4G`) :
+
+### 1. `pending_segments` figés — distinguer open (dumpcap) vs stuck (défaut)
+
+**Observation ANR2** (comment 15:11Z) : `pending_segments=5 / pending_fingerprints=5` restent identiques pendant 30 min+ malgré des publications complètes.
+
+**Fix 2.10.3** :
+
+- Nouveau champ `CaptureMetrics.open_segments` (+ liste `open_segment_paths` bornée à 16) : nombre de pcap identifiés **lex-greatest filename** pour leur interface SANS record de clôture dans `capture-rotation.jsonl`. Source : `discovery.known_active_paths` (déjà calculé par `finalized_candidates_only`). Ces segments sont **attendus** d'être pending (dumpcap écrit encore dessus) ; les sortir du suspense.
+- Nouveau champ `CaptureMetrics.pending_segment_paths` (bornée à 16) : chemins pcap **fermés** dont le SHA n'est pas encore dans `state.seen_checksums` (= vrai pending). Vidé à chaque publication complète.
+- Nouveau log structuré **ligne unique par scan** : `CONTINUOUS_PENDING_INVENTORY {pending_segments, pending_paths, open_segments, open_paths}` — ANR2 parse directement via `journalctl -u oiran-api | rg CONTINUOUS_PENDING_INVENTORY`.
+
+**Commande de preuve** (pour ANR2) :
+
+```bash
+# Prod: inventaire pending vs open en direct.
+curl -fsS http://127.0.0.1:49152/api/v1/metrics | jq '.data|{
+  pending_segments,
+  pending_segment_paths,
+  open_segments,
+  open_segment_paths
+}'
+
+# Historique: dernière passe d'inventaire logué.
+journalctl -u oiran-api --since '-10min' --no-pager -o short-iso \
+  | rg CONTINUOUS_PENDING_INVENTORY | tail -3
+```
+
+Interprétation attendue : `pending_segments == 0` dès qu'aucun segment fermé n'attend l'ingest. `open_segments` ≈ nombre d'interfaces dumpcap actives (12-13 en prod).
+
+### 2. Segments ingérés avec 0 events — surface du défaut S6a
+
+**Observation ANR2** (comment 15:38Z) : les segments S6a `_00064` et `_00065` sont **dans `seen_checksums`** (donc ingérés) mais **zéro `capture_id` correspondant dans le JSONL publié**. 490 + 492 trames Diameter brutes, 0 events décodés.
+
+**Fix 2.10.3** :
+
+- Nouveau champ `LiveDataset.zero_event_captures: Vec<String>` — liste des `sha256:...` pour lesquels le décodeur a produit 0 event par cycle.
+- Nouveau champ `CaptureMetrics.zero_event_segments` (cumulatif worker lifetime) + `zero_event_segment_paths` (16 derniers chemins).
+- Nouveau log structuré **par segment** : `CONTINUOUS_SEGMENT_ZERO_EVENTS {path, capture_id, interface}` — émis depuis `process_capture_into` dès qu'un pcap passe le décodeur avec `report.events == 0`.
+- **La cause du défaut n'est PAS corrigée dans 2.10.3** — il faut la pcap réelle (ou un synthetic reproduction) pour investiguer le décodeur Diameter. 2.10.3 **surface** le problème pour qu'ANR2 puisse prouver + que l'enquête ciblée 2.10.4 démarre avec des pcap samples (via `zero_event_segment_paths`).
+
+### 3. `state=PARTIAL` documenté
+
+**Semantics** (gelées en code + CHANGELOG) :
+
+- `state = "COMPLETED_EMPTY"` ⇔ `event_count == 0`.
+- `state = "COMPLETED"` ⇔ `event_count > 0 && discovery.unmatched_event_ids.is_empty()`.
+- `state = "PARTIAL"` ⇔ `event_count > 0 && !discovery.unmatched_event_ids.is_empty()` — des events wire-identiques ont été publiés mais le `session-engine` n'a pas pu les rattacher à :
+  - une session N2 (contexte UE non reconstruit — F-TEID / NAS inaccessible),
+  - une session LTE (S1-MME context absent),
+  - ni un tunnel GTP-U orphelin.
+
+Ce n'est PAS un défaut mais la lecture honnête des events pour lesquels la corrélation n'était pas démontrable à l'instant de la publication. Un nouveau log structuré `CONTINUOUS_PUBLICATION_PARTIAL` est émis quand l'état bascule en `PARTIAL`, avec `unmatched_event_count` + `event_count` + `zero_event_captures` count.
+
+**Correction honnête du commentaire 15:29Z** : la prod observée en 15:24:50Z avec `state=PARTIAL` + `event_count=1538411` signifie **des events décodés ne sont pas reliés à une session connue**, pas que le dataset soit incomplet. Ceci inclut vraisemblablement les events S6a (point 2) dont le décodeur n'a pas réussi à extraire les identifiants nécessaires à la corrélation.
+
+### 4. Publication batchée — 13× plus rapide dans le bench
+
+**Observation ANR2** (comment 15:29Z) : un cycle de publication prend **22 min** à ~82 % CPU (`phase 00` à 15:05:50Z → `phase 12` à 15:24:50Z → `phase 13` à 15:27:35Z).
+
+**Cause localisée sur bench synthétique 200 K events / 400 sessions** :
+
+```text
+PUBLICATION_RSS_TRACE phase=00-after-streaming-merge       elapsed_ms=0
+PUBLICATION_RSS_TRACE phase=01-after-streaming-representatives  elapsed_ms=6287  (~6,3 s — streaming index)
+PUBLICATION_RSS_TRACE phase=02 .. 09                       elapsed_ms=6287 → 6312  (~5 ms — discovery+correlation+flows+drop)
+PUBLICATION_RSS_TRACE phase=10-session-callflow-batch-0    elapsed_ms=103306   ← **97 sec pour 100 sessions**
+PUBLICATION_RSS_TRACE phase=10-session-callflow-batch-1    elapsed_ms=201469   ← 98 sec
+PUBLICATION_RSS_TRACE phase=10-session-callflow-batch-2    elapsed_ms=299075
+PUBLICATION_RSS_TRACE phase=10-session-callflow-batch-3    elapsed_ms=396648   ← total 400 sec session loop
+```
+
+**La boucle session dominait**. Chaque session faisait un full JSONL scan via `load_events_by_ids_spilling` → **O(sessions × events)** scans.
+
+**Fix 2.10.3** : boucle batchée. `SESSION_PUBLICATION_BATCH_SIZE_DEFAULT = 32` (tunable via `OIRAN_SESSION_PUBLICATION_BATCH_SIZE`). Pour chaque batch de K sessions :
+
+1. Construire K `SpillingEventIdSet` (K × mem_cap ≈ K × 1,5 MiB = 48 MiB RAM max pour K=32 — sous la ligne 2.10.2).
+2. **Un seul** JSONL full-scan : dispatch chaque event aux scratch files `.publish-staging/session-scratch/<idx>.jsonl` des sessions dont l'ids-set le contient (cheap `event_id` peek, pas full parse).
+3. Per session : lire son scratch (~KB), reconstruct, write callflow, drop set+scratch.
+4. Batch suivant.
+
+Scans totaux = `ceil(sessions / K)`. Pour 500 sessions / K=32 = **16 scans** vs 500 à l'ancien → **~31× moins de scans JSONL**.
+
+**Bench 2.10.3 (mêmes 200 K events / 400 sessions)** :
+
+```text
+PUBLICATION_RSS_TRACE phase=01-after-streaming-representatives  elapsed_ms=6287
+PUBLICATION_RSS_TRACE phase=09-after-events-dropped             elapsed_ms=6312
+PUBLICATION_RSS_TRACE phase=10-session-batch-1-of-13            elapsed_ms=8798   ← ~2,5 s pour 32 sessions
+PUBLICATION_RSS_TRACE phase=10-session-batch-13-of-13           elapsed_ms=37727  ← total ~31 s session loop
+PUBLICATION_RSS_TRACE phase=13-after-release-pages              elapsed_ms=41551
+FU3_RSS verdict vmhwm_mib=12.9 cap_mib=200.0 pass=YES
+```
+
+- **Session loop** : 400 s → **31 s** (**~13× speedup**).
+- **Total publication (200 K / 400 sessions)** : ~400 s → **~42 s**.
+- **VmHWM** : 12,9 MiB (+4 MiB vs 2.10.2 mais large sous la ligne prod 1,2 GiB anon).
+
+**Extrapolation prod 1,5 M events / ~500 sessions** (non mesuré — à confirmer par ANR2) :
+
+- Phase 01 streaming representatives : ~45 s (2,7 GB JSONL).
+- Session loop K=32 : 500/32 = 16 scans × ~30 s = ~8 min.
+- Si opérateur pousse `OIRAN_SESSION_PUBLICATION_BATCH_SIZE=128` (128 × 1,5 MiB = 192 MiB RAM) → 500/128 = 4 scans × 30 s = **~2 min**, cible atteinte.
+
+**Honnêteté** : ces chiffres prod sont **une projection** depuis le bench. La preuve réelle doit venir d'une publication observée avec le binaire 2.10.3 déployé, traces `PUBLICATION_RSS_TRACE phase=10-session-batch-<i>-of-<N>` dans `journalctl -u oiran-api`.
+
+### 5. Autres bornages
+
+- Trace `elapsed_ms` par phase ajoutée au format `PUBLICATION_RSS_TRACE` (Linux `SystemTime::now()` au début de chaque publication via `trace_publication_rss_reset`). ANR2 peut maintenant calculer des deltas directement.
+- Scan redondant `retained_event_ids` **retiré hors rétention**. Pré-2.10.3 on faisait 2 scans JSONL : 1 pour les représentants (phase 01), 1 pour construire `retained_event_ids` (filtre call-flow prior). L'invariant de merge (first-write-wins sur event_id) garantit que tous les event_ids prior sont dans le JSONL courant, DONC le filtre est always-true sans rétention. 2.10.3 skippe cette 2ᵉ passe quand `OIRAN_DATASET_RETENTION_DAYS` est absent. Économie : ~30 s par cycle en prod (2,7 GB JSONL).
+- Métrique `retention_active=true|false` dans le log `PUBLICATION_RETAINED_IDS` pour audit.
+
+### 6. LTE E2E run `lte-run-551efaa842ea83c95cbd47e90210e989`
+
+**État** : ANR2 a lancé la certification LTE à 15:40:38Z et terminé à 15:42:46Z (comment 15:56Z sur #10). 1083 UL G-PDUs + 1079 DL sur S1-U/S5-U, AIR + ULR sur S6a, PFCP 50/51 sur Sxa/Sxb. **Les segments pcap couvrant le run sont toujours les actifs `_00067` au moment où j'écris** (`_00068` n'existe pas). **Aucun défaut de corrélation OIRAN n'est publié** (comment 15:56Z explicit : « session OIRAN et corrélations non qualifiées »). Point 4 du brief = pas de blocage.
+
+À la prochaine rotation dumpcap (sortie du `_00068`), les 11 étapes LTE deviendront ingérables par OIRAN continu. Le rapport corrélation LTE suivra de ANR2.
+
+### Versions
+
+| crate / package | 2.10.2 | 2.10.3 |
+|---|---|---|
+| `oiran-api` | 2.10.2 | **2.10.3** (patch) |
+| `live-probe` | 0.4.30 | **0.4.31** (patch) |
+| `@oiran/web` | 2.10.2 | **2.10.3** (patch — sync) |
+| `session-engine` | 0.5.5 | 0.5.5 |
+
+### Tests
+
+- `cargo test -p live-probe --lib -- --test-threads=1` : **121 PASS, 0 fail, 5 ignored**.
+- `cargo test -p oiran-api --lib` : **63 PASS, 0 fail**.
+- Bench `rss_fu3_bench 200000 500` : **vmhwm 12,9 MiB pass=YES** ; session loop **31 s vs 400 s** 2.10.2 → **13× speedup**.
+
+### Fichiers
+
+- `live-probe/src/lib.rs` :
+  - `CaptureMetrics` : nouveaux champs `open_segments`, `open_segment_paths`, `pending_segment_paths`, `zero_event_segments`, `zero_event_segment_paths`.
+  - `LiveDataset` : nouveau champ `zero_event_captures`.
+  - `trace_publication_rss` : `elapsed_ms` + `trace_publication_rss_reset`.
+  - `process_capture_into` : log `CONTINUOUS_SEGMENT_ZERO_EVENTS` + propagation.
+  - `publish_events_to_dataset_dir` : boucle batchée (`SESSION_PUBLICATION_BATCH_SIZE`, scratch files per-session).
+  - `retained_event_ids` scan skipped hors rétention.
+  - `state=PARTIAL` : log structuré + documentation.
+  - Nouveaux config env : `OIRAN_SESSION_PUBLICATION_BATCH_SIZE` (default 32).
+
+---
+
 ## OIRAN API 2.10.2 — 2026-11-10 — instrumentation anon-RSS par phase + publication bornée (devmat, ANR2 #9 comments 6765365357 + 6765466589)
 
 Patch ciblant **la cause OOM localisée par ANR2** : la mémoire fautive est **anonyme**, pas cache fichier, et surgit **après** l'écriture du JSONL (`CONTINUOUS_IMPORT_SEEN_IDS phase=after-merge`) et **avant** le manifeste. Cible : la sous-étape à l'intérieur de `publish_events_to_dataset_dir` — redécouverte des sessions, corrélation, construction des plans de session, génération des call-flows.
