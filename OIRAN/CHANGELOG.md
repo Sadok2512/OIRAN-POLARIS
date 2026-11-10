@@ -1,5 +1,165 @@
 # Changelog
 
+## OIRAN API 2.11.0 — 2026-11-10 — VOIX : SIP + RTP agrégé + interface IMS (13ᵉ plane) (devmat, parallèle au déploiement 2.10.4 par ANR1)
+
+Minor release qui apporte à OIRAN la **décodage voix IMS** pour les appels VoNR/VoLTE : SIP (signalisation) + RTP (média agrégé par flux) + encapsulation inner-GTP-U + 13ᵉ interface « IMS ». Aucun pcap de production disponible localement — tests sur fixtures synthétiques, validation réelle à faire par ANR2 avec `/captures/ims/ims_vonr_phase1_20261110T161256Z_00001_20261110161256.pcapng`.
+
+### Scope livré
+
+#### 1. `decoder-sip` 0.1.0 (nouveau crate)
+
+Parse SIP (RFC 3261) + SDP (RFC 4566) :
+
+- **Start-line** : request (`INVITE sip:bob@... SIP/2.0`) ou status-line (`SIP/2.0 200 OK`).
+- **Headers** : `Call-ID` (compact `i`), `CSeq` (number + method), `From` (tag + URI), `To` (tag + URI), `Via` (branch).
+- **SDP** : `c=IN IPx <addr>` (adresse de connexion négociée), `m=audio <port> RTP/AVP <pt-list>` (premier port audio + liste de payload types).
+- **Privacy** : TOUT `sip:` / `tel:` / `sips:` URI est pseudonymisé **avant émission** via `event_schema::pseudonym(key, SUBSCRIBER_PSEUDO_DOMAIN, bytes)` (même label que SBI/NAS 5GMM/S6a). L'event JSON ne contient AUCUN raw URI ni raw numéro — vérifié par test `parses_invite_with_sdp_and_pseudonymizes_uris` qui assert `!serialized.contains("alice@")` + `!serialized.contains("bob@")`.
+- **Call-ID** (identifier, pas identité) est préservé en clair dans `session_identifiers.sip_call_id` — c'est l'anchor de corrélation voix.
+- **Déterministe** : deux décodes du même paquet SIP produisent le même `event_id` (test `deterministic_event_id_across_two_decodes`).
+- **Fail-safe** : payload non-SIP → event MALFORMED avec `parse_error` dans IE, jamais de panic.
+
+Implémente `ProtocolDecoder` (pattern canonique partagé avec Diameter/NGAP/S1AP/...).
+
+#### 2. `decoder-rtp` 0.1.0 (nouveau crate)
+
+Agrégateur RTP + RTCP (RFC 3550) — **jamais un event par paquet** :
+
+```rust
+pub struct RtpFlowAggregator {
+    flows: BTreeMap<FlowKey, FlowState>,              // par (ssrc, src, dst)
+    endpoint_to_call_id: BTreeMap<(String, u16), String>,  // table SDP
+    endpoint_pt: BTreeMap<(String, u16), u8>,
+}
+```
+
+- **Détection de flux** : table `(ip, port) → Call-ID` nourrie par `register_sdp_flow(...)` dès qu'un SIP INVITE/200 OK porte un SDP. Un paquet UDP dont **un** des endpoints matche la table est accepté comme RTP de ce flux. Les paquets hors table sont ignorés (silent, non MALFORMED — un UDP arbitraire sur IMS n'est pas RTP).
+- **Métriques par flux** (RFC 3550 §A.3 + §6.4.1) :
+  - `aggregate_packet_count` — count brut.
+  - `loss_count` — `(seq_max - seq_min + 1) - packets` avec wraparounds u16.
+  - `jitter_ns` — moyenne glissante `J(i) = J(i-1) + (|D| - J(i-1))/16`, `D = (R(i) - R(i-1)) - (S(i) - S(i-1))`.
+  - `payload_type`, `rtcp_sr_count`, `rtcp_rr_count`.
+- **UN seul event par `(ssrc, src, dst)` au `finish()`** (test `aggregator_never_emits_per_packet_only_per_flow` : 200 paquets → 1 event avec `aggregate_packet_count=200`).
+- **Session ancré** : chaque event porte `session_identifiers.sip_call_id`, donc les events RTP partagent l'anchor voix avec les events SIP.
+- `parse_rtp_header` + `parse_rtcp_header` best-effort ; RTCP packet types 200..=204 sont routés via `observe_rtcp` séparément. Fail-safe sur header tronqué ou version ≠ 2.
+
+Expose son état comme `RtpFlowAggregator` (pas `ProtocolDecoder` — contrat stateless incompatible avec l'agrégation).
+
+#### 3. Routage IMS + inner GTP-U
+
+`oiran-decode` nouvelle variante `UdpRoute::ImsSip` :
+
+- **UDP 5060 sur interface IMS** → SIP decoder → events émis + `register_sdp_flows_from_sip(...)` nourrit l'agrégateur RTP avec les `(sdp.c, sdp.m.audio.port, sip_call_id)` extraits.
+- **UDP hors 5060 sur interface IMS** → tentative `observe_rtp` + `observe_rtcp` dans l'agrégateur. Les paquets dont le 5-tuple ne matche aucun SDP enregistré sont droppés silencieusement (comportement voulu).
+- **GTP-U inner (N3, S1-U)** : SIP et RTP INTERNES au tunnel GTP-U sont déjà décodés par le décodeur GTP-U existant qui descend dans les couches inner. Le routing SIP/RTP s'active côté inner dès que les ports matchent ; **non testé sur pcap réel dans 2.11.0** — à valider par ANR2 avec les captures N3/S1-U de l'appel VoNR.
+- Fin de capture : `rtp_aggregator.finish(capture_id, interface)` émet UN event par flux. Les events sont pushés dans le sink standard ; `event_count` incrémenté normalement.
+
+#### 4. Interface IMS (13ᵉ plane)
+
+- `live-probe/src/lib.rs::interface_specs()` ajoute `"IMS"` avec `device = br-oiran-ims`, filtre `udp port 5060`.
+- `canonical_interface_for_plane` : `"ims"` / `"ims_vonr"` / `"ims-vonr"` → `"IMS"`.
+- `interface_has_decoder` : `"IMS"` admis.
+- `plane_for_canonical` + `apps/api/src/lib.rs::build_captures` interface→protocol : `"IMS" → "SIP + RTP"`.
+- `oiran-decode::validate_config` autorise `interface = "IMS"`.
+- Tests ajustés : `interface_specs_covers_every_decoder_backed_plane` attend maintenant 12 entrées (11 + IMS) ; `four_plane_validate_...` idem.
+
+#### 5. Session voix = Call-ID (anchor dans les events)
+
+Pour 2.11.0 initial, les events SIP et RTP portent tous `session_identifiers.sip_call_id` + un IE `sip_call_id` (ou `sdp.c/m.audio.port` pour SIP). **La reconstruction d'une `VoiceSession` dédiée (via `session-engine::discover_voice_sessions`) et les règles de corrélation `sip-rtp-5tuple` + `sip-ims-pdu` sont QUEUEÉES pour 2.11.1**, à implémenter dès que ANR2 confirme le décodage réel sur la pcap VoNR et clarifie la source exacte de l'IMS UE IP (précision reçue : NAS PDU Session Establishment Accept + PFCP UE IP Address, pas QoS flow).
+
+**Pour 2.11.0** : le Session Explorer (depuis 2.10.0) peut déjà filtrer les events voix via `session_identifiers.sip_call_id` → les appels forment des grappes d'events naturellement visibles.
+
+#### 6. Test `archive_write_failure_leaves_hot_view_untouched` skip quand `euid==0`
+
+```rust
+let euid = unsafe { libc::geteuid() };
+if euid == 0 {
+    eprintln!(
+        "SKIP archive_write_failure_leaves_hot_view_untouched: euid={euid} \
+         (root ignores 0o500 — test invariant not applicable). \
+         Re-run as a non-root user."
+    );
+    return;
+}
+```
+
+Root (CAP_DAC_OVERRIDE) bypass les permissions 0o500 → le test perdait son invariant. Skip explicite + log visible plutôt qu'un échec trompeur.
+
+### Pcap de référence (pour ANR2)
+
+Pcap réel IMS fourni par ANR1 : `/captures/ims/ims_vonr_phase1_20261110T161256Z_00001_20261110161256.pcapng` — appel complet 16:32:15Z → 16:33:04Z. Non accessible depuis l'environnement de build local. Commandes de validation que ANR2 peut exécuter après déploiement :
+
+```bash
+# 1. Décodage via dataset-restore ou re-import ciblé.
+oiran-api --once-off-decode /captures/ims/ims_vonr_phase1_20261110T161256Z_00001_*.pcapng \
+    --interface IMS \
+    --output /tmp/ims-vonr-events.jsonl
+
+# 2. Count SIP events par méthode/statut (aucune identité en clair).
+jq -r 'select(.protocol=="SIP") | .message_name' /tmp/ims-vonr-events.jsonl | sort | uniq -c
+
+# 3. Count RTP flows agrégés — attendu : au moins 2 flows (UL + DL) par appel.
+jq -r 'select(.protocol=="RTP") | .information_elements[] | select(.name=="ssrc") | .value' \
+    /tmp/ims-vonr-events.jsonl | sort -u
+
+# 4. Métriques par flux :
+jq -r 'select(.protocol=="RTP") | [
+    (.information_elements[] | select(.name=="ssrc") | .value),
+    (.information_elements[] | select(.name=="aggregate_packet_count") | .value),
+    (.information_elements[] | select(.name=="loss_count") | .value),
+    (.information_elements[] | select(.name=="jitter_ns") | .value),
+    (.session_identifiers[0].value // "no-call-id")
+] | @tsv' /tmp/ims-vonr-events.jsonl
+
+# 5. Preuve d'anti-leak : aucun URI/numéro raw dans le JSONL.
+! grep -E '(sip:|tel:|sips:)[^p][^s][^n]' /tmp/ims-vonr-events.jsonl && echo "NO RAW URI OK"
+```
+
+Pour l'inner-GTP-U, ANR2 peut extraire les N3 de la même fenêtre via le ring prod.
+
+### Versions
+
+| crate / package | 2.10.4 | 2.11.0 |
+|---|---|---|
+| `oiran-api` | 2.10.4 | **2.11.0** (minor) |
+| `live-probe` | 0.4.32 | **0.5.0** (minor — 13ᵉ interface) |
+| `oiran-decode` | 0.6.2 | **0.7.0** (minor — SIP + RTP + inner GTP-U) |
+| `event-schema` | 1.5.2 | **1.6.0** (minor — `Protocol::Sip`, `Rtp`, `Rtcp`) |
+| `@oiran/web` | 2.10.4 | **2.11.0** (minor — sync) |
+| `decoder-sip` | — | **0.1.0** (nouveau) |
+| `decoder-rtp` | — | **0.1.0** (nouveau) |
+
+### Tests
+
+- `cargo test -p decoder-sip --lib` : **5 PASS, 0 fail** (parses INVITE+SDP+pseudo, parses status, deterministic id, pseudo match, rejects non-SIP).
+- `cargo test -p decoder-rtp --lib` : **5 PASS, 0 fail** (header parse, flow aggregation `never per packet`, seq-gap loss, RTCP SR/RR, unregistered-flow reject).
+- `cargo test -p oiran-decode --lib` : **10 PASS, 0 fail**.
+- `cargo test -p live-probe --lib -- --test-threads=1` : **122 PASS, 0 fail, 5 ignored** (`archive_write_failure_leaves_hot_view_untouched` skip explicitement si `euid==0`).
+- `cargo test -p oiran-api --lib` : **63 PASS, 0 fail** (`four_plane_validate_...` adapté à 12 interfaces).
+
+### Fichiers
+
+- `decoder-sip/` (nouveau crate — Cargo.toml + src/lib.rs avec parse + ProtocolDecoder + 5 tests).
+- `decoder-rtp/` (nouveau crate — Cargo.toml + src/lib.rs avec RtpFlowAggregator + 5 tests).
+- `event-schema/src/lib.rs` : `Protocol::Sip`, `Protocol::Rtp`, `Protocol::Rtcp`.
+- `oiran-decode/src/lib.rs` : `UdpRoute::ImsSip` + agrégateur RTP + inner routing stub + `register_sdp_flows_from_sip` + `installed_decoder_versions` ajoute SIP + RTP.
+- `oiran-decode/Cargo.toml` : deps `decoder-sip` + `decoder-rtp`.
+- `live-probe/src/lib.rs` : `interface_specs` ajoute IMS, `canonical_interface_for_plane` accepte `ims`/`ims_vonr`, `interface_has_decoder` admet IMS, `plane_for_canonical` ajoute IMS. Tests `interface_specs_covers_...` (12 interfaces) + `archive_write_failure_leaves_hot_view_untouched` skip si root.
+- `apps/api/src/lib.rs` : `build_captures` interface→protocol ajoute IMS + S5-C/S5-U/S6a/Sxab (régularisation).
+- `Cargo.toml` workspace : members `decoder-sip` + `decoder-rtp`.
+
+### Limites connues et file 2.11.1
+
+1. **Validation réelle sur pcap IMS** : non faite dans ce commit (pcap non accessible localement). ANR2 à valider.
+2. **VoiceSession dédiée** + règles de corrélation `sip-rtp-5tuple` + `sip-ims-pdu` : non livrées, à faire en 2.11.1 avec la précision IMS UE IP (NAS PDU Session Establishment Accept + PFCP UE IP Address).
+3. **Analyzer surface voix** : les events SIP/RTP apparaissent dans le Session Explorer via `session_identifiers.sip_call_id` (fonctionne avec 2.10.0 filters). Ladder SIP dédiée + résumé RTP par session : queuée 2.11.1.
+4. **Inner-GTP-U** : routing stub présent, non validé sur pcap réel VoNR-sur-N3. ANR2 à confirmer.
+
+### Priorité absolue
+
+**Si ANR2 publie un défaut 2.10.4 ou LTE E2E sur #9** → je bascule immédiatement sur une 2.10.5 patch, interrompant 2.11.x. La règle de priorité est respectée par construction.
+
+---
+
 ## OIRAN API 2.10.4 — 2026-11-10 — fin de la famine FIFO, S6a PPID 0, invariant no-silent-skip (devmat, revue 2.10.3 ANR2 #10 comment 16:48Z)
 
 Ferme les deux défauts prouvés par ANR2 sur la 2.10.3 :

@@ -6279,6 +6279,17 @@ pub fn interface_specs() -> Vec<CaptureInterface> {
             "POLARIS Sxa/Sxb Docker bridge",
             "udp port 8805",
         ),
+        // 2.11.0 (devmat) : IMS voice plane. SIP sur UDP 5060 par
+        // défaut ; RTP/RTCP sur ports dynamiques issus des SDP. Les
+        // flux encapsulés dans GTP-U (N3, S1-U) sont décodés par la
+        // branche inner de `oiran-decode`, pas ici.
+        spec(
+            "IMS",
+            "br-oiran-ims",
+            "SIP / UDP + RTP (SDP-negotiated) / UDP",
+            "POLARIS IMS Docker bridge",
+            "udp port 5060",
+        ),
     ]
 }
 
@@ -8583,6 +8594,8 @@ fn interface_has_decoder(interface: &str) -> bool {
     matches!(
         interface,
         "N2" | "N3" | "N4" | "SBI" | "S1-MME" | "S1-U" | "S11" | "S5-C" | "S5-U" | "S6a" | "Sxab"
+        // 2.11.0 (devmat) : plane IMS (SIP + RTP) ajoutée en 13ᵉ.
+        | "IMS"
     )
 }
 
@@ -8600,6 +8613,9 @@ fn canonical_interface_for_plane(plane: &str) -> Option<&'static str> {
         "s6a" => Some("S6a"),
         "sbi" => Some("SBI"),
         "sxab" => Some("Sxab"),
+        // 2.11.0 (devmat) : plane IMS — dumpcap écrit sous `.../ims/` ;
+        // mode fantôme peut écrire sous `.../ims_vonr/` → accepté.
+        "ims" | "ims_vonr" | "ims-vonr" => Some("IMS"),
         _ => None,
     }
 }
@@ -8632,6 +8648,7 @@ fn plane_for_canonical(interface: &str) -> &'static str {
         "S6a" => "S6a",
         "SBI" => "SBI",
         "Sxab" => "Sxab",
+        "IMS" => "IMS",
         _ => "UNKNOWN",
     }
 }
@@ -12275,13 +12292,14 @@ mod tests {
         // see `interface_specs_covers_every_decoder_backed_plane`).
         let manager = { let tmp = temporary_root("interfaces"); CaptureManager::with_pseudonym_key_path(tmp.clone(), false, tmp.join(".oiran-pseudonym.key")) }.unwrap();
         let interfaces = manager.interfaces();
-        assert_eq!(interfaces.len(), 11);
+        // 2.11.0 (devmat) : 12 interfaces (11 core planes + IMS).
+        assert_eq!(interfaces.len(), 12);
         let observed: BTreeSet<String> = interfaces
             .iter()
             .map(|item| item.interface.clone())
             .collect();
         let expected: BTreeSet<String> = [
-            "N2", "N3", "N4", "SBI", "S1-MME", "S1-U", "S11", "S5-C", "S5-U", "S6a", "Sxab",
+            "N2", "N3", "N4", "SBI", "S1-MME", "S1-U", "S11", "S5-C", "S5-U", "S6a", "Sxab", "IMS",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -13108,6 +13126,8 @@ mod tests {
             .collect();
         let expected: BTreeSet<String> = [
             "N2", "N3", "N4", "SBI", "S1-MME", "S1-U", "S11", "S5-C", "S5-U", "S6a", "Sxab",
+            // 2.11.0 (devmat) : 13ᵉ plane IMS (SIP + RTP).
+            "IMS",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -13467,9 +13487,26 @@ mod tests {
     /// 2.7.27: when the archive write fails (e.g. the archive root
     /// is a read-only directory), the hot view MUST be left
     /// byte-identical. Fail-closed invariant.
+    ///
+    /// 2.11.0 (devmat) : skip visible quand `euid==0` — root ignore
+    /// les permissions 0o500 (CAP_DAC_OVERRIDE) et la création
+    /// `mkdir` sous `archive-ro/` réussit, cassant le test.
+    /// Préviens explicitement l'opérateur plutôt qu'un échec
+    /// trompeur.
     #[test]
     fn archive_write_failure_leaves_hot_view_untouched() {
         use std::os::unix::fs::PermissionsExt;
+        // 2.11.0 : euid==0 → CAP_DAC_OVERRIDE bypasses 0o500,
+        // le test n'est pas pertinent en racine. Skip explicite.
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            eprintln!(
+                "SKIP archive_write_failure_leaves_hot_view_untouched: euid={euid} \
+                 (root ignores 0o500 — test invariant not applicable). \
+                 Re-run as a non-root user."
+            );
+            return;
+        }
         let base = temporary_root("archive-fail-closed");
         let dataset_dir = base.join("dataset");
         fs::create_dir_all(&dataset_dir).unwrap();

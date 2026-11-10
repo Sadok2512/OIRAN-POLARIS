@@ -20,6 +20,8 @@ members = [
     "decoder-gtpu",
     "decoder-gtpv2c",
     "decoder-diameter",
+    "decoder-sip",
+    "decoder-rtp",
     "oiran-decode",
     "session-engine",
     "correlation-engine",

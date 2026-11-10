@@ -10,8 +10,10 @@ use decoder_gtpu::GtpuDecoder;
 use decoder_gtpv2c::Gtpv2cDecoder;
 use decoder_ngap::NgapDecoder;
 use decoder_pfcp::PfcpDecoder;
+use decoder_rtp::RtpFlowAggregator;
 use decoder_s1ap::S1apDecoder;
 use decoder_sbi::{decode_connections, SbiDecodeReport};
+use decoder_sip::{SipDecoder, SIP_DEFAULT_PORT};
 use event_schema::{sha256_hex, Endpoint, NormalizedEvent, PacketReference, PseudonymKey};
 use plugin_runtime::{DecoderInput, ProtocolDecoder};
 use serde::{Deserialize, Serialize};
@@ -40,6 +42,8 @@ pub fn installed_decoder_versions() -> BTreeMap<String, String> {
         ("S1AP", decoder_s1ap::VERSION),
         ("Diameter", decoder_diameter::VERSION),
         ("SBI-HTTP2", decoder_sbi::VERSION),
+        ("SIP", decoder_sip::VERSION),
+        ("RTP", decoder_rtp::VERSION),
     ]
     .into_iter()
     .map(|(name, version)| (name.to_owned(), version.to_owned()))
@@ -56,6 +60,11 @@ enum UdpRoute {
     S5uGtpu,
     S5cGtpv2c,
     SxabPfcp,
+    /// 2.11.0 (devmat) : IMS plane — UDP/TCP 5060 porte le SIP ;
+    /// les ports négociés dans les SDP portent le RTP/RTCP et
+    /// sont routés via la table de flux RTP tenue par
+    /// `RtpFlowAggregator`.
+    ImsSip,
 }
 
 fn udp_route(interface: &str, source_port: u16, destination_port: u16) -> Option<UdpRoute> {
@@ -71,6 +80,8 @@ fn udp_route(interface: &str, source_port: u16, destination_port: u16) -> Option
         "S5-U" if has_port(2152) => Some(UdpRoute::S5uGtpu),
         "S5-C" if has_port(2123) => Some(UdpRoute::S5cGtpv2c),
         "Sxab" if has_port(8805) => Some(UdpRoute::SxabPfcp),
+        // 2.11.0 : IMS SIP.
+        "IMS" if has_port(SIP_DEFAULT_PORT) => Some(UdpRoute::ImsSip),
         _ => None,
     }
 }
@@ -190,6 +201,8 @@ where
     let gtpu = GtpuDecoder;
     let gtpv2c = Gtpv2cDecoder;
     let diameter = DiameterDecoder;
+    let sip = SipDecoder;
+    let mut rtp_aggregator = RtpFlowAggregator::new();
     let mut sctp = SctpReassembler::new();
     let mut tcp = TcpReassembler::new();
     let mut event_count = 0usize;
@@ -227,6 +240,7 @@ where
                         UdpRoute::S5uGtpu => (&gtpu, "S5-U"),
                         UdpRoute::S5cGtpv2c => (&gtpv2c, "S5-C"),
                         UdpRoute::SxabPfcp => (&pfcp, "Sxab"),
+                        UdpRoute::ImsSip => (&sip, "IMS"),
                     };
                     let mut decoded = Vec::new();
                     decode_udp(
@@ -238,7 +252,33 @@ where
                         &pseudonym_key,
                         &mut decoded,
                     );
+                    // 2.11.0 (devmat) : chaque SIP décodé peut porter un SDP ;
+                    // extraire `(ip, port)` + Call-ID + payload type et nourrir
+                    // l'agrégateur RTP qui tourne pour la même capture.
+                    if matches!(route, UdpRoute::ImsSip) {
+                        register_sdp_flows_from_sip(&decoded, &mut rtp_aggregator);
+                    }
                     emit_events(decoded, &mut sink, &mut event_count, &mut sink_error);
+                } else if config.interface == "IMS" {
+                    // 2.11.0 : paquet UDP IMS en dehors du port SIP 5060 → tenter
+                    // RTP/RTCP sur un flux déjà enregistré par un SDP.
+                    let src_ip = view.source_ip.as_str();
+                    let dst_ip = view.destination_ip.as_str();
+                    let payload = packet_payload_slice(&packet, &view);
+                    let arrival_ns = packet_arrival_ns(&packet);
+                    let packet_ref = build_packet_reference(&packet, config);
+                    let ts = build_timestamp(&packet);
+                    let _ = rtp_aggregator.observe_rtp(
+                        src_ip,
+                        ports.0,
+                        dst_ip,
+                        ports.1,
+                        payload,
+                        arrival_ns,
+                        &packet_ref,
+                        &ts,
+                    );
+                    let _ = rtp_aggregator.observe_rtcp(src_ip, ports.0, dst_ip, ports.1, payload);
                 }
             }
             TransportProtocol::Sctp => {
@@ -314,6 +354,16 @@ where
     );
     if let Some(error) = sink_error {
         return Err(error);
+    }
+    // 2.11.0 : émet UN event par flux RTP agrégé — jamais un event
+    // par paquet. L'agrégateur peut être vide si le dataset n'a vu
+    // aucune SDP + RTP ; c'est le cas habituel hors IMS.
+    let rtp_events = rtp_aggregator.finish(&config.capture_id, &config.interface);
+    for event in rtp_events {
+        if let Err(error) = sink(event) {
+            return Err(error);
+        }
+        event_count = event_count.saturating_add(1);
     }
     Ok(DecodeReport {
         capture_format: format!("{:?}", capture.format),
@@ -474,9 +524,11 @@ fn validate_config(config: &DecodeConfig) -> Result<(), String> {
         // (`CONTINUOUS_PLANE_COUNTED_NO_DECODER`).
         "N2" | "N3" | "N4" | "SBI" | "S1-MME" | "S1-U" | "S11"
             | "S5-C" | "S5-U" | "S6a" | "Sxab"
+            // 2.11.0 : plane IMS (SIP/RTP) ajoutée en 13ᵉ interface.
+            | "IMS"
     ) {
         return Err(
-            "interface must be N2, N3, N4, SBI, S1-MME, S1-U, S11, S5-C, S5-U, S6a or Sxab".into(),
+            "interface must be N2, N3, N4, SBI, S1-MME, S1-U, S11, S5-C, S5-U, S6a, Sxab or IMS".into(),
         );
     }
     Ok(())
@@ -517,6 +569,78 @@ fn endpoint(ip: &str, port: Option<u16>, map: &HashMap<String, String>) -> Endpo
         address: ip.into(),
         port,
         network_function: map.get(ip).cloned(),
+    }
+}
+
+/// 2.11.0 : helper pour l'IMS branch RTP — même shape que
+/// `packet_reference` ci-dessous, lié au config courant.
+fn build_packet_reference(packet: &CapturePacket, _config: &DecodeConfig) -> PacketReference {
+    packet_reference(packet)
+}
+
+fn build_timestamp(packet: &CapturePacket) -> event_schema::ExactTimestamp {
+    packet.metadata.timestamp.clone()
+}
+
+fn packet_payload_slice<'a>(packet: &'a CapturePacket, view: &TransportView) -> &'a [u8] {
+    let start = view.payload_offset;
+    let end = start.saturating_add(view.payload_length);
+    if end <= packet.data.len() {
+        &packet.data[start..end]
+    } else {
+        &[]
+    }
+}
+
+fn packet_arrival_ns(packet: &CapturePacket) -> u64 {
+    let ts = &packet.metadata.timestamp;
+    let seconds = ts.seconds.max(0) as u64;
+    seconds
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.nanoseconds as u64)
+}
+
+/// 2.11.0 : balaie les events SIP fraîchement décodés, extrait leur
+/// `sdp.c` + `sdp.m.audio.port` + Call-ID, et enregistre le flux
+/// correspondant auprès de l'agrégateur RTP. L'appel est idempotent.
+fn register_sdp_flows_from_sip(
+    events: &[NormalizedEvent],
+    aggregator: &mut RtpFlowAggregator,
+) {
+    for event in events {
+        let mut call_id: Option<String> = None;
+        let mut sdp_c: Option<String> = None;
+        let mut sdp_port: Option<u16> = None;
+        let mut sdp_pt: Option<u8> = None;
+        for id in &event.session_identifiers {
+            if id.name == "sip_call_id" {
+                call_id = Some(id.value.clone());
+            }
+        }
+        for ie in &event.information_elements {
+            match ie.name.as_str() {
+                "sdp.c" => sdp_c = ie.value.clone(),
+                "sdp.m.audio.port" => {
+                    sdp_port = ie.value.as_deref().and_then(|v| v.parse::<u16>().ok());
+                }
+                "sdp.m.audio.pt" => {
+                    sdp_pt = ie
+                        .value
+                        .as_deref()
+                        .and_then(|v| v.split(',').next())
+                        .and_then(|first| first.parse::<u8>().ok());
+                }
+                _ => {}
+            }
+        }
+        if let (Some(ip), Some(port), Some(cid)) = (sdp_c, sdp_port, call_id) {
+            aggregator.register_sdp_flow(decoder_rtp::SdpFlowRegistration {
+                ip,
+                port,
+                call_id: cid,
+                payload_type: sdp_pt,
+            });
+        }
     }
 }
 

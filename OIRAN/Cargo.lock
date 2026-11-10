@@ -316,6 +316,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "decoder-rtp"
+version = "0.1.0"
+dependencies = [
+ "event-schema",
+]
+
+[[package]]
 name = "decoder-s1ap"
 version = "0.2.0"
 dependencies = [
@@ -333,6 +340,14 @@ dependencies = [
  "hpack",
  "serde_json",
  "transport-tcp",
+]
+
+[[package]]
+name = "decoder-sip"
+version = "0.1.0"
+dependencies = [
+ "event-schema",
+ "plugin-runtime",
 ]
 
 [[package]]
@@ -355,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "event-schema"
-version = "1.5.2"
+version = "1.6.0"
 dependencies = [
  "serde_json",
 ]
@@ -532,7 +547,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "live-probe"
-version = "0.4.32"
+version = "0.5.0"
 dependencies = [
  "callflow-renderer",
  "callflow-schema",
@@ -632,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.10.4"
+version = "2.11.0"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -668,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "capture-pcap",
  "decoder-diameter",
@@ -677,8 +692,10 @@ dependencies = [
  "decoder-nas",
  "decoder-ngap",
  "decoder-pfcp",
+ "decoder-rtp",
  "decoder-s1ap",
  "decoder-sbi",
+ "decoder-sip",
  "event-schema",
  "plugin-runtime",
  "serde",

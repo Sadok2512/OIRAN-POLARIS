@@ -546,6 +546,12 @@ fn build_captures(dataset_dir: &FsPath, manifest: &Value) -> Result<Vec<Value>, 
                 "S1-MME" => "S1AP",
                 "S11" => "GTPv2-C",
                 "S1-U" => "GTP-U",
+                "S5-C" => "GTPv2-C",
+                "S5-U" => "GTP-U",
+                "S6a" => "Diameter",
+                "Sxab" => "PFCP",
+                // 2.11.0 (devmat) : IMS plane.
+                "IMS" => "SIP + RTP",
                 _ => "UNKNOWN",
             };
             Ok(json!({
@@ -5639,12 +5645,13 @@ mod tests {
         assert_eq!(body["data"]["validation"]["valid"], true);
         // 2.9.2 (#9 comment 6710853974): the allowlist carries 11
         // decoder-backed planes (N2/N3/N4/SBI + 7 LTE core planes).
+        // 2.11.0 (devmat) : 13ᵉ plane IMS (SIP + RTP) → 12 maintenant.
         assert_eq!(
             body["data"]["validation"]["interfaces"]
                 .as_array()
                 .unwrap()
                 .len(),
-            11
+            12
         );
         helper_thread.join().unwrap();
         let _ = fs::remove_dir_all(manager_root);

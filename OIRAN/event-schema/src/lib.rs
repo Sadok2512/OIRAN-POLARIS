@@ -37,6 +37,18 @@ pub enum Protocol {
     Gtpu,
     Sctp,
     SbiHttp2,
+    /// 2.11.0 (devmat) — Session Initiation Protocol (RFC 3261) for IMS
+    /// voice signalling. Carried over UDP/TCP 5060 on the IMS plane,
+    /// and inner to GTP-U on N3 / S1-U once observed in SDP offers.
+    Sip,
+    /// 2.11.0 (devmat) — Real-time Transport Protocol (RFC 3550). Flow
+    /// detection is driven by the SIP SDP `c=` + `m=audio` observations ;
+    /// events are AGGREGATED per SSRC (one event per flow at finish),
+    /// never one event per RTP packet.
+    Rtp,
+    /// 2.11.0 (devmat) — RTCP Sender/Receiver Reports (RFC 3550 §6).
+    /// Also aggregated per SSRC.
+    Rtcp,
     Unknown,
 }
 impl Protocol {
@@ -55,6 +67,9 @@ impl Protocol {
             Self::Gtpu => "GTP-U",
             Self::Sctp => "SCTP",
             Self::SbiHttp2 => "SBI-HTTP2",
+            Self::Sip => "SIP",
+            Self::Rtp => "RTP",
+            Self::Rtcp => "RTCP",
             Self::Unknown => "UNKNOWN",
         }
     }
