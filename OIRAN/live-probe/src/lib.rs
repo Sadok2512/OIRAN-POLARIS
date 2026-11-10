@@ -2574,29 +2574,123 @@ impl CaptureManager {
                 }
                 let (native_owned_bytes, native_job_count) =
                     native_owned_usage(&config.source_root)?;
-                if native_owned_bytes > config.max_owned_bytes
-                    || native_job_count > usize::from(config.max_segments)
-                {
+                // 2.11.2 (devmat, revue ANR1 — plus d'arrêt silencieux
+                // sur BLOCKED). Règle projet :
+                //   * blocage à 99 % des `max_owned_bytes`
+                //   * alerte à 95 % des `max_owned_bytes`
+                //   * sur les octets réellement possédés par OIRAN
+                //     (`native_owned_bytes`), pas le FS entier.
+                // Pré-2.11.2 : `> max_owned_bytes` (= 100 %) + `return
+                // Ok(())` arrêtait la boucle d'import en silence
+                // jusqu'à un redémarrage de l'API. ANR1 a dû
+                // rollback 2.10.4 (`BOUNDED_STORAGE_FULL` sans
+                // reprise auto).
+                // 2.11.2 : garde dans la boucle, ne retourne jamais ;
+                // réévaluation périodique → reprise auto dès que la
+                // cause (bytes > 99 %) disparaît.
+                let block_threshold_bytes = native_percentile_of_max(
+                    config.max_owned_bytes,
+                    99,
+                );
+                let alert_threshold_bytes = native_percentile_of_max(
+                    config.max_owned_bytes,
+                    95,
+                );
+                let over_block = native_owned_bytes >= block_threshold_bytes
+                    || native_job_count > usize::from(config.max_segments);
+                let over_alert = native_owned_bytes >= alert_threshold_bytes
+                    && !over_block;
+                if over_block {
                     self.update(CONTINUOUS_CAPTURE_ID, |job| {
                         job.state = CaptureState::Blocked;
                         job.error = Some("CONTINUOUS_NATIVE_AGGREGATE_BUDGET".into());
                         job.stop_reason = Some("BOUNDED_STORAGE_FULL".into());
-                        job.ended_epoch_ms = Some(epoch_ms());
+                        // 2.11.2 : n'écrase pas `ended_epoch_ms` ici —
+                        // la boucle reste vivante, pas « ended ».
                     })?;
-                    return Ok(());
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_IMPORT_BLOCKED",
+                            "reason": "BOUNDED_STORAGE_FULL",
+                            "native_owned_bytes": native_owned_bytes,
+                            "max_owned_bytes": config.max_owned_bytes,
+                            "block_threshold_bytes": block_threshold_bytes,
+                            "native_job_count": native_job_count,
+                            "max_segments": config.max_segments,
+                            "auto_resume": "on next scan when bytes < 99% and job_count ≤ max",
+                        })
+                    );
+                    thread::sleep(config.scan_interval.min(Duration::from_secs(5)));
+                    continue;
+                } else if over_alert {
+                    self.update(CONTINUOUS_CAPTURE_ID, |job| {
+                        job.error = Some(format!(
+                            "CONTINUOUS_NATIVE_BUDGET_WARN: {:.1}% owned bytes",
+                            (native_owned_bytes as f64 / config.max_owned_bytes as f64) * 100.0
+                        ));
+                    })?;
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_IMPORT_STORAGE_ALERT",
+                            "native_owned_bytes": native_owned_bytes,
+                            "max_owned_bytes": config.max_owned_bytes,
+                            "alert_threshold_bytes": alert_threshold_bytes,
+                            "percent": (native_owned_bytes as f64 / config.max_owned_bytes as f64) * 100.0,
+                        })
+                    );
+                } else {
+                    // 2.11.2 : condition disparue → reprise auto.
+                    // Si l'état précédent était Blocked, re-transition
+                    // Capturing (sans redémarrage).
+                    self.update(CONTINUOUS_CAPTURE_ID, |job| {
+                        if job.state == CaptureState::Blocked {
+                            eprintln!(
+                                "{}",
+                                serde_json::json!({
+                                    "event": "CONTINUOUS_IMPORT_RESUMED",
+                                    "reason": "BOUNDED_STORAGE_FULL cleared",
+                                    "native_owned_bytes": native_owned_bytes,
+                                    "max_owned_bytes": config.max_owned_bytes,
+                                })
+                            );
+                            job.state = CaptureState::Capturing;
+                            job.stop_reason = None;
+                            job.ended_epoch_ms = None;
+                        }
+                        if job.error.as_deref() == Some("CONTINUOUS_NATIVE_AGGREGATE_BUDGET") {
+                            job.error = None;
+                        }
+                    })?;
                 }
                 if terminal_native_captures.is_empty() {
                     match self.run_native_segment(config) {
                         Ok(capture_id) => terminal_native_captures.push(capture_id),
                         Err(error) => {
                             if error.contains("DISK_SAFETY") {
+                                // 2.11.2 : disque plein → BLOCKED visible + retry.
+                                // Pas de return Ok(()) : la boucle reste vivante
+                                // et re-tentera à chaque scan dès que
+                                // run_native_segment n'échoue plus sur DISK_SAFETY.
                                 self.update(CONTINUOUS_CAPTURE_ID, |job| {
                                     job.state = CaptureState::Blocked;
                                     job.error = Some(error.clone());
                                     job.stop_reason = Some("DISK_SAFETY_POLICY".into());
-                                    job.ended_epoch_ms = Some(epoch_ms());
+                                    // ended_epoch_ms NOT set — the worker is
+                                    // alive and will auto-resume.
                                 })?;
-                                return Ok(());
+                                eprintln!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "event": "CONTINUOUS_IMPORT_BLOCKED",
+                                        "reason": "DISK_SAFETY_POLICY",
+                                        "detail": error,
+                                        "auto_resume": "on next scan when disk safety policy allows capture",
+                                    })
+                                );
+                                thread::sleep(config.scan_interval.min(Duration::from_secs(5)));
+                                continue;
                             }
                             self.update(CONTINUOUS_CAPTURE_ID, |job| {
                                 job.metrics.ingestion_failures =
@@ -2907,6 +3001,36 @@ impl CaptureManager {
             // `metrics.pending_batch_segments` and logged once per
             // deferred segment so no skip is silent.
             let mut pending_batch_this_scan: usize = 0;
+            // 2.11.2 (devmat, revue ANR1) : un segment qui a un
+            // SUCCESSEUR (= lex-plus-grand existe dans l'interface)
+            // est stable par définition — dumpcap est passé à la
+            // rotation suivante, le fichier courant ne reçoit plus
+            // d'écriture. La garde de stabilité qui exigeait 2 scans
+            // était redondante pour ces cas. 2.11.2 ingère ces
+            // segments **dès le premier scan** et réserve la garde
+            // aux (rares) cas où le segment est lex-greatest avec
+            // rotation record (preuve plus faible, peut encore
+            // recevoir un flush out-of-order théorique).
+            let mut max_filename_by_iface: BTreeMap<String, String> = BTreeMap::new();
+            for candidate in &candidates {
+                let filename = candidate
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                if filename.is_empty() {
+                    continue;
+                }
+                max_filename_by_iface
+                    .entry(candidate.interface.clone())
+                    .and_modify(|current| {
+                        if filename > *current {
+                            *current = filename.clone();
+                        }
+                    })
+                    .or_insert(filename);
+            }
             let mut candidate_iter = candidates.into_iter();
             while let Some(candidate) = candidate_iter.next() {
                 if state.seen_checksums.contains(&candidate.checksum) {
@@ -2915,7 +3039,20 @@ impl CaptureManager {
                 let fingerprint = (candidate.size_bytes, candidate.modified);
                 let stable_across_scans = observed.get(&candidate.path) == Some(&fingerprint);
                 observed.insert(candidate.path.clone(), fingerprint);
-                if config.native_segment_seconds.is_none() && !stable_across_scans {
+                // 2.11.2 : « successeur présent = stable par définition ».
+                let candidate_filename = candidate
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                let has_successor = max_filename_by_iface
+                    .get(&candidate.interface)
+                    .map(|max| max.as_str() > candidate_filename)
+                    .unwrap_or(false);
+                if config.native_segment_seconds.is_none()
+                    && !has_successor
+                    && !stable_across_scans
+                {
                     pending_stability_this_scan =
                         pending_stability_this_scan.saturating_add(1);
                     // 2.9.8 (#9 comment 6725097122): per-segment log —
@@ -4872,6 +5009,16 @@ impl CaptureManager {
                 // dans LiveDataset.zero_event_captures. Jamais
                 // d'identité abonné dans ce log (chemin + SHA + 0).
                 if report.events == 0 {
+                    // 2.11.2 (devmat, revue ANR1 — ANR2 observed 341
+                    // ZERO_EVENTS on 2.10.4 run) : enrichir le log
+                    // avec `packets` (trames observées par
+                    // `capture_pcap::visit_capture`), `transport_errors`,
+                    // `sctp_errors`, `incomplete_sctp`,
+                    // `warnings`. Un pcap `packets=0` → vraiment vide
+                    // = ZERO_EVENTS légitime. Un pcap `packets>0` mais
+                    // `events=0` = soit keepalive agrégé par un autre
+                    // décodeur, soit traffic non-reconnu par le
+                    // décodeur (défaut à investiguer).
                     let capture_sha = format!("sha256:{}", &checksum);
                     eprintln!(
                         "{}",
@@ -4880,6 +5027,21 @@ impl CaptureManager {
                             "path": path.display().to_string(),
                             "capture_id": capture_sha,
                             "interface": interface.interface,
+                            "capture_format": report.capture_format.clone(),
+                            "packets_in_pcap": report.packets,
+                            "transport_errors": report.transport_errors,
+                            "sctp_errors": report.sctp_errors,
+                            "incomplete_sctp": report.incomplete_sctp,
+                            "tcp_connections": report.tcp_connections,
+                            "tcp_errors": report.tcp_errors,
+                            "warnings": report.warnings,
+                            "legitimacy_hint": if report.packets == 0 {
+                                "empty_pcap_legitimate"
+                            } else if report.transport_errors > 0 || report.sctp_errors > 0 {
+                                "transport_errors_present_investigate"
+                            } else {
+                                "traffic_present_decoded_zero_events_investigate"
+                            },
                         })
                     );
                     zero_event_captures.push(capture_sha);
@@ -7303,6 +7465,14 @@ fn native_capture_fully_ingested(
         }
     }
     Ok(true)
+}
+
+/// 2.11.2 (devmat, règle projet « blocage à 99 %, alerte à 95 %
+/// sur les octets réellement possédés par OIRAN ») : seuil calculé
+/// en octets. `saturating_mul` + division par 100 évite les
+/// débordements sur un cap ≥ u64::MAX/100.
+fn native_percentile_of_max(max_owned_bytes: u64, percent: u64) -> u64 {
+    max_owned_bytes.saturating_mul(percent) / 100
 }
 
 fn native_owned_usage(root: &Path) -> Result<(u64, usize), String> {

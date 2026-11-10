@@ -1,5 +1,176 @@
 # Changelog
 
+## OIRAN API 2.11.2 — 2026-11-10 — BLOCKED non-silent + auto-resume + stability skip successor + ZERO_EVENTS enrichi (devmat, revue ANR1)
+
+Patch au-dessus de 2.11.1 (`482861a`). Ne dépend PAS de la cause publiée par ANR1 — attaque les trois axes indépendants pointés par la revue.
+
+### (a) BLOCKED : plus jamais d'arrêt silencieux, auto-resume dès que la cause disparaît
+
+**Cause fichier:ligne (pré-2.11.2)** : `live-probe/src/lib.rs:2581` et `:2594` faisaient `return Ok(())` après avoir marqué le job `Blocked` — la boucle d'import se terminait proprement SANS message visible côté opérateur, sans reprise. Un redémarrage de `oiran-api` était la seule façon de relancer l'import.
+
+**Règle projet (ANR1)** : blocage à **99 %** des octets réellement possédés par OIRAN (`native_owned_bytes`), alerte à **95 %**, auto-reprise dès que la cause disparaît sans redémarrage.
+
+**Fix 2.11.2** :
+
+- Seuils précis via `native_percentile_of_max(max_owned_bytes, 99)` / `(..., 95)` — multiplication saturante pour éviter les débordements.
+- Au lieu de `return Ok(())` :
+  - `job.state = CaptureState::Blocked` (visible via `/metrics`).
+  - Log structuré ligne unique `CONTINUOUS_IMPORT_BLOCKED {reason, native_owned_bytes, max_owned_bytes, block_threshold_bytes, auto_resume: "..."}`.
+  - **Pas de `return`** — `thread::sleep(...) ; continue;` garde la boucle vivante.
+  - `job.ended_epoch_ms` reste `None` : le worker est alive.
+- Lorsque la condition disparaît (bytes < 99 % ET job_count ≤ max) :
+  - Si state était `Blocked` → transition à `Capturing`, log `CONTINUOUS_IMPORT_RESUMED`, efface `stop_reason` + `ended_epoch_ms`.
+  - Efface l'erreur `CONTINUOUS_NATIVE_AGGREGATE_BUDGET`.
+- Zone 95 % ≤ bytes < 99 % :
+  - State reste `Capturing`.
+  - Log `CONTINUOUS_IMPORT_STORAGE_ALERT` + `job.error` avec le pourcentage exact (alerte visible sans bloquer).
+
+**Deux sites corrigés** :
+
+1. `BOUNDED_STORAGE_FULL` (native budget exceeded) → thresholds 99/95 + retry.
+2. `DISK_SAFETY_POLICY` (`run_native_segment` fails on `DISK_SAFETY`) → `continue` au lieu de `return`, retry à chaque scan dès que le disque libère.
+
+**Observation** :
+
+```bash
+# État blocké + raison + conditions de reprise.
+curl -fsS http://127.0.0.1:49152/api/v1/metrics | jq '.data|{
+  capture_state, capture_stop_reason, capture_error
+}'
+# Logs transitions.
+journalctl -u oiran-api --since '-10min' --no-pager -o short-iso \
+  | rg 'CONTINUOUS_IMPORT_(BLOCKED|RESUMED|STORAGE_ALERT)'
+```
+
+### (b) Garde de stabilité : successeur présent = stable par définition
+
+**Cause fichier:ligne (pré-2.11.2)** : `live-probe/src/lib.rs:2914-2934` exigeait **2 observations identiques (size, mtime)** avant d'admettre un candidat, même quand un fichier **successeur existait dans la même interface** (= dumpcap est déjà passé à la rotation suivante, le candidate ne reçoit plus d'écriture). Résultat : chaque segment fermé attendait un scan de plus (jusqu'à `MAX_IDLE_SLEEP = 10 s`) pour rien.
+
+**Fix 2.11.2** :
+
+```rust
+let mut max_filename_by_iface: BTreeMap<String, String> = ...; // calculé
+let has_successor = max_filename_by_iface
+    .get(&candidate.interface)
+    .map(|max| max.as_str() > candidate_filename)
+    .unwrap_or(false);
+if !has_successor && !stable_across_scans {
+    // stability check préservée pour le lex-greatest avec rotation
+    // record (preuve plus faible).
+}
+```
+
+Un segment proven-by-sequence (= a un successeur) est admis **au premier scan**. Un segment proven-by-rotation-record (lex-greatest + closure attestée) continue d'être protégé par la garde de stabilité (defensive, protège contre un flush out-of-order théorique).
+
+**Impact attendu** sur le dataset ANR2 (20 pending, tous ayant un successeur) : **drain divisé par 2** — l'étape « stability wait » qui coûtait `scan_interval` est supprimée. Combinée à l'oldest-first de 2.10.4, drain d'un segment fermé = `scan_interval` + publish_duration (si batch de ≥ 1).
+
+### (c) 341 `CONTINUOUS_SEGMENT_ZERO_EVENTS` — légitime ou défaut ?
+
+**Hypothèse mécanique** (vérifiable par ANR2 avec les commandes ci-dessous) :
+
+`report.events` est la somme `individual_events + n3_aggregates + keepalive_aggregates`. `report.events == 0` signifie :
+
+1. Pas d'événement individuel décodé (aucune trame reconnue par un décodeur).
+2. Pas de N3 flow aggregate (aucun GTP-U vu).
+3. Pas de keepalive aggregate (aucun PFCP Heartbeat / Diameter Device-Watchdog / GTPv2 Echo / GTP-U Echo).
+
+Trois sous-cas :
+
+- **Pcap vide (`packets=0`)** : SACK/HEARTBEAT SCTP, UDP de contrôle, trames < 24 B filtrées → **légitime**.
+- **Pcap avec trames mais `transport_errors > 0`** : trames malformées, PPID inconnu → **investiguer** (défaut potentiel d'un décodeur ou d'un gate de routage).
+- **Pcap avec trames décodables mais 0 event** : traffic reconnaissable (Diameter, NGAP, PFCP...) ignoré → **défaut à investiguer**.
+
+**2.11.2 enrichit le log `CONTINUOUS_SEGMENT_ZERO_EVENTS`** pour discriminer les trois sous-cas immédiatement :
+
+```json
+{
+  "event": "CONTINUOUS_SEGMENT_ZERO_EVENTS",
+  "path": "...",
+  "capture_id": "sha256:...",
+  "interface": "S6a",
+  "capture_format": "Pcapng",
+  "packets_in_pcap": 490,
+  "transport_errors": 0,
+  "sctp_errors": 0,
+  "incomplete_sctp": 0,
+  "tcp_connections": 0,
+  "tcp_errors": 0,
+  "warnings": 0,
+  "legitimacy_hint": "traffic_present_decoded_zero_events_investigate"
+}
+```
+
+`legitimacy_hint` prend trois valeurs :
+
+- `empty_pcap_legitimate` — `packets=0` → aucun doute.
+- `transport_errors_present_investigate` — `transport_errors > 0` ou `sctp_errors > 0`.
+- `traffic_present_decoded_zero_events_investigate` — pcap non vide, décodeurs transport OK, mais 0 event (défaut probable).
+
+**Commandes tshark de preuve** (pour ANR2 sur 2 segments cités dans le journal 2.10.4 run) :
+
+```sh
+# 1. Identifier 2 segments qui ont déclenché ZERO_EVENTS, avec hint.
+journalctl -u oiran-api --since '2026-11-10 20:35:47' --until '2026-11-10 20:48:00' --no-pager -o cat \
+  | rg 'CONTINUOUS_SEGMENT_ZERO_EVENTS' \
+  | head -2 \
+  | jq -r '[.path, .interface, .packets_in_pcap, .legitimacy_hint] | @tsv'
+
+# 2. Pour chaque path <PATH>, extraire les commandes détectables.
+# S6a Diameter attendu : DWR/DWA, ULR, AIR, PUR, Cancel-Location.
+tshark -n -r <PATH> -Y 'diameter' -T fields -e _ws.col.Info | sort | uniq -c
+
+# 3. Interfaces N3/S1-U (GTP-U) attendues : G-PDU, Echo, Error Indication.
+tshark -n -r <PATH> -Y 'gtp' -T fields -e _ws.col.Info | sort | uniq -c
+
+# 4. Si (2) et (3) retournent VIDE sur un pcap avec packets > 0 →
+#    traffic non reconnu → défaut à investiguer.
+# 5. Si Diameter DWR/DWA observé mais 0 events décodés → bug keepalive
+#    aggregator (devrait émettre au moins 1 agrégat).
+# 6. Si pcap entièrement SACK/HEARTBEAT SCTP sans chunk DATA →
+#    légitime (dump d'une période idle).
+```
+
+**Attente ANR2** : sortie brute de ces commandes sur 2 segments (S6a `_00071`/`_00072` par exemple). Selon le `legitimacy_hint` majoritaire dans les 341, je corrige :
+
+- Si majorité `empty_pcap_legitimate` → **aucun défaut**, le compteur devrait rester informationnel.
+- Si majorité `traffic_present_decoded_zero_events_investigate` → **défaut décodeur** à cibler précisément (2.11.3+).
+- Si mélange → tri par interface + protocole pour localiser.
+
+### Non-dépendance de la cause ANR1
+
+Ce patch n'attend PAS « BLOCKED — CAUSE » publiée par ANR1. Dès que cette cause paraît sur #9, je corrigerai la cause précise selon la règle projet (99 %/95 % sur les octets OIRAN — déjà en place via (a)).
+
+### Versions
+
+| crate / package | 2.11.1 | 2.11.2 |
+|---|---|---|
+| `oiran-api` | 2.11.1 | **2.11.2** (patch) |
+| `live-probe` | 0.5.0 | **0.5.1** (patch) |
+| `@oiran/web` | 2.11.1 | **2.11.2** (sync) |
+| `oiran-decode` | 0.7.1 | 0.7.1 |
+| `event-schema` | 1.6.0 | 1.6.0 |
+| `decoder-sip` / `decoder-rtp` | 0.1.0 | 0.1.0 |
+
+### Tests
+
+- `cargo test -p live-probe --lib -- --test-threads=1` : **122 PASS, 0 fail, 5 ignored**.
+- `cargo test -p oiran-api --lib` : **63 PASS, 0 fail**.
+- `cargo test -p oiran-decode --lib` : **12 PASS, 0 fail**.
+
+### Fichiers
+
+- `live-probe/src/lib.rs` :
+  - `native_percentile_of_max` (helper 99 %/95 %).
+  - `BOUNDED_STORAGE_FULL` + `DISK_SAFETY_POLICY` : plus de `return Ok(())`, retry + auto-resume.
+  - Stability skip quand `has_successor`.
+  - `CONTINUOUS_SEGMENT_ZERO_EVENTS` enrichi avec `packets_in_pcap`, `transport_errors`, `sctp_errors`, `incomplete_sctp`, `warnings`, `legitimacy_hint`.
+
+### Priorité absolue maintenue
+
+Si ANR1 publie la cause (10 vs 20, pending figé) sur #9 → bascule immédiate sur 2.11.3 avec la correction ciblée.
+
+---
+
 ## OIRAN API 2.11.1 — 2026-11-10 — expose metrics fields + non-régression N3/S1-U + drain latency documentée (devmat, revue ANR1 #10 comment 6778895992 rollback 2.10.4)
 
 Patch directement au-dessus de 2.11.0 (`70d39db`) pour répondre au rollback 2.10.4 par ANR1 à 20:49Z. **Cause du rollback** : le gate « file descendante en 10 min » a échoué (pending 10 → 10) parce que **les nouveaux champs `pending_segment_paths`, `open_segments`, `zero_event_segments` existaient dans `job.metrics` mais le handler API ne les exposait pas** — ANR1 lisait `null` sur chaque champ, impossible de distinguer « 10 segments ouverts par dumpcap » vs « 10 segments fermés bloqués ». 2.11.1 ferme ce défaut + ajoute la non-régression N3/S1-U demandée + publie le délai de drainage garanti.
