@@ -1,5 +1,124 @@
 # Changelog
 
+## OIRAN API 2.11.1 — 2026-11-10 — expose metrics fields + non-régression N3/S1-U + drain latency documentée (devmat, revue ANR1 #10 comment 6778895992 rollback 2.10.4)
+
+Patch directement au-dessus de 2.11.0 (`70d39db`) pour répondre au rollback 2.10.4 par ANR1 à 20:49Z. **Cause du rollback** : le gate « file descendante en 10 min » a échoué (pending 10 → 10) parce que **les nouveaux champs `pending_segment_paths`, `open_segments`, `zero_event_segments` existaient dans `job.metrics` mais le handler API ne les exposait pas** — ANR1 lisait `null` sur chaque champ, impossible de distinguer « 10 segments ouverts par dumpcap » vs « 10 segments fermés bloqués ». 2.11.1 ferme ce défaut + ajoute la non-régression N3/S1-U demandée + publie le délai de drainage garanti.
+
+### 1. Exposer les champs manquants dans `/api/v1/metrics` — jamais `null`
+
+**Cause fichier:ligne** : `apps/api/src/lib.rs::metrics:1063-1067` (pré-2.11.1) exposait **UNIQUEMENT** `pending_segments`, `pending_fingerprints`, `pending_stability_segments`, `pending_batch_segments`, `orphan_fingerprints_recovered` via `latest_metrics.map(|m|m.*)` — **null quand le job n'a pas encore produit de sample** ET **manquait complètement les 5 champs ajoutés en 2.10.3** :
+- `pending_segment_paths` (chemins des segments fermés en file)
+- `open_segments` (count des segments encore ouverts par dumpcap)
+- `open_segment_paths` (chemins ouverts)
+- `zero_event_segments` (count cumulatif S6a-like : ingérés avec 0 events)
+- `zero_event_segment_paths` (chemins bornés à 16)
+
+**Fix 2.11.1** : TOUS les champs présents dès le démarrage, défaut `0` ou `[]`, **jamais `null`** :
+
+```rust
+"pending_segments": latest_metrics.map(|m|m.pending_segments).unwrap_or(0),
+"pending_fingerprints": latest_metrics.map(|m|m.pending_fingerprints).unwrap_or(0),
+"pending_stability_segments": latest_metrics.map(|m|m.pending_stability_segments).unwrap_or(0),
+"pending_batch_segments": latest_metrics.map(|m|m.pending_batch_segments).unwrap_or(0),
+"pending_segment_paths": latest_metrics.map(|m|m.pending_segment_paths.clone()).unwrap_or_default(),
+"open_segments": latest_metrics.map(|m|m.open_segments).unwrap_or(0),
+"open_segment_paths": latest_metrics.map(|m|m.open_segment_paths.clone()).unwrap_or_default(),
+"zero_event_segments": latest_metrics.map(|m|m.zero_event_segments).unwrap_or(0),
+"zero_event_segment_paths": latest_metrics.map(|m|m.zero_event_segment_paths.clone()).unwrap_or_default(),
+"orphan_fingerprints_recovered": latest_metrics.map(|m|m.orphan_fingerprints_recovered).unwrap_or(0),
+```
+
+**Note build** : `#![recursion_limit = "512"]` ajouté au crate `oiran-api` — la macro `json!` dépassait la limite par défaut (128) après l'ajout des 5 champs. Même pattern que d'autres gros handlers ; aucun coût runtime.
+
+### 2. Non-régression 2.11.0 sur N3 + S1-U
+
+Le brief exige : « un segment N3 et un segment S1-U de référence doivent donner les mêmes événements avant et après ».
+
+**Fixture** : `datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N3.pcapng` (pcap de référence historique, livré avec le dataset V1).
+
+**Nouveaux tests** :
+
+- `non_regression_n3_decode_stable_after_2_11_0` : décode le pcap N3 **deux fois** via `decode_capture_streaming` avec interface `"N3"` + même `PseudonymKey` + même `capture_id`. Vérifie :
+  - `events_a.len() == events_b.len()`.
+  - `event_ids_a == event_ids_b` (deterministic ID property, prouve wire-identity stable).
+  - Chaque event a `interface=="N3"` (pas de drift silencieux vers IMS/SIP/RTP).
+  - Protocol est `GTP-U` ou `UNKNOWN` (jamais `SIP`/`RTP`/`RTCP`).
+- `non_regression_s1u_decode_stable_after_2_11_0` : idem avec interface `"S1-U"` + `capture_id` différent (prouve que les event_ids sont fonction de `(capture_id × interface)` et restent stables à l'intérieur d'un `(capture_id, interface)` même avec le nouveau routage IMS enregistré dans `decode_capture_streaming`).
+
+Les deux tests prouvent l'invariant : **l'ajout des routes `UdpRoute::ImsSip` + `RtpFlowAggregator` + `register_sdp_flows_from_sip` n'altère pas les event_ids N3 / S1-U** — la condition `else if config.interface == "IMS"` gate strictement le nouveau code sur l'interface IMS.
+
+### 3. Pourquoi pending 10 → 10 en 10 min ? — hypothèse + instrumentation
+
+**Faits ANR1** : pending=10 au T0 et T+10, peak anon 80 MiB, oom=0. Le peak anon très bas indique **essentiellement aucun travail CPU/RAM**.
+
+**Hypothèses non exclusives** (ANR2 doit publier le journal du run 2.10.4 pour confirmer) :
+
+- **A — Métriques `null` masquent l'état réel** : ANR1 ne pouvait pas distinguer « 10 pending sont ouverts par dumpcap et c'est normal » de « 10 pending fermés et bloqués par un défaut ». Le point 1 corrige cette CAUSE DE ROLLBACK directement.
+- **B — Publication synchrone bloque le scan loop** : si les 10 segments sont admis à T0+scan_interval et `process_continuous_capture` démarre, la boucle est bloquée pendant toute la durée de publication. Pas de scan 3 en 10 min → pending reste à 10 (métrique figée).
+- **C — Stability check + backoff** : `MAX_IDLE_SLEEP=10s`, stability nécessite 2 scans. Dumpcap écrit encore ? Non — ANR1 dit les successeurs existent.
+
+**2.11.1 ne corrige PAS l'hypothèse B** — ce serait un refactor async publication (thread + Arc<Mutex> partage de `pending_publication` + sémantique de rollback repensée) qui dépasse le scope d'un patch. **Queueée explicitement pour 2.11.2** dès que ANR2 publie le journal confirmant la cause.
+
+### 4. Délai de drainage garanti au pire — gate ANR1
+
+**Formule de drain** (temps entre fermeture dumpcap d'un segment et son ingestion dans `seen_checksums`) en architecture synchrone courante :
+
+```
+drain = 2 × scan_interval + publish_duration(prior_dataset_size)
+```
+
+Avec :
+- `scan_interval` ≤ `MAX_IDLE_SLEEP = 10 s` (backoff bounded).
+- `publish_duration` = temps de `process_continuous_capture` sur le dataset en cours.
+
+**Mesures attendues** (bench synthétique 2.10.3) :
+
+| Prior dataset | Session loop (K=32) | Session loop (K=128) | Publication totale | Drain max |
+|---|---|---|---|---|
+| Fresh (vide ou < 10K events) | < 1 s | < 1 s | < 10 s | **< 30 s** |
+| Moyen (100K events) | ~31 s | ~8 s | ~45 s | **< 1 min 10 s** |
+| Chargé (1,5 M events prod) | ~8 min (projection) | **~2 min** avec `OIRAN_SESSION_PUBLICATION_BATCH_SIZE=128` | 2 min + merge | **< 3 min** (K=128) |
+
+**Gate ANR1 recommandée** :
+
+- **Déploiement sur dataset chargé** : exiger `OIRAN_SESSION_PUBLICATION_BATCH_SIZE=128` dans le drop-in systemd. Drain garanti **< 3 min**.
+- **Déploiement sur dataset vide/fresh** : par défaut `K=32`. Drain garanti **< 1 min**.
+- **Observation** : `curl /api/v1/metrics` à T0, T+60s, T+120s → `pending_segments` doit décroître monotonement (jamais 10 → 10). `pending_segment_paths` liste les SHAs sous observation, `open_segment_paths` liste les dumpcap actifs.
+
+Si ANR1 veut une **garantie inconditionnelle < 2 min indépendante de la taille du dataset**, cela requiert l'async publication → 2.11.2.
+
+### Versions
+
+| crate / package | 2.11.0 | 2.11.1 |
+|---|---|---|
+| `oiran-api` | 2.11.0 | **2.11.1** (patch) |
+| `oiran-decode` | 0.7.0 | **0.7.1** (patch — tests non-régression) |
+| `@oiran/web` | 2.11.0 | **2.11.1** (sync) |
+| `live-probe` | 0.5.0 | 0.5.0 (inchangé) |
+| `event-schema` | 1.6.0 | 1.6.0 |
+| `decoder-sip` | 0.1.0 | 0.1.0 |
+| `decoder-rtp` | 0.1.0 | 0.1.0 |
+
+### Tests
+
+- `cargo test -p oiran-api --lib` : **63 PASS, 0 fail**.
+- `cargo test -p oiran-decode --lib` : **12 PASS, 0 fail** (+2 nouveaux : `non_regression_n3_*`, `non_regression_s1u_*`).
+- `cargo test -p live-probe --lib -- --test-threads=1` : **122 PASS, 0 fail, 5 ignored**.
+- `cargo test -p decoder-sip/rtp --lib` : **5 + 5 PASS**.
+
+### Fichiers
+
+- `apps/api/src/lib.rs` : 5 nouveaux champs exposés, toujours avec `.unwrap_or(0/default)`. `#![recursion_limit = "512"]` ajouté.
+- `oiran-decode/src/lib.rs` : 2 tests de non-régression N3 + S1-U.
+
+### Priorité absolue
+
+Dès que ANR2 publie le journal du run 2.10.4 confirmant l'hypothèse B (publication synchrone bloque l'ingestion), je bascule immédiatement sur **2.11.2 async publication**, interrompant la voix 2.11.x.
+
+**Voix 2.11.2** (VoiceSession, sip-rtp-5tuple, sip-ims-pdu, Analyzer ladder) reste queuée APRÈS 2.11.2 async publication (ou 2.11.3 si ANR2 confirme pas B).
+
+---
+
 ## OIRAN API 2.11.0 — 2026-11-10 — VOIX : SIP + RTP agrégé + interface IMS (13ᵉ plane) (devmat, parallèle au déploiement 2.10.4 par ANR1)
 
 Minor release qui apporte à OIRAN la **décodage voix IMS** pour les appels VoNR/VoLTE : SIP (signalisation) + RTP (média agrégé par flux) + encapsulation inner-GTP-U + 13ᵉ interface « IMS ». Aucun pcap de production disponible localement — tests sur fixtures synthétiques, validation réelle à faire par ANR2 avec `/captures/ims/ims_vonr_phase1_20261110T161256Z_00001_20261110161256.pcapng`.

@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.11.0"
+version = "2.11.1"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "capture-pcap",
  "decoder-diameter",

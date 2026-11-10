@@ -1,4 +1,11 @@
 //! Versioned, read-only HTTP adapter for certified OIRAN artifacts.
+// 2.11.1 : la macro `json!` dans le handler `metrics` a dépassé la
+// profondeur de récursion par défaut (128) après l'ajout des 5
+// nouveaux champs pending/open/zero exigés par ANR1 (#10 comment
+// 6778895992). On remonte la limite plutôt que d'éclater le JSON
+// en sous-blocs — c'est le même pattern que d'autres gros
+// handlers API.
+#![recursion_limit = "512"]
 
 mod probe_registry;
 mod session_filters;
@@ -1060,11 +1067,25 @@ async fn metrics(State(state): State<AppState>) -> Json<Value> {
         // worker never silently reports 0. `capture_state` and
         // `capture_stop_reason` make the state explicit; the client
         // can diagnose the stall without a separate `/jobs` call.
-        "pending_segments":latest_metrics.map(|m|m.pending_segments),
-        "pending_fingerprints":latest_metrics.map(|m|m.pending_fingerprints),
-        "pending_stability_segments":latest_metrics.map(|m|m.pending_stability_segments),
-        "pending_batch_segments":latest_metrics.map(|m|m.pending_batch_segments),
-        "orphan_fingerprints_recovered":latest_metrics.map(|m|m.orphan_fingerprints_recovered),
+        // 2.11.1 (devmat, revue ANR1 #10 comment 6778895992 2.10.4
+        // rollback) : TOUS les compteurs pending/open/zero sont
+        // présents dès le démarrage (défaut `0` ou `[]`), jamais
+        // `null`. ANR1 a observé `pending_segment_paths=null`,
+        // `open_segments=null`, `zero_event_segments=null` sur
+        // 2.10.4 parce que (a) ces champs n'étaient tout simplement
+        // pas exposés par le handler et (b) `latest_metrics.map`
+        // laisse `null` quand le job n'a pas encore produit de
+        // sample. Le patch 2.11.1 unwrap toujours vers `0` / `[]`.
+        "pending_segments":latest_metrics.map(|m|m.pending_segments).unwrap_or(0),
+        "pending_fingerprints":latest_metrics.map(|m|m.pending_fingerprints).unwrap_or(0),
+        "pending_stability_segments":latest_metrics.map(|m|m.pending_stability_segments).unwrap_or(0),
+        "pending_batch_segments":latest_metrics.map(|m|m.pending_batch_segments).unwrap_or(0),
+        "pending_segment_paths":latest_metrics.map(|m|m.pending_segment_paths.clone()).unwrap_or_default(),
+        "open_segments":latest_metrics.map(|m|m.open_segments).unwrap_or(0),
+        "open_segment_paths":latest_metrics.map(|m|m.open_segment_paths.clone()).unwrap_or_default(),
+        "zero_event_segments":latest_metrics.map(|m|m.zero_event_segments).unwrap_or(0),
+        "zero_event_segment_paths":latest_metrics.map(|m|m.zero_event_segment_paths.clone()).unwrap_or_default(),
+        "orphan_fingerprints_recovered":latest_metrics.map(|m|m.orphan_fingerprints_recovered).unwrap_or(0),
         "capture_state":capture_state_label,
         "capture_stop_reason":capture_stop_reason,
         "capture_error":capture_error,

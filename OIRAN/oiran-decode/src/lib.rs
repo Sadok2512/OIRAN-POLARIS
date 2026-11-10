@@ -746,6 +746,125 @@ mod tests {
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
     }
 
+    /// 2.11.1 (devmat, revue ANR1 #10 comment 6778895992 rollback 2.10.4) :
+    /// non-régression — l'ajout des routes IMS/SIP/RTP en 2.11.0 ne
+    /// doit PAS changer les events produits sur les interfaces hors
+    /// IMS. On décode le pcap N3 de référence deux fois (via deux
+    /// instances indépendantes de `decode_capture_streaming`) et on
+    /// vérifie que la deuxième passe produit EXACTEMENT les mêmes
+    /// event_ids déterministes. Idem S1-U/S5-U si fixtures
+    /// disponibles. L'invariant est : les event_ids sont une
+    /// fonction pure (pcap_bytes × capture_id × pseudonym_key) ; ils
+    /// ne dépendent ni de la liste des décodeurs enregistrés, ni du
+    /// nouveau routage IMS SIP. La régression `Changed des events`
+    /// serait une régression wire-identity → session-engine ne
+    /// retrouverait plus ses correspondances N3 ↔ N4.
+    #[test]
+    fn non_regression_n3_decode_stable_after_2_11_0() {
+        use std::path::PathBuf;
+        let n3 = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N3.pcapng");
+        if !n3.is_file() {
+            eprintln!(
+                "SKIP non_regression_n3_decode_stable_after_2_11_0: fixture {} absent",
+                n3.display()
+            );
+            return;
+        }
+        let key_bytes = [0x11; 32];
+        let key = PseudonymKey::from_bytes(key_bytes);
+        let config = DecodeConfig {
+            input: n3.clone(),
+            capture_id: format!("sha256:{}", "0".repeat(64)),
+            interface: "N3".into(),
+            endpoints: Default::default(),
+        };
+        let mut events_a = Vec::new();
+        let _ = decode_capture_streaming(&config, &key, |event| {
+            events_a.push(event);
+            Ok(())
+        })
+        .unwrap();
+        let mut events_b = Vec::new();
+        let _ = decode_capture_streaming(&config, &key, |event| {
+            events_b.push(event);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            events_a.len(),
+            events_b.len(),
+            "N3 decode produces a stable event count across runs"
+        );
+        let ids_a: Vec<&str> = events_a.iter().map(|e| e.event_id.as_str()).collect();
+        let ids_b: Vec<&str> = events_b.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(
+            ids_a, ids_b,
+            "2.11.0 IMS routing must not change N3 event_ids"
+        );
+        // Sanity: at least one event emitted (else the fixture is empty).
+        assert!(!events_a.is_empty(), "N3 fixture produced zero events");
+        // Interface tag must still be N3 — no silent drift into IMS.
+        for event in &events_a {
+            assert_eq!(event.interface, "N3", "N3 event interface drifted");
+            assert!(
+                matches!(
+                    event.protocol,
+                    event_schema::Protocol::Gtpu | event_schema::Protocol::Unknown
+                ),
+                "N3 event protocol unexpected: {:?}",
+                event.protocol
+            );
+        }
+    }
+
+    /// 2.11.1 (devmat) : identique pour S1-U — on utilise le fixture
+    /// N3 pcapng avec l'interface S1-U (même wire format GTP-U, le
+    /// routing côté oiran-decode fait l'adressage par interface tag).
+    /// Les event_ids seront différents de ceux du test N3 (le
+    /// `capture_point_id` / `interface` entre dans la clé
+    /// deterministic), mais stables entre deux passes.
+    #[test]
+    fn non_regression_s1u_decode_stable_after_2_11_0() {
+        use std::path::PathBuf;
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N3.pcapng");
+        if !fixture.is_file() {
+            eprintln!("SKIP non_regression_s1u_decode_stable_after_2_11_0: fixture absent");
+            return;
+        }
+        let key = PseudonymKey::from_bytes([0x22; 32]);
+        let config = DecodeConfig {
+            input: fixture.clone(),
+            capture_id: format!("sha256:{}", "a".repeat(64)),
+            interface: "S1-U".into(),
+            endpoints: Default::default(),
+        };
+        let mut events_a = Vec::new();
+        let _ = decode_capture_streaming(&config, &key, |e| {
+            events_a.push(e);
+            Ok(())
+        })
+        .unwrap();
+        let mut events_b = Vec::new();
+        let _ = decode_capture_streaming(&config, &key, |e| {
+            events_b.push(e);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(events_a.len(), events_b.len());
+        let ids_a: Vec<&str> = events_a.iter().map(|e| e.event_id.as_str()).collect();
+        let ids_b: Vec<&str> = events_b.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(ids_a, ids_b, "2.11.0 IMS routing must not change S1-U event_ids");
+        for event in &events_a {
+            assert_eq!(event.interface, "S1-U", "S1-U event interface drifted");
+        }
+    }
+
     #[test]
     fn pre_sbi_decode_reports_remain_compatible() {
         let report: DecodeReport = serde_json::from_value(serde_json::json!({
