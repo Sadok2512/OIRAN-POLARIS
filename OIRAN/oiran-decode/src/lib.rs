@@ -78,10 +78,22 @@ fn udp_route(interface: &str, source_port: u16, destination_port: u16) -> Option
 fn sctp_route(interface: &str, ppid: u32) -> Option<&'static str> {
     match (interface, ppid) {
         ("N2", 60) => Some("N2"),
+        // 2.10.4 (devmat, revue 2.10.3 ANR2 #10 comment 2026-11-10 16:48Z,
+        // cas S6a `_00064`/`_00065` à 490+492 trames Diameter et
+        // 0 events) : certains EPC (srsEPC inclus) émettent les
+        // chunks SCTP DATA S6a avec **PPID 0** (= unspecified) et
+        // non la valeur IANA 46. Wireshark décode quand même via le
+        // port 3868 ; côté OIRAN la contrainte `("S6a", 46)` strict
+        // droppait TOUS les chunks → 0 events. L'interface tag est
+        // suffisante : les captures sur `br-oiran-s6a` ne portent
+        // que du Diameter.
+        //
+        // S1-MME garde la contrainte stricte PPID 18 (S1AP IANA) car
+        // le bridge S1-MME ne porte que du S1AP et le décodeur ngap
+        // tomberait sur un payload invalide si on relâchait le gate.
+        // Idem N2 (PPID 60 strict NGAP).
         ("S1-MME", 18) => Some("S1-MME"),
-        // 2.9.1 (#9): S6a carries Diameter over SCTP with the IETF
-        // DIAMETER_PPID=46 (RFC 6733 §2.1).
-        ("S6a", 46) => Some("S6a"),
+        ("S6a", _) => Some("S6a"),
         _ => None,
     }
 }
@@ -565,6 +577,18 @@ mod tests {
         assert_eq!(udp_route("S11", 2123, 9999), Some(UdpRoute::S11Gtpv2c));
         assert_eq!(udp_route("N4", 8805, 9999), Some(UdpRoute::N4Pfcp));
         assert_eq!(udp_route("S11", 2152, 9999), None);
+    }
+
+    /// 2.10.4 (devmat, revue 2.10.3 ANR2 cas S6a `_00064`/`_00065`) :
+    /// S6a doit router quel que soit le PPID — certains EPC
+    /// (srsEPC) émettent du Diameter avec PPID 0 au lieu de 46.
+    /// Pré-2.10.4, `("S6a", 46)` strict droppait tous les chunks.
+    #[test]
+    fn routes_s6a_regardless_of_ppid_2_10_4() {
+        assert_eq!(sctp_route("S6a", 46), Some("S6a"));
+        assert_eq!(sctp_route("S6a", 0), Some("S6a"));
+        assert_eq!(sctp_route("S6a", 7), Some("S6a"));
+        assert_eq!(sctp_route("S6a", 255), Some("S6a"));
     }
 
     #[test]

@@ -1,5 +1,144 @@
 # Changelog
 
+## OIRAN API 2.10.4 — 2026-11-10 — fin de la famine FIFO, S6a PPID 0, invariant no-silent-skip (devmat, revue 2.10.3 ANR2 #10 comment 16:48Z)
+
+Ferme les deux défauts prouvés par ANR2 sur la 2.10.3 :
+
+### 1. 9 segments fermés jamais ingérés — cause : famine newest-first
+
+**Preuve ANR2** (#10 comment 16:48Z) :
+
+- 7 segments `_00067` (s1mme, s11, s1u, s5c, s5u, sxab, s6a), fermés depuis 16:38:57-59Z (successeur `_00068` présent) : AUCUNE entrée dans `.source_fingerprints` ni `.segments[].source_path`. `ingestion_failures=0`.
+- 2 segments `_00066` (N2, SBI), fermés depuis 15:38Z (successeur `_00067` présent, lui-même lex-greatest sans `_00068`) : non ingérés depuis 70 min+. `pending_segments=2` visible mais ne drainent jamais.
+
+**Cause fichier:ligne** : `live-probe/src/lib.rs::source_segments:6795-6800` (pré-2.10.4) triait les candidats **newest-first** :
+
+```rust
+segments.sort_by(|left, right| {
+    right.modified.cmp(&left.modified)   // ← newest first
+        .then_with(|| left.checksum.cmp(&right.checksum))
+});
+```
+
+Combiné au plafond `MAX_INGESTED_SEGMENTS_PER_SCAN = 32` dans la boucle de scan, les 32 **plus récents** segments étaient ingérés à chaque cycle, laissant les plus anciens au bas de la file. Avec dumpcap rotant ~26 nouveaux segments par 22-min cycle (12 interfaces × ~2 rotations), **un segment fermé plus ancien que les 32 nouveaux n'atteignait jamais la tête** — famine nette entre nouvelles rotations et plafond de drain.
+
+Pour `n2_..._00066_...pcapng` (fermé 15:38Z) : chaque scan subséquent voyait émerger 12+ nouveaux segments d'autres interfaces (plus récents), poussant `_00066` en fin de file. Sur 70 min × 3 cycles × 32 cap = 96 segments traités, aucun n'était `_00066` car sa `modified` était systématiquement plus ancienne.
+
+**Fix 2.10.4** : tri **oldest-first** garantit le drain FIFO :
+
+```rust
+segments.sort_by(|left, right| {
+    left.modified.cmp(&right.modified)   // ← oldest first
+        .then_with(|| left.checksum.cmp(&right.checksum))
+});
+```
+
+**Garantie** : un segment fermé atteint la tête de la file en au plus `backlog/32` cycles, jamais indéfiniment reporté. Avec un backlog de 50 segments et un cap de 32, la tête se déplace de ≥ 32 positions par cycle → au plus 2 cycles pour tout segment.
+
+**Test unit** (`tests::source_segments_sort_is_oldest_first_fifo_drain_2_10_4`) : 3 interfaces × 3 segments avec mtimes échelonnés (1794000000 à 1794000240). Après `source_segments(...)`, `segments[0].modified` est strictement le minimum du set. Pré-2.10.4 : assert échoue (head = max).
+
+### 2. Saut silencieux sur SHA-256 fail — invariant « jamais silent »
+
+**Code pré-2.10.4** (`live-probe/src/lib.rs:6768-6770`) :
+
+```rust
+let Ok(fresh) = sha256_hex_file(&candidate.path) else {
+    continue;   // ← saut silencieux
+};
+```
+
+Un pcap illisible (permission, I/O, etc.) disparaissait de la pipeline sans log, sans compteur, sans `ingestion_failures`. ANR2 ne pouvait pas distinguer « jamais vu » de « vu et skipped silently ».
+
+**Fix 2.10.4** : log structuré `CONTINUOUS_SEGMENT_SHA_FAILED {path, interface, size_bytes, reason}` + push dans `discovery.rejected` → persisté en `state.failed_ingestions` à la prochaine passe. Invariant respecté : **un segment fermé est soit ingéré, soit en `ingestion_failures` avec sa raison — jamais un saut silencieux**.
+
+### 3. S6a 0 events — cause : PPID 0 strictement filtré
+
+**Preuve ANR2** (#9 comment 15:38Z) : S6a `_00064` et `_00065` ingérés avec `packets=490/492` mais **0 events** dans `oiran_events.jsonl`.
+
+**Cause fichier:ligne** : `oiran-decode/src/lib.rs::sctp_route:78-87` (pré-2.10.4) exigeait **PPID=46** strict pour router S6a :
+
+```rust
+("S6a", 46) => Some("S6a"),
+_ => None,
+```
+
+PPID 46 est la valeur IANA RFC 6733 §2.1 pour Diameter. Mais **certains EPC (srsEPC inclus)** émettent leurs chunks SCTP DATA avec **PPID=0** (= `unspecified`). Wireshark décode quand même via le port 3868 — OIRAN droppait tous les chunks silencieusement.
+
+**Fix 2.10.4** :
+
+```rust
+// 2.10.4 : S6a accept quel que soit le PPID — l'interface tag
+// `br-oiran-s6a` ne porte que du Diameter. S1-MME (PPID 18) et
+// N2 (PPID 60) restent stricts.
+("S6a", _) => Some("S6a"),
+```
+
+**Fail-safe** : si le payload n'est pas du Diameter valide, le décodeur `DiameterDecoder::decode` retourne `errors[]` sans event — compté dans `report.incomplete_sctp` du report. Jamais de garbage event généré.
+
+**Test unit** (`tests::routes_s6a_regardless_of_ppid_2_10_4`) : `sctp_route("S6a", 0) == Some("S6a")`, `sctp_route("S6a", 7) == Some("S6a")`, `sctp_route("S6a", 255) == Some("S6a")`. Pré-2.10.4 : seule PPID 46 passait.
+
+**Commandes tshark de référence** (pour ANR2 à relancer sur les pcap `_00064` et `_00065` du ring) :
+
+```bash
+# PPID réellement observé sur chaque chunk SCTP DATA S6a :
+tshark -n -r <s6a_00064.pcapng> -Y 'sctp.chunk_type == 0' \
+    -T fields -e sctp.data_payload_proto_id | sort -u
+# Pré-2.10.4 attendu : «0» (= cause du 0 events).
+# Post-2.10.4 : même résultat, mais OIRAN ingère maintenant.
+
+# Count de messages Diameter par cmd code :
+tshark -n -r <s6a_00064.pcapng> \
+    -Y 'diameter.cmd.code == 316 || diameter.cmd.code == 318' \
+    -T fields -e diameter.cmd.code -e diameter.flags.request \
+    | sort | uniq -c
+# Attendu : X requêtes/réponses AIR (318) + ULR (316).
+
+# Post-déploiement 2.10.4, vérifier que les events sont dans
+# oiran_events.jsonl (sans extraire d'identité) :
+STATE=/var/lib/oiran/captures/continuous-lab-import
+jq -r '.segments[].owned_file' $STATE/import_state.json \
+    | rg '^S6a\.' | while read owned; do
+    CAP=$(jq -r --arg k "$owned" \
+        '[.segments[] | select(.owned_file==$k) | "sha256:"+.] | first' \
+        $STATE/import_state.json)
+    rg -c "\"$CAP\"" $STATE/dataset/oiran_events.jsonl || echo "$owned: 0 events"
+done
+```
+
+### 4. Fichiers
+
+- `live-probe/src/lib.rs::source_segments` : tri oldest-first + log `CONTINUOUS_SEGMENT_SHA_FAILED` + push à `rejected`.
+- `live-probe/src/lib.rs::tests::source_segments_sort_is_oldest_first_fifo_drain_2_10_4` : nouveau test FIFO.
+- `oiran-decode/src/lib.rs::sctp_route` : `("S6a", _) => Some("S6a")`.
+- `oiran-decode/src/lib.rs::tests::routes_s6a_regardless_of_ppid_2_10_4` : nouveau test.
+
+### Versions
+
+| crate / package | 2.10.3 | 2.10.4 |
+|---|---|---|
+| `oiran-api` | 2.10.3 | **2.10.4** |
+| `live-probe` | 0.4.31 | **0.4.32** |
+| `oiran-decode` | 0.6.1 | **0.6.2** |
+| `@oiran/web` | 2.10.3 | **2.10.4** (sync) |
+
+### Tests
+
+- `cargo test -p live-probe --lib -- --test-threads=1` : **122 PASS, 0 fail, 5 ignored** (+1 nouveau : `source_segments_sort_is_oldest_first_fifo_drain_2_10_4`).
+- `cargo test -p oiran-api --lib` : **63 PASS, 0 fail**.
+- `cargo test -p oiran-decode --lib` : **10 PASS, 0 fail** (+1 nouveau : `routes_s6a_regardless_of_ppid_2_10_4`).
+- `cargo test -p decoder-diameter --lib` : **14 PASS, 0 fail**.
+
+### Impact opérateur
+
+Après re-déploiement :
+
+- **FIFO drain** : les 9 segments pending de ANR2 (N2/SBI `_00066`, 7 × `_00067`) seront ingérés dès le prochain cycle. Vérifier via `curl /api/v1/metrics | jq '.data.pending_segments'` → doit décroître monotonement vers 0 hors fenêtre dumpcap active.
+- **S6a 0 events** : les segments déjà ingérés avec 0 events (`_00064`, `_00065`) restent à 0 (leur SHA est dans `seen_checksums`, pas re-processé). Ils seront reingested à la prochaine commande `dataset-repair-partial-imports` OU en demandant à ANR1 de re-importer manuellement ces SHAs. 2.10.4 décode correctement tout **nouveau** S6a segment.
+- **`CONTINUOUS_SEGMENT_SHA_FAILED`** : si ANR2 voit cet événement dans `journalctl -u oiran-api`, c'est un défaut I/O réel (permission, FS corrupt) → preuve directe au lieu d'un saut silencieux.
+- **Rollout LTE E2E** : les segments `_00067` couvrant `lte-run-551efaa842ea83c95cbd47e90210e989` deviennent ingérés → une session OIRAN sera créée. ANR2 peut qualifier S1-MME↔S11, S11↔S1-U, S5-C↔S5-U, Sxa/b↔S5-U, S6a par pseudonyme.
+
+---
+
 ## OIRAN API 2.10.3 — 2026-11-10 — pending vs open, zero-event surface, state=PARTIAL documenté, publication batchée × 13 (devmat, revue 2.10.2 prod ANR2 #10 + #9 15:38Z)
 
 Patch qui ferme les points ouverts remontés sur la 2.10.2 déployée (ANR1 14:31Z + ANR2 15:11Z/15:29Z — 0 OOM, anon max ~1,2 GiB sous `MemoryMax=4G`) :

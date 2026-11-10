@@ -6765,23 +6765,52 @@ fn source_segments(
         let (checksum, packets) = if let Some(entry) = cached_hit {
             (entry.checksum.clone(), entry.packets)
         } else {
-            let Ok(fresh) = sha256_hex_file(&candidate.path) else {
-                continue;
-            };
-            let count = count_pcap_records(&candidate.path);
-            cache.insert(
-                candidate.path.clone(),
-                SourceFingerprint {
-                    dev,
-                    inode,
-                    size_bytes: size,
-                    mtime_ns,
-                    checksum: fresh.clone(),
-                    packets: count,
-                },
-            );
-            cache_mutated = true;
-            (fresh, count)
+            match sha256_hex_file(&candidate.path) {
+                Ok(fresh) => {
+                    let count = count_pcap_records(&candidate.path);
+                    cache.insert(
+                        candidate.path.clone(),
+                        SourceFingerprint {
+                            dev,
+                            inode,
+                            size_bytes: size,
+                            mtime_ns,
+                            checksum: fresh.clone(),
+                            packets: count,
+                        },
+                    );
+                    cache_mutated = true;
+                    (fresh, count)
+                }
+                Err(error) => {
+                    // 2.10.4 (devmat, revue 2.10.3 ANR2) : interdiction
+                    // du saut silencieux. Pré-2.10.4, un `sha256_hex_file`
+                    // qui échouait (I/O, permission, etc.) exécutait un
+                    // `continue;` sans aucune trace — ANR2 n'avait aucun
+                    // moyen de distinguer un segment ignoré d'un segment
+                    // encore pending. 2.10.4 loggue + enregistre dans
+                    // `rejected` pour que la ronde suivante retente
+                    // (invariant ouvert par ANR2 : « segment fermé →
+                    // ingéré OU ingestion_failures avec sa raison »).
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_SEGMENT_SHA_FAILED",
+                            "path": candidate.path.display().to_string(),
+                            "interface": candidate.interface,
+                            "size_bytes": size,
+                            "reason": format!("sha256_hex_file: {error}"),
+                        })
+                    );
+                    if rejected.len() < MAX_PERSISTED_INGESTION_FAILURES {
+                        rejected.push(RejectedSourceSegment {
+                            path: candidate.path.clone(),
+                            size_bytes: size,
+                        });
+                    }
+                    continue;
+                }
+            }
         };
         segments.push(SourceSegment {
             path: candidate.path,
@@ -6792,10 +6821,20 @@ fn source_segments(
             modified: candidate.modified,
         });
     }
+    // 2.10.4 (devmat, revue 2.10.3 ANR2 #10 comment 2026-11-10 16:48Z) :
+    // tri **oldest-first** pour le drain FIFO. Pré-2.10.4, la clé
+    // `right.modified.cmp(&left.modified)` triait **newest-first** et
+    // combinée au plafond `MAX_INGESTED_SEGMENTS_PER_SCAN = 32`
+    // provoquait une **famine des plus anciens segments fermés**
+    // (ANR2 : `n2_..._00066_...` fermé 15:38Z toujours non ingéré à
+    // 16:48Z = 70 min / 3 cycles × 32 = 96 nouveaux segments traités
+    // avant lui). Le tri oldest-first garantit qu'un segment fermé
+    // atteint la tête de la file en au plus `backlog/32` cycles,
+    // jamais indéfiniment reporté au profit d'un segment plus récent
+    // d'une autre interface.
     segments.sort_by(|left, right| {
-        right
-            .modified
-            .cmp(&left.modified)
+        left.modified
+            .cmp(&right.modified)
             .then_with(|| left.checksum.cmp(&right.checksum))
     });
     rejected.sort_by(|left, right| left.path.cmp(&right.path));
@@ -10710,6 +10749,89 @@ mod tests {
         .segments;
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].interface, "N2");
+    }
+
+    /// 2.10.4 (devmat, revue 2.10.3 ANR2 #10 comment 16:48Z) : la
+    /// cause confirmée des 9 segments fermés non ingérés était un
+    /// tri `newest-first` dans `source_segments`, combiné au plafond
+    /// `MAX_INGESTED_SEGMENTS_PER_SCAN = 32`. Les segments plus
+    /// anciens étaient systématiquement poussés en fin de file
+    /// (donc coupés par la cap) chaque cycle. 2.10.4 trie
+    /// `oldest-first` → un segment fermé atteint la tête en au plus
+    /// `backlog/32` cycles. Ce test matérialise l'invariant FIFO
+    /// sur 3 interfaces × 3 segments chacune.
+    #[test]
+    fn source_segments_sort_is_oldest_first_fifo_drain_2_10_4() {
+        use std::time::{Duration as StdDuration, UNIX_EPOCH};
+        use std::os::unix::fs::MetadataExt;
+        let source = temporary_root("segments-fifo");
+        // Trois interfaces × 3 segments, chacun avec un mtime
+        // distinct. Ordre canonique attendu :
+        //   N2 (older, mtime 1794000000) < S1-MME (1794000060) < N4 (1794000120)
+        // avec dans chaque interface, _00064 < _00065 < _00066.
+        let planes: &[(&str, &[(u32, &str)])] = &[
+            ("N2", &[(1794000000, "n2_00064"), (1794000030, "n2_00065"), (1794000060, "n2_00066")]),
+            ("S1-MME", &[(1794000090, "s1m_00064"), (1794000120, "s1m_00065"), (1794000150, "s1m_00066")]),
+            ("N4", &[(1794000180, "n4_00064"), (1794000210, "n4_00065"), (1794000240, "n4_00066")]),
+        ];
+        for (plane, files) in planes {
+            fs::create_dir_all(source.join(plane)).unwrap();
+            // 2.8.3 rotation closures required for finalized_candidates_only.
+            write_rotation_closures(&source, plane, files.len());
+            for (seconds, name) in *files {
+                let path = source.join(plane).join(format!("{name}.pcap"));
+                write_pcap_at(&path, *seconds, &[vec![0; 128]]);
+                // Force a distinct mtime via utimensat (write_pcap_at seeds
+                // timestamps inside the pcap header, not the FS mtime).
+                let atime = fs::metadata(&path).unwrap().atime();
+                let mtime_sec = *seconds as i64;
+                let times = [
+                    libc::timespec { tv_sec: atime, tv_nsec: 0 },
+                    libc::timespec { tv_sec: mtime_sec, tv_nsec: 0 },
+                ];
+                let path_c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                unsafe {
+                    libc::utimensat(
+                        libc::AT_FDCWD,
+                        path_c.as_ptr(),
+                        times.as_ptr(),
+                        0,
+                    );
+                }
+            }
+        }
+        let mut cache = SourceSegmentsCache::new();
+        let discovery = source_segments(
+            &source,
+            StdDuration::ZERO,
+            false,
+            DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES,
+            &mut cache,
+        )
+        .unwrap();
+        // Oldest-first: N2 _00064 doit sortir en premier,
+        // N4 _00066 en dernier. ANR2 invariant.
+        assert!(discovery.segments.len() >= 6, "expected multiple segments, got {}", discovery.segments.len());
+        let first_mtime = discovery.segments.first().unwrap().modified;
+        let last_mtime = discovery.segments.last().unwrap().modified;
+        assert!(
+            first_mtime <= last_mtime,
+            "FIFO drain violated: first modified {:?} should be <= last {:?}",
+            first_mtime,
+            last_mtime
+        );
+        // Assertion de force : la toute 1re entrée doit avoir le plus petit mtime du set.
+        let min_mtime = discovery
+            .segments
+            .iter()
+            .map(|seg| seg.modified)
+            .min()
+            .unwrap();
+        assert_eq!(
+            discovery.segments[0].modified, min_mtime,
+            "oldest-first expected: head mtime {:?} != min {:?}",
+            discovery.segments[0].modified, min_mtime
+        );
     }
 
     /// 2.8.1 (#9, ANR2 CPU proof): the per-worker `source_segments`
