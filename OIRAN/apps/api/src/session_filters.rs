@@ -79,6 +79,15 @@ pub struct SessionFilterEntry {
     pub causes: BTreeSet<(String, String, bool)>, // (domain, value, is_failure)
     pub pseudonyms: BTreeSet<String>,
     pub has_failure: bool,
+    /// 2.10.1 (devmat review) : ancre de pagination canonique.
+    /// `anchor_capture_id` = min capture_id string observé sur
+    /// les événements de la session (lexicographique stable).
+    /// `first_packet_number` = plus petit `packet_number` observé
+    /// SUR cet anchor_capture_id. Clé de tri complète :
+    /// `(anchor_capture_id, first_packet_number, session_id)`.
+    /// Jamais de `ts` dans la clé (règle ANR2).
+    pub anchor_capture_id: String,
+    pub first_packet_number: u64,
 }
 
 pub struct SessionFilterIndex {
@@ -101,6 +110,23 @@ impl SessionFilterIndex {
     }
 
     pub fn upsert_flow(&mut self, flow: &CallFlow) {
+        // Ancre canonique : min(capture_id) sur TOUS les events de
+        // la session. `first_packet_number` = plus petit
+        // packet_number OBSERVÉ sur cet anchor_capture_id.
+        let anchor_capture_id = flow
+            .events
+            .iter()
+            .map(|event| event.capture_id.as_str())
+            .min()
+            .unwrap_or("")
+            .to_string();
+        let first_packet_number = flow
+            .events
+            .iter()
+            .filter(|event| event.capture_id == anchor_capture_id)
+            .flat_map(|event| event.packet_references.iter().map(|p| p.packet_number))
+            .min()
+            .unwrap_or(0);
         let mut entry = SessionFilterEntry {
             session_id: flow.session_id.clone(),
             interfaces: flow.interfaces.clone(),
@@ -108,6 +134,8 @@ impl SessionFilterIndex {
             causes: BTreeSet::new(),
             pseudonyms: BTreeSet::new(),
             has_failure: false,
+            anchor_capture_id,
+            first_packet_number,
         };
         for event in &flow.events {
             if event.message_name.is_empty() {
@@ -130,6 +158,26 @@ impl SessionFilterIndex {
             collect_pseudonyms(&event.decoded_ie_tree, &mut entry.pseudonyms);
         }
         self.sessions.insert(flow.session_id.clone(), entry);
+    }
+
+    /// 2.10.1 : clé de tri canonique de pagination. Jamais de `ts`.
+    pub fn pagination_key<'a>(&'a self, session_id: &str) -> Option<(&'a str, u64, &'a str)> {
+        self.sessions
+            .get(session_id)
+            .map(|entry| (entry.anchor_capture_id.as_str(), entry.first_packet_number, entry.session_id.as_str()))
+    }
+
+    /// 2.10.1 : itération ordonnée par clé canonique pour
+    /// pagination curseur. Retourne (session_id) dans l'ordre
+    /// `(anchor_capture_id, first_packet_number, session_id)`.
+    pub fn ids_sorted(&self) -> Vec<&str> {
+        let mut rows: Vec<(&str, u64, &str)> = self
+            .sessions
+            .values()
+            .map(|entry| (entry.anchor_capture_id.as_str(), entry.first_packet_number, entry.session_id.as_str()))
+            .collect();
+        rows.sort();
+        rows.into_iter().map(|(_, _, id)| id).collect()
     }
 
     pub fn entry(&self, session_id: &str) -> Option<&SessionFilterEntry> {
@@ -328,6 +376,19 @@ mod tests {
         ies: Value,
         semantic_status: &str,
     ) -> CallFlowEvent {
+        event_at(id, interface, protocol, name, ies, semantic_status, "cap-a", 1)
+    }
+
+    fn event_at(
+        id: &str,
+        interface: &str,
+        protocol: &str,
+        name: &str,
+        ies: Value,
+        semantic_status: &str,
+        capture_id: &str,
+        packet_number: u64,
+    ) -> CallFlowEvent {
         CallFlowEvent {
             event_id: id.into(),
             timestamp: "2026-11-10T00:00:00.000000000Z".into(),
@@ -345,13 +406,13 @@ mod tests {
             procedure_group: "test".into(),
             packet_references: vec![PacketRef {
                 source_file: "x".into(),
-                packet_number: 1,
+                packet_number,
                 byte_offset: 0,
                 interface_id: 0,
                 captured_length: 64,
                 original_length: 64,
             }],
-            capture_id: "cap-a".into(),
+            capture_id: capture_id.into(),
             decoder_name: "test".into(),
             decoder_version: "test".into(),
             raw_payload_reference: "sha256:x".into(),
@@ -542,6 +603,45 @@ mod tests {
         assert_eq!(causes[0]["value"], "cause=64");
         assert_eq!(causes[0]["session_count"], 2);
         assert_eq!(causes[0]["is_failure"], true);
+    }
+
+    #[test]
+    fn pagination_key_is_capture_then_packet_then_session_never_ts() {
+        // 2.10.1 (review devmat) : vérifie que la clé canonique
+        // est `(anchor_capture_id, first_packet_number, session_id)`
+        // et JAMAIS un timestamp. Les `timestamp` des events
+        // sont identiques dans ce test (volontairement) ; seule
+        // la combinaison capture+packet+session_id doit trier.
+        let flows = vec![
+            flow(
+                "zeta",
+                vec![
+                    event_at("ez1", "N2", "NGAP", "A", serde_json::json!([]), "NORMAL", "cap-a", 42),
+                    event_at("ez2", "N2", "NGAP", "B", serde_json::json!([]), "NORMAL", "cap-a", 7),
+                ],
+                vec!["N2"],
+            ),
+            flow(
+                "alpha",
+                vec![event_at("ea1", "N2", "NGAP", "A", serde_json::json!([]), "NORMAL", "cap-a", 100)],
+                vec!["N2"],
+            ),
+            flow(
+                "mid",
+                vec![event_at("em1", "N2", "NGAP", "A", serde_json::json!([]), "NORMAL", "cap-b", 1)],
+                vec!["N2"],
+            ),
+        ];
+        let index = SessionFilterIndex::from_flows(&flows);
+        // zeta : (cap-a, 7, zeta)
+        // alpha : (cap-a, 100, alpha)
+        // mid : (cap-b, 1, mid)
+        // Ordre attendu : zeta, alpha, mid.
+        assert_eq!(index.ids_sorted(), vec!["zeta", "alpha", "mid"]);
+        // Clé publique cohérente.
+        assert_eq!(index.pagination_key("zeta"), Some(("cap-a", 7u64, "zeta")));
+        assert_eq!(index.pagination_key("alpha"), Some(("cap-a", 100u64, "alpha")));
+        assert_eq!(index.pagination_key("mid"), Some(("cap-b", 1u64, "mid")));
     }
 
     #[test]

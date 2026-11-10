@@ -1,5 +1,68 @@
 # Changelog
 
+## OIRAN API 2.10.1 — 2026-11-10 — pagination canonique sans `ts` + retrait du claim mémoire non prouvé (devmat, revue ANR2)
+
+Patch qui corrige **deux points de revue** sur 2.10.0 (`997cabe`). Aucun changement de contrat utilisateur côté UI (le panneau Advanced filters reste identique).
+
+### 1. Pagination : clé canonique `(anchor_capture_id, first_packet_number, session_id)` — jamais `ts`
+
+**Revue** : la 2.10.0 triait les résultats de `POST /sessions/filter` sur `(capture_id, start_timestamp, session_id)`. `start_timestamp` est un **timestamp**, donc contraire à la règle ANR2 « jamais `ts` » pour l'ordre canonique de pagination.
+
+**Correction** :
+
+- `SessionFilterEntry` gagne deux champs indexés au moment du `upsert_flow` :
+  - `anchor_capture_id = min(capture_id)` sur tous les events de la session (lexicographique stable, pas de `ts`).
+  - `first_packet_number = min(packet_number)` observé **sur cet `anchor_capture_id`** (via `event.packet_references[*].packet_number`).
+- Clé de tri complète de pagination : `(anchor_capture_id, first_packet_number, session_id)`.
+- La réponse documente l'invariant via `meta.pagination_key = "(anchor_capture_id, first_packet_number, session_id)"` — reviewers peuvent auditer sans lire le code.
+
+**Curseur opaque** :
+
+- `POST /sessions/filter` body remplace `page` / `page_size` par `cursor` (opaque — c'est un `session_id` de session déjà émise ; le serveur résout sa clé canonique et renvoie les sessions **strictement supérieures**) et `limit` (clamp 1..=100, défaut 25).
+- Réponse : `meta.next_cursor = <session_id|null>`. Le dernier `session_id` renvoyé **si** il reste des pages. `null` sinon.
+- Un curseur pointant vers une session qui n'est plus dans l'ensemble filtré (p.ex. le filtre a été modifié) est traité comme fin-de-flux — pas de 404, pas de reset implicite.
+- UI : reset du curseur à chaque changement de filtre (`useEffect` sur `filterMessages/causes/failuresOnly/identityCacheToken`). Pagination « First page » / « Next page » au lieu d'un indexateur 1..N.
+
+**Tests** :
+
+- `session_filters::tests::pagination_key_is_capture_then_packet_then_session_never_ts` — vérifie que **trois** sessions au **même `timestamp`** ressortent dans l'ordre `(capture_id, packet_number, session_id)` ; démontre que `ts` n'intervient pas.
+- `tests::sessions_filter_pagination_uses_capture_packet_session_not_ts` — intégration : `meta.pagination_key` annonce la clé canonique ; `meta.next_cursor` est **string ou null**, jamais un ISO timestamp ; les paires consécutives sont triées par `(capture_id, session_id)` et non par `start_timestamp`.
+- `tests::sessions_filter_cursor_advances_without_duplicates` — deux appels `limit=1` avec curseur reportent **deux session_id distincts**.
+
+### 2. Retrait du claim mémoire non prouvé
+
+**Revue** : la note « pas de régression sous `MemoryMax=256M` » dans 2.10.0 n'est **pas prouvée** — elle a été faite sans mesure en vrai cgroup sur des données réelles. De plus la base fu3 reste sous instruction ANR2 (mesures fantômes attendues sur #9).
+
+**Correction** :
+
+- La revendication est **retirée** de cette release. Aucune affirmation de « non-régression mémoire » sans mesure `systemd-run -p MemoryMax=256M` sur un jeu de données de production.
+- L'empreinte théorique (`O(messages + causes + pseudonymes uniques par session)`, ~kilo-octet/entrée) reste documentée **comme analyse de conception**, pas comme preuve.
+- La 2.10.0+2.10.1 **ne partira en production qu'après** le correctif mémoire qui sort des mesures fantômes ANR2 (à rebaser alors sur la base corrective).
+
+### Versions
+
+| crate / package | 2.10.0 | 2.10.1 |
+|---|---|---|
+| `oiran-api` | 2.10.0 | **2.10.1** (patch) |
+| `@oiran/web` | 2.10.0 | **2.10.1** (patch) |
+| `live-probe` | 0.4.29 | 0.4.29 (inchangé) |
+| `session-engine` | 0.5.5 | 0.5.5 (inchangé) |
+
+### Tests
+
+- `cargo test -p oiran-api --lib` : **session_filters 7/7** + **sessions_* 10/10** = 17 PASS, 0 fail.
+- `npm run typecheck` : clean.
+- `npm run test` : 94/94 (14 fichiers).
+- `npm run build` : clean (dist-leaks checker vert, 374 KB bundle gzipped 110 KB).
+
+### Fichiers
+
+- `apps/api/src/session_filters.rs` : `anchor_capture_id` + `first_packet_number` + `pagination_key()` + `ids_sorted()` + 1 nouveau test unit.
+- `apps/api/src/lib.rs` : handler `sessions_filter` → cursor-based pagination, `meta.pagination_key`, `meta.next_cursor` ; 2 nouveaux tests d'intégration.
+- `apps/web/src/pages/SessionExplorer.tsx` : `cursor`/`limit` body, reset `useEffect`, boutons « First page » / « Next page » en mode advanced.
+
+---
+
 ## OIRAN API 2.10.0 — 2026-11-10 — Session Explorer filters (messages, causes, identity) (devmat)
 
 Minor release qui ajoute **au Session Explorer** trois axes de filtre combinables (ET logique) et le pseudonymizer côté serveur pour la recherche d'identité opérateur. Aucune modification du pipeline de reconstruction (fu3 reste intact).
@@ -76,7 +139,9 @@ Suite complète `oiran-api --lib` : **10 tests `sessions_*` passed, 0 failed** (
 
 ### 6. Mémoire
 
-Index `SessionFilterIndex` protégé par `RwLock` — lecteurs multiples (handlers HTTP) + rare upsert sous `write` lors d'un refresh. Aucune nouvelle structure disque. Sur le dataset lab (1,5 M events, ~3 sessions) l'index pèse < 10 KiB ; sur une production à 10 000 sessions l'index tient sous les 10 MiB — pas de régression sous `MemoryMax=256M`.
+Index `SessionFilterIndex` protégé par `RwLock` — lecteurs multiples (handlers HTTP) + rare upsert sous `write` lors d'un refresh. Aucune nouvelle structure disque. **Analyse de conception** (pas une preuve) : l'empreinte théorique est `O(messages + causes + pseudonymes uniques par session)`, ~kilo-octet/entrée ; sur le dataset lab (1,5 M events, ~3 sessions) l'index pèse < 10 KiB.
+
+**La 2.10.0 ne revendique AUCUNE non-régression mémoire en production** : il faut une mesure `systemd-run -p MemoryMax=256M` sur un jeu de données réel pour la prouver, et la base fu3 reste sous instruction ANR2 (mesures fantômes attendues sur #9). La 2.10.0 ne partira en production qu'après le correctif mémoire issu de ces mesures (voir rollout plan en 2.10.1).
 
 ### Versions
 

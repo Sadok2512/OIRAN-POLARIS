@@ -31,9 +31,9 @@ type IdentityKind = 'supi_or_imsi' | 'imei_or_pei' | 'guti_or_tmsi' | 's_tmsi';
 
 interface AvailableCause { domain: string; value: string; is_failure: boolean; session_count: number }
 
-async function postFilter(body: Record<string, unknown>): Promise<ApiEnvelope<Session[]> & { meta: { identity_matched_pseudonym?: string } }> {
+async function postFilter(body: Record<string, unknown>): Promise<ApiEnvelope<Session[]> & { meta: { identity_matched_pseudonym?: string; next_cursor?: string|null; limit?: number } }> {
   const envelope = await api<Session[]>('/sessions/filter', { method: 'POST', body: JSON.stringify(body) });
-  return envelope as ApiEnvelope<Session[]> & { meta: { identity_matched_pseudonym?: string } };
+  return envelope as ApiEnvelope<Session[]> & { meta: { identity_matched_pseudonym?: string; next_cursor?: string|null; limit?: number } };
 }
 
 export function SessionExplorer(){
@@ -83,16 +83,23 @@ export function SessionExplorer(){
   const identityCacheToken = identityActive
     ? `${identityKind}:${identityValue.length}:${identityValue.length === 0 ? '0' : '1'}`
     : 'none';
+  // 2.10.1 (revue devmat) : la pagination est curseur-based sur
+  // la clé canonique `(anchor_capture_id, first_packet_number,
+  // session_id)`. On n'envoie PLUS `page`/`page_size` au serveur.
+  // Le curseur reste en state local (jamais dans l'URL — on garde
+  // l'invariant anti-fuite pour l'identity flow).
+  const [filterCursor, setFilterCursor] = useState<string | undefined>(undefined);
+  useEffect(() => { setFilterCursor(undefined); /* reset on filter change */ }, [failuresOnly, JSON.stringify(filterMessages), JSON.stringify(filterCauses), identityCacheToken]);
   const filteredSessions = useQuery({
-    queryKey: ['sessions-filter', sessionPage, failuresOnly, JSON.stringify(filterMessages), JSON.stringify(filterCauses), identityCacheToken, contextResolved],
+    queryKey: ['sessions-filter', filterCursor ?? '', failuresOnly, JSON.stringify(filterMessages), JSON.stringify(filterCauses), identityCacheToken, contextResolved],
     enabled: contextResolved && advancedActive,
     queryFn: () => postFilter({
       messages: filterMessages,
       causes: filterCauses,
       failures_only: failuresOnly,
       identity: identityActive && identityValue.length > 0 ? { kind: identityKind, value: identityValue } : undefined,
-      page: sessionPage,
-      page_size: 25,
+      limit: 25,
+      cursor: filterCursor,
     }),
   });
 
@@ -210,7 +217,10 @@ export function SessionExplorer(){
         </>}
       </div>
     </section>}
-    <section className="panel session-table-panel">{zeroSession?<ZeroSession captureId={captureId} datasetId={datasetId}/>:activeData?.data.length?<><DataTable data={activeData.data} columns={columns} onRowClick={openSession} selectedId={selectedId} getId={item=>item.session_id}/><Pagination page={activeData.meta.page??1} totalPages={activeData.meta.total_pages??1} onChange={value=>{setSessionPage(value);const next=new URLSearchParams(params);next.set('page',String(value));setParams(next)}}/></>:<EmptyState title={advancedActive?'No sessions match the advanced filters':'No sessions match these filters'}/>}</section>
+    <section className="panel session-table-panel">{zeroSession?<ZeroSession captureId={captureId} datasetId={datasetId}/>:activeData?.data.length?<><DataTable data={activeData.data} columns={columns} onRowClick={openSession} selectedId={selectedId} getId={item=>item.session_id}/>{advancedActive ? (() => {
+      const nextCursor = (filteredSessions.data?.meta as { next_cursor?: string|null } | undefined)?.next_cursor ?? null;
+      return <div className="pagination"><span className="muted">Canonical order (capture_id, first_packet_number, session_id) · cursor-based. {totalCount} session{totalCount===1?'':'s'} match.</span>{filterCursor && <button className="btn" onClick={()=>setFilterCursor(undefined)}>First page</button>}{nextCursor && <button className="btn primary" onClick={()=>setFilterCursor(nextCursor)}>Next page</button>}</div>;
+    })() : <Pagination page={activeData.meta.page??1} totalPages={activeData.meta.total_pages??1} onChange={value=>{setSessionPage(value);const next=new URLSearchParams(params);next.set('page',String(value));setParams(next)}}/>}</>:<EmptyState title={advancedActive?'No sessions match the advanced filters':'No sessions match these filters'}/>}</section>
     {selectedId&&!selectedBelongs&&<section className="state-box error"><strong>Session outside the selected dataset</strong><span>OIRAN will not switch to another dataset automatically.</span></section>}
     {selectedId&&selectedBelongs&&<section className="panel details"><div className="panel-head"><div><h2>{selectedId}</h2><p>Session-associated events stay separate from dataset background.</p></div>{detail.data&&<StatusBadge value={detail.data.summary.correlation_status}/>}</div><div className="tabs page-tabs">{['summary','procedures','messages','correlation','provenance','background'].map(value=><button key={value} className={tab===value?'active':''} onClick={()=>{setTab(value);setEventPage(1)}}>{value}</button>)}</div>{detail.isLoading?<LoadingState/>:detail.data&&<SessionTab tab={tab} detail={detail.data} events={events.data} loading={events.isLoading} page={eventPage} setPage={setEventPage}/>}</section>}
   </div>;

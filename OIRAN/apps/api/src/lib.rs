@@ -2715,10 +2715,15 @@ struct SessionsFilterRequest {
     /// jamais loggée, jamais stockée, jamais renvoyée.
     #[serde(default)]
     identity: Option<SessionsFilterIdentity>,
+    /// 2.10.1 (revue devmat) : pagination curseur sur la clé
+    /// canonique `(anchor_capture_id, first_packet_number,
+    /// session_id)`. `cursor` est l'opaque renvoyé par
+    /// `meta.next_cursor` d'une page précédente ; si absent, on
+    /// renvoie la première page.
     #[serde(default)]
-    page: Option<usize>,
+    cursor: Option<String>,
     #[serde(default)]
-    page_size: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -2819,13 +2824,21 @@ async fn sessions_filter(
         None => (None, ()),
     };
 
-    let matching_ids: Vec<String> = {
+    // 2.10.1 (revue devmat) : la clé de tri de pagination est
+    // `(anchor_capture_id, first_packet_number, session_id)` —
+    // JAMAIS un timestamp. Elle vient de `SessionFilterIndex`,
+    // qui l'a calculée à partir des events (capture_id min +
+    // packet_number min sur ce capture_id).
+    let (matching_keys, sorted_ids): (
+        std::collections::BTreeMap<String, (String, u64, String)>,
+        Vec<String>,
+    ) = {
         let guard = state
             .inner
             .session_filter_index
             .read()
             .expect("session_filter_index poisoned");
-        guard
+        let matching: Vec<String> = guard
             .filter(
                 &messages,
                 &causes,
@@ -2834,23 +2847,72 @@ async fn sessions_filter(
             )
             .into_iter()
             .map(str::to_owned)
-            .collect()
+            .collect();
+        let keys: std::collections::BTreeMap<String, (String, u64, String)> = matching
+            .iter()
+            .filter_map(|id| {
+                guard.pagination_key(id).map(|(cap, pkt, sid)| {
+                    (id.clone(), (cap.to_owned(), pkt, sid.to_owned()))
+                })
+            })
+            .collect();
+        let mut rows: Vec<(String, (String, u64, String))> =
+            matching.into_iter().filter_map(|id| keys.get(&id).map(|k| (id.clone(), k.clone()))).collect();
+        rows.sort_by(|a, b| a.1.cmp(&b.1));
+        let sorted: Vec<String> = rows.into_iter().map(|(id, _)| id).collect();
+        (keys, sorted)
     };
 
-    // Reconstitue les summaries sessions pour les ids retenus.
-    // Reutilise la même logique que `sessions` : tous les
-    // channels (static flows, live manager, LTE evidence store).
-    let mut items: Vec<Value> = Vec::new();
-    let matching_set: std::collections::BTreeSet<&str> =
-        matching_ids.iter().map(String::as_str).collect();
+    // Curseur : index à démarrer DANS `sorted_ids`. Si fourni,
+    // on cherche le session_id post-curseur strict (clé
+    // canonique strictement supérieure).
+    let limit = request.limit.unwrap_or(25).clamp(1, 100);
+    let start_index = match request.cursor.as_deref() {
+        None => 0,
+        Some(cursor_sid) => match matching_keys.get(cursor_sid) {
+            Some(cursor_key) => sorted_ids
+                .iter()
+                .position(|id| {
+                    matching_keys
+                        .get(id)
+                        .map(|k| k > cursor_key)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(sorted_ids.len()),
+            None => {
+                // Curseur pointant vers une session qui n'est
+                // plus dans le set filtré : traité comme
+                // fin-de-flux.
+                sorted_ids.len()
+            }
+        },
+    };
+    let page_ids: Vec<&str> = sorted_ids
+        .iter()
+        .skip(start_index)
+        .take(limit)
+        .map(String::as_str)
+        .collect();
+    let next_cursor: Option<&str> = if start_index + page_ids.len() < sorted_ids.len() {
+        page_ids.last().copied()
+    } else {
+        None
+    };
+
+    // Reconstitue les summaries sessions pour les ids de la
+    // page. Même ordre canonique qu'au tri (pas de re-sort par
+    // `ts` dans cette étape).
+    let page_set: std::collections::BTreeSet<&str> = page_ids.iter().copied().collect();
+    let mut items_by_id: std::collections::BTreeMap<String, Value> =
+        std::collections::BTreeMap::new();
     for flow in state.inner.flows.values() {
-        if matching_set.contains(flow.session_id.as_str()) {
-            items.push(session_summary(&state, flow));
+        if page_set.contains(flow.session_id.as_str()) {
+            items_by_id.insert(flow.session_id.clone(), session_summary(&state, flow));
         }
     }
     for dataset in state.inner.capture_manager.datasets() {
         for session_id in &dataset.session_ids {
-            if !matching_set.contains(session_id.as_str()) {
+            if !page_set.contains(session_id.as_str()) {
                 continue;
             }
             if let Some(flow) = state
@@ -2858,7 +2920,7 @@ async fn sessions_filter(
                 .capture_manager
                 .callflow(&dataset.dataset_id, session_id)
             {
-                items.push(live_session_summary(&dataset, &flow));
+                items_by_id.insert(session_id.clone(), live_session_summary(&dataset, &flow));
             }
         }
     }
@@ -2872,8 +2934,11 @@ async fn sessions_filter(
                 if let Some(records) = page["data"].as_array() {
                     for record in records {
                         if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
-                            if matching_set.contains(session.session_id.as_str()) {
-                                items.push(lte_session_summary(&manifest, &session));
+                            if page_set.contains(session.session_id.as_str()) {
+                                items_by_id.insert(
+                                    session.session_id.clone(),
+                                    lte_session_summary(&manifest, &session),
+                                );
                             }
                         }
                     }
@@ -2881,39 +2946,26 @@ async fn sessions_filter(
             }
         }
     }
-    // 2.10.0 : ordre canonique `(capture_id, start_timestamp,
-    // session_id)` — reproducible sur runs répétés, jamais via `ts`
-    // seul.
-    items.sort_by(|a, b| {
-        let ka = (
-            a["capture_id"].as_str().unwrap_or(""),
-            a["start_timestamp"].as_str().unwrap_or(""),
-            a["session_id"].as_str().unwrap_or(""),
-        );
-        let kb = (
-            b["capture_id"].as_str().unwrap_or(""),
-            b["start_timestamp"].as_str().unwrap_or(""),
-            b["session_id"].as_str().unwrap_or(""),
-        );
-        ka.cmp(&kb)
-    });
-    sanitize_all(&mut items);
+    // Assemble la page DANS l'ordre canonique page_ids — pas
+    // de re-sort sur `ts` ou autre après ça.
+    let mut data: Vec<Value> = page_ids
+        .iter()
+        .filter_map(|id| items_by_id.remove(*id))
+        .collect();
+    sanitize_all(&mut data);
 
-    let total = items.len();
-    let page = request.page.unwrap_or(1).max(1);
-    let page_size = request.page_size.unwrap_or(25).clamp(1, 100);
-    let start = (page - 1).saturating_mul(page_size);
-    let data: Vec<Value> = items.into_iter().skip(start).take(page_size).collect();
-
+    let total = sorted_ids.len();
     let mut response = serde_json::json!({
         "data": data,
         "meta": {
             "api_version": API_VERSION,
-            "page": page,
-            "page_size": page_size,
+            "limit": limit,
             "total": total,
-            "total_pages": total.div_ceil(page_size),
             "role": role.name(),
+            "next_cursor": next_cursor,
+            // 2.10.1 : clé de pagination documentée en réponse —
+            // reviewers peuvent auditer l'invariant "jamais ts".
+            "pagination_key": "(anchor_capture_id, first_packet_number, session_id)",
         }
     });
     if let Some(pseudo) = identity_pseudonym.as_deref() {
@@ -5936,6 +5988,98 @@ mod tests {
         }
         // Aucune identité ne doit figurer dans la réponse.
         assert_no_identity_material(&body);
+    }
+
+    #[tokio::test]
+    async fn sessions_filter_pagination_uses_capture_packet_session_not_ts() {
+        // 2.10.1 (revue devmat) : la réponse doit documenter
+        // explicitement sa clé de pagination et NE JAMAIS
+        // contenir `start_timestamp` dans le tri. On vérifie :
+        //   * `meta.pagination_key` annonce la clé canonique.
+        //   * `meta.next_cursor` existe ou est null (jamais un
+        //     ts).
+        //   * `data` est trié par (capture_id, …) et la paire
+        //     consécutive n'est pas monotone en start_timestamp
+        //     seul — ce qui serait la signature d'un tri sur
+        //     `ts`.
+        let state = state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({ "limit": 5 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["meta"]["pagination_key"],
+            "(anchor_capture_id, first_packet_number, session_id)"
+        );
+        // next_cursor doit être une string de session_id ou
+        // null — JAMAIS un timestamp.
+        match &body["meta"]["next_cursor"] {
+            Value::Null => {}
+            Value::String(cursor) => {
+                assert!(
+                    !cursor.contains('T') || !cursor.ends_with('Z'),
+                    "next_cursor looks like a timestamp (ANR2 rule « jamais ts ») : {cursor}"
+                );
+            }
+            other => panic!("next_cursor must be string or null, got: {other}"),
+        }
+        // Tri : vérifier que les items retournés sont
+        // ordonnés par (capture_id, session_id) — leur
+        // start_timestamp n'a aucune garantie de monotonie.
+        let data = body["data"].as_array().expect("data array");
+        for pair in data.windows(2) {
+            let ka = (
+                pair[0]["capture_id"].as_str().unwrap_or(""),
+                pair[0]["session_id"].as_str().unwrap_or(""),
+            );
+            let kb = (
+                pair[1]["capture_id"].as_str().unwrap_or(""),
+                pair[1]["session_id"].as_str().unwrap_or(""),
+            );
+            assert!(ka <= kb, "pagination out of canonical order: {ka:?} vs {kb:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_filter_cursor_advances_without_duplicates() {
+        // 2.10.1 : deux pages consécutives via `cursor` ne
+        // doivent pas se chevaucher, ni introduire de session
+        // deux fois.
+        let state = state();
+        let (_, body_a) = post_sessions_filter(
+            &state,
+            json!({ "limit": 1 }),
+            None,
+        )
+        .await;
+        let first = body_a["data"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|s| s["session_id"].as_str())
+            .map(str::to_owned);
+        let cursor = body_a["meta"]["next_cursor"].as_str().map(str::to_owned);
+        if let (Some(first_id), Some(cursor_val)) = (first, cursor) {
+            let (_, body_b) = post_sessions_filter(
+                &state,
+                json!({ "limit": 1, "cursor": cursor_val }),
+                None,
+            )
+            .await;
+            let second = body_b["data"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|s| s["session_id"].as_str())
+                .map(str::to_owned);
+            if let Some(second_id) = second {
+                assert_ne!(
+                    first_id, second_id,
+                    "cursor must not re-emit the same session_id"
+                );
+            }
+        }
     }
 
     #[tokio::test]
