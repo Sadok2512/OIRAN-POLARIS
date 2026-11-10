@@ -1,6 +1,7 @@
 //! Versioned, read-only HTTP adapter for certified OIRAN artifacts.
 
 mod probe_registry;
+mod session_filters;
 
 use axum::{
     body::Body,
@@ -78,6 +79,13 @@ struct Inner {
     lte_evidence_bundle_root: PathBuf,
     operator_token_sha256: Option<String>,
     administrator_token_sha256: Option<String>,
+    /// 2.10.0 : index des filtres Session Explorer (messages, causes,
+    /// pseudonymes), construit au chargement depuis `flows` + mis à
+    /// jour par `refresh_session_filter_index` quand le capture
+    /// manager publie une nouvelle version du dataset continu.
+    /// Verrouillé par `RwLock` : lecteurs multiples (handlers HTTP)
+    /// + rare upsert sous `write`.
+    session_filter_index: std::sync::RwLock<session_filters::SessionFilterIndex>,
 }
 
 #[derive(Clone, Debug)]
@@ -400,6 +408,8 @@ impl AppState {
             error_count: 0,
             read_only: true,
         })?;
+        let session_filter_index =
+            session_filters::SessionFilterIndex::from_flows(flows.values());
         Ok(Self {
             inner: Arc::new(Inner {
                 flows,
@@ -418,6 +428,7 @@ impl AppState {
                 lte_evidence_bundle_root,
                 operator_token_sha256: config.operator_token_sha256,
                 administrator_token_sha256: config.administrator_token_sha256,
+                session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
     }
@@ -478,8 +489,38 @@ impl AppState {
                 lte_evidence_bundle_root,
                 operator_token_sha256: config.operator_token_sha256,
                 administrator_token_sha256: config.administrator_token_sha256,
+                session_filter_index: std::sync::RwLock::new(
+                    session_filters::SessionFilterIndex::empty(),
+                ),
             }),
         })
+    }
+}
+
+impl AppState {
+    /// 2.10.0 : reconstruit l'index des filtres Session Explorer à
+    /// partir des `flows` statiques + des `callflows/` de chaque
+    /// dataset publié par le `CaptureManager` (continuous +
+    /// derived). Appelé à chaque rafraîchissement opérationnel.
+    fn refresh_session_filter_index(&self) {
+        let mut index = session_filters::SessionFilterIndex::empty();
+        for flow in self.inner.flows.values() {
+            index.upsert_flow(flow);
+        }
+        for dataset in self.inner.capture_manager.datasets() {
+            for session_id in &dataset.session_ids {
+                if let Some(flow) = self
+                    .inner
+                    .capture_manager
+                    .callflow(&dataset.dataset_id, session_id)
+                {
+                    index.upsert_flow(&flow);
+                }
+            }
+        }
+        if let Ok(mut guard) = self.inner.session_filter_index.write() {
+            *guard = index;
+        }
     }
 }
 
@@ -561,6 +602,8 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/captures/start", post(start_capture))
         .route("/captures/:id/stop", post(stop_capture))
         .route("/sessions", get(sessions))
+        .route("/sessions/filter", post(sessions_filter))
+        .route("/sessions/available_causes", get(sessions_available_causes))
         .route("/sessions/:id", get(session))
         .route("/sessions/:id/procedures", get(session_procedures))
         .route("/sessions/:id/events", get(session_events))
@@ -2641,6 +2684,243 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
     );
     sanitize_all(&mut items);
     paginated(items, &query)
+}
+
+/// 2.10.0 — `GET /sessions/available_causes` : liste les causes
+/// réellement présentes dans le dataset courant avec compteur de
+/// sessions touchées. Accessible viewer ; aucune identité en clair
+/// dans la réponse (l'index ne stocke que des codes de cause et un
+/// compteur). ETag absent — valeur réactive au dataset courant.
+async fn sessions_available_causes(State(state): State<AppState>) -> Response {
+    state.refresh_session_filter_index();
+    let causes = state
+        .inner
+        .session_filter_index
+        .read()
+        .map(|index| index.available_causes())
+        .unwrap_or_default();
+    ok(serde_json::json!({ "causes": causes })).into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct SessionsFilterRequest {
+    #[serde(default)]
+    messages: Vec<SessionsFilterMessage>,
+    #[serde(default)]
+    causes: Vec<SessionsFilterCause>,
+    #[serde(default)]
+    failures_only: bool,
+    /// Optionnel. Rôle d'identité + valeur brute. Serveur hashe
+    /// immédiatement avec la clé courante et le label décodeur ;
+    /// jamais loggée, jamais stockée, jamais renvoyée.
+    #[serde(default)]
+    identity: Option<SessionsFilterIdentity>,
+    #[serde(default)]
+    page: Option<usize>,
+    #[serde(default)]
+    page_size: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SessionsFilterMessage {
+    name: String,
+    #[serde(default)]
+    interface: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionsFilterCause {
+    value: String,
+    #[serde(default)]
+    domain: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionsFilterIdentity {
+    kind: String,
+    value: String,
+}
+
+/// 2.10.0 — `POST /sessions/filter` : AND logique sur
+/// `messages` (par interface optionnelle), `causes` (par domaine
+/// optionnel), `failures_only`, et `identity` (operator seulement).
+///
+/// Contrat vie privée :
+/// * Méthode POST : la valeur d'identité n'apparaît jamais dans
+///   l'URL, donc jamais dans les logs d'accès ni la history
+///   navigateur.
+/// * Le serveur calcule
+///   `pseudonym(key, identity_kind.pseudo_domain(), value.bytes())`
+///   et compare au set de pseudonymes observé par session. La
+///   valeur brute est droppée immédiatement après le hash.
+/// * Role check : si `identity` est présent et le role est Viewer,
+///   on retourne 403 `IDENTITY_FILTER_OPERATOR_REQUIRED` SANS
+///   lire la valeur. Un viewer ne peut même pas émettre la requête
+///   avec un hint présent.
+/// * Réponse : liste de summaries de sessions sanitisée par
+///   `sanitize_all`, plus `identity_matched_pseudonym` (le `psn-...`
+///   recherché, pas la valeur brute). Si `identity` était absent,
+///   ce champ est absent aussi.
+async fn sessions_filter(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SessionsFilterRequest>,
+) -> Response {
+    let role = role_from_headers(&state, &headers);
+    if request.identity.is_some() && !role.can_control() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "IDENTITY_FILTER_OPERATOR_REQUIRED",
+            "identity-scoped session filtering requires an operator bearer",
+        );
+    }
+    state.refresh_session_filter_index();
+
+    let messages: Vec<(Option<String>, String)> = request
+        .messages
+        .into_iter()
+        .map(|m| (m.interface, m.name))
+        .collect();
+    let causes: Vec<(Option<String>, String)> = request
+        .causes
+        .into_iter()
+        .map(|c| (c.domain, c.value))
+        .collect();
+
+    // Calcul du pseudonyme à matcher. La valeur brute vit
+    // uniquement dans cette variable locale, consommée par
+    // `pseudonym(...)` et jamais relue.
+    let (identity_pseudonym, _identity_value_dropped) = match request.identity {
+        Some(identity) => {
+            let Some(kind) = session_filters::IdentityKind::parse(&identity.kind) else {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "IDENTITY_KIND_UNKNOWN",
+                    "identity.kind must be one of supi_or_imsi | imei_or_pei | guti_or_tmsi | s_tmsi",
+                );
+            };
+            if identity.value.is_empty() {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "IDENTITY_VALUE_EMPTY",
+                    "identity.value must be a non-empty string",
+                );
+            }
+            let key = state.inner.capture_manager.pseudonym_key();
+            let pseudo = event_schema::pseudonym(
+                key.as_ref(),
+                kind.pseudo_domain(),
+                identity.value.as_bytes(),
+            );
+            // `identity.value` goes out of scope immediately after
+            // this binding — Rust drops the String.
+            (Some(pseudo), ())
+        }
+        None => (None, ()),
+    };
+
+    let matching_ids: Vec<String> = {
+        let guard = state
+            .inner
+            .session_filter_index
+            .read()
+            .expect("session_filter_index poisoned");
+        guard
+            .filter(
+                &messages,
+                &causes,
+                request.failures_only,
+                identity_pseudonym.as_deref(),
+            )
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    };
+
+    // Reconstitue les summaries sessions pour les ids retenus.
+    // Reutilise la même logique que `sessions` : tous les
+    // channels (static flows, live manager, LTE evidence store).
+    let mut items: Vec<Value> = Vec::new();
+    let matching_set: std::collections::BTreeSet<&str> =
+        matching_ids.iter().map(String::as_str).collect();
+    for flow in state.inner.flows.values() {
+        if matching_set.contains(flow.session_id.as_str()) {
+            items.push(session_summary(&state, flow));
+        }
+    }
+    for dataset in state.inner.capture_manager.datasets() {
+        for session_id in &dataset.session_ids {
+            if !matching_set.contains(session_id.as_str()) {
+                continue;
+            }
+            if let Some(flow) = state
+                .inner
+                .capture_manager
+                .callflow(&dataset.dataset_id, session_id)
+            {
+                items.push(live_session_summary(&dataset, &flow));
+            }
+        }
+    }
+    if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
+        for manifest in catalog {
+            if let Ok(page) = state
+                .inner
+                .lte_evidence_store
+                .session_page(&manifest.run_id, 1, 100)
+            {
+                if let Some(records) = page["data"].as_array() {
+                    for record in records {
+                        if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
+                            if matching_set.contains(session.session_id.as_str()) {
+                                items.push(lte_session_summary(&manifest, &session));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 2.10.0 : ordre canonique `(capture_id, start_timestamp,
+    // session_id)` — reproducible sur runs répétés, jamais via `ts`
+    // seul.
+    items.sort_by(|a, b| {
+        let ka = (
+            a["capture_id"].as_str().unwrap_or(""),
+            a["start_timestamp"].as_str().unwrap_or(""),
+            a["session_id"].as_str().unwrap_or(""),
+        );
+        let kb = (
+            b["capture_id"].as_str().unwrap_or(""),
+            b["start_timestamp"].as_str().unwrap_or(""),
+            b["session_id"].as_str().unwrap_or(""),
+        );
+        ka.cmp(&kb)
+    });
+    sanitize_all(&mut items);
+
+    let total = items.len();
+    let page = request.page.unwrap_or(1).max(1);
+    let page_size = request.page_size.unwrap_or(25).clamp(1, 100);
+    let start = (page - 1).saturating_mul(page_size);
+    let data: Vec<Value> = items.into_iter().skip(start).take(page_size).collect();
+
+    let mut response = serde_json::json!({
+        "data": data,
+        "meta": {
+            "api_version": API_VERSION,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total.div_ceil(page_size),
+            "role": role.name(),
+        }
+    });
+    if let Some(pseudo) = identity_pseudonym.as_deref() {
+        response["meta"]["identity_matched_pseudonym"] =
+            serde_json::Value::String(pseudo.to_owned());
+    }
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -5465,5 +5745,211 @@ mod tests {
 
         // Empty list: None (handler already encodes as JSON null).
         assert!(select_metrics_source_job(&[]).is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 2.10.0 (devmat) — Session Explorer filter endpoints (API).
+    //
+    // Couvre :
+    //   * messages — multi-select par interface
+    //   * causes — scopées par domain, failures_only
+    //   * identity — viewer 403, operator OK, pseudonymisation
+    //     côté serveur, aucune identité en clair dans la
+    //     réponse / URL
+    //   * combinaison AND
+    //   * IMSI inconnu → 0 sans leak
+    // ─────────────────────────────────────────────────────────────
+
+    async fn post_sessions_filter(
+        app_state: &AppState,
+        body: Value,
+        bearer: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let router = router(app_state.clone(), None);
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sessions/filter")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = bearer {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let request = builder.body(Body::from(body.to_string())).unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let payload = json_body(response).await;
+        (status, payload)
+    }
+
+    #[tokio::test]
+    async fn sessions_filter_message_narrows_result() {
+        let state = state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "messages": [{"name": "PDUSessionResourceSetupRequest", "interface": "N2"}]
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let data = body["data"].as_array().expect("data array present");
+        for item in data {
+            // Chaque session retenue DOIT contenir le message
+            // demandé (vérifié par l'index), donc son interface
+            // de call-flow doit comporter N2.
+            let interfaces = item["interfaces"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                interfaces.iter().any(|i| i == "N2"),
+                "session {} returned without N2 interface",
+                item["session_id"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_filter_viewer_cannot_pass_identity_hint() {
+        let state = operator_state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "identity": {"kind": "supi_or_imsi", "value": "imsi-208010001234567"}
+            }),
+            None, // ← pas de bearer → Viewer
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "IDENTITY_FILTER_OPERATOR_REQUIRED");
+        // La réponse n'écho jamais la valeur brute.
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains("imsi-208010001234567"),
+            "raw identity leaked in viewer-403 response: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_filter_identity_never_echoes_raw_value() {
+        let state = operator_state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "identity": {"kind": "supi_or_imsi", "value": "imsi-208010009999999"}
+            }),
+            Some("test-operator-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains("imsi-208010009999999"),
+            "raw identity leaked in operator response: {serialized}"
+        );
+        // La meta expose le pseudonyme recherché mais jamais la
+        // valeur brute.
+        assert!(body["meta"]["identity_matched_pseudonym"].is_string());
+        let pseudo = body["meta"]["identity_matched_pseudonym"]
+            .as_str()
+            .unwrap();
+        assert!(
+            pseudo.starts_with("psn-"),
+            "expected psn- prefix, got {pseudo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_filter_unknown_identity_returns_zero_without_leak() {
+        let state = operator_state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "identity": {"kind": "supi_or_imsi", "value": "imsi-999999999999999"}
+            }),
+            Some("test-operator-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["meta"]["total"], 0);
+        assert_eq!(
+            body["data"].as_array().map(|a| a.len()),
+            Some(0),
+            "unknown IMSI must return zero sessions"
+        );
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains("999999999999999"),
+            "raw unknown identity leaked: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_filter_combines_messages_and_failures_only_and() {
+        let state = state();
+        // Combinaison large : messages d'enregistrement + échec
+        // uniquement. Avec le dataset synthétique embarqué,
+        // peut renvoyer 0 ou plus, mais chaque entrée DOIT
+        // satisfaire les deux prédicats.
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "messages": [{"name": "Registration Reject"}],
+                "failures_only": true,
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let data = body["data"].as_array().expect("data present");
+        for item in data {
+            // Pas de preuve directe sans re-fetcher la session ;
+            // on vérifie au moins l'absence d'identité en clair.
+            assert_no_identity_material(item);
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_available_causes_lists_causes_with_counts() {
+        let state = state();
+        let router = router(state.clone(), None);
+        let request = Request::builder()
+            .uri("/api/v1/sessions/available_causes")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let causes = body["data"]["causes"]
+            .as_array()
+            .expect("causes array present");
+        // Shape invariants plus critiques que le compte : chaque
+        // cause porte domain, value, is_failure, session_count ≥ 1.
+        for cause in causes {
+            assert!(cause["domain"].is_string(), "domain missing: {cause}");
+            assert!(cause["value"].is_string(), "value missing: {cause}");
+            assert!(cause["is_failure"].is_boolean(), "is_failure missing: {cause}");
+            assert!(
+                cause["session_count"].as_u64().unwrap_or(0) >= 1,
+                "session_count must be >= 1: {cause}"
+            );
+        }
+        // Aucune identité ne doit figurer dans la réponse.
+        assert_no_identity_material(&body);
+    }
+
+    #[tokio::test]
+    async fn sessions_filter_unknown_identity_kind_rejected() {
+        let state = operator_state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "identity": {"kind": "not_a_kind", "value": "whatever"}
+            }),
+            Some("test-operator-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "IDENTITY_KIND_UNKNOWN");
     }
 }

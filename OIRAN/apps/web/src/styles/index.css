@@ -38,3 +38,29 @@
 
 .app-footer{display:flex;gap:16px;align-items:center;justify-content:flex-end;padding:8px 18px;font-size:10px;color:var(--muted);border-top:1px solid var(--border);background:var(--surface)}
 .app-footer b{color:var(--text);font-weight:700;font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace}
+
+/* 2.10.0 — Session Explorer advanced filters (devmat) */
+.advanced-filters{display:flex;flex-direction:column;gap:14px}
+.advanced-filters h3{margin:0 0 4px;font-size:12px;letter-spacing:.02em}
+.advanced-filters h3 svg{vertical-align:middle;margin:0 4px 1px 2px;color:var(--warning)}
+.advanced-filters .muted.small{font-size:10px;margin:0 0 6px}
+.advanced-filters .chip-row{display:flex;flex-wrap:wrap;gap:5px;align-items:center}
+.advanced-filters .chip-row-label{min-width:48px;display:inline-block;font-size:10px;color:var(--muted);letter-spacing:.07em;text-transform:uppercase}
+.chip.toggle{height:24px;padding:0 9px;border:1px solid var(--border);background:var(--surface-2);color:var(--text);border-radius:999px;font-size:10px;font-weight:600;cursor:pointer}
+.chip.toggle:hover{border-color:var(--blue)}
+.chip.toggle.on{background:var(--blue);border-color:var(--blue);color:#fff}
+.chip.toggle.failure{border-color:#ef444460}
+.chip.toggle.failure.on{background:var(--critical);border-color:var(--critical)}
+.chip.toggle .count{display:inline-block;margin-left:6px;padding:0 5px;background:#00000018;border-radius:999px;font-weight:700;font-size:9px}
+.chip.toggle.on .count{background:#ffffff28}
+.filterbar .chip{height:16px;padding:0 6px;border-radius:999px;background:var(--blue);color:#fff;font-size:9px;line-height:16px;margin-left:4px;font-weight:700}
+.advanced-filters .toggle-inline{display:inline-flex;align-items:center;gap:5px;margin:0 0 6px;font-size:11px;color:var(--text)}
+.advanced-filters .toggle-inline input{margin:0}
+.advanced-filters .identity-group{border-top:1px dashed var(--border);padding-top:12px}
+.advanced-filters .identity-group svg{vertical-align:middle}
+.advanced-filters .identity-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:4px}
+.advanced-filters .identity-row select{height:30px;border:1px solid var(--border);background:var(--surface);color:var(--text);border-radius:6px;padding:0 7px;min-width:180px}
+.advanced-filters .identity-row input{height:30px;border:1px solid var(--border);background:var(--surface);color:var(--text);border-radius:6px;padding:0 8px;min-width:220px;font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace}
+.advanced-filters .identity-row .btn{height:30px}
+.advanced-filters .identity-row .btn.ghost{background:transparent;color:var(--muted)}
+.advanced-filters .identity-group code{font-size:11px}

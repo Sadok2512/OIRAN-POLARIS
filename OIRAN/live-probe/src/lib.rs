@@ -1463,6 +1463,17 @@ impl CaptureManager {
                 .is_some_and(|job| job.state.active())
     }
 
+    /// 2.10.0 (devmat) : accessor sur la clé de pseudonymisation
+    /// chargée par ce manager. Utilisé par l'API `POST
+    /// /sessions/filter` pour calculer le pseudonyme du hint
+    /// d'identité opérateur AVANT comparaison — la valeur brute
+    /// n'est jamais stockée ni loggée ; seule la clé (déjà protégée
+    /// par `OIRAN_PSEUDONYM_KEY_UNAVAILABLE` / `_INSECURE`) est
+    /// partagée via l'`Arc`.
+    pub fn pseudonym_key(&self) -> Arc<PseudonymKey> {
+        self.pseudonym_key.clone()
+    }
+
     pub fn start_continuous_import(
         &self,
         config: ContinuousImportConfig,

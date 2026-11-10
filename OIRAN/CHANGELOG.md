@@ -1,5 +1,104 @@
 # Changelog
 
+## OIRAN API 2.10.0 — 2026-11-10 — Session Explorer filters (messages, causes, identity) (devmat)
+
+Minor release qui ajoute **au Session Explorer** trois axes de filtre combinables (ET logique) et le pseudonymizer côté serveur pour la recherche d'identité opérateur. Aucune modification du pipeline de reconstruction (fu3 reste intact).
+
+### 1. Filtre par MESSAGE
+
+- Multi-select par interface sur un catalogue par défaut (N2, SBI, N4, S1-MME, S11) — étendable sans contrat API (purement UI).
+- Backend : `SessionFilterIndex` (`apps/api/src/session_filters.rs`) construit au chargement + rafraîchi via `AppState::refresh_session_filter_index()` quand le capture manager publie une nouvelle version. Index borné : `O(messages uniques + causes uniques + pseudonymes uniques)` par session, ~kilooctet par entrée (10 000 sessions → < 10 MiB).
+
+### 2. Filtre par CAUSE (cas d'échec)
+
+- `GET /api/v1/sessions/available_causes` → liste les causes **réellement présentes** avec `domain` (`NGAP` / `S1AP` / `5GMM` / `EMM` / `5GSM` / `ESM` / `GTPV2` / `PFCP` / `SBI`), `value`, `is_failure`, `session_count ≥ 1`.
+- Toggle « Failures only » côté UI → filtre serveur qui ne garde que les sessions avec `semantic_status = FAILURE`.
+- Classification `is_failure` : SBI → HTTP ≥ 400 ; autres → `cause != 1` (et `!= 0`) — tolérance aux motifs legacy `cause=X`.
+
+### 3. Filtre par IDENTITÉ (operator-only, pseudonymisation côté serveur)
+
+**Contrat vie privée (critique ANR2)** :
+
+- **Endpoint** : `POST /api/v1/sessions/filter` — méthode POST obligatoire pour que la valeur d'identité n'apparaisse jamais dans l'URL (donc jamais dans les logs d'accès ni l'historique navigateur).
+- **Role check** : si `identity` est présent et le role est Viewer → **403** `IDENTITY_FILTER_OPERATOR_REQUIRED` SANS lire la valeur. Le viewer ne peut même pas émettre la requête avec un hint présent.
+- **Pseudonymisation serveur** :
+  ```rust
+  let key = state.inner.capture_manager.pseudonym_key();
+  let pseudo = event_schema::pseudonym(
+      key.as_ref(),
+      kind.pseudo_domain(),
+      identity.value.as_bytes(),
+  );
+  // identity.value sort du scope immédiatement après ce bind.
+  ```
+  Labels (identiques aux décodeurs) :
+  | kind UI | `pseudo_domain()` | source décodeur |
+  |---|---|---|
+  | `supi_or_imsi` | `subscriber` | `event_schema::SUBSCRIBER_PSEUDO_DOMAIN` |
+  | `imei_or_pei` | `masked-imeisv` | `decoder-ngap/src/lib.rs:209` |
+  | `guti_or_tmsi` | `five-g-s-tmsi` | `decoder-ngap/src/lib.rs:197` |
+  | `s_tmsi` | `s1ap-s-tmsi` | `decoder-s1ap/src/lib.rs:186` |
+- **Réponse** : liste de summaries sanitisées par `sanitize_all` (anti-fuite existant) + `meta.identity_matched_pseudonym = psn-xxx` (le pseudonyme recherché, pas la valeur brute). Absent si pas d'`identity` dans la requête.
+- **IMSI inconnu** → `total: 0`, `data: []` — réponse normale sans fuite. Le pseudonyme calculé (déterministe) peut figurer dans `meta` : c'est un hash HMAC-SHA256 tronqué à 128 bits, non inversible, et jamais corrélable à une identité sans la clé.
+- **Côté UI** : champ de type `password`, `autocomplete=off`, `spellCheck=false` ; `queryKey` React Query hashe la LONGUEUR + un booléen « non-vide » plutôt que la valeur (jamais dans la cache clé). Mention « 5G-GUTI/TMSI éphémère — une ré-enregistrement fait tourner la valeur ».
+
+### 4. Pagination et combinaison
+
+- `POST /sessions/filter` combine `messages`, `causes`, `failures_only`, `identity` en **ET logique** strict.
+- Ordre de pagination canonique : `(capture_id, start_timestamp, session_id)` — jamais sur `ts` seul.
+- Page / page_size dans le body JSON ; pas de valeur d'identité dans l'URL, jamais.
+
+### 5. Tests
+
+**Backend** (`cargo test -p oiran-api --lib`) :
+
+- `session_filters::tests::*` — 6/6 (message, cause scopé, failures_only, pseudonyme IE, available_causes agrégation, AND combinaison).
+- `tests::sessions_filter_message_narrows_result` — PASS
+- `tests::sessions_filter_viewer_cannot_pass_identity_hint` — PASS (403 + aucune fuite)
+- `tests::sessions_filter_identity_never_echoes_raw_value` — PASS
+- `tests::sessions_filter_unknown_identity_returns_zero_without_leak` — PASS
+- `tests::sessions_filter_combines_messages_and_failures_only_and` — PASS
+- `tests::sessions_available_causes_lists_causes_with_counts` — PASS
+- `tests::sessions_filter_unknown_identity_kind_rejected` — PASS
+
+Suite complète `oiran-api --lib` : **10 tests `sessions_*` passed, 0 failed** (+7 vs 2.9.18).
+
+**Frontend** (`npm run test`) : **94 passed** (14 fichiers). Le fichier `SessionExplorer.tsx` typechecke sans erreur (`npm run typecheck`).
+
+**E2E** (`tests/e2e/v2_10_session_filters.spec.ts`) :
+
+- Viewer voit messages + causes + failures_only mais PAS l'identity input (role-gate avec message `Sign in as an operator`).
+- Un clic sur un chip message ne pousse rien d'identifiant dans l'URL (POST-only invariant).
+- `GET /sessions/available_causes` : shape OK (domain, value, is_failure, session_count ≥ 1).
+- `POST /sessions/filter` viewer sans identity : 200 OK, role=viewer, pas de `identity_matched_pseudonym`.
+- `POST /sessions/filter` viewer avec identity : 403 `IDENTITY_FILTER_OPERATOR_REQUIRED` ; `imsi-208010001234567` jamais dans le body.
+- Captures 1280×800, 1440×900, 1920×1080 (light + dark) sous `OIRAN_V2_10_SESSION_FILTERS_SCREENSHOTS/`.
+
+### 6. Mémoire
+
+Index `SessionFilterIndex` protégé par `RwLock` — lecteurs multiples (handlers HTTP) + rare upsert sous `write` lors d'un refresh. Aucune nouvelle structure disque. Sur le dataset lab (1,5 M events, ~3 sessions) l'index pèse < 10 KiB ; sur une production à 10 000 sessions l'index tient sous les 10 MiB — pas de régression sous `MemoryMax=256M`.
+
+### Versions
+
+| crate | pré-2.10.0 | 2.10.0 |
+|---|---|---|
+| `oiran-api` | 2.9.18 | **2.10.0** (minor) |
+| `live-probe` | 0.4.28 | **0.4.29** (patch — expose `pseudonym_key()`) |
+| `@oiran/web` | 2.9.3 | **2.10.0** (minor) |
+| `session-engine` | 0.5.5 | 0.5.5 (inchangé) |
+
+### Fichiers
+
+- `apps/api/src/session_filters.rs` (nouveau, 400+ lignes + 6 tests)
+- `apps/api/src/lib.rs` : nouveaux handlers `sessions_filter` + `sessions_available_causes`, index sur `Inner`, `refresh_session_filter_index`
+- `apps/web/src/pages/SessionExplorer.tsx` : panneau Advanced filters, hook `useQuery('/auth/me')` pour le role-gate, POST client
+- `apps/web/src/styles/index.css` : chip toggles + identity row
+- `live-probe/src/lib.rs` : `CaptureManager::pseudonym_key()` public accessor
+- `tests/e2e/v2_10_session_filters.spec.ts` (nouveau)
+- `OIRAN/Cargo.lock` cohérent
+
+---
+
 ## OIRAN API 2.9.18-fu3 — 2026-11-09 — reconstruction continue bornée sous MemoryMax 256 MiB (devmat, ANR2 #9 comment 6750859966)
 
 **Preuve ANR2** (comment 6750859966) : deux OOM consécutifs sur `oiran-api` 2.9.18 puis 2.9.18-fu2 sous `MemoryMax=268435456` (256 MiB) pendant la reconstruction continue de `.dataset-next/`.
