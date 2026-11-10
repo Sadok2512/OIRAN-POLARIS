@@ -1,5 +1,182 @@
 # Changelog
 
+## OIRAN API 2.11.3 — 2026-11-10 — exclusion rollback/next/previous du budget (devmat, cause BLOCKED ANR1 #9 comment 6781367658)
+
+**Patch qui corrige la cause BLOCKED prouvée par ANR1** sur la production 2.10.2. C'est **la version qui sera déployée** (2.11.1 et 2.11.2 ne le sont pas seules).
+
+### 1. Cause exacte (ANR1)
+
+```
+.dataset.rollback.20261110T204701Z : 3 380 541 933 octets
+  dans la racine d'import `/var/lib/oiran/captures/continuous-lab-import/`
+→ counted dans work_bytes
+→ staging_bytes = 3 386 220 588 octets
+→ 3 386 220 588 + 193 772 (candidate) + 67 108 864 (derived reserve)
+  = 3 453 423 224 > 1 140 850 688 (max_owned_bytes)
+→ CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT
+→ CaptureState::Blocked
+```
+
+Le répertoire `.dataset.rollback.YYYYMMDDTHHMMSSZ/` est un tombstone opérateur créé par la procédure de rollback ANR1 (**pas** un artefact OIRAN). `work_bytes` (`live-probe/src/lib.rs:8681-8688`) comptait TOUT sous `base/` sauf `dataset/` et `pcap/<sha>.pcap...`, donc incluait ce tombstone.
+
+### 2. Fix : exclure `.dataset.rollback.*` + `.dataset-previous` + `.dataset-next` du budget
+
+```rust
+fn work_bytes(base: &Path) -> u64 {
+    let total = directory_size(base);
+    let published = directory_size(&base.join("dataset"));
+    let committed_ring = committed_ring_bytes(&base.join("pcap"));
+    let next = directory_size(&base.join(".dataset-next"));
+    let previous = directory_size(&base.join(".dataset-previous"));
+    let (rollback_bytes, rollback_paths) = rollback_tombstones(base);
+    if next > 0 || previous > 0 || rollback_bytes > 0 {
+        eprintln!("CONTINUOUS_BUDGET_EXCLUSION {...}");
+    }
+    total
+        .saturating_sub(published)
+        .saturating_sub(committed_ring)
+        .saturating_sub(next)
+        .saturating_sub(previous)
+        .saturating_sub(rollback_bytes)
+}
+```
+
+Trois exclusions, toutes argumentées en commentaire du code :
+
+| Exclusion | Pourquoi |
+|---|---|
+| `.dataset-next/` | Mid-publish staging. Sa taille est une FONCTION de l'historique du dataset (jusqu'à ~3,3 Go observé en prod sur 1,5 M events). **`max_owned_bytes = 1,06 GiB` serait trivialement dépassé par une publication normale** — voir §3. Le budget ne gate plus l'écho du dataset existant. |
+| `.dataset-previous/` | Tombstone transient de l'atomic swap (`dataset → .dataset-previous → delete`). Pre-2.11.3 → le dataset comptait **deux fois** pendant quelques ms. |
+| `.dataset.rollback.YYYYMMDDTHHMMSSZ/` | Tombstone opérateur ANR1 (3,38 Go observé). Non géré par OIRAN. Représente un choix opérationnel, pas de la consommation d'ingest. |
+
+Log structuré `CONTINUOUS_BUDGET_EXCLUSION` émis à chaque calcul `work_bytes` quand l'une au moins est non-nulle, pour qu'ANR2 puisse prouver le calcul en direct :
+
+```json
+{
+  "event": "CONTINUOUS_BUDGET_EXCLUSION",
+  "dataset_next_bytes": 0,
+  "dataset_previous_bytes": 0,
+  "rollback_bytes": 3380541933,
+  "rollback_paths": [".../continuous-lab-import/.dataset.rollback.20261110T204701Z"],
+  "published_bytes": 3380541904,
+  "committed_ring_bytes": 1806897788,
+  "total_bytes": 8573660280,
+  "reason": "2.11.3 excludes transient dataset staging + operator rollback tombstones from backpressure budget"
+}
+```
+
+### 3. Preuve chiffrée : `.dataset-next` vs `max_owned_bytes` pendant une publication normale
+
+**Observation prod 1,5 M events** (ANR2 trace fu3 et plus tard) :
+
+- `.dataset-next/oiran_events.jsonl` ≈ **3,3 Go** après merge (prior 2,7 Go + decoded spool 600 Mo).
+- `.dataset-next/callflows/` ≈ 60 Mo (1000 sessions × JSON + HTML).
+- `.dataset-next/dataset_manifest.json` ≈ 1 Mo.
+- **Total `.dataset-next/` pic ~3,3-3,4 Go** pendant publication.
+
+`max_owned_bytes = 1 GiB + 64 MiB = 1 140 850 688` (`live-probe/src/lib.rs:967-968`, `DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES` + `MAX_CONTINUOUS_DERIVED_BYTES`).
+
+**Verdict pre-2.11.3** : chaque publication normale 1,5 M events **dépassait structurellement** `max_owned_bytes` sur son staging seul (3,3 Go > 1,06 GiB). Le gate backpressure trippait au premier candidate pendant le publish. La prod ne fonctionnait avant 2.10.2 que parce que :
+- La publication était rare (sync, bloquait tout).
+- `storage_bytes` observait 8,5 Go sans que ce chiffre entre dans le gate (chiffre indicatif).
+
+**Verdict post-2.11.3** : `.dataset-next` exclu → staging reflète UNIQUEMENT le pcap-in-flight (`.importing` temp, quelques KB par candidate) + petits fichiers top-level. La publication normale tient trivialement sous max_owned_bytes.
+
+**Seuils NON modifiés** :
+- `DEFAULT_CONTINUOUS_MAX_SEGMENT_BYTES = 1 GiB` — inchangé.
+- `MAX_CONTINUOUS_DERIVED_BYTES = 64 MiB` — inchangé.
+- `max_owned_bytes = 1 140 850 688` — inchangé.
+- Règle projet 99 %/95 % (ajoutée en 2.11.2) — inchangée.
+
+Seul le CALCUL de `work_bytes` change — comme demandé par la coordination.
+
+### 4. Recommandation déploiement : tombstones rollback **hors** racine d'import
+
+Point 1 du brief demande : « Qu'OIRAN ne les crée plus jamais dans la racine d'import ; documente dans le CHANGELOG un chemin de rollback hors racine pour les procédures de déploiement. »
+
+**Grep confirme** qu'OIRAN ne crée pas `.dataset.rollback.*` (pas de référence dans `*.rs`). C'est la procédure de rollback ANR1 (hors repo) qui le crée.
+
+**Recommandation pour la procédure ANR1** :
+
+```sh
+# Pré-swap : sauvegarder l'ancien dataset HORS racine d'import.
+OIRAN_ROLLBACK_ARCHIVE=/var/lib/oiran/rollback-archive
+mkdir -p $OIRAN_ROLLBACK_ARCHIVE
+
+BASE=/var/lib/oiran/captures/continuous-lab-import
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+mv $BASE/dataset $OIRAN_ROLLBACK_ARCHIVE/dataset.$STAMP
+# ou, atomic : cp -a + mv final.
+
+# Appliquer le nouveau dataset.
+mv /tmp/new-dataset $BASE/dataset
+
+# En cas de rollback nécessaire :
+mv $BASE/dataset $BASE/.dataset.rollback.failed-$STAMP   # <-- sous rollback-archive à terme
+mv $OIRAN_ROLLBACK_ARCHIVE/dataset.$STAMP $BASE/dataset
+```
+
+Un répertoire tombstone **hors** `/var/lib/oiran/captures/<capture-id>/` ne sera jamais vu par `work_bytes` (qui ne regarde que la racine du capture). Même si ANR1 continue de placer les tombstones dans la racine d'import, 2.11.3 les exclut explicitement — c'est une double sécurité.
+
+### 5. Test reproduisant le cas exact ANR1
+
+`rollback_tombstone_excluded_from_work_bytes_proof_anr1_6781367658` :
+
+- Fabrique `.dataset.rollback.20261110T204701Z/oiran_events.jsonl` **sparse** de **3 380 541 933 octets** (chiffre exact ANR1).
+- Assert `directory_size(rollback) == 3 380 541 933`.
+- Fabrique `pcap/N2.pcap-....importing` de 193 772 octets (candidate N2 typique).
+- Seuils prod 2.10.2 : `max_owned_bytes = 1 140 850 688`, `derived_reserve = 64 MiB`, `candidate = 193 772`.
+- Assert `staging + candidate + derived_reserve ≤ max_owned_bytes`.
+- Assert `staging < 64 MiB` (reflète seulement `.importing`).
+
+Deux tests additionnels :
+- `dataset_next_excluded_from_work_bytes_matches_normal_publication` — `.dataset-next/oiran_events.jsonl` sparse 3,3 Go → `staging < max_owned_bytes`.
+- `dataset_previous_excluded_from_work_bytes` — `.dataset-previous/oiran_events.jsonl` sparse 2,7 Go → `staging < max_owned_bytes`.
+
+**4 tests `work_bytes_*` passent** (le test 2.9.8 historique `work_bytes_excludes_committed_pcap_ring_proof_anr2` continue de passer).
+
+### Versions
+
+| crate / package | 2.11.2 | 2.11.3 |
+|---|---|---|
+| `oiran-api` | 2.11.2 | **2.11.3** (patch) |
+| `live-probe` | 0.5.1 | **0.5.2** (patch) |
+| `@oiran/web` | 2.11.2 | **2.11.3** (sync) |
+| `oiran-decode` | 0.7.1 | 0.7.1 |
+| `event-schema` | 1.6.0 | 1.6.0 |
+
+### Tests
+
+- `cargo test -p live-probe --lib -- --test-threads=1` : **125 PASS, 0 fail, 5 ignored** (+3 nouveaux `work_bytes` exclusion).
+- `cargo test -p oiran-api --lib` : **63 PASS, 0 fail**.
+- `cargo test -p oiran-decode --lib` : **12 PASS, 0 fail**.
+
+### Impact opérateur
+
+Après déploiement 2.11.3 :
+
+- **Le BLOCKED actuel disparaît** : à la prochaine itération du scan loop, `work_bytes` retourne quelques MiB (pas 3,38 Go) → condition `staging + candidate + derived_reserve ≤ max_owned_bytes` satisfaite → `state` transitionne `Blocked → Capturing` automatiquement (grâce à 2.11.2 auto-resume).
+- **Les 25 pending_segments** du relevé ANR1 sont ingérés au premier scan post-déploiement (grâce à 2.11.2 stability-skip-on-successor).
+- **Le tombstone `.dataset.rollback.20261110T204701Z`** reste sur disque pour audit — il n'est pas touché par OIRAN. ANR1 peut le supprimer manuellement après vérification.
+
+**Observation post-déploiement** :
+
+```bash
+# État du job.
+curl -fsS http://127.0.0.1:49152/api/v1/metrics | jq '.data|{
+  capture_state, capture_stop_reason, capture_error,
+  pending_segments, open_segments, segments_ingested
+}'
+
+# Log d'exclusion active.
+journalctl -u oiran-api --since '-5min' --no-pager -o short-iso \
+  | rg CONTINUOUS_BUDGET_EXCLUSION | tail -3
+```
+
+Attendu : `capture_state=Capturing`, `pending_segments → 0` en quelques scans, `rollback_bytes=3380541933` dans le log d'exclusion (constant tant que le tombstone n'est pas effacé).
+
+---
+
 ## OIRAN API 2.11.2 — 2026-11-10 — BLOCKED non-silent + auto-resume + stability skip successor + ZERO_EVENTS enrichi (devmat, revue ANR1)
 
 Patch au-dessus de 2.11.1 (`482861a`). Ne dépend PAS de la cause publiée par ANR1 — attaque les trois axes indépendants pointés par la revue.

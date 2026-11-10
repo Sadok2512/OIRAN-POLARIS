@@ -8668,7 +8668,6 @@ fn collect_source_paths(
 /// part of the staging budget.
 ///
 /// Counted:
-///   * `.dataset-previous/`, `.dataset-next/` — publication staging.
 ///   * `.importing` temp files under `pcap/` — in-flight copy from
 ///     `copy_verified`.
 ///   * `import_state.json` + any other top-level file — small
@@ -8678,13 +8677,90 @@ fn collect_source_paths(
 ///   * `pcap/<interface>.pcap-<sha16>.ext` — committed ring entries.
 ///   * `dataset/` — the published dataset (already excluded in the
 ///     pre-2.9.8 definition; kept excluded).
+///   * `.dataset-next/` — mid-publish staging. **Pre-2.11.3 était
+///     compté**, mais sa taille est une FONCTION de l'historique
+///     du dataset (jusqu'à ~3,3 Go observé en prod sur 1,5 M
+///     events). Un `max_owned_bytes = 1,06 GiB` serait trivialement
+///     dépassé par une publication normale. 2.11.3 l'exclut : le
+///     budget ne gate plus l'écho du dataset existant, seulement
+///     le travail nouvellement ingéré (`pcap-in-flight`).
+///   * `.dataset-previous/` — transient atomic-swap tombstone.
+///     Pre-2.11.3 était compté → un cycle de swap `dataset →
+///     .dataset-previous → remove` comptait le dataset DEUX FOIS
+///     pendant quelques ms. 2.11.3 l'exclut.
+///   * `.dataset.rollback.YYYYMMDDTHHMMSSZ/` — tombstone opérateur
+///     créé par la procédure de rollback ANR1 (3,38 Go observés le
+///     2026-11-10T20:47Z). Ce n'est **pas** un artefact OIRAN. 2.11.3
+///     l'exclut car il représente un CHOIX opérationnel de garder
+///     l'ancien dataset pour audit, pas une consommation d'ingest.
+///     Documenté dans le CHANGELOG : les procédures de rollback
+///     devraient **créer ces tombstones HORS de la racine d'import**
+///     (ex. `/var/lib/oiran/rollback-archive/`).
+///
+/// Log : `CONTINUOUS_BUDGET_EXCLUSION` émis une fois par scan avec
+/// les tailles exclues pour qu'ANR2 puisse prouver le calcul.
 fn work_bytes(base: &Path) -> u64 {
     let total = directory_size(base);
     let published = directory_size(&base.join("dataset"));
     let committed_ring = committed_ring_bytes(&base.join("pcap"));
+    let next = directory_size(&base.join(".dataset-next"));
+    let previous = directory_size(&base.join(".dataset-previous"));
+    let (rollback_bytes, rollback_paths) = rollback_tombstones(base);
+    if next > 0 || previous > 0 || rollback_bytes > 0 {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "CONTINUOUS_BUDGET_EXCLUSION",
+                "dataset_next_bytes": next,
+                "dataset_previous_bytes": previous,
+                "rollback_bytes": rollback_bytes,
+                "rollback_paths": rollback_paths,
+                "published_bytes": published,
+                "committed_ring_bytes": committed_ring,
+                "total_bytes": total,
+                "reason": "2.11.3 excludes transient dataset staging + operator rollback tombstones from backpressure budget",
+            })
+        );
+    }
     total
         .saturating_sub(published)
         .saturating_sub(committed_ring)
+        .saturating_sub(next)
+        .saturating_sub(previous)
+        .saturating_sub(rollback_bytes)
+}
+
+/// 2.11.3 : énumère les tombstones de rollback opérateur sous
+/// `<base>/.dataset.rollback.YYYYMMDDTHHMMSSZ/` (créés par la
+/// procédure de rollback ANR1). Retourne la somme et la liste des
+/// chemins (pour journalisation).
+fn rollback_tombstones(base: &Path) -> (u64, Vec<String>) {
+    let mut total = 0u64;
+    let mut paths = Vec::new();
+    let read = match fs::read_dir(base) {
+        Ok(iter) => iter,
+        Err(_) => return (0, Vec::new()),
+    };
+    for entry in read.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        // Deux formes acceptées : `.dataset.rollback.<timestamp>`
+        // (format ANR1 courant, point-séparateur) et
+        // `.dataset-rollback.<timestamp>` (variante dash,
+        // acceptée par symétrie).
+        if !(name_str.starts_with(".dataset.rollback.")
+            || name_str.starts_with(".dataset-rollback."))
+        {
+            continue;
+        }
+        let path = entry.path();
+        let size = directory_size(&path);
+        total = total.saturating_add(size);
+        paths.push(path.display().to_string());
+    }
+    (total, paths)
 }
 
 /// 2.9.8 (#9, ANR2 comment 6725097122): size of the committed import
@@ -15706,6 +15782,119 @@ mod tests {
             trip <= max_owned,
             "a 16 MiB candidate must not trip backpressure on a 10 GiB committed ring; \
              staging={staging} trip={trip} max_owned={max_owned}"
+        );
+    }
+
+    /// 2.11.3 (devmat, revue ANR1 #9 comment 6781367658) : reproduit
+    /// EXACTEMENT le cas qui a causé le BLOCKED 2.10.2 à 20:47Z en
+    /// prod. Un répertoire `.dataset.rollback.YYYYMMDDTHHMMSSZ` de
+    /// **3,38 Go** à la racine d'import NE DOIT PAS déclencher le
+    /// backpressure. Pre-2.11.3 `work_bytes` comptait ce répertoire ;
+    /// la condition `staging + candidate + derived_reserve >
+    /// max_owned_bytes` trippait sur chaque segment de 193 KB →
+    /// `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT` → état `BLOCKED` sans
+    /// cause OIRAN réelle.
+    #[test]
+    fn rollback_tombstone_excluded_from_work_bytes_proof_anr1_6781367658() {
+        let base = temporary_root("work-bytes-rollback");
+        fs::create_dir_all(base.join("dataset")).unwrap();
+        fs::create_dir_all(base.join("pcap")).unwrap();
+
+        // Fabrique un `.dataset.rollback.YYYYMMDDTHHMMSSZ` sparse
+        // de 3 380 541 933 octets — chiffre exact observé par ANR1
+        // sur la prod 2.10.2 (`du -sb`). Le fichier sparse ne
+        // consomme pas 3 Go sur le disque local du bench, mais
+        // `metadata.len()` retourne la taille logique.
+        let rollback = base.join(".dataset.rollback.20261110T204701Z");
+        fs::create_dir_all(&rollback).unwrap();
+        let file = fs::File::create(rollback.join("oiran_events.jsonl")).unwrap();
+        file.set_len(3_380_541_933).unwrap();
+        drop(file);
+
+        // Sanity : `directory_size` voit bien les 3,38 Go sparse.
+        let rollback_size = directory_size(&rollback);
+        assert_eq!(
+            rollback_size, 3_380_541_933,
+            "sparse rollback dir must count as 3.38 GB via metadata.len()"
+        );
+
+        // Petit `.importing` 193 KB (1 segment N2 typique ANR1).
+        fs::write(base.join("pcap/N2.pcap-cafebabedeadbeef.importing"), vec![0u8; 193_772]).unwrap();
+
+        // Les seuils prod 2.10.2 observés par ANR1 :
+        //   max_owned_bytes = 1 140 850 688 (1 GiB + 64 MiB).
+        //   derived_reserve = 67 108 864    (64 MiB).
+        //   candidate       = 193 772       (segment N2).
+        let max_owned_bytes: u64 = 1_140_850_688;
+        let derived_reserve: u64 = MAX_CONTINUOUS_DERIVED_BYTES;
+        let candidate_bytes: u64 = 193_772;
+
+        // Pre-2.11.3 : staging = 3.38 Go + 193 KB ≈ 3,38 Go.
+        //   Gate : 3,38 Go + 193 KB + 64 MiB > 1,06 GiB → BLOCKED.
+        // Post-2.11.3 : rollback exclu, staging = 193 KB.
+        //   Gate : 193 KB + 193 KB + 64 MiB << 1,06 GiB → OK.
+        let staging = work_bytes(&base);
+        let trip = staging
+            .saturating_add(candidate_bytes)
+            .saturating_add(derived_reserve);
+        assert!(
+            trip <= max_owned_bytes,
+            "ANR1 case 6781367658 : rollback tombstone 3,38 Go + candidate 193 KB + \
+             derived reserve 64 MiB NE DOIT PAS dépasser max_owned_bytes {max_owned_bytes} ; \
+             staging={staging} trip={trip}"
+        );
+        // `staging` doit refléter uniquement le `.importing` (~193 KB) +
+        // d'éventuels fichiers top-level, pas le tombstone.
+        assert!(
+            staging < 64 * 1024 * 1024,
+            "staging doit rester < 64 MiB après exclusion du rollback ; obtenu {staging}"
+        );
+    }
+
+    /// 2.11.3 (devmat) : `.dataset-next` peut atteindre ~3,3 Go pendant
+    /// une publication normale (1,5 M events → oiran_events.jsonl +
+    /// callflows + manifest). La publication ne doit pas tripper
+    /// backpressure sur son propre staging. Pre-2.11.3 l'aurait fait.
+    #[test]
+    fn dataset_next_excluded_from_work_bytes_matches_normal_publication() {
+        let base = temporary_root("work-bytes-next");
+        fs::create_dir_all(base.join("dataset")).unwrap();
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        fs::create_dir_all(base.join(".dataset-next/callflows")).unwrap();
+
+        // Simule une publication normale 1,5 M events : .dataset-next
+        // contient un JSONL de 3,3 Go.
+        let file = fs::File::create(base.join(".dataset-next/oiran_events.jsonl")).unwrap();
+        file.set_len(3_300_000_000).unwrap();
+        drop(file);
+
+        let max_owned_bytes: u64 = 1_140_850_688;
+        let staging = work_bytes(&base);
+        assert!(
+            staging < max_owned_bytes,
+            "publication normale (.dataset-next 3,3 Go) NE DOIT PAS dépasser \
+             max_owned_bytes {max_owned_bytes} ; staging={staging}"
+        );
+    }
+
+    /// 2.11.3 (devmat) : `.dataset-previous` est un tombstone transient
+    /// de swap atomique. Il contient une copie de l'ancien dataset
+    /// pendant quelques ms. Pre-2.11.3 était compté, doublant
+    /// temporairement l'empreinte dataset dans le budget.
+    #[test]
+    fn dataset_previous_excluded_from_work_bytes() {
+        let base = temporary_root("work-bytes-previous");
+        fs::create_dir_all(base.join("dataset")).unwrap();
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        fs::create_dir_all(base.join(".dataset-previous")).unwrap();
+        let file = fs::File::create(base.join(".dataset-previous/oiran_events.jsonl")).unwrap();
+        file.set_len(2_700_000_000).unwrap();
+        drop(file);
+
+        let staging = work_bytes(&base);
+        assert!(
+            staging < 1_140_850_688,
+            "dataset-previous doit être exclu du budget ; staging={staging}"
         );
     }
 
