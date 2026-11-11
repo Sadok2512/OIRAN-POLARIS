@@ -296,6 +296,32 @@ fn within_lte_window(_event: &EventRecord, related: &[&EventRecord]) -> bool {
     !related.is_empty()
 }
 
+fn same_gtpv2c_transaction(left: &EventRecord, right: &EventRecord) -> bool {
+    if left.protocol != "GTPv2-C"
+        || right.protocol != "GTPv2-C"
+        || left.capture_id != right.capture_id
+        || left.first_identifier("gtpv2c_sequence")
+            != right.first_identifier("gtpv2c_sequence")
+    {
+        return false;
+    }
+    let left_procedure = left
+        .message_name
+        .trim_end_matches("Request")
+        .trim_end_matches("Response");
+    let right_procedure = right
+        .message_name
+        .trim_end_matches("Request")
+        .trim_end_matches("Response");
+    let same_endpoints = (left.source_address == right.source_address
+        && left.destination_address == right.destination_address)
+        || (left.source_address == right.destination_address
+            && left.destination_address == right.source_address);
+    left.first_identifier("gtpv2c_sequence").is_some()
+        && left_procedure == right_procedure
+        && same_endpoints
+}
+
 /// Builds a deterministic LTE preparation view from normalized S1AP/EPS NAS,
 /// S11 and S1-U events. It deliberately does not infer UE identity from timing
 /// and does not claim an S1AP/S11 bridge until an explicit bearer identifier is
@@ -516,6 +542,34 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
         }
     }
 
+    // A Create Session request and response do not necessarily repeat every
+    // U-plane F-TEID. Once one half is uniquely owned through S11, admit its
+    // companion only by the exact GTPv2-C transaction key: capture,
+    // sequence, procedure and unordered endpoint pair. This is structural;
+    // timestamps never participate.
+    for event in lte.iter().copied().filter(|event| event.interface == "S5-C") {
+        if lte_contexts
+            .iter()
+            .any(|context| context.s5c_events.iter().any(|owned| owned.event_id == event.event_id))
+        {
+            continue;
+        }
+        let owners = lte_contexts
+            .iter()
+            .enumerate()
+            .filter(|(_, context)| {
+                context
+                    .s5c_events
+                    .iter()
+                    .any(|owned| same_gtpv2c_transaction(event, owned))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let [owner] = owners.as_slice() {
+            lte_contexts[*owner].s5c_events.push(event);
+        }
+    }
+
     // S5-U is owned by the unique S5-C bearer F-TEID.
     for event in lte.iter().copied().filter(|event| event.interface == "S5-U") {
         let Some(teid) = event.first_identifier("teid").and_then(normalized_lte_teid) else {
@@ -565,13 +619,22 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
     }
 
     // S6a carries no bearer key. Its only admissible bridge is the exact,
-    // common-domain subscriber pseudonym; raw identity is never surfaced.
+    // common-domain subscriber pseudonym. The EPS identity can first appear
+    // on GTPv2-C/S11, so compare both the S1 context and its owned S11
+    // events. Raw identity is never surfaced.
     for event in lte.iter().copied().filter(|event| event.interface == "S6a") {
         let Some(pseudonym) = lte_subscriber_pseudonym(event) else { continue };
         let owners = lte_contexts
             .iter()
             .enumerate()
-            .filter(|(_, context)| context.pseudonym.as_deref() == Some(pseudonym))
+            .filter(|(_, context)| {
+                context.pseudonym.as_deref() == Some(pseudonym)
+                    || context
+                        .s11_events
+                        .iter()
+                        .filter_map(|control| lte_subscriber_pseudonym(control))
+                        .any(|control_pseudonym| control_pseudonym == pseudonym)
+            })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         if let [owner] = owners.as_slice() {

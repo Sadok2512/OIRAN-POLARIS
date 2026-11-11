@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.11.7 — 2026-11-11 — fermeture du lot A LTE
+
+- `session-engine` 0.5.8 rattache les deux moitiés d'une transaction Create Session S5-C par la clé structurelle exacte `(capture_id, gtpv2c_sequence, procédure, paire d'endpoints)`. Le F-TEID DL porté uniquement par la requête rejoint ainsi la même session que le F-TEID UL de la réponse, sans aucune jointure temporelle.
+- S6a est rattaché à l'unique session LTE lorsque son `subscriber_pseudonym` commun au domaine `SUBSCRIBER_PSEUDO_DOMAIN` correspond à celui d'un événement S11 déjà possédé. Aucune identité brute n'est lue ni publiée.
+- `correlation-engine` 0.6.7 produit l'arête S5-C↔S5-U DL sur le F-TEID de la requête et une arête S11↔S6a EXACT sur le pseudonyme commun. La limitation périmée « Synthetic preparation rule; real LTE evidence is not ANR1-certified » est retirée.
+- Tests synthétiques : requête/réponse GTPv2-C aux F-TEID distincts, S5-U dans les deux sens et pseudonymes S1/S11 volontairement différents afin de prouver le rattachement S6a par S11. Aucun pcap réel ni identité abonné n'est inclus.
+- Versions : `oiran-api` 2.11.7, web 2.11.7, `session-engine` 0.5.8, `correlation-engine` 0.6.7.
+- Gate manuel : `cargo build --release --locked`. La recette réelle des sept segments `_00067`, publication et compaction comprises, reste exécutée par ANR2 avant tout déploiement.
+
 ## OIRAN API 2.11.6 — 2026-11-11 — exhaustivité LTE bidirectionnelle et Diameter TCP cadré
 
 - `correlation-engine` 0.6.6 émet une arête pour chaque F-TEID U-plane décodé sur S11↔S1-U, S5-C↔S5-U et Sxab↔S5-U. Il préfère l'agrégat à son ancien singleton de frontière de lot, échoue fermé pour un TEID réellement ambigu et initialise toujours `matched_rules` avec `rule_id`. La limitation E-RAB périmée est retirée puisque l'extraction imbriquée est présente.

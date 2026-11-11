@@ -378,7 +378,7 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
 
 /// Prepares explicit LTE bearer edges from the uniquely partitioned LTE
 /// sessions. Per-file capture IDs remain provenance and are never an identity
-/// key. Real-world certification remains gated on an ANR1 fixture.
+/// key. Production evidence is validated by the external ANR2 recipe gate.
 pub fn correlate_lte_evidence(events: &[EventRecord]) -> Vec<CorrelationEdge> {
     let mut edges = Vec::new();
     let by_id = events
@@ -449,9 +449,8 @@ pub fn correlate_lte_evidence(events: &[EventRecord]) -> Vec<CorrelationEdge> {
                 found.evidence_type = "EXACT_TUNNEL_MATCH".into();
                 found.scope = "lte-bearer-tunnel-only".into();
                 found.limitations = vec![
-                "Synthetic preparation rule; real LTE evidence is not ANR1-certified".into(),
                     "The tunnel edge depends on the explicit S1 context, opaque pseudonym and bearer chain".into(),
-            ];
+                ];
                 edges.push(found);
             }
         }
@@ -492,6 +491,15 @@ pub fn correlate_lte_evidence(events: &[EventRecord]) -> Vec<CorrelationEdge> {
         append_lte_bridge(&mut edges, &controls, &users, "S11", "S1-U", &["f_teid", "bearer_f_teid", "teid"], "s11-s1u-teid");
         append_lte_bridge(&mut edges, &s5c, &s5u, "S5-C", "S5-U", &["f_teid", "bearer_f_teid", "teid"], "s5c-s5u-teid");
         append_lte_bridge(&mut edges, &sxab, &s5u, "Sxab", "S5-U", &["f_teid", "bearer_f_teid", "teid"], "sxab-s5u-teid");
+        append_lte_bridge(
+            &mut edges,
+            &controls,
+            &s6a,
+            "S11",
+            "S6a",
+            &["subscriber_pseudonym"],
+            "s11-s6a-subscriber-pseudonym",
+        );
         append_lte_bridge(&mut edges, &radios, &s6a, "S1-MME", "S6a", &["subscriber_pseudonym"], "s1mme-s6a-pseudonym");
     }
     edges.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
@@ -1653,8 +1661,9 @@ mod tests {
     }
 
     #[test]
-    fn lte_bridges_cover_every_uplane_fteid_in_both_directions_2_11_6() {
-        let pseudo = "psn-synthetic-lte";
+    fn lte_bridges_cover_split_s5c_transaction_and_s11_s6a_pseudonym_2_11_7() {
+        let radio_pseudo = "psn-radio-context";
+        let eps_pseudo = "psn-eps-common";
         let radio = e(
             "radio",
             "S1-MME",
@@ -1664,7 +1673,7 @@ mod tests {
             &[
                 ("enb_ue_s1ap_id", "41"),
                 ("mme_ue_s1ap_id", "7"),
-                ("subscriber_pseudonym", pseudo),
+                ("subscriber_pseudonym", radio_pseudo),
                 ("erab_teid", "0x7804"),
                 ("erab_teid", "0x1"),
             ],
@@ -1677,7 +1686,7 @@ mod tests {
             "CreateSessionResponse",
             2,
             &[
-                ("subscriber_pseudonym", pseudo),
+                ("subscriber_pseudonym", eps_pseudo),
                 ("f_teid", "0x7804"),
                 ("f_teid", "0x1"),
                 ("bearer_f_teid", "0x7f6f"),
@@ -1686,20 +1695,55 @@ mod tests {
         );
         let s1u_ul = e("s1u-ul", "S1-U", "GTP-U", "G-PDU", 3, &[("teid", "0x7804")], json!([]));
         let s1u_dl = e("s1u-dl", "S1-U", "GTP-U", "G-PDU", 4, &[("teid", "0x1")], json!([]));
-        let s5c = e(
-            "s5c",
+        let s5c_request = e(
+            "s5c-request",
             "S5-C",
             "GTPv2-C",
             "CreateSessionRequest",
             5,
-            &[("f_teid", "0x7f6f"), ("f_teid", "0xbe90")],
+            &[("gtpv2c_sequence", "23"), ("f_teid", "0xbe90")],
             json!([]),
         );
-        let s5u_ul = e("s5u-ul", "S5-U", "GTP-U", "G-PDU", 6, &[("teid", "0x7f6f")], json!([]));
-        let s5u_dl = e("s5u-dl", "S5-U", "GTP-U", "G-PDU", 7, &[("teid", "0xbe90")], json!([]));
-        let sxab_ul = e("sxab-ul", "Sxab", "PFCP", "SessionEstablishment", 8, &[("f_teid", "0x7f6f")], json!([]));
-        let sxab_dl = e("sxab-dl", "Sxab", "PFCP", "SessionEstablishment", 9, &[("f_teid", "0xbe90")], json!([]));
-        let events = vec![radio, s11, s1u_ul, s1u_dl, s5c, s5u_ul, s5u_dl, sxab_ul, sxab_dl];
+        let s5c_response = e(
+            "s5c-response",
+            "S5-C",
+            "GTPv2-C",
+            "CreateSessionResponse",
+            6,
+            &[("gtpv2c_sequence", "23"), ("f_teid", "0x7f6f")],
+            json!([]),
+        );
+        let s5u_ul = e("s5u-ul", "S5-U", "GTP-U", "G-PDU", 7, &[("teid", "0x7f6f")], json!([]));
+        let s5u_dl = e("s5u-dl", "S5-U", "GTP-U", "G-PDU", 8, &[("teid", "0xbe90")], json!([]));
+        let sxab_ul = e("sxab-ul", "Sxab", "PFCP", "SessionEstablishment", 9, &[("f_teid", "0x7f6f")], json!([]));
+        let sxab_dl = e("sxab-dl", "Sxab", "PFCP", "SessionEstablishment", 10, &[("f_teid", "0xbe90")], json!([]));
+        let s6a = e(
+            "s6a",
+            "S6a",
+            "Diameter",
+            "Update-Location-Request",
+            11,
+            &[("subscriber_pseudonym", eps_pseudo)],
+            json!([]),
+        );
+        let events = vec![
+            radio,
+            s11,
+            s1u_ul,
+            s1u_dl,
+            s5c_request,
+            s5c_response,
+            s5u_ul,
+            s5u_dl,
+            sxab_ul,
+            sxab_dl,
+            s6a,
+        ];
+        let sessions = session_engine::discover_lte_sessions(&events);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].interfaces.len(), 7);
+        assert!(sessions[0].event_ids.contains(&"s5c-request".to_string()));
+        assert!(sessions[0].event_ids.contains(&"s6a".to_string()));
         let edges = correlate_lte_evidence(&events);
         for (left, right, expected) in [
             ("S11", "S1-U", ["teid=0x1", "teid=0x7804"]),
@@ -1721,6 +1765,17 @@ mod tests {
                 );
             }
         }
+        let s6a_edge = edges
+            .iter()
+            .find(|edge| edge.rule_id == "s11-s6a-subscriber-pseudonym")
+            .expect("S11 and S6a must share the common-domain EPS pseudonym");
+        assert_eq!(s6a_edge.confidence, "EXACT");
+        assert!(edges.iter().all(|edge| {
+            edge.limitations.iter().all(|limitation| {
+                limitation
+                    != "Synthetic preparation rule; real LTE evidence is not ANR1-certified"
+            })
+        }));
     }
 
     #[test]
