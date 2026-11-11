@@ -1,7 +1,10 @@
 //! Native, bounded 5G and EPS NAS envelope and observed-message decoder.
 //! Specification baseline: 3GPP TS 24.501 Release 17 (5G); TS 24.301 (EPS).
 
-use event_schema::{pseudonym, sha256_hex, DecodeStatus, InformationElement, NamedValue, PseudonymKey};
+use event_schema::{
+    pseudonym, pseudonym_subscriber_tbcd, sha256_hex, DecodeStatus, InformationElement,
+    NamedValue, PseudonymKey,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SPECIFICATION: &str = "3GPP TS 24.501 Release 17 + 3GPP TS 24.301";
@@ -1124,7 +1127,11 @@ fn attach_eps_mobile_identity(
     // 24.301 §9.9.3.12 type code numerically and let the Analyzer resolve
     // the meaning out-of-band.
     let identity_type_code = value.first().map(|b| b & 0x07).unwrap_or(0);
-    let pseudo = pseudonym(pseudonym_key, "nas-eps-mobile-identity", value);
+    let pseudo = if identity_type_code == 1 {
+        pseudonym_subscriber_tbcd(pseudonym_key, value, true)
+    } else {
+        pseudonym(pseudonym_key, "nas-eps-mobile-identity", value)
+    };
     msg.information_elements.push(InformationElement {
         id: None,
         name: "identity_pseudonym".into(),

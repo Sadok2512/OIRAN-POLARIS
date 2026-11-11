@@ -8,8 +8,9 @@
 //! from the raw bytes; the raw digits are never surfaced.
 
 use event_schema::{
-    pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState,
-    InformationElement, NamedValue, NormalizedEvent, Protocol, PseudonymKey,
+    pseudonym, pseudonym_subscriber_tbcd, sha256_hex, DecodeStatus, Direction,
+    EvidenceReference, EvidenceState, InformationElement, NamedValue, NormalizedEvent, Protocol,
+    PseudonymKey,
 };
 use plugin_runtime::{
     DecoderCapabilities, DecoderInput, DecoderManifest, DecoderOutput, ProtocolDecoder,
@@ -117,7 +118,7 @@ fn decode_ie(
     let name = ie_name(ie.ie_type);
     match ie.ie_type {
         1 => (
-            Some(pseudonym(pseudonym_key, "subscriber", &ie.value)),
+            Some(pseudonym_subscriber_tbcd(pseudonym_key, &ie.value, false)),
             DecodeStatus::Decoded,
             true,
             name,

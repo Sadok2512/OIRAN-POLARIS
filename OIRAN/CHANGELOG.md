@@ -1,5 +1,16 @@
 # Changelog
 
+## OIRAN API 2.11.4 — 2026-11-11 — découverte LTE continue et lockfile gate
+
+- Cause exacte : `session-engine/src/lib.rs`, `compact_publication_event`, supprimait les ancres S1AP/LTE avant que `live-probe` appelle `offline_lte_callflows` à la phase `07-after-lte-flows-built`. La phase était bien publiée, mais recevait des événements sans `enb_ue_s1ap_id`, `mme_ue_s1ap_id`, `erab_teid` ni `bearer_f_teid`.
+- Le compactage conserve désormais les ancres LTE. La découverte rattache S1-MME, S11, S1-U, S5-C, S5-U, Sxab et S6a uniquement par clés structurelles normalisées ou pseudonyme abonné commun ; aucune jointure temporelle.
+- Les arêtes LTE sont `EXACT` quand une clé décodée est égale, sinon `OPEN`; aucune confiance probable n'est produite.
+- Le pseudonyme abonné inter-protocoles utilise `SUBSCRIBER_PSEUDO_DOMAIN`; aucune identité brute n'est sérialisée.
+- Le routage S6a avec PPID 0 introduit en 2.10.4 reste couvert par `routes_s6a_regardless_of_ppid_2_10_4`.
+- Route documentée pour les arêtes d'une session : `GET /api/v1/sessions/{session_id}/correlations`.
+- Versions : `oiran-api` 2.11.4, `live-probe` 0.5.3, `session-engine` 0.5.6, `correlation-engine` 0.6.5, `callflow-schema` 1.3.2, `event-schema` 1.6.1, `decoder-nas` 0.3.2, `decoder-gtpv2c` 0.1.1, `decoder-diameter` 0.2.5, web 2.11.4.
+- Gate obligatoire : régénérer `Cargo.lock`, puis exécuter `cargo build --release --locked` avant chaque poussée de version.
+
 ## OIRAN API 2.11.3 — 2026-11-10 — exclusion rollback/next/previous du budget (devmat, cause BLOCKED ANR1 #9 comment 6781367658)
 
 **Patch qui corrige la cause BLOCKED prouvée par ANR1** sur la production 2.10.2. C'est **la version qui sera déployée** (2.11.1 et 2.11.2 ne le sont pas seules).

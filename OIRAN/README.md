@@ -48,3 +48,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the data path and scaling boundaries 
 
 OIRAN now includes an execution-gated live capture pipeline for the discovered POLARIS N2/N3/N4 bridges. Acquisition is implemented by the separate native Rust `capture-helper` over authenticated Unix IPC; the Web API no longer launches tcpdump. It is disabled by default and requires an authenticated Operator, explicit server-side enablement, and the separately deployed helper socket. See `docs/OIRAN_CAPTURE_HELPER_DEPLOYMENT_PLAN.md` and `OIRAN_LIVE_CAPTURE_TEST_PLAN.md` before any live test.
 
+# Session correlation API
+
+For the correlation edges of one reconstructed session, use
+`GET /api/v1/sessions/{session_id}/correlations`. The global
+`GET /api/v1/correlation/edges` catalog is not a substitute for this
+session-scoped route.

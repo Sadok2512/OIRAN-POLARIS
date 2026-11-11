@@ -461,11 +461,11 @@ pub fn correlate_lte_evidence(events: &[EventRecord]) -> Vec<CorrelationEdge> {
                     control,
                     vec![format!("erab_teid={teid}"), format!("session_id={}", session.session_id)],
                 "s1ap-gtpv2c-context-pseudonym-bearer",
-                "STRONG",
+                    "EXACT",
                     "A unique S1 context and opaque pseudonym bridge the matching E-RAB/F-TEID across capture files",
             );
                 found.rule_version = LTE_RULE_VERSION.into();
-                found.evidence_type = "STRONG_BEARER_ASSOCIATION".into();
+                found.evidence_type = "EXACT_BEARER_ASSOCIATION".into();
                 found.scope = "lte-bearer-control-plane".into();
                 found.limitations = vec![
                     "Requires certified nested E-RAB TEID extraction before production use".into(),
@@ -473,9 +473,106 @@ pub fn correlate_lte_evidence(events: &[EventRecord]) -> Vec<CorrelationEdge> {
                 edges.push(found);
             }
         }
+
+        append_lte_bridge(&mut edges, &radios, &controls, "S1-MME", "S11", &["subscriber_pseudonym"], "s1mme-s11-exact-or-open");
+        let s5c = session_events.iter().copied().filter(|e| e.interface == "S5-C").collect::<Vec<_>>();
+        let s5u = session_events.iter().copied().filter(|e| e.interface == "S5-U").collect::<Vec<_>>();
+        let sxab = session_events.iter().copied().filter(|e| e.interface == "Sxab").collect::<Vec<_>>();
+        let s6a = session_events.iter().copied().filter(|e| e.interface == "S6a").collect::<Vec<_>>();
+        append_lte_bridge(&mut edges, &controls, &users, "S11", "S1-U", &["f_teid", "bearer_f_teid", "teid"], "s11-s1u-teid");
+        append_lte_bridge(&mut edges, &s5c, &s5u, "S5-C", "S5-U", &["f_teid", "bearer_f_teid", "teid"], "s5c-s5u-teid");
+        append_lte_bridge(&mut edges, &sxab, &s5u, "Sxab", "S5-U", &["f_teid", "teid"], "sxab-s5u-teid");
+        append_lte_bridge(&mut edges, &radios, &s6a, "S1-MME", "S6a", &["subscriber_pseudonym"], "s1mme-s6a-pseudonym");
     }
     edges.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
     edges
+}
+
+fn append_lte_bridge(
+    edges: &mut Vec<CorrelationEdge>,
+    left: &[&EventRecord],
+    right: &[&EventRecord],
+    left_interface: &str,
+    right_interface: &str,
+    identifiers: &[&str],
+    rule_id: &str,
+) {
+    if left.is_empty() || right.is_empty() {
+        return;
+    }
+    if edges.iter().any(|edge| {
+        (edge.source_interface == left_interface && edge.target_interface == right_interface)
+            || (edge.source_interface == right_interface
+                && edge.target_interface == left_interface)
+    }) {
+        return;
+    }
+    let teid_names = identifiers
+        .iter()
+        .copied()
+        .filter(|name| name.contains("teid"))
+        .collect::<Vec<_>>();
+    let exact_teid = left.iter().find_map(|source| {
+        right.iter().find_map(|target| {
+            teid_names.iter().find_map(|left_name| {
+                source.identifier_values(left_name).iter().find_map(|left_value| {
+                    teid_names.iter().find_map(|right_name| {
+                        target.identifier_values(right_name).iter().find_map(|right_value| {
+                            let normalized = normalize_teid(left_value);
+                            (normalized.is_some() && normalized == normalize_teid(right_value))
+                                .then_some((*source, *target, format!("teid={}", normalized.unwrap())))
+                        })
+                    })
+                })
+            })
+        })
+    });
+    let exact = exact_teid.or_else(|| {
+        left.iter().find_map(|source| {
+            right.iter().find_map(|target| {
+                identifiers.iter().filter(|name| !name.contains("teid")).find_map(|name| {
+                    let left_values = source.identifier_values(name);
+                    let right_values = target.identifier_values(name);
+                    left_values.iter().find_map(|left_value| {
+                        right_values.iter().find_map(|right_value| {
+                            (left_value == right_value)
+                                .then_some((*source, *target, format!("{name}={left_value}")))
+                        })
+                    })
+                })
+            })
+        })
+    });
+    let (source, target, matching, confidence, description) = match exact {
+        Some((source, target, evidence)) => (
+            source,
+            target,
+            vec![evidence],
+            "EXACT",
+            "Byte-equal normalized LTE structural key observed on both interfaces",
+        ),
+        None => (
+            left[0],
+            right[0],
+            Vec::new(),
+            "OPEN",
+            "Both LTE interfaces are session-owned but no shared structural key was decoded",
+        ),
+    };
+    let mut found = edge(source, target, matching, rule_id, confidence, description);
+    found.rule_version = LTE_RULE_VERSION.into();
+    found.evidence_type = if confidence == "EXACT" {
+        "EXACT_STRUCTURAL_MATCH".into()
+    } else {
+        "OPEN_MISSING_DECODED_KEY".into()
+    };
+    found.scope = format!("{left_interface}-{right_interface}");
+    found.limitations = if confidence == "OPEN" {
+        vec!["No probabilistic or timestamp-based association is asserted".into()]
+    } else {
+        Vec::new()
+    };
+    edges.push(found);
 }
 
 /// 2.9.9 (#9 comment 6725858177) : délégation vers la normalisation
@@ -1446,6 +1543,44 @@ mod tests {
         assert_eq!(tunnel.confidence, "EXACT");
         assert_eq!(tunnel.rule_version, LTE_RULE_VERSION);
         assert_eq!(tunnel.source_interface, "S11");
+    }
+
+    #[test]
+    fn continuous_lte_chain_has_only_exact_or_open_edges_2_11_4() {
+        let pseudo = "psn-00000000000000000000000000000000";
+        let mut radio = e("radio", "S1-MME", "S1AP", "InitialContextSetupResponse", 1,
+            &[("enb_ue_s1ap_id", "41"), ("mme_ue_s1ap_id", "7"), ("subscriber_pseudonym", pseudo)], json!([]));
+        radio.capture_id = "cap-s1".into();
+        let mut s11 = e("s11", "S11", "GTPv2-C", "CreateSessionResponse", 2,
+            &[("subscriber_pseudonym", pseudo), ("bearer_f_teid", "0x7804"), ("bearer_f_teid", "0x7f6f")], json!([]));
+        s11.capture_id = "cap-s11".into();
+        let mut s1u = e("s1u", "S1-U", "GTP-U", "G-PDU", 3, &[("teid", "0x7804")], json!([]));
+        s1u.capture_id = "cap-s1u".into();
+        let mut s5c = e("s5c", "S5-C", "GTPv2-C", "CreateSessionResponse", 4,
+            &[("f_teid", "0x7f6f"), ("f_teid", "0xbe90")], json!([]));
+        s5c.capture_id = "cap-s5c".into();
+        let mut s5u = e("s5u", "S5-U", "GTP-U", "G-PDU", 5, &[("teid", "0xbe90")], json!([]));
+        s5u.capture_id = "cap-s5u".into();
+        let mut sxab = e("sxab", "Sxab", "PFCP", "PFCP Session Establishment Response", 6,
+            &[("f_teid", "0xbe90")], json!([]));
+        sxab.capture_id = "cap-sxab".into();
+        let mut s6a = e("s6a", "S6a", "Diameter", "Update-Location-Request", 7,
+            &[("subscriber_pseudonym", pseudo)], json!([]));
+        s6a.capture_id = "cap-s6a".into();
+
+        let events = vec![radio, s11, s1u, s5c, s5u, sxab, s6a];
+        let sessions = discover_lte_sessions(&events);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].interfaces.len(), 7);
+        let edges = correlate_lte_evidence(&events);
+        for (left, right) in [("S1-MME", "S11"), ("S11", "S1-U"), ("S5-C", "S5-U"), ("Sxab", "S5-U"), ("S1-MME", "S6a")] {
+            let edge = edges.iter().find(|edge| {
+                (edge.source_interface == left && edge.target_interface == right)
+                    || (edge.source_interface == right && edge.target_interface == left)
+            }).unwrap_or_else(|| panic!("missing {left}<->{right}"));
+            assert!(matches!(edge.confidence.as_str(), "EXACT" | "OPEN"));
+        }
+        assert!(edges.iter().all(|edge| edge.confidence != "POSSIBLE"));
     }
 
     #[test]

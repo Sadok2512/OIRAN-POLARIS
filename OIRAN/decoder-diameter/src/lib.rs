@@ -8,8 +8,9 @@
 //! are decoded.
 
 use event_schema::{
-    pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState, PseudonymKey,
-    InformationElement, NamedValue, NormalizedEvent, Protocol,
+    pseudonym, pseudonym_subscriber_text, sha256_hex, DecodeStatus, Direction,
+    EvidenceReference, EvidenceState, InformationElement, NamedValue, NormalizedEvent, Protocol,
+    PseudonymKey,
 };
 use plugin_runtime::{
     DecoderCapabilities, DecoderInput, DecoderManifest, DecoderOutput, ProtocolDecoder,
@@ -157,7 +158,7 @@ fn decode_avp(
         (1, None) => (
             Some(format!(
                 "subscriber_pseudonym={}",
-                pseudonym(pseudonym_key, "diameter-user-name", &avp.value)
+                pseudonym_subscriber_text(pseudonym_key, &avp.value)
             )),
             DecodeStatus::Decoded,
             true,

@@ -268,6 +268,10 @@ struct LteContext<'a> {
     erab_teids: BTreeSet<String>,
     s11_events: Vec<&'a EventRecord>,
     s1u_events: Vec<&'a EventRecord>,
+    s5c_events: Vec<&'a EventRecord>,
+    s5u_events: Vec<&'a EventRecord>,
+    sxab_events: Vec<&'a EventRecord>,
+    s6a_events: Vec<&'a EventRecord>,
 }
 
 fn normalized_lte_teid(value: &str) -> Option<String> {
@@ -300,10 +304,19 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
     let mut lte = events
         .iter()
         .filter(|event| {
-            matches!(event.interface.as_str(), "S1-MME" | "S11" | "S1-U")
+            matches!(
+                event.interface.as_str(),
+                "S1-MME" | "S11" | "S1-U" | "S5-C" | "S5-U" | "Sxab" | "S6a"
+            )
                 && matches!(
                     event.protocol.as_str(),
-                    "S1AP" | "NAS-EPS-MM" | "NAS-EPS-SM" | "GTPv2-C" | "GTP-U"
+                    "S1AP"
+                        | "NAS-EPS-MM"
+                        | "NAS-EPS-SM"
+                        | "GTPv2-C"
+                        | "GTP-U"
+                        | "PFCP"
+                        | "Diameter"
                 )
         })
         .collect::<Vec<_>>();
@@ -403,6 +416,10 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
                 erab_teids,
                 s11_events: Vec::new(),
                 s1u_events: Vec::new(),
+                s5c_events: Vec::new(),
+                s5u_events: Vec::new(),
+                sxab_events: Vec::new(),
+                s6a_events: Vec::new(),
             }
         })
         .collect::<Vec<_>>();
@@ -428,14 +445,13 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
             .iter()
             .enumerate()
             .filter(|(_, context)| {
-                let pseudonyms_agree = match (context.pseudonym.as_deref(), event_pseudonym) {
-                    (Some(context_pseudonym), Some(event_pseudonym)) => {
-                        context_pseudonym == event_pseudonym
-                    }
-                    _ => true,
-                };
-                pseudonyms_agree
-                    && !context.erab_teids.is_disjoint(&event_teids)
+                let exact_pseudonym = matches!(
+                    (context.pseudonym.as_deref(), event_pseudonym),
+                    (Some(context_pseudonym), Some(event_pseudonym))
+                        if context_pseudonym == event_pseudonym
+                );
+                let exact_bearer = !context.erab_teids.is_disjoint(&event_teids);
+                (exact_pseudonym || exact_bearer)
                     && within_lte_window(event, &context.s1_events)
             })
             .map(|(index, _)| index)
@@ -474,6 +490,95 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
         }
     }
 
+    // S5-C is owned by the unique S11 context sharing a normalized F-TEID.
+    for event in lte.iter().copied().filter(|event| event.interface == "S5-C") {
+        let event_teids = ["f_teid", "bearer_f_teid"]
+            .into_iter()
+            .flat_map(|name| event.identifier_values(name))
+            .filter_map(normalized_lte_teid)
+            .collect::<BTreeSet<_>>();
+        let owners = lte_contexts
+            .iter()
+            .enumerate()
+            .filter(|(_, context)| {
+                context.s11_events.iter().any(|control| {
+                    ["f_teid", "bearer_f_teid"]
+                        .into_iter()
+                        .flat_map(|name| control.identifier_values(name))
+                        .filter_map(normalized_lte_teid)
+                        .any(|teid| event_teids.contains(&teid))
+                })
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let [owner] = owners.as_slice() {
+            lte_contexts[*owner].s5c_events.push(event);
+        }
+    }
+
+    // S5-U is owned by the unique S5-C bearer F-TEID.
+    for event in lte.iter().copied().filter(|event| event.interface == "S5-U") {
+        let Some(teid) = event.first_identifier("teid").and_then(normalized_lte_teid) else {
+            continue;
+        };
+        let owners = lte_contexts
+            .iter()
+            .enumerate()
+            .filter(|(_, context)| {
+                context.s5c_events.iter().any(|control| {
+                    ["f_teid", "bearer_f_teid"]
+                        .into_iter()
+                        .flat_map(|name| control.identifier_values(name))
+                        .filter_map(normalized_lte_teid)
+                        .any(|candidate| candidate == teid)
+                })
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let [owner] = owners.as_slice() {
+            lte_contexts[*owner].s5u_events.push(event);
+        }
+    }
+
+    // Sxab PFCP is admitted only when one LTE context owns a matching S5-U TEID.
+    for event in lte.iter().copied().filter(|event| event.interface == "Sxab") {
+        let event_teids = ["teid", "f_teid"]
+            .into_iter()
+            .flat_map(|name| event.identifier_values(name))
+            .filter_map(normalized_lte_teid)
+            .collect::<BTreeSet<_>>();
+        let owners = lte_contexts
+            .iter()
+            .enumerate()
+            .filter(|(_, context)| {
+                context.s5u_events.iter().any(|user| {
+                    user.first_identifier("teid")
+                        .and_then(normalized_lte_teid)
+                        .is_some_and(|teid| event_teids.contains(&teid))
+                })
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let [owner] = owners.as_slice() {
+            lte_contexts[*owner].sxab_events.push(event);
+        }
+    }
+
+    // S6a carries no bearer key. Its only admissible bridge is the exact,
+    // common-domain subscriber pseudonym; raw identity is never surfaced.
+    for event in lte.iter().copied().filter(|event| event.interface == "S6a") {
+        let Some(pseudonym) = lte_subscriber_pseudonym(event) else { continue };
+        let owners = lte_contexts
+            .iter()
+            .enumerate()
+            .filter(|(_, context)| context.pseudonym.as_deref() == Some(pseudonym))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let [owner] = owners.as_slice() {
+            lte_contexts[*owner].s6a_events.push(event);
+        }
+    }
+
     let mut sessions = Vec::new();
     for context in lte_contexts {
         let LteContext {
@@ -484,6 +589,10 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
             pseudonym,
             s11_events: s11,
             s1u_events: s1u,
+            s5c_events: s5c,
+            s5u_events: s5u,
+            sxab_events: sxab,
+            s6a_events: s6a,
             ..
         } = context;
         let mut associated = s1_events;
@@ -508,6 +617,10 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
             collect_ids(&associated, &["eps_bearer_identity", "ebi", "bearer_ebi"]);
         let s11_f_teids = collect_ids(&s11, &["f_teid", "bearer_f_teid"]);
         associated.extend(s1u.iter().copied());
+        associated.extend(s5c.iter().copied());
+        associated.extend(s5u.iter().copied());
+        associated.extend(sxab.iter().copied());
+        associated.extend(s6a.iter().copied());
         // 2.7.13: canonical (capture_id, seq, event_id) — associated bundle
         // mixes events from S1-MME, S11 and S1-U captures.
         associated.sort_by(|a, b| canonical_sort_key(a).cmp(&canonical_sort_key(b)));
@@ -714,6 +827,14 @@ pub fn load_path_streaming_representatives(
 
 fn compact_publication_event(event: &mut EventRecord) {
     const STABLE_IDENTIFIERS: &[&str] = &[
+        "enb_ue_s1ap_id",
+        "mme_ue_s1ap_id",
+        "erab_teid",
+        "bearer_f_teid",
+        "ebi",
+        "bearer_ebi",
+        "gtpv2c_sequence",
+        "pfcp_sequence",
         "ran_ue_ngap_id",
         "amf_ue_ngap_id",
         "pdu_session_id",
@@ -2116,7 +2237,11 @@ mod tests {
                 "session_identifiers": [
                     {"name":"ran_ue_ngap_id","value":"41","pseudonymized":false},
                     {"name":"amf_ue_ngap_id","value":"73","pseudonymized":false},
-                    {"name":"pdu_session_id","value":"1","pseudonymized":false}
+                    {"name":"pdu_session_id","value":"1","pseudonymized":false},
+                    {"name":"enb_ue_s1ap_id","value":"9","pseudonymized":false},
+                    {"name":"mme_ue_s1ap_id","value":"10","pseudonymized":false},
+                    {"name":"erab_teid","value":"0x7804","pseudonymized":false},
+                    {"name":"bearer_f_teid","value":"0x7f6f","pseudonymized":false}
                 ],
                 "information_elements": [
                     {"name":"TEID","value":"0x01020304"},
@@ -2154,6 +2279,9 @@ mod tests {
             .unwrap()
             .iter()
             .all(|value| value["name"] != "large-render-only-payload"));
+        for name in ["enb_ue_s1ap_id", "mme_ue_s1ap_id", "erab_teid", "bearer_f_teid"] {
+            assert!(representative.first_identifier(name).is_some(), "{name} compacted away");
+        }
     }
 
     fn event(

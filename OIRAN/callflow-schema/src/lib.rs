@@ -462,6 +462,18 @@ pub fn build_lte_callflow(
         "S11_S1_U".into(),
         confidence_for(&edges, "S11", "S1-U"),
     );
+    correlation_status.insert(
+        "S5_C_S5_U".into(),
+        confidence_for(&edges, "S5-C", "S5-U"),
+    );
+    correlation_status.insert(
+        "SXAB_S5_U".into(),
+        confidence_for(&edges, "Sxab", "S5-U"),
+    );
+    correlation_status.insert(
+        "S1_MME_S6A".into(),
+        confidence_for(&edges, "S1-MME", "S6a"),
+    );
     let e2e = if matches!(
         correlation_status.get("S1_MME_S11").map(String::as_str),
         Some("EXACT" | "STRONG")
@@ -524,7 +536,11 @@ pub fn build_lte_callflow(
 
 fn lte_procedure_group(protocol: &str, name: &str) -> String {
     if protocol == "GTP-U" {
-        "S1-U User Plane".into()
+        "LTE User Plane".into()
+    } else if protocol == "PFCP" {
+        "Sxab Bearer Control".into()
+    } else if protocol == "Diameter" {
+        "S6a Subscriber Control".into()
     } else if protocol == "GTPv2-C" {
         "S11 Bearer Control".into()
     } else if name.contains("Attach") {
@@ -558,6 +574,7 @@ fn confidence_for(edges: &[CorrelationEdge], a: &str, b: &str) -> String {
                 (_, "EXACT") => "EXACT",
                 ("UNKNOWN", "STRONG") => "STRONG",
                 ("UNKNOWN", "POSSIBLE") => "POSSIBLE",
+                ("UNKNOWN", "OPEN") => "OPEN",
                 (x, _) => x,
             };
         }

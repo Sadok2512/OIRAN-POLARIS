@@ -891,6 +891,43 @@ pub fn pseudonym(key: &PseudonymKey, label: &str, bytes: &[u8]) -> String {
 /// utiliser ce label — ne jamais le passer en dur.
 pub const SUBSCRIBER_PSEUDO_DOMAIN: &str = "subscriber";
 
+/// Produces one cross-protocol subscriber pseudonym from digit nibbles.
+/// The returned value is opaque; the canonical digits never leave the
+/// decoder. `first_high_nibble` covers EPS mobile identity octet 3, while
+/// ordinary GTPv2-C TBCD starts with the low nibble.
+pub fn pseudonym_subscriber_tbcd(
+    key: &PseudonymKey,
+    bytes: &[u8],
+    first_high_nibble: bool,
+) -> String {
+    let mut digits = Vec::with_capacity(bytes.len().saturating_mul(2));
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        let nibbles = if index == 0 && first_high_nibble {
+            [byte >> 4, 0x0f]
+        } else {
+            [byte & 0x0f, byte >> 4]
+        };
+        for nibble in nibbles {
+            if nibble <= 9 {
+                digits.push(b'0' + nibble);
+            }
+        }
+    }
+    pseudonym(key, SUBSCRIBER_PSEUDO_DOMAIN, &digits)
+}
+
+/// Diameter User-Name is textual. Only its leading decimal identity is fed
+/// to the common subscriber domain; realm/decoration is deliberately ignored.
+pub fn pseudonym_subscriber_text(key: &PseudonymKey, value: &[u8]) -> String {
+    let digits = value
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect::<Vec<_>>();
+    let canonical = if digits.is_empty() { value } else { &digits };
+    pseudonym(key, SUBSCRIBER_PSEUDO_DOMAIN, canonical)
+}
+
 /// 2.9.9 (#9 comment 6725858177) : normalisation TEID partagée par
 /// SBI / N2 / N4. ANR2 a prouvé des formats divergents sur le même
 /// TEID numérique : SBI/N2 `0xd4a6`, N4 `0x0000d4a6`. La fonction
@@ -1566,6 +1603,20 @@ mod tests {
         // exactement le défaut 2.9.8 qu'ANR2 a mis en évidence.
         let legacy_uri = pseudonym(&key, "supi", supi);
         assert_ne!(legacy_uri, body_side);
+    }
+
+    #[test]
+    fn subscriber_pseudonym_matches_gtpv2_eps_nas_and_diameter_encodings() {
+        let key = PseudonymKey::from_bytes([0x5a; 32]);
+        let gtpv2_tbcd = [0x21, 0x43, 0xf5];
+        let eps_mobile_identity = [0x19, 0x32, 0x54];
+        let diameter_user_name = b"12345@epc.invalid";
+        let expected = pseudonym_subscriber_tbcd(&key, &gtpv2_tbcd, false);
+        assert_eq!(
+            expected,
+            pseudonym_subscriber_tbcd(&key, &eps_mobile_identity, true)
+        );
+        assert_eq!(expected, pseudonym_subscriber_text(&key, diameter_user_name));
     }
 
     fn deployment_key_path(label: &str) -> std::path::PathBuf {
