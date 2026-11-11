@@ -164,7 +164,7 @@ pub fn offline_lte_callflows(events: &[EventRecord]) -> Result<Vec<CallFlow>, St
             MAX_OFFLINE_LTE_SESSIONS
         ));
     }
-    let global_edges = correlate_lte_evidence(events);
+    let global_edges = fold_overlapping_edges(correlate_lte_evidence(events));
     Ok(sessions
         .iter()
         .map(|session| {
@@ -186,12 +186,6 @@ struct N3FlowKey {
     message_type: u32,
     teid: String,
     direction: String,
-    source: String,
-    destination: String,
-    inner_source: String,
-    inner_destination: String,
-    ue_ip: String,
-    qfi: Option<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -211,7 +205,7 @@ struct N3FlowAggregator {
 }
 
 impl N3FlowAggregator {
-    fn observe(&mut self, event: NormalizedEvent) -> Result<(), String> {
+    fn observe(&mut self, mut event: NormalizedEvent) -> Result<(), String> {
         let identifier = |name: &str| {
             event
                 .session_identifiers
@@ -226,16 +220,26 @@ impl N3FlowAggregator {
             .find(|item| item.name == "PDU Session Container")
             .and_then(|item| item.value.as_deref())
             .and_then(parse_qfi);
+        let teid = identifier("teid");
+        let mut direction = event.direction.as_str().to_string();
+        if direction == "UNKNOWN" {
+            let known = self
+                .flows
+                .iter()
+                .filter(|(key, _)| key.message_type == event.message_type && key.teid == teid)
+                .filter(|(key, _)| key.direction != "UNKNOWN")
+                .map(|(_, flow)| flow.event.direction.clone())
+                .collect::<Vec<_>>();
+            if let [resolved] = known.as_slice() {
+                event.direction = resolved.clone();
+                direction = resolved.as_str().to_string();
+                set_tunnel_direction(&mut event, resolved.as_str());
+            }
+        }
         let key = N3FlowKey {
             message_type: event.message_type,
-            teid: identifier("teid"),
-            direction: event.direction.as_str().to_string(),
-            source: event.source_endpoint.address.clone(),
-            destination: event.destination_endpoint.address.clone(),
-            inner_source: identifier("inner_source_ip"),
-            inner_destination: identifier("inner_destination_ip"),
-            ue_ip: identifier("ue_ip"),
-            qfi,
+            teid,
+            direction,
         };
         let packet_count = event.packet_references.len() as u64;
         let wire_bytes = event
@@ -245,11 +249,29 @@ impl N3FlowAggregator {
             .sum::<u64>();
         let timestamp_ns = event.timestamp.unix_nanoseconds().unwrap_or_default();
         let last_packet = event.packet_references.last().cloned();
+        let mut incoming = N3FlowAggregate {
+            event,
+            packet_count,
+            wire_bytes,
+            first_seen_ns: timestamp_ns,
+            last_seen_ns: timestamp_ns,
+            last_packet,
+            qfi,
+        };
+        if key.direction != "UNKNOWN" {
+            let unknown_key = N3FlowKey {
+                message_type: key.message_type,
+                teid: key.teid.clone(),
+                direction: "UNKNOWN".into(),
+            };
+            if let Some(mut unknown) = self.flows.remove(&unknown_key) {
+                unknown.event.direction = incoming.event.direction.clone();
+                set_tunnel_direction(&mut unknown.event, &key.direction);
+                merge_gtpu_aggregate(&mut incoming, unknown);
+            }
+        }
         if let Some(flow) = self.flows.get_mut(&key) {
-            flow.packet_count = flow.packet_count.saturating_add(packet_count);
-            flow.wire_bytes = flow.wire_bytes.saturating_add(wire_bytes);
-            flow.last_seen_ns = timestamp_ns;
-            flow.last_packet = last_packet;
+            merge_gtpu_aggregate(flow, incoming);
             return Ok(());
         }
         if self.flows.len() >= MAX_N3_FLOW_AGGREGATES {
@@ -257,15 +279,7 @@ impl N3FlowAggregator {
         }
         self.flows.insert(
             key,
-            N3FlowAggregate {
-                event,
-                packet_count,
-                wire_bytes,
-                first_seen_ns: timestamp_ns,
-                last_seen_ns: timestamp_ns,
-                last_packet,
-                qfi,
-            },
+            incoming,
         );
         Ok(())
     }
@@ -358,6 +372,52 @@ impl N3FlowAggregator {
             })
             .collect()
     }
+}
+
+fn set_tunnel_direction(event: &mut NormalizedEvent, direction: &str) {
+    if let Some(identifier) = event
+        .session_identifiers
+        .iter_mut()
+        .find(|identifier| identifier.name == "tunnel_direction")
+    {
+        identifier.value = direction.into();
+    }
+}
+
+fn merge_gtpu_aggregate(target: &mut N3FlowAggregate, source: N3FlowAggregate) {
+    target.packet_count = target.packet_count.saturating_add(source.packet_count);
+    target.wire_bytes = target.wire_bytes.saturating_add(source.wire_bytes);
+    target.first_seen_ns = target.first_seen_ns.min(source.first_seen_ns);
+    target.last_seen_ns = target.last_seen_ns.max(source.last_seen_ns);
+    if source
+        .last_packet
+        .as_ref()
+        .map(|packet| packet.packet_number)
+        > target
+            .last_packet
+            .as_ref()
+            .map(|packet| packet.packet_number)
+    {
+        target.last_packet = source.last_packet.clone();
+    }
+    if gtpu_aggregate_order_key(&source.event) < gtpu_aggregate_order_key(&target.event) {
+        target.event = source.event;
+    }
+    if target.qfi.is_none() {
+        target.qfi = source.qfi;
+    }
+}
+
+fn gtpu_aggregate_order_key(event: &NormalizedEvent) -> (String, u64, String) {
+    (
+        event.capture_id.clone(),
+        event
+            .packet_references
+            .first()
+            .map(|packet| packet.packet_number)
+            .unwrap_or_default(),
+        event.event_id.clone(),
+    )
 }
 
 fn parse_qfi(value: &str) -> Option<u8> {
@@ -15404,6 +15464,64 @@ mod tests {
             evidence_references: vec![],
             sbi: None,
         }
+    }
+
+    #[test]
+    fn gtpu_aggregator_rekeys_first_unknown_packet_by_teid_and_resolved_direction_2_11_6() {
+        let event = |id: &str, packet: u64, direction: event_schema::Direction| {
+            let mut event = keepalive_event(
+                id,
+                "S5-U",
+                Protocol::Gtpu,
+                "G-PDU",
+                "10.77.14.13",
+                "10.77.14.15",
+                "sha256:synthetic-s5u",
+                packet,
+            );
+            event.message_type = 255;
+            event.direction = direction.clone();
+            event.session_identifiers = vec![
+                NamedValue {
+                    name: "teid".into(),
+                    value: "0x00007f6f".into(),
+                    pseudonymized: false,
+                },
+                NamedValue {
+                    name: "tunnel_direction".into(),
+                    value: direction.as_str().into(),
+                    pseudonymized: false,
+                },
+            ];
+            event
+        };
+        let mut aggregator = N3FlowAggregator::default();
+        aggregator
+            .observe(event("first", 1, event_schema::Direction::Unknown))
+            .unwrap();
+        aggregator
+            .observe(event("second", 2, event_schema::Direction::Uplink))
+            .unwrap();
+        aggregator
+            .observe(event("third", 3, event_schema::Direction::Uplink))
+            .unwrap();
+        let flows = aggregator.finish();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].direction, event_schema::Direction::Uplink);
+        assert!(flows[0].session_identifiers.iter().any(|identifier| {
+            identifier.name == "tunnel_direction" && identifier.value == "UPLINK"
+        }));
+        assert!(flows[0].information_elements.iter().any(|element| {
+            element.name == "aggregate_packet_count" && element.value.as_deref() == Some("3")
+        }));
+        assert_eq!(
+            flows[0]
+                .packet_references
+                .iter()
+                .map(|packet| packet.packet_number)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
     }
 
     /// 1000 PFCP Heartbeat Requests + 1000 Responses du même couple de

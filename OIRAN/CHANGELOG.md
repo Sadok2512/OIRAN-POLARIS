@@ -1,5 +1,15 @@
 # Changelog
 
+## OIRAN API 2.11.6 — 2026-11-11 — exhaustivité LTE bidirectionnelle et Diameter TCP cadré
+
+- `correlation-engine` 0.6.6 émet une arête pour chaque F-TEID U-plane décodé sur S11↔S1-U, S5-C↔S5-U et Sxab↔S5-U. Il préfère l'agrégat à son ancien singleton de frontière de lot, échoue fermé pour un TEID réellement ambigu et initialise toujours `matched_rules` avec `rule_id`. La limitation E-RAB périmée est retirée puisque l'extraction imbriquée est présente.
+- `live-probe` 0.5.5 agrège GTP-U par `(message_type, teid, direction)` et fusionne l'éventuel premier paquet `UNKNOWN` lorsque la direction du tunnel est résolue. L'ordre canonique de sélection reste `(capture_id, packet_number, event_id)`, jamais l'horodatage.
+- `oiran-decode` 0.7.3 réassemble chaque direction TCP par 4-tuple puis découpe le flux Diameter au champ `Length`, y compris plusieurs messages dans un segment et un message réparti sur plusieurs segments, avec provenance exacte et sans doublon.
+- `decoder-diameter` 0.2.6 corrige les types AVP 3GPP nécessaires à AIR/ULR, notamment `ULR-Flags` (1405, entier non groupé). Un message de trame valide reste `DECODED` quand un AVP inconnu est conservé par longueur et empreinte ; un défaut de structure reste `MALFORMED`.
+- Les tests construits couvrent les TEID `0x00007804`, `0x00000001`, `0x00007f6f`, `0x0000be90`, les deux sens de chaque pont LTE, l'agrégation du premier paquet, AIR/ULR et les segmentations TCP 2→1 et 1→2. Ils ne contiennent aucun pcap réel ni identité abonné.
+- Versions : `oiran-api` 2.11.6, web 2.11.6, `live-probe` 0.5.5, `correlation-engine` 0.6.6, `oiran-decode` 0.7.3, `decoder-diameter` 0.2.6.
+- Gate manuel : `cargo build --release --locked`. La recette réelle des sept segments `_00067`, publication et compaction comprises, reste exécutée par ANR2 avant tout déploiement.
+
 ## OIRAN API 2.11.5 — 2026-11-11 — clés LTE décodées avant corrélation
 
 - `decoder-s1ap` 0.2.1 décode les listes E-RAB des procédures Initial Context Setup et E-RAB Setup (requêtes et réponses) et publie `erab_id`, `erab_teid`, `transport_layer_address` et `tunnel_endpoint_ip`. Les IE NAS-PDU et SecurityKey de l'Initial Context Setup restent entièrement omis : ni valeur, ni empreinte.

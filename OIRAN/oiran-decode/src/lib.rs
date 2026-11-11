@@ -494,19 +494,6 @@ where
             if sink_error.is_some() || direction.bytes.is_empty() || direction.spans.is_empty() {
                 continue;
             }
-            let mut packet_references = direction
-                .spans
-                .iter()
-                .map(|span| span.packet.clone())
-                .collect::<Vec<_>>();
-            packet_references.sort_by_key(|packet| packet.packet_number);
-            packet_references.dedup_by_key(|packet| packet.packet_number);
-            let timestamp = direction
-                .spans
-                .iter()
-                .min_by_key(|span| span.packet.packet_number)
-                .map(|span| span.timestamp.clone())
-                .expect("non-empty Diameter TCP provenance");
             let source = endpoint(
                 &direction.source.address,
                 Some(direction.source.port),
@@ -517,27 +504,77 @@ where
                 Some(direction.destination.port),
                 &config.endpoints,
             );
-            let raw = format!("sha256:{}", sha256_hex(&direction.bytes));
-            let input = DecoderInput {
-                capture_id: &config.capture_id,
-                packet_references: &packet_references,
-                timestamp: &timestamp,
-                interface: "S6a",
-                source_endpoint: source,
-                destination_endpoint: destination,
-                payload: &direction.bytes,
-                raw_payload_reference: &raw,
-                pseudonym_key,
-            };
-            emit_events(
-                decoder.decode(&input).events,
-                sink,
-                event_count,
-                sink_error,
-            );
+            for range in diameter_frame_ranges(&direction.bytes) {
+                let frame = &direction.bytes[range.clone()];
+                let mut packet_references = direction
+                    .spans
+                    .iter()
+                    .filter(|span| span.start < range.end && span.end > range.start)
+                    .map(|span| {
+                        let mut packet = span.packet.clone();
+                        if span.start <= range.start && range.start < span.end {
+                            packet.byte_offset = packet
+                                .byte_offset
+                                .saturating_add((range.start - span.start) as u64);
+                        }
+                        packet
+                    })
+                    .collect::<Vec<_>>();
+                packet_references.sort_by_key(|packet| packet.packet_number);
+                packet_references.dedup_by_key(|packet| packet.packet_number);
+                let Some(timestamp) = direction
+                    .spans
+                    .iter()
+                    .filter(|span| span.start < range.end && span.end > range.start)
+                    .min_by_key(|span| span.packet.packet_number)
+                    .map(|span| span.timestamp.clone())
+                else {
+                    continue;
+                };
+                let raw = format!("sha256:{}", sha256_hex(frame));
+                let input = DecoderInput {
+                    capture_id: &config.capture_id,
+                    packet_references: &packet_references,
+                    timestamp: &timestamp,
+                    interface: "S6a",
+                    source_endpoint: source.clone(),
+                    destination_endpoint: destination.clone(),
+                    payload: frame,
+                    raw_payload_reference: &raw,
+                    pseudonym_key,
+                };
+                emit_events(
+                    decoder.decode(&input).events,
+                    sink,
+                    event_count,
+                    sink_error,
+                );
+            }
         }
     }
     connection_count
+}
+
+fn diameter_frame_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let remaining = &bytes[cursor..];
+        if remaining.len() < 20 || remaining[0] != 1 {
+            ranges.push(cursor..bytes.len());
+            break;
+        }
+        let length = ((remaining[1] as usize) << 16)
+            | ((remaining[2] as usize) << 8)
+            | remaining[3] as usize;
+        if length < 20 || length > remaining.len() {
+            ranges.push(cursor..bytes.len());
+            break;
+        }
+        ranges.push(cursor..cursor + length);
+        cursor += length;
+    }
+    ranges
 }
 
 pub fn write_jsonl(path: &Path, events: &[NormalizedEvent], append: bool) -> Result<(), String> {
@@ -924,6 +961,146 @@ mod tests {
         assert_eq!(count, 2);
         assert_eq!(events[0].message_name, "Authentication-Information-Request");
         assert_eq!(events[1].message_name, "Authentication-Information-Answer");
+    }
+
+    #[test]
+    fn diameter_tcp_framing_handles_two_messages_in_one_segment_and_one_in_two_2_11_6() {
+        fn message(command: u32, request: bool) -> Vec<u8> {
+            let mut bytes = vec![1, 0, 0, 20, if request { 0x80 } else { 0 }];
+            bytes.extend_from_slice(&command.to_be_bytes()[1..]);
+            bytes.extend_from_slice(&16_777_251u32.to_be_bytes());
+            bytes.extend_from_slice(&command.to_be_bytes());
+            bytes.extend_from_slice(&(command + 1).to_be_bytes());
+            bytes
+        }
+        fn packet(number: u64, length: usize) -> event_schema::PacketReference {
+            event_schema::PacketReference {
+                source_file: "synthetic-s6a.pcap".into(),
+                source_sha256: Some("0".repeat(64)),
+                packet_number: number,
+                byte_offset: number * 64,
+                interface_id: 0,
+                link_type: Some(1),
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: length as u32,
+                original_length: length as u32,
+            }
+        }
+        fn timestamp(number: u64) -> event_schema::ExactTimestamp {
+            event_schema::ExactTimestamp {
+                seconds: 1,
+                nanoseconds: number as u32,
+                raw_ticks: number,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            }
+        }
+
+        let client = transport_tcp::TcpEndpoint {
+            address: "192.0.2.10".into(),
+            port: 39200,
+        };
+        let server = transport_tcp::TcpEndpoint {
+            address: "192.0.2.20".into(),
+            port: 3868,
+        };
+        let mut requests = message(318, true);
+        requests.extend_from_slice(&message(316, true));
+        let answer = message(318, false);
+        let request_direction = transport_tcp::ReassembledDirection {
+            source: client.clone(),
+            destination: server.clone(),
+            spans: vec![transport_tcp::ProvenanceSpan {
+                start: 0,
+                end: requests.len(),
+                timestamp: timestamp(1),
+                packet: packet(1, requests.len()),
+            }],
+            bytes: requests,
+            incomplete: false,
+            retransmissions: 0,
+            duplicate_segments: 0,
+        };
+        let answer_direction = transport_tcp::ReassembledDirection {
+            source: server.clone(),
+            destination: client.clone(),
+            spans: vec![
+                transport_tcp::ProvenanceSpan {
+                    start: 0,
+                    end: 10,
+                    timestamp: timestamp(2),
+                    packet: packet(2, 10),
+                },
+                transport_tcp::ProvenanceSpan {
+                    start: 10,
+                    end: answer.len(),
+                    timestamp: timestamp(3),
+                    packet: packet(3, answer.len() - 10),
+                },
+            ],
+            bytes: answer,
+            incomplete: false,
+            retransmissions: 0,
+            duplicate_segments: 0,
+        };
+        let (connection_key, _) =
+            transport_tcp::TcpConnectionKey::new(client, server);
+        let connection = transport_tcp::ReassembledConnection {
+            key: connection_key,
+            directions: [request_direction, answer_direction],
+        };
+        let config = DecodeConfig {
+            input: "unused.pcap".into(),
+            capture_id: format!("sha256:{}", "0".repeat(64)),
+            interface: "S6a".into(),
+            endpoints: HashMap::new(),
+        };
+        let key = PseudonymKey::from_bytes([0x44; 32]);
+        let mut events = Vec::new();
+        let mut count = 0;
+        let mut error = None;
+        emit_diameter_connections(
+            vec![connection],
+            &config,
+            &DiameterDecoder,
+            &key,
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+            &mut count,
+            &mut error,
+        );
+        assert_eq!(error, None);
+        assert_eq!(count, 3);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.message_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Authentication-Information-Request",
+                "Update-Location-Request",
+                "Authentication-Information-Answer",
+            ]
+        );
+        assert!(events
+            .iter()
+            .all(|event| event.decoding_status == event_schema::DecodeStatus::Decoded));
+        assert_eq!(
+            events[2]
+                .packet_references
+                .iter()
+                .map(|packet| packet.packet_number)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     #[test]

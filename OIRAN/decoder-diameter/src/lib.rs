@@ -140,12 +140,17 @@ fn is_grouped_avp(code: u32, vendor_id: Option<u32>) -> bool {
             | (284, None) // Proxy-Info
             | (297, None) // Experimental-Result
             | (1400, Some(10415)) // Subscription-Data
-            | (1430, Some(10415)) // APN-Configuration-Profile
-            | (1429, Some(10415)) // APN-Configuration
-            | (1431, Some(10415)) // AMBR
-            | (1620, Some(10415)) // Terminal-Information
-            | (1405, Some(10415)) // Authentication-Info
-            | (1413, Some(10415)) // Subscriber-Status
+            | (1401, Some(10415)) // Terminal-Information
+            | (1404, Some(10415)) // QoS-Subscribed
+            | (1408, Some(10415)) // Requested-EUTRAN-Authentication-Info
+            | (1409, Some(10415)) // Requested-UTRAN-GERAN-Authentication-Info
+            | (1413, Some(10415)) // Authentication-Info
+            | (1414, Some(10415)) // E-UTRAN-Vector
+            | (1415, Some(10415)) // UTRAN-Vector
+            | (1416, Some(10415)) // GERAN-Vector
+            | (1429, Some(10415)) // APN-Configuration-Profile
+            | (1430, Some(10415)) // APN-Configuration
+            | (1435, Some(10415)) // AMBR
     )
 }
 
@@ -204,18 +209,29 @@ fn decode_avp(
             false,
             name,
         ),
-        (1404, Some(10415)) => decode_u32("ulr_flags", &avp.value, name),
-        (1405, Some(10415)) => (
+        (1032, Some(10415)) => decode_u32("rat_type", &avp.value, name),
+        (1405, Some(10415)) => decode_u32("ulr_flags", &avp.value, name),
+        (1406, Some(10415)) => decode_u32("ula_flags", &avp.value, name),
+        (1408, Some(10415)) | (1409, Some(10415)) => (
+            Some(format!(
+                "requested_authentication_info_children={}",
+                avp.children.len()
+            )),
+            DecodeStatus::Decoded,
+            false,
+            name,
+        ),
+        (1410, Some(10415)) => decode_u32("number_of_requested_vectors", &avp.value, name),
+        (1412, Some(10415)) => decode_u32("immediate_response_preferred", &avp.value, name),
+        (1413, Some(10415)) => (
             Some(format!(
                 "authentication_info_children={}",
                 avp.children.len()
             )),
-            DecodeStatus::Partial,
+            DecodeStatus::Decoded,
             false,
             name,
         ),
-        (1406, Some(10415)) => decode_u32("rat_type", &avp.value, name),
-        (1408, Some(10415)) => decode_u32("sgsn_number", &avp.value, name),
         _ => (None, DecodeStatus::Unsupported, false, name),
     }
 }
@@ -322,17 +338,24 @@ fn avp_name(code: u32, vendor: Option<u32>) -> Option<&'static str> {
         (701, Some(10415)) => "identity_pseudonym",
         (1032, Some(10415)) => "RAT-Type",
         (1400, Some(10415)) => "Subscription-Data",
-        (1404, Some(10415)) => "ULR-Flags",
-        (1405, Some(10415)) => "Authentication-Info",
-        (1406, Some(10415)) => "RAT-Type",
+        (1401, Some(10415)) => "Terminal-Information",
+        (1404, Some(10415)) => "QoS-Subscribed",
+        (1405, Some(10415)) => "ULR-Flags",
+        (1406, Some(10415)) => "ULA-Flags",
         (1407, Some(10415)) => "Visited-PLMN-Id",
-        (1408, Some(10415)) => "SGSN-Number",
-        (1413, Some(10415)) => "Subscriber-Status",
-        (1429, Some(10415)) => "APN-Configuration",
-        (1430, Some(10415)) => "APN-Configuration-Profile",
-        (1431, Some(10415)) => "AMBR",
-        (1420, Some(10415)) => "QoS-Subscribed",
-        (1620, Some(10415)) => "Terminal-Information",
+        (1408, Some(10415)) => "Requested-EUTRAN-Authentication-Info",
+        (1409, Some(10415)) => "Requested-UTRAN-GERAN-Authentication-Info",
+        (1410, Some(10415)) => "Number-Of-Requested-Vectors",
+        (1411, Some(10415)) => "Re-Synchronization-Info",
+        (1412, Some(10415)) => "Immediate-Response-Preferred",
+        (1413, Some(10415)) => "Authentication-Info",
+        (1414, Some(10415)) => "E-UTRAN-Vector",
+        (1415, Some(10415)) => "UTRAN-Vector",
+        (1416, Some(10415)) => "GERAN-Vector",
+        (1424, Some(10415)) => "Subscriber-Status",
+        (1429, Some(10415)) => "APN-Configuration-Profile",
+        (1430, Some(10415)) => "APN-Configuration",
+        (1435, Some(10415)) => "AMBR",
         _ => return None,
     })
 }
@@ -688,13 +711,11 @@ fn emit_avp(
     pseudonym_key: &PseudonymKey,
 ) {
     let (value, avp_status, sensitive, name) = decode_avp(avp, pseudonym_key);
-    if matches!(
-        avp_status,
-        DecodeStatus::Unsupported | DecodeStatus::Partial
-    ) && *status == DecodeStatus::Decoded
-    {
-        *status = DecodeStatus::Partial;
-    }
+    // A structurally valid Diameter message remains DECODED when an AVP is
+    // preserved opaquely by exact length + SHA-256. The individual IE keeps
+    // its PARTIAL/UNSUPPORTED status; only malformed wire structure degrades
+    // the event envelope. This is essential for S6a AIR/ULR routing without
+    // pretending that an unknown extension was semantically interpreted.
     if avp_status == DecodeStatus::Malformed {
         *status = DecodeStatus::Malformed;
     }
@@ -879,13 +900,14 @@ mod tests {
         let ulr_flags = &[0x00, 0x00, 0x00, 0x02];
         let mut body = Vec::new();
         body.extend_from_slice(&avp(1, None, 0x40, synthetic_user_name));
-        body.extend_from_slice(&avp(1404, Some(10415), 0x40, ulr_flags));
+        body.extend_from_slice(&avp(1405, Some(10415), 0x40, ulr_flags));
         body.extend_from_slice(&avp(1407, Some(10415), 0x40, visited_plmn));
         let bytes = message(316, true, 16777251, &body);
         let (p, t) = fixtures();
         let key = PseudonymKey::from_bytes([0xbb; 32]);
         let in_ = input(&bytes, &p, &t, &key, "MME", "HSS");
         let out = DiameterDecoder.decode(&in_);
+        assert_eq!(out.status, DecodeStatus::Decoded);
         assert_eq!(out.events.len(), 1);
         let ev = &out.events[0];
         assert_eq!(ev.message_name, "Update-Location-Request");
@@ -903,6 +925,23 @@ mod tests {
             .find(|v| v.name == "visited_plmn_id")
             .expect("visited_plmn_id");
         assert_eq!(plmn.value, "001-01");
+    }
+
+    #[test]
+    fn air_requested_authentication_group_is_framed_without_malformed_children() {
+        let requested = avp(1410, Some(10415), 0x40, &[0, 0, 0, 1]);
+        let body = avp(1408, Some(10415), 0x40, &requested);
+        let bytes = message(318, true, 16777251, &body);
+        let (packets, timestamp) = fixtures();
+        let key = PseudonymKey::from_bytes([0xcc; 32]);
+        let input = input(&bytes, &packets, &timestamp, &key, "MME", "HSS");
+        let output = DiameterDecoder.decode(&input);
+        assert_eq!(output.status, DecodeStatus::Decoded);
+        assert_eq!(output.events[0].message_name, "Authentication-Information-Request");
+        assert!(output.events[0].information_elements.iter().any(|element| {
+            element.name == "Number-Of-Requested-Vectors"
+                && element.value.as_deref() == Some("number_of_requested_vectors=1")
+        }));
     }
 
     #[test]
