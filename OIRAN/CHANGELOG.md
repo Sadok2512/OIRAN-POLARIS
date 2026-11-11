@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.11.8 — 2026-11-11 — protocoles normalisés pour la collecte S6a
+
+- `session-engine` 0.5.9 compare sans tenir compte de la casse tous les noms de protocole utilisés par ses filtres. Les événements S6a publiés avec `protocol="DIAMETER"` rejoignent ainsi la collection LTE avant leur rattachement par `subscriber_pseudonym`.
+- `correlation-engine` 0.6.8 applique la même comparaison normalisée à tous ses filtres de protocole afin qu'une variation de casse ne supprime aucune preuve avant corrélation.
+- Le test synthétique associe un événement S1AP et un événement S6a `DIAMETER` par le même pseudonyme opaque, puis vérifie la présence de S6a dans la session LTE et l'arête S1-MME↔S6a EXACT. Il ne contient ni pcap réel ni identité abonné.
+- Versions : `oiran-api` 2.11.8, web 2.11.8, `session-engine` 0.5.9, `correlation-engine` 0.6.8.
+- Gate manuel : `cargo build --release --locked`. La recette réelle reste exécutée par ANR2 avant tout déploiement.
+
 ## OIRAN API 2.11.7 — 2026-11-11 — fermeture du lot A LTE
 
 - `session-engine` 0.5.8 rattache les deux moitiés d'une transaction Create Session S5-C par la clé structurelle exacte `(capture_id, gtpv2c_sequence, procédure, paire d'endpoints)`. Le F-TEID DL porté uniquement par la requête rejoint ainsi la même session que le F-TEID UL de la réponse, sans aucune jointure temporelle.

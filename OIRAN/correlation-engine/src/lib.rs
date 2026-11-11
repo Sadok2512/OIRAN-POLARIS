@@ -18,6 +18,10 @@ pub const E2E_EVIDENCE_RULE_VERSION: &str = "2.0.0";
 pub const N4_N3_RULE_VERSION: &str = "1.0.0";
 pub const LTE_RULE_VERSION: &str = "1.1.0-offline.1";
 
+fn protocol_is(event: &EventRecord, expected: &str) -> bool {
+    event.protocol.eq_ignore_ascii_case(expected)
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TunnelCorrelationKey {
     endpoint_ip: String,
@@ -61,7 +65,7 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
     let ngap = events
         .iter()
         .filter_map(|event| {
-            if event.interface != "N2" || event.protocol != "NGAP" {
+            if event.interface != "N2" || !protocol_is(event, "NGAP") {
                 return None;
             }
             tunnel_key(event).map(|key| (event, key))
@@ -70,7 +74,7 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
     let pfcp = events
         .iter()
         .flat_map(|event| {
-            if event.interface != "N4" || event.protocol != "PFCP" {
+            if event.interface != "N4" || !protocol_is(event, "PFCP") {
                 return Vec::new();
             }
             tunnel_keys(event)
@@ -107,7 +111,7 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
         .iter()
         .filter(|e| {
             e.interface == "N2"
-                && e.protocol == "NGAP"
+                && protocol_is(e, "NGAP")
                 && e.message_name == "PDUSessionResourceSetupRequest"
                 && e.first_identifier("pdu_session_id").is_some()
         })
@@ -116,7 +120,7 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
         .iter()
         .filter(|e| {
             e.interface == "SBI"
-                && e.protocol == "SBI-HTTP2"
+                && protocol_is(e, "SBI-HTTP2")
                 && matches!(
                     e.message_name.as_str(),
                     "CreateSMContext" | "N1N2MessageTransfer" | "UpdateSMContext"
@@ -155,7 +159,7 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
         .iter()
         .filter(|event| {
             event.interface == "N4"
-                && event.protocol == "PFCP"
+                && protocol_is(event, "PFCP")
                 && event.message_name == "PFCP Session Establishment Request"
         })
         .collect::<Vec<_>>();
@@ -205,7 +209,7 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
     // timestamp. Multi-match → fail-closed, no edge.
     let n4_tunnels = events
         .iter()
-        .filter(|event| event.interface == "N4" && event.protocol == "PFCP")
+        .filter(|event| event.interface == "N4" && protocol_is(event, "PFCP"))
         .flat_map(|event| {
             tunnel_keys(event)
                 .into_iter()
@@ -214,7 +218,7 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
         .collect::<Vec<_>>();
     let n3_tunnels = events
         .iter()
-        .filter(|event| event.interface == "N3" && event.protocol == "GTP-U")
+        .filter(|event| event.interface == "N3" && protocol_is(event, "GTP-U"))
         .filter_map(|event| {
             let teid = event.first_identifier("teid").and_then(normalize_teid)?;
             Some((
@@ -305,7 +309,7 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
     // seule la paire (IP normalisée, TEID normalisée) compte.
     let sbi_tunnels = events
         .iter()
-        .filter(|event| event.interface == "SBI" && event.protocol == "SBI-HTTP2")
+        .filter(|event| event.interface == "SBI" && protocol_is(event, "SBI-HTTP2"))
         .flat_map(|event| {
             tunnel_keys(event)
                 .into_iter()
@@ -394,17 +398,17 @@ pub fn correlate_lte_evidence(events: &[EventRecord]) -> Vec<CorrelationEdge> {
         let radios = session_events
             .iter()
             .copied()
-            .filter(|event| event.interface == "S1-MME" && event.protocol == "S1AP")
+            .filter(|event| event.interface == "S1-MME" && protocol_is(event, "S1AP"))
             .collect::<Vec<_>>();
         let controls = session_events
             .iter()
             .copied()
-            .filter(|event| event.interface == "S11" && event.protocol == "GTPv2-C")
+            .filter(|event| event.interface == "S11" && protocol_is(event, "GTPv2-C"))
             .collect::<Vec<_>>();
         let users = session_events
             .iter()
             .copied()
-            .filter(|event| event.interface == "S1-U" && event.protocol == "GTP-U")
+            .filter(|event| event.interface == "S1-U" && protocol_is(event, "GTP-U"))
             .collect::<Vec<_>>();
 
         for control in &controls {
@@ -786,7 +790,7 @@ pub fn correlate_sbi_routing(events: &[EventRecord]) -> Vec<CorrelationEdge> {
     let mut edges = Vec::new();
     let sbi = events
         .iter()
-        .filter(|event| event.protocol == "SBI-HTTP2")
+        .filter(|event| protocol_is(event, "SBI-HTTP2"))
         .collect::<Vec<_>>();
     for first in &sbi {
         let Some(first_meta) = first.source_json.get("sbi") else {
@@ -922,7 +926,7 @@ pub fn correlate(r: &Reconstruction, manifest: &ScenarioManifest) -> Vec<Correla
             .iter()
             .filter(|e| {
                 r.association.get(&e.event_id) == Some(&Association::Session)
-                    && e.protocol == "GTP-U"
+                    && protocol_is(e, "GTP-U")
                     && e.first_identifier("teid") == Some(teid)
                     && endpoint
                         .as_ref()
@@ -1053,7 +1057,7 @@ fn unique_pfcp_teid<'a>(r: &'a Reconstruction, teid: &str, endpoint: &str) -> Ma
         .iter()
         .filter(|e| {
             r.association.get(&e.event_id) == Some(&Association::Session)
-                && e.protocol == "PFCP"
+                && protocol_is(e, "PFCP")
                 && pfcp_teid_endpoint(e, teid).as_deref() == Some(endpoint)
         })
         .collect();
@@ -1658,6 +1662,26 @@ mod tests {
         }
         assert!(edges.iter().all(|edge| edge.confidence != "POSSIBLE"));
         assert!(edges.iter().all(|edge| edge.matched_rules.contains(&edge.rule_id)));
+    }
+
+    #[test]
+    fn uppercase_diameter_s6a_attaches_to_lte_session_2_11_8() {
+        let pseudo = "psn-opaque-shared";
+        let radio = e("radio", "S1-MME", "S1AP", "InitialUEMessage", 1,
+            &[("enb_ue_s1ap_id", "41"), ("mme_ue_s1ap_id", "7"),
+              ("subscriber_pseudonym", pseudo)], json!([]));
+        let s6a = e("s6a", "S6a", "DIAMETER", "Authentication-Information-Request", 2,
+            &[("subscriber_pseudonym", pseudo)], json!([]));
+        let events = vec![radio, s6a];
+
+        let sessions = discover_lte_sessions(&events);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].interfaces.contains(&"S6a".to_string()));
+        assert!(sessions[0].event_ids.contains(&"s6a".to_string()));
+        let edge = correlate_lte_evidence(&events).into_iter()
+            .find(|edge| edge.rule_id == "s1mme-s6a-pseudonym")
+            .expect("uppercase DIAMETER S6a must correlate with S1-MME");
+        assert_eq!(edge.confidence, "EXACT");
     }
 
     #[test]

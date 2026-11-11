@@ -296,9 +296,22 @@ fn within_lte_window(_event: &EventRecord, related: &[&EventRecord]) -> bool {
     !related.is_empty()
 }
 
+fn protocol_is(event: &EventRecord, expected: &str) -> bool {
+    event.protocol.eq_ignore_ascii_case(expected)
+}
+
+fn protocol_is_any(event: &EventRecord, expected: &[&str]) -> bool {
+    expected.iter().any(|value| protocol_is(event, value))
+}
+
+fn protocol_starts_with(event: &EventRecord, prefix: &str) -> bool {
+    event.protocol.get(..prefix.len())
+        .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+}
+
 fn same_gtpv2c_transaction(left: &EventRecord, right: &EventRecord) -> bool {
-    if left.protocol != "GTPv2-C"
-        || right.protocol != "GTPv2-C"
+    if !protocol_is(left, "GTPv2-C")
+        || !protocol_is(right, "GTPv2-C")
         || left.capture_id != right.capture_id
         || left.first_identifier("gtpv2c_sequence")
             != right.first_identifier("gtpv2c_sequence")
@@ -334,16 +347,10 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
                 event.interface.as_str(),
                 "S1-MME" | "S11" | "S1-U" | "S5-C" | "S5-U" | "Sxab" | "S6a"
             )
-                && matches!(
-                    event.protocol.as_str(),
-                    "S1AP"
-                        | "NAS-EPS-MM"
-                        | "NAS-EPS-SM"
-                        | "GTPv2-C"
-                        | "GTP-U"
-                        | "PFCP"
-                        | "Diameter"
-                )
+                && protocol_is_any(event, &[
+                    "S1AP", "NAS-EPS-MM", "NAS-EPS-SM", "GTPv2-C",
+                    "GTP-U", "PFCP", "DIAMETER",
+                ])
         })
         .collect::<Vec<_>>();
     // 2.7.13: canonical (capture_id, seq, event_id). ts never influences
@@ -367,7 +374,7 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
     // identifier (fully anonymous exchange). Two distinct UEs — with
     // distinct `enb_ue_s1ap_id` values — still yield two contexts.
     let mut mme_by_enb: BTreeMap<(String, Option<String>), BTreeSet<String>> = BTreeMap::new();
-    for event in lte.iter().filter(|event| event.protocol == "S1AP") {
+    for event in lte.iter().filter(|event| protocol_is(event, "S1AP")) {
         let enb = event.first_identifier("enb_ue_s1ap_id").map(str::to_owned);
         let mme = event.first_identifier("mme_ue_s1ap_id").map(str::to_owned);
         if enb.is_none() && mme.is_none() {
@@ -928,7 +935,7 @@ fn compact_publication_event(event: &mut EventRecord) {
         .identifiers
         .retain(|(name, _)| STABLE_IDENTIFIERS.contains(&name.as_str()));
     event.identifiers.sort();
-    if matches!(event.protocol.as_str(), "PFCP" | "NGAP") {
+    if protocol_is_any(event, &["PFCP", "NGAP"]) {
         if let Some(items) = event.information_elements.as_array_mut() {
             items.retain(|item| {
                 let name = item
@@ -1041,7 +1048,7 @@ pub fn load_jsonl_slim<R: BufRead>(reader: R) -> Result<Vec<EventRecord>, String
             .map_err(|e| format!("line {}: invalid JSON: {e}", line_no + 1))?;
         let mut event =
             parse_event(value).map_err(|e| format!("line {}: {e}", line_no + 1))?;
-        if !matches!(event.protocol.as_str(), "PFCP" | "NGAP") {
+        if !protocol_is_any(&event, &["PFCP", "NGAP"]) {
             event.information_elements = Value::Array(Vec::new());
         }
         events.push(event);
@@ -1186,7 +1193,7 @@ pub fn reconstruct(mut events: Vec<EventRecord>, hints: ReconstructionHints) -> 
     let duplicate_event_ids = duplicate_ids(&events);
     let pdu_anchor = events
         .iter()
-        .find(|e| e.protocol == "NGAP" && e.message_name.contains("PDUSessionResourceSetup"));
+        .find(|e| protocol_is(e, "NGAP") && e.message_name.contains("PDUSessionResourceSetup"));
     let ran = pdu_anchor
         .and_then(|e| e.first_identifier("ran_ue_ngap_id"))
         .map(ToOwned::to_owned);
@@ -1206,7 +1213,7 @@ pub fn reconstruct(mut events: Vec<EventRecord>, hints: ReconstructionHints) -> 
     let mut pfcp_sequences = BTreeSet::new();
     let mut seids = BTreeSet::new();
     for e in &events {
-        if e.protocol == "PFCP"
+        if protocol_is(e, "PFCP")
             && (e.message_name.contains("Session Establishment")
                 || e.message_name.contains("Session Modification"))
         {
@@ -1225,8 +1232,7 @@ pub fn reconstruct(mut events: Vec<EventRecord>, hints: ReconstructionHints) -> 
     let teid_records = collect_pfcp_tunnels(&events);
     let mut association = BTreeMap::new();
     for e in &events {
-        let value = match e.protocol.as_str() {
-            "NGAP" => {
+        let value = if protocol_is(e, "NGAP") {
                 let same_ran = ran
                     .as_deref()
                     .map(|x| e.identifier_values("ran_ue_ngap_id").contains(&x))
@@ -1240,8 +1246,7 @@ pub fn reconstruct(mut events: Vec<EventRecord>, hints: ReconstructionHints) -> 
                 } else {
                     Association::Background
                 }
-            }
-            "PFCP" => {
+            } else if protocol_is(e, "PFCP") {
                 let session_message = e.message_name.contains("Session Establishment")
                     || e.message_name.contains("Session Modification")
                     || e.message_name.contains("Session Deletion");
@@ -1258,8 +1263,7 @@ pub fn reconstruct(mut events: Vec<EventRecord>, hints: ReconstructionHints) -> 
                 } else {
                     Association::Background
                 }
-            }
-            "GTP-U" => {
+            } else if protocol_is(e, "GTP-U") {
                 let teid = e.first_identifier("teid");
                 if teid_records.iter().any(|(t, endpoint)| {
                     Some(t.as_str()) == teid
@@ -1271,8 +1275,8 @@ pub fn reconstruct(mut events: Vec<EventRecord>, hints: ReconstructionHints) -> 
                 } else {
                     Association::Unmatched
                 }
-            }
-            _ => Association::Unmatched,
+            } else {
+                Association::Unmatched
         };
         association.insert(e.event_id.clone(), value);
     }
@@ -1281,7 +1285,7 @@ pub fn reconstruct(mut events: Vec<EventRecord>, hints: ReconstructionHints) -> 
     for (teid, endpoint) in teid_records {
         let matching: Vec<_> = events
             .iter()
-            .filter(|e| e.protocol == "GTP-U" && e.first_identifier("teid") == Some(&teid))
+            .filter(|e| protocol_is(e, "GTP-U") && e.first_identifier("teid") == Some(&teid))
             .collect();
         if matching.is_empty() {
             continue;
@@ -1390,7 +1394,7 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
     let mut event_context: BTreeMap<String, String> = BTreeMap::new();
     let mut generations: BTreeMap<String, u32> = BTreeMap::new();
 
-    for event in events.iter().filter(|event| event.protocol == "NGAP") {
+    for event in events.iter().filter(|event| protocol_is(event, "NGAP")) {
         let ran = event.first_identifier("ran_ue_ngap_id").map(str::to_owned);
         let amf = event.first_identifier("amf_ue_ngap_id").map(str::to_owned);
         if ran.is_none() && amf.is_none() {
@@ -1459,7 +1463,7 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
     // Iterate to resolve a nested 5GSM child whose direct parent is a 5GMM event.
     let mut unresolved_nas = events
         .iter()
-        .filter(|event| matches!(event.protocol.as_str(), "NAS-5GMM" | "NAS-5GSM"))
+        .filter(|event| protocol_is_any(event, &["NAS-5GMM", "NAS-5GSM"]))
         .collect::<Vec<_>>();
     loop {
         let before = unresolved_nas.len();
@@ -1736,7 +1740,7 @@ fn attach_sbi_to_sessions(
         }
     }
 
-    for event in events.iter().filter(|event| event.protocol == "SBI-HTTP2") {
+    for event in events.iter().filter(|event| protocol_is(event, "SBI-HTTP2")) {
         if event_context.contains_key(&event.event_id) {
             continue;
         }
@@ -1854,17 +1858,17 @@ fn discover_procedures(
     let mut groups: BTreeMap<&str, Vec<&EventRecord>> = BTreeMap::new();
     let nas_parents = events
         .iter()
-        .filter(|event| event.protocol.starts_with("NAS-5G"))
+        .filter(|event| protocol_starts_with(event, "NAS-5G"))
         .filter_map(|event| event.parent_event_id.as_deref())
         .collect::<BTreeSet<_>>();
     for event in events {
-        if event.protocol == "NGAP"
+        if protocol_is(event, "NGAP")
             && nas_parents.contains(event.event_id.as_str())
             && (event.message_name.contains("NAS") || event.message_name.contains("InitialUE"))
         {
             continue;
         }
-        let kind = if event.protocol.starts_with("NAS-5G") {
+        let kind = if protocol_starts_with(event, "NAS-5G") {
             event
                 .source_json
                 .get("procedure")
@@ -2014,7 +2018,7 @@ fn discover_pfcp_sessions(events: &[EventRecord]) -> Vec<DiscoveredPfcpSession> 
 
     let mut ordered = events
         .iter()
-        .filter(|event| event.protocol == "PFCP" && event.message_name.contains("Session"))
+        .filter(|event| protocol_is(event, "PFCP") && event.message_name.contains("Session"))
         .collect::<Vec<_>>();
     // 2.7.13: canonical (capture_id, seq, event_id) — PFCP session
     // reconstruction stays deterministic without a cross-capture ts
@@ -2123,7 +2127,7 @@ fn discover_gtpu_tunnels(
     pfcp_sessions: &[DiscoveredPfcpSession],
 ) -> Vec<DiscoveredGtpuTunnel> {
     let mut groups: BTreeMap<String, Vec<&EventRecord>> = BTreeMap::new();
-    for event in events.iter().filter(|event| event.protocol == "GTP-U") {
+    for event in events.iter().filter(|event| protocol_is(event, "GTP-U")) {
         let Some(teid) = event.first_identifier("teid") else {
             continue;
         };
@@ -2235,7 +2239,7 @@ fn stable_id(prefix: &str, value: &str) -> String {
 
 fn collect_pfcp_tunnels(events: &[EventRecord]) -> Vec<(String, Option<String>)> {
     let mut result = BTreeSet::new();
-    for e in events.iter().filter(|e| e.protocol == "PFCP") {
+    for e in events.iter().filter(|e| protocol_is(e, "PFCP")) {
         if let Some(items) = e.information_elements.as_array() {
             for item in items {
                 let Some(value) = item.get("value").and_then(Value::as_str) else {
