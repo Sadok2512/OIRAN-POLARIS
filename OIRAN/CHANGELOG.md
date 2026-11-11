@@ -1,5 +1,16 @@
 # Changelog
 
+## OIRAN API 2.11.14 — 2026-11-11 — publication continue par shards immuables
+
+- Cause de l’arrêt observé en 2.11.13 : le lot courant était bien limité à deux segments, mais la phase de fusion recopiait encore les 3,4 Go de `oiran_events.jsonl` dans `.dataset-next` avant toute publication. Le coût d’écriture restait donc proportionnel à tout l’historique.
+- Le dataset continu est désormais une suite de shards JSONL immuables décrits dans `dataset_manifest.json` par chemin relatif, checksum SHA-256, taille et nombre d’événements. Chaque cycle écrit uniquement le shard du lot courant. Les shards antérieurs sont réutilisés par liens physiques pendant le swap atomique ; aucun de leurs octets n’est réécrit.
+- La migration du dataset historique inscrit le monolithe existant comme shard 0, sans modifier son inode ni son contenu. Le manifeste est le dernier fichier remplacé au commit.
+- `session-engine` charge plusieurs shards en flux et trie les représentants par l’ordre canonique `(capture_id, packet_number, event_id)`. L’API sait également ouvrir un dataset shardé. Les sessions globales sont recalculées depuis les flux de shards ; les callflows historiques non affectés restent réutilisés.
+- `CONTINUOUS_CYCLE` expose `bytes_written`, égal aux octets du nouveau shard. `/api/v1/metrics` expose toujours `closed_not_ingested_segments`, défini comme les segments fermés par présence d’un successeur sur la même interface et absents de `import_state`.
+- Le test de trois publications vérifie trois shards, l’invariance des checksums précédents et l’égalité des sessions/événements avec une publication complète des mêmes données.
+- Versions : `oiran-api` et web 2.11.14, `live-probe` 0.5.8, `session-engine` 0.5.11. Décodeurs et moteur de corrélation inchangés.
+- Gate manuel : tests Rust concernés puis `cargo build --release --locked`. La recette à l’échelle reste exécutée par ANR2 avant déploiement selon `docs/OIRAN_2_11_14_SHARDED_SCALE_GATE.md`.
+
 ## OIRAN API 2.11.13 — 2026-11-11 — reprise continue après publication
 
 - Cause des ~30 minutes avant `00a` : `live-probe::process_capture_into` redécodait tous les PCAP possédés à chaque cycle avant de fusionner le JSONL historique. Avec 5 636 segments déjà importés, ce travail était linéaire dans tout l'historique et précédait la première trace de publication.

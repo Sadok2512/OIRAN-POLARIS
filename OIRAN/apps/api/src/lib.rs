@@ -24,6 +24,7 @@ use dataset_registry::{CaptureRecord, DatasetRecord, DatasetRegistry};
 use disk_safety::{assess, capture_budget, measure_path, rotation_plan, Policy};
 use event_schema::sha256_hex;
 use live_probe::{
+    load_dataset_events,
     lte_evidence::{
         LteDatasetManifest, LteEvidenceError, LteEvidenceImportPayload, LteEvidenceStore,
     },
@@ -35,7 +36,7 @@ use probe_registry::{CreateError as ProbeCreateError, ProbeInput, ProbeRecord, P
 use serde::Deserialize;
 use serde_json::{json, Value};
 use session_engine::{
-    discover_sessions, load_path, reconstruct, Association, DiscoveryResult, LteSession,
+    discover_sessions, reconstruct, Association, DiscoveryResult, LteSession,
     ReconstructionHints,
 };
 use std::{
@@ -311,7 +312,7 @@ impl AppState {
                 flow_values.insert(candidate.session_id, candidate_value);
             }
         }
-        let events = load_path(&dataset_dir.join("oiran_events.jsonl"))?;
+        let events = load_dataset_events(&dataset_dir)?;
         let discovery = discover_sessions(&mut events.clone());
         for session in &discovery.pdu_sessions {
             let represented = flows.values().any(|flow| {
@@ -1077,6 +1078,7 @@ async fn metrics(State(state): State<AppState>) -> Json<Value> {
         // laisse `null` quand le job n'a pas encore produit de
         // sample. Le patch 2.11.1 unwrap toujours vers `0` / `[]`.
         "pending_segments":latest_metrics.map(|m|m.pending_segments).unwrap_or(0),
+        "closed_not_ingested_segments":latest_metrics.map(|m|m.closed_not_ingested_segments).unwrap_or(0),
         "pending_fingerprints":latest_metrics.map(|m|m.pending_fingerprints).unwrap_or(0),
         "pending_stability_segments":latest_metrics.map(|m|m.pending_stability_segments).unwrap_or(0),
         "pending_batch_segments":latest_metrics.map(|m|m.pending_batch_segments).unwrap_or(0),
@@ -5399,6 +5401,7 @@ mod tests {
         assert_eq!(value["data"]["active_captures"], 0);
         assert_eq!(value["data"]["active_sessions"], 0);
         assert!(value["data"]["packet_rate_pps"].is_null());
+        assert_eq!(value["data"]["closed_not_ingested_segments"], 0);
         // 2.7.18: `historical_events` is the per-flow accounting sum, 76 in
         // the regenerated dataset. 64 is the on-wire event count.
         assert_eq!(value["data"]["historical_events"], 76);

@@ -880,29 +880,46 @@ pub fn load_path_streaming_representatives(
 /// publier une trace RSS/progression sans modifier l'ordre canonique.
 pub fn load_path_streaming_representatives_with_progress<F>(
     path: &std::path::Path,
+    progress: F,
+) -> Result<StreamingRepresentativesIndex, String>
+where
+    F: FnMut(usize, usize),
+{
+    load_paths_streaming_representatives_with_progress(&[path.to_path_buf()], progress)
+}
+
+/// Stream an immutable-shard dataset without materialising or concatenating
+/// its JSONL files. Shards are visited in manifest order; representatives are
+/// finally sorted by the canonical event key, never by timestamp.
+pub fn load_paths_streaming_representatives_with_progress<F>(
+    paths: &[std::path::PathBuf],
     mut progress: F,
 ) -> Result<StreamingRepresentativesIndex, String>
 where
     F: FnMut(usize, usize),
 {
-    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let reader = io::BufReader::new(file);
     let mut representatives = BTreeMap::<String, EventRecord>::new();
     let mut source_event_count = 0usize;
-    for (line_no, line) in reader.lines().enumerate() {
-        let line = line.map_err(|e| format!("line {}: {e}", line_no + 1))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(&line)
-            .map_err(|e| format!("line {}: invalid JSON: {e}", line_no + 1))?;
-        let mut event = parse_event(value).map_err(|e| format!("line {}: {e}", line_no + 1))?;
-        source_event_count = source_event_count.saturating_add(1);
-        compact_publication_event(&mut event);
-        let key = publication_semantic_key(&event);
-        representatives.entry(key).or_insert(event);
-        if source_event_count % 100_000 == 0 {
-            progress(source_event_count, representatives.len());
+    for path in paths {
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let reader = io::BufReader::new(file);
+        for (line_no, line) in reader.lines().enumerate() {
+            let line = line.map_err(|e| format!("{} line {}: {e}", path.display(), line_no + 1))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).map_err(|e| {
+                format!("{} line {}: invalid JSON: {e}", path.display(), line_no + 1)
+            })?;
+            let mut event = parse_event(value)
+                .map_err(|e| format!("{} line {}: {e}", path.display(), line_no + 1))?;
+            source_event_count = source_event_count.saturating_add(1);
+            compact_publication_event(&mut event);
+            let key = publication_semantic_key(&event);
+            representatives.entry(key).or_insert(event);
+            if source_event_count % 100_000 == 0 {
+                progress(source_event_count, representatives.len());
+            }
         }
     }
     progress(source_event_count, representatives.len());

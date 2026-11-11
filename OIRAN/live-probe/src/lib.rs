@@ -73,6 +73,7 @@ struct ContinuousCycleTrace {
     publication_started: bool,
     publication_completed: bool,
     oldest_closed_epoch_ms: Option<u64>,
+    bytes_written: u64,
 }
 
 impl ContinuousCycleTrace {
@@ -87,6 +88,7 @@ impl ContinuousCycleTrace {
             publication_started: false,
             publication_completed: false,
             oldest_closed_epoch_ms: None,
+            bytes_written: 0,
         };
         eprintln!(
             "{}",
@@ -128,6 +130,7 @@ impl Drop for ContinuousCycleTrace {
                 "oldest_closed_epoch_ms": self.oldest_closed_epoch_ms,
                 "closed_segment_max_lag_ms": closed_segment_max_lag_ms,
                 "closed_segment_slo_met": closed_segment_slo_met,
+                "bytes_written": self.bytes_written,
             })
         );
     }
@@ -912,6 +915,10 @@ pub struct CaptureMetrics {
     pub segments_ingested: u64,
     #[serde(default)]
     pub pending_segments: u64,
+    /// Closed ring segments (a lexicographically newer successor exists on
+    /// the same interface) whose checksum is absent from import_state.
+    #[serde(default)]
+    pub closed_not_ingested_segments: u64,
     /// 2.9.8 (#9 comment 6725097122): segments whose SHA is cached but
     /// whose checksum is NOT in `state.seen_checksums` — i.e. a
     /// candidate observed by the latest scan that has not yet been
@@ -1092,6 +1099,18 @@ pub struct LiveDataset {
     /// décodeur produit au moins 1 event par segment ingéré.
     #[serde(default)]
     pub zero_event_captures: Vec<String>,
+    #[serde(default)]
+    pub event_shards: Vec<EventShard>,
+    #[serde(default)]
+    pub publication_bytes_written: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventShard {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub event_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2340,6 +2359,8 @@ impl CaptureManager {
             active_ue_ips: Vec::new(),
             active_pdu_contexts: Vec::new(),
             zero_event_captures: Vec::new(),
+            event_shards: Vec::new(),
+            publication_bytes_written: 0,
         };
         atomic_write(
             &dataset_dir.join("dataset_manifest.json"),
@@ -3103,6 +3124,22 @@ impl CaptureManager {
                 .map(|path| path.display().to_string())
                 .collect();
             open_paths.truncate(16);
+            let mut newest_by_interface = BTreeMap::<String, String>::new();
+            for candidate in &candidates {
+                let name = candidate.path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+                newest_by_interface
+                    .entry(candidate.interface.clone())
+                    .and_modify(|current| {
+                        if name > current.as_str() { *current = name.to_owned(); }
+                    })
+                    .or_insert_with(|| name.to_owned());
+            }
+            let closed_not_ingested = candidates.iter().filter(|candidate| {
+                if state.seen_checksums.contains(&candidate.checksum) { return false; }
+                let name = candidate.path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+                newest_by_interface.get(&candidate.interface)
+                    .is_some_and(|newest| newest.as_str() > name)
+            }).count() as u64;
             // Log structuré ligne unique par scan — ANR2 parse
             // directement via `journalctl -u oiran-api`.
             eprintln!(
@@ -3110,6 +3147,7 @@ impl CaptureManager {
                 serde_json::json!({
                     "event": "CONTINUOUS_PENDING_INVENTORY",
                     "pending_segments": pending,
+                    "closed_not_ingested_segments": closed_not_ingested,
                     "pending_paths": pending_paths,
                     "open_segments": open_count,
                     "open_paths": open_paths,
@@ -3117,6 +3155,7 @@ impl CaptureManager {
             );
             self.update(CONTINUOUS_CAPTURE_ID, |job| {
                 job.metrics.pending_segments = pending;
+                job.metrics.closed_not_ingested_segments = closed_not_ingested;
                 job.metrics.pending_fingerprints = pending;
                 job.metrics.open_segments = open_count;
                 job.metrics.open_segment_paths = open_paths.clone();
@@ -3487,6 +3526,8 @@ impl CaptureManager {
                             );
                             job.metrics.segments_ingested = state.seen_checksums.len() as u64;
                             job.metrics.pending_segments = 0;
+                            job.metrics.closed_not_ingested_segments = closed_not_ingested
+                                .saturating_sub(ingested_this_scan as u64);
                             // 2.9.8: keep the mirror field in lockstep
                             // with `pending_segments` so `/metrics`
                             // and `job.json` prove concordance by
@@ -3529,6 +3570,7 @@ impl CaptureManager {
                             job.error = None;
                         })?;
                         cycle_trace.publication_completed = true;
+                        cycle_trace.bytes_written = dataset.publication_bytes_written;
                         cycle_trace.segments_ingested = state.seen_checksums.len() as u64;
                         cycle_trace.pending = pending.saturating_sub(ingested_this_scan as u64);
                         published = true;
@@ -3999,8 +4041,14 @@ impl CaptureManager {
             }
         };
         let next_bytes = directory_size(&next);
+        let immutable_shard_bytes = dataset
+            .event_shards
+            .iter()
+            .map(|shard| shard.bytes)
+            .sum::<u64>();
+        let derived_bytes = next_bytes.saturating_sub(immutable_shard_bytes);
         let derived_limit = derived_output_hard_limit_bytes();
-        if next_bytes > derived_limit {
+        if derived_bytes > derived_limit {
             let _ = fs::remove_dir_all(&next);
             // 2.7.23: the in-publish merge (`process_capture_into`)
             // applied the age-based retention at
@@ -4016,7 +4064,7 @@ impl CaptureManager {
                 .map(|days| days.to_string())
                 .unwrap_or_else(|| "disabled".to_string());
             return Err(format!(
-                "CONTINUOUS_DERIVED_OUTPUT_LIMIT: derived output {next_bytes} B exceeds \
+                "CONTINUOUS_DERIVED_OUTPUT_LIMIT: derived output {derived_bytes} B exceeds \
                  OIRAN_CONTINUOUS_DERIVED_OUTPUT_MAX_BYTES={derived_limit} B after \
                  age-based retention (OIRAN_DATASET_RETENTION_DAYS={retention_label}); \
                  shorten the retention window or raise the limit",
@@ -4165,6 +4213,9 @@ impl CaptureManager {
             BTreeMap::new(),
             BTreeMap::new(),
             Vec::new(),
+            None,
+            Vec::new(),
+            0,
         )?;
         // Atomic swap next ↔ current via previous.
         if previous.exists() {
@@ -5082,6 +5133,9 @@ impl CaptureManager {
             BTreeMap::new(),
             BTreeMap::new(),
             Vec::new(),
+            None,
+            Vec::new(),
+            0,
         )?;
         if previous.exists() {
             fs::remove_dir_all(&previous).map_err(display_error)?;
@@ -5174,6 +5228,10 @@ impl CaptureManager {
         } else {
             None
         };
+        let prior_capture_checksums = prior_continuous
+            .as_ref()
+            .map(|(_, dataset)| dataset.checksums.values().cloned().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
         prepare_dataset_directory(dataset_dir)?;
         let events_path = dataset_dir.join("oiran_events.jsonl");
         let decoded_spool_path = dataset_dir.join(".decoded-events.spool");
@@ -5207,6 +5265,11 @@ impl CaptureManager {
                 // Streaming SHA-256; the decoder re-reads from the file path
                 // on its own, so we do not need to keep the bytes in memory.
                 let checksum = sha256_hex_file(&path)?;
+                if capture_id == CONTINUOUS_CAPTURE_ID
+                    && prior_capture_checksums.contains(&checksum)
+                {
+                    continue;
+                }
                 let capture_hash = format!("sha256:{checksum}");
                 // 2.11.5: all GTP-U user planes use the same bounded flow
                 // aggregation. Restricting this to N3 left S1-U/S5-U as
@@ -5313,59 +5376,66 @@ impl CaptureManager {
         decoded_spool.flush().map_err(display_error)?;
         decoded_spool.get_ref().sync_all().map_err(display_error)?;
         drop(decoded_spool);
-        // 2.9.18-fu3 (ANR2 #9 comment 6750859966) : `seen_ids`
-        // persiste sur disque sous `.dataset-next/.merge-staging/ids/`
-        // via `SpillingEventIdSet` — au plus 1,5 MiB en RAM, le
-        // reste en chunks triés u64 relus en binary search.
-        let merge_staging = dataset_dir.join(".merge-staging").join("ids");
-        let mut seen_ids = SpillingEventIdSet::new(
-            &merge_staging,
-            event_id_set_mem_cap(),
-        )
-        .map_err(display_error)?;
+        let mut event_shards = Vec::new();
+        let mut publication_bytes_written = 0u64;
         if capture_id == CONTINUOUS_CAPTURE_ID {
-            // 2.7.23: streaming merge, write directly to tmp.
-            // 2.7.27: NO retention / purge during merge. Every event
-            // passes through — the published dataset is never
-            // filtered. Capture-level archive (which NEVER deletes)
-            // runs after the rename below.
-            let tmp_path = events_path.with_extension("jsonl.tmp");
-            let mut writer = BufWriter::with_capacity(
-                STREAM_CHUNK_BYTES,
-                fs::File::create(&tmp_path).map_err(display_error)?,
-            );
-            if let Some((prior_dir, _)) = &prior_continuous {
-                let prior_events_file = fs::File::open(prior_dir.join("oiran_events.jsonl"))
-                    .map_err(display_error)?;
-                let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, prior_events_file);
-                merge_event_stream(reader, &mut writer, &mut seen_ids)?;
+            // Immutable append-only shards. Existing files are hard-linked
+            // into the atomic staging tree, never copied or rewritten.
+            if let Some((prior_dir, prior)) = &prior_continuous {
+                event_shards = if prior.event_shards.is_empty() {
+                    let path = prior_dir.join("oiran_events.jsonl");
+                    vec![EventShard {
+                        path: "oiran_events.jsonl".into(),
+                        sha256: sha256_hex_file(&path)?,
+                        bytes: fs::metadata(&path).map_err(display_error)?.len(),
+                        event_count: prior.event_count,
+                    }]
+                } else {
+                    prior.event_shards.clone()
+                };
+                for shard in &event_shards {
+                    let source = prior_dir.join(&shard.path);
+                    let target = dataset_dir.join(&shard.path);
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent).map_err(display_error)?;
+                    }
+                    fs::hard_link(&source, &target).map_err(|error| {
+                        format!("CONTINUOUS_SHARD_LINK {}: {error}", source.display())
+                    })?;
+                }
             }
-            let decoded_reader = BufReader::with_capacity(
-                STREAM_CHUNK_BYTES,
-                fs::File::open(&decoded_spool_path).map_err(display_error)?,
-            );
-            merge_event_stream(decoded_reader, &mut writer, &mut seen_ids)?;
-            writer.flush().map_err(display_error)?;
-            writer.get_ref().sync_all().map_err(display_error)?;
-            drop(writer);
-            fs::rename(&tmp_path, &events_path).map_err(display_error)?;
-            // Log opérateur : empreinte mémoire du set.
-            eprintln!(
-                "CONTINUOUS_IMPORT_SEEN_IDS phase=after-merge total_unique={} chunks={} flushes={} mem_entries={}",
-                seen_ids.len_hint(),
-                seen_ids.chunk_count(),
-                seen_ids.flush_count(),
-                seen_ids.mem_len(),
-            );
+            let shard_dir = dataset_dir.join("event-shards");
+            fs::create_dir_all(&shard_dir).map_err(display_error)?;
+            let shard_index = event_shards.len();
+            let shard_sha = sha256_hex_file(&decoded_spool_path)?;
+            let shard_name = format!("event-shards/shard-{shard_index:020}-{}.jsonl", &shard_sha[..16]);
+            let shard_path = dataset_dir.join(&shard_name);
+            fs::rename(&decoded_spool_path, &shard_path).map_err(display_error)?;
+            let shard_bytes = fs::metadata(&shard_path).map_err(display_error)?.len();
+            let shard_events = count_valid_event_records(&shard_path)?;
+            let shard_appended = shard_bytes != 0 || event_shards.is_empty();
+            if !shard_appended {
+                fs::remove_file(&shard_path).map_err(display_error)?;
+            } else {
+                event_shards.push(EventShard {
+                    path: shard_name,
+                    sha256: shard_sha,
+                    bytes: shard_bytes,
+                    event_count: shard_events,
+                });
+                publication_bytes_written = shard_bytes;
+            }
+            eprintln!("{}", serde_json::json!({
+                "event": "CONTINUOUS_SHARD_COMMITTED",
+                "shard_index": shard_index,
+                "bytes_written": shard_bytes,
+                "event_count": shard_events,
+                "historical_shards_reused": shard_index,
+                "shard_appended": shard_appended,
+            }));
         } else {
             fs::rename(&decoded_spool_path, &events_path).map_err(display_error)?;
         }
-        // Le set n'est plus nécessaire à partir d'ici ; son `Drop`
-        // supprime chunks + répertoire `.merge-staging/ids/`. On le
-        // relâche explicitement avant la publication pour rendre la
-        // RAM mesurable et déterministe.
-        drop(seen_ids);
-        let _ = fs::remove_dir(dataset_dir.join(".merge-staging"));
         // 2.7.27 (issue #10, ANR2): capture-level age retention. Runs
         // ONLY when `OIRAN_DATASET_RETENTION_DAYS` is explicitly set to
         // a positive value. Moves whole captures (never slices inside)
@@ -5383,6 +5453,9 @@ impl CaptureManager {
         if decoded_spool_path.exists() {
             fs::remove_file(&decoded_spool_path).map_err(display_error)?;
         }
+        let event_paths = (!event_shards.is_empty()).then(|| {
+            event_shards.iter().map(|shard| dataset_dir.join(&shard.path)).collect::<Vec<_>>()
+        });
         self.publish_events_to_dataset_dir(
             capture_id,
             dataset_id,
@@ -5392,6 +5465,9 @@ impl CaptureManager {
             reports,
             checksums,
             zero_event_captures,
+            event_paths.as_deref(),
+            event_shards,
+            publication_bytes_written,
         )
     }
 
@@ -5414,8 +5490,14 @@ impl CaptureManager {
         mut reports: BTreeMap<String, DecodeReport>,
         mut checksums: BTreeMap<String, String>,
         zero_event_captures: Vec<String>,
+        event_paths: Option<&[PathBuf]>,
+        event_shards: Vec<EventShard>,
+        publication_bytes_written: u64,
     ) -> Result<LiveDataset, String> {
         let events_path = dataset_dir.join("oiran_events.jsonl");
+        let event_paths = event_paths
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| vec![events_path.clone()]);
         trace_publication_rss_reset();
         trace_publication_rss("00a-before-heap-release", None);
         release_unused_heap_pages();
@@ -5435,8 +5517,8 @@ impl CaptureManager {
         // Quand la rétention est active, la passe est conservée
         // (archive_stale_captures peut supprimer des captures
         // entières du hot view).
-        let index = session_engine::load_path_streaming_representatives_with_progress(
-            &events_path,
+        let index = session_engine::load_paths_streaming_representatives_with_progress(
+            &event_paths,
             |scanned_events, retained_events| {
                 trace_publication_rss_progress(
                     "00c-streaming-representatives",
@@ -5455,21 +5537,19 @@ impl CaptureManager {
         )
         .map_err(display_error)?;
         if retention_active {
-            let file = fs::File::open(&events_path).map_err(display_error)?;
-            let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
-            for line in reader.lines() {
-                let line = line.map_err(display_error)?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let value: serde_json::Value = match serde_json::from_str(&line) {
-                    Ok(value) => value,
-                    Err(_) => continue,
-                };
-                if let Some(event_id) = value.get("event_id").and_then(serde_json::Value::as_str) {
-                    retained_event_ids
-                        .insert(event_id)
-                        .map_err(display_error)?;
+            for event_path in &event_paths {
+                let file = fs::File::open(event_path).map_err(display_error)?;
+                let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
+                for line in reader.lines() {
+                    let line = line.map_err(display_error)?;
+                    if line.trim().is_empty() { continue; }
+                    let value: serde_json::Value = match serde_json::from_str(&line) {
+                        Ok(value) => value,
+                        Err(_) => continue,
+                    };
+                    if let Some(event_id) = value.get("event_id").and_then(serde_json::Value::as_str) {
+                        retained_event_ids.insert(event_id).map_err(display_error)?;
+                    }
                 }
             }
         }
@@ -5666,29 +5746,23 @@ impl CaptureManager {
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(display_error)?;
-                let file = fs::File::open(&events_path).map_err(display_error)?;
-                let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
-                for line in reader.lines() {
-                    let line = line.map_err(display_error)?;
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    #[derive(serde::Deserialize)]
-                    struct IdOnly<'a> {
-                        event_id: &'a str,
-                    }
-                    let id_only: IdOnly = match serde_json::from_str(&line) {
-                        Ok(value) => value,
-                        Err(_) => continue,
-                    };
-                    for (idx, entry) in entries.iter().enumerate() {
-                        if entry.ids.contains(id_only.event_id).map_err(display_error)? {
-                            scratch_writers[idx]
-                                .write_all(line.as_bytes())
-                                .map_err(display_error)?;
-                            scratch_writers[idx]
-                                .write_all(b"\n")
-                                .map_err(display_error)?;
+                for event_path in &event_paths {
+                    let file = fs::File::open(event_path).map_err(display_error)?;
+                    let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
+                    for line in reader.lines() {
+                        let line = line.map_err(display_error)?;
+                        if line.trim().is_empty() { continue; }
+                        #[derive(serde::Deserialize)]
+                        struct IdOnly<'a> { event_id: &'a str }
+                        let id_only: IdOnly = match serde_json::from_str(&line) {
+                            Ok(value) => value,
+                            Err(_) => continue,
+                        };
+                        for (idx, entry) in entries.iter().enumerate() {
+                            if entry.ids.contains(id_only.event_id).map_err(display_error)? {
+                                scratch_writers[idx].write_all(line.as_bytes()).map_err(display_error)?;
+                                scratch_writers[idx].write_all(b"\n").map_err(display_error)?;
+                            }
                         }
                     }
                 }
@@ -5916,6 +5990,8 @@ impl CaptureManager {
             active_ue_ips,
             active_pdu_contexts,
             zero_event_captures,
+            event_shards,
+            publication_bytes_written,
         };
         trace_publication_rss("11-after-callflows-loop", None);
         atomic_write(
@@ -6430,11 +6506,35 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 fn validate_dataset_artifacts(dataset: &LiveDataset, dataset_dir: &Path) -> Result<(), String> {
     let events_path = dataset_dir.join("oiran_events.jsonl");
     let manifest_path = dataset_dir.join("dataset_manifest.json");
-    if !events_path.is_file() || !manifest_path.is_file() || !dataset_dir.join("callflows").is_dir()
-    {
+    if !manifest_path.is_file() || !dataset_dir.join("callflows").is_dir() {
         return Err("DATASET_REGISTRATION_ARTIFACT_MISSING".into());
     }
-    let event_count = count_valid_event_records(&events_path)?;
+    let event_count = if dataset.event_shards.is_empty() {
+        if !events_path.is_file() {
+            return Err("DATASET_REGISTRATION_ARTIFACT_MISSING".into());
+        }
+        if dataset.capture_id == CONTINUOUS_CAPTURE_ID {
+            dataset.event_count
+        } else {
+            count_valid_event_records(&events_path)?
+        }
+    } else {
+        let mut count = 0usize;
+        for shard in &dataset.event_shards {
+            let relative = Path::new(&shard.path);
+            if relative.is_absolute()
+                || relative.components().any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err("DATASET_SHARD_PATH_INVALID".into());
+            }
+            let metadata = fs::metadata(dataset_dir.join(relative)).map_err(display_error)?;
+            if !metadata.is_file() || metadata.len() != shard.bytes {
+                return Err("DATASET_SHARD_SIZE_MISMATCH".into());
+            }
+            count = count.saturating_add(shard.event_count);
+        }
+        count
+    };
     if event_count != dataset.event_count {
         return Err("DATASET_REGISTRATION_EVENT_COUNT_MISMATCH".into());
     }
@@ -6445,6 +6545,7 @@ fn validate_dataset_artifacts(dataset: &LiveDataset, dataset_dir: &Path) -> Resu
         || persisted.capture_id != dataset.capture_id
         || persisted.event_count != dataset.event_count
         || persisted.checksums != dataset.checksums
+        || persisted.event_shards != dataset.event_shards
     {
         return Err("DATASET_REGISTRATION_MANIFEST_MISMATCH".into());
     }
@@ -6462,6 +6563,28 @@ fn validate_dataset_artifacts(dataset: &LiveDataset, dataset_dir: &Path) -> Resu
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// Bounded/reference reader for API startup. Continuous publication uses the
+/// streaming multi-shard loader and never concatenates these files.
+pub fn load_dataset_events(dataset_dir: &Path) -> Result<Vec<EventRecord>, String> {
+    let manifest_path = dataset_dir.join("dataset_manifest.json");
+    if !manifest_path.is_file() {
+        return load_path(&dataset_dir.join("oiran_events.jsonl"));
+    }
+    let dataset: LiveDataset = serde_json::from_slice(
+        &fs::read(&manifest_path).map_err(display_error)?,
+    ).map_err(|error| error.to_string())?;
+    let paths = if dataset.event_shards.is_empty() {
+        vec![dataset_dir.join("oiran_events.jsonl")]
+    } else {
+        dataset.event_shards.iter().map(|shard| dataset_dir.join(&shard.path)).collect()
+    };
+    let mut events = Vec::new();
+    for path in paths { events.extend(load_path(&path)?); }
+    session_engine::deterministic_sort(&mut events);
+    events.dedup_by(|left, right| left.event_id == right.event_id);
+    Ok(events)
 }
 
 /// Validate a persisted event artifact without rebuilding the complete
@@ -11795,6 +11918,8 @@ mod tests {
                     .collect(),
                 active_pdu_contexts: contexts,
                 zero_event_captures: Vec::new(),
+                event_shards: Vec::new(),
+                publication_bytes_written: 0,
             },
         );
         manager.jobs.lock().unwrap().insert(
@@ -11921,7 +12046,7 @@ mod tests {
             .process_continuous_capture(&base, &interface_specs(), 128 * 1024 * 1024)
             .unwrap();
         let first_event_ids: BTreeSet<String> =
-            load_path(&base.join("dataset/oiran_events.jsonl"))
+            load_dataset_events(&base.join("dataset"))
                 .unwrap()
                 .into_iter()
                 .map(|event| event.event_id)
@@ -11955,7 +12080,7 @@ mod tests {
             .process_continuous_capture(&base, &interface_specs(), 128 * 1024 * 1024)
             .unwrap();
         let second_event_ids: BTreeSet<String> =
-            load_path(&base.join("dataset/oiran_events.jsonl"))
+            load_dataset_events(&base.join("dataset"))
                 .unwrap()
                 .into_iter()
                 .map(|event| event.event_id)
@@ -11973,6 +12098,58 @@ mod tests {
             second_event_ids.len()
         );
         assert!(second.event_count >= first.event_count);
+    }
+
+    #[test]
+    fn three_incremental_cycles_append_three_immutable_shards() {
+        let root = temporary_root("three-immutable-shards");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(), false, root.join(".oiran-pseudonym.key"),
+        ).unwrap();
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let mut prior_hashes = BTreeMap::<String, String>::new();
+        let mut incremental = None;
+        for (cycle, interface) in ["N2", "N3", "N4"].into_iter().enumerate() {
+            let path = base.join("pcap").join(format!("{interface}.pcap-cycle-{cycle}.pcapng"));
+            fs::copy(fixture.join(format!("{interface}.pcapng")), &path).unwrap();
+            incremental = Some(manager.process_continuous_capture_selected(
+                &base, &interface_specs(), 128 * 1024 * 1024, &BTreeSet::from([path]),
+            ).unwrap());
+            let manifest: LiveDataset = serde_json::from_slice(
+                &fs::read(base.join("dataset/dataset_manifest.json")).unwrap(),
+            ).unwrap();
+            assert_eq!(manifest.event_shards.len(), cycle + 1);
+            for shard in manifest.event_shards.iter().take(cycle) {
+                let actual = sha256_hex_file(&base.join("dataset").join(&shard.path)).unwrap();
+                assert_eq!(prior_hashes.get(&shard.path), Some(&actual));
+            }
+            prior_hashes = manifest.event_shards.iter()
+                .map(|shard| (shard.path.clone(), shard.sha256.clone())).collect();
+        }
+
+        let full_root = temporary_root("three-immutable-shards-full");
+        let full_manager = CaptureManager::with_pseudonym_key_path(
+            full_root.clone(), false, root.join(".oiran-pseudonym.key"),
+        ).unwrap();
+        let full_base = full_root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(full_base.join("pcap")).unwrap();
+        for (cycle, interface) in ["N2", "N3", "N4"].into_iter().enumerate() {
+            let source = base.join("pcap").join(format!("{interface}.pcap-cycle-{cycle}.pcapng"));
+            fs::copy(&source, full_base.join("pcap").join(source.file_name().unwrap())).unwrap();
+        }
+        let full = full_manager.process_continuous_capture(
+            &full_base, &interface_specs(), 128 * 1024 * 1024,
+        ).unwrap();
+        let incremental = incremental.unwrap();
+        assert_eq!(incremental.session_ids, full.session_ids);
+        let incremental_ids = load_dataset_events(&base.join("dataset")).unwrap()
+            .into_iter().map(|event| event.event_id).collect::<BTreeSet<_>>();
+        let full_ids = load_dataset_events(&full_base.join("dataset")).unwrap()
+            .into_iter().map(|event| event.event_id).collect::<BTreeSet<_>>();
+        assert_eq!(incremental_ids, full_ids);
     }
 
     /// 2.7.22: age-based retention
@@ -12148,7 +12325,8 @@ mod tests {
             .process_continuous_capture(&base, &interface_specs(), 1024 * 1024 * 1024)
             .unwrap();
         assert!(dataset.event_count > 0);
-        assert!(base.join("dataset/oiran_events.jsonl").is_file());
+        assert_eq!(dataset.event_shards.len(), 1);
+        assert!(base.join("dataset").join(&dataset.event_shards[0].path).is_file());
         assert!(base.join("dataset/dataset_manifest.json").is_file());
     }
 
@@ -12276,7 +12454,7 @@ mod tests {
         )
         .unwrap();
         validate_dataset_artifacts(&checkpoint, &base.join("dataset")).unwrap();
-        let checkpoint_events = load_path(&base.join("dataset/oiran_events.jsonl")).unwrap();
+        let checkpoint_events = load_dataset_events(&base.join("dataset")).unwrap();
         let checkpoint_event_ids = checkpoint_events
             .iter()
             .map(|event| event.event_id.clone())
@@ -12307,7 +12485,7 @@ mod tests {
             .unwrap();
         assert_eq!(extended.session_ids.len(), 5);
         assert!(extended.event_count > checkpoint.event_count);
-        let extended_events = load_path(&base.join("dataset/oiran_events.jsonl")).unwrap();
+        let extended_events = load_dataset_events(&base.join("dataset")).unwrap();
         assert_eq!(
             extended_events
                 .iter()
@@ -12324,7 +12502,10 @@ mod tests {
         assert_eq!(idempotent.event_count, extended.event_count);
         assert_eq!(idempotent.session_ids, extended.session_ids);
 
-        let events_before = fs::read(base.join("dataset/oiran_events.jsonl")).unwrap();
+        let events_before = extended.event_shards.iter().map(|shard| {
+            let path = base.join("dataset").join(&shard.path);
+            (path.clone(), sha256_hex_file(&path).unwrap())
+        }).collect::<Vec<_>>();
         atomic_write(&base.join("dataset/dataset_manifest.json"), b"{}").unwrap();
         assert_eq!(
             restarted
@@ -12333,7 +12514,9 @@ mod tests {
             "CONTINUOUS_CHECKPOINT_MANIFEST_INVALID"
         );
         assert_eq!(
-            fs::read(base.join("dataset/oiran_events.jsonl")).unwrap(),
+            events_before.iter().map(|(path, _)| {
+                (path.clone(), sha256_hex_file(path).unwrap())
+            }).collect::<Vec<_>>(),
             events_before,
             "an invalid checkpoint must fail closed without replacing evidence"
         );
@@ -13604,6 +13787,8 @@ mod tests {
             active_ue_ips: Vec::new(),
             active_pdu_contexts: Vec::new(),
             zero_event_captures: Vec::new(),
+            event_shards: Vec::new(),
+            publication_bytes_written: 0,
         };
         fs::write(source.join("dataset/oiran_events.jsonl"), b"").unwrap();
         fs::write(
@@ -16491,6 +16676,7 @@ mod tests {
         metrics.pending_fingerprints = 7;
         let json = serde_json::to_value(&metrics).unwrap();
         assert_eq!(json["pending_segments"], 7);
+        assert_eq!(json["closed_not_ingested_segments"], 0);
         assert_eq!(json["pending_fingerprints"], 7);
         assert_eq!(json["pending_stability_segments"], 0);
         assert_eq!(json["pending_batch_segments"], 0);
