@@ -400,6 +400,16 @@ pub fn correlate_lte_evidence(events: &[EventRecord]) -> Vec<CorrelationEdge> {
             .copied()
             .filter(|event| event.interface == "S1-MME" && protocol_is(event, "S1AP"))
             .collect::<Vec<_>>();
+        let radio_identity_events = session_events
+            .iter()
+            .copied()
+            .filter(|event| {
+                event.interface == "S1-MME"
+                    && (protocol_is(event, "S1AP")
+                        || protocol_is(event, "NAS-EPS-MM")
+                        || protocol_is(event, "NAS-EPS-SM"))
+            })
+            .collect::<Vec<_>>();
         let controls = session_events
             .iter()
             .copied()
@@ -504,7 +514,7 @@ pub fn correlate_lte_evidence(events: &[EventRecord]) -> Vec<CorrelationEdge> {
             &["subscriber_pseudonym"],
             "s11-s6a-subscriber-pseudonym",
         );
-        append_lte_bridge(&mut edges, &radios, &s6a, "S1-MME", "S6a", &["subscriber_pseudonym"], "s1mme-s6a-pseudonym");
+        append_lte_bridge(&mut edges, &radio_identity_events, &s6a, "S1-MME", "S6a", &["subscriber_pseudonym"], "s1mme-s6a-pseudonym");
     }
     edges.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
     edges
@@ -550,7 +560,12 @@ fn append_lte_bridge(
                     .iter()
                     .filter(|value| right_values.contains(value))
                 {
-                    exact.push((*source, *target, format!("{name}={value}")));
+                    let evidence = if *name == "subscriber_pseudonym" {
+                        (*name).to_owned()
+                    } else {
+                        format!("{name}={value}")
+                    };
+                    exact.push((*source, *target, evidence));
                 }
             }
         }
@@ -1682,6 +1697,27 @@ mod tests {
             .find(|edge| edge.rule_id == "s1mme-s6a-pseudonym")
             .expect("uppercase DIAMETER S6a must correlate with S1-MME");
         assert_eq!(edge.confidence, "EXACT");
+    }
+
+    #[test]
+    fn nas_eps_pseudonym_is_the_exact_s1mme_s6a_edge_source_2_11_9() {
+        let pseudo = "psn-opaque-shared";
+        let radio = e("radio", "S1-MME", "S1AP", "InitialUEMessage", 1,
+            &[("enb_ue_s1ap_id", "41")], json!([]));
+        let mut nas = e("nas", "S1-MME", "NAS-EPS-MM", "Attach Request", 1,
+            &[("enb_ue_s1ap_id", "41"), ("subscriber_pseudonym", pseudo)], json!([]));
+        nas.parent_event_id = Some(radio.event_id.clone());
+        let s6a = e("s6a", "S6a", "DIAMETER", "Authentication-Information-Request", 2,
+            &[("subscriber_pseudonym", pseudo)], json!([]));
+        let events = vec![radio, nas, s6a];
+
+        let edge = correlate_lte_evidence(&events).into_iter()
+            .find(|edge| edge.rule_id == "s1mme-s6a-pseudonym")
+            .expect("NAS-EPS pseudonym carrier must correlate with S6a");
+        assert_eq!(edge.source_event_id, "nas");
+        assert_eq!(edge.target_event_id, "s6a");
+        assert_eq!(edge.confidence, "EXACT");
+        assert_eq!(edge.matching_identifiers, ["subscriber_pseudonym"]);
     }
 
     #[test]

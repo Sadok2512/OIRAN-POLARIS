@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.11.9 — 2026-11-11 — porteur NAS du pseudonyme S1-MME↔S6a
+
+- `correlation-engine` 0.6.9 inclut les événements NAS-EPS appartenant au contexte S1-MME dans le pont vers S6a. Quand le NAS Attach Request enfant porte le même `subscriber_pseudonym` que l'AIR, l'arête EXACT part de cet événement NAS plutôt que du parent S1AP dépourvu de pseudonyme.
+- La comparaison reste effectuée sur les valeurs pseudonymisées en mémoire, mais `matching_identifiers` publie uniquement le nom `subscriber_pseudonym`, jamais sa valeur.
+- L'audit du chemin 5G confirme que le rattachement SBI indexe déjà tous les événements de la session, NAS-5GS inclus ; aucun filtre NGAP-only analogue ne participe à ce rattachement et aucun changement 5G n'est nécessaire.
+- Le test synthétique construit un S1AP InitialUEMessage, son NAS-EPS-MM Attach Request enfant et un AIR S6a partageant un pseudonyme opaque ; il vérifie la source NAS, la confiance EXACT et la preuve non vide sans valeur sensible.
+- Versions : `oiran-api` 2.11.9, web 2.11.9, `correlation-engine` 0.6.9. `session-engine` reste en 0.5.9.
+- Gate manuel : `cargo build --release --locked`. La recette réelle reste exécutée par ANR2 avant tout déploiement.
+
 ## OIRAN API 2.11.8 — 2026-11-11 — protocoles normalisés pour la collecte S6a
 
 - `session-engine` 0.5.9 compare sans tenir compte de la casse tous les noms de protocole utilisés par ses filtres. Les événements S6a publiés avec `protocol="DIAMETER"` rejoignent ainsi la collection LTE avant leur rattachement par `subscriber_pseudonym`.
