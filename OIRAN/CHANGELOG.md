@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.11.15 — 2026-11-11 — shard 0 strictement immuable sur overlayfs
+
+- La migration du monolithe historique en shard 0 ne crée plus de hard-link dans `.dataset-next` et ne renomme plus le répertoire `dataset`. Le manifeste référence directement `oiran_events.jsonl`; ce fichier n'est ouvert qu'en lecture et ne subit ni écriture, ni renommage, ni `fsync`, ni changement de métadonnées.
+- Chaque cycle installe uniquement son nouveau shard et une nouvelle génération de callflows, puis remplace atomiquement `dataset_manifest.json`. Le GC ne reçoit jamais un chemin de shard événement référencé.
+- `CONTINUOUS_CYCLE phase=end` expose désormais `bytes_written` et `files_created`. Le test de migration conserve inode, taille, mtime et SHA-256 du shard 0 pendant trois cycles et refuse tout autre fichier supérieur à 10 MiB.
+- La recette fantôme impose `upper < 50 MiB` après 60 minutes. Le test overlayfs local a été tenté mais le noyau de développement refuse le montage aux utilisateurs non privilégiés ; la commande et le critère restent normatifs pour ANR2.
+- Versions : `oiran-api` et web 2.11.15, `live-probe` 0.5.9. Moteurs et décodeurs inchangés.
+
 ## OIRAN API 2.11.14 — 2026-11-11 — publication continue par shards immuables
 
 - Cause de l’arrêt observé en 2.11.13 : le lot courant était bien limité à deux segments, mais la phase de fusion recopiait encore les 3,4 Go de `oiran_events.jsonl` dans `.dataset-next` avant toute publication. Le coût d’écriture restait donc proportionnel à tout l’historique.
