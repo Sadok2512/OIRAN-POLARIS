@@ -131,6 +131,7 @@ impl ProtocolDecoder for GtpuDecoder {
     fn decode(&self, input: &DecoderInput<'_>) -> DecoderOutput {
         match parse(input.payload) {
             Ok(header) => {
+                let mut direction = infer_direction(input);
                 let mut ies = Vec::new();
                 for ext in &header.extensions {
                     ies.push(InformationElement {
@@ -158,6 +159,15 @@ impl ProtocolDecoder for GtpuDecoder {
                     name: "teid".into(),
                     value: format!("0x{:08x}", header.teid),
                     pseudonymized: false,
+                }, NamedValue {
+                    // A GTP-U TEID identifies the receiving tunnel endpoint.
+                    name: "tunnel_endpoint_ip".into(),
+                    value: input.destination_endpoint.address.clone(),
+                    pseudonymized: false,
+                }, NamedValue {
+                    name: "tunnel_direction".into(),
+                    value: direction.as_str().into(),
+                    pseudonymized: false,
                 }];
                 if let Some(seq) = header.sequence_number {
                     ids.push(NamedValue {
@@ -171,6 +181,9 @@ impl ProtocolDecoder for GtpuDecoder {
                         &input.payload
                             [header.payload_offset..header.payload_offset + header.payload_length],
                     ) {
+                        if direction == Direction::Unknown {
+                            direction = infer_direction_from_inner_ipv4(&source, &destination);
+                        }
                         ids.push(NamedValue {
                             name: "inner_source_ip".into(),
                             value: source.clone(),
@@ -181,7 +194,7 @@ impl ProtocolDecoder for GtpuDecoder {
                             value: destination.clone(),
                             pseudonymized: false,
                         });
-                        let ue_ip = match infer_direction(input) {
+                        let ue_ip = match direction {
                             Direction::Uplink => Some(source),
                             Direction::Downlink => Some(destination),
                             _ => None,
@@ -194,6 +207,12 @@ impl ProtocolDecoder for GtpuDecoder {
                             });
                         }
                     }
+                }
+                if let Some(identifier) = ids
+                    .iter_mut()
+                    .find(|identifier| identifier.name == "tunnel_direction")
+                {
+                    identifier.value = direction.as_str().into();
                 }
                 let mut event = NormalizedEvent {
                     event_id: String::new(),
@@ -213,7 +232,7 @@ impl ProtocolDecoder for GtpuDecoder {
                     source_byte_offset: None,
                     source_endpoint: input.source_endpoint.clone(),
                     destination_endpoint: input.destination_endpoint.clone(),
-                    direction: infer_direction(input),
+                    direction,
                     session_identifiers: ids,
                     information_elements: ies,
                     decoder_name: "decoder-gtpu".into(),
@@ -256,6 +275,18 @@ fn inner_ipv4_addresses(payload: &[u8]) -> Option<(String, String)> {
     let address = |bytes: &[u8]| format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
     Some((address(&payload[12..16]), address(&payload[16..20])))
 }
+
+fn infer_direction_from_inner_ipv4(source: &str, destination: &str) -> Direction {
+    // POLARIS assigns LTE and 5G UE addresses from these two lab pools.
+    // Only a unique UE-side match is accepted; ambiguous/private traffic is
+    // left UNKNOWN instead of being guessed.
+    let is_ue = |address: &str| address.starts_with("10.45.") || address.starts_with("10.46.");
+    match (is_ue(source), is_ue(destination)) {
+        (true, false) => Direction::Uplink,
+        (false, true) => Direction::Downlink,
+        _ => Direction::Unknown,
+    }
+}
 fn infer_direction(i: &DecoderInput<'_>) -> Direction {
     let src = i
         .source_endpoint
@@ -271,10 +302,12 @@ fn infer_direction(i: &DecoderInput<'_>) -> Direction {
         .to_ascii_lowercase();
     if (src.contains("gnb") && dst.contains("upf"))
         || (src.contains("enb") && dst.contains("sgw"))
+        || (src.contains("sgw") && dst.contains("pgw"))
     {
         Direction::Uplink
     } else if (src.contains("upf") && dst.contains("gnb"))
         || (src.contains("sgw") && dst.contains("enb"))
+        || (src.contains("pgw") && dst.contains("sgw"))
     {
         Direction::Downlink
     } else {
@@ -370,5 +403,67 @@ mod tests {
         };
         assert_eq!(infer_direction(&make("eNB", "SGW-U")), Direction::Uplink);
         assert_eq!(infer_direction(&make("SGW-U", "eNB")), Direction::Downlink);
+    }
+
+    #[test]
+    fn gpdu_exposes_teid_receiver_endpoint_and_direction_on_s1u_and_s5u() {
+        let packets = vec![];
+        let timestamp = event_schema::ExactTimestamp {
+            seconds: 1,
+            nanoseconds: 0,
+            raw_ticks: 1,
+            resolution_base: 10,
+            resolution_exponent: 9,
+        };
+        let key = event_schema::PseudonymKey::from_bytes([0xaa; 32]);
+        for (interface, source_role, destination_role, destination_ip, teid, expected) in [
+            ("S1-U", "eNB", "SGW-U", "10.77.11.13", 0x0000_7804u32, Direction::Uplink),
+            ("S1-U", "SGW-U", "eNB", "10.77.11.20", 0x0000_0001u32, Direction::Downlink),
+            ("S5-U", "", "", "192.0.2.15", 0x0000_7f6fu32, Direction::Uplink),
+            ("S5-U", "", "", "192.0.2.13", 0x0000_be90u32, Direction::Downlink),
+        ] {
+            let mut payload = vec![0x30, 0xff, 0, 20];
+            payload.extend_from_slice(&teid.to_be_bytes());
+            let (inner_source, inner_destination) = if expected == Direction::Uplink {
+                ([10, 45, 0, 2], [192, 0, 2, 1])
+            } else {
+                ([192, 0, 2, 1], [10, 45, 0, 2])
+            };
+            payload.extend_from_slice(&[0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0]);
+            payload.extend_from_slice(&inner_source);
+            payload.extend_from_slice(&inner_destination);
+            let input = DecoderInput {
+                capture_id: "sha256:synthetic",
+                packet_references: &packets,
+                timestamp: &timestamp,
+                interface,
+                source_endpoint: event_schema::Endpoint {
+                    address: "192.0.2.20".into(),
+                    port: Some(2152),
+                    network_function: Some(source_role.into()),
+                },
+                destination_endpoint: event_schema::Endpoint {
+                    address: destination_ip.into(),
+                    port: Some(2152),
+                    network_function: Some(destination_role.into()),
+                },
+                payload: &payload,
+                raw_payload_reference: "sha256:synthetic",
+                pseudonym_key: &key,
+            };
+            let output = GtpuDecoder.decode(&input);
+            let event = &output.events[0];
+            assert_eq!(event.direction, expected);
+            assert!(event.session_identifiers.iter().any(|identifier| {
+                identifier.name == "teid" && identifier.value == format!("0x{teid:08x}")
+            }));
+            assert!(event.session_identifiers.iter().any(|identifier| {
+                identifier.name == "tunnel_endpoint_ip" && identifier.value == destination_ip
+            }));
+            assert!(event.session_identifiers.iter().any(|identifier| {
+                identifier.name == "tunnel_direction"
+                    && identifier.value == expected.as_str()
+            }));
+        }
     }
 }

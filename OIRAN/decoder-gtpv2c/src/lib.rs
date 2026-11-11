@@ -463,6 +463,7 @@ fn emit_event(msg: Gtpv2cMessage, input: &DecoderInput<'_>) -> DecoderOutput {
                             | "identity_pseudonym"
                             | "apn"
                             | "serving_plmn"
+                            | "f_teid_iface"
                             | "f_teid"
                             | "ue_ipv4"
                             | "ue_ipv6"
@@ -496,7 +497,10 @@ fn emit_event(msg: Gtpv2cMessage, input: &DecoderInput<'_>) -> DecoderOutput {
             if let Some(v) = &cv {
                 for pair in v.split(',') {
                     if let Some((key, val)) = pair.split_once('=') {
-                        if matches!(key, "f_teid" | "ue_ipv4" | "ue_ipv6" | "ebi") {
+                        if matches!(
+                            key,
+                            "f_teid_iface" | "f_teid" | "ue_ipv4" | "ue_ipv6" | "ebi"
+                        ) {
                             identifiers.push(NamedValue {
                                 name: format!("bearer_{key}"),
                                 value: val.into(),
@@ -930,6 +934,50 @@ mod tests {
             .information_elements
             .iter()
             .any(|e| e.name == "F-TEID"));
+        assert!(ev.session_identifiers.iter().any(|identifier| {
+            identifier.name == "bearer_f_teid" && identifier.value == "0x00000005"
+        }));
+        assert!(ev.session_identifiers.iter().any(|identifier| {
+            identifier.name == "bearer_f_teid_iface" && identifier.value == "1"
+        }));
+    }
+
+    #[test]
+    fn s11_and_s5c_fteids_keep_interface_type_and_normalized_teid() {
+        let cases = [
+            ("S11", 10u8, 0x0000_7804u32, 1u8, 0x0000_7f6fu32),
+            ("S5-C", 7u8, 0x0000_be90u32, 5u8, 0x0000_7f6fu32),
+        ];
+        for (interface, top_type, top_teid, bearer_type, bearer_teid) in cases {
+            let mut top = vec![0x80 | top_type];
+            top.extend_from_slice(&top_teid.to_be_bytes());
+            top.extend_from_slice(&[192, 0, 2, 1]);
+            let mut bearer = vec![0x80 | bearer_type];
+            bearer.extend_from_slice(&bearer_teid.to_be_bytes());
+            bearer.extend_from_slice(&[192, 0, 2, 2]);
+            let mut grouped = Vec::new();
+            grouped.extend_from_slice(&ie(73, 0, &[5]));
+            grouped.extend_from_slice(&ie(87, 0, &bearer));
+            let mut body = ie(87, 0, &top);
+            body.extend_from_slice(&ie(93, 0, &grouped));
+            let bytes = msg(32, Some(0), 1, &body);
+            let (packets, timestamp) = fixtures();
+            let key = PseudonymKey::from_bytes([0x44; 32]);
+            let mut decoder_input = input(&bytes, &packets, &timestamp, &key, "MME", "SGW");
+            decoder_input.interface = interface;
+            let output = Gtpv2cDecoder.decode(&decoder_input);
+            let identifiers = &output.events[0].session_identifiers;
+            for (name, expected) in [
+                ("f_teid", format!("0x{top_teid:08x}")),
+                ("f_teid_iface", top_type.to_string()),
+                ("bearer_f_teid", format!("0x{bearer_teid:08x}")),
+                ("bearer_f_teid_iface", bearer_type.to_string()),
+            ] {
+                assert!(identifiers
+                    .iter()
+                    .any(|identifier| identifier.name == name && identifier.value == expected));
+            }
+        }
     }
 
     #[test]

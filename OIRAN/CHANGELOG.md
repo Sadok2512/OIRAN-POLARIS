@@ -1,5 +1,15 @@
 # Changelog
 
+## OIRAN API 2.11.5 — 2026-11-11 — clés LTE décodées avant corrélation
+
+- `decoder-s1ap` 0.2.1 décode les listes E-RAB des procédures Initial Context Setup et E-RAB Setup (requêtes et réponses) et publie `erab_id`, `erab_teid`, `transport_layer_address` et `tunnel_endpoint_ip`. Les IE NAS-PDU et SecurityKey de l'Initial Context Setup restent entièrement omis : ni valeur, ni empreinte.
+- `decoder-gtpu` 0.2.1 publie `teid`, `tunnel_endpoint_ip` et `tunnel_direction` sur chaque G-PDU. `live-probe` 0.5.4 applique la même agrégation continue aux interfaces N3, S1-U et S5-U ; `session-engine` 0.5.7 conserve ces clés pendant le compactage de publication.
+- `decoder-gtpv2c` 0.1.2 publie le type d'interface associé à `f_teid` et `bearer_f_teid` sous `f_teid_iface` et `bearer_f_teid_iface`, conservés eux aussi par le compactage.
+- La preuve ANR2 #9 `6784427670` établit que le segment S6a LTE utilise Diameter sur TCP, port serveur 3868, et non SCTP. `oiran-decode` 0.7.2 réassemble donc les deux directions TCP portant le port 3868 et les route vers `decoder-diameter`. Le correctif SCTP PPID 0 de 2.10.4 reste présent et testé.
+- Les tests unitaires utilisent uniquement des trames synthétiques construites d'après les structures ASN.1 PER et les en-têtes GTP/Diameter ; aucun pcap réel ni identité abonné n'est inclus.
+- Versions : `oiran-api` 2.11.5, web 2.11.5, `live-probe` 0.5.4, `session-engine` 0.5.7, `oiran-decode` 0.7.2, `decoder-s1ap` 0.2.1, `decoder-gtpu` 0.2.1, `decoder-gtpv2c` 0.1.2.
+- Gate de build manuel : `cargo build --release --locked`. La recette des sept segments `_00067`, publication/compaction comprise, reste un gate ANR2 obligatoire avant déploiement.
+
 ## OIRAN API 2.11.4 — 2026-11-11 — découverte LTE continue et lockfile gate
 
 - Cause exacte : `session-engine/src/lib.rs`, `compact_publication_event`, supprimait les ancres S1AP/LTE avant que `live-probe` appelle `offline_lte_callflows` à la phase `07-after-lte-flows-built`. La phase était bien publiée, mais recevait des événements sans `enb_ue_s1ap_id`, `mme_ue_s1ap_id`, `erab_teid` ni `bearer_f_teid`.

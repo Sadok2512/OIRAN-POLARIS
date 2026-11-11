@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-gtpu"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "event-schema",
  "plugin-runtime",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-gtpv2c"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "event-schema",
  "plugin-runtime",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-s1ap"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "decoder-nas",
  "event-schema",
@@ -547,7 +547,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "live-probe"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "callflow-renderer",
  "callflow-schema",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.11.4"
+version = "2.11.5"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "capture-pcap",
  "decoder-diameter",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "session-engine"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "event-schema",
  "serde",

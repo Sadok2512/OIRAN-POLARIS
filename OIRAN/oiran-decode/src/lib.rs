@@ -109,6 +109,10 @@ fn sctp_route(interface: &str, ppid: u32) -> Option<&'static str> {
     }
 }
 
+fn is_s6a_diameter_tcp(interface: &str, source_port: u16, destination_port: u16) -> bool {
+    interface == "S6a" && (source_port == 3868 || destination_port == 3868)
+}
+
 #[derive(Clone, Debug)]
 pub struct DecodeConfig {
     pub input: std::path::PathBuf,
@@ -209,6 +213,7 @@ where
     let mut transport_errors = 0usize;
     let mut sink_error = None;
     let mut sbi_report = SbiDecodeReport::default();
+    let mut diameter_tcp_connections = 0usize;
 
     let capture = visit_capture(&config.input, &config.capture_id, |packet| {
         if sink_error.is_some() {
@@ -334,6 +339,25 @@ where
                     &mut sbi_report,
                 );
             }
+            TransportProtocol::Tcp
+                if is_s6a_diameter_tcp(
+                    &config.interface,
+                    view.source_port.unwrap_or(0),
+                    view.destination_port.unwrap_or(0),
+                ) =>
+            {
+                tcp.consume(&packet, &view);
+                let finalized = tcp.take_finalized();
+                diameter_tcp_connections += emit_diameter_connections(
+                    finalized,
+                    config,
+                    &diameter,
+                    &pseudonym_key,
+                    &mut sink,
+                    &mut event_count,
+                    &mut sink_error,
+                );
+            }
             TransportProtocol::Tcp | TransportProtocol::Other(_) => {}
         }
     })
@@ -343,15 +367,27 @@ where
     }
     let (sctp_errors, incomplete_sctp) = sctp.finish();
     let (connections, tcp_errors) = tcp.finish();
-    emit_sbi_connections(
-        connections,
-        config,
-        &pseudonym_key,
-        &mut sink,
-        &mut event_count,
-        &mut sink_error,
-        &mut sbi_report,
-    );
+    if config.interface == "S6a" {
+        diameter_tcp_connections += emit_diameter_connections(
+            connections,
+            config,
+            &diameter,
+            &pseudonym_key,
+            &mut sink,
+            &mut event_count,
+            &mut sink_error,
+        );
+    } else {
+        emit_sbi_connections(
+            connections,
+            config,
+            &pseudonym_key,
+            &mut sink,
+            &mut event_count,
+            &mut sink_error,
+            &mut sbi_report,
+        );
+    }
     if let Some(error) = sink_error {
         return Err(error);
     }
@@ -373,7 +409,7 @@ where
         transport_errors,
         sctp_errors: sctp_errors.len(),
         incomplete_sctp,
-        tcp_connections: sbi_report.tcp_connections,
+        tcp_connections: sbi_report.tcp_connections + diameter_tcp_connections,
         tcp_errors: tcp_errors.len(),
         http2_frames: sbi_report.http2_frames,
         http2_streams: sbi_report.http2_streams,
@@ -438,6 +474,70 @@ fn emit_sbi_connections<F>(
         aggregate.errors.extend(report.errors);
         emit_events(events, sink, event_count, sink_error);
     }
+}
+
+fn emit_diameter_connections<F>(
+    connections: Vec<transport_tcp::ReassembledConnection>,
+    config: &DecodeConfig,
+    decoder: &DiameterDecoder,
+    pseudonym_key: &PseudonymKey,
+    sink: &mut F,
+    event_count: &mut usize,
+    sink_error: &mut Option<String>,
+) -> usize
+where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
+    let connection_count = connections.len();
+    for connection in connections {
+        for direction in connection.directions {
+            if sink_error.is_some() || direction.bytes.is_empty() || direction.spans.is_empty() {
+                continue;
+            }
+            let mut packet_references = direction
+                .spans
+                .iter()
+                .map(|span| span.packet.clone())
+                .collect::<Vec<_>>();
+            packet_references.sort_by_key(|packet| packet.packet_number);
+            packet_references.dedup_by_key(|packet| packet.packet_number);
+            let timestamp = direction
+                .spans
+                .iter()
+                .min_by_key(|span| span.packet.packet_number)
+                .map(|span| span.timestamp.clone())
+                .expect("non-empty Diameter TCP provenance");
+            let source = endpoint(
+                &direction.source.address,
+                Some(direction.source.port),
+                &config.endpoints,
+            );
+            let destination = endpoint(
+                &direction.destination.address,
+                Some(direction.destination.port),
+                &config.endpoints,
+            );
+            let raw = format!("sha256:{}", sha256_hex(&direction.bytes));
+            let input = DecoderInput {
+                capture_id: &config.capture_id,
+                packet_references: &packet_references,
+                timestamp: &timestamp,
+                interface: "S6a",
+                source_endpoint: source,
+                destination_endpoint: destination,
+                payload: &direction.bytes,
+                raw_payload_reference: &raw,
+                pseudonym_key,
+            };
+            emit_events(
+                decoder.decode(&input).events,
+                sink,
+                event_count,
+                sink_error,
+            );
+        }
+    }
+    connection_count
 }
 
 pub fn write_jsonl(path: &Path, events: &[NormalizedEvent], append: bool) -> Result<(), String> {
@@ -713,6 +813,117 @@ mod tests {
         assert_eq!(sctp_route("S6a", 0), Some("S6a"));
         assert_eq!(sctp_route("S6a", 7), Some("S6a"));
         assert_eq!(sctp_route("S6a", 255), Some("S6a"));
+    }
+
+    #[test]
+    fn routes_only_tcp_3868_to_s6a_diameter_2_11_5() {
+        assert!(is_s6a_diameter_tcp("S6a", 3868, 39200));
+        assert!(is_s6a_diameter_tcp("S6a", 59770, 3868));
+        assert!(!is_s6a_diameter_tcp("S6a", 39200, 59770));
+        assert!(!is_s6a_diameter_tcp("SBI", 3868, 39200));
+    }
+
+    #[test]
+    fn reassembled_s6a_tcp_emits_diameter_request_and_answer() {
+        fn diameter(command: u32, request: bool) -> Vec<u8> {
+            let mut bytes = vec![1, 0, 0, 20, if request { 0x80 } else { 0 }];
+            bytes.extend_from_slice(&command.to_be_bytes()[1..]);
+            bytes.extend_from_slice(&16_777_251u32.to_be_bytes());
+            bytes.extend_from_slice(&1u32.to_be_bytes());
+            bytes.extend_from_slice(&2u32.to_be_bytes());
+            bytes
+        }
+        fn direction(
+            source: transport_tcp::TcpEndpoint,
+            destination: transport_tcp::TcpEndpoint,
+            bytes: Vec<u8>,
+            packet_number: u64,
+        ) -> transport_tcp::ReassembledDirection {
+            let timestamp = event_schema::ExactTimestamp {
+                seconds: 1,
+                nanoseconds: packet_number as u32,
+                raw_ticks: packet_number,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            };
+            let packet = event_schema::PacketReference {
+                source_file: "synthetic-s6a.pcap".into(),
+                source_sha256: Some("0".repeat(64)),
+                packet_number,
+                byte_offset: packet_number * 64,
+                interface_id: 0,
+                link_type: Some(1),
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: bytes.len() as u32,
+                original_length: bytes.len() as u32,
+            };
+            transport_tcp::ReassembledDirection {
+                source,
+                destination,
+                spans: vec![transport_tcp::ProvenanceSpan {
+                    start: 0,
+                    end: bytes.len(),
+                    timestamp,
+                    packet,
+                }],
+                bytes,
+                incomplete: false,
+                retransmissions: 0,
+                duplicate_segments: 0,
+            }
+        }
+
+        let client = transport_tcp::TcpEndpoint {
+            address: "192.0.2.10".into(),
+            port: 39200,
+        };
+        let server = transport_tcp::TcpEndpoint {
+            address: "192.0.2.20".into(),
+            port: 3868,
+        };
+        let (key, _) = transport_tcp::TcpConnectionKey::new(client.clone(), server.clone());
+        let connection = transport_tcp::ReassembledConnection {
+            key,
+            directions: [
+                direction(client.clone(), server.clone(), diameter(318, true), 1),
+                direction(server, client, diameter(318, false), 2),
+            ],
+        };
+        let config = DecodeConfig {
+            input: "unused.pcap".into(),
+            capture_id: format!("sha256:{}", "0".repeat(64)),
+            interface: "S6a".into(),
+            endpoints: HashMap::new(),
+        };
+        let key = PseudonymKey::from_bytes([0x33; 32]);
+        let mut events = Vec::new();
+        let mut count = 0;
+        let mut error = None;
+        assert_eq!(
+            emit_diameter_connections(
+                vec![connection],
+                &config,
+                &DiameterDecoder,
+                &key,
+                &mut |event| {
+                    events.push(event);
+                    Ok(())
+                },
+                &mut count,
+                &mut error,
+            ),
+            1
+        );
+        assert_eq!(error, None);
+        assert_eq!(count, 2);
+        assert_eq!(events[0].message_name, "Authentication-Information-Request");
+        assert_eq!(events[1].message_name, "Authentication-Information-Answer");
     }
 
     #[test]

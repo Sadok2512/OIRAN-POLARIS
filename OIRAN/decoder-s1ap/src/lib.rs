@@ -48,6 +48,180 @@ pub struct S1apPdu {
     pub ies: Vec<S1apIe>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ErabTunnel {
+    erab_id: u8,
+    transport_layer_address: String,
+    teid: u32,
+}
+
+/// Minimal aligned-PER reader for the four E-RAB list types decoded below.
+/// It deliberately supports only root values: unknown extension additions are
+/// rejected instead of being guessed or scanned byte-wise.
+struct AperBits<'a> {
+    bytes: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> AperBits<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, bit: 0 }
+    }
+
+    fn read_bit(&mut self) -> Result<bool, String> {
+        if self.bit >= self.bytes.len().saturating_mul(8) {
+            return Err("E-RAB APER value truncated".into());
+        }
+        let value = self.bytes[self.bit / 8] & (0x80 >> (self.bit % 8)) != 0;
+        self.bit += 1;
+        Ok(value)
+    }
+
+    fn read_bits(&mut self, count: usize) -> Result<u64, String> {
+        if count > 64 {
+            return Err("E-RAB APER integer exceeds 64 bits".into());
+        }
+        let mut value = 0u64;
+        for _ in 0..count {
+            value = (value << 1) | u64::from(self.read_bit()?);
+        }
+        Ok(value)
+    }
+
+    fn align(&mut self) {
+        self.bit = (self.bit + 7) & !7;
+    }
+
+    fn read_octets(&mut self, count: usize) -> Result<&'a [u8], String> {
+        self.align();
+        let start = self.bit / 8;
+        let end = start
+            .checked_add(count)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| "E-RAB APER octet string truncated".to_string())?;
+        self.bit = end * 8;
+        Ok(&self.bytes[start..end])
+    }
+
+    fn read_open_type(&mut self) -> Result<&'a [u8], String> {
+        self.align();
+        let start = self.bit / 8;
+        let (length, octets) = aper_length(&self.bytes[start..])?;
+        self.bit = (start + octets) * 8;
+        self.read_octets(length)
+    }
+}
+
+fn decode_erab_list(id: u16, value: &[u8]) -> Result<Vec<ErabTunnel>, String> {
+    let (expected_item_id, request_with_qos, nas_optional) = match id {
+        24 => (52, true, true),  // E-RABToBeSetupListCtxtSUReq
+        51 => (50, false, false), // E-RABSetupListCtxtSURes
+        16 => (17, true, false), // E-RABToBeSetupListBearerSUReq
+        28 => (39, false, false), // E-RABSetupListBearerSURes
+        _ => return Err(format!("S1AP IE {id} is not an E-RAB setup list")),
+    };
+    let mut bits = AperBits::new(value);
+    let count = bits.read_bits(8)? as usize + 1;
+    bits.align();
+    let mut tunnels = Vec::with_capacity(count);
+    for _ in 0..count {
+        let item_id = bits.read_bits(16)? as u16;
+        if item_id != expected_item_id {
+            return Err(format!(
+                "unexpected E-RAB list item id {item_id}, expected {expected_item_id}"
+            ));
+        }
+        let criticality = bits.read_bits(2)?;
+        if criticality > 2 {
+            return Err("invalid E-RAB item criticality".into());
+        }
+        bits.align();
+        let item = bits.read_open_type()?;
+        tunnels.push(decode_erab_item(item, request_with_qos, nas_optional)?);
+    }
+    Ok(tunnels)
+}
+
+fn decode_erab_item(
+    value: &[u8],
+    request_with_qos: bool,
+    nas_optional: bool,
+) -> Result<ErabTunnel, String> {
+    let mut bits = AperBits::new(value);
+    if bits.read_bit()? {
+        return Err("extended E-RAB item is unsupported".into());
+    }
+    let nas_present = if nas_optional { bits.read_bit()? } else { false };
+    if bits.read_bit()? {
+        return Err("E-RAB item extension container is unsupported".into());
+    }
+    if bits.read_bit()? {
+        return Err("extended E-RAB-ID is unsupported".into());
+    }
+    let erab_id = bits.read_bits(4)? as u8;
+
+    if request_with_qos {
+        skip_erab_qos(&mut bits)?;
+    }
+    let transport_layer_address = decode_transport_layer_address(&mut bits)?;
+    let teid_bytes = bits.read_octets(4)?;
+    let teid = u32::from_be_bytes(teid_bytes.try_into().expect("four-byte GTP-TEID"));
+    if teid == 0 {
+        return Err("E-RAB GTP-TEID is zero".into());
+    }
+
+    // The optional/mandatory NAS-PDU follows GTP-TEID. It is intentionally
+    // not decoded, hashed, copied or returned by this function.
+    let _ = nas_present;
+    Ok(ErabTunnel {
+        erab_id,
+        transport_layer_address,
+        teid,
+    })
+}
+
+fn skip_erab_qos(bits: &mut AperBits<'_>) -> Result<(), String> {
+    if bits.read_bit()? {
+        return Err("extended E-RAB QoS parameters are unsupported".into());
+    }
+    let gbr_present = bits.read_bit()?;
+    if bits.read_bit()? {
+        return Err("E-RAB QoS extension container is unsupported".into());
+    }
+    bits.align();
+    let _qci = bits.read_bits(8)?;
+    if bits.read_bit()? {
+        return Err("extended allocation/retention priority is unsupported".into());
+    }
+    if bits.read_bit()? {
+        return Err("allocation/retention extension container is unsupported".into());
+    }
+    let _priority_level = bits.read_bits(4)?;
+    let _pre_emption_capability = bits.read_bit()?;
+    let _pre_emption_vulnerability = bits.read_bit()?;
+    if gbr_present {
+        return Err("GBR E-RAB QoS parameters are unsupported".into());
+    }
+    Ok(())
+}
+
+fn decode_transport_layer_address(bits: &mut AperBits<'_>) -> Result<String, String> {
+    if bits.read_bit()? {
+        return Err("extended TransportLayerAddress is unsupported".into());
+    }
+    let bit_length = bits.read_bits(8)? as usize + 1;
+    if bit_length != 32 {
+        return Err(format!(
+            "TransportLayerAddress has {bit_length} bits, expected IPv4/32"
+        ));
+    }
+    let address = bits.read_octets(4)?;
+    Ok(format!(
+        "{}.{}.{}.{}",
+        address[0], address[1], address[2], address[3]
+    ))
+}
+
 pub fn parse(payload: &[u8]) -> Result<S1apPdu, String> {
     if payload.len() < 4 {
         return Err("S1AP-PDU APER envelope truncated".into());
@@ -378,6 +552,7 @@ fn ie_name(id: u16) -> Option<&'static str> {
         16 => "E-RABToBeSetupListBearerSUReq",
         24 => "E-RABToBeSetupListCtxtSUReq",
         26 => "NAS-PDU",
+        28 => "E-RABSetupListBearerSURes",
         33 => "E-RABToBeReleasedList",
         // 2.7.7: identity-bearing IE names replaced by `identity_pseudonym`
         // so the serialised event never carries `tmsi`/`imsi`/`imei` even
@@ -454,6 +629,12 @@ impl ProtocolDecoder for S1apDecoder {
                 let mut status = DecodeStatus::Decoded;
                 let mut nas_messages: Vec<NasMessage> = Vec::new();
                 for ie in &pdu.ies {
+                    // Initial Context Setup can carry both a top-level
+                    // SecurityKey (KeNB) and NAS-PDU. Neither is exported in
+                    // any form: no bytes, digest, length marker or NAS child.
+                    if pdu.procedure_code == 9 && matches!(ie.id, 26 | 73) {
+                        continue;
+                    }
                     if ie.id == 26 {
                         match nas_pdu_contents(&ie.value) {
                             Ok((nas, offset)) => {
@@ -466,7 +647,52 @@ impl ProtocolDecoder for S1apDecoder {
                             Err(error) => errors.push(error),
                         }
                     }
-                    let (value, ie_status, sensitive) = decode_ie(ie, input.pseudonym_key);
+                    let erab_list = matches!(ie.id, 16 | 24 | 28 | 51);
+                    let (value, ie_status, sensitive) = if erab_list {
+                        match decode_erab_list(ie.id, &ie.value) {
+                            Ok(tunnels) => {
+                                for tunnel in &tunnels {
+                                    for (name, value) in [
+                                        ("erab_id", tunnel.erab_id.to_string()),
+                                        ("erab_teid", format!("0x{:08x}", tunnel.teid)),
+                                        (
+                                            "transport_layer_address",
+                                            tunnel.transport_layer_address.clone(),
+                                        ),
+                                        (
+                                            "tunnel_endpoint_ip",
+                                            tunnel.transport_layer_address.clone(),
+                                        ),
+                                    ] {
+                                        identifiers.push(NamedValue {
+                                            name: name.into(),
+                                            value,
+                                            pseudonymized: false,
+                                        });
+                                    }
+                                }
+                                let value = tunnels
+                                    .iter()
+                                    .map(|tunnel| {
+                                        format!(
+                                            "erab_id={},transport_layer_address={},erab_teid=0x{:08x}",
+                                            tunnel.erab_id,
+                                            tunnel.transport_layer_address,
+                                            tunnel.teid
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(";");
+                                (Some(value), DecodeStatus::Decoded, false)
+                            }
+                            Err(error) => {
+                                errors.push(format!("{}: {error}", ie.known_name.unwrap_or("E-RAB list")));
+                                (None, DecodeStatus::Unsupported, false)
+                            }
+                        }
+                    } else {
+                        decode_ie(ie, input.pseudonym_key)
+                    };
                     if matches!(
                         ie_status,
                         DecodeStatus::Unsupported
@@ -522,7 +748,14 @@ impl ProtocolDecoder for S1apDecoder {
                             name: ie.known_name.unwrap_or("Unknown IE").into(),
                             length: ie.value.len() as u32,
                             value,
-                            raw_sha256: Some(sha256_hex(&ie.value)),
+                            // E-RAB request lists can contain a nested NAS-PDU.
+                            // The typed bearer coordinates are sufficient
+                            // evidence; never retain a digest of the container.
+                            raw_sha256: if erab_list {
+                                None
+                            } else {
+                                Some(sha256_hex(&ie.value))
+                            },
                             status: ie_status,
                         });
                     }
@@ -741,6 +974,91 @@ mod tests {
         out
     }
 
+    #[derive(Default)]
+    struct TestBits {
+        bytes: Vec<u8>,
+        bit: usize,
+    }
+
+    impl TestBits {
+        fn push_bit(&mut self, value: bool) {
+            if self.bit % 8 == 0 {
+                self.bytes.push(0);
+            }
+            if value {
+                let last = self.bytes.len() - 1;
+                self.bytes[last] |= 0x80 >> (self.bit % 8);
+            }
+            self.bit += 1;
+        }
+        fn push_bits(&mut self, value: u64, count: usize) {
+            for shift in (0..count).rev() {
+                self.push_bit((value >> shift) & 1 != 0);
+            }
+        }
+        fn align(&mut self) {
+            while self.bit % 8 != 0 {
+                self.push_bit(false);
+            }
+        }
+        fn push_octets(&mut self, value: &[u8]) {
+            self.align();
+            for byte in value {
+                self.push_bits(u64::from(*byte), 8);
+            }
+        }
+        fn finish(mut self) -> Vec<u8> {
+            self.align();
+            self.bytes
+        }
+    }
+
+    fn erab_item(
+        erab_id: u8,
+        address: [u8; 4],
+        teid: u32,
+        with_qos: bool,
+        nas_optional: bool,
+    ) -> Vec<u8> {
+        let mut bits = TestBits::default();
+        bits.push_bit(false); // SEQUENCE extension marker
+        if nas_optional {
+            bits.push_bit(false); // NAS-PDU absent
+        }
+        bits.push_bit(false); // IE-Extensions absent
+        bits.push_bit(false); // E-RAB-ID root value
+        bits.push_bits(u64::from(erab_id), 4);
+        if with_qos {
+            bits.push_bit(false); // QoS extension marker
+            bits.push_bit(false); // GBR absent
+            bits.push_bit(false); // QoS IE-Extensions absent
+            bits.align();
+            bits.push_bits(9, 8); // QCI 9
+            bits.push_bit(false); // ARP extension marker
+            bits.push_bit(false); // ARP IE-Extensions absent
+            bits.push_bits(15, 4); // priority level
+            bits.push_bit(false); // pre-emption capability
+            bits.push_bit(false); // pre-emption vulnerability
+        }
+        bits.push_bit(false); // TransportLayerAddress root length
+        bits.push_bits(31, 8); // 32 bits, lower bound is one
+        bits.push_octets(&address);
+        bits.push_octets(&teid.to_be_bytes());
+        bits.finish()
+    }
+
+    fn erab_list(item_id: u16, item: &[u8]) -> Vec<u8> {
+        let mut bits = TestBits::default();
+        bits.push_bits(0, 8); // one item (1..256)
+        bits.align();
+        bits.push_bits(u64::from(item_id), 16);
+        bits.push_bits(1, 2); // criticality ignore
+        bits.align();
+        bits.push_octets(&[item.len() as u8]);
+        bits.push_octets(item);
+        bits.finish()
+    }
+
     fn synthetic_input<'a>(
         bytes: &'a [u8],
         packets: &'a [PacketReference],
@@ -926,6 +1244,77 @@ mod tests {
     }
 
     #[test]
+    fn decodes_ics_request_and_response_erab_tunnels_without_sensitive_ies() {
+        let request_item = erab_item(5, [10, 77, 11, 13], 0x0000_7804, true, true);
+        let response_item = erab_item(5, [10, 77, 11, 20], 0x0000_0001, false, false);
+        let request_list = erab_list(52, &request_item);
+        let response_list = erab_list(50, &response_item);
+        let security_key = [0x5a; 32];
+        let nas = [0x02, 0x07, 0x42];
+        let request = pdu(
+            0,
+            9,
+            &[(24, 0, &request_list), (26, 0, &nas), (73, 0, &security_key)],
+        );
+        let response = pdu(1, 9, &[(51, 1, &response_list)]);
+        let (packets, timestamp) = fixtures();
+        let key = PseudonymKey::from_bytes([0x11; 32]);
+
+        for (bytes, src, dst, address, teid) in [
+            (&request, "MME", "eNB", "10.77.11.13", "0x00007804"),
+            (&response, "eNB", "MME", "10.77.11.20", "0x00000001"),
+        ] {
+            let input = synthetic_input(bytes, &packets, &timestamp, &key, src, dst);
+            let output = S1apDecoder.decode(&input);
+            assert_eq!(output.status, DecodeStatus::Decoded);
+            assert_eq!(output.events.len(), 1, "ICS must not emit a NAS child");
+            let event = &output.events[0];
+            assert_eq!(
+                event
+                    .session_identifiers
+                    .iter()
+                    .find(|value| value.name == "erab_teid")
+                    .map(|value| value.value.as_str()),
+                Some(teid)
+            );
+            assert_eq!(
+                event
+                    .session_identifiers
+                    .iter()
+                    .find(|value| value.name == "transport_layer_address")
+                    .map(|value| value.value.as_str()),
+                Some(address)
+            );
+            let json = event.to_json();
+            assert!(!json.contains("NAS-PDU"));
+            assert!(!json.contains("SecurityKey"));
+            assert!(!json.contains(&sha256_hex(&security_key)));
+        }
+    }
+
+    #[test]
+    fn decodes_erab_setup_request_and_response_lists() {
+        let request_item = erab_item(5, [192, 0, 2, 13], 0x0102_0304, true, false);
+        let response_item = erab_item(5, [192, 0, 2, 20], 0x0506_0708, false, false);
+        for (kind, list_id, item_id, item, expected) in [
+            (0, 16, 17, request_item.as_slice(), "0x01020304"),
+            (1, 28, 39, response_item.as_slice(), "0x05060708"),
+        ] {
+            let list = erab_list(item_id, item);
+            let bytes = pdu(kind, 5, &[(list_id, 1, &list)]);
+            let (packets, timestamp) = fixtures();
+            let key = PseudonymKey::from_bytes([0x22; 32]);
+            let input = synthetic_input(&bytes, &packets, &timestamp, &key, "MME", "eNB");
+            let output = S1apDecoder.decode(&input);
+            assert_eq!(output.status, DecodeStatus::Decoded);
+            assert!(output.events[0]
+                .session_identifiers
+                .iter()
+                .any(|value| value.name == "erab_teid" && value.value == expected));
+        }
+    }
+
+    #[test]
     fn ue_context_release_procedure_names() {
         let mme_ue = &[0x00, 0x06];
         let req = parse(&pdu(0, 18, &[(0, 0, mme_ue)])).unwrap();
@@ -1010,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_context_setup_request_withholds_security_key_payload() {
+    fn initial_context_setup_request_omits_security_key_payload_entirely() {
         // 2.7.11: SecurityKey (S1AP IE 73) carries KeNB*/NH/NCC. The
         // normalised event must keep the IE's length but surface no bytes,
         // no hash and no sibling identifier. Synthetic 32-byte value stands
@@ -1028,16 +1417,10 @@ mod tests {
         assert_eq!(out.events.len(), 1);
         let event = &out.events[0];
         assert_eq!(event.message_name, "InitialContextSetupRequest");
-        let security_ie = event
+        assert!(event
             .information_elements
             .iter()
-            .find(|ie| ie.id == Some(73))
-            .expect("SecurityKey IE preserved by length");
-        assert_eq!(security_ie.name, "key_material_withheld");
-        assert_eq!(security_ie.length, security_key.len() as u32);
-        assert_eq!(security_ie.value.as_deref(), Some("WITHHELD"));
-        assert_eq!(security_ie.raw_sha256, None);
-        assert_eq!(security_ie.status, DecodeStatus::Decoded);
+            .all(|ie| ie.id != Some(73) && ie.id != Some(26)));
         // No session identifier carries the key or its hash.
         for sid in &event.session_identifiers {
             assert!(

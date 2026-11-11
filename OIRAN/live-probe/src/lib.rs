@@ -4952,8 +4952,12 @@ impl CaptureManager {
                 // on its own, so we do not need to keep the bytes in memory.
                 let checksum = sha256_hex_file(&path)?;
                 let capture_hash = format!("sha256:{checksum}");
-                let aggregate_n3 = capture_id == CONTINUOUS_CAPTURE_ID
-                    && interface.interface.eq_ignore_ascii_case("N3");
+                // 2.11.5: all GTP-U user planes use the same bounded flow
+                // aggregation. Restricting this to N3 left S1-U/S5-U as
+                // packet events and made their tunnel evidence disappear
+                // from the compact continuous publication.
+                let aggregate_gtpu = capture_id == CONTINUOUS_CAPTURE_ID
+                    && matches!(interface.interface.as_str(), "N3" | "S1-U" | "S5-U");
                 let mut n3_aggregator = N3FlowAggregator::default();
                 let mut keepalive_aggregator = KeepaliveAggregator::default();
                 let mut individual_events = 0usize;
@@ -4975,7 +4979,7 @@ impl CaptureManager {
                             None => return Ok(()),
                             Some(event) => event,
                         };
-                        if aggregate_n3 && event.protocol == Protocol::Gtpu {
+                        if aggregate_gtpu && event.protocol == Protocol::Gtpu {
                             return n3_aggregator.observe(event);
                         }
                         individual_events = individual_events.saturating_add(1);
@@ -4985,7 +4989,7 @@ impl CaptureManager {
                             .map_err(display_error)
                     },
                 )?;
-                let n3_aggregates = if aggregate_n3 {
+                let n3_aggregates = if aggregate_gtpu {
                     n3_aggregator.finish()
                 } else {
                     Vec::new()
@@ -9413,6 +9417,13 @@ fn endpoint_map() -> HashMap<String, String> {
         ("10.77.22.13", "UPF"),
         ("10.77.23.12", "SMF"),
         ("10.77.23.13", "UPF"),
+        ("10.77.10.10", "MME"),
+        ("10.77.10.20", "eNB"),
+        ("10.77.11.13", "SGW-U"),
+        ("10.77.11.20", "eNB"),
+        ("10.77.12.10", "MME"),
+        ("10.77.12.12", "SGW-C"),
+        ("10.77.12.14", "PGW-C"),
     ]
     .into_iter()
     .map(|(address, function)| (address.into(), function.into()))
