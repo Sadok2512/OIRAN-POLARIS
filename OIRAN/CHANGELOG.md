@@ -1,5 +1,15 @@
 # Changelog
 
+## OIRAN API 2.11.12 — 2026-11-11 — publication bornée avant la phase 01
+
+- Cause prouvée : `session-engine::load_path_streaming_representatives` conservait un `BTreeMap<String, EventRecord>` par clé dite sémantique. Depuis 2.11.4, la clé reprenait notamment les nouveaux `gtpv2c_sequence` et `pfcp_sequence`, en plus des identifiants de règle transactionnels historiques `pdr_id`, `far_id` et `qer_id`. Ces valeurs changeaient à chaque message et empêchaient la compaction ; le chargeur retenait donc presque tout le JSONL sous forme de clés et objets Rust avant `01-after-streaming-representatives`, conformément aux 4,2 GiB anonymes mesurés par le noyau.
+- La représentation conserve tous ces identifiants pour la découverte et la corrélation, mais la clé de déduplication ne contient plus que l'état durable de session/tunnel. Les clés tunnel restent discriminantes ; aucun seuil n'est modifié et l'ordre canonique `(capture_id, packet_number, event_id)` reste inchangé.
+- `load_path_streaming_representatives_with_progress` publie le nombre d'événements lus et de représentants tous les 100 000 événements. `live-probe` ajoute les phases `00a-before-heap-release`, `00b-after-heap-release` et `00c-streaming-representatives` entre la fusion et la phase 01.
+- `PUBLICATION_RSS_TRACE` lit aussi `anon`, `file`, `shmem` et `memory.peak` depuis `/sys/fs/cgroup/system.slice/oiran-api.service`. La commande `cargo test -p session-engine --release publication_scale_1_5m -- --ignored --nocapture` a traité 1 500 000 événements et 3 883 537 216 octets de JSONL (plus que les 3 394 193 764 octets de production), retenu 4 096 représentants et mesuré `VmHWM=18 640 KiB`, sous le gate strict de 2 GiB.
+- La recette ANR2 est documentée dans `docs/OIRAN_2_11_12_SCALE_GATE.md` : copie/overlay du dataset de production complet et du ring, `MemoryMax=4G`, lecture de `memory.stat` et `memory.peak` toutes les 30 s jusqu'à la phase 13, progression d'ingestion, puis session LTE 5/5 EXACT.
+- Versions : `oiran-api` et web 2.11.12, `session-engine` 0.5.10, `live-probe` 0.5.6. Les décodeurs et moteurs de corrélation restent inchangés.
+- Gate manuel : test release à l'échelle, tests Rust concernés, puis `cargo build --release --locked`. La recette fantôme sur données réelles reste exécutée par ANR2 avant tout déploiement.
+
 ## OIRAN API 2.11.11 — 2026-11-11 — cardinalité légitime des preuves abonné S6a
 
 - Cause prouvée : `append_lte_bridge` appliquait la garde anti-ambiguïté des clés tunnel à `subscriber_pseudonym`. Un NAS Attach Request correspondant à plusieurs messages S6a du même abonné faisait rejeter tout le groupe, puis produisait l'arête de repli OPEN.

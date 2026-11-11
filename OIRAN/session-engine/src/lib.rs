@@ -870,6 +870,21 @@ pub struct StreamingRepresentativesIndex {
 pub fn load_path_streaming_representatives(
     path: &std::path::Path,
 ) -> Result<StreamingRepresentativesIndex, String> {
+    load_path_streaming_representatives_with_progress(path, |_, _| {})
+}
+
+/// Charge les représentants de publication et rend la passe observable sans
+/// conserver un second index en mémoire. Le callback reçoit
+/// `(événements_lus, représentants_retenus)` tous les 100 000 événements puis
+/// une dernière fois à EOF. Il est volontairement synchrone : le caller peut
+/// publier une trace RSS/progression sans modifier l'ordre canonique.
+pub fn load_path_streaming_representatives_with_progress<F>(
+    path: &std::path::Path,
+    mut progress: F,
+) -> Result<StreamingRepresentativesIndex, String>
+where
+    F: FnMut(usize, usize),
+{
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let reader = io::BufReader::new(file);
     let mut representatives = BTreeMap::<String, EventRecord>::new();
@@ -886,7 +901,11 @@ pub fn load_path_streaming_representatives(
         compact_publication_event(&mut event);
         let key = publication_semantic_key(&event);
         representatives.entry(key).or_insert(event);
+        if source_event_count % 100_000 == 0 {
+            progress(source_event_count, representatives.len());
+        }
     }
+    progress(source_event_count, representatives.len());
     let mut events = representatives.into_values().collect::<Vec<_>>();
     deterministic_sort(&mut events);
     Ok(StreamingRepresentativesIndex {
@@ -989,9 +1008,47 @@ fn compact_publication_event(event: &mut EventRecord) {
 }
 
 fn publication_semantic_key(event: &EventRecord) -> String {
+    // 2.11.12: la représentation garde tous les identifiants stables ci-dessus,
+    // mais la *clé* ne doit contenir que l'état durable d'une session/tunnel.
+    // Les numéros de transaction GTPv2/PFCP et les identifiants PDR/FAR/QER
+    // changent à chaque message. Les inclure ici empêchait la compaction et
+    // retenait pratiquement tout le JSONL de production sous forme d'objets Rust
+    // + String (4,2 GiB anonymes observés avant la phase 01). Ils restent bien
+    // présents dans EventRecord pour la découverte/corrélation.
+    const SEMANTIC_KEY_IDENTIFIERS: &[&str] = &[
+        "enb_ue_s1ap_id",
+        "mme_ue_s1ap_id",
+        "erab_teid",
+        "bearer_f_teid",
+        "f_teid_iface",
+        "bearer_f_teid_iface",
+        "ebi",
+        "bearer_ebi",
+        "ran_ue_ngap_id",
+        "amf_ue_ngap_id",
+        "pdu_session_id",
+        "dnn",
+        "network_instance",
+        "snssai",
+        "s_nssai",
+        "seid",
+        "f_seid",
+        "teid",
+        "tunnel_endpoint_ip",
+        "tunnel_direction",
+        "transport_layer_address",
+        "ue_ip",
+        "inner_source_ip",
+        "inner_destination_ip",
+        "qfi",
+        "sm_context_reference",
+        "subscriber_pseudonym",
+        "imsi_pseudonym",
+    ];
     let identifiers = event
         .identifiers
         .iter()
+        .filter(|(name, _)| SEMANTIC_KEY_IDENTIFIERS.contains(&name.as_str()))
         .map(|(name, value)| format!("{name}={value}"))
         .collect::<Vec<_>>()
         .join("|");
@@ -1001,7 +1058,23 @@ fn publication_semantic_key(event: &EventRecord) -> String {
         .into_iter()
         .flatten()
         .filter_map(|item| item.get("value").and_then(Value::as_str))
-        .collect::<Vec<_>>()
+        .flat_map(|value| value.split(','))
+        .filter_map(|part| {
+            let (name, value) = part.split_once('=')?;
+            let name = name.trim().to_ascii_lowercase();
+            [
+                "teid",
+                "ipv4",
+                "seid",
+                "network_instance",
+                "dnn",
+                "snssai",
+                "s_nssai",
+            ]
+            .contains(&name.as_str())
+            .then(|| format!("{name}={}", value.trim()))
+        })
+        .collect::<Vec<String>>()
         .join("|");
     format!(
         "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
@@ -2354,6 +2427,154 @@ mod tests {
         for name in ["enb_ue_s1ap_id", "mme_ue_s1ap_id", "erab_teid", "bearer_f_teid"] {
             assert!(representative.first_identifier(name).is_some(), "{name} compacted away");
         }
+    }
+
+    #[test]
+    fn publication_key_ignores_transaction_ids_but_representative_keeps_them() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "oiran-publication-key-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        for (packet, sequence, pdr) in [(1, "100", "1"), (2, "101", "2")] {
+            let record = serde_json::json!({
+                "event_id": format!("event-{packet}"),
+                "capture_id": "cap",
+                "capture_point_id": "N4",
+                "timestamp": {"seconds":1,"nanoseconds":packet,"raw_ticks":packet,"display":"1Z"},
+                "interface": "N4",
+                "protocol": "PFCP",
+                "message_name": "SessionModificationRequest",
+                "source_endpoint": {"address":"a","network_function":"SMF"},
+                "destination_endpoint": {"address":"b","network_function":"UPF"},
+                "direction": "CORE_TO_CORE",
+                "session_identifiers": [
+                    {"name":"seid","value":"42","pseudonymized":false},
+                    {"name":"teid","value":"0x01020304","pseudonymized":false},
+                    {"name":"pfcp_sequence","value":sequence,"pseudonymized":false},
+                    {"name":"pdr_id","value":pdr,"pseudonymized":false}
+                ],
+                "information_elements": [
+                    {"name":"Create PDR","value":format!("pdr_id={pdr},far_id={pdr},teid=0x01020304,ipv4=10.0.0.2")}
+                ],
+                "decoding_status": "DECODED",
+                "decoder_name": "test",
+                "decoder_version": "1",
+                "raw_payload_reference": "sha256:test",
+                "packet_references": [{"source_file":"x","packet_number":packet,"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}],
+                "errors": []
+            });
+            writeln!(writer, "{record}").unwrap();
+        }
+        writer.flush().unwrap();
+
+        let mut progress = Vec::new();
+        let index = load_path_streaming_representatives_with_progress(&path, |read, retained| {
+            progress.push((read, retained));
+        })
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(index.source_event_count, 2);
+        assert_eq!(index.events.len(), 1, "transaction ids must not defeat compaction");
+        assert_eq!(progress.last(), Some(&(2, 1)));
+        let representative = &index.events[0];
+        assert!(representative.first_identifier("pfcp_sequence").is_some());
+        assert!(representative.first_identifier("pdr_id").is_some());
+    }
+
+    /// Gate mémoire 2.11.12. Exécution volontairement explicite :
+    /// `cargo test -p session-engine --release publication_scale_1_5m -- --ignored --nocapture`
+    ///
+    /// Le profil reproduit le facteur aggravant de production : gros IE de
+    /// rendu, 1,5 M observations, séquence/identifiant de règle variant à
+    /// chaque message, mais seulement 4 096 états de session/tunnel durables.
+    #[test]
+    #[ignore = "scale gate: writes about 3.9 GB and parses 1.5 M events"]
+    fn publication_scale_1_5m_stays_below_two_gib() {
+        use std::io::Write;
+
+        const EVENT_COUNT: usize = 1_500_000;
+        const STATE_COUNT: usize = 4_096;
+        const TWO_GIB_KB: u64 = 2 * 1024 * 1024;
+        let path = std::env::temp_dir().join(format!(
+            "oiran-publication-scale-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("scale")
+        ));
+        let mut writer = std::io::BufWriter::with_capacity(
+            1024 * 1024,
+            std::fs::File::create(&path).unwrap(),
+        );
+        let render_payload = "x".repeat(1_500);
+        for packet in 0..EVENT_COUNT {
+            let state = packet % STATE_COUNT;
+            let record = serde_json::json!({
+                "event_id": format!("synthetic-{packet:08x}"),
+                "capture_id": "synthetic-production-profile",
+                "capture_point_id": "N4",
+                "timestamp": {"seconds":1,"nanoseconds":packet % 1_000_000_000,"raw_ticks":packet,"display":"synthetic"},
+                "interface": "N4",
+                "protocol": "PFCP",
+                "message_name": "SessionModificationRequest",
+                "source_endpoint": {"address":"10.0.0.1","network_function":"SMF"},
+                "destination_endpoint": {"address":"10.0.0.2","network_function":"UPF"},
+                "direction": "CORE_TO_CORE",
+                "session_identifiers": [
+                    {"name":"seid","value":format!("{state}"),"pseudonymized":false},
+                    {"name":"teid","value":format!("0x{state:08x}"),"pseudonymized":false},
+                    {"name":"pfcp_sequence","value":format!("{packet}"),"pseudonymized":false},
+                    {"name":"pdr_id","value":format!("{packet}"),"pseudonymized":false}
+                ],
+                "information_elements": [
+                    {"name":"F-TEID","value":format!("teid=0x{state:08x},ipv4=10.0.0.2")},
+                    {"name":"render_payload","value":render_payload}
+                ],
+                "decoding_status": "DECODED",
+                "decoder_name": "synthetic",
+                "decoder_version": "1",
+                "raw_payload_reference": "sha256:synthetic",
+                "packet_references": [{"source_file":"synthetic","packet_number":packet,"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}],
+                "errors": []
+            });
+            writeln!(writer, "{record}").unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+        let input_bytes = std::fs::metadata(&path).unwrap().len();
+
+        let index = load_path_streaming_representatives_with_progress(&path, |read, retained| {
+            if read % 100_000 == 0 {
+                eprintln!(
+                    "PUBLICATION_SCALE_PROGRESS scanned_events={read} retained_events={retained}"
+                );
+            }
+        })
+        .unwrap();
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let vmhwm_kb = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        eprintln!(
+            "PUBLICATION_SCALE_RESULT source_events={} representatives={} input_bytes={} vmhwm_kb={vmhwm_kb}",
+            index.source_event_count,
+            index.events.len(),
+            input_bytes,
+        );
+        assert_eq!(index.source_event_count, EVENT_COUNT);
+        assert_eq!(index.events.len(), STATE_COUNT);
+        assert!(
+            vmhwm_kb < TWO_GIB_KB,
+            "VmHWM {vmhwm_kb} KiB must remain below 2 GiB"
+        );
     }
 
     fn event(

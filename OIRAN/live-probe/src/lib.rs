@@ -5220,8 +5220,10 @@ impl CaptureManager {
         zero_event_captures: Vec<String>,
     ) -> Result<LiveDataset, String> {
         let events_path = dataset_dir.join("oiran_events.jsonl");
-        release_unused_heap_pages();
         trace_publication_rss_reset();
+        trace_publication_rss("00a-before-heap-release", None);
+        release_unused_heap_pages();
+        trace_publication_rss("00b-after-heap-release", None);
         trace_publication_rss("00-after-streaming-merge", None);
         // 2.7.24 + 2.9.18-fu3 + 2.10.3 : stream the JSONL into
         // compact semantic representatives. Pré-2.10.3 on faisait
@@ -5237,7 +5239,16 @@ impl CaptureManager {
         // Quand la rétention est active, la passe est conservée
         // (archive_stale_captures peut supprimer des captures
         // entières du hot view).
-        let index = session_engine::load_path_streaming_representatives(&events_path)?;
+        let index = session_engine::load_path_streaming_representatives_with_progress(
+            &events_path,
+            |scanned_events, retained_events| {
+                trace_publication_rss_progress(
+                    "00c-streaming-representatives",
+                    scanned_events,
+                    retained_events,
+                );
+            },
+        )?;
         let event_count = index.source_event_count;
         let mut events = index.events;
         let retention_active = retention_cutoff_epoch_s().is_some();
@@ -8209,13 +8220,15 @@ pub struct DatasetRestoreReport {
 /// (anon ≈ 1,06 GB alors que file retombait à 4 KB au kill).
 ///
 /// Format ligne unique parsable par ANR2 :
-/// `PUBLICATION_RSS_TRACE phase=<name> indexed_events=<N>
+/// `PUBLICATION_RSS_TRACE phase=<name> scanned_events=<N> indexed_events=<N>
 ///   anon_kb=<N> file_kb=<N> vmrss_kb=<N> vmhwm_kb=<N>
-///   vmpeak_kb=<N>`
+///   vmpeak_kb=<N> cgroup_anon_kb=<N> cgroup_file_kb=<N>
+///   cgroup_shmem_kb=<N> cgroup_peak_kb=<N>`
 ///
-/// `RssAnon` + `RssFile` viennent de `/proc/self/status` — ces
-/// deux compteurs sont exactement ceux que le noyau publie dans
-/// `memory.stat` du cgroup au moment de l'OOM.
+/// Les champs `Rss*` viennent de `/proc/self/status`, à titre de diagnostic.
+/// Depuis 2.11.12, la source de gate est lue directement depuis
+/// `/sys/fs/cgroup/system.slice/oiran-api.service/memory.stat` et
+/// `memory.peak` ; elle mesure le cgroup entier, pas seulement le processus.
 /// 2.10.3 (devmat, revue 2.10.2 point 2) : horodatage de la
 /// première trace de chaque publication. ANR2 peut maintenant
 /// calculer `elapsed_ms` par phase — c'est la métrique nécessaire
@@ -8236,6 +8249,18 @@ pub(crate) fn trace_publication_rss_reset() {
 }
 
 pub(crate) fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) {
+    trace_publication_rss_detail(phase, 0, indexed_events.unwrap_or(0));
+}
+
+pub(crate) fn trace_publication_rss_progress(
+    phase: &str,
+    scanned_events: usize,
+    indexed_events: usize,
+) {
+    trace_publication_rss_detail(phase, scanned_events, indexed_events);
+}
+
+fn trace_publication_rss_detail(phase: &str, scanned_events: usize, indexed_events: usize) {
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     let value = |name: &str| {
         status
@@ -8255,14 +8280,39 @@ pub(crate) fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) 
     } else {
         now_ms - start_ms
     };
+    // La source de vérité production est le memcg du service, pas une
+    // estimation applicative. Ce chemin exact est également imposé par la
+    // procédure de gate 2.11.12. Hors systemd (tests/dev), les champs valent 0.
+    const SERVICE_CGROUP: &str = "/sys/fs/cgroup/system.slice/oiran-api.service";
+    let memory_stat = fs::read_to_string(format!("{SERVICE_CGROUP}/memory.stat"))
+        .unwrap_or_default();
+    let cgroup_value = |name: &str| {
+        memory_stat
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next() == Some(name))
+                    .then(|| fields.next())
+                    .flatten()
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+    };
+    let cgroup_peak_kb = fs::read_to_string(format!("{SERVICE_CGROUP}/memory.peak"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        / 1024;
     eprintln!(
-        "PUBLICATION_RSS_TRACE phase={phase} elapsed_ms={elapsed_ms} indexed_events={} anon_kb={} file_kb={} vmrss_kb={} vmhwm_kb={} vmpeak_kb={}",
-        indexed_events.unwrap_or(0),
+        "PUBLICATION_RSS_TRACE phase={phase} elapsed_ms={elapsed_ms} scanned_events={scanned_events} indexed_events={indexed_events} anon_kb={} file_kb={} vmrss_kb={} vmhwm_kb={} vmpeak_kb={} cgroup_source={SERVICE_CGROUP} cgroup_anon_kb={} cgroup_file_kb={} cgroup_shmem_kb={} cgroup_peak_kb={cgroup_peak_kb}",
         value("RssAnon"),
         value("RssFile"),
         value("VmRSS"),
         value("VmHWM"),
         value("VmPeak"),
+        cgroup_value("anon") / 1024,
+        cgroup_value("file") / 1024,
+        cgroup_value("shmem") / 1024,
     );
 }
 
