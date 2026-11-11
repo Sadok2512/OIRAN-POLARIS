@@ -1,5 +1,12 @@
 # Changelog
 
+## OIRAN API 2.11.16 — 2026-11-11 — gate phase 13 mesuré et scan callflow accéléré
+
+- Le compteur `PUBLICATION_RSS_TRACE elapsed_ms` démarre désormais sur la ligne `CONTINUOUS_PUBLICATION_INCREMENTAL phase=begin`, avant le décodage du lot, afin de coïncider avec la méthode chronométrique du gate fantôme.
+- Pour un index compact d'au plus 262 144 représentants, la phase 10 reconstruit les callflows depuis cet index déjà en mémoire, par lots bornés de 32, puis le libère. La recette 2.11.15 en comptait 240 097 : son second balayage de 3,4 Go disparaît. Au-delà du seuil, le chemin disque reste actif et extrait `event_id` au niveau JSON racine sans désérialiser les arbres décodés ; le repli serde conserve les identifiants échappés ou atypiques.
+- Régression couverte pour un `event_id` racine, un champ homonyme imbriqué, les espaces JSON, les chaînes échappées et les lignes invalides.
+- Versions : `oiran-api` et web 2.11.16, `live-probe` 0.5.10. Décodeurs, `session-engine` et règles de corrélation inchangés.
+
 ## OIRAN API 2.11.15 — 2026-11-11 — shard 0 strictement immuable sur overlayfs
 
 - La migration du monolithe historique en shard 0 ne crée plus de hard-link dans `.dataset-next` et ne renomme plus le répertoire `dataset`. Le manifeste référence directement `oiran_events.jsonl`; ce fichier n'est ouvert qu'en lecture et ne subit ni écriture, ni renommage, ni `fsync`, ni changement de métadonnées.
