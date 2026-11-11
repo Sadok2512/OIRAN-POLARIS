@@ -32,6 +32,7 @@ use session_engine::{
     ReconstructionHints,
 };
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Read, Write},
@@ -198,6 +199,10 @@ fn event_id_set_mem_cap() -> usize {
 /// cgroup l'autorise et si le nombre de scans JSONL par
 /// publication (= ceil(sessions / K)) devient significatif.
 const SESSION_PUBLICATION_BATCH_SIZE_DEFAULT: usize = 32;
+/// Keep the already compacted representatives for session callflow materialization
+/// only while their cardinality remains below the measured 2 GiB gate envelope.
+/// Higher-cardinality publications retain the disk-backed phase-10 path.
+const IN_MEMORY_SESSION_PUBLICATION_MAX_EVENTS: usize = 262_144;
 fn session_publication_batch_size() -> usize {
     std::env::var("OIRAN_SESSION_PUBLICATION_BATCH_SIZE")
         .ok()
@@ -3496,6 +3501,7 @@ impl CaptureManager {
                     .map(|segment| base.join("pcap").join(&segment.owned_file))
                     .collect::<BTreeSet<_>>();
                 cycle_trace.publication_started = true;
+                trace_publication_rss_prestart();
                 eprintln!(
                     "{}",
                     serde_json::json!({
@@ -5518,7 +5524,7 @@ impl CaptureManager {
         let event_paths = event_paths
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| vec![events_path.clone()]);
-        trace_publication_rss_reset();
+        trace_publication_rss_begin();
         trace_publication_rss("00a-before-heap-release", None);
         release_unused_heap_pages();
         trace_publication_rss("00b-after-heap-release", None);
@@ -5657,7 +5663,9 @@ impl CaptureManager {
         // manifeste). Fix 2.10.2 :
         //   * LTE + runtime flows construits d'abord (ont encore besoin
         //     de `events`).
-        //   * `drop(events)` AVANT la construction des session plans.
+        //   * `drop(events)` AVANT la construction des session plans lorsque
+        //     l'index dépasse le seuil borné ; sous ce seuil, 2.11.16 le garde
+        //     seulement pendant le lot courant pour éviter un rescan de 3,4 Go.
         //   * `SessionPlan.ids` → `SpillingEventIdSet` disk-backed
         //     (~1,5 MiB RAM max par session, le reste sur disque sous
         //     `.publish-staging/session-ids/<idx>/`).
@@ -5672,9 +5680,20 @@ impl CaptureManager {
             .collect();
         trace_publication_rss("08-after-runtime-flows-built", Some(events.len()));
         let indexed_events_count = events.len();
-        drop(events);
-        release_unused_heap_pages();
-        trace_publication_rss("09-after-events-dropped", None);
+        let retained_publication_events = if indexed_events_count
+            <= IN_MEMORY_SESSION_PUBLICATION_MAX_EVENTS
+        {
+            trace_publication_rss(
+                "09-events-retained-for-bounded-session-callflows",
+                Some(indexed_events_count),
+            );
+            Some(events)
+        } else {
+            drop(events);
+            release_unused_heap_pages();
+            trace_publication_rss("09-after-events-dropped", None);
+            None
+        };
 
         // 2.10.3 (devmat, revue 2.10.2 point 2) : boucle de session
         // BATCHÉE. La 2.10.2 faisait 1 full JSONL scan PAR SESSION
@@ -5757,7 +5776,7 @@ impl CaptureManager {
             // scratchs dont la SpillingEventIdSet le contient.
             // La passe ne parse pas tout l'event, juste `event_id`
             // (clone du cheap-peek 2.9.17 depuis `load_events_by_ids`).
-            {
+            if retained_publication_events.is_none() {
                 let mut scratch_writers: Vec<BufWriter<fs::File>> = entries
                     .iter()
                     .map(|entry| {
@@ -5772,14 +5791,12 @@ impl CaptureManager {
                     for line in reader.lines() {
                         let line = line.map_err(display_error)?;
                         if line.trim().is_empty() { continue; }
-                        #[derive(serde::Deserialize)]
-                        struct IdOnly<'a> { event_id: &'a str }
-                        let id_only: IdOnly = match serde_json::from_str(&line) {
-                            Ok(value) => value,
-                            Err(_) => continue,
+                        let event_id = match event_id_from_json_line(&line) {
+                            Some(value) => value,
+                            None => continue,
                         };
                         for (idx, entry) in entries.iter().enumerate() {
-                            if entry.ids.contains(id_only.event_id).map_err(display_error)? {
+                            if entry.ids.contains(event_id.as_ref()).map_err(display_error)? {
                                 scratch_writers[idx].write_all(line.as_bytes()).map_err(display_error)?;
                                 scratch_writers[idx].write_all(b"\n").map_err(display_error)?;
                             }
@@ -5801,11 +5818,20 @@ impl CaptureManager {
                     ids,
                     scratch_path,
                 } = entry;
+                let selected = if let Some(indexed) = retained_publication_events.as_ref() {
+                    let mut selected = Vec::new();
+                    for event in indexed {
+                        if ids.contains(&event.event_id).map_err(display_error)? {
+                            selected.push(event.clone());
+                        }
+                    }
+                    selected
+                } else {
+                    let scratch_bytes = fs::read(&scratch_path).map_err(display_error)?;
+                    let _ = fs::remove_file(&scratch_path);
+                    session_engine::load_jsonl(&scratch_bytes[..])?
+                };
                 drop(ids); // libère chunks + tmp_dir avant le reconstruct.
-                let scratch_bytes =
-                    fs::read(&scratch_path).map_err(display_error)?;
-                let _ = fs::remove_file(&scratch_path);
-                let selected = session_engine::load_jsonl(&scratch_bytes[..])?;
                 let selected_ids: std::collections::BTreeSet<String> = selected
                     .iter()
                     .map(|event| event.event_id.clone())
@@ -5856,6 +5882,8 @@ impl CaptureManager {
                 Some(indexed_events_count),
             );
         }
+        drop(retained_publication_events);
+        release_unused_heap_pages();
         trace_publication_rss(
             "10a-after-session-callflows",
             Some(indexed_events_count),
@@ -8761,6 +8789,7 @@ pub struct DatasetRestoreReport {
 /// le compteur est réinitialisé via `trace_publication_rss_reset`
 /// pour qu'`elapsed_ms` commence à 0.
 static PUBLICATION_RSS_START_UNIX_MS: AtomicU64 = AtomicU64::new(0);
+static PUBLICATION_RSS_PRESTARTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn trace_publication_rss_reset() {
     let now_ms = std::time::SystemTime::now()
@@ -8768,6 +8797,94 @@ pub(crate) fn trace_publication_rss_reset() {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     PUBLICATION_RSS_START_UNIX_MS.store(now_ms, Ordering::Relaxed);
+}
+
+fn trace_publication_rss_prestart() {
+    trace_publication_rss_reset();
+    PUBLICATION_RSS_PRESTARTED.store(true, Ordering::Release);
+}
+
+fn trace_publication_rss_begin() {
+    if !PUBLICATION_RSS_PRESTARTED.swap(false, Ordering::AcqRel) {
+        trace_publication_rss_reset();
+    }
+}
+
+/// Reads the top-level `event_id` without deserializing the remaining JSON.
+/// Publication phase 10 only needs this one field, while production lines can
+/// contain a large `decoded_ie_tree`. The common path is allocation-free; the
+/// serde fallback preserves compatibility with an escaped or unusual key.
+fn event_id_from_json_line(line: &str) -> Option<Cow<'_, str>> {
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    let mut depth = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                index += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b'"' => {
+                let start = index + 1;
+                index = start;
+                let mut escaped = false;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => {
+                            escaped = true;
+                            index = index.saturating_add(2);
+                        }
+                        b'"' => break,
+                        _ => index += 1,
+                    }
+                }
+                if index >= bytes.len() {
+                    break;
+                }
+                let end = index;
+                index += 1;
+                if depth != 1 || escaped || &line[start..end] != "event_id" {
+                    continue;
+                }
+                let mut cursor = index;
+                while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                }
+                if bytes.get(cursor) != Some(&b':') {
+                    continue;
+                }
+                cursor += 1;
+                while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                }
+                if bytes.get(cursor) != Some(&b'"') {
+                    break;
+                }
+                let value_start = cursor + 1;
+                cursor = value_start;
+                while cursor < bytes.len() {
+                    match bytes[cursor] {
+                        b'\\' => break,
+                        b'"' => return Some(Cow::Borrowed(&line[value_start..cursor])),
+                        _ => cursor += 1,
+                    }
+                }
+                break;
+            }
+            _ => index += 1,
+        }
+    }
+    #[derive(Deserialize)]
+    struct IdOnly {
+        event_id: String,
+    }
+    serde_json::from_str::<IdOnly>(line)
+        .ok()
+        .map(|value| Cow::Owned(value.event_id))
 }
 
 pub(crate) fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) {
@@ -10072,6 +10189,45 @@ fn display_error(error: std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_ten_event_id_extractor_reads_only_the_top_level_key() {
+        let line = r#"{"decoded_ie_tree":{"event_id":"nested-decoy"}, "event_id" : "capture-001:42", "message_name":"Registration Accept"}"#;
+        assert_eq!(event_id_from_json_line(line).as_deref(), Some("capture-001:42"));
+    }
+
+    #[test]
+    fn phase_ten_event_id_extractor_falls_back_for_escaped_values() {
+        let line = r#"{"event_id":"capture-001:\u0034\u0032","decoded_ie_tree":{}}"#;
+        assert_eq!(event_id_from_json_line(line).as_deref(), Some("capture-001:42"));
+        assert!(event_id_from_json_line("not-json").is_none());
+    }
+
+    #[test]
+    #[ignore = "read-only production-scale benchmark; set OIRAN_PHASE10_BENCH_PATH"]
+    fn phase_ten_event_id_extractor_scans_a_scale_jsonl_without_logging_values() {
+        let path = std::env::var("OIRAN_PHASE10_BENCH_PATH")
+            .expect("OIRAN_PHASE10_BENCH_PATH is required");
+        let metadata = fs::metadata(&path).expect("benchmark input metadata");
+        let reader = BufReader::with_capacity(
+            STREAM_CHUNK_BYTES,
+            fs::File::open(path).expect("benchmark input open"),
+        );
+        let started = Instant::now();
+        let mut lines = 0u64;
+        for line in reader.lines() {
+            let line = line.expect("benchmark input line");
+            assert!(event_id_from_json_line(&line).is_some());
+            lines = lines.saturating_add(1);
+        }
+        eprintln!(
+            "PHASE10_EVENT_ID_SCAN bytes={} lines={} elapsed_ms={}",
+            metadata.len(),
+            lines,
+            started.elapsed().as_millis()
+        );
+        assert!(lines > 0);
+    }
 
     fn lte_event(
         id: &str,
