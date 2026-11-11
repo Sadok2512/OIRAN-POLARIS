@@ -2,8 +2,8 @@
 //! Specification baseline: 3GPP TS 24.501 Release 17 (5G); TS 24.301 (EPS).
 
 use event_schema::{
-    pseudonym, pseudonym_subscriber_tbcd, sha256_hex, DecodeStatus, InformationElement,
-    NamedValue, PseudonymKey,
+    pseudonym, pseudonym_subscriber_digits, pseudonym_subscriber_tbcd, sha256_hex,
+    subscriber_digits_tbcd, DecodeStatus, InformationElement, NamedValue, PseudonymKey,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -245,18 +245,19 @@ fn parse_5gmm_body(
             if 6 + len > payload.len() {
                 return mark_truncated(msg, "5GS Mobile Context");
             }
+            let pseudo = pseudonym_5gs_mobile_identity(
+                pseudonym_key,
+                &payload[6..6 + len],
+            );
             msg.information_elements.push(ie(
                 "identity_pseudonym",
                 &payload[6..6 + len],
-                Some(format!(
-                    "pseudonym={}",
-                    pseudonym(pseudonym_key, "nas-5gs-mobile-identity", &payload[6..6 + len])
-                )),
+                Some(format!("pseudonym={pseudo}")),
                 DecodeStatus::Decoded,
             ));
             msg.identifiers.push(NamedValue {
                 name: "subscriber_pseudonym".into(),
-                value: pseudonym(pseudonym_key, "nas-5gs-mobile-identity", &payload[6..6 + len]),
+                value: pseudo,
                 pseudonymized: true,
             });
             parse_optional_tlvs(msg, &payload[6 + len..], 6 + len);
@@ -379,6 +380,34 @@ fn parse_5gmm_body(
             }
         }
     }
+}
+
+fn pseudonym_5gs_mobile_identity(key: &PseudonymKey, value: &[u8]) -> String {
+    // TS 24.501 5GS mobile identity, SUCI with null protection scheme:
+    // canonical IMSI = MCC || MNC || MSIN. Routing indicator, scheme id and
+    // public-key id are representation metadata and are never hashed.
+    if value.len() >= 9 && value[0] & 0x07 == 1 && value[6] & 0x0f == 0 {
+        let mut digits = Vec::with_capacity(15);
+        for nibble in [
+            value[1] & 0x0f,
+            value[1] >> 4,
+            value[2] & 0x0f,
+            value[3] & 0x0f,
+            value[3] >> 4,
+            value[2] >> 4,
+        ] {
+            if nibble <= 9 {
+                digits.push(b'0' + nibble);
+            } else if nibble != 0x0f {
+                return pseudonym(key, "nas-5gs-mobile-identity", value);
+            }
+        }
+        if let Some(msin) = subscriber_digits_tbcd(&value[8..], false) {
+            digits.extend(msin);
+            return pseudonym_subscriber_digits(key, &digits);
+        }
+    }
+    pseudonym(key, "nas-5gs-mobile-identity", value)
 }
 
 fn decode_5gsm(payload: &[u8], source_offset: usize) -> NasMessage {
@@ -1553,6 +1582,29 @@ mod tests {
         // TS 24.301 §9.9.3.12 identity type 1 = subscriber-level identity.
         assert_eq!(identity_type.value, "1");
         assert!(identity_type.value.bytes().all(|byte| byte.is_ascii_digit()));
+    }
+
+    #[test]
+    fn eps_imsi_and_5gs_null_scheme_suci_share_canonical_digits() {
+        let key = test_key();
+        let eps = [
+            0x07, 0x41, 0x01, 0x08, 0x09, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98,
+        ];
+        let suci = [
+            0x01, 0x00, 0xf1, 0x10, 0xff, 0xff, 0x00, 0x00, 0x10, 0x32, 0x54, 0x76, 0x98,
+        ];
+        let mut five_gs = vec![0x7e, 0x00, 0x41, 0x01, 0x00, suci.len() as u8];
+        five_gs.extend_from_slice(&suci);
+
+        let eps_message = super::decode(&eps, &key);
+        let five_gs_message = super::decode(&five_gs, &key);
+        let identifier = |message: &NasMessage| {
+            message.identifiers.iter()
+                .find(|value| value.name == "subscriber_pseudonym")
+                .map(|value| value.value.clone())
+                .expect("decoder must emit subscriber_pseudonym")
+        };
+        assert_eq!(identifier(&eps_message), identifier(&five_gs_message));
     }
 
     #[test]

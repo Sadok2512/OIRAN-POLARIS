@@ -1700,22 +1700,187 @@ mod tests {
     }
 
     #[test]
-    fn nas_eps_pseudonym_is_the_exact_s1mme_s6a_edge_source_2_11_9() {
-        let pseudo = "psn-opaque-shared";
-        let radio = e("radio", "S1-MME", "S1AP", "InitialUEMessage", 1,
-            &[("enb_ue_s1ap_id", "41")], json!([]));
-        let mut nas = e("nas", "S1-MME", "NAS-EPS-MM", "Attach Request", 1,
-            &[("enb_ue_s1ap_id", "41"), ("subscriber_pseudonym", pseudo)], json!([]));
-        nas.parent_event_id = Some(radio.event_id.clone());
-        let s6a = e("s6a", "S6a", "DIAMETER", "Authentication-Information-Request", 2,
-            &[("subscriber_pseudonym", pseudo)], json!([]));
-        let events = vec![radio, nas, s6a];
+    fn real_decoders_publication_and_correlation_share_subscriber_pseudonym_2_11_10() {
+        use decoder_diameter::DiameterDecoder;
+        use decoder_gtpv2c::Gtpv2cDecoder;
+        use decoder_s1ap::S1apDecoder;
+        use event_schema::{Endpoint, ExactTimestamp, PacketReference, PseudonymKey};
+        use plugin_runtime::{DecoderInput, ProtocolDecoder};
 
-        let edge = correlate_lte_evidence(&events).into_iter()
+        fn s1ap_pdu(kind: u8, procedure: u8, ies: &[(u16, u8, &[u8])]) -> Vec<u8> {
+            let mut value = vec![0, (ies.len() >> 8) as u8, ies.len() as u8];
+            for (id, criticality, body) in ies {
+                value.extend_from_slice(&id.to_be_bytes());
+                value.push(*criticality << 6);
+                value.push(body.len() as u8);
+                value.extend_from_slice(body);
+            }
+            let mut output = vec![kind << 5, procedure, 0, value.len() as u8];
+            output.extend_from_slice(&value);
+            output
+        }
+
+        fn gtpv2_ie(kind: u8, instance: u8, value: &[u8]) -> Vec<u8> {
+            let mut output = vec![kind];
+            output.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            output.push(instance & 0x0f);
+            output.extend_from_slice(value);
+            output
+        }
+
+        fn gtpv2_message(message_type: u8, sequence: u32, body: &[u8]) -> Vec<u8> {
+            let mut output = vec![0x40, message_type];
+            output.extend_from_slice(&((4 + body.len()) as u16).to_be_bytes());
+            output.extend_from_slice(&[
+                (sequence >> 16) as u8,
+                (sequence >> 8) as u8,
+                sequence as u8,
+                0,
+            ]);
+            output.extend_from_slice(body);
+            output
+        }
+
+        fn diameter_avp(code: u32, value: &[u8]) -> Vec<u8> {
+            let total = 8 + value.len();
+            let mut output = Vec::new();
+            output.extend_from_slice(&code.to_be_bytes());
+            output.extend_from_slice(&[0x40, (total >> 16) as u8, (total >> 8) as u8, total as u8]);
+            output.extend_from_slice(value);
+            output.resize(output.len() + (4 - total % 4) % 4, 0);
+            output
+        }
+
+        fn diameter_message(command: u32, body: &[u8]) -> Vec<u8> {
+            let total = 20 + body.len();
+            let mut output = vec![
+                1,
+                (total >> 16) as u8,
+                (total >> 8) as u8,
+                total as u8,
+                0x80,
+                (command >> 16) as u8,
+                (command >> 8) as u8,
+                command as u8,
+            ];
+            output.extend_from_slice(&16_777_251u32.to_be_bytes());
+            output.extend_from_slice(&0x11223344u32.to_be_bytes());
+            output.extend_from_slice(&0x55667788u32.to_be_bytes());
+            output.extend_from_slice(body);
+            output
+        }
+
+        fn packet(number: u64) -> Vec<PacketReference> {
+            vec![PacketReference {
+                source_file: "synthetic.pcap".into(),
+                source_sha256: None,
+                packet_number: number,
+                byte_offset: 0,
+                interface_id: 0,
+                link_type: Some(1),
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: 128,
+                original_length: 128,
+            }]
+        }
+
+        fn timestamp(number: u64) -> ExactTimestamp {
+            ExactTimestamp {
+                seconds: 1,
+                nanoseconds: number as u32,
+                raw_ticks: number,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            }
+        }
+
+        let key = PseudonymKey::from_bytes([0x5a; 32]);
+        let eps_identity = [0x09, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98];
+        let mut nas = vec![0x07, 0x41, 0x01, eps_identity.len() as u8];
+        nas.extend_from_slice(&eps_identity);
+        let mut nas_open_type = vec![nas.len() as u8];
+        nas_open_type.extend_from_slice(&nas);
+        let enb_ue = [0x00, 0x2a];
+        let s1ap = s1ap_pdu(0, 12, &[(8, 0, &enb_ue), (26, 0, &nas_open_type)]);
+        let s1_packets = packet(1);
+        let s1_timestamp = timestamp(1);
+        let s1_input = DecoderInput {
+            capture_id: "cap-s1",
+            packet_references: &s1_packets,
+            timestamp: &s1_timestamp,
+            interface: "S1-MME",
+            source_endpoint: Endpoint { address: "10.0.0.1".into(), port: Some(36412), network_function: Some("eNB".into()) },
+            destination_endpoint: Endpoint { address: "10.0.0.2".into(), port: Some(36412), network_function: Some("MME".into()) },
+            payload: &s1ap,
+            raw_payload_reference: "sha256:s1",
+            pseudonym_key: &key,
+        };
+        let mut decoded = S1apDecoder.decode(&s1_input).events;
+
+        let gtpv2_identity = [0x00, 0x01, 0x01, 0x21, 0x43, 0x65, 0x87, 0xf9];
+        let gtpv2 = gtpv2_message(32, 7, &gtpv2_ie(1, 0, &gtpv2_identity));
+        let gtp_packets = packet(2);
+        let gtp_timestamp = timestamp(2);
+        let gtp_input = DecoderInput {
+            capture_id: "cap-s11",
+            packet_references: &gtp_packets,
+            timestamp: &gtp_timestamp,
+            interface: "S11",
+            source_endpoint: Endpoint { address: "10.0.0.2".into(), port: Some(2123), network_function: Some("MME".into()) },
+            destination_endpoint: Endpoint { address: "10.0.0.3".into(), port: Some(2123), network_function: Some("SGW".into()) },
+            payload: &gtpv2,
+            raw_payload_reference: "sha256:s11",
+            pseudonym_key: &key,
+        };
+        decoded.extend(Gtpv2cDecoder.decode(&gtp_input).events);
+
+        let diameter_identity = [48, 48, 49, 48, 49, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57];
+        let diameter = diameter_message(318, &diameter_avp(1, &diameter_identity));
+        let diameter_packets = packet(3);
+        let diameter_timestamp = timestamp(3);
+        let diameter_input = DecoderInput {
+            capture_id: "cap-s6a",
+            packet_references: &diameter_packets,
+            timestamp: &diameter_timestamp,
+            interface: "S6a",
+            source_endpoint: Endpoint { address: "10.0.0.2".into(), port: Some(3868), network_function: Some("MME".into()) },
+            destination_endpoint: Endpoint { address: "10.0.0.4".into(), port: Some(3868), network_function: Some("HSS".into()) },
+            payload: &diameter,
+            raw_payload_reference: "sha256:s6a",
+            pseudonym_key: &key,
+        };
+        decoded.extend(DiameterDecoder.decode(&diameter_input).events);
+
+        let path = std::env::temp_dir().join(format!(
+            "oiran-2-11-10-subscriber-{}.jsonl",
+            std::process::id()
+        ));
+        let jsonl = decoded.iter().map(|event| event.to_json()).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, format!("{jsonl}\n")).expect("write publication input");
+        let publication = session_engine::load_path_streaming_index(&path)
+            .expect("compact publication");
+        let _ = std::fs::remove_file(&path);
+
+        let pseudo = |interface: &str, message: &str| {
+            publication.events.iter()
+                .find(|event| event.interface == interface && event.message_name == message)
+                .and_then(|event| event.first_identifier("subscriber_pseudonym"))
+                .map(str::to_owned)
+                .unwrap_or_else(|| panic!("missing compacted subscriber pseudonym for {interface}/{message}"))
+        };
+        let nas_pseudo = pseudo("S1-MME", "Attach Request");
+        assert_eq!(nas_pseudo, pseudo("S11", "CreateSessionRequest"));
+        assert_eq!(nas_pseudo, pseudo("S6a", "Authentication-Information-Request"));
+
+        let edge = correlate_lte_evidence(&publication.events).into_iter()
             .find(|edge| edge.rule_id == "s1mme-s6a-pseudonym")
-            .expect("NAS-EPS pseudonym carrier must correlate with S6a");
-        assert_eq!(edge.source_event_id, "nas");
-        assert_eq!(edge.target_event_id, "s6a");
+            .expect("published decoder events must correlate S1-MME with S6a");
         assert_eq!(edge.confidence, "EXACT");
         assert_eq!(edge.matching_identifiers, ["subscriber_pseudonym"]);
     }

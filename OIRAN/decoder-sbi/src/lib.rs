@@ -1,9 +1,9 @@
 //! Native bounded HTTP/2 and 5G SBI transaction decoder.
 
 use event_schema::{
-    normalize_ip, normalize_teid_hex, pseudonym, sha256_hex, DecodeStatus, Direction, Endpoint,
+    normalize_ip, pseudonym_subscriber_text, sha256_hex, DecodeStatus, Direction, Endpoint,
     EvidenceReference, EvidenceState, InformationElement, NamedValue, NormalizedEvent, Protocol,
-    PseudonymKey, SbiMetadata, SUBSCRIBER_PSEUDO_DOMAIN,
+    PseudonymKey, SbiMetadata,
 };
 use hpack::huffman::HuffmanDecoder;
 use hpack::Decoder;
@@ -1038,7 +1038,7 @@ fn sanitize_uri(value: &str, pseudonym_key: &PseudonymKey) -> String {
                 // interne cohérent.
                 format!(
                     "subscriber-{}{}",
-                    pseudonym(pseudonym_key, SUBSCRIBER_PSEUDO_DOMAIN, identity.as_bytes()),
+                    pseudonym_subscriber_text(pseudonym_key, identity.as_bytes()),
                     suffix
                 )
             } else {
@@ -1227,7 +1227,7 @@ fn collect_json(value: &Value, fields: &mut Vec<(String, String)>, pseudonym_key
                 // pseudonyms diverge.
                 fields.push((
                     "subscriber_pseudonym".into(),
-                    pseudonym(pseudonym_key, SUBSCRIBER_PSEUDO_DOMAIN, text.as_bytes()),
+                    pseudonym_subscriber_text(pseudonym_key, text.as_bytes()),
                 ));
             }
         } else {

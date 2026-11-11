@@ -1,5 +1,15 @@
 # Changelog
 
+## OIRAN API 2.11.10 — 2026-11-11 — canonicalisation inter-protocoles du pseudonyme abonné
+
+- Cause prouvée : `event-schema/src/lib.rs` hachait le label et les octets fournis par chaque décodeur. NAS EPS et GTPv2-C fournissaient du TBCD, Diameter les octets ASCII de `User-Name`, NAS 5GS l'identité mobile binaire complète et SBI la chaîne `imsi-…` ; ces représentations différentes d'une même identité produisaient donc des pseudonymes différents.
+- `event-schema` 1.6.2 définit une entrée commune : la chaîne de chiffres décimale canonique, le label partagé et `SUBSCRIBER_PSEUDO_DOMAIN`. `decoder-nas` 0.3.3 l'applique aux identités EPS et aux SUCI 5GS à schéma nul ; `decoder-gtpv2c` 0.1.3, `decoder-diameter` 0.2.7 et `decoder-sbi` 0.4.3 l'appliquent respectivement à l'IMSI TBCD, au `User-Name` et au SUPI `imsi-…`.
+- NAS Attach Request / Identity Response, GTPv2-C IMSI, Diameter AIR/ULR et SBI SUPI publient `subscriber_pseudonym` dans `identifiers`. Le compactage de `session-engine` conserve explicitement cette clé.
+- Le test bout en bout construit les octets NAS Attach, GTPv2 Create Session Request et Diameter AIR, exécute les vrais décodeurs S1AP/NAS, GTPv2-C et Diameter, écrit puis recharge la publication compacte, et vérifie trois pseudonymes égaux ainsi qu'une arête S1-MME↔S6a EXACT avec `matching_identifiers=["subscriber_pseudonym"]`. Aucun identifiant n'est injecté à la main.
+- **Les pseudonymes d'abonné d'avant 2.11.10 ne sont pas comparables à ceux d'après.**
+- Versions : `oiran-api` 2.11.10, web 2.11.10, `event-schema` 1.6.2, `decoder-nas` 0.3.3, `decoder-s1ap` 0.2.2, `decoder-gtpv2c` 0.1.3, `decoder-diameter` 0.2.7, `decoder-sbi` 0.4.3, `correlation-engine` 0.6.10 et `oiran-decode` 0.7.4.
+- Gate manuel : `cargo build --release --locked`. La recette réelle reste exécutée par ANR2 avant tout déploiement.
+
 ## OIRAN API 2.11.9 — 2026-11-11 — porteur NAS du pseudonyme S1-MME↔S6a
 
 - `correlation-engine` 0.6.9 inclut les événements NAS-EPS appartenant au contexte S1-MME dans le pont vers S6a. Quand le NAS Attach Request enfant porte le même `subscriber_pseudonym` que l'AIR, l'arête EXACT part de cet événement NAS plutôt que du parent S1AP dépourvu de pseudonyme.
