@@ -57,6 +57,81 @@ const MAX_N3_FLOW_AGGREGATES: usize = 4096;
 /// dataset — the latter is `derived_output_hard_limit_bytes()` and is
 /// operator-configurable (2.7.23).
 const MAX_CONTINUOUS_DERIVED_BYTES: u64 = 64 * 1024 * 1024;
+/// Published operational upper bound for a closed ring segment. Every
+/// continuous cycle logs this SLO and its actual duration.
+pub const CONTINUOUS_CLOSED_SEGMENT_SLO_MINUTES: u64 = 10;
+
+static DATASET_GC_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct ContinuousCycleTrace {
+    id: u64,
+    started: Instant,
+    segments_ingested: u64,
+    pending: u64,
+    pending_stability: u64,
+    ingested_this_cycle: u64,
+    publication_started: bool,
+    publication_completed: bool,
+    oldest_closed_epoch_ms: Option<u64>,
+}
+
+impl ContinuousCycleTrace {
+    fn new(id: u64, metrics: Option<&CaptureMetrics>) -> Self {
+        let trace = Self {
+            id,
+            started: Instant::now(),
+            segments_ingested: metrics.map_or(0, |value| value.segments_ingested),
+            pending: metrics.map_or(0, |value| value.pending_segments),
+            pending_stability: metrics.map_or(0, |value| value.pending_stability_segments),
+            ingested_this_cycle: 0,
+            publication_started: false,
+            publication_completed: false,
+            oldest_closed_epoch_ms: None,
+        };
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "CONTINUOUS_CYCLE",
+                "phase": "begin",
+                "cycle_id": trace.id,
+                "segments_ingested": trace.segments_ingested,
+                "pending": trace.pending,
+                "pending_stability": trace.pending_stability,
+                "closed_segment_slo_minutes": CONTINUOUS_CLOSED_SEGMENT_SLO_MINUTES,
+            })
+        );
+        trace
+    }
+}
+
+impl Drop for ContinuousCycleTrace {
+    fn drop(&mut self) {
+        let closed_segment_max_lag_ms = self
+            .oldest_closed_epoch_ms
+            .map(|closed| epoch_ms().saturating_sub(closed));
+        let closed_segment_slo_met = closed_segment_max_lag_ms
+            .map(|lag| lag <= CONTINUOUS_CLOSED_SEGMENT_SLO_MINUTES * 60 * 1000);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "CONTINUOUS_CYCLE",
+                "phase": "end",
+                "cycle_id": self.id,
+                "segments_ingested": self.segments_ingested,
+                "ingested_this_cycle": self.ingested_this_cycle,
+                "pending": self.pending,
+                "pending_stability": self.pending_stability,
+                "publication_started": self.publication_started,
+                "publication_completed": self.publication_completed,
+                "duration_ms": self.started.elapsed().as_millis(),
+                "closed_segment_slo_minutes": CONTINUOUS_CLOSED_SEGMENT_SLO_MINUTES,
+                "oldest_closed_epoch_ms": self.oldest_closed_epoch_ms,
+                "closed_segment_max_lag_ms": closed_segment_max_lag_ms,
+                "closed_segment_slo_met": closed_segment_slo_met,
+            })
+        );
+    }
+}
 
 /// 2.7.23 (issue #10 comment 6662293690): configurable hard cap on the
 /// derived publication (`<base>/.dataset-next/`) size. The 2.7.22 flow
@@ -2542,6 +2617,7 @@ impl CaptureManager {
         // scan_interval at the worst case after a burst.
         let mut idle_backoff_factor: u32 = 1;
         let mut bootstrap_pending = Vec::new();
+        let mut continuous_cycle_id = 0u64;
         if let Some(path) = &config.historical_n2_bootstrap {
             if !allowlisted_historical_n2_bootstrap(path) {
                 return Err("CONTINUOUS_BOOTSTRAP_NOT_ALLOWLISTED".into());
@@ -2605,6 +2681,10 @@ impl CaptureManager {
             }
         })?;
         loop {
+            continuous_cycle_id = continuous_cycle_id.saturating_add(1);
+            let cycle_metrics = self.get(CONTINUOUS_CAPTURE_ID).map(|job| job.metrics);
+            let mut cycle_trace =
+                ContinuousCycleTrace::new(continuous_cycle_id, cycle_metrics.as_ref());
             if self.continuous_stop.load(Ordering::Acquire) {
                 self.update(CONTINUOUS_CAPTURE_ID, |job| {
                     job.state = CaptureState::Completed;
@@ -3003,6 +3083,7 @@ impl CaptureManager {
                 .iter()
                 .filter(|candidate| !state.seen_checksums.contains(&candidate.checksum))
                 .count() as u64;
+            cycle_trace.pending = pending;
             // 2.10.3 (devmat, revue 2.10.2 ANR2) : inventaire
             // explicite des segments pending + open. ANR2 a vu
             // `pending_segments=5` figés 1h+ sans savoir lesquels ;
@@ -3287,6 +3368,16 @@ impl CaptureManager {
                     )?;
                     continue;
                 }
+                let closed_epoch_ms = candidate
+                    .modified
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or_else(|_| epoch_ms());
+                cycle_trace.oldest_closed_epoch_ms = Some(
+                    cycle_trace
+                        .oldest_closed_epoch_ms
+                        .map_or(closed_epoch_ms, |prior| prior.min(closed_epoch_ms)),
+                );
                 state.segments.insert(
                     candidate.checksum.clone(),
                     ImportedSegment {
@@ -3341,12 +3432,31 @@ impl CaptureManager {
                 job.metrics.pending_batch_segments =
                     pending_batch_this_scan as u64;
             })?;
+            cycle_trace.pending_stability = pending_stability_this_scan as u64;
+            cycle_trace.ingested_this_cycle = ingested_this_scan as u64;
             let mut published = !changed;
             if changed {
-                match self.process_continuous_capture(
+                let selected_files = pending_publication
+                    .iter()
+                    .filter_map(|checksum| state.segments.get(checksum))
+                    .map(|segment| base.join("pcap").join(&segment.owned_file))
+                    .collect::<BTreeSet<_>>();
+                cycle_trace.publication_started = true;
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "CONTINUOUS_PUBLICATION_INCREMENTAL",
+                        "phase": "begin",
+                        "cycle_id": continuous_cycle_id,
+                        "selected_segments": selected_files.len(),
+                        "historical_segments_skipped": state.segments.len().saturating_sub(selected_files.len()),
+                    })
+                );
+                match self.process_continuous_capture_selected(
                     &base,
                     &interface_specs(),
                     config.max_owned_bytes,
+                    &selected_files,
                 ) {
                     Ok(dataset) => {
                         self.upsert_dataset(dataset.clone(), &base.join("dataset"))?;
@@ -3359,7 +3469,13 @@ impl CaptureManager {
                             .values()
                             .map(|report| report.packets as u64)
                             .sum();
-                        let bytes = directory_size(&base);
+                        // Never walk the base recursively here: a retired
+                        // overlay tree may still be undergoing asynchronous
+                        // whiteout deletion. Count the three owned surfaces
+                        // directly and exclude GC tombstones by construction.
+                        let bytes = directory_size(&base.join("dataset"))
+                            .saturating_add(committed_ring_bytes(&base.join("pcap")))
+                            .saturating_add(work_bytes(&base));
                         self.update(CONTINUOUS_CAPTURE_ID, |job| {
                             job.dataset_id = Some(dataset.dataset_id.clone());
                             job.session_ids = dataset.session_ids.clone();
@@ -3412,6 +3528,9 @@ impl CaptureManager {
                             job.metrics.active_ue_ips = dataset.active_ue_ips.clone();
                             job.error = None;
                         })?;
+                        cycle_trace.publication_completed = true;
+                        cycle_trace.segments_ingested = state.seen_checksums.len() as u64;
+                        cycle_trace.pending = pending.saturating_sub(ingested_this_scan as u64);
                         published = true;
                     }
                     Err(error) => {
@@ -3802,6 +3921,31 @@ impl CaptureManager {
         interfaces: &[CaptureInterface],
         max_owned_bytes: u64,
     ) -> Result<LiveDataset, String> {
+        self.process_continuous_capture_inner(base, interfaces, max_owned_bytes, None)
+    }
+
+    fn process_continuous_capture_selected(
+        &self,
+        base: &Path,
+        interfaces: &[CaptureInterface],
+        max_owned_bytes: u64,
+        selected_files: &BTreeSet<PathBuf>,
+    ) -> Result<LiveDataset, String> {
+        self.process_continuous_capture_inner(
+            base,
+            interfaces,
+            max_owned_bytes,
+            Some(selected_files),
+        )
+    }
+
+    fn process_continuous_capture_inner(
+        &self,
+        base: &Path,
+        interfaces: &[CaptureInterface],
+        max_owned_bytes: u64,
+        selected_files: Option<&BTreeSet<PathBuf>>,
+    ) -> Result<LiveDataset, String> {
         // 2.7.28: cross-process advisory lock (flock) held through the
         // entire dataset-next → dataset swap. `dataset-restore` takes
         // the same lock with `LOCK_NB` and refuses with
@@ -3819,13 +3963,33 @@ impl CaptureManager {
         if work_bytes(base).saturating_add(MAX_CONTINUOUS_DERIVED_BYTES) > max_owned_bytes {
             return Err("CONTINUOUS_ATOMIC_TEMP_BUDGET".into());
         }
-        let result = self.process_capture_into(
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "CONTINUOUS_PUBLICATION_PHASE",
+                "phase": "before-incremental-decode",
+                "selected_segments": selected_files.map_or(0, BTreeSet::len),
+                "decode_scope": if selected_files.is_some() { "new-segments-only" } else { "all-owned-segments" },
+            })
+        );
+        #[cfg(test)]
+        {
+            let delay_path = base.join(".test-publication-delay-ms");
+            if let Ok(delay) = fs::read_to_string(&delay_path) {
+                let _ = fs::write(base.join(".test-publication-entered"), b"entered");
+                if let Ok(delay_ms) = delay.trim().parse::<u64>() {
+                    thread::sleep(Duration::from_millis(delay_ms));
+                }
+            }
+        }
+        let result = self.process_capture_into_selected(
             CONTINUOUS_CAPTURE_ID,
             CONTINUOUS_DATASET_ID.into(),
             &base.join("pcap"),
             &next,
             format!("runtime/live-captures/{CONTINUOUS_CAPTURE_ID}/dataset"),
             interfaces,
+            selected_files,
         );
         let dataset = match result {
             Ok(dataset) => dataset,
@@ -3859,7 +4023,7 @@ impl CaptureManager {
             ));
         }
         if previous.exists() {
-            fs::remove_dir_all(&previous).map_err(display_error)?;
+            retire_dataset_tree(&previous)?;
         }
         if current.exists() {
             fs::rename(&current, &previous).map_err(display_error)?;
@@ -3871,8 +4035,16 @@ impl CaptureManager {
             return Err(display_error(error));
         }
         if previous.exists() {
-            fs::remove_dir_all(&previous).map_err(display_error)?;
+            retire_dataset_tree(&previous)?;
         }
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "CONTINUOUS_PUBLICATION_PHASE",
+                "phase": "swap-complete-gc-scheduled",
+                "selected_segments": selected_files.map_or(0, BTreeSet::len),
+            })
+        );
         Ok(dataset)
     }
 
@@ -4956,6 +5128,27 @@ impl CaptureManager {
         dataset_path: String,
         interfaces: &[CaptureInterface],
     ) -> Result<LiveDataset, String> {
+        self.process_capture_into_selected(
+            capture_id,
+            dataset_id,
+            pcap_dir,
+            dataset_dir,
+            dataset_path,
+            interfaces,
+            None,
+        )
+    }
+
+    fn process_capture_into_selected(
+        &self,
+        capture_id: &str,
+        dataset_id: String,
+        pcap_dir: &Path,
+        dataset_dir: &Path,
+        dataset_path: String,
+        interfaces: &[CaptureInterface],
+        selected_files: Option<&BTreeSet<PathBuf>>,
+    ) -> Result<LiveDataset, String> {
         // 2.7.6 (adjusted): the per-deployment key is owned by the manager
         // and shared across every capture processed by this binary — so a
         // probe restart that rebuilds the same dataset reuses the same key
@@ -5001,6 +5194,9 @@ impl CaptureManager {
             let mut files = capture_files_for(pcap_dir, &interface.interface);
             files.sort();
             for path in files {
+                if selected_files.is_some_and(|selected| !selected.contains(&path)) {
+                    continue;
+                }
                 if fs::metadata(&path)
                     .map(|metadata| metadata.len())
                     .unwrap_or(0)
@@ -7989,8 +8185,8 @@ fn clean_continuous_import_root(base: &Path) -> Result<CompactionReport, String>
         let path = base.join(name);
         if path.exists() {
             let size = directory_size(&path);
-            fs::remove_dir_all(&path).map_err(display_error)?;
-            report.push(&path, size, 0, "removed-rollback-or-crash-artifact");
+            retire_dataset_tree(&path)?;
+            report.push(&path, size, 0, "scheduled-rollback-or-crash-artifact-gc");
         }
     }
     // Base-level orphan atomic_write partials. Does NOT descend into
@@ -7998,6 +8194,17 @@ fn clean_continuous_import_root(base: &Path) -> Result<CompactionReport, String>
     if let Ok(entries) = fs::read_dir(base) {
         for entry in entries.flatten() {
             let path = entry.path();
+            if path.is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".dataset-gc-"))
+            {
+                let size = directory_size(&path);
+                remove_dataset_tree_async(path.clone(), size);
+                report.push(&path, size, 0, "scheduled-stale-dataset-gc");
+                continue;
+            }
             if !path.is_file() {
                 continue;
             }
@@ -8015,6 +8222,53 @@ fn clean_continuous_import_root(base: &Path) -> Result<CompactionReport, String>
         }
     }
     Ok(report)
+}
+
+/// Move an obsolete publication tree out of the atomic-swap namespace, then
+/// reclaim it on a detached worker.  On overlay filesystems the recursive
+/// unlink may create millions of whiteouts and take longer than the whole
+/// publication; it must never hold the continuous scan loop hostage.
+fn retire_dataset_tree(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "CONTINUOUS_DATASET_GC_PARENT_INVALID".to_string())?;
+    let sequence = DATASET_GC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let retired = parent.join(format!(".dataset-gc-{}-{sequence}", epoch_ms()));
+    let bytes = directory_size(path);
+    fs::rename(path, &retired).map_err(display_error)?;
+    remove_dataset_tree_async(retired, bytes);
+    Ok(())
+}
+
+fn remove_dataset_tree_async(path: PathBuf, bytes: u64) {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "event": "CONTINUOUS_DATASET_GC",
+            "phase": "scheduled",
+            "path": path.display().to_string(),
+            "bytes": bytes,
+        })
+    );
+    thread::spawn(move || {
+        let started = Instant::now();
+        let result = fs::remove_dir_all(&path);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "CONTINUOUS_DATASET_GC",
+                "phase": "complete",
+                "path": path.display().to_string(),
+                "bytes": bytes,
+                "duration_ms": started.elapsed().as_millis(),
+                "result": if result.is_ok() { "ok" } else { "error" },
+                "error": result.err().map(|error| error.to_string()),
+            })
+        );
+    });
 }
 
 #[derive(Debug, Default)]
@@ -8811,70 +9065,66 @@ fn collect_source_paths(
 ///     devraient **créer ces tombstones HORS de la racine d'import**
 ///     (ex. `/var/lib/oiran/rollback-archive/`).
 ///
-/// Log : `CONTINUOUS_BUDGET_EXCLUSION` émis une fois par scan avec
-/// les tailles exclues pour qu'ANR2 puisse prouver le calcul.
+/// 2.11.13: calculate the in-flight surface directly instead of recursively
+/// walking the whole base and subtracting multi-gigabyte trees afterwards.
+/// That old subtraction was numerically correct but could itself stall on an
+/// overlay GC tombstone. `CONTINUOUS_BUDGET_EXCLUSION` lists every excluded
+/// root and the directly measured work total.
 fn work_bytes(base: &Path) -> u64 {
-    let total = directory_size(base);
-    let published = directory_size(&base.join("dataset"));
-    let committed_ring = committed_ring_bytes(&base.join("pcap"));
-    let next = directory_size(&base.join(".dataset-next"));
-    let previous = directory_size(&base.join(".dataset-previous"));
-    let (rollback_bytes, rollback_paths) = rollback_tombstones(base);
-    if next > 0 || previous > 0 || rollback_bytes > 0 {
+    let mut work = 0u64;
+    let mut excluded_paths = Vec::new();
+    let Ok(entries) = fs::read_dir(base) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_file() {
+            work = work.saturating_add(entry.metadata().map(|value| value.len()).unwrap_or(0));
+            continue;
+        }
+        if name == "pcap" {
+            if let Ok(pcap_entries) = fs::read_dir(&path) {
+                for pcap_entry in pcap_entries.flatten() {
+                    if pcap_entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|value| value.ends_with(".importing"))
+                    {
+                        work = work.saturating_add(
+                            pcap_entry.metadata().map(|value| value.len()).unwrap_or(0),
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+        let excluded = name == "dataset"
+            || name == ".dataset-next"
+            || name == ".dataset-previous"
+            || name.starts_with(".dataset-gc-")
+            || name.starts_with(".dataset.rollback.")
+            || name.starts_with(".dataset-rollback.");
+        if excluded {
+            excluded_paths.push(path.display().to_string());
+        } else if path.is_dir() {
+            work = work.saturating_add(directory_size(&path));
+        }
+    }
+    if !excluded_paths.is_empty() {
         eprintln!(
             "{}",
             serde_json::json!({
                 "event": "CONTINUOUS_BUDGET_EXCLUSION",
-                "dataset_next_bytes": next,
-                "dataset_previous_bytes": previous,
-                "rollback_bytes": rollback_bytes,
-                "rollback_paths": rollback_paths,
-                "published_bytes": published,
-                "committed_ring_bytes": committed_ring,
-                "total_bytes": total,
-                "reason": "2.11.3 excludes transient dataset staging + operator rollback tombstones from backpressure budget",
+                "excluded_paths": excluded_paths,
+                "work_bytes": work,
+                "calculation": "direct-inflight-only-no-recursive-base-walk",
+                "reason": "published/ring/staging/GC/operator rollback trees are outside the in-flight budget",
             })
         );
     }
-    total
-        .saturating_sub(published)
-        .saturating_sub(committed_ring)
-        .saturating_sub(next)
-        .saturating_sub(previous)
-        .saturating_sub(rollback_bytes)
-}
-
-/// 2.11.3 : énumère les tombstones de rollback opérateur sous
-/// `<base>/.dataset.rollback.YYYYMMDDTHHMMSSZ/` (créés par la
-/// procédure de rollback ANR1). Retourne la somme et la liste des
-/// chemins (pour journalisation).
-fn rollback_tombstones(base: &Path) -> (u64, Vec<String>) {
-    let mut total = 0u64;
-    let mut paths = Vec::new();
-    let read = match fs::read_dir(base) {
-        Ok(iter) => iter,
-        Err(_) => return (0, Vec::new()),
-    };
-    for entry in read.flatten() {
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        // Deux formes acceptées : `.dataset.rollback.<timestamp>`
-        // (format ANR1 courant, point-séparateur) et
-        // `.dataset-rollback.<timestamp>` (variante dash,
-        // acceptée par symétrie).
-        if !(name_str.starts_with(".dataset.rollback.")
-            || name_str.starts_with(".dataset-rollback."))
-        {
-            continue;
-        }
-        let path = entry.path();
-        let size = directory_size(&path);
-        total = total.saturating_add(size);
-        paths.push(path.display().to_string());
-    }
-    (total, paths)
+    work
 }
 
 /// 2.9.8 (#9, ANR2 comment 6725097122): size of the committed import
@@ -12191,6 +12441,85 @@ mod tests {
                 "PARTIAL_EXTERNAL_RUNTIME_CORROBORATED"
             );
         }
+    }
+
+    #[test]
+    fn continuous_worker_ingests_three_rotations_during_and_after_publication() {
+        if skip_if_disk_too_full(
+            "continuous_worker_ingests_three_rotations_during_and_after_publication",
+        ) {
+            return;
+        }
+        let root = temporary_root("continuous-three-rotations");
+        let source = temporary_root("continuous-three-rotations-source");
+        let n3 = source.join("N3");
+        fs::create_dir_all(&n3).unwrap();
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join(".test-publication-delay-ms"), b"750").unwrap();
+
+        write_pcap(
+            &n3.join("n3_00001.pcap"),
+            &[gtpu_gpdu_frame(4, 0x1001)],
+        );
+        write_rotation_closures(&source, "N3", 1);
+
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source.clone(),
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
+                max_segments: 8,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+            })
+            .unwrap();
+
+        wait_for(|| base.join(".test-publication-entered").is_file());
+        // Rotation 2 closes while rotation 1 is inside publication.
+        write_pcap(
+            &n3.join("n3_00002.pcap"),
+            &[gtpu_gpdu_frame(5, 0x1002)],
+        );
+        write_rotation_closures(&source, "N3", 1);
+        wait_for(|| {
+            manager
+                .get(CONTINUOUS_CAPTURE_ID)
+                .is_some_and(|job| job.metrics.segments_ingested >= 1)
+        });
+
+        fs::remove_file(base.join(".test-publication-delay-ms")).unwrap();
+        // Rotation 3 closes after the first publication commit.
+        write_pcap(
+            &n3.join("n3_00003.pcap"),
+            &[gtpu_gpdu_frame(6, 0x1003)],
+        );
+        write_rotation_closures(&source, "N3", 1);
+        wait_for(|| {
+            manager
+                .get(CONTINUOUS_CAPTURE_ID)
+                .is_some_and(|job| {
+                    job.metrics.segments_ingested == 3
+                        && job.metrics.pending_segments == 0
+                        && job.metrics.pending_stability_segments == 0
+                })
+        });
+
+        let state: ContinuousImportState = serde_json::from_slice(
+            &fs::read(base.join("import_state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.seen_checksums.len(), 3);
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
     }
 
     #[test]

@@ -1,5 +1,16 @@
 # Changelog
 
+## OIRAN API 2.11.13 — 2026-11-11 — reprise continue après publication
+
+- Cause des ~30 minutes avant `00a` : `live-probe::process_capture_into` redécodait tous les PCAP possédés à chaque cycle avant de fusionner le JSONL historique. Avec 5 636 segments déjà importés, ce travail était linéaire dans tout l'historique et précédait la première trace de publication.
+- Cause du gel après la phase 13 : le thread unique restait dans `process_continuous_capture` pour permuter le dataset puis supprimer récursivement `.dataset-previous`. Sur l'overlay du fantôme, cette suppression produisait les whiteouts du dataset complet ; aucun nouveau scan n'était lancé, donc les six candidats en stabilité ne pouvaient pas atteindre leur second passage. `MAX_INGESTED_SEGMENTS_PER_SCAN=32` n'était pas atteint par les 30 pending.
+- La publication continue ne décode désormais que les segments du lot courant ; le JSONL, les rapports et les checksums antérieurs sont fusionnés depuis le checkpoint publié. L'ancien dataset est renommé en tombstone unique puis supprimé par un ramasse-miettes asynchrone, hors du thread de scan. Les tombstones GC sont exclus du budget de travail et récupérés au démarrage.
+- Chaque tour journalise `CONTINUOUS_CYCLE` au début et à la fin avec segments ingérés, pending, pending stabilité, durée, état de publication et délai maximal du segment fermé. Le SLO publié est de 10 minutes. `CONTINUOUS_PUBLICATION_INCREMENTAL`, `CONTINUOUS_PUBLICATION_PHASE` et `CONTINUOUS_DATASET_GC` rendent chaque sous-phase visible.
+- Le test de rotation ferme trois segments avant, pendant et après une publication, puis vérifie les trois checksums commités et `pending=0` hors segments ouverts.
+- La recette ANR2 de 60 minutes est documentée dans `docs/OIRAN_2_11_13_CONTINUOUS_GATE.md`, avec mesures cgroup toutes les 30 secondes, progression des cycles et recette LTE 5/5 finale.
+- Versions : `oiran-api` et web 2.11.13, `live-probe` 0.5.7. Les décodeurs et moteurs de session/corrélation restent inchangés.
+- Gate manuel : tests `live-probe`, puis `cargo build --release --locked`. La recette fantôme complète reste exécutée par ANR2 avant tout déploiement.
+
 ## OIRAN API 2.11.12 — 2026-11-11 — publication bornée avant la phase 01
 
 - Cause prouvée : `session-engine::load_path_streaming_representatives` conservait un `BTreeMap<String, EventRecord>` par clé dite sémantique. Depuis 2.11.4, la clé reprenait notamment les nouveaux `gtpv2c_sequence` et `pfcp_sequence`, en plus des identifiants de règle transactionnels historiques `pdr_id`, `far_id` et `qer_id`. Ces valeurs changeaient à chaque message et empêchaient la compaction ; le chargeur retenait donc presque tout le JSONL sous forme de clés et objets Rust avant `01-after-streaming-representatives`, conformément aux 4,2 GiB anonymes mesurés par le noyau.
