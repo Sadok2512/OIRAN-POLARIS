@@ -16,7 +16,7 @@ pub const E2E_EVIDENCE_RULE_VERSION: &str = "2.0.0";
 /// evidence that was previously hidden inside session-engine's gtpu_tunnels
 /// discovery. See DSN-ENGINE-002 in AUDIT_E2E_CERT_001.
 pub const N4_N3_RULE_VERSION: &str = "1.0.0";
-pub const LTE_RULE_VERSION: &str = "1.1.0-offline.1";
+pub const LTE_RULE_VERSION: &str = "1.1.1-offline.1";
 
 fn protocol_is(event: &EventRecord, expected: &str) -> bool {
     event.protocol.eq_ignore_ascii_case(expected)
@@ -532,6 +532,59 @@ fn append_lte_bridge(
     if left.is_empty() || right.is_empty() {
         return;
     }
+    let subscriber_key = identifiers == ["subscriber_pseudonym"];
+    if subscriber_key {
+        let right_pseudonyms = right
+            .iter()
+            .flat_map(|event| event.identifier_values("subscriber_pseudonym"))
+            .collect::<std::collections::BTreeSet<_>>();
+        if right_pseudonyms.len() > 1 {
+            let canonical = |a: &&EventRecord, b: &&EventRecord| {
+                (a.capture_id.as_str(), a.packet_number(), a.event_id.as_str()).cmp(&(
+                    b.capture_id.as_str(),
+                    b.packet_number(),
+                    b.event_id.as_str(),
+                ))
+            };
+            let source = left
+                .iter()
+                .copied()
+                .filter(|event| {
+                    !event
+                        .identifier_values("subscriber_pseudonym")
+                        .is_empty()
+                })
+                .min_by(canonical)
+                .unwrap_or(left[0]);
+            let target = right
+                .iter()
+                .copied()
+                .filter(|event| {
+                    !event
+                        .identifier_values("subscriber_pseudonym")
+                        .is_empty()
+                })
+                .min_by(canonical)
+                .unwrap_or(right[0]);
+            let mut found = edge(
+                source,
+                target,
+                Vec::new(),
+                rule_id,
+                "OPEN",
+                "Multiple distinct subscriber pseudonyms are present on the target interface",
+            );
+            found.rule_version = LTE_RULE_VERSION.into();
+            found.evidence_type = "OPEN_AMBIGUOUS_SUBSCRIBER_PSEUDONYM".into();
+            found.scope = format!("{left_interface}-{right_interface}");
+            found.limitations = vec![
+                "No subscriber edge is asserted while the session contains distinct target pseudonyms"
+                    .into(),
+            ];
+            edges.push(found);
+            return;
+        }
+    }
     let teid_names = identifiers
         .iter()
         .copied()
@@ -584,41 +637,43 @@ fn append_lte_bridge(
                 right.1.event_id.as_str(),
             ))
     });
-    // A compacted aggregate and the one-packet precursor produced by an old
-    // batch boundary can carry the same TEID. Prefer the aggregate only in
-    // that mechanically identifiable case. Any other repeated TEID remains
-    // ambiguous and must fail closed instead of selecting an event by ID.
-    let mut unambiguous = Vec::new();
-    let mut start = 0;
-    while start < exact.len() {
-        let mut end = start + 1;
-        while end < exact.len()
-            && exact[end].0.event_id == exact[start].0.event_id
-            && exact[end].2 == exact[start].2
-        {
-            end += 1;
-        }
-        let group = &exact[start..end];
-        if group.len() == 1 {
-            unambiguous.push(group[0].clone());
-        } else {
-            let aggregates = group
-                .iter()
-                .filter(|(_, target, _)| target.packet_references.len() > 1)
-                .collect::<Vec<_>>();
-            if aggregates.len() == 1
-                && group
-                    .iter()
-                    .filter(|(_, target, _)| target.packet_references.len() <= 1)
-                    .count()
-                    == group.len() - 1
+    if !subscriber_key {
+        // A compacted aggregate and the one-packet precursor produced by an
+        // old batch boundary can carry the same TEID. Prefer the aggregate
+        // only in that mechanically identifiable case. Any other repeated
+        // tunnel key remains ambiguous and must fail closed.
+        let mut unambiguous = Vec::new();
+        let mut start = 0;
+        while start < exact.len() {
+            let mut end = start + 1;
+            while end < exact.len()
+                && exact[end].0.event_id == exact[start].0.event_id
+                && exact[end].2 == exact[start].2
             {
-                unambiguous.push((*aggregates[0]).clone());
+                end += 1;
             }
+            let group = &exact[start..end];
+            if group.len() == 1 {
+                unambiguous.push(group[0].clone());
+            } else {
+                let aggregates = group
+                    .iter()
+                    .filter(|(_, target, _)| target.packet_references.len() > 1)
+                    .collect::<Vec<_>>();
+                if aggregates.len() == 1
+                    && group
+                        .iter()
+                        .filter(|(_, target, _)| target.packet_references.len() <= 1)
+                        .count()
+                        == group.len() - 1
+                {
+                    unambiguous.push((*aggregates[0]).clone());
+                }
+            }
+            start = end;
         }
-        start = end;
+        exact = unambiguous;
     }
-    exact = unambiguous;
 
     if exact.is_empty() {
         let pair_exists = edges.iter().any(|edge| {
@@ -1700,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn real_decoders_publication_and_correlation_share_subscriber_pseudonym_2_11_10() {
+    fn real_decoders_publish_one_exact_subscriber_edge_per_s6a_message_2_11_11() {
         use decoder_diameter::DiameterDecoder;
         use decoder_gtpv2c::Gtpv2cDecoder;
         use decoder_s1ap::S1apDecoder;
@@ -1751,21 +1806,26 @@ mod tests {
             output
         }
 
-        fn diameter_message(command: u32, body: &[u8]) -> Vec<u8> {
+        fn diameter_message(
+            command: u32,
+            request: bool,
+            transaction: u32,
+            body: &[u8],
+        ) -> Vec<u8> {
             let total = 20 + body.len();
             let mut output = vec![
                 1,
                 (total >> 16) as u8,
                 (total >> 8) as u8,
                 total as u8,
-                0x80,
+                if request { 0x80 } else { 0 },
                 (command >> 16) as u8,
                 (command >> 8) as u8,
                 command as u8,
             ];
             output.extend_from_slice(&16_777_251u32.to_be_bytes());
-            output.extend_from_slice(&0x11223344u32.to_be_bytes());
-            output.extend_from_slice(&0x55667788u32.to_be_bytes());
+            output.extend_from_slice(&transaction.to_be_bytes());
+            output.extend_from_slice(&transaction.rotate_left(13).to_be_bytes());
             output.extend_from_slice(body);
             output
         }
@@ -1841,21 +1901,44 @@ mod tests {
         decoded.extend(Gtpv2cDecoder.decode(&gtp_input).events);
 
         let diameter_identity = [48, 48, 49, 48, 49, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57];
-        let diameter = diameter_message(318, &diameter_avp(1, &diameter_identity));
-        let diameter_packets = packet(3);
-        let diameter_timestamp = timestamp(3);
-        let diameter_input = DecoderInput {
-            capture_id: "cap-s6a",
-            packet_references: &diameter_packets,
-            timestamp: &diameter_timestamp,
-            interface: "S6a",
-            source_endpoint: Endpoint { address: "10.0.0.2".into(), port: Some(3868), network_function: Some("MME".into()) },
-            destination_endpoint: Endpoint { address: "10.0.0.4".into(), port: Some(3868), network_function: Some("HSS".into()) },
-            payload: &diameter,
-            raw_payload_reference: "sha256:s6a",
-            pseudonym_key: &key,
-        };
-        decoded.extend(DiameterDecoder.decode(&diameter_input).events);
+        for (number, command, request) in [
+            (3, 318, true),
+            (4, 318, false),
+            (5, 316, true),
+            (6, 316, false),
+        ] {
+            let diameter = diameter_message(
+                command,
+                request,
+                number as u32,
+                &diameter_avp(1, &diameter_identity),
+            );
+            let diameter_packets = packet(number);
+            let diameter_timestamp = timestamp(number);
+            let (source_endpoint, destination_endpoint) = if request {
+                (
+                    Endpoint { address: "10.0.0.2".into(), port: Some(3868), network_function: Some("MME".into()) },
+                    Endpoint { address: "10.0.0.4".into(), port: Some(3868), network_function: Some("HSS".into()) },
+                )
+            } else {
+                (
+                    Endpoint { address: "10.0.0.4".into(), port: Some(3868), network_function: Some("HSS".into()) },
+                    Endpoint { address: "10.0.0.2".into(), port: Some(3868), network_function: Some("MME".into()) },
+                )
+            };
+            let diameter_input = DecoderInput {
+                capture_id: "cap-s6a",
+                packet_references: &diameter_packets,
+                timestamp: &diameter_timestamp,
+                interface: "S6a",
+                source_endpoint,
+                destination_endpoint,
+                payload: &diameter,
+                raw_payload_reference: "sha256:s6a",
+                pseudonym_key: &key,
+            };
+            decoded.extend(DiameterDecoder.decode(&diameter_input).events);
+        }
 
         let path = std::env::temp_dir().join(format!(
             "oiran-2-11-10-subscriber-{}.jsonl",
@@ -1878,11 +1961,86 @@ mod tests {
         assert_eq!(nas_pseudo, pseudo("S11", "CreateSessionRequest"));
         assert_eq!(nas_pseudo, pseudo("S6a", "Authentication-Information-Request"));
 
-        let edge = correlate_lte_evidence(&publication.events).into_iter()
-            .find(|edge| edge.rule_id == "s1mme-s6a-pseudonym")
-            .expect("published decoder events must correlate S1-MME with S6a");
-        assert_eq!(edge.confidence, "EXACT");
-        assert_eq!(edge.matching_identifiers, ["subscriber_pseudonym"]);
+        let edges = correlate_lte_evidence(&publication.events)
+            .into_iter()
+            .filter(|edge| edge.rule_id == "s1mme-s6a-pseudonym")
+            .collect::<Vec<_>>();
+        assert_eq!(edges.len(), 4, "every S6a transaction message is evidence");
+        assert!(edges.iter().all(|edge| edge.confidence == "EXACT"));
+        assert!(edges.iter().all(|edge| {
+            edge.matching_identifiers == ["subscriber_pseudonym"]
+        }));
+        let sessions = discover_lte_sessions(&publication.events);
+        assert_eq!(sessions.len(), 1);
+        let flow = callflow_schema::build_lte_callflow(
+            &sessions[0],
+            &publication.events,
+            edges.clone(),
+        );
+        assert_eq!(flow.correlation_status["S1_MME_S6A"], "EXACT");
+
+        let second_identity = [48, 48, 49, 48, 49, 48, 49, 50, 51, 52, 53, 54, 55, 56, 48];
+        let second_diameter = diameter_message(
+            316,
+            true,
+            7,
+            &diameter_avp(1, &second_identity),
+        );
+        let second_packets = packet(7);
+        let second_timestamp = timestamp(7);
+        let second_input = DecoderInput {
+            capture_id: "cap-s6a",
+            packet_references: &second_packets,
+            timestamp: &second_timestamp,
+            interface: "S6a",
+            source_endpoint: Endpoint { address: "10.0.0.2".into(), port: Some(3868), network_function: Some("MME".into()) },
+            destination_endpoint: Endpoint { address: "10.0.0.4".into(), port: Some(3868), network_function: Some("HSS".into()) },
+            payload: &second_diameter,
+            raw_payload_reference: "sha256:s6a-second",
+            pseudonym_key: &key,
+        };
+        decoded.extend(DiameterDecoder.decode(&second_input).events);
+        let negative_path = std::env::temp_dir().join(format!(
+            "oiran-2-11-11-subscriber-ambiguity-{}.jsonl",
+            std::process::id()
+        ));
+        let negative_jsonl = decoded
+            .iter()
+            .map(|event| event.to_json())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&negative_path, format!("{negative_jsonl}\n"))
+            .expect("write ambiguous publication input");
+        let negative_publication = session_engine::load_path_streaming_index(&negative_path)
+            .expect("compact ambiguous publication");
+        let _ = std::fs::remove_file(&negative_path);
+        let negative_left = negative_publication
+            .events
+            .iter()
+            .filter(|event| event.interface == "S1-MME" && event.message_name == "Attach Request")
+            .collect::<Vec<_>>();
+        let negative_right = negative_publication
+            .events
+            .iter()
+            .filter(|event| event.interface == "S6a")
+            .collect::<Vec<_>>();
+        let mut negative_edges = Vec::new();
+        append_lte_bridge(
+            &mut negative_edges,
+            &negative_left,
+            &negative_right,
+            "S1-MME",
+            "S6a",
+            &["subscriber_pseudonym"],
+            "s1mme-s6a-pseudonym",
+        );
+        assert_eq!(negative_edges.len(), 1);
+        assert_eq!(negative_edges[0].confidence, "OPEN");
+        assert_eq!(
+            negative_edges[0].evidence_type,
+            "OPEN_AMBIGUOUS_SUBSCRIBER_PSEUDONYM"
+        );
+        assert!(negative_edges[0].matching_identifiers.is_empty());
     }
 
     #[test]

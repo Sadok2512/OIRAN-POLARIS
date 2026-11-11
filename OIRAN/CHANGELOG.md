@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.11.11 — 2026-11-11 — cardinalité légitime des preuves abonné S6a
+
+- Cause prouvée : `append_lte_bridge` appliquait la garde anti-ambiguïté des clés tunnel à `subscriber_pseudonym`. Un NAS Attach Request correspondant à plusieurs messages S6a du même abonné faisait rejeter tout le groupe, puis produisait l'arête de repli OPEN.
+- `correlation-engine` 0.6.11 et la règle LTE `1.1.1-offline.1` distinguent désormais les preuves : un TEID répété reste fermé et ambigu, tandis qu'un pseudonyme abonné commun produit une arête EXACT vers chaque message S6a qui le porte. Ce choix conserve séparément la provenance AIR/ULR requête/réponse et le fold d'interface accepte cette cardinalité.
+- Si le même ensemble S6a contient deux pseudonymes distincts, aucune arête abonné exacte n'est publiée : une arête OPEN `OPEN_AMBIGUOUS_SUBSCRIBER_PSEUDONYM` explique l'ambiguïté. Son couple représentatif est choisi dans l'ordre canonique `(capture_id, packet_number, event_id)`, jamais par horodatage.
+- Le test construit les octets d'un NAS Attach Request et de quatre messages Diameter — AIR requête/réponse et ULR requête/réponse — puis exécute les vrais décodeurs, la publication compacte et la corrélation. Il vérifie quatre arêtes EXACT avec `matching_identifiers=["subscriber_pseudonym"]`. Une variante décodée avec un second abonné vérifie l'unique résultat OPEN. Les tests de TEID réutilisé restent fermés.
+- Versions : `oiran-api` 2.11.11, web 2.11.11, `correlation-engine` 0.6.11. Les décodeurs et `session-engine` restent inchangés.
+- Gate manuel : `cargo build --release --locked`. La recette réelle reste exécutée par ANR2 avant tout déploiement.
+
 ## OIRAN API 2.11.10 — 2026-11-11 — canonicalisation inter-protocoles du pseudonyme abonné
 
 - Cause prouvée : `event-schema/src/lib.rs` hachait le label et les octets fournis par chaque décodeur. NAS EPS et GTPv2-C fournissaient du TBCD, Diameter les octets ASCII de `User-Name`, NAS 5GS l'identité mobile binaire complète et SBI la chaîne `imsi-…` ; ces représentations différentes d'une même identité produisaient donc des pseudonymes différents.
