@@ -1,5 +1,22 @@
 # Changelog
 
+## OIRAN API 2.16.0 — 2026-11-12 — cellules des sessions
+
+- `decoder-s1ap` 0.3.0 publie TAI et E-UTRAN CGI en clair sous forme de
+  coordonnées radio (`plmn`, `tac`, `eci`, `enb_id`, `cell_id`) au lieu des
+  anciens condensats `tai_sha256` et `eutran_cgi_sha256`. Ces coordonnées ne
+  sont pas des identités d’abonné.
+- `decoder-gtpv2c` 0.2.0 décode l’ULI (IE 86) pour TAI, ECGI et NCGI;
+  `decoder-ngap` 0.7.0 expose et teste UserLocationInformation sur
+  InitialUEMessage, UplinkNASTransport, PathSwitchRequest et HandoverNotify.
+- `GET /api/v1/sessions/:id/cells` restitue les changements de cellule dans
+  l’ordre canonique `(capture_id, packet_number, event_id)`, joint les NCI/ECI
+  au snapshot actif et marque explicitement `cell_unknown` en l’absence de
+  correspondance. Les résumés de liste et de détail exposent `serving_cell`.
+- Les événements déjà publiés ne sont pas redécodés : l’historique qui ne
+  contient que les anciens condensats ne peut pas alimenter la route Cellules
+  sans réimportation avec ces versions de décodeurs.
+
 ## OIRAN API 2.15.0 — 2026-11-12 — référentiel cellules versionné
 
 - `POST /api/v1/cell-reference?dry_run=true` valide sans écrire un CSV de 5 Mio maximum et retourne le nombre de lignes valides, les erreurs structurées ligne/colonne/code, l’identifiant SHA-256 du snapshot, les comptes par technologie et l’aperçu normalisé.

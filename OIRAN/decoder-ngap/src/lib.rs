@@ -1068,6 +1068,7 @@ fn be16(v: &[u8]) -> u16 {
 fn message_name(code: u8, kind: PduKind) -> &'static str {
     match (code, kind) {
         (4, PduKind::Initiating) => "DownlinkNASTransport",
+        (12, PduKind::Initiating) => "HandoverNotify",
         (14, PduKind::Initiating) => "InitialContextSetupRequest",
         (14, PduKind::SuccessfulOutcome) => "InitialContextSetupResponse",
         (14, PduKind::UnsuccessfulOutcome) => "InitialContextSetupFailure",
@@ -1075,6 +1076,9 @@ fn message_name(code: u8, kind: PduKind) -> &'static str {
         (21, PduKind::Initiating) => "NGSetupRequest",
         (21, PduKind::SuccessfulOutcome) => "NGSetupResponse",
         (21, PduKind::UnsuccessfulOutcome) => "NGSetupFailure",
+        (25, PduKind::Initiating) => "PathSwitchRequest",
+        (25, PduKind::SuccessfulOutcome) => "PathSwitchRequestAcknowledge",
+        (25, PduKind::UnsuccessfulOutcome) => "PathSwitchRequestFailure",
         (29, PduKind::Initiating) => "PDUSessionResourceSetupRequest",
         (29, PduKind::SuccessfulOutcome) => "PDUSessionResourceSetupResponse",
         (29, PduKind::UnsuccessfulOutcome) => "PDUSessionResourceSetupFailure",
@@ -1183,6 +1187,29 @@ mod tests {
         ]);
         assert_eq!(status, DecodeStatus::Decoded);
         assert!(location.unwrap().contains("nr_cell_id=0x000000010"));
+    }
+
+    #[test]
+    fn user_location_is_available_on_mobility_and_nas_messages() {
+        let location = [
+            0x50, 0x00, 0xf1, 0x10, 0, 0, 0, 1, 0, 0x00, 0xf1, 0x10, 0, 0, 0xc8,
+        ];
+        for (procedure, expected) in [
+            (15, "InitialUEMessage"),
+            (46, "UplinkNASTransport"),
+            (25, "PathSwitchRequest"),
+            (12, "HandoverNotify"),
+        ] {
+            let parsed = parse(&pdu(0, procedure, &[(121, 0, &location)])).unwrap();
+            assert_eq!(parsed.message_name, expected);
+            let key = PseudonymKey::from_bytes([0x66; 32]);
+            let (value, status, _) = decode_ie(&parsed.ies[0], &key);
+            assert_eq!(status, DecodeStatus::Decoded);
+            let value = value.expect("clear user location");
+            assert!(value.contains("plmn=001-01"));
+            assert!(value.contains("tac=0x0000c8"));
+            assert!(value.contains("nr_cell_id=0x000000010"));
+        }
     }
     #[test]
     fn security_capabilities_and_unknown_extension_are_explicit() {

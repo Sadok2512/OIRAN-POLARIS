@@ -25,7 +25,7 @@ use axum::{
 };
 use axum::extract::DefaultBodyLimit;
 use cell_reference::{CellReferenceStore, ImportError as CellImportError, ValidationReport};
-use callflow_schema::{build_callflow, CallFlow};
+use callflow_schema::{build_callflow, CallFlow, CallFlowEvent};
 use dataset_registry::{CaptureRecord, DatasetRecord, DatasetRegistry};
 use disk_safety::{assess, capture_budget, measure_path, rotation_plan, Policy};
 use event_schema::{pseudonym_subscriber_text, sha256_hex};
@@ -838,6 +838,7 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/sessions/:id/callflow", get(session_callflow))
         .route("/sessions/:id/correlations", get(session_correlations))
         .route("/sessions/:id/identities", get(session_identities))
+        .route("/sessions/:id/cells", get(session_cells))
         .route("/subscribers", get(subscribers))
         .route("/subscribers/:pseudo/journey", get(subscriber_journey))
         .route("/subscribers/:pseudo/tmsi", get(subscriber_tmsi))
@@ -2764,6 +2765,118 @@ async fn stop_capture(
     }
 }
 
+fn decoded_cell_fields(event: &CallFlowEvent) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::new();
+    if let Some(elements) = event.decoded_ie_tree.as_array() {
+        for element in elements {
+            let Some(value) = element.get("value").and_then(Value::as_str) else { continue };
+            for pair in value.split(',') {
+                if let Some((name, value)) = pair.split_once('=') {
+                    if matches!(name, "plmn" | "tai_plmn" | "ecgi_plmn" | "ncgi_plmn" | "tac" | "eci" | "nr_cell_id" | "enb_id" | "cell_id" | "pci" | "arfcn") {
+                        fields.insert(name.to_owned(), value.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    fields
+}
+
+fn parsed_cell_number(value: Option<&String>) -> Option<u64> {
+    let value = value?;
+    value
+        .strip_prefix("0x")
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .or_else(|| value.parse().ok())
+}
+
+fn session_cell_rows(flow: &CallFlow, store: &CellReferenceStore) -> Vec<Value> {
+    let active = store.active_snapshot().ok().flatten();
+    let mut events = flow.events.iter().collect::<Vec<_>>();
+    events.sort_by(|left, right| {
+        let left_packet = left.packet_references.first().map(|reference| reference.packet_number).unwrap_or(u64::MAX);
+        let right_packet = right.packet_references.first().map(|reference| reference.packet_number).unwrap_or(u64::MAX);
+        (left.capture_id.as_str(), left_packet, left.event_id.as_str())
+            .cmp(&(right.capture_id.as_str(), right_packet, right.event_id.as_str()))
+    });
+    let mut previous: Option<(String, Option<u64>, Option<u64>)> = None;
+    let mut rows = Vec::new();
+    for event in events {
+        let fields = decoded_cell_fields(event);
+        let nci = parsed_cell_number(fields.get("nr_cell_id"));
+        let eci = parsed_cell_number(fields.get("eci"));
+        if nci.is_none() && eci.is_none() {
+            continue;
+        }
+        let plmn = fields
+            .get("plmn")
+            .or_else(|| fields.get("ncgi_plmn"))
+            .or_else(|| fields.get("ecgi_plmn"))
+            .or_else(|| fields.get("tai_plmn"))
+            .cloned()
+            .unwrap_or_else(|| "UNKNOWN".into());
+        let key = (plmn.clone(), nci, eci);
+        if previous.as_ref() == Some(&key) {
+            continue;
+        }
+        previous = Some(key);
+        let joined = active.as_ref().and_then(|snapshot| {
+            let (mcc, mnc) = plmn.split_once('-')?;
+            snapshot.cells.iter().find(|cell| {
+                cell.mcc == mcc
+                    && cell.mnc == mnc
+                    && match (nci, eci) {
+                        (Some(value), _) => cell.nci == Some(value),
+                        (_, Some(value)) => cell.eci == Some(value as u32),
+                        _ => false,
+                    }
+            }).map(|cell| (snapshot, cell))
+        });
+        let packet_number = event.packet_references.first().map(|reference| reference.packet_number);
+        rows.push(json!({
+            "event_id":event.event_id,
+            "interface":event.interface,
+            "message":event.message_name,
+            "capture_id":event.capture_id,
+            "packet_number":packet_number,
+            "plmn":plmn,
+            "tac":fields.get("tac"),
+            "nci":nci.map(|value| format!("0x{value:09x}")),
+            "eci":eci.map(|value| format!("0x{value:07x}")),
+            "enb_id":fields.get("enb_id"),
+            "cell_id":fields.get("cell_id"),
+            "pci":fields.get("pci"),
+            "arfcn":fields.get("arfcn"),
+            "site":Value::Null,
+            "latitude":joined.map(|(_, cell)| cell.latitude),
+            "longitude":joined.map(|(_, cell)| cell.longitude),
+            "azimuth":Value::Null,
+            "opening":Value::Null,
+            "range":Value::Null,
+            "snapshot_id":joined.map(|(snapshot, _)| snapshot.snapshot_id.as_str()),
+            "cell_unknown":joined.is_none()
+        }));
+    }
+    rows
+}
+
+fn decorate_cell_summary(summary: &mut Value, flow: &CallFlow, store: &CellReferenceStore) {
+    let rows = session_cell_rows(flow, store);
+    summary["serving_cell"] = rows.last().cloned().unwrap_or(Value::Null);
+}
+
+async fn session_cells(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let flows = queryable_flows(&state);
+    let Some(flow) = flows.get(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "SESSION_NOT_FOUND", "unknown session id");
+    };
+    ok(json!({
+        "session_id": id,
+        "ordering": "capture_id,packet_number,event_id",
+        "cells": session_cell_rows(flow, &state.inner.cell_reference_store)
+    })).into_response()
+}
+
 fn session_summary(state: &AppState, flow: &CallFlow) -> Value {
     let (parsed_ue, parsed_pdu) = parse_session_identity(&flow.session_id);
     let is_lte = flow.technology == "LTE";
@@ -2850,7 +2963,7 @@ fn session_summary(state: &AppState, flow: &CallFlow) -> Value {
             .to_owned()
         })
         .unwrap_or_else(|| "UNKNOWN".into());
-    json!({
+    let mut summary = json!({
         "session_id":flow.session_id,"dataset_id":state.inner.manifest.get("scenario_id"),"ue_context_id":ue_context_id,
         "dataset_kind":"HISTORICAL",
         "technology":flow.technology,"ue_pseudonym":ue_pseudonym,"pdu_session_id":pdu_session_id,"serving_node":serving_node,
@@ -2859,10 +2972,16 @@ fn session_summary(state: &AppState, flow: &CallFlow) -> Value {
         "duration_ns":duration_ns.to_string(),
         "source_event_count":flow.accounting.source_events,"background_event_count":flow.accounting.background_events,"correlation_status":flow.correlation_status.get("E2E"),
         "decode_completeness":{"decoded":decoded,"partial":partial,"unresolved_fields":flow.unresolved_fields},"state":state_name
-    })
+    });
+    decorate_cell_summary(&mut summary, flow, &state.inner.cell_reference_store);
+    summary
 }
 
-fn live_session_summary(dataset: &live_probe::LiveDataset, flow: &CallFlow) -> Value {
+fn live_session_summary(
+    dataset: &live_probe::LiveDataset,
+    flow: &CallFlow,
+    cell_store: &CellReferenceStore,
+) -> Value {
     let started_ns = dataset
         .capture_started_epoch_ms
         .map(|value| i128::from(value) * 1_000_000);
@@ -2925,7 +3044,7 @@ fn live_session_summary(dataset: &live_probe::LiveDataset, flow: &CallFlow) -> V
             .to_owned()
         })
         .unwrap_or_else(|| "UNKNOWN".into());
-    json!({
+    let mut summary = json!({
         "session_id":flow.session_id,"dataset_id":dataset.dataset_id,"ue_context_id":discovered.map(|session|session.ue_context_id.clone()),
         "dataset_kind":if dataset.dataset_id.starts_with("derived-") {"DERIVED"} else if dataset.dataset_id.starts_with("recovered-dataset-") {"RECOVERED"} else if dataset.capture_id == live_probe::CONTINUOUS_CAPTURE_ID && !fresh_flow {"HISTORICAL"} else {"CAPTURED_LIVE"},
         "technology":flow.technology,"ue_pseudonym":runtime.map(|context|context.internal_ue_id.as_str()).or_else(||context.map(|context|context.pseudonym.as_str())).unwrap_or("UNKNOWN"),"pdu_session_id":runtime.map(|context|context.pdu_session_id.as_str()).or_else(||discovered.map(|session|session.pdu_session_id.as_str())),"serving_node":serving_node,
@@ -2936,7 +3055,9 @@ fn live_session_summary(dataset: &live_probe::LiveDataset, flow: &CallFlow) -> V
         "decode_completeness":{"decoded":decoded,"partial":partial,"unresolved_fields":flow.unresolved_fields},
         "runtime_evidence":runtime.map(|context|json!({"observed_epoch_ms":context.observed_epoch_ms,"provenance":context.provenance,"correlation_status":context.correlation_status,"ue_ip":context.ue_ip,"teids":context.teids,"directions":context.directions})),
         "state":if dataset.capture_id == live_probe::CONTINUOUS_CAPTURE_ID && !fresh_flow {"HISTORICAL_CONTEXT"} else if fresh_flow {"ACTIVE_WITH_USER_PLANE"} else {"UNKNOWN"}
-    })
+    });
+    decorate_cell_summary(&mut summary, flow, cell_store);
+    summary
 }
 
 fn lte_session_summary(manifest: &LteDatasetManifest, session: &LteSession) -> Value {
@@ -3101,7 +3222,7 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                 .capture_manager
                 .callflow(&dataset.dataset_id, session_id)
             {
-                let mut summary = live_session_summary(&dataset, &flow);
+                let mut summary = live_session_summary(&dataset, &flow, &state.inner.cell_reference_store);
                 decorate_subscriber_summary(&mut summary, &flow, &journey_index);
                 unique.insert(session_id.clone(), summary);
             }
@@ -3117,9 +3238,18 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                 if let Some(records) = page["data"].as_array() {
                     for record in records {
                         if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
+                            let mut summary = lte_session_summary(&manifest, &session);
+                            if let Some(flow) = journey_flows.get(&session.session_id) {
+                                decorate_cell_summary(
+                                    &mut summary,
+                                    flow,
+                                    &state.inner.cell_reference_store,
+                                );
+                                decorate_subscriber_summary(&mut summary, flow, &journey_index);
+                            }
                             unique.insert(
                                 session.session_id.clone(),
-                                lte_session_summary(&manifest, &session),
+                                summary,
                             );
                         }
                     }
@@ -3404,7 +3534,7 @@ async fn sessions_filter(
                 .capture_manager
                 .callflow(&dataset.dataset_id, session_id)
             {
-                let mut summary = live_session_summary(&dataset, &flow);
+                let mut summary = live_session_summary(&dataset, &flow, &state.inner.cell_reference_store);
                 decorate_subscriber_summary(&mut summary, &flow, &journey_index);
                 items_by_id.insert(session_id.clone(), summary);
             }
@@ -3421,9 +3551,14 @@ async fn sessions_filter(
                     for record in records {
                         if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
                             if page_set.contains(session.session_id.as_str()) {
+                                let mut summary = lte_session_summary(&manifest, &session);
+                                if let Some(flow) = journey_flows.get(&session.session_id) {
+                                    decorate_cell_summary(&mut summary, flow, &state.inner.cell_reference_store);
+                                    decorate_subscriber_summary(&mut summary, flow, &journey_index);
+                                }
                                 items_by_id.insert(
                                     session.session_id.clone(),
-                                    lte_session_summary(&manifest, &session),
+                                    summary,
                                 );
                             }
                         }
@@ -3475,7 +3610,7 @@ async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Respo
             .capture_manager
             .dataset(&dataset_id)
             .expect("live flow dataset remains registered");
-        let mut summary = live_session_summary(&dataset,&flow);
+        let mut summary = live_session_summary(&dataset,&flow, &state.inner.cell_reference_store);
         decorate_subscriber_summary(&mut summary, &flow, &journey_index);
         return ok(json!({"summary":summary,"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
     }
@@ -3488,8 +3623,13 @@ async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Respo
             .keys()
             .map(|plane| format!("capture:{plane}"))
             .collect::<Vec<_>>();
+        let mut summary = lte_session_summary(&manifest,&lte);
+        if let Some(flow) = journey_flows.get(&id) {
+            decorate_cell_summary(&mut summary, flow, &state.inner.cell_reference_store);
+            decorate_subscriber_summary(&mut summary, flow, &journey_index);
+        }
         let mut value = json!({
-            "summary":lte_session_summary(&manifest,&lte),"procedures":procedures,
+            "summary":summary,"procedures":procedures,
             "accounting":{"source_events":manifest.event_count,"session_events":lte.event_ids.len()},
             "capture_references":capture_references
         });
@@ -4927,6 +5067,62 @@ mod tests {
         assert!(cell_root.join("active.json").is_file());
         assert!(cell_root.join("audit.json").is_file());
         fs::remove_dir_all(cell_root).unwrap();
+    }
+
+    #[test]
+    fn session_cells_join_active_snapshot_and_keep_canonical_order() {
+        let test_state = state();
+        let source = test_state
+            .inner
+            .flows
+            .values()
+            .next()
+            .expect("fixture callflow");
+        let mut flow = source.clone();
+        flow.technology = "5G".into();
+        let mut first = flow.events[0].clone();
+        first.event_id = "evt-cell-later".into();
+        first.capture_id = "capture-b".into();
+        first.packet_references[0].packet_number = 9;
+        first.decoded_ie_tree = json!([{"name":"UserLocationInformation","value":"plmn=001-01,nr_cell_id=0x000000123,tai_plmn=001-01,tac=0x00002a"}]);
+        let mut second = first.clone();
+        second.event_id = "evt-cell-first".into();
+        second.capture_id = "capture-a".into();
+        second.packet_references[0].packet_number = 2;
+        flow.events = vec![first, second];
+
+        let unknown = session_cell_rows(&flow, &test_state.inner.cell_reference_store);
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0]["event_id"], "evt-cell-first");
+        assert_eq!(unknown[0]["cell_unknown"], true);
+
+        let csv = format!(
+            "{}\n5G,001,01,18,32,291,,,3,1.25,2.5\n",
+            cell_reference::CSV_HEADERS.join(",")
+        );
+        let snapshot = test_state
+            .inner
+            .cell_reference_store
+            .import(csv.as_bytes(), "test-operator")
+            .expect("valid cell snapshot");
+        test_state
+            .inner
+            .cell_reference_store
+            .activate(&snapshot.snapshot_id, "test-operator")
+            .expect("activate snapshot");
+        let joined = session_cell_rows(&flow, &test_state.inner.cell_reference_store);
+        assert_eq!(joined[0]["cell_unknown"], false);
+        assert_eq!(joined[0]["latitude"], 1.25);
+        assert_eq!(joined[0]["snapshot_id"], snapshot.snapshot_id);
+
+        let mut lte = flow;
+        lte.technology = "LTE".into();
+        for event in &mut lte.events {
+            event.decoded_ie_tree = json!([{"name":"EUTRAN-CGI","value":"plmn=001-01,tac=0x002a,eci=0x1234567,enb_id=0x12345,cell_id=0x67"}]);
+        }
+        let lte_rows = session_cell_rows(&lte, &test_state.inner.cell_reference_store);
+        assert_eq!(lte_rows[0]["eci"], "0x1234567");
+        assert_eq!(lte_rows[0]["cell_unknown"], true);
     }
     fn test_config(root: &FsPath, label: &str) -> ApiConfig {
         let mut config = ApiConfig::from_workspace(root);

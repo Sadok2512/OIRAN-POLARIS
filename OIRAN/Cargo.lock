@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-gtpv2c"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "event-schema",
  "plugin-runtime",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-ngap"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "decoder-nas",
  "event-schema",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-s1ap"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "decoder-nas",
  "event-schema",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.15.0"
+version = "2.16.0"
 dependencies = [
  "axum",
  "callflow-renderer",

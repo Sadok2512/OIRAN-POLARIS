@@ -259,6 +259,15 @@ impl CellReferenceStore {
         }))
     }
 
+    pub fn active_snapshot(&self) -> Result<Option<SnapshotDocument>, StoreError> {
+        let active_path = self.root.join("active.json");
+        if !active_path.exists() {
+            return Ok(None);
+        }
+        let active: ActiveDocument = read_json(&active_path)?;
+        read_json(&self.snapshot_path(&active.snapshot_id)).map(Some)
+    }
+
     fn snapshot_path(&self, snapshot_id: &str) -> PathBuf {
         self.root.join(format!("{snapshot_id}.json"))
     }

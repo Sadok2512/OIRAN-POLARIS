@@ -366,16 +366,8 @@ fn decode_ie(ie: &S1apIe, pseudonym_key: &PseudonymKey) -> (Option<String>, Deco
         87 => decode_single_byte("relative_mme_capacity", &ie.value),
         59 => decode_global_enb_id(&ie.value),
         134 => decode_rrc_establishment_cause(&ie.value),
-        67 => (
-            Some(format!("tai_sha256={}", sha256_hex(&ie.value))),
-            DecodeStatus::Partial,
-            false,
-        ),
-        100 => (
-            Some(format!("eutran_cgi_sha256={}", sha256_hex(&ie.value))),
-            DecodeStatus::Partial,
-            false,
-        ),
+        67 => decode_tai(&ie.value),
+        100 => decode_eutran_cgi(&ie.value),
         64 => (
             Some(format!(
                 "supported_tas_sha256={}",
@@ -480,6 +472,40 @@ fn decode_global_enb_id(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
             sha256_hex(v)
         )),
         DecodeStatus::Partial,
+        false,
+    )
+}
+
+fn decode_tai(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
+    if v.len() != 5 {
+        return (None, DecodeStatus::Malformed, false);
+    }
+    let tac = u16::from_be_bytes([v[3], v[4]]);
+    (
+        Some(format!("plmn={},tac=0x{tac:04x}", decode_plmn(&v[..3]))),
+        DecodeStatus::Decoded,
+        false,
+    )
+}
+
+fn decode_eutran_cgi(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
+    // EUTRAN-CGI is PLMN-Identity followed by a 28-bit E-UTRAN Cell Identity.
+    // Some producers retain the APER extension bit in a leading zero octet;
+    // accept both canonical encodings without hashing this non-identity data.
+    let (plmn, cell_bytes) = match v.len() {
+        7 => (&v[..3], &v[3..7]),
+        8 if v[0] == 0 => (&v[1..4], &v[4..8]),
+        _ => return (None, DecodeStatus::Malformed, false),
+    };
+    let eci = u32::from_be_bytes(cell_bytes.try_into().expect("four bytes")) >> 4;
+    let enb_id = eci >> 8;
+    let cell_id = eci & 0xff;
+    (
+        Some(format!(
+            "plmn={},eci=0x{eci:07x},enb_id=0x{enb_id:05x},cell_id=0x{cell_id:02x}",
+            decode_plmn(plmn)
+        )),
+        DecodeStatus::Decoded,
         false,
     )
 }
@@ -720,7 +746,7 @@ impl ProtocolDecoder for S1apDecoder {
                                     "mme_ue_s1ap_id"
                                         | "enb_ue_s1ap_id"
                                         | "subscriber_pseudonym"
-                                        | "plmn"
+                                        | "plmn" | "tac" | "eci" | "enb_id" | "cell_id"
                                 ) {
                                     identifiers.push(NamedValue {
                                         name: key.into(),
@@ -1138,6 +1164,21 @@ mod tests {
         assert_eq!(parsed.procedure_code, 17);
         assert_eq!(parsed.ies.len(), 4);
         assert_eq!(parsed.ies[1].known_name, Some("eNBname"));
+    }
+
+    #[test]
+    fn decodes_tai_and_eutran_cgi_as_clear_cell_coordinates() {
+        let (tai, tai_status, _) = decode_tai(&[0x00, 0xf1, 0x10, 0x00, 0x2a]);
+        assert_eq!(tai_status, DecodeStatus::Decoded);
+        assert_eq!(tai.as_deref(), Some("plmn=001-01,tac=0x002a"));
+
+        let (cgi, cgi_status, _) =
+            decode_eutran_cgi(&[0x00, 0xf1, 0x10, 0x12, 0x34, 0x56, 0x70]);
+        assert_eq!(cgi_status, DecodeStatus::Decoded);
+        assert_eq!(
+            cgi.as_deref(),
+            Some("plmn=001-01,eci=0x1234567,enb_id=0x12345,cell_id=0x67")
+        );
     }
 
     #[test]

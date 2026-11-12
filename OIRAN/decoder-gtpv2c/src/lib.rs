@@ -142,6 +142,7 @@ fn decode_ie(
         73 => decode_single_byte("ebi", &ie.value, name),
         79 => decode_paa(&ie.value, name),
         83 => decode_serving_network(&ie.value, name),
+        86 => decode_uli(&ie.value, name),
         87 => decode_fteid(&ie.value, name),
         93 => (
             Some(format!(
@@ -321,6 +322,69 @@ fn decode_plmn(v: &[u8]) -> String {
     format!("{mcc}-{mnc}")
 }
 
+fn decode_uli(
+    v: &[u8],
+    ie_name: Option<&'static str>,
+) -> (Option<String>, DecodeStatus, bool, Option<&'static str>) {
+    if v.is_empty() {
+        return (None, DecodeStatus::Malformed, false, ie_name);
+    }
+    let flags = v[0];
+    let mut offset = 1usize;
+    let mut fields = Vec::new();
+    let mut take = |length: usize| -> Option<&[u8]> {
+        let end = offset.checked_add(length)?;
+        let value = v.get(offset..end)?;
+        offset = end;
+        Some(value)
+    };
+
+    // TS 29.274 ULI fields are encoded in CGI, SAI, RAI, TAI, ECGI, LAI,
+    // macro-eNB and extended-macro-eNB order when their flag is present.
+    if flags & 0x20 != 0 && take(7).is_none() { return (None, DecodeStatus::Malformed, false, ie_name); }
+    if flags & 0x10 != 0 && take(7).is_none() { return (None, DecodeStatus::Malformed, false, ie_name); }
+    if flags & 0x08 != 0 && take(7).is_none() { return (None, DecodeStatus::Malformed, false, ie_name); }
+    if flags & 0x04 != 0 {
+        let Some(tai) = take(5) else { return (None, DecodeStatus::Malformed, false, ie_name) };
+        fields.push(format!(
+            "tai_plmn={},tac=0x{:04x}",
+            decode_plmn(&tai[..3]),
+            u16::from_be_bytes([tai[3], tai[4]])
+        ));
+    }
+    if flags & 0x02 != 0 {
+        let Some(ecgi) = take(7) else { return (None, DecodeStatus::Malformed, false, ie_name) };
+        let eci = u32::from_be_bytes(ecgi[3..7].try_into().expect("four bytes")) & 0x0fff_ffff;
+        fields.push(format!(
+            "ecgi_plmn={},eci=0x{eci:07x},enb_id=0x{:05x},cell_id=0x{:02x}",
+            decode_plmn(&ecgi[..3]), eci >> 8, eci & 0xff
+        ));
+    }
+    if flags & 0x01 != 0 && take(5).is_none() { return (None, DecodeStatus::Malformed, false, ie_name); }
+    if flags & 0x40 != 0 && take(6).is_none() { return (None, DecodeStatus::Malformed, false, ie_name); }
+    if flags & 0x80 != 0 && take(6).is_none() { return (None, DecodeStatus::Malformed, false, ie_name); }
+
+    // Rel-15 producers append NCGI (PLMN + 36-bit NR Cell Identity) after
+    // the legacy flagged fields. Preserve it in clear because cell
+    // coordinates are not subscriber identities.
+    if v.len().saturating_sub(offset) == 8 {
+        let ncgi = &v[offset..];
+        let nci = ncgi[3..]
+            .iter()
+            .fold(0u64, |value, octet| (value << 8) | u64::from(*octet))
+            & 0x0f_ffff_ffff;
+        fields.push(format!(
+            "ncgi_plmn={},nr_cell_id=0x{nci:09x}",
+            decode_plmn(&ncgi[..3])
+        ));
+        offset = v.len();
+    }
+    if offset != v.len() || fields.is_empty() {
+        return (None, DecodeStatus::Unsupported, false, ie_name);
+    }
+    (Some(fields.join(",")), DecodeStatus::Decoded, false, ie_name)
+}
+
 fn message_name(code: u8) -> &'static str {
     match code {
         1 => "EchoRequest",
@@ -468,6 +532,14 @@ fn emit_event(msg: Gtpv2cMessage, input: &DecoderInput<'_>) -> DecoderOutput {
                             | "ue_ipv4"
                             | "ue_ipv6"
                             | "ebi"
+                            | "tai_plmn"
+                            | "ecgi_plmn"
+                            | "ncgi_plmn"
+                            | "tac"
+                            | "eci"
+                            | "enb_id"
+                            | "cell_id"
+                            | "nr_cell_id"
                     ) {
                         identifiers.push(NamedValue {
                             name: key.into(),
@@ -978,6 +1050,24 @@ mod tests {
                     .any(|identifier| identifier.name == name && identifier.value == expected));
             }
         }
+    }
+
+    #[test]
+    fn uli_decodes_tai_ecgi_and_ncgi_coordinates() {
+        let mut value = vec![0x06]; // TAI + ECGI
+        value.extend_from_slice(&[0x00, 0xf1, 0x10, 0x00, 0x2a]);
+        value.extend_from_slice(&[0x00, 0xf1, 0x10, 0x01, 0x23, 0x45, 0x67]);
+        let (decoded, status, _, _) = decode_uli(&value, Some("ULI"));
+        assert_eq!(status, DecodeStatus::Decoded);
+        let decoded = decoded.expect("decoded ULI");
+        assert!(decoded.contains("tai_plmn=001-01,tac=0x002a"));
+        assert!(decoded.contains("ecgi_plmn=001-01,eci=0x1234567"));
+        assert!(decoded.contains("enb_id=0x12345,cell_id=0x67"));
+
+        let ncgi = [0x00, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x00, 0x01, 0x23];
+        let (decoded, status, _, _) = decode_uli(&ncgi, Some("ULI"));
+        assert_eq!(status, DecodeStatus::Decoded);
+        assert!(decoded.expect("decoded NCGI").contains("nr_cell_id=0x000000123"));
     }
 
     #[test]
