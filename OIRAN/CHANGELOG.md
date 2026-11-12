@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.15.0 — 2026-11-12 — référentiel cellules versionné
+
+- `POST /api/v1/cell-reference?dry_run=true` valide sans écrire un CSV de 5 Mio maximum et retourne le nombre de lignes valides, les erreurs structurées ligne/colonne/code, l’identifiant SHA-256 du snapshot, les comptes par technologie et l’aperçu normalisé.
+- Le schéma CSV canonique est `technology,mcc,mnc,gnb_id,gnb_id_length,nci,enb_id,eci,cell_id,latitude,longitude`. Les validations couvrent en-tête, champs obligatoires, PLMN, longueur gNB, cohérence NCI/ECI, coordonnées, doublons et snapshot déjà présent.
+- L’import réel est tout-ou-rien. Les snapshots immuables sont écrits atomiquement sous `/var/lib/oiran/cell-reference/<snapshot_id>.json`, sans écrasement; `POST /cell-reference/:snapshot_id/activate` remplace atomiquement `active.json` et conserve l’audit acteur/date/snapshot/nombre de cellules.
+- Le contrôle de démarrage exige que la racine du référentiel soit inscriptible si elle existe, ou créable si elle est absente. Les contrôles du coffre et de capture restent inchangés.
+- Version : `oiran-api` 2.15.0; live-probe, web embarqué, schémas, moteurs et décodeurs inchangés.
+
 ## OIRAN API 2.14.3 — 2026-11-12 — contrôle d’accès au démarrage
 
 - Les racines `derived_import_root`, `lte_evidence_root` et `lte_evidence_bundle_root` déjà présentes exigent uniquement lecture et traversée (`R_OK|X_OK`). La création n’est exigée que lorsque la racine est absente; un montage de référence existant en lecture seule ne bloque donc plus le démarrage.

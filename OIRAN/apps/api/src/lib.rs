@@ -7,6 +7,7 @@
 // handlers API.
 #![recursion_limit = "512"]
 
+mod cell_reference;
 mod identity_vault;
 mod live_trace;
 mod probe_registry;
@@ -14,7 +15,7 @@ mod session_filters;
 mod subscriber_journey;
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{from_fn, Next},
@@ -22,6 +23,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use axum::extract::DefaultBodyLimit;
+use cell_reference::{CellReferenceStore, ImportError as CellImportError, ValidationReport};
 use callflow_schema::{build_callflow, CallFlow};
 use dataset_registry::{CaptureRecord, DatasetRecord, DatasetRegistry};
 use disk_safety::{assess, capture_budget, measure_path, rotation_plan, Policy};
@@ -73,6 +76,7 @@ const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
 const DEFAULT_IDENTITY_VAULT_DIR: &str = "/var/lib/oiran/identity-vault";
 const DEFAULT_IDENTITY_VAULT_PATH: &str = "/var/lib/oiran/identity-vault/vault.json";
+const DEFAULT_CELL_REFERENCE_ROOT: &str = "/var/lib/oiran/cell-reference";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -97,6 +101,7 @@ struct Inner {
     operator_token_sha256: Option<String>,
     administrator_token_sha256: Option<String>,
     identity_vault: IdentityVault,
+    cell_reference_store: CellReferenceStore,
     live_traces: live_trace::LiveTraceRegistry,
     /// 2.10.0 : index des filtres Session Explorer (messages, causes,
     /// pseudonymes), construit au chargement depuis `flows` + mis à
@@ -138,6 +143,7 @@ pub struct ApiConfig {
     /// Root-only identity evidence, deliberately outside the capture and
     /// publication roots.
     pub identity_vault_path: PathBuf,
+    pub cell_reference_root: PathBuf,
 }
 
 impl ApiConfig {
@@ -184,6 +190,9 @@ impl ApiConfig {
             identity_vault_path: std::env::var_os("OIRAN_IDENTITY_VAULT_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_VAULT_DIR).join("vault.json")),
+            cell_reference_root: std::env::var_os("OIRAN_CELL_REFERENCE_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_CELL_REFERENCE_ROOT)),
         }
     }
 }
@@ -199,6 +208,23 @@ fn validate_identity_vault_path(config: &ApiConfig) -> Result<(), String> {
     if !allowed || path.parent() == Some(FsPath::new("/var/lib/oiran")) {
         return Err(format!(
             "identity vault path is not isolated path={}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cell_reference_path(config: &ApiConfig) -> Result<(), String> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    let path = &config.cell_reference_root;
+    if path != FsPath::new(DEFAULT_CELL_REFERENCE_ROOT)
+        && !path.starts_with("/var/tmp/oiran-phantom")
+        && !path.starts_with(config.workspace.join("runtime"))
+    {
+        return Err(format!(
+            "cell reference path escapes the allowlist path={}",
             path.display()
         ));
     }
@@ -295,6 +321,7 @@ fn startup_access_checks(config: &ApiConfig) -> Result<(), String> {
         return Ok(());
     }
     validate_identity_vault_path(config)?;
+    validate_cell_reference_path(config)?;
     access_check(&config.workspace, libc::R_OK | libc::X_OK, "workspace-read")?;
     if config.capture_root.exists() {
         access_check(&config.capture_root, libc::R_OK | libc::X_OK, "capture-root-read")?;
@@ -309,6 +336,7 @@ fn startup_access_checks(config: &ApiConfig) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "identity vault path has no parent".to_owned())?;
     access_check_creatable(vault_directory, "identity-vault-create")?;
+    access_check_creatable(&config.cell_reference_root, "cell-reference-create")?;
     service_state_access_checks(config)?;
     if config.probe_registry_path.exists() {
         access_check(
@@ -392,6 +420,8 @@ impl AppState {
         }
         validate_identity_vault_path(&config)?;
         let identity_vault = IdentityVault::load(config.identity_vault_path.clone())?;
+        let cell_reference_store = CellReferenceStore::new(config.cell_reference_root.clone())
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
         let workspace = config.workspace.canonicalize().map_err(io_error)?;
         let dataset_dir = config.dataset_dir.canonicalize().map_err(io_error)?;
         let callflow_json = config.callflow_json.canonicalize().map_err(io_error)?;
@@ -590,6 +620,7 @@ impl AppState {
                 operator_token_sha256: config.operator_token_sha256,
                 administrator_token_sha256: config.administrator_token_sha256,
                 identity_vault,
+                cell_reference_store,
                 live_traces: live_trace::LiveTraceRegistry::new(),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
@@ -602,6 +633,8 @@ impl AppState {
     ) -> Result<Self, String> {
         validate_identity_vault_path(&config)?;
         let identity_vault = IdentityVault::load(config.identity_vault_path.clone())?;
+        let cell_reference_store = CellReferenceStore::new(config.cell_reference_root.clone())
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
         let workspace = config.workspace.canonicalize().map_err(io_error)?;
         let capture_root = config.capture_root;
         if !capture_root.starts_with(&workspace)
@@ -655,6 +688,7 @@ impl AppState {
                 operator_token_sha256: config.operator_token_sha256,
                 administrator_token_sha256: config.administrator_token_sha256,
                 identity_vault,
+                cell_reference_store,
                 live_traces: live_trace::LiveTraceRegistry::new(),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
@@ -760,6 +794,16 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/live/traces/:id/markers", post(live_trace::marker))
         .route("/live/traces/:id/stream", get(live_trace::stream))
         .route("/audit", get(live_trace::audit))
+        .route(
+            "/cell-reference",
+            get(cell_reference_list)
+                .post(cell_reference_import)
+                .layer(DefaultBodyLimit::max(cell_reference::MAX_CSV_BYTES + 1)),
+        )
+        .route(
+            "/cell-reference/:snapshot_id/activate",
+            post(cell_reference_activate),
+        )
         .route("/datasets", get(datasets))
         .route("/datasets/import-derived", post(import_derived_dataset))
         .route("/lte/evidence/import", post(import_lte_evidence))
@@ -2130,6 +2174,101 @@ async fn datasets(
 #[derive(Debug, Deserialize)]
 struct DerivedDatasetImportRequest {
     dataset_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CellReferenceImportQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn cell_reference_list(State(state): State<AppState>) -> Response {
+    match state.inner.cell_reference_store.list() {
+        Ok(value) => ok(value).into_response(),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.code,
+            &error.message,
+        ),
+    }
+}
+
+async fn cell_reference_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CellReferenceImportQuery>,
+    body: Bytes,
+) -> Response {
+    let role = match require_operator_csrf(&state, &headers) {
+        Ok(role) => role,
+        Err(response) => return response,
+    };
+    if body.len() > cell_reference::MAX_CSV_BYTES {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "CELL_REFERENCE_TOO_LARGE",
+            "cell reference CSV exceeds 5 MiB",
+        );
+    }
+    if query.dry_run {
+        return ok(serde_json::to_value(state.inner.cell_reference_store.validate(&body)).unwrap())
+            .into_response();
+    }
+    match state
+        .inner
+        .cell_reference_store
+        .import(&body, role.name())
+    {
+        Ok(snapshot) => (
+            StatusCode::CREATED,
+            ok(serde_json::to_value(snapshot).unwrap()),
+        )
+            .into_response(),
+        Err(CellImportError::Validation(report)) => cell_reference_validation_error(report),
+        Err(CellImportError::Store(error)) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.code,
+            &error.message,
+        ),
+    }
+}
+
+async fn cell_reference_activate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(snapshot_id): Path<String>,
+) -> Response {
+    let role = match require_operator_csrf(&state, &headers) {
+        Ok(role) => role,
+        Err(response) => return response,
+    };
+    match state
+        .inner
+        .cell_reference_store
+        .activate(&snapshot_id, role.name())
+    {
+        Ok(audit) => ok(audit).into_response(),
+        Err(error) => api_error(
+            if error.code == "SNAPSHOT_NOT_FOUND" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+            error.code,
+            &error.message,
+        ),
+    }
+}
+
+fn cell_reference_validation_error(report: ValidationReport) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "data": report,
+            "meta": {"api_version": API_VERSION}
+        })),
+    )
+        .into_response()
 }
 
 async fn import_derived_dataset(
@@ -4704,6 +4843,91 @@ mod tests {
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn absent_cell_reference_root_in_read_only_parent_is_explicit() {
+        let root = temporary_directory("cell-reference-missing");
+        let parent = root.join("read-only-parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let missing = parent.join("cell-reference");
+        let error = access_check_creatable(&missing, "cell-reference-create").unwrap_err();
+        assert!(error.contains("ACCESS_CHECK_FAILED"));
+        assert!(error.contains("required=cell-reference-create"));
+        assert!(error.contains(&format!("requested_path={}", missing.display())));
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cell_reference_dry_run_import_and_activation_are_atomic() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut config = test_config(workspace, "cell-reference-http");
+        config.operator_token_sha256 = Some(sha256_hex(b"test-operator-token"));
+        let cell_root = config.cell_reference_root.clone();
+        let app = router(AppState::load(config).unwrap(), None);
+        let headers = cell_reference::CSV_HEADERS.join(",");
+        let invalid = format!(
+            "{headers}\n5G,001,01,100,22,1638408,,,7,48.1,2.1\n"
+        );
+        let invalid_response = app
+            .clone()
+            .oneshot(cell_reference_request("/api/v1/cell-reference", invalid))
+            .await
+            .unwrap();
+        assert_eq!(invalid_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let invalid_body = json_body(invalid_response).await;
+        assert_eq!(invalid_body["data"]["errors"][0]["line"], 2);
+        assert_eq!(invalid_body["data"]["errors"][0]["code"], "NCI_MISMATCH");
+        assert_eq!(fs::read_dir(&cell_root).unwrap().count(), 0);
+
+        let valid = format!(
+            "{headers}\n5G,001,01,100,22,1638407,,,7,48.1,2.1\nLTE,001,01,,,,200,51208,8,48.2,2.2\n"
+        );
+        let dry = app
+            .clone()
+            .oneshot(cell_reference_request(
+                "/api/v1/cell-reference?dry_run=true",
+                valid.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(dry.status(), StatusCode::OK);
+        let dry = json_body(dry).await;
+        assert_eq!(dry["data"]["valid_rows"], 2);
+        assert_eq!(dry["data"]["errors"], json!([]));
+        assert_eq!(fs::read_dir(&cell_root).unwrap().count(), 0, "dry run wrote files");
+
+        let imported = app
+            .clone()
+            .oneshot(cell_reference_request("/api/v1/cell-reference", valid))
+            .await
+            .unwrap();
+        assert_eq!(imported.status(), StatusCode::CREATED);
+        let imported = json_body(imported).await;
+        let snapshot_id = imported["data"]["snapshot_id"].as_str().unwrap();
+        assert!(cell_root.join(format!("{snapshot_id}.json")).is_file());
+
+        let activated = app
+            .clone()
+            .oneshot(cell_reference_request(
+                &format!("/api/v1/cell-reference/{snapshot_id}/activate"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(activated.status(), StatusCode::OK);
+        let activated = json_body(activated).await;
+        assert_eq!(activated["data"]["snapshot_id"], snapshot_id);
+        assert_eq!(activated["data"]["cell_count"], 2);
+        assert!(cell_root.join("active.json").is_file());
+        assert!(cell_root.join("audit.json").is_file());
+        fs::remove_dir_all(cell_root).unwrap();
+    }
     fn test_config(root: &FsPath, label: &str) -> ApiConfig {
         let mut config = ApiConfig::from_workspace(root);
         config.probe_registry_path = temporary_directory(label).join("probe-registry.json");
@@ -4715,6 +4939,7 @@ mod tests {
         let identity_directory = temporary_directory(&format!("{label}-identities"));
         fs::set_permissions(&identity_directory, fs::Permissions::from_mode(0o700)).unwrap();
         config.identity_vault_path = identity_directory.join("identity-vault.json");
+        config.cell_reference_root = temporary_directory(&format!("{label}-cell-reference"));
         config
     }
     fn state() -> AppState {
@@ -4737,6 +4962,17 @@ mod tests {
     }
     fn req(path: &str, _public_access: bool) -> Request<Body> {
         Request::builder().uri(path).body(Body::empty()).unwrap()
+    }
+    fn cell_reference_request(path: &str, csv: impl Into<Body>) -> Request<Body> {
+        let csrf = sha256_hex(b"oiran-csrf-v1:test-operator-token");
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, "text/csv")
+            .header(header::AUTHORIZATION, "Bearer test-operator-token")
+            .header(CSRF_HEADER, csrf)
+            .body(csv.into())
+            .unwrap()
     }
     async fn json_body(response: Response) -> Value {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
