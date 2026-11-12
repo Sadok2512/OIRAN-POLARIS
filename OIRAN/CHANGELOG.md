@@ -3,6 +3,8 @@
 ## OIRAN API 2.12.0 — 2026-11-11 — coffre d'identités operator
 
 - Coffre d'identités persistant hors dataset, répertoire 0700 et fichier 0600, avec preuves ordonnées `(capture_id, packet_number)` et aucune valeur claire dans les journaux.
+- Coffre situé dans `/var/lib/oiran/identity-vault/vault.json`, créé par le compte du service sans modifier le mode de `/var/lib/oiran`.
+- Préflight des chemins requis avec erreur `ACCESS_CHECK_FAILED path=… mode=…` au lieu d'un `Permission denied` sans contexte.
 - `GET /sessions/:id/identities` et `GET /identities?q=…` sont réservés à l'operator et exposent IMSI, TMSI, S-TMSI, M-TMSI, IMEI/IMEISV et MSISDN avec leur événement source.
 - `GET /packets/:capture_id/:packet_number/dissect` fournit la dissection `tshark -V` d'une référence déjà connue, uniquement à l'operator et sans accepter de chemin client.
 - La collecte claire est un canal privé fondé sur les paquets sources ; les événements et datasets publiés restent pseudonymisés.
