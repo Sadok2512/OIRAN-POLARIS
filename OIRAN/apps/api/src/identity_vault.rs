@@ -163,29 +163,6 @@ fn ensure_private_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn access_error(path: &Path, error: &std::io::Error) -> String {
-    let mode = fs::metadata(path)
-        .map(|metadata| format!("{:04o}", metadata.permissions().mode() & 0o7777))
-        .unwrap_or_else(|_| "UNAVAILABLE".into());
-    format!(
-        "ACCESS_CHECK_FAILED path={} mode={mode} error={error}",
-        path.display()
-    )
-}
-
-fn ensure_private_directory(path: &Path) -> Result<(), String> {
-    let metadata = fs::metadata(path).map_err(|error| access_error(path, &error))?;
-    let mode = metadata.permissions().mode() & 0o777;
-    let service_uid = unsafe { libc::geteuid() };
-    if !metadata.is_dir() || mode != 0o700 || metadata.uid() != service_uid {
-        return Err(format!(
-            "ACCESS_CHECK_FAILED path={} mode={mode:04o} owner_uid={} service_uid={service_uid} required=directory-0700-service-owned",
-            path.display(), metadata.uid()
-        ));
-    }
-    Ok(())
-}
-
 fn ensure_private_file(path: &Path) -> Result<(), String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     let mode = metadata.permissions().mode() & 0o777;
