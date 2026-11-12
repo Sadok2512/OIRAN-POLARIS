@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.14.2 — 2026-11-12 — résolution publiée et index operator borné
+
+- Les routes événement consultent désormais l'union interrogeable commune : callflows statiques, datasets continus et sessions LTE d'évidence. Tout `event_id` renvoyé par une session est donc résolvable par `/events/:id` et `/events/:id/provenance`, y compris une session LTE limitée à S1-MME.
+- La dissection résout les chemins de capture relatifs depuis le répertoire de stockage OIRAN. Les erreurs distinguent désormais capture inconnue (`CAPTURE_NOT_FOUND`), fichier source absent (`CAPTURE_SOURCE_NOT_FOUND`), numéro de paquet hors bornes (`PACKET_OUT_OF_RANGE`), outil indisponible (`TSHARK_UNAVAILABLE`) et échec de dissection (`TSHARK_DISSECTION_FAILED`).
+- Le coffre maintient un index en mémoire des valeurs normalisées vers leurs observations et sessions. `GET /identities` est paginé (`page`, `page_size`, maximum 100) et n'effectue plus de balayage ni de dissection des sessions lors d'une recherche manquée. Un test mesure une recherche en moins de deux secondes dans 10 000 observations synthétiques.
+- Les écritures atomiques live-probe utilisent un nom temporaire unique `(pid, milliseconde, séquence atomique)`. Deux écritures concurrentes ne peuvent plus choisir le même temporaire puis provoquer `finalize dataset_manifest.json: ENOENT`. Le test ANR2 de nettoyage et drainage de 250 segments est ainsi déterministe. Le test d'empreintes orphelines attend aussi le commit atomique final au lieu du seul compteur publié un peu plus tôt dans le cycle.
+- Versions : `oiran-api` et web 2.14.2; schémas, moteurs et décodeurs inchangés.
+
 ## OIRAN API 2.14.1 — 2026-11-12 — fusion 2.13.1 + 2.14.0
 
 - Fusion sans nouvelle fonctionnalité du Parcours abonné et de la chaîne TMSI 2.13.1 avec Live Trace et le coffre d'identités 2.14.0.

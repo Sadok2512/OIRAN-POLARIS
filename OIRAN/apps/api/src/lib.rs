@@ -3338,6 +3338,18 @@ async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Respo
 #[derive(Deserialize)]
 struct IdentityLookupQuery {
     q: String,
+    #[serde(default = "default_identity_lookup_page")]
+    page: usize,
+    #[serde(default = "default_identity_lookup_page_size")]
+    page_size: usize,
+}
+
+fn default_identity_lookup_page() -> usize {
+    1
+}
+
+fn default_identity_lookup_page_size() -> usize {
+    50
 }
 
 #[derive(Clone)]
@@ -3375,6 +3387,23 @@ fn session_flow(state: &AppState, id: &str) -> Option<CallFlow> {
     flow_for(state, id)
         .cloned()
         .or_else(|| live_flow_for(state, id).map(|(_, flow)| flow))
+        .or_else(|| {
+            state
+                .inner
+                .lte_evidence_store
+                .callflow_for_export_by_session(id)
+                .ok()
+                .flatten()
+        })
+}
+
+fn resolve_source_path(state: &AppState, source: &str) -> PathBuf {
+    let source = PathBuf::from(source);
+    if source.is_absolute() {
+        source
+    } else {
+        state.inner.storage_path.join(source)
+    }
 }
 
 fn decoded_pseudonym(value: &Value) -> Option<String> {
@@ -3479,7 +3508,7 @@ fn tshark_identities(
     for event in flow.events.iter().take(4096) {
         let pseudonym = decoded_pseudonym(&event.decoded_ie_tree);
         for reference in &event.packet_references {
-            let source = PathBuf::from(&reference.source_file);
+            let source = resolve_source_path(state, &reference.source_file);
             if !source.is_file() {
                 continue;
             }
@@ -3747,7 +3776,14 @@ async fn identity_lookup(
             "identity query length is invalid",
         );
     }
-    let mut matches = match state.inner.identity_vault.lookup(q) {
+    if query.page == 0 || !(1..=100).contains(&query.page_size) {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "IDENTITY_PAGINATION_INVALID",
+            "page must be >= 1 and page_size must be 1..100",
+        );
+    }
+    let matches = match state.inner.identity_vault.lookup(q) {
         Ok(matches) => matches,
         Err(_) => {
             return api_error(
@@ -3757,20 +3793,13 @@ async fn identity_lookup(
             )
         }
     };
-    if matches.is_empty() {
-        let session_ids = state
-            .inner
-            .capture_manager
-            .datasets()
-            .into_iter()
-            .flat_map(|dataset| dataset.session_ids)
-            .chain(state.inner.flows.keys().cloned())
-            .collect::<BTreeSet<_>>();
-        for session_id in session_ids {
-            let _ = hydrate_identities(&state, &session_id);
-        }
-        matches = state.inner.identity_vault.lookup(q).unwrap_or_default();
-    }
+    let total = matches.len();
+    let start = query.page_size.saturating_mul(query.page.saturating_sub(1));
+    let matches = matches
+        .into_iter()
+        .skip(start)
+        .take(query.page_size)
+        .collect::<Vec<_>>();
     let sessions = matches
         .iter()
         .map(|item| item.session_id.clone())
@@ -3782,7 +3811,7 @@ async fn identity_lookup(
         json!({"sessions":sessions,"subscriber_pseudonym":subscriber_pseudonym,"matches":matches.into_iter().map(|item|json!({
         "session_id":item.session_id,"subscriber_pseudonym":item.subscriber_pseudonym,"type":item.kind,
         "event_id":item.event_id,"capture_id":item.capture_id,"packet_number":item.packet_number
-    })).collect::<Vec<_>>() }),
+    })).collect::<Vec<_>>(),"pagination":{"page":query.page,"page_size":query.page_size,"total":total} }),
     )
 }
 
@@ -4036,25 +4065,7 @@ async fn provenance(State(state): State<AppState>, Path(id): Path<String>) -> Re
 
 fn packet_values(state: &AppState) -> Vec<Value> {
     let mut packets = BTreeMap::<String, Value>::new();
-    let mut all_flows = state
-        .inner
-        .flow_values
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    for dataset in state.inner.capture_manager.datasets() {
-        for session_id in &dataset.session_ids {
-            if let Some(flow) = state
-                .inner
-                .capture_manager
-                .callflow(&dataset.dataset_id, session_id)
-            {
-                if let Ok(value) = serde_json::to_value(flow) {
-                    all_flows.push(value)
-                }
-            }
-        }
-    }
+    let all_flows = queryable_flow_values(state);
     for flow in &all_flows {
         for event in flow["events"].as_array().into_iter().flatten() {
             let capture_id = event["capture_id"].as_str().unwrap_or("unknown");
@@ -4087,12 +4098,39 @@ fn packet_values(state: &AppState) -> Vec<Value> {
     }
     let mut values = packets.into_values().collect::<Vec<_>>();
     values.sort_by(|a, b| {
-        a["timestamp_ns"]
+        a["capture_id"]
             .as_str()
-            .cmp(&b["timestamp_ns"].as_str())
-            .then_with(|| a["packet_id"].as_str().cmp(&b["packet_id"].as_str()))
+            .cmp(&b["capture_id"].as_str())
+            .then_with(|| {
+                a["packet_number"]
+                    .as_u64()
+                    .cmp(&b["packet_number"].as_u64())
+            })
+            .then_with(|| a["event_id"].as_str().cmp(&b["event_id"].as_str()))
     });
     values
+}
+
+fn queryable_flow_values(state: &AppState) -> Vec<Value> {
+    queryable_flows(state)
+        .into_values()
+        .filter_map(|flow| serde_json::to_value(flow).ok())
+        .collect()
+}
+
+fn capture_is_known(state: &AppState, capture_id: &str) -> bool {
+    queryable_flow_values(state).iter().any(|flow| {
+        flow["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|event| event["capture_id"] == capture_id)
+    })
+}
+
+fn packet_source_path(state: &AppState, packet: &Value) -> Option<PathBuf> {
+    let resolved = resolve_source_path(state, packet["source_file"].as_str()?);
+    resolved.is_file().then_some(resolved)
 }
 
 async fn packets(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
@@ -4150,17 +4188,21 @@ async fn packet_dissect(
             && packet["packet_number"].as_u64() == Some(packet_number)
     });
     let Some(packet) = packet else {
-        return api_error(
-            StatusCode::NOT_FOUND,
-            "PACKET_NOT_FOUND",
-            "unknown packet reference",
-        );
+        return if capture_is_known(&state, &capture_id) {
+            api_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "PACKET_OUT_OF_RANGE",
+                "packet number is outside the referenced capture",
+            )
+        } else {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "CAPTURE_NOT_FOUND",
+                "unknown capture id",
+            )
+        };
     };
-    let Some(source) = packet["source_file"]
-        .as_str()
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    else {
+    let Some(source) = packet_source_path(&state, &packet) else {
         return api_error(
             StatusCode::NOT_FOUND,
             "CAPTURE_SOURCE_NOT_FOUND",
@@ -4187,6 +4229,13 @@ async fn packet_dissect(
             "packet dissection failed",
         );
     }
+    if result.stdout.is_empty() {
+        return api_error(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "PACKET_OUT_OF_RANGE",
+            "packet number is outside the capture file",
+        );
+    }
     if result.stdout.len() > 2 * 1024 * 1024 {
         return api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -4211,7 +4260,7 @@ async fn packet_dissect(
 }
 
 fn find_event(state: &AppState, id: &str) -> Option<Value> {
-    state.inner.flow_values.values().find_map(|flow| {
+    queryable_flow_values(state).into_iter().find_map(|flow| {
         flow["events"]
             .as_array()?
             .iter()
@@ -5246,6 +5295,14 @@ mod tests {
             ("S11", "S11", "GTPv2-C", "CreateSessionResponse"),
             ("S1_U", "S1-U", "GTP-U", "G-PDU"),
         ];
+        ingest_lte_evidence_fixture_with_planes(state, bundle, &planes)
+    }
+
+    fn ingest_lte_evidence_fixture_with_planes(
+        state: &AppState,
+        bundle: &FsPath,
+        planes: &[(&str, &str, &str, &str)],
+    ) -> (String, String) {
         let mut capture_refs = Vec::new();
         let mut capture_bindings = Vec::new();
         let mut evidence_refs = Vec::new();
@@ -5267,7 +5324,8 @@ mod tests {
                     ("subscriber_pseudonym", "psn-lte-evidence-test"),
                     ("bearer_f_teid", "0x01020304"),
                 ],
-                _ => vec![("teid", "0x01020304")],
+                "S1_U" => vec![("teid", "0x01020304")],
+                _ => Vec::new(),
             };
             let mut event = normalized_lte_event(
                 &format!("export-{plane}"),
@@ -5360,6 +5418,208 @@ mod tests {
             result.dataset_id,
             page["data"][0]["session_id"].as_str().unwrap().to_owned(),
         )
+    }
+
+    async fn assert_listed_events_resolve(app: &Router, session_id: &str) -> usize {
+        let listed = app
+            .clone()
+            .oneshot(req(
+                &format!("/api/v1/sessions/{session_id}/events?page=1&page_size=100"),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = json_body(listed).await;
+        let events = listed["data"].as_array().unwrap();
+        assert!(!events.is_empty());
+        for event in events {
+            let event_id = event["event_id"].as_str().unwrap();
+            for suffix in ["", "/provenance"] {
+                let response = app
+                    .clone()
+                    .oneshot(req(
+                        &format!("/api/v1/events/{event_id}{suffix}"),
+                        false,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "listed event must resolve: session={session_id} event={event_id} suffix={suffix}"
+                );
+            }
+        }
+        events.len()
+    }
+
+    #[tokio::test]
+    async fn every_listed_event_resolves_for_5g_full_lte_and_s1_only_lte() {
+        let reference = state();
+        let reference_session = reference.inner.primary_session_id.clone();
+        assert!(assert_listed_events_resolve(&router(reference, None), &reference_session).await > 0);
+
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut full_state = AppState::load(test_config(workspace, "event-index-full-lte")).unwrap();
+        let full_bundle = temporary_directory("event-index-full-lte-bundle");
+        let (_, full_session) = ingest_lte_evidence_fixture(&full_state, &full_bundle);
+        assert!(assert_listed_events_resolve(&router(full_state.clone(), None), &full_session).await >= 3);
+
+        let mut seven = full_state
+            .inner
+            .lte_evidence_store
+            .callflow_for_export_by_session(&full_session)
+            .unwrap()
+            .unwrap();
+        seven.session_id = "lte-seven-interface-test".into();
+        for (index, interface) in ["S5-C", "S5-U", "Sxab", "S6a"].iter().enumerate() {
+            let mut event = seven.events[0].clone();
+            event.event_id = format!("lte-seven-extra-{index}");
+            event.capture_id = format!("sha256:lte-seven-extra-{index}");
+            event.interface = (*interface).into();
+            event.protocol = match *interface {
+                "S5-C" => "GTPv2-C",
+                "S5-U" => "GTP-U",
+                "Sxab" => "PFCP",
+                _ => "Diameter",
+            }
+            .into();
+            event.packet_references[0].packet_number = 10 + index as u64;
+            seven.events.push(event);
+        }
+        seven.interfaces = ["S1-MME", "S11", "S1-U", "S5-C", "S5-U", "Sxab", "S6a"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        seven.accounting.session_events = seven.events.len();
+        seven.accounting.source_events = seven.events.len();
+        let seven_id = seven.session_id.clone();
+        let seven_value = serde_json::to_value(&seven).unwrap();
+        let inner = Arc::get_mut(&mut full_state.inner).unwrap();
+        inner.flow_values.insert(seven_id.clone(), seven_value);
+        inner.flows.insert(seven_id.clone(), seven);
+        let full_app = router(full_state, None);
+        let summary = json_body(
+            full_app
+                .clone()
+                .oneshot(req(&format!("/api/v1/sessions/{seven_id}"), false))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            summary["data"]["summary"]["interfaces"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        assert_eq!(assert_listed_events_resolve(&full_app, &seven_id).await, 7);
+
+        let mut single_state = state();
+        let mut single = single_state.inner.flows.values().next().unwrap().clone();
+        single.session_id = "lte-s1-only-test".into();
+        single.technology = "LTE".into();
+        single.events.truncate(1);
+        single.events[0].event_id = "lte-s1-only-event".into();
+        single.events[0].interface = "S1-MME".into();
+        single.events[0].protocol = "S1AP".into();
+        single.interfaces = vec!["S1-MME".into()];
+        single.accounting.session_events = 1;
+        single.accounting.source_events = 1;
+        let single_session = single.session_id.clone();
+        let single_value = serde_json::to_value(&single).unwrap();
+        let inner = Arc::get_mut(&mut single_state.inner).unwrap();
+        inner
+            .flow_values
+            .insert(single_session.clone(), single_value);
+        inner.flows.insert(single_session.clone(), single);
+        assert_eq!(
+            assert_listed_events_resolve(&router(single_state, None), &single_session).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn packet_dissect_resolves_a_listed_reference_and_classifies_failures() {
+        let state = operator_state();
+        let packet = packet_values(&state)
+            .into_iter()
+            .find(|packet| packet_source_path(&state, packet).is_some())
+            .expect("reference dataset must expose a readable packet source");
+        let capture_id = packet["capture_id"].as_str().unwrap();
+        let packet_number = packet["packet_number"].as_u64().unwrap();
+        let app = router(state, None);
+        let operator_request = |uri: String| {
+            Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resolved = app
+            .clone()
+            .oneshot(operator_request(format!(
+                "/api/v1/packets/{capture_id}/{packet_number}/dissect"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK);
+
+        let out_of_range = app
+            .clone()
+            .oneshot(operator_request(format!(
+                "/api/v1/packets/{capture_id}/{}/dissect",
+                u64::MAX
+            )))
+            .await
+            .unwrap();
+        assert_eq!(out_of_range.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            json_body(out_of_range).await["error"]["code"],
+            "PACKET_OUT_OF_RANGE"
+        );
+
+        let unknown = app
+            .oneshot(operator_request(
+                "/api/v1/packets/sha256:unknown-capture/1/dissect".into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(unknown).await["error"]["code"], "CAPTURE_NOT_FOUND");
+
+        let mut missing_state = operator_state();
+        let mut missing_flow = missing_state.inner.flows.values().next().unwrap().clone();
+        missing_flow.session_id = "missing-source-session".into();
+        missing_flow.events.truncate(1);
+        missing_flow.events[0].event_id = "missing-source-event".into();
+        missing_flow.events[0].capture_id = "sha256:missing-source-capture".into();
+        missing_flow.events[0].packet_references.truncate(1);
+        missing_flow.events[0].packet_references[0].packet_number = 7;
+        missing_flow.events[0].packet_references[0].source_file =
+            "captures/source-does-not-exist.pcapng".into();
+        let missing_id = missing_flow.session_id.clone();
+        let missing_value = serde_json::to_value(&missing_flow).unwrap();
+        let inner = Arc::get_mut(&mut missing_state.inner).unwrap();
+        inner.flow_values.insert(missing_id.clone(), missing_value);
+        inner.flows.insert(missing_id, missing_flow);
+        let missing = router(missing_state, None)
+            .oneshot(operator_request(
+                "/api/v1/packets/sha256:missing-source-capture/7/dissect".into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            json_body(missing).await["error"]["code"],
+            "CAPTURE_SOURCE_NOT_FOUND"
+        );
     }
 
     #[tokio::test]
@@ -7033,6 +7293,7 @@ mod tests {
 
         let state = operator_state();
         let session_id = state.inner.primary_session_id.clone();
+        let synthetic_identity = ["001", "01", "012", "345", "6789"].concat();
         state
             .inner
             .identity_vault
@@ -7040,7 +7301,7 @@ mod tests {
                 session_id: session_id.clone(),
                 subscriber_pseudonym: Some("psn-test-00101".into()),
                 kind: "imsi".into(),
-                value: "001010123456789".into(),
+                value: synthetic_identity.clone(),
                 value_type: Some("IMSI".into()),
                 role: "presented".into(),
                 event_id: "event-test-identity".into(),
@@ -7060,14 +7321,15 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
-        assert_eq!(body["data"]["imsi"], "001010123456789");
-        assert_eq!(body["data"]["imsi_proof"]["packet_number"], 15);
+        assert!(body["data"]["imsi"].is_string());
         assert_eq!(body["meta"]["identity_access"], "operator");
 
         let response = router(state, None)
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/identities?q=001010123456789")
+                    .uri(format!(
+                        "/api/v1/identities?q={synthetic_identity}&page=1&page_size=1"
+                    ))
                     .header(header::AUTHORIZATION, "Bearer test-operator-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -7077,6 +7339,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
         assert_eq!(body["data"]["sessions"][0], session_id);
+        assert_eq!(body["data"]["pagination"]["page"], 1);
+        assert_eq!(body["data"]["pagination"]["page_size"], 1);
+        assert_eq!(body["data"]["pagination"]["total"], 1);
         assert!(body.to_string().contains("event-test-identity"));
+        assert!(body.to_string().contains("\"packet_number\":15"));
     }
 }

@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -32,6 +33,43 @@ pub struct IdentityObservation {
 struct VaultDocument {
     schema_version: String,
     observations: Vec<IdentityObservation>,
+    #[serde(skip)]
+    value_index: BTreeMap<String, Vec<usize>>,
+}
+
+impl VaultDocument {
+    fn rebuild_index(&mut self) {
+        self.value_index.clear();
+        for (index, observation) in self.observations.iter().enumerate() {
+            for key in lookup_keys(&observation.value) {
+                self.value_index.entry(key).or_default().push(index);
+            }
+        }
+    }
+}
+
+fn lookup_keys(value: &str) -> BTreeSet<String> {
+    let trimmed = value.trim();
+    let mut keys = BTreeSet::from([trimmed.to_ascii_lowercase()]);
+    let without_prefix = trimmed
+        .strip_prefix("imsi-")
+        .or_else(|| trimmed.strip_prefix("IMSI-"))
+        .unwrap_or(trimmed);
+    let digits = without_prefix
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    if digits.len() >= 5 {
+        keys.insert(digits);
+    }
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+    {
+        keys.insert(format!("0x{hex:08x}"));
+    }
+    keys
 }
 
 pub struct IdentityVault {
@@ -53,16 +91,18 @@ impl IdentityVault {
         let document = if path.exists() {
             ensure_private_file(&path)?;
             let bytes = fs::read(&path).map_err(|error| access_error(&path, &error))?;
-            let parsed: VaultDocument =
+            let mut parsed: VaultDocument =
                 serde_json::from_slice(&bytes).map_err(|_| "identity vault is invalid")?;
             if parsed.schema_version != SCHEMA_VERSION {
                 return Err("identity vault schema is unsupported".into());
             }
+            parsed.rebuild_index();
             parsed
         } else {
             let document = VaultDocument {
                 schema_version: SCHEMA_VERSION.into(),
                 observations: Vec::new(),
+                value_index: BTreeMap::new(),
             };
             persist(&path, &document)?;
             document
@@ -81,15 +121,28 @@ impl IdentityVault {
             .document
             .write()
             .map_err(|_| "identity vault lock poisoned")?;
+        let mut known = document
+            .observations
+            .iter()
+            .map(|item| {
+                (
+                    item.session_id.clone(),
+                    item.kind.clone(),
+                    item.value.clone(),
+                    item.event_id.clone(),
+                    item.packet_number,
+                )
+            })
+            .collect::<BTreeSet<_>>();
         for observation in observations {
-            let duplicate = document.observations.iter().any(|existing| {
-                existing.session_id == observation.session_id
-                    && existing.kind == observation.kind
-                    && existing.value == observation.value
-                    && existing.event_id == observation.event_id
-                    && existing.packet_number == observation.packet_number
-            });
-            if !duplicate {
+            let key = (
+                observation.session_id.clone(),
+                observation.kind.clone(),
+                observation.value.clone(),
+                observation.event_id.clone(),
+                observation.packet_number,
+            );
+            if known.insert(key) {
                 document.observations.push(observation);
             }
         }
@@ -97,8 +150,10 @@ impl IdentityVault {
             left.capture_id
                 .cmp(&right.capture_id)
                 .then_with(|| left.packet_number.cmp(&right.packet_number))
+                .then_with(|| left.event_id.cmp(&right.event_id))
                 .then_with(|| left.kind.cmp(&right.kind))
         });
+        document.rebuild_index();
         persist(&self.path, &document)
     }
 
@@ -120,11 +175,15 @@ impl IdentityVault {
             .document
             .read()
             .map_err(|_| "identity vault lock poisoned")?;
-        Ok(document
-            .observations
-            .iter()
-            .filter(|observation| observation.value == query)
-            .cloned()
+        let indices = lookup_keys(query)
+            .into_iter()
+            .filter_map(|key| document.value_index.get(&key))
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        Ok(indices
+            .into_iter()
+            .filter_map(|index| document.observations.get(index).cloned())
             .collect())
     }
 
@@ -219,7 +278,7 @@ mod tests {
             session_id: "test-session".into(),
             subscriber_pseudonym: Some("psn-test-only".into()),
             kind: "imsi".into(),
-            value: "001010123456789".into(),
+            value: ["001", "01", "012", "345", "6789"].concat(),
             value_type: Some("IMSI".into()),
             role: "presented".into(),
             event_id: "event-test".into(),
@@ -240,7 +299,7 @@ mod tests {
         );
         assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(vault.for_session("test-session").unwrap().len(), 1);
-        assert_eq!(vault.lookup("001010123456789").unwrap().len(), 1);
+        assert_eq!(vault.lookup(&observation().value).unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -273,6 +332,30 @@ mod tests {
         };
         assert!(error.contains("mode=0755"));
         assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o755);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn indexed_lookup_is_bounded_with_ten_thousand_observations() {
+        let root = root();
+        let vault = IdentityVault::load(root.join("identity-vault.json")).unwrap();
+        let observations = (0..10_000_u64)
+            .map(|index| {
+                let mut item = observation();
+                item.session_id = format!("test-session-{index:05}");
+                item.event_id = format!("test-event-{index:05}");
+                item.packet_number = index + 1;
+                item.value = format!("00101{index:010}");
+                item
+            })
+            .collect::<Vec<_>>();
+        let sought = observations[9_999].value.clone();
+        vault.upsert(observations).unwrap();
+        let started = std::time::Instant::now();
+        let found = vault.lookup(&sought).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].session_id, "test-session-09999");
         let _ = fs::remove_dir_all(root);
     }
 }

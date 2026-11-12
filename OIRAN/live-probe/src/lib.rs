@@ -63,6 +63,7 @@ const MAX_CONTINUOUS_DERIVED_BYTES: u64 = 64 * 1024 * 1024;
 pub const CONTINUOUS_CLOSED_SEGMENT_SLO_MINUTES: u64 = 10;
 
 static DATASET_GC_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct ContinuousCycleTrace {
     id: u64,
@@ -6623,7 +6624,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("artifact");
-    let temporary = parent.join(format!(".{name}.{}.tmp", epoch_ms()));
+    let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{name}.{}.{}.{sequence}.tmp",
+        std::process::id(),
+        epoch_ms()
+    ));
     let result = (|| {
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -11586,9 +11592,20 @@ mod tests {
         .unwrap();
         manager.start_continuous_import(config).unwrap();
         wait_for(|| {
-            manager
+            let metrics_committed = manager
                 .get(CONTINUOUS_CAPTURE_ID)
-                .is_some_and(|job| job.metrics.segments_ingested == 3)
+                .is_some_and(|job| job.metrics.segments_ingested == 3);
+            // The job metric is updated immediately after the dataset and
+            // checksum commit. Source fingerprints are persisted later in
+            // the same cycle. Waiting only for the metric raced that final
+            // atomic write and made the first run observe an empty map.
+            let fingerprints_committed = fs::read(&state_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<ContinuousImportState>(&bytes).ok())
+                .is_some_and(|state| {
+                    state.source_fingerprints.len() == 3 && state.seen_checksums.len() == 3
+                });
+            metrics_committed && fingerprints_committed
         });
 
         let job = manager.get(CONTINUOUS_CAPTURE_ID).unwrap();
