@@ -7,9 +7,10 @@
 // handlers API.
 #![recursion_limit = "512"]
 
+mod identity_vault;
+mod live_trace;
 mod probe_registry;
 mod session_filters;
-mod identity_vault;
 
 use axum::{
     body::Body,
@@ -38,8 +39,7 @@ use probe_registry::{CreateError as ProbeCreateError, ProbeInput, ProbeRecord, P
 use serde::Deserialize;
 use serde_json::{json, Value};
 use session_engine::{
-    discover_sessions, reconstruct, Association, DiscoveryResult, LteSession,
-    ReconstructionHints,
+    discover_sessions, reconstruct, Association, DiscoveryResult, LteSession, ReconstructionHints,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -91,6 +91,7 @@ struct Inner {
     operator_token_sha256: Option<String>,
     administrator_token_sha256: Option<String>,
     identity_vault: IdentityVault,
+    live_traces: live_trace::LiveTraceRegistry,
     /// 2.10.0 : index des filtres Session Explorer (messages, causes,
     /// pseudonymes), construit au chargement depuis `flows` + mis à
     /// jour par `refresh_session_filter_index` quand le capture
@@ -430,8 +431,7 @@ impl AppState {
             error_count: 0,
             read_only: true,
         })?;
-        let session_filter_index =
-            session_filters::SessionFilterIndex::from_flows(flows.values());
+        let session_filter_index = session_filters::SessionFilterIndex::from_flows(flows.values());
         Ok(Self {
             inner: Arc::new(Inner {
                 flows,
@@ -451,6 +451,7 @@ impl AppState {
                 operator_token_sha256: config.operator_token_sha256,
                 administrator_token_sha256: config.administrator_token_sha256,
                 identity_vault,
+                live_traces: live_trace::LiveTraceRegistry::new(),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -517,6 +518,7 @@ impl AppState {
                 operator_token_sha256: config.operator_token_sha256,
                 administrator_token_sha256: config.administrator_token_sha256,
                 identity_vault,
+                live_traces: live_trace::LiveTraceRegistry::new(),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -610,6 +612,17 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/interfaces", get(interfaces))
         .route("/metrics", get(metrics))
         .route("/storage/safety", get(storage_safety))
+        .route(
+            "/live/traces",
+            get(live_trace::list).post(live_trace::create),
+        )
+        .route(
+            "/live/traces/:id",
+            axum::routing::delete(live_trace::remove),
+        )
+        .route("/live/traces/:id/markers", post(live_trace::marker))
+        .route("/live/traces/:id/stream", get(live_trace::stream))
+        .route("/audit", get(live_trace::audit))
         .route("/datasets", get(datasets))
         .route("/datasets/import-derived", post(import_derived_dataset))
         .route("/lte/evidence/import", post(import_lte_evidence))
@@ -776,8 +789,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
             source_events = source_events.saturating_add(live.event_count);
             session_count = session_count.saturating_add(live.session_ids.len());
             if let Some(discovery) = &live.discovery {
-                ue_context_count =
-                    ue_context_count.saturating_add(discovery.ue_contexts.len());
+                ue_context_count = ue_context_count.saturating_add(discovery.ue_contexts.len());
             }
             if dataset.is_none() {
                 dataset = Some(Value::String(live.dataset_id.clone()));
@@ -1941,7 +1953,10 @@ async fn datasets(
     let payload = paginated(items, &query);
     let body = serde_json::to_vec(&payload.0).unwrap_or_default();
     let etag = format!("W/\"{}\"", &sha256_hex(&body)[..16]);
-    if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH).and_then(|value| value.to_str().ok()) {
+    if let Some(if_none_match) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    {
         if if_none_match == etag {
             let mut response = Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
@@ -2906,13 +2921,15 @@ async fn sessions_filter(
         let keys: std::collections::BTreeMap<String, (String, u64, String)> = matching
             .iter()
             .filter_map(|id| {
-                guard.pagination_key(id).map(|(cap, pkt, sid)| {
-                    (id.clone(), (cap.to_owned(), pkt, sid.to_owned()))
-                })
+                guard
+                    .pagination_key(id)
+                    .map(|(cap, pkt, sid)| (id.clone(), (cap.to_owned(), pkt, sid.to_owned())))
             })
             .collect();
-        let mut rows: Vec<(String, (String, u64, String))> =
-            matching.into_iter().filter_map(|id| keys.get(&id).map(|k| (id.clone(), k.clone()))).collect();
+        let mut rows: Vec<(String, (String, u64, String))> = matching
+            .into_iter()
+            .filter_map(|id| keys.get(&id).map(|k| (id.clone(), k.clone())))
+            .collect();
         rows.sort_by(|a, b| a.1.cmp(&b.1));
         let sorted: Vec<String> = rows.into_iter().map(|(id, _)| id).collect();
         (keys, sorted)
@@ -3137,25 +3154,38 @@ fn identity_digits(value: &str) -> Option<String> {
         .strip_prefix("imsi-")
         .or_else(|| value.trim().strip_prefix("IMSI-"))
         .unwrap_or(value.trim());
-    let digits = value.chars().filter(char::is_ascii_digit).collect::<String>();
+    let digits = value
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
     (digits.len() >= 5).then_some(digits)
 }
 
 fn canonical_tmsi(value: &str) -> Option<String> {
     let trimmed = value.trim();
-    let parsed = if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         u32::from_str_radix(hex, 16).ok()
     } else {
-        trimmed.parse::<u32>().ok().or_else(|| u32::from_str_radix(trimmed, 16).ok())
+        trimmed
+            .parse::<u32>()
+            .ok()
+            .or_else(|| u32::from_str_radix(trimmed, 16).ok())
     }?;
     Some(format!("0x{parsed:08X}"))
 }
 
 fn identity_role(message_name: &str) -> &'static str {
     let lower = message_name.to_ascii_lowercase();
-    if ["accept", "reallocation command", "configuration update command"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    if [
+        "accept",
+        "reallocation command",
+        "configuration update command",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
     {
         "assigned"
     } else {
@@ -3201,15 +3231,17 @@ fn tshark_identities(
             if !source.is_file() {
                 continue;
             }
-            by_file.entry(source).or_default().entry(reference.packet_number).or_insert_with(|| {
-                PacketIdentityEvidence {
+            by_file
+                .entry(source)
+                .or_default()
+                .entry(reference.packet_number)
+                .or_insert_with(|| PacketIdentityEvidence {
                     event_id: event.event_id.clone(),
                     capture_id: event.capture_id.clone(),
                     packet_number: reference.packet_number,
                     message_name: event.message_name.clone(),
                     subscriber_pseudonym: pseudonym.clone(),
-                }
-            });
+                });
         }
     }
     let mut observations = Vec::new();
@@ -3220,11 +3252,23 @@ fn tshark_identities(
             .collect::<Vec<_>>()
             .join(" || ");
         let mut command = Command::new("tshark");
-        command.args(["-n", "-r"]).arg(&source).args(["-Y", &filter, "-T", "fields"]);
+        command
+            .args(["-n", "-r"])
+            .arg(&source)
+            .args(["-Y", &filter, "-T", "fields"]);
         for field in IDENTITY_TSHARK_FIELDS {
             command.args(["-e", field]);
         }
-        command.args(["-E", "separator=\t", "-E", "quote=n", "-E", "occurrence=a", "-E", "aggregator=,"]);
+        command.args([
+            "-E",
+            "separator=\t",
+            "-E",
+            "quote=n",
+            "-E",
+            "occurrence=a",
+            "-E",
+            "aggregator=,",
+        ]);
         let result = command.output().map_err(|_| "TSHARK_UNAVAILABLE")?;
         if !result.status.success() {
             return Err("TSHARK_DISSECTION_FAILED".into());
@@ -3233,7 +3277,9 @@ fn tshark_identities(
         for line in stdout.lines() {
             let columns = line.split('\t').collect::<Vec<_>>();
             let packet_number = columns.first().and_then(|value| value.parse::<u64>().ok());
-            let Some(evidence) = packet_number.and_then(|number| packets.get(&number)) else { continue };
+            let Some(evidence) = packet_number.and_then(|number| packets.get(&number)) else {
+                continue;
+            };
             let role = identity_role(&evidence.message_name);
             let field = |index: usize| columns.get(index).copied().unwrap_or("");
             for raw in split_field(field(1)).chain(split_field(field(2))) {
@@ -3242,7 +3288,15 @@ fn tshark_identities(
                         state.inner.capture_manager.pseudonym_key().as_ref(),
                         imsi.as_bytes(),
                     ));
-                    push_identity(&mut observations, evidence, "imsi", imsi, Some("IMSI"), role, pseudo);
+                    push_identity(
+                        &mut observations,
+                        evidence,
+                        "imsi",
+                        imsi,
+                        Some("IMSI"),
+                        role,
+                        pseudo,
+                    );
                 }
             }
             let tmsi = split_field(field(3))
@@ -3252,32 +3306,95 @@ fn tshark_identities(
                 .find_map(canonical_tmsi);
             if let Some(m_tmsi) = tmsi {
                 let pseudo = evidence.subscriber_pseudonym.clone();
-                push_identity(&mut observations, evidence, "m_tmsi", m_tmsi.clone(), Some("M-TMSI"), role, pseudo.clone());
+                push_identity(
+                    &mut observations,
+                    evidence,
+                    "m_tmsi",
+                    m_tmsi.clone(),
+                    Some("M-TMSI"),
+                    role,
+                    pseudo.clone(),
+                );
                 let is_5g = !field(8).is_empty();
                 let components = if is_5g {
-                    [field(5), field(6), field(7), field(8)].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("-")
+                    [field(5), field(6), field(7), field(8)]
+                        .into_iter()
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("-")
                 } else {
-                    [field(9), field(10), field(11)].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("-")
+                    [field(9), field(10), field(11)]
+                        .into_iter()
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("-")
                 };
-                let temporary = if components.is_empty() { m_tmsi.clone() } else { components };
-                push_identity(&mut observations, evidence, "s_tmsi", temporary.clone(), Some(if is_5g { "5G-S-TMSI" } else { "S-TMSI" }), role, pseudo.clone());
+                let temporary = if components.is_empty() {
+                    m_tmsi.clone()
+                } else {
+                    components
+                };
+                push_identity(
+                    &mut observations,
+                    evidence,
+                    "s_tmsi",
+                    temporary.clone(),
+                    Some(if is_5g { "5G-S-TMSI" } else { "S-TMSI" }),
+                    role,
+                    pseudo.clone(),
+                );
                 if role == "assigned" {
-                    push_identity(&mut observations, evidence, "tmsi", temporary, Some(if is_5g { "5G-GUTI" } else { "GUTI" }), role, pseudo);
+                    push_identity(
+                        &mut observations,
+                        evidence,
+                        "tmsi",
+                        temporary,
+                        Some(if is_5g { "5G-GUTI" } else { "GUTI" }),
+                        role,
+                        pseudo,
+                    );
                 }
             }
-            for raw in split_field(field(12)).chain(split_field(field(14))).chain(split_field(field(15))) {
+            for raw in split_field(field(12))
+                .chain(split_field(field(14)))
+                .chain(split_field(field(15)))
+            {
                 if let Some(imei) = identity_digits(raw) {
-                    push_identity(&mut observations, evidence, "imei", imei, Some("IMEI"), role, evidence.subscriber_pseudonym.clone());
+                    push_identity(
+                        &mut observations,
+                        evidence,
+                        "imei",
+                        imei,
+                        Some("IMEI"),
+                        role,
+                        evidence.subscriber_pseudonym.clone(),
+                    );
                 }
             }
             for raw in split_field(field(13)).chain(split_field(field(16))) {
                 if let Some(imeisv) = identity_digits(raw) {
-                    push_identity(&mut observations, evidence, "imei", imeisv, Some("IMEISV"), role, evidence.subscriber_pseudonym.clone());
+                    push_identity(
+                        &mut observations,
+                        evidence,
+                        "imei",
+                        imeisv,
+                        Some("IMEISV"),
+                        role,
+                        evidence.subscriber_pseudonym.clone(),
+                    );
                 }
             }
             for raw in split_field(field(17)).chain(split_field(field(18))) {
                 if let Some(msisdn) = identity_digits(raw) {
-                    push_identity(&mut observations, evidence, "msisdn", msisdn, Some("MSISDN"), role, evidence.subscriber_pseudonym.clone());
+                    push_identity(
+                        &mut observations,
+                        evidence,
+                        "msisdn",
+                        msisdn,
+                        Some("MSISDN"),
+                        role,
+                        evidence.subscriber_pseudonym.clone(),
+                    );
                 }
             }
         }
@@ -3298,11 +3415,19 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<(), String> 
 
 fn identity_bundle(observations: Vec<IdentityObservation>) -> Value {
     let latest = |kind: &str| observations.iter().rev().find(|item| item.kind == kind);
-    let evidence = |item: &IdentityObservation| json!({
-        "value":item.value,"type":item.value_type,"role":item.role,"event_id":item.event_id,
-        "capture_id":item.capture_id,"packet_number":item.packet_number,"cap_seq":format!("{}·{}",item.capture_id,item.packet_number)
-    });
-    let all = |kind: &str| observations.iter().filter(|item| item.kind == kind).map(evidence).collect::<Vec<_>>();
+    let evidence = |item: &IdentityObservation| {
+        json!({
+            "value":item.value,"type":item.value_type,"role":item.role,"event_id":item.event_id,
+            "capture_id":item.capture_id,"packet_number":item.packet_number,"cap_seq":format!("{}·{}",item.capture_id,item.packet_number)
+        })
+    };
+    let all = |kind: &str| {
+        observations
+            .iter()
+            .filter(|item| item.kind == kind)
+            .map(evidence)
+            .collect::<Vec<_>>()
+    };
     json!({
         "imsi":latest("imsi").map(|item|item.value.clone()),
         "imsi_proof":latest("imsi").map(evidence),
@@ -3317,7 +3442,8 @@ fn identity_bundle(observations: Vec<IdentityObservation>) -> Value {
 }
 
 fn operator_envelope(data: Value) -> Response {
-    Json(json!({"data":data,"meta":{"api_version":API_VERSION,"identity_access":"operator"}})).into_response()
+    Json(json!({"data":data,"meta":{"api_version":API_VERSION,"identity_access":"operator"}}))
+        .into_response()
 }
 
 async fn session_identities(
@@ -3331,13 +3457,25 @@ async fn session_identities(
     if let Err(error) = hydrate_identities(&state, &id) {
         return match error.as_str() {
             "SESSION_NOT_FOUND" => api_error(StatusCode::NOT_FOUND, &error, "unknown session id"),
-            "TSHARK_UNAVAILABLE" => api_error(StatusCode::NOT_IMPLEMENTED, &error, "packet dissector unavailable"),
-            _ => api_error(StatusCode::INTERNAL_SERVER_ERROR, "IDENTITY_VAULT_FAILED", "identity evidence could not be loaded"),
+            "TSHARK_UNAVAILABLE" => api_error(
+                StatusCode::NOT_IMPLEMENTED,
+                &error,
+                "packet dissector unavailable",
+            ),
+            _ => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "IDENTITY_VAULT_FAILED",
+                "identity evidence could not be loaded",
+            ),
         };
     }
     match state.inner.identity_vault.for_session(&id) {
         Ok(observations) => operator_envelope(identity_bundle(observations)),
-        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "IDENTITY_VAULT_FAILED", "identity evidence could not be loaded"),
+        Err(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "IDENTITY_VAULT_FAILED",
+            "identity evidence could not be loaded",
+        ),
     }
 }
 
@@ -3351,11 +3489,21 @@ async fn identity_lookup(
     }
     let q = query.q.trim();
     if q.len() < 4 || q.len() > 128 {
-        return api_error(StatusCode::BAD_REQUEST, "IDENTITY_QUERY_INVALID", "identity query length is invalid");
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "IDENTITY_QUERY_INVALID",
+            "identity query length is invalid",
+        );
     }
     let mut matches = match state.inner.identity_vault.lookup(q) {
         Ok(matches) => matches,
-        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "IDENTITY_VAULT_FAILED", "identity evidence could not be loaded"),
+        Err(_) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "IDENTITY_VAULT_FAILED",
+                "identity evidence could not be loaded",
+            )
+        }
     };
     if matches.is_empty() {
         let session_ids = state
@@ -3371,12 +3519,19 @@ async fn identity_lookup(
         }
         matches = state.inner.identity_vault.lookup(q).unwrap_or_default();
     }
-    let sessions = matches.iter().map(|item| item.session_id.clone()).collect::<BTreeSet<_>>();
-    let subscriber_pseudonym = matches.iter().find_map(|item| item.subscriber_pseudonym.clone());
-    operator_envelope(json!({"sessions":sessions,"subscriber_pseudonym":subscriber_pseudonym,"matches":matches.into_iter().map(|item|json!({
+    let sessions = matches
+        .iter()
+        .map(|item| item.session_id.clone())
+        .collect::<BTreeSet<_>>();
+    let subscriber_pseudonym = matches
+        .iter()
+        .find_map(|item| item.subscriber_pseudonym.clone());
+    operator_envelope(
+        json!({"sessions":sessions,"subscriber_pseudonym":subscriber_pseudonym,"matches":matches.into_iter().map(|item|json!({
         "session_id":item.session_id,"subscriber_pseudonym":item.subscriber_pseudonym,"type":item.kind,
         "event_id":item.event_id,"capture_id":item.capture_id,"packet_number":item.packet_number
-    })).collect::<Vec<_>>() }))
+    })).collect::<Vec<_>>() }),
+    )
 }
 
 async fn session_procedures(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -3743,10 +3898,22 @@ async fn packet_dissect(
             && packet["packet_number"].as_u64() == Some(packet_number)
     });
     let Some(packet) = packet else {
-        return api_error(StatusCode::NOT_FOUND, "PACKET_NOT_FOUND", "unknown packet reference");
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "PACKET_NOT_FOUND",
+            "unknown packet reference",
+        );
     };
-    let Some(source) = packet["source_file"].as_str().map(PathBuf::from).filter(|path| path.is_file()) else {
-        return api_error(StatusCode::NOT_FOUND, "CAPTURE_SOURCE_NOT_FOUND", "capture source is unavailable");
+    let Some(source) = packet["source_file"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "CAPTURE_SOURCE_NOT_FOUND",
+            "capture source is unavailable",
+        );
     };
     let filter = format!("frame.number == {packet_number}");
     let result = Command::new("tshark")
@@ -3755,16 +3922,32 @@ async fn packet_dissect(
         .args(["-Y", &filter, "-V"])
         .output();
     let Ok(result) = result else {
-        return api_error(StatusCode::NOT_IMPLEMENTED, "TSHARK_UNAVAILABLE", "packet dissector unavailable");
+        return api_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "TSHARK_UNAVAILABLE",
+            "packet dissector unavailable",
+        );
     };
     if !result.status.success() {
-        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "TSHARK_DISSECTION_FAILED", "packet dissection failed");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "TSHARK_DISSECTION_FAILED",
+            "packet dissection failed",
+        );
     }
     if result.stdout.len() > 2 * 1024 * 1024 {
-        return api_error(StatusCode::PAYLOAD_TOO_LARGE, "DISSECTION_TOO_LARGE", "packet dissection exceeds the response limit");
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "DISSECTION_TOO_LARGE",
+            "packet dissection exceeds the response limit",
+        );
     }
     let Ok(dissection) = String::from_utf8(result.stdout) else {
-        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "TSHARK_OUTPUT_INVALID", "packet dissection is not UTF-8");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "TSHARK_OUTPUT_INVALID",
+            "packet dissection is not UTF-8",
+        );
     };
     operator_envelope(json!({
         "capture_id":capture_id,
@@ -4125,8 +4308,8 @@ mod tests {
         config.lte_evidence_bundle_root = evidence.join("inbox");
         let key_dir = temporary_directory(&format!("{label}-pseudonym"));
         config.pseudonym_key_path = Some(key_dir.join("pseudonym.key"));
-        config.identity_vault_path = temporary_directory(&format!("{label}-identities"))
-            .join("identity-vault.json");
+        config.identity_vault_path =
+            temporary_directory(&format!("{label}-identities")).join("identity-vault.json");
         config
     }
     fn state() -> AppState {
@@ -4383,16 +4566,12 @@ mod tests {
                 "unresolved_fields": 0
             });
             fs::write(
-                dataset_dir
-                    .join("callflows")
-                    .join(format!("sess-{i}.json")),
+                dataset_dir.join("callflows").join(format!("sess-{i}.json")),
                 serde_json::to_vec(&stub).unwrap(),
             )
             .unwrap();
             fs::write(
-                dataset_dir
-                    .join("callflows")
-                    .join(format!("sess-{i}.html")),
+                dataset_dir.join("callflows").join(format!("sess-{i}.html")),
                 b"<html></html>",
             )
             .unwrap();
@@ -4431,10 +4610,9 @@ mod tests {
         assert_eq!(body["data"]["dataset"], CONTINUOUS_DATASET_ID);
         // Final invariant: /health must match the on-disk manifest on
         // the same fields.
-        let on_disk: serde_json::Value = serde_json::from_slice(
-            &fs::read(dataset_dir.join("dataset_manifest.json")).unwrap(),
-        )
-        .unwrap();
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(dataset_dir.join("dataset_manifest.json")).unwrap())
+                .unwrap();
         assert_eq!(
             body["data"]["source_events"].as_u64().unwrap() as usize,
             on_disk["event_count"].as_u64().unwrap() as usize
@@ -4699,7 +4877,10 @@ mod tests {
         assert_eq!(value["data"]["backend_api"], env!("CARGO_PKG_VERSION"));
         assert_eq!(value["data"]["platform_core"], env!("CARGO_PKG_VERSION"));
         assert_eq!(value["data"]["backend_api"], value["data"]["platform_core"]);
-        assert_eq!(value["data"]["web_frontend"], env!("OIRAN_WEB_FRONTEND_VERSION"));
+        assert_eq!(
+            value["data"]["web_frontend"],
+            env!("OIRAN_WEB_FRONTEND_VERSION")
+        );
         for protocol in [
             "S1AP",
             "NAS-EPS-MM",
@@ -5610,7 +5791,10 @@ mod tests {
         assert_eq!(value["data"]["policy"]["warning_percent"], 97);
         assert_eq!(value["data"]["policy"]["stop_percent"], 98);
         assert_eq!(value["data"]["policy"]["hard_limit_percent"], 98);
-        assert_eq!(value["data"]["policy"]["reserve_bytes"], 8 * 1024 * 1024 * 1024_u64);
+        assert_eq!(
+            value["data"]["policy"]["reserve_bytes"],
+            8 * 1024 * 1024 * 1024_u64
+        );
     }
 
     #[tokio::test]
@@ -5839,7 +6023,10 @@ mod tests {
         // objects; the historical sample exposes them as the empty
         // object. Either way the key MUST be present on the single-id
         // route.
-        if first_id.starts_with("ue-") || first_id.starts_with("derived-") || first_id.starts_with("recovered-dataset-") {
+        if first_id.starts_with("ue-")
+            || first_id.starts_with("derived-")
+            || first_id.starts_with("recovered-dataset-")
+        {
             assert!(body.contains_key("decode_reports"));
             assert!(body.contains_key("checksums"));
         }
@@ -6096,10 +6283,7 @@ mod tests {
             "cold dataset derives from the 5G SA profile"
         );
         assert_eq!(
-            technology_for_live_fallback(
-                std::iter::empty(),
-                Some("POLARIS_LTE_E2E_SMALL_TRAFFIC"),
-            ),
+            technology_for_live_fallback(std::iter::empty(), Some("POLARIS_LTE_E2E_SMALL_TRAFFIC"),),
             "LTE",
             "cold dataset derives from the LTE profile"
         );
@@ -6109,10 +6293,7 @@ mod tests {
             "no plane and no profile → UNKNOWN (never invented)"
         );
         assert_eq!(
-            technology_for_live_fallback(
-                std::iter::empty(),
-                Some("CUSTOM_OPERATOR_PROFILE_42"),
-            ),
+            technology_for_live_fallback(std::iter::empty(), Some("CUSTOM_OPERATOR_PROFILE_42"),),
             "UNKNOWN",
             "unrecognised profile → UNKNOWN (never invented)"
         );
@@ -6266,10 +6447,7 @@ mod tests {
             // Chaque session retenue DOIT contenir le message
             // demandé (vérifié par l'index), donc son interface
             // de call-flow doit comporter N2.
-            let interfaces = item["interfaces"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            let interfaces = item["interfaces"].as_array().cloned().unwrap_or_default();
             assert!(
                 interfaces.iter().any(|i| i == "N2"),
                 "session {} returned without N2 interface",
@@ -6319,9 +6497,7 @@ mod tests {
         // La meta expose le pseudonyme recherché mais jamais la
         // valeur brute.
         assert!(body["meta"]["identity_matched_pseudonym"].is_string());
-        let pseudo = body["meta"]["identity_matched_pseudonym"]
-            .as_str()
-            .unwrap();
+        let pseudo = body["meta"]["identity_matched_pseudonym"].as_str().unwrap();
         assert!(
             pseudo.starts_with("psn-"),
             "expected psn- prefix, got {pseudo}"
@@ -6397,7 +6573,10 @@ mod tests {
         for cause in causes {
             assert!(cause["domain"].is_string(), "domain missing: {cause}");
             assert!(cause["value"].is_string(), "value missing: {cause}");
-            assert!(cause["is_failure"].is_boolean(), "is_failure missing: {cause}");
+            assert!(
+                cause["is_failure"].is_boolean(),
+                "is_failure missing: {cause}"
+            );
             assert!(
                 cause["session_count"].as_u64().unwrap_or(0) >= 1,
                 "session_count must be >= 1: {cause}"
@@ -6420,12 +6599,7 @@ mod tests {
         //     seul — ce qui serait la signature d'un tri sur
         //     `ts`.
         let state = state();
-        let (status, body) = post_sessions_filter(
-            &state,
-            json!({ "limit": 5 }),
-            None,
-        )
-        .await;
+        let (status, body) = post_sessions_filter(&state, json!({ "limit": 5 }), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body["meta"]["pagination_key"],
@@ -6456,7 +6630,10 @@ mod tests {
                 pair[1]["capture_id"].as_str().unwrap_or(""),
                 pair[1]["session_id"].as_str().unwrap_or(""),
             );
-            assert!(ka <= kb, "pagination out of canonical order: {ka:?} vs {kb:?}");
+            assert!(
+                ka <= kb,
+                "pagination out of canonical order: {ka:?} vs {kb:?}"
+            );
         }
     }
 
@@ -6466,12 +6643,7 @@ mod tests {
         // doivent pas se chevaucher, ni introduire de session
         // deux fois.
         let state = state();
-        let (_, body_a) = post_sessions_filter(
-            &state,
-            json!({ "limit": 1 }),
-            None,
-        )
-        .await;
+        let (_, body_a) = post_sessions_filter(&state, json!({ "limit": 1 }), None).await;
         let first = body_a["data"]
             .as_array()
             .and_then(|a| a.first())
@@ -6479,12 +6651,9 @@ mod tests {
             .map(str::to_owned);
         let cursor = body_a["meta"]["next_cursor"].as_str().map(str::to_owned);
         if let (Some(first_id), Some(cursor_val)) = (first, cursor) {
-            let (_, body_b) = post_sessions_filter(
-                &state,
-                json!({ "limit": 1, "cursor": cursor_val }),
-                None,
-            )
-            .await;
+            let (_, body_b) =
+                post_sessions_filter(&state, json!({ "limit": 1, "cursor": cursor_val }), None)
+                    .await;
             let second = body_b["data"]
                 .as_array()
                 .and_then(|a| a.first())

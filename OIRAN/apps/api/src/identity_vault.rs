@@ -122,6 +122,17 @@ impl IdentityVault {
             .cloned()
             .collect())
     }
+
+    pub fn pseudonyms_for_value(&self, query: &str) -> Result<Vec<String>, String> {
+        let mut values = self
+            .lookup(query)?
+            .into_iter()
+            .filter_map(|observation| observation.subscriber_pseudonym)
+            .collect::<Vec<_>>();
+        values.sort();
+        values.dedup();
+        Ok(values)
+    }
 }
 
 fn ensure_private_file(path: &Path) -> Result<(), String> {
@@ -187,7 +198,10 @@ mod tests {
         let path = root.join("identity-vault.json");
         let vault = IdentityVault::load(path.clone()).unwrap();
         vault.upsert(vec![observation(), observation()]).unwrap();
-        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(vault.for_session("test-session").unwrap().len(), 1);
         assert_eq!(vault.lookup("001010123456789").unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);

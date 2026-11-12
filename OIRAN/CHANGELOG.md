@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.14.0
+
+- Registre borné à dix Live Traces avec recherche pseudonyme ou coffre d'identités, état armé, expiration automatique et mutations protégées par CSRF.
+- Flux SSE reprenable par `Last-Event-ID`, heartbeat 15 s et tampon borné à 2 000 événements par trace.
+
 ## OIRAN API 2.12.0 — 2026-11-11 — coffre d'identités operator
 
 - Coffre d'identités persistant hors dataset, répertoire 0700 et fichier 0600, avec preuves ordonnées `(capture_id, packet_number)` et aucune valeur claire dans les journaux.
