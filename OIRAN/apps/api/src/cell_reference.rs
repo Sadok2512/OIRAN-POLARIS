@@ -24,6 +24,10 @@ pub const CSV_HEADERS: [&str; 11] = [
     "latitude",
     "longitude",
 ];
+pub const EXTENDED_CSV_HEADERS: [&str; 15] = [
+    "technology", "mcc", "mnc", "gnb_id", "gnb_id_length", "nci", "enb_id", "eci",
+    "cell_id", "latitude", "longitude", "site", "azimuth", "opening", "range",
+];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CellRecord {
@@ -38,6 +42,14 @@ pub struct CellRecord {
     pub cell_id: u32,
     pub latitude: f64,
     pub longitude: f64,
+    #[serde(default)]
+    pub site: Option<String>,
+    #[serde(default)]
+    pub azimuth: Option<f64>,
+    #[serde(default)]
+    pub opening: Option<f64>,
+    #[serde(default)]
+    pub range: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -282,14 +294,15 @@ fn parse_csv(bytes: &[u8], snapshot_id: String) -> ValidationReport {
         .trim(csv::Trim::All)
         .from_reader(bytes);
     match reader.headers() {
-        Ok(headers) if headers.iter().eq(CSV_HEADERS) => {}
+        Ok(headers)
+            if headers.iter().eq(CSV_HEADERS) || headers.iter().eq(EXTENDED_CSV_HEADERS) => {}
         Ok(headers) => errors.push(validation_error(
             1,
             "header",
             "HEADER_MISMATCH",
             &format!(
                 "expected {}; received {}",
-                CSV_HEADERS.join(","),
+                format!("{} (optional suffix: site,azimuth,opening,range)", CSV_HEADERS.join(",")),
                 headers.iter().collect::<Vec<_>>().join(",")
             ),
         )),
@@ -312,7 +325,7 @@ fn parse_csv(bytes: &[u8], snapshot_id: String) -> ValidationReport {
     for (offset, row) in reader.records().enumerate() {
         let line = offset + 2;
         let row = match row {
-            Ok(row) if row.len() == CSV_HEADERS.len() => row,
+            Ok(row) if row.len() == CSV_HEADERS.len() || row.len() == EXTENDED_CSV_HEADERS.len() => row,
             Ok(_) => {
                 errors.push(validation_error(
                     line,
@@ -431,6 +444,16 @@ fn parse_row(
         return None;
     }
     let cell_id = parse_u64(required("cell_id", errors)?, line, "cell_id", errors)?;
+    let optional_text = |index: usize| row.get(index).filter(|value| !value.is_empty()).map(str::to_owned);
+    let optional_number = |index: usize, column: &str, errors: &mut Vec<ValidationError>| {
+        row.get(index)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| parse_f64(value, line, column, errors))
+    };
+    let site = optional_text(11);
+    let azimuth = optional_number(12, "azimuth", errors);
+    let opening = optional_number(13, "opening", errors);
+    let range = optional_number(14, "range", errors);
     if technology == "5G" {
         let gnb_id = parse_u64(required("gnb_id", errors)?, line, "gnb_id", errors)?;
         let length = parse_u64(
@@ -480,6 +503,10 @@ fn parse_row(
             cell_id: cell_id as u32,
             latitude,
             longitude,
+            site,
+            azimuth,
+            opening,
+            range,
         })
     } else {
         let enb_id = parse_u64(required("enb_id", errors)?, line, "enb_id", errors)?;
@@ -509,6 +536,10 @@ fn parse_row(
             cell_id: cell_id as u32,
             latitude,
             longitude,
+            site,
+            azimuth,
+            opening,
+            range,
         })
     }
 }
@@ -662,6 +693,24 @@ mod tests {
             0,
             "dry run wrote files"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extended_csv_preserves_optional_radio_site_metadata() {
+        let root = root("extended");
+        let store = CellReferenceStore::new(root.clone()).unwrap();
+        let csv = format!(
+            "{}\nLTE,001,01,,,,200,51208,8,48.2,2.2,site-a,120,65,1500\n",
+            EXTENDED_CSV_HEADERS.join(",")
+        );
+        let report = store.validate(csv.as_bytes());
+        assert!(report.errors.is_empty());
+        let cell = &report.preview[0];
+        assert_eq!(cell.site.as_deref(), Some("site-a"));
+        assert_eq!(cell.azimuth, Some(120.0));
+        assert_eq!(cell.opening, Some(65.0));
+        assert_eq!(cell.range, Some(1500.0));
         fs::remove_dir_all(root).unwrap();
     }
 

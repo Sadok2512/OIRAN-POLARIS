@@ -12,7 +12,8 @@
 - `GET /api/v1/sessions/:id/cells` restitue les changements de cellule dans
   l’ordre canonique `(capture_id, packet_number, event_id)`, joint les NCI/ECI
   au snapshot actif et marque explicitement `cell_unknown` en l’absence de
-  correspondance. Les résumés de liste et de détail exposent `serving_cell`.
+  correspondance. Le CSV accepte le suffixe optionnel `site,azimuth,opening,range`;
+  les résumés de liste et de détail exposent `serving_cell`.
 - Les événements déjà publiés ne sont pas redécodés : l’historique qui ne
   contient que les anciens condensats ne peut pas alimenter la route Cellules
   sans réimportation avec ces versions de décodeurs.

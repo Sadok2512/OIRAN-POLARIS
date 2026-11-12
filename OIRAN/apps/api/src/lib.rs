@@ -2847,12 +2847,12 @@ fn session_cell_rows(flow: &CallFlow, store: &CellReferenceStore) -> Vec<Value> 
             "cell_id":fields.get("cell_id"),
             "pci":fields.get("pci"),
             "arfcn":fields.get("arfcn"),
-            "site":Value::Null,
+            "site":joined.and_then(|(_, cell)| cell.site.as_deref()),
             "latitude":joined.map(|(_, cell)| cell.latitude),
             "longitude":joined.map(|(_, cell)| cell.longitude),
-            "azimuth":Value::Null,
-            "opening":Value::Null,
-            "range":Value::Null,
+            "azimuth":joined.and_then(|(_, cell)| cell.azimuth),
+            "opening":joined.and_then(|(_, cell)| cell.opening),
+            "range":joined.and_then(|(_, cell)| cell.range),
             "snapshot_id":joined.map(|(snapshot, _)| snapshot.snapshot_id.as_str()),
             "cell_unknown":joined.is_none()
         }));
