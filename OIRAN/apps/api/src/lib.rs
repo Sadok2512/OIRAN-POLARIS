@@ -4519,7 +4519,7 @@ mod tests {
     /// rehydrate it, adds a DIFFERENT recovered dataset in RAM, and
     /// asserts /health still reflects exactly the continuous manifest.
     #[tokio::test]
-    async fn health_counters_mirror_the_continuous_manifest_exclusively() {
+    async fn health_published_counters_mirror_the_continuous_manifest_exclusively() {
         use live_probe::{CaptureManager, CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID};
         use std::fs;
         let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
@@ -4664,11 +4664,11 @@ mod tests {
         let live = manager.dataset(CONTINUOUS_DATASET_ID).unwrap();
         assert_eq!(live.event_count, EVENT_COUNT);
         assert_eq!(live.session_ids.len(), SESSION_COUNT);
-        // /health must report EXACTLY the continuous dataset's counters,
-        // ignoring any residual dataset that might sit next to it in the
-        // manager's map. The sum-of-all projection of 2.7.17 would have
-        // added a residual dataset's events on top; 2.7.19 reads only
-        // the continuous dataset, so the number MUST equal the manifest.
+        // /health must expose the continuous dataset's publication counters
+        // independently from the queryable union used by `session_count`.
+        // The sum-of-all projection of 2.7.17 would have added a residual
+        // dataset's events on top; the publication projection reads only the
+        // continuous dataset, so these numbers MUST equal the manifest.
         let response = router(state, None)
             .oneshot(req("/api/v1/health", false))
             .await
@@ -4676,6 +4676,7 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["data"]["source_events"], EVENT_COUNT);
         assert_eq!(body["data"]["session_count"], SESSION_COUNT);
+        assert_eq!(body["data"]["published_session_count"], SESSION_COUNT);
         assert_eq!(body["data"]["dataset"], CONTINUOUS_DATASET_ID);
         // Final invariant: /health must match the on-disk manifest on
         // the same fields.
