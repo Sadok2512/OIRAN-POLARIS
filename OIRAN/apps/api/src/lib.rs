@@ -2791,6 +2791,35 @@ fn queryable_flows(state: &AppState) -> BTreeMap<String, CallFlow> {
             }
         }
     }
+    match state.inner.lte_evidence_store.catalog() {
+        Ok(catalog) => {
+            for manifest in catalog {
+                for session_id in manifest.session_ids {
+                    match state
+                        .inner
+                        .lte_evidence_store
+                        .callflow_for_export_by_session(&session_id)
+                    {
+                        Ok(Some(flow)) => {
+                            flows.insert(session_id, flow);
+                        }
+                        Ok(None) => eprintln!(
+                            "SUBSCRIBER_JOURNEY_LTE_CALLFLOW_SKIPPED session_id={} reason=manifest_session_not_resolvable",
+                            session_id
+                        ),
+                        Err(error) => eprintln!(
+                            "SUBSCRIBER_JOURNEY_LTE_CALLFLOW_SKIPPED session_id={} reason={}",
+                            session_id, error
+                        ),
+                    }
+                }
+            }
+        }
+        Err(error) => eprintln!(
+            "SUBSCRIBER_JOURNEY_LTE_CATALOG_SKIPPED reason={}",
+            error
+        ),
+    }
     flows
 }
 
@@ -5049,12 +5078,12 @@ mod tests {
                 "S1_MME" => vec![
                     ("enb_ue_s1ap_id", "42"),
                     ("mme_ue_s1ap_id", "84"),
-                    ("imsi_pseudonym", "lte-ue-anon-export"),
+                    ("subscriber_pseudonym", "psn-lte-evidence-test"),
                     ("eps_bearer_identity", "5"),
                     ("erab_teid", "0x01020304"),
                 ],
                 "S11" => vec![
-                    ("imsi_pseudonym", "lte-ue-anon-export"),
+                    ("subscriber_pseudonym", "psn-lte-evidence-test"),
                     ("bearer_f_teid", "0x01020304"),
                 ],
                 _ => vec![("teid", "0x01020304")],
@@ -5150,6 +5179,58 @@ mod tests {
             result.dataset_id,
             page["data"][0]["session_id"].as_str().unwrap().to_owned(),
         )
+    }
+
+    #[tokio::test]
+    async fn subscribers_include_lte_evidence_alongside_5g_flows() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let config = test_config(workspace, "subscriber-lte-evidence");
+        let store_root = config.lte_evidence_root.clone();
+        let state = AppState::load(config).unwrap();
+        assert!(state.inner.flows.values().any(|flow| flow.technology.contains("5G")));
+        let bundle = temporary_directory("subscriber-lte-evidence-bundle");
+        ingest_lte_evidence_fixture(&state, &bundle);
+
+        let indexed = queryable_flows(&state);
+        assert!(indexed.values().any(|flow| flow.technology == "LTE"));
+        assert!(indexed.values().any(|flow| flow.technology.contains("5G")));
+
+        let app = router(state, None);
+        let subscribers = json_body(
+            app.clone()
+                .oneshot(req("/api/v1/subscribers?page_size=100", false))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(subscribers["data"].as_array().is_some_and(|rows| !rows.is_empty()));
+        assert!(subscribers["data"].as_array().unwrap().iter().any(|row| {
+            row["technologies"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == "LTE"))
+        }));
+
+        let health = json_body(
+            app.clone()
+                .oneshot(req("/api/v1/health", false))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let sessions = json_body(
+            app.oneshot(req("/api/v1/sessions?page_size=100", false))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(health["data"]["session_count"], sessions["meta"]["total"]);
+
+        fs::remove_dir_all(bundle).unwrap();
+        fs::remove_dir_all(store_root.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]

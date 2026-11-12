@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.13.1 — 2026-11-12 — parcours LTE d'évidence
+
+- Cause du parcours vide localisée : `queryable_flows()` indexait les callflows statiques et continus, mais pas les callflows finalisés de `lte_evidence_store`; `/sessions` les ajoutait séparément. L'index commun charge désormais chaque callflow LTE référencé par un manifeste finalisé. Un artefact absent ou illisible produit un journal `SUBSCRIBER_JOURNEY_LTE_*_SKIPPED`, jamais un saut silencieux.
+- Audit des noms réellement émis : NAS 5GS publie `subscriber_pseudonym` pour SUCI et `temporary_identity_pseudonym`/`tmsi_pseudonym` pour 5G-GUTI; SBI publie `subscriber_pseudonym`. NAS EPS publie `subscriber_pseudonym` pour l'identité abonné et `temporary_identity_pseudonym`/`tmsi_pseudonym` pour GUTI/S-TMSI; S1AP, GTPv2-C et Diameter publient `subscriber_pseudonym`. Les alias `ue_identity_pseudonym`, `imsi_pseudonym`, `guti_pseudonym`, `s_tmsi_pseudonym` et `m_tmsi_pseudonym` ne sont émis par aucun décodeur actuel : écart **OUVERT**. Les anciens exports S1AP/NGAP classent encore leur identité temporaire externe sous `subscriber_pseudonym`; le parcours fiable de chaîne TMSI repose donc sur le NAS canonique.
+- Les événements déjà publiés ne sont pas redécodés. L'historique n'apparaît dans `/subscribers` que si son callflow contient déjà les pseudonymes nécessaires dans `decoded_ie_tree`; sinon la session reste absente ou sa chaîne TMSI reste `OUVERT` jusqu'à une réimportation avec les décodeurs actuels. Aucun rapprochement de repli n'est fait par IMEI, heure, cellule ou IP.
+- Tests ajoutés : coexistence d'un run LTE d'évidence et des flows 5G dans l'index, chaîne TMSI attribuée puis présentée `EXACT`, présentation sans attribution `attribution non capturée`, et parité `/health.session_count` avec `/sessions`.
+- Versions : `oiran-api` et web 2.13.1; moteurs, schémas et décodeurs inchangés.
+
 ## OIRAN API 2.13.0 — 2026-11-12 — parcours abonné et chaîne TMSI
 
 - Ajout des routes viewer `GET /subscribers`, `GET /subscribers/:pseudo/journey` et `GET /subscribers/:pseudo/tmsi`. La hiérarchie publiée est Abonné → Contexte UE → Sessions PDN/PDU → Procédures, dans l'ordre canonique `(capture_id, packet_number, event_id)`.

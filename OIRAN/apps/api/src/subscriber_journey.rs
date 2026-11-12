@@ -525,4 +525,20 @@ mod tests {
         let index = JourneyIndex::from_flows(&flows);
         assert_eq!(index.sessions("psn-subscriber-a").len(), 1);
     }
+
+    #[test]
+    fn presentation_without_captured_assignment_is_open() {
+        // Synthetic PLMN 001-01 context; only pseudonyms enter the journey.
+        let flows = vec![flow(
+            "a",
+            1,
+            Some("psn-subscriber-a"),
+            Some(("presented", "psn-tmsi-a")),
+        )];
+        let index = JourneyIndex::from_flows(&flows);
+        let tmsi = index.tmsi("psn-subscriber-a");
+        assert_eq!(tmsi.len(), 1);
+        assert_eq!(tmsi[0].status, "attribution non capturée");
+        assert!(tmsi[0].assigned.is_none());
+    }
 }
