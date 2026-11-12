@@ -1,5 +1,15 @@
 # Changelog
 
+## POLARIS 3.0.0 — 2026-11-12 — renumérotation exacte de la production Analyzer
+
+- Version produit unifiée de l’Analyzer 8091 uniquement : API OIRAN issue de
+  `7ad769e48937c54e801e573c3f22b0d7ab9f122f` et UI p900 issue de
+  `666847332d3a8345605189df200e430a79f6c360`.
+- Aucun changement fonctionnel et aucun apport des versions 2.15/2.16 ou
+  p900 2.3/2.4. POLARIS Control 8020 reste une application séparée.
+- `/api/v1/version` expose seulement le produit, la version et les deux
+  commits API/UI de cette release Analyzer; aucun `control_commit`.
+
 ## OIRAN API 2.14.3 — 2026-11-12 — contrôle d’accès au démarrage
 
 - Les racines `derived_import_root`, `lte_evidence_root` et `lte_evidence_bundle_root` déjà présentes exigent uniquement lecture et traversée (`R_OK|X_OK`). La création n’est exigée que lorsque la racine est absente; un montage de référence existant en lecture seule ne bloque donc plus le démarrage.

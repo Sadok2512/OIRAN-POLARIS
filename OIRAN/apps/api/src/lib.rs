@@ -65,6 +65,8 @@ use tower_http::{
 // hardcoded to "2.7.15" while apps/api/Cargo.toml was already at 2.7.16).
 pub const API_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PLATFORM_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const API_COMMIT: &str = "7ad769e48937c54e801e573c3f22b0d7ab9f122f";
+pub const UI_COMMIT: &str = "666847332d3a8345605189df200e430a79f6c360";
 /// 2.7.17 — the web frontend's version is read from `apps/web/package.json`
 /// at build time via `build.rs` (`cargo:rustc-env=OIRAN_WEB_FRONTEND_VERSION`),
 /// so bumping the frontend never requires editing this crate again.
@@ -952,14 +954,12 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn version(State(state): State<AppState>) -> Json<Value> {
-    let flow = primary_flow(&state);
+async fn version(State(_state): State<AppState>) -> Json<Value> {
     ok(json!({
-        "platform_core":PLATFORM_VERSION,"backend_api":API_VERSION,"web_frontend":WEB_FRONTEND_VERSION,
-        "event_schema":"1.2.0","callflow_schema":flow.map(|value|value.schema_version.as_str()).unwrap_or("UNKNOWN"),
-        "session_engine":session_engine::VERSION,"correlation_engine":correlation_engine::VERSION,"dataset_registry":dataset_registry::VERSION,
-        "disk_safety":disk_safety::VERSION,
-        "decoders":oiran_decode::installed_decoder_versions()
+        "product":"POLARIS",
+        "version":PLATFORM_VERSION,
+        "api_commit":API_COMMIT,
+        "ui_commit":UI_COMMIT
     }))
 }
 
@@ -5280,40 +5280,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_reports_installed_lte_and_5g_decoders() {
+    async fn version_reports_the_exact_analyzer_release() {
         let response = router(state(), None)
             .oneshot(req("/api/v1/version", true))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let value = json_body(response).await;
-        // 2.7.17: verify the binary reports exactly the Cargo-declared
-        // version. No literal here — ANR2 refused 2.7.16 because this
-        // assertion still read "2.7.15" after the package bump.
-        assert_eq!(value["data"]["backend_api"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(value["data"]["platform_core"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(value["data"]["backend_api"], value["data"]["platform_core"]);
-        assert_eq!(
-            value["data"]["web_frontend"],
-            env!("OIRAN_WEB_FRONTEND_VERSION")
-        );
-        for protocol in [
-            "S1AP",
-            "NAS-EPS-MM",
-            "NAS-EPS-SM",
-            "GTPv2-C",
-            "GTP-U",
-            "NGAP",
-            "NAS-5GMM",
-            "NAS-5GSM",
-            "PFCP",
-            "SBI-HTTP2",
-        ] {
-            assert!(
-                value["data"]["decoders"][protocol].is_string(),
-                "missing installed decoder {protocol}"
-            );
-        }
+        assert_eq!(value["data"], json!({
+            "product":"POLARIS",
+            "version":"3.0.0",
+            "api_commit":API_COMMIT,
+            "ui_commit":UI_COMMIT
+        }));
+        assert!(value["data"].get("control_commit").is_none());
     }
 
     fn normalized_lte_event(
