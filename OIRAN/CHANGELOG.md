@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.12.0 — 2026-11-11 — coffre d'identités operator
+
+- Coffre d'identités persistant hors dataset, répertoire 0700 et fichier 0600, avec preuves ordonnées `(capture_id, packet_number)` et aucune valeur claire dans les journaux.
+- Coffre situé dans `/var/lib/oiran/identity-vault/vault.json`, créé par le compte du service sans modifier le mode de `/var/lib/oiran`.
+- Préflight des chemins requis avec erreur `ACCESS_CHECK_FAILED path=… mode=…` au lieu d'un `Permission denied` sans contexte.
+- `GET /sessions/:id/identities` et `GET /identities?q=…` sont réservés à l'operator et exposent IMSI, TMSI, S-TMSI, M-TMSI, IMEI/IMEISV et MSISDN avec leur événement source.
+- `GET /packets/:capture_id/:packet_number/dissect` fournit la dissection `tshark -V` d'une référence déjà connue, uniquement à l'operator et sans accepter de chemin client.
+- La collecte claire est un canal privé fondé sur les paquets sources ; les événements et datasets publiés restent pseudonymisés.
+
 ## OIRAN API 2.11.16 — 2026-11-11 — gate phase 13 mesuré et scan callflow accéléré
 
 - Le compteur `PUBLICATION_RSS_TRACE elapsed_ms` démarre désormais sur la ligne `CONTINUOUS_PUBLICATION_INCREMENTAL phase=begin`, avant le décodage du lot, afin de coïncider avec la méthode chronométrique du gate fantôme. Cette origine est transmise explicitement dans la pile de publication ; aucun chrono global n'est partagé entre threads.
