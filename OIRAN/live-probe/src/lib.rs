@@ -32,6 +32,7 @@ use session_engine::{
     ReconstructionHints,
 };
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Read, Write},
@@ -198,6 +199,10 @@ fn event_id_set_mem_cap() -> usize {
 /// cgroup l'autorise et si le nombre de scans JSONL par
 /// publication (= ceil(sessions / K)) devient significatif.
 const SESSION_PUBLICATION_BATCH_SIZE_DEFAULT: usize = 32;
+/// Keep the already compacted representatives for session callflow materialization
+/// only while their cardinality remains below the measured 2 GiB gate envelope.
+/// Higher-cardinality publications retain the disk-backed phase-10 path.
+const IN_MEMORY_SESSION_PUBLICATION_MAX_EVENTS: usize = 262_144;
 fn session_publication_batch_size() -> usize {
     std::env::var("OIRAN_SESSION_PUBLICATION_BATCH_SIZE")
         .ok()
@@ -3496,6 +3501,7 @@ impl CaptureManager {
                     .map(|segment| base.join("pcap").join(&segment.owned_file))
                     .collect::<BTreeSet<_>>();
                 cycle_trace.publication_started = true;
+                let publication_started_epoch_ms = epoch_ms();
                 eprintln!(
                     "{}",
                     serde_json::json!({
@@ -3506,11 +3512,12 @@ impl CaptureManager {
                         "historical_segments_skipped": state.segments.len().saturating_sub(selected_files.len()),
                     })
                 );
-                match self.process_continuous_capture_selected(
+                match self.process_continuous_capture_selected_at(
                     &base,
                     &interface_specs(),
                     config.max_owned_bytes,
                     &selected_files,
+                    publication_started_epoch_ms,
                 ) {
                     Ok(dataset) => {
                         self.upsert_dataset(dataset.clone(), &base.join("dataset"))?;
@@ -3979,7 +3986,7 @@ impl CaptureManager {
         interfaces: &[CaptureInterface],
         max_owned_bytes: u64,
     ) -> Result<LiveDataset, String> {
-        self.process_continuous_capture_inner(base, interfaces, max_owned_bytes, None)
+        self.process_continuous_capture_inner(base, interfaces, max_owned_bytes, None, None)
     }
 
     fn process_continuous_capture_selected(
@@ -3994,6 +4001,27 @@ impl CaptureManager {
             interfaces,
             max_owned_bytes,
             Some(selected_files),
+            None,
+        )
+    }
+
+    /// Continuous-worker entry point carrying the cycle's publication clock
+    /// explicitly. This avoids cross-thread timing state when two managers
+    /// publish concurrently in tests or during an operator recovery.
+    fn process_continuous_capture_selected_at(
+        &self,
+        base: &Path,
+        interfaces: &[CaptureInterface],
+        max_owned_bytes: u64,
+        selected_files: &BTreeSet<PathBuf>,
+        publication_started_epoch_ms: u64,
+    ) -> Result<LiveDataset, String> {
+        self.process_continuous_capture_inner(
+            base,
+            interfaces,
+            max_owned_bytes,
+            Some(selected_files),
+            Some(publication_started_epoch_ms),
         )
     }
 
@@ -4003,6 +4031,7 @@ impl CaptureManager {
         interfaces: &[CaptureInterface],
         max_owned_bytes: u64,
         selected_files: Option<&BTreeSet<PathBuf>>,
+        publication_started_epoch_ms: Option<u64>,
     ) -> Result<LiveDataset, String> {
         // Cross-process advisory lock (flock) held through the manifest
         // commit. `dataset-restore` takes
@@ -4044,6 +4073,7 @@ impl CaptureManager {
             format!("runtime/live-captures/{CONTINUOUS_CAPTURE_ID}/dataset"),
             interfaces,
             selected_files,
+            publication_started_epoch_ms,
         );
         let dataset = match result {
             Ok(dataset) => dataset,
@@ -4211,6 +4241,7 @@ impl CaptureManager {
             None,
             Vec::new(),
             0,
+            None,
         )?;
         // Atomic swap next ↔ current via previous.
         if previous.exists() {
@@ -5131,6 +5162,7 @@ impl CaptureManager {
             None,
             Vec::new(),
             0,
+            None,
         )?;
         if previous.exists() {
             fs::remove_dir_all(&previous).map_err(display_error)?;
@@ -5185,6 +5217,7 @@ impl CaptureManager {
             dataset_path,
             interfaces,
             None,
+            None,
         )
     }
 
@@ -5197,6 +5230,7 @@ impl CaptureManager {
         dataset_path: String,
         interfaces: &[CaptureInterface],
         selected_files: Option<&BTreeSet<PathBuf>>,
+        publication_started_epoch_ms: Option<u64>,
     ) -> Result<LiveDataset, String> {
         // 2.7.6 (adjusted): the per-deployment key is owned by the manager
         // and shared across every capture processed by this binary — so a
@@ -5488,6 +5522,7 @@ impl CaptureManager {
             event_paths.as_deref(),
             event_shards,
             publication_bytes_written,
+            publication_started_epoch_ms,
         )
     }
 
@@ -5513,16 +5548,30 @@ impl CaptureManager {
         event_paths: Option<&[PathBuf]>,
         event_shards: Vec<EventShard>,
         publication_bytes_written: u64,
+        publication_started_epoch_ms: Option<u64>,
     ) -> Result<LiveDataset, String> {
         let events_path = dataset_dir.join("oiran_events.jsonl");
         let event_paths = event_paths
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| vec![events_path.clone()]);
-        trace_publication_rss_reset();
-        trace_publication_rss("00a-before-heap-release", None);
+        let publication_started_epoch_ms =
+            publication_started_epoch_ms.unwrap_or_else(epoch_ms);
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "00a-before-heap-release",
+            None,
+        );
         release_unused_heap_pages();
-        trace_publication_rss("00b-after-heap-release", None);
-        trace_publication_rss("00-after-streaming-merge", None);
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "00b-after-heap-release",
+            None,
+        );
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "00-after-streaming-merge",
+            None,
+        );
         // 2.7.24 + 2.9.18-fu3 + 2.10.3 : stream the JSONL into
         // compact semantic representatives. Pré-2.10.3 on faisait
         // AUSSI une 2ᵉ passe streaming pour alimenter un
@@ -5541,6 +5590,7 @@ impl CaptureManager {
             &event_paths,
             |scanned_events, retained_events| {
                 trace_publication_rss_progress(
+                    publication_started_epoch_ms,
                     "00c-streaming-representatives",
                     scanned_events,
                     retained_events,
@@ -5581,7 +5631,11 @@ impl CaptureManager {
             retained_event_ids.flush_count(),
             retained_event_ids.mem_len(),
         );
-        trace_publication_rss("01-after-streaming-representatives", Some(events.len()));
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "01-after-streaming-representatives",
+            Some(events.len()),
+        );
         let capture_job = self.get(capture_id);
         // 2.7.28: when restore runs in a manager that never saw the
         // continuous worker start, `capture_job` is None. Fall back to
@@ -5611,13 +5665,21 @@ impl CaptureManager {
             epoch_ms(),
             runtime_evidence.as_deref(),
         );
-        trace_publication_rss("02-after-continuous-activity", Some(events.len()));
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "02-after-continuous-activity",
+            Some(events.len()),
+        );
         let active_ue_ips = active_pdu_contexts
             .iter()
             .map(|context| context.ue_ip.clone())
             .collect::<Vec<_>>();
         let mut discovery = discover_sessions(&mut events);
-        trace_publication_rss("03-after-discover-sessions", Some(events.len()));
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "03-after-discover-sessions",
+            Some(events.len()),
+        );
         discovery
             .event_accounting
             .insert("source_events".into(), event_count);
@@ -5625,9 +5687,17 @@ impl CaptureManager {
             .event_accounting
             .insert("publication_index_events".into(), events.len());
         let mut global_edges = correlate_discovered_tunnels(&events, &discovery);
-        trace_publication_rss("04-after-correlate-discovered-tunnels", Some(events.len()));
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "04-after-correlate-discovered-tunnels",
+            Some(events.len()),
+        );
         global_edges.extend(correlate_cross_interface_evidence(&events));
-        trace_publication_rss("05-after-correlate-cross-interface", Some(events.len()));
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "05-after-correlate-cross-interface",
+            Some(events.len()),
+        );
         // 2.7.26 (ANR2 production rollback): two orthogonal rules can
         // compute the same N4↔N3 (or any other) pair from independent
         // evidence paths — in production the audit observed both
@@ -5646,7 +5716,11 @@ impl CaptureManager {
         // order, evidence_type)` and collapses the matching rule_ids
         // into `matched_rules` without losing a single distinct link.
         global_edges = fold_overlapping_edges(global_edges);
-        trace_publication_rss("06-after-fold-overlapping-edges", Some(events.len()));
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "06-after-fold-overlapping-edges",
+            Some(events.len()),
+        );
         // 2.10.2 (devmat, ANR2 #9 comments 6765365357 + 6765466589) :
         // avant 2.10.2, le pipeline construisait `Vec<SessionPlan>` où chaque
         // `SessionPlan` clonait `Vec<CorrelationEdge>` + `BTreeSet<String>`
@@ -5657,7 +5731,9 @@ impl CaptureManager {
         // manifeste). Fix 2.10.2 :
         //   * LTE + runtime flows construits d'abord (ont encore besoin
         //     de `events`).
-        //   * `drop(events)` AVANT la construction des session plans.
+        //   * `drop(events)` AVANT la construction des session plans lorsque
+        //     l'index dépasse le seuil borné ; sous ce seuil, 2.11.16 le garde
+        //     seulement pendant le lot courant pour éviter un rescan de 3,4 Go.
         //   * `SessionPlan.ids` → `SpillingEventIdSet` disk-backed
         //     (~1,5 MiB RAM max par session, le reste sur disque sous
         //     `.publish-staging/session-ids/<idx>/`).
@@ -5665,16 +5741,40 @@ impl CaptureManager {
         //     re-filtrées depuis `global_edges` au moment de la boucle
         //     par session (petit coût CPU, gros gain mémoire).
         let lte_flows: Vec<CallFlow> = offline_lte_callflows(&events)?;
-        trace_publication_rss("07-after-lte-flows-built", Some(events.len()));
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "07-after-lte-flows-built",
+            Some(events.len()),
+        );
         let runtime_flows: Vec<CallFlow> = active_pdu_contexts
             .iter()
             .map(|active| runtime_pdu_callflow(&events, active))
             .collect();
-        trace_publication_rss("08-after-runtime-flows-built", Some(events.len()));
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "08-after-runtime-flows-built",
+            Some(events.len()),
+        );
         let indexed_events_count = events.len();
-        drop(events);
-        release_unused_heap_pages();
-        trace_publication_rss("09-after-events-dropped", None);
+        let retained_publication_events = if indexed_events_count
+            <= IN_MEMORY_SESSION_PUBLICATION_MAX_EVENTS
+        {
+            trace_publication_rss(
+                publication_started_epoch_ms,
+                "09-events-retained-for-bounded-session-callflows",
+                Some(indexed_events_count),
+            );
+            Some(events)
+        } else {
+            drop(events);
+            release_unused_heap_pages();
+            trace_publication_rss(
+                publication_started_epoch_ms,
+                "09-after-events-dropped",
+                None,
+            );
+            None
+        };
 
         // 2.10.3 (devmat, revue 2.10.2 point 2) : boucle de session
         // BATCHÉE. La 2.10.2 faisait 1 full JSONL scan PAR SESSION
@@ -5757,7 +5857,7 @@ impl CaptureManager {
             // scratchs dont la SpillingEventIdSet le contient.
             // La passe ne parse pas tout l'event, juste `event_id`
             // (clone du cheap-peek 2.9.17 depuis `load_events_by_ids`).
-            {
+            if retained_publication_events.is_none() {
                 let mut scratch_writers: Vec<BufWriter<fs::File>> = entries
                     .iter()
                     .map(|entry| {
@@ -5772,14 +5872,12 @@ impl CaptureManager {
                     for line in reader.lines() {
                         let line = line.map_err(display_error)?;
                         if line.trim().is_empty() { continue; }
-                        #[derive(serde::Deserialize)]
-                        struct IdOnly<'a> { event_id: &'a str }
-                        let id_only: IdOnly = match serde_json::from_str(&line) {
-                            Ok(value) => value,
-                            Err(_) => continue,
+                        let event_id = match event_id_from_json_line(&line) {
+                            Some(value) => value,
+                            None => continue,
                         };
                         for (idx, entry) in entries.iter().enumerate() {
-                            if entry.ids.contains(id_only.event_id).map_err(display_error)? {
+                            if entry.ids.contains(event_id.as_ref()).map_err(display_error)? {
                                 scratch_writers[idx].write_all(line.as_bytes()).map_err(display_error)?;
                                 scratch_writers[idx].write_all(b"\n").map_err(display_error)?;
                             }
@@ -5801,11 +5899,15 @@ impl CaptureManager {
                     ids,
                     scratch_path,
                 } = entry;
+                let selected = phase_ten_session_events(
+                    retained_publication_events.as_deref(),
+                    &ids,
+                    &scratch_path,
+                )?;
+                if retained_publication_events.is_none() {
+                    let _ = fs::remove_file(&scratch_path);
+                }
                 drop(ids); // libère chunks + tmp_dir avant le reconstruct.
-                let scratch_bytes =
-                    fs::read(&scratch_path).map_err(display_error)?;
-                let _ = fs::remove_file(&scratch_path);
-                let selected = session_engine::load_jsonl(&scratch_bytes[..])?;
                 let selected_ids: std::collections::BTreeSet<String> = selected
                     .iter()
                     .map(|event| event.event_id.clone())
@@ -5848,6 +5950,7 @@ impl CaptureManager {
             }
             release_unused_heap_pages();
             trace_publication_rss(
+                publication_started_epoch_ms,
                 &format!(
                     "10-session-batch-{}-of-{}",
                     batch_idx + 1,
@@ -5856,7 +5959,10 @@ impl CaptureManager {
                 Some(indexed_events_count),
             );
         }
+        drop(retained_publication_events);
+        release_unused_heap_pages();
         trace_publication_rss(
+            publication_started_epoch_ms,
             "10a-after-session-callflows",
             Some(indexed_events_count),
         );
@@ -6014,15 +6120,27 @@ impl CaptureManager {
             publication_files_created: 0,
             callflows_path: None,
         };
-        trace_publication_rss("11-after-callflows-loop", None);
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "11-after-callflows-loop",
+            None,
+        );
         atomic_write(
             &dataset_dir.join("dataset_manifest.json"),
             &serde_json::to_vec_pretty(&dataset).map_err(|error| error.to_string())?,
         )?;
-        trace_publication_rss("12-after-manifest-written", None);
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "12-after-manifest-written",
+            None,
+        );
         validate_dataset_artifacts(&dataset, dataset_dir)?;
         release_unused_heap_pages();
-        trace_publication_rss("13-after-release-pages", None);
+        trace_publication_rss(
+            publication_started_epoch_ms,
+            "13-after-release-pages",
+            None,
+        );
         Ok(dataset)
     }
 
@@ -8757,32 +8875,140 @@ pub struct DatasetRestoreReport {
 /// pour savoir laquelle des phases eat le cycle 22 min observé en
 /// prod.
 ///
-/// Utilisation : au tout début de `publish_events_to_dataset_dir`,
-/// le compteur est réinitialisé via `trace_publication_rss_reset`
-/// pour qu'`elapsed_ms` commence à 0.
-static PUBLICATION_RSS_START_UNIX_MS: AtomicU64 = AtomicU64::new(0);
+/// Le début est capturé par le cycle appelant puis transmis explicitement à
+/// chaque trace. Aucun état global n'est partagé entre threads/publications.
 
-pub(crate) fn trace_publication_rss_reset() {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    PUBLICATION_RSS_START_UNIX_MS.store(now_ms, Ordering::Relaxed);
+/// Reads the top-level `event_id` without deserializing the remaining JSON.
+/// Publication phase 10 only needs this one field, while production lines can
+/// contain a large `decoded_ie_tree`. The common path is allocation-free; the
+/// serde fallback preserves compatibility with an escaped or unusual key.
+fn event_id_from_json_line(line: &str) -> Option<Cow<'_, str>> {
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    let mut depth = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                index += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b'"' => {
+                let start = index + 1;
+                index = start;
+                let mut escaped = false;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => {
+                            escaped = true;
+                            index = index.saturating_add(2);
+                        }
+                        b'"' => break,
+                        _ => index += 1,
+                    }
+                }
+                if index >= bytes.len() {
+                    break;
+                }
+                let end = index;
+                index += 1;
+                if depth != 1 || escaped || &line[start..end] != "event_id" {
+                    continue;
+                }
+                let mut cursor = index;
+                while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                }
+                if bytes.get(cursor) != Some(&b':') {
+                    continue;
+                }
+                cursor += 1;
+                while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                }
+                if bytes.get(cursor) != Some(&b'"') {
+                    break;
+                }
+                let value_start = cursor + 1;
+                cursor = value_start;
+                while cursor < bytes.len() {
+                    match bytes[cursor] {
+                        b'\\' => break,
+                        b'"' => return Some(Cow::Borrowed(&line[value_start..cursor])),
+                        _ => cursor += 1,
+                    }
+                }
+                break;
+            }
+            _ => index += 1,
+        }
+    }
+    #[derive(Deserialize)]
+    struct IdOnly {
+        event_id: String,
+    }
+    serde_json::from_str::<IdOnly>(line)
+        .ok()
+        .map(|value| Cow::Owned(value.event_id))
 }
 
-pub(crate) fn trace_publication_rss(phase: &str, indexed_events: Option<usize>) {
-    trace_publication_rss_detail(phase, 0, indexed_events.unwrap_or(0));
+/// Phase 10 has two storage strategies but one selection contract. Keeping
+/// this operation shared prevents the in-memory fast path and disk fallback
+/// from producing different callflows for the same event-id set.
+fn phase_ten_session_events(
+    retained_publication_events: Option<&[EventRecord]>,
+    ids: &SpillingEventIdSet,
+    scratch_path: &Path,
+) -> Result<Vec<EventRecord>, String> {
+    if let Some(indexed) = retained_publication_events {
+        let mut selected = Vec::new();
+        for event in indexed {
+            if ids.contains(&event.event_id).map_err(display_error)? {
+                selected.push(event.clone());
+            }
+        }
+        Ok(selected)
+    } else {
+        load_path(scratch_path)
+    }
+}
+
+pub(crate) fn trace_publication_rss(
+    publication_started_epoch_ms: u64,
+    phase: &str,
+    indexed_events: Option<usize>,
+) {
+    trace_publication_rss_detail(
+        publication_started_epoch_ms,
+        phase,
+        0,
+        indexed_events.unwrap_or(0),
+    );
 }
 
 pub(crate) fn trace_publication_rss_progress(
+    publication_started_epoch_ms: u64,
     phase: &str,
     scanned_events: usize,
     indexed_events: usize,
 ) {
-    trace_publication_rss_detail(phase, scanned_events, indexed_events);
+    trace_publication_rss_detail(
+        publication_started_epoch_ms,
+        phase,
+        scanned_events,
+        indexed_events,
+    );
 }
 
-fn trace_publication_rss_detail(phase: &str, scanned_events: usize, indexed_events: usize) {
+fn trace_publication_rss_detail(
+    publication_started_epoch_ms: u64,
+    phase: &str,
+    scanned_events: usize,
+    indexed_events: usize,
+) {
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     let value = |name: &str| {
         status
@@ -8796,11 +9022,12 @@ fn trace_publication_rss_detail(phase: &str, scanned_events: usize, indexed_even
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let start_ms = PUBLICATION_RSS_START_UNIX_MS.load(Ordering::Relaxed);
-    let elapsed_ms = if start_ms == 0 || now_ms < start_ms {
+    let elapsed_ms = if publication_started_epoch_ms == 0
+        || now_ms < publication_started_epoch_ms
+    {
         0u64
     } else {
-        now_ms - start_ms
+        now_ms - publication_started_epoch_ms
     };
     // La source de vérité production est le memcg du service, pas une
     // estimation applicative. Ce chemin exact est également imposé par la
@@ -10073,6 +10300,126 @@ fn display_error(error: std::io::Error) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn phase_ten_event_id_extractor_reads_only_the_top_level_key() {
+        let line = r#"{"decoded_ie_tree":{"event_id":"nested-decoy"}, "event_id" : "capture-001:42", "message_name":"Registration Accept"}"#;
+        assert_eq!(event_id_from_json_line(line).as_deref(), Some("capture-001:42"));
+    }
+
+    #[test]
+    fn phase_ten_event_id_extractor_falls_back_for_escaped_values() {
+        let line = r#"{"event_id":"capture-001:\u0034\u0032","decoded_ie_tree":{}}"#;
+        assert_eq!(event_id_from_json_line(line).as_deref(), Some("capture-001:42"));
+        assert!(event_id_from_json_line("not-json").is_none());
+    }
+
+    #[test]
+    fn phase_ten_memory_and_disk_paths_build_identical_callflows_and_edges() {
+        let root = temporary_root("phase-ten-equivalence");
+        let scratch = root.join("selected.jsonl");
+        let selected = vec![
+            lte_event("phase10-a", "N2", "NGAP", "InitialUEMessage", &[], "UPLINK", 1),
+            lte_event("phase10-b", "N4", "PFCP", "PFCP Session Establishment Request", &[], "DOWNLINK", 2),
+        ];
+        let mut indexed = selected.clone();
+        indexed.push(lte_event("phase10-extra", "N3", "GTP-U", "G-PDU", &[], "UPLINK", 3));
+        let mut ids = SpillingEventIdSet::new(&root.join("ids"), 16).unwrap();
+        for event in &selected {
+            ids.insert(&event.event_id).unwrap();
+        }
+        let mut jsonl = Vec::new();
+        for event in &selected {
+            let packet = event.packet_references[0].packet_number;
+            let identifiers = event.identifiers.iter().map(|(name, value)| {
+                serde_json::json!({"name": name, "value": value, "pseudonymized": false})
+            }).collect::<Vec<_>>();
+            let wire = serde_json::json!({
+                "event_id": event.event_id,
+                "capture_id": event.capture_id,
+                "capture_point_id": event.capture_point_id,
+                "timestamp": {"seconds": 1, "nanoseconds": packet, "raw_ticks": packet, "display": "constructed"},
+                "interface": event.interface,
+                "protocol": event.protocol,
+                "message_name": event.message_name,
+                "source_endpoint": {"address": event.source_address, "network_function": event.source_participant},
+                "destination_endpoint": {"address": event.destination_address, "network_function": event.destination_participant},
+                "direction": event.direction,
+                "session_identifiers": identifiers,
+                "information_elements": [],
+                "decoding_status": "DECODED",
+                "decoder_name": event.decoder_name,
+                "decoder_version": event.decoder_version,
+                "raw_payload_reference": event.raw_payload_reference,
+                "packet_references": event.packet_references,
+                "errors": []
+            });
+            serde_json::to_writer(&mut jsonl, &wire).unwrap();
+            jsonl.push(b'\n');
+        }
+        fs::write(&scratch, jsonl).unwrap();
+
+        let from_memory = phase_ten_session_events(Some(&indexed), &ids, &scratch).unwrap();
+        let from_disk = phase_ten_session_events(None, &ids, &scratch).unwrap();
+        let edge = CorrelationEdge {
+            edge_id: "phase10-edge".into(),
+            source_event_id: "phase10-a".into(),
+            target_event_id: "phase10-b".into(),
+            source_interface: "N2".into(),
+            target_interface: "N4".into(),
+            matching_identifiers: vec!["test_key".into()],
+            rule_id: "phase10-test".into(),
+            rule_version: "1".into(),
+            evidence_description: "constructed equivalence evidence".into(),
+            packet_references: Vec::new(),
+            confidence: "EXACT".into(),
+            evidence_type: "EXACT_TEST".into(),
+            scope: "test".into(),
+            limitations: Vec::new(),
+            matched_rules: vec!["phase10-test".into()],
+        };
+        let build = |events| {
+            let reconstruction = reconstruct(events, ReconstructionHints::default());
+            build_callflow(&reconstruction, vec![edge.clone()])
+        };
+        let memory_flow = build(from_memory);
+        let disk_flow = build(from_disk);
+        assert_eq!(
+            memory_flow.events.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+            disk_flow.events.iter().map(|event| &event.event_id).collect::<Vec<_>>()
+        );
+        assert_eq!(memory_flow.interfaces, disk_flow.interfaces);
+        assert_eq!(
+            serde_json::to_value(memory_flow.correlation_edges).unwrap(),
+            serde_json::to_value(disk_flow.correlation_edges).unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "read-only production-scale benchmark; set OIRAN_PHASE10_BENCH_PATH"]
+    fn phase_ten_event_id_extractor_scans_a_scale_jsonl_without_logging_values() {
+        let path = std::env::var("OIRAN_PHASE10_BENCH_PATH")
+            .expect("OIRAN_PHASE10_BENCH_PATH is required");
+        let metadata = fs::metadata(&path).expect("benchmark input metadata");
+        let reader = BufReader::with_capacity(
+            STREAM_CHUNK_BYTES,
+            fs::File::open(path).expect("benchmark input open"),
+        );
+        let started = Instant::now();
+        let mut lines = 0u64;
+        for line in reader.lines() {
+            let line = line.expect("benchmark input line");
+            assert!(event_id_from_json_line(&line).is_some());
+            lines = lines.saturating_add(1);
+        }
+        eprintln!(
+            "PHASE10_EVENT_ID_SCAN bytes={} lines={} elapsed_ms={}",
+            metadata.len(),
+            lines,
+            started.elapsed().as_millis()
+        );
+        assert!(lines > 0);
+    }
+
     fn lte_event(
         id: &str,
         interface: &str,
@@ -10116,6 +10463,34 @@ mod tests {
             "source_json": {}
         }))
         .unwrap()
+    }
+
+    fn event_record_wire_json(event: &EventRecord) -> Value {
+        let packet = event.packet_references[0].packet_number;
+        let identifiers = event.identifiers.iter().map(|(name, value)| {
+            serde_json::json!({"name": name, "value": value, "pseudonymized": false})
+        }).collect::<Vec<_>>();
+        serde_json::json!({
+            "event_id": event.event_id,
+            "parent_event_id": event.parent_event_id,
+            "capture_id": event.capture_id,
+            "capture_point_id": event.capture_point_id,
+            "timestamp": {"seconds": 1, "nanoseconds": packet, "raw_ticks": packet, "display": "constructed"},
+            "interface": event.interface,
+            "protocol": event.protocol,
+            "message_name": event.message_name,
+            "source_endpoint": {"address": event.source_address, "network_function": event.source_participant},
+            "destination_endpoint": {"address": event.destination_address, "network_function": event.destination_participant},
+            "direction": event.direction,
+            "session_identifiers": identifiers,
+            "information_elements": [],
+            "decoding_status": "DECODED",
+            "decoder_name": event.decoder_name,
+            "decoder_version": event.decoder_version,
+            "raw_payload_reference": event.raw_payload_reference,
+            "packet_references": event.packet_references,
+            "errors": []
+        })
     }
 
     #[test]
@@ -10168,6 +10543,85 @@ mod tests {
         );
         assert_eq!(flows[0].correlation_status["E2E"], "STRONG");
         assert!(!serde_json::to_string(&flows).unwrap().contains("001010"));
+    }
+
+    #[test]
+    fn lte_publication_is_identical_in_one_shard_and_three_successive_lots() {
+        let pseudo = "subscriber-test-pseudonym";
+        let lots = vec![
+            vec![lte_event(
+                "lte-s1", "S1-MME", "S1AP", "InitialContextSetupResponse",
+                &[("enb_ue_s1ap_id", "42"), ("mme_ue_s1ap_id", "84"),
+                  ("subscriber_pseudonym", pseudo), ("erab_teid", "0x7804")],
+                "UPLINK", 1,
+            )],
+            vec![
+                lte_event(
+                    "lte-s11", "S11", "GTPv2-C", "CreateSessionResponse",
+                    &[("subscriber_pseudonym", pseudo), ("f_teid", "0x7804"),
+                      ("bearer_f_teid", "0x7f6f")], "DOWNLINK", 2,
+                ),
+                lte_event(
+                    "lte-s1u", "S1-U", "GTP-U", "G-PDU",
+                    &[("teid", "0x7804")], "UPLINK", 3,
+                ),
+            ],
+            vec![
+                lte_event(
+                    "lte-s5c", "S5-C", "GTPv2-C", "CreateSessionResponse",
+                    &[("f_teid", "0x7f6f"), ("bearer_f_teid", "0xbe90")],
+                    "DOWNLINK", 4,
+                ),
+                lte_event(
+                    "lte-s5u", "S5-U", "GTP-U", "G-PDU",
+                    &[("teid", "0xbe90")], "DOWNLINK", 5,
+                ),
+                lte_event(
+                    "lte-sxab", "Sxab", "PFCP", "PFCP Session Establishment Response",
+                    &[("teid", "0xbe90")], "CORE_TO_CORE", 6,
+                ),
+                lte_event(
+                    "lte-s6a", "S6a", "DIAMETER", "Authentication-Information-Request",
+                    &[("subscriber_pseudonym", pseudo)], "CORE_TO_CORE", 7,
+                ),
+            ],
+        ];
+        let root = temporary_root("lte-one-vs-three-shards");
+        let write = |path: &Path, events: &[EventRecord]| {
+            let mut bytes = Vec::new();
+            for event in events {
+                serde_json::to_writer(&mut bytes, &event_record_wire_json(event)).unwrap();
+                bytes.push(b'\n');
+            }
+            fs::write(path, bytes).unwrap();
+        };
+        let all = lots.iter().flatten().cloned().collect::<Vec<_>>();
+        let monolith = root.join("all.jsonl");
+        write(&monolith, &all);
+        let shard_paths = lots.iter().enumerate().map(|(index, events)| {
+            let path = root.join(format!("shard-{index}.jsonl"));
+            write(&path, events);
+            path
+        }).collect::<Vec<_>>();
+        let one = session_engine::load_paths_streaming_representatives_with_progress(
+            &[monolith], |_, _| {},
+        ).unwrap();
+        let three = session_engine::load_paths_streaming_representatives_with_progress(
+            &shard_paths, |_, _| {},
+        ).unwrap();
+        let one_flow = offline_lte_callflows(&one.events).unwrap().remove(0);
+        let three_flow = offline_lte_callflows(&three.events).unwrap().remove(0);
+        let summarize = |flow: &CallFlow| {
+            let edges = flow.correlation_edges.iter().map(|edge| (
+                edge.source_event_id.clone(), edge.target_event_id.clone(),
+                edge.rule_id.clone(), edge.confidence.clone(),
+            )).collect::<BTreeSet<_>>();
+            (flow.session_id.clone(), flow.interfaces.clone(), flow.events.len(), edges)
+        };
+        assert_eq!(summarize(&one_flow), summarize(&three_flow));
+        assert_eq!(three_flow.interfaces,
+            vec!["S1-MME", "S1-U", "S11", "S5-C", "S5-U", "S6a", "Sxab"]);
+        assert!(three_flow.correlation_edges.iter().all(|edge| edge.confidence == "EXACT"));
     }
 
     #[test]
@@ -12298,6 +12752,37 @@ mod tests {
         let full_ids = load_dataset_events(&full_base.join("dataset")).unwrap()
             .into_iter().map(|event| event.event_id).collect::<BTreeSet<_>>();
         assert_eq!(incremental_ids, full_ids);
+        let persisted = |dataset_dir: &Path| -> LiveDataset {
+            serde_json::from_slice(&fs::read(dataset_dir.join("dataset_manifest.json")).unwrap())
+                .unwrap()
+        };
+        let incremental_manifest = persisted(&base.join("dataset"));
+        let full_manifest = persisted(&full_base.join("dataset"));
+        let incremental_callflows =
+            dataset_callflows_dir(&base.join("dataset"), &incremental_manifest);
+        let full_callflows =
+            dataset_callflows_dir(&full_base.join("dataset"), &full_manifest);
+        for session_id in &full.session_ids {
+            let read_flow = |callflows: &Path| -> CallFlow {
+                serde_json::from_slice(
+                    &fs::read(callflows.join(format!("{session_id}.json")))
+                        .unwrap(),
+                ).unwrap()
+            };
+            let incremental_flow = read_flow(&incremental_callflows);
+            let full_flow = read_flow(&full_callflows);
+            let summary = |flow: &CallFlow| {
+                let event_ids = flow.events.iter()
+                    .map(|event| event.event_id.clone()).collect::<Vec<_>>();
+                let edges = flow.correlation_edges.iter().map(|edge| (
+                    edge.source_event_id.clone(), edge.target_event_id.clone(),
+                    edge.rule_id.clone(), edge.confidence.clone(),
+                )).collect::<BTreeSet<_>>();
+                (flow.session_id.clone(), flow.interfaces.clone(), event_ids, edges)
+            };
+            assert_eq!(summary(&incremental_flow), summary(&full_flow),
+                "one-shard and three-shard 5G publication diverged for {session_id}");
+        }
     }
 
     #[cfg(unix)]

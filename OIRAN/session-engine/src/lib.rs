@@ -484,7 +484,16 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
                         if context_pseudonym == event_pseudonym
                 );
                 let exact_bearer = !context.erab_teids.is_disjoint(&event_teids);
-                (exact_pseudonym || exact_bearer)
+                // A subscriber can legitimately have several historical S1
+                // contexts in an append-only dataset. When bearer evidence
+                // is present it is the session key; the subscriber proof is
+                // only a fallback when neither side exposes an E-RAB/F-TEID.
+                let context_has_bearer = !context.erab_teids.is_empty();
+                (if context_has_bearer && !event_teids.is_empty() {
+                    exact_bearer
+                } else {
+                    exact_pseudonym
+                })
                     && within_lte_window(event, &context.s1_events)
             })
             .map(|(index, _)| index)
@@ -631,16 +640,27 @@ pub fn discover_lte_sessions(events: &[EventRecord]) -> Vec<LteSession> {
     // events. Raw identity is never surfaced.
     for event in lte.iter().copied().filter(|event| event.interface == "S6a") {
         let Some(pseudonym) = lte_subscriber_pseudonym(event) else { continue };
+        let has_owned_s11_match = lte_contexts.iter().any(|context| {
+            context
+                .s11_events
+                .iter()
+                .filter_map(|control| lte_subscriber_pseudonym(control))
+                .any(|control_pseudonym| control_pseudonym == pseudonym)
+        });
         let owners = lte_contexts
             .iter()
             .enumerate()
             .filter(|(_, context)| {
-                context.pseudonym.as_deref() == Some(pseudonym)
-                    || context
+                let via_owned_s11 = context
                         .s11_events
                         .iter()
                         .filter_map(|control| lte_subscriber_pseudonym(control))
-                        .any(|control_pseudonym| control_pseudonym == pseudonym)
+                        .any(|control_pseudonym| control_pseudonym == pseudonym);
+                if has_owned_s11_match {
+                    via_owned_s11
+                } else {
+                    context.pseudonym.as_deref() == Some(pseudonym)
+                }
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
@@ -916,7 +936,11 @@ where
             source_event_count = source_event_count.saturating_add(1);
             compact_publication_event(&mut event);
             let key = publication_semantic_key(&event);
-            representatives.entry(key).or_insert(event);
+            // A shard list is the logical concatenation of its immutable
+            // files. Match the monolithic reader's last-observation-wins
+            // contract exactly: retaining the first observation made a
+            // historical shard shadow later LTE/5G evidence.
+            representatives.insert(key, event);
             if source_event_count % 100_000 == 0 {
                 progress(source_event_count, representatives.len());
             }
@@ -936,6 +960,7 @@ fn compact_publication_event(event: &mut EventRecord) {
         "enb_ue_s1ap_id",
         "mme_ue_s1ap_id",
         "erab_teid",
+        "f_teid",
         "bearer_f_teid",
         "f_teid_iface",
         "bearer_f_teid_iface",
@@ -1036,6 +1061,7 @@ fn publication_semantic_key(event: &EventRecord) -> String {
         "enb_ue_s1ap_id",
         "mme_ue_s1ap_id",
         "erab_teid",
+        "f_teid",
         "bearer_f_teid",
         "f_teid_iface",
         "bearer_f_teid_iface",
@@ -1093,8 +1119,33 @@ fn publication_semantic_key(event: &EventRecord) -> String {
         })
         .collect::<Vec<String>>()
         .join("|");
+    // Setup/establishment messages are procedure occurrences, not periodic
+    // state samples. Two packets with the same tunnel/session material are
+    // both legitimate (for example a second PDU resource setup in one UE
+    // context). Preserve their canonical packet occurrence while keeping
+    // high-volume PFCP modifications and GTP-U data compacted.
+    let procedure = event
+        .message_name
+        .to_ascii_lowercase()
+        .replace(' ', "")
+        .replace('-', "");
+    let preserve_occurrence = (protocol_is(event, "NGAP")
+        && procedure.contains("pdusessionresourcesetup"))
+        || (protocol_is(event, "S1AP")
+            && (procedure.contains("initialcontextsetup")
+                || procedure.contains("erabsetup")))
+        || (protocol_is(event, "GTPv2-C") && procedure.contains("createsession"))
+        || (protocol_is(event, "PFCP") && procedure.contains("sessionestablishment"));
+    let distinct_procedure_occurrence = preserve_occurrence
+        .then(|| {
+            event.packet_references.first().map_or_else(
+                || event.event_id.clone(),
+                |packet| format!("{}:{}", event.capture_id, packet.packet_number),
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         event.capture_point_id,
         event.interface,
         event.protocol,
@@ -1105,6 +1156,7 @@ fn publication_semantic_key(event: &EventRecord) -> String {
         event.parent_event_id.as_deref().unwrap_or(""),
         identifiers,
         tunnel_material,
+        distinct_procedure_occurrence,
     )
 }
 
@@ -2375,7 +2427,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn streaming_index_retains_only_ids_and_compact_semantic_representatives() {
+    fn streaming_index_preserves_distinct_setup_occurrences() {
         use std::io::Write;
 
         let path = std::env::temp_dir().join(format!(
@@ -2427,12 +2479,9 @@ mod tests {
         assert_eq!(index.event_ids.len(), 2);
         assert!(index.event_ids.contains("event-1"));
         assert!(index.event_ids.contains("event-2"));
-        assert_eq!(index.events.len(), 1, "one semantic state is retained");
-        let representative = &index.events[0];
-        assert_eq!(
-            representative.event_id, "event-2",
-            "latest observation wins"
-        );
+        assert_eq!(index.events.len(), 2, "both setup packets are legitimate events");
+        let representative = &index.events[1];
+        assert_eq!(representative.event_id, "event-2");
         assert!(representative.timestamp.is_empty());
         assert!(representative.raw_payload_reference.is_empty());
         assert!(representative

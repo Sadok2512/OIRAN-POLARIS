@@ -9,6 +9,17 @@
 - `GET /packets/:capture_id/:packet_number/dissect` fournit la dissection `tshark -V` d'une référence déjà connue, uniquement à l'operator et sans accepter de chemin client.
 - La collecte claire est un canal privé fondé sur les paquets sources ; les événements et datasets publiés restent pseudonymisés.
 
+## OIRAN API 2.11.16 — 2026-11-11 — gate phase 13 mesuré et scan callflow accéléré
+
+- Le compteur `PUBLICATION_RSS_TRACE elapsed_ms` démarre désormais sur la ligne `CONTINUOUS_PUBLICATION_INCREMENTAL phase=begin`, avant le décodage du lot, afin de coïncider avec la méthode chronométrique du gate fantôme. Cette origine est transmise explicitement dans la pile de publication ; aucun chrono global n'est partagé entre threads.
+- Pour un index compact d'au plus 262 144 représentants, la phase 10 reconstruit les callflows depuis cet index déjà en mémoire, par lots bornés de 32, puis le libère. **Seuil 262 144 : décision coordination 2026-11-11**, validée sur 240 097 représentants, pic 1,39 GiB, plafond 2 GiB. Au-delà, le chemin disque reste actif. Un test compare désormais les deux chemins : mêmes `event_id`, callflows et arêtes.
+- Cause LTE : la publication lisait bien tous les shards ensemble, mais `compact_publication_event` supprimait `f_teid`; en outre, le lecteur multi-shards gardait le premier représentant historique alors que le lecteur monolithique gardait le dernier. Les preuves S11/S5-C disparaissaient donc avant `discover_lte_sessions`, et un pseudonyme réutilisé sur plusieurs contextes rendait l'attachement ambigu. `f_teid` est stable, le remplacement est identique en monolithe et en shards, et l'E-RAB/F-TEID prime désormais sur le pseudonyme pour choisir le contexte LTE. S6a s'attache au contexte déjà ancré sur S11.
+- Cause 5G : la compaction traitait comme doublons trois occurrences de procédure distinctes. Les événements perdus étaient `evt-ddfb813e4307a5da`, `evt-22e6637edeb40b0b` et `evt-3567800af548bd0b` (seconds Setup NGAP et seconde réponse d'établissement PFCP). Les procédures de setup/établissement conservent maintenant leur occurrence canonique ; les modifications PFCP à haute fréquence restent compactées.
+- Le test d'équivalence publie le même jeu 5G en un shard puis trois lots et compare IDs de session, interfaces, événements et arêtes. Le cas LTE répartit S1-MME/S11/S1-U/S5-C/S5-U/Sxab/S6a sur trois lots et impose le même résultat global.
+- La décision de coordination classe le critère 5 de la recette 2.11.15 en faux échec : à l'arrêt `pending=0`, `closed_not_ingested_segments=0`, sans rotation entre 22:44 et 23:04 ; l'ingestion est validée.
+- La recette 2.11.16 utilise exclusivement une copie figée du dataset de production et du ring sous `/var/tmp`, jamais un lower vivant (`docs/OIRAN_2_11_16_FROZEN_SCALE_GATE.md`).
+- Versions : `oiran-api` et web 2.11.16, `live-probe` 0.5.10, `session-engine` 0.5.12. Décodeurs et moteur de corrélation inchangés.
+
 ## OIRAN API 2.11.15 — 2026-11-11 — shard 0 strictement immuable sur overlayfs
 
 - La migration du monolithe historique en shard 0 ne crée plus de hard-link dans `.dataset-next` et ne renomme plus le répertoire `dataset`. Le manifeste référence directement `oiran_events.jsonl`; ce fichier n'est ouvert qu'en lecture et ne subit ni écriture, ni renommage, ni `fsync`, ni changement de métadonnées.
