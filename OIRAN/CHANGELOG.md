@@ -4,6 +4,8 @@
 
 - Registre borné à dix Live Traces avec recherche pseudonyme ou coffre d'identités, état armé, expiration automatique et mutations protégées par CSRF.
 - Flux SSE reprenable par `Last-Event-ID`, heartbeat 15 s et tampon borné à 2 000 événements par trace.
+- Coffre déplacé vers `/var/lib/oiran/identity-vault/vault.json`, répertoire dédié 0700 appartenant au compte du service; aucun changement de mode de `/var/lib/oiran`.
+- Préflight de démarrage explicite des chemins requis avec erreur `ACCESS_CHECK_FAILED path=… mode=…` au lieu d'un `Permission denied` sans contexte.
 
 ## OIRAN API 2.12.0 — 2026-11-11 — coffre d'identités operator
 

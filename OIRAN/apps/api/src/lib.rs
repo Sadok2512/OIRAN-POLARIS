@@ -49,6 +49,9 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use tower_http::{
     compression::CompressionLayer,
     services::{ServeDir, ServeFile},
@@ -67,6 +70,8 @@ pub const PLATFORM_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const WEB_FRONTEND_VERSION: &str = env!("OIRAN_WEB_FRONTEND_VERSION");
 const HEARTBEAT_ONLINE_WINDOW_SECONDS: u64 = 15;
 const CSRF_HEADER: &str = "x-csrf-token";
+const DEFAULT_IDENTITY_VAULT_DIR: &str = "/var/lib/oiran/identity-vault";
+const DEFAULT_IDENTITY_VAULT_PATH: &str = "/var/lib/oiran/identity-vault/vault.json";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -177,13 +182,119 @@ impl ApiConfig {
             pseudonym_key_path: None,
             identity_vault_path: std::env::var_os("OIRAN_IDENTITY_VAULT_PATH")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/var/lib/oiran/identity-vault.json")),
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_VAULT_DIR).join("vault.json")),
         }
     }
 }
 
+fn validate_identity_vault_path(config: &ApiConfig) -> Result<(), String> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    let path = &config.identity_vault_path;
+    let allowed = path == FsPath::new(DEFAULT_IDENTITY_VAULT_PATH)
+        || path.starts_with("/var/tmp/oiran-phantom")
+        || path.starts_with(config.workspace.join("runtime"));
+    if !allowed || path.parent() == Some(FsPath::new("/var/lib/oiran")) {
+        return Err(format!(
+            "identity vault path is not isolated path={}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn access_check(path: &FsPath, flags: i32, required: &str) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        format!(
+            "ACCESS_CHECK_FAILED path={} mode=UNAVAILABLE required={required} error={error}",
+            path.display()
+        )
+    })?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "ACCESS_CHECK_FAILED path={} mode={mode:04o} required={required} error=invalid-path",
+            path.display()
+        )
+    })?;
+    if unsafe { libc::access(c_path.as_ptr(), flags) } != 0 {
+        return Err(format!(
+            "ACCESS_CHECK_FAILED path={} mode={mode:04o} required={required} error={}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn access_check_creatable(path: &FsPath, required: &str) -> Result<(), String> {
+    if path.exists() {
+        return access_check(path, libc::R_OK | libc::W_OK | libc::X_OK, required);
+    }
+    let mut ancestor = path.parent();
+    while let Some(candidate) = ancestor {
+        if candidate.exists() {
+            return access_check(candidate, libc::W_OK | libc::X_OK, required).map_err(|_| {
+                let mode = fs::metadata(candidate)
+                    .map(|metadata| metadata.permissions().mode() & 0o7777)
+                    .unwrap_or(0);
+                format!(
+                    "ACCESS_CHECK_FAILED path={} mode={mode:04o} required={required} requested_path={}",
+                    candidate.display(),
+                    path.display()
+                )
+            });
+        }
+        ancestor = candidate.parent();
+    }
+    Err(format!(
+        "ACCESS_CHECK_FAILED path={} mode=UNAVAILABLE required={required} error=no-existing-parent",
+        path.display()
+    ))
+}
+
+fn startup_access_checks(config: &ApiConfig) -> Result<(), String> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    validate_identity_vault_path(config)?;
+    access_check(&config.workspace, libc::R_OK | libc::X_OK, "workspace-read")?;
+    if config.capture_root.exists() {
+        access_check(&config.capture_root, libc::R_OK | libc::X_OK, "capture-root-read")?;
+    } else {
+        access_check_creatable(&config.capture_root, "capture-root-create")?;
+    }
+    if let Some(source) = config.continuous_import_source.as_deref() {
+        access_check(source, libc::R_OK | libc::X_OK, "continuous-source-read")?;
+    }
+    let vault_directory = config
+        .identity_vault_path
+        .parent()
+        .ok_or_else(|| "identity vault path has no parent".to_owned())?;
+    access_check_creatable(vault_directory, "identity-vault-create")?;
+    for directory in [
+        &config.derived_import_root,
+        &config.lte_evidence_root,
+        &config.lte_evidence_bundle_root,
+    ] {
+        access_check_creatable(directory, "service-state-create")?;
+    }
+    if config.probe_registry_path.exists() {
+        access_check(
+            &config.probe_registry_path,
+            libc::R_OK | libc::W_OK,
+            "probe-registry-read-write",
+        )?;
+    } else if let Some(parent) = config.probe_registry_path.parent() {
+        access_check_creatable(parent, "probe-registry-create")?;
+    }
+    Ok(())
+}
+
 impl AppState {
     pub fn load(config: ApiConfig) -> Result<Self, String> {
+        startup_access_checks(&config)?;
         let workspace = config.workspace.canonicalize().map_err(io_error)?;
         if !config.capture_root.starts_with(&workspace)
             && config.capture_root != FsPath::new("/var/lib/oiran/captures")
@@ -249,9 +360,7 @@ impl AppState {
         if !config.reference_dataset_enabled {
             return Self::load_operational(config, capture_manager);
         }
-        if !config.identity_vault_path.starts_with("/var/lib/oiran") && !cfg!(test) {
-            return Err("identity vault path escapes /var/lib/oiran".into());
-        }
+        validate_identity_vault_path(&config)?;
         let identity_vault = IdentityVault::load(config.identity_vault_path.clone())?;
         let workspace = config.workspace.canonicalize().map_err(io_error)?;
         let dataset_dir = config.dataset_dir.canonicalize().map_err(io_error)?;
@@ -461,9 +570,7 @@ impl AppState {
         config: ApiConfig,
         capture_manager: CaptureManager,
     ) -> Result<Self, String> {
-        if !config.identity_vault_path.starts_with("/var/lib/oiran") && !cfg!(test) {
-            return Err("identity vault path escapes /var/lib/oiran".into());
-        }
+        validate_identity_vault_path(&config)?;
         let identity_vault = IdentityVault::load(config.identity_vault_path.clone())?;
         let workspace = config.workspace.canonicalize().map_err(io_error)?;
         let capture_root = config.capture_root;
@@ -4300,6 +4407,30 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         path
     }
+
+    #[test]
+    fn identity_vault_default_is_below_the_dedicated_directory() {
+        assert_eq!(DEFAULT_IDENTITY_VAULT_DIR, "/var/lib/oiran/identity-vault");
+        assert_eq!(DEFAULT_IDENTITY_VAULT_PATH, "/var/lib/oiran/identity-vault/vault.json");
+        assert_ne!(
+            FsPath::new(DEFAULT_IDENTITY_VAULT_PATH).parent(),
+            Some(FsPath::new("/var/lib/oiran"))
+        );
+    }
+
+    #[test]
+    fn access_check_failure_reports_exact_path_and_mode() {
+        let root = temporary_directory("access-check");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("not-executable");
+        fs::write(&path, b"test").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = access_check(&path, libc::X_OK, "executable").unwrap_err();
+        assert!(error.contains("ACCESS_CHECK_FAILED"));
+        assert!(error.contains(&format!("path={}", path.display())));
+        assert!(error.contains("mode=0600"));
+        let _ = fs::remove_dir_all(root);
+    }
     fn test_config(root: &FsPath, label: &str) -> ApiConfig {
         let mut config = ApiConfig::from_workspace(root);
         config.probe_registry_path = temporary_directory(label).join("probe-registry.json");
@@ -4308,8 +4439,9 @@ mod tests {
         config.lte_evidence_bundle_root = evidence.join("inbox");
         let key_dir = temporary_directory(&format!("{label}-pseudonym"));
         config.pseudonym_key_path = Some(key_dir.join("pseudonym.key"));
-        config.identity_vault_path =
-            temporary_directory(&format!("{label}-identities")).join("identity-vault.json");
+        let identity_directory = temporary_directory(&format!("{label}-identities"));
+        fs::set_permissions(&identity_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        config.identity_vault_path = identity_directory.join("identity-vault.json");
         config
     }
     fn state() -> AppState {

@@ -42,12 +42,17 @@ pub struct IdentityVault {
 impl IdentityVault {
     pub fn load(path: PathBuf) -> Result<Self, String> {
         let parent = path.parent().ok_or("identity vault path has no parent")?;
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string())?;
+        if parent.exists() {
+            ensure_private_directory(parent)?;
+        } else {
+            fs::create_dir_all(parent).map_err(|error| access_error(parent, &error))?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .map_err(|error| access_error(parent, &error))?;
+            ensure_private_directory(parent)?;
+        }
         let document = if path.exists() {
             ensure_private_file(&path)?;
-            let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+            let bytes = fs::read(&path).map_err(|error| access_error(&path, &error))?;
             let parsed: VaultDocument =
                 serde_json::from_slice(&bytes).map_err(|_| "identity vault is invalid")?;
             if parsed.schema_version != SCHEMA_VERSION {
@@ -135,14 +140,45 @@ impl IdentityVault {
     }
 }
 
+fn access_error(path: &Path, error: &std::io::Error) -> String {
+    let mode = fs::metadata(path)
+        .map(|metadata| format!("{:04o}", metadata.permissions().mode() & 0o7777))
+        .unwrap_or_else(|_| "UNAVAILABLE".into());
+    format!(
+        "ACCESS_CHECK_FAILED path={} mode={mode} error={error}",
+        path.display()
+    )
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|error| access_error(path, &error))?;
+    let mode = metadata.permissions().mode() & 0o777;
+    let service_uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || mode != 0o700 || metadata.uid() != service_uid {
+        return Err(format!(
+            "ACCESS_CHECK_FAILED path={} mode={mode:04o} owner_uid={} service_uid={service_uid} required=directory-0700-service-owned",
+            path.display(), metadata.uid()
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_private_file(path: &Path) -> Result<(), String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     let mode = metadata.permissions().mode() & 0o777;
     if mode != 0o600 {
-        return Err("identity vault permissions must be 0600".into());
+        return Err(format!(
+            "ACCESS_CHECK_FAILED path={} mode={mode:04o} required=file-0600",
+            path.display()
+        ));
     }
-    if !cfg!(test) && metadata.uid() != 0 {
-        return Err("identity vault owner must be root".into());
+    let service_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != service_uid {
+        return Err(format!(
+            "ACCESS_CHECK_FAILED path={} mode={mode:04o} owner_uid={} service_uid={service_uid} required=service-owned",
+            path.display(),
+            metadata.uid()
+        ));
     }
     Ok(())
 }
@@ -156,12 +192,12 @@ fn persist(path: &Path, document: &VaultDocument) -> Result<(), String> {
         .write(true)
         .mode(0o600)
         .open(&temporary)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| access_error(&temporary, &error))?;
     file.set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|error| error.to_string())?;
-    file.write_all(&bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
-    fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+        .map_err(|error| access_error(&temporary, &error))?;
+    file.write_all(&bytes).map_err(|error| access_error(&temporary, &error))?;
+    file.sync_all().map_err(|error| access_error(&temporary, &error))?;
+    fs::rename(&temporary, path).map_err(|error| access_error(path, &error))?;
     ensure_private_file(path)
 }
 
@@ -202,6 +238,7 @@ mod tests {
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(vault.for_session("test-session").unwrap().len(), 1);
         assert_eq!(vault.lookup("001010123456789").unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);
@@ -211,10 +248,31 @@ mod tests {
     fn wider_existing_permissions_fail_closed() {
         let root = root();
         fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let path = root.join("identity-vault.json");
         fs::write(&path, b"{}").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(IdentityVault::load(path).is_err());
+        let error = match IdentityVault::load(path.clone()) {
+            Ok(_) => panic!("insecure vault unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("ACCESS_CHECK_FAILED"));
+        assert!(error.contains(&format!("path={}", path.display())));
+        assert!(error.contains("mode=0644"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_parent_mode_is_never_rewritten() {
+        let root = root();
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = match IdentityVault::load(root.join("vault.json")) {
+            Ok(_) => panic!("insecure directory unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("mode=0755"));
+        assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o755);
         let _ = fs::remove_dir_all(root);
     }
 }
