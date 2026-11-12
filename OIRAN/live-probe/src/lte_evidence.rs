@@ -303,9 +303,17 @@ pub struct LteEvidenceStore {
 
 impl LteEvidenceStore {
     pub fn new(root: PathBuf) -> Result<Self, LteEvidenceError> {
-        fs::create_dir_all(root.join("datasets"))
-            .and_then(|_| fs::create_dir_all(root.join("exports")))
-            .map_err(|error| LteEvidenceError::new("LTE_STORE_UNAVAILABLE", error.to_string()))?;
+        if !root.exists() {
+            fs::create_dir_all(&root).map_err(|error| {
+                LteEvidenceError::new("LTE_STORE_CREATE_FAILED", error.to_string())
+            })?;
+        }
+        if !root.is_dir() {
+            return Err(LteEvidenceError::new(
+                "LTE_STORE_UNAVAILABLE",
+                format!("{} is not a directory", root.display()),
+            ));
+        }
         Ok(Self { root })
     }
 
@@ -1866,6 +1874,7 @@ fn epoch_ms() -> u128 {
 mod tests {
     use super::*;
     use session_engine::PacketRef;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
@@ -1879,6 +1888,20 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn opening_existing_read_only_store_does_not_create_children() {
+        let root = temp_root("read-only-open");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let store = LteEvidenceStore::new(root.clone()).unwrap();
+
+        assert_eq!(store.root, root);
+        assert!(!store.root.join("datasets").exists());
+        assert!(!store.root.join("exports").exists());
+        fs::set_permissions(&store.root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&store.root).unwrap();
     }
 
     fn event(

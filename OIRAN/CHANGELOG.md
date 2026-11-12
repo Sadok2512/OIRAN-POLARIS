@@ -1,5 +1,12 @@
 # Changelog
 
+## OIRAN API 2.14.3 — 2026-11-12 — contrôle d’accès au démarrage
+
+- Les racines `derived_import_root`, `lte_evidence_root` et `lte_evidence_bundle_root` déjà présentes exigent uniquement lecture et traversée (`R_OK|X_OK`). La création n’est exigée que lorsque la racine est absente; un montage de référence existant en lecture seule ne bloque donc plus le démarrage.
+- Le magasin LTE ne crée plus `datasets/` et `exports/` dans son constructeur. Les écritures restent paresseuses et renvoient leurs erreurs explicites de création, copie atomique ou finalisation depuis les routes d’import/export, sans faire échouer le service au démarrage.
+- Les contrôles du coffre d’identités et de `capture_root` sont inchangés. Tests ajoutés pour une racine existante en lecture seule et une racine absente sous un parent non inscriptible.
+- Versions : `oiran-api` 2.14.3 et `live-probe` 0.5.11; web, schémas, moteurs et décodeurs inchangés.
+
 ## OIRAN API 2.14.2 — 2026-11-12 — résolution publiée et index operator borné
 
 - Les routes événement consultent désormais l'union interrogeable commune : callflows statiques, datasets continus et sessions LTE d'évidence. Tout `event_id` renvoyé par une session est donc résolvable par `/events/:id` et `/events/:id/provenance`, y compris une session LTE limitée à S1-MME.

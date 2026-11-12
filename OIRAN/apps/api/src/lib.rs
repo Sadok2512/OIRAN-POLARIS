@@ -255,6 +255,41 @@ fn access_check_creatable(path: &FsPath, required: &str) -> Result<(), String> {
     ))
 }
 
+fn access_check_readable_or_creatable(
+    path: &FsPath,
+    read_required: &str,
+    create_required: &str,
+) -> Result<(), String> {
+    if path.exists() {
+        access_check(path, libc::R_OK | libc::X_OK, read_required)
+    } else {
+        access_check_creatable(path, create_required)
+    }
+}
+
+fn service_state_access_checks(config: &ApiConfig) -> Result<(), String> {
+    for (directory, read_required, create_required) in [
+        (
+            &config.derived_import_root,
+            "derived-import-read",
+            "derived-import-create",
+        ),
+        (
+            &config.lte_evidence_root,
+            "lte-evidence-read",
+            "lte-evidence-create",
+        ),
+        (
+            &config.lte_evidence_bundle_root,
+            "lte-evidence-bundle-read",
+            "lte-evidence-bundle-create",
+        ),
+    ] {
+        access_check_readable_or_creatable(directory, read_required, create_required)?;
+    }
+    Ok(())
+}
+
 fn startup_access_checks(config: &ApiConfig) -> Result<(), String> {
     if cfg!(test) {
         return Ok(());
@@ -274,13 +309,7 @@ fn startup_access_checks(config: &ApiConfig) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "identity vault path has no parent".to_owned())?;
     access_check_creatable(vault_directory, "identity-vault-create")?;
-    for directory in [
-        &config.derived_import_root,
-        &config.lte_evidence_root,
-        &config.lte_evidence_bundle_root,
-    ] {
-        access_check_creatable(directory, "service-state-create")?;
-    }
+    service_state_access_checks(config)?;
     if config.probe_registry_path.exists() {
         access_check(
             &config.probe_registry_path,
@@ -4624,6 +4653,56 @@ mod tests {
         assert!(error.contains(&format!("path={}", path.display())));
         assert!(error.contains("mode=0600"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_read_only_service_state_directories_pass_startup_checks() {
+        let root = temporary_directory("service-state-read-only");
+        let mut config = ApiConfig::from_workspace(&root);
+        config.derived_import_root = root.join("derived");
+        config.lte_evidence_root = root.join("lte-store");
+        config.lte_evidence_bundle_root = root.join("lte-bundles");
+        for path in [
+            &config.derived_import_root,
+            &config.lte_evidence_root,
+            &config.lte_evidence_bundle_root,
+        ] {
+            fs::create_dir_all(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        service_state_access_checks(&config).unwrap();
+
+        for path in [
+            &config.derived_import_root,
+            &config.lte_evidence_root,
+            &config.lte_evidence_bundle_root,
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn absent_service_state_directory_in_read_only_parent_is_explicit() {
+        let root = temporary_directory("service-state-missing");
+        let parent = root.join("read-only-parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let missing = parent.join("missing-derived-import");
+        let error = access_check_readable_or_creatable(
+            &missing,
+            "derived-import-read",
+            "derived-import-create",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("ACCESS_CHECK_FAILED"));
+        assert!(error.contains("required=derived-import-create"));
+        assert!(error.contains(&format!("requested_path={}", missing.display())));
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
     fn test_config(root: &FsPath, label: &str) -> ApiConfig {
         let mut config = ApiConfig::from_workspace(root);
