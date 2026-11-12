@@ -127,6 +127,17 @@ impl IdentityVault {
             .cloned()
             .collect())
     }
+
+    pub fn pseudonyms_for_value(&self, query: &str) -> Result<Vec<String>, String> {
+        let mut values = self
+            .lookup(query)?
+            .into_iter()
+            .filter_map(|observation| observation.subscriber_pseudonym)
+            .collect::<Vec<_>>();
+        values.sort();
+        values.dedup();
+        Ok(values)
+    }
 }
 
 fn access_error(path: &Path, error: &std::io::Error) -> String {

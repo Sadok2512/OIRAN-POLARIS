@@ -28,6 +28,10 @@ no LTE dataset or session is returned until approved, sanitized evidence is admi
   withheld.
 - `GET /api/v1/sessions/:id/callflow?limit=1..256&cursor=<event_id>`: bounded persisted
   Call Flow page. Cursor and limit errors fail closed.
+- `GET /api/v1/health`: `session_count` and `queryable_session_count` equal the
+  unfiltered union returned by `/sessions`. `published_session_count` counts only
+  sessions present in static and continuous published callflows, so it can be lower
+  when finalized LTE evidence contributes additional queryable sessions.
 
 ## Privacy and evidence rules
 

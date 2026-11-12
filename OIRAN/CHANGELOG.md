@@ -1,5 +1,10 @@
 # Changelog
 
+## OIRAN API 2.14.1 — 2026-11-12 — fusion 2.13.1 + 2.14.0
+
+- Fusion sans nouvelle fonctionnalité du Parcours abonné et de la chaîne TMSI 2.13.1 avec Live Trace et le coffre d'identités 2.14.0.
+- Le contrat `/health` documente `session_count` et `queryable_session_count` comme l'union interrogeable de `/sessions`; `published_session_count` reste le sous-ensemble publié par les callflows statiques et continus et peut donc être inférieur.
+
 ## OIRAN API 2.13.1 — 2026-11-12 — parcours LTE d'évidence
 
 - Cause du parcours vide localisée : `queryable_flows()` indexait les callflows statiques et continus, mais pas les callflows finalisés de `lte_evidence_store`; `/sessions` les ajoutait séparément. L'index commun charge désormais chaque callflow LTE référencé par un manifeste finalisé. Un artefact absent ou illisible produit un journal `SUBSCRIBER_JOURNEY_LTE_*_SKIPPED`, jamais un saut silencieux.
@@ -16,6 +21,13 @@
 - Les résumés de session exposent `subscriber_pseudonym`, `subscriber_session_count`, `previous_session_id` et `next_session_id`. Le coffre et les routes `/identities` de 2.12.0 restent inchangés.
 - L'écart `/health` 42 contre `/sessions` 44 provenait de deux ensembles : manifeste continu contre union interrogeable (datasets + preuves). `session_count` et `queryable_session_count` comptent désormais l'union de `/sessions`; le compteur plus étroit porte le nom `published_session_count`.
 - Versions : `oiran-api` et web 2.13.0, `decoder-nas` 0.4.0, `event-schema` 1.7.0, `session-engine` 0.5.13, `callflow-schema` 1.4.0.
+
+## 2.14.0
+
+- Registre borné à dix Live Traces avec recherche pseudonyme ou coffre d'identités, état armé, expiration automatique et mutations protégées par CSRF.
+- Flux SSE reprenable par `Last-Event-ID`, heartbeat 15 s et tampon borné à 2 000 événements par trace.
+- Coffre déplacé vers `/var/lib/oiran/identity-vault/vault.json`, répertoire dédié 0700 appartenant au compte du service; aucun changement de mode de `/var/lib/oiran`.
+- Préflight de démarrage explicite des chemins requis avec erreur `ACCESS_CHECK_FAILED path=… mode=…` au lieu d'un `Permission denied` sans contexte.
 
 ## OIRAN API 2.12.0 — 2026-11-11 — coffre d'identités operator
 
