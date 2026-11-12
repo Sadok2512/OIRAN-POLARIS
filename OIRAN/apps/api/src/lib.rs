@@ -9,6 +9,7 @@
 
 mod probe_registry;
 mod session_filters;
+mod identity_vault;
 
 use axum::{
     body::Body,
@@ -22,7 +23,8 @@ use axum::{
 use callflow_schema::{build_callflow, CallFlow};
 use dataset_registry::{CaptureRecord, DatasetRecord, DatasetRegistry};
 use disk_safety::{assess, capture_budget, measure_path, rotation_plan, Policy};
-use event_schema::sha256_hex;
+use event_schema::{pseudonym_subscriber_text, sha256_hex};
+use identity_vault::{IdentityObservation, IdentityVault};
 use live_probe::{
     load_dataset_events,
     lte_evidence::{
@@ -40,9 +42,10 @@ use session_engine::{
     ReconstructionHints,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path as FsPath, PathBuf},
+    process::Command,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -87,6 +90,7 @@ struct Inner {
     lte_evidence_bundle_root: PathBuf,
     operator_token_sha256: Option<String>,
     administrator_token_sha256: Option<String>,
+    identity_vault: IdentityVault,
     /// 2.10.0 : index des filtres Session Explorer (messages, causes,
     /// pseudonymes), construit au chargement depuis `flows` + mis à
     /// jour par `refresh_session_filter_index` quand le capture
@@ -124,6 +128,9 @@ pub struct ApiConfig {
     /// capture root so they neither touch the real filesystem nor collide
     /// with parallel tests.
     pub pseudonym_key_path: Option<PathBuf>,
+    /// Root-only identity evidence, deliberately outside the capture and
+    /// publication roots.
+    pub identity_vault_path: PathBuf,
 }
 
 impl ApiConfig {
@@ -167,6 +174,9 @@ impl ApiConfig {
             reference_dataset_enabled: cfg!(test)
                 || std::env::var("OIRAN_REFERENCE_DATASET_ENABLED").is_ok_and(|value| value == "1"),
             pseudonym_key_path: None,
+            identity_vault_path: std::env::var_os("OIRAN_IDENTITY_VAULT_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/var/lib/oiran/identity-vault.json")),
         }
     }
 }
@@ -238,6 +248,10 @@ impl AppState {
         if !config.reference_dataset_enabled {
             return Self::load_operational(config, capture_manager);
         }
+        if !config.identity_vault_path.starts_with("/var/lib/oiran") && !cfg!(test) {
+            return Err("identity vault path escapes /var/lib/oiran".into());
+        }
+        let identity_vault = IdentityVault::load(config.identity_vault_path.clone())?;
         let workspace = config.workspace.canonicalize().map_err(io_error)?;
         let dataset_dir = config.dataset_dir.canonicalize().map_err(io_error)?;
         let callflow_json = config.callflow_json.canonicalize().map_err(io_error)?;
@@ -436,6 +450,7 @@ impl AppState {
                 lte_evidence_bundle_root,
                 operator_token_sha256: config.operator_token_sha256,
                 administrator_token_sha256: config.administrator_token_sha256,
+                identity_vault,
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -445,6 +460,10 @@ impl AppState {
         config: ApiConfig,
         capture_manager: CaptureManager,
     ) -> Result<Self, String> {
+        if !config.identity_vault_path.starts_with("/var/lib/oiran") && !cfg!(test) {
+            return Err("identity vault path escapes /var/lib/oiran".into());
+        }
+        let identity_vault = IdentityVault::load(config.identity_vault_path.clone())?;
         let workspace = config.workspace.canonicalize().map_err(io_error)?;
         let capture_root = config.capture_root;
         if !capture_root.starts_with(&workspace)
@@ -497,6 +516,7 @@ impl AppState {
                 lte_evidence_bundle_root,
                 operator_token_sha256: config.operator_token_sha256,
                 administrator_token_sha256: config.administrator_token_sha256,
+                identity_vault,
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -623,10 +643,16 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/sessions/:id/events", get(session_events))
         .route("/sessions/:id/callflow", get(session_callflow))
         .route("/sessions/:id/correlations", get(session_correlations))
+        .route("/sessions/:id/identities", get(session_identities))
+        .route("/identities", get(identity_lookup))
         .route("/events/:id", get(event))
         .route("/events/:id/provenance", get(provenance))
         .route("/packets", get(packets))
         .route("/packets/:id", get(packet))
+        .route(
+            "/packets/:capture_id/:packet_number/dissect",
+            get(packet_dissect),
+        )
         .route("/correlation/edges", get(correlation_edges))
         .route("/correlation/rules", get(correlation_rules))
         .route("/exports/callflow/:id", get(export_callflow))
@@ -3040,6 +3066,319 @@ async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Respo
     )
 }
 
+#[derive(Deserialize)]
+struct IdentityLookupQuery {
+    q: String,
+}
+
+#[derive(Clone)]
+struct PacketIdentityEvidence {
+    event_id: String,
+    capture_id: String,
+    packet_number: u64,
+    message_name: String,
+    subscriber_pseudonym: Option<String>,
+}
+
+const IDENTITY_TSHARK_FIELDS: &[&str] = &[
+    "frame.number",
+    "e212.imsi",
+    "diameter.User-Name",
+    "gsm_a.tmsi",
+    "3gpp.tmsi",
+    "ngap.aMFRegionID",
+    "ngap.aMFSetID",
+    "ngap.aMFPointer",
+    "ngap.fiveG_TMSI",
+    "s1ap.mME_Group_ID",
+    "s1ap.mME_Code",
+    "s1ap.m_TMSI",
+    "gsm_a.imei",
+    "gsm_a.imeisv",
+    "gtpv2.mei",
+    "diameter.IMEI",
+    "diameter.user_equipment_info.imeisv",
+    "e164.msisdn",
+    "diameter.MSISDN",
+];
+
+fn session_flow(state: &AppState, id: &str) -> Option<CallFlow> {
+    flow_for(state, id)
+        .cloned()
+        .or_else(|| live_flow_for(state, id).map(|(_, flow)| flow))
+}
+
+fn decoded_pseudonym(value: &Value) -> Option<String> {
+    match value {
+        Value::Array(items) => items.iter().find_map(decoded_pseudonym),
+        Value::Object(map) => {
+            let direct = map
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| matches!(*name, "subscriber_pseudonym" | "imsi_pseudonym"))
+                .and_then(|_| map.get("value").and_then(Value::as_str))
+                .map(str::to_owned);
+            direct.or_else(|| map.values().find_map(decoded_pseudonym))
+        }
+        _ => None,
+    }
+}
+
+fn split_field(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+}
+
+fn identity_digits(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .strip_prefix("imsi-")
+        .or_else(|| value.trim().strip_prefix("IMSI-"))
+        .unwrap_or(value.trim());
+    let digits = value.chars().filter(char::is_ascii_digit).collect::<String>();
+    (digits.len() >= 5).then_some(digits)
+}
+
+fn canonical_tmsi(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let parsed = if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u32>().ok().or_else(|| u32::from_str_radix(trimmed, 16).ok())
+    }?;
+    Some(format!("0x{parsed:08X}"))
+}
+
+fn identity_role(message_name: &str) -> &'static str {
+    let lower = message_name.to_ascii_lowercase();
+    if ["accept", "reallocation command", "configuration update command"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        "assigned"
+    } else {
+        "presented"
+    }
+}
+
+fn push_identity(
+    output: &mut Vec<IdentityObservation>,
+    evidence: &PacketIdentityEvidence,
+    kind: &str,
+    value: String,
+    value_type: Option<&str>,
+    role: &str,
+    subscriber_pseudonym: Option<String>,
+) {
+    if value.is_empty() {
+        return;
+    }
+    output.push(IdentityObservation {
+        session_id: String::new(),
+        subscriber_pseudonym,
+        kind: kind.into(),
+        value,
+        value_type: value_type.map(str::to_owned),
+        role: role.into(),
+        event_id: evidence.event_id.clone(),
+        capture_id: evidence.capture_id.clone(),
+        packet_number: evidence.packet_number,
+    });
+}
+
+fn tshark_identities(
+    state: &AppState,
+    session_id: &str,
+    flow: &CallFlow,
+) -> Result<Vec<IdentityObservation>, String> {
+    let mut by_file = BTreeMap::<PathBuf, BTreeMap<u64, PacketIdentityEvidence>>::new();
+    for event in flow.events.iter().take(4096) {
+        let pseudonym = decoded_pseudonym(&event.decoded_ie_tree);
+        for reference in &event.packet_references {
+            let source = PathBuf::from(&reference.source_file);
+            if !source.is_file() {
+                continue;
+            }
+            by_file.entry(source).or_default().entry(reference.packet_number).or_insert_with(|| {
+                PacketIdentityEvidence {
+                    event_id: event.event_id.clone(),
+                    capture_id: event.capture_id.clone(),
+                    packet_number: reference.packet_number,
+                    message_name: event.message_name.clone(),
+                    subscriber_pseudonym: pseudonym.clone(),
+                }
+            });
+        }
+    }
+    let mut observations = Vec::new();
+    for (source, packets) in by_file {
+        let filter = packets
+            .keys()
+            .map(|number| format!("frame.number == {number}"))
+            .collect::<Vec<_>>()
+            .join(" || ");
+        let mut command = Command::new("tshark");
+        command.args(["-n", "-r"]).arg(&source).args(["-Y", &filter, "-T", "fields"]);
+        for field in IDENTITY_TSHARK_FIELDS {
+            command.args(["-e", field]);
+        }
+        command.args(["-E", "separator=\t", "-E", "quote=n", "-E", "occurrence=a", "-E", "aggregator=,"]);
+        let result = command.output().map_err(|_| "TSHARK_UNAVAILABLE")?;
+        if !result.status.success() {
+            return Err("TSHARK_DISSECTION_FAILED".into());
+        }
+        let stdout = String::from_utf8(result.stdout).map_err(|_| "TSHARK_OUTPUT_INVALID")?;
+        for line in stdout.lines() {
+            let columns = line.split('\t').collect::<Vec<_>>();
+            let packet_number = columns.first().and_then(|value| value.parse::<u64>().ok());
+            let Some(evidence) = packet_number.and_then(|number| packets.get(&number)) else { continue };
+            let role = identity_role(&evidence.message_name);
+            let field = |index: usize| columns.get(index).copied().unwrap_or("");
+            for raw in split_field(field(1)).chain(split_field(field(2))) {
+                if let Some(imsi) = identity_digits(raw) {
+                    let pseudo = Some(pseudonym_subscriber_text(
+                        state.inner.capture_manager.pseudonym_key().as_ref(),
+                        imsi.as_bytes(),
+                    ));
+                    push_identity(&mut observations, evidence, "imsi", imsi, Some("IMSI"), role, pseudo);
+                }
+            }
+            let tmsi = split_field(field(3))
+                .chain(split_field(field(4)))
+                .chain(split_field(field(8)))
+                .chain(split_field(field(11)))
+                .find_map(canonical_tmsi);
+            if let Some(m_tmsi) = tmsi {
+                let pseudo = evidence.subscriber_pseudonym.clone();
+                push_identity(&mut observations, evidence, "m_tmsi", m_tmsi.clone(), Some("M-TMSI"), role, pseudo.clone());
+                let is_5g = !field(8).is_empty();
+                let components = if is_5g {
+                    [field(5), field(6), field(7), field(8)].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("-")
+                } else {
+                    [field(9), field(10), field(11)].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("-")
+                };
+                let temporary = if components.is_empty() { m_tmsi.clone() } else { components };
+                push_identity(&mut observations, evidence, "s_tmsi", temporary.clone(), Some(if is_5g { "5G-S-TMSI" } else { "S-TMSI" }), role, pseudo.clone());
+                if role == "assigned" {
+                    push_identity(&mut observations, evidence, "tmsi", temporary, Some(if is_5g { "5G-GUTI" } else { "GUTI" }), role, pseudo);
+                }
+            }
+            for raw in split_field(field(12)).chain(split_field(field(14))).chain(split_field(field(15))) {
+                if let Some(imei) = identity_digits(raw) {
+                    push_identity(&mut observations, evidence, "imei", imei, Some("IMEI"), role, evidence.subscriber_pseudonym.clone());
+                }
+            }
+            for raw in split_field(field(13)).chain(split_field(field(16))) {
+                if let Some(imeisv) = identity_digits(raw) {
+                    push_identity(&mut observations, evidence, "imei", imeisv, Some("IMEISV"), role, evidence.subscriber_pseudonym.clone());
+                }
+            }
+            for raw in split_field(field(17)).chain(split_field(field(18))) {
+                if let Some(msisdn) = identity_digits(raw) {
+                    push_identity(&mut observations, evidence, "msisdn", msisdn, Some("MSISDN"), role, evidence.subscriber_pseudonym.clone());
+                }
+            }
+        }
+    }
+    for observation in &mut observations {
+        observation.session_id = session_id.to_owned();
+    }
+    Ok(observations)
+}
+
+fn hydrate_identities(state: &AppState, session_id: &str) -> Result<(), String> {
+    let Some(flow) = session_flow(state, session_id) else {
+        return Err("SESSION_NOT_FOUND".into());
+    };
+    let observations = tshark_identities(state, session_id, &flow)?;
+    state.inner.identity_vault.upsert(observations)
+}
+
+fn identity_bundle(observations: Vec<IdentityObservation>) -> Value {
+    let latest = |kind: &str| observations.iter().rev().find(|item| item.kind == kind);
+    let evidence = |item: &IdentityObservation| json!({
+        "value":item.value,"type":item.value_type,"role":item.role,"event_id":item.event_id,
+        "capture_id":item.capture_id,"packet_number":item.packet_number,"cap_seq":format!("{}·{}",item.capture_id,item.packet_number)
+    });
+    let all = |kind: &str| observations.iter().filter(|item| item.kind == kind).map(evidence).collect::<Vec<_>>();
+    json!({
+        "imsi":latest("imsi").map(|item|item.value.clone()),
+        "imsi_proof":latest("imsi").map(evidence),
+        "msisdn":latest("msisdn").map(|item|item.value.clone()),
+        "msisdn_proof":latest("msisdn").map(evidence),
+        "imei":latest("imei").map(evidence),
+        "tmsi":all("tmsi"),
+        "s_tmsi":all("s_tmsi"),
+        "m_tmsi":all("m_tmsi"),
+        "subscriber_pseudonym":observations.iter().find_map(|item|item.subscriber_pseudonym.clone()),
+    })
+}
+
+fn operator_envelope(data: Value) -> Response {
+    Json(json!({"data":data,"meta":{"api_version":API_VERSION,"identity_access":"operator"}})).into_response()
+}
+
+async fn session_identities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) = require_operator(&state, &headers) {
+        return response;
+    }
+    if let Err(error) = hydrate_identities(&state, &id) {
+        return match error.as_str() {
+            "SESSION_NOT_FOUND" => api_error(StatusCode::NOT_FOUND, &error, "unknown session id"),
+            "TSHARK_UNAVAILABLE" => api_error(StatusCode::NOT_IMPLEMENTED, &error, "packet dissector unavailable"),
+            _ => api_error(StatusCode::INTERNAL_SERVER_ERROR, "IDENTITY_VAULT_FAILED", "identity evidence could not be loaded"),
+        };
+    }
+    match state.inner.identity_vault.for_session(&id) {
+        Ok(observations) => operator_envelope(identity_bundle(observations)),
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "IDENTITY_VAULT_FAILED", "identity evidence could not be loaded"),
+    }
+}
+
+async fn identity_lookup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<IdentityLookupQuery>,
+) -> Response {
+    if let Err(response) = require_operator(&state, &headers) {
+        return response;
+    }
+    let q = query.q.trim();
+    if q.len() < 4 || q.len() > 128 {
+        return api_error(StatusCode::BAD_REQUEST, "IDENTITY_QUERY_INVALID", "identity query length is invalid");
+    }
+    let mut matches = match state.inner.identity_vault.lookup(q) {
+        Ok(matches) => matches,
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "IDENTITY_VAULT_FAILED", "identity evidence could not be loaded"),
+    };
+    if matches.is_empty() {
+        let session_ids = state
+            .inner
+            .capture_manager
+            .datasets()
+            .into_iter()
+            .flat_map(|dataset| dataset.session_ids)
+            .chain(state.inner.flows.keys().cloned())
+            .collect::<BTreeSet<_>>();
+        for session_id in session_ids {
+            let _ = hydrate_identities(&state, &session_id);
+        }
+        matches = state.inner.identity_vault.lookup(q).unwrap_or_default();
+    }
+    let sessions = matches.iter().map(|item| item.session_id.clone()).collect::<BTreeSet<_>>();
+    let subscriber_pseudonym = matches.iter().find_map(|item| item.subscriber_pseudonym.clone());
+    operator_envelope(json!({"sessions":sessions,"subscriber_pseudonym":subscriber_pseudonym,"matches":matches.into_iter().map(|item|json!({
+        "session_id":item.session_id,"subscriber_pseudonym":item.subscriber_pseudonym,"type":item.kind,
+        "event_id":item.event_id,"capture_id":item.capture_id,"packet_number":item.packet_number
+    })).collect::<Vec<_>>() }))
+}
+
 async fn session_procedures(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     if let Some(flow) = flow_for(&state, &id) {
         return ok(json!(flow.procedures)).into_response();
@@ -3389,6 +3728,51 @@ async fn packet(State(state): State<AppState>, Path(id): Path<String>) -> Respon
                 "unknown packet id",
             )
         })
+}
+
+async fn packet_dissect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((capture_id, packet_number)): Path<(String, u64)>,
+) -> Response {
+    if let Err(response) = require_operator(&state, &headers) {
+        return response;
+    }
+    let packet = packet_values(&state).into_iter().find(|packet| {
+        packet["capture_id"] == capture_id
+            && packet["packet_number"].as_u64() == Some(packet_number)
+    });
+    let Some(packet) = packet else {
+        return api_error(StatusCode::NOT_FOUND, "PACKET_NOT_FOUND", "unknown packet reference");
+    };
+    let Some(source) = packet["source_file"].as_str().map(PathBuf::from).filter(|path| path.is_file()) else {
+        return api_error(StatusCode::NOT_FOUND, "CAPTURE_SOURCE_NOT_FOUND", "capture source is unavailable");
+    };
+    let filter = format!("frame.number == {packet_number}");
+    let result = Command::new("tshark")
+        .args(["-n", "-r"])
+        .arg(source)
+        .args(["-Y", &filter, "-V"])
+        .output();
+    let Ok(result) = result else {
+        return api_error(StatusCode::NOT_IMPLEMENTED, "TSHARK_UNAVAILABLE", "packet dissector unavailable");
+    };
+    if !result.status.success() {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "TSHARK_DISSECTION_FAILED", "packet dissection failed");
+    }
+    if result.stdout.len() > 2 * 1024 * 1024 {
+        return api_error(StatusCode::PAYLOAD_TOO_LARGE, "DISSECTION_TOO_LARGE", "packet dissection exceeds the response limit");
+    }
+    let Ok(dissection) = String::from_utf8(result.stdout) else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "TSHARK_OUTPUT_INVALID", "packet dissection is not UTF-8");
+    };
+    operator_envelope(json!({
+        "capture_id":capture_id,
+        "packet_number":packet_number,
+        "event_id":packet["event_id"],
+        "format":"tshark -V",
+        "dissection":dissection,
+    }))
 }
 
 fn find_event(state: &AppState, id: &str) -> Option<Value> {
@@ -3741,6 +4125,8 @@ mod tests {
         config.lte_evidence_bundle_root = evidence.join("inbox");
         let key_dir = temporary_directory(&format!("{label}-pseudonym"));
         config.pseudonym_key_path = Some(key_dir.join("pseudonym.key"));
+        config.identity_vault_path = temporary_directory(&format!("{label}-identities"))
+            .join("identity-vault.json");
         config
     }
     fn state() -> AppState {
@@ -6126,5 +6512,62 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "IDENTITY_KIND_UNKNOWN");
+    }
+
+    #[tokio::test]
+    async fn clear_identity_routes_are_operator_only_and_keep_packet_proof() {
+        let viewer = router(state(), None)
+            .oneshot(req("/api/v1/sessions/anything/identities", true))
+            .await
+            .unwrap();
+        assert_eq!(viewer.status(), StatusCode::FORBIDDEN);
+
+        let state = operator_state();
+        let session_id = state.inner.primary_session_id.clone();
+        state
+            .inner
+            .identity_vault
+            .upsert(vec![IdentityObservation {
+                session_id: session_id.clone(),
+                subscriber_pseudonym: Some("psn-test-00101".into()),
+                kind: "imsi".into(),
+                value: "001010123456789".into(),
+                value_type: Some("IMSI".into()),
+                role: "presented".into(),
+                event_id: "event-test-identity".into(),
+                capture_id: "capture-test-identity".into(),
+                packet_number: 15,
+            }])
+            .unwrap();
+        let response = router(state.clone(), None)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/sessions/{session_id}/identities"))
+                    .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["data"]["imsi"], "001010123456789");
+        assert_eq!(body["data"]["imsi_proof"]["packet_number"], 15);
+        assert_eq!(body["meta"]["identity_access"], "operator");
+
+        let response = router(state, None)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/identities?q=001010123456789")
+                    .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["data"]["sessions"][0], session_id);
+        assert!(body.to_string().contains("event-test-identity"));
     }
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## OIRAN API 2.12.0 — 2026-11-11 — coffre d'identités operator
+
+- Coffre d'identités persistant hors dataset, répertoire 0700 et fichier 0600, avec preuves ordonnées `(capture_id, packet_number)` et aucune valeur claire dans les journaux.
+- `GET /sessions/:id/identities` et `GET /identities?q=…` sont réservés à l'operator et exposent IMSI, TMSI, S-TMSI, M-TMSI, IMEI/IMEISV et MSISDN avec leur événement source.
+- `GET /packets/:capture_id/:packet_number/dissect` fournit la dissection `tshark -V` d'une référence déjà connue, uniquement à l'operator et sans accepter de chemin client.
+- La collecte claire est un canal privé fondé sur les paquets sources ; les événements et datasets publiés restent pseudonymisés.
+
 ## OIRAN API 2.11.15 — 2026-11-11 — shard 0 strictement immuable sur overlayfs
 
 - La migration du monolithe historique en shard 0 ne crée plus de hard-link dans `.dataset-next` et ne renomme plus le répertoire `dataset`. Le manifeste référence directement `oiran_events.jsonl`; ce fichier n'est ouvert qu'en lecture et ne subit ni écriture, ni renommage, ni `fsync`, ni changement de métadonnées.
