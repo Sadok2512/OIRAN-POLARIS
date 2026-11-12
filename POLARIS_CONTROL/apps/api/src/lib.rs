@@ -87,6 +87,7 @@ pub struct AppState {
     pub static_dir: PathBuf,
     users_path: PathBuf,
     sessions: Arc<Mutex<BTreeMap<String, SessionRecord>>>,
+    open_access: bool,
     audit_path: PathBuf,
     job_state_path: PathBuf,
     ue_job_state_path: PathBuf,
@@ -3244,6 +3245,7 @@ impl AppState {
                 .unwrap_or_else(|_| "/var/lib/polaris-control/users.json".into())
                 .into(),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            open_access: std::env::var("POLARIS_OPEN_ACCESS").as_deref() == Ok("1"),
             audit_path: std::env::var("POLARIS_AUDIT_PATH")
                 .unwrap_or_else(|_| "/var/log/polaris-control/audit.jsonl".into())
                 .into(),
@@ -3508,7 +3510,7 @@ async fn authorize(
         sessions.retain(|_, session| session.expires_at > now);
         sessions.get(id).cloned()
     });
-    let csrf_valid = session.as_ref().map_or(false, |session| {
+    let csrf_valid = state.open_access || session.as_ref().map_or(false, |session| {
         matches!(
             *request.method(),
             Method::GET | Method::HEAD | Method::OPTIONS
@@ -3518,18 +3520,27 @@ async fn authorize(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value == session.csrf_token)
     });
-    let identity = session.map_or(
-        EffectiveIdentity {
-            role: "viewer".into(),
-            username: None,
-            session_id: None,
-            csrf_valid: true,
+    let identity = session.map_or_else(
+        || if state.open_access {
+            const OPEN_SESSION_ID: &str = "open-access-sadok";
+            if let Ok(mut sessions) = state.sessions.lock() {
+                sessions.entry(OPEN_SESSION_ID.into()).or_insert_with(|| SessionRecord {
+                    username: "sadok".into(), role: "operator".into(),
+                    csrf_token: "open-access".into(), expires_at: u64::MAX,
+                    certified_validation_until: None, certified_scenario_type: None,
+                    certified_target_ue_id: None, ue_control_authorized_until: None,
+                    ue_control_authorized_ids: BTreeSet::new(),
+                });
+            }
+            EffectiveIdentity { role: "operator".into(), username: Some("sadok".into()), session_id: Some(OPEN_SESSION_ID.into()), csrf_valid: true }
+        } else {
+            EffectiveIdentity { role: "viewer".into(), username: None, session_id: None, csrf_valid: true }
         },
         |session| EffectiveIdentity {
             role: session.role,
             username: Some(session.username),
             session_id,
-            csrf_valid,
+            csrf_valid: state.open_access || csrf_valid,
         },
     );
     // 0.19.2 — Snapshot the three attributable fields BEFORE moving the
@@ -3709,7 +3720,7 @@ async fn health() -> Json<Value> {
 }
 async fn version() -> Json<Value> {
     Json(
-        json!({"platform":"3.2.1","api":VERSION,"scenario_engine":scenario_engine::VERSION,"safety_guard":safety_guard::VERSION,"ueransim_adapter":ueransim_adapter::VERSION,"srsran_controller":srsran_controller::VERSION,"multi_ue_controller":simulator_controller::VERSION,"staging_read_only":staging_read_only_enabled()}),
+        json!({"platform":"0.31.0","api":VERSION,"scenario_engine":scenario_engine::VERSION,"safety_guard":safety_guard::VERSION,"ueransim_adapter":ueransim_adapter::VERSION,"srsran_controller":srsran_controller::VERSION,"multi_ue_controller":simulator_controller::VERSION,"staging_read_only":staging_read_only_enabled()}),
     )
 }
 async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -14707,6 +14718,7 @@ mod p0_tests {
             static_dir: root.join("no-web"),
             users_path,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            open_access: false,
             audit_path: root.join("audit.jsonl"),
             job_state_path: root.join("jobs.json"),
             ue_job_state_path: root.join("ue-jobs.json"),
@@ -16366,6 +16378,40 @@ mod p0_tests {
         assert_eq!(value["role"], "operator");
         assert_eq!(value["authenticated"], true);
         assert_eq!(value["csrf_token"], csrf);
+    }
+
+    #[tokio::test]
+    async fn open_access_authenticates_sadok_and_bypasses_csrf_for_ui_mutations() {
+        let mut test_state = state();
+        test_state.open_access = true;
+        let application = app(test_state);
+        let response = application
+            .clone()
+            .oneshot(Request::builder().uri("/api/v1/auth/me").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["authenticated"], true);
+        assert_eq!(value["username"], "sadok");
+        assert_eq!(value["role"], "operator");
+        assert_eq!(value["can_start"], true);
+
+        let logout = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/logout")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::OK);
     }
 
     #[tokio::test]

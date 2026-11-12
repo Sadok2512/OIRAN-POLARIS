@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.31.0 — 2026-11-12 — open laboratory access
+
+- Adds `POLARIS_OPEN_ACCESS=1`: unauthenticated requests receive the synthetic
+  `sadok` operator session, `/auth/me` reports an authenticated operator, and
+  UI mutations do not require a CSRF token in this explicit deployment mode.
+- Removes sign-in/sign-out controls and role-based disabling from the web and
+  simulator portal while retaining all operational safety gates: the thirteen
+  dumpcap preflight, disk ceiling, certified-scenario checks, ownership checks,
+  and the prohibition on restarting shared processes.
+- Enables open access in the production service-unit example and aligns the
+  platform, API, and web manifests on version 0.31.0.
+
 ## 0.29.16 (polaris-control-api) — 2026-11-04 — privacy contract lock-down for `subscriber_pseudonym` / `identity_pseudonym`
 
 - `privacy_safe_value()` adds a single lock-down exception agreed with
