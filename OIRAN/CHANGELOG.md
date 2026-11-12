@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.13.0 — 2026-11-12 — parcours abonné et chaîne TMSI
+
+- Ajout des routes viewer `GET /subscribers`, `GET /subscribers/:pseudo/journey` et `GET /subscribers/:pseudo/tmsi`. La hiérarchie publiée est Abonné → Contexte UE → Sessions PDN/PDU → Procédures, dans l'ordre canonique `(capture_id, packet_number, event_id)`.
+- Deux sessions ne sont reliées `EXACT` que par égalité de `subscriber_pseudonym`, ou par une identité temporaire observée d'abord comme attribuée puis comme présentée. L'IMEI, l'heure, la cellule et l'adresse IP ne sont jamais des preuves de liaison. Une attribution absente reste `OUVERT` avec la raison `attribution non capturée`.
+- `decoder-nas` 0.4.0 distingue désormais les identités d'abonné et temporaires, et émet `tmsi_pseudonym` sous le domaine partagé `temporary-mobile-identity` pour les GUTI EPS/5GS attribués ou présentés. Les octets et valeurs TMSI ne sont jamais publiés.
+- Les résumés de session exposent `subscriber_pseudonym`, `subscriber_session_count`, `previous_session_id` et `next_session_id`. Le coffre et les routes `/identities` de 2.12.0 restent inchangés.
+- L'écart `/health` 42 contre `/sessions` 44 provenait de deux ensembles : manifeste continu contre union interrogeable (datasets + preuves). `session_count` et `queryable_session_count` comptent désormais l'union de `/sessions`; le compteur plus étroit porte le nom `published_session_count`.
+- Versions : `oiran-api` et web 2.13.0, `decoder-nas` 0.4.0, `event-schema` 1.7.0, `session-engine` 0.5.13, `callflow-schema` 1.4.0.
+
 ## OIRAN API 2.12.0 — 2026-11-11 — coffre d'identités operator
 
 - Coffre d'identités persistant hors dataset, répertoire 0700 et fichier 0600, avec preuves ordonnées `(capture_id, packet_number)` et aucune valeur claire dans les journaux.

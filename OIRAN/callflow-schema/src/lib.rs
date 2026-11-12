@@ -38,6 +38,19 @@ pub struct CallFlowEvent {
     pub errors: Vec<String>,
 }
 
+fn decoded_tree_with_identifiers(event: &EventRecord) -> Value {
+    let mut tree = event.information_elements.clone();
+    let identifiers = event.identifiers.iter().map(|(name, value)| {
+        serde_json::json!({"name":name,"value":value,"source":"session_identifiers"})
+    });
+    if let Some(items) = tree.as_array_mut() {
+        items.extend(identifiers);
+    } else {
+        tree = Value::Array(identifiers.collect());
+    }
+    tree
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CorrelationEdge {
     pub edge_id: String,
@@ -283,7 +296,7 @@ pub fn build_callflow(reconstruction: &Reconstruction, edges: Vec<CorrelationEdg
             source_participant: event.source_participant.clone(),
             destination_participant: event.destination_participant.clone(),
             direction: event.direction.clone(),
-            decoded_ie_tree: event.information_elements.clone(),
+            decoded_ie_tree: decoded_tree_with_identifiers(event),
             decoding_status: event.decoding_status.clone(),
             semantic_status: semantic_status(
                 &event.message_name,
@@ -436,7 +449,7 @@ pub fn build_lte_callflow(
             source_participant: event.source_participant.clone(),
             destination_participant: event.destination_participant.clone(),
             direction: event.direction.clone(),
-            decoded_ie_tree: event.information_elements.clone(),
+            decoded_ie_tree: decoded_tree_with_identifiers(event),
             decoding_status: event.decoding_status.clone(),
             semantic_status: semantic_status(
                 &event.message_name,

@@ -991,6 +991,7 @@ fn compact_publication_event(event: &mut EventRecord) {
         "sm_context_reference",
         "subscriber_pseudonym",
         "imsi_pseudonym",
+        "tmsi_pseudonym",
     ];
     event
         .identifiers

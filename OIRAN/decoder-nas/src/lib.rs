@@ -4,6 +4,7 @@
 use event_schema::{
     pseudonym, pseudonym_subscriber_digits, pseudonym_subscriber_tbcd, sha256_hex,
     subscriber_digits_tbcd, DecodeStatus, InformationElement, NamedValue, PseudonymKey,
+    TEMPORARY_IDENTITY_PSEUDO_DOMAIN,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -245,21 +246,23 @@ fn parse_5gmm_body(
             if 6 + len > payload.len() {
                 return mark_truncated(msg, "5GS Mobile Context");
             }
-            let pseudo = pseudonym_5gs_mobile_identity(
-                pseudonym_key,
-                &payload[6..6 + len],
-            );
-            msg.information_elements.push(ie(
-                "identity_pseudonym",
-                &payload[6..6 + len],
-                Some(format!("pseudonym={pseudo}")),
-                DecodeStatus::Decoded,
-            ));
-            msg.identifiers.push(NamedValue {
-                name: "subscriber_pseudonym".into(),
-                value: pseudo,
-                pseudonymized: true,
-            });
+            let identity = &payload[6..6 + len];
+            if identity.first().is_some_and(|byte| byte & 0x07 == 2) {
+                attach_temporary_identity(msg, identity, pseudonym_key);
+            } else {
+                let pseudo = pseudonym_5gs_mobile_identity(pseudonym_key, identity);
+                msg.information_elements.push(ie(
+                    "identity_pseudonym",
+                    identity,
+                    Some(pseudo.clone()),
+                    DecodeStatus::Decoded,
+                ));
+                msg.identifiers.push(NamedValue {
+                    name: "subscriber_pseudonym".into(),
+                    value: pseudo,
+                    pseudonymized: true,
+                });
+            }
             parse_optional_tlvs(msg, &payload[6 + len..], 6 + len);
         }
         0x44 | 0x4e | 0x59 => {
@@ -334,7 +337,13 @@ fn parse_5gmm_body(
             ));
             parse_optional_tlvs(msg, &payload[6 + replayed_len..], 6 + replayed_len);
         }
-        0x57 | 0x5e | 0x5f | 0x42 | 0x43 | 0x45 | 0x46 | 0x47 | 0x48 | 0x4c | 0x4d
+        0x42 => {
+            if let Some(identity) = find_tlv_e(&payload[3..], 0x77) {
+                attach_temporary_identity(msg, identity, pseudonym_key);
+            }
+            parse_optional_tlvs(msg, &payload[3..], 3)
+        }
+        0x57 | 0x5e | 0x5f | 0x43 | 0x45 | 0x46 | 0x47 | 0x48 | 0x4c | 0x4d
         | 0x54 | 0x55 | 0x5b | 0x5c => parse_optional_tlvs(msg, &payload[3..], 3),
         0x67 | 0x68 => {
             if payload.len() < 6 {
@@ -628,6 +637,58 @@ fn parse_optional_tlvs(msg: &mut NasMessage, bytes: &[u8], base: usize) {
         }
         pos += header + len;
     }
+}
+
+fn find_tlv(bytes: &[u8], wanted: u8) -> Option<&[u8]> {
+    let mut pos = 0usize;
+    while pos + 2 <= bytes.len() {
+        let iei = bytes[pos];
+        if iei & 0x80 != 0 { pos += 1; continue; }
+        let len = bytes[pos + 1] as usize;
+        if pos + 2 + len > bytes.len() { return None; }
+        if iei == wanted { return Some(&bytes[pos + 2..pos + 2 + len]); }
+        pos += 2 + len;
+    }
+    None
+}
+
+fn find_tlv_e(bytes: &[u8], wanted: u8) -> Option<&[u8]> {
+    let mut pos = 0usize;
+    while pos + 3 <= bytes.len() {
+        let iei = bytes[pos];
+        if iei & 0x80 != 0 { pos += 1; continue; }
+        let extended = matches!(iei, 0x77 | 0x78 | 0x79 | 0x7b);
+        let (header, len) = if extended {
+            (3, u16::from_be_bytes([bytes[pos + 1], bytes[pos + 2]]) as usize)
+        } else {
+            (2, bytes[pos + 1] as usize)
+        };
+        if pos + header + len > bytes.len() { return None; }
+        if iei == wanted { return Some(&bytes[pos + header..pos + header + len]); }
+        pos += header + len;
+    }
+    None
+}
+
+fn temporary_identity_pseudonym(key: &PseudonymKey, value: &[u8]) -> String {
+    // EPS GUTI and 5G-GUTI both end in the temporary component. Using its
+    // canonical five-byte form makes GUTI assignment and S-TMSI presentation
+    // comparable without publishing the identity.
+    let canonical = value.get(value.len().saturating_sub(5)..).unwrap_or(value);
+    pseudonym(key, TEMPORARY_IDENTITY_PSEUDO_DOMAIN, canonical)
+}
+
+fn attach_temporary_identity(msg: &mut NasMessage, value: &[u8], key: &PseudonymKey) {
+    let pseudo = temporary_identity_pseudonym(key, value);
+    msg.information_elements.push(InformationElement {
+        id: None,
+        name: "temporary_identity_pseudonym".into(),
+        length: value.len() as u32,
+        value: Some(pseudo.clone()),
+        raw_sha256: Some(sha256_hex(value)),
+        status: DecodeStatus::Decoded,
+    });
+    msg.identifiers.push(NamedValue { name: "tmsi_pseudonym".into(), value: pseudo, pseudonymized: true });
 }
 
 fn decode_dnn(value: &[u8]) -> Option<String> {
@@ -996,6 +1057,19 @@ fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8], pseudonym_key: &Pseud
             }
             attach_eps_mobile_identity(msg, &body[2..2 + len], pseudonym_key);
         }
+        0x42 => {
+            // Attach Accept: result, T3412, TAI list LV, ESM container LV-E,
+            // then optional TLVs. GUTI (0x50) is an assignment.
+            if body.len() < 5 { return mark_truncated(msg, "Attach Accept mandatory fields"); }
+            let tai_end = 3usize.saturating_add(body[2] as usize);
+            if tai_end + 2 > body.len() { return mark_truncated(msg, "Attach Accept TAI list"); }
+            let esm_len = u16::from_be_bytes([body[tai_end], body[tai_end + 1]]) as usize;
+            let optional = tai_end + 2 + esm_len;
+            if optional > body.len() { return mark_truncated(msg, "Attach Accept ESM container"); }
+            if let Some(identity) = find_tlv(&body[optional..], 0x50) {
+                attach_temporary_identity(msg, identity, pseudonym_key);
+            }
+        }
         0x48 => {
             // TAU Request: EPS update type/NAS-KSI (1 byte), old GUTI LV.
             if body.len() < 2 {
@@ -1016,6 +1090,18 @@ fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8], pseudonym_key: &Pseud
                 return mark_truncated(msg, "Old EPS Context");
             }
             attach_eps_mobile_identity(msg, &body[2..2 + len], pseudonym_key);
+        }
+        0x49 => {
+            if body.is_empty() { return mark_truncated(msg, "TAU Accept mandatory fields"); }
+            if let Some(identity) = find_tlv(&body[1..], 0x50) {
+                attach_temporary_identity(msg, identity, pseudonym_key);
+            }
+        }
+        0x50 => {
+            let Some(&len) = body.first() else { return mark_truncated(msg, "GUTI Reallocation Command"); };
+            let len = len as usize;
+            if 1 + len > body.len() { return mark_truncated(msg, "GUTI Reallocation Command identity"); }
+            attach_temporary_identity(msg, &body[1..1 + len], pseudonym_key);
         }
         0x45 => {
             // Detach Request: Detach type (1 byte), EPS mobile identity LV.
@@ -1156,6 +1242,11 @@ fn attach_eps_mobile_identity(
     // 24.301 §9.9.3.12 type code numerically and let the Analyzer resolve
     // the meaning out-of-band.
     let identity_type_code = value.first().map(|b| b & 0x07).unwrap_or(0);
+    if identity_type_code == 6 {
+        attach_temporary_identity(msg, value, pseudonym_key);
+        msg.identifiers.push(NamedValue { name: "eps_mobile_type_code".into(), value: identity_type_code.to_string(), pseudonymized: false });
+        return;
+    }
     let pseudo = if identity_type_code == 1 {
         pseudonym_subscriber_tbcd(pseudonym_key, value, true)
     } else {
@@ -1169,11 +1260,13 @@ fn attach_eps_mobile_identity(
         raw_sha256: Some(sha256_hex(value)),
         status: DecodeStatus::Decoded,
     });
-    msg.identifiers.push(NamedValue {
-        name: "subscriber_pseudonym".into(),
-        value: pseudo,
-        pseudonymized: true,
-    });
+    if identity_type_code == 1 {
+        msg.identifiers.push(NamedValue {
+            name: "subscriber_pseudonym".into(),
+            value: pseudo,
+            pseudonymized: true,
+        });
+    }
     msg.identifiers.push(NamedValue {
         name: "eps_mobile_type_code".into(),
         value: identity_type_code.to_string(),
@@ -1625,6 +1718,23 @@ mod tests {
             .find(|v| v.name == "eps_mobile_type_code")
             .expect("eps_mobile_type_code");
         assert_eq!(identity_type.value, "6");
+    }
+
+    #[test]
+    fn eps_assigned_guti_and_later_presentation_share_tmsi_pseudonym() {
+        // Synthetic PLMN 001-01; all remaining values are test-only.
+        let guti = [0xf6, 0x00, 0xf1, 0x10, 0x00, 0x01, 0x12, 0x34, 0x56, 0x78, 0x9a];
+        let mut accept = vec![0x07, 0x42, 0x01, 0x01, 0x00, 0x00, 0x00, 0x50, guti.len() as u8];
+        accept.extend_from_slice(&guti);
+        let mut request = vec![0x07, 0x41, 0x01, guti.len() as u8];
+        request.extend_from_slice(&guti);
+        let key = PseudonymKey::from_bytes([0x31; 32]);
+        let assigned = super::decode(&accept, &key);
+        let presented = super::decode(&request, &key);
+        let temporary = |message: &NasMessage| message.identifiers.iter().find(|value| value.name == "tmsi_pseudonym").map(|value| value.value.clone());
+        assert_eq!(temporary(&assigned), temporary(&presented));
+        assert!(temporary(&assigned).is_some());
+        assert!(!presented.identifiers.iter().any(|value| value.name == "subscriber_pseudonym"));
     }
 
     #[test]

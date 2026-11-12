@@ -890,6 +890,9 @@ pub fn pseudonym(key: &PseudonymKey, label: &str, bytes: &[u8]) -> String {
 /// décodeurs qui veulent surfacer l'identité d'abonné DOIVENT
 /// utiliser ce label — ne jamais le passer en dur.
 pub const SUBSCRIBER_PSEUDO_DOMAIN: &str = "subscriber";
+/// Shared domain for temporary radio identities. Assignment and later
+/// presentation hash the canonical temporary component with this label.
+pub const TEMPORARY_IDENTITY_PSEUDO_DOMAIN: &str = "temporary-mobile-identity";
 
 /// Converts one canonical decimal subscriber identity to the shared domain.
 /// Callers must decode transport-specific representations before invoking it.

@@ -10,6 +10,7 @@
 mod probe_registry;
 mod session_filters;
 mod identity_vault;
+mod subscriber_journey;
 
 use axum::{
     body::Body,
@@ -751,6 +752,9 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/sessions/:id/callflow", get(session_callflow))
         .route("/sessions/:id/correlations", get(session_correlations))
         .route("/sessions/:id/identities", get(session_identities))
+        .route("/subscribers", get(subscribers))
+        .route("/subscribers/:pseudo/journey", get(subscriber_journey))
+        .route("/subscribers/:pseudo/tmsi", get(subscriber_tmsi))
         .route("/identities", get(identity_lookup))
         .route("/events/:id", get(event))
         .route("/events/:id/provenance", get(provenance))
@@ -871,17 +875,17 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         .values()
         .map(|flow| flow.accounting.source_events)
         .sum::<usize>();
-    let mut session_count = state.inner.flows.len();
+    let mut published_session_count = state.inner.flows.len();
     let mut ue_context_count = state.inner.discovery.ue_contexts.len();
     let mut dataset = state.inner.manifest.get("scenario_id").cloned();
-    if session_count == 0 {
+    if published_session_count == 0 {
         if let Some(live) = state
             .inner
             .capture_manager
             .dataset(live_probe::CONTINUOUS_DATASET_ID)
         {
             source_events = source_events.saturating_add(live.event_count);
-            session_count = session_count.saturating_add(live.session_ids.len());
+            published_session_count = published_session_count.saturating_add(live.session_ids.len());
             if let Some(discovery) = &live.discovery {
                 ue_context_count =
                     ue_context_count.saturating_add(discovery.ue_contexts.len());
@@ -891,12 +895,17 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
             }
         }
     }
+    let queryable_session_count = queryable_session_ids(&state).len();
     ok(json!({
         "status":"healthy",
         "mode":"LIVE_CAPTURE_CAPABLE_EXECUTION_GATED",
         "dataset":dataset,
         "source_events":source_events,
-        "session_count":session_count,
+        // Same union as an unfiltered GET /sessions. The narrower continuous
+        // manifest count is named explicitly instead of overloading this key.
+        "session_count":queryable_session_count,
+        "queryable_session_count":queryable_session_count,
+        "published_session_count":published_session_count,
         "ue_context_count":ue_context_count,
         "capabilities":{"live_capture":true,"capture_control":state.inner.capture_manager.execution_enabled(),"session_analysis":true,"multi_session":true,"dataset_registry":true,"packet_analysis":true,"exports":true,"future_sse":false}
     }))
@@ -2773,12 +2782,105 @@ fn lte_session_summary(manifest: &LteDatasetManifest, session: &LteSession) -> V
     })
 }
 
+fn queryable_flows(state: &AppState) -> BTreeMap<String, CallFlow> {
+    let mut flows = state.inner.flows.clone();
+    for dataset in state.inner.capture_manager.datasets() {
+        for session_id in &dataset.session_ids {
+            if let Some(flow) = state.inner.capture_manager.callflow(&dataset.dataset_id, session_id) {
+                flows.insert(session_id.clone(), flow);
+            }
+        }
+    }
+    flows
+}
+
+fn queryable_session_ids(state: &AppState) -> BTreeSet<String> {
+    let mut ids = state.inner.flows.keys().cloned().collect::<BTreeSet<_>>();
+    for dataset in state.inner.capture_manager.datasets() {
+        ids.extend(dataset.session_ids.iter().filter_map(|session_id| {
+            state.inner.capture_manager.callflow(&dataset.dataset_id, session_id)
+                .map(|_| session_id.clone())
+        }));
+    }
+    if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
+        for manifest in catalog {
+            if let Ok(page) = state.inner.lte_evidence_store.session_page(&manifest.run_id, 1, 100) {
+                if let Some(records) = page["data"].as_array() {
+                    ids.extend(records.iter().filter_map(|record| record.get("session_id").and_then(Value::as_str).map(str::to_owned)));
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn decorate_subscriber_summary(summary: &mut Value, flow: &CallFlow, index: &subscriber_journey::JourneyIndex) {
+    let Some(pseudo) = index.subscriber_for_session(&flow.session_id) else { return };
+    let sessions = index.sessions(pseudo);
+    let Some(position) = sessions.iter().position(|session| session.session_id == flow.session_id) else { return };
+    summary["subscriber_pseudonym"] = Value::String(pseudo.to_owned());
+    summary["ue_pseudonym"] = Value::String(pseudo.to_owned());
+    summary["subscriber_session_count"] = Value::from(sessions.len());
+    summary["previous_session_id"] = position.checked_sub(1).and_then(|index| sessions.get(index)).map(|session| Value::String(session.session_id.clone())).unwrap_or(Value::Null);
+    summary["next_session_id"] = sessions.get(position + 1).map(|session| Value::String(session.session_id.clone())).unwrap_or(Value::Null);
+}
+
+async fn subscribers(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
+    let flows = queryable_flows(&state);
+    let index = subscriber_journey::JourneyIndex::from_flows(flows.values());
+    let mut rows = serde_json::to_value(index.subscribers()).unwrap_or_else(|_| Value::Array(Vec::new())).as_array().cloned().unwrap_or_default();
+    if let Some(search) = query.search.as_deref() {
+        let search = search.to_ascii_lowercase();
+        rows.retain(|row| row.to_string().to_ascii_lowercase().contains(&search));
+    }
+    paginated(rows, &query)
+}
+
+async fn subscriber_journey(State(state): State<AppState>, Path(pseudo): Path<String>) -> Response {
+    let flows = queryable_flows(&state);
+    let index = subscriber_journey::JourneyIndex::from_flows(flows.values());
+    let sessions = index.sessions(&pseudo);
+    if sessions.is_empty() {
+        return api_error(StatusCode::NOT_FOUND, "SUBSCRIBER_NOT_FOUND", "subscriber journey not found");
+    }
+    let mut contexts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for session in &sessions {
+        let context_id = flows.get(&session.session_id)
+            .and_then(|flow| discovered_session_for_flow(&state, flow))
+            .map(|session| session.ue_context_id.clone())
+            .unwrap_or_else(|| format!("ue-context-for-{}", session.session_id));
+        contexts.entry(context_id).or_default().push(session.session_id.clone());
+    }
+    ok(json!({
+        "subscriber_pseudonym":pseudo,
+        "contexts":contexts.into_iter().map(|(ue_context_id, session_ids)| json!({"ue_context_id":ue_context_id,"session_ids":session_ids})).collect::<Vec<_>>(),
+        "sessions":sessions,
+        "links":index.links(&pseudo),
+        "ordering":"capture_id,packet_number,event_id"
+    })).into_response()
+}
+
+async fn subscriber_tmsi(State(state): State<AppState>, Path(pseudo): Path<String>) -> Response {
+    let flows = queryable_flows(&state);
+    let index = subscriber_journey::JourneyIndex::from_flows(flows.values());
+    if index.sessions(&pseudo).is_empty() {
+        return api_error(StatusCode::NOT_FOUND, "SUBSCRIBER_NOT_FOUND", "subscriber temporary identity chain not found");
+    }
+    ok(serde_json::to_value(index.tmsi(&pseudo)).unwrap_or(Value::Array(Vec::new()))).into_response()
+}
+
 async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
+    let journey_flows = queryable_flows(&state);
+    let journey_index = subscriber_journey::JourneyIndex::from_flows(journey_flows.values());
     let mut unique = state
         .inner
         .flows
         .values()
-        .map(|flow| (flow.session_id.clone(), session_summary(&state, flow)))
+        .map(|flow| {
+            let mut summary = session_summary(&state, flow);
+            decorate_subscriber_summary(&mut summary, flow, &journey_index);
+            (flow.session_id.clone(), summary)
+        })
         .collect::<BTreeMap<_, _>>();
     for dataset in state.inner.capture_manager.datasets() {
         for session_id in &dataset.session_ids {
@@ -2787,7 +2889,9 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                 .capture_manager
                 .callflow(&dataset.dataset_id, session_id)
             {
-                unique.insert(session_id.clone(), live_session_summary(&dataset, &flow));
+                let mut summary = live_session_summary(&dataset, &flow);
+                decorate_subscriber_summary(&mut summary, &flow, &journey_index);
+                unique.insert(session_id.clone(), summary);
             }
         }
     }
@@ -2942,6 +3046,8 @@ async fn sessions_filter(
         );
     }
     state.refresh_session_filter_index();
+    let journey_flows = queryable_flows(&state);
+    let journey_index = subscriber_journey::JourneyIndex::from_flows(journey_flows.values());
 
     let messages: Vec<(Option<String>, String)> = request
         .messages
@@ -3069,7 +3175,9 @@ async fn sessions_filter(
         std::collections::BTreeMap::new();
     for flow in state.inner.flows.values() {
         if page_set.contains(flow.session_id.as_str()) {
-            items_by_id.insert(flow.session_id.clone(), session_summary(&state, flow));
+            let mut summary = session_summary(&state, flow);
+            decorate_subscriber_summary(&mut summary, flow, &journey_index);
+            items_by_id.insert(flow.session_id.clone(), summary);
         }
     }
     for dataset in state.inner.capture_manager.datasets() {
@@ -3082,7 +3190,9 @@ async fn sessions_filter(
                 .capture_manager
                 .callflow(&dataset.dataset_id, session_id)
             {
-                items_by_id.insert(session_id.clone(), live_session_summary(&dataset, &flow));
+                let mut summary = live_session_summary(&dataset, &flow);
+                decorate_subscriber_summary(&mut summary, &flow, &journey_index);
+                items_by_id.insert(session_id.clone(), summary);
             }
         }
     }
@@ -3138,8 +3248,12 @@ async fn sessions_filter(
 }
 
 async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let journey_flows = queryable_flows(&state);
+    let journey_index = subscriber_journey::JourneyIndex::from_flows(journey_flows.values());
     if let Some(flow) = flow_for(&state, &id) {
-        return ok(json!({"summary":session_summary(&state,flow),"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
+        let mut summary = session_summary(&state,flow);
+        decorate_subscriber_summary(&mut summary, flow, &journey_index);
+        return ok(json!({"summary":summary,"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
     }
     if let Some((dataset_id, flow)) = live_flow_for(&state, &id) {
         let dataset = state
@@ -3147,7 +3261,9 @@ async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Respo
             .capture_manager
             .dataset(&dataset_id)
             .expect("live flow dataset remains registered");
-        return ok(json!({"summary":live_session_summary(&dataset,&flow),"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
+        let mut summary = live_session_summary(&dataset,&flow);
+        decorate_subscriber_summary(&mut summary, &flow, &journey_index);
+        return ok(json!({"summary":summary,"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
     }
     if let Ok(Some((manifest, lte))) = state.inner.lte_evidence_store.find_session(&id) {
         let procedures = lte.procedures.iter().enumerate().map(|(index, name)| json!({
@@ -4818,6 +4934,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_session_count_matches_unfiltered_sessions_union() {
+        let app = router(state(), None);
+        let health = json_body(app.clone().oneshot(req("/api/v1/health", false)).await.unwrap()).await;
+        let sessions = json_body(app.oneshot(req("/api/v1/sessions?page_size=100", false)).await.unwrap()).await;
+        assert_eq!(health["data"]["session_count"], sessions["meta"]["total"]);
+        assert_eq!(health["data"]["queryable_session_count"], sessions["meta"]["total"]);
+        assert!(health["data"].get("published_session_count").is_some());
+    }
+
+    #[tokio::test]
     async fn version_reports_installed_lte_and_5g_decoders() {
         let response = router(state(), None)
             .oneshot(req("/api/v1/version", true))
@@ -5293,7 +5419,7 @@ mod tests {
             .unwrap();
         let registry_root = temporary_directory("registry-persistence");
         let registry_path = registry_root.join("probes.json");
-        let mut config = ApiConfig::from_workspace(workspace);
+        let mut config = test_config(workspace, "registry-persistence");
         config.probe_registry_path = registry_path.clone();
         config.operator_token_sha256 = Some(sha256_hex(b"test-operator-token"));
         config.pseudonym_key_path =

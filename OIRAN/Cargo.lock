@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "callflow-schema"
-version = "1.3.2"
+version = "1.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-nas"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "event-schema",
 ]
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "event-schema"
-version = "1.6.2"
+version = "1.7.0"
 dependencies = [
  "serde_json",
 ]
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.12.0"
+version = "2.13.0"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "session-engine"
-version = "0.5.12"
+version = "0.5.13"
 dependencies = [
  "event-schema",
  "serde",
