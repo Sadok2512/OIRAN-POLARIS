@@ -5519,7 +5519,7 @@ async fn cleanup_lte_run(
         srsenb_stopped,
         sidecars_removed,
         epc_healthy,
-        dumpcaps_preserved: external_dumpcap_count() == 12,
+        dumpcaps_preserved: external_dumpcap_set_is_expected(external_dumpcap_count()),
     };
     let clean = cleanup.srsue_stopped
         && cleanup.srsenb_stopped
@@ -6414,7 +6414,7 @@ fn lte_start_resource_gate(state: &AppState) -> Result<Value, String> {
     let memory = memory_stats();
     let (used, available) = validate_lte_memory(&memory)?;
     let dumpcaps = external_dumpcap_count();
-    if dumpcaps != 12 {
+    if !external_dumpcap_set_is_expected(dumpcaps) {
         return Err("LTE_EXTERNAL_CAPTURE_SET_MISMATCH".into());
     }
     Ok(json!({
@@ -6428,6 +6428,12 @@ fn lte_start_resource_gate(state: &AppState) -> Result<Value, String> {
         "memory_required_bytes":4_294_967_296_u64,
         "external_dumpcap_count":dumpcaps
     }))
+}
+
+const EXPECTED_EXTERNAL_DUMPCAP_COUNT: usize = 13;
+
+fn external_dumpcap_set_is_expected(count: usize) -> bool {
+    count == EXPECTED_EXTERNAL_DUMPCAP_COUNT
 }
 
 fn validate_lte_memory(memory: &Value) -> Result<(u64, u64), String> {
@@ -14414,6 +14420,13 @@ mod p0_tests {
     const OPERATOR_PASSWORD: &str = "operator-test-password-2026";
     const ADMIN_PASSWORD: &str = "administrator-test-password-2026";
     static TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn lte_preflight_requires_exactly_thirteen_external_dumpcaps() {
+        assert!(!external_dumpcap_set_is_expected(12));
+        assert!(external_dumpcap_set_is_expected(13));
+        assert!(!external_dumpcap_set_is_expected(14));
+    }
 
     #[test]
     fn staging_read_only_allows_reads_and_local_auth_but_blocks_mutations() {

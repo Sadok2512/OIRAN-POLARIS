@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.30.1 (polaris-control-api) — 2026-11-12
+
+- Le préflight LTE exige exactement 13 processus `dumpcap` : les 12 interfaces
+  de capture de la plateforme et la capture IMS. Douze ou quatorze processus
+  bloquent toujours le démarrage.
+
 ## 0.30.0 (polaris-control-api) — 2026-11-09 — LTE certification-run endpoint + 423 lift + DN default (ANR1 #10 6737561274)
 
 ANR1 a prouvé que l'API 0.29.16 reste bloquée en 423 sur
