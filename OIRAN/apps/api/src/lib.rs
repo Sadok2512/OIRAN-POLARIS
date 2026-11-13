@@ -4735,11 +4735,29 @@ mod tests {
 
     #[test]
     fn absent_service_state_directory_in_read_only_parent_is_explicit() {
+        // 2.14.5 (ANR1 #10) : le test 2.14.4 utilisait un répertoire parent
+        // à mode 0o555 et comptait sur l'échec de `libc::access(parent, W_OK)`
+        // pour prouver qu'un dossier d'état absent + parent non-créable
+        // remonte une erreur explicite. Sous euid=0 (`unshare -r`, conteneur
+        // privilégié, service systemd `User=root`), `libc::access` outrepasse
+        // les mode bits pour le bit W_OK → le test recevait Ok(()). Faux
+        // positif, pas une garantie.
+        //
+        // On provoque désormais l'échec par ENOTDIR / EACCES sur X_OK en
+        // utilisant un FICHIER comme « parent ». `libc::access(fichier, X_OK)`
+        // échoue pour tout utilisateur — y compris root — tant qu'aucun bit
+        // d'exécution n'est positionné dans les trois triplets de permissions
+        // (POSIX.1-2008 : « If any of the specified access permissions would
+        // be denied, access() shall return -1 »). Un fichier régulier créé
+        // via `fs::write` avec l'umask courant est systématiquement
+        // non-exécutable, et on force explicitement 0o644 pour couper tout
+        // doute. Pas de garde `euid==0 → skip` : un garde qui se saute
+        // ne garantit rien.
         let root = temporary_directory("service-state-missing");
-        let parent = root.join("read-only-parent");
-        fs::create_dir_all(&parent).unwrap();
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
-        let missing = parent.join("missing-derived-import");
+        let non_directory_parent = root.join("parent-is-a-regular-file");
+        fs::write(&non_directory_parent, b"").unwrap();
+        fs::set_permissions(&non_directory_parent, fs::Permissions::from_mode(0o644)).unwrap();
+        let missing = non_directory_parent.join("missing-derived-import");
         let error = access_check_readable_or_creatable(
             &missing,
             "derived-import-read",
@@ -4751,7 +4769,7 @@ mod tests {
         assert!(error.contains("required=derived-import-create"));
         assert!(error.contains(&format!("requested_path={}", missing.display())));
 
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_file(&non_directory_parent).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
     fn test_config(root: &FsPath, label: &str) -> ApiConfig {

@@ -1,5 +1,18 @@
 # Changelog
 
+## OIRAN API 2.14.5 — 2026-11-13 — test d’accès au démarrage déterministe sous root
+
+- Le test `absent_service_state_directory_in_read_only_parent_is_explicit` utilisait un répertoire parent à mode 0o555 et comptait sur l’échec de `libc::access(parent, W_OK)` ; `libc::access` outrepasse les mode bits pour un `euid=0` (reproduit via `unshare -r` sur `7ad769e` et sur `6e118ef`), le test recevait alors `Ok(())` — faux positif.
+- Le correctif utilise un fichier régulier comme « parent » du chemin absent. `libc::access(fichier, X_OK)` échoue pour tout utilisateur (y compris root) quand aucun bit d’exécution n’est positionné (POSIX.1-2008). Le mode est fixé explicitement à 0o644 pour couper tout doute d’umask. Aucun garde `euid==0 → skip` : un test qui se saute ne garantit rien.
+- Aucune autre modification de la lib : `access_check`, `access_check_creatable` et `service_state_access_checks` sont inchangés. `oiran-api` 2.14.5, les autres crates (`decoder-s1ap` 0.3.0, `decoder-nas` 0.4.1, `oiran-decode` 0.7.5) inchangées.
+
+## OIRAN API 2.14.4 — 2026-11-13 — ladder analyzer écarts 1-4 (ANR2 #10 6853084865)
+
+- `oiran-decode` 0.7.5 : résolution SCTP port-based du `network_function` quand la map `config.endpoints` est muette. Port 36412 → MME (pair = eNB) ; port 38412 → AMF (pair = gNB). N’écrase jamais un `network_function` déjà résolu.
+- `decoder-s1ap` 0.3.0 (minor) : direction uniquement dérivée du transport (`infer_direction_from_transport`) — suppression du fallback `procedureCode`. Table `message_name` étendue à l’intégralité des Elementary Procedures TS 36.413 §9.1 (103 entrées `(code, kind)`), incluant `(22, Initiating) = UECapabilityInfoIndication`. `S1apPdu.message_name` passe en `String`, repli numérique « S1AP proc N (kind, non mappé) ». NAS enfant : `message_name` combiné `<procédure S1AP ASN.1> · <NAS>` (« downlinkNASTransport · Security Mode Command »), « Protected EPS EMM message » remplacé par « NAS chiffré ».
+- `decoder-nas` 0.4.1 : table EPS EMM réalignée sur TS 24.301 §9.8.1 Table 9.8.1.1 (0x5D = Security mode command, 0x5E = Complete, 0x5F = Reject ; 0x5C retiré) ; parser EPS Security Mode Command corrigé en conséquence.
+- `oiran-api` 2.14.4 : `session_summary` HISTORICAL, live et LTE publient `serving_ran_node` (eNB/gNB) et `core_node` (MME/AMF) en plus de `serving_node` (conservé par compat 2.14.3).
+
 ## OIRAN API 2.14.3 — 2026-11-12 — contrôle d’accès au démarrage
 
 - Les racines `derived_import_root`, `lte_evidence_root` et `lte_evidence_bundle_root` déjà présentes exigent uniquement lecture et traversée (`R_OK|X_OK`). La création n’est exigée que lorsque la racine est absente; un montage de référence existant en lecture seule ne bloque donc plus le démarrage.
