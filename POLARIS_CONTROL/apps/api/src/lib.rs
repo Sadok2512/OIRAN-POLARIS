@@ -112,6 +112,7 @@ pub struct AppState {
     dl_sender: DlSenderConfig,
     dl_sender_health_override: Option<Result<(), String>>,
     resource_override: Option<Result<(), String>>,
+    dumpcap_count_override: Option<usize>,
     cpu_safety: Arc<Mutex<CpuSafetyMonitor>>,
     runtime: Arc<Mutex<ControlRuntime>>,
     multi_ue: Arc<Mutex<MultiUeController>>,
@@ -3277,6 +3278,7 @@ impl AppState {
             dl_sender,
             dl_sender_health_override: None,
             resource_override: None,
+            dumpcap_count_override: None,
             cpu_safety: Arc::new(Mutex::new(CpuSafetyMonitor::default())),
             runtime: Arc::new(Mutex::new(runtime)),
             multi_ue: Arc::new(Mutex::new(multi_ue)),
@@ -5530,7 +5532,11 @@ async fn cleanup_lte_run(
         srsenb_stopped,
         sidecars_removed,
         epc_healthy,
-        dumpcaps_preserved: external_dumpcap_set_is_expected(external_dumpcap_count()),
+        dumpcaps_preserved: external_dumpcap_set_is_expected(
+            state
+                .dumpcap_count_override
+                .unwrap_or_else(external_dumpcap_count),
+        ),
     };
     let clean = cleanup.srsue_stopped
         && cleanup.srsenb_stopped
@@ -14931,6 +14937,7 @@ mod p0_tests {
             dl_sender: DlSenderConfig::unavailable(),
             dl_sender_health_override: Some(Err("DL_SENDER_NOT_AVAILABLE".into())),
             resource_override: Some(Ok(())),
+            dumpcap_count_override: Some(EXPECTED_EXTERNAL_DUMPCAP_COUNT),
             cpu_safety: Arc::new(Mutex::new(CpuSafetyMonitor::default())),
             runtime: Arc::new(Mutex::new(ControlRuntime {
                 active: None,
