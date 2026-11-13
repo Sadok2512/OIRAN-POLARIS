@@ -2479,6 +2479,72 @@ impl DockerUeRuntime {
         command
     }
 
+    fn pdu_for_dnn(output: &str, expected_dnn: &str) -> Option<String> {
+        let mut matched = false;
+        let mut address = None;
+        for raw in output.lines() {
+            let line = raw.trim();
+            if line.starts_with("PDU Session") || line.starts_with("Session") {
+                if matched {
+                    return address;
+                }
+                matched = false;
+                address = None;
+                continue;
+            }
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            match key.trim().to_ascii_lowercase().as_str() {
+                "apn" | "dnn" => matched = value.trim() == expected_dnn,
+                "address" | "ue-address" | "ipv4" => {
+                    address = Some(value.trim().split('/').next()?.to_string())
+                }
+                _ => {}
+            }
+        }
+        matched.then_some(address).flatten()
+    }
+
+    fn observe_pdu_dnn(target: &str, dnn: &str) -> Result<Option<String>, String> {
+        let output = Self::output(&[
+            "exec".into(),
+            target.into(),
+            "nr-cli".into(),
+            Self::ue_cli_node(target)?,
+            "-e".into(),
+            "ps-list".into(),
+        ])?;
+        Ok(Self::pdu_for_dnn(&output, dnn))
+    }
+
+    fn wait_for_owned_pdu_dnn(
+        &self,
+        spec: &LiveLaunchSpec,
+        handle: &str,
+        dnn: &str,
+        timeout_seconds: u64,
+        cancel: &AtomicBool,
+    ) -> Result<String, String> {
+        let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Err("SCENARIO_STOP_REQUESTED".into());
+            }
+            if !self.owns(spec, handle) {
+                return Err("LIVE_UE_OWNERSHIP_NOT_PROVEN".into());
+            }
+            if let Some(address) = Self::observe_pdu_dnn(target, dnn)? {
+                return Ok(address);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("PDU_DNN_NOT_OBSERVED".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
     fn wait_for_owned_pdu(
         &self,
         spec: &LiveLaunchSpec,
@@ -2785,12 +2851,13 @@ impl UeRuntime for DockerUeRuntime {
         if !self.owns(spec, handle) {
             return Err("LIVE_UE_OWNERSHIP_NOT_PROVEN".into());
         }
-        if self.observe_owned(spec, handle)?.pdu_session_state == "ACTIVE" {
+        let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
+        if Self::observe_pdu_dnn(target, &profile.dnn)?.is_some() {
             return Ok(());
         }
-        let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
         Self::execute_ue_cli(target, Self::pdu_establish_command(profile))?;
-        self.wait_for_owned_pdu(spec, handle, "ACTIVE", timeout_seconds, cancel)
+        self.wait_for_owned_pdu_dnn(spec, handle, &profile.dnn, timeout_seconds, cancel)
+            .map(|_| ())
     }
 
     fn release_pdu(
@@ -12639,9 +12706,16 @@ fn ims_client_name(ue_id: &str) -> Result<(&'static str, &'static str), String> 
 
 fn stop_ims_client(ue_id: &str) {
     if let Ok((name, _)) = ims_client_name(ue_id) {
-        let _ = Command::new("/usr/bin/docker")
-            .args(["stop", "--time", "5", name])
-            .output();
+        let owned = DockerUeRuntime::output(&[
+            "inspect".into(), "--format".into(),
+            "{{index .Config.Labels \"polaris.control.owner\"}}|{{index .Config.Labels \"polaris.control.ue-id\"}}".into(),
+            name.into(),
+        ]).is_ok_and(|value| value.trim() == format!("polaris-control-ims|{ue_id}"));
+        if owned {
+            let _ = Command::new("/usr/bin/docker")
+                .args(["stop", "--time", "5", name])
+                .output();
+        }
     }
 }
 
@@ -12661,17 +12735,36 @@ fn execute_ims_register(
     }
     let handle = job.process_handle.as_deref().ok_or("UE_HANDLE_INVALID")?;
     let container_id = DockerUeRuntime::container_id(handle).ok_or("UE_HANDLE_INVALID")?;
-    let ps = DockerUeRuntime::output(&[
+    let ims_ip =
+        DockerUeRuntime::observe_pdu_dnn(container_id, "ims")?.ok_or("IMS_PDU_NOT_ACTIVE")?;
+    let links = DockerUeRuntime::output(&[
         "exec".into(),
         container_id.into(),
-        "nr-cli".into(),
-        DockerUeRuntime::ue_cli_node(container_id)?,
-        "-e".into(),
-        "ps-list".into(),
+        "ip".into(),
+        "-o".into(),
+        "-4".into(),
+        "addr".into(),
+        "show".into(),
     ])?;
-    if !ps.to_ascii_lowercase().contains("ims") {
-        return Err("IMS_PDU_NOT_ACTIVE".into());
-    }
+    let ims_iface = links
+        .lines()
+        .find(|line| line.contains(&format!(" {ims_ip}/")))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(|name| name.trim_end_matches(':'))
+        .filter(|name| name.starts_with("uesimtun"))
+        .ok_or("IMS_TUN_NOT_READY")?;
+    DockerUeRuntime::output(&[
+        "exec".into(),
+        container_id.into(),
+        "ip".into(),
+        "route".into(),
+        "replace".into(),
+        format!("{IMS_PROXY_IP}/32"),
+        "dev".into(),
+        ims_iface.into(),
+        "src".into(),
+        ims_ip.clone(),
+    ])?;
     let route = DockerUeRuntime::output(&[
         "exec".into(),
         container_id.into(),
@@ -12679,8 +12772,10 @@ fn execute_ims_register(
         "route".into(),
         "get".into(),
         IMS_PROXY_IP.into(),
+        "from".into(),
+        ims_ip.clone(),
     ])?;
-    if !route.contains("uesimtun") {
+    if !route.contains(ims_iface) {
         return Err("IMS_PCSCF_UNREACHABLE".into());
     }
     if !Path::new(IMS_AUTH_FILE).exists() || !Path::new(IMS_REGISTER_SCRIPT).exists() {
@@ -12689,6 +12784,8 @@ fn execute_ims_register(
     let network = format!("container:{container_id}");
     let proxy = format!("SIP_PROXY={IMS_PROXY_IP}");
     let aor_env = format!("SIP_AOR={aor}");
+    let iface_env = format!("SIP_IFACE={ims_iface}");
+    let ue_label = format!("polaris.control.ue-id={ue_id}");
     let output = Command::new("/usr/bin/docker")
         .args([
             "run",
@@ -12706,12 +12803,16 @@ fn execute_ims_register(
             "NET_ADMIN",
             "--security-opt",
             "no-new-privileges:true",
+            "--label",
+            "polaris.control.owner=polaris-control-ims",
+            "--label",
+            &ue_label,
             "-e",
             &aor_env,
             "-e",
             &proxy,
             "-e",
-            "SIP_IFACE=uesimtun0",
+            &iface_env,
             "-v",
             "/opt/polaris-control/libexec/baresip-register:/usr/local/bin/baresip-register:ro",
             "-v",
@@ -12744,6 +12845,7 @@ fn execute_ims_register(
         if text.contains("200 OK") || text.contains("SIP/2.0 200") {
             let elapsed = started.elapsed().as_millis() as u64;
             let result = json!({"sip_code":200,"registration_time_ms":elapsed,"pcscf":IMS_PROXY_IP,
+                "ims_ip":ims_ip,"ims_interface":ims_iface,
                 "route":route.lines().next().unwrap_or_default(),"client":client_name});
             record_activity_event(state, ue_id, "ims_register", "OK", result.clone());
             return Ok(result);
@@ -18897,6 +18999,21 @@ mod p0_tests {
         let established = observe_controller_ue(&test_state, "UE-02").unwrap();
         assert_eq!(established.process_state, "RUNNING");
         assert_eq!(established.pdu_session_state, "ACTIVE");
+    }
+
+    #[test]
+    fn pdu_dnn_probe_selects_the_requested_session_not_the_first_active_one() {
+        let output = "PDU Session 1:\n  state: PS-ACTIVE\n  apn: internet\n  address: 10.46.0.6\n\
+PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
+        assert_eq!(
+            DockerUeRuntime::pdu_for_dnn(output, "ims").as_deref(),
+            Some("10.47.0.6")
+        );
+        assert_eq!(
+            DockerUeRuntime::pdu_for_dnn(output, "internet").as_deref(),
+            Some("10.46.0.6")
+        );
+        assert_eq!(DockerUeRuntime::pdu_for_dnn(output, "missing"), None);
     }
 
     #[test]
