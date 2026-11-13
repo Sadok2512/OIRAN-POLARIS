@@ -898,6 +898,7 @@ impl ProtocolDecoder for S1apDecoder {
                 let parent_id = event.event_id.clone();
                 let parent_identifiers = event.session_identifiers.clone();
                 let mut output_events = vec![event];
+                let parent_message_name = pdu.message_name.clone();
                 for nas in &nas_messages {
                     append_eps_nas_events(
                         &mut output_events,
@@ -906,6 +907,7 @@ impl ProtocolDecoder for S1apDecoder {
                         &parent_identifiers,
                         input,
                         pdu.procedure_code,
+                        &parent_message_name,
                     );
                 }
                 DecoderOutput {
@@ -930,6 +932,7 @@ fn append_eps_nas_events(
     parent_identifiers: &[NamedValue],
     input: &DecoderInput<'_>,
     s1ap_procedure: u8,
+    parent_message_name: &str,
 ) {
     let mut identifiers = parent_identifiers.to_vec();
     identifiers.extend(nas.identifiers.clone());
@@ -957,7 +960,13 @@ fn append_eps_nas_events(
         timestamp: input.timestamp.clone(),
         interface: input.interface.into(),
         protocol,
-        message_name: nas.message_name.clone(),
+        // 2.14.4 (ANR2 ladder écart 2b) : le nom public de l'événement NAS
+        // enfant porte la procédure S1AP qui le transporte pour que l'UI
+        // affiche « downlinkNASTransport · Security Mode Command » sur
+        // msg04 et « uplinkNASTransport · NAS chiffré » sur les NAS
+        // chiffrés. Le nom NAS brut (`nas.message_name`) reste identifiant
+        // via `procedure_code` et `procedure`.
+        message_name: combined_message_name(parent_message_name, &nas.message_name),
         message_type: nas.message_type.unwrap_or(0) as u32,
         procedure_code: nas.message_type.map(u32::from),
         procedure: Some(nas.procedure.clone()),
@@ -1000,7 +1009,36 @@ fn append_eps_nas_events(
             &nas_identifiers,
             input,
             s1ap_procedure,
+            parent_message_name,
         );
+    }
+}
+
+/// 2.14.4 — combine le nom de la procédure S1AP porteuse (en camelCase
+/// contractuel 3GPP, première lettre en minuscule pour aligner sur les
+/// noms ASN.1 TS 36.413 §9.3.1 : `initialUEMessage`, `downlinkNASTransport`,
+/// `uplinkNASTransport`) avec le nom NAS décodé. Remplace également le
+/// placeholder « Protected EPS EMM message » par « NAS chiffré ».
+fn combined_message_name(parent_s1ap: &str, nas_name: &str) -> String {
+    let parent = asn1_procedure_name(parent_s1ap);
+    let nas = if nas_name == "Protected EPS EMM message" {
+        "NAS chiffré"
+    } else {
+        nas_name
+    };
+    format!("{parent} · {nas}")
+}
+
+fn asn1_procedure_name(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut out = String::with_capacity(name.len());
+            out.extend(first.to_lowercase());
+            out.push_str(chars.as_str());
+            out
+        }
+        None => String::new(),
     }
 }
 
@@ -1301,7 +1339,9 @@ mod tests {
         assert!(subscriber.value.starts_with("psn-"));
         let nas_event = &out.events[1];
         assert_eq!(nas_event.protocol, Protocol::NasEpsMm);
-        assert_eq!(nas_event.message_name, "Attach Request");
+        // 2.14.4 (ANR2 ladder écart 2b) : nom NAS enfant préfixé par la
+        // procédure S1AP porteuse (ASN.1 TS 36.413 §9.3.1).
+        assert_eq!(nas_event.message_name, "initialUEMessage · Attach Request");
         assert_eq!(
             nas_event.parent_event_id.as_deref(),
             Some(event.event_id.as_str())
