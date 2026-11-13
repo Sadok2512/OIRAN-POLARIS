@@ -12,19 +12,79 @@ use std::{
     process::Command,
 };
 
+/// 2.14.6 (ANR1 #10) : le test construit lui-même le binaire release
+/// `dataset-restore` au lieu d'exiger qu'un `cargo build --release`
+/// préalable ait eu lieu. Cargo sérialise les accès au `target/` via son
+/// propre fichier de verrou, donc une exécution parallèle d'autres
+/// `cargo test` dans le même workspace reste sûre.
+///
+/// L'ancien comportement (trois candidats fixes + `panic!("…binary not
+/// found; run cargo build…")`) rendait le test environnementalement
+/// dépendant : qui lançait `cargo test` sans avoir fait un build release
+/// préalable voyait un `FAILED` opaque dans le résumé. « Un garde qui se
+/// saute ne garde rien » (ANR1).
 fn target_bin() -> PathBuf {
-    let candidates = [
+    // Fast path : le binaire peut déjà être présent (release build préalable
+    // manuel pour le pipeline 2.14.x ; re-utilisation du cache cargo entre
+    // runs). Évite de payer le coût d'un cargo-build à chaque invocation.
+    let fast_candidates = [
         "OIRAN/target/release/dataset-restore",
         "target/release/dataset-restore",
         "../target/release/dataset-restore",
     ];
-    for candidate in candidates {
+    for candidate in fast_candidates {
         let path = PathBuf::from(candidate);
         if path.is_file() {
             return path;
         }
     }
-    panic!("dataset-restore binary not found; run `cargo build --release -p live-probe --bin dataset-restore` first");
+
+    // Chemin lent : construire le binaire via la CLI cargo courante. Cargo
+    // positionne `CARGO` sur son propre chemin pendant `cargo test`, donc on
+    // réutilise la même toolchain que le runner. `--locked` interdit toute
+    // modification du Cargo.lock (règle projet).
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let build = Command::new(&cargo)
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "live-probe",
+            "--bin",
+            "dataset-restore",
+        ])
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to spawn `{cargo} build --release --locked -p live-probe --bin dataset-restore`: {error}"
+            )
+        });
+    if !build.status.success() {
+        panic!(
+            "cargo build --release -p live-probe --bin dataset-restore failed (status={:?}); stderr:\n{}",
+            build.status.code(),
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+
+    // Re-chercher après build. Le `target/` est positionné par cargo via
+    // `CARGO_TARGET_DIR` (quand défini) ou à défaut `<workspace>/target`.
+    for candidate in fast_candidates {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return path;
+        }
+    }
+    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        let path = PathBuf::from(target_dir).join("release").join("dataset-restore");
+        if path.is_file() {
+            return path;
+        }
+    }
+    panic!(
+        "dataset-restore binary not found after `cargo build --release --locked -p live-probe --bin dataset-restore` succeeded; searched {fast_candidates:?} and $CARGO_TARGET_DIR/release/"
+    );
 }
 
 fn jsonl_line(event_id: &str, capture_id: &str, packet_number: u64) -> String {

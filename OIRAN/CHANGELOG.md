@@ -1,5 +1,23 @@
 # Changelog
 
+## OIRAN API 2.14.6 / live-probe 0.5.12 — 2026-11-13 — tests autonomes (dataset-restore, four-plane, continuous-capture)
+
+Trois tests dépendaient de l’environnement sans le dire ; ANR1 l’a formulé : « un test qui dépend de la machine sans le dire est un garde qui ne garde rien ». Correctifs appliqués sans toucher à la production — uniquement du câblage de tests, via trois points d’injection `set_*_for_tests` sur `CaptureManager`.
+
+- `dataset_restore_reinjects_archived_events_idempotently` (`live-probe/tests/dataset_restore.rs:15`) : `target_bin()` conserve un chemin rapide (3 candidats fixes) pour les runs successifs, puis reconstruit lui-même le binaire via `cargo build --release --locked -p live-probe --bin dataset-restore` (toolchain héritée de `env!("CARGO")`). Plus aucune dépendance à un build release préalable ; message d’erreur explicite si le build invoqué échoue, incluant stderr et status code.
+- `four_plane_validate_traverses_http_api_and_unix_ipc_without_acquisition` (`apps/api/src/lib.rs:6915`) : scission en deux tests. Un test unitaire déterministe (`..._unit`) qui court-circuite la découverte réseau via la nouvelle trait `InterfaceProbe` (implémentée par `FakeInterfaceProbe` exposant les 12 interfaces du contrat comme disponibles) et relâche la Policy disque via `set_policy_for_tests` + `set_disk_sample_override_for_tests` (côté manager) et une `permissive_server_policy` (côté helper). Un test de laboratoire (`..._lab`, `#[ignore]`) qui exige les ponts `br-oiran-{n2,sbi,n4,n3,…}` et ≥ 2 % d’espace disque libre ; précondition vérifiée au démarrage et produit un panic `PRECONDITION:` explicite si elle n’est pas remplie.
+- `continuous_capture_state_and_incremental_sessions_are_truthful` (`apps/api/src/lib.rs:6223`) : garde sérielle via `std::sync::Mutex` statique local au test (évite l’ajout de dépendance `serial_test` au workspace `--locked`). La Policy disque est forcée à seuils 100 % + réserve 0 pour que le worker d’import continu (`live-probe/src/lib.rs:3428`) ne bloque pas sur `CONTINUOUS_SEGMENT_PENDING_DISK_SAFETY` sur un runner saturé. L’échec au premier assert produit désormais un diagnostic structuré : `segments_ingested=X (expected ≥3); job state=Y; elapsed_ms=Z (deadline=10_000); scans_performed=N`. L’échéance n’est pas allongée (règle ANR1 : « pas d’augmentation d’échéance sans mesure »).
+
+Changements de surface API ajoutés en 2.14.6 :
+- `live_probe::InterfaceProbe` : trait `pub` avec une méthode `fn interfaces(&self) -> Vec<CaptureInterface>`.
+- `live_probe::SysfsInterfaceProbe` : implémentation par défaut (lecture de `<interface_root>/<device>/operstate`).
+- `CaptureManager::set_interface_probe_for_tests(Arc<dyn InterfaceProbe>)`.
+- `CaptureManager::set_disk_sample_override_for_tests(Option<Result<FilesystemSample, String>>)`.
+- `CaptureManager::set_policy_for_tests(Policy)`.
+- Re-export `pub use disk_safety;` depuis `live-probe` pour que les crates externes (ici `oiran-api`) puissent construire un `FilesystemSample` sans dépendre directement de `disk-safety`.
+
+Aucun comportement de production modifié : les constructeurs publics `with_pseudonym_key_path` / `with_helper` / `with_helper_and_interface_root` installent toujours `SysfsInterfaceProbe` par défaut, `disk_sample_override_for_tests = None` et `policy = Policy::default()`. Les trois setters sont nommés `_for_tests` pour signaler l’intention à la lecture.
+
 ## OIRAN API 2.14.5 — 2026-11-13 — test d’accès au démarrage déterministe sous root
 
 - Le test `absent_service_state_directory_in_read_only_parent_is_explicit` utilisait un répertoire parent à mode 0o555 et comptait sur l’échec de `libc::access(parent, W_OK)` ; `libc::access` outrepasse les mode bits pour un `euid=0` (reproduit via `unshare -r` sur `7ad769e` et sur `6e118ef`), le test recevait alors `Ok(())` — faux positif.

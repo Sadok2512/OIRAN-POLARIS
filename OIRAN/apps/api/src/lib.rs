@@ -6219,8 +6219,30 @@ mod tests {
         );
     }
 
+    /// 2.14.6 (ANR1 #10) — ce test instancie un vrai thread d'import
+    /// continu qui travaille sur `/tmp`. Sous une exécution `cargo test`
+    /// non `--test-threads=1`, les autres tests parallèles de la suite
+    /// peuvent saturer le pool d'I/O du runner et faire dériver le
+    /// polling à 10 s (deadline historique, conservée telle quelle par
+    /// ANR1). On sérialise ce test via un `std::sync::Mutex` statique
+    /// contre lui-même et contre les futurs tests `continuous_*` de
+    /// `apps/api`. L'échéance n'est PAS allongée (règle ANR1 : « pas
+    /// d'augmentation d'échéance sans mesure »).
+    ///
+    /// L'échec au premier assert produit désormais un message
+    /// diagnostique structuré : état observé (segments_ingested,
+    /// job state), temps écoulé réel, nombre de scans effectués.
     #[tokio::test]
     async fn continuous_capture_state_and_incremental_sessions_are_truthful() {
+        // Garde sérielle : tout autre test `continuous_*` ajouté à
+        // `apps/api/src/lib.rs` doit acquérir ce même lock pour éviter
+        // que les threads d'import continu ne se partagent le pool
+        // d'I/O.
+        static CONTINUOUS_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = CONTINUOUS_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -6255,8 +6277,36 @@ mod tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
         let mut config = test_config(workspace, "registry-continuous");
-        config.capture_root = capture_root;
-        let state = AppState::load(config).unwrap();
+        config.capture_root = capture_root.clone();
+        // 2.14.6 (ANR1 #10) : le worker d'import continu réévalue
+        // `capture_budget(measure_path(&self.root), …)` à chaque segment
+        // (`live-probe/src/lib.rs:3428`). Sans cet override, un runner
+        // dont le disque dépasse 98 % (policy.stop_percent par défaut)
+        // rend `CONTINUOUS_SEGMENT_PENDING_DISK_SAFETY` et le job
+        // bascule en `Blocked` → `active_captures = 0` au lieu de 1.
+        // On applique une politique permissive AVANT de confier le
+        // manager à `AppState` (le thread spawné par
+        // `start_continuous_import` lit `self.policy` à la clone).
+        let permissive_continuous_policy = live_probe::disk_safety::Policy {
+            information_percent: 100,
+            warning_percent: 100,
+            stop_percent: 100,
+            hard_limit_percent: 100,
+            max_file_bytes: 256 * 1024 * 1024,
+            max_files: 8,
+            max_job_seconds: 15 * 60,
+            max_concurrent_jobs: 1,
+            polling_interval_ms: 1_000,
+            reserve_bytes: 0,
+        };
+        let mut manager = live_probe::CaptureManager::with_pseudonym_key_path(
+            capture_root.clone(),
+            config.capture_execution_enabled,
+            capture_root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        manager.set_policy_for_tests(permissive_continuous_policy);
+        let state = AppState::load_with_capture_manager(config, manager).unwrap();
         state
             .inner
             .capture_manager
@@ -6272,7 +6322,9 @@ mod tests {
                 runtime_pdu_evidence: None,
             })
             .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(10);
+        let mut scans = 0u32;
         while state
             .inner
             .capture_manager
@@ -6281,7 +6333,26 @@ mod tests {
             && std::time::Instant::now() < deadline
         {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            scans += 1;
         }
+        let final_job = state
+            .inner
+            .capture_manager
+            .get(live_probe::CONTINUOUS_CAPTURE_ID);
+        let final_segments_ingested = final_job
+            .as_ref()
+            .map(|job| job.metrics.segments_ingested)
+            .unwrap_or_default();
+        let final_state = final_job
+            .as_ref()
+            .map(|job| format!("{:?}", job.state))
+            .unwrap_or_else(|| "JOB_MISSING".into());
+        let elapsed_ms = started.elapsed().as_millis();
+        let diag = move |expected: &'static str| -> String {
+            format!(
+                "continuous import diagnostic: {expected}; segments_ingested={final_segments_ingested} (expected ≥3); job state={final_state}; elapsed_ms={elapsed_ms} (deadline=10_000); scans_performed={scans}"
+            )
+        };
         let app = router(state.clone(), None);
         let metrics = json_body(
             app.clone()
@@ -6290,7 +6361,11 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(metrics["data"]["active_captures"], 1);
+        assert_eq!(
+            metrics["data"]["active_captures"], 1,
+            "{}",
+            diag("active_captures != 1")
+        );
         assert_eq!(metrics["data"]["active_sessions"], 0);
         assert_eq!(metrics["data"]["fresh_packet_count"], 0);
         assert_eq!(metrics["data"]["active_ue_ips"], json!([]));
@@ -6911,8 +6986,14 @@ mod tests {
         assert_eq!(json_body(start).await["error"]["code"], "OPERATOR_REQUIRED");
     }
 
+    /// 2.14.6 (ANR1 #10) — variante déterministe du test
+    /// `four_plane_validate_traverses_http_api_and_unix_ipc` : utilise
+    /// `InterfaceProbe` injectable et `set_disk_sample_override_for_tests`
+    /// pour couper toute dépendance à l'environnement (ponts réseau,
+    /// taux de remplissage du disque local). Doit passer partout, en
+    /// uid 1001 comme en uid 0, en parallèle comme en sériel.
     #[tokio::test]
-    async fn four_plane_validate_traverses_http_api_and_unix_ipc_without_acquisition() {
+    async fn four_plane_validate_traverses_http_api_and_unix_ipc_without_acquisition_unit() {
         let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -6921,8 +7002,180 @@ mod tests {
         let suffix = format!("{}-{}", std::process::id(), epoch_seconds());
         let manager_root = workspace
             .join("runtime")
-            .join(format!("api-four-plane-{suffix}"));
-        let helper_root = std::env::temp_dir().join(format!("oiran-four-plane-{suffix}"));
+            .join(format!("api-four-plane-unit-{suffix}"));
+        let helper_root = std::env::temp_dir().join(format!("oiran-four-plane-unit-{suffix}"));
+        let interface_root = helper_root.join("interfaces");
+        for interface in [
+            InterfaceId::N2,
+            InterfaceId::Sbi,
+            InterfaceId::N4,
+            InterfaceId::N3,
+        ] {
+            fs::create_dir_all(interface_root.join(interface.device())).unwrap();
+        }
+        let socket = helper_root.join("capture-helper.sock");
+        let permissive_server_policy = Policy {
+            information_percent: 100,
+            warning_percent: 100,
+            stop_percent: 100,
+            hard_limit_percent: 100,
+            max_file_bytes: 256 * 1024 * 1024,
+            max_files: 8,
+            max_job_seconds: 15 * 60,
+            max_concurrent_jobs: 1,
+            polling_interval_ms: 1_000,
+            reserve_bytes: 0,
+        };
+        let service = CaptureService::new(
+            ServerConfig {
+                socket_path: socket.clone(),
+                capture_root: helper_root.join("captures"),
+                interface_root: interface_root.clone(),
+                allowed_client_uid: unsafe { libc::geteuid() },
+                allowed_client_gid: Some(unsafe { libc::getegid() }),
+                socket_gid: None,
+                policy: permissive_server_policy,
+            },
+            ValidationOnlyBackend,
+        )
+        .unwrap();
+        let listener = service.bind().unwrap();
+        let server = service.clone();
+        let helper_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            server.handle_stream(stream).unwrap();
+        });
+
+        // Politique test : tous les seuils de sûreté disque sont relâchés
+        // pour que la décision ne dépende pas du taux de remplissage réel
+        // du runner. Réserve à 0 pour que `capture_budget` ne compare pas
+        // les 8 GiB de réserve par défaut à un volume quasi plein.
+        let permissive_policy = live_probe::disk_safety::Policy {
+            information_percent: 100,
+            warning_percent: 100,
+            stop_percent: 100,
+            hard_limit_percent: 100,
+            max_file_bytes: 256 * 1024 * 1024,
+            max_files: 8,
+            max_job_seconds: 15 * 60,
+            max_concurrent_jobs: 1,
+            polling_interval_ms: 1_000,
+            reserve_bytes: 0,
+        };
+        let helper = CaptureHelperClient::new(socket, unsafe { libc::geteuid() });
+        let mut manager = CaptureManager::with_helper_and_interface_root(
+            manager_root.clone(),
+            true,
+            helper,
+            interface_root,
+            manager_root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        // Sonde factice qui expose les 12 interfaces attendues comme
+        // disponibles, sans lire `/sys/class/net` ni dépendre des ponts
+        // Docker du lab POLARIS.
+        manager.set_interface_probe_for_tests(Arc::new(FakeInterfaceProbe::all_available()));
+        // Disque simulé à 10 % d'utilisation avec 450 GiB libres, inodes
+        // confortables : court-circuite `measure_path(&self.root)` qui
+        // dépend du taux de remplissage réel du runner.
+        manager.set_disk_sample_override_for_tests(Some(Ok(
+            live_probe::disk_safety::FilesystemSample {
+                total_bytes: 500 * 1024 * 1024 * 1024,
+                available_bytes: 450 * 1024 * 1024 * 1024,
+                total_inodes: 10_000_000,
+                available_inodes: 9_000_000,
+            },
+        )));
+        manager.set_policy_for_tests(permissive_policy);
+        let mut config = test_config(workspace, "registry-four-plane-unit");
+        config.capture_root = manager_root.clone();
+        config.capture_execution_enabled = true;
+        config.operator_token_sha256 = Some(sha256_hex(b"test-operator-token"));
+        let app = router(
+            AppState::load_with_capture_manager(config, manager).unwrap(),
+            None,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/captures/validate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                    .body(Body::from(
+                        serde_json::to_vec(&CaptureRequest::default()).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["data"]["validation"]["valid"], true,
+            "validation blockers: {:?}",
+            body["data"]["validation"]["blockers"]
+        );
+        // 2.9.2 (#9 comment 6710853974): the allowlist carries 11
+        // decoder-backed planes (N2/N3/N4/SBI + 7 LTE core planes).
+        // 2.11.0 (devmat) : 13ᵉ plane IMS (SIP + RTP) → 12 maintenant.
+        assert_eq!(
+            body["data"]["validation"]["interfaces"]
+                .as_array()
+                .unwrap()
+                .len(),
+            12
+        );
+        helper_thread.join().unwrap();
+        let _ = fs::remove_dir_all(manager_root);
+        let _ = fs::remove_dir_all(helper_root);
+    }
+
+    /// 2.14.6 (ANR1 #10) — variante de laboratoire. Nécessite les ponts
+    /// `br-oiran-{n2,n3,n4,sbi,s1m,s1u,s11,s5c,s5u,s6a,sxab,ims}` et
+    /// au moins 2 % d'espace disque libre sur le workspace. Marquée
+    /// `#[ignore]` pour qu'un `cargo test` ordinaire ne la lance pas
+    /// implicitement ; à exécuter avec `cargo test -- --ignored` sur
+    /// un hôte de laboratoire POLARIS. Les préconditions sont
+    /// vérifiées explicitement au démarrage et produisent un panic
+    /// clair quand elles ne sont pas remplies (« un garde qui se saute
+    /// ne garde rien » — ANR1).
+    #[tokio::test]
+    #[ignore = "lab: requires br-oiran-{n2,n3,n4,sbi,…} bridges and ≥2% disk free"]
+    async fn four_plane_validate_traverses_http_api_and_unix_ipc_without_acquisition_lab() {
+        for bridge in [
+            "br-oiran-n2",
+            "br-oiran-sbi",
+            "br-oiran-n4",
+            "br-oiran-n3",
+        ] {
+            let sysfs = FsPath::new("/sys/class/net").join(bridge);
+            assert!(
+                sysfs.is_dir(),
+                "PRECONDITION: bridge {sysfs:?} is missing — run POLARIS Control compose stack \
+                 before `cargo test -- --ignored four_plane_...lab`"
+            );
+        }
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let sample = live_probe::disk_safety::measure_path(workspace)
+            .expect("PRECONDITION: workspace filesystem is not reachable");
+        let usage_bp = sample.usage_basis_points().unwrap_or(10_000);
+        assert!(
+            usage_bp < 9_800,
+            "PRECONDITION: workspace filesystem at {}‱ usage is above the 98% hard-limit \
+             (disk-safety rejects new captures) — free space before running this test",
+            usage_bp
+        );
+
+        let suffix = format!("{}-{}", std::process::id(), epoch_seconds());
+        let manager_root = workspace
+            .join("runtime")
+            .join(format!("api-four-plane-lab-{suffix}"));
+        let helper_root = std::env::temp_dir().join(format!("oiran-four-plane-lab-{suffix}"));
         let interface_root = helper_root.join("interfaces");
         for interface in [
             InterfaceId::N2,
@@ -6958,11 +7211,11 @@ mod tests {
             manager_root.clone(),
             true,
             helper,
-            interface_root,
+            PathBuf::from("/sys/class/net"),
             manager_root.join(".oiran-pseudonym.key"),
         )
         .unwrap();
-        let mut config = test_config(workspace, "registry-four-plane");
+        let mut config = test_config(workspace, "registry-four-plane-lab");
         config.capture_root = manager_root.clone();
         config.capture_execution_enabled = true;
         config.operator_token_sha256 = Some(sha256_hex(b"test-operator-token"));
@@ -6986,10 +7239,11 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
-        assert_eq!(body["data"]["validation"]["valid"], true);
-        // 2.9.2 (#9 comment 6710853974): the allowlist carries 11
-        // decoder-backed planes (N2/N3/N4/SBI + 7 LTE core planes).
-        // 2.11.0 (devmat) : 13ᵉ plane IMS (SIP + RTP) → 12 maintenant.
+        assert_eq!(
+            body["data"]["validation"]["valid"], true,
+            "validation blockers: {:?}",
+            body["data"]["validation"]["blockers"]
+        );
         assert_eq!(
             body["data"]["validation"]["interfaces"]
                 .as_array()
@@ -7000,6 +7254,36 @@ mod tests {
         helper_thread.join().unwrap();
         let _ = fs::remove_dir_all(manager_root);
         let _ = fs::remove_dir_all(helper_root);
+    }
+
+    /// Sonde factice pour les tests déterministes (cf.
+    /// `four_plane_validate_..._unit`). Produit exactement les 12
+    /// interfaces publiées par `live_probe::interface_specs()`, toutes
+    /// marquées disponibles, operstate "UP", sans toucher au sysfs.
+    struct FakeInterfaceProbe {
+        interfaces: Vec<live_probe::CaptureInterface>,
+    }
+
+    impl FakeInterfaceProbe {
+        fn all_available() -> Self {
+            Self {
+                interfaces: live_probe::interface_specs()
+                    .into_iter()
+                    .map(|mut interface| {
+                        interface.available = true;
+                        interface.operstate = "UP".into();
+                        interface.reason = None;
+                        interface
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    impl live_probe::InterfaceProbe for FakeInterfaceProbe {
+        fn interfaces(&self) -> Vec<live_probe::CaptureInterface> {
+            self.interfaces.clone()
+        }
     }
 
     /// 2.9.2 (#9 Analyzer T5 — comment 6712678520). The continuous lab

@@ -20,6 +20,11 @@ use correlation_engine::{
     correlate_cross_interface_evidence, correlate_discovered_tunnels, correlate_lte_evidence,
 };
 use disk_safety::{assess, capture_budget, measure_path, CaptureBudget, Decision, Policy};
+// 2.14.6 (ANR1 #10) : re-export du module `disk_safety` pour que les
+// tests externes (apps/api) puissent construire un `FilesystemSample`
+// à injecter via `set_disk_sample_override_for_tests` sans ajouter
+// `disk-safety` en dépendance directe à chaque crate test.
+pub use disk_safety;
 use event_schema::{
     sha256_hex, DecodeStatus, EvidenceReference, EvidenceState, InformationElement, NamedValue,
     NormalizedEvent, Protocol, PseudonymKey, Sha256Hasher,
@@ -1579,6 +1584,30 @@ struct ForensicCaptureFile {
     size_bytes: u64,
 }
 
+/// 2.14.6 (ANR1 #10) — abstraction sur la découverte d'interfaces, pour
+/// permettre à un test unitaire de court-circuiter la lecture de
+/// `/sys/class/net/<device>/operstate` sans toucher au filesystem. En
+/// production, l'implémentation par défaut (`SysfsInterfaceProbe`) scrute
+/// toujours le vrai sysfs (ou le répertoire injecté via
+/// `with_helper_and_interface_root`). Le test peut fournir un stub.
+pub trait InterfaceProbe: Send + Sync {
+    fn interfaces(&self) -> Vec<CaptureInterface>;
+}
+
+/// Implémentation production : lit `<interface_root>/<device>/operstate`.
+pub struct SysfsInterfaceProbe {
+    pub interface_root: PathBuf,
+}
+
+impl InterfaceProbe for SysfsInterfaceProbe {
+    fn interfaces(&self) -> Vec<CaptureInterface> {
+        interface_specs()
+            .into_iter()
+            .map(|interface| discover_interface(interface, &self.interface_root))
+            .collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct CaptureManager {
     root: PathBuf,
@@ -1596,6 +1625,17 @@ pub struct CaptureManager {
     // including after a probe restart against the same key path. Wrapped in
     // Arc so the struct stays Clone (handles only, no key copies).
     pseudonym_key: Arc<PseudonymKey>,
+    /// 2.14.6 (ANR1 #10) — sonde injectable pour la liste des interfaces.
+    /// Permet au test `four_plane_validate_..._unit` de passer sans
+    /// présence physique des ponts `br-oiran-*`. Les constructeurs de
+    /// production renvoient `SysfsInterfaceProbe { interface_root }`.
+    interface_probe: Arc<dyn InterfaceProbe>,
+    /// 2.14.6 (ANR1 #10) — override test-only du résultat de
+    /// `measure_path(&self.root)` consommé par `validate()`. `None` en
+    /// production (mesure sysfs réelle) ; `Some(Ok(…))` dans les tests
+    /// pour que le disque local du runner (saturé à 98 %+ sur certaines
+    /// machines dev) n'influence pas la décision `capture_budget`.
+    disk_sample_override_for_tests: Option<Result<disk_safety::FilesystemSample, String>>,
 }
 
 impl CaptureManager {
@@ -1660,6 +1700,9 @@ impl CaptureManager {
         fs::create_dir_all(&root).map_err(display_error)?;
         let pseudonym_key = PseudonymKey::load_or_generate(&pseudonym_key_path)
             .map_err(|code| code.to_string())?;
+        let interface_probe: Arc<dyn InterfaceProbe> = Arc::new(SysfsInterfaceProbe {
+            interface_root: interface_root.clone(),
+        });
         let manager = Self {
             root,
             interface_root,
@@ -1672,6 +1715,8 @@ impl CaptureManager {
             continuous_stop: Arc::new(AtomicBool::new(false)),
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
             pseudonym_key: Arc::new(pseudonym_key),
+            interface_probe,
+            disk_sample_override_for_tests: None,
         };
         manager.recover_registry()?;
         manager.load_recovery_registry()?;
@@ -1785,10 +1830,37 @@ impl CaptureManager {
     }
 
     pub fn interfaces(&self) -> Vec<CaptureInterface> {
-        interface_specs()
-            .into_iter()
-            .map(|interface| discover_interface(interface, &self.interface_root))
-            .collect()
+        self.interface_probe.interfaces()
+    }
+
+    /// 2.14.6 (ANR1 #10) — swap test-only de la sonde d'interfaces.
+    /// L'appelant est responsable de ne l'invoquer que depuis un contexte
+    /// de test ; les constructeurs publics installent toujours
+    /// `SysfsInterfaceProbe` par défaut.
+    pub fn set_interface_probe_for_tests(&mut self, probe: Arc<dyn InterfaceProbe>) {
+        self.interface_probe = probe;
+    }
+
+    /// 2.14.6 (ANR1 #10) — force le `FilesystemSample` consommé par
+    /// `capture_budget` dans `validate()`. `None` en production (mesure
+    /// sysfs réelle via `measure_path`). Les tests passent
+    /// `Some(Ok(FilesystemSample { … }))` pour que le disque local du
+    /// runner (saturé à 98 %+ sur certaines machines dev) n'influence
+    /// pas la décision de validation.
+    pub fn set_disk_sample_override_for_tests(
+        &mut self,
+        sample: Option<Result<disk_safety::FilesystemSample, String>>,
+    ) {
+        self.disk_sample_override_for_tests = sample;
+    }
+
+    /// 2.14.6 (ANR1 #10) — swap test-only de la Policy consommée par
+    /// `validate()` et `start()`. Les constructeurs publics installent
+    /// `Policy::default()` ; le test peut relever les seuils pour que la
+    /// décision disque ne dépende pas du taux de remplissage réel du
+    /// runner.
+    pub fn set_policy_for_tests(&mut self, policy: Policy) {
+        self.policy = policy;
     }
 
     pub fn validate(&self, request: &CaptureRequest) -> ValidationResult {
@@ -1797,7 +1869,10 @@ impl CaptureManager {
         if !self.execution_enabled() {
             blockers.push("CAPTURE_EXECUTION_NOT_ENABLED".into());
         }
-        let sample = measure_path(&self.root);
+        let sample = self
+            .disk_sample_override_for_tests
+            .clone()
+            .unwrap_or_else(|| measure_path(&self.root));
         let disk_decision = assess(sample.clone(), self.policy);
         let budget = capture_budget(sample, request.max_bytes, self.policy);
         if !budget.allowed {
