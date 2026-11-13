@@ -2711,10 +2711,35 @@ fn session_summary(state: &AppState, flow: &CallFlow) -> Value {
             .to_owned()
         })
         .unwrap_or_else(|| "UNKNOWN".into());
+    // 2.14.4 (ANR2 ladder écart 4) : la colonne AMF/MME de l'UI lisait
+    // `serving_node`, qui contient toujours le RAN (eNB/gNB). On expose
+    // désormais deux champs distincts, résolus depuis la même liste de
+    // participants, pour que l'UI puisse afficher gNB/eNB d'un côté et
+    // AMF/MME de l'autre. `serving_node` est maintenu pour la compat
+    // arrière mais devient équivalent à `serving_ran_node`.
+    let serving_ran_node = serving_node.clone();
+    let core_node = flow
+        .participants
+        .iter()
+        .find(|participant| matches!(participant.role.as_str(), "AMF" | "MME"))
+        .map(|participant| {
+            format!(
+                "{} {}",
+                participant.role,
+                participant
+                    .addresses
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("")
+            )
+            .trim()
+            .to_owned()
+        })
+        .unwrap_or_else(|| "UNKNOWN".into());
     json!({
         "session_id":flow.session_id,"dataset_id":state.inner.manifest.get("scenario_id"),"ue_context_id":ue_context_id,
         "dataset_kind":"HISTORICAL",
-        "technology":flow.technology,"ue_pseudonym":ue_pseudonym,"pdu_session_id":pdu_session_id,"serving_node":serving_node,
+        "technology":flow.technology,"ue_pseudonym":ue_pseudonym,"pdu_session_id":pdu_session_id,"serving_node":serving_node,"serving_ran_node":serving_ran_node,"core_node":core_node,
         "procedure":flow.procedures.iter().filter(|procedure| procedure.name!="Background / Lifecycle").map(|procedure|procedure.name.as_str()).collect::<Vec<_>>().join(" + "),
         "start_timestamp":flow.start_timestamp,"end_timestamp":flow.end_timestamp,"interfaces":flow.interfaces,"message_count":flow.accounting.session_events,
         "duration_ns":duration_ns.to_string(),
@@ -2786,10 +2811,35 @@ fn live_session_summary(dataset: &live_probe::LiveDataset, flow: &CallFlow) -> V
             .to_owned()
         })
         .unwrap_or_else(|| "UNKNOWN".into());
+    // 2.14.4 (ANR2 ladder écart 4) : la colonne AMF/MME de l'UI lisait
+    // `serving_node`, qui contient toujours le RAN (eNB/gNB). On expose
+    // désormais deux champs distincts, résolus depuis la même liste de
+    // participants, pour que l'UI puisse afficher gNB/eNB d'un côté et
+    // AMF/MME de l'autre. `serving_node` est maintenu pour la compat
+    // arrière mais devient équivalent à `serving_ran_node`.
+    let serving_ran_node = serving_node.clone();
+    let core_node = flow
+        .participants
+        .iter()
+        .find(|participant| matches!(participant.role.as_str(), "AMF" | "MME"))
+        .map(|participant| {
+            format!(
+                "{} {}",
+                participant.role,
+                participant
+                    .addresses
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("")
+            )
+            .trim()
+            .to_owned()
+        })
+        .unwrap_or_else(|| "UNKNOWN".into());
     json!({
         "session_id":flow.session_id,"dataset_id":dataset.dataset_id,"ue_context_id":discovered.map(|session|session.ue_context_id.clone()),
         "dataset_kind":if dataset.dataset_id.starts_with("derived-") {"DERIVED"} else if dataset.dataset_id.starts_with("recovered-dataset-") {"RECOVERED"} else if dataset.capture_id == live_probe::CONTINUOUS_CAPTURE_ID && !fresh_flow {"HISTORICAL"} else {"CAPTURED_LIVE"},
-        "technology":flow.technology,"ue_pseudonym":runtime.map(|context|context.internal_ue_id.as_str()).or_else(||context.map(|context|context.pseudonym.as_str())).unwrap_or("UNKNOWN"),"pdu_session_id":runtime.map(|context|context.pdu_session_id.as_str()).or_else(||discovered.map(|session|session.pdu_session_id.as_str())),"serving_node":serving_node,
+        "technology":flow.technology,"ue_pseudonym":runtime.map(|context|context.internal_ue_id.as_str()).or_else(||context.map(|context|context.pseudonym.as_str())).unwrap_or("UNKNOWN"),"pdu_session_id":runtime.map(|context|context.pdu_session_id.as_str()).or_else(||discovered.map(|session|session.pdu_session_id.as_str())),"serving_node":serving_node,"serving_ran_node":serving_ran_node,"core_node":core_node,
         "procedure":flow.procedures.iter().map(|procedure|procedure.name.as_str()).collect::<Vec<_>>().join(" + "),
         "start_timestamp":flow.start_timestamp,"end_timestamp":flow.end_timestamp,"interfaces":flow.interfaces,
         "message_count":flow.accounting.session_events,"source_event_count":flow.accounting.source_events,
@@ -2812,7 +2862,7 @@ fn lte_session_summary(manifest: &LteDatasetManifest, session: &LteSession) -> V
         "session_id":session.session_id,"dataset_id":manifest.dataset_id,
         "ue_context_id":Value::Null,"dataset_kind":"EVIDENCE","technology":"LTE",
         "ue_pseudonym":session.ue_pseudonym,
-        "pdu_session_id":session.eps_bearer_ids.first().cloned(),"serving_node":Value::Null,
+        "pdu_session_id":session.eps_bearer_ids.first().cloned(),"serving_node":Value::Null,"serving_ran_node":Value::Null,"core_node":Value::Null,
         "procedure":session.procedures.join(" + "),
         "start_timestamp":session.start_timestamp_ns.to_string(),
         "end_timestamp":session.end_timestamp_ns.to_string(),"interfaces":session.interfaces,
