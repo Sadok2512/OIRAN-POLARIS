@@ -12,6 +12,94 @@
 - Enables open access in the production service-unit example and aligns the
   platform, API, and web manifests on version 0.31.0.
 
+## 0.30.1 (polaris-control-api) — 2026-11-12
+
+- Le préflight LTE exige exactement 13 processus `dumpcap` : les 12 interfaces
+  de capture de la plateforme et la capture IMS. Douze ou quatorze processus
+  bloquent toujours le démarrage.
+
+## 0.30.0 (polaris-control-api) — 2026-11-09 — LTE certification-run endpoint + 423 lift + DN default (ANR1 #10 6737561274)
+
+ANR1 a prouvé que l'API 0.29.16 reste bloquée en 423 sur
+`lte_attach`/`lte_detach`/`lte_traffic_ul`/`lte_traffic_dl` :
+impasse logique puisque le run produit lui-même la certification.
+ANR1 a aussi observé que `config/scenarios/lte.yaml:4` vise
+`10.77.16.100` alors que le DN SGi réel est `10.77.16.30`
+(sidecar `polaris-lte-sgi-dn`,
+`deployment/dn-sender/lte-sgi/compose.yaml:30`).
+
+### Nouveau endpoint `POST /polaris-api/v1/lte/certification-run`
+
+- `require_operator` (rôle `operator` ou `administrator` + CSRF
+  valide). Viewer → 403 `OPERATOR_PERMISSION_REQUIRED`.
+- Exige `execution_mode=live`, `srsran_live_enabled=true` et le
+  mode `LteOperationMode::CertificationRun` (env
+  `POLARIS_LTE_CERTIFICATION_RUN_ENABLED=1`). Sinon 423
+  `LTE_CERTIFICATION_RUN_REQUIRED` avec l'état courant pour
+  diagnostic.
+- Génère un `run_id` sûr (`lte-certif-<16 hex>` ; validation
+  stricte via `lte_certification_run_id_is_valid`).
+- Écrit une ligne d'audit
+  `LTE_CERTIFICATION_RUN_AUTHORIZED` via la sink `audit()`
+  existante.
+- Retourne `target_dn_ip` lu de `configured_traffic_peer()`
+  (env override + fallback `LTE_SGI_DN_DEFAULT_PEER_IP =
+  10.77.16.30`), `authorized_steps` = exactement
+  `[lte_attach, lte_detach, lte_traffic_ul, lte_traffic_dl]`
+  (pas `lte_attach_data`), et `authorized_at_epoch_s`.
+
+### 423 levée pour le mode CertificationRun
+
+Deux sites du gate 423 modifiés :
+- `apps/api/src/lib.rs:12961-12979` (steps `lte_attach` et
+  siblings dans `resolved[*]`) : accepte désormais le mode
+  `CertificationRun` en plus de `LiveOperational`.
+- `apps/api/src/lib.rs:10911-10921` (traffic session request) :
+  même règle.
+
+La condition devient `lte_operation_mode(&state) !=
+LteOperationMode::Disabled` + `execution_mode=live` +
+`srsran_live_enabled=true`. Le démarrage effectif de srsENB +
+srsUE reste orchestré par les routes existantes
+`POST /lte/runs` et `POST /lte/components/start` qui lancent
+`docker compose --profile lte` via `COMPOSE_FILE_ARGS` (0.29.13).
+
+### DN LTE SGi — valeur par défaut dans le code
+
+`apps/api/src/srsran_controller.rs` :
+- Nouvelle constante publique
+  `LTE_SGI_DN_DEFAULT_PEER_IP = "10.77.16.30"` (source de
+  vérité : le sidecar `polaris-lte-sgi-dn`,
+  `deployment/dn-sender/lte-sgi/compose.yaml:30` `ipv4_address`).
+- `configured_traffic_peer()` retombe désormais sur cette
+  constante quand `POLARIS_LTE_TRAFFIC_PEER_IP` n'est pas défini.
+  L'override opérateur par env PRIME. ANR1 observait
+  `10.77.16.100` dans `/root/POLARIS/config/scenarios/lte.yaml:4` ;
+  la nouvelle valeur par défaut corrige l'impasse de recette
+  côté code, indépendamment de l'édit YAML.
+- Fonction `configured_traffic_peer_public()` expose au reste
+  du crate l'IP résolue (utilisée par
+  `authorize_lte_certification_run`).
+
+### Tests
+
+- `p0_tests::lte_certification_run_id_validates_safe_identifier_only_0_30_0`
+  — chaque chemin de validation `run_id` (préfixe, longueur
+  ≤ 48, caractères shell-unsafe rejetés).
+- `p0_tests::lte_certification_response_authorizes_only_the_four_canonical_steps_0_30_0`
+  — les 4 steps autorisés exactement, pas de `lte_attach_data`,
+  et la sérialisation JSON ne fuit AUCUN secret (IMSI/IMEI/K/
+  OPc/password tous absents).
+- `srsran_controller::tests::configured_traffic_peer_rejects_collision_with_n6_sender`
+  — étendu : prouve le fallback 0.30.0 sur `10.77.16.30`
+  quand l'env opérateur est absent.
+
+### Lignée
+
+Basée sur `feat/oiran-2.9.0` (tip `a4f640d`, OIRAN 2.9.16) qui
+contient `aaa15fb` (le commit « 2.7.7 / 0.29.16 » que ANR1 référence).
+`git merge-base --is-ancestor aaa15fb HEAD` → true.
+
 ## 0.29.16 (polaris-control-api) — 2026-11-04 — privacy contract lock-down for `subscriber_pseudonym` / `identity_pseudonym`
 
 - `privacy_safe_value()` adds a single lock-down exception agreed with
