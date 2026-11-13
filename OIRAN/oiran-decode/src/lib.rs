@@ -291,15 +291,29 @@ where
                     let Some(interface) = sctp_route(&config.interface, message.ppid) else {
                         continue;
                     };
-                    let source = endpoint(
+                    let mut source = endpoint(
                         &message.source_ip,
                         Some(message.source_port),
                         &config.endpoints,
                     );
-                    let destination = endpoint(
+                    let mut destination = endpoint(
                         &message.destination_ip,
                         Some(message.destination_port),
                         &config.endpoints,
+                    );
+                    // 2.14.4 (ANR2 ladder écart 1) : si la map `config.endpoints`
+                    // (clé = IP) n'a pas connaissance du couple SCTP vu dans la
+                    // capture, on résout le `network_function` depuis le port
+                    // SCTP seul. Côté S1-MME : port 36412 == MME, pair == eNB ;
+                    // côté N2/NGAP : port 38412 == AMF, pair == gNB. Un transport
+                    // qui ne se résout toujours pas garde `None` — le libellé
+                    // « Unknown endpoint » affiché par l'UI reste explicite.
+                    infer_sctp_network_function(
+                        interface,
+                        &mut source,
+                        &mut destination,
+                        message.source_port,
+                        message.destination_port,
                     );
                     let raw = format!("sha256:{}", sha256_hex(&message.payload));
                     let input = DecoderInput {
@@ -706,6 +720,45 @@ fn endpoint(ip: &str, port: Option<u16>, map: &HashMap<String, String>) -> Endpo
         address: ip.into(),
         port,
         network_function: map.get(ip).cloned(),
+    }
+}
+
+/// 2.14.4 — résolution « port SCTP seul » des `network_function` S1-MME /
+/// N2 quand la map `config.endpoints` ignore les IP du couple.
+///
+/// S1-MME (TS 36.413) : port serveur 36412 côté MME ; le pair est l'eNB.
+/// N2 / NGAP (TS 38.413) : port serveur 38412 côté AMF ; le pair est le gNB.
+///
+/// On n'écrase pas un `network_function` déjà résolu par la map : le
+/// paramétrage d'une plateforme reste prioritaire. Si aucun des deux ports
+/// SCTP n'est connu, on laisse le champ à `None` (`Unknown endpoint` côté
+/// UI, ouvert et comptable, pas silencieux).
+fn infer_sctp_network_function(
+    interface: &'static str,
+    source: &mut Endpoint,
+    destination: &mut Endpoint,
+    source_port: u16,
+    destination_port: u16,
+) {
+    let (server_port, server_nf, peer_nf): (u16, &str, &str) = match interface {
+        "S1-MME" => (36412, "MME", "eNB"),
+        "N2" => (38412, "AMF", "gNB"),
+        _ => return,
+    };
+    if source_port == server_port {
+        if source.network_function.is_none() {
+            source.network_function = Some(server_nf.into());
+        }
+        if destination.network_function.is_none() {
+            destination.network_function = Some(peer_nf.into());
+        }
+    } else if destination_port == server_port {
+        if source.network_function.is_none() {
+            source.network_function = Some(peer_nf.into());
+        }
+        if destination.network_function.is_none() {
+            destination.network_function = Some(server_nf.into());
+        }
     }
 }
 

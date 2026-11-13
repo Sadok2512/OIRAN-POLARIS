@@ -44,7 +44,7 @@ pub struct S1apPdu {
     pub kind: PduKind,
     pub procedure_code: u8,
     pub criticality: u8,
-    pub message_name: &'static str,
+    pub message_name: String,
     pub ies: Vec<S1apIe>,
 }
 
@@ -297,6 +297,19 @@ pub fn parse(payload: &[u8]) -> Result<S1apPdu, String> {
     })
 }
 
+/// Libellé TS 36.413 d'un couple (procedureCode, PduKind). Les procédures
+/// connues renvoient leur nom canonique ; les codes non mappés retombent
+/// sur « S1AP proc <code> <kind> (non mappé) » pour que le `procedureCode`
+/// numérique reste observable depuis le livrable API — cf. ANR2 ladder
+/// écart 3 (msg09 = code 22, UECapabilityInfoIndication).
+fn pdu_kind_label(kind: PduKind) -> &'static str {
+    match kind {
+        PduKind::Initiating => "initiating",
+        PduKind::SuccessfulOutcome => "successfulOutcome",
+        PduKind::UnsuccessfulOutcome => "unsuccessfulOutcome",
+    }
+}
+
 fn aper_length(data: &[u8]) -> Result<(usize, usize), String> {
     let first = *data
         .first()
@@ -521,26 +534,113 @@ fn be16(v: &[u8]) -> u16 {
     u16::from_be_bytes([v[0], v[1]])
 }
 
-fn message_name(code: u8, kind: PduKind) -> &'static str {
-    match (code, kind) {
-        (5, PduKind::Initiating) => "E-RABSetupRequest",
-        (5, PduKind::SuccessfulOutcome) => "E-RABSetupResponse",
-        (7, PduKind::Initiating) => "E-RABReleaseCommand",
-        (7, PduKind::SuccessfulOutcome) => "E-RABReleaseResponse",
-        (9, PduKind::Initiating) => "InitialContextSetupRequest",
-        (9, PduKind::SuccessfulOutcome) => "InitialContextSetupResponse",
-        (9, PduKind::UnsuccessfulOutcome) => "InitialContextSetupFailure",
-        (10, PduKind::Initiating) => "Paging",
-        (11, PduKind::Initiating) => "DownlinkNASTransport",
-        (12, PduKind::Initiating) => "InitialUEMessage",
-        (13, PduKind::Initiating) => "UplinkNASTransport",
-        (17, PduKind::Initiating) => "S1SetupRequest",
-        (17, PduKind::SuccessfulOutcome) => "S1SetupResponse",
-        (17, PduKind::UnsuccessfulOutcome) => "S1SetupFailure",
-        (18, PduKind::Initiating) => "UEContextReleaseRequest",
-        (23, PduKind::Initiating) => "UEContextReleaseCommand",
-        (23, PduKind::SuccessfulOutcome) => "UEContextReleaseComplete",
-        _ => "UnknownS1APProcedure",
+fn message_name(code: u8, kind: PduKind) -> String {
+    // TS 36.413 v16+ §9.1 — table des Elementary Procedures.
+    // Audit complet appliqué par le lot « analyzer ladder écarts 1-4 ».
+    let canonical: Option<&'static str> = match (code, kind) {
+        (0, PduKind::Initiating) => Some("HandoverRequired"),
+        (0, PduKind::SuccessfulOutcome) => Some("HandoverCommand"),
+        (0, PduKind::UnsuccessfulOutcome) => Some("HandoverPreparationFailure"),
+        (1, PduKind::Initiating) => Some("HandoverRequest"),
+        (1, PduKind::SuccessfulOutcome) => Some("HandoverRequestAcknowledge"),
+        (1, PduKind::UnsuccessfulOutcome) => Some("HandoverFailure"),
+        (2, PduKind::Initiating) => Some("HandoverNotify"),
+        (3, PduKind::Initiating) => Some("PathSwitchRequest"),
+        (3, PduKind::SuccessfulOutcome) => Some("PathSwitchRequestAcknowledge"),
+        (3, PduKind::UnsuccessfulOutcome) => Some("PathSwitchRequestFailure"),
+        (4, PduKind::Initiating) => Some("HandoverCancel"),
+        (4, PduKind::SuccessfulOutcome) => Some("HandoverCancelAcknowledge"),
+        (5, PduKind::Initiating) => Some("E-RABSetupRequest"),
+        (5, PduKind::SuccessfulOutcome) => Some("E-RABSetupResponse"),
+        (6, PduKind::Initiating) => Some("E-RABModifyRequest"),
+        (6, PduKind::SuccessfulOutcome) => Some("E-RABModifyResponse"),
+        (7, PduKind::Initiating) => Some("E-RABReleaseCommand"),
+        (7, PduKind::SuccessfulOutcome) => Some("E-RABReleaseResponse"),
+        (8, PduKind::Initiating) => Some("E-RABReleaseIndication"),
+        (9, PduKind::Initiating) => Some("InitialContextSetupRequest"),
+        (9, PduKind::SuccessfulOutcome) => Some("InitialContextSetupResponse"),
+        (9, PduKind::UnsuccessfulOutcome) => Some("InitialContextSetupFailure"),
+        (10, PduKind::Initiating) => Some("Paging"),
+        (11, PduKind::Initiating) => Some("DownlinkNASTransport"),
+        (12, PduKind::Initiating) => Some("InitialUEMessage"),
+        (13, PduKind::Initiating) => Some("UplinkNASTransport"),
+        (14, PduKind::Initiating) => Some("Reset"),
+        (14, PduKind::SuccessfulOutcome) => Some("ResetAcknowledge"),
+        (15, PduKind::Initiating) => Some("ErrorIndication"),
+        (16, PduKind::Initiating) => Some("NASNonDeliveryIndication"),
+        (17, PduKind::Initiating) => Some("S1SetupRequest"),
+        (17, PduKind::SuccessfulOutcome) => Some("S1SetupResponse"),
+        (17, PduKind::UnsuccessfulOutcome) => Some("S1SetupFailure"),
+        (18, PduKind::Initiating) => Some("UEContextReleaseRequest"),
+        (19, PduKind::Initiating) => Some("DownlinkS1CDMA2000Tunneling"),
+        (20, PduKind::Initiating) => Some("UplinkS1CDMA2000Tunneling"),
+        (21, PduKind::Initiating) => Some("UEContextModificationRequest"),
+        (21, PduKind::SuccessfulOutcome) => Some("UEContextModificationResponse"),
+        (21, PduKind::UnsuccessfulOutcome) => Some("UEContextModificationFailure"),
+        // Ajouté lot ladder : msg09 de la capture lab (pkt 31, procedureCode
+        // 22, initiating) retombait sur « UnknownS1APProcedure » faute
+        // d'entrée dans cette table.
+        (22, PduKind::Initiating) => Some("UECapabilityInfoIndication"),
+        (23, PduKind::Initiating) => Some("UEContextReleaseCommand"),
+        (23, PduKind::SuccessfulOutcome) => Some("UEContextReleaseComplete"),
+        (24, PduKind::Initiating) => Some("ENBStatusTransfer"),
+        (25, PduKind::Initiating) => Some("MMEStatusTransfer"),
+        (26, PduKind::Initiating) => Some("DeactivateTrace"),
+        (27, PduKind::Initiating) => Some("TraceStart"),
+        (28, PduKind::Initiating) => Some("TraceFailureIndication"),
+        (29, PduKind::Initiating) => Some("ENBConfigurationUpdate"),
+        (29, PduKind::SuccessfulOutcome) => Some("ENBConfigurationUpdateAcknowledge"),
+        (29, PduKind::UnsuccessfulOutcome) => Some("ENBConfigurationUpdateFailure"),
+        (30, PduKind::Initiating) => Some("MMEConfigurationUpdate"),
+        (30, PduKind::SuccessfulOutcome) => Some("MMEConfigurationUpdateAcknowledge"),
+        (30, PduKind::UnsuccessfulOutcome) => Some("MMEConfigurationUpdateFailure"),
+        (31, PduKind::Initiating) => Some("LocationReportingControl"),
+        (32, PduKind::Initiating) => Some("LocationReportingFailureIndication"),
+        (33, PduKind::Initiating) => Some("LocationReport"),
+        (34, PduKind::Initiating) => Some("OverloadStart"),
+        (35, PduKind::Initiating) => Some("OverloadStop"),
+        (36, PduKind::Initiating) => Some("WriteReplaceWarningRequest"),
+        (36, PduKind::SuccessfulOutcome) => Some("WriteReplaceWarningResponse"),
+        (37, PduKind::Initiating) => Some("ENBDirectInformationTransfer"),
+        (38, PduKind::Initiating) => Some("MMEDirectInformationTransfer"),
+        (39, PduKind::Initiating) => Some("PrivateMessage"),
+        (40, PduKind::Initiating) => Some("ENBConfigurationTransfer"),
+        (41, PduKind::Initiating) => Some("MMEConfigurationTransfer"),
+        (42, PduKind::Initiating) => Some("CellTrafficTrace"),
+        (43, PduKind::Initiating) => Some("KillRequest"),
+        (43, PduKind::SuccessfulOutcome) => Some("KillResponse"),
+        (44, PduKind::Initiating) => Some("DownlinkUEAssociatedLPPaTransport"),
+        (45, PduKind::Initiating) => Some("UplinkUEAssociatedLPPaTransport"),
+        (46, PduKind::Initiating) => Some("DownlinkNonUEAssociatedLPPaTransport"),
+        (47, PduKind::Initiating) => Some("UplinkNonUEAssociatedLPPaTransport"),
+        (48, PduKind::Initiating) => Some("UERadioCapabilityMatchRequest"),
+        (48, PduKind::SuccessfulOutcome) => Some("UERadioCapabilityMatchResponse"),
+        (49, PduKind::Initiating) => Some("PWSRestartIndication"),
+        (50, PduKind::Initiating) => Some("E-RABModificationIndication"),
+        (50, PduKind::SuccessfulOutcome) => Some("E-RABModificationConfirm"),
+        (51, PduKind::Initiating) => Some("PWSFailureIndication"),
+        (52, PduKind::Initiating) => Some("RerouteNASRequest"),
+        (53, PduKind::Initiating) => Some("UEContextModificationIndication"),
+        (53, PduKind::SuccessfulOutcome) => Some("UEContextModificationConfirm"),
+        (54, PduKind::Initiating) => Some("ConnectionEstablishmentIndication"),
+        (55, PduKind::Initiating) => Some("UEContextSuspendRequest"),
+        (55, PduKind::SuccessfulOutcome) => Some("UEContextSuspendResponse"),
+        (56, PduKind::Initiating) => Some("UEContextResumeRequest"),
+        (56, PduKind::SuccessfulOutcome) => Some("UEContextResumeResponse"),
+        (56, PduKind::UnsuccessfulOutcome) => Some("UEContextResumeFailure"),
+        (57, PduKind::Initiating) => Some("NASDeliveryIndication"),
+        (58, PduKind::Initiating) => Some("RetrieveUEInformation"),
+        (59, PduKind::Initiating) => Some("UEInformationTransfer"),
+        (60, PduKind::Initiating) => Some("ENBCPRelocationIndication"),
+        (61, PduKind::Initiating) => Some("MMECPRelocationIndication"),
+        (62, PduKind::Initiating) => Some("SecondaryRATDataUsageReport"),
+        (63, PduKind::Initiating) => Some("UERadioCapabilityIDMappingRequest"),
+        (63, PduKind::SuccessfulOutcome) => Some("UERadioCapabilityIDMappingResponse"),
+        _ => None,
+    };
+    match canonical {
+        Some(name) => name.to_string(),
+        None => format!("S1AP proc {code} ({}, non mappé)", pdu_kind_label(kind)),
     }
 }
 
@@ -770,7 +870,7 @@ impl ProtocolDecoder for S1apDecoder {
                     timestamp: input.timestamp.clone(),
                     interface: input.interface.into(),
                     protocol: Protocol::S1ap,
-                    message_name: pdu.message_name.into(),
+                    message_name: pdu.message_name.clone(),
                     message_type: kind_number(pdu.kind),
                     procedure_code: Some(pdu.procedure_code as u32),
                     procedure: None,
@@ -904,16 +1004,13 @@ fn append_eps_nas_events(
     }
 }
 
-fn infer_eps_nas_direction(input: &DecoderInput<'_>, procedure: u8) -> Direction {
-    let base = infer_direction(input, procedure);
-    if base != Direction::Unknown {
-        return base;
-    }
-    match procedure {
-        12 | 13 | 18 => Direction::RanToCore,
-        9 | 10 | 11 | 23 => Direction::CoreToRan,
-        _ => Direction::Unknown,
-    }
+fn infer_eps_nas_direction(input: &DecoderInput<'_>, _procedure: u8) -> Direction {
+    // 2.14.4 (ANR2 ladder écart 1) : la direction NAS suit toujours la
+    // direction du S1AP porteur, qui elle-même suit strictement le
+    // transport. Aucun fallback sur le procedureCode S1AP — il inversait
+    // les msg11 (InitialContextSetupResponse eNB→MME) et msg16
+    // (UEContextReleaseComplete eNB→MME) de la capture lab.
+    infer_direction_from_transport(input)
 }
 
 fn kind_number(k: PduKind) -> u32 {
@@ -924,7 +1021,16 @@ fn kind_number(k: PduKind) -> u32 {
     }
 }
 
-fn infer_direction(i: &DecoderInput<'_>, procedure: u8) -> Direction {
+fn infer_direction(i: &DecoderInput<'_>, _procedure: u8) -> Direction {
+    // 2.14.4 (ANR2 ladder écart 1) : direction = transport, jamais déduite
+    // du nom de procédure. Le code pré-2.14.4 bricolait un fallback
+    // procedureCode → (RanToCore | CoreToRan) quand le `network_function`
+    // n'était pas résolu, ce qui inversait msg11 et msg16 (deux procédures
+    // eNB→MME classées CoreToRan à tort).
+    infer_direction_from_transport(i)
+}
+
+fn infer_direction_from_transport(i: &DecoderInput<'_>) -> Direction {
     let src = i
         .source_endpoint
         .network_function
@@ -937,17 +1043,17 @@ fn infer_direction(i: &DecoderInput<'_>, procedure: u8) -> Direction {
         .as_deref()
         .unwrap_or("")
         .to_ascii_lowercase();
-    if src.contains("enb") && dst.contains("mme") {
+    let src_is_ran = src.contains("enb") || src.contains("gnb");
+    let src_is_core = src.contains("mme") || src.contains("amf");
+    let dst_is_ran = dst.contains("enb") || dst.contains("gnb");
+    let dst_is_core = dst.contains("mme") || dst.contains("amf");
+    if src_is_ran && dst_is_core {
         return Direction::RanToCore;
     }
-    if src.contains("mme") && dst.contains("enb") {
+    if src_is_core && dst_is_ran {
         return Direction::CoreToRan;
     }
-    match procedure {
-        12 | 13 | 18 => Direction::RanToCore,
-        9 | 10 | 11 | 23 => Direction::CoreToRan,
-        _ => Direction::Unknown,
-    }
+    Direction::Unknown
 }
 
 #[cfg(test)]
