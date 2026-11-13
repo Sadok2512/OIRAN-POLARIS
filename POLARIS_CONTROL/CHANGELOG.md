@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.33.0 — 2026-11-13 — IMS registration phase 1
+
+- Adds a bounded, per-run `ims_register` step for UE-201/UE-05: IMS PDU and
+  P-CSCF route verification, digest-protected Baresip startup and real SIP 200 evidence.
+- Makes Activity and Voice consume one REGISTER-based IMS probe. Stopping a run
+  stops only its SIP client; voice calls remain uncertified for 0.34.0.
+
 ## 0.32.0 — 2026-11-13 — scenario and UE workflow simplification
 
 - Protects system templates with HTTP 403 and clone-only editing, repairs seed

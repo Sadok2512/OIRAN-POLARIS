@@ -1383,17 +1383,42 @@ mod tests {
             .fail_step(run_id, 6, "LTE_UL_ROUTE_PROBE_FAILED", 3)
             .unwrap();
         let run = store.get(run_id).unwrap();
-        assert_eq!(run.steps[6].reason_code.as_deref(), Some("LTE_UL_ROUTE_PROBE_FAILED"));
-        assert_eq!(run.steps[6].measurements["route_probe"]["diagnostic"]["exit_code"], 2);
+        assert_eq!(
+            run.steps[6].reason_code.as_deref(),
+            Some("LTE_UL_ROUTE_PROBE_FAILED")
+        );
+        assert_eq!(
+            run.steps[6].measurements["route_probe"]["diagnostic"]["exit_code"],
+            2
+        );
         let _ = fs::remove_file(p);
     }
     #[test]
     fn ping_diagnostic_persists_before_failure_and_cleanup() {
-        let p = path("ping-diagnostic"); let mut store = RunStore::load(p.clone()).unwrap(); let run_id = "lte-run-ping-diagnostic-12345678";
-        store.create(run_id.into(), "grant-test".into(), 1, 999_999, "idem").unwrap();
+        let p = path("ping-diagnostic");
+        let mut store = RunStore::load(p.clone()).unwrap();
+        let run_id = "lte-run-ping-diagnostic-12345678";
+        store
+            .create(run_id.into(), "grant-test".into(), 1, 999_999, "idem")
+            .unwrap();
         store.record_step_diagnostic(run_id, 6, Observation { sequence: 6, observed_at: timestamp(2), source_kind: "ping_runtime_diagnostic".into(), source_sha256: "b".repeat(64), validity: "VALID".into(), sanitization_state: "SANITIZED".into(), measurements: serde_json::json!({"evidence":{"ping":{"exit_code":1},"ue_link":{"exit_code":0},"ue_routes":{"exit_code":0},"srsue_log_tail":{"exit_code":0},"srsenb_log_tail":{"exit_code":0}},"error_code":"LTE_PING_FAILED"}) }).unwrap();
-        store.fail_step(run_id, 6, "LTE_PING_FAILED", 3).unwrap(); let run = store.get(run_id).unwrap(); assert!(run.cleanup_required);
-        for key in ["ping", "ue_link", "ue_routes", "srsue_log_tail", "srsenb_log_tail"] { assert!(run.steps[6].measurements["ping_runtime_diagnostic"]["evidence"].get(key).is_some(), "missing {key}"); }
+        store.fail_step(run_id, 6, "LTE_PING_FAILED", 3).unwrap();
+        let run = store.get(run_id).unwrap();
+        assert!(run.cleanup_required);
+        for key in [
+            "ping",
+            "ue_link",
+            "ue_routes",
+            "srsue_log_tail",
+            "srsenb_log_tail",
+        ] {
+            assert!(
+                run.steps[6].measurements["ping_runtime_diagnostic"]["evidence"]
+                    .get(key)
+                    .is_some(),
+                "missing {key}"
+            );
+        }
         let _ = fs::remove_file(p);
     }
 
@@ -1433,8 +1458,7 @@ mod tests {
         let run = store.get(run_id).unwrap();
         assert!(run.cleanup_required);
         assert_eq!(
-            run.steps[8].measurements["iperf_runtime_diagnostic"]["diagnostic"]
-                ["exit_code"],
+            run.steps[8].measurements["iperf_runtime_diagnostic"]["diagnostic"]["exit_code"],
             1
         );
         assert_eq!(

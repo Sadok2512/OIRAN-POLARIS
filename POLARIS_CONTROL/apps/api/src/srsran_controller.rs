@@ -1911,13 +1911,8 @@ impl DockerSrsranRuntime {
             .unwrap_or_else(|| "UNKNOWN".into())
     }
     fn create(&self, target: Target) -> Result<(), String> {
-        let mut args: Vec<&str> = vec![
-            "compose",
-            "--project-name",
-            PROJECT,
-            "--env-file",
-            ENV_FILE,
-        ];
+        let mut args: Vec<&str> =
+            vec!["compose", "--project-name", PROJECT, "--env-file", ENV_FILE];
         args.extend_from_slice(&COMPOSE_FILE_ARGS);
         args.extend_from_slice(&["--profile", LTE_PROFILE, "create", target.service()]);
         Self::ok(self.run(&args, 60)?, "SRSRAN_CREATE_FAILED").map(|_| ())
@@ -2248,9 +2243,8 @@ impl SrsranRuntime for DockerSrsranRuntime {
                 };
             };
             let file_name = format!("/var/log/oiran/{component}.log");
-            let read_script = format!(
-                "for file in {file_name}*; do test -f \"$file\" && cat \"$file\"; done"
-            );
+            let read_script =
+                format!("for file in {file_name}*; do test -f \"$file\" && cat \"$file\"; done");
             let direct = self
                 .run(&["exec", &container.id, "/bin/sh", "-ec", &read_script], 5)
                 .and_then(|output| {
@@ -2676,26 +2670,30 @@ impl SrsranRuntime for DockerSrsranRuntime {
         }
         let mut m = TrafficMeasurement::default();
         if matches!(direction, "ul" | "both") {
-            let ((v, b), _) = self.iperf(
-                &ue,
-                false,
-                protocol,
-                u64::from(rate).saturating_mul(1_000_000),
-                1,
-                1_200,
-            ).map_err(|(error, _)| error)?;
+            let ((v, b), _) = self
+                .iperf(
+                    &ue,
+                    false,
+                    protocol,
+                    u64::from(rate).saturating_mul(1_000_000),
+                    1,
+                    1_200,
+                )
+                .map_err(|(error, _)| error)?;
             m.bytes_ul = v;
             m.rate_ul_bps = Some(b);
         }
         if matches!(direction, "dl" | "both") {
-            let ((v, b), _) = self.iperf(
-                &ue,
-                true,
-                protocol,
-                u64::from(rate).saturating_mul(1_000_000),
-                1,
-                1_200,
-            ).map_err(|(error, _)| error)?;
+            let ((v, b), _) = self
+                .iperf(
+                    &ue,
+                    true,
+                    protocol,
+                    u64::from(rate).saturating_mul(1_000_000),
+                    1,
+                    1_200,
+                )
+                .map_err(|(error, _)| error)?;
             m.bytes_dl = v;
             m.rate_dl_bps = Some(b);
         }
@@ -2724,14 +2722,16 @@ impl SrsranRuntime for DockerSrsranRuntime {
             return Err("LTE_UE_NOT_RUNNING".into());
         }
         let reverse = direction == "dl";
-        let ((bytes, bps), _) = self.iperf(
-            &ue,
-            reverse,
-            "udp",
-            rate_bps,
-            duration_seconds,
-            payload_bytes,
-        ).map_err(|(error, _)| error)?;
+        let ((bytes, bps), _) = self
+            .iperf(
+                &ue,
+                reverse,
+                "udp",
+                rate_bps,
+                duration_seconds,
+                payload_bytes,
+            )
+            .map_err(|(error, _)| error)?;
         Ok(TrafficMeasurement {
             bytes_ul: if reverse { 0 } else { bytes },
             bytes_dl: if reverse { bytes } else { 0 },
@@ -3533,10 +3533,7 @@ mod tests {
             Some(value) => std::env::set_var("POLARIS_LTE_TRAFFIC_PEER_IP", value),
             None => std::env::remove_var("POLARIS_LTE_TRAFFIC_PEER_IP"),
         }
-        assert_eq!(
-            result.unwrap_err().0,
-            "LTE_UL_ROUTE_NOT_VIA_UE_TUN"
-        );
+        assert_eq!(result.unwrap_err().0, "LTE_UL_ROUTE_NOT_VIA_UE_TUN");
         // Only the probe ran; no iperf3 spawn, no ue_ip query.
         let calls = executor.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -3851,12 +3848,9 @@ mod tests {
             .windows(2)
             .any(|w| w == ["--security-opt", "no-new-privileges:true"]));
         assert!(args.iter().any(|a| a == "--read-only"));
-        assert!(args.windows(2).any(|w| {
-            w == [
-                "--tmpfs",
-                "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777",
-            ]
-        }));
+        assert!(args
+            .windows(2)
+            .any(|w| { w == ["--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777",] }));
         assert!(args.windows(2).any(|w| w == ["--user", "0:0"]));
         assert!(args.windows(2).any(|w| w == ["--cap-drop", "ALL"]));
         assert!(args.windows(2).any(|w| w == ["--cap-add", "NET_ADMIN"]));
@@ -3880,12 +3874,9 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--cap-drop", "ALL"]));
         assert!(!args.iter().any(|a| a == "--cap-add"));
         assert!(args.iter().any(|a| a == "--read-only"));
-        assert!(args.windows(2).any(|w| {
-            w == [
-                "--tmpfs",
-                "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777",
-            ]
-        }));
+        assert!(args
+            .windows(2)
+            .any(|w| { w == ["--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777",] }));
         assert!(args
             .windows(2)
             .any(|w| w == ["--security-opt", "no-new-privileges:true"]));
@@ -3903,9 +3894,8 @@ mod tests {
 
     #[test]
     fn lte_0298_overlay_has_rt_limits_without_cpu_quota() {
-        let overlay = include_str!(
-            "../../../deployment/srsran-lte-0298/docker-compose.polaris-0.29.8.yml"
-        );
+        let overlay =
+            include_str!("../../../deployment/srsran-lte-0298/docker-compose.polaris-0.29.8.yml");
         assert_eq!(overlay.matches("rtprio: 99").count(), 2);
         assert_eq!(overlay.matches("memlock: -1").count(), 2);
         assert_eq!(overlay.matches("cpus: 0.0").count(), 2);
@@ -3943,12 +3933,8 @@ mod tests {
 
     #[test]
     fn lte_0298_log_fragments_are_bounded_and_diagnostic() {
-        let ue = include_str!(
-            "../../../deployment/srsran-lte-0298/ue-log.conf.fragment"
-        );
-        let enb = include_str!(
-            "../../../deployment/srsran-lte-0298/enb-log.conf.fragment"
-        );
+        let ue = include_str!("../../../deployment/srsran-lte-0298/ue-log.conf.fragment");
+        let enb = include_str!("../../../deployment/srsran-lte-0298/enb-log.conf.fragment");
         for (component, fragment) in [("srsue", ue), ("srsenb", enb)] {
             for setting in [
                 "phy_lib_level = none",
@@ -3961,8 +3947,14 @@ mod tests {
             ] {
                 assert!(fragment.contains(setting), "{component}: {setting}");
             }
-            assert!(fragment.contains("filename = stdout"), "{component}: stdout");
-            assert!(!fragment.contains("file_max_size"), "{component}: no file bound on stdout");
+            assert!(
+                fragment.contains("filename = stdout"),
+                "{component}: stdout"
+            );
+            assert!(
+                !fragment.contains("file_max_size"),
+                "{component}: no file bound on stdout"
+            );
         }
         assert!(ue.contains("nas_level = debug"));
         assert!(ue.contains("usim_level = warning"));
@@ -4271,12 +4263,7 @@ mod tests {
         // carries `base,overlay` in config_files. The validator must accept
         // it; the pre-0.29.13 single-file value is a no-go.
         let id = "0123456789abcdef";
-        let raw = inspect_json_with_labels(
-            id,
-            "srsenb",
-            &compose_config_files_label(),
-            PROJECT,
-        );
+        let raw = inspect_json_with_labels(id, "srsenb", &compose_config_files_label(), PROJECT);
         let container = parse_container_inspect(&raw, "srsenb").unwrap();
         assert_eq!(container.id, id);
     }
@@ -4294,12 +4281,8 @@ mod tests {
     #[test]
     fn parse_container_inspect_rejects_a_label_from_a_different_project() {
         let id = "0123456789abcdef";
-        let raw = inspect_json_with_labels(
-            id,
-            "srsenb",
-            &compose_config_files_label(),
-            "other-project",
-        );
+        let raw =
+            inspect_json_with_labels(id, "srsenb", &compose_config_files_label(), "other-project");
         assert_eq!(
             parse_container_inspect(&raw, "srsenb"),
             Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into())
@@ -4311,7 +4294,10 @@ mod tests {
         // Only the LTE srsRAN services are created with the overlay. Everything
         // else is Open5GS core (mme/sgwc/sgwu/…) created from the base compose
         // file alone.
-        assert_eq!(expected_config_files("srsenb"), compose_config_files_label());
+        assert_eq!(
+            expected_config_files("srsenb"),
+            compose_config_files_label()
+        );
         assert_eq!(expected_config_files("srsue"), compose_config_files_label());
         for base_only in ["mme", "sgwc", "sgwu", "upf", "hss", "pcrf"] {
             assert_eq!(expected_config_files(base_only), COMPOSE);
@@ -4328,12 +4314,7 @@ mod tests {
         // converted a healthy MME into LTE_RUNTIME_OWNERSHIP_CONFLICT and
         // turned a real S1 Setup into LTE_S1_SETUP_TIMEOUT.
         for service in ["mme", "sgwc", "sgwu"] {
-            let raw = inspect_json_with_labels(
-                "0123456789abcdef",
-                service,
-                COMPOSE,
-                PROJECT,
-            );
+            let raw = inspect_json_with_labels("0123456789abcdef", service, COMPOSE, PROJECT);
             let container = parse_container_inspect(&raw, service).unwrap_or_else(|e| {
                 panic!("{service} should be accepted with base-only label, got {e}")
             });
@@ -4364,12 +4345,7 @@ mod tests {
         // srsUE must carry the overlay label — a base-only one means create()
         // was called without `-f COMPOSE_0298_OVERRIDE` (0.29.12 bug). The
         // validator rejects the container to stop the LTE run before it starts.
-        let raw = inspect_json_with_labels(
-            "0123456789abcdef",
-            "srsue",
-            COMPOSE,
-            PROJECT,
-        );
+        let raw = inspect_json_with_labels("0123456789abcdef", "srsue", COMPOSE, PROJECT);
         assert_eq!(
             parse_container_inspect(&raw, "srsue"),
             Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into())
@@ -4378,12 +4354,7 @@ mod tests {
 
     #[test]
     fn parse_container_inspect_rejects_open5gs_core_container_from_a_different_project() {
-        let raw = inspect_json_with_labels(
-            "0123456789abcdef",
-            "mme",
-            COMPOSE,
-            "other-project",
-        );
+        let raw = inspect_json_with_labels("0123456789abcdef", "mme", COMPOSE, "other-project");
         assert_eq!(
             parse_container_inspect(&raw, "mme"),
             Err("LTE_RUNTIME_OWNERSHIP_CONFLICT".into())
@@ -4573,17 +4544,25 @@ some_option = 1
         assert!(after.contains("[log]\n"));
         for (key, value) in RUN_UE_LOG_SECTION {
             let line = format!("{key} = {value}");
-            assert!(after.contains(&line), "appended [log] must include `{line}`");
+            assert!(
+                after.contains(&line),
+                "appended [log] must include `{line}`"
+            );
         }
     }
 
     #[test]
     fn runtime_log_gate_requires_every_frozen_pair() {
-        let valid = inject_log_section("[rat.eutra]\ndl_earfcn = 3350\n", "log", RUN_UE_LOG_SECTION);
+        let valid =
+            inject_log_section("[rat.eutra]\ndl_earfcn = 3350\n", "log", RUN_UE_LOG_SECTION);
         assert!(log_section_matches(&valid, "log", RUN_UE_LOG_SECTION));
         let invalid = valid.replace("phy_lib_level = none", "phy_lib_level = info");
         assert!(!log_section_matches(&invalid, "log", RUN_UE_LOG_SECTION));
-        assert!(!log_section_matches("[rat.eutra]\ndl_earfcn = 3350\n", "log", RUN_UE_LOG_SECTION));
+        assert!(!log_section_matches(
+            "[rat.eutra]\ndl_earfcn = 3350\n",
+            "log",
+            RUN_UE_LOG_SECTION
+        ));
     }
 
     #[test]

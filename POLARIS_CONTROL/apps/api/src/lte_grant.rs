@@ -961,10 +961,7 @@ mod tests {
             .constraints
             .allowed_actions
             .retain(|action| action != "ping_dl");
-        assert_eq!(
-            missing_ping.validate(),
-            Err("LTE_CONSTRAINT_OUT_OF_RANGE")
-        );
+        assert_eq!(missing_ping.validate(), Err("LTE_CONSTRAINT_OUT_OF_RANGE"));
         let mut duplicate = request();
         duplicate.constraints.allowed_actions.push("cleanup".into());
         assert_eq!(duplicate.validate(), Err("LTE_CONSTRAINT_OUT_OF_RANGE"));
@@ -1160,17 +1157,19 @@ mod tests {
             )
             .unwrap();
         assert!(!idempotent);
-        assert!(store
-            .authorize_temporary_activation(
-                "grant-1",
-                &"n".repeat(43),
-                "activation-request-1",
-                102,
-                "operator",
-                "session-a",
-            )
-            .unwrap()
-            .1);
+        assert!(
+            store
+                .authorize_temporary_activation(
+                    "grant-1",
+                    &"n".repeat(43),
+                    "activation-request-1",
+                    102,
+                    "operator",
+                    "session-a",
+                )
+                .unwrap()
+                .1
+        );
         assert_eq!(
             store
                 .authorize_temporary_activation(

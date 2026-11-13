@@ -102,8 +102,18 @@ impl ActivityEventStore {
 /// a reader cannot distinguish "field removed" from "field never set".
 pub fn filter_identity_fields(input: &str) -> String {
     const TOKENS: &[&str] = &[
-        "suci", "guti", "5g-guti", "tmsi", "5g-tmsi", "s-tmsi", "ptmsi",
-        "key", "opc", "op-c", "op_c", "authentication_key",
+        "suci",
+        "guti",
+        "5g-guti",
+        "tmsi",
+        "5g-tmsi",
+        "s-tmsi",
+        "ptmsi",
+        "key",
+        "opc",
+        "op-c",
+        "op_c",
+        "authentication_key",
     ];
     let mut out = String::with_capacity(input.len());
     for line in input.lines() {
@@ -160,12 +170,13 @@ pub fn compose_activity_payload(
     job_step: Option<Value>,
     events: Vec<ActivityEvent>,
 ) -> Value {
+    let voice = voice_probe(&events, running);
     if !running {
         return json!({
             "ue_id": ue_id,
             "running": false,
             "reason": reason_when_stopped.unwrap_or("UE_NOT_RUNNING"),
-            "voice": { "available": false, "reason": "IMS_NOT_AVAILABLE" },
+            "voice": voice,
             "events": events,
         });
     }
@@ -183,8 +194,51 @@ pub fn compose_activity_payload(
         "counters": counters,
         "job_step": job_step,
         "events": events,
-        "voice": { "available": false, "reason": "IMS_NOT_AVAILABLE" },
+        "voice": voice,
     })
+}
+
+/// One authoritative IMS probe: only a real, most-recent successful
+/// ims_register event while the UE is running makes voice available.
+pub fn voice_probe(events: &[ActivityEvent], running: bool) -> Value {
+    if !running {
+        return json!({"available":false,"reason":"IMS_NOT_AVAILABLE","detail":"IMS_CLIENT_STOPPED"});
+    }
+    for event in events.iter().rev() {
+        if event.kind == "ims_register" {
+            if event.outcome == "OK" && event.detail["sip_code"] == 200 {
+                return json!({"available":true,"reason":Value::Null,"sip_code":200,
+                    "registration_time_ms":event.detail["registration_time_ms"]});
+            }
+            return json!({"available":false,"reason":"IMS_NOT_AVAILABLE",
+                "detail":event.detail["error"].as_str().unwrap_or("IMS_REGISTER_NOT_OBSERVED")});
+        }
+    }
+    json!({"available":false,"reason":"IMS_NOT_AVAILABLE","detail":"IMS_REGISTER_NOT_OBSERVED"})
+}
+
+#[cfg(test)]
+mod voice_probe_tests {
+    use super::*;
+    #[test]
+    fn only_real_register_200_makes_voice_available() {
+        let ok = ActivityEvent::new(
+            "ims_register",
+            "OK",
+            json!({"sip_code":200,"registration_time_ms":42}),
+        );
+        assert_eq!(voice_probe(&[ok], true)["available"], true);
+        let failed = ActivityEvent::new(
+            "ims_register",
+            "FAILED",
+            json!({"error":"IMS_REGISTER_TIMEOUT"}),
+        );
+        assert_eq!(
+            voice_probe(&[failed], true)["detail"],
+            "IMS_REGISTER_TIMEOUT"
+        );
+        assert_eq!(voice_probe(&[], false)["detail"], "IMS_CLIENT_STOPPED");
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -323,7 +377,12 @@ pub fn parse_uesimtun_counters(proc_net_dev: &str) -> Option<CountersSnapshot> {
         if numbers.len() < 16 {
             continue;
         }
-        let parse = |index: usize| numbers.get(index).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let parse = |index: usize| {
+            numbers
+                .get(index)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
         return Some(CountersSnapshot {
             interface: Some(name.into()),
             rx_bytes: parse(0),
@@ -498,7 +557,10 @@ eth0: 9999 9 0 0 0 0 0 0 8888 8 0 0 0 0 0 0\n\
         );
         assert_eq!(payload["running"], Value::Bool(false));
         assert_eq!(payload["ue_id"], Value::String("UE-01".into()));
-        assert_eq!(payload["reason"], Value::String("UE_NOT_PROVISIONED".into()));
+        assert_eq!(
+            payload["reason"],
+            Value::String("UE_NOT_PROVISIONED".into())
+        );
         assert_eq!(payload["voice"]["available"], Value::Bool(false));
         assert_eq!(
             payload["voice"]["reason"],
@@ -512,11 +574,7 @@ eth0: 9999 9 0 0 0 0 0 0 8888 8 0 0 0 0 0 0\n\
         for index in 0..30 {
             store.record(
                 "UE-01",
-                ActivityEvent::new(
-                    format!("step-{index}"),
-                    "OK",
-                    json!({ "index": index }),
-                ),
+                ActivityEvent::new(format!("step-{index}"), "OK", json!({ "index": index })),
             );
         }
         let kept = store.snapshot("UE-01");

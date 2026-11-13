@@ -262,8 +262,7 @@ impl ProfileStore {
                     // non-regular-file registries — the only concession is
                     // that the owner uid may be the current process (which
                     // is != 0 on a dev workstation).
-                    if !metadata.file_type().is_file()
-                        || metadata.permissions().mode() & 0o022 != 0
+                    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o022 != 0
                     {
                         return Err("UE_PROFILE_REGISTRY_PERMISSIONS_UNSAFE".into());
                     }

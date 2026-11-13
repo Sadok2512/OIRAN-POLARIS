@@ -316,14 +316,20 @@ impl MongoSubscriberBackend {
                         .pointer("/ambr/uplink/value")
                         .and_then(json_u64)
                         .ok_or("OPEN5GS_SUBSCRIBER_INVALID")?,
-                    value.pointer("/ambr/uplink/unit").and_then(json_u64).unwrap_or(0),
+                    value
+                        .pointer("/ambr/uplink/unit")
+                        .and_then(json_u64)
+                        .unwrap_or(0),
                 ),
                 downlink: decode_ambr_value_unit(
                     value
                         .pointer("/ambr/downlink/value")
                         .and_then(json_u64)
                         .ok_or("OPEN5GS_SUBSCRIBER_INVALID")?,
-                    value.pointer("/ambr/downlink/unit").and_then(json_u64).unwrap_or(0),
+                    value
+                        .pointer("/ambr/downlink/unit")
+                        .and_then(json_u64)
+                        .unwrap_or(0),
                 ),
             },
         };
@@ -346,7 +352,10 @@ impl SubscriberBackend for MongoSubscriberBackend {
             .as_array()
             .ok_or("OPEN5GS_DATABASE_RESPONSE_INVALID")?
             .iter()
-            .map(|v| self.decode_record(v).map(|r| sanitize_for_role(&r, visibility)))
+            .map(|v| {
+                self.decode_record(v)
+                    .map(|r| sanitize_for_role(&r, visibility))
+            })
             .collect()
     }
 
@@ -454,7 +463,9 @@ print(JSON.stringify(results));
     }
 
     fn taken_imsis(&self) -> Result<BTreeSet<String>, String> {
-        let value = self.mongosh(br#"print(JSON.stringify(db.subscribers.find({},{imsi:1,_id:0}).toArray()))"#)?;
+        let value = self.mongosh(
+            br#"print(JSON.stringify(db.subscribers.find({},{imsi:1,_id:0}).toArray()))"#,
+        )?;
         let array = value
             .as_array()
             .ok_or("OPEN5GS_DATABASE_RESPONSE_INVALID")?;
@@ -1120,10 +1131,12 @@ mod tests {
                 "001010000000004".to_string(),
             ]
         );
-        assert_eq!(allocate_next_imsis(&taken, 0).unwrap(), Vec::<String>::new());
         assert_eq!(
-            allocate_next_imsis(&taken, GENERATE_MAX_COUNT + 1)
-                .unwrap_err(),
+            allocate_next_imsis(&taken, 0).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            allocate_next_imsis(&taken, GENERATE_MAX_COUNT + 1).unwrap_err(),
             "SUBSCRIBER_GENERATE_COUNT_INVALID"
         );
     }
@@ -1309,10 +1322,7 @@ mod tests {
         // Overflow guard: a value too big to fit int32 at any scale clamps
         // to i32::MAX with unit=0 — `validate_mutation` rejects the input
         // anyway, but we must never emit a negative BSON int.
-        assert_eq!(
-            encode_ambr_bps_to_value_unit(u64::MAX).0,
-            i32::MAX
-        );
+        assert_eq!(encode_ambr_bps_to_value_unit(u64::MAX).0, i32::MAX);
     }
 
     #[test]
@@ -1424,7 +1434,10 @@ mod tests {
         // argument object, where the second silently clobbered the first) must
         // not reappear — the script now constructs a single `setFields`.
         let update_calls = script.matches("db.subscribers.updateOne").count();
-        assert_eq!(update_calls, 1, "expected a single updateOne call: {script}");
+        assert_eq!(
+            update_calls, 1,
+            "expected a single updateOne call: {script}"
+        );
     }
 
     /// 0.17.8 (#39) — mandatory MongoDB integration test. Gated by
@@ -1449,10 +1462,8 @@ mod tests {
             }
         };
         std::env::set_var("POLARIS_OPEN5GS_MONGODB_CONTAINER", &container);
-        let root = std::env::temp_dir().join(format!(
-            "polaris-ambr-bson-test-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("polaris-ambr-bson-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         std::env::set_var("POLARIS_SUBSCRIBER_BACKUP_ROOT", &root);
@@ -1486,7 +1497,11 @@ mod tests {
         let provision = backend
             .provision_batch(vec![(0, mutation)])
             .expect("provision_batch");
-        assert!(provision[0].ok, "provision failed: {:?}", provision[0].error);
+        assert!(
+            provision[0].ok,
+            "provision failed: {:?}",
+            provision[0].error
+        );
 
         let update = SubscriberUpdate {
             ambr: Some(SubscriberAmbr {
@@ -1583,7 +1598,12 @@ print(JSON.stringify({{ sessions: sessions, top: top, shape: shape }}));
         //   downlink 1.5 Gbit/s → (1500, 2)  // 1500 Mbit/s
         //   uplink   500 Mbit/s → (500,  2)  // 500 Mbit/s
         let top = &probe_value["top"];
-        for key in ["dl_value_type", "ul_value_type", "dl_unit_type", "ul_unit_type"] {
+        for key in [
+            "dl_value_type",
+            "ul_value_type",
+            "dl_unit_type",
+            "ul_unit_type",
+        ] {
             let actual = top
                 .get(key)
                 .and_then(Value::as_str)
@@ -1655,7 +1675,11 @@ print(JSON.stringify({{ sessions: sessions, top: top, shape: shape }}));
         // 3. Document shape: slice[] + slice[].session[] stay arrays of
         //    objects; no `{"$numberLong":"N"}` sub-document residue anywhere.
         let shape = &probe_value["shape"];
-        assert_eq!(shape["slice_is_array"].as_bool(), Some(true), "shape: {shape}");
+        assert_eq!(
+            shape["slice_is_array"].as_bool(),
+            Some(true),
+            "shape: {shape}"
+        );
         assert_eq!(shape["slice_count"].as_u64(), Some(1), "shape: {shape}");
         assert_eq!(
             shape["slice_0_session_is_array"].as_bool(),
@@ -1760,7 +1784,9 @@ print(JSON.stringify({{ sessions: sessions, top: top, shape: shape }}));
                 downlink: 1,
             },
         };
-        backend.provision_batch(vec![(1, mutation)]).expect("provision");
+        backend
+            .provision_batch(vec![(1, mutation)])
+            .expect("provision");
 
         let viewer = backend
             .list_with_visibility(SubscriberIdentityVisibility::Protected)

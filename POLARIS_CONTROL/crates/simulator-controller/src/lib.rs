@@ -640,11 +640,7 @@ impl MultiUeController {
     /// progress across an API restart), and periodically with
     /// `MAX_OPERATION_LOCK_SECONDS` during runtime to evict stuck
     /// locks whose owning worker thread died mid-flight.
-    pub fn release_stale_locks(
-        &mut self,
-        now_epoch_s: u64,
-        max_age_s: u64,
-    ) -> Vec<ReleasedLock> {
+    pub fn release_stale_locks(&mut self, now_epoch_s: u64, max_age_s: u64) -> Vec<ReleasedLock> {
         let mut released = Vec::new();
         for job in self.jobs.values_mut() {
             let Some(operation_id) = job.operation_id.clone() else {
@@ -1441,7 +1437,11 @@ mod tests {
         assert_eq!(released.len(), 1, "only the stale lock is reaped");
         assert_eq!(released[0].ue_id, "UE-02");
         // The fresh UE-03 lock survived the sweep.
-        let ue03 = controller.inventory().into_iter().find(|job| job.ue_id == "UE-03").unwrap();
+        let ue03 = controller
+            .inventory()
+            .into_iter()
+            .find(|job| job.ue_id == "UE-03")
+            .unwrap();
         assert_eq!(ue03.operation_id.as_deref(), Some("op-fresh"));
     }
 
@@ -1470,12 +1470,8 @@ mod tests {
             job.operation_id = Some("op-stuck".into());
             job.operation_locked_at_epoch_s = Some(now);
         }
-        let refused = controller.reserve_live_stop(
-            "UE-02",
-            "op-new",
-            now + 1,
-            MAX_OPERATION_LOCK_SECONDS,
-        );
+        let refused =
+            controller.reserve_live_stop("UE-02", "op-new", now + 1, MAX_OPERATION_LOCK_SECONDS);
         assert_eq!(refused.unwrap_err(), "UE_OPERATION_IN_PROGRESS");
 
         // Age the lock past the max → Stop reclaims it.

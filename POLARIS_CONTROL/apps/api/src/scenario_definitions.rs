@@ -1724,10 +1724,17 @@ mod tests {
             BTreeMap::from([("duration_ms".into(), fixed(2_000_u64))]),
         )];
         let definition = ScenarioDefinition {
-            id: wait.id.clone(), name: wait.name.clone(), version: 1,
-            loop_count: 1, steps: wait.steps, created_at_epoch_s: 1,
-            updated_at_epoch_s: 1, rat: "5G_SA".into(), simulator: "UERANSIM".into(),
-            description: String::new(), source_definition_id: None,
+            id: wait.id.clone(),
+            name: wait.name.clone(),
+            version: 1,
+            loop_count: 1,
+            steps: wait.steps,
+            created_at_epoch_s: 1,
+            updated_at_epoch_s: 1,
+            rat: "5G_SA".into(),
+            simulator: "UERANSIM".into(),
+            description: String::new(),
+            source_definition_id: None,
         };
         assert_eq!(estimate_duration_ms(&definition).unwrap(), 2_000);
     }

@@ -55,11 +55,11 @@ use subscriber_provisioning::{
     SubscriberBackend, SubscriberMutation, SubscriberRecord, SubscriberUpdate, GENERATE_MAX_COUNT,
     MAX_BULK_ROWS, WRITE_BATCH_ROWS,
 };
+use tokio::sync::Mutex as AsyncMutex;
 use tower_http::{
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,
 };
-use tokio::sync::Mutex as AsyncMutex;
 use ue_profiles::{
     BulkProfileInput, ManagedUeProfile, ProfileMutationInput, ProfileStore, ScenarioAssignmentInput,
 };
@@ -3234,7 +3234,11 @@ impl AppState {
         // consumed grant into recovery-only. Temporary profile elevation must
         // therefore never survive restart, while the recovery cleanup remains
         // available independently of grant validity.
-        if lte_profile_registry.profile().temporary_activation.is_some() {
+        if lte_profile_registry
+            .profile()
+            .temporary_activation
+            .is_some()
+        {
             lte_profile_registry.clear_temporary_activation(None)?;
         }
         Ok(Self {
@@ -3310,10 +3314,8 @@ impl AppState {
             srsran_runtime: Arc::new(srsran_controller::DockerSrsranRuntime::default()),
             srsran_live_enabled: std::env::var("POLARIS_SRSRAN_LIVE_ENABLED")
                 .is_ok_and(|value| value == "true"),
-            lte_certification_run_enabled: std::env::var(
-                "POLARIS_LTE_CERTIFICATION_RUN_ENABLED",
-            )
-            .is_ok_and(|value| value == "true"),
+            lte_certification_run_enabled: std::env::var("POLARIS_LTE_CERTIFICATION_RUN_ENABLED")
+                .is_ok_and(|value| value == "true"),
             lte_e2e_certified: std::env::var("POLARIS_LTE_E2E_CERTIFIED")
                 .is_ok_and(|value| value == "true"),
             certified_subject_override: None,
@@ -3514,31 +3516,50 @@ async fn authorize(
         sessions.retain(|_, session| session.expires_at > now);
         sessions.get(id).cloned()
     });
-    let csrf_valid = state.open_access || session.as_ref().map_or(false, |session| {
-        matches!(
-            *request.method(),
-            Method::GET | Method::HEAD | Method::OPTIONS
-        ) || request
-            .headers()
-            .get("x-csrf-token")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == session.csrf_token)
-    });
+    let csrf_valid = state.open_access
+        || session.as_ref().map_or(false, |session| {
+            matches!(
+                *request.method(),
+                Method::GET | Method::HEAD | Method::OPTIONS
+            ) || request
+                .headers()
+                .get("x-csrf-token")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value == session.csrf_token)
+        });
     let identity = session.map_or_else(
-        || if state.open_access {
-            const OPEN_SESSION_ID: &str = "open-access-sadok";
-            if let Ok(mut sessions) = state.sessions.lock() {
-                sessions.entry(OPEN_SESSION_ID.into()).or_insert_with(|| SessionRecord {
-                    username: "sadok".into(), role: "operator".into(),
-                    csrf_token: "open-access".into(), expires_at: u64::MAX,
-                    certified_validation_until: None, certified_scenario_type: None,
-                    certified_target_ue_id: None, ue_control_authorized_until: None,
-                    ue_control_authorized_ids: BTreeSet::new(),
-                });
+        || {
+            if state.open_access {
+                const OPEN_SESSION_ID: &str = "open-access-sadok";
+                if let Ok(mut sessions) = state.sessions.lock() {
+                    sessions
+                        .entry(OPEN_SESSION_ID.into())
+                        .or_insert_with(|| SessionRecord {
+                            username: "sadok".into(),
+                            role: "operator".into(),
+                            csrf_token: "open-access".into(),
+                            expires_at: u64::MAX,
+                            certified_validation_until: None,
+                            certified_scenario_type: None,
+                            certified_target_ue_id: None,
+                            ue_control_authorized_until: None,
+                            ue_control_authorized_ids: BTreeSet::new(),
+                        });
+                }
+                EffectiveIdentity {
+                    role: "operator".into(),
+                    username: Some("sadok".into()),
+                    session_id: Some(OPEN_SESSION_ID.into()),
+                    csrf_valid: true,
+                }
+            } else {
+                EffectiveIdentity {
+                    role: "viewer".into(),
+                    username: None,
+                    session_id: None,
+                    csrf_valid: true,
+                }
             }
-            EffectiveIdentity { role: "operator".into(), username: Some("sadok".into()), session_id: Some(OPEN_SESSION_ID.into()), csrf_valid: true }
-        } else {
-            EffectiveIdentity { role: "viewer".into(), username: None, session_id: None, csrf_valid: true }
         },
         |session| EffectiveIdentity {
             role: session.role,
@@ -4373,11 +4394,13 @@ fn lte_certification_state(state: &AppState) -> LteCertificationState {
     if state.lte_e2e_certified {
         return LteCertificationState::Certified;
     }
-    let latest = state
-        .lte_runs_v2
-        .lock()
-        .ok()
-        .and_then(|store| store.records().iter().max_by_key(|run| run.created_at_epoch_ms).cloned());
+    let latest = state.lte_runs_v2.lock().ok().and_then(|store| {
+        store
+            .records()
+            .iter()
+            .max_by_key(|run| run.created_at_epoch_ms)
+            .cloned()
+    });
     match latest {
         Some(run)
             if matches!(
@@ -4417,10 +4440,7 @@ fn current_lte_compose_model_sha256(state: &AppState) -> Result<String, String> 
         .unwrap_or_else(srsran_controller::compose_model_sha256)
 }
 
-fn purpose_matches_mode(
-    purpose: lte_grant::GrantPurpose,
-    mode: LteOperationMode,
-) -> bool {
+fn purpose_matches_mode(purpose: lte_grant::GrantPurpose, mode: LteOperationMode) -> bool {
     matches!(
         (purpose, mode),
         (
@@ -4433,9 +4453,7 @@ fn purpose_matches_mode(
     )
 }
 
-fn active_lte_temporary_activation(
-    state: &AppState,
-) -> Option<lte_grant::TemporaryActivation> {
+fn active_lte_temporary_activation(state: &AppState) -> Option<lte_grant::TemporaryActivation> {
     let activation = state
         .lte_profile_registry
         .lock()
@@ -4619,8 +4637,7 @@ fn lte_run_execution_constraints(
         .iter()
         .find(|grant| grant.run_id.as_deref() == Some(run_id))
         .filter(|grant| {
-            grant.state == lte_grant::GrantState::Consumed
-                && now_ms < grant.expires_at_epoch_ms
+            grant.state == lte_grant::GrantState::Consumed && now_ms < grant.expires_at_epoch_ms
         })
         .map(|grant| grant.constraints.clone())
         .ok_or_else(|| "LTE_GRANT_INACTIVE".into())
@@ -4725,17 +4742,13 @@ async fn update_lte_profile(
         );
     }
     if !input.enabled {
-        let activation_grant_id = state
-            .lte_profile_registry
-            .lock()
-            .ok()
-            .and_then(|registry| {
-                registry
-                    .profile()
-                    .temporary_activation
-                    .as_ref()
-                    .map(|activation| activation.grant_id.clone())
-            });
+        let activation_grant_id = state.lte_profile_registry.lock().ok().and_then(|registry| {
+            registry
+                .profile()
+                .temporary_activation
+                .as_ref()
+                .map(|activation| activation.grant_id.clone())
+        });
         if let Some(grant_id) = activation_grant_id {
             if let Err(error) = state
                 .lte_grants_v2
@@ -4906,16 +4919,24 @@ async fn authorize_lte_certification_run(
     );
     (
         StatusCode::OK,
-        Json(serde_json::to_value(LteCertificationRunResponse {
-            run_id,
-            state: "AUTHORIZED",
-            operation_mode: mode,
-            srsran_live_enabled: state.srsran_live_enabled,
-            execution_mode: state.execution_mode.clone(),
-            authorized_steps: ["lte_attach", "lte_detach", "lte_traffic_ul", "lte_traffic_dl"],
-            target_dn_ip,
-            authorized_at_epoch_s: epoch_seconds(),
-        }).unwrap_or(json!({}))),
+        Json(
+            serde_json::to_value(LteCertificationRunResponse {
+                run_id,
+                state: "AUTHORIZED",
+                operation_mode: mode,
+                srsran_live_enabled: state.srsran_live_enabled,
+                execution_mode: state.execution_mode.clone(),
+                authorized_steps: [
+                    "lte_attach",
+                    "lte_detach",
+                    "lte_traffic_ul",
+                    "lte_traffic_dl",
+                ],
+                target_dn_ip,
+                authorized_at_epoch_s: epoch_seconds(),
+            })
+            .unwrap_or(json!({})),
+        ),
     )
 }
 
@@ -4964,7 +4985,10 @@ async fn activate_lte_profile_for_certification(
         );
     }
     if let Err(error) = certified_release_subject_gate(&state) {
-        return (StatusCode::PRECONDITION_FAILED, Json(json!({"error":error})));
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({"error":error})),
+        );
     }
     let Some(nonce) = headers
         .get("x-polaris-grant-nonce")
@@ -5002,11 +5026,13 @@ async fn activate_lte_profile_for_certification(
     let current_compose = current_lte_compose_model_sha256(&state);
     let subject_valid = state.lte_grants_v2.lock().ok().is_some_and(|store| {
         store.get(&input.grant_id).is_some_and(|grant| {
-            current_configuration.as_ref().is_ok_and(|hash| {
-                hash == &grant.target.configuration_sha256
-            }) && current_compose.as_ref().is_ok_and(|hash| {
-                hash == &grant.target.compose_model_sha256
-            }) && grant.target.profile_id == lte_grant::PROFILE_ID
+            current_configuration
+                .as_ref()
+                .is_ok_and(|hash| hash == &grant.target.configuration_sha256)
+                && current_compose
+                    .as_ref()
+                    .is_ok_and(|hash| hash == &grant.target.compose_model_sha256)
+                && grant.target.profile_id == lte_grant::PROFILE_ID
                 && grant.target.profile_revision == 1
                 && grant.scenario.scenario_id == lte_grant::SCENARIO_ID
         })
@@ -5070,11 +5096,19 @@ async fn activate_lte_profile_for_certification(
         &state,
         &identity.role,
         "LTE_TEMPORARY_ACTIVATION",
-        if idempotent { "IDEMPOTENT" } else { "AUTHORIZED" },
+        if idempotent {
+            "IDEMPOTENT"
+        } else {
+            "AUTHORIZED"
+        },
         Some(&grant.grant_id),
     );
     (
-        if idempotent { StatusCode::OK } else { StatusCode::CREATED },
+        if idempotent {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
         Json(json!({
             "profile_id":lte_grant::PROFILE_ID,
             "state":"TEMPORARILY_ENABLED",
@@ -5115,15 +5149,11 @@ async fn create_lte_run(
             })),
         );
     }
-    let grant_purpose = state
-        .lte_grants_v2
-        .lock()
-        .ok()
-        .and_then(|store| {
-            store
-                .get(&request.grant_id)
-                .map(|grant| grant.purpose.unwrap_or_default())
-        });
+    let grant_purpose = state.lte_grants_v2.lock().ok().and_then(|store| {
+        store
+            .get(&request.grant_id)
+            .map(|grant| grant.purpose.unwrap_or_default())
+    });
     if grant_purpose.is_some_and(|purpose| !purpose_matches_mode(purpose, mode)) {
         return (
             StatusCode::LOCKED,
@@ -5132,7 +5162,10 @@ async fn create_lte_run(
     }
     if mode == LteOperationMode::CertificationRun {
         if let Err(error) = certified_release_subject_gate(&state) {
-            return (StatusCode::PRECONDITION_FAILED, Json(json!({"error":error})));
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                Json(json!({"error":error})),
+            );
         }
     }
     let now = epoch_millis();
@@ -5193,7 +5226,8 @@ async fn create_lte_run(
             Json(json!({"error":"GRANT_SUBJECT_CHANGED"})),
         );
     }
-    if request.compose_model_sha256 != current_lte_compose_model_sha256(&state).unwrap_or_default() {
+    if request.compose_model_sha256 != current_lte_compose_model_sha256(&state).unwrap_or_default()
+    {
         return (
             StatusCode::PRECONDITION_FAILED,
             Json(json!({"error":"GRANT_SUBJECT_CHANGED"})),
@@ -5308,8 +5342,8 @@ async fn create_lte_run(
             error_code: Some("LTE_UE_LOG_CONFIG_WORKER_FAILED".into()),
             ..srsran_controller::LogSectionPatch::default()
         });
-    let patch_json = serde_json::to_value(&patch)
-        .unwrap_or_else(|_| json!({"error":"serialization_failed"}));
+    let patch_json =
+        serde_json::to_value(&patch).unwrap_or_else(|_| json!({"error":"serialization_failed"}));
     let _ = state.lte_runs_v2.lock().map(|mut store| {
         store.record_step_diagnostic(
             &run.run_id,
@@ -5417,9 +5451,10 @@ async fn orchestrate_lte_run_with_timeout(
     )
     .await;
     if result.is_err() {
-        let _ = state.lte_runs_v2.lock().map(|mut store| {
-            store.fail_active_step(&run_id, "LTE_GLOBAL_TIMEOUT", epoch_millis())
-        });
+        let _ = state
+            .lte_runs_v2
+            .lock()
+            .map(|mut store| store.fail_active_step(&run_id, "LTE_GLOBAL_TIMEOUT", epoch_millis()));
         let _ = state
             .lte_grants_v2
             .lock()
@@ -5705,13 +5740,7 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
         )
     });
     let lifecycle_guard = state.lte_lifecycle.lock().await;
-    if lte_run_execution_constraints(
-        &state,
-        &run_id,
-        deadline_at_epoch_ms,
-        epoch_millis(),
-    )
-    .is_err()
+    if lte_run_execution_constraints(&state, &run_id, deadline_at_epoch_ms, epoch_millis()).is_err()
     {
         drop(lifecycle_guard);
         let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
@@ -5770,10 +5799,7 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
         }
         let runtime = state.srsran_runtime.clone();
         let evidence = tokio::task::spawn_blocking(move || {
-            runtime.attach_complete_event(
-                attach_observation_not_before_epoch_ms,
-                attach_deadline,
-            )
+            runtime.attach_complete_event(attach_observation_not_before_epoch_ms, attach_deadline)
         })
         .await
         .ok()
@@ -5793,12 +5819,8 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
                 let _ = state.lte_runs_v2.lock().map(|mut store| {
                     store.fail_step(&run_id, 4, "LTE_ATTACH_TIMEOUT", epoch_millis())
                 });
-                let _ = cleanup_lte_run(
-                    &state,
-                    &run_id,
-                    lte_orchestrator::RunOutcome::Failed,
-                )
-                .await;
+                let _ =
+                    cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
                 return;
             }
         }
@@ -5954,20 +5976,10 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Cancelled).await;
             return;
         }
-        if lte_run_execution_constraints(
-            &state,
-            &run_id,
-            deadline_at_epoch_ms,
-            epoch_millis(),
-        )
-        .is_err()
+        if lte_run_execution_constraints(&state, &run_id, deadline_at_epoch_ms, epoch_millis())
+            .is_err()
         {
-            let _ = cleanup_lte_run(
-                &state,
-                &run_id,
-                lte_orchestrator::RunOutcome::Cancelled,
-            )
-            .await;
+            let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Cancelled).await;
             return;
         }
         let runtime = state.srsran_runtime.clone();
@@ -6002,21 +6014,35 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
         let runtime = state.srsran_runtime.clone();
         let dir = direction.to_string();
         let packets = constraints.ping.max_packets_per_direction;
-        let ping_operation = tokio::task::spawn_blocking(move || runtime.ping_with_evidence(&dir, packets)).await
-            .unwrap_or_else(|_| srsran_controller::PingOperation { error_code: Some("LTE_TRAFFIC_WORKER_FAILED".into()), ..srsran_controller::PingOperation::default() });
-        let ping_evidence = serde_json::to_value(&ping_operation).unwrap_or_else(|_| json!({"error_code":"LTE_EVIDENCE_SERIALIZATION_FAILED"}));
-        let _ = state.lte_runs_v2.lock().map(|mut store| store.record_step_diagnostic(&run_id, step,
-            lte_observation(step as u64, "ping_runtime_diagnostic", ping_evidence)));
+        let ping_operation =
+            tokio::task::spawn_blocking(move || runtime.ping_with_evidence(&dir, packets))
+                .await
+                .unwrap_or_else(|_| srsran_controller::PingOperation {
+                    error_code: Some("LTE_TRAFFIC_WORKER_FAILED".into()),
+                    ..srsran_controller::PingOperation::default()
+                });
+        let ping_evidence = serde_json::to_value(&ping_operation)
+            .unwrap_or_else(|_| json!({"error_code":"LTE_EVIDENCE_SERIALIZATION_FAILED"}));
+        let _ = state.lte_runs_v2.lock().map(|mut store| {
+            store.record_step_diagnostic(
+                &run_id,
+                step,
+                lte_observation(step as u64, "ping_runtime_diagnostic", ping_evidence),
+            )
+        });
         match ping_operation.measurement.clone() {
             Some(value) if ping_operation.succeeded() => {
                 let _=state.lte_runs_v2.lock().map(|mut store|{store.observe(&run_id,step,lte_observation(step as u64,"bounded_ping",json!({"direction":direction,"sent":value.sent,"received":value.received})),epoch_millis())?;store.advance(&run_id,lte_orchestrator::RunState::TrafficRunning)});
                 set_state(&state, &run_id, "TRAFFIC_RUNNING").await;
             }
             _ => {
-                let error = ping_operation.error_code.unwrap_or_else(|| "LTE_PING_FAILED".into());
-                let _ = state.lte_runs_v2.lock().map(|mut store| {
-                    store.fail_step(&run_id, step, &error, epoch_millis())
-                });
+                let error = ping_operation
+                    .error_code
+                    .unwrap_or_else(|| "LTE_PING_FAILED".into());
+                let _ = state
+                    .lte_runs_v2
+                    .lock()
+                    .map(|mut store| store.fail_step(&run_id, step, &error, epoch_millis()));
                 let _ =
                     cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
                 return;
@@ -6053,20 +6079,10 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Cancelled).await;
             return;
         }
-        if lte_run_execution_constraints(
-            &state,
-            &run_id,
-            deadline_at_epoch_ms,
-            epoch_millis(),
-        )
-        .is_err()
+        if lte_run_execution_constraints(&state, &run_id, deadline_at_epoch_ms, epoch_millis())
+            .is_err()
         {
-            let _ = cleanup_lte_run(
-                &state,
-                &run_id,
-                lte_orchestrator::RunOutcome::Cancelled,
-            )
-            .await;
+            let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Cancelled).await;
             return;
         }
         let runtime = state.srsran_runtime.clone();
@@ -6102,15 +6118,17 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
             .saturating_sub(epoch_millis())
             .saturating_div(1_000)
             .saturating_sub(5);
-        let duration_seconds = u64::from(
-            constraints.udp.max_duration_seconds_per_direction,
-        )
-        .min(remaining_seconds) as u32;
+        let duration_seconds = u64::from(constraints.udp.max_duration_seconds_per_direction)
+            .min(remaining_seconds) as u32;
         if duration_seconds == 0 {
-            let _ = state
-                .lte_runs_v2
-                .lock()
-                .map(|mut store| store.fail_step(&run_id, step, "LTE_GRANT_DEADLINE_EXHAUSTED", epoch_millis()));
+            let _ = state.lte_runs_v2.lock().map(|mut store| {
+                store.fail_step(
+                    &run_id,
+                    step,
+                    "LTE_GRANT_DEADLINE_EXHAUSTED",
+                    epoch_millis(),
+                )
+            });
             let _ = cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
             return;
         }
@@ -6149,9 +6167,10 @@ async fn orchestrate_lte_run(state: Arc<AppState>, run_id: String, deadline_at_e
                 let error = traffic_operation
                     .error_code
                     .unwrap_or_else(|| "LTE_TRAFFIC_COMMAND_FAILED".into());
-                let _ = state.lte_runs_v2.lock().map(|mut store| {
-                    store.fail_step(&run_id, step, &error, epoch_millis())
-                });
+                let _ = state
+                    .lte_runs_v2
+                    .lock()
+                    .map(|mut store| store.fail_step(&run_id, step, &error, epoch_millis()));
                 let _ =
                     cleanup_lte_run(&state, &run_id, lte_orchestrator::RunOutcome::Failed).await;
                 return;
@@ -6216,7 +6235,12 @@ async fn publish_lte_evidence_envelope(
         .and_then(|store| store.get(&run_id).cloned())
     {
         Some(run) => run,
-        None => return (StatusCode::NOT_FOUND, Json(json!({"error":"LTE_RUN_NOT_FOUND"}))),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"LTE_RUN_NOT_FOUND"})),
+            )
+        }
     };
     let input = match lte_orchestrator::load_observed_evidence_bundle(
         &state.lte_evidence_bundle_root,
@@ -6225,15 +6249,33 @@ async fn publish_lte_evidence_envelope(
     ) {
         Ok(input) => input,
         Err(error) => {
-            audit(&state, &identity.role, "LTE_EVIDENCE_PUBLISH", &error, Some(&run_id));
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":error})));
+            audit(
+                &state,
+                &identity.role,
+                "LTE_EVIDENCE_PUBLISH",
+                &error,
+                Some(&run_id),
+            );
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":error})),
+            );
         }
     };
     let envelope = match lte_orchestrator::build_oiran_evidence_envelope(&run, input) {
         Ok(envelope) => envelope,
         Err(error) => {
-            audit(&state, &identity.role, "LTE_EVIDENCE_PUBLISH", &error, Some(&run_id));
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":error})));
+            audit(
+                &state,
+                &identity.role,
+                "LTE_EVIDENCE_PUBLISH",
+                &error,
+                Some(&run_id),
+            );
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":error})),
+            );
         }
     };
     let refs = envelope.evidence.capture_refs.clone();
@@ -6257,14 +6299,13 @@ async fn publish_lte_evidence_envelope(
         &state,
         &identity.role,
         "LTE_EVIDENCE_PUBLISH",
-        if idempotent {
-            "IDEMPOTENT"
-        } else {
-            "APPROVED"
-        },
+        if idempotent { "IDEMPOTENT" } else { "APPROVED" },
         Some(&run_id),
     );
-    (StatusCode::OK, Json(serde_json::to_value(envelope).unwrap_or(Value::Null)))
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(envelope).unwrap_or(Value::Null)),
+    )
 }
 
 async fn finalize_lte_evidence(
@@ -6283,7 +6324,12 @@ async fn finalize_lte_evidence(
         .and_then(|store| store.get(&run_id).cloned())
     {
         Some(run) => run,
-        None => return (StatusCode::NOT_FOUND, Json(json!({"error":"LTE_RUN_NOT_FOUND"}))),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"LTE_RUN_NOT_FOUND"})),
+            )
+        }
     };
     let input = match lte_orchestrator::finalize_authorized_evidence_release(
         &state.lte_evidence_release_root,
@@ -6293,7 +6339,13 @@ async fn finalize_lte_evidence(
     ) {
         Ok(input) => input,
         Err(error) => {
-            audit(&state, &identity.role, "LTE_EVIDENCE_FINALIZE", &error, Some(&run_id));
+            audit(
+                &state,
+                &identity.role,
+                "LTE_EVIDENCE_FINALIZE",
+                &error,
+                Some(&run_id),
+            );
             let status = if error == "LTE_EVIDENCE_FINALIZATION_CONFLICT"
                 || error == "LTE_EVIDENCE_PUBLICATION_CONFLICT"
             {
@@ -6309,8 +6361,17 @@ async fn finalize_lte_evidence(
     let envelope = match lte_orchestrator::build_oiran_evidence_envelope(&run, input) {
         Ok(envelope) => envelope,
         Err(error) => {
-            audit(&state, &identity.role, "LTE_EVIDENCE_FINALIZE", &error, Some(&run_id));
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":error})));
+            audit(
+                &state,
+                &identity.role,
+                "LTE_EVIDENCE_FINALIZE",
+                &error,
+                Some(&run_id),
+            );
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":error})),
+            );
         }
     };
     let refs = envelope.evidence.capture_refs.clone();
@@ -6337,7 +6398,10 @@ async fn finalize_lte_evidence(
         if idempotent { "IDEMPOTENT" } else { "APPROVED" },
         Some(&run_id),
     );
-    (StatusCode::OK, Json(serde_json::to_value(envelope).unwrap_or(Value::Null)))
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(envelope).unwrap_or(Value::Null)),
+    )
 }
 
 async fn stop_lte_run(
@@ -8406,10 +8470,7 @@ fn scenario_definition_block_reason(
     if !dl_sender_available && resolved.iter().any(|step| step.step_type == "traffic_ul") {
         return Ok(Some("UL_RECEIVER_NOT_AVAILABLE"));
     }
-    if resolved
-        .iter()
-        .any(|step| matches!(step.step_type.as_str(), "ims_register" | "voice_call"))
-    {
+    if resolved.iter().any(|step| step.step_type == "voice_call") {
         return Ok(Some("IMS_NOT_AVAILABLE"));
     }
     Ok(None)
@@ -9328,10 +9389,9 @@ fn scenario_definition_error(error: String) -> (StatusCode, Json<Value>) {
     }
     let status = match error.as_str() {
         "SCENARIO_DEFINITION_NOT_FOUND" => StatusCode::NOT_FOUND,
-        "SCENARIO_DEFINITION_ALREADY_EXISTS"
-        | "SCENARIO_ID_EXISTS"
-        | "TEMPLATE_ID_RESERVED"
-        => StatusCode::CONFLICT,
+        "SCENARIO_DEFINITION_ALREADY_EXISTS" | "SCENARIO_ID_EXISTS" | "TEMPLATE_ID_RESERVED" => {
+            StatusCode::CONFLICT
+        }
         "SCENARIO_TEMPLATE_READ_ONLY" => StatusCode::FORBIDDEN,
         _ => StatusCode::UNPROCESSABLE_ENTITY,
     };
@@ -9516,7 +9576,9 @@ fn scenario_definition_view(
         object.insert("execution_block_reason".into(), json!(block));
         object.insert(
             "execution_message".into(),
-            block.map_or(Value::Null, |reason| json!(scenario_execution_message(reason))),
+            block.map_or(Value::Null, |reason| {
+                json!(scenario_execution_message(reason))
+            }),
         );
     }
     value
@@ -11646,9 +11708,7 @@ fn resource_gate_for_budget(
     let usage = disk.basis_points().unwrap_or(10_000);
     let disk_decision = evaluate(Ok(disk), Policy::default());
     let estimated_write_bytes = budget.storage_bytes.max(1);
-    if !disk_decision.writes_allowed
-        || disk_decision.maximum_budget_bytes < estimated_write_bytes
-    {
+    if !disk_decision.writes_allowed || disk_decision.maximum_budget_bytes < estimated_write_bytes {
         return Err("DISK_STOP_THRESHOLD".into());
     }
     let memory = memory_stats();
@@ -12476,6 +12536,7 @@ fn execute_live_definition_step(
         }
         "detach" => {
             for ue_id in ue_ids {
+                stop_ims_client(ue_id);
                 let target = resolve_controller_traffic_target(state, ue_id)?;
                 let job = if let Some(approval) = definition_job_approval(control, ue_id)? {
                     approval
@@ -12555,10 +12616,161 @@ fn execute_live_definition_step(
                 "completion_evidence":"CONTROLLER_STOPPED_AND_PDU_INACTIVE"
             }))
         }
-        "ims_register" | "voice_call" => Err("IMS_NOT_AVAILABLE".into()),
+        "ims_register" => execute_ims_register(state, ue_ids, control),
+        "voice_call" => Err("IMS_NOT_AVAILABLE".into()),
         "repeat" => Err("SCENARIO_REPEAT_NOT_RESOLVED".into()),
         _ => Err("SCENARIO_STEP_TYPE_UNSUPPORTED".into()),
     }
+}
+
+const IMS_PROXY_IP: &str = "10.77.24.20";
+const IMS_CLIENT_IMAGE: &str =
+    "oiran/baresip@sha256:14027922a16b221ff61a9ba9ec696c49a10f3894ddfa1249883748478dab02c7";
+const IMS_AUTH_FILE: &str = "/etc/oiran/secrets/ims-lite-auth.cfg";
+const IMS_REGISTER_SCRIPT: &str = "/opt/polaris-control/libexec/baresip-register";
+
+fn ims_client_name(ue_id: &str) -> Result<(&'static str, &'static str), String> {
+    match ue_id {
+        "UE-201" => Ok(("sip-ue-201", "ue201")),
+        "UE-05" => Ok(("sip-ue-05", "ue05")),
+        _ => Err("IMS_UE_NOT_AUTHORIZED".into()),
+    }
+}
+
+fn stop_ims_client(ue_id: &str) {
+    if let Ok((name, _)) = ims_client_name(ue_id) {
+        let _ = Command::new("/usr/bin/docker")
+            .args(["stop", "--time", "5", name])
+            .output();
+    }
+}
+
+fn execute_ims_register(
+    state: &AppState,
+    ue_ids: &[String],
+    control: &DefinitionJobControl,
+) -> Result<Value, String> {
+    if ue_ids.len() != 1 {
+        return Err("IMS_SINGLE_UE_REQUIRED".into());
+    }
+    let ue_id = &ue_ids[0];
+    let (client_name, aor) = ims_client_name(ue_id)?;
+    let job = definition_job_approval(control, ue_id)?.ok_or("UE_NOT_STARTED")?;
+    if observe_controller_ue(state, ue_id)?.pdu_session_state != "ACTIVE" {
+        return Err("IMS_PDU_NOT_ACTIVE".into());
+    }
+    let handle = job.process_handle.as_deref().ok_or("UE_HANDLE_INVALID")?;
+    let container_id = DockerUeRuntime::container_id(handle).ok_or("UE_HANDLE_INVALID")?;
+    let ps = DockerUeRuntime::output(&[
+        "exec".into(),
+        container_id.into(),
+        "nr-cli".into(),
+        DockerUeRuntime::ue_cli_node(container_id)?,
+        "-e".into(),
+        "ps-list".into(),
+    ])?;
+    if !ps.to_ascii_lowercase().contains("ims") {
+        return Err("IMS_PDU_NOT_ACTIVE".into());
+    }
+    let route = DockerUeRuntime::output(&[
+        "exec".into(),
+        container_id.into(),
+        "ip".into(),
+        "route".into(),
+        "get".into(),
+        IMS_PROXY_IP.into(),
+    ])?;
+    if !route.contains("uesimtun") {
+        return Err("IMS_PCSCF_UNREACHABLE".into());
+    }
+    if !Path::new(IMS_AUTH_FILE).exists() || !Path::new(IMS_REGISTER_SCRIPT).exists() {
+        return Err("IMS_CLIENT_CONFIGURATION_UNAVAILABLE".into());
+    }
+    let network = format!("container:{container_id}");
+    let proxy = format!("SIP_PROXY={IMS_PROXY_IP}");
+    let aor_env = format!("SIP_AOR={aor}");
+    let output = Command::new("/usr/bin/docker")
+        .args([
+            "run",
+            "-d",
+            "--name",
+            client_name,
+            "--network",
+            &network,
+            "--read-only",
+            "--tmpfs",
+            "/tmp:size=16m",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "NET_ADMIN",
+            "--security-opt",
+            "no-new-privileges:true",
+            "-e",
+            &aor_env,
+            "-e",
+            &proxy,
+            "-e",
+            "SIP_IFACE=uesimtun0",
+            "-v",
+            "/opt/polaris-control/libexec/baresip-register:/usr/local/bin/baresip-register:ro",
+            "-v",
+            "/etc/oiran/secrets/ims-lite-auth.cfg:/run/secrets/ims-lite-auth.cfg:ro",
+            "--entrypoint",
+            "/usr/local/bin/baresip-register",
+            IMS_CLIENT_IMAGE,
+        ])
+        .output()
+        .map_err(|_| "IMS_CLIENT_START_FAILED")?;
+    if !output.status.success() {
+        return Err("IMS_CLIENT_START_FAILED".into());
+    }
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if control.cancel.load(Ordering::SeqCst) {
+            stop_ims_client(ue_id);
+            return Err("SCENARIO_STOP_REQUESTED".into());
+        }
+        let logs = Command::new("/usr/bin/docker")
+            .args(["logs", client_name])
+            .output()
+            .map_err(|_| "IMS_CLIENT_LOG_UNAVAILABLE")?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&logs.stdout),
+            String::from_utf8_lossy(&logs.stderr)
+        );
+        if text.contains("200 OK") || text.contains("SIP/2.0 200") {
+            let elapsed = started.elapsed().as_millis() as u64;
+            let result = json!({"sip_code":200,"registration_time_ms":elapsed,"pcscf":IMS_PROXY_IP,
+                "route":route.lines().next().unwrap_or_default(),"client":client_name});
+            record_activity_event(state, ue_id, "ims_register", "OK", result.clone());
+            return Ok(result);
+        }
+        if text.contains("401") || text.contains("403") {
+            stop_ims_client(ue_id);
+            let code = if text.contains("403") { 403 } else { 401 };
+            record_activity_event(
+                state,
+                ue_id,
+                "ims_register",
+                "FAILED",
+                json!({"error":"IMS_REGISTER_REFUSED","sip_code":code}),
+            );
+            return Err(format!("IMS_REGISTER_REFUSED_{code}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    stop_ims_client(ue_id);
+    record_activity_event(
+        state,
+        ue_id,
+        "ims_register",
+        "FAILED",
+        json!({"error":"IMS_REGISTER_TIMEOUT"}),
+    );
+    Err("IMS_REGISTER_TIMEOUT".into())
 }
 
 fn definition_job_approval(
@@ -12589,6 +12801,7 @@ fn cleanup_definition_started_ues(state: &AppState, control: &DefinitionJobContr
         .unwrap_or_default();
     let mut errors = Vec::new();
     for ue_id in started {
+        stop_ims_client(&ue_id);
         if ue_id == srsran_controller::LTE_UE_ID {
             let result = state
                 .srsran_runtime
@@ -12921,11 +13134,13 @@ fn build_ue_activity_payload(state: &AppState, ue_id: &str, identity: &Effective
         )
     };
 
-    let managed_profile = state
-        .profile_registry
-        .lock()
-        .ok()
-        .and_then(|registry| registry.profiles.iter().find(|profile| profile.profile.ue_id == ue_id).cloned());
+    let managed_profile = state.profile_registry.lock().ok().and_then(|registry| {
+        registry
+            .profiles
+            .iter()
+            .find(|profile| profile.profile.ue_id == ue_id)
+            .cloned()
+    });
     let imsi_from_profile = managed_profile
         .as_ref()
         .and_then(|profile| state.profile_store.subscriber_imsi(profile).ok());
@@ -13774,7 +13989,10 @@ async fn create_live_grant(
         }
         if request.purpose == lte_grant::GrantPurpose::CertificationRun {
             if let Err(error) = certified_release_subject_gate(&state) {
-                return (StatusCode::PRECONDITION_FAILED, Json(json!({"error":error})));
+                return (
+                    StatusCode::PRECONDITION_FAILED,
+                    Json(json!({"error":error})),
+                );
             }
         }
         let Some(idempotency_key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok())
@@ -13784,26 +14002,24 @@ async fn create_live_grant(
                 Json(json!({"error":"IDEMPOTENCY_KEY_REQUIRED"})),
             );
         };
-        let profile_ready = state
-            .lte_profile_registry
-            .lock()
-            .is_ok_and(|registry| {
-                let profile = registry.profile();
-                profile.profile_id == lte_grant::PROFILE_ID
-                    && profile.owner == "POLARIS_CONTROLLER"
-                    && profile.revision == request.target.profile_revision
-                    && profile.max_running_ues == 1
-                    && (request.purpose == lte_grant::GrantPurpose::CertificationRun
-                        || profile.enabled)
-            });
+        let profile_ready = state.lte_profile_registry.lock().is_ok_and(|registry| {
+            let profile = registry.profile();
+            profile.profile_id == lte_grant::PROFILE_ID
+                && profile.owner == "POLARIS_CONTROLLER"
+                && profile.revision == request.target.profile_revision
+                && profile.max_running_ues == 1
+                && (request.purpose == lte_grant::GrantPurpose::CertificationRun || profile.enabled)
+        });
         if !profile_ready {
             return (
                 StatusCode::LOCKED,
-                Json(json!({"error":if request.purpose == lte_grant::GrantPurpose::CertificationRun {
-                    "LTE_PROFILE_OWNERSHIP_REQUIRED"
-                } else {
-                    "LTE_PROFILE_DISABLED"
-                }})),
+                Json(
+                    json!({"error":if request.purpose == lte_grant::GrantPurpose::CertificationRun {
+                        "LTE_PROFILE_OWNERSHIP_REQUIRED"
+                    } else {
+                        "LTE_PROFILE_DISABLED"
+                    }}),
+                ),
             );
         }
         let current_hash = match current_lte_profile_configuration_sha256(&state) {
@@ -15383,12 +15599,21 @@ mod p0_tests {
         test_state.srsran_live_enabled = true;
         assert_eq!(lte_operation_mode(&test_state), LteOperationMode::Disabled);
         test_state.lte_certification_run_enabled = true;
-        assert_eq!(lte_operation_mode(&test_state), LteOperationMode::CertificationRun);
+        assert_eq!(
+            lte_operation_mode(&test_state),
+            LteOperationMode::CertificationRun
+        );
         test_state.lte_e2e_certified = true;
-        assert_eq!(lte_operation_mode(&test_state), LteOperationMode::LiveOperational);
+        assert_eq!(
+            lte_operation_mode(&test_state),
+            LteOperationMode::LiveOperational
+        );
     }
 
-    fn attach_event(event_at_epoch_ms: u64, observed_at_epoch_ms: u64) -> srsran_controller::AttachProtocolEvidence {
+    fn attach_event(
+        event_at_epoch_ms: u64,
+        observed_at_epoch_ms: u64,
+    ) -> srsran_controller::AttachProtocolEvidence {
         srsran_controller::AttachProtocolEvidence {
             event_at_epoch_ms,
             observed_at_epoch_ms,
@@ -15408,7 +15633,12 @@ mod p0_tests {
             AttachEventDecision::Accept
         );
         assert_eq!(
-            classify_attach_event(101_447, deadline, reconcile, Some(&at_deadline_observed_late)),
+            classify_attach_event(
+                101_447,
+                deadline,
+                reconcile,
+                Some(&at_deadline_observed_late)
+            ),
             AttachEventDecision::Accept
         );
         assert_eq!(
@@ -15655,10 +15885,9 @@ mod p0_tests {
             .await
             .unwrap();
         assert_eq!(stopped.status(), StatusCode::OK);
-        let stopped: Value = serde_json::from_slice(
-            &to_bytes(stopped.into_body(), usize::MAX).await.unwrap(),
-        )
-        .unwrap();
+        let stopped: Value =
+            serde_json::from_slice(&to_bytes(stopped.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
         assert_eq!(stopped["state"], "CLEAN");
     }
 
@@ -15669,7 +15898,10 @@ mod p0_tests {
         test_state.srsran_live_enabled = true;
         test_state.lte_certification_run_enabled = true;
         test_state.lte_e2e_certified = false;
-        assert_eq!(lte_operation_mode(&test_state), LteOperationMode::CertificationRun);
+        assert_eq!(
+            lte_operation_mode(&test_state),
+            LteOperationMode::CertificationRun
+        );
         let application = app(test_state.clone());
         let pending = application
             .clone()
@@ -15681,10 +15913,9 @@ mod p0_tests {
             )
             .await
             .unwrap();
-        let pending: Value = serde_json::from_slice(
-            &to_bytes(pending.into_body(), usize::MAX).await.unwrap(),
-        )
-        .unwrap();
+        let pending: Value =
+            serde_json::from_slice(&to_bytes(pending.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
         assert_eq!(pending["certified"], false);
         assert_eq!(pending["operation_mode"], "CERTIFICATION_RUN");
         assert_eq!(pending["certification_state"], "CERTIFICATION_PENDING");
@@ -15700,7 +15931,9 @@ mod p0_tests {
                     .header(header::COOKIE, &cookie)
                     .header("x-csrf-token", &csrf)
                     .header("idempotency-key", "certification-grant-1")
-                    .body(Body::from(certification_grant_body("CERTIFICATION_RUN").to_string()))
+                    .body(Body::from(
+                        certification_grant_body("CERTIFICATION_RUN").to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -15722,16 +15955,17 @@ mod p0_tests {
                     .header("x-csrf-token", &csrf)
                     .header("idempotency-key", "certification-activation-1")
                     .header("x-polaris-grant-nonce", "n".repeat(43))
-                    .body(Body::from(json!({"grant_id":grant["grant_id"]}).to_string()))
+                    .body(Body::from(
+                        json!({"grant_id":grant["grant_id"]}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(activation.status(), StatusCode::CREATED);
-        let activation: Value = serde_json::from_slice(
-            &to_bytes(activation.into_body(), usize::MAX).await.unwrap(),
-        )
-        .unwrap();
+        let activation: Value =
+            serde_json::from_slice(&to_bytes(activation.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
         assert_eq!(activation["state"], "TEMPORARILY_ENABLED");
         assert_eq!(
             test_state
@@ -15781,10 +16015,9 @@ mod p0_tests {
             )
             .await
             .unwrap();
-        let status: Value = serde_json::from_slice(
-            &to_bytes(status.into_body(), usize::MAX).await.unwrap(),
-        )
-        .unwrap();
+        let status: Value =
+            serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
         assert_eq!(status["certified"], false);
         assert_eq!(status["certification_state"], "CERTIFICATION_RUNNING");
     }
@@ -15813,7 +16046,9 @@ mod p0_tests {
                     .header(header::COOKIE, &cookie)
                     .header("x-csrf-token", &csrf)
                     .header("idempotency-key", "operational-grant-1")
-                    .body(Body::from(certification_grant_body("LIVE_OPERATIONAL").to_string()))
+                    .body(Body::from(
+                        certification_grant_body("LIVE_OPERATIONAL").to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -15832,7 +16067,9 @@ mod p0_tests {
                     .header(header::COOKIE, cookie)
                     .header("x-csrf-token", csrf)
                     .header("idempotency-key", "certification-grant-bad-subject")
-                    .body(Body::from(certification_grant_body("CERTIFICATION_RUN").to_string()))
+                    .body(Body::from(
+                        certification_grant_body("CERTIFICATION_RUN").to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -15873,14 +16110,18 @@ mod p0_tests {
                     .header(header::COOKIE, &cookie)
                     .header("x-csrf-token", &csrf)
                     .header("idempotency-key", "activation-security-grant")
-                    .body(Body::from(certification_grant_body("CERTIFICATION_RUN").to_string()))
+                    .body(Body::from(
+                        certification_grant_body("CERTIFICATION_RUN").to_string(),
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(grant_response.status(), StatusCode::CREATED);
         let grant: Value = serde_json::from_slice(
-            &to_bytes(grant_response.into_body(), usize::MAX).await.unwrap(),
+            &to_bytes(grant_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
         )
         .unwrap();
         let activation_uri = "/api/v1/lte/profiles/LTE-SRSUE-TEST-01/certification-activation";
@@ -15894,7 +16135,9 @@ mod p0_tests {
                     .header(header::COOKIE, &cookie)
                     .header("idempotency-key", "activation-security-1")
                     .header("x-polaris-grant-nonce", "n".repeat(43))
-                    .body(Body::from(json!({"grant_id":grant["grant_id"]}).to_string()))
+                    .body(Body::from(
+                        json!({"grant_id":grant["grant_id"]}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -15911,7 +16154,9 @@ mod p0_tests {
                     .header("x-csrf-token", &csrf)
                     .header("idempotency-key", "activation-security-1")
                     .header("x-polaris-grant-nonce", "x".repeat(43))
-                    .body(Body::from(json!({"grant_id":grant["grant_id"]}).to_string()))
+                    .body(Body::from(
+                        json!({"grant_id":grant["grant_id"]}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -15928,7 +16173,9 @@ mod p0_tests {
                     .header("x-csrf-token", &csrf)
                     .header("idempotency-key", "activation-security-1")
                     .header("x-polaris-grant-nonce", "n".repeat(43))
-                    .body(Body::from(json!({"grant_id":grant["grant_id"]}).to_string()))
+                    .body(Body::from(
+                        json!({"grant_id":grant["grant_id"]}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -15972,7 +16219,9 @@ mod p0_tests {
                     .header("x-csrf-token", &csrf)
                     .header("idempotency-key", "activation-security-1")
                     .header("x-polaris-grant-nonce", "n".repeat(43))
-                    .body(Body::from(json!({"grant_id":grant["grant_id"]}).to_string()))
+                    .body(Body::from(
+                        json!({"grant_id":grant["grant_id"]}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -15989,7 +16238,9 @@ mod p0_tests {
                     .header("x-csrf-token", &csrf)
                     .header("idempotency-key", "activation-security-2")
                     .header("x-polaris-grant-nonce", "n".repeat(43))
-                    .body(Body::from(json!({"grant_id":grant["grant_id"]}).to_string()))
+                    .body(Body::from(
+                        json!({"grant_id":grant["grant_id"]}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -15999,7 +16250,10 @@ mod p0_tests {
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri(format!("/api/v1/live/grant/{}", grant["grant_id"].as_str().unwrap()))
+                    .uri(format!(
+                        "/api/v1/live/grant/{}",
+                        grant["grant_id"].as_str().unwrap()
+                    ))
                     .header(header::COOKIE, cookie)
                     .header("x-csrf-token", csrf)
                     .body(Body::empty())
@@ -16661,14 +16915,18 @@ mod p0_tests {
         let application = app(test_state);
         let response = application
             .clone()
-            .oneshot(Request::builder().uri("/api/v1/auth/me").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let value: Value = serde_json::from_slice(
-            &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-        )
-        .unwrap();
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
         assert_eq!(value["authenticated"], true);
         assert_eq!(value["username"], "sadok");
         assert_eq!(value["role"], "operator");
@@ -21232,7 +21490,13 @@ mod p0_tests {
         {
             let mut store = test_state.lte_runs_v2.lock().unwrap();
             store
-                .create(run_id.into(), "grant-http".into(), 1, 999_999, "envelope-http-key")
+                .create(
+                    run_id.into(),
+                    "grant-http".into(),
+                    1,
+                    999_999,
+                    "envelope-http-key",
+                )
                 .unwrap();
             store
                 .finalize(
@@ -21277,29 +21541,52 @@ mod p0_tests {
                 "profile_id":lte_orchestrator::PROFILE_ID,
                 "scenario_id":lte_orchestrator::SCENARIO_ID,
                 "capture_proofs":proofs
-            })).unwrap(),
-        ).unwrap();
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let application = app(test_state);
         let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
         let body = json!({"bundle_id":bundle_id});
-        let no_csrf = application.clone().oneshot(
-            Request::builder().method(Method::POST)
-                .uri(format!("/api/v1/lte/runs/{run_id}/evidence-envelope"))
-                .header(header::COOKIE, &cookie).header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string())).unwrap(),
-        ).await.unwrap();
+        let no_csrf = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/lte/runs/{run_id}/evidence-envelope"))
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
-        let response = application.oneshot(
-            Request::builder().method(Method::POST)
-                .uri(format!("/api/v1/lte/runs/{run_id}/evidence-envelope"))
-                .header(header::COOKIE, cookie).header("x-csrf-token", csrf)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string())).unwrap(),
-        ).await.unwrap();
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/lte/runs/{run_id}/evidence-envelope"))
+                    .header(header::COOKIE, cookie)
+                    .header("x-csrf-token", csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let json: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-        assert_eq!(json["schema_version"], lte_orchestrator::OIRAN_INGESTION_SCHEMA);
-        assert_eq!(json["evidence"]["schema_version"], lte_orchestrator::EVIDENCE_SCHEMA);
+        let json: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            json["schema_version"],
+            lte_orchestrator::OIRAN_INGESTION_SCHEMA
+        );
+        assert_eq!(
+            json["evidence"]["schema_version"],
+            lte_orchestrator::EVIDENCE_SCHEMA
+        );
         assert_eq!(json["capture_bindings"].as_array().unwrap().len(), 3);
     }
 
@@ -21310,7 +21597,13 @@ mod p0_tests {
         let run = {
             let mut store = test_state.lte_runs_v2.lock().unwrap();
             store
-                .create(run_id.into(), "grant-http".into(), 1, 999_999, "finalizer-http-key")
+                .create(
+                    run_id.into(),
+                    "grant-http".into(),
+                    1,
+                    999_999,
+                    "finalizer-http-key",
+                )
                 .unwrap();
             store
                 .finalize(
@@ -21359,40 +21652,68 @@ mod p0_tests {
             "final_state":"COMPLETED","authorization_state":"SANITIZED_APPROVED","captures":captures
         });
         let manifest_path = release.join("oiran-lte-capture-release.json");
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
 
         let application = app(test_state);
         let (cookie, csrf) = login_session(&application, "operator-test", OPERATOR_PASSWORD).await;
         let body = json!({"release_id":release_id});
-        let no_csrf = application.clone().oneshot(
-            Request::builder().method(Method::POST)
-                .uri(format!("/api/v1/lte/runs/{run_id}/evidence-finalize"))
-                .header(header::COOKIE, &cookie).header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string())).unwrap(),
-        ).await.unwrap();
+        let no_csrf = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/lte/runs/{run_id}/evidence-finalize"))
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
-        let response = application.clone().oneshot(
-            Request::builder().method(Method::POST)
-                .uri(format!("/api/v1/lte/runs/{run_id}/evidence-finalize"))
-                .header(header::COOKIE, &cookie).header("x-csrf-token", &csrf)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string())).unwrap(),
-        ).await.unwrap();
+        let response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/lte/runs/{run_id}/evidence-finalize"))
+                    .header(header::COOKIE, &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let json: Value = serde_json::from_slice(
-            &to_bytes(response.into_body(), usize::MAX).await.unwrap()
-        ).unwrap();
+        let json: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
         assert_eq!(json["capture_bindings"].as_array().unwrap().len(), 3);
 
         manifest["captures"][0]["proof"]["capture_ref"]["last_frame"] = Value::from(99);
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
-        let conflict = application.oneshot(
-            Request::builder().method(Method::POST)
-                .uri(format!("/api/v1/lte/runs/{run_id}/evidence-finalize"))
-                .header(header::COOKIE, cookie).header("x-csrf-token", csrf)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string())).unwrap(),
-        ).await.unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let conflict = application
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/lte/runs/{run_id}/evidence-finalize"))
+                    .header(header::COOKIE, cookie)
+                    .header("x-csrf-token", csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
     }
 
@@ -21744,8 +22065,12 @@ mod p0_tests {
     /// et injections shell si la valeur est un jour persistée.
     #[test]
     fn lte_certification_run_id_validates_safe_identifier_only_0_30_0() {
-        assert!(lte_certification_run_id_is_valid("lte-certif-20261109T1200Z"));
-        assert!(lte_certification_run_id_is_valid("lte-certif-a1b2c3d4e5f60718"));
+        assert!(lte_certification_run_id_is_valid(
+            "lte-certif-20261109T1200Z"
+        ));
+        assert!(lte_certification_run_id_is_valid(
+            "lte-certif-a1b2c3d4e5f60718"
+        ));
         assert!(lte_certification_run_id_is_valid("lte-certif-run.001-v2_a"));
         // Doit refuser les préfixes incorrects.
         assert!(!lte_certification_run_id_is_valid("certif-run-x"));
@@ -21780,7 +22105,12 @@ mod p0_tests {
             operation_mode: LteOperationMode::CertificationRun,
             srsran_live_enabled: true,
             execution_mode: "live".into(),
-            authorized_steps: ["lte_attach", "lte_detach", "lte_traffic_ul", "lte_traffic_dl"],
+            authorized_steps: [
+                "lte_attach",
+                "lte_detach",
+                "lte_traffic_ul",
+                "lte_traffic_dl",
+            ],
             target_dn_ip: "10.77.16.30".into(),
             authorized_at_epoch_s: 0,
         };
@@ -21792,7 +22122,12 @@ mod p0_tests {
             .map(|v| v.as_str().unwrap().to_owned())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(steps.len(), 4);
-        for canonical in ["lte_attach", "lte_detach", "lte_traffic_ul", "lte_traffic_dl"] {
+        for canonical in [
+            "lte_attach",
+            "lte_detach",
+            "lte_traffic_ul",
+            "lte_traffic_dl",
+        ] {
             assert!(
                 steps.contains(canonical),
                 "le step {canonical} doit faire partie de authorized_steps"
