@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.31.1 — 2026-11-13 — 0.31.0 + exigence de 13 captures issue de 0.30.1 (ANR1 #10)
+
+ANR1 a prouvé (issue #10) que 0.31.0 (SHA `68f4784`) ne contenait pas le
+correctif 13 captures livré sur 0.30.1 (`be66bf3`). Sur un run réel à
+13 processus `dumpcap`, le test d'arrêt d'urgence rendait 503 parce que
+`lte_start_resource_gate` et `cleanup_lte_run` exigeaient encore
+`external_dumpcap_count() == 12` (12 interfaces, sans IMS). Côté Rust :
+328 tests passés, 1 échec, 3 ignorés.
+
+- Fusionne `origin/fix/polaris-control-0.30.1-dumpcap-gate` (commit merge
+  `d61da9b`) sans réécrire l'historique publié de `feat/oiran-2.9.0`. Deux
+  commits apportés dans la lignée 0.31.0 :
+  - `a2477b0` feat(polaris-control-api): 0.30.0 — LTE certification-run
+    endpoint + 423 lift + DN default (ANR1 #10 6737561274).
+  - `be66bf3` fix(polaris-control): require 13 capture processes.
+- Le préflight LTE exige désormais exactement 13 processus `dumpcap`
+  (12 interfaces + IMS) via `external_dumpcap_set_is_expected(count) :=
+  count == EXPECTED_EXTERNAL_DUMPCAP_COUNT` avec
+  `EXPECTED_EXTERNAL_DUMPCAP_COUNT = 13`. L'égalité est stricte : 12 ou
+  14 captures renvoient `LTE_EXTERNAL_CAPTURE_SET_MISMATCH` et bloquent
+  le démarrage. Même règle appliquée au nettoyage
+  (`cleanup.dumpcaps_preserved`).
+- Test dédié : `p0_tests::lte_preflight_requires_exactly_thirteen_external_dumpcaps`
+  prouve que 12 bloque, 13 passe et 14 bloque.
+- Bump manifestes `platform`/`web`/`api` → `0.31.1` et
+  `polaris-control-api` 0.31.1 (`Cargo.toml` + `Cargo.lock`).
+
 ## 0.31.0 — 2026-11-12 — open laboratory access
 
 - Adds `POLARIS_OPEN_ACCESS=1`: unauthenticated requests receive the synthetic
