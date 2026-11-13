@@ -541,7 +541,13 @@ fn s1ap_name_for(raw: &Value) -> Option<String> {
     }
 }
 
-fn nas_name_for(raw: &Value, parent_name: &str) -> Option<String> {
+/// 2.14.12 (ANR1 #10 6867204663) — nom NAS brut (sans parent), même
+/// tables TS 24.301 / TS 24.501 que l'ingestion (`decoder-nas`).
+/// Retourne `None` si le protocole n'est pas une variante NAS
+/// reconnue. Un `message_type == 0` sur un événement NAS signale un
+/// NAS chiffré → `"NAS chiffré"` (même règle que la combinaison via
+/// parent).
+fn nas_name_only(raw: &Value) -> Option<String> {
     let protocol = raw.get("protocol").and_then(Value::as_str)?;
     let (is_eps, is_sm, is_fiveg) = match protocol {
         "NAS-EPS-MM" | "NasEpsMm" => (true, false, false),
@@ -554,13 +560,10 @@ fn nas_name_for(raw: &Value, parent_name: &str) -> Option<String> {
         .get("message_type")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    // 2.14.7-2.14.9 (ANR1 #10) : `message_type == 0` sur un
-    // événement NAS enfant signale un NAS chiffré. Placeholder
-    // publique uniforme « NAS chiffré » (remplace « Protected EPS
-    // EMM message », « Protected 5GMM message », etc.).
-    let nas_name: &str = if message_type == 0 {
-        "NAS chiffré"
-    } else if is_fiveg {
+    if message_type == 0 {
+        return Some("NAS chiffré".to_string());
+    }
+    let nas_name: &str = if is_fiveg {
         // TS 24.501 §9.7 — même table que decoder-nas à l'ingestion.
         if is_sm {
             decoder_nas::sm_name_5g(message_type as u8).0
@@ -569,7 +572,7 @@ fn nas_name_for(raw: &Value, parent_name: &str) -> Option<String> {
         }
     } else if is_eps {
         // TS 24.301 §9.8 — mm_eps_name (table auditée en 2.14.5).
-        // L'extension SM EPS n'est pas exposée publiquement ; on y
+        // L'extension SM EPS n'est pas exposée publiquement ; on
         // retombe dans la variante MM par défaut quand le décodeur
         // d'ingestion renvoie "NAS-EPS-SM" sans entrée dédiée côté
         // mm_eps_name. Les captures lab n'exposent pas de SM EPS
@@ -579,7 +582,12 @@ fn nas_name_for(raw: &Value, parent_name: &str) -> Option<String> {
     } else {
         return None;
     };
-    Some(decoder_s1ap::combined_message_name(parent_name, nas_name))
+    Some(nas_name.to_string())
+}
+
+fn nas_name_for(raw: &Value, parent_name: &str) -> Option<String> {
+    let nas_name = nas_name_only(raw)?;
+    Some(decoder_s1ap::combined_message_name(parent_name, &nas_name))
 }
 
 /// Patch a vector of `CallFlowEvent` values in place. Returns the
@@ -657,8 +665,17 @@ fn patch_one(
         destination.network_function.as_deref(),
     );
 
-    // 4) message_name : d'abord le parent S1AP recalculé, puis le NAS
-    //    combiné pour les enfants.
+    // 4) message_name : trois chemins, par ordre de spécificité.
+    //    a) NAS avec parent S1AP/NGAP résolu dans l'index → nom
+    //       combiné « procédure · NAS » (ex. `downlinkNASTransport
+    //       · Security Mode Command`).
+    //    b) Événement S1AP ou NGAP lui-même → nom de la procédure.
+    //    c) 2.14.12 (ANR1 #10 6867204663) — NAS **sans** parent
+    //       dans le JSONL : on recalcule le nom NAS seul via les
+    //       mêmes fonctions uniques que l'ingestion
+    //       (`mm_eps_name`, `mm_name`, `sm_name_5g`). Sans ce
+    //       fallback, un NAS orphelin (observé en prod sur l'event
+    //       04, 0x5D) restait sur son libellé stale de 2.14.3.
     let parent_s1ap_name = raw
         .get("parent_event_id")
         .and_then(Value::as_str)
@@ -667,7 +684,7 @@ fn patch_one(
     let new_message_name = if let Some(parent_name) = parent_s1ap_name.as_deref() {
         nas_name_for(raw, parent_name)
     } else {
-        s1ap_name_for(raw)
+        s1ap_name_for(raw).or_else(|| nas_name_only(raw))
     };
 
     // Publier les nouvelles valeurs si elles diffèrent (idempotent).
@@ -1576,6 +1593,154 @@ mod tests {
         assert!(counters.events_patched_message_name.load(Ordering::Relaxed) >= 3);
         assert_eq!(counters.events_unresolved_participant.load(Ordering::Relaxed), 0);
 
+        std::fs::remove_file(&jsonl_path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    /// 2.14.12 (ANR1 #10 6867204663) — cas prod observé : un
+    /// événement NAS 0x5D (Security Mode Command) qui existe dans le
+    /// JSONL **sans** parent S1AP (`parent_event_id = null`). Avant
+    /// 2.14.12, `patch_one` ne recalculait le libellé NAS que via le
+    /// nom combiné « procédure · NAS » — un NAS orphelin tombait
+    /// dans `s1ap_name_for` qui retourne `None` pour un protocole
+    /// `NAS-EPS-MM`, laissant le libellé stale « Security Mode
+    /// Complete » (bug 2.14.3 pré-2.14.4). Le fallback
+    /// `nas_name_only` doit maintenant produire « Security Mode
+    /// Command » (TS 24.301 §9.8.1 table 9.8.1.1).
+    #[test]
+    fn patcher_rewrites_nas_eps_without_parent() {
+        let dir = std::env::temp_dir().join(format!(
+            "oiran-read-time-patch-nas-orphan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Évt NAS 0x5D sans parent_event_id (observé en prod sur
+        // l'event 04 des sessions lte-session-81c8e02939b8f868 et
+        // lte-session-7d5a9620319218ed, ANR1 #10 6867204663).
+        let raw = vec![json!({
+            "event_id": "evt-04",
+            "parent_event_id": null,
+            "interface": "S1-MME",
+            "protocol": "NAS-EPS-MM",
+            "message_name": "stale",
+            "message_type": 0x5d,
+            "procedure_code": 0x5d,
+            "source_endpoint": {"address":"10.77.10.10","port":36412,"network_function":null},
+            "destination_endpoint": {"address":"10.77.10.20","port":46859,"network_function":null},
+            "direction": "UNKNOWN",
+        })];
+        let jsonl_path = write_jsonl(&dir, &raw);
+        let index = RawEventIndex::from_jsonl_path(&jsonl_path).unwrap();
+        let mut events = vec![stale_callflow_event(
+            "evt-04",
+            "Unknown endpoint",
+            "Unknown endpoint",
+            "UNKNOWN",
+            "Security Mode Complete", // bug 2.14.3 : 0x5d mal mappé
+        )];
+        let map = lab_endpoint_map();
+        let counters = Arc::new(PatchCounters::new());
+        let rewritten = patch_flow_events(&mut events, &index, &map, &counters);
+        assert_eq!(rewritten, 1);
+        assert_eq!(
+            events[0]["message_name"], "Security Mode Command",
+            "NAS orphelin 0x5d doit porter le nom NAS SEUL via mm_eps_name"
+        );
+        assert_eq!(events[0]["source_participant"], "MME");
+        assert_eq!(events[0]["destination_participant"], "eNB");
+        // Provenance : read_time_patch.fields doit contenir
+        // message_name (règle du lot 2.14.12).
+        let fields = events[0]["read_time_patch"]["fields"]
+            .as_array()
+            .expect("fields");
+        assert!(
+            fields.iter().any(|v| v.as_str() == Some("message_name")),
+            "read_time_patch.fields doit inclure message_name, got {:?}",
+            fields
+        );
+        std::fs::remove_file(&jsonl_path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    /// 2.14.12 (ANR1 #10 6867204663) — même règle pour 5G : un NAS
+    /// 5GMM orphelin (sans parent NGAP) doit porter son nom NAS seul
+    /// via `mm_name(5G)`. Cas : Registration Request (0x41) orphelin
+    /// → « Registration Request ». Cas NAS chiffré (message_type=0) →
+    /// « NAS chiffré ».
+    #[test]
+    fn patcher_rewrites_nas_5gmm_without_parent() {
+        let dir = std::env::temp_dir().join(format!(
+            "oiran-read-time-patch-nas-5g-orphan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = vec![
+            json!({
+                "event_id": "ngap-nas-01",
+                "parent_event_id": null,
+                "interface": "N2",
+                "protocol": "NAS-5GMM",
+                "message_name": "stale",
+                "message_type": 0x41,
+                "procedure_code": 0x41,
+                "source_endpoint": {"address":"10.77.21.20","port":55123,"network_function":null},
+                "destination_endpoint": {"address":"10.77.21.11","port":38412,"network_function":null},
+                "direction": "UNKNOWN",
+            }),
+            json!({
+                "event_id": "ngap-nas-02",
+                "parent_event_id": null,
+                "interface": "N2",
+                "protocol": "NAS-5GMM",
+                "message_name": "stale",
+                "message_type": 0,
+                "procedure_code": null,
+                "source_endpoint": {"address":"10.77.21.20","port":55123,"network_function":null},
+                "destination_endpoint": {"address":"10.77.21.11","port":38412,"network_function":null},
+                "direction": "UNKNOWN",
+            }),
+        ];
+        let jsonl_path = write_jsonl(&dir, &raw);
+        let index = RawEventIndex::from_jsonl_path(&jsonl_path).unwrap();
+        let mut events = vec![
+            stale_callflow_event(
+                "ngap-nas-01",
+                "Unknown endpoint",
+                "Unknown endpoint",
+                "RAN_TO_CORE",
+                "Registration stale",
+            ),
+            stale_callflow_event(
+                "ngap-nas-02",
+                "Unknown endpoint",
+                "Unknown endpoint",
+                "RAN_TO_CORE",
+                "Protected 5GMM message",
+            ),
+        ];
+        let ngap_map = HashMap::from([
+            ("10.77.21.20".to_string(), "gNB".to_string()),
+            ("10.77.21.11".to_string(), "AMF".to_string()),
+        ]);
+        let counters = Arc::new(PatchCounters::new());
+        let rewritten = patch_flow_events(&mut events, &index, &ngap_map, &counters);
+        assert_eq!(rewritten, 2);
+        assert_eq!(
+            events[0]["message_name"], "Registration Request",
+            "NAS-5GMM 0x41 orphelin doit être étiqueté par mm_name (TS 24.501 §9.7)"
+        );
+        assert_eq!(
+            events[1]["message_name"], "NAS chiffré",
+            "NAS orphelin avec message_type=0 → placeholder NAS chiffré"
+        );
         std::fs::remove_file(&jsonl_path).ok();
         std::fs::remove_dir(&dir).ok();
     }

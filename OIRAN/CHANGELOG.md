@@ -1,5 +1,65 @@
 # Changelog
 
+## OIRAN API 2.14.12 — 2026-11-13 — correction à la lecture des événements NAS sans parent S1AP
+
+Gate prod ANR1 (#10 6867204663) sur la 2.14.11 : tout passe (index prêt en 5,2 s, requêtes LTE à 50 ms, mémoire max 193 Mo) SAUF un point — l'événement 04 est resté « Security Mode Complete » au lieu de « Security Mode Command ».
+
+### Cause mesurée (fichier:ligne)
+
+Dans `apps/api/src/read_time_patch.rs`, l'ancienne logique de `patch_one` (lignes ~660-671 avant 2.14.12) ne recalculait le libellé NAS que **via son parent S1AP** (`nas_name_for(raw, parent_name)`). Si `parent_event_id` était `null` dans le JSONL, le fallback tombait sur `s1ap_name_for(raw)` — qui retourne `None` pour tout protocole `NAS-*` (match ligne 535-541 restreint à `S1AP` / `NGAP`). Résultat : aucun recalcul possible, le libellé stale 2.14.3 restait tel quel.
+
+### Audit NAS orphelins (ce runner, 2026-11-13)
+
+```
+$ grep '"protocol":"NAS' OIRAN/benchmarks/E2E_002/.../oiran_events.jsonl | grep -c '"parent_event_id":null'
+0
+$ grep '"protocol":"NAS' OIRAN/datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl | grep -c '"parent_event_id":null'
+0
+```
+
+Les deux fixtures du repo ne contiennent **aucun** NAS orphelin → elles ne reproduisent pas le cas prod. Le JSONL prod (3 393 914 516 octets, sessions `lte-session-81c8e02939b8f868` et `lte-session-7d5a9620319218ed`) n'est pas présent sur le runner devmat → audit prod sur ces deux sessions = **OUVERT côté devmat**, mais le défaut est **confirmé par le rapport ANR1** (#10 6867204663) et par l'analyse code ci-dessus.
+
+### Correctif
+
+- Nouvelle fonction `nas_name_only(raw: &Value) -> Option<String>` : extrait le nom NAS brut depuis `protocol` + `message_type`, via les mêmes tables uniques que l'ingestion (`decoder_nas::mm_eps_name` pour EPS, `decoder_nas::mm_name` / `sm_name_5g` pour 5G). `message_type == 0` → `"NAS chiffré"` (même règle que la combinaison via parent).
+- `nas_name_for(raw, parent_name)` passe sur `nas_name_only` + `decoder_s1ap::combined_message_name` → deux chemins partagent la même source de vérité.
+- `patch_one` : trois cas ordonnés par spécificité — (a) NAS **avec** parent S1AP/NGAP résolu → nom combiné ; (b) événement S1AP / NGAP lui-même → nom de procédure ; (c) **2.14.12 nouveau** — NAS **sans** parent → nom NAS seul via `nas_name_only`. Dans tous les cas où `message_name` est réécrit, `read_time_patch.fields` inclut `"message_name"`.
+
+### Tests nouveaux (3)
+
+- `patcher_rewrites_nas_eps_without_parent` : NAS 0x5D orphelin au format 2.14.3 → `"Security Mode Command"` (seul, pas combiné). Vérifie participants, provenance `read_time_patch.fields` contient `message_name`.
+- `patcher_rewrites_nas_5gmm_without_parent` : NAS-5GMM 0x41 orphelin → `"Registration Request"` ; NAS-5GMM `message_type=0` orphelin → `"NAS chiffré"`.
+- Le test LTE historique `patcher_rewrites_s1_mme_stale_fields_via_jsonl_cross_reference` (cas **avec** parent) reste vert → non-régression.
+
+### Preuves (ce lot, 2026-11-13)
+
+```
+$ cargo test --release --locked -p oiran-api --lib -- \
+    patcher_rewrites_nas_eps_without_parent \
+    patcher_rewrites_nas_5gmm_without_parent \
+    patcher_rewrites_s1_mme_stale_fields_via_jsonl_cross_reference \
+    patcher_rewrites_ngap_5g_stale_fields
+test result: ok. 4 passed; 0 failed; 0 ignored; 89 filtered out; finished in 0.00s
+
+$ cargo test --release --locked --workspace --no-fail-fast
+# 77 suites, 543 passed, 0 failed, 9 ignored, exit 0
+
+$ cargo test --release --locked --workspace --no-fail-fast -- --test-threads=1
+# 77 suites, 543 passed, 0 failed, 9 ignored, exit 0
+
+$ OIRAN_READ_TIME_PATCH_LOAD_TEST_BYTES=3400000000 \
+    cargo test --release --locked -p oiran-api --lib -- --ignored --nocapture \
+    read_time_patch_compact_index_bounded_and_fast_on_large_jsonl
+COMPACT_INDEX entries=1481738 bytes_estimate=28 MiB build_ms=3224 last_offset=3243 MiB jsonl_size=3243 MiB
+VmHWM     before=3 MiB, after=58 MiB, threshold=512 MiB, jsonl_size=3243 MiB
+test result: ok. 1 passed; 0 failed; 0 ignored; finished in 28.77s
+
+$ df -h /home/devmat
+/dev/sda1       388G  376G   12G  97% /
+```
+
+Non-régression du test de charge 2.14.11 : index = **28 MiB** (< 64 MiB), VmHWM = **58 MiB** (< 512 MiB), build = **3,22 s**, latence sessions < 500 ms. +2 tests dans la suite (541 → 543 passed).
+
 ## OIRAN API 2.14.11 — 2026-11-13 — index compact du JSONL (latence < 500 ms, RAM bornée)
 
 Constat ANR1 (#10 6860508699) : `oiran_events.jsonl` de prod = **3 393 914 516 octets, 1 554 682 lignes**. La 2.14.9 relit ce fichier à chaque session **non cachée** (streaming + filtrage par `event_id`) : ~35 s pour 2 Go observé → ~60 s pour 3,4 Go extrapolé. Inutilisable en interactif. Le changement de plan d'ANR1 (confirmé) : la 2.14.9 ne sera pas déployée seule, ANR1 pousse directement la 2.14.11 qui contient 2.14.9 et 2.14.10.
