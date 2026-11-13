@@ -1957,7 +1957,10 @@ mod tests {
                 .map(str::to_owned)
                 .unwrap_or_else(|| panic!("missing compacted subscriber pseudonym for {interface}/{message}"))
         };
-        let nas_pseudo = pseudo("S1-MME", "Attach Request");
+        // 2.14.4 (ANR2 ladder écart 2b) : le nom combiné `initialUEMessage · <NAS>`
+        // porte désormais la procédure S1AP porteuse pour tout événement NAS
+        // enfant produit par decoder-s1ap.
+        let nas_pseudo = pseudo("S1-MME", "initialUEMessage · Attach Request");
         assert_eq!(nas_pseudo, pseudo("S11", "CreateSessionRequest"));
         assert_eq!(nas_pseudo, pseudo("S6a", "Authentication-Information-Request"));
 
@@ -2017,7 +2020,12 @@ mod tests {
         let negative_left = negative_publication
             .events
             .iter()
-            .filter(|event| event.interface == "S1-MME" && event.message_name == "Attach Request")
+            .filter(|event| {
+                event.interface == "S1-MME"
+                    // 2.14.4 (ANR2 ladder écart 2b) : nom combiné depuis
+                    // decoder-s1ap 0.3.0.
+                    && event.message_name == "initialUEMessage · Attach Request"
+            })
             .collect::<Vec<_>>();
         let negative_right = negative_publication
             .events
