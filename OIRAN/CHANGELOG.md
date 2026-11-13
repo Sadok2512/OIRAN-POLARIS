@@ -20,9 +20,11 @@ Les 11 échecs `capture-helper` et le 12e (`worker-runtime::queue_saturation_is_
 
 ### worker-runtime 0.3.0 → 0.3.1
 
-- `queue_saturation_is_bounded_and_accounted` rendu déterministe : l'assertion `hw <= 2` dépendait du timing OS (sous `--test-threads=1`, le worker drainait plus vite et exposait un hw observé de 3). Remplacée par une **borne mathématique fermée** : `hw <= queue_capacity_batches + workers + 1`, dérivée du code (`enqueue()` incrémente avant `try_send`, `dequeue()` ne décrémente qu'après `recv()` côté worker + branche `TrySendError::Full`). Pour la config du test (`queue_capacity=1, workers=1`) → borne = 3, sans dépendance au scheduler OS.
+- **Correctif de code, pas de test.** Audit ANR1 sur `queue_saturation_is_bounded_and_accounted` : l'ancienne assertion `hw <= 2` était la **vraie garantie sémantique** de la file (queue_occupancy = batches effectivement en vol dans le channel + batches tenus par un worker). Elle échouait sous `--test-threads=1` parce que `submit` incrémentait `enqueue()` **avant** `try_send`, puis appelait `dequeue()` dans la branche `TrySendError::Full` : le compteur comptait donc transitoirement des batches qui **ne rentraient JAMAIS dans la file**, exposant un hw observé de 3 sur une config `queue=1 / workers=1`. La bonne borne restait 2 — c'est le code qui mentait.
+- Fix dans `WorkerRuntime::submit` : `enqueue()` déplacé **à l'intérieur de la branche `Ok(())` de `try_send`**. Les deux branches d'échec (`Full` et `Disconnected`) ne touchent plus `queue_occupancy`. La borne devient tight par construction : `max(queue_occupancy) = queue_capacity_batches + workers` (items dans le channel + items tenus par un worker entre `recv()` et `dequeue()`).
+- Assertion de test **restaurée** à `hw <= queue_capacity_batches + workers` (= 2 pour la config du test). Aucun timing réel dans l'assertion ; la borne est dérivée du code et ne dépend pas du scheduler OS.
 - Les autres assertions (`rejected > 0`, `backpressure_events > 0`, `dropped > 0`) sont inchangées — elles portent sur des compteurs incrémentés côté submit, pas sur le drain worker.
-- Preuve : 5 runs successifs du test en isolation → `test result: ok. 1 passed; 0 failed` à chaque fois (voir rapport #9).
+- Preuve : 5 runs successifs du test en isolation, parallèle + `--test-threads=1`, disque à 95 % → `test result: ok. 1 passed; 0 failed` à chaque fois.
 
 ### Preuves (disque à 95 %)
 

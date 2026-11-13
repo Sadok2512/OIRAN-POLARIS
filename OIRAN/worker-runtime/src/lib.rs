@@ -220,17 +220,36 @@ impl WorkerRuntime {
             return Ok(());
         }
         let count = batch.len() as u64;
-        self.counters[worker].enqueue();
+        // 2.14.10 (ANR1 #10) — `queue_occupancy` représente les batches
+        // qui ont effectivement franchi le channel SyncSender (en vol
+        // : channel + worker-en-cours-de-process). La version 2.14.9 et
+        // antérieures incrémentaient le compteur AVANT `try_send` puis
+        // le décrémentaient dans la branche d'échec : `enqueue()` et
+        // `dequeue()` étaient donc appelés sur des batches qui ne
+        // rentraient JAMAIS dans la file, ce qui exposait
+        // transitoirement `queue_occupancy = queue_capacity + workers
+        // + 1` (3 sur la config `queue=1, workers=1`) et faisait
+        // échouer l'assertion « the counter includes the one batch
+        // handed to the worker plus channel capacity » (c.-à-d.
+        // `hw <= queue_capacity + workers = 2`).
+        //
+        // On ne compte désormais `enqueue()` QUE si `try_send` a
+        // réussi, c'est-à-dire si le batch a effectivement été placé
+        // dans le SyncSender. La borne devient tight par construction :
+        //   max(queue_occupancy) = (max items in channel) + (workers
+        //   holding a batch between recv() and dequeue())
+        //                        = queue_capacity_batches + workers.
         match self.senders[worker].try_send(batch) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.counters[worker].enqueue();
+                Ok(())
+            }
             Err(TrySendError::Full(_)) => {
-                self.counters[worker].dequeue();
                 self.counters[worker].backpressure();
                 self.counters[worker].drop_packets(count);
                 Err("queue full")
             }
             Err(TrySendError::Disconnected(_)) => {
-                self.counters[worker].dequeue();
                 self.counters[worker].drop_packets(count);
                 Err("worker disconnected")
             }
@@ -580,25 +599,20 @@ mod tests {
         assert_eq!(telemetry::sum(&report.workers).packets, accepted);
     }
 
-    /// 2.14.10 (ANR1 #10) — Déterministe, SANS dépendance au timing
-    /// réel. L'ancienne assertion `queue_high_watermark <= 2`
-    /// supposait que le worker dequeue avant la seconde soumission,
-    /// ce qui est un pari sur la rapidité du scheduler OS (cas
-    /// observé en `--test-threads=1` : hw monte à 3 et casse
-    /// l'assertion).
+    /// 2.14.10 (ANR1 #10) — assertion `queue_high_watermark <= 2`
+    /// restaurée (ancienne garantie, sémantiquement correcte). Le
+    /// correctif est **côté code** et non côté test : `submit`
+    /// n'incrémente plus `queue_occupancy` qu'après un `try_send`
+    /// réussi, pour que le compteur ne reflète que les batches qui
+    /// ont effectivement franchi le `SyncSender`. La borne devient
+    /// une garantie dure, dérivée du code sans timing :
     ///
-    /// La borne théorique est dérivée du code :
-    ///   enqueue() incrémente occupancy AVANT try_send ; dequeue()
-    ///   décrémente seulement après qu'un batch soit accepté par le
-    ///   worker (worker.dequeue()) OU que la soumission ait échoué
-    ///   (branche TrySendError::Full). Entre les deux, chaque submit
-    ///   en vol ajoute 1, chaque batch dans le channel ajoute 1, et
-    ///   un batch tenu par le worker (déjà recv() mais pas encore
-    ///   dequeue()) ajoute 1 → max théorique =
-    ///   `queue_capacity_batches + workers + 1`.
+    ///   max(queue_occupancy) = (items in channel) + (workers holding
+    ///                           a batch between recv() and dequeue())
+    ///                        = queue_capacity_batches + workers.
     ///
-    /// Avec `queue_capacity_batches=1, workers=1` → borne = 3. Ne
-    /// dépend d'aucun timing réel.
+    /// Pour `queue_capacity_batches=1, workers=1` → borne = 2.
+    /// Reproduit 5 fois de suite sans échec sur disque à 95 %.
     #[test]
     fn queue_saturation_is_bounded_and_accounted() {
         let config = RuntimeConfig {
@@ -630,14 +644,16 @@ mod tests {
             "backpressure events must be counted"
         );
         assert!(total.dropped > 0, "dropped packets must be counted");
-        // Borne mathématique déterministe (voir doc). Pas de timing
-        // réel dans l'assertion.
-        let theoretical_bound = config.queue_capacity_batches + config.workers + 1;
+        // Borne stricte : max items dans le channel + max items tenus
+        // par les workers entre recv() et dequeue(). La correction du
+        // code de `submit` (enqueue sur try_send Ok uniquement) rend
+        // cette borne tight ; aucun timing dans l'assertion.
+        let tight_bound = config.queue_capacity_batches + config.workers;
         assert!(
-            total.queue_high_watermark <= theoretical_bound,
-            "queue_high_watermark = {} exceeds theoretical bound {} (queue_capacity={}, workers={})",
+            total.queue_high_watermark <= tight_bound,
+            "queue_high_watermark = {} exceeds tight bound {} (queue_capacity={}, workers={})",
             total.queue_high_watermark,
-            theoretical_bound,
+            tight_bound,
             config.queue_capacity_batches,
             config.workers
         );
