@@ -1793,6 +1793,32 @@ struct DockerUeRuntime {
     ownership_id: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PduDnnObservation {
+    state: Option<String>,
+    address: Option<String>,
+}
+
+impl PduDnnObservation {
+    fn ready_address(&self) -> Option<&str> {
+        (self.state.as_deref() == Some("PS-ACTIVE"))
+            .then_some(self.address.as_deref())
+            .flatten()
+    }
+
+    fn raw_state(&self) -> &str {
+        self.state.as_deref().unwrap_or("UNKNOWN")
+    }
+
+    fn pending_error(&self, dnn: &str) -> String {
+        if dnn == "ims" {
+            format!("IMS_PDU_PENDING:state={}", self.raw_state())
+        } else {
+            format!("PDU_DNN_PENDING:dnn={dnn}:state={}", self.raw_state())
+        }
+    }
+}
+
 impl DockerUeRuntime {
     const ATTESTATION_PATH: &'static str =
         "/var/lib/polaris-control/ue-provisioning-attestation.json";
@@ -2483,16 +2509,18 @@ impl DockerUeRuntime {
         command
     }
 
-    fn pdu_for_dnn(output: &str, expected_dnn: &str) -> Option<String> {
+    fn pdu_for_dnn(output: &str, expected_dnn: &str) -> Option<PduDnnObservation> {
         let mut matched = false;
+        let mut state = None;
         let mut address = None;
         for raw in output.lines() {
             let line = raw.trim();
             if line.starts_with("PDU Session") || line.starts_with("Session") {
                 if matched {
-                    return address;
+                    return Some(PduDnnObservation { state, address });
                 }
                 matched = false;
+                state = None;
                 address = None;
                 continue;
             }
@@ -2501,16 +2529,22 @@ impl DockerUeRuntime {
             };
             match key.trim().to_ascii_lowercase().as_str() {
                 "apn" | "dnn" => matched = value.trim() == expected_dnn,
+                "state" => state = Some(value.trim().to_string()),
                 "address" | "ue-address" | "ipv4" => {
-                    address = Some(value.trim().split('/').next()?.to_string())
+                    address = value
+                        .trim()
+                        .split('/')
+                        .next()
+                        .and_then(|candidate| candidate.parse::<std::net::Ipv4Addr>().ok())
+                        .map(|candidate| candidate.to_string())
                 }
                 _ => {}
             }
         }
-        matched.then_some(address).flatten()
+        matched.then_some(PduDnnObservation { state, address })
     }
 
-    fn observe_pdu_dnn(target: &str, dnn: &str) -> Result<Option<String>, String> {
+    fn observe_pdu_dnn(target: &str, dnn: &str) -> Result<Option<PduDnnObservation>, String> {
         let output = Self::output(&[
             "exec".into(),
             target.into(),
@@ -2532,6 +2566,7 @@ impl DockerUeRuntime {
     ) -> Result<String, String> {
         let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+        let mut last_observation = None;
         loop {
             if cancel.load(Ordering::SeqCst) {
                 return Err("SCENARIO_STOP_REQUESTED".into());
@@ -2539,10 +2574,18 @@ impl DockerUeRuntime {
             if !self.owns(spec, handle) {
                 return Err("LIVE_UE_OWNERSHIP_NOT_PROVEN".into());
             }
-            if let Some(address) = Self::observe_pdu_dnn(target, dnn)? {
-                return Ok(address);
+            if let Some(observation) = Self::observe_pdu_dnn(target, dnn)? {
+                if let Some(address) = observation.ready_address() {
+                    return Ok(address.to_string());
+                }
+                last_observation = Some(observation);
             }
             if std::time::Instant::now() >= deadline {
+                if dnn == "ims" {
+                    if let Some(observation) = last_observation {
+                        return Err(observation.pending_error(dnn));
+                    }
+                }
                 return Err("PDU_DNN_NOT_OBSERVED".into());
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -2856,10 +2899,17 @@ impl UeRuntime for DockerUeRuntime {
             return Err("LIVE_UE_OWNERSHIP_NOT_PROVEN".into());
         }
         let target = Self::container_id(handle).ok_or("INVALID_PROCESS_HANDLE")?;
-        if Self::observe_pdu_dnn(target, &profile.dnn)?.is_some() {
+        let observation = Self::observe_pdu_dnn(target, &profile.dnn)?;
+        if observation
+            .as_ref()
+            .and_then(PduDnnObservation::ready_address)
+            .is_some()
+        {
             return Ok(());
         }
-        Self::execute_ue_cli(target, Self::pdu_establish_command(profile))?;
+        if observation.is_none() {
+            Self::execute_ue_cli(target, Self::pdu_establish_command(profile))?;
+        }
         self.wait_for_owned_pdu_dnn(spec, handle, &profile.dnn, timeout_seconds, cancel)
             .map(|_| ())
     }
@@ -12836,8 +12886,9 @@ fn execute_ims_register(
     }
     let handle = job.process_handle.as_deref().ok_or("UE_HANDLE_INVALID")?;
     let container_id = DockerUeRuntime::container_id(handle).ok_or("UE_HANDLE_INVALID")?;
-    let ims_ip =
-        DockerUeRuntime::observe_pdu_dnn(container_id, "ims")?.ok_or("IMS_PDU_NOT_ACTIVE")?;
+    let ims_ip = DockerUeRuntime::observe_pdu_dnn(container_id, "ims")?
+        .and_then(|observation| observation.ready_address().map(str::to_string))
+        .ok_or("IMS_PDU_NOT_ACTIVE")?;
     let ims_iface = wait_for_ims_interface(
         container_id,
         &ims_ip,
@@ -19158,14 +19209,36 @@ mod p0_tests {
         let output = "PDU Session 1:\n  state: PS-ACTIVE\n  apn: internet\n  address: 10.46.0.6\n\
 PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         assert_eq!(
-            DockerUeRuntime::pdu_for_dnn(output, "ims").as_deref(),
-            Some("10.47.0.6")
+            DockerUeRuntime::pdu_for_dnn(output, "ims")
+                .and_then(|observation| observation.ready_address().map(str::to_string))
+                .as_deref(),
+            Some("10.47.0.6"),
         );
         assert_eq!(
-            DockerUeRuntime::pdu_for_dnn(output, "internet").as_deref(),
-            Some("10.46.0.6")
+            DockerUeRuntime::pdu_for_dnn(output, "internet")
+                .and_then(|observation| observation.ready_address().map(str::to_string))
+                .as_deref(),
+            Some("10.46.0.6"),
         );
         assert_eq!(DockerUeRuntime::pdu_for_dnn(output, "missing"), None);
+    }
+
+    #[test]
+    fn pdu_dnn_probe_rejects_null_or_empty_address_and_keeps_raw_state() {
+        for address in ["null", ""] {
+            let output = format!(
+                "PDU Session 2:\n  state: PS-ACTIVE-PENDING\n  dnn: ims\n  address: {address}\n"
+            );
+            let observation = DockerUeRuntime::pdu_for_dnn(&output, "ims")
+                .expect("the pending IMS session remains observable");
+            assert_eq!(observation.raw_state(), "PS-ACTIVE-PENDING");
+            assert_eq!(observation.address, None);
+            assert_eq!(observation.ready_address(), None);
+            assert_eq!(
+                observation.pending_error("ims"),
+                "IMS_PDU_PENDING:state=PS-ACTIVE-PENDING"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,10 @@
 # @telecom/simulator-control — Changelog
 
+## 0.34.0 — 2026-11-13 — IMS PDU readiness contract
+
+- Aligns the release version with the API that keeps IMS unavailable until
+  UERANSIM reports `PS-ACTIVE` and a real IPv4 address.
+
 ## 0.33.2 — 2026-11-13 — rich UI delivery gate
 
 - Delivers the 0.33.1 rich UI corrections independently from the uncertified
