@@ -33,6 +33,7 @@ import {
 } from 'lucide-react';
 import { PageHeader } from '@/components/mockup';
 import { StatusIndicator } from '@/ui/StatusIndicator';
+import { IMSI_MASK } from '@/ue/imsiHelpers';
 
 interface ActivityStates {
   rm_state?: string | null;
@@ -79,10 +80,11 @@ export interface UeActivityPayload {
   imsi?: string | null;
   states?: ActivityStates;
   pdu?: ActivityPdu | null;
+  pdus?: ActivityPdu[];
   counters?: ActivityCounters | null;
   job_step?: ActivityJobStep | null;
   events?: ActivityEvent[];
-  voice?: { available: boolean; reason: string };
+  voice?: { available: boolean; reason: string | null; detail?: string | null; sip_code?: number };
 }
 
 const MAX_SAMPLES = 60; // 2 min at 2 s cadence.
@@ -226,7 +228,7 @@ export function UeActivityPage() {
             data-testid="activity-pdu"
           >
             <h2 className="text-ep-sm font-semibold">PDU</h2>
-            <PduBlock pdu={payload.pdu ?? null} />
+            <PduBlock pdus={payload.pdus ?? (payload.pdu ? [payload.pdu] : [])} />
           </section>
 
           <section
@@ -255,13 +257,13 @@ export function UeActivityPage() {
             <h2 className="text-ep-sm font-semibold flex items-center gap-2">
               <Mic width={13} height={13} aria-hidden="true" /> Voix
             </h2>
-            <p className="text-ep-sm text-text-secondary">
-              IMS not available.
-            </p>
-            <p className="text-ep-xs text-text-secondary">
-              <span className="mono">{payload.voice?.reason ?? 'IMS_NOT_AVAILABLE'}</span> —
-              la pile IMS n'est pas déployée côté lab ; les appels ne peuvent pas être lancés.
-            </p>
+            {payload.voice?.available ? (
+              <p className="text-ep-sm text-ok">IMS enregistré · SIP 200 observé.</p>
+            ) : (
+              <p className="text-ep-sm text-text-secondary">
+                IMS indisponible · <span className="mono">{payload.voice?.reason ?? 'IMS_NOT_AVAILABLE'}</span>
+              </p>
+            )}
           </section>
 
           <section
@@ -367,18 +369,20 @@ function IdentityRow({ imsi }: { imsi?: string | null }) {
     <p className="text-ep-xs text-text-secondary flex items-center gap-2">
       <span className="uppercase tracking-wider">IMSI</span>
       <span className="mono" data-testid="activity-imsi">
-        {imsi ?? '—'}
+        {imsi ? IMSI_MASK : '—'}
       </span>
     </p>
   );
 }
 
-function PduBlock({ pdu }: { pdu: ActivityPdu | null }) {
-  if (!pdu) {
+function PduBlock({ pdus }: { pdus: ActivityPdu[] }) {
+  if (pdus.length === 0) {
     return <p className="text-ep-sm text-text-secondary">Aucune session PDU active.</p>;
   }
   return (
-    <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-ep-sm">
+    <div className="flex flex-col gap-3">
+      {pdus.map((pdu, index) => (
+      <dl key={`${pdu.dnn ?? 'unknown'}-${pdu.psi ?? index}`} className="grid grid-cols-2 gap-x-3 gap-y-1 text-ep-sm border-b border-line pb-2 last:border-0 last:pb-0">
       <dt className="text-text-secondary">PSI</dt>
       <dd className="mono" data-testid="activity-pdu-psi">
         {pdu.psi ?? '—'}
@@ -393,7 +397,9 @@ function PduBlock({ pdu }: { pdu: ActivityPdu | null }) {
       <dd className="mono" data-testid="activity-pdu-ip">
         {pdu.address ?? '—'}
       </dd>
-    </dl>
+      </dl>
+      ))}
+    </div>
   );
 }
 

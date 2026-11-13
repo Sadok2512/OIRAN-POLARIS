@@ -470,6 +470,10 @@ struct ControlRuntime {
 struct DefinitionJobControl {
     cancel: Arc<AtomicBool>,
     started_ues: Arc<Mutex<BTreeSet<String>>>,
+    /// IMS clients launched by this exact scenario run. This is deliberately
+    /// independent from `started_ues`: a run may register an already-running
+    /// UE and must still clean up only the Baresip process it owns.
+    ims_clients: Arc<Mutex<BTreeSet<String>>>,
     // Immutable runtime approvals obtained by this definition job. Runtime
     // observation may clear the registry copy after switch-off, but terminal
     // steps and cleanup remain authorized by the job-owned copy until the job
@@ -3836,10 +3840,9 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
         "detach",
         "repeat",
     ];
-    let mut unavailable_steps = vec![
-        json!({"type":"ims_register","http_status":423,"reason":"IMS_NOT_AVAILABLE"}),
-        json!({"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}),
-    ];
+    executable_steps.push("ims_register");
+    let mut unavailable_steps =
+        vec![json!({"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"})];
     if dl_sender.is_ok() {
         executable_steps.push("traffic_dl");
         executable_steps.push("traffic_ul");
@@ -8424,10 +8427,6 @@ async fn get_ue_profile(
         .snapshot()
         .into_iter()
         .find(|job| job.ue_id == ue_id);
-    let pdu_state = job
-        .as_ref()
-        .map(|job| job.pdu_session_state.as_str())
-        .unwrap_or("NOT_OBSERVED");
     let last_job = {
         let runtime = state.runtime.lock().unwrap();
         runtime
@@ -8446,7 +8445,8 @@ async fn get_ue_profile(
         "subscriber_identity_exposed".into(),
         Value::Bool(identity_exposed),
     );
-    object.insert("pdu_sessions".into(),json!([{"dnn":record.profile.dnn,"state":pdu_state,"source":"CURRENT_CONTROLLER_OBSERVATION"}]));
+    let pdu_sessions = job.as_ref().map(pdu_snapshots_for_job).unwrap_or_default();
+    object.insert("pdu_sessions".into(), json!(pdu_sessions));
     object.insert("ims".into(),json!({"configured":subscriber.as_ref().is_some_and(|s|s.dnns.iter().any(|d|d=="ims")),"state":"NOT_OBSERVED"}));
     object.insert(
         "subscriber".into(),
@@ -9880,6 +9880,28 @@ fn ue_control_is_authorized(
     !ue_ids.is_empty() && ue_ids.iter().all(|ue_id| authorized.contains(ue_id))
 }
 
+fn pdu_snapshots_for_job(job: &simulator_controller::UeJob) -> Vec<activity::PduSnapshot> {
+    let Some(handle) = job.process_handle.as_deref() else {
+        return vec![];
+    };
+    let Some(container_id) = DockerUeRuntime::container_id(handle) else {
+        return vec![];
+    };
+    let Ok(node_name) = DockerUeRuntime::ue_cli_node(container_id) else {
+        return vec![];
+    };
+    DockerUeRuntime::output(&[
+        "exec".into(),
+        container_id.into(),
+        "nr-cli".into(),
+        node_name,
+        "-e".into(),
+        "ps-list".into(),
+    ])
+    .map(|output| activity::parse_ps_list_all(&output))
+    .unwrap_or_default()
+}
+
 async fn ues(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<EffectiveIdentity>,
@@ -9999,6 +10021,10 @@ async fn ues(
     }
     let controller_inventory = controller.inventory();
     let controller_jobs = controller.snapshot();
+    let pdu_sessions_by_ue = controller_jobs
+        .iter()
+        .map(|job| (job.ue_id.clone(), pdu_snapshots_for_job(job)))
+        .collect::<BTreeMap<_, _>>();
     let profile_specs = controller.profiles();
     let control_authorized_ids = authorized_ue_control_ids(&state, &identity);
     // 0.19.6 — Pre-compute the set of UE ids covered by at least one
@@ -10160,6 +10186,7 @@ async fn ues(
                 "profile_state":"CONFIGURED","subscription_status":subscription_status,
                 "serving_node":profile.serving_gnb,"process_state":process_state,
                 "registration_state":registration_state,"rrc_state":"UNKNOWN","pdu_session":pdu_session,
+                "pdu_sessions":pdu_sessions_by_ue.get(&profile.ue_id).cloned().unwrap_or_default(),
                 "ue_ip":if shared {shared_observation.ue_ip.clone().map_or(Value::Null,Value::from)} else {job.and_then(|value|value.ue_ip.clone()).map_or(Value::Null,Value::from)},
                 "traffic_state":traffic_state,
                 "uptime_seconds":if shared {Value::Null} else {job.and_then(|value|value.started_at_epoch_s).map(|started|epoch_seconds().saturating_sub(started)).map_or(Value::Null,Value::from)},
@@ -10726,7 +10753,7 @@ fn stop_one_live_inner(
     // container removes the namespace in either case.
     let policy_target = resolve_controller_traffic_target(state, ue_id).ok();
     let operation_id = random_hex(16);
-    let (approved_runtime, handle) = {
+    let (approved_runtime, handle, release_job) = {
         let mut controller = state
             .multi_ue
             .lock()
@@ -10746,6 +10773,7 @@ fn stop_one_live_inner(
             persist_ue_registry(state, &controller)?;
             return Ok(stopped);
         }
+        let release_job = job.clone();
         let approved_runtime = job
             .approved_runtime
             .or_else(|| job_approval.and_then(|approved| approved.approved_runtime.clone()))
@@ -10754,7 +10782,7 @@ fn stop_one_live_inner(
             .process_handle
             .or_else(|| job_approval.and_then(|approved| approved.process_handle.clone()))
             .ok_or("UE_NOT_STARTED")?;
-        let result = (approved_runtime, handle);
+        let result = (approved_runtime, handle, release_job);
         // 0.19.5 — Stop reclaims an expired lock instead of returning
         // 409: pass the current clock and the max age so the controller
         // can decide.
@@ -10799,6 +10827,25 @@ fn stop_one_live_inner(
                 json!({ "reason": error, "ue_ip": target.ue_ip }),
             );
         }
+    }
+    // Release every PDU owned by this UE before tearing its namespace down.
+    // A failed explicit release must never strand Stop: stopping the owned
+    // container is still the terminal cleanup, while Activity keeps the
+    // precise warning for diagnosis.
+    let release_cancel = AtomicBool::new(false);
+    stop_ims_client(ue_id);
+    if let Err(error) =
+        state
+            .ue_runtime
+            .release_pdu(job_approval.unwrap_or(&release_job), 30, &release_cancel)
+    {
+        record_activity_event(
+            state,
+            ue_id,
+            "PDU_RELEASE_ALL_WARNING",
+            "WARNING",
+            json!({ "reason": error }),
+        );
     }
     if let Err(error) = state.ue_runtime.stop(&approved_runtime, &handle) {
         if let Ok(mut controller) = state.multi_ue.lock() {
@@ -12603,7 +12650,7 @@ fn execute_live_definition_step(
         }
         "detach" => {
             for ue_id in ue_ids {
-                stop_ims_client(ue_id);
+                stop_definition_ims_client(control, ue_id);
                 let target = resolve_controller_traffic_target(state, ue_id)?;
                 let job = if let Some(approval) = definition_job_approval(control, ue_id)? {
                     approval
@@ -12704,6 +12751,45 @@ fn ims_client_name(ue_id: &str) -> Result<(&'static str, &'static str), String> 
     }
 }
 
+fn ims_interface_for_ip(links: &str, ims_ip: &str) -> Option<String> {
+    links
+        .lines()
+        .find(|line| line.contains(&format!(" {ims_ip}/")))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(|name| name.trim_end_matches(':').to_string())
+        .filter(|name| name.starts_with("uesimtun"))
+}
+
+fn wait_for_ims_interface(
+    container_id: &str,
+    ims_ip: &str,
+    control: &DefinitionJobControl,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if control.cancel.load(Ordering::SeqCst) {
+            return Err("SCENARIO_STOP_REQUESTED".into());
+        }
+        let links = DockerUeRuntime::output(&[
+            "exec".into(),
+            container_id.into(),
+            "ip".into(),
+            "-o".into(),
+            "-4".into(),
+            "addr".into(),
+            "show".into(),
+        ])?;
+        if let Some(interface) = ims_interface_for_ip(&links, ims_ip) {
+            return Ok(interface);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("IMS_TUN_NOT_READY".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 fn stop_ims_client(ue_id: &str) {
     if let Ok((name, _)) = ims_client_name(ue_id) {
         let owned = DockerUeRuntime::output(&[
@@ -12715,6 +12801,20 @@ fn stop_ims_client(ue_id: &str) {
             let _ = Command::new("/usr/bin/docker")
                 .args(["stop", "--time", "5", name])
                 .output();
+        }
+    }
+}
+
+fn stop_definition_ims_client(control: &DefinitionJobControl, ue_id: &str) {
+    let owned = control
+        .ims_clients
+        .lock()
+        .map(|clients| clients.contains(ue_id))
+        .unwrap_or(false);
+    if owned {
+        stop_ims_client(ue_id);
+        if let Ok(mut clients) = control.ims_clients.lock() {
+            clients.remove(ue_id);
         }
     }
 }
@@ -12737,22 +12837,12 @@ fn execute_ims_register(
     let container_id = DockerUeRuntime::container_id(handle).ok_or("UE_HANDLE_INVALID")?;
     let ims_ip =
         DockerUeRuntime::observe_pdu_dnn(container_id, "ims")?.ok_or("IMS_PDU_NOT_ACTIVE")?;
-    let links = DockerUeRuntime::output(&[
-        "exec".into(),
-        container_id.into(),
-        "ip".into(),
-        "-o".into(),
-        "-4".into(),
-        "addr".into(),
-        "show".into(),
-    ])?;
-    let ims_iface = links
-        .lines()
-        .find(|line| line.contains(&format!(" {ims_ip}/")))
-        .and_then(|line| line.split_whitespace().nth(1))
-        .map(|name| name.trim_end_matches(':'))
-        .filter(|name| name.starts_with("uesimtun"))
-        .ok_or("IMS_TUN_NOT_READY")?;
+    let ims_iface = wait_for_ims_interface(
+        container_id,
+        &ims_ip,
+        control,
+        std::time::Duration::from_secs(15),
+    )?;
     DockerUeRuntime::output(&[
         "exec".into(),
         container_id.into(),
@@ -12761,7 +12851,7 @@ fn execute_ims_register(
         "replace".into(),
         format!("{IMS_PROXY_IP}/32"),
         "dev".into(),
-        ims_iface.into(),
+        ims_iface.clone(),
         "src".into(),
         ims_ip.clone(),
     ])?;
@@ -12775,12 +12865,13 @@ fn execute_ims_register(
         "from".into(),
         ims_ip.clone(),
     ])?;
-    if !route.contains(ims_iface) {
+    if !route.contains(&ims_iface) {
         return Err("IMS_PCSCF_UNREACHABLE".into());
     }
     if !Path::new(IMS_AUTH_FILE).exists() || !Path::new(IMS_REGISTER_SCRIPT).exists() {
         return Err("IMS_CLIENT_CONFIGURATION_UNAVAILABLE".into());
     }
+    stop_ims_client(ue_id);
     let network = format!("container:{container_id}");
     let proxy = format!("SIP_PROXY={IMS_PROXY_IP}");
     let aor_env = format!("SIP_AOR={aor}");
@@ -12826,11 +12917,17 @@ fn execute_ims_register(
     if !output.status.success() {
         return Err("IMS_CLIENT_START_FAILED".into());
     }
+    if let Ok(mut clients) = control.ims_clients.lock() {
+        clients.insert(ue_id.to_string());
+    } else {
+        stop_ims_client(ue_id);
+        return Err("IMS_CLIENT_OWNERSHIP_UNAVAILABLE".into());
+    }
     let started = std::time::Instant::now();
     let deadline = started + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         if control.cancel.load(Ordering::SeqCst) {
-            stop_ims_client(ue_id);
+            stop_definition_ims_client(control, ue_id);
             return Err("SCENARIO_STOP_REQUESTED".into());
         }
         let logs = Command::new("/usr/bin/docker")
@@ -12851,7 +12948,7 @@ fn execute_ims_register(
             return Ok(result);
         }
         if text.contains("401") || text.contains("403") {
-            stop_ims_client(ue_id);
+            stop_definition_ims_client(control, ue_id);
             let code = if text.contains("403") { 403 } else { 401 };
             record_activity_event(
                 state,
@@ -12864,7 +12961,7 @@ fn execute_ims_register(
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    stop_ims_client(ue_id);
+    stop_definition_ims_client(control, ue_id);
     record_activity_event(
         state,
         ue_id,
@@ -12896,6 +12993,14 @@ fn request_terminal_detach(
 }
 
 fn cleanup_definition_started_ues(state: &AppState, control: &DefinitionJobControl) -> Vec<String> {
+    let ims_clients = control
+        .ims_clients
+        .lock()
+        .map(|ids| ids.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for ue_id in ims_clients {
+        stop_definition_ims_client(control, &ue_id);
+    }
     let started = control
         .started_ues
         .lock()
@@ -13138,6 +13243,7 @@ fn start_live_definition_scenario(
     let control = DefinitionJobControl {
         cancel: Arc::new(AtomicBool::new(false)),
         started_ues: Arc::new(Mutex::new(BTreeSet::new())),
+        ims_clients: Arc::new(Mutex::new(BTreeSet::new())),
         started_jobs: Arc::new(Mutex::new(BTreeMap::new())),
         authorised_at_start: Arc::new(authorisation),
     };
@@ -13199,7 +13305,7 @@ fn build_ue_activity_payload(state: &AppState, ue_id: &str, identity: &Effective
             Some("UE_NOT_OWNED_BY_CONTROLLER"),
             None,
             activity::NrCliStates::default(),
-            None,
+            vec![],
             None,
             None,
             vec![],
@@ -13219,7 +13325,7 @@ fn build_ue_activity_payload(state: &AppState, ue_id: &str, identity: &Effective
                     Some("UE_REGISTRY_UNAVAILABLE"),
                     None,
                     activity::NrCliStates::default(),
-                    None,
+                    vec![],
                     None,
                     None,
                     events,
@@ -13259,7 +13365,7 @@ fn build_ue_activity_payload(state: &AppState, ue_id: &str, identity: &Effective
             Some("UE_NOT_RUNNING"),
             imsi_projection,
             activity::NrCliStates::default(),
-            None,
+            vec![],
             None,
             None,
             events,
@@ -13272,7 +13378,7 @@ fn build_ue_activity_payload(state: &AppState, ue_id: &str, identity: &Effective
             Some("UE_HANDLE_INVALID"),
             imsi_projection,
             activity::NrCliStates::default(),
-            None,
+            vec![],
             None,
             None,
             events,
@@ -13298,7 +13404,7 @@ fn build_ue_activity_payload(state: &AppState, ue_id: &str, identity: &Effective
     } else {
         activity::NrCliStates::default()
     };
-    let pdu = if !node_name.is_empty() {
+    let pdus = if !node_name.is_empty() {
         DockerUeRuntime::output(&[
             "exec".into(),
             container_id.into(),
@@ -13309,9 +13415,10 @@ fn build_ue_activity_payload(state: &AppState, ue_id: &str, identity: &Effective
         ])
         .ok()
         .as_deref()
-        .and_then(activity::parse_ps_list)
+        .map(activity::parse_ps_list_all)
+        .unwrap_or_default()
     } else {
-        None
+        vec![]
     };
 
     // 5. uesimtun* counters + bps rates vs. previous sample.
@@ -13415,7 +13522,7 @@ fn build_ue_activity_payload(state: &AppState, ue_id: &str, identity: &Effective
         None,
         imsi_projection,
         states,
-        pdu,
+        pdus,
         counters,
         job_step,
         events,
@@ -13465,6 +13572,34 @@ async fn ue_activity_stream(
     )
     .boxed();
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Global header projection backed by the exact same `voice_probe` used by
+/// per-UE Activity. Infrastructure health alone can never produce IMS up.
+async fn voice_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let profiles = state
+        .multi_ue
+        .lock()
+        .map(|controller| controller.profiles())
+        .unwrap_or_default();
+    let mut fallback = json!({
+        "available": false,
+        "reason": "IMS_NOT_AVAILABLE",
+        "detail": "IMS_REGISTER_NOT_OBSERVED"
+    });
+    for profile in profiles {
+        let probe = activity::voice_probe(
+            &state.activity_events.snapshot(&profile.ue_id),
+            ue_has_live_launch(&state, &profile.ue_id),
+        );
+        if probe["available"] == true {
+            return Json(json!({"ue_id": profile.ue_id, "voice": probe}));
+        }
+        if probe["detail"] != "IMS_CLIENT_STOPPED" {
+            fallback = probe;
+        }
+    }
+    Json(json!({"ue_id": Value::Null, "voice": fallback}))
 }
 
 async fn start_scenario(
@@ -14660,6 +14795,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         // required, SUCI/GUTI/TMSI/key hard-filtered, IMSI role-gated.
         .route("/ues/:ue_id/activity", get(ue_activity))
         .route("/ues/:ue_id/activity/stream", get(ue_activity_stream))
+        .route("/voice/status", get(voice_status))
         .route("/traffic/status", get(traffic_status))
         // 0.20.1 (#47) — Traffic Generator CRUD + per-tick samples for
         // the live chart.
@@ -15527,7 +15663,8 @@ mod p0_tests {
                 "wait",
                 "idle",
                 "detach",
-                "repeat"
+                "repeat",
+                "ims_register"
             ])
         );
         assert_eq!(
@@ -15536,7 +15673,6 @@ mod p0_tests {
                 {"type":"traffic_dl","http_status":422,"reason":"DL_SENDER_NOT_AVAILABLE"},
                 {"type":"traffic_ul","http_status":422,"reason":"UL_RECEIVER_NOT_AVAILABLE"},
                 {"type":"transfer_verify","http_status":422,"reason":"TRANSFER_PEER_NOT_AVAILABLE"},
-                {"type":"ims_register","http_status":423,"reason":"IMS_NOT_AVAILABLE"},
                 {"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}
             ])
         );
@@ -15546,6 +15682,16 @@ mod p0_tests {
         );
         assert_eq!(body["scenario_step_limits"]["repeat_depth_max"], 2);
         assert_eq!(body["scenario_step_limits"]["resolved_steps_max"], 10_000);
+    }
+
+    #[test]
+    fn ims_interface_requires_matching_ims_address_on_uesimtun() {
+        let links = "7: uesimtun0 inet 10.46.0.5/24 scope global uesimtun0\n8: uesimtun1 inet 10.47.0.5/24 scope global uesimtun1\n";
+        assert_eq!(
+            ims_interface_for_ip(links, "10.47.0.5").as_deref(),
+            Some("uesimtun1")
+        );
+        assert_eq!(ims_interface_for_ip(links, "10.47.0.9"), None);
     }
 
     #[tokio::test]
@@ -16440,7 +16586,7 @@ mod p0_tests {
     }
 
     #[tokio::test]
-    async fn healthy_dl_sender_promotes_traffic_dl_without_promoting_ims_steps() {
+    async fn healthy_dl_sender_keeps_real_ims_register_executable() {
         let mut test_state = state();
         test_state.dl_sender.container = Some("polaris-dn-sender".into());
         test_state.dl_sender_health_override = Some(Ok(()));
@@ -16472,7 +16618,12 @@ mod p0_tests {
             .unwrap()
             .iter()
             .any(|step| step["type"] == "traffic_dl"));
-        assert!(body["unavailable_scenario_step_types"]
+        assert!(body["executable_scenario_step_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step == "ims_register"));
+        assert!(!body["unavailable_scenario_step_types"]
             .as_array()
             .unwrap()
             .iter()
@@ -19221,7 +19372,7 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
             1,
             [("UE-01".into(), "a".repeat(64))].into_iter().collect(),
         );
-        assert_eq!(&*stopped.lock().unwrap(), &["UE-02"]);
+        assert_eq!(&*stopped.lock().unwrap(), &["PDU_RELEASED:UE-02", "UE-02"]);
         let job = test_state
             .multi_ue
             .lock()
@@ -20885,6 +21036,7 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         let control = DefinitionJobControl {
             cancel: Arc::new(AtomicBool::new(false)),
             started_ues: Arc::new(Mutex::new(BTreeSet::from(["UE-02".into()]))),
+            ims_clients: Arc::new(Mutex::new(BTreeSet::new())),
             started_jobs: Arc::new(Mutex::new(BTreeMap::from([(
                 "UE-02".into(),
                 approved.clone(),

@@ -5,8 +5,7 @@
 //   * running:false path renders the "UE non démarré" banner;
 //   * running:true path renders the four state chips, PDU block, voice
 //     "IMS not available" line, and the timeline;
-//   * identity row shows the raw IMSI (no masking at this level — the
-//     backend already enforced the role-aware projection).
+//   * identity row never reveals a raw IMSI, even to operators.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
@@ -62,12 +61,10 @@ const RUNNING_PAYLOAD: UeActivityPayload = {
     rrc_state: 'RRC-CONNECTED',
     mm_5g_state: 'MM-REGISTERED-NORMAL-SERVICE',
   },
-  pdu: {
-    psi: 1,
-    dnn: 'internet',
-    state: 'PS-ACTIVE',
-    address: '10.46.0.7',
-  },
+  pdus: [
+    { psi: 1, dnn: 'internet', state: 'PS-ACTIVE', address: '10.46.0.7' },
+    { psi: 2, dnn: 'ims', state: 'PS-ACTIVE', address: '10.47.0.7' },
+  ],
   counters: {
     interface: 'uesimtun0',
     rx_bytes: 12_345_678,
@@ -125,11 +122,11 @@ describe('UeActivityPage (0.11.0)', () => {
     expect(screen.getByTestId('chip-cm')).toHaveTextContent('CM-CONNECTED');
     expect(screen.getByTestId('chip-rrc')).toHaveTextContent('RRC-CONNECTED');
     expect(screen.getByTestId('chip-5gmm')).toHaveTextContent('MM-REGISTERED-NORMAL-SERVICE');
-    expect(screen.getByTestId('activity-pdu-dnn')).toHaveTextContent('internet');
-    expect(screen.getByTestId('activity-pdu-ip')).toHaveTextContent('10.46.0.7');
-    expect(screen.getByTestId('activity-voice')).toHaveTextContent(/IMS not available/i);
+    expect(screen.getAllByTestId('activity-pdu-dnn').map((node) => node.textContent)).toEqual(['internet', 'ims']);
+    expect(screen.getAllByTestId('activity-pdu-ip').map((node) => node.textContent)).toEqual(['10.46.0.7', '10.47.0.7']);
+    expect(screen.getByTestId('activity-voice')).toHaveTextContent(/IMS indisponible/i);
     expect(screen.getByTestId('activity-voice')).toHaveTextContent('IMS_NOT_AVAILABLE');
-    expect(screen.getByTestId('activity-imsi')).toHaveTextContent('imsi-001010000000007');
+    expect(screen.getByTestId('activity-imsi').textContent).not.toMatch(/\d{14,16}/);
     expect(screen.getByTestId('activity-job-step')).toHaveTextContent('udp_traffic');
     expect(screen.getByTestId('timeline-list').children.length).toBe(2);
   });

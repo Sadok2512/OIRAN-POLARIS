@@ -1,5 +1,14 @@
 # @telecom/simulator-control — Changelog
 
+## 0.33.1 — 2026-11-13 — authoritative rich Control UI
+
+- Uses `/voice/status`, backed by the per-UE REGISTER-200 probe, as the only
+  source for the IMS header state.
+- Keeps Run primary and moves Start/Stop into the row overflow menu.
+- Masks IMSIs in UE Manager and Activity for every browser role.
+- Renders all active PDU sessions by DNN and removes legacy “Unused parameter”
+  noise while keeping representable voice drafts saveable.
+
 ## 0.20.0 — 2026-11-01 — temporary Operator LTE activation
 
 - Splits LTE certification into explicit Grant V2 preparation, temporary

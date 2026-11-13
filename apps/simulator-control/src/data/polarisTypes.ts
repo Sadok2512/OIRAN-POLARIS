@@ -144,6 +144,7 @@ export interface UeState {
   registration_state: string;
   rrc_state?: string;
   pdu_session: string;
+  pdu_sessions?: Array<{ psi?: number | null; dnn?: string | null; state?: string | null; address?: string | null }>;
   ue_ip: string | null;
   traffic_state: string;
   uptime_seconds?: number | null;
@@ -164,6 +165,17 @@ export interface UeState {
     traffic: boolean;
     provisioning_review?: boolean;
     reason: string;
+  };
+}
+
+export interface VoiceStatus {
+  ue_id: string | null;
+  voice: {
+    available: boolean;
+    reason: string | null;
+    detail?: string | null;
+    sip_code?: number;
+    registration_time_ms?: number;
   };
 }
 

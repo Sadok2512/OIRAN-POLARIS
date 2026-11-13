@@ -26,7 +26,6 @@ export function StepEditor({
   depth?: number;
 }) {
   const meta = STEP_METADATA[step.kind];
-  const paramKeys = Object.keys(step.params) as (keyof StepParams)[];
   const supportedKeys = meta.defaultParams ?? [];
   const isRepeat = step.kind === 'REPEAT';
   const nestedSteps = step.steps ?? [];
@@ -120,14 +119,6 @@ export function StepEditor({
       ) : (
         <p className="text-ep-xs text-text-secondary">No parameter for this step.</p>
       )}
-
-      {paramKeys
-        .filter((key) => !(supportedKeys as string[]).includes(key as string))
-        .map((key) => (
-          <p key={key as string} className="text-ep-xs text-warning">
-            Unused parameter: <code className="mono">{key}</code>
-          </p>
-        ))}
 
       {isRepeat && (
         <section

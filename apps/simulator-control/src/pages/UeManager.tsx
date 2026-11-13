@@ -1191,7 +1191,7 @@ export function UeManagerPage() {
                         <span data-testid={`ue-owner-${row.profile.id}`}>owner —</span>
                       )}
                       <span className="mono" data-testid={`ue-imsi-${row.profile.id}`}>
-                        {formatImsiForRole(row.profile.imsi, canOperate)}
+                        {formatImsiForRole(row.profile.imsi, false)}
                       </span>
                     </div>
                   </td>
@@ -1310,36 +1310,9 @@ export function UeManagerPage() {
                   </td>
                   <td>
                     <div className="flex items-center justify-end gap-1 flex-nowrap">
-                      {/* 0.10.0 — Start/Stop are state-driven: whichever action
-                          applies to the UE's current runtime is shown; the other is
-                          collapsed. Keeps the row within the 10% column at 1440/1920. */}
-                      {showStop ? (
-                        <button
-                          type="button"
-                          className="ep-button ep-button-sm ep-button-danger"
-                          onClick={() => setConfirmStop(row)}
-                          disabled={stopDisabled}
-                          title={stopReason ?? 'Arrêter le job actif de cette UE.'}
-                          data-testid={`ue-stop-${row.profile.id}`}
-                        >
-                          <StopCircle width={13} height={13} aria-hidden="true" />
-                          <span className="ml-1">Stop</span>
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          className="ep-button ep-button-sm"
-                          onClick={() => void startBackendUe(row)}
-                          disabled={startDisabled}
-                          title={startReason ?? 'Démarrer cette UE sur le backend.'}
-                          data-testid={`ue-start-${row.profile.id}`}
-                        >
-                          Start
-                        </button>
-                      )}
                       <button
                         type="button"
-                        className="ep-button ep-button-sm"
+                        className="ep-button ep-button-sm ep-button-primary"
                         onClick={() => scenario && setConfirmRun({ row, scenario })}
                         disabled={runDisabled}
                         title={runReason ?? 'Dispatcher le scénario assigné sur cette UE.'}
@@ -1351,6 +1324,25 @@ export function UeManagerPage() {
                         ariaLabel={`More actions for ${row.profile.id}`}
                         testid={`ue-more-${row.profile.id}`}
                         items={[
+                          showStop
+                            ? {
+                                key: 'stop',
+                                label: 'Stop',
+                                icon: <StopCircle width={12} height={12} aria-hidden="true" />,
+                                onSelect: () => setConfirmStop(row),
+                                disabled: stopDisabled,
+                                disabledReason: stopReason ?? undefined,
+                                tone: 'danger' as const,
+                                testid: `ue-stop-${row.profile.id}`,
+                              }
+                            : {
+                                key: 'start',
+                                label: 'Start',
+                                onSelect: () => void startBackendUe(row),
+                                disabled: startDisabled,
+                                disabledReason: startReason ?? undefined,
+                                testid: `ue-start-${row.profile.id}`,
+                              },
                           {
                             key: 'edit',
                             label: 'Edit',

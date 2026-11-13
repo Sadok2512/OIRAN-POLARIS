@@ -7,6 +7,14 @@
   back to API milliseconds.
 - Replaces verbose backend warnings with short French operator messages while
   retaining technical details in tooltips.
+- Waits for the IMS tunnel that owns the IMS PDU address before starting the
+  per-run Baresip client, and publishes `ims_register` as executable while
+  keeping `voice_call` unavailable.
+- Lists every observed PDU by DNN in `/ues`, UE detail and Activity; Stop
+  requests `ps-release-all` before terminating the owned UE namespace.
+- Makes the rich Simulator Control artifact the 0.33.1 reference: Run is the
+  primary row action, Start/Stop live under the overflow menu, IMSIs stay
+  masked, and the header reads the same REGISTER-200 voice probe as Activity.
 
 ## 0.33.0 — 2026-11-13 — IMS registration phase 1
 

@@ -107,6 +107,13 @@ export function AppShell() {
             <span className="num" data-testid="live-ues">
               Live UEs {lab.liveUes} / {lab.maxUes || '—'}
             </span>
+            <span
+              className={lab.voiceAvailable ? 'text-ok' : 'text-mute'}
+              data-testid="ims-status"
+              title={lab.voiceAvailable ? 'REGISTER SIP 200 observé' : lab.voiceReason}
+            >
+              {lab.voiceAvailable ? 'IMS up' : 'IMS indisponible'}
+            </span>
             {auth.data?.authenticated ? (
               <span
                 className="rounded border border-line px-1.5 py-0.5 text-ep-xs"

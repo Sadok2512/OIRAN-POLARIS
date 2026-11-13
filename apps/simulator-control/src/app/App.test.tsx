@@ -41,6 +41,8 @@ function stubFetch() {
       return respond(200, { data: { items: [], total: 0, source: 'test', live_execution: false }, meta: {} });
     if (url.includes('/traffic/status'))
       return respond(200, { data: { state: 'IDLE', packets_requested: 0, packets_sent: null, packets_received: null, bytes: null, accounting_source: 'none', last_result: null, approved_destinations: [] }, meta: {} });
+    if (url.includes('/voice/status'))
+      return respond(200, { data: { ue_id: null, voice: { available: false, reason: 'IMS_NOT_AVAILABLE', detail: 'IMS_REGISTER_NOT_OBSERVED' } }, meta: {} });
     if (url.includes('/ues'))
       return respond(200, { data: { items: [], configured_profiles: [], configured_count: 0, active_count: 0, registered_count: 0, source: 'test' }, meta: {} });
     if (url.includes('/nodes'))
@@ -131,6 +133,13 @@ describe('Simulator Control routes', () => {
   it('surfaces the header identity badge', async () => {
     renderApp();
     expect(await screen.findByTestId('header-identity')).toHaveTextContent(/not signed in/i);
+  });
+
+  it('never renders IMS up without the authoritative REGISTER 200 state', async () => {
+    renderApp();
+    const status = await screen.findByTestId('ims-status');
+    expect(status).toHaveTextContent('IMS indisponible');
+    expect(status).not.toHaveTextContent('IMS up');
   });
 
   it('navigates to Scenarios library and opens the builder', async () => {

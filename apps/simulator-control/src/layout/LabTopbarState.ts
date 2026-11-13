@@ -1,4 +1,4 @@
-import { useLab, useLabObserved, usePlmns, useUes } from '@/data/queries';
+import { useLab, useLabObserved, usePlmns, useUes, useVoiceStatus } from '@/data/queries';
 
 export interface LabTopbarState {
   coreHealth: 'healthy' | 'degraded' | 'offline' | 'unknown';
@@ -6,6 +6,8 @@ export interface LabTopbarState {
   tac: string;
   liveUes: number;
   maxUes: number;
+  voiceAvailable: boolean;
+  voiceReason: string;
 }
 
 function toHealth(state: string | undefined): LabTopbarState['coreHealth'] {
@@ -22,6 +24,7 @@ export function useLabTopbarState(): LabTopbarState {
   const observed = useLabObserved();
   const ues = useUes();
   const plmns = usePlmns();
+  const voice = useVoiceStatus();
 
   const open5gs = observed.data?.observed?.open5gs;
   let coreHealth: LabTopbarState['coreHealth'] = 'unknown';
@@ -48,5 +51,7 @@ export function useLabTopbarState(): LabTopbarState {
     tac: 'UNKNOWN',
     liveUes: ues.data?.active_count ?? 0,
     maxUes: lab.data?.max_ues ?? ues.data?.configured_count ?? 0,
+    voiceAvailable: voice.data?.voice?.available === true,
+    voiceReason: voice.data?.voice?.detail ?? voice.data?.voice?.reason ?? 'IMS_NOT_AVAILABLE',
   };
 }

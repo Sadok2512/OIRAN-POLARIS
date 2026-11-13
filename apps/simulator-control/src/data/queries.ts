@@ -18,6 +18,7 @@ import type {
   SystemHealth,
   TrafficState,
   UeInventory,
+  VoiceStatus,
   ValidationResult,
 } from './polarisTypes';
 
@@ -40,6 +41,14 @@ export function useCapabilities() {
     queryKey: ['polaris', 'capabilities'],
     queryFn: () => polarisApi<Capabilities>('/capabilities'),
     staleTime: 30_000,
+  });
+}
+
+export function useVoiceStatus() {
+  return useQuery({
+    queryKey: ['polaris', 'voice-status'],
+    queryFn: () => polarisApi<VoiceStatus>('/voice/status'),
+    refetchInterval: 2_000,
   });
 }
 

@@ -161,13 +161,14 @@ describe('recordFromWire — operator IMSI reveal', () => {
   });
 });
 
-describe('UE Manager — operator sees the API IMSI', () => {
-  it('renders the digits (imsi-<15 chars>) for a signed-in operator', async () => {
+describe('UE Manager — operator IMSI remains masked', () => {
+  it('never renders the digits returned by the API', async () => {
     stubFetch('operator', '001011234567890');
     renderPage();
     await waitFor(() => expect(screen.getByTestId('ue-imsi-UE-12')).toBeInTheDocument());
     const cell = screen.getByTestId('ue-imsi-UE-12');
-    expect(cell.textContent).toMatch(/imsi-001011234567890/);
+    expect(cell.textContent).not.toMatch(/\d{14,16}/);
+    expect(cell.textContent).toMatch(/•/);
   });
 });
 

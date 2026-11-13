@@ -165,7 +165,7 @@ pub fn compose_activity_payload(
     reason_when_stopped: Option<&str>,
     imsi_projection: Option<String>,
     nr_cli_states: NrCliStates,
-    pdu: Option<PduSnapshot>,
+    pdus: Vec<PduSnapshot>,
     counters: Option<CountersSnapshot>,
     job_step: Option<Value>,
     events: Vec<ActivityEvent>,
@@ -190,7 +190,8 @@ pub fn compose_activity_payload(
             "rrc_state": nr_cli_states.rrc_state,
             "mm_5g_state": nr_cli_states.mm_5g_state,
         },
-        "pdu": pdu,
+        "pdu": pdus.first(),
+        "pdus": pdus,
         "counters": counters,
         "job_step": job_step,
         "events": events,
@@ -286,9 +287,10 @@ pub struct PduSnapshot {
     pub address: Option<String>,
 }
 
-/// Parse the first PDU session block out of `nr-cli … -e ps-list`.
-pub fn parse_ps_list(stdout: &str) -> Option<PduSnapshot> {
+/// Parse every PDU session block out of `nr-cli … -e ps-list`.
+pub fn parse_ps_list_all(stdout: &str) -> Vec<PduSnapshot> {
     let filtered = filter_identity_fields(stdout);
+    let mut sessions = Vec::new();
     let mut psi = None;
     let mut dnn = None;
     let mut state = None;
@@ -301,7 +303,17 @@ pub fn parse_ps_list(stdout: &str) -> Option<PduSnapshot> {
         }
         if line.starts_with("PDU Session") || line.starts_with("Session") {
             if inside {
-                break;
+                if psi.is_some() || dnn.is_some() || state.is_some() || address.is_some() {
+                    sessions.push(PduSnapshot {
+                        psi,
+                        dnn,
+                        state,
+                        address,
+                    });
+                }
+                dnn = None;
+                state = None;
+                address = None;
             }
             inside = true;
             psi = line
@@ -331,16 +343,20 @@ pub fn parse_ps_list(stdout: &str) -> Option<PduSnapshot> {
             _ => {}
         }
     }
-    if psi.is_none() && dnn.is_none() && state.is_none() && address.is_none() {
-        None
-    } else {
-        Some(PduSnapshot {
+    if psi.is_some() || dnn.is_some() || state.is_some() || address.is_some() {
+        sessions.push(PduSnapshot {
             psi,
             dnn,
             state,
             address,
-        })
+        });
     }
+    sessions
+}
+
+/// Backward-compatible projection for callers that only need one session.
+pub fn parse_ps_list(stdout: &str) -> Option<PduSnapshot> {
+    parse_ps_list_all(stdout).into_iter().next()
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -501,6 +517,15 @@ PDU Session 1:\n\
     }
 
     #[test]
+    fn parse_ps_list_all_keeps_internet_and_ims_by_dnn() {
+        let sessions = parse_ps_list_all("PDU Session 1:\n state: PS-ACTIVE\n dnn: internet\n address: 10.46.0.5\nPDU Session 2:\n state: PS-ACTIVE\n dnn: ims\n address: 10.47.0.5\n");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].dnn.as_deref(), Some("internet"));
+        assert_eq!(sessions[1].dnn.as_deref(), Some("ims"));
+        assert_eq!(sessions[1].address.as_deref(), Some("10.47.0.5"));
+    }
+
+    #[test]
     fn parse_counters_pulls_uesimtun_lines_only() {
         let proc_net_dev = "\
 Inter-|   Receive                                                |  Transmit\n\
@@ -550,7 +575,7 @@ eth0: 9999 9 0 0 0 0 0 0 8888 8 0 0 0 0 0 0\n\
             Some("UE_NOT_PROVISIONED"),
             None,
             NrCliStates::default(),
-            None,
+            vec![],
             None,
             None,
             vec![],
