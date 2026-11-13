@@ -13,6 +13,8 @@ Upgrade PATCH : 0.31.1 oubliait d'actualiser le littéral hardcodé
   `VERSION_MANIFEST.toml` (platform / web / api).
 - Aucun changement fonctionnel, aucun changement sur la règle 13 captures
   introduite en 0.31.1.
+- test : `emergency_stop_cleanup` déterministe (`dumpcap_count_override`),
+  ne dépend plus des `dumpcap` réels de la machine.
 
 ## 0.31.1 — 2026-11-13 — 0.31.0 + exigence de 13 captures issue de 0.30.1 (ANR1 #10)
 
