@@ -32,9 +32,14 @@ use std::sync::Arc;
 use event_schema::Endpoint;
 use serde_json::{json, Value};
 
-/// Version exposed on each `read_time_patch` object. Bumped only when
-/// the set of rewritten fields grows.
-pub const PATCH_VERSION: &str = "2.14.7";
+/// Version exposée sur chaque objet `read_time_patch` et dans
+/// `/api/v1/version.read_time_patch.version`. Suit systématiquement
+/// la version Cargo d'`oiran-api` : chaque bump du package met à
+/// jour le marqueur de provenance et permet à la gate ANR1 de
+/// distinguer les événements patchés par la version courante des
+/// événements patchés par une version antérieure. Lu depuis
+/// `env!("CARGO_PKG_VERSION")`, jamais écrit en dur.
+pub const PATCH_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Snapshot of patch activity since the service started. Shared via
 /// `Arc`; every field is atomic for lock-free reads from `/version`.

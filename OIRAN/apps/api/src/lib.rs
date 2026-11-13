@@ -5773,7 +5773,13 @@ mod tests {
                 "read_time_patch missing for {}",
                 event["event_id"]
             );
-            assert_eq!(event["read_time_patch"]["version"], "2.14.7");
+            // 2.14.8 (ANR1 #10) : la version est lue depuis
+            // CARGO_PKG_VERSION pour suivre chaque bump du package
+            // sans mise à jour manuelle du test.
+            assert_eq!(
+                event["read_time_patch"]["version"],
+                read_time_patch::PATCH_VERSION
+            );
         }
 
         // 5. Compteurs exposés dans /api/v1/version.
@@ -5806,7 +5812,7 @@ mod tests {
     /// 1. GET `/api/v1/sessions/<id>/events` renvoie les événements
     ///    patchés en RAM (participants eNB/MME, msg04 = Security Mode
     ///    Command, msg05 = UECapabilityInfoIndication, provenance
-    ///    `read_time_patch.version = "2.14.7"`).
+    ///    `read_time_patch.version == CARGO_PKG_VERSION`).
     /// 2. GET `/api/v1/sessions` renvoie un `serving_ran_node = "eNB …"`
     ///    et un `core_node = "MME 10.77.10.10"` recalculés depuis les
     ///    participants patchés.
