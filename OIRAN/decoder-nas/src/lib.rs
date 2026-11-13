@@ -1160,7 +1160,7 @@ fn parse_eps_mm_body(msg: &mut NasMessage, payload: &[u8], pseudonym_key: &Pseud
                 DecodeStatus::Decoded,
             ));
         }
-        0x5c => {
+        0x5d => {
             // TS 24.301 §8.5 Security Mode Command: Selected NAS security algorithms (V, 1),
             // NAS key set identifier + spare half octet (V, 1), Replayed UE security
             // capabilities (LV, 3-6). Optional TLVs follow at variable positions.
@@ -1352,9 +1352,16 @@ fn mm_eps_name(mt: u8) -> (&'static str, &'static str) {
         0x55 => ("Authentication Failure", "EPS_AUTHENTICATION"),
         0x56 => ("Identity Request", "EPS_IDENTITY"),
         0x57 => ("Identity Response", "EPS_IDENTITY"),
-        0x5c => ("Security Mode Command", "EPS_SECURITY_MODE"),
-        0x5d => ("Security Mode Complete", "EPS_SECURITY_MODE"),
-        0x5e => ("Security Mode Reject", "EPS_SECURITY_MODE"),
+        // TS 24.301 §9.8.1 Table 9.8.1.1 : les codes 0x5D / 0x5E / 0x5F
+        // sont réservés aux messages Security Mode Command / Complete / Reject
+        // dans cet ordre. La table pré-2.14.4 décalait les trois d'un cran
+        // (0x5C erronément étiqueté « Security Mode Command »), ce qui faisait
+        // apparaître le msg04 de la capture lab (pkt 26, security_header_type
+        // = 3, nas_msg_emm_type = 0x5D) en « Security Mode Complete » au lieu
+        // de « Security Mode Command ». Cf. ANR2 ladder écart 2.
+        0x5d => ("Security Mode Command", "EPS_SECURITY_MODE"),
+        0x5e => ("Security Mode Complete", "EPS_SECURITY_MODE"),
+        0x5f => ("Security Mode Reject", "EPS_SECURITY_MODE"),
         0x60 => ("EMM Status", "EPS_EMM_STATUS"),
         0x61 => ("EMM Information", "EPS_EMM_INFORMATION"),
         0x62 => ("Downlink NAS Transport", "EPS_NAS_TRANSPORT"),
@@ -1765,13 +1772,15 @@ mod tests {
 
     #[test]
     fn eps_security_mode_command_decodes_mandatory_fields_per_ts24301() {
-        // Byte 0 = 0x07 (PD EMM), byte 1 = 0x5C (Security Mode Command).
+        // Byte 0 = 0x07 (PD EMM), byte 1 = 0x5D (Security Mode Command per
+        // TS 24.301 §9.8.1 Table 9.8.1.1). Le code pré-2.14.4 encodait à tort
+        // 0x5C ; corrigé en lot « analyzer ladder écarts 1-4 ».
         // Body: 0x12 = Selected NAS security algorithms (ciphering=EEA1, integrity=EIA2).
         //       0x05 = NAS KSI (ksi=5, tsc=0).
         //       0x05 = Replayed UE sec cap length.
         //       0xf0 0xe0 0x80 0x40 0x20 = EEA bitmap / EIA / UEA / UIA / GEA bytes.
         let bytes = &[
-            0x07, 0x5c, 0x12, 0x05, 0x05, 0xf0, 0xe0, 0x80, 0x40, 0x20,
+            0x07, 0x5d, 0x12, 0x05, 0x05, 0xf0, 0xe0, 0x80, 0x40, 0x20,
         ];
         let r = decode(bytes);
         assert_eq!(r.message_name, "Security Mode Command");
@@ -1807,7 +1816,9 @@ mod tests {
 
     #[test]
     fn eps_security_mode_command_truncated_mandatory_fields_are_malformed() {
-        let short = &[0x07, 0x5c, 0x12, 0x05];
+        // 0x5D = Security Mode Command (TS 24.301 §9.8.1), cf. correction du
+        // lot ladder écarts 1-4.
+        let short = &[0x07, 0x5d, 0x12, 0x05];
         let r = decode(short);
         assert_eq!(r.message_name, "Security Mode Command");
         assert_eq!(r.status, DecodeStatus::Malformed);
@@ -1854,7 +1865,9 @@ mod tests {
             (0x45, "Detach Request"),
             (0x48, "Tracking Area Update Request"),
             (0x52, "Authentication Request"),
-            (0x5c, "Security Mode Command"),
+            (0x5d, "Security Mode Command"),
+            (0x5e, "Security Mode Complete"),
+            (0x5f, "Security Mode Reject"),
         ] {
             assert_eq!(mm_eps_name(mt).0, name);
         }
