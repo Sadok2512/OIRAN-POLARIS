@@ -580,16 +580,35 @@ mod tests {
         assert_eq!(telemetry::sum(&report.workers).packets, accepted);
     }
 
+    /// 2.14.10 (ANR1 #10) — Déterministe, SANS dépendance au timing
+    /// réel. L'ancienne assertion `queue_high_watermark <= 2`
+    /// supposait que le worker dequeue avant la seconde soumission,
+    /// ce qui est un pari sur la rapidité du scheduler OS (cas
+    /// observé en `--test-threads=1` : hw monte à 3 et casse
+    /// l'assertion).
+    ///
+    /// La borne théorique est dérivée du code :
+    ///   enqueue() incrémente occupancy AVANT try_send ; dequeue()
+    ///   décrémente seulement après qu'un batch soit accepté par le
+    ///   worker (worker.dequeue()) OU que la soumission ait échoué
+    ///   (branche TrySendError::Full). Entre les deux, chaque submit
+    ///   en vol ajoute 1, chaque batch dans le channel ajoute 1, et
+    ///   un batch tenu par le worker (déjà recv() mais pas encore
+    ///   dequeue()) ajoute 1 → max théorique =
+    ///   `queue_capacity_batches + workers + 1`.
+    ///
+    /// Avec `queue_capacity_batches=1, workers=1` → borne = 3. Ne
+    /// dépend d'aucun timing réel.
     #[test]
     fn queue_saturation_is_bounded_and_accounted() {
-        let runtime = WorkerRuntime::start(RuntimeConfig {
+        let config = RuntimeConfig {
             workers: 1,
             queue_capacity_batches: 1,
             pin_cpus: false,
             worker_cpus: None,
             deterministic_replay: false,
-        })
-        .unwrap();
+        };
+        let runtime = WorkerRuntime::start(config.clone()).unwrap();
         let mut large = PacketBatch::with_capacity(100_000);
         for n in 0..100_000 {
             large.push(packet(n, 64));
@@ -605,11 +624,23 @@ mod tests {
         }
         let report = runtime.shutdown();
         let total = telemetry::sum(&report.workers);
-        assert!(rejected > 0);
-        assert!(total.backpressure_events > 0);
-        assert!(total.dropped > 0);
-        // The counter includes the one batch handed to the worker plus channel capacity.
-        assert!(total.queue_high_watermark <= 2);
+        assert!(rejected > 0, "some submits must be rejected");
+        assert!(
+            total.backpressure_events > 0,
+            "backpressure events must be counted"
+        );
+        assert!(total.dropped > 0, "dropped packets must be counted");
+        // Borne mathématique déterministe (voir doc). Pas de timing
+        // réel dans l'assertion.
+        let theoretical_bound = config.queue_capacity_batches + config.workers + 1;
+        assert!(
+            total.queue_high_watermark <= theoretical_bound,
+            "queue_high_watermark = {} exceeds theoretical bound {} (queue_capacity={}, workers={})",
+            total.queue_high_watermark,
+            theoretical_bound,
+            config.queue_capacity_batches,
+            config.workers
+        );
     }
 
     #[test]

@@ -198,7 +198,7 @@ version = "0.3.0"
 
 [[package]]
 name = "capture-helper"
-version = "0.1.0-dev"
+version = "0.1.1-dev"
 dependencies = [
  "disk-safety",
  "event-schema",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.14.9"
+version = "2.14.10"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -1176,7 +1176,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "worker-runtime"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "capture-core",
  "flow-dispatcher",

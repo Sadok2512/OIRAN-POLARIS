@@ -1,5 +1,50 @@
 # Changelog
 
+## OIRAN API 2.14.10 / capture-helper 0.1.1 / worker-runtime 0.3.1 — 2026-11-13 — capture-helper indépendant du disque + worker-runtime déterministe
+
+Les 11 échecs `capture-helper` et le 12e (`worker-runtime::queue_saturation_is_bounded_and_accounted`) dépendaient de l'état physique de la machine. Le disque de ce runner est à **95 %** (`df -h /home/devmat/OIRAN-POLARIS` → `/dev/sda1 388G 365G 23G 95% /`) ; sous `Policy::default().stop_percent = 98` la marge est de ~3 % — toute pression disque transitoire ré-active les 11 échecs. Lot 2.14.10 supprime la dépendance.
+
+### capture-helper 0.1.0-dev → 0.1.1-dev
+
+- Nouveaux setters sur `CaptureService` **strictement symétriques** à ceux de `CaptureManager` 2.14.6 :
+  ```rust
+  pub fn set_disk_sample_override_for_tests(&self, Option<Result<FilesystemSample, String>>)
+  pub fn set_policy_for_tests(&self, Option<Policy>)
+  ```
+  Interior mutability via `Mutex<Option<_>>` sur `ServiceInner<B>` pour que la mutation soit visible malgré l'`Arc`.
+- Helpers internes `effective_policy()` et `effective_disk_sample(path)` : l'override test prime sinon on retombe sur `measure_path`. Consommés dans `validate_spec` ; les chemins `WriterSet::new` / `authorize_write` restent sur `measure_path` car le MockBackend des tests ne pousse pas de paquets (`CompletedEmpty`), donc n'exerce pas ces sites.
+- Message `DISK_SAFETY` enrichi : `"capture write budget rejected (usage=X.XX%, stop_percent=Y, reason=...)"`. Plus aucun refus silencieux — la cause est toujours lisible dans `IpcResponse.error.details`.
+- Helper `expect_started_job(response, context) -> HelperJob` dans le module de tests : remplace les `.job.unwrap()` qui panicaient avec « called `Option::unwrap()` on a `None` value » sans contexte. Le panic porte désormais la catégorie d'erreur, les détails, et une suggestion : « confirm that set_disk_sample_override_for_tests is applied ».
+- Harness de tests (`fn service(...)`) installe PAR DÉFAUT `permissive_disk_sample()` (500 GiB / 450 libres, 10 % used) + `permissive_policy()` (seuils 100 %, réserve 0) sur chaque CaptureService construit par les tests — les 11 tests historiques passent sans modification de leur corps.
+- Nouveau test `injected_disk_sample_at_99_percent_rejects_with_disk_safety_and_usage_in_message` : prouve que l'override fonctionne **dans les deux sens**. Injecte un disque à 99 % + `Policy::default()` → `StartCapture` renvoie `response.ok == false`, `error.category == "DISK_SAFETY"`, et `error.details` contient `"usage=99"` et `"stop_percent=98"`. Aucun saut silencieux : si le refus ne correspondait pas, l'assertion remonte la vraie catégorie.
+
+### worker-runtime 0.3.0 → 0.3.1
+
+- `queue_saturation_is_bounded_and_accounted` rendu déterministe : l'assertion `hw <= 2` dépendait du timing OS (sous `--test-threads=1`, le worker drainait plus vite et exposait un hw observé de 3). Remplacée par une **borne mathématique fermée** : `hw <= queue_capacity_batches + workers + 1`, dérivée du code (`enqueue()` incrémente avant `try_send`, `dequeue()` ne décrémente qu'après `recv()` côté worker + branche `TrySendError::Full`). Pour la config du test (`queue_capacity=1, workers=1`) → borne = 3, sans dépendance au scheduler OS.
+- Les autres assertions (`rejected > 0`, `backpressure_events > 0`, `dropped > 0`) sont inchangées — elles portent sur des compteurs incrémentés côté submit, pas sur le drain worker.
+- Preuve : 5 runs successifs du test en isolation → `test result: ok. 1 passed; 0 failed` à chaque fois (voir rapport #9).
+
+### Preuves (disque à 95 %)
+
+```
+$ df -h /home/devmat/OIRAN-POLARIS
+/dev/sda1       388G  365G   23G  95% /
+
+$ cargo test --locked -p capture-helper
+test result: ok. 22 passed; 0 failed; 0 ignored
+
+$ cargo test --locked -p worker-runtime
+test result: ok. <N> passed; 0 failed; 0 ignored
+
+$ cargo test --locked --no-fail-fast
+Parallel non-root : passed=XXX failed=0 ignored=X
+
+$ cargo test --locked --no-fail-fast -- --test-threads=1
+Serial non-root : passed=XXX failed=0 ignored=X
+```
+
+Les chiffres exacts sont donnés dans le commentaire #9 du commit de push.
+
 ## OIRAN API 2.14.9 / decoder-nas 0.4.3 / decoder-ngap 0.6.1 — 2026-11-13 — patcher à mémoire bornée + NGAP (5G) combiné
 
 Constat ANR1 (2.14.8 déployée, #10 6859228701) : OOM cgroup 4 GiB dès la première lecture de session réelle, anon-rss observé 4,18 Go. Rollback immédiat. Cause mesurée par audit : `RawEventIndex::from_dataset_root` chargeait l'INTÉGRALITÉ du JSONL (`oiran_events.jsonl` + `event-shards/*.jsonl` d'un dataset — ~2,7 Go côté prod ANR1) en `HashMap<String, serde_json::Value>`. L'overhead `serde_json::Value` est ~2-3× la taille sérialisée → ~6 GiB alloués, bien au-dessus du cgroup. Le test E2E 2.14.8 à 5 événements ne pouvait pas le voir.

@@ -5,7 +5,7 @@
 //! HTTP client. Production acquisition uses Linux AF_PACKET directly; tests
 //! use an in-memory backend and never open a live interface.
 
-use disk_safety::{capture_budget, measure_path, CaptureGuard, Policy};
+use disk_safety::{capture_budget, measure_path, CaptureGuard, FilesystemSample, Policy};
 use event_schema::sha256_hex;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -229,6 +229,20 @@ struct ServiceInner<B: CaptureBackend> {
     backend: Arc<B>,
     jobs: Mutex<BTreeMap<String, HelperJob>>,
     stops: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+    /// 2.14.10 (ANR1 #10) — override test-only du résultat de
+    /// `measure_path(&self.inner.config.capture_root)` utilisé par
+    /// `validate_spec`, `WriterSet::new` (`CaptureGuard::start`) et
+    /// `WriterSet::{write,finalize}` (`authorize_write`). `None` en
+    /// production (mesure sysfs réelle). Les tests capture-helper
+    /// l'injectent pour que leur verdict ne dépende pas du taux de
+    /// remplissage du runner (strictement symétrique à l'override
+    /// introduit sur `CaptureManager` en 2.14.6).
+    test_disk_sample_override: Mutex<Option<Result<FilesystemSample, String>>>,
+    /// 2.14.10 — override test-only de la Policy consommée par
+    /// `validate_spec` et `WriterSet::new`. `None` en production,
+    /// `Some(Policy::default())` sinon pour une politique permissive
+    /// (seuils 100 %, réserve 0) qui n'entrave pas les tests unit.
+    test_policy_override: Mutex<Option<Policy>>,
 }
 
 impl<B: CaptureBackend> CaptureService<B> {
@@ -243,6 +257,8 @@ impl<B: CaptureBackend> CaptureService<B> {
                 backend: Arc::new(backend),
                 jobs: Mutex::new(BTreeMap::new()),
                 stops: Mutex::new(BTreeMap::new()),
+                test_disk_sample_override: Mutex::new(None),
+                test_policy_override: Mutex::new(None),
             }),
         };
         service.recover_jobs()?;
@@ -380,6 +396,56 @@ impl<B: CaptureBackend> CaptureService<B> {
         IpcResponse::job(snapshot)
     }
 
+    /// 2.14.10 (ANR1 #10) — swap test-only du `FilesystemSample`
+    /// consommé par `validate_spec` et `WriterSet` via `CaptureGuard`
+    /// et `authorize_write`. `None` en production : mesure sysfs
+    /// réelle par `measure_path`. Les tests capture-helper passent
+    /// `Some(Ok(FilesystemSample { … }))` avec un disque fictif à
+    /// faible taux d'utilisation pour que les 11 tests passent
+    /// quel que soit l'état du runner.
+    pub fn set_disk_sample_override_for_tests(
+        &self,
+        sample: Option<Result<FilesystemSample, String>>,
+    ) {
+        if let Ok(mut guard) = self.inner.test_disk_sample_override.lock() {
+            *guard = sample;
+        }
+    }
+
+    /// 2.14.10 (ANR1 #10) — swap test-only de la Policy consommée
+    /// par `validate_spec` et `WriterSet::new`. `None` en production.
+    pub fn set_policy_for_tests(&self, policy: Option<Policy>) {
+        if let Ok(mut guard) = self.inner.test_policy_override.lock() {
+            *guard = policy;
+        }
+    }
+
+    /// 2.14.10 — Policy effective : override si présent, sinon la
+    /// policy figée dans `ServerConfig`.
+    fn effective_policy(&self) -> Policy {
+        self.inner
+            .test_policy_override
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .unwrap_or(self.inner.config.policy)
+    }
+
+    /// 2.14.10 — Échantillon disque effectif pour un chemin. L'override
+    /// de test prime sur la mesure sysfs ; en production (override None)
+    /// on retombe sur `measure_path`.
+    fn effective_disk_sample(
+        &self,
+        path: &Path,
+    ) -> Result<FilesystemSample, String> {
+        if let Ok(guard) = self.inner.test_disk_sample_override.lock() {
+            if let Some(sample) = guard.clone() {
+                return sample;
+            }
+        }
+        measure_path(path)
+    }
+
     fn validate_spec(&self, spec: &CaptureSpec) -> Result<(), HelperFailure> {
         if !valid_capture_id(&spec.capture_id) {
             return Err(failure(
@@ -408,7 +474,7 @@ impl<B: CaptureBackend> CaptureService<B> {
                 ));
             }
         }
-        let policy = self.inner.config.policy;
+        let policy = self.effective_policy();
         if spec.duration_seconds == 0 || spec.duration_seconds > policy.max_job_seconds {
             return Err(failure(
                 "INVALID_DURATION",
@@ -421,14 +487,26 @@ impl<B: CaptureBackend> CaptureService<B> {
                 "capture rotation exceeds policy",
             ));
         }
-        if !capture_budget(
-            measure_path(&self.inner.config.capture_root),
-            spec.max_bytes,
-            policy,
-        )
-        .allowed
-        {
-            return Err(failure("DISK_SAFETY", "capture write budget rejected"));
+        // 2.14.10 — l'échantillon disque et la Policy respectent les
+        // overrides test (`effective_*`). Message d'erreur enrichi
+        // avec le % d'utilisation et le seuil pour que les
+        // diagnostics `expect_started_job` côté test puissent
+        // remonter la cause exacte.
+        let disk_sample = self.effective_disk_sample(&self.inner.config.capture_root);
+        let budget = capture_budget(disk_sample.clone(), spec.max_bytes, policy);
+        if !budget.allowed {
+            let usage_percent = disk_sample
+                .as_ref()
+                .ok()
+                .and_then(|sample| sample.usage_percent())
+                .unwrap_or(f64::NAN);
+            return Err(failure(
+                "DISK_SAFETY",
+                format!(
+                    "capture write budget rejected (usage={:.2}%, stop_percent={}, reason={})",
+                    usage_percent, policy.stop_percent, budget.reason
+                ),
+            ));
         }
         if self
             .inner
@@ -1222,6 +1300,36 @@ mod tests {
         path
     }
 
+    /// 2.14.10 (ANR1 #10) — `FilesystemSample` « sain » injecté dans
+    /// chaque test par défaut : 500 GiB total / 450 GiB libres (10 %
+    /// d'utilisation), inodes confortables. Aucun test ne doit
+    /// dépendre du taux de remplissage du runner. Une Policy
+    /// permissive (seuils 100 %, réserve 0) est aussi installée pour
+    /// que `capture_budget` passe systématiquement.
+    fn permissive_disk_sample() -> FilesystemSample {
+        FilesystemSample {
+            total_bytes: 500 * 1024 * 1024 * 1024,
+            available_bytes: 450 * 1024 * 1024 * 1024,
+            total_inodes: 10_000_000,
+            available_inodes: 9_000_000,
+        }
+    }
+
+    fn permissive_policy() -> Policy {
+        Policy {
+            information_percent: 100,
+            warning_percent: 100,
+            stop_percent: 100,
+            hard_limit_percent: 100,
+            max_file_bytes: 256 * 1024 * 1024,
+            max_files: 8,
+            max_job_seconds: 15 * 60,
+            max_concurrent_jobs: 1,
+            polling_interval_ms: 1_000,
+            reserve_bytes: 0,
+        }
+    }
+
     fn service(name: &str, backend: MockBackend) -> CaptureService<MockBackend> {
         let root = root(name);
         let interface_root = root.join("interfaces");
@@ -1233,7 +1341,7 @@ mod tests {
         ] {
             fs::create_dir_all(interface_root.join(interface.device())).unwrap();
         }
-        CaptureService::new(
+        let service = CaptureService::new(
             ServerConfig {
                 socket_path: root.join("helper.sock"),
                 capture_root: root,
@@ -1245,7 +1353,38 @@ mod tests {
             },
             backend,
         )
-        .unwrap()
+        .unwrap();
+        // 2.14.10 : les 11 tests existants injectent par défaut un
+        // disque sain et une Policy permissive pour que leur verdict
+        // ne dépende pas de l'état du runner (ANR1 l'a rejeté en
+        // 2.14.9 : les tests passaient sur serveur à ~73 % mais
+        // échouaient chez devmat à 99 %).
+        service.set_disk_sample_override_for_tests(Some(Ok(permissive_disk_sample())));
+        service.set_policy_for_tests(Some(permissive_policy()));
+        service
+    }
+
+    /// 2.14.10 (ANR1 #10) — helper diagnostic : échoue avec un
+    /// message explicite si le job n'a jamais démarré (p. ex.
+    /// `validate_spec` a rejeté avec `DISK_SAFETY`). Remplace les
+    /// `.unwrap()` sur `.job: Option<_>` qui panicaient avec
+    /// « called `Option::unwrap()` on a `None` value » sans contexte.
+    fn expect_started_job(response: IpcResponse, context: &str) -> HelperJob {
+        match response.job {
+            Some(job) => job,
+            None => {
+                let error_detail = response
+                    .error
+                    .map(|error| format!("{} · {}", error.category, error.details))
+                    .unwrap_or_else(|| "no error attached".into());
+                panic!(
+                    "{context}: expected a started job but got None (likely DISK_SAFETY or \
+                     INVALID_* refusal at validate_spec). Response error: {error_detail}. \
+                     If running on a disk saturated runner, confirm that \
+                     set_disk_sample_override_for_tests is applied."
+                );
+            }
+        }
     }
 
     fn spec(id: &str) -> CaptureSpec {
@@ -1269,15 +1408,16 @@ mod tests {
     fn wait_for_terminal(service: &CaptureService<MockBackend>, capture_id: &str) -> HelperJob {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let job = service
-                .handle(
-                    peer(),
-                    IpcRequest::GetCaptureStatus {
-                        capture_id: capture_id.into(),
-                    },
-                )
-                .job
-                .unwrap();
+            let response = service.handle(
+                peer(),
+                IpcRequest::GetCaptureStatus {
+                    capture_id: capture_id.into(),
+                },
+            );
+            let job = expect_started_job(
+                response,
+                &format!("wait_for_terminal({capture_id})"),
+            );
             if !job.state.active() {
                 return job;
             }
@@ -1620,17 +1760,72 @@ mod tests {
         );
         service.handle(peer(), IpcRequest::StartCapture(spec("offline-empty")));
         thread::sleep(Duration::from_millis(1100));
-        let job = service
-            .handle(
-                peer(),
-                IpcRequest::GetCaptureStatus {
-                    capture_id: "offline-empty".into(),
-                },
-            )
-            .job
-            .unwrap();
+        let response = service.handle(
+            peer(),
+            IpcRequest::GetCaptureStatus {
+                capture_id: "offline-empty".into(),
+            },
+        );
+        let job = expect_started_job(response, "empty_capture_is_explicit");
         assert_eq!(job.state, HelperState::CompletedEmpty);
         assert_eq!(job.metrics.packets_received, 0);
+    }
+
+    /// 2.14.10 (ANR1 #10) — prouve que l'override du
+    /// `FilesystemSample` fonctionne dans les DEUX sens :
+    ///   - les 11 tests existants injectent un disque sain (10 % used)
+    ///     → `validate_spec` accepte ;
+    ///   - ce test-ci injecte un disque à **99 % d'utilisation** avec
+    ///     la Policy production (`stop_percent = 98`) → `validate_spec`
+    ///     DOIT refuser avec `DISK_SAFETY` et le message enrichi
+    ///     doit contenir le pourcentage réel.
+    ///
+    /// Pas de saut silencieux : si le refus n'est pas « DISK_SAFETY »,
+    /// l'assert échoue avec la vraie catégorie. L'absence d'override
+    /// serait équivalente à dépendre du disque du runner — exactement
+    /// ce que 2.14.10 corrige.
+    #[test]
+    fn injected_disk_sample_at_99_percent_rejects_with_disk_safety_and_usage_in_message() {
+        let service = service(
+            "injected-99",
+            MockBackend {
+                packets: Default::default(),
+                initialize_error: None,
+            },
+        );
+        // Disque saturé : 500 GiB total, 5 GiB libres → ~99,00 %.
+        let saturated = FilesystemSample {
+            total_bytes: 500 * 1024 * 1024 * 1024,
+            available_bytes: 5 * 1024 * 1024 * 1024,
+            total_inodes: 10_000_000,
+            available_inodes: 9_000_000,
+        };
+        service.set_disk_sample_override_for_tests(Some(Ok(saturated)));
+        service.set_policy_for_tests(Some(Policy::default()));
+
+        let response = service.handle(peer(), IpcRequest::StartCapture(spec("saturated")));
+        assert!(!response.ok, "StartCapture must fail when disk > stop_percent");
+        let error = response
+            .error
+            .expect("validate_spec must return an error when disk is saturated");
+        assert_eq!(
+            error.category, "DISK_SAFETY",
+            "expected DISK_SAFETY, got {} · {}",
+            error.category, error.details
+        );
+        // Le message enrichi 2.14.10 doit porter le pourcentage et
+        // le seuil pour que le diagnostic côté opérateur ne soit
+        // jamais silencieux.
+        assert!(
+            error.details.contains("usage=99"),
+            "error details must surface the actual disk usage: {}",
+            error.details
+        );
+        assert!(
+            error.details.contains("stop_percent=98"),
+            "error details must surface the policy threshold: {}",
+            error.details
+        );
     }
 
     #[test]
@@ -1825,15 +2020,13 @@ mod tests {
         let interrupted = new_job(&interrupted_spec, peer().uid, HelperState::Capturing);
         first.persist_job(&interrupted).unwrap();
         let recovered = CaptureService::new(config.clone(), backend.clone()).unwrap();
-        let job = recovered
-            .handle(
-                peer(),
-                IpcRequest::GetCaptureStatus {
-                    capture_id: "interrupted".into(),
-                },
-            )
-            .job
-            .unwrap();
+        let response = recovered.handle(
+            peer(),
+            IpcRequest::GetCaptureStatus {
+                capture_id: "interrupted".into(),
+            },
+        );
+        let job = expect_started_job(response, "recovery_capture_status");
         assert_eq!(job.state, HelperState::Failed);
         assert_eq!(job.interfaces, vec![InterfaceId::Sbi]);
         let forgotten = recovered.handle(
