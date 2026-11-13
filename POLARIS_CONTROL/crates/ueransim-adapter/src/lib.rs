@@ -514,6 +514,11 @@ pub fn render_profile_with_gnbs(
         .strip_prefix("UE-")
         .and_then(|value| value.parse::<usize>().ok())
         .ok_or("invalid UE profile identifier")?;
+    let sd = profile
+        .sd
+        .as_deref()
+        .filter(|value| value.len() == 6 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .ok_or("PDU_SLICE_SD_REQUIRED")?;
     Ok(format!(
         "supi: '{supi}'\nmcc: '{mcc}'\nmnc: '{mnc}'\nprotectionScheme: 0\nhomeNetworkPublicKey: '5a8d38864820197c3394b92613b20b91633cbd897119273bf8e4a6f4eec0a650'\nhomeNetworkPublicKeyId: 1\nroutingIndicator: '0000'\nkey: '{key}'\nop: '{opc}'\nopType: 'OPC'\namf: '8000'\nimei: '356938035{ue_index:06}'\nimeiSv: '356938035{ue_index:07}'\ngnbSearchList: [{gnb_link_ip}]\nuacAic: {{mps: false, mcs: false}}\nuacAcc: {{normalClass: 0, class11: false, class12: false, class13: false, class14: false, class15: false}}\nsessions:\n  - type: IPv4\n    apn: {dnn}\n    slice: {{sst: {sst}, sd: 0x{sd}}}\nconfigured-nssai: [{{sst: {sst}, sd: 0x{sd}}}]\ndefault-nssai: [{{sst: {sst}, sd: 0x{sd}}}]\nintegrity: {{IA1: true, IA2: true, IA3: true}}\nciphering: {{EA1: true, EA2: true, EA3: true}}\nintegrityMaxRate: {{uplink: full, downlink: full}}\n",
         ue_index = ue_index,
@@ -525,7 +530,7 @@ pub fn render_profile_with_gnbs(
         opc = secrets.opc,
         dnn = profile.dnn,
         sst = profile.sst,
-        sd = profile.sd.as_deref().unwrap_or("010203")
+        sd = sd
     ))
 }
 pub fn audit_profile(
@@ -630,6 +635,19 @@ mod tests {
         let profile = planned_profiles().remove(0);
         let expected = "supi: 'imsi-999990000000001'\nmcc: '001'\nmnc: '01'\nprotectionScheme: 0\nhomeNetworkPublicKey: '5a8d38864820197c3394b92613b20b91633cbd897119273bf8e4a6f4eec0a650'\nhomeNetworkPublicKeyId: 1\nroutingIndicator: '0000'\nkey: '00112233445566778899aabbccddeeff'\nop: 'ffeeddccbbaa99887766554433221100'\nopType: 'OPC'\namf: '8000'\nimei: '356938035000001'\nimeiSv: '3569380350000001'\ngnbSearchList: [10.77.0.20]\nuacAic: {mps: false, mcs: false}\nuacAcc: {normalClass: 0, class11: false, class12: false, class13: false, class14: false, class15: false}\nsessions:\n  - type: IPv4\n    apn: internet\n    slice: {sst: 1, sd: 0x010203}\nconfigured-nssai: [{sst: 1, sd: 0x010203}]\ndefault-nssai: [{sst: 1, sd: 0x010203}]\nintegrity: {IA1: true, IA2: true, IA3: true}\nciphering: {EA1: true, EA2: true, EA3: true}\nintegrityMaxRate: {uplink: full, downlink: full}\n";
         assert_eq!(render_profile(&profile, test_secrets()).unwrap(), expected);
+    }
+
+    #[test]
+    fn profile_rendering_requires_sd_and_writes_profile_value_as_explicit_hex() {
+        let mut profile = planned_profiles().remove(0);
+        profile.sd = Some("A1B2C3".into());
+        let rendered = render_profile(&profile, test_secrets()).unwrap();
+        assert!(rendered.contains("slice: {sst: 1, sd: 0xA1B2C3}"));
+        profile.sd = None;
+        assert_eq!(
+            render_profile(&profile, test_secrets()).unwrap_err(),
+            "PDU_SLICE_SD_REQUIRED"
+        );
     }
 
     #[test]

@@ -2497,16 +2497,16 @@ impl DockerUeRuntime {
         .map(|_| ())
     }
 
-    fn pdu_establish_command(profile: &UeProfileSpec) -> String {
-        let mut command = format!(
-            "ps-establish IPv4 --dnn {} --sst {}",
+    fn pdu_establish_command(profile: &UeProfileSpec) -> Result<String, String> {
+        let sd = profile
+            .sd
+            .as_deref()
+            .filter(|value| value.len() == 6 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+            .ok_or("PDU_SLICE_SD_REQUIRED")?;
+        Ok(format!(
+            "ps-establish IPv4 --dnn {} --sst {} --sd 0x{sd}",
             profile.dnn, profile.sst
-        );
-        if let Some(sd) = profile.sd.as_deref() {
-            command.push_str(" --sd ");
-            command.push_str(sd);
-        }
-        command
+        ))
     }
 
     fn pdu_for_dnn(output: &str, expected_dnn: &str) -> Option<PduDnnObservation> {
@@ -2908,7 +2908,7 @@ impl UeRuntime for DockerUeRuntime {
             return Ok(());
         }
         if observation.is_none() {
-            Self::execute_ue_cli(target, Self::pdu_establish_command(profile))?;
+            Self::execute_ue_cli(target, Self::pdu_establish_command(profile)?)?;
         }
         self.wait_for_owned_pdu_dnn(spec, handle, &profile.dnn, timeout_seconds, cancel)
             .map(|_| ())
@@ -3889,11 +3889,10 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
         "idle",
         "detach",
         "repeat",
+        "ims_register",
     ];
-    let mut unavailable_steps = vec![
-        json!({"type":"ims_register","http_status":423,"reason":"IMS_NOT_AVAILABLE"}),
-        json!({"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}),
-    ];
+    let mut unavailable_steps =
+        vec![json!({"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"})];
     if dl_sender.is_ok() {
         executable_steps.push("traffic_dl");
         executable_steps.push("traffic_ul");
@@ -15715,7 +15714,8 @@ mod p0_tests {
                 "wait",
                 "idle",
                 "detach",
-                "repeat"
+                "repeat",
+                "ims_register"
             ])
         );
         assert_eq!(
@@ -15724,7 +15724,6 @@ mod p0_tests {
                 {"type":"traffic_dl","http_status":422,"reason":"DL_SENDER_NOT_AVAILABLE"},
                 {"type":"traffic_ul","http_status":422,"reason":"UL_RECEIVER_NOT_AVAILABLE"},
                 {"type":"transfer_verify","http_status":422,"reason":"TRANSFER_PEER_NOT_AVAILABLE"},
-                {"type":"ims_register","http_status":423,"reason":"IMS_NOT_AVAILABLE"},
                 {"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}
             ])
         );
@@ -16638,7 +16637,7 @@ mod p0_tests {
     }
 
     #[tokio::test]
-    async fn healthy_dl_sender_does_not_certify_ims_register() {
+    async fn capabilities_publish_bounded_ims_register_independently_from_dl_sender() {
         let mut test_state = state();
         test_state.dl_sender.container = Some("polaris-dn-sender".into());
         test_state.dl_sender_health_override = Some(Ok(()));
@@ -16670,12 +16669,12 @@ mod p0_tests {
             .unwrap()
             .iter()
             .any(|step| step["type"] == "traffic_dl"));
-        assert!(!body["executable_scenario_step_types"]
+        assert!(body["executable_scenario_step_types"]
             .as_array()
             .unwrap()
             .iter()
             .any(|step| step == "ims_register"));
-        assert!(body["unavailable_scenario_step_types"]
+        assert!(!body["unavailable_scenario_step_types"]
             .as_array()
             .unwrap()
             .iter()
@@ -19158,8 +19157,33 @@ mod p0_tests {
             .all(|argument| argument != "sh" && argument != "-c"));
         let profile = ueransim_adapter::planned_profiles().remove(0);
         assert_eq!(
-            DockerUeRuntime::pdu_establish_command(&profile),
-            "ps-establish IPv4 --dnn internet --sst 1 --sd 010203"
+            DockerUeRuntime::pdu_establish_command(&profile).as_deref(),
+            Ok("ps-establish IPv4 --dnn internet --sst 1 --sd 0x010203")
+        );
+    }
+
+    #[test]
+    fn pdu_establish_commands_use_each_profile_dnn_and_explicit_hex_slice() {
+        let mut internet = ueransim_adapter::planned_profiles().remove(0);
+        internet.dnn = "internet".into();
+        internet.sst = 1;
+        internet.sd = Some("A1B2C3".into());
+        let mut ims = internet.clone();
+        ims.dnn = "ims".into();
+        ims.sd = Some("0F0E0D".into());
+
+        assert_eq!(
+            DockerUeRuntime::pdu_establish_command(&internet).as_deref(),
+            Ok("ps-establish IPv4 --dnn internet --sst 1 --sd 0xA1B2C3")
+        );
+        assert_eq!(
+            DockerUeRuntime::pdu_establish_command(&ims).as_deref(),
+            Ok("ps-establish IPv4 --dnn ims --sst 1 --sd 0x0F0E0D")
+        );
+        ims.sd = None;
+        assert_eq!(
+            DockerUeRuntime::pdu_establish_command(&ims),
+            Err("PDU_SLICE_SD_REQUIRED".into())
         );
     }
 

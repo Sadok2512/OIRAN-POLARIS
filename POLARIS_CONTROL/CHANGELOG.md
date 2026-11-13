@@ -6,6 +6,8 @@
   treating a pending IMS session as ready.
 - Waits for `PS-ACTIVE` with a real address and reports bounded
   `IMS_PDU_PENDING:state=<raw UERANSIM state>` evidence on timeout.
+- Emits every CLI PDU slice as explicit hexadecimal (`--sd 0x<profile SD>`),
+  and advertises the bounded REGISTER-only step while calls remain locked.
 
 ## 0.33.2 — 2026-11-13 — Rich UI delivery independent from IMS certification
 
