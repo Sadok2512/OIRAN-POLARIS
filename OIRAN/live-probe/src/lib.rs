@@ -10345,7 +10345,7 @@ fn count_pcap_records_bytes(bytes: &[u8]) -> u64 {
     count
 }
 
-fn endpoint_map() -> HashMap<String, String> {
+pub fn endpoint_map() -> HashMap<String, String> {
     [
         ("10.77.21.20", "gNB"),
         ("10.77.21.11", "AMF"),

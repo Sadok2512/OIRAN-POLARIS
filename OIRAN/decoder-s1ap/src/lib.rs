@@ -302,7 +302,7 @@ pub fn parse(payload: &[u8]) -> Result<S1apPdu, String> {
 /// sur « S1AP proc <code> <kind> (non mappé) » pour que le `procedureCode`
 /// numérique reste observable depuis le livrable API — cf. ANR2 ladder
 /// écart 3 (msg09 = code 22, UECapabilityInfoIndication).
-fn pdu_kind_label(kind: PduKind) -> &'static str {
+pub fn pdu_kind_label(kind: PduKind) -> &'static str {
     match kind {
         PduKind::Initiating => "initiating",
         PduKind::SuccessfulOutcome => "successfulOutcome",
@@ -534,7 +534,7 @@ fn be16(v: &[u8]) -> u16 {
     u16::from_be_bytes([v[0], v[1]])
 }
 
-fn message_name(code: u8, kind: PduKind) -> String {
+pub fn message_name(code: u8, kind: PduKind) -> String {
     // TS 36.413 v16+ §9.1 — table des Elementary Procedures.
     // Audit complet appliqué par le lot « analyzer ladder écarts 1-4 ».
     let canonical: Option<&'static str> = match (code, kind) {
@@ -1019,7 +1019,7 @@ fn append_eps_nas_events(
 /// noms ASN.1 TS 36.413 §9.3.1 : `initialUEMessage`, `downlinkNASTransport`,
 /// `uplinkNASTransport`) avec le nom NAS décodé. Remplace également le
 /// placeholder « Protected EPS EMM message » par « NAS chiffré ».
-fn combined_message_name(parent_s1ap: &str, nas_name: &str) -> String {
+pub fn combined_message_name(parent_s1ap: &str, nas_name: &str) -> String {
     let parent = asn1_procedure_name(parent_s1ap);
     let nas = if nas_name == "Protected EPS EMM message" {
         "NAS chiffré"
@@ -1029,7 +1029,7 @@ fn combined_message_name(parent_s1ap: &str, nas_name: &str) -> String {
     format!("{parent} · {nas}")
 }
 
-fn asn1_procedure_name(name: &str) -> String {
+pub fn asn1_procedure_name(name: &str) -> String {
     let mut chars = name.chars();
     match chars.next() {
         Some(first) => {
@@ -1068,19 +1068,22 @@ fn infer_direction(i: &DecoderInput<'_>, _procedure: u8) -> Direction {
     infer_direction_from_transport(i)
 }
 
-fn infer_direction_from_transport(i: &DecoderInput<'_>) -> Direction {
-    let src = i
-        .source_endpoint
-        .network_function
-        .as_deref()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let dst = i
-        .destination_endpoint
-        .network_function
-        .as_deref()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+pub fn infer_direction_from_transport(i: &DecoderInput<'_>) -> Direction {
+    infer_direction_from_network_functions(
+        i.source_endpoint.network_function.as_deref(),
+        i.destination_endpoint.network_function.as_deref(),
+    )
+}
+
+/// 2.14.7 — variante utilisable sans `DecoderInput`, consommée par le
+/// patcher à la lecture dans `oiran-api`. Une seule source de vérité :
+/// `infer_direction_from_transport` délègue ici.
+pub fn infer_direction_from_network_functions(
+    source_nf: Option<&str>,
+    destination_nf: Option<&str>,
+) -> Direction {
+    let src = source_nf.unwrap_or("").to_ascii_lowercase();
+    let dst = destination_nf.unwrap_or("").to_ascii_lowercase();
     let src_is_ran = src.contains("enb") || src.contains("gnb");
     let src_is_core = src.contains("mme") || src.contains("amf");
     let dst_is_ran = dst.contains("enb") || dst.contains("gnb");

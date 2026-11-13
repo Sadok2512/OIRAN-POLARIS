@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-nas"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "event-schema",
 ]
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-s1ap"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "decoder-nas",
  "event-schema",
@@ -551,7 +551,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "live-probe"
-version = "0.5.12"
+version = "0.5.13"
 dependencies = [
  "callflow-renderer",
  "callflow-schema",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.14.6"
+version = "2.14.7"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -659,6 +659,8 @@ dependencies = [
  "capture-helper",
  "correlation-engine",
  "dataset-registry",
+ "decoder-nas",
+ "decoder-s1ap",
  "disk-safety",
  "event-schema",
  "http-body-util",
@@ -688,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.7.5"
+version = "0.7.6"
 dependencies = [
  "capture-pcap",
  "decoder-diameter",

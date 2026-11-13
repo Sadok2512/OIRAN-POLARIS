@@ -1329,7 +1329,7 @@ fn decode_eps_sm(payload: &[u8], source_offset: usize) -> NasMessage {
     msg
 }
 
-fn mm_eps_name(mt: u8) -> (&'static str, &'static str) {
+pub fn mm_eps_name(mt: u8) -> (&'static str, &'static str) {
     match mt {
         0x41 => ("Attach Request", "EPS_ATTACH"),
         0x42 => ("Attach Accept", "EPS_ATTACH"),

@@ -733,8 +733,8 @@ fn endpoint(ip: &str, port: Option<u16>, map: &HashMap<String, String>) -> Endpo
 /// paramétrage d'une plateforme reste prioritaire. Si aucun des deux ports
 /// SCTP n'est connu, on laisse le champ à `None` (`Unknown endpoint` côté
 /// UI, ouvert et comptable, pas silencieux).
-fn infer_sctp_network_function(
-    interface: &'static str,
+pub fn infer_sctp_network_function(
+    interface: &str,
     source: &mut Endpoint,
     destination: &mut Endpoint,
     source_port: u16,

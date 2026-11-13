@@ -10,6 +10,7 @@
 mod identity_vault;
 mod live_trace;
 mod probe_registry;
+mod read_time_patch;
 mod session_filters;
 mod subscriber_journey;
 
@@ -43,7 +44,7 @@ use session_engine::{
     discover_sessions, reconstruct, Association, DiscoveryResult, LteSession, ReconstructionHints,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::{Path as FsPath, PathBuf},
     process::Command,
@@ -98,6 +99,12 @@ struct Inner {
     administrator_token_sha256: Option<String>,
     identity_vault: IdentityVault,
     live_traces: live_trace::LiveTraceRegistry,
+    /// 2.14.7 (ANR1 #10) — compteurs du patcher à la lecture. Partagé
+    /// via `Arc` : chaque chargement/accès à un `flow_value`
+    /// incrémente ces compteurs sans verrouillage global. Exposé dans
+    /// `/api/v1/version` pour que la gate ANR1 puisse constater que
+    /// le patch est actif.
+    read_time_patch_counters: Arc<read_time_patch::PatchCounters>,
     /// 2.10.0 : index des filtres Session Explorer (messages, causes,
     /// pseudonymes), construit au chargement depuis `flows` + mis à
     /// jour par `refresh_session_filter_index` quand le capture
@@ -570,6 +577,60 @@ impl AppState {
             error_count: 0,
             read_only: true,
         })?;
+        // 2.14.7 (ANR1 #10) — read-time patcher : cross-réfère les
+        // `CallFlowEvent` chargés avec les `NormalizedEvent` complets
+        // de `oiran_events.jsonl` (ports + message_type + procedure_code
+        // retenus) et réécrit en mémoire les champs stale introduits
+        // par les ingestions pré-2.14.5 (participants « Unknown
+        // endpoint », direction heuristique procedureCode, noms NAS
+        // mal mappés, procédure S1AP 22 « UnknownS1APProcedure »).
+        // Les fichiers sur disque restent intacts — la provenance 2.14.3
+        // reste tracée et chaque événement patché porte
+        // `read_time_patch.fields`.
+        let read_time_patch_counters = Arc::new(read_time_patch::PatchCounters::new());
+        let jsonl_path = dataset_dir.join("oiran_events.jsonl");
+        if jsonl_path.is_file() {
+            match read_time_patch::RawEventIndex::from_jsonl_path(&jsonl_path) {
+                Ok(raw_index) => {
+                    let map = oiran_endpoint_map();
+                    for flow_value in flow_values.values_mut() {
+                        if let Some(events) = flow_value
+                            .get_mut("events")
+                            .and_then(Value::as_array_mut)
+                        {
+                            read_time_patch::patch_flow_events(
+                                events,
+                                &raw_index,
+                                &map,
+                                &read_time_patch_counters,
+                            );
+                            read_time_patch_counters
+                                .callflows_loaded
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "READ_TIME_PATCH_JSONL_UNREADABLE",
+                            "path": jsonl_path.display().to_string(),
+                            "error": error,
+                        })
+                    );
+                }
+            }
+        } else {
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "READ_TIME_PATCH_JSONL_MISSING",
+                    "path": jsonl_path.display().to_string(),
+                    "reason": "no oiran_events.jsonl sidecar; stored CallFlowEvent values served as-is",
+                })
+            );
+        }
         let session_filter_index = session_filters::SessionFilterIndex::from_flows(flows.values());
         Ok(Self {
             inner: Arc::new(Inner {
@@ -591,6 +652,7 @@ impl AppState {
                 administrator_token_sha256: config.administrator_token_sha256,
                 identity_vault,
                 live_traces: live_trace::LiveTraceRegistry::new(),
+                read_time_patch_counters: read_time_patch_counters.clone(),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -656,6 +718,7 @@ impl AppState {
                 administrator_token_sha256: config.administrator_token_sha256,
                 identity_vault,
                 live_traces: live_trace::LiveTraceRegistry::new(),
+                read_time_patch_counters: Arc::new(read_time_patch::PatchCounters::new()),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -874,6 +937,13 @@ fn flow_path_for<'a>(state: &'a AppState, id: &str) -> Option<&'a FsPath> {
     state.inner.flow_paths.get(id).map(PathBuf::as_path)
 }
 
+/// 2.14.7 (ANR1 #10) — miroir de `live_probe::endpoint_map()`.
+/// Exposé ici pour que le patcher à la lecture consomme la même table
+/// IP → NF que l'ingestion ; une seule source de vérité.
+fn oiran_endpoint_map() -> HashMap<String, String> {
+    live_probe::endpoint_map()
+}
+
 fn live_flow_for(state: &AppState, id: &str) -> Option<(String, CallFlow)> {
     state
         .inner
@@ -959,7 +1029,12 @@ async fn version(State(state): State<AppState>) -> Json<Value> {
         "event_schema":"1.2.0","callflow_schema":flow.map(|value|value.schema_version.as_str()).unwrap_or("UNKNOWN"),
         "session_engine":session_engine::VERSION,"correlation_engine":correlation_engine::VERSION,"dataset_registry":dataset_registry::VERSION,
         "disk_safety":disk_safety::VERSION,
-        "decoders":oiran_decode::installed_decoder_versions()
+        "decoders":oiran_decode::installed_decoder_versions(),
+        // 2.14.7 (ANR1 #10) — compteurs du patcher à la lecture.
+        // La gate ANR1 vérifie que `callflows_loaded > 0` et que
+        // `events_patched.{source_participant,direction,message_name}`
+        // reflètent le nombre d'événements stale corrigés.
+        "read_time_patch": state.inner.read_time_patch_counters.as_json()
     }))
 }
 
@@ -5382,6 +5457,209 @@ mod tests {
                 "missing installed decoder {protocol}"
             );
         }
+        // 2.14.7 (ANR1 #10) : le patcher à la lecture est exposé dans
+        // `/api/v1/version` pour que la gate ANR1 constate qu'il est
+        // bien actif. `callflows_loaded` doit être > 0 dès qu'au moins
+        // un callflow a été chargé.
+        let patch = &value["data"]["read_time_patch"];
+        assert_eq!(patch["version"], read_time_patch::PATCH_VERSION);
+        assert!(
+            patch["callflows_loaded"].as_u64().unwrap_or(0) > 0,
+            "read_time_patch.callflows_loaded must be > 0 after reference dataset load"
+        );
+        assert!(patch["events_seen"].as_u64().is_some());
+        assert!(patch["events_patched"]["source_participant"].as_u64().is_some());
+        assert!(patch["events_patched"]["destination_participant"].as_u64().is_some());
+        assert!(patch["events_patched"]["direction"].as_u64().is_some());
+        assert!(patch["events_patched"]["message_name"].as_u64().is_some());
+        assert!(patch["events_unresolved_participant"].as_u64().is_some());
+        assert!(patch["events_without_raw_counterpart"].as_u64().is_some());
+    }
+
+    /// 2.14.7 (ANR1 #10) — E2E HTTP contre une fixture S1-MME
+    /// synthétique représentant exactement un callflow stocké par
+    /// l'ingestion 2.14.3 (participants « Unknown endpoint »,
+    /// direction via fallback procedureCode, message_name mal
+    /// mappés). L'API est lancée via `AppState::load` puis une
+    /// requête `GET /api/v1/sessions/<id>/events` doit renvoyer la
+    /// version corrigée des événements. Prouve que le patcher à la
+    /// lecture est effectivement branché sur la route servie, pas
+    /// seulement fonctionnellement correct (cf. gate prod ANR1 où
+    /// 2.14.5 prouvait les fonctions mais pas la route).
+    #[tokio::test]
+    async fn read_time_patch_rewrites_s1_mme_stale_fields_on_sessions_events_route() {
+        use std::io::Write as _;
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dataset_name = format!("read-time-patch-s1mme-{suffix}");
+        let dataset_dir = workspace.join("datasets").join(&dataset_name);
+        fs::create_dir_all(&dataset_dir).unwrap();
+        // 5 événements synthétiques imitant une capture S1-MME 2.14.3 :
+        // participants null, port 36412 côté MME / 46859 côté eNB,
+        // message_type porteur de l'info brute (procedureCode S1AP ou
+        // NAS EMM type).
+        let raw_event = |id: &str,
+                         parent: Option<&str>,
+                         protocol: &str,
+                         decoder: &str,
+                         message_type: u32,
+                         procedure_code: u32,
+                         packet: u64,
+                         from_enb: bool| {
+            let (src, dst, src_port, dst_port) = if from_enb {
+                ("10.77.10.20", "10.77.10.10", 46859u16, 36412u16)
+            } else {
+                ("10.77.10.10", "10.77.10.20", 36412u16, 46859u16)
+            };
+            json!({
+                "event_id":id,
+                "parent_event_id":parent,
+                "capture_id":"sha256:stub","capture_point_id":"S1-MME",
+                "timestamp":{"seconds":packet as i64,"nanoseconds":0u64,"raw_ticks":packet,"display":""},
+                "interface":"S1-MME","protocol":protocol,
+                "message_name":"stale","message_type":message_type,"procedure_code":procedure_code,
+                "source_endpoint":{"address":src,"port":src_port,"network_function":null},
+                "destination_endpoint":{"address":dst,"port":dst_port,"network_function":null},
+                "direction":"UNKNOWN","session_identifiers":[],"information_elements":[],
+                "decoding_status":"DECODED","decoder_name":decoder,"decoder_version":"0.2.2",
+                "raw_payload_reference":"sha256:stub",
+                "packet_references":[{"source_file":"synthetic.pcap","packet_number":packet,"byte_offset":0u64,"interface_id":0u32,"captured_length":1u32,"original_length":1u32}],
+                "errors":[],
+            })
+        };
+        let raw_events = vec![
+            raw_event("evt-01", None, "S1AP", "decoder-s1ap", 0, 12, 23, true),
+            raw_event("evt-02", Some("evt-01"), "NAS-EPS-MM", "decoder-nas", 0x41, 65, 23, true),
+            raw_event("evt-03", None, "S1AP", "decoder-s1ap", 0, 11, 24, false),
+            raw_event("evt-04", Some("evt-03"), "NAS-EPS-MM", "decoder-nas", 0x5d, 93, 24, false),
+            raw_event("evt-05", None, "S1AP", "decoder-s1ap", 0, 22, 31, true),
+        ];
+        let mut jsonl = fs::File::create(dataset_dir.join("oiran_events.jsonl")).unwrap();
+        for event in &raw_events {
+            writeln!(jsonl, "{}", serde_json::to_string(event).unwrap()).unwrap();
+        }
+        drop(jsonl);
+        // scenario_manifest.json minimal (le loader exige au moins
+        // `scenario_id` et `captures` non vide).
+        // Fichier capture fictif (le loader vérifie sa présence via
+        // `fs::metadata`).
+        fs::write(dataset_dir.join("synthetic.pcap"), b"\0").unwrap();
+        fs::write(
+            dataset_dir.join("scenario_manifest.json"),
+            json!({
+                "scenario_id":"synthetic-s1mme-read-time-patch",
+                "captures":[{
+                    "file":"synthetic.pcap",
+                    "capture_id":"sha256:stub",
+                    "name":"synthetic.pcap",
+                    "interface":"S1-MME",
+                    "sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "packet_count":5,
+                    "size_bytes":1
+                }]
+            }).to_string(),
+        )
+        .unwrap();
+        // callflow.json : participants « Unknown endpoint », directions
+        // 2.14.3 (fallback procedureCode), libellés 2.14.3 (Security
+        // Mode Complete au lieu de Command, UnknownS1APProcedure au
+        // lieu de UECapabilityInfoIndication).
+        let callflow = json!({
+            "callflow_id":"cf-s1mme-stale",
+            "session_id":"session-s1mme-stale",
+            "technology":"LTE",
+            "start_timestamp":"","end_timestamp":"",
+            "participants":[],
+            "interfaces":["S1-MME"],
+            "procedures":[],
+            "events":[
+                {"event_id":"evt-01","timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"S1AP","message_name":"InitialUEMessage","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"RAN_TO_CORE","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"S1 Setup","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-s1ap","decoder_version":"0.2.2","raw_payload_reference":"sha256:stub","errors":[]},
+                {"event_id":"evt-02","timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"NAS-EPS-MM","message_name":"Attach Request","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"UNKNOWN","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"EPS_ATTACH","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-nas","decoder_version":"0.4.0","raw_payload_reference":"sha256:stub","errors":[]},
+                {"event_id":"evt-03","timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"S1AP","message_name":"DownlinkNASTransport","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"CORE_TO_RAN","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"NAS Transport","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-s1ap","decoder_version":"0.2.2","raw_payload_reference":"sha256:stub","errors":[]},
+                {"event_id":"evt-04","timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"NAS-EPS-MM","message_name":"Security Mode Complete","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"UNKNOWN","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"EPS_SECURITY_MODE","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-nas","decoder_version":"0.4.0","raw_payload_reference":"sha256:stub","errors":[]},
+                {"event_id":"evt-05","timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"S1AP","message_name":"UnknownS1APProcedure","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"RAN_TO_CORE","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"S1 Setup","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-s1ap","decoder_version":"0.2.2","raw_payload_reference":"sha256:stub","errors":[]}
+            ],
+            "correlation_edges":[],
+            "correlation_status":{},
+            "decoder_versions":{"decoder-s1ap":"0.2.2","decoder-nas":"0.4.0"},
+            "schema_version":"1.5.0",
+            "capture_references":["sha256:stub"],
+            "accounting":{"source_events":5,"session_events":5,"background_events":0,"unmatched_events":0,"duplicate_events":0,"extra_events":0},
+            "unresolved_fields":0
+        });
+        let callflow_json_path = dataset_dir.join("callflow.json");
+        fs::write(
+            &callflow_json_path,
+            serde_json::to_vec_pretty(&callflow).unwrap(),
+        )
+        .unwrap();
+        // Config pointée sur la fixture.
+        let mut config = test_config(workspace, &format!("registry-{dataset_name}"));
+        config.dataset_dir = dataset_dir.clone();
+        config.callflow_json = callflow_json_path;
+        config.callflow_html = dataset_dir.join("callflow.html");
+        fs::write(&config.callflow_html, b"<html>stub</html>").unwrap();
+
+        let state = AppState::load(config).expect("AppState::load succeeds on synthetic fixture");
+        let response = router(state.clone(), None)
+            .oneshot(req("/api/v1/sessions/session-s1mme-stale/events", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let events = body["data"].as_array().expect("events array");
+        assert_eq!(events.len(), 5, "fixture a 5 événements");
+
+        // 1. Participants eNB/MME.
+        assert_eq!(events[0]["source_participant"], "eNB");
+        assert_eq!(events[0]["destination_participant"], "MME");
+        assert_eq!(events[2]["source_participant"], "MME");
+        assert_eq!(events[2]["destination_participant"], "eNB");
+
+        // 2. msg04 = Security Mode Command (le 0x5D de TS 24.301), combiné.
+        assert_eq!(
+            events[3]["message_name"],
+            "downlinkNASTransport · Security Mode Command"
+        );
+        // 3. msg09-like → UECapabilityInfoIndication.
+        assert_eq!(events[4]["message_name"], "UECapabilityInfoIndication");
+
+        // 4. Provenance read_time_patch sur chaque événement patché.
+        for event in events {
+            assert!(
+                event.get("read_time_patch").is_some(),
+                "read_time_patch missing for {}",
+                event["event_id"]
+            );
+            assert_eq!(event["read_time_patch"]["version"], "2.14.7");
+        }
+
+        // 5. Compteurs exposés dans /api/v1/version.
+        let version = json_body(
+            router(state, None)
+                .oneshot(req("/api/v1/version", true))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let patch = &version["data"]["read_time_patch"];
+        assert_eq!(patch["version"], read_time_patch::PATCH_VERSION);
+        assert!(patch["callflows_loaded"].as_u64().unwrap() >= 1);
+        assert!(patch["events_patched"]["source_participant"].as_u64().unwrap() >= 5);
+        assert!(patch["events_patched"]["message_name"].as_u64().unwrap() >= 3);
+
+        fs::remove_dir_all(&dataset_dir).ok();
     }
 
     fn normalized_lte_event(

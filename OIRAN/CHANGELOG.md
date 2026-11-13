@@ -1,5 +1,37 @@
 # Changelog
 
+## OIRAN API 2.14.7 — 2026-11-13 — read-time patcher pour sessions ingérées pré-2.14.5 (gate prod ANR1 #10)
+
+Constat ANR1 (déploiement 2.14.5 puis rollback) : tests PASS mais prod KO. La 2.14.5 fixait les décodeurs à l'INGESTION — les sessions stockées par 2.14.3 et antérieur (ANR1 héberge 25 sessions) continuaient à être servies telles quelles. Les tests prouvaient les fonctions, pas la route servie.
+
+Cause du stale sur ANR1 mesurée par `git log --format="%h %s · %cI" -S '10.77.10.10' OIRAN/live-probe/src/lib.rs` :
+```
+90ad491 fix(oiran): 2.11.5 expose LTE bearer keys upstream · 2026-11-11T01:46:16+00:00
+```
+Les IPs 10.77.10.10 (MME) et 10.77.10.20 (eNB) du lab S1-MME n'ont été ajoutées à `endpoint_map()` qu'en 2.11.5. Les captures ingérées avant cette date ont `source_endpoint.network_function = null` dans `oiran_events.jsonl` → `source_participant = "Unknown endpoint"` dans `callflow.json` → l'API 2.14.5 (et antérieures) sert cette valeur stale. Même mécanique pour les 3 autres écarts du ladder ANR2.
+
+Correctif 2.14.7 — lazy read-time patcher, aucune réécriture sur disque :
+- Nouveau module `apps/api/src/read_time_patch.rs`. `patch_flow_events` cross-référence chaque `CallFlowEvent` en mémoire avec le `NormalizedEvent` brut du sidecar `oiran_events.jsonl` (qui conserve `address`, `port`, `message_type`, `procedure_code`, `parent_event_id`).
+- Une seule source de vérité : le patcher appelle EXACTEMENT les fonctions publiques exposées par les décodeurs à l'ingestion — `oiran_decode::infer_sctp_network_function`, `decoder_s1ap::infer_direction_from_network_functions` (nouvelle variante sans `DecoderInput`), `decoder_s1ap::message_name`, `decoder_s1ap::combined_message_name`, `decoder_nas::mm_eps_name`. Pas de seconde implémentation.
+- Idempotent : un événement déjà conforme 2.14.5+ (NF résolus, direction transport, nom via la table S1AP corrigée) n'est pas modifié et n'est pas compté comme patché. Prouvé par le test unitaire `patcher_is_idempotent_on_already_correct_events`.
+- Provenance : chaque événement patché porte `read_time_patch: { "version": "2.14.7", "fields": ["source_participant", "direction", "message_name"] }`. L'UI/opérateur peut distinguer un libellé 2.14.7 d'un libellé d'ingestion.
+- Compteurs exposés dans `/api/v1/version` sous `read_time_patch` : `callflows_loaded`, `events_seen`, `events_patched.{source_participant,destination_participant,direction,message_name}`, `events_unresolved_participant` (participant reste `"Unknown endpoint"` explicite si le transport ne se résout pas), `events_without_raw_counterpart` (sidecar JSONL absent pour un événement). Aucun saut silencieux.
+- Fichiers `callflow.json` et `oiran_events.jsonl` restent intacts sur disque (la provenance 2.14.3 reste tracée). Alignement avec la règle ANR1 « aucune suppression ».
+
+Changements de surface (décodeurs) :
+- `oiran_decode::infer_sctp_network_function` passe `pub` (signature inchangée, `interface: &str` au lieu de `&'static str` pour accepter un string construit à la lecture). `oiran-decode` 0.7.5 → 0.7.6.
+- `decoder_s1ap::{message_name, combined_message_name, asn1_procedure_name, pdu_kind_label, infer_direction_from_transport}` passent `pub`. Nouvelle fn `pub fn infer_direction_from_network_functions(Option<&str>, Option<&str>) -> Direction` ; `infer_direction_from_transport` y délègue (une seule logique). `decoder-s1ap` 0.3.0 → 0.3.1.
+- `decoder_nas::mm_eps_name` passe `pub`. `decoder-nas` 0.4.1 → 0.4.2.
+- `live_probe::endpoint_map` passe `pub` (mirroir consommé par le patcher). `live-probe` 0.5.12 → 0.5.13.
+- `oiran-api` 2.14.6 → 2.14.7. Nouveau helper `oiran_endpoint_map()` qui délègue à `live_probe::endpoint_map()` (une seule source de vérité pour la table IP → NF).
+
+Tests :
+- `read_time_patch::tests::patcher_rewrites_s1_mme_stale_fields_via_jsonl_cross_reference` : 5 événements synthétiques (initialUEMessage + Attach Request + downlinkNASTransport + Security Mode Command + UECapabilityInfoIndication) en format 2.14.3 → 5 patches, participants eNB/MME, directions strictes transport, msg04 = `downlinkNASTransport · Security Mode Command`, msg05 = `UECapabilityInfoIndication`, provenance présente.
+- `read_time_patch::tests::patcher_is_idempotent_on_already_correct_events` : fixture format 2.14.5 → 0 patch, pas de `read_time_patch` injecté.
+- `tests::read_time_patch_rewrites_s1_mme_stale_fields_on_sessions_events_route` : HTTP E2E — construction d'un dataset synthétique sur disque (`datasets/read-time-patch-s1mme-*`), `AppState::load`, `GET /api/v1/sessions/<id>/events` → payload JSON avec les 5 événements corrigés et la provenance ; `GET /api/v1/version` → compteurs `read_time_patch` renseignés.
+
+Audit des 11 échecs `capture-helper` en parallèle (écart OUVERT mentionné par ANR1) : `cargo test -p capture-helper empty_capture_is_explicit` échoue à `capture-helper/src/lib.rs:1631` avec `called Option::unwrap() on a None value`. Cause mesurée par `df -h /home/devmat/OIRAN-POLARIS` → Use% 99% sur `/dev/sda1`. Chaîne : `CaptureService::validate_spec` (`capture-helper/src/lib.rs:395-443`) appelle `capture_budget(measure_path(&self.inner.config.capture_root), …, Policy::default())` à `:424`. `Policy::default().stop_percent = 98` (`disk-safety/src/lib.rs:30`). Runner au-dessus du seuil → `capture_budget.allowed = false` → `validate_spec` renvoie `DISK_SAFETY`, le job n'est jamais enregistré, `GetCaptureStatus.job = None`, `.unwrap()` panique. Même dépendance pour les 10 autres tests. Correctif proposé (**non implémenté dans ce lot**, documenté comme écart OUVERT dans le commentaire #9) : exposer sur `CaptureService` un setter test-only `set_disk_sample_override_for_tests` symétrique à celui de `CaptureManager` (2.14.6), avec une `Policy` permissive (seuils 100 %, réserve 0) pour que les 11 tests passent sur tout runner. Même motif que la fix four-plane déjà en 2.14.6.
+
 ## OIRAN API 2.14.6 / live-probe 0.5.12 — 2026-11-13 — tests autonomes (dataset-restore, four-plane, continuous-capture)
 
 Trois tests dépendaient de l’environnement sans le dire ; ANR1 l’a formulé : « un test qui dépend de la machine sans le dire est un garde qui ne garde rien ». Correctifs appliqués sans toucher à la production — uniquement du câblage de tests, via trois points d’injection `set_*_for_tests` sur `CaptureManager`.
