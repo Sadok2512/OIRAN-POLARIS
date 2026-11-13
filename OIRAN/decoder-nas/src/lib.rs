@@ -779,7 +779,13 @@ fn decode_eps_ue_network_capability(value: &[u8]) -> Option<String> {
     Some(parts.join(","))
 }
 
-fn mm_name(mt: u8) -> (&'static str, &'static str) {
+pub fn mm_name(mt: u8) -> (&'static str, &'static str) {
+    // 2.14.9 (ANR1 #10) : table 5GMM auditée contre TS 24.501
+    // §9.7.1 Table 9.7.1.1. Entrées ajoutées en 2.14.9 :
+    // 0x58 Authentication Result, 0x5A Authentication Reject,
+    // 0x64 5GMM Status, 0x65 Notification, 0x66 Notification
+    // Response. Les autres entrées sont inchangées (0x41-0x5F déjà
+    // couvertes conformément à la spec).
     match mt {
         0x41 => ("Registration Request", "REGISTRATION"),
         0x42 => ("Registration Accept", "REGISTRATION"),
@@ -794,16 +800,28 @@ fn mm_name(mt: u8) -> (&'static str, &'static str) {
         0x55 => ("Configuration Update Complete", "CONFIGURATION_UPDATE"),
         0x56 => ("Authentication Request", "AUTHENTICATION"),
         0x57 => ("Authentication Response", "AUTHENTICATION"),
+        0x58 => ("Authentication Result", "AUTHENTICATION"),
         0x59 => ("Authentication Failure", "AUTHENTICATION"),
+        0x5a => ("Authentication Reject", "AUTHENTICATION"),
         0x5b => ("Identity Request", "IDENTITY"),
         0x5c => ("Identity Response", "IDENTITY"),
         0x5d => ("Security Mode Command", "SECURITY_MODE"),
         0x5e => ("Security Mode Complete", "SECURITY_MODE"),
         0x5f => ("Security Mode Reject", "SECURITY_MODE"),
+        0x64 => ("5GMM Status", "STATUS"),
+        0x65 => ("Notification", "NOTIFICATION"),
+        0x66 => ("Notification Response", "NOTIFICATION"),
         0x67 => ("UL NAS Transport", "NAS_TRANSPORT"),
         0x68 => ("DL NAS Transport", "NAS_TRANSPORT"),
         _ => ("Unknown 5GMM message", "UNKNOWN"),
     }
+}
+
+/// 2.14.9 (ANR1 #10) — nom 5GSM depuis `message_type` TS 24.501 §9.11.
+/// Exposé pub pour que le patcher à la lecture ait la même source de
+/// vérité que l'ingestion.
+pub fn sm_name_5g(mt: u8) -> (&'static str, &'static str) {
+    sm_name(mt)
 }
 
 fn sm_name(mt: u8) -> (&'static str, &'static str) {

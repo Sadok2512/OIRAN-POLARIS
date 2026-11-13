@@ -47,7 +47,7 @@ pub struct NgapPdu {
     pub kind: PduKind,
     pub procedure_code: u8,
     pub criticality: u8,
-    pub message_name: &'static str,
+    pub message_name: String,
     pub ies: Vec<NgapIe>,
 }
 
@@ -121,7 +121,7 @@ pub fn parse(payload: &[u8]) -> Result<NgapPdu, String> {
         kind,
         procedure_code: procedure,
         criticality,
-        message_name: message_name(procedure, kind),
+        message_name: message_name(procedure, kind).to_string(),
         ies,
     })
 }
@@ -886,7 +886,7 @@ impl ProtocolDecoder for NgapDecoder {
                     timestamp: input.timestamp.clone(),
                     interface: input.interface.into(),
                     protocol: Protocol::Ngap,
-                    message_name: pdu.message_name.into(),
+                    message_name: pdu.message_name.clone(),
                     message_type: kind_number(pdu.kind),
                     procedure_code: Some(pdu.procedure_code as u32),
                     procedure: None,
@@ -913,6 +913,7 @@ impl ProtocolDecoder for NgapDecoder {
                 event.assign_deterministic_id();
                 let parent_id = event.event_id.clone();
                 let parent_identifiers = event.session_identifiers.clone();
+                let parent_ngap_name = pdu.message_name.clone();
                 let mut output_events = vec![event];
                 for nas in &nas_messages {
                     append_nas_events(
@@ -922,6 +923,7 @@ impl ProtocolDecoder for NgapDecoder {
                         &parent_identifiers,
                         input,
                         pdu.procedure_code,
+                        &parent_ngap_name,
                     );
                 }
                 DecoderOutput {
@@ -946,6 +948,7 @@ fn append_nas_events(
     parent_identifiers: &[NamedValue],
     input: &DecoderInput<'_>,
     ngap_procedure: u8,
+    parent_ngap_name: &str,
 ) {
     let mut identifiers = parent_identifiers.to_vec();
     identifiers.extend(nas.identifiers.clone());
@@ -973,7 +976,24 @@ fn append_nas_events(
         timestamp: input.timestamp.clone(),
         interface: input.interface.into(),
         protocol,
-        message_name: nas.message_name.clone(),
+        // 2.14.9 (ANR1 #10) : nom NAS enfant préfixé par la procédure
+        // NGAP porteuse en ASN.1 (initialUEMessage, downlinkNASTransport,
+        // uplinkNASTransport, pDUSessionResourceSetupRequest, …). NAS
+        // chiffré (5GMM SHT 2/4) → placeholder "Protected 5G NAS
+        // message" remplacé par "NAS chiffré" via
+        // `decoder_s1ap::combined_message_name` (helper partagé pour
+        // garder une seule source de vérité du prefix et de la
+        // substitution ciphered).
+        message_name: decoder_s1ap::combined_message_name(
+            parent_ngap_name,
+            &if nas.message_name == "Protected 5GMM message"
+                || nas.message_name == "Protected 5GSM message"
+            {
+                "NAS chiffré".to_string()
+            } else {
+                nas.message_name.clone()
+            },
+        ),
         message_type: nas.message_type.unwrap_or(0) as u32,
         procedure_code: nas.message_type.map(u32::from),
         procedure: Some(nas.procedure.clone()),
@@ -1016,6 +1036,7 @@ fn append_nas_events(
             &nas_identifiers,
             input,
             ngap_procedure,
+            parent_ngap_name,
         );
     }
 }
@@ -1065,7 +1086,7 @@ fn unsigned(v: &[u8]) -> u64 {
 fn be16(v: &[u8]) -> u16 {
     u16::from_be_bytes([v[0], v[1]])
 }
-fn message_name(code: u8, kind: PduKind) -> &'static str {
+pub fn message_name(code: u8, kind: PduKind) -> &'static str {
     match (code, kind) {
         (4, PduKind::Initiating) => "DownlinkNASTransport",
         (14, PduKind::Initiating) => "InitialContextSetupRequest",
@@ -1293,7 +1314,14 @@ mod tests {
         let output = NgapDecoder.decode(&input);
         assert_eq!(output.events.len(), 2);
         assert_eq!(output.events[1].protocol, Protocol::Nas5gmm);
-        assert_eq!(output.events[1].message_name, "Registration Reject");
+        // 2.14.9 (ANR1 #10) : NAS enfant préfixé par la procédure
+        // NGAP ASN.1 (initialUEMessage) — même mécanique que S1AP
+        // depuis 2.14.5. Une seule source de vérité :
+        // `decoder_s1ap::combined_message_name`.
+        assert_eq!(
+            output.events[1].message_name,
+            "initialUEMessage · Registration Reject"
+        );
         assert_eq!(
             output.events[1].parent_event_id.as_deref(),
             Some(output.events[0].event_id.as_str())

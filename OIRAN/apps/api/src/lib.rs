@@ -111,14 +111,14 @@ struct Inner {
     /// quand une requête vient du chemin A (`flow_value_for`). None
     /// en mode operational (le chemin A n'a jamais servi d'event).
     reference_dataset_root: Option<PathBuf>,
-    /// 2.14.8 (ANR1 #10) — cache des `RawEventIndex` par racine de
-    /// dataset. Chaque dataset_root (chemin absolu vers le répertoire
-    /// contenant `oiran_events.jsonl` + `event-shards/`) est indexé
-    /// une fois, à la première requête qui l'adresse, et conservé en
-    /// mémoire jusqu'à la fin du processus. Le chemin B (continuous)
-    /// relit les callflows à chaque requête ; sans ce cache le patcher
-    /// re-parserait le JSONL à chaque fois.
-    raw_index_cache: std::sync::Mutex<HashMap<PathBuf, Arc<read_time_patch::RawEventIndex>>>,
+    /// 2.14.9 (ANR1 #10 6859228701) — cache LRU borné des indexes raw
+    /// par (dataset_root, session_id). Remplace la map non bornée de
+    /// 2.14.8 qui a provoqué un OOM à 4 Gio sur la prod ANR1. Limites
+    /// configurables via `OIRAN_READ_TIME_PATCH_CACHE_SESSIONS`
+    /// (défaut 16) et `OIRAN_READ_TIME_PATCH_CACHE_BYTES` (défaut 64
+    /// MiB). Compteurs exposés dans
+    /// `/api/v1/version.read_time_patch.cache.*`.
+    raw_index_cache: read_time_patch::RawIndexCache,
     /// 2.10.0 : index des filtres Session Explorer (messages, causes,
     /// pseudonymes), construit au chargement depuis `flows` + mis à
     /// jour par `refresh_session_filter_index` quand le capture
@@ -668,7 +668,10 @@ impl AppState {
                 live_traces: live_trace::LiveTraceRegistry::new(),
                 read_time_patch_counters: read_time_patch_counters.clone(),
                 reference_dataset_root: Some(dataset_dir.clone()),
-                raw_index_cache: std::sync::Mutex::new(HashMap::new()),
+                raw_index_cache: read_time_patch::RawIndexCache::new(
+                    read_time_patch::CacheLimits::from_env(),
+                    read_time_patch_counters.clone(),
+                ),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -714,6 +717,14 @@ impl AppState {
             .lte_evidence_bundle_root
             .canonicalize()
             .map_err(io_error)?;
+        // 2.14.9 : les compteurs du patcher et du cache partagent le
+        // même Arc pour que `/api/v1/version.read_time_patch.cache.*`
+        // reflète fidèlement l'activité du LRU.
+        let read_time_patch_counters = Arc::new(read_time_patch::PatchCounters::new());
+        let raw_index_cache = read_time_patch::RawIndexCache::new(
+            read_time_patch::CacheLimits::from_env(),
+            read_time_patch_counters.clone(),
+        );
         Ok(Self {
             inner: Arc::new(Inner {
                 flows: BTreeMap::new(),
@@ -734,9 +745,9 @@ impl AppState {
                 administrator_token_sha256: config.administrator_token_sha256,
                 identity_vault,
                 live_traces: live_trace::LiveTraceRegistry::new(),
-                read_time_patch_counters: Arc::new(read_time_patch::PatchCounters::new()),
+                read_time_patch_counters,
                 reference_dataset_root: None,
-                raw_index_cache: std::sync::Mutex::new(HashMap::new()),
+                raw_index_cache,
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -962,58 +973,39 @@ fn oiran_endpoint_map() -> HashMap<String, String> {
     live_probe::endpoint_map()
 }
 
-/// 2.14.8 (ANR1 #10) — résout (ou construit) le `RawEventIndex` d'un
-/// dataset_root donné. Première invocation : scanne
-/// `oiran_events.jsonl` + `event-shards/*.jsonl` et met en cache. Les
-/// invocations suivantes pour le même chemin retournent l'instance
-/// cachée. Un chemin dont l'index n'a pas pu être construit (I/O
-/// error, JSONL corrompu) est logué via `eprintln!` et renvoyé
-/// `None` — compteur `events_without_raw_counterpart` incrémenté par
-/// le patcher dès qu'un event_id sera cherché.
-fn resolve_raw_index(
-    state: &AppState,
-    dataset_root: &std::path::Path,
-) -> Option<Arc<read_time_patch::RawEventIndex>> {
-    let dataset_root = match dataset_root.canonicalize() {
-        Ok(path) => path,
-        Err(_) => dataset_root.to_path_buf(),
-    };
-    let mut cache = state.inner.raw_index_cache.lock().ok()?;
-    if let Some(existing) = cache.get(&dataset_root) {
-        return Some(existing.clone());
-    }
-    match read_time_patch::RawEventIndex::from_dataset_root(&dataset_root) {
-        Ok(index) => {
-            let index = Arc::new(index);
-            cache.insert(dataset_root, index.clone());
-            Some(index)
-        }
-        Err(error) => {
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "event": "READ_TIME_PATCH_INDEX_UNAVAILABLE",
-                    "dataset_root": dataset_root.display().to_string(),
-                    "error": error,
-                })
-            );
-            None
-        }
-    }
-}
-
-/// 2.14.8 (ANR1 #10) — applique le patcher à une tranche d'événements
-/// déjà sérialisés en `Vec<Value>`, en résolvant le JSONL raw via
-/// `dataset_root`. Point de convergence du serving : le chemin A
-/// (reference_dataset_enabled) l'appelle aussi mais, comme ses
-/// events ont déjà été patchés au démarrage, l'opération est
-/// idempotente (0 nouveau patch, 0 provenance ajoutée).
+/// 2.14.9 (ANR1 #10 6859228701) — applique le patcher à une tranche
+/// d'événements en RAM. Au lieu de charger TOUT le JSONL du dataset,
+/// on extrait les `event_id` des items reçus et on demande au cache
+/// LRU un `RawEventIndex` scoped à cet ensemble. L'empreinte mémoire
+/// du patch d'une session est donc bornée par la taille de la
+/// session elle-même (≤ 16 événements en prod), pas par la taille
+/// du JSONL (2.7 GiB côté ANR1 → OOM en 2.14.8).
+///
+/// Clé de cache : `(dataset_root canonicalized, session_id)`.
+/// `session_id` sert uniquement d'étiquette LRU ; la correction
+/// identité est faite par event_id.
 fn apply_read_time_patch(
     state: &AppState,
     items: &mut Vec<Value>,
     dataset_root: &std::path::Path,
+    session_id: &str,
 ) {
-    let Some(index) = resolve_raw_index(state, dataset_root) else {
+    if items.is_empty() {
+        return;
+    }
+    let wanted: std::collections::HashSet<String> = items
+        .iter()
+        .filter_map(|event| event.get("event_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    let Some(index) = state
+        .inner
+        .raw_index_cache
+        .resolve(dataset_root, session_id, &wanted)
+    else {
         return;
     };
     let map = oiran_endpoint_map();
@@ -3182,7 +3174,7 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                     if let Ok(serde_json::Value::Array(mut items)) =
                         serde_json::to_value(&flow.events)
                     {
-                        apply_read_time_patch(&state, &mut items, &dataset_root);
+                        apply_read_time_patch(&state, &mut items, &dataset_root, session_id);
                         let (serving_node, serving_ran_node, core_node) =
                             read_time_patch::recompute_session_participants(&items);
                         if let Some(object) = summary.as_object_mut() {
@@ -4152,7 +4144,7 @@ async fn session_events(
             }
         };
     if let Some(root) = dataset_root.as_deref() {
-        apply_read_time_patch(&state, &mut items, root);
+        apply_read_time_patch(&state, &mut items, root, &id);
     }
     filter_events(&mut items, &query);
     sanitize_all(&mut items);
@@ -6032,6 +6024,295 @@ mod tests {
         );
         assert_eq!(before_manifest, before_sha(&manifest_path));
         assert_eq!(before_jsonl, before_sha(&jsonl_path));
+
+        fs::remove_dir_all(&capture_root).ok();
+    }
+
+    /// 2.14.9 (ANR1 #10 6859228701) — test de CHARGE : construit un
+    /// JSONL synthétique de taille configurable (≥ 2 GiB par défaut,
+    /// surchargé via `OIRAN_READ_TIME_PATCH_LOAD_TEST_BYTES`), sert
+    /// deux sessions via le patcher, et mesure `VmHWM` depuis
+    /// `/proc/self/status` avant/après. Assertion dure : le process
+    /// ne doit pas dépasser 512 MiB d'anon-rss observé.
+    ///
+    /// Reproduit le scénario OOM de prod ANR1 (2.14.8 tuée par le
+    /// cgroup 4 GiB à la première lecture d'une session réelle) : le
+    /// chargement complet du JSONL en `HashMap<String, Value>` par
+    /// `from_dataset_root` aurait alloué ~2-3× la taille sur disque,
+    /// ici ~6 GiB pour un fichier de 2 GiB. Avec 2.14.9, seul le
+    /// sous-ensemble des événements de la session demandée est
+    /// chargé.
+    ///
+    /// Marqué `#[ignore]` pour que `cargo test` par défaut ne le
+    /// lance pas (coût disque + temps : plusieurs minutes et 2 GiB
+    /// de temp). Exécution explicite :
+    /// `cargo test --release -p oiran-api --lib -- --ignored
+    /// read_time_patch_bounded_memory_on_large_jsonl`.
+    #[tokio::test]
+    #[ignore = "load test: writes ≥2 GiB of synthetic JSONL, run explicitly with --ignored"]
+    async fn read_time_patch_bounded_memory_on_large_jsonl() {
+        use std::io::Write as _;
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let target_bytes: usize = std::env::var("OIRAN_READ_TIME_PATCH_LOAD_TEST_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2 * 1024 * 1024 * 1024);
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let capture_root = workspace
+            .join("runtime")
+            .join(format!("api-read-time-patch-load-{suffix}"));
+        let base = capture_root.join(live_probe::CONTINUOUS_CAPTURE_ID);
+        let dataset_dir = base.join("dataset");
+        let generation_name = format!("generation-{}-0", epoch_seconds());
+        let callflows_dir = dataset_dir.join("callflow-generations").join(&generation_name);
+        fs::create_dir_all(&callflows_dir).unwrap();
+        fs::create_dir_all(base.join("pcap")).unwrap();
+
+        // Génère 2 sessions ciblées (session-a / session-b), chacune
+        // 5 événements au format raw 2.14.3. Puis padding JSONL avec
+        // des événements "bruit" portant des event_id qui n'appartiennent
+        // à aucune session, jusqu'à atteindre `target_bytes`. Le
+        // patcher 2.14.9 doit ignorer tout le bruit à la lecture
+        // streaming (extract_event_id puis skip).
+        let jsonl_path = dataset_dir.join("oiran_events.jsonl");
+        let jsonl_file = fs::File::create(&jsonl_path).unwrap();
+        let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, jsonl_file);
+        let session_a_events = [
+            (0u32, 12u32, 23u64, true),   // initialUEMessage eNB→MME
+            (0x41, 65, 23, true),         // NAS Attach Request
+            (0, 11, 24, false),           // downlinkNASTransport MME→eNB
+            (0x5d, 93, 24, false),        // NAS Security Mode Command
+            (0, 22, 31, true),            // UECapabilityInfoIndication
+        ];
+        let session_b_events = [
+            (0, 12, 101, true),
+            (0x41, 65, 101, true),
+            (0, 11, 102, false),
+            (0x5d, 93, 102, false),
+            (0, 22, 103, true),
+        ];
+        let write_event =
+            |writer: &mut dyn std::io::Write,
+             id: &str,
+             parent: Option<&str>,
+             protocol: &str,
+             message_type: u32,
+             procedure_code: u32,
+             packet: u64,
+             from_enb: bool| {
+                let (src, dst, src_port, dst_port) = if from_enb {
+                    ("10.77.10.20", "10.77.10.10", 46859u16, 36412u16)
+                } else {
+                    ("10.77.10.10", "10.77.10.20", 36412u16, 46859u16)
+                };
+                let line = serde_json::json!({
+                    "event_id":id,"parent_event_id":parent,
+                    "capture_id":"sha256:stub","capture_point_id":"S1-MME",
+                    "timestamp":{"seconds":packet as i64,"nanoseconds":0u64,"raw_ticks":packet,"display":""},
+                    "interface":"S1-MME","protocol":protocol,
+                    "message_name":"stale","message_type":message_type,"procedure_code":procedure_code,
+                    "source_endpoint":{"address":src,"port":src_port,"network_function":null},
+                    "destination_endpoint":{"address":dst,"port":dst_port,"network_function":null},
+                    "direction":"UNKNOWN","session_identifiers":[],"information_elements":[],
+                    "decoding_status":"DECODED","decoder_name":"decoder-s1ap","decoder_version":"0.2.2",
+                    "raw_payload_reference":"sha256:stub",
+                    "packet_references":[{"source_file":"S1-MME.pcap-stub","packet_number":packet,"byte_offset":0u64,"interface_id":0u32,"captured_length":1u32,"original_length":1u32}],
+                    "errors":[],
+                });
+                writeln!(writer, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+            };
+        for (i, (mt, proc, pkt, from_enb)) in session_a_events.iter().enumerate() {
+            let id = format!("evt-session-a-{i:02}");
+            let parent = if i == 1 { Some("evt-session-a-00") } else if i == 3 { Some("evt-session-a-02") } else { None };
+            let protocol = if *mt == 0 { "S1AP" } else { "NAS-EPS-MM" };
+            write_event(&mut writer, &id, parent, protocol, *mt, *proc, *pkt, *from_enb);
+        }
+        for (i, (mt, proc, pkt, from_enb)) in session_b_events.iter().enumerate() {
+            let id = format!("evt-session-b-{i:02}");
+            let parent = if i == 1 { Some("evt-session-b-00") } else if i == 3 { Some("evt-session-b-02") } else { None };
+            let protocol = if *mt == 0 { "S1AP" } else { "NAS-EPS-MM" };
+            write_event(&mut writer, &id, parent, protocol, *mt, *proc, *pkt, *from_enb);
+        }
+        // Padding bruyant : événements dont `event_id` n'appartient
+        // à aucune session demandée (préfixe `evt-noise-`), donc
+        // ignorés par `extract_event_id` + `wanted.contains`.
+        let mut noise_bytes = 0usize;
+        let mut noise_idx = 0u64;
+        while noise_bytes < target_bytes {
+            let id = format!("evt-noise-{noise_idx:010}");
+            noise_idx += 1;
+            let batch_start = noise_idx;
+            // Batch de 4 kio pour limiter le coût des calls syscall ;
+            // on vérifie la taille tous les 1 024 événements.
+            for _ in 0..1024 {
+                let id = format!("evt-noise-{noise_idx:010}");
+                noise_idx += 1;
+                write_event(&mut writer, &id, None, "S1AP", 0, 15, 42, true);
+            }
+            let _ = batch_start;
+            noise_bytes = fs::metadata(&jsonl_path).map(|m| m.len() as usize).unwrap_or(0);
+            if noise_bytes == 0 {
+                writer.flush().unwrap();
+                noise_bytes = fs::metadata(&jsonl_path).map(|m| m.len() as usize).unwrap_or(0);
+            }
+        }
+        writer.flush().unwrap();
+        drop(writer);
+        let jsonl_size = fs::metadata(&jsonl_path).unwrap().len();
+        assert!(
+            jsonl_size as usize >= target_bytes,
+            "JSONL synthetic size {} < target {}",
+            jsonl_size,
+            target_bytes
+        );
+
+        // Callflow 2.14.3 stale pour chaque session.
+        let stale_callflow = |session_id: &str, event_prefix: &str| {
+            serde_json::json!({
+                "callflow_id":format!("cf-{session_id}"),"session_id":session_id,"technology":"LTE",
+                "start_timestamp":"","end_timestamp":"",
+                "participants":[],"interfaces":["S1-MME"],"procedures":[],
+                "events":[
+                    {"event_id":format!("{event_prefix}-00"),"timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"S1AP","message_name":"InitialUEMessage","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"RAN_TO_CORE","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"S1 Setup","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-s1ap","decoder_version":"0.2.2","raw_payload_reference":"sha256:stub","errors":[]},
+                    {"event_id":format!("{event_prefix}-03"),"timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"NAS-EPS-MM","message_name":"Security Mode Complete","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"UNKNOWN","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"EPS_SECURITY_MODE","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-nas","decoder_version":"0.4.0","raw_payload_reference":"sha256:stub","errors":[]},
+                    {"event_id":format!("{event_prefix}-04"),"timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"S1AP","message_name":"UnknownS1APProcedure","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"RAN_TO_CORE","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"S1 Setup","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-s1ap","decoder_version":"0.2.2","raw_payload_reference":"sha256:stub","errors":[]}
+                ],
+                "correlation_edges":[],"correlation_status":{},"decoder_versions":{"decoder-s1ap":"0.2.2","decoder-nas":"0.4.0"},
+                "schema_version":"1.5.0","capture_references":["sha256:stub"],
+                "accounting":{"source_events":3,"session_events":3,"background_events":0,"unmatched_events":0,"duplicate_events":0,"extra_events":0},
+                "unresolved_fields":0
+            })
+        };
+        for (session_id, prefix) in [
+            ("lte-session-load-a", "evt-session-a"),
+            ("lte-session-load-b", "evt-session-b"),
+        ] {
+            let path = callflows_dir.join(format!("{session_id}.json"));
+            fs::write(&path, serde_json::to_vec_pretty(&stale_callflow(session_id, prefix)).unwrap()).unwrap();
+            fs::write(callflows_dir.join(format!("{session_id}.html")), b"<html/>").unwrap();
+        }
+
+        let manifest = serde_json::json!({
+            "dataset_id": live_probe::CONTINUOUS_DATASET_ID,
+            "capture_id": live_probe::CONTINUOUS_CAPTURE_ID,
+            "path": "runtime/live-captures/continuous-lab-import/dataset",
+            "event_count": 10,
+            "session_ids": ["lte-session-load-a", "lte-session-load-b"],
+            "decode_reports": {},
+            "checksums": {},
+            "state": "PARTIAL",
+            "callflows_path": format!("callflow-generations/{generation_name}"),
+        });
+        fs::write(
+            dataset_dir.join("dataset_manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // VmHWM AVANT.
+        let vmhwm = || -> usize {
+            let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmHWM:") {
+                    let kib: usize = rest
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(0);
+                    return kib * 1024;
+                }
+            }
+            0
+        };
+        let before = vmhwm();
+
+        // Construit le manager et la state.
+        let pseudonym_key_path = base.join(".oiran-pseudonym.key");
+        let manager = live_probe::CaptureManager::with_pseudonym_key_path(
+            capture_root.clone(),
+            false,
+            pseudonym_key_path,
+        )
+        .unwrap();
+        manager
+            .recover_continuous_dataset_from_disk(&base)
+            .expect("recover dataset");
+        let mut config = test_config(workspace, &format!("registry-load-{suffix}"));
+        config.reference_dataset_enabled = false;
+        config.capture_root = capture_root.clone();
+        let state = AppState::load_with_capture_manager(config, manager).unwrap();
+
+        // Sert les deux sessions via le patcher (chemin SERVING).
+        for session_id in ["lte-session-load-a", "lte-session-load-b"] {
+            let response = router(state.clone(), None)
+                .oneshot(req(&format!("/api/v1/sessions/{session_id}/events"), true))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            let events = body["data"].as_array().expect("events array");
+            assert_eq!(events.len(), 3, "callflow stub expose 3 events / session");
+            // 2.14.9 : vérifie que TOUS les events ont été patchés
+            // vers {eNB, MME}. Le sens dépend de l'event, mais
+            // "Unknown endpoint" doit avoir disparu.
+            for event in events {
+                let src = event["source_participant"].as_str().unwrap_or("");
+                let dst = event["destination_participant"].as_str().unwrap_or("");
+                assert!(
+                    (src == "eNB" && dst == "MME") || (src == "MME" && dst == "eNB"),
+                    "event {} participants not patched: {} → {}",
+                    event["event_id"], src, dst
+                );
+            }
+        }
+
+        // VmHWM APRÈS. L'empreinte doit rester bornée malgré 2 GiB
+        // de JSONL écrit (99 % des lignes sont du bruit filtré par
+        // extract_event_id + wanted.contains).
+        let after = vmhwm();
+        let threshold = 512usize * 1024 * 1024;
+        eprintln!(
+            "VmHWM before={} MiB, after={} MiB, threshold={} MiB, jsonl_size={} MiB",
+            before / 1024 / 1024,
+            after / 1024 / 1024,
+            threshold / 1024 / 1024,
+            jsonl_size / 1024 / 1024,
+        );
+        assert!(
+            after < threshold,
+            "VmHWM {} B exceeds 512 MiB threshold (jsonl size {} B)",
+            after,
+            jsonl_size,
+        );
+
+        // Compteurs : au moins 2 misses (une par session), hits > 0
+        // si on re-sert la même, cache_bytes borné.
+        let version = json_body(
+            router(state.clone(), None)
+                .oneshot(req("/api/v1/version", true))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let cache = &version["data"]["read_time_patch"]["cache"];
+        assert!(cache["misses"].as_u64().unwrap_or(0) >= 2);
+        assert!(
+            cache["bytes"].as_u64().unwrap_or(0)
+                <= read_time_patch::CacheLimits::DEFAULT_BYTES as u64
+        );
 
         fs::remove_dir_all(&capture_root).ok();
     }

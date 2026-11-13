@@ -23,11 +23,11 @@
 //! by design: an event already consistent with the 2.14.7 helpers is not
 //! modified and is not counted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use event_schema::Endpoint;
 use serde_json::{json, Value};
@@ -59,6 +59,14 @@ pub struct PatchCounters {
     /// to cross-reference (e.g., the sidecar `oiran_events.jsonl` is
     /// absent). Surfaced so the gate cannot pass silently.
     pub events_without_raw_counterpart: AtomicU64,
+    /// 2.14.9 (ANR1 #10 6859228701) — compteurs du cache LRU des
+    /// indexes raw par session. Exposés sous
+    /// `/api/v1/version.read_time_patch.cache.*`.
+    pub cache_bytes: AtomicU64,
+    pub cache_sessions: AtomicU64,
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
+    pub cache_evictions: AtomicU64,
 }
 
 impl PatchCounters {
@@ -87,7 +95,180 @@ impl PatchCounters {
             "events_without_raw_counterpart": self
                 .events_without_raw_counterpart
                 .load(Ordering::Relaxed),
+            "cache": {
+                "bytes": self.cache_bytes.load(Ordering::Relaxed),
+                "sessions": self.cache_sessions.load(Ordering::Relaxed),
+                "hits": self.cache_hits.load(Ordering::Relaxed),
+                "misses": self.cache_misses.load(Ordering::Relaxed),
+                "evictions": self.cache_evictions.load(Ordering::Relaxed),
+            },
         })
+    }
+}
+
+/// 2.14.9 (ANR1 #10 6859228701) — bornes configurables du cache LRU.
+/// Par défaut : 16 sessions, 64 MiB. Override via `OIRAN_READ_TIME_PATCH_CACHE_SESSIONS`
+/// et `OIRAN_READ_TIME_PATCH_CACHE_BYTES`. Les valeurs à 0 désactivent
+/// la limite correspondante (dangereux en prod ; prévu pour les tests).
+#[derive(Clone, Copy, Debug)]
+pub struct CacheLimits {
+    pub max_sessions: usize,
+    pub max_bytes: usize,
+}
+
+impl CacheLimits {
+    pub const DEFAULT_SESSIONS: usize = 16;
+    pub const DEFAULT_BYTES: usize = 64 * 1024 * 1024;
+
+    pub fn from_env() -> Self {
+        let max_sessions = std::env::var("OIRAN_READ_TIME_PATCH_CACHE_SESSIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(Self::DEFAULT_SESSIONS);
+        let max_bytes = std::env::var("OIRAN_READ_TIME_PATCH_CACHE_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(Self::DEFAULT_BYTES);
+        Self {
+            max_sessions,
+            max_bytes,
+        }
+    }
+}
+
+/// 2.14.9 (ANR1 #10 6859228701) — cache LRU borné des index raw par
+/// (dataset_root canonicalized, session_id). L'implémentation est
+/// volontairement simple (VecDeque + HashMap, O(k) par promotion) pour
+/// garder le code lisible : le volume de clés est borné par
+/// `max_sessions` (par défaut 16).
+///
+/// Chaque entrée porte une estimation du poids en octets de l'index
+/// (serialization length des Value conservés). `insert` évince
+/// LRU-first jusqu'à ce que `cache_bytes <= max_bytes` et
+/// `cache_sessions <= max_sessions`.
+pub struct RawIndexCache {
+    limits: CacheLimits,
+    entries: Mutex<RawIndexCacheInner>,
+    counters: Arc<PatchCounters>,
+}
+
+struct RawIndexCacheInner {
+    by_key: HashMap<(PathBuf, String), CacheEntry>,
+    order: VecDeque<(PathBuf, String)>,
+    bytes: usize,
+}
+
+#[derive(Clone)]
+struct CacheEntry {
+    index: Arc<RawEventIndex>,
+    weight_bytes: usize,
+}
+
+impl RawIndexCache {
+    pub fn new(limits: CacheLimits, counters: Arc<PatchCounters>) -> Self {
+        Self {
+            limits,
+            entries: Mutex::new(RawIndexCacheInner {
+                by_key: HashMap::new(),
+                order: VecDeque::new(),
+                bytes: 0,
+            }),
+            counters,
+        }
+    }
+
+    /// Résout l'index pour une session. Si absent du cache, construit
+    /// un `RawEventIndex` scoped à l'ensemble d'`event_ids` demandé
+    /// (lecture streaming du JSONL + shards, allocation bornée au
+    /// sous-ensemble des événements de la session). Retourne None
+    /// si l'I/O échoue.
+    pub fn resolve(
+        &self,
+        dataset_root: &Path,
+        session_id: &str,
+        wanted_event_ids: &HashSet<String>,
+    ) -> Option<Arc<RawEventIndex>> {
+        let key_root = dataset_root
+            .canonicalize()
+            .unwrap_or_else(|_| dataset_root.to_path_buf());
+        let key = (key_root.clone(), session_id.to_string());
+        {
+            let mut inner = self.entries.lock().ok()?;
+            if let Some(entry) = inner.by_key.get(&key).cloned() {
+                self.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+                // Promotion : déplace la clé au bout de `order` (le plus
+                // récemment utilisé). Coût O(|order|) bornés par
+                // `max_sessions`.
+                inner.order.retain(|existing| existing != &key);
+                inner.order.push_back(key.clone());
+                return Some(entry.index);
+            }
+        }
+        self.counters.cache_misses.fetch_add(1, Ordering::Relaxed);
+        let built = match RawEventIndex::from_dataset_root_for_event_ids(
+            dataset_root,
+            wanted_event_ids,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "READ_TIME_PATCH_INDEX_UNAVAILABLE",
+                        "dataset_root": dataset_root.display().to_string(),
+                        "session_id": session_id,
+                        "wanted_events": wanted_event_ids.len(),
+                        "error": error,
+                    })
+                );
+                return None;
+            }
+        };
+        let weight_bytes = built.estimated_bytes();
+        let index = Arc::new(built);
+        let mut inner = self.entries.lock().ok()?;
+        inner.by_key.insert(
+            key.clone(),
+            CacheEntry {
+                index: index.clone(),
+                weight_bytes,
+            },
+        );
+        inner.order.push_back(key);
+        inner.bytes = inner.bytes.saturating_add(weight_bytes);
+        self.enforce_limits(&mut inner);
+        self.counters
+            .cache_sessions
+            .store(inner.by_key.len() as u64, Ordering::Relaxed);
+        self.counters
+            .cache_bytes
+            .store(inner.bytes as u64, Ordering::Relaxed);
+        Some(index)
+    }
+
+    fn enforce_limits(&self, inner: &mut RawIndexCacheInner) {
+        while inner.by_key.len() > self.limits.max_sessions.max(1)
+            || inner.bytes > self.limits.max_bytes.max(1)
+        {
+            let Some(victim) = inner.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = inner.by_key.remove(&victim) {
+                inner.bytes = inner.bytes.saturating_sub(entry.weight_bytes);
+                self.counters.cache_evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn snapshot_bytes(&self) -> usize {
+        self.entries.lock().map(|inner| inner.bytes).unwrap_or(0)
+    }
+
+    pub fn snapshot_sessions(&self) -> usize {
+        self.entries
+            .lock()
+            .map(|inner| inner.by_key.len())
+            .unwrap_or(0)
     }
 }
 
@@ -103,24 +284,51 @@ pub struct RawEventIndex {
 impl RawEventIndex {
     pub fn from_jsonl_path(path: &Path) -> Result<Self, String> {
         let mut by_event_id = HashMap::new();
-        Self::ingest_jsonl_into(path, &mut by_event_id)?;
+        Self::ingest_jsonl_filtered(path, None, &mut by_event_id)?;
         Ok(Self { by_event_id })
     }
 
     /// 2.14.8 (ANR1 #10) — construction depuis un `dataset_root` qui
     /// contient `oiran_events.jsonl` ET/OU des event shards sous
-    /// `event-shards/*.jsonl`. Les deux coexistent en production : le
-    /// JSONL racine est le flux historique monolithique, les shards
-    /// sont les shards append-only publiés par chaque nouvelle
-    /// génération continue (`commit_incremental_publication`,
-    /// `live-probe/src/lib.rs:6735`). Les deux doivent être indexés
-    /// pour que la cross-référence par `event_id` trouve TOUS les
-    /// événements stockés à l'ingestion.
+    /// `event-shards/*.jsonl`. Charge TOUS les événements du dataset.
+    /// **Non borné en mémoire** : réservé aux tests ou aux datasets
+    /// dont la taille est connue a priori. La prod utilise
+    /// `from_dataset_root_for_event_ids` qui filtre à la lecture.
     pub fn from_dataset_root(dataset_root: &Path) -> Result<Self, String> {
+        Self::from_dataset_root_filtered(dataset_root, None)
+    }
+
+    /// 2.14.9 (ANR1 #10 6859228701) — construction scoped à un
+    /// ensemble d'`event_ids`. Les lignes JSONL dont `event_id` n'est
+    /// PAS dans `wanted` sont rejetées à la volée : l'allocation
+    /// finale est bornée à `wanted.len()` événements et ne dépend
+    /// pas de la taille du JSONL source. C'est le constructeur
+    /// utilisé par le serving ANR1 (prod, 2.7 GiB de JSONL, 46
+    /// sessions) : une session ouverte charge ~16 événements → ~16
+    /// KiB au lieu de ~2 GiB.
+    pub fn from_dataset_root_for_event_ids(
+        dataset_root: &Path,
+        wanted: &HashSet<String>,
+    ) -> Result<Self, String> {
+        Self::from_dataset_root_filtered(dataset_root, Some(wanted))
+    }
+
+    fn from_dataset_root_filtered(
+        dataset_root: &Path,
+        wanted: Option<&HashSet<String>>,
+    ) -> Result<Self, String> {
         let mut by_event_id = HashMap::new();
         let flat = dataset_root.join("oiran_events.jsonl");
         if flat.is_file() {
-            Self::ingest_jsonl_into(&flat, &mut by_event_id)?;
+            Self::ingest_jsonl_filtered(&flat, wanted, &mut by_event_id)?;
+            if let Some(wanted) = wanted {
+                if by_event_id.len() >= wanted.len() {
+                    // Fast path : tous les événements demandés ont été
+                    // trouvés dans le JSONL racine, inutile de scanner
+                    // les event-shards.
+                    return Ok(Self { by_event_id });
+                }
+            }
         }
         let shards_dir = dataset_root.join("event-shards");
         if shards_dir.is_dir() {
@@ -136,14 +344,20 @@ impl RawEventIndex {
                 .collect();
             shard_paths.sort();
             for shard_path in shard_paths {
-                Self::ingest_jsonl_into(&shard_path, &mut by_event_id)?;
+                Self::ingest_jsonl_filtered(&shard_path, wanted, &mut by_event_id)?;
+                if let Some(wanted) = wanted {
+                    if by_event_id.len() >= wanted.len() {
+                        break;
+                    }
+                }
             }
         }
         Ok(Self { by_event_id })
     }
 
-    fn ingest_jsonl_into(
+    fn ingest_jsonl_filtered(
         path: &Path,
+        wanted: Option<&HashSet<String>>,
         out: &mut HashMap<String, Value>,
     ) -> Result<(), String> {
         let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
@@ -153,14 +367,41 @@ impl RawEventIndex {
             if line.trim().is_empty() {
                 continue;
             }
-            let value: Value = serde_json::from_str(&line).map_err(|error| {
-                format!("{}:{}: invalid JSONL: {error}", path.display(), line_number + 1)
-            })?;
-            if let Some(id) = value.get("event_id").and_then(Value::as_str) {
-                out.insert(id.to_string(), value);
+            // Short-cut streaming : extraire `event_id` via une regex
+            // minimaliste AVANT de parser la Value entière, pour que
+            // 99 % des lignes d'un JSONL multi-sessions ne paient pas
+            // la désérialisation serde_json (allocation lourde) quand
+            // leur event_id n'appartient pas à la session demandée.
+            let event_id = match extract_event_id(&line) {
+                Some(id) => id,
+                None => continue,
+            };
+            if let Some(wanted) = wanted {
+                if !wanted.contains(event_id) {
+                    continue;
+                }
             }
+            let value: Value = serde_json::from_str(&line).map_err(|error| {
+                format!(
+                    "{}:{}: invalid JSONL: {error}",
+                    path.display(),
+                    line_number + 1
+                )
+            })?;
+            out.insert(event_id.to_string(), value);
         }
         Ok(())
+    }
+
+    /// 2.14.9 — estimation du poids mémoire de l'index pour piloter
+    /// le LRU. Approximation par la longueur sérialisée de chaque
+    /// Value (overhead de l'allocation `serde_json::Value` ~2-3× en
+    /// pratique, mais l'approximation suffit pour borner la croissance).
+    pub fn estimated_bytes(&self) -> usize {
+        self.by_event_id
+            .iter()
+            .map(|(key, value)| key.len() + value.to_string().len())
+            .sum()
     }
 
     pub fn get(&self, event_id: &str) -> Option<&Value> {
@@ -174,6 +415,23 @@ impl RawEventIndex {
     pub fn is_empty(&self) -> bool {
         self.by_event_id.is_empty()
     }
+}
+
+/// 2.14.9 — extraction lexicale rapide de l'`event_id` d'une ligne
+/// JSONL sans allouer la Value entière. Utilisé par l'ingestion
+/// filtrée pour que 99 % des lignes d'un JSONL multi-sessions soient
+/// rejetées avant la désérialisation serde_json complète. La règle
+/// cherche le premier token `"event_id"` suivi d'un `:` puis une
+/// chaîne JSON `"..."` (pas d'échappement complexe attendu ; le
+/// publisher écrit des ids safe : `evt-<hex>`, cf. decoder-s1ap).
+fn extract_event_id(line: &str) -> Option<&str> {
+    let key = line.find("\"event_id\"")?;
+    let after = &line[key + "\"event_id\"".len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
 }
 
 fn endpoint_from_raw(value: Option<&Value>) -> (Option<Endpoint>, Option<u16>) {
@@ -210,49 +468,77 @@ fn kind_from_u32(value: u32) -> decoder_s1ap::PduKind {
     }
 }
 
+fn kind_from_ngap_u32(value: u32) -> decoder_ngap::PduKind {
+    match value {
+        1 => decoder_ngap::PduKind::SuccessfulOutcome,
+        2 => decoder_ngap::PduKind::UnsuccessfulOutcome,
+        _ => decoder_ngap::PduKind::Initiating,
+    }
+}
+
+/// 2.14.9 (ANR1 #10) — nom canonique de la procédure porteuse, S1AP
+/// (TS 36.413) ou NGAP (TS 38.413). Les deux appelées à la même
+/// signature mais via deux tables disjointes. Une seule source de
+/// vérité par protocole (les fonctions publiques des décodeurs).
 fn s1ap_name_for(raw: &Value) -> Option<String> {
     let protocol = raw.get("protocol").and_then(Value::as_str)?;
-    if protocol != "S1AP" {
-        return None;
-    }
     let code = raw
         .get("procedure_code")
         .and_then(Value::as_u64)
         .and_then(|value| u8::try_from(value).ok())?;
-    let kind = raw
+    let kind_number = raw
         .get("message_type")
         .and_then(Value::as_u64)
-        .map(|value| kind_from_u32(value as u32))
-        .unwrap_or(decoder_s1ap::PduKind::Initiating);
-    Some(decoder_s1ap::message_name(code, kind))
+        .map(|value| value as u32)
+        .unwrap_or(0);
+    match protocol {
+        "S1AP" => Some(decoder_s1ap::message_name(code, kind_from_u32(kind_number))),
+        "NGAP" => Some(
+            decoder_ngap::message_name(code, kind_from_ngap_u32(kind_number)).to_string(),
+        ),
+        _ => None,
+    }
 }
 
-fn nas_name_for(raw: &Value, parent_s1ap_name: &str) -> Option<String> {
+fn nas_name_for(raw: &Value, parent_name: &str) -> Option<String> {
     let protocol = raw.get("protocol").and_then(Value::as_str)?;
-    let is_nas = matches!(
-        protocol,
-        "NAS-EPS-MM" | "NAS-EPS-SM" | "NasEpsMm" | "NasEpsSm"
-    );
-    if !is_nas {
-        return None;
-    }
+    let (is_eps, is_sm, is_fiveg) = match protocol {
+        "NAS-EPS-MM" | "NasEpsMm" => (true, false, false),
+        "NAS-EPS-SM" | "NasEpsSm" => (true, true, false),
+        "NAS-5GMM" | "Nas5gmm" => (false, false, true),
+        "NAS-5GSM" | "Nas5gsm" => (false, true, true),
+        _ => return None,
+    };
     let message_type = raw
         .get("message_type")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    // 2.14.7 (ANR1 #10) : convention héritée de `decoder-s1ap` —
-    // `message_type == 0` sur un événement NAS enfant signale un NAS
-    // chiffré ; le décodeur ne peut pas lire le type interne. Le
-    // libellé public est « NAS chiffré » (placeholder « Protected EPS
-    // EMM message » de 2.14.3 remplacé par `combined_message_name`).
+    // 2.14.7-2.14.9 (ANR1 #10) : `message_type == 0` sur un
+    // événement NAS enfant signale un NAS chiffré. Placeholder
+    // publique uniforme « NAS chiffré » (remplace « Protected EPS
+    // EMM message », « Protected 5GMM message », etc.).
     let nas_name: &str = if message_type == 0 {
         "NAS chiffré"
-    } else {
-        // Même table que `decoder-nas` à l'ingestion : une seule source
-        // de vérité.
+    } else if is_fiveg {
+        // TS 24.501 §9.7 — même table que decoder-nas à l'ingestion.
+        if is_sm {
+            decoder_nas::sm_name_5g(message_type as u8).0
+        } else {
+            decoder_nas::mm_name(message_type as u8).0
+        }
+    } else if is_eps {
+        // TS 24.301 §9.8 — mm_eps_name (table auditée en 2.14.5).
+        // L'extension SM EPS n'est pas exposée publiquement ; on y
+        // retombe dans la variante MM par défaut quand le décodeur
+        // d'ingestion renvoie "NAS-EPS-SM" sans entrée dédiée côté
+        // mm_eps_name. Les captures lab n'exposent pas de SM EPS
+        // dédié → aucun impact prod observé.
+        let _ = is_sm;
         decoder_nas::mm_eps_name(message_type as u8).0
+    } else {
+        return None;
     };
-    Some(decoder_s1ap::combined_message_name(parent_s1ap_name, nas_name))
+    Some(decoder_s1ap::combined_message_name(parent_name, nas_name))
 }
 
 /// Patch a vector of `CallFlowEvent` values in place. Returns the
@@ -747,6 +1033,73 @@ mod tests {
         assert!(counters.events_patched_message_name.load(Ordering::Relaxed) >= 3);
         assert_eq!(counters.events_unresolved_participant.load(Ordering::Relaxed), 0);
 
+        std::fs::remove_file(&jsonl_path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    /// 2.14.9 (ANR1 #10) — chemin NGAP (5G) : InitialUEMessage +
+    /// NAS Registration Request + NAS chiffré. Vérifie que la
+    /// patcher produit le nom combiné `initialUEMessage · Registration
+    /// Request` et `initialUEMessage · NAS chiffré`.
+    #[test]
+    fn patcher_rewrites_ngap_5g_stale_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "oiran-read-time-patch-ngap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = vec![
+            json!({"event_id":"ngap-01","parent_event_id":null,
+                "interface":"N2","protocol":"NGAP",
+                "message_name":"stale","message_type":0,"procedure_code":15,
+                "source_endpoint":{"address":"10.77.21.20","port":55123,"network_function":null},
+                "destination_endpoint":{"address":"10.77.21.11","port":38412,"network_function":null},
+                "direction":"UNKNOWN",
+            }),
+            json!({"event_id":"ngap-02","parent_event_id":"ngap-01",
+                "interface":"N2","protocol":"NAS-5GMM",
+                "message_name":"stale","message_type":0x41,"procedure_code":65,
+                "source_endpoint":{"address":"10.77.21.20","port":55123,"network_function":null},
+                "destination_endpoint":{"address":"10.77.21.11","port":38412,"network_function":null},
+                "direction":"UNKNOWN",
+            }),
+            json!({"event_id":"ngap-03","parent_event_id":"ngap-01",
+                "interface":"N2","protocol":"NAS-5GMM",
+                "message_name":"stale","message_type":0,"procedure_code":null,
+                "source_endpoint":{"address":"10.77.21.20","port":55123,"network_function":null},
+                "destination_endpoint":{"address":"10.77.21.11","port":38412,"network_function":null},
+                "direction":"UNKNOWN",
+            }),
+        ];
+        let jsonl_path = write_jsonl(&dir, &raw);
+        let index = RawEventIndex::from_jsonl_path(&jsonl_path).unwrap();
+        let mut events = vec![
+            stale_callflow_event("ngap-01", "Unknown endpoint", "Unknown endpoint", "RAN_TO_CORE", "InitialUEMessage"),
+            stale_callflow_event("ngap-02", "Unknown endpoint", "Unknown endpoint", "RAN_TO_CORE", "Registration Request"),
+            stale_callflow_event("ngap-03", "Unknown endpoint", "Unknown endpoint", "RAN_TO_CORE", "Protected 5GMM message"),
+        ];
+        let ngap_map = HashMap::from([
+            ("10.77.21.20".to_string(), "gNB".to_string()),
+            ("10.77.21.11".to_string(), "AMF".to_string()),
+        ]);
+        let counters = Arc::new(PatchCounters::new());
+        let rewritten = patch_flow_events(&mut events, &index, &ngap_map, &counters);
+        assert_eq!(rewritten, 3);
+        assert_eq!(events[0]["source_participant"], "gNB");
+        assert_eq!(events[0]["destination_participant"], "AMF");
+        assert_eq!(events[0]["message_name"], "InitialUEMessage");
+        assert_eq!(
+            events[1]["message_name"],
+            "initialUEMessage · Registration Request"
+        );
+        assert_eq!(
+            events[2]["message_name"],
+            "initialUEMessage · NAS chiffré"
+        );
         std::fs::remove_file(&jsonl_path).ok();
         std::fs::remove_dir(&dir).ok();
     }

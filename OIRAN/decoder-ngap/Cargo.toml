@@ -1,12 +1,16 @@
 [package]
 name = "decoder-ngap"
-version = "0.6.0"
+version = "0.6.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 decoder-nas = { path = "../decoder-nas" }
+# 2.14.9 : combined_message_name réutilisé pour les NAS 5G enfants
+# (une seule source de vérité du prefix et de la substitution « NAS
+# chiffré »).
+decoder-s1ap = { path = "../decoder-s1ap" }
 event-schema = { path = "../event-schema" }
 plugin-runtime = { path = "../plugin-runtime" }
 serde = { version = "1", features = ["derive"] }

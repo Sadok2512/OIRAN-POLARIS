@@ -1,5 +1,51 @@
 # Changelog
 
+## OIRAN API 2.14.9 / decoder-nas 0.4.3 / decoder-ngap 0.6.1 — 2026-11-13 — patcher à mémoire bornée + NGAP (5G) combiné
+
+Constat ANR1 (2.14.8 déployée, #10 6859228701) : OOM cgroup 4 GiB dès la première lecture de session réelle, anon-rss observé 4,18 Go. Rollback immédiat. Cause mesurée par audit : `RawEventIndex::from_dataset_root` chargeait l'INTÉGRALITÉ du JSONL (`oiran_events.jsonl` + `event-shards/*.jsonl` d'un dataset — ~2,7 Go côté prod ANR1) en `HashMap<String, serde_json::Value>`. L'overhead `serde_json::Value` est ~2-3× la taille sérialisée → ~6 GiB alloués, bien au-dessus du cgroup. Le test E2E 2.14.8 à 5 événements ne pouvait pas le voir.
+
+### Priorité OOM (correctif 2.14.9)
+
+- **RawEventIndex scoped par session** : nouveau `RawEventIndex::from_dataset_root_for_event_ids(dataset_root, wanted: &HashSet<String>)` qui lit en streaming le JSONL + event-shards et NE conserve en RAM QUE les événements dont l'`event_id` appartient à la session demandée. Fast-path lexical : `extract_event_id(&str) -> Option<&str>` extrait l'id d'une ligne JSONL sans allouer la Value entière, pour que 99 % des lignes d'un JSONL multi-sessions soient rejetées avant la désérialisation serde_json complète.
+- **Cache LRU borné** : nouveau `RawIndexCache` par `(dataset_root canonicalized, session_id)` avec limites configurables :
+  - `OIRAN_READ_TIME_PATCH_CACHE_SESSIONS` (défaut `16`)
+  - `OIRAN_READ_TIME_PATCH_CACHE_BYTES` (défaut `64 MiB`)
+  Éviction LRU-first dès qu'une limite est franchie. Compteurs exposés sous `/api/v1/version.read_time_patch.cache.*` : `bytes`, `sessions`, `hits`, `misses`, `evictions`.
+- **Test de charge obligatoire** : `read_time_patch_bounded_memory_on_large_jsonl` génère un JSONL synthétique de 2 GiB (configurable via `OIRAN_READ_TIME_PATCH_LOAD_TEST_BYTES`), sert 2 sessions via le patcher, mesure `VmHWM` (`/proc/self/status`), assert `VmHWM < 512 MiB`. Exécution :
+  ```
+  OIRAN_READ_TIME_PATCH_LOAD_TEST_BYTES=2147483648 \
+    cargo test --release --locked -p oiran-api --lib -- --ignored read_time_patch_bounded_memory_on_large_jsonl
+  → VmHWM before=3 MiB, after=6 MiB, threshold=512 MiB, jsonl_size=2049 MiB
+  → test result: ok. 1 passed; 0 failed in 35.12s
+  ```
+  Reproduit à l'échelle prod, prouve que le footprint est borné à `~CacheLimits::DEFAULT_BYTES` + taille des événements de la session servie (≤ 16 événements en pratique).
+
+### Complément NGAP (5G)
+
+- **decoder-ngap 0.6.0 → 0.6.1** : `message_name` passe `pub`. `NgapPdu.message_name` passe `&'static str` → `String`. `append_nas_events` reçoit `parent_ngap_name: &str` et appelle `decoder_s1ap::combined_message_name(parent, nas_name)` pour produire le nom combiné (ex. `initialUEMessage · Registration Request`, `initialUEMessage · NAS chiffré`). Les placeholders « Protected 5GMM message » / « Protected 5GSM message » sont remplacés par « NAS chiffré » — même mécanique que S1AP en 2.14.5.
+- **decoder-nas 0.4.2 → 0.4.3** : table 5GMM `mm_name` auditée contre TS 24.501 §9.7.1 Table 9.7.1.1. Entrées ajoutées :
+  - `0x58` Authentication Result
+  - `0x5A` Authentication Reject
+  - `0x64` 5GMM Status
+  - `0x65` Notification
+  - `0x66` Notification Response
+  `mm_name` passe `pub` ; nouveau wrapper public `sm_name_5g(mt) -> (name, procedure)` pour que le patcher à la lecture ait la même source de vérité que l'ingestion.
+- **oiran-api 2.14.8 → 2.14.9** : `read_time_patch::s1ap_name_for` étendu pour accepter `protocol == "NGAP"` (via `decoder_ngap::message_name`). `read_time_patch::nas_name_for` étendu pour accepter `NAS-5GMM / Nas5gmm / NAS-5GSM / Nas5gsm` ; la patcher appelle `decoder_nas::mm_name` (5GMM) ou `decoder_nas::sm_name_5g` (5GSM) selon le protocole. Tests ajoutés :
+  - `read_time_patch::tests::patcher_rewrites_ngap_5g_stale_fields` (unit) : 3 événements NGAP + NAS 5GMM → `initialUEMessage · Registration Request` + `initialUEMessage · NAS chiffré`, participants `gNB` / `AMF` recalculés depuis `endpoint_map` 5G (10.77.21.*).
+  - `decoder-ngap::tests::nas_pdu_emits_provenance_linked_child_event` mis à jour pour attendre `initialUEMessage · Registration Reject` à la place du nom isolé `Registration Reject`.
+
+### Audit : qui réécrit `dataset_manifest.json` ?
+
+- `commit_incremental_publication` (`live-probe/src/lib.rs:6729`) réécrit atomiquement `dataset_manifest.json` après chaque cycle de publication continue (ligne `:6782-6785` : `atomic_write(&current.join("dataset_manifest.json"), …)`). Déclencheurs : nouveau segment pcap stable ingéré (worker `run_continuous_import`, boucle `:3572-3579` quand `changed=true`), OU un segment finalisé qui faisait précédemment partie de `pending_finalization`. La fenêtre 16:39:56 observée par ANR1 correspond très probablement à une publication incrémentale (job state=`CAPTURING`, nouveau segment ingéré).
+- Autres chemins qui touchent le manifeste :
+  - `recover_continuous_dataset_from_disk` (`:6285`) ne réécrit JAMAIS — il lit uniquement et rehydratele dataset en mémoire.
+  - Les routes `/lte/evidence/import` écrivent dans `lte-evidence-store`, chemin dédié, pas le manifeste continu.
+
+### UI p900 2.2.5 → 2.2.6
+
+- Ladder : la colonne de gauche (procedure_group) passe d'un tronc `.slice(0,7)` à `.slice(0,14)` + tooltip `<title>` SVG qui expose la valeur complète au survol. Même traitement pour le badge interface (title = valeur complète). Aucune refonte du gabarit ladder ; alignement vertical préservé.
+- Test `polaris-screens.test.tsx` version strings alignés sur 2.2.6.
+
 ## OIRAN API 2.14.8 / live-probe 0.5.14 — 2026-11-13 — read-time patcher appliqué au chemin de SERVING (gate prod ANR1 #10 bis)
 
 Constat ANR1 (2.14.7 déployée) : `callflows_loaded = 0`, `events_seen = 0`, aucun événement patché en prod. Le patcher 2.14.7 était branché sur `AppState::load` (chemin A, `reference_dataset_enabled`), or la prod tourne en mode operational avec `reference_dataset_enabled = false` → `load_operational` laisse `flow_values` vide → le patcher n'est JAMAIS appelé. Les sessions prod viennent du chemin B (continuous import) : `capture_manager.callflow(...)` relit `callflows/*.json` à chaque requête (`live-probe/src/lib.rs:2104`) et renvoie un `CallFlow` jamais patché.

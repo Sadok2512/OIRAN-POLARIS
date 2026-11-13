@@ -1,6 +1,6 @@
 [package]
 name = "oiran-api"
-version = "2.14.8"
+version = "2.14.9"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -17,6 +17,10 @@ live-probe = { path = "../../live-probe" }
 oiran-decode = { path = "../../oiran-decode" }
 decoder-s1ap = { path = "../../decoder-s1ap" }
 decoder-nas = { path = "../../decoder-nas" }
+# 2.14.9 : patcher à la lecture étend le combined_message_name à NGAP
+# (TS 38.413) + NAS 5GMM/5GSM (TS 24.501) ; même table publique
+# consommée par l'ingestion.
+decoder-ngap = { path = "../../decoder-ngap" }
 correlation-engine = { path = "../../correlation-engine" }
 session-engine = { path = "../../session-engine" }
 serde = { version = "1.0", features = ["derive"] }

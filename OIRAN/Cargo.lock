@@ -295,16 +295,17 @@ dependencies = [
 
 [[package]]
 name = "decoder-nas"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "event-schema",
 ]
 
 [[package]]
 name = "decoder-ngap"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "decoder-nas",
+ "decoder-s1ap",
  "event-schema",
  "plugin-runtime",
  "serde",
@@ -651,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.14.8"
+version = "2.14.9"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -660,6 +661,7 @@ dependencies = [
  "correlation-engine",
  "dataset-registry",
  "decoder-nas",
+ "decoder-ngap",
  "decoder-s1ap",
  "disk-safety",
  "event-schema",
