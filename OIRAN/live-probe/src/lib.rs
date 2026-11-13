@@ -2118,24 +2118,44 @@ impl CaptureManager {
                 dataset.callflows_path.clone().unwrap_or_else(|| "callflows".into()),
             )
         };
-        let dataset_root = if stored_dataset_id.starts_with("derived-") {
-            self.root
-                .join("derived-datasets")
-                .join(&stored_dataset_id)
-                .join("dataset")
-        } else if stored_dataset_id.starts_with("recovered-dataset-") {
-            self.root
-                .join("recovered-datasets")
-                .join(&capture_id)
-                .join("dataset")
-        } else {
-            self.root.join(&capture_id).join("dataset")
-        };
+        let dataset_root = self.dataset_root_for(&stored_dataset_id, &capture_id);
         Some(
             dataset_root
                 .join(callflows_path)
                 .join(format!("{session_id}.json")),
         )
+    }
+
+    /// 2.14.8 (ANR1 #10) — chemin du répertoire racine du dataset
+    /// pour un `dataset_id` donné. C'est le répertoire qui contient
+    /// `dataset_manifest.json`, `oiran_events.jsonl`, `event-shards/`
+    /// et `callflow-generations/`. Nécessaire au patcher à la lecture
+    /// pour cross-référencer les `CallFlowEvent` de la génération
+    /// active avec les raw `NormalizedEvent` conservés dans les event
+    /// shards et dans le JSONL racine.
+    pub fn dataset_root(&self, dataset_id: &str) -> Option<PathBuf> {
+        let (stored_dataset_id, capture_id) = {
+            let datasets = self.datasets.lock().unwrap();
+            let dataset = datasets.get(dataset_id)?;
+            (dataset.dataset_id.clone(), dataset.capture_id.clone())
+        };
+        Some(self.dataset_root_for(&stored_dataset_id, &capture_id))
+    }
+
+    fn dataset_root_for(&self, stored_dataset_id: &str, capture_id: &str) -> PathBuf {
+        if stored_dataset_id.starts_with("derived-") {
+            self.root
+                .join("derived-datasets")
+                .join(stored_dataset_id)
+                .join("dataset")
+        } else if stored_dataset_id.starts_with("recovered-dataset-") {
+            self.root
+                .join("recovered-datasets")
+                .join(capture_id)
+                .join("dataset")
+        } else {
+            self.root.join(capture_id).join("dataset")
+        }
     }
 
     pub fn callflow_page(

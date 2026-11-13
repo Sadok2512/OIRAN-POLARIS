@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -97,9 +97,52 @@ pub struct RawEventIndex {
 
 impl RawEventIndex {
     pub fn from_jsonl_path(path: &Path) -> Result<Self, String> {
+        let mut by_event_id = HashMap::new();
+        Self::ingest_jsonl_into(path, &mut by_event_id)?;
+        Ok(Self { by_event_id })
+    }
+
+    /// 2.14.8 (ANR1 #10) — construction depuis un `dataset_root` qui
+    /// contient `oiran_events.jsonl` ET/OU des event shards sous
+    /// `event-shards/*.jsonl`. Les deux coexistent en production : le
+    /// JSONL racine est le flux historique monolithique, les shards
+    /// sont les shards append-only publiés par chaque nouvelle
+    /// génération continue (`commit_incremental_publication`,
+    /// `live-probe/src/lib.rs:6735`). Les deux doivent être indexés
+    /// pour que la cross-référence par `event_id` trouve TOUS les
+    /// événements stockés à l'ingestion.
+    pub fn from_dataset_root(dataset_root: &Path) -> Result<Self, String> {
+        let mut by_event_id = HashMap::new();
+        let flat = dataset_root.join("oiran_events.jsonl");
+        if flat.is_file() {
+            Self::ingest_jsonl_into(&flat, &mut by_event_id)?;
+        }
+        let shards_dir = dataset_root.join("event-shards");
+        if shards_dir.is_dir() {
+            let mut shard_paths: Vec<PathBuf> = std::fs::read_dir(&shards_dir)
+                .map_err(|error| error.to_string())?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value == "jsonl")
+                })
+                .collect();
+            shard_paths.sort();
+            for shard_path in shard_paths {
+                Self::ingest_jsonl_into(&shard_path, &mut by_event_id)?;
+            }
+        }
+        Ok(Self { by_event_id })
+    }
+
+    fn ingest_jsonl_into(
+        path: &Path,
+        out: &mut HashMap<String, Value>,
+    ) -> Result<(), String> {
         let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
         let reader = BufReader::new(file);
-        let mut by_event_id = HashMap::new();
         for (line_number, line) in reader.lines().enumerate() {
             let line = line.map_err(|error| error.to_string())?;
             if line.trim().is_empty() {
@@ -109,10 +152,10 @@ impl RawEventIndex {
                 format!("{}:{}: invalid JSONL: {error}", path.display(), line_number + 1)
             })?;
             if let Some(id) = value.get("event_id").and_then(Value::as_str) {
-                by_event_id.insert(id.to_string(), value);
+                out.insert(id.to_string(), value);
             }
         }
-        Ok(Self { by_event_id })
+        Ok(())
     }
 
     pub fn get(&self, event_id: &str) -> Option<&Value> {
@@ -312,6 +355,26 @@ fn patch_one(
         None => return false,
     };
 
+    // 2.14.8 (ANR1 #10) — enrichissement idempotent : expose
+    // `source_address` / `destination_address` sur l'événement patché
+    // pour que `recompute_session_participants` puisse reconstruire
+    // `core_node = "MME 10.77.10.10"` depuis l'IP raw. CallFlowEvent
+    // ne stocke pas ces champs, ils viennent du raw JSONL. Pas de
+    // provenance pour un simple ajout d'adresse (le participant est
+    // déjà tracé via `read_time_patch.fields`).
+    if !source.address.is_empty() {
+        event_object.insert(
+            "source_address".into(),
+            Value::String(source.address.clone()),
+        );
+    }
+    if !destination.address.is_empty() {
+        event_object.insert(
+            "destination_address".into(),
+            Value::String(destination.address.clone()),
+        );
+    }
+
     let old_source = event_object
         .get("source_participant")
         .and_then(Value::as_str)
@@ -400,6 +463,56 @@ fn patch_one(
     } else {
         false
     }
+}
+
+/// 2.14.8 (ANR1 #10) — à partir des `source_participant` et
+/// `destination_participant` (éventuellement patchés) de chaque
+/// événement, recalcule les 3 synthèses exposées dans le `session_summary` :
+///
+/// - `serving_ran_node` : premier participant avec un rôle ∈ {eNB, gNB}.
+/// - `core_node` : premier participant avec un rôle ∈ {MME, AMF}.
+/// - `serving_node` : alias conservé pour compat 2.14.3, égal à
+///   `serving_ran_node`.
+///
+/// Les trois sont retournés au format « ROLE ADRESSE » (ex. « MME
+/// 10.77.10.10 ») ou « UNKNOWN » si aucun participant ne colle. La
+/// fonction s'applique sur une copie `Value` ; l'appelant la ré-injecte
+/// dans la session summary.
+pub fn recompute_session_participants(events: &[Value]) -> (String, String, String) {
+    use std::collections::BTreeMap;
+    let mut participants: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for event in events {
+        for (role_key, address_key) in [
+            ("source_participant", "source_address"),
+            ("destination_participant", "destination_address"),
+        ] {
+            let role = event.get(role_key).and_then(Value::as_str).unwrap_or("");
+            if role.is_empty() || role == "Unknown endpoint" {
+                continue;
+            }
+            let address = event
+                .get(address_key)
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let entry = participants.entry(role.to_string()).or_default();
+            if !address.is_empty() && !entry.iter().any(|existing| existing == address) {
+                entry.push(address.to_string());
+            }
+        }
+    }
+    let first = |roles: &[&str]| -> String {
+        for role in roles {
+            if let Some(addresses) = participants.get(*role) {
+                let address = addresses.first().map(String::as_str).unwrap_or("");
+                return format!("{role} {address}").trim().to_string();
+            }
+        }
+        "UNKNOWN".to_string()
+    };
+    let serving_ran_node = first(&["gNB", "eNB"]);
+    let core_node = first(&["AMF", "MME"]);
+    let serving_node = serving_ran_node.clone();
+    (serving_node, serving_ran_node, core_node)
 }
 
 #[cfg(test)]

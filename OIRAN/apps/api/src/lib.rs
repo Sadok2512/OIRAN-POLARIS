@@ -105,6 +105,20 @@ struct Inner {
     /// `/api/v1/version` pour que la gate ANR1 puisse constater que
     /// le patch est actif.
     read_time_patch_counters: Arc<read_time_patch::PatchCounters>,
+    /// 2.14.8 (ANR1 #10) — racine du dataset de référence quand
+    /// `reference_dataset_enabled`. Utilisée par le patcher à la
+    /// lecture pour relire `oiran_events.jsonl` / `event-shards/*`
+    /// quand une requête vient du chemin A (`flow_value_for`). None
+    /// en mode operational (le chemin A n'a jamais servi d'event).
+    reference_dataset_root: Option<PathBuf>,
+    /// 2.14.8 (ANR1 #10) — cache des `RawEventIndex` par racine de
+    /// dataset. Chaque dataset_root (chemin absolu vers le répertoire
+    /// contenant `oiran_events.jsonl` + `event-shards/`) est indexé
+    /// une fois, à la première requête qui l'adresse, et conservé en
+    /// mémoire jusqu'à la fin du processus. Le chemin B (continuous)
+    /// relit les callflows à chaque requête ; sans ce cache le patcher
+    /// re-parserait le JSONL à chaque fois.
+    raw_index_cache: std::sync::Mutex<HashMap<PathBuf, Arc<read_time_patch::RawEventIndex>>>,
     /// 2.10.0 : index des filtres Session Explorer (messages, causes,
     /// pseudonymes), construit au chargement depuis `flows` + mis à
     /// jour par `refresh_session_filter_index` quand le capture
@@ -653,6 +667,8 @@ impl AppState {
                 identity_vault,
                 live_traces: live_trace::LiveTraceRegistry::new(),
                 read_time_patch_counters: read_time_patch_counters.clone(),
+                reference_dataset_root: Some(dataset_dir.clone()),
+                raw_index_cache: std::sync::Mutex::new(HashMap::new()),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -719,6 +735,8 @@ impl AppState {
                 identity_vault,
                 live_traces: live_trace::LiveTraceRegistry::new(),
                 read_time_patch_counters: Arc::new(read_time_patch::PatchCounters::new()),
+                reference_dataset_root: None,
+                raw_index_cache: std::sync::Mutex::new(HashMap::new()),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -942,6 +960,69 @@ fn flow_path_for<'a>(state: &'a AppState, id: &str) -> Option<&'a FsPath> {
 /// IP → NF que l'ingestion ; une seule source de vérité.
 fn oiran_endpoint_map() -> HashMap<String, String> {
     live_probe::endpoint_map()
+}
+
+/// 2.14.8 (ANR1 #10) — résout (ou construit) le `RawEventIndex` d'un
+/// dataset_root donné. Première invocation : scanne
+/// `oiran_events.jsonl` + `event-shards/*.jsonl` et met en cache. Les
+/// invocations suivantes pour le même chemin retournent l'instance
+/// cachée. Un chemin dont l'index n'a pas pu être construit (I/O
+/// error, JSONL corrompu) est logué via `eprintln!` et renvoyé
+/// `None` — compteur `events_without_raw_counterpart` incrémenté par
+/// le patcher dès qu'un event_id sera cherché.
+fn resolve_raw_index(
+    state: &AppState,
+    dataset_root: &std::path::Path,
+) -> Option<Arc<read_time_patch::RawEventIndex>> {
+    let dataset_root = match dataset_root.canonicalize() {
+        Ok(path) => path,
+        Err(_) => dataset_root.to_path_buf(),
+    };
+    let mut cache = state.inner.raw_index_cache.lock().ok()?;
+    if let Some(existing) = cache.get(&dataset_root) {
+        return Some(existing.clone());
+    }
+    match read_time_patch::RawEventIndex::from_dataset_root(&dataset_root) {
+        Ok(index) => {
+            let index = Arc::new(index);
+            cache.insert(dataset_root, index.clone());
+            Some(index)
+        }
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "READ_TIME_PATCH_INDEX_UNAVAILABLE",
+                    "dataset_root": dataset_root.display().to_string(),
+                    "error": error,
+                })
+            );
+            None
+        }
+    }
+}
+
+/// 2.14.8 (ANR1 #10) — applique le patcher à une tranche d'événements
+/// déjà sérialisés en `Vec<Value>`, en résolvant le JSONL raw via
+/// `dataset_root`. Point de convergence du serving : le chemin A
+/// (reference_dataset_enabled) l'appelle aussi mais, comme ses
+/// events ont déjà été patchés au démarrage, l'opération est
+/// idempotente (0 nouveau patch, 0 provenance ajoutée).
+fn apply_read_time_patch(
+    state: &AppState,
+    items: &mut Vec<Value>,
+    dataset_root: &std::path::Path,
+) {
+    let Some(index) = resolve_raw_index(state, dataset_root) else {
+        return;
+    };
+    let map = oiran_endpoint_map();
+    read_time_patch::patch_flow_events(
+        items,
+        &index,
+        &map,
+        &state.inner.read_time_patch_counters,
+    );
 }
 
 fn live_flow_for(state: &AppState, id: &str) -> Option<(String, CallFlow)> {
@@ -3088,6 +3169,32 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                 .callflow(&dataset.dataset_id, session_id)
             {
                 let mut summary = live_session_summary(&dataset, &flow);
+                // 2.14.8 (ANR1 #10) — patcher à la lecture sur le chemin B
+                // (continuous / derived / recovered). On sérialise les
+                // events, on patch via le raw JSONL du dataset_root,
+                // puis on recalcule serving_node/serving_ran_node/
+                // core_node depuis les participants patchés.
+                if let Some(dataset_root) = state
+                    .inner
+                    .capture_manager
+                    .dataset_root(&dataset.dataset_id)
+                {
+                    if let Ok(serde_json::Value::Array(mut items)) =
+                        serde_json::to_value(&flow.events)
+                    {
+                        apply_read_time_patch(&state, &mut items, &dataset_root);
+                        let (serving_node, serving_ran_node, core_node) =
+                            read_time_patch::recompute_session_participants(&items);
+                        if let Some(object) = summary.as_object_mut() {
+                            object.insert("serving_node".into(), Value::String(serving_node));
+                            object.insert(
+                                "serving_ran_node".into(),
+                                Value::String(serving_ran_node),
+                            );
+                            object.insert("core_node".into(), Value::String(core_node));
+                        }
+                    }
+                }
                 decorate_subscriber_summary(&mut summary, &flow, &journey_index);
                 unique.insert(session_id.clone(), summary);
             }
@@ -3999,30 +4106,54 @@ async fn session_events(
     Path(id): Path<String>,
     Query(query): Query<ListQuery>,
 ) -> Response {
-    let mut items: Vec<Value> = if let Some(flow_value) = flow_value_for(&state, &id) {
-        flow_value["events"].as_array().cloned().unwrap_or_default()
-    } else if let Some((_dataset, flow)) = live_flow_for(&state, &id) {
-        serde_json::to_value(flow.events)
-            .ok()
-            .and_then(|value| value.as_array().cloned())
-            .unwrap_or_default()
-    } else {
-        match state.inner.lte_evidence_store.callflow_page_by_session(
-            &id,
-            None,
-            MAX_CALLFLOW_PAGE_EVENTS,
-        ) {
-            Ok(Some(value)) => value["events"].as_array().cloned().unwrap_or_default(),
-            Ok(None) => {
-                return api_error(
-                    StatusCode::NOT_FOUND,
-                    "SESSION_NOT_FOUND",
-                    "unknown session id",
-                )
+    // 2.14.8 (ANR1 #10) — chaque chemin fournit (items, dataset_root
+    // optionnel) : A (reference_dataset_enabled) → `state.inner.storage_path`
+    // joint à `datasets/<id>` indirect, on résout ici via la config
+    // stockée au chargement (`storage_path` pointe sur le workspace,
+    // les JSONL sont déjà patchés au démarrage, donc idempotent) ;
+    // B (continuous/derived/recovered) → `capture_manager.dataset_root(dataset_id)` ;
+    // C (LTE evidence) → pas de JSONL raw cross-référençable, on
+    // sert tel quel (les callflows LTE sont produits dans un autre
+    // flux et n'ont pas le mélange old/new shards).
+    let (mut items, dataset_root): (Vec<Value>, Option<PathBuf>) =
+        if let Some(flow_value) = flow_value_for(&state, &id) {
+            // Path A : events déjà patchés à `AppState::load` ; la
+            // ré-application depuis le dataset_dir configuré reste
+            // idempotente (compteurs inchangés).
+            let items = flow_value["events"].as_array().cloned().unwrap_or_default();
+            (items, state.inner.reference_dataset_root.clone())
+        } else if let Some((dataset_id, flow)) = live_flow_for(&state, &id) {
+            let items = serde_json::to_value(flow.events)
+                .ok()
+                .and_then(|value| value.as_array().cloned())
+                .unwrap_or_default();
+            (
+                items,
+                state.inner.capture_manager.dataset_root(&dataset_id),
+            )
+        } else {
+            match state.inner.lte_evidence_store.callflow_page_by_session(
+                &id,
+                None,
+                MAX_CALLFLOW_PAGE_EVENTS,
+            ) {
+                Ok(Some(value)) => (
+                    value["events"].as_array().cloned().unwrap_or_default(),
+                    None,
+                ),
+                Ok(None) => {
+                    return api_error(
+                        StatusCode::NOT_FOUND,
+                        "SESSION_NOT_FOUND",
+                        "unknown session id",
+                    )
+                }
+                Err(error) => return lte_evidence_error(error),
             }
-            Err(error) => return lte_evidence_error(error),
-        }
-    };
+        };
+    if let Some(root) = dataset_root.as_deref() {
+        apply_read_time_patch(&state, &mut items, root);
+    }
     filter_events(&mut items, &query);
     sanitize_all(&mut items);
     paginated(items, &query).into_response()
@@ -5660,6 +5791,243 @@ mod tests {
         assert!(patch["events_patched"]["message_name"].as_u64().unwrap() >= 3);
 
         fs::remove_dir_all(&dataset_dir).ok();
+    }
+
+    /// 2.14.8 (ANR1 #10) — E2E HTTP contre une fixture au format
+    /// **continuous** (chemin B de la prod ANR1) : `CaptureManager`
+    /// avec un `CONTINUOUS_CAPTURE_ID` dataset recovered depuis le
+    /// disque, `operational` mode (`reference_dataset_enabled=false`,
+    /// `flow_values` vide à `AppState::load_operational`). Le callflow
+    /// est servi par `capture_manager.callflow(...)` à chaque
+    /// requête via `live_flow_for` / `live_session_summary` — le
+    /// chemin exact que 2.14.7 ne couvrait pas (gate prod fail).
+    ///
+    /// Vérifie que :
+    /// 1. GET `/api/v1/sessions/<id>/events` renvoie les événements
+    ///    patchés en RAM (participants eNB/MME, msg04 = Security Mode
+    ///    Command, msg05 = UECapabilityInfoIndication, provenance
+    ///    `read_time_patch.version = "2.14.7"`).
+    /// 2. GET `/api/v1/sessions` renvoie un `serving_ran_node = "eNB …"`
+    ///    et un `core_node = "MME 10.77.10.10"` recalculés depuis les
+    ///    participants patchés.
+    /// 3. Le fichier `callflow-generations/generation-…/<id>.json`
+    ///    reste BYTE-IDENTIQUE avant / après l'appel HTTP (SHA-256
+    ///    identique). Preuve que le patcher n'a rien écrit sur disque.
+    /// 4. Les compteurs `/api/v1/version.read_time_patch.*` reflètent
+    ///    les événements patchés.
+    #[tokio::test]
+    async fn read_time_patch_covers_continuous_path_b_without_disk_writes() {
+        use live_probe::{CaptureManager, CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID};
+        use std::io::Write as _;
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let capture_root = workspace
+            .join("runtime")
+            .join(format!("api-read-time-patch-continuous-{suffix}"));
+        let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset_dir = base.join("dataset");
+        let generation_name = format!("generation-{}-0", epoch_seconds());
+        let callflows_dir = dataset_dir.join("callflow-generations").join(&generation_name);
+        let pcap_dir = base.join("pcap");
+        fs::create_dir_all(&callflows_dir).unwrap();
+        fs::create_dir_all(&pcap_dir).unwrap();
+
+        // 5 raw NormalizedEvents en format « ingestion 2.14.3 »
+        // (ports connus, NF=null, endpoint_map ne résolvait pas 10.77.10.*
+        // avant 2.11.5).
+        let raw_event = |id: &str,
+                         parent: Option<&str>,
+                         protocol: &str,
+                         message_type: u32,
+                         procedure_code: u32,
+                         packet: u64,
+                         from_enb: bool| {
+            let (src, dst, src_port, dst_port) = if from_enb {
+                ("10.77.10.20", "10.77.10.10", 46859u16, 36412u16)
+            } else {
+                ("10.77.10.10", "10.77.10.20", 36412u16, 46859u16)
+            };
+            json!({
+                "event_id":id,"parent_event_id":parent,
+                "capture_id":"sha256:stub","capture_point_id":"S1-MME",
+                "timestamp":{"seconds":packet as i64,"nanoseconds":0u64,"raw_ticks":packet,"display":""},
+                "interface":"S1-MME","protocol":protocol,
+                "message_name":"stale","message_type":message_type,"procedure_code":procedure_code,
+                "source_endpoint":{"address":src,"port":src_port,"network_function":null},
+                "destination_endpoint":{"address":dst,"port":dst_port,"network_function":null},
+                "direction":"UNKNOWN","session_identifiers":[],"information_elements":[],
+                "decoding_status":"DECODED","decoder_name":"decoder-s1ap","decoder_version":"0.2.2",
+                "raw_payload_reference":"sha256:stub",
+                "packet_references":[{"source_file":"S1-MME.pcap-stub","packet_number":packet,"byte_offset":0u64,"interface_id":0u32,"captured_length":1u32,"original_length":1u32}],
+                "errors":[],
+            })
+        };
+        let raw_events = vec![
+            raw_event("evt-01", None, "S1AP", 0, 12, 23, true),
+            raw_event("evt-02", Some("evt-01"), "NAS-EPS-MM", 0x41, 65, 23, true),
+            raw_event("evt-03", None, "S1AP", 0, 11, 24, false),
+            raw_event("evt-04", Some("evt-03"), "NAS-EPS-MM", 0x5d, 93, 24, false),
+            raw_event("evt-05", None, "S1AP", 0, 22, 31, true),
+        ];
+        let jsonl_path = dataset_dir.join("oiran_events.jsonl");
+        let mut jsonl = fs::File::create(&jsonl_path).unwrap();
+        for event in &raw_events {
+            writeln!(jsonl, "{}", serde_json::to_string(event).unwrap()).unwrap();
+        }
+        drop(jsonl);
+
+        // Callflow 2.14.3 stale persisté dans la génération active.
+        let session_id = "lte-session-synthetic-continuous";
+        let callflow = json!({
+            "callflow_id":format!("cf-{session_id}"),
+            "session_id":session_id,
+            "technology":"LTE",
+            "start_timestamp":"","end_timestamp":"",
+            "participants":[],
+            "interfaces":["S1-MME"],
+            "procedures":[],
+            "events":[
+                {"event_id":"evt-01","timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"S1AP","message_name":"InitialUEMessage","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"RAN_TO_CORE","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"S1 Setup","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-s1ap","decoder_version":"0.2.2","raw_payload_reference":"sha256:stub","errors":[]},
+                {"event_id":"evt-02","timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"NAS-EPS-MM","message_name":"Attach Request","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"UNKNOWN","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"EPS_ATTACH","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-nas","decoder_version":"0.4.0","raw_payload_reference":"sha256:stub","errors":[]},
+                {"event_id":"evt-03","timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"S1AP","message_name":"DownlinkNASTransport","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"CORE_TO_RAN","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"NAS Transport","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-s1ap","decoder_version":"0.2.2","raw_payload_reference":"sha256:stub","errors":[]},
+                {"event_id":"evt-04","timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"NAS-EPS-MM","message_name":"Security Mode Complete","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"UNKNOWN","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"EPS_SECURITY_MODE","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-nas","decoder_version":"0.4.0","raw_payload_reference":"sha256:stub","errors":[]},
+                {"event_id":"evt-05","timestamp":"","timestamp_ns":"0","interface":"S1-MME","protocol":"S1AP","message_name":"UnknownS1APProcedure","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint","direction":"RAN_TO_CORE","decoded_ie_tree":[],"decoding_status":"DECODED","semantic_status":"EXACT","association":"SESSION","procedure_group":"S1 Setup","packet_references":[],"capture_id":"sha256:stub","decoder_name":"decoder-s1ap","decoder_version":"0.2.2","raw_payload_reference":"sha256:stub","errors":[]}
+            ],
+            "correlation_edges":[],
+            "correlation_status":{},
+            "decoder_versions":{"decoder-s1ap":"0.2.2","decoder-nas":"0.4.0"},
+            "schema_version":"1.5.0",
+            "capture_references":["sha256:stub"],
+            "accounting":{"source_events":5,"session_events":5,"background_events":0,"unmatched_events":0,"duplicate_events":0,"extra_events":0},
+            "unresolved_fields":0
+        });
+        let callflow_path = callflows_dir.join(format!("{session_id}.json"));
+        fs::write(&callflow_path, serde_json::to_vec_pretty(&callflow).unwrap()).unwrap();
+        fs::write(
+            callflows_dir.join(format!("{session_id}.html")),
+            b"<html>stub</html>",
+        )
+        .unwrap();
+        // Manifest avec callflows_path pointant vers la génération.
+        let manifest = json!({
+            "dataset_id": CONTINUOUS_DATASET_ID,
+            "capture_id": CONTINUOUS_CAPTURE_ID,
+            "path": "runtime/live-captures/continuous-lab-import/dataset",
+            "event_count": 5,
+            "session_ids": [session_id],
+            "decode_reports": {},
+            "checksums": {},
+            "state": "PARTIAL",
+            "callflows_path": format!("callflow-generations/{generation_name}"),
+        });
+        let manifest_path = dataset_dir.join("dataset_manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // SHA-256 des artefacts callflow + manifest + jsonl AVANT.
+        let before_sha = |path: &std::path::Path| sha256_hex(&fs::read(path).unwrap());
+        let before_callflow = before_sha(&callflow_path);
+        let before_manifest = before_sha(&manifest_path);
+        let before_jsonl = before_sha(&jsonl_path);
+
+        // Construction du CaptureManager en operational mode.
+        let pseudonym_key_path = base.join(".oiran-pseudonym.key");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            capture_root.clone(),
+            false,
+            pseudonym_key_path,
+        )
+        .unwrap();
+        manager
+            .recover_continuous_dataset_from_disk(&base)
+            .expect("recover continuous dataset from on-disk manifest");
+
+        // AppState::load_with_capture_manager → mode operational :
+        // flow_values vide, les sessions ne viennent QUE de
+        // `capture_manager.datasets()`.
+        let mut config = test_config(workspace, &format!("registry-continuous-b-{suffix}"));
+        config.reference_dataset_enabled = false;
+        config.capture_root = capture_root.clone();
+        let state = AppState::load_with_capture_manager(config, manager).unwrap();
+
+        // Sanity : /sessions renvoie la session continue avec core_node
+        // recalculé.
+        let sessions = json_body(
+            router(state.clone(), None)
+                .oneshot(req("/api/v1/sessions?page_size=10", true))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let session = sessions["data"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .find(|item| item["session_id"] == session_id)
+            .expect("continuous session served");
+        assert_eq!(session["core_node"], "MME 10.77.10.10");
+        assert_eq!(session["serving_ran_node"], "eNB 10.77.10.20");
+
+        // GET /sessions/<id>/events → events patchés.
+        let response = router(state.clone(), None)
+            .oneshot(req(&format!("/api/v1/sessions/{session_id}/events"), true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let events = body["data"].as_array().expect("events array");
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[0]["source_participant"], "eNB");
+        assert_eq!(events[0]["destination_participant"], "MME");
+        assert_eq!(events[2]["source_participant"], "MME");
+        assert_eq!(
+            events[3]["message_name"],
+            "downlinkNASTransport · Security Mode Command"
+        );
+        assert_eq!(events[4]["message_name"], "UECapabilityInfoIndication");
+        for event in events {
+            assert!(
+                event.get("read_time_patch").is_some(),
+                "missing provenance on {}",
+                event["event_id"]
+            );
+        }
+
+        // Compteurs /api/v1/version.
+        let version = json_body(
+            router(state.clone(), None)
+                .oneshot(req("/api/v1/version", true))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let patch = &version["data"]["read_time_patch"];
+        assert_eq!(patch["version"], read_time_patch::PATCH_VERSION);
+        assert!(patch["events_patched"]["source_participant"].as_u64().unwrap() >= 5);
+
+        // Preuve zéro écriture : SHA-256 identiques avant / après HTTP.
+        assert_eq!(
+            before_callflow, before_sha(&callflow_path),
+            "callflow.json must stay byte-identical on disk"
+        );
+        assert_eq!(before_manifest, before_sha(&manifest_path));
+        assert_eq!(before_jsonl, before_sha(&jsonl_path));
+
+        fs::remove_dir_all(&capture_root).ok();
     }
 
     fn normalized_lte_event(

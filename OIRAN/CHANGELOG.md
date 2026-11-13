@@ -1,5 +1,35 @@
 # Changelog
 
+## OIRAN API 2.14.8 / live-probe 0.5.14 — 2026-11-13 — read-time patcher appliqué au chemin de SERVING (gate prod ANR1 #10 bis)
+
+Constat ANR1 (2.14.7 déployée) : `callflows_loaded = 0`, `events_seen = 0`, aucun événement patché en prod. Le patcher 2.14.7 était branché sur `AppState::load` (chemin A, `reference_dataset_enabled`), or la prod tourne en mode operational avec `reference_dataset_enabled = false` → `load_operational` laisse `flow_values` vide → le patcher n'est JAMAIS appelé. Les sessions prod viennent du chemin B (continuous import) : `capture_manager.callflow(...)` relit `callflows/*.json` à chaque requête (`live-probe/src/lib.rs:2104`) et renvoie un `CallFlow` jamais patché.
+
+Diagnostic complet (preuve par le code, sans ré-ingestion) :
+- `commit_incremental_publication` (`live-probe/src/lib.rs:6729`) crée une nouvelle `callflow-generations/generation-<ms>-<n>` à chaque cycle de publication.
+- `process_capture_into_selected` (`:5300`) saute `decode_capture_streaming` pour les segments déjà dans `prior.checksums` (`:5373-5377`). Les event shards sont déclarés append-only (`:6787`).
+- Donc une nouvelle génération réutilise les shards existants verbatim. Une correction « à la source » (option b) nécessiterait d'invalider les shards (contradiction avec « aucune suppression »).
+
+Correctif 2.14.8 — option (c) retenue : patcher au point de convergence du serving, pas au chargement.
+
+Changements :
+- `live-probe` 0.5.13 → 0.5.14 : nouveau `pub fn CaptureManager::dataset_root(dataset_id) -> Option<PathBuf>` qui expose la racine `<capture_root>/<capture_id>/dataset` (ou `derived-datasets/<id>/dataset` / `recovered-datasets/<capture_id>/dataset`) — le répertoire qui contient `dataset_manifest.json`, `oiran_events.jsonl`, `event-shards/` et `callflow-generations/`. Nécessaire au patcher pour localiser le sidecar raw par dataset_id.
+- `oiran-api` 2.14.7 → 2.14.8 :
+  - `read_time_patch::RawEventIndex::from_dataset_root(&Path)` : indexe `oiran_events.jsonl` ET tous les `event-shards/*.jsonl` d'un coup. Le JSONL racine est le flux historique, les shards sont les publications incrémentales — les deux coexistent en prod continue et doivent tous être cross-référencés.
+  - `read_time_patch::recompute_session_participants(events)` : à partir des événements patchés (qui portent désormais `source_address`/`destination_address` injectés par `patch_one`), renvoie `(serving_node, serving_ran_node, core_node)` au format `"ROLE ADRESSE"` ou `"UNKNOWN"`. Pour les 25 sessions ANR1 : `"MME 10.77.10.10"` / `"eNB 10.77.10.20"`.
+  - `patch_one` ajoute idempotemment `source_address`/`destination_address` sur chaque `CallFlowEvent` patché (les champs manquent de la schema `CallFlowEvent` mais sont dispo dans le raw).
+  - `apply_read_time_patch(state, items, dataset_root)` au point de convergence HTTP : cache `RawEventIndex` par `dataset_root` (canonicalized) derrière un `Mutex<HashMap<PathBuf, Arc<RawEventIndex>>>` sur `Inner` — première requête par dataset → parse unique du JSONL+shards, requêtes suivantes → lookup O(1).
+  - `session_events` (`:4075`) et `sessions` (`:3083`) invoquent `apply_read_time_patch` sur chaque flow servi (chemins A, B, C). Pour B/A on résout `dataset_root` via `capture_manager.dataset_root(dataset_id)` et `state.inner.reference_dataset_root`. Pour les sessions live, après le patch des events on recalcule `serving_node`/`serving_ran_node`/`core_node` via `recompute_session_participants`.
+- Les règles 2.14.7 sont strictement préservées : fonctions uniques (mêmes helpers `oiran_decode::infer_sctp_network_function`, `decoder_s1ap::infer_direction_from_network_functions`, `decoder_s1ap::message_name`, `decoder_s1ap::combined_message_name`, `decoder_nas::mm_eps_name`, `live_probe::endpoint_map`), provenance `read_time_patch.fields` par événement, compteurs dans `/api/v1/version`, idempotent, ZÉRO écriture disque (prouvé par le test).
+
+Preuve sur le chemin B (test `read_time_patch_covers_continuous_path_b_without_disk_writes`) :
+- Construction d'une fixture `<capture_root>/continuous-lab-import/dataset/` avec `dataset_manifest.json` dont `callflows_path = "callflow-generations/generation-<ms>-0"`, un `<session_id>.json` stale (participants « Unknown endpoint », direction fallback procedureCode, « Security Mode Complete » sur 0x5D, « UnknownS1APProcedure » sur proc 22), et un `oiran_events.jsonl` au format raw (NF=null, ports 36412/46859 explicites).
+- `CaptureManager::with_pseudonym_key_path(capture_root, false, …)` + `recover_continuous_dataset_from_disk(&base)`.
+- `AppState::load_with_capture_manager(config_operational, manager)`.
+- `GET /api/v1/sessions?page_size=10` → le session_id est servi avec `core_node = "MME 10.77.10.10"`, `serving_ran_node = "eNB 10.77.10.20"`.
+- `GET /api/v1/sessions/<id>/events` → 5 événements patchés, `read_time_patch` présente sur tous, msg04 = `downlinkNASTransport · Security Mode Command`, msg05 = `UECapabilityInfoIndication`.
+- `GET /api/v1/version` → `read_time_patch.events_patched.source_participant ≥ 5`.
+- SHA-256 de `callflow-generations/<gen>/<id>.json`, `dataset_manifest.json`, `oiran_events.jsonl` **avant et après** les requêtes HTTP : **byte-identiques** (preuve zéro écriture disque).
+
 ## OIRAN API 2.14.7 — 2026-11-13 — read-time patcher pour sessions ingérées pré-2.14.5 (gate prod ANR1 #10)
 
 Constat ANR1 (déploiement 2.14.5 puis rollback) : tests PASS mais prod KO. La 2.14.5 fixait les décodeurs à l'INGESTION — les sessions stockées par 2.14.3 et antérieur (ANR1 héberge 25 sessions) continuaient à être servies telles quelles. Les tests prouvaient les fonctions, pas la route servie.
