@@ -1,5 +1,98 @@
 # Changelog
 
+## OIRAN API 2.14.11 — 2026-11-13 — index compact du JSONL (latence < 500 ms, RAM bornée)
+
+Constat ANR1 (#10 6860508699) : `oiran_events.jsonl` de prod = **3 393 914 516 octets, 1 554 682 lignes**. La 2.14.9 relit ce fichier à chaque session **non cachée** (streaming + filtrage par `event_id`) : ~35 s pour 2 Go observé → ~60 s pour 3,4 Go extrapolé. Inutilisable en interactif. Le changement de plan d'ANR1 (confirmé) : la 2.14.9 ne sera pas déployée seule, ANR1 pousse directement la 2.14.11 qui contient 2.14.9 et 2.14.10.
+
+### Principe du correctif
+
+L'index compact `hash(event_id) → byte offset` est construit UNE fois au démarrage, en arrière-plan, par un worker tokio, et étendu de manière incrémentale depuis `last_offset` toutes les `OIRAN_READ_TIME_PATCH_INDEX_POLL_SECS` secondes (défaut 30 s). L'index tient en RAM seulement — **aucune écriture disque**. Chaque lecture de session fait alors `seek(offset)` + lecture d'une ligne par `event_id` demandé, au lieu d'un re-scan du JSONL en entier.
+
+### Nouveaux modules
+
+- **`read_time_patch::CompactJsonlIndex`** (`apps/api/src/read_time_patch.rs`) : struct par fichier JSONL. Expose `build_initial`, `extend_from_tail`, `get_raw_value(event_id) -> Option<Value>`, `claim_build` (idempotent). Compteurs atomiques : `entries`, `bytes_estimate`, `build_ms`, `last_offset`, `hash_collisions`, `ready`. Budget RAM public `MEMORY_BUDGET_BYTES = 64 MiB`.
+- **`read_time_patch::CompactJsonlIndexRegistry`** : registre par `dataset_root` canonicalisé. `ensure_tracking(dataset_root) -> Arc<DatasetIndexes>` idempotent (flat JSONL + chaque shard). `snapshot_into_counters()` pousse l'état agrégé vers `PatchCounters.index_*` → exposé sous `/api/v1/version.read_time_patch.index.*`.
+- **`read_time_patch::scoped_index_from_compact`** : construit un `RawEventIndex` scoped à `wanted` en interrogeant l'index compact (une lookup par `event_id`). Garde la même signature que l'ancien `from_dataset_root_for_event_ids` pour `patch_flow_events`.
+
+### Statut explicite (`read_time_patch.status`)
+
+- Nouvelle enum `PatchStatus { Applied, IndexBuilding, NotApplicable }` renvoyée par `apply_read_time_patch`. Jamais une correction silencieuse :
+  - Index pas prêt → `IndexBuilding`. Le handler marque `meta.read_time_patch.status = "index_building"` (events servis TELS QUELS).
+  - Patch appliqué → `Applied`. Le handler marque `meta.read_time_patch.status = "applied"`.
+  - Rien à patcher (items vide, pas de dataset_root, LTE evidence) → `NotApplicable`. Le handler n'ajoute pas le champ.
+- Helper `paginated_with_patch_status(items, query, status)` : injecte le label dans `meta.read_time_patch` sans dupliquer la logique de `paginated`.
+- La session summary (`sessions()` handler) porte le même marqueur à la racine de chaque entrée quand le patch n'est pas appliqué.
+
+### Collisions hash
+
+Hash 64 bits (`DefaultHasher`) sur l'`event_id`. Pour 1,55 M entrées, p(collision) ≈ 6×10⁻⁸. Détection à la lecture : si la ligne lue à `offset` n'a pas le même `event_id` que celui demandé → événement non patché, compteur `index.hash_collisions++`. Zéro collision attendue en prod.
+
+### Mise à jour incrémentale
+
+`extend_from_tail` lit depuis `last_offset` ; `oiran_events.jsonl` étant append-only (confirmé par `live-probe/src/lib.rs:6787`), les offsets déjà indexés restent valides. Le worker tourne tant que le service vit, sans ré-initialisation.
+
+### Compteurs `/api/v1/version.read_time_patch.index.*`
+
+```
+index: {
+  entries,         # nombre d'event_ids indexés (tous fichiers du root)
+  bytes,           # estimation RAM agrégée (budget 64 MiB)
+  build_ms,        # durée de la construction initiale la plus longue
+  last_offset,     # octets scannés (incrémental, après extend_from_tail)
+  ready,           # true une fois le build initial terminé pour TOUS les fichiers
+  building_responses,  # requêtes servies avec status=index_building
+  hash_collisions,     # collisions hash observées (attendu 0 en prod)
+  hits, misses,        # resolutions index (hit = raw Value fournie, miss = event_id absent)
+}
+```
+
+### Test de charge `read_time_patch_compact_index_bounded_and_fast_on_large_jsonl`
+
+`#[ignore]`, exécution explicite. Génère un JSONL synthétique de taille `OIRAN_READ_TIME_PATCH_LOAD_TEST_BYTES` (défaut **3 400 000 000 octets**, soit le volume prod ANR1), démarre `AppState`, attend `index.ready == true` (timeout 180 s, poll 100 ms), puis mesure :
+
+- VmHWM après construction + 2 lectures de session → **< 512 MiB**.
+- `index.bytes` → **≤ 64 MiB** (borne publique `CompactJsonlIndex::MEMORY_BUDGET_BYTES`).
+- Latence de chaque requête `GET /sessions/<id>/events` → **< 500 ms** (seek + read, pas de re-scan).
+- Chaque événement de la session doit porter `source_participant ∈ {eNB, MME}` et `read_time_patch.fields` (patch effectivement appliqué).
+- Statut de la toute première requête : `applied` ou `index_building` (aucune autre valeur acceptée — jamais de correction silencieuse).
+
+Exécution :
+```
+OIRAN_READ_TIME_PATCH_LOAD_TEST_BYTES=3400000000 \
+  cargo test --release --locked -p oiran-api --lib -- --ignored \
+  read_time_patch_compact_index_bounded_and_fast_on_large_jsonl
+```
+
+### Rétro-compatibilité
+
+- `RawEventIndex::from_jsonl_path` / `from_dataset_root_for_event_ids` restent publiques, utilisées par le chargement initial (reference mode) et par les tests unitaires.
+- `RawIndexCache` (LRU 2.14.9) reste présent dans l'API publique mais n'est plus consommé par `apply_read_time_patch` — le hot path SERVING passe par l'index compact. Le champ `cache.*` de `/version` reste exposé à 0 en opérationnel.
+
+### Preuves (ce lot, 2026-11-13)
+
+```
+$ df -h /home/devmat
+/dev/sda1       388G  372G   16G  96% /
+
+$ cargo test --release --locked --workspace --no-fail-fast
+# 77 suites, 541 passed, 0 failed, 9 ignored, exit 0
+
+$ cargo test --release --locked --workspace --no-fail-fast -- --test-threads=1
+# 77 suites, 541 passed, 0 failed, 9 ignored, exit 0
+
+$ cargo build --release --locked --workspace
+Finished `release` profile [optimized] target(s) in 1m 34s
+
+$ OIRAN_READ_TIME_PATCH_LOAD_TEST_BYTES=3400000000 \
+    cargo test --release --locked -p oiran-api --lib -- --ignored --nocapture \
+    read_time_patch_compact_index_bounded_and_fast_on_large_jsonl
+COMPACT_INDEX entries=1481738 bytes_estimate=28 MiB build_ms=4362 last_offset=3243 MiB jsonl_size=3243 MiB
+VmHWM before=3 MiB, after=58 MiB, threshold=512 MiB, jsonl_size=3243 MiB
+test result: ok. 1 passed; 0 failed; 0 ignored; finished in 29.49s
+```
+
+Lecture : 3,24 GiB de JSONL → 1 481 738 entrées indexées, index compact = **28 MiB** (< 64 MiB budget), construction = **4,36 s**, VmHWM = **58 MiB** (< 512 MiB borne). Les deux `GET /sessions/<id>/events` servis sous 500 ms (assertion `elapsed.as_millis() < 500` passée). Cleanup `AutoRemoveDir` vérifié : disque 372 G → 372 G avant/après, 0 Mo d'artefact résiduel.
+
 ## OIRAN API 2.14.10 / capture-helper 0.1.1 / worker-runtime 0.3.1 — 2026-11-13 — capture-helper indépendant du disque + worker-runtime déterministe
 
 Les 11 échecs `capture-helper` et le 12e (`worker-runtime::queue_saturation_is_bounded_and_accounted`) dépendaient de l'état physique de la machine. Le disque de ce runner est à **95 %** (`df -h /home/devmat/OIRAN-POLARIS` → `/dev/sda1 388G 365G 23G 95% /`) ; sous `Policy::default().stop_percent = 98` la marge est de ~3 % — toute pression disque transitoire ré-active les 11 échecs. Lot 2.14.10 supprime la dépendance.

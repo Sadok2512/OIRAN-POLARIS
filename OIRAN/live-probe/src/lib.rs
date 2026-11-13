@@ -1716,7 +1716,31 @@ impl CaptureManager {
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
             pseudonym_key: Arc::new(pseudonym_key),
             interface_probe,
-            disk_sample_override_for_tests: None,
+            // 2.14.11 (ANR1 #10 6860508699) — override test-only par
+            // défaut à `None` (production). Les tests internes
+            // live-probe installent une valeur permissive via
+            // `set_disk_sample_override_for_tests` en une passe au
+            // constructeur, pour que les ~20 tests qui écrivent de
+            // vrais pcap (continuous_*, anr2_layout_*, etc.) ne
+            // dépendent pas du taux de remplissage du runner. La
+            // branche `#[cfg(test)]` n'affecte PAS les consommateurs
+            // (oiran-api, etc.) : cfg(test) ne traverse pas les
+            // crates.
+            disk_sample_override_for_tests: {
+                #[cfg(test)]
+                {
+                    Some(Ok(disk_safety::FilesystemSample {
+                        total_bytes: 500 * 1024 * 1024 * 1024,
+                        available_bytes: 450 * 1024 * 1024 * 1024,
+                        total_inodes: 10_000_000,
+                        available_inodes: 9_000_000,
+                    }))
+                }
+                #[cfg(not(test))]
+                {
+                    None
+                }
+            },
         };
         manager.recover_registry()?;
         manager.load_recovery_registry()?;
@@ -1863,16 +1887,25 @@ impl CaptureManager {
         self.policy = policy;
     }
 
+    /// 2.14.11 (ANR1 #10 6860508699) — centralise le choix entre
+    /// override test et mesure sysfs. Toute consultation disque (depuis
+    /// `validate()` ou `run_continuous_import`) DOIT passer par ici :
+    /// sans cela, un chemin qui lit `measure_path(&self.root)` directement
+    /// bypass l'override installé par les tests et retombe sous
+    /// DISK_SAFETY dès que le runner dépasse ~97 %.
+    fn effective_disk_sample(&self) -> Result<disk_safety::FilesystemSample, String> {
+        self.disk_sample_override_for_tests
+            .clone()
+            .unwrap_or_else(|| measure_path(&self.root))
+    }
+
     pub fn validate(&self, request: &CaptureRequest) -> ValidationResult {
         let interfaces = self.interfaces();
         let mut blockers = validate_request(request, &interfaces, self.policy);
         if !self.execution_enabled() {
             blockers.push("CAPTURE_EXECUTION_NOT_ENABLED".into());
         }
-        let sample = self
-            .disk_sample_override_for_tests
-            .clone()
-            .unwrap_or_else(|| measure_path(&self.root));
+        let sample = self.effective_disk_sample();
         let disk_decision = assess(sample.clone(), self.policy);
         let budget = capture_budget(sample, request.max_bytes, self.policy);
         if !budget.allowed {
@@ -3444,8 +3477,11 @@ impl CaptureManager {
                     ));
                     break;
                 }
-                let budget =
-                    capture_budget(measure_path(&self.root), candidate.size_bytes, self.policy);
+                let budget = capture_budget(
+                    self.effective_disk_sample(),
+                    candidate.size_bytes,
+                    self.policy,
+                );
                 if !budget.allowed {
                     // 2.9.8 (#9 comment 6725097122): same per-segment
                     // log pattern for the disk-safety path — never
@@ -11451,6 +11487,57 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// 2.14.11 (ANR1 #10 6860508699) — preuve que l'override test-only
+    /// du `FilesystemSample` sur `CaptureManager` fonctionne **dans les
+    /// deux sens** :
+    ///   - les tests continuous_* / anr2_layout_* / full_ring_* / etc.
+    ///     installent par défaut un disque sain à 10 % d'utilisation
+    ///     (`CaptureManager::new` sous `#[cfg(test)]`) et passent quel
+    ///     que soit le taux réel du runner ;
+    ///   - ce test-ci réinstalle un disque **saturé à 99 %** avec la
+    ///     Policy production (`Policy::default()`, `stop_percent = 98`)
+    ///     → `validate()` DOIT refuser avec le blocker
+    ///     `CAPTURE_STORAGE_BUDGET_REJECTED`.
+    ///
+    /// Si l'override était silencieusement ignoré, le refus ne serait
+    /// pas déclenché (le runner à 96 % passerait sous `stop_percent =
+    /// 98`). La preuve est donc double : symétrie de l'override +
+    /// chaîne `effective_disk_sample → validate → capture_budget`
+    /// correctement branchée.
+    #[test]
+    fn injected_disk_sample_at_99_percent_rejects_capture_with_budget_blocker() {
+        let root = temporary_root("continuous-injected-99-refusal");
+        let mut manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        // Disque saturé : 500 GiB total, 5 GiB libres → ~99,00 %.
+        let saturated = disk_safety::FilesystemSample {
+            total_bytes: 500 * 1024 * 1024 * 1024,
+            available_bytes: 5 * 1024 * 1024 * 1024,
+            total_inodes: 10_000_000,
+            available_inodes: 9_000_000,
+        };
+        manager.set_disk_sample_override_for_tests(Some(Ok(saturated)));
+        // Policy production (stop_percent = 98).
+        manager.set_policy_for_tests(Policy::default());
+        let request = CaptureRequest {
+            scenario_id: None,
+            ..CaptureRequest::default()
+        };
+        let outcome = manager.validate(&request);
+        assert!(
+            outcome
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "CAPTURE_STORAGE_BUDGET_REJECTED"),
+            "expected CAPTURE_STORAGE_BUDGET_REJECTED in blockers, got {:?}",
+            outcome.blockers
+        );
     }
 
     fn skip_if_disk_too_full(reason: &str) -> bool {

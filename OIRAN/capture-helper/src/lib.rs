@@ -224,6 +224,16 @@ impl<B: CaptureBackend> Clone for CaptureService<B> {
     }
 }
 
+/// 2.14.11 (ANR1 #10 6860508699) — closure réentrante qui retourne
+/// l'échantillon disque effectif pour un chemin donné. Partagée entre
+/// `ServiceInner` et `WriterSet` (dans un thread de capture) pour que
+/// les sites d'écriture (`CaptureGuard::start`, `authorize_write`)
+/// honorent le même override que `validate_spec`. En prod, la closure
+/// appelle `measure_path` ; en test, elle retourne un
+/// `Some(Result::Ok(FilesystemSample))` figé.
+pub(crate) type DiskSampleFn =
+    Arc<dyn Fn(&Path) -> Result<FilesystemSample, String> + Send + Sync>;
+
 struct ServiceInner<B: CaptureBackend> {
     config: ServerConfig,
     backend: Arc<B>,
@@ -243,6 +253,23 @@ struct ServiceInner<B: CaptureBackend> {
     /// `Some(Policy::default())` sinon pour une politique permissive
     /// (seuils 100 %, réserve 0) qui n'entrave pas les tests unit.
     test_policy_override: Mutex<Option<Policy>>,
+}
+
+impl<B: CaptureBackend> ServiceInner<B> {
+    /// 2.14.11 — même logique que `CaptureService::effective_disk_sample`,
+    /// mais exposée directement sur `ServiceInner` pour pouvoir être
+    /// appelée depuis une closure qui ne détient qu'un `Arc<ServiceInner>`.
+    fn effective_disk_sample_from_inner(
+        inner: &Arc<ServiceInner<B>>,
+        path: &Path,
+    ) -> Result<FilesystemSample, String> {
+        if let Ok(guard) = inner.test_disk_sample_override.lock() {
+            if let Some(sample) = guard.clone() {
+                return sample;
+            }
+        }
+        measure_path(path)
+    }
 }
 
 impl<B: CaptureBackend> CaptureService<B> {
@@ -438,12 +465,21 @@ impl<B: CaptureBackend> CaptureService<B> {
         &self,
         path: &Path,
     ) -> Result<FilesystemSample, String> {
-        if let Ok(guard) = self.inner.test_disk_sample_override.lock() {
-            if let Some(sample) = guard.clone() {
-                return sample;
-            }
-        }
-        measure_path(path)
+        ServiceInner::<B>::effective_disk_sample_from_inner(&self.inner, path)
+    }
+
+    /// 2.14.11 (ANR1 #10 6860508699) — closure qui capture l'`Arc<ServiceInner>`
+    /// et expose `effective_disk_sample` au `WriterSet`. Nécessaire pour
+    /// que les sites d'écriture (`CaptureGuard::start`, `authorize_write`)
+    /// consultent l'override au lieu de `measure_path` qui lit le disque
+    /// physique. Sans cette closure, les 15 tests capture-helper /
+    /// live-probe qui écrivent de vrais pcap tombent sous DISK_SAFETY
+    /// dès que le runner passe ~97 % de remplissage.
+    fn effective_disk_sample_fn(&self) -> DiskSampleFn {
+        let inner = self.inner.clone();
+        Arc::new(move |path: &Path| {
+            ServiceInner::<B>::effective_disk_sample_from_inner(&inner, path)
+        })
     }
 
     fn validate_spec(&self, spec: &CaptureSpec) -> Result<(), HelperFailure> {
@@ -614,7 +650,12 @@ impl<B: CaptureBackend> CaptureService<B> {
         let pcap_root = output.join("pcap");
         fs::create_dir_all(&pcap_root)
             .map_err(|error| failure("STORAGE_INITIALIZATION", error.to_string()))?;
-        let mut writers = WriterSet::new(&pcap_root, spec, self.inner.config.policy)?;
+        let mut writers = WriterSet::new(
+            &pcap_root,
+            spec,
+            self.effective_policy(),
+            self.effective_disk_sample_fn(),
+        )?;
         self.update(&spec.capture_id, |job| {
             job.state = HelperState::Capturing;
             job.started_epoch_ms = Some(epoch_ms());
@@ -1116,17 +1157,27 @@ struct WriterSet {
     packets: u64,
     captured_bytes: u64,
     storage_bytes: u64,
+    /// 2.14.11 — closure injectée par le service (prod → `measure_path`,
+    /// test → override figé). Partagée avec `ServiceInner` pour que
+    /// `CaptureGuard::start` + `authorize_write` consultent LA MÊME
+    /// source de vérité que `validate_spec`.
+    disk_sample_fn: DiskSampleFn,
 }
 
 impl WriterSet {
-    fn new(root: &Path, spec: &CaptureSpec, policy: Policy) -> Result<Self, HelperFailure> {
+    fn new(
+        root: &Path,
+        spec: &CaptureSpec,
+        policy: Policy,
+        disk_sample_fn: DiskSampleFn,
+    ) -> Result<Self, HelperFailure> {
         let segments = (spec.interfaces.len() as u64)
             .saturating_mul(u64::from(spec.rotation_files))
             .max(1);
         let max_file_bytes = (spec.max_bytes / segments)
             .max(PCAP_GLOBAL_HEADER_BYTES + PCAP_RECORD_HEADER_BYTES + 1)
             .min(policy.max_file_bytes);
-        let guard = CaptureGuard::start(measure_path(root), spec.max_bytes, policy)
+        let guard = CaptureGuard::start((disk_sample_fn)(root), spec.max_bytes, policy)
             .map_err(|error| failure("DISK_SAFETY", error))?;
         let writers = spec
             .interfaces
@@ -1145,6 +1196,7 @@ impl WriterSet {
             packets: 0,
             captured_bytes: 0,
             storage_bytes: 0,
+            disk_sample_fn,
         })
     }
 
@@ -1157,7 +1209,7 @@ impl WriterSet {
         })?;
         let required = writer.additional_bytes(packet.data.len());
         self.guard
-            .authorize_write(required, measure_path(&self.root))
+            .authorize_write(required, (self.disk_sample_fn)(&self.root))
             .map_err(|error| failure("DISK_SAFETY", error))?;
         self.storage_bytes = self.storage_bytes.saturating_add(writer.write(&packet)?);
         self.packets += 1;
@@ -1170,7 +1222,7 @@ impl WriterSet {
         for writer in self.writers.values_mut() {
             if writer.file.is_none() {
                 self.guard
-                    .authorize_write(PCAP_GLOBAL_HEADER_BYTES, measure_path(&self.root))
+                    .authorize_write(PCAP_GLOBAL_HEADER_BYTES, (self.disk_sample_fn)(&self.root))
                     .map_err(|error| failure("DISK_SAFETY", error))?;
                 self.storage_bytes = self.storage_bytes.saturating_add(PCAP_GLOBAL_HEADER_BYTES);
             }
@@ -1655,7 +1707,13 @@ mod tests {
             max_bytes: 64 * 1024 * 1024,
             rotation_files: 4,
         };
-        let writers = WriterSet::new(&capture_root, &spec, Policy::default()).unwrap();
+        // 2.14.11 — même override que le helper `service()` : disque
+        // sain injecté pour que le test ne dépende pas de l'état réel
+        // du runner (97 % chez devmat).
+        let disk_sample_fn: DiskSampleFn =
+            Arc::new(|_: &Path| Ok(permissive_disk_sample()));
+        let writers =
+            WriterSet::new(&capture_root, &spec, permissive_policy(), disk_sample_fn).unwrap();
         assert_eq!(writers.writers.len(), MAX_CAPTURE_PLANES);
         let allocated = writers
             .writers

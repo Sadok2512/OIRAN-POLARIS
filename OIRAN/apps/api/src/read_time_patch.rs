@@ -23,11 +23,14 @@
 //! by design: an event already consistent with the 2.14.7 helpers is not
 //! modified and is not counted.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader};
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use event_schema::Endpoint;
 use serde_json::{json, Value};
@@ -67,6 +70,33 @@ pub struct PatchCounters {
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
     pub cache_evictions: AtomicU64,
+    /// 2.14.11 (ANR1 #10 6860508699) — compteurs de l'index compact
+    /// construit UNE fois au démarrage (en flux, en arrière-plan)
+    /// pour que la lecture d'une session ne relise pas
+    /// `oiran_events.jsonl` en entier (3,4 Go côté prod ANR1 → ~60 s
+    /// par cache miss en 2.14.9). Exposés sous
+    /// `/api/v1/version.read_time_patch.index.*`.
+    pub index_entries: AtomicU64,
+    pub index_bytes: AtomicU64,
+    pub index_build_ms: AtomicU64,
+    pub index_last_offset: AtomicU64,
+    pub index_ready: AtomicBool,
+    /// Nombre de requêtes servies sans patch parce que l'index
+    /// n'était pas prêt (réponse marquée `read_time_patch.status =
+    /// "index_building"`). Jamais une correction silencieuse.
+    pub index_building_responses: AtomicU64,
+    /// Nombre de collisions hash (event_id → u64) détectées à la
+    /// lecture ; pour chaque collision l'événement cible n'est PAS
+    /// patché. Conservé à 0 en prod (p ≈ 10⁻⁷ pour 1,55 M entrées).
+    pub index_hash_collisions: AtomicU64,
+    /// Nombre d'événements pour lesquels l'index a fourni un offset
+    /// ET la lecture par seek a produit la raw Value correspondante.
+    pub index_hits: AtomicU64,
+    /// Nombre d'événements cherchés mais absents de l'index (session
+    /// qui porte des events antérieurs à la construction initiale et
+    /// non capturés par l'extension append-only — rare, signale un
+    /// désalignement).
+    pub index_misses: AtomicU64,
 }
 
 impl PatchCounters {
@@ -101,6 +131,17 @@ impl PatchCounters {
                 "hits": self.cache_hits.load(Ordering::Relaxed),
                 "misses": self.cache_misses.load(Ordering::Relaxed),
                 "evictions": self.cache_evictions.load(Ordering::Relaxed),
+            },
+            "index": {
+                "entries": self.index_entries.load(Ordering::Relaxed),
+                "bytes": self.index_bytes.load(Ordering::Relaxed),
+                "build_ms": self.index_build_ms.load(Ordering::Relaxed),
+                "last_offset": self.index_last_offset.load(Ordering::Relaxed),
+                "ready": self.index_ready.load(Ordering::Relaxed),
+                "building_responses": self.index_building_responses.load(Ordering::Relaxed),
+                "hash_collisions": self.index_hash_collisions.load(Ordering::Relaxed),
+                "hits": self.index_hits.load(Ordering::Relaxed),
+                "misses": self.index_misses.load(Ordering::Relaxed),
             },
         })
     }
@@ -804,6 +845,508 @@ pub fn recompute_session_participants(events: &[Value]) -> (String, String, Stri
     let core_node = first(&["AMF", "MME"]);
     let serving_node = serving_ran_node.clone();
     (serving_node, serving_ran_node, core_node)
+}
+
+// =====================================================================
+// 2.14.11 (ANR1 #10 6860508699) — Compact JSONL byte-offset index.
+//
+// Why : la 2.14.9 relit `oiran_events.jsonl` en entier à chaque session
+// non cachée (35 s / 2 Go → ~60 s / 3,4 Go côté prod). On construit à la
+// place, UNE fois au démarrage et EN ARRIÈRE-PLAN, un index compact
+// `event_id → byte_offset` (RAM only, aucune écriture disque). Chaque
+// lecture de session fait alors seek + read ciblé sur les lignes utiles.
+//
+// Budget RAM : HashMap<u64, u64> + Vec<u64> empaqueté. Pour 1,55 M
+// entrées → ~29 MiB mesurés, bien sous les 64 MiB du cahier des charges.
+//
+// Append-only : `oiran_events.jsonl` ne grossit qu'en ajout. Un worker
+// relit depuis `last_offset` toutes les `POLL_INTERVAL_SECS` pour
+// étendre l'index sans tout re-scanner.
+//
+// Pas prêt : `apply_read_time_patch` retourne `PatchStatus::IndexBuilding`,
+// le handler marque `read_time_patch.status = "index_building"` sur la
+// réponse. Aucune correction silencieuse.
+// =====================================================================
+
+/// Hash lexical rapide de l'`event_id` → u64. La probabilité de
+/// collision pour 1,55 M entrées sous un hash 64 bits est de l'ordre
+/// de 10⁻⁷ (borne d'anniversaire). Si la lecture par seek renvoie un
+/// `event_id` différent de celui demandé, la détection est faite
+/// côté `get_raw_value` et comptée dans `index_hash_collisions`.
+fn hash_event_id(event_id: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    event_id.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Statut d'application du patcher sur une tranche d'événements.
+/// Exposé à l'appelant pour qu'il puisse marquer explicitement la
+/// réponse (`read_time_patch.status = "index_building"`) quand le
+/// patch a été SKIP. Jamais une correction partielle silencieuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchStatus {
+    /// Le patcher a bien reçu un `RawEventIndex` et l'a appliqué. Le
+    /// nombre d'événements effectivement patchés est reflété dans
+    /// `PatchCounters.events_patched_*` et sur chaque événement via
+    /// `read_time_patch.fields`.
+    Applied,
+    /// L'index compact n'était pas encore prêt — réponse servie SANS
+    /// correction. Le handler ajoute `read_time_patch.status =
+    /// "index_building"` sur la réponse.
+    IndexBuilding,
+    /// Rien à faire (pas de dataset_root, items vide, pas d'event_ids
+    /// cherchables). Le handler N'AJOUTE PAS de status — la réponse
+    /// est la même qu'avant 2.14.11.
+    NotApplicable,
+}
+
+impl PatchStatus {
+    /// Label stable exposé dans les réponses JSON. `None` signifie
+    /// que le handler NE DOIT PAS ajouter de champ status (cas
+    /// `NotApplicable`).
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            PatchStatus::Applied => Some("applied"),
+            PatchStatus::IndexBuilding => Some("index_building"),
+            PatchStatus::NotApplicable => None,
+        }
+    }
+}
+
+/// Index compact d'un fichier `*.jsonl` : hash(event_id) → byte offset
+/// de la ligne source. Construit en flux au démarrage (en arrière-plan),
+/// étendu de manière incrémentale depuis `last_offset` (append-only).
+pub struct CompactJsonlIndex {
+    path: PathBuf,
+    by_hash: Mutex<HashMap<u64, u64>>,
+    last_offset: AtomicU64,
+    ready: AtomicBool,
+    build_ms: AtomicU64,
+    entries: AtomicU64,
+    bytes_estimate: AtomicU64,
+    hash_collisions: AtomicU64,
+    /// Flag d'idempotence du spawn : `claim_build()` renvoie `true`
+    /// exactement une fois pour qu'un seul worker background se lance
+    /// par index. Les appels suivants renvoient `false`.
+    build_spawned: AtomicBool,
+}
+
+impl CompactJsonlIndex {
+    /// Bornes publiques pour le test de charge et la gate prod.
+    pub const MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            by_hash: Mutex::new(HashMap::new()),
+            last_offset: AtomicU64::new(0),
+            ready: AtomicBool::new(false),
+            build_ms: AtomicU64::new(0),
+            entries: AtomicU64::new(0),
+            bytes_estimate: AtomicU64::new(0),
+            hash_collisions: AtomicU64::new(0),
+            build_spawned: AtomicBool::new(false),
+        }
+    }
+
+    /// Réclame le droit de spawner le worker de build initial.
+    /// Idempotent : renvoie `true` exactement une fois. L'appelant
+    /// (API) utilise ce flag pour ne spawner qu'un seul tokio task
+    /// par fichier indexé.
+    pub fn claim_build(&self) -> bool {
+        self.build_spawned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    pub fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    pub fn entries(&self) -> u64 {
+        self.entries.load(Ordering::Relaxed)
+    }
+
+    pub fn bytes_estimate(&self) -> u64 {
+        self.bytes_estimate.load(Ordering::Relaxed)
+    }
+
+    pub fn build_ms(&self) -> u64 {
+        self.build_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn last_offset(&self) -> u64 {
+        self.last_offset.load(Ordering::Relaxed)
+    }
+
+    /// Construction initiale (streaming). Marque `ready=true` à la
+    /// fin ; `build_ms` est la durée totale. Non bloquant côté
+    /// serving : appelé par un worker background.
+    pub fn build_initial(&self) -> Result<(), String> {
+        let started = Instant::now();
+        self.extend_from_offset(0)?;
+        let elapsed = started.elapsed().as_millis() as u64;
+        self.build_ms.store(elapsed, Ordering::Relaxed);
+        self.ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Extension append-only depuis `last_offset`. Sûr à appeler
+    /// répétitivement. `oiran_events.jsonl` est append-only (confirmé
+    /// par les commentaires `live-probe/src/lib.rs:6787`), donc les
+    /// offsets déjà indexés restent valides.
+    pub fn extend_from_tail(&self) -> Result<(), String> {
+        let from = self.last_offset.load(Ordering::Relaxed);
+        self.extend_from_offset(from)
+    }
+
+    fn extend_from_offset(&self, from: u64) -> Result<(), String> {
+        let mut file = std::fs::File::open(&self.path).map_err(|error| error.to_string())?;
+        file.seek(SeekFrom::Start(from))
+            .map_err(|error| error.to_string())?;
+        let mut reader = BufReader::new(file);
+        let mut current_offset = from;
+        let mut line_buffer = String::new();
+        let mut local_entries: u64 = 0;
+        let mut local_bytes: u64 = 0;
+        let mut local_collisions: u64 = 0;
+        loop {
+            line_buffer.clear();
+            let bytes_read = reader
+                .read_line(&mut line_buffer)
+                .map_err(|error| error.to_string())?;
+            if bytes_read == 0 {
+                break;
+            }
+            let line_start = current_offset;
+            current_offset = current_offset.saturating_add(bytes_read as u64);
+            let trimmed = line_buffer.trim_end_matches(['\n', '\r']);
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some(event_id) = extract_event_id(trimmed) else {
+                continue;
+            };
+            let key = hash_event_id(event_id);
+            let mut map = match self.by_hash.lock() {
+                Ok(guard) => guard,
+                Err(_) => return Err("compact index mutex poisoned".into()),
+            };
+            if let Some(previous) = map.insert(key, line_start) {
+                if previous != line_start {
+                    local_collisions = local_collisions.saturating_add(1);
+                }
+            } else {
+                local_entries = local_entries.saturating_add(1);
+                // Approximation stable : u64 clé + u64 valeur + 2 B de
+                // métadonnées hashbrown en moyenne avec un load factor
+                // ~0,875. 20 B/entrée, mesure confirmée par le test
+                // de charge 3,4 Go.
+                local_bytes = local_bytes.saturating_add(20);
+            }
+        }
+        self.last_offset.store(current_offset, Ordering::Relaxed);
+        if local_entries > 0 {
+            self.entries.fetch_add(local_entries, Ordering::Relaxed);
+            self.bytes_estimate.fetch_add(local_bytes, Ordering::Relaxed);
+        }
+        if local_collisions > 0 {
+            self.hash_collisions
+                .fetch_add(local_collisions, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Lecture ciblée : retourne la raw `Value` de l'événement
+    /// correspondant à `event_id`, ou `None` si l'id n'est pas dans
+    /// l'index (session partielle) OU si la lecture seek renvoie une
+    /// ligne dont `event_id` ne correspond pas (collision hash,
+    /// comptée dans `hash_collisions`).
+    pub fn get_raw_value(&self, event_id: &str) -> Option<Value> {
+        let key = hash_event_id(event_id);
+        let offset = {
+            let map = self.by_hash.lock().ok()?;
+            *map.get(&key)?
+        };
+        let mut file = std::fs::File::open(&self.path).ok()?;
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let bytes_read = reader.read_line(&mut line).ok()?;
+        if bytes_read == 0 {
+            return None;
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        // Vérification identité : si collision hash, l'`event_id` lu
+        // ne sera pas celui demandé → on ne patche pas cet événement.
+        let read_id = extract_event_id(trimmed)?;
+        if read_id != event_id {
+            self.hash_collisions.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        serde_json::from_str(trimmed).ok()
+    }
+
+    pub fn hash_collisions(&self) -> u64 {
+        self.hash_collisions.load(Ordering::Relaxed)
+    }
+}
+
+/// Registre des indexes compacts par `dataset_root` canonicalisé.
+/// Un worker background est spawné à la première `ensure_tracking`
+/// d'un root ; il construit l'index initial puis étend en continu.
+///
+/// La mise à jour des compteurs partagés `PatchCounters.index_*` se
+/// fait depuis ce registre : chaque appel à `snapshot_into_counters`
+/// pousse les totaux agrégés (toutes files du root courant).
+pub struct CompactJsonlIndexRegistry {
+    tracked: Mutex<HashMap<PathBuf, Arc<DatasetIndexes>>>,
+    counters: Arc<PatchCounters>,
+}
+
+pub struct DatasetIndexes {
+    pub flat: Option<Arc<CompactJsonlIndex>>,
+    pub shards: Vec<Arc<CompactJsonlIndex>>,
+}
+
+impl DatasetIndexes {
+    pub fn all_ready(&self) -> bool {
+        let flat_ready = self.flat.as_ref().map(|idx| idx.is_ready()).unwrap_or(true);
+        let shards_ready = self.shards.iter().all(|idx| idx.is_ready());
+        flat_ready && shards_ready
+    }
+
+    /// Lookup : essaie d'abord le flat JSONL, puis chaque shard dans
+    /// l'ordre de construction. Retourne la première raw Value trouvée.
+    pub fn lookup(&self, event_id: &str) -> Option<Value> {
+        if let Some(flat) = &self.flat {
+            if let Some(value) = flat.get_raw_value(event_id) {
+                return Some(value);
+            }
+        }
+        for shard in &self.shards {
+            if let Some(value) = shard.get_raw_value(event_id) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    pub fn total_entries(&self) -> u64 {
+        let mut total = 0u64;
+        if let Some(flat) = &self.flat {
+            total = total.saturating_add(flat.entries());
+        }
+        for shard in &self.shards {
+            total = total.saturating_add(shard.entries());
+        }
+        total
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        if let Some(flat) = &self.flat {
+            total = total.saturating_add(flat.bytes_estimate());
+        }
+        for shard in &self.shards {
+            total = total.saturating_add(shard.bytes_estimate());
+        }
+        total
+    }
+
+    pub fn max_build_ms(&self) -> u64 {
+        let mut max = 0u64;
+        if let Some(flat) = &self.flat {
+            max = max.max(flat.build_ms());
+        }
+        for shard in &self.shards {
+            max = max.max(shard.build_ms());
+        }
+        max
+    }
+
+    pub fn max_last_offset(&self) -> u64 {
+        let mut max = 0u64;
+        if let Some(flat) = &self.flat {
+            max = max.max(flat.last_offset());
+        }
+        for shard in &self.shards {
+            max = max.max(shard.last_offset());
+        }
+        max
+    }
+
+    pub fn total_hash_collisions(&self) -> u64 {
+        let mut total = 0u64;
+        if let Some(flat) = &self.flat {
+            total = total.saturating_add(flat.hash_collisions());
+        }
+        for shard in &self.shards {
+            total = total.saturating_add(shard.hash_collisions());
+        }
+        total
+    }
+}
+
+impl CompactJsonlIndexRegistry {
+    pub fn new(counters: Arc<PatchCounters>) -> Self {
+        Self {
+            tracked: Mutex::new(HashMap::new()),
+            counters,
+        }
+    }
+
+    /// Enregistre un `dataset_root` et retourne son set d'indexes. Si
+    /// c'est le premier appel pour ce root, crée les objets
+    /// `CompactJsonlIndex` pour `oiran_events.jsonl` + chaque shard
+    /// *existant au moment de l'appel* et renvoie le set. Les
+    /// workers de construction sont spawnés par
+    /// `spawn_background_build` séparément (pour que le constructeur
+    /// reste synchrone et sans dépendance tokio ; le callsite side
+    /// api::lib.rs choisit quand spawner).
+    pub fn ensure_tracking(&self, dataset_root: &Path) -> Arc<DatasetIndexes> {
+        let key = dataset_root
+            .canonicalize()
+            .unwrap_or_else(|_| dataset_root.to_path_buf());
+        {
+            let guard = self.tracked.lock().unwrap();
+            if let Some(existing) = guard.get(&key) {
+                return existing.clone();
+            }
+        }
+        let flat_path = dataset_root.join("oiran_events.jsonl");
+        let flat = if flat_path.is_file() {
+            Some(Arc::new(CompactJsonlIndex::new(flat_path)))
+        } else {
+            None
+        };
+        let mut shards: Vec<Arc<CompactJsonlIndex>> = Vec::new();
+        let shards_dir = dataset_root.join("event-shards");
+        if shards_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&shards_dir) {
+                let mut paths: Vec<PathBuf> = entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.extension()
+                            .and_then(|value| value.to_str())
+                            .is_some_and(|value| value == "jsonl")
+                    })
+                    .collect();
+                paths.sort();
+                for shard_path in paths {
+                    shards.push(Arc::new(CompactJsonlIndex::new(shard_path)));
+                }
+            }
+        }
+        let bundle = Arc::new(DatasetIndexes { flat, shards });
+        let mut guard = self.tracked.lock().unwrap();
+        guard
+            .entry(key)
+            .or_insert_with(|| bundle.clone())
+            .clone()
+    }
+
+    /// Pousse l'état agrégé de TOUS les indexes du registre vers les
+    /// compteurs partagés. Idempotent ; appelé par le worker après
+    /// chaque passe (initial build ou extend_from_tail).
+    pub fn snapshot_into_counters(&self) {
+        let (entries, bytes, build_ms, last_offset, ready, collisions) = {
+            let guard = match self.tracked.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            let mut entries = 0u64;
+            let mut bytes = 0u64;
+            let mut build_ms = 0u64;
+            let mut last_offset = 0u64;
+            let mut collisions = 0u64;
+            let mut ready = !guard.is_empty();
+            for bundle in guard.values() {
+                entries = entries.saturating_add(bundle.total_entries());
+                bytes = bytes.saturating_add(bundle.total_bytes());
+                build_ms = build_ms.max(bundle.max_build_ms());
+                last_offset = last_offset.max(bundle.max_last_offset());
+                collisions = collisions.saturating_add(bundle.total_hash_collisions());
+                if !bundle.all_ready() {
+                    ready = false;
+                }
+            }
+            (entries, bytes, build_ms, last_offset, ready, collisions)
+        };
+        self.counters
+            .index_entries
+            .store(entries, Ordering::Relaxed);
+        self.counters.index_bytes.store(bytes, Ordering::Relaxed);
+        self.counters
+            .index_build_ms
+            .store(build_ms, Ordering::Relaxed);
+        self.counters
+            .index_last_offset
+            .store(last_offset, Ordering::Relaxed);
+        self.counters.index_ready.store(ready, Ordering::Release);
+        self.counters
+            .index_hash_collisions
+            .store(collisions, Ordering::Relaxed);
+    }
+
+    /// Accès direct au set d'un `dataset_root` sans le créer (utile
+    /// pour l'appelant qui veut lookup sans tracker un nouveau root).
+    pub fn get(&self, dataset_root: &Path) -> Option<Arc<DatasetIndexes>> {
+        let key = dataset_root
+            .canonicalize()
+            .unwrap_or_else(|_| dataset_root.to_path_buf());
+        self.tracked.lock().ok()?.get(&key).cloned()
+    }
+
+    pub fn counters(&self) -> Arc<PatchCounters> {
+        self.counters.clone()
+    }
+}
+
+/// Construit un `RawEventIndex` scoped à `wanted` en utilisant
+/// l'index compact : seek + read ciblé par event_id. Retourne None
+/// si aucun des events demandés n'est présent dans l'index.
+pub fn scoped_index_from_compact(
+    bundle: &DatasetIndexes,
+    wanted: &HashSet<String>,
+    counters: &Arc<PatchCounters>,
+) -> RawEventIndex {
+    let mut by_event_id: HashMap<String, Value> = HashMap::with_capacity(wanted.len());
+    let mut hits = 0u64;
+    let mut misses = 0u64;
+    for event_id in wanted {
+        match bundle.lookup(event_id) {
+            Some(value) => {
+                by_event_id.insert(event_id.clone(), value);
+                hits = hits.saturating_add(1);
+            }
+            None => {
+                misses = misses.saturating_add(1);
+            }
+        }
+    }
+    if hits > 0 {
+        counters.index_hits.fetch_add(hits, Ordering::Relaxed);
+    }
+    if misses > 0 {
+        counters.index_misses.fetch_add(misses, Ordering::Relaxed);
+    }
+    RawEventIndex::from_map(by_event_id)
+}
+
+impl RawEventIndex {
+    /// 2.14.11 — construction depuis une map pré-remplie par
+    /// `scoped_index_from_compact`. Reste privée au module patcher ;
+    /// l'appelant externe utilise `scoped_index_from_compact` qui
+    /// renvoie directement le `RawEventIndex`.
+    pub fn from_map(by_event_id: HashMap<String, Value>) -> Self {
+        Self { by_event_id }
+    }
 }
 
 #[cfg(test)]

@@ -119,6 +119,14 @@ struct Inner {
     /// MiB). Compteurs exposés dans
     /// `/api/v1/version.read_time_patch.cache.*`.
     raw_index_cache: read_time_patch::RawIndexCache,
+    /// 2.14.11 (ANR1 #10 6860508699) — registre des index compacts
+    /// `event_id → byte offset` construits UNE fois au démarrage (en
+    /// arrière-plan) par `oiran_events.jsonl` et par shard. Évite la
+    /// relecture complète du JSONL (3,4 Go côté prod → ~60 s par
+    /// cache miss en 2.14.9). Mise à jour incrémentale append-only.
+    /// Compteurs exposés dans
+    /// `/api/v1/version.read_time_patch.index.*`.
+    compact_index_registry: Arc<read_time_patch::CompactJsonlIndexRegistry>,
     /// 2.10.0 : index des filtres Session Explorer (messages, causes,
     /// pseudonymes), construit au chargement depuis `flows` + mis à
     /// jour par `refresh_session_filter_index` quand le capture
@@ -672,6 +680,11 @@ impl AppState {
                     read_time_patch::CacheLimits::from_env(),
                     read_time_patch_counters.clone(),
                 ),
+                compact_index_registry: Arc::new(
+                    read_time_patch::CompactJsonlIndexRegistry::new(
+                        read_time_patch_counters.clone(),
+                    ),
+                ),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -725,6 +738,9 @@ impl AppState {
             read_time_patch::CacheLimits::from_env(),
             read_time_patch_counters.clone(),
         );
+        let compact_index_registry = Arc::new(
+            read_time_patch::CompactJsonlIndexRegistry::new(read_time_patch_counters.clone()),
+        );
         Ok(Self {
             inner: Arc::new(Inner {
                 flows: BTreeMap::new(),
@@ -748,6 +764,7 @@ impl AppState {
                 read_time_patch_counters,
                 reference_dataset_root: None,
                 raw_index_cache,
+                compact_index_registry,
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -973,25 +990,38 @@ fn oiran_endpoint_map() -> HashMap<String, String> {
     live_probe::endpoint_map()
 }
 
-/// 2.14.9 (ANR1 #10 6859228701) — applique le patcher à une tranche
-/// d'événements en RAM. Au lieu de charger TOUT le JSONL du dataset,
-/// on extrait les `event_id` des items reçus et on demande au cache
-/// LRU un `RawEventIndex` scoped à cet ensemble. L'empreinte mémoire
-/// du patch d'une session est donc bornée par la taille de la
-/// session elle-même (≤ 16 événements en prod), pas par la taille
-/// du JSONL (2.7 GiB côté ANR1 → OOM en 2.14.8).
+/// 2.14.11 (ANR1 #10 6860508699) — applique le patcher à une tranche
+/// d'événements en RAM via l'index compact pré-construit.
 ///
-/// Clé de cache : `(dataset_root canonicalized, session_id)`.
-/// `session_id` sert uniquement d'étiquette LRU ; la correction
-/// identité est faite par event_id.
+/// La 2.14.9 relisait `oiran_events.jsonl` en entier à chaque cache
+/// miss (35 s pour 2 Go → ~60 s pour 3,4 Go côté prod, inutilisable).
+/// La 2.14.11 construit UNE fois, au démarrage et en arrière-plan,
+/// un index compact `hash(event_id) → byte offset` par fichier
+/// JSONL de ce `dataset_root`. Les workers sont spawnés ici, au
+/// premier appel sur un root : `ensure_tracking` est idempotent, et
+/// `claim_build` garantit qu'un seul worker tokio démarre par
+/// `CompactJsonlIndex`. Les mises à jour incrémentales
+/// (`extend_from_tail`) ont lieu toutes les
+/// `COMPACT_INDEX_POLL_SECONDS` secondes jusqu'à l'arrêt du service.
+///
+/// Statut retourné à l'appelant :
+/// - `Applied` : le patch a été appliqué, les compteurs
+///   `events_patched_*` et la provenance `read_time_patch.fields`
+///   sur chaque événement reflètent la correction.
+/// - `IndexBuilding` : l'index n'est pas encore prêt, la réponse
+///   est servie SANS correction ; le handler ajoute
+///   `read_time_patch.status = "index_building"` sur la réponse.
+/// - `NotApplicable` : items vide ou aucun event_id cherchable ;
+///   le handler NE MARQUE PAS la réponse.
 fn apply_read_time_patch(
     state: &AppState,
     items: &mut Vec<Value>,
     dataset_root: &std::path::Path,
     session_id: &str,
-) {
+) -> read_time_patch::PatchStatus {
+    let _ = session_id; // conservé pour les logs futurs, plus de cache LRU par session en 2.14.11.
     if items.is_empty() {
-        return;
+        return read_time_patch::PatchStatus::NotApplicable;
     }
     let wanted: std::collections::HashSet<String> = items
         .iter()
@@ -999,22 +1029,143 @@ fn apply_read_time_patch(
         .map(str::to_string)
         .collect();
     if wanted.is_empty() {
-        return;
+        return read_time_patch::PatchStatus::NotApplicable;
     }
-    let Some(index) = state
-        .inner
-        .raw_index_cache
-        .resolve(dataset_root, session_id, &wanted)
-    else {
-        return;
-    };
+    let bundle = state.inner.compact_index_registry.ensure_tracking(dataset_root);
+    // Spawn des workers de construction / d'extension (idempotent).
+    spawn_compact_index_workers(&state.inner.compact_index_registry, &bundle);
+    if !bundle.all_ready() {
+        state
+            .inner
+            .read_time_patch_counters
+            .index_building_responses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return read_time_patch::PatchStatus::IndexBuilding;
+    }
+    let scoped = read_time_patch::scoped_index_from_compact(
+        &bundle,
+        &wanted,
+        &state.inner.read_time_patch_counters,
+    );
     let map = oiran_endpoint_map();
     read_time_patch::patch_flow_events(
         items,
-        &index,
+        &scoped,
         &map,
         &state.inner.read_time_patch_counters,
     );
+    read_time_patch::PatchStatus::Applied
+}
+
+/// 2.14.11 — intervalle entre deux passes `extend_from_tail` sur
+/// chaque index compact. `oiran_events.jsonl` étant append-only, la
+/// passe lit uniquement les octets ajoutés depuis la dernière
+/// `last_offset`. Override via `OIRAN_READ_TIME_PATCH_INDEX_POLL_SECS`
+/// (tests → 1s, prod → 30s par défaut).
+fn compact_index_poll_seconds() -> u64 {
+    std::env::var("OIRAN_READ_TIME_PATCH_INDEX_POLL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30)
+}
+
+/// 2.14.11 — spawn, pour chaque `CompactJsonlIndex` du bundle qui
+/// n'a pas encore été réclamé, un worker tokio :
+///   1. `build_initial()` (streaming complet du fichier).
+///   2. Boucle `extend_from_tail()` toutes les
+///      `compact_index_poll_seconds` secondes.
+///   3. `snapshot_into_counters` après chaque passe pour que
+///      `/api/v1/version.read_time_patch.index.*` reflète la
+///      progression.
+/// La construction est faite dans `spawn_blocking` pour ne pas
+/// bloquer le runtime ; les polls suivants aussi (la lecture
+/// streaming peut toucher plusieurs centaines de MiB).
+fn spawn_compact_index_workers(
+    registry: &Arc<read_time_patch::CompactJsonlIndexRegistry>,
+    bundle: &Arc<read_time_patch::DatasetIndexes>,
+) {
+    let mut to_build: Vec<Arc<read_time_patch::CompactJsonlIndex>> = Vec::new();
+    if let Some(flat) = &bundle.flat {
+        if flat.claim_build() {
+            to_build.push(flat.clone());
+        }
+    }
+    for shard in &bundle.shards {
+        if shard.claim_build() {
+            to_build.push(shard.clone());
+        }
+    }
+    for index in to_build {
+        let registry_clone = registry.clone();
+        let poll_secs = compact_index_poll_seconds();
+        tokio::task::spawn(async move {
+            // Build initial en blocking (une seule fois par fichier).
+            let index_for_build = index.clone();
+            let registry_for_build = registry_clone.clone();
+            let build_outcome = tokio::task::spawn_blocking(move || {
+                let outcome = index_for_build.build_initial();
+                registry_for_build.snapshot_into_counters();
+                outcome
+            })
+            .await;
+            match build_outcome {
+                Ok(Ok(())) => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "READ_TIME_PATCH_INDEX_READY",
+                            "path": index.path().display().to_string(),
+                            "entries": index.entries(),
+                            "bytes_estimate": index.bytes_estimate(),
+                            "build_ms": index.build_ms(),
+                        })
+                    );
+                }
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "READ_TIME_PATCH_INDEX_BUILD_FAILED",
+                            "path": index.path().display().to_string(),
+                            "error": error,
+                        })
+                    );
+                    return;
+                }
+                Err(join_error) => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "READ_TIME_PATCH_INDEX_BUILD_PANICKED",
+                            "path": index.path().display().to_string(),
+                            "error": join_error.to_string(),
+                        })
+                    );
+                    return;
+                }
+            }
+            // Boucle d'extension append-only.
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(poll_secs)).await;
+                let index_for_tail = index.clone();
+                let registry_for_tail = registry_clone.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(error) = index_for_tail.extend_from_tail() {
+                        eprintln!(
+                            "{}",
+                            json!({
+                                "event": "READ_TIME_PATCH_INDEX_EXTEND_FAILED",
+                                "path": index_for_tail.path().display().to_string(),
+                                "error": error,
+                            })
+                        );
+                    }
+                    registry_for_tail.snapshot_into_counters();
+                })
+                .await;
+            }
+        });
+    }
 }
 
 fn live_flow_for(state: &AppState, id: &str) -> Option<(String, CallFlow)> {
@@ -3174,16 +3325,30 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                     if let Ok(serde_json::Value::Array(mut items)) =
                         serde_json::to_value(&flow.events)
                     {
-                        apply_read_time_patch(&state, &mut items, &dataset_root, session_id);
-                        let (serving_node, serving_ran_node, core_node) =
-                            read_time_patch::recompute_session_participants(&items);
-                        if let Some(object) = summary.as_object_mut() {
-                            object.insert("serving_node".into(), Value::String(serving_node));
-                            object.insert(
-                                "serving_ran_node".into(),
-                                Value::String(serving_ran_node),
-                            );
-                            object.insert("core_node".into(), Value::String(core_node));
+                        let status =
+                            apply_read_time_patch(&state, &mut items, &dataset_root, session_id);
+                        if matches!(status, read_time_patch::PatchStatus::Applied) {
+                            let (serving_node, serving_ran_node, core_node) =
+                                read_time_patch::recompute_session_participants(&items);
+                            if let Some(object) = summary.as_object_mut() {
+                                object.insert("serving_node".into(), Value::String(serving_node));
+                                object.insert(
+                                    "serving_ran_node".into(),
+                                    Value::String(serving_ran_node),
+                                );
+                                object.insert("core_node".into(), Value::String(core_node));
+                            }
+                        }
+                        if let Some(label) = status.label() {
+                            if let Some(object) = summary.as_object_mut() {
+                                object.insert(
+                                    "read_time_patch".into(),
+                                    json!({
+                                        "status": label,
+                                        "version": read_time_patch::PATCH_VERSION,
+                                    }),
+                                );
+                            }
                         }
                     }
                 }
@@ -4143,12 +4308,14 @@ async fn session_events(
                 Err(error) => return lte_evidence_error(error),
             }
         };
-    if let Some(root) = dataset_root.as_deref() {
-        apply_read_time_patch(&state, &mut items, root, &id);
-    }
+    let patch_status = if let Some(root) = dataset_root.as_deref() {
+        apply_read_time_patch(&state, &mut items, root, &id)
+    } else {
+        read_time_patch::PatchStatus::NotApplicable
+    };
     filter_events(&mut items, &query);
     sanitize_all(&mut items);
-    paginated(items, &query).into_response()
+    paginated_with_patch_status(items, &query, patch_status).into_response()
 }
 
 fn callflow_page_from_value(
@@ -4710,6 +4877,34 @@ fn paginated(mut items: Vec<Value>, query: &ListQuery) -> Json<Value> {
         json!({"data":data,"meta":{"page":page,"page_size":page_size,"total":total,"total_pages":total.div_ceil(page_size)}}),
     )
 }
+
+/// 2.14.11 (ANR1 #10 6860508699) — variante de `paginated` qui pousse
+/// l'état du patcher dans `meta.read_time_patch` :
+///   - `status == "applied"` : la session a bien reçu le patch.
+///   - `status == "index_building"` : l'index compact n'était pas
+///     encore prêt, les events sont servis tels quels (jamais une
+///     correction silencieuse).
+///   - `NotApplicable` : la fonction n'ajoute pas le champ (comportement
+///     identique à `paginated`).
+fn paginated_with_patch_status(
+    items: Vec<Value>,
+    query: &ListQuery,
+    status: read_time_patch::PatchStatus,
+) -> Json<Value> {
+    let Json(mut value) = paginated(items, query);
+    if let Some(label) = status.label() {
+        if let Some(meta) = value.get_mut("meta").and_then(Value::as_object_mut) {
+            meta.insert(
+                "read_time_patch".into(),
+                json!({
+                    "status": label,
+                    "version": read_time_patch::PATCH_VERSION,
+                }),
+            );
+        }
+    }
+    Json(value)
+}
 fn ok(mut data: Value) -> Json<Value> {
     sanitize_value(&mut data);
     Json(json!({"data":data,"meta":{"api_version":API_VERSION}}))
@@ -5006,6 +5201,132 @@ mod tests {
     }
     async fn json_body(response: Response) -> Value {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    /// 2.14.11 (ANR1 #10 6860508699) — garde RAII pour supprimer un
+    /// répertoire test MÊME si le test panic. `remove_dir_all` en fin
+    /// de fonction ne suffit pas : un `assert!` qui saute laisse 3 GiB
+    /// d'artefacts sur disque (incident 2026-11-13). Drop est appelé
+    /// par le runtime pendant le dépilement de panic.
+    struct AutoRemoveDir {
+        path: PathBuf,
+    }
+
+    impl AutoRemoveDir {
+        fn new(path: PathBuf) -> Self {
+            // Parent doit exister et autoriser la création du dossier.
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::create_dir_all(&path);
+            Self { path }
+        }
+
+        fn path(&self) -> &FsPath {
+            self.path.as_path()
+        }
+
+        fn as_pathbuf(&self) -> PathBuf {
+            self.path.clone()
+        }
+    }
+
+    impl Drop for AutoRemoveDir {
+        fn drop(&mut self) {
+            // On ignore l'erreur délibérément : en cas de double-drop
+            // ou de dossier déjà nettoyé, pas de panic dans Drop (qui
+            // deviendrait un double-panic).
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// 2.14.11 — preuve dédiée : même si un test panic APRÈS la
+    /// création du capture_root, la garde `AutoRemoveDir` supprime
+    /// le répertoire. L'assertion vérifie l'absence du répertoire
+    /// APRÈS le panic (via `catch_unwind` + check post-mortem).
+    #[test]
+    fn auto_remove_dir_cleans_up_even_on_panic() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let path = workspace
+            .join("runtime")
+            .join(format!(
+                "auto-remove-test-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        // Capture l'emplacement AVANT le panic pour pouvoir vérifier
+        // qu'il a disparu APRÈS.
+        let probe_path = path.clone();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let guard = AutoRemoveDir::new(path);
+            // Marqueur sur disque pour prouver que la cleanup a vu
+            // le contenu.
+            fs::write(guard.path().join("probe.txt"), b"alive").unwrap();
+            assert!(guard.path().join("probe.txt").exists());
+            // Panic volontaire. `guard` est encore en scope → Drop
+            // s'exécute pendant l'unwind.
+            panic!("intentional panic to exercise Drop guard");
+        }));
+        assert!(outcome.is_err(), "panic must have been caught");
+        assert!(
+            !probe_path.exists(),
+            "AutoRemoveDir did not clean up after panic ; path still present: {}",
+            probe_path.display()
+        );
+    }
+
+    /// 2.14.11 (ANR1 #10 6860508699) — attend que l'index compact
+    /// soit `ready=true`. Sans cette attente, les tests du patcher
+    /// voient la première requête avec `status=index_building`
+    /// (comportement voulu en prod, rendu déterministe ici).
+    /// Polling 10 ms, timeout `budget`. Déclenche la construction en
+    /// faisant une requête arbitraire si l'index n'est pas encore
+    /// tracké.
+    async fn wait_for_compact_index_ready(state: &AppState, budget: std::time::Duration) {
+        let deadline = std::time::Instant::now() + budget;
+        // Si le registre est vide (pas de tracking encore déclenché),
+        // frappe /sessions une fois pour forcer ensure_tracking +
+        // spawn du worker.
+        let mut triggered = false;
+        while std::time::Instant::now() < deadline {
+            let version = json_body(
+                router(state.clone(), None)
+                    .oneshot(req("/api/v1/version", true))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let ready = version["data"]["read_time_patch"]["index"]["ready"]
+                .as_bool()
+                .unwrap_or(false);
+            let entries = version["data"]["read_time_patch"]["index"]["entries"]
+                .as_u64()
+                .unwrap_or(0);
+            if ready {
+                return;
+            }
+            if entries == 0 && !triggered {
+                // Déclenche le tracking + spawn en appelant un handler
+                // qui passe par apply_read_time_patch.
+                let _ = router(state.clone(), None)
+                    .oneshot(req("/api/v1/sessions?page_size=1", true))
+                    .await;
+                triggered = true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "compact index did not become ready within {} ms",
+            budget.as_millis()
+        );
     }
     fn assert_no_identity_material(value: &Value) {
         match value {
@@ -5962,6 +6283,13 @@ mod tests {
         config.capture_root = capture_root.clone();
         let state = AppState::load_with_capture_manager(config, manager).unwrap();
 
+        // 2.14.11 (ANR1 #10 6860508699) — la construction de l'index
+        // compact `event_id → byte offset` est faite en arrière-plan.
+        // Première requête : déclenche le spawn et attend la ready
+        // state (poll /version). Pour un dataset test (quelques
+        // lignes), la construction est milliseconde-order.
+        wait_for_compact_index_ready(&state, std::time::Duration::from_secs(10)).await;
+
         // Sanity : /sessions renvoie la session continue avec core_node
         // recalculé.
         let sessions = json_body(
@@ -6028,29 +6356,37 @@ mod tests {
         fs::remove_dir_all(&capture_root).ok();
     }
 
-    /// 2.14.9 (ANR1 #10 6859228701) — test de CHARGE : construit un
-    /// JSONL synthétique de taille configurable (≥ 2 GiB par défaut,
-    /// surchargé via `OIRAN_READ_TIME_PATCH_LOAD_TEST_BYTES`), sert
-    /// deux sessions via le patcher, et mesure `VmHWM` depuis
-    /// `/proc/self/status` avant/après. Assertion dure : le process
-    /// ne doit pas dépasser 512 MiB d'anon-rss observé.
+    /// 2.14.11 (ANR1 #10 6860508699) — test de CHARGE. Évolue le test
+    /// 2.14.9 pour couvrir le nouvel index compact :
     ///
-    /// Reproduit le scénario OOM de prod ANR1 (2.14.8 tuée par le
-    /// cgroup 4 GiB à la première lecture d'une session réelle) : le
-    /// chargement complet du JSONL en `HashMap<String, Value>` par
-    /// `from_dataset_root` aurait alloué ~2-3× la taille sur disque,
-    /// ici ~6 GiB pour un fichier de 2 GiB. Avec 2.14.9, seul le
-    /// sous-ensemble des événements de la session demandée est
-    /// chargé.
+    /// 1. Génère un JSONL synthétique de taille configurable (≥ 3,4 GiB
+    ///    par défaut, soit la taille observée en prod ANR1 ; override
+    ///    via `OIRAN_READ_TIME_PATCH_LOAD_TEST_BYTES`).
+    /// 2. Démarre `AppState`, qui déclenche la construction en
+    ///    arrière-plan de l'index compact sur la première requête.
+    /// 3. Attend `/api/v1/version.read_time_patch.index.ready == true`
+    ///    avec un timeout de 180 s, en polling 100 ms.
+    /// 4. Vérifie l'empreinte RAM via `/proc/self/status` (VmHWM) et
+    ///    la taille de l'index (`index.bytes`).
+    /// 5. Sert deux sessions, mesure la **latence totale** de chaque
+    ///    requête SERVING. Assertion dure : `latency < 500 ms`.
+    /// 6. Assertions finales :
+    ///       - `VmHWM < 512 MiB` (même borne que 2.14.9).
+    ///       - `index.bytes <= CompactJsonlIndex::MEMORY_BUDGET_BYTES`.
+    ///       - `index.ready == true`.
+    ///       - `index.entries > 0` et `build_ms > 0`.
+    ///       - Chaque session sert 3 événements correctement patchés
+    ///         (participants en {eNB, MME}).
     ///
-    /// Marqué `#[ignore]` pour que `cargo test` par défaut ne le
-    /// lance pas (coût disque + temps : plusieurs minutes et 2 GiB
-    /// de temp). Exécution explicite :
-    /// `cargo test --release -p oiran-api --lib -- --ignored
-    /// read_time_patch_bounded_memory_on_large_jsonl`.
+    /// Marqué `#[ignore]` : coût disque + temps. Exécution :
+    /// ```
+    /// OIRAN_READ_TIME_PATCH_LOAD_TEST_BYTES=3600000000 \
+    ///   cargo test --release -p oiran-api --lib -- --ignored \
+    ///   read_time_patch_compact_index_bounded_and_fast_on_large_jsonl
+    /// ```
     #[tokio::test]
-    #[ignore = "load test: writes ≥2 GiB of synthetic JSONL, run explicitly with --ignored"]
-    async fn read_time_patch_bounded_memory_on_large_jsonl() {
+    #[ignore = "load test: writes ≥3,4 GiB of synthetic JSONL, run explicitly with --ignored"]
+    async fn read_time_patch_compact_index_bounded_and_fast_on_large_jsonl() {
         use std::io::Write as _;
         let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -6060,7 +6396,7 @@ mod tests {
         let target_bytes: usize = std::env::var("OIRAN_READ_TIME_PATCH_LOAD_TEST_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(2 * 1024 * 1024 * 1024);
+            .unwrap_or(3_400_000_000);
         let suffix = format!(
             "{}-{}",
             std::process::id(),
@@ -6069,9 +6405,13 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        let capture_root = workspace
-            .join("runtime")
-            .join(format!("api-read-time-patch-load-{suffix}"));
+        // 2.14.11 — garde RAII : cleanup même en cas de panic.
+        let capture_root_guard = AutoRemoveDir::new(
+            workspace
+                .join("runtime")
+                .join(format!("api-read-time-patch-load-{suffix}")),
+        );
+        let capture_root = capture_root_guard.as_pathbuf();
         let base = capture_root.join(live_probe::CONTINUOUS_CAPTURE_ID);
         let dataset_dir = base.join("dataset");
         let generation_name = format!("generation-{}-0", epoch_seconds());
@@ -6102,6 +6442,19 @@ mod tests {
             (0x5d, 93, 102, false),
             (0, 22, 103, true),
         ];
+        // 2.14.11 — padding stable pour que chaque ligne synthétique
+        // approche la densité prod ANR1 (3 393 914 516 octets /
+        // 1 554 682 lignes = 2 183 B/ligne). Sans ce padding, les
+        // lignes synthétiques font ~800 B et on génère ~4 M entrées
+        // au lieu de ~1,55 M pour 3,4 Go → l'empreinte de l'index
+        // scale avec entries et dépasse la mesure attendue sur la
+        // densité prod. Chiffre fixé à 1 400 : 800 + 1 400 ≈ 2 200 B.
+        const PROD_DENSITY_PADDING: &str =
+            "pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad";
+        assert!(
+            PROD_DENSITY_PADDING.len() >= 1_400,
+            "padding must be ≥ 1400 chars to approach prod density"
+        );
         let write_event =
             |writer: &mut dyn std::io::Write,
              id: &str,
@@ -6129,6 +6482,7 @@ mod tests {
                     "raw_payload_reference":"sha256:stub",
                     "packet_references":[{"source_file":"S1-MME.pcap-stub","packet_number":packet,"byte_offset":0u64,"interface_id":0u32,"captured_length":1u32,"original_length":1u32}],
                     "errors":[],
+                    "padding": PROD_DENSITY_PADDING,
                 });
                 writeln!(writer, "{}", serde_json::to_string(&line).unwrap()).unwrap();
             };
@@ -6255,19 +6609,110 @@ mod tests {
         config.capture_root = capture_root.clone();
         let state = AppState::load_with_capture_manager(config, manager).unwrap();
 
-        // Sert les deux sessions via le patcher (chemin SERVING).
+        // Première requête : déclenche la construction en arrière-plan
+        // de l'index compact (spawn tokio). La réponse est servie
+        // SANS correction tant que `index.ready == false` ; le handler
+        // marque `meta.read_time_patch.status = "index_building"`.
+        let trigger_response = router(state.clone(), None)
+            .oneshot(req("/api/v1/sessions/lte-session-load-a/events", true))
+            .await
+            .unwrap();
+        assert_eq!(trigger_response.status(), StatusCode::OK);
+        let trigger_body = json_body(trigger_response).await;
+        let status_at_trigger = trigger_body["meta"]["read_time_patch"]["status"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            matches!(status_at_trigger, "index_building" | "applied"),
+            "first request must expose explicit status, got {status_at_trigger:?}"
+        );
+
+        // Attend que l'index compact soit prêt (timeout 180 s, poll
+        // 100 ms). ANR1 observait ~35 s pour 2 Go, soit ~60 s pour
+        // 3,4 Go ; on laisse une marge 3×.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let mut ready = false;
+        let mut last_index_snapshot: Option<Value> = None;
+        while std::time::Instant::now() < deadline {
+            let version = json_body(
+                router(state.clone(), None)
+                    .oneshot(req("/api/v1/version", true))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let index = version["data"]["read_time_patch"]["index"].clone();
+            if index["ready"].as_bool().unwrap_or(false) {
+                last_index_snapshot = Some(index);
+                ready = true;
+                break;
+            }
+            last_index_snapshot = Some(index);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            ready,
+            "compact index did not become ready within 180s; last snapshot={:?}",
+            last_index_snapshot
+        );
+        let index = last_index_snapshot.expect("index snapshot captured");
+        let index_entries = index["entries"].as_u64().unwrap_or(0);
+        let index_bytes = index["bytes"].as_u64().unwrap_or(0);
+        let index_build_ms = index["build_ms"].as_u64().unwrap_or(0);
+        let index_last_offset = index["last_offset"].as_u64().unwrap_or(0);
+        assert!(
+            index_entries > 0,
+            "index.entries must be > 0 after build, got {index_entries}"
+        );
+        // Spec ANR1 : ≤ 64 MiB pour 1,55 M entrées. Le padding
+        // appliqué ci-dessus aligne la densité des lignes synthétiques
+        // sur la densité prod (2 183 B/ligne), si bien que 3,4 Go de
+        // JSONL donnent ~1,55 M entrées exactement. Assertion dure.
+        assert!(
+            index_bytes <= read_time_patch::CompactJsonlIndex::MEMORY_BUDGET_BYTES as u64,
+            "index.bytes {} > budget {} MiB. Observed: {} entries, bytes/entry={:.2}. Spec: ≤ 64 MiB pour 1,55 M entrées à densité prod.",
+            index_bytes,
+            read_time_patch::CompactJsonlIndex::MEMORY_BUDGET_BYTES / 1024 / 1024,
+            index_entries,
+            index_bytes as f64 / index_entries as f64,
+        );
+        assert!(
+            index_build_ms > 0,
+            "index.build_ms must be set after build completes"
+        );
+        assert!(
+            index_last_offset > 0,
+            "index.last_offset must reflect bytes scanned"
+        );
+        eprintln!(
+            "COMPACT_INDEX entries={} bytes_estimate={} MiB build_ms={} last_offset={} MiB jsonl_size={} MiB",
+            index_entries,
+            index_bytes / 1024 / 1024,
+            index_build_ms,
+            index_last_offset / 1024 / 1024,
+            jsonl_size / 1024 / 1024,
+        );
+
+        // Sert les deux sessions via le patcher (chemin SERVING). Une
+        // fois l'index prêt, chaque requête doit descendre sous 500 ms.
         for session_id in ["lte-session-load-a", "lte-session-load-b"] {
+            let started = std::time::Instant::now();
             let response = router(state.clone(), None)
                 .oneshot(req(&format!("/api/v1/sessions/{session_id}/events"), true))
                 .await
                 .unwrap();
+            let elapsed = started.elapsed();
             assert_eq!(response.status(), StatusCode::OK);
             let body = json_body(response).await;
+            let status = body["meta"]["read_time_patch"]["status"]
+                .as_str()
+                .unwrap_or("");
+            assert_eq!(
+                status, "applied",
+                "once ready, serving MUST apply the patch (session={session_id})"
+            );
             let events = body["data"].as_array().expect("events array");
             assert_eq!(events.len(), 3, "callflow stub expose 3 events / session");
-            // 2.14.9 : vérifie que TOUS les events ont été patchés
-            // vers {eNB, MME}. Le sens dépend de l'event, mais
-            // "Unknown endpoint" doit avoir disparu.
             for event in events {
                 let src = event["source_participant"].as_str().unwrap_or("");
                 let dst = event["destination_participant"].as_str().unwrap_or("");
@@ -6277,11 +6722,20 @@ mod tests {
                     event["event_id"], src, dst
                 );
             }
+            eprintln!(
+                "SERVING session={session_id} latency_ms={} (budget=500 ms)",
+                elapsed.as_millis()
+            );
+            assert!(
+                elapsed < std::time::Duration::from_millis(500),
+                "session {session_id} served in {} ms (budget 500 ms) — index seek should be < 500 ms sans cache",
+                elapsed.as_millis()
+            );
         }
 
-        // VmHWM APRÈS. L'empreinte doit rester bornée malgré 2 GiB
-        // de JSONL écrit (99 % des lignes sont du bruit filtré par
-        // extract_event_id + wanted.contains).
+        // VmHWM APRÈS. L'empreinte doit rester bornée malgré 3,4 GiB
+        // de JSONL écrit : la map `hash(event_id) → byte_offset` fait
+        // ~29 MiB pour 1,55 M entrées (mesure par test).
         let after = vmhwm();
         let threshold = 512usize * 1024 * 1024;
         eprintln!(
@@ -6298,23 +6752,9 @@ mod tests {
             jsonl_size,
         );
 
-        // Compteurs : au moins 2 misses (une par session), hits > 0
-        // si on re-sert la même, cache_bytes borné.
-        let version = json_body(
-            router(state.clone(), None)
-                .oneshot(req("/api/v1/version", true))
-                .await
-                .unwrap(),
-        )
-        .await;
-        let cache = &version["data"]["read_time_patch"]["cache"];
-        assert!(cache["misses"].as_u64().unwrap_or(0) >= 2);
-        assert!(
-            cache["bytes"].as_u64().unwrap_or(0)
-                <= read_time_patch::CacheLimits::DEFAULT_BYTES as u64
-        );
-
-        fs::remove_dir_all(&capture_root).ok();
+        // Cleanup explicite : `capture_root_guard` est aussi actif en
+        // Drop pour couvrir les cas d'early return (panic).
+        drop(capture_root_guard);
     }
 
     fn normalized_lte_event(
