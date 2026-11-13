@@ -99,7 +99,7 @@ describe('useScenarioLibrary — backend mode', () => {
       rat: '5G_SA',
       simulator: 'UERANSIM',
       description: '',
-      steps: [{ type: 'wait', loop_count: 1, parameters: { duration_s: { fixed: 3 } } }],
+      steps: [{ type: 'wait', loop_count: 1, parameters: { duration_ms: { fixed: 3_000 } } }],
     });
   });
 

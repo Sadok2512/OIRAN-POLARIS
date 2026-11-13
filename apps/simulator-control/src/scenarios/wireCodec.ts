@@ -183,6 +183,12 @@ export function decodeParam(value: WireScalarParam | number): FixedOrRandom {
   return { mode: 'random', min: value.random.min, max: value.random.max };
 }
 
+function scaleParam(value: FixedOrRandom, factor: number): FixedOrRandom {
+  return value.mode === 'fixed'
+    ? { mode: 'fixed', value: value.value * factor }
+    : { mode: 'random', min: value.min * factor, max: value.max * factor };
+}
+
 /* ------------------------------- Step codec ------------------------------- */
 
 export function encodeStep(step: ScenarioStep): WireScenarioStep {
@@ -192,7 +198,14 @@ export function encodeStep(step: ScenarioStep): WireScenarioStep {
   (Object.keys(step.params) as (keyof StepParams)[]).forEach((key) => {
     if (step.kind === 'REPEAT' && key === 'loop_count') return;
     const value = step.params[key];
-    if (value) parameters[key] = encodeParam(key, value);
+    if (!value) return;
+    // The editor contract is seconds; the API contract for wait/idle is
+    // duration_ms. Keep the conversion at the wire boundary only.
+    if (step.kind === 'IDLE' && key === 'duration_s') {
+      parameters.duration_ms = encodeParam('duration_ms', scaleParam(value, 1_000));
+    } else {
+      parameters[key] = encodeParam(key, value);
+    }
   });
   const repeatCount = step.kind === 'REPEAT' && step.params.loop_count?.mode === 'fixed'
     ? step.params.loop_count.value
@@ -213,6 +226,10 @@ export function decodeStep(wire: WireScenarioStep): ScenarioStep {
   for (const [key, value] of Object.entries(wire.parameters)) {
     if ('fixed' in value && typeof value.fixed !== 'number') {
       preservedWireParameters[key] = value;
+    } else if (kind === 'IDLE' && key === 'duration_ms') {
+      // Read-only compatibility for definitions persisted before the UI/API
+      // units were aligned. The stored object is never rewritten here.
+      params.duration_s = scaleParam(decodeParam(value), 1 / 1_000);
     } else {
       (params as Record<string, FixedOrRandom>)[key] = decodeParam(value);
     }

@@ -87,7 +87,7 @@ describe('StepEditor — REPEAT nesting (0.5.0)', () => {
     expect(within(innerPalette).getByTestId(`repeat-add-TRAFFIC_UL-${inner.id}`)).toBeInTheDocument();
   });
 
-  it('shows the backend-note verbatim on locked step kinds (TRAFFIC_DL, IMS_REGISTER, VOICE_CALL)', () => {
+  it('shows a short French warning and keeps the technical backend note in the tooltip', () => {
     const locked: ScenarioStep[] = [
       { id: 'a', kind: 'TRAFFIC_DL', params: {} },
       { id: 'b', kind: 'IMS_REGISTER', params: {} },
@@ -96,8 +96,13 @@ describe('StepEditor — REPEAT nesting (0.5.0)', () => {
     for (const step of locked) {
       const { unmount } = render(<Harness initial={step} />);
       const notice = screen.getByTestId('step-backend-notice');
-      if (step.kind === 'TRAFFIC_DL') expect(notice).toHaveTextContent('DL_SENDER_NOT_AVAILABLE');
-      else expect(notice).toHaveTextContent('IMS_NOT_AVAILABLE');
+      if (step.kind === 'TRAFFIC_DL') {
+        expect(notice).toHaveTextContent('Fonction pas encore disponible — enregistrable, non exécutable');
+        expect(notice).toHaveAttribute('title', expect.stringContaining('DL_SENDER_NOT_AVAILABLE'));
+      } else {
+        expect(notice).toHaveTextContent('Voix pas encore disponible (IMS) — enregistrable, non exécutable');
+        expect(notice).toHaveAttribute('title', expect.stringContaining('IMS_NOT_AVAILABLE'));
+      }
       unmount();
     }
   });

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.33.1 — 2026-11-13 — Wait duration compatibility
+
+- Normalizes legacy wait/idle `duration_ms` to editor seconds at the web wire
+  boundary without rewriting persisted definitions, and serializes new values
+  back to API milliseconds.
+- Replaces verbose backend warnings with short French operator messages while
+  retaining technical details in tooltips.
+
 ## 0.33.0 — 2026-11-13 — IMS registration phase 1
 
 - Adds a bounded, per-run `ims_register` step for UE-201/UE-05: IMS PDU and

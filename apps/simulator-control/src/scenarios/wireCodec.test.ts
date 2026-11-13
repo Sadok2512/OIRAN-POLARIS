@@ -55,6 +55,22 @@ describe('wireCodec — parameter shape (scenario_definitions.rs ParameterSpec)'
   });
 });
 
+describe('wireCodec — wait duration compatibility', () => {
+  it('normalizes a legacy duration_ms on read without retaining an unused parameter', () => {
+    const decoded = decodeStep({
+      type: 'wait', loop_count: 1, parameters: { duration_ms: { fixed: 2_000 } },
+    });
+    expect(decoded.params).toEqual({ duration_s: { mode: 'fixed', value: 2 } });
+    expect(decoded.preservedWireParameters).toBeUndefined();
+  });
+
+  it('encodes a new duration in seconds using the API duration_ms contract', () => {
+    expect(encodeStep({
+      id: newStepId(), kind: 'IDLE', params: { duration_s: { mode: 'fixed', value: 2 } },
+    })).toEqual({ type: 'wait', loop_count: 1, parameters: { duration_ms: { fixed: 2_000 } } });
+  });
+});
+
 describe('wireCodec — step types (6-type whitelist)', () => {
   const certifiedPairs: [string, string][] = [
     ['UE_START', 'ue_start'],
@@ -127,7 +143,7 @@ describe('wireCodec — scenario loop (definition loop_count)', () => {
       rat: '5G_SA',
       simulator: 'UERANSIM',
       description: '',
-      steps: [{ type: 'wait', loop_count: 1, parameters: { duration_s: { fixed: 5 } } }],
+      steps: [{ type: 'wait', loop_count: 1, parameters: { duration_ms: { fixed: 5_000 } } }],
     });
   });
 });

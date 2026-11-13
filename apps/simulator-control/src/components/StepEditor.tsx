@@ -92,11 +92,16 @@ export function StepEditor({
       </header>
 
       {!meta.backendCertified && (
-        <div className="flex items-start gap-2 text-ep-xs text-warning" data-testid="step-backend-notice">
+        <div
+          className="flex items-start gap-2 text-ep-xs text-warning"
+          data-testid="step-backend-notice"
+          title={meta.backendNote ?? 'Backend support required'}
+        >
           <AlertTriangle width={12} height={12} className="mt-0.5 shrink-0" />
           <span>
-            Backend support required: {meta.backendNote ?? 'this step is not implemented in POLARIS /scenarios/*.'}
-            {' '}The scenario stays saveable, but Run Scenario stays disabled until the backend contract exists.
+            {step.kind === 'IMS_REGISTER' || step.kind === 'VOICE_CALL'
+              ? 'Voix pas encore disponible (IMS) — enregistrable, non exécutable'
+              : 'Fonction pas encore disponible — enregistrable, non exécutable'}
           </span>
         </div>
       )}
