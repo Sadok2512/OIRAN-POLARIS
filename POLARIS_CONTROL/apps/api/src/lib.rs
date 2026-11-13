@@ -3840,9 +3840,10 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
         "detach",
         "repeat",
     ];
-    executable_steps.push("ims_register");
-    let mut unavailable_steps =
-        vec![json!({"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"})];
+    let mut unavailable_steps = vec![
+        json!({"type":"ims_register","http_status":423,"reason":"IMS_NOT_AVAILABLE"}),
+        json!({"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}),
+    ];
     if dl_sender.is_ok() {
         executable_steps.push("traffic_dl");
         executable_steps.push("traffic_ul");
@@ -15663,8 +15664,7 @@ mod p0_tests {
                 "wait",
                 "idle",
                 "detach",
-                "repeat",
-                "ims_register"
+                "repeat"
             ])
         );
         assert_eq!(
@@ -15673,6 +15673,7 @@ mod p0_tests {
                 {"type":"traffic_dl","http_status":422,"reason":"DL_SENDER_NOT_AVAILABLE"},
                 {"type":"traffic_ul","http_status":422,"reason":"UL_RECEIVER_NOT_AVAILABLE"},
                 {"type":"transfer_verify","http_status":422,"reason":"TRANSFER_PEER_NOT_AVAILABLE"},
+                {"type":"ims_register","http_status":423,"reason":"IMS_NOT_AVAILABLE"},
                 {"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}
             ])
         );
@@ -16586,7 +16587,7 @@ mod p0_tests {
     }
 
     #[tokio::test]
-    async fn healthy_dl_sender_keeps_real_ims_register_executable() {
+    async fn healthy_dl_sender_does_not_certify_ims_register() {
         let mut test_state = state();
         test_state.dl_sender.container = Some("polaris-dn-sender".into());
         test_state.dl_sender_health_override = Some(Ok(()));
@@ -16618,12 +16619,12 @@ mod p0_tests {
             .unwrap()
             .iter()
             .any(|step| step["type"] == "traffic_dl"));
-        assert!(body["executable_scenario_step_types"]
+        assert!(!body["executable_scenario_step_types"]
             .as_array()
             .unwrap()
             .iter()
             .any(|step| step == "ims_register"));
-        assert!(!body["unavailable_scenario_step_types"]
+        assert!(body["unavailable_scenario_step_types"]
             .as_array()
             .unwrap()
             .iter()

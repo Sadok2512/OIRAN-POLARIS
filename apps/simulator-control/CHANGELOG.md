@@ -1,5 +1,10 @@
 # @telecom/simulator-control — Changelog
 
+## 0.33.2 — 2026-11-13 — rich UI delivery gate
+
+- Delivers the 0.33.1 rich UI corrections independently from the uncertified
+  IMS REGISTER path; the header and Activity stay unavailable until a real 200.
+
 ## 0.33.1 — 2026-11-13 — authoritative rich Control UI
 
 - Uses `/voice/status`, backed by the per-UE REGISTER-200 probe, as the only

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.33.2 — 2026-11-13 — Rich UI delivery independent from IMS certification
+
+- Ships the validated rich Simulator UI, multi-DNN PDU observations and UE-05
+  catalogue support without claiming IMS registration is certified.
+- Keeps the bounded `ims_register` implementation for diagnosis, but advertises
+  it as unavailable with `IMS_NOT_AVAILABLE`; voice remains false unless an
+  actual REGISTER 200 event exists.
+
 ## 0.33.1 — 2026-11-13 — Wait duration compatibility
 
 - Normalizes legacy wait/idle `duration_ms` to editor seconds at the web wire
