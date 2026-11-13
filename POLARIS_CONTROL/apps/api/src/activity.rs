@@ -250,8 +250,15 @@ pub fn parse_ps_list(stdout: &str) -> Option<PduSnapshot> {
                 break;
             }
             inside = true;
-            if let Some(number) = line.split_whitespace().last() {
-                psi = number.trim_end_matches(':').parse::<u32>().ok();
+            psi = line
+                .split(|character: char| !character.is_ascii_digit())
+                .find(|part| !part.is_empty())
+                .and_then(|part| part.parse::<u32>().ok());
+            if state.is_none() {
+                state = line
+                    .split_once('[')
+                    .and_then(|(_, rest)| rest.split_once(']'))
+                    .map(|(value, _)| value.to_string());
             }
             continue;
         }
@@ -265,7 +272,7 @@ pub fn parse_ps_list(stdout: &str) -> Option<PduSnapshot> {
         let value = value.trim();
         match key_lc.as_str() {
             "apn" | "dnn" => dnn = Some(value.into()),
-            "state" => state = Some(value.into()),
+            "state" | "status" => state = Some(value.into()),
             "address" | "ue-address" => address = Some(value.into()),
             _ => {}
         }

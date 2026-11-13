@@ -12,15 +12,27 @@ export type NodeInventory = { items: NodeItem[]; configured_count: number; runni
 export type ProcessState = { process_state: string; health: string; observed: boolean };
 export type RuntimeState = { source: string; configuration_changed: boolean; observed: { ueransim_ue_profile: boolean; ueransim_profile: string; open5gs: ProcessState; ueransim_gnb: ProcessState; ueransim_ue: ProcessState; srsran_enb: ProcessState; srsran_ue: ProcessState; lte_attach: string; controller_owned_active_jobs: number } };
 export type UeInventory = { items: UeState[]; configured_profiles: UeProfile[]; configured_count: number; planned_count?: number; max_configurable?: number; active_count: number; registered_count: number; pdu_session_count?: number; observed_at_epoch_s?: number; source: string };
-export type UeProfile = { id: string; pseudonym?: string; profile: string; serving_gnb?: string; simulator: string; state: string; configured?: boolean; controller_owned: boolean; subscription_status?: string; actions?: { start: boolean; stop: boolean; traffic: boolean; reason: string } };
+export type UeProfile = { id: string; pseudonym?: string; profile: string; serving_gnb?: string; simulator: string; state: string; configured?: boolean; controller_owned: boolean; subscription_status?: string; subscriber_identity?:string; scenario_id?:string|null; actions?: { start: boolean; stop: boolean; traffic: boolean; reason: string } };
 export type UeReconciliation = { operation_id: string | null; desired_count: number; state: 'IDLE' | 'RUNNING' | 'COMPLETED' | 'FAILED'; started_at_epoch_s: number | null; completed_at_epoch_s: number | null; started: string[]; stopped: string[]; failures: [string,string][] };
 export type LabConfiguration = { ue_count: number; desired_ue_count: number; gnb_count: number; max_ues: number; max_gnbs: number; max_ues_live_certified: number; max_gnbs_live_certified: number; missing_subscriber_profiles: number; updated_at_epoch_s: number; updated_by: string; observed_controller_running: number; observed_total_running: number; reconciliation: UeReconciliation; execution_started: boolean };
-export type UeState = { id: string; internal_ue_id?: string; profile?: string; profile_state?: string; subscription_status?: string; serving_node?: string; process_state?: string; registration_state: string; rrc_state?: string; pdu_session: string; ue_ip: string | null; traffic_state: string; uptime_seconds?: number | null; last_event: string | null; controller_owned: boolean; traffic_target_verified?: boolean; actions?: { start: boolean; stop: boolean; pdu_start: boolean; pdu_stop: boolean; traffic: boolean; provisioning_review?: boolean; reason: string } };
+export type UeState = { id: string; internal_ue_id?: string; profile?: string; profile_state?: string; subscription_status?: string; subscriber_identity?:string; scenario_id?:string|null; serving_node?: string; process_state?: string; registration_state: string; rrc_state?: string; pdu_session: string; ue_ip: string | null; traffic_state: string; uptime_seconds?: number | null; last_event: string | null; controller_owned: boolean; traffic_target_verified?: boolean; actions?: { authorize?:boolean; start: boolean; start_reason?:string; stop: boolean; stop_reason?:string; pdu_start: boolean; pdu_stop: boolean; traffic: boolean; provisioning_review?: boolean; reason: string } };
 export type ScenarioList = { items: ScenarioState[]; total: number; source: string; live_execution: boolean; note?: string };
 export type ScenarioState = { scenario_id: string; job_id?: string; target_ue_id?: string; target_ue_pseudonym?: string; tun_interface?: string | null; technology: string; simulator: string; started_at: string; started_at_epoch_s: number; ended_at_epoch_s: number | null; duration_seconds: number; configured_ues: number; registered_ues: number; active_pdu_sessions: number; traffic_state: string; packets_requested: number; packets_sent: number | null; terminal_result: string | null; cpu: string; memory: string; state: string; controller_owned: boolean };
 export type ScenarioRuntime = { active_job: ScenarioState | null; latest_terminal_job: ScenarioState | null; active_count: number; history_count: number; observed_at_epoch_s: number; source: string };
 export type TrafficState = { state: string; packets_requested: number; packets_sent: number | null; packets_received: number | null; bytes: number | null; current_rate_pps?: number | null; accounting_source: string; target_ue_id?: string | null; target_ue_pseudonym?: string | null; tun_interface?: string | null; last_result: ScenarioState | null; approved_destinations: string[] };
 export type ValidationResult = { valid: boolean; execution?: string; next?: string; scenario_type?: string; error?: string };
+export type ScenarioDefinition = { id:string; name:string; version:number; loop_count:number; steps:{type:string;parameters?:Record<string,unknown>}[]; created_at_epoch_s:number; updated_at_epoch_s:number; catalog_scope:'SYSTEM'|'USER'; mutable:boolean; cloneable:boolean; assigned_ues:number; backend_support:string; executable:boolean; execution_block_reason:string|null; execution_message:string|null };
+export type ScenarioDefinitions = { items:ScenarioDefinition[]; total:number; schema_version:number };
+
+export const secondsToDurationMs = (seconds:number) => Math.round(seconds * 1000);
+export const maskSubscriberIdentity = (value:string|undefined|null) => {
+  if (!value || value === 'PROTECTED') return 'PROTECTED';
+  const prefix=value.startsWith('imsi-')?'imsi-':'';
+  const digits=value.slice(prefix.length);
+  return digits.length>8?`${prefix}${digits.slice(0,4)}…${digits.slice(-4)}`:`${prefix}…`;
+};
+export const reportedState = (value:string|undefined|null) => value && value !== 'UNKNOWN' ? value : '-- (non rapporté par UERANSIM)';
+export const eventFailureDetail = (event:{detail?:{error?:string};error?:string}) => event.detail?.error ?? event.error ?? '';
 
 export const eligibleTrafficTargets = (items: UeState[]) => items.filter(item =>
   item.controller_owned &&
@@ -43,9 +55,9 @@ export const setCsrfToken = (value: string) => value ? sessionStorage.setItem(cs
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const method = (init?.method ?? 'GET').toUpperCase();
   const csrf = sessionStorage.getItem(csrfKey) ?? '';
-  const response = await fetch('/api/v1' + path, { ...init, credentials: 'same-origin', headers: { 'content-type': 'application/json', ...(!['GET', 'HEAD', 'OPTIONS'].includes(method) && csrf ? { 'x-csrf-token': csrf } : {}), ...init?.headers } });
+  const response = await fetch('/api/v1' + path, { ...init, cache: 'no-store', credentials: 'same-origin', headers: { 'content-type': 'application/json', ...(!['GET', 'HEAD', 'OPTIONS'].includes(method) && csrf ? { 'x-csrf-token': csrf } : {}), ...init?.headers } });
   const body = await response.json().catch(() => ({ error: 'INVALID_RESPONSE' }));
   if (body && typeof body === 'object' && 'csrf_token' in body && typeof body.csrf_token === 'string' && body.csrf_token) setCsrfToken(body.csrf_token);
-  if (!response.ok) throw new Error(typeof body.error === 'string' ? body.error : `API ${response.status}`);
+  if (!response.ok) throw new Error(typeof body.error === 'string' ? `${body.error}${body.suggestion?`: ${body.suggestion}`:''}` : `API ${response.status}`);
   return body as T;
 }

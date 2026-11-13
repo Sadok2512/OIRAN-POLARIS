@@ -1679,7 +1679,7 @@ trait UeRuntime: Send + Sync {
             ])
             .output()
             .map_err(|_| "IPERF3_DL_SENDER_SPAWN_FAILED")?;
-        let _receiver_output = receiver
+        let receiver_output = receiver
             .wait_with_output()
             .map_err(|_| "IPERF3_DL_RECEIVER_WAIT_FAILED")?;
         let sender_report: Value = serde_json::from_slice(&sender_output.stdout).map_err(|_| {
@@ -1699,7 +1699,9 @@ trait UeRuntime: Send + Sync {
         // measurement surfaces as a warning on `IperfMeasurement.warning`;
         // the step only fails when the connection cannot be attempted
         // (process spawn, wait, or stdout parsing).
-        let receiver_report = sender_report.get("server_output_json").cloned();
+        let receiver_report = serde_json::from_slice::<Value>(&receiver_output.stdout)
+            .ok()
+            .or_else(|| sender_report.get("server_output_json").cloned());
         let server_missing = receiver_report.is_none();
         let sender_opt = sender_report
             .pointer("/end/sum_sent/bytes")
@@ -3722,7 +3724,7 @@ async fn health() -> Json<Value> {
 }
 async fn version() -> Json<Value> {
     Json(
-        json!({"platform":"0.31.2","api":VERSION,"scenario_engine":scenario_engine::VERSION,"safety_guard":safety_guard::VERSION,"ueransim_adapter":ueransim_adapter::VERSION,"srsran_controller":srsran_controller::VERSION,"multi_ue_controller":simulator_controller::VERSION,"staging_read_only":staging_read_only_enabled()}),
+        json!({"platform":VERSION,"api":VERSION,"web":VERSION,"scenario_engine":scenario_engine::VERSION,"safety_guard":safety_guard::VERSION,"ueransim_adapter":ueransim_adapter::VERSION,"srsran_controller":srsran_controller::VERSION,"multi_ue_controller":simulator_controller::VERSION,"staging_read_only":staging_read_only_enabled()}),
     )
 }
 async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -8377,7 +8379,7 @@ async fn update_ue_profile(
     (StatusCode::OK, Json(managed_profile_json(&record)))
 }
 
-fn scenario_assignment_block_reason(
+fn scenario_execution_block_reason(
     catalog: &ScenarioCatalog,
     scenario_id: &str,
     dl_sender_available: bool,
@@ -8387,6 +8389,13 @@ fn scenario_assignment_block_reason(
         .iter()
         .find(|item| item.id == scenario_id)
         .ok_or("SCENARIO_DEFINITION_NOT_FOUND")?;
+    scenario_definition_block_reason(definition, dl_sender_available)
+}
+
+fn scenario_definition_block_reason(
+    definition: &ScenarioDefinition,
+    dl_sender_available: bool,
+) -> Result<Option<&'static str>, String> {
     if definition_support_status(definition) == SUPPORT_BACKEND_REQUIRED {
         return Ok(Some("SCENARIO_BACKEND_REQUIRED"));
     }
@@ -8404,6 +8413,24 @@ fn scenario_assignment_block_reason(
         return Ok(Some("IMS_NOT_AVAILABLE"));
     }
     Ok(None)
+}
+
+fn scenario_execution_message(reason: &str) -> &'static str {
+    match reason {
+        "IMS_NOT_AVAILABLE" => "Brouillon non exécutable : pile IMS et client SIP requis.",
+        "DL_SENDER_NOT_AVAILABLE" => "Brouillon non exécutable : émetteur DN indisponible.",
+        "UL_RECEIVER_NOT_AVAILABLE" => "Brouillon non exécutable : récepteur DN indisponible.",
+        "SCENARIO_BACKEND_REQUIRED" => "Brouillon non exécutable : prérequis backend manquant.",
+        _ => "Brouillon non exécutable.",
+    }
+}
+
+fn scenario_assignment_block_reason(
+    catalog: &ScenarioCatalog,
+    scenario_id: &str,
+    dl_sender_available: bool,
+) -> Result<Option<&'static str>, String> {
+    scenario_execution_block_reason(catalog, scenario_id, dl_sender_available)
 }
 
 async fn assign_ue_profile_scenario(
@@ -9290,15 +9317,30 @@ async fn history(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 fn scenario_definition_error(error: String) -> (StatusCode, Json<Value>) {
+    if let Some(suggestion) = error.strip_prefix("SCENARIO_NAME_VERSION_CONFLICT|") {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error":"SCENARIO_NAME_VERSION_CONFLICT",
+                "suggestion":suggestion
+            })),
+        );
+    }
     let status = match error.as_str() {
         "SCENARIO_DEFINITION_NOT_FOUND" => StatusCode::NOT_FOUND,
         "SCENARIO_DEFINITION_ALREADY_EXISTS"
         | "SCENARIO_ID_EXISTS"
         | "TEMPLATE_ID_RESERVED"
-        | "SCENARIO_TEMPLATE_READ_ONLY" => StatusCode::CONFLICT,
+        => StatusCode::CONFLICT,
+        "SCENARIO_TEMPLATE_READ_ONLY" => StatusCode::FORBIDDEN,
         _ => StatusCode::UNPROCESSABLE_ENTITY,
     };
-    (status, Json(json!({"error":error})))
+    let public_error = if error == "SCENARIO_TEMPLATE_READ_ONLY" {
+        "TEMPLATE_PROTECTED"
+    } else {
+        error.as_str()
+    };
+    (status, Json(json!({"error":public_error})))
 }
 
 async fn estimate_scenario_definition(
@@ -9427,10 +9469,11 @@ async fn import_scenario_definition(
 
 async fn list_scenario_definitions(State(state): State<Arc<AppState>>) -> Json<Value> {
     let catalog = state.scenario_catalog.lock().unwrap();
+    let dl_available = dl_sender_health(&state).is_ok();
     let items = catalog
         .definitions
         .iter()
-        .map(scenario_definition_view)
+        .map(|definition| scenario_definition_view(&state, definition, dl_available))
         .collect::<Vec<_>>();
     Json(json!({
         "items":items,
@@ -9439,7 +9482,11 @@ async fn list_scenario_definitions(State(state): State<Arc<AppState>>) -> Json<V
     }))
 }
 
-fn scenario_definition_view(definition: &ScenarioDefinition) -> Value {
+fn scenario_definition_view(
+    state: &AppState,
+    definition: &ScenarioDefinition,
+    dl_available: bool,
+) -> Value {
     let mut value = serde_json::to_value(definition).unwrap_or(Value::Null);
     if let Some(object) = value.as_object_mut() {
         let system = definition.id.starts_with("tpl-");
@@ -9452,6 +9499,24 @@ fn scenario_definition_view(definition: &ScenarioDefinition) -> Value {
         object.insert(
             "backend_support".into(),
             json!(definition_support_status(definition)),
+        );
+        let assigned = state
+            .profile_registry
+            .lock()
+            .unwrap()
+            .profiles
+            .iter()
+            .filter(|profile| profile.scenario_id.as_deref() == Some(definition.id.as_str()))
+            .count();
+        object.insert("assigned_ues".into(), json!(assigned));
+        let block = scenario_definition_block_reason(definition, dl_available)
+            .ok()
+            .flatten();
+        object.insert("executable".into(), json!(block.is_none()));
+        object.insert("execution_block_reason".into(), json!(block));
+        object.insert(
+            "execution_message".into(),
+            block.map_or(Value::Null, |reason| json!(scenario_execution_message(reason))),
         );
     }
     value
@@ -9481,7 +9546,14 @@ async fn get_scenario_definition(
 ) -> impl IntoResponse {
     let catalog = state.scenario_catalog.lock().unwrap();
     match catalog.definitions.iter().find(|item| item.id == id) {
-        Some(definition) => (StatusCode::OK, Json(scenario_definition_view(definition))),
+        Some(definition) => (
+            StatusCode::OK,
+            Json(scenario_definition_view(
+                &state,
+                definition,
+                dl_sender_health(&state).is_ok(),
+            )),
+        ),
         None => scenario_definition_error("SCENARIO_DEFINITION_NOT_FOUND".into()),
     }
 }
@@ -9498,7 +9570,11 @@ async fn create_scenario_definition(
     match state.scenario_definition_store.create(&mut catalog, input) {
         Ok(definition) => (
             StatusCode::CREATED,
-            Json(scenario_definition_view(&definition)),
+            Json(scenario_definition_view(
+                &state,
+                &definition,
+                dl_sender_health(&state).is_ok(),
+            )),
         ),
         Err(error) => scenario_definition_error(error),
     }
@@ -9518,7 +9594,14 @@ async fn update_scenario_definition(
         .scenario_definition_store
         .update(&mut catalog, &id, input)
     {
-        Ok(definition) => (StatusCode::OK, Json(scenario_definition_view(&definition))),
+        Ok(definition) => (
+            StatusCode::OK,
+            Json(scenario_definition_view(
+                &state,
+                &definition,
+                dl_sender_health(&state).is_ok(),
+            )),
+        ),
         Err(error) => scenario_definition_error(error),
     }
 }
@@ -9559,7 +9642,11 @@ async fn clone_scenario_definition(
     {
         Ok(definition) => (
             StatusCode::CREATED,
-            Json(scenario_definition_view(&definition)),
+            Json(scenario_definition_view(
+                &state,
+                &definition,
+                dl_sender_health(&state).is_ok(),
+            )),
         ),
         Err(error) => scenario_definition_error(error),
     }
@@ -12807,7 +12894,7 @@ fn build_ue_activity_payload(state: &AppState, ue_id: &str, identity: &Effective
     let events = state.activity_events.snapshot(ue_id);
 
     // 2. Resolve the owning backend job (if any) + its spec + handle.
-    let (approved_runtime, handle, imsi_from_profile) = {
+    let (approved_runtime, handle) = {
         let controller = match state.multi_ue.lock() {
             Ok(guard) => guard,
             Err(_) => {
@@ -12828,17 +12915,20 @@ fn build_ue_activity_payload(state: &AppState, ue_id: &str, identity: &Effective
             .snapshot()
             .into_iter()
             .find(|job| job.ue_id == ue_id);
-        let profile_imsi = controller
-            .profiles()
-            .into_iter()
-            .find(|profile| profile.ue_id == ue_id)
-            .map(|profile| profile.pseudonym);
         (
             job.as_ref().and_then(|job| job.approved_runtime.clone()),
             job.and_then(|job| job.process_handle),
-            profile_imsi,
         )
     };
+
+    let managed_profile = state
+        .profile_registry
+        .lock()
+        .ok()
+        .and_then(|registry| registry.profiles.iter().find(|profile| profile.profile.ue_id == ue_id).cloned());
+    let imsi_from_profile = managed_profile
+        .as_ref()
+        .and_then(|profile| state.profile_store.subscriber_imsi(profile).ok());
 
     let imsi_projection = activity::imsi_for_role(imsi_from_profile.as_deref(), &identity.role);
 
@@ -13100,25 +13190,26 @@ async fn start_scenario(
         let Some(definition) = definition else {
             return scenario_definition_error("SCENARIO_DEFINITION_NOT_FOUND".into());
         };
-        if definition_support_status(&definition) == SUPPORT_BACKEND_REQUIRED {
+        if let Ok(Some(reason)) =
+            scenario_definition_block_reason(&definition, dl_sender_health(&state).is_ok())
+        {
+            let status = if reason == "IMS_NOT_AVAILABLE" {
+                StatusCode::LOCKED
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            };
             return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"error":"SCENARIO_BACKEND_REQUIRED"})),
+                status,
+                Json(json!({
+                    "error":reason,
+                    "message":scenario_execution_message(reason)
+                })),
             );
         }
         let resolved = match resolve_steps(&definition) {
             Ok(value) => value,
             Err(error) => return scenario_definition_error(error),
         };
-        if resolved
-            .iter()
-            .any(|step| matches!(step.step_type.as_str(), "ims_register" | "voice_call"))
-        {
-            return (
-                StatusCode::LOCKED,
-                Json(json!({"error":"IMS_NOT_AVAILABLE"})),
-            );
-        }
         let has_lte_steps = resolved.iter().any(|step| {
             matches!(
                 step.step_type.as_str(),
@@ -20055,11 +20146,12 @@ mod p0_tests {
             )
             .await
             .unwrap();
-        assert_eq!(imported.status(), StatusCode::CREATED);
+        assert_eq!(imported.status(), StatusCode::CONFLICT);
         let imported: Value =
             serde_json::from_slice(&to_bytes(imported.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(imported["id"], "high-runner-copy");
+        assert_eq!(imported["error"], "SCENARIO_NAME_VERSION_CONFLICT");
+        assert_eq!(imported["suggestion"], "High runner (2)");
 
         for (id, expected, error) in [
             ("tpl-voice-short", StatusCode::LOCKED, "IMS_NOT_AVAILABLE"),
@@ -20139,7 +20231,7 @@ mod p0_tests {
         assert!(items
             .iter()
             .any(|item| item["template_id"] == "tpl-5g-data-ul"
-                && item["backend_support"] == "BACKEND_REQUIRED"));
+                && item["backend_support"] == "SUPPORTED"));
 
         let viewer_clone = application
             .clone()
@@ -20214,7 +20306,7 @@ mod p0_tests {
         let denied_body: Value =
             serde_json::from_slice(&to_bytes(denied.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(denied_body["error"], "SCENARIO_BACKEND_REQUIRED");
+        assert_eq!(denied_body["error"], "UL_RECEIVER_NOT_AVAILABLE");
     }
 
     fn install_definition(

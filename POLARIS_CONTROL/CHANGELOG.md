@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.32.0 — 2026-11-13 — scenario and UE workflow simplification
+
+- Protects system templates with HTTP 403 and clone-only editing, repairs seed
+  timestamps, assignment counts, duplicate name/version detection, and exposes a
+  single executable/draft contract shared by API and UI.
+- Makes seconds-to-milliseconds conversion explicit and rejects traffic whose
+  byte/rate estimate exceeds the bounded server execution window.
+- Simplifies UE actions around Run, masks subscriber identities in lists, and
+  reports Activity values and failure details without invented states.
+- Uses the UE receiver's actual iperf3 JSON for downlink accounting and aligns
+  traffic capability labels with the backend already present in this branch.
+- Aligns platform, API and web manifests on 0.32.0. IMS voice remains unavailable
+  until the separately documented SIP/IMS design is implemented.
+
 ## 0.31.2 — 2026-11-13 — platform version string alignment (patch)
 
 Upgrade PATCH : 0.31.1 oubliait d'actualiser le littéral hardcodé

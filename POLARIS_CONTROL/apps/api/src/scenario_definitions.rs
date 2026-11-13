@@ -13,6 +13,7 @@ pub const MAX_LOOP_COUNT: u32 = 10_000;
 pub const MAX_RESOLVED_STEPS: usize = 10_000;
 pub const MAX_REPEAT_DEPTH: usize = 2;
 pub const MAX_TRAFFIC_BYTES: u64 = 200 * 1024 * 1024;
+pub const MAX_TRAFFIC_EXECUTION_MS: u64 = 300_000;
 pub const EXPORT_SCHEMA_VERSION: &str = "polaris.scenario-definition.v2";
 pub const TEMPLATE_CATALOG_SCHEMA_VERSION: &str = "polaris.scenario-template-catalog.v1";
 pub const DEFAULT_TEMPLATE_UE_COUNT: u64 = 1;
@@ -221,6 +222,7 @@ impl ScenarioDefinitionStore {
         if catalog.definitions.iter().any(|item| item.id == input.id) {
             return Err("SCENARIO_DEFINITION_ALREADY_EXISTS".into());
         }
+        reject_name_version_conflict(catalog, &input.name, 1, None)?;
         let now = epoch_seconds();
         let definition = ScenarioDefinition {
             id: input.id,
@@ -264,10 +266,12 @@ impl ScenarioDefinitionStore {
             .ok_or("SCENARIO_DEFINITION_NOT_FOUND")?;
         let original = catalog.clone();
         let previous = &original.definitions[index];
+        let next_version = previous.version.saturating_add(1);
+        reject_name_version_conflict(catalog, &input.name, next_version, Some(id))?;
         let updated = ScenarioDefinition {
             id: input.id,
             name: input.name,
-            version: previous.version.saturating_add(1),
+            version: next_version,
             loop_count: input.loop_count,
             steps: input.steps,
             created_at_epoch_s: previous.created_at_epoch_s,
@@ -343,6 +347,7 @@ impl ScenarioDefinitionStore {
         {
             return Err("SCENARIO_DEFINITION_ALREADY_EXISTS".into());
         }
+        reject_name_version_conflict(catalog, &mutation.name, 1, None)?;
         let now = epoch_seconds();
         let clone = ScenarioDefinition {
             id: mutation.id,
@@ -367,6 +372,25 @@ impl ScenarioDefinitionStore {
         }
         Ok(clone)
     }
+}
+
+fn reject_name_version_conflict(
+    catalog: &ScenarioCatalog,
+    name: &str,
+    version: u64,
+    except_id: Option<&str>,
+) -> Result<(), String> {
+    if catalog.definitions.iter().any(|item| {
+        item.name.trim().eq_ignore_ascii_case(name.trim())
+            && item.version == version
+            && except_id != Some(item.id.as_str())
+    }) {
+        return Err(format!(
+            "SCENARIO_NAME_VERSION_CONFLICT|{} (2)",
+            name.trim()
+        ));
+    }
+    Ok(())
 }
 
 pub fn resolve_steps(definition: &ScenarioDefinition) -> Result<Vec<ResolvedStep>, String> {
@@ -616,6 +640,15 @@ fn validate_parameters(step: &ScenarioStep) -> Result<(), String> {
             if rate == 0 || rate > 100_000_000 || duration == 0 || duration > 300 {
                 return Err("TRAFFIC_RATE_DURATION_OUT_OF_RANGE".into());
             }
+            let estimated_ms = bytes
+                .checked_mul(8)
+                .and_then(|bits| bits.checked_mul(1_000))
+                .and_then(|value| value.checked_add(rate.saturating_sub(1)))
+                .map(|value| value / rate)
+                .ok_or("SCENARIO_DURATION_OVERFLOW")?;
+            if estimated_ms > MAX_TRAFFIC_EXECUTION_MS {
+                return Err("TRAFFIC_ESTIMATED_DURATION_EXCEEDS_SERVER_LIMIT".into());
+            }
         }
     }
     if matches!(step.step_type.as_str(), "idle" | "voice_call") {
@@ -678,7 +711,7 @@ fn repeat(loop_count: u32, steps: Vec<ScenarioStep>) -> ScenarioStep {
 }
 
 pub fn builtin_templates() -> Vec<ScenarioDefinition> {
-    let now = 0;
+    let now = epoch_seconds();
     let p = |pairs: &[(&str, u64)]| {
         pairs
             .iter()
@@ -991,7 +1024,7 @@ pub fn default_scenario_templates() -> Vec<ScenarioTemplateDescriptor> {
             "5G SA Data UL — UDP 1 Mbit/s for 60 seconds",
             vec![step("traffic_ul", data())],
             &["pdu_session", "udp_rate_duration_v1"],
-            SUPPORT_BACKEND_REQUIRED,
+            SUPPORT_SUPPORTED,
             false,
         ),
         descriptor(
@@ -1001,7 +1034,7 @@ pub fn default_scenario_templates() -> Vec<ScenarioTemplateDescriptor> {
             "5G SA Data DL — UDP 1 Mbit/s for 60 seconds",
             vec![step("traffic_dl", data())],
             &["pdu_session", "udp_rate_duration_v1", "dn_sender"],
-            SUPPORT_BACKEND_REQUIRED,
+            SUPPORT_SUPPORTED,
             false,
         ),
         descriptor(
@@ -1021,7 +1054,7 @@ pub fn default_scenario_templates() -> Vec<ScenarioTemplateDescriptor> {
                 "udp_rate_duration_v1",
                 "dn_sender",
             ],
-            SUPPORT_BACKEND_REQUIRED,
+            SUPPORT_SUPPORTED,
             false,
         ),
         descriptor(
@@ -1042,7 +1075,7 @@ pub fn default_scenario_templates() -> Vec<ScenarioTemplateDescriptor> {
                 "udp_rate_duration_v1",
                 "dn_sender",
             ],
-            SUPPORT_BACKEND_REQUIRED,
+            SUPPORT_SUPPORTED,
             false,
         ),
     ];
@@ -1169,13 +1202,6 @@ pub fn definition_support_status(definition: &ScenarioDefinition) -> &'static st
     if definition
         .steps
         .iter()
-        .any(step_requires_udp_rate_duration_backend)
-    {
-        return SUPPORT_BACKEND_REQUIRED;
-    }
-    if definition
-        .steps
-        .iter()
         .any(|step| step.step_type.starts_with("lte_"))
     {
         return SUPPORT_CERTIFICATION_REQUIRED;
@@ -1258,6 +1284,9 @@ pub fn migrate_builtin_templates(
                     continue;
                 }
                 if stored.version < template.version {
+                    let old = std::mem::replace(&mut catalog.definitions[index], template);
+                    report.replaced.push(old);
+                } else if stored.created_at_epoch_s == 0 || stored.updated_at_epoch_s == 0 {
                     let old = std::mem::replace(&mut catalog.definitions[index], template);
                     report.replaced.push(old);
                 }
@@ -1498,6 +1527,7 @@ mod tests {
         for template in &templates {
             validate_definition(template).unwrap();
             assert!(resolve_steps(template).unwrap().len() <= MAX_RESOLVED_STEPS);
+            assert!(template.created_at_epoch_s > 0);
         }
         let root = std::env::temp_dir().join(format!("polaris-templates-{}", epoch_seconds()));
         let store = ScenarioDefinitionStore::new(root.join("catalog.json"));
@@ -1620,7 +1650,7 @@ mod tests {
             template_descriptor("tpl-5g-data-dl")
                 .unwrap()
                 .backend_support,
-            SUPPORT_BACKEND_REQUIRED
+            SUPPORT_SUPPORTED
         );
     }
 
@@ -1630,7 +1660,7 @@ mod tests {
             .into_iter()
             .find(|definition| definition.id == "tpl-5g-data-ul")
             .unwrap();
-        assert_eq!(definition_support_status(&data), SUPPORT_BACKEND_REQUIRED);
+        assert_eq!(definition_support_status(&data), SUPPORT_SUPPORTED);
         let mut mutation = mutation("tcp-without-approval");
         mutation.steps = vec![step(
             "traffic_ul",
@@ -1649,6 +1679,57 @@ mod tests {
             .parameters
             .insert("tcp_authorized".into(), fixed(true));
         validate_mutation(&mutation).unwrap();
+    }
+
+    #[test]
+    fn duplicate_name_and_version_returns_a_numbered_suggestion() {
+        let root = std::env::temp_dir().join(format!("polaris-duplicate-{}", epoch_seconds()));
+        let store = ScenarioDefinitionStore::new(root.join("catalog.json"));
+        let mut catalog = store.load().unwrap();
+        let mut first = mutation("first");
+        first.name = "Unique workflow".into();
+        store.create(&mut catalog, first).unwrap();
+        let mut duplicate = mutation("second");
+        duplicate.name = "Unique workflow".into();
+        assert_eq!(
+            store.create(&mut catalog, duplicate).unwrap_err(),
+            "SCENARIO_NAME_VERSION_CONFLICT|Unique workflow (2)"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn traffic_byte_rate_estimate_must_fit_server_window() {
+        let mut slow = mutation("slow-transfer");
+        slow.steps = vec![step(
+            "traffic_ul",
+            BTreeMap::from([
+                ("bytes".into(), fixed(100_u64 * 1024 * 1024)),
+                ("protocol".into(), fixed("UDP")),
+                ("rate_bps".into(), fixed(1_000_u64)),
+                ("duration_seconds".into(), fixed(300_u64)),
+            ]),
+        )];
+        assert_eq!(
+            validate_mutation(&slow).unwrap_err(),
+            "TRAFFIC_ESTIMATED_DURATION_EXCEEDS_SERVER_LIMIT"
+        );
+    }
+
+    #[test]
+    fn wait_contract_is_milliseconds() {
+        let mut wait = mutation("wait-two-seconds");
+        wait.steps = vec![step(
+            "wait",
+            BTreeMap::from([("duration_ms".into(), fixed(2_000_u64))]),
+        )];
+        let definition = ScenarioDefinition {
+            id: wait.id.clone(), name: wait.name.clone(), version: 1,
+            loop_count: 1, steps: wait.steps, created_at_epoch_s: 1,
+            updated_at_epoch_s: 1, rat: "5G_SA".into(), simulator: "UERANSIM".into(),
+            description: String::new(), source_definition_id: None,
+        };
+        assert_eq!(estimate_duration_ms(&definition).unwrap(), 2_000);
     }
 
     #[test]
