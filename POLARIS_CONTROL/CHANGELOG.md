@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.31.2 — 2026-11-13 — platform version string alignment (patch)
+
+Upgrade PATCH : 0.31.1 oubliait d'actualiser le littéral hardcodé
+`"platform":"0.31.0"` dans `polaris_control_api::version()` ; constat ANR1 sur
+`451f52f` : `GET /api/v1/version` renvoyait `{"api":"0.31.1","platform":"0.31.0",…}`
+(platform et api désalignés).
+
+- `apps/api/src/lib.rs:3723` : littéral `platform` passé à `"0.31.2"`.
+- Manifestes alignés sur `0.31.2` : `apps/api/Cargo.toml`, `Cargo.lock`
+  (polaris-control-api), `apps/web/package.json`, `apps/web/package-lock.json`,
+  `VERSION_MANIFEST.toml` (platform / web / api).
+- Aucun changement fonctionnel, aucun changement sur la règle 13 captures
+  introduite en 0.31.1.
+
 ## 0.31.1 — 2026-11-13 — 0.31.0 + exigence de 13 captures issue de 0.30.1 (ANR1 #10)
 
 ANR1 a prouvé (issue #10) que 0.31.0 (SHA `68f4784`) ne contenait pas le

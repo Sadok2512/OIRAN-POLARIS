@@ -3720,7 +3720,7 @@ async fn health() -> Json<Value> {
 }
 async fn version() -> Json<Value> {
     Json(
-        json!({"platform":"0.31.0","api":VERSION,"scenario_engine":scenario_engine::VERSION,"safety_guard":safety_guard::VERSION,"ueransim_adapter":ueransim_adapter::VERSION,"srsran_controller":srsran_controller::VERSION,"multi_ue_controller":simulator_controller::VERSION,"staging_read_only":staging_read_only_enabled()}),
+        json!({"platform":"0.31.2","api":VERSION,"scenario_engine":scenario_engine::VERSION,"safety_guard":safety_guard::VERSION,"ueransim_adapter":ueransim_adapter::VERSION,"srsran_controller":srsran_controller::VERSION,"multi_ue_controller":simulator_controller::VERSION,"staging_read_only":staging_read_only_enabled()}),
     )
 }
 async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
