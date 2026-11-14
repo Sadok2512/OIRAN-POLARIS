@@ -5,7 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { LabUesPage, rowState } from './LabUes';
 import { DEFAULT_FORM, buildSteps, isListed, slugify } from './LabScenarios';
-import { LabUeMonitorPage, lastRun, nextSamples, toneFor } from './LabUeMonitor';
+import { LabUeMonitorPage, lastRun, nextSamples, rrcView, toneFor } from './LabUeMonitor';
 import { needsTwoUes, stepsSummary } from './labShared';
 import type { WireScenarioDefinition } from '@/scenarios/wireCodec';
 
@@ -155,4 +155,13 @@ describe('LabUeMonitorPage — 0.36.1 (ANR2 FAIL 0.36.0)', () => {
     expect(screen.getByTestId('monitor-last-run').textContent).toContain('Trafic DL');
     vi.unstubAllGlobals();
   }, 10000);
+});
+
+describe('rrcView — 0.36.2 (ANR2 FAIL 0.36.1 : rrc_state=null)', () => {
+  it('derives RRC from CM state when nr-cli gives none', () => {
+    expect(rrcView({ rrc_state: null, cm_state: 'CM-CONNECTED' })).toEqual({ value: 'RRC-CONNECTED', source: 'déduit de CM-CONNECTED' });
+    expect(rrcView({ rrc_state: null, cm_state: 'CM-IDLE' }).value).toBe('RRC-IDLE');
+    expect(rrcView({ rrc_state: 'RRC-CONNECTED', cm_state: 'CM-IDLE' })).toEqual({ value: 'RRC-CONNECTED', source: 'nr-cli' });
+    expect(rrcView({}).value).toBeNull();
+  });
 });

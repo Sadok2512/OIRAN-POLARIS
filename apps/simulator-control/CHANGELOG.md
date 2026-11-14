@@ -1,5 +1,14 @@
 # @telecom/simulator-control — Changelog
 
+## 0.36.2 — 2026-11-14 — Suivi UE : RRC affiché (patch)
+
+- Corrige le FAIL ANR2 de 0.36.1 (#10 6880630088) : `states.rrc_state` est
+  toujours `null` car UERANSIM `nr-cli status` n'imprime pas de ligne
+  `rrc-state` (seulement cm/rm/mm-state). UERANSIM n'a pas d'état
+  RRC_INACTIVE : la tuile RRC affiche `RRC-CONNECTED` / `RRC-IDLE` déduit
+  de `cm_state`, avec la mention « déduit de CM-… ». Si le backend fournit
+  un jour `rrc_state`, il est affiché tel quel (source nr-cli).
+
 ## 0.36.1 — 2026-11-14 — Suivi UE : valeurs live et dernier run (patch)
 
 - Corrige le FAIL ANR2 de 0.36.0 (#10 6880321239) : la page de suivi ne

@@ -74,6 +74,20 @@ export function toneFor(value: string | null | undefined): Tone {
   return 'idle';
 }
 
+/**
+ * 0.36.2 — UERANSIM `nr-cli status` prints cm-state / rm-state / mm-state
+ * but no rrc-state line, so `states.rrc_state` is always null (ANR2 FAIL
+ * 0.36.1). UERANSIM has no RRC_INACTIVE: CM-CONNECTED ⇔ RRC connected,
+ * CM-IDLE ⇔ RRC idle. The derived value is labelled as such.
+ */
+export function rrcView(states: { rrc_state?: string | null; cm_state?: string | null }): { value: string | null; source: string | null } {
+  if (states.rrc_state) return { value: states.rrc_state, source: 'nr-cli' };
+  const cm = (states.cm_state ?? '').toUpperCase();
+  if (cm.includes('CONNECTED')) return { value: 'RRC-CONNECTED', source: `déduit de ${states.cm_state}` };
+  if (cm.includes('IDLE')) return { value: 'RRC-IDLE', source: `déduit de ${states.cm_state}` };
+  return { value: null, source: null };
+}
+
 export function nextSamples(prev: RateSample[], data: UeActivityPayload): RateSample[] {
   const c = data.counters;
   if (!c || (c.rx_bps == null && c.tx_bps == null)) return prev;
@@ -127,6 +141,7 @@ export function LabUeMonitorPage() {
   }, [ueId]);
 
   const st = payload?.states ?? {};
+  const rrc = rrcView(st);
   const pdus = payload?.pdus?.length ? payload.pdus : payload?.pdu ? [payload.pdu] : [];
   const job = payload?.job_step ?? null;
   const events = useMemo(() => [...(payload?.events ?? [])].sort((a, b) => b.epoch_s - a.epoch_s).slice(0, 30), [payload?.events]);
@@ -166,7 +181,12 @@ export function LabUeMonitorPage() {
       )}
 
       <div className="grid gap-3 grid-cols-2 lg:grid-cols-4" data-testid="monitor-kpis">
-        <Kpi label="RRC" value={<Badge tone={toneFor(st.rrc_state)}>{st.rrc_state ?? '--'}</Badge>} />
+        <Kpi
+          label="RRC"
+          testid="monitor-rrc"
+          value={<Badge tone={toneFor(rrc.value)}>{rrc.value ?? '--'}</Badge>}
+          sub={rrc.source ?? (payload?.running ? 'non exposé par UERANSIM' : undefined)}
+        />
         <Kpi
           label="Enregistrement (5GMM / RM)"
           value={<Badge tone={toneFor(st.rm_state ?? st.mm_5g_state)}>{st.rm_state ?? st.mm_5g_state ?? '--'}</Badge>}
