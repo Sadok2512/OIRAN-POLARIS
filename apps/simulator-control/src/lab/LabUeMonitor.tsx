@@ -7,7 +7,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { Card, PageHeader } from '@/components/mockup';
 import { polarisApi } from '@/data/polarisClient';
-import { useStopScenario } from '@/data/queries';
+import { useStopScenario, useUes } from '@/data/queries';
 import type { UeActivityPayload } from '@/pages/UeActivity';
 import { Badge, Kpi, ThroughputChart, formatBps, formatBytes, hhmmss, type RateSample, type Tone } from './labShared';
 
@@ -112,6 +112,8 @@ export function LabUeMonitorPage() {
   const [live, setLive] = useState<'connexion' | 'en direct' | 'reconnexion'>('connexion');
   const [error, setError] = useState<string | null>(null);
   const stop = useStopScenario();
+  const ues = useUes();
+  const inventoryImsi = (ues.data?.items ?? []).find((u) => u.id === ueId) as { subscriber_identity?: string | null } | undefined;
 
   useEffect(() => {
     if (!ueId) return;
@@ -163,7 +165,7 @@ export function LabUeMonitorPage() {
       <PageHeader
         eyebrow="Suivi UE"
         title={ueId}
-        desc={`IMSI ${payload?.imsi ?? '--'} · flux ${live}`}
+        desc={`IMSI ${payload?.imsi ?? inventoryImsi?.subscriber_identity ?? '--'} · flux ${live}`}
         actions={
           <div className="flex gap-2">
             <Link to="/lab/ues" className="inline-flex items-center h-10 px-4 rounded-md border border-line text-ep-md">

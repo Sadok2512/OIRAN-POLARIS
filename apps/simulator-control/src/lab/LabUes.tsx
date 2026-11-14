@@ -133,10 +133,10 @@ export function LabUesPage() {
         </p>
       )}
       <Card className="overflow-x-auto">
-        <table className="w-full min-w-[900px] text-ep-sm" data-testid="lab-ue-table">
+        <table className="w-full min-w-[720px] text-ep-sm" data-testid="lab-ue-table">
           <thead>
             <tr className="text-left text-ep-xs uppercase tracking-wider text-mute">
-              <th className="px-4 py-3 font-semibold">UE</th>
+              <th className="px-3 py-3 font-semibold">UE</th>
               <th className="px-3 py-3 font-semibold">IMSI</th>
               <th className="px-3 py-3 font-semibold">Abonné</th>
               <th className="px-3 py-3 font-semibold">État</th>
@@ -176,7 +176,7 @@ export function LabUesPage() {
                     <Link to={`/lab/ues/${encodeURIComponent(id)}`} className="font-semibold text-brand underline underline-offset-2">
                       {id}
                     </Link>
-                    <div className="text-ep-xs text-mute">{row.technology ?? '5G SA'} · {row.simulator ?? 'UERANSIM'} · {row.serving_node ?? '--'}</div>
+                    <div className="text-ep-xs text-mute whitespace-nowrap">{row.technology ?? '5G SA'} · {row.serving_node ?? '--'}</div>
                   </td>
                   <td className="px-3 py-3 font-mono text-ep-sm">{row.subscriber_identity && row.subscriber_identity !== 'PROTECTED' ? row.subscriber_identity : '-- (protégé)'}</td>
                   <td className="px-3 py-3">
@@ -186,7 +186,7 @@ export function LabUesPage() {
                   <td className="px-3 py-3">
                     <select
                       aria-label={`Scénario pour ${id}`}
-                      className="h-10 w-full max-w-[280px] rounded-md border border-line bg-surface px-2 text-ep-sm"
+                      className="h-10 w-full max-w-[210px] rounded-md border border-line bg-surface px-2 text-ep-sm"
                       value={selectable ? selected : ''}
                       disabled={!pilotable || running}
                       onChange={(e) => setChoice((prev) => ({ ...prev, [id]: e.target.value }))}
@@ -218,7 +218,7 @@ export function LabUesPage() {
                         {busy === id ? 'Lancement…' : 'Lancer'}
                       </button>
                     )}
-                    {!running && reason && <div className="text-ep-xs text-mute mt-1">{reason}</div>}
+                    {!running && reason && <div className="text-ep-xs text-mute mt-1 max-w-[180px] ml-auto">{reason}</div>}
                   </td>
                 </tr>
               );

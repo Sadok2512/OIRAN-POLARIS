@@ -5,6 +5,9 @@
 - « Dernier run » affiche l'événement `n2_qos` (5QI vus sur N2 par PDU,
   polaris-control-api 0.36.0) et le 5QI de l'appel voix ; « -- (statut) »
   quand il n'est pas observé.
+- « UE du lab » tient sans défilement horizontal sur un écran portable
+  (bouton Lancer visible) ; le suivi affiche l'IMSI de l'inventaire quand
+  l'UE est arrêté.
 
 ## 0.36.2 — 2026-11-14 — Suivi UE : RRC affiché (patch)
 

@@ -134,7 +134,10 @@ describe('LabUeMonitorPage — 0.36.1 (ANR2 FAIL 0.36.0)', () => {
     }
     vi.stubGlobal('EventSource', FakeES);
     let n = 0;
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input).endsWith('/ues')) {
+        return json(200, { items: [{ id: 'UE-201', subscriber_identity: '001010000000201' }], configured_profiles: [], configured_count: 1, active_count: 0, registered_count: 0 });
+      }
       n += 1;
       return json(200, n === 1
         ? { ue_id: 'UE-201', running: false, reason: 'UE_NOT_RUNNING', events: [] }
@@ -153,6 +156,7 @@ describe('LabUeMonitorPage — 0.36.1 (ANR2 FAIL 0.36.0)', () => {
     expect(screen.getByText('ACTIVE')).toBeTruthy();
     expect(screen.getByText(/DL 4\.0 Mbit\/s/)).toBeTruthy();
     expect(screen.getByTestId('monitor-last-run').textContent).toContain('Trafic DL');
+    expect(await screen.findByText(/IMSI 001010000000201/)).toBeTruthy();
     vi.unstubAllGlobals();
   }, 10000);
 });
