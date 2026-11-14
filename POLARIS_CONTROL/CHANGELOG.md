@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.36.3 — 2026-11-14 — Comptage RTP et SIP de l'appel fiables (patch)
+
+- Corrige l'écart ANR1 #10 6883618493 (API 143 paquets RTP par sens,
+  PCAP 301). Cause dans le code : `tcpdump -A` écrivait dans un pipe lu
+  seulement à la sortie (`wait_with_output`) ; une fois le tampon de
+  64 KiB plein, tcpdump bloquait et le RTP suivant était perdu.
+  143 × 2 paquets × ~230 octets de texte ≈ 64 KiB.
+- Les deux UE recevaient les chiffres de l'appelant
+  (`measurements.clone()`). Désormais une capture par UE (appelant ET
+  appelé) dans son netns, en pcap (`tcpdump -w`), analysée par tshark
+  après l'appel ; chaque événement `voice_call` porte ses propres
+  compteurs, son rôle et `capture.kernel_drops`.
+- SIP : le contrôle « BYE 200 » acceptait n'importe quel 200 (celui de
+  l'INVITE). Il exige maintenant un 200 dont le CSeq est BYE
+  (`sip.CSeq.method`). Idem pour 180 et 200 de l'INVITE.
+
 ## 0.36.2 — 2026-11-14 — 5QI de la PDU ouverte à l'enregistrement (patch)
 
 - Corrige l'écart ANR2 #10 6883071989 (`n2_qos internet five_qi=[]`).

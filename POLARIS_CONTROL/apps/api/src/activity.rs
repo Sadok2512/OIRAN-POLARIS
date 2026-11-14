@@ -688,6 +688,63 @@ pub fn five_qis_for_psi(pairs: &[(Option<u32>, u8)], psi: Option<u32>) -> Vec<u8
         .collect()
 }
 
+/// 0.36.3 — SIP ladder from `tshark -e sip.Method -e sip.Status-Code -e sip.CSeq.method`.
+pub struct SipLadder {
+    pub invite: bool,
+    pub ringing: bool,
+    pub invite_ok: bool,
+    pub ack: bool,
+    pub bye: bool,
+    pub bye_ok: bool,
+}
+
+pub fn parse_sip_ladder(stdout: &str) -> SipLadder {
+    let mut l = SipLadder { invite: false, ringing: false, invite_ok: false, ack: false, bye: false, bye_ok: false };
+    for line in stdout.lines() {
+        let cols: Vec<&str> = line.split('\t').map(str::trim).collect();
+        let method = cols.first().copied().unwrap_or("");
+        let status = cols.get(1).copied().unwrap_or("");
+        let cseq = cols.get(2).copied().unwrap_or("");
+        match method {
+            "INVITE" => l.invite = true,
+            "ACK" => l.ack = true,
+            "BYE" => l.bye = true,
+            _ => {}
+        }
+        if status == "180" && cseq == "INVITE" {
+            l.ringing = true;
+        }
+        // A 200 counts for the method of its CSeq only (0.35 matched any 200).
+        if status == "200" && cseq == "INVITE" {
+            l.invite_ok = true;
+        }
+        if status == "200" && cseq == "BYE" {
+            l.bye_ok = true;
+        }
+    }
+    l
+}
+
+/// (tx_packets, tx_bytes, rx_packets, rx_bytes) from `-e ip.src -e udp.length`;
+/// bytes = UDP payload (udp.length − 8), like tcpdump's "UDP, length".
+pub fn count_call_rtp(stdout: &str, ip: &str) -> (u64, u64, u64, u64) {
+    let (mut txp, mut txb, mut rxp, mut rxb) = (0, 0, 0, 0);
+    for line in stdout.lines() {
+        let mut cols = line.split('\t');
+        let src = cols.next().unwrap_or("").trim();
+        let Some(len) = cols.next().and_then(|v| v.trim().parse::<u64>().ok()) else { continue };
+        let payload = len.saturating_sub(8);
+        if src == ip {
+            txp += 1;
+            txb += payload;
+        } else {
+            rxp += 1;
+            rxb += payload;
+        }
+    }
+    (txp, txb, rxp, rxb)
+}
+
 #[cfg(test)]
 mod five_qi_tests {
     use super::*;
@@ -695,6 +752,20 @@ mod five_qi_tests {
     fn parses_tshark_fields() {
         assert_eq!(parse_tshark_five_qis("1\n\n9,1\n"), vec![1, 9, 1]);
         assert!(parse_tshark_five_qis("").is_empty());
+    }
+    #[test]
+    fn sip_ladder_requires_200_for_the_right_cseq() {
+        // INVITE 200 alone must NOT validate BYE 200 (0.35 text check did).
+        let partial = parse_sip_ladder("INVITE\t\tINVITE\n\t180\tINVITE\n\t200\tINVITE\nACK\t\tACK\nBYE\t\tBYE\n");
+        assert!(partial.invite && partial.ringing && partial.invite_ok && partial.ack && partial.bye);
+        assert!(!partial.bye_ok);
+        let full = parse_sip_ladder("BYE\t\tBYE\n\t200\tBYE\n");
+        assert!(full.bye_ok);
+    }
+    #[test]
+    fn counts_rtp_per_direction() {
+        let out = "10.47.0.29\t180\n10.77.24.20\t180\n10.47.0.29\t180\n";
+        assert_eq!(count_call_rtp(out, "10.47.0.29"), (2, 344, 1, 172));
     }
     #[test]
     fn attributes_five_qi_by_psi() {

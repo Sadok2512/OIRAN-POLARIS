@@ -13280,6 +13280,7 @@ fn wait_for_call_established(
     }
 }
 
+#[cfg(test)]
 fn rtp_measurements(tcpdump: &str, local_ip: &str) -> (u64, u64, u64, u64) {
     let mut tx_packets = 0u64;
     let mut tx_bytes = 0u64;
@@ -13349,45 +13350,23 @@ fn execute_voice_call(
         control,
         std::time::Duration::from_secs(5),
     )?;
-    let capture_seconds = duration_ms.div_ceil(1_000) + 8;
-    let caller_pid = DockerUeRuntime::output(&[
-        "inspect".into(),
-        "--format".into(),
-        "{{.State.Pid}}".into(),
-        caller_name.into(),
-    ])?
-    .trim()
-    .parse::<u32>()
-    .ok()
-    .filter(|pid| *pid > 0)
-    .ok_or("IMS_CALL_CAPTURE_FAILED")?;
-    let caller_pid = caller_pid.to_string();
-    let capture = Command::new("/usr/bin/nsenter")
-        .args([
-            "-t",
-            &caller_pid,
-            "-n",
-            "/usr/bin/timeout",
-            &capture_seconds.to_string(),
-            "/usr/bin/tcpdump",
-            "-n",
-            "-l",
-            "-U",
-            "-s",
-            "0",
-            "-A",
-            "-i",
-            "any",
-            "host",
-            &caller_ip,
-            "and",
-            "udp",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| "IMS_CALL_CAPTURE_FAILED")?;
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // 0.36.3 — one pcap per UE (caller AND callee), written to disk and
+    // analysed by tshark after the call. The previous `tcpdump -A` piped to
+    // stdout was only read at exit: once the 64 KiB pipe filled, tcpdump
+    // stalled and RTP was lost (API 143 vs PCAP 301, ANR1 #10 6883618493),
+    // and both UEs received the caller's numbers.
+    let callee_job = definition_job_approval(control, callee_id)?.ok_or("UE_NOT_STARTED")?;
+    let callee_container = callee_job
+        .process_handle
+        .as_deref()
+        .and_then(DockerUeRuntime::container_id)
+        .ok_or("UE_HANDLE_INVALID")?;
+    let callee_ip = DockerUeRuntime::observe_pdu_dnn(callee_container, "ims")?
+        .and_then(|pdu| pdu.ready_address().map(str::to_string))
+        .ok_or("IMS_PDU_NOT_ACTIVE")?;
+    let capture_seconds = duration_ms.div_ceil(1_000) + 30;
+    let caller_capture = CallPcap::start(caller_name, caller_id, &caller_ip, capture_seconds)?;
+    let callee_capture = CallPcap::start(callee_name, callee_id, &callee_ip, capture_seconds)?;
     let target = format!("sip:{callee_aor}@ims-lite.audit");
     baresip_control(caller_name, "dial", &target)?;
     let started = std::time::Instant::now();
@@ -13399,28 +13378,20 @@ fn execute_voice_call(
     )?;
     cancellable_wait(control, duration_ms)?;
     baresip_control(caller_name, "hangup", "")?;
-    let capture_output = capture
-        .wait_with_output()
-        .map_err(|_| "IMS_CALL_CAPTURE_FAILED")?;
-    let capture_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&capture_output.stdout),
-        String::from_utf8_lossy(&capture_output.stderr)
-    );
+    // Let BYE / 200 OK land in the captures.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let call_duration_ms = started.elapsed().as_millis() as u64;
+    let caller_result = caller_capture.finish();
+    let callee_result = callee_capture.finish();
     let caller_logs = DockerUeRuntime::output(&["logs".into(), caller_name.into()])?;
     let callee_logs = DockerUeRuntime::output(&["logs".into(), callee_name.into()])?;
-    let (tx_packets, tx_bytes, rx_packets, rx_bytes) = rtp_measurements(&capture_text, &caller_ip);
-    let invite = capture_text.contains("INVITE sip:") || caller_logs.contains("connecting to");
-    let ringing = capture_text.contains("SIP/2.0 180") || caller_logs.contains("180 Ringing");
-    let ok = capture_text.contains("SIP/2.0 200") || caller_logs.contains("SIP Progress: 200");
-    let ack = capture_text.contains("ACK sip:");
-    let bye = capture_text.contains("BYE sip:") || caller_logs.contains("terminated");
-    let bye_ok = capture_text.contains("CSeq:")
-        && capture_text.contains("BYE")
-        && capture_text.contains("SIP/2.0 200");
+    let caller_stats = caller_result?;
+    let callee_stats = callee_result?;
+    let sip = &caller_stats.sip;
     let established = caller_logs.contains("Call established")
         && (callee_logs.contains("Call established") || callee_logs.contains("answering call"));
-    if !(invite && ringing && ok && ack && bye && bye_ok && established) {
+    let signaling_ok = sip.invite && sip.ringing && sip.invite_ok && sip.ack && sip.bye && sip.bye_ok && established;
+    if !signaling_ok {
         record_activity_event(
             state,
             caller_id,
@@ -13428,28 +13399,219 @@ fn execute_voice_call(
             "FAILED",
             json!({
                 "error":"IMS_CALL_SIGNALING_INCOMPLETE",
-                "signaling":{"invite":invite,"ringing":ringing,"ok":ok,"ack":ack,
-                    "bye":bye,"bye_ok":bye_ok,"established":established},
-                "rtp":{"tx_packets":tx_packets,"tx_bytes":tx_bytes,
-                    "rx_packets":rx_packets,"rx_bytes":rx_bytes}
+                "signaling":{"invite":sip.invite,"ringing":sip.ringing,"ok":sip.invite_ok,"ack":sip.ack,
+                    "bye":sip.bye,"bye_ok":sip.bye_ok,"established":established},
+                "rtp":caller_stats.rtp_json()
             }),
         );
         return Err("IMS_CALL_SIGNALING_INCOMPLETE".into());
     }
-    if tx_packets == 0 || tx_bytes == 0 || rx_packets == 0 || rx_bytes == 0 {
+    if !caller_stats.bidirectional() || !callee_stats.bidirectional() {
         return Err("IMS_CALL_RTP_BIDIRECTIONAL_NOT_OBSERVED".into());
     }
-    let measurements = json!({
-        "sip":{"invite":true,"ringing":180,"ok":200,"ack":true,"bye":true,"bye_ok":200},
-        "duration_ms":started.elapsed().as_millis() as u64,
-        "rtp":{"tx_packets":tx_packets,"tx_bytes":tx_bytes,"rx_packets":rx_packets,"rx_bytes":rx_bytes},
-        "qos":ims_qos_verdict(state, ue_ids)
-    });
-    for ue_id in ue_ids {
-        record_activity_event(state, ue_id, "voice_call", "OK", measurements.clone());
-    }
-    Ok(measurements)
+    let qos = ims_qos_verdict(state, ue_ids);
+    let base = |stats: &CallPcapStats, role: &str| {
+        json!({
+            "role": role,
+            "sip":{"invite":true,"ringing":180,"ok":200,"ack":true,"bye":true,"bye_ok":200},
+            "duration_ms": call_duration_ms,
+            "rtp": stats.rtp_json(),
+            "capture": {"source":"tcpdump -w (UE netns) + tshark","kernel_drops":stats.kernel_drops},
+            "qos": qos.clone()
+        })
+    };
+    let caller_measurements = base(&caller_stats, "caller");
+    let callee_measurements = base(&callee_stats, "callee");
+    record_activity_event(state, caller_id, "voice_call", "OK", caller_measurements.clone());
+    record_activity_event(state, callee_id, "voice_call", "OK", callee_measurements);
+    Ok(caller_measurements)
 }
+
+/// 0.36.3 — Per-UE call capture written to a pcap (no stdout pipe).
+struct CallPcap {
+    child: std::process::Child,
+    path: std::path::PathBuf,
+    ip: String,
+}
+
+struct CallSip {
+    invite: bool,
+    ringing: bool,
+    invite_ok: bool,
+    ack: bool,
+    bye: bool,
+    bye_ok: bool,
+}
+
+struct CallPcapStats {
+    sip: CallSip,
+    tx_packets: u64,
+    tx_bytes: u64,
+    rx_packets: u64,
+    rx_bytes: u64,
+    kernel_drops: Option<u64>,
+}
+
+impl CallPcapStats {
+    fn bidirectional(&self) -> bool {
+        self.tx_packets > 0 && self.tx_bytes > 0 && self.rx_packets > 0 && self.rx_bytes > 0
+    }
+    fn rtp_json(&self) -> Value {
+        json!({"tx_packets":self.tx_packets,"tx_bytes":self.tx_bytes,
+               "rx_packets":self.rx_packets,"rx_bytes":self.rx_bytes})
+    }
+}
+
+impl CallPcap {
+    fn start(client_name: &str, ue_id: &str, ip: &str, seconds: u64) -> Result<Self, String> {
+        use std::io::{BufRead, BufReader};
+        let pid = DockerUeRuntime::output(&[
+            "inspect".into(),
+            "--format".into(),
+            "{{.State.Pid}}".into(),
+            client_name.into(),
+        ])?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or("IMS_CALL_CAPTURE_FAILED")?
+        .to_string();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default();
+        let safe: String = ue_id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+        let path = std::env::temp_dir().join(format!("polaris-call-{safe}-{stamp}.pcap"));
+        let mut child = Command::new("/usr/bin/nsenter")
+            .args([
+                "-t".to_string(),
+                pid,
+                "-n".into(),
+                "/usr/bin/timeout".into(),
+                seconds.to_string(),
+                "/usr/bin/tcpdump".into(),
+                "-n".into(),
+                "-U".into(),
+                "-s".into(),
+                "0".into(),
+                "-i".into(),
+                "any".into(),
+                "-w".into(),
+                path.to_string_lossy().into_owned(),
+                "host".into(),
+                ip.into(),
+                "and".into(),
+                "udp".into(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|_| "IMS_CALL_CAPTURE_FAILED")?;
+        // Wait for "listening on", then keep draining stderr in the background
+        // (the final statistics arrive there on exit).
+        let stderr = child.stderr.take().ok_or("IMS_CALL_CAPTURE_FAILED")?;
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(line) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                if line.contains("listening on") {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        if !ready {
+            let _ = Command::new("/bin/kill").args(["-TERM", &child.id().to_string()]).status();
+            let _ = child.wait();
+            let _ = fs::remove_file(&path);
+            return Err("IMS_CALL_CAPTURE_NOT_READY".into());
+        }
+        let capture = Self { child, path, ip: ip.to_string() };
+        CALL_STDERR.lock().map_err(|_| "IMS_CALL_CAPTURE_FAILED")?.insert(capture.child.id(), rx);
+        Ok(capture)
+    }
+
+    fn finish(mut self) -> Result<CallPcapStats, String> {
+        let _ = Command::new("/bin/kill").args(["-TERM", &self.child.id().to_string()]).status();
+        let mut exited = false;
+        for _ in 0..30 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !exited {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        let rx = CALL_STDERR.lock().ok().and_then(|mut map| map.remove(&self.child.id()));
+        let mut kernel_drops = None;
+        if let Some(rx) = rx {
+            while let Ok(line) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+                if let Some(n) = line.strip_suffix(" packets dropped by kernel") {
+                    kernel_drops = n.trim().parse::<u64>().ok();
+                }
+            }
+        }
+        let result = analyse_call_pcap(&self.path, &self.ip);
+        let _ = fs::remove_file(&self.path);
+        let (sip, rtp) = result?;
+        Ok(CallPcapStats {
+            sip,
+            tx_packets: rtp.0,
+            tx_bytes: rtp.1,
+            rx_packets: rtp.2,
+            rx_bytes: rtp.3,
+            kernel_drops,
+        })
+    }
+}
+
+static CALL_STDERR: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, std::sync::mpsc::Receiver<String>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn tshark_fields(path: &std::path::Path, filter: &str, fields: &[&str]) -> Result<String, String> {
+    let mut args: Vec<String> = vec![
+        "-n".into(), "19".into(), "/usr/bin/tshark".into(), "-n".into(),
+        "-r".into(), path.to_string_lossy().into_owned(), "-Y".into(), filter.into(),
+        "-T".into(), "fields".into(),
+    ];
+    for field in fields {
+        args.push("-e".into());
+        args.push((*field).into());
+    }
+    let output = Command::new("/usr/bin/nice")
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| "IMS_CALL_TSHARK_UNAVAILABLE".to_string())?;
+    if !output.status.success() {
+        return Err("IMS_CALL_TSHARK_FAILED".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// SIP ladder + RTP counters of one UE's call pcap.
+fn analyse_call_pcap(path: &std::path::Path, ip: &str) -> Result<(CallSip, (u64, u64, u64, u64)), String> {
+    let sip_text = tshark_fields(path, "sip", &["sip.Method", "sip.Status-Code", "sip.CSeq.method"])?;
+    let media = format!("udp && !(udp.port == 5060) && !sip && (ip.src == {ip} || ip.dst == {ip})");
+    let media_text = tshark_fields(path, &media, &["ip.src", "udp.length"])?;
+    let l = activity::parse_sip_ladder(&sip_text);
+    let sip = CallSip { invite: l.invite, ringing: l.ringing, invite_ok: l.invite_ok, ack: l.ack, bye: l.bye, bye_ok: l.bye_ok };
+    Ok((sip, activity::count_call_rtp(&media_text, ip)))
+}
+
+
 
 /// 0.36.0 — Latest `n2_qos` observation of the IMS PDU of each UE.
 fn ims_qos_verdict(state: &AppState, ue_ids: &[String]) -> Value {
