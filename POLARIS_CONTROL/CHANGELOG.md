@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.36.2 — 2026-11-14 — 5QI de la PDU ouverte à l'enregistrement (patch)
+
+- Corrige l'écart ANR2 #10 6883071989 (`n2_qos internet five_qi=[]`).
+  UERANSIM ouvre sa PDU configurée (internet) juste après
+  l'enregistrement, pendant `ue_start` : la capture placée autour de
+  `pdu_establish` ne voyait aucun Setup Request. La capture N2 couvre
+  maintenant `ue_start` jusqu'à ce que les PDU aient une adresse (8 s max).
+  `pdu_establish` ne capture plus quand la DNN est déjà active.
+- Attribution par session : tshark lit `ngap.pDUSessionID` + `ngap.fiveQI`,
+  et chaque événement `n2_qos` porte {dnn, psi, five_qi} filtré sur le PSI
+  de cette DNN (relevé dans `nr-cli ps-list`).
+- Limite déclarée : plusieurs UE démarrés à la suite → fenêtres
+  successives, attribution par PSI dans la fenêtre de chaque UE.
+
 ## 0.36.1 — 2026-11-14 — Capture N2 fiable, décodage hors étapes radio (patch)
 
 - Corrige l'écart ANR2 #10 6881802375 : le Setup Request internet (5QI 9,

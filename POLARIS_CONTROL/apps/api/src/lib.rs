@@ -12420,7 +12420,29 @@ fn execute_live_definition_step(
                     .iter()
                     .any(|job| job.ue_id == *ue_id && job.process_state == "RUNNING");
                 if !already_running {
-                    let started_job = start_one_live(state, ue_id)?;
+                    // 0.36.2 — UERANSIM opens its configured PDU (internet) right
+                    // after registration: capture N2 across the start (ANR2 #10
+                    // 6883071989, n2_qos internet five_qi=[]).
+                    let n2_capture = N2QosCapture::start(ue_id, 60);
+                    let started = start_one_live(state, ue_id);
+                    match (n2_capture, &started) {
+                        (Ok(capture), Ok(job)) => {
+                            let sessions = wait_for_active_pdus(job, std::time::Duration::from_secs(8));
+                            match capture.stop() {
+                                Ok(path) => park_n2_capture(ue_id, path, sessions),
+                                Err(error) => record_activity_event(state, ue_id, "n2_qos", "FAILED", json!({"error": error})),
+                            }
+                        }
+                        (Ok(capture), Err(_)) => {
+                            if let Ok(path) = capture.stop() {
+                                let _ = fs::remove_file(path);
+                            }
+                        }
+                        (Err(error), _) => {
+                            record_activity_event(state, ue_id, "n2_qos", "FAILED", json!({"error": error}))
+                        }
+                    }
+                    let started_job = started?;
                     control
                         .started_ues
                         .lock()
@@ -12515,7 +12537,15 @@ fn execute_live_definition_step(
                 }
                 let pdu_profile_dnn = profile.dnn.clone();
                 // 0.36.0 — observe the 5QI really granted on N2 for this PDU.
-                let n2_capture = N2QosCapture::start(ue_id, timeout);
+                // 0.36.2 — not when this DNN is already up (captured at ue_start).
+                let already_active = pdu_snapshots_for_job(&job)
+                    .iter()
+                    .any(|pdu| pdu.dnn.as_deref() == Some(pdu_profile_dnn.as_str()) && pdu.address.is_some());
+                let n2_capture = if already_active {
+                    Err(String::new())
+                } else {
+                    N2QosCapture::start(ue_id, timeout)
+                };
                 trace_step_result(
                     state,
                     ue_id,
@@ -12528,7 +12558,14 @@ fn execute_live_definition_step(
                 match n2_capture.and_then(N2QosCapture::stop) {
                     // 0.36.1 — decode later (after the call / at detach) so tshark
                     // never runs in the API cgroup during radio steps.
-                    Ok(path) => park_n2_capture(ue_id, &pdu_profile_dnn, path),
+                    Ok(path) => {
+                        let psi = pdu_snapshots_for_job(&job)
+                            .into_iter()
+                            .find(|pdu| pdu.dnn.as_deref() == Some(pdu_profile_dnn.as_str()))
+                            .and_then(|pdu| pdu.psi);
+                        park_n2_capture(ue_id, path, vec![(pdu_profile_dnn.clone(), psi)]);
+                    }
+                    Err(error) if error.is_empty() => {}
                     Err(error) => record_activity_event(
                         state,
                         ue_id,
@@ -13449,18 +13486,39 @@ struct N2QosCapture {
     path: std::path::PathBuf,
 }
 
-static PARKED_N2: std::sync::Mutex<Vec<(String, String, std::path::PathBuf)>> =
-    std::sync::Mutex::new(Vec::new());
+type ParkedN2 = (String, std::path::PathBuf, Vec<(String, Option<u32>)>);
 
-fn park_n2_capture(ue_id: &str, dnn: &str, path: std::path::PathBuf) {
+static PARKED_N2: std::sync::Mutex<Vec<ParkedN2>> = std::sync::Mutex::new(Vec::new());
+
+/// One pcap, and the (dnn, psi) sessions it must answer for.
+fn park_n2_capture(ue_id: &str, path: std::path::PathBuf, sessions: Vec<(String, Option<u32>)>) {
     if let Ok(mut parked) = PARKED_N2.lock() {
-        parked.push((ue_id.to_string(), dnn.to_string(), path));
+        parked.push((ue_id.to_string(), path, sessions));
+    }
+}
+
+/// Wait until the UE's configured PDU sessions have an address (bounded).
+fn wait_for_active_pdus(
+    job: &simulator_controller::UeJob,
+    limit: std::time::Duration,
+) -> Vec<(String, Option<u32>)> {
+    let started = std::time::Instant::now();
+    loop {
+        let active: Vec<(String, Option<u32>)> = pdu_snapshots_for_job(job)
+            .into_iter()
+            .filter(|pdu| pdu.address.is_some())
+            .filter_map(|pdu| pdu.dnn.map(|dnn| (dnn, pdu.psi)))
+            .collect();
+        if !active.is_empty() || started.elapsed() >= limit {
+            return active;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }
 
 /// Decode every parked N2 capture of this UE and publish `n2_qos` events.
 fn decode_parked_n2(state: &AppState, ue_id: &str) {
-    let mine: Vec<(String, String, std::path::PathBuf)> = match PARKED_N2.lock() {
+    let mine: Vec<ParkedN2> = match PARKED_N2.lock() {
         Ok(mut parked) => {
             let (mine, rest): (Vec<_>, Vec<_>) = parked.drain(..).partition(|(ue, _, _)| ue == ue_id);
             *parked = rest;
@@ -13468,20 +13526,27 @@ fn decode_parked_n2(state: &AppState, ue_id: &str) {
         }
         Err(_) => return,
     };
-    for (_, dnn, path) in mine {
-        let detail = match decode_n2_five_qis(&path) {
-            Ok(qis) => json!({"dnn": dnn, "five_qi": qis,
-                "source": "tcpdump sctp port 38412 + tshark ngap.fiveQI"}),
-            Err(error) => json!({"dnn": dnn, "error": error}),
-        };
-        let outcome = if detail.get("error").is_some() { "FAILED" } else { "OK" };
-        record_activity_event(state, ue_id, "n2_qos", outcome, detail);
+    for (_, path, sessions) in mine {
+        let decoded = decode_n2_psi_five_qis(&path);
+        for (dnn, psi) in sessions {
+            let detail = match &decoded {
+                Ok(pairs) => json!({"dnn": dnn, "psi": psi,
+                    "five_qi": activity::five_qis_for_psi(pairs, psi),
+                    "source": "tcpdump sctp port 38412 + tshark ngap.pDUSessionID/ngap.fiveQI"}),
+                Err(error) => json!({"dnn": dnn, "psi": psi, "error": error}),
+            };
+            let outcome = if detail.get("error").is_some() { "FAILED" } else { "OK" };
+            record_activity_event(state, ue_id, "n2_qos", outcome, detail);
+        }
     }
 }
 
-fn decode_n2_five_qis(path: &std::path::Path) -> Result<Vec<u8>, String> {
+fn decode_n2_psi_five_qis(path: &std::path::Path) -> Result<Vec<(Option<u32>, u8)>, String> {
     let output = Command::new("/usr/bin/nice")
-        .args(["-n", "19", "/usr/bin/tshark", "-n", "-r", &path.to_string_lossy(), "-Y", "ngap.fiveQI", "-T", "fields", "-e", "ngap.fiveQI"])
+        .args([
+            "-n", "19", "/usr/bin/tshark", "-n", "-r", &path.to_string_lossy(),
+            "-Y", "ngap.fiveQI", "-T", "fields", "-e", "ngap.pDUSessionID", "-e", "ngap.fiveQI",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -13491,7 +13556,7 @@ fn decode_n2_five_qis(path: &std::path::Path) -> Result<Vec<u8>, String> {
     if !output.status.success() {
         return Err("N2_QOS_TSHARK_FAILED".into());
     }
-    Ok(activity::parse_tshark_five_qis(&String::from_utf8_lossy(&output.stdout)))
+    Ok(activity::parse_tshark_psi_five_qis(&String::from_utf8_lossy(&output.stdout)))
 }
 
 impl N2QosCapture {

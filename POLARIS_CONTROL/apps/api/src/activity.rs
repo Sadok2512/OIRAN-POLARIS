@@ -619,6 +619,7 @@ eth0: 9999 9 0 0 0 0 0 0 8888 8 0 0 0 0 0 0\n\
 
 /// 0.36.0 — Parse `tshark -T fields -e ngap.fiveQI` output: one line per
 /// NGAP frame carrying a QoS flow, comma-separated when several flows.
+#[cfg(test)]
 pub fn parse_tshark_five_qis(stdout: &str) -> Vec<u8> {
     stdout
         .lines()
@@ -648,6 +649,45 @@ pub fn voice_qos_verdict(per_ue: &[(String, Option<Vec<u8>>)]) -> Value {
     }
 }
 
+/// 0.36.2 — Parse `tshark -T fields -e ngap.pDUSessionID -e ngap.fiveQI`:
+/// one line per frame, tab between fields, comma between list items.
+/// Returns (psi, 5QI) pairs, aligned by position.
+pub fn parse_tshark_psi_five_qis(stdout: &str) -> Vec<(Option<u32>, u8)> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let mut cols = line.split('\t');
+        let psis: Vec<Option<u32>> = cols
+            .next()
+            .unwrap_or("")
+            .split(',')
+            .map(|v| v.trim().parse::<u32>().ok())
+            .collect();
+        let qis: Vec<u8> = cols
+            .next()
+            .unwrap_or("")
+            .split(',')
+            .filter_map(|v| v.trim().parse::<u8>().ok())
+            .collect();
+        for (i, qi) in qis.into_iter().enumerate() {
+            // One PDU session per Setup Request in the lab; reuse the only psi.
+            let psi = psis.get(i).copied().flatten().or_else(|| {
+                (psis.len() == 1).then(|| psis[0]).flatten()
+            });
+            out.push((psi, qi));
+        }
+    }
+    out
+}
+
+/// 5QIs seen for one PDU session id; all of them when the psi is unknown.
+pub fn five_qis_for_psi(pairs: &[(Option<u32>, u8)], psi: Option<u32>) -> Vec<u8> {
+    pairs
+        .iter()
+        .filter(|(p, _)| psi.is_none() || *p == psi)
+        .map(|(_, q)| *q)
+        .collect()
+}
+
 #[cfg(test)]
 mod five_qi_tests {
     use super::*;
@@ -655,6 +695,16 @@ mod five_qi_tests {
     fn parses_tshark_fields() {
         assert_eq!(parse_tshark_five_qis("1\n\n9,1\n"), vec![1, 9, 1]);
         assert!(parse_tshark_five_qis("").is_empty());
+    }
+    #[test]
+    fn attributes_five_qi_by_psi() {
+        // registration window: internet psi 1 / 5QI 9 ; later ims psi 2 / 5QI 1
+        let pairs = parse_tshark_psi_five_qis("1\t9\n2\t1\n");
+        assert_eq!(pairs, vec![(Some(1), 9), (Some(2), 1)]);
+        assert_eq!(five_qis_for_psi(&pairs, Some(1)), vec![9]);
+        assert_eq!(five_qis_for_psi(&pairs, Some(2)), vec![1]);
+        assert_eq!(five_qis_for_psi(&pairs, None), vec![9, 1]);
+        assert!(parse_tshark_psi_five_qis("").is_empty());
     }
     #[test]
     fn verdict_requires_observed_one_on_every_ue() {
