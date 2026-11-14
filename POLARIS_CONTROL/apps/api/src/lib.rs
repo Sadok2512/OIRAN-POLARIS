@@ -16113,7 +16113,10 @@ mod p0_tests {
         let script = include_str!("../assets/baresip-register.sh");
         assert!(script.contains("module_app menu.so"));
         assert!(script.contains("module_app ctrl_tcp.so"));
+        assert!(script.contains("module aufile.so"));
+        assert!(script.contains("audio_source aufile,/usr/share/baresip/callwaiting.wav"));
         assert!(!script.contains("module stdio.so"));
+        assert!(!script.contains("module ausine.so"));
     }
 
     #[tokio::test]

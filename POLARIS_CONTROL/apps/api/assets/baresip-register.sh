@@ -20,12 +20,12 @@ module_path /usr/lib/baresip/modules
 module account.so
 module contact.so
 module g711.so
-module ausine.so
+module aufile.so
 module aubridge.so
 module_app menu.so
 module_app ctrl_tcp.so
 ctrl_tcp_listen 127.0.0.1:4444
-audio_source ausine,440
+audio_source aufile,/usr/share/baresip/callwaiting.wav
 audio_player aubridge,polaris
 EOF
 umask 077
