@@ -5,7 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { LabUesPage, rowState } from './LabUes';
 import { DEFAULT_FORM, buildSteps, isListed, slugify } from './LabScenarios';
-import { nextSamples, toneFor } from './LabUeMonitor';
+import { LabUeMonitorPage, lastRun, nextSamples, toneFor } from './LabUeMonitor';
 import { needsTwoUes, stepsSummary } from './labShared';
 import type { WireScenarioDefinition } from '@/scenarios/wireCodec';
 
@@ -100,4 +100,59 @@ describe('LabUesPage run flow', () => {
     expect(screen.getByRole('link', { name: 'UE-201' }).getAttribute('href')).toBe('/lab/ues/UE-201');
     await waitFor(() => expect(calls.findIndex((c) => c.url.endsWith('/live/grant'))).toBeLessThan(calls.findIndex((c) => c.url.endsWith('/scenarios/start'))));
   });
+});
+
+describe('LabUeMonitorPage — 0.36.1 (ANR2 FAIL 0.36.0)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  const EVENTS = [
+    { detail: {}, epoch_s: 1794672069, kind: 'live_start', outcome: 'OK' },
+    { detail: { already_running: false }, epoch_s: 1794672069, kind: 'registration', outcome: 'OK' },
+    { detail: { dnn: 'internet' }, epoch_s: 1794672070, kind: 'pdu_establish', outcome: 'OK' },
+    { detail: { direction: 'UL', rate: '5M', receiver_bytes: 1310720, retransmissions: 0, sender_bytes: 1310720, warning: null }, epoch_s: 1794672074, kind: 'iperf3', outcome: 'OK' },
+    { detail: { direction: 'DL', rate: '5M', receiver_bytes: 1310720, retransmissions: 0, sender_bytes: 1310720, warning: null }, epoch_s: 1794672078, kind: 'iperf3', outcome: 'OK' },
+    { detail: { pdu_state: 'INACTIVE', process_state: 'STOPPED' }, epoch_s: 1794672080, kind: 'detach', outcome: 'OK' },
+  ];
+
+  it('lastRun rebuilds the run from the prod events', () => {
+    const run = lastRun([{ detail: {}, epoch_s: 1, kind: 'live_start', outcome: 'OK' }, ...EVENTS]);
+    expect(run.map((r) => r.label)).toEqual(['Démarrage UE', 'RRC + enregistrement 5G', 'Session PDU', 'Trafic UL', 'Trafic DL', 'Détachement']);
+    expect(run[3].detail).toContain('1.3 Mo reçus');
+  });
+
+  it('keeps polling while SSE is open and shows the last run', async () => {
+    class FakeES {
+      static OPEN = 1;
+      readyState = 1;
+      onopen: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      onmessage: ((e: MessageEvent) => void) | null = null;
+      close() {}
+    }
+    vi.stubGlobal('EventSource', FakeES);
+    let n = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      n += 1;
+      return json(200, n === 1
+        ? { ue_id: 'UE-201', running: false, reason: 'UE_NOT_RUNNING', events: [] }
+        : { ue_id: 'UE-201', running: true, states: { rrc_state: 'RRC_CONNECTED', rm_state: 'RM-REGISTERED' }, pdus: [{ dnn: 'internet', state: 'ACTIVE', address: '10.45.0.9' }], counters: { rx_bytes: 10, rx_packets: 1, tx_bytes: 5, tx_packets: 1, rx_bps: 4_000_000, tx_bps: 1_000_000 }, events: EVENTS });
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={['/lab/ues/UE-201']}>
+          <Routes><Route path="/lab/ues/:ueId" element={<LabUeMonitorPage />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    // First snapshot is empty; the 2 s poll must bring live values despite SSE OPEN.
+    expect(await screen.findByText('RRC_CONNECTED', {}, { timeout: 4000 })).toBeTruthy();
+    expect(screen.getByText('ACTIVE')).toBeTruthy();
+    expect(screen.getByText(/DL 4\.0 Mbit\/s/)).toBeTruthy();
+    expect(screen.getByTestId('monitor-last-run').textContent).toContain('Trafic DL');
+    vi.unstubAllGlobals();
+  }, 10000);
 });

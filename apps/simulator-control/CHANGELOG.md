@@ -1,5 +1,16 @@
 # @telecom/simulator-control — Changelog
 
+## 0.36.1 — 2026-11-14 — Suivi UE : valeurs live et dernier run (patch)
+
+- Corrige le FAIL ANR2 de 0.36.0 (#10 6880321239) : la page de suivi ne
+  relisait plus l'état dès que le flux SSE était ouvert. Elle interroge
+  désormais `GET /ues/:id/activity` toutes les 2 s en plus du SSE.
+- Ajout du bloc « Dernier run » reconstruit depuis les événements :
+  démarrage, RRC + enregistrement, PDU (DNN), trafic UL/DL (octets reçus /
+  envoyés, débit cible, retransmissions), IMS, appel, détachement. Un
+  scénario « Données UL/DL » dure ~11 s : après la fin, l'UE est arrêté et
+  le résultat reste visible ici.
+
 ## 0.36.0 — 2026-11-14 — Pages « Lab » simplifiées + app allégée (minor)
 
 - Nouvelles pages (maquette utilisateur), ouvertes par défaut :

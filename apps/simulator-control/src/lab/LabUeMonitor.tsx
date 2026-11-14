@@ -12,6 +12,58 @@ import type { UeActivityPayload } from '@/pages/UeActivity';
 import { Badge, Kpi, ThroughputChart, formatBps, formatBytes, hhmmss, type RateSample, type Tone } from './labShared';
 
 const MAX_SAMPLES = 60;
+const POLL_MS = 2000;
+
+type Ev = NonNullable<UeActivityPayload['events']>[number];
+
+export interface RunStep {
+  label: string;
+  outcome: string;
+  at: number;
+  detail: string;
+}
+
+/** Steps of the most recent run = events after the last `live_start` (included). */
+export function lastRun(events: Ev[] | undefined): RunStep[] {
+  const evs = [...(events ?? [])].sort((a, b) => a.epoch_s - b.epoch_s);
+  let start = -1;
+  evs.forEach((e, i) => {
+    if (e.kind === 'live_start') start = i;
+  });
+  if (start < 0) return [];
+  return evs.slice(start).map((e) => {
+    const d = e.detail ?? {};
+    const n = (k: string) => (typeof d[k] === 'number' ? (d[k] as number) : null);
+    const str = (k: string) => (typeof d[k] === 'string' ? (d[k] as string) : null);
+    switch (e.kind) {
+      case 'live_start':
+        return { label: 'Démarrage UE', outcome: e.outcome, at: e.epoch_s, detail: str('error') ?? '' };
+      case 'registration':
+        return { label: 'RRC + enregistrement 5G', outcome: e.outcome, at: e.epoch_s, detail: '' };
+      case 'pdu_establish':
+        return { label: 'Session PDU', outcome: e.outcome, at: e.epoch_s, detail: `DNN ${str('dnn') ?? '?'}` };
+      case 'iperf3':
+        return {
+          label: `Trafic ${str('direction') ?? ''}`.trim(),
+          outcome: e.outcome,
+          at: e.epoch_s,
+          detail: `${formatBytes(n('receiver_bytes'))} reçus / ${formatBytes(n('sender_bytes'))} envoyés · cible ${str('rate') ?? '--'} · retrans. ${n('retransmissions') ?? '--'}`,
+        };
+      case 'ims_register':
+        return { label: 'REGISTER IMS', outcome: e.outcome, at: e.epoch_s, detail: `SIP ${n('sip_code') ?? '--'} · ${n('registration_time_ms') ?? '--'} ms` };
+      case 'voice_call': {
+        const rtp = (d.rtp ?? {}) as Record<string, number>;
+        return { label: 'Appel voix', outcome: e.outcome, at: e.epoch_s, detail: `${n('duration_ms') ?? '--'} ms · RTP ${rtp.rx_packets ?? '--'} paquets reçus` };
+      }
+      case 'detach':
+        return { label: 'Détachement', outcome: e.outcome, at: e.epoch_s, detail: str('process_state') ?? str('phase') ?? '' };
+      case 'live_stop':
+        return { label: 'Arrêt UE', outcome: e.outcome, at: e.epoch_s, detail: '' };
+      default:
+        return { label: e.kind, outcome: e.outcome, at: e.epoch_s, detail: '' };
+    }
+  });
+}
 
 export function toneFor(value: string | null | undefined): Tone {
   const v = (value ?? '').toUpperCase();
@@ -64,14 +116,13 @@ export function LabUeMonitorPage() {
         }
       };
     }
-    const fallback = window.setInterval(() => {
-      if (source && source.readyState === EventSource.OPEN) return;
-      void snapshot();
-    }, 5000);
+    // Always poll: a scenario can finish in ~10 s, the SSE stream alone
+    // is not enough to guarantee fresh state (0.36.1, ANR2 FAIL 0.36.0).
+    const poll = window.setInterval(() => void snapshot(), POLL_MS);
     return () => {
       cancelled = true;
       source?.close();
-      window.clearInterval(fallback);
+      window.clearInterval(poll);
     };
   }, [ueId]);
 
@@ -80,6 +131,7 @@ export function LabUeMonitorPage() {
   const job = payload?.job_step ?? null;
   const events = useMemo(() => [...(payload?.events ?? [])].sort((a, b) => b.epoch_s - a.epoch_s).slice(0, 30), [payload?.events]);
   const voice = payload?.voice;
+  const run = useMemo(() => lastRun(payload?.events), [payload?.events]);
 
   return (
     <>
@@ -109,7 +161,7 @@ export function LabUeMonitorPage() {
       {error && !payload && <p className="text-bad text-ep-sm">Suivi indisponible : {error}</p>}
       {payload && !payload.running && (
         <p className="text-ep-sm text-mute" data-testid="monitor-not-running">
-          UE arrêté{payload.reason ? ` — ${payload.reason}` : ''}. Lance un scénario depuis « UE du lab ».
+          UE arrêté{payload.reason ? ` — ${payload.reason}` : ''}. Valeurs live vides ; le dernier run est détaillé ci-dessous.
         </p>
       )}
 
@@ -152,6 +204,24 @@ export function LabUeMonitorPage() {
           <p className="text-ep-xs text-mute">{voice?.reason ?? voice?.detail ?? '--'}{voice?.sip_code ? ` · SIP ${voice.sip_code}` : ''}</p>
         </Card>
       </div>
+
+      <Card className="p-4">
+        <h2 className="text-ep-lg font-semibold mb-2">Dernier run</h2>
+        {run.length === 0 ? (
+          <p className="text-ep-sm text-mute">-- (aucun run)</p>
+        ) : (
+          <ol className="flex flex-col divide-y divide-line" data-testid="monitor-last-run">
+            {run.map((r, i) => (
+              <li key={`${r.at}-${i}`} className="flex flex-wrap items-center gap-3 py-2 text-ep-sm">
+                <span className="font-mono text-mute w-20 shrink-0">{hhmmss(r.at)}</span>
+                <span className="font-semibold w-48 shrink-0">{r.label}</span>
+                <Badge tone={toneFor(r.outcome)}>{r.outcome}</Badge>
+                <span className="text-mute">{r.detail}</span>
+              </li>
+            ))}
+          </ol>
+        )}
+      </Card>
 
       <Card className="p-4">
         <h2 className="text-ep-lg font-semibold mb-2">Journal</h2>
