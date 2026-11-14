@@ -5,7 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { LabUesPage, rowState } from './LabUes';
 import { DEFAULT_FORM, buildSteps, callScenarios, isListed, slugify } from './LabScenarios';
-import { LabUeMonitorPage, lastRun, nextSamples, rrcView, toneFor } from './LabUeMonitor';
+import { LabUeMonitorPage, lastRun, lastVoiceCall, nextSamples, rrcView, toneFor } from './LabUeMonitor';
 import { needsTwoUes, stepsSummary } from './labShared';
 import type { WireScenarioDefinition } from '@/scenarios/wireCodec';
 
@@ -200,5 +200,16 @@ describe('quietMode — 0.36.5 (ANR2 #10 6882271073 : charge UI → throttling)'
     expect(politeInterval(10_000)()).toBe(false);
     expect(isQuiet(Date.now() + 61_000)).toBe(false);
     leaveQuiet();
+  });
+});
+
+describe('lastVoiceCall — 0.36.6 (RTP au lieu du débit pour la voix)', () => {
+  it('reads this UE\'s own RTP counters, role and 5QI', () => {
+    const v = lastVoiceCall([
+      { epoch_s: 10, kind: 'voice_call', outcome: 'OK', detail: { role: 'callee', duration_ms: 7489, rtp: { tx_packets: 301, tx_bytes: 15652, rx_packets: 300, rx_bytes: 15600 }, qos: { five_qi: 1, status: 'FIVE_QI_1_OBSERVED' }, capture: { kernel_drops: 0 } } },
+      { epoch_s: 5, kind: 'voice_call', outcome: 'OK', detail: { rtp: { tx_packets: 1 } } },
+    ]);
+    expect(v).toMatchObject({ role: 'appelé', txPackets: 301, rxPackets: 300, fiveQi: 1, kernelDrops: 0 });
+    expect(lastVoiceCall([])).toBeNull();
   });
 });

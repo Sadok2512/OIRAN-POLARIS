@@ -7,7 +7,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { Card, PageHeader } from '@/components/mockup';
 import { polarisApi } from '@/data/polarisClient';
-import { useStopScenario, useUes } from '@/data/queries';
+import { useStopScenario, useStopUe, useUes } from '@/data/queries';
 import type { UeActivityPayload } from '@/pages/UeActivity';
 import { Badge, Kpi, ThroughputChart, formatBps, formatBytes, hhmmss, type RateSample, type Tone } from './labShared';
 
@@ -99,6 +99,63 @@ export function rrcView(states: { rrc_state?: string | null; cm_state?: string |
   return { value: null, source: null };
 }
 
+export interface VoiceCallView {
+  at: number;
+  outcome: string;
+  role: string | null;
+  durationMs: number | null;
+  txPackets: number | null;
+  txBytes: number | null;
+  rxPackets: number | null;
+  rxBytes: number | null;
+  fiveQi: number | null;
+  qosStatus: string | null;
+  kernelDrops: number | null;
+}
+
+/** 0.36.6 — Latest voice_call event of this UE (its own RTP counters since API 0.36.3). */
+export function lastVoiceCall(events: UeActivityPayload['events']): VoiceCallView | null {
+  const ev = [...(events ?? [])].filter((e) => e.kind === 'voice_call').sort((a, b) => b.epoch_s - a.epoch_s)[0];
+  if (!ev) return null;
+  const d = ev.detail ?? {};
+  const rtp = (d.rtp ?? {}) as Record<string, unknown>;
+  const qos = (d.qos ?? {}) as Record<string, unknown>;
+  const cap = (d.capture ?? {}) as Record<string, unknown>;
+  const num = (v: unknown) => (typeof v === 'number' ? v : null);
+  return {
+    at: ev.epoch_s,
+    outcome: ev.outcome,
+    role: typeof d.role === 'string' ? (d.role === 'caller' ? 'appelant' : d.role === 'callee' ? 'appelé' : d.role) : null,
+    durationMs: num(d.duration_ms),
+    txPackets: num(rtp.tx_packets),
+    txBytes: num(rtp.tx_bytes),
+    rxPackets: num(rtp.rx_packets),
+    rxBytes: num(rtp.rx_bytes),
+    fiveQi: num(qos.five_qi),
+    qosStatus: typeof qos.status === 'string' ? qos.status : null,
+    kernelDrops: num(cap.kernel_drops),
+  };
+}
+
+function RtpBars({ tx, rx }: { tx: number; rx: number }) {
+  const max = Math.max(1, tx, rx);
+  const bar = (v: number, cls: string, label: string) => (
+    <div className="flex items-center gap-2 text-ep-xs">
+      <span className="w-14 text-mute">{label}</span>
+      <div className="flex-1 h-3 rounded bg-track overflow-hidden">
+        <div className={`h-3 ${cls}`} style={{ width: `${(v / max) * 100}%` }} />
+      </div>
+      <span className="w-10 text-right">{v}</span>
+    </div>
+  );
+  return (
+    <div className="flex flex-col gap-1" aria-label="Paquets RTP envoyés et reçus">
+      {bar(tx, 'bg-brand', 'envoyés')}
+      {bar(rx, 'bg-ok', 'reçus')}
+    </div>
+  );
+}
+
 export function nextSamples(prev: RateSample[], data: UeActivityPayload): RateSample[] {
   const c = data.counters;
   if (!c || (c.rx_bps == null && c.tx_bps == null)) return prev;
@@ -113,6 +170,7 @@ export function LabUeMonitorPage() {
   const [live, setLive] = useState<'connexion' | 'en direct' | 'reconnexion'>('connexion');
   const [error, setError] = useState<string | null>(null);
   const stop = useStopScenario();
+  const stopUe = useStopUe();
   const ues = useUes();
   const inventoryImsi = (ues.data?.items ?? []).find((u) => u.id === ueId) as { subscriber_identity?: string | null } | undefined;
 
@@ -165,6 +223,8 @@ export function LabUeMonitorPage() {
   const events = useMemo(() => [...(payload?.events ?? [])].sort((a, b) => b.epoch_s - a.epoch_s).slice(0, 30), [payload?.events]);
   const voice = payload?.voice;
   const run = useMemo(() => lastRun(payload?.events), [payload?.events]);
+  const call = useMemo(() => lastVoiceCall(payload?.events), [payload?.events]);
+  const callRunning = job?.current_step?.type === 'voice_call' && job.current_step.state !== 'COMPLETED';
 
   return (
     <>
@@ -177,6 +237,17 @@ export function LabUeMonitorPage() {
             <Link to="/lab/ues" className="inline-flex items-center h-10 px-4 rounded-md border border-line text-ep-md">
               ← UE du lab
             </Link>
+            {payload?.running && (
+              <button
+                type="button"
+                className="h-10 px-4 rounded-md border border-bad text-bad font-semibold"
+                disabled={stopUe.isPending}
+                onClick={() => stopUe.mutate(ueId)}
+                data-testid="monitor-stop-ue"
+              >
+                Arrêter l’UE
+              </button>
+            )}
             {job?.job_id && job.state && !/(COMPLETED|FAILED|STOPPED)/.test(job.state) && (
               <button
                 type="button"
@@ -225,7 +296,7 @@ export function LabUeMonitorPage() {
       <div className="grid gap-3 lg:grid-cols-[2fr_1fr]">
         <Card className="p-4 flex flex-col gap-3">
           <div className="flex items-baseline justify-between">
-            <h2 className="text-ep-lg font-semibold">Débit</h2>
+            <h2 className="text-ep-lg font-semibold">Débit data</h2>
             <span className="text-ep-sm text-mute">
               DL {formatBps(payload?.counters?.rx_bps)} · UL {formatBps(payload?.counters?.tx_bps)}
             </span>
@@ -236,10 +307,25 @@ export function LabUeMonitorPage() {
             <Kpi label="Total UL envoyé" value={formatBytes(payload?.counters?.tx_bytes)} />
           </div>
         </Card>
-        <Card className="p-4 flex flex-col gap-3">
-          <h2 className="text-ep-lg font-semibold">Voix / IMS</h2>
+        <Card className="p-4 flex flex-col gap-3" data-testid="monitor-voice">
+          <h2 className="text-ep-lg font-semibold">Voix / IMS — RTP</h2>
           <Badge tone={voice?.available ? 'ok' : 'idle'}>{voice?.available ? 'IMS enregistré' : 'IMS non enregistré'}</Badge>
-          <p className="text-ep-xs text-mute">{voice?.reason ?? voice?.detail ?? '--'}{voice?.sip_code ? ` · SIP ${voice.sip_code}` : ''}</p>
+          {callRunning && <Badge tone="run" pulse>Appel en cours — comptage RTP à la fin de l’appel</Badge>}
+          {call ? (
+            <>
+              <div className="grid grid-cols-2 gap-2">
+                <Kpi label="RTP envoyés" value={`${call.txPackets ?? '--'} paquets`} sub={formatBytes(call.txBytes)} testid="monitor-rtp-tx" />
+                <Kpi label="RTP reçus" value={`${call.rxPackets ?? '--'} paquets`} sub={formatBytes(call.rxBytes)} testid="monitor-rtp-rx" />
+              </div>
+              <RtpBars tx={call.txPackets ?? 0} rx={call.rxPackets ?? 0} />
+              <p className="text-ep-xs text-mute">
+                {hhmmss(call.at)} · {call.role ?? 'appel'} · {call.durationMs ?? '--'} ms · 5QI {call.fiveQi ?? `-- (${call.qosStatus ?? 'non observé'})`}
+                {call.kernelDrops != null ? ` · pertes capture ${call.kernelDrops}` : ''} · {call.outcome}
+              </p>
+            </>
+          ) : (
+            <p className="text-ep-sm text-mute">-- (aucun appel sur ce run)</p>
+          )}
         </Card>
       </div>
 

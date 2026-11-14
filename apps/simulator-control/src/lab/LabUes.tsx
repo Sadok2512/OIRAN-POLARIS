@@ -7,7 +7,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Card, PageHeader } from '@/components/mockup';
-import { useStopScenario, useUes } from '@/data/queries';
+import { useStopScenario, useStopUe, useUes } from '@/data/queries';
 import { fetchScenarioSteps, useScenarioDefinitions, useStartScenarioRun } from '@/data/scenarioApi';
 import { useCreateLiveGrant } from '@/data/liveGrantApi';
 import type { UeState } from '@/data/polarisTypes';
@@ -46,6 +46,7 @@ export function LabUesPage() {
   const createGrant = useCreateLiveGrant();
   const startRun = useStartScenarioRun();
   const stopRun = useStopScenario();
+  const stopUe = useStopUe();
   const [choice, setChoice] = useState<Record<string, string>>({});
   const [runs, setRuns] = useState<Record<string, LocalRun>>({});
   const [busy, setBusy] = useState<string | null>(null);
@@ -98,6 +99,21 @@ export function LabUesPage() {
     } catch (error) {
       const e = error as { code?: string; message?: string; status?: number };
       setMessage(`${id} : lancement refusé — ${reasonFr(e.code) || e.message || 'erreur'}${e.status ? ` (HTTP ${e.status})` : ''}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** 0.36.6 — Stop a running UE that has no scenario started from this page. */
+  async function stopUeNow(id: string) {
+    setBusy(id);
+    setMessage(null);
+    try {
+      await stopUe.mutateAsync(id);
+      setMessage(`${id} : arrêt demandé.`);
+    } catch (error) {
+      const e = error as { code?: string; message?: string };
+      setMessage(`${id} : arrêt refusé — ${reasonFr(e.code) || e.message}`);
     } finally {
       setBusy(null);
     }
@@ -204,6 +220,17 @@ export function LabUesPage() {
                     </select>
                   </td>
                   <td className="px-4 py-3 text-right">
+                    {!running && pilotable && (row.process_state === 'RUNNING' || row.registration_state === 'REGISTERED') && (
+                      <button
+                        type="button"
+                        className="h-10 px-4 mr-2 rounded-md border border-bad text-bad font-semibold"
+                        disabled={busy === id || row.actions?.stop === false}
+                        onClick={() => void stopUeNow(id)}
+                        data-testid={`lab-stop-ue-${id}`}
+                      >
+                        Arrêter l’UE
+                      </button>
+                    )}
                     {running ? (
                       <button
                         type="button"

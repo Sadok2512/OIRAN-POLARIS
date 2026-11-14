@@ -1,5 +1,16 @@
 # @telecom/simulator-control — Changelog
 
+## 0.36.6 — 2026-11-14 — Bouton Arrêter l'UE + RTP pour la voix (patch)
+
+- « UE du lab » : bouton « Arrêter l'UE » sur un UE démarré ou enregistré
+  (`POST /ues/stop`), même sans scénario lancé depuis la page. Avant, seul
+  un run lancé depuis la page avait un bouton Arrêter.
+- Suivi UE : bouton « Arrêter l'UE » quand l'UE tourne.
+- Suivi UE, carte « Voix / IMS — RTP » : paquets et octets RTP envoyés et
+  reçus de CET UE (compteurs propres depuis l'API 0.36.3), rôle
+  appelant/appelé, durée, 5QI, pertes de capture ; « Appel en cours »
+  pendant l'étape voice_call. La courbe devient « Débit data ».
+
 ## 0.36.5 — 2026-11-14 — UI moins gourmande pour l'API (patch)
 
 - Corrige le FAIL ANR2 #10 6882271073 : la charge de l'UI portait le cgroup
