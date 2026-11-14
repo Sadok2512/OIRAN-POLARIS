@@ -315,6 +315,7 @@ impl ServedNetworkPolicy {
     fn validate_mutation(&self, input: &SubscriberMutation) -> Result<(), String> {
         self.validate(&SubscriberRecord {
             imsi: String::new(),
+            msisdn: None,
             k: String::new(),
             opc: String::new(),
             slot: String::new(),
@@ -3959,9 +3960,9 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
         "detach",
         "repeat",
         "ims_register",
+        "voice_call",
     ];
-    let mut unavailable_steps =
-        vec![json!({"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"})];
+    let mut unavailable_steps: Vec<Value> = Vec::new();
     if dl_sender.is_ok() {
         executable_steps.push("traffic_dl");
         executable_steps.push("traffic_ul");
@@ -7976,7 +7977,6 @@ async fn list_ue_profiles(
         visibility,
         subscriber_provisioning::SubscriberIdentityVisibility::Imsi
     );
-    let registry = state.profile_registry.lock().unwrap();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(100).clamp(1, 500);
     let search = query
@@ -7986,43 +7986,74 @@ async fn list_ue_profiles(
         .trim()
         .to_ascii_lowercase();
     let offset = (page - 1).saturating_mul(page_size);
-    let mut total = 0usize;
-    let mut items = Vec::with_capacity(page_size);
-    for record in &registry.profiles {
-        let matches_search = search.is_empty()
-            || record.profile.ue_id.to_ascii_lowercase().contains(&search)
-            || record
-                .profile
-                .pseudonym
-                .to_ascii_lowercase()
-                .contains(&search);
-        let matches_scenario = query.scenario_id.as_ref().map_or(true, |scenario| {
-            record.scenario_id.as_deref() == Some(scenario.as_str())
-        });
-        let matches_status =
-            query
-                .subscription_status
-                .as_deref()
-                .map_or(true, |status| match status {
-                    "VERIFIED" => record.profile.subscription_verified,
-                    "PROVISIONING_REQUIRED" => !record.profile.subscription_verified,
-                    _ => false,
-                });
-        if matches_search && matches_scenario && matches_status {
-            if total >= offset && items.len() < page_size {
-                let mut row = managed_profile_json(record);
-                if identity_exposed {
-                    if let Ok(imsi) = state.profile_store.subscriber_imsi(record) {
-                        if let Some(object) = row.as_object_mut() {
-                            object.insert("subscriber_identity".into(), Value::String(imsi));
-                        }
-                    }
+    let (records, total) = {
+        let registry = state.profile_registry.lock().unwrap();
+        let mut total = 0usize;
+        let mut records = Vec::with_capacity(page_size);
+        for record in &registry.profiles {
+            let matches_search = search.is_empty()
+                || record.profile.ue_id.to_ascii_lowercase().contains(&search)
+                || record
+                    .profile
+                    .pseudonym
+                    .to_ascii_lowercase()
+                    .contains(&search);
+            let matches_scenario = query.scenario_id.as_ref().map_or(true, |scenario| {
+                record.scenario_id.as_deref() == Some(scenario.as_str())
+            });
+            let matches_status =
+                query
+                    .subscription_status
+                    .as_deref()
+                    .map_or(true, |status| match status {
+                        "VERIFIED" => record.profile.subscription_verified,
+                        "PROVISIONING_REQUIRED" => !record.profile.subscription_verified,
+                        _ => false,
+                    });
+            if matches_search && matches_scenario && matches_status {
+                if total >= offset && records.len() < page_size {
+                    records.push(record.clone());
                 }
-                items.push(row);
+                total += 1;
             }
-            total += 1;
         }
-    }
+        (records, total)
+    };
+    let identities = records
+        .iter()
+        .filter_map(|record| state.profile_store.subscriber_imsi(record).ok())
+        .collect::<Vec<_>>();
+    let backend = state.subscriber_backend.clone();
+    let subscribers = tokio::task::spawn_blocking(move || backend.lookup_many(&identities))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let items = records
+        .iter()
+        .map(|record| {
+            let mut row = managed_profile_json(record);
+            if let Some(object) = row.as_object_mut() {
+                let imsi = state.profile_store.subscriber_imsi(record).ok();
+                if identity_exposed {
+                    if let Some(imsi) = imsi.as_ref() {
+                        object.insert("subscriber_identity".into(), Value::String(imsi.clone()));
+                    }
+                    object.insert(
+                        "msisdn".into(),
+                        imsi.as_ref()
+                            .and_then(|imsi| subscribers.get(imsi))
+                            .and_then(|subscriber| subscriber.msisdn.clone())
+                            .map(Value::String)
+                            .unwrap_or(Value::Null),
+                    );
+                } else {
+                    object.insert("msisdn".into(), Value::Null);
+                }
+            }
+            row
+        })
+        .collect::<Vec<_>>();
     Json(json!({
         "items":items,
         "total":total,
@@ -8656,9 +8687,6 @@ fn scenario_definition_block_reason(
     }
     if !dl_sender_available && resolved.iter().any(|step| step.step_type == "traffic_ul") {
         return Ok(Some("UL_RECEIVER_NOT_AVAILABLE"));
-    }
-    if resolved.iter().any(|step| step.step_type == "voice_call") {
-        return Ok(Some("IMS_NOT_AVAILABLE"));
     }
     Ok(None)
 }
@@ -12851,7 +12879,7 @@ fn execute_live_definition_step(
             }))
         }
         "ims_register" => execute_ims_register(state, ue_ids, control),
-        "voice_call" => Err("IMS_NOT_AVAILABLE".into()),
+        "voice_call" => execute_voice_call(state, step, ue_ids, control),
         "repeat" => Err("SCENARIO_REPEAT_NOT_RESOLVED".into()),
         _ => Err("SCENARIO_STEP_TYPE_UNSUPPORTED".into()),
     }
@@ -12978,10 +13006,25 @@ fn execute_ims_register(
     ue_ids: &[String],
     control: &DefinitionJobControl,
 ) -> Result<Value, String> {
-    if ue_ids.len() != 1 {
-        return Err("IMS_SINGLE_UE_REQUIRED".into());
+    if ue_ids.is_empty() {
+        return Err("IMS_UE_REQUIRED".into());
     }
-    let ue_id = &ue_ids[0];
+    let mut registrations = Vec::with_capacity(ue_ids.len());
+    for ue_id in ue_ids {
+        registrations.push(execute_single_ims_register(state, ue_id, control)?);
+    }
+    if registrations.len() == 1 {
+        Ok(registrations.pop().unwrap())
+    } else {
+        Ok(json!({"registrations":registrations}))
+    }
+}
+
+fn execute_single_ims_register(
+    state: &AppState,
+    ue_id: &str,
+    control: &DefinitionJobControl,
+) -> Result<Value, String> {
     let (client_name, aor) = ims_client_name(ue_id)?;
     let job = definition_job_approval(control, ue_id)?.ok_or("UE_NOT_STARTED")?;
     if observe_controller_ue(state, ue_id)?.pdu_session_state != "ACTIVE" {
@@ -13126,6 +13169,200 @@ fn execute_ims_register(
         json!({"error":"IMS_REGISTER_TIMEOUT"}),
     );
     Err("IMS_REGISTER_TIMEOUT".into())
+}
+
+fn baresip_control(client_name: &str, command: &str, params: &str) -> Result<String, String> {
+    let payload = json!({"command":command,"params":params,"token":"polaris-control"}).to_string();
+    let frame = format!("{}:{payload},", payload.len());
+    let output = Command::new("/usr/bin/docker")
+        .args([
+            "exec",
+            client_name,
+            "/bin/bash",
+            "-c",
+            "exec 3<>/dev/tcp/127.0.0.1/4444; printf '%s' \"$1\" >&3; timeout 3 cat <&3",
+            "--",
+            &frame,
+        ])
+        .output()
+        .map_err(|_| "IMS_CALL_CONTROL_FAILED")?;
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() && text.is_empty() {
+        return Err("IMS_CALL_CONTROL_FAILED".into());
+    }
+    if text.contains("\"ok\":false") {
+        return Err("IMS_CALL_COMMAND_REJECTED".into());
+    }
+    Ok(text)
+}
+
+fn wait_for_call_established(
+    caller: &str,
+    callee: &str,
+    control: &DefinitionJobControl,
+    timeout: std::time::Duration,
+) -> Result<(String, String), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if control.cancel.load(Ordering::SeqCst) {
+            return Err("SCENARIO_STOP_REQUESTED".into());
+        }
+        let caller_logs = DockerUeRuntime::output(&["logs".into(), caller.into()])?;
+        let callee_logs = DockerUeRuntime::output(&["logs".into(), callee.into()])?;
+        let caller_ready = caller_logs.contains("Call established")
+            || caller_logs.contains("CALL_ESTABLISHED")
+            || caller_logs.contains("SIP Progress: 200");
+        let callee_ready = callee_logs.contains("Call established")
+            || callee_logs.contains("CALL_ESTABLISHED")
+            || callee_logs.contains("answering call")
+            || callee_logs.contains("200 OK");
+        if caller_ready && callee_ready {
+            return Ok((caller_logs, callee_logs));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("IMS_CALL_200_TIMEOUT".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+fn rtp_measurements(tcpdump: &str, local_ip: &str) -> (u64, u64, u64, u64) {
+    let mut tx_packets = 0u64;
+    let mut tx_bytes = 0u64;
+    let mut rx_packets = 0u64;
+    let mut rx_bytes = 0u64;
+    for line in tcpdump
+        .lines()
+        .filter(|line| line.contains(" UDP, length "))
+    {
+        let Some(length) = line
+            .rsplit_once(" UDP, length ")
+            .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let is_sip = line.contains(".5060 >") || line.contains(" > ") && line.contains(".5060:");
+        if is_sip {
+            continue;
+        }
+        if line.contains(&format!("IP {local_ip}.")) {
+            tx_packets += 1;
+            tx_bytes += length;
+        } else if line.contains(&format!("> {local_ip}.")) {
+            rx_packets += 1;
+            rx_bytes += length;
+        }
+    }
+    (tx_packets, tx_bytes, rx_packets, rx_bytes)
+}
+
+fn execute_voice_call(
+    state: &AppState,
+    step: &ResolvedStep,
+    ue_ids: &[String],
+    control: &DefinitionJobControl,
+) -> Result<Value, String> {
+    if ue_ids.len() != 2 || ue_ids[0] == ue_ids[1] {
+        return Err("VOICE_TWO_DISTINCT_UES_REQUIRED".into());
+    }
+    let duration_ms = resolved_parameter_u64(step, "duration_ms", 30_000, 120_000)?;
+    let caller_id = &ue_ids[0];
+    let callee_id = &ue_ids[1];
+    let (caller_name, _) = ims_client_name(caller_id)?;
+    let (callee_name, callee_aor) = ims_client_name(callee_id)?;
+    for ue_id in ue_ids {
+        if !control
+            .ims_clients
+            .lock()
+            .map_err(|_| "IMS_CLIENT_OWNERSHIP_UNAVAILABLE".to_string())?
+            .contains(ue_id)
+        {
+            return Err("IMS_CALL_REQUIRES_REGISTERED_UES".into());
+        }
+    }
+    let caller_job = definition_job_approval(control, caller_id)?.ok_or("UE_NOT_STARTED")?;
+    let caller_container = caller_job
+        .process_handle
+        .as_deref()
+        .and_then(DockerUeRuntime::container_id)
+        .ok_or("UE_HANDLE_INVALID")?;
+    let caller_ip = DockerUeRuntime::observe_pdu_dnn(caller_container, "ims")?
+        .and_then(|pdu| pdu.ready_address().map(str::to_string))
+        .ok_or("IMS_PDU_NOT_ACTIVE")?;
+    let caller_iface = wait_for_ims_interface(
+        caller_container,
+        &caller_ip,
+        control,
+        std::time::Duration::from_secs(5),
+    )?;
+    let capture_seconds = duration_ms.div_ceil(1_000) + 8;
+    let capture = Command::new("/usr/bin/docker")
+        .args([
+            "exec",
+            caller_name,
+            "timeout",
+            &capture_seconds.to_string(),
+            "tcpdump",
+            "-n",
+            "-l",
+            "-s",
+            "0",
+            "-A",
+            "-i",
+            &caller_iface,
+            "udp",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| "IMS_CALL_CAPTURE_FAILED")?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let target = format!("sip:{callee_aor}@ims-lite.audit");
+    baresip_control(caller_name, "dial", &target)?;
+    let started = std::time::Instant::now();
+    let (caller_logs, callee_logs) = wait_for_call_established(
+        caller_name,
+        callee_name,
+        control,
+        std::time::Duration::from_secs(20),
+    )?;
+    cancellable_wait(control, duration_ms)?;
+    baresip_control(caller_name, "hangup", "")?;
+    let capture_output = capture
+        .wait_with_output()
+        .map_err(|_| "IMS_CALL_CAPTURE_FAILED")?;
+    let capture_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&capture_output.stdout),
+        String::from_utf8_lossy(&capture_output.stderr)
+    );
+    let (tx_packets, tx_bytes, rx_packets, rx_bytes) = rtp_measurements(&capture_text, &caller_ip);
+    let invite = capture_text.contains("INVITE sip:") || caller_logs.contains("connecting to");
+    let ringing = capture_text.contains("SIP/2.0 180") || caller_logs.contains("180 Ringing");
+    let ok = capture_text.contains("SIP/2.0 200") || caller_logs.contains("SIP Progress: 200");
+    let ack = capture_text.contains("ACK sip:");
+    let bye = capture_text.contains("BYE sip:") || caller_logs.contains("terminated");
+    let bye_ok = capture_text.contains("CSeq:")
+        && capture_text.contains("BYE")
+        && capture_text.contains("SIP/2.0 200");
+    let established = caller_logs.contains("Call established")
+        && (callee_logs.contains("Call established") || callee_logs.contains("answering call"));
+    if !(invite && ringing && ok && ack && bye && bye_ok && established) {
+        return Err("IMS_CALL_SIGNALING_INCOMPLETE".into());
+    }
+    if tx_packets == 0 || tx_bytes == 0 || rx_packets == 0 || rx_bytes == 0 {
+        return Err("IMS_CALL_RTP_BIDIRECTIONAL_NOT_OBSERVED".into());
+    }
+    let measurements = json!({
+        "sip":{"invite":true,"ringing":180,"ok":200,"ack":true,"bye":true,"bye_ok":200},
+        "duration_ms":started.elapsed().as_millis() as u64,
+        "rtp":{"tx_packets":tx_packets,"tx_bytes":tx_bytes,"rx_packets":rx_packets,"rx_bytes":rx_bytes},
+        "qos":{"five_qi":Value::Null,"status":"FIVE_QI_1_NOT_OBSERVED"}
+    });
+    for ue_id in ue_ids {
+        record_activity_event(state, ue_id, "voice_call", "OK", measurements.clone());
+    }
+    Ok(measurements)
 }
 
 fn definition_job_approval(
@@ -13376,6 +13613,12 @@ fn start_live_definition_scenario(
             )
         })?;
     let resolved = resolve_steps(&definition).map_err(scenario_definition_error)?;
+    if resolved.iter().any(|step| step.step_type == "voice_call") && ue_ids.len() != 2 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":"VOICE_TWO_DISTINCT_UES_REQUIRED"})),
+        ));
+    }
     let job_id = format!("{}-{}", definition.id, random_hex(6));
     let steps = resolved
         .iter()
@@ -13818,6 +14061,12 @@ async fn start_scenario(
             Ok(value) => value,
             Err(error) => return scenario_definition_error(error),
         };
+        if resolved.iter().any(|step| step.step_type == "voice_call") && input.ue_ids.len() != 2 {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":"VOICE_TWO_DISTINCT_UES_REQUIRED"})),
+            );
+        }
         let has_lte_steps = resolved.iter().any(|step| {
             matches!(
                 step.step_type.as_str(),
@@ -15821,7 +16070,8 @@ mod p0_tests {
                 "idle",
                 "detach",
                 "repeat",
-                "ims_register"
+                "ims_register",
+                "voice_call"
             ])
         );
         assert_eq!(
@@ -15829,8 +16079,7 @@ mod p0_tests {
             json!([
                 {"type":"traffic_dl","http_status":422,"reason":"DL_SENDER_NOT_AVAILABLE"},
                 {"type":"traffic_ul","http_status":422,"reason":"UL_RECEIVER_NOT_AVAILABLE"},
-                {"type":"transfer_verify","http_status":422,"reason":"TRANSFER_PEER_NOT_AVAILABLE"},
-                {"type":"voice_call","http_status":423,"reason":"IMS_NOT_AVAILABLE"}
+                {"type":"transfer_verify","http_status":422,"reason":"TRANSFER_PEER_NOT_AVAILABLE"}
             ])
         );
         assert_eq!(
@@ -15849,6 +16098,14 @@ mod p0_tests {
             Some("uesimtun1")
         );
         assert_eq!(ims_interface_for_ip(links, "10.47.0.9"), None);
+    }
+
+    #[test]
+    fn voice_call_rtp_measurement_requires_packets_in_both_directions() {
+        let capture = "12:00:00 IP 10.47.0.5.40000 > 10.77.24.21.41000: UDP, length 160\n\
+12:00:00 IP 10.77.24.21.41000 > 10.47.0.5.40000: UDP, length 172\n\
+12:00:00 IP 10.47.0.5.5060 > 10.77.24.20.5060: UDP, length 500\n";
+        assert_eq!(rtp_measurements(capture, "10.47.0.5"), (1, 160, 1, 172));
     }
 
     #[tokio::test]
@@ -20312,6 +20569,7 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
             DockerUeRuntime::hash_bytes(format!("imsi-{imsi}").as_bytes()).unwrap();
         let subscriber = SubscriberRecord {
             imsi: imsi.into(),
+            msisdn: None,
             k: "11".repeat(16),
             opc: "22".repeat(16),
             slot: "slot-test".into(),
@@ -20924,7 +21182,11 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         assert_eq!(imported["suggestion"], "High runner (2)");
 
         for (id, expected, error) in [
-            ("tpl-voice-short", StatusCode::LOCKED, "IMS_NOT_AVAILABLE"),
+            (
+                "tpl-voice-short",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "VOICE_TWO_DISTINCT_UES_REQUIRED",
+            ),
             (
                 "tpl-small-traffic",
                 StatusCode::UNPROCESSABLE_ENTITY,

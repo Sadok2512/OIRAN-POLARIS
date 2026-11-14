@@ -54,6 +54,7 @@ export function recordFromWire(wire: WireUeProfile): UeProfileRecord {
     subscriptionStatus: wire.subscription_status,
     scenarioId: wire.scenario_id,
     imsi: imsiFromBackend,
+    msisdn: wire.msisdn ?? undefined,
   };
 }
 

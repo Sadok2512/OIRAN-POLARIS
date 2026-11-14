@@ -80,6 +80,10 @@ export function useScenarioSteps(jobId: string | null) {
   });
 }
 
+export function fetchScenarioSteps(jobId: string) {
+  return polarisApi<WireScenarioStepsResponse>(`/scenarios/${encodeURIComponent(jobId)}/steps`);
+}
+
 /* ------------------------------- Mutations ------------------------------- */
 
 export function useCreateScenarioDefinition() {

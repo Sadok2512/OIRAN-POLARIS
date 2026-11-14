@@ -39,6 +39,7 @@ const PROFILE_WIRE: WireUeProfile = {
   auto_run_scenario: false,
   subscription_status: 'VERIFIED',
   subscriber_identity: '001011234567890',
+  msisdn: '15550000012',
   authentication_material: 'PROTECTED',
   profile: 'bounded-controller-ue-udp-v1',
   revision: 1,
@@ -159,6 +160,11 @@ describe('recordFromWire — operator IMSI reveal', () => {
     const r = recordFromWire({ ...PROFILE_WIRE, subscriber_identity: '' });
     expect(r.imsi).toBeUndefined();
   });
+
+  it('carries the MSISDN returned by the read-only subscriber lookup', () => {
+    const r = recordFromWire(PROFILE_WIRE);
+    expect(r.msisdn).toBe('15550000012');
+  });
 });
 
 describe('UE Manager — lab IMSI reveal', () => {
@@ -169,6 +175,33 @@ describe('UE Manager — lab IMSI reveal', () => {
     const cell = screen.getByTestId('ue-imsi-UE-12');
     expect(cell).toHaveTextContent('001011234567890');
     expect(cell.textContent).not.toMatch(/•/);
+    expect(screen.getByTestId('ue-msisdn-UE-12')).toHaveTextContent('15550000012');
+  });
+
+  it('shows the explicit non-provisioned fallback when MSISDN is absent', async () => {
+    stubFetch('operator', '001011234567890');
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/ue-profiles')) {
+        return respond(200, {
+          data: {
+            items: [{ ...PROFILE_WIRE, msisdn: null }],
+            total: 1,
+            page: 1,
+            page_size: 100,
+            pages: 1,
+            max: 10,
+            secrets_exposed: false,
+          },
+          meta: {},
+        });
+      }
+      return respond(200, { data: {}, meta: {} });
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId('ue-msisdn-UE-12')).toBeInTheDocument());
+    expect(screen.getByTestId('ue-msisdn-UE-12')).toHaveTextContent('-- (non provisionné)');
   });
 });
 

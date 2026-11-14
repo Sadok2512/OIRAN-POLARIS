@@ -19,6 +19,8 @@ export interface UeProfileDraft {
 }
 
 export interface UeProfileRecord extends UeProfileDraft {
+  /** Read-only subscriber phone number projected from Open5GS. */
+  msisdn?: string;
   createdAt: number;
   updatedAt: number;
   /** When true, this profile was synthesized from the backend UE inventory and never persisted. */

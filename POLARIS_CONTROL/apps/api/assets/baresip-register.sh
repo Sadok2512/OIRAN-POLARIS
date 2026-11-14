@@ -20,9 +20,16 @@ module_path /usr/lib/baresip/modules
 module stdio.so
 module account.so
 module contact.so
+module g711.so
+module ausine.so
+module aubridge.so
+module_app ctrl_tcp.so
+ctrl_tcp_listen 127.0.0.1:4444
+audio_source ausine,440
+audio_player aubridge,polaris
 EOF
 umask 077
 cat >"$cfg/accounts" <<EOF
-<sip:${SIP_AOR}@ims-lite.audit>;auth_user=ue;auth_pass=${password};regint=60;outbound="sip:${SIP_PROXY};lr"
+<sip:${SIP_AOR}@ims-lite.audit>;auth_user=ue;auth_pass=${password};regint=60;answermode=auto;outbound="sip:${SIP_PROXY};lr"
 EOF
 exec baresip -4 -n "$SIP_IFACE" -f "$cfg"

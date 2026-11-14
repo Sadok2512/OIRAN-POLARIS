@@ -1193,6 +1193,9 @@ export function UeManagerPage() {
                       <span className="mono" data-testid={`ue-imsi-${row.profile.id}`}>
                         {formatImsiForRole(row.profile.imsi, true)}
                       </span>
+                      <span className="mono" data-testid={`ue-msisdn-${row.profile.id}`}>
+                        MSISDN {row.profile.msisdn ?? '-- (non provisionné)'}
+                      </span>
                     </div>
                   </td>
                   <td className="px-3 py-3" data-testid={`ue-technology-${row.profile.id}`}>

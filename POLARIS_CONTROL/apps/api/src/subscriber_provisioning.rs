@@ -37,6 +37,7 @@ pub struct SubscriberMutation {
 #[derive(Clone)]
 pub struct SubscriberRecord {
     pub imsi: String,
+    pub msisdn: Option<String>,
     pub k: String,
     pub opc: String,
     pub slot: String,
@@ -67,6 +68,7 @@ pub struct SanitizedSubscriber {
     pub dnns: Vec<String>,
     pub ambr: SubscriberAmbr,
     pub subscriber_identity: String,
+    pub msisdn: Option<String>,
     pub authentication_material: String,
 }
 
@@ -290,6 +292,15 @@ impl MongoSubscriberBackend {
             .collect::<Vec<_>>();
         let record = SubscriberRecord {
             imsi: imsi.to_string(),
+            msisdn: value["msisdn"]
+                .as_array()
+                .and_then(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .find(|value| !value.is_empty())
+                })
+                .map(str::to_string),
             k: k.to_string(),
             opc: opc.to_string(),
             slot: marker["slot"]
@@ -347,7 +358,7 @@ impl SubscriberBackend for MongoSubscriberBackend {
         &self,
         visibility: SubscriberIdentityVisibility,
     ) -> Result<Vec<SanitizedSubscriber>, String> {
-        let value = self.mongosh(br#"print(JSON.stringify(db.subscribers.find({"polaris.owned":true},{imsi:1,security:1,slice:1,ambr:1,polaris:1}).toArray()))"#)?;
+        let value = self.mongosh(br#"print(JSON.stringify(db.subscribers.find({"polaris.owned":true},{imsi:1,msisdn:1,security:1,slice:1,ambr:1,polaris:1}).toArray()))"#)?;
         value
             .as_array()
             .ok_or("OPEN5GS_DATABASE_RESPONSE_INVALID")?
@@ -820,6 +831,7 @@ pub fn sanitize_for_role(
         dnns: record.dnns.clone(),
         ambr: record.ambr.clone(),
         subscriber_identity: identity,
+        msisdn: record.msisdn.clone(),
         authentication_material: "PROTECTED".into(),
     }
 }
@@ -828,6 +840,7 @@ fn record_from_mutation(input: SubscriberMutation, mcc: &str, mnc: &str) -> Subs
     SubscriberRecord {
         slot: slot_for(&input.imsi),
         imsi: input.imsi,
+        msisdn: None,
         k: input.k,
         opc: input.opc,
         plmn_mcc: mcc.into(),
@@ -1726,6 +1739,7 @@ print(JSON.stringify({{ sessions: sessions, top: top, shape: shape }}));
         let record = SubscriberRecord {
             slot: "UE-07".into(),
             imsi: "001011234567890".into(),
+            msisdn: Some("15550000007".into()),
             k: "aa".repeat(16),
             opc: "bb".repeat(16),
             plmn_mcc: "001".into(),
@@ -1740,11 +1754,13 @@ print(JSON.stringify({{ sessions: sessions, top: top, shape: shape }}));
         };
         let viewer = sanitize_for_role(&record, SubscriberIdentityVisibility::Protected);
         assert_eq!(viewer.subscriber_identity, "PROTECTED");
+        assert_eq!(viewer.msisdn.as_deref(), Some("15550000007"));
         assert_eq!(viewer.authentication_material, "PROTECTED");
 
         // Operator view exposes the raw IMSI, but K / OPc stay PROTECTED.
         let operator = sanitize_for_role(&record, SubscriberIdentityVisibility::Imsi);
         assert_eq!(operator.subscriber_identity, "001011234567890");
+        assert_eq!(operator.msisdn.as_deref(), Some("15550000007"));
         assert_eq!(operator.authentication_material, "PROTECTED");
 
         // JSON round-trip: operator payload must contain the IMSI once; the

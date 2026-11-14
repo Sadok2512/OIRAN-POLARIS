@@ -105,7 +105,11 @@ afterEach(() => {
 
 describe('UeActivityPage (0.11.0)', () => {
   it('renders the "UE non démarré" banner when running:false', async () => {
-    globalThis.fetch = vi.fn(async () => respond(STOPPED_PAYLOAD)) as unknown as typeof fetch;
+    globalThis.fetch = vi.fn(async (input) =>
+      String(input).includes('/ue-profiles/')
+        ? respond({ data: { subscriber: { msisdn: null } }, meta: {} })
+        : respond(STOPPED_PAYLOAD),
+    ) as unknown as typeof fetch;
     renderAt('UE-99');
     const banner = await screen.findByTestId('activity-not-running');
     expect(banner).toHaveTextContent(/non démarré/i);
@@ -115,7 +119,11 @@ describe('UeActivityPage (0.11.0)', () => {
   });
 
   it('renders the four state chips, PDU, voice and timeline on running:true', async () => {
-    globalThis.fetch = vi.fn(async () => respond(RUNNING_PAYLOAD)) as unknown as typeof fetch;
+    globalThis.fetch = vi.fn(async (input) =>
+      String(input).includes('/ue-profiles/')
+        ? respond({ data: { subscriber: { msisdn: '15550000007' } }, meta: {} })
+        : respond(RUNNING_PAYLOAD),
+    ) as unknown as typeof fetch;
     renderAt('UE-07');
     await waitFor(() => expect(screen.queryByTestId('activity-loading')).toBeNull());
     expect(screen.getByTestId('chip-rm')).toHaveTextContent('RM-REGISTERED');
@@ -128,8 +136,23 @@ describe('UeActivityPage (0.11.0)', () => {
     expect(screen.getByTestId('activity-voice')).toHaveTextContent('IMS_NOT_AVAILABLE');
     expect(screen.getByTestId('activity-imsi')).toHaveTextContent('001010000000007');
     expect(screen.getByTestId('activity-imsi').textContent).not.toMatch(/•/);
+    await waitFor(() =>
+      expect(screen.getByTestId('activity-msisdn')).toHaveTextContent('15550000007'),
+    );
     expect(screen.getByTestId('activity-job-step')).toHaveTextContent('udp_traffic');
     expect(screen.getByTestId('timeline-list').children.length).toBe(2);
+  });
+
+  it('shows the explicit non-provisioned fallback when MSISDN is absent', async () => {
+    globalThis.fetch = vi.fn(async (input) =>
+      String(input).includes('/ue-profiles/')
+        ? respond({ data: { subscriber: { msisdn: null } }, meta: {} })
+        : respond(RUNNING_PAYLOAD),
+    ) as unknown as typeof fetch;
+    renderAt('UE-07');
+    await waitFor(() =>
+      expect(screen.getByTestId('activity-msisdn')).toHaveTextContent('-- (non provisionné)'),
+    );
   });
 });
 

@@ -24,6 +24,7 @@ export interface WireUeProfile {
    * the digits or the solid mask based on the caller's role.
    */
   subscriber_identity: string;
+  msisdn?: string | null;
   authentication_material: 'PROTECTED';
   profile: string;
   revision: number;
@@ -170,6 +171,7 @@ export interface WireSanitizedSubscriber {
   ambr: { uplink: number; downlink: number };
   /** 0.19.7 (#48) — raw IMSI for operator / administrator, "PROTECTED" otherwise. */
   subscriber_identity: string;
+  msisdn?: string | null;
   authentication_material: 'PROTECTED';
 }
 
@@ -178,6 +180,14 @@ export interface WireSubscriberDetail {
   linked_profile_ue_ids: string[];
   linked_profile_count: number;
   secrets_exposed: false;
+}
+
+export interface WireUeProfileDetail extends WireUeProfile {
+  subscriber: WireSanitizedSubscriber;
+}
+
+export function fetchUeProfileDetail(ueId: string) {
+  return polarisApi<WireUeProfileDetail>(`/ue-profiles/${encodeURIComponent(ueId)}`);
 }
 
 export interface WireSubscriberUpdate {

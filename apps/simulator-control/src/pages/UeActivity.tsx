@@ -32,6 +32,7 @@ import {
   Wifi,
 } from 'lucide-react';
 import { PageHeader } from '@/components/mockup';
+import { fetchUeProfileDetail } from '@/data/profileApi';
 import { StatusIndicator } from '@/ui/StatusIndicator';
 import { formatImsiForRole } from '@/ue/imsiHelpers';
 
@@ -104,6 +105,7 @@ export function UeActivityPage() {
     'connecting',
   );
   const [samples, setSamples] = useState<Sample[]>([]);
+  const [msisdn, setMsisdn] = useState<string | null>(null);
 
   const payloadRef = useRef<UeActivityPayload | null>(null);
   useEffect(() => {
@@ -121,6 +123,21 @@ export function UeActivityPage() {
         appendSample(setSamples, data);
       }
     });
+    return () => {
+      cancelled = true;
+    };
+  }, [ueId]);
+
+  useEffect(() => {
+    if (!ueId) return;
+    let cancelled = false;
+    void fetchUeProfileDetail(ueId)
+      .then((profile) => {
+        if (!cancelled) setMsisdn(profile.subscriber.msisdn ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setMsisdn(null);
+      });
     return () => {
       cancelled = true;
     };
@@ -220,7 +237,7 @@ export function UeActivityPage() {
                 <ChipCard key={chip.label} chip={chip} />
               ))}
             </div>
-            <IdentityRow imsi={payload.imsi} />
+            <IdentityRow imsi={payload.imsi} msisdn={msisdn} />
           </section>
 
           <section
@@ -364,12 +381,16 @@ function ChipCard({ chip }: { chip: Chip }) {
   );
 }
 
-function IdentityRow({ imsi }: { imsi?: string | null }) {
+function IdentityRow({ imsi, msisdn }: { imsi?: string | null; msisdn?: string | null }) {
   return (
     <p className="text-ep-xs text-text-secondary flex items-center gap-2">
       <span className="uppercase tracking-wider">IMSI</span>
       <span className="mono" data-testid="activity-imsi">
         {formatImsiForRole(imsi, true)}
+      </span>
+      <span className="uppercase tracking-wider">MSISDN</span>
+      <span className="mono" data-testid="activity-msisdn">
+        {msisdn ?? '-- (non provisionné)'}
       </span>
     </p>
   );

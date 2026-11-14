@@ -27,7 +27,7 @@ import {
   useScenarioTemplates,
   type ScenarioTemplateDescriptor,
 } from '@/data/scenarioTemplatesApi';
-import { useStartScenarioRun } from '@/data/scenarioApi';
+import { fetchScenarioSteps, useStartScenarioRun } from '@/data/scenarioApi';
 import { useUes } from '@/data/queries';
 import { useCreateLiveGrant } from '@/data/liveGrantApi';
 import type { WireScenarioDefinition } from '@/scenarios/wireCodec';
@@ -106,6 +106,33 @@ export function ScenariosLibraryPage() {
         ue_ids: [caller, callee],
       });
       setCallResult(`Appel lancé · ${result.job_id} · ${result.state}`);
+      for (let attempt = 0; attempt < 180; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+        const observed = await fetchScenarioSteps(result.job_id);
+        if (!['COMPLETED', 'FAILED', 'STOPPED'].includes(observed.state ?? '')) continue;
+        if (observed.state !== 'COMPLETED') {
+          setCallResult(`Appel échoué · ${observed.failure?.code ?? observed.state}`);
+          return;
+        }
+        const call = observed.steps.find((step) => step.type === 'voice_call');
+        const measurements = call?.measurements as {
+          sip?: { ringing?: number; ok?: number; ack?: boolean; bye_ok?: number };
+          duration_ms?: number;
+          rtp?: { tx_packets?: number; tx_bytes?: number; rx_packets?: number; rx_bytes?: number };
+          qos?: { five_qi?: number | null; status?: string };
+        } | undefined;
+        const sip = measurements?.sip;
+        const rtp = measurements?.rtp;
+        setCallResult(
+          `Appel terminé · SIP 180/${sip?.ok ?? '—'} · ACK ${sip?.ack ? 'OK' : '—'} · BYE ${sip?.bye_ok ?? '—'} · ` +
+          `RTP ↑ ${rtp?.tx_packets ?? 0} paquets / ${rtp?.tx_bytes ?? 0} octets · ` +
+          `↓ ${rtp?.rx_packets ?? 0} paquets / ${rtp?.rx_bytes ?? 0} octets · ` +
+          `durée ${measurements?.duration_ms ?? 0} ms · ` +
+          `5QI ${measurements?.qos?.five_qi ?? measurements?.qos?.status ?? '—'}`,
+        );
+        return;
+      }
+      setCallResult('Appel non confirmé · VOICE_CALL_OBSERVATION_TIMEOUT');
     } catch (error) {
       setCallResult(`Appel indisponible · ${(error as Error).message}`);
     }

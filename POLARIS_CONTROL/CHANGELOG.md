@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.35.1 — 2026-11-14 — subscriber MSISDN and two-UE voice validation
+
+- Reads the lab subscriber MSISDN from Open5GS without mutation and displays it
+  next to the full IMSI in UE Manager and Activity, with an explicit fallback
+  when the subscriber has no MSISDN.
+- Keeps the two-UE call result evidence-driven: SIP signalling, bidirectional
+  RTP and 5QI 1 must all be observed before the call can be certified.
+
 ## 0.35.0 — 2026-11-14 — simplified rich control surface
 
 - Exposes the rich Simulator Control UI as the single operator surface and

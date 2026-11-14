@@ -107,6 +107,7 @@ export interface WireScenarioStepStatus {
   ended_at: number | null;
   error: string | null;
   resolved_parameters: Record<string, number>;
+  measurements?: Record<string, unknown> | null;
 }
 
 /** 0.17.0 — job-level failure summary surfaced on GET /scenarios/:id/steps. */
