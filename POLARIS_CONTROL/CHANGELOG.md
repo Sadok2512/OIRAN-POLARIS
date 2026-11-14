@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.36.4 — 2026-11-14 — Pas d'attente PDU sans UE réel (patch)
+
+- Corrige 2 tests en échec sur le serveur (ANR2 #10 6884304792) :
+  `live_definition_reports_real_step_transitions_without_host_execution` et
+  `operator_stop_cancels_definition_and_cleans_only_job_started_ues`.
+  Depuis 0.36.2, `ue_start` attendait jusqu'à 8 s une PDU active ; avec
+  tcpdump présent sur l'hôte, un UE simulé (conteneur inexistant) faisait
+  expirer l'attente de terminaison des tests. L'attente s'arrête désormais
+  dès que le CLI de l'UE est injoignable, et les captures N2 ne sont
+  lancées que si le gNB du lab (`oiran-lab-ueransim-gnb-1`) existe.
+  Reproduit en local avec tcpdump installé : 2 FAIL avant, 2 PASS après.
+
 ## 0.36.3 — 2026-11-14 — Comptage RTP et SIP de l'appel fiables (patch)
 
 - Corrige l'écart ANR1 #10 6883618493 (API 143 paquets RTP par sens,

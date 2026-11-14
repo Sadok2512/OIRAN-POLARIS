@@ -12423,7 +12423,13 @@ fn execute_live_definition_step(
                     // 0.36.2 — UERANSIM opens its configured PDU (internet) right
                     // after registration: capture N2 across the start (ANR2 #10
                     // 6883071989, n2_qos internet five_qi=[]).
-                    let n2_capture = N2QosCapture::start(ue_id, 60);
+                    // 0.36.4 — only when the real lab gNB exists (no capture in
+                    // mocked runtimes: it delayed termination, ANR2 #10 6884304792).
+                    let n2_capture = if inspect_container_state("oiran-lab-ueransim-gnb-1").is_some() {
+                        N2QosCapture::start(ue_id, 60)
+                    } else {
+                        Err(String::new())
+                    };
                     let started = start_one_live(state, ue_id);
                     match (n2_capture, &started) {
                         (Ok(capture), Ok(job)) => {
@@ -12438,6 +12444,7 @@ fn execute_live_definition_step(
                                 let _ = fs::remove_file(path);
                             }
                         }
+                        (Err(error), _) if error.is_empty() => {}
                         (Err(error), _) => {
                             record_activity_event(state, ue_id, "n2_qos", "FAILED", json!({"error": error}))
                         }
@@ -12541,7 +12548,7 @@ fn execute_live_definition_step(
                 let already_active = pdu_snapshots_for_job(&job)
                     .iter()
                     .any(|pdu| pdu.dnn.as_deref() == Some(pdu_profile_dnn.as_str()) && pdu.address.is_some());
-                let n2_capture = if already_active {
+                let n2_capture = if already_active || inspect_container_state("oiran-lab-ueransim-gnb-1").is_none() {
                     Err(String::new())
                 } else {
                     N2QosCapture::start(ue_id, timeout)
@@ -13664,6 +13671,16 @@ fn wait_for_active_pdus(
     job: &simulator_controller::UeJob,
     limit: std::time::Duration,
 ) -> Vec<(String, Option<u32>)> {
+    // 0.36.4 — a job without a real UE container (test / mocked runtime)
+    // can never report a PDU: don't wait (ANR2 #10 6884304792, 2 tests
+    // timing out on their termination wait once tcpdump exists on the host).
+    let Some(container_id) = job.process_handle.as_deref().and_then(DockerUeRuntime::container_id) else {
+        return Vec::new();
+    };
+    // Unreachable UE CLI (no such container, e.g. mocked runtime): stop now.
+    if DockerUeRuntime::ue_cli_node(container_id).is_err() {
+        return Vec::new();
+    }
     let started = std::time::Instant::now();
     loop {
         let active: Vec<(String, Option<u32>)> = pdu_snapshots_for_job(job)
