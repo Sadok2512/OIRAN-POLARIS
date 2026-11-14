@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.35.0 — 2026-11-14 — simplified rich control surface
+
+- Exposes the rich Simulator Control UI as the single operator surface and
+  limits its main library to the three French lab workflows.
+- Adds an honest two-UE call launcher that remains locked until two verified,
+  controller-owned UE profiles are available.
+- Reports disk-probe failures explicitly, including their measured cause,
+  instead of leaving either frontend in a perpetual measuring state.
+
 ## 0.34.1 — 2026-11-14 — test-lab IMSI display
 
 - Show the complete operator-provided lab IMSI in rich and minimal UE lists and Activity views.

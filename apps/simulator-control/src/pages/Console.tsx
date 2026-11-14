@@ -9,10 +9,25 @@ import {
   useNodes,
   useScenarioHistory,
   useScenarioRuntime,
+  useSystemHealth,
   useUes,
 } from '@/data/queries';
 
 const NOT_AVAILABLE = 'NOT_AVAILABLE';
+
+export function diskMeasurementView(
+  health: ReturnType<typeof useSystemHealth>['data'],
+  error: Error | null,
+): { error: string | null; usage: string | null } {
+  if (error) return { error: error.message, usage: null };
+  if (!health?.disk) {
+    return {
+      error: health?.disk_measurement_error ?? health?.decision.reason ?? 'SONDE_DISQUE_SANS_RESULTAT',
+      usage: null,
+    };
+  }
+  return { error: null, usage: `${health.disk.usage_percent.toFixed(2)} % utilisés` };
+}
 
 type ReadinessRow = {
   label: string;
@@ -95,6 +110,7 @@ export function ConsolePage() {
   const nodes = useNodes();
   const runtime = useScenarioRuntime();
   const history = useScenarioHistory();
+  const health = useSystemHealth();
 
   const loading = lab.isLoading && ues.isLoading && nodes.isLoading;
   const error = lab.error || ues.error;
@@ -117,6 +133,7 @@ export function ConsolePage() {
   const configuredUes = ues.data?.configured_count ?? 0;
   const liveCap = lab.data?.max_ues ?? configuredUes;
   const pdu = ues.data?.pdu_session_count ?? 0;
+  const diskView = diskMeasurementView(health.data, health.error as Error | null);
 
   // Readiness
   const missingSubscribers = lab.data?.missing_subscriber_profiles ?? 0;
@@ -197,6 +214,24 @@ export function ConsolePage() {
               sub={`DNN ${NOT_AVAILABLE}`}
             />
           </div>
+          <Card className="p-4" data-testid="disk-measurement">
+            <p className="text-ep-xs font-semibold uppercase tracking-wider text-mute">Disque</p>
+            {diskView.error ? (
+              <div className="mt-2 text-bad" role="alert" data-testid="disk-measurement-error">
+                <strong>Erreur de mesure disque</strong>
+                <p className="text-ep-sm">{diskView.error}</p>
+              </div>
+            ) : (
+              <div className="mt-2" data-testid="disk-measurement-ok">
+                <strong className="num">{diskView.usage}</strong>
+                <p className="text-ep-sm text-mute">
+                  {health.data?.decision.writes_allowed
+                    ? 'Mesure valide · nouveaux jobs autorisés'
+                    : `Nouveaux jobs bloqués · ${health.data?.decision.reason ?? 'raison non rapportée'}`}
+                </p>
+              </div>
+            )}
+          </Card>
           <div className="grid gap-5 lg:grid-cols-2">
             <Readiness rows={readinessRows} />
             <RecentActivity items={activityItems} />

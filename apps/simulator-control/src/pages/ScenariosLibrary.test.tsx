@@ -67,6 +67,7 @@ beforeEach(() => {
     if (url.endsWith('/scenario-templates')) return respond(200, templateCatalog);
     if (url.includes('/estimate')) return respond(200, { duration_ms: 60_000 });
     if (url.endsWith('/scenario-definitions')) return respond(200, { items: [], total: 0, schema_version: 1 });
+    if (url.endsWith('/ues')) return respond(200, { items: [], configured_profiles: [], configured_count: 0, active_count: 0, registered_count: 0, source: 'TEST' });
     if (url.endsWith('/capabilities')) return respond(200, {
       live_control: true, approval_state: 'OPERATOR_AUTHORIZATION_REQUIRED', max_ues: 10, max_nodes: 2,
       registration_modes: ['STAGGERED'], traffic_protocols: ['UDP'], approved_destinations: [],
@@ -125,5 +126,40 @@ describe('ScenariosLibrary — default LTE/5G system templates', () => {
     expect(await screen.findAllByTestId(/^template-row-/)).toHaveLength(13);
     expect(screen.queryByRole('button', { name: /^Edit / })).toBeNull();
     expect(screen.queryByRole('button', { name: /^Delete / })).toBeNull();
+  });
+});
+
+describe('ScenariosLibrary — simplified operator surface', () => {
+  it('shows only the three simple French scenarios and blocks Appeler without two verified UEs', async () => {
+    const fallback = globalThis.fetch;
+    const definition = (id: string, name: string) => ({
+      id, name, version: 1, loop_count: 1, created_at_epoch_s: 1, updated_at_epoch_s: 1,
+      rat: '5G_SA', simulator: 'UERANSIM', description: '', assigned_ues: 0,
+      backend_support: 'SUPPORTED', executable: true, execution_block_reason: null,
+      steps: [{ type: 'wait', loop_count: 1, parameters: { duration_ms: { fixed: 1000 } } }],
+    });
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/scenario-definitions')) return respond(200, {
+        items: [
+          definition('simple-data-ul-dl', 'Données UL/DL'),
+          definition('simple-voice-register', 'Enregistrement voix'),
+          definition('simple-voice-call', 'Appel voix entre 2 UE'),
+          definition('anr2-old-test', 'Ancien test'),
+          definition('tpl-high-runner', 'High runner'),
+        ],
+        total: 5,
+        schema_version: 1,
+      });
+      return fallback(input, init);
+    }) as typeof fetch;
+    renderPage();
+    expect(await screen.findAllByTestId(/^scenario-row-/)).toHaveLength(3);
+    expect(screen.getByText('Données UL/DL')).toBeVisible();
+    expect(screen.getByText('Enregistrement voix')).toBeVisible();
+    expect(screen.getAllByText('Appel voix entre 2 UE').length).toBeGreaterThan(0);
+    expect(screen.queryByText('Ancien test')).toBeNull();
+    expect(screen.getByTestId('call-submit')).toBeDisabled();
+    expect(screen.getByTestId('call-prerequisite-error')).toHaveTextContent('deux UE vérifiés');
   });
 });

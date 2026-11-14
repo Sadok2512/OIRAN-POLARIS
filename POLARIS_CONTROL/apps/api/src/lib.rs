@@ -4221,13 +4221,14 @@ async fn me(
 
 async fn system(State(state): State<Arc<AppState>>) -> Json<Value> {
     let sample = measure(&state.storage_path);
+    let measurement_error = sample.as_ref().err().cloned();
     let decision = evaluate(sample.clone(), Policy::default());
     let disk = sample.ok().map(|s| json!({"total_bytes":s.total_bytes,"used_bytes":s.used_bytes(),"available_bytes":s.available_bytes,"usage_percent":s.basis_points().map(|v|f64::from(v)/100.0),"available_inodes":s.available_inodes}));
     let memory = memory_stats();
     let cpu_safety = cpu_safety_evidence(&state, ScenarioResourceBudget::traffic());
     let four_plane_capture_budget = ScenarioResourceBudget::four_plane_capture();
     Json(
-        json!({"disk":disk,"decision":decision,"memory":memory,"cpu":{"usage_percent":cpu_safety.host.usage_percent,"idle_percent":cpu_safety.host.idle_percent,"steal_percent":cpu_safety.host.steal_percent,"iowait_percent":cpu_safety.host.iowait_percent,"logical_cpus":cpu_safety.host.logical_cpus,"sample_duration_ms":cpu_safety.host.sample_duration_ms},"cpu_safety":cpu_safety,"reference_budgets":{"four_plane_capture":four_plane_capture_budget},"load_average":fs::read_to_string("/proc/loadavg").unwrap_or_else(|_|"NOT_AVAILABLE".into()).trim(),"uptime_seconds":fs::read_to_string("/proc/uptime").ok().and_then(|v|v.split_whitespace().next()?.parse::<f64>().ok()),"observed_at_epoch_s":epoch_seconds(),"decision_source":"MEASURED","poll_interval_ms":1000,"capture_limits":{"max_file_bytes":268435456u64,"max_files":8,"max_duration_seconds":900,"max_concurrent_jobs":1},"automatic_cleanup":false}),
+        json!({"disk":disk,"disk_measurement_error":measurement_error,"decision":decision,"memory":memory,"cpu":{"usage_percent":cpu_safety.host.usage_percent,"idle_percent":cpu_safety.host.idle_percent,"steal_percent":cpu_safety.host.steal_percent,"iowait_percent":cpu_safety.host.iowait_percent,"logical_cpus":cpu_safety.host.logical_cpus,"sample_duration_ms":cpu_safety.host.sample_duration_ms},"cpu_safety":cpu_safety,"reference_budgets":{"four_plane_capture":four_plane_capture_budget},"load_average":fs::read_to_string("/proc/loadavg").unwrap_or_else(|_|"NOT_AVAILABLE".into()).trim(),"uptime_seconds":fs::read_to_string("/proc/uptime").ok().and_then(|v|v.split_whitespace().next()?.parse::<f64>().ok()),"observed_at_epoch_s":epoch_seconds(),"decision_source":"MEASURED","poll_interval_ms":1000,"capture_limits":{"max_file_bytes":268435456u64,"max_files":8,"max_duration_seconds":900,"max_concurrent_jobs":1},"automatic_cleanup":false}),
     )
 }
 
@@ -22620,5 +22621,23 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
         assert!(!encoded.contains("K="));
         assert!(!encoded.contains("OPc="));
         assert!(!encoded.contains("password"));
+    }
+
+    #[tokio::test]
+    async fn system_health_exposes_disk_measurement_failure_cause_0_35_0() {
+        let mut test_state = state();
+        test_state.storage_path = std::env::temp_dir().join(format!(
+            "polaris-control-missing-disk-probe-{}",
+            TEST_ID.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+
+        let Json(body) = system(State(Arc::new(test_state))).await;
+
+        assert!(body["disk"].is_null());
+        assert!(body["disk_measurement_error"]
+            .as_str()
+            .is_some_and(|cause| !cause.is_empty()));
+        assert_eq!(body["decision"]["state"], "MEASUREMENT_FAILED");
+        assert_eq!(body["decision"]["writes_allowed"], false);
     }
 }

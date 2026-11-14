@@ -385,6 +385,7 @@ export interface SystemHealth {
     available_bytes: number;
     usage_percent: number;
   } | null;
+  disk_measurement_error?: string | null;
   decision: { state: string; writes_allowed: boolean; reason: string; maximum_budget_bytes: number };
   load_average: string;
   uptime_seconds: number | null;

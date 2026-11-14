@@ -27,11 +27,20 @@ import {
   useScenarioTemplates,
   type ScenarioTemplateDescriptor,
 } from '@/data/scenarioTemplatesApi';
+import { useStartScenarioRun } from '@/data/scenarioApi';
+import { useUes } from '@/data/queries';
+import { useCreateLiveGrant } from '@/data/liveGrantApi';
 import type { WireScenarioDefinition } from '@/scenarios/wireCodec';
 import { ApiError } from '@shared/api';
 import { ImportScenarioDialog } from '@/scenarios/ImportScenarioDialog';
 
 type Tab = 'library' | 'templates';
+
+export const SIMPLE_SCENARIO_IDS = [
+  'simple-data-ul-dl',
+  'simple-voice-register',
+  'simple-voice-call',
+] as const;
 
 function loopLabel(loop: LoopMode): string {
   switch (loop.kind) {
@@ -56,17 +65,51 @@ export function ScenariosLibraryPage() {
   const [tab, setTab] = useState<Tab>('library');
   const [importOpen, setImportOpen] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [caller, setCaller] = useState('');
+  const [callee, setCallee] = useState('');
+  const [callResult, setCallResult] = useState('');
+  const ues = useUes();
+  const createGrant = useCreateLiveGrant();
+  const startRun = useStartScenarioRun();
+
+  const callableUes = useMemo(
+    () => (ues.data?.items ?? []).filter(
+      (ue) => ue.controller_owned && ue.subscription_status === 'VERIFIED',
+    ),
+    [ues.data?.items],
+  );
 
   const filtered = useMemo(() => {
     const needle = search.trim().toLowerCase();
-    if (!needle) return library.scenarios;
-    return library.scenarios.filter((scenario) =>
+    const simple = library.scenarios.filter((scenario) =>
+      SIMPLE_SCENARIO_IDS.includes(scenario.id as (typeof SIMPLE_SCENARIO_IDS)[number]),
+    );
+    if (!needle) return simple;
+    return simple.filter((scenario) =>
       [scenario.name, scenario.description ?? '', scenario.id]
         .join(' ')
         .toLowerCase()
         .includes(needle),
     );
   }, [library.scenarios, search]);
+
+  async function startVoiceCall() {
+    setCallResult('');
+    if (!caller || !callee || caller === callee) {
+      setCallResult('Choisissez deux UE différents.');
+      return;
+    }
+    try {
+      await createGrant.mutateAsync({ ue_ids: [caller, callee], duration_minutes: 15 });
+      const result = await startRun.mutateAsync({
+        scenario_definition_id: 'simple-voice-call',
+        ue_ids: [caller, callee],
+      });
+      setCallResult(`Appel lancé · ${result.job_id} · ${result.state}`);
+    } catch (error) {
+      setCallResult(`Appel indisponible · ${(error as Error).message}`);
+    }
+  }
 
   function createScenario() {
     if (library.backend) {
@@ -164,6 +207,45 @@ export function ScenariosLibraryPage() {
           data-testid="download-error"
         >
           {downloadError}
+        </div>
+      )}
+
+      {tab === 'library' && (
+        <div className="ep-card p-4 mb-4" data-testid="simple-call-panel">
+          <h2 className="font-semibold">Appel voix entre 2 UE</h2>
+          <p className="text-ep-sm text-text-secondary mt-1">
+            Choisissez l'appelant et l'appelé, puis lancez l'appel. Seuls les UE vérifiés et contrôlables sont proposés.
+          </p>
+          <div className="flex flex-wrap items-end gap-2 mt-3">
+            <label className="text-ep-sm">UE A
+              <select className="ep-input block mt-1" value={caller} onChange={(event) => setCaller(event.target.value)} data-testid="call-caller">
+                <option value="">Choisir</option>
+                {callableUes.map((ue) => <option key={ue.id} value={ue.id}>{ue.id}</option>)}
+              </select>
+            </label>
+            <label className="text-ep-sm">UE B
+              <select className="ep-input block mt-1" value={callee} onChange={(event) => setCallee(event.target.value)} data-testid="call-callee">
+                <option value="">Choisir</option>
+                {callableUes.map((ue) => <option key={ue.id} value={ue.id}>{ue.id}</option>)}
+              </select>
+            </label>
+            <button
+              type="button"
+              className="ep-button ep-button-primary"
+              onClick={() => void startVoiceCall()}
+              disabled={callableUes.length < 2 || createGrant.isPending || startRun.isPending}
+              title={callableUes.length < 2 ? 'Deux UE vérifiés et contrôlables sont requis.' : undefined}
+              data-testid="call-submit"
+            >
+              Appeler
+            </button>
+          </div>
+          {callableUes.length < 2 && (
+            <p className="text-ep-sm text-warn mt-2" data-testid="call-prerequisite-error">
+              Appel bloqué : deux UE vérifiés et contrôlables sont requis.
+            </p>
+          )}
+          {callResult && <p className="text-ep-sm mt-2" role="status">{callResult}</p>}
         </div>
       )}
 
