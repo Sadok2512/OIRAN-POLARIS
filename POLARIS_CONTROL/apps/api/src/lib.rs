@@ -12925,6 +12925,40 @@ fn stop_ims_client(ue_id: &str) {
     }
 }
 
+fn ims_evidence_container_name(name: &str, observed_at_epoch_s: u64, suffix: &str) -> String {
+    format!("{name}-evidence-{observed_at_epoch_s}-{suffix}")
+}
+
+fn archive_stopped_ims_client(ue_id: &str) -> Result<(), String> {
+    let (name, _) = ims_client_name(ue_id)?;
+    let inspect = Command::new("/usr/bin/docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{index .Config.Labels \"polaris.control.owner\"}}|{{index .Config.Labels \"polaris.control.ue-id\"}}|{{.State.Running}}",
+            name,
+        ])
+        .output()
+        .map_err(|_| "IMS_CLIENT_INSPECT_FAILED")?;
+    if !inspect.status.success() {
+        return Ok(());
+    }
+    let binding = String::from_utf8_lossy(&inspect.stdout);
+    let expected = format!("polaris-control-ims|{ue_id}|false");
+    if binding.trim() != expected {
+        return Err("IMS_CLIENT_OWNERSHIP_CONFLICT".into());
+    }
+    let evidence_name = ims_evidence_container_name(name, epoch_seconds(), random_hex(3).as_str());
+    let renamed = Command::new("/usr/bin/docker")
+        .args(["rename", name, &evidence_name])
+        .output()
+        .map_err(|_| "IMS_CLIENT_ARCHIVE_FAILED")?;
+    if !renamed.status.success() {
+        return Err("IMS_CLIENT_ARCHIVE_FAILED".into());
+    }
+    Ok(())
+}
+
 fn stop_definition_ims_client(control: &DefinitionJobControl, ue_id: &str) {
     let owned = control
         .ims_clients
@@ -12993,6 +13027,7 @@ fn execute_ims_register(
         return Err("IMS_CLIENT_CONFIGURATION_UNAVAILABLE".into());
     }
     stop_ims_client(ue_id);
+    archive_stopped_ims_client(ue_id)?;
     let network = format!("container:{container_id}");
     let proxy = format!("SIP_PROXY={IMS_PROXY_IP}");
     let aor_env = format!("SIP_AOR={aor}");
@@ -22639,5 +22674,13 @@ PDU Session 2:\n  state: PS-ACTIVE\n  dnn: ims\n  ipv4: 10.47.0.6/16\n";
             .is_some_and(|cause| !cause.is_empty()));
         assert_eq!(body["decision"]["state"], "MEASUREMENT_FAILED");
         assert_eq!(body["decision"]["writes_allowed"], false);
+    }
+
+    #[test]
+    fn stopped_ims_client_is_archived_under_a_bounded_evidence_name_0_35_0() {
+        assert_eq!(
+            ims_evidence_container_name("sip-ue-201", 1_794_655_074, "a1b2c3"),
+            "sip-ue-201-evidence-1794655074-a1b2c3"
+        );
     }
 }
