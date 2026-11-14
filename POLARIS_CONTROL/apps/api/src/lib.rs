@@ -13307,11 +13307,15 @@ fn execute_voice_call(
             "tcpdump",
             "-n",
             "-l",
+            "-U",
             "-s",
             "0",
             "-A",
             "-i",
-            &caller_iface,
+            "any",
+            "host",
+            &caller_ip,
+            "and",
             "udp",
         ])
         .stdout(Stdio::piped())
