@@ -11,6 +11,7 @@ import { useUes } from '@/data/queries';
 import { useCreateScenarioDefinition, useScenarioDefinitions, useStartScenarioRun } from '@/data/scenarioApi';
 import { useCreateLiveGrant } from '@/data/liveGrantApi';
 import type { WireScenarioDefinition, WireScenarioStep } from '@/scenarios/wireCodec';
+import { enterQuiet } from '@/data/quietMode';
 import { Badge, needsTwoUes, reasonFr, stepsSummary } from './labShared';
 
 const MB = 1024 * 1024;
@@ -118,6 +119,7 @@ export function LabScenariosPage() {
     if (!voiceDef || !callA || !callB || callA === callB) return;
     setCallBusy(true);
     setMsg(null);
+    enterQuiet(90_000); // two UE starts + IMS + call: keep the API cgroup quiet
     try {
       await grant.mutateAsync({ ue_ids: [callA, callB], duration_minutes: 15 });
       const job = await start.mutateAsync({ scenario_definition_id: voiceDef.id, ue_ids: [callA, callB] });

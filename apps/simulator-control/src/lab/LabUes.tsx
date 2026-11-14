@@ -11,6 +11,7 @@ import { useStopScenario, useUes } from '@/data/queries';
 import { fetchScenarioSteps, useScenarioDefinitions, useStartScenarioRun } from '@/data/scenarioApi';
 import { useCreateLiveGrant } from '@/data/liveGrantApi';
 import type { UeState } from '@/data/polarisTypes';
+import { enterQuiet, leaveQuiet } from '@/data/quietMode';
 import { Badge, needsTwoUes, reasonFr, stepsSummary, type Tone } from './labShared';
 
 type Row = UeState & { subscriber_identity?: string | null; scenario_id?: string | null };
@@ -62,8 +63,12 @@ export function LabUesPage() {
   // Poll the jobs started here until they are terminal (one light call per active job).
   useEffect(() => {
     const active = Object.entries(runs).filter(([, r]) => !TERMINAL.has(r.state));
-    if (active.length === 0) return;
+    if (active.length === 0) {
+      leaveQuiet();
+      return;
+    }
     const timer = window.setInterval(async () => {
+      enterQuiet(10_000); // keep background polling off while a run is active
       for (const [ue, r] of active) {
         try {
           const steps = await fetchScenarioSteps(r.jobId);
@@ -84,6 +89,7 @@ export function LabUesPage() {
     if (!def) return;
     setBusy(id);
     setMessage(null);
+    enterQuiet(60_000);
     try {
       await createGrant.mutateAsync({ ue_ids: [id], duration_minutes: 15 });
       const job = await startRun.mutateAsync({ scenario_definition_id: def.id, ue_ids: [id] });

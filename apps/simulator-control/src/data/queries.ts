@@ -1,3 +1,4 @@
+import { politeInterval } from './quietMode';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { polarisApi, writeCsrf } from './polarisClient';
 
@@ -48,7 +49,7 @@ export function useVoiceStatus() {
   return useQuery({
     queryKey: ['polaris', 'voice-status'],
     queryFn: () => polarisApi<VoiceStatus>('/voice/status'),
-    refetchInterval: 2_000,
+    refetchInterval: politeInterval(15_000),
   });
 }
 
@@ -64,7 +65,7 @@ export function useLab() {
   return useQuery({
     queryKey: ['polaris', 'lab'],
     queryFn: () => polarisApi<LabConfiguration>('/lab'),
-    refetchInterval: 10_000,
+    refetchInterval: politeInterval(30_000),
   });
 }
 
@@ -102,7 +103,7 @@ export function useLabObserved() {
   return useQuery({
     queryKey: ['polaris', 'lab-observed'],
     queryFn: () => polarisApi<WireLabEnvelope>('/lab'),
-    refetchInterval: 10_000,
+    refetchInterval: politeInterval(15_000),
   });
 }
 
@@ -118,7 +119,7 @@ export function useUes() {
   return useQuery({
     queryKey: ['polaris', 'ues'],
     queryFn: () => polarisApi<UeInventory>('/ues'),
-    refetchInterval: 4_000,
+    refetchInterval: politeInterval(10_000),
   });
 }
 

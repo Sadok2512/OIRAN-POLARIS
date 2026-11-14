@@ -12,7 +12,8 @@ import type { UeActivityPayload } from '@/pages/UeActivity';
 import { Badge, Kpi, ThroughputChart, formatBps, formatBytes, hhmmss, type RateSample, type Tone } from './labShared';
 
 const MAX_SAMPLES = 60;
-const POLL_MS = 2000;
+const POLL_MS = 3000;
+const SSE_STALE_MS = 5000;
 
 type Ev = NonNullable<UeActivityPayload['events']>[number];
 
@@ -118,6 +119,7 @@ export function LabUeMonitorPage() {
   useEffect(() => {
     if (!ueId) return;
     let cancelled = false;
+    let lastFrame = 0;
     const apply = (data: UeActivityPayload) => {
       if (cancelled) return;
       setPayload(data);
@@ -136,15 +138,19 @@ export function LabUeMonitorPage() {
       source.onmessage = (ev) => {
         try {
           apply(JSON.parse(ev.data) as UeActivityPayload);
+          lastFrame = Date.now();
           setError(null);
         } catch {
           /* ignore malformed frame */
         }
       };
     }
-    // Always poll: a scenario can finish in ~10 s, the SSE stream alone
-    // is not enough to guarantee fresh state (0.36.1, ANR2 FAIL 0.36.0).
-    const poll = window.setInterval(() => void snapshot(), POLL_MS);
+    // 0.36.5 — poll only when no SSE frame arrived recently (0.36.1 polled
+    // on top of SSE: double nr-cli load on the API cgroup, ANR2 #10 6882271073).
+    const poll = window.setInterval(() => {
+      if (Date.now() - lastFrame < SSE_STALE_MS) return;
+      void snapshot();
+    }, POLL_MS);
     return () => {
       cancelled = true;
       source?.close();

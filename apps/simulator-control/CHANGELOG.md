@@ -1,5 +1,16 @@
 # @telecom/simulator-control — Changelog
 
+## 0.36.5 — 2026-11-14 — UI moins gourmande pour l'API (patch)
+
+- Corrige le FAIL ANR2 #10 6882271073 : la charge de l'UI portait le cgroup
+  API à 22/87 périodes throttled, et la garde CPU refusait `ue_start`.
+- Polling de fond ralenti : voice-status 2 s → 15 s, lab/observed → 15 s,
+  lab → 30 s, inventaire UE 4 s → 10 s.
+- « Mode calme » : suspendu pendant un lancement (60 s, appel 2 UE 90 s) et
+  tant qu'un run lancé depuis « UE du lab » est actif.
+- Suivi UE : le GET de secours ne part que si aucune trame SSE n'est arrivée
+  depuis 5 s (0.36.1 doublait la charge nr-cli).
+
 ## 0.36.4 — 2026-11-14 — Appel 2 UE : scénario certifié par défaut (patch)
 
 - Corrige le FAIL ANR2 de 0.36.3 (#10 6881378526) : la carte « Appel voix

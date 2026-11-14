@@ -189,3 +189,16 @@ describe('callScenarios — 0.36.4 (ANR2 FAIL 0.36.3 : tpl-voice-long choisi)', 
     expect(calls.map((d) => d.id)).toEqual(['simple-voice-call', 'tpl-voice-long']);
   });
 });
+
+describe('quietMode — 0.36.5 (ANR2 #10 6882271073 : charge UI → throttling)', () => {
+  it('suspends background polling while quiet', async () => {
+    const { enterQuiet, leaveQuiet, isQuiet, politeInterval } = await import('@/data/quietMode');
+    leaveQuiet();
+    expect(politeInterval(10_000)()).toBe(10_000);
+    enterQuiet(60_000);
+    expect(isQuiet()).toBe(true);
+    expect(politeInterval(10_000)()).toBe(false);
+    expect(isQuiet(Date.now() + 61_000)).toBe(false);
+    leaveQuiet();
+  });
+});
