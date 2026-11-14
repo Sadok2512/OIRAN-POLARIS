@@ -13091,8 +13091,6 @@ fn execute_single_ims_register(
             "ALL",
             "--cap-add",
             "NET_ADMIN",
-            "--cap-add",
-            "NET_RAW",
             "--security-opt",
             "no-new-privileges:true",
             "--label",
@@ -13291,20 +13289,33 @@ fn execute_voice_call(
     let caller_ip = DockerUeRuntime::observe_pdu_dnn(caller_container, "ims")?
         .and_then(|pdu| pdu.ready_address().map(str::to_string))
         .ok_or("IMS_PDU_NOT_ACTIVE")?;
-    let caller_iface = wait_for_ims_interface(
+    let _caller_iface = wait_for_ims_interface(
         caller_container,
         &caller_ip,
         control,
         std::time::Duration::from_secs(5),
     )?;
     let capture_seconds = duration_ms.div_ceil(1_000) + 8;
-    let capture = Command::new("/usr/bin/docker")
+    let caller_pid = DockerUeRuntime::output(&[
+        "inspect".into(),
+        "--format".into(),
+        "{{.State.Pid}}".into(),
+        caller_name.into(),
+    ])?
+    .trim()
+    .parse::<u32>()
+    .ok()
+    .filter(|pid| *pid > 0)
+    .ok_or("IMS_CALL_CAPTURE_FAILED")?;
+    let caller_pid = caller_pid.to_string();
+    let capture = Command::new("/usr/bin/nsenter")
         .args([
-            "exec",
-            caller_name,
-            "timeout",
+            "-t",
+            &caller_pid,
+            "-n",
+            "/usr/bin/timeout",
             &capture_seconds.to_string(),
-            "tcpdump",
+            "/usr/bin/tcpdump",
             "-n",
             "-l",
             "-U",
