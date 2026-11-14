@@ -1,5 +1,17 @@
 # @telecom/simulator-control — Changelog
 
+## 0.35.2 — 2026-11-14 — UE detail page no longer blank (patch)
+
+- Fixes `/ues/:id` rendering a blank page: `/ue-profiles/:id` now returns a
+  flat profile (`subscriber_identity`, `subscriber{…}`, `snssai`,
+  `scenario_id`, `last_job`) while the page read the legacy nested shape
+  (`identity.owner`) and threw `TypeError: Cannot read properties of
+  undefined (reading 'owner')`. Both shapes are normalised; any missing
+  field renders as "—" instead of crashing.
+- Shows MSISDN ("-- (non provisionné)" when absent), the subscriber's
+  authorised DNNs, and a direct link to the live Activity page.
+- Traffic counters show "-- (aucun run mesuré)" instead of failing on null.
+
 ## 0.34.0 — 2026-11-13 — IMS PDU readiness contract
 
 - Aligns the release version with the API that keeps IMS unavailable until

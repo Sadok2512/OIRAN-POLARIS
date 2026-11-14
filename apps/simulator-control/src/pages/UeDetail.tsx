@@ -25,6 +25,11 @@ import { useAuth, useUes } from '@/data/queries';
 import { formatImsiForRole } from '@/ue/imsiHelpers';
 import { ApiError } from '@shared/api';
 
+// 0.35.2 — `/ue-profiles/:id` now returns a FLAT profile (subscriber_identity,
+// subscriber{…}, snssai, scenario_id, last_job…). The page used to read the
+// legacy nested shape (identity.owner…) and crashed into a blank screen.
+// Both shapes are normalised into `UeDetail`; a missing field renders as
+// "—", never as an exception.
 interface UeDetail {
   ue_id: string;
   identity: {
@@ -32,8 +37,10 @@ interface UeDetail {
     owner: string;
     note: string | null;
     imsi: string;
+    msisdn: string | null;
     authentication: string;
   };
+  subscriber_dnns: string[];
   provisioning: {
     status: string;
     subscriber_id: string | null;
@@ -67,16 +74,95 @@ interface UeDetail {
     last_job_id: string | null;
   };
   traffic: {
-    bytes_dl: number;
-    bytes_ul: number;
+    bytes_dl: number | null;
+    bytes_ul: number | null;
     last_sample_epoch_s: number | null;
+  };
+}
+
+type Raw = Record<string, unknown>;
+const obj = (v: unknown): Raw => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Raw) : {});
+const str = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
+const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+
+/** Accepts the legacy nested detail and the current flat profile. Exported for tests. */
+export function normalizeUeDetail(input: unknown, ueId: string): UeDetail {
+  const raw = obj(input);
+  const legacyIdentity = obj(raw.identity);
+  const subscriber = obj(raw.subscriber);
+  const legacyNet = obj(raw.network_profile);
+  const snssai = obj(raw.snssai ?? subscriber.snssai);
+  const plmn = obj(legacyNet.plmn ?? raw.plmn ?? subscriber.plmn);
+  const pdu = obj(raw.pdu_session);
+  const legacyProv = obj(raw.provisioning);
+  const legacyReg = obj(raw.registration);
+  const legacyScen = obj(raw.scenario);
+  const legacyTraffic = obj(raw.traffic);
+  const lastJob = obj(raw.last_job);
+  const ims = obj(raw.ims);
+  const sessions = Array.isArray(raw.pdu_sessions) ? raw.pdu_sessions : [];
+  return {
+    ue_id: str(raw.ue_id) ?? ueId,
+    identity: {
+      name: str(legacyIdentity.name) ?? str(raw.name) ?? ueId,
+      owner: str(legacyIdentity.owner) ?? str(raw.owner) ?? '—',
+      note: str(legacyIdentity.note) ?? str(raw.note),
+      imsi:
+        str(legacyIdentity.imsi) ??
+        str(raw.subscriber_identity) ??
+        str(subscriber.subscriber_identity) ??
+        '',
+      msisdn: str(legacyIdentity.msisdn) ?? str(subscriber.msisdn) ?? str(raw.msisdn),
+      authentication: 'PROTECTED',
+    },
+    subscriber_dnns: Array.isArray(subscriber.dnns)
+      ? subscriber.dnns.filter((d): d is string => typeof d === 'string')
+      : [],
+    provisioning: {
+      status: str(legacyProv.status) ?? str(raw.subscription_status) ?? str(subscriber.state) ?? '—',
+      subscriber_id: str(legacyProv.subscriber_id) ?? str(subscriber.slot),
+      bound_at_epoch_s: num(legacyProv.bound_at_epoch_s),
+    },
+    network_profile: {
+      plmn: { mcc: str(plmn.mcc) ?? '—', mnc: str(plmn.mnc) ?? '—' },
+      dnn: str(legacyNet.dnn) ?? str(raw.dnn) ?? str(pdu.dnn) ?? '—',
+      sst: num(legacyNet.sst) ?? num(snssai.sst) ?? 0,
+      sd: str(legacyNet.sd) ?? str(snssai.sd),
+      serving_gnb: str(legacyNet.serving_gnb) ?? str(raw.serving_gnb) ?? '—',
+    },
+    registration: {
+      state: str(legacyReg.state) ?? '—',
+      last_registered_at_epoch_s: num(legacyReg.last_registered_at_epoch_s),
+    },
+    pdu_sessions: sessions.map((s, index) => {
+      const row = obj(s);
+      return {
+        id: num(row.id) ?? num(row.psi) ?? index + 1,
+        dnn: str(row.dnn) ?? '—',
+        type: str(row.type) ?? '—',
+        ip: str(row.ip) ?? str(row.address),
+        established_at_epoch_s: num(row.established_at_epoch_s),
+      };
+    }),
+    ims: { state: str(ims.state) ?? '—', reason: str(ims.reason) },
+    scenario: {
+      assigned_id: str(legacyScen.assigned_id) ?? str(raw.scenario_id),
+      auto_run: legacyScen.auto_run === true || raw.auto_run_scenario === true,
+      last_job_id: str(legacyScen.last_job_id) ?? str(lastJob.job_id),
+    },
+    traffic: {
+      bytes_dl: num(legacyTraffic.bytes_dl) ?? num(lastJob.bytes_dl),
+      bytes_ul: num(legacyTraffic.bytes_ul) ?? num(lastJob.bytes_ul),
+      last_sample_epoch_s: num(legacyTraffic.last_sample_epoch_s),
+    },
   };
 }
 
 function useUeDetail(ueId: string, enabled: boolean) {
   return useQuery({
     queryKey: ['polaris', 'ue-detail', ueId],
-    queryFn: () => polarisApi<UeDetail>(`/ue-profiles/${encodeURIComponent(ueId)}`),
+    queryFn: async () =>
+      normalizeUeDetail(await polarisApi<unknown>(`/ue-profiles/${encodeURIComponent(ueId)}`), ueId),
     enabled,
     retry: false,
     staleTime: 10_000,
@@ -165,17 +251,35 @@ export function UeDetailPage() {
             protectedLabel={!canOperate}
           />
           <Field
+            label="MSISDN"
+            value={detail.data?.identity.msisdn ?? '-- (non provisionné)'}
+            mono
+          />
+          <Field
             label="Authentication material"
             value="PROTECTED"
             mono
             protectedLabel
           />
+          <p className="text-ep-xs pt-1">
+            <Link
+              to={`/ues/${encodeURIComponent(ueId)}/activity`}
+              className="underline"
+              data-testid="ue-detail-live-link"
+            >
+              Suivi en direct (RRC, enregistrement, PDU, débit)
+            </Link>
+          </p>
         </Block>
 
         <Block title="Registration" testid="ue-block-registration">
           <Field
             label="State"
-            value={detail.data?.registration.state ?? inventoryUe?.registration_state ?? '—'}
+            value={
+              detail.data && detail.data.registration.state !== '—'
+                ? detail.data.registration.state
+                : inventoryUe?.registration_state ?? '—'
+            }
           />
           <Field
             label="PDU session"
@@ -215,6 +319,11 @@ export function UeDetailPage() {
                 mono
               />
               <Field label="DNN" value={detail.data.network_profile.dnn} mono />
+              <Field
+                label="DNN autorisés"
+                value={detail.data.subscriber_dnns.length ? detail.data.subscriber_dnns.join(', ') : '—'}
+                mono
+              />
               <Field label="S-NSSAI SST" value={String(detail.data.network_profile.sst)} mono />
               <Field label="S-NSSAI SD" value={detail.data.network_profile.sd ?? '—'} mono />
             </Block>
@@ -268,8 +377,8 @@ export function UeDetailPage() {
             </Block>
 
             <Block title="Traffic" testid="ue-block-traffic">
-              <Field label="DL bytes" value={detail.data.traffic.bytes_dl.toLocaleString()} mono />
-              <Field label="UL bytes" value={detail.data.traffic.bytes_ul.toLocaleString()} mono />
+              <Field label="DL bytes" value={formatBytes(detail.data.traffic.bytes_dl)} mono />
+              <Field label="UL bytes" value={formatBytes(detail.data.traffic.bytes_ul)} mono />
               <Field
                 label="Last sample"
                 value={formatEpoch(detail.data.traffic.last_sample_epoch_s)}
@@ -341,6 +450,10 @@ function Field({
       </span>
     </div>
   );
+}
+
+function formatBytes(value: number | null): string {
+  return value == null ? '-- (aucun run mesuré)' : value.toLocaleString();
 }
 
 function formatEpoch(epochS: number | null): string {

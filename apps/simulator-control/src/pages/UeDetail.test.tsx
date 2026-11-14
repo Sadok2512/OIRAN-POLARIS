@@ -105,6 +105,69 @@ describe('UeDetailPage', () => {
     expect(screen.getByText(/polarisProvisioning is OFF/i)).toBeInTheDocument();
   });
 
+  it('renders the current FLAT /ue-profiles body without crashing (prod regression 2026-11-14)', async () => {
+    // Exact shape served in production by polaris-control 0.35.1 for UE-201
+    // (blank page before 0.35.2: `identity` was undefined).
+    const FLAT = {
+      authentication_material: 'PROTECTED',
+      auto_run_scenario: false,
+      dnn: 'internet',
+      ims: { configured: true, state: 'NOT_OBSERVED' },
+      last_job: { bytes_dl: null, bytes_ul: null, job_id: null },
+      name: 'UE-201',
+      pdu_session: { dnn: 'internet', type: 'IPv4' },
+      pdu_sessions: [],
+      plmn: { mcc: '001', mnc: '01' },
+      profile: 'ue-00201.yaml',
+      revision: 15,
+      scenario_id: 'simple-voice-register',
+      serving_gnb: 'GNB-01',
+      snssai: { sd: '010203', sst: 1 },
+      subscriber: {
+        authentication_material: 'PROTECTED',
+        dnns: ['internet', 'ims'],
+        msisdn: null,
+        plmn: { mcc: '001', mnc: '01' },
+        slot: 'SUB-aa285255e257',
+        snssai: { sd: '010203', sst: 1 },
+        state: 'PROVISIONED',
+        subscriber_identity: '001010000000201',
+      },
+      subscriber_identity: '001010000000201',
+      subscriber_identity_exposed: true,
+      subscription_status: 'VERIFIED',
+      ue_id: 'UE-201',
+      updated_at_epoch_s: 1794655154,
+    };
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/ue-profiles/UE-201')) return respond(200, FLAT);
+      return respond(404, { error: 'not stubbed' });
+    }) as unknown as typeof fetch;
+    renderPage('/ues/UE-201');
+    await screen.findByTestId('ue-block-provisioning');
+    expect(screen.getByTestId('ue-block-provisioning')).toHaveTextContent('VERIFIED');
+    expect(screen.getByTestId('ue-block-provisioning')).toHaveTextContent('SUB-aa285255e257');
+    expect(screen.getByTestId('ue-block-network')).toHaveTextContent('001/01');
+    expect(screen.getByTestId('ue-block-network')).toHaveTextContent('010203');
+    expect(screen.getByTestId('ue-block-network')).toHaveTextContent('internet, ims');
+    expect(screen.getByTestId('ue-block-scenario')).toHaveTextContent('simple-voice-register');
+    expect(screen.getByTestId('ue-block-ims')).toHaveTextContent('NOT_OBSERVED');
+    expect(screen.getByTestId('ue-block-traffic')).toHaveTextContent('aucun run mesuré');
+    expect(screen.getByTestId('ue-block-identity')).toHaveTextContent('non provisionné');
+    expect(screen.getByTestId('ue-detail-live-link')).toHaveAttribute('href', '/ues/UE-201/activity');
+  });
+
+  it('normalizeUeDetail never throws on an empty or hostile body', async () => {
+    const { normalizeUeDetail } = await import('./UeDetail');
+    for (const body of [null, undefined, 42, 'x', [], {}, { identity: null, subscriber: 7 }]) {
+      const out = normalizeUeDetail(body, 'UE-X');
+      expect(out.ue_id).toBe('UE-X');
+      expect(out.pdu_sessions).toEqual([]);
+      expect(out.traffic.bytes_dl).toBeNull();
+    }
+  });
+
   it('surfaces the backend code verbatim on 404', async () => {
     globalThis.fetch = vi.fn(async () =>
       respond(404, { error: 'UE_NOT_FOUND' }),
