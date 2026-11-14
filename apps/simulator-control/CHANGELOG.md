@@ -1,5 +1,14 @@
 # @telecom/simulator-control — Changelog
 
+## 0.36.4 — 2026-11-14 — Appel 2 UE : scénario certifié par défaut (patch)
+
+- Corrige le FAIL ANR2 de 0.36.3 (#10 6881378526) : la carte « Appel voix
+  entre 2 UE » prenait le premier scénario contenant `voice_call`
+  (`tpl-voice-long` → `SCENARIO_PARAMETER_OUT_OF_RANGE`). `simple-voice-call`
+  est maintenant sélectionné par défaut, avec un choix explicite du scénario.
+- `n2_qos` sans 5QI : libellé « aucun établissement N2 capté dans la
+  fenêtre » au lieu de « aucun 5QI vu ».
+
 ## 0.36.3 — 2026-11-14 — Suivi UE : 5QI affiché (patch)
 
 - « Dernier run » affiche l'événement `n2_qos` (5QI vus sur N2 par PDU,

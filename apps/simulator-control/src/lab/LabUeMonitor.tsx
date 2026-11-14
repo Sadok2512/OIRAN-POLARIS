@@ -63,7 +63,7 @@ export function lastRun(events: Ev[] | undefined): RunStep[] {
       }
       case 'n2_qos': {
         const qis = Array.isArray(d.five_qi) ? (d.five_qi as number[]).join(', ') : null;
-        return { label: `QoS N2 (${str('dnn') ?? '?'})`, outcome: e.outcome, at: e.epoch_s, detail: qis ? `5QI ${qis}` : str('error') ?? '-- (aucun 5QI vu)' };
+        return { label: `QoS N2 (${str('dnn') ?? '?'})`, outcome: e.outcome, at: e.epoch_s, detail: qis ? `5QI ${qis}` : str('error') ?? '-- (aucun établissement N2 capté dans la fenêtre)' };
       }
       case 'detach':
         return { label: 'Détachement', outcome: e.outcome, at: e.epoch_s, detail: str('process_state') ?? str('phase') ?? '' };

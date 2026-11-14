@@ -4,7 +4,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { LabUesPage, rowState } from './LabUes';
-import { DEFAULT_FORM, buildSteps, isListed, slugify } from './LabScenarios';
+import { DEFAULT_FORM, buildSteps, callScenarios, isListed, slugify } from './LabScenarios';
 import { LabUeMonitorPage, lastRun, nextSamples, rrcView, toneFor } from './LabUeMonitor';
 import { needsTwoUes, stepsSummary } from './labShared';
 import type { WireScenarioDefinition } from '@/scenarios/wireCodec';
@@ -179,5 +179,13 @@ describe('lastRun — 0.36.3 5QI', () => {
     ]);
     expect(run[1]).toMatchObject({ label: 'QoS N2 (ims)', detail: '5QI 1' });
     expect(run[2].detail).toContain('5QI 1');
+  });
+});
+
+describe('callScenarios — 0.36.4 (ANR2 FAIL 0.36.3 : tpl-voice-long choisi)', () => {
+  it('puts simple-voice-call first even when listed after tpl-voice-long', () => {
+    const long = { ...CALL, id: 'tpl-voice-long', name: 'Voice long ×100', catalog_scope: 'SYSTEM' as const };
+    const calls = callScenarios([long, DATA, CALL]);
+    expect(calls.map((d) => d.id)).toEqual(['simple-voice-call', 'tpl-voice-long']);
   });
 });

@@ -61,6 +61,12 @@ export function isListed(d: WireScenarioDefinition): boolean {
   return (d as { executable?: boolean }).executable !== false;
 }
 
+/** 0.36.4 — 2-UE call scenarios; the certified simple-voice-call first (ANR2 FAIL 0.36.3). */
+export function callScenarios(list: WireScenarioDefinition[]): WireScenarioDefinition[] {
+  const calls = list.filter((d) => needsTwoUes(d));
+  return [...calls].sort((a, b) => (a.id === 'simple-voice-call' ? -1 : b.id === 'simple-voice-call' ? 1 : 0));
+}
+
 export function LabScenariosPage() {
   const defs = useScenarioDefinitions();
   const ues = useUes();
@@ -74,7 +80,9 @@ export function LabScenariosPage() {
   const [callBusy, setCallBusy] = useState(false);
 
   const list = useMemo(() => (defs.data?.items ?? []).filter(isListed), [defs.data]);
-  const voiceDef = list.find((d) => needsTwoUes(d));
+  const calls = useMemo(() => callScenarios(list), [list]);
+  const [callDefId, setCallDefId] = useState('');
+  const voiceDef = calls.find((d) => d.id === callDefId) ?? calls[0];
   const pilotable = useMemo(
     () =>
       (ues.data?.items ?? []).filter(
@@ -186,6 +194,11 @@ export function LabScenariosPage() {
               <p className="text-ep-sm text-mute">-- (aucun scénario d’appel exécutable)</p>
             ) : (
               <div className="flex flex-wrap items-end gap-2 text-ep-sm">
+                <label className="flex flex-col gap-1">Scénario
+                  <select className={field} value={voiceDef.id} onChange={(e) => setCallDefId(e.target.value)} aria-label="Scénario d’appel" data-testid="lab-call-def">
+                    {calls.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+                  </select>
+                </label>
                 <label className="flex flex-col gap-1">Appelant
                   <select className={field} value={callA} onChange={(e) => setCallA(e.target.value)} aria-label="Appelant">
                     <option value="">—</option>
