@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { Suspense, useState } from 'react';
 import { Outlet } from 'react-router-dom';
 import { PanelLeftClose, PanelLeftOpen, Sun, Moon, Antenna } from 'lucide-react';
 import clsx from 'clsx';
@@ -144,7 +144,9 @@ export function AppShell() {
         <div className="flex-1 min-h-0 overflow-y-auto px-5 py-6">
           <SessionExpiredBanner />
           <div className="flex flex-col gap-5">
-            <Outlet />
+            <Suspense fallback={<p className="text-mute">Chargement…</p>}>
+              <Outlet />
+            </Suspense>
           </div>
         </div>
       </main>

@@ -12,17 +12,19 @@ import {
 import clsx from 'clsx';
 
 const NAV = [
+  { to: '/lab/ues', label: 'UE du lab', Icon: Smartphone, section: 'Lab' },
+  { to: '/lab/scenarios', label: 'Scénarios', Icon: Workflow, section: 'Lab' },
   { to: '/console', label: 'Console', Icon: LayoutDashboard, section: 'Network' },
   { to: '/network/topology', label: 'Topology', Icon: Network, section: 'Network' },
   { to: '/network/core', label: 'Core · Open5GS', Icon: Cpu, section: 'Network' },
   { to: '/network/gnbs', label: 'gNodeBs', Icon: Antenna, section: 'Network' },
-  { to: '/ues', label: 'UE Manager', Icon: Smartphone, section: 'Simulation' },
-  { to: '/scenarios', label: 'Scenarios', Icon: Workflow, section: 'Simulation' },
+  { to: '/ues', label: 'UE Manager (avancé)', Icon: Smartphone, section: 'Simulation' },
+  { to: '/scenarios', label: 'Scenarios (avancé)', Icon: Workflow, section: 'Simulation' },
   { to: '/scenarios/monitor', label: 'Execution monitor', Icon: Activity, section: 'Simulation' },
   { to: '/history', label: 'History', Icon: History, section: 'Review' },
 ] as const;
 
-const SECTIONS = ['Network', 'Simulation', 'Review'] as const;
+const SECTIONS = ['Lab', 'Network', 'Simulation', 'Review'] as const;
 
 export function SidebarNavigation({ collapsed }: { collapsed: boolean }) {
   return (
@@ -44,7 +46,7 @@ export function SidebarNavigation({ collapsed }: { collapsed: boolean }) {
             <NavLink
               key={to}
               to={to}
-              end={to === '/scenarios'}
+              end={to === '/scenarios' || to === '/lab/ues'}
               className={({ isActive }) =>
                 clsx(
                   'flex items-center gap-2.5 whitespace-nowrap rounded-md px-2.5 py-2 text-ep-md transition-colors',

@@ -1,5 +1,23 @@
 # @telecom/simulator-control — Changelog
 
+## 0.36.0 — 2026-11-14 — Pages « Lab » simplifiées + app allégée (minor)
+
+- Nouvelles pages (maquette utilisateur), ouvertes par défaut :
+  - `/lab/ues` « UE du lab » : IMSI en clair, abonné, état, choix du
+    scénario par ligne, un seul bouton Lancer (autorisation live 15 min
+    puis `POST /scenarios/start`), la ligne passe « En cours », Arrêter.
+    Clic sur l'UE → page de suivi. « + Ajouter un UE » mène à l'UE Manager.
+  - `/lab/ues/:id` « Suivi UE » : RRC, 5GMM/RM, PDU + IP, étape du
+    scénario, courbe débit DL/UL, totaux, IMS, journal. Un seul flux SSE,
+    GET de secours toutes les 5 s si le flux tombe.
+  - `/lab/scenarios` : création par cases à cocher (Démarrer, PDU+DNN,
+    UL/DL en Mo, IMS, Détacher) → apparaît dans la liste et dans le choix
+    des UE ; liste sans restes de test `anr2-*` ni modèles LTE/non
+    supportés ; lancement de l'appel voix entre 2 UE (A, B).
+- Allègement : toutes les pages sont chargées à la demande (lazy) ;
+  bundle initial 550 kB → 251 kB (`npx vite build`).
+- Les anciennes pages restent sous « Simulation (avancé) ».
+
 ## 0.35.2 — 2026-11-14 — UE detail page no longer blank (patch)
 
 - Fixes `/ues/:id` rendering a blank page: `/ue-profiles/:id` now returns a
