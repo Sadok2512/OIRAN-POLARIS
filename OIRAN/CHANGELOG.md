@@ -1,5 +1,40 @@
 # Changelog
 
+## OIRAN API 2.15.1 — 2026-11-14 — D4 câblage decoder-nas (helpers publics décodent SUPI null-scheme + IMSI EPS en clair)
+
+Patch 2.15.0 : le champ `IdentityObservation::cleartext` existe mais la chaîne `decoder-nas` ne le remplit pas. 2.15.1 ajoute les 2 helpers publics strictement conformes à la règle Sadok 2026-11-14 pour alimenter ce champ depuis les bytes raw d'un IE NAS.
+
+### Nouveaux helpers publics dans `decoder-nas`
+
+- `pub fn decode_suci_null_scheme_supi(value: &[u8]) -> Option<String>` : extrait le SUPI en clair d'un 5GS mobile identity IE **uniquement** quand `type=SUCI` **et** `protectionScheme=0` (null-scheme). TS 24.501 §9.11.3.4, routage + MCC/MNC + MSIN TBCD. Retourne `None` pour un SUCI chiffré (scheme ECIES profile A/B), un 5G-GUTI, un IMEI ou un IE tronqué.
+- `pub fn decode_imsi_eps(value: &[u8]) -> Option<String>` : extrait l'IMSI en clair d'un EPS mobile identity IE **uniquement** quand `type=IMSI` (1). TS 24.301 §9.9.3.12. Retourne `None` pour IMEI (2), IMEISV (3), TMSI (4), GUTI (6).
+
+Les 2 helpers encodent la règle Sadok **par filtrage** : impossible d'obtenir un clear-text GUTI/TMSI/IMEI/MSISDN par ces APIs — la règle est une **propriété du type**, pas une discipline du caller. `pseudonym_5gs_mobile_identity` est refactorisé pour s'appuyer sur `decode_suci_null_scheme_supi` (une seule source de vérité du décodage SUCI null-scheme).
+
+8 nouveaux tests dans `decoder-nas` : 4 pour SUCI null-scheme (clear-text + 3 rejets), 4 pour IMSI EPS (clear-text + 3 rejets). Fixtures reproduisent la mobile identity du test existant `eps_imsi_and_5gs_null_scheme_suci_share_canonical_digits` (PLMN 001-01, MSIN `0123456789`) → attendu `001010123456789`.
+
+### Point OUVERT — ingestion
+
+Les helpers sont exposés mais **pas encore appelés** par le chemin d'ingestion `tshark_identities` / `attach_eps_mobile_identity` / `attach_5gs_mobile_identity` qui alimente l'identity_vault. Un lot ultérieur peut tirer le clear-text en vault en ajoutant 2 lignes aux call-sites de pseudonymisation : `let cleartext = decoder_nas::decode_suci_null_scheme_supi(value)` pour 5GS et `decode_imsi_eps` pour EPS, puis le passer à `IdentityObservation { cleartext, … }`. L'infrastructure vault + payload `/sessions.identities.imsi_cleartext` est prête depuis 2.15.0 (voir ci-dessous).
+
+### Point OUVERT — D6 chemin disque scratch (reporté 2.15.2)
+
+Le chemin in-memory de `phase_ten_session_events` applique `expand_pfcp_session_members` depuis 2.15.0. Le chemin disque scratch (quand `retained_publication_events.is_none()`) reste non couvert : le scratch ne contient que les events pré-filtrés par session, l'expansion demande une relecture d'un scratch **global** PFCP. Le refactor demande une modification de signature de `phase_ten_session_events` (nouveau paramètre `all_pfcp_scratch_path: Option<&Path>`) et une évolution coordonnée des callers (live-probe:6034 + test:10498). Reporté au lot suivant.
+
+### Preuves (runner devmat, 2026-11-14)
+
+```
+$ cargo test --release --locked -p decoder-nas --lib -- \
+    decode_suci_null_scheme_supi decode_imsi_eps
+test result: ok. 8 passed; 0 failed; 23 filtered out
+
+$ cargo test --release --locked --workspace --no-fail-fast
+# 77 suites, 558 passed, 0 failed, 9 ignored, exit 0
+# +8 nouveaux tests D4 câblage vs 550 en 2.15.0
+```
+
+Bump patch : `oiran-api 2.15.0 → 2.15.1`. `decoder-nas` crate interne reste en 0.4.3 : le changement est additif (nouvelles fns publiques), rétro-compat du reste de l'API.
+
 ## OIRAN API 2.15.0 — 2026-11-14 — D6 (PFCP Request type 50 rattachée à sa session) + D3 (identités compactes dans /sessions) + D4 (champ cleartext optionnel pour SUPI null-scheme + IMSI EPS)
 
 Three defects fermés sur les payloads ANR1 (#10 6883006379) de la session `5g-session-c330d205adafa233`. Minor bump : nouveau helper public `session_engine::expand_pfcp_session_members`, nouveau champ public `IdentityObservation::cleartext`, enrichissement de la shape `/api/v1/sessions`.

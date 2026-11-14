@@ -391,30 +391,69 @@ fn parse_5gmm_body(
     }
 }
 
+/// 2.15.1 (ANR1 #10, règle Sadok 2026-11-14) — SUPI en clair
+/// extrait d'un 5GS mobile identity IE de type SUCI
+/// (`type=1`) avec **null protection scheme**
+/// (`protectionScheme=0`). Retourne `Some(<15 chars de
+/// chiffres décimaux>)` uniquement si :
+///   - `value.len() >= 9`,
+///   - octet 0 bits 0-2 == 1 (SUCI),
+///   - octet 6 bits 0-3 == 0 (null scheme),
+///   - les nibbles MCC+MNC sont décimaux ou filler,
+///   - le MSIN est un TBCD décodable.
+/// Dans tous les autres cas (SUCI chiffré par un
+/// protectionScheme ≠ 0, 5G-GUTI, IMEI, etc.) retourne `None` :
+/// la règle Sadok n'autorise pas l'exposition clear-text de
+/// ces kinds. Helper public destiné à alimenter
+/// `IdentityObservation::cleartext` **côté ingestion
+/// opérateur** uniquement. Ne doit jamais être logué.
+pub fn decode_suci_null_scheme_supi(value: &[u8]) -> Option<String> {
+    if value.len() < 9 || value[0] & 0x07 != 1 || value[6] & 0x0f != 0 {
+        return None;
+    }
+    let mut digits: Vec<u8> = Vec::with_capacity(15);
+    for nibble in [
+        value[1] & 0x0f,
+        value[1] >> 4,
+        value[2] & 0x0f,
+        value[3] & 0x0f,
+        value[3] >> 4,
+        value[2] >> 4,
+    ] {
+        if nibble <= 9 {
+            digits.push(b'0' + nibble);
+        } else if nibble != 0x0f {
+            return None;
+        }
+    }
+    let msin = subscriber_digits_tbcd(&value[8..], false)?;
+    digits.extend(msin);
+    String::from_utf8(digits).ok()
+}
+
+/// 2.15.1 (ANR1 #10, règle Sadok 2026-11-14) — IMSI EPS en
+/// clair extrait d'un EPS mobile identity IE de type IMSI
+/// (`type=1`, TS 24.301 §9.9.3.12). Pour tous les autres
+/// types — IMEI (2), IMEISV (3), TMSI (4), GUTI (6), … —
+/// retourne `None` : la règle Sadok n'autorise que SUPI
+/// null-scheme + IMSI EPS en clair dans l'UI auth. Helper
+/// public destiné à alimenter `IdentityObservation::cleartext`
+/// côté ingestion opérateur uniquement.
+pub fn decode_imsi_eps(value: &[u8]) -> Option<String> {
+    let first = *value.first()?;
+    if first & 0x07 != 1 {
+        return None;
+    }
+    let digits = subscriber_digits_tbcd(value, true)?;
+    String::from_utf8(digits).ok()
+}
+
 fn pseudonym_5gs_mobile_identity(key: &PseudonymKey, value: &[u8]) -> String {
     // TS 24.501 5GS mobile identity, SUCI with null protection scheme:
     // canonical IMSI = MCC || MNC || MSIN. Routing indicator, scheme id and
     // public-key id are representation metadata and are never hashed.
-    if value.len() >= 9 && value[0] & 0x07 == 1 && value[6] & 0x0f == 0 {
-        let mut digits = Vec::with_capacity(15);
-        for nibble in [
-            value[1] & 0x0f,
-            value[1] >> 4,
-            value[2] & 0x0f,
-            value[3] & 0x0f,
-            value[3] >> 4,
-            value[2] >> 4,
-        ] {
-            if nibble <= 9 {
-                digits.push(b'0' + nibble);
-            } else if nibble != 0x0f {
-                return pseudonym(key, "nas-5gs-mobile-identity", value);
-            }
-        }
-        if let Some(msin) = subscriber_digits_tbcd(&value[8..], false) {
-            digits.extend(msin);
-            return pseudonym_subscriber_digits(key, &digits);
-        }
+    if let Some(supi) = decode_suci_null_scheme_supi(value) {
+        return pseudonym_subscriber_digits(key, supi.as_bytes());
     }
     pseudonym(key, "nas-5gs-mobile-identity", value)
 }
@@ -1723,6 +1762,96 @@ mod tests {
                 .expect("decoder must emit subscriber_pseudonym")
         };
         assert_eq!(identifier(&eps_message), identifier(&five_gs_message));
+    }
+
+    /// 2.15.1 (ANR1 #10, règle Sadok 2026-11-14) — helper
+    /// `decode_suci_null_scheme_supi` : étant donné le même
+    /// SUCI null-scheme que le test
+    /// `eps_imsi_and_5gs_null_scheme_suci_share_canonical_digits`
+    /// (PLMN 001-01, MSIN `0123456789`), retourne le SUPI en
+    /// clair `001010123456789`. Retourne `None` pour tout autre
+    /// type que SUCI, tout autre scheme, ou un value trop court.
+    #[test]
+    fn decode_suci_null_scheme_supi_returns_cleartext_when_scheme_is_zero() {
+        // TS 24.501 : type SUCI = 1 ; routing_indicator octet 1
+        // = 0x00 ; MCC-MNC octets = {0xf1, 0x10} (PLMN 001-01) ;
+        // scheme id octet 6 nibble bas = 0 (null) ; MSIN TBCD
+        // sur octets 8..
+        let suci = [
+            0x01, 0x00, 0xf1, 0x10, 0xff, 0xff, 0x00, 0x00, 0x10, 0x32, 0x54, 0x76, 0x98,
+        ];
+        assert_eq!(
+            super::decode_suci_null_scheme_supi(&suci).as_deref(),
+            Some("001010123456789")
+        );
+    }
+
+    #[test]
+    fn decode_suci_null_scheme_supi_rejects_non_null_scheme() {
+        // Même bytes que ci-dessus mais octet 6 nibble bas = 1
+        // (scheme ECIES profile A). La règle Sadok interdit
+        // l'exposition clear-text ici.
+        let suci = [
+            0x01, 0x00, 0xf1, 0x10, 0xff, 0xff, 0x01, 0x00, 0x10, 0x32, 0x54, 0x76, 0x98,
+        ];
+        assert_eq!(super::decode_suci_null_scheme_supi(&suci), None);
+    }
+
+    #[test]
+    fn decode_suci_null_scheme_supi_rejects_non_suci_type() {
+        // Même bytes mais octet 0 bits 0-2 = 2 (IMEI). Pas SUCI.
+        let imei_like = [
+            0x02, 0x00, 0xf1, 0x10, 0xff, 0xff, 0x00, 0x00, 0x10, 0x32, 0x54, 0x76, 0x98,
+        ];
+        assert_eq!(super::decode_suci_null_scheme_supi(&imei_like), None);
+    }
+
+    #[test]
+    fn decode_suci_null_scheme_supi_rejects_truncated_value() {
+        // Length < 9 octets.
+        assert_eq!(super::decode_suci_null_scheme_supi(&[0x01, 0x00, 0xf1]), None);
+    }
+
+    /// 2.15.1 — helper `decode_imsi_eps` : étant donné le même
+    /// EPS mobile identity IMSI que le test
+    /// `eps_imsi_and_5gs_null_scheme_suci_share_canonical_digits`,
+    /// retourne `001010123456789` en clair. Retourne `None` pour
+    /// un IMEI (type=2), IMEISV (3), GUTI (6) ou TMSI (4).
+    #[test]
+    fn decode_imsi_eps_returns_cleartext_for_type_1() {
+        // TS 24.301 §9.9.3.12 : type IMSI = 1 ; octet 0 bits
+        // 0-2 = 1 (IMSI), bit 3 = 1 (odd = 15 digits), bits
+        // 4-7 = MSIN[0] (=0). Mêmes bytes que la mobile identity
+        // du test
+        // `eps_imsi_and_5gs_null_scheme_suci_share_canonical_digits`
+        // après le length-byte, soit octets 4..=11.
+        let eps_mi = [
+            0x09, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98,
+        ];
+        assert_eq!(super::decode_imsi_eps(&eps_mi).as_deref(), Some("001010123456789"));
+    }
+
+    #[test]
+    fn decode_imsi_eps_rejects_imei() {
+        // Type IMEI = 2 (bits 0-2 == 2). La règle Sadok interdit
+        // clear-text IMEI. On flip le dernier bit du mobile
+        // identity type pour tomber sur IMEI.
+        let imei_bytes = [
+            0x0a, 0x10, 0x10, 0x10, 0x32, 0x54, 0x76, 0x98,
+        ];
+        assert_eq!(super::decode_imsi_eps(&imei_bytes), None);
+    }
+
+    #[test]
+    fn decode_imsi_eps_rejects_guti() {
+        // Type GUTI = 6.
+        let guti_bytes = [0xf6, 0x00, 0xf1, 0x10, 0x00, 0x01, 0x12, 0x34, 0x56, 0x78, 0x9a];
+        assert_eq!(super::decode_imsi_eps(&guti_bytes), None);
+    }
+
+    #[test]
+    fn decode_imsi_eps_rejects_empty() {
+        assert_eq!(super::decode_imsi_eps(&[]), None);
     }
 
     #[test]
