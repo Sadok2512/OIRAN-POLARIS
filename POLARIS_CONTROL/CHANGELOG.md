@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.36.0 — 2026-11-14 — 5QI de l'appel voix réellement observé (minor)
+
+- `voice_call` ne renvoie plus un `qos` figé à `FIVE_QI_1_NOT_OBSERVED`
+  (valeur codée en dur, lib.rs). Chaque `pdu_establish` est encadré par une
+  capture N2 (`tcpdump -i any sctp port 38412`, netns hôte) lue par
+  `tshark -e ngap.fiveQI` ; le résultat est publié comme événement
+  `n2_qos` {dnn, five_qi[], source}. Le verdict de l'appel vaut
+  `FIVE_QI_1_OBSERVED` seulement si la PDU `ims` de chaque UE montre 5QI 1
+  sur N2, sinon `FIVE_QI_1_NOT_OBSERVED` avec les valeurs vues par UE.
+- Capture ou tshark indisponible → événement `n2_qos` FAILED avec la cause
+  (`N2_QOS_CAPTURE_UNAVAILABLE`, `N2_QOS_TSHARK_UNAVAILABLE`), jamais une
+  valeur supposée. Le pcap temporaire de Control est effacé après lecture.
+
 ## 0.35.1 — 2026-11-14 — subscriber MSISDN and two-UE voice validation
 
 - Reads the lab subscriber MSISDN from Open5GS without mutation and displays it

@@ -1,5 +1,11 @@
 # @telecom/simulator-control — Changelog
 
+## 0.36.3 — 2026-11-14 — Suivi UE : 5QI affiché (patch)
+
+- « Dernier run » affiche l'événement `n2_qos` (5QI vus sur N2 par PDU,
+  polaris-control-api 0.36.0) et le 5QI de l'appel voix ; « -- (statut) »
+  quand il n'est pas observé.
+
 ## 0.36.2 — 2026-11-14 — Suivi UE : RRC affiché (patch)
 
 - Corrige le FAIL ANR2 de 0.36.1 (#10 6880630088) : `states.rrc_state` est

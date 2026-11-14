@@ -616,3 +616,55 @@ eth0: 9999 9 0 0 0 0 0 0 8888 8 0 0 0 0 0 0\n\
         assert!(store.snapshot("").is_empty());
     }
 }
+
+/// 0.36.0 — Parse `tshark -T fields -e ngap.fiveQI` output: one line per
+/// NGAP frame carrying a QoS flow, comma-separated when several flows.
+pub fn parse_tshark_five_qis(stdout: &str) -> Vec<u8> {
+    stdout
+        .lines()
+        .flat_map(|line| line.split(','))
+        .filter_map(|value| value.trim().parse::<u8>().ok())
+        .collect()
+}
+
+/// 0.36.0 — QoS verdict for a voice call from the `n2_qos` events of the
+/// IMS PDU establishment of each UE. Only an observed 5QI 1 on every UE
+/// yields FIVE_QI_1_OBSERVED; nothing is assumed.
+pub fn voice_qos_verdict(per_ue: &[(String, Option<Vec<u8>>)]) -> Value {
+    let observed: Vec<Value> = per_ue
+        .iter()
+        .map(|(ue, qis)| json!({"ue_id": ue, "five_qi": qis}))
+        .collect();
+    let all_one = !per_ue.is_empty()
+        && per_ue
+            .iter()
+            .all(|(_, qis)| qis.as_ref().is_some_and(|q| !q.is_empty() && q.iter().all(|v| *v == 1)));
+    if all_one {
+        json!({"five_qi": 1, "status": "FIVE_QI_1_OBSERVED",
+               "source": "N2 NGAP PDUSessionResourceSetupRequest (dnn ims)", "per_ue": observed})
+    } else {
+        json!({"five_qi": Value::Null, "status": "FIVE_QI_1_NOT_OBSERVED",
+               "source": "N2 NGAP PDUSessionResourceSetupRequest (dnn ims)", "per_ue": observed})
+    }
+}
+
+#[cfg(test)]
+mod five_qi_tests {
+    use super::*;
+    #[test]
+    fn parses_tshark_fields() {
+        assert_eq!(parse_tshark_five_qis("1\n\n9,1\n"), vec![1, 9, 1]);
+        assert!(parse_tshark_five_qis("").is_empty());
+    }
+    #[test]
+    fn verdict_requires_observed_one_on_every_ue() {
+        let ok = voice_qos_verdict(&[("UE-201".into(), Some(vec![1])), ("UE-05".into(), Some(vec![1]))]);
+        assert_eq!(ok["status"], "FIVE_QI_1_OBSERVED");
+        assert_eq!(ok["five_qi"], 1);
+        let missing = voice_qos_verdict(&[("UE-201".into(), Some(vec![1])), ("UE-05".into(), None)]);
+        assert_eq!(missing["status"], "FIVE_QI_1_NOT_OBSERVED");
+        let nine = voice_qos_verdict(&[("UE-201".into(), Some(vec![9]))]);
+        assert_eq!(nine["five_qi"], Value::Null);
+        assert_eq!(voice_qos_verdict(&[])["status"], "FIVE_QI_1_NOT_OBSERVED");
+    }
+}

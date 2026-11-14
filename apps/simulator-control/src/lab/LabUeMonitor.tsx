@@ -53,7 +53,17 @@ export function lastRun(events: Ev[] | undefined): RunStep[] {
         return { label: 'REGISTER IMS', outcome: e.outcome, at: e.epoch_s, detail: `SIP ${n('sip_code') ?? '--'} · ${n('registration_time_ms') ?? '--'} ms` };
       case 'voice_call': {
         const rtp = (d.rtp ?? {}) as Record<string, number>;
-        return { label: 'Appel voix', outcome: e.outcome, at: e.epoch_s, detail: `${n('duration_ms') ?? '--'} ms · RTP ${rtp.rx_packets ?? '--'} paquets reçus` };
+        const qos = (d.qos ?? {}) as { five_qi?: number | null; status?: string };
+        return {
+          label: 'Appel voix',
+          outcome: e.outcome,
+          at: e.epoch_s,
+          detail: `${n('duration_ms') ?? '--'} ms · RTP ${rtp.rx_packets ?? '--'} paquets reçus · 5QI ${qos.five_qi ?? `-- (${qos.status ?? 'non observé'})`}`,
+        };
+      }
+      case 'n2_qos': {
+        const qis = Array.isArray(d.five_qi) ? (d.five_qi as number[]).join(', ') : null;
+        return { label: `QoS N2 (${str('dnn') ?? '?'})`, outcome: e.outcome, at: e.epoch_s, detail: qis ? `5QI ${qis}` : str('error') ?? '-- (aucun 5QI vu)' };
       }
       case 'detach':
         return { label: 'Détachement', outcome: e.outcome, at: e.epoch_s, detail: str('process_state') ?? str('phase') ?? '' };

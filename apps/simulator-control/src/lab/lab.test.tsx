@@ -165,3 +165,15 @@ describe('rrcView — 0.36.2 (ANR2 FAIL 0.36.1 : rrc_state=null)', () => {
     expect(rrcView({}).value).toBeNull();
   });
 });
+
+describe('lastRun — 0.36.3 5QI', () => {
+  it('shows the N2 5QI and the call verdict', () => {
+    const run = lastRun([
+      { detail: {}, epoch_s: 1, kind: 'live_start', outcome: 'OK' },
+      { detail: { dnn: 'ims', five_qi: [1] }, epoch_s: 2, kind: 'n2_qos', outcome: 'OK' },
+      { detail: { duration_ms: 7489, rtp: { rx_packets: 148 }, qos: { five_qi: 1, status: 'FIVE_QI_1_OBSERVED' } }, epoch_s: 3, kind: 'voice_call', outcome: 'OK' },
+    ]);
+    expect(run[1]).toMatchObject({ label: 'QoS N2 (ims)', detail: '5QI 1' });
+    expect(run[2].detail).toContain('5QI 1');
+  });
+});
