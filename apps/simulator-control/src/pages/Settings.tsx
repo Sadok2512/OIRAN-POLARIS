@@ -212,7 +212,7 @@ export function SettingsPage() {
               <span className="font-medium">Use POLARIS UE profile registry</span>
               <span className="block text-ep-xs text-text-secondary">
                 When enabled, the UE Manager creates, edits, clones, deletes and assigns profiles through
-                <code className="mono"> /ue-profiles </code>. SUPI, K and OPc are write-only and never
+                <code className="mono"> /ue-profiles </code>. Lab IMSIs are readable; K and OPc are write-only and never
                 stored in this browser. Local profiles (polaris.ueProfiles.v1) are not migrated.
               </span>
             </span>

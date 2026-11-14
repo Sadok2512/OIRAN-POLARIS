@@ -161,25 +161,25 @@ describe('recordFromWire — operator IMSI reveal', () => {
   });
 });
 
-describe('UE Manager — operator IMSI remains masked', () => {
-  it('never renders the digits returned by the API', async () => {
+describe('UE Manager — lab IMSI reveal', () => {
+  it('renders the complete IMSI returned by the API', async () => {
     stubFetch('operator', '001011234567890');
     renderPage();
     await waitFor(() => expect(screen.getByTestId('ue-imsi-UE-12')).toBeInTheDocument());
     const cell = screen.getByTestId('ue-imsi-UE-12');
-    expect(cell.textContent).not.toMatch(/\d{14,16}/);
-    expect(cell.textContent).toMatch(/•/);
+    expect(cell).toHaveTextContent('001011234567890');
+    expect(cell.textContent).not.toMatch(/•/);
   });
 });
 
-describe('UE Manager — viewer stays on the mask', () => {
-  it('never shows a raw digit span when the role is viewer', async () => {
+describe('UE Manager — protected API value stays absent', () => {
+  it('shows no fabricated IMSI when the API withholds it', async () => {
     stubFetch('viewer', 'PROTECTED');
     renderPage();
     await waitFor(() => expect(screen.getByTestId('ue-imsi-UE-12')).toBeInTheDocument());
     const cell = screen.getByTestId('ue-imsi-UE-12');
     expect(cell.textContent).not.toMatch(/\d{14,16}/);
-    // The mask contains the Unicode "black circle" bullet repeated.
-    expect(cell.textContent).toMatch(/•/);
+    expect(cell).toHaveTextContent('—');
+    expect(cell.textContent).not.toMatch(/•/);
   });
 });

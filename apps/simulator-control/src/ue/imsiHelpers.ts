@@ -83,8 +83,7 @@ export function isLabFictiveImsi(value: string | null | undefined): boolean {
 
 /**
  * Format an IMSI for display given the viewer's role.
- *   * `canOperate = true` → the raw IMSI, with the `imsi-` prefix
- *     normalised so the column stays aligned.
+ *   * `canOperate = true` → the full lab IMSI digits.
  *   * `canOperate = false` → the solid mask (`•` dots), so the viewer
  *     sees that an IMSI is present without learning the identity.
  */
@@ -95,5 +94,5 @@ export function formatImsiForRole(
   if (!value) return canOperate ? '—' : IMSI_MASK;
   const trimmed = value.trim();
   if (!canOperate) return IMSI_MASK;
-  return trimmed.startsWith('imsi-') ? trimmed : `imsi-${trimmed}`;
+  return trimmed.replace(/^imsi-/i, '');
 }

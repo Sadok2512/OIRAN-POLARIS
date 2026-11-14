@@ -33,7 +33,7 @@ import {
 } from 'lucide-react';
 import { PageHeader } from '@/components/mockup';
 import { StatusIndicator } from '@/ui/StatusIndicator';
-import { IMSI_MASK } from '@/ue/imsiHelpers';
+import { formatImsiForRole } from '@/ue/imsiHelpers';
 
 interface ActivityStates {
   rm_state?: string | null;
@@ -369,7 +369,7 @@ function IdentityRow({ imsi }: { imsi?: string | null }) {
     <p className="text-ep-xs text-text-secondary flex items-center gap-2">
       <span className="uppercase tracking-wider">IMSI</span>
       <span className="mono" data-testid="activity-imsi">
-        {imsi ? IMSI_MASK : '—'}
+        {formatImsiForRole(imsi, true)}
       </span>
     </p>
   );

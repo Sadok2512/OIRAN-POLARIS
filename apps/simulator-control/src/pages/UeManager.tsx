@@ -687,7 +687,7 @@ export function UeManagerPage() {
       <PageHeader
         eyebrow="Simulation"
         title="UE Manager"
-        desc="UE profiles bound to a serving RAN (gNB or srsENB). Technology and UE simulator come only from POLARIS evidence. Identity is write-only."
+        desc="UE profiles bound to a serving RAN (gNB or srsENB). Lab IMSIs are visible; authentication material remains write-only."
         actions={
           <div className="flex items-center gap-2 flex-wrap justify-end">
             <LiveGrantCountdown canRevoke={canOperate} />
@@ -1191,7 +1191,7 @@ export function UeManagerPage() {
                         <span data-testid={`ue-owner-${row.profile.id}`}>owner —</span>
                       )}
                       <span className="mono" data-testid={`ue-imsi-${row.profile.id}`}>
-                        {formatImsiForRole(row.profile.imsi, false)}
+                        {formatImsiForRole(row.profile.imsi, true)}
                       </span>
                     </div>
                   </td>

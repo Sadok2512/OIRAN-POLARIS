@@ -5,7 +5,7 @@
 //   * running:false path renders the "UE non démarré" banner;
 //   * running:true path renders the four state chips, PDU block, voice
 //     "IMS not available" line, and the timeline;
-//   * identity row never reveals a raw IMSI, even to operators.
+//   * identity row reveals the full test-lab IMSI supplied by the operator API.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
@@ -126,7 +126,8 @@ describe('UeActivityPage (0.11.0)', () => {
     expect(screen.getAllByTestId('activity-pdu-ip').map((node) => node.textContent)).toEqual(['10.46.0.7', '10.47.0.7']);
     expect(screen.getByTestId('activity-voice')).toHaveTextContent(/IMS indisponible/i);
     expect(screen.getByTestId('activity-voice')).toHaveTextContent('IMS_NOT_AVAILABLE');
-    expect(screen.getByTestId('activity-imsi').textContent).not.toMatch(/\d{14,16}/);
+    expect(screen.getByTestId('activity-imsi')).toHaveTextContent('001010000000007');
+    expect(screen.getByTestId('activity-imsi').textContent).not.toMatch(/•/);
     expect(screen.getByTestId('activity-job-step')).toHaveTextContent('udp_traffic');
     expect(screen.getByTestId('timeline-list').children.length).toBe(2);
   });

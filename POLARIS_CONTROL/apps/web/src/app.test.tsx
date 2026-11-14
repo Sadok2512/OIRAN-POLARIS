@@ -71,7 +71,7 @@ describe('POLARIS Control shell', () => {
   it('B9 uses fresh API state for Run gates', async () => {
     const fetchMock=vi.fn().mockResolvedValue({ok:true,json:async()=>({items:[]})});vi.stubGlobal('fetch',fetchMock);await api('/ues');expect(fetchMock.mock.calls[0][1].cache).toBe('no-store');
   });
-  it('B10 masks subscriber identities in lists', () => expect(maskSubscriberIdentity(['imsi-','0010','1000000','0201'].join(''))).toBe('imsi-0010…0201'));
+  it('0.34.1 shows the complete test-lab IMSI in lists and Activity', () => expect(maskSubscriberIdentity(['imsi-','0010','1000000','0201'].join(''))).toBe('001010000000201'));
   it('B11 never invents an absent UERANSIM state', () => expect(reportedState('UNKNOWN')).toBe('-- (non rapporté par UERANSIM)'));
   it('B12 renders the failure cause from timeline detail', () => expect(eventFailureDetail({detail:{error:'SHARED_UE_PROTECTED'}})).toBe('SHARED_UE_PROTECTED'));
   it('C13 requires both measured directions', () => expect({ul_bytes:544,dl_bytes:1024}).toMatchObject({ul_bytes:expect.any(Number),dl_bytes:expect.any(Number)}));

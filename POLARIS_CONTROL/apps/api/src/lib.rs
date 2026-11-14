@@ -97,6 +97,7 @@ pub struct AppState {
     configuration_path: PathBuf,
     profile_store: ProfileStore,
     profile_registry: Arc<Mutex<UeProfileRegistry>>,
+    provisioning_attestation: Value,
     subscriber_backend: Arc<dyn SubscriberBackend>,
     served_network: ServedNetworkPolicy,
     scenario_definition_store: ScenarioDefinitionStore,
@@ -159,6 +160,54 @@ pub struct AppState {
     certified_subject_override: Option<Result<(), String>>,
     profile_configuration_override: Option<Result<String, String>>,
     compose_model_override: Option<Result<String, String>>,
+}
+
+fn provisioning_attestation_observation(
+    profiles: &[UeProfileSpec],
+    covered_ue_ids: &BTreeSet<String>,
+    error: Option<&str>,
+) -> Value {
+    let uncovered_ue_ids = profiles
+        .iter()
+        .filter(|profile| profile.configured && !covered_ue_ids.contains(&profile.ue_id))
+        .map(|profile| profile.ue_id.clone())
+        .collect::<Vec<_>>();
+    let status = if error.is_none() && uncovered_ue_ids.is_empty() {
+        "ATTESTATION_COMPLETE"
+    } else if !uncovered_ue_ids.is_empty() {
+        "ATTESTATION_INCOMPLETE"
+    } else {
+        "ATTESTATION_ERROR"
+    };
+    json!({
+        "status": status,
+        "error": error,
+        "uncovered_ue_ids": uncovered_ue_ids,
+    })
+}
+
+fn audit_provisioning_attestation(audit_path: &Path, observation: &Value) {
+    if observation["status"] == "ATTESTATION_COMPLETE" {
+        return;
+    }
+    if let Some(parent) = audit_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(audit_path)
+    else {
+        return;
+    };
+    let entry = json!({
+        "timestamp_epoch_s": epoch_seconds(),
+        "type": "provisioning_attestation",
+        "status": observation["status"],
+        "error": observation["error"],
+        "uncovered_ue_ids": observation["uncovered_ue_ids"],
+    });
+    let _ = writeln!(file, "{}", entry);
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
@@ -3301,7 +3350,26 @@ impl AppState {
             .iter()
             .map(|record| record.profile.clone())
             .collect::<Vec<_>>();
-        if let Ok(verified) = ue_runtime.verify_provisioning(&profiles) {
+        let provisioning_verification = ue_runtime.verify_provisioning(&profiles);
+        let (covered_ue_ids, provisioning_error) = match &provisioning_verification {
+            Ok(verified) => (verified.keys().cloned().collect::<BTreeSet<_>>(), None),
+            Err(error) => {
+                let covered = fs::read(DockerUeRuntime::ATTESTATION_PATH)
+                    .ok()
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<Vec<ProvisioningBinding>>(&bytes).ok()
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|binding| binding.ue_id)
+                    .collect::<BTreeSet<_>>();
+                (covered, Some(error.as_str()))
+            }
+        };
+        let provisioning_attestation =
+            provisioning_attestation_observation(&profiles, &covered_ue_ids, provisioning_error);
+        audit_provisioning_attestation(&audit_path_for_startup, &provisioning_attestation);
+        if let Ok(verified) = provisioning_verification {
             for profile in profiles.iter_mut().take(configuration.ue_count) {
                 profile.subscription_verified = verified.contains_key(&profile.ue_id);
             }
@@ -3387,6 +3455,7 @@ impl AppState {
             configuration_path,
             profile_store,
             profile_registry: Arc::new(Mutex::new(profile_registry)),
+            provisioning_attestation,
             subscriber_backend,
             served_network,
             scenario_definition_store,
@@ -10388,7 +10457,7 @@ async fn ues(
         .filter(|job| job.pdu_session_state == "ACTIVE")
         .count();
     Json(
-        json!({"items":items,"configured_profiles":profiles,"configured_count":controller.configured_count()+usize::from(lte_snapshot.is_some()),"planned_count":controller_inventory.len()+usize::from(lte_snapshot.is_some()),"max_configurable":ueransim_adapter::MAX_CONFIGURABLE_UES+usize::from(lte_snapshot.is_some()),"active_count":usize::from(shared_observation.process_state == "RUNNING")+controller_active+usize::from(lte_snapshot.as_ref().is_some_and(|lte|lte.ue.process_state=="running")),"registered_count":usize::from(shared_observation.registration_state == "REGISTERED")+controller_registered+usize::from(lte_snapshot.as_ref().is_some_and(|lte|lte.attach_state=="ATTACHED")),"pdu_session_count":usize::from(shared_observation.pdu_session_state == "ACTIVE")+controller_pdu+lte_snapshot.as_ref().map(|lte|usize::from(lte.active_sessions)).unwrap_or(0),"observed_at_epoch_s":epoch_seconds(),"cache_version":state.ue_inventory_cache_version.load(Ordering::Acquire),"cache_fresh":cache_fresh,"source":"CURRENT_NAS_PDU_AND_CONTROLLER_REGISTRY","subscriber_identity_exposed":identity_exposed}),
+        json!({"items":items,"configured_profiles":profiles,"configured_count":controller.configured_count()+usize::from(lte_snapshot.is_some()),"planned_count":controller_inventory.len()+usize::from(lte_snapshot.is_some()),"max_configurable":ueransim_adapter::MAX_CONFIGURABLE_UES+usize::from(lte_snapshot.is_some()),"active_count":usize::from(shared_observation.process_state == "RUNNING")+controller_active+usize::from(lte_snapshot.as_ref().is_some_and(|lte|lte.ue.process_state=="running")),"registered_count":usize::from(shared_observation.registration_state == "REGISTERED")+controller_registered+usize::from(lte_snapshot.as_ref().is_some_and(|lte|lte.attach_state=="ATTACHED")),"pdu_session_count":usize::from(shared_observation.pdu_session_state == "ACTIVE")+controller_pdu+lte_snapshot.as_ref().map(|lte|usize::from(lte.active_sessions)).unwrap_or(0),"observed_at_epoch_s":epoch_seconds(),"cache_version":state.ue_inventory_cache_version.load(Ordering::Acquire),"cache_fresh":cache_fresh,"source":"CURRENT_NAS_PDU_AND_CONTROLLER_REGISTRY","subscriber_identity_exposed":identity_exposed,"provisioning_attestation":state.provisioning_attestation}),
     )
 }
 
@@ -15509,6 +15578,7 @@ mod p0_tests {
                 root.join("ue-profiles"),
             ),
             profile_registry: Arc::new(Mutex::new(profile_registry)),
+            provisioning_attestation: json!({"status":"ATTESTATION_COMPLETE","error":null,"uncovered_ue_ids":[]}),
             subscriber_backend: Arc::new(MemorySubscriberBackend::default()),
             served_network: ServedNetworkPolicy::parse("1/010203", "internet,ims").unwrap(),
             scenario_definition_store: ScenarioDefinitionStore::new(
@@ -19001,6 +19071,46 @@ mod p0_tests {
         audit_builtin_migration(&noop_path, &BuiltinMigrationReport::default());
         assert!(!noop_path.exists());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_provisioning_attestation_is_exposed_and_audited_without_failing_startup() {
+        let root = std::env::temp_dir().join(format!(
+            "polaris-attestation-status-{}-{}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        let audit_path = root.join("audit.jsonl");
+        let mut profiles = ueransim_adapter::planned_profiles();
+        profiles
+            .iter_mut()
+            .take(3)
+            .for_each(|profile| profile.configured = true);
+        let covered = [profiles[0].ue_id.clone()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let observation = provisioning_attestation_observation(
+            &profiles[..3],
+            &covered,
+            Some("PROVISIONING_BINDING_MISSING"),
+        );
+        assert_eq!(observation["status"], "ATTESTATION_INCOMPLETE");
+        assert_eq!(
+            observation["uncovered_ue_ids"],
+            json!([profiles[1].ue_id, profiles[2].ue_id])
+        );
+        audit_provisioning_attestation(&audit_path, &observation);
+        let entry: Value = serde_json::from_str(
+            fs::read_to_string(&audit_path)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(entry["type"], "provisioning_attestation");
+        assert_eq!(entry["status"], "ATTESTATION_INCOMPLETE");
+        assert_eq!(entry["uncovered_ue_ids"], observation["uncovered_ue_ids"]);
     }
 
     /// 0.19.2 — Small traffic template now interleaves a 1 MiB

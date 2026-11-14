@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.34.1 — 2026-11-14 — test-lab IMSI display
+
+- Show the complete operator-provided lab IMSI in rich and minimal UE lists and Activity views.
+- Keep authentication material, logs, reports, and exports protected.
+
 ## 0.34.0 — 2026-11-13 — Honest IMS PDU readiness
 
 - Rejects empty, `null`, and non-IPv4 UERANSIM PDU addresses instead of
