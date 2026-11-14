@@ -1,5 +1,64 @@
 # Changelog
 
+## OIRAN API 2.15.0 — 2026-11-14 — D6 (PFCP Request type 50 rattachée à sa session) + D3 (identités compactes dans /sessions) + D4 (champ cleartext optionnel pour SUPI null-scheme + IMSI EPS)
+
+Three defects fermés sur les payloads ANR1 (#10 6883006379) de la session `5g-session-c330d205adafa233`. Minor bump : nouveau helper public `session_engine::expand_pfcp_session_members`, nouveau champ public `IdentityObservation::cleartext`, enrichissement de la shape `/api/v1/sessions`.
+
+### D6 — PFCP Session Establishment Request type 50 rattachée à sa session
+
+Payload ANR1 : le shard `shard-…-103-094c31b26bd5662b.jsonl` contient `evt-349c72dc0f5510c3` (PFCP Session Establishment Request, `pfcp_sequence=2209`) mais la route `/api/v1/sessions/:id/events?protocol=PFCP` ne l'expose pas, alors que la Response et la Modification (`pfcp_sequence=2209/2210`) y figurent. Cause : les callers de `session_engine::reconstruct` filtrent les events par `session.event_ids ∪ context.event_ids` avant d'appeler `reconstruct` ; la découverte 5G de session s'ancre sur N2 et ne connaît pas les SEIDs avant la Response, la Request type 50 n'entre donc jamais dans la sélection.
+
+Fix en amont de `reconstruct` :
+- Nouveau helper public `session_engine::expand_pfcp_session_members(events, selection) -> BTreeSet<String>` :
+  - Collecte `pfcp_sequence` et `seid`/`f_seid` non nuls des events PFCP déjà sélectionnés.
+  - Tire dans la sélection tout event PFCP hors sélection qui partage un `pfcp_sequence` connu OU un `seid`/`f_seid` non nul connu.
+  - Ignore strictement `f_seid = 0x0000000000000000` (placeholder nul partagé à la création, pas une identité).
+  - Ordre canonique `(capture_id, packet_number, event_id)` garanti par `canonical_sort_key` / `deterministic_sort` à l'étape `reconstruct` qui suit — aucune décision n'est prise en fonction de `timestamp_ns`.
+- Câblage dans `apps/api/src/lib.rs:522` (chemin reference/HISTORICAL) et `live-probe/src/lib.rs:9098` (`phase_ten_session_events`, chemin in-memory de publication continue). Le chemin disque scratch (sans backing memory) reste OUVERT pour un lot ultérieur : le scratch ne contient que les events pré-filtrés, l'expansion demanderait de relire le scratch global.
+
+3 tests de régression dans `session-engine/src/lib.rs` reproduisant **fidèlement** les event_ids et `pfcp_sequence` du payload ANR1.
+
+### D3 — identités compactes exposées directement dans /api/v1/sessions
+
+Payload ANR1 : les 6 colonnes identity de la vue « Toutes les sessions » affichent `"ouvrir la session"` parce que p900 ne précharge les identités que pour la session sélectionnée. Fix backend : nouvelle `identity_summary_for_session(state, session_id)` qui lit `identity_vault.for_session(...)` et retourne la shape `{imsi, imei, msisdn, tmsi, s_tmsi, m_tmsi, subscriber_pseudonym}` compacte (sans objets `_proof`), ou `Value::Null` si pas d'observation. Injection dans les 3 boucles du handler `sessions()` : reference flows, capture_manager datasets, LTE evidence catalog.
+
+Correction `sanitize_value` (apps/api/src/lib.rs:5042) : la sanitize générique supprimait les clés `imsi`, `imei`, `msisdn`, etc. de n'importe quel objet comme labels identity. Fix : quand `key == "identities"` dans un `session_summary`, on ne descend pas dans la sanitize récursive. Les valeurs du vault sont déjà des pseudonymes vault-managed.
+
+2 tests de régression : upsert vault + GET /sessions assert `identities.imsi`, `identities.s_tmsi` ; garde `identities: null` quand vault vide pour la session.
+
+### D4 — champ cleartext optionnel pour SUPI null-scheme + IMSI EPS (règle permanente Sadok 2026-11-14)
+
+Règle permanente Sadok : SUPI dérivé d'un SUCI null-scheme (`protectionScheme=0`) et IMSI EPS (NAS EMM Attach Request / Identity Response en clair) peuvent être exposés en clair dans l'UI authentifiée. GUTI/TMSI/S-TMSI/M-TMSI/IMEI/MSISDN restent pseudonymisés uniformément. Jamais en clair dans GitHub, logs, snapshots, exports.
+
+Plomberie bout en bout (sans câblage decoder-nas, à traiter en 2.15.1) :
+- `apps/api/src/identity_vault.rs:30` : nouveau `IdentityObservation::cleartext: Option<String>` avec `#[serde(default, skip_serializing_if = "Option::is_none")]` (rétro-compat du vault persisté).
+- `identity_summary_for_session` ajoute `imsi_cleartext` à la payload `/sessions`. Les kinds non autorisés (GUTI/TMSI/IMEI/MSISDN) n'ont PAS de `*_cleartext` : la règle est encodée par **omission** dans la shape.
+- Call-sites existants (`lib.rs:3936`, `identity_vault.rs:291`, `lib.rs:9428`) initialisent `cleartext: None` → aucun clear-text publié par défaut.
+
+2 tests de régression : upsert avec `cleartext: Some(...)` → payload expose `imsi_cleartext` + absence stricte de `tmsi_cleartext`/`imei_cleartext`/`msisdn_cleartext` ; garde — `imsi_cleartext: null` quand observation sans cleartext.
+
+Point OUVERT (lot ultérieur) : la chaîne `decoder-nas` / `pseudonym_5gs_mobile_identity` / `pseudonym_eps_mobile_identity` doit, pour un SUCI null-scheme ou un IMSI EPS clair, pousser un `IdentityObservation` avec `cleartext = Some(SUPI/IMSI brut)`. Cela demande l'évolution coordonnée de la signature des helpers de pseudonymisation.
+
+### Preuves (runner devmat, 2026-11-14)
+
+```
+$ cargo test --release --locked --workspace --no-fail-fast
+# 77 suites, 550 passed, 0 failed, 9 ignored, exit 0
+# +7 nouveaux tests (3 D6 + 2 D3 + 2 D4) vs 543 en 2.14.12
+
+$ cargo test --release --locked -p session-engine --lib -- expand_pfcp_session_members
+test result: ok. 3 passed; 0 failed
+
+$ cargo test --release --locked -p oiran-api --lib -- \
+    sessions_list_exposes_compact_identities_summary_from_vault \
+    sessions_list_identities_is_null_when_vault_empty_for_session \
+    sessions_list_exposes_cleartext_imsi_when_vault_stores_it \
+    sessions_list_omits_imsi_cleartext_when_absent
+test result: ok. 4 passed; 0 failed
+```
+
+Bump minor : `oiran-api 2.14.12 → 2.15.0`. `session-engine`, `identity-vault` crate interne : version non bumpée (change compatible via champ `#[serde(default)]`).
+
 ## OIRAN API 2.14.12 — 2026-11-13 — correction à la lecture des événements NAS sans parent S1AP
 
 Gate prod ANR1 (#10 6867204663) sur la 2.14.11 : tout passe (index prêt en 5,2 s, requêtes LTE à 50 ms, mémoire max 193 Mo) SAUF un point — l'événement 04 est resté « Security Mode Complete » au lieu de « Security Mode Command ».
