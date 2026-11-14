@@ -1331,6 +1331,82 @@ pub fn deterministic_sort(events: &mut [EventRecord]) {
     events.sort_by(|a, b| canonical_sort_key(a).cmp(&canonical_sort_key(b)));
 }
 
+/// 2.15.0 (ANR1 #10 6883006379) — étend un ensemble d'`event_id`
+/// sélectionnés avec les PFCP siblings observés dans la même
+/// slice d'events : tout event PFCP qui partage un `pfcp_sequence`
+/// ou un `seid`/`f_seid` non nul avec un event déjà dans la
+/// sélection est tiré dans la sélection.
+///
+/// Corrige le défaut mesuré en prod : le `shard JSONL contenait
+/// un `PFCP Session Establishment Request` (type 50,
+/// `pfcp_sequence=2209`) qui n'était **pas** dans
+/// `session.event_ids` (parce que la découverte 5G de la session
+/// s'ancre sur N2 et ne connaît pas les SEIDs avant d'avoir vu
+/// la Response/Modification), alors que la `Response` et la
+/// `Modification` **étaient** dans la sélection. Résultat : la
+/// Request disparaissait du callflow côté UI alors que le shard
+/// la contenait.
+///
+/// Les callers doivent passer **tous** les events disponibles
+/// au niveau de l'agrégation (la slice non filtrée) et
+/// l'ensemble initial `selection`. Le résultat est un nouveau
+/// `BTreeSet` qui inclut `selection` + les PFCP siblings. Ordre
+/// canonique `(capture_id, packet_number, event_id)` garanti par
+/// `canonical_sort_key` / `deterministic_sort` à l'étape
+/// `reconstruct` qui suit — aucune décision n'est prise ici en
+/// fonction de `timestamp_ns`.
+pub fn expand_pfcp_session_members(
+    events: &[EventRecord],
+    selection: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut known_seqs: BTreeSet<String> = BTreeSet::new();
+    let mut known_seids: BTreeSet<String> = BTreeSet::new();
+    for event in events {
+        if !selection.contains(&event.event_id) {
+            continue;
+        }
+        if !protocol_is(event, "PFCP") {
+            continue;
+        }
+        if let Some(seq) = event.first_identifier("pfcp_sequence") {
+            known_seqs.insert(seq.to_owned());
+        }
+        for name in ["seid", "f_seid"] {
+            for v in event.identifier_values(name) {
+                if v != "0x0000000000000000" {
+                    known_seids.insert(v.to_owned());
+                }
+            }
+        }
+    }
+    let mut expanded = selection.clone();
+    if known_seqs.is_empty() && known_seids.is_empty() {
+        return expanded;
+    }
+    for event in events {
+        if expanded.contains(&event.event_id) {
+            continue;
+        }
+        if !protocol_is(event, "PFCP") {
+            continue;
+        }
+        let seq_match = event
+            .first_identifier("pfcp_sequence")
+            .map(|seq| known_seqs.contains(seq))
+            .unwrap_or(false);
+        let seid_match = ["seid", "f_seid"].iter().any(|name| {
+            event
+                .identifier_values(name)
+                .into_iter()
+                .any(|v| v != "0x0000000000000000" && known_seids.contains(v))
+        });
+        if seq_match || seid_match {
+            expanded.insert(event.event_id.clone());
+        }
+    }
+    expanded
+}
+
 pub fn reconstruct(mut events: Vec<EventRecord>, hints: ReconstructionHints) -> Reconstruction {
     deterministic_sort(&mut events);
     let duplicate_event_ids = duplicate_ids(&events);
@@ -2979,6 +3055,128 @@ mod tests {
         let r = reconstruct(events, Default::default());
         assert_eq!(r.pfcp.state, "ESTABLISHED");
         assert_eq!(r.pfcp.pdr_ids, vec!["1"]);
+    }
+
+    /// 2.15.0 (ANR1 #10 6883006379) — test de régression fidèle
+    /// aux payloads ANR1 sur la session `5g-session-c330d205adafa233` :
+    /// le shard JSONL contient la `PFCP Session Establishment
+    /// Request` (type 50, `pfcp_sequence=2209`) mais la découverte
+    /// 5G de session n'a pas inclus son `event_id` dans la
+    /// sélection initiale (seuls la Response et la Modification y
+    /// étaient). `expand_pfcp_session_members` doit re-rattacher
+    /// la Request par match `pfcp_sequence`, puis `reconstruct`
+    /// doit la classifier `Association::Session`.
+    #[test]
+    fn expand_pfcp_session_members_pulls_request_absent_from_initial_selection() {
+        // IDs et pfcp_sequence (2209/2210) repris tels quels du
+        // commentaire #10 6883006379.
+        let request = event(
+            "evt-349c72dc0f5510c3",
+            "PFCP",
+            "PFCP Session Establishment Request",
+            &[("pfcp_sequence", "2209")],
+            1,
+        );
+        let response = event(
+            "evt-104645ebe2174b02",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            &[("pfcp_sequence", "2209"), ("f_seid", "0x314")],
+            2,
+        );
+        let modif = event(
+            "evt-aa1b0ac453b62fd9",
+            "PFCP",
+            "PFCP Session Modification Request",
+            &[("pfcp_sequence", "2210"), ("f_seid", "0x314")],
+            3,
+        );
+        let events = vec![request, response, modif];
+        // Sélection initiale : seuls Response et Modification
+        // (comme observé en prod, la Request manque).
+        let selection: BTreeSet<String> = [
+            "evt-104645ebe2174b02".to_string(),
+            "evt-aa1b0ac453b62fd9".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let expanded = expand_pfcp_session_members(&events, &selection);
+        assert!(
+            expanded.contains("evt-349c72dc0f5510c3"),
+            "the PFCP Session Establishment Request must be re-included \
+             via pfcp_sequence=2209 match, got {expanded:?}"
+        );
+        assert_eq!(expanded.len(), 3, "selection must contain 3 events");
+
+        // Après expand, reconstruct doit classifier les 3 PFCP
+        // events comme Association::Session.
+        let selected = events
+            .iter()
+            .filter(|event| expanded.contains(&event.event_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let r = reconstruct(selected, Default::default());
+        assert_eq!(r.events.len(), 3, "all 3 events must enter reconstruct");
+        for event in &r.events {
+            assert_eq!(
+                r.association.get(&event.event_id),
+                Some(&Association::Session),
+                "PFCP event {} must be Association::Session",
+                event.event_id
+            );
+        }
+    }
+
+    /// 2.15.0 — garde : si la sélection initiale ne contient aucun
+    /// event PFCP, l'expansion est un no-op. On ne tire pas des
+    /// events PFCP non liés dans la session.
+    #[test]
+    fn expand_pfcp_session_members_is_noop_without_pfcp_seed() {
+        let ngap = event(
+            "ngap-01",
+            "NGAP",
+            "InitialUEMessage",
+            &[("ran_ue_ngap_id", "1")],
+            1,
+        );
+        let pfcp = event(
+            "pfcp-99",
+            "PFCP",
+            "PFCP Session Establishment Request",
+            &[("pfcp_sequence", "999")],
+            2,
+        );
+        let events = vec![ngap, pfcp];
+        let selection: BTreeSet<String> = ["ngap-01".to_string()].into_iter().collect();
+        let expanded = expand_pfcp_session_members(&events, &selection);
+        assert_eq!(expanded.len(), 1, "no PFCP seed → no PFCP sibling pulled in");
+        assert!(expanded.contains("ngap-01"));
+        assert!(!expanded.contains("pfcp-99"));
+    }
+
+    /// 2.15.0 — garde : un `f_seid` nul (`0x0000000000000000`) ne
+    /// doit jamais faire match (plusieurs sessions partagent le
+    /// placeholder nul à la création).
+    #[test]
+    fn expand_pfcp_session_members_ignores_null_seid() {
+        let seed = event(
+            "pfcp-seed",
+            "PFCP",
+            "PFCP Session Establishment Response",
+            &[("f_seid", "0x0000000000000000"), ("pfcp_sequence", "1")],
+            1,
+        );
+        let other = event(
+            "pfcp-other",
+            "PFCP",
+            "PFCP Session Establishment Request",
+            &[("f_seid", "0x0000000000000000"), ("pfcp_sequence", "2")],
+            2,
+        );
+        let events = vec![seed, other];
+        let selection: BTreeSet<String> = ["pfcp-seed".to_string()].into_iter().collect();
+        let expanded = expand_pfcp_session_members(&events, &selection);
+        assert!(!expanded.contains("pfcp-other"), "null f_seid must not create a match");
     }
 
     #[test]

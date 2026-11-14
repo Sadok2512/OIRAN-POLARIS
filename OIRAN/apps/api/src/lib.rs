@@ -519,6 +519,13 @@ impl AppState {
             if let Some(context) = context {
                 selected_ids.extend(context.event_ids.iter().cloned());
             }
+            // 2.15.0 (ANR1 #10 6883006379) — étend la sélection
+            // avec les PFCP siblings (même `pfcp_sequence` ou
+            // `seid`/`f_seid`) pour rattacher la `PFCP Session
+            // Establishment Request` que la découverte 5G
+            // n'incluait pas dans `session.event_ids`.
+            let selected_ids =
+                session_engine::expand_pfcp_session_members(&events, &selected_ids);
             let selected = events
                 .iter()
                 .filter(|event| selected_ids.contains(&event.event_id))

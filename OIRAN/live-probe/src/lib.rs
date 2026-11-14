@@ -9095,15 +9095,34 @@ fn event_id_from_json_line(line: &str) -> Option<Cow<'_, str>> {
 /// Phase 10 has two storage strategies but one selection contract. Keeping
 /// this operation shared prevents the in-memory fast path and disk fallback
 /// from producing different callflows for the same event-id set.
+///
+/// 2.15.0 (ANR1 #10 6883006379) — sur le chemin in-memory, on
+/// étend la sélection avec les PFCP siblings
+/// (`session_engine::expand_pfcp_session_members`) pour récupérer
+/// la `PFCP Session Establishment Request` (type 50) que la
+/// découverte 5G n'inclut pas dans `session.event_ids`. Sur le
+/// chemin disque (scratch), l'expansion n'est pas appliquée pour
+/// cette version : le scratch ne contient que les events déjà
+/// filtrés et il n'y a pas de backing memory des autres events.
+/// Ce chemin reste OUVERT pour un lot ultérieur
+/// (voir CHANGELOG oiran-api 2.15.0).
 fn phase_ten_session_events(
     retained_publication_events: Option<&[EventRecord]>,
     ids: &SpillingEventIdSet,
     scratch_path: &Path,
 ) -> Result<Vec<EventRecord>, String> {
     if let Some(indexed) = retained_publication_events {
-        let mut selected = Vec::new();
+        let mut selected_ids: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         for event in indexed {
             if ids.contains(&event.event_id).map_err(display_error)? {
+                selected_ids.insert(event.event_id.clone());
+            }
+        }
+        let expanded = session_engine::expand_pfcp_session_members(indexed, &selected_ids);
+        let mut selected = Vec::new();
+        for event in indexed {
+            if expanded.contains(&event.event_id) {
                 selected.push(event.clone());
             }
         }
