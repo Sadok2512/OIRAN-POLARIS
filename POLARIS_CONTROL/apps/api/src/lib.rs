@@ -13091,6 +13091,8 @@ fn execute_single_ims_register(
             "ALL",
             "--cap-add",
             "NET_ADMIN",
+            "--cap-add",
+            "NET_RAW",
             "--security-opt",
             "no-new-privileges:true",
             "--label",
