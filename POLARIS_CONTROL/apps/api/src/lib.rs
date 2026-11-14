@@ -109,6 +109,10 @@ pub struct AppState {
     execution_mode: String,
     additional_ue_live_enabled: bool,
     ue01_controller_owned: bool,
+    /// 0.36.5 — N2 QoS captures (tcpdump/tshark on the host). On in the
+    /// service, off in unit tests: tests must not depend on the host's
+    /// tcpdump or lab containers (ANR2 #10 6885069540).
+    n2_qos_capture: bool,
     ue_runtime: Arc<dyn UeRuntime>,
     dl_sender: DlSenderConfig,
     dl_sender_health_override: Option<Result<(), String>>,
@@ -3468,6 +3472,7 @@ impl AppState {
             policy_enabled: Arc::new(AtomicBool::new(policy_enabled)),
             execution_mode: std::env::var("POLARIS_EXECUTION_MODE")
                 .unwrap_or_else(|_| "disabled".into()),
+            n2_qos_capture: true,
             additional_ue_live_enabled: std::env::var("POLARIS_ADDITIONAL_UE_LIVE_ENABLED")
                 .is_ok_and(|value| value == "true"),
             ue01_controller_owned,
@@ -12425,7 +12430,9 @@ fn execute_live_definition_step(
                     // 6883071989, n2_qos internet five_qi=[]).
                     // 0.36.4 — only when the real lab gNB exists (no capture in
                     // mocked runtimes: it delayed termination, ANR2 #10 6884304792).
-                    let n2_capture = if inspect_container_state("oiran-lab-ueransim-gnb-1").is_some() {
+                    let n2_capture = if state.n2_qos_capture
+                        && inspect_container_state("oiran-lab-ueransim-gnb-1").is_some()
+                    {
                         N2QosCapture::start(ue_id, 60)
                     } else {
                         Err(String::new())
@@ -12548,7 +12555,10 @@ fn execute_live_definition_step(
                 let already_active = pdu_snapshots_for_job(&job)
                     .iter()
                     .any(|pdu| pdu.dnn.as_deref() == Some(pdu_profile_dnn.as_str()) && pdu.address.is_some());
-                let n2_capture = if already_active || inspect_container_state("oiran-lab-ueransim-gnb-1").is_none() {
+                let n2_capture = if already_active
+                    || !state.n2_qos_capture
+                    || inspect_container_state("oiran-lab-ueransim-gnb-1").is_none()
+                {
                     Err(String::new())
                 } else {
                     N2QosCapture::start(ue_id, timeout)
@@ -16317,6 +16327,7 @@ mod p0_tests {
             policy_path: root.join("policy.json"),
             policy_enabled: Arc::new(AtomicBool::new(true)),
             execution_mode: "mock".into(),
+            n2_qos_capture: false,
             additional_ue_live_enabled: false,
             ue01_controller_owned: false,
             ue_runtime: Arc::new(FakeLiveUeRuntime {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.36.5 — 2026-11-14 — Tests indépendants de l'hôte (patch)
+
+- Corrige le FAIL ANR2 de 0.36.4 (#10 6885069540) : sur le serveur, le gNB
+  réel existe, donc la garde « gNB présent » laissait la capture N2 tourner
+  pendant le test simulé `live_definition_reports_real_step_transitions_
+  without_host_execution`. Nouveau champ `AppState.n2_qos_capture` : vrai
+  dans le service, faux dans l'état de test. Les tests ne dépendent plus
+  ni de tcpdump ni des conteneurs du lab.
+
 ## 0.36.4 — 2026-11-14 — Pas d'attente PDU sans UE réel (patch)
 
 - Corrige 2 tests en échec sur le serveur (ANR2 #10 6884304792) :
