@@ -13320,7 +13320,7 @@ fn execute_voice_call(
     let target = format!("sip:{callee_aor}@ims-lite.audit");
     baresip_control(caller_name, "dial", &target)?;
     let started = std::time::Instant::now();
-    let (caller_logs, callee_logs) = wait_for_call_established(
+    let (_established_caller_logs, _established_callee_logs) = wait_for_call_established(
         caller_name,
         callee_name,
         control,
@@ -13336,6 +13336,8 @@ fn execute_voice_call(
         String::from_utf8_lossy(&capture_output.stdout),
         String::from_utf8_lossy(&capture_output.stderr)
     );
+    let caller_logs = DockerUeRuntime::output(&["logs".into(), caller_name.into()])?;
+    let callee_logs = DockerUeRuntime::output(&["logs".into(), callee_name.into()])?;
     let (tx_packets, tx_bytes, rx_packets, rx_bytes) = rtp_measurements(&capture_text, &caller_ip);
     let invite = capture_text.contains("INVITE sip:") || caller_logs.contains("connecting to");
     let ringing = capture_text.contains("SIP/2.0 180") || caller_logs.contains("180 Ringing");
@@ -13348,6 +13350,19 @@ fn execute_voice_call(
     let established = caller_logs.contains("Call established")
         && (callee_logs.contains("Call established") || callee_logs.contains("answering call"));
     if !(invite && ringing && ok && ack && bye && bye_ok && established) {
+        record_activity_event(
+            state,
+            caller_id,
+            "voice_call",
+            "FAILED",
+            json!({
+                "error":"IMS_CALL_SIGNALING_INCOMPLETE",
+                "signaling":{"invite":invite,"ringing":ringing,"ok":ok,"ack":ack,
+                    "bye":bye,"bye_ok":bye_ok,"established":established},
+                "rtp":{"tx_packets":tx_packets,"tx_bytes":tx_bytes,
+                    "rx_packets":rx_packets,"rx_bytes":rx_bytes}
+            }),
+        );
         return Err("IMS_CALL_SIGNALING_INCOMPLETE".into());
     }
     if tx_packets == 0 || tx_bytes == 0 || rx_packets == 0 || rx_bytes == 0 {
