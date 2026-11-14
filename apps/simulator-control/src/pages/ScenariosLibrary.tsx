@@ -234,7 +234,7 @@ export function ScenariosLibraryPage() {
               className="ep-button ep-button-primary"
               onClick={() => void startVoiceCall()}
               disabled={callableUes.length < 2 || createGrant.isPending || startRun.isPending}
-              title={callableUes.length < 2 ? 'Deux UE vérifiés et contrôlables sont requis.' : undefined}
+              title={callableUes.length < 2 ? 'Second UE non prêt (VOICE_SECOND_UE_NOT_READY)' : undefined}
               data-testid="call-submit"
             >
               Appeler
@@ -242,7 +242,7 @@ export function ScenariosLibraryPage() {
           </div>
           {callableUes.length < 2 && (
             <p className="text-ep-sm text-warn mt-2" data-testid="call-prerequisite-error">
-              Appel bloqué : deux UE vérifiés et contrôlables sont requis.
+              Second UE non prêt (VOICE_SECOND_UE_NOT_READY)
             </p>
           )}
           {callResult && <p className="text-ep-sm mt-2" role="status">{callResult}</p>}

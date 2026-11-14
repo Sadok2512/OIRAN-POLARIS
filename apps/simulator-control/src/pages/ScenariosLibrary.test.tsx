@@ -160,6 +160,8 @@ describe('ScenariosLibrary — simplified operator surface', () => {
     expect(screen.getAllByText('Appel voix entre 2 UE').length).toBeGreaterThan(0);
     expect(screen.queryByText('Ancien test')).toBeNull();
     expect(screen.getByTestId('call-submit')).toBeDisabled();
-    expect(screen.getByTestId('call-prerequisite-error')).toHaveTextContent('deux UE vérifiés');
+    expect(screen.getByTestId('call-prerequisite-error')).toHaveTextContent(
+      'Second UE non prêt (VOICE_SECOND_UE_NOT_READY)',
+    );
   });
 });
