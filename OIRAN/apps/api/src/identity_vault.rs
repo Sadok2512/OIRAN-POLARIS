@@ -27,6 +27,20 @@ pub struct IdentityObservation {
     pub event_id: String,
     pub capture_id: String,
     pub packet_number: u64,
+    /// 2.15.0 (ANR1 #10 6883006379, règle Sadok 2026-11-14) —
+    /// valeur en clair accessoire du `value` pseudonymisé,
+    /// réservée **exclusivement** aux kinds autorisés par la
+    /// politique privacy du repo : SUPI dérivé d'un SUCI
+    /// null-scheme (`protectionScheme=0`) et IMSI EPS en clair
+    /// (NAS EMM Attach Request / Identity Response non chiffré).
+    /// Ne doit JAMAIS être rempli pour GUTI/TMSI/IMEI/MSISDN.
+    /// Exposé uniquement par la route `/api/v1/sessions*` servie
+    /// à l'UI authentifiée ; `apply_privacy_mask` / `forbidden_list`
+    /// tests continuent de s'appliquer partout ailleurs (logs,
+    /// snapshots, exports). Default `None` → aucun clear-text
+    /// publié par défaut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleartext: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -284,6 +298,7 @@ mod tests {
             event_id: "event-test".into(),
             capture_id: "capture-test".into(),
             packet_number: 7,
+            cleartext: None,
         }
     }
 

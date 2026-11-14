@@ -3943,6 +3943,10 @@ fn push_identity(
         event_id: evidence.event_id.clone(),
         capture_id: evidence.capture_id.clone(),
         packet_number: evidence.packet_number,
+        // 2.15.0 — cleartext rempli uniquement par les chemins
+        // SUCI null-scheme / IMSI EPS en clair ; ce helper
+        // générique reste sur None (pseudonymisation seule).
+        cleartext: None,
     });
 }
 
@@ -4179,8 +4183,24 @@ fn identity_summary_for_session(state: &AppState, session_id: &str) -> Value {
     let subscriber_pseudonym = observations
         .iter()
         .find_map(|item| item.subscriber_pseudonym.clone());
+    // 2.15.0 (D4, règle Sadok 2026-11-14) — clear-text accessoire
+    // dérivé de l'observation vault la plus récente, **uniquement**
+    // pour les kinds autorisés (SUPI d'un SUCI null-scheme + IMSI
+    // EPS). Le vault stocke ce clear-text via
+    // `IdentityObservation::cleartext` ; l'ingestion decoder-nas
+    // décide si elle le remplit en fonction de `protectionScheme`
+    // (chaîne de confiance à câbler dans un lot ultérieur). Ici on
+    // se contente de LIRE le champ si présent.
+    let cleartext_of = |kind: &str| -> Option<String> {
+        observations
+            .iter()
+            .rev()
+            .find(|item| item.kind == kind)
+            .and_then(|item| item.cleartext.clone())
+    };
     json!({
         "imsi": latest_value("imsi"),
+        "imsi_cleartext": cleartext_of("imsi"),
         "imei": latest_value("imei"),
         "msisdn": latest_value("msisdn"),
         "tmsi": all_values("tmsi"),
@@ -5554,6 +5574,7 @@ mod tests {
                     event_id: "event-imsi-01".into(),
                     capture_id: "cap-identity".into(),
                     packet_number: 1,
+                    cleartext: None,
                 },
                 IdentityObservation {
                     session_id: session_id.clone(),
@@ -5565,6 +5586,7 @@ mod tests {
                     event_id: "event-stmsi-01".into(),
                     capture_id: "cap-identity".into(),
                     packet_number: 2,
+                    cleartext: None,
                 },
             ])
             .unwrap();
@@ -5604,6 +5626,113 @@ mod tests {
         assert!(identities["msisdn"].is_null());
         assert!(identities["tmsi"].as_array().unwrap().is_empty());
         assert!(identities["m_tmsi"].as_array().unwrap().is_empty());
+    }
+
+    /// 2.15.0 (D4, règle Sadok 2026-11-14) — quand l'ingestion
+    /// `decoder-nas` détecte un SUCI null-scheme (protectionScheme=0)
+    /// ou un IMSI EPS en clair, elle **peut** pousser la valeur
+    /// clear-text via `IdentityObservation::cleartext`. Dans ce
+    /// cas, `/api/v1/sessions` expose ce clear-text sous la clé
+    /// `imsi_cleartext` à côté du `imsi` pseudonymisé. Les kinds
+    /// NON autorisés par la règle (GUTI/TMSI/IMEI/MSISDN) n'ont
+    /// pas de champ `*_cleartext` : ils restent pseudonymisés
+    /// uniformément.
+    #[tokio::test]
+    async fn sessions_list_exposes_cleartext_imsi_when_vault_stores_it() {
+        let state = state();
+        let session_id = state.inner.primary_session_id.clone();
+        state
+            .inner
+            .identity_vault
+            .upsert(vec![IdentityObservation {
+                session_id: session_id.clone(),
+                subscriber_pseudonym: Some("psn-null-scheme".into()),
+                kind: "imsi".into(),
+                value: "imsi-REDACTED-pseudo-abc".into(),
+                value_type: Some("IMSI".into()),
+                role: "presented".into(),
+                event_id: "event-null-scheme-attach".into(),
+                capture_id: "cap-null-scheme".into(),
+                packet_number: 7,
+                // Clear-text autorisé : SUCI null-scheme / IMSI EPS.
+                // La chaîne decoder-nas remplira ce champ en lot
+                // ultérieur ; le test exerce la plomberie
+                // `/sessions` + sanitize.
+                cleartext: Some("208010123456789".into()),
+            }])
+            .unwrap();
+        let response = router(state, None)
+            .oneshot(req("/api/v1/sessions", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let sessions = body["data"].as_array().expect("data array");
+        let target = sessions
+            .iter()
+            .find(|item| item["session_id"] == session_id)
+            .expect("primary session visible");
+        let identities = &target["identities"];
+        assert!(identities.is_object());
+        assert_eq!(
+            identities["imsi_cleartext"], "208010123456789",
+            "imsi_cleartext must be exposed when vault has a non-null cleartext"
+        );
+        // Le pseudonyme reste présent — les deux champs cohabitent.
+        assert!(identities["imsi"].is_string(), "imsi pseudo must stay next to cleartext");
+        // Aucun *_cleartext pour les autres kinds (GUTI/TMSI/IMEI
+        // restent pseudonymisés uniformément par la règle Sadok).
+        assert!(
+            identities.get("tmsi_cleartext").is_none(),
+            "GUTI/TMSI/IMEI must never have a *_cleartext field"
+        );
+        assert!(identities.get("imei_cleartext").is_none());
+        assert!(identities.get("msisdn_cleartext").is_none());
+    }
+
+    /// 2.15.0 — garde : si une observation imsi n'a pas de
+    /// cleartext (default `None`), la payload `/sessions` **omet**
+    /// `imsi_cleartext` (serialize_if = Option::is_none) plutôt
+    /// que de le forcer à null. L'UI distingue « cleartext non
+    /// disponible » (clé absente) de « cleartext présent mais
+    /// vide » (impossible par construction).
+    #[tokio::test]
+    async fn sessions_list_omits_imsi_cleartext_when_absent() {
+        let state = state();
+        let session_id = state.inner.primary_session_id.clone();
+        state
+            .inner
+            .identity_vault
+            .upsert(vec![IdentityObservation {
+                session_id: session_id.clone(),
+                subscriber_pseudonym: Some("psn-default".into()),
+                kind: "imsi".into(),
+                value: "imsi-pseudo-only".into(),
+                value_type: Some("IMSI".into()),
+                role: "presented".into(),
+                event_id: "event-pseudo".into(),
+                capture_id: "cap-pseudo".into(),
+                packet_number: 1,
+                cleartext: None,
+            }])
+            .unwrap();
+        let response = router(state, None)
+            .oneshot(req("/api/v1/sessions", true))
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        let target = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["session_id"] == session_id)
+            .expect("primary session visible");
+        let identities = &target["identities"];
+        assert_eq!(
+            identities["imsi_cleartext"],
+            Value::Null,
+            "imsi_cleartext must be JSON null when vault has None"
+        );
     }
 
     /// 2.15.0 — garde : quand l'identity_vault n'a RIEN observé
@@ -9308,6 +9437,7 @@ mod tests {
                 event_id: "event-test-identity".into(),
                 capture_id: "capture-test-identity".into(),
                 packet_number: 15,
+                cleartext: None,
             }])
             .unwrap();
         let response = router(state.clone(), None)
