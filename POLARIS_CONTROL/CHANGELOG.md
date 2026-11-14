@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.36.1 — 2026-11-14 — Capture N2 fiable, décodage hors étapes radio (patch)
+
+- Corrige l'écart ANR2 #10 6881802375 : le Setup Request internet (5QI 9,
+  frame à 1794678560.15) était vu par OIRAN mais pas par la capture API.
+  `start()` attend maintenant la ligne « listening on » de tcpdump (5 s
+  max, sinon `N2_QOS_CAPTURE_NOT_READY`) au lieu d'un `sleep` de 500 ms.
+- L'arrêt envoie SIGTERM à `timeout`, qui le transmet à tcpdump (le SIGKILL
+  précédent laissait tcpdump orphelin).
+- tshark ne tourne plus pendant les étapes radio : les pcaps sont décodés
+  (`nice -n 19`) après l'appel (`voice_call`) et au `detach`. Réduit la
+  charge du cgroup API pendant `ue_start`/`pdu_establish`. La cause des
+  refus `BLOCKED_CGROUP_THROTTLING` reste **OUVERTE** : à mesurer.
+
 ## 0.36.0 — 2026-11-14 — 5QI de l'appel voix réellement observé (minor)
 
 - `voice_call` ne renvoie plus un `qos` figé à `FIVE_QI_1_NOT_OBSERVED`

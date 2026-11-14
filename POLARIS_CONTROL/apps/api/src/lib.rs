@@ -12525,16 +12525,10 @@ fn execute_live_definition_step(
                         .ue_runtime
                         .establish_pdu(&job, &profile, timeout, &control.cancel),
                 )?;
-                match n2_capture {
-                    Ok(capture) => {
-                        let detail = match capture.finish() {
-                            Ok(qis) => json!({"dnn": &pdu_profile_dnn, "five_qi": qis,
-                                "source": "tcpdump sctp port 38412 + tshark ngap.fiveQI"}),
-                            Err(error) => json!({"dnn": &pdu_profile_dnn, "error": error}),
-                        };
-                        let outcome = if detail.get("error").is_some() { "FAILED" } else { "OK" };
-                        record_activity_event(state, ue_id, "n2_qos", outcome, detail);
-                    }
+                match n2_capture.and_then(N2QosCapture::stop) {
+                    // 0.36.1 — decode later (after the call / at detach) so tshark
+                    // never runs in the API cgroup during radio steps.
+                    Ok(path) => park_n2_capture(ue_id, &pdu_profile_dnn, path),
                     Err(error) => record_activity_event(
                         state,
                         ue_id,
@@ -12889,6 +12883,9 @@ fn execute_live_definition_step(
                     .lock()
                     .map_err(|_| "SCENARIO_RUNTIME_UNAVAILABLE".to_string())?
                     .remove(ue_id);
+            }
+            for ue_id in ue_ids {
+                decode_parked_n2(state, ue_id);
             }
             Ok(json!({
                 "pdu_state":"INACTIVE",
@@ -13419,6 +13416,9 @@ fn execute_voice_call(
 
 /// 0.36.0 — Latest `n2_qos` observation of the IMS PDU of each UE.
 fn ims_qos_verdict(state: &AppState, ue_ids: &[String]) -> Value {
+    for ue in ue_ids {
+        decode_parked_n2(state, ue);
+    }
     let per_ue: Vec<(String, Option<Vec<u8>>)> = ue_ids
         .iter()
         .map(|ue| {
@@ -13442,22 +13442,70 @@ fn ims_qos_verdict(state: &AppState, ue_ids: &[String]) -> Value {
 /// 0.36.0 — N2 capture (host netns, all lab bridges) bracketing one PDU
 /// establishment. Control establishes PDUs one UE at a time, so the window
 /// belongs to that UE. The temporary pcap is Control's own file.
+/// 0.36.1 — start() waits for tcpdump's "listening on" (the 500 ms sleep
+/// missed the Setup Request, ANR2 #10 6881802375); decoding is deferred.
 struct N2QosCapture {
     child: std::process::Child,
     path: std::path::PathBuf,
 }
 
+static PARKED_N2: std::sync::Mutex<Vec<(String, String, std::path::PathBuf)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn park_n2_capture(ue_id: &str, dnn: &str, path: std::path::PathBuf) {
+    if let Ok(mut parked) = PARKED_N2.lock() {
+        parked.push((ue_id.to_string(), dnn.to_string(), path));
+    }
+}
+
+/// Decode every parked N2 capture of this UE and publish `n2_qos` events.
+fn decode_parked_n2(state: &AppState, ue_id: &str) {
+    let mine: Vec<(String, String, std::path::PathBuf)> = match PARKED_N2.lock() {
+        Ok(mut parked) => {
+            let (mine, rest): (Vec<_>, Vec<_>) = parked.drain(..).partition(|(ue, _, _)| ue == ue_id);
+            *parked = rest;
+            mine
+        }
+        Err(_) => return,
+    };
+    for (_, dnn, path) in mine {
+        let detail = match decode_n2_five_qis(&path) {
+            Ok(qis) => json!({"dnn": dnn, "five_qi": qis,
+                "source": "tcpdump sctp port 38412 + tshark ngap.fiveQI"}),
+            Err(error) => json!({"dnn": dnn, "error": error}),
+        };
+        let outcome = if detail.get("error").is_some() { "FAILED" } else { "OK" };
+        record_activity_event(state, ue_id, "n2_qos", outcome, detail);
+    }
+}
+
+fn decode_n2_five_qis(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let output = Command::new("/usr/bin/nice")
+        .args(["-n", "19", "/usr/bin/tshark", "-n", "-r", &path.to_string_lossy(), "-Y", "ngap.fiveQI", "-T", "fields", "-e", "ngap.fiveQI"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| "N2_QOS_TSHARK_UNAVAILABLE".to_string());
+    let _ = fs::remove_file(path);
+    let output = output?;
+    if !output.status.success() {
+        return Err("N2_QOS_TSHARK_FAILED".into());
+    }
+    Ok(activity::parse_tshark_five_qis(&String::from_utf8_lossy(&output.stdout)))
+}
+
 impl N2QosCapture {
     fn start(ue_id: &str, timeout_s: u64) -> Result<Self, String> {
+        use std::io::{BufRead, BufReader};
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or_default();
         let safe: String = ue_id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
         let path = std::env::temp_dir().join(format!("polaris-n2qos-{safe}-{stamp}.pcap"));
-        let child = Command::new("/usr/bin/timeout")
+        let mut child = Command::new("/usr/bin/timeout")
             .args([
-                (timeout_s + 10).to_string(),
+                (timeout_s + 15).to_string(),
                 "/usr/bin/tcpdump".into(),
                 "-n".into(),
                 "-U".into(),
@@ -13472,30 +13520,46 @@ impl N2QosCapture {
                 "38412".into(),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|_| "N2_QOS_CAPTURE_UNAVAILABLE".to_string())?;
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        let stderr = child.stderr.take().ok_or("N2_QOS_CAPTURE_UNAVAILABLE")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if line.contains("listening on") {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+            let _ = Command::new("/bin/kill").args(["-TERM", &child.id().to_string()]).status();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&path);
+            return Err("N2_QOS_CAPTURE_NOT_READY".into());
+        }
         Ok(Self { child, path })
     }
 
-    fn finish(mut self) -> Result<Vec<u8>, String> {
-        // Let the last NGAP frames land, then stop the capture.
-        std::thread::sleep(std::time::Duration::from_millis(500));
+    fn stop(mut self) -> Result<std::path::PathBuf, String> {
+        // Let the last NGAP frames land; -U writes each packet immediately.
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        // SIGTERM to `timeout`, which forwards it to tcpdump (SIGKILL would
+        // orphan tcpdump). Fallback SIGKILL only if timeout is still alive.
+        let _ = Command::new("/bin/kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status();
+        for _ in 0..20 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return Ok(self.path);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let output = Command::new("/usr/bin/tshark")
-            .args(["-r", &self.path.to_string_lossy(), "-Y", "ngap.fiveQI", "-T", "fields", "-e", "ngap.fiveQI"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|_| "N2_QOS_TSHARK_UNAVAILABLE".to_string());
-        let _ = fs::remove_file(&self.path);
-        let output = output?;
-        if !output.status.success() {
-            return Err("N2_QOS_TSHARK_FAILED".into());
-        }
-        Ok(activity::parse_tshark_five_qis(&String::from_utf8_lossy(&output.stdout)))
+        Ok(self.path)
     }
 }
 
