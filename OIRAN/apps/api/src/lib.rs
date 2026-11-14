@@ -3308,6 +3308,15 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
         .map(|flow| {
             let mut summary = session_summary(&state, flow);
             decorate_subscriber_summary(&mut summary, flow, &journey_index);
+            // 2.15.0 (ANR1 #10 6883006379) — identités compactes
+            // directement dans la liste /sessions pour que l'UI
+            // n'ait pas besoin d'ouvrir chaque session.
+            if let Some(object) = summary.as_object_mut() {
+                object.insert(
+                    "identities".into(),
+                    identity_summary_for_session(&state, &flow.session_id),
+                );
+            }
             (flow.session_id.clone(), summary)
         })
         .collect::<BTreeMap<_, _>>();
@@ -3360,6 +3369,13 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                     }
                 }
                 decorate_subscriber_summary(&mut summary, &flow, &journey_index);
+                // 2.15.0 (ANR1 #10 6883006379) — identités compactes.
+                if let Some(object) = summary.as_object_mut() {
+                    object.insert(
+                        "identities".into(),
+                        identity_summary_for_session(&state, session_id),
+                    );
+                }
                 unique.insert(session_id.clone(), summary);
             }
         }
@@ -3374,10 +3390,16 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                 if let Some(records) = page["data"].as_array() {
                     for record in records {
                         if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
-                            unique.insert(
-                                session.session_id.clone(),
-                                lte_session_summary(&manifest, &session),
-                            );
+                            let mut summary = lte_session_summary(&manifest, &session);
+                            // 2.15.0 (ANR1 #10 6883006379) — identités
+                            // compactes.
+                            if let Some(object) = summary.as_object_mut() {
+                                object.insert(
+                                    "identities".into(),
+                                    identity_summary_for_session(&state, &session.session_id),
+                                );
+                            }
+                            unique.insert(session.session_id.clone(), summary);
                         }
                     }
                 }
@@ -4117,6 +4139,55 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<(), String> 
     };
     let observations = tshark_identities(state, session_id, &flow)?;
     state.inner.identity_vault.upsert(observations)
+}
+
+/// 2.15.0 (ANR1 #10 6883006379) — résumé compact des identités
+/// pour l'inclusion directe dans `/api/v1/sessions`. Garde le
+/// même champ naming que `/sessions/:id/identities` (shape vue par
+/// l'UI : `imsi`, `imei`, `msisdn`, `tmsi`, `s_tmsi`, `m_tmsi`,
+/// `subscriber_pseudonym`) mais SANS les objets `_proof` afin de
+/// garder la payload de la liste bornée. Appelé par
+/// `session_summary` / `live_session_summary` / `lte_session_summary`
+/// pour chaque session de la page `/sessions`.
+///
+/// Les valeurs sont celles observées par `identity_vault.for_session`
+/// — toujours pseudonymisées côté stockage (règle privacy-first du
+/// repo). La politique D4 (clear-text SUPI null-scheme + IMSI EPS
+/// sous auth UI) est portée par un chemin séparé, pas par ce helper.
+fn identity_summary_for_session(state: &AppState, session_id: &str) -> Value {
+    let observations = match state.inner.identity_vault.for_session(session_id) {
+        Ok(observations) => observations,
+        Err(_) => return Value::Null,
+    };
+    if observations.is_empty() {
+        return Value::Null;
+    }
+    let latest_value = |kind: &str| -> Option<String> {
+        observations
+            .iter()
+            .rev()
+            .find(|item| item.kind == kind)
+            .map(|item| item.value.clone())
+    };
+    let all_values = |kind: &str| -> Vec<Value> {
+        observations
+            .iter()
+            .filter(|item| item.kind == kind)
+            .map(|item| Value::String(item.value.clone()))
+            .collect()
+    };
+    let subscriber_pseudonym = observations
+        .iter()
+        .find_map(|item| item.subscriber_pseudonym.clone());
+    json!({
+        "imsi": latest_value("imsi"),
+        "imei": latest_value("imei"),
+        "msisdn": latest_value("msisdn"),
+        "tmsi": all_values("tmsi"),
+        "s_tmsi": all_values("s_tmsi"),
+        "m_tmsi": all_values("m_tmsi"),
+        "subscriber_pseudonym": subscriber_pseudonym,
+    })
 }
 
 fn identity_bundle(observations: Vec<IdentityObservation>) -> Value {
@@ -5004,6 +5075,18 @@ fn sanitize_value(value: &mut Value) {
                         };
                         *v = Value::String(format!("capture://{safe_name}"));
                     }
+                } else if key == "identities" {
+                    // 2.15.0 (ANR1 #10 6883006379) — le champ
+                    // `identities` d'un `session_summary` est
+                    // construit par `identity_summary_for_session`
+                    // à partir du vault : les valeurs sont déjà
+                    // des pseudonymes vault-managed, pas des
+                    // identifiants bruts. Les supprimer ici
+                    // viderait la payload D3 entière vue par
+                    // l'UI. Laisser tel quel ; la sanitization
+                    // générique du reste du summary continue de
+                    // s'appliquer.
+                    continue;
                 } else {
                     sanitize_value(v)
                 }
@@ -5439,6 +5522,113 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["meta"]["total"], 0);
         assert!(body["data"].as_array().unwrap().is_empty());
+    }
+
+    /// 2.15.0 (ANR1 #10 6883006379) — D3 : enrichissement
+    /// `identities` compact dans /api/v1/sessions. Pousse une
+    /// IdentityObservation sur la session primaire, puis vérifie
+    /// que la payload /sessions expose directement les champs
+    /// imsi/imei/msisdn/tmsi/s_tmsi/m_tmsi/subscriber_pseudonym
+    /// (shape consommée par p900 `observedIdentity`). L'UI n'a
+    /// plus besoin d'ouvrir la session pour afficher les
+    /// identités dans la liste.
+    #[tokio::test]
+    async fn sessions_list_exposes_compact_identities_summary_from_vault() {
+        let state = state();
+        let session_id = state.inner.primary_session_id.clone();
+        assert!(
+            !session_id.is_empty(),
+            "primary session is required for this test"
+        );
+        state
+            .inner
+            .identity_vault
+            .upsert(vec![
+                IdentityObservation {
+                    session_id: session_id.clone(),
+                    subscriber_pseudonym: Some("psn-test-c330d205adafa233".into()),
+                    kind: "imsi".into(),
+                    value: "imsi-001010123456789".into(),
+                    value_type: Some("IMSI".into()),
+                    role: "presented".into(),
+                    event_id: "event-imsi-01".into(),
+                    capture_id: "cap-identity".into(),
+                    packet_number: 1,
+                },
+                IdentityObservation {
+                    session_id: session_id.clone(),
+                    subscriber_pseudonym: Some("psn-test-c330d205adafa233".into()),
+                    kind: "s_tmsi".into(),
+                    value: "s-tmsi-cafebabe".into(),
+                    value_type: Some("S-TMSI".into()),
+                    role: "presented".into(),
+                    event_id: "event-stmsi-01".into(),
+                    capture_id: "cap-identity".into(),
+                    packet_number: 2,
+                },
+            ])
+            .unwrap();
+        let response = router(state, None)
+            .oneshot(req("/api/v1/sessions", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let sessions = body["data"].as_array().expect("data array");
+        let target = sessions
+            .iter()
+            .find(|item| item["session_id"] == session_id)
+            .expect("primary session visible in /sessions");
+        let identities = &target["identities"];
+        assert!(
+            identities.is_object(),
+            "identities summary must be a JSON object, got {identities:?}"
+        );
+        assert_eq!(
+            identities["imsi"], "imsi-001010123456789",
+            "imsi must be the latest observation value"
+        );
+        assert_eq!(
+            identities["subscriber_pseudonym"], "psn-test-c330d205adafa233",
+            "subscriber_pseudonym must be the vault pseudonym"
+        );
+        let s_tmsi = identities["s_tmsi"]
+            .as_array()
+            .expect("s_tmsi must be an array");
+        assert_eq!(s_tmsi.len(), 1);
+        assert_eq!(s_tmsi[0], "s-tmsi-cafebabe");
+        // Shape : les kinds absents doivent valoir explicitement
+        // null (imei, msisdn) ou tableau vide (tmsi, m_tmsi) —
+        // c'est le format que p900 `observedIdentity` consomme.
+        assert!(identities["imei"].is_null());
+        assert!(identities["msisdn"].is_null());
+        assert!(identities["tmsi"].as_array().unwrap().is_empty());
+        assert!(identities["m_tmsi"].as_array().unwrap().is_empty());
+    }
+
+    /// 2.15.0 — garde : quand l'identity_vault n'a RIEN observé
+    /// pour la session, `identities` doit être `null`, pas un
+    /// objet vide. L'UI distingue ainsi « pas d'observation » de
+    /// « observation sans valeurs utiles ».
+    #[tokio::test]
+    async fn sessions_list_identities_is_null_when_vault_empty_for_session() {
+        let state = state();
+        let session_id = state.inner.primary_session_id.clone();
+        let response = router(state, None)
+            .oneshot(req("/api/v1/sessions", true))
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        let sessions = body["data"].as_array().expect("data array");
+        let target = sessions
+            .iter()
+            .find(|item| item["session_id"] == session_id)
+            .expect("primary session visible");
+        assert!(
+            target["identities"].is_null(),
+            "identities must be null when vault has no observation, got {:?}",
+            target["identities"]
+        );
     }
 
     /// 2.7.19 (issue #9 part 2): /health and the on-disk
