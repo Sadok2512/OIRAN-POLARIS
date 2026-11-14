@@ -16108,6 +16108,14 @@ mod p0_tests {
         assert_eq!(rtp_measurements(capture, "10.47.0.5"), (1, 160, 1, 172));
     }
 
+    #[test]
+    fn voice_client_loads_menu_commands_without_stdin_console() {
+        let script = include_str!("../assets/baresip-register.sh");
+        assert!(script.contains("module_app menu.so"));
+        assert!(script.contains("module_app ctrl_tcp.so"));
+        assert!(!script.contains("module stdio.so"));
+    }
+
     #[tokio::test]
     async fn lte_api_is_observable_but_start_stays_locked_without_certification() {
         let runtime = srsran_controller::MockSrsranRuntime::default();

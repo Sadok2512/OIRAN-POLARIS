@@ -17,12 +17,12 @@ mkdir -p "$cfg" && chmod 700 "$cfg"
 cat >"$cfg/config" <<EOF
 sip_listen ${local_ip}:5060
 module_path /usr/lib/baresip/modules
-module stdio.so
 module account.so
 module contact.so
 module g711.so
 module ausine.so
 module aubridge.so
+module_app menu.so
 module_app ctrl_tcp.so
 ctrl_tcp_listen 127.0.0.1:4444
 audio_source ausine,440
