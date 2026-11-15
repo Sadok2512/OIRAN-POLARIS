@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.18.6 — 2026-11-15 — Live : doublons écartés, inversions comptées (patch)
+
+- Constat ANR1 (#10 6901968948, trace UE-201) : 105 messages, 19 doublons adjacents exacts, 13 inversions `(capture_id, seq)`.
+- `live_trace` : un message `(capture_id, packet_number, event_id)` n'est émis qu'une fois par trace (`duplicates_dropped`) ; un packet_number inférieur au dernier émis pour la même capture est compté (`out_of_order`) et marqué `late:true` — jamais masqué.
+- Les méta-events (`procedure`, `ue_info`, `throughput`) portent la clé `(capture_id, packet_number)` de leur message : au replay ils restent juste après lui (avant : clé vide → triés en tête).
+- Contrat d'ordre : monotone `(capture_id, seq)` **à l'intérieur de chaque capture** ; entre captures d'interfaces différentes (N2, SBI…) le flux live entrelace (aucune comparaison `ts` inter-capture) ; le replay est trié `(capture_id, seq)`.
+- Test `duplicate_messages_are_dropped_and_intra_capture_inversions_are_counted`.
+
 ## OIRAN API 2.18.5 — 2026-11-15 — `identities` dans `POST /sessions/filter` (patch)
 
 - Cause prouvée par ANR2 (#10 6901691533) : p900 ≥ 2.5.1 lit uniquement `POST /sessions/filter`, qui n'ajoutait pas `identities` → colonnes IMSI/TMSI/IMEI « — » ; et l'hydratation tshark (déclenchée seulement par `GET /sessions`) ne démarrait jamais.

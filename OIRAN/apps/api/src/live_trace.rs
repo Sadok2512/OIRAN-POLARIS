@@ -32,6 +32,13 @@ pub(crate) struct LiveTrace {
     armed: bool,
     messages: u64,
     markers: u64,
+    /// 2.18.6 — doublons (capture_id, packet_number, event_id) écartés.
+    #[serde(default)]
+    duplicates_dropped: u64,
+    /// 2.18.6 — messages arrivés avec un packet_number inférieur au
+    /// dernier émis pour la même capture (inversion intra-capture).
+    #[serde(default)]
+    out_of_order: u64,
 }
 
 #[derive(Clone)]
@@ -49,6 +56,10 @@ struct TraceState {
     throughput_second: u64,
     ul_bytes: u64,
     dl_bytes: u64,
+    /// 2.18.6 — dernier packet_number émis par capture_id.
+    last_packet: HashMap<String, u64>,
+    /// 2.18.6 — messages déjà émis (capture_id, packet_number, event_id).
+    seen: HashSet<(String, u64, String)>,
 }
 pub(crate) struct LiveTraceRegistry {
     traces: Mutex<HashMap<String, TraceState>>,
@@ -144,14 +155,34 @@ impl LiveTraceRegistry {
             ) {
                 state.keys.clear();
             }
-            state.next_id += 1;
-            state.trace.messages += 1;
             let packet = event
                 .packet_references
                 .first()
                 .map(|p| p.packet_number)
                 .unwrap_or(0);
-            let payload = json!({"interface":event.interface,"protocol":event.protocol.as_str(),"message_name":event.message_name,"direction":event.direction.as_str(),"source":value.get("source_endpoint"),"destination":value.get("destination_endpoint"),"capture_id":event.capture_id,"packet_number":packet,"event_id":event.event_id,"decoded_ie_tree":value.get("information_elements")});
+            // 2.18.6 (ANR1 #10 6901968948 : 19 doublons adjacents, 13
+            // inversions) — un même message (capture_id, packet_number,
+            // event_id) n'est émis qu'une fois ; une inversion dans une
+            // même capture est comptée (`out_of_order`) et marquée
+            // `late:true`, jamais masquée.
+            let message_key = (event.capture_id.clone(), packet, event.event_id.clone());
+            if !state.seen.insert(message_key) {
+                state.trace.duplicates_dropped += 1;
+                continue;
+            }
+            if state.seen.len() > MAX_EVENTS * 4 {
+                state.seen.clear();
+            }
+            let last = state.last_packet.get(&event.capture_id).copied();
+            let late = last.is_some_and(|last| packet < last);
+            if late {
+                state.trace.out_of_order += 1;
+            } else {
+                state.last_packet.insert(event.capture_id.clone(), packet);
+            }
+            state.next_id += 1;
+            state.trace.messages += 1;
+            let payload = json!({"interface":event.interface,"protocol":event.protocol.as_str(),"message_name":event.message_name,"direction":event.direction.as_str(),"source":value.get("source_endpoint"),"destination":value.get("destination_endpoint"),"capture_id":event.capture_id,"packet_number":packet,"event_id":event.event_id,"decoded_ie_tree":value.get("information_elements"),"late":late});
             let item = BufferedEvent {
                 id: state.next_id,
                 kind: "message".into(),
@@ -169,7 +200,7 @@ impl LiveTraceRegistry {
                     let rate = BufferedEvent {
                         id: state.next_id,
                         kind: "throughput".into(),
-                        payload: json!({"second":state.throughput_second,"ul_bytes_s":state.ul_bytes,"dl_bytes_s":state.dl_bytes}),
+                        payload: json!({"second":state.throughput_second,"ul_bytes_s":state.ul_bytes,"dl_bytes_s":state.dl_bytes,"capture_id":event.capture_id,"packet_number":packet}),
                     };
                     state.events.push_back(rate.clone());
                     let _ = state.tx.send(rate);
@@ -193,7 +224,7 @@ impl LiveTraceRegistry {
                 let update = BufferedEvent {
                     id: state.next_id,
                     kind: "procedure".into(),
-                    payload: json!({"procedure":procedure,"phase":"update","event_id":event.event_id}),
+                    payload: json!({"procedure":procedure,"phase":"update","event_id":event.event_id,"capture_id":event.capture_id,"packet_number":packet}),
                 };
                 state.events.push_back(update.clone());
                 let _ = state.tx.send(update);
@@ -202,7 +233,7 @@ impl LiveTraceRegistry {
             let info = BufferedEvent {
                 id: state.next_id,
                 kind: "ue_info".into(),
-                payload: json!({"technology":if event.interface.starts_with('S'){"LTE"}else{"5G"},"keys":state.keys}),
+                payload: json!({"technology":if event.interface.starts_with('S'){"LTE"}else{"5G"},"keys":state.keys,"capture_id":event.capture_id,"packet_number":packet}),
             };
             state.events.push_back(info.clone());
             let _ = state.tx.send(info);
@@ -414,6 +445,8 @@ pub(crate) async fn create(
         armed,
         messages: 0,
         markers: 0,
+        duplicates_dropped: 0,
+        out_of_order: 0,
     };
     traces.insert(
         trace_id.clone(),
@@ -426,6 +459,8 @@ pub(crate) async fn create(
             throughput_second: 0,
             ul_bytes: 0,
             dl_bytes: 0,
+            last_packet: HashMap::new(),
+            seen: HashSet::new(),
         },
     );
     drop(traces);
@@ -735,6 +770,8 @@ mod tests {
                 armed,
                 messages: 0,
                 markers: 0,
+                duplicates_dropped: 0,
+                out_of_order: 0,
             },
             next_id: 0,
             events: VecDeque::new(),
@@ -743,6 +780,8 @@ mod tests {
             throughput_second: 0,
             ul_bytes: 0,
             dl_bytes: 0,
+            last_packet: HashMap::new(),
+            seen: HashSet::new(),
         }
     }
     #[test]
@@ -853,6 +892,62 @@ mod tests {
         assert!(!traces["t"].trace.armed);
         assert_eq!(traces["t"].trace.messages, 1);
         assert!(!traces["t"].keys.is_empty());
+    }
+
+    /// 2.18.6 (ANR1 #10 6901968948) — un message routé deux fois n'est
+    /// émis qu'une fois ; un packet_number plus ancien dans la même
+    /// capture est compté `out_of_order` et marqué `late`.
+    #[test]
+    fn duplicate_messages_are_dropped_and_intra_capture_inversions_are_counted() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let config = oiran_decode::DecodeConfig {
+            input: source,
+            capture_id: format!("sha256:{}", "c".repeat(64)),
+            interface: "N2".into(),
+            endpoints: HashMap::new(),
+        };
+        let key = event_schema::PseudonymKey::from_bytes([9; 32]);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&config, &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        let tagged: Vec<_> = events
+            .iter()
+            .filter(|event| !event.session_identifiers.is_empty())
+            .collect();
+        assert!(tagged.len() >= 2, "fixture needs two correlated N2 messages");
+        let root = tagged[0].session_identifiers[0].value.clone();
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, true, vec![root]));
+        r.route_normalized(tagged[0]);
+        r.route_normalized(tagged[0]); // doublon exact
+        r.route_normalized(tagged[1]);
+        r.route_normalized(tagged[0]); // doublon après un autre message
+        let traces = r.traces.lock().unwrap();
+        let t = &traces["t"];
+        assert_eq!(t.trace.messages, 2);
+        assert_eq!(t.trace.duplicates_dropped, 2);
+        let packets: Vec<u64> = t
+            .events
+            .iter()
+            .filter(|e| e.kind == "message")
+            .map(|e| e.payload["packet_number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(packets.len(), 2);
+        let expected_late = u64::from(packets[1] < packets[0]);
+        assert_eq!(t.trace.out_of_order, expected_late);
+        // les méta-events portent la clé du message parent
+        assert!(t
+            .events
+            .iter()
+            .filter(|e| e.kind == "ue_info")
+            .all(|e| e.payload.get("capture_id").is_some()));
     }
 
     /// 2.16.0 (ANR1 #10 Live-IMSI) — `canonical_sort_key` trie le
