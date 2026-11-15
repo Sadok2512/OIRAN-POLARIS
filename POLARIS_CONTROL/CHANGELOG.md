@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.36.10 — 2026-11-15 — 409 SCENARIO_CONFLICT explicite (patch)
+
+- Le lab n'exécute qu'un scénario à la fois (`definition_jobs`). Le 409 `SCENARIO_CONFLICT` renvoie désormais `active_job_id`, `active_scenario_id`, `active_ue_ids` et un message en français, pour que l'UI dise quel scénario bloque (constat Sadok : « Données UL/DL ne lance pas » après un appel voix).
+- Test `scenario_conflict_names_the_blocking_scenario_and_ues`.
+
 ## 0.36.9 — 2026-11-15 — Pré-check gNB toujours tracé (patch)
 
 - Retour ANR2 #9 6899036879 (FAIL 0.36.8) : quand NGAP est déjà up, aucune activité n'était émise. Désormais `gnb_ngap_check` / OK `{"ngap":"up","action":"aucune (NGAP déjà up)"}` à chaque lancement 5G ; `gnb_ngap_recover` après redémarrage ; `gnb_ngap_check` / FAILED sur erreur (inchangé).

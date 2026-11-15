@@ -12373,6 +12373,21 @@ fn definition_record_index(runtime: &ControlRuntime, job_id: &str) -> Option<usi
         .position(|record| record["job_id"].as_str() == Some(job_id))
 }
 
+/// 0.36.10 — résumé (scénario, UE) d'un job de définition, pour le 409.
+fn definition_record_summary(state: &AppState, job_id: &str) -> Value {
+    state
+        .runtime
+        .lock()
+        .ok()
+        .and_then(|runtime| {
+            definition_record_index(&runtime, job_id).map(|index| {
+                let record = &runtime.history[index];
+                json!({"scenario_id":record["scenario_id"],"ue_ids":record["ue_ids"]})
+            })
+        })
+        .unwrap_or_else(|| json!({"scenario_id":null,"ue_ids":[]}))
+}
+
 fn update_definition_record(
     state: &AppState,
     job_id: &str,
@@ -14295,10 +14310,21 @@ fn start_live_definition_scenario(
     };
     {
         let mut jobs = state.definition_jobs.lock().unwrap();
-        if !jobs.is_empty() {
+        if let Some(active_job_id) = jobs.keys().next().cloned() {
+            // 0.36.10 — le lab n'exécute qu'un scénario à la fois. Le 409
+            // nomme le scénario qui bloque (job, scénario, UE) pour que
+            // l'UI dise quoi arrêter, au lieu d'un SCENARIO_CONFLICT nu.
+            drop(jobs);
+            let active = definition_record_summary(&state, &active_job_id);
             return Err((
                 StatusCode::CONFLICT,
-                Json(json!({"error":"SCENARIO_CONFLICT"})),
+                Json(json!({
+                    "error":"SCENARIO_CONFLICT",
+                    "active_job_id":active_job_id,
+                    "active_scenario_id":active["scenario_id"],
+                    "active_ue_ids":active["ue_ids"],
+                    "message":"Un scénario est déjà en cours dans le lab : arrête-le ou attends sa fin.",
+                })),
             ));
         }
         jobs.insert(job_id.clone(), control.clone());
@@ -16453,6 +16479,19 @@ mod p0_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("test process did not reach a terminal state");
+    }
+
+    #[test]
+    fn scenario_conflict_names_the_blocking_scenario_and_ues() {
+        let state = state();
+        state.runtime.lock().unwrap().history.push(json!({
+            "job_id":"job-voice","scenario_id":"simple-voice-call","ue_ids":["UE-05","UE-201"]
+        }));
+        let summary = definition_record_summary(&state, "job-voice");
+        assert_eq!(summary["scenario_id"], "simple-voice-call");
+        assert_eq!(summary["ue_ids"], json!(["UE-05","UE-201"]));
+        let unknown = definition_record_summary(&state, "absent");
+        assert!(unknown["scenario_id"].is_null());
     }
 
     fn state() -> AppState {
