@@ -2,6 +2,8 @@
 
 ## 0.36.8 — 2026-11-15 — Pré-check gNB NGAP + reprise ciblée (patch)
 
+- Revue : un statut `nr-cli status` illisible (`Unknown`) ne déclenche **jamais** de redémarrage du gNB ; le run échoue en `GNB_NGAP_STATUS_UNREADABLE`, aucune action. Seul un NGAP prouvé down avec AMF en écoute redémarre le gNB.
+
 Corrige le FAIL ANR1 (#9 #10 6898459838) où le gNB UERANSIM tente son SCTP vers l'AMF avant que celui-ci écoute, reçoit `Connection refused`, ne retente **jamais** → cellule barrée → UE jamais enregistré → le run échoue en générique `PDU_DNN_NOT_OBSERVED` (`lib.rs:2643`), cause racine masquée.
 
 ### Pré-check avant tout scénario 5G

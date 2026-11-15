@@ -89,10 +89,13 @@ pub enum GnbRecoveryDecision {
 pub fn decide_gnb_recovery(ngap: NgapState, amf_listening: bool) -> GnbRecoveryDecision {
     match (ngap, amf_listening) {
         (NgapState::NgapUp, _) => GnbRecoveryDecision::Ready,
-        (NgapState::NgapDown, true) | (NgapState::Unknown, true) => {
-            GnbRecoveryDecision::RestartGnb
-        }
-        (NgapState::NgapDown, false) | (NgapState::Unknown, false) => {
+        (NgapState::NgapDown, true) => GnbRecoveryDecision::RestartGnb,
+        // Revue Claude : un statut illisible (timeout CLI, format
+        // inconnu) ne prouve pas que NGAP est down → jamais de
+        // redémarrage sur Unknown (il couperait tous les UE à chaque
+        // lancement). Erreur explicite, aucune action.
+        (NgapState::Unknown, _) => GnbRecoveryDecision::Fail(GNB_NGAP_STATUS_UNREADABLE),
+        (NgapState::NgapDown, false) => {
             // Code d'erreur stable pour que le run surface la cause
             // en amont, au lieu du générique PDU_DNN_NOT_OBSERVED
             // qui masquait la racine (lib.rs:2643).
@@ -106,6 +109,8 @@ pub fn decide_gnb_recovery(ngap: NgapState, amf_listening: bool) -> GnbRecoveryD
 /// rétabli NGAP dans le délai imparti).
 pub const GNB_NGAP_DOWN: &str = "GNB_NGAP_DOWN";
 pub const GNB_NGAP_DOWN_AMF_UNAVAILABLE: &str = "GNB_NGAP_DOWN_AMF_UNAVAILABLE";
+/// Revue Claude 0.36.8 — statut `nr-cli status` illisible : aucune reprise.
+pub const GNB_NGAP_STATUS_UNREADABLE: &str = "GNB_NGAP_STATUS_UNREADABLE";
 
 /// 0.36.8 — Trait d'injection pour isoler l'IO docker en test.
 /// Implémenté en prod par [`DockerGnbNgapChecker`] ci-dessous ; en
@@ -206,15 +211,14 @@ mod tests {
             decide_gnb_recovery(NgapState::NgapDown, false),
             GnbRecoveryDecision::Fail(GNB_NGAP_DOWN_AMF_UNAVAILABLE)
         );
-        // Unknown est traité comme Down côté décision — cohérent
-        // avec `is_up()` qui ne renvoie true que pour NgapUp.
+        // Statut illisible : jamais de redémarrage, erreur explicite.
         assert_eq!(
             decide_gnb_recovery(NgapState::Unknown, true),
-            GnbRecoveryDecision::RestartGnb
+            GnbRecoveryDecision::Fail(GNB_NGAP_STATUS_UNREADABLE)
         );
         assert_eq!(
             decide_gnb_recovery(NgapState::Unknown, false),
-            GnbRecoveryDecision::Fail(GNB_NGAP_DOWN_AMF_UNAVAILABLE)
+            GnbRecoveryDecision::Fail(GNB_NGAP_STATUS_UNREADABLE)
         );
     }
 
@@ -320,7 +324,21 @@ mod tests {
             restart_calls: Cell::new(0),
         };
         let err = check_gnb_ngap_up_or_recover(&checker, 10).unwrap_err();
-        assert_eq!(err, GNB_NGAP_DOWN_AMF_UNAVAILABLE);
+        assert_eq!(err, GNB_NGAP_STATUS_UNREADABLE);
+        assert_eq!(checker.restart_calls.get(), 0);
+    }
+
+    #[test]
+    fn check_gnb_unknown_status_with_amf_up_never_restarts() {
+        let checker = ScriptedChecker {
+            initial_status: "cli-mode: shell".into(),
+            after_restart_status: String::new(),
+            amf_listening: true,
+            restart_ok: true,
+            restart_calls: Cell::new(0),
+        };
+        let err = check_gnb_ngap_up_or_recover(&checker, 10).unwrap_err();
+        assert_eq!(err, GNB_NGAP_STATUS_UNREADABLE);
         assert_eq!(checker.restart_calls.get(), 0);
     }
 }
