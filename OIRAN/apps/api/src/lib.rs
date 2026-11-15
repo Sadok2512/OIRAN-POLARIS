@@ -4581,7 +4581,10 @@ fn merge_sbi_identities(identities: &mut Value, events: &[callflow_schema::CallF
     }
 }
 
-fn identity_bundle(observations: Vec<IdentityObservation>) -> Value {
+fn identity_bundle(
+    observations: Vec<IdentityObservation>,
+    events: &[callflow_schema::CallFlowEvent],
+) -> Value {
     let latest = |kind: &str| observations.iter().rev().find(|item| item.kind == kind);
     let evidence = |item: &IdentityObservation| {
         json!({
@@ -4596,12 +4599,101 @@ fn identity_bundle(observations: Vec<IdentityObservation>) -> Value {
             .map(evidence)
             .collect::<Vec<_>>()
     };
+    // 2.18.4 (ANR1 #10) — fallback SBI quand le vault ne porte pas
+    // MSISDN / IMEI. Scan en lecture seule des events SBI de la
+    // session (vault prioritaire). Preuve séparée en champs
+    // (`source`, `event_id`, `capture_id`, `packet_number`,
+    // `cap_seq`) pour que l'UI puisse les afficher sans parser une
+    // chaîne. `source = "SBI:<service>:<operation>"` quand les deux
+    // identifiants sont présents ; `"SBI:<service>"` sinon ;
+    // `"SBI:<message_name>"` en dernier recours. Aucune déduction :
+    // si aucun event SBI ne porte le pseudonyme recherché, la fn
+    // renvoie `None`.
+    let sbi_identity = |name: &str| -> Option<(String, Value)> {
+        events
+            .iter()
+            .filter(|event| event.protocol.to_ascii_uppercase().starts_with("SBI"))
+            .find_map(|event| {
+                let items = event.decoded_ie_tree.as_array()?;
+                let value = items.iter().find_map(|item| {
+                    (item["name"] == name)
+                        .then(|| item["value"].as_str().map(str::to_owned))
+                        .flatten()
+                        .filter(|v| !v.is_empty())
+                })?;
+                let field = |key: &str| {
+                    items
+                        .iter()
+                        .find(|item| item["name"] == key)
+                        .and_then(|item| item["value"].as_str())
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned)
+                };
+                let source = match (field("sbi_service"), field("sbi_operation")) {
+                    (Some(s), Some(op)) => format!("SBI:{s}:{op}"),
+                    (Some(s), None) => format!("SBI:{s}"),
+                    _ => format!("SBI:{}", event.message_name),
+                };
+                let packet = event
+                    .packet_references
+                    .first()
+                    .map(|p| p.packet_number)
+                    .unwrap_or(0);
+                Some((
+                    value,
+                    json!({
+                        "source": source,
+                        "event_id": event.event_id,
+                        "capture_id": event.capture_id,
+                        "packet_number": packet,
+                        "cap_seq": format!("{}·{}", event.capture_id, packet),
+                    }),
+                ))
+            })
+    };
+    // Vault prioritaire : si l'observation existe dans le vault,
+    // on n'interroge pas le SBI.
+    let msisdn_vault = latest("msisdn");
+    let imei_vault = latest("imei");
+
+    let (msisdn_value, msisdn_proof) = if let Some(item) = msisdn_vault {
+        (Some(item.value.clone()), Some(evidence(item)))
+    } else if let Some((value, proof)) = sbi_identity("msisdn_pseudonym") {
+        (Some(value), Some(proof))
+    } else {
+        (None, None)
+    };
+
+    // IMEI : shape legacy = objet `evidence` directement dans
+    // `imei` (vault). En fallback SBI, on reprend le même shape
+    // en y ajoutant `source` et en nommant `type` = IMEI/IMEISV
+    // selon le préfixe du pseudonyme observé.
+    let imei_value: Value = if let Some(item) = imei_vault {
+        evidence(item)
+    } else if let Some((pseudo_value, mut proof)) = sbi_identity("imei_pseudonym") {
+        if let Some(object) = proof.as_object_mut() {
+            object.insert("value".into(), Value::String(pseudo_value));
+            object.insert("type".into(), Value::String("IMEI".into()));
+            object.insert("role".into(), Value::String("sbi-observed".into()));
+        }
+        proof
+    } else if let Some((pseudo_value, mut proof)) = sbi_identity("imeisv_pseudonym") {
+        if let Some(object) = proof.as_object_mut() {
+            object.insert("value".into(), Value::String(pseudo_value));
+            object.insert("type".into(), Value::String("IMEISV".into()));
+            object.insert("role".into(), Value::String("sbi-observed".into()));
+        }
+        proof
+    } else {
+        Value::Null
+    };
+
     json!({
         "imsi":latest("imsi").map(|item|item.value.clone()),
         "imsi_proof":latest("imsi").map(evidence),
-        "msisdn":latest("msisdn").map(|item|item.value.clone()),
-        "msisdn_proof":latest("msisdn").map(evidence),
-        "imei":latest("imei").map(evidence),
+        "msisdn": msisdn_value,
+        "msisdn_proof": msisdn_proof,
+        "imei": imei_value,
         "tmsi":all("tmsi"),
         "s_tmsi":all("s_tmsi"),
         "m_tmsi":all("m_tmsi"),
@@ -4638,7 +4730,20 @@ async fn session_identities(
         };
     }
     match state.inner.identity_vault.for_session(&id) {
-        Ok(observations) => operator_envelope(identity_bundle(observations)),
+        Ok(observations) => {
+            // 2.18.4 (ANR1 #10) — fournir les events de la session à
+            // `identity_bundle` pour que MSISDN / IMEI / IMEISV
+            // observés dans les events SBI du call flow soient
+            // exposés quand le vault ne les porte pas. Vault
+            // prioritaire ; si `session_flow` ne retrouve pas la
+            // session (edge case), on tombe sur le bundle vault-only
+            // comme avant 2.18.4.
+            let events_owned: Vec<callflow_schema::CallFlowEvent> =
+                session_flow(&state, &id)
+                    .map(|flow| flow.events)
+                    .unwrap_or_default();
+            operator_envelope(identity_bundle(observations, &events_owned))
+        }
         Err(_) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "IDENTITY_VAULT_FAILED",
@@ -5608,6 +5713,108 @@ mod sbi_identity_wiring_tests {
         let mut identities = Value::Null;
         merge_sbi_identities(&mut identities, &events);
         assert!(identities.is_null());
+    }
+
+    /// 2.18.4 (ANR1 #10) — route détail `/sessions/:id/identities` :
+    /// quand le vault est vide pour une session mais que les events
+    /// SBI du call flow portent `msisdn_pseudonym` / `imeisv_pseudonym`,
+    /// `identity_bundle(observations, events)` doit remonter les
+    /// valeurs avec preuve séparée (source + event_id + capture_id +
+    /// packet_number + cap_seq).
+    #[test]
+    fn identity_bundle_fills_msisdn_and_imei_from_sbi_when_vault_is_empty_2184() {
+        let mut ev = event(
+            "SBI-HTTP2",
+            json!([
+                {"name":"sbi_service","value":"nudm-sdm"},
+                {"name":"sbi_operation","value":"am-data"},
+                {"name":"msisdn_pseudonym","value":"msisdn-pseudo-A"},
+                {"name":"imeisv_pseudonym","value":"pei-pseudo-B"}
+            ]),
+        );
+        ev.packet_references = vec![session_engine::PacketRef {
+            source_file: "x".into(),
+            packet_number: 42,
+            byte_offset: 0,
+            interface_id: 0,
+            captured_length: 1,
+            original_length: 1,
+        }];
+        let bundle = identity_bundle(Vec::new(), &[ev]);
+        // IMSI absent du vault → null.
+        assert!(bundle["imsi"].is_null());
+        assert!(bundle["imsi_proof"].is_null());
+        // MSISDN depuis SBI avec preuve séparée.
+        assert_eq!(bundle["msisdn"], "msisdn-pseudo-A");
+        let proof = &bundle["msisdn_proof"];
+        assert_eq!(proof["source"], "SBI:nudm-sdm:am-data");
+        assert_eq!(proof["event_id"], "ev-SBI-HTTP2");
+        assert_eq!(proof["capture_id"], "cap-sbi");
+        assert_eq!(proof["packet_number"], 42);
+        assert_eq!(proof["cap_seq"], "cap-sbi·42");
+        // IMEI/IMEISV depuis SBI dans la même shape que le vault
+        // (objet evidence), avec `type = IMEISV` et `role = sbi-observed`.
+        let imei = &bundle["imei"];
+        assert_eq!(imei["value"], "pei-pseudo-B");
+        assert_eq!(imei["type"], "IMEISV");
+        assert_eq!(imei["role"], "sbi-observed");
+        assert_eq!(imei["source"], "SBI:nudm-sdm:am-data");
+        assert_eq!(imei["event_id"], "ev-SBI-HTTP2");
+        assert_eq!(imei["packet_number"], 42);
+    }
+
+    /// 2.18.4 — Vault prioritaire : si une observation `msisdn`
+    /// existe dans le vault, l'event SBI doit être IGNORÉ pour ce
+    /// kind (pas de fuite SBI quand le vault parle). La preuve est
+    /// celle du vault, pas celle du SBI.
+    #[test]
+    fn identity_bundle_vault_msisdn_takes_priority_over_sbi_2184() {
+        let vault = vec![IdentityObservation {
+            session_id: "s".into(),
+            subscriber_pseudonym: Some("psn-vault".into()),
+            kind: "msisdn".into(),
+            value: "msisdn-from-vault".into(),
+            value_type: Some("MSISDN".into()),
+            role: "presented".into(),
+            event_id: "evt-vault-1".into(),
+            capture_id: "cap-vault".into(),
+            packet_number: 7,
+            cleartext: None,
+        }];
+        let ev = event(
+            "SBI-HTTP2",
+            json!([
+                {"name":"sbi_service","value":"nudm-sdm"},
+                {"name":"sbi_operation","value":"am-data"},
+                {"name":"msisdn_pseudonym","value":"msisdn-pseudo-SBI"}
+            ]),
+        );
+        let bundle = identity_bundle(vault, &[ev]);
+        // Vault l'emporte : la valeur et la preuve sont celles du vault.
+        assert_eq!(bundle["msisdn"], "msisdn-from-vault");
+        assert_eq!(bundle["msisdn_proof"]["value"], "msisdn-from-vault");
+        assert_eq!(bundle["msisdn_proof"]["event_id"], "evt-vault-1");
+        assert_eq!(bundle["msisdn_proof"]["capture_id"], "cap-vault");
+        // Pas de `source` SBI puisque le vault a parlé.
+        assert!(bundle["msisdn_proof"]["source"].is_null());
+    }
+
+    /// 2.18.4 — Shape inchangée du bundle quand il n'y a rien du
+    /// tout (ni vault, ni SBI) : les champs identité valent `null`.
+    /// Garantit la non-régression du contrat `/sessions/:id/identities`
+    /// pour les sessions sans identité observée.
+    #[test]
+    fn identity_bundle_without_vault_or_sbi_keeps_null_shape_2184() {
+        let bundle = identity_bundle(Vec::new(), &[]);
+        assert!(bundle["imsi"].is_null());
+        assert!(bundle["imsi_proof"].is_null());
+        assert!(bundle["msisdn"].is_null());
+        assert!(bundle["msisdn_proof"].is_null());
+        assert!(bundle["imei"].is_null());
+        assert_eq!(bundle["tmsi"], json!([]));
+        assert_eq!(bundle["s_tmsi"], json!([]));
+        assert_eq!(bundle["m_tmsi"], json!([]));
+        assert!(bundle["subscriber_pseudonym"].is_null());
     }
 }
 

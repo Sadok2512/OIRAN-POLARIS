@@ -1,5 +1,55 @@
 # Changelog
 
+## OIRAN API 2.18.4 — 2026-11-15 — `/sessions/:id/identities` expose MSISDN + IMEI/IMEISV depuis le SBI (patch)
+
+Patch de parité pour la route **détail** `GET /api/v1/sessions/:id/identities`. Depuis 2.18.1, la **liste** `/api/v1/sessions` fusionnait déjà les identités SBI (MSISDN via `gpsi`, IMEI/IMEISV via `pei`) avec le vault via `merge_sbi_identities(&mut identities, &flow.events)`. La route détail (`identity_bundle`) ne le faisait pas → écart OUVERT (#10 6898944250).
+
+### `identity_bundle` étendue (fn + handler `/sessions/:id/identities`)
+
+- Nouvelle signature : `identity_bundle(observations, events: &[CallFlowEvent])`. Les events sont ceux du call flow de la session, récupérés dans la route via `session_flow(&state, &id)` (helper existant).
+- **Vault prioritaire** : si une observation du vault existe pour un kind (`msisdn`, `imei`, `imeisv`), elle est utilisée telle quelle. Aucune fuite SBI quand le vault parle.
+- **Fallback SBI** (vault vide pour ce kind) : scan des events SBI du call flow (`event.protocol` commence par `SBI`), recherche de `msisdn_pseudonym` / `imei_pseudonym` / `imeisv_pseudonym` dans `decoded_ie_tree`.
+- **Preuve séparée** (nouveau format par rapport à la liste 2.18.1 qui utilisait une chaîne unique) : objet `{source, event_id, capture_id, packet_number, cap_seq}`.
+  - `source` = `"SBI:<service>:<operation>"` quand les deux IE sont présents, sinon `"SBI:<service>"`, sinon `"SBI:<message_name>"` (3GPP TS 29.571).
+  - `cap_seq` = `"{capture_id}·{packet_number}"` — même convention que les evidences vault.
+- Pour IMEI/IMEISV, le fallback SBI renvoie la **même shape** que le vault (objet `{value, type, role, event_id, capture_id, packet_number, cap_seq, source}`) avec `type = "IMEI"` ou `"IMEISV"` selon le préfixe du pseudonyme observé et `role = "sbi-observed"`.
+
+### Tests ajoutés (3 unitaires dans `sbi_identity_wiring_tests`)
+
+- `identity_bundle_fills_msisdn_and_imei_from_sbi_when_vault_is_empty_2184` — events SBI avec `msisdn_pseudonym` + `imeisv_pseudonym` + `sbi_service` + `sbi_operation` → bundle expose les 3 champs avec preuve séparée (source, event_id, capture_id, packet_number=42, cap_seq).
+- `identity_bundle_vault_msisdn_takes_priority_over_sbi_2184` — vault porte `msisdn-from-vault`, event SBI porte `msisdn-pseudo-SBI` → bundle retourne la valeur **vault**, preuve vault, PAS de champ `source` SBI (pas de fuite).
+- `identity_bundle_without_vault_or_sbi_keeps_null_shape_2184` — vault vide + events vides → shape legacy `{imsi:null, imsi_proof:null, msisdn:null, msisdn_proof:null, imei:null, tmsi:[], s_tmsi:[], m_tmsi:[], subscriber_pseudonym:null}` **préservée**.
+
+### Preuves (runner devmat, 2026-11-15)
+
+```
+$ cargo test --release --offline -p oiran-api --lib -- \
+    identity_bundle_fills_msisdn identity_bundle_vault_msisdn identity_bundle_without_vault
+# 3 passed; 0 failed; 116 filtered out
+
+$ cargo test --release --offline --workspace --no-fail-fast
+# exit=0 ; 77 suites, 599 passed, 0 failed, 10 ignored
+# +3 vs 596 en 2.18.3
+```
+
+### Règle Sadok (2026-11-14) respectée
+
+- IMSI clair-text dans l'UI auth uniquement (comportement 2.17.x préservé — route `/sessions/:id/identities` déjà sous `require_operator`).
+- Nouveaux kinds `msisdn_pseudonym` / `imei_pseudonym` / `imeisv_pseudonym` = **hashs** produits par `decoder-sbi` avec domains `gpsi-msisdn` / `pei` (2.18.0). Jamais de valeur clair-text.
+- Aucune déduction côté bundle : un event SBI sans IE pseudonyme → aucun champ ajouté, le kind reste `null`.
+
+### Hors périmètre respecté
+
+- Seule `identity_bundle` + le handler `session_identities` (ligne 4617-...) modifiés dans `lib.rs`. Toutes les autres fonctions (`identity_summary_for_session`, `sbi_identity_from_events`, `merge_sbi_identities`, `/sessions`, `/callflow`, etc.) sont **INTACTES**.
+- `apps/api/src/read_time_patch.rs` : INTACTE.
+- `POLARIS_CONTROL/`, `apps/control/` : INTACTES.
+
+Bump patch : `oiran-api 2.18.3 → 2.18.4`.
+
+### Note de déploiement
+
+ANR1 déploiera **2.18.4** à la place de **2.18.3** uniquement si 2.18.3 n'est pas déjà en recette (2.18.4 est strictement additif : il expose en détail ce que 2.18.1 exposait déjà en liste).
+
 ## OIRAN API 2.18.3 — 2026-11-15 — SBI dedup + telemetry overflow (patch)
 
 Deux fixes ciblés sur la branche `feat/oiran-api-2.18.0-sbi-identities` (même branche que 2.18.0/1/2, pas de nouvelle branche).
