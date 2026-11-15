@@ -875,6 +875,10 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         )
         .route("/live/traces/:id/markers", post(live_trace::marker))
         .route("/live/traces/:id/stream", get(live_trace::stream))
+        .route(
+            "/live/traces/:id/sessions",
+            get(live_trace::sessions_for_trace),
+        )
         .route("/audit", get(live_trace::audit))
         .route("/datasets", get(datasets))
         .route("/datasets/import-derived", post(import_derived_dataset))
