@@ -5,6 +5,7 @@ import {
 } from '@/ui/EmptyErrorLoading';
 import {
   useLab,
+  IMS_COMPONENTS,
   useLabObserved,
   useNodes,
   useScenarioHistory,
@@ -115,7 +116,10 @@ export function ConsolePage() {
   const loading = lab.isLoading && ues.isLoading && nodes.isLoading;
   const error = lab.error || ues.error;
 
-  const nfValues = Object.values(observedLab.data?.observed?.nfs ?? {});
+  // 0.36.7 — Open5GS NFs only (IMS proxy/RTPengine are not core NFs).
+  const nfValues = Object.entries(observedLab.data?.observed?.nfs ?? {})
+    .filter(([name]) => !IMS_COMPONENTS.has(name.toUpperCase()))
+    .map(([, nf]) => nf);
   const observedNfs = nfValues.filter((nf) => nf.observed).length;
   const healthyNfs = nfValues.filter((nf) =>
     nf.observed && nf.process_state === 'running' && nf.health === 'healthy').length;

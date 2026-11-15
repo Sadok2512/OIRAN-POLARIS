@@ -99,10 +99,32 @@ export interface WireLabEnvelope {
   configuration_changed?: boolean;
   observed?: WireLabObserved;
 }
+/** 0.36.7 — IMS components reported in /lab.observed.nfs but not Open5GS NFs. */
+export const IMS_COMPONENTS = new Set(['KAMAILIO', 'RTPENGINE', 'PCSCF', 'P-CSCF', 'SCSCF', 'S-CSCF', 'ICSCF', 'I-CSCF']);
+
+/**
+ * 0.36.7 — /lab.observed.nfs arrives as an ARRAY of
+ * `{nf, container, health, process_state, observed}` (ANR2 Node Manager
+ * audit, #10). Every page read it as a map keyed by NF name, so
+ * `nfs['SMF']` was always undefined: Topology showed « Core NFs 0/0 » and
+ * Core showed 9 NFs « not exposed » while 10 were healthy. Normalised once
+ * here into the map shape the pages expect (key = upper-case NF name).
+ */
+export function normalizeLabEnvelope(raw: WireLabEnvelope): WireLabEnvelope {
+  const nfs = (raw?.observed as { nfs?: unknown } | undefined)?.nfs;
+  if (!Array.isArray(nfs)) return raw;
+  const map: Record<string, WireContainerStatus> = {};
+  for (const entry of nfs) {
+    const nf = (entry as { nf?: unknown })?.nf;
+    if (typeof nf === 'string' && nf.trim()) map[nf.trim().toUpperCase()] = entry as WireContainerStatus;
+  }
+  return { ...raw, observed: { ...raw.observed, nfs: map } };
+}
+
 export function useLabObserved() {
   return useQuery({
     queryKey: ['polaris', 'lab-observed'],
-    queryFn: () => polarisApi<WireLabEnvelope>('/lab'),
+    queryFn: async () => normalizeLabEnvelope(await polarisApi<WireLabEnvelope>('/lab')),
     refetchInterval: politeInterval(15_000),
   });
 }

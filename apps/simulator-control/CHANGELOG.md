@@ -1,5 +1,22 @@
 # @telecom/simulator-control — Changelog
 
+## 0.36.7 — 2026-11-15 — Node Manager : NF, eNB, UE réels (patch)
+
+- Corrige l'audit Node Manager d'ANR2 (#10) :
+  - `/lab.observed.nfs` arrive en TABLEAU `{nf, container, health,
+    process_state}`, les pages le lisaient comme une map par nom de NF :
+    Topology affichait « Core NFs 0/0 », Core 9 NF « not exposed » alors que
+    10 NF Open5GS sont healthy. Normalisé une fois dans `useLabObserved`
+    (`normalizeLabEnvelope`).
+  - Console : le compteur Open5GS exclut Kamailio/RTPengine (IMS) — plus de
+    « 10 / 12 ».
+  - gNodeBs : ENB-01 (`technology: "LTE 4G"`) n'était pas affiché (filtre
+    `=== 'LTE'`).
+  - gNodeBs : « UEs attached » listait les profils affectés ; séparé en
+    « UEs enregistrés » (REGISTERED) et « Profils affectés ».
+- Les boutons Restart/Stop des NF et gNB restent verrouillés (pas de
+  pilotage du cœur sans autorisation explicite).
+
 ## 0.36.6 — 2026-11-14 — Bouton Arrêter l'UE + RTP pour la voix (patch)
 
 - « UE du lab » : bouton « Arrêter l'UE » sur un UE démarré ou enregistré

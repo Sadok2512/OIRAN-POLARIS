@@ -16,7 +16,8 @@ export function GnbsPage() {
   const ues = useUes();
 
   const gnbs = (nodes.data?.items ?? []).filter((node) => node.technology.includes('5G'));
-  const enbs = (nodes.data?.items ?? []).filter((node) => node.technology === 'LTE');
+  // 0.36.7 — /nodes reports « LTE 4G » (ANR2 audit): ENB-01 was filtered out.
+  const enbs = (nodes.data?.items ?? []).filter((node) => node.technology.startsWith('LTE'));
 
   return (
     <>
@@ -82,7 +83,7 @@ function GnbCard({
   legacy,
 }: {
   node: NodeItem;
-  attachedUes: string[];
+  attachedUes: { assigned: string[]; registered: string[] };
   legacy?: boolean;
 }) {
   const isActive = node.process_state === 'running';
@@ -145,8 +146,12 @@ function GnbCard({
           </dd>
         </div>
         <div>
-          <dt className="text-ep-xs uppercase tracking-wider text-mute">UEs attached</dt>
-          <dd className="mono">{attachedUes.length === 0 ? '—' : attachedUes.join(', ')}</dd>
+          <dt className="text-ep-xs uppercase tracking-wider text-mute">UEs enregistrés</dt>
+          <dd className="mono" data-testid="gnb-registered-ues">{attachedUes.registered.length === 0 ? '— (aucun)' : attachedUes.registered.join(', ')}</dd>
+        </div>
+        <div>
+          <dt className="text-ep-xs uppercase tracking-wider text-mute">Profils affectés</dt>
+          <dd className="mono" data-testid="gnb-assigned-profiles">{attachedUes.assigned.length === 0 ? '—' : attachedUes.assigned.join(', ')}</dd>
         </div>
       </dl>
 
@@ -190,9 +195,18 @@ function GnbCard({
   );
 }
 
-function countAttached(
+/**
+ * 0.36.7 — split « profiles assigned to this node » from « UEs really
+ * registered through it » (ANR2 audit: the page called every assigned
+ * profile « attached »).
+ */
+export function countAttached(
   items: NonNullable<ReturnType<typeof useUes>['data']>['items'] | undefined,
   nodeId: string,
-): string[] {
-  return (items ?? []).filter((ue) => ue.serving_node === nodeId).map((ue) => ue.id);
+): { assigned: string[]; registered: string[] } {
+  const mine = (items ?? []).filter((ue) => ue.serving_node === nodeId);
+  return {
+    assigned: mine.map((ue) => ue.id),
+    registered: mine.filter((ue) => ue.registration_state === 'REGISTERED').map((ue) => ue.id),
+  };
 }
