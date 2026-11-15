@@ -43,6 +43,9 @@ use serde_json::{json, Value};
 use session_engine::{
     discover_sessions, reconstruct, Association, DiscoveryResult, LteSession, ReconstructionHints,
 };
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -51,9 +54,6 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use tower_http::{
     compression::CompressionLayer,
     services::{ServeDir, ServeFile},
@@ -326,7 +326,11 @@ fn startup_access_checks(config: &ApiConfig) -> Result<(), String> {
     validate_identity_vault_path(config)?;
     access_check(&config.workspace, libc::R_OK | libc::X_OK, "workspace-read")?;
     if config.capture_root.exists() {
-        access_check(&config.capture_root, libc::R_OK | libc::X_OK, "capture-root-read")?;
+        access_check(
+            &config.capture_root,
+            libc::R_OK | libc::X_OK,
+            "capture-root-read",
+        )?;
     } else {
         access_check_creatable(&config.capture_root, "capture-root-create")?;
     }
@@ -524,8 +528,7 @@ impl AppState {
             // `seid`/`f_seid`) pour rattacher la `PFCP Session
             // Establishment Request` que la découverte 5G
             // n'incluait pas dans `session.event_ids`.
-            let selected_ids =
-                session_engine::expand_pfcp_session_members(&events, &selected_ids);
+            let selected_ids = session_engine::expand_pfcp_session_members(&events, &selected_ids);
             let selected = events
                 .iter()
                 .filter(|event| selected_ids.contains(&event.event_id))
@@ -623,9 +626,8 @@ impl AppState {
                 Ok(raw_index) => {
                     let map = oiran_endpoint_map();
                     for flow_value in flow_values.values_mut() {
-                        if let Some(events) = flow_value
-                            .get_mut("events")
-                            .and_then(Value::as_array_mut)
+                        if let Some(events) =
+                            flow_value.get_mut("events").and_then(Value::as_array_mut)
                         {
                             read_time_patch::patch_flow_events(
                                 events,
@@ -687,11 +689,9 @@ impl AppState {
                     read_time_patch::CacheLimits::from_env(),
                     read_time_patch_counters.clone(),
                 ),
-                compact_index_registry: Arc::new(
-                    read_time_patch::CompactJsonlIndexRegistry::new(
-                        read_time_patch_counters.clone(),
-                    ),
-                ),
+                compact_index_registry: Arc::new(read_time_patch::CompactJsonlIndexRegistry::new(
+                    read_time_patch_counters.clone(),
+                )),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -745,9 +745,9 @@ impl AppState {
             read_time_patch::CacheLimits::from_env(),
             read_time_patch_counters.clone(),
         );
-        let compact_index_registry = Arc::new(
-            read_time_patch::CompactJsonlIndexRegistry::new(read_time_patch_counters.clone()),
-        );
+        let compact_index_registry = Arc::new(read_time_patch::CompactJsonlIndexRegistry::new(
+            read_time_patch_counters.clone(),
+        ));
         Ok(Self {
             inner: Arc::new(Inner {
                 flows: BTreeMap::new(),
@@ -808,7 +808,11 @@ impl AppState {
         // same bound (page 1, 100 per run) as `sessions()`.
         if let Ok(catalog) = self.inner.lte_evidence_store.catalog() {
             for manifest in catalog {
-                let Ok(page) = self.inner.lte_evidence_store.session_page(&manifest.run_id, 1, 100) else {
+                let Ok(page) = self
+                    .inner
+                    .lte_evidence_store
+                    .session_page(&manifest.run_id, 1, 100)
+                else {
                     continue;
                 };
                 for record in page["data"].as_array().into_iter().flatten() {
@@ -1066,7 +1070,10 @@ fn apply_read_time_patch(
     if wanted.is_empty() {
         return read_time_patch::PatchStatus::NotApplicable;
     }
-    let bundle = state.inner.compact_index_registry.ensure_tracking(dataset_root);
+    let bundle = state
+        .inner
+        .compact_index_registry
+        .ensure_tracking(dataset_root);
     // Spawn des workers de construction / d'extension (idempotent).
     spawn_compact_index_workers(&state.inner.compact_index_registry, &bundle);
     if !bundle.all_ready() {
@@ -1083,12 +1090,7 @@ fn apply_read_time_patch(
         &state.inner.read_time_patch_counters,
     );
     let map = oiran_endpoint_map();
-    read_time_patch::patch_flow_events(
-        items,
-        &scoped,
-        &map,
-        &state.inner.read_time_patch_counters,
-    );
+    read_time_patch::patch_flow_events(items, &scoped, &map, &state.inner.read_time_patch_counters);
     read_time_patch::PatchStatus::Applied
 }
 
@@ -1134,8 +1136,15 @@ fn spawn_compact_index_workers(
     // le premier /events ou /callflow n'ait pas à relire tous les shards.
     if let Some(first) = to_build.first() {
         let path = first.path().to_path_buf();
-        let root = if path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("event-shards") {
-            path.parent().and_then(|p| p.parent()).map(std::path::Path::to_path_buf)
+        let root = if path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("event-shards")
+        {
+            path.parent()
+                .and_then(|p| p.parent())
+                .map(std::path::Path::to_path_buf)
         } else {
             path.parent().map(std::path::Path::to_path_buf)
         };
@@ -1271,7 +1280,8 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
             .dataset(live_probe::CONTINUOUS_DATASET_ID)
         {
             source_events = source_events.saturating_add(live.event_count);
-            published_session_count = published_session_count.saturating_add(live.session_ids.len());
+            published_session_count =
+                published_session_count.saturating_add(live.session_ids.len());
             if let Some(discovery) = &live.discovery {
                 ue_context_count = ue_context_count.saturating_add(discovery.ue_contexts.len());
             }
@@ -3229,7 +3239,11 @@ fn queryable_flows(state: &AppState) -> BTreeMap<String, CallFlow> {
     let mut flows = state.inner.flows.clone();
     for dataset in state.inner.capture_manager.datasets() {
         for session_id in &dataset.session_ids {
-            if let Some(flow) = state.inner.capture_manager.callflow(&dataset.dataset_id, session_id) {
+            if let Some(flow) = state
+                .inner
+                .capture_manager
+                .callflow(&dataset.dataset_id, session_id)
+            {
                 flows.insert(session_id.clone(), flow);
             }
         }
@@ -3258,10 +3272,7 @@ fn queryable_flows(state: &AppState) -> BTreeMap<String, CallFlow> {
                 }
             }
         }
-        Err(error) => eprintln!(
-            "SUBSCRIBER_JOURNEY_LTE_CATALOG_SKIPPED reason={}",
-            error
-        ),
+        Err(error) => eprintln!("SUBSCRIBER_JOURNEY_LTE_CATALOG_SKIPPED reason={}", error),
     }
     flows
 }
@@ -3270,15 +3281,27 @@ fn queryable_session_ids(state: &AppState) -> BTreeSet<String> {
     let mut ids = state.inner.flows.keys().cloned().collect::<BTreeSet<_>>();
     for dataset in state.inner.capture_manager.datasets() {
         ids.extend(dataset.session_ids.iter().filter_map(|session_id| {
-            state.inner.capture_manager.callflow(&dataset.dataset_id, session_id)
+            state
+                .inner
+                .capture_manager
+                .callflow(&dataset.dataset_id, session_id)
                 .map(|_| session_id.clone())
         }));
     }
     if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
         for manifest in catalog {
-            if let Ok(page) = state.inner.lte_evidence_store.session_page(&manifest.run_id, 1, 100) {
+            if let Ok(page) = state
+                .inner
+                .lte_evidence_store
+                .session_page(&manifest.run_id, 1, 100)
+            {
                 if let Some(records) = page["data"].as_array() {
-                    ids.extend(records.iter().filter_map(|record| record.get("session_id").and_then(Value::as_str).map(str::to_owned)));
+                    ids.extend(records.iter().filter_map(|record| {
+                        record
+                            .get("session_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    }));
                 }
             }
         }
@@ -3286,21 +3309,43 @@ fn queryable_session_ids(state: &AppState) -> BTreeSet<String> {
     ids
 }
 
-fn decorate_subscriber_summary(summary: &mut Value, flow: &CallFlow, index: &subscriber_journey::JourneyIndex) {
-    let Some(pseudo) = index.subscriber_for_session(&flow.session_id) else { return };
+fn decorate_subscriber_summary(
+    summary: &mut Value,
+    flow: &CallFlow,
+    index: &subscriber_journey::JourneyIndex,
+) {
+    let Some(pseudo) = index.subscriber_for_session(&flow.session_id) else {
+        return;
+    };
     let sessions = index.sessions(pseudo);
-    let Some(position) = sessions.iter().position(|session| session.session_id == flow.session_id) else { return };
+    let Some(position) = sessions
+        .iter()
+        .position(|session| session.session_id == flow.session_id)
+    else {
+        return;
+    };
     summary["subscriber_pseudonym"] = Value::String(pseudo.to_owned());
     summary["ue_pseudonym"] = Value::String(pseudo.to_owned());
     summary["subscriber_session_count"] = Value::from(sessions.len());
-    summary["previous_session_id"] = position.checked_sub(1).and_then(|index| sessions.get(index)).map(|session| Value::String(session.session_id.clone())).unwrap_or(Value::Null);
-    summary["next_session_id"] = sessions.get(position + 1).map(|session| Value::String(session.session_id.clone())).unwrap_or(Value::Null);
+    summary["previous_session_id"] = position
+        .checked_sub(1)
+        .and_then(|index| sessions.get(index))
+        .map(|session| Value::String(session.session_id.clone()))
+        .unwrap_or(Value::Null);
+    summary["next_session_id"] = sessions
+        .get(position + 1)
+        .map(|session| Value::String(session.session_id.clone()))
+        .unwrap_or(Value::Null);
 }
 
 async fn subscribers(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
     let flows = queryable_flows(&state);
     let index = subscriber_journey::JourneyIndex::from_flows(flows.values());
-    let mut rows = serde_json::to_value(index.subscribers()).unwrap_or_else(|_| Value::Array(Vec::new())).as_array().cloned().unwrap_or_default();
+    let mut rows = serde_json::to_value(index.subscribers())
+        .unwrap_or_else(|_| Value::Array(Vec::new()))
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     if let Some(search) = query.search.as_deref() {
         let search = search.to_ascii_lowercase();
         rows.retain(|row| row.to_string().to_ascii_lowercase().contains(&search));
@@ -3313,15 +3358,23 @@ async fn subscriber_journey(State(state): State<AppState>, Path(pseudo): Path<St
     let index = subscriber_journey::JourneyIndex::from_flows(flows.values());
     let sessions = index.sessions(&pseudo);
     if sessions.is_empty() {
-        return api_error(StatusCode::NOT_FOUND, "SUBSCRIBER_NOT_FOUND", "subscriber journey not found");
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "SUBSCRIBER_NOT_FOUND",
+            "subscriber journey not found",
+        );
     }
     let mut contexts: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for session in &sessions {
-        let context_id = flows.get(&session.session_id)
+        let context_id = flows
+            .get(&session.session_id)
             .and_then(|flow| discovered_session_for_flow(&state, flow))
             .map(|session| session.ue_context_id.clone())
             .unwrap_or_else(|| format!("ue-context-for-{}", session.session_id));
-        contexts.entry(context_id).or_default().push(session.session_id.clone());
+        contexts
+            .entry(context_id)
+            .or_default()
+            .push(session.session_id.clone());
     }
     ok(json!({
         "subscriber_pseudonym":pseudo,
@@ -3336,9 +3389,14 @@ async fn subscriber_tmsi(State(state): State<AppState>, Path(pseudo): Path<Strin
     let flows = queryable_flows(&state);
     let index = subscriber_journey::JourneyIndex::from_flows(flows.values());
     if index.sessions(&pseudo).is_empty() {
-        return api_error(StatusCode::NOT_FOUND, "SUBSCRIBER_NOT_FOUND", "subscriber temporary identity chain not found");
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "SUBSCRIBER_NOT_FOUND",
+            "subscriber temporary identity chain not found",
+        );
     }
-    ok(serde_json::to_value(index.tmsi(&pseudo)).unwrap_or(Value::Array(Vec::new()))).into_response()
+    ok(serde_json::to_value(index.tmsi(&pseudo)).unwrap_or(Value::Array(Vec::new())))
+        .into_response()
 }
 
 async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
@@ -3355,10 +3413,9 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
             // directement dans la liste /sessions pour que l'UI
             // n'ait pas besoin d'ouvrir chaque session.
             if let Some(object) = summary.as_object_mut() {
-                object.insert(
-                    "identities".into(),
-                    identity_summary_for_session(&state, &flow.session_id),
-                );
+                let mut identities = identity_summary_for_session(&state, &flow.session_id);
+                merge_sbi_identities(&mut identities, &flow.events);
+                object.insert("identities".into(), identities);
             }
             (flow.session_id.clone(), summary)
         })
@@ -3444,6 +3501,7 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                             }
                         }
                     }
+                    merge_sbi_identities(&mut identities, &flow.events);
                     object.insert("identities".into(), identities);
                 }
                 unique.insert(session_id.clone(), summary);
@@ -3814,7 +3872,7 @@ async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Respo
     let journey_flows = queryable_flows(&state);
     let journey_index = subscriber_journey::JourneyIndex::from_flows(journey_flows.values());
     if let Some(flow) = flow_for(&state, &id) {
-        let mut summary = session_summary(&state,flow);
+        let mut summary = session_summary(&state, flow);
         decorate_subscriber_summary(&mut summary, flow, &journey_index);
         return ok(json!({"summary":summary,"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
     }
@@ -3824,7 +3882,7 @@ async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Respo
             .capture_manager
             .dataset(&dataset_id)
             .expect("live flow dataset remains registered");
-        let mut summary = live_session_summary(&dataset,&flow);
+        let mut summary = live_session_summary(&dataset, &flow);
         decorate_subscriber_summary(&mut summary, &flow, &journey_index);
         return ok(json!({"summary":summary,"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
     }
@@ -3915,7 +3973,8 @@ const IDENTITY_TSHARK_FIELDS: &[&str] = &[
 /// computed once. Empty set = listing unavailable: every field is requested
 /// as before.
 fn available_identity_fields() -> &'static std::collections::HashSet<String> {
-    static FIELDS: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    static FIELDS: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
     FIELDS.get_or_init(|| {
         let Ok(output) = Command::new("tshark").args(["-G", "fields"]).output() else {
             return std::collections::HashSet::new();
@@ -3939,15 +3998,32 @@ fn parse_tshark_field_list(stdout: &str) -> std::collections::HashSet<String> {
 /// 2.15.3 — SUPI (IMSI) from a null-scheme SUCI as dissected by TShark:
 /// only SUPI format 0 (IMSI) with protection scheme 0 (null) is readable;
 /// any other scheme is ciphered (ECIES) and yields None.
-fn supi_from_null_scheme_suci(supi_fmt: &str, scheme_id: &str, mcc: &str, mnc: &str, msin: &str) -> Option<String> {
+fn supi_from_null_scheme_suci(
+    supi_fmt: &str,
+    scheme_id: &str,
+    mcc: &str,
+    mnc: &str,
+    msin: &str,
+) -> Option<String> {
     let first = |v: &str| v.split(',').next().unwrap_or("").trim().to_string();
-    let (fmt, scheme, mcc, mnc, msin) = (first(supi_fmt), first(scheme_id), first(mcc), first(mnc), first(msin));
+    let (fmt, scheme, mcc, mnc, msin) = (
+        first(supi_fmt),
+        first(scheme_id),
+        first(mcc),
+        first(mnc),
+        first(msin),
+    );
     let digits = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
     let zero = |v: &str| v.parse::<u32>().ok() == Some(0) || v == "0x00" || v == "0x0";
     if !zero(&fmt) || !zero(&scheme) {
         return None;
     }
-    if !(digits(&mcc) && mcc.len() == 3 && digits(&mnc) && (2..=3).contains(&mnc.len()) && digits(&msin)) {
+    if !(digits(&mcc)
+        && mcc.len() == 3
+        && digits(&mnc)
+        && (2..=3).contains(&mnc.len())
+        && digits(&msin))
+    {
         return None;
     }
     let imsi = format!("{mcc}{mnc}{msin}");
@@ -4180,7 +4256,8 @@ fn tshark_identities(
                     .and_then(|column| columns.get(column).copied())
                     .unwrap_or("")
             };
-            let suci_supi = supi_from_null_scheme_suci(field(19), field(20), field(21), field(22), field(23));
+            let suci_supi =
+                supi_from_null_scheme_suci(field(19), field(20), field(21), field(22), field(23));
             for raw in split_field(field(1))
                 .chain(split_field(field(2)))
                 .chain(suci_supi.as_deref().into_iter())
@@ -4285,7 +4362,10 @@ fn tshark_identities(
                     );
                 }
             }
-            for raw in split_field(field(13)).chain(split_field(field(16))).chain(split_field(field(26))) {
+            for raw in split_field(field(13))
+                .chain(split_field(field(16)))
+                .chain(split_field(field(26)))
+            {
                 if let Some(imeisv) = identity_digits(raw) {
                     push_identity(
                         &mut observations,
@@ -4322,14 +4402,18 @@ fn tshark_identities(
 /// 2.15.3 — background identity hydration for the session list: at most
 /// two tshark dissections at a time, each session attempted once per
 /// process (failures are not retried in a loop).
-static IDENTITY_HYDRATION_SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-static IDENTITY_HYDRATION_RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static IDENTITY_HYDRATION_SEEN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static IDENTITY_HYDRATION_RUNNING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 const IDENTITY_HYDRATION_MAX: usize = 2;
 
 fn schedule_identity_hydration(state: &AppState, session_id: &str) {
     use std::sync::atomic::Ordering;
-    let Ok(mut seen) = IDENTITY_HYDRATION_SEEN.lock() else { return };
+    let Ok(mut seen) = IDENTITY_HYDRATION_SEEN.lock() else {
+        return;
+    };
     if seen.contains(session_id) {
         return;
     }
@@ -4418,6 +4502,83 @@ fn identity_summary_for_session(state: &AppState, session_id: &str) -> Value {
         "m_tmsi": all_values("m_tmsi"),
         "subscriber_pseudonym": subscriber_pseudonym,
     })
+}
+
+/// 2.18.1 — identités SBI (MSISDN via `gpsi`, IMEI/IMEISV via `pei`)
+/// publiées par decoder-sbi 2.18.0 dans `session_identifiers`, donc
+/// présentes dans `decoded_ie_tree` des events SBI du call flow
+/// (`{"name":…,"value":…,"source":"session_identifiers"}`). Première
+/// observation dans l'ordre du call flow. Aucune déduction : nom absent
+/// → rien.
+fn sbi_identity_from_events(
+    events: &[callflow_schema::CallFlowEvent],
+    name: &str,
+) -> Option<(String, String)> {
+    events
+        .iter()
+        .filter(|event| event.protocol.to_ascii_uppercase().starts_with("SBI"))
+        .find_map(|event| {
+            let items = event.decoded_ie_tree.as_array()?;
+            let value = items.iter().find_map(|item| {
+                (item["name"] == name)
+                    .then(|| item["value"].as_str().map(str::to_owned))
+                    .flatten()
+                    .filter(|value| !value.is_empty())
+            })?;
+            let field = |key: &str| {
+                items
+                    .iter()
+                    .find(|item| item["name"] == key)
+                    .and_then(|item| item["value"].as_str())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            };
+            let source = match (field("sbi_service"), field("sbi_operation")) {
+                (Some(service), Some(operation)) => format!("SBI:{service}:{operation}"),
+                (Some(service), None) => format!("SBI:{service}"),
+                _ => format!("SBI:{}", event.message_name),
+            };
+            Some((
+                value,
+                format!("{source} ({}·{})", event.capture_id, event.event_id),
+            ))
+        })
+}
+
+/// 2.18.1 — complète `identities` (vault / fallback) avec les identités
+/// SBI quand le vault ne les porte pas. Le vault garde la priorité.
+fn merge_sbi_identities(identities: &mut Value, events: &[callflow_schema::CallFlowEvent]) {
+    let msisdn = sbi_identity_from_events(events, "msisdn_pseudonym");
+    let imei = sbi_identity_from_events(events, "imei_pseudonym")
+        .map(|found| (found, "IMEI"))
+        .or_else(|| {
+            sbi_identity_from_events(events, "imeisv_pseudonym").map(|found| (found, "IMEISV"))
+        });
+    if msisdn.is_none() && imei.is_none() {
+        return;
+    }
+    if !identities.is_object() {
+        *identities = json!({
+            "imsi": null, "imsi_cleartext": null, "imei": null, "msisdn": null,
+            "tmsi": [], "s_tmsi": [], "m_tmsi": [], "subscriber_pseudonym": null,
+        });
+    }
+    let Some(object) = identities.as_object_mut() else {
+        return;
+    };
+    if let Some((value, source)) = msisdn {
+        if object.get("msisdn").map_or(true, Value::is_null) {
+            object.insert("msisdn".into(), Value::String(value));
+            object.insert("msisdn_source".into(), Value::String(source));
+        }
+    }
+    if let Some(((value, source), kind)) = imei {
+        if object.get("imei").map_or(true, Value::is_null) {
+            object.insert("imei".into(), Value::String(value));
+            object.insert("imei_type".into(), Value::String(kind.into()));
+            object.insert("imei_source".into(), Value::String(source));
+        }
+    }
 }
 
 fn identity_bundle(observations: Vec<IdentityObservation>) -> Value {
@@ -4592,10 +4753,7 @@ async fn session_events(
                 .ok()
                 .and_then(|value| value.as_array().cloned())
                 .unwrap_or_default();
-            (
-                items,
-                state.inner.capture_manager.dataset_root(&dataset_id),
-            )
+            (items, state.inner.capture_manager.dataset_root(&dataset_id))
         } else {
             match state.inner.lte_evidence_store.callflow_page_by_session(
                 &id,
@@ -4773,12 +4931,14 @@ async fn session_callflow(
                 let dataset_root = if flow_value_for(&state, &id).is_some() {
                     state.inner.reference_dataset_root.clone()
                 } else {
-                    live_flow_for(&state, &id)
-                        .and_then(|(dataset_id, _)| state.inner.capture_manager.dataset_root(&dataset_id))
+                    live_flow_for(&state, &id).and_then(|(dataset_id, _)| {
+                        state.inner.capture_manager.dataset_root(&dataset_id)
+                    })
                 };
-                if let (Some(root), Some(events)) =
-                    (dataset_root.as_deref(), value.get_mut("events").and_then(Value::as_array_mut))
-                {
+                if let (Some(root), Some(events)) = (
+                    dataset_root.as_deref(),
+                    value.get_mut("events").and_then(Value::as_array_mut),
+                ) {
                     let _ = read_time_patch::insert_pfcp_siblings_into_callflow(events, root);
                 }
             }
@@ -5384,6 +5544,74 @@ fn json_error(error: serde_json::Error) -> String {
 }
 
 #[cfg(test)]
+mod sbi_identity_wiring_tests {
+    use super::*;
+
+    fn event(protocol: &str, items: Value) -> callflow_schema::CallFlowEvent {
+        serde_json::from_value(json!({
+            "event_id": format!("ev-{protocol}"), "timestamp": "", "timestamp_ns": "0",
+            "interface": "SBI", "protocol": protocol, "message_name": "GET am-data",
+            "source_participant": "AMF", "destination_participant": "UDM",
+            "direction": "REQUEST", "decoded_ie_tree": items,
+            "decoding_status": "DECODED", "semantic_status": "OK",
+            "association": "SESSION", "procedure_group": "", "packet_references": [],
+            "capture_id": "cap-sbi", "decoder_name": "decoder-sbi", "decoder_version": "2.18.0",
+            "raw_payload_reference": "", "errors": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn sbi_msisdn_and_imeisv_fill_identities_when_vault_is_empty() {
+        let events = vec![event(
+            "SBI-HTTP2",
+            json!([
+                {"name":"sbi_service","value":"nudm-sdm","source":"session_identifiers"},
+                {"name":"sbi_operation","value":"am-data","source":"session_identifiers"},
+                {"name":"msisdn_pseudonym","value":"msisdn-pseudo-A","source":"session_identifiers"},
+                {"name":"imeisv_pseudonym","value":"pei-pseudo-B","source":"session_identifiers"}
+            ]),
+        )];
+        let mut identities = Value::Null;
+        merge_sbi_identities(&mut identities, &events);
+        assert_eq!(identities["msisdn"], "msisdn-pseudo-A");
+        assert_eq!(identities["imei"], "pei-pseudo-B");
+        assert_eq!(identities["imei_type"], "IMEISV");
+        assert!(identities["msisdn_source"]
+            .as_str()
+            .unwrap()
+            .starts_with("SBI:nudm-sdm:am-data"));
+        assert!(identities["imsi"].is_null());
+    }
+
+    #[test]
+    fn vault_identity_keeps_priority_over_sbi() {
+        let events = vec![event(
+            "SBI-HTTP2",
+            json!([{"name":"msisdn_pseudonym","value":"from-sbi"}]),
+        )];
+        let mut identities = json!({"imsi":"x","msisdn":"from-vault","imei":null});
+        merge_sbi_identities(&mut identities, &events);
+        assert_eq!(identities["msisdn"], "from-vault");
+        assert!(identities.get("msisdn_source").is_none());
+    }
+
+    #[test]
+    fn non_sbi_or_absent_identifier_changes_nothing() {
+        let events = vec![
+            event(
+                "NGAP",
+                json!([{"name":"msisdn_pseudonym","value":"not-sbi"}]),
+            ),
+            event("SBI-HTTP2", json!([{"name":"supi_pseudonym","value":"x"}])),
+        ];
+        let mut identities = Value::Null;
+        merge_sbi_identities(&mut identities, &events);
+        assert!(identities.is_null());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::{Request, StatusCode};
@@ -5421,7 +5649,10 @@ mod tests {
     #[test]
     fn identity_vault_default_is_below_the_dedicated_directory() {
         assert_eq!(DEFAULT_IDENTITY_VAULT_DIR, "/var/lib/oiran/identity-vault");
-        assert_eq!(DEFAULT_IDENTITY_VAULT_PATH, "/var/lib/oiran/identity-vault/vault.json");
+        assert_eq!(
+            DEFAULT_IDENTITY_VAULT_PATH,
+            "/var/lib/oiran/identity-vault/vault.json"
+        );
         assert_ne!(
             FsPath::new(DEFAULT_IDENTITY_VAULT_PATH).parent(),
             Some(FsPath::new("/var/lib/oiran"))
@@ -5596,16 +5827,14 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let path = workspace
-            .join("runtime")
-            .join(format!(
-                "auto-remove-test-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
+        let path = workspace.join("runtime").join(format!(
+            "auto-remove-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         // Capture l'emplacement AVANT le panic pour pouvoir vérifier
         // qu'il a disparu APRÈS.
         let probe_path = path.clone();
@@ -5913,7 +6142,10 @@ mod tests {
             "imsi_cleartext must be exposed when vault has a non-null cleartext"
         );
         // Le pseudonyme reste présent — les deux champs cohabitent.
-        assert!(identities["imsi"].is_string(), "imsi pseudo must stay next to cleartext");
+        assert!(
+            identities["imsi"].is_string(),
+            "imsi pseudo must stay next to cleartext"
+        );
         // Aucun *_cleartext pour les autres kinds (GUTI/TMSI/IMEI
         // restent pseudonymisés uniformément par la règle Sadok).
         assert!(
@@ -6419,10 +6651,24 @@ mod tests {
     #[tokio::test]
     async fn health_session_count_matches_unfiltered_sessions_union() {
         let app = router(state(), None);
-        let health = json_body(app.clone().oneshot(req("/api/v1/health", false)).await.unwrap()).await;
-        let sessions = json_body(app.oneshot(req("/api/v1/sessions?page_size=100", false)).await.unwrap()).await;
+        let health = json_body(
+            app.clone()
+                .oneshot(req("/api/v1/health", false))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let sessions = json_body(
+            app.oneshot(req("/api/v1/sessions?page_size=100", false))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(health["data"]["session_count"], sessions["meta"]["total"]);
-        assert_eq!(health["data"]["queryable_session_count"], sessions["meta"]["total"]);
+        assert_eq!(
+            health["data"]["queryable_session_count"],
+            sessions["meta"]["total"]
+        );
         assert!(health["data"].get("published_session_count").is_some());
     }
 
@@ -6472,8 +6718,12 @@ mod tests {
             "read_time_patch.callflows_loaded must be > 0 after reference dataset load"
         );
         assert!(patch["events_seen"].as_u64().is_some());
-        assert!(patch["events_patched"]["source_participant"].as_u64().is_some());
-        assert!(patch["events_patched"]["destination_participant"].as_u64().is_some());
+        assert!(patch["events_patched"]["source_participant"]
+            .as_u64()
+            .is_some());
+        assert!(patch["events_patched"]["destination_participant"]
+            .as_u64()
+            .is_some());
         assert!(patch["events_patched"]["direction"].as_u64().is_some());
         assert!(patch["events_patched"]["message_name"].as_u64().is_some());
         assert!(patch["events_unresolved_participant"].as_u64().is_some());
@@ -6544,9 +6794,27 @@ mod tests {
         };
         let raw_events = vec![
             raw_event("evt-01", None, "S1AP", "decoder-s1ap", 0, 12, 23, true),
-            raw_event("evt-02", Some("evt-01"), "NAS-EPS-MM", "decoder-nas", 0x41, 65, 23, true),
+            raw_event(
+                "evt-02",
+                Some("evt-01"),
+                "NAS-EPS-MM",
+                "decoder-nas",
+                0x41,
+                65,
+                23,
+                true,
+            ),
             raw_event("evt-03", None, "S1AP", "decoder-s1ap", 0, 11, 24, false),
-            raw_event("evt-04", Some("evt-03"), "NAS-EPS-MM", "decoder-nas", 0x5d, 93, 24, false),
+            raw_event(
+                "evt-04",
+                Some("evt-03"),
+                "NAS-EPS-MM",
+                "decoder-nas",
+                0x5d,
+                93,
+                24,
+                false,
+            ),
             raw_event("evt-05", None, "S1AP", "decoder-s1ap", 0, 22, 31, true),
         ];
         let mut jsonl = fs::File::create(dataset_dir.join("oiran_events.jsonl")).unwrap();
@@ -6572,7 +6840,8 @@ mod tests {
                     "packet_count":5,
                     "size_bytes":1
                 }]
-            }).to_string(),
+            })
+            .to_string(),
         )
         .unwrap();
         // callflow.json : participants « Unknown endpoint », directions
@@ -6666,7 +6935,12 @@ mod tests {
         let patch = &version["data"]["read_time_patch"];
         assert_eq!(patch["version"], read_time_patch::PATCH_VERSION);
         assert!(patch["callflows_loaded"].as_u64().unwrap() >= 1);
-        assert!(patch["events_patched"]["source_participant"].as_u64().unwrap() >= 5);
+        assert!(
+            patch["events_patched"]["source_participant"]
+                .as_u64()
+                .unwrap()
+                >= 5
+        );
         assert!(patch["events_patched"]["message_name"].as_u64().unwrap() >= 3);
 
         fs::remove_dir_all(&dataset_dir).ok();
@@ -6717,7 +6991,9 @@ mod tests {
         let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
         let dataset_dir = base.join("dataset");
         let generation_name = format!("generation-{}-0", epoch_seconds());
-        let callflows_dir = dataset_dir.join("callflow-generations").join(&generation_name);
+        let callflows_dir = dataset_dir
+            .join("callflow-generations")
+            .join(&generation_name);
         let pcap_dir = base.join("pcap");
         fs::create_dir_all(&callflows_dir).unwrap();
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -6792,7 +7068,11 @@ mod tests {
             "unresolved_fields":0
         });
         let callflow_path = callflows_dir.join(format!("{session_id}.json"));
-        fs::write(&callflow_path, serde_json::to_vec_pretty(&callflow).unwrap()).unwrap();
+        fs::write(
+            &callflow_path,
+            serde_json::to_vec_pretty(&callflow).unwrap(),
+        )
+        .unwrap();
         fs::write(
             callflows_dir.join(format!("{session_id}.html")),
             b"<html>stub</html>",
@@ -6903,11 +7183,17 @@ mod tests {
         .await;
         let patch = &version["data"]["read_time_patch"];
         assert_eq!(patch["version"], read_time_patch::PATCH_VERSION);
-        assert!(patch["events_patched"]["source_participant"].as_u64().unwrap() >= 5);
+        assert!(
+            patch["events_patched"]["source_participant"]
+                .as_u64()
+                .unwrap()
+                >= 5
+        );
 
         // Preuve zéro écriture : SHA-256 identiques avant / après HTTP.
         assert_eq!(
-            before_callflow, before_sha(&callflow_path),
+            before_callflow,
+            before_sha(&callflow_path),
             "callflow.json must stay byte-identical on disk"
         );
         assert_eq!(before_manifest, before_sha(&manifest_path));
@@ -6959,7 +7245,9 @@ mod tests {
         let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
         let dataset_dir = base.join("dataset");
         let generation_name = format!("generation-{}-0", epoch_seconds());
-        let callflows_dir = dataset_dir.join("callflow-generations").join(&generation_name);
+        let callflows_dir = dataset_dir
+            .join("callflow-generations")
+            .join(&generation_name);
         let pcap_dir = base.join("pcap");
         fs::create_dir_all(&callflows_dir).unwrap();
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -7045,15 +7333,21 @@ mod tests {
         // Callflow persisté ne contient QUE Response + Modification.
         // Shape alignée sur ANR1 (decoded_ie_tree avec pfcp_sequence/F-SEID).
         let session_id = "5g-session-c330d205adafa233";
-        let flow_event = |event_id: &str, message_name: &str, direction: &str, decoded_ie_tree: Value, packet: u64| json!({
-            "event_id":event_id,"timestamp":"","timestamp_ns":"0","interface":"N4","protocol":"PFCP",
-            "message_name":message_name,"source_participant":"SMF","destination_participant":"UPF","direction":direction,
-            "decoded_ie_tree":decoded_ie_tree,"decoding_status":"DECODED","semantic_status":"EXACT",
-            "association":"SESSION","procedure_group":"PFCP Session",
-            "packet_references":[{"source_file":"N4.pcap-stub","packet_number":packet,"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}],
-            "capture_id":"sha256:continuous","decoder_name":"decoder-pfcp","decoder_version":"0.3.0",
-            "raw_payload_reference":"sha256:stub","errors":[]
-        });
+        let flow_event = |event_id: &str,
+                          message_name: &str,
+                          direction: &str,
+                          decoded_ie_tree: Value,
+                          packet: u64| {
+            json!({
+                "event_id":event_id,"timestamp":"","timestamp_ns":"0","interface":"N4","protocol":"PFCP",
+                "message_name":message_name,"source_participant":"SMF","destination_participant":"UPF","direction":direction,
+                "decoded_ie_tree":decoded_ie_tree,"decoding_status":"DECODED","semantic_status":"EXACT",
+                "association":"SESSION","procedure_group":"PFCP Session",
+                "packet_references":[{"source_file":"N4.pcap-stub","packet_number":packet,"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}],
+                "capture_id":"sha256:continuous","decoder_name":"decoder-pfcp","decoder_version":"0.3.0",
+                "raw_payload_reference":"sha256:stub","errors":[]
+            })
+        };
         let callflow = json!({
             "callflow_id":format!("cf-{session_id}"),
             "session_id":session_id,
@@ -7215,7 +7509,9 @@ mod tests {
         let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
         let dataset_dir = base.join("dataset");
         let generation_name = format!("generation-{}-0", epoch_seconds());
-        let callflows_dir = dataset_dir.join("callflow-generations").join(&generation_name);
+        let callflows_dir = dataset_dir
+            .join("callflow-generations")
+            .join(&generation_name);
         let pcap_dir = base.join("pcap");
         fs::create_dir_all(&callflows_dir).unwrap();
         fs::create_dir_all(&pcap_dir).unwrap();
@@ -7334,11 +7630,7 @@ mod tests {
 
         // Pré-condition : vault VIDE pour cette session (reproduction
         // fidèle du cas prod).
-        let vault_observations = state
-            .inner
-            .identity_vault
-            .for_session(session_id)
-            .unwrap();
+        let vault_observations = state.inner.identity_vault.for_session(session_id).unwrap();
         assert!(
             vault_observations.is_empty(),
             "vault doit être vide pour reproduire le FAIL prod 2.15.0/2.15.1"
@@ -7449,7 +7741,9 @@ mod tests {
         let base = capture_root.join(live_probe::CONTINUOUS_CAPTURE_ID);
         let dataset_dir = base.join("dataset");
         let generation_name = format!("generation-{}-0", epoch_seconds());
-        let callflows_dir = dataset_dir.join("callflow-generations").join(&generation_name);
+        let callflows_dir = dataset_dir
+            .join("callflow-generations")
+            .join(&generation_name);
         fs::create_dir_all(&callflows_dir).unwrap();
         fs::create_dir_all(base.join("pcap")).unwrap();
 
@@ -7463,11 +7757,11 @@ mod tests {
         let jsonl_file = fs::File::create(&jsonl_path).unwrap();
         let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, jsonl_file);
         let session_a_events = [
-            (0u32, 12u32, 23u64, true),   // initialUEMessage eNB→MME
-            (0x41, 65, 23, true),         // NAS Attach Request
-            (0, 11, 24, false),           // downlinkNASTransport MME→eNB
-            (0x5d, 93, 24, false),        // NAS Security Mode Command
-            (0, 22, 31, true),            // UECapabilityInfoIndication
+            (0u32, 12u32, 23u64, true), // initialUEMessage eNB→MME
+            (0x41, 65, 23, true),       // NAS Attach Request
+            (0, 11, 24, false),         // downlinkNASTransport MME→eNB
+            (0x5d, 93, 24, false),      // NAS Security Mode Command
+            (0, 22, 31, true),          // UECapabilityInfoIndication
         ];
         let session_b_events = [
             (0, 12, 101, true),
@@ -7489,48 +7783,77 @@ mod tests {
             PROD_DENSITY_PADDING.len() >= 1_400,
             "padding must be ≥ 1400 chars to approach prod density"
         );
-        let write_event =
-            |writer: &mut dyn std::io::Write,
-             id: &str,
-             parent: Option<&str>,
-             protocol: &str,
-             message_type: u32,
-             procedure_code: u32,
-             packet: u64,
-             from_enb: bool| {
-                let (src, dst, src_port, dst_port) = if from_enb {
-                    ("10.77.10.20", "10.77.10.10", 46859u16, 36412u16)
-                } else {
-                    ("10.77.10.10", "10.77.10.20", 36412u16, 46859u16)
-                };
-                let line = serde_json::json!({
-                    "event_id":id,"parent_event_id":parent,
-                    "capture_id":"sha256:stub","capture_point_id":"S1-MME",
-                    "timestamp":{"seconds":packet as i64,"nanoseconds":0u64,"raw_ticks":packet,"display":""},
-                    "interface":"S1-MME","protocol":protocol,
-                    "message_name":"stale","message_type":message_type,"procedure_code":procedure_code,
-                    "source_endpoint":{"address":src,"port":src_port,"network_function":null},
-                    "destination_endpoint":{"address":dst,"port":dst_port,"network_function":null},
-                    "direction":"UNKNOWN","session_identifiers":[],"information_elements":[],
-                    "decoding_status":"DECODED","decoder_name":"decoder-s1ap","decoder_version":"0.2.2",
-                    "raw_payload_reference":"sha256:stub",
-                    "packet_references":[{"source_file":"S1-MME.pcap-stub","packet_number":packet,"byte_offset":0u64,"interface_id":0u32,"captured_length":1u32,"original_length":1u32}],
-                    "errors":[],
-                    "padding": PROD_DENSITY_PADDING,
-                });
-                writeln!(writer, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+        let write_event = |writer: &mut dyn std::io::Write,
+                           id: &str,
+                           parent: Option<&str>,
+                           protocol: &str,
+                           message_type: u32,
+                           procedure_code: u32,
+                           packet: u64,
+                           from_enb: bool| {
+            let (src, dst, src_port, dst_port) = if from_enb {
+                ("10.77.10.20", "10.77.10.10", 46859u16, 36412u16)
+            } else {
+                ("10.77.10.10", "10.77.10.20", 36412u16, 46859u16)
             };
+            let line = serde_json::json!({
+                "event_id":id,"parent_event_id":parent,
+                "capture_id":"sha256:stub","capture_point_id":"S1-MME",
+                "timestamp":{"seconds":packet as i64,"nanoseconds":0u64,"raw_ticks":packet,"display":""},
+                "interface":"S1-MME","protocol":protocol,
+                "message_name":"stale","message_type":message_type,"procedure_code":procedure_code,
+                "source_endpoint":{"address":src,"port":src_port,"network_function":null},
+                "destination_endpoint":{"address":dst,"port":dst_port,"network_function":null},
+                "direction":"UNKNOWN","session_identifiers":[],"information_elements":[],
+                "decoding_status":"DECODED","decoder_name":"decoder-s1ap","decoder_version":"0.2.2",
+                "raw_payload_reference":"sha256:stub",
+                "packet_references":[{"source_file":"S1-MME.pcap-stub","packet_number":packet,"byte_offset":0u64,"interface_id":0u32,"captured_length":1u32,"original_length":1u32}],
+                "errors":[],
+                "padding": PROD_DENSITY_PADDING,
+            });
+            writeln!(writer, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+        };
         for (i, (mt, proc, pkt, from_enb)) in session_a_events.iter().enumerate() {
             let id = format!("evt-session-a-{i:02}");
-            let parent = if i == 1 { Some("evt-session-a-00") } else if i == 3 { Some("evt-session-a-02") } else { None };
+            let parent = if i == 1 {
+                Some("evt-session-a-00")
+            } else if i == 3 {
+                Some("evt-session-a-02")
+            } else {
+                None
+            };
             let protocol = if *mt == 0 { "S1AP" } else { "NAS-EPS-MM" };
-            write_event(&mut writer, &id, parent, protocol, *mt, *proc, *pkt, *from_enb);
+            write_event(
+                &mut writer,
+                &id,
+                parent,
+                protocol,
+                *mt,
+                *proc,
+                *pkt,
+                *from_enb,
+            );
         }
         for (i, (mt, proc, pkt, from_enb)) in session_b_events.iter().enumerate() {
             let id = format!("evt-session-b-{i:02}");
-            let parent = if i == 1 { Some("evt-session-b-00") } else if i == 3 { Some("evt-session-b-02") } else { None };
+            let parent = if i == 1 {
+                Some("evt-session-b-00")
+            } else if i == 3 {
+                Some("evt-session-b-02")
+            } else {
+                None
+            };
             let protocol = if *mt == 0 { "S1AP" } else { "NAS-EPS-MM" };
-            write_event(&mut writer, &id, parent, protocol, *mt, *proc, *pkt, *from_enb);
+            write_event(
+                &mut writer,
+                &id,
+                parent,
+                protocol,
+                *mt,
+                *proc,
+                *pkt,
+                *from_enb,
+            );
         }
         // Padding bruyant : événements dont `event_id` n'appartient
         // à aucune session demandée (préfixe `evt-noise-`), donc
@@ -7549,10 +7872,14 @@ mod tests {
                 write_event(&mut writer, &id, None, "S1AP", 0, 15, 42, true);
             }
             let _ = batch_start;
-            noise_bytes = fs::metadata(&jsonl_path).map(|m| m.len() as usize).unwrap_or(0);
+            noise_bytes = fs::metadata(&jsonl_path)
+                .map(|m| m.len() as usize)
+                .unwrap_or(0);
             if noise_bytes == 0 {
                 writer.flush().unwrap();
-                noise_bytes = fs::metadata(&jsonl_path).map(|m| m.len() as usize).unwrap_or(0);
+                noise_bytes = fs::metadata(&jsonl_path)
+                    .map(|m| m.len() as usize)
+                    .unwrap_or(0);
             }
         }
         writer.flush().unwrap();
@@ -7587,7 +7914,11 @@ mod tests {
             ("lte-session-load-b", "evt-session-b"),
         ] {
             let path = callflows_dir.join(format!("{session_id}.json"));
-            fs::write(&path, serde_json::to_vec_pretty(&stale_callflow(session_id, prefix)).unwrap()).unwrap();
+            fs::write(
+                &path,
+                serde_json::to_vec_pretty(&stale_callflow(session_id, prefix)).unwrap(),
+            )
+            .unwrap();
             fs::write(callflows_dir.join(format!("{session_id}.html")), b"<html/>").unwrap();
         }
 
@@ -7753,7 +8084,9 @@ mod tests {
                 assert!(
                     (src == "eNB" && dst == "MME") || (src == "MME" && dst == "eNB"),
                     "event {} participants not patched: {} → {}",
-                    event["event_id"], src, dst
+                    event["event_id"],
+                    src,
+                    dst
                 );
             }
             eprintln!(
@@ -7992,10 +8325,7 @@ mod tests {
             for suffix in ["", "/provenance"] {
                 let response = app
                     .clone()
-                    .oneshot(req(
-                        &format!("/api/v1/events/{event_id}{suffix}"),
-                        false,
-                    ))
+                    .oneshot(req(&format!("/api/v1/events/{event_id}{suffix}"), false))
                     .await
                     .unwrap();
                 assert_eq!(
@@ -8012,17 +8342,23 @@ mod tests {
     async fn every_listed_event_resolves_for_5g_full_lte_and_s1_only_lte() {
         let reference = state();
         let reference_session = reference.inner.primary_session_id.clone();
-        assert!(assert_listed_events_resolve(&router(reference, None), &reference_session).await > 0);
+        assert!(
+            assert_listed_events_resolve(&router(reference, None), &reference_session).await > 0
+        );
 
         let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .parent()
             .unwrap();
-        let mut full_state = AppState::load(test_config(workspace, "event-index-full-lte")).unwrap();
+        let mut full_state =
+            AppState::load(test_config(workspace, "event-index-full-lte")).unwrap();
         let full_bundle = temporary_directory("event-index-full-lte-bundle");
         let (_, full_session) = ingest_lte_evidence_fixture(&full_state, &full_bundle);
-        assert!(assert_listed_events_resolve(&router(full_state.clone(), None), &full_session).await >= 3);
+        assert!(
+            assert_listed_events_resolve(&router(full_state.clone(), None), &full_session).await
+                >= 3
+        );
 
         let mut seven = full_state
             .inner
@@ -8146,7 +8482,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
-        assert_eq!(json_body(unknown).await["error"]["code"], "CAPTURE_NOT_FOUND");
+        assert_eq!(
+            json_body(unknown).await["error"]["code"],
+            "CAPTURE_NOT_FOUND"
+        );
 
         let mut missing_state = operator_state();
         let mut missing_flow = missing_state.inner.flows.values().next().unwrap().clone();
@@ -8186,7 +8525,11 @@ mod tests {
         let config = test_config(workspace, "subscriber-lte-evidence");
         let store_root = config.lte_evidence_root.clone();
         let state = AppState::load(config).unwrap();
-        assert!(state.inner.flows.values().any(|flow| flow.technology.contains("5G")));
+        assert!(state
+            .inner
+            .flows
+            .values()
+            .any(|flow| flow.technology.contains("5G")));
         let bundle = temporary_directory("subscriber-lte-evidence-bundle");
         ingest_lte_evidence_fixture(&state, &bundle);
 
@@ -8202,7 +8545,9 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert!(subscribers["data"].as_array().is_some_and(|rows| !rows.is_empty()));
+        assert!(subscribers["data"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()));
         assert!(subscribers["data"].as_array().unwrap().iter().any(|row| {
             row["technologies"]
                 .as_array()
@@ -8769,7 +9114,8 @@ mod tests {
         )
         .await;
         assert_eq!(
-            metrics["data"]["active_captures"], 1,
+            metrics["data"]["active_captures"],
+            1,
             "{}",
             diag("active_captures != 1")
         );
@@ -9550,12 +9896,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "lab: requires br-oiran-{n2,n3,n4,sbi,…} bridges and ≥2% disk free"]
     async fn four_plane_validate_traverses_http_api_and_unix_ipc_without_acquisition_lab() {
-        for bridge in [
-            "br-oiran-n2",
-            "br-oiran-sbi",
-            "br-oiran-n4",
-            "br-oiran-n3",
-        ] {
+        for bridge in ["br-oiran-n2", "br-oiran-sbi", "br-oiran-n4", "br-oiran-n3"] {
             let sysfs = FsPath::new("/sys/class/net").join(bridge);
             assert!(
                 sysfs.is_dir(),
@@ -9916,8 +10257,14 @@ mod tests {
             }
         }
         filtered.sort();
-        assert!(listed.contains(&lte_session_id), "LTE evidence session must be in GET /sessions");
-        assert!(filtered.contains(&lte_session_id), "LTE evidence session missing from POST /sessions/filter");
+        assert!(
+            listed.contains(&lte_session_id),
+            "LTE evidence session must be in GET /sessions"
+        );
+        assert!(
+            filtered.contains(&lte_session_id),
+            "LTE evidence session missing from POST /sessions/filter"
+        );
         assert_eq!(filtered, listed);
 
         fs::remove_dir_all(bundle).unwrap();
@@ -10262,8 +10609,14 @@ mod suci_null_scheme_tests {
 
     #[test]
     fn refuses_ciphered_or_non_imsi_suci() {
-        assert_eq!(supi_from_null_scheme_suci("0", "1", "001", "01", "0000000201"), None); // ECIES profile A
-        assert_eq!(supi_from_null_scheme_suci("1", "0", "001", "01", "0000000201"), None); // NAI
+        assert_eq!(
+            supi_from_null_scheme_suci("0", "1", "001", "01", "0000000201"),
+            None
+        ); // ECIES profile A
+        assert_eq!(
+            supi_from_null_scheme_suci("1", "0", "001", "01", "0000000201"),
+            None
+        ); // NAI
         assert_eq!(supi_from_null_scheme_suci("", "", "", "", ""), None);
         assert_eq!(supi_from_null_scheme_suci("0", "0", "001", "01", ""), None);
     }
@@ -10280,7 +10633,11 @@ mod tshark_field_list_tests {
         let known = parse_tshark_field_list(listing);
         assert!(known.contains("e212.imsi") && known.contains("frame.number"));
         assert!(!known.contains("nas-5gs.mm.suci.msin"));
-        let requested: Vec<&str> = IDENTITY_TSHARK_FIELDS.iter().copied().filter(|f| known.contains(*f)).collect();
+        let requested: Vec<&str> = IDENTITY_TSHARK_FIELDS
+            .iter()
+            .copied()
+            .filter(|f| known.contains(*f))
+            .collect();
         assert_eq!(requested, vec!["frame.number", "e212.imsi", "e212.mcc"]);
     }
 }

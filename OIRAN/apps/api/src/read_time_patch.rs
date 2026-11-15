@@ -246,25 +246,23 @@ impl RawIndexCache {
             }
         }
         self.counters.cache_misses.fetch_add(1, Ordering::Relaxed);
-        let built = match RawEventIndex::from_dataset_root_for_event_ids(
-            dataset_root,
-            wanted_event_ids,
-        ) {
-            Ok(index) => index,
-            Err(error) => {
-                eprintln!(
-                    "{}",
-                    json!({
-                        "event": "READ_TIME_PATCH_INDEX_UNAVAILABLE",
-                        "dataset_root": dataset_root.display().to_string(),
-                        "session_id": session_id,
-                        "wanted_events": wanted_event_ids.len(),
-                        "error": error,
-                    })
-                );
-                return None;
-            }
-        };
+        let built =
+            match RawEventIndex::from_dataset_root_for_event_ids(dataset_root, wanted_event_ids) {
+                Ok(index) => index,
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "READ_TIME_PATCH_INDEX_UNAVAILABLE",
+                            "dataset_root": dataset_root.display().to_string(),
+                            "session_id": session_id,
+                            "wanted_events": wanted_event_ids.len(),
+                            "error": error,
+                        })
+                    );
+                    return None;
+                }
+            };
         let weight_bytes = built.estimated_bytes();
         let index = Arc::new(built);
         let mut inner = self.entries.lock().ok()?;
@@ -296,7 +294,9 @@ impl RawIndexCache {
             };
             if let Some(entry) = inner.by_key.remove(&victim) {
                 inner.bytes = inner.bytes.saturating_sub(entry.weight_bytes);
-                self.counters.cache_evictions.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .cache_evictions
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -534,9 +534,9 @@ fn s1ap_name_for(raw: &Value) -> Option<String> {
         .unwrap_or(0);
     match protocol {
         "S1AP" => Some(decoder_s1ap::message_name(code, kind_from_u32(kind_number))),
-        "NGAP" => Some(
-            decoder_ngap::message_name(code, kind_from_ngap_u32(kind_number)).to_string(),
-        ),
+        "NGAP" => {
+            Some(decoder_ngap::message_name(code, kind_from_ngap_u32(kind_number)).to_string())
+        }
         _ => None,
     }
 }
@@ -556,10 +556,7 @@ fn nas_name_only(raw: &Value) -> Option<String> {
         "NAS-5GSM" | "Nas5gsm" => (false, true, true),
         _ => return None,
     };
-    let message_type = raw
-        .get("message_type")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let message_type = raw.get("message_type").and_then(Value::as_u64).unwrap_or(0);
     if message_type == 0 {
         return Some("NAS chiffré".to_string());
     }
@@ -839,10 +836,7 @@ pub fn recompute_session_participants(events: &[Value]) -> (String, String, Stri
             if role.is_empty() || role == "Unknown endpoint" {
                 continue;
             }
-            let address = event
-                .get(address_key)
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let address = event.get(address_key).and_then(Value::as_str).unwrap_or("");
             let entry = participants.entry(role.to_string()).or_default();
             if !address.is_empty() && !entry.iter().any(|existing| existing == address) {
                 entry.push(address.to_string());
@@ -1069,7 +1063,8 @@ impl CompactJsonlIndex {
         self.last_offset.store(current_offset, Ordering::Relaxed);
         if local_entries > 0 {
             self.entries.fetch_add(local_entries, Ordering::Relaxed);
-            self.bytes_estimate.fetch_add(local_bytes, Ordering::Relaxed);
+            self.bytes_estimate
+                .fetch_add(local_bytes, Ordering::Relaxed);
         }
         if local_collisions > 0 {
             self.hash_collisions
@@ -1262,10 +1257,7 @@ impl CompactJsonlIndexRegistry {
         }
         let bundle = Arc::new(DatasetIndexes { flat, shards });
         let mut guard = self.tracked.lock().unwrap();
-        guard
-            .entry(key)
-            .or_insert_with(|| bundle.clone())
-            .clone()
+        guard.entry(key).or_insert_with(|| bundle.clone()).clone()
     }
 
     /// Pousse l'état agrégé de TOUS les indexes du registre vers les
@@ -1422,7 +1414,9 @@ pub fn extend_items_with_pfcp_siblings_from_jsonl(
     let candidates = pfcp_events_for_keys(&index, &keys);
     let mut added = 0usize;
     for value in candidates.iter() {
-        let Some(event_id) = value.get("event_id").and_then(Value::as_str) else { continue };
+        let Some(event_id) = value.get("event_id").and_then(Value::as_str) else {
+            continue;
+        };
         if event_id.is_empty() || known_event_ids.contains(event_id) {
             continue;
         }
@@ -1438,11 +1432,7 @@ pub fn extend_items_with_pfcp_siblings_from_jsonl(
     Ok(added)
 }
 
-fn collect_pfcp_keys(
-    item: &Value,
-    sequences: &mut BTreeSet<String>,
-    seids: &mut BTreeSet<String>,
-) {
+fn collect_pfcp_keys(item: &Value, sequences: &mut BTreeSet<String>, seids: &mut BTreeSet<String>) {
     // Top-level `pfcp_sequence` (shape JSONL raw de production).
     if let Some(seq) = item.get("pfcp_sequence").and_then(Value::as_str) {
         if !seq.is_empty() {
@@ -1521,7 +1511,11 @@ fn canonical_sort_tuple(item: &Value) -> (String, u64, String) {
     (capture_id, packet_number, event_id)
 }
 
-fn pfcp_event_matches(value: &Value, known_sequences: &BTreeSet<String>, known_seids: &BTreeSet<String>) -> bool {
+fn pfcp_event_matches(
+    value: &Value,
+    known_sequences: &BTreeSet<String>,
+    known_seids: &BTreeSet<String>,
+) -> bool {
     if let Some(seq) = value.get("pfcp_sequence").and_then(Value::as_str) {
         if known_sequences.contains(seq) {
             return true;
@@ -1537,7 +1531,10 @@ fn pfcp_event_matches(value: &Value, known_sequences: &BTreeSet<String>, known_s
             if name == "pfcp_sequence" && known_sequences.contains(val) {
                 return true;
             }
-            if (name == "seid" || name == "f_seid") && val != "0x0000000000000000" && known_seids.contains(val) {
+            if (name == "seid" || name == "f_seid")
+                && val != "0x0000000000000000"
+                && known_seids.contains(val)
+            {
                 return true;
             }
         }
@@ -1562,7 +1559,8 @@ impl PfcpIndex {
     }
 }
 
-type PfcpCache = std::collections::HashMap<PathBuf, (Vec<(PathBuf, u64, u128)>, std::sync::Arc<PfcpIndex>)>;
+type PfcpCache =
+    std::collections::HashMap<PathBuf, (Vec<(PathBuf, u64, u128)>, std::sync::Arc<PfcpIndex>)>;
 static PFCP_EVENT_CACHE: std::sync::LazyLock<std::sync::Mutex<PfcpCache>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(PfcpCache::new()));
 /// Un seul constructeur à la fois (préchauffage et 1re requête ne doivent
@@ -1616,7 +1614,9 @@ fn pfcp_keys(value: &Value) -> Vec<String> {
             }
             match name {
                 "pfcp_sequence" => keys.push(format!("seq:{val}")),
-                "seid" | "f_seid" if val != "0x0000000000000000" => keys.push(format!("seid:{val}")),
+                "seid" | "f_seid" if val != "0x0000000000000000" => {
+                    keys.push(format!("seid:{val}"))
+                }
                 _ => {}
             }
         }
@@ -1639,12 +1639,15 @@ pub fn cached_pfcp_index(dataset_root: &Path) -> Result<std::sync::Arc<PfcpIndex
     if let Some(index) = lookup(&signature) {
         return Ok(index);
     }
-    let _guard = PFCP_INDEX_BUILD.lock().map_err(|_| "PFCP_INDEX_LOCK_POISONED".to_string())?;
+    let _guard = PFCP_INDEX_BUILD
+        .lock()
+        .map_err(|_| "PFCP_INDEX_LOCK_POISONED".to_string())?;
     if let Some(index) = lookup(&signature) {
         return Ok(index);
     }
     let mut files = Vec::new();
-    let mut by_key: std::collections::HashMap<String, Vec<(u32, u64)>> = std::collections::HashMap::new();
+    let mut by_key: std::collections::HashMap<String, Vec<(u32, u64)>> =
+        std::collections::HashMap::new();
     let mut entries = 0usize;
     for (file_idx, (path, _, _)) in signature.iter().enumerate() {
         files.push(path.clone());
@@ -1654,7 +1657,8 @@ pub fn cached_pfcp_index(dataset_root: &Path) -> Result<std::sync::Arc<PfcpIndex
         let mut line = String::new();
         loop {
             line.clear();
-            let read = std::io::BufRead::read_line(&mut reader, &mut line).map_err(|error| error.to_string())?;
+            let read = std::io::BufRead::read_line(&mut reader, &mut line)
+                .map_err(|error| error.to_string())?;
             if read == 0 {
                 break;
             }
@@ -1663,7 +1667,9 @@ pub fn cached_pfcp_index(dataset_root: &Path) -> Result<std::sync::Arc<PfcpIndex
             if !line.contains("\"protocol\":\"PFCP\"") {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
+                continue;
+            };
             let keys = pfcp_keys(&value);
             drop(value);
             if keys.is_empty() {
@@ -1671,11 +1677,18 @@ pub fn cached_pfcp_index(dataset_root: &Path) -> Result<std::sync::Arc<PfcpIndex
             }
             entries += 1;
             for key in keys {
-                by_key.entry(key).or_default().push((file_idx as u32, start));
+                by_key
+                    .entry(key)
+                    .or_default()
+                    .push((file_idx as u32, start));
             }
         }
     }
-    let index = std::sync::Arc::new(PfcpIndex { files, by_key, entries });
+    let index = std::sync::Arc::new(PfcpIndex {
+        files,
+        by_key,
+        entries,
+    });
     if let Ok(mut cache) = PFCP_EVENT_CACHE.lock() {
         cache.insert(dataset_root.to_path_buf(), (signature, index.clone()));
     }
@@ -1693,8 +1706,12 @@ fn pfcp_events_for_keys(index: &PfcpIndex, keys: &BTreeSet<String>) -> Vec<Value
     }
     let mut out = Vec::new();
     for (file_idx, offset) in positions {
-        let Some(path) = index.files.get(file_idx as usize) else { continue };
-        let Ok(mut file) = std::fs::File::open(path) else { continue };
+        let Some(path) = index.files.get(file_idx as usize) else {
+            continue;
+        };
+        let Ok(mut file) = std::fs::File::open(path) else {
+            continue;
+        };
         if file.seek(SeekFrom::Start(offset)).is_err() {
             continue;
         }
@@ -1785,7 +1802,10 @@ fn scan_jsonl_for_pfcp_siblings(
 /// (participants, timestamp_ns, decoded_ie_tree) et placé juste AVANT le
 /// premier event PFCP qui partage son `pfcp_sequence` (la Response) : on
 /// ne retrie pas tout le callflow, son ordre existant est conservé.
-pub fn insert_pfcp_siblings_into_callflow(events: &mut Vec<Value>, dataset_root: &Path) -> Result<usize, String> {
+pub fn insert_pfcp_siblings_into_callflow(
+    events: &mut Vec<Value>,
+    dataset_root: &Path,
+) -> Result<usize, String> {
     let known: BTreeSet<String> = events
         .iter()
         .filter_map(|e| e.get("event_id").and_then(Value::as_str).map(str::to_owned))
@@ -1794,7 +1814,9 @@ pub fn insert_pfcp_siblings_into_callflow(events: &mut Vec<Value>, dataset_root:
     extend_items_with_pfcp_siblings_from_jsonl(&mut scratch, dataset_root)?;
     let mut added = 0usize;
     for raw in scratch.into_iter().filter(|e| {
-        e.get("event_id").and_then(Value::as_str).is_some_and(|id| !known.contains(id))
+        e.get("event_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !known.contains(id))
     }) {
         let converted = raw_event_to_callflow_event(&raw);
         let seq = pfcp_sequence_of(&converted);
@@ -1836,7 +1858,9 @@ fn pfcp_sequence_of(event: &Value) -> Option<String> {
 /// callflow shape are kept as they are.
 pub fn raw_event_to_callflow_event(raw: &Value) -> Value {
     let mut out = raw.clone();
-    let Some(object) = out.as_object_mut() else { return out };
+    let Some(object) = out.as_object_mut() else {
+        return out;
+    };
     let nf = |key: &str| {
         raw.get(key)
             .and_then(|e| e.get("network_function"))
@@ -1854,7 +1878,11 @@ pub fn raw_event_to_callflow_event(raw: &Value) -> Value {
         }
     }
     if !object.contains_key("timestamp_ns") {
-        if let Some(ticks) = raw.get("timestamp").and_then(|t| t.get("raw_ticks")).and_then(Value::as_u64) {
+        if let Some(ticks) = raw
+            .get("timestamp")
+            .and_then(|t| t.get("raw_ticks"))
+            .and_then(Value::as_u64)
+        {
             object.insert("timestamp_ns".into(), Value::String(ticks.to_string()));
         }
     }
@@ -1879,8 +1907,12 @@ pub fn raw_event_to_callflow_event(raw: &Value) -> Value {
         }
         object.insert("decoded_ie_tree".into(), Value::Array(tree));
     }
-    object.entry("association").or_insert_with(|| Value::String("SESSION".into()));
-    object.entry("procedure_group").or_insert_with(|| Value::String("PFCP Session".into()));
+    object
+        .entry("association")
+        .or_insert_with(|| Value::String("SESSION".into()));
+    object
+        .entry("procedure_group")
+        .or_insert_with(|| Value::String("PFCP Session".into()));
     out
 }
 
@@ -1940,8 +1972,7 @@ pub fn extract_identity_summary_from_items(items: &[Value]) -> Option<Value> {
                     guti_pseudonyms.insert(value.to_owned());
                 }
                 "identity_pseudonym" => {
-                    if matches!(eps_mobile_type_code, Some(2) | Some(3))
-                        && imei_pseudonym.is_none()
+                    if matches!(eps_mobile_type_code, Some(2) | Some(3)) && imei_pseudonym.is_none()
                     {
                         imei_pseudonym = Some(value.to_owned());
                     }
@@ -1960,9 +1991,8 @@ pub fn extract_identity_summary_from_items(items: &[Value]) -> Option<Value> {
         return None;
     }
 
-    let to_array = |set: BTreeSet<String>| -> Vec<Value> {
-        set.into_iter().map(Value::String).collect()
-    };
+    let to_array =
+        |set: BTreeSet<String>| -> Vec<Value> { set.into_iter().map(Value::String).collect() };
     Some(serde_json::json!({
         "imsi": Value::Null,
         "imsi_cleartext": Value::Null,
@@ -1977,7 +2007,11 @@ pub fn extract_identity_summary_from_items(items: &[Value]) -> Option<Value> {
 
 fn iter_named_pairs(item: &Value) -> Vec<(&str, &str)> {
     let mut out: Vec<(&str, &str)> = Vec::new();
-    for key in ["session_identifiers", "decoded_ie_tree", "information_elements"] {
+    for key in [
+        "session_identifiers",
+        "decoded_ie_tree",
+        "information_elements",
+    ] {
         let Some(items) = item.get(key).and_then(Value::as_array) else {
             continue;
         };
@@ -2057,12 +2091,7 @@ mod tests {
         })
     }
 
-    fn raw_nas(
-        event_id: &str,
-        parent_event_id: &str,
-        message_type: u8,
-        from_enb: bool,
-    ) -> Value {
+    fn raw_nas(event_id: &str, parent_event_id: &str, message_type: u8, from_enb: bool) -> Value {
         let (src, dst, src_port, dst_port) = if from_enb {
             ("10.77.10.20", "10.77.10.10", 46859u16, 36412u16)
         } else {
@@ -2216,17 +2245,26 @@ mod tests {
 
         // 5. Compteurs.
         assert_eq!(counters.events_seen.load(Ordering::Relaxed), 5);
-        assert!(counters
-            .events_patched_source_participant
-            .load(Ordering::Relaxed)
-            >= 5);
-        assert!(counters
-            .events_patched_destination_participant
-            .load(Ordering::Relaxed)
-            >= 5);
+        assert!(
+            counters
+                .events_patched_source_participant
+                .load(Ordering::Relaxed)
+                >= 5
+        );
+        assert!(
+            counters
+                .events_patched_destination_participant
+                .load(Ordering::Relaxed)
+                >= 5
+        );
         assert!(counters.events_patched_direction.load(Ordering::Relaxed) >= 1);
         assert!(counters.events_patched_message_name.load(Ordering::Relaxed) >= 3);
-        assert_eq!(counters.events_unresolved_participant.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            counters
+                .events_unresolved_participant
+                .load(Ordering::Relaxed),
+            0
+        );
 
         std::fs::remove_file(&jsonl_path).ok();
         std::fs::remove_dir(&dir).ok();
@@ -2421,9 +2459,27 @@ mod tests {
         let jsonl_path = write_jsonl(&dir, &raw);
         let index = RawEventIndex::from_jsonl_path(&jsonl_path).unwrap();
         let mut events = vec![
-            stale_callflow_event("ngap-01", "Unknown endpoint", "Unknown endpoint", "RAN_TO_CORE", "InitialUEMessage"),
-            stale_callflow_event("ngap-02", "Unknown endpoint", "Unknown endpoint", "RAN_TO_CORE", "Registration Request"),
-            stale_callflow_event("ngap-03", "Unknown endpoint", "Unknown endpoint", "RAN_TO_CORE", "Protected 5GMM message"),
+            stale_callflow_event(
+                "ngap-01",
+                "Unknown endpoint",
+                "Unknown endpoint",
+                "RAN_TO_CORE",
+                "InitialUEMessage",
+            ),
+            stale_callflow_event(
+                "ngap-02",
+                "Unknown endpoint",
+                "Unknown endpoint",
+                "RAN_TO_CORE",
+                "Registration Request",
+            ),
+            stale_callflow_event(
+                "ngap-03",
+                "Unknown endpoint",
+                "Unknown endpoint",
+                "RAN_TO_CORE",
+                "Protected 5GMM message",
+            ),
         ];
         let ngap_map = HashMap::from([
             ("10.77.21.20".to_string(), "gNB".to_string()),
@@ -2439,10 +2495,7 @@ mod tests {
             events[1]["message_name"],
             "initialUEMessage · Registration Request"
         );
-        assert_eq!(
-            events[2]["message_name"],
-            "initialUEMessage · NAS chiffré"
-        );
+        assert_eq!(events[2]["message_name"], "initialUEMessage · NAS chiffré");
         std::fs::remove_file(&jsonl_path).ok();
         std::fs::remove_dir(&dir).ok();
     }
@@ -2589,14 +2642,28 @@ mod callflow_pfcp_insert_tests {
         ];
         let added = insert_pfcp_siblings_into_callflow(&mut events, &dir).unwrap();
         assert_eq!(added, 1);
-        let ids: Vec<&str> = events.iter().map(|e| e["event_id"].as_str().unwrap()).collect();
-        assert_eq!(ids, vec!["evt-ngap", "evt-349c72dc0f5510c3", "evt-104645ebe2174b02", "evt-aa1b0ac453b62fd9"]);
+        let ids: Vec<&str> = events
+            .iter()
+            .map(|e| e["event_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "evt-ngap",
+                "evt-349c72dc0f5510c3",
+                "evt-104645ebe2174b02",
+                "evt-aa1b0ac453b62fd9"
+            ]
+        );
         let req = &events[1];
         assert_eq!(req["source_participant"], "SMF");
         assert_eq!(req["destination_participant"], "UPF");
         assert_eq!(req["timestamp_ns"], "1794673477113697742");
         // idempotent
-        assert_eq!(insert_pfcp_siblings_into_callflow(&mut events, &dir).unwrap(), 0);
+        assert_eq!(
+            insert_pfcp_siblings_into_callflow(&mut events, &dir).unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -2608,21 +2675,33 @@ mod pfcp_cache_tests {
 
     #[test]
     fn index_keeps_only_offsets_and_rereads_matching_lines() {
-        let dir = std::env::temp_dir().join(format!("rtp-cache-{}-{}", std::process::id(), line!()));
+        let dir =
+            std::env::temp_dir().join(format!("rtp-cache-{}-{}", std::process::id(), line!()));
         std::fs::create_dir_all(&dir).unwrap();
         let req = |id: &str, seq: &str| json!({"event_id":id,"protocol":"PFCP","pfcp_sequence":seq,"message_name":"PFCP Session Establishment Request"});
         let other = json!({"event_id":"evt-ngap","protocol":"NGAP"});
-        std::fs::write(dir.join("oiran_events.jsonl"), format!("{}\n{}\n", other, req("evt-a", "1"))).unwrap();
+        std::fs::write(
+            dir.join("oiran_events.jsonl"),
+            format!("{}\n{}\n", other, req("evt-a", "1")),
+        )
+        .unwrap();
         let first = cached_pfcp_index(&dir).unwrap();
         assert_eq!(first.entries(), 1);
         let again = cached_pfcp_index(&dir).unwrap();
-        assert!(std::sync::Arc::ptr_eq(&first, &again), "unchanged files must reuse the index");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &again),
+            "unchanged files must reuse the index"
+        );
         let keys: BTreeSet<String> = ["seq:1".to_string()].into_iter().collect();
         let found = pfcp_events_for_keys(&first, &keys);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0]["event_id"], "evt-a");
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(dir.join("oiran_events.jsonl"), format!("{}\n{}\n{}\n", other, req("evt-a", "1"), req("evt-b", "2"))).unwrap();
+        std::fs::write(
+            dir.join("oiran_events.jsonl"),
+            format!("{}\n{}\n{}\n", other, req("evt-a", "1"), req("evt-b", "2")),
+        )
+        .unwrap();
         assert_eq!(cached_pfcp_index(&dir).unwrap().entries(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }

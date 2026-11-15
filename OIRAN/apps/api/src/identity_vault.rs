@@ -268,8 +268,10 @@ fn persist(path: &Path, document: &VaultDocument) -> Result<(), String> {
         .map_err(|error| access_error(&temporary, &error))?;
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|error| access_error(&temporary, &error))?;
-    file.write_all(&bytes).map_err(|error| access_error(&temporary, &error))?;
-    file.sync_all().map_err(|error| access_error(&temporary, &error))?;
+    file.write_all(&bytes)
+        .map_err(|error| access_error(&temporary, &error))?;
+    file.sync_all()
+        .map_err(|error| access_error(&temporary, &error))?;
     fs::rename(&temporary, path).map_err(|error| access_error(path, &error))?;
     ensure_private_file(path)
 }
@@ -312,7 +314,10 @@ mod tests {
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert_eq!(vault.for_session("test-session").unwrap().len(), 1);
         assert_eq!(vault.lookup(&observation().value).unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);
@@ -346,7 +351,10 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("mode=0755"));
-        assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
         let _ = fs::remove_dir_all(root);
     }
 

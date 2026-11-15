@@ -162,9 +162,13 @@ impl SessionFilterIndex {
 
     /// 2.10.1 : clé de tri canonique de pagination. Jamais de `ts`.
     pub fn pagination_key<'a>(&'a self, session_id: &str) -> Option<(&'a str, u64, &'a str)> {
-        self.sessions
-            .get(session_id)
-            .map(|entry| (entry.anchor_capture_id.as_str(), entry.first_packet_number, entry.session_id.as_str()))
+        self.sessions.get(session_id).map(|entry| {
+            (
+                entry.anchor_capture_id.as_str(),
+                entry.first_packet_number,
+                entry.session_id.as_str(),
+            )
+        })
     }
 
     /// 2.10.1 : itération ordonnée par clé canonique pour
@@ -174,7 +178,13 @@ impl SessionFilterIndex {
         let mut rows: Vec<(&str, u64, &str)> = self
             .sessions
             .values()
-            .map(|entry| (entry.anchor_capture_id.as_str(), entry.first_packet_number, entry.session_id.as_str()))
+            .map(|entry| {
+                (
+                    entry.anchor_capture_id.as_str(),
+                    entry.first_packet_number,
+                    entry.session_id.as_str(),
+                )
+            })
             .collect();
         rows.sort();
         rows.into_iter().map(|(_, _, id)| id).collect()
@@ -203,7 +213,8 @@ impl SessionFilterIndex {
                 if !messages.is_empty()
                     && !messages.iter().any(|(iface, name)| {
                         entry.messages.iter().any(|(entry_iface, entry_name)| {
-                            entry_name == name && iface.as_deref().map_or(true, |i| entry_iface == i)
+                            entry_name == name
+                                && iface.as_deref().map_or(true, |i| entry_iface == i)
                         })
                     })
                 {
@@ -376,7 +387,16 @@ mod tests {
         ies: Value,
         semantic_status: &str,
     ) -> CallFlowEvent {
-        event_at(id, interface, protocol, name, ies, semantic_status, "cap-a", 1)
+        event_at(
+            id,
+            interface,
+            protocol,
+            name,
+            ies,
+            semantic_status,
+            "cap-a",
+            1,
+        )
     }
 
     fn event_at(
@@ -494,12 +514,7 @@ mod tests {
             vec!["N2"],
         )];
         let index = SessionFilterIndex::from_flows(&flows);
-        let matches = index.filter(
-            &[],
-            &[(Some("NGAP".into()), "cause=64".into())],
-            true,
-            None,
-        );
+        let matches = index.filter(&[], &[(Some("NGAP".into()), "cause=64".into())], true, None);
         assert_eq!(matches, vec!["s1"]);
         assert!(index
             .filter(
@@ -616,19 +631,55 @@ mod tests {
             flow(
                 "zeta",
                 vec![
-                    event_at("ez1", "N2", "NGAP", "A", serde_json::json!([]), "NORMAL", "cap-a", 42),
-                    event_at("ez2", "N2", "NGAP", "B", serde_json::json!([]), "NORMAL", "cap-a", 7),
+                    event_at(
+                        "ez1",
+                        "N2",
+                        "NGAP",
+                        "A",
+                        serde_json::json!([]),
+                        "NORMAL",
+                        "cap-a",
+                        42,
+                    ),
+                    event_at(
+                        "ez2",
+                        "N2",
+                        "NGAP",
+                        "B",
+                        serde_json::json!([]),
+                        "NORMAL",
+                        "cap-a",
+                        7,
+                    ),
                 ],
                 vec!["N2"],
             ),
             flow(
                 "alpha",
-                vec![event_at("ea1", "N2", "NGAP", "A", serde_json::json!([]), "NORMAL", "cap-a", 100)],
+                vec![event_at(
+                    "ea1",
+                    "N2",
+                    "NGAP",
+                    "A",
+                    serde_json::json!([]),
+                    "NORMAL",
+                    "cap-a",
+                    100,
+                )],
                 vec!["N2"],
             ),
             flow(
                 "mid",
-                vec![event_at("em1", "N2", "NGAP", "A", serde_json::json!([]), "NORMAL", "cap-b", 1)],
+                vec![event_at(
+                    "em1",
+                    "N2",
+                    "NGAP",
+                    "A",
+                    serde_json::json!([]),
+                    "NORMAL",
+                    "cap-b",
+                    1,
+                )],
                 vec!["N2"],
             ),
         ];
@@ -640,7 +691,10 @@ mod tests {
         assert_eq!(index.ids_sorted(), vec!["zeta", "alpha", "mid"]);
         // Clé publique cohérente.
         assert_eq!(index.pagination_key("zeta"), Some(("cap-a", 7u64, "zeta")));
-        assert_eq!(index.pagination_key("alpha"), Some(("cap-a", 100u64, "alpha")));
+        assert_eq!(
+            index.pagination_key("alpha"),
+            Some(("cap-a", 100u64, "alpha"))
+        );
         assert_eq!(index.pagination_key("mid"), Some(("cap-b", 1u64, "mid")));
     }
 

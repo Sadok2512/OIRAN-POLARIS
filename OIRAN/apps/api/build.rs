@@ -6,7 +6,8 @@
 use std::{env, fs, path::PathBuf};
 
 fn main() {
-    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let web_package_json = manifest_dir
         .parent()
         .expect("apps/")
@@ -27,11 +28,17 @@ fn main() {
         .find(needle)
         .unwrap_or_else(|| panic!("apps/web/package.json: no \"version\" key"));
     let after = &text[start + needle.len()..];
-    let colon = after.find(':').expect("apps/web/package.json: \"version\" needs :");
+    let colon = after
+        .find(':')
+        .expect("apps/web/package.json: \"version\" needs :");
     let after = &after[colon + 1..];
-    let open = after.find('"').expect("apps/web/package.json: \"version\" value open");
+    let open = after
+        .find('"')
+        .expect("apps/web/package.json: \"version\" value open");
     let after = &after[open + 1..];
-    let close = after.find('"').expect("apps/web/package.json: \"version\" value close");
+    let close = after
+        .find('"')
+        .expect("apps/web/package.json: \"version\" value close");
     let version = &after[..close];
     assert!(
         !version.is_empty() && version.chars().all(|c| c.is_ascii() && c != '\n'),

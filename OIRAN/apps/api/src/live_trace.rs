@@ -64,7 +64,13 @@ impl LiveTraceRegistry {
             audit: Mutex::new(VecDeque::new()),
         }
     }
-    fn audit(&self, entry: Value) { let mut audit=self.audit.lock().unwrap(); audit.push_front(entry); while audit.len()>500 { audit.pop_back(); } }
+    fn audit(&self, entry: Value) {
+        let mut audit = self.audit.lock().unwrap();
+        audit.push_front(entry);
+        while audit.len() > 500 {
+            audit.pop_back();
+        }
+    }
     fn purge(map: &mut HashMap<String, TraceState>) {
         let now = epoch_seconds();
         map.retain(|_, state| state.trace.expires_at > now);
@@ -101,7 +107,15 @@ impl LiveTraceRegistry {
         let mut traces = self.traces.lock().unwrap();
         Self::purge(&mut traces);
         for state in traces.values_mut() {
-            if !state.trace.interfaces.is_empty() && !state.trace.interfaces.iter().any(|item|item.eq_ignore_ascii_case(&event.interface)) { continue; }
+            if !state.trace.interfaces.is_empty()
+                && !state
+                    .trace
+                    .interfaces
+                    .iter()
+                    .any(|item| item.eq_ignore_ascii_case(&event.interface))
+            {
+                continue;
+            }
             let matched = state
                 .trace
                 .subscriber_pseudonyms
@@ -115,7 +129,7 @@ impl LiveTraceRegistry {
             if let Some(ids) = value.get("session_identifiers").and_then(Value::as_array) {
                 for id in ids {
                     if let Some(v) = id.get("value").and_then(Value::as_str) {
-                    if v.len() >= 3 && v.parse::<std::net::IpAddr>().is_err() {
+                        if v.len() >= 3 && v.parse::<std::net::IpAddr>().is_err() {
                             state.keys.insert(v.to_owned());
                         }
                     }
@@ -148,11 +162,53 @@ impl LiveTraceRegistry {
                 state.events.pop_front();
             }
             let _ = state.tx.send(item);
-            let second=event.timestamp.seconds.max(0) as u64;
-            if event.protocol.as_str()=="GTP-U" { if state.throughput_second!=0 && state.throughput_second!=second { state.next_id+=1; let rate=BufferedEvent{id:state.next_id,kind:"throughput".into(),payload:json!({"second":state.throughput_second,"ul_bytes_s":state.ul_bytes,"dl_bytes_s":state.dl_bytes})}; state.events.push_back(rate.clone());let _=state.tx.send(rate);state.ul_bytes=0;state.dl_bytes=0;} state.throughput_second=second; let bytes=event.packet_references.first().map(|p|u64::from(p.original_length)).unwrap_or(0); if event.direction.as_str()=="UPLINK"{state.ul_bytes+=bytes}else if event.direction.as_str()=="DOWNLINK"{state.dl_bytes+=bytes} }
-            if let Some(procedure)=event.procedure.as_deref(){state.next_id+=1;let update=BufferedEvent{id:state.next_id,kind:"procedure".into(),payload:json!({"procedure":procedure,"phase":"update","event_id":event.event_id})};state.events.push_back(update.clone());let _=state.tx.send(update);}
-            state.next_id+=1;let info=BufferedEvent{id:state.next_id,kind:"ue_info".into(),payload:json!({"technology":if event.interface.starts_with('S'){"LTE"}else{"5G"},"keys":state.keys})};state.events.push_back(info.clone());let _=state.tx.send(info);
-            while state.events.len()>MAX_EVENTS{state.events.pop_front();}
+            let second = event.timestamp.seconds.max(0) as u64;
+            if event.protocol.as_str() == "GTP-U" {
+                if state.throughput_second != 0 && state.throughput_second != second {
+                    state.next_id += 1;
+                    let rate = BufferedEvent {
+                        id: state.next_id,
+                        kind: "throughput".into(),
+                        payload: json!({"second":state.throughput_second,"ul_bytes_s":state.ul_bytes,"dl_bytes_s":state.dl_bytes}),
+                    };
+                    state.events.push_back(rate.clone());
+                    let _ = state.tx.send(rate);
+                    state.ul_bytes = 0;
+                    state.dl_bytes = 0;
+                }
+                state.throughput_second = second;
+                let bytes = event
+                    .packet_references
+                    .first()
+                    .map(|p| u64::from(p.original_length))
+                    .unwrap_or(0);
+                if event.direction.as_str() == "UPLINK" {
+                    state.ul_bytes += bytes
+                } else if event.direction.as_str() == "DOWNLINK" {
+                    state.dl_bytes += bytes
+                }
+            }
+            if let Some(procedure) = event.procedure.as_deref() {
+                state.next_id += 1;
+                let update = BufferedEvent {
+                    id: state.next_id,
+                    kind: "procedure".into(),
+                    payload: json!({"procedure":procedure,"phase":"update","event_id":event.event_id}),
+                };
+                state.events.push_back(update.clone());
+                let _ = state.tx.send(update);
+            }
+            state.next_id += 1;
+            let info = BufferedEvent {
+                id: state.next_id,
+                kind: "ue_info".into(),
+                payload: json!({"technology":if event.interface.starts_with('S'){"LTE"}else{"5G"},"keys":state.keys}),
+            };
+            state.events.push_back(info.clone());
+            let _ = state.tx.send(info);
+            while state.events.len() > MAX_EVENTS {
+                state.events.pop_front();
+            }
         }
     }
 }
@@ -199,27 +255,44 @@ fn start_reader(state: AppState) {
                         "N2", "N4", "N3", "SBI", "S1-MME", "S11", "S5-C", "S5-U", "S1-U", "Sxab",
                         "S6a", "IMS",
                     ] {
-                        let directory=match interface {"S1-MME"=>"s1mme","S1-U"=>"s1u","S5-C"=>"s5c","S5-U"=>"s5u",other=>other};
+                        let directory = match interface {
+                            "S1-MME" => "s1mme",
+                            "S1-U" => "s1u",
+                            "S5-C" => "s5c",
+                            "S5-U" => "s5u",
+                            other => other,
+                        };
                         let dir = root.join(directory.to_ascii_lowercase());
                         let Ok(entries) = fs::read_dir(dir) else {
                             continue;
                         };
-                        let Some(path)=entries.flatten().map(|entry|entry.path()).filter(|path|path.extension().and_then(|v|v.to_str())==Some("pcapng")).max_by_key(|path|path.metadata().and_then(|m|m.modified()).ok()) else{continue};
-                        let capture_id = format!("sha256:{}",sha256_hex(path.to_string_lossy().as_bytes()));
-                            let config = oiran_decode::DecodeConfig {
-                                input: path,
-                                capture_id,
-                                interface: interface.into(),
-                                endpoints: HashMap::new(),
-                            };
-                            let _ =
-                                oiran_decode::decode_capture_streaming(&config, &key, |event| {
-                                    if prior.insert(event.event_id.clone()) {
-                                        state2.inner.live_traces.route_normalized(&event);
-                                    }
-                                    Ok(())
-                                });
-                        if prior.len()>200_000 { prior.clear(); }
+                        let Some(path) = entries
+                            .flatten()
+                            .map(|entry| entry.path())
+                            .filter(|path| {
+                                path.extension().and_then(|v| v.to_str()) == Some("pcapng")
+                            })
+                            .max_by_key(|path| path.metadata().and_then(|m| m.modified()).ok())
+                        else {
+                            continue;
+                        };
+                        let capture_id =
+                            format!("sha256:{}", sha256_hex(path.to_string_lossy().as_bytes()));
+                        let config = oiran_decode::DecodeConfig {
+                            input: path,
+                            capture_id,
+                            interface: interface.into(),
+                            endpoints: HashMap::new(),
+                        };
+                        let _ = oiran_decode::decode_capture_streaming(&config, &key, |event| {
+                            if prior.insert(event.event_id.clone()) {
+                                state2.inner.live_traces.route_normalized(&event);
+                            }
+                            Ok(())
+                        });
+                        if prior.len() > 200_000 {
+                            prior.clear();
+                        }
                     }
                     prior
                 })
@@ -349,7 +422,10 @@ pub(crate) async fn create(
             next_id: 0,
             events: VecDeque::new(),
             tx,
-            keys: HashSet::new(), throughput_second:0, ul_bytes:0, dl_bytes:0,
+            keys: HashSet::new(),
+            throughput_second: 0,
+            ul_bytes: 0,
+            dl_bytes: 0,
         },
     );
     drop(traces);
@@ -392,15 +468,12 @@ pub(crate) async fn remove(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let role=match require_csrf(&state,&headers){Ok(role)=>role,Err(e)=>return e};
-    let removed = state
-        .inner
-        .live_traces
-        .traces
-        .lock()
-        .unwrap()
-        .remove(&id);
-    let Some(removed)=removed else {
+    let role = match require_csrf(&state, &headers) {
+        Ok(role) => role,
+        Err(e) => return e,
+    };
+    let removed = state.inner.live_traces.traces.lock().unwrap().remove(&id);
+    let Some(removed) = removed else {
         return api_error(
             StatusCode::NOT_FOUND,
             "LIVE_TRACE_NOT_FOUND",
@@ -411,7 +484,20 @@ pub(crate) async fn remove(
     live_ok(json!({"trace_id":id,"deleted":true}))
 }
 
-pub(crate) async fn audit(State(state):State<AppState>,headers:HeaderMap)->Response { if let Err(e)=require_operator(&state,&headers){return e}; live_ok(json!(state.inner.live_traces.audit.lock().unwrap().iter().cloned().collect::<Vec<_>>())) }
+pub(crate) async fn audit(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = require_operator(&state, &headers) {
+        return e;
+    };
+    live_ok(json!(state
+        .inner
+        .live_traces
+        .audit
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()))
+}
 pub(crate) async fn marker(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -460,7 +546,7 @@ pub(crate) async fn stream(
     Path(id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<StreamQuery>,
 ) -> Response {
-    let role=role_from_headers(&state,&headers);
+    let role = role_from_headers(&state, &headers);
     // 2.16.0 (ANR1 #10 Live-IMSI) — reprise après pause front : le
     // navigateur gère Last-Event-ID nativement sur reconnect SSE,
     // mais EventSource n'accepte pas d'envoyer de header custom en
@@ -484,7 +570,13 @@ pub(crate) async fn stream(
                 "trace not found",
             );
         };
-        if s.trace.key_type != "pseudonym" && !role.can_control() { return api_error(StatusCode::FORBIDDEN,"OPERATOR_REQUIRED","operator role required for identity trace"); }
+        if s.trace.key_type != "pseudonym" && !role.can_control() {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "OPERATOR_REQUIRED",
+                "operator role required for identity trace",
+            );
+        }
         // 2.16.0 (ANR1 #10 Live-IMSI) — snapshot atomique du replay
         // sous le lock mutex : (a) on filtre les events d'id > after,
         // (b) on les trie de façon STABLE par la clé canonique prod
@@ -587,10 +679,7 @@ pub(crate) async fn sessions_for_trace(
     }))
 }
 
-fn correlate_sessions_by_pseudonyms(
-    state: &AppState,
-    pseudos: &HashSet<String>,
-) -> Vec<Value> {
+fn correlate_sessions_by_pseudonyms(state: &AppState, pseudos: &HashSet<String>) -> Vec<Value> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut matches: Vec<Value> = Vec::new();
     let session_matches = |session_id: &str| -> bool {
@@ -635,12 +724,34 @@ mod tests {
     use super::*;
     fn state(expires_at: u64, armed: bool, keys: Vec<String>) -> TraceState {
         let (tx, _) = broadcast::channel(MAX_EVENTS);
-        TraceState { trace: LiveTrace { trace_id:"t".into(), key_type:"pseudonym".into(), subscriber_pseudonyms:keys, interfaces:vec![], created_at:0, expires_at, armed, messages:0, markers:0 }, next_id:0, events:VecDeque::new(), tx, keys:HashSet::new(), throughput_second:0, ul_bytes:0, dl_bytes:0 }
+        TraceState {
+            trace: LiveTrace {
+                trace_id: "t".into(),
+                key_type: "pseudonym".into(),
+                subscriber_pseudonyms: keys,
+                interfaces: vec![],
+                created_at: 0,
+                expires_at,
+                armed,
+                messages: 0,
+                markers: 0,
+            },
+            next_id: 0,
+            events: VecDeque::new(),
+            tx,
+            keys: HashSet::new(),
+            throughput_second: 0,
+            ul_bytes: 0,
+            dl_bytes: 0,
+        }
     }
     #[test]
     fn bounded_buffer() {
         let r = LiveTraceRegistry::new();
-        r.traces.lock().unwrap().insert("t".into(), state(u64::MAX,true,vec![]));
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, true, vec![]));
         for n in 0..2100 {
             r.append("t", "message", json!({"n":n}));
         }
@@ -653,24 +764,95 @@ mod tests {
 
     #[test]
     fn expiration_and_last_event_id_are_deterministic() {
-        let r=LiveTraceRegistry::new(); r.traces.lock().unwrap().insert("old".into(),state(1,true,vec![])); r.traces.lock().unwrap().insert("t".into(),state(u64::MAX,true,vec![]));
-        for n in 0..4 { r.append("t","message",json!({"n":n})); }
-        let mut traces=r.traces.lock().unwrap(); LiveTraceRegistry::purge(&mut traces); assert!(!traces.contains_key("old"));
-        let replay=traces["t"].events.iter().filter(|event|event.id>2).map(|event|event.id).collect::<Vec<_>>(); assert_eq!(replay,vec![3,4]);
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("old".into(), state(1, true, vec![]));
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, true, vec![]));
+        for n in 0..4 {
+            r.append("t", "message", json!({"n":n}));
+        }
+        let mut traces = r.traces.lock().unwrap();
+        LiveTraceRegistry::purge(&mut traces);
+        assert!(!traces.contains_key("old"));
+        let replay = traces["t"]
+            .events
+            .iter()
+            .filter(|event| event.id > 2)
+            .map(|event| event.id)
+            .collect::<Vec<_>>();
+        assert_eq!(replay, vec![3, 4]);
     }
 
     #[test]
     fn growing_pcapng_emits_complete_packets_before_partial_tail() {
-        let source=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
-        let bytes=fs::read(&source).unwrap(); assert!(bytes.len()>64); let path=std::env::temp_dir().join(format!("oiran-live-partial-{}.pcapng",std::process::id())); fs::write(&path,&bytes[..bytes.len()-7]).unwrap();
-        let config=oiran_decode::DecodeConfig{input:path.clone(),capture_id:format!("sha256:{}","a".repeat(64)),interface:"N2".into(),endpoints:HashMap::new()}; let key=event_schema::PseudonymKey::from_bytes([7;32]); let mut partial=Vec::new(); let _=oiran_decode::decode_capture_streaming(&config,&key,|event|{partial.push(event);Ok(())}); assert!(!partial.is_empty());
-        fs::write(&path,&bytes).unwrap(); let mut complete=0; oiran_decode::decode_capture_streaming(&config,&key,|_|{complete+=1;Ok(())}).unwrap(); assert!(complete>=partial.len()); let _=fs::remove_file(path);
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let bytes = fs::read(&source).unwrap();
+        assert!(bytes.len() > 64);
+        let path =
+            std::env::temp_dir().join(format!("oiran-live-partial-{}.pcapng", std::process::id()));
+        fs::write(&path, &bytes[..bytes.len() - 7]).unwrap();
+        let config = oiran_decode::DecodeConfig {
+            input: path.clone(),
+            capture_id: format!("sha256:{}", "a".repeat(64)),
+            interface: "N2".into(),
+            endpoints: HashMap::new(),
+        };
+        let key = event_schema::PseudonymKey::from_bytes([7; 32]);
+        let mut partial = Vec::new();
+        let _ = oiran_decode::decode_capture_streaming(&config, &key, |event| {
+            partial.push(event);
+            Ok(())
+        });
+        assert!(!partial.is_empty());
+        fs::write(&path, &bytes).unwrap();
+        let mut complete = 0;
+        oiran_decode::decode_capture_streaming(&config, &key, |_| {
+            complete += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(complete >= partial.len());
+        let _ = fs::remove_file(path);
     }
 
     #[test]
     fn armed_trace_starts_only_on_decoder_key_and_learns_correlations() {
-        let source=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng"); let config=oiran_decode::DecodeConfig{input:source,capture_id:format!("sha256:{}","b".repeat(64)),interface:"N2".into(),endpoints:HashMap::new()}; let key=event_schema::PseudonymKey::from_bytes([9;32]); let mut events=Vec::new(); oiran_decode::decode_capture_streaming(&config,&key,|event|{events.push(event);Ok(())}).unwrap();
-        let first=events.iter().find(|event|!event.session_identifiers.is_empty()).unwrap(); let root=first.session_identifiers[0].value.clone(); let r=LiveTraceRegistry::new(); r.traces.lock().unwrap().insert("t".into(),state(u64::MAX,true,vec![root])); r.route_normalized(first); let traces=r.traces.lock().unwrap(); assert!(!traces["t"].trace.armed); assert_eq!(traces["t"].trace.messages,1); assert!(!traces["t"].keys.is_empty());
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let config = oiran_decode::DecodeConfig {
+            input: source,
+            capture_id: format!("sha256:{}", "b".repeat(64)),
+            interface: "N2".into(),
+            endpoints: HashMap::new(),
+        };
+        let key = event_schema::PseudonymKey::from_bytes([9; 32]);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&config, &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        let first = events
+            .iter()
+            .find(|event| !event.session_identifiers.is_empty())
+            .unwrap();
+        let root = first.session_identifiers[0].value.clone();
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, true, vec![root]));
+        r.route_normalized(first);
+        let traces = r.traces.lock().unwrap();
+        assert!(!traces["t"].trace.armed);
+        assert_eq!(traces["t"].trace.messages, 1);
+        assert!(!traces["t"].keys.is_empty());
     }
 
     /// 2.16.0 (ANR1 #10 Live-IMSI) — `canonical_sort_key` trie le
@@ -733,9 +915,21 @@ mod tests {
         let (tx, _rx0) = broadcast::channel::<BufferedEvent>(16);
         // 3 events déjà dans le buffer, ids 1..=3.
         let buffer = vec![
-            BufferedEvent { id: 1, kind: "message".into(), payload: json!({"capture_id":"c","packet_number":1}) },
-            BufferedEvent { id: 2, kind: "message".into(), payload: json!({"capture_id":"c","packet_number":2}) },
-            BufferedEvent { id: 3, kind: "message".into(), payload: json!({"capture_id":"c","packet_number":3}) },
+            BufferedEvent {
+                id: 1,
+                kind: "message".into(),
+                payload: json!({"capture_id":"c","packet_number":1}),
+            },
+            BufferedEvent {
+                id: 2,
+                kind: "message".into(),
+                payload: json!({"capture_id":"c","packet_number":2}),
+            },
+            BufferedEvent {
+                id: 3,
+                kind: "message".into(),
+                payload: json!({"capture_id":"c","packet_number":3}),
+            },
         ];
         // Un subscriber est fait AU MOMENT où le buffer contient
         // déjà ces 3 events. Il n'a rien reçu encore (channel vide).
@@ -745,8 +939,16 @@ mod tests {
         // verra. On broadcast AUSSI un retardataire d'id=3 (edge
         // case : une re-push accidentelle d'un event déjà dans le
         // replay). Le filter (id > cutoff_id) doit l'éliminer.
-        let _ = tx.send(BufferedEvent { id: 3, kind: "message".into(), payload: json!({"capture_id":"c","packet_number":3}) });
-        let _ = tx.send(BufferedEvent { id: 4, kind: "message".into(), payload: json!({"capture_id":"c","packet_number":4}) });
+        let _ = tx.send(BufferedEvent {
+            id: 3,
+            kind: "message".into(),
+            payload: json!({"capture_id":"c","packet_number":3}),
+        });
+        let _ = tx.send(BufferedEvent {
+            id: 4,
+            kind: "message".into(),
+            payload: json!({"capture_id":"c","packet_number":4}),
+        });
         let cutoff_id = buffer.iter().map(|e| e.id).max().unwrap();
         assert_eq!(cutoff_id, 3);
         // Maintenant on consume ce que verrait le filter `e.id > cutoff_id`.

@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.18.1 — 2026-11-15 — Câblage des identités SBI dans `/api/v1/sessions` (patch)
+
+- `lib.rs` : `merge_sbi_identities` complète l'objet `identities` de la liste `/api/v1/sessions` (sessions statiques et continuous) avec `msisdn` (depuis `msisdn_pseudonym`) et `imei` (depuis `imei_pseudonym`, sinon `imeisv_pseudonym`, `imei_type` = IMEI/IMEISV) lus dans les events SBI du call flow (`decoded_ie_tree`, identifiants publiés par decoder-sbi 2.18.0).
+- Le vault garde la priorité ; la source est exposée (`msisdn_source`, `imei_source` = `SBI:<service>:<opération> (capture·event)`).
+- Aucune déduction : identifiant absent ou event non SBI → rien. Valeurs pseudonymisées (jamais de MSISDN/IMEI en clair).
+- 3 tests (`sbi_identity_wiring_tests`).
+- Ouvert : la route détail `/sessions/:id/identities` (`identity_bundle`) n'est pas encore alimentée par le SBI.
+
 ## OIRAN API 2.18.0 — 2026-11-15 — Identités MSISDN + IMEI/IMEISV depuis le SBI (ANR1 #10 E2E-5G)
 
 Lot sur branche dédiée `feat/oiran-api-2.18.0-sbi-identities` (depuis `177135e`), pour ne pas bouger `feat/oiran-api-e2e-5g` qu'ANR1 déploie.
