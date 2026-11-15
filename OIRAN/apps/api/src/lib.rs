@@ -1113,7 +1113,7 @@ fn spawn_compact_index_workers(
         };
         if let Some(root) = root {
             tokio::task::spawn_blocking(move || {
-                let _ = read_time_patch::cached_pfcp_events(&root);
+                let _ = read_time_patch::cached_pfcp_index(&root);
             });
         }
     }

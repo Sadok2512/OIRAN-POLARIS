@@ -1,5 +1,21 @@
 # Changelog
 
+## OIRAN API 2.15.5 — 2026-11-15 — Index PFCP sans OOM (patch)
+
+- Corrige le FAIL ANR1 #10 6895136076 : OOM (MemoryMax=4G, anon-rss
+  4 184 972 kB) au premier GET /events avec 2.15.4. Cause dans le code :
+  le cache 2.15.4 gardait en mémoire TOUS les events PFCP complets (arbres
+  d'IE) du dataset, et le préchauffage pouvait le construire en même temps
+  que la première requête.
+- Remplacé par un index léger : par event PFCP seulement (fichier, offset)
+  rangé par clé `pfcp_sequence` / `seid` ; les lignes utiles sont relues sur
+  disque à la demande. Un seul constructeur à la fois (mutex).
+- Mesure : 1,2 Go de JSONL, 400 000 events PFCP → index de 400 000 entrées,
+  RSS max 144 168 kB, 5,17 s (`/usr/bin/time -v` sur la sonde
+  `pfcp_index_memory_probe`, ignorée par défaut).
+- `cargo test --release --workspace` : 567 OK / 0 FAIL / 10 ignorés.
+
+
 ## OIRAN API 2.15.4 — 2026-11-15 — Détail de session rapide (patch)
 
 - Corrige le FAIL ANR1 #10 6894872305 : avec 2.15.3, les GET de détail
