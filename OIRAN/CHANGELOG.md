@@ -1,5 +1,84 @@
 # Changelog
 
+## OIRAN API 2.18.3 — 2026-11-15 — SBI dedup + telemetry overflow (patch)
+
+Deux fixes ciblés sur la branche `feat/oiran-api-2.18.0-sbi-identities` (même branche que 2.18.0/1/2, pas de nouvelle branche).
+
+### Fix (a) — SBI continuous collisions dans `publication_semantic_key`
+
+**FAIL prod ANR1 #10 6898944250** : session `5g-session-99e8a9a6f5a0d5af` — 0 event SBI rattaché (callflow : 9 N2 / 2 N3 / 8 N4 / **0 SBI**), `correlation_status.N2_SBI` et `SBI_N4` à `UNKNOWN` malgré le fix 2.17.1 (indexation GTP-U) et le câblage attach_sbi_to_sessions.
+
+**Cause prouvée par audit** du chemin continuous (`live-probe:5853 publish_events_to_dataset_dir → discover_sessions`) : la fonction `publication_semantic_key` (`session-engine/src/lib.rs:1053-1162`) **ne distinguait pas** les opérations SBI consécutives sur la même PDU session. Plusieurs events SBI du même pseudonyme + même `pdu_session_id` + même `message_name` (ex. 3 `CreateSMContext` successifs) collisionnaient sur une clé unique → `representatives.insert(key, event)` (ligne 943 dans `load_paths_streaming_representatives_with_progress`) ne retenait **que le dernier** → `discover_sessions` recevait un seul event SBI (ou aucun) → `attach_sbi_to_sessions` avait 0 event SBI à rattacher → callflow produit avec 0 SBI.
+
+La liste `preserve_occurrence` (ligne 1133-1139) ne listait que NGAP/S1AP/GTPv2-C/PFCP setup — **pas SBI-HTTP2**.
+
+**Fix 2.18.3** : ajout de `protocol_is(event, "SBI-HTTP2")` à la condition `preserve_occurrence`. Chaque event SBI est maintenant distingué par `(capture_id, packet_number)` dans la clé semantic. Les events GTP-U data-plane restent compactés (vital pour la mémoire — explosion 4 GiB observée en 2.11.12 si on désactive partout).
+
+### Fix (b) — telemetry `queue_occupancy` underflow panic
+
+**Tests intermittents** : `worker-runtime::tests::four_worker_accounting_has_no_silent_loss` et `queue_saturation_is_bounded_and_accounted` échouaient par intermittence avec « attempt to add with overflow » à `telemetry/src/lib.rs:108`.
+
+**Cause prouvée par lecture** :
+
+- `dequeue()` (ligne 124) faisait `queue_occupancy.fetch_sub(1, Ordering::Relaxed)`. Appelé AVANT tout `enqueue()` (cas d'ordonnancement non-strict dans worker-runtime), le compteur `AtomicUsize` passait de `0` à `usize::MAX` par wrap.
+- `enqueue()` (ligne 108) faisait `fetch_add(1) + 1`. Avec `fetch_add` renvoyant `usize::MAX`, le `+ 1` paniquait en debug (`attempt to add with overflow`).
+
+**Fix 2.18.3** :
+
+- `dequeue()` : **CAS saturant à 0**. Si `current == 0`, return sans décrémenter. Invariant anti-underflow garanti par construction.
+- `enqueue()` : **CAS saturant à `usize::MAX`**. Si `current == usize::MAX`, return sans incrémenter. Combiné au fix dequeue, l'invariant `0 ≤ queue_occupancy ≤ usize::MAX` est garanti.
+
+### Tests ajoutés (6 unitaires)
+
+session-engine :
+- `publication_semantic_key_preserves_each_sbi_operation_occurrence_anr1_6898944250` — 2 SBI `CreateSMContext` consécutifs + 1 SBI `N1N2MessageTransfer` → 3 clés semantic distinctes.
+- `publication_semantic_key_still_compacts_gtpu_data_plane` — 2 GTP-U successifs → même clé (compactage préservé).
+- `sbi_events_survive_representatives_dedup_anr1_6898944250` — JSONL de 3 SBI identiques (même pseudo+pdu+message_name) passé dans `load_paths_streaming_representatives_with_progress` → **3** events survivent (avant 2.18.3 : 1 seul).
+
+telemetry :
+- `dequeue_on_empty_queue_stays_at_zero_no_underflow` — invariant anti-underflow.
+- `enqueue_dequeue_updates_occupancy_and_high_watermark` — comportement normal préservé.
+- `interleaved_dequeue_and_enqueue_never_panics` — 16 threads × 1000 ops en alternance, pas de panic.
+
+### Stabilité worker-runtime (20 exécutions)
+
+```
+$ for i in $(seq 1 20); do
+    cargo test --release --offline -p worker-runtime --lib -- \
+      four_worker_accounting_has_no_silent_loss \
+      queue_saturation_is_bounded_and_accounted ;
+  done
+# 20/20 passes (0 fail intermittent)
+```
+
+### Preuves (runner devmat, 2026-11-15)
+
+```
+$ cargo test --release --offline -p session-engine --lib -- \
+    publication_semantic_key sbi_events_survive
+# test result: ok. 3 passed; 0 failed
+
+$ cargo test --release --offline -p telemetry --lib
+# test result: ok. 3 passed; 0 failed
+
+$ cargo test --release --offline --workspace --no-fail-fast
+# exit=0 ; 77 suites, 596 passed, 0 failed, 10 ignored
+# +6 vs 590 en 2.18.2 : 3 session-engine + 3 telemetry
+```
+
+### Points OUVERTS (jamais par hypothèse)
+
+- **Validation sur données prod** : la cause SBI est identifiée par audit statique de `publication_semantic_key` + test qui reproduit la collision. L'extrait JSONL de la session `5g-session-99e8a9a6f5a0d5af` demandé en lecture seule à ANR1 permettra de confirmer le nombre exact d'events SBI perdus avant 2.18.3 vs retenus après. La demande est postée sur #10.
+- **worker-runtime race observable** : le CAS corrige l'invariant arithmétique, mais la racine logique (dequeue précédant enqueue) peut rester dans le code applicatif. Cas documenté dans `interleaved_dequeue_and_enqueue_never_panics` — à traquer dans un lot ultérieur si une analyse profilée du worker-runtime en expose les symptômes.
+
+### Hors périmètre respecté
+
+- `apps/api/src/lib.rs` : INTACTE (sauf bump version Cargo.toml).
+- `apps/api/src/read_time_patch.rs` : INTACTE.
+- `POLARIS_CONTROL/`, `apps/control/` : INTACTES.
+
+Bump patch : `oiran-api 2.18.2 → 2.18.3`.
+
 ## OIRAN API 2.18.2 — 2026-11-15 — PFCP siblings bornés à l'interface de la session (patch)
 
 - `read_time_patch` : un event PFCP du JSONL n'est rattaché comme sibling que s'il est sur une interface déjà portée par la session (N4 pour le 5G, Sxa/Sxb pour le LTE). `pfcp_sequence` et les SEID Open5GS sont de petits compteurs par nœud qui se répètent entre N4 et Sxab : la session 5G `5g-session-99e8…` aspirait 48 events Sxab (ANR1 #10 6898944250).

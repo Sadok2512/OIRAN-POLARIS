@@ -1125,6 +1125,19 @@ fn publication_semantic_key(event: &EventRecord) -> String {
     // both legitimate (for example a second PDU resource setup in one UE
     // context). Preserve their canonical packet occurrence while keeping
     // high-volume PFCP modifications and GTP-U data compacted.
+    //
+    // 2.18.3 (ANR1 #10 6898944250) — SBI-HTTP2 ajouté : la clé
+    // semantic pré-2.18.3 ne distinguait pas deux opérations SBI
+    // consécutives sur la même PDU session (même pseudonyme, même
+    // pdu_session_id, même message_name « CreateSMContext » → même
+    // clé → `representatives.insert` ne gardait que le dernier).
+    // Résultat prod : pour la session `5g-session-99e8a9a6f5a0d5af`,
+    // les events SBI étaient PERDUS avant `discover_sessions` →
+    // `attach_sbi_to_sessions` avait 0 event SBI à rattacher →
+    // callflow `9 N2 / 2 N3 / 8 N4 / 0 SBI` observé par Sadok.
+    // Les events SBI sont des procédures (pas des échantillons
+    // périodiques comme GTP-U) ; on les préserve tous par
+    // `(capture_id, packet_number)`.
     let procedure = event
         .message_name
         .to_ascii_lowercase()
@@ -1136,7 +1149,8 @@ fn publication_semantic_key(event: &EventRecord) -> String {
             && (procedure.contains("initialcontextsetup")
                 || procedure.contains("erabsetup")))
         || (protocol_is(event, "GTPv2-C") && procedure.contains("createsession"))
-        || (protocol_is(event, "PFCP") && procedure.contains("sessionestablishment"));
+        || (protocol_is(event, "PFCP") && procedure.contains("sessionestablishment"))
+        || protocol_is(event, "SBI-HTTP2");
     let distinct_procedure_occurrence = preserve_occurrence
         .then(|| {
             event.packet_references.first().map_or_else(
@@ -4574,5 +4588,125 @@ mod tests {
         assert!(summary.msisdn_pseudonym.is_none());
         assert!(summary.imei_pseudonym.is_none());
         assert!(summary.imeisv_pseudonym.is_none());
+    }
+
+    /// 2.18.3 (ANR1 #10 6898944250) — reproduit le FAIL prod sur
+    /// `5g-session-99e8a9a6f5a0d5af` : plusieurs events SBI du même
+    /// pseudonyme + PDU session + message_name collisionnaient sur
+    /// une `publication_semantic_key` identique → `load_paths_
+    /// streaming_representatives` ne retenait qu'un seul event SBI
+    /// (le dernier) → `attach_sbi_to_sessions` avait 0 SBI à
+    /// rattacher. Le fix 2.18.3 ajoute SBI-HTTP2 à
+    /// `preserve_occurrence`, chaque event SBI est distingué par
+    /// `(capture_id, packet_number)` et tous sont retenus.
+    #[test]
+    fn publication_semantic_key_preserves_each_sbi_operation_occurrence_anr1_6898944250() {
+        let make = |event_id: &str, packet: u64, name: &str| {
+            let mut e = event(
+                event_id,
+                "SBI-HTTP2",
+                name,
+                &[
+                    ("subscriber_pseudonym", "psn-supi-abc"),
+                    ("pdu_session_id", "1"),
+                ],
+                packet,
+            );
+            // Toutes les opérations SBI sur le même capture + même
+            // couple source/dest/direction → clé 100 % identique
+            // en-dehors du packet_number.
+            e.capture_id = "sha256:continuous".into();
+            e.packet_references[0].packet_number = packet;
+            e
+        };
+        let sbi1 = make("evt-sbi-1", 10, "CreateSMContext");
+        let sbi2 = make("evt-sbi-2", 20, "CreateSMContext");
+        let sbi3 = make("evt-sbi-3", 30, "N1N2MessageTransfer");
+        let key1 = publication_semantic_key(&sbi1);
+        let key2 = publication_semantic_key(&sbi2);
+        let key3 = publication_semantic_key(&sbi3);
+        assert_ne!(
+            key1, key2,
+            "deux CreateSMContext consécutifs doivent avoir des clés distinctes (packet_number)"
+        );
+        assert_ne!(key1, key3, "message_name différent → clé différente");
+        assert_ne!(key2, key3);
+    }
+
+    /// 2.18.3 — l'event GTP-U data-plane reste compacté : deux
+    /// paquets GTP-U successifs avec le même tunnel partagent la
+    /// clé (pour éviter l'explosion mémoire 4 GiB déjà rencontrée
+    /// en 2.11.12).
+    #[test]
+    fn publication_semantic_key_still_compacts_gtpu_data_plane() {
+        let make = |event_id: &str, packet: u64| {
+            let mut e = event(
+                event_id,
+                "GTP-U",
+                "G-PDU",
+                &[
+                    ("teid", "0x1234"),
+                    ("tunnel_endpoint_ip", "10.77.23.13"),
+                ],
+                packet,
+            );
+            e.capture_id = "sha256:continuous".into();
+            e.packet_references[0].packet_number = packet;
+            e
+        };
+        let g1 = make("evt-gtpu-1", 100);
+        let g2 = make("evt-gtpu-2", 101);
+        let key1 = publication_semantic_key(&g1);
+        let key2 = publication_semantic_key(&g2);
+        assert_eq!(
+            key1, key2,
+            "deux GTP-U data-plane doivent partager la clé (compactage vital)"
+        );
+    }
+
+    /// 2.18.3 — vérifie la chaîne `publication_semantic_key →
+    /// representatives dedup` : 3 events SBI du même pseudonyme +
+    /// même PDU session + même message_name survivent tous au
+    /// dédoublonnage (avant 2.18.3 : collision → 2 perdus). C'est
+    /// l'étape où la cause prod a été observée (FAIL #10 6898944250).
+    /// Le rattachement final par `attach_sbi_to_sessions` dépend
+    /// aussi du pipeline PDU complet (Response + context release) ;
+    /// ici on isole UNIQUEMENT la correction du dedup — la suite
+    /// est couverte par `sbi_attach_rules_match_anr2_production_shapes_2_9_9`
+    /// et consorts.
+    #[test]
+    fn sbi_events_survive_representatives_dedup_anr1_6898944250() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!(
+            "oiran-sbi-dedup-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut file = std::fs::File::create(&tmp).unwrap();
+            for (ev, packet) in [("evt-sbi-1", 10u64), ("evt-sbi-2", 20), ("evt-sbi-3", 30)] {
+                writeln!(file, r#"{{"event_id":"{ev}","parent_event_id":null,"capture_id":"sha256:continuous","capture_point_id":"SBI","timestamp":{{"seconds":1,"nanoseconds":{packet},"raw_ticks":{packet},"resolution_base":10,"resolution_exponent":9,"display":"1.000000{packet:03}Z"}},"interface":"SBI","protocol":"SBI-HTTP2","message_name":"CreateSMContext","source_endpoint":{{"address":"10.77.3.1","network_function":"AMF"}},"destination_endpoint":{{"address":"10.77.3.2","network_function":"SMF"}},"direction":"CORE_TO_CORE","session_identifiers":[{{"name":"subscriber_pseudonym","value":"psn-supi-abc","pseudonymized":true}},{{"name":"pdu_session_id","value":"1","pseudonymized":false}}],"information_elements":[],"decoding_status":"DECODED","decoder_name":"decoder-sbi","decoder_version":"0","raw_payload_reference":"sha256:x","packet_references":[{{"source_file":"x","packet_number":{packet},"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}}],"errors":[]}}"#).unwrap();
+            }
+        }
+        let index = load_paths_streaming_representatives_with_progress(
+            std::slice::from_ref(&tmp),
+            |_, _| {},
+        )
+        .unwrap();
+        let sbi_events: Vec<_> = index
+            .events
+            .iter()
+            .filter(|e| protocol_is(e, "SBI-HTTP2"))
+            .collect();
+        assert_eq!(
+            sbi_events.len(),
+            3,
+            "les 3 events SBI (même pseudo+pdu, même message_name) doivent survivre au dedup avec 2.18.3 ; got {}",
+            sbi_events.len()
+        );
+        std::fs::remove_file(&tmp).ok();
     }
 }

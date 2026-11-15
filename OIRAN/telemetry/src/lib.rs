@@ -104,8 +104,35 @@ impl WorkerCounters {
         self.work_accumulator.load(Ordering::Relaxed)
     }
 
+    /// 2.18.3 (ANR1 #10 6898944250) — CAS saturant à `usize::MAX` au
+    /// lieu de `fetch_add(1) + 1`. L'ancienne version pouvait
+    /// déborder si un `dequeue()` survenait avant tout `enqueue()`
+    /// (cas worker-runtime observé par intermittence sur les tests
+    /// `four_worker_accounting_has_no_silent_loss` et
+    /// `queue_saturation_is_bounded_and_accounted`) : le compteur
+    /// passait de 0 à `usize::MAX` via le `fetch_sub(1)` de
+    /// `dequeue`, et le prochain `fetch_add(1) + 1` paniquait avec
+    /// « attempt to add with overflow » en debug. Le CAS garantit
+    /// que la valeur reste ≤ `usize::MAX` sans wrap.
     pub fn enqueue(&self) {
-        let now = self.queue_occupancy.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = loop {
+            let current = self.queue_occupancy.load(Ordering::Relaxed);
+            let next = current.saturating_add(1);
+            if next == current {
+                // Déjà saturé — cas pathologique, on n'incrémente
+                // plus et on ne touche pas au high watermark.
+                return;
+            }
+            match self.queue_occupancy.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break next,
+                Err(_) => continue,
+            }
+        };
         let mut high = self.queue_high_watermark.load(Ordering::Relaxed);
         while now > high {
             match self.queue_high_watermark.compare_exchange_weak(
@@ -120,8 +147,29 @@ impl WorkerCounters {
         }
     }
 
+    /// 2.18.3 — CAS saturant à 0. L'ancienne version `fetch_sub(1)`
+    /// pouvait sous-déborder quand un `dequeue()` survenait avant
+    /// `enqueue()` (ordonnancement non-strict dans worker-runtime).
+    /// Le compteur sous-débordait alors à `usize::MAX`, et
+    /// l'`enqueue()` suivant paniquait sur `fetch_add(1) + 1`. Le
+    /// CAS empêche le passage sous 0.
     pub fn dequeue(&self) {
-        self.queue_occupancy.fetch_sub(1, Ordering::Relaxed);
+        let mut current = self.queue_occupancy.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                // Rien à décrémenter — invariant anti-underflow.
+                return;
+            }
+            match self.queue_occupancy.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
     pub fn drop_packets(&self, count: u64) {
         self.dropped.fetch_add(count, Ordering::Relaxed);
@@ -146,6 +194,88 @@ impl WorkerCounters {
             packet_number_sum: self.packet_number_sum.load(Ordering::Relaxed),
             packet_number_xor: self.packet_number_xor.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2.18.3 (ANR1 #10 6898944250) — invariant anti-underflow :
+    /// `dequeue()` sur un compteur vide doit rester à 0, jamais
+    /// sous-déborder à `usize::MAX`. L'ancienne version
+    /// `fetch_sub(1)` paniquait au prochain `enqueue()`
+    /// (« attempt to add with overflow ») en debug.
+    #[test]
+    fn dequeue_on_empty_queue_stays_at_zero_no_underflow() {
+        let c = WorkerCounters::default();
+        assert_eq!(c.snapshot().queue_occupancy, 0);
+        c.dequeue();
+        c.dequeue();
+        c.dequeue();
+        assert_eq!(
+            c.snapshot().queue_occupancy,
+            0,
+            "dequeue sur queue vide doit rester à 0 (saturant)"
+        );
+        // Un enqueue ultérieur doit toujours fonctionner.
+        c.enqueue();
+        assert_eq!(c.snapshot().queue_occupancy, 1);
+        assert_eq!(c.snapshot().queue_high_watermark, 1);
+    }
+
+    /// 2.18.3 — enqueue puis dequeue retombe à 0 proprement et met
+    /// à jour le high watermark correctement.
+    #[test]
+    fn enqueue_dequeue_updates_occupancy_and_high_watermark() {
+        let c = WorkerCounters::default();
+        c.enqueue();
+        c.enqueue();
+        c.enqueue();
+        assert_eq!(c.snapshot().queue_occupancy, 3);
+        assert_eq!(c.snapshot().queue_high_watermark, 3);
+        c.dequeue();
+        c.dequeue();
+        assert_eq!(c.snapshot().queue_occupancy, 1);
+        // High watermark reste à 3 (c'est une valeur de pic).
+        assert_eq!(c.snapshot().queue_high_watermark, 3);
+    }
+
+    /// 2.18.3 — alternance dequeue/enqueue sous concurrence réelle
+    /// (worker-runtime) : aucun panic d'overflow. Reproduit la
+    /// situation où `dequeue` peut précéder `enqueue` par
+    /// ordonnancement entre threads.
+    #[test]
+    fn interleaved_dequeue_and_enqueue_never_panics() {
+        use std::sync::Arc;
+        use std::thread;
+        let counters = Arc::new(WorkerCounters::default());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = Arc::clone(&counters);
+            handles.push(thread::spawn(move || {
+                for _ in 0..1000 {
+                    c.dequeue();
+                    c.enqueue();
+                }
+            }));
+        }
+        for _ in 0..8 {
+            let c = Arc::clone(&counters);
+            handles.push(thread::spawn(move || {
+                for _ in 0..1000 {
+                    c.enqueue();
+                    c.dequeue();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Occupancy final doit être un nombre raisonnable
+        // (ni panic ni valeur énorme > 16 workers × 1000).
+        let occ = counters.snapshot().queue_occupancy;
+        assert!(occ <= 16 * 1000, "occupancy sauté: {occ}");
     }
 }
 
