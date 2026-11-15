@@ -3389,6 +3389,10 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                 if let Some(object) = summary.as_object_mut() {
                     let mut identities = identity_summary_for_session(&state, session_id);
                     if identities.is_null() {
+                        // 2.15.3 — remplir le vault en arrière-plan pour que
+                        // la liste affiche IMSI/TMSI/IMEI sans ouvrir la
+                        // session (au rafraîchissement suivant).
+                        schedule_identity_hydration(&state, session_id);
                         if let Some(items) = patched_items.as_deref() {
                             if let Some(fallback) =
                                 read_time_patch::extract_identity_summary_from_items(items)
@@ -3851,7 +3855,36 @@ const IDENTITY_TSHARK_FIELDS: &[&str] = &[
     "diameter.user_equipment_info.imeisv",
     "e164.msisdn",
     "diameter.MSISDN",
+    // 2.15.3 — NAS 5GS (TS 24.501). `e212.imsi` stays empty for a 5G SUCI:
+    // TShark 4.2 exposes the null-scheme SUCI as MCC/MNC/MSIN (ANR1 proof
+    // #10 6894182928, frame 1217 Registration Request).
+    "nas-5gs.mm.suci.supi_fmt",
+    "nas-5gs.mm.suci.scheme_id",
+    "e212.mcc",
+    "e212.mnc",
+    "nas-5gs.mm.suci.msin",
+    "nas-5gs.5g_tmsi",
+    "nas-5gs.mm.imei",
+    "nas-5gs.mm.imeisv",
 ];
+
+/// 2.15.3 — SUPI (IMSI) from a null-scheme SUCI as dissected by TShark:
+/// only SUPI format 0 (IMSI) with protection scheme 0 (null) is readable;
+/// any other scheme is ciphered (ECIES) and yields None.
+fn supi_from_null_scheme_suci(supi_fmt: &str, scheme_id: &str, mcc: &str, mnc: &str, msin: &str) -> Option<String> {
+    let first = |v: &str| v.split(',').next().unwrap_or("").trim().to_string();
+    let (fmt, scheme, mcc, mnc, msin) = (first(supi_fmt), first(scheme_id), first(mcc), first(mnc), first(msin));
+    let digits = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
+    let zero = |v: &str| v.parse::<u32>().ok() == Some(0) || v == "0x00" || v == "0x0";
+    if !zero(&fmt) || !zero(&scheme) {
+        return None;
+    }
+    if !(digits(&mcc) && mcc.len() == 3 && digits(&mnc) && (2..=3).contains(&mnc.len()) && digits(&msin)) {
+        return None;
+    }
+    let imsi = format!("{mcc}{mnc}{msin}");
+    (imsi.len() <= 15 && imsi.len() >= 14).then_some(imsi)
+}
 
 fn session_flow(state: &AppState, id: &str) -> Option<CallFlow> {
     flow_for(state, id)
@@ -4062,7 +4095,11 @@ fn tshark_identities(
             };
             let role = identity_role(&evidence.message_name);
             let field = |index: usize| columns.get(index).copied().unwrap_or("");
-            for raw in split_field(field(1)).chain(split_field(field(2))) {
+            let suci_supi = supi_from_null_scheme_suci(field(19), field(20), field(21), field(22), field(23));
+            for raw in split_field(field(1))
+                .chain(split_field(field(2)))
+                .chain(suci_supi.as_deref().into_iter())
+            {
                 if let Some(imsi) = identity_digits(raw) {
                     let pseudo = Some(pseudonym_subscriber_text(
                         state.inner.capture_manager.pseudonym_key().as_ref(),
@@ -4093,6 +4130,7 @@ fn tshark_identities(
                 .chain(split_field(field(4)))
                 .chain(split_field(field(8)))
                 .chain(split_field(field(11)))
+                .chain(split_field(field(24)))
                 .find_map(canonical_tmsi);
             if let Some(m_tmsi) = tmsi {
                 let pseudo = evidence.subscriber_pseudonym.clone();
@@ -4148,6 +4186,7 @@ fn tshark_identities(
             for raw in split_field(field(12))
                 .chain(split_field(field(14)))
                 .chain(split_field(field(15)))
+                .chain(split_field(field(25)))
             {
                 if let Some(imei) = identity_digits(raw) {
                     push_identity(
@@ -4161,7 +4200,7 @@ fn tshark_identities(
                     );
                 }
             }
-            for raw in split_field(field(13)).chain(split_field(field(16))) {
+            for raw in split_field(field(13)).chain(split_field(field(16))).chain(split_field(field(26))) {
                 if let Some(imeisv) = identity_digits(raw) {
                     push_identity(
                         &mut observations,
@@ -4193,6 +4232,34 @@ fn tshark_identities(
         observation.session_id = session_id.to_owned();
     }
     Ok(observations)
+}
+
+/// 2.15.3 — background identity hydration for the session list: at most
+/// two tshark dissections at a time, each session attempted once per
+/// process (failures are not retried in a loop).
+static IDENTITY_HYDRATION_SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static IDENTITY_HYDRATION_RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const IDENTITY_HYDRATION_MAX: usize = 2;
+
+fn schedule_identity_hydration(state: &AppState, session_id: &str) {
+    use std::sync::atomic::Ordering;
+    let Ok(mut seen) = IDENTITY_HYDRATION_SEEN.lock() else { return };
+    if seen.contains(session_id) {
+        return;
+    }
+    if IDENTITY_HYDRATION_RUNNING.fetch_add(1, Ordering::SeqCst) >= IDENTITY_HYDRATION_MAX {
+        IDENTITY_HYDRATION_RUNNING.fetch_sub(1, Ordering::SeqCst);
+        return; // retried on a later list request
+    }
+    seen.insert(session_id.to_owned());
+    drop(seen);
+    let state = state.clone();
+    let session_id = session_id.to_owned();
+    std::thread::spawn(move || {
+        let _ = hydrate_identities(&state, &session_id);
+        IDENTITY_HYDRATION_RUNNING.fetch_sub(1, Ordering::SeqCst);
+    });
 }
 
 fn hydrate_identities(state: &AppState, session_id: &str) -> Result<(), String> {
@@ -4615,6 +4682,21 @@ async fn session_callflow(
     };
     match result {
         Ok(Some(mut value)) => {
+            // 2.15.3 — même réconciliation PFCP que /events (2.15.2), sur la
+            // première page du callflow lue par le ladder p900.
+            if cursor.is_none() {
+                let dataset_root = if flow_value_for(&state, &id).is_some() {
+                    state.inner.reference_dataset_root.clone()
+                } else {
+                    live_flow_for(&state, &id)
+                        .and_then(|(dataset_id, _)| state.inner.capture_manager.dataset_root(&dataset_id))
+                };
+                if let (Some(root), Some(events)) =
+                    (dataset_root.as_deref(), value.get_mut("events").and_then(Value::as_array_mut))
+                {
+                    let _ = read_time_patch::insert_pfcp_siblings_into_callflow(events, root);
+                }
+            }
             sanitize_value(&mut value);
             ok(value).into_response()
         }
@@ -10016,5 +10098,32 @@ mod tests {
         assert_eq!(body["data"]["pagination"]["total"], 1);
         assert!(body.to_string().contains("event-test-identity"));
         assert!(body.to_string().contains("\"packet_number\":15"));
+    }
+}
+
+#[cfg(test)]
+mod suci_null_scheme_tests {
+    use super::supi_from_null_scheme_suci;
+
+    #[test]
+    fn rebuilds_supi_from_anr1_frame_1217_shape() {
+        // ANR1 #10 6894182928 : type_id=1, supi_fmt=0, scheme_id=0, MCC 001, MNC 01, MSIN 10 digits.
+        assert_eq!(
+            supi_from_null_scheme_suci("0", "0", "001", "01", "0000000201").as_deref(),
+            Some("001010000000201")
+        );
+        // aggregated fields keep the first occurrence
+        assert_eq!(
+            supi_from_null_scheme_suci("0", "0", "001,208", "01,93", "0000000201").as_deref(),
+            Some("001010000000201")
+        );
+    }
+
+    #[test]
+    fn refuses_ciphered_or_non_imsi_suci() {
+        assert_eq!(supi_from_null_scheme_suci("0", "1", "001", "01", "0000000201"), None); // ECIES profile A
+        assert_eq!(supi_from_null_scheme_suci("1", "0", "001", "01", "0000000201"), None); // NAI
+        assert_eq!(supi_from_null_scheme_suci("", "", "", "", ""), None);
+        assert_eq!(supi_from_null_scheme_suci("0", "0", "001", "01", ""), None);
     }
 }

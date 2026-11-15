@@ -1,5 +1,31 @@
 # Changelog
 
+## OIRAN API 2.15.3 — 2026-11-15 — IMSI 5G (SUCI null-scheme), PFCP Request dans /callflow (patch)
+
+- **IMSI 5G** : `tshark_identities` ne lisait que des champs 4G/Diameter
+  (`e212.imsi`…). Pour un SUCI 5G, TShark 4.2 laisse `e212.imsi` vide et
+  expose `nas-5gs.mm.suci.{supi_fmt,scheme_id,msin}` + `e212.mcc/mnc`
+  (preuve ANR1 #10 6894182928, frame 1217 Registration Request :
+  type_id=1, supi_fmt=0, scheme_id=0, MCC 001, MNC 01, MSIN 10 chiffres).
+  Ajout de ces champs + `nas-5gs.5g_tmsi`, `nas-5gs.mm.imei`,
+  `nas-5gs.mm.imeisv`. Le SUPI n'est reconstruit que pour SUPI format 0 +
+  schéma nul (`supi_from_null_scheme_suci`) ; tout SUCI chiffré (ECIES)
+  reste non observé.
+- **Liste /sessions** : quand le vault d'une session est vide, une
+  hydratation tshark est lancée en arrière-plan (2 au plus en parallèle,
+  une tentative par session et par processus) ; les identités
+  apparaissent au rafraîchissement suivant sans ouvrir la session.
+- **/callflow** : la PFCP Session Establishment Request (type 50), corrigée
+  en 2.15.2 pour `/events` seulement, est réinsérée dans la première page
+  du callflow lu par le ladder (ANR1 #10 6893754032), convertie au format
+  callflow et placée juste avant la Response de même `pfcp_sequence`.
+- MSISDN : non présent sur le réseau du lab (N2/NAS n'en portent pas ; le
+  SIP ims-lite n'a pas de P-Asserted-Identity, preuve ANR1) → reste
+  « non observé ».
+- Tests : `cargo test --release --workspace` 566 OK / 0 FAIL / 9 ignorés
+  (+3 : SUPI null-scheme, refus SUCI chiffré, insertion PFCP callflow).
+
+
 ## OIRAN API 2.15.2 — 2026-11-15 — D3/D4 complément (identities non null sur /sessions, D4 cleartext IMSI câblé)
 
 Complément 2.15.2 (même tag) après le D6 prod-path : fermeture simultanée de **D3** (`/api/v1/sessions` renvoyait `identities:null` pour la session continuous `5g-session-c330d205adafa233` parce que l'identity_vault est vide — `hydrate_identities` via tshark n'est jamais déclenché par la boucle `capture_manager`) et de **D4** (le champ `IdentityObservation::cleartext` exposé par 2.15.0 et les helpers 2.15.1 restaient non câblés sur le chemin chaud). Règle Sadok 2026-11-14 respectée : IMSI/SUPI null-scheme cleartext **UI authentifiée uniquement** ; GUTI/TMSI/IMEI toujours pseudonymisés ; jamais dans GitHub/logs.

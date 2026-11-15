@@ -1603,6 +1603,112 @@ fn scan_jsonl_for_pfcp_siblings(
     Ok(added)
 }
 
+/// 2.15.3 — `/callflow` : la PFCP Session Establishment Request (type 50)
+/// présente dans le JSONL mais absente du callflow persisté est réinsérée
+/// (ANR1 #10 6893754032 : /events PASS, ladder FAIL car p900 lit
+/// /callflow). Chaque event récupéré est converti au format callflow
+/// (participants, timestamp_ns, decoded_ie_tree) et placé juste AVANT le
+/// premier event PFCP qui partage son `pfcp_sequence` (la Response) : on
+/// ne retrie pas tout le callflow, son ordre existant est conservé.
+pub fn insert_pfcp_siblings_into_callflow(events: &mut Vec<Value>, dataset_root: &Path) -> Result<usize, String> {
+    let known: BTreeSet<String> = events
+        .iter()
+        .filter_map(|e| e.get("event_id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let mut scratch = events.clone();
+    extend_items_with_pfcp_siblings_from_jsonl(&mut scratch, dataset_root)?;
+    let mut added = 0usize;
+    for raw in scratch.into_iter().filter(|e| {
+        e.get("event_id").and_then(Value::as_str).is_some_and(|id| !known.contains(id))
+    }) {
+        let converted = raw_event_to_callflow_event(&raw);
+        let seq = pfcp_sequence_of(&converted);
+        let position = seq
+            .as_deref()
+            .and_then(|seq| {
+                events.iter().position(|e| {
+                    e.get("protocol").and_then(Value::as_str) == Some("PFCP")
+                        && pfcp_sequence_of(e).as_deref() == Some(seq)
+                })
+            })
+            .unwrap_or(events.len());
+        events.insert(position, converted);
+        added += 1;
+    }
+    Ok(added)
+}
+
+fn pfcp_sequence_of(event: &Value) -> Option<String> {
+    if let Some(seq) = event.get("pfcp_sequence").and_then(Value::as_str) {
+        return Some(seq.to_owned());
+    }
+    for key in ["session_identifiers", "decoded_ie_tree"] {
+        if let Some(list) = event.get(key).and_then(Value::as_array) {
+            for item in list {
+                if item.get("name").and_then(Value::as_str) == Some("pfcp_sequence") {
+                    if let Some(v) = item.get("value").and_then(Value::as_str) {
+                        return Some(v.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Raw JSONL event (endpoints, structured timestamp, session_identifiers)
+/// → callflow event shape read by the UI ladder. Fields already in the
+/// callflow shape are kept as they are.
+pub fn raw_event_to_callflow_event(raw: &Value) -> Value {
+    let mut out = raw.clone();
+    let Some(object) = out.as_object_mut() else { return out };
+    let nf = |key: &str| {
+        raw.get(key)
+            .and_then(|e| e.get("network_function"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    if !object.contains_key("source_participant") {
+        if let Some(v) = nf("source_endpoint") {
+            object.insert("source_participant".into(), Value::String(v));
+        }
+    }
+    if !object.contains_key("destination_participant") {
+        if let Some(v) = nf("destination_endpoint") {
+            object.insert("destination_participant".into(), Value::String(v));
+        }
+    }
+    if !object.contains_key("timestamp_ns") {
+        if let Some(ticks) = raw.get("timestamp").and_then(|t| t.get("raw_ticks")).and_then(Value::as_u64) {
+            object.insert("timestamp_ns".into(), Value::String(ticks.to_string()));
+        }
+    }
+    if raw.get("timestamp").is_some_and(Value::is_object) {
+        object.insert("timestamp".into(), Value::String(String::new()));
+    }
+    if !object.contains_key("decoded_ie_tree") {
+        let mut tree: Vec<Value> = raw
+            .get("information_elements")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(ids) = raw.get("session_identifiers").and_then(Value::as_array) {
+            for id in ids {
+                if let (Some(name), Some(value)) = (
+                    id.get("name").and_then(Value::as_str),
+                    id.get("value").and_then(Value::as_str),
+                ) {
+                    tree.push(serde_json::json!({"name": name, "source": "session_identifiers", "value": value}));
+                }
+            }
+        }
+        object.insert("decoded_ie_tree".into(), Value::Array(tree));
+    }
+    object.entry("association").or_insert_with(|| Value::String("SESSION".into()));
+    object.entry("procedure_group").or_insert_with(|| Value::String("PFCP Session".into()));
+    out
+}
+
 /// 2.15.2 (ANR1 #10 6885876387, D3) — résumé compact des identités
 /// extrait **des events déjà présents** (après `apply_read_time_patch`
 /// et `extend_items_with_pfcp_siblings_from_jsonl`) pour alimenter
@@ -2276,5 +2382,46 @@ mod tests {
             ],
         })];
         assert!(extract_identity_summary_from_items(&items).is_none());
+    }
+}
+
+#[cfg(test)]
+mod callflow_pfcp_insert_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn raw_request_is_converted_and_placed_before_its_response() {
+        let dir = std::env::temp_dir().join(format!("rtp-cf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // ANR1 #10 6885876387 shape: Request type 50 only in the JSONL.
+        let request = json!({
+            "event_id":"evt-349c72dc0f5510c3","capture_id":"sha256:continuous","interface":"N4","protocol":"PFCP",
+            "message_name":"PFCP Session Establishment Request","message_type":50,
+            "timestamp":{"seconds":1,"nanoseconds":0,"raw_ticks":1794673477113697742u64,"display":"x"},
+            "source_endpoint":{"address":"10.77.23.12","port":8805,"network_function":"SMF"},
+            "destination_endpoint":{"address":"10.77.23.13","port":8805,"network_function":"UPF"},
+            "session_identifiers":[{"name":"pfcp_sequence","value":"2209","pseudonymized":false}],
+            "information_elements":[],"pfcp_sequence":"2209"
+        });
+        std::fs::write(dir.join("oiran_events.jsonl"), format!("{}\n", request)).unwrap();
+        let mut events = vec![
+            json!({"event_id":"evt-ngap","protocol":"NGAP","interface":"N2","message_name":"InitialUEMessage"}),
+            json!({"event_id":"evt-104645ebe2174b02","protocol":"PFCP","interface":"N4","message_name":"PFCP Session Establishment Response",
+                   "decoded_ie_tree":[{"name":"pfcp_sequence","source":"session_identifiers","value":"2209"}]}),
+            json!({"event_id":"evt-aa1b0ac453b62fd9","protocol":"PFCP","interface":"N4","message_name":"PFCP Session Modification Request",
+                   "decoded_ie_tree":[{"name":"pfcp_sequence","source":"session_identifiers","value":"2210"}]}),
+        ];
+        let added = insert_pfcp_siblings_into_callflow(&mut events, &dir).unwrap();
+        assert_eq!(added, 1);
+        let ids: Vec<&str> = events.iter().map(|e| e["event_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["evt-ngap", "evt-349c72dc0f5510c3", "evt-104645ebe2174b02", "evt-aa1b0ac453b62fd9"]);
+        let req = &events[1];
+        assert_eq!(req["source_participant"], "SMF");
+        assert_eq!(req["destination_participant"], "UPF");
+        assert_eq!(req["timestamp_ns"], "1794673477113697742");
+        // idempotent
+        assert_eq!(insert_pfcp_siblings_into_callflow(&mut events, &dir).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
