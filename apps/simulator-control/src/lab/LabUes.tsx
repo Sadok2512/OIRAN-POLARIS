@@ -12,7 +12,7 @@ import { fetchScenarioSteps, useScenarioDefinitions, useStartScenarioRun } from 
 import { useCreateLiveGrant } from '@/data/liveGrantApi';
 import type { UeState } from '@/data/polarisTypes';
 import { enterQuiet, leaveQuiet } from '@/data/quietMode';
-import { Badge, needsTwoUes, reasonFr, stepsSummary, type Tone } from './labShared';
+import { Badge, conflictMessageFr, needsTwoUes, reasonFr, stepsSummary, type Tone } from './labShared';
 
 type Row = UeState & { subscriber_identity?: string | null; scenario_id?: string | null };
 
@@ -97,8 +97,9 @@ export function LabUesPage() {
       setRuns((prev) => ({ ...prev, [id]: { jobId: job.job_id, scenarioName: def.name, state: job.state || 'RUNNING' } }));
       setMessage(`« ${def.name} » lancé sur ${id}. Clique sur ${id} pour suivre en direct.`);
     } catch (error) {
-      const e = error as { code?: string; message?: string; status?: number };
-      setMessage(`${id} : lancement refusé — ${reasonFr(e.code) || e.message || 'erreur'}${e.status ? ` (HTTP ${e.status})` : ''}`);
+      const e = error as { code?: string; message?: string; status?: number; details?: Record<string, unknown> };
+      const conflict = conflictMessageFr(e.details);
+      setMessage(`${id} : lancement refusé — ${conflict ?? (reasonFr(e.code) || e.message || 'erreur')}${e.status ? ` (HTTP ${e.status})` : ''}`);
     } finally {
       setBusy(null);
     }

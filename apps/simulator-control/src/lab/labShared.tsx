@@ -46,8 +46,18 @@ export function reasonFr(code: string | null | undefined): string {
     UE_CONTROL_VALIDATION_REQUIRED: 'Autorisation live demandée au lancement',
     UE_NOT_RUNNING: 'UE arrêté',
     SUBSCRIBER_NOT_PROVISIONED: 'Abonné absent d’Open5GS',
+    SCENARIO_CONFLICT: 'Un autre scénario est déjà en cours dans le lab',
   };
   return map[code] ? `${map[code]} · ${code}` : code;
+}
+
+/** 0.36.10 — 409 SCENARIO_CONFLICT : dire quel scénario occupe le lab. */
+export function conflictMessageFr(details: Record<string, unknown> | undefined): string | null {
+  if (!details || details.error !== 'SCENARIO_CONFLICT') return null;
+  const scenario = typeof details.active_scenario_id === 'string' ? details.active_scenario_id : null;
+  const ues = Array.isArray(details.active_ue_ids) ? (details.active_ue_ids as unknown[]).map(String) : [];
+  const what = scenario ? `« ${scenario} »${ues.length ? ` sur ${ues.join(', ')}` : ''}` : 'un autre scénario';
+  return `le lab exécute déjà ${what}. Un seul scénario à la fois : arrête-le (page Scénarios) ou attends sa fin.`;
 }
 
 /** Scenario needs two UEs (voice call) → not runnable from a single UE row. */

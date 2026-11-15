@@ -1,5 +1,11 @@
 # @telecom/simulator-control — Changelog
 
+## 0.36.10 — 2026-11-15 — Refus « un scénario à la fois » expliqué (patch)
+
+- Lab UE : un 409 `SCENARIO_CONFLICT` affiche le scénario et les UE qui occupent le lab (« le lab exécute déjà « simple-voice-call » sur UE-05, UE-201… arrête-le ou attends sa fin »), au lieu de « SCENARIO_CONFLICT (HTTP 409) ». Requiert Control API 0.36.10.
+- `packages/ui` `ApiError` porte `details` (corps JSON de l'erreur), champ optionnel rétro-compatible.
+- 2 tests (`conflictMessageFr`).
+
 ## 0.36.7 — 2026-11-15 — Node Manager : NF, eNB, UE réels (patch)
 
 - Corrige l'audit Node Manager d'ANR2 (#10) :

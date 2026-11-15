@@ -213,3 +213,21 @@ describe('lastVoiceCall — 0.36.6 (RTP au lieu du débit pour la voix)', () => 
     expect(lastVoiceCall([])).toBeNull();
   });
 });
+
+describe('0.36.10 conflictMessageFr', () => {
+  it('names the scenario and UEs that occupy the lab', async () => {
+    const { conflictMessageFr } = await import('./labShared');
+    const text = conflictMessageFr({
+      error: 'SCENARIO_CONFLICT',
+      active_scenario_id: 'simple-voice-call',
+      active_ue_ids: ['UE-05', 'UE-201'],
+    });
+    expect(text).toContain('« simple-voice-call » sur UE-05, UE-201');
+    expect(text).toContain('Un seul scénario à la fois');
+  });
+  it('returns null for other errors', async () => {
+    const { conflictMessageFr } = await import('./labShared');
+    expect(conflictMessageFr({ error: 'UE_NOT_RUNNING' })).toBeNull();
+    expect(conflictMessageFr(undefined)).toBeNull();
+  });
+});

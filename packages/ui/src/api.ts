@@ -14,6 +14,8 @@ export class ApiError extends Error {
     public status: number,
     public code: string,
     message: string,
+    /** Corps JSON complet de la réponse d'erreur (champs annexes, ex. 409). */
+    public details: Record<string, unknown> = {},
   ) {
     super(message);
     this.name = 'ApiError';
@@ -185,6 +187,7 @@ export async function api<T>(
       response.status,
       err?.code ?? 'REQUEST_FAILED',
       err?.message ?? response.statusText,
+      (body && typeof body === 'object' ? body : {}) as Record<string, unknown>,
     );
   }
   return body as ApiEnvelope<T>;
