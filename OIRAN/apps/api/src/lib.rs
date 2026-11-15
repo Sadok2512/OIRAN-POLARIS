@@ -801,6 +801,30 @@ impl AppState {
                 }
             }
         }
+        // 2.15.7 — /sessions lists the LTE evidence store too; the filter
+        // index did not, so « Afficher toutes les sessions » (POST
+        // /sessions/filter) returned 173 sessions against 174 for GET
+        // /sessions (ANR1 #10, gate pagination 2.16.0/2.5.1). Same source,
+        // same bound (page 1, 100 per run) as `sessions()`.
+        if let Ok(catalog) = self.inner.lte_evidence_store.catalog() {
+            for manifest in catalog {
+                let Ok(page) = self.inner.lte_evidence_store.session_page(&manifest.run_id, 1, 100) else {
+                    continue;
+                };
+                for record in page["data"].as_array().into_iter().flatten() {
+                    let Some(session_id) = record.get("session_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if let Ok(Some(flow)) = self
+                        .inner
+                        .lte_evidence_store
+                        .callflow_for_export_by_session(session_id)
+                    {
+                        index.upsert_flow(&flow);
+                    }
+                }
+            }
+        }
         if let Ok(mut guard) = self.inner.session_filter_index.write() {
             *guard = index;
         }
@@ -9842,6 +9866,62 @@ mod tests {
         let status = response.status();
         let payload = json_body(response).await;
         (status, payload)
+    }
+
+    /// 2.15.7 — ANR1 #10 (gate pagination 2.16.0/2.5.1) : GET /sessions
+    /// renvoyait 174 sessions et POST /sessions/filter 173 — l'index du
+    /// filtre ignorait le LTE evidence store. Les deux totaux doivent
+    /// être égaux, session LTE evidence comprise.
+    #[tokio::test]
+    async fn sessions_filter_and_sessions_list_cover_the_same_sessions_including_lte_evidence() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let config = test_config(workspace, "filter-vs-list-lte");
+        let store_root = config.lte_evidence_root.clone();
+        let state = AppState::load(config).unwrap();
+        let bundle = temporary_directory("filter-vs-list-lte-bundle");
+        let (_dataset_id, lte_session_id) = ingest_lte_evidence_fixture(&state, &bundle);
+
+        let list = router(state.clone(), None)
+            .oneshot(req("/api/v1/sessions?page_size=100", false))
+            .await
+            .unwrap();
+        let list = json_body(list).await;
+        let mut listed: Vec<String> = list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["session_id"].as_str().unwrap().to_owned())
+            .collect();
+        listed.sort();
+
+        let mut filtered: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut body = json!({"limit": 100});
+            if let Some(c) = &cursor {
+                body["cursor"] = Value::String(c.clone());
+            }
+            let (status, page) = post_sessions_filter(&state, body, None).await;
+            assert_eq!(status, StatusCode::OK);
+            for row in page["data"].as_array().unwrap() {
+                filtered.push(row["session_id"].as_str().unwrap().to_owned());
+            }
+            cursor = page["meta"]["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        filtered.sort();
+        assert!(listed.contains(&lte_session_id), "LTE evidence session must be in GET /sessions");
+        assert!(filtered.contains(&lte_session_id), "LTE evidence session missing from POST /sessions/filter");
+        assert_eq!(filtered, listed);
+
+        fs::remove_dir_all(bundle).unwrap();
+        fs::remove_dir_all(store_root.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]

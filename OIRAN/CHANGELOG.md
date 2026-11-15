@@ -68,7 +68,19 @@ Trois points amont prouvés par Sadok (#10 6896869321) ne sont PAS résolus par 
 - Aucune modif `apps/api/src/read_time_patch.rs`.
 - Aucune modif `POLARIS_CONTROL/` ni `apps/control/`.
 
-Bump minor : `oiran-api 2.16.0 → 2.17.0`.
+Bump minor : `oiran-api 2.16.0 → 2.17.0`. **Inclut 2.16.1** (patch `/sessions/filter` LTE evidence store, voir entrée suivante — mergé explicitement depuis `fix/oiran-api-2.16.1-filter-lte @ 17f2c6d` par un `git merge --no-ff`, aucun force-push sur l'historique publié).
+
+## OIRAN API 2.16.1 — 2026-11-15 — /sessions/filter couvre les mêmes sessions que /sessions (patch)
+
+- Corrige le FAIL ANR1 #10 (gate pagination 2.16.0 / p900 2.5.1) : GET
+  `/sessions` renvoyait 174 sessions, POST `/sessions/filter` 173. Cause :
+  `refresh_session_filter_index` n'indexait que les flows de référence et
+  les datasets du capture manager, pas le LTE evidence store que
+  `sessions()` liste aussi. Les sessions LTE evidence sont maintenant
+  indexées (même source, même borne page 1 / 100 par run).
+- Test `sessions_filter_and_sessions_list_cover_the_same_sessions_including_lte_evidence` :
+  ensembles d'ids identiques (tous les curseurs suivis) ; échoue sans le
+  correctif, passe avec.
 
 ## OIRAN API 2.16.0 — 2026-11-15 — Live par IMSI : ordre canonique SSE + corrélation sessions (ANR1 #10 Live-IMSI)
 
