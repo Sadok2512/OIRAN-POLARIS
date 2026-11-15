@@ -1,5 +1,10 @@
 # Changelog
 
+## OIRAN API 2.18.2 — 2026-11-15 — PFCP siblings bornés à l'interface de la session (patch)
+
+- `read_time_patch` : un event PFCP du JSONL n'est rattaché comme sibling que s'il est sur une interface déjà portée par la session (N4 pour le 5G, Sxa/Sxb pour le LTE). `pfcp_sequence` et les SEID Open5GS sont de petits compteurs par nœud qui se répètent entre N4 et Sxab : la session 5G `5g-session-99e8…` aspirait 48 events Sxab (ANR1 #10 6898944250).
+- Test `sxab_pfcp_with_same_sequence_is_not_pulled_into_a_5g_n4_session`.
+
 ## OIRAN API 2.18.1 — 2026-11-15 — Câblage des identités SBI dans `/api/v1/sessions` (patch)
 
 - `lib.rs` : `merge_sbi_identities` complète l'objet `identities` de la liste `/api/v1/sessions` (sessions statiques et continuous) avec `msisdn` (depuis `msisdn_pseudonym`) et `imei` (depuis `imei_pseudonym`, sinon `imeisv_pseudonym`, `imei_type` = IMEI/IMEISV) lus dans les events SBI du call flow (`decoded_ie_tree`, identifiants publiés par decoder-sbi 2.18.0).

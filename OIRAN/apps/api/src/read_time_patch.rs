@@ -1392,6 +1392,12 @@ pub fn extend_items_with_pfcp_siblings_from_jsonl(
     let mut known_sequences: BTreeSet<String> = BTreeSet::new();
     let mut known_seids: BTreeSet<String> = BTreeSet::new();
     let mut known_event_ids: BTreeSet<String> = BTreeSet::new();
+    // 2.18.2 — `pfcp_sequence` et les SEID Open5GS sont de petits
+    // compteurs par nœud : ils se répètent entre N4 (5G) et Sxa/Sxb
+    // (LTE). Sans contrainte d'interface, une session 5G aspirait
+    // 48 events Sxab (ANR1 #10 6898944250). Un sibling n'est retenu
+    // que sur une interface déjà portée par la session.
+    let mut known_interfaces: BTreeSet<String> = BTreeSet::new();
     for item in items.iter() {
         if let Some(id) = item.get("event_id").and_then(Value::as_str) {
             known_event_ids.insert(id.to_owned());
@@ -1400,6 +1406,9 @@ pub fn extend_items_with_pfcp_siblings_from_jsonl(
             continue;
         }
         collect_pfcp_keys(item, &mut known_sequences, &mut known_seids);
+        if let Some(interface) = pfcp_interface_of(item) {
+            known_interfaces.insert(interface);
+        }
     }
     if known_sequences.is_empty() && known_seids.is_empty() {
         return Ok(0);
@@ -1420,7 +1429,11 @@ pub fn extend_items_with_pfcp_siblings_from_jsonl(
         if event_id.is_empty() || known_event_ids.contains(event_id) {
             continue;
         }
-        if pfcp_event_matches(value, &known_sequences, &known_seids) {
+        let same_interface = match pfcp_interface_of(value) {
+            Some(interface) => known_interfaces.contains(&interface),
+            None => known_interfaces.is_empty(),
+        };
+        if same_interface && pfcp_event_matches(value, &known_sequences, &known_seids) {
             known_event_ids.insert(event_id.to_owned());
             items.push(value.clone());
             added += 1;
@@ -1430,6 +1443,17 @@ pub fn extend_items_with_pfcp_siblings_from_jsonl(
         items.sort_by(|a, b| canonical_sort_tuple(a).cmp(&canonical_sort_tuple(b)));
     }
     Ok(added)
+}
+
+/// Interface d'un event PFCP (shape callflow `interface` ou JSONL brut
+/// `interface` / `interface_id`), normalisée en majuscules.
+fn pfcp_interface_of(item: &Value) -> Option<String> {
+    ["interface", "interface_id", "interface_type"]
+        .iter()
+        .find_map(|key| item.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_uppercase)
 }
 
 fn collect_pfcp_keys(item: &Value, sequences: &mut BTreeSet<String>, seids: &mut BTreeSet<String>) {
@@ -2664,6 +2688,37 @@ mod callflow_pfcp_insert_tests {
             insert_pfcp_siblings_into_callflow(&mut events, &dir).unwrap(),
             0
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod pfcp_interface_guard_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sxab_pfcp_with_same_sequence_is_not_pulled_into_a_5g_n4_session() {
+        let dir = std::env::temp_dir().join(format!("rtp-if-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n4_request = json!({"event_id":"evt-n4-req","capture_id":"c","interface":"N4","protocol":"PFCP",
+            "message_name":"PFCP Session Establishment Request","pfcp_sequence":"7",
+            "session_identifiers":[{"name":"pfcp_sequence","value":"7"},{"name":"f_seid","value":"0x0000000000000001"}]});
+        let sxab_same_seq = json!({"event_id":"evt-sxab-req","capture_id":"c","interface":"Sxab","protocol":"PFCP",
+            "message_name":"PFCP Session Establishment Request","pfcp_sequence":"7",
+            "session_identifiers":[{"name":"pfcp_sequence","value":"7"},{"name":"f_seid","value":"0x0000000000000001"}]});
+        std::fs::write(
+            dir.join("oiran_events.jsonl"),
+            format!("{}\n{}\n", n4_request, sxab_same_seq),
+        )
+        .unwrap();
+        let mut events = vec![json!({"event_id":"evt-n4-resp","protocol":"PFCP","interface":"N4",
+            "message_name":"PFCP Session Establishment Response",
+            "decoded_ie_tree":[{"name":"pfcp_sequence","source":"session_identifiers","value":"7"}]})];
+        let added = insert_pfcp_siblings_into_callflow(&mut events, &dir).unwrap();
+        let ids: Vec<&str> = events.iter().map(|e| e["event_id"].as_str().unwrap()).collect();
+        assert_eq!(added, 1);
+        assert_eq!(ids, vec!["evt-n4-req", "evt-n4-resp"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
