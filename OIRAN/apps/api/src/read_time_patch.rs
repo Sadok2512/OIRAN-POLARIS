@@ -1412,37 +1412,21 @@ pub fn extend_items_with_pfcp_siblings_from_jsonl(
     if known_sequences.is_empty() && known_seids.is_empty() {
         return Ok(0);
     }
+    // 2.15.4 — index PFCP du dataset en cache (reconstruit seulement si
+    // les fichiers JSONL changent). 2.15.2/2.15.3 relisaient tous les
+    // shards à CHAQUE /events et /callflow : détail de session > 60 s en
+    // prod (ANR1 #10 6894872305).
+    let pfcp_events = cached_pfcp_events(dataset_root)?;
     let mut added = 0usize;
-    let flat = dataset_root.join("oiran_events.jsonl");
-    if flat.is_file() {
-        added += scan_jsonl_for_pfcp_siblings(
-            &flat,
-            items,
-            &mut known_event_ids,
-            &known_sequences,
-            &known_seids,
-        )?;
-    }
-    let shards_dir = dataset_root.join("event-shards");
-    if shards_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&shards_dir) {
-            let mut paths: Vec<PathBuf> = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.extension().and_then(|value| value.to_str()) == Some("jsonl")
-                })
-                .collect();
-            paths.sort();
-            for path in paths {
-                added += scan_jsonl_for_pfcp_siblings(
-                    &path,
-                    items,
-                    &mut known_event_ids,
-                    &known_sequences,
-                    &known_seids,
-                )?;
-            }
+    for value in pfcp_events.iter() {
+        let Some(event_id) = value.get("event_id").and_then(Value::as_str) else { continue };
+        if event_id.is_empty() || known_event_ids.contains(event_id) {
+            continue;
+        }
+        if pfcp_event_matches(value, &known_sequences, &known_seids) {
+            known_event_ids.insert(event_id.to_owned());
+            items.push(value.clone());
+            added += 1;
         }
     }
     if added > 0 {
@@ -1534,6 +1518,96 @@ fn canonical_sort_tuple(item: &Value) -> (String, u64, String) {
     (capture_id, packet_number, event_id)
 }
 
+fn pfcp_event_matches(value: &Value, known_sequences: &BTreeSet<String>, known_seids: &BTreeSet<String>) -> bool {
+    if let Some(seq) = value.get("pfcp_sequence").and_then(Value::as_str) {
+        if known_sequences.contains(seq) {
+            return true;
+        }
+    }
+    if let Some(ids) = value.get("session_identifiers").and_then(Value::as_array) {
+        for id in ids {
+            let name = id.get("name").and_then(Value::as_str).unwrap_or("");
+            let val = id.get("value").and_then(Value::as_str).unwrap_or("");
+            if val.is_empty() {
+                continue;
+            }
+            if name == "pfcp_sequence" && known_sequences.contains(val) {
+                return true;
+            }
+            if (name == "seid" || name == "f_seid") && val != "0x0000000000000000" && known_seids.contains(val) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+type PfcpCache = std::collections::HashMap<PathBuf, (Vec<(PathBuf, u64, u128)>, std::sync::Arc<Vec<Value>>)>;
+static PFCP_EVENT_CACHE: std::sync::LazyLock<std::sync::Mutex<PfcpCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(PfcpCache::new()));
+
+fn dataset_jsonl_files(dataset_root: &Path) -> Vec<(PathBuf, u64, u128)> {
+    let mut paths = Vec::new();
+    let flat = dataset_root.join("oiran_events.jsonl");
+    if flat.is_file() {
+        paths.push(flat);
+    }
+    if let Ok(entries) = std::fs::read_dir(dataset_root.join("event-shards")) {
+        let mut shards: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("jsonl"))
+            .collect();
+        shards.sort();
+        paths.extend(shards);
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let meta = std::fs::metadata(&path).ok();
+            let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = meta
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            (path, len, mtime)
+        })
+        .collect()
+}
+
+/// All PFCP raw events of a dataset, read once and reused until a JSONL
+/// file is added, grows or is rewritten.
+pub fn cached_pfcp_events(dataset_root: &Path) -> Result<std::sync::Arc<Vec<Value>>, String> {
+    let signature = dataset_jsonl_files(dataset_root);
+    if let Ok(cache) = PFCP_EVENT_CACHE.lock() {
+        if let Some((sig, events)) = cache.get(dataset_root) {
+            if *sig == signature {
+                return Ok(events.clone());
+            }
+        }
+    }
+    let mut events = Vec::new();
+    for (path, _, _) in &signature {
+        let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|error| error.to_string())?;
+            if !line.contains("\"protocol\":\"PFCP\"") {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                events.push(value);
+            }
+        }
+    }
+    let events = std::sync::Arc::new(events);
+    if let Ok(mut cache) = PFCP_EVENT_CACHE.lock() {
+        cache.insert(dataset_root.to_path_buf(), (signature, events.clone()));
+    }
+    Ok(events)
+}
+
+#[allow(dead_code)]
 fn scan_jsonl_for_pfcp_siblings(
     path: &Path,
     items: &mut Vec<Value>,
@@ -2422,6 +2496,28 @@ mod callflow_pfcp_insert_tests {
         assert_eq!(req["timestamp_ns"], "1794673477113697742");
         // idempotent
         assert_eq!(insert_pfcp_siblings_into_callflow(&mut events, &dir).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod pfcp_cache_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cache_reuses_index_and_refreshes_when_file_changes() {
+        let dir = std::env::temp_dir().join(format!("rtp-cache-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let req = |id: &str, seq: &str| json!({"event_id":id,"protocol":"PFCP","pfcp_sequence":seq,"message_name":"PFCP Session Establishment Request"});
+        std::fs::write(dir.join("oiran_events.jsonl"), format!("{}\n", req("evt-a", "1"))).unwrap();
+        let first = cached_pfcp_events(&dir).unwrap();
+        assert_eq!(first.len(), 1);
+        let again = cached_pfcp_events(&dir).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &again), "unchanged files must reuse the cache");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.join("oiran_events.jsonl"), format!("{}\n{}\n", req("evt-a", "1"), req("evt-b", "2"))).unwrap();
+        assert_eq!(cached_pfcp_events(&dir).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

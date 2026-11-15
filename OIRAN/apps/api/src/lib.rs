@@ -1102,6 +1102,21 @@ fn spawn_compact_index_workers(
             to_build.push(shard.clone());
         }
     }
+    // 2.15.4 — préchauffe le cache PFCP du dataset en arrière-plan, pour que
+    // le premier /events ou /callflow n'ait pas à relire tous les shards.
+    if let Some(first) = to_build.first() {
+        let path = first.path().to_path_buf();
+        let root = if path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("event-shards") {
+            path.parent().and_then(|p| p.parent()).map(std::path::Path::to_path_buf)
+        } else {
+            path.parent().map(std::path::Path::to_path_buf)
+        };
+        if let Some(root) = root {
+            tokio::task::spawn_blocking(move || {
+                let _ = read_time_patch::cached_pfcp_events(&root);
+            });
+        }
+    }
     for index in to_build {
         let registry_clone = registry.clone();
         let poll_secs = compact_index_poll_seconds();

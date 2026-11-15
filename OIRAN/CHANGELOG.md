@@ -1,5 +1,19 @@
 # Changelog
 
+## OIRAN API 2.15.4 — 2026-11-15 — Détail de session rapide (patch)
+
+- Corrige le FAIL ANR1 #10 6894872305 : avec 2.15.3, les GET de détail
+  (session, events, procedures, callflow, correlations) dépassaient la
+  limite UI de 60 s. Cause dans le code : la réconciliation PFCP
+  (`extend_items_with_pfcp_siblings_from_jsonl`, 2.15.2 sur /events,
+  2.15.3 aussi sur /callflow) relisait TOUS les shards JSONL du dataset à
+  chaque requête. Les events PFCP du dataset sont maintenant indexés une
+  fois (`cached_pfcp_events`), réutilisés tant qu'aucun fichier JSONL ne
+  change (taille + mtime), et le cache est préchauffé au démarrage avec
+  l'index compact.
+- `cargo test --release --workspace` : 567 OK / 0 FAIL / 9 ignorés.
+
+
 ## OIRAN API 2.15.3 — 2026-11-15 — IMSI 5G (SUCI null-scheme), PFCP Request dans /callflow (patch)
 
 - **IMSI 5G** : `tshark_identities` ne lisait que des champs 4G/Diameter
