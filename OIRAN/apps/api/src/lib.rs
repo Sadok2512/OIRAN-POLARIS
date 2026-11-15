@@ -3333,7 +3333,7 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                 // events, on patch via le raw JSONL du dataset_root,
                 // puis on recalcule serving_node/serving_ran_node/
                 // core_node depuis les participants patchés.
-                if let Some(dataset_root) = state
+                let patched_items: Option<Vec<Value>> = if let Some(dataset_root) = state
                     .inner
                     .capture_manager
                     .dataset_root(&dataset.dataset_id)
@@ -3366,15 +3366,38 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                                 );
                             }
                         }
+                        Some(items)
+                    } else {
+                        None
                     }
-                }
+                } else {
+                    None
+                };
                 decorate_subscriber_summary(&mut summary, &flow, &journey_index);
                 // 2.15.0 (ANR1 #10 6883006379) — identités compactes.
+                // 2.15.2 (ANR1 #10 6885876387, D3) — en prod le vault
+                // est vide pour les sessions continuous (hydrate_identities
+                // n'est déclenché que par la route /sessions/:id/identities,
+                // jamais au boot), ce qui faisait retourner `null` à la
+                // liste /api/v1/sessions. Fallback : extraire une shape
+                // d'identités compacte (subscriber_pseudonym +
+                // GUTI/TMSI/IMEI pseudonymisés) depuis les events déjà
+                // patchés. Respect règle Sadok 2026-11-14 : aucun
+                // clear-text IMSI/SUPI par ce chemin (pas de pcap/tshark
+                // disponible en lecture ; seul `tshark_identities` câble
+                // D4).
                 if let Some(object) = summary.as_object_mut() {
-                    object.insert(
-                        "identities".into(),
-                        identity_summary_for_session(&state, session_id),
-                    );
+                    let mut identities = identity_summary_for_session(&state, session_id);
+                    if identities.is_null() {
+                        if let Some(items) = patched_items.as_deref() {
+                            if let Some(fallback) =
+                                read_time_patch::extract_identity_summary_from_items(items)
+                            {
+                                identities = fallback;
+                            }
+                        }
+                    }
+                    object.insert("identities".into(), identities);
                 }
                 unique.insert(session_id.clone(), summary);
             }
@@ -3930,6 +3953,34 @@ fn push_identity(
     role: &str,
     subscriber_pseudonym: Option<String>,
 ) {
+    push_identity_full(
+        output,
+        evidence,
+        kind,
+        value,
+        value_type,
+        role,
+        subscriber_pseudonym,
+        None,
+    );
+}
+
+/// 2.15.2 (ANR1 #10 6885876387, D4, règle Sadok 2026-11-14) —
+/// helper interne qui autorise le remplissage de `cleartext`. Appelé
+/// uniquement pour les kinds autorisés (IMSI issu de `e212.imsi` =
+/// IMSI EPS en clair ou SUPI null-scheme déchiffré par tshark). Les
+/// autres kinds (GUTI, TMSI, IMEI, MSISDN) passent par `push_identity`
+/// ci-dessus et restent `cleartext: None`.
+fn push_identity_full(
+    output: &mut Vec<IdentityObservation>,
+    evidence: &PacketIdentityEvidence,
+    kind: &str,
+    value: String,
+    value_type: Option<&str>,
+    role: &str,
+    subscriber_pseudonym: Option<String>,
+    cleartext: Option<String>,
+) {
     if value.is_empty() {
         return;
     }
@@ -3943,10 +3994,7 @@ fn push_identity(
         event_id: evidence.event_id.clone(),
         capture_id: evidence.capture_id.clone(),
         packet_number: evidence.packet_number,
-        // 2.15.0 — cleartext rempli uniquement par les chemins
-        // SUCI null-scheme / IMSI EPS en clair ; ce helper
-        // générique reste sur None (pseudonymisation seule).
-        cleartext: None,
+        cleartext,
     });
 }
 
@@ -4020,7 +4068,16 @@ fn tshark_identities(
                         state.inner.capture_manager.pseudonym_key().as_ref(),
                         imsi.as_bytes(),
                     ));
-                    push_identity(
+                    // 2.15.2 (D4, règle Sadok 2026-11-14) — tshark n'emit
+                    // `e212.imsi` qu'une fois l'identité en clair pour
+                    // l'Analyzer (IMSI EPS ou SUPI d'un SUCI null-scheme
+                    // déchiffré par le dissecteur NAS). Ces deux cas sont
+                    // précisément les kinds autorisés à exposer
+                    // `IdentityObservation::cleartext` → UI
+                    // authentifiée de `/api/v1/sessions*`. GUTI/TMSI/
+                    // IMEI ci-dessous restent `cleartext: None`.
+                    let cleartext = Some(imsi.clone());
+                    push_identity_full(
                         &mut observations,
                         evidence,
                         "imsi",
@@ -4028,6 +4085,7 @@ fn tshark_identities(
                         Some("IMSI"),
                         role,
                         pseudo,
+                        cleartext,
                     );
                 }
             }
@@ -6945,6 +7003,224 @@ mod tests {
         assert_eq!(events[0]["event_id"], request_id);
         assert_eq!(events[1]["event_id"], response_id);
         assert_eq!(events[2]["event_id"], modif_id);
+    }
+
+    /// 2.15.2 (ANR1 #10 6885876387, D3) — test de régression du FAIL
+    /// prod 2.15.0/2.15.1 : `/api/v1/sessions` renvoie `identities:null`
+    /// pour une session continuous parce que `hydrate_identities` n'a
+    /// jamais tourné sur ce chemin (vault vide). Le fix 2.15.2 ajoute
+    /// un fallback `extract_identity_summary_from_items` qui lit les
+    /// identités pseudonymisées (subscriber_pseudonym, tmsi_pseudonym,
+    /// identity_pseudonym…) directement depuis les events déjà patchés.
+    ///
+    /// Setup identique au test D6 : dataset continuous reconstitué
+    /// à partir d'un `oiran_events.jsonl` + manifest + callflow
+    /// persisté. Les events du callflow (shape ANR1) portent les
+    /// identifiers NAS normalement produits par `decoder-nas`
+    /// (`subscriber_pseudonym`, `tmsi_pseudonym`, `identity_pseudonym`
+    /// + `eps_mobile_type_code=3` pour IMEISV). Règle Sadok 2026-11-14
+    /// respectée : aucune valeur IMSI/SUPI en clair dans ce chemin
+    /// (pas de pcap/tshark en lecture ; clear-text réservé à
+    /// `tshark_identities` côté `/sessions/:id/identities`).
+    #[tokio::test]
+    async fn prod_sessions_list_exposes_identities_from_items_when_vault_empty() {
+        use live_probe::{CaptureManager, CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID};
+        use std::io::Write as _;
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let capture_root_guard = AutoRemoveDir::new(
+            workspace
+                .join("runtime")
+                .join(format!("api-prod-d3-identities-{suffix}")),
+        );
+        let capture_root = capture_root_guard.as_pathbuf();
+        let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset_dir = base.join("dataset");
+        let generation_name = format!("generation-{}-0", epoch_seconds());
+        let callflows_dir = dataset_dir.join("callflow-generations").join(&generation_name);
+        let pcap_dir = base.join("pcap");
+        fs::create_dir_all(&callflows_dir).unwrap();
+        fs::create_dir_all(&pcap_dir).unwrap();
+
+        let session_id = "5g-session-c330d205adafa233";
+        let subscriber_pseudo = "sha256-c330d205adafa233subscriber";
+        let tmsi_pseudo = "sha256-tmsi-abcd1234";
+        let imei_pseudo = "sha256-imei-ef5678";
+
+        // Un event NAS 5G avec identifiers pseudonymisés (shape alignée
+        // sur `decoded_tree_with_identifiers` : union de
+        // `information_elements` et `identifiers`).
+        let nas_event = json!({
+            "event_id":"evt-nas-registration",
+            "timestamp":"","timestamp_ns":"0","interface":"N1","protocol":"NAS-5GS-MM",
+            "message_name":"Registration Request","source_participant":"UE","destination_participant":"AMF",
+            "direction":"RAN_TO_CORE",
+            "decoded_ie_tree":[
+                {"name":"identity_pseudonym","value":imei_pseudo,"pseudonymized":true},
+                {"name":"subscriber_pseudonym","value":subscriber_pseudo,"source":"session_identifiers","pseudonymized":true},
+                {"name":"eps_mobile_type_code","value":"3","source":"session_identifiers","pseudonymized":false},
+                {"name":"tmsi_pseudonym","value":tmsi_pseudo,"source":"session_identifiers","pseudonymized":true},
+            ],
+            "decoding_status":"DECODED","semantic_status":"EXACT",
+            "association":"SESSION","procedure_group":"5GMM Registration",
+            "packet_references":[{"source_file":"N1.pcap-stub","packet_number":1,"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}],
+            "capture_id":"sha256:continuous","decoder_name":"decoder-nas","decoder_version":"0.4.1",
+            "raw_payload_reference":"sha256:stub","errors":[]
+        });
+        let callflow = json!({
+            "callflow_id":format!("cf-{session_id}"),
+            "session_id":session_id,
+            "technology":"5G SA",
+            "start_timestamp":"","end_timestamp":"",
+            "participants":[],
+            "interfaces":["N1"],
+            "procedures":[],
+            "events":[nas_event],
+            "correlation_edges":[],
+            "correlation_status":{},
+            "decoder_versions":{"decoder-nas":"0.4.1"},
+            "schema_version":"1.5.0",
+            "capture_references":["sha256:continuous"],
+            "accounting":{"source_events":1,"session_events":1,"background_events":0,"unmatched_events":0,"duplicate_events":0,"extra_events":0},
+            "unresolved_fields":0
+        });
+        fs::write(
+            callflows_dir.join(format!("{session_id}.json")),
+            serde_json::to_vec_pretty(&callflow).unwrap(),
+        )
+        .unwrap();
+        fs::write(callflows_dir.join(format!("{session_id}.html")), b"<html/>").unwrap();
+
+        // Un JSONL raw minimal (même event NAS) pour que le
+        // read_time_patch index soit construit depuis un shard réel.
+        let jsonl_path = dataset_dir.join("oiran_events.jsonl");
+        let mut jsonl = fs::File::create(&jsonl_path).unwrap();
+        let raw_event = json!({
+            "event_id":"evt-nas-registration","parent_event_id":null,
+            "capture_id":"sha256:continuous","capture_point_id":"N1",
+            "timestamp":{"seconds":1794673477i64,"nanoseconds":0u64,"raw_ticks":1794673477000000000u64,"display":"1794673477.000000000Z"},
+            "interface":"N1","protocol":"NAS-5GS-MM",
+            "message_name":"Registration Request","message_type":65,"procedure_code":null,
+            "source_endpoint":{"address":"10.77.1.1","port":0u16,"network_function":"UE"},
+            "destination_endpoint":{"address":"10.77.1.2","port":0u16,"network_function":"AMF"},
+            "direction":"RAN_TO_CORE",
+            "session_identifiers":[
+                {"name":"subscriber_pseudonym","value":subscriber_pseudo,"pseudonymized":true},
+                {"name":"eps_mobile_type_code","value":"3","pseudonymized":false},
+                {"name":"tmsi_pseudonym","value":tmsi_pseudo,"pseudonymized":true},
+            ],
+            "information_elements":[
+                {"name":"identity_pseudonym","value":imei_pseudo,"pseudonymized":true},
+            ],
+            "decoding_status":"DECODED","decoder_name":"decoder-nas","decoder_version":"0.4.1",
+            "raw_payload_reference":"sha256:stub",
+            "packet_references":[{"source_file":"N1.pcap-stub","packet_number":1u64,"byte_offset":0u64,"interface_id":0u32,"captured_length":1u32,"original_length":1u32}],
+            "errors":[],
+        });
+        writeln!(jsonl, "{}", serde_json::to_string(&raw_event).unwrap()).unwrap();
+        drop(jsonl);
+
+        let manifest = json!({
+            "dataset_id": CONTINUOUS_DATASET_ID,
+            "capture_id": CONTINUOUS_CAPTURE_ID,
+            "path": "runtime/live-captures/continuous-lab-import/dataset",
+            "event_count": 1,
+            "session_ids": [session_id],
+            "decode_reports": {},
+            "checksums": {},
+            "state": "PARTIAL",
+            "callflows_path": format!("callflow-generations/{generation_name}"),
+        });
+        fs::write(
+            dataset_dir.join("dataset_manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let pseudonym_key_path = base.join(".oiran-pseudonym.key");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            capture_root.clone(),
+            false,
+            pseudonym_key_path,
+        )
+        .unwrap();
+        manager
+            .recover_continuous_dataset_from_disk(&base)
+            .expect("recover continuous dataset from on-disk manifest");
+
+        let mut config = test_config(workspace, &format!("registry-d3-prod-{suffix}"));
+        config.reference_dataset_enabled = false;
+        config.capture_root = capture_root.clone();
+        let state = AppState::load_with_capture_manager(config, manager).unwrap();
+        wait_for_compact_index_ready(&state, std::time::Duration::from_secs(10)).await;
+
+        // Pré-condition : vault VIDE pour cette session (reproduction
+        // fidèle du cas prod).
+        let vault_observations = state
+            .inner
+            .identity_vault
+            .for_session(session_id)
+            .unwrap();
+        assert!(
+            vault_observations.is_empty(),
+            "vault doit être vide pour reproduire le FAIL prod 2.15.0/2.15.1"
+        );
+
+        // GET /api/v1/sessions — gate ANR1 : identities non null.
+        let response = router(state.clone(), None)
+            .oneshot(req("/api/v1/sessions", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let items = body["data"].as_array().expect("sessions array");
+        let session = items
+            .iter()
+            .find(|item| item["session_id"] == session_id)
+            .expect("session présente dans /sessions");
+
+        let identities = &session["identities"];
+        assert!(
+            !identities.is_null(),
+            "identities doit être non null après le fix 2.15.2 (D3) : got {identities:?}"
+        );
+        assert_eq!(
+            identities["subscriber_pseudonym"].as_str(),
+            Some(subscriber_pseudo),
+            "subscriber_pseudonym remonté depuis l'event event déjà patché"
+        );
+        assert_eq!(
+            identities["imei"].as_str(),
+            Some(imei_pseudo),
+            "IMEI pseudo (identity_pseudonym + eps_mobile_type_code=3)"
+        );
+        let m_tmsi = identities["m_tmsi"].as_array().expect("m_tmsi array");
+        assert!(
+            m_tmsi.iter().any(|v| v.as_str() == Some(tmsi_pseudo)),
+            "tmsi_pseudonym remonté dans m_tmsi, got {m_tmsi:?}"
+        );
+        // Règle Sadok 2026-11-14 : aucun clear-text IMSI via ce chemin.
+        assert!(
+            identities["imsi"].is_null(),
+            "imsi doit rester null sans tshark/pcap (règle Sadok)"
+        );
+        assert!(
+            identities["imsi_cleartext"].is_null(),
+            "imsi_cleartext doit rester null sans tshark/pcap (règle Sadok)"
+        );
+
+        fs::remove_dir_all(&capture_root).ok();
     }
 
     /// 2.14.11 (ANR1 #10 6860508699) — test de CHARGE. Évolue le test

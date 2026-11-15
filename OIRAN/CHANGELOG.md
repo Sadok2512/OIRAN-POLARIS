@@ -1,5 +1,59 @@
 # Changelog
 
+## OIRAN API 2.15.2 — 2026-11-15 — D3/D4 complément (identities non null sur /sessions, D4 cleartext IMSI câblé)
+
+Complément 2.15.2 (même tag) après le D6 prod-path : fermeture simultanée de **D3** (`/api/v1/sessions` renvoyait `identities:null` pour la session continuous `5g-session-c330d205adafa233` parce que l'identity_vault est vide — `hydrate_identities` via tshark n'est jamais déclenché par la boucle `capture_manager`) et de **D4** (le champ `IdentityObservation::cleartext` exposé par 2.15.0 et les helpers 2.15.1 restaient non câblés sur le chemin chaud). Règle Sadok 2026-11-14 respectée : IMSI/SUPI null-scheme cleartext **UI authentifiée uniquement** ; GUTI/TMSI/IMEI toujours pseudonymisés ; jamais dans GitHub/logs.
+
+### Nouvelle API publique dans `read_time_patch`
+
+- `pub fn extract_identity_summary_from_items(items: &[Value]) -> Option<Value>` : remonte une shape identités compacte (`subscriber_pseudonym`, `imei`, `m_tmsi`, `s_tmsi`, `tmsi`) depuis les events **déjà patchés** d'une session (shapes `session_identifiers`, `decoded_ie_tree`, `information_elements`). Reconnaît :
+  - `subscriber_pseudonym` / `imsi_pseudonym` → `identities.subscriber_pseudonym`.
+  - `tmsi_pseudonym` → `identities.m_tmsi[]`.
+  - `s_tmsi_pseudonym` / `5g_s_tmsi_pseudonym` → `identities.s_tmsi[]`.
+  - `guti_pseudonym` / `5g_guti_pseudonym` → `identities.tmsi[]`.
+  - `identity_pseudonym` + `eps_mobile_type_code == 2|3` → `identities.imei` (IMEI/IMEISV pseudonymisé).
+  - `identity_pseudonym` + `eps_mobile_type_code == 1` → **ignoré** (IMSI subscriber, nommage explicite requis).
+  - `imsi` / `imsi_cleartext` restent `null` par ce chemin (règle Sadok : pas de pcap/tshark en lecture ; clear-text réservé à la voie vault ← `tshark_identities`).
+- Retourne `None` si aucune identité pseudonyme trouvée → caller laisse `identities: null` (comportement 2.15.0/2.15.1 strictement préservé quand aucune donnée identité n'est présente).
+
+### Câblage dans la route /api/v1/sessions
+
+- `apps/api/src/lib.rs::sessions` (boucle `capture_manager.datasets()`) : après `apply_read_time_patch`, l'ensemble `items` patché est capturé. Pour le résumé identités, on tente d'abord `identity_summary_for_session(state, session_id)` (vault) ; si le résultat est `Value::Null`, fallback `read_time_patch::extract_identity_summary_from_items(&items)`. Les deux autres branches (`state.inner.flows`, LTE evidence store) restent inchangées : le fix est **localisé au chemin prod continuous**, aucune régression ailleurs.
+
+### Câblage D4 cleartext dans tshark_identities
+
+- `apps/api/src/lib.rs::push_identity` dédoublé en `push_identity_full(…, cleartext: Option<String>)`. Pour `kind == "imsi"` observé via `e212.imsi` (tshark n'emit ce champ **que** quand l'IMSI est en clair : IMSI EPS ou SUPI d'un SUCI null-scheme déchiffré par le dissecteur NAS), `cleartext = Some(imsi.clone())`. Tous les autres kinds (`tmsi`, `s_tmsi`, `m_tmsi`, `imei`, `msisdn`) continuent d'appeler `push_identity` qui force `cleartext: None` — règle Sadok appliquée **par signature**, impossible de régresser par inadvertance.
+- La route `/api/v1/sessions/:id/identities` (sous `require_operator`) expose désormais `imsi_cleartext` quand la dissection tshark a réussi — même format que `sessions.identities[].imsi_cleartext` déjà livré par 2.15.0.
+
+### Tests ajoutés (3 unitaires + 1 d'intégration chemin prod)
+
+- `read_time_patch::tests::extract_identity_summary_remonte_pseudonymes_depuis_items` : subscriber + tmsi + IMEI (type_code=3) remonte la shape attendue ; `imsi` et `imsi_cleartext` restent `null`.
+- `read_time_patch::tests::extract_identity_summary_ignore_identity_pseudonym_pour_eps_type_code_1` : `identity_pseudonym` + `eps_mobile_type_code=1` → **pas** promu en `imei` (c'est subscriber).
+- `read_time_patch::tests::extract_identity_summary_retourne_none_quand_aucun_pseudo` : event purement PFCP → `None` (aucun impact `/sessions`).
+- `tests::prod_sessions_list_exposes_identities_from_items_when_vault_empty` (chemin prod) : dataset `continuous-lab-import` reconstitué (JSONL raw + manifest + callflow), vault **vide** pré-asserté, `AppState::load_with_capture_manager` + `wait_for_compact_index_ready` → `GET /api/v1/sessions` renvoie `identities.subscriber_pseudonym`, `identities.imei`, `identities.m_tmsi` non null ; `identities.imsi` et `identities.imsi_cleartext` restent `null` (règle Sadok).
+
+### Preuves (runner devmat, 2026-11-15)
+
+```
+$ cargo test --release --locked -p oiran-api --lib -- \
+    prod_pfcp_request_type_50_appears_in_events_even_when_absent_from_callflow \
+    prod_sessions_list_exposes_identities_from_items_when_vault_empty \
+    extract_identity_summary
+test result: ok. 5 passed; 0 failed; 98 filtered out
+
+$ cargo test --release --locked --workspace --no-fail-fast
+# 77 suites, 563 passed, 0 failed, 9 ignored, exit 0
+# +4 tests D3/D4 vs 559 en D6-only 2.15.2
+
+$ cargo build --release --locked --workspace
+Finished `release` profile [optimized] target(s) in 1m 28s
+```
+
+### Note de contrat (règle Sadok 2026-11-14)
+
+- `/api/v1/sessions*` : seules routes qui peuvent exposer `imsi_cleartext`. Toutes les autres surfaces (logs, exports, snapshots, callflow HTML publié) continuent d'appliquer la privacy mask (`apply_privacy_mask`) et sont couvertes par la `forbidden_list` existante.
+- Le JSONL raw sur disque reste **sans** clear-text IMSI/SUPI : les helpers `decoder-nas::decode_*` (2.15.1) ne sont pas câblés dans l'ingestion. Clear-text IMSI/SUPI apparaît uniquement (a) dans l'`IdentityVault` (mode 0600, store privé root-only) alimenté par `tshark_identities` quand un opérateur demande `/sessions/:id/identities`, puis (b) dans la réponse HTTP `/sessions*` sous UI authentifiée après lecture vault → summary.
+
 ## OIRAN API 2.15.2 — 2026-11-15 — D6 chemin prod (/sessions/:id/events scanne le JSONL raw à la lecture)
 
 Correction du FAIL prod ANR1 #10 6885876387 sur 2.15.0 et 2.15.1. Le fix 2.15.0 côté `session_engine::expand_pfcp_session_members` + `phase_ten_session_events` ne s'appliquait qu'au chemin in-memory et ne rattrapait pas les callflows **déjà persistés sur disque avant 2.15.0**. En prod, le shard `shard-…-103-094c31b26bd5662b.jsonl` contenait la PFCP Session Establishment Request type 50 (`evt-349c72dc0f5510c3`, `pfcp_sequence=2209`) mais `/api/v1/sessions/5g-session-c330d205adafa233/events?protocol=PFCP` continuait à n'exposer que 2 events (Response + Modification). Le fix 2.15.2 agit **à la lecture**, côté route HTTP.

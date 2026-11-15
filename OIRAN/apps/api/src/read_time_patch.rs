@@ -1603,6 +1603,123 @@ fn scan_jsonl_for_pfcp_siblings(
     Ok(added)
 }
 
+/// 2.15.2 (ANR1 #10 6885876387, D3) — résumé compact des identités
+/// extrait **des events déjà présents** (après `apply_read_time_patch`
+/// et `extend_items_with_pfcp_siblings_from_jsonl`) pour alimenter
+/// `/api/v1/sessions` quand le vault est vide (cas prod : la session
+/// continuous n'a jamais déclenché `hydrate_identities` via tshark).
+///
+/// La shape renvoyée est volontairement alignée sur celle produite par
+/// `identity_summary_for_session(state, session_id)` côté lib.rs :
+/// `imsi`, `imsi_cleartext`, `imei`, `msisdn`, `tmsi`, `s_tmsi`,
+/// `m_tmsi`, `subscriber_pseudonym`. Les valeurs retournées sont
+/// extraites des champs déjà pseudonymisés par le décodeur (nom
+/// canonique dans `session_identifiers` ou `decoded_ie_tree`) :
+///
+/// - `subscriber_pseudonym` : première occurrence trouvée
+///   (NAS pseudonym 5GS/EPS, cf. decoder-nas).
+/// - `tmsi_pseudonym` / `*_pseudonym` : remonté dans `m_tmsi`
+///   (pseudonymisé, règle Sadok 2026-11-14).
+/// - `identity_pseudonym` + `eps_mobile_type_code=2|3` : IMEI/IMEISV
+///   pseudonymisé → kind `imei` (digits non disponibles depuis
+///   l'event JSONL raw).
+///
+/// Clear-text IMSI/SUPI : **jamais** rempli par ce chemin
+/// (règle Sadok : clear-text réservé à la voie
+/// vault ← `tshark_identities`, qui dispose du pcap). Le champ
+/// `imsi_cleartext` reste donc `null` quand on tire de ce helper.
+///
+/// Retourne `None` si aucune identité pseudonyme n'est trouvée (cas
+/// d'une session purement PFCP sans NAS) : dans ce cas le caller
+/// laisse `identities` à `null` (comportement 2.15.0/2.15.1 préservé).
+pub fn extract_identity_summary_from_items(items: &[Value]) -> Option<Value> {
+    let mut subscriber_pseudonym: Option<String> = None;
+    let mut imei_pseudonym: Option<String> = None;
+    let mut m_tmsi_pseudonyms: BTreeSet<String> = BTreeSet::new();
+    let mut s_tmsi_pseudonyms: BTreeSet<String> = BTreeSet::new();
+    let mut guti_pseudonyms: BTreeSet<String> = BTreeSet::new();
+
+    for item in items {
+        let eps_mobile_type_code = find_named_value(item, "eps_mobile_type_code")
+            .and_then(|value| value.parse::<u8>().ok());
+        for (name, value) in iter_named_pairs(item) {
+            match name {
+                "subscriber_pseudonym" | "imsi_pseudonym" => {
+                    if subscriber_pseudonym.is_none() {
+                        subscriber_pseudonym = Some(value.to_owned());
+                    }
+                }
+                "tmsi_pseudonym" => {
+                    m_tmsi_pseudonyms.insert(value.to_owned());
+                }
+                "s_tmsi_pseudonym" | "5g_s_tmsi_pseudonym" => {
+                    s_tmsi_pseudonyms.insert(value.to_owned());
+                }
+                "guti_pseudonym" | "5g_guti_pseudonym" => {
+                    guti_pseudonyms.insert(value.to_owned());
+                }
+                "identity_pseudonym" => {
+                    if matches!(eps_mobile_type_code, Some(2) | Some(3))
+                        && imei_pseudonym.is_none()
+                    {
+                        imei_pseudonym = Some(value.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if subscriber_pseudonym.is_none()
+        && imei_pseudonym.is_none()
+        && m_tmsi_pseudonyms.is_empty()
+        && s_tmsi_pseudonyms.is_empty()
+        && guti_pseudonyms.is_empty()
+    {
+        return None;
+    }
+
+    let to_array = |set: BTreeSet<String>| -> Vec<Value> {
+        set.into_iter().map(Value::String).collect()
+    };
+    Some(serde_json::json!({
+        "imsi": Value::Null,
+        "imsi_cleartext": Value::Null,
+        "imei": imei_pseudonym,
+        "msisdn": Value::Null,
+        "tmsi": to_array(guti_pseudonyms),
+        "s_tmsi": to_array(s_tmsi_pseudonyms),
+        "m_tmsi": to_array(m_tmsi_pseudonyms),
+        "subscriber_pseudonym": subscriber_pseudonym,
+    }))
+}
+
+fn iter_named_pairs(item: &Value) -> Vec<(&str, &str)> {
+    let mut out: Vec<(&str, &str)> = Vec::new();
+    for key in ["session_identifiers", "decoded_ie_tree", "information_elements"] {
+        let Some(items) = item.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in items {
+            let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
+            let value = entry.get("value").and_then(Value::as_str).unwrap_or("");
+            if !name.is_empty() && !value.is_empty() {
+                out.push((name, value));
+            }
+        }
+    }
+    out
+}
+
+fn find_named_value<'a>(item: &'a Value, needle: &str) -> Option<&'a str> {
+    for (name, value) in iter_named_pairs(item) {
+        if name == needle {
+            return Some(value);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2101,5 +2218,63 @@ mod tests {
         );
         std::fs::remove_file(&jsonl_path).ok();
         std::fs::remove_dir(&dir).ok();
+    }
+
+    /// 2.15.2 (ANR1 #10 6885876387, D3) — `extract_identity_summary_from_items`
+    /// doit remonter `subscriber_pseudonym`, `tmsi_pseudonym`,
+    /// `identity_pseudonym` (via `eps_mobile_type_code=3`) depuis
+    /// `decoded_ie_tree` / `session_identifiers` / `information_elements`.
+    #[test]
+    fn extract_identity_summary_remonte_pseudonymes_depuis_items() {
+        let items = vec![json!({
+            "event_id":"evt-nas",
+            "session_identifiers":[
+                {"name":"subscriber_pseudonym","value":"sha256-sub","pseudonymized":true},
+                {"name":"eps_mobile_type_code","value":"3","pseudonymized":false},
+                {"name":"tmsi_pseudonym","value":"sha256-tmsi","pseudonymized":true},
+            ],
+            "information_elements":[
+                {"name":"identity_pseudonym","value":"sha256-imei","pseudonymized":true},
+            ],
+        })];
+        let summary = extract_identity_summary_from_items(&items).expect("summary");
+        assert_eq!(summary["subscriber_pseudonym"], "sha256-sub");
+        assert_eq!(summary["imei"], "sha256-imei");
+        let m_tmsi = summary["m_tmsi"].as_array().unwrap();
+        assert_eq!(m_tmsi.len(), 1);
+        assert_eq!(m_tmsi[0], "sha256-tmsi");
+        // Règle Sadok 2026-11-14 : IMSI / clear-text jamais via ce chemin.
+        assert!(summary["imsi"].is_null());
+        assert!(summary["imsi_cleartext"].is_null());
+    }
+
+    /// Règle Sadok 2026-11-14 : `identity_pseudonym` avec
+    /// `eps_mobile_type_code=1` (IMSI) ne doit **pas** être remonté
+    /// dans `imei` — c'est un cas d'identité subscriber, pas device.
+    #[test]
+    fn extract_identity_summary_ignore_identity_pseudonym_pour_eps_type_code_1() {
+        let items = vec![json!({
+            "event_id":"evt-nas-eps",
+            "decoded_ie_tree":[
+                {"name":"identity_pseudonym","value":"sha256-sub","pseudonymized":true},
+                {"name":"eps_mobile_type_code","value":"1","source":"session_identifiers","pseudonymized":false},
+            ],
+        })];
+        let summary = extract_identity_summary_from_items(&items);
+        assert!(
+            summary.is_none(),
+            "aucune identité device/subscriber pseudo nommée explicitement → None"
+        );
+    }
+
+    #[test]
+    fn extract_identity_summary_retourne_none_quand_aucun_pseudo() {
+        let items = vec![json!({
+            "event_id":"evt-pfcp",
+            "session_identifiers":[
+                {"name":"pfcp_sequence","value":"2209","pseudonymized":false},
+            ],
+        })];
+        assert!(extract_identity_summary_from_items(&items).is_none());
     }
 }
