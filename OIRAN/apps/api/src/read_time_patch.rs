@@ -24,7 +24,7 @@
 //! modified and is not counted.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -1364,6 +1364,243 @@ impl RawEventIndex {
     pub fn from_map(by_event_id: HashMap<String, Value>) -> Self {
         Self { by_event_id }
     }
+}
+
+/// 2.15.2 (ANR1 #10 6885876387) — réconciliation à la lecture
+/// des events PFCP de la session avec le JSONL raw du dataset.
+/// Le callflow persisté sur disque (chemin prod CONTINUOUS) peut
+/// ne pas contenir la `PFCP Session Establishment Request` type
+/// 50 alors que le shard JSONL la porte avec le même
+/// `pfcp_sequence` ou `seid`/`f_seid` qu'une Response/Modification
+/// déjà rattachée à la session. Fix 2.15.0 côté pré-publication
+/// (`session_engine::expand_pfcp_session_members`) ne prenait que
+/// sur le chemin in-memory ; les callflows déjà persistés avant
+/// 2.15.0 restent sans la Request → ANR1 FAIL 2.15.0 + 2.15.1.
+///
+/// Cette fonction fait le fix **à la lecture** (côté
+/// `/api/v1/sessions/:id/events`) : on collecte les
+/// `pfcp_sequence`/`seid` des events PFCP déjà dans `items`,
+/// puis on scanne en streaming `oiran_events.jsonl` +
+/// `event-shards/*.jsonl` du dataset_root pour tirer tout event
+/// PFCP partageant ces clés et non déjà présent par `event_id`.
+///
+/// Garanties :
+/// - Ordre canonique `(capture_id, packet_number, event_id)`
+///   garanti si des events sont ajoutés.
+/// - `f_seid = 0x0000000000000000` (placeholder nul partagé)
+///   n'est **jamais** considéré comme un match.
+/// - Short-circuit si aucun event PFCP n'a de clé connue :
+///   on ne scanne pas le JSONL (zéro I/O).
+/// - Retourne le nombre d'events ajoutés (0 = pas de sibling,
+///   comportement idempotent).
+pub fn extend_items_with_pfcp_siblings_from_jsonl(
+    items: &mut Vec<Value>,
+    dataset_root: &Path,
+) -> Result<usize, String> {
+    let mut known_sequences: BTreeSet<String> = BTreeSet::new();
+    let mut known_seids: BTreeSet<String> = BTreeSet::new();
+    let mut known_event_ids: BTreeSet<String> = BTreeSet::new();
+    for item in items.iter() {
+        if let Some(id) = item.get("event_id").and_then(Value::as_str) {
+            known_event_ids.insert(id.to_owned());
+        }
+        if item.get("protocol").and_then(Value::as_str) != Some("PFCP") {
+            continue;
+        }
+        collect_pfcp_keys(item, &mut known_sequences, &mut known_seids);
+    }
+    if known_sequences.is_empty() && known_seids.is_empty() {
+        return Ok(0);
+    }
+    let mut added = 0usize;
+    let flat = dataset_root.join("oiran_events.jsonl");
+    if flat.is_file() {
+        added += scan_jsonl_for_pfcp_siblings(
+            &flat,
+            items,
+            &mut known_event_ids,
+            &known_sequences,
+            &known_seids,
+        )?;
+    }
+    let shards_dir = dataset_root.join("event-shards");
+    if shards_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&shards_dir) {
+            let mut paths: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+                })
+                .collect();
+            paths.sort();
+            for path in paths {
+                added += scan_jsonl_for_pfcp_siblings(
+                    &path,
+                    items,
+                    &mut known_event_ids,
+                    &known_sequences,
+                    &known_seids,
+                )?;
+            }
+        }
+    }
+    if added > 0 {
+        items.sort_by(|a, b| canonical_sort_tuple(a).cmp(&canonical_sort_tuple(b)));
+    }
+    Ok(added)
+}
+
+fn collect_pfcp_keys(
+    item: &Value,
+    sequences: &mut BTreeSet<String>,
+    seids: &mut BTreeSet<String>,
+) {
+    // Top-level `pfcp_sequence` (shape JSONL raw de production).
+    if let Some(seq) = item.get("pfcp_sequence").and_then(Value::as_str) {
+        if !seq.is_empty() {
+            sequences.insert(seq.to_owned());
+        }
+    }
+    // `session_identifiers` (shape JSONL raw).
+    if let Some(ids) = item.get("session_identifiers").and_then(Value::as_array) {
+        for id in ids {
+            let name = id.get("name").and_then(Value::as_str).unwrap_or("");
+            let value = id.get("value").and_then(Value::as_str).unwrap_or("");
+            if value.is_empty() {
+                continue;
+            }
+            match name {
+                "pfcp_sequence" => {
+                    sequences.insert(value.to_owned());
+                }
+                "seid" | "f_seid" if value != "0x0000000000000000" => {
+                    seids.insert(value.to_owned());
+                }
+                _ => {}
+            }
+        }
+    }
+    // `decoded_ie_tree` (shape callflow persisté, payload ANR1
+    // #10 6883006379 : `{"name":"F-SEID","value":"f_seid=0x314,...}`).
+    if let Some(tree) = item.get("decoded_ie_tree").and_then(Value::as_array) {
+        for entry in tree {
+            let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
+            let raw = entry.get("value").and_then(Value::as_str).unwrap_or("");
+            if raw.is_empty() {
+                continue;
+            }
+            match name {
+                "pfcp_sequence" => {
+                    sequences.insert(raw.to_owned());
+                }
+                "F-SEID" | "f_seid" | "seid" => {
+                    let seid_val = raw
+                        .split(',')
+                        .next()
+                        .map(|part| {
+                            part.trim_start_matches("f_seid=")
+                                .trim_start_matches("seid=")
+                        })
+                        .unwrap_or("");
+                    if seid_val != "0x0000000000000000" && !seid_val.is_empty() {
+                        seids.insert(seid_val.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn canonical_sort_tuple(item: &Value) -> (String, u64, String) {
+    let capture_id = item
+        .get("capture_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let packet_number = item
+        .get("packet_references")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|first| first.get("packet_number").and_then(Value::as_u64))
+        .or_else(|| item.get("packet_number").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let event_id = item
+        .get("event_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    (capture_id, packet_number, event_id)
+}
+
+fn scan_jsonl_for_pfcp_siblings(
+    path: &Path,
+    items: &mut Vec<Value>,
+    known_event_ids: &mut BTreeSet<String>,
+    known_sequences: &BTreeSet<String>,
+    known_seids: &BTreeSet<String>,
+) -> Result<usize, String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let reader = BufReader::new(file);
+    let mut added = 0usize;
+    for line in reader.lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Short-circuit : skip si pas PFCP via match string.
+        if !line.contains("\"protocol\":\"PFCP\"") {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let event_id = match value.get("event_id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => id.to_owned(),
+            _ => continue,
+        };
+        if known_event_ids.contains(&event_id) {
+            continue;
+        }
+        let mut matched = false;
+        // Top-level pfcp_sequence.
+        if let Some(seq) = value.get("pfcp_sequence").and_then(Value::as_str) {
+            if known_sequences.contains(seq) {
+                matched = true;
+            }
+        }
+        // session_identifiers.
+        if !matched {
+            if let Some(ids) = value.get("session_identifiers").and_then(Value::as_array) {
+                for id in ids {
+                    let name = id.get("name").and_then(Value::as_str).unwrap_or("");
+                    let val = id.get("value").and_then(Value::as_str).unwrap_or("");
+                    if val.is_empty() {
+                        continue;
+                    }
+                    if name == "pfcp_sequence" && known_sequences.contains(val) {
+                        matched = true;
+                        break;
+                    }
+                    if (name == "seid" || name == "f_seid")
+                        && val != "0x0000000000000000"
+                        && known_seids.contains(val)
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if matched {
+            known_event_ids.insert(event_id);
+            items.push(value);
+            added += 1;
+        }
+    }
+    Ok(added)
 }
 
 #[cfg(test)]

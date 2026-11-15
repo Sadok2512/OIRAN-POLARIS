@@ -1,5 +1,51 @@
 # Changelog
 
+## OIRAN API 2.15.2 — 2026-11-15 — D6 chemin prod (/sessions/:id/events scanne le JSONL raw à la lecture)
+
+Correction du FAIL prod ANR1 #10 6885876387 sur 2.15.0 et 2.15.1. Le fix 2.15.0 côté `session_engine::expand_pfcp_session_members` + `phase_ten_session_events` ne s'appliquait qu'au chemin in-memory et ne rattrapait pas les callflows **déjà persistés sur disque avant 2.15.0**. En prod, le shard `shard-…-103-094c31b26bd5662b.jsonl` contenait la PFCP Session Establishment Request type 50 (`evt-349c72dc0f5510c3`, `pfcp_sequence=2209`) mais `/api/v1/sessions/5g-session-c330d205adafa233/events?protocol=PFCP` continuait à n'exposer que 2 events (Response + Modification). Le fix 2.15.2 agit **à la lecture**, côté route HTTP.
+
+### Nouvelle fonction publique
+
+- `pub fn extend_items_with_pfcp_siblings_from_jsonl(items, dataset_root) -> Result<usize, String>` dans `read_time_patch` : scanne en streaming `oiran_events.jsonl` + `event-shards/*.jsonl` du `dataset_root`, collecte les `pfcp_sequence`/`seid`/`f_seid` des events PFCP déjà dans `items`, tire les siblings PFCP non encore présents (match par sequence OU seid non nul), retourne le nombre d'events ajoutés. Zéro I/O si aucune clé PFCP connue (short-circuit). Ordre canonique `(capture_id, packet_number, event_id)` garanti si des events sont ajoutés. `f_seid = 0x0000000000000000` jamais considéré comme match (placeholder nul partagé).
+- Reconnaît les 3 shapes de porte-clés : top-level `pfcp_sequence` (JSONL raw), `session_identifiers[].name=="pfcp_sequence"/"seid"/"f_seid"` (JSONL raw), `decoded_ie_tree[].name=="pfcp_sequence"/"F-SEID"` (callflow persisté format ANR1).
+
+### Câblage dans le handler /events
+
+- `apps/api/src/lib.rs::session_events` : après `apply_read_time_patch`, appelle `extend_items_with_pfcp_siblings_from_jsonl(&mut items, dataset_root)`. Sanitize + filter + pagination appliqués ensuite comme avant. Compatible avec read_time_patch existant (compteurs inchangés).
+
+### Test obligatoire du chemin prod
+
+`prod_pfcp_request_type_50_appears_in_events_even_when_absent_from_callflow` (apps/api/src/lib.rs) reproduit **fidèlement** le FAIL prod ANR1 #10 6885876387 :
+
+- Dataset `continuous-lab-import` + `CaptureManager::with_pseudonym_key_path` + `recover_continuous_dataset_from_disk` (chemin prod).
+- `oiran_events.jsonl` avec les 3 events (Request `evt-349c72dc0f5510c3` + Response `evt-104645ebe2174b02` + Modification `evt-aa1b0ac453b62fd9`), `pfcp_sequence=2209/2210`, `f_seid=0x0000000000000314`.
+- Callflow `5g-session-c330d205adafa233.json` persisté contenant **UNIQUEMENT** Response + Modification (reproduit exactement le callflow prod).
+- `AppState::load_with_capture_manager` + `wait_for_compact_index_ready` (chemin prod `read_time_patch.index.ready=true`).
+- Assert : `GET /sessions/5g-session-c330d205adafa233/events?protocol=PFCP` renvoie **3 events** incluant `evt-349c72dc0f5510c3`.
+- Assert : ordre canonique Request → Response → Modification (packets 1,2,3).
+
+### Preuves (runner devmat, 2026-11-15)
+
+```
+$ cargo test --release --locked -p oiran-api --lib -- \
+    prod_pfcp_request_type_50_appears_in_events_even_when_absent_from_callflow --nocapture
+{"build_ms":0,"bytes_estimate":60,"entries":3,"event":"READ_TIME_PATCH_INDEX_READY","path":".../oiran_events.jsonl"}
+test tests::prod_pfcp_request_type_50_appears_in_events_even_when_absent_from_callflow ... ok
+test result: ok. 1 passed; 0 failed; 97 filtered out
+
+$ cargo test --release --locked --workspace --no-fail-fast
+# 77 suites, 559 passed, 0 failed, 9 ignored, exit 0
+# +1 nouveau test prod D6 vs 558 en 2.15.1
+```
+
+### Points OUVERTS 2.15.3
+
+- **D3 chemin prod** (identités non null sur `/sessions`) : le vault reste vide pour la session cible en prod. Fix demande d'extraire les identités depuis les events NAS du JSONL raw (shape `information_elements[].name="identity_pseudonym"` + raw bytes) et upsert dans le vault. Le code `tshark_identities` existant demande `&flow` et passe par tshark external, ni l'un ni l'autre n'est utilisable depuis le handler `sessions()` qui traite N sessions. Lot dédié 2.15.3 : nouvelle fn `extract_identities_from_jsonl_events(dataset_root, session_id, event_ids) -> Vec<IdentityObservation>` + câblage dans `sessions()` + test de régression.
+- **D4 câblage ingestion** : les helpers 2.15.1 `decoder_nas::decode_suci_null_scheme_supi` + `decode_imsi_eps` restent exposés mais pas appelés. Le lot 2.15.3 doit les câbler dans la nouvelle fn `extract_identities_from_jsonl_events` pour peupler `IdentityObservation::cleartext`.
+- **D6 chemin publication** : `phase_ten_session_events` branche disque scratch (`retained_publication_events.is_none()`) reste non couverte. Moins critique maintenant : le fix à la lecture (2.15.2) couvre les callflows déjà écrits. À traiter si la charge I/O à la lecture devient un problème (actuellement scan streaming avec short-circuit `"\"protocol\":\"PFCP\""`).
+
+Bump patch : `oiran-api 2.15.1 → 2.15.2`. Aucune autre crate touchée.
+
 ## OIRAN API 2.15.1 — 2026-11-14 — D4 câblage decoder-nas (helpers publics décodent SUPI null-scheme + IMSI EPS en clair)
 
 Patch 2.15.0 : le champ `IdentityObservation::cleartext` existe mais la chaîne `decoder-nas` ne le remplit pas. 2.15.1 ajoute les 2 helpers publics strictement conformes à la règle Sadok 2026-11-14 pour alimenter ce champ depuis les bytes raw d'un IE NAS.

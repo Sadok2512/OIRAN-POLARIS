@@ -4411,6 +4411,15 @@ async fn session_events(
     } else {
         read_time_patch::PatchStatus::NotApplicable
     };
+    // 2.15.2 (ANR1 #10 6885876387) — réconciliation avec le JSONL
+    // raw : la PFCP Session Establishment Request type 50 absente
+    // du callflow persisté est récupérée si elle partage un
+    // `pfcp_sequence`/`seid` avec la Response/Modification déjà
+    // présente. Fix 2.15.0 pré-publication ne couvrait pas le
+    // chemin prod (callflow déjà écrit sur disque avant 2.15.0).
+    if let Some(root) = dataset_root.as_deref() {
+        let _ = read_time_patch::extend_items_with_pfcp_siblings_from_jsonl(&mut items, root);
+    }
     filter_events(&mut items, &query);
     sanitize_all(&mut items);
     paginated_with_patch_status(items, &query, patch_status).into_response()
@@ -6680,6 +6689,262 @@ mod tests {
         assert_eq!(before_jsonl, before_sha(&jsonl_path));
 
         fs::remove_dir_all(&capture_root).ok();
+    }
+
+    /// 2.15.2 (ANR1 #10 6885876387) — test de régression du FAIL
+    /// prod 2.15.0/2.15.1 : la `PFCP Session Establishment Request`
+    /// type 50 (`evt-349c72dc0f5510c3`, `pfcp_sequence=2209`) est
+    /// dans le shard JSONL de production mais ABSENTE du callflow
+    /// persisté sur disque (continuous-lab-import). La Response
+    /// (seq=2209) et la Modification (seq=2210) sont dans les
+    /// deux. Le fix 2.15.0 pré-publication (`session_engine::
+    /// expand_pfcp_session_members`) ne s'applique qu'au chemin
+    /// in-memory et ne rattrape pas les callflows déjà écrits.
+    ///
+    /// Ce test monte un dataset `continuous-lab-import` fidèle au
+    /// chemin prod (CaptureManager + manifest + callflow
+    /// persisté qui ne contient QUE Response + Modification) et
+    /// vérifie que `GET /api/v1/sessions/<id>/events?protocol=PFCP`
+    /// renvoie désormais les **3 events** (Request + Response +
+    /// Modification), avec `read_time_patch.index.ready=true` au
+    /// moment de la requête.
+    #[tokio::test]
+    async fn prod_pfcp_request_type_50_appears_in_events_even_when_absent_from_callflow() {
+        use live_probe::{CaptureManager, CONTINUOUS_CAPTURE_ID, CONTINUOUS_DATASET_ID};
+        use std::io::Write as _;
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let capture_root_guard = AutoRemoveDir::new(
+            workspace
+                .join("runtime")
+                .join(format!("api-prod-pfcp-request-{suffix}")),
+        );
+        let capture_root = capture_root_guard.as_pathbuf();
+        let base = capture_root.join(CONTINUOUS_CAPTURE_ID);
+        let dataset_dir = base.join("dataset");
+        let generation_name = format!("generation-{}-0", epoch_seconds());
+        let callflows_dir = dataset_dir.join("callflow-generations").join(&generation_name);
+        let pcap_dir = base.join("pcap");
+        fs::create_dir_all(&callflows_dir).unwrap();
+        fs::create_dir_all(&pcap_dir).unwrap();
+
+        // 3 events PFCP raw (fidèles au payload ANR1 #10 6883006379).
+        // Request type 50 dans le JSONL mais absente du callflow.
+        let request_id = "evt-349c72dc0f5510c3";
+        let response_id = "evt-104645ebe2174b02";
+        let modif_id = "evt-aa1b0ac453b62fd9";
+        let raw_request = json!({
+            "event_id": request_id,
+            "parent_event_id": null,
+            "capture_id":"sha256:continuous",
+            "capture_point_id":"N4",
+            "timestamp":{"seconds":1794673477i64,"nanoseconds":113697742u64,"raw_ticks":1794673477113697742u64,"display":"1794673477.113697742Z"},
+            "interface":"N4","protocol":"PFCP",
+            "message_name":"PFCP Session Establishment Request","message_type":50,"procedure_code":null,
+            "source_endpoint":{"address":"10.77.23.12","port":8805u16,"network_function":"SMF"},
+            "destination_endpoint":{"address":"10.77.23.13","port":8805u16,"network_function":"UPF"},
+            "direction":"SMF_TO_UPF",
+            "session_identifiers":[
+                {"name":"pfcp_sequence","value":"2209","pseudonymized":false},
+            ],
+            "information_elements":[],
+            "pfcp_sequence":"2209",
+            "decoding_status":"DECODED","decoder_name":"decoder-pfcp","decoder_version":"0.3.0",
+            "raw_payload_reference":"sha256:stub",
+            "packet_references":[{"source_file":"N4.pcap-stub","packet_number":1u64,"byte_offset":0u64,"interface_id":0u32,"captured_length":1u32,"original_length":1u32}],
+            "errors":[],
+        });
+        let raw_response = json!({
+            "event_id": response_id,
+            "parent_event_id": null,
+            "capture_id":"sha256:continuous",
+            "capture_point_id":"N4",
+            "timestamp":{"seconds":1794673477i64,"nanoseconds":114281357u64,"raw_ticks":1794673477114281357u64,"display":"1794673477.114281357Z"},
+            "interface":"N4","protocol":"PFCP",
+            "message_name":"PFCP Session Establishment Response","message_type":51,"procedure_code":null,
+            "source_endpoint":{"address":"10.77.23.13","port":8805u16,"network_function":"UPF"},
+            "destination_endpoint":{"address":"10.77.23.12","port":8805u16,"network_function":"SMF"},
+            "direction":"UPF_TO_SMF",
+            "session_identifiers":[
+                {"name":"pfcp_sequence","value":"2209","pseudonymized":false},
+                {"name":"f_seid","value":"0x0000000000000314","pseudonymized":false},
+            ],
+            "information_elements":[],
+            "pfcp_sequence":"2209",
+            "decoding_status":"DECODED","decoder_name":"decoder-pfcp","decoder_version":"0.3.0",
+            "raw_payload_reference":"sha256:stub",
+            "packet_references":[{"source_file":"N4.pcap-stub","packet_number":2u64,"byte_offset":0u64,"interface_id":0u32,"captured_length":1u32,"original_length":1u32}],
+            "errors":[],
+        });
+        let raw_modif = json!({
+            "event_id": modif_id,
+            "parent_event_id": null,
+            "capture_id":"sha256:continuous",
+            "capture_point_id":"N4",
+            "timestamp":{"seconds":1794673477i64,"nanoseconds":121578185u64,"raw_ticks":1794673477121578185u64,"display":"1794673477.121578185Z"},
+            "interface":"N4","protocol":"PFCP",
+            "message_name":"PFCP Session Modification Request","message_type":52,"procedure_code":null,
+            "source_endpoint":{"address":"10.77.23.12","port":8805u16,"network_function":"SMF"},
+            "destination_endpoint":{"address":"10.77.23.13","port":8805u16,"network_function":"UPF"},
+            "direction":"SMF_TO_UPF",
+            "session_identifiers":[
+                {"name":"pfcp_sequence","value":"2210","pseudonymized":false},
+                {"name":"f_seid","value":"0x0000000000000314","pseudonymized":false},
+            ],
+            "information_elements":[],
+            "pfcp_sequence":"2210",
+            "decoding_status":"DECODED","decoder_name":"decoder-pfcp","decoder_version":"0.3.0",
+            "raw_payload_reference":"sha256:stub",
+            "packet_references":[{"source_file":"N4.pcap-stub","packet_number":3u64,"byte_offset":0u64,"interface_id":0u32,"captured_length":1u32,"original_length":1u32}],
+            "errors":[],
+        });
+        // JSONL raw contient les 3.
+        let jsonl_path = dataset_dir.join("oiran_events.jsonl");
+        let mut jsonl = fs::File::create(&jsonl_path).unwrap();
+        for event in [&raw_request, &raw_response, &raw_modif] {
+            writeln!(jsonl, "{}", serde_json::to_string(event).unwrap()).unwrap();
+        }
+        drop(jsonl);
+
+        // Callflow persisté ne contient QUE Response + Modification.
+        // Shape alignée sur ANR1 (decoded_ie_tree avec pfcp_sequence/F-SEID).
+        let session_id = "5g-session-c330d205adafa233";
+        let flow_event = |event_id: &str, message_name: &str, direction: &str, decoded_ie_tree: Value, packet: u64| json!({
+            "event_id":event_id,"timestamp":"","timestamp_ns":"0","interface":"N4","protocol":"PFCP",
+            "message_name":message_name,"source_participant":"SMF","destination_participant":"UPF","direction":direction,
+            "decoded_ie_tree":decoded_ie_tree,"decoding_status":"DECODED","semantic_status":"EXACT",
+            "association":"SESSION","procedure_group":"PFCP Session",
+            "packet_references":[{"source_file":"N4.pcap-stub","packet_number":packet,"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}],
+            "capture_id":"sha256:continuous","decoder_name":"decoder-pfcp","decoder_version":"0.3.0",
+            "raw_payload_reference":"sha256:stub","errors":[]
+        });
+        let callflow = json!({
+            "callflow_id":format!("cf-{session_id}"),
+            "session_id":session_id,
+            "technology":"5G SA",
+            "start_timestamp":"","end_timestamp":"",
+            "participants":[],
+            "interfaces":["N4"],
+            "procedures":[],
+            "events":[
+                flow_event(response_id, "PFCP Session Establishment Response", "UPF_TO_SMF", json!([{"name":"pfcp_sequence","value":"2209"},{"name":"F-SEID","value":"f_seid=0x0000000000000314,v4=true,ipv4=10.77.23.13"}]), 2),
+                flow_event(modif_id, "PFCP Session Modification Request", "SMF_TO_UPF", json!([{"name":"pfcp_sequence","value":"2210"},{"name":"F-SEID","value":"f_seid=0x0000000000000314,v4=true,ipv4=10.77.23.13"}]), 3),
+            ],
+            "correlation_edges":[],
+            "correlation_status":{},
+            "decoder_versions":{"decoder-pfcp":"0.3.0"},
+            "schema_version":"1.5.0",
+            "capture_references":["sha256:continuous"],
+            "accounting":{"source_events":2,"session_events":2,"background_events":0,"unmatched_events":0,"duplicate_events":0,"extra_events":0},
+            "unresolved_fields":0
+        });
+        fs::write(
+            callflows_dir.join(format!("{session_id}.json")),
+            serde_json::to_vec_pretty(&callflow).unwrap(),
+        )
+        .unwrap();
+        fs::write(callflows_dir.join(format!("{session_id}.html")), b"<html/>").unwrap();
+
+        let manifest = json!({
+            "dataset_id": CONTINUOUS_DATASET_ID,
+            "capture_id": CONTINUOUS_CAPTURE_ID,
+            "path": "runtime/live-captures/continuous-lab-import/dataset",
+            "event_count": 3,
+            "session_ids": [session_id],
+            "decode_reports": {},
+            "checksums": {},
+            "state": "PARTIAL",
+            "callflows_path": format!("callflow-generations/{generation_name}"),
+        });
+        fs::write(
+            dataset_dir.join("dataset_manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // Construction du CaptureManager (operational mode).
+        let pseudonym_key_path = base.join(".oiran-pseudonym.key");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            capture_root.clone(),
+            false,
+            pseudonym_key_path,
+        )
+        .unwrap();
+        manager
+            .recover_continuous_dataset_from_disk(&base)
+            .expect("recover continuous dataset from on-disk manifest");
+
+        let mut config = test_config(workspace, &format!("registry-pfcp-prod-{suffix}"));
+        config.reference_dataset_enabled = false;
+        config.capture_root = capture_root.clone();
+        let state = AppState::load_with_capture_manager(config, manager).unwrap();
+
+        // Attendre que l'index compact soit prêt (chemin prod :
+        // read_time_patch index built in background).
+        wait_for_compact_index_ready(&state, std::time::Duration::from_secs(10)).await;
+
+        // Vérif pré-conditions : index.ready=true + capture_id visible.
+        let version = json_body(
+            router(state.clone(), None)
+                .oneshot(req("/api/v1/version", true))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            version["data"]["read_time_patch"]["index"]["ready"], true,
+            "index must be ready before we assert on /events"
+        );
+
+        // GET /sessions/<id>/events?protocol=PFCP — gate ANR1.
+        let response = router(state.clone(), None)
+            .oneshot(req(
+                &format!("/api/v1/sessions/{session_id}/events?protocol=PFCP"),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let events = body["data"].as_array().expect("events array");
+
+        // L'assertion qui OBLIGEAIT 2.15.0/2.15.1 à FAIL en prod.
+        let event_ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e.get("event_id").and_then(Value::as_str))
+            .collect();
+        assert!(
+            event_ids.contains(&request_id),
+            "PFCP Session Establishment Request {} must be present in /events even when absent \
+             from the persisted callflow (seen in prod shard JSONL, same pfcp_sequence=2209 \
+             as the Response). event_ids observed: {:?}",
+            request_id,
+            event_ids
+        );
+        assert_eq!(
+            events.len(),
+            3,
+            "all 3 PFCP events must be served (Request + Response + Modification), got {} : {:?}",
+            events.len(),
+            event_ids
+        );
+
+        // Ordre canonique : Request (packet=1) avant Response (packet=2)
+        // avant Modification (packet=3).
+        assert_eq!(events[0]["event_id"], request_id);
+        assert_eq!(events[1]["event_id"], response_id);
+        assert_eq!(events[2]["event_id"], modif_id);
     }
 
     /// 2.14.11 (ANR1 #10 6860508699) — test de CHARGE. Évolue le test
