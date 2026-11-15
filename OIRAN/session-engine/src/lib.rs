@@ -1898,6 +1898,18 @@ fn attach_sbi_to_sessions(
     let mut pseudo_pdu: BTreeMap<(String, String), usize> = BTreeMap::new();
     // Index (tunnel_endpoint_ip_norm, gtp_teid_norm) → session_index.
     let mut tunnel_idx: BTreeMap<(String, String), usize> = BTreeMap::new();
+    // 2.18.7 (ANR1 #10 6901968948) — Index pseudo → ensemble de
+    // sessions. Fallback pour les events SBI qui portent le
+    // `subscriber_pseudonym` mais PAS de `pdu_session_id` (ex.
+    // Nudm_SDM `am-data`, Nudm_UECM `registrations`, Npcf
+    // `am-policy-data`) ni de tunnel `(ip, teid)` (pas de
+    // n2SmInfo). Avant 2.18.7 : ces events n'étaient attachés à
+    // AUCUNE session malgré un match abonné prouvé par la trace
+    // Live. On relie désormais ces events à TOUTES les sessions
+    // du même pseudonyme — l'abonné est le seul lien légitime
+    // disponible, et attacher à plusieurs sessions concurrentes
+    // reste correct (c'est bien l'abonné qui porte l'opération).
+    let mut pseudo_only: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (idx, session) in pdu_sessions.iter().enumerate() {
         let pdu_id = session.pdu_session_id.clone();
         for event_id in &session.event_ids {
@@ -1905,6 +1917,10 @@ fn attach_sbi_to_sessions(
                 continue;
             };
             if let Some(pseudo) = event.first_identifier("subscriber_pseudonym") {
+                let entry = pseudo_only.entry(pseudo.to_owned()).or_default();
+                if !entry.contains(&idx) {
+                    entry.push(idx);
+                }
                 pseudo_pdu
                     .entry((pseudo.to_owned(), pdu_id.clone()))
                     .or_insert(idx);
@@ -2010,13 +2026,20 @@ fn attach_sbi_to_sessions(
         let pseudo = event
             .first_identifier("subscriber_pseudonym")
             .map(str::to_owned);
-        let mut target_idx: Option<usize> = None;
+        // 2.18.7 (ANR1 #10 6901968948) — on n'a plus un seul
+        // `target_idx` mais un VEC d'indices : les events SBI qui
+        // ne portent pas de PDU session ID (ex. Nudm_SDM am-data)
+        // doivent pouvoir se rattacher à toutes les sessions
+        // actives du même abonné. La trace Live le fait déjà par
+        // simple substring du pseudonyme dans le JSON de l'event ;
+        // on offre le même filet côté session-engine.
+        let mut target_indices: Vec<usize> = Vec::new();
         if let (Some(pseudo), Some(pdu_id)) = (&pseudo, &pdu_id) {
             if let Some(&idx) = pseudo_pdu.get(&(pseudo.clone(), pdu_id.clone())) {
-                target_idx = Some(idx);
+                target_indices.push(idx);
             }
         }
-        if target_idx.is_none() {
+        if target_indices.is_empty() {
             let ip = event
                 .first_identifier("tunnel_endpoint_ip")
                 .map(event_schema::normalize_ip);
@@ -2025,18 +2048,38 @@ fn attach_sbi_to_sessions(
                 .and_then(event_schema::normalize_teid_hex);
             if let (Some(ip), Some(teid)) = (ip, teid) {
                 if let Some(&idx) = tunnel_idx.get(&(ip, teid)) {
-                    target_idx = Some(idx);
+                    target_indices.push(idx);
                 }
             }
         }
-        if let Some(idx) = target_idx {
+        // 2.18.7 — fallback pseudo-seul (dernier recours).
+        // S'applique SEULEMENT si les 2 clés dual précédentes
+        // n'ont rien trouvé. Évite de dupliquer un event SBI
+        // (pseudo+pdu+tunnel déjà prouvés) sur toutes les
+        // sessions d'un même abonné : la précision du match dual
+        // reste prioritaire. Ne s'applique qu'aux SBI qui portent
+        // un pseudonyme — jamais de hypothèse.
+        if target_indices.is_empty() {
+            if let Some(pseudo) = pseudo.as_deref() {
+                if let Some(indices) = pseudo_only.get(pseudo) {
+                    target_indices = indices.clone();
+                }
+            }
+        }
+        for idx in target_indices {
             let session = &mut pdu_sessions[idx];
             session.event_ids.push(event.event_id.clone());
             if !session.interfaces.iter().any(|iface| iface == &event.interface) {
                 session.interfaces.push(event.interface.clone());
                 session.interfaces.sort();
             }
-            event_context.insert(event.event_id.clone(), session.ue_context_id.clone());
+            // event_context est un BTreeMap<event_id, context_id>.
+            // Insertion unique : si plusieurs sessions rattachent
+            // le même SBI (cas pseudo-seul), le 1er UE context
+            // est retenu (déterministe par ordre d'indices).
+            event_context
+                .entry(event.event_id.clone())
+                .or_insert_with(|| session.ue_context_id.clone());
         }
     }
 }
@@ -4708,5 +4751,248 @@ mod tests {
             sbi_events.len()
         );
         std::fs::remove_file(&tmp).ok();
+    }
+
+    /// 2.18.7 (ANR1 #10 6901968948) — reproduit le FAIL prod.
+    /// Sessions `5g-session-92e82900a18969c3` + `5g-session-
+    /// eab5cc6d8c2b9131` (même abonné) : Live UE-201 reçoit 59 SBI
+    /// alors que `/sessions/:id/callflow` montre 0 SBI rattaché.
+    ///
+    /// Cause : les events SBI N8/N10/N12 (`Nudm_SDM am-data`,
+    /// `Nudm_UECM registrations`, `Npcf am-policy-data`) portent
+    /// `subscriber_pseudonym` mais PAS de `pdu_session_id` ni de
+    /// tunnel `(ip, teid)` (pas de n2SmInfo). Les 2 clés dual de
+    /// `attach_sbi_to_sessions` pré-2.18.7 échouaient toutes les
+    /// deux → 0 rattachement malgré le match abonné prouvé par la
+    /// trace Live.
+    ///
+    /// Fix 2.18.7 : fallback pseudo-seul après échec des 2 dual.
+    /// L'event SBI est rattaché à TOUTES les sessions du même
+    /// pseudonyme (l'abonné est le seul lien légitime disponible,
+    /// et plusieurs PDU sessions concurrentes du même UE partagent
+    /// toutes la même opération AM data / registration).
+    #[test]
+    fn sbi_without_pdu_or_tunnel_attaches_by_subscriber_pseudonym_alone_anr1_6901968948() {
+        // Session 5G avec son N2 setup (seule clé disponible côté
+        // session : subscriber_pseudonym via N2).
+        let n2 = event(
+            "evt-n2-setup",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            &[
+                ("subscriber_pseudonym", "psn-supi-xyz"),
+                ("pdu_session_id", "1"),
+                ("ran_ue_ngap_id", "5"),
+                ("amf_ue_ngap_id", "11"),
+                ("item_0_tunnel_ip_ul", "10.77.22.13"),
+                ("item_0_gtp_teid_ul", "0x1234"),
+            ],
+            1,
+        );
+        let n2_resp = event(
+            "evt-n2-resp",
+            "NGAP",
+            "PDUSessionResourceSetupResponse",
+            &[
+                ("subscriber_pseudonym", "psn-supi-xyz"),
+                ("pdu_session_id", "1"),
+            ],
+            2,
+        );
+        // Event SBI Nudm_SDM am-data : porte le pseudo (hashé
+        // depuis le SUPI de l'URI/body) mais PAS de PDU session
+        // ID (opération par abonné, pas par PDU). Shape prod.
+        let sbi_am_data = event(
+            "evt-sbi-am-data",
+            "SBI-HTTP2",
+            "GET am-data",
+            &[("subscriber_pseudonym", "psn-supi-xyz")],
+            3,
+        );
+        // Event SBI Nudm_UECM registration : idem.
+        let sbi_reg = event(
+            "evt-sbi-registration",
+            "SBI-HTTP2",
+            "PUT registrations/amf-3gpp-access",
+            &[("subscriber_pseudonym", "psn-supi-xyz")],
+            4,
+        );
+        let events = vec![n2, n2_resp, sbi_am_data, sbi_reg];
+        let discovery = discover_sessions(&mut events.clone());
+        assert_eq!(discovery.pdu_sessions.len(), 1);
+        let session = &discovery.pdu_sessions[0];
+        assert!(
+            session
+                .event_ids
+                .iter()
+                .any(|id| id == "evt-sbi-am-data"),
+            "SBI am-data (sans pdu_session_id, sans tunnel) doit être rattaché par pseudo-seul ; got {:?}",
+            session.event_ids
+        );
+        assert!(
+            session
+                .event_ids
+                .iter()
+                .any(|id| id == "evt-sbi-registration"),
+            "SBI registration doit aussi être rattaché par pseudo-seul ; got {:?}",
+            session.event_ids
+        );
+        assert!(
+            session.interfaces.iter().any(|i| i == "SBI-HTTP2"),
+            "SBI-HTTP2 doit apparaître dans session.interfaces ; got {:?}",
+            session.interfaces
+        );
+    }
+
+    /// 2.18.7 — un abonné avec DEUX sessions actives : un SBI
+    /// AM data (sans pdu_session_id) doit être rattaché aux DEUX
+    /// sessions (l'opération est par abonné, pas par PDU — toute
+    /// les PDU sessions concurrentes partagent la même operation).
+    #[test]
+    fn sbi_pseudo_only_attaches_to_all_sessions_of_the_same_subscriber() {
+        let make_n2 = |event_id: &str, pdu_id: &str, packet: u64| {
+            event(
+                event_id,
+                "NGAP",
+                "PDUSessionResourceSetupRequest",
+                &[
+                    ("subscriber_pseudonym", "psn-supi-xyz"),
+                    ("pdu_session_id", pdu_id),
+                    ("ran_ue_ngap_id", "5"),
+                    ("amf_ue_ngap_id", "11"),
+                    ("item_0_tunnel_ip_ul", "10.77.22.13"),
+                    ("item_0_gtp_teid_ul", pdu_id),
+                ],
+                packet,
+            )
+        };
+        let make_resp = |event_id: &str, pdu_id: &str, packet: u64| {
+            event(
+                event_id,
+                "NGAP",
+                "PDUSessionResourceSetupResponse",
+                &[
+                    ("subscriber_pseudonym", "psn-supi-xyz"),
+                    ("pdu_session_id", pdu_id),
+                ],
+                packet,
+            )
+        };
+        let n2_a = make_n2("evt-n2-setup-a", "1", 1);
+        let n2_a_resp = make_resp("evt-n2-resp-a", "1", 2);
+        let n2_b = make_n2("evt-n2-setup-b", "2", 3);
+        let n2_b_resp = make_resp("evt-n2-resp-b", "2", 4);
+        let sbi_am_data = event(
+            "evt-sbi-am-data",
+            "SBI-HTTP2",
+            "GET am-data",
+            &[("subscriber_pseudonym", "psn-supi-xyz")],
+            5,
+        );
+        let events = vec![n2_a, n2_a_resp, n2_b, n2_b_resp, sbi_am_data];
+        let discovery = discover_sessions(&mut events.clone());
+        assert_eq!(
+            discovery.pdu_sessions.len(),
+            2,
+            "deux PDU sessions distinctes attendues"
+        );
+        let both_have_sbi = discovery.pdu_sessions.iter().all(|session| {
+            session
+                .event_ids
+                .iter()
+                .any(|id| id == "evt-sbi-am-data")
+        });
+        assert!(
+            both_have_sbi,
+            "l'event SBI am-data doit être rattaché aux DEUX sessions du même abonné ; got {:?}",
+            discovery
+                .pdu_sessions
+                .iter()
+                .map(|s| (s.pdu_session_id.as_str(), s.event_ids.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// 2.18.7 — non-régression : un SBI qui porte (pseudo, pdu_id)
+    /// MATCHANT reste rattaché UNIQUEMENT à la session de ce PDU
+    /// (match dual prioritaire). Le fallback pseudo-seul ne doit
+    /// PAS inonder les autres sessions du même abonné.
+    #[test]
+    fn sbi_with_pdu_id_stays_bound_to_its_pdu_session_only() {
+        let n2_a = event(
+            "evt-n2-a",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            &[
+                ("subscriber_pseudonym", "psn-supi-xyz"),
+                ("pdu_session_id", "1"),
+                ("ran_ue_ngap_id", "5"),
+                ("amf_ue_ngap_id", "11"),
+            ],
+            1,
+        );
+        let n2_a_resp = event(
+            "evt-n2-a-resp",
+            "NGAP",
+            "PDUSessionResourceSetupResponse",
+            &[
+                ("subscriber_pseudonym", "psn-supi-xyz"),
+                ("pdu_session_id", "1"),
+            ],
+            2,
+        );
+        let n2_b = event(
+            "evt-n2-b",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            &[
+                ("subscriber_pseudonym", "psn-supi-xyz"),
+                ("pdu_session_id", "2"),
+                ("ran_ue_ngap_id", "5"),
+                ("amf_ue_ngap_id", "11"),
+            ],
+            3,
+        );
+        let n2_b_resp = event(
+            "evt-n2-b-resp",
+            "NGAP",
+            "PDUSessionResourceSetupResponse",
+            &[
+                ("subscriber_pseudonym", "psn-supi-xyz"),
+                ("pdu_session_id", "2"),
+            ],
+            4,
+        );
+        let sbi_pdu1 = event(
+            "evt-sbi-pdu1",
+            "SBI-HTTP2",
+            "CreateSMContext",
+            &[
+                ("subscriber_pseudonym", "psn-supi-xyz"),
+                ("pdu_session_id", "1"),
+            ],
+            5,
+        );
+        let events = vec![n2_a, n2_a_resp, n2_b, n2_b_resp, sbi_pdu1];
+        let discovery = discover_sessions(&mut events.clone());
+        assert_eq!(discovery.pdu_sessions.len(), 2);
+        let session_1 = discovery
+            .pdu_sessions
+            .iter()
+            .find(|s| s.pdu_session_id == "1")
+            .unwrap();
+        let session_2 = discovery
+            .pdu_sessions
+            .iter()
+            .find(|s| s.pdu_session_id == "2")
+            .unwrap();
+        assert!(
+            session_1.event_ids.iter().any(|id| id == "evt-sbi-pdu1"),
+            "SBI pdu=1 doit être sur session pdu=1"
+        );
+        assert!(
+            !session_2.event_ids.iter().any(|id| id == "evt-sbi-pdu1"),
+            "SBI pdu=1 ne doit PAS être sur session pdu=2 (match dual prioritaire)"
+        );
     }
 }

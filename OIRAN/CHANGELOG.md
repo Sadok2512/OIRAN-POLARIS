@@ -1,5 +1,64 @@
 # Changelog
 
+## OIRAN API 2.18.7 — 2026-11-15 — SBI rattaché par pseudonyme-seul (patch)
+
+**FAIL prod ANR1 #10 6901968948** : Live UE-201 reçoit **59 events SBI-HTTP2** du même abonné (prouvé côté trace Live), mais les sessions publiées (`5g-session-92e82900a18969c3`, `5g-session-eab5cc6d8c2b9131`) montrent **0 SBI rattaché** malgré 2.18.3 (dedup SBI preserve_occurrence). La cause n'est donc pas une perte de l'event SBI en amont, mais l'échec du match côté `attach_sbi_to_sessions`.
+
+### Comparaison des clés (audit statique)
+
+| Chemin | Clé de match SBI |
+|---|---|
+| `live_trace::route_normalized` (`apps/api/src/live_trace.rs:115-136`) | **substring** du pseudonyme (hash SUPI) dans le JSON entier de l'event SBI — n'importe où (identifiers, IE, URI sanitisée, body décodé). Bascule aussi par `state.keys` accumulés (TMSI/GUTI/TEID/IP) via substring. |
+| `session-engine::attach_sbi_to_sessions` ≤ 2.18.6 | **structuré dual** : `(pseudo, pdu_id)` lus depuis `event.first_identifier(...)` **OU** `(tunnel_endpoint_ip, gtp_teid)` lus depuis les identifiers normalisés. Aucun fallback pseudo-seul. |
+
+**Cause prouvée par lecture** : la majorité des events SBI N8/N10/N12 (`Nudm_SDM am-data`, `Nudm_UECM registrations/amf-3gpp-access`, `Npcf am-policy-data`, etc.) portent `subscriber_pseudonym` **mais pas de `pdu_session_id`** (opération par abonné, pas par PDU) et **pas de tunnel** (`n2SmInfo` est uniquement dans `N1N2MessageTransfer`). Les 2 clés dual échouent → aucun rattachement → `/sessions/:id/callflow` montre 0 SBI.
+
+Live ne voit pas ce problème parce que son match substring sur le JSON entier capture le pseudonyme dans n'importe quelle représentation.
+
+### Fix 2.18.7 — fallback pseudo-seul (dernier recours)
+
+Dans `session-engine::attach_sbi_to_sessions` :
+
+1. Nouvel index `pseudo_only: BTreeMap<String, Vec<usize>>` construit en parallèle de `pseudo_pdu` : chaque pseudonyme pointe sur **toutes** les sessions qui le portent (plusieurs PDU concurrentes pour un même UE).
+2. `target_idx: Option<usize>` → `target_indices: Vec<usize>`. Un SBI peut maintenant être rattaché à **plusieurs** sessions (l'opération par abonné est partagée — c'est bien l'abonné qui porte la requête, pas une PDU en particulier).
+3. Flux de match (ordre strict de priorité) :
+   - **(pseudo, pdu_id)** : match dual → rattache à l'unique session PDU prouvée.
+   - **(tunnel_endpoint_ip, gtp_teid)** : match tunnel → rattache à l'unique session N3/N4.
+   - **pseudo-seul** (fallback dernier recours) : rattache à **toutes** les sessions du même abonné, mais SEULEMENT si les deux précédentes clés n'ont rien trouvé. Évite de dupliquer un match déjà précis.
+4. `event_context` : insertion via `entry().or_insert_with(...)` pour que le 1er UE context (par ordre d'indices) soit retenu de façon déterministe quand plusieurs sessions rattachent le même SBI.
+
+### Tests ajoutés (3 unitaires dans `session_engine::tests`)
+
+- `sbi_without_pdu_or_tunnel_attaches_by_subscriber_pseudonym_alone_anr1_6901968948` — reproduit exactement la shape prod : session N2 setup/response + 2 events SBI (`am-data`, `registrations`) qui portent **seulement** `subscriber_pseudonym` → session rattache les 2 events SBI, interface `SBI-HTTP2` apparaît.
+- `sbi_pseudo_only_attaches_to_all_sessions_of_the_same_subscriber` — un abonné avec 2 PDU sessions actives + 1 SBI `am-data` sans PDU → l'event SBI est rattaché aux **deux** sessions (opération par abonné).
+- `sbi_with_pdu_id_stays_bound_to_its_pdu_session_only` — **non-régression** : un SBI avec `(pseudo, pdu_id=1)` matchant reste exclusivement sur la session pdu=1, ne contamine pas la session pdu=2. Le match dual prioritaire est préservé.
+
+### Preuves (runner devmat, 2026-11-15)
+
+```
+$ cargo test --release --offline -p session-engine --lib -- \
+    sbi_without_pdu sbi_pseudo_only sbi_with_pdu_id
+# 3 passed; 0 failed; 37 filtered out
+
+$ cargo test --release --offline --workspace --no-fail-fast
+# exit=0 ; 77 suites, 604 passed, 0 failed, 10 ignored
+# +3 vs 601 en 2.18.6
+```
+
+### Points OUVERTS (jamais par hypothèse)
+
+- **Validation sur données prod** : la cause est identifiée par analyse statique + 3 tests qui reproduisent fidèlement la shape prod (SBI avec pseudo seul, 2 PDU concurrentes, SBI avec pdu_id pour non-régression). La confirmation du nombre exact d'events SBI rattachés avant/après 2.18.7 sur `5g-session-92e82900a18969c3` + `5g-session-eab5cc6d8c2b9131` demande l'extrait JSONL prod déjà demandé à ANR1 sur #10 pour 2.18.3.
+- **Capture SBI séparée** (hypothèse #2 du prompt Sadok) : si le pipeline continuous publie les shards SBI dans un dataset séparé des N2/N4 (fenêtre différente), `attach_sbi_to_sessions` ne les voit pas du tout. Le code `live-probe::publish_events_to_dataset_dir` passe `events` complet à `discover_sessions` donc, SI les SBI sont dans `events`, ils sont bien vus. La question « sont-ils dans events » demande un `ls` du dossier shards prod + `grep "protocol":"SBI-HTTP2"` sur les shards récents. Postée sur #10.
+
+### Hors périmètre respecté
+
+- `apps/api/src/lib.rs` : INTACTE (sauf bump version).
+- `apps/api/src/read_time_patch.rs` : INTACTE.
+- `POLARIS_CONTROL/`, `apps/control/` : INTACTES.
+- Seule `session-engine::attach_sbi_to_sessions` modifiée.
+
+Bump patch : `oiran-api 2.18.6 → 2.18.7`.
+
 ## OIRAN API 2.18.6 — 2026-11-15 — Live : doublons écartés, inversions comptées (patch)
 
 - Constat ANR1 (#10 6901968948, trace UE-201) : 105 messages, 19 doublons adjacents exacts, 13 inversions `(capture_id, seq)`.
