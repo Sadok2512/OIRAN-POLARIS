@@ -1,5 +1,75 @@
 # Changelog
 
+## OIRAN API 2.17.0 — 2026-11-15 — Trace E2E 5G : IMS ingestion + règles SIP/RTP + N4_IMS dans `correlation_status` (ANR1 #10 E2E-5G)
+
+Lot 1 de la feuille de route « Trace E2E 5G » (audit #10 6896790347, feu vert #10 6896869321). Étend la chaîne de corrélation du data-plane (N2→SBI→N4→N3) au voice-plane IMS (SIP + RTP). Trois diagnostics amont prouvés par Sadok (SBI continuous perdu, IMS non ingéré, 412 ingestion_failures) traités partiellement — le reste est documenté sur #10 pour un lot 2.17.1.
+
+### Interface `IMS` acceptée par le capture-helper et le mode continuous-import
+
+- `OIRAN/capture-helper/src/lib.rs` : nouvelle variante `InterfaceId::Ims` avec `device = "br-oiran-ims"`, `label = "IMS"`, matching de classification UDP port 5060 (SIP). Les flux RTP (ports SDP dynamiques) sont déjà capturés via N3 GTP-U.
+- `OIRAN/live-probe/src/lib.rs::helper_spec` : accepte `"IMS"` et le mappe à `InterfaceId::Ims` (avant 2.17.0, toute interface hors N2/N3/N4/SBI était silencieusement droppée du spec envoyé au capture-helper).
+- `OIRAN/live-probe/src/lib.rs::plane_name` : ajoute `"IMS" => "IMS"` pour que le plan IMS soit étiqueté dans les RSS traces et les JSON `/metrics`.
+- Déjà acquis avant 2.17.0 (donc préservé) : `interface_has_decoder("IMS") == true` et `canonical_interface_for_plane("ims"|"ims_vonr") == "IMS"`, qui reconnaissent les pcaps `/var/lib/.../ims/ims_vonr_*.pcapng` par chemin en mode `OIRAN_CONTINUOUS_IMPORT_SOURCE`.
+
+### Nouveau IE `sdp.c_ue_ip_pseudonym` dans `decoder-sip`
+
+- `OIRAN/decoder-sip/src/lib.rs` : ajout d'un IE `sdp.c_ue_ip_pseudonym` calculé comme `pseudonym(key, "pfcp-ue-ip", sdp.connection_address.as_bytes())`. Le domain `"pfcp-ue-ip"` est **exactement** celui qu'utilise `decoder-pfcp` (`src/lib.rs:268`) pour pseudonymiser l'IE `ue_ip`. Cette égalité de domain et de sel garantit que les deux hashs comparent la même IP UE **sans jamais écrire l'IP en clair** côté correlation-engine.
+- Règle Sadok préservée : l'IP UE en clair reste confinée au décodeur (payload dissequé localement), le hash seul traverse la chaîne de corrélation.
+
+### 3 nouvelles règles de corrélation IMS (`correlation-engine/src/lib.rs`)
+
+Factorisation dans `ims_edges_from_events()` appelée à la fin de `correlate_cross_interface_evidence()` pour la testabilité.
+
+1. **`sip-pfcp-ue-ipv4-pseudonym-match`** — arête **IMS ↔ N4**, confidence `EXACT`, evidence_type `EXACT_UE_IP_MATCH`, scope `ue-ip-only`. Match strict : `sip.sdp.c_ue_ip_pseudonym == pfcp.ue_ip` + `capture_scope` identique + unicité du match côté PFCP (un seul PFCP event par hash par capture_scope).
+2. **`rtp-sip-call-id-match`** — arête **IMS ↔ IMS** (interne RTP↔SIP), confidence `EXACT`, evidence_type `EXACT_CALL_ID_MATCH`, scope `ims-call-id`. Match sur `sip_call_id` identique + `capture_scope` identique. Exploite le fait que `decoder-rtp` propage `sip_call_id` via `register_sdp_flow()` (`decoder-rtp/src/lib.rs:348-363`).
+3. **`sip-sbi-ue-ipv4-match`** (demandée par Sadok, **laissée OUVERTE**) — bloquée tant que `decoder-sbi` n'émet pas `ue_ipv4_address` (ou `pcf_ue_ipv4_address` sur N7). Documentée sur #10 ; rattrapable par un petit patch décodeur-sbi dans un lot 2.17.1 dès que le format JSON SBI N11 CreateSMContext Response porte le champ.
+
+### `correlation_status` étendu + E2E composite (`callflow-schema/src/lib.rs`)
+
+- Ajout des clés `N4_IMS` et `IMS_RTP` dans la map. Alimentées par `confidence_for` sur les arêtes `N4↔IMS` et `IMS↔IMS` produites par les règles ci-dessus.
+- Calcul `E2E` révisé :
+  - `STRONG` quand le data-plane N2→SBI→N4→N3 est entièrement prouvé (identique à 2.16.0).
+  - `OPEN` quand une seule des jonctions E2E (data-plane ou IMS) est observée mais pas prouvée — remplace le silence `UNKNOWN` par une déclaration explicite d'écart (règle « un écart se déclare OUVERT, jamais par hypothèse »).
+  - `UNKNOWN` seulement quand aucune des jonctions E2E n'est observée — session sans trace multi-plan.
+- Les tests existants de `confidence_for` et de la chaîne data-plane restent intacts. L'invariant `callflow-schema v1.4.0` est préservé (pas de bump du crate schema).
+
+### Tests ajoutés (3 unitaires dans `correlation-engine::tests`)
+
+- `sip_pfcp_ue_ipv4_pseudonym_match_emits_ims_n4_edge_on_exact_pseudonym` : SIP avec IE `sdp.c_ue_ip_pseudonym=X` + PFCP avec IE `ue_ip=X` → 1 arête EXACT, interfaces `{IMS, N4}`.
+- `rtp_sip_call_id_match_emits_ims_internal_edge_on_shared_call_id` : SIP et RTP partagent `sip_call_id` → 1 arête EXACT, evidence_type `EXACT_CALL_ID_MATCH`.
+- `ims_rules_do_not_fabricate_edges_when_payload_is_absent` : aucun event SIP/RTP → aucune arête `sip-*`/`rtp-*` (invariant anti-hypothèse).
+
+### Preuves (runner devmat, 2026-11-15)
+
+```
+$ cargo test --release --offline -p correlation-engine --lib -- \
+    sip_pfcp_ue_ipv4_pseudonym_match \
+    rtp_sip_call_id_match \
+    ims_rules_do_not_fabricate
+test result: ok. 3 passed; 0 failed; 33 filtered out
+
+$ cargo test --release --offline --workspace --no-fail-fast
+# exit=0
+# suites=77, passed=574, failed=0, ignored=10
+# (+3 IMS vs 571 sur 2.16.0)
+```
+
+### Diagnostics amont — restent OUVERTS pour 2.17.1 (documentés sur #10)
+
+Trois points amont prouvés par Sadok (#10 6896869321) ne sont PAS résolus par ce lot — ils sont documentés :
+
+1. **SBI continuous perdu** (`/sessions/5g-session-99e8a9a6f5a0d5af/events?protocol=HTTP2` = 0). Root cause probable (audit #15) : les sessions continuous orphelines (sans N2 associé au moment de la découverte) n'ont pas de clé de match disponible pour `attach_sbi_to_sessions` (`session-engine/src/lib.rs:1869-1999`). Les events SBI tombent en `association=Unmatched` et ne sont jamais rattachés. **Fix proposé pour 2.17.1** : ajouter une 3e clé de match `(ue_ipv4_address_pseudonym + capture_scope)` dans `attach_sbi_to_sessions` en indexant depuis N3 GTP-U inner header (ou PFCP CreateSessionResponse `ue_ip` pseudo).
+2. **IMS non ingéré** (`/interfaces` : `IMS=UNAVAILABLE`, reason `NETWORK_DEVICE_NOT_FOUND (device br-oiran-ims)`). Le code 2.17.0 accepte `IMS` dans `helper_spec`, mais en mode live-capture le bridge Docker `br-oiran-ims` n'existe pas. **Fix proposé pour 2.17.1** (dépend de ANR1) : ANR1 exécute `ip -br link` + `docker network ls` sur le runner prod et nomme le pont IMS réel. Le mode continuous-import lit déjà les pcaps IMS depuis le volume si `OIRAN_CONTINUOUS_IMPORT_SOURCE` les rend visibles — à confirmer prod.
+3. **412 ingestion_failures** — compteur mono-cumulatif (`live-probe/src/lib.rs:997`). 8 emplacements d'incrémentation (file:line listés dans l'audit #10 6896790347 §4) avec codes `CONTINUOUS_NATIVE_RETRYABLE`, `CONTINUOUS_NATIVE_SEGMENT_REJECTED`, `CONTINUOUS_SEGMENT_NOT_FINALIZED`, `CONTINUOUS_COPY_RETRYABLE`, `CONTINUOUS_DECODE_RETRYABLE`, `CONTINUOUS_NATIVE_FORGET_RETRYABLE`. L'erreur « Truncated at byte 593820 » vient de `capture-pcap/src/lib.rs:257-263` (reader PCAP échoue, segment rejeté entier). **Fix proposé pour 2.17.1** : catégoriser `ingestion_failures` dans `CaptureMetrics` sous un `BTreeMap<String, u64>` indexé par `error_code`, exposé au JSON `/metrics` via `serde` automatique.
+
+### Hors périmètre respecté
+
+- Aucune modif `apps/api/src/lib.rs` (routes `/sessions*`, `/callflow*`, `/identities*`, live-trace).
+- Aucune modif `apps/api/src/read_time_patch.rs`.
+- Aucune modif `POLARIS_CONTROL/` ni `apps/control/`.
+
+Bump minor : `oiran-api 2.16.0 → 2.17.0`.
+
 ## OIRAN API 2.16.0 — 2026-11-15 — Live par IMSI : ordre canonique SSE + corrélation sessions (ANR1 #10 Live-IMSI)
 
 Lot B de la feuille de route « UI tape IMSI → suivre UE en direct ». Déplace les derniers manques backend identifiés par l'audit #10 6895079284 et respecte strictement le hors-périmètre (pas de `/sessions` ni `/callflow`).

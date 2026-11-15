@@ -376,7 +376,134 @@ pub fn correlate_cross_interface_evidence(events: &[EventRecord]) -> Vec<Correla
         }
     }
 
+    // 2.17.0 (ANR1 #10 E2E 5G) — règles IMS :
+    //   * `sip-pfcp-ue-ipv4-pseudonym-match` : SIP SDP `c=` hash
+    //     (`sdp.c_ue_ip_pseudonym`, decoder-sip 2.17.0) ⇔ PFCP
+    //     `ue_ip` (decoder-pfcp, déjà pseudonymisé avec le même
+    //     domain `"pfcp-ue-ip"`). Produit une arête `IMS`↔`N4`
+    //     scope `ue-ip-only`, confiance EXACT quand (a) le hash est
+    //     unique côté SIP ET côté PFCP, (b) le capture_scope est
+    //     identique.
+    //   * `rtp-sip-call-id-match` : event RTP agrégé (decoder-rtp)
+    //     porte `sip_call_id` propagé via l'enregistrement SDP ⇔
+    //     event SIP avec même `sip_call_id`. Produit une arête
+    //     `IMS`↔`IMS` (RTP↔SIP interne) confiance EXACT.
+    // Les events IMS ne sont pas inclus dans les filtres N2/N4/SBI
+    // précédents ; on les traite dans une sous-passe dédiée.
+    edges.extend(ims_edges_from_events(events));
+
     edges.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
+    edges
+}
+
+/// 2.17.0 (ANR1 #10 E2E 5G) — passe IMS. Factorisée hors de
+/// `correlate_cross_interface_evidence` pour la lisibilité et la
+/// testabilité unitaire. Produit exclusivement des arêtes impliquant
+/// le plan IMS (SIP ou RTP). Préserve l'invariant « jamais d'IMSI /
+/// SUPI / IP UE en clair » : seul `ue_ip_pseudonym` et `sip_call_id`
+/// opaque transitent, et `evidence_description` ne cite jamais la
+/// valeur en clair.
+fn ims_edges_from_events(events: &[EventRecord]) -> Vec<CorrelationEdge> {
+    let mut edges: Vec<CorrelationEdge> = Vec::new();
+
+    // --- Règle 1 : sip-pfcp-ue-ipv4-pseudonym-match --------------------
+    // SIP events émettent `sdp.c_ue_ip_pseudonym` dans leurs IE
+    // (decoder-sip 2.17.0). PFCP events émettent `ue_ip` dans leurs
+    // IE, pseudonymisé avec le même domain `"pfcp-ue-ip"`
+    // (decoder-pfcp, voir `src/lib.rs:268` et `src/lib.rs:400`).
+    // On relie par égalité stricte de ces deux pseudonymes + même
+    // `capture_scope`. L'arête produite est (IMS ↔ N4).
+    let sip_events: Vec<(&EventRecord, String)> = events
+        .iter()
+        .filter(|e| e.interface == "IMS" && protocol_is(e, "SIP"))
+        .filter_map(|e| ie_value(e, "sdp.c_ue_ip_pseudonym").map(|v| (e, v.to_owned())))
+        .collect();
+    let pfcp_ue_ip: Vec<(&EventRecord, String)> = events
+        .iter()
+        .filter(|e| e.interface == "N4" && protocol_is(e, "PFCP"))
+        .filter_map(|e| ie_value(e, "ue_ip").map(|v| (e, v.to_owned())))
+        .collect();
+    for (sip, sip_hash) in &sip_events {
+        let matches: Vec<&(&EventRecord, String)> = pfcp_ue_ip
+            .iter()
+            .filter(|(pfcp, pfcp_hash)| {
+                pfcp_hash == sip_hash && capture_scope(pfcp) == capture_scope(sip)
+            })
+            .collect();
+        if matches.len() == 1 {
+            let (pfcp_event, _) = matches[0];
+            let mut found = edge(
+                sip,
+                pfcp_event,
+                vec![
+                    format!("ue_ip_pseudonym={}", sip_hash),
+                    format!("capture_scope={}", capture_scope(sip)),
+                ],
+                "sip-pfcp-ue-ipv4-pseudonym-match",
+                "EXACT",
+                "The SIP SDP connection address pseudonym equals the PFCP UE IP pseudonym in the same capture scope",
+            );
+            found.rule_version = E2E_EVIDENCE_RULE_VERSION.into();
+            found.evidence_type = "EXACT_UE_IP_MATCH".into();
+            found.scope = "ue-ip-only".into();
+            found.limitations = vec![
+                "The UE IP pseudonym match binds the IMS SIP call to the N4 PFCP session on the same UE allocation; it does not by itself prove end-user identity".into(),
+            ];
+            edges.push(found);
+        }
+    }
+
+    // --- Règle 2 : rtp-sip-call-id-match ---------------------------------
+    // Les events SIP exposent `sip_call_id` dans
+    // `session_identifiers` (decoder-sip). Les events RTP agrégés par
+    // flux exposent le même `sip_call_id` quand l'enregistrement SDP
+    // a propagé la clé (decoder-rtp, `src/lib.rs:348-363`). Match
+    // direct, scope IMS. Produit une arête IMS↔IMS.
+    let sip_calls: Vec<(&EventRecord, String)> = events
+        .iter()
+        .filter(|e| e.interface == "IMS" && protocol_is(e, "SIP"))
+        .filter_map(|e| {
+            e.first_identifier("sip_call_id")
+                .map(|v| (e, v.to_owned()))
+        })
+        .collect();
+    let rtp_flows: Vec<(&EventRecord, String)> = events
+        .iter()
+        .filter(|e| e.interface == "IMS" && protocol_is(e, "RTP"))
+        .filter_map(|e| {
+            e.first_identifier("sip_call_id")
+                .map(|v| (e, v.to_owned()))
+        })
+        .collect();
+    for (sip, call_id) in &sip_calls {
+        for (rtp, rtp_call_id) in &rtp_flows {
+            if rtp_call_id != call_id {
+                continue;
+            }
+            if capture_scope(sip) != capture_scope(rtp) {
+                continue;
+            }
+            let mut found = edge(
+                sip,
+                rtp,
+                vec![
+                    format!("sip_call_id={}", call_id),
+                    format!("capture_scope={}", capture_scope(sip)),
+                ],
+                "rtp-sip-call-id-match",
+                "EXACT",
+                "The RTP flow aggregator propagated the SDP-negotiated Call-ID that equals the SIP session Call-ID in the same capture scope",
+            );
+            found.rule_version = E2E_EVIDENCE_RULE_VERSION.into();
+            found.evidence_type = "EXACT_CALL_ID_MATCH".into();
+            found.scope = "ims-call-id".into();
+            found.limitations = vec![
+                "The Call-ID match binds the RTP flow to the SIP signalling dialog; it does not prove end-user identity".into(),
+            ];
+            edges.push(found);
+        }
+    }
+
     edges
 }
 
@@ -3346,6 +3473,106 @@ mod tests {
                 .iter()
                 .map(|e| (e.rule_id.clone(), e.confidence.clone()))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// 2.17.0 (ANR1 #10 E2E 5G) — la règle `sip-pfcp-ue-ipv4-pseudonym-match`
+    /// doit produire une arête EXACT quand un event SIP IMS porte
+    /// `sdp.c_ue_ip_pseudonym=X` dans ses IE et qu'un event PFCP N4
+    /// porte `ue_ip=X` dans les siens, pour le même capture_scope.
+    /// Aucune autre arête ne doit être produite si aucun autre couple
+    /// n'est présent.
+    #[test]
+    fn sip_pfcp_ue_ipv4_pseudonym_match_emits_ims_n4_edge_on_exact_pseudonym() {
+        let sip_hash = "sha256:ue-ip-pseudo-aabbcc";
+        let sip = e(
+            "sip-1",
+            "IMS",
+            "SIP",
+            "INVITE",
+            1,
+            &[("sip_call_id", "call-xyz-001")],
+            json!([{"name":"sdp.c_ue_ip_pseudonym","value":sip_hash}]),
+        );
+        let pfcp = e(
+            "pfcp-1",
+            "N4",
+            "PFCP",
+            "Session Establishment Request",
+            2,
+            &[("pfcp_sequence", "2209")],
+            json!([{"name":"ue_ip","value":sip_hash}]),
+        );
+        let edges = correlate_cross_interface_evidence(&[sip, pfcp]);
+        let ims_n4: Vec<_> = edges
+            .iter()
+            .filter(|e| e.rule_id == "sip-pfcp-ue-ipv4-pseudonym-match")
+            .collect();
+        assert_eq!(ims_n4.len(), 1, "une seule arête SIP↔N4 attendue ; got {edges:?}");
+        let edge = ims_n4[0];
+        assert_eq!(edge.confidence, "EXACT");
+        assert_eq!(edge.evidence_type, "EXACT_UE_IP_MATCH");
+        // L'arête lie IMS (SIP) et N4 (PFCP) — l'ordre dépend de l'id
+        // généré, on vérifie l'ensemble.
+        let interfaces: std::collections::BTreeSet<&str> =
+            [edge.source_interface.as_str(), edge.target_interface.as_str()].into_iter().collect();
+        assert!(interfaces.contains("IMS"));
+        assert!(interfaces.contains("N4"));
+    }
+
+    /// 2.17.0 (ANR1 #10 E2E 5G) — la règle `rtp-sip-call-id-match`
+    /// doit produire une arête EXACT quand un event SIP et un event
+    /// RTP partagent `sip_call_id` + capture_scope.
+    #[test]
+    fn rtp_sip_call_id_match_emits_ims_internal_edge_on_shared_call_id() {
+        let call_id = "call-xyz-007";
+        let sip = e(
+            "sip-1",
+            "IMS",
+            "SIP",
+            "INVITE",
+            1,
+            &[("sip_call_id", call_id)],
+            json!([]),
+        );
+        let rtp = e(
+            "rtp-1",
+            "IMS",
+            "RTP",
+            "RTP flow",
+            2,
+            &[("sip_call_id", call_id)],
+            json!([]),
+        );
+        let edges = correlate_cross_interface_evidence(&[sip, rtp]);
+        let matched: Vec<_> = edges
+            .iter()
+            .filter(|e| e.rule_id == "rtp-sip-call-id-match")
+            .collect();
+        assert_eq!(matched.len(), 1, "une seule arête RTP↔SIP attendue ; got {edges:?}");
+        assert_eq!(matched[0].confidence, "EXACT");
+        assert_eq!(matched[0].evidence_type, "EXACT_CALL_ID_MATCH");
+    }
+
+    /// 2.17.0 — si aucun hash IMS n'est présent, la passe IMS ne
+    /// produit AUCUNE arête (invariant « un écart se déclare OUVERT,
+    /// jamais par hypothèse »).
+    #[test]
+    fn ims_rules_do_not_fabricate_edges_when_payload_is_absent() {
+        let pfcp = e(
+            "pfcp-1",
+            "N4",
+            "PFCP",
+            "Session Establishment Request",
+            1,
+            &[("pfcp_sequence", "2209")],
+            json!([]),
+        );
+        let edges = correlate_cross_interface_evidence(&[pfcp]);
+        assert!(
+            !edges.iter().any(|e| e.rule_id.starts_with("sip-")
+                || e.rule_id.starts_with("rtp-")),
+            "aucune règle IMS ne doit matcher sans events SIP/RTP ; got {edges:?}"
         );
     }
 }

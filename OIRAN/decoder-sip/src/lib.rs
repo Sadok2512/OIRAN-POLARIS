@@ -437,6 +437,26 @@ fn emit_event(mut msg: SipMessage, input: &DecoderInput<'_>) -> NormalizedEvent 
             raw_sha256: None,
             status: DecodeStatus::Decoded,
         });
+        // 2.17.0 (ANR1 #10 E2E 5G) — pseudonyme de l'adresse de
+        // connexion SDP, utilisant EXACTEMENT le même domain que
+        // `decoder-pfcp` pour `ue_ip` (`"pfcp-ue-ip"`, voir
+        // `decoder-pfcp/src/lib.rs:268`). Ce hash est l'unique
+        // identifiant qui permet la corrélation EXACT SIP↔N4 via UE
+        // IP sans jamais exposer l'IP UE en clair hors de la trame
+        // dissequée. Nom canonique : `sdp.c_ue_ip_pseudonym`.
+        let ue_ip_pseudo = pseudonym(
+            input.pseudonym_key,
+            "pfcp-ue-ip",
+            sdp.connection_address.as_bytes(),
+        );
+        ies.push(InformationElement {
+            id: None,
+            name: "sdp.c_ue_ip_pseudonym".into(),
+            length: ue_ip_pseudo.len() as u32,
+            value: Some(ue_ip_pseudo),
+            raw_sha256: None,
+            status: DecodeStatus::Decoded,
+        });
         ies.push(InformationElement {
             id: None,
             name: "sdp.m.audio.port".into(),

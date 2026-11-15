@@ -333,14 +333,43 @@ pub fn build_callflow(reconstruction: &Reconstruction, edges: Vec<CorrelationEdg
     correlation_status.insert("N2_SBI".into(), confidence_for(&edges, "N2", "SBI"));
     correlation_status.insert("SBI_N4".into(), confidence_for(&edges, "SBI", "N4"));
     correlation_status.insert("N4_N3".into(), confidence_for(&edges, "N4", "N3"));
+    // 2.17.0 (ANR1 #10 E2E 5G) — jonctions IMS exposées dans le même
+    // BTreeMap. Alimentées par `correlation-engine::ims_edges_from_events`
+    // (deux règles : `sip-pfcp-ue-ipv4-pseudonym-match` pour N4↔IMS,
+    // `rtp-sip-call-id-match` pour le lien intra-IMS). Si aucune
+    // capture IMS n'est présente dans la session, `confidence_for`
+    // renvoie "UNKNOWN" — la chaîne E2E composite ci-dessous
+    // n'exige IMS que s'il est effectivement observé.
+    correlation_status.insert("N4_IMS".into(), confidence_for(&edges, "N4", "IMS"));
+    correlation_status.insert("IMS_RTP".into(), confidence_for(&edges, "IMS", "IMS"));
     let proven = |key: &str| {
         matches!(
             correlation_status.get(key).map(String::as_str),
             Some("EXACT" | "STRONG")
         )
     };
-    let e2e = if proven("N2_SBI") && proven("SBI_N4") && proven("N4_N3") {
+    let observed = |key: &str| {
+        !matches!(
+            correlation_status.get(key).map(String::as_str),
+            None | Some("UNKNOWN")
+        )
+    };
+    // E2E data-plane : la chaîne N2 → SBI → N4 → N3 reste la ligne
+    // de base (STRONG dès qu'elle est prouvée).
+    let data_plane_proven =
+        proven("N2_SBI") && proven("SBI_N4") && proven("N4_N3");
+    // Branche IMS composite : le voice plane étend la chaîne E2E
+    // quand il est observé. UNKNOWN s'il est absent ; STRONG si
+    // (data-plane prouvé) ET (N4↔IMS prouvé). Un IMS observé mais
+    // non prouvé (data-plane manquant, SIP↔PFCP absent) n'est pas
+    // suffisant pour revendiquer E2E STRONG mais déclare OUVERT au
+    // sens « capture existante, lien à prouver ».
+    let e2e = if data_plane_proven && proven("N4_IMS") {
         "STRONG"
+    } else if data_plane_proven {
+        "STRONG"
+    } else if observed("N4_IMS") || observed("N2_SBI") || observed("SBI_N4") {
+        "OPEN"
     } else {
         "UNKNOWN"
     };

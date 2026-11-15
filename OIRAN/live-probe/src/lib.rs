@@ -7268,6 +7268,12 @@ fn helper_spec(capture_id: String, request: &CaptureRequest) -> CaptureSpec {
                 "N3" => Some(InterfaceId::N3),
                 "N4" => Some(InterfaceId::N4),
                 "SBI" => Some(InterfaceId::Sbi),
+                // 2.17.0 (ANR1 #10 E2E 5G) — IMS accepté dans le
+                // mapping pour que les pcaps IMS déjà sur disque
+                // soient ingérés en mode continuous-import. Le
+                // matching par chemin (`canonical_interface_for_plane`
+                // ligne ~9879) reconnaît déjà le répertoire `ims/`.
+                "IMS" => Some(InterfaceId::Ims),
                 _ => None,
             })
             .collect(),
@@ -7283,6 +7289,8 @@ fn plane_name(interface: &str) -> &'static str {
         "SBI" => "SBI",
         "N4" => "N4",
         "N3" => "NG-U",
+        // 2.17.0 (ANR1 #10 E2E 5G) — IMS voice plane (SIP + RTP).
+        "IMS" => "IMS",
         _ => "UNKNOWN",
     }
 }

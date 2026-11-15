@@ -42,6 +42,13 @@ pub enum InterfaceId {
     N3,
     N4,
     Sbi,
+    /// 2.17.0 (ANR1 #10 E2E 5G) — IMS voice plane. SIP sur UDP 5060,
+    /// RTP/RTCP sur ports dynamiques issus des SDP. Permet d'ingérer
+    /// les pcaps IMS (ex. `/var/lib/.../ims/ims_vonr_restored_*.pcapng`)
+    /// via le chemin continuous-import, sans dépendance au bridge
+    /// réseau `br-oiran-ims` tant que `OIRAN_CONTINUOUS_IMPORT_SOURCE`
+    /// est actif.
+    Ims,
 }
 
 impl InterfaceId {
@@ -51,6 +58,7 @@ impl InterfaceId {
             Self::N3 => "br-oiran-n3",
             Self::N4 => "br-oiran-n4",
             Self::Sbi => "br-oiran-sbi",
+            Self::Ims => "br-oiran-ims",
         }
     }
 
@@ -60,6 +68,7 @@ impl InterfaceId {
             Self::N3 => "N3",
             Self::N4 => "N4",
             Self::Sbi => "SBI",
+            Self::Ims => "IMS",
         }
     }
 }
@@ -1046,6 +1055,11 @@ fn packet_matches_interface(interface: InterfaceId, frame: &[u8]) -> bool {
         InterfaceId::N3 => protocol == 17 && port(2152),
         InterfaceId::N4 => protocol == 17 && port(8805),
         InterfaceId::Sbi => protocol == 6 && port(7777),
+        // 2.17.0 (ANR1 #10 E2E 5G) — IMS : SIP sur UDP 5060 (Z,A) +
+        // RTP sur UDP (ports dynamiques issus des SDP). Pour le mode
+        // live-capture, on se limite au contrôle SIP ; les flux RTP
+        // sont déjà capturés par N3 GTP-U (voice plane encapsulé).
+        InterfaceId::Ims => protocol == 17 && port(5060),
     }
 }
 
