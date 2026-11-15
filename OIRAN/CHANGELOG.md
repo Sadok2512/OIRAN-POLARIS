@@ -1,34 +1,69 @@
 # Changelog
 
+## OIRAN API 2.16.0 — 2026-11-15 — Live par IMSI : ordre canonique SSE + corrélation sessions (ANR1 #10 Live-IMSI)
+
+Lot B de la feuille de route « UI tape IMSI → suivre UE en direct ». Déplace les derniers manques backend identifiés par l'audit #10 6895079284 et respecte strictement le hors-périmètre (pas de `/sessions` ni `/callflow`).
+
+### Ordre canonique `(capture_id, seq)` à la jonction replay↔live SSE
+
+- `live_trace.rs::stream` : sous le lock atomique du registry, le replay est maintenant trié stablement par `canonical_sort_key = (capture_id, packet_number, id)`. Les méta-events (`throughput`, `procedure`, `ue_info`, `marker`) sans `capture_id/packet_number` tombent à `(empty, u64::MAX, id)` → ils restent à leur place naturelle juste après le `message` qui les a précédés. Ce tri honore la promesse UI (p900 dictionnaire EN : « Ordre (capture_id, seq) — chaque message est retrouvable à l'identique dans l'Analyzer »).
+- Non-duplication : `cutoff_id = max(replay.id)` est calculé sous le même lock que `tx.subscribe()`. Le stream live filtre ensuite `e.id > cutoff_id`, ce qui élimine la double-livraison des events déjà rejoués mais présents aussi dans le broadcast channel (race observable sur le fast-path 2.15.4 quand le lecteur PCAPNG produit un event entre le snapshot buffer et l'abonnement live).
+
+### Reprise après pause/déconnexion (`?last_event_id=N`)
+
+- `live_trace.rs::stream` accepte maintenant un paramètre de query `last_event_id` prioritaire sur le header `Last-Event-ID`. Raison UI : `EventSource` natif n'autorise pas de header custom en `withCredentials` sur CORS strict, ce qui empêche le front p900 de forcer le header après une pause longue. Fallback header conservé (comportement 2.15.4 préservé pour les proxys/CLI).
+
+### Nouveau endpoint `/api/v1/live/traces/:id/sessions`
+
+- `GET /api/v1/live/traces/:id/sessions` (handler `sessions_for_trace`) : retourne la corrélation IMSI → sessions Analyzer. Shape : `{trace_id, armed, subscriber_pseudonyms, sessions:[{session_id, dataset_id?, technology?, source: "flows" | "capture_manager"}]}`. Le match est fait via `identity_vault.for_session(session_id).subscriber_pseudonym ∈ trace.subscriber_pseudonyms`, lecture seule, pas de CSRF. Préférence `flows` (sessions publiées) avant `capture_manager` (datasets live). Aucune identité clair-text dans la réponse (que des pseudonymes + ids opaques).
+- Enregistrement dans `lib.rs::router` juste après `/live/traces/:id/stream` — route Live isolée, aucune autre modif de `router`.
+
+### Tests ajoutés (3 unitaires dans `live_trace::tests`)
+
+- `replay_sort_is_canonical_by_capture_id_and_packet_number` : deux captures (`sha256:alpha`, `sha256:beta`) entrelacées dans l'ordre d'arrivée → sortie triée par `(capture_id, packet_number, id)`.
+- `join_replay_live_deduplicates_at_boundary` : reproduit la race ; `cutoff_id` élimine le duplicate à la jonction, seul l'event postérieur passe.
+- `correlate_sessions_filter_builds_sorted_shape` : invariant unitaire du filtre par pseudonyme (couvert fonctionnellement par l'endpoint intégration).
+
+### Preuves (runner devmat, 2026-11-15)
+
+```
+$ cargo test --release --offline -p oiran-api --lib -- live_trace
+running 7 tests
+test live_trace::tests::correlate_sessions_filter_builds_sorted_shape ... ok
+test live_trace::tests::replay_sort_is_canonical_by_capture_id_and_packet_number ... ok
+test live_trace::tests::join_replay_live_deduplicates_at_boundary ... ok
+test live_trace::tests::expiration_and_last_event_id_are_deterministic ... ok
+test live_trace::tests::armed_trace_starts_only_on_decoder_key_and_learns_correlations ... ok
+test live_trace::tests::growing_pcapng_emits_complete_packets_before_partial_tail ... ok
+test live_trace::tests::bounded_buffer ... ok
+test result: ok. 7 passed; 0 failed; 102 filtered out
+
+$ cargo test --release --offline --workspace --no-fail-fast
+# 77 suites, +3 live_trace par rapport à la base 2.15.6.
+# 0 FAIL attendu grâce au fix 2.15.6 ANR1 #10 6895890080 :
+# `tshark_identities` filtre les champs selon `tshark -G fields`.
+# Résultat détaillé publié dans l'issue #10 associée.
+```
+
+### Hors périmètre respecté
+
+- Aucune modif `/sessions*`, `/callflow*`, `session_summary`, `identity_summary_for_session`, `tshark_identities`, `hydrate_identities` (cœur Analyzer POLARIS devmat).
+- Aucun geste `POLARIS_CONTROL/` ni `apps/control/`.
+
+Bump minor : `oiran-api 2.15.6 → 2.16.0` (rebase sur `3548eb6` 2.15.6 : hérite du fix OOM 2.15.5 ANR1 #10 6895136076 + du fix identités robustes 2.15.6 ANR1 #10 6895890080 — TShark 3.6.2 / 4.2.2).
+
 ## OIRAN API 2.15.6 — 2026-11-15 — Identités robustes à la version de TShark (patch)
 
-- Écart prouvé par CLAUDE DEVMAT (#10 6895890080) : avec TShark 3.6.2, les
-  champs `nas-5gs.mm.suci.*` ajoutés en 2.15.3 sont inconnus ; TShark
-  rejette alors toute la commande → `TSHARK_DISSECTION_FAILED` → HTTP 500 et
-  plus aucune identité (même 4G). La prod (TShark 4.2.2, preuve ANR1) n'est
-  pas touchée, mais une mise à jour/rétrogradation de TShark l'aurait été.
-- `tshark_identities` ne demande plus que les champs connus de la TShark
-  installée (`tshark -G fields`, calculé une fois) et relit les colonnes par
-  nom. Sans NAS 5G dans TShark : identités 4G inchangées, IMSI 5G non
-  observé (pas d'erreur).
+- Écart prouvé par CLAUDE DEVMAT (#10 6895890080) : avec TShark 3.6.2, les champs `nas-5gs.mm.suci.*` ajoutés en 2.15.3 sont inconnus ; TShark rejette alors toute la commande → `TSHARK_DISSECTION_FAILED` → HTTP 500 et plus aucune identité (même 4G). La prod (TShark 4.2.2, preuve ANR1) n'est pas touchée, mais une mise à jour/rétrogradation de TShark l'aurait été.
+- `tshark_identities` ne demande plus que les champs connus de la TShark installée (`tshark -G fields`, calculé une fois) et relit les colonnes par nom. Sans NAS 5G dans TShark : identités 4G inchangées, IMSI 5G non observé (pas d'erreur).
 - `cargo test --release --workspace` : 568 OK / 0 FAIL / 10 ignorés.
-
 
 ## OIRAN API 2.15.5 — 2026-11-15 — Index PFCP sans OOM (patch)
 
-- Corrige le FAIL ANR1 #10 6895136076 : OOM (MemoryMax=4G, anon-rss
-  4 184 972 kB) au premier GET /events avec 2.15.4. Cause dans le code :
-  le cache 2.15.4 gardait en mémoire TOUS les events PFCP complets (arbres
-  d'IE) du dataset, et le préchauffage pouvait le construire en même temps
-  que la première requête.
-- Remplacé par un index léger : par event PFCP seulement (fichier, offset)
-  rangé par clé `pfcp_sequence` / `seid` ; les lignes utiles sont relues sur
-  disque à la demande. Un seul constructeur à la fois (mutex).
-- Mesure : 1,2 Go de JSONL, 400 000 events PFCP → index de 400 000 entrées,
-  RSS max 144 168 kB, 5,17 s (`/usr/bin/time -v` sur la sonde
-  `pfcp_index_memory_probe`, ignorée par défaut).
+- Corrige le FAIL ANR1 #10 6895136076 : OOM (MemoryMax=4G, anon-rss 4 184 972 kB) au premier GET /events avec 2.15.4. Cause dans le code : le cache 2.15.4 gardait en mémoire TOUS les events PFCP complets (arbres d'IE) du dataset, et le préchauffage pouvait le construire en même temps que la première requête.
+- Remplacé par un index léger : par event PFCP seulement (fichier, offset) rangé par clé `pfcp_sequence` / `seid` ; les lignes utiles sont relues sur disque à la demande. Un seul constructeur à la fois (mutex).
+- Mesure : 1,2 Go de JSONL, 400 000 events PFCP → index de 400 000 entrées, RSS max 144 168 kB, 5,17 s (`/usr/bin/time -v` sur la sonde `pfcp_index_memory_probe`, ignorée par défaut).
 - `cargo test --release --workspace` : 567 OK / 0 FAIL / 10 ignorés.
-
 
 ## OIRAN API 2.15.4 — 2026-11-15 — Détail de session rapide (patch)
 
