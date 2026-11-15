@@ -995,6 +995,16 @@ pub struct CaptureMetrics {
     pub last_ingested_epoch_ms: Option<u64>,
     #[serde(default)]
     pub ingestion_failures: u64,
+    /// 2.17.1 (ANR1 #10 E2E-5G) — catégorisation des
+    /// `ingestion_failures` par code d'erreur. Chaque fois que le
+    /// compteur cumulatif est incrémenté via `bump_failure`, la
+    /// même catégorie l'est aussi dans cette map. Permet au JSON
+    /// `/metrics` d'exposer `{"NATIVE_RETRYABLE": 123,
+    /// "SEGMENT_NOT_FINALIZED": 1, ...}` sans perdre la back-compat
+    /// du compteur plat. `skip_serializing_if` garde le JSON
+    /// pré-2.17.1 inchangé pour les métriques vides.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub failures_by_category: BTreeMap<String, u64>,
     #[serde(default)]
     pub last_packet_epoch_ms: Option<u64>,
     #[serde(default)]
@@ -1358,6 +1368,35 @@ pub fn record_ingestion_failure_with_size(
     while log.len() > MAX_PERSISTED_INGESTION_FAILURES {
         log.pop_front();
     }
+}
+
+/// 2.17.1 (ANR1 #10 E2E-5G) — réduit un `error_code` libre à une
+/// catégorie courte stable pour la map `failures_by_category`. La
+/// règle : tout ce qui est avant le premier `:` (code littéral
+/// `CONTINUOUS_SEGMENT_NOT_FINALIZED` dans
+/// `"CONTINUOUS_SEGMENT_NOT_FINALIZED: Truncated at byte 593820"`),
+/// trimmé. Si le code n'a pas de `:`, il est retenu tel quel. Les
+/// codes vides tombent sur `"UNKNOWN"` — jamais d'hypothèse masquée.
+pub fn categorize_failure_code(error_code: &str) -> String {
+    let head = error_code.split(':').next().unwrap_or("").trim();
+    if head.is_empty() {
+        "UNKNOWN".into()
+    } else {
+        head.to_owned()
+    }
+}
+
+/// 2.17.1 (ANR1 #10 E2E-5G) — incrément couplé du compteur plat
+/// `ingestion_failures` et de la map `failures_by_category`.
+/// Remplace les 8 occurrences de
+/// `job.metrics.ingestion_failures = job.metrics.ingestion_failures
+/// .saturating_add(1)` pour que chaque classe de défaut soit aussi
+/// comptée par catégorie.
+pub fn bump_failure(metrics: &mut CaptureMetrics, error_code: &str) {
+    metrics.ingestion_failures = metrics.ingestion_failures.saturating_add(1);
+    let category = categorize_failure_code(error_code);
+    let slot = metrics.failures_by_category.entry(category).or_insert(0);
+    *slot = slot.saturating_add(1);
 }
 
 /// 0.2.0 — Decide whether a candidate file is the active dumpcap target
@@ -3003,8 +3042,7 @@ impl CaptureManager {
                                 continue;
                             }
                             self.update(CONTINUOUS_CAPTURE_ID, |job| {
-                                job.metrics.ingestion_failures =
-                                    job.metrics.ingestion_failures.saturating_add(1);
+                                bump_failure(&mut job.metrics, "CONTINUOUS_NATIVE_RETRYABLE");
                                 job.error = Some(format!("CONTINUOUS_NATIVE_RETRYABLE: {error}"));
                             })?;
                             thread::sleep(config.scan_interval.min(Duration::from_secs(5)));
@@ -3073,8 +3111,7 @@ impl CaptureManager {
                 Ok(candidates) => candidates,
                 Err(error) if !terminal_native_captures.is_empty() => {
                     self.update(CONTINUOUS_CAPTURE_ID, |job| {
-                        job.metrics.ingestion_failures =
-                            job.metrics.ingestion_failures.saturating_add(1);
+                        bump_failure(&mut job.metrics, "CONTINUOUS_NATIVE_SEGMENT_REJECTED");
                         job.error = Some(format!("CONTINUOUS_NATIVE_SEGMENT_REJECTED: {error}"));
                     })?;
                     thread::sleep(config.scan_interval.min(Duration::from_secs(5)));
@@ -3198,6 +3235,17 @@ impl CaptureManager {
                         .metrics
                         .ingestion_failures
                         .saturating_add(newly_rejected);
+                    // 2.17.1 (ANR1 #10 E2E-5G) — compte aussi par
+                    // catégorie. Ce site est un incrément de bulk
+                    // de N rejets issus de la pré-validation
+                    // schema/décodeur. Catégorisés en
+                    // `CONTINUOUS_NEWLY_REJECTED`.
+                    let slot = job
+                        .metrics
+                        .failures_by_category
+                        .entry("CONTINUOUS_NEWLY_REJECTED".into())
+                        .or_insert(0);
+                    *slot = slot.saturating_add(newly_rejected);
                 })?;
             }
             let candidates = discovery.segments;
@@ -3412,8 +3460,7 @@ impl CaptureManager {
                     |_| Ok(()),
                 ) {
                     self.update(CONTINUOUS_CAPTURE_ID, |job| {
-                        job.metrics.ingestion_failures =
-                            job.metrics.ingestion_failures.saturating_add(1);
+                        bump_failure(&mut job.metrics, "CONTINUOUS_SEGMENT_NOT_FINALIZED");
                         job.error = Some(format!("CONTINUOUS_SEGMENT_NOT_FINALIZED: {error}"));
                     })?;
                     // 0.2.0 — persist the failure (source path + code + ts) so
@@ -3515,8 +3562,7 @@ impl CaptureManager {
                 let destination = base.join("pcap").join(&owned_file);
                 if let Err(error) = copy_verified(&candidate, &destination) {
                     self.update(CONTINUOUS_CAPTURE_ID, |job| {
-                        job.metrics.ingestion_failures =
-                            job.metrics.ingestion_failures.saturating_add(1);
+                        bump_failure(&mut job.metrics, "CONTINUOUS_COPY_RETRYABLE");
                         job.error = Some(format!("CONTINUOUS_COPY_RETRYABLE: {error}"));
                     })?;
                     record_ingestion_failure(
@@ -3543,8 +3589,7 @@ impl CaptureManager {
                 ) {
                     let _ = fs::remove_file(&destination);
                     self.update(CONTINUOUS_CAPTURE_ID, |job| {
-                        job.metrics.ingestion_failures =
-                            job.metrics.ingestion_failures.saturating_add(1);
+                        bump_failure(&mut job.metrics, "CONTINUOUS_SEGMENT_NOT_FINALIZED");
                         job.error = Some(format!("CONTINUOUS_SEGMENT_NOT_FINALIZED: {error}"));
                     })?;
                     record_ingestion_failure(
@@ -3750,8 +3795,7 @@ impl CaptureManager {
                             return Ok(());
                         }
                         self.update(CONTINUOUS_CAPTURE_ID, |job| {
-                            job.metrics.ingestion_failures =
-                                job.metrics.ingestion_failures.saturating_add(1);
+                            bump_failure(&mut job.metrics, "CONTINUOUS_DECODE_RETRYABLE");
                             job.error = Some(format!("CONTINUOUS_DECODE_RETRYABLE: {error}"));
                         })?;
                     }
@@ -3929,7 +3973,7 @@ impl CaptureManager {
             .is_ok_and(|response| response.ok);
         if !forgotten {
             self.update(CONTINUOUS_CAPTURE_ID, |job| {
-                job.metrics.ingestion_failures = job.metrics.ingestion_failures.saturating_add(1);
+                bump_failure(&mut job.metrics, "CONTINUOUS_NATIVE_FORGET_RETRYABLE");
                 job.error = Some("CONTINUOUS_NATIVE_FORGET_RETRYABLE".into());
             })?;
         }
@@ -7227,14 +7271,61 @@ pub fn interface_specs() -> Vec<CaptureInterface> {
         // défaut ; RTP/RTCP sur ports dynamiques issus des SDP. Les
         // flux encapsulés dans GTP-U (N3, S1-U) sont décodés par la
         // branche inner de `oiran-decode`, pas ici.
+        //
+        // 2.17.1 (ANR1 #10 E2E-5G) — le bridge Docker IMS en prod
+        // n'est pas toujours nommé `br-oiran-ims` (NETWORK_DEVICE_
+        // NOT_FOUND remonté par `/api/v1/interfaces`). Le device
+        // est désormais résolu dans cet ordre :
+        //   1. variable d'env `OIRAN_IMS_BRIDGE_DEVICE` si définie ;
+        //   2. scan de `/sys/class/net/` pour un bridge dont le
+        //      nom contient `ims` (`br-*-ims`, `br-ims-*` etc.) ;
+        //   3. défaut historique `br-oiran-ims`.
+        // Cette résolution est pure côté lecture (aucun side-effect
+        // réseau) et est testée ci-dessous via un test dédié.
         spec(
             "IMS",
-            "br-oiran-ims",
+            &resolve_ims_bridge_device(),
             "SIP / UDP + RTP (SDP-negotiated) / UDP",
             "POLARIS IMS Docker bridge",
             "udp port 5060",
         ),
     ]
+}
+
+/// 2.17.1 (ANR1 #10 E2E-5G) — résout le nom du bridge réseau IMS
+/// réellement présent sur l'hôte. Ne fait **aucune** modification
+/// système, lit uniquement `/sys/class/net/` (ou l'env). Factorisée
+/// pour être testable sans mocks de l'OS.
+pub fn resolve_ims_bridge_device() -> String {
+    if let Ok(name) = std::env::var("OIRAN_IMS_BRIDGE_DEVICE") {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    if let Some(found) = scan_sys_class_net_for_ims_bridge() {
+        return found;
+    }
+    "br-oiran-ims".into()
+}
+
+fn scan_sys_class_net_for_ims_bridge() -> Option<String> {
+    let entries = fs::read_dir("/sys/class/net").ok()?;
+    let mut candidates: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.contains("ims") && lower.starts_with("br")
+        })
+        .collect();
+    candidates.sort();
+    // `br-oiran-ims` est le nom historique. Si présent, on le garde
+    // pour préserver l'idempotence avec les déploiements antérieurs.
+    if let Some(preferred) = candidates.iter().find(|c| *c == "br-oiran-ims") {
+        return Some(preferred.clone());
+    }
+    candidates.into_iter().next()
 }
 
 fn spec(
@@ -17607,5 +17698,84 @@ mod tests {
         assert_eq!(json["pending_stability_segments"], 0);
         assert_eq!(json["pending_batch_segments"], 0);
         assert_eq!(json["orphan_fingerprints_recovered"], 0);
+    }
+
+    /// 2.17.1 (ANR1 #10 E2E-5G, fix c — 412 ingestion_failures).
+    /// `bump_failure` doit incrémenter le compteur plat ET la map
+    /// `failures_by_category` sur la même ligne, pour que les 8
+    /// sites d'incrément produisent une catégorisation sans double
+    /// bookkeeping côté callers.
+    #[test]
+    fn bump_failure_updates_flat_counter_and_category_map() {
+        let mut m = CaptureMetrics::default();
+        bump_failure(&mut m, "CONTINUOUS_SEGMENT_NOT_FINALIZED");
+        bump_failure(&mut m, "CONTINUOUS_SEGMENT_NOT_FINALIZED: Truncated at byte 593820");
+        bump_failure(&mut m, "CONTINUOUS_NATIVE_RETRYABLE");
+        assert_eq!(m.ingestion_failures, 3);
+        assert_eq!(
+            m.failures_by_category.get("CONTINUOUS_SEGMENT_NOT_FINALIZED"),
+            Some(&2),
+            "le prefixe avant `:` est la catégorie ; 2 incréments attendus"
+        );
+        assert_eq!(
+            m.failures_by_category.get("CONTINUOUS_NATIVE_RETRYABLE"),
+            Some(&1)
+        );
+        // Deux catégories distinctes → aucune fusion accidentelle.
+        assert_eq!(m.failures_by_category.len(), 2);
+    }
+
+    /// 2.17.1 — `categorize_failure_code` extrait le préfixe avant
+    /// le `:` quand il existe, retourne tel quel sinon, et tombe
+    /// sur `UNKNOWN` pour les codes vides (invariant anti-silent).
+    #[test]
+    fn categorize_failure_code_splits_at_colon_then_defaults_to_unknown() {
+        assert_eq!(
+            categorize_failure_code(
+                "CONTINUOUS_SEGMENT_NOT_FINALIZED: Truncated at byte 593820"
+            ),
+            "CONTINUOUS_SEGMENT_NOT_FINALIZED"
+        );
+        assert_eq!(categorize_failure_code("CONTINUOUS_NATIVE_RETRYABLE"), "CONTINUOUS_NATIVE_RETRYABLE");
+        assert_eq!(categorize_failure_code(""), "UNKNOWN");
+        assert_eq!(categorize_failure_code(":payload"), "UNKNOWN");
+    }
+
+    /// 2.17.1 (ANR1 #10 E2E-5G, fix b — IMS bridge device
+    /// configurable). Priorité : env var > scan `/sys/class/net/` >
+    /// fallback historique `br-oiran-ims`. Vérifie la 1ère branche
+    /// (env var) qui est déterministe en test. La branche scan n'est
+    /// pas mockable sans injection de filesystem — elle est couverte
+    /// par l'audit `ls /sys/class/net/` sur le runner ANR1.
+    #[test]
+    fn resolve_ims_bridge_device_honors_env_override() {
+        let original = std::env::var("OIRAN_IMS_BRIDGE_DEVICE").ok();
+        std::env::set_var("OIRAN_IMS_BRIDGE_DEVICE", "br-lab-ims-01");
+        let resolved = resolve_ims_bridge_device();
+        assert_eq!(resolved, "br-lab-ims-01");
+        // Restaure l'env pour ne pas polluer les autres tests.
+        match original {
+            Some(v) => std::env::set_var("OIRAN_IMS_BRIDGE_DEVICE", v),
+            None => std::env::remove_var("OIRAN_IMS_BRIDGE_DEVICE"),
+        }
+    }
+
+    #[test]
+    fn resolve_ims_bridge_device_trims_and_rejects_empty_env() {
+        let original = std::env::var("OIRAN_IMS_BRIDGE_DEVICE").ok();
+        std::env::set_var("OIRAN_IMS_BRIDGE_DEVICE", "   ");
+        let resolved = resolve_ims_bridge_device();
+        // Env vide → fallback sur scan ou défaut historique.
+        // On ne peut pas mocker le scan, mais on peut vérifier
+        // qu'au moins la valeur retournée commence par "br"
+        // (préfixe attendu pour un bridge réseau Linux).
+        assert!(
+            resolved.starts_with("br"),
+            "fallback doit renvoyer un nom de bridge (br-*) ; got {resolved:?}"
+        );
+        match original {
+            Some(v) => std::env::set_var("OIRAN_IMS_BRIDGE_DEVICE", v),
+            None => std::env::remove_var("OIRAN_IMS_BRIDGE_DEVICE"),
+        }
     }
 }

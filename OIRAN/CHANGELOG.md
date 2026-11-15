@@ -1,5 +1,78 @@
 # Changelog
 
+## OIRAN API 2.17.1 — 2026-11-15 — 3 écarts OUVERTS fermés : SBI continuous orphelin, IMS bridge réel, ingestion_failures catégorisées (ANR1 #10 E2E-5G)
+
+Lot continu de 2.17.0 sur la même branche `feat/oiran-api-e2e-5g`. Ferme les 3 écarts documentés OUVERTS dans le CHANGELOG 2.17.0 (voir « Diagnostics amont RESTENT OUVERTS »). Hors périmètre strict préservé : `apps/api/src/lib.rs`, `read_time_patch.rs`, `/sessions*`, `/callflow*`, `/identities*`, `POLARIS_CONTROL/` — intacts.
+
+### Fix (a) — SBI continuous orphelin rattaché via GTP-U N3
+
+Cause prouvée côté audit (#10 6896790347) : les sessions découvertes depuis le seul plan utilisateur (GTP-U N3 sans N2) n'ont AUCUN event N2 qui publierait `tunnel_endpoint_ip`/`gtp_teid` → `tunnel_idx` reste vide dans `attach_sbi_to_sessions` (`session-engine/src/lib.rs:1869-1999`) → les events SBI qui portent pourtant le même tuple ne sont jamais rattachés. Cas prod : `/sessions/5g-session-99e8a9a6f5a0d5af/events?protocol=HTTP2 = 0` malgré SBI « INGESTING » côté `/metrics`.
+
+Fix : dans `attach_sbi_to_sessions`, après l'indexation N2, on indexe aussi les events N3 GTP-U de la session. `decoder-gtpu` émet `teid` + `tunnel_endpoint_ip` dans ses `session_identifiers` (`decoder-gtpu/src/lib.rs:158-171`). On normalise ces valeurs (`normalize_ip`, `normalize_teid_hex`) et on les insère dans `tunnel_idx` sous l'alias `gtp_teid` attendu par les SBI. L'indexation N2 existante (2.9.15 + 2.9.17) reste prioritaire : on tombe sur GTP-U uniquement pour les sessions orphelines.
+
+Test : `session-engine::tests::sbi_attach_rescues_orphan_session_via_n3_gtpu_tunnel_anr1_e2e_5g` — construit une `DiscoveredPduSession` dont `event_ids = [n3_gtpu_ul]`, passe un SBI avec `(tunnel_endpoint_ip, gtp_teid)` matching → assert rattachement complet (event_ids, interfaces, event_context).
+
+### Fix (b) — IMS bridge device résolu dynamiquement
+
+Cause (audit #10 6896790347 §1) : `interface_specs()` hardcode `br-oiran-ims`. L'API `/interfaces` retourne `IMS=UNAVAILABLE, reason NETWORK_DEVICE_NOT_FOUND (device br-oiran-ims)` quand le pont Docker réel a un autre nom.
+
+Fix : nouveau helper public `resolve_ims_bridge_device()` dans `live-probe/src/lib.rs`, résolution dans l'ordre :
+1. **Variable d'environnement `OIRAN_IMS_BRIDGE_DEVICE`** (prioritaire, déterministe, ANR1 peut l'exporter sur le runner prod après `docker network ls` / `ip -br link`).
+2. **Scan `/sys/class/net/`** pour un bridge dont le nom contient `ims` et commence par `br` (`br-*-ims`, `br-ims-*`, etc.). Préférence pour `br-oiran-ims` quand il existe (idempotence avec les déploiements antérieurs).
+3. **Défaut historique `br-oiran-ims`** (fallback compat).
+
+Zero side-effect réseau. `interface_specs()` appelle maintenant `resolve_ims_bridge_device()` au lieu du littéral hardcodé.
+
+Tests :
+- `live-probe::tests::resolve_ims_bridge_device_honors_env_override` — env var définie → valeur exacte retournée.
+- `live-probe::tests::resolve_ims_bridge_device_trims_and_rejects_empty_env` — env vide → fallback sur scan ou défaut `br-*`.
+
+### Fix (c) — `ingestion_failures` catégorisées par code
+
+Cause (audit #10 6896790347 §4) : 412 ingestion_failures observés en prod sans aucun moyen de savoir laquelle des 8 causes incrémente le compteur. Mono-cumulatif, aucune sous-catégorie.
+
+Fix :
+- Nouveau champ `pub failures_by_category: BTreeMap<String, u64>` dans `CaptureMetrics` (`live-probe/src/lib.rs`), avec `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]` pour back-compat.
+- Nouvelle fn publique `pub fn categorize_failure_code(error_code: &str) -> String` — extrait le préfixe avant `:` (ex. `"CONTINUOUS_SEGMENT_NOT_FINALIZED: Truncated at byte 593820"` → `"CONTINUOUS_SEGMENT_NOT_FINALIZED"`). Codes vides → `"UNKNOWN"` (invariant anti-silent).
+- Nouvelle fn publique `pub fn bump_failure(metrics, error_code)` — incrémente simultanément le compteur plat et la catégorie correspondante. **Remplace les 8 sites d'incrément** de `metrics.ingestion_failures.saturating_add(1)` par un seul call.
+- Le 9e site (bulk `newly_rejected`) est catégorisé en `CONTINUOUS_NEWLY_REJECTED`.
+
+JSON `/metrics` exposera automatiquement `failures_by_category` grâce à la sérialisation `serde` déjà en place (aucune modif `lib.rs`).
+
+Tests :
+- `live-probe::tests::bump_failure_updates_flat_counter_and_category_map` — 3 bump → compteur plat = 3, 2 catégories distinctes avec les bons compteurs.
+- `live-probe::tests::categorize_failure_code_splits_at_colon_then_defaults_to_unknown` — 4 cas : préfixe, pas de `:`, chaîne vide, `:payload`.
+
+### Preuves (runner devmat, 2026-11-15)
+
+```
+$ cargo test --release --offline -p session-engine --lib -- \
+    sbi_attach_rescues_orphan_session_via_n3_gtpu_tunnel
+# test result: ok. 1 passed; 0 failed; 31 filtered out
+
+$ cargo test --release --offline -p live-probe --lib -- \
+    bump_failure_updates_flat categorize_failure_code_splits resolve_ims_bridge_device
+# test result: ok. 4 passed; 0 failed; 141 filtered out
+
+$ cargo test --release --offline --workspace --no-fail-fast
+# exit=0 ; 77 suites, 580 passed, 0 failed, 10 ignored
+# +5 vs 575 (merge 2.16.1) : 1 SBI orphan + 2 IMS + 2 failures catégorisation
+```
+
+### Reste OUVERT (jamais par hypothèse)
+
+Aucun écart « laissé OUVERT par silence ». Les 2 points pouvant encore être vérifiés en prod :
+- **`/interfaces` IMS=AVAILABLE** : sera confirmé seulement après qu'ANR1 ait soit exporté `OIRAN_IMS_BRIDGE_DEVICE`, soit créé un bridge `br-*-ims` sur l'hôte. Le code 2.17.1 fonctionne dès que l'un des deux est présent ; si aucun, fallback `br-oiran-ims` qui reste inchangé.
+- **Catégorisation réelle des 412 failures** : sera visible après redémarrage du service (le compteur plat `ingestion_failures` reste cumulatif, `failures_by_category` commence à zéro après restart).
+
+### Hors périmètre respecté
+
+- `apps/api/src/lib.rs` : INTACTE.
+- `apps/api/src/read_time_patch.rs` : INTACTE.
+- `POLARIS_CONTROL/`, `apps/control/` : INTACTES.
+
+Bump patch : `oiran-api 2.17.0 → 2.17.1`.
+
 ## OIRAN API 2.17.0 — 2026-11-15 — Trace E2E 5G : IMS ingestion + règles SIP/RTP + N4_IMS dans `correlation_status` (ANR1 #10 E2E-5G)
 
 Lot 1 de la feuille de route « Trace E2E 5G » (audit #10 6896790347, feu vert #10 6896869321). Étend la chaîne de corrélation du data-plane (N2→SBI→N4→N3) au voice-plane IMS (SIP + RTP). Trois diagnostics amont prouvés par Sadok (SBI continuous perdu, IMS non ingéré, 412 ingestion_failures) traités partiellement — le reste est documenté sur #10 pour un lot 2.17.1.

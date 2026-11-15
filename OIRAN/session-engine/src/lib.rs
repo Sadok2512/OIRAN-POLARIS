@@ -1956,6 +1956,35 @@ fn attach_sbi_to_sessions(
                     index_tunnel_names(&parsed, idx, &mut tunnel_idx);
                 }
             }
+
+            // 2.17.1 (ANR1 #10 E2E-5G) — fix SBI continuous perdu.
+            // Les sessions découvertes depuis le plan utilisateur
+            // seul (GTP-U N3 sans N2 associé — cas prod
+            // `5g-session-99e8a9a6f5a0d5af`) n'ont AUCUN event N2
+            // qui publierait `tunnel_endpoint_ip`/`gtp_teid` →
+            // `tunnel_idx` reste vide pour cette session → les
+            // events SBI qui portent pourtant le même tuple
+            // `(tunnel_endpoint_ip, gtp_teid)` ne sont jamais
+            // rattachés. decoder-gtpu émet `teid` (sans préfixe
+            // `gtp_`) + `tunnel_endpoint_ip` dans ses
+            // `session_identifiers` (voir decoder-gtpu/src/lib.rs:
+            // 158-171). On les indexe ici avec le MÊME alias
+            // `gtp_teid` que celui qu'attendent les SBI (lookup
+            // ligne 1980-1982 ci-dessous).
+            if event.protocol.eq_ignore_ascii_case("GTP-U") {
+                if let (Some(ip_raw), Some(teid_raw)) = (
+                    event.first_identifier("tunnel_endpoint_ip"),
+                    event.first_identifier("teid"),
+                ) {
+                    let normalized_ip = event_schema::normalize_ip(ip_raw);
+                    let normalized_teid = event_schema::normalize_teid_hex(teid_raw);
+                    if let Some(teid) = normalized_teid {
+                        tunnel_idx
+                            .entry((normalized_ip, teid))
+                            .or_insert(idx);
+                    }
+                }
+            }
         }
     }
 
@@ -4237,6 +4266,95 @@ mod tests {
         assert!(
             teids.contains("0x2222"),
             "session TEIDs should contain the UE2 bearer, got {teids:?}"
+        );
+    }
+
+    /// 2.17.1 (ANR1 #10 E2E-5G, fix a — SBI continuous perdu).
+    /// Reproduit le cas `5g-session-99e8a9a6f5a0d5af` : une session
+    /// 5G découverte uniquement depuis GTP-U N3 (sans N2 associé
+    /// dans le callflow). Le SBI publie `(tunnel_endpoint_ip,
+    /// gtp_teid)` qui MATCHE exactement les events N3 GTP-U, mais
+    /// avant 2.17.1 `attach_sbi_to_sessions` n'indexait les tunnels
+    /// qu'à partir des events N2 → tunnel_idx vide → SBI jamais
+    /// rattaché → `/sessions/.../events?protocol=HTTP2` = 0.
+    /// Le fix 2.17.1 indexe aussi les events N3 GTP-U (ils émettent
+    /// `teid` + `tunnel_endpoint_ip` depuis decoder-gtpu, voir
+    /// `decoder-gtpu/src/lib.rs:158-171`) sous l'alias `gtp_teid`
+    /// attendu par les SBI.
+    #[test]
+    fn sbi_attach_rescues_orphan_session_via_n3_gtpu_tunnel_anr1_e2e_5g() {
+        // Pas d'event N2 : la session « orpheline » est découverte
+        // par l'autre voie (GTP-U N3 + UE context release). On
+        // simule en construisant un `DiscoveredPduSession` à la
+        // main ET en passant un event N3 GTP-U qui porte la clé.
+        //
+        // Les tests existants passent par `discover_sessions` pour
+        // construire les PDU sessions. Ici on teste la sous-fn
+        // `attach_sbi_to_sessions` directement pour prouver
+        // l'indexation GTP-U.
+        let mut n3 = event(
+            "evt-n3-gtpu-ul",
+            "GTP-U",
+            "GTP-U",
+            &[
+                ("teid", "0x7a1c"),
+                ("tunnel_endpoint_ip", "10.77.23.13"),
+                ("tunnel_direction", "UPLINK"),
+            ],
+            1,
+        );
+        n3.interface = "N3".into();
+        let sbi = event(
+            "evt-sbi-orphan",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            &[
+                ("pdu_session_id", "1"),
+                ("tunnel_endpoint_ip", "10.77.23.13"),
+                ("gtp_teid", "0x7a1c"),
+            ],
+            2,
+        );
+        let events = vec![n3.clone(), sbi.clone()];
+        // Session orpheline : event_ids = [n3] (découverte GTP-U).
+        let mut pdu_sessions = vec![DiscoveredPduSession {
+            session_id: "5g-session-orphan".into(),
+            ue_context_id: "ue-ctx-orphan".into(),
+            pdu_session_id: "1".into(),
+            dnn: None,
+            snssai: None,
+            state: "ACTIVE".into(),
+            establishment_timestamp_ns: 0,
+            release_timestamp_ns: None,
+            interfaces: vec!["N3".into()],
+            correlation_status: "OPEN".into(),
+            event_ids: vec!["evt-n3-gtpu-ul".into()],
+        }];
+        let mut event_context: BTreeMap<String, String> = BTreeMap::new();
+        event_context.insert("evt-n3-gtpu-ul".into(), "ue-ctx-orphan".into());
+
+        attach_sbi_to_sessions(&events, &mut pdu_sessions, &mut event_context);
+
+        assert_eq!(
+            pdu_sessions[0].event_ids.len(),
+            2,
+            "SBI doit être rattaché à la session orpheline découverte via GTP-U ; got {:?}",
+            pdu_sessions[0].event_ids
+        );
+        assert!(
+            pdu_sessions[0].event_ids.contains(&"evt-sbi-orphan".into()),
+            "event_ids doit contenir evt-sbi-orphan ; got {:?}",
+            pdu_sessions[0].event_ids
+        );
+        assert!(
+            pdu_sessions[0].interfaces.iter().any(|i| i == "SBI-HTTP2"),
+            "SBI-HTTP2 doit apparaître dans session.interfaces ; got {:?}",
+            pdu_sessions[0].interfaces
+        );
+        assert_eq!(
+            event_context.get("evt-sbi-orphan").map(String::as_str),
+            Some("ue-ctx-orphan"),
+            "event_context doit cartographier le SBI à la session orpheline"
         );
     }
 }
