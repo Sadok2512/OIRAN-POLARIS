@@ -3631,6 +3631,38 @@ struct SessionsFilterIdentity {
     value: String,
 }
 
+/// 2.18.5 (ANR2 #10 6901691533) — `identities` d'une ligne de liste,
+/// identique pour `GET /sessions` et `POST /sessions/filter`. p900 ≥ 2.5.1
+/// ne lit que `/sessions/filter` : sans ce champ, IMSI/TMSI/IMEI
+/// s'affichaient « — », et l'hydratation tshark (déclenchée seulement par
+/// `/sessions`) ne démarrait jamais. Vault d'abord ; vide → hydratation en
+/// arrière-plan + repli sur les events du call flow ; puis SBI.
+fn insert_list_identities(
+    state: &AppState,
+    summary: &mut Value,
+    session_id: &str,
+    events: Option<&[callflow_schema::CallFlowEvent]>,
+) {
+    let mut identities = identity_summary_for_session(state, session_id);
+    if identities.is_null() {
+        schedule_identity_hydration(state, session_id);
+        if let Some(events) = events {
+            if let Ok(Value::Array(items)) = serde_json::to_value(events) {
+                if let Some(fallback) = read_time_patch::extract_identity_summary_from_items(&items)
+                {
+                    identities = fallback;
+                }
+            }
+        }
+    }
+    if let Some(events) = events {
+        merge_sbi_identities(&mut identities, events);
+    }
+    if let Some(object) = summary.as_object_mut() {
+        object.insert("identities".into(), identities);
+    }
+}
+
 /// 2.10.0 — `POST /sessions/filter` : AND logique sur
 /// `messages` (par interface optionnelle), `causes` (par domaine
 /// optionnel), `failures_only`, et `identity` (operator seulement).
@@ -3798,6 +3830,7 @@ async fn sessions_filter(
         if page_set.contains(flow.session_id.as_str()) {
             let mut summary = session_summary(&state, flow);
             decorate_subscriber_summary(&mut summary, flow, &journey_index);
+            insert_list_identities(&state, &mut summary, &flow.session_id, Some(&flow.events));
             items_by_id.insert(flow.session_id.clone(), summary);
         }
     }
@@ -3813,6 +3846,7 @@ async fn sessions_filter(
             {
                 let mut summary = live_session_summary(&dataset, &flow);
                 decorate_subscriber_summary(&mut summary, &flow, &journey_index);
+                insert_list_identities(&state, &mut summary, session_id, Some(&flow.events));
                 items_by_id.insert(session_id.clone(), summary);
             }
         }
@@ -3828,10 +3862,14 @@ async fn sessions_filter(
                     for record in records {
                         if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
                             if page_set.contains(session.session_id.as_str()) {
-                                items_by_id.insert(
-                                    session.session_id.clone(),
-                                    lte_session_summary(&manifest, &session),
+                                let mut summary = lte_session_summary(&manifest, &session);
+                                insert_list_identities(
+                                    &state,
+                                    &mut summary,
+                                    &session.session_id,
+                                    None,
                                 );
+                                items_by_id.insert(session.session_id.clone(), summary);
                             }
                         }
                     }
@@ -10414,6 +10452,45 @@ mod tests {
         let status = response.status();
         let payload = json_body(response).await;
         (status, payload)
+    }
+
+    /// 2.18.5 — ANR2 #10 6901691533 : p900 lit /sessions/filter, qui
+    /// omettait `identities` → IMSI/TMSI/IMEI « — ». Chaque ligne filtrée
+    /// porte la même clé `identities` que GET /sessions.
+    #[tokio::test]
+    async fn sessions_filter_rows_carry_the_same_identities_as_sessions_list() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let state = AppState::load(test_config(workspace, "filter-identities")).unwrap();
+        let list = router(state.clone(), None)
+            .oneshot(req("/api/v1/sessions?page_size=100", false))
+            .await
+            .unwrap();
+        let list = json_body(list).await;
+        let by_id: std::collections::BTreeMap<String, Value> = list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| (row["session_id"].as_str().unwrap().to_owned(), row["identities"].clone()))
+            .collect();
+        let (status, page) = post_sessions_filter(&state, json!({"limit": 100}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = page["data"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        for row in rows {
+            let id = row["session_id"].as_str().unwrap();
+            assert!(
+                row.as_object().unwrap().contains_key("identities"),
+                "row {id} of /sessions/filter has no identities key"
+            );
+            // Le filtre peut en savoir plus (repli events) ; jamais moins.
+            if let Some(expected) = by_id.get(id).filter(|value| !value.is_null()) {
+                assert_eq!(&row["identities"], expected, "identities differ for {id}");
+            }
+        }
     }
 
     /// 2.15.7 — ANR1 #10 (gate pagination 2.16.0/2.5.1) : GET /sessions

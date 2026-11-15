@@ -1,5 +1,11 @@
 # Changelog
 
+## OIRAN API 2.18.5 — 2026-11-15 — `identities` dans `POST /sessions/filter` (patch)
+
+- Cause prouvée par ANR2 (#10 6901691533) : p900 ≥ 2.5.1 lit uniquement `POST /sessions/filter`, qui n'ajoutait pas `identities` → colonnes IMSI/TMSI/IMEI « — » ; et l'hydratation tshark (déclenchée seulement par `GET /sessions`) ne démarrait jamais.
+- `insert_list_identities` : même logique pour les 3 sources du filtre (statique, continuous, LTE evidence) — vault, sinon hydratation en arrière-plan + repli events, puis SBI (`merge_sbi_identities`).
+- Test `sessions_filter_rows_carry_the_same_identities_as_sessions_list`.
+
 ## OIRAN API 2.18.4 — 2026-11-15 — `/sessions/:id/identities` expose MSISDN + IMEI/IMEISV depuis le SBI (patch)
 
 Patch de parité pour la route **détail** `GET /api/v1/sessions/:id/identities`. Depuis 2.18.1, la **liste** `/api/v1/sessions` fusionnait déjà les identités SBI (MSISDN via `gpsi`, IMEI/IMEISV via `pei`) avec le vault via `merge_sbi_identities(&mut identities, &flow.events)`. La route détail (`identity_bundle`) ne le faisait pas → écart OUVERT (#10 6898944250).
