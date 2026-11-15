@@ -1,9 +1,9 @@
 //! Native bounded HTTP/2 and 5G SBI transaction decoder.
 
 use event_schema::{
-    normalize_ip, pseudonym_subscriber_text, sha256_hex, DecodeStatus, Direction, Endpoint,
-    EvidenceReference, EvidenceState, InformationElement, NamedValue, NormalizedEvent, Protocol,
-    PseudonymKey, SbiMetadata,
+    normalize_ip, pseudonym, pseudonym_subscriber_text, sha256_hex, DecodeStatus, Direction,
+    Endpoint, EvidenceReference, EvidenceState, InformationElement, NamedValue, NormalizedEvent,
+    Protocol, PseudonymKey, SbiMetadata,
 };
 use hpack::huffman::HuffmanDecoder;
 use hpack::Decoder;
@@ -743,11 +743,34 @@ fn build_event(
     for part in &request_parts {
         if part.content_type.starts_with("application/json") {
             for (name, value) in json_fields(&part.body, pseudonym_key) {
-                if name == "pdu_session_id" || name == "subscriber_pseudonym" {
+                // 2.18.0 (ANR1 #10 E2E-5G — SBI identities) — on
+                // promeut aussi les nouveaux identifiants
+                // d'identité (`msisdn_pseudonym`, `imei_pseudonym`,
+                // `imeisv_pseudonym`) dans `session_identifiers`
+                // pour qu'ils soient disponibles au
+                // `session-engine::attach_sbi_to_sessions` (match
+                // par SUPI) et relayés vers l'UI. Ils restent
+                // également visibles dans `information_elements`
+                // pour l'audit (shape inchangée).
+                let as_identifier = matches!(
+                    name.as_str(),
+                    "pdu_session_id"
+                        | "subscriber_pseudonym"
+                        | "msisdn_pseudonym"
+                        | "imei_pseudonym"
+                        | "imeisv_pseudonym"
+                );
+                if as_identifier {
                     identifiers.push(NamedValue {
                         name: name.clone(),
                         value: value.clone(),
-                        pseudonymized: name == "subscriber_pseudonym",
+                        pseudonymized: matches!(
+                            name.as_str(),
+                            "subscriber_pseudonym"
+                                | "msisdn_pseudonym"
+                                | "imei_pseudonym"
+                                | "imeisv_pseudonym"
+                        ),
                     });
                 }
                 ies.push(InformationElement {
@@ -1214,42 +1237,102 @@ fn extract_json(body: &[u8]) -> Option<&[u8]> {
     None
 }
 
+/// 2.18.0 (ANR1 #10 E2E-5G — SBI identities) — domain hash pour les
+/// identifiants d'équipement (PEI : IMEI / IMEISV). Séparé de
+/// `SUBSCRIBER_PSEUDO_DOMAIN` pour que le hash d'un IMEI ne soit
+/// jamais confondu avec celui d'un SUPI (cross-domain collision
+/// prevention).
+const PEI_PSEUDO_DOMAIN: &str = "pei";
+/// 2.18.0 — domain hash pour MSISDN (GPSI préfixé `msisdn-`). Identité
+/// abonné publique, mais domain distinct de SUPI pour que le hash
+/// MSISDN ne match pas celui d'un SUPI.
+const GPSI_MSISDN_PSEUDO_DOMAIN: &str = "gpsi-msisdn";
+
 fn collect_json(value: &Value, fields: &mut Vec<(String, String)>, pseudonym_key: &PseudonymKey) {
     let Value::Object(map) = value else { return };
     for (key, value) in map {
-        if matches!(key.as_str(), "supi" | "suci" | "pei") {
-            if let Some(text) = scalar(value) {
-                // 2.9.9 (#9 comment 6725858177) : was the literal
-                // string `"subscriber"`. Pulled through the shared
-                // `SUBSCRIBER_PSEUDO_DOMAIN` constant — any decoder
-                // that wants to surface the subscriber identity
-                // uses this one label, otherwise cross-site
-                // pseudonyms diverge.
-                fields.push((
-                    "subscriber_pseudonym".into(),
-                    pseudonym_subscriber_text(pseudonym_key, text.as_bytes()),
-                ));
-            }
-        } else {
-            let normalized = match key.as_str() {
-                "pduSessionId" => Some("pdu_session_id"),
-                "dnn" => Some("dnn"),
-                "accessType" => Some("access_type"),
-                "cause" => Some("cause"),
-                "smContextRef" => Some("sm_context_reference"),
-                "sst" => Some("s_nssai_sst"),
-                "sd" => Some("s_nssai_sd"),
-                _ => None,
-            };
-            if let Some(name) = normalized {
+        match key.as_str() {
+            // SUPI / SUCI — identité abonné 5G. 2.9.9 : domain
+            // `SUBSCRIBER_PSEUDO_DOMAIN` partagé avec la sanitation
+            // URI pour cross-site consistency.
+            "supi" | "suci" => {
                 if let Some(text) = scalar(value) {
-                    fields.push((name.into(), text));
+                    fields.push((
+                        "subscriber_pseudonym".into(),
+                        pseudonym_subscriber_text(pseudonym_key, text.as_bytes()),
+                    ));
+                }
+            }
+            // 2.18.0 (ANR1 #10 E2E-5G — SBI identities) — PEI =
+            // Permanent Equipment Identifier. TS 29.571 §5.4.4 :
+            // préfixe `imei-{digits}` ou `imeisv-{digits}`. On
+            // sépare la pseudonymisation en 2 kinds distincts
+            // (`imei_pseudonym`, `imeisv_pseudonym`) pour que le
+            // vault/UI puisse les présenter séparément. L'input du
+            // hash est la chaîne complète `imei-…`/`imeisv-…` pour
+            // préserver la stabilité avec le domain PEI_PSEUDO_DOMAIN.
+            "pei" => {
+                if let Some(text) = scalar(value) {
+                    let kind = if text.starts_with("imeisv-") {
+                        Some("imeisv_pseudonym")
+                    } else if text.starts_with("imei-") {
+                        Some("imei_pseudonym")
+                    } else {
+                        // Préfixe inconnu → aucune hypothèse, on ne
+                        // publie rien (invariant « un écart se
+                        // déclare OUVERT, jamais par hypothèse »).
+                        None
+                    };
+                    if let Some(name) = kind {
+                        fields.push((
+                            name.into(),
+                            pseudonym(pseudonym_key, PEI_PSEUDO_DOMAIN, text.as_bytes()),
+                        ));
+                    }
+                }
+            }
+            // 2.18.0 — GPSI = Generic Public Subscription Identifier.
+            // TS 29.571 §5.4.5 : préfixe `msisdn-{digits}` (E.164) ou
+            // `extid-{identifier}@{domain}`. On ne traite ici que
+            // `msisdn-…` (identité numérotée universelle). Les
+            // external-id (extid) relèvent d'un autre kind non câblé
+            // par cette version.
+            "gpsi" => {
+                if let Some(text) = scalar(value) {
+                    if text.starts_with("msisdn-") {
+                        fields.push((
+                            "msisdn_pseudonym".into(),
+                            pseudonym(
+                                pseudonym_key,
+                                GPSI_MSISDN_PSEUDO_DOMAIN,
+                                text.as_bytes(),
+                            ),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                let normalized = match key.as_str() {
+                    "pduSessionId" => Some("pdu_session_id"),
+                    "dnn" => Some("dnn"),
+                    "accessType" => Some("access_type"),
+                    "cause" => Some("cause"),
+                    "smContextRef" => Some("sm_context_reference"),
+                    "sst" => Some("s_nssai_sst"),
+                    "sd" => Some("s_nssai_sd"),
+                    _ => None,
+                };
+                if let Some(name) = normalized {
+                    if let Some(text) = scalar(value) {
+                        fields.push((name.into(), text));
+                    }
                 }
             }
         }
         collect_json(value, fields, pseudonym_key);
     }
 }
+
 
 fn scalar(value: &Value) -> Option<String> {
     match value {
@@ -1366,6 +1449,121 @@ mod tests {
         assert!(!fields
             .iter()
             .any(|(_, value)| value.contains("imsi-secret")));
+    }
+
+    /// 2.18.0 (ANR1 #10 E2E-5G — SBI identities) — un corps JSON
+    /// `Nudm_SDM am-data` porte `gpsi: "msisdn-…"`. decoder-sbi émet
+    /// `msisdn_pseudonym` sous un hash du domain GPSI_MSISDN,
+    /// séparé de `subscriber_pseudonym` pour que les deux hashs ne
+    /// collisionnent jamais. Le MSISDN littéral n'apparaît nulle
+    /// part dans la sortie.
+    #[test]
+    fn extracts_gpsi_msisdn_as_msisdn_pseudonym_without_clear_value() {
+        let fields = json_fields(
+            // Fixture 3GPP opaque : PLMN test 001-01, MSISDN E.164
+            // de documentation. Pas d'identité PII.
+            br#"{"supi":"imsi-001010000000001","gpsi":"msisdn-33000000001","amData":{}}"#,
+            &test_key(),
+        );
+        let msisdn: Vec<_> = fields
+            .iter()
+            .filter(|(name, _)| name == "msisdn_pseudonym")
+            .collect();
+        assert_eq!(
+            msisdn.len(),
+            1,
+            "exactement un msisdn_pseudonym attendu ; got {fields:?}"
+        );
+        let hash = &msisdn[0].1;
+        assert!(!hash.contains("33000000001"), "hash ne doit pas contenir le MSISDN clair");
+        assert!(!hash.contains("msisdn"), "hash ne doit pas préserver le préfixe");
+        // Le subscriber_pseudonym (SUPI) est aussi émis ET distinct
+        // du msisdn_pseudonym (domains séparés).
+        let subscriber: Vec<_> = fields
+            .iter()
+            .filter(|(name, _)| name == "subscriber_pseudonym")
+            .collect();
+        assert_eq!(subscriber.len(), 1);
+        assert_ne!(
+            &subscriber[0].1, hash,
+            "hash SUPI et hash MSISDN doivent diverger (domains distincts)"
+        );
+    }
+
+    /// 2.18.0 — `pei: "imeisv-…"` → émet `imeisv_pseudonym` ;
+    /// `pei: "imei-…"` → émet `imei_pseudonym`. Les deux sont
+    /// pseudonymisés avec le domain PEI, distinct de
+    /// `SUBSCRIBER_PSEUDO_DOMAIN`.
+    #[test]
+    fn extracts_pei_as_imei_or_imeisv_pseudonym_per_prefix() {
+        let imeisv = json_fields(
+            br#"{"pei":"imeisv-4901542032375180"}"#,
+            &test_key(),
+        );
+        assert!(imeisv.iter().any(|(n, _)| n == "imeisv_pseudonym"));
+        assert!(!imeisv.iter().any(|(n, _)| n == "imei_pseudonym"));
+
+        let imei = json_fields(
+            br#"{"pei":"imei-490154203237518"}"#,
+            &test_key(),
+        );
+        assert!(imei.iter().any(|(n, _)| n == "imei_pseudonym"));
+        assert!(!imei.iter().any(|(n, _)| n == "imeisv_pseudonym"));
+
+        // Un préfixe inconnu (ex. hypothétique `mac-…`) ne doit
+        // JAMAIS produire de pseudonyme IMEI par hypothèse.
+        let unknown = json_fields(
+            br#"{"pei":"mac-00-11-22-33-44-55"}"#,
+            &test_key(),
+        );
+        assert!(!unknown.iter().any(|(n, _)| n == "imei_pseudonym" || n == "imeisv_pseudonym"));
+    }
+
+    /// 2.18.0 — `Nsmf_PDUSession CreateSMContext` est un
+    /// multipart/related. La partie `application/json` porte `supi`
+    /// + `gpsi` + `pei` ; la partie binaire NGAP porte le n2SmInfo.
+    /// decoder-sbi doit extraire les 3 identifiants depuis la partie
+    /// JSON, chacun sous un hash distinct.
+    #[test]
+    fn extracts_sbi_identities_from_sm_context_json_body() {
+        let body = br#"{
+            "supi":"imsi-001010000000001",
+            "pei":"imeisv-4901542032375180",
+            "gpsi":"msisdn-33000000001",
+            "pduSessionId":1,
+            "dnn":"internet",
+            "sNssai":{"sst":1,"sd":"010203"}
+        }"#;
+        let fields = json_fields(body, &test_key());
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"subscriber_pseudonym"));
+        assert!(names.contains(&"imeisv_pseudonym"));
+        assert!(names.contains(&"msisdn_pseudonym"));
+        assert!(names.contains(&"pdu_session_id"));
+        // Les 3 hashs identité (supi, msisdn, imeisv) sont TOUS
+        // distincts : domains séparés garantissent qu'un hash d'un
+        // ne match jamais un hash de l'autre.
+        let supi = fields.iter().find(|(n, _)| n == "subscriber_pseudonym").unwrap();
+        let msisdn = fields.iter().find(|(n, _)| n == "msisdn_pseudonym").unwrap();
+        let imeisv = fields.iter().find(|(n, _)| n == "imeisv_pseudonym").unwrap();
+        assert_ne!(supi.1, msisdn.1);
+        assert_ne!(supi.1, imeisv.1);
+        assert_ne!(msisdn.1, imeisv.1);
+    }
+
+    /// 2.18.0 — Un message SBI sans `gpsi` ni `pei` n'émet aucun
+    /// IE identité (invariant « jamais d'hypothèse »).
+    #[test]
+    fn body_without_gpsi_or_pei_emits_no_identity_ie() {
+        let fields = json_fields(
+            br#"{"supi":"imsi-001010000000001","pduSessionId":1,"dnn":"internet"}"#,
+            &test_key(),
+        );
+        assert!(!fields.iter().any(|(n, _)| n == "msisdn_pseudonym"));
+        assert!(!fields.iter().any(|(n, _)| n == "imei_pseudonym"));
+        assert!(!fields.iter().any(|(n, _)| n == "imeisv_pseudonym"));
+        // subscriber_pseudonym reste émis (supi présent).
+        assert!(fields.iter().any(|(n, _)| n == "subscriber_pseudonym"));
     }
     #[test]
     fn rejects_invalid_frame_lengths() {

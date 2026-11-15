@@ -1,5 +1,98 @@
 # Changelog
 
+## OIRAN API 2.18.0 — 2026-11-15 — Identités MSISDN + IMEI/IMEISV depuis le SBI (ANR1 #10 E2E-5G)
+
+Lot sur branche dédiée `feat/oiran-api-2.18.0-sbi-identities` (depuis `177135e`), pour ne pas bouger `feat/oiran-api-e2e-5g` qu'ANR1 déploie.
+
+Nouveau : `decoder-sbi` extrait désormais 2 identifiants supplémentaires depuis les corps HTTP/2 JSON des réponses `Nudm_SDM`/`Nudm_UECM`/`Nsmf_PDUSession` (et autres services) — **MSISDN** (via `gpsi`) et **IMEI / IMEISV** (via `pei`). Chaque identifiant est hashé avec un domain distinct de `SUBSCRIBER_PSEUDO_DOMAIN`, pour que les hashs ne collisionnent jamais avec celui d'un SUPI.
+
+Hors périmètre strict respecté : `apps/api/src/lib.rs`, `read_time_patch.rs`, `/sessions*`, `/callflow*`, `/identities*`, `POLARIS_CONTROL/` — **intacts**. Le câblage de l'affichage dans `/api/v1/sessions.identities` nécessite une modif ciblée de `lib.rs` documentée sur #10.
+
+### decoder-sbi — nouveaux kinds dans `session_identifiers`
+
+- `msisdn_pseudonym` — produit depuis `"gpsi":"msisdn-{digits}"` (TS 29.571 §5.4.5). Hash via nouveau domain privé `"gpsi-msisdn"`. Jamais depuis un `extid-…` (laissé OUVERT par design).
+- `imei_pseudonym` — produit depuis `"pei":"imei-{digits}"` (TS 29.571 §5.4.4). Hash via nouveau domain privé `"pei"`.
+- `imeisv_pseudonym` — produit depuis `"pei":"imeisv-{digits}"` (même domain `"pei"`, préfixe distinct).
+- Préfixe PEI inconnu (ex. hypothétique `"mac-…"`) → **aucun** pseudonyme émis (invariant anti-hypothèse).
+- Les 3 kinds sont aussi présents dans `information_elements` (shape inchangée pour les consommateurs legacy).
+
+Les 3 nouveaux names sont également ajoutés à la whitelist `as_identifier` du callsite SBI → les events SBI les publient dans `session_identifiers` et pas uniquement dans `information_elements`, pour que `session-engine::attach_sbi_to_sessions` et `collect_sbi_identities_for_session` les voient directement.
+
+### session-engine — nouvelle fonction publique `collect_sbi_identities_for_session`
+
+```rust
+pub struct SbiIdentitySummary {
+    pub msisdn_pseudonym: Option<SbiIdentityValue>,
+    pub imei_pseudonym: Option<SbiIdentityValue>,
+    pub imeisv_pseudonym: Option<SbiIdentityValue>,
+}
+
+pub struct SbiIdentityValue {
+    pub value: String,
+    pub source: String,              // "SBI:<service>:<operation>" ou "SBI:<message_name>"
+    pub source_event_id: String,
+    pub capture_id: String,
+    pub packet_number: u64,
+}
+
+pub fn collect_sbi_identities_for_session(
+    session: &DiscoveredPduSession,
+    events: &[EventRecord],
+) -> SbiIdentitySummary
+```
+
+Invariants :
+- Scan **uniquement** les events dont `event_id ∈ session.event_ids` → le match SUPI est déjà prouvé par `attach_sbi_to_sessions` (2.9.9 / 2.9.15 / 2.9.17 / 2.17.1).
+- Un seul event par kind → la 1re observation canonique est retenue (ordre `event_ids`).
+- Aucune identité fuitée depuis les events d'une autre session (test dédié).
+- Zéro side-effect, fonction pure.
+
+### Point de câblage pour `lib.rs` (à toucher par Sadok)
+
+L'affichage des 3 nouveaux kinds dans la réponse `/api/v1/sessions/:id` nécessite 1 appel `collect_sbi_identities_for_session` dans `apps/api/src/lib.rs::identity_summary_for_session` (ligne précise dans le rapport #10 « PRÊT CÂBLAGE »). Le lot 2.18.0 **ne fait pas** cette modification (règle Sadok : hors périmètre).
+
+### Tests ajoutés (6 unitaires)
+
+decoder-sbi (`decoder-sbi/src/lib.rs::tests`) :
+- `extracts_gpsi_msisdn_as_msisdn_pseudonym_without_clear_value` — hash MSISDN distinct de hash SUPI, pas de MSISDN clair.
+- `extracts_pei_as_imei_or_imeisv_pseudonym_per_prefix` — préfixe `imei-` vs `imeisv-` différencié ; préfixe inconnu → aucun.
+- `extracts_sbi_identities_from_sm_context_json_body` — body `Nsmf_PDUSession CreateSMContext` (supi+pei+gpsi) → 3 hashs distincts.
+- `body_without_gpsi_or_pei_emits_no_identity_ie` — invariant anti-hypothèse.
+
+session-engine (`session-engine/src/lib.rs::tests`) :
+- `collect_sbi_identities_for_session_reads_only_attached_events` — SBI d'un autre SUPI ne fuite pas.
+- `collect_sbi_identities_for_session_returns_empty_when_no_sbi_event` — session sans SBI → summary vide.
+
+### Preuves (runner devmat, 2026-11-15)
+
+```
+$ cargo test --release --offline -p decoder-sbi --lib -- \
+    extracts_gpsi_msisdn extracts_pei_as_imei extracts_sbi_identities body_without_gpsi
+# test result: ok. 4 passed; 0 failed; 16 filtered out
+
+$ cargo test --release --offline -p session-engine --lib -- \
+    collect_sbi_identities_for
+# test result: ok. 2 passed; 0 failed; 32 filtered out
+
+$ cargo test --release --offline --workspace --no-fail-fast
+# exit=0 ; 77 suites, 586 passed, 0 failed, 10 ignored
+# +6 vs 580 (2.17.1) : 4 decoder-sbi + 2 session-engine
+```
+
+### Règle Sadok 2026-11-14 respectée
+
+- Aucune identité en clair dans le code, les tests ni ce CHANGELOG.
+- Fixtures de test : PLMN 001-01 (test ITU-T E.212), MSISDN E.164 `33000000001` (reservé documentation), IMEI `490154203237518` / IMEISV `4901542032375180` (TAC 49-01-54 = fixture Wireshark publique).
+- Les 3 hashs sont dérivés de domains **distincts** (`subscriber`, `gpsi-msisdn`, `pei`) → impossible de retrouver la valeur en clair sans la clé pseudonyme serveur.
+
+### Hors périmètre respecté
+
+- `apps/api/src/lib.rs` : INTACTE.
+- `apps/api/src/read_time_patch.rs` : INTACTE.
+- `POLARIS_CONTROL/`, `apps/control/` : INTACTES.
+
+Bump minor : `oiran-api 2.17.1 → 2.18.0`.
+
 ## OIRAN API 2.17.1 — 2026-11-15 — 3 écarts OUVERTS fermés : SBI continuous orphelin, IMS bridge réel, ingestion_failures catégorisées (ANR1 #10 E2E-5G)
 
 Lot continu de 2.17.0 sur la même branche `feat/oiran-api-e2e-5g`. Ferme les 3 écarts documentés OUVERTS dans le CHANGELOG 2.17.0 (voir « Diagnostics amont RESTENT OUVERTS »). Hors périmètre strict préservé : `apps/api/src/lib.rs`, `read_time_patch.rs`, `/sessions*`, `/callflow*`, `/identities*`, `POLARIS_CONTROL/` — intacts.

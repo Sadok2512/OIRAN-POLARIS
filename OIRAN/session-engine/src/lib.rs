@@ -2027,6 +2027,124 @@ fn attach_sbi_to_sessions(
     }
 }
 
+/// 2.18.0 (ANR1 #10 E2E-5G — SBI identities) — agrégat compact des
+/// identités abonné/équipement observées pour UNE session, dérivé des
+/// events SBI rattachés par `attach_sbi_to_sessions`. Shape prévue
+/// pour être consommée par `lib.rs::identity_summary_for_session`
+/// (ou son équivalent) **sans modifier** la pipeline tshark → vault
+/// existante. Chaque champ documente la source SBI (service +
+/// opération + event_id) pour que l'UI puisse afficher la preuve.
+///
+/// Invariant « jamais d'hypothèse » : un champ est `None` tant
+/// qu'aucun event SBI rattaché à la session ne publie l'identifiant
+/// correspondant. Un seul event → un seul `source_event_id` ;
+/// plusieurs events → la 1re observation canonique
+/// `(capture_id, packet_number, event_id)` est retenue.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SbiIdentitySummary {
+    pub msisdn_pseudonym: Option<SbiIdentityValue>,
+    pub imei_pseudonym: Option<SbiIdentityValue>,
+    pub imeisv_pseudonym: Option<SbiIdentityValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SbiIdentityValue {
+    pub value: String,
+    /// Chaîne lisible `"SBI:<service>:<operation>"` ou simplement
+    /// `"SBI"` si l'event ne porte pas les deux. Permet à l'UI de
+    /// montrer la source sans dévoiler le payload.
+    pub source: String,
+    pub source_event_id: String,
+    pub capture_id: String,
+    pub packet_number: u64,
+}
+
+/// 2.18.0 — Collecte les identités SBI observées dans la fenêtre
+/// d'une session PDU. Rattachement par subscriber_pseudonym : seuls
+/// les events SBI appartenant déjà à `session.event_ids` sont
+/// scannés, ce qui garantit que le match SUPI est déjà prouvé par
+/// `attach_sbi_to_sessions`.
+///
+/// La fonction est pure (aucun side-effect) et testable isolément
+/// sans `lib.rs`. Elle sera appelée côté lib.rs au moment de
+/// construire `/api/v1/sessions/:id.identities` — voir rapport #10
+/// pour la ligne exacte à toucher.
+pub fn collect_sbi_identities_for_session(
+    session: &DiscoveredPduSession,
+    events: &[EventRecord],
+) -> SbiIdentitySummary {
+    let event_by_id: BTreeMap<_, _> = events
+        .iter()
+        .map(|event| (event.event_id.as_str(), event))
+        .collect();
+    let mut summary = SbiIdentitySummary::default();
+    for event_id in &session.event_ids {
+        let Some(event) = event_by_id.get(event_id.as_str()).copied() else {
+            continue;
+        };
+        if !protocol_is(event, "SBI-HTTP2") {
+            continue;
+        }
+        let source = sbi_identity_source(event);
+        let capture_id = event.capture_id.clone();
+        let packet_number = event.packet_number();
+        if summary.msisdn_pseudonym.is_none() {
+            if let Some(value) = event.first_identifier("msisdn_pseudonym") {
+                summary.msisdn_pseudonym = Some(SbiIdentityValue {
+                    value: value.to_owned(),
+                    source: source.clone(),
+                    source_event_id: event.event_id.clone(),
+                    capture_id: capture_id.clone(),
+                    packet_number,
+                });
+            }
+        }
+        if summary.imei_pseudonym.is_none() {
+            if let Some(value) = event.first_identifier("imei_pseudonym") {
+                summary.imei_pseudonym = Some(SbiIdentityValue {
+                    value: value.to_owned(),
+                    source: source.clone(),
+                    source_event_id: event.event_id.clone(),
+                    capture_id: capture_id.clone(),
+                    packet_number,
+                });
+            }
+        }
+        if summary.imeisv_pseudonym.is_none() {
+            if let Some(value) = event.first_identifier("imeisv_pseudonym") {
+                summary.imeisv_pseudonym = Some(SbiIdentityValue {
+                    value: value.to_owned(),
+                    source: source.clone(),
+                    source_event_id: event.event_id.clone(),
+                    capture_id,
+                    packet_number,
+                });
+            }
+        }
+    }
+    summary
+}
+
+fn sbi_identity_source(event: &EventRecord) -> String {
+    let service = event
+        .first_identifier("sbi_service")
+        .map(str::to_owned);
+    let operation = event
+        .first_identifier("sbi_operation")
+        .map(str::to_owned);
+    match (service.as_deref(), operation.as_deref()) {
+        (Some(service), Some(op)) if !service.is_empty() && !op.is_empty() => {
+            format!("SBI:{service}:{op}")
+        }
+        (Some(service), _) if !service.is_empty() => format!("SBI:{service}"),
+        _ => event
+            .message_name
+            .is_empty()
+            .then(|| "SBI".to_owned())
+            .unwrap_or_else(|| format!("SBI:{}", event.message_name)),
+    }
+}
+
 /// 2.9.17 (#9 comment 6738246907) : scanne une map name→value
 /// pour les paires directional
 /// `*tunnel_(endpoint_ip|ip_ul|ip_dl|ip)` ↔
@@ -4356,5 +4474,105 @@ mod tests {
             Some("ue-ctx-orphan"),
             "event_context doit cartographier le SBI à la session orpheline"
         );
+    }
+
+    /// 2.18.0 (ANR1 #10 E2E-5G — SBI identities) —
+    /// `collect_sbi_identities_for_session` remonte les 3 kinds
+    /// (`msisdn`, `imei`, `imeisv`) depuis les events SBI de la
+    /// session, et laisse `None` quand aucun event SBI ne porte
+    /// l'identifiant correspondant (invariant anti-hypothèse).
+    /// Les events d'autres sessions (SUPI différent, donc pas dans
+    /// `session.event_ids`) ne doivent JAMAIS fuiter leurs
+    /// identités dans la summary de la session courante.
+    #[test]
+    fn collect_sbi_identities_for_session_reads_only_attached_events() {
+        let sbi_full = event(
+            "evt-sbi-a-sm-ctx",
+            "SBI-HTTP2",
+            "N1N2MessageTransfer",
+            &[
+                ("pdu_session_id", "1"),
+                ("subscriber_pseudonym", "psn-supi-a"),
+                ("msisdn_pseudonym", "hash-msisdn-a"),
+                ("imei_pseudonym", "hash-imei-a"),
+                ("sbi_service", "nsmf-pdusession"),
+                ("sbi_operation", "CreateSMContext"),
+            ],
+            1,
+        );
+        // Un event SBI d'une AUTRE session (SUPI différent) — il
+        // ne doit JAMAIS fuiter ses identités dans la summary de
+        // la session A.
+        let sbi_other = event(
+            "evt-sbi-b-sm-ctx",
+            "SBI-HTTP2",
+            "CreateSMContext",
+            &[
+                ("pdu_session_id", "2"),
+                ("subscriber_pseudonym", "psn-supi-b"),
+                ("msisdn_pseudonym", "hash-msisdn-b"),
+                ("imeisv_pseudonym", "hash-imeisv-b"),
+            ],
+            2,
+        );
+        let session = DiscoveredPduSession {
+            session_id: "5g-session-a".into(),
+            ue_context_id: "ue-ctx-a".into(),
+            pdu_session_id: "1".into(),
+            dnn: None,
+            snssai: None,
+            state: "ACTIVE".into(),
+            establishment_timestamp_ns: 0,
+            release_timestamp_ns: None,
+            interfaces: vec!["SBI-HTTP2".into()],
+            correlation_status: "OPEN".into(),
+            // SEULE la session A pointe sur evt-sbi-a-sm-ctx ;
+            // sbi_other n'est PAS dans event_ids.
+            event_ids: vec!["evt-sbi-a-sm-ctx".into()],
+        };
+        let events = vec![sbi_full.clone(), sbi_other.clone()];
+        let summary = collect_sbi_identities_for_session(&session, &events);
+
+        // MSISDN + IMEI pour la session A.
+        let msisdn = summary.msisdn_pseudonym.as_ref().expect("msisdn attendu");
+        assert_eq!(msisdn.value, "hash-msisdn-a");
+        assert_eq!(msisdn.source_event_id, "evt-sbi-a-sm-ctx");
+        assert_eq!(msisdn.source, "SBI:nsmf-pdusession:CreateSMContext");
+        let imei = summary.imei_pseudonym.as_ref().expect("imei attendu");
+        assert_eq!(imei.value, "hash-imei-a");
+
+        // IMEISV absent → None (invariant anti-hypothèse).
+        assert!(summary.imeisv_pseudonym.is_none());
+    }
+
+    /// 2.18.0 — Une session qui n'a AUCUN event SBI rattaché
+    /// retourne une summary entièrement None (pas de fuite depuis
+    /// des events d'autres sessions).
+    #[test]
+    fn collect_sbi_identities_for_session_returns_empty_when_no_sbi_event() {
+        let n2 = event(
+            "evt-n2-only",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            &[("pdu_session_id", "1")],
+            1,
+        );
+        let session = DiscoveredPduSession {
+            session_id: "5g-session-only-n2".into(),
+            ue_context_id: "ue-ctx-only".into(),
+            pdu_session_id: "1".into(),
+            dnn: None,
+            snssai: None,
+            state: "ACTIVE".into(),
+            establishment_timestamp_ns: 0,
+            release_timestamp_ns: None,
+            interfaces: vec!["N2".into()],
+            correlation_status: "OPEN".into(),
+            event_ids: vec!["evt-n2-only".into()],
+        };
+        let summary = collect_sbi_identities_for_session(&session, &[n2]);
+        assert!(summary.msisdn_pseudonym.is_none());
+        assert!(summary.imei_pseudonym.is_none());
+        assert!(summary.imeisv_pseudonym.is_none());
     }
 }
