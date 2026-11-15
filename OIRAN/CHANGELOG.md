@@ -1,5 +1,18 @@
 # Changelog
 
+## OIRAN API 2.16.1 — 2026-11-15 — /sessions/filter couvre les mêmes sessions que /sessions (patch)
+
+- Corrige le FAIL ANR1 #10 (gate pagination 2.16.0 / p900 2.5.1) : GET
+  `/sessions` renvoyait 174 sessions, POST `/sessions/filter` 173. Cause :
+  `refresh_session_filter_index` n'indexait que les flows de référence et
+  les datasets du capture manager, pas le LTE evidence store que
+  `sessions()` liste aussi. Les sessions LTE evidence sont maintenant
+  indexées (même source, même borne page 1 / 100 par run).
+- Test `sessions_filter_and_sessions_list_cover_the_same_sessions_including_lte_evidence` :
+  ensembles d'ids identiques (tous les curseurs suivis) ; échoue sans le
+  correctif, passe avec.
+
+
 ## OIRAN API 2.16.0 — 2026-11-15 — Live par IMSI : ordre canonique SSE + corrélation sessions (ANR1 #10 Live-IMSI)
 
 Lot B de la feuille de route « UI tape IMSI → suivre UE en direct ». Déplace les derniers manques backend identifiés par l'audit #10 6895079284 et respecte strictement le hors-périmètre (pas de `/sessions` ni `/callflow`).
