@@ -1,5 +1,19 @@
 # Changelog
 
+## OIRAN API 2.15.6 — 2026-11-15 — Identités robustes à la version de TShark (patch)
+
+- Écart prouvé par CLAUDE DEVMAT (#10 6895890080) : avec TShark 3.6.2, les
+  champs `nas-5gs.mm.suci.*` ajoutés en 2.15.3 sont inconnus ; TShark
+  rejette alors toute la commande → `TSHARK_DISSECTION_FAILED` → HTTP 500 et
+  plus aucune identité (même 4G). La prod (TShark 4.2.2, preuve ANR1) n'est
+  pas touchée, mais une mise à jour/rétrogradation de TShark l'aurait été.
+- `tshark_identities` ne demande plus que les champs connus de la TShark
+  installée (`tshark -G fields`, calculé une fois) et relit les colonnes par
+  nom. Sans NAS 5G dans TShark : identités 4G inchangées, IMSI 5G non
+  observé (pas d'erreur).
+- `cargo test --release --workspace` : 568 OK / 0 FAIL / 10 ignorés.
+
+
 ## OIRAN API 2.15.5 — 2026-11-15 — Index PFCP sans OOM (patch)
 
 - Corrige le FAIL ANR1 #10 6895136076 : OOM (MemoryMax=4G, anon-rss

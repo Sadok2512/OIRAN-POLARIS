@@ -3883,6 +3883,31 @@ const IDENTITY_TSHARK_FIELDS: &[&str] = &[
     "nas-5gs.mm.imeisv",
 ];
 
+/// 2.15.6 — field names known by the installed TShark (`tshark -G fields`),
+/// computed once. Empty set = listing unavailable: every field is requested
+/// as before.
+fn available_identity_fields() -> &'static std::collections::HashSet<String> {
+    static FIELDS: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    FIELDS.get_or_init(|| {
+        let Ok(output) = Command::new("tshark").args(["-G", "fields"]).output() else {
+            return std::collections::HashSet::new();
+        };
+        if !output.status.success() {
+            return std::collections::HashSet::new();
+        }
+        parse_tshark_field_list(&String::from_utf8_lossy(&output.stdout))
+    })
+}
+
+/// `tshark -G fields` lines: `F\t<name>\t<abbrev>\t...` → set of abbrevs.
+fn parse_tshark_field_list(stdout: &str) -> std::collections::HashSet<String> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("F\t"))
+        .filter_map(|line| line.split('\t').nth(2).map(str::to_owned))
+        .collect()
+}
+
 /// 2.15.3 — SUPI (IMSI) from a null-scheme SUCI as dissected by TShark:
 /// only SUPI format 0 (IMSI) with protection scheme 0 (null) is readable;
 /// any other scheme is ciphered (ECIES) and yields None.
@@ -4084,7 +4109,17 @@ fn tshark_identities(
             .args(["-n", "-r"])
             .arg(&source)
             .args(["-Y", &filter, "-T", "fields"]);
-        for field in IDENTITY_TSHARK_FIELDS {
+        // 2.15.6 — only the fields this TShark knows: an unknown `-e` field
+        // makes TShark reject the whole command (TShark 3.6.2 has no
+        // `nas-5gs.mm.suci.*`, CLAUDE DEVMAT #10 6895890080 → 500 and no
+        // identity at all). Columns are mapped back by field name.
+        let available = available_identity_fields();
+        let requested: Vec<&str> = IDENTITY_TSHARK_FIELDS
+            .iter()
+            .copied()
+            .filter(|field| available.is_empty() || available.contains(*field))
+            .collect();
+        for field in &requested {
             command.args(["-e", field]);
         }
         command.args([
@@ -4109,7 +4144,14 @@ fn tshark_identities(
                 continue;
             };
             let role = identity_role(&evidence.message_name);
-            let field = |index: usize| columns.get(index).copied().unwrap_or("");
+            // index into IDENTITY_TSHARK_FIELDS → column of the requested subset
+            let field = |index: usize| {
+                IDENTITY_TSHARK_FIELDS
+                    .get(index)
+                    .and_then(|name| requested.iter().position(|r| r == name))
+                    .and_then(|column| columns.get(column).copied())
+                    .unwrap_or("")
+            };
             let suci_supi = supi_from_null_scheme_suci(field(19), field(20), field(21), field(22), field(23));
             for raw in split_field(field(1))
                 .chain(split_field(field(2)))
@@ -10140,5 +10182,21 @@ mod suci_null_scheme_tests {
         assert_eq!(supi_from_null_scheme_suci("1", "0", "001", "01", "0000000201"), None); // NAI
         assert_eq!(supi_from_null_scheme_suci("", "", "", "", ""), None);
         assert_eq!(supi_from_null_scheme_suci("0", "0", "001", "01", ""), None);
+    }
+}
+
+#[cfg(test)]
+mod tshark_field_list_tests {
+    use super::{parse_tshark_field_list, IDENTITY_TSHARK_FIELDS};
+
+    #[test]
+    fn keeps_only_fields_known_by_this_tshark() {
+        // TShark 3.6.2 shape: no nas-5gs.mm.suci.* (CLAUDE DEVMAT #10 6895890080).
+        let listing = "P\tNAS-5GS\tnas-5gs\nF\tIMSI\te212.imsi\tFT_STRING\te212\nF\tMCC\te212.mcc\tFT_UINT16\te212\nF\tFrame\tframe.number\tFT_UINT32\tframe\n";
+        let known = parse_tshark_field_list(listing);
+        assert!(known.contains("e212.imsi") && known.contains("frame.number"));
+        assert!(!known.contains("nas-5gs.mm.suci.msin"));
+        let requested: Vec<&str> = IDENTITY_TSHARK_FIELDS.iter().copied().filter(|f| known.contains(*f)).collect();
+        assert_eq!(requested, vec!["frame.number", "e212.imsi", "e212.mcc"]);
     }
 }
