@@ -1,5 +1,6 @@
 mod activity;
 mod cpu_safety;
+mod gnb_ngap_check;
 mod lte_grant;
 mod lte_orchestrator;
 mod scenario_definitions;
@@ -4377,6 +4378,122 @@ fn container_status(name: &str) -> Value {
             json!({"process_state":process_state,"health":health,"observed":true})
         }
         None => json!({"process_state":"unknown","health":"unknown","observed":false}),
+    }
+}
+
+/// 0.36.8 (ANR1 #9 — gNB NGAP pre-check + restart ciblé).
+/// Implémentation docker du trait [`gnb_ngap_check::GnbNgapChecker`].
+/// Jamais instancié en test — la garde `state.n2_qos_capture` (déjà
+/// `false` en test) empêche le pré-check de s'exécuter.
+struct DockerGnbNgapChecker;
+
+impl DockerGnbNgapChecker {
+    const GNB_CONTAINER: &'static str = "oiran-lab-ueransim-gnb-1";
+    const AMF_CONTAINER: &'static str = "oiran-lab-amf-1";
+    const AMF_NGAP_PORT: &'static str = "38412";
+
+    fn nr_cli_node() -> Result<String, String> {
+        let output = Command::new("/usr/bin/timeout")
+            .args([
+                "--signal=TERM",
+                "--kill-after=1s",
+                "5s",
+                "/usr/bin/docker",
+                "exec",
+                Self::GNB_CONTAINER,
+                "nr-cli",
+                "--dump",
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err("GNB_CLI_NODE_NOT_OBSERVED".into());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let name = stdout.lines().map(str::trim).find(|line| !line.is_empty());
+        name.map(str::to_owned)
+            .ok_or_else(|| "GNB_CLI_NODE_NOT_OBSERVED".into())
+    }
+}
+
+impl gnb_ngap_check::GnbNgapChecker for DockerGnbNgapChecker {
+    fn nr_cli_status(&self) -> Result<String, String> {
+        let node = Self::nr_cli_node()?;
+        let output = Command::new("/usr/bin/timeout")
+            .args([
+                "--signal=TERM",
+                "--kill-after=1s",
+                "5s",
+                "/usr/bin/docker",
+                "exec",
+                Self::GNB_CONTAINER,
+                "nr-cli",
+                &node,
+                "-e",
+                "status",
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err("GNB_CLI_STATUS_UNAVAILABLE".into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn amf_listening(&self) -> bool {
+        inspect_container_interface_state(
+            Self::AMF_CONTAINER,
+            "sctp",
+            Self::AMF_NGAP_PORT,
+        )
+        .eq_ignore_ascii_case("CONNECTED")
+            || Command::new("/usr/bin/timeout")
+                .args([
+                    "--signal=TERM",
+                    "--kill-after=1s",
+                    "5s",
+                    "/usr/bin/docker",
+                    "exec",
+                    Self::AMF_CONTAINER,
+                    "/bin/sh",
+                    "-c",
+                    &format!("ss -H -n -A sctp state listen | grep -F ':{}'", Self::AMF_NGAP_PORT),
+                ])
+                .output()
+                .map(|out| out.status.success() && !out.stdout.is_empty())
+                .unwrap_or(false)
+    }
+
+    fn restart_gnb(&self) -> Result<(), String> {
+        let out = Command::new("/usr/bin/timeout")
+            .args([
+                "--signal=TERM",
+                "--kill-after=5s",
+                "30s",
+                "/usr/bin/docker",
+                "restart",
+                Self::GNB_CONTAINER,
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err("GNB_CONTAINER_RESTART_FAILED".into())
+        }
+    }
+
+    fn wait_for_ngap_up(&self, timeout_seconds: u64) -> gnb_ngap_check::NgapState {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+        loop {
+            let status = self.nr_cli_status().unwrap_or_default();
+            let state = gnb_ngap_check::parse_nr_cli_status(&status);
+            if state.is_up() || std::time::Instant::now() >= deadline {
+                return state;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
 }
 
@@ -12413,6 +12530,56 @@ fn execute_live_definition_step(
             Ok(json!({"duration_ms":duration_ms}))
         }
         "ue_start" => {
+            // 0.36.8 (ANR1 #9 — gNB NGAP pre-check + restart).
+            // Avant de démarrer un UE 5G, prouver que le gNB
+            // UERANSIM a bien établi NGAP avec l'AMF. Sinon : le
+            // container UE va démarrer mais n'arrivera jamais à
+            // s'enregistrer → le step `pdu_establish` échouera en
+            // `PDU_DNN_NOT_OBSERVED` (lib.rs:2643), cause masquée.
+            //
+            // Garde : on saute le pré-check (a) pour les UE LTE
+            // (srsran, pas UERANSIM) et (b) en mode test
+            // (`n2_qos_capture == false`, cohérent avec la capture
+            // N2 qui ne tourne qu'en prod réelle — ANR2 #10 6884304792).
+            let any_5g_ue = ue_ids
+                .iter()
+                .any(|id| id != srsran_controller::LTE_UE_ID);
+            if any_5g_ue && state.n2_qos_capture {
+                let checker = DockerGnbNgapChecker;
+                match gnb_ngap_check::check_gnb_ngap_up_or_recover(&checker, 30) {
+                    Ok(outcome) => {
+                        if matches!(
+                            outcome,
+                            gnb_ngap_check::GnbNgapOutcome::RestartedAndUp
+                        ) {
+                            for ue_id in ue_ids {
+                                record_activity_event(
+                                    state,
+                                    ue_id,
+                                    "gnb_ngap_recover",
+                                    "OK",
+                                    json!({
+                                        "action": "gNB redémarré : NGAP down",
+                                        "container": DockerGnbNgapChecker::GNB_CONTAINER,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    Err(code) => {
+                        for ue_id in ue_ids {
+                            record_activity_event(
+                                state,
+                                ue_id,
+                                "gnb_ngap_check",
+                                "FAILED",
+                                json!({ "error": code.clone() }),
+                            );
+                        }
+                        return Err(code);
+                    }
+                }
+            }
             for ue_id in ue_ids {
                 if control.cancel.load(Ordering::SeqCst) {
                     return Err("SCENARIO_STOP_REQUESTED".into());

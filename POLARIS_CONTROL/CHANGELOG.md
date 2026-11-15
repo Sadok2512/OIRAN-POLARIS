@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.36.8 — 2026-11-15 — Pré-check gNB NGAP + reprise ciblée (patch)
+
+Corrige le FAIL ANR1 (#9 #10 6898459838) où le gNB UERANSIM tente son SCTP vers l'AMF avant que celui-ci écoute, reçoit `Connection refused`, ne retente **jamais** → cellule barrée → UE jamais enregistré → le run échoue en générique `PDU_DNN_NOT_OBSERVED` (`lib.rs:2643`), cause racine masquée.
+
+### Pré-check avant tout scénario 5G
+
+Nouveau module isolé `apps/api/src/gnb_ngap_check.rs` (fonctions pures, testables sans Docker) :
+
+- `parse_nr_cli_status(output)` : classe la sortie de `nr-cli <gnb-node> -e status` en `NgapState { NgapUp | NgapDown | Unknown }`. Toute sortie non reconnue est traitée comme `NgapDown` **par construction** (jamais présumer `Up` — règle « un écart se déclare OUVERT »).
+- `decide_gnb_recovery(ngap, amf_listening)` : table de transition explicite à 6 cas couvrant `{Up, Down, Unknown} × {amf_up, amf_down}`.
+- `check_gnb_ngap_up_or_recover(checker, timeout)` : flux complet, orchestré via le trait `GnbNgapChecker` pour isoler l'IO en test.
+
+Erreurs explicites publiées au run :
+
+- **`GNB_NGAP_DOWN`** : NGAP ne revient pas up après un restart ciblé.
+- **`GNB_NGAP_DOWN_AMF_UNAVAILABLE`** : NGAP est down ET l'AMF n'écoute pas 38412 SCTP — aucun restart gNB tenté (redémarrer ne servirait à rien tant que l'AMF est absente).
+
+### Reprise ciblée — jamais silencieuse
+
+- `DockerGnbNgapChecker` (prod) : `docker exec oiran-lab-ueransim-gnb-1 nr-cli <node> -e status`, test AMF listening via `inspect_container_interface_state` + `ss -A sctp state listen`, et **restart du SEUL conteneur gNB** (`docker restart oiran-lab-ueransim-gnb-1`). **Aucun conteneur Open5GS** n'est jamais touché.
+- Trace activité : événement `gnb_ngap_recover` avec payload `{action: "gNB redémarré : NGAP down", container: "oiran-lab-ueransim-gnb-1"}` enregistré pour chaque UE du scénario.
+- Erreur : événement `gnb_ngap_check` `FAILED` avec `{error: <code>}` par UE, puis propagation via `Err(code)` qui surface dans le run.
+
+### Garde test (`n2_qos_capture: false`)
+
+Le pré-check s'exécute uniquement quand `state.n2_qos_capture == true` — la même garde runtime que la capture N2 (introduite en 0.36.5). En test, cette valeur est `false` → le pré-check est sauté, les suites ne dépendent ni de `docker` ni du lab réel. En prod, elle est `true` → le pré-check tourne.
+
+Le pré-check est aussi sauté quand le scénario cible **uniquement** l'UE LTE (srsran, pas UERANSIM) — le gNB UERANSIM n'est pas impliqué.
+
+### Tests ajoutés (7 unitaires dans `gnb_ngap_check::tests`)
+
+- `parse_nr_cli_status_classifies_true_false_and_unknown` (cas up/down/inconnu/casse mixte).
+- `decide_gnb_recovery_covers_the_four_transitions` (6 cas exhaustifs).
+- `check_gnb_ready_short_circuits_without_restart`.
+- `check_gnb_down_with_amf_listening_restarts_then_passes`.
+- `check_gnb_down_with_amf_listening_restart_fails_to_recover_returns_gnb_ngap_down`.
+- `check_gnb_down_with_amf_not_listening_fails_without_restart` — **aucun** restart tenté si AMF down.
+- `check_gnb_unknown_status_with_amf_down_also_fails_without_restart`.
+
+### Preuves (runner devmat, 2026-11-15)
+
+```
+$ cargo test --release --offline -p polaris-control-api --lib -- gnb_ngap_check
+running 7 tests
+test gnb_ngap_check::tests::check_gnb_down_with_amf_not_listening_fails_without_restart ... ok
+test gnb_ngap_check::tests::check_gnb_down_with_amf_listening_restart_fails_to_recover_returns_gnb_ngap_down ... ok
+test gnb_ngap_check::tests::check_gnb_down_with_amf_listening_restarts_then_passes ... ok
+test gnb_ngap_check::tests::check_gnb_ready_short_circuits_without_restart ... ok
+test gnb_ngap_check::tests::check_gnb_unknown_status_with_amf_down_also_fails_without_restart ... ok
+test gnb_ngap_check::tests::decide_gnb_recovery_covers_the_four_transitions ... ok
+test gnb_ngap_check::tests::parse_nr_cli_status_classifies_true_false_and_unknown ... ok
+test result: ok. 7 passed; 0 failed; 354 filtered out
+
+$ cargo test --release --offline --workspace --no-fail-fast
+# exit=0 ; 17 suites, 407 passed, 0 failed, 3 ignored
+# +7 vs 400 en 0.36.5
+```
+
+### Hors périmètre respecté
+
+- `POLARIS_CONTROL/apps/api/src` uniquement (élargi pour ce lot).
+- Aucune modif `OIRAN/`, aucune modif UI.
+
+Bump patch : `polaris-control-api 0.36.5 → 0.36.8` (0.36.6/0.36.7 réservés aux lots `simulator-control` déjà déployés en parallèle).
+
 ## 0.36.5 — 2026-11-14 — Tests indépendants de l'hôte (patch)
 
 - Corrige le FAIL ANR2 de 0.36.4 (#10 6885069540) : sur le serveur, le gNB
