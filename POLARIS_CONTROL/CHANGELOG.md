@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.36.9 — 2026-11-15 — Pré-check gNB toujours tracé (patch)
+
+- Retour ANR2 #9 6899036879 (FAIL 0.36.8) : quand NGAP est déjà up, aucune activité n'était émise. Désormais `gnb_ngap_check` / OK `{"ngap":"up","action":"aucune (NGAP déjà up)"}` à chaque lancement 5G ; `gnb_ngap_recover` après redémarrage ; `gnb_ngap_check` / FAILED sur erreur (inchangé).
+- 2 tests (`gnb_ngap_activity_tests`).
+
 ## 0.36.8 — 2026-11-15 — Pré-check gNB NGAP + reprise ciblée (patch)
 
 - Revue : un statut `nr-cli status` illisible (`Unknown`) ne déclenche **jamais** de redémarrage du gNB ; le run échoue en `GNB_NGAP_STATUS_UNREADABLE`, aucune action. Seul un NGAP prouvé down avec AMF en écoute redémarre le gNB.

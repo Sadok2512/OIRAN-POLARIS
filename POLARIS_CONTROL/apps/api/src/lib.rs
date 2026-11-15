@@ -4382,6 +4382,44 @@ fn container_status(name: &str) -> Value {
 }
 
 /// 0.36.8 (ANR1 #9 — gNB NGAP pre-check + restart ciblé).
+/// 0.36.9 — activité publiée pour un pré-check gNB réussi.
+fn gnb_ngap_activity(outcome: &gnb_ngap_check::GnbNgapOutcome) -> (&'static str, Value) {
+    match outcome {
+        gnb_ngap_check::GnbNgapOutcome::RestartedAndUp => (
+            "gnb_ngap_recover",
+            json!({
+                "ngap": "up",
+                "action": "gNB redémarré : NGAP down",
+                "container": DockerGnbNgapChecker::GNB_CONTAINER,
+            }),
+        ),
+        _ => (
+            "gnb_ngap_check",
+            json!({ "ngap": "up", "action": "aucune (NGAP déjà up)" }),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod gnb_ngap_activity_tests {
+    use super::*;
+
+    #[test]
+    fn already_up_is_traced_as_a_check_without_action() {
+        let (kind, detail) = gnb_ngap_activity(&gnb_ngap_check::GnbNgapOutcome::AlreadyUp);
+        assert_eq!(kind, "gnb_ngap_check");
+        assert_eq!(detail["ngap"], "up");
+    }
+
+    #[test]
+    fn restart_is_traced_as_a_recovery() {
+        let (kind, detail) =
+            gnb_ngap_activity(&gnb_ngap_check::GnbNgapOutcome::RestartedAndUp);
+        assert_eq!(kind, "gnb_ngap_recover");
+        assert_eq!(detail["action"], "gNB redémarré : NGAP down");
+    }
+}
+
 /// Implémentation docker du trait [`gnb_ngap_check::GnbNgapChecker`].
 /// Jamais instancié en test — la garde `state.n2_qos_capture` (déjà
 /// `false` en test) empêche le pré-check de s'exécuter.
@@ -12548,22 +12586,12 @@ fn execute_live_definition_step(
                 let checker = DockerGnbNgapChecker;
                 match gnb_ngap_check::check_gnb_ngap_up_or_recover(&checker, 30) {
                     Ok(outcome) => {
-                        if matches!(
-                            outcome,
-                            gnb_ngap_check::GnbNgapOutcome::RestartedAndUp
-                        ) {
-                            for ue_id in ue_ids {
-                                record_activity_event(
-                                    state,
-                                    ue_id,
-                                    "gnb_ngap_recover",
-                                    "OK",
-                                    json!({
-                                        "action": "gNB redémarré : NGAP down",
-                                        "container": DockerGnbNgapChecker::GNB_CONTAINER,
-                                    }),
-                                );
-                            }
+                        // 0.36.9 (ANR2 #9 6899036879) — le pré-check est
+                        // TOUJOURS tracé, y compris quand NGAP est déjà up
+                        // (un garde qui passe en silence ne prouve rien).
+                        let (kind, detail) = gnb_ngap_activity(&outcome);
+                        for ue_id in ue_ids {
+                            record_activity_event(state, ue_id, kind, "OK", detail.clone());
                         }
                     }
                     Err(code) => {
