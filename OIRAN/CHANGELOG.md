@@ -312,9 +312,18 @@ Ce lot 2.22.0 s'arrête ici : validation Sadok requise sur chiffres, schéma et 
 - Preuve réelle (hôte de dev, curl HTTP/2 sur TLS) : `VTAP_FD_TRACEPOINTS_ON pending_records=2`, puis `VTAP_FD_TRACEPOINTS_OFF on_ms=10610` ; 8 records, `unresolved={}` ; `oiran-decode` : `tcp_errors=0 sbi_transactions=2`. Tests : 16 unitaires (+4 `fdlearn`) + 3 d'intégration, `--locked`.
 - OUVERT : vérifier sur le lab que la PSI P1 retombe près de P0 (essai 5).
 
+## OIRAN API 2.21.12 — 2026-11-16 — version du commit 0179d48 (cache catalogue + test /health) (patch)
+
+- Correction de versionnage (revue Sadok #9 6930687937, commit `96ec0ca`) : le commit `0179d48` ajoutait du code (cache du catalogue, test `/health` non bloqué) en gardant la version 2.21.11 déjà attribuée à `55ab6f5`. Deux binaires différents portaient donc le même numéro. Ce contenu devient **2.21.12** ; 2.21.11 désigne uniquement `55ab6f5` (SBI classifier 30 ops).
+- Aucun changement de code : version, lock et CHANGELOG. Côté branche P2 `feat/oiran-2.22.0-userplane`, la version oiran-api reste à 2.22.4 (plus récente).
+- `cargo test --locked -p oiran-api --lib` : 160 passed (+ 2 tests tshark ignorés car outil absent sur l'hôte de relecture) ; vTAP `--locked` : 15 passed.
+- **Règle permanente retenue** : chaque commit qui change du code = nouvelle version SemVer. `git pull --ff-only` avant chaque commit sur branche partagée.
+
 ## OIRAN API 2.21.11 — 2026-11-16 — SBI 30 ops + catalog cache + test /health non-bloqué (spec #9 6930315055)
 
-Lot sur `fix/oiran-2.21.10-analyzer` (mergé dans `feat/oiran-2.22.0-userplane`). Couvre les points 1, 2, 3 de la spec 2.21.11 (#9 6930315055). Point 4 (CPU/mémoire au repos) attend la trace `CONTINUOUS_IDLE_LOOP_TRACE` ANR1 → fix 2.21.12.
+**Note versionnage 2.21.12** (ci-dessus) : la 2.21.11 stricto sensu désigne `55ab6f5` (point 1 — SBI classifier). Les points 2+3 (`0179d48`) ont été renommés **2.21.12** par revue Sadok. Cette entrée documente la spec complète à titre de chapeau ; les deux sous-sections (points 1 et 2+3) sont attribuées respectivement à 2.21.11 et 2.21.12.
+
+Lot sur `fix/oiran-2.21.10-analyzer` (mergé dans `feat/oiran-2.22.0-userplane`). Couvre les points 1, 2, 3 de la spec 2.21.11 (#9 6930315055). Point 4 (CPU/mémoire au repos) attend la trace `CONTINUOUS_IDLE_LOOP_TRACE` ANR1 → fix 2.21.13.
 
 ### Composants et versions
 
