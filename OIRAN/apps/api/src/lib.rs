@@ -4565,13 +4565,13 @@ fn build_protocol_tree(
     run_id: Option<&str>,
 ) -> session_catalog::ProtocolTreeBuilder {
     let mut builder = session_catalog::ProtocolTreeBuilder::new();
-    for flow in state.inner.flows.values() {
+    let feed = |builder: &mut session_catalog::ProtocolTreeBuilder, flow: &CallFlow| {
         if !technologies_scope.is_empty() && !technologies_scope.contains(&flow.technology) {
-            continue;
+            return;
         }
         if let Some(run) = run_id {
             if !flow.capture_references.iter().any(|r| r == run) {
-                continue;
+                return;
             }
         }
         for participant in &flow.participants {
@@ -4594,6 +4594,25 @@ fn build_protocol_tree(
                 }
             }
             builder.observe_event(event);
+        }
+    };
+    // 2.21.10 (défaut 2 #9 6929162657) — en production, `state.inner.flows`
+    // est vide (iso-comportement opérationnel ; les flows live sont lus
+    // via le capture_manager). Résultat : `protocol_tree=0` et
+    // `network_elements=0` sur le dataset réel. Correctif : alimenter
+    // aussi le builder depuis les datasets live.
+    for flow in state.inner.flows.values() {
+        feed(&mut builder, flow);
+    }
+    for dataset in state.inner.capture_manager.datasets() {
+        for session_id in &dataset.session_ids {
+            if let Some(flow) = state
+                .inner
+                .capture_manager
+                .callflow(&dataset.dataset_id, session_id)
+            {
+                feed(&mut builder, &flow);
+            }
         }
     }
     builder
@@ -5853,7 +5872,28 @@ async fn session_identities(
     if let Err(response) = require_operator(&state, &headers) {
         return response;
     }
-    if let Err(error) = hydrate_identities(&state, &id) {
+    // 2.21.10 (défaut 3 #9 6929162657) — `hydrate_identities` lance
+    // tshark et peut prendre plus de 25 s au premier appel « froid ».
+    // Avant 2.21.10 l'appel blocait le runtime async, d'où `/health`
+    // qui timeoutait (5 timeouts × 5 s). Déport dans `spawn_blocking`
+    // libère la thread du runtime et laisse `/health` répondre.
+    let state_for_hydrate = state.clone();
+    let id_for_hydrate = id.clone();
+    let hydrate_result = tokio::task::spawn_blocking(move || {
+        hydrate_identities(&state_for_hydrate, &id_for_hydrate)
+    })
+    .await;
+    let hydrate_result = match hydrate_result {
+        Ok(result) => result,
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "IDENTITY_VAULT_FAILED",
+                &format!("identity hydrate panicked: {error}"),
+            )
+        }
+    };
+    if let Err(error) = hydrate_result {
         return match error.as_str() {
             "SESSION_NOT_FOUND" => api_error(StatusCode::NOT_FOUND, &error, "unknown session id"),
             "TSHARK_UNAVAILABLE" => api_error(
