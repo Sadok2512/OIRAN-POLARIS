@@ -312,9 +312,9 @@ Ce lot 2.22.0 s'arrête ici : validation Sadok requise sur chiffres, schéma et 
 - Preuve réelle (hôte de dev, curl HTTP/2 sur TLS) : `VTAP_FD_TRACEPOINTS_ON pending_records=2`, puis `VTAP_FD_TRACEPOINTS_OFF on_ms=10610` ; 8 records, `unresolved={}` ; `oiran-decode` : `tcp_errors=0 sbi_transactions=2`. Tests : 16 unitaires (+4 `fdlearn`) + 3 d'intégration, `--locked`.
 - OUVERT : vérifier sur le lab que la PSI P1 retombe près de P0 (essai 5).
 
-## OIRAN API 2.21.11 — 2026-11-16 — SBI classifier : 30 opérations ANR1 réelles (clôture défaut 1 2.21.10)
+## OIRAN API 2.21.11 — 2026-11-16 — SBI 30 ops + catalog cache + test /health non-bloqué (spec #9 6930315055)
 
-Lot sur `fix/oiran-2.21.10-analyzer` (mergé dans `feat/oiran-2.22.0-userplane`). Ferme le défaut 1 de 2.21.10 (#9 6929162657) avec la spec #9 6930117150 et le tableau op→n ANR1 (#10 6929768219).
+Lot sur `fix/oiran-2.21.10-analyzer` (mergé dans `feat/oiran-2.22.0-userplane`). Couvre les points 1, 2, 3 de la spec 2.21.11 (#9 6930315055). Point 4 (CPU/mémoire au repos) attend la trace `CONTINUOUS_IDLE_LOOP_TRACE` ANR1 → fix 2.21.12.
 
 ### Composants et versions
 
@@ -323,44 +323,44 @@ Lot sur `fix/oiran-2.21.10-analyzer` (mergé dans `feat/oiran-2.22.0-userplane`)
 | `oiran-api` | 2.21.10 | **2.21.11** (intégré dans 2.22.4 côté branche P2) |
 | `decoder-sbi` | 0.4.6 | **0.4.7** |
 
-### Classifier étendu — 14 nouvelles entrées pour les 30 ops ANR1
+### Point 1 — SBI classifier : 30 opérations ANR1 (défaut 1 2.21.10)
 
-16 ops déjà couvertes par le catalogue 2.21.3/2.21.4 (Nudm_SDM, Nudm_UECM, Nudm_UEAuthentication, Nausf_UEAuthentication, Npcf_AMPolicyControl, Npcf_SMPolicyControl). **14 nouvelles entrées** ajoutées :
+14 nouvelles entrées pour couvrir le tableau ANR1 (#10 6929768219) : Nbsf_Management (pcfBindings), Namf_Communication SMContextStatusNotify (callback), Nudr_DataRepository (12 variantes sur policy-data/ues + subscription-data/{authentication-data,context-data,provisioned-data}).
 
-- **Nbsf_Management** (TS 29.521) : `/nbsf-management/.../pcfBindings` → `Register` / `Deregister` / `Update` / `Discovery`.
-- **Namf_Communication** (TS 29.518) : `/namf-callback/.../sm-context-status/{id}` → `SMContextStatusNotify`.
-- **Nudr_DataRepository** (TS 29.504/29.505) : 12 variantes (policy-data/ues, subscription-data/{authentication-data/context-data/provisioned-data}).
+Test paramétrique `classifies_all_30_anr1_sbi_operations_as_non_unsupported` : 1 assert par ligne du tableau. Run initial 2.21.10 : 14 échecs. Après 2.21.11 : **0 échec**.
 
-### Test paramétrique — un assert par ligne du tableau (30 lignes)
+### Point 2 — Catalog cache `(commit_seq, dataset_ids, scope_hash)` (défaut 2 bis)
 
-`decoder-sbi::tests::classifies_all_30_anr1_sbi_operations_as_non_unsupported` vérifie que `classify()` retourne `(Some(expected_service), Some(expected_operation))` pour chaque ligne. **Run initial 2.21.10** : 14 échecs. **Après 2.21.11** : 0 échec.
+Reconstruction du call flow de chaque session de chaque dataset à chaque requête `/sessions/catalog` (217 sessions sur le lab) → 45 s observés. Correctif :
 
-### Critère d'acceptation lab
+- Nouveau `AppState.inner.sessions_catalog_cache: Mutex<SessionsCatalogCache>` avec entrée `{ dataset_signatures, scope_hash, protocol_tree, network_elements }`.
+- `dataset_signatures = [(dataset_id, commit_seq), ...]` → un commit_seq qui bouge invalide l'entrée.
+- `scope_hash` = hash de `(interfaces, technologies, from_ns, to_ns, run_id)` → portées distinctes = entrées distinctes.
+- Test `sessions_catalog_cache_hits_on_second_call_without_rebuild` : (a) 1er appel renseigne le cache, (b) 2e appel renvoie **strictement** les mêmes JSON sans reconstruction.
 
-**`UnsupportedSbiOperation = 0` sur `5g-session-0bfac1e7ae159a77` après redécodage** :
+### Point 3 — Test `/health` non-bloqué pendant `/identities` froid (test manquant de 2.21.10)
 
-```bash
-jq -r 'select(.protocol=="SBI-HTTP2" and (.message_name|startswith("UnsupportedSbiOperation"))) | .sbi.request_uri' \
-  /chemin/oiran_events.jsonl | wc -l
-```
+Test `spawn_blocking_does_not_starve_async_runtime_for_health_during_slow_identities` : modélise une tâche `spawn_blocking` 500 ms (hydrate_identities lent) + timer async concurrent (`/health`). Vérifie que le timer se résout en < 100 ms. Prouve l'architecture ciblée en 2.21.10 (déport dans `tokio::task::spawn_blocking`).
 
-Attendu **0**. Si > 0 : répartition résiduelle en 2.21.12.
+### Point 4 — CPU/mémoire au repos : attente trace ANR1
+
+Instrumentation `CONTINUOUS_IDLE_LOOP_TRACE` depuis 2.21.10. Fix 2.21.12 sur base du retour ANR1 (sleep_ms médian, seen_checksums croissance, `perf top` / `smem` pour discriminer reclaim mémoire sous plafond vs. vrai busy loop).
 
 ### Note — `decoded_ie_tree` vs `information_elements` (constat ANR1 #9 6930117150)
 
-Voulu : `CallFlowEvent` stocke un arbre aplati `decoded_ie_tree` qui mélange `information_elements` + `session_identifiers` (`callflow-schema/src/lib.rs:53`). Consommateurs internes lisent déjà `decoded_ie_tree` (ProtocolTreeBuilder l. 537, hydrate_identities l. 5679/5775, filtre l. 4286). Route packets réalias en `information_elements` pour UI historique. Doc API 2.21.12.
-
-### Note — défaut 4 CPU 65 % (hypothèse Sadok)
-
-`MemoryMax = MemoryPeak = 4 GiB` : Analyzer collé au plafond. Le 65 % CPU au repos peut venir du **reclaim mémoire** sous plafond. À confirmer par `perf top` / `smem` lab avant tout fix. Instrumentation `CONTINUOUS_IDLE_LOOP_TRACE` toujours en place.
+Voulu : `CallFlowEvent` (crate `callflow-schema` l. 53) stocke un arbre aplati `decoded_ie_tree` qui mélange `information_elements` + `session_identifiers`. Consommateurs internes OK (ProtocolTreeBuilder l. 537, hydrate_identities l. 5679/5775, filtre l. 4286). Route packets (l. 6316) réalias en `information_elements` pour UI historique. Doc README API 2.21.12.
 
 ### Tests
 
 ```bash
-cargo test -p decoder-sbi --lib --locked        # 38 passed (était 37 → +1 paramétrique)
-cargo test -p oiran-api   --lib --locked        # 160 passed, 3 ignored
+cargo test -p decoder-sbi --lib --locked    # 38 passed (+1 paramétrique)
+cargo test -p oiran-api   --lib --locked    # 162 passed, 3 ignored (+2 : cache + spawn_blocking)
 cd OIRAN/vtap && cargo update -w && cargo test --locked   # 12 unit + 3 integration passed
 ```
+
+### Critère d'acceptation lab
+
+PASS = (a) `UnsupportedSbiOperation = 0` sur `5g-session-0bfac1e7ae159a77` + (b) 2e `/sessions/catalog` < 100 ms + (c) `/health` répond pendant `/identities` froid. À confirmer par ANR1.
 
 ## OIRAN API 2.21.10 — 2026-11-16 — 4 défauts Analyzer prod (patch, PRIORITÉ #9 6929162657 + #9 6929676898)
 
