@@ -1,14 +1,16 @@
 # Changelog
 
-## OIRAN API 2.21.3 — 2026-11-16 — Catalogue SBI élargi (clôture 416/552 UE-201) + commit_seq dans ListRowCache (patch)
+## OIRAN API 2.21.4 — 2026-11-16 — Catalogue SBI élargi (clôture 416/552 UE-201) + commit_seq dans ListRowCache (patch)
 
 Lot C.4/B.2 — clôture écart ANR2 #10 6921238261 + avancée Phase 1 contenue.
+
+**Collision de numérotation** : 2.21.3 a été prise en parallèle par ANR2 pour le patch `polaris-vtap` tracefs (cf. entrée ci-dessous). Pas de force-push, pas de ré-écriture : ce lot avance en **2.21.4**.
 
 ### Composants et versions (incrément de chaque crate touché)
 
 | Composant | Avant | Après | Type |
 |---|---|---|---|
-| `oiran-api` | 2.21.2 | **2.21.3** | patch |
+| `oiran-api` | 2.21.3 | **2.21.4** | patch |
 | `decoder-sbi` | 0.4.4 | **0.4.5** | patch |
 | `live-probe` | 0.6.1 | — | inchangé |
 | `event-schema` | 1.8.0 | — | inchangé |
@@ -93,6 +95,10 @@ PINNED_INDEXMAP indexmap-2.13.1
 ### Lock vTAP
 
 Après hausse `decoder-sbi 0.4.4 → 0.4.5` : `cd OIRAN/vtap && cargo update -w && cargo test --locked` exécuté — chiffres reportés dans le rapport #10.
+
+## polaris-vtap 2.21.3 — 2026-11-16 — état tracefs toujours journalisé (patch)
+
+- Rapport ANR2 #10 6922471096 : `VTAP_TRACEFS_MOUNTED` était absent parce que tracefs était déjà monté, et cette branche ne journalisait rien. L'agent émet désormais `VTAP_TRACEFS_PRESENT` (avec le chemin) ou `VTAP_TRACEFS_MOUNTED` : jamais de silence. Écart fermé.
 
 ## polaris-vtap 2.21.2 — 2026-11-16 — lock vTAP resynchronisé après decoder-sbi 0.4.4 / live-probe 0.6.1 (patch)
 

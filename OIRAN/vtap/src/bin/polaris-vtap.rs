@@ -354,8 +354,11 @@ fn run() -> Result<(), String> {
 /// l'agent le monte lui-même et le journalise ; échec → VTAP_FATAL explicite.
 fn ensure_tracefs() -> Result<(), String> {
     let present = |p: &str| std::path::Path::new(p).join("events").is_dir();
-    if present("/sys/kernel/tracing") || present("/sys/kernel/debug/tracing") {
-        return Ok(());
+    for path in ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"] {
+        if present(path) {
+            log(json!({"event":"VTAP_TRACEFS_PRESENT","path":path}));
+            return Ok(());
+        }
     }
     let rc = unsafe {
         libc::mount(

@@ -1,4 +1,4 @@
-# POLARIS vTAP 2.21.1 (P1b) — SBI TLS visible sans clé
+# POLARIS vTAP 2.21.3 (P1b) — SBI TLS visible sans clé
 
 Agent eBPF `polaris-vtap` : uprobes sur `SSL_write`/`SSL_read` (+ `_ex`, `SSL_set_fd`) de la libssl des
 conteneurs Open5GS. Le HTTP/2 en clair est rejoué en pcap TCP normal (handshake synthétique, seq/ack
@@ -18,7 +18,7 @@ nice -n 19 ionice -c3 cargo build --release --locked -j 2 --features ebpf
 ## Lancement (root : CAP_BPF + CAP_PERFMON + accès /proc/<pid>/fd)
 
 ```bash
-# tracefs absent → l'agent le monte lui-même (log VTAP_TRACEFS_MOUNTED).
+# tracefs : log VTAP_TRACEFS_PRESENT (déjà monté) ou VTAP_TRACEFS_MOUNTED (monté par l'agent).
 sudo ./target/release/polaris-vtap --out-dir /var/lib/oiran/vtap --probe-id lab-vtap --rotate-seconds 300
 ```
 
