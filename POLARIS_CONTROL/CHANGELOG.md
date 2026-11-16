@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.36.11 — 2026-11-16 — Pré-check gNB : NGAP up exige un AMF connu (patch)
+
+- Cause prouvée par ANR2 (#10 6915042783, UE-201 bloqué MM-DEREGISTERED/ATTEMPTING-REGISTRATION) : après le redémarrage de l'AMF, UERANSIM garde `is-ngap-up: true` mais sa liste d'AMF est vide (« Could not find a suitable AMF ») ; Control publiait `gnb_ngap_check OK` et ne redémarrait pas le gNB.
+- `effective_ngap_state` : NGAP up seulement si `nr-cli <gnb> -e amf-list` liste au moins un AMF ; liste vide → down (→ redémarrage du seul gNB si l'AMF écoute) ; liste illisible → `GNB_NGAP_STATUS_UNREADABLE`, aucune action. Même règle dans l'attente post-redémarrage.
+- Tests `ngap_up_with_an_empty_amf_list_is_down`, `empty_amf_list_with_amf_listening_triggers_a_gnb_restart`.
+
 ## 0.36.10 — 2026-11-15 — 409 SCENARIO_CONFLICT explicite (patch)
 
 - Le lab n'exécute qu'un scénario à la fois (`definition_jobs`). Le 409 `SCENARIO_CONFLICT` renvoie désormais `active_job_id`, `active_scenario_id`, `active_ue_ids` et un message en français, pour que l'UI dise quel scénario bloque (constat Sadok : « Données UL/DL ne lance pas » après un appel voix).

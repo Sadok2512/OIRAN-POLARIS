@@ -67,6 +67,33 @@ pub fn parse_nr_cli_status(output: &str) -> NgapState {
     NgapState::Unknown
 }
 
+/// 0.36.11 (ANR2 #10 6915042783) — `is-ngap-up: true` ne suffit PAS :
+/// après un redémarrage de l'AMF, UERANSIM garde `is-ngap-up: true`
+/// alors que sa liste d'AMF est VIDE (« Could not find a suitable AMF »,
+/// aucun Initial NAS ne part). NGAP n'est déclaré up que si la liste
+/// `nr-cli <gnb> -e amf-list` contient au moins un AMF. Liste illisible
+/// (commande en échec) → `Unknown` (jamais d'up présumé).
+pub fn effective_ngap_state(status_output: &str, amf_list: Result<&str, &str>) -> NgapState {
+    match parse_nr_cli_status(status_output) {
+        NgapState::NgapUp => match amf_list {
+            Ok(list) if amf_count(list) > 0 => NgapState::NgapUp,
+            Ok(_) => NgapState::NgapDown,
+            Err(_) => NgapState::Unknown,
+        },
+        other => other,
+    }
+}
+
+/// Nombre d'AMF listés par `nr-cli <gnb> -e amf-list` (sortie YAML :
+/// une entrée `- id: N` par AMF ; liste vide = sortie vide ou `[]`).
+pub fn amf_count(output: &str) -> usize {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("- ") || line.starts_with("id:"))
+        .count()
+}
+
 /// 0.36.8 — Décision de reprise. Un `NgapState` observé + un
 /// booléen d'écoute AMF donne 4 transitions :
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +147,8 @@ pub trait GnbNgapChecker {
     /// et retourne la sortie brute. `Err` si docker/nr-cli ont échoué
     /// (le caller traite ça comme `Unknown`).
     fn nr_cli_status(&self) -> Result<String, String>;
+    /// 0.36.11 — `docker exec <gnb-container> nr-cli <node> -e amf-list`.
+    fn nr_cli_amf_list(&self) -> Result<String, String>;
     /// Teste si l'AMF écoute sur son endpoint NGAP SCTP. `true` =
     /// socket listening observée, `false` sinon.
     fn amf_listening(&self) -> bool;
@@ -143,7 +172,11 @@ pub fn check_gnb_ngap_up_or_recover<C: GnbNgapChecker>(
     restart_timeout_seconds: u64,
 ) -> Result<GnbNgapOutcome, String> {
     let initial_output = checker.nr_cli_status().unwrap_or_default();
-    let initial_state = parse_nr_cli_status(&initial_output);
+    let amf_list = checker.nr_cli_amf_list();
+    let initial_state = effective_ngap_state(
+        &initial_output,
+        amf_list.as_deref().map_err(String::as_str),
+    );
     match decide_gnb_recovery(initial_state, checker.amf_listening()) {
         GnbRecoveryDecision::Ready => Ok(GnbNgapOutcome::AlreadyUp),
         GnbRecoveryDecision::Fail(code) => Err(code.to_string()),
@@ -233,6 +266,9 @@ mod tests {
         restart_calls: Cell<u32>,
     }
 
+    /// Liste d'AMF du double : non vide par défaut (cas nominal).
+    const ONE_AMF: &str = "- id: 2";
+
     impl GnbNgapChecker for ScriptedChecker {
         fn nr_cli_status(&self) -> Result<String, String> {
             if self.restart_calls.get() == 0 {
@@ -240,6 +276,9 @@ mod tests {
             } else {
                 Ok(self.after_restart_status.clone())
             }
+        }
+        fn nr_cli_amf_list(&self) -> Result<String, String> {
+            Ok(ONE_AMF.into())
         }
         fn amf_listening(&self) -> bool {
             self.amf_listening
@@ -340,5 +379,45 @@ mod tests {
         let err = check_gnb_ngap_up_or_recover(&checker, 10).unwrap_err();
         assert_eq!(err, GNB_NGAP_STATUS_UNREADABLE);
         assert_eq!(checker.restart_calls.get(), 0);
+    }
+
+    /// 0.36.11 — cas prouvé par ANR2 : is-ngap-up true + amf-list vide.
+    #[test]
+    fn ngap_up_with_an_empty_amf_list_is_down() {
+        assert_eq!(effective_ngap_state("is-ngap-up: true", Ok("")), NgapState::NgapDown);
+        assert_eq!(effective_ngap_state("is-ngap-up: true", Ok("[]")), NgapState::NgapDown);
+        assert_eq!(effective_ngap_state("is-ngap-up: true", Ok("- id: 2")), NgapState::NgapUp);
+        assert_eq!(effective_ngap_state("is-ngap-up: true", Err("x")), NgapState::Unknown);
+        assert_eq!(effective_ngap_state("is-ngap-up: false", Ok("- id: 2")), NgapState::NgapDown);
+    }
+
+    struct EmptyAmfListChecker {
+        restart_calls: Cell<u32>,
+    }
+    impl GnbNgapChecker for EmptyAmfListChecker {
+        fn nr_cli_status(&self) -> Result<String, String> {
+            Ok("is-ngap-up: true".into())
+        }
+        fn nr_cli_amf_list(&self) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn amf_listening(&self) -> bool {
+            true
+        }
+        fn restart_gnb(&self) -> Result<(), String> {
+            self.restart_calls.set(self.restart_calls.get() + 1);
+            Ok(())
+        }
+        fn wait_for_ngap_up(&self, _timeout_seconds: u64) -> NgapState {
+            NgapState::NgapUp
+        }
+    }
+
+    #[test]
+    fn empty_amf_list_with_amf_listening_triggers_a_gnb_restart() {
+        let checker = EmptyAmfListChecker { restart_calls: Cell::new(0) };
+        let outcome = check_gnb_ngap_up_or_recover(&checker, 10).unwrap();
+        assert_eq!(outcome, GnbNgapOutcome::RestartedAndUp);
+        assert_eq!(checker.restart_calls.get(), 1);
     }
 }

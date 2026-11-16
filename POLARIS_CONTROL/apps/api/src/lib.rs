@@ -4478,6 +4478,29 @@ impl gnb_ngap_check::GnbNgapChecker for DockerGnbNgapChecker {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    fn nr_cli_amf_list(&self) -> Result<String, String> {
+        let node = Self::nr_cli_node()?;
+        let output = Command::new("/usr/bin/timeout")
+            .args([
+                "--signal=TERM",
+                "--kill-after=1s",
+                "5s",
+                "/usr/bin/docker",
+                "exec",
+                Self::GNB_CONTAINER,
+                "nr-cli",
+                &node,
+                "-e",
+                "amf-list",
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err("GNB_CLI_AMF_LIST_UNAVAILABLE".into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     fn amf_listening(&self) -> bool {
         inspect_container_interface_state(
             Self::AMF_CONTAINER,
@@ -4526,7 +4549,11 @@ impl gnb_ngap_check::GnbNgapChecker for DockerGnbNgapChecker {
             std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
         loop {
             let status = self.nr_cli_status().unwrap_or_default();
-            let state = gnb_ngap_check::parse_nr_cli_status(&status);
+            let amf_list = self.nr_cli_amf_list();
+            let state = gnb_ngap_check::effective_ngap_state(
+                &status,
+                amf_list.as_deref().map_err(String::as_str),
+            );
             if state.is_up() || std::time::Instant::now() >= deadline {
                 return state;
             }
