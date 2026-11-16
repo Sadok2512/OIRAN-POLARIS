@@ -11,6 +11,7 @@ mod identity_vault;
 mod live_trace;
 mod probe_registry;
 mod read_time_patch;
+mod session_catalog;
 mod session_filters;
 mod subscriber_journey;
 
@@ -960,6 +961,9 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/sessions", get(sessions))
         .route("/sessions/filter", post(sessions_filter))
         .route("/sessions/available_causes", get(sessions_available_causes))
+        // 2.19.0 — catalog + columns (ANR1 p900 2.7.0 en dépend).
+        .route("/sessions/catalog", get(sessions_catalog))
+        .route("/sessions/columns", post(sessions_columns))
         .route("/sessions/:id", get(session))
         .route("/sessions/:id/procedures", get(session_procedures))
         .route("/sessions/:id/events", get(session_events))
@@ -3773,6 +3777,24 @@ struct SessionsFilterRequest {
     cursor: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    /// 2.19.0 — restreint la projection serveur aux colonnes
+    /// demandées. Les colonnes `ALWAYS_PRESENT_COLUMNS` sont
+    /// toujours préservées. Un nom hors catalog renvoie 400
+    /// `UNKNOWN_COLUMN`. Absent → aucun filtre (comportement
+    /// 2.18.x inchangé).
+    #[serde(default)]
+    columns: Option<Vec<String>>,
+    /// 2.19.0 — filtres étendus. Chacun est en OR interne, les
+    /// familles sont combinées en AND avec les prédicats 2.10.0
+    /// (messages/causes/identity/failures_only).
+    #[serde(default)]
+    technologies: Vec<String>,
+    #[serde(default)]
+    dataset_kinds: Vec<String>,
+    #[serde(default)]
+    states: Vec<String>,
+    #[serde(default)]
+    correlation_statuses: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -3951,10 +3973,127 @@ async fn sessions_filter(
     // on cherche le session_id post-curseur strict (clé
     // canonique strictement supérieure).
     let limit = request.limit.unwrap_or(25).clamp(1, 100);
+
+    // 2.19.0 — valide `columns` tôt (avant tout calcul coûteux) :
+    // un nom hors catalog devient 400 UNKNOWN_COLUMN, aucune ligne
+    // partielle n'est servie.
+    let projected_columns = match request.columns.as_deref() {
+        Some(names) => match session_catalog::validate_columns(names) {
+            Ok(set) => Some(set),
+            Err(unknown) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "UNKNOWN_COLUMN",
+                    &format!("unknown column name: {unknown}"),
+                );
+            }
+        },
+        None => None,
+    };
+
+    // 2.19.0 — extended filters normalisés en sets (OR interne,
+    // AND entre familles).
+    let technologies: std::collections::BTreeSet<String> =
+        request.technologies.into_iter().collect();
+    let dataset_kinds: std::collections::BTreeSet<String> =
+        request.dataset_kinds.into_iter().collect();
+    let states: std::collections::BTreeSet<String> = request.states.into_iter().collect();
+    let correlation_statuses: std::collections::BTreeSet<String> =
+        request.correlation_statuses.into_iter().collect();
+    let has_extended_filter = !technologies.is_empty()
+        || !dataset_kinds.is_empty()
+        || !states.is_empty()
+        || !correlation_statuses.is_empty();
+
+    // Helper local : récupère/construit le summary complet d'une
+    // session par id. Jamais d'ajout de clé — retourne None si
+    // aucune source ne connaît l'id (session supprimée entre
+    // l'index et la résolution).
+    let resolve_summary = |session_id: &str| -> Option<Value> {
+        if let Some(flow) = state.inner.flows.get(session_id) {
+            let mut summary = session_summary(&state, flow);
+            decorate_subscriber_summary(&mut summary, flow, &journey_index);
+            insert_list_identities(&state, &mut summary, &flow.session_id, Some(&flow.events));
+            return Some(summary);
+        }
+        for dataset in state.inner.capture_manager.datasets() {
+            let matching_id = dataset
+                .session_ids
+                .iter()
+                .find(|id| id.as_str() == session_id);
+            if let Some(owned_id) = matching_id {
+                if let Some(summary) =
+                    cached_live_list_row(&state, &dataset, owned_id, &journey_index)
+                {
+                    return Some(summary);
+                }
+            }
+        }
+        if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
+            for manifest in catalog {
+                if let Ok(page) = state
+                    .inner
+                    .lte_evidence_store
+                    .session_page(&manifest.run_id, 1, 100)
+                {
+                    if let Some(records) = page["data"].as_array() {
+                        for record in records {
+                            if let Ok(session) = serde_json::from_value::<LteSession>(record.clone())
+                            {
+                                if session.session_id == session_id {
+                                    let mut summary = lte_session_summary(&manifest, &session);
+                                    insert_list_identities(
+                                        &state,
+                                        &mut summary,
+                                        &session.session_id,
+                                        None,
+                                    );
+                                    return Some(summary);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    // 2.19.0 — si extended filters présents, on construit TOUS les
+    // summaries des sorted_ids, on filtre, puis on re-tri par clé
+    // canonique conservée dans matching_keys (jamais par ts). Le
+    // fast path 2.18 (aucun extended filter) garde la construction
+    // paresseuse par page.
+    let (effective_sorted_ids, prebuilt_items): (Vec<String>, Option<BTreeMap<String, Value>>) =
+        if has_extended_filter {
+            let mut built: BTreeMap<String, Value> = BTreeMap::new();
+            for session_id in &sorted_ids {
+                if let Some(summary) = resolve_summary(session_id) {
+                    if passes_extended_filter(
+                        &summary,
+                        &technologies,
+                        &dataset_kinds,
+                        &states,
+                        &correlation_statuses,
+                    ) {
+                        built.insert(session_id.clone(), summary);
+                    }
+                }
+            }
+            let mut rows: Vec<(String, (String, u64, String))> = built
+                .keys()
+                .filter_map(|id| matching_keys.get(id).map(|k| (id.clone(), k.clone())))
+                .collect();
+            rows.sort_by(|a, b| a.1.cmp(&b.1));
+            (rows.into_iter().map(|(id, _)| id).collect(), Some(built))
+        } else {
+            (sorted_ids.clone(), None)
+        };
+
     let start_index = match request.cursor.as_deref() {
         None => 0,
         Some(cursor_sid) => match matching_keys.get(cursor_sid) {
-            Some(cursor_key) => sorted_ids
+            Some(cursor_key) => effective_sorted_ids
                 .iter()
                 .position(|id| {
                     matching_keys
@@ -3962,72 +4101,89 @@ async fn sessions_filter(
                         .map(|k| k > cursor_key)
                         .unwrap_or(false)
                 })
-                .unwrap_or(sorted_ids.len()),
+                .unwrap_or(effective_sorted_ids.len()),
             None => {
                 // Curseur pointant vers une session qui n'est
                 // plus dans le set filtré : traité comme
                 // fin-de-flux.
-                sorted_ids.len()
+                effective_sorted_ids.len()
             }
         },
     };
-    let page_ids: Vec<&str> = sorted_ids
+    let page_ids: Vec<&str> = effective_sorted_ids
         .iter()
         .skip(start_index)
         .take(limit)
         .map(String::as_str)
         .collect();
-    let next_cursor: Option<&str> = if start_index + page_ids.len() < sorted_ids.len() {
-        page_ids.last().copied()
-    } else {
-        None
-    };
+    let next_cursor: Option<&str> =
+        if start_index + page_ids.len() < effective_sorted_ids.len() {
+            page_ids.last().copied()
+        } else {
+            None
+        };
 
     // Reconstitue les summaries sessions pour les ids de la
     // page. Même ordre canonique qu'au tri (pas de re-sort par
-    // `ts` dans cette étape).
+    // `ts` dans cette étape). Fast path : build paresseux par
+    // page. Extended filter : on réutilise `prebuilt_items`.
     let page_set: std::collections::BTreeSet<&str> = page_ids.iter().copied().collect();
     let mut items_by_id: std::collections::BTreeMap<String, Value> =
         std::collections::BTreeMap::new();
-    for flow in state.inner.flows.values() {
-        if page_set.contains(flow.session_id.as_str()) {
-            let mut summary = session_summary(&state, flow);
-            decorate_subscriber_summary(&mut summary, flow, &journey_index);
-            insert_list_identities(&state, &mut summary, &flow.session_id, Some(&flow.events));
-            items_by_id.insert(flow.session_id.clone(), summary);
-        }
-    }
-    for dataset in state.inner.capture_manager.datasets() {
-        for session_id in &dataset.session_ids {
-            if !page_set.contains(session_id.as_str()) {
-                continue;
-            }
-            if let Some(summary) =
-                cached_live_list_row(&state, &dataset, session_id, &journey_index)
-            {
-                items_by_id.insert(session_id.clone(), summary);
+    if let Some(mut prebuilt) = prebuilt_items {
+        for session_id in page_ids.iter() {
+            if let Some(summary) = prebuilt.remove(*session_id) {
+                items_by_id.insert((*session_id).to_owned(), summary);
             }
         }
-    }
-    if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
-        for manifest in catalog {
-            if let Ok(page) = state
-                .inner
-                .lte_evidence_store
-                .session_page(&manifest.run_id, 1, 100)
-            {
-                if let Some(records) = page["data"].as_array() {
-                    for record in records {
-                        if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
-                            if page_set.contains(session.session_id.as_str()) {
-                                let mut summary = lte_session_summary(&manifest, &session);
-                                insert_list_identities(
-                                    &state,
-                                    &mut summary,
-                                    &session.session_id,
-                                    None,
-                                );
-                                items_by_id.insert(session.session_id.clone(), summary);
+    } else {
+        for flow in state.inner.flows.values() {
+            if page_set.contains(flow.session_id.as_str()) {
+                let mut summary = session_summary(&state, flow);
+                decorate_subscriber_summary(&mut summary, flow, &journey_index);
+                insert_list_identities(
+                    &state,
+                    &mut summary,
+                    &flow.session_id,
+                    Some(&flow.events),
+                );
+                items_by_id.insert(flow.session_id.clone(), summary);
+            }
+        }
+        for dataset in state.inner.capture_manager.datasets() {
+            for session_id in &dataset.session_ids {
+                if !page_set.contains(session_id.as_str()) {
+                    continue;
+                }
+                if let Some(summary) =
+                    cached_live_list_row(&state, &dataset, session_id, &journey_index)
+                {
+                    items_by_id.insert(session_id.clone(), summary);
+                }
+            }
+        }
+        if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
+            for manifest in catalog {
+                if let Ok(page) = state
+                    .inner
+                    .lte_evidence_store
+                    .session_page(&manifest.run_id, 1, 100)
+                {
+                    if let Some(records) = page["data"].as_array() {
+                        for record in records {
+                            if let Ok(session) =
+                                serde_json::from_value::<LteSession>(record.clone())
+                            {
+                                if page_set.contains(session.session_id.as_str()) {
+                                    let mut summary = lte_session_summary(&manifest, &session);
+                                    insert_list_identities(
+                                        &state,
+                                        &mut summary,
+                                        &session.session_id,
+                                        None,
+                                    );
+                                    items_by_id.insert(session.session_id.clone(), summary);
+                                }
                             }
                         }
                     }
@@ -4041,9 +4197,15 @@ async fn sessions_filter(
         .iter()
         .filter_map(|id| items_by_id.remove(*id))
         .collect();
+    // 2.19.0 — projection colonnes (serveur) avant sanitize.
+    if let Some(ref requested) = projected_columns {
+        for item in data.iter_mut() {
+            session_catalog::project_columns(item, requested);
+        }
+    }
     sanitize_all(&mut data);
 
-    let total = sorted_ids.len();
+    let total = effective_sorted_ids.len();
     let mut response = serde_json::json!({
         "data": data,
         "meta": {
@@ -4061,7 +4223,201 @@ async fn sessions_filter(
         response["meta"]["identity_matched_pseudonym"] =
             serde_json::Value::String(pseudo.to_owned());
     }
+    if let Some(ref requested) = projected_columns {
+        response["meta"]["projected_columns"] = serde_json::to_value(
+            requested
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or(Value::Null);
+    }
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// 2.19.0 — AND entre familles (OR interne à chaque famille). Un
+/// summary passe le filtre ssi, pour chaque famille non vide, il
+/// matche au moins une valeur. Lecture uniquement : aucune
+/// mutation du summary.
+fn passes_extended_filter(
+    summary: &Value,
+    technologies: &std::collections::BTreeSet<String>,
+    dataset_kinds: &std::collections::BTreeSet<String>,
+    states: &std::collections::BTreeSet<String>,
+    correlation_statuses: &std::collections::BTreeSet<String>,
+) -> bool {
+    fn matches_any(set: &std::collections::BTreeSet<String>, value: Option<&str>) -> bool {
+        if set.is_empty() {
+            return true;
+        }
+        match value {
+            Some(v) => set.contains(v),
+            None => false,
+        }
+    }
+    matches_any(technologies, summary["technology"].as_str())
+        && matches_any(dataset_kinds, summary["dataset_kind"].as_str())
+        && matches_any(states, summary["state"].as_str())
+        && matches_any(correlation_statuses, summary["correlation_status"].as_str())
+}
+
+/// 2.19.0 — catalogue des filtres & colonnes pour p900 2.7.0
+/// (ANR1). Lecture seule, pas d'identité en clair. Reflète l'état
+/// courant de `SessionFilterIndex` pour messages/causes/interfaces,
+/// et la liste statique des colonnes publiables.
+async fn sessions_catalog(State(state): State<AppState>) -> Response {
+    state.refresh_session_filter_index();
+    let guard = state
+        .inner
+        .session_filter_index
+        .read()
+        .expect("session_filter_index poisoned");
+    let interfaces = session_catalog::distinct_interfaces(&guard);
+    let messages = session_catalog::distinct_messages(&guard);
+    let causes = guard.available_causes();
+    let session_count = guard.session_count();
+    drop(guard);
+    let body = json!({
+        "columns": session_catalog::columns_catalog(),
+        "filters": {
+            "interfaces": interfaces,
+            "messages": messages,
+            "causes": causes,
+            "technologies": ["5G SA", "LTE"],
+            "dataset_kinds": [
+                "HISTORICAL",
+                "CAPTURED_LIVE",
+                "EVIDENCE",
+                "DERIVED",
+                "RECOVERED",
+            ],
+            "states": [
+                "ACTIVE_WITH_USER_PLANE",
+                "RELEASED",
+                "INCOMPLETE",
+                "HISTORICAL_CONTEXT",
+                "UNKNOWN",
+            ],
+            "correlation_statuses": [
+                "EXACT",
+                "PARTIAL",
+                "UNKNOWN",
+            ],
+            "pseudonym_match": "exact string from decoded IE",
+        },
+        "always_present_columns": session_catalog::ALWAYS_PRESENT_COLUMNS,
+        "session_count": session_count,
+    });
+    ok(body).into_response()
+}
+
+/// 2.19.0 — projection sur une liste d'ids : `{session_ids,
+/// columns}`. Les colonnes `ALWAYS_PRESENT_COLUMNS` sont toujours
+/// présentes. Les ids inconnus apparaissent dans
+/// `meta.missing_session_ids`. Un nom de colonne inconnu → 400
+/// `UNKNOWN_COLUMN`.
+async fn sessions_columns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<session_catalog::SessionsColumnsRequest>,
+) -> Response {
+    let role = role_from_headers(&state, &headers);
+    let requested_columns = match session_catalog::validate_columns(&request.columns) {
+        Ok(set) => set,
+        Err(unknown) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "UNKNOWN_COLUMN",
+                &format!("unknown column name: {unknown}"),
+            );
+        }
+    };
+    if request.session_ids.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "SESSION_IDS_REQUIRED",
+            "session_ids must be a non-empty array",
+        );
+    }
+    let journey_index = cached_journey_index(&state);
+    let mut data: Vec<Value> = Vec::with_capacity(request.session_ids.len());
+    let mut missing: Vec<String> = Vec::new();
+    for session_id in &request.session_ids {
+        let summary_opt = resolve_summary_for_columns(&state, session_id, &journey_index);
+        match summary_opt {
+            Some(mut summary) => {
+                session_catalog::project_columns(&mut summary, &requested_columns);
+                data.push(summary);
+            }
+            None => missing.push(session_id.clone()),
+        }
+    }
+    sanitize_all(&mut data);
+    let response = json!({
+        "data": data,
+        "meta": {
+            "api_version": API_VERSION,
+            "role": role.name(),
+            "projected_columns": requested_columns.iter().cloned().collect::<Vec<_>>(),
+            "missing_session_ids": missing,
+            "total": data.len(),
+        }
+    });
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// 2.19.0 — même logique que la résolution dans `sessions_filter`
+/// mais non-lambda pour pouvoir être appelée depuis
+/// `sessions_columns`.
+fn resolve_summary_for_columns(
+    state: &AppState,
+    session_id: &str,
+    journey_index: &subscriber_journey::JourneyIndex,
+) -> Option<Value> {
+    if let Some(flow) = state.inner.flows.get(session_id) {
+        let mut summary = session_summary(state, flow);
+        decorate_subscriber_summary(&mut summary, flow, journey_index);
+        insert_list_identities(state, &mut summary, &flow.session_id, Some(&flow.events));
+        return Some(summary);
+    }
+    for dataset in state.inner.capture_manager.datasets() {
+        let matching_id = dataset
+            .session_ids
+            .iter()
+            .find(|id| id.as_str() == session_id);
+        if let Some(owned_id) = matching_id {
+            if let Some(summary) = cached_live_list_row(state, &dataset, owned_id, journey_index) {
+                return Some(summary);
+            }
+        }
+    }
+    if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
+        for manifest in catalog {
+            if let Ok(page) = state
+                .inner
+                .lte_evidence_store
+                .session_page(&manifest.run_id, 1, 100)
+            {
+                if let Some(records) = page["data"].as_array() {
+                    for record in records {
+                        if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
+                            if session.session_id == session_id {
+                                let mut summary = lte_session_summary(&manifest, &session);
+                                insert_list_identities(
+                                    state,
+                                    &mut summary,
+                                    &session.session_id,
+                                    None,
+                                );
+                                return Some(summary);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -10944,6 +11300,241 @@ mod tests {
         }
         // Aucune identité ne doit figurer dans la réponse.
         assert_no_identity_material(&body);
+    }
+
+    /// 2.19.0 — `GET /sessions/catalog` expose les 4 familles de
+    /// filtres et un catalog de colonnes non vide. Aucune colonne
+    /// de type identité en clair.
+    #[tokio::test]
+    async fn sessions_catalog_exposes_filters_and_columns_without_clear_identities() {
+        let state = state();
+        let router = router(state.clone(), None);
+        let request = Request::builder()
+            .uri("/api/v1/sessions/catalog")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let columns = body["data"]["columns"]
+            .as_array()
+            .expect("columns array present");
+        assert!(!columns.is_empty(), "columns catalog must be non-empty");
+        for column in columns {
+            assert!(column["name"].is_string());
+            assert!(column["type"].is_string());
+            assert!(column["applies_to"].is_array());
+            assert!(column["always_present"].is_boolean());
+            let name = column["name"].as_str().unwrap().to_ascii_lowercase();
+            // Jamais de nom de colonne portant imsi/supi/msisdn/
+            // imei/guti/tmsi/suci/pei en clair (règle Sadok
+            // 2026-11-14). Les pseudonymes & le wrapper
+            // `identities` sont autorisés.
+            for banned in [
+                "imsi", "supi", "suci", "msisdn", "imei", "imeisv", "guti", "tmsi",
+            ] {
+                let is_pseudo_wrap =
+                    name.contains("pseudonym") || name.contains("identities");
+                assert!(
+                    !name.contains(banned) || is_pseudo_wrap,
+                    "forbidden clear identity column: {name}"
+                );
+            }
+        }
+        let filters = &body["data"]["filters"];
+        for family in [
+            "interfaces",
+            "messages",
+            "causes",
+            "technologies",
+            "dataset_kinds",
+            "states",
+            "correlation_statuses",
+        ] {
+            assert!(filters[family].is_array(), "missing filter family: {family}");
+        }
+        assert_no_identity_material(&body);
+    }
+
+    /// 2.19.0 — `POST /sessions/filter` avec `columns` renvoie les
+    /// lignes projetées. Les colonnes ALWAYS_PRESENT sont
+    /// toujours là, et `meta.projected_columns` reflète la
+    /// requête. Aucune identité en clair dans la projection.
+    #[tokio::test]
+    async fn sessions_filter_with_columns_projects_and_keeps_always_present() {
+        let state = state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "limit": 5,
+                "columns": ["state", "procedure", "message_count"],
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let data = body["data"].as_array().expect("data present");
+        for item in data {
+            // Toujours présentes.
+            assert!(item.get("session_id").is_some());
+            assert!(item.get("dataset_id").is_some());
+            assert!(item.get("dataset_kind").is_some());
+            assert!(item.get("technology").is_some());
+            // Demandées.
+            // (Elles peuvent être présentes OU absentes selon le
+            // producteur — mais toute autre colonne doit l'être.)
+            let allowed: std::collections::BTreeSet<&str> = [
+                "session_id",
+                "dataset_id",
+                "dataset_kind",
+                "technology",
+                "state",
+                "procedure",
+                "message_count",
+            ]
+            .into_iter()
+            .collect();
+            if let Value::Object(object) = item {
+                for key in object.keys() {
+                    assert!(
+                        allowed.contains(key.as_str()),
+                        "unexpected column after projection: {key}"
+                    );
+                }
+            }
+            assert_no_identity_material(item);
+        }
+        let projected = body["meta"]["projected_columns"]
+            .as_array()
+            .expect("projected_columns array");
+        assert_eq!(projected.len(), 3);
+    }
+
+    /// 2.19.0 — un nom de colonne hors catalog déclenche 400
+    /// `UNKNOWN_COLUMN` sans leak de données.
+    #[tokio::test]
+    async fn sessions_filter_with_unknown_column_returns_400_unknown_column() {
+        let state = state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({"columns": ["not_a_real_column"]}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "UNKNOWN_COLUMN");
+    }
+
+    /// 2.19.0 — `POST /sessions/columns` projette pour une liste
+    /// d'ids explicite. Les ids inconnus apparaissent dans
+    /// `meta.missing_session_ids`. Valide l'empty body → 400.
+    #[tokio::test]
+    async fn sessions_columns_projects_for_explicit_ids_and_reports_missing() {
+        let state = state();
+        // Récupère une liste d'ids réels via /sessions/filter.
+        let (status, filter_body) =
+            post_sessions_filter(&state, json!({"limit": 3}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let real_ids: Vec<String> = filter_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["session_id"].as_str().map(str::to_owned))
+            .collect();
+        if real_ids.is_empty() {
+            // Pas de donnée dans le dataset embarqué : encore test
+            // sanity du schéma d'erreur.
+            let router = router(state.clone(), None);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions/columns")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_ids": [],
+                        "columns": ["state"],
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            return;
+        }
+        let mut ids = real_ids.clone();
+        ids.push("session-does-not-exist".to_owned());
+        let router = router(state.clone(), None);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sessions/columns")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "session_ids": ids,
+                    "columns": ["state", "procedure"],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let data = body["data"].as_array().expect("data array");
+        assert_eq!(data.len(), real_ids.len());
+        let missing = body["meta"]["missing_session_ids"]
+            .as_array()
+            .expect("missing_session_ids array");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0], "session-does-not-exist");
+        for item in data {
+            assert!(item["session_id"].is_string());
+            assert!(item["dataset_id"].is_string());
+            // Pas d'autres colonnes que ALWAYS_PRESENT + demandées.
+            let allowed: std::collections::BTreeSet<&str> = [
+                "session_id",
+                "dataset_id",
+                "dataset_kind",
+                "technology",
+                "state",
+                "procedure",
+            ]
+            .into_iter()
+            .collect();
+            if let Value::Object(object) = item {
+                for key in object.keys() {
+                    assert!(
+                        allowed.contains(key.as_str()),
+                        "unexpected column after projection: {key}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 2.19.0 — filtre étendu `technologies` restreint à 5G SA
+    /// (quand des sessions 5G existent) et jamais ne renvoie une
+    /// ligne LTE. Vérifie que la projection par défaut inclut
+    /// toujours la colonne `technology`.
+    #[tokio::test]
+    async fn sessions_filter_technologies_restricts_to_5g_sa() {
+        let state = state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "limit": 50,
+                "technologies": ["5G SA"],
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for item in body["data"].as_array().unwrap() {
+            assert_eq!(
+                item["technology"].as_str().unwrap_or(""),
+                "5G SA",
+                "row should be 5G SA when filter technologies=[5G SA]"
+            );
+        }
     }
 
     #[tokio::test]

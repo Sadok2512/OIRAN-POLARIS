@@ -1,5 +1,58 @@
 # Changelog
 
+## OIRAN API 2.19.0 — 2026-11-16 — Catalog filtres/colonnes + filtre étendu + projection serveur (minor)
+
+ANR1 a déployé p900 2.7.0 en attendant `catalog` + `columns` : ces deux routes débloquent l'écran Sessions (choix dynamique de colonnes + filtres multiples). Le filtre 2.10.0 est étendu avec 4 nouvelles familles AND (OR interne), sans toucher à la clé de pagination canonique.
+
+### Ajouts
+
+- `GET /api/v1/sessions/catalog` — catalog unifié :
+  - `columns[]` liste **toutes** les colonnes publiables avec `{name, type, applies_to[], always_present, description}`. `applies_to` : `HISTORICAL_5G | CAPTURED_LIVE | HISTORICAL_CONTINUOUS | EVIDENCE_LTE`. `always_present=true` ↔ colonne préservée par toute projection (`session_id`, `dataset_id`, `dataset_kind`, `technology`).
+  - `filters.interfaces[]` / `filters.messages[]` / `filters.causes[]` : lectures live de `SessionFilterIndex` (reflètent le dataset courant).
+  - `filters.technologies[]` / `filters.dataset_kinds[]` / `filters.states[]` / `filters.correlation_statuses[]` : énumérations fermées.
+  - `always_present_columns[]`, `session_count` : invariants publiés.
+- `POST /api/v1/sessions/columns` — projection sur ids explicites :
+  - Body : `{session_ids: [...], columns: [...]}`.
+  - Réponse : `data[]` projeté (ALWAYS_PRESENT + colonnes demandées), `meta.missing_session_ids[]` pour les ids absents, `meta.projected_columns[]`.
+  - `session_ids` vide → 400 `SESSION_IDS_REQUIRED`. Colonne inconnue → 400 `UNKNOWN_COLUMN`.
+- `POST /api/v1/sessions/filter` — champ optionnel `columns: [...]` qui projette chaque ligne avant `sanitize_all`. `meta.projected_columns` reflète la projection, et les colonnes ALWAYS_PRESENT sont toujours là. Colonne inconnue → 400 `UNKNOWN_COLUMN` AVANT tout calcul coûteux.
+- `POST /api/v1/sessions/filter` — 4 nouveaux filtres AND-entre-familles, OR-interne :
+  - `technologies: ["5G SA", "LTE"]`
+  - `dataset_kinds: ["HISTORICAL", "CAPTURED_LIVE", "EVIDENCE", "DERIVED", "RECOVERED"]`
+  - `states: ["ACTIVE_WITH_USER_PLANE", "RELEASED", "INCOMPLETE", "HISTORICAL_CONTEXT", "UNKNOWN"]`
+  - `correlation_statuses: [...]`
+  - Appliqués APRÈS les filtres 2.10.0 (messages/causes/identity/failures_only), AVANT la pagination curseur. La clé canonique `(anchor_capture_id, first_packet_number, session_id)` reste inchangée.
+
+### Invariants préservés
+
+- **Pagination** : clé `(anchor_capture_id, first_packet_number, session_id)`. Jamais de `ts`. `meta.pagination_key` reste publié.
+- **Vie privée** : les colonnes du catalog ne portent **jamais** de nom d'identité en clair (`imsi`/`supi`/`msisdn`/`imei`/`guti`/`tmsi`/`suci` sont interdits, test `catalog_never_lists_clear_identity_columns`). Les wrappers pseudonymisés (`ue_pseudonym`, `subscriber_pseudonym`, `identities`) restent permis. Règle Sadok 2026-11-14 respectée.
+- **Projection** : ne crée jamais de clé, ne fabrique jamais de valeur. Si un producteur ne publie pas une colonne pour une ligne, la colonne reste absente (test `projection_does_not_invent_missing_columns`).
+- **Fast path 2.18.x** : si aucun filtre étendu n'est fourni, la construction des summaries reste paresseuse par page (comportement 2.18.12). Seul le mode avec filtre étendu pré-construit tous les summaries pour filtrer.
+- **ETag/cache** : le catalog est réactif au dataset courant via `refresh_session_filter_index()`.
+
+### Tests ajoutés (5 unit + 5 HTTP)
+
+- `session_catalog::tests::always_present_columns_remain_after_projection`
+- `session_catalog::tests::projection_does_not_invent_missing_columns`
+- `session_catalog::tests::validate_columns_rejects_unknown_name`
+- `session_catalog::tests::validate_columns_accepts_all_catalog_names`
+- `session_catalog::tests::catalog_never_lists_clear_identity_columns`
+- `tests::sessions_catalog_exposes_filters_and_columns_without_clear_identities`
+- `tests::sessions_filter_with_columns_projects_and_keeps_always_present`
+- `tests::sessions_filter_with_unknown_column_returns_400_unknown_column`
+- `tests::sessions_columns_projects_for_explicit_ids_and_reports_missing`
+- `tests::sessions_filter_technologies_restricts_to_5g_sa`
+
+### Impact client
+
+- p900 2.7.0 peut maintenant lire `/sessions/catalog` au mount, exposer un UI de sélection de colonnes, et envoyer `columns:[...]` dans `/sessions/filter` pour payload réduit. Compat 2.18 inchangée : omettre `columns` (et les 4 extended filters) ⇒ comportement 2.18.12.
+- `/sessions/columns` ouvre la voie à des vues détail-liste (ex. "montre-moi juste state+procedure pour ces 50 sessions") sans refetcher les call flows.
+
+### OUVERTS
+
+- O1–O7 (cf. `docs/architecture/PHASE1-2.md` sur `feat/oiran-2.20.0-streaming`) restent ouverts pour les lots 2.20.x/2.21.x. 2.19.0 ne traite pas ces écarts.
+
 ## OIRAN API 2.18.12 — 2026-11-16 — Audit perf : cause racine de la lourdeur (patch)
 
 Cause racine (audit code, Sadok « l'app est lourde ») : plusieurs routes relisaient et re-parsaient depuis le disque le call flow JSON de TOUTES les sessions à chaque requête.
