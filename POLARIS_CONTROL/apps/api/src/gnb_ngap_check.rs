@@ -138,6 +138,12 @@ pub const GNB_NGAP_DOWN: &str = "GNB_NGAP_DOWN";
 pub const GNB_NGAP_DOWN_AMF_UNAVAILABLE: &str = "GNB_NGAP_DOWN_AMF_UNAVAILABLE";
 /// Revue Claude 0.36.8 — statut `nr-cli status` illisible : aucune reprise.
 pub const GNB_NGAP_STATUS_UNREADABLE: &str = "GNB_NGAP_STATUS_UNREADABLE";
+/// 0.36.16 — gNB redémarré, NGAP up, mais le conteneur n'est pas revenu
+/// `healthy` dans le délai : la gate santé du job échouerait (course
+/// prouvée ANR2 #10, job simple-data-ul-dl-19900c89a294).
+pub const GNB_NOT_HEALTHY_AFTER_RESTART: &str = "GNB_NOT_HEALTHY_AFTER_RESTART";
+/// 0.36.16 — délai max d'attente du healthcheck docker du gNB après restart.
+pub const GNB_HEALTH_TIMEOUT_SECONDS: u64 = 120;
 
 /// 0.36.8 — Trait d'injection pour isoler l'IO docker en test.
 /// Implémenté en prod par [`DockerGnbNgapChecker`] ci-dessous ; en
@@ -161,6 +167,10 @@ pub trait GnbNgapChecker {
     /// final observé (peut rester `Down` si le restart n'a pas
     /// suffi).
     fn wait_for_ngap_up(&self, timeout_seconds: u64) -> NgapState;
+    /// 0.36.16 — attend que le conteneur gNB soit `running/healthy`
+    /// (healthcheck docker) après un restart. `Ok` seulement sur
+    /// `healthy` observé ; délai dépassé → `Err(état observé)`.
+    fn wait_for_container_healthy(&self, timeout_seconds: u64) -> Result<(), String>;
 }
 
 /// 0.36.8 — Flux de décision + action. Pure côté logique, les IO
@@ -183,11 +193,16 @@ pub fn check_gnb_ngap_up_or_recover<C: GnbNgapChecker>(
         GnbRecoveryDecision::RestartGnb => {
             checker.restart_gnb()?;
             let after = checker.wait_for_ngap_up(restart_timeout_seconds);
-            if after.is_up() {
-                Ok(GnbNgapOutcome::RestartedAndUp)
-            } else {
-                Err(GNB_NGAP_DOWN.into())
+            if !after.is_up() {
+                return Err(GNB_NGAP_DOWN.into());
             }
+            // 0.36.16 — NGAP up ne suffit pas : la gate santé du job
+            // exige le conteneur `healthy`. Sans cette attente, la gate
+            // était évaluée < 1 s après le restart → LAB_HEALTH_GATE_FAILED.
+            checker
+                .wait_for_container_healthy(GNB_HEALTH_TIMEOUT_SECONDS)
+                .map_err(|observed| format!("{GNB_NOT_HEALTHY_AFTER_RESTART}: {observed}"))?;
+            Ok(GnbNgapOutcome::RestartedAndUp)
         }
     }
 }
@@ -264,6 +279,8 @@ mod tests {
         amf_listening: bool,
         restart_ok: bool,
         restart_calls: Cell<u32>,
+        healthy_after_restart: bool,
+        health_waits: Cell<u32>,
     }
 
     /// Liste d'AMF du double : non vide par défaut (cas nominal).
@@ -294,6 +311,14 @@ mod tests {
         fn wait_for_ngap_up(&self, _timeout_seconds: u64) -> NgapState {
             parse_nr_cli_status(&self.after_restart_status)
         }
+        fn wait_for_container_healthy(&self, _timeout_seconds: u64) -> Result<(), String> {
+            self.health_waits.set(self.health_waits.get() + 1);
+            if self.healthy_after_restart {
+                Ok(())
+            } else {
+                Err("running/starting".into())
+            }
+        }
     }
 
     #[test]
@@ -304,6 +329,8 @@ mod tests {
             amf_listening: true,
             restart_ok: false,
             restart_calls: Cell::new(0),
+            healthy_after_restart: true,
+            health_waits: Cell::new(0),
         };
         let out = check_gnb_ngap_up_or_recover(&checker, 10).unwrap();
         assert_eq!(out, GnbNgapOutcome::AlreadyUp);
@@ -318,6 +345,8 @@ mod tests {
             amf_listening: true,
             restart_ok: true,
             restart_calls: Cell::new(0),
+            healthy_after_restart: true,
+            health_waits: Cell::new(0),
         };
         let out = check_gnb_ngap_up_or_recover(&checker, 10).unwrap();
         assert_eq!(out, GnbNgapOutcome::RestartedAndUp);
@@ -332,6 +361,8 @@ mod tests {
             amf_listening: true,
             restart_ok: true,
             restart_calls: Cell::new(0),
+            healthy_after_restart: true,
+            health_waits: Cell::new(0),
         };
         let err = check_gnb_ngap_up_or_recover(&checker, 10).unwrap_err();
         assert_eq!(err, GNB_NGAP_DOWN);
@@ -346,6 +377,8 @@ mod tests {
             amf_listening: false,
             restart_ok: true,
             restart_calls: Cell::new(0),
+            healthy_after_restart: true,
+            health_waits: Cell::new(0),
         };
         let err = check_gnb_ngap_up_or_recover(&checker, 10).unwrap_err();
         assert_eq!(err, GNB_NGAP_DOWN_AMF_UNAVAILABLE);
@@ -361,6 +394,8 @@ mod tests {
             amf_listening: false,
             restart_ok: true,
             restart_calls: Cell::new(0),
+            healthy_after_restart: true,
+            health_waits: Cell::new(0),
         };
         let err = check_gnb_ngap_up_or_recover(&checker, 10).unwrap_err();
         assert_eq!(err, GNB_NGAP_STATUS_UNREADABLE);
@@ -375,6 +410,8 @@ mod tests {
             amf_listening: true,
             restart_ok: true,
             restart_calls: Cell::new(0),
+            healthy_after_restart: true,
+            health_waits: Cell::new(0),
         };
         let err = check_gnb_ngap_up_or_recover(&checker, 10).unwrap_err();
         assert_eq!(err, GNB_NGAP_STATUS_UNREADABLE);
@@ -411,6 +448,9 @@ mod tests {
         fn wait_for_ngap_up(&self, _timeout_seconds: u64) -> NgapState {
             NgapState::NgapUp
         }
+        fn wait_for_container_healthy(&self, _timeout_seconds: u64) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -420,4 +460,39 @@ mod tests {
         assert_eq!(outcome, GnbNgapOutcome::RestartedAndUp);
         assert_eq!(checker.restart_calls.get(), 1);
     }
+
+    /// 0.36.16 — restart gNB + NGAP up mais conteneur pas `healthy` →
+    /// erreur explicite, jamais RestartedAndUp (la gate échouerait ensuite).
+    #[test]
+    fn restart_with_ngap_up_but_container_not_healthy_fails_explicitly() {
+        let checker = ScriptedChecker {
+            initial_status: "is-ngap-up: false".into(),
+            after_restart_status: "is-ngap-up: true".into(),
+            amf_listening: true,
+            restart_ok: true,
+            restart_calls: Cell::new(0),
+            healthy_after_restart: false,
+            health_waits: Cell::new(0),
+        };
+        let err = check_gnb_ngap_up_or_recover(&checker, 10).unwrap_err();
+        assert!(err.starts_with(GNB_NOT_HEALTHY_AFTER_RESTART), "{err}");
+        assert_eq!(checker.health_waits.get(), 1);
+    }
+
+    /// 0.36.16 — chemin nominal : le restart attend `healthy` avant de rendre la main.
+    #[test]
+    fn restart_waits_for_container_healthy_before_returning() {
+        let checker = ScriptedChecker {
+            initial_status: "is-ngap-up: false".into(),
+            after_restart_status: "is-ngap-up: true".into(),
+            amf_listening: true,
+            restart_ok: true,
+            restart_calls: Cell::new(0),
+            healthy_after_restart: true,
+            health_waits: Cell::new(0),
+        };
+        assert_eq!(check_gnb_ngap_up_or_recover(&checker, 10).unwrap(), GnbNgapOutcome::RestartedAndUp);
+        assert_eq!(checker.health_waits.get(), 1);
+    }
+
 }

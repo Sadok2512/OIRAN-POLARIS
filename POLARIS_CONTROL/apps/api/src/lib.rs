@@ -4568,6 +4568,36 @@ impl gnb_ngap_check::GnbNgapChecker for DockerGnbNgapChecker {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
+
+    /// 0.36.16 — attend `running/healthy` du conteneur gNB (healthcheck
+    /// docker) ; chaque attente est journalisée, jamais silencieuse.
+    fn wait_for_container_healthy(&self, timeout_seconds: u64) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(timeout_seconds);
+        loop {
+            let observed = inspect_container_state(Self::GNB_CONTAINER);
+            if let Some((process, health)) = observed.as_ref() {
+                if process == "running" && health == "healthy" {
+                    eprintln!(
+                        "{}",
+                        json!({"event":"GNB_HEALTHY_AFTER_RESTART","container":Self::GNB_CONTAINER,"waited_ms":started.elapsed().as_millis() as u64})
+                    );
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let text = observed
+                    .map(|(p, h)| format!("{p}/{h}"))
+                    .unwrap_or_else(|| "unobserved".into());
+                eprintln!(
+                    "{}",
+                    json!({"event":"GNB_NOT_HEALTHY_AFTER_RESTART","container":Self::GNB_CONTAINER,"observed":text,"waited_ms":started.elapsed().as_millis() as u64})
+                );
+                return Err(text);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
 }
 
 /// 0.36.12 (ANR2 #10 6917003639) — `ss … state listen` est rejeté par

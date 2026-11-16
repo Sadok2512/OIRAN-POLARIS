@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.36.16 — 2026-11-16 — Récupération NGAP : attendre gNB `healthy` avant la gate santé (patch)
+
+- Cause prouvée par ANR2 (#10, job `simple-data-ul-dl-19900c89a294`) : `gnb_ngap_recover` redémarrait le gNB (StartedAt 18:01:57.9) puis rendait la main dès NGAP up. La gate santé (`resource_gate_for_budget` → `container_is_healthy`) était alors évaluée < 1 s plus tard, sur un gNB en `starting` → `LAB_HEALTH_GATE_FAILED` à `ue_start`, sans trafic. Même cause probable pour l'échec du job d'ANR1 à la même heure.
+- `GnbNgapChecker::wait_for_container_healthy` : après un restart et NGAP up, attente du healthcheck docker `running/healthy` (`GNB_HEALTH_TIMEOUT_SECONDS = 120`, sondage 1 s). Journalisation `GNB_HEALTHY_AFTER_RESTART` / `GNB_NOT_HEALTHY_AFTER_RESTART` (avec waited_ms et l'état observé). Délai dépassé → erreur `GNB_NOT_HEALTHY_AFTER_RESTART: <état>`, jamais `RestartedAndUp`.
+- La gate santé elle-même est inchangée (aucune attente dans les aperçus `GET`).
+- Tests : `restart_with_ngap_up_but_container_not_healthy_fails_explicitly`, `restart_waits_for_container_healthy_before_returning`. Suite complète `cargo test --locked --workspace -j 2` : 420 passed, 0 failed, 3 ignored.
+
 ## 0.36.15 — 2026-11-16 — Garde CPU : les builds basse priorité ne bloquent plus le lab (patch)
 
 Écart OUVERT « builds → 503 » (encore observé par ANR2, #10 6921238261 : `BLOCKED_CPU_PRESSURE` sur `simple-data-ul-dl`). Cause dans `cpu_safety.rs` : (1) le temps `nice` des builds en `nice -n 19` était compté comme utilisation de l'hôte et comme marge perdue ; (2) la PSI lue était celle de TOUT l'hôte (`/proc/pressure/cpu`), où les threads d'une build en attente de CPU créent de la pression « some » même avec la priorité minimale.
