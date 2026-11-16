@@ -1,5 +1,78 @@
 # Changelog
 
+## OIRAN API 2.21.5 — 2026-11-16 — Câblage effectif Live/Vtap dans CaptureManager + stamp probe_type (minor)
+
+Lot C.5 validé Sadok #10 2.21.4. Câblage effectif des moteurs `vtap` et `vprobe` dans le watcher continuous : chaque event publié porte désormais sa marque de sonde (probe_id, probe_type, timestamp_source). Pré-requis Phase 1 pour que ANR2 puisse vérifier à l'oeil nu la source d'un event dans `oiran_events.jsonl`.
+
+### Composants et versions
+
+| Composant | Avant | Après | Type |
+|---|---|---|---|
+| `oiran-api` | 2.21.4 | **2.21.5** | minor |
+| `live-probe` | 0.6.1 | **0.6.2** | patch (nouvelle fonction publique) |
+| `decoder-sbi` | 0.4.5 | — | inchangé |
+| `event-schema` | 1.8.0 | — | inchangé |
+
+### Câblage effectif
+
+**Nouvelle fonction** `live-probe::capture_source::probe_stamp_for_pcap_path(path) -> ProbeStamp` :
+
+- `vtap_*.pcap` fermés (filtrés par `VtapSource::is_ingestible`) → `probe_id="lab-vtap"`, `probe_type="vtap"`, `timestamp_source="ebpf_monotonic"`.
+- Tout autre pcap (`.pcapng` dumpcap, pcap live) → `probe_id="lab-vprobe"`, `probe_type="vprobe"`, `timestamp_source="kernel"`.
+- `physical_link` reste `None` (sera câblé via `polaris.toml` quand la config multi-sonde sera active, lot futur).
+
+**Sites de câblage** dans `live-probe/src/lib.rs` :
+
+- **Decode streaming principal** (`process_continuous_capture_inner`) — chaque `event.to_json()` devient `event.to_json_with_probe(&probe_stamp)` avec `probe_stamp = probe_stamp_for_pcap_path(&path)` calculé une fois par pcap avant la boucle. Deux emplacements modifiés (event normal + flush N3/keepalive aggregates).
+- **Fresh-import** (chemin de reprise 2.9.2) — même stamp dérivé de `on_disk_path`. Préserve la cohérence sur les pcaps réingérés après restart.
+
+**Ingestion** :
+- `.pcap.part` et `.vtap.json` déjà filtrés par `VtapSource::is_ingestible` (depuis 2.21.0) et par la rotation-watcher dumpcap pour les pcaps classiques. **Aucun changement d'ingestion** dans 2.21.5 — seule la sérialisation est stampée.
+
+### Invariants préservés
+
+- **Iso-comportement 2.21.4 sur TOUS les autres champs** : seul l'ajout des 3 clés `probe_id` / `probe_type` / `timestamp_source` est nouveau sur chaque ligne JSONL. `#[serde(skip_serializing_if = "Option::is_none")]` garantit que les champs inchangés restent bit-identiques.
+- **Ordre canonique** `(capture_id, packet_number, event_id)` strictement conservé. Le stamp ne participe pas à la clé d'ordre.
+- **Vie privée** : `probe_id` est une étiquette d'infra stable (`lab-vtap` / `lab-vprobe`), **jamais** une identité abonné. `physical_link` reste optionnel.
+- **Compat parseur 2.20.x** : `session-engine::parse_event` lit déjà les 4 champs multi-sonde depuis le JSONL (2.20.0) ; `callflow-schema::CallFlowEvent` les propage. Aucun changement amont requis.
+- **Compat API 2.21.4** : les routes `/sessions/*` exposent `probe_type` via `callflow.events[].probe_type` et sont déjà filtrables via le catalog 2.19.1. Pas de nouvelle route.
+
+### Tests ajoutés (4 nouveaux)
+
+**`live-probe::capture_source::tests`** (4) :
+- `probe_stamp_from_pcap_path_is_vtap_for_vtap_filenames`
+- `probe_stamp_from_pcap_path_is_vprobe_for_dumpcap_filenames`
+- `probe_stamp_from_pcap_part_file_falls_back_to_vprobe` (garde : un `.pcap.part` échappé au filtre d'ingestion ne reçoit PAS le stamp vtap par erreur)
+- `integration_wiring_pcap_path_then_json_marks_probe_type_as_source` — compose `probe_stamp_for_pcap_path` + `to_json_with_probe` sur un `NormalizedEvent` minimal et vérifie les 3 cas (vprobe / vtap / `.pcap.part`) directement dans la JSONL sérialisée.
+
+Le test end-to-end sur un vrai pcap vtap reste couvert par `vtap/tests/sbi_roundtrip.rs::every_event_from_vtap_pcap_is_stamped_probe_type_vtap` (depuis 2.21.0).
+
+### Non traités dans 2.21.5 (déclarés OUVERT 2.21.6+)
+
+- **Tri `frames.sort_by_key` intra-connexion TCP** dans `decoder-sbi::decode_connections` (ligne 107) : la règle « jamais de `ts` dans la clé d'ordre » n'est pas encore respectée à ce niveau. OUVERT du 2.21.2, à basculer sur `(packet_number, direction_index, offset)` dans un lot dédié avec preuve de reassembly HTTP/2 stable.
+- **Bench O1 chiffré (100/500/1000 Mbit/s tp_drops)** : nécessite `CAP_NET_RAW` + `pktgen` sur bench vProbe. Scaffold `benchmarks/live-rx-drops/measure.sh` en place depuis 2.20.1. OUVERT.
+- **`polaris.toml` surchargeant `probe_id` par sonde** : le lot n'ajoute pas de lookup opérateur ; les 2 étiquettes par défaut (`lab-vtap`/`lab-vprobe`) suffisent pour ANR2. Config custom = lot futur.
+
+### Audit `Cargo.lock` compatible Rust 1.83 (règle Sadok, commande + chiffres)
+
+```bash
+nice -n 19 ionice -c3 cargo fetch
+# puis parser du lock (identique aux lots précédents)
+```
+
+Résultat sur ce commit :
+
+```
+TOTAL_REGISTRY_PACKAGES_IN_LOCK 105
+NOT_FETCHED_LOCALLY 0
+EDITION_2024_OR_RUST_GT_1_83_IN_LOCK 0 []
+PINNED_INDEXMAP indexmap-2.13.1
+```
+
+### Lock vTAP
+
+Après hausse `live-probe 0.6.1 → 0.6.2` : `cd OIRAN/vtap && cargo update -w && cargo test --locked`. Chiffres reportés dans le rapport #10.
+
 ## OIRAN API 2.21.4 — 2026-11-16 — Catalogue SBI élargi (clôture 416/552 UE-201) + commit_seq dans ListRowCache (patch)
 
 Lot C.4/B.2 — clôture écart ANR2 #10 6921238261 + avancée Phase 1 contenue.

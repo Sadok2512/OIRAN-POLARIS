@@ -5188,6 +5188,11 @@ impl CaptureManager {
                     if interface.is_empty() {
                         continue;
                     }
+                    // 2.21.5 — stamp dérivé du nom du pcap (vtap → vtap,
+                    // sinon vprobe). Évite tout état global pendant le
+                    // fresh-import.
+                    let probe_stamp =
+                        crate::capture_source::probe_stamp_for_pcap_path(on_disk_path);
                     let config = DecodeConfig {
                         input: on_disk_path.clone(),
                         capture_id: full_capture_id.clone(),
@@ -5246,7 +5251,9 @@ impl CaptureManager {
                                 });
                                 return Ok(());
                             }
-                            let line = event.to_json();
+                            // 2.21.5 — stamp Live/Vtap (iso-comportement si
+                            // None dans ProbeStamp ; ici toujours Some).
+                            let line = event.to_json_with_probe(&probe_stamp);
                             let payload = line.as_bytes();
                             scratch_writer_ref.write_all(payload).map_err(display_error)?;
                             scratch_writer_ref.write_all(b"\n").map_err(display_error)?;
@@ -5511,6 +5518,14 @@ impl CaptureManager {
                     continue;
                 }
                 let capture_hash = format!("sha256:{checksum}");
+                // 2.21.5 — stamp Live/Vtap dérivé du chemin pcap, apposé
+                // sur CHAQUE event publié. `vtap_*.pcap` → probe_type=vtap,
+                // sinon probe_type=vprobe. Iso-comportement 2.21.4 préservé
+                // à l'exception des 3 nouvelles clés
+                // (probe_id/probe_type/timestamp_source) qui s'ajoutent
+                // à chaque ligne JSONL — la publication ANR2 attendait
+                // précisément cette marque.
+                let probe_stamp = crate::capture_source::probe_stamp_for_pcap_path(&path);
                 // 2.11.5: all GTP-U user planes use the same bounded flow
                 // aggregation. Restricting this to N3 left S1-U/S5-U as
                 // packet events and made their tunnel evidence disappear
@@ -5543,7 +5558,7 @@ impl CaptureManager {
                         }
                         individual_events = individual_events.saturating_add(1);
                         decoded_spool
-                            .write_all(event.to_json().as_bytes())
+                            .write_all(event.to_json_with_probe(&probe_stamp).as_bytes())
                             .and_then(|_| decoded_spool.write_all(b"\n"))
                             .map_err(display_error)
                     },
@@ -5559,7 +5574,7 @@ impl CaptureManager {
                     .saturating_add(keepalive_aggregates.len());
                 for event in n3_aggregates.into_iter().chain(keepalive_aggregates) {
                     decoded_spool
-                        .write_all(event.to_json().as_bytes())
+                        .write_all(event.to_json_with_probe(&probe_stamp).as_bytes())
                         .and_then(|_| decoded_spool.write_all(b"\n"))
                         .map_err(display_error)?;
                 }

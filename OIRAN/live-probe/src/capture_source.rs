@@ -695,6 +695,43 @@ impl CaptureSource for VtapSource {
     }
 }
 
+/// 2.21.5 — câblage effectif Live/Vtap dans `CaptureManager`.
+/// Dérive l'empreinte de sonde à apposer sur les events d'un pcap
+/// à partir **uniquement du nom de fichier** (donc sans état
+/// global, sans manifeste additionnel). Deux moteurs sont câblés :
+///
+/// * `vtap_*.pcap` fermés (filtrés par `VtapSource::is_ingestible`) →
+///   `probe_type="vtap"`, `probe_id="lab-vtap"`, `timestamp_source="ebpf_monotonic"`.
+/// * Tout autre pcap (fichier `.pcapng` dumpcap ou pcap live) →
+///   `probe_type="vprobe"`, `probe_id="lab-vprobe"`, `timestamp_source="kernel"`.
+///
+/// Les `probe_id` par défaut sont des étiquettes stables ; un
+/// opérateur qui veut différencier plusieurs sondes passe par
+/// `polaris.toml` (lot futur) qui remontera sur la même fonction.
+/// L'invariant **iso-comportement 2.21.4** est préservé car les
+/// 4 champs multi-sonde sont émis via `to_json_with_probe()` qui
+/// skip `None` : la fonction renvoie toujours `Some(_)` pour
+/// `probe_type` + `probe_id` + `timestamp_source`, les lignes
+/// publiées 2.21.5 portent ces 3 clés (nouveau comportement voulu
+/// par ANR2), les 2.21.4 ne les portaient pas.
+pub fn probe_stamp_for_pcap_path(path: &Path) -> ProbeStamp {
+    if VtapSource::is_ingestible(path) {
+        ProbeStamp {
+            probe_id: Some("lab-vtap".into()),
+            probe_type: Some(CaptureSourceKind::Vtap.probe_type().into()),
+            physical_link: None,
+            timestamp_source: Some(VtapSource::TIMESTAMP_SOURCE.into()),
+        }
+    } else {
+        ProbeStamp {
+            probe_id: Some("lab-vprobe".into()),
+            probe_type: Some(CaptureSourceKind::PcapRotating.probe_type().into()),
+            physical_link: None,
+            timestamp_source: Some("kernel".into()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1053,5 +1090,146 @@ mod tests {
         ));
         let entries = VtapSource::ingestible_entries(&missing).unwrap();
         assert!(entries.is_empty());
+    }
+
+    /// 2.21.5 — câblage effectif : un pcap `vtap_*.pcap` fermé
+    /// produit un `ProbeStamp` « vtap », un pcap dumpcap classique
+    /// produit un `ProbeStamp` « vprobe ». Jamais de ProbeStamp
+    /// vide : les 3 champs clés sont toujours `Some(_)`.
+    #[test]
+    fn probe_stamp_from_pcap_path_is_vtap_for_vtap_filenames() {
+        let stamp = probe_stamp_for_pcap_path(Path::new(
+            "/var/lib/oiran/vtap/vtap_SBI_20261116T120000Z.pcap",
+        ));
+        assert_eq!(stamp.probe_id.as_deref(), Some("lab-vtap"));
+        assert_eq!(stamp.probe_type.as_deref(), Some("vtap"));
+        assert_eq!(stamp.timestamp_source.as_deref(), Some("ebpf_monotonic"));
+        assert!(stamp.physical_link.is_none());
+    }
+
+    #[test]
+    fn probe_stamp_from_pcap_path_is_vprobe_for_dumpcap_filenames() {
+        let stamp = probe_stamp_for_pcap_path(Path::new(
+            "/var/lib/oiran/capture/N2/N2_00042.pcapng",
+        ));
+        assert_eq!(stamp.probe_id.as_deref(), Some("lab-vprobe"));
+        assert_eq!(stamp.probe_type.as_deref(), Some("vprobe"));
+        assert_eq!(stamp.timestamp_source.as_deref(), Some("kernel"));
+    }
+
+    /// 2.21.5 — un `.pcap.part` n'est **pas** un vtap fermé →
+    /// classé vprobe en fallback (iso-comportement 2.21.4 pour les
+    /// pcaps classiques). En pratique un `.part` n'est jamais
+    /// ingéré (filtré par rotation-watcher et par
+    /// `VtapSource::is_ingestible`) ; ce test prouve que même si
+    /// un bug laissait passer un `.part` dans le pipeline, le
+    /// stamp vtap ne lui serait pas apposé par erreur.
+    #[test]
+    fn probe_stamp_from_pcap_part_file_falls_back_to_vprobe() {
+        let stamp = probe_stamp_for_pcap_path(Path::new(
+            "/var/lib/oiran/vtap/vtap_SBI_20261116T120000Z.pcap.part",
+        ));
+        assert_eq!(stamp.probe_type.as_deref(), Some("vprobe"));
+    }
+
+    /// 2.21.5 — INTÉGRATION : le câblage `probe_stamp_for_pcap_path`
+    /// + `NormalizedEvent::to_json_with_probe` produit des lignes
+    /// JSONL marquées `probe_type` conformément au chemin pcap
+    /// source. Reproduit exactement ce que le pipeline
+    /// `process_continuous_capture_inner` fait depuis la 2.21.5.
+    #[test]
+    fn integration_wiring_pcap_path_then_json_marks_probe_type_as_source() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, ExactTimestamp, NormalizedEvent, PacketReference,
+            Protocol,
+        };
+        fn minimal_event(capture_id: &str, packet_number: u64) -> NormalizedEvent {
+            NormalizedEvent {
+                event_id: String::new(),
+                parent_event_id: None,
+                probe_id: "will-be-overridden".into(),
+                capture_point_id: "SBI".into(),
+                capture_id: capture_id.into(),
+                packet_references: vec![PacketReference {
+                    source_file: "stub.pcap".into(),
+                    source_sha256: None,
+                    packet_number,
+                    byte_offset: 0,
+                    interface_id: 0,
+                    link_type: None,
+                    sll2_protocol_type: None,
+                    sll2_reserved: None,
+                    sll2_interface_index: None,
+                    sll2_arphrd_type: None,
+                    sll2_packet_type: None,
+                    sll2_address_length: None,
+                    sll2_address: None,
+                    captured_length: 64,
+                    original_length: 64,
+                }],
+                timestamp: ExactTimestamp {
+                    seconds: 0,
+                    nanoseconds: 0,
+                    raw_ticks: 0,
+                    resolution_base: 10,
+                    resolution_exponent: 9,
+                },
+                interface: "SBI".into(),
+                protocol: Protocol::SbiHttp2,
+                message_name: "integration-test".into(),
+                message_type: 0,
+                procedure_code: None,
+                procedure: None,
+                security_state: None,
+                source_byte_offset: None,
+                source_endpoint: Endpoint {
+                    address: "a".into(),
+                    port: None,
+                    network_function: None,
+                },
+                destination_endpoint: Endpoint {
+                    address: "b".into(),
+                    port: None,
+                    network_function: None,
+                },
+                direction: Direction::Unknown,
+                session_identifiers: vec![],
+                information_elements: vec![],
+                decoder_name: "test".into(),
+                decoder_version: "test".into(),
+                schema_version: NormalizedEvent::SCHEMA_VERSION,
+                decoding_status: DecodeStatus::Decoded,
+                errors: vec![],
+                raw_payload_reference: "sha256:int".into(),
+                evidence_references: vec![],
+                sbi: None,
+            }
+        }
+        // (a) Pcap classique dumpcap → vprobe partout dans la JSONL.
+        let path_vprobe = Path::new("/var/lib/oiran/capture/N2/N2_00001.pcapng");
+        let stamp_vprobe = probe_stamp_for_pcap_path(path_vprobe);
+        let line_vprobe = minimal_event("sha256:vprobe", 1).to_json_with_probe(&stamp_vprobe);
+        let v: serde_json::Value = serde_json::from_str(&line_vprobe).unwrap();
+        assert_eq!(v["probe_type"], "vprobe", "{line_vprobe}");
+        assert_eq!(v["probe_id"], "lab-vprobe");
+        assert_eq!(v["timestamp_source"], "kernel");
+        // physical_link reste absent (None → skip_serializing_if).
+        assert!(v.as_object().unwrap().get("physical_link").is_none());
+
+        // (b) Pcap vTAP fermé → vtap partout.
+        let path_vtap = Path::new("/var/lib/oiran/vtap/vtap_SBI_20261116T120000Z.pcap");
+        let stamp_vtap = probe_stamp_for_pcap_path(path_vtap);
+        let line_vtap = minimal_event("sha256:vtap", 2).to_json_with_probe(&stamp_vtap);
+        let v: serde_json::Value = serde_json::from_str(&line_vtap).unwrap();
+        assert_eq!(v["probe_type"], "vtap", "{line_vtap}");
+        assert_eq!(v["probe_id"], "lab-vtap");
+        assert_eq!(v["timestamp_source"], "ebpf_monotonic");
+
+        // (c) `.pcap.part` → fallback vprobe : jamais de confusion.
+        let path_part = Path::new("/var/lib/oiran/vtap/vtap_SBI_20261116T120100Z.pcap.part");
+        let stamp_part = probe_stamp_for_pcap_path(path_part);
+        let line_part = minimal_event("sha256:part", 3).to_json_with_probe(&stamp_part);
+        let v: serde_json::Value = serde_json::from_str(&line_part).unwrap();
+        assert_eq!(v["probe_type"], "vprobe", "{line_part}");
     }
 }
