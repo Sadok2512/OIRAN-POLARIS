@@ -1,5 +1,99 @@
 # Changelog
 
+## OIRAN API 2.21.3 — 2026-11-16 — Catalogue SBI élargi (clôture 416/552 UE-201) + commit_seq dans ListRowCache (patch)
+
+Lot C.4/B.2 — clôture écart ANR2 #10 6921238261 + avancée Phase 1 contenue.
+
+### Composants et versions (incrément de chaque crate touché)
+
+| Composant | Avant | Après | Type |
+|---|---|---|---|
+| `oiran-api` | 2.21.2 | **2.21.3** | patch |
+| `decoder-sbi` | 0.4.4 | **0.4.5** | patch |
+| `live-probe` | 0.6.1 | — | inchangé |
+| `event-schema` | 1.8.0 | — | inchangé |
+
+### Clôture écart ANR2 #10 6921238261 — catalogue SBI élargi
+
+**Écart** : session de référence UE-201 `5g-session-0bfac1e7ae159a77` → **552 events SBI** dont **416 `UnsupportedSbiOperation`** (76 %). Le classifieur `decoder-sbi::classify()` ne reconnaissait que `Nsmf_PDUSession` sm-contexts + `Namf_Communication` (n1-n2-messages, ue-context).
+
+**Fix** : extension sur les paths 3GPP TS 29.502/29.503/29.509/29.510/29.512/29.518. Fallback `UnsupportedSbiOperation` conservé pour les paths inconnus (aucune inférence silencieuse).
+
+Familles maintenant nommées :
+- **Nsmf_PDUSession** : `CreateSMContext`, `UpdateSMContext`, `ReleaseSMContext`, `RetrieveSMContext`, `CreatePduSession`, `ModifyPduSession`, `ReleasePduSession`.
+- **Namf_Communication** : `N1N2MessageTransfer`, `UEContextTransfer`, `CreateUEContext`, `ReleaseUEContext`.
+- **Namf_EventExposure** : `CreateEventSubscription`, `DeleteEventSubscription`.
+- **Nnrf_NFManagement** : `RegisterNFInstance` (PUT), `UpdateNFInstance` (PATCH), `DeregisterNFInstance` (DELETE), `GetNFInstance` (GET).
+- **Nnrf_NFDiscovery** : `SearchNFInstances`.
+- **Nudm_SDM** : `GetAmData`, `GetSmData`, `GetNssai`, `GetSmfSelectData`, `GetUeContextInSmfData`, `SubscribeDataChange`, `UnsubscribeDataChange`.
+- **Nudm_UECM** : `RegisterAmfForUe`, `RegisterAmfForNon3GppAccess`, `RegisterSmfForUe`, `DeregisterSmfForUe`, `UpdateAmfRegistration`, `DeregisterAmf`.
+- **Nudm_UEAuthentication** : `GenerateAuthData`, `ConfirmAuth`.
+- **Nausf_UEAuthentication** : `UeAuthenticate`, `FiveGAkaConfirmation`, `EapAuthMethod`.
+- **Npcf_AMPolicyControl** : `CreateAmPolicy`, `UpdateAmPolicy`, `DeleteAmPolicy`.
+- **Npcf_SMPolicyControl** : `CreateSmPolicy`, `UpdateSmPolicy`, `DeleteSmPolicy`.
+
+**Règle d'ordre** : la méthode HTTP est consultée AVANT la ressource pour `nudm-uecm/registrations` (PATCH `/amf-3gpp-access` = `UpdateAmfRegistration`, pas `RegisterAmfForUe`). Évite le match silencieux sur `ends_with`.
+
+Clôture ANR2 à PROUVER par relance du run UE-201 sur ce commit : les 416 `UnsupportedSbiOperation` doivent ventiler sur les noms ci-dessus. Paths encore inconnus → fallback explicite conservé.
+
+### `commit_seq` dans `ListRowCache` (Phase 1 contenue)
+
+- Clé de cache étendue : `(len, mtime_ns)` → `(len, mtime_ns, commit_seq)`. Le `commit_seq` lu via `CaptureManager::dataset_commit_seq()` (exposé en 2.20.1).
+- Effet : une publication incrémentale `live-probe 0.6.1` bump `commit_seq.txt` → la ligne de cache s'invalide même si le mtime filesystem (tmpfs/NFS) n'a pas encore été propagé. Les sessions « en cours » deviennent visibles dans la foulée de la publication, sans attendre le rafraîchissement filesystem.
+- Fallback iso-comportement 2.21.x : `commit_seq.txt` absent → `0` → invalidation inchangée.
+
+### Non traités dans 2.21.3 (déclarés OUVERT)
+
+- **Câblage pipeline `LiveInterfaceSource` + `VtapSource`** (demandé en 2.20.2) : le trait + helpers (`to_probe_stamp`, `ingestible_entries`, `try_open`, `packet_statistics_v3`) sont en place. Le câblage effectif dans `CaptureManager::process_continuous_capture_inner` et les watchers associés est un refactor à part entière (changer la source active du continuous path, préserver iso-comportement). **OUVERT 2.21.4+** : dédier un lot spécifique avec contrat d'iso-comportement prouvé avant/après sur dataset de référence.
+- **Bench O1 chiffré (100/500/1000 Mbit/s tp_drops)** : nécessite `CAP_NET_RAW` + générateur pktgen sur bench vProbe. Non exécutable depuis l'hôte de dev (scaffold `benchmarks/live-rx-drops/measure.sh` en place). **OUVERT 2.21.4+** : prouver `drop_ratio ≤ 1e-4` sur le lab.
+- **Tri `frames.sort_by_key` intra-connexion TCP** dans `decoder-sbi::decode_connections` ligne 107 : OUVERT (déjà déclaré en 2.21.2), investigation dédiée pour basculer sur `(packet_number, direction_index, offset)`.
+
+### Tests ajoutés (13 nouveaux)
+
+**`decoder-sbi::tests`** (13) :
+- `classifies_nsmf_create_update_release_retrieve_sm_context`
+- `classifies_nsmf_pdu_sessions_lifecycle`
+- `classifies_namf_communication_n1n2_and_ue_context`
+- `classifies_namf_event_exposure_subscriptions`
+- `classifies_nnrf_nfmanagement_register_update_deregister_get`
+- `classifies_nnrf_discovery_search_nf_instances`
+- `classifies_nudm_sdm_am_sm_nssai_smf_select_and_subscriptions`
+- `classifies_nudm_uecm_registrations_amf_and_smf`
+- `classifies_nudm_ueauthentication_generate_and_confirm`
+- `classifies_nausf_ueauthentication_authenticate_confirm_eap`
+- `classifies_npcf_am_policy_control_create_update_delete`
+- `classifies_npcf_sm_policy_control_create_update_delete`
+- `unknown_sbi_path_still_returns_no_operation` (fallback explicite, aucune inférence silencieuse)
+
+### Invariants préservés
+
+- **Vie privée** : les paths contenant `imsi-…`/`nai-…`/`suci-…` sont sanitisés par `sanitize_uri()` AVANT publication (inchangé depuis 2.18.11). Le classifieur ne mémorise pas la valeur sensible.
+- **Ordre canonique** `(capture_id, packet_number, event_id)` strictement conservé (clôture 2.21.2 inchangée).
+- **Compat 2.21.2** : les noms d'opération déjà émis (`CreateSMContext`, `UpdateSMContext`, `ReleaseSMContext`, `N1N2MessageTransfer`, `UEContextTransfer`) sont identiques. Aucun rename.
+- **Aucune suppression**, **aucun force-push**.
+
+### Audit `Cargo.lock` compatible Rust 1.83 (commande + chiffres)
+
+`cargo fetch` exécuté avant audit (règle Sadok 2026-11-16) :
+
+```bash
+nice -n 19 ionice -c3 cargo fetch --locked 2>&1
+# (sortie et chiffres fetched reportés dans le rapport #10)
+```
+
+Puis audit identique à 2.21.2 (parser Python du lock + lecture `~/.cargo/registry/src/*/Cargo.toml`) :
+
+```
+TOTAL_REGISTRY_PACKAGES_IN_LOCK 105
+NOT_FETCHED_LOCALLY <après cargo fetch — reportés #10>
+EDITION_2024_OR_RUST_GT_1_83_IN_LOCK 0 []
+PINNED_INDEXMAP indexmap-2.13.1
+```
+
+### Lock vTAP
+
+Après hausse `decoder-sbi 0.4.4 → 0.4.5` : `cd OIRAN/vtap && cargo update -w && cargo test --locked` exécuté — chiffres reportés dans le rapport #10.
+
 ## polaris-vtap 2.21.2 — 2026-11-16 — lock vTAP resynchronisé après decoder-sbi 0.4.4 / live-probe 0.6.1 (patch)
 
 - Le lock autonome `OIRAN/vtap/Cargo.lock` référence les crates OIRAN (dev-deps via `oiran-decode`) : la hausse de version de `decoder-sbi` en 2.21.2 rendait `cargo test --locked` impossible dans `OIRAN/vtap`. Corrigé par `cargo update -w`.

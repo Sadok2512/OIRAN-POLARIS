@@ -3297,8 +3297,16 @@ fn journey_signature(state: &AppState) -> Vec<String> {
     signature
 }
 
+/// 2.21.3 — clé de cache étendue avec `commit_seq` (publication
+/// incrémentale live-probe 0.6.1). Composition : `(len, mtime_ns,
+/// commit_seq)`. Change de l'un invalide la ligne — en pratique
+/// `commit_seq` bouge AVANT que le mtime du filesystem (NFS/tmpfs)
+/// ne se propage, donc les UI reçoivent les sessions « en cours »
+/// dans la foulée de la publication, sans attendre le rafraîchissement
+/// mtime. Un `commit_seq.txt` absent → 0, comportement iso-2.20.x.
+type ListRowCacheSignature = (u64, u128, u64);
 type ListRowCache =
-    std::collections::HashMap<(String, String), ((u64, u128), Value, Value)>;
+    std::collections::HashMap<(String, String), (ListRowCacheSignature, Value, Value)>;
 type JourneyCache = Option<(Vec<String>, std::sync::Arc<subscriber_journey::JourneyIndex>)>;
 
 fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::JourneyIndex> {
@@ -3606,10 +3614,18 @@ fn cached_live_list_row(
     // le vault (qui évoluent sans que le fichier change) sont
     // recalculés à chaque requête.
     let key = (dataset.dataset_id.clone(), session_id.clone());
-    let signature = state
+    // 2.21.3 — signature étendue avec `commit_seq` (live-probe 0.6.1).
+    // Un bump de la publication incrémentale invalide la ligne même
+    // si le mtime filesystem n'a pas encore été propagé (tmpfs/NFS).
+    let file_sig = state
         .inner
         .capture_manager
         .callflow_file_signature(&dataset.dataset_id, session_id);
+    let commit_seq = state
+        .inner
+        .capture_manager
+        .dataset_commit_seq(&dataset.dataset_id);
+    let signature: Option<ListRowCacheSignature> = file_sig.map(|(len, mtime)| (len, mtime, commit_seq));
     let cached = signature.and_then(|signature| {
         state.inner.list_row_cache.lock().ok().and_then(|cache| {
             cache

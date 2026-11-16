@@ -1060,11 +1060,22 @@ fn classify(path: Option<&str>, method: Option<&str>) -> (Option<String>, Option
     let Some(path) = path else {
         return (None, None);
     };
+    // 2.21.3 (clôture ANR2 416/552 UnsupportedSbiOperation sur UE-201) —
+    // nommage étendu aux 5 familles NF réellement observées en lab
+    // Open5GS. Les paths proviennent des APIs 3GPP TS 29.502/29.503/
+    // 29.509/29.510/29.512/29.518. Le fallback
+    // `UnsupportedSbiOperation` subsiste pour les paths inconnus
+    // (jamais une inférence silencieuse).
+    //
+    // Nsmf_PDUSession (TS 29.502) — déjà couvert (CreateSMContext,
+    // UpdateSMContext, ReleaseSMContext).
     if path.contains("/nsmf-pdusession/") && path.contains("/sm-contexts") {
         let operation = if path.ends_with("/modify") {
             "UpdateSMContext"
         } else if path.ends_with("/release") {
             "ReleaseSMContext"
+        } else if path.ends_with("/retrieve") {
+            "RetrieveSMContext"
         } else if method == Some("POST") {
             "CreateSMContext"
         } else {
@@ -1072,6 +1083,20 @@ fn classify(path: Option<&str>, method: Option<&str>) -> (Option<String>, Option
         };
         return (Some("Nsmf_PDUSession".into()), Some(operation.into()));
     }
+    // Nsmf_PDUSession — nsmf-pdusession/v1/pdu-sessions/{id}/*
+    if path.contains("/nsmf-pdusession/") && path.contains("/pdu-sessions") {
+        let operation = if path.ends_with("/modify") {
+            "ModifyPduSession"
+        } else if path.ends_with("/release") {
+            "ReleasePduSession"
+        } else if method == Some("POST") {
+            "CreatePduSession"
+        } else {
+            "PduSessionOperation"
+        };
+        return (Some("Nsmf_PDUSession".into()), Some(operation.into()));
+    }
+    // Namf_Communication (TS 29.518).
     if path.contains("/namf-comm/") && path.contains("/n1-n2-messages") {
         return (
             Some("Namf_Communication".into()),
@@ -1079,10 +1104,145 @@ fn classify(path: Option<&str>, method: Option<&str>) -> (Option<String>, Option
         );
     }
     if path.contains("/namf-comm/") && path.contains("ue-context") {
+        let operation = if path.ends_with("/transfer") {
+            "UEContextTransfer"
+        } else if path.ends_with("/release") {
+            "ReleaseUEContext"
+        } else if method == Some("POST") {
+            "CreateUEContext"
+        } else {
+            "UEContextOperation"
+        };
+        return (Some("Namf_Communication".into()), Some(operation.into()));
+    }
+    // Namf_EventExposure.
+    if path.contains("/namf-evts/") && path.contains("/subscriptions") {
+        let operation = if method == Some("POST") {
+            "CreateEventSubscription"
+        } else if method == Some("DELETE") {
+            "DeleteEventSubscription"
+        } else {
+            "EventSubscriptionOperation"
+        };
+        return (Some("Namf_EventExposure".into()), Some(operation.into()));
+    }
+    // Nnrf_NFManagement (TS 29.510) — enregistrements NF.
+    if path.contains("/nnrf-nfm/") && path.contains("/nf-instances") {
+        let operation = match method {
+            Some("PUT") => "RegisterNFInstance",
+            Some("PATCH") => "UpdateNFInstance",
+            Some("DELETE") => "DeregisterNFInstance",
+            Some("GET") => "GetNFInstance",
+            _ => "NFInstanceOperation",
+        };
+        return (Some("Nnrf_NFManagement".into()), Some(operation.into()));
+    }
+    // Nnrf_NFDiscovery.
+    if path.contains("/nnrf-disc/") {
         return (
-            Some("Namf_Communication".into()),
-            Some("UEContextTransfer".into()),
+            Some("Nnrf_NFDiscovery".into()),
+            Some("SearchNFInstances".into()),
         );
+    }
+    // Nudm_SDM (TS 29.503) — Subscriber Data Management.
+    if path.contains("/nudm-sdm/") {
+        let op = if path.contains("/am-data") {
+            "GetAmData"
+        } else if path.contains("/sm-data") {
+            "GetSmData"
+        } else if path.contains("/smf-select-data") {
+            "GetSmfSelectData"
+        } else if path.contains("/ue-context-in-smf-data") {
+            "GetUeContextInSmfData"
+        } else if path.contains("/nssai") {
+            "GetNssai"
+        } else if path.contains("/sdm-subscriptions") {
+            if method == Some("POST") {
+                "SubscribeDataChange"
+            } else if method == Some("DELETE") {
+                "UnsubscribeDataChange"
+            } else {
+                "SdmSubscriptionOperation"
+            }
+        } else {
+            "SdmOperation"
+        };
+        return (Some("Nudm_SDM".into()), Some(op.into()));
+    }
+    // Nudm_UECM — UE Context Management (TS 29.503). La méthode
+    // est consultée AVANT la ressource : PATCH `/amf-3gpp-access`
+    // est un UpdateAmfRegistration, pas un RegisterAmfForUe.
+    if path.contains("/nudm-uecm/") && path.contains("/registrations") {
+        let op = if path.contains("/smf-registrations") {
+            if method == Some("PUT") {
+                "RegisterSmfForUe"
+            } else if method == Some("DELETE") {
+                "DeregisterSmfForUe"
+            } else {
+                "SmfRegistrationOperation"
+            }
+        } else if method == Some("PATCH") {
+            "UpdateAmfRegistration"
+        } else if method == Some("DELETE") {
+            "DeregisterAmf"
+        } else if path.ends_with("/amf-3gpp-access") {
+            "RegisterAmfForUe"
+        } else if path.ends_with("/amf-non-3gpp-access") {
+            "RegisterAmfForNon3GppAccess"
+        } else {
+            "UecmRegistrationOperation"
+        };
+        return (Some("Nudm_UECM".into()), Some(op.into()));
+    }
+    // Nudm_UEAuthentication (TS 29.503).
+    if path.contains("/nudm-ueau/") {
+        let op = if path.contains("/security-information/generate-auth-data") {
+            "GenerateAuthData"
+        } else if path.contains("/auth-events") {
+            "ConfirmAuth"
+        } else {
+            "UeauOperation"
+        };
+        return (Some("Nudm_UEAuthentication".into()), Some(op.into()));
+    }
+    // Nausf_UEAuthentication (TS 29.509).
+    if path.contains("/nausf-auth/") && path.contains("/ue-authentications") {
+        let op = if path.ends_with("/5g-aka-confirmation") {
+            "FiveGAkaConfirmation"
+        } else if path.ends_with("/eap-session") {
+            "EapAuthMethod"
+        } else if method == Some("POST") {
+            "UeAuthenticate"
+        } else {
+            "UeAuthenticationOperation"
+        };
+        return (Some("Nausf_UEAuthentication".into()), Some(op.into()));
+    }
+    // Npcf_AMPolicyControl (TS 29.507).
+    if path.contains("/npcf-am-policy-control/") && path.contains("/policies") {
+        let op = if path.ends_with("/update") {
+            "UpdateAmPolicy"
+        } else if path.ends_with("/delete") {
+            "DeleteAmPolicy"
+        } else if method == Some("POST") {
+            "CreateAmPolicy"
+        } else {
+            "AmPolicyOperation"
+        };
+        return (Some("Npcf_AMPolicyControl".into()), Some(op.into()));
+    }
+    // Npcf_SMPolicyControl (TS 29.512).
+    if path.contains("/npcf-smpolicycontrol/") && path.contains("/sm-policies") {
+        let op = if path.ends_with("/update") {
+            "UpdateSmPolicy"
+        } else if path.ends_with("/delete") {
+            "DeleteSmPolicy"
+        } else if method == Some("POST") {
+            "CreateSmPolicy"
+        } else {
+            "SmPolicyOperation"
+        };
+        return (Some("Npcf_SMPolicyControl".into()), Some(op.into()));
     }
     (service_from_path(path), None)
 }
@@ -1540,6 +1700,293 @@ mod tests {
                 .as_deref(),
             Some("CreateSMContext")
         );
+    }
+
+    // 2.21.3 — Catalogue SBI élargi (clôture ANR2 #10 6921238261 :
+    // 416/552 UnsupportedSbiOperation sur UE-201). Un test par
+    // opération pour prouver qu'elle n'est plus classée
+    // UnsupportedSbiOperation. Les paths viennent des APIs 3GPP
+    // TS 29.502/29.503/29.509/29.510/29.512/29.518.
+
+    fn classified(path: &str, method: &str) -> (Option<String>, Option<String>) {
+        classify(Some(path), Some(method))
+    }
+
+    #[test]
+    fn classifies_nsmf_create_update_release_retrieve_sm_context() {
+        let (svc, op) = classified("/nsmf-pdusession/v1/sm-contexts", "POST");
+        assert_eq!(svc.as_deref(), Some("Nsmf_PDUSession"));
+        assert_eq!(op.as_deref(), Some("CreateSMContext"));
+        assert_eq!(
+            classified("/nsmf-pdusession/v1/sm-contexts/4/modify", "POST").1.as_deref(),
+            Some("UpdateSMContext")
+        );
+        assert_eq!(
+            classified("/nsmf-pdusession/v1/sm-contexts/4/release", "POST").1.as_deref(),
+            Some("ReleaseSMContext")
+        );
+        assert_eq!(
+            classified("/nsmf-pdusession/v1/sm-contexts/4/retrieve", "POST").1.as_deref(),
+            Some("RetrieveSMContext")
+        );
+    }
+
+    #[test]
+    fn classifies_nsmf_pdu_sessions_lifecycle() {
+        assert_eq!(
+            classified("/nsmf-pdusession/v1/pdu-sessions", "POST").1.as_deref(),
+            Some("CreatePduSession")
+        );
+        assert_eq!(
+            classified("/nsmf-pdusession/v1/pdu-sessions/42/modify", "POST").1.as_deref(),
+            Some("ModifyPduSession")
+        );
+        assert_eq!(
+            classified("/nsmf-pdusession/v1/pdu-sessions/42/release", "POST").1.as_deref(),
+            Some("ReleasePduSession")
+        );
+    }
+
+    #[test]
+    fn classifies_namf_communication_n1n2_and_ue_context() {
+        assert_eq!(
+            classified("/namf-comm/v1/ue-contexts/0/n1-n2-messages", "POST").1.as_deref(),
+            Some("N1N2MessageTransfer")
+        );
+        let (svc, op) = classified("/namf-comm/v1/ue-contexts/42/transfer", "POST");
+        assert_eq!(svc.as_deref(), Some("Namf_Communication"));
+        assert_eq!(op.as_deref(), Some("UEContextTransfer"));
+        assert_eq!(
+            classified("/namf-comm/v1/ue-contexts/42/release", "POST").1.as_deref(),
+            Some("ReleaseUEContext")
+        );
+        assert_eq!(
+            classified("/namf-comm/v1/ue-contexts", "POST").1.as_deref(),
+            Some("CreateUEContext")
+        );
+    }
+
+    #[test]
+    fn classifies_namf_event_exposure_subscriptions() {
+        let (svc, op) = classified("/namf-evts/v1/subscriptions", "POST");
+        assert_eq!(svc.as_deref(), Some("Namf_EventExposure"));
+        assert_eq!(op.as_deref(), Some("CreateEventSubscription"));
+        assert_eq!(
+            classified("/namf-evts/v1/subscriptions/123", "DELETE").1.as_deref(),
+            Some("DeleteEventSubscription")
+        );
+    }
+
+    #[test]
+    fn classifies_nnrf_nfmanagement_register_update_deregister_get() {
+        let (svc, op) = classified("/nnrf-nfm/v1/nf-instances/abcdef", "PUT");
+        assert_eq!(svc.as_deref(), Some("Nnrf_NFManagement"));
+        assert_eq!(op.as_deref(), Some("RegisterNFInstance"));
+        assert_eq!(
+            classified("/nnrf-nfm/v1/nf-instances/abcdef", "PATCH").1.as_deref(),
+            Some("UpdateNFInstance")
+        );
+        assert_eq!(
+            classified("/nnrf-nfm/v1/nf-instances/abcdef", "DELETE").1.as_deref(),
+            Some("DeregisterNFInstance")
+        );
+        assert_eq!(
+            classified("/nnrf-nfm/v1/nf-instances/abcdef", "GET").1.as_deref(),
+            Some("GetNFInstance")
+        );
+    }
+
+    #[test]
+    fn classifies_nnrf_discovery_search_nf_instances() {
+        let (svc, op) = classified(
+            "/nnrf-disc/v1/nf-instances?target-nf-type=SMF&requester-nf-type=AMF",
+            "GET",
+        );
+        assert_eq!(svc.as_deref(), Some("Nnrf_NFDiscovery"));
+        assert_eq!(op.as_deref(), Some("SearchNFInstances"));
+    }
+
+    #[test]
+    fn classifies_nudm_sdm_am_sm_nssai_smf_select_and_subscriptions() {
+        assert_eq!(
+            classified("/nudm-sdm/v2/imsi-001010000000201/am-data", "GET").1.as_deref(),
+            Some("GetAmData")
+        );
+        assert_eq!(
+            classified("/nudm-sdm/v2/imsi-001010000000201/sm-data", "GET").1.as_deref(),
+            Some("GetSmData")
+        );
+        assert_eq!(
+            classified("/nudm-sdm/v2/imsi-001010000000201/nssai", "GET").1.as_deref(),
+            Some("GetNssai")
+        );
+        assert_eq!(
+            classified("/nudm-sdm/v2/imsi-001010000000201/smf-select-data", "GET").1.as_deref(),
+            Some("GetSmfSelectData")
+        );
+        assert_eq!(
+            classified(
+                "/nudm-sdm/v2/imsi-001010000000201/ue-context-in-smf-data",
+                "GET"
+            )
+            .1
+            .as_deref(),
+            Some("GetUeContextInSmfData")
+        );
+        assert_eq!(
+            classified("/nudm-sdm/v2/imsi-001010000000201/sdm-subscriptions", "POST")
+                .1
+                .as_deref(),
+            Some("SubscribeDataChange")
+        );
+        assert_eq!(
+            classified("/nudm-sdm/v2/imsi-001010000000201/sdm-subscriptions/42", "DELETE")
+                .1
+                .as_deref(),
+            Some("UnsubscribeDataChange")
+        );
+    }
+
+    #[test]
+    fn classifies_nudm_uecm_registrations_amf_and_smf() {
+        assert_eq!(
+            classified(
+                "/nudm-uecm/v1/imsi-001010000000201/registrations/amf-3gpp-access",
+                "PUT"
+            )
+            .1
+            .as_deref(),
+            Some("RegisterAmfForUe")
+        );
+        assert_eq!(
+            classified(
+                "/nudm-uecm/v1/imsi-001010000000201/registrations/amf-non-3gpp-access",
+                "PUT"
+            )
+            .1
+            .as_deref(),
+            Some("RegisterAmfForNon3GppAccess")
+        );
+        assert_eq!(
+            classified(
+                "/nudm-uecm/v1/imsi-001010000000201/registrations/smf-registrations/1",
+                "PUT"
+            )
+            .1
+            .as_deref(),
+            Some("RegisterSmfForUe")
+        );
+        assert_eq!(
+            classified(
+                "/nudm-uecm/v1/imsi-001010000000201/registrations/smf-registrations/1",
+                "DELETE"
+            )
+            .1
+            .as_deref(),
+            Some("DeregisterSmfForUe")
+        );
+        assert_eq!(
+            classified(
+                "/nudm-uecm/v1/imsi-001010000000201/registrations/amf-3gpp-access",
+                "PATCH"
+            )
+            .1
+            .as_deref(),
+            Some("UpdateAmfRegistration")
+        );
+    }
+
+    #[test]
+    fn classifies_nudm_ueauthentication_generate_and_confirm() {
+        assert_eq!(
+            classified(
+                "/nudm-ueau/v1/imsi-001010000000201/security-information/generate-auth-data",
+                "POST"
+            )
+            .1
+            .as_deref(),
+            Some("GenerateAuthData")
+        );
+        assert_eq!(
+            classified(
+                "/nudm-ueau/v1/imsi-001010000000201/auth-events",
+                "POST"
+            )
+            .1
+            .as_deref(),
+            Some("ConfirmAuth")
+        );
+    }
+
+    #[test]
+    fn classifies_nausf_ueauthentication_authenticate_confirm_eap() {
+        let (svc, op) = classified("/nausf-auth/v1/ue-authentications", "POST");
+        assert_eq!(svc.as_deref(), Some("Nausf_UEAuthentication"));
+        assert_eq!(op.as_deref(), Some("UeAuthenticate"));
+        assert_eq!(
+            classified(
+                "/nausf-auth/v1/ue-authentications/ctxid/5g-aka-confirmation",
+                "PUT"
+            )
+            .1
+            .as_deref(),
+            Some("FiveGAkaConfirmation")
+        );
+        assert_eq!(
+            classified("/nausf-auth/v1/ue-authentications/ctxid/eap-session", "POST")
+                .1
+                .as_deref(),
+            Some("EapAuthMethod")
+        );
+    }
+
+    #[test]
+    fn classifies_npcf_am_policy_control_create_update_delete() {
+        assert_eq!(
+            classified("/npcf-am-policy-control/v1/policies", "POST").1.as_deref(),
+            Some("CreateAmPolicy")
+        );
+        assert_eq!(
+            classified("/npcf-am-policy-control/v1/policies/42/update", "POST")
+                .1
+                .as_deref(),
+            Some("UpdateAmPolicy")
+        );
+        assert_eq!(
+            classified("/npcf-am-policy-control/v1/policies/42/delete", "POST")
+                .1
+                .as_deref(),
+            Some("DeleteAmPolicy")
+        );
+    }
+
+    #[test]
+    fn classifies_npcf_sm_policy_control_create_update_delete() {
+        assert_eq!(
+            classified("/npcf-smpolicycontrol/v1/sm-policies", "POST").1.as_deref(),
+            Some("CreateSmPolicy")
+        );
+        assert_eq!(
+            classified("/npcf-smpolicycontrol/v1/sm-policies/42/update", "POST")
+                .1
+                .as_deref(),
+            Some("UpdateSmPolicy")
+        );
+        assert_eq!(
+            classified("/npcf-smpolicycontrol/v1/sm-policies/42/delete", "POST")
+                .1
+                .as_deref(),
+            Some("DeleteSmPolicy")
+        );
+    }
+
+    /// 2.21.3 — fallback : un path totalement inconnu reste bien
+    /// non-classé (operation None → message_name
+    /// UnsupportedSbiOperation). Pas d'invention silencieuse.
+    #[test]
+    fn unknown_sbi_path_still_returns_no_operation() {
+        let (_svc, op) = classified("/this-does-not-exist/v1/foo", "GET");
+        assert!(op.is_none());
     }
     fn test_key() -> PseudonymKey {
         PseudonymKey::from_bytes([0x55; 32])
