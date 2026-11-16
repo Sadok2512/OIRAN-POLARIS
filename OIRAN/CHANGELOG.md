@@ -62,6 +62,55 @@ Le `ts` ne participe plus à aucune décision d'ordre. Les 22 tests existants `d
 - **Aucune suppression** : pas de code retiré, pas de force-push.
 - **Serveur basse priorité** : `nice -n 19 ionice -c3 cargo … -j 2 flock heavy-build.lock`.
 
+### Audit `Cargo.lock` compatible Rust 1.83 (commande + chiffres)
+
+Base du merge inclut déjà `1cf8bd0` (ANR2 pin `indexmap 2.13.1`). Vérification de ma livraison avec sa commande :
+
+```bash
+python3 - << 'PY'
+import re, os
+path = "OIRAN/Cargo.lock"
+text = open(path).read()
+blocks = text.split("[[package]]")
+pkgs = []
+for block in blocks[1:]:
+    name = re.search(r'^name\s*=\s*"([^"]+)"', block, re.M)
+    version = re.search(r'^version\s*=\s*"([^"]+)"', block, re.M)
+    source = re.search(r'^source\s*=\s*"([^"]+)"', block, re.M)
+    if name and version:
+        pkgs.append((name.group(1), version.group(1), source.group(1) if source else ""))
+registry = [p for p in pkgs if p[2].startswith("registry")]
+suspects, not_fetched = [], 0
+for n, v, _ in registry:
+    manifest = f"{os.path.expanduser('~')}/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/{n}-{v}/Cargo.toml"
+    if not os.path.exists(manifest):
+        not_fetched += 1; continue
+    c = open(manifest).read()
+    e2024 = re.search(r'^edition\s*=\s*"2024"', c, re.M)
+    rvr = re.search(r'^rust-version\s*=\s*"([^"]+)"', c, re.M)
+    rv_hi = False
+    if rvr:
+        parts = rvr.group(1).split('.')
+        try:
+            if (int(parts[0]), int(parts[1]) if len(parts)>1 else 0) > (1,83):
+                rv_hi = True
+        except Exception: pass
+    if e2024 or rv_hi: suspects.append(f"{n}-{v}")
+print(f"TOTAL_REGISTRY_PACKAGES_IN_LOCK {len(registry)}")
+print(f"NOT_FETCHED_LOCALLY {not_fetched}")
+print(f"EDITION_2024_OR_RUST_GT_1_83_IN_LOCK {len(suspects)} {suspects}")
+for n,v,_ in registry:
+    if n == "indexmap": print(f"PINNED_INDEXMAP {n}-{v}")
+PY
+# Résultat sur ce commit :
+# TOTAL_REGISTRY_PACKAGES_IN_LOCK 105
+# NOT_FETCHED_LOCALLY 19
+# EDITION_2024_OR_RUST_GT_1_83_IN_LOCK 0 []
+# PINNED_INDEXMAP indexmap-2.13.1
+```
+
+**Chiffres mesurés** : 105 crates registry, 0 en edition 2024, 0 avec rust-version > 1.83 sur les 86 manifests disponibles localement, `indexmap-2.13.1` conservé. **OUVERT** : 19 crates ne sont pas fetchées sur cet hôte de dev (rust-version/edition non vérifiée depuis Cargo.toml) ; la preuve finale en 1.83 reste la build `--locked` sur le lab (règle 2.21.1 inchangée).
+
 ## OIRAN API 2.21.1 — 2026-11-16 — lock du workspace OIRAN compatible Rust 1.83 (patch)
 
 Rapport ANR2 #10 6921899654 : le lock `OIRAN/Cargo.lock` contenait `indexmap 2.14.2` (edition2024, Rust ≥ 1.85), tiré par `toml` depuis la 2.20.0. Le workspace ne compilait donc pas avec le Cargo 1.83 du lab : 2.20.0, 2.20.1 et 2.21.0 sont concernées.
