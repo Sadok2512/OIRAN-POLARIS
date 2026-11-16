@@ -1,5 +1,61 @@
 # Changelog
 
+## OIRAN API 2.21.11 — 2026-11-16 — SBI classifier : 30 opérations ANR1 réelles (clôture défaut 1 2.21.10)
+
+Lot sur `fix/oiran-2.21.10-analyzer` (à merger ensuite dans `feat/oiran-2.22.0-userplane`). Ferme le défaut 1 de 2.21.10 (#9 6929162657) avec la spec #9 6930117150 et le tableau op→n ANR1 (#10 6929768219).
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.10 | **2.21.11** |
+| `decoder-sbi` | 0.4.6 | **0.4.7** |
+
+### Classifier étendu — 14 nouvelles entrées pour les 30 ops ANR1
+
+Les 30 opérations extraites par ANR1 sur `5g-session-0bfac1e7ae159a77` (696/696, chemins anonymisés) sont désormais classifiées. Sur ces 30, 16 étaient déjà couvertes par le catalogue 2.21.3/2.21.4 (Nudm_SDM, Nudm_UECM, Nudm_UEAuthentication, Nausf_UEAuthentication, Npcf_AMPolicyControl, Npcf_SMPolicyControl). **14 nouvelles entrées** ajoutées :
+
+- **Nbsf_Management** (TS 29.521) : `/nbsf-management/.../pcfBindings` → `Register` / `Deregister` / `Update` / `Discovery`.
+- **Namf_Communication** (TS 29.518) : `/namf-callback/.../sm-context-status/{id}` → `SMContextStatusNotify`.
+- **Nudr_DataRepository** (TS 29.504/29.505) : 12 variantes (policy-data/ues, subscription-data/{authentication-data/context-data/provisioned-data}).
+
+### Test paramétrique — un assert par ligne du tableau (30 lignes)
+
+`decoder-sbi::tests::classifies_all_30_anr1_sbi_operations_as_non_unsupported` — pour chaque `(method, path, expected_service, expected_operation)` des 30 lignes ANR1, vérifie que `classify()` retourne `(Some(expected_service), Some(expected_operation))`. Un échec fait échouer le test avec la liste des cas en défaut.
+
+**Run initial 2.21.10** : 14 échecs. **Après 2.21.11** : 0 échec.
+
+### Critère d'acceptation lab
+
+**`UnsupportedSbiOperation = 0` sur `5g-session-0bfac1e7ae159a77` après redécodage** :
+
+```bash
+jq -r 'select(.protocol=="SBI-HTTP2" and (.message_name|startswith("UnsupportedSbiOperation"))) | .sbi.request_uri' \
+  /chemin/oiran_events.jsonl | wc -l
+```
+
+Attendu **0**. Si > 0 : répartition résiduelle en 2.21.12.
+
+### Note — `decoded_ie_tree` vs `information_elements` (constat ANR1 #9 6930117150)
+
+Voulu : le modèle `CallFlowEvent` (crate `callflow-schema`) stocke un **arbre aplati** `decoded_ie_tree` qui mélange `information_elements` + `session_identifiers` d'origine (`callflow-schema/src/lib.rs:53` `decoded_tree_with_identifiers`). Les consommateurs internes lisent déjà `decoded_ie_tree` : `session_catalog::ProtocolTreeBuilder::observe_event` l. 537, `hydrate_identities` chaîne via `event.decoded_ie_tree` (l. 5679/5775), filtre l. 4286-4299. La route packets `GET /api/v1/.../packets` (l. 6316) réalias ce tree en `information_elements` pour l'UI historique. **À documenter côté README API en 2.21.12.**
+
+### Note — défaut 4 CPU 65 % (hypothèse Sadok #9 6930117150)
+
+`MemoryMax=4294967296` = `MemoryPeak` : Analyzer collé au plafond. Le 65 % CPU au repos peut venir de la **récupération mémoire sous plafond** (allocator / page reclaim). À confirmer par `perf top` / `smem` sur lab avant tout fix. Instrumentation `CONTINUOUS_IDLE_LOOP_TRACE` déjà en place depuis 2.21.10 complète les métriques.
+
+### Tests
+
+```bash
+cargo test -p decoder-sbi --lib --locked        # 38 passed (était 37 → +1 test paramétrique)
+cargo test -p oiran-api   --lib --locked        # 160 passed, 3 ignored
+cd OIRAN/vtap && cargo update -w && cargo test --locked   # 12 + 3 integration passed
+```
+
+### Suite
+
+Merge immédiat dans `feat/oiran-2.22.0-userplane`. Reprise P2 **2.22.5** uniquement après **PASS 2.21.11 lab** (critère `UnsupportedSbiOperation = 0`) ET retour `CONTINUOUS_IDLE_LOOP_TRACE` d'ANR1 sur défaut 4.
+
 ## OIRAN API 2.21.10 — 2026-11-16 — 4 défauts Analyzer prod (patch, PRIORITÉ #9 6929162657 + #9 6929676898)
 
 Lot urgent ANR1/ANR2 lab (base `413417a`, branche `fix/oiran-2.21.10-analyzer`, à merger ensuite dans `feat/oiran-2.22.0-userplane`). Aucun travail P2 dans ce lot.
