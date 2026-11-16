@@ -1592,10 +1592,14 @@ fn pfcp_event_matches(
 /// 2.15.4 gardait tous les events PFCP complets en mémoire → OOM à 4 Gio
 /// (MemoryMax) au premier /events en prod (ANR1 #10 6895136076). Les
 /// quelques lignes qui correspondent sont relues sur disque à la demande.
+#[derive(Clone)]
 pub struct PfcpIndex {
     files: Vec<PathBuf>,
     by_key: std::collections::HashMap<String, Vec<(u32, u64)>>,
     entries: usize,
+    /// 2.18.10 — octets déjà indexés par fichier (même ordre que `files`),
+    /// toujours en fin de ligne complète.
+    scanned: Vec<u64>,
 }
 
 impl PfcpIndex {
@@ -1690,54 +1694,100 @@ pub fn cached_pfcp_index(dataset_root: &Path) -> Result<std::sync::Arc<PfcpIndex
     if let Some(index) = lookup(&signature) {
         return Ok(index);
     }
-    let mut files = Vec::new();
-    let mut by_key: std::collections::HashMap<String, Vec<(u32, u64)>> =
-        std::collections::HashMap::new();
-    let mut entries = 0usize;
-    for (file_idx, (path, _, _)) in signature.iter().enumerate() {
-        files.push(path.clone());
-        let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
-        let mut reader = BufReader::new(file);
-        let mut offset = 0u64;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = std::io::BufRead::read_line(&mut reader, &mut line)
-                .map_err(|error| error.to_string())?;
-            if read == 0 {
-                break;
+    // 2.18.10 (ANR2 #10 : 1er /callflow 19,7 s) — le dataset continuous
+    // est en append : la signature (taille, mtime) change à chaque lot
+    // publié et l'index était reconstruit EN ENTIER (relecture de tout le
+    // JSONL). Désormais on reprend l'index précédent et on n'indexe que
+    // les octets ajoutés ; reconstruction complète seulement si un
+    // fichier a rétréci (rotation / réécriture).
+    let previous = PFCP_EVENT_CACHE
+        .lock()
+        .ok()
+        .and_then(|mut cache| cache.remove(dataset_root))
+        .map(|(_, index)| std::sync::Arc::try_unwrap(index).unwrap_or_else(|shared| (*shared).clone()));
+    let mut index = match previous {
+        Some(previous) if pfcp_index_can_extend(&previous, &signature) => previous,
+        _ => PfcpIndex {
+            files: Vec::new(),
+            by_key: std::collections::HashMap::new(),
+            entries: 0,
+            scanned: Vec::new(),
+        },
+    };
+    for (path, _, _) in &signature {
+        let file_idx = match index.files.iter().position(|known| known == path) {
+            Some(position) => position,
+            None => {
+                index.files.push(path.clone());
+                index.scanned.push(0);
+                index.files.len() - 1
             }
-            let start = offset;
-            offset += read as u64;
-            if !line.contains("\"protocol\":\"PFCP\"") {
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
-                continue;
-            };
-            let keys = pfcp_keys(&value);
-            drop(value);
-            if keys.is_empty() {
-                continue;
-            }
-            entries += 1;
-            for key in keys {
-                by_key
-                    .entry(key)
-                    .or_default()
-                    .push((file_idx as u32, start));
-            }
-        }
+        };
+        let from = index.scanned[file_idx];
+        let (scanned, added) = scan_pfcp_file(path, file_idx as u32, from, &mut index.by_key)?;
+        index.scanned[file_idx] = scanned;
+        index.entries += added;
     }
-    let index = std::sync::Arc::new(PfcpIndex {
-        files,
-        by_key,
-        entries,
-    });
+    let index = std::sync::Arc::new(index);
     if let Ok(mut cache) = PFCP_EVENT_CACHE.lock() {
         cache.insert(dataset_root.to_path_buf(), (signature, index.clone()));
     }
     Ok(index)
+}
+
+/// Un index peut être étendu si aucun fichier déjà indexé n'a rétréci
+/// ni disparu.
+fn pfcp_index_can_extend(index: &PfcpIndex, signature: &[(PathBuf, u64, u128)]) -> bool {
+    index.files.iter().zip(&index.scanned).all(|(path, scanned)| {
+        signature
+            .iter()
+            .find(|(candidate, _, _)| candidate == path)
+            .is_some_and(|(_, len, _)| len >= scanned)
+    })
+}
+
+/// Indexe les lignes PFCP complètes de `path` à partir de l'octet `from`.
+/// Retourne (nouvel octet de reprise, nombre d'events PFCP indexés). Une
+/// dernière ligne sans `\n` (écriture en cours) n'est pas consommée.
+fn scan_pfcp_file(
+    path: &Path,
+    file_idx: u32,
+    from: u64,
+    by_key: &mut std::collections::HashMap<String, Vec<(u32, u64)>>,
+) -> Result<(u64, usize), String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(from)).map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut offset = from;
+    let mut added = 0usize;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = std::io::BufRead::read_line(&mut reader, &mut line)
+            .map_err(|error| error.to_string())?;
+        if read == 0 || !line.ends_with('\n') {
+            break;
+        }
+        let start = offset;
+        offset += read as u64;
+        if !line.contains("\"protocol\":\"PFCP\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
+            continue;
+        };
+        let keys = pfcp_keys(&value);
+        drop(value);
+        if keys.is_empty() {
+            continue;
+        }
+        added += 1;
+        for key in keys {
+            by_key.entry(key).or_default().push((file_idx, start));
+        }
+    }
+    Ok((offset, added))
 }
 
 /// Relit sur disque les events PFCP qui partagent une clé connue.
@@ -2717,6 +2767,41 @@ mod callflow_pfcp_insert_tests {
 mod pfcp_interface_guard_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pfcp_index_extends_on_append_and_skips_a_partial_last_line() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("rtp-inc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oiran_events.jsonl");
+        let line = |id: &str, seq: &str| {
+            json!({"event_id":id,"protocol":"PFCP","interface":"N4","message_name":"PFCP Session Establishment Request",
+                "pfcp_sequence":seq}).to_string()
+        };
+        std::fs::write(&path, format!("{}\n", line("e1", "1"))).unwrap();
+        let first = cached_pfcp_index(&dir).unwrap();
+        assert_eq!(first.entries(), 1);
+        let scanned_before = first.scanned[0];
+        drop(first);
+        // ajout d'une ligne complète + d'une ligne en cours d'écriture
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{}\n{}", line("e2", "2"), &line("e3", "3")[..20]).unwrap();
+        drop(file);
+        let second = cached_pfcp_index(&dir).unwrap();
+        assert_eq!(second.entries(), 2, "seule la ligne complète est indexée");
+        assert!(second.scanned[0] > scanned_before);
+        let found = pfcp_events_for_keys(&second, &["seq:2".to_string()].into_iter().collect());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["event_id"], "e2");
+        drop(second);
+        // rotation : fichier réécrit plus court → reconstruction complète
+        std::fs::write(&path, format!("{}\n", line("e9", "9"))).unwrap();
+        let third = cached_pfcp_index(&dir).unwrap();
+        assert_eq!(third.entries(), 1);
+        assert_eq!(pfcp_events_for_keys(&third, &["seq:9".to_string()].into_iter().collect()).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn pfcp_heartbeat_sharing_the_sequence_is_never_pulled_into_a_session() {

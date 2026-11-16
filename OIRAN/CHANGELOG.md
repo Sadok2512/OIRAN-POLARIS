@@ -1,5 +1,11 @@
 # Changelog
 
+## OIRAN API 2.18.10 — 2026-11-16 — Live dans l'ordre + 1er ladder rapide (patch)
+
+- Live (ANR2 #10 6902524402 : 24/55 messages `late`) : le lecteur Live collecte les nouveaux events de chaque passe de décodage et les route triés par `(packet_number, event_id)` — le décodeur émet dans l'ordre de reconstruction (réassemblage SCTP / HTTP/2). `late` reste compté et marqué pour un message arrivé à une passe ultérieure. Test `a_batch_decoded_out_of_order_is_routed_without_late_messages`.
+- Ladder (ANR2 : 1er `/callflow` 19,7 s) : l'index PFCP d'un dataset continuous était reconstruit en entier à chaque lot publié (la signature taille/mtime change en append). Il est désormais **étendu** depuis l'octet déjà indexé ; reconstruction complète uniquement si un fichier rétrécit ; une dernière ligne incomplète n'est pas consommée. Test `pfcp_index_extends_on_append_and_skips_a_partial_last_line`.
+- Corrélation SBI pseudonyme-seul (2.18.7) : vérifié — elle rattache les events sans créer d'edge, donc `N2_SBI` / `SBI_N4` ne passent jamais EXACT sur ce seul lien.
+
 ## OIRAN API 2.18.9 — 2026-11-16 — Participants LTE résolus par rôle d'interface (patch)
 
 - Constat Sadok (ladder d'une session LTE : une seule colonne « Unknown endpoint ») : les sessions du LTE evidence store n'ont pas de JSONL raw, le patch IP/port ne peut rien résoudre.

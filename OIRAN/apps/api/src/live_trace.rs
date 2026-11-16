@@ -244,6 +244,23 @@ impl LiveTraceRegistry {
     }
 }
 
+/// 2.18.10 — ordre canonique intra-capture d'un lot d'events :
+/// (packet_number du premier paquet, event_id). Tri stable.
+fn sort_by_capture_order(events: &mut [event_schema::NormalizedEvent]) {
+    events.sort_by(|a, b| {
+        let packet = |event: &event_schema::NormalizedEvent| {
+            event
+                .packet_references
+                .first()
+                .map(|reference| reference.packet_number)
+                .unwrap_or(u64::MAX)
+        };
+        packet(a)
+            .cmp(&packet(b))
+            .then_with(|| a.event_id.cmp(&b.event_id))
+    });
+}
+
 fn start_reader(state: AppState) {
     if state
         .inner
@@ -315,12 +332,24 @@ fn start_reader(state: AppState) {
                             interface: interface.into(),
                             endpoints: HashMap::new(),
                         };
+                        // 2.18.10 (ANR2 #10 6902524402 : 24/55 messages `late`) —
+                        // le décodeur émet dans l'ordre de RECONSTRUCTION
+                        // (réassemblage SCTP / flux HTTP/2 : un message
+                        // complet peut sortir après des paquets plus
+                        // récents). On collecte les nouveaux events d'une
+                        // passe et on les route triés par packet_number
+                        // (ordre canonique intra-capture), puis event_id.
+                        let mut fresh = Vec::new();
                         let _ = oiran_decode::decode_capture_streaming(&config, &key, |event| {
                             if prior.insert(event.event_id.clone()) {
-                                state2.inner.live_traces.route_normalized(&event);
+                                fresh.push(event);
                             }
                             Ok(())
                         });
+                        sort_by_capture_order(&mut fresh);
+                        for event in &fresh {
+                            state2.inner.live_traces.route_normalized(event);
+                        }
                         if prior.len() > 200_000 {
                             prior.clear();
                         }
@@ -892,6 +921,46 @@ mod tests {
         assert!(!traces["t"].trace.armed);
         assert_eq!(traces["t"].trace.messages, 1);
         assert!(!traces["t"].keys.is_empty());
+    }
+
+    /// 2.18.10 — un lot décodé dans le désordre de reconstruction est
+    /// routé dans l'ordre des paquets : 0 `late`.
+    #[test]
+    fn a_batch_decoded_out_of_order_is_routed_without_late_messages() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        let config = oiran_decode::DecodeConfig {
+            input: source,
+            capture_id: format!("sha256:{}", "d".repeat(64)),
+            interface: "N2".into(),
+            endpoints: HashMap::new(),
+        };
+        let key = event_schema::PseudonymKey::from_bytes([9; 32]);
+        let mut events = Vec::new();
+        oiran_decode::decode_capture_streaming(&config, &key, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        let mut tagged: Vec<_> = events
+            .into_iter()
+            .filter(|event| !event.session_identifiers.is_empty())
+            .collect();
+        assert!(tagged.len() >= 3);
+        let root = tagged[0].session_identifiers[0].value.clone();
+        tagged.reverse(); // pire cas : ordre de reconstruction inversé
+        sort_by_capture_order(&mut tagged);
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, true, vec![root]));
+        for event in &tagged {
+            r.route_normalized(event);
+        }
+        let traces = r.traces.lock().unwrap();
+        assert!(traces["t"].trace.messages >= 1);
+        assert_eq!(traces["t"].trace.out_of_order, 0);
     }
 
     /// 2.18.6 (ANR1 #10 6901968948) — un message routé deux fois n'est
