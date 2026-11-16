@@ -1,14 +1,16 @@
 # Changelog
 
-## OIRAN API 2.21.1 — 2026-11-16 — Câblage VtapSource + ProbeStamp + fix decoder-sbi tri canonique (patch)
+## OIRAN API 2.21.2 — 2026-11-16 — Câblage VtapSource + ProbeStamp + fix decoder-sbi tri canonique (patch)
 
 Lot C.3 validé Sadok #10. Câblage effectif du moteur `vtap` de la 2.21.0 dans la fondation `CaptureSource`, clôture de l'écart OUVERT `decoder-sbi::decode_connections` qui triait les events par `ts` (interdit par la règle canonique OIRAN).
+
+**Collision de numérotation** : 2.21.1 a été prise en parallèle par ANR2 pour le patch Rust 1.83 (indexmap 2.13.1, cf. entrée ci-dessous) + polaris-vtap. Pas de force-push, pas de ré-écriture d'historique : ce lot avance en **2.21.2**.
 
 ### Composants et versions (incrément de chaque crate touché)
 
 | Composant | Avant | Après | Type |
 |---|---|---|---|
-| `oiran-api` | 2.21.0 | **2.21.1** | patch |
+| `oiran-api` | 2.21.1 | **2.21.2** | patch |
 | `live-probe` | 0.6.0 | **0.6.1** | minor-dans-séquence |
 | `decoder-sbi` | 0.4.3 | **0.4.4** | patch |
 | `event-schema` | 1.8.0 | — | inchangé |
@@ -59,6 +61,22 @@ Le `ts` ne participe plus à aucune décision d'ordre. Les 22 tests existants `d
 - **Garde visible** : `ingestible_entries` remonte les erreurs IO autres que NotFound au lieu de les masquer.
 - **Aucune suppression** : pas de code retiré, pas de force-push.
 - **Serveur basse priorité** : `nice -n 19 ionice -c3 cargo … -j 2 flock heavy-build.lock`.
+
+## OIRAN API 2.21.1 — 2026-11-16 — lock du workspace OIRAN compatible Rust 1.83 (patch)
+
+Rapport ANR2 #10 6921899654 : le lock `OIRAN/Cargo.lock` contenait `indexmap 2.14.2` (edition2024, Rust ≥ 1.85), tiré par `toml` depuis la 2.20.0. Le workspace ne compilait donc pas avec le Cargo 1.83 du lab : 2.20.0, 2.20.1 et 2.21.0 sont concernées.
+- `cargo update -p indexmap --precise 2.13.1` (hashbrown 0.17.1 → 0.16.1).
+- Audit du lock (`python3 /tmp/audit.py Cargo.lock`, lecture des Cargo.toml de `~/.cargo/registry/src`) : 105 crates du registre, 0 en edition 2024, 0 avec rust-version > 1.83.
+- `cargo build --locked -p oiran-api -p oiran-decode -p live-probe` : PASS (Rust 1.97 sur l'hôte de dev). La preuve en 1.83 reste la build du lab.
+
+## polaris-vtap 2.21.1 — 2026-11-16 — build lab sans clang + Rust 1.83 + tracefs (patch)
+
+Suite au rapport ANR2 #10 6921485041 (étape 1 OUVERTE : `clang` absent ; Cargo 1.83.0 refuse `indexmap 2.14.2`, qui exige edition2024). Seul `OIRAN/vtap` change ; oiran-api reste en 2.21.0.
+
+- **Rust 1.83** : `rust-version = "1.83"` + lock résolu par `CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo update` (indexmap 2.14.2 → 2.13.1, hashbrown 0.17.1 → 0.16.1). Audit du lock : 35 crates du registre, 0 en edition 2024, 0 avec rust-version > 1.83 (script tomllib sur `~/.cargo/registry/src`). OUVERT : aucune build réelle en 1.83 sur l'hôte de dev (toolchain non téléchargeable) ; la preuve sera la build `--locked` sur le lab.
+- **Sans clang** : objet eBPF précompilé `bpf/prebuilt/vtap.bpf.o` (clang 18.1.3, sha256 `2f2c8ea4…c3d702`, provenance dans `bpf/prebuilt/PROVENANCE.txt`). `build.rs` ne l'utilise que si `bpf/vtap.bpf.c` est identique à `bpf/prebuilt/vtap.bpf.c`, sinon échec `VTAP_PREBUILT_STALE`. La voie choisie est toujours annoncée (`cargo:warning`). Régénération : `bpf/build-prebuilt.sh`. Les 3 voies ont été vérifiées (précompilé accepté, source modifiée refusée, clang présent compilé).
+- **tracefs** : absent (cas vu après réinitialisation de l'hôte de test) → l'agent le monte (`VTAP_TRACEFS_MOUNTED`) ; échec → `VTAP_TRACEFS_UNAVAILABLE` fatal explicite.
+- Preuve réelle avec un binaire construit SANS clang : curl HTTP/2 TLS → 6 records, 1 connexion, `open_items=[]` → `oiran-decode --interface SBI --probe-type vtap` : `tcp_connections=1 tcp_errors=0 sbi_transactions=1`.
 
 ## OIRAN API 2.21.0 — 2026-11-16 — P1b vTAP : agent eBPF libssl → pcap SBI en clair + source `vtap` (minor)
 

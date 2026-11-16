@@ -245,6 +245,7 @@ fn run() -> Result<(), String> {
     if attached_core < 4 {
         return Err("VTAP_ATTACH_FAILED: SSL_write/SSL_read non attachés".into());
     }
+    ensure_tracefs()?;
     for (prog, tp) in TRACEPOINTS {
         let p: &mut TracePoint = bpf
             .program_mut(prog)
@@ -347,6 +348,32 @@ fn run() -> Result<(), String> {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+}
+
+/// 2.21.1 — les tracepoints exigent tracefs. Absent (ex. après reboot) →
+/// l'agent le monte lui-même et le journalise ; échec → VTAP_FATAL explicite.
+fn ensure_tracefs() -> Result<(), String> {
+    let present = |p: &str| std::path::Path::new(p).join("events").is_dir();
+    if present("/sys/kernel/tracing") || present("/sys/kernel/debug/tracing") {
+        return Ok(());
+    }
+    let rc = unsafe {
+        libc::mount(
+            c"nodev".as_ptr(),
+            c"/sys/kernel/tracing".as_ptr(),
+            c"tracefs".as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 || !present("/sys/kernel/tracing") {
+        return Err(format!(
+            "VTAP_TRACEFS_UNAVAILABLE: tracefs absent et montage impossible ({})",
+            std::io::Error::last_os_error()
+        ));
+    }
+    log(json!({"event":"VTAP_TRACEFS_MOUNTED","path":"/sys/kernel/tracing"}));
+    Ok(())
 }
 
 fn read_stats(stats: &PerCpuArray<aya::maps::MapData, u64>) -> [u64; 4] {
