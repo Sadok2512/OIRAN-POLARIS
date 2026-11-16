@@ -1,5 +1,78 @@
 # Changelog
 
+## OIRAN API 2.20.1 — 2026-11-16 — Phase 1 (C.2) : LiveInterfaceSource (AF_PACKET TPACKET_V3) + commit_seq + bench O1 (patch)
+
+Phase 1 lot C.2 validé Sadok sur #10. Publication incrémentale `commit_seq` + source live AF_PACKET TPACKET_V3 + PACKET_FANOUT (non câblée dans le pipeline actif, rotation horaire conservée) + bench O1 scaffold. Design doc enrichi du projet PHASE P8 « Performance TCP ».
+
+### Ajouts
+
+**`LiveInterfaceSource`** (`live-probe/src/capture_source.rs`) :
+- `Tpacketv3Params` : `block_size=4 MiB`, `block_nr=64`, `frame_size=2048`, `retire_blk_tov=10 ms`, buffer total **256 MiB**, `feature_req_word=1` (TP_FT_REQ_FILL_RXHASH).
+- `PacketFanoutParams` : `fanout_id` + mode (`Hash` / `LoadBalance`). `setsockopt_value()` pack `(mode << 16) | id` conforme Linux.
+- `LiveInterfaceError` : 10 variantes typées (`NonLinuxBuild`, `MissingCapNetRaw`, `InterfaceNotFound`, `SocketOpen`, `SetsockoptVersion`, `SetsockoptRing`, `SetsockoptFanout`, `SetsockoptTimestamping`, `Bind`, `MmapRing`).
+- `LiveInterfaceSource::try_open()` : sous `cfg(target_os="linux")`, exécute `socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))` + `PACKET_VERSION=TPACKET_V3` + `PACKET_RX_RING(tpacket_req3)` + `PACKET_FANOUT` + `SO_TIMESTAMPING` (si `hw_timestamping_requested`) + `bind(sockaddr_ll)`. Soft-fail silencieux sur `SO_TIMESTAMPING` (fallback kernel). Hors Linux → `NonLinuxBuild` sans appel kernel.
+- `LiveInterfaceSource::packet_statistics_v3()` : lit `PACKET_STATISTICS` → `(tp_packets, tp_drops, tp_freeze_q_cnt)` pour bench O1.
+- `timestamp_source()` : `"hw_ptp"` si demandé, `"kernel"` sinon — publicité event cohérente avec la demande opérateur.
+- **Non câblée dans le pipeline actif** : `PcapRotatingSource` reste la seule source effective. Rotation horaire `-b duration:3600` conservée tant que R1.a n'est pas prouvé.
+
+**Publication incrémentale `commit_seq`** (`live-probe/src/commit_seq.rs`) :
+- Nouveau fichier `commit_seq.txt` dans chaque `dataset_dir` contenant un entier u64 décimal.
+- API : `read(dir) -> u64` (défaut 0), `write(dir, seq) -> Result` (atomic tempfile + rename), `bump_and_write(dir) -> u64`.
+- Intégration dans `publish_events_to_dataset_dir` : bump + write APRÈS la mise à jour atomique du manifest. Trace structurée `CONTINUOUS_PUBLICATION_COMMIT` ou `CONTINUOUS_PUBLICATION_COMMIT_FAILED`.
+- Lecteur public `CaptureManager::dataset_commit_seq(dataset_id) -> u64`. API consommera dans un lot suivant (ListRowCache invalidation sub-seconde).
+- Fallback iso-comportement 2.20.0 : fichier absent/corrompu → 0, aucune régression.
+
+**Bench O1 scaffold** (`benchmarks/live-rx-drops/measure.sh`) :
+- Contrat d'appel : `sudo ./measure.sh <iface> <probe_id> [duration_s=60] [target_mbps=1000]`.
+- Sortie JSON `{probe_id, interface, target_mbps, duration_s, rx_packets, tp_drops, drop_ratio, r1e_passed}`.
+- Scaffold shell en 2.20.1 ; binaire `oiran-live-probe-bench` à câbler dans un lot suivant (le trait expose déjà `packet_statistics_v3()`).
+- Critère R1.e : `drop_ratio ≤ 1e-4` à 1 Gbit/s sur 60 s.
+
+**Complément design doc PHASE P8** (`docs/architecture/PHASE1-2.md` §4.5) :
+- Préparation **documentaire uniquement** (aucune implémentation 2.21.x).
+- Schéma `UserPlaneTcpInnerFlow` : 5-tuple interne + handshake SYN/SYN-ACK/ACK (RTT) + retransmissions/pertes/hors ordre + fenêtre (zero window) + octets utiles UL/DL par seconde.
+- Règle troncature fixe : **128 octets après GTP-U**, jamais de payload applicatif.
+- Coût mesuré sur dataset lab : ~140 oct/event après troncature, **1.2 KiB/flux RAM**, **8 MiB disque/run 60 s à 1 Gbit/s**, projection 400G : **24 MiB RAM** + **3 GiB/jour** disque.
+- 7 OUVERTS documentés (O8.1–O8.7) : IPv6+options SACK, pseudonymisation IP, ACK dup×3 vs CUBIC+ECN, zero-window, RTT 3-paquets, rétention 400G, co-existence `payload_sampled`.
+
+### Invariants préservés
+
+- **Iso-comportement 2.20.0** : aucun changement runtime visible — `LiveInterfaceSource` non câblée, `commit_seq` écrit en plus du manifest (fichier additionnel, absent → `0`, fallback propre).
+- **Rotation horaire conservée** : `-b duration:3600` reste actif. Retrait prévu en 2.20.2 **uniquement après R1.a prouvé sur 24 h**.
+- **Ordre canonique** : `(capture_id, packet_number, event_id)` inchangé. `commit_seq` ne participe PAS à la clé canonique — c'est un marker de cache uniquement.
+- **Vie privée** : `commit_seq.txt` ne contient que l'entier. Bench O1 n'écrit que des compteurs numériques. `LiveInterfaceSource` ne logge pas les paquets, seulement `tp_drops`/`tp_packets`.
+- **Serveur** : règle `nice -n 19 ionice -c3 cargo … -j 2` appliquée aux builds lourds.
+
+### Tests ajoutés (10 nouveaux)
+
+**`live-probe::capture_source::tests`** (6) :
+- `tpacketv3_defaults_match_design_doc_latency_and_buffer`
+- `packet_fanout_setsockopt_value_packs_mode_and_id`
+- `live_interface_source_publishes_kind_and_timestamp_source`
+- `live_interface_source_defaults_to_kernel_timestamp_when_not_requested`
+- `live_interface_try_open_returns_typed_error_without_cap_net_raw_or_on_non_linux`
+- `packet_statistics_v3_fails_cleanly_when_socket_not_open`
+
+**`live-probe::commit_seq::tests`** (4) :
+- `read_returns_zero_when_commit_seq_file_absent`
+- `write_then_read_round_trips_the_sequence`
+- `bump_increments_from_zero_or_prior`
+- `read_returns_zero_on_corrupted_file`
+
+### Non touché en 2.20.1 (prévu 2.20.2+)
+
+- Wiring `LiveInterfaceSource` dans `CaptureManager` (pipeline actif).
+- Binaire `oiran-live-probe-bench` (le scaffold shell est en place).
+- Wiring `commit_seq` dans `ListRowCache` côté API (invalidation sub-seconde). Lecteur public `dataset_commit_seq()` déjà exposé côté CaptureManager.
+- Retrait rotation horaire → **2.20.2** uniquement après preuve R1.a.
+- `polaris.toml` wiring dans `nf_from_target` du decoder-sbi → 2.20.2+.
+
+### OUVERTS
+
+- O1 encore ouvert : bench O1 scaffold-only ; chiffres `tp_drops` à mesurer sur bench vProbe réel (CAP_NET_RAW requis).
+- R1.a bloqué tant que `LiveInterfaceSource` non câblée dans le pipeline (2.20.2).
+- O2 (crash kernel vs commit_seq) : à prouver via test `kill -9` + reprise dans un lot suivant.
+
 ## OIRAN API 2.20.0 — 2026-11-16 — Phase 1 (C.1) : CaptureSource + PcapRotatingSource iso-comportement + polaris.toml + 5 event fields (minor)
 
 **Première release de PHASE 1** validée Sadok sur #10. Fondation modulaire pour le multi-sonde PRO 400G. **Aucun changement de comportement visible** : mêmes sessions, mêmes ids, mêmes call flows avant/après sur un dataset de référence (preuve = suite complète inchangée + 4 nouveaux tests d'invariant iso-comportement).

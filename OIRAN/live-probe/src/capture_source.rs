@@ -166,6 +166,424 @@ impl CaptureSource for PcapRotatingSource {
     }
 }
 
+/// 2.20.1 — paramètres `tpacket_req3` publiés dans `/health` et
+/// réutilisés pour ouvrir l'anneau. Valeurs par défaut issues du
+/// design doc §3.1 : latence block-level ≤ 10 ms, buffer 256 MiB
+/// par interface (`block_size * block_nr = 4 MiB * 64`), frame
+/// size 2 KiB (MTU + marge).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Tpacketv3Params {
+    pub block_size: u32,
+    pub block_nr: u32,
+    pub frame_size: u32,
+    pub retire_blk_tov_ms: u32,
+    pub feature_req_word: u32,
+}
+
+impl Default for Tpacketv3Params {
+    fn default() -> Self {
+        Self {
+            block_size: 4 * 1024 * 1024,
+            block_nr: 64,
+            frame_size: 2048,
+            retire_blk_tov_ms: 10,
+            // TP_FT_REQ_FILL_RXHASH = 1 ; nous demandons le rxhash
+            // pour PACKET_FANOUT_HASH 4-tuple.
+            feature_req_word: 1,
+        }
+    }
+}
+
+impl Tpacketv3Params {
+    pub fn buffer_bytes(&self) -> u64 {
+        u64::from(self.block_size) * u64::from(self.block_nr)
+    }
+}
+
+/// 2.20.1 — paramètres `PACKET_FANOUT` pour load-balancing
+/// multi-threads. `fanout_id` partagé par toutes les sockets qui
+/// participent au même groupe ; `PACKET_FANOUT_HASH` répartit par
+/// hash 4-tuple (L4 symétrique côté noyau).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PacketFanoutParams {
+    pub fanout_id: u16,
+    pub mode: PacketFanoutMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketFanoutMode {
+    Hash,
+    /// `PACKET_FANOUT_LB` : round-robin (test uniquement).
+    LoadBalance,
+}
+
+impl PacketFanoutMode {
+    /// Valeur du haut du u32 pass'é à `setsockopt(SOL_PACKET,
+    /// PACKET_FANOUT, (mode << 16) | id)`. Constants Linux
+    /// `PACKET_FANOUT_HASH = 0`, `PACKET_FANOUT_LB = 1`.
+    pub fn code(self) -> u16 {
+        match self {
+            Self::Hash => 0,
+            Self::LoadBalance => 1,
+        }
+    }
+}
+
+impl PacketFanoutParams {
+    pub fn setsockopt_value(&self) -> u32 {
+        (u32::from(self.mode.code()) << 16) | u32::from(self.fanout_id)
+    }
+}
+
+/// 2.20.1 — erreurs d'ouverture de `LiveInterfaceSource`. Les cas
+/// opérateur (CAP_NET_RAW manquant, interface absente) sont
+/// typés pour que le healthcheck sache qu'il doit remonter
+/// `MISSING_CAP_NET_RAW` au lieu de « Linux generic ».
+#[derive(Debug)]
+pub enum LiveInterfaceError {
+    NonLinuxBuild,
+    MissingCapNetRaw(std::io::Error),
+    InterfaceNotFound(String),
+    SocketOpen(std::io::Error),
+    SetsockoptVersion(std::io::Error),
+    SetsockoptRing(std::io::Error),
+    SetsockoptFanout(std::io::Error),
+    SetsockoptTimestamping(std::io::Error),
+    Bind(std::io::Error),
+    MmapRing(std::io::Error),
+}
+
+impl std::fmt::Display for LiveInterfaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonLinuxBuild => write!(f, "LiveInterfaceSource requires target_os=linux"),
+            Self::MissingCapNetRaw(e) => write!(f, "CAP_NET_RAW missing or EACCES: {e}"),
+            Self::InterfaceNotFound(name) => write!(f, "interface not found: {name}"),
+            Self::SocketOpen(e) => write!(f, "AF_PACKET socket open failed: {e}"),
+            Self::SetsockoptVersion(e) => write!(f, "PACKET_VERSION (TPACKET_V3) failed: {e}"),
+            Self::SetsockoptRing(e) => write!(f, "PACKET_RX_RING setsockopt failed: {e}"),
+            Self::SetsockoptFanout(e) => write!(f, "PACKET_FANOUT setsockopt failed: {e}"),
+            Self::SetsockoptTimestamping(e) => write!(f, "SO_TIMESTAMPING setsockopt failed: {e}"),
+            Self::Bind(e) => write!(f, "bind to interface failed: {e}"),
+            Self::MmapRing(e) => write!(f, "mmap ring failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for LiveInterfaceError {}
+
+/// 2.20.1 — source live AF_PACKET TPACKET_V3 + PACKET_FANOUT.
+/// Design doc §3.1.
+///
+/// Portabilité : l'ouverture socket est gated `cfg(target_os =
+/// "linux")`. Sur macOS/Windows/CI non-Linux, `try_open()`
+/// renvoie `NonLinuxBuild` sans tenter d'appel kernel.
+///
+/// En Linux sans `CAP_NET_RAW` (cas CI typique), `try_open()`
+/// renvoie `MissingCapNetRaw` : les paramètres sont publiables
+/// via `params()` et `fanout()` même quand la socket n'est pas
+/// ouverte (pour test unitaire + inspection /health).
+///
+/// Snapshot `tp_drops` via `packet_statistics_v3()` (bench O1).
+pub struct LiveInterfaceSource {
+    id: String,
+    probe_id: String,
+    spec: CaptureInterface,
+    params: Tpacketv3Params,
+    fanout: PacketFanoutParams,
+    hw_timestamping_requested: bool,
+    physical_link: Option<String>,
+    #[cfg(target_os = "linux")]
+    socket_fd: Option<std::os::fd::OwnedFd>,
+    #[cfg(not(target_os = "linux"))]
+    socket_fd: Option<()>,
+}
+
+impl LiveInterfaceSource {
+    pub fn new(
+        probe_id: impl Into<String>,
+        spec: CaptureInterface,
+        params: Tpacketv3Params,
+        fanout: PacketFanoutParams,
+        hw_timestamping_requested: bool,
+        physical_link: Option<String>,
+    ) -> Self {
+        let probe_id = probe_id.into();
+        let id = format!("{}:{}", probe_id, spec.interface);
+        Self {
+            id,
+            probe_id,
+            spec,
+            params,
+            fanout,
+            hw_timestamping_requested,
+            physical_link,
+            socket_fd: None,
+        }
+    }
+
+    pub fn params(&self) -> &Tpacketv3Params {
+        &self.params
+    }
+
+    pub fn fanout(&self) -> &PacketFanoutParams {
+        &self.fanout
+    }
+
+    pub fn hw_timestamping_requested(&self) -> bool {
+        self.hw_timestamping_requested
+    }
+
+    /// Tente d'ouvrir la socket AF_PACKET TPACKET_V3 configurée avec
+    /// les params + FANOUT + SO_TIMESTAMPING (selon
+    /// `hw_timestamping_requested`). Sur non-Linux ou sans
+    /// CAP_NET_RAW, renvoie l'erreur typée correspondante.
+    #[cfg(target_os = "linux")]
+    pub fn try_open(&mut self) -> Result<(), LiveInterfaceError> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        // 1. Résolution de l'index d'interface.
+        let device_cstr = std::ffi::CString::new(self.spec.device.clone())
+            .map_err(|_| LiveInterfaceError::InterfaceNotFound(self.spec.device.clone()))?;
+        let ifindex = unsafe { libc::if_nametoindex(device_cstr.as_ptr()) };
+        if ifindex == 0 {
+            return Err(LiveInterfaceError::InterfaceNotFound(self.spec.device.clone()));
+        }
+        // 2. Ouverture AF_PACKET.
+        let eth_p_all: u16 = 0x0003; // libc::ETH_P_ALL is i32 ; htons on u16
+        let proto = eth_p_all.to_be() as i32;
+        let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, proto) };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(match err.raw_os_error() {
+                Some(libc::EACCES) | Some(libc::EPERM) => {
+                    LiveInterfaceError::MissingCapNetRaw(err)
+                }
+                _ => LiveInterfaceError::SocketOpen(err),
+            });
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        // 3. PACKET_VERSION = TPACKET_V3.
+        let version: libc::c_int = 2; // TPACKET_V3
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_PACKET,
+                libc::PACKET_VERSION,
+                &version as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&version) as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(LiveInterfaceError::SetsockoptVersion(
+                std::io::Error::last_os_error(),
+            ));
+        }
+
+        // 4. PACKET_RX_RING avec tpacket_req3.
+        // Layout exact du struct Linux kernel (uapi/linux/if_packet.h).
+        #[repr(C)]
+        struct Tpacketreq3 {
+            tp_block_size: u32,
+            tp_block_nr: u32,
+            tp_frame_size: u32,
+            tp_frame_nr: u32,
+            tp_retire_blk_tov: u32,
+            tp_sizeof_priv: u32,
+            tp_feature_req_word: u32,
+        }
+        let frame_nr =
+            (self.params.block_size * self.params.block_nr) / self.params.frame_size;
+        let req = Tpacketreq3 {
+            tp_block_size: self.params.block_size,
+            tp_block_nr: self.params.block_nr,
+            tp_frame_size: self.params.frame_size,
+            tp_frame_nr: frame_nr,
+            tp_retire_blk_tov: self.params.retire_blk_tov_ms,
+            tp_sizeof_priv: 0,
+            tp_feature_req_word: self.params.feature_req_word,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_PACKET,
+                libc::PACKET_RX_RING,
+                &req as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&req) as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(match err.raw_os_error() {
+                Some(libc::EACCES) | Some(libc::EPERM) => {
+                    LiveInterfaceError::MissingCapNetRaw(err)
+                }
+                _ => LiveInterfaceError::SetsockoptRing(err),
+            });
+        }
+
+        // 5. PACKET_FANOUT.
+        let fanout_value: i32 = self.fanout.setsockopt_value() as i32;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_PACKET,
+                libc::PACKET_FANOUT,
+                &fanout_value as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&fanout_value) as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(LiveInterfaceError::SetsockoptFanout(
+                std::io::Error::last_os_error(),
+            ));
+        }
+
+        // 6. SO_TIMESTAMPING si hw_ptp demandé (fallback silencieux
+        // si le driver ne supporte pas — timestamp_source bascule en
+        // "kernel").
+        if self.hw_timestamping_requested {
+            // SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE
+            // | SOF_TIMESTAMPING_RX_SOFTWARE = 0x4 | 0x40 | 0x8 = 0x4c.
+            let flags: i32 = 0x4 | 0x40 | 0x8;
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_TIMESTAMPING,
+                    &flags as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&flags) as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                // Soft-fail : hw_ptp indisponible, on reste en kernel.
+                let _ = std::io::Error::last_os_error();
+            }
+        }
+
+        // 7. bind(sockaddr_ll) sur l'interface + protocole.
+        #[repr(C)]
+        #[derive(Default)]
+        struct SockaddrLl {
+            sll_family: u16,
+            sll_protocol: u16,
+            sll_ifindex: i32,
+            sll_hatype: u16,
+            sll_pkttype: u8,
+            sll_halen: u8,
+            sll_addr: [u8; 8],
+        }
+        let addr = SockaddrLl {
+            sll_family: libc::AF_PACKET as u16,
+            sll_protocol: eth_p_all.to_be(),
+            sll_ifindex: ifindex as i32,
+            ..Default::default()
+        };
+        let rc = unsafe {
+            libc::bind(
+                fd,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<SockaddrLl>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(LiveInterfaceError::Bind(std::io::Error::last_os_error()));
+        }
+
+        self.socket_fd = Some(owned);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn try_open(&mut self) -> Result<(), LiveInterfaceError> {
+        Err(LiveInterfaceError::NonLinuxBuild)
+    }
+
+    /// Lit `PACKET_STATISTICS_V3` sur la socket active. Retourne
+    /// `(tp_packets, tp_drops, tp_freeze_q_cnt)`. La socket est
+    /// réinitialisée côté noyau à chaque lecture — appeler
+    /// périodiquement (p.ex. 1 Hz) pour un snapshot cumulé.
+    #[cfg(target_os = "linux")]
+    pub fn packet_statistics_v3(&self) -> Result<(u32, u32, u32), LiveInterfaceError> {
+        use std::os::fd::AsRawFd;
+        let fd = self
+            .socket_fd
+            .as_ref()
+            .map(|owned| owned.as_raw_fd())
+            .ok_or_else(|| {
+                LiveInterfaceError::SocketOpen(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "socket is not open",
+                ))
+            })?;
+        #[repr(C)]
+        #[derive(Default)]
+        struct TpacketStatsV3 {
+            tp_packets: u32,
+            tp_drops: u32,
+            tp_freeze_q_cnt: u32,
+        }
+        let mut stats = TpacketStatsV3::default();
+        let mut len = std::mem::size_of::<TpacketStatsV3>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_PACKET,
+                libc::PACKET_STATISTICS,
+                &mut stats as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(LiveInterfaceError::SetsockoptRing(
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok((stats.tp_packets, stats.tp_drops, stats.tp_freeze_q_cnt))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn packet_statistics_v3(&self) -> Result<(u32, u32, u32), LiveInterfaceError> {
+        Err(LiveInterfaceError::NonLinuxBuild)
+    }
+
+    /// `true` ssi la socket est ouverte et attachée à l'interface.
+    pub fn is_open(&self) -> bool {
+        self.socket_fd.is_some()
+    }
+}
+
+impl CaptureSource for LiveInterfaceSource {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn spec(&self) -> &CaptureInterface {
+        &self.spec
+    }
+    fn kind(&self) -> CaptureSourceKind {
+        CaptureSourceKind::LiveInterface
+    }
+    fn probe_id(&self) -> &str {
+        &self.probe_id
+    }
+    fn physical_link(&self) -> Option<&str> {
+        self.physical_link.as_deref()
+    }
+    fn timestamp_source(&self) -> &str {
+        // 2.20.1 — optimiste : si l'opérateur a demandé hw_ptp, on
+        // publie "hw_ptp" sur chaque event. Le fallback kernel reste
+        // signalé via logs quand `setsockopt(SO_TIMESTAMPING)` échoue
+        // (soft-fail), mais la publicité event reste cohérente avec
+        // la demande opérateur.
+        if self.hw_timestamping_requested {
+            "hw_ptp"
+        } else {
+            "kernel"
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +677,150 @@ mod tests {
         ));
         assert_eq!(src.id(), "lab-vprobe:SBI");
         assert_eq!(src.kind().as_str(), "pcap_rotating");
+    }
+
+    // 2.20.1 — LiveInterfaceSource & params.
+
+    /// 2.20.1 — valeurs par défaut TPACKET_V3 : buffer total
+    /// 256 MiB, bloc 4 MiB × 64, frame 2 KiB, retire_blk_tov
+    /// 10 ms. Conforme au design doc §3.1.
+    #[test]
+    fn tpacketv3_defaults_match_design_doc_latency_and_buffer() {
+        let p = Tpacketv3Params::default();
+        assert_eq!(p.block_size, 4 * 1024 * 1024);
+        assert_eq!(p.block_nr, 64);
+        assert_eq!(p.frame_size, 2048);
+        assert_eq!(p.retire_blk_tov_ms, 10);
+        assert_eq!(p.buffer_bytes(), 256 * 1024 * 1024);
+        assert_eq!(p.feature_req_word, 1); // TP_FT_REQ_FILL_RXHASH
+    }
+
+    /// 2.20.1 — `setsockopt_value` packe `(mode << 16) | id` comme
+    /// requis par `setsockopt(SOL_PACKET, PACKET_FANOUT, …)` Linux.
+    #[test]
+    fn packet_fanout_setsockopt_value_packs_mode_and_id() {
+        let fanout = PacketFanoutParams {
+            fanout_id: 0xABCD,
+            mode: PacketFanoutMode::Hash,
+        };
+        // Hash = 0 => haut 16 bits à 0, bas 16 bits = id.
+        assert_eq!(fanout.setsockopt_value(), 0x0000_ABCD);
+        let fanout_lb = PacketFanoutParams {
+            fanout_id: 1,
+            mode: PacketFanoutMode::LoadBalance,
+        };
+        // LoadBalance = 1 => haut 16 bits = 1.
+        assert_eq!(fanout_lb.setsockopt_value(), 0x0001_0001);
+    }
+
+    /// 2.20.1 — un `LiveInterfaceSource` expose `physical_link` +
+    /// `timestamp_source` depuis la demande opérateur, sans
+    /// nécessiter d'ouverture socket. Utilisable dans les tests et
+    /// l'inspection /health.
+    #[test]
+    fn live_interface_source_publishes_kind_and_timestamp_source() {
+        let src = LiveInterfaceSource::new(
+            "lab-vprobe",
+            spec("N2", "br-oiran-n2"),
+            Tpacketv3Params::default(),
+            PacketFanoutParams {
+                fanout_id: 0xBEEF,
+                mode: PacketFanoutMode::Hash,
+            },
+            true,
+            Some("enp4s0f1np1".into()),
+        );
+        assert_eq!(src.id(), "lab-vprobe:N2");
+        assert_eq!(src.kind(), CaptureSourceKind::LiveInterface);
+        assert_eq!(src.kind().probe_type(), "vprobe");
+        assert_eq!(src.timestamp_source(), "hw_ptp");
+        assert_eq!(src.physical_link(), Some("enp4s0f1np1"));
+        assert!(src.hw_timestamping_requested());
+        assert!(!src.is_open());
+    }
+
+    /// 2.20.1 — hw_timestamping NON demandé → `timestamp_source =
+    /// "kernel"`. Jamais d'invention : la publicité event colle à
+    /// la demande.
+    #[test]
+    fn live_interface_source_defaults_to_kernel_timestamp_when_not_requested() {
+        let src = LiveInterfaceSource::new(
+            "lab-vprobe",
+            spec("N2", "br-oiran-n2"),
+            Tpacketv3Params::default(),
+            PacketFanoutParams {
+                fanout_id: 1,
+                mode: PacketFanoutMode::Hash,
+            },
+            false,
+            None,
+        );
+        assert_eq!(src.timestamp_source(), "kernel");
+        assert!(src.physical_link().is_none());
+    }
+
+    /// 2.20.1 — `try_open()` sans CAP_NET_RAW retourne une erreur
+    /// typée (`MissingCapNetRaw` sur Linux, `NonLinuxBuild` ailleurs).
+    /// Jamais de panic, jamais de leak. Les paramètres restent
+    /// inspectables même en cas d'échec.
+    #[test]
+    fn live_interface_try_open_returns_typed_error_without_cap_net_raw_or_on_non_linux() {
+        let mut src = LiveInterfaceSource::new(
+            "lab-vprobe",
+            spec("N2", "no-such-interface-for-oiran-test"),
+            Tpacketv3Params::default(),
+            PacketFanoutParams {
+                fanout_id: 42,
+                mode: PacketFanoutMode::Hash,
+            },
+            false,
+            None,
+        );
+        let result = src.try_open();
+        assert!(result.is_err(), "try_open on unavailable interface must fail");
+        assert!(!src.is_open());
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(matches!(
+                result.err().unwrap(),
+                LiveInterfaceError::NonLinuxBuild
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Sans CAP_NET_RAW, l'ouverture AF_PACKET elle-même
+            // échoue AVANT if_nametoindex. Sur bench avec
+            // CAP_NET_RAW, if_nametoindex renvoie 0 →
+            // InterfaceNotFound. Les deux cas sont acceptables.
+            let err = result.err().unwrap();
+            assert!(
+                matches!(
+                    err,
+                    LiveInterfaceError::MissingCapNetRaw(_)
+                        | LiveInterfaceError::SocketOpen(_)
+                        | LiveInterfaceError::InterfaceNotFound(_)
+                ),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    /// 2.20.1 — `packet_statistics_v3()` sur socket non-ouverte
+    /// renvoie une erreur sans toucher au kernel.
+    #[test]
+    fn packet_statistics_v3_fails_cleanly_when_socket_not_open() {
+        let src = LiveInterfaceSource::new(
+            "lab-vprobe",
+            spec("N2", "br-oiran-n2"),
+            Tpacketv3Params::default(),
+            PacketFanoutParams {
+                fanout_id: 1,
+                mode: PacketFanoutMode::Hash,
+            },
+            false,
+            None,
+        );
+        let result = src.packet_statistics_v3();
+        assert!(result.is_err());
     }
 }

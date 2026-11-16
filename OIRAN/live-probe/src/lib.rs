@@ -2,6 +2,7 @@
 
 mod callflow_page;
 pub mod capture_source;
+pub mod commit_seq;
 pub mod event_id_set;
 pub mod lte_evidence;
 
@@ -2190,6 +2191,25 @@ impl CaptureManager {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         Some((meta.len(), mtime))
+    }
+
+    /// 2.20.1 — publication incrémentale : lit `commit_seq.txt` du
+    /// dataset. Absent → 0 (iso-comportement 2.19.x). Utilisé par
+    /// les caches API pour invalider sub-seconde quand la mtime du
+    /// filesystem a un délai (tmpfs, NFS).
+    pub fn dataset_commit_seq(&self, dataset_id: &str) -> u64 {
+        let Some(path) = self.callflow_path(dataset_id, "__sentinel__") else {
+            return 0;
+        };
+        // `callflow_path` renvoie `<dataset_root>/callflows/<id>.json` —
+        // on remonte au `dataset_root` pour chercher commit_seq.txt.
+        let Some(callflows_dir) = path.parent() else {
+            return 0;
+        };
+        let Some(dataset_root) = callflows_dir.parent() else {
+            return 0;
+        };
+        commit_seq::read(dataset_root)
     }
 
     fn callflow_path(&self, dataset_id: &str, session_id: &str) -> Option<PathBuf> {
@@ -6326,6 +6346,37 @@ impl CaptureManager {
             None,
         );
         validate_dataset_artifacts(&dataset, dataset_dir)?;
+        // 2.20.1 — publication incrémentale : bump `commit_seq.txt`
+        // APRÈS la mise à jour atomique du manifest. Les lecteurs API
+        // (ListRowCache, cached_live_list_row) invalident par
+        // comparaison de ce marker, ce qui rend les sessions « en
+        // cours » visibles dans les secondes qui suivent la
+        // publication (vs. mtime filesystem qui peut avoir un délai
+        // non borné sous charge NFS/tmpfs). Fallback iso-comportement
+        // 2.20.0 : si l'écriture échoue, on logge et on continue —
+        // la signature `(len, mtime)` reste correcte.
+        match commit_seq::bump_and_write(dataset_dir) {
+            Ok(seq) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "CONTINUOUS_PUBLICATION_COMMIT",
+                        "dataset_id": dataset.dataset_id,
+                        "commit_seq": seq,
+                    })
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "CONTINUOUS_PUBLICATION_COMMIT_FAILED",
+                        "dataset_id": dataset.dataset_id,
+                        "error": error,
+                    })
+                );
+            }
+        }
         release_unused_heap_pages();
         trace_publication_rss(
             publication_started_epoch_ms,

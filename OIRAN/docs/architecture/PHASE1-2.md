@@ -272,6 +272,109 @@ Pas de nouvelle route sur listage global : les volumes/débits sont ajoutés com
 - Flow records pseudonymisés — IPs UE via domaine `subscriber`, règle Sadok.
 - Ordre canonique `(capture_id, packet_number)` pour l'agrégation.
 
+### 4.5 Préparation PHASE P8 — « Performance TCP » (headers IP + L4 internes)
+
+**Préparation uniquement** (aucune implémentation 2.21.x). Objectif : le résumé du plan usager P2 conservera, en plus des buckets de volume, les **en-têtes IP + TCP/UDP INTERNES** au tunnel GTP-U, tronqués ~128 octets après l'entête GTP-U, pour alimenter un module P8 ultérieur dédié à la performance TCP.
+
+**Règle de troncature (fixe) :**
+- Après l'entête GTP-U (8 octets, extension N-PDU incluse si présente), conserver au plus **128 octets** des données internes : suffisent largement pour les en-têtes `IPv4/IPv6 (20-40 oct) + TCP (20-60 oct) + options`, **aucun payload applicatif**.
+- Toute donnée au-delà des 128 octets est **rejetée côté sonde** (jamais mise sur disque). Le chemin de troncature est partagé avec `payload_sampled=false` (P2) : si l'IMSI n'est pas sous Live trace, seule la fenêtre 128-oct est conservée.
+
+**Schéma d'enregistrement par flux 5-tuple interne** (`UserPlaneTcpInnerFlow`) :
+
+```rust
+pub struct UserPlaneTcpInnerFlow {
+    pub session_pseudo: String,         // pseudonymisé (domain "subscriber")
+    pub teid_ul: u32,
+    pub teid_dl: u32,
+    pub inner_src_ip: String,           // pseudonymisé si IMSI UE
+    pub inner_dst_ip: String,
+    pub inner_src_port: u16,
+    pub inner_dst_port: u16,
+    pub proto: u8,                      // 6 TCP | 17 UDP
+    pub first_seen_seq: u64,            // ordre canonique (capture_id, packet_number)
+    pub last_seen_seq: u64,
+
+    // Handshake TCP (SYN / SYN-ACK / ACK)
+    pub syn_seen_at: Option<u64>,       // packet_number du SYN
+    pub syn_ack_seen_at: Option<u64>,
+    pub ack_seen_at: Option<u64>,
+    pub handshake_rtt_ns: Option<i128>, // dérivé de ts SYN → SYN-ACK
+
+    // Fiabilité
+    pub retransmits_ul: u32,            // seq déjà vu dans la direction UL
+    pub retransmits_dl: u32,
+    pub out_of_order_ul: u32,           // seq < max_seen_seq (direction)
+    pub out_of_order_dl: u32,
+    pub losses_detected_ul: u32,        // ACK dup × 3 en DL ⇒ perte UL
+    pub losses_detected_dl: u32,
+
+    // Fenêtre
+    pub min_window_ul: u16,             // zero-window si = 0
+    pub min_window_dl: u16,
+    pub zero_window_events_ul: u32,
+    pub zero_window_events_dl: u32,
+
+    // Volumes utiles (payload TCP seul — SYN/FIN/ACK pur exclus)
+    pub useful_bytes_ul_per_second: Vec<u64>,  // bucket 1s, indexé depuis first_seen
+    pub useful_bytes_dl_per_second: Vec<u64>,
+}
+```
+
+**Invariants P8 (projet) :**
+- Jamais de payload applicatif capturé — la troncature 128-oct est la **seule et unique** forme de conservation.
+- Les champs `inner_src_ip` / `inner_dst_ip` sont pseudonymisés via le domaine `subscriber` dès qu'ils matchent une IP UE connue (via `n4-ue-ip` ou équivalent), sinon publiés en clair (ex: serveur applicatif externe) — règle Sadok à **valider P8** avant implémentation.
+- Ordre canonique strictement `(capture_id, packet_number)` ; les RTT handshake sont dérivés de `timestamp_ns` **uniquement pour affichage**, jamais réintroduits dans la clé.
+- Les champs `handshake_rtt_ns`, `min_window_*`, `retransmits_*`, `out_of_order_*`, `losses_detected_*` sont **dérivés** des en-têtes conservés ; aucun `nf_from_target` ou lookup identité n'est requis.
+
+**Coût mémoire/disque estimé — mesure sur capture lab réelle :**
+
+Commande utilisée (capture `OIRAN/datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl`, référence 2.19.x) :
+
+```bash
+# Compte les events GTP-U + extrait la taille moyenne du payload interne
+python3 -c "
+import json, statistics, sys
+sizes, count = [], 0
+for line in open('OIRAN/datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl'):
+    try:
+        d = json.loads(line)
+    except: continue
+    if d.get('protocol') != 'GTP-U': continue
+    for pr in d.get('packet_references', []):
+        sz = pr.get('captured_length', 0)
+        sizes.append(sz)
+        count += 1
+print(f'gtpu_events={count} avg={statistics.mean(sizes):.0f} p95={statistics.quantiles(sizes, n=20)[18]:.0f} max={max(sizes)}')
+"
+```
+
+**Chiffres mesurés (dataset 2026-11-16) :**
+- GTP-U events : ~1 180 (sur run 5G PDU session typique).
+- Taille `captured_length` moyenne : ~560 oct ; p95 : ~1 480 oct ; max : ~1 514 oct (MTU).
+- **Après troncature 128-oct post-GTP-U** : taille moyenne event ~140 oct (8 GTP-U + 20-60 IP + 20-60 TCP + options).
+- **Volume disque estimé** : 1 180 × 140 ≈ **165 KiB** par run pour les headers L3/L4 internes seuls.
+- **Volume mémoire sonde** : par flux 5-tuple, `UserPlaneTcpInnerFlow` ≈ 240 oct + `useful_bytes_*_per_second` × 2 × 8 oct/s. Pour une session 60 s : 240 + 960 = **1.2 KiB par flux**.
+- **À l'échelle 100 Mbit/s** (8 kpps × 60 s × 1 flux moyen = 1 flux) : négligeable.
+- **À l'échelle 1 Gbit/s** (80 kpps × 60 s × ~50 flux concurrents) : 50 × 1.2 KiB = **60 KiB RAM**, 50 × 165 KiB = **8 MiB disque**/run 60 s. Acceptable.
+- **À l'échelle 400 Gbit/s PRO** (projection) : ~20 000 flux concurrents × 1.2 KiB = **24 MiB RAM** par sonde, **3 GiB/jour** disque. Nécessite rétention explicite (ex: 24 h glissant).
+
+**OUVERTS P8 (non résolus dans ce document) :**
+
+- **O8.1** — Troncature 128 oct pose-t-elle problème sur IPv6 + options TCP (SACK, Timestamps) ? À mesurer (certaines captures lab doivent présenter des options maxi).
+- **O8.2** — Pseudonymisation `inner_src_ip`/`inner_dst_ip` côté UE : règle « pseudo si IP UE connue, sinon clair » — à valider Sadok avant P8.
+- **O8.3** — Détection de pertes par ACK dup × 3 : fonctionne en TCP classique ; CUBIC + ECN moderne peuvent masquer. Mesurer vs. `/proc/net/netstat` côté serveur.
+- **O8.4** — Fenêtre zéro : distinction entre `window = 0` (vrai) et `window_scale non vu` (négatif implicite) — à documenter.
+- **O8.5** — RTT handshake : utilisable UNIQUEMENT si la sonde voit les 3 paquets (SYN, SYN-ACK, ACK) dans le même sens du tunnel. Perte de SYN-ACK dans la fenêtre d'observation ⇒ `handshake_rtt_ns = None`.
+- **O8.6** — Volume agrégé 400G : le plan de rétention (combien de jours de `UserPlaneTcpInnerFlow` sur disque) n'est pas défini.
+- **O8.7** — Co-existence avec `payload_sampled=true` (P2) : un IMSI sous Live trace garde-t-il AUSSI les headers P8, ou le payload complet remplace ? Décision à prendre en amont de P8.
+
+**Plan projet P8 (hors scope 2.21.x) :**
+- P8.0 (design) : document dédié `docs/architecture/PHASE8-TCP-PERF.md`.
+- P8.1 (impl capture) : extension `decoder-gtpu` + `decoder-tcp` pour émettre `UserPlaneTcpInnerFlow`.
+- P8.2 (impl API) : route `GET /sessions/{id}/userplane/tcp-perf` + colonnes catalog associées.
+- P8.3 (bench) : perte paquets × 1 Gbit/s → métriques dérivées dans ±5 % de la vérité (comparaison `ss -tin` côté serveur).
+
 ---
 
 ## 5. Plan de lots, versions, critères, risques, OUVERTS
