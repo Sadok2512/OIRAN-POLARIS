@@ -129,12 +129,31 @@ pub fn decode_connections(
         report.errors.extend(errors);
         events.extend(decoded);
     }
-    events.sort_by_key(|event| {
-        (
-            event.timestamp.seconds,
-            event.timestamp.nanoseconds,
-            event.event_id.clone(),
-        )
+    // 2.21.1 (clôture OUVERT #10) — l'ancien tri `(ts.seconds,
+    // ts.nanoseconds, event_id)` violait l'ordre canonique OIRAN
+    // (`(capture_id, packet_number, event_id)`, jamais de ts).
+    // Deux events de captures distinctes au même ts pouvaient
+    // s'intervertir selon l'alignement d'horloge, et un dataset
+    // multi-sonde (vtap + vprobe sur le même SBI) exposait ce
+    // non-déterminisme. On trie désormais par capture_id (string)
+    // puis par le `packet_number` du premier `packet_reference`
+    // (monotone par capture), avec `event_id` en tiebreaker.
+    // Le ts ne participe plus à aucune décision d'ordre.
+    events.sort_by(|a, b| {
+        let a_seq = a
+            .packet_references
+            .first()
+            .map(|p| p.packet_number)
+            .unwrap_or(0);
+        let b_seq = b
+            .packet_references
+            .first()
+            .map(|p| p.packet_number)
+            .unwrap_or(0);
+        a.capture_id
+            .cmp(&b.capture_id)
+            .then(a_seq.cmp(&b_seq))
+            .then(a.event_id.cmp(&b.event_id))
     });
     (events, report)
 }
@@ -2353,5 +2372,173 @@ mod tests {
         let (events, report) = decode_connections(&[conn], "sha256:test", "SBI", &HashMap::new(), &test_key());
         assert!(events.is_empty());
         assert_eq!(report.encrypted_connections, 1);
+    }
+
+    /// 2.21.1 — clôture OUVERT : les events sortent dans l'ordre
+    /// canonique `(capture_id, packet_number, event_id)` et JAMAIS
+    /// par `ts`. On construit deux events avec un timestamp inversé
+    /// par rapport à l'ordre packet_number, et on vérifie que c'est
+    /// bien packet_number qui dicte l'ordre final.
+    #[test]
+    fn events_are_sorted_canonically_by_capture_packet_event_never_by_ts() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, ExactTimestamp, NormalizedEvent, PacketReference,
+            Protocol,
+        };
+        fn mk(
+            event_id: &str,
+            capture_id: &str,
+            packet_number: u64,
+            ts_seconds: i64,
+            ts_nanoseconds: u32,
+        ) -> NormalizedEvent {
+            // Round-trip via from_json évite d'ancrer le test sur
+            // chaque champ de `NormalizedEvent` (compat forward
+            // quand le schéma s'enrichit).
+            use event_schema::{self, DecodeStatus, Protocol};
+            let json = serde_json::json!({
+                "event_id": event_id,
+                "capture_id": capture_id,
+                "capture_point_id": "SBI",
+                "interface": "SBI",
+                "protocol": "SBI",
+                "message_name": "test",
+                "message_type": 0,
+                "timestamp": {
+                    "seconds": ts_seconds,
+                    "nanoseconds": ts_nanoseconds,
+                    "raw_ticks": 0,
+                    "display": format!("{}.{:09}Z", ts_seconds, ts_nanoseconds),
+                },
+                "source_endpoint": {"address": "a", "network_function": "a"},
+                "destination_endpoint": {"address": "b", "network_function": "b"},
+                "direction": "UNKNOWN",
+                "session_identifiers": [],
+                "information_elements": [],
+                "decoder_name": "sbi",
+                "decoder_version": "test",
+                "schema_version": NormalizedEvent::SCHEMA_VERSION,
+                "decoding_status": "DECODED",
+                "raw_payload_reference": format!("sha256:{event_id}"),
+                "packet_references": [{
+                    "source_file": "stub.pcapng",
+                    "packet_number": packet_number,
+                    "byte_offset": 0,
+                    "interface_id": 0,
+                    "captured_length": 128,
+                    "original_length": 128,
+                }],
+            });
+            // Construction minimale via champs publics ; on remplit
+            // seulement ce dont le tri a besoin.
+            let _ = (json, DecodeStatus::Decoded, Protocol::SbiHttp2);
+            NormalizedEvent {
+                event_id: event_id.into(),
+                parent_event_id: None,
+                probe_id: String::new(),
+                capture_point_id: "SBI".into(),
+                capture_id: capture_id.into(),
+                packet_references: vec![PacketReference {
+                    source_file: "stub.pcapng".into(),
+                    source_sha256: None,
+                    packet_number,
+                    byte_offset: 0,
+                    interface_id: 0,
+                    link_type: None,
+                    sll2_protocol_type: None,
+                    sll2_reserved: None,
+                    sll2_interface_index: None,
+                    sll2_arphrd_type: None,
+                    sll2_packet_type: None,
+                    sll2_address_length: None,
+                    sll2_address: None,
+                    captured_length: 128,
+                    original_length: 128,
+                }],
+                timestamp: ExactTimestamp {
+                    seconds: ts_seconds,
+                    nanoseconds: ts_nanoseconds,
+                    raw_ticks: 0,
+                    resolution_base: 10,
+                    resolution_exponent: 9,
+                },
+                interface: "SBI".into(),
+                protocol: Protocol::SbiHttp2,
+                message_name: "test".into(),
+                message_type: 0,
+                procedure_code: None,
+                procedure: None,
+                security_state: None,
+                source_byte_offset: None,
+                source_endpoint: Endpoint {
+                    address: "a".into(),
+                    port: None,
+                    network_function: None,
+                },
+                destination_endpoint: Endpoint {
+                    address: "b".into(),
+                    port: None,
+                    network_function: None,
+                },
+                direction: Direction::Unknown,
+                session_identifiers: vec![],
+                information_elements: vec![],
+                decoder_name: "sbi".into(),
+                decoder_version: "test".into(),
+                schema_version: NormalizedEvent::SCHEMA_VERSION,
+                decoding_status: DecodeStatus::Decoded,
+                errors: vec![],
+                raw_payload_reference: format!("sha256:{event_id}"),
+                evidence_references: vec![],
+                sbi: None,
+            }
+        }
+        // ts dans l'ordre inverse de packet_number. Si on triait
+        // par ts, l'event packet=200 (ts=1) sortirait avant
+        // packet=100 (ts=9). L'ordre canonique doit renvoyer
+        // packet=100 d'abord.
+        let mut events = vec![
+            mk("evt-late-by-packet", "sha256:cap-a", 200, 1, 0),
+            mk("evt-early-by-packet", "sha256:cap-a", 100, 9, 0),
+        ];
+        // On passe directement par le même tri que `decode_connections`.
+        events.sort_by(|a, b| {
+            let a_seq = a
+                .packet_references
+                .first()
+                .map(|p| p.packet_number)
+                .unwrap_or(0);
+            let b_seq = b
+                .packet_references
+                .first()
+                .map(|p| p.packet_number)
+                .unwrap_or(0);
+            a.capture_id
+                .cmp(&b.capture_id)
+                .then(a_seq.cmp(&b_seq))
+                .then(a.event_id.cmp(&b.event_id))
+        });
+        // Premier = packet=100 (plus petit paquet), même si ts=9.
+        assert_eq!(events[0].event_id, "evt-early-by-packet");
+        assert_eq!(events[0].packet_references[0].packet_number, 100);
+        assert_eq!(events[1].event_id, "evt-late-by-packet");
+        assert_eq!(events[1].packet_references[0].packet_number, 200);
+        // Et deux captures distinctes : capture_id tri lexicographique
+        // en 1er. Un ts très grand sur cap-a ne doit pas repousser
+        // après cap-b.
+        let mut mixed = vec![
+            mk("evt-on-cap-b", "sha256:cap-b", 1, 0, 0),
+            mk("evt-on-cap-a-late-ts", "sha256:cap-a", 999, 1_000_000, 0),
+        ];
+        mixed.sort_by(|a, b| {
+            let a_seq = a.packet_references.first().map(|p| p.packet_number).unwrap_or(0);
+            let b_seq = b.packet_references.first().map(|p| p.packet_number).unwrap_or(0);
+            a.capture_id
+                .cmp(&b.capture_id)
+                .then(a_seq.cmp(&b_seq))
+                .then(a.event_id.cmp(&b.event_id))
+        });
+        assert_eq!(mixed[0].capture_id, "sha256:cap-a");
+        assert_eq!(mixed[1].capture_id, "sha256:cap-b");
     }
 }

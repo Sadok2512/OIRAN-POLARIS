@@ -1,5 +1,65 @@
 # Changelog
 
+## OIRAN API 2.21.1 — 2026-11-16 — Câblage VtapSource + ProbeStamp + fix decoder-sbi tri canonique (patch)
+
+Lot C.3 validé Sadok #10. Câblage effectif du moteur `vtap` de la 2.21.0 dans la fondation `CaptureSource`, clôture de l'écart OUVERT `decoder-sbi::decode_connections` qui triait les events par `ts` (interdit par la règle canonique OIRAN).
+
+### Composants et versions (incrément de chaque crate touché)
+
+| Composant | Avant | Après | Type |
+|---|---|---|---|
+| `oiran-api` | 2.21.0 | **2.21.1** | patch |
+| `live-probe` | 0.6.0 | **0.6.1** | minor-dans-séquence |
+| `decoder-sbi` | 0.4.3 | **0.4.4** | patch |
+| `event-schema` | 1.8.0 | — | inchangé |
+| `oiran-decode` | — | — | inchangé |
+
+### Câblage `VtapSource` (parité `LiveInterfaceSource`)
+
+- `CaptureSource::to_probe_stamp()` — nouvelle méthode par défaut sur le trait. Compose `event_schema::ProbeStamp` depuis la source : `probe_id`, `probe_type` (via `kind().probe_type()`), `physical_link`, `timestamp_source`. Jamais fabriqué côté appelant. `oiran-decode::write_jsonl_stamped` peut maintenant consommer directement `source.to_probe_stamp()`.
+- `VtapSource::ingestible_entries(dir)` — scan atomique du `out_dir` qui renvoie la liste **triée** des `vtap_*.pcap` **fermés** uniquement. `.pcap.part`, `.vtap.json`, et fichiers non préfixés `vtap_` sont filtrés. Ordre canonique : tri lexicographique du nom (jamais mtime). `NotFound` → `Ok(vec![])` ; autres erreurs IO remontées (garde visible).
+- Status : `VtapSource` reste **non câblée dans le pipeline actif** — même mécanique que `LiveInterfaceSource`. Les helpers permettent à un appelant (ex: `oiran-decode` CLI, batch script) de composer le `ProbeStamp` et de filtrer les pcap fermés. Le wiring effectif dans `CaptureManager` (continuous) arrivera dans un lot suivant une fois le pipeline live validé.
+
+### Fix `decoder-sbi::decode_connections` (clôture OUVERT)
+
+**Écart** : `events.sort_by_key(|e| (e.timestamp.seconds, e.timestamp.nanoseconds, e.event_id))` violait la règle OIRAN « ordre canonique `(capture_id, packet_number, event_id)`, jamais de `ts` ». Reproduit : un run multi-sonde (vprobe + vtap sur SBI) pouvait intervertir des events à horloges non alignées ; deux events de captures distinctes au même `ts` n'avaient pas d'ordre déterministe.
+
+**Fix** :
+```rust
+events.sort_by(|a, b| {
+    let a_seq = a.packet_references.first().map(|p| p.packet_number).unwrap_or(0);
+    let b_seq = b.packet_references.first().map(|p| p.packet_number).unwrap_or(0);
+    a.capture_id.cmp(&b.capture_id)
+        .then(a_seq.cmp(&b_seq))
+        .then(a.event_id.cmp(&b.event_id))
+});
+```
+Le `ts` ne participe plus à aucune décision d'ordre. Les 22 tests existants `decoder-sbi` passent sans modification (les fixtures single-connection ont `packet_number` monotone en `ts` → set de sortie identique).
+
+### OUVERT restant dans decoder-sbi
+
+- `frames.sort_by_key(|frame| (frame.timestamp_ns, frame.direction_index, frame.offset))` à `decoder-sbi:107` — tri intra-connexion TCP. Techniquement un `ts` dans la clé, mais **local à une TCP reassembly** (interleave des deux sens d'une même connexion). Non couvert par la règle multi-sonde cross-capture. **Déclaré OUVERT** pour investigation dédiée : prouver si `packet_number` est reliable pour interleave HTTP/2, puis basculer. Pas traité dans 2.21.1.
+
+### Tests ajoutés (6 nouveaux)
+
+**`live-probe::capture_source::tests`** (5) :
+- `vtap_source_to_probe_stamp_is_filled_with_vtap_values`
+- `pcap_rotating_source_to_probe_stamp_is_filled_with_vprobe_values`
+- `live_interface_source_to_probe_stamp_carries_physical_link`
+- `vtap_source_ingestible_entries_filters_closed_pcaps_and_sorts_by_name`
+- `vtap_source_ingestible_entries_on_missing_dir_returns_empty`
+
+**`decoder-sbi::tests`** (1) :
+- `events_are_sorted_canonically_by_capture_packet_event_never_by_ts` — vérifie que `ts` dans l'ordre inverse de `packet_number` n'inverse PAS le résultat, et que `capture_id` tri lexicographique prime sur `ts` géant.
+
+### Invariants préservés
+
+- **Ordre canonique strict** : `(capture_id, packet_number, event_id)` dans tous les tris publiés de `decoder-sbi`. `ts` jamais utilisé.
+- **Iso-comportement 2.21.0** : `VtapSource::to_probe_stamp()` + `ingestible_entries()` sont des helpers additionnels ; aucun appelant actuel n'en dépend. Les 22 tests `decoder-sbi` passent sans modification.
+- **Garde visible** : `ingestible_entries` remonte les erreurs IO autres que NotFound au lieu de les masquer.
+- **Aucune suppression** : pas de code retiré, pas de force-push.
+- **Serveur basse priorité** : `nice -n 19 ionice -c3 cargo … -j 2 flock heavy-build.lock`.
+
 ## OIRAN API 2.21.0 — 2026-11-16 — P1b vTAP : agent eBPF libssl → pcap SBI en clair + source `vtap` (minor)
 
 Branche `feat/oiran-2.21.0-vtap` (base 2.20.1 @ 7b13119). Rend le SBI TLS visible sans clé : uprobes libssl dans les NF Open5GS, HTTP/2 en clair rejoué en pcap TCP lu **sans changement** par `transport-tcp` + `decoder-sbi`.

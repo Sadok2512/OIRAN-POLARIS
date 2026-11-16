@@ -31,7 +31,9 @@
 //! - **2.20.2** : retrait de la rotation horaire **uniquement si**
 //!   R1.a (latence E2E médiane ≤ 2 s sur 24 h) prouvé.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use event_schema::ProbeStamp;
 
 use crate::CaptureInterface;
 
@@ -120,6 +122,21 @@ pub trait CaptureSource: Send + Sync {
     /// sonde ; plusieurs interfaces d'une même sonde partagent le
     /// même `probe_id`.
     fn probe_id(&self) -> &str;
+
+    /// 2.21.1 — compose un `event_schema::ProbeStamp` depuis la
+    /// source. Appelé par `oiran-decode::write_jsonl_stamped` et par
+    /// le pipeline live pour apposer la même identité de sonde sur
+    /// chaque event émis par cette source. Les champs
+    /// `probe_id`/`probe_type`/`timestamp_source`/`physical_link`
+    /// viennent directement du trait, jamais fabriqués côté appelant.
+    fn to_probe_stamp(&self) -> ProbeStamp {
+        ProbeStamp {
+            probe_id: Some(self.probe_id().to_owned()),
+            probe_type: Some(self.kind().probe_type().to_owned()),
+            physical_link: self.physical_link().map(ToOwned::to_owned),
+            timestamp_source: Some(self.timestamp_source().to_owned()),
+        }
+    }
 }
 
 /// Implémentation 2.20.0 : enveloppe iso-comportement du chemin
@@ -633,6 +650,31 @@ impl VtapSource {
                 .map(|n| n.to_string_lossy().starts_with("vtap_"))
                 .unwrap_or(false)
     }
+
+    /// 2.21.1 — scan atomique du `out_dir` : renvoie la liste
+    /// triée (`capture_id canonique`) des `vtap_*.pcap` **fermés**
+    /// prêts à être décodés. `.pcap.part`, `.vtap.json`, et tout
+    /// autre fichier sont filtrés. L'ordre canonique de retour est
+    /// le tri lexicographique du nom (dumpcap-style monotone car
+    /// l'agent inclut un timestamp au format `YYYYMMDDTHHMMSSZ` et
+    /// un index), **jamais un tri par mtime** (règle 2.21.1).
+    /// Fichier manquant, dir inexistant → `Ok(vec![])`. Erreur IO
+    /// autre → remontée. Un garde qui se saute en silence ne garde
+    /// rien : une erreur de scan est visible.
+    pub fn ingestible_entries(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+        match std::fs::read_dir(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+            Ok(iter) => {
+                let mut paths: Vec<PathBuf> = iter
+                    .filter_map(|entry| entry.ok().map(|e| e.path()))
+                    .filter(|p| Self::is_ingestible(p))
+                    .collect();
+                paths.sort();
+                Ok(paths)
+            }
+        }
+    }
 }
 
 impl CaptureSource for VtapSource {
@@ -914,5 +956,102 @@ mod tests {
         assert!(!VtapSource::is_ingestible(Path::new("/x/vtap_SBI_20261116T150000Z.pcap.part")));
         assert!(!VtapSource::is_ingestible(Path::new("/x/vtap_SBI_20261116T150000Z.vtap.json")));
         assert!(!VtapSource::is_ingestible(Path::new("/x/SBI_00001.pcap")));
+    }
+
+    /// 2.21.1 — `to_probe_stamp()` compose un `ProbeStamp` complet
+    /// depuis la source (vtap). Jamais d'invention : `probe_id`,
+    /// `probe_type`, `timestamp_source` viennent du trait.
+    #[test]
+    fn vtap_source_to_probe_stamp_is_filled_with_vtap_values() {
+        let src = VtapSource::new("lab-vtap", spec("SBI", "vtap"), "/var/lib/oiran/vtap");
+        let stamp = src.to_probe_stamp();
+        assert_eq!(stamp.probe_id.as_deref(), Some("lab-vtap"));
+        assert_eq!(stamp.probe_type.as_deref(), Some("vtap"));
+        assert_eq!(stamp.timestamp_source.as_deref(), Some("ebpf_monotonic"));
+        assert!(stamp.physical_link.is_none());
+    }
+
+    /// 2.21.1 — un `PcapRotatingSource` compose aussi son propre
+    /// `ProbeStamp` : parité du contrat sur le trait.
+    #[test]
+    fn pcap_rotating_source_to_probe_stamp_is_filled_with_vprobe_values() {
+        let src = PcapRotatingSource::new(
+            "lab-vprobe",
+            spec("N2", "br-oiran-n2"),
+            "/tmp/pcap-rotation",
+        );
+        let stamp = src.to_probe_stamp();
+        assert_eq!(stamp.probe_id.as_deref(), Some("lab-vprobe"));
+        assert_eq!(stamp.probe_type.as_deref(), Some("vprobe"));
+        assert_eq!(stamp.timestamp_source.as_deref(), Some("kernel"));
+        assert!(stamp.physical_link.is_none());
+    }
+
+    /// 2.21.1 — `LiveInterfaceSource::to_probe_stamp()` propage
+    /// `physical_link` (phy-like) et le `timestamp_source` demandé.
+    /// Le `probe_type` reste `"vprobe"` (vProbe sur bridges Docker) ;
+    /// le passage à `"phy"` sera géré par `AfXdpSource`/`DpdkSource`
+    /// en 2.22.x.
+    #[test]
+    fn live_interface_source_to_probe_stamp_carries_physical_link() {
+        let src = LiveInterfaceSource::new(
+            "lab-vprobe",
+            spec("N2", "br-oiran-n2"),
+            Tpacketv3Params::default(),
+            PacketFanoutParams {
+                fanout_id: 1,
+                mode: PacketFanoutMode::Hash,
+            },
+            true,
+            Some("enp4s0f1np1".into()),
+        );
+        let stamp = src.to_probe_stamp();
+        assert_eq!(stamp.probe_id.as_deref(), Some("lab-vprobe"));
+        assert_eq!(stamp.probe_type.as_deref(), Some("vprobe"));
+        assert_eq!(stamp.timestamp_source.as_deref(), Some("hw_ptp"));
+        assert_eq!(stamp.physical_link.as_deref(), Some("enp4s0f1np1"));
+    }
+
+    /// 2.21.1 — `ingestible_entries()` scanne un vrai répertoire
+    /// temporaire : retourne uniquement les `vtap_*.pcap` fermés,
+    /// jamais le `.pcap.part` ni le `.vtap.json`. Ordre canonique
+    /// = tri du nom (jamais mtime).
+    #[test]
+    fn vtap_source_ingestible_entries_filters_closed_pcaps_and_sorts_by_name() {
+        let base = std::path::PathBuf::from(format!(
+            "/tmp/oiran-vtap-ingestible-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for name in [
+            "vtap_SBI_20261116T120000Z.pcap",       // kept
+            "vtap_SBI_20261116T120100Z.pcap",       // kept
+            "vtap_SBI_20261116T120200Z.pcap.part",  // skipped (open)
+            "vtap_SBI_20261116T120200Z.vtap.json",  // skipped (manifest)
+            "SBI_00001.pcap",                       // skipped (not vtap_*)
+            "random.log",                           // skipped
+        ] {
+            std::fs::write(base.join(name), b"stub").unwrap();
+        }
+        let entries = VtapSource::ingestible_entries(&base).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].ends_with("vtap_SBI_20261116T120000Z.pcap"));
+        assert!(entries[1].ends_with("vtap_SBI_20261116T120100Z.pcap"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 2.21.1 — scan d'un répertoire inexistant → `Ok(vec![])`.
+    /// Un dossier `out_dir` pas encore créé n'est PAS une erreur
+    /// bloquante — l'agent vTAP peut démarrer plus tard. Les
+    /// autres erreurs IO sont remontées (pas de garde silencieuse).
+    #[test]
+    fn vtap_source_ingestible_entries_on_missing_dir_returns_empty() {
+        let missing = std::path::PathBuf::from(format!(
+            "/tmp/oiran-vtap-missing-{}-never-created",
+            std::process::id()
+        ));
+        let entries = VtapSource::ingestible_entries(&missing).unwrap();
+        assert!(entries.is_empty());
     }
 }
