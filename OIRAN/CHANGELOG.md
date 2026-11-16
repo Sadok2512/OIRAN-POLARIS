@@ -1,6 +1,86 @@
 # Changelog
 
+## OIRAN API 2.21.6 — 2026-11-16 — vrai câblage vTAP (out_dir + manifeste) + fix régression probe_id + VTAP_MANIFEST_MISSING (patch)
+
+Lot C.6 — **rejet 2.21.5** par Sadok (relecture, 3 écarts). Correction des 3 écarts avant tri des trames (2.21.6 prochain).
+
+### Écarts 2.21.5 déclarés et corrigés
+
+**Écart #1 (prouvé) — PAS DE CÂBLAGE RÉEL** : `grep -n "ingestible_entries\|out_dir" live-probe/src/lib.rs` → 0 appel (seulement un commentaire ligne 10003). La 2.21.5 posait le stamp sur le path mais ne scannait jamais `probes[].out_dir`. 2.21.6 : scan effectif ajouté dans `process_continuous_capture_inner` après la boucle `for interface in interfaces`. Résolution :
+- Env `OIRAN_VTAP_OUT_DIRS` (CSV) OR défaut `/var/lib/oiran/vtap`.
+- Pour chaque `out_dir` : `VtapSource::ingestible_entries(&out_dir)` renvoie les `vtap_*.pcap` fermés triés par nom.
+- Chaque pcap : même pipeline que les segments dumpcap — SHA-256, dedup `prior_capture_checksums`, `decode_capture_streaming`, agrégation keepalive, journal `CONTINUOUS_SEGMENT_ZERO_EVENTS`, `reports`/`checksums` map.
+- Interface hardcodée à **SBI** (seule que l'agent `polaris-vtap` produit aujourd'hui).
+- Préparation `polaris.toml` : la fonction `vtap_out_dirs()` est l'adaptateur. Le wiring `probes[].out_dir` depuis `polaris.toml` arrivera quand `polaris_config` sera consommé par `CaptureManager` (lot futur).
+
+**Écart #2 (corrigé) — RÉGRESSION probe_id** : la 2.21.5 posait `probe_stamp_for_pcap_path(path)` qui écrasait `probe_id="lab-vprobe"` sur CHAQUE event vProbe (ex. `oiran-vprobe-local-01` → `lab-vprobe`). 2.21.6 remplace par `vprobe_stamp()` qui renvoie `probe_id: None` — `to_json_with_probe` ne touche pas au champ. Preuve : test `vprobe_event_keeps_original_probe_id_through_to_json_with_probe`.
+
+**Écart #3 (corrigé) — CONTENU, PAS ÉTIQUETTE** : la 2.21.5 posait `probe_id="lab-vtap"` en dur pour tout `vtap_*.pcap`. 2.21.6 lit le manifeste `<pcap>.vtap.json` écrit par l'agent (`polaris_vtap::pcap::FileManifest`) et apposent les 4 champs (`probe_id`, `probe_type`, `timestamp_source`, `physical_link`) tels qu'écrits par l'agent. Jamais d'étiquette en dur. Manifeste absent / unreadable / JSON malformé / schema incomplet → erreur typée `VtapManifestError` → `bump_failure(VTAP_MANIFEST_MISSING)` + log structuré `CONTINUOUS_VTAP_INGESTION_FAILED` + **skip** (pas de repli silencieux sur vprobe — « un garde qui se saute en silence ne garde rien »).
+
+### Composants et versions
+
+| Composant | Avant | Après | Type |
+|---|---|---|---|
+| `oiran-api` | 2.21.5 | **2.21.6** | patch |
+| `live-probe` | 0.6.2 | **0.6.3** | patch (API publique étendue : `vprobe_stamp`, `read_vtap_manifest_stamp`, `VtapManifestError`, `VTAP_MANIFEST_MISSING`, `append_vtap_manifest_suffix`, `vtap_out_dirs`) |
+
+### API publique `live-probe::capture_source`
+
+**Retirées** (retrait net pour forcer la relecture — aucun caller survivant hors 2.21.5 incorrect) :
+- `probe_stamp_for_pcap_path(path) -> ProbeStamp` : deviné depuis le nom, écrivait un `probe_id` en dur.
+
+**Ajoutées** :
+- `vprobe_stamp() -> ProbeStamp` : `probe_id: None` (préserve l'existant), `probe_type: "vprobe"`, `timestamp_source: "kernel"`.
+- `read_vtap_manifest_stamp(pcap_path) -> Result<ProbeStamp, VtapManifestError>` : lit `<pcap>.vtap.json`.
+- `append_vtap_manifest_suffix(pcap_path) -> PathBuf` : calcule le chemin manifeste.
+- `enum VtapManifestError { Missing | Unreadable(io::Error) | Invalid(serde_json::Error) | SchemaIncomplete { field } }`.
+- `const VTAP_MANIFEST_MISSING: &str = "VTAP_MANIFEST_MISSING"` (code racine `categorize_failure_code`).
+- `live_probe::vtap_out_dirs() -> Vec<PathBuf>` : env `OIRAN_VTAP_OUT_DIRS` CSV OR défaut `/var/lib/oiran/vtap`.
+
+### Invariants préservés
+
+- **Ordre canonique** `(capture_id, packet_number, event_id)` inchangé.
+- **Dedup** : les vtap pcaps passent par le même `prior_capture_checksums` que les segments dumpcap. SHA-256 identique → ingestion ignorée.
+- **Iso-comportement 2.21.5 sur les events vProbe** : seuls `probe_type="vprobe"` + `timestamp_source="kernel"` restent apposés. Le `probe_id` écrit par le décodeur est conservé (fix régression).
+- **Garde visible** : `VTAP_MANIFEST_MISSING` passe par `bump_failure` + event structuré. Jamais de skip silencieux.
+- **Contenu, pas étiquette** : le stamp vtap vient EXCLUSIVEMENT du `.vtap.json` posé par l'agent. Aucune valeur en dur côté lecteur.
+
+### Tests ajoutés (12 nouveaux)
+
+**`live-probe::capture_source::tests`** (7) :
+- `vprobe_stamp_leaves_probe_id_none_and_sets_probe_type_and_timestamp_source`
+- `vprobe_event_keeps_original_probe_id_through_to_json_with_probe` (**garde régression 2.21.5**)
+- `vtap_manifest_stamp_is_derived_from_manifest_content_not_from_a_hardcoded_label`
+- `vtap_manifest_missing_returns_typed_error_never_falls_back`
+- `vtap_manifest_invalid_json_returns_invalid`
+- `vtap_manifest_schema_incomplete_is_rejected_never_fallback`
+- `append_vtap_manifest_suffix_preserves_pcap_extension`
+
+**`live-probe/tests/vtap_wiring.rs`** (5, intégration) :
+- `ingestible_entries_pair_with_manifest_stamp_for_a_real_vtap_filename`
+- `ingestion_with_missing_manifest_raises_vtap_manifest_missing_never_falls_back`
+- `vtap_out_dirs_env_overrides_default_and_splits_on_comma`
+- `vtap_out_dirs_default_is_var_lib_oiran_vtap_when_env_absent`
+- `ingestible_entries_filters_pcap_part_so_vtap_scan_never_picks_an_open_file`
+
+### Non traités dans 2.21.6 (déclarés OUVERT 2.21.7+)
+
+- **Tri `frames.sort_by_key` intra-connexion TCP** dans `decoder-sbi::decode_connections` (ligne 107). OUVERT depuis 2.21.2 — à traiter dans 2.21.7 comme prévu.
+- **Bench O1 chiffré** (100/500/1000 Mbit/s tp_drops) : CAP_NET_RAW + pktgen lab. OUVERT.
+- **Test d'intégration bout-en-bout** avec un vrai pcap vTAP (via `polaris_vtap::synth::Synthesizer`) vérifiant que `process_continuous_capture_inner` produit des events SBI avec `probe_type=vtap` dans `oiran_events.jsonl`. Il nécessite un `CaptureManager` + répertoire racine complet — refactor dédié. **Clôture partielle** par les 5 tests `vtap_wiring.rs` qui prouvent la chaîne path → manifest → stamp.
+- **polaris.toml → `vtap_out_dirs`** : `vtap_out_dirs()` lit `OIRAN_VTAP_OUT_DIRS` en 2.21.6. Le wiring `polaris_config::probes[].out_dir` arrivera quand `CaptureManager` consommera `polaris.toml`.
+
+### Audit `Cargo.lock` compatible Rust 1.83
+
+`cargo fetch` exécuté avant audit. Commande + chiffres publiés dans le rapport #10 (parser Python du lock identique à 2.21.4/5).
+
+### Lock vTAP
+
+Après hausse `live-probe 0.6.2 → 0.6.3` : `cd OIRAN/vtap && cargo update -w && cargo test --locked` exécuté. Chiffres reportés dans le rapport #10.
+
 ## OIRAN API 2.21.5 — 2026-11-16 — Câblage effectif Live/Vtap dans CaptureManager + stamp probe_type (minor)
+
+**⚠️ 2.21.5 REJETÉE en relecture par Sadok (3 écarts documentés dans l'entrée 2.21.6 ci-dessus). Les commits 2.21.5 restent en historique (règle : aucune suppression, aucun force-push) mais la fonctionnalité visée n'était PAS câblée. Voir 2.21.6 pour les correctifs.**
 
 Lot C.5 validé Sadok #10 2.21.4. Câblage effectif des moteurs `vtap` et `vprobe` dans le watcher continuous : chaque event publié porte désormais sa marque de sonde (probe_id, probe_type, timestamp_source). Pré-requis Phase 1 pour que ANR2 puisse vérifier à l'oeil nu la source d'un event dans `oiran_events.jsonl`.
 

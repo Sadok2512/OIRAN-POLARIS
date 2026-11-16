@@ -5192,7 +5192,7 @@ impl CaptureManager {
                     // sinon vprobe). Évite tout état global pendant le
                     // fresh-import.
                     let probe_stamp =
-                        crate::capture_source::probe_stamp_for_pcap_path(on_disk_path);
+                        crate::capture_source::vprobe_stamp();
                     let config = DecodeConfig {
                         input: on_disk_path.clone(),
                         capture_id: full_capture_id.clone(),
@@ -5525,7 +5525,10 @@ impl CaptureManager {
                 // (probe_id/probe_type/timestamp_source) qui s'ajoutent
                 // à chaque ligne JSONL — la publication ANR2 attendait
                 // précisément cette marque.
-                let probe_stamp = crate::capture_source::probe_stamp_for_pcap_path(&path);
+                // 2.21.6 — vprobe stamp SANS override probe_id : préserve
+                // le `probe_id` posé par le décodeur (ex. `oiran-vprobe-local-01`).
+                // Les pcaps vTAP suivent un chemin séparé en fin de fonction.
+                let probe_stamp = crate::capture_source::vprobe_stamp();
                 // 2.11.5: all GTP-U user planes use the same bounded flow
                 // aggregation. Restricting this to N3 left S1-U/S5-U as
                 // packet events and made their tunnel evidence disappear
@@ -5620,6 +5623,152 @@ impl CaptureManager {
                             } else {
                                 "traffic_present_decoded_zero_events_investigate"
                             },
+                        })
+                    );
+                    zero_event_captures.push(capture_sha);
+                }
+                checksums.insert(key.clone(), checksum);
+                reports.insert(key, report);
+            }
+        }
+        // 2.21.6 — Phase vTAP : scan des `out_dirs` (env
+        // `OIRAN_VTAP_OUT_DIRS` CSV ; défaut `/var/lib/oiran/vtap`),
+        // ingestion exclusive des `vtap_*.pcap` **fermés**
+        // (filtre `VtapSource::is_ingestible`). Même pipeline
+        // `decode_capture_streaming` que les segments dumpcap, même
+        // SHA-256, même capture_id canonique, même journal
+        // d'échec. Interface hardcodée à **SBI** — c'est la seule
+        // que l'agent `polaris-vtap` produit aujourd'hui (TS 29.5xx).
+        //
+        // Pour CHAQUE `vtap_*.pcap`, le stamp (probe_id / probe_type /
+        // timestamp_source) est lu dans `<pcap>.vtap.json` posé par
+        // l'agent. Manifeste absent / illisible / schema incomplet
+        // → `bump_failure(VTAP_MANIFEST_MISSING)` + log structuré +
+        // skip. **JAMAIS de repli silencieux sur vprobe** (règle
+        // Sadok 2.21.6 : « un garde qui se saute en silence ne
+        // garde rien »).
+        for vtap_dir in vtap_out_dirs() {
+            let vtap_pcaps = match crate::capture_source::VtapSource::ingestible_entries(&vtap_dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_VTAP_SCAN_FAILED",
+                            "out_dir": vtap_dir.display().to_string(),
+                            "error": e.to_string(),
+                        })
+                    );
+                    continue;
+                }
+            };
+            for vtap_pcap in vtap_pcaps {
+                if fs::metadata(&vtap_pcap)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+                    <= 24
+                {
+                    continue;
+                }
+                // Lecture du manifeste — jamais de repli.
+                let probe_stamp = match crate::capture_source::read_vtap_manifest_stamp(&vtap_pcap) {
+                    Ok(stamp) => stamp,
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        let _ = self.update(CONTINUOUS_CAPTURE_ID, |job| {
+                            bump_failure(&mut job.metrics, &msg);
+                        });
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "event": "CONTINUOUS_VTAP_INGESTION_FAILED",
+                                "path": vtap_pcap.display().to_string(),
+                                "error_code": crate::capture_source::VTAP_MANIFEST_MISSING,
+                                "error": msg,
+                            })
+                        );
+                        continue;
+                    }
+                };
+                let checksum = sha256_hex_file(&vtap_pcap)?;
+                if capture_id == CONTINUOUS_CAPTURE_ID
+                    && prior_capture_checksums.contains(&checksum)
+                {
+                    continue;
+                }
+                let capture_hash = format!("sha256:{checksum}");
+                let mut n3_aggregator = N3FlowAggregator::default();
+                let mut keepalive_aggregator = KeepaliveAggregator::default();
+                let mut individual_events = 0usize;
+                let decode_outcome = decode_capture_streaming(
+                    &DecodeConfig {
+                        input: vtap_pcap.clone(),
+                        capture_id: capture_hash.clone(),
+                        interface: "SBI".into(),
+                        endpoints: endpoints.clone(),
+                    },
+                    &pseudonym_key,
+                    |event| {
+                        let event = match keepalive_aggregator.observe(event)? {
+                            None => return Ok(()),
+                            Some(event) => event,
+                        };
+                        individual_events = individual_events.saturating_add(1);
+                        decoded_spool
+                            .write_all(event.to_json_with_probe(&probe_stamp).as_bytes())
+                            .and_then(|_| decoded_spool.write_all(b"\n"))
+                            .map_err(display_error)
+                    },
+                );
+                let mut report = match decode_outcome {
+                    Ok(report) => report,
+                    Err(e) => {
+                        let msg = format!("VTAP_DECODE_FAILED: {e}");
+                        let _ = self.update(CONTINUOUS_CAPTURE_ID, |job| {
+                            bump_failure(&mut job.metrics, &msg);
+                        });
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "event": "CONTINUOUS_VTAP_INGESTION_FAILED",
+                                "path": vtap_pcap.display().to_string(),
+                                "error_code": "VTAP_DECODE_FAILED",
+                                "error": e,
+                            })
+                        );
+                        continue;
+                    }
+                };
+                let keepalive_aggregates = keepalive_aggregator.finish();
+                let _ = n3_aggregator.finish(); // pas de GTP-U sur SBI
+                report.events = individual_events.saturating_add(keepalive_aggregates.len());
+                for event in keepalive_aggregates {
+                    decoded_spool
+                        .write_all(event.to_json_with_probe(&probe_stamp).as_bytes())
+                        .and_then(|_| decoded_spool.write_all(b"\n"))
+                        .map_err(display_error)?;
+                }
+                let key = vtap_pcap
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("vtap.pcap")
+                    .to_string();
+                if report.events == 0 {
+                    let capture_sha = format!("sha256:{}", &checksum);
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_SEGMENT_ZERO_EVENTS",
+                            "path": vtap_pcap.display().to_string(),
+                            "capture_id": capture_sha,
+                            "interface": "SBI",
+                            "capture_format": report.capture_format.clone(),
+                            "packets_in_pcap": report.packets,
+                            "transport_errors": report.transport_errors,
+                            "tcp_connections": report.tcp_connections,
+                            "tcp_errors": report.tcp_errors,
+                            "warnings": report.warnings,
+                            "probe_type": "vtap",
                         })
                     );
                     zero_event_captures.push(capture_sha);
@@ -10630,6 +10779,33 @@ fn epoch_ms() -> u64 {
 
 fn display_error(error: std::io::Error) -> String {
     error.to_string()
+}
+
+/// 2.21.6 — répertoires où l'agent `polaris-vtap` dépose ses
+/// `vtap_*.pcap` fermés + leurs manifestes `.vtap.json`.
+///
+/// Résolution :
+/// * `OIRAN_VTAP_OUT_DIRS` (CSV) si défini et non vide : chemins
+///   fournis par l'opérateur dans l'ordre d'apparition.
+/// * Défaut : `/var/lib/oiran/vtap` (répertoire canonique agent).
+///
+/// Chemin futur : lorsque le wiring `polaris.toml` sera actif dans
+/// `CaptureManager`, cette fonction retournera
+/// `probes[].out_dir` pour chaque `engine = "vtap"` du fichier. En
+/// 2.21.6 l'env var tient ce rôle sans nouvelle dépendance.
+pub fn vtap_out_dirs() -> Vec<PathBuf> {
+    if let Ok(raw) = std::env::var("OIRAN_VTAP_OUT_DIRS") {
+        let dirs: Vec<PathBuf> = raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !dirs.is_empty() {
+            return dirs;
+        }
+    }
+    vec![PathBuf::from("/var/lib/oiran/vtap")]
 }
 
 #[cfg(test)]
