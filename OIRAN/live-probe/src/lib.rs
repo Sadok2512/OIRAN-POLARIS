@@ -1195,6 +1195,12 @@ pub struct ContinuousImportConfig {
     pub native_segment_seconds: Option<u64>,
     pub historical_n2_bootstrap: Option<PathBuf>,
     pub runtime_pdu_evidence: Option<PathBuf>,
+    /// 2.21.9 — répertoires vTAP scannés par l'import continu. Production :
+    /// `bounded()` → `vtap_out_dirs()` (env `OIRAN_VTAP_OUT_DIRS`, défaut
+    /// `/var/lib/oiran/vtap`). Tests : vide → le scan ne lit JAMAIS le vrai
+    /// répertoire de l'hôte (cause de l'échec lab de
+    /// `oversized_segment_is_persisted_individually_while_other_segment_imports`).
+    pub vtap_out_dirs: Vec<PathBuf>,
 }
 
 impl ContinuousImportConfig {
@@ -1211,6 +1217,7 @@ impl ContinuousImportConfig {
             native_segment_seconds: None,
             historical_n2_bootstrap: None,
             runtime_pdu_evidence: None,
+            vtap_out_dirs: vtap_out_dirs(),
         }
     }
 
@@ -1661,6 +1668,9 @@ pub struct CaptureManager {
     sequence: Arc<AtomicU64>,
     continuous_stop: Arc<AtomicBool>,
     continuous_runtime_evidence: Arc<Mutex<Option<PathBuf>>>,
+    /// 2.21.9 — répertoires vTAP de l'import continu en cours (vide par
+    /// défaut et en test ; posé par `start_continuous_import`).
+    continuous_vtap_dirs: Arc<Mutex<Vec<PathBuf>>>,
     // 2.7.6: per-deployment HMAC-SHA256 secret. Loaded once from a root-only
     // 0600 file at startup and shared by every import this manager runs,
     // including after a probe restart against the same key path. Wrapped in
@@ -1755,6 +1765,7 @@ impl CaptureManager {
             sequence: Arc::new(AtomicU64::new(1)),
             continuous_stop: Arc::new(AtomicBool::new(false)),
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
+            continuous_vtap_dirs: Arc::new(Mutex::new(Vec::new())),
             pseudonym_key: Arc::new(pseudonym_key),
             interface_probe,
             // 2.14.11 (ANR1 #10 6860508699) — override test-only par
@@ -1822,6 +1833,7 @@ impl CaptureManager {
         fs::create_dir_all(base.join("pcap")).map_err(display_error)?;
         self.continuous_stop.store(false, Ordering::Release);
         *self.continuous_runtime_evidence.lock().unwrap() = config.runtime_pdu_evidence.clone();
+        *self.continuous_vtap_dirs.lock().unwrap() = config.vtap_out_dirs.clone();
         // 2.7.16 (issue #9 part 1): a previous worker may have published a
         // dataset to disk at `base/dataset/dataset_manifest.json`. The import
         // state tracks seen_checksums (so no segment is re-ingested), but the
@@ -5669,7 +5681,8 @@ impl CaptureManager {
             _ => ContinuousImportState::default(),
         };
         let mut vtap_state_dirty = false;
-        for vtap_dir in vtap_out_dirs() {
+        let vtap_dirs = self.continuous_vtap_dirs.lock().unwrap().clone();
+        for vtap_dir in vtap_dirs {
             let vtap_pcaps = match crate::capture_source::VtapSource::ingestible_entries(&vtap_dir) {
                 Ok(v) => v,
                 Err(e) => {
@@ -11604,6 +11617,7 @@ mod tests {
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
                 runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
             })
             .unwrap();
         wait_for(|| {
@@ -11661,6 +11675,7 @@ mod tests {
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
                 runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
             })
             .unwrap();
         wait_for(|| {
@@ -11749,6 +11764,7 @@ mod tests {
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
                 runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
             })
             .unwrap();
         wait_for(|| {
@@ -12060,6 +12076,7 @@ mod tests {
             native_segment_seconds: None,
             historical_n2_bootstrap: Some(bootstrap),
             runtime_pdu_evidence: None,
+            vtap_out_dirs: Vec::new(),
         };
         let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
         manager.start_continuous_import(config.clone()).unwrap();
@@ -12207,6 +12224,7 @@ mod tests {
             native_segment_seconds: None,
             historical_n2_bootstrap: None,
             runtime_pdu_evidence: None,
+            vtap_out_dirs: Vec::new(),
         };
         let manager = CaptureManager::with_pseudonym_key_path(
             root.clone(),
@@ -12498,6 +12516,7 @@ mod tests {
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
                 runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
             })
             .unwrap();
         // The worker's first act is `clean_continuous_import_root`; by
@@ -12605,6 +12624,7 @@ mod tests {
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
                 runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
             })
             .unwrap();
         // Up to 120 s to drain 250 segments in batches of 32 (~8 batches,
@@ -12700,6 +12720,7 @@ mod tests {
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
                 runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
             })
             .unwrap();
         wait_for(|| {
@@ -14003,6 +14024,7 @@ mod tests {
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
                 runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
             })
             .unwrap();
 
@@ -14102,6 +14124,7 @@ mod tests {
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
                 runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
             })
             .unwrap();
         *manager.continuous_runtime_evidence.lock().unwrap() = Some(evidence.clone());
@@ -15297,6 +15320,7 @@ mod tests {
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
                 runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
             })
             .unwrap();
         // Three scan cycles with no JSONL and no sibling: the active

@@ -10429,6 +10429,7 @@ mod tests {
                 native_segment_seconds: None,
                 historical_n2_bootstrap: None,
                 runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
             })
             .unwrap();
         let started = std::time::Instant::now();
