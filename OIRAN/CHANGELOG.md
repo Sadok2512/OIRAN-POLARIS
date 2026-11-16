@@ -1,5 +1,10 @@
 # Changelog
 
+## OIRAN API 2.18.8 — 2026-11-16 — PFCP de nœud hors des sessions + NAS 5GS NEA0 (patch)
+
+- Constat Sadok (ladder d'une session rempli de « PFCP Heartbeat Request/Response ») : les messages PFCP de NŒUD (Heartbeat, Association, Node Report, PFD Management, Version Not Supported — TS 29.244 §7.4) ne sont plus jamais rattachés comme siblings ni utilisés comme clé (`pfcp_sequence` de nœud). Test `pfcp_heartbeat_sharing_the_sequence_is_never_pulled_into_a_session`.
+- Hydratation identités : `-o nas-5gs.null_decipher:TRUE` quand ce TShark connaît la préférence (sinon rien, raison journalisée). Utile seulement si l'AMF négocie NEA0 ; le lab négocie aujourd'hui 128-5G-EA2 (vérifié sur la fixture N2 : Security Mode Command EA2/IA2) → 5G-GUTI/5G-TMSI de la Registration Accept et IMEISV de la Security Mode Complete restent chiffrés : « non observé » est exact.
+
 ## OIRAN API 2.18.7 — 2026-11-15 — SBI rattaché par pseudonyme-seul (patch)
 
 **FAIL prod ANR1 #10 6901968948** : Live UE-201 reçoit **59 events SBI-HTTP2** du même abonné (prouvé côté trace Live), mais les sessions publiées (`5g-session-92e82900a18969c3`, `5g-session-eab5cc6d8c2b9131`) montrent **0 SBI rattaché** malgré 2.18.3 (dedup SBI preserve_occurrence). La cause n'est donc pas une perte de l'event SBI en amont, mais l'échec du match côté `attach_sbi_to_sessions`.

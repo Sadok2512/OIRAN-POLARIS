@@ -1405,7 +1405,9 @@ pub fn extend_items_with_pfcp_siblings_from_jsonl(
         if item.get("protocol").and_then(Value::as_str) != Some("PFCP") {
             continue;
         }
-        collect_pfcp_keys(item, &mut known_sequences, &mut known_seids);
+        if !is_pfcp_node_message(item) {
+            collect_pfcp_keys(item, &mut known_sequences, &mut known_seids);
+        }
         if let Some(interface) = pfcp_interface_of(item) {
             known_interfaces.insert(interface);
         }
@@ -1426,7 +1428,8 @@ pub fn extend_items_with_pfcp_siblings_from_jsonl(
         let Some(event_id) = value.get("event_id").and_then(Value::as_str) else {
             continue;
         };
-        if event_id.is_empty() || known_event_ids.contains(event_id) {
+        if event_id.is_empty() || known_event_ids.contains(event_id) || is_pfcp_node_message(value)
+        {
             continue;
         }
         let same_interface = match pfcp_interface_of(value) {
@@ -1443,6 +1446,24 @@ pub fn extend_items_with_pfcp_siblings_from_jsonl(
         items.sort_by(|a, b| canonical_sort_tuple(a).cmp(&canonical_sort_tuple(b)));
     }
     Ok(added)
+}
+
+/// 2.18.8 — messages PFCP de NŒUD (TS 29.244 §7.4 : Heartbeat,
+/// Association Setup/Update/Release, Node Report, PFD Management,
+/// Version Not Supported). Ils ne portent pas de SEID et leur
+/// `pfcp_sequence` est un compteur de nœud : ils n'appartiennent à aucune
+/// session (constat Sadok : ladder d'une session rempli de « PFCP
+/// Heartbeat Request/Response »). Jamais rattachés, jamais utilisés
+/// comme clé.
+fn is_pfcp_node_message(item: &Value) -> bool {
+    let name = item
+        .get("message_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    ["heartbeat", "association", "node report", "pfd management", "version not supported"]
+        .iter()
+        .any(|needle| name.contains(needle))
 }
 
 /// Interface d'un event PFCP (shape callflow `interface` ou JSONL brut
@@ -2696,6 +2717,26 @@ mod callflow_pfcp_insert_tests {
 mod pfcp_interface_guard_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pfcp_heartbeat_sharing_the_sequence_is_never_pulled_into_a_session() {
+        let dir = std::env::temp_dir().join(format!("rtp-hb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let request = json!({"event_id":"evt-req","capture_id":"c","interface":"N4","protocol":"PFCP",
+            "message_name":"PFCP Session Establishment Request","pfcp_sequence":"9",
+            "session_identifiers":[{"name":"pfcp_sequence","value":"9"}]});
+        let heartbeat = json!({"event_id":"evt-hb","capture_id":"c","interface":"N4","protocol":"PFCP",
+            "message_name":"PFCP Heartbeat Request","pfcp_sequence":"9",
+            "session_identifiers":[{"name":"pfcp_sequence","value":"9"}]});
+        std::fs::write(dir.join("oiran_events.jsonl"), format!("{}\n{}\n", request, heartbeat)).unwrap();
+        let mut events = vec![json!({"event_id":"evt-resp","protocol":"PFCP","interface":"N4",
+            "message_name":"PFCP Session Establishment Response",
+            "decoded_ie_tree":[{"name":"pfcp_sequence","source":"session_identifiers","value":"9"}]})];
+        insert_pfcp_siblings_into_callflow(&mut events, &dir).unwrap();
+        let ids: Vec<&str> = events.iter().map(|e| e["event_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["evt-req", "evt-resp"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sxab_pfcp_with_same_sequence_is_not_pulled_into_a_5g_n4_session() {

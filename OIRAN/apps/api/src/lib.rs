@@ -4024,6 +4024,36 @@ fn available_identity_fields() -> &'static std::collections::HashSet<String> {
     })
 }
 
+/// 2.18.8 — NAS 5GS protégé en intégrité avec chiffrement NULL (NEA0,
+/// premier de `ciphering_order` Open5GS en lab) : TShark ne dissèque le
+/// contenu (5G-GUTI/5G-TMSI de la Registration Accept, IMEISV de la
+/// Security Mode Complete) qu'avec `nas-5gs.null_decipher:TRUE`. Préférence
+/// ajoutée seulement si ce TShark la connaît (une préférence inconnue
+/// fait échouer la commande entière) — sinon rien, et la raison est
+/// journalisée une fois.
+fn tshark_nas_null_decipher_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let supported = Command::new("tshark")
+            .args(["-G", "defaultprefs"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| tshark_prefs_contain_null_decipher(&String::from_utf8_lossy(&output.stdout)))
+            .unwrap_or(false);
+        if !supported {
+            eprintln!("oiran-api: tshark sans préférence nas-5gs.null_decipher — NAS 5GS NEA0 non dissequé");
+        }
+        supported
+    })
+}
+
+fn tshark_prefs_contain_null_decipher(defaultprefs: &str) -> bool {
+    defaultprefs
+        .lines()
+        .any(|line| line.trim_start_matches(['#', ' ']).starts_with("nas-5gs.null_decipher:"))
+}
+
 /// `tshark -G fields` lines: `F\t<name>\t<abbrev>\t...` → set of abbrevs.
 fn parse_tshark_field_list(stdout: &str) -> std::collections::HashSet<String> {
     stdout
@@ -4247,8 +4277,12 @@ fn tshark_identities(
             .collect::<Vec<_>>()
             .join(" || ");
         let mut command = Command::new("tshark");
+        command.arg("-n");
+        if tshark_nas_null_decipher_supported() {
+            command.args(["-o", "nas-5gs.null_decipher:TRUE"]);
+        }
         command
-            .args(["-n", "-r"])
+            .arg("-r")
             .arg(&source)
             .args(["-Y", &filter, "-T", "fields"]);
         // 2.15.6 — only the fields this TShark knows: an unknown `-e` field
@@ -10452,6 +10486,15 @@ mod tests {
         let status = response.status();
         let payload = json_body(response).await;
         (status, payload)
+    }
+
+    #[test]
+    fn null_decipher_preference_is_detected_only_when_tshark_lists_it() {
+        assert!(tshark_prefs_contain_null_decipher(
+            "# Some comment\n#nas-5gs.null_decipher: FALSE\n"
+        ));
+        assert!(tshark_prefs_contain_null_decipher("nas-5gs.null_decipher: TRUE\n"));
+        assert!(!tshark_prefs_contain_null_decipher("#nas-eps.null_decipher: FALSE\n"));
     }
 
     /// 2.18.5 — ANR2 #10 6901691533 : p900 lit /sessions/filter, qui
