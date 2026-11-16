@@ -236,6 +236,17 @@ SEC("uprobe") int vtap_ssl_set_fd(struct pt_regs *ctx)
     return 0;
 }
 
+/* 2.21.6 — SSL_free(ssl) : oublie l'association SSL* → fd, pour qu'un SSL*
+ * réalloué à la même adresse ne reçoive pas un ancien fd (les tracepoints
+ * de syscalls n'étant plus attachés en permanence). */
+SEC("uprobe") int vtap_ssl_free(struct pt_regs *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct ssl_key key = {.tgid = id >> 32, .pad = 0, .ssl = PARM1(ctx)};
+    bpf_map_delete_elem(&ssl_fd, &key);
+    return 0;
+}
+
 /* Pendant un SSL_* actif sur ce thread, le premier syscall d'E/S révèle
  * le fd du socket (cas libcurl / BIO custom sans SSL_set_fd). */
 static __attribute__((always_inline)) int learn_fd(struct sys_enter_ctx *ctx)

@@ -1,4 +1,4 @@
-# POLARIS vTAP 2.21.4 (P1b) — SBI TLS visible sans clé
+# POLARIS vTAP 2.21.6 (P1b) — SBI TLS visible sans clé
 
 Agent eBPF `polaris-vtap` : uprobes sur `SSL_write`/`SSL_read` (+ `_ex`, `SSL_set_fd`) de la libssl des
 conteneurs Open5GS. Le HTTP/2 en clair est rejoué en pcap TCP normal (handshake synthétique, seq/ack

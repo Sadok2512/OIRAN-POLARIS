@@ -18,6 +18,7 @@
 //!   réassembleur).
 
 pub mod conn;
+pub mod fdlearn;
 pub mod pcap;
 pub mod record;
 pub mod synth;
