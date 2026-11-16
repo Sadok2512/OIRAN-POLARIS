@@ -1,5 +1,10 @@
 # Changelog
 
+## OIRAN API 2.21.12 — 2026-11-16 — version du commit 0179d48 (cache catalogue + test /health) (patch)
+
+- Correction de versionnage (revue Claude) : le commit `0179d48` ajoutait du code (cache du catalogue, test `/health` non bloqué) en gardant la version 2.21.11 déjà attribuée à `55ab6f5`. Deux binaires différents portaient donc le même numéro. Ce contenu devient **2.21.12** ; 2.21.11 désigne uniquement `55ab6f5` (classement des 30 opérations SBI).
+- Aucun changement de code dans ce commit : version, lock et CHANGELOG. `cargo test --locked -p oiran-api --lib` : 160 passed (+ 2 tests tshark, outil absent sur l'hôte de relecture) ; vTAP `--locked` : 15 passed.
+
 ## OIRAN API 2.21.11 — 2026-11-16 — SBI 30 ops + catalog cache + test /health non-bloqué (spec #9 6930315055)
 
 Lot sur `fix/oiran-2.21.10-analyzer` (à merger ensuite dans `feat/oiran-2.22.0-userplane`). Couvre les 3 premiers points de la spec 2.21.11 (#9 6930315055). Le point 4 (CPU/mémoire au repos) attend la trace `CONTINUOUS_IDLE_LOOP_TRACE` d'ANR1 → fix dans 2.21.12 si la trace n'arrive pas à temps.
