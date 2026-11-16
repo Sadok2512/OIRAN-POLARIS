@@ -5509,6 +5509,20 @@ impl CaptureManager {
         // `LiveDataset.zero_event_captures`.
         let mut zero_event_captures: Vec<String> = Vec::new();
         let endpoints = endpoint_map();
+        // 2.22.4 — state cross-capture pour UserPlaneSummary (P2.4).
+        // `UserplaneIndex` : table de corrélation TEID↔SEID↔SUPI
+        // alimentée par TOUS les events (N2/N3/N4/SBI) ; les jointures DL
+        // (amf_ue_ngap_id / ran_ue_ngap_id / seid) résolvent le pseudonym
+        // pour les TEID DL arrivant sans pseudonym propre.
+        // `UserPlaneSummaryAggregator` : 1 record par PDU session, fermé
+        // sur événement (PFCP Session Deletion, NGAP PDU Session Resource
+        // Release) ou sur inactivité, avec éviction LRU bornée mémoire.
+        let userplane_index = std::cell::RefCell::new(userplane_index::UserplaneIndex::new());
+        let userplane_summary = std::cell::RefCell::new(
+            userplane_summary::UserPlaneSummaryAggregator::new(
+                userplane_summary::UserPlaneSummaryConfig::default(),
+            ),
+        );
         for interface in interfaces {
             let mut files = capture_files_for(pcap_dir, &interface.interface);
             files.sort();
@@ -5561,6 +5575,22 @@ impl CaptureManager {
                     },
                     &pseudonym_key,
                     |event| {
+                        // 2.22.4 — alimente l'index multi-source
+                        // (N2/N3/N4/SBI) AVANT toute agrégation. Seuls les
+                        // events portant un identifier utile y sont
+                        // enregistrés ; les autres sont silencieusement
+                        // ignorés par `observe`.
+                        userplane_index.borrow_mut().observe(&event);
+                        // 2.22.4 — détection des events de contrôle qui
+                        // ferment une session PDU (PFCP Session Deletion,
+                        // NGAP PDU Session Resource Release). Ne consomme
+                        // pas l'event (continue dans le pipeline normal).
+                        {
+                            let index_ref = userplane_index.borrow();
+                            userplane_summary
+                                .borrow_mut()
+                                .observe_close_event(&event, &index_ref);
+                        }
                         // 2.9.5 (devmat #9 T1) : les keepalives (PFCP HB,
                         // Diameter Device-Watchdog, GTPv2 Echo, GTP-U Echo)
                         // sont toujours agrégés par (interface, paire de
@@ -5586,6 +5616,16 @@ impl CaptureManager {
                     Vec::new()
                 };
                 let keepalive_aggregates = keepalive_aggregator.finish();
+                // 2.22.4 — feed les N3 aggregates au UserPlaneSummaryAggregator
+                // (recolle UL/DL par PDU session via l'index). Les aggregates
+                // eux-mêmes restent écrits sur le spool pour compat descendante.
+                if !n3_aggregates.is_empty() {
+                    let index_ref = userplane_index.borrow();
+                    let mut summary_ref = userplane_summary.borrow_mut();
+                    for aggregate in &n3_aggregates {
+                        summary_ref.observe_n3_aggregate(aggregate, &index_ref);
+                    }
+                }
                 report.events = individual_events
                     .saturating_add(n3_aggregates.len())
                     .saturating_add(keepalive_aggregates.len());
@@ -5857,6 +5897,23 @@ impl CaptureManager {
                 if let Ok(bytes) = serde_json::to_vec_pretty(&vtap_state) {
                     let _ = atomic_write(path, &bytes);
                 }
+            }
+        }
+        // 2.22.4 — drain UserPlaneSummaryAggregator en fin de passe
+        // (toutes les sessions encore ouvertes sont fermées avec
+        // `end_of_stream`). Les sessions déjà fermées sur événement de
+        // contrôle (PFCP Session Deletion / NGAP Resource Release) ou
+        // évincées par LRU sont déjà dans la file ; cet appel final
+        // garantit qu'aucune session n'est perdue par la coupe.
+        {
+            let mut summary = userplane_summary.borrow_mut();
+            summary.finish();
+            let probe_stamp = crate::capture_source::vprobe_stamp();
+            for event in summary.drain() {
+                decoded_spool
+                    .write_all(event.to_json_with_probe(&probe_stamp).as_bytes())
+                    .and_then(|_| decoded_spool.write_all(b"\n"))
+                    .map_err(display_error)?;
             }
         }
         decoded_spool.flush().map_err(display_error)?;

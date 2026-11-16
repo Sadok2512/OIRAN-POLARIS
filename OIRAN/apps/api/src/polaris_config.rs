@@ -73,24 +73,58 @@ pub struct PolarisConfig {
 /// `captured_length`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserplaneConfig {
+    /// 2.22.4 — bascule iso-comportement. `false` par défaut : la sonde
+    /// ne publie AUCUN record `UserPlaneSummary` (iso-comportement
+    /// 2.22.3). À passer à `true` pour activer la vue par PDU session.
+    #[serde(default)]
+    pub enabled: bool,
     /// Snaplen BPF pour les interfaces N3 (après l'entête GTP-U).
     /// Défaut : 128 octets — suffisant pour IPv4/IPv6 + TCP/UDP +
     /// options SACK/Timestamps (cf. PHASE1-2.md §4.5). La sonde
     /// capture `L2 + L3 externe + GTP-U header + snaplen_n3_bytes`.
     #[serde(default = "default_snaplen_n3_bytes")]
     pub snaplen_n3_bytes: u32,
+    /// 2.22.4 — largeur du bucket de throughput, en nanosecondes.
+    /// Défaut 1 s (OP2.3 tranché #9 6927882355). Recommandation prod 5 s.
+    #[serde(default = "default_window_ns")]
+    pub window_ns: i128,
+    /// 2.22.4 — timeout d'inactivité d'une session PDU avant
+    /// fermeture automatique du `UserPlaneSummary`. Défaut 300 s.
+    #[serde(default = "default_inactivity_timeout_ns")]
+    pub inactivity_timeout_ns: i128,
+    /// 2.22.4 — nombre maximum de `UserPlaneSummary` actifs
+    /// simultanément. Au-delà : éviction LRU avec event tracé.
+    /// Défaut 4096.
+    #[serde(default = "default_max_summaries")]
+    pub max_summaries: usize,
 }
 
 impl Default for UserplaneConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             snaplen_n3_bytes: default_snaplen_n3_bytes(),
+            window_ns: default_window_ns(),
+            inactivity_timeout_ns: default_inactivity_timeout_ns(),
+            max_summaries: default_max_summaries(),
         }
     }
 }
 
 fn default_snaplen_n3_bytes() -> u32 {
     128
+}
+
+fn default_window_ns() -> i128 {
+    1_000_000_000
+}
+
+fn default_inactivity_timeout_ns() -> i128 {
+    300_000_000_000
+}
+
+fn default_max_summaries() -> usize {
+    4096
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

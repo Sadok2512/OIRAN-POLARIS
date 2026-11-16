@@ -1,5 +1,113 @@
 # Changelog
 
+## OIRAN API 2.22.4 — 2026-11-16 — jointure DL TEID + buckets throughput + câblage pipeline (iso-comportement par défaut)
+
+Lot P2.4 — ferme les 3 points demandés en tête par Sadok (#9 6928930450) et ajoute les buckets throughput + câblage pipeline multi-capture.
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.22.3 | **2.22.4** |
+| `live-probe` | 0.7.0 | **0.7.1** |
+
+### Point 1/3 — lock vTAP propagé (règle #9)
+
+Commit `d0ab5b7` : `cd OIRAN/vtap && cargo update -w && cargo test --locked` après bump `decoder-gtpu 0.2.1 → 0.3.0`. Sortie : 16 unit + 3 integration = 19 passed. Règle mémorisée pour tous les futurs bumps shared.
+
+### Point 2/3 — merge `76bae04` (polaris-vtap 2.21.6) sans force-push
+
+Commit `d9c49be` : merge non-destructif de `76bae04` (fd tracepoints à la demande + SSL_free, base essai vTAP 5 ANR2) dans la branche `feat/oiran-2.22.0-userplane`. Conflit CHANGELOG résolu en ordre chronologique.
+
+### Point 3/3 — jointure DL TEID via (amf/ran_ue_ngap_id, pdu_session_id) + SEID
+
+`live-probe::userplane_index` élargi avec 3 indices secondaires :
+- `by_amf_pdu: BTreeMap<(u64, u8), String>` — résout par `(amf_ue_ngap_id, pdu_session_id)` ;
+- `by_ran_pdu: BTreeMap<(u64, u8), String>` — même sémantique via `ran_ue_ngap_id` ;
+- `by_seid: BTreeMap<u64, String>` — via la session PFCP.
+
+Dans `observe()` :
+1. Si le patch courant n'a **pas** de `subscriber_pseudonym`, tente la résolution via les clés secondaires.
+2. Si le patch **a** un pseudonym + une clé secondaire, enregistre la jointure pour les events suivants (ex. NGAP PDUSessionResourceSetupResponse portant DL TEID sans pseudonym).
+
+**Résultat attendu sur UE-201** : les deux TEID d'une PDU session (UL seedé par SBI, DL seedé par NGAP Setup Response) résolvent vers le **même** `subscriber_pseudonym`. Plus de `USERPLANE_INDEX_MISS` sur la direction DL quand la UL est seedée.
+
+**3 nouveaux tests** (12 au total dans `userplane_index`) :
+- `dl_teid_resolves_via_amf_ue_ngap_id_and_pdu_session_id_join`
+- `dl_teid_resolves_via_ran_ue_ngap_id_and_pdu_session_id_join`
+- `dl_teid_resolves_via_seid_join_when_ngap_ids_absent`
+
+### Buckets throughput (OP2.3 tranché)
+
+`UserPlaneSummaryConfig` étendu :
+- `window_ns: i128` (défaut `1_000_000_000` = 1 s ; recommandation prod 5 s) ;
+- `max_buckets: usize` (défaut 3600, protège les sessions très longues).
+
+Dans `observe_n3_aggregate` : chaque aggregate N3 dépose `wire_bytes` dans le bucket `(last_seen_ns - summary.first_seen_ns) / window_ns`, section `ul_bytes_per_window` ou `dl_bytes_per_window` selon la direction.
+
+IEs émises : `ul_bytes_per_window` et `dl_bytes_per_window` sous forme CSV (`"1000,2000,3000"`).
+
+**Test** `throughput_buckets_reflect_window_ns_configurable` : 3 aggregates UL à `t0, t0+1s, t0+2s` → `"1000,2000,3000"`.
+
+### Câblage pipeline `process_capture_into_selected` (cross-capture)
+
+État partagé via `RefCell` à la vie de `process_capture_into_selected` (toutes les captures N2/N3/N4/SBI/… d'une passe) :
+
+```rust
+let userplane_index   = RefCell::new(UserplaneIndex::new());
+let userplane_summary = RefCell::new(UserPlaneSummaryAggregator::new(
+    UserPlaneSummaryConfig::default(),
+));
+```
+
+Dans la callback `decode_capture_streaming` :
+1. `userplane_index.observe(&event)` — alimente l'index pour TOUT event (N2/N3/N4/SBI) ;
+2. `userplane_summary.observe_close_event(&event, &index)` — détecte PFCP Session Deletion / NGAP PDU Session Resource Release ;
+3. Chemin existant inchangé : keepalive → N3 aggregator → spool.
+
+Après `n3_aggregator.finish()` : chaque GTP-U aggregate est feed à `userplane_summary.observe_n3_aggregate(&aggregate, &index)`.
+
+En fin de passe (avant `publish_events_to_dataset_dir`) : `userplane_summary.finish()` ferme tous les records encore ouverts avec `closed_reason=end_of_stream`, puis `drain()` écrit dans le spool avec le `probe_stamp` normal.
+
+### Gate iso-comportement (défaut `enabled = false`)
+
+`UserPlaneSummaryConfig.enabled: bool` (défaut **false**) : la sonde ne publie **aucun** record `UserPlaneSummary` en production tant que la clé `polaris.toml [userplane] enabled = true` n'est pas posée. Iso-comportement 2.22.3 préservé pour tous les tests existants et déploiements actuels.
+
+`polaris.toml [userplane]` étendu : `enabled`, `snaplen_n3_bytes`, `window_ns`, `inactivity_timeout_ns`, `max_summaries`.
+
+### Tests (tous passés)
+
+```bash
+cargo test -p live-probe   --lib --locked       # 186 passed, 6 ignored, 0 failed
+cargo test -p decoder-gtpu --lib --locked       # 11 passed
+cargo test -p oiran-api    --lib userplane      # 2 passed (polaris_config)
+cd OIRAN/vtap && cargo test --locked            # 16 unit + 3 integration = 19 passed
+```
+
+### Session de référence lab (C4)
+
+La commande d'acceptation UE-201 sur session lab `5g-session-0bfac1e7ae159a77` nécessite :
+1. `polaris.toml [userplane] enabled = true` sur l'hôte lab.
+2. Rerun via **ANR2 sous `LAB_LOCK`** pour générer `oiran_events.jsonl` incluant les records `UserPlane Summary (aggregated)`.
+3. Vérification :
+```bash
+jq -r 'select(.decoder_name=="live-probe-userplane-summary-aggregator") |
+       [(.session_identifiers[]|select(.name=="subscriber_pseudonym")|.value),
+        (.session_identifiers[]|select(.name=="pdu_session_id")|.value),
+        (.information_elements[]|select(.name=="ul_bytes")|.value),
+        (.information_elements[]|select(.name=="dl_bytes")|.value),
+        (.information_elements[]|select(.name=="closed_reason")|.value)] | @tsv' \
+  /chemin/vers/oiran_events.jsonl
+```
+
+Attendu : **1 ligne** avec un seul `subscriber_pseudonym` non vide, `ul_bytes > 0`, `dl_bytes > 0`, `closed_reason` dans `{pfcp_session_deletion, ngap_pdu_session_resource_release, inactivity_timeout, end_of_stream}`.
+
+Demande `LAB_LOCK` ANR2 à envoyer en parallèle sur #10 pour ce run.
+
+### Suite
+
+**2.22.5** : route API `GET /sessions/{id}/userplane/summary` + colonnes catalogue (`ul_bytes`, `dl_bytes`, `qfi`, `five_qi`, `duration_ms`). **2.22.6** : rétention 7 jours glissante. Chaînage sans pause.
+
 ## OIRAN API 2.22.3 — 2026-11-16 — UserPlaneSummary aggregator (fermeture sur événement + éviction LRU)
 
 Lot P2.3 — `UserPlaneSummaryAggregator` qui recolle UL/DL par PDU session, se ferme sur événement de contrôle (PFCP Session Deletion / NGAP PDU Session Resource Release) ou sur inactivité, et borne la mémoire par éviction LRU ordonnée (correction C2 #9 6927882355).

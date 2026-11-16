@@ -142,17 +142,27 @@ impl UserplaneIndexEntry {
 
 /// Table de corrélation partagée sur l'ensemble des captures N2/N3/N4/SBI.
 ///
-/// Indexée **par TEID** (UL et DL pointent vers la même entrée logique via
-/// `canonical_by_teid`). Une seconde table `by_subscriber` facilite le
-/// recoupement avec le NAS en clair pour émettre `USERPLANE_NAS_CLEARTEXT_SEEN`
-/// quand un subscriber_pseudonym vient du NAS secondaire sur un réseau qui
-/// devrait l'avoir chiffré.
+/// Indexée **par TEID** (UL et DL pointent vers la même entrée logique).
+///
+/// Indices secondaires (2.22.4, correction #9 6928930450) : `by_amf_pdu`,
+/// `by_ran_pdu` et `by_seid` résolvent le `subscriber_pseudonym` d'un
+/// TEID DL arrivant SANS pseudonym propre (NGAP PDUSessionResourceSetup
+/// Response côté gNB), via jointure sur `(amf_ue_ngap_id, pdu_session_id)`,
+/// `(ran_ue_ngap_id, pdu_session_id)` ou `seid`. Sans cette jointure,
+/// le TEID DL resterait en `USERPLANE_INDEX_MISS` et le `UserPlaneSummary`
+/// serait à moitié vide.
 #[derive(Default, Debug)]
 pub struct UserplaneIndex {
     /// Clé = `teid` en représentation hexadécimale `0x12345678` (format
     /// émis par `decoder-gtpu`, `decoder-pfcp`, `decoder-ngap`).
     by_teid: BTreeMap<String, UserplaneIndexEntry>,
     by_subscriber: BTreeMap<String, Vec<String>>, // pseudonym → [teids]
+    /// 2.22.4 — jointure `(amf_ue_ngap_id, pdu_session_id) → subscriber_pseudonym`.
+    by_amf_pdu: BTreeMap<(u64, u8), String>,
+    /// 2.22.4 — jointure `(ran_ue_ngap_id, pdu_session_id) → subscriber_pseudonym`.
+    by_ran_pdu: BTreeMap<(u64, u8), String>,
+    /// 2.22.4 — jointure `seid → subscriber_pseudonym` (via PFCP Session).
+    by_seid: BTreeMap<u64, String>,
     miss_seen: BTreeSet<(String, String)>,         // (teid, direction)
     nas_cleartext_seen: BTreeSet<String>,          // pseudonyms déjà loggés
 }
@@ -170,7 +180,45 @@ impl UserplaneIndex {
     pub fn observe(&mut self, event: &NormalizedEvent) -> Vec<SourceKind> {
         let mut triggered = Vec::new();
         for source in classify_sources(event) {
-            if let Some((teid_keys, patch)) = extract_patch(event, source) {
+            if let Some((teid_keys, mut patch)) = extract_patch(event, source) {
+                // 2.22.4 — jointure DL (correction #9 6928930450) :
+                // (1) si l'event n'a pas de pseudonym propre, tente
+                // la résolution via les clés secondaires `(amf, pdu)`,
+                // `(ran, pdu)` ou `seid`.
+                if patch.subscriber_pseudonym.is_none() {
+                    if let Some(pseudo) = self.resolve_pseudonym_via_joins(&patch) {
+                        patch.subscriber_pseudonym = Some(pseudo);
+                        // La source d'origine du pseudonym est celle qui l'a
+                        // enregistré ; on le laisse sur `source` du patch
+                        // courant pour signaler que le lookup vient d'un
+                        // event propagé — l'enregistrement initial dans
+                        // `by_amf_pdu/by_ran_pdu/by_seid` conserve la source
+                        // primaire sur l'entrée correspondante dans
+                        // `by_teid`. Ici on propage simplement.
+                    }
+                }
+                // (2) si l'event porte un pseudonym, on l'enregistre dans
+                // les secondary indexes pour qu'un event ultérieur sans
+                // pseudonym puisse le retrouver.
+                if let Some(pseudo) = patch.subscriber_pseudonym.as_ref() {
+                    if let (Some(amf), Some(pdu)) =
+                        (patch.amf_ue_ngap_id, patch.pdu_session_id)
+                    {
+                        self.by_amf_pdu.entry((amf, pdu)).or_insert_with(|| pseudo.clone());
+                    }
+                    if let (Some(ran), Some(pdu)) =
+                        (patch.ran_ue_ngap_id, patch.pdu_session_id)
+                    {
+                        self.by_ran_pdu.entry((ran, pdu)).or_insert_with(|| pseudo.clone());
+                    }
+                    if let Some(seid) = patch.seid_smf {
+                        self.by_seid.entry(seid).or_insert_with(|| pseudo.clone());
+                    }
+                    if let Some(seid) = patch.seid_upf {
+                        self.by_seid.entry(seid).or_insert_with(|| pseudo.clone());
+                    }
+                }
+
                 for teid in teid_keys {
                     self.upsert(&teid, patch.clone(), source);
                 }
@@ -189,6 +237,33 @@ impl UserplaneIndex {
             }
         }
         triggered
+    }
+
+    /// Jointure secondaire pour résoudre un pseudonym manquant via
+    /// `(amf_ue_ngap_id, pdu_session_id)`, `(ran_ue_ngap_id, pdu_session_id)`
+    /// ou `seid`.
+    fn resolve_pseudonym_via_joins(&self, patch: &UserplaneIndexEntry) -> Option<String> {
+        if let (Some(amf), Some(pdu)) = (patch.amf_ue_ngap_id, patch.pdu_session_id) {
+            if let Some(pseudo) = self.by_amf_pdu.get(&(amf, pdu)) {
+                return Some(pseudo.clone());
+            }
+        }
+        if let (Some(ran), Some(pdu)) = (patch.ran_ue_ngap_id, patch.pdu_session_id) {
+            if let Some(pseudo) = self.by_ran_pdu.get(&(ran, pdu)) {
+                return Some(pseudo.clone());
+            }
+        }
+        if let Some(seid) = patch.seid_smf {
+            if let Some(pseudo) = self.by_seid.get(&seid) {
+                return Some(pseudo.clone());
+            }
+        }
+        if let Some(seid) = patch.seid_upf {
+            if let Some(pseudo) = self.by_seid.get(&seid) {
+                return Some(pseudo.clone());
+            }
+        }
+        None
     }
 
     /// Lookup par TEID. Retourne `None` si le TEID n'a jamais été vu. L'appelant
@@ -722,5 +797,110 @@ mod tests {
         assert_eq!(normalize_teid_key("0X96A8"), "0x000096a8");
         assert_eq!(normalize_teid_key("0x000096a8"), "0x000096a8");
         assert_eq!(normalize_teid_key("38568"), "0x000096a8"); // décimal
+    }
+
+    /// 2.22.4 (correction #9 6928930450) — scénario UE-201 réel :
+    /// 1. SBI `CreateSMContext` apporte `subscriber_pseudonym` + UL TEID (UPF).
+    /// 2. NGAP `PDUSessionResourceSetupResponse` apporte le DL TEID (gNB) mais
+    ///    AUCUN pseudonym propre. Jointure par `(amf_ue_ngap_id,
+    ///    pdu_session_id)` → le DL TEID doit résoudre vers le même
+    ///    `sha256:pseudo-ue201`.
+    #[test]
+    fn dl_teid_resolves_via_amf_ue_ngap_id_and_pdu_session_id_join() {
+        let mut index = UserplaneIndex::new();
+        // Étape 1 : SBI pose pseudonym + amf_ue_ngap_id + pdu_session_id sur le UL TEID.
+        index.observe(&make_event(
+            Protocol::SbiHttp2,
+            "SBI",
+            "Nsmf_PDUSession CreateSMContext",
+            vec![
+                ("teid", "0x000096a8", false),
+                ("subscriber_pseudonym", "sha256:pseudo-ue201", true),
+                ("pdu_session_id", "1", false),
+                ("amf_ue_ngap_id", "73", false),
+            ],
+        ));
+        // Étape 2 : NGAP PDUSessionResourceSetupResponse — DL TEID + mêmes
+        // (amf_ue_ngap_id, pdu_session_id), PAS de subscriber_pseudonym.
+        index.observe(&make_event(
+            Protocol::Ngap,
+            "N2",
+            "PDUSessionResourceSetupResponse",
+            vec![
+                ("gtp_teid_dl", "0x00000003", false),
+                ("pdu_session_id", "1", false),
+                ("amf_ue_ngap_id", "73", false),
+            ],
+        ));
+        // Vérification : le DL TEID doit porter le pseudonym SBI.
+        let dl = index.lookup("0x00000003").expect("DL TEID indexed");
+        assert_eq!(
+            dl.subscriber_pseudonym.as_deref(),
+            Some("sha256:pseudo-ue201"),
+            "DL TEID doit résoudre via (amf_ue_ngap_id, pdu_session_id) → même pseudonym que UL"
+        );
+    }
+
+    /// 2.22.4 — variante jointure via `(ran_ue_ngap_id, pdu_session_id)`
+    /// quand l'event NGAP DL ne porte que `ran_ue_ngap_id`.
+    #[test]
+    fn dl_teid_resolves_via_ran_ue_ngap_id_and_pdu_session_id_join() {
+        let mut index = UserplaneIndex::new();
+        index.observe(&make_event(
+            Protocol::SbiHttp2,
+            "SBI",
+            "Nsmf_PDUSession CreateSMContext",
+            vec![
+                ("teid", "0x000096a8", false),
+                ("subscriber_pseudonym", "sha256:pseudo-ue201", true),
+                ("pdu_session_id", "1", false),
+                ("ran_ue_ngap_id", "4", false),
+            ],
+        ));
+        index.observe(&make_event(
+            Protocol::Ngap,
+            "N2",
+            "PDUSessionResourceSetupResponse",
+            vec![
+                ("gtp_teid_dl", "0x00000003", false),
+                ("pdu_session_id", "1", false),
+                ("ran_ue_ngap_id", "4", false),
+            ],
+        ));
+        let dl = index.lookup("0x00000003").expect("DL TEID indexed");
+        assert_eq!(dl.subscriber_pseudonym.as_deref(), Some("sha256:pseudo-ue201"));
+    }
+
+    /// 2.22.4 — jointure par SEID (PFCP) : l'UL TEID est posé par SBI avec
+    /// un pseudonym + seid ; un évenement PFCP Session Modification sur le
+    /// même SEID portant le DL TEID (OuterHeaderCreation côté UPF → gNB)
+    /// résout ce DL TEID via le SEID commun.
+    #[test]
+    fn dl_teid_resolves_via_seid_join_when_ngap_ids_absent() {
+        let mut index = UserplaneIndex::new();
+        // PFCP Session Establishment : pose seid + pseudonym + UL TEID.
+        index.observe(&make_event(
+            Protocol::Pfcp,
+            "N4",
+            "Session Establishment Request",
+            vec![
+                ("teid", "0x000096a8", false),
+                ("f_seid", "0x0123456789abcdef", false),
+                ("subscriber_pseudonym", "sha256:pseudo-ue201", true),
+            ],
+        ));
+        // PFCP Session Modification : DL TEID (depuis OuterHeaderCreation)
+        // sur même seid, sans pseudonym direct dans l'event.
+        index.observe(&make_event(
+            Protocol::Pfcp,
+            "N4",
+            "Session Modification Request",
+            vec![
+                ("teid", "0x00000003", false),
+                ("f_seid", "0x0123456789abcdef", false),
+            ],
+        ));
+        let dl = index.lookup("0x00000003").expect("DL TEID indexed via seid join");
+        assert_eq!(dl.subscriber_pseudonym.as_deref(), Some("sha256:pseudo-ue201"));
     }
 }

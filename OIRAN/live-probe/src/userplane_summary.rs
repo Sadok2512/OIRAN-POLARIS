@@ -44,18 +44,33 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [userplane]` au câblage 2.22.4.
 #[derive(Clone, Copy, Debug)]
 pub struct UserPlaneSummaryConfig {
+    /// 2.22.4 — gate iso-comportement : `false` par défaut, la sonde ne
+    /// publie AUCUN record `UserPlaneSummary` (iso-comportement 2.22.3).
+    /// À passer à `true` via `polaris.toml [userplane] enabled = true`
+    /// quand l'opérateur veut activer la vue par PDU session.
+    pub enabled: bool,
     /// Timeout d'inactivité en nanosecondes. Défaut 300 s.
     pub inactivity_timeout_ns: i128,
     /// Nombre maximum d'entrées actives simultanément. Au-delà, LRU
     /// éviction. Défaut 4096.
     pub max_summaries: usize,
+    /// 2.22.4 — largeur d'un bucket de throughput en nanosecondes.
+    /// Défaut 1 s (OP2.3 tranché #9 6927882355). Recommandation prod 5 s.
+    pub window_ns: i128,
+    /// 2.22.4 — borne haute sur le nombre de buckets par session
+    /// (évite qu'une session très longue n'alloue un vecteur immense).
+    /// Défaut 3600 (1 h à window 1 s, ou 5 h à window 5 s).
+    pub max_buckets: usize,
 }
 
 impl Default for UserPlaneSummaryConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             inactivity_timeout_ns: 300_000_000_000, // 300 s
             max_summaries: 4096,
+            window_ns: 1_000_000_000, // 1 s
+            max_buckets: 3600,
         }
     }
 }
@@ -99,6 +114,10 @@ struct Summary {
     last_packet_ul: Option<PacketReference>,
     first_packet_dl: Option<PacketReference>,
     last_packet_dl: Option<PacketReference>,
+    /// 2.22.4 — buckets throughput indexés depuis `first_seen_ns` par
+    /// pas de `window_ns`. Alloué à la demande, borné par `max_buckets`.
+    ul_bytes_per_window: Vec<u64>,
+    dl_bytes_per_window: Vec<u64>,
 }
 
 /// Raison de clôture d'un record.
@@ -149,6 +168,9 @@ impl UserPlaneSummaryAggregator {
         aggregate: &NormalizedEvent,
         index: &UserplaneIndex,
     ) {
+        if !self.config.enabled {
+            return;
+        }
         if aggregate.protocol != Protocol::Gtpu || aggregate.message_type != 255 {
             return;
         }
@@ -196,6 +218,7 @@ impl UserPlaneSummaryAggregator {
             self.evict_lru();
         }
 
+        let is_new_entry = !self.summaries.contains_key(&key);
         let summary = self.summaries.entry(key.clone()).or_insert_with(|| Summary {
             key: key.clone(),
             subscriber_pseudonym: index_entry
@@ -226,15 +249,24 @@ impl UserPlaneSummaryAggregator {
             last_packet_ul: None,
             first_packet_dl: None,
             last_packet_dl: None,
+            ul_bytes_per_window: Vec::new(),
+            dl_bytes_per_window: Vec::new(),
         });
         if summary.qfi.is_none() {
             summary.qfi = qfi;
         }
-        if first_seen_ns != 0 && (summary.first_seen_ns == 0 || first_seen_ns < summary.first_seen_ns) {
+        if is_new_entry {
+            // Première observation : adopte les bornes de cet aggregate
+            // (évite d'écraser avec 0 ou avec le dernier ns).
             summary.first_seen_ns = first_seen_ns;
-        }
-        if last_seen_ns > summary.last_seen_ns {
             summary.last_seen_ns = last_seen_ns;
+        } else {
+            if first_seen_ns < summary.first_seen_ns {
+                summary.first_seen_ns = first_seen_ns;
+            }
+            if last_seen_ns > summary.last_seen_ns {
+                summary.last_seen_ns = last_seen_ns;
+            }
         }
         if direction_is_ul {
             summary.ul_bytes = summary.ul_bytes.saturating_add(wire_bytes);
@@ -246,6 +278,14 @@ impl UserPlaneSummaryAggregator {
             if summary.teid_ul.is_none() {
                 summary.teid_ul = teid_num;
             }
+            Self::deposit_bucket(
+                &mut summary.ul_bytes_per_window,
+                summary.first_seen_ns,
+                last_seen_ns,
+                wire_bytes,
+                self.config.window_ns,
+                self.config.max_buckets,
+            );
         } else if direction_is_dl {
             summary.dl_bytes = summary.dl_bytes.saturating_add(wire_bytes);
             summary.dl_packets = summary.dl_packets.saturating_add(packet_count);
@@ -256,7 +296,38 @@ impl UserPlaneSummaryAggregator {
             if summary.teid_dl.is_none() {
                 summary.teid_dl = teid_num;
             }
+            Self::deposit_bucket(
+                &mut summary.dl_bytes_per_window,
+                summary.first_seen_ns,
+                last_seen_ns,
+                wire_bytes,
+                self.config.window_ns,
+                self.config.max_buckets,
+            );
         }
+    }
+
+    /// 2.22.4 — dépose `bytes` dans le bucket qui contient `last_seen_ns`
+    /// (bucket = `(last_seen_ns - first_seen_ns) / window_ns`). Borné par
+    /// `max_buckets` ; au-delà, le dernier bucket accumule.
+    fn deposit_bucket(
+        buckets: &mut Vec<u64>,
+        first_seen_ns: i128,
+        last_seen_ns: i128,
+        bytes: u64,
+        window_ns: i128,
+        max_buckets: usize,
+    ) {
+        if window_ns <= 0 || last_seen_ns < first_seen_ns {
+            return;
+        }
+        let bucket_i128 = (last_seen_ns - first_seen_ns) / window_ns;
+        let bucket = usize::try_from(bucket_i128).unwrap_or(max_buckets.saturating_sub(1));
+        let bucket = bucket.min(max_buckets.saturating_sub(1));
+        if buckets.len() <= bucket {
+            buckets.resize(bucket + 1, 0);
+        }
+        buckets[bucket] = buckets[bucket].saturating_add(bytes);
     }
 
     /// Détecte un event de contrôle qui ferme une session (PFCP Session
@@ -267,6 +338,9 @@ impl UserPlaneSummaryAggregator {
         event: &NormalizedEvent,
         index: &UserplaneIndex,
     ) -> bool {
+        if !self.config.enabled {
+            return false;
+        }
         let reason = classify_close(event);
         let Some(reason) = reason else {
             return false;
@@ -498,6 +572,18 @@ fn render_summary(summary: Summary, reason: CloseReason) -> NormalizedEvent {
     } else {
         0
     };
+    let ul_buckets = summary
+        .ul_bytes_per_window
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let dl_buckets = summary
+        .dl_bytes_per_window
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let information_elements = vec![
         ie("ul_bytes", summary.ul_bytes.to_string()),
         ie("ul_packets", summary.ul_packets.to_string()),
@@ -507,6 +593,8 @@ fn render_summary(summary: Summary, reason: CloseReason) -> NormalizedEvent {
         ie("last_seen_ns", summary.last_seen_ns.to_string()),
         ie("duration_ns", duration_ns.to_string()),
         ie("closed_reason", reason.as_str().into()),
+        ie("ul_bytes_per_window", ul_buckets),
+        ie("dl_bytes_per_window", dl_buckets),
     ];
     let mut packet_references = Vec::new();
     for packet in [
@@ -791,7 +879,10 @@ mod tests {
     #[test]
     fn ue201_scenario_5_ul_5_dl_collapsed_into_one_user_plane_summary_650_650() {
         let index = seed_index_for_ue201();
-        let mut aggregator = UserPlaneSummaryAggregator::new(UserPlaneSummaryConfig::default());
+        let mut aggregator = UserPlaneSummaryAggregator::new(UserPlaneSummaryConfig {
+            enabled: true,
+            ..UserPlaneSummaryConfig::default()
+        });
         aggregator.observe_n3_aggregate(
             &n3_aggregate("0x000096a8", Direction::Uplink, 5, 7500, 1_000, 5_000, (1, 5)),
             &index,
@@ -833,7 +924,10 @@ mod tests {
     #[test]
     fn pfcp_session_deletion_closes_summary_and_emits_closed_reason() {
         let index = seed_index_for_ue201();
-        let mut aggregator = UserPlaneSummaryAggregator::new(UserPlaneSummaryConfig::default());
+        let mut aggregator = UserPlaneSummaryAggregator::new(UserPlaneSummaryConfig {
+            enabled: true,
+            ..UserPlaneSummaryConfig::default()
+        });
         aggregator.observe_n3_aggregate(
             &n3_aggregate("0x000096a8", Direction::Uplink, 5, 7500, 1_000, 5_000, (1, 5)),
             &index,
@@ -903,8 +997,10 @@ mod tests {
     fn inactivity_tick_closes_stale_summaries() {
         let index = seed_index_for_ue201();
         let config = UserPlaneSummaryConfig {
+            enabled: true,
             inactivity_timeout_ns: 100,
             max_summaries: 4096,
+            ..UserPlaneSummaryConfig::default()
         };
         let mut aggregator = UserPlaneSummaryAggregator::new(config);
         aggregator.observe_n3_aggregate(
@@ -929,8 +1025,10 @@ mod tests {
     fn lru_eviction_closes_oldest_summary_as_memory_pressure_never_panics() {
         let index = seed_index_for_ue201();
         let config = UserPlaneSummaryConfig {
+            enabled: true,
             inactivity_timeout_ns: 3_600_000_000_000,
             max_summaries: 2,
+            ..UserPlaneSummaryConfig::default()
         };
         let mut aggregator = UserPlaneSummaryAggregator::new(config);
         aggregator.observe_n3_aggregate(
@@ -958,10 +1056,74 @@ mod tests {
         assert_eq!(events[0].message_name, "UserPlane Summary (evicted)");
     }
 
+    /// 2.22.4 — `ul_bytes_per_window` / `dl_bytes_per_window` : trois
+    /// aggregates UL espacés de 1 s (`window_ns = 1_000_000_000`) doivent
+    /// produire 3 buckets non vides.
+    #[test]
+    fn throughput_buckets_reflect_window_ns_configurable() {
+        let index = seed_index_for_ue201();
+        let config = UserPlaneSummaryConfig {
+            enabled: true,
+            window_ns: 1_000_000_000, // 1 s
+            ..UserPlaneSummaryConfig::default()
+        };
+        let mut aggregator = UserPlaneSummaryAggregator::new(config);
+        // 3 aggregates UL à t0, t0+1s, t0+2s (same session ue201).
+        aggregator.observe_n3_aggregate(
+            &n3_aggregate(
+                "0x000096a8",
+                Direction::Uplink,
+                1,
+                1000,
+                0,
+                0,
+                (1, 1),
+            ),
+            &index,
+        );
+        aggregator.observe_n3_aggregate(
+            &n3_aggregate(
+                "0x000096a8",
+                Direction::Uplink,
+                1,
+                2000,
+                1_000_000_000,
+                1_000_000_000,
+                (2, 2),
+            ),
+            &index,
+        );
+        aggregator.observe_n3_aggregate(
+            &n3_aggregate(
+                "0x000096a8",
+                Direction::Uplink,
+                1,
+                3000,
+                2_000_000_000,
+                2_000_000_000,
+                (3, 3),
+            ),
+            &index,
+        );
+        aggregator.finish();
+        let events = aggregator.drain();
+        assert_eq!(events.len(), 1);
+        let ul_buckets = events[0]
+            .information_elements
+            .iter()
+            .find(|element| element.name == "ul_bytes_per_window")
+            .and_then(|element| element.value.as_deref())
+            .expect("ul_bytes_per_window émis");
+        assert_eq!(ul_buckets, "1000,2000,3000");
+    }
+
     #[test]
     fn ngap_pdu_session_resource_release_also_closes_summary() {
         let index = seed_index_for_ue201();
-        let mut aggregator = UserPlaneSummaryAggregator::new(UserPlaneSummaryConfig::default());
+        let mut aggregator = UserPlaneSummaryAggregator::new(UserPlaneSummaryConfig {
+            enabled: true,
+            ..UserPlaneSummaryConfig::default()
+        });
         aggregator.observe_n3_aggregate(
             &n3_aggregate("0x000096a8", Direction::Uplink, 5, 7500, 1_000, 5_000, (1, 5)),
             &index,
