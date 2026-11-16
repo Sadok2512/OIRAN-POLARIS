@@ -176,7 +176,7 @@ impl Default for CpuSafetyPolicy {
             throttle_recovery_ratio: 0.05,
             shared_headroom_cpus: 1.0,
             psi_cgroup: Some(
-                std::env::var("POLARIS_CPU_PSI_CGROUP").unwrap_or_else(|_| "/system.slice".into()),
+                std::env::var("POLARIS_CPU_PSI_CGROUP").unwrap_or_else(|_| "/system.slice/docker-*.scope".into()),
             ),
         }
     }
@@ -289,18 +289,29 @@ impl CpuSafetyMonitor {
             self.previous_cpu = Some((counters, now));
         }
 
-        let cgroup_pressure = self.policy.psi_cgroup.as_deref().and_then(|cg| {
-            fs::read_to_string(
-                self.cgroup_root
-                    .join(cg.trim_start_matches('/'))
-                    .join("cpu.pressure"),
-            )
-            .ok()
-        });
+        let (cgroup_pressure, glob_mode) = match self.policy.psi_cgroup.as_deref() {
+            Some(pattern) if pattern.contains('*') => {
+                (read_glob_pressure(&self.cgroup_root, pattern), true)
+            }
+            Some(cg) => (
+                fs::read_to_string(
+                    self.cgroup_root
+                        .join(cg.trim_start_matches('/'))
+                        .join("cpu.pressure"),
+                )
+                .ok(),
+                false,
+            ),
+            None => (None, false),
+        };
         let (mut pressure, total) = match cgroup_pressure.as_deref() {
             Some(text) => {
                 let (mut p, t) = parse_pressure(text);
-                p.source = "cgroup_cpu.pressure";
+                p.source = if glob_mode {
+                    "cgroup_glob_max_cpu.pressure"
+                } else {
+                    "cgroup_cpu.pressure"
+                };
                 (p, t)
             }
             None => fs::read_to_string(self.proc_root.join("pressure/cpu"))
@@ -931,6 +942,57 @@ fn parse_pressure(value: &str) -> (CpuPressureTelemetry, Option<u64>) {
     )
 }
 
+/// 0.36.17 — PSI des conteneurs du lab : `pattern` = `dir/prefix*suffix`
+/// (ex. `/system.slice/docker-*.scope`, un seul `*`, dans le dernier
+/// segment). Retourne la ligne `cpu.pressure` du cgroup le PLUS sous
+/// pression (avg10 « some » maximal). Les totaux `total=` sont sommés pour
+/// le delta de stall. Aucun cgroup trouvé → `None` (repli hôte, source
+/// exposée).
+fn read_glob_pressure(cgroup_root: &Path, pattern: &str) -> Option<String> {
+    let pattern = pattern.trim_start_matches('/');
+    let (dir, leaf) = pattern.rsplit_once('/').unwrap_or(("", pattern));
+    let (prefix, suffix) = leaf.split_once('*')?;
+    let mut best: Option<(f64, String)> = None;
+    let mut total_sum: u64 = 0;
+    for entry in fs::read_dir(cgroup_root.join(dir)).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !(name.starts_with(prefix) && name.ends_with(suffix)) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(entry.path().join("cpu.pressure")) else {
+            continue;
+        };
+        let (p, t) = parse_pressure(&text);
+        let Some(avg10) = p.some_avg10 else { continue };
+        total_sum = total_sum.saturating_add(t.unwrap_or(0));
+        if best.as_ref().map_or(true, |(b, _)| avg10 > *b) {
+            best = Some((avg10, text));
+        }
+    }
+    let (_, text) = best?;
+    // Remplace `total=` de la ligne « some » par la somme des conteneurs.
+    let mut out = String::new();
+    for line in text.lines() {
+        if line.starts_with("some ") {
+            let rebuilt: Vec<String> = line
+                .split_whitespace()
+                .map(|item| {
+                    if item.starts_with("total=") {
+                        format!("total={total_sum}")
+                    } else {
+                        item.to_string()
+                    }
+                })
+                .collect();
+            out.push_str(&rebuilt.join(" "));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    Some(out)
+}
+
 fn invalid_pressure() -> CpuPressureTelemetry {
     CpuPressureTelemetry {
         valid: false,
@@ -1480,6 +1542,37 @@ mod tests {
         let p = &monitor.latest.as_ref().unwrap().pressure;
         assert_eq!(p.source, "/proc/pressure/cpu");
         assert_eq!(p.some_avg10, Some(80.0));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+
+    /// 0.36.17 — PSI = conteneur du lab le plus sous pression ; l'Analyzer
+    /// (oiran-api, system.slice) n'entre plus dans la mesure.
+    #[test]
+    fn psi_glob_takes_the_most_pressured_lab_container_and_ignores_other_units() {
+        let root = std::env::temp_dir().join(format!("cpu-psi-glob-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cg = root.join("cg/system.slice");
+        let proc_root = root.join("proc");
+        fs::create_dir_all(proc_root.join("pressure")).unwrap();
+        fs::write(proc_root.join("pressure/cpu"), "some avg10=90.00 avg60=0 avg300=0 total=1\n").unwrap();
+        for (unit, avg) in [("docker-aaa.scope", "4.00"), ("docker-bbb.scope", "7.50"), ("oiran-api.service", "60.00")] {
+            fs::create_dir_all(cg.join(unit)).unwrap();
+            fs::write(
+                cg.join(unit).join("cpu.pressure"),
+                format!("some avg10={avg} avg60=1.00 avg300=1.00 total=100\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"),
+            )
+            .unwrap();
+        }
+        let policy = CpuSafetyPolicy {
+            psi_cgroup: Some("/system.slice/docker-*.scope".into()),
+            ..CpuSafetyPolicy::default()
+        };
+        let mut monitor = CpuSafetyMonitor::new(policy, &proc_root, root.join("cg"));
+        monitor.refresh();
+        let p = &monitor.latest.as_ref().unwrap().pressure;
+        assert_eq!(p.source, "cgroup_glob_max_cpu.pressure");
+        assert_eq!(p.some_avg10, Some(7.5));
         let _ = fs::remove_dir_all(&root);
     }
 

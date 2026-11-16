@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.36.17 — 2026-11-16 — Garde CPU : PSI mesurée sur les conteneurs du lab, pas sur tout system.slice (patch)
+
+- Essai vTAP 5 d'ANR2 (#10, 21:14) : sans agent, la PSI de `system.slice` a une médiane de 10,34 avec des pointes à 22, au-dessus du seuil de reprise (10). Observation : l'Analyzer 2.21.9, dans `system.slice`, tourne à 65,6 % de CPU, mémoire au plafond (4 GiB). Le garde, censé protéger le trafic du lab, mesurait l'Analyzer avec.
+- `psi_cgroup` accepte un motif à un `*` ; défaut `/system.slice/docker-*.scope` (conteneurs Open5GS/UERANSIM, driver systemd confirmé par ANR2). La PSI retenue est celle du conteneur le PLUS sous pression (avg10 « some » maximal) ; totaux sommés pour le delta. Source exposée : `cgroup_glob_max_cpu.pressure`. Aucun conteneur trouvé → `/proc/pressure/cpu`, avec la source exposée.
+- Le surcoût eBPF de l'agent vTAP, exécuté dans le contexte des processus NF, reste compté : c'est voulu.
+- Test `psi_glob_takes_the_most_pressured_lab_container_and_ignores_other_units` (oiran-api à 60 ignoré, conteneur le plus chargé à 7,5 retenu). Suite : 421 passed, 0 failed, 3 ignored.
+
 ## 0.36.16 — 2026-11-16 — Récupération NGAP : attendre gNB `healthy` avant la gate santé (patch)
 
 - Cause prouvée par ANR2 (#10, job `simple-data-ul-dl-19900c89a294`) : `gnb_ngap_recover` redémarrait le gNB (StartedAt 18:01:57.9) puis rendait la main dès NGAP up. La gate santé (`resource_gate_for_budget` → `container_is_healthy`) était alors évaluée < 1 s plus tard, sur un gNB en `starting` → `LAB_HEALTH_GATE_FAILED` à `ue_start`, sans trafic. Même cause probable pour l'échec du job d'ANR1 à la même heure.
