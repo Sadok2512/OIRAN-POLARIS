@@ -1,5 +1,11 @@
 # Changelog
 
+## polaris-vtap 2.21.4 — 2026-11-16 — manifeste aligné sur l'ingestion 2.21.6 + écrit avant le pcap (patch)
+
+- Écart trouvé en relisant la 2.21.6 : l'agent écrivait `vtap_SBI_X.vtap.json` (`with_extension`), alors que l'ingestion `live-probe::read_vtap_manifest_stamp` et `vtap-replay` utilisent `vtap_SBI_X.pcap.vtap.json`. En production, chaque pcap vTAP aurait levé `VTAP_MANIFEST_MISSING`. Corrigé : `pcap::manifest_path()` produit `<pcap>.vtap.json`.
+- Course corrigée : le `.pcap` était renommé AVANT l'écriture du manifeste, donc le watcher pouvait voir un pcap sans manifeste. Ordre 2.21.4 : manifeste en `.part`, puis rename atomique, puis rename `.pcap.part` → `.pcap`.
+- Test `rotation_renames_part_atomically_and_writes_manifest` étendu (nom `.pcap.vtap.json`, aucun `.part` résiduel). `cargo test --locked` : 15 passed ; build `--features ebpf` sans clang : PASS.
+
 ## OIRAN API 2.21.6 — 2026-11-16 — vrai câblage vTAP (out_dir + manifeste) + fix régression probe_id + VTAP_MANIFEST_MISSING (patch)
 
 Lot C.6 — **rejet 2.21.5** par Sadok (relecture, 3 écarts). Correction des 3 écarts avant tri des trames (2.21.6 prochain).

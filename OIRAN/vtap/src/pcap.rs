@@ -91,7 +91,13 @@ impl RotatingWriter {
         Ok(())
     }
 
-    /// Ferme, renomme `.part` → `.pcap` et écrit le manifeste JSON.
+    /// Ferme le fichier courant. 2.21.4 — ordre garanti pour le watcher :
+    /// 1. manifeste écrit en `<nom>.pcap.vtap.json.part` puis renommé en
+    ///    `<nom>.pcap.vtap.json` (atomique) ;
+    /// 2. SEULEMENT ENSUITE `.pcap.part` → `.pcap`.
+    /// Un `.pcap` visible a donc toujours son manifeste (sinon le watcher
+    /// lèverait un faux `VTAP_MANIFEST_MISSING`). Nommage aligné sur le
+    /// lecteur `live-probe::read_vtap_manifest_stamp` et sur `vtap-replay`.
     pub fn close(&mut self, manifest: impl FnOnce(&Path) -> String) -> std::io::Result<Option<PathBuf>> {
         let Some((part, mut w)) = self.current.take() else {
             return Ok(None);
@@ -99,11 +105,20 @@ impl RotatingWriter {
         w.flush()?;
         drop(w);
         let final_path = part.with_extension("");
+        let json_path = manifest_path(&final_path);
+        let json_part = PathBuf::from(format!("{}.part", json_path.display()));
+        std::fs::write(&json_part, manifest(&final_path))?;
+        std::fs::rename(&json_part, &json_path)?;
         std::fs::rename(&part, &final_path)?;
-        let json_path = final_path.with_extension("vtap.json");
-        std::fs::write(&json_path, manifest(&final_path))?;
         Ok(Some(final_path))
     }
+}
+
+/// `<pcap>.vtap.json` (ex. `vtap_SBI_X.pcap.vtap.json`).
+pub fn manifest_path(pcap: &Path) -> PathBuf {
+    let mut raw = pcap.as_os_str().to_os_string();
+    raw.push(".vtap.json");
+    PathBuf::from(raw)
 }
 
 #[cfg(test)]
@@ -128,7 +143,12 @@ mod tests {
         let out = w.close(|_| "{}".into()).unwrap().unwrap();
         assert_eq!(out, dir.join("vtap_SBI_20261116T150000Z.pcap"));
         assert!(!dir.join("vtap_SBI_20261116T150000Z.pcap.part").exists());
-        assert!(dir.join("vtap_SBI_20261116T150000Z.vtap.json").exists());
+        assert!(dir.join("vtap_SBI_20261116T150000Z.pcap.vtap.json").exists());
+        assert!(!dir.join("vtap_SBI_20261116T150000Z.pcap.vtap.json.part").exists());
+        assert_eq!(
+            manifest_path(&out),
+            dir.join("vtap_SBI_20261116T150000Z.pcap.vtap.json")
+        );
         assert_eq!(std::fs::metadata(&out).unwrap().len(), 24 + 16 + 60);
         let _ = std::fs::remove_dir_all(&dir);
     }
