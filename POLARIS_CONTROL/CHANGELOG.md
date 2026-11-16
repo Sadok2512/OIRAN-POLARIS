@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.36.15 — 2026-11-16 — Garde CPU : les builds basse priorité ne bloquent plus le lab (patch)
+
+Écart OUVERT « builds → 503 » (encore observé par ANR2, #10 6921238261 : `BLOCKED_CPU_PRESSURE` sur `simple-data-ul-dl`). Cause dans `cpu_safety.rs` : (1) le temps `nice` des builds en `nice -n 19` était compté comme utilisation de l'hôte et comme marge perdue ; (2) la PSI lue était celle de TOUT l'hôte (`/proc/pressure/cpu`), où les threads d'une build en attente de CPU créent de la pression « some » même avec la priorité minimale.
+- `HostCpuTelemetry` : nouveaux champs `nice_percent` et `available_percent = idle + nice`. `usage_percent` exclut le nice ; la marge (`INSUFFICIENT_HOST_CPU_HEADROOM`, `available_host_cpus`) se calcule sur `available_percent`.
+- PSI lue sur le cgroup du lab `system.slice/cpu.pressure` (`POLARIS_CPU_PSI_CGROUP` pour le changer). Si le fichier est absent → `/proc/pressure/cpu`. La source effective est exposée dans l'évidence (`pressure.source`) : rien de silencieux.
+- `scripts/polaris-build.sh` : lance builds et tests dans `polaris-build.slice` (CPUWeight=1, CPUQuota=200 %, IOWeight=1, nice 19, ionice idle), donc hors de `system.slice`. Sans systemd-run ou sans root : nice/ionice seuls, avec le log `POLARIS_BUILD_NO_SLICE`.
+- Inchangé : seuils, hystérésis, throttling du cgroup de l'API, fail-closed sur télémétrie absente ou périmée. Une vraie saturation du lab bloque toujours.
+- Tests : `niced_build_load_does_not_block_lab_scenarios`, `host_delta_excludes_nice_from_usage_and_counts_it_available`, `psi_is_read_from_lab_cgroup_and_falls_back_to_host_with_explicit_source`.
+- OUVERT : chemin réel du cgroup des conteneurs Open5GS/UERANSIM sur le lab (system.slice en driver systemd) à vérifier par ANR2 avec `cat /proc/<pid NF>/cgroup`.
+
 ## 0.36.14 — 2026-11-16 — Lancement d'appel UI explicite (patch)
 
 - Audit navigateur de la page Lab/Scénarios : le clic crée d'abord le grant live, puis envoie `POST /api/v1/scenarios/start` avec `scenario_definition_id: simple-voice-call` et les deux identifiants UE, dans cet ordre.

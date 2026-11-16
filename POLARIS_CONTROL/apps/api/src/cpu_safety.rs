@@ -66,6 +66,12 @@ pub struct HostCpuTelemetry {
     pub system_percent: Option<f64>,
     pub usage_percent: Option<f64>,
     pub idle_percent: Option<f64>,
+    /// 0.36.15 — temps `nice` (tâches de basse priorité, ex. builds en
+    /// `nice -n 19`). Elles cèdent le CPU au trafic du lab : ce temps
+    /// n'est PAS compté dans `usage_percent` et compte comme disponible.
+    pub nice_percent: Option<f64>,
+    /// 0.36.15 — `idle + nice` : CPU réellement disponible pour le lab.
+    pub available_percent: Option<f64>,
     pub iowait_percent: Option<f64>,
     pub steal_percent: Option<f64>,
 }
@@ -147,6 +153,11 @@ pub struct CpuSafetyPolicy {
     pub throttle_block_ratio: f64,
     pub throttle_recovery_ratio: f64,
     pub shared_headroom_cpus: f64,
+    /// 0.36.15 — cgroup dont la PSI CPU protège le lab (services POLARIS,
+    /// conteneurs Open5GS/UERANSIM). Les builds lancées hors de ce cgroup
+    /// (`scripts/polaris-build.sh` → `polaris-build.slice`) n'y comptent pas.
+    /// Fichier absent → PSI hôte `/proc/pressure/cpu`, source exposée.
+    pub psi_cgroup: Option<String>,
 }
 
 impl Default for CpuSafetyPolicy {
@@ -164,6 +175,9 @@ impl Default for CpuSafetyPolicy {
             throttle_block_ratio: 0.20,
             throttle_recovery_ratio: 0.05,
             shared_headroom_cpus: 1.0,
+            psi_cgroup: Some(
+                std::env::var("POLARIS_CPU_PSI_CGROUP").unwrap_or_else(|_| "/system.slice".into()),
+            ),
         }
     }
 }
@@ -275,11 +289,26 @@ impl CpuSafetyMonitor {
             self.previous_cpu = Some((counters, now));
         }
 
-        let pressure_text = fs::read_to_string(self.proc_root.join("pressure/cpu")).ok();
-        let (mut pressure, total) = pressure_text
-            .as_deref()
-            .map(parse_pressure)
-            .unwrap_or_else(|| (invalid_pressure(), None));
+        let cgroup_pressure = self.policy.psi_cgroup.as_deref().and_then(|cg| {
+            fs::read_to_string(
+                self.cgroup_root
+                    .join(cg.trim_start_matches('/'))
+                    .join("cpu.pressure"),
+            )
+            .ok()
+        });
+        let (mut pressure, total) = match cgroup_pressure.as_deref() {
+            Some(text) => {
+                let (mut p, t) = parse_pressure(text);
+                p.source = "cgroup_cpu.pressure";
+                (p, t)
+            }
+            None => fs::read_to_string(self.proc_root.join("pressure/cpu"))
+                .ok()
+                .as_deref()
+                .map(parse_pressure)
+                .unwrap_or_else(|| (invalid_pressure(), None)),
+        };
         pressure.some_stall_delta_usec = self
             .previous_pressure_total
             .zip(total)
@@ -379,7 +408,7 @@ impl CpuSafetyMonitor {
         let mandatory_valid = raw.host.valid && raw.pressure.valid && raw.api_cgroup.valid;
         let available_host_cpus = raw
             .host
-            .idle_percent
+            .available_percent
             .map(|idle| raw.host.logical_cpus as f64 * idle / 100.0);
         let valid_samples = self
             .history
@@ -695,7 +724,7 @@ fn sample_violation(
         ))
     } else if raw
         .host
-        .idle_percent
+        .available_percent
         .map(|idle| raw.host.logical_cpus as f64 * idle / 100.0)
         .unwrap_or(0.0)
         < budget.cpu_cpus + policy.shared_headroom_cpus
@@ -705,7 +734,7 @@ fn sample_violation(
             "INSUFFICIENT_HOST_CPU_HEADROOM",
             "available_host_cpus",
             raw.host
-                .idle_percent
+                .available_percent
                 .map(|idle| raw.host.logical_cpus as f64 * idle / 100.0),
             Some(budget.cpu_cpus + policy.shared_headroom_cpus),
             false,
@@ -819,6 +848,7 @@ fn host_delta(
     };
     let idle = pct(current.idle, previous.idle);
     let iowait = pct(current.iowait, previous.iowait);
+    let nice = pct(current.nice, previous.nice);
     HostCpuTelemetry {
         valid: idle.is_some() && iowait.is_some() && logical_cpus > 0,
         source: "/proc/stat",
@@ -841,8 +871,11 @@ fn host_delta(
         ),
         usage_percent: idle
             .zip(iowait)
-            .map(|(idle, iowait)| (100.0 - idle - iowait).clamp(0.0, 100.0)),
+            .zip(nice)
+            .map(|((idle, iowait), nice)| (100.0 - idle - iowait - nice).clamp(0.0, 100.0)),
         idle_percent: idle,
+        nice_percent: nice,
+        available_percent: idle.zip(nice).map(|(i, n)| (i + n).clamp(0.0, 100.0)),
         iowait_percent: iowait,
         steal_percent: pct(current.steal, previous.steal),
     }
@@ -859,6 +892,8 @@ fn invalid_host(logical_cpus: usize, observed_at_epoch_ms: u64) -> HostCpuTeleme
         system_percent: None,
         usage_percent: None,
         idle_percent: None,
+        nice_percent: None,
+        available_percent: None,
         iowait_percent: None,
         steal_percent: None,
     }
@@ -1101,6 +1136,8 @@ mod tests {
                 system_percent: Some(0.0),
                 usage_percent: Some(usage),
                 idle_percent: Some(idle),
+                nice_percent: Some(0.0),
+                available_percent: Some(idle),
                 iowait_percent: Some(0.0),
                 steal_percent: Some(0.0),
             },
@@ -1367,4 +1404,83 @@ mod tests {
         assert!(pressure.valid);
         assert_eq!(total, Some(42));
     }
+
+    /// 0.36.15 — une build `nice -n 19` qui occupe 80 % de l'hôte ne bloque
+    /// plus le lab : le temps nice n'est ni de l'utilisation ni de la marge
+    /// perdue (cause des 503 BLOCKED_* pendant les builds des agents).
+    #[test]
+    fn niced_build_load_does_not_block_lab_scenarios() {
+        let mut monitor = CpuSafetyMonitor::default();
+        let samples = (0..3)
+            .map(|_| {
+                let mut r = raw(10.0, 10.0, 2.0, 0.0, 8, 1.0);
+                r.host.nice_percent = Some(80.0);
+                r.host.available_percent = Some(90.0);
+                r
+            })
+            .collect();
+        assert_eq!(
+            evaluate_samples(&mut monitor, samples, ScenarioResourceBudget::ue(1)).state,
+            "READY"
+        );
+    }
+
+    #[test]
+    fn host_delta_excludes_nice_from_usage_and_counts_it_available() {
+        let c = |user, nice, idle| CpuCounters {
+            user,
+            nice,
+            system: 0,
+            idle,
+            iowait: 0,
+            irq: 0,
+            softirq: 0,
+            steal: 0,
+        };
+        let h = host_delta(c(0, 0, 0), c(10, 80, 10), Duration::from_secs(1), 4, 0);
+        assert_eq!(h.usage_percent, Some(10.0));
+        assert_eq!(h.nice_percent, Some(80.0));
+        assert_eq!(h.available_percent, Some(90.0));
+        assert_eq!(h.idle_percent, Some(10.0));
+    }
+
+    /// 0.36.15 — la PSI lue est celle du cgroup du lab (system.slice), pas
+    /// celle de l'hôte : une build en polaris-build.slice ne la gonfle pas.
+    /// Source exposée dans l'évidence (`cgroup_cpu.pressure` ou `/proc/pressure/cpu`).
+    #[test]
+    fn psi_is_read_from_lab_cgroup_and_falls_back_to_host_with_explicit_source() {
+        let root = std::env::temp_dir().join(format!("cpu-psi-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let proc_root = root.join("proc");
+        let cg_root = root.join("cg");
+        fs::create_dir_all(proc_root.join("pressure")).unwrap();
+        fs::create_dir_all(cg_root.join("system.slice")).unwrap();
+        fs::write(
+            proc_root.join("pressure/cpu"),
+            "some avg10=80.00 avg60=80.00 avg300=80.00 total=1000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        fs::write(
+            cg_root.join("system.slice/cpu.pressure"),
+            "some avg10=3.00 avg60=3.00 avg300=3.00 total=10\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        let policy = CpuSafetyPolicy {
+            psi_cgroup: Some("/system.slice".into()),
+            ..CpuSafetyPolicy::default()
+        };
+        let mut monitor = CpuSafetyMonitor::new(policy.clone(), &proc_root, &cg_root);
+        monitor.refresh();
+        let p = &monitor.latest.as_ref().unwrap().pressure;
+        assert_eq!(p.source, "cgroup_cpu.pressure");
+        assert_eq!(p.some_avg10, Some(3.0));
+        fs::remove_file(cg_root.join("system.slice/cpu.pressure")).unwrap();
+        let mut monitor = CpuSafetyMonitor::new(policy, &proc_root, &cg_root);
+        monitor.refresh();
+        let p = &monitor.latest.as_ref().unwrap().pressure;
+        assert_eq!(p.source, "/proc/pressure/cpu");
+        assert_eq!(p.some_avg10, Some(80.0));
+        let _ = fs::remove_dir_all(&root);
+    }
+
 }
