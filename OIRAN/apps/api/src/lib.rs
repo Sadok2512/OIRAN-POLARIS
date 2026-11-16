@@ -9,6 +9,7 @@
 
 mod identity_vault;
 mod live_trace;
+mod polaris_config;
 mod probe_registry;
 mod read_time_patch;
 mod session_catalog;

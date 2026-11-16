@@ -437,6 +437,10 @@ mod tests {
             decoder_version: "test".into(),
             raw_payload_reference: "sha256:x".into(),
             errors: vec![],
+            probe_id: None,
+            probe_type: None,
+            physical_link: None,
+            timestamp_source: None,
         }
     }
 

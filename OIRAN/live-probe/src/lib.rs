@@ -1,6 +1,7 @@
 //! Strictly owned, allowlisted live capture jobs for the OIRAN local vProbe.
 
 mod callflow_page;
+pub mod capture_source;
 pub mod event_id_set;
 pub mod lte_evidence;
 

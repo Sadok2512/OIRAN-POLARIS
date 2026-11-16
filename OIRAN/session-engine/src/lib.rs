@@ -45,6 +45,19 @@ pub struct EventRecord {
     pub packet_references: Vec<PacketRef>,
     pub errors: Vec<String>,
     pub source_json: Value,
+    /// 2.20.0 — modèle multi-sonde PRO 400G. Les 4 champs ci-dessous
+    /// sont OPTIONNELS : absent du JSONL → `None`, emission JSONL
+    /// skip quand `None` (`skip_serializing_if`). La sortie reste
+    /// bit-identique aux events 2.19.x qui ne portent pas ces
+    /// champs. Design : `OIRAN/docs/architecture/PHASE1-2.md` §3.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_link: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_source: Option<String>,
 }
 
 impl EventRecord {
@@ -1291,6 +1304,16 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
             compact_source.insert(key.to_string(), value.clone());
         }
     }
+    // 2.20.0 — lit les champs multi-sonde optionnels s'ils sont
+    // présents dans le JSONL. Absent → None (iso-comportement
+    // 2.19.x : rien n'est émis en retour).
+    let opt_string = |path: &[&str]| -> Option<String> {
+        let mut p = &v;
+        for key in path {
+            p = p.get(*key)?;
+        }
+        p.as_str().map(ToOwned::to_owned)
+    };
     Ok(EventRecord {
         event_id: string(&["event_id"])?,
         parent_event_id: v
@@ -1326,6 +1349,10 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
         packet_references,
         errors,
         source_json: Value::Object(compact_source),
+        probe_id: opt_string(&["probe_id"]),
+        probe_type: opt_string(&["probe_type"]),
+        physical_link: opt_string(&["physical_link"]),
+        timestamp_source: opt_string(&["timestamp_source"]),
     })
 }
 
@@ -5081,5 +5108,76 @@ mod tests {
             !session_2.event_ids.iter().any(|id| id == "evt-sbi-pdu1"),
             "SBI pdu=1 ne doit PAS être sur session pdu=2 (match dual prioritaire)"
         );
+    }
+
+    /// 2.20.0 — un JSONL event SANS les 4 champs multi-sonde se
+    /// parse avec `Option::None` : iso-comportement 2.19.x prouvé
+    /// au niveau parseur. Aucune ligne existante ne change de
+    /// forme.
+    #[test]
+    fn event_record_parses_without_new_multi_probe_fields_as_none() {
+        let line = r#"{
+            "event_id":"evt-a",
+            "capture_id":"cap-a",
+            "capture_point_id":"NGAP",
+            "timestamp":{"seconds":1,"nanoseconds":2,"raw_ticks":3,"display":"1.000000002Z"},
+            "interface":"N2",
+            "protocol":"NGAP",
+            "message_name":"InitialUEMessage",
+            "source_endpoint":{"address":"a","network_function":"gNB"},
+            "destination_endpoint":{"address":"b","network_function":"AMF"},
+            "direction":"RAN_TO_CORE",
+            "session_identifiers":[],
+            "information_elements":[],
+            "decoding_status":"DECODED",
+            "decoder_name":"d",
+            "decoder_version":"1",
+            "raw_payload_reference":"sha256:x",
+            "packet_references":[{"source_file":"x","packet_number":1,"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}],
+            "errors":[]
+        }"#;
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        let event = parse_event(value).expect("event parses");
+        assert!(event.probe_id.is_none(), "probe_id defaults to None");
+        assert!(event.probe_type.is_none(), "probe_type defaults to None");
+        assert!(event.physical_link.is_none(), "physical_link defaults to None");
+        assert!(event.timestamp_source.is_none(), "timestamp_source defaults to None");
+    }
+
+    /// 2.20.0 — un JSONL event AVEC les 4 champs les propage
+    /// intégralement. Forward-compat pour 2.20.1 (publication
+    /// réelle par `CaptureSource`).
+    #[test]
+    fn event_record_parses_with_multi_probe_fields_propagated() {
+        let line = r#"{
+            "event_id":"evt-b",
+            "capture_id":"cap-a",
+            "capture_point_id":"NGAP",
+            "timestamp":{"seconds":1,"nanoseconds":2,"raw_ticks":3,"display":"1.000000002Z"},
+            "interface":"N2",
+            "protocol":"NGAP",
+            "message_name":"InitialUEMessage",
+            "source_endpoint":{"address":"a","network_function":"gNB"},
+            "destination_endpoint":{"address":"b","network_function":"AMF"},
+            "direction":"RAN_TO_CORE",
+            "session_identifiers":[],
+            "information_elements":[],
+            "decoding_status":"DECODED",
+            "decoder_name":"d",
+            "decoder_version":"1",
+            "raw_payload_reference":"sha256:x",
+            "packet_references":[{"source_file":"x","packet_number":1,"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}],
+            "errors":[],
+            "probe_id":"lab-vprobe",
+            "probe_type":"vprobe",
+            "physical_link":"enp4s0f1np1",
+            "timestamp_source":"hw_ptp"
+        }"#;
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        let event = parse_event(value).expect("event parses");
+        assert_eq!(event.probe_id.as_deref(), Some("lab-vprobe"));
+        assert_eq!(event.probe_type.as_deref(), Some("vprobe"));
+        assert_eq!(event.physical_link.as_deref(), Some("enp4s0f1np1"));
+        assert_eq!(event.timestamp_source.as_deref(), Some("hw_ptp"));
     }
 }

@@ -36,6 +36,18 @@ pub struct CallFlowEvent {
     pub decoder_version: String,
     pub raw_payload_reference: String,
     pub errors: Vec<String>,
+    /// 2.20.0 — modèle multi-sonde propagé depuis `EventRecord`.
+    /// `skip_serializing_if=Option::is_none` conserve la sortie
+    /// bit-identique aux call flows 2.19.x qui ne portent pas ces
+    /// champs. Design : `OIRAN/docs/architecture/PHASE1-2.md` §3.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_link: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_source: Option<String>,
 }
 
 fn decoded_tree_with_identifiers(event: &EventRecord) -> Value {
@@ -311,6 +323,10 @@ pub fn build_callflow(reconstruction: &Reconstruction, edges: Vec<CorrelationEdg
             decoder_version: event.decoder_version.clone(),
             raw_payload_reference: event.raw_payload_reference.clone(),
             errors: event.errors.clone(),
+            probe_id: event.probe_id.clone(),
+            probe_type: event.probe_type.clone(),
+            physical_link: event.physical_link.clone(),
+            timestamp_source: event.timestamp_source.clone(),
         });
     }
     let session_events = reconstruction
@@ -493,6 +509,10 @@ pub fn build_lte_callflow(
             decoder_version: event.decoder_version.clone(),
             raw_payload_reference: event.raw_payload_reference.clone(),
             errors: event.errors.clone(),
+            probe_id: event.probe_id.clone(),
+            probe_type: event.probe_type.clone(),
+            physical_link: event.physical_link.clone(),
+            timestamp_source: event.timestamp_source.clone(),
         });
     }
     let mut correlation_status = BTreeMap::new();
@@ -709,8 +729,15 @@ mod tests {
             }],
             errors: vec![],
             source_json: serde_json::json!({}),
+            probe_id: None,
+            probe_type: None,
+            physical_link: None,
+            timestamp_source: None,
         }
     }
+
+    #[allow(dead_code)]
+    fn callflow_event_marker() {}
 
     #[test]
     fn schema_round_trip_has_required_fields() {
@@ -832,5 +859,86 @@ mod tests {
         };
         assert_eq!(confidence_for(&[edge.clone()], "N2", "SBI"), "EXACT");
         assert_eq!(confidence_for(&[edge], "SBI", "N2"), "EXACT");
+    }
+
+    /// 2.20.0 — invariant iso-comportement : un `CallFlowEvent` qui
+    /// ne porte PAS les 4 champs multi-sonde (probe_id, probe_type,
+    /// physical_link, timestamp_source) doit sérialiser sans ces
+    /// clés. L'UI et les snapshots 2.19.x restent bit-identiques.
+    #[test]
+    fn call_flow_event_without_multi_probe_fields_omits_them_in_serialization() {
+        let event = CallFlowEvent {
+            event_id: "e1".into(),
+            timestamp: "2026-11-16T00:00:00.000000000Z".into(),
+            timestamp_ns: "0".into(),
+            interface: "N2".into(),
+            protocol: "NGAP".into(),
+            message_name: "InitialUEMessage".into(),
+            source_participant: "gNB".into(),
+            destination_participant: "AMF".into(),
+            direction: "RAN_TO_CORE".into(),
+            decoded_ie_tree: serde_json::json!([]),
+            decoding_status: "DECODED".into(),
+            semantic_status: "NORMAL".into(),
+            association: Association::Session,
+            procedure_group: "Registration".into(),
+            packet_references: vec![],
+            capture_id: "cap-a".into(),
+            decoder_name: "decoder-ngap".into(),
+            decoder_version: "test".into(),
+            raw_payload_reference: "sha256:x".into(),
+            errors: vec![],
+            probe_id: None,
+            probe_type: None,
+            physical_link: None,
+            timestamp_source: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        let object = json.as_object().unwrap();
+        for new_key in ["probe_id", "probe_type", "physical_link", "timestamp_source"] {
+            assert!(
+                !object.contains_key(new_key),
+                "field {new_key} must be absent when None (iso-comportement 2.19.x)"
+            );
+        }
+    }
+
+    /// 2.20.0 — quand les 4 champs multi-sonde SONT fournis, ils
+    /// apparaissent dans la sérialisation. Jamais d'invention : si
+    /// la source les pose, on les transporte sans mutation.
+    #[test]
+    fn call_flow_event_with_multi_probe_fields_serializes_them() {
+        let event = CallFlowEvent {
+            event_id: "e1".into(),
+            timestamp: "2026-11-16T00:00:00.000000000Z".into(),
+            timestamp_ns: "0".into(),
+            interface: "N2".into(),
+            protocol: "NGAP".into(),
+            message_name: "InitialUEMessage".into(),
+            source_participant: "gNB".into(),
+            destination_participant: "AMF".into(),
+            direction: "RAN_TO_CORE".into(),
+            decoded_ie_tree: serde_json::json!([]),
+            decoding_status: "DECODED".into(),
+            semantic_status: "NORMAL".into(),
+            association: Association::Session,
+            procedure_group: "Registration".into(),
+            packet_references: vec![],
+            capture_id: "cap-a".into(),
+            decoder_name: "decoder-ngap".into(),
+            decoder_version: "test".into(),
+            raw_payload_reference: "sha256:x".into(),
+            errors: vec![],
+            probe_id: Some("lab-vprobe".into()),
+            probe_type: Some("vprobe".into()),
+            physical_link: None,
+            timestamp_source: Some("kernel".into()),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["probe_id"], "lab-vprobe");
+        assert_eq!(json["probe_type"], "vprobe");
+        assert_eq!(json["timestamp_source"], "kernel");
+        // physical_link reste None → absent.
+        assert!(json.as_object().unwrap().get("physical_link").is_none());
     }
 }

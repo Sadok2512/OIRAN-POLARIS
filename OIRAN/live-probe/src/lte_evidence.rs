@@ -1971,6 +1971,10 @@ mod tests {
             }],
             errors: vec![],
             source_json: json!({"schema_version":"1.5.0"}),
+            probe_id: None,
+            probe_type: None,
+            physical_link: None,
+            timestamp_source: None,
         }
     }
 

@@ -1,5 +1,85 @@
 # Changelog
 
+## OIRAN API 2.20.0 — 2026-11-16 — Phase 1 (C.1) : CaptureSource + PcapRotatingSource iso-comportement + polaris.toml + 5 event fields (minor)
+
+**Première release de PHASE 1** validée Sadok sur #10. Fondation modulaire pour le multi-sonde PRO 400G. **Aucun changement de comportement visible** : mêmes sessions, mêmes ids, mêmes call flows avant/après sur un dataset de référence (preuve = suite complète inchangée + 4 nouveaux tests d'invariant iso-comportement).
+
+Design doc : `OIRAN/docs/architecture/PHASE1-2.md` (branche `feat/oiran-2.20.0-streaming`).
+
+### Trait `CaptureSource`
+
+- Nouveau module `live-probe/src/capture_source.rs` :
+  - Enum `CaptureSourceKind` : `PcapRotating | LiveInterface | AfXdp | Dpdk`.
+  - `parse(engine_str)` et `as_str()` pour I/O avec `polaris.toml`.
+  - `probe_type()` → `"vprobe" | "phy"` selon le moteur.
+- Trait `CaptureSource` (`Send + Sync`) avec `id()`, `spec() -> &CaptureInterface`, `kind()`, `timestamp_source() -> &str` (défaut `"kernel"`), `physical_link() -> Option<&str>` (défaut `None`), `probe_id() -> &str`.
+- `PcapRotatingSource` : implémentation iso-comportement 2.19.x — enveloppe le chemin `rotation-watcher` + `process_continuous_capture_inner` existant. **Non câblée** dans le pipeline actif ; le binaire `oiran-api` continue d'utiliser le chemin 2.19.x inchangé.
+- `LiveInterfaceSource` (AF_PACKET TPACKET_V3 + PACKET_FANOUT) arrive en **2.20.1** (lot suivant).
+
+### `polaris.toml` (facultatif)
+
+- Nouveau module `apps/api/src/polaris_config.rs` :
+  - `PolarisConfig::load_default()` cherche `POLARIS_CONFIG` env puis `/etc/polaris.toml`. Absent → `Ok(None)` → iso-comportement.
+  - Shape : `[[probes]] id/engine/probe_type/rotation_dir/interfaces[]` + `[endpoints]` IP → `{nf, plmn}`.
+  - Validation : duplicate `probe_id` → `DuplicateProbeId`, engine inconnu → `UnknownEngine { probe_id, engine }`, IO/parse → erreurs qualifiées.
+  - `nf_for_endpoint(ip)` : point d'entrée pour remplacer les hardcodes `172.22.0.7/SMF` et `172.22.0.10/AMF` du `decoder-sbi` (**wiring effectif en 2.20.1**, pas dans ce lot).
+- Dépendance ajoutée : `toml = "0.8"` (serde-compat, standard).
+- Vie privée : le fichier ne contient JAMAIS d'identité (pas de IMSI/SUPI/IMEI). Il décrit la topologie de capture et le mapping NF uniquement.
+
+### 5 champs multi-sonde sur les events
+
+- `EventRecord` (session-engine) + `CallFlowEvent` (callflow-schema) gagnent **4 champs Option<String>** (`probe_id` déjà émis dans le JSONL mais ignoré en 2.19.x — maintenant propagé) :
+  - `probe_id` — identifiant stable de la sonde (`polaris.toml.probes[].id`).
+  - `probe_type` — `"vprobe" | "phy"`.
+  - `physical_link` — identifiant physique de carte/port, rempli en `phy`.
+  - `timestamp_source` — `"kernel" | "hw_ptp"`.
+- Les 4 champs sont annotés `#[serde(default, skip_serializing_if = "Option::is_none")]` : **sortie bit-identique** aux events 2.19.x qui ne les portent pas. Parseur `parse_event` lit les champs du JSONL si présents, sinon `None`.
+- Le 5ème champ (`interface`) est inchangé — il existait déjà dans 2.19.x. Design doc §3.0.
+
+### Invariants iso-comportement (vérifiés par test)
+
+- **Schéma** : un `CallFlowEvent` sans les 4 nouveaux champs sérialise sans ces clés (test `call_flow_event_without_multi_probe_fields_omits_them_in_serialization`).
+- **Schéma** : les 4 champs apparaissent **uniquement** quand fournis (test `call_flow_event_with_multi_probe_fields_serializes_them`).
+- **Parseur** : un JSONL event sans les 4 champs se parse en `None` (test `event_record_parses_without_new_multi_probe_fields_as_none`).
+- **Parseur** : les 4 champs sont propagés quand le JSONL les porte (test `event_record_parses_with_multi_probe_fields_propagated`).
+- **Pipeline** : aucun wiring runtime ajouté — le binaire oiran-api 2.20.0 se comporte comme oiran-api 2.19.1 en l'absence de `polaris.toml`.
+
+### Tests ajoutés (11 nouveaux)
+
+**`live-probe::capture_source::tests`** (4) :
+- `capture_source_kind_parses_canonical_and_aliases`
+- `capture_source_kind_round_trip_and_probe_type`
+- `pcap_rotating_source_fills_id_probe_and_defaults`
+- `capture_source_trait_object_dispatches`
+
+**`oiran-api::polaris_config::tests`** (5) :
+- `empty_config_is_valid_and_probe_count_zero`
+- `parse_single_probe_with_two_interfaces_and_endpoints`
+- `duplicate_probe_id_is_rejected`
+- `unknown_engine_is_rejected_with_probe_id`
+- `load_default_returns_none_when_no_file_exists`
+- `validator_accepts_every_capture_source_kind_including_aliases`
+
+**`callflow-schema::tests`** (2) :
+- `call_flow_event_without_multi_probe_fields_omits_them_in_serialization`
+- `call_flow_event_with_multi_probe_fields_serializes_them`
+
+**`session-engine::tests`** (2) :
+- `event_record_parses_without_new_multi_probe_fields_as_none`
+- `event_record_parses_with_multi_probe_fields_propagated`
+
+### Pas touché en 2.20.0 (prévu 2.20.1)
+
+- `LiveInterfaceSource` AF_PACKET TPACKET_V3 + PACKET_FANOUT.
+- Publication incrémentale `commit_seq` + invalidation sub-seconde `ListRowCache`.
+- Wiring `polaris.toml` dans `CaptureManager` et `decoder-sbi::nf_from_target` (actuellement hardcode `172.22.0.7/10`).
+- Pipeline live ingestion sans rotation `-b duration:3600`.
+
+### OUVERTS
+
+- O1–O7 (cf. `docs/architecture/PHASE1-2.md`) restent ouverts pour 2.20.1/2.20.2/2.21.x.
+- **R1.a — latence E2E ≤ 2 s pendant 24 h** : non atteignable en 2.20.0 (rotation horaire encore en place). Attend 2.20.1.
+
 ## OIRAN API 2.19.1 — 2026-11-16 — Catalogue protocolaire + critères + fields + explorateur (minor)
 
 Cœur de la spec validée avec Sadok sur #10 : ANR1 a besoin d'un catalog protocolaire **construit depuis les events réels** (jamais une liste figée), des critères protocolaires combinables dans `/sessions/filter`, et des colonnes protocolaires dans `/sessions/columns`. 2.19.0 posait la base (catalog de filtres/colonnes + projection) ; 2.19.1 la complète.

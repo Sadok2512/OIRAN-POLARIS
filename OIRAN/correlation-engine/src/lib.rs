@@ -1384,6 +1384,10 @@ mod tests {
             }],
             errors: vec![],
             source_json: json!({}),
+            probe_id: None,
+            probe_type: None,
+            physical_link: None,
+            timestamp_source: None,
         }
     }
     fn manifest() -> ScenarioManifest {
