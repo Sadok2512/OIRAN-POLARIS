@@ -1,5 +1,9 @@
 # Changelog
 
+## polaris-vtap 2.21.3 — 2026-11-16 — état tracefs toujours journalisé (patch)
+
+- Rapport ANR2 #10 6922471096 : `VTAP_TRACEFS_MOUNTED` était absent parce que tracefs était déjà monté, et cette branche ne journalisait rien. L'agent émet désormais `VTAP_TRACEFS_PRESENT` (avec le chemin) ou `VTAP_TRACEFS_MOUNTED` : jamais de silence. Écart fermé.
+
 ## polaris-vtap 2.21.2 — 2026-11-16 — lock vTAP resynchronisé après decoder-sbi 0.4.4 / live-probe 0.6.1 (patch)
 
 - Le lock autonome `OIRAN/vtap/Cargo.lock` référence les crates OIRAN (dev-deps via `oiran-decode`) : la hausse de version de `decoder-sbi` en 2.21.2 rendait `cargo test --locked` impossible dans `OIRAN/vtap`. Corrigé par `cargo update -w`.
