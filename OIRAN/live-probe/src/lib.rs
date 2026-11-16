@@ -3959,6 +3959,22 @@ impl CaptureManager {
                 .scan_interval
                 .saturating_mul(idle_backoff_factor)
                 .min(MAX_IDLE_SLEEP);
+            // 2.21.10 (défaut 4 #9 6929162657, #10 21:14) — trace
+            // structurée pour mesurer le travail par cycle. Permet à
+            // ANR1 de localiser le busy loop qui explique les 65 % CPU
+            // au repos. Jamais d'identité dans ce log.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "CONTINUOUS_IDLE_LOOP_TRACE",
+                    "pending_this_scan": pending,
+                    "changed": changed,
+                    "idle_backoff_factor": idle_backoff_factor,
+                    "sleep_ms": sleep_for.as_millis() as u64,
+                    "segments_known": state.segments.len(),
+                    "seen_checksums": state.seen_checksums.len(),
+                })
+            );
             thread::sleep(sleep_for);
         }
     }

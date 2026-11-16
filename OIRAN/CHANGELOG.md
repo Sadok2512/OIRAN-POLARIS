@@ -1,5 +1,71 @@
 # Changelog
 
+## OIRAN API 2.21.10 — 2026-11-16 — 4 défauts Analyzer prod (patch, PRIORITÉ #9 6929162657 + #9 6929676898)
+
+Lot urgent ANR1/ANR2 lab (base `413417a`, branche `fix/oiran-2.21.10-analyzer`, à merger ensuite dans `feat/oiran-2.22.0-userplane`). Aucun travail P2 dans ce lot.
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.9 | **2.21.10** |
+| `live-probe` | 0.6.5 | **0.6.6** |
+
+### Défaut 3 — `/sessions/:id/identities` bloquait `/health` 25 s (`spawn_blocking`)
+
+**Avant** : `session_identities` appelait directement `hydrate_identities(&state, &id)` sur le runtime async, qui exécute `tshark_identities` (sub-process tshark + parsing + vault upsert, blocage I/O sur plusieurs secondes). Le thread du runtime était bloqué → `/health` retombait dans le timeout 5 s client × 5 timeouts = 25 s observés.
+
+**Fix** `apps/api/src/lib.rs:5848` : déport dans `tokio::task::spawn_blocking` d'un closure qui clone `state` + `id`. Le thread async est libéré pendant la hydratation ; `/health` répond en < 10 ms pendant le `/identities` froid. Erreurs propres (`spawn_blocking` panique → `IDENTITY_VAULT_FAILED` avec message).
+
+### Défaut 2 — `/sessions/catalog` : `protocol_tree=0` + `network_elements=0` sur dataset réel
+
+**Cause prouvée par lecture** : `build_protocol_tree` itérait uniquement sur `state.inner.flows.values()` — vide en production opérationnelle (les flows live sont lus via `state.inner.capture_manager`, cf. `live_flow_for`). Résultat : builder jamais alimenté → tree + network_elements à zéro.
+
+**Fix** `apps/api/src/lib.rs:4567` : la fonction extrait d'abord un closure `feed(&mut builder, &CallFlow)` puis l'applique **à la fois** sur `state.inner.flows.values()` (datasets historiques) ET sur chaque `callflow(dataset.dataset_id, session_id)` retourné par `capture_manager.datasets()` (datasets live). Même scope `interfaces` / `technologies` / `from` / `to` / `run_id` dans les deux cas.
+
+**Latence 45 s** : non attaquée dans ce lot (nécessite cache `commit_seq`-keyed sur le builder). Ouverte pour 2.21.11.
+
+### Défaut 1 — SBI non classé 81 % (696/856) sur session réelle
+
+Pas de fix dans ce lot. Les paths des 696 operations non classifiées sont **déjà exposés** dans `oiran_events.jsonl` via `sbi.request_uri` et `sbi.http_method` (événements où `message_name` commence par `UnsupportedSbiOperation`).
+
+**Commande de collecte pour ANR1** (chemins **pseudonymisés** : SUPI → `sha256:<hash>` dans les paths via `uri_subscriber_pseudonym`) :
+
+```bash
+jq -r 'select(.protocol=="SBI-HTTP2" and (.message_name|startswith("UnsupportedSbiOperation"))) |
+       [.sbi.http_method, .sbi.request_uri] | @tsv' \
+  /chemin/vers/oiran_events.jsonl | sort | uniq -c | sort -rn | head -50
+```
+
+Le lot **2.21.11** ajoutera chaque opération retournée par ANR1 à `decoder-sbi::classify` avec **un test par opération** construit sur la forme réelle (méthode + path anonymisé), pas sur une forme supposée. Attente de la répartition sur #10.
+
+### Défaut 4 — CPU 65 % / RAM ≈ MemoryPeak 4 GiB au repos (log diagnostique)
+
+Hypothèse à mesurer : la boucle `run_continuous_import_inner` ne devrait pas consommer autant si rien ne change (elle a déjà un backoff exponentiel `scan_interval * 2^factor` capé à `MAX_IDLE_SLEEP = 10 s`). Cause probable : le scan vTAP sur `/var/lib/oiran/vtap` (continuous_vtap_dirs populated depuis 2.21.9) re-hache des fichiers déjà seen, OU bien la mémoire accumule via un index qui ne libère pas (seen_checksums, source_fingerprints).
+
+**Pas de fix dans 2.21.10 sans mesure lab.** Instrumentation ajoutée `live-probe/src/lib.rs:3962` : log structuré **`CONTINUOUS_IDLE_LOOP_TRACE`** à chaque fin de cycle, exposant `pending_this_scan`, `changed`, `idle_backoff_factor`, `sleep_ms`, `segments_known`, `seen_checksums`. ANR1 peut agréger ces traces sur 60 s au repos et trancher :
+
+```bash
+journalctl -u oiran-api --since '-5 min' -o cat | \
+  jq -r 'select(.event=="CONTINUOUS_IDLE_LOOP_TRACE") |
+         [.sleep_ms, .pending_this_scan, .changed, .idle_backoff_factor, .seen_checksums] | @tsv'
+```
+
+Si `sleep_ms` médian < 10 000, il y a du travail entre cycles → trouver où. Si `seen_checksums` croît sans borne, cache à purger. Fix précis dans 2.21.11.
+
+### Tests
+
+```bash
+cargo test -p oiran-api    --lib --locked            # 160 passed, 3 ignored, 0 failed
+cargo test -p live-probe   --lib --locked            # 167 passed, 6 ignored, 0 failed
+cd OIRAN/vtap && cargo update -w && cargo test --locked
+# 12 unit + 3 integration = 15 passed (branche pre-merge polaris-vtap 2.21.6, cf. P2)
+```
+
+### Suite
+
+Merge immédiat de ce lot dans `feat/oiran-2.22.0-userplane` (via merge non-destructif), puis reprise P2 2.22.5 **UNIQUEMENT après le PASS 2.21.10 sur lab** (défaut 4 requiert le retour `CONTINUOUS_IDLE_LOOP_TRACE` d'ANR1).
+
 ## OIRAN API 2.21.9 — 2026-11-16 — le scan vTAP ne lit plus le vrai répertoire de l'hôte en test (patch)
 
 - Rapport ANR1 #10 6927549061 : `oversized_segment_is_persisted_individually_while_other_segment_imports` échoue sur le lab, de façon reproductible, et passe sur l'hôte de dev.
