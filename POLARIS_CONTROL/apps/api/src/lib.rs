@@ -11382,21 +11382,29 @@ async fn stop_ue(
             .await
             .unwrap_or_else(|_| Err("UE_RUNTIME_TASK_FAILED".into()));
         return match outcome {
-            Ok(job) => (
-                StatusCode::OK,
-                Json(serde_json::to_value(job).unwrap_or(Value::Null)),
-            ),
+            Ok(job) => {
+                let mut body = serde_json::to_value(job).unwrap_or(Value::Null);
+                let cancelled = cancel_definition_jobs_for_ue(&state, &input.ue_id);
+                if let Some(object) = body.as_object_mut() {
+                    object.insert("cancelled_scenario_jobs".into(), json!(cancelled));
+                }
+                (StatusCode::OK, Json(body))
+            }
             Err(error) => (StatusCode::CONFLICT, Json(json!({"error":error}))),
         };
     }
+    let cancelled = cancel_definition_jobs_for_ue(&state, &input.ue_id);
     let mut controller = state.multi_ue.lock().unwrap();
     let outcome = controller.stop_offline(&input.ue_id).cloned();
     match outcome {
         Ok(job) => match persist_ue_registry(&state, &controller) {
-            Ok(()) => (
-                StatusCode::OK,
-                Json(serde_json::to_value(job).unwrap_or(Value::Null)),
-            ),
+            Ok(()) => {
+                let mut body = serde_json::to_value(job).unwrap_or(Value::Null);
+                if let Some(object) = body.as_object_mut() {
+                    object.insert("cancelled_scenario_jobs".into(), json!(cancelled));
+                }
+                (StatusCode::OK, Json(body))
+            }
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error":error})),
@@ -12431,6 +12439,48 @@ fn definition_record_summary(state: &AppState, job_id: &str) -> Value {
             })
         })
         .unwrap_or_else(|| json!({"scenario_id":null,"ue_ids":[]}))
+}
+
+/// 0.36.13 (ANR2 #10 6919471495) — « Arrêter l'UE » arrêtait le conteneur
+/// mais laissait le job de scénario qui l'utilisait vivant dans
+/// `definition_jobs` (étape `idle`) : toute relance recevait 409
+/// SCENARIO_CONFLICT. Un arrêt d'UE demande désormais l'arrêt de TOUT job
+/// de définition qui porte cet UE (UE démarré, client IMS ou UE listé dans
+/// l'enregistrement du run). Le job voit `cancel` à sa prochaine attente
+/// (`cancellable_wait`), se termine et se retire lui-même. Retourne les
+/// job_id concernés.
+fn cancel_definition_jobs_for_ue(state: &AppState, ue_id: &str) -> Vec<String> {
+    let candidates: Vec<(String, DefinitionJobControl)> = state
+        .definition_jobs
+        .lock()
+        .map(|jobs| jobs.iter().map(|(id, control)| (id.clone(), control.clone())).collect())
+        .unwrap_or_default();
+    let mut cancelled = Vec::new();
+    for (job_id, control) in candidates {
+        let owns = control
+            .started_ues
+            .lock()
+            .map(|ues| ues.contains(ue_id))
+            .unwrap_or(false)
+            || control
+                .ims_clients
+                .lock()
+                .map(|ues| ues.contains(ue_id))
+                .unwrap_or(false)
+            || definition_record_summary(state, &job_id)["ue_ids"]
+                .as_array()
+                .is_some_and(|ues| ues.iter().any(|value| value.as_str() == Some(ue_id)));
+        if !owns {
+            continue;
+        }
+        control.cancel.store(true, Ordering::SeqCst);
+        let _ = update_definition_record(state, &job_id, |record| {
+            record["state"] = json!("STOPPING");
+            record["terminal_result"] = json!("UE_STOPPED_BY_OPERATOR");
+        });
+        cancelled.push(job_id);
+    }
+    cancelled
 }
 
 fn update_definition_record(
@@ -16524,6 +16574,48 @@ mod p0_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("test process did not reach a terminal state");
+    }
+
+    /// 0.36.13 (ANR2 #10 6919471495) — arrêter un UE annule le job de
+    /// scénario qui le porte (sinon relance = 409 SCENARIO_CONFLICT), et
+    /// seulement celui-là.
+    #[test]
+    fn stopping_a_ue_cancels_only_the_scenario_job_that_carries_it() {
+        let state = state();
+        let job = |ues: &[&str]| DefinitionJobControl {
+            cancel: Arc::new(AtomicBool::new(false)),
+            started_ues: Arc::new(Mutex::new(ues.iter().map(|u| (*u).to_string()).collect())),
+            ims_clients: Arc::new(Mutex::new(BTreeSet::new())),
+            started_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            authorised_at_start: Arc::new(GrantAuthorisationSnapshot::authorised(
+                &["UE-05".into()],
+                "test-fixture",
+            )),
+        };
+        let carrying = job(&["UE-05"]);
+        let other = job(&["UE-201"]);
+        {
+            let mut jobs = state.definition_jobs.lock().unwrap();
+            jobs.insert("job-voice-05".into(), carrying.clone());
+            jobs.insert("job-data-201".into(), other.clone());
+        }
+        state.runtime.lock().unwrap().history.push(json!({
+            "job_id":"job-voice-05","scenario_id":"simple-voice-register","ue_ids":["UE-05"],"state":"RUNNING"
+        }));
+        let cancelled = cancel_definition_jobs_for_ue(&state, "UE-05");
+        assert_eq!(cancelled, vec!["job-voice-05".to_string()]);
+        assert!(carrying.cancel.load(Ordering::SeqCst));
+        assert!(!other.cancel.load(Ordering::SeqCst));
+        assert_eq!(definition_record_summary(&state, "job-voice-05")["scenario_id"], "simple-voice-register");
+        let record = state.runtime.lock().unwrap().history.iter().find(|r| r["job_id"]=="job-voice-05").cloned().unwrap();
+        assert_eq!(record["terminal_result"], "UE_STOPPED_BY_OPERATOR");
+        // IMS client seul (UE déjà démarré par ailleurs) : aussi annulé
+        let ims_only = job(&[]);
+        ims_only.ims_clients.lock().unwrap().insert("UE-201".into());
+        state.definition_jobs.lock().unwrap().insert("job-ims-201".into(), ims_only.clone());
+        let cancelled = cancel_definition_jobs_for_ue(&state, "UE-201");
+        assert!(cancelled.contains(&"job-ims-201".to_string()));
+        assert!(ims_only.cancel.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.36.13 — 2026-11-16 — « Arrêter l'UE » libère le scénario (patch)
+
+- Cause prouvée par ANR2 (#10 6919471495) : `POST /ues/stop` arrêtait l'UE (handle nul, conteneur exited) sans annuler le job de scénario qui le portait ; le job restait `RUNNING/idle` dans `definition_jobs` → toute relance : 409 SCENARIO_CONFLICT (Sadok : « UE-05 se lance une fois, après arrêt on ne peut plus lancer »).
+- `cancel_definition_jobs_for_ue` : l'arrêt d'un UE annule tout job de définition qui le porte (UE démarré, client IMS ou UE du run), et seulement ceux-là ; enregistrement `STOPPING / UE_STOPPED_BY_OPERATOR` ; le job sort à sa prochaine attente et se retire. Réponse de l'arrêt : `cancelled_scenario_jobs`.
+- Test `stopping_a_ue_cancels_only_the_scenario_job_that_carries_it`.
+
 ## 0.36.12 — 2026-11-16 — Pré-check gNB : détection d'écoute AMF réparée (patch)
 
 - Cause prouvée par ANR2 (#10 6917003639, runs simple-data-ul-dl-23a3a0648956 / -60b0fb3eabde) : la sonde d'écoute AMF lançait `ss … state listen`, rejeté par iproute2 (« wrong state name: listen ») → AMF déclaré absent alors qu'il écoutait sur SCTP 38412 → `GNB_NGAP_DOWN_AMF_UNAVAILABLE` immédiat, gNB jamais redémarré. Commande remplacée par `ss -H -n -l -A sctp` (sockets en écoute). Le contrôle `amf-list` de 0.36.11 est conservé.
