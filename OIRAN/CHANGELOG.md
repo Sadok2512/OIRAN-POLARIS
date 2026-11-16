@@ -1,5 +1,35 @@
 # Changelog
 
+## OIRAN API 2.22.0 — 2026-11-16 — audit P2 USERPLANE (livrable design, pas de code d'agrégation)
+
+Lot P2.0 — audit préalable avant toute implémentation du résumé plan usager par UE / PDU session. Aucun code d'agrégation ajouté dans ce lot : il produit le livrable `docs/architecture/P2-USERPLANE.md` qui conditionne les lots 2.22.1 → 2.22.5.
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.8 | **2.22.0** |
+
+### Livrable
+
+`docs/architecture/P2-USERPLANE.md` — 4 sections :
+
+1. **Existant** : `decoder-gtpu` 0.2.1 (`GtpuHeader`, `inner_ipv4_addresses` IPv4 seul, pas de ports/proto/IPv6), `N3FlowAggregator` dans `live-probe/src/lib.rs:279-469` (clé `(message_type, teid, direction)`, `MAX_N3_FLOW_AGGREGATES=4096`, IEs `aggregate_packet_count/wire_bytes/first_seen_ns/last_seen_ns`, émission `qfi` depuis extension PDU Session Container), `KeepaliveAggregator` (`PFCP Heartbeat` + `Device-Watchdog` + `GTPv2 Echo` + `GTP-U Echo`), publication **par agrégat TEID** aujourd'hui (pas d'entité « PDU session »). Chiffres mesurés sur dataset de référence UE-201 : 10 events GTP-U → 2 agrégats (2 TEIDs × 1 direction), 1 300 octets wire totaux, moyenne 130 oct/paquet.
+
+2. **Manque** : inner 5-tuple complet (ports + IPv6 + proto) après GTP-U mutualisé avec la troncature 128 oct P8 (PHASE1-2.md §4.5), recollage UL/DL par PDU session (aujourd'hui éclaté par TEID), buckets `bytes_per_window` pour throughput, 5QI via NGAP `PDU Session Resource Setup`, SEID via PFCP Session Establishment, et surtout **rattachement `subscriber_pseudonym` absent côté N3** (à propager via chaîne NAS Registration → NGAP → PDU Session Resource).
+
+3. **Schéma `UserPlaneSummary`** : struct `event-schema` avec `subscriber_pseudonym`, `pdu_session_id`, `teid_ul/dl`, `seid_smf/upf`, `qfi` + `five_qi`, `ue_ipv4/v6` pseudonymisés, `ul/dl_bytes/packets`, bornes `(capture_id, packet_number)` canoniques, `ul/dl_bytes_per_window[]`. Taille ≈ 1.3 KiB par PDU session (session 60s). Projection 400G : ~20 000 sessions concurrentes → ~25 MiB RAM, ~3.6 GiB/jour disque.
+
+4. **Plan de lots 2.22.1 → 2.22.5** : (2.22.1) extension `decoder-gtpu` inner 5-tuple IPv4+IPv6+ports+proto avec troncature 128 oct partagée P8 ; (2.22.2) table corrélation `teid ↔ seid ↔ subscriber_pseudonym` alimentée par PFCP + NGAP ; (2.22.3) `UserPlaneSummary` struct + agrégateur qui recolle UL/DL par PDU session ; (2.22.4) buckets throughput par fenêtre configurable ; (2.22.5) route API + colonnes catalogue. Un test de recette par lot sur la session UE-201.
+
+### OUVERTS
+
+OP2.1 troncature 128 oct côté sonde vs. decoder, OP2.2 pseudonymisation IP UE, OP2.3 fenêtre throughput défaut 1s vs. 5s, OP2.4 rétention disque 400G, OP2.5 LTE S1-U (hors scope), OP2.6 coexistence API P2/P8.
+
+### Pause pour validation
+
+Ce lot 2.22.0 s'arrête ici : validation Sadok requise sur chiffres, schéma et plan de lots avant 2.22.1 (code inner 5-tuple).
+
 ## polaris-vtap 2.21.5 — 2026-11-16 — l'agent ne meurt plus en silence (patch)
 
 Essai 3 (ANR2 #10, 19:19) : agent 2.21.4 disparu sans `VTAP_STOP` ; `.pcap.part` de 0 octet ; aucune paire fermée. Lancement en `&` depuis le shell de l'outil → SIGHUP de fin de session non géré (cause la plus probable ; aucune ligne OOM).
