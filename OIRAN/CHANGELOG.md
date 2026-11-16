@@ -2,13 +2,13 @@
 
 ## OIRAN API 2.22.0 — 2026-11-16 — audit P2 USERPLANE (livrable design, pas de code d'agrégation)
 
-Lot P2.0 — audit préalable avant toute implémentation du résumé plan usager par UE / PDU session. Aucun code d'agrégation ajouté dans ce lot : il produit le livrable `docs/architecture/P2-USERPLANE.md` qui conditionne les lots 2.22.1 → 2.22.5.
+Lot P2.0 — audit préalable avant toute implémentation du résumé plan usager par UE / PDU session. Aucun code d'agrégation ajouté dans ce lot : il produit le livrable `docs/architecture/P2-USERPLANE.md` qui conditionne les lots 2.22.1 → 2.22.5. Rebasé sur 413417a (2.21.9) comme demandé #9 2026-11-16 20:03.
 
 ### Composants et versions
 
 | Composant | Avant | Après |
 |---|---|---|
-| `oiran-api` | 2.21.8 | **2.22.0** |
+| `oiran-api` | 2.21.9 | **2.22.0** |
 
 ### Livrable
 
@@ -29,6 +29,14 @@ OP2.1 troncature 128 oct côté sonde vs. decoder, OP2.2 pseudonymisation IP UE,
 ### Pause pour validation
 
 Ce lot 2.22.0 s'arrête ici : validation Sadok requise sur chiffres, schéma et plan de lots avant 2.22.1 (code inner 5-tuple).
+
+## OIRAN API 2.21.9 — 2026-11-16 — le scan vTAP ne lit plus le vrai répertoire de l'hôte en test (patch)
+
+- Rapport ANR1 #10 6927549061 : `oversized_segment_is_persisted_individually_while_other_segment_imports` échoue sur le lab, de façon reproductible, et passe sur l'hôte de dev.
+- Cause prouvée : le scan vTAP 2.21.6 appelait `vtap_out_dirs()` directement, d'où `/var/lib/oiran/vtap` RÉEL lu même pendant les tests. Sur le lab, ce répertoire contient les fichiers des essais vTAP : ingestions et échecs supplémentaires, et l'attente du test (`segments_ingested == 1 && ingestion_failures == 1`) n'aboutit jamais. Reproduction sur l'hôte de dev avec un `vtap_SBI_*.pcap` déposé dans `/var/lib/oiran/vtap` : code 2.21.8 → FAILED (panique ligne 11896) ; code 2.21.9 → ok.
+- Correctif : `ContinuousImportConfig.vtap_out_dirs` (production : `bounded()` → `vtap_out_dirs()`, inchangé ; tests : `Vec::new()`). Le gestionnaire mémorise les répertoires au démarrage de l'import (`continuous_vtap_dirs`) et le scan ne lit que ceux-là.
+- `cargo test --locked -p live-probe` avec le répertoire réel rempli : 167 passed, 0 failed. oiran-api : seuls les 2 tests tshark échouent (outil absent sur l'hôte de dev, déjà connu). vTAP `--locked` : 15 passed. Audit du lock Rust 1.83 : 0 incompatible.
+- Versions : oiran-api 2.21.8 → 2.21.9, live-probe 0.6.4 → 0.6.5.
 
 ## polaris-vtap 2.21.5 — 2026-11-16 — l'agent ne meurt plus en silence (patch)
 
