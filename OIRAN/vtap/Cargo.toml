@@ -1,9 +1,9 @@
 [package]
 name = "polaris-vtap"
-version = "2.21.0"
+version = "2.21.1"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.75"
+rust-version = "1.83"
 description = "POLARIS vTAP — agent eBPF (uprobes libssl) qui rejoue le HTTP/2 SBI en clair sous forme de pcap TCP"
 
 # Workspace autonome : l'agent eBPF (aya) ne doit pas toucher au Cargo.lock

@@ -1,5 +1,14 @@
 # Changelog
 
+## polaris-vtap 2.21.1 — 2026-11-16 — build lab sans clang + Rust 1.83 + tracefs (patch)
+
+Suite au rapport ANR2 #10 6921485041 (étape 1 OUVERTE : `clang` absent ; Cargo 1.83.0 refuse `indexmap 2.14.2`, qui exige edition2024). Seul `OIRAN/vtap` change ; oiran-api reste en 2.21.0.
+
+- **Rust 1.83** : `rust-version = "1.83"` + lock résolu par `CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo update` (indexmap 2.14.2 → 2.13.1, hashbrown 0.17.1 → 0.16.1). Audit du lock : 35 crates du registre, 0 en edition 2024, 0 avec rust-version > 1.83 (script tomllib sur `~/.cargo/registry/src`). OUVERT : aucune build réelle en 1.83 sur l'hôte de dev (toolchain non téléchargeable) ; la preuve sera la build `--locked` sur le lab.
+- **Sans clang** : objet eBPF précompilé `bpf/prebuilt/vtap.bpf.o` (clang 18.1.3, sha256 `2f2c8ea4…c3d702`, provenance dans `bpf/prebuilt/PROVENANCE.txt`). `build.rs` ne l'utilise que si `bpf/vtap.bpf.c` est identique à `bpf/prebuilt/vtap.bpf.c`, sinon échec `VTAP_PREBUILT_STALE`. La voie choisie est toujours annoncée (`cargo:warning`). Régénération : `bpf/build-prebuilt.sh`. Les 3 voies ont été vérifiées (précompilé accepté, source modifiée refusée, clang présent compilé).
+- **tracefs** : absent (cas vu après réinitialisation de l'hôte de test) → l'agent le monte (`VTAP_TRACEFS_MOUNTED`) ; échec → `VTAP_TRACEFS_UNAVAILABLE` fatal explicite.
+- Preuve réelle avec un binaire construit SANS clang : curl HTTP/2 TLS → 6 records, 1 connexion, `open_items=[]` → `oiran-decode --interface SBI --probe-type vtap` : `tcp_connections=1 tcp_errors=0 sbi_transactions=1`.
+
 ## OIRAN API 2.21.0 — 2026-11-16 — P1b vTAP : agent eBPF libssl → pcap SBI en clair + source `vtap` (minor)
 
 Branche `feat/oiran-2.21.0-vtap` (base 2.20.1 @ 7b13119). Rend le SBI TLS visible sans clé : uprobes libssl dans les NF Open5GS, HTTP/2 en clair rejoué en pcap TCP lu **sans changement** par `transport-tcp` + `decoder-sbi`.

@@ -1,4 +1,4 @@
-# POLARIS vTAP 2.21.0 (P1b) — SBI TLS visible sans clé
+# POLARIS vTAP 2.21.1 (P1b) — SBI TLS visible sans clé
 
 Agent eBPF `polaris-vtap` : uprobes sur `SSL_write`/`SSL_read` (+ `_ex`, `SSL_set_fd`) de la libssl des
 conteneurs Open5GS. Le HTTP/2 en clair est rejoué en pcap TCP normal (handshake synthétique, seq/ack
@@ -10,13 +10,15 @@ SBI actuel le lit sans changement.
 ```bash
 cd OIRAN/vtap
 nice -n 19 ionice -c3 cargo test -j 2                                   # hors ligne, sans clang ni root
-nice -n 19 ionice -c3 cargo build --release -j 2 --features ebpf        # requiert clang (cible bpf)
+nice -n 19 ionice -c3 cargo build --release --locked -j 2 --features ebpf
+# Rust ≥ 1.83 (lock aligné). clang facultatif : absent → objet précompilé bpf/prebuilt/vtap.bpf.o,
+# accepté seulement si bpf/vtap.bpf.c == bpf/prebuilt/vtap.bpf.c (sinon VTAP_PREBUILT_STALE).
 ```
 
 ## Lancement (root : CAP_BPF + CAP_PERFMON + accès /proc/<pid>/fd)
 
 ```bash
-mount | grep -q tracefs || mount -t tracefs nodev /sys/kernel/tracing
+# tracefs absent → l'agent le monte lui-même (log VTAP_TRACEFS_MOUNTED).
 sudo ./target/release/polaris-vtap --out-dir /var/lib/oiran/vtap --probe-id lab-vtap --rotate-seconds 300
 ```
 
