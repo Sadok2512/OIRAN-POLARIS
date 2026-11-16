@@ -1910,6 +1910,36 @@ fn attach_sbi_to_sessions(
     // disponible, et attacher à plusieurs sessions concurrentes
     // reste correct (c'est bien l'abonné qui porte l'opération).
     let mut pseudo_only: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    // 2.18.11 (ANR2 #10 — 0 SBI rattaché alors que 4 SBI portent le
+    // pseudonyme exact de la session) : les events d'une PDU session
+    // (N2 PDUSessionResourceSetup, N4, N3) ne portent PAS le SUPI ;
+    // le `subscriber_pseudonym` vit sur le NAS de Registration du MÊME
+    // UE context (SUCI null-scheme). `pseudo_only` restait donc vide.
+    // On indexe aussi les pseudonymes portés par n'importe quel event
+    // du UE context exact de la session (lien `event_context`, jamais
+    // de proximité temporelle).
+    let mut context_pseudos: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for event in events {
+        if let (Some(context_id), Some(pseudo)) = (
+            event_context.get(&event.event_id),
+            event.first_identifier("subscriber_pseudonym"),
+        ) {
+            context_pseudos
+                .entry(context_id.as_str())
+                .or_default()
+                .insert(pseudo);
+        }
+    }
+    for (idx, session) in pdu_sessions.iter().enumerate() {
+        if let Some(pseudos) = context_pseudos.get(session.ue_context_id.as_str()) {
+            for pseudo in pseudos {
+                let entry = pseudo_only.entry((*pseudo).to_owned()).or_default();
+                if !entry.contains(&idx) {
+                    entry.push(idx);
+                }
+            }
+        }
+    }
     for (idx, session) in pdu_sessions.iter().enumerate() {
         let pdu_id = session.pdu_session_id.clone();
         for event_id in &session.event_ids {
@@ -4442,6 +4472,63 @@ mod tests {
             teids.contains("0x2222"),
             "session TEIDs should contain the UE2 bearer, got {teids:?}"
         );
+    }
+
+    /// 2.18.11 (ANR2 #10) — la PDU session ne porte pas le SUPI ; le
+    /// pseudonyme abonné est sur le NAS Registration du MÊME UE
+    /// context. Un SBI am-data (pseudonyme seul) doit s'y rattacher ;
+    /// un SBI d'un autre abonné non.
+    #[test]
+    fn sbi_attaches_via_the_pseudonym_of_the_session_ue_context() {
+        let registration = event(
+            "evt-nas-reg",
+            "NAS-5GMM",
+            "Registration Request",
+            &[("subscriber_pseudonym", "psn-ue201")],
+            1,
+        );
+        let n2_setup = event(
+            "evt-n2-pdu",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            &[("pdu_session_id", "1"), ("ran_ue_ngap_id", "5")],
+            2,
+        );
+        let sbi_same = event(
+            "evt-sbi-am-data",
+            "SBI-HTTP2",
+            "GET am-data",
+            &[("subscriber_pseudonym", "psn-ue201")],
+            3,
+        );
+        let sbi_other = event(
+            "evt-sbi-other",
+            "SBI-HTTP2",
+            "GET am-data",
+            &[("subscriber_pseudonym", "psn-ue05")],
+            4,
+        );
+        let events = vec![registration, n2_setup, sbi_same, sbi_other];
+        let mut pdu_sessions = vec![DiscoveredPduSession {
+            session_id: "5g-session-ue201".into(),
+            ue_context_id: "ue-ctx-201".into(),
+            pdu_session_id: "1".into(),
+            dnn: None,
+            snssai: None,
+            state: "ACTIVE".into(),
+            establishment_timestamp_ns: 0,
+            release_timestamp_ns: None,
+            interfaces: vec!["N2".into()],
+            correlation_status: "OPEN".into(),
+            event_ids: vec!["evt-n2-pdu".into()],
+        }];
+        let mut event_context: BTreeMap<String, String> = BTreeMap::new();
+        event_context.insert("evt-nas-reg".into(), "ue-ctx-201".into());
+        event_context.insert("evt-n2-pdu".into(), "ue-ctx-201".into());
+        attach_sbi_to_sessions(&events, &mut pdu_sessions, &mut event_context);
+        let ids = &pdu_sessions[0].event_ids;
+        assert!(ids.contains(&"evt-sbi-am-data".to_string()), "got {ids:?}");
+        assert!(!ids.contains(&"evt-sbi-other".to_string()), "contamination : {ids:?}");
     }
 
     /// 2.17.1 (ANR1 #10 E2E-5G, fix a — SBI continuous perdu).

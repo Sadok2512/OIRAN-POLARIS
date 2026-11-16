@@ -680,6 +680,21 @@ fn build_event(
             .map(|name| name == "SCP")
             .unwrap_or(false);
     let mut identifiers = Vec::new();
+    // 2.18.11 (ANR2 #10) — Nudm_SDM `GET …/{supi}/am-data`, Nudm_UECM
+    // `…/{ueId}/registrations/…`, Npcf… portent le SUPI dans l'URI,
+    // pas dans un corps JSON (souvent absent sur un GET) : aucun
+    // `subscriber_pseudonym` n'était émis → SBI non rattachable. Même
+    // pseudonyme (domaine abonné partagé) que le corps JSON et le NAS.
+    if let Some(pseudo) = raw_path
+        .as_deref()
+        .and_then(|value| uri_subscriber_pseudonym(value, pseudonym_key))
+    {
+        identifiers.push(NamedValue {
+            name: "subscriber_pseudonym".into(),
+            value: pseudo,
+            pseudonymized: true,
+        });
+    }
     if let Some(path) = path.as_deref() {
         if let Some(context) = sm_context(path) {
             identifiers.push(NamedValue {
@@ -836,6 +851,43 @@ fn build_event(
                     });
                 }
             }
+        }
+    }
+    // 2.18.11 (ANR2 #10 : MSISDN/IMEI absents) — l'identité est souvent
+    // dans la RÉPONSE : Nudm_SDM `GET am-data` → 200 `{"gpsis":["msisdn-…"]}`.
+    // Seuls les identifiants d'identité sont repris du corps de réponse
+    // (jamais les autres champs : la réponse ne redéfinit pas la session).
+    let response_content_type = header(&state.response.headers, "content-type");
+    for part in decompose_body(response_content_type.as_deref(), &state.response.body) {
+        if !part.content_type.starts_with("application/json") {
+            continue;
+        }
+        for (name, value) in json_fields(&part.body, pseudonym_key) {
+            if !matches!(
+                name.as_str(),
+                "subscriber_pseudonym" | "msisdn_pseudonym" | "imei_pseudonym" | "imeisv_pseudonym"
+            ) {
+                continue;
+            }
+            if identifiers
+                .iter()
+                .any(|known: &NamedValue| known.name == name && known.value == value)
+            {
+                continue;
+            }
+            identifiers.push(NamedValue {
+                name: name.clone(),
+                value: value.clone(),
+                pseudonymized: true,
+            });
+            ies.push(InformationElement {
+                id: None,
+                name: format!("response {name}"),
+                length: value.len() as u32,
+                value: Some(value),
+                raw_sha256: None,
+                status: DecodeStatus::Decoded,
+            });
         }
     }
     if let Some(value) = target.as_deref() {
@@ -1036,6 +1088,14 @@ fn nf_from_target(value: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// 2.18.11 — pseudonyme abonné du premier segment d'URI `imsi-…` /
+/// `nai-…` (SUPI). Un SUCI (`suci-…`) chiffré n'est pas un SUPI : ignoré.
+fn uri_subscriber_pseudonym(path: &str, pseudonym_key: &PseudonymKey) -> Option<String> {
+    path.split(['/', '?'])
+        .find(|part| part.starts_with("imsi-") || part.starts_with("nai-"))
+        .map(|identity| pseudonym_subscriber_text(pseudonym_key, identity.as_bytes()))
 }
 
 fn sanitize_uri(value: &str, pseudonym_key: &PseudonymKey) -> String {
@@ -1297,6 +1357,18 @@ fn collect_json(value: &Value, fields: &mut Vec<(String, String)>, pseudonym_key
             // `msisdn-…` (identité numérotée universelle). Les
             // external-id (extid) relèvent d'un autre kind non câblé
             // par cette version.
+            // TS 29.503 AccessAndMobilitySubscriptionData : `gpsis` est un
+            // TABLEAU de GPSI.
+            "gpsis" => {
+                for item in value.as_array().into_iter().flatten() {
+                    if let Some(text) = scalar(item).filter(|text| text.starts_with("msisdn-")) {
+                        fields.push((
+                            "msisdn_pseudonym".into(),
+                            pseudonym(pseudonym_key, GPSI_MSISDN_PSEUDO_DOMAIN, text.as_bytes()),
+                        ));
+                    }
+                }
+            }
             "gpsi" => {
                 if let Some(text) = scalar(value) {
                     if text.starts_with("msisdn-") {
@@ -1345,6 +1417,29 @@ fn scalar(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn am_data_gpsis_array_yields_msisdn_pseudonym() {
+        let key = PseudonymKey::from_bytes([7; 32]);
+        let fields = json_fields(br#"{"gpsis":["msisdn-33600000201"],"subscribedUeAmbr":{}}"#, &key);
+        let msisdn = fields.iter().find(|(name, _)| name == "msisdn_pseudonym").unwrap();
+        assert!(!msisdn.1.contains("33600000201"));
+    }
+
+    #[test]
+    fn supi_in_the_uri_yields_the_same_subscriber_pseudonym_as_the_json_body() {
+        let key = PseudonymKey::from_bytes([7; 32]);
+        let from_uri = uri_subscriber_pseudonym(
+            "/nudm-sdm/v2/imsi-001010000000201/am-data?plmn-id=x",
+            &key,
+        )
+        .unwrap();
+        let from_body = pseudonym_subscriber_text(&key, b"imsi-001010000000201");
+        assert_eq!(from_uri, from_body);
+        assert!(!from_uri.contains("001010000000201"));
+        assert!(uri_subscriber_pseudonym("/nudm-sdm/v2/suci-0-001-01-0-0-0-x/am-data", &key).is_none());
+        assert!(uri_subscriber_pseudonym("/nsmf-pdusession/v1/sm-contexts", &key).is_none());
+    }
+
     use super::*;
     use event_schema::{ExactTimestamp, PacketReference};
     use hpack::Encoder;

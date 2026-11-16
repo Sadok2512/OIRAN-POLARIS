@@ -1,5 +1,11 @@
 # Changelog
 
+## OIRAN API 2.18.11 — 2026-11-16 — SBI réellement rattaché + MSISDN/IMEI depuis le SBI réel (patch)
+
+- Constat ANR2 (#10, run UE-201) : 28 SBI pendant la session, 4 portant le pseudonyme exact, 0 rattaché ; MSISDN/IMEI absents.
+- session-engine : le fallback pseudonyme (2.18.7) cherchait le pseudonyme dans les events de la PDU session (N2/N4/N3), qui ne portent pas le SUPI. Il est désormais pris sur les events du MÊME UE context (NAS Registration, lien `event_context`, jamais de proximité temporelle). Test `sbi_attaches_via_the_pseudonym_of_the_session_ue_context` (dont 0 contamination d'un autre abonné).
+- decoder-sbi : `subscriber_pseudonym` émis depuis le SUPI de l'URI (`GET …/imsi-…/am-data`, UECM, …), même domaine que le corps JSON et le NAS ; SUCI chiffré ignoré. Identités reprises aussi du corps de RÉPONSE (am-data 200 `gpsis`) ; `gpsis` (tableau, TS 29.503) → `msisdn_pseudonym`. Tests `supi_in_the_uri_…`, `am_data_gpsis_array_yields_msisdn_pseudonym`.
+
 ## OIRAN API 2.18.10 — 2026-11-16 — Live dans l'ordre + 1er ladder rapide (patch)
 
 - Live (ANR2 #10 6902524402 : 24/55 messages `late`) : le lecteur Live collecte les nouveaux events de chaque passe de décodage et les route triés par `(packet_number, event_id)` — le décodeur émet dans l'ordre de reconstruction (réassemblage SCTP / HTTP/2). `late` reste compté et marqué pour un message arrivé à une passe ultérieure. Test `a_batch_decoded_out_of_order_is_routed_without_late_messages`.
