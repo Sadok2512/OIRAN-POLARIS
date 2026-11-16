@@ -1,5 +1,89 @@
 # Changelog
 
+## OIRAN API 2.19.1 — 2026-11-16 — Catalogue protocolaire + critères + fields + explorateur (minor)
+
+Cœur de la spec validée avec Sadok sur #10 : ANR1 a besoin d'un catalog protocolaire **construit depuis les events réels** (jamais une liste figée), des critères protocolaires combinables dans `/sessions/filter`, et des colonnes protocolaires dans `/sessions/columns`. 2.19.0 posait la base (catalog de filtres/colonnes + projection) ; 2.19.1 la complète.
+
+### 2.19.1 — Ajouts `GET /api/v1/sessions/catalog`
+
+- **Query params** : `interfaces=` (csv), `technologies=` (csv), `from=` (ns), `to=` (ns), `run_id=`. Scope l'arbre protocolaire + les network_elements.
+- **`protocol_tree`** : hiérarchie `interface → protocole → messages[] → {occurrences, params[]}` avec par paramètre `{param_path, type (integer|enum|choice|octetstring|bitstring|string|object), observed_values ≤ 50 avec compte, min/max numériques, occurrences, decoded_from_octets: true}`. Au-delà de 50 distincts : `truncated: true` + `distinct_values_seen`. Les IEs identité (`imsi`/`supi`/`imei`/…) sont **exclues** du bag de valeurs (test `protocol_tree_excludes_clear_identity_ies_from_value_bag`).
+- **`network_elements`** : AMF/SMF/UPF/MME/SGW/PGW/gNB/eNB/UDM/AUSF/PCF/NRF observés via `participants`, avec compteur par (role, address).
+- **`scope`** : écho des query params pour auditabilité.
+
+### 2.19.1 — Ajouts explorateur de protocoles
+
+- **`GET /api/v1/sessions/catalog/search?q=&interfaces=&limit=50`** : recherche insensible à la casse sur messages ET paramètres. Tri par pertinence (exact 1000 > préfixe 500 > contient 100). Sans `q` ou vide → 400 `SEARCH_QUERY_EMPTY`. Entièrement issu de `ProtocolTreeBuilder`.
+- **`GET /api/v1/sessions/catalog/param?interface=&protocol=&message=&param_path=`** : fiche détaillée `{type, observed_values, min/max, occurrences, decoded_from_octets, truncated, distinct_values_seen, example_sessions[]}` où `example_sessions` liste ≤ 5 sessions `{session_id, event_id, capture_id, seq}` triées (capture_id, seq, event_id). Param non observé → 404 `PARAM_NOT_OBSERVED`. Query incomplet → 400 `PARAM_QUERY_INCOMPLETE`.
+
+### 2.19.1 — Extensions `POST /api/v1/sessions/filter`
+
+- **`criteria[]`** : `{interface?, protocol?, message, param_path?, op, value|values}` où `op ∈ {eq, ne, gt, lt, contains, in}`. Op hors liste → 400 `UNKNOWN_CRITERION_OP`.
+- **`combinator`** : `and` (défaut) | `or`. En AND, tous les critères doivent matcher ≥ 1 event de la session. En OR, un seul suffit.
+- **`network_elements`** : AND-entre-familles, OR-interne. Garde les sessions avec ≥ 1 participant du rôle demandé.
+- **`time_window: {from, to}`** : chaîne ns décimales. Garde les sessions avec ≥ 1 event dans la fenêtre. **Ordre canonique `(capture_id, seq)` inchangé** — c'est un cadrage, pas un tri par ts.
+- **`run_id`** : alternative à `time_window`. Match exact sur un `capture_references`.
+- **`search`** : si IMSI-shaped (digits, 14-16) → pseudonyme SUPI (operator-only, 403 `IDENTITY_FILTER_OPERATOR_REQUIRED` sinon) ; sinon substring case-insensitive sur `message_name` et `decoded_ie_tree.to_string()`. Pseudonyme publié dans `meta.search_matched_pseudonym`.
+- **`limit: 0`** : aperçu. Pas de `data`, seulement `meta.total` + `meta.preview=true`. Compat ascendante : `limit=None` → 25, autres clampés à [1, 100].
+- **`matched_criteria`** : pour chaque ligne, tableau `{criterion_index, event_id, capture_id, seq}` — les events qui ont validé le prédicat. Publié même après `columns:[]` (c'est une preuve de match, pas une colonne). Injecté APRÈS la projection.
+- **`meta.criteria_combinator`** : publié quand `criteria` est fourni.
+
+### 2.19.1 — Extensions `POST /api/v1/sessions/columns`
+
+- **`fields[]`** : `{interface, protocol, message?, param_path, mode}` où `mode ∈ {last, first, all, count}`. Résultat par session : `{interface, protocol, message, param_path, mode, value, proof[]}`. `proof` contient `{event_id, capture_id, seq}` en ordre canonique. Field invalide → 400 `INVALID_FIELD`.
+- `mode=last` : valeur du dernier event matchant (canonique), proof = 1 event.
+- `mode=first` : valeur du premier, proof = 1 event.
+- `mode=all` : valeurs en tableau ordre canonique, proof = tous les events.
+- `mode=count` : entier, proof = tous.
+- Absent dans les events → `value=null, proof=[]`.
+- **`meta.field_count`** : écho du nombre de fields demandés.
+
+### Invariants préservés (vérifiés par test)
+
+- **Ordre canonique** : `(anchor_capture_id, first_packet_number, session_id)` pour la pagination ; `(capture_id, seq, event_id)` pour les hits et proofs. Jamais de `ts` dans la clé.
+- **Vie privée** : les IEs identité ne contribuent **pas** à `protocol_tree.observed_values` (règle Sadok 2026-11-14). Le wrapper `identities` reste publié dans `/sessions/filter` (décision Sadok 2026-11-16 : UI p900 sans rôles) mais **rien d'identité en clair n'apparaît dans les rapports GitHub/logs**.
+- **Catalog non figé** : chaque exécution reconstruit l'arbre depuis les events `state.inner.flows` ; aucune liste statique.
+- **Fast path 2.18.x** : aucun filtre étendu/2.19.1 + aucune colonne/field ⇒ construction paresseuse par page (comportement 2.18.12 inchangé). Test `sessions_filter_body_limit100_remains_retrocompat_with_2_19_0`.
+- **Compat 2.19.0** : les routes et champs 2.19.0 restent identiques. `matched_criteria` n'apparaît **pas** quand `criteria` est vide.
+
+### Tests ajoutés (20 nouveaux)
+
+**session_catalog::tests** (9) :
+- `protocol_tree_publishes_observed_values_and_min_max`
+- `protocol_tree_excludes_clear_identity_ies_from_value_bag`
+- `protocol_tree_caps_distinct_values_and_signals_truncation`
+- `criteria_operators_match_expected_events`
+- `criteria_combinator_and_or_and_matched_hits_point_events`
+- `column_field_modes_last_first_all_count_with_proof`
+- `search_protocol_tree_orders_by_relevance_and_scopes_by_interface`
+- `lookup_param_returns_type_and_observed_values_bag`
+- `param_example_sessions_are_bounded_and_canonically_ordered`
+
+**tests HTTP** (11) :
+- `sessions_catalog_publishes_protocol_tree_and_network_elements`
+- `sessions_catalog_search_returns_relevance_sorted_results`
+- `sessions_catalog_search_without_q_returns_400`
+- `sessions_catalog_param_returns_detail_or_404`
+- `sessions_filter_limit_zero_returns_only_total_preview`
+- `sessions_filter_criteria_and_publishes_matched_criteria`
+- `sessions_filter_criteria_or_passes_on_single_match`
+- `sessions_columns_fields_publish_value_and_proof`
+- `sessions_filter_body_limit100_remains_retrocompat_with_2_19_0`
+- `sessions_filter_unknown_criterion_op_returns_400`
+
+### Impact client
+
+- p900 2.7.x peut maintenant explorer le catalog en live : `/sessions/catalog?interfaces=N2,SBI` pour scoper, `/sessions/catalog/search?q=Cause` pour un auto-complete, `/sessions/catalog/param` pour la fiche d'un paramètre.
+- Les filtres protocolaires permettent des requêtes de type « sessions qui portent un `Cause = cause=64` sur NGAP et un `PFCP Session Deletion Response` sur N4 », combinés AND ou OR.
+- `fields[]` dans `/sessions/columns` permet des colonnes custom (ex. `Cause last` par session) sans toucher au catalog de colonnes statiques.
+- `limit=0` donne un compteur temps réel pour l'UI (badge de résultats pré-affichage).
+
+### OUVERTS
+
+- O1–O7 (cf. `docs/architecture/PHASE1-2.md` sur `feat/oiran-2.20.0-streaming`) restent ouverts pour les lots 2.20.x/2.21.x. 2.19.1 ne traite pas ces écarts.
+- Criteria sur sessions LIVE (continuous) : fonctionnel via `live_flow_for`, mais les callflows live sont relus sur disque — à vérifier à la montée en charge (le cache file-signature 2.18.12 absorbe la relecture).
+- LTE evidence : pas de criteria matching (événements non exposés dans la même shape) — session filtrée hors du résultat quand `criteria` est non vide.
+
 ## OIRAN API 2.19.0 — 2026-11-16 — Catalog filtres/colonnes + filtre étendu + projection serveur (minor)
 
 ANR1 a déployé p900 2.7.0 en attendant `catalog` + `columns` : ces deux routes débloquent l'écran Sessions (choix dynamique de colonnes + filtres multiples). Le filtre 2.10.0 est étendu avec 4 nouvelles familles AND (OR interne), sans toucher à la clé de pagination canonique.
