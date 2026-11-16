@@ -1,5 +1,11 @@
 # Changelog
 
+## polaris-vtap 2.21.2 — 2026-11-16 — lock vTAP resynchronisé après decoder-sbi 0.4.4 / live-probe 0.6.1 (patch)
+
+- Le lock autonome `OIRAN/vtap/Cargo.lock` référence les crates OIRAN (dev-deps via `oiran-decode`) : la hausse de version de `decoder-sbi` en 2.21.2 rendait `cargo test --locked` impossible dans `OIRAN/vtap`. Corrigé par `cargo update -w`.
+- Audit Rust 1.83 (`python3 /tmp/audit.py Cargo.lock`) : 0 incompatible. `cargo test --locked` : 15 passed ; `cargo build --locked --features ebpf` sans clang : PASS (objet précompilé vérifié).
+- Règle ajoutée : toute hausse de version d'un crate OIRAN doit être suivie de `cargo update -w` dans `OIRAN/vtap`, puis du test `--locked`.
+
 ## OIRAN API 2.21.2 — 2026-11-16 — Câblage VtapSource + ProbeStamp + fix decoder-sbi tri canonique (patch)
 
 Lot C.3 validé Sadok #10. Câblage effectif du moteur `vtap` de la 2.21.0 dans la fondation `CaptureSource`, clôture de l'écart OUVERT `decoder-sbi::decode_connections` qui triait les events par `ts` (interdit par la règle canonique OIRAN).
