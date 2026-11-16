@@ -18,9 +18,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use aya::maps::{PerCpuArray, RingBuf};
+use aya::programs::trace_point::TracePointLinkId;
 use aya::programs::{TracePoint, UProbe};
 use aya::Ebpf;
 use polaris_vtap::conn::ProcResolver;
+use polaris_vtap::fdlearn::{FdLearner, PENDING_MAX_AGE, PENDING_MAX_BYTES};
 use polaris_vtap::pcap::{FileManifest, RotatingWriter};
 use polaris_vtap::record::TlsRecord;
 use polaris_vtap::synth::{Synthesizer, DEFAULT_SERVER_PORTS};
@@ -43,6 +45,9 @@ struct Args {
     probe_id: String,
     proc_root: PathBuf,
     duration: Option<Duration>,
+    /// 2.21.6 — `on-demand` (défaut) : tracepoints de syscalls attachés
+    /// seulement tant qu'un fd reste inconnu ; `always` : comportement 2.21.5.
+    fd_tracepoints_always: bool,
 }
 
 fn log(value: serde_json::Value) {
@@ -70,6 +75,7 @@ fn parse_args() -> Result<Args, String> {
         probe_id: "lab-vtap".into(),
         proc_root: PathBuf::from("/proc"),
         duration: None,
+        fd_tracepoints_always: false,
     };
     let mut i = 0;
     while i < raw.len() {
@@ -84,6 +90,13 @@ fn parse_args() -> Result<Args, String> {
             "--probe-id" => a.probe_id = v.clone(),
             "--proc-root" => a.proc_root = v.into(),
             "--duration-seconds" => a.duration = Some(Duration::from_secs(num(v)?)),
+            "--fd-tracepoints" => {
+                a.fd_tracepoints_always = match v.as_str() {
+                    "always" => true,
+                    "on-demand" => false,
+                    other => return Err(format!("--fd-tracepoints: on-demand|always, pas {other}")),
+                }
+            }
             other => return Err(format!("unknown option {other}")),
         }
         i += 2;
@@ -178,6 +191,7 @@ const UPROBES: &[(&str, &str, bool)] = &[
     ("vtap_ssl_read_ex_enter", "SSL_read_ex", false),
     ("vtap_ssl_read_ex_exit", "SSL_read_ex", false),
     ("vtap_ssl_set_fd", "SSL_set_fd", false),
+    ("vtap_ssl_free", "SSL_free", false),
 ];
 
 const TRACEPOINTS: &[(&str, &str)] = &[
@@ -254,15 +268,23 @@ fn run() -> Result<(), String> {
         return Err("VTAP_ATTACH_FAILED: SSL_write/SSL_read non attachés".into());
     }
     ensure_tracefs()?;
-    for (prog, tp) in TRACEPOINTS {
+    for (prog, _tp) in TRACEPOINTS {
         let p: &mut TracePoint = bpf
             .program_mut(prog)
             .ok_or(format!("program {prog} absent"))?
             .try_into()
             .map_err(|e| format!("{prog}: {e}"))?;
         p.load().map_err(|e| format!("{prog} load: {e}"))?;
-        p.attach("syscalls", tp).map_err(|e| format!("{prog} attach {tp}: {e}"))?;
     }
+    let mut tp_links: Vec<(&str, TracePointLinkId)> = Vec::new();
+    if args.fd_tracepoints_always {
+        attach_tracepoints(&mut bpf, &mut tp_links)?;
+    }
+    log(json!({"event":"VTAP_FD_TRACEPOINTS_MODE","mode": if args.fd_tracepoints_always {"always"} else {"on-demand"}}));
+    let mut learner = FdLearner::new();
+    let mut last_need = Instant::now();
+    let mut tp_on_since: Option<Instant> = None;
+    let mut tp_on_total = Duration::ZERO;
 
     let mut ring = RingBuf::try_from(bpf.take_map("events").ok_or("map events absente")?)
         .map_err(|e| format!("ringbuf: {e}"))?;
@@ -298,17 +320,40 @@ fn run() -> Result<(), String> {
                 synth.counters.filtered_records += 1;
                 continue;
             }
-            let tuple = match resolver.resolve(record.tgid, record.fd) {
-                Ok(t) => t,
-                Err(e) => {
-                    synth.counters.records += 1;
-                    synth.note_unresolved(e.counter());
-                    continue;
+            for record in learner.on_record(record, Instant::now()) {
+                let tuple = match resolver.resolve(record.tgid, record.fd) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        synth.counters.records += 1;
+                        synth.note_unresolved(e.counter());
+                        continue;
+                    }
+                };
+                let ts = (record.mono_ns as i128 + offset).max(0) as u64;
+                let packets = synth.push(ts, tuple, record.op, &record.comm, record.truncated(), &record.data);
+                writer.write(&packets).map_err(|e| format!("pcap write: {e}"))?;
+            }
+        }
+        // 2.21.6 — records sans fd au-delà de 10 s (ou plafond mémoire) :
+        // comptés fd_unknown, jamais en silence.
+        for _ in learner.expire(Instant::now(), PENDING_MAX_AGE, PENDING_MAX_BYTES) {
+            synth.counters.records += 1;
+            synth.note_unresolved("fd_unknown");
+        }
+        if !args.fd_tracepoints_always {
+            if learner.needs_tracepoints() {
+                last_need = Instant::now();
+                if tp_links.is_empty() {
+                    attach_tracepoints(&mut bpf, &mut tp_links)?;
+                    tp_on_since = Some(Instant::now());
+                    log(json!({"event":"VTAP_FD_TRACEPOINTS_ON","pending_records":learner.pending_records()}));
                 }
-            };
-            let ts = (record.mono_ns as i128 + offset).max(0) as u64;
-            let packets = synth.push(ts, tuple, record.op, &record.comm, record.truncated(), &record.data);
-            writer.write(&packets).map_err(|e| format!("pcap write: {e}"))?;
+            } else if !tp_links.is_empty() && last_need.elapsed() >= Duration::from_secs(10) {
+                detach_tracepoints(&mut bpf, &mut tp_links)?;
+                let on = tp_on_since.take().map(|t| t.elapsed()).unwrap_or_default();
+                tp_on_total += on;
+                log(json!({"event":"VTAP_FD_TRACEPOINTS_OFF","on_ms":on.as_millis() as u64}));
+            }
         }
         let stop = STOP.load(Ordering::SeqCst)
             || args.duration.map(|d| started.elapsed() >= d).unwrap_or(false);
@@ -316,6 +361,13 @@ fn run() -> Result<(), String> {
             let now = read_stats(&stats);
             let delta: Vec<u64> = now.iter().zip(&bpf_base).map(|(a, b)| a.saturating_sub(*b)).collect();
             bpf_base = now;
+            if stop {
+                // Arrêt : les records encore en attente de fd sont comptés.
+                for _ in learner.expire(Instant::now(), Duration::ZERO, 0) {
+                    synth.counters.records += 1;
+                    synth.note_unresolved("fd_unknown");
+                }
+            }
             // Pertes ringbuf : seul compteur invisible côté userspace
             // (troncature et fd inconnu arrivent déjà flaggés par event).
             if delta[0] > 0 {
@@ -357,7 +409,8 @@ fn run() -> Result<(), String> {
             // 2.21.5 — battement de vie : prouve que l'agent tourne et
             // date sa mort s'il disparaît (aucun silence).
             writer.flush().map_err(|e| format!("pcap flush: {e}"))?;
-            log(json!({"event":"VTAP_ALIVE","uptime_s":started.elapsed().as_secs(),"counters":synth.counters}));
+            let on_now = tp_on_since.map(|t| t.elapsed()).unwrap_or_default();
+            log(json!({"event":"VTAP_ALIVE","uptime_s":started.elapsed().as_secs(),"fd_tracepoints_attached":!tp_links.is_empty(),"fd_tracepoints_on_total_s":(tp_on_total + on_now).as_secs(),"pending_records":learner.pending_records(),"counters":synth.counters}));
             last_alive = Instant::now();
         }
         if drained == 0 {
@@ -392,6 +445,31 @@ fn ensure_tracefs() -> Result<(), String> {
         ));
     }
     log(json!({"event":"VTAP_TRACEFS_MOUNTED","path":"/sys/kernel/tracing"}));
+    Ok(())
+}
+
+fn attach_tracepoints(bpf: &mut Ebpf, links: &mut Vec<(&'static str, TracePointLinkId)>) -> Result<(), String> {
+    for (prog, tp) in TRACEPOINTS {
+        let p: &mut TracePoint = bpf
+            .program_mut(prog)
+            .ok_or(format!("program {prog} absent"))?
+            .try_into()
+            .map_err(|e| format!("{prog}: {e}"))?;
+        let link = p.attach("syscalls", tp).map_err(|e| format!("{prog} attach {tp}: {e}"))?;
+        links.push((prog, link));
+    }
+    Ok(())
+}
+
+fn detach_tracepoints(bpf: &mut Ebpf, links: &mut Vec<(&'static str, TracePointLinkId)>) -> Result<(), String> {
+    for (prog, link) in links.drain(..) {
+        let p: &mut TracePoint = bpf
+            .program_mut(prog)
+            .ok_or(format!("program {prog} absent"))?
+            .try_into()
+            .map_err(|e| format!("{prog}: {e}"))?;
+        p.detach(link).map_err(|e| format!("{prog} detach: {e}"))?;
+    }
     Ok(())
 }
 

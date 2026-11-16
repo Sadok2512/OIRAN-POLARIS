@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-vtap"
-version = "2.21.5"
+version = "2.21.6"
 dependencies = [
  "aya",
  "event-schema",

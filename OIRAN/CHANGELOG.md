@@ -195,6 +195,15 @@ OP2.1 troncature 128 oct côté sonde vs. decoder, OP2.2 pseudonymisation IP UE,
 
 Ce lot 2.22.0 s'arrête ici : validation Sadok requise sur chiffres, schéma et plan de lots avant 2.22.1 (code inner 5-tuple).
 
+## polaris-vtap 2.21.6 — 2026-11-16 — tracepoints de syscalls à la demande (surcoût PSI de l'agent) (minor)
+
+- Mesure ANR2, essai 4 (#10 6927767705, 90 mesures de `system.slice/cpu.pressure`) : PSI médiane P0 HTTP sans agent 8,51 ; P1 HTTP + agent 11,42 ; P2 TLS + agent 11,96. Le surcoût vient de l'AGENT (+2,9) et non du TLS (+0,5) : il existe même sans trafic TLS. Cause : les 8 tracepoints `sys_enter_{read,write,…}` attachés en permanence, exécutés pour chaque syscall d'E/S de TOUS les processus de l'hôte. Le garde de Control ne revenait donc jamais sous son seuil de reprise (10).
+- Correctif : module `fdlearn::FdLearner`. Un record dont le fd est inconnu est mis en attente par (tgid, SSL*) ; les tracepoints ne s'attachent qu'à ce moment-là (`VTAP_FD_TRACEPOINTS_ON`) et se détachent après 10 s sans besoin (`VTAP_FD_TRACEPOINTS_OFF`, durée attachée). L'attente est vidée dans l'ordre dès que le fd est appris. Au-delà de 10 s ou de 64 MiB, les records sont comptés `fd_unknown`, jamais en silence. `--fd-tracepoints always` rétablit le comportement 2.21.5.
+- Nouvelle uprobe `SSL_free` : oublie l'association SSL*→fd (un SSL* réalloué à la même adresse ne reçoit pas d'ancien fd). Objet précompilé régénéré (`bpf/prebuilt/PROVENANCE.txt`).
+- `VTAP_ALIVE` publie `fd_tracepoints_attached`, `fd_tracepoints_on_total_s` et `pending_records`.
+- Preuve réelle (hôte de dev, curl HTTP/2 sur TLS) : `VTAP_FD_TRACEPOINTS_ON pending_records=2`, puis `VTAP_FD_TRACEPOINTS_OFF on_ms=10610` ; 8 records, `unresolved={}` ; `oiran-decode` : `tcp_errors=0 sbi_transactions=2`. Tests : 16 unitaires (+4 `fdlearn`) + 3 d'intégration, `--locked`.
+- OUVERT : vérifier sur le lab que la PSI P1 retombe près de P0 (essai 5).
+
 ## OIRAN API 2.21.9 — 2026-11-16 — le scan vTAP ne lit plus le vrai répertoire de l'hôte en test (patch)
 
 - Rapport ANR1 #10 6927549061 : `oversized_segment_is_persisted_individually_while_other_segment_imports` échoue sur le lab, de façon reproductible, et passe sur l'hôte de dev.
