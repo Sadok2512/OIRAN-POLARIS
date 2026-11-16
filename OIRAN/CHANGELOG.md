@@ -1,5 +1,63 @@
 # Changelog
 
+## OIRAN API 2.22.2 — 2026-11-16 — table de corrélation TEID↔SEID↔SUPI multi-source
+
+Lot P2.2 — module `live-probe::userplane_index` qui alimente une table de corrélation partagée sur les captures N2/N3/N4/SBI. Prépare 2.22.3 (`UserPlaneSummary` attache les champs de l'entrée à chaque record).
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.22.1 | **2.22.2** |
+| `live-probe` | 0.6.5 | **0.6.6** |
+
+### Sources multi-source (correction C3 #9 6927882355)
+
+| Source | Fiabilité | Message typique |
+|---|---|---|
+| `SourceKind::Sbi` (primaire) | HAUTE | `Nsmf_PDUSession CreateSMContext` (vTAP TLS) |
+| `SourceKind::Pfcp` (primaire) | HAUTE | PFCP Session Establishment Req/Resp |
+| `SourceKind::Ngap` (primaire) | HAUTE | NGAP PDUSessionResourceSetup Req/Resp |
+| `SourceKind::NasCleartext` (secondaire) | FAIBLE | NAS Registration — uniquement en clair (NEA0, lab) |
+
+En production sous NEA2+, `NasCleartext` est inutilisable ; les 3 sources primaires suffisent. Quand `NasCleartext` est observée et qu'un pseudonym est déjà posé par une source primaire, l'entrée n'est **pas** écrasée (primary > secondary). Le pseudonym NAS peut cependant déclencher `USERPLANE_NAS_CLEARTEXT_SEEN` (dédupé) pour signaler un NAS en clair en prod.
+
+### `UserplaneIndex` API publique
+
+- `observe(&NormalizedEvent) -> Vec<SourceKind>` : parse `session_identifiers` selon `(protocol, message_name)` et met à jour la table.
+- `lookup(teid_hex: &str) -> Option<&UserplaneIndexEntry>` : lookup O(log n) par TEID (BTreeMap). Clé normalisée en `0x{:08x}` (gère les émissions `0x96a8` de decoder-pfcp et `0x000096a8` de decoder-gtpu sur la même entrée).
+- `record_miss(teid_hex, direction) -> bool` : dédup sur `(teid, direction)` ; renvoie `true` la 1ʳᵉ fois (l'appelant émet `USERPLANE_INDEX_MISS`).
+- `attach_entry_to_event(&mut NormalizedEvent, &UserplaneIndexEntry)` : attache les identifiers `subscriber_pseudonym`, `subscriber_pseudonym_source`, `pdu_session_id`, `seid_smf`, `seid_upf`, `five_qi`, `qfi` à un event d'agrégat sans écraser les identifiers déjà présents (préserve le `qfi` natif du décodeur gtpu).
+
+### Pipeline integration
+
+Module `pub mod userplane_index` exposé dans `live-probe::lib.rs`. **Le wiring effectif dans `process_capture_into_selected`** (feeding + lookup/attach) est consolidé dans le lot 2.22.3 avec la struct `UserPlaneSummary` et son aggregator — un seul et même point d'intégration, atomique.
+
+### Tests (9 passed)
+
+```bash
+cargo test -p live-probe --lib --locked userplane_index   # 9 passed
+```
+
+Scénarios couverts :
+1. `sbi_create_smcontext_seeds_subscriber_pseudonym_and_pdu_session_id`
+2. `pfcp_session_establishment_seeds_seid_and_ue_ip` (normalisation TEID `0x96a8` → `0x000096a8`)
+3. `ngap_pdu_session_resource_setup_seeds_five_qi_and_teid_ul`
+4. `nas_cleartext_is_secondary_and_does_not_overwrite_sbi_primary_pseudonym`
+5. `multi_source_scenario_fills_all_fields` (UE-201 synthétique : SBI + PFCP + NGAP → entrée complète)
+6. `miss_is_deduped_per_teid_and_direction`
+7. `nas_cleartext_sans_pseudonym_existant_ouvre_entry_mais_marque_source_nas`
+8. `attach_entry_to_event_fills_aggregate_identifiers`
+9. `teid_key_normalization_canonical_format_regardless_of_input`
+
+### Session de référence lab (C4)
+
+Test d'acceptation sur session lab `5g-session-0bfac1e7ae159a77` (via ANR2 sous `LAB_LOCK`) **reporté en 2.22.3** quand le pipeline complet enchaîne feed → aggregate → lookup → attach. Rejouer 2.22.2 seul sur UE-201 lab n'apporterait rien par rapport aux unit tests.
+
+### Suite
+
+Enchaînement **2.22.3** immédiat : struct `UserPlaneSummary` dans `event-schema`, agrégateur `UserPlaneSummaryAggregator` avec **fermeture sur événement** (PFCP Session Deletion / NGAP PDU Session Resource Release / inactivité configurable) + **éviction LRU** `USERPLANE_SUMMARY_EVICTED` (jamais erreur bloquante).
+
 ## OIRAN API 2.22.1 — 2026-11-16 — inner 5-tuple IPv4/IPv6 + snaplen sonde + invariant volumes
 
 Lot P2.1 — premier lot de code P2 après validation 2.22.0 avec 4 corrections (#9 6927882355). Document `docs/architecture/P2-USERPLANE.md` mis à jour : C1 chiffres étiquetés HYPOTHÈSE H1/H2/H3, C2 fermeture sur événement + éviction LRU (lot 2.22.3), C3 chaîne SUPI multi-source avec SBI primary, C4 session lab via ANR2 sous LAB_LOCK ; OUVERTS OP2.1→OP2.6 tranchés.
