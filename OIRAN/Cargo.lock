@@ -767,6 +767,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "polaris-bench-o1"
+version = "0.1.0"
+dependencies = [
+ "capture-pcap",
+ "event-schema",
+ "oiran-decode",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"

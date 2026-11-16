@@ -1,5 +1,75 @@
 # Changelog
 
+## OIRAN API 2.23.0 — 2026-11-16 — harnais bench O1 (volet A + stub amplify) — GO #9 6930944260
+
+Branche `feat/oiran-2.23.0-bench-o1` depuis `243ed5c`. Nouvelle crate `OIRAN/benchmarks/o1` (binaire `polaris-bench-o1`). Objectif : fournir la seule source de chiffres « 400G » en attendant la trace CPU d'ANR1 (2.21.13).
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.22.4 | **2.23.0** |
+| `polaris-bench-o1` | — | **0.1.0** (nouveau) |
+
+### Volet A — rejeu multi-worker (**livré**)
+
+`polaris-bench-o1 replay-workers --input <pcap> --workers N --rounds M [--interface N3]` :
+- Charge le pcap une fois en RAM, le matérialise sur `/dev/shm` pour les workers (rejeu 100 % mémoire, zéro I/O disque pendant le run).
+- Répartit `rounds` sur `workers` round-robin (base + remainder sur les premiers workers).
+- Chaque worker décode via `oiran_decode::decode_capture_streaming` avec `capture_id = sha256:<sha256(base:worker:round)>` (déterministe ; tombe dans la règle `capture ID must be sha256: + 64 hex`).
+- Sorties JSON (1 ligne stdout) : `packets_per_second`, `bits_per_second` (= `wire_bytes * 8 / wall_elapsed`, sur `original_length` — invariant OP2.1), `events_per_second`, `rss_kib_before`/`rss_kib_after` (lu depuis `/proc/self/status`), détails par worker.
+
+**Run hôte de dev — mesure publiée** :
+- Machine : `nproc = 10`, Intel(R) Xeon(R) Platinum 8173M CPU @ 2.00GHz.
+- Pcap synthétique : 100 paquets UDP/GTP-U G-PDU (TEID `0x000096a8`, payload 64 oct).
+- Commandes :
+```bash
+./target/release/polaris-bench-o1 replay-workers --input /tmp/polaris-bench-o1-sample.pcap --workers N --rounds 400 --interface N3
+```
+- Résultats (total 40 000 paquets G-PDU décodés par essai) :
+
+| Workers | pps | bps (Mbps) | wall_elapsed_ms | efficacité (= pps_N / (N × pps_1)) |
+|---|---|---|---|---|
+| 1 | 144 404 | 131.7 | 277 | 1.00 (ref) |
+| 2 | 210 526 | 192.0 | 190 | 0.73 |
+| 4 | 273 972 | 249.9 | 146 | 0.47 |
+
+**Étiquetage « hôte de dev »** : ces chiffres ne sont **pas** extrapolables en 400 Gbit/s. Formule de projection (à valider avec bench AF_PACKET lab, volet B ANR2) : `throughput_prod ≈ throughput_dev × (CPU_prod/CPU_dev) × scaling_eff(cores)`. Avec `scaling_eff(4) ≈ 0.47` sur hôte dev, un UPF 400G nécessiterait des cores NUMA-aware (DPDK/XDP) pour échelle linéaire — hors scope O1 harnais.
+
+### Amplify — **stub 2.23.0**, primitives + plan JSON
+
+`polaris-bench-o1 amplify --input <pcap> --ues K [--output-dir DIR]` (stub) :
+- **Pas de réécriture pcap** dans ce lot. La lecture/écriture pcap (buffers, checksums IP+UDP, pcapng Enhanced Packet Block) est consolidée en 2.23.1 avec `capture-pcap` writer.
+- Imprime le **plan d'amplification** : pour chaque `ue_index ∈ [0, K)`, une `SyntheticUe { imsi, msisdn, imei, teid_offset, seid_offset, ran_ue_ngap_id_offset, amf_ue_ngap_id_offset }`.
+- Les identités cibles sont **synthétiques** (MCC 001 MNC 01 + MSIN dérivé de `ue_index`). Aucune identité réelle ne sort du lab.
+
+Primitives testables unitairement (`amplify.rs`) :
+- `synthesize_imsi(ue_index) -> String` : 15 chiffres, "00101" + MSIN 10 chiffres.
+- `synthesize_msisdn(ue_index) -> String` : 12 chiffres, "33" + 10 chiffres lab.
+- `synthesize_imei(ue_index) -> String` : 15 chiffres, TAC 86000000 + SN 6 chiffres + Luhn check digit.
+- `build_synthetic_ue(ue_index) -> SyntheticUe` : agrège tout avec offsets TEID/SEID/NGAP IDs déterministes.
+- `replace_bytes_all(haystack, needle, replacement) -> usize` : remplacement in-place qui **panique** si `needle.len() != replacement.len()` (préserve les offsets du pcap — capture de drift à la compile).
+
+### Volet B (AF_PACKET lab) — à demander à ANR2 plus tard
+
+Script `measure.sh` 2.20.1 existant à compléter avec pktgen sur veth, débit montant, palier au premier drop (`packet_statistics_v3`). Hors scope 2.23.0 (nécessite accès lab ANR2).
+
+### Volet C (UserPlaneSummary on/off) — bloqué sur gate P2
+
+Même rejeu avec `polaris.toml [userplane] enabled=true` vs `false`, pour comparer CPU et volume publiés. Bloqué tant que P2 2.22.x n'est pas PASS lab (cf. CHANGELOG 2.22.4).
+
+### Tests
+
+```bash
+cargo test -p polaris-bench-o1 --locked          # 12 passed (amplify.rs : 8 ; replay.rs : 4)
+cargo build --release -p polaris-bench-o1        # binaire 2.23.0 produit
+cd OIRAN/vtap && cargo update -w && cargo test --locked   # 12 unit + 3 integration passed
+```
+
+### Suite
+
+En VEILLE sur #9 pour trace CPU ANR1 (→ 2.21.13 fix défaut 4) et retour PASS 2.21.11 lab. 2.23.1 : réécriture pcap complète (amplify) dès qu'un pcap lab de référence sera disponible (via ANR2).
+
 ## OIRAN API 2.22.4 — 2026-11-16 — jointure DL TEID + buckets throughput + câblage pipeline (iso-comportement par défaut)
 
 Lot P2.4 — ferme les 3 points demandés en tête par Sadok (#9 6928930450) et ajoute les buckets throughput + câblage pipeline multi-capture.

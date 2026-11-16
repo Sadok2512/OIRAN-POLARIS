@@ -1,0 +1,18 @@
+[package]
+name = "polaris-bench-o1"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Harnais du bench O1 : rejeu multi-worker + amplificateur de pcaps synthétiques (bench 400G)."
+
+[[bin]]
+name = "polaris-bench-o1"
+path = "src/main.rs"
+
+[dependencies]
+oiran-decode = { path = "../../oiran-decode" }
+event-schema = { path = "../../event-schema" }
+capture-pcap = { path = "../../capture-pcap" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

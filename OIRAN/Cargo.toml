@@ -33,6 +33,7 @@ members = [
     "disk-safety",
     "live-probe",
     "capture-helper",
+    "benchmarks/o1",
 ]
 
 [workspace.package]
