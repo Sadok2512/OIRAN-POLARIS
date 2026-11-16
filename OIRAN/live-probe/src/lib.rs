@@ -17453,6 +17453,116 @@ mod tests {
         );
     }
 
+    /// 2.22.1 — invariant OP2.1 (#9 6927882355) : les volumes agrégés
+    /// `aggregate_wire_bytes` sont calculés sur `original_length` (taille
+    /// sur le fil avant snaplen sonde), **jamais** sur `captured_length`
+    /// (fenêtre effectivement persistée après troncature). Sans cet
+    /// invariant, un snaplen de 128 oct faussait tous les débits.
+    #[test]
+    fn n3_aggregator_counts_wire_bytes_on_original_length_not_captured_length() {
+        use event_schema::PacketReference;
+        let make = |packet_number: u64, direction: event_schema::Direction| NormalizedEvent {
+            event_id: format!("evt-{packet_number}"),
+            parent_event_id: None,
+            probe_id: "oiran-vprobe-local-01".into(),
+            capture_point_id: "N3".into(),
+            capture_id: "sha256:truncation-test".into(),
+            packet_references: vec![PacketReference {
+                source_file: "n3.pcapng".into(),
+                source_sha256: None,
+                packet_number,
+                byte_offset: packet_number * 1500,
+                interface_id: 0,
+                link_type: None,
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                // Fenêtre persistée après snaplen = 128 octets.
+                captured_length: 128,
+                // Taille sur le fil = 1500 octets (MTU standard).
+                original_length: 1500,
+            }],
+            timestamp: event_schema::ExactTimestamp {
+                seconds: 1,
+                nanoseconds: packet_number as u32,
+                raw_ticks: 1_000_000_000 + packet_number,
+                resolution_base: 10,
+                resolution_exponent: 9,
+            },
+            interface: "N3".into(),
+            protocol: Protocol::Gtpu,
+            message_name: "G-PDU".into(),
+            message_type: 255,
+            procedure_code: None,
+            procedure: None,
+            security_state: None,
+            source_byte_offset: None,
+            source_endpoint: event_schema::Endpoint {
+                address: "10.77.14.13".into(),
+                port: None,
+                network_function: None,
+            },
+            destination_endpoint: event_schema::Endpoint {
+                address: "10.77.14.15".into(),
+                port: None,
+                network_function: None,
+            },
+            direction,
+            session_identifiers: vec![
+                NamedValue {
+                    name: "teid".into(),
+                    value: "0x000096a8".into(),
+                    pseudonymized: false,
+                },
+                NamedValue {
+                    name: "tunnel_direction".into(),
+                    value: "UPLINK".into(),
+                    pseudonymized: false,
+                },
+            ],
+            information_elements: vec![],
+            decoder_name: "decoder-gtpu".into(),
+            decoder_version: "0.3.0".into(),
+            schema_version: NormalizedEvent::SCHEMA_VERSION,
+            decoding_status: event_schema::DecodeStatus::Decoded,
+            errors: vec![],
+            raw_payload_reference: format!("sha256:evt-{packet_number}"),
+            evidence_references: vec![],
+            sbi: None,
+        };
+
+        let mut aggregator = N3FlowAggregator::default();
+        for pn in 1..=5 {
+            aggregator
+                .observe(make(pn, event_schema::Direction::Uplink))
+                .unwrap();
+        }
+        let flows = aggregator.finish();
+        assert_eq!(flows.len(), 1, "un seul aggregate (1 teid × 1 direction)");
+        let wire_bytes = flows[0]
+            .information_elements
+            .iter()
+            .find(|element| element.name == "aggregate_wire_bytes")
+            .and_then(|element| element.value.as_deref())
+            .expect("aggregate_wire_bytes émis");
+        assert_eq!(
+            wire_bytes, "7500",
+            "5 × original_length (1500) = 7500 ; snaplen 128 NE DOIT PAS \
+             réduire le compteur de volume. Vu: {wire_bytes}"
+        );
+        let packet_count = flows[0]
+            .information_elements
+            .iter()
+            .find(|element| element.name == "aggregate_packet_count")
+            .and_then(|element| element.value.as_deref())
+            .expect("aggregate_packet_count émis");
+        assert_eq!(packet_count, "5");
+    }
+
     /// 1000 PFCP Heartbeat Requests + 1000 Responses du même couple de
     /// nœuds collapsent en 1 aggregate avec request_count=1000,
     /// response_count=1000, failure_count=0, et la paire canonique

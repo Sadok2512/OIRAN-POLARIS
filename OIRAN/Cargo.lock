@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-gtpu"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "event-schema",
  "plugin-runtime",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.22.0"
+version = "2.22.1"
 dependencies = [
  "axum",
  "callflow-renderer",

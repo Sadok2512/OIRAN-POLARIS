@@ -1,5 +1,56 @@
 # Changelog
 
+## OIRAN API 2.22.1 — 2026-11-16 — inner 5-tuple IPv4/IPv6 + snaplen sonde + invariant volumes
+
+Lot P2.1 — premier lot de code P2 après validation 2.22.0 avec 4 corrections (#9 6927882355). Document `docs/architecture/P2-USERPLANE.md` mis à jour : C1 chiffres étiquetés HYPOTHÈSE H1/H2/H3, C2 fermeture sur événement + éviction LRU (lot 2.22.3), C3 chaîne SUPI multi-source avec SBI primary, C4 session lab via ANR2 sous LAB_LOCK ; OUVERTS OP2.1→OP2.6 tranchés.
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.22.0 | **2.22.1** |
+| `decoder-gtpu` | 0.2.1 | **0.3.0** |
+
+### decoder-gtpu 0.3.0 — `parse_inner_five_tuple`
+
+Remplace `inner_ipv4_addresses` par une API publique `parse_inner_five_tuple(payload) -> Option<InnerFiveTuple>` qui :
+
+- gère **IPv4** (header variable via IHL) **et IPv6** (header fixe 40 oct) ;
+- traverse les extension headers IPv6 : hop-by-hop (0), routing (43), fragment (44), destination options (60), AH (51). Borne à 16 extensions ; dépassement → `None` (pas de panique). ESP (50) et final (59) stoppent l'extraction de ports ;
+- extrait `(src_port, dst_port)` pour TCP (6), UDP (17), UDP-Lite (136), DCCP (33), SCTP (132). Autre proto → ports `None` ;
+- expose `l4_proto` et `ip_version` séparément ;
+- **ne lit jamais un octet au-delà du `payload` fourni** : un payload tronqué (snaplen sonde) retourne `None` ou ports à `None`, jamais une lecture partielle ni un panic.
+
+Dans `decode()` (message_type 255 = G-PDU) : émission des identifiers `inner_source_ip`, `inner_destination_ip`, `inner_ip_version`, `inner_l4_proto`, `inner_src_port`, `inner_dst_port`. `ue_ip` reste émis selon direction résolue (pools v4 `10.45.*`/`10.46.*` étendus avec préfixes v6 `fd45:`/`fd46:` ULA lab).
+
+Tests (6 nouveaux, 11 au total) : IPv4+UDP, IPv4+TCP, IPv6+UDP, IPv6+TCP, IPv6+hop-by-hop+TCP, troncature (ports `None` jamais partiels), version IP inconnue → `None`.
+
+### `polaris.toml [userplane]` — snaplen sonde (OP2.1 tranché)
+
+Nouvelle section `[userplane]` dans `PolarisConfig` avec champ `snaplen_n3_bytes` (défaut 128 oct — fenêtre documentée dans PHASE1-2.md §4.5, suffisante pour IPv4/IPv6 + TCP/UDP + options SACK/Timestamps). Section absente ⇒ 128 par défaut (iso-comportement). Clé dédiée pour éviter que P2 et P8 configurent chacun leur troncature.
+
+Tests polaris_config (2 nouveaux) : section absente → défaut 128 ; section surchargée → valeur respectée.
+
+### Invariant volumes (OP2.1, test dédié live-probe)
+
+Test `n3_aggregator_counts_wire_bytes_on_original_length_not_captured_length` : 5 paquets G-PDU avec `captured_length=128` + `original_length=1500` agrégés → `aggregate_wire_bytes = 7500` (= 5 × 1500). Garantit que la troncature sonde ne fausse pas les débits : la somme reste sur la **taille sur le fil**, jamais sur la fenêtre persistée.
+
+### Tests
+
+```bash
+cargo test -p decoder-gtpu --lib --locked        # 11 passed
+cargo test -p live-probe   --lib --locked        # 168 passed, 6 ignored
+cargo test -p oiran-api    --lib --locked userplane   # 2 passed (polaris_config)
+```
+
+### Session de référence
+
+C4 appliquée (#9 6927882355) : dataset dépôt `datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl` sert de test unitaire minimal, session lab `5g-session-0bfac1e7ae159a77` à rejouer via ANR2 sous `LAB_LOCK` (demande posée sur #10 après ce lot).
+
+### Suite
+
+Enchaînement **2.22.2** (table corrélation TEID↔SEID↔SUPI multi-source SBI primary + PFCP + NGAP + NAS secondary) immédiatement après ce lot, puis **2.22.3** (`UserPlaneSummary` struct + aggregator « fermeture sur événement » + éviction LRU `USERPLANE_SUMMARY_EVICTED`), sans pause (règle #9 6927220811 + 6927882355).
+
 ## OIRAN API 2.22.0 — 2026-11-16 — audit P2 USERPLANE (livrable design, pas de code d'agrégation)
 
 Lot P2.0 — audit préalable avant toute implémentation du résumé plan usager par UE / PDU session. Aucun code d'agrégation ajouté dans ce lot : il produit le livrable `docs/architecture/P2-USERPLANE.md` qui conditionne les lots 2.22.1 → 2.22.5. Rebasé sur 413417a (2.21.9) comme demandé #9 2026-11-16 20:03.

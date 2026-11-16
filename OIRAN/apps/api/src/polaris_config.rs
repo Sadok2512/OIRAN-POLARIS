@@ -56,6 +56,41 @@ pub struct PolarisConfig {
     pub probes: Vec<ProbeConfig>,
     #[serde(default)]
     pub endpoints: BTreeMap<String, EndpointConfig>,
+    /// 2.22.1 — section `[userplane]` (plan usager résumé). Absence =
+    /// comportement historique inchangé ; chaque champ a un défaut
+    /// documenté (voir `UserplaneConfig`).
+    #[serde(default)]
+    pub userplane: UserplaneConfig,
+}
+
+/// 2.22.1 — section `[userplane]` de `polaris.toml`. Configure la
+/// troncature sonde (OP2.1 tranché) et préparera les clés 2.22.3
+/// `inactivity_timeout_ns` + 2.22.4 `window_ns` dans les lots suivants.
+///
+/// Invariant OP2.1 : le snaplen sonde définit la **fenêtre capturée**
+/// sur disque ; les volumes `aggregate_wire_bytes` se calculent
+/// **toujours** sur `original_length` (champ pcapng), jamais sur
+/// `captured_length`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserplaneConfig {
+    /// Snaplen BPF pour les interfaces N3 (après l'entête GTP-U).
+    /// Défaut : 128 octets — suffisant pour IPv4/IPv6 + TCP/UDP +
+    /// options SACK/Timestamps (cf. PHASE1-2.md §4.5). La sonde
+    /// capture `L2 + L3 externe + GTP-U header + snaplen_n3_bytes`.
+    #[serde(default = "default_snaplen_n3_bytes")]
+    pub snaplen_n3_bytes: u32,
+}
+
+impl Default for UserplaneConfig {
+    fn default() -> Self {
+        Self {
+            snaplen_n3_bytes: default_snaplen_n3_bytes(),
+        }
+    }
+}
+
+fn default_snaplen_n3_bytes() -> u32 {
+    128
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -385,5 +420,28 @@ out_dir = "/tmp/vtap"
             PolarisConfig::load_from_str(&text, &tmp_path(&format!("engine-{engine}")))
                 .expect("engine accepted");
         }
+    }
+
+    /// 2.22.1 — section `[userplane]` absente ⇒ snaplen par défaut
+    /// 128 oct (OP2.1 tranché #9 6927882355).
+    #[test]
+    fn missing_userplane_section_yields_default_snaplen_128() {
+        let text = "";
+        let config =
+            PolarisConfig::load_from_str(text, &tmp_path("userplane-default")).expect("parses");
+        assert_eq!(config.userplane.snaplen_n3_bytes, 128);
+    }
+
+    /// 2.22.1 — `[userplane]` surchargée dans `polaris.toml`.
+    #[test]
+    fn userplane_section_overrides_snaplen_n3_bytes() {
+        let text = r#"
+[userplane]
+snaplen_n3_bytes = 192
+"#;
+        let config =
+            PolarisConfig::load_from_str(text, &tmp_path("userplane-overridden"))
+                .expect("parses");
+        assert_eq!(config.userplane.snaplen_n3_bytes, 192);
     }
 }

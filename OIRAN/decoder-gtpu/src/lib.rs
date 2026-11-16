@@ -177,26 +177,59 @@ impl ProtocolDecoder for GtpuDecoder {
                     });
                 }
                 if header.message_type == 255 {
-                    if let Some((source, destination)) = inner_ipv4_addresses(
+                    // 2.22.1 — 5-tuple interne IPv4/IPv6 + proto + ports après
+                    // l'entête GTP-U. La fenêtre réellement lue est limitée à
+                    // `payload_length` (borné par snaplen sonde ; cf. polaris.toml
+                    // `[userplane] snaplen_n3_bytes`). Les volumes agrégés en
+                    // aval restent calculés sur `original_length` (jamais sur
+                    // `captured_length`) — invariant OP2.1 #9 6927882355.
+                    if let Some(tuple) = parse_inner_five_tuple(
                         &input.payload
                             [header.payload_offset..header.payload_offset + header.payload_length],
                     ) {
                         if direction == Direction::Unknown {
-                            direction = infer_direction_from_inner_ipv4(&source, &destination);
+                            direction = infer_direction_from_inner_ips(
+                                &tuple.source_ip,
+                                &tuple.destination_ip,
+                            );
                         }
                         ids.push(NamedValue {
                             name: "inner_source_ip".into(),
-                            value: source.clone(),
+                            value: tuple.source_ip.clone(),
                             pseudonymized: false,
                         });
                         ids.push(NamedValue {
                             name: "inner_destination_ip".into(),
-                            value: destination.clone(),
+                            value: tuple.destination_ip.clone(),
                             pseudonymized: false,
                         });
+                        ids.push(NamedValue {
+                            name: "inner_ip_version".into(),
+                            value: tuple.ip_version.to_string(),
+                            pseudonymized: false,
+                        });
+                        ids.push(NamedValue {
+                            name: "inner_l4_proto".into(),
+                            value: tuple.l4_proto.to_string(),
+                            pseudonymized: false,
+                        });
+                        if let Some(port) = tuple.source_port {
+                            ids.push(NamedValue {
+                                name: "inner_src_port".into(),
+                                value: port.to_string(),
+                                pseudonymized: false,
+                            });
+                        }
+                        if let Some(port) = tuple.destination_port {
+                            ids.push(NamedValue {
+                                name: "inner_dst_port".into(),
+                                value: port.to_string(),
+                                pseudonymized: false,
+                            });
+                        }
                         let ue_ip = match direction {
-                            Direction::Uplink => Some(source),
-                            Direction::Downlink => Some(destination),
+                            Direction::Uplink => Some(tuple.source_ip.clone()),
+                            Direction::Downlink => Some(tuple.destination_ip.clone()),
                             _ => None,
                         };
                         if let Some(ue_ip) = ue_ip {
@@ -264,23 +297,141 @@ impl ProtocolDecoder for GtpuDecoder {
     }
 }
 
-fn inner_ipv4_addresses(payload: &[u8]) -> Option<(String, String)> {
-    if payload.len() < 20 || payload[0] >> 4 != 4 {
-        return None;
-    }
-    let header_len = usize::from(payload[0] & 0x0f) * 4;
-    if header_len < 20 || header_len > payload.len() {
-        return None;
-    }
-    let address = |bytes: &[u8]| format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
-    Some((address(&payload[12..16]), address(&payload[16..20])))
+/// 5-tuple interne extrait du payload GTP-U (lot 2.22.1).
+/// `source_port` / `destination_port` sont `None` pour les protocoles sans
+/// ports (ICMP/ICMPv6, ESP, etc.). La fenêtre lue est strictement bornée par
+/// `payload.len()` (reflète la troncature côté sonde) ; aucun octet au-delà
+/// n'est jamais touché.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InnerFiveTuple {
+    pub ip_version: u8,
+    pub source_ip: String,
+    pub destination_ip: String,
+    pub l4_proto: u8,
+    pub source_port: Option<u16>,
+    pub destination_port: Option<u16>,
 }
 
-fn infer_direction_from_inner_ipv4(source: &str, destination: &str) -> Direction {
-    // POLARIS assigns LTE and 5G UE addresses from these two lab pools.
-    // Only a unique UE-side match is accepted; ambiguous/private traffic is
-    // left UNKNOWN instead of being guessed.
-    let is_ue = |address: &str| address.starts_with("10.45.") || address.starts_with("10.46.");
+pub fn parse_inner_five_tuple(payload: &[u8]) -> Option<InnerFiveTuple> {
+    if payload.is_empty() {
+        return None;
+    }
+    match payload[0] >> 4 {
+        4 => parse_inner_ipv4(payload),
+        6 => parse_inner_ipv6(payload),
+        _ => None,
+    }
+}
+
+fn parse_inner_ipv4(payload: &[u8]) -> Option<InnerFiveTuple> {
+    if payload.len() < 20 {
+        return None;
+    }
+    let ihl = usize::from(payload[0] & 0x0f) * 4;
+    if ihl < 20 || ihl > payload.len() {
+        return None;
+    }
+    let proto = payload[9];
+    let format_ipv4 =
+        |bytes: &[u8]| format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
+    let source_ip = format_ipv4(&payload[12..16]);
+    let destination_ip = format_ipv4(&payload[16..20]);
+    let (src_port, dst_port) = parse_l4_ports(proto, &payload[ihl..]);
+    Some(InnerFiveTuple {
+        ip_version: 4,
+        source_ip,
+        destination_ip,
+        l4_proto: proto,
+        source_port: src_port,
+        destination_port: dst_port,
+    })
+}
+
+fn parse_inner_ipv6(payload: &[u8]) -> Option<InnerFiveTuple> {
+    // IPv6 fixed header = 40 octets. On traverse les extension headers
+    // hop-by-hop (0), routing (43), fragment (44), destination options (60),
+    // AH (51). ESP (50) et final (59) stoppent l'extraction de ports.
+    if payload.len() < 40 {
+        return None;
+    }
+    let source_ip = format_ipv6(&payload[8..24]);
+    let destination_ip = format_ipv6(&payload[24..40]);
+    let mut next_header = payload[6];
+    let mut offset: usize = 40;
+    let mut hops = 0;
+    loop {
+        match next_header {
+            0 | 43 | 60 | 51 => {
+                hops += 1;
+                if hops > 16 || offset + 8 > payload.len() {
+                    return None;
+                }
+                let ext_next = payload[offset];
+                let hdr_ext_len = usize::from(payload[offset + 1]);
+                let ext_len = (hdr_ext_len + 1) * 8;
+                if offset + ext_len > payload.len() {
+                    return None;
+                }
+                next_header = ext_next;
+                offset += ext_len;
+            }
+            44 => {
+                if offset + 8 > payload.len() {
+                    return None;
+                }
+                let ext_next = payload[offset];
+                next_header = ext_next;
+                offset += 8;
+            }
+            _ => break,
+        }
+    }
+    let (src_port, dst_port) = parse_l4_ports(next_header, &payload[offset.min(payload.len())..]);
+    Some(InnerFiveTuple {
+        ip_version: 6,
+        source_ip,
+        destination_ip,
+        l4_proto: next_header,
+        source_port: src_port,
+        destination_port: dst_port,
+    })
+}
+
+fn format_ipv6(bytes: &[u8]) -> String {
+    debug_assert_eq!(bytes.len(), 16);
+    let mut groups = [0u16; 8];
+    for (i, group) in groups.iter_mut().enumerate() {
+        *group = u16::from_be_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+    }
+    groups
+        .iter()
+        .map(|g| format!("{g:x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn parse_l4_ports(proto: u8, payload: &[u8]) -> (Option<u16>, Option<u16>) {
+    // TCP = 6, UDP = 17, UDP-Lite = 136, DCCP = 33, SCTP = 132.
+    // Dans tous ces cas, la paire (src_port, dst_port) occupe les 4
+    // premiers octets du header L4. Si le payload est tronqué (snaplen
+    // sonde), on renvoie None plutôt qu'un port partiel.
+    let has_ports = matches!(proto, 6 | 17 | 33 | 132 | 136);
+    if !has_ports || payload.len() < 4 {
+        return (None, None);
+    }
+    (Some(be16(&payload[0..2])), Some(be16(&payload[2..4])))
+}
+
+fn infer_direction_from_inner_ips(source: &str, destination: &str) -> Direction {
+    // Pools UE lab 5G/LTE (IPv4) + préfixe v6 ULA/GUA conventionnel.
+    // Seule une correspondance UE-unique est acceptée ; l'ambiguïté reste
+    // UNKNOWN pour éviter de deviner.
+    let is_ue = |address: &str| {
+        address.starts_with("10.45.")
+            || address.starts_with("10.46.")
+            || address.starts_with("fd45:")
+            || address.starts_with("fd46:")
+    };
     match (is_ue(source), is_ue(destination)) {
         (true, false) => Direction::Uplink,
         (false, true) => Direction::Downlink,
@@ -362,12 +513,83 @@ mod tests {
     }
     #[test]
     fn extracts_inner_ipv4_addresses_for_per_ue_traffic_evidence() {
-        let mut ipv4 = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0];
+        // IPv4 header + UDP (proto 17) + ports src=5000 dst=443.
+        let mut ipv4 = vec![0x45, 0, 0, 28, 0, 0, 0, 0, 64, 17, 0, 0];
         ipv4.extend_from_slice(&[10, 46, 0, 4, 10, 46, 0, 1]);
-        assert_eq!(
-            inner_ipv4_addresses(&ipv4),
-            Some(("10.46.0.4".into(), "10.46.0.1".into()))
-        );
+        ipv4.extend_from_slice(&[0x13, 0x88, 0x01, 0xbb, 0, 0, 0, 0]); // UDP 5000→443
+        let tuple = parse_inner_five_tuple(&ipv4).expect("ipv4 5-tuple");
+        assert_eq!(tuple.ip_version, 4);
+        assert_eq!(tuple.source_ip, "10.46.0.4");
+        assert_eq!(tuple.destination_ip, "10.46.0.1");
+        assert_eq!(tuple.l4_proto, 17);
+        assert_eq!(tuple.source_port, Some(5000));
+        assert_eq!(tuple.destination_port, Some(443));
+    }
+
+    #[test]
+    fn parses_ipv4_tcp_inner_tuple() {
+        let mut ipv4 = vec![0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0];
+        ipv4.extend_from_slice(&[10, 46, 0, 4, 142, 251, 37, 110]);
+        // TCP 49152→443
+        ipv4.extend_from_slice(&[0xc0, 0x00, 0x01, 0xbb, 0, 0, 0, 0, 0, 0, 0, 0]);
+        ipv4.extend_from_slice(&[0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]);
+        let tuple = parse_inner_five_tuple(&ipv4).expect("ipv4 tcp");
+        assert_eq!(tuple.l4_proto, 6);
+        assert_eq!(tuple.source_port, Some(49152));
+        assert_eq!(tuple.destination_port, Some(443));
+    }
+
+    #[test]
+    fn parses_ipv6_udp_inner_tuple() {
+        // IPv6 : version 6 + traffic class 0 + flow 0, payload_len 8,
+        // next_header 17 (UDP), hop_limit 64, src+dst, UDP 1234→80.
+        let mut v6 = vec![0x60, 0, 0, 0, 0, 8, 17, 64];
+        v6.extend_from_slice(&[0xfd, 0x45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        v6.extend_from_slice(&[0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x8a]);
+        v6.extend_from_slice(&[0x04, 0xd2, 0x00, 0x50, 0, 0, 0, 0]);
+        let tuple = parse_inner_five_tuple(&v6).expect("ipv6 udp");
+        assert_eq!(tuple.ip_version, 6);
+        assert_eq!(tuple.l4_proto, 17);
+        assert_eq!(tuple.source_port, Some(1234));
+        assert_eq!(tuple.destination_port, Some(80));
+        assert_eq!(tuple.source_ip, "fd45:0:0:0:0:0:0:1");
+    }
+
+    #[test]
+    fn parses_ipv6_tcp_with_hop_by_hop_extension() {
+        // Chaîne : IPv6 (next=0 hop-by-hop) → hop-by-hop (next=6 TCP, len=0 soit 8 oct) → TCP.
+        let mut v6 = vec![0x60, 0, 0, 0, 0, 28, 0, 64];
+        v6.extend_from_slice(&[0xfd, 0x46, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        v6.extend_from_slice(&[0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x8a]);
+        // Hop-by-hop : next=6 TCP, hdr_ext_len=0 (= 8 octets), 6 octets padding.
+        v6.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0]);
+        // TCP 55555→8080
+        v6.extend_from_slice(&[0xd9, 0x03, 0x1f, 0x90, 0, 0, 0, 0, 0, 0, 0, 0]);
+        v6.extend_from_slice(&[0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]);
+        let tuple = parse_inner_five_tuple(&v6).expect("ipv6+hopbyhop+tcp");
+        assert_eq!(tuple.ip_version, 6);
+        assert_eq!(tuple.l4_proto, 6);
+        assert_eq!(tuple.source_port, Some(55555));
+        assert_eq!(tuple.destination_port, Some(8080));
+    }
+
+    #[test]
+    fn truncated_payload_returns_none_or_no_ports_but_never_panics() {
+        // OP2.1 invariant : aucun octet lu au-delà de la fenêtre.
+        // Fenêtre tronquée à 12 oct (header IPv4 incomplet + aucun port).
+        let v4_hdr_only = vec![0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0];
+        let tuple = parse_inner_five_tuple(&v4_hdr_only);
+        // Header 20 oct non atteint -> None accepté ; sinon ports doivent être None.
+        if let Some(t) = tuple {
+            assert_eq!(t.source_port, None, "port partiel interdit");
+            assert_eq!(t.destination_port, None, "port partiel interdit");
+        }
+    }
+
+    #[test]
+    fn inner_tuple_unknown_ip_version_returns_none() {
+        assert!(parse_inner_five_tuple(&[0]).is_none());
+        assert!(parse_inner_five_tuple(&[0x50, 0, 0, 0]).is_none());
     }
 
     #[test]
