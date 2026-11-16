@@ -1261,6 +1261,93 @@ fn classify(path: Option<&str>, method: Option<&str>) -> (Option<String>, Option
         };
         return (Some("Npcf_SMPolicyControl".into()), Some(op.into()));
     }
+    // 2.21.11 (spec #9 6930117150, ANR1 #10 6929768219) — Nbsf_Management
+    // (TS 29.521). PCF binding registration par BSF.
+    if path.contains("/nbsf-management/") && path.contains("/pcfBindings") {
+        let op = if method == Some("POST") {
+            "Register"
+        } else if method == Some("DELETE") {
+            "Deregister"
+        } else if method == Some("PATCH") {
+            "Update"
+        } else if method == Some("GET") {
+            "Discovery"
+        } else {
+            "PcfBindingOperation"
+        };
+        return (Some("Nbsf_Management".into()), Some(op.into()));
+    }
+    // 2.21.11 — Namf callback SMContextStatusNotify (SMF → AMF via namf-callback).
+    // Path réel observé : `POST /namf-callback/v1/{subscriber}/sm-context-status/{id}`.
+    // Classé sous `Namf_Communication` (TS 29.518) qui groupe aussi ue-context et
+    // n1-n2-messages.
+    if path.contains("/namf-callback/") && path.contains("/sm-context-status") {
+        return (
+            Some("Namf_Communication".into()),
+            Some("SMContextStatusNotify".into()),
+        );
+    }
+    // 2.21.11 — Nudr_DataRepository (TS 29.504/29.505). Toutes les variantes
+    // observées sur la session lab. Ordre : d'abord sous-ressources les plus
+    // spécifiques, puis le fallback DataRepositoryOperation.
+    if path.contains("/nudr-dr/") {
+        let op = if path.contains("/policy-data/ues/") {
+            // UE policy data queries
+            if path.contains("/sm-data") {
+                "QueryPolicyDataUeSmData"
+            } else if path.contains("/am-data") {
+                "QueryPolicyDataUeAmData"
+            } else {
+                "QueryPolicyDataUe"
+            }
+        } else if path.contains("/subscription-data/") {
+            if path.contains("/authentication-data/authentication-subscription") {
+                "QueryAuthenticationSubscription"
+            } else if path.contains("/authentication-data/authentication-status") {
+                match method {
+                    Some("PUT") => "UpdateAuthenticationStatus",
+                    Some("DELETE") => "DeleteAuthenticationStatus",
+                    _ => "AuthenticationStatusOperation",
+                }
+            } else if path.contains("/context-data/smf-registrations") {
+                match method {
+                    Some("PUT") => "CreateSmfRegistrationContext",
+                    Some("DELETE") => "DeleteSmfRegistrationContext",
+                    _ => "SmfRegistrationContextOperation",
+                }
+            } else if path.contains("/context-data/amf-3gpp-access") {
+                // PUT = create/update, PATCH = partial update. ANR1 observe les deux ;
+                // Nudr n'a pas de distinction opération spec stricte ici, on
+                // garde `UpdateAmfRegistrationContext` pour les deux.
+                "UpdateAmfRegistrationContext"
+            } else if path.contains("/provisioned-data/sm-data") {
+                "QueryProvisionedSmData"
+            } else if path.contains("/provisioned-data/am-data") {
+                "QueryProvisionedAmData"
+            } else if path.contains("/provisioned-data/smf-selection-subscription-data") {
+                "QueryProvisionedSmfSelectionData"
+            } else if path.contains("/provisioned-data/") {
+                "QueryProvisionedData"
+            } else {
+                match method {
+                    Some("GET") => "QuerySubscriptionData",
+                    Some("PUT") => "CreateSubscriptionData",
+                    Some("PATCH") => "UpdateSubscriptionData",
+                    Some("DELETE") => "DeleteSubscriptionData",
+                    _ => "SubscriptionDataOperation",
+                }
+            }
+        } else {
+            match method {
+                Some("GET") => "QueryDataRepository",
+                Some("PUT") => "CreateDataRepository",
+                Some("PATCH") => "UpdateDataRepository",
+                Some("DELETE") => "DeleteDataRepository",
+                _ => "DataRepositoryOperation",
+            }
+        };
+        return (Some("Nudr_DataRepository".into()), Some(op.into()));
+    }
     (service_from_path(path), None)
 }
 
@@ -2004,6 +2091,98 @@ mod tests {
     fn unknown_sbi_path_still_returns_no_operation() {
         let (_svc, op) = classified("/this-does-not-exist/v1/foo", "GET");
         assert!(op.is_none());
+    }
+
+    /// 2.21.11 (spec #9 6930117150, ANR1 #10 6929768219) — chaque ligne
+    /// du tableau des 30 opérations observées sur la session lab
+    /// `5g-session-0bfac1e7ae159a77` DOIT être classifiée (op ≠ None).
+    /// Critère d'acceptation : `UnsupportedSbiOperation = 0` après
+    /// redécodage de cette session.
+    #[test]
+    fn classifies_all_30_anr1_sbi_operations_as_non_unsupported() {
+        let anr1_ops: &[(&str, &str, &str, &str)] = &[
+            // (method, path, expected_service, expected_operation)
+            ("POST",   "/nbsf-management/v1/pcfBindings",
+                "Nbsf_Management", "Register"),
+            ("POST",   "/npcf-smpolicycontrol/v1/sm-policies",
+                "Npcf_SMPolicyControl", "CreateSmPolicy"),
+            ("POST",   "/npcf-am-policy-control/v1/policies",
+                "Npcf_AMPolicyControl", "CreateAmPolicy"),
+            ("POST",   "/nudm-sdm/v2/subscriber-psn-abc/sdm-subscriptions",
+                "Nudm_SDM", "SubscribeDataChange"),
+            ("DELETE", "/nudm-sdm/v2/subscriber-psn-abc/sdm-subscriptions/42",
+                "Nudm_SDM", "UnsubscribeDataChange"),
+            ("GET",    "/nudm-sdm/v2/subscriber-psn-abc/sm-data",
+                "Nudm_SDM", "GetSmData"),
+            ("GET",    "/nudr-dr/v1/policy-data/ues/subscriber-psn-abc/sm-data",
+                "Nudr_DataRepository", "QueryPolicyDataUeSmData"),
+            ("GET",    "/nudr-dr/v1/subscription-data/subscriber-psn-abc/42/provisioned-data/sm-data",
+                "Nudr_DataRepository", "QueryProvisionedSmData"),
+            ("PUT",    "/nudm-uecm/v1/subscriber-psn-abc/registrations/smf-registrations/1",
+                "Nudm_UECM", "RegisterSmfForUe"),
+            ("PUT",    "/nudr-dr/v1/subscription-data/subscriber-psn-abc/context-data/smf-registrations/1",
+                "Nudr_DataRepository", "CreateSmfRegistrationContext"),
+            ("DELETE", "/nudm-uecm/v1/subscriber-psn-abc/registrations/smf-registrations/1",
+                "Nudm_UECM", "DeregisterSmfForUe"),
+            ("DELETE", "/nudr-dr/v1/subscription-data/subscriber-psn-abc/context-data/smf-registrations/1",
+                "Nudr_DataRepository", "DeleteSmfRegistrationContext"),
+            ("POST",   "/namf-callback/v1/subscriber-psn-abc/sm-context-status/42",
+                "Namf_Communication", "SMContextStatusNotify"),
+            ("GET",    "/nudm-sdm/v2/subscriber-psn-abc/am-data",
+                "Nudm_SDM", "GetAmData"),
+            ("GET",    "/nudm-sdm/v2/subscriber-psn-abc/smf-select-data",
+                "Nudm_SDM", "GetSmfSelectData"),
+            ("GET",    "/nudm-sdm/v2/subscriber-psn-abc/ue-context-in-smf-data",
+                "Nudm_SDM", "GetUeContextInSmfData"),
+            ("GET",    "/nudr-dr/v1/policy-data/ues/subscriber-psn-abc/am-data",
+                "Nudr_DataRepository", "QueryPolicyDataUeAmData"),
+            ("GET",    "/nudr-dr/v1/subscription-data/subscriber-psn-abc/authentication-data/authentication-subscription",
+                "Nudr_DataRepository", "QueryAuthenticationSubscription"),
+            ("GET",    "/nudr-dr/v1/subscription-data/subscriber-psn-abc/42/provisioned-data/am-data",
+                "Nudr_DataRepository", "QueryProvisionedAmData"),
+            ("GET",    "/nudr-dr/v1/subscription-data/subscriber-psn-abc/42/provisioned-data/smf-selection-subscription-data",
+                "Nudr_DataRepository", "QueryProvisionedSmfSelectionData"),
+            ("POST",   "/nudm-ueau/v1/subscriber-psn-abc/auth-events",
+                "Nudm_UEAuthentication", "ConfirmAuth"),
+            ("POST",   "/nudm-ueau/v1/subscriber-psn-abc/security-information/generate-auth-data",
+                "Nudm_UEAuthentication", "GenerateAuthData"),
+            ("PUT",    "/nausf-auth/v1/ue-authentications/1/5g-aka-confirmation",
+                "Nausf_UEAuthentication", "FiveGAkaConfirmation"),
+            ("PUT",    "/nudm-uecm/v1/subscriber-psn-abc/registrations/amf-3gpp-access",
+                "Nudm_UECM", "RegisterAmfForUe"),
+            ("PUT",    "/nudr-dr/v1/subscription-data/subscriber-psn-abc/authentication-data/authentication-status",
+                "Nudr_DataRepository", "UpdateAuthenticationStatus"),
+            ("PUT",    "/nudr-dr/v1/subscription-data/subscriber-psn-abc/context-data/amf-3gpp-access",
+                "Nudr_DataRepository", "UpdateAmfRegistrationContext"),
+            ("DELETE", "/nudr-dr/v1/subscription-data/subscriber-psn-abc/authentication-data/authentication-status",
+                "Nudr_DataRepository", "DeleteAuthenticationStatus"),
+            ("PATCH",  "/nudm-uecm/v1/subscriber-psn-abc/registrations/amf-3gpp-access",
+                "Nudm_UECM", "UpdateAmfRegistration"),
+            ("PATCH",  "/nudr-dr/v1/subscription-data/subscriber-psn-abc/context-data/amf-3gpp-access",
+                "Nudr_DataRepository", "UpdateAmfRegistrationContext"),
+            ("PUT",    "/nudm-ueau/v1/subscriber-psn-abc/auth-events",
+                "Nudm_UEAuthentication", "ConfirmAuth"),
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        for (method, path, expected_service, expected_op) in anr1_ops {
+            let (svc, op) = classified(path, method);
+            if op.as_deref() != Some(*expected_op) {
+                failures.push(format!(
+                    "{method} {path} → expected ({expected_service}, {expected_op}), got ({:?}, {:?})",
+                    svc, op
+                ));
+            } else if svc.as_deref() != Some(*expected_service) {
+                failures.push(format!(
+                    "{method} {path} → expected service {expected_service}, got {:?}",
+                    svc
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "ops non classifiées ou mauvais service :\n{}",
+            failures.join("\n")
+        );
     }
     fn test_key() -> PseudonymKey {
         PseudonymKey::from_bytes([0x55; 32])
