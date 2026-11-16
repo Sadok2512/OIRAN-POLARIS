@@ -104,7 +104,24 @@ pub fn decode_connections(
             frames.append(&mut decoded);
             report.errors.append(&mut errors);
         }
-        frames.sort_by_key(|frame| (frame.timestamp_ns, frame.direction_index, frame.offset));
+        // 2.21.8 — tri canonique OIRAN. Les trames HTTP/2 d'une
+        // même connexion TCP sont ordonnées par `(packet_number,
+        // direction_index, offset)`, lu dans la provenance de la
+        // trame (premier `PacketReference`). Jamais de `ts`. Si
+        // la provenance est vide (défaut défensif, jamais observé
+        // en prod), on retombe sur `packet_number=0` + les 2
+        // tiebreakers — l'absence de preuve pcap force à conserver
+        // l'ordre `(direction, offset)` déjà déterministe par
+        // reassembly TCP. Clôt l'OUVERT 2.21.2 sur le dernier tri
+        // par `ts` subsistant dans decoder-sbi.
+        frames.sort_by_key(|frame| {
+            let packet_number = frame
+                .provenance
+                .first()
+                .map(|p| p.packet_number)
+                .unwrap_or(0);
+            (packet_number, frame.direction_index, frame.offset)
+        });
         let (decoded, streams, incomplete, errors) = transactions(
             connection,
             frames,
@@ -2987,5 +3004,96 @@ mod tests {
         });
         assert_eq!(mixed[0].capture_id, "sha256:cap-a");
         assert_eq!(mixed[1].capture_id, "sha256:cap-b");
+    }
+
+    /// 2.21.8 — clôture OUVERT 2.21.2 : le tri `frames` intra-
+    /// connexion TCP suit désormais `(packet_number,
+    /// direction_index, offset)` (lu dans `frame.provenance`).
+    /// `timestamp_ns` ne participe plus à aucune décision d'ordre
+    /// à ce niveau. Reproduit la situation où `ts` inverse
+    /// `packet_number` : la clé canonique doit gagner.
+    #[test]
+    fn frames_in_a_tcp_connection_are_sorted_by_packet_number_never_by_ts() {
+        use event_schema::PacketReference;
+        fn pr(packet_number: u64) -> PacketReference {
+            PacketReference {
+                source_file: "stub.pcap".into(),
+                source_sha256: None,
+                packet_number,
+                byte_offset: 0,
+                interface_id: 0,
+                link_type: None,
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: 64,
+                original_length: 64,
+            }
+        }
+        fn mk(
+            packet_number: u64,
+            direction_index: usize,
+            offset: usize,
+            ts_ns: i128,
+        ) -> super::Frame {
+            super::Frame {
+                frame_type: 0,
+                flags: 0,
+                stream_id: 1,
+                payload: vec![],
+                offset,
+                timestamp_ns: ts_ns,
+                provenance: vec![pr(packet_number)],
+                source: super::TcpEndpoint { address: "a".into(), port: 1 },
+                destination: super::TcpEndpoint { address: "b".into(), port: 2 },
+                direction_index,
+            }
+        }
+        // 3 trames : packet_number=20 porte le ts=1 (le plus tôt
+        // par ts), packet_number=5 porte le ts=99 (le plus tard).
+        // Si on triait par ts, l'ordre serait 20, 10, 5. L'ordre
+        // canonique doit renvoyer 5, 10, 20 (packet_number).
+        let mut frames = vec![
+            mk(20, 1, 0, 1),
+            mk(10, 0, 0, 50),
+            mk(5, 0, 0, 99),
+        ];
+        frames.sort_by_key(|frame| {
+            let pkt = frame.provenance.first().map(|p| p.packet_number).unwrap_or(0);
+            (pkt, frame.direction_index, frame.offset)
+        });
+        let pkts: Vec<u64> = frames
+            .iter()
+            .map(|f| f.provenance.first().unwrap().packet_number)
+            .collect();
+        assert_eq!(pkts, vec![5, 10, 20], "tri canonique par packet_number");
+
+        // Même packet_number, tiebreaker direction_index puis offset.
+        let mut same_pkt = vec![
+            mk(7, 1, 0, 50),  // s2c, offset 0
+            mk(7, 0, 100, 50), // c2s, offset 100
+            mk(7, 0, 0, 50),   // c2s, offset 0
+        ];
+        same_pkt.sort_by_key(|frame| {
+            let pkt = frame.provenance.first().map(|p| p.packet_number).unwrap_or(0);
+            (pkt, frame.direction_index, frame.offset)
+        });
+        // Attendu : (dir=0, off=0), (dir=0, off=100), (dir=1, off=0).
+        assert_eq!(
+            (same_pkt[0].direction_index, same_pkt[0].offset),
+            (0, 0)
+        );
+        assert_eq!(
+            (same_pkt[1].direction_index, same_pkt[1].offset),
+            (0, 100)
+        );
+        assert_eq!(
+            (same_pkt[2].direction_index, same_pkt[2].offset),
+            (1, 0)
+        );
     }
 }

@@ -1,5 +1,72 @@
 # Changelog
 
+## OIRAN API 2.21.8 — 2026-11-16 — tri frames intra-connexion TCP en ordre canonique (clôture OUVERT 2.21.2) (patch)
+
+Lot C.8 — enchaînement direct après 2.21.7. Clôt le dernier OUVERT `ts` dans `decoder-sbi`.
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.7 | **2.21.8** |
+| `decoder-sbi` | 0.4.5 | **0.4.6** |
+
+### Fix `decoder-sbi::decode_connections` ligne 107 (clôture OUVERT 2.21.2)
+
+**Écart déclaré OUVERT depuis 2.21.2** :
+```rust
+frames.sort_by_key(|frame| (frame.timestamp_ns, frame.direction_index, frame.offset));
+```
+Un `ts` en position de clé primaire viole la règle « ordre canonique `(capture_id, seq)`, jamais `ts` ». Cas concret : deux trames HTTP/2 de sens différents d'une même connexion TCP arrivées à ts identiques (même paquet TCP qui transporte un HEADERS c→s et un DATA s→c, rare mais observable sur SBI miroir) avaient un ordre non-déterministe entre captures multi-sondes à horloges non alignées.
+
+**Fix** :
+```rust
+frames.sort_by_key(|frame| {
+    let packet_number = frame
+        .provenance
+        .first()
+        .map(|p| p.packet_number)
+        .unwrap_or(0);
+    (packet_number, frame.direction_index, frame.offset)
+});
+```
+- `packet_number` est lu depuis `frame.provenance[0]` (le `PacketReference` qui a livré la trame).
+- Fallback défensif `packet_number = 0` si provenance vide — jamais observé en prod, laisse `(direction_index, offset)` déterministe par reassembly TCP.
+- `ts` **retiré** de la clé. Clôture nette.
+
+### Non-régression
+
+Les 36 tests existants de `decoder-sbi` passent sans modification. Les fixtures existantes (HPACK roundtrip, `attach_sbi_to_sessions` par pseudo, flat-expansion, etc.) produisent le même set de résultats parce que, dans ces fixtures, `packet_number` suit `timestamp_ns` (monotone par capture synthétique). Le fix change l'ordre **uniquement** quand `ts` et `packet_number` divergent — cas des runs multi-sondes à horloges désynchronisées.
+
+### Test ajouté (1 nouveau)
+
+- `frames_in_a_tcp_connection_are_sorted_by_packet_number_never_by_ts` dans `decoder-sbi::tests` :
+  - Cas 1 : 3 trames avec `(packet_number=20, ts=1), (10, 50), (5, 99)`. L'ordre par `ts` serait `20, 10, 5` ; l'ordre canonique attendu est `5, 10, 20` par `packet_number`. ✓
+  - Cas 2 : mêmes `packet_number=7`, directions/offsets différents. Tiebreaker `(direction_index, offset)` validé. ✓
+
+### Invariants préservés
+
+- **Ordre canonique strict** `(capture_id, packet_number, event_id)` au niveau events (clôture 2.21.2) ET désormais `(packet_number, direction_index, offset)` au niveau frames intra-connexion (clôture 2.21.8). **`ts` jamais utilisé comme clé d'ordre dans `decoder-sbi`**.
+- **Compat 2.21.7** : les events émis conservent leur contenu ; seule l'ordination relative des trames de même connexion change dans les cas `ts != packet_number` (rare).
+- **Aucune suppression**, **aucun force-push**.
+
+### OUVERTS résiduels
+
+- **Bench O1 chiffré** : CAP_NET_RAW + pktgen bench vProbe. Scaffold `benchmarks/live-rx-drops/measure.sh` en place depuis 2.20.1. Hors hôte de dev.
+- **Test cross-workspace réel vtap → live-probe dev-dep** : clôture partielle 2.21.7 par le test cross-schema.
+
+### Audit `Cargo.lock` compatible Rust 1.83
+
+```bash
+$ nice -n 19 ionice -c3 cargo fetch
+# puis parser Python identique aux lots précédents
+```
+Chiffres reportés dans le rapport #10.
+
+### Lock vTAP
+
+Après hausse `decoder-sbi 0.4.5 → 0.4.6` : `cd OIRAN/vtap && cargo update -w && cargo test --locked`. Chiffres reportés dans le rapport #10.
+
 ## OIRAN API 2.21.7 — 2026-11-16 — 3 suites vTAP (empty visible + dedup manifest + cross-schema test) (patch)
 
 Lot C.7 — 3 suites demandées par Sadok (#9 2026-11-16 18:35 UTC) avant le tri des trames (2.21.8 enchaîné).
