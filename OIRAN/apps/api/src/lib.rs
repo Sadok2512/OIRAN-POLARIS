@@ -11,6 +11,7 @@ mod identity_vault;
 mod live_trace;
 mod probe_registry;
 mod read_time_patch;
+mod session_catalog;
 mod session_filters;
 mod subscriber_journey;
 
@@ -960,6 +961,12 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/sessions", get(sessions))
         .route("/sessions/filter", post(sessions_filter))
         .route("/sessions/available_causes", get(sessions_available_causes))
+        // 2.19.0 — catalog + columns (ANR1 p900 2.7.0 en dépend).
+        .route("/sessions/catalog", get(sessions_catalog))
+        // 2.19.1 — explorateur de protocoles.
+        .route("/sessions/catalog/search", get(sessions_catalog_search))
+        .route("/sessions/catalog/param", get(sessions_catalog_param))
+        .route("/sessions/columns", post(sessions_columns))
         .route("/sessions/:id", get(session))
         .route("/sessions/:id/procedures", get(session_procedures))
         .route("/sessions/:id/events", get(session_events))
@@ -3773,6 +3780,60 @@ struct SessionsFilterRequest {
     cursor: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    /// 2.19.0 — restreint la projection serveur aux colonnes
+    /// demandées. Les colonnes `ALWAYS_PRESENT_COLUMNS` sont
+    /// toujours préservées. Un nom hors catalog renvoie 400
+    /// `UNKNOWN_COLUMN`. Absent → aucun filtre (comportement
+    /// 2.18.x inchangé).
+    #[serde(default)]
+    columns: Option<Vec<String>>,
+    /// 2.19.0 — filtres étendus. Chacun est en OR interne, les
+    /// familles sont combinées en AND avec les prédicats 2.10.0
+    /// (messages/causes/identity/failures_only).
+    #[serde(default)]
+    technologies: Vec<String>,
+    #[serde(default)]
+    dataset_kinds: Vec<String>,
+    #[serde(default)]
+    states: Vec<String>,
+    #[serde(default)]
+    correlation_statuses: Vec<String>,
+    /// 2.19.1 — prédicats protocolaires sur les events. Chaque
+    /// critère cible `{interface?, protocol?, message, param_path?,
+    /// op, value|values}`. `combinator` AND (défaut) ou OR les
+    /// combine. `matched_criteria` est publié dans chaque ligne.
+    #[serde(default)]
+    criteria: Vec<session_catalog::FilterCriterion>,
+    #[serde(default)]
+    combinator: session_catalog::FilterCombinator,
+    /// 2.19.1 — restreint aux sessions dont ≥ 1 participant est
+    /// dans ce rôle (AMF/SMF/UPF/MME/SGW/PGW/gNB/eNB/…).
+    #[serde(default)]
+    network_elements: Vec<String>,
+    /// 2.19.1 — cadrage horaire par capture. Chaînes en ns
+    /// décimales (l'UI convertit). Ordre canonique inchangé.
+    #[serde(default)]
+    time_window: Option<SessionsFilterTimeWindow>,
+    /// 2.19.1 — alternative à `time_window`. Une session passe le
+    /// filtre si au moins un de ses `capture_references` matche
+    /// `run_id` (exact).
+    #[serde(default)]
+    run_id: Option<String>,
+    /// 2.19.1 — raccourci de recherche. Si la valeur ressemble à
+    /// un IMSI (digits only ≥ 14 caractères), le serveur calcule
+    /// le pseudonyme SupiOrImsi et l'applique comme identity hint
+    /// (operator-only, 403 sinon). Autrement, substring
+    /// case-insensitive sur `message_name` et valeurs d'IE.
+    #[serde(default)]
+    search: Option<String>,
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+struct SessionsFilterTimeWindow {
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3950,11 +4011,308 @@ async fn sessions_filter(
     // Curseur : index à démarrer DANS `sorted_ids`. Si fourni,
     // on cherche le session_id post-curseur strict (clé
     // canonique strictement supérieure).
-    let limit = request.limit.unwrap_or(25).clamp(1, 100);
+    // 2.19.1 — `limit=0` est un aperçu : on renvoie meta.total
+    // seul, sans construire aucune ligne. `limit=None` conserve le
+    // défaut 25. Autres valeurs clampées à [1, 100].
+    let limit_requested = request.limit;
+    let limit = match limit_requested {
+        Some(0) => 0,
+        Some(n) => n.clamp(1, 100),
+        None => 25,
+    };
+
+    // 2.19.0 — valide `columns` tôt (avant tout calcul coûteux) :
+    // un nom hors catalog devient 400 UNKNOWN_COLUMN, aucune ligne
+    // partielle n'est servie.
+    let projected_columns = match request.columns.as_deref() {
+        Some(names) => match session_catalog::validate_columns(names) {
+            Ok(set) => Some(set),
+            Err(unknown) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "UNKNOWN_COLUMN",
+                    &format!("unknown column name: {unknown}"),
+                );
+            }
+        },
+        None => None,
+    };
+
+    // 2.19.0 — extended filters normalisés en sets (OR interne,
+    // AND entre familles).
+    let technologies: std::collections::BTreeSet<String> =
+        request.technologies.into_iter().collect();
+    let dataset_kinds: std::collections::BTreeSet<String> =
+        request.dataset_kinds.into_iter().collect();
+    let states: std::collections::BTreeSet<String> = request.states.into_iter().collect();
+    let correlation_statuses: std::collections::BTreeSet<String> =
+        request.correlation_statuses.into_iter().collect();
+    // 2.19.1 — prédicats protocolaires + time window + network
+    // elements + search + run_id. Validation précoce : opérateur
+    // requis si search ressemble à un IMSI (règle vie privée).
+    let criteria = request.criteria;
+    let combinator = request.combinator;
+    for (i, c) in criteria.iter().enumerate() {
+        if !matches!(
+            c.op.as_str(),
+            "eq" | "ne" | "gt" | "lt" | "contains" | "in"
+        ) {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "UNKNOWN_CRITERION_OP",
+                &format!(
+                    "criteria[{i}].op must be one of eq|ne|gt|lt|contains|in"
+                ),
+            );
+        }
+    }
+    let network_elements_scope: std::collections::BTreeSet<String> =
+        request.network_elements.into_iter().collect();
+    let (from_ns, to_ns) = match &request.time_window {
+        Some(window) => (parse_ns(&window.from), parse_ns(&window.to)),
+        None => (None, None),
+    };
+    let run_id_filter = request.run_id.clone();
+    let mut free_text_search: Option<String> = None;
+    let mut search_pseudonym: Option<String> = None;
+    if let Some(raw_search) = request.search.as_deref() {
+        let trimmed = raw_search.trim();
+        if !trimmed.is_empty() {
+            let looks_like_imsi = trimmed.len() >= 14
+                && trimmed.len() <= 16
+                && trimmed.chars().all(|c| c.is_ascii_digit());
+            if looks_like_imsi {
+                if !role.can_control() {
+                    return api_error(
+                        StatusCode::FORBIDDEN,
+                        "IDENTITY_FILTER_OPERATOR_REQUIRED",
+                        "imsi-shaped search requires an operator bearer",
+                    );
+                }
+                let key = state.inner.capture_manager.pseudonym_key();
+                let kind = session_filters::IdentityKind::SupiOrImsi;
+                search_pseudonym = Some(event_schema::pseudonym(
+                    key.as_ref(),
+                    kind.pseudo_domain(),
+                    trimmed.as_bytes(),
+                ));
+                // La valeur brute `trimmed` est droppée ici.
+            } else {
+                free_text_search = Some(trimmed.to_ascii_lowercase());
+            }
+        }
+    }
+    let has_2191_filter = !criteria.is_empty()
+        || !network_elements_scope.is_empty()
+        || from_ns.is_some()
+        || to_ns.is_some()
+        || run_id_filter.is_some()
+        || free_text_search.is_some()
+        || search_pseudonym.is_some();
+    let has_extended_filter = !technologies.is_empty()
+        || !dataset_kinds.is_empty()
+        || !states.is_empty()
+        || !correlation_statuses.is_empty()
+        || has_2191_filter;
+
+    // Helper local : récupère/construit le summary complet d'une
+    // session par id. Jamais d'ajout de clé — retourne None si
+    // aucune source ne connaît l'id (session supprimée entre
+    // l'index et la résolution).
+    let resolve_summary = |session_id: &str| -> Option<Value> {
+        if let Some(flow) = state.inner.flows.get(session_id) {
+            let mut summary = session_summary(&state, flow);
+            decorate_subscriber_summary(&mut summary, flow, &journey_index);
+            insert_list_identities(&state, &mut summary, &flow.session_id, Some(&flow.events));
+            return Some(summary);
+        }
+        for dataset in state.inner.capture_manager.datasets() {
+            let matching_id = dataset
+                .session_ids
+                .iter()
+                .find(|id| id.as_str() == session_id);
+            if let Some(owned_id) = matching_id {
+                if let Some(summary) =
+                    cached_live_list_row(&state, &dataset, owned_id, &journey_index)
+                {
+                    return Some(summary);
+                }
+            }
+        }
+        if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
+            for manifest in catalog {
+                if let Ok(page) = state
+                    .inner
+                    .lte_evidence_store
+                    .session_page(&manifest.run_id, 1, 100)
+                {
+                    if let Some(records) = page["data"].as_array() {
+                        for record in records {
+                            if let Ok(session) = serde_json::from_value::<LteSession>(record.clone())
+                            {
+                                if session.session_id == session_id {
+                                    let mut summary = lte_session_summary(&manifest, &session);
+                                    insert_list_identities(
+                                        &state,
+                                        &mut summary,
+                                        &session.session_id,
+                                        None,
+                                    );
+                                    return Some(summary);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    // 2.19.0/2.19.1 — si extended filters présents, on construit
+    // TOUS les summaries des sorted_ids, on filtre, puis on re-tri
+    // par clé canonique conservée dans matching_keys (jamais par
+    // ts). Le fast path 2.18 (aucun extended filter) garde la
+    // construction paresseuse par page. `matched_criteria` est
+    // mémorisé par session pour injection dans le summary à la
+    // sortie.
+    let mut matched_hits_by_session: BTreeMap<String, Vec<session_catalog::CriterionHit>> =
+        BTreeMap::new();
+    let (effective_sorted_ids, prebuilt_items): (Vec<String>, Option<BTreeMap<String, Value>>) =
+        if has_extended_filter {
+            let mut built: BTreeMap<String, Value> = BTreeMap::new();
+            for session_id in &sorted_ids {
+                let Some(summary) = resolve_summary(session_id) else {
+                    continue;
+                };
+                if !passes_extended_filter(
+                    &summary,
+                    &technologies,
+                    &dataset_kinds,
+                    &states,
+                    &correlation_statuses,
+                ) {
+                    continue;
+                }
+                // 2.19.1 — filtres protocolaires + time window +
+                // run_id + search + network_elements. Besoin des
+                // events du flow pour matcher criteria/search.
+                let flow_for_match: Option<&CallFlow> = state.inner.flows.get(session_id);
+                let owned_live_flow: Option<CallFlow> = if flow_for_match.is_none() {
+                    live_flow_for(&state, session_id).map(|(_, flow)| flow)
+                } else {
+                    None
+                };
+                let events_ref: &[callflow_schema::CallFlowEvent] =
+                    match (flow_for_match, &owned_live_flow) {
+                        (Some(f), _) => f.events.as_slice(),
+                        (None, Some(f)) => f.events.as_slice(),
+                        _ => &[],
+                    };
+                let participants_ref: &[callflow_schema::Participant] =
+                    match (flow_for_match, &owned_live_flow) {
+                        (Some(f), _) => f.participants.as_slice(),
+                        (None, Some(f)) => f.participants.as_slice(),
+                        _ => &[],
+                    };
+                let capture_references_ref: &[String] =
+                    match (flow_for_match, &owned_live_flow) {
+                        (Some(f), _) => f.capture_references.as_slice(),
+                        (None, Some(f)) => f.capture_references.as_slice(),
+                        _ => &[],
+                    };
+
+                // 2.19.1 : network_elements AND entre familles.
+                if !network_elements_scope.is_empty() {
+                    let has_role = participants_ref.iter().any(|p| {
+                        network_elements_scope
+                            .iter()
+                            .any(|needle| p.role.eq_ignore_ascii_case(needle))
+                    });
+                    if !has_role {
+                        continue;
+                    }
+                }
+                // 2.19.1 : run_id (capture_references porte les ids).
+                if let Some(run) = run_id_filter.as_deref() {
+                    if !capture_references_ref.iter().any(|r| r == run) {
+                        continue;
+                    }
+                }
+                // 2.19.1 : time_window ⇒ au moins un event dans [from,to].
+                if from_ns.is_some() || to_ns.is_some() {
+                    let has_event_in_window = events_ref.iter().any(|event| {
+                        let Some(ts) = event.timestamp_ns.parse::<i128>().ok() else {
+                            return false;
+                        };
+                        if let Some(f) = from_ns {
+                            if ts < f {
+                                return false;
+                            }
+                        }
+                        if let Some(t) = to_ns {
+                            if ts > t {
+                                return false;
+                            }
+                        }
+                        true
+                    });
+                    if !has_event_in_window {
+                        continue;
+                    }
+                }
+                // 2.19.1 : free text search.
+                if let Some(needle) = &free_text_search {
+                    let hit = events_ref.iter().any(|event| {
+                        event.message_name.to_ascii_lowercase().contains(needle)
+                            || event
+                                .decoded_ie_tree
+                                .to_string()
+                                .to_ascii_lowercase()
+                                .contains(needle)
+                    });
+                    if !hit {
+                        continue;
+                    }
+                }
+                // 2.19.1 : search IMSI → pseudonyme (substring sur
+                // decoded_ie_tree, même sémantique que live_trace).
+                if let Some(pseudo) = &search_pseudonym {
+                    let hit = events_ref.iter().any(|event| {
+                        event.decoded_ie_tree.to_string().contains(pseudo)
+                    });
+                    if !hit {
+                        continue;
+                    }
+                }
+                // 2.19.1 : criteria + combinator.
+                let (hits, passes) = session_catalog::aggregate_session_hits(
+                    events_ref,
+                    &criteria,
+                    &combinator,
+                );
+                if !passes {
+                    continue;
+                }
+                if !hits.is_empty() {
+                    matched_hits_by_session.insert(session_id.clone(), hits);
+                }
+                built.insert(session_id.clone(), summary);
+            }
+            let mut rows: Vec<(String, (String, u64, String))> = built
+                .keys()
+                .filter_map(|id| matching_keys.get(id).map(|k| (id.clone(), k.clone())))
+                .collect();
+            rows.sort_by(|a, b| a.1.cmp(&b.1));
+            (rows.into_iter().map(|(id, _)| id).collect(), Some(built))
+        } else {
+            (sorted_ids.clone(), None)
+        };
+
     let start_index = match request.cursor.as_deref() {
         None => 0,
         Some(cursor_sid) => match matching_keys.get(cursor_sid) {
-            Some(cursor_key) => sorted_ids
+            Some(cursor_key) => effective_sorted_ids
                 .iter()
                 .position(|id| {
                     matching_keys
@@ -3962,72 +4320,115 @@ async fn sessions_filter(
                         .map(|k| k > cursor_key)
                         .unwrap_or(false)
                 })
-                .unwrap_or(sorted_ids.len()),
+                .unwrap_or(effective_sorted_ids.len()),
             None => {
                 // Curseur pointant vers une session qui n'est
                 // plus dans le set filtré : traité comme
                 // fin-de-flux.
-                sorted_ids.len()
+                effective_sorted_ids.len()
             }
         },
     };
-    let page_ids: Vec<&str> = sorted_ids
+    // 2.19.1 — `limit=0` : aperçu, on renvoie meta.total seul.
+    if limit == 0 {
+        let total = effective_sorted_ids.len();
+        let mut response = serde_json::json!({
+            "data": Vec::<Value>::new(),
+            "meta": {
+                "api_version": API_VERSION,
+                "limit": 0,
+                "total": total,
+                "role": role.name(),
+                "next_cursor": Value::Null,
+                "pagination_key": "(anchor_capture_id, first_packet_number, session_id)",
+                "preview": true,
+            }
+        });
+        if let Some(pseudo) = identity_pseudonym.as_deref() {
+            response["meta"]["identity_matched_pseudonym"] =
+                serde_json::Value::String(pseudo.to_owned());
+        }
+        if let Some(pseudo) = search_pseudonym.as_deref() {
+            response["meta"]["search_matched_pseudonym"] =
+                serde_json::Value::String(pseudo.to_owned());
+        }
+        return (StatusCode::OK, Json(response)).into_response();
+    }
+
+    let page_ids: Vec<&str> = effective_sorted_ids
         .iter()
         .skip(start_index)
         .take(limit)
         .map(String::as_str)
         .collect();
-    let next_cursor: Option<&str> = if start_index + page_ids.len() < sorted_ids.len() {
-        page_ids.last().copied()
-    } else {
-        None
-    };
+    let next_cursor: Option<&str> =
+        if start_index + page_ids.len() < effective_sorted_ids.len() {
+            page_ids.last().copied()
+        } else {
+            None
+        };
 
     // Reconstitue les summaries sessions pour les ids de la
     // page. Même ordre canonique qu'au tri (pas de re-sort par
-    // `ts` dans cette étape).
+    // `ts` dans cette étape). Fast path : build paresseux par
+    // page. Extended filter : on réutilise `prebuilt_items`.
     let page_set: std::collections::BTreeSet<&str> = page_ids.iter().copied().collect();
     let mut items_by_id: std::collections::BTreeMap<String, Value> =
         std::collections::BTreeMap::new();
-    for flow in state.inner.flows.values() {
-        if page_set.contains(flow.session_id.as_str()) {
-            let mut summary = session_summary(&state, flow);
-            decorate_subscriber_summary(&mut summary, flow, &journey_index);
-            insert_list_identities(&state, &mut summary, &flow.session_id, Some(&flow.events));
-            items_by_id.insert(flow.session_id.clone(), summary);
-        }
-    }
-    for dataset in state.inner.capture_manager.datasets() {
-        for session_id in &dataset.session_ids {
-            if !page_set.contains(session_id.as_str()) {
-                continue;
-            }
-            if let Some(summary) =
-                cached_live_list_row(&state, &dataset, session_id, &journey_index)
-            {
-                items_by_id.insert(session_id.clone(), summary);
+    if let Some(mut prebuilt) = prebuilt_items {
+        for session_id in page_ids.iter() {
+            if let Some(summary) = prebuilt.remove(*session_id) {
+                items_by_id.insert((*session_id).to_owned(), summary);
             }
         }
-    }
-    if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
-        for manifest in catalog {
-            if let Ok(page) = state
-                .inner
-                .lte_evidence_store
-                .session_page(&manifest.run_id, 1, 100)
-            {
-                if let Some(records) = page["data"].as_array() {
-                    for record in records {
-                        if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
-                            if page_set.contains(session.session_id.as_str()) {
-                                let mut summary = lte_session_summary(&manifest, &session);
-                                insert_list_identities(
-                                    &state,
-                                    &mut summary,
-                                    &session.session_id,
-                                    None,
-                                );
-                                items_by_id.insert(session.session_id.clone(), summary);
+    } else {
+        for flow in state.inner.flows.values() {
+            if page_set.contains(flow.session_id.as_str()) {
+                let mut summary = session_summary(&state, flow);
+                decorate_subscriber_summary(&mut summary, flow, &journey_index);
+                insert_list_identities(
+                    &state,
+                    &mut summary,
+                    &flow.session_id,
+                    Some(&flow.events),
+                );
+                items_by_id.insert(flow.session_id.clone(), summary);
+            }
+        }
+        for dataset in state.inner.capture_manager.datasets() {
+            for session_id in &dataset.session_ids {
+                if !page_set.contains(session_id.as_str()) {
+                    continue;
+                }
+                if let Some(summary) =
+                    cached_live_list_row(&state, &dataset, session_id, &journey_index)
+                {
+                    items_by_id.insert(session_id.clone(), summary);
+                }
+            }
+        }
+        if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
+            for manifest in catalog {
+                if let Ok(page) = state
+                    .inner
+                    .lte_evidence_store
+                    .session_page(&manifest.run_id, 1, 100)
+                {
+                    if let Some(records) = page["data"].as_array() {
+                        for record in records {
+                            if let Ok(session) =
+                                serde_json::from_value::<LteSession>(record.clone())
+                            {
+                                if page_set.contains(session.session_id.as_str()) {
+                                    let mut summary = lte_session_summary(&manifest, &session);
+                                    insert_list_identities(
+                                        &state,
+                                        &mut summary,
+                                        &session.session_id,
+                                        None,
+                                    );
+                                    items_by_id.insert(session.session_id.clone(), summary);
+                                }
                             }
                         }
                     }
@@ -4041,9 +4442,35 @@ async fn sessions_filter(
         .iter()
         .filter_map(|id| items_by_id.remove(*id))
         .collect();
+    // 2.19.0 — projection colonnes (serveur) avant sanitize.
+    if let Some(ref requested) = projected_columns {
+        for item in data.iter_mut() {
+            session_catalog::project_columns(item, requested);
+        }
+    }
+    // 2.19.1 — injecter matched_criteria APRÈS projection : c'est
+    // une preuve de match (pas une colonne), toujours publiée
+    // quand `criteria` est fourni.
+    if !criteria.is_empty() {
+        for item in data.iter_mut() {
+            let session_id_opt = item["session_id"].as_str().map(str::to_owned);
+            let Some(session_id) = session_id_opt else { continue };
+            let arr: Vec<Value> = matched_hits_by_session
+                .get(&session_id)
+                .map(|hits| {
+                    hits.iter()
+                        .map(session_catalog::criterion_hit_to_json)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(object) = item.as_object_mut() {
+                object.insert("matched_criteria".into(), Value::Array(arr));
+            }
+        }
+    }
     sanitize_all(&mut data);
 
-    let total = sorted_ids.len();
+    let total = effective_sorted_ids.len();
     let mut response = serde_json::json!({
         "data": data,
         "meta": {
@@ -4061,7 +4488,473 @@ async fn sessions_filter(
         response["meta"]["identity_matched_pseudonym"] =
             serde_json::Value::String(pseudo.to_owned());
     }
+    if let Some(pseudo) = search_pseudonym.as_deref() {
+        response["meta"]["search_matched_pseudonym"] =
+            serde_json::Value::String(pseudo.to_owned());
+    }
+    if let Some(ref requested) = projected_columns {
+        response["meta"]["projected_columns"] = serde_json::to_value(
+            requested
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or(Value::Null);
+    }
+    if !criteria.is_empty() {
+        response["meta"]["criteria_combinator"] = match combinator {
+            session_catalog::FilterCombinator::And => Value::String("and".to_owned()),
+            session_catalog::FilterCombinator::Or => Value::String("or".to_owned()),
+        };
+    }
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// 2.19.0 — AND entre familles (OR interne à chaque famille). Un
+/// summary passe le filtre ssi, pour chaque famille non vide, il
+/// matche au moins une valeur. Lecture uniquement : aucune
+/// mutation du summary.
+fn passes_extended_filter(
+    summary: &Value,
+    technologies: &std::collections::BTreeSet<String>,
+    dataset_kinds: &std::collections::BTreeSet<String>,
+    states: &std::collections::BTreeSet<String>,
+    correlation_statuses: &std::collections::BTreeSet<String>,
+) -> bool {
+    fn matches_any(set: &std::collections::BTreeSet<String>, value: Option<&str>) -> bool {
+        if set.is_empty() {
+            return true;
+        }
+        match value {
+            Some(v) => set.contains(v),
+            None => false,
+        }
+    }
+    matches_any(technologies, summary["technology"].as_str())
+        && matches_any(dataset_kinds, summary["dataset_kind"].as_str())
+        && matches_any(states, summary["state"].as_str())
+        && matches_any(correlation_statuses, summary["correlation_status"].as_str())
+}
+
+/// 2.19.1 — construit un arbre protocolaire à partir des events
+/// statiques courants, scopés par (interfaces, technologies,
+/// time_window, run_id). Lecture uniquement.
+fn build_protocol_tree(
+    state: &AppState,
+    interfaces_scope: &std::collections::BTreeSet<String>,
+    technologies_scope: &std::collections::BTreeSet<String>,
+    from_ns: Option<i128>,
+    to_ns: Option<i128>,
+    run_id: Option<&str>,
+) -> session_catalog::ProtocolTreeBuilder {
+    let mut builder = session_catalog::ProtocolTreeBuilder::new();
+    for flow in state.inner.flows.values() {
+        if !technologies_scope.is_empty() && !technologies_scope.contains(&flow.technology) {
+            continue;
+        }
+        if let Some(run) = run_id {
+            if !flow.capture_references.iter().any(|r| r == run) {
+                continue;
+            }
+        }
+        for participant in &flow.participants {
+            for address in &participant.addresses {
+                builder.observe_participant(&participant.role, address);
+            }
+        }
+        for event in &flow.events {
+            if !interfaces_scope.is_empty() && !interfaces_scope.contains(&event.interface) {
+                continue;
+            }
+            if let Some(from) = from_ns {
+                if event.timestamp_ns.parse::<i128>().map_or(false, |ts| ts < from) {
+                    continue;
+                }
+            }
+            if let Some(to) = to_ns {
+                if event.timestamp_ns.parse::<i128>().map_or(false, |ts| ts > to) {
+                    continue;
+                }
+            }
+            builder.observe_event(event);
+        }
+    }
+    builder
+}
+
+/// 2.19.1 — `GET /api/v1/sessions/catalog/search?q=&interfaces=&limit=50`.
+/// Recherche insensible à la casse sur messages ET paramètres. Tri par
+/// pertinence (exact > préfixe > contient). Jamais de liste figée :
+/// 100 % issu de `ProtocolTreeBuilder` construit sur les events réels.
+#[derive(Deserialize, Default)]
+struct SessionsCatalogSearchQuery {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    interfaces: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn sessions_catalog_search(
+    State(state): State<AppState>,
+    Query(query): Query<SessionsCatalogSearchQuery>,
+) -> Response {
+    let needle = match query.q.as_deref() {
+        Some(s) if !s.trim().is_empty() => s.trim().to_owned(),
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "SEARCH_QUERY_EMPTY",
+                "query parameter `q` is required and must be non-empty",
+            );
+        }
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let interfaces_scope = parse_csv(&query.interfaces);
+    let empty_set = std::collections::BTreeSet::<String>::new();
+    let builder = build_protocol_tree(&state, &interfaces_scope, &empty_set, None, None, None);
+    let results = session_catalog::search_protocol_tree(
+        &builder,
+        &needle,
+        &interfaces_scope,
+        limit,
+    );
+    let total = results.len();
+    ok(json!({
+        "results": results,
+        "query": {
+            "q": needle,
+            "interfaces": query.interfaces,
+            "limit": limit,
+        },
+        "total": total,
+    }))
+    .into_response()
+}
+
+/// 2.19.1 — `GET /api/v1/sessions/catalog/param?interface=&protocol=
+/// &message=&param_path=`. Fiche détaillée d'un paramètre
+/// observé + ≤ 5 sessions d'exemple.
+#[derive(Deserialize, Default)]
+struct SessionsCatalogParamQuery {
+    interface: String,
+    protocol: String,
+    message: String,
+    param_path: String,
+}
+
+async fn sessions_catalog_param(
+    State(state): State<AppState>,
+    Query(query): Query<SessionsCatalogParamQuery>,
+) -> Response {
+    for (field, value) in [
+        ("interface", &query.interface),
+        ("protocol", &query.protocol),
+        ("message", &query.message),
+        ("param_path", &query.param_path),
+    ] {
+        if value.trim().is_empty() {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "PARAM_QUERY_INCOMPLETE",
+                &format!("`{field}` query parameter is required"),
+            );
+        }
+    }
+    let empty_set = std::collections::BTreeSet::<String>::new();
+    let builder = build_protocol_tree(&state, &empty_set, &empty_set, None, None, None);
+    let mut body = match session_catalog::lookup_param(
+        &builder,
+        &query.interface,
+        &query.protocol,
+        &query.message,
+        &query.param_path,
+    ) {
+        Some(body) => body,
+        None => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "PARAM_NOT_OBSERVED",
+                "no event in the current scope has observed this parameter",
+            );
+        }
+    };
+    // ≤ 5 sessions d'exemple avec preuve {event_id, capture_id, seq}.
+    let flows_iter = state.inner.flows.values().map(|flow| {
+        (
+            flow.session_id.as_str(),
+            flow.events.as_slice(),
+        )
+    });
+    let examples = session_catalog::collect_param_example_sessions(
+        flows_iter,
+        &query.interface,
+        &query.protocol,
+        &query.message,
+        &query.param_path,
+        5,
+    );
+    if let Some(object) = body.as_object_mut() {
+        object.insert("example_sessions".into(), Value::Array(examples));
+    }
+    ok(body).into_response()
+}
+
+/// 2.19.1 — query params du GET /sessions/catalog qui scopent la
+/// construction de `protocol_tree` + `network_elements`.
+#[derive(Deserialize, Default)]
+struct SessionsCatalogQuery {
+    #[serde(default)]
+    interfaces: Option<String>,
+    #[serde(default)]
+    technologies: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+}
+
+fn parse_csv(opt: &Option<String>) -> std::collections::BTreeSet<String> {
+    opt.as_deref()
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_ns(opt: &Option<String>) -> Option<i128> {
+    // Accepte un entier ns (format canonique dans l'app). L'UI
+    // qui souhaite transmettre un RFC3339 convertit côté client ;
+    // garder le serveur sans dépendance chrono.
+    opt.as_deref().and_then(|raw| raw.trim().parse::<i128>().ok())
+}
+
+/// 2.19.0 (liste des filtres + colonnes) + 2.19.1 (protocol_tree +
+/// network_elements scopés par query). Lecture seule.
+async fn sessions_catalog(
+    State(state): State<AppState>,
+    Query(query): Query<SessionsCatalogQuery>,
+) -> Response {
+    state.refresh_session_filter_index();
+    let guard = state
+        .inner
+        .session_filter_index
+        .read()
+        .expect("session_filter_index poisoned");
+    let interfaces_distinct = session_catalog::distinct_interfaces(&guard);
+    let messages = session_catalog::distinct_messages(&guard);
+    let causes = guard.available_causes();
+    let session_count = guard.session_count();
+    drop(guard);
+
+    // 2.19.1 — construction du protocol_tree. Scope :
+    // interfaces ∈ query.interfaces (si fourni), technology ∈
+    // query.technologies (si fourni), timestamp_ns ∈ [from, to]
+    // (si fourni), dataset_id == run_id (si fourni). Jamais de
+    // re-tri par ts : on filtre event-par-event mais les events
+    // restent dans l'ordre fourni par le CallFlow (canonique).
+    let interfaces_scope = parse_csv(&query.interfaces);
+    let technologies_scope = parse_csv(&query.technologies);
+    let from_ns = parse_ns(&query.from);
+    let to_ns = parse_ns(&query.to);
+    let run_id = query.run_id.clone();
+
+    let builder = build_protocol_tree(
+        &state,
+        &interfaces_scope,
+        &technologies_scope,
+        from_ns,
+        to_ns,
+        run_id.as_deref(),
+    );
+    let protocol_tree = builder.to_protocol_tree_json();
+    let network_elements = builder.to_network_elements_json();
+
+    let body = json!({
+        "columns": session_catalog::columns_catalog(),
+        "filters": {
+            "interfaces": interfaces_distinct,
+            "messages": messages,
+            "causes": causes,
+            "technologies": ["5G SA", "LTE"],
+            "dataset_kinds": [
+                "HISTORICAL",
+                "CAPTURED_LIVE",
+                "EVIDENCE",
+                "DERIVED",
+                "RECOVERED",
+            ],
+            "states": [
+                "ACTIVE_WITH_USER_PLANE",
+                "RELEASED",
+                "INCOMPLETE",
+                "HISTORICAL_CONTEXT",
+                "UNKNOWN",
+            ],
+            "correlation_statuses": [
+                "EXACT",
+                "PARTIAL",
+                "UNKNOWN",
+            ],
+            "pseudonym_match": "exact string from decoded IE",
+        },
+        "always_present_columns": session_catalog::ALWAYS_PRESENT_COLUMNS,
+        "session_count": session_count,
+        "protocol_tree": protocol_tree,
+        "network_elements": network_elements,
+        "scope": {
+            "interfaces": query.interfaces,
+            "technologies": query.technologies,
+            "from": query.from,
+            "to": query.to,
+            "run_id": query.run_id,
+        }
+    });
+    ok(body).into_response()
+}
+
+/// 2.19.0 — projection sur une liste d'ids : `{session_ids,
+/// columns}`. Les colonnes `ALWAYS_PRESENT_COLUMNS` sont toujours
+/// présentes. Les ids inconnus apparaissent dans
+/// `meta.missing_session_ids`. Un nom de colonne inconnu → 400
+/// `UNKNOWN_COLUMN`.
+async fn sessions_columns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<session_catalog::SessionsColumnsRequest>,
+) -> Response {
+    let role = role_from_headers(&state, &headers);
+    let requested_columns = match session_catalog::validate_columns(&request.columns) {
+        Ok(set) => set,
+        Err(unknown) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "UNKNOWN_COLUMN",
+                &format!("unknown column name: {unknown}"),
+            );
+        }
+    };
+    // 2.19.1 — valider les fields PROTOCOLAIRES.
+    if let Err(msg) = session_catalog::validate_fields(&request.fields) {
+        return api_error(StatusCode::BAD_REQUEST, "INVALID_FIELD", &msg);
+    }
+    if request.session_ids.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "SESSION_IDS_REQUIRED",
+            "session_ids must be a non-empty array",
+        );
+    }
+    let journey_index = cached_journey_index(&state);
+    let mut data: Vec<Value> = Vec::with_capacity(request.session_ids.len());
+    let mut missing: Vec<String> = Vec::new();
+    for session_id in &request.session_ids {
+        let summary_opt = resolve_summary_for_columns(&state, session_id, &journey_index);
+        match summary_opt {
+            Some(mut summary) => {
+                session_catalog::project_columns(&mut summary, &requested_columns);
+                // 2.19.1 — colonnes protocolaires + preuve.
+                if !request.fields.is_empty() {
+                    let events: Vec<callflow_schema::CallFlowEvent> =
+                        if let Some(flow) = state.inner.flows.get(session_id) {
+                            flow.events.clone()
+                        } else if let Some((_, live)) = live_flow_for(&state, session_id) {
+                            live.events
+                        } else {
+                            Vec::new()
+                        };
+                    let mut field_values: Vec<Value> = Vec::new();
+                    for field in &request.fields {
+                        if let Some(result) =
+                            session_catalog::evaluate_field_on_session(&events, field)
+                        {
+                            field_values.push(session_catalog::field_result_to_json(
+                                field, &result,
+                            ));
+                        }
+                    }
+                    if let Some(object) = summary.as_object_mut() {
+                        object.insert("fields".into(), Value::Array(field_values));
+                    }
+                }
+                data.push(summary);
+            }
+            None => missing.push(session_id.clone()),
+        }
+    }
+    sanitize_all(&mut data);
+    let response = json!({
+        "data": data,
+        "meta": {
+            "api_version": API_VERSION,
+            "role": role.name(),
+            "projected_columns": requested_columns.iter().cloned().collect::<Vec<_>>(),
+            "missing_session_ids": missing,
+            "total": data.len(),
+            "field_count": request.fields.len(),
+        }
+    });
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// 2.19.0 — même logique que la résolution dans `sessions_filter`
+/// mais non-lambda pour pouvoir être appelée depuis
+/// `sessions_columns`.
+fn resolve_summary_for_columns(
+    state: &AppState,
+    session_id: &str,
+    journey_index: &subscriber_journey::JourneyIndex,
+) -> Option<Value> {
+    if let Some(flow) = state.inner.flows.get(session_id) {
+        let mut summary = session_summary(state, flow);
+        decorate_subscriber_summary(&mut summary, flow, journey_index);
+        insert_list_identities(state, &mut summary, &flow.session_id, Some(&flow.events));
+        return Some(summary);
+    }
+    for dataset in state.inner.capture_manager.datasets() {
+        let matching_id = dataset
+            .session_ids
+            .iter()
+            .find(|id| id.as_str() == session_id);
+        if let Some(owned_id) = matching_id {
+            if let Some(summary) = cached_live_list_row(state, &dataset, owned_id, journey_index) {
+                return Some(summary);
+            }
+        }
+    }
+    if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
+        for manifest in catalog {
+            if let Ok(page) = state
+                .inner
+                .lte_evidence_store
+                .session_page(&manifest.run_id, 1, 100)
+            {
+                if let Some(records) = page["data"].as_array() {
+                    for record in records {
+                        if let Ok(session) = serde_json::from_value::<LteSession>(record.clone()) {
+                            if session.session_id == session_id {
+                                let mut summary = lte_session_summary(&manifest, &session);
+                                insert_list_identities(
+                                    state,
+                                    &mut summary,
+                                    &session.session_id,
+                                    None,
+                                );
+                                return Some(summary);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -5773,6 +6666,13 @@ fn is_identity_label(value: &str) -> bool {
         .any(|marker| normalized.contains(marker))
         || matches!(normalized.as_str(), "pei" | "k")
         || normalized.contains("permanentequipmentidentifier")
+}
+
+/// 2.19.1 — point d'entrée public pour le constructeur d'arbre
+/// protocolaire : filtre les IEs identité AVANT ingestion. Jamais de
+/// dérivation sémantique à partir du nom.
+pub fn is_identity_label_pub(value: &str) -> bool {
+    is_identity_label(value)
 }
 
 fn is_identity_object(value: &Value) -> bool {
@@ -10944,6 +11844,527 @@ mod tests {
         }
         // Aucune identité ne doit figurer dans la réponse.
         assert_no_identity_material(&body);
+    }
+
+    /// 2.19.0 — `GET /sessions/catalog` expose les 4 familles de
+    /// filtres et un catalog de colonnes non vide. Aucune colonne
+    /// de type identité en clair.
+    #[tokio::test]
+    async fn sessions_catalog_exposes_filters_and_columns_without_clear_identities() {
+        let state = state();
+        let router = router(state.clone(), None);
+        let request = Request::builder()
+            .uri("/api/v1/sessions/catalog")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let columns = body["data"]["columns"]
+            .as_array()
+            .expect("columns array present");
+        assert!(!columns.is_empty(), "columns catalog must be non-empty");
+        for column in columns {
+            assert!(column["name"].is_string());
+            assert!(column["type"].is_string());
+            assert!(column["applies_to"].is_array());
+            assert!(column["always_present"].is_boolean());
+            let name = column["name"].as_str().unwrap().to_ascii_lowercase();
+            // Jamais de nom de colonne portant imsi/supi/msisdn/
+            // imei/guti/tmsi/suci/pei en clair (règle Sadok
+            // 2026-11-14). Les pseudonymes & le wrapper
+            // `identities` sont autorisés.
+            for banned in [
+                "imsi", "supi", "suci", "msisdn", "imei", "imeisv", "guti", "tmsi",
+            ] {
+                let is_pseudo_wrap =
+                    name.contains("pseudonym") || name.contains("identities");
+                assert!(
+                    !name.contains(banned) || is_pseudo_wrap,
+                    "forbidden clear identity column: {name}"
+                );
+            }
+        }
+        let filters = &body["data"]["filters"];
+        for family in [
+            "interfaces",
+            "messages",
+            "causes",
+            "technologies",
+            "dataset_kinds",
+            "states",
+            "correlation_statuses",
+        ] {
+            assert!(filters[family].is_array(), "missing filter family: {family}");
+        }
+        assert_no_identity_material(&body);
+    }
+
+    /// 2.19.0 — `POST /sessions/filter` avec `columns` renvoie les
+    /// lignes projetées. Les colonnes ALWAYS_PRESENT sont
+    /// toujours là, et `meta.projected_columns` reflète la
+    /// requête. Aucune identité en clair dans la projection.
+    #[tokio::test]
+    async fn sessions_filter_with_columns_projects_and_keeps_always_present() {
+        let state = state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "limit": 5,
+                "columns": ["state", "procedure", "message_count"],
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let data = body["data"].as_array().expect("data present");
+        for item in data {
+            // Toujours présentes.
+            assert!(item.get("session_id").is_some());
+            assert!(item.get("dataset_id").is_some());
+            assert!(item.get("dataset_kind").is_some());
+            assert!(item.get("technology").is_some());
+            // Demandées.
+            // (Elles peuvent être présentes OU absentes selon le
+            // producteur — mais toute autre colonne doit l'être.)
+            let allowed: std::collections::BTreeSet<&str> = [
+                "session_id",
+                "dataset_id",
+                "dataset_kind",
+                "technology",
+                "state",
+                "procedure",
+                "message_count",
+            ]
+            .into_iter()
+            .collect();
+            if let Value::Object(object) = item {
+                for key in object.keys() {
+                    assert!(
+                        allowed.contains(key.as_str()),
+                        "unexpected column after projection: {key}"
+                    );
+                }
+            }
+            assert_no_identity_material(item);
+        }
+        let projected = body["meta"]["projected_columns"]
+            .as_array()
+            .expect("projected_columns array");
+        assert_eq!(projected.len(), 3);
+    }
+
+    /// 2.19.0 — un nom de colonne hors catalog déclenche 400
+    /// `UNKNOWN_COLUMN` sans leak de données.
+    #[tokio::test]
+    async fn sessions_filter_with_unknown_column_returns_400_unknown_column() {
+        let state = state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({"columns": ["not_a_real_column"]}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "UNKNOWN_COLUMN");
+    }
+
+    /// 2.19.0 — `POST /sessions/columns` projette pour une liste
+    /// d'ids explicite. Les ids inconnus apparaissent dans
+    /// `meta.missing_session_ids`. Valide l'empty body → 400.
+    #[tokio::test]
+    async fn sessions_columns_projects_for_explicit_ids_and_reports_missing() {
+        let state = state();
+        // Récupère une liste d'ids réels via /sessions/filter.
+        let (status, filter_body) =
+            post_sessions_filter(&state, json!({"limit": 3}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let real_ids: Vec<String> = filter_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["session_id"].as_str().map(str::to_owned))
+            .collect();
+        if real_ids.is_empty() {
+            // Pas de donnée dans le dataset embarqué : encore test
+            // sanity du schéma d'erreur.
+            let router = router(state.clone(), None);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions/columns")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_ids": [],
+                        "columns": ["state"],
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            return;
+        }
+        let mut ids = real_ids.clone();
+        ids.push("session-does-not-exist".to_owned());
+        let router = router(state.clone(), None);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sessions/columns")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "session_ids": ids,
+                    "columns": ["state", "procedure"],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let data = body["data"].as_array().expect("data array");
+        assert_eq!(data.len(), real_ids.len());
+        let missing = body["meta"]["missing_session_ids"]
+            .as_array()
+            .expect("missing_session_ids array");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0], "session-does-not-exist");
+        for item in data {
+            assert!(item["session_id"].is_string());
+            assert!(item["dataset_id"].is_string());
+            // Pas d'autres colonnes que ALWAYS_PRESENT + demandées.
+            let allowed: std::collections::BTreeSet<&str> = [
+                "session_id",
+                "dataset_id",
+                "dataset_kind",
+                "technology",
+                "state",
+                "procedure",
+            ]
+            .into_iter()
+            .collect();
+            if let Value::Object(object) = item {
+                for key in object.keys() {
+                    assert!(
+                        allowed.contains(key.as_str()),
+                        "unexpected column after projection: {key}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 2.19.0 — filtre étendu `technologies` restreint à 5G SA
+    /// (quand des sessions 5G existent) et jamais ne renvoie une
+    /// ligne LTE. Vérifie que la projection par défaut inclut
+    /// toujours la colonne `technology`.
+    #[tokio::test]
+    async fn sessions_filter_technologies_restricts_to_5g_sa() {
+        let state = state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "limit": 50,
+                "technologies": ["5G SA"],
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for item in body["data"].as_array().unwrap() {
+            assert_eq!(
+                item["technology"].as_str().unwrap_or(""),
+                "5G SA",
+                "row should be 5G SA when filter technologies=[5G SA]"
+            );
+        }
+    }
+
+    /// 2.19.1 — `/sessions/catalog` publie `protocol_tree` et
+    /// `network_elements` construits sur les events réels. Aucun
+    /// nom d'identité en clair dans la publication.
+    #[tokio::test]
+    async fn sessions_catalog_publishes_protocol_tree_and_network_elements() {
+        let state = state();
+        let router = router(state.clone(), None);
+        let request = Request::builder()
+            .uri("/api/v1/sessions/catalog")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let tree = body["data"]["protocol_tree"]
+            .as_array()
+            .expect("protocol_tree array present");
+        // Dataset embarqué 5G SA : au moins l'interface N2 doit apparaître.
+        assert!(
+            tree.iter().any(|iface| iface["interface"] == "N2"),
+            "protocol_tree must contain observed N2"
+        );
+        assert!(body["data"]["network_elements"].is_array());
+        assert_no_identity_material(&body);
+    }
+
+    /// 2.19.1 — `/sessions/catalog/search?q=` renvoie des matches
+    /// triés par pertinence et aucun n'est en clair.
+    #[tokio::test]
+    async fn sessions_catalog_search_returns_relevance_sorted_results() {
+        let state = state();
+        let router = router(state.clone(), None);
+        let request = Request::builder()
+            .uri("/api/v1/sessions/catalog/search?q=Cause")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let results = body["data"]["results"].as_array().expect("results array");
+        // Dataset de test porte `Cause` dans NGAP/PFCP → au moins 1 match.
+        if !results.is_empty() {
+            let first = &results[0];
+            assert!(first["interface"].is_string());
+            assert!(first["protocol"].is_string());
+            assert!(first["message"].is_string());
+            assert!(first["occurrences"].is_number());
+        }
+        assert_no_identity_material(&body);
+    }
+
+    /// 2.19.1 — `/sessions/catalog/search` sans `q` → 400
+    /// `SEARCH_QUERY_EMPTY`.
+    #[tokio::test]
+    async fn sessions_catalog_search_without_q_returns_400() {
+        let state = state();
+        let router = router(state.clone(), None);
+        let request = Request::builder()
+            .uri("/api/v1/sessions/catalog/search")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "SEARCH_QUERY_EMPTY");
+    }
+
+    /// 2.19.1 — `/sessions/catalog/param` sur un paramètre observé
+    /// retourne la fiche détaillée. Paramètre non observé → 404
+    /// `PARAM_NOT_OBSERVED`.
+    #[tokio::test]
+    async fn sessions_catalog_param_returns_detail_or_404() {
+        let state = state();
+        let router = router(state.clone(), None);
+        // Essai sur un path sûrement inexistant.
+        let request = Request::builder()
+            .uri("/api/v1/sessions/catalog/param?interface=N2&protocol=NGAP&message=PDUSessionResourceSetupResponse&param_path=NoSuchParamHere")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "PARAM_NOT_OBSERVED");
+    }
+
+    /// 2.19.1 — `POST /sessions/filter` avec `limit=0` ne renvoie
+    /// aucune ligne, seulement `meta.total` + `meta.preview=true`.
+    #[tokio::test]
+    async fn sessions_filter_limit_zero_returns_only_total_preview() {
+        let state = state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "limit": 0,
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"].as_array().unwrap().len(), 0);
+        assert!(body["meta"]["total"].as_u64().is_some());
+        assert_eq!(body["meta"]["preview"], true);
+        // Comparaison : même total que l'appel non-preview.
+        let (_, body_full) = post_sessions_filter(&state, json!({"limit": 100}), None).await;
+        assert_eq!(body["meta"]["total"], body_full["meta"]["total"]);
+    }
+
+    /// 2.19.1 — `criteria` + `combinator=and` filtre les sessions
+    /// et publie `matched_criteria` dans chaque ligne. Vérifie que
+    /// chaque hit pointe un event existant (event_id non vide).
+    #[tokio::test]
+    async fn sessions_filter_criteria_and_publishes_matched_criteria() {
+        let state = state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "limit": 100,
+                "combinator": "and",
+                "criteria": [
+                    {
+                        "message": "PDUSessionResourceSetupResponse",
+                        "op": "eq",
+                        "value": "cause=1",
+                        "param_path": "Cause",
+                    }
+                ],
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["meta"]["criteria_combinator"], "and");
+        for item in body["data"].as_array().unwrap() {
+            let hits = item["matched_criteria"].as_array().expect("hits array");
+            // Session a passé le filtre AND → ≥ 1 hit.
+            assert!(!hits.is_empty());
+            for hit in hits {
+                assert!(hit["event_id"].is_string());
+                assert!(hit["capture_id"].is_string());
+                assert!(hit["seq"].is_number());
+                assert_eq!(hit["criterion_index"], 0);
+            }
+        }
+    }
+
+    /// 2.19.1 — `combinator=or` passe la session dès qu'un
+    /// critère matche.
+    #[tokio::test]
+    async fn sessions_filter_criteria_or_passes_on_single_match() {
+        let state = state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "limit": 100,
+                "combinator": "or",
+                "criteria": [
+                    {
+                        "message": "DoesNotExistAnywhere",
+                        "op": "eq",
+                        "value": "_",
+                    },
+                    {
+                        "message": "PDUSessionResourceSetupResponse",
+                        "op": "eq",
+                        "value": "cause=1",
+                        "param_path": "Cause",
+                    }
+                ],
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["meta"]["criteria_combinator"], "or");
+        // Les sessions retournées doivent toutes avoir au moins
+        // un match sur l'une des deux critères (hit du 2e).
+        for item in body["data"].as_array().unwrap() {
+            let hits = item["matched_criteria"].as_array().expect("hits array");
+            assert!(hits.iter().any(|h| h["criterion_index"] == 1));
+        }
+    }
+
+    /// 2.19.1 — `POST /sessions/columns` avec `fields[]` publie
+    /// value + proof par session.
+    #[tokio::test]
+    async fn sessions_columns_fields_publish_value_and_proof() {
+        let state = state();
+        let (_, filter_body) =
+            post_sessions_filter(&state, json!({"limit": 3}), None).await;
+        let real_ids: Vec<String> = filter_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["session_id"].as_str().map(str::to_owned))
+            .collect();
+        if real_ids.is_empty() {
+            return;
+        }
+        let router = router(state.clone(), None);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sessions/columns")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "session_ids": real_ids,
+                    "columns": ["state"],
+                    "fields": [
+                        {
+                            "interface": "N2",
+                            "protocol": "NGAP",
+                            "message": "PDUSessionResourceSetupResponse",
+                            "param_path": "Cause",
+                            "mode": "last"
+                        }
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        for item in body["data"].as_array().unwrap() {
+            let fields = item["fields"].as_array().expect("fields array");
+            assert_eq!(fields.len(), 1);
+            let field = &fields[0];
+            assert_eq!(field["interface"], "N2");
+            assert_eq!(field["protocol"], "NGAP");
+            assert_eq!(field["mode"], "last");
+            // value peut être présent (Value) ou Null si l'event
+            // n'a pas été observé — mais le proof est consistant.
+            if field["value"].is_null() {
+                assert_eq!(field["proof"].as_array().unwrap().len(), 0);
+            } else {
+                assert!(!field["proof"].as_array().unwrap().is_empty());
+                let proof = &field["proof"][0];
+                assert!(proof["event_id"].is_string());
+                assert!(proof["capture_id"].is_string());
+                assert!(proof["seq"].is_number());
+            }
+        }
+        assert_eq!(body["meta"]["field_count"], 1);
+    }
+
+    /// 2.19.1 — rétro-compat avec la shape 2.19.0 : `{limit:100}`
+    /// seul retourne exactement le même set de lignes qu'en 2.19.0.
+    #[tokio::test]
+    async fn sessions_filter_body_limit100_remains_retrocompat_with_2_19_0() {
+        let state = state();
+        let (status, body) = post_sessions_filter(&state, json!({"limit": 100}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        // meta.pagination_key inchangée.
+        assert_eq!(
+            body["meta"]["pagination_key"],
+            "(anchor_capture_id, first_packet_number, session_id)"
+        );
+        // matched_criteria ABSENT si criteria vide (compat).
+        for item in body["data"].as_array().unwrap() {
+            assert!(
+                item.get("matched_criteria").is_none()
+                    || item["matched_criteria"].as_array().map_or(0, Vec::len) == 0,
+                "matched_criteria must not leak when no criteria provided"
+            );
+        }
+    }
+
+    /// 2.19.1 — un critère avec op inconnu → 400 `UNKNOWN_CRITERION_OP`.
+    #[tokio::test]
+    async fn sessions_filter_unknown_criterion_op_returns_400() {
+        let state = state();
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "criteria": [{
+                    "message": "AnyMessage",
+                    "op": "like",
+                }]
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "UNKNOWN_CRITERION_OP");
     }
 
     #[tokio::test]
