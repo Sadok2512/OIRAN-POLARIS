@@ -1,5 +1,12 @@
 # Changelog
 
+## OIRAN API 2.21.1 — 2026-11-16 — lock du workspace OIRAN compatible Rust 1.83 (patch)
+
+Rapport ANR2 #10 6921899654 : le lock `OIRAN/Cargo.lock` contenait `indexmap 2.14.2` (edition2024, Rust ≥ 1.85), tiré par `toml` depuis la 2.20.0. Le workspace ne compilait donc pas avec le Cargo 1.83 du lab : 2.20.0, 2.20.1 et 2.21.0 sont concernées.
+- `cargo update -p indexmap --precise 2.13.1` (hashbrown 0.17.1 → 0.16.1).
+- Audit du lock (`python3 /tmp/audit.py Cargo.lock`, lecture des Cargo.toml de `~/.cargo/registry/src`) : 105 crates du registre, 0 en edition 2024, 0 avec rust-version > 1.83.
+- `cargo build --locked -p oiran-api -p oiran-decode -p live-probe` : PASS (Rust 1.97 sur l'hôte de dev). La preuve en 1.83 reste la build du lab.
+
 ## polaris-vtap 2.21.1 — 2026-11-16 — build lab sans clang + Rust 1.83 + tracefs (patch)
 
 Suite au rapport ANR2 #10 6921485041 (étape 1 OUVERTE : `clang` absent ; Cargo 1.83.0 refuse `indexmap 2.14.2`, qui exige edition2024). Seul `OIRAN/vtap` change ; oiran-api reste en 2.21.0.
