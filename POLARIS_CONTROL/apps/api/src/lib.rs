@@ -4405,6 +4405,14 @@ mod gnb_ngap_activity_tests {
     use super::*;
 
     #[test]
+    fn amf_listen_probe_uses_a_valid_ss_invocation() {
+        let command = amf_sctp_listen_command("38412");
+        assert!(command.contains(" -l "), "{command}");
+        assert!(!command.contains("state listen"), "{command}");
+        assert!(command.ends_with("':38412'"), "{command}");
+    }
+
+    #[test]
     fn already_up_is_traced_as_a_check_without_action() {
         let (kind, detail) = gnb_ngap_activity(&gnb_ngap_check::GnbNgapOutcome::AlreadyUp);
         assert_eq!(kind, "gnb_ngap_check");
@@ -4518,7 +4526,7 @@ impl gnb_ngap_check::GnbNgapChecker for DockerGnbNgapChecker {
                     Self::AMF_CONTAINER,
                     "/bin/sh",
                     "-c",
-                    &format!("ss -H -n -A sctp state listen | grep -F ':{}'", Self::AMF_NGAP_PORT),
+                    &amf_sctp_listen_command(Self::AMF_NGAP_PORT),
                 ])
                 .output()
                 .map(|out| out.status.success() && !out.stdout.is_empty())
@@ -4560,6 +4568,16 @@ impl gnb_ngap_check::GnbNgapChecker for DockerGnbNgapChecker {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
+}
+
+/// 0.36.12 (ANR2 #10 6917003639) — `ss … state listen` est rejeté par
+/// iproute2 (« wrong state name: listen » ; le nom d'état est
+/// `listening`) → la commande échouait, l'AMF était déclaré absent alors
+/// qu'il écoutait, et Control répondait GNB_NGAP_DOWN_AMF_UNAVAILABLE sans
+/// jamais redémarrer le gNB. `-l` liste les sockets en écoute, sans nom
+/// d'état.
+fn amf_sctp_listen_command(port: &str) -> String {
+    format!("ss -H -n -l -A sctp | grep -F ':{port}'")
 }
 
 fn inspect_container_interface_state(name: &str, transport: &str, port: &str) -> String {

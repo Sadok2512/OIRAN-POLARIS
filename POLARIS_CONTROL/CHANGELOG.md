@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.36.12 — 2026-11-16 — Pré-check gNB : détection d'écoute AMF réparée (patch)
+
+- Cause prouvée par ANR2 (#10 6917003639, runs simple-data-ul-dl-23a3a0648956 / -60b0fb3eabde) : la sonde d'écoute AMF lançait `ss … state listen`, rejeté par iproute2 (« wrong state name: listen ») → AMF déclaré absent alors qu'il écoutait sur SCTP 38412 → `GNB_NGAP_DOWN_AMF_UNAVAILABLE` immédiat, gNB jamais redémarré. Commande remplacée par `ss -H -n -l -A sctp` (sockets en écoute). Le contrôle `amf-list` de 0.36.11 est conservé.
+- Test `amf_listen_probe_uses_a_valid_ss_invocation`.
+- Ouvert : la validité réelle de la commande `ss` dans le conteneur AMF n'est prouvable que sur le serveur (pas de CI) — à prouver en recette.
+
 ## 0.36.11 — 2026-11-16 — Pré-check gNB : NGAP up exige un AMF connu (patch)
 
 - Cause prouvée par ANR2 (#10 6915042783, UE-201 bloqué MM-DEREGISTERED/ATTEMPTING-REGISTRATION) : après le redémarrage de l'AMF, UERANSIM garde `is-ngap-up: true` mais sa liste d'AMF est vide (« Could not find a suitable AMF ») ; Control publiait `gnb_ngap_check OK` et ne redémarrait pas le gNB.
