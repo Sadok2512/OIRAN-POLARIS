@@ -74,7 +74,18 @@ impl RotatingWriter {
         let path = self.dir.join(format!("{}_{}.pcap.part", self.prefix, stamp));
         let mut w = BufWriter::new(File::create(&path)?);
         w.write_all(&global_header())?;
+        // 2.21.5 — en-tête sur disque immédiatement (un `.part` de 0 octet
+        // ne doit plus pouvoir exister).
+        w.flush()?;
         self.current = Some((path, w));
+        Ok(())
+    }
+
+    /// 2.21.5 — vidage périodique du tampon (battement de vie).
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        if let Some((_, w)) = self.current.as_mut() {
+            w.flush()?;
+        }
         Ok(())
     }
 
@@ -139,6 +150,11 @@ mod tests {
         let mut w = RotatingWriter::new(&dir, "vtap_SBI").unwrap();
         w.open("20261116T150000Z").unwrap();
         assert!(dir.join("vtap_SBI_20261116T150000Z.pcap.part").exists());
+        assert_eq!(
+            std::fs::metadata(dir.join("vtap_SBI_20261116T150000Z.pcap.part")).unwrap().len(),
+            24,
+            "en-tête pcap écrit dès l'ouverture"
+        );
         w.write(&[SynthPacket { ts_ns: 1, frame: vec![0u8; 60] }]).unwrap();
         let out = w.close(|_| "{}".into()).unwrap().unwrap();
         assert_eq!(out, dir.join("vtap_SBI_20261116T150000Z.pcap"));

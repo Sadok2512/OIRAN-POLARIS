@@ -27,8 +27,10 @@ use polaris_vtap::synth::{Synthesizer, DEFAULT_SERVER_PORTS};
 use serde_json::json;
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static STOP_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-extern "C" fn on_signal(_: libc::c_int) {
+extern "C" fn on_signal(sig: libc::c_int) {
+    STOP_SIGNAL.store(sig, Ordering::SeqCst);
     STOP.store(true, Ordering::SeqCst);
 }
 
@@ -194,6 +196,12 @@ fn run() -> Result<(), String> {
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        // 2.21.5 — essai 3 : agent lancé en `&` depuis un shell d'outil,
+        // tué au SIGHUP de fin de session sans VTAP_STOP ni pcap fermé.
+        // SIGHUP/SIGQUIT déclenchent désormais l'arrêt propre (fichier
+        // fermé + manifeste + VTAP_STOP avec le signal reçu).
+        libc::signal(libc::SIGHUP, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        libc::signal(libc::SIGQUIT, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
     }
     log(json!({
         "event": "VTAP_START",
@@ -270,6 +278,7 @@ fn run() -> Result<(), String> {
     writer.open(&utc_stamp()).map_err(|e| e.to_string())?;
     let started = Instant::now();
     let mut file_started = Instant::now();
+    let mut last_alive = Instant::now();
     let mut bpf_base = read_stats(&stats);
 
     loop {
@@ -338,11 +347,18 @@ fn run() -> Result<(), String> {
             }));
             synth.rotate();
             if stop {
-                log(json!({"event":"VTAP_STOP"}));
+                log(json!({"event":"VTAP_STOP","signal":STOP_SIGNAL.load(Ordering::SeqCst),"uptime_s":started.elapsed().as_secs()}));
                 return Ok(());
             }
             writer.open(&utc_stamp()).map_err(|e| e.to_string())?;
             file_started = Instant::now();
+        }
+        if last_alive.elapsed() >= Duration::from_secs(60) {
+            // 2.21.5 — battement de vie : prouve que l'agent tourne et
+            // date sa mort s'il disparaît (aucun silence).
+            writer.flush().map_err(|e| format!("pcap flush: {e}"))?;
+            log(json!({"event":"VTAP_ALIVE","uptime_s":started.elapsed().as_secs(),"counters":synth.counters}));
+            last_alive = Instant::now();
         }
         if drained == 0 {
             std::thread::sleep(Duration::from_millis(5));

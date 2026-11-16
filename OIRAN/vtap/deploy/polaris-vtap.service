@@ -1,0 +1,21 @@
+# POLARIS vTAP 2.21.5 — agent lancé en service, JAMAIS en `&` depuis un shell
+# (essai 3 : agent tué en silence à la fin de la session de l'outil).
+# Installation : cp deploy/polaris-vtap.service /etc/systemd/system/ && systemctl daemon-reload
+# Démarrage : systemctl start polaris-vtap ; arrêt propre : systemctl stop polaris-vtap (SIGTERM → VTAP_STOP)
+[Unit]
+Description=POLARIS vTAP agent (eBPF libssl -> pcap SBI)
+After=docker.service
+
+[Service]
+Type=simple
+# Hors de system.slice : le CPU de l'agent ne compte pas dans la PSI que surveille le garde de Control.
+Slice=polaris-probe.slice
+ExecStart=/opt/polaris/vtap/polaris-vtap --out-dir /var/lib/oiran/vtap --probe-id lab-vtap --rotate-seconds 300
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=no
+StandardError=append:/var/log/oiran/vtap.log
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

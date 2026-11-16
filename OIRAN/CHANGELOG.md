@@ -1,5 +1,14 @@
 # Changelog
 
+## polaris-vtap 2.21.5 — 2026-11-16 — l'agent ne meurt plus en silence (patch)
+
+Essai 3 (ANR2 #10, 19:19) : agent 2.21.4 disparu sans `VTAP_STOP` ; `.pcap.part` de 0 octet ; aucune paire fermée. Lancement en `&` depuis le shell de l'outil → SIGHUP de fin de session non géré (cause la plus probable ; aucune ligne OOM).
+- SIGHUP et SIGQUIT gérés comme SIGTERM : fichier fermé, manifeste écrit, `VTAP_STOP` avec le numéro du signal et `uptime_s`.
+- En-tête pcap vidé sur disque dès l'ouverture : plus de `.part` de 0 octet.
+- `VTAP_ALIVE` toutes les 60 s (uptime + compteurs) et vidage du tampon : la mort de l'agent est datable.
+- `deploy/polaris-vtap.service` : lancement en service systemd (`polaris-probe.slice`, hors de `system.slice`, donc hors de la PSI surveillée par Control), arrêt propre par `systemctl stop`. Plus jamais de `&`.
+- Preuve réelle (hôte de dev) : `kill -HUP` → `{"event":"VTAP_STOP","signal":1,…}`, paire `vtap_SBI_*.pcap` + `.pcap.vtap.json` présente, `.part` à 24 octets à l'ouverture. `cargo test --locked` : 15 passed.
+
 ## OIRAN API 2.21.8 — 2026-11-16 — tri frames intra-connexion TCP en ordre canonique (clôture OUVERT 2.21.2) (patch)
 
 Lot C.8 — enchaînement direct après 2.21.7. Clôt le dernier OUVERT `ts` dans `decoder-sbi`.
