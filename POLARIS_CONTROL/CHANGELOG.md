@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.36.14 — 2026-11-16 — Lancement d'appel UI explicite (patch)
+
+- Audit navigateur de la page Lab/Scénarios : le clic crée d'abord le grant live, puis envoie `POST /api/v1/scenarios/start` avec `scenario_definition_id: simple-voice-call` et les deux identifiants UE, dans cet ordre.
+- L'interface affiche désormais l'étape intermédiaire après création du grant, puis le `job_id` retourné ; une erreur indique si elle vient de l'autorisation ou du démarrage du scénario. Aucun échec silencieux.
+- Test de régression dédié au bouton « Lancer l’appel » : ordre grant → start, corps du start et affichage du `job_id`.
+- Écart de version fermé : `apps/simulator-control/package.json` était resté à `0.36.5` alors que Control progressait ; le paquet web est réaligné sur le patch `0.36.14`.
+
 ## 0.36.13 — 2026-11-16 — « Arrêter l'UE » libère le scénario (patch)
 
 - Cause prouvée par ANR2 (#10 6919471495) : `POST /ues/stop` arrêtait l'UE (handle nul, conteneur exited) sans annuler le job de scénario qui le portait ; le job restait `RUNNING/idle` dans `definition_jobs` → toute relance : 409 SCENARIO_CONFLICT (Sadok : « UE-05 se lance une fois, après arrêt on ne peut plus lancer »).

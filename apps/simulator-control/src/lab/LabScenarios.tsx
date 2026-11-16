@@ -8,7 +8,8 @@ import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Card, PageHeader } from '@/components/mockup';
 import { useUes } from '@/data/queries';
-import { useCreateScenarioDefinition, useScenarioDefinitions, useStartScenarioRun } from '@/data/scenarioApi';
+import { useCreateScenarioDefinition, useScenarioDefinitions } from '@/data/scenarioApi';
+import { polarisApi } from '@/data/polarisClient';
 import { useCreateLiveGrant } from '@/data/liveGrantApi';
 import type { WireScenarioDefinition, WireScenarioStep } from '@/scenarios/wireCodec';
 import { enterQuiet } from '@/data/quietMode';
@@ -73,7 +74,6 @@ export function LabScenariosPage() {
   const ues = useUes();
   const create = useCreateScenarioDefinition();
   const grant = useCreateLiveGrant();
-  const start = useStartScenarioRun();
   const [form, setForm] = useState<BuilderForm>(DEFAULT_FORM);
   const [msg, setMsg] = useState<string | null>(null);
   const [callA, setCallA] = useState('');
@@ -120,13 +120,22 @@ export function LabScenariosPage() {
     setCallBusy(true);
     setMsg(null);
     enterQuiet(90_000); // two UE starts + IMS + call: keep the API cgroup quiet
+    let phase = 'autorisation live';
     try {
       await grant.mutateAsync({ ue_ids: [callA, callB], duration_minutes: 15 });
-      const job = await start.mutateAsync({ scenario_definition_id: voiceDef.id, ue_ids: [callA, callB] });
+      phase = 'démarrage du scénario';
+      setMsg('Autorisation créée · lancement de l’appel…');
+      const job = await polarisApi<{ job_id: string; state: string }>('/scenarios/start', {
+        method: 'POST',
+        body: JSON.stringify({
+          scenario_definition_id: 'simple-voice-call',
+          ue_ids: [callA, callB],
+        }),
+      });
       setMsg(`Appel ${callA} → ${callB} lancé (job ${job.job_id}). Suivi : clique sur ${callA} ou ${callB}.`);
     } catch (error) {
       const e = error as { code?: string; message?: string; status?: number };
-      setMsg(`Appel refusé — ${reasonFr(e.code) || e.message}${e.status ? ` (HTTP ${e.status})` : ''}`);
+      setMsg(`Appel refusé pendant ${phase} — ${reasonFr(e.code) || e.message}${e.status ? ` (HTTP ${e.status})` : ''}`);
     } finally {
       setCallBusy(false);
     }

@@ -4,7 +4,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { LabUesPage, rowState } from './LabUes';
-import { DEFAULT_FORM, buildSteps, callScenarios, isListed, slugify } from './LabScenarios';
+import { DEFAULT_FORM, LabScenariosPage, buildSteps, callScenarios, isListed, slugify } from './LabScenarios';
 import { LabUeMonitorPage, lastRun, nextSamples, rrcView, toneFor } from './LabUeMonitor';
 import { needsTwoUes, stepsSummary } from './labShared';
 import type { WireScenarioDefinition } from '@/scenarios/wireCodec';
@@ -99,6 +99,71 @@ describe('LabUesPage run flow', () => {
     expect(JSON.parse(start!.body!)).toEqual({ scenario_definition_id: 'simple-data-ul-dl', ue_ids: ['UE-201'] });
     expect(screen.getByRole('link', { name: 'UE-201' }).getAttribute('href')).toBe('/lab/ues/UE-201');
     await waitFor(() => expect(calls.findIndex((c) => c.url.endsWith('/live/grant'))).toBeLessThan(calls.findIndex((c) => c.url.endsWith('/scenarios/start'))));
+  });
+});
+
+describe('LabScenariosPage voice call flow — 0.36.14', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('creates the two-UE grant, then starts simple-voice-call and exposes the job id', async () => {
+    const calls: Array<{ url: string; body?: string }> = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      calls.push({ url, body: init?.body as string | undefined });
+      if (url.endsWith('/ues')) return json(200, {
+        items: ['UE-05', 'UE-201'].map((id) => ({ id, subscription_status: 'VERIFIED', controller_owned: true, technology: '5G SA' })),
+      });
+      if (url.endsWith('/scenario-definitions')) return json(200, { items: [CALL], total: 1, schema_version: 2 });
+      if (url.endsWith('/live/grant')) return json(201, { id: 'grant-test', ue_ids: ['UE-05', 'UE-201'] });
+      if (url.endsWith('/scenarios/start')) return json(200, { job_id: 'simple-voice-call-test', state: 'RUNNING' });
+      return json(200, {});
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={['/lab/scenarios']}>
+          <Routes><Route path="/lab/scenarios" element={<LabScenariosPage />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.change(await screen.findByLabelText('Appelant'), { target: { value: 'UE-05' } });
+    fireEvent.change(screen.getByLabelText('Appelé'), { target: { value: 'UE-201' } });
+    fireEvent.click(screen.getByTestId('lab-call-run'));
+    expect(await screen.findByText(/simple-voice-call-test/)).toBeTruthy();
+    const grantIndex = calls.findIndex((call) => call.url.endsWith('/live/grant') && call.body);
+    const startIndex = calls.findIndex((call) => call.url.endsWith('/scenarios/start'));
+    expect(grantIndex).toBeGreaterThanOrEqual(0);
+    expect(startIndex).toBeGreaterThan(grantIndex);
+    expect(JSON.parse(calls[startIndex].body!)).toEqual({
+      scenario_definition_id: 'simple-voice-call',
+      ue_ids: ['UE-05', 'UE-201'],
+    });
+  });
+
+  it('shows the scenarios/start failure after the grant instead of failing silently', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/ues')) return json(200, {
+        items: ['UE-05', 'UE-201'].map((id) => ({ id, subscription_status: 'VERIFIED', controller_owned: true, technology: '5G SA' })),
+      });
+      if (url.endsWith('/scenario-definitions')) return json(200, { items: [CALL], total: 1, schema_version: 2 });
+      if (url.endsWith('/live/grant')) return json(201, { id: 'grant-test', ue_ids: ['UE-05', 'UE-201'] });
+      if (url.endsWith('/scenarios/start') && init?.method === 'POST') return json(503, { error: 'SCENARIO_START_UNAVAILABLE' });
+      return json(200, {});
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={['/lab/scenarios']}>
+          <Routes><Route path="/lab/scenarios" element={<LabScenariosPage />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.change(await screen.findByLabelText('Appelant'), { target: { value: 'UE-05' } });
+    fireEvent.change(screen.getByLabelText('Appelé'), { target: { value: 'UE-201' } });
+    fireEvent.click(screen.getByTestId('lab-call-run'));
+    expect(await screen.findByText(/Appel refusé pendant démarrage du scénario/)).toBeTruthy();
+    expect(screen.getByRole('status').textContent).toContain('SCENARIO_START_UNAVAILABLE');
   });
 });
 
