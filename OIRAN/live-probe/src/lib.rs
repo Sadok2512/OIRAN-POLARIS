@@ -5647,6 +5647,28 @@ impl CaptureManager {
         // skip. **JAMAIS de repli silencieux sur vprobe** (règle
         // Sadok 2.21.6 : « un garde qui se saute en silence ne
         // garde rien »).
+        // 2.21.7 — pour dédupliquer `VTAP_MANIFEST_MISSING` par
+        // `(path, size)` entre scans successifs, on charge le
+        // journal persistant `state.failed_ingestions` au tout
+        // début de la phase vTAP. `bump_failure` n'est appelé que
+        // si une entrée identique n'est PAS déjà dans le journal.
+        // Même sémantique que le journal d'échec dumpcap.
+        //
+        // Le fichier d'état vit à côté du dataset :
+        // `<base>/import_state.json`, où `<base>` est le parent de
+        // `dataset_dir`. Si `dataset_dir` n'a pas de parent, le
+        // journal est tenu en mémoire uniquement — rare, cas test.
+        let vtap_state_path: Option<PathBuf> = dataset_dir
+            .parent()
+            .map(|p| p.join("import_state.json"));
+        let mut vtap_state: ContinuousImportState = match &vtap_state_path {
+            Some(path) if path.is_file() => fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default(),
+            _ => ContinuousImportState::default(),
+        };
+        let mut vtap_state_dirty = false;
         for vtap_dir in vtap_out_dirs() {
             let vtap_pcaps = match crate::capture_source::VtapSource::ingestible_entries(&vtap_dir) {
                 Ok(v) => v,
@@ -5663,11 +5685,20 @@ impl CaptureManager {
                 }
             };
             for vtap_pcap in vtap_pcaps {
-                if fs::metadata(&vtap_pcap)
-                    .map(|m| m.len())
-                    .unwrap_or(0)
-                    <= 24
-                {
+                let vtap_size = fs::metadata(&vtap_pcap).map(|m| m.len()).unwrap_or(0);
+                if vtap_size <= 24 {
+                    // 2.21.7 — garde visible : un `.pcap` fermé mais
+                    // ne contenant que l'entête (24 o) est sauté
+                    // avec une trace structurée. Pas de skip silencieux.
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_VTAP_EMPTY_SKIPPED",
+                            "path": vtap_pcap.display().to_string(),
+                            "size_bytes": vtap_size,
+                            "reason": "pcap header only (≤ 24 bytes)",
+                        })
+                    );
                     continue;
                 }
                 // Lecture du manifeste — jamais de repli.
@@ -5675,16 +5706,41 @@ impl CaptureManager {
                     Ok(stamp) => stamp,
                     Err(e) => {
                         let msg = format!("{e}");
-                        let _ = self.update(CONTINUOUS_CAPTURE_ID, |job| {
-                            bump_failure(&mut job.metrics, &msg);
+                        let path_str = vtap_pcap.display().to_string();
+                        // 2.21.7 — dédup par `(path, size)` dans
+                        // `state.failed_ingestions` : un même fichier
+                        // qui reste sans manifeste à travers plusieurs
+                        // scans ne gonfle pas le compteur. Un
+                        // réessai qui aboutirait (manifeste posé entre
+                        // deux scans) sortirait du chemin d'erreur ici
+                        // et le fichier serait ingéré au scan suivant.
+                        let already_recorded = vtap_state.failed_ingestions.iter().any(|f| {
+                            f.source_path == path_str
+                                && f.source_size_bytes == Some(vtap_size)
+                                && f.error_code.starts_with(crate::capture_source::VTAP_MANIFEST_MISSING)
                         });
+                        if !already_recorded {
+                            let _ = self.update(CONTINUOUS_CAPTURE_ID, |job| {
+                                bump_failure(&mut job.metrics, &msg);
+                            });
+                            record_ingestion_failure_with_size(
+                                &mut vtap_state.failed_ingestions,
+                                path_str.clone(),
+                                Some(vtap_size),
+                                msg.clone(),
+                                epoch_ms(),
+                            );
+                            vtap_state_dirty = true;
+                        }
                         eprintln!(
                             "{}",
                             serde_json::json!({
                                 "event": "CONTINUOUS_VTAP_INGESTION_FAILED",
-                                "path": vtap_pcap.display().to_string(),
+                                "path": path_str,
+                                "size_bytes": vtap_size,
                                 "error_code": crate::capture_source::VTAP_MANIFEST_MISSING,
                                 "error": msg,
+                                "deduplicated": already_recorded,
                             })
                         );
                         continue;
@@ -5775,6 +5831,17 @@ impl CaptureManager {
                 }
                 checksums.insert(key.clone(), checksum);
                 reports.insert(key, report);
+            }
+        }
+        // 2.21.7 — persistance du journal mis à jour. On ne réécrit
+        // le fichier QUE si une nouvelle entrée a été ajoutée dans
+        // cette passe (évite une rotation stat inutile par cycle)
+        // ET si on dispose d'un chemin parent où l'écrire.
+        if vtap_state_dirty {
+            if let Some(path) = &vtap_state_path {
+                if let Ok(bytes) = serde_json::to_vec_pretty(&vtap_state) {
+                    let _ = atomic_write(path, &bytes);
+                }
             }
         }
         decoded_spool.flush().map_err(display_error)?;

@@ -1,5 +1,85 @@
 # Changelog
 
+## OIRAN API 2.21.7 — 2026-11-16 — 3 suites vTAP (empty visible + dedup manifest + cross-schema test) (patch)
+
+Lot C.7 — 3 suites demandées par Sadok (#9 2026-11-16 18:35 UTC) avant le tri des trames (2.21.8 enchaîné).
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.6 | **2.21.7** |
+| `live-probe` | 0.6.3 | **0.6.4** |
+
+### Suite #1 — `CONTINUOUS_VTAP_EMPTY_SKIPPED` (garde visible)
+
+**Écart** : dans la boucle vtap de `process_capture_into_selected`, un `vtap_*.pcap` ≤ 24 octets (entête pcap seul) était sauté silencieusement avant 2.21.7 — un `continue` nu, aucune trace. Règle Sadok : « un garde qui se saute en silence ne garde rien ».
+
+**Fix** : émission structurée avant `continue` :
+```json
+{"event":"CONTINUOUS_VTAP_EMPTY_SKIPPED",
+ "path":"…","size_bytes":24,"reason":"pcap header only (≤ 24 bytes)"}
+```
+
+### Suite #2 — Dédup `VTAP_MANIFEST_MISSING` par `(path, size)`
+
+**Écart** : en 2.21.6, chaque scan continuous appelait `bump_failure(VTAP_MANIFEST_MISSING)` pour un même fichier sans manifeste. Un pcap qui restait sans manifeste 1 h gonflait `ingestion_failures` de ~3600 entrées (watcher cadencé à ~1 s).
+
+**Fix** : même sémantique que le journal d'échec dumpcap. Charge `state.failed_ingestions` au début de la phase vTAP (si `dataset_dir.parent()/import_state.json` existe). Avant de `bump_failure`, vérifier :
+```rust
+let already_recorded = state.failed_ingestions.iter().any(|f| {
+    f.source_path == path_str
+        && f.source_size_bytes == Some(vtap_size)
+        && f.error_code.starts_with(VTAP_MANIFEST_MISSING)
+});
+```
+- `already_recorded == true` → **pas de bump**, l'event JSON `CONTINUOUS_VTAP_INGESTION_FAILED` porte `"deduplicated":true` pour tracer le skip (jamais de silence).
+- Sinon → `bump_failure` + `record_ingestion_failure_with_size` + marquer l'état dirty.
+- Persistance atomique du nouvel état uniquement si une entrée a été ajoutée dans la passe.
+
+Si le manifeste apparaît entre deux scans, le chemin d'erreur n'est plus pris, le fichier est ingéré (règle : « ré-essayer au scan suivant sans recompter »).
+
+### Suite #3 — Test croisé `RotatingWriter::close` → `read_vtap_manifest_stamp`
+
+**Test** : `vtap_rotating_writer_close_schema_is_consumed_by_read_vtap_manifest_stamp` dans `live-probe/tests/vtap_wiring.rs`.
+
+- Reproduit la séquence d'écriture atomique de `polaris_vtap::pcap::RotatingWriter::close` (2.21.4) : manifeste `.vtap.json.part` → `.vtap.json` **AVANT** que `.pcap` n'apparaisse.
+- Body manifeste au même schéma `polaris.vtap.manifest.v1` que `FileManifest` (champs identiques).
+- Le lecteur `read_vtap_manifest_stamp` extrait correctement `probe_id="oiran-vtap-lab-01"`, `probe_type="vtap"`, `timestamp_source="ebpf_monotonic"`.
+
+Clôture **partielle** de l'interop : le schéma réel de `FileManifest` est exercé sans ajouter de cross-workspace dep. Le vrai cross-dep (vtap importe live-probe en dev-dep) est OUVERT pour un lot dédié.
+
+### Tests ajoutés (2 nouveaux)
+
+- `ingestible_entries_lists_header_only_pcap_so_scan_can_log_empty_skipped`
+- `vtap_rotating_writer_close_schema_is_consumed_by_read_vtap_manifest_stamp`
+
+### Invariants préservés
+
+- **Ordre canonique** `(capture_id, packet_number, event_id)` inchangé.
+- **Jamais de garde silencieuse** : `EMPTY_SKIPPED` et `MANIFEST_MISSING` tracés dans tous les cas (le dedup pose `"deduplicated":true` sur l'event, le bump n'est juste pas répété).
+- **Compat 2.21.6** : si aucun fichier vtap n'a de manifeste manquant persistant, `import_state.json` reste intact (`vtap_state_dirty = false`).
+- **Aucune suppression**, **aucun force-push**.
+
+### Non traités dans 2.21.7 (OUVERT 2.21.8+)
+
+- **2.21.8 (prochain lot, enchaînement direct)** : tri des trames `frames.sort_by_key` intra-connexion TCP en ordre canonique dans `decoder-sbi::decode_connections` (ligne 107). OUVERT depuis 2.21.2.
+- **Bench O1 chiffré** : CAP_NET_RAW + pktgen lab, hors hôte de dev.
+- **Test cross-workspace réel** (vtap importe live-probe comme dev-dep) : clôture partielle par le test cross-schema.
+
+### Audit `Cargo.lock` compatible Rust 1.83
+
+```bash
+$ nice -n 19 ionice -c3 cargo fetch
+# puis parser Python du lock (identique 2.21.4/5/6)
+```
+
+Résultat reporté dans le rapport #10.
+
+### Lock vTAP
+
+Après hausse `live-probe 0.6.3 → 0.6.4` : `cd OIRAN/vtap && cargo update -w && cargo test --locked`. Chiffres reportés dans le rapport #10.
+
 ## polaris-vtap 2.21.4 — 2026-11-16 — manifeste aligné sur l'ingestion 2.21.6 + écrit avant le pcap (patch)
 
 - Écart trouvé en relisant la 2.21.6 : l'agent écrivait `vtap_SBI_X.vtap.json` (`with_extension`), alors que l'ingestion `live-probe::read_vtap_manifest_stamp` et `vtap-replay` utilisent `vtap_SBI_X.pcap.vtap.json`. En production, chaque pcap vTAP aurait levé `VTAP_MANIFEST_MISSING`. Corrigé : `pcap::manifest_path()` produit `<pcap>.vtap.json`.

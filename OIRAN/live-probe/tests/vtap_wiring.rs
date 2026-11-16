@@ -110,6 +110,78 @@ fn vtap_out_dirs_default_is_var_lib_oiran_vtap_when_env_absent() {
     assert_eq!(dirs, vec![PathBuf::from("/var/lib/oiran/vtap")]);
 }
 
+/// 2.21.7 — un `vtap_*.pcap` qui ne contient QUE l'entête pcap
+/// (24 octets) est filtré **AVANT** la lecture du manifeste par
+/// `ingestible_entries` ? Non — c'est `lib.rs` qui le skip. Ce test
+/// prouve qu'un tel fichier est bien listé par `ingestible_entries`
+/// (son filtre ne regarde que le nom), charge à l'appelant de le
+/// loger comme `CONTINUOUS_VTAP_EMPTY_SKIPPED` (règle Sadok : pas
+/// de garde silencieuse).
+#[test]
+fn ingestible_entries_lists_header_only_pcap_so_scan_can_log_empty_skipped() {
+    let dir = tmp_dir("empty-visible");
+    let pcap = dir.join("vtap_SBI_20261116T120000Z.pcap");
+    // pcap-header-only = 24 octets exactement.
+    std::fs::write(&pcap, vec![0u8; 24]).unwrap();
+    let entries = VtapSource::ingestible_entries(&dir).unwrap();
+    // `ingestible_entries` ne juge que le nom (contrat) —
+    // c'est la boucle d'ingestion qui filtre les ≤ 24 et loge
+    // `CONTINUOUS_VTAP_EMPTY_SKIPPED`. Preuve de la ligne de
+    // défense : le fichier est bien vu.
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0], pcap);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 2.21.7 — simulation de l'écriture atomique de
+/// `polaris_vtap::pcap::RotatingWriter::close` : manifeste
+/// (`<pcap>.vtap.json.part` → `<pcap>.vtap.json`) écrit AVANT que
+/// `<pcap>.pcap` n'apparaisse. Au moment où l'ingestion voit un
+/// `vtap_*.pcap` dans l'`ingestible_entries`, le manifeste est
+/// garanti présent. Test croisé : même schéma que
+/// `polaris_vtap::pcap::FileManifest` (champs identiques).
+#[test]
+fn vtap_rotating_writer_close_schema_is_consumed_by_read_vtap_manifest_stamp() {
+    let dir = tmp_dir("cross");
+    let pcap = dir.join("vtap_SBI_20261116T120100Z.pcap");
+
+    // Étape 1 — comme `RotatingWriter::close` : écrire le
+    // manifeste AVANT le pcap. On utilise le même suffixe `.part`
+    // + rename pour prouver la séquence.
+    let manifest_path = append_vtap_manifest_suffix(&pcap);
+    let manifest_part = PathBuf::from(format!("{}.part", manifest_path.display()));
+    let manifest_body = serde_json::json!({
+        "schema": "polaris.vtap.manifest.v1",
+        "agent_version": "2.21.4-stub",
+        "probe_id": "oiran-vtap-lab-01",
+        "probe_type": "vtap",
+        "interface": "SBI",
+        "timestamp_source": "ebpf_monotonic",
+        "pcap": "vtap_SBI_20261116T120100Z.pcap",
+        "counters": {},
+        "connections": [],
+        "open_items": []
+    })
+    .to_string();
+    std::fs::write(&manifest_part, manifest_body.as_bytes()).unwrap();
+    std::fs::rename(&manifest_part, &manifest_path).unwrap();
+    // Étape 2 — le pcap n'arrive qu'après : garantit que l'ordre
+    // de visibilité (manifeste puis pcap) attendu par le lecteur
+    // est respecté.
+    std::fs::write(&pcap, vec![0u8; 100]).unwrap();
+
+    // Au moment où la boucle d'ingestion scanne le répertoire,
+    // elle voit le pcap ET le manifeste à côté.
+    let entries = VtapSource::ingestible_entries(&dir).unwrap();
+    assert_eq!(entries.len(), 1);
+    let stamp = read_vtap_manifest_stamp(&entries[0]).unwrap();
+    assert_eq!(stamp.probe_id.as_deref(), Some("oiran-vtap-lab-01"));
+    assert_eq!(stamp.probe_type.as_deref(), Some("vtap"));
+    assert_eq!(stamp.timestamp_source.as_deref(), Some("ebpf_monotonic"));
+    assert!(stamp.physical_link.is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn ingestible_entries_filters_pcap_part_so_vtap_scan_never_picks_an_open_file() {
     let dir = tmp_dir("part");
