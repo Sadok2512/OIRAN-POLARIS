@@ -1,5 +1,56 @@
 # Changelog
 
+## OIRAN API 2.21.0 — 2026-11-16 — P1b vTAP : agent eBPF libssl → pcap SBI en clair + source `vtap` (minor)
+
+Branche `feat/oiran-2.21.0-vtap` (base 2.20.1 @ 7b13119). Rend le SBI TLS visible sans clé : uprobes libssl dans les NF Open5GS, HTTP/2 en clair rejoué en pcap TCP lu **sans changement** par `transport-tcp` + `decoder-sbi`.
+
+### Composants et versions
+
+| Composant | Avant | Après | Type |
+|---|---|---|---|
+| oiran-api | 2.20.1 | 2.21.0 | minor |
+| polaris-vtap (nouveau, `OIRAN/vtap`, workspace autonome) | — | 2.21.0 | nouveau |
+| live-probe | 0.5.14 | 0.6.0 | minor (2.20.0 et 2.20.1 ne l'avaient pas incrémenté : écart de versionnage corrigé ici) |
+| event-schema | 1.7.0 | 1.8.0 | minor |
+| oiran-decode | 0.7.6 | 0.8.0 | minor |
+
+### Agent `polaris-vtap` (`OIRAN/vtap`)
+
+- `bpf/vtap.bpf.c` : uprobes/uretprobes `SSL_write`, `SSL_read`, `SSL_write_ex`, `SSL_read_ex`, uprobe `SSL_set_fd` ; tracepoints `sys_enter_{write,writev,sendto,sendmsg,read,readv,recvfrom,recvmsg}` pour attribuer le fd du socket pendant un appel SSL actif (cas libcurl/BIO sans `SSL_set_fd`). Ringbuf de 16 MiB, chunks de 16 KiB (8 au plus par appel, au-delà flag `truncated`). Compteurs PERCPU (`ringbuf_full`, `truncated`, `fd_unknown`). Autonome : ni libbpf-dev ni vmlinux.h.
+- Chargeur aya (feature `ebpf`) : découvre la libssl via `/proc/<pid>/maps` des processus `open5gs-*`, dédoublonne par (dev, inode), échoue en `VTAP_NO_TARGET` / `VTAP_ATTACH_FAILED` plutôt que de tourner à vide.
+- Résolution fd → 4-tuple via `/proc/<tgid>/fd` + `/proc/<tgid>/net/tcp` (netns du conteneur), avec un cache par `(tgid, fd, inode)` (fd réutilisé = nouvelle connexion ; fd fermé = tuple de la dernière connexion de ce fd).
+- Synthèse TCP : SYN/SYN-ACK/ACK synthétiques, seq/ack cohérents dans les deux sens, segments ≤ 16 KiB, checksums IPv4/TCP valides, ISN déterministe (rejeu bit-identique). **Déduplication par sens** : une connexion entre deux NF est vue en `SSL_write` et en `SSL_read`, et chaque sens est verrouillé sur la première source observée (`dedup_dropped_records`).
+- Pcap nanoseconde LINKTYPE_ETHERNET, rotation atomique `.pcap.part` → `.pcap`, plus un manifeste `.vtap.json` par fichier (connexions, source par sens, `hpack_context`, compteurs, `open_items`). Aucune identité ni charge utile dans les logs ou manifestes.
+- `vtap-replay` : rejeu hors ligne JSONL → pcap (recette, debug).
+
+### Source `vtap` (multi-sonde)
+
+- `CaptureSourceKind::Vtap` (`engine = "vtap"`, alias `ebpf_tls`) → `probe_type = "vtap"`. `VtapSource` (`timestamp_source = "ebpf_monotonic"`, `is_ingestible` refuse les `.pcap.part`). **Non câblée** dans le watcher continu, comme `PcapRotatingSource` : le câblage se fera avec le wiring 2.20.2.
+- `polaris.toml` : champ `out_dir` (requis pour vtap → `MissingField`), `probe_type` contrôlé contre le moteur (`ProbeTypeMismatch`, y compris `pcap_rotating` + `phy`).
+- `event-schema::ProbeStamp` + `NormalizedEvent::to_json_with_probe` : `probe_id` / `probe_type` / `physical_link` / `timestamp_source` apposés à la sérialisation. Un stamp vide donne une sortie bit-identique à `to_json()`.
+- `oiran-decode` : `write_jsonl_stamped` + flags CLI `--probe-id`, `--probe-type vprobe|phy|vtap`, `--timestamp-source`.
+
+### Revue 2.20.0 / 2.20.1 (corrigé ici)
+
+- `PolarisConfig::resolve_path` : une variable `POLARIS_CONFIG` pointant vers un fichier absent retombait **en silence** sur `/etc/polaris.toml` (ou `Ok(None)`). C'est désormais une erreur `Io` visible. Le test 2.20.0 qui figeait ce repli (et dépendait de l'absence de /etc/polaris.toml sur l'hôte) est remplacé.
+- `live-probe` non incrémenté en 2.20.0 et en 2.20.1 : il passe à 0.6.0.
+
+### Preuves (commandes)
+
+- `cd OIRAN/vtap && nice -n 19 ionice -c3 cargo test -j 2` → 12 tests unitaires + 3 tests d'intégration verts (`vtap_pcap_is_decoded_as_sbi_by_unchanged_decoder`, `mid_stream_connection_is_declared_open_in_manifest`, `every_event_from_vtap_pcap_is_stamped_probe_type_vtap`).
+- `cd OIRAN && nice -n 19 ionice -c3 cargo test -j 2 -p event-schema -p live-probe -p oiran-api -p oiran-decode` → tout vert sauf 2 tests oiran-api (`packet_dissect_resolves_…`, `clear_identity_routes_…`) en 501 parce que `tshark` est absent de l'hôte de build. Cela relève de l'environnement, sans lien avec ce lot : **OUVERT, à rejouer sur le lab**.
+- Test eBPF réel (hôte de build, noyau 6.18, OpenSSL 3, curl HTTP/2 sur TLS, port 7777) : `polaris-vtap --libssl /lib/x86_64-linux-gnu/libssl.so.3 --comm-prefix curl` donne 8 records, 430 octets, 1 connexion `preface_seen`, `open_items` vide. Puis `oiran-decode … --interface SBI --probe-type vtap` donne `tcp_connections=1 tcp_errors=0 http2_frames=11 sbi_transactions=2`, 2 events `nnrf-disc` GET → 200, `probe_type=vtap`.
+- Bug trouvé et corrigé par ce test réel : le code de retour `int` de `SSL_read` était lu sur 64 bits (`rax`), si bien que `-1` (EAGAIN) devenait 4294967295 et produisait de faux octets et de fausses troncatures. Corrigé : `(int)RC(ctx)`.
+
+### OUVERT (déclaré, jamais masqué)
+
+- HPACK `mid_stream` : les NF Open5GS doivent être redémarrées APRÈS le lancement de l'agent (log `VTAP_START.open_item`, manifeste, `open_items`).
+- HPACK entre fichiers rotatés : même limite que le chemin dumpcap.
+- IPv6 non supporté (`unsupported_family`) ; pas de FIN synthétique ; x86_64 uniquement.
+- `decoder-sbi` trie ses events par `timestamp` (`decoder-sbi/src/lib.rs` `decode_connections`) : contraire à la règle d'ordre canonique `(capture_id, seq)`. `decode_capture` re-trie bien de façon canonique, mais le chemin streaming hérite de l'ordre `ts`. **OUVERT**, non modifié dans ce lot.
+- `decoder-sbi` écrit `probe_id = "local-vprobe"` en dur : le stamp de sérialisation le remplace, mais l'objet en mémoire le garde.
+- Recette lab : TLS SBI Open5GS + redémarrage des NF, à faire avec l'accord de Sadok et APRÈS la recette SBI 2.18.12.
+
 ## OIRAN API 2.20.1 — 2026-11-16 — Phase 1 (C.2) : LiveInterfaceSource (AF_PACKET TPACKET_V3) + commit_seq + bench O1 (patch)
 
 Phase 1 lot C.2 validé Sadok sur #10. Publication incrémentale `commit_seq` + source live AF_PACKET TPACKET_V3 + PACKET_FANOUT (non câblée dans le pipeline actif, rotation horaire conservée) + bench O1 scaffold. Design doc enrichi du projet PHASE P8 « Performance TCP ».

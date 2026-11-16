@@ -592,6 +592,18 @@ fn diameter_frame_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
 }
 
 pub fn write_jsonl(path: &Path, events: &[NormalizedEvent], append: bool) -> Result<(), String> {
+    write_jsonl_stamped(path, events, append, &event_schema::ProbeStamp::default())
+}
+
+/// 0.8.0 (POLARIS 2.21.0) — comme `write_jsonl`, avec l'identité de sonde
+/// apposée sur CHAQUE event (ex. `probe_type = "vtap"` pour les pcap de
+/// l'agent `polaris-vtap`). Stamp vide → sortie identique à `write_jsonl`.
+pub fn write_jsonl_stamped(
+    path: &Path,
+    events: &[NormalizedEvent],
+    append: bool,
+    stamp: &event_schema::ProbeStamp,
+) -> Result<(), String> {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -601,7 +613,7 @@ pub fn write_jsonl(path: &Path, events: &[NormalizedEvent], append: bool) -> Res
         .map_err(|error| format!("open {}: {error}", path.display()))?;
     let mut writer = std::io::BufWriter::new(file);
     for event in events {
-        writeln!(writer, "{}", event.to_json()).map_err(|error| error.to_string())?;
+        writeln!(writer, "{}", event.to_json_with_probe(stamp)).map_err(|error| error.to_string())?;
     }
     writer.flush().map_err(|error| error.to_string())
 }

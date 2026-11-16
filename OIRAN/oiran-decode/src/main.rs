@@ -1,8 +1,8 @@
-use oiran_decode::{decode_capture, write_jsonl, DecodeConfig};
+use oiran_decode::{decode_capture, write_jsonl_stamped, DecodeConfig};
 use std::{collections::HashMap, env, process};
 
 fn usage() {
-    eprintln!("usage: oiran-decode --input FILE --capture-id sha256:HEX --interface N2|N3|N4|SBI|S1-MME|S1-U|S11 --output FILE [--append] [--endpoint IP=FUNCTION]...");
+    eprintln!("usage: oiran-decode --input FILE --capture-id sha256:HEX --interface N2|N3|N4|SBI|S1-MME|S1-U|S11 --output FILE [--append] [--endpoint IP=FUNCTION]... [--probe-id ID] [--probe-type vprobe|phy|vtap] [--timestamp-source SRC]");
 }
 fn main() {
     if let Err(e) = execute() {
@@ -18,6 +18,7 @@ fn execute() -> Result<(), String> {
     let mut output = None;
     let mut append = false;
     let mut endpoints = HashMap::new();
+    let mut stamp = event_schema::ProbeStamp::default();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--append" {
@@ -34,6 +35,15 @@ fn execute() -> Result<(), String> {
             "--capture-id" => capture_id = Some(args[i + 1].clone()),
             "--interface" => interface = Some(args[i + 1].clone()),
             "--output" => output = Some(args[i + 1].clone()),
+            "--probe-id" => stamp.probe_id = Some(args[i + 1].clone()),
+            "--probe-type" => {
+                let v = args[i + 1].clone();
+                if !matches!(v.as_str(), "vprobe" | "phy" | "vtap") {
+                    return Err(format!("--probe-type must be vprobe|phy|vtap, got {v}"));
+                }
+                stamp.probe_type = Some(v);
+            }
+            "--timestamp-source" => stamp.timestamp_source = Some(args[i + 1].clone()),
             "--endpoint" => {
                 let (ip, nf) = args[i + 1]
                     .split_once('=')
@@ -60,7 +70,7 @@ fn execute() -> Result<(), String> {
         interface,
         endpoints,
     })?;
-    write_jsonl(std::path::Path::new(&output), &decoded.events, append)?;
+    write_jsonl_stamped(std::path::Path::new(&output), &decoded.events, append, &stamp)?;
     println!("capture_format={} packets={} events={} warnings={} transport_errors={} sctp_errors={} incomplete_sctp={} tcp_connections={} tcp_errors={} http2_frames={} http2_streams={} sbi_transactions={} output={}", decoded.report.capture_format, decoded.report.packets, decoded.report.events, decoded.report.warnings, decoded.report.transport_errors, decoded.report.sctp_errors, decoded.report.incomplete_sctp, decoded.report.tcp_connections, decoded.report.tcp_errors, decoded.report.http2_frames, decoded.report.http2_streams, decoded.report.sbi_transactions, output);
     Ok(())
 }

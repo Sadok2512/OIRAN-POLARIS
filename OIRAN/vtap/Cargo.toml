@@ -1,0 +1,38 @@
+[package]
+name = "polaris-vtap"
+version = "2.21.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+description = "POLARIS vTAP — agent eBPF (uprobes libssl) qui rejoue le HTTP/2 SBI en clair sous forme de pcap TCP"
+
+# Workspace autonome : l'agent eBPF (aya) ne doit pas toucher au Cargo.lock
+# du workspace OIRAN ni à sa build. Les crates OIRAN ne servent qu'en
+# dev-dependencies (preuve hors ligne : pcap vTAP → oiran-decode → SBI).
+[workspace]
+
+[features]
+default = []
+# Active le chargeur eBPF (aya) et le binaire `polaris-vtap`.
+# Requiert clang (cible bpf) au build et CAP_BPF/CAP_PERFMON au run.
+ebpf = ["dep:aya"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+libc = "0.2"
+aya = { version = "0.13", optional = true }
+
+[dev-dependencies]
+hpack = "0.3.0"
+oiran-decode = { path = "../oiran-decode" }
+event-schema = { path = "../event-schema" }
+
+[[bin]]
+name = "polaris-vtap"
+path = "src/bin/polaris-vtap.rs"
+required-features = ["ebpf"]
+
+[[bin]]
+name = "vtap-replay"
+path = "src/bin/vtap-replay.rs"

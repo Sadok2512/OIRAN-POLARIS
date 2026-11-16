@@ -256,6 +256,16 @@ pub struct SbiMetadata {
     pub transaction_duration_ns: Option<u64>,
 }
 
+/// 1.8.0 (POLARIS 2.21.0) — identité de la sonde source apposée à la
+/// sérialisation (`probe_id`, `probe_type` vprobe|phy|vtap, …).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProbeStamp {
+    pub probe_id: Option<String>,
+    pub probe_type: Option<String>,
+    pub physical_link: Option<String>,
+    pub timestamp_source: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NormalizedEvent {
     pub event_id: String,
@@ -327,6 +337,15 @@ impl NormalizedEvent {
             && !self.raw_payload_reference.is_empty()
     }
     pub fn to_json(&self) -> String {
+        self.to_json_with_probe(&ProbeStamp::default())
+    }
+
+    /// 1.8.0 (POLARIS 2.21.0) — sérialise en ajoutant, juste après
+    /// `probe_id`, les champs multi-sonde lus par `session-engine`
+    /// (`probe_type`, `timestamp_source`, `physical_link`). Un stamp vide
+    /// produit une sortie bit-identique à `to_json()` ; `probe_id` n'est
+    /// remplacé que s'il est fourni.
+    pub fn to_json_with_probe(&self, stamp: &ProbeStamp) -> String {
         // 1.5.1 — serialisation compacte : omet les champs optionnels à null
         // et les tableaux [] vides sans perte d'information. Voir SCHEMA_VERSION.
         let packets = self
@@ -378,7 +397,19 @@ impl NormalizedEvent {
         if let Some(parent) = self.parent_event_id.as_deref() {
             parts.push(format!("\"parent_event_id\":\"{}\"", escape(parent)));
         }
-        parts.push(format!("\"probe_id\":\"{}\"", escape(&self.probe_id)));
+        parts.push(format!(
+            "\"probe_id\":\"{}\"",
+            escape(stamp.probe_id.as_deref().unwrap_or(&self.probe_id))
+        ));
+        if let Some(v) = stamp.probe_type.as_deref() {
+            parts.push(format!("\"probe_type\":\"{}\"", escape(v)));
+        }
+        if let Some(v) = stamp.physical_link.as_deref() {
+            parts.push(format!("\"physical_link\":\"{}\"", escape(v)));
+        }
+        if let Some(v) = stamp.timestamp_source.as_deref() {
+            parts.push(format!("\"timestamp_source\":\"{}\"", escape(v)));
+        }
         parts.push(format!("\"capture_point_id\":\"{}\"", escape(&self.capture_point_id)));
         parts.push(format!("\"capture_id\":\"{}\"", escape(&self.capture_id)));
         parts.push(format!("\"packet_references\":[{}]", packets));
@@ -1755,4 +1786,21 @@ mod tests {
             assert_eq!(resolved, std::path::PathBuf::from(PseudonymKey::DEFAULT_KEY_PATH));
         }
     }
+
+    /// 1.8.0 — stamp vide : bit-identique à `to_json()` ; stamp vtap :
+    /// `probe_type`/`timestamp_source` présents, `probe_id` remplacé.
+    #[test]
+    fn to_json_with_probe_is_identical_when_empty_and_stamps_vtap() {
+        let event = event();
+        assert_eq!(event.to_json(), event.to_json_with_probe(&ProbeStamp::default()));
+        let stamped = event.to_json_with_probe(&ProbeStamp {
+            probe_id: Some("lab-vtap".into()),
+            probe_type: Some("vtap".into()),
+            physical_link: None,
+            timestamp_source: Some("ebpf_monotonic".into()),
+        });
+        assert!(stamped.contains("\"probe_id\":\"lab-vtap\",\"probe_type\":\"vtap\",\"timestamp_source\":\"ebpf_monotonic\""), "{stamped}");
+        assert!(!stamped.contains("physical_link"));
+    }
+
 }

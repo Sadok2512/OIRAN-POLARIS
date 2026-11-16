@@ -48,6 +48,10 @@ pub enum CaptureSourceKind {
     AfXdp,
     /// DPDK UIO/VFIO 400 Gbit/s (prévu, hors scope PHASE 1).
     Dpdk,
+    /// 2.21.0 (P1b) — vTAP eBPF : uprobes libssl dans les NF, HTTP/2
+    /// SBI en clair rejoué en pcap TCP par l'agent `polaris-vtap`
+    /// (`OIRAN/vtap`). Sonde logicielle : ni vProbe bridge ni phy.
+    Vtap,
 }
 
 impl CaptureSourceKind {
@@ -60,6 +64,7 @@ impl CaptureSourceKind {
             "live_pcap" | "live_interface" | "af_packet" => Some(Self::LiveInterface),
             "af_xdp" | "xdp" => Some(Self::AfXdp),
             "dpdk" => Some(Self::Dpdk),
+            "vtap" | "ebpf_tls" => Some(Self::Vtap),
             _ => None,
         }
     }
@@ -70,6 +75,7 @@ impl CaptureSourceKind {
             Self::LiveInterface => "live_interface",
             Self::AfXdp => "af_xdp",
             Self::Dpdk => "dpdk",
+            Self::Vtap => "vtap",
         }
     }
 
@@ -80,6 +86,7 @@ impl CaptureSourceKind {
         match self {
             Self::PcapRotating | Self::LiveInterface => "vprobe",
             Self::AfXdp | Self::Dpdk => "phy",
+            Self::Vtap => "vtap",
         }
     }
 }
@@ -584,6 +591,68 @@ impl CaptureSource for LiveInterfaceSource {
     }
 }
 
+/// 2.21.0 (P1b) — source vTAP. L'agent `polaris-vtap` écrit des pcap
+/// fermés atomiquement (`.pcap.part` → `.pcap`) + manifeste
+/// `.vtap.json` dans `out_dir`, consommés comme une rotation. Chaque
+/// event issu de cette source porte `probe_type = "vtap"` et
+/// `timestamp_source = "ebpf_monotonic"`. **Non câblée** dans le
+/// watcher continu (même statut que `PcapRotatingSource`) : câblage
+/// effectif avec le wiring 2.20.2 de `LiveInterfaceSource`.
+pub struct VtapSource {
+    id: String,
+    probe_id: String,
+    spec: CaptureInterface,
+    out_dir: PathBuf,
+}
+
+impl VtapSource {
+    /// Horodatage : `bpf_ktime_get_ns` + offset REALTIME au démarrage.
+    pub const TIMESTAMP_SOURCE: &'static str = "ebpf_monotonic";
+
+    pub fn new(probe_id: impl Into<String>, spec: CaptureInterface, out_dir: impl Into<PathBuf>) -> Self {
+        let probe_id = probe_id.into();
+        let id = format!("{}:{}", probe_id, spec.interface);
+        Self {
+            id,
+            probe_id,
+            spec,
+            out_dir: out_dir.into(),
+        }
+    }
+
+    pub fn out_dir(&self) -> &PathBuf {
+        &self.out_dir
+    }
+
+    /// Fichiers prêts à l'ingestion : `.pcap` fermés uniquement, jamais
+    /// le `.pcap.part` en cours d'écriture (invariant 2.19.x).
+    pub fn is_ingestible(path: &std::path::Path) -> bool {
+        path.extension().map(|e| e == "pcap").unwrap_or(false)
+            && path
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with("vtap_"))
+                .unwrap_or(false)
+    }
+}
+
+impl CaptureSource for VtapSource {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn spec(&self) -> &CaptureInterface {
+        &self.spec
+    }
+    fn kind(&self) -> CaptureSourceKind {
+        CaptureSourceKind::Vtap
+    }
+    fn timestamp_source(&self) -> &str {
+        Self::TIMESTAMP_SOURCE
+    }
+    fn probe_id(&self) -> &str {
+        &self.probe_id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,5 +891,28 @@ mod tests {
         );
         let result = src.packet_statistics_v3();
         assert!(result.is_err());
+    }
+
+    /// 2.21.0 — moteur `vtap` : parse, round-trip, probe_type `vtap`.
+    #[test]
+    fn vtap_kind_parses_and_reports_probe_type_vtap() {
+        assert_eq!(CaptureSourceKind::parse("vtap"), Some(CaptureSourceKind::Vtap));
+        assert_eq!(CaptureSourceKind::parse("EBPF_TLS"), Some(CaptureSourceKind::Vtap));
+        assert_eq!(CaptureSourceKind::Vtap.as_str(), "vtap");
+        assert_eq!(CaptureSourceKind::Vtap.probe_type(), "vtap");
+    }
+
+    #[test]
+    fn vtap_source_fills_fields_and_never_ingests_part_files() {
+        let src = VtapSource::new("lab-vtap", spec("SBI", "vtap"), "/var/lib/oiran/vtap");
+        assert_eq!(src.id(), "lab-vtap:SBI");
+        assert_eq!(src.kind(), CaptureSourceKind::Vtap);
+        assert_eq!(src.timestamp_source(), "ebpf_monotonic");
+        assert!(src.physical_link().is_none());
+        use std::path::Path;
+        assert!(VtapSource::is_ingestible(Path::new("/x/vtap_SBI_20261116T150000Z.pcap")));
+        assert!(!VtapSource::is_ingestible(Path::new("/x/vtap_SBI_20261116T150000Z.pcap.part")));
+        assert!(!VtapSource::is_ingestible(Path::new("/x/vtap_SBI_20261116T150000Z.vtap.json")));
+        assert!(!VtapSource::is_ingestible(Path::new("/x/SBI_00001.pcap")));
     }
 }

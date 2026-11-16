@@ -66,6 +66,10 @@ pub struct ProbeConfig {
     pub probe_type: Option<String>,
     #[serde(default)]
     pub rotation_dir: Option<PathBuf>,
+    /// 2.21.0 — `engine = "vtap"` uniquement : répertoire où l'agent
+    /// `polaris-vtap` dépose `vtap_SBI_*.pcap` + `.vtap.json`.
+    #[serde(default)]
+    pub out_dir: Option<PathBuf>,
     #[serde(default)]
     pub interfaces: Vec<ProbeInterfaceConfig>,
 }
@@ -98,6 +102,12 @@ pub enum PolarisConfigError {
     Parse(toml::de::Error, PathBuf),
     DuplicateProbeId(String),
     UnknownEngine { probe_id: String, engine: String },
+    /// 2.21.0 — `probe_type` déclaré incohérent avec le moteur (ex.
+    /// `engine = "vtap"` + `probe_type = "phy"`) : refus, pas de
+    /// correction silencieuse.
+    ProbeTypeMismatch { probe_id: String, declared: String, expected: String },
+    /// 2.21.0 — champ requis par le moteur absent (`out_dir` pour vtap).
+    MissingField { probe_id: String, field: &'static str },
 }
 
 impl std::fmt::Display for PolarisConfigError {
@@ -111,8 +121,16 @@ impl std::fmt::Display for PolarisConfigError {
             Self::UnknownEngine { probe_id, engine } => write!(
                 f,
                 "polaris.toml: probe `{probe_id}` has unknown engine `{engine}` \
-                 (must be pcap_rotating|live_pcap|af_xdp|dpdk)"
+                 (must be pcap_rotating|live_pcap|af_xdp|dpdk|vtap)"
             ),
+            Self::ProbeTypeMismatch { probe_id, declared, expected } => write!(
+                f,
+                "polaris.toml: probe `{probe_id}` declares probe_type `{declared}` \
+                 but its engine implies `{expected}`"
+            ),
+            Self::MissingField { probe_id, field } => {
+                write!(f, "polaris.toml: probe `{probe_id}` requires `{field}`")
+            }
         }
     }
 }
@@ -125,10 +143,11 @@ impl PolarisConfig {
     pub fn resolve_path(env_value: Option<&str>) -> Option<PathBuf> {
         if let Some(path) = env_value {
             if !path.is_empty() {
-                let p = PathBuf::from(path);
-                if p.exists() {
-                    return Some(p);
-                }
+                // 2.21.0 (revue) : une variable explicite pointant vers un
+                // fichier absent n'est PLUS remplacée en silence par
+                // /etc/polaris.toml — le chemin est rendu tel quel et
+                // `load_from_file` échoue en `Io` (garde visible).
+                return Some(PathBuf::from(path));
             }
         }
         let default = PathBuf::from(DEFAULT_CONFIG_PATH);
@@ -172,10 +191,26 @@ impl PolarisConfig {
             if !seen.insert(probe.id.clone()) {
                 return Err(PolarisConfigError::DuplicateProbeId(probe.id.clone()));
             }
-            if live_probe::capture_source::CaptureSourceKind::parse(&probe.engine).is_none() {
+            let Some(kind) = live_probe::capture_source::CaptureSourceKind::parse(&probe.engine)
+            else {
                 return Err(PolarisConfigError::UnknownEngine {
                     probe_id: probe.id.clone(),
                     engine: probe.engine.clone(),
+                });
+            };
+            if let Some(declared) = probe.probe_type.as_deref() {
+                if declared != kind.probe_type() {
+                    return Err(PolarisConfigError::ProbeTypeMismatch {
+                        probe_id: probe.id.clone(),
+                        declared: declared.to_string(),
+                        expected: kind.probe_type().to_string(),
+                    });
+                }
+            }
+            if kind == live_probe::capture_source::CaptureSourceKind::Vtap && probe.out_dir.is_none() {
+                return Err(PolarisConfigError::MissingField {
+                    probe_id: probe.id.clone(),
+                    field: "out_dir",
                 });
             }
         }
@@ -279,19 +314,48 @@ engine = "magic_pipe"
         }
     }
 
-    /// 2.20.0 — `load_default()` renvoie `Ok(None)` quand aucun
-    /// fichier n'est présent : aucun crash, aucun log, chemin
-    /// iso-comportement.
+    /// 2.21.0 (revue) — une variable `POLARIS_CONFIG` explicite vers un
+    /// fichier absent est une ERREUR visible, jamais un repli silencieux
+    /// sur `/etc/polaris.toml` ni un `Ok(None)`. (Remplace le test 2.20.0
+    /// qui figeait ce repli et dépendait de l'absence de /etc/polaris.toml.)
     #[test]
-    fn load_default_returns_none_when_no_file_exists() {
-        // Isole env à cette thread.
-        std::env::remove_var(CONFIG_ENV_VAR);
-        // Garantit l'absence : var vide pointe vers un chemin
-        // volontairement improbable.
-        std::env::set_var(CONFIG_ENV_VAR, "/no/such/polaris/config/for/test");
-        let result = PolarisConfig::load_default();
-        std::env::remove_var(CONFIG_ENV_VAR);
-        assert!(matches!(result, Ok(None)));
+    fn explicit_env_path_to_missing_file_is_an_error_not_a_silent_fallback() {
+        assert_eq!(
+            PolarisConfig::resolve_path(Some("/no/such/polaris/config/for/test")),
+            Some(PathBuf::from("/no/such/polaris/config/for/test"))
+        );
+        let err = PolarisConfig::load_from_file(Path::new("/no/such/polaris/config/for/test"))
+            .unwrap_err();
+        assert!(matches!(err, PolarisConfigError::Io(..)), "{err}");
+    }
+
+    #[test]
+    fn vtap_probe_requires_out_dir_and_coherent_probe_type() {
+        let ok = r#"
+[[probes]]
+id = "lab-vtap"
+engine = "vtap"
+probe_type = "vtap"
+out_dir = "/var/lib/oiran/vtap"
+interfaces = [ { label = "SBI", device = "vtap", decoder = "sbi" } ]
+"#;
+        let config = PolarisConfig::load_from_str(ok, &tmp_path("vtap-ok")).expect("vtap ok");
+        assert_eq!(config.probes[0].out_dir.as_deref(), Some(Path::new("/var/lib/oiran/vtap")));
+        let missing = "[[probes]]\nid = \"v\"\nengine = \"vtap\"\n";
+        assert!(matches!(
+            PolarisConfig::load_from_str(missing, &tmp_path("vtap-missing")),
+            Err(PolarisConfigError::MissingField { field: "out_dir", .. })
+        ));
+        let mismatch = "[[probes]]\nid = \"v\"\nengine = \"vtap\"\nprobe_type = \"phy\"\nout_dir = \"/x\"\n";
+        assert!(matches!(
+            PolarisConfig::load_from_str(mismatch, &tmp_path("vtap-mismatch")),
+            Err(PolarisConfigError::ProbeTypeMismatch { .. })
+        ));
+        let pcap_phy = "[[probes]]\nid = \"p\"\nengine = \"pcap_rotating\"\nprobe_type = \"phy\"\n";
+        assert!(matches!(
+            PolarisConfig::load_from_str(pcap_phy, &tmp_path("pcap-phy")),
+            Err(PolarisConfigError::ProbeTypeMismatch { .. })
+        ));
     }
 
     /// 2.20.0 — chaque engine valide listé par `CaptureSourceKind`
@@ -308,12 +372,14 @@ engine = "magic_pipe"
             "af_xdp",
             "xdp",
             "dpdk",
+            "vtap",
         ] {
             let text = format!(
                 r#"
 [[probes]]
 id = "p"
 engine = "{engine}"
+out_dir = "/tmp/vtap"
 "#
             );
             PolarisConfig::load_from_str(&text, &tmp_path(&format!("engine-{engine}")))
