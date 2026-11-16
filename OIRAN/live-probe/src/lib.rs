@@ -2177,6 +2177,20 @@ impl CaptureManager {
         serde_json::from_slice(&fs::read(path).ok()?).ok()
     }
 
+    /// 2.18.12 — signature (taille, mtime ns) du fichier callflow d'une
+    /// session : permet aux caches de l'API de ne relire / re-parser le
+    /// JSON que s'il a changé (un `stat`, pas une lecture).
+    pub fn callflow_file_signature(&self, dataset_id: &str, session_id: &str) -> Option<(u64, u128)> {
+        let meta = fs::metadata(self.callflow_path(dataset_id, session_id)?).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        Some((meta.len(), mtime))
+    }
+
     fn callflow_path(&self, dataset_id: &str, session_id: &str) -> Option<PathBuf> {
         if !safe_identifier(session_id) {
             return None;

@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.18.12 — 2026-11-16 — Audit perf : cause racine de la lourdeur (patch)
+
+Cause racine (audit code, Sadok « l'app est lourde ») : plusieurs routes relisaient et re-parsaient depuis le disque le call flow JSON de TOUTES les sessions à chaque requête.
+- `queryable_flows` (appelé par `/sessions`, `/sessions/filter`, `/sessions/:id`, `/subscribers…`) clonait tous les call flows statiques et relisait tous les fichiers callflow continuous + exports LTE, uniquement pour construire l'index de parcours abonné → ouvrir UNE session parsait les ~190 call flows. Index désormais en cache par instance (`cached_journey_index`), reconstruit seulement si la signature change (sessions + taille/mtime de chaque fichier callflow : un `stat`, aucune lecture).
+- `refresh_session_filter_index` était appelée à CHAQUE page de `POST /sessions/filter` (la liste p900 en charge 2) et relisait tous les call flows : reconstruction seulement si la même signature change.
+- `GET /sessions` et `POST /sessions/filter` : la ligne d'une session continuous (lecture + parse du call flow, patch à la lecture, identités tirées des events) est en cache par fichier callflow (`cached_live_list_row`) ; parcours abonné et vault recalculés à chaque requête (ils évoluent sans que le fichier change). Pas de mise en cache pendant la construction de l'index du patch.
+- Test `filter_index_cache_is_invalidated_when_a_session_is_added` (session ajoutée après un premier appel → visible).
+
 ## OIRAN API 2.18.11 — 2026-11-16 — SBI réellement rattaché + MSISDN/IMEI depuis le SBI réel (patch)
 
 - Constat ANR2 (#10, run UE-201) : 28 SBI pendant la session, 4 portant le pseudonyme exact, 0 rattaché ; MSISDN/IMEI absents.

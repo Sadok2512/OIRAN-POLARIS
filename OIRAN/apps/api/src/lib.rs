@@ -134,6 +134,11 @@ struct Inner {
     /// Verrouillé par `RwLock` : lecteurs multiples (handlers HTTP)
     /// + rare upsert sous `write`.
     session_filter_index: std::sync::RwLock<session_filters::SessionFilterIndex>,
+    /// 2.18.12 — signature des sources de l'index de filtrage (rebuild
+    /// seulement si elle change) et index de parcours abonné en cache.
+    session_filter_signature: std::sync::Mutex<Option<Vec<String>>>,
+    journey_index_cache: std::sync::Mutex<JourneyCache>,
+    list_row_cache: std::sync::Mutex<ListRowCache>,
 }
 
 #[derive(Clone, Debug)]
@@ -692,6 +697,9 @@ impl AppState {
                 compact_index_registry: Arc::new(read_time_patch::CompactJsonlIndexRegistry::new(
                     read_time_patch_counters.clone(),
                 )),
+                session_filter_signature: std::sync::Mutex::new(None),
+                journey_index_cache: std::sync::Mutex::new(None),
+                list_row_cache: std::sync::Mutex::new(ListRowCache::new()),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -772,6 +780,9 @@ impl AppState {
                 reference_dataset_root: None,
                 raw_index_cache,
                 compact_index_registry,
+                session_filter_signature: std::sync::Mutex::new(None),
+                journey_index_cache: std::sync::Mutex::new(None),
+                list_row_cache: std::sync::Mutex::new(ListRowCache::new()),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -786,6 +797,16 @@ impl AppState {
     /// dataset publié par le `CaptureManager` (continuous +
     /// derived). Appelé à chaque rafraîchissement opérationnel.
     fn refresh_session_filter_index(&self) {
+        // 2.18.12 (audit perf) — appelée à CHAQUE page de
+        // POST /sessions/filter : relisait et re-parsait tous les call
+        // flows (+ exports LTE) à chaque fois. Reconstruction seulement si
+        // la signature (sessions + taille/mtime des fichiers) a changé.
+        let signature = journey_signature(self);
+        if let Ok(last) = self.inner.session_filter_signature.lock() {
+            if last.as_ref() == Some(&signature) {
+                return;
+            }
+        }
         let mut index = session_filters::SessionFilterIndex::empty();
         for flow in self.inner.flows.values() {
             index.upsert_flow(flow);
@@ -828,6 +849,9 @@ impl AppState {
                     }
                 }
             }
+        }
+        if let Ok(mut last) = self.inner.session_filter_signature.lock() {
+            *last = Some(signature);
         }
         if let Ok(mut guard) = self.inner.session_filter_index.write() {
             *guard = index;
@@ -3235,6 +3259,57 @@ fn lte_session_summary(manifest: &LteDatasetManifest, session: &LteSession) -> V
     })
 }
 
+/// 2.18.12 — CAUSE RACINE de la lenteur (audit perf Sadok) : chaque
+/// requête `/sessions`, `/sessions/filter`, `/sessions/:id`, `/subscribers…`
+/// appelait `queryable_flows`, qui CLONE tous les call flows statiques et
+/// RELIT + RE-PARSE depuis le disque le JSON de TOUTES les sessions
+/// continuous (et l'export de toutes les sessions LTE), uniquement pour
+/// construire l'index de parcours abonné. Ouvrir une session = parser les
+/// 190 call flows. L'index est désormais mis en cache et reconstruit
+/// seulement si la signature change (sessions ajoutées, fichier callflow
+/// modifié : un `stat` par fichier, aucune lecture).
+fn journey_signature(state: &AppState) -> Vec<String> {
+    let mut signature = vec![format!("static:{}", state.inner.flows.len())];
+    for dataset in state.inner.capture_manager.datasets() {
+        for session_id in &dataset.session_ids {
+            let file = state
+                .inner
+                .capture_manager
+                .callflow_file_signature(&dataset.dataset_id, session_id)
+                .map(|(len, mtime)| format!("{len}:{mtime}"))
+                .unwrap_or_default();
+            signature.push(format!("{}/{}:{}", dataset.dataset_id, session_id, file));
+        }
+    }
+    if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
+        for manifest in catalog {
+            signature.push(format!("lte:{}:{}", manifest.run_id, manifest.session_ids.len()));
+        }
+    }
+    signature
+}
+
+type ListRowCache =
+    std::collections::HashMap<(String, String), ((u64, u128), Value, Value)>;
+type JourneyCache = Option<(Vec<String>, std::sync::Arc<subscriber_journey::JourneyIndex>)>;
+
+fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::JourneyIndex> {
+    let signature = journey_signature(state);
+    if let Ok(cache) = state.inner.journey_index_cache.lock() {
+        if let Some((cached, index)) = cache.as_ref() {
+            if *cached == signature {
+                return index.clone();
+            }
+        }
+    }
+    let flows = queryable_flows(state);
+    let index = std::sync::Arc::new(subscriber_journey::JourneyIndex::from_flows(flows.values()));
+    if let Ok(mut cache) = state.inner.journey_index_cache.lock() {
+        *cache = Some((signature, index.clone()));
+    }
+    index
+}
+
 fn queryable_flows(state: &AppState) -> BTreeMap<String, CallFlow> {
     let mut flows = state.inner.flows.clone();
     for dataset in state.inner.capture_manager.datasets() {
@@ -3339,8 +3414,7 @@ fn decorate_subscriber_summary(
 }
 
 async fn subscribers(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
-    let flows = queryable_flows(&state);
-    let index = subscriber_journey::JourneyIndex::from_flows(flows.values());
+    let index = cached_journey_index(&state);
     let mut rows = serde_json::to_value(index.subscribers())
         .unwrap_or_else(|_| Value::Array(Vec::new()))
         .as_array()
@@ -3386,8 +3460,7 @@ async fn subscriber_journey(State(state): State<AppState>, Path(pseudo): Path<St
 }
 
 async fn subscriber_tmsi(State(state): State<AppState>, Path(pseudo): Path<String>) -> Response {
-    let flows = queryable_flows(&state);
-    let index = subscriber_journey::JourneyIndex::from_flows(flows.values());
+    let index = cached_journey_index(&state);
     if index.sessions(&pseudo).is_empty() {
         return api_error(
             StatusCode::NOT_FOUND,
@@ -3399,9 +3472,179 @@ async fn subscriber_tmsi(State(state): State<AppState>, Path(pseudo): Path<Strin
         .into_response()
 }
 
+/// 2.18.12 — calcul (coûteux) d'une ligne de liste continuous : résumé +
+/// patch à la lecture + identités tirées des events (repli + SBI). Le
+/// booléen indique si le résultat peut être mis en cache (patch appliqué
+/// ou non applicable — pas pendant la construction de l'index).
+fn live_list_row(
+    state: &AppState,
+    dataset: &live_probe::LiveDataset,
+    session_id: &str,
+    flow: &CallFlow,
+) -> (Value, Value, bool) {
+    let state = state.clone();
+    let mut summary = live_session_summary(dataset, flow);
+    // 2.14.8 (ANR1 #10) — patcher à la lecture sur le chemin B
+    // (continuous / derived / recovered). On sérialise les
+    // events, on patch via le raw JSONL du dataset_root,
+    // puis on recalcule serving_node/serving_ran_node/
+    // core_node depuis les participants patchés.
+    let patched_items: Option<Vec<Value>> = if let Some(dataset_root) = state
+        .inner
+        .capture_manager
+        .dataset_root(&dataset.dataset_id)
+    {
+        if let Ok(serde_json::Value::Array(mut items)) =
+            serde_json::to_value(&flow.events)
+        {
+            let status =
+                apply_read_time_patch(&state, &mut items, &dataset_root, session_id);
+            if matches!(status, read_time_patch::PatchStatus::Applied) {
+                let (serving_node, serving_ran_node, core_node) =
+                    read_time_patch::recompute_session_participants(&items);
+                if let Some(object) = summary.as_object_mut() {
+                    object.insert("serving_node".into(), Value::String(serving_node));
+                    object.insert(
+                        "serving_ran_node".into(),
+                        Value::String(serving_ran_node),
+                    );
+                    object.insert("core_node".into(), Value::String(core_node));
+                }
+            }
+            if let Some(label) = status.label() {
+                if let Some(object) = summary.as_object_mut() {
+                    object.insert(
+                        "read_time_patch".into(),
+                        json!({
+                            "status": label,
+                            "version": read_time_patch::PATCH_VERSION,
+                        }),
+                    );
+                }
+            }
+            Some(items)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut events_identities = patched_items
+        .as_deref()
+        .and_then(read_time_patch::extract_identity_summary_from_items)
+        .unwrap_or(Value::Null);
+    merge_sbi_identities(&mut events_identities, &flow.events);
+    let cacheable = !summary["read_time_patch"]["status"]
+        .as_str()
+        .is_some_and(|status| status.to_ascii_lowercase().contains("build"));
+    (summary, events_identities, cacheable)
+}
+
+/// 2.18.12 — complète une shape d'identités du vault avec les valeurs
+/// tirées des events (MSISDN/IMEI SBI…) quand le vault ne les a pas.
+fn fill_missing_identities(identities: &mut Value, fallback: &Value) {
+    let (Some(target), Some(source)) = (identities.as_object_mut(), fallback.as_object()) else {
+        return;
+    };
+    for (key, value) in source {
+        let missing = target.get(key).map_or(true, |current| {
+            current.is_null() || current.as_array().is_some_and(Vec::is_empty)
+        });
+        if missing && !value.is_null() {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn decorate_subscriber_summary_by_id(
+    summary: &mut Value,
+    session_id: &str,
+    index: &subscriber_journey::JourneyIndex,
+) {
+    let Some(pseudo) = index.subscriber_for_session(session_id) else {
+        return;
+    };
+    let sessions = index.sessions(pseudo);
+    let Some(position) = sessions.iter().position(|session| session.session_id == session_id) else {
+        return;
+    };
+    summary["subscriber_pseudonym"] = Value::String(pseudo.to_owned());
+    summary["ue_pseudonym"] = Value::String(pseudo.to_owned());
+    summary["subscriber_session_count"] = Value::from(sessions.len());
+    summary["previous_session_id"] = position
+        .checked_sub(1)
+        .and_then(|index| sessions.get(index))
+        .map(|session| Value::String(session.session_id.clone()))
+        .unwrap_or(Value::Null);
+    summary["next_session_id"] = sessions
+        .get(position + 1)
+        .map(|session| Value::String(session.session_id.clone()))
+        .unwrap_or(Value::Null);
+}
+
+/// 2.18.12 — ligne de liste d'une session continuous, avec cache par
+/// fichier callflow (voir `live_list_row`). Partagée par `GET /sessions`
+/// et `POST /sessions/filter`.
+fn cached_live_list_row(
+    state: &AppState,
+    dataset: &live_probe::LiveDataset,
+    session_id: &String,
+    journey_index: &subscriber_journey::JourneyIndex,
+) -> Option<Value> {
+    // 2.18.12 (audit perf) — la ligne de liste d'une session
+    // continuous (lecture + parse du call flow, patch à la lecture,
+    // identités tirées des events) est mise en cache, invalidée par
+    // la signature du fichier callflow. Seuls le parcours abonné et
+    // le vault (qui évoluent sans que le fichier change) sont
+    // recalculés à chaque requête.
+    let key = (dataset.dataset_id.clone(), session_id.clone());
+    let signature = state
+        .inner
+        .capture_manager
+        .callflow_file_signature(&dataset.dataset_id, session_id);
+    let cached = signature.and_then(|signature| {
+        state.inner.list_row_cache.lock().ok().and_then(|cache| {
+            cache
+                .get(&key)
+                .filter(|entry| entry.0 == signature)
+                .map(|entry| (entry.1.clone(), entry.2.clone()))
+        })
+    });
+    let (mut summary, events_identities) = if let Some(hit) = cached {
+        hit
+    } else {
+        let Some(flow) = state
+            .inner
+            .capture_manager
+            .callflow(&dataset.dataset_id, session_id)
+        else {
+            return None;
+        };
+        let (summary, events_identities, cacheable) =
+            live_list_row(state, dataset, session_id, &flow);
+        if let (Some(signature), true) = (signature, cacheable) {
+            if let Ok(mut cache) = state.inner.list_row_cache.lock() {
+                cache.insert(key, (signature, summary.clone(), events_identities.clone()));
+            }
+        }
+        (summary, events_identities)
+    };
+    decorate_subscriber_summary_by_id(&mut summary, session_id, &journey_index);
+    if let Some(object) = summary.as_object_mut() {
+        let mut identities = identity_summary_for_session(&state, session_id);
+        if identities.is_null() {
+            schedule_identity_hydration(&state, session_id);
+            identities = events_identities;
+        } else {
+            fill_missing_identities(&mut identities, &events_identities);
+        }
+        object.insert("identities".into(), identities);
+    }
+    Some(summary)
+}
+
 async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
-    let journey_flows = queryable_flows(&state);
-    let journey_index = subscriber_journey::JourneyIndex::from_flows(journey_flows.values());
+    let journey_index = cached_journey_index(&state);
     let mut unique = state
         .inner
         .flows
@@ -3422,90 +3665,11 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
         .collect::<BTreeMap<_, _>>();
     for dataset in state.inner.capture_manager.datasets() {
         for session_id in &dataset.session_ids {
-            if let Some(flow) = state
-                .inner
-                .capture_manager
-                .callflow(&dataset.dataset_id, session_id)
-            {
-                let mut summary = live_session_summary(&dataset, &flow);
-                // 2.14.8 (ANR1 #10) — patcher à la lecture sur le chemin B
-                // (continuous / derived / recovered). On sérialise les
-                // events, on patch via le raw JSONL du dataset_root,
-                // puis on recalcule serving_node/serving_ran_node/
-                // core_node depuis les participants patchés.
-                let patched_items: Option<Vec<Value>> = if let Some(dataset_root) = state
-                    .inner
-                    .capture_manager
-                    .dataset_root(&dataset.dataset_id)
-                {
-                    if let Ok(serde_json::Value::Array(mut items)) =
-                        serde_json::to_value(&flow.events)
-                    {
-                        let status =
-                            apply_read_time_patch(&state, &mut items, &dataset_root, session_id);
-                        if matches!(status, read_time_patch::PatchStatus::Applied) {
-                            let (serving_node, serving_ran_node, core_node) =
-                                read_time_patch::recompute_session_participants(&items);
-                            if let Some(object) = summary.as_object_mut() {
-                                object.insert("serving_node".into(), Value::String(serving_node));
-                                object.insert(
-                                    "serving_ran_node".into(),
-                                    Value::String(serving_ran_node),
-                                );
-                                object.insert("core_node".into(), Value::String(core_node));
-                            }
-                        }
-                        if let Some(label) = status.label() {
-                            if let Some(object) = summary.as_object_mut() {
-                                object.insert(
-                                    "read_time_patch".into(),
-                                    json!({
-                                        "status": label,
-                                        "version": read_time_patch::PATCH_VERSION,
-                                    }),
-                                );
-                            }
-                        }
-                        Some(items)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                decorate_subscriber_summary(&mut summary, &flow, &journey_index);
-                // 2.15.0 (ANR1 #10 6883006379) — identités compactes.
-                // 2.15.2 (ANR1 #10 6885876387, D3) — en prod le vault
-                // est vide pour les sessions continuous (hydrate_identities
-                // n'est déclenché que par la route /sessions/:id/identities,
-                // jamais au boot), ce qui faisait retourner `null` à la
-                // liste /api/v1/sessions. Fallback : extraire une shape
-                // d'identités compacte (subscriber_pseudonym +
-                // GUTI/TMSI/IMEI pseudonymisés) depuis les events déjà
-                // patchés. Respect règle Sadok 2026-11-14 : aucun
-                // clear-text IMSI/SUPI par ce chemin (pas de pcap/tshark
-                // disponible en lecture ; seul `tshark_identities` câble
-                // D4).
-                if let Some(object) = summary.as_object_mut() {
-                    let mut identities = identity_summary_for_session(&state, session_id);
-                    if identities.is_null() {
-                        // 2.15.3 — remplir le vault en arrière-plan pour que
-                        // la liste affiche IMSI/TMSI/IMEI sans ouvrir la
-                        // session (au rafraîchissement suivant).
-                        schedule_identity_hydration(&state, session_id);
-                        if let Some(items) = patched_items.as_deref() {
-                            if let Some(fallback) =
-                                read_time_patch::extract_identity_summary_from_items(items)
-                            {
-                                identities = fallback;
-                            }
-                        }
-                    }
-                    merge_sbi_identities(&mut identities, &flow.events);
-                    object.insert("identities".into(), identities);
-                }
-                unique.insert(session_id.clone(), summary);
-            }
+            let Some(summary) = cached_live_list_row(&state, &dataset, session_id, &journey_index)
+            else {
+                continue;
+            };
+            unique.insert(session_id.clone(), summary);
         }
     }
     if let Ok(catalog) = state.inner.lte_evidence_store.catalog() {
@@ -3697,8 +3861,7 @@ async fn sessions_filter(
         );
     }
     state.refresh_session_filter_index();
-    let journey_flows = queryable_flows(&state);
-    let journey_index = subscriber_journey::JourneyIndex::from_flows(journey_flows.values());
+    let journey_index = cached_journey_index(&state);
 
     let messages: Vec<(Option<String>, String)> = request
         .messages
@@ -3839,14 +4002,9 @@ async fn sessions_filter(
             if !page_set.contains(session_id.as_str()) {
                 continue;
             }
-            if let Some(flow) = state
-                .inner
-                .capture_manager
-                .callflow(&dataset.dataset_id, session_id)
+            if let Some(summary) =
+                cached_live_list_row(&state, &dataset, session_id, &journey_index)
             {
-                let mut summary = live_session_summary(&dataset, &flow);
-                decorate_subscriber_summary(&mut summary, &flow, &journey_index);
-                insert_list_identities(&state, &mut summary, session_id, Some(&flow.events));
                 items_by_id.insert(session_id.clone(), summary);
             }
         }
@@ -3907,8 +4065,7 @@ async fn sessions_filter(
 }
 
 async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let journey_flows = queryable_flows(&state);
-    let journey_index = subscriber_journey::JourneyIndex::from_flows(journey_flows.values());
+    let journey_index = cached_journey_index(&state);
     if let Some(flow) = flow_for(&state, &id) {
         let mut summary = session_summary(&state, flow);
         decorate_subscriber_summary(&mut summary, flow, &journey_index);
@@ -10499,6 +10656,37 @@ mod tests {
         ));
         assert!(tshark_prefs_contain_null_decipher("nas-5gs.null_decipher: TRUE\n"));
         assert!(!tshark_prefs_contain_null_decipher("#nas-eps.null_decipher: FALSE\n"));
+    }
+
+    /// 2.18.12 — l'index de filtrage n'est plus reconstruit à chaque page,
+    /// mais une session ajoutée APRÈS un premier appel doit apparaître
+    /// (signature invalidée).
+    #[tokio::test]
+    async fn filter_index_cache_is_invalidated_when_a_session_is_added() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let state = AppState::load(test_config(workspace, "filter-cache-invalidation")).unwrap();
+        let (status, before) = post_sessions_filter(&state, json!({"limit": 100}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let before_total = before["meta"]["total"].as_u64().unwrap();
+        let signature_before = journey_signature(&state);
+        let (_status, again) = post_sessions_filter(&state, json!({"limit": 100}), None).await;
+        assert_eq!(again["meta"]["total"].as_u64().unwrap(), before_total);
+        let bundle = temporary_directory("filter-cache-invalidation-bundle");
+        let (_dataset_id, lte_session_id) = ingest_lte_evidence_fixture(&state, &bundle);
+        assert_ne!(journey_signature(&state), signature_before);
+        let (_status, after) = post_sessions_filter(&state, json!({"limit": 100}), None).await;
+        let ids: Vec<&str> = after["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["session_id"].as_str())
+            .collect();
+        assert!(ids.contains(&lte_session_id.as_str()), "new LTE session missing after cache");
+        assert!(after["meta"]["total"].as_u64().unwrap() > before_total);
     }
 
     /// 2.18.5 — ANR2 #10 6901691533 : p900 lit /sessions/filter, qui
