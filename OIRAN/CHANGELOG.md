@@ -1,5 +1,11 @@
 # Changelog
 
+## OIRAN API 2.18.9 — 2026-11-16 — Participants LTE résolus par rôle d'interface (patch)
+
+- Constat Sadok (ladder d'une session LTE : une seule colonne « Unknown endpoint ») : les sessions du LTE evidence store n'ont pas de JSONL raw, le patch IP/port ne peut rien résoudre.
+- `fill_unknown_participants_by_interface` (routes `/events` et `/callflow`, toutes sources) : un participant « Unknown endpoint » est remplacé par le rôle que l'interface impose (S1-MME eNB↔MME, S1-U eNB↔SGW-U, S11 MME↔SGW-C, S5-C/S5-U, Sxa SGW-C↔SGW-U, Sxb PGW-C↔PGW-U, S6a, N2, N3, N4), orienté par la direction publiée ou, pour un NAS sans direction, par le sens normatif du message (TS 24.301/24.501). Direction inconnue et message non classé → inchangé. Provenance `participant_source = "interface_roles"`. Un participant déjà connu n'est jamais écrasé.
+- Test `unknown_lte_participants_resolve_from_interface_and_direction`.
+
 ## OIRAN API 2.18.8 — 2026-11-16 — PFCP de nœud hors des sessions + NAS 5GS NEA0 (patch)
 
 - Constat Sadok (ladder d'une session rempli de « PFCP Heartbeat Request/Response ») : les messages PFCP de NŒUD (Heartbeat, Association, Node Report, PFD Management, Version Not Supported — TS 29.244 §7.4) ne sont plus jamais rattachés comme siblings ni utilisés comme clé (`pfcp_sequence` de nœud). Test `pfcp_heartbeat_sharing_the_sequence_is_never_pulled_into_a_session`.

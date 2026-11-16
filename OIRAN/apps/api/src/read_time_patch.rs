@@ -2815,3 +2815,137 @@ mod pfcp_index_memory_probe {
         eprintln!("pfcp_index_entries={}", index.entries());
     }
 }
+
+/// 2.18.9 — dernier recours pour les participants restés « Unknown
+/// endpoint » (constat Sadok : ladder LTE d'une seule colonne « Unknown
+/// endpoint » ; sessions du LTE evidence store sans JSONL raw → aucun
+/// patch IP/port possible). On ne devine rien au-delà de ce que
+/// l'interface 3GPP impose : chaque interface relie exactement deux
+/// rôles (TS 23.401 / 23.501), et la direction déjà publiée
+/// (`RAN_TO_CORE`, `CORE_TO_RAN`, `UPLINK`, `DOWNLINK`, `REQUEST`,
+/// `RESPONSE`) — ou, pour un NAS sans direction, le sens normatif du
+/// message (TS 24.301 / 24.501) — dit lequel est la source. Direction
+/// inconnue et message non classé → on laisse « Unknown endpoint ».
+/// Retourne le nombre d'events résolus.
+pub fn fill_unknown_participants_by_interface(events: &mut [Value]) -> usize {
+    let mut resolved = 0;
+    for event in events.iter_mut() {
+        let unknown = |key: &str| {
+            event
+                .get(key)
+                .and_then(Value::as_str)
+                .map_or(true, |value| value.is_empty() || value == "Unknown endpoint")
+        };
+        if !(unknown("source_participant") || unknown("destination_participant")) {
+            continue;
+        }
+        let interface = event.get("interface").and_then(Value::as_str).unwrap_or("").to_ascii_uppercase();
+        let Some((ran_side, core_side)) = interface_roles(&interface) else {
+            continue;
+        };
+        let direction = event.get("direction").and_then(Value::as_str).unwrap_or("").to_ascii_uppercase();
+        let message = event.get("message_name").and_then(Value::as_str).unwrap_or("");
+        let from_ran = match direction.as_str() {
+            "RAN_TO_CORE" | "UPLINK" | "UE_TO_NETWORK" => Some(true),
+            "CORE_TO_RAN" | "DOWNLINK" | "NETWORK_TO_UE" => Some(false),
+            _ => nas_message_is_uplink(message),
+        };
+        let Some(from_ran) = from_ran else { continue };
+        let (source, destination) = if from_ran { (ran_side, core_side) } else { (core_side, ran_side) };
+        let Some(object) = event.as_object_mut() else { continue };
+        let mut changed = false;
+        for (key, value) in [("source_participant", source), ("destination_participant", destination)] {
+            let is_unknown = object
+                .get(key)
+                .and_then(Value::as_str)
+                .map_or(true, |current| current.is_empty() || current == "Unknown endpoint");
+            if is_unknown {
+                object.insert(key.into(), Value::String(value.into()));
+                changed = true;
+            }
+        }
+        if changed {
+            object.insert(
+                "participant_source".into(),
+                Value::String("interface_roles".into()),
+            );
+            resolved += 1;
+        }
+    }
+    resolved
+}
+
+/// (côté « RAN / amont », côté « cœur / aval ») de chaque interface.
+fn interface_roles(interface: &str) -> Option<(&'static str, &'static str)> {
+    Some(match interface {
+        "S1-MME" | "S1MME" | "S1AP" => ("eNB", "MME"),
+        "S1-U" | "S1U" => ("eNB", "SGW-U"),
+        "S11" => ("MME", "SGW-C"),
+        "S5-C" | "S5C" | "S5/S8-C" => ("SGW-C", "PGW-C"),
+        "S5-U" | "S5U" => ("SGW-U", "PGW-U"),
+        "SXA" => ("SGW-C", "SGW-U"),
+        "SXB" => ("PGW-C", "PGW-U"),
+        "S6A" => ("MME", "HSS"),
+        "N2" => ("gNB", "AMF"),
+        "N3" => ("gNB", "UPF"),
+        "N4" => ("SMF", "UPF"),
+        _ => return None,
+    })
+}
+
+/// Sens normatif d'un message NAS sans direction publiée : `Some(true)`
+/// = UE → réseau, `Some(false)` = réseau → UE, `None` = non classé.
+fn nas_message_is_uplink(message: &str) -> Option<bool> {
+    let name = message.to_ascii_lowercase();
+    const UPLINK: &[&str] = &[
+        "attach request", "attach complete", "authentication response", "authentication failure",
+        "security mode complete", "security mode reject", "identity response", "detach request",
+        "tracking area update request", "tracking area update complete", "service request",
+        "registration request", "registration complete", "esm information response",
+        "pdn connectivity request", "ul nas transport", "uplink nas transport",
+        "activate default eps bearer context accept", "pdu session establishment request",
+        "initialuemessage", "initial ue message",
+    ];
+    const DOWNLINK: &[&str] = &[
+        "attach accept", "attach reject", "authentication request", "authentication reject",
+        "security mode command", "identity request", "detach accept", "tracking area update accept",
+        "service reject", "registration accept", "registration reject", "esm information request",
+        "activate default eps bearer context request", "dl nas transport", "downlink nas transport",
+        "emm information", "configuration update command", "pdu session establishment accept",
+    ];
+    if DOWNLINK.iter().any(|needle| name.contains(needle)) {
+        Some(false)
+    } else if UPLINK.iter().any(|needle| name.contains(needle)) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod interface_roles_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unknown_lte_participants_resolve_from_interface_and_direction() {
+        let mut events = vec![
+            json!({"interface":"S1-MME","direction":"RAN_TO_CORE","message_name":"InitialUEMessage · Attach Request","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint"}),
+            json!({"interface":"S1-MME","direction":"UNKNOWN","message_name":"Authentication Request","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint"}),
+            json!({"interface":"S1-MME","direction":"UNKNOWN","message_name":"Security Mode Complete","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint"}),
+            json!({"interface":"S1-MME","direction":"UNKNOWN","message_name":"UnknownS1APProcedure","source_participant":"Unknown endpoint","destination_participant":"Unknown endpoint"}),
+            json!({"interface":"S11","direction":"CORE_TO_RAN","message_name":"Create Session Response","source_participant":"Unknown endpoint","destination_participant":"MME"}),
+            json!({"interface":"N2","direction":"RAN_TO_CORE","message_name":"x","source_participant":"gNB 10.0.0.1","destination_participant":"AMF"}),
+        ];
+        assert_eq!(fill_unknown_participants_by_interface(&mut events), 4);
+        assert_eq!((events[0]["source_participant"].as_str(), events[0]["destination_participant"].as_str()), (Some("eNB"), Some("MME")));
+        assert_eq!((events[1]["source_participant"].as_str(), events[1]["destination_participant"].as_str()), (Some("MME"), Some("eNB")));
+        assert_eq!(events[2]["source_participant"], "eNB");
+        // message non classé, direction inconnue → rien deviné
+        assert_eq!(events[3]["source_participant"], "Unknown endpoint");
+        // participant déjà connu conservé
+        assert_eq!(events[4]["source_participant"], "SGW-C");
+        assert_eq!(events[4]["destination_participant"], "MME");
+        assert_eq!(events[5]["source_participant"], "gNB 10.0.0.1");
+    }
+}

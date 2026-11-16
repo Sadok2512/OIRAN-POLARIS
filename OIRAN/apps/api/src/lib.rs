@@ -4965,6 +4965,7 @@ async fn session_events(
     if let Some(root) = dataset_root.as_deref() {
         let _ = read_time_patch::extend_items_with_pfcp_siblings_from_jsonl(&mut items, root);
     }
+    read_time_patch::fill_unknown_participants_by_interface(&mut items);
     filter_events(&mut items, &query);
     sanitize_all(&mut items);
     paginated_with_patch_status(items, &query, patch_status).into_response()
@@ -5118,6 +5119,9 @@ async fn session_callflow(
                 ) {
                     let _ = read_time_patch::insert_pfcp_siblings_into_callflow(events, root);
                 }
+            }
+            if let Some(events) = value.get_mut("events").and_then(Value::as_array_mut) {
+                read_time_patch::fill_unknown_participants_by_interface(events);
             }
             sanitize_value(&mut value);
             ok(value).into_response()
