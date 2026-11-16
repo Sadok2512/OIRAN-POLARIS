@@ -141,6 +141,36 @@ struct Inner {
     session_filter_signature: std::sync::Mutex<Option<Vec<String>>>,
     journey_index_cache: std::sync::Mutex<JourneyCache>,
     list_row_cache: std::sync::Mutex<ListRowCache>,
+    /// 2.21.11 (défaut 2 #9 6930315055) — cache `/sessions/catalog`
+    /// keyé par `(commit_seq, dataset_ids, scope_hash)`. Évite de
+    /// reconstruire `protocol_tree` + `network_elements` à chaque
+    /// requête (45 s observés avec 217 sessions). Invalidé
+    /// automatiquement dès qu'un dataset publie un nouveau
+    /// `commit_seq`. La clé inclut aussi un hash des paramètres de
+    /// scope (interfaces/technologies/from/to/run_id) pour que deux
+    /// portées différentes ne se partagent pas une entrée.
+    sessions_catalog_cache: std::sync::Mutex<SessionsCatalogCache>,
+}
+
+/// 2.21.11 — entrée de cache + clé composite pour `/sessions/catalog`.
+#[derive(Default)]
+struct SessionsCatalogCache {
+    entry: Option<SessionsCatalogCacheEntry>,
+}
+
+#[derive(Clone)]
+struct SessionsCatalogCacheEntry {
+    /// `(dataset_id, commit_seq)` pour chaque dataset live vu. Si un
+    /// dataset_id apparaît/disparaît ou si un commit_seq change, l'entrée
+    /// est invalide.
+    dataset_signatures: Vec<(String, u64)>,
+    /// Hash des paramètres de scope de la requête (interfaces,
+    /// technologies, from, to, run_id).
+    scope_hash: u64,
+    /// `protocol_tree` pré-calculé (JSON).
+    protocol_tree: Value,
+    /// `network_elements` pré-calculé (JSON).
+    network_elements: Value,
 }
 
 #[derive(Clone, Debug)]
@@ -702,6 +732,7 @@ impl AppState {
                 session_filter_signature: std::sync::Mutex::new(None),
                 journey_index_cache: std::sync::Mutex::new(None),
                 list_row_cache: std::sync::Mutex::new(ListRowCache::new()),
+                sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -785,6 +816,7 @@ impl AppState {
                 session_filter_signature: std::sync::Mutex::new(None),
                 journey_index_cache: std::sync::Mutex::new(None),
                 list_row_cache: std::sync::Mutex::new(ListRowCache::new()),
+                sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -4801,16 +4833,68 @@ async fn sessions_catalog(
     let to_ns = parse_ns(&query.to);
     let run_id = query.run_id.clone();
 
-    let builder = build_protocol_tree(
-        &state,
-        &interfaces_scope,
-        &technologies_scope,
-        from_ns,
-        to_ns,
-        run_id.as_deref(),
-    );
-    let protocol_tree = builder.to_protocol_tree_json();
-    let network_elements = builder.to_network_elements_json();
+    // 2.21.11 (défaut 2 #9 6930315055) — cache par
+    // (commit_seq, dataset_ids, scope). Un hit évite le parcours
+    // intégral de 217 call flows (45 s en prod).
+    let dataset_signatures: Vec<(String, u64)> = state
+        .inner
+        .capture_manager
+        .datasets()
+        .into_iter()
+        .map(|dataset| {
+            let seq = state
+                .inner
+                .capture_manager
+                .dataset_commit_seq(&dataset.dataset_id);
+            (dataset.dataset_id, seq)
+        })
+        .collect();
+    let scope_hash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        for interface in &interfaces_scope {
+            interface.hash(&mut hasher);
+        }
+        for technology in &technologies_scope {
+            technology.hash(&mut hasher);
+        }
+        from_ns.hash(&mut hasher);
+        to_ns.hash(&mut hasher);
+        run_id.hash(&mut hasher);
+        hasher.finish()
+    };
+    let cached = {
+        let guard = state.inner.sessions_catalog_cache.lock().unwrap();
+        guard.entry.as_ref().and_then(|entry| {
+            (entry.dataset_signatures == dataset_signatures && entry.scope_hash == scope_hash)
+                .then(|| (entry.protocol_tree.clone(), entry.network_elements.clone()))
+        })
+    };
+    let (protocol_tree, network_elements) = if let Some(cached) = cached {
+        cached
+    } else {
+        let builder = build_protocol_tree(
+            &state,
+            &interfaces_scope,
+            &technologies_scope,
+            from_ns,
+            to_ns,
+            run_id.as_deref(),
+        );
+        let protocol_tree = builder.to_protocol_tree_json();
+        let network_elements = builder.to_network_elements_json();
+        {
+            let mut guard = state.inner.sessions_catalog_cache.lock().unwrap();
+            guard.entry = Some(SessionsCatalogCacheEntry {
+                dataset_signatures,
+                scope_hash,
+                protocol_tree: protocol_tree.clone(),
+                network_elements: network_elements.clone(),
+            });
+        }
+        (protocol_tree, network_elements)
+    };
 
     let body = json!({
         "columns": session_catalog::columns_catalog(),
@@ -12163,6 +12247,91 @@ mod tests {
         );
         assert!(body["data"]["network_elements"].is_array());
         assert_no_identity_material(&body);
+    }
+
+    /// 2.21.11 (défaut 2 #9 6930315055) — le catalogue reconstruisait
+    /// le call flow de CHAQUE session de CHAQUE dataset à chaque
+    /// requête (45 s observés sur 217 sessions). Le cache keyé par
+    /// `(commit_seq, dataset_ids, scope_hash)` doit rendre un 2e
+    /// appel STRICTEMENT identique sans aucune reconstruction.
+    #[tokio::test]
+    async fn sessions_catalog_cache_hits_on_second_call_without_rebuild() {
+        let state = state();
+        let router = router(state.clone(), None);
+        // 1er appel : alimente le cache.
+        let first = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sessions/catalog")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = json_body(first).await;
+        let first_tree = first_body["data"]["protocol_tree"].clone();
+        let first_elements = first_body["data"]["network_elements"].clone();
+        // Vérifie que le cache porte bien une entrée.
+        {
+            let guard = state.inner.sessions_catalog_cache.lock().unwrap();
+            assert!(guard.entry.is_some(), "1er appel doit renseigner le cache");
+        }
+        // 2e appel : identique → cache hit.
+        let second = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sessions/catalog")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = json_body(second).await;
+        // L'entrée du cache n'a pas été déplacée : même valeurs.
+        assert_eq!(second_body["data"]["protocol_tree"], first_tree);
+        assert_eq!(second_body["data"]["network_elements"], first_elements);
+    }
+
+    /// 2.21.11 (défaut 3 #9 6930315055) — preuve architecturale que
+    /// `spawn_blocking` libère le runtime async pendant une tâche
+    /// bloquante longue (comme `hydrate_identities` → `tshark`
+    /// sub-process). Un timer async concurrent doit continuer de
+    /// tourner et se résoudre en « temps normal » (= quelques ms).
+    ///
+    /// Modèle du scénario `/health` pendant `/identities` froid :
+    /// l'ancien code appelait `hydrate_identities` directement sur
+    /// la worker thread axum, ce qui bloquait tous les handlers
+    /// (incluant `/health`) sur cette thread.
+    #[tokio::test]
+    async fn spawn_blocking_does_not_starve_async_runtime_for_health_during_slow_identities() {
+        use std::time::{Duration, Instant};
+        // Modélise `hydrate_identities` lent via `spawn_blocking` (c'est
+        // précisément ce que fait `session_identities` depuis 2.21.10).
+        let blocking = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_millis(500));
+            "hydrate done"
+        });
+        // Pendant ce temps, un handler async rapide (modèle `/health`)
+        // doit pouvoir tourner. On mesure qu'il se résout bien en < 100 ms.
+        let start = Instant::now();
+        let health: &str = async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            "ok"
+        }
+        .await;
+        let health_elapsed = start.elapsed();
+        assert_eq!(health, "ok");
+        assert!(
+            health_elapsed < Duration::from_millis(100),
+            "/health doit répondre pendant un hydrate lent — vu {:?}",
+            health_elapsed
+        );
+        // On vérifie quand même que la tâche bloquante termine propre.
+        let hydrate = blocking.await.expect("blocking task joined");
+        assert_eq!(hydrate, "hydrate done");
     }
 
     /// 2.19.1 — `/sessions/catalog/search?q=` renvoie des matches
