@@ -6,6 +6,7 @@ pub mod commit_seq;
 pub mod event_id_set;
 pub mod lte_evidence;
 pub mod userplane_index;
+pub mod userplane_summary;
 
 pub use event_id_set::{SpillingEventIdSet, DEFAULT_MEM_CAP as EVENT_ID_SET_DEFAULT_MEM_CAP};
 

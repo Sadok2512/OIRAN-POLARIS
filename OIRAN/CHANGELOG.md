@@ -1,5 +1,61 @@
 # Changelog
 
+## OIRAN API 2.22.3 — 2026-11-16 — UserPlaneSummary aggregator (fermeture sur événement + éviction LRU)
+
+Lot P2.3 — `UserPlaneSummaryAggregator` qui recolle UL/DL par PDU session, se ferme sur événement de contrôle (PFCP Session Deletion / NGAP PDU Session Resource Release) ou sur inactivité, et borne la mémoire par éviction LRU ordonnée (correction C2 #9 6927882355).
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.22.2 | **2.22.3** |
+| `live-probe` | 0.6.6 | **0.7.0** (minor : nouveau module public `userplane_summary`) |
+
+### Nouveau module `live-probe::userplane_summary`
+
+- `UserPlaneSummaryAggregator::new(config: UserPlaneSummaryConfig)`.
+- `UserPlaneSummaryConfig { inactivity_timeout_ns: 300s, max_summaries: 4096 }` (défauts).
+- API :
+  - `observe_n3_aggregate(&NormalizedEvent, &UserplaneIndex)` — consomme les sorties de `N3FlowAggregator::finish()` (1 aggregate par `(message_type, teid, direction)`), fait un lookup dans l'index, accumule UL/DL bytes/packets par `(subscriber_pseudonym, pdu_session_id)` ou fallback TEID canonique si l'index n'a pas encore vu le SBI.
+  - `observe_close_event(&NormalizedEvent, &UserplaneIndex) -> bool` — détecte PFCP Session Deletion et NGAP PDU Session Resource Release, ferme les sessions matchantes et les range dans la file `pending`.
+  - `tick_inactivity(now_ns) -> usize` — ferme les sessions inactives depuis `inactivity_timeout_ns`.
+  - `drain() -> Vec<NormalizedEvent>` — vide la file des records prêts à être écrits.
+- **Éviction LRU** : à `observe_n3_aggregate` dépassant `max_summaries`, l'entrée au plus petit `last_seen_ns` est évincée et émise avec `message_name = "UserPlane Summary (evicted)"`, IE `closed_reason = "memory_pressure"`. **Jamais** d'erreur bloquante type `CARDINALITY_LIMIT` — correction C2 appliquée.
+
+### Format du record
+
+Un `NormalizedEvent` avec :
+- `decoder_name = "live-probe-userplane-summary-aggregator"` ;
+- `message_name = "UserPlane Summary (aggregated)"` (ou `(evicted)` sur LRU) ;
+- `protocol = Gtpu`, `message_type = 255` ;
+- `session_identifiers` : `subscriber_pseudonym` + `subscriber_pseudonym_source` + `pdu_session_id` + `teid_ul` + `teid_dl` + `seid_smf` + `seid_upf` + `qfi` + `five_qi` + `ue_ipv4/v6` (ces derniers pseudonymisés) ;
+- `information_elements` : `ul_bytes`, `ul_packets`, `dl_bytes`, `dl_packets`, `first_seen_ns`, `last_seen_ns`, `duration_ns`, `closed_reason` ;
+- `packet_references` : (first, last) UL + (first, last) DL dédupées par `packet_number`.
+
+### Tests (5 passed)
+
+```bash
+cargo test -p live-probe --lib userplane_summary
+```
+
+1. `ue201_scenario_5_ul_5_dl_collapsed_into_one_user_plane_summary_650_650` — 5 G-PDU UL + 5 DL + index SBI UE-201 → 1 `UserPlaneSummary` avec `ul_bytes=7500 ul_packets=5 dl_bytes=7500 dl_packets=5`, `subscriber_pseudonym=sha256:pseudo-ue201`, `pdu_session_id=1`.
+2. `pfcp_session_deletion_closes_summary_and_emits_closed_reason` — Session Deletion → fermeture, `closed_reason=pfcp_session_deletion`.
+3. `inactivity_tick_closes_stale_summaries` — `tick_inactivity(now > last_seen + timeout)` ferme les entrées expirées.
+4. `lru_eviction_closes_oldest_summary_as_memory_pressure_never_panics` — `max_summaries = 2`, 3 sessions → 1 éviction LRU avec `closed_reason=memory_pressure`, zéro panique.
+5. `ngap_pdu_session_resource_release_also_closes_summary` — NGAP Release → fermeture, `closed_reason=ngap_pdu_session_resource_release`.
+
+### Note : wiring pipeline `process_capture_into_selected`
+
+Le wiring effectif dans la boucle de capture `process_capture_into_selected` (feeding index + N3 aggregate → UserPlaneSummary + close events cross-capture) nécessite un partage d'état `UserplaneIndex` et `UserPlaneSummaryAggregator` entre les captures N2/N3/N4/SBI. Ce shared state est consolidé dans le lot **2.22.4** avec les buckets throughput — point d'intégration atomique qui touche la même zone de code.
+
+### Session de référence lab (C4)
+
+Test d'acceptation sur session lab `5g-session-0bfac1e7ae159a77` (via ANR2 sous `LAB_LOCK`) rejoué dans 2.22.4 quand le pipeline shared-state atterrira. Les 5 tests d'unité ci-dessus prouvent la logique (incluant le scénario UE-201 synthétique multi-source) ; la mesure end-to-end attend le câblage.
+
+### Suite
+
+Enchaînement **2.22.4** : buckets throughput `ul/dl_bytes_per_window` au fil de `observe_n3_aggregate` + câblage pipeline (shared `UserplaneIndex` + `UserPlaneSummaryAggregator` dans `CaptureManager`). Puis **2.22.5** (route API + colonnes catalogue) et **2.22.6** (rétention 7 j glissante).
+
 ## OIRAN API 2.22.2 — 2026-11-16 — table de corrélation TEID↔SEID↔SUPI multi-source
 
 Lot P2.2 — module `live-probe::userplane_index` qui alimente une table de corrélation partagée sur les captures N2/N3/N4/SBI. Prépare 2.22.3 (`UserPlaneSummary` attache les champs de l'entrée à chaque record).
