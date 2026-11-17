@@ -3479,12 +3479,68 @@ fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::
             }
         }
     }
-    let flows = queryable_flows(state);
-    let index = std::sync::Arc::new(subscriber_journey::JourneyIndex::from_flows(flows.values()));
+    // 2.21.23 (règle #9 6947485672 — audit mémoire des 4 OUVERTS) — le
+    // JourneyIndex est désormais construit flow-par-flow : un seul
+    // callflow en RAM à la fois, puis libéré après accumulation. Avant
+    // 2.21.23, `queryable_flows(state)` chargeait TOUS les callflows
+    // simultanément (= OOM lab pour gros datasets, même profil que
+    // /packets pré-2.21.21).
+    let mut builder = subscriber_journey::JourneyIndex::builder();
+    stream_queryable_flows(state, |flow| {
+        builder.observe(flow);
+    });
+    let index = std::sync::Arc::new(builder.finish());
     if let Ok(mut cache) = state.inner.journey_index_cache.lock() {
         *cache = Some((signature, index.clone()));
     }
     index
+}
+
+/// 2.21.23 — stream les flows requêtables UN PAR UN. `queryable_flows`
+/// reste disponible comme référence pour les tests d'équivalence mais
+/// ne doit plus être appelé depuis les handlers (interdit sur routes
+/// qui peuvent scaler).
+fn stream_queryable_flows(state: &AppState, mut visit: impl FnMut(&CallFlow)) {
+    for flow in state.inner.flows.values() {
+        visit(flow);
+    }
+    for dataset in state.inner.capture_manager.datasets() {
+        for session_id in &dataset.session_ids {
+            if let Some(flow) = state
+                .inner
+                .capture_manager
+                .callflow(&dataset.dataset_id, session_id)
+            {
+                visit(&flow);
+                // `flow` est drop ici → la RAM allouée est libérée avant
+                // le prochain callflow.
+            }
+        }
+    }
+    match state.inner.lte_evidence_store.catalog() {
+        Ok(catalog) => {
+            for manifest in catalog {
+                for session_id in manifest.session_ids {
+                    match state
+                        .inner
+                        .lte_evidence_store
+                        .callflow_for_export_by_session(&session_id)
+                    {
+                        Ok(Some(flow)) => visit(&flow),
+                        Ok(None) => eprintln!(
+                            "STREAM_QUERYABLE_FLOWS_LTE_CALLFLOW_SKIPPED session_id={} reason=manifest_session_not_resolvable",
+                            session_id
+                        ),
+                        Err(error) => eprintln!(
+                            "STREAM_QUERYABLE_FLOWS_LTE_CALLFLOW_SKIPPED session_id={} reason={}",
+                            session_id, error
+                        ),
+                    }
+                }
+            }
+        }
+        Err(error) => eprintln!("STREAM_QUERYABLE_FLOWS_LTE_CATALOG_SKIPPED reason={}", error),
+    }
 }
 
 fn queryable_flows(state: &AppState) -> BTreeMap<String, CallFlow> {
@@ -3611,21 +3667,43 @@ async fn subscribers(State(state): State<AppState>, Query(query): Query<ListQuer
 }
 
 async fn subscriber_journey(State(state): State<AppState>, Path(pseudo): Path<String>) -> Response {
-    // 2.21.20 — queryable_flows + JourneyIndex::from_flows + fs reads.
-    tokio::task::spawn_blocking(move || {
-        let flows = queryable_flows(&state);
-        let index = subscriber_journey::JourneyIndex::from_flows(flows.values());
-        let sessions = index.sessions(&pseudo);
-        subscriber_journey_render(&state, &flows, &index, &pseudo, sessions)
-    })
-    .await
-    .unwrap_or_else(|_| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "SUBSCRIBER_JOURNEY_FAILED",
-            "subscriber_journey handler panicked",
-        )
-    })
+    // 2.21.20 — spawn_blocking pour isoler du runtime async.
+    // 2.21.23 — règle #9 6947485672 : plus de `queryable_flows` global.
+    // Le JourneyIndex vient du cache streaming (`cached_journey_index`,
+    // un seul callflow en RAM à la fois) et les flows nécessaires au
+    // rendu (résolution UE context par session) sont chargés à la demande
+    // pour le sous-ensemble du subscriber uniquement.
+    tokio::task::spawn_blocking(move || subscriber_journey_blocking(&state, &pseudo))
+        .await
+        .unwrap_or_else(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SUBSCRIBER_JOURNEY_FAILED",
+                "subscriber_journey handler panicked",
+            )
+        })
+}
+
+fn subscriber_journey_blocking(state: &AppState, pseudo: &str) -> Response {
+    let index = cached_journey_index(state);
+    let sessions = index.sessions(pseudo);
+    if sessions.is_empty() {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "SUBSCRIBER_NOT_FOUND",
+            "subscriber journey not found",
+        );
+    }
+    let sources = queryable_flow_sources(state);
+    let mut flows = BTreeMap::<String, CallFlow>::new();
+    for session in &sessions {
+        if let Some(entries) = sources.get(&session.session_id) {
+            if let Some(flow) = find_queryable_callflow(state, &session.session_id, entries) {
+                flows.insert(session.session_id.clone(), flow);
+            }
+        }
+    }
+    subscriber_journey_render(state, &flows, &index, pseudo, sessions)
 }
 
 fn subscriber_journey_render(
@@ -6767,6 +6845,19 @@ fn queryable_flow_sources(state: &AppState) -> BTreeMap<String, Vec<FlowSource>>
 }
 
 fn load_queryable_flow(state: &AppState, session_id: &str, sources: &[FlowSource]) -> Option<Value> {
+    find_queryable_callflow(state, session_id, sources)
+        .and_then(|flow| serde_json::to_value(flow).ok())
+}
+
+/// 2.21.23 — variante `CallFlow` de `load_queryable_flow` : utilisée par
+/// `subscriber_journey_blocking` pour résoudre, à la demande et UN par
+/// UN, chaque callflow d'un sous-ensemble de sessions sans matérialiser
+/// `queryable_flows` entier.
+fn find_queryable_callflow(
+    state: &AppState,
+    session_id: &str,
+    sources: &[FlowSource],
+) -> Option<CallFlow> {
     for source in sources.iter().rev() {
         let flow = match source {
             FlowSource::Memory => state.inner.flows.get(session_id).cloned(),
@@ -6781,15 +6872,15 @@ fn load_queryable_flow(state: &AppState, session_id: &str, sources: &[FlowSource
                 Ok(flow) => flow,
                 Err(error) => {
                     eprintln!(
-                        "PACKETS_LTE_CALLFLOW_SKIPPED session_id={} reason={}",
+                        "SUBSCRIBER_JOURNEY_LTE_CALLFLOW_SKIPPED session_id={} reason={}",
                         session_id, error
                     );
                     None
                 }
             },
         };
-        if let Some(flow) = flow {
-            return serde_json::to_value(flow).ok();
+        if flow.is_some() {
+            return flow;
         }
     }
     None
@@ -13420,6 +13511,37 @@ mod tests {
             start.elapsed()
         );
         let _ = s_task.await.unwrap(); // 404 attendu sur pseudo synthétique
+    }
+
+    // 2.21.23 — règle #9 6947485672 : `subscriber_journey` ne doit
+    // bloquer ni le runtime (spawn_blocking) ni la mémoire (le
+    // JourneyIndex vient du cache streaming ; les flows détaillés sont
+    // chargés UN PAR UN uniquement pour les sessions du subscriber).
+    #[tokio::test]
+    async fn subscriber_journey_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_j = app.clone();
+        let j_task = tokio::spawn(async move {
+            app_j
+                .oneshot(req(
+                    "/api/v1/subscribers/sha256-nonexistent/journey",
+                    false,
+                ))
+                .await
+                .unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "/health starved by /subscribers/.../journey ; {:?}",
+            start.elapsed()
+        );
+        let _ = j_task.await.unwrap(); // 404 attendu sur pseudo synthétique
     }
 
     #[tokio::test]

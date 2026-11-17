@@ -149,50 +149,73 @@ fn anchor(flow: &CallFlow) -> (String, u64) {
         .unwrap_or_default()
 }
 
-impl JourneyIndex {
-    pub fn from_flows<'a>(flows: impl IntoIterator<Item = &'a CallFlow>) -> Self {
-        let mut index = Self::default();
-        for flow in flows {
-            let (anchor_capture_id, first_packet_number) = anchor(flow);
-            let mut node = SessionNode {
-                session: JourneySession {
-                    session_id: flow.session_id.clone(),
-                    anchor_capture_id,
-                    first_packet_number,
-                    technology: flow.technology.clone(),
-                    procedures: flow.procedures.iter().map(|p| p.name.clone()).collect(),
-                },
-                subscribers: BTreeSet::new(),
-                assignments: BTreeMap::new(),
-                presentations: BTreeMap::new(),
-            };
-            for event in &flow.events {
-                values_named(
-                    &event.decoded_ie_tree,
-                    SUBSCRIBER_NAMES,
-                    &mut node.subscribers,
-                );
-                let mut temporary = BTreeSet::new();
-                values_named(&event.decoded_ie_tree, TEMPORARY_NAMES, &mut temporary);
-                let reference = event_ref(flow, event);
-                for value in temporary {
-                    if is_assignment(&event.message_name) {
-                        node.assignments
-                            .entry(value)
-                            .or_default()
-                            .push(reference.clone());
-                    } else if is_presentation(&event.message_name) {
-                        node.presentations
-                            .entry(value)
-                            .or_default()
-                            .push(reference.clone());
-                    }
+#[derive(Debug, Default)]
+pub struct JourneyIndexBuilder {
+    nodes: BTreeMap<String, SessionNode>,
+}
+
+impl JourneyIndexBuilder {
+    pub fn observe(&mut self, flow: &CallFlow) {
+        let (anchor_capture_id, first_packet_number) = anchor(flow);
+        let mut node = SessionNode {
+            session: JourneySession {
+                session_id: flow.session_id.clone(),
+                anchor_capture_id,
+                first_packet_number,
+                technology: flow.technology.clone(),
+                procedures: flow.procedures.iter().map(|p| p.name.clone()).collect(),
+            },
+            subscribers: BTreeSet::new(),
+            assignments: BTreeMap::new(),
+            presentations: BTreeMap::new(),
+        };
+        for event in &flow.events {
+            values_named(
+                &event.decoded_ie_tree,
+                SUBSCRIBER_NAMES,
+                &mut node.subscribers,
+            );
+            let mut temporary = BTreeSet::new();
+            values_named(&event.decoded_ie_tree, TEMPORARY_NAMES, &mut temporary);
+            let reference = event_ref(flow, event);
+            for value in temporary {
+                if is_assignment(&event.message_name) {
+                    node.assignments
+                        .entry(value)
+                        .or_default()
+                        .push(reference.clone());
+                } else if is_presentation(&event.message_name) {
+                    node.presentations
+                        .entry(value)
+                        .or_default()
+                        .push(reference.clone());
                 }
             }
-            index.nodes.insert(flow.session_id.clone(), node);
         }
+        self.nodes.insert(flow.session_id.clone(), node);
+    }
+
+    pub fn finish(self) -> JourneyIndex {
+        let mut index = JourneyIndex {
+            nodes: self.nodes,
+            sessions_by_subscriber: BTreeMap::new(),
+        };
         index.resolve();
         index
+    }
+}
+
+impl JourneyIndex {
+    pub fn builder() -> JourneyIndexBuilder {
+        JourneyIndexBuilder::default()
+    }
+
+    pub fn from_flows<'a>(flows: impl IntoIterator<Item = &'a CallFlow>) -> Self {
+        let mut builder = Self::builder();
+        for flow in flows {
+            builder.observe(flow);
+        }
+        builder.finish()
     }
 
     fn resolve(&mut self) {
@@ -544,5 +567,67 @@ mod tests {
         assert_eq!(tmsi.len(), 1);
         assert_eq!(tmsi[0].status, "attribution non capturée");
         assert!(tmsi[0].assigned.is_none());
+    }
+
+    // 2.21.23 — règle #9 6947485672 : test d'équivalence entre
+    // l'ancienne API `from_flows(IntoIterator)` (matérialise toutes les
+    // références en RAM) et le builder streaming `observe` (utilisé par
+    // `cached_journey_index` qui ne garde qu'UN callflow en RAM à la
+    // fois). Le résultat observable (sessions / links / tmsi par
+    // subscriber) doit être identique.
+    #[test]
+    fn builder_streaming_matches_from_flows() {
+        let flows = vec![
+            flow(
+                "a",
+                1,
+                Some("psn-subscriber-a"),
+                Some(("assigned", "psn-tmsi-a")),
+            ),
+            flow("b", 2, None, Some(("presented", "psn-tmsi-a"))),
+            flow("c", 3, Some("psn-subscriber-b"), None),
+            flow(
+                "d",
+                4,
+                Some("psn-subscriber-a"),
+                Some(("presented", "psn-tmsi-b")),
+            ),
+        ];
+
+        let legacy = JourneyIndex::from_flows(&flows);
+
+        let mut builder = JourneyIndex::builder();
+        for flow in &flows {
+            builder.observe(flow);
+        }
+        let streaming = builder.finish();
+
+        for subscriber in ["psn-subscriber-a", "psn-subscriber-b"] {
+            let legacy_sessions = legacy.sessions(subscriber);
+            let streaming_sessions = streaming.sessions(subscriber);
+            assert_eq!(
+                serde_json::to_value(&legacy_sessions).unwrap(),
+                serde_json::to_value(&streaming_sessions).unwrap(),
+                "sessions({subscriber}) diverge entre from_flows et builder",
+            );
+            let legacy_links = legacy.links(subscriber);
+            let streaming_links = streaming.links(subscriber);
+            assert_eq!(
+                serde_json::to_value(&legacy_links).unwrap(),
+                serde_json::to_value(&streaming_links).unwrap(),
+                "links({subscriber}) diverge entre from_flows et builder",
+            );
+            let legacy_tmsi = legacy.tmsi(subscriber);
+            let streaming_tmsi = streaming.tmsi(subscriber);
+            assert_eq!(
+                serde_json::to_value(&legacy_tmsi).unwrap(),
+                serde_json::to_value(&streaming_tmsi).unwrap(),
+                "tmsi({subscriber}) diverge entre from_flows et builder",
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(legacy.subscribers()).unwrap(),
+            serde_json::to_value(streaming.subscribers()).unwrap(),
+        );
     }
 }

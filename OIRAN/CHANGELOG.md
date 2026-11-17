@@ -1,5 +1,46 @@
 # Changelog
 
+## OIRAN API 2.21.24 — 2026-11-17 — audit mémoire 4 OUVERTS : `cached_journey_index` streaming + `/subscribers/:pseudo/journey` ne matérialise plus `queryable_flows`
+
+Upgrade **patch**. Ordre #9 6947821709 : *« 2.21.24 : la conversion flow par flow des 4 routes à risque mémoire, chacune avec un test d'équivalence entre l'ancien et le nouveau résultat »*.
+
+Règle appliquée (mémoire — `spawn_blocking` protège `/health`, pas la mémoire) : un handler qui matérialise tous les callflows reste un défaut même en `spawn_blocking`. Bloquant mémoire : `cached_journey_index` chargeait l'intégralité de `queryable_flows(state)` en RAM puis construisait l'index. Avec un dataset lab de 500 sessions × ~5 MB/callflow, peak attendu identique au FAIL `/packets` 2.21.19. Fix : builder streaming.
+
+### Changements
+
+- `subscriber_journey::JourneyIndex::builder()` + `JourneyIndexBuilder::observe(&CallFlow)` + `finish()` : construit l'index flow par flow, un seul callflow en RAM à la fois. `from_flows` rempli désormais en termes du builder (iso-comportement, pour rétro-compat + équivalence).
+- `cached_journey_index(state)` : parcourt via `stream_queryable_flows` (nouveau helper) et appelle `builder.observe(flow)` ; le callflow est drop entre deux visites. Cache signature inchangée.
+- `/subscribers/:pseudo/journey` : `fn subscriber_journey_blocking(state, pseudo)` n'appelle plus `queryable_flows(&state)`. Il part de `cached_journey_index(state).sessions(pseudo)` puis charge, UN PAR UN via `find_queryable_callflow(state, session_id, sources)`, uniquement les callflows des sessions du subscriber (bornes : nombre de sessions du subscriber, ≠ total dataset).
+- `find_queryable_callflow` : variante `CallFlow` de `load_queryable_flow` ; même priorité `LTE > dataset > mémoire`, même sémantique « une source qui ne résout pas laisse la précédente ».
+
+### Audit des 4 routes OUVERTS (ordre #9 6947821709)
+
+| Route | Statut post-2.21.24 | Raison |
+|---|---|---|
+| `/subscribers/:pseudo/journey` | **CONVERTIE** | `subscriber_journey_blocking` : `cached_journey_index` + chargement UN PAR UN des callflows nécessaires. |
+| `/sessions/filter` (POST) | **FIXÉE TRANSITIVEMENT** | `sessions_filter_blocking` consomme `cached_journey_index` (devenu streaming) + `refresh_session_filter_index` (déjà flow-par-flow depuis 2.18.12). |
+| `/sessions/catalog/search` | **DÉJÀ STREAMING** (audit) | `build_protocol_tree` itère datasets et appelle `capture_manager.callflow(...)` un flow à la fois (lignes 4911-4924). |
+| `/sessions/columns` (POST) | **DÉJÀ STREAMING** (audit) | `sessions_columns_blocking` utilise `cached_journey_index` + lookup per session_id via `state.inner.flows.get` ou `live_flow_for` (jamais matérialisation globale). |
+
+### Tests (règle `cargo test --locked -p oiran-api --lib` avant push)
+
+1. `subscriber_journey::tests::builder_streaming_matches_from_flows` (nouveau — équivalence) — la construction streaming `builder.observe(flow)` puis `finish()` produit exactement les mêmes `sessions`/`links`/`tmsi`/`subscribers` que l'ancienne `from_flows(IntoIterator)` sur 4 flows synthétiques (subscriber-a avec assigned-TMSI, subscriber-b isolé, subscriber-a avec presented-TMSI séparé).
+2. `subscriber_journey_route_is_spawned_blocking_real_router` (nouveau — VRAI routeur) — `tokio::spawn router.oneshot("/subscribers/.../journey")` + `/health` en < 500 ms.
+3. Suite complète `cargo test --locked -p oiran-api --lib` : **183 OK, 0 FAIL, 3 ignored** (+2 nouveaux tests vs. 2.21.23).
+
+### Hors scope (noté OUVERT dans ce changelog, pas traité)
+
+- `find_event` (ligne 7189) consomme encore `queryable_flow_values` → bloc mémoire équivalent. Pas listé dans les 4 OUVERTS de #9 6947821709 ; conversion à prévoir dans un lot ultérieur avec `for_each_packet_reference`.
+- `/live/*` : à traiter en 2.21.25 (ordre #9 6947821709).
+
+### Composant et version
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.23 | **2.21.24** |
+
+Branche : `fix/oiran-2.21.23-handlers` (commits séquentiels, pas de force-push).
+
 ## OIRAN API 2.21.23 — 2026-11-17 — audit handlers lot 4 : 7 routes en spawn_blocking (renuméroté depuis 2.21.20, rebasé sur 2.21.22 Sadok)
 
 Ordre #9 6947821709 : « ton lot handlers (l'actuel 2.21.20), sur une **nouvelle branche** basée sur 2412038. Pas de force-push ». Lot livré initialement en 2.21.20 (branche `fix/oiran-2.21.20-handlers` @ `02fffe9`), rebasé une première fois sur `c3a4857` (Sadok 2.21.21) en 2.21.22 sur `fix/oiran-2.21.22-handlers` — mais Sadok a pris 2.21.22 pour le fix `/health` (@ `2412038`). Renuméroté à **2.21.23** sur une nouvelle branche `fix/oiran-2.21.23-handlers` basée sur `2412038`. Deux branches précédentes gelées sur origin (pas de force-push, pas de suppression) : `fix/oiran-2.21.20-handlers` + `fix/oiran-2.21.22-handlers`.
