@@ -1,5 +1,16 @@
 # Changelog
 
+## OIRAN API 2.21.13 — 2026-11-17 — `/health` sans E/S : instantané recalculé en arrière-plan (patch)
+
+Fix lab critique (correctif `99f8651` par Sadok ; intégré dans la branche bench O1 par merge non-destructif).
+
+- Rapport ANR1 #10 6931550052 : 2.21.12 FAIL, retour arrière en 2.21.9. Pendant un `/identities` froid (210,6 s), 20/20 `/health` en timeout de 5 s.
+- Cause : `/health` appelait `queryable_session_ids()` qui relit + désérialise le callflow JSON de CHAQUE session de CHAQUE dataset + pages LTE, sur le runtime async. Pas d'E/S sur `/identities` (déjà en `spawn_blocking` depuis 2.21.10).
+- Mon test `spawn_blocking_does_not_starve_async_runtime_for_health_during_slow_identities` était faux : deux `sleep` en simulation, jamais le vrai `/health` ni le vrai `session_identities`. **Règle retenue** (#9 6940906119) : un test de non-blocage DOIT exercer `router(state).oneshot()`.
+- Correctif Sadok : `compute_health_counters()` en `spawn_blocking` ; `/health` sert instantané mémoire TTL 5 s, recalcule en arrière-plan, sert périmé avec `counters_status=stale/computing/fresh` et `counters_age_ms`. Plus d'E/S sur le chemin de requête.
+- Test sur le VRAI routeur : `health_serves_snapshot_without_io_while_counters_refresh_is_slow`.
+- OUVERT : `/identities` froid = 210 s. Non bloquant pour le service mais lent. Point 3 de la reprise 2026-11-17 à traiter.
+
 ## OIRAN API 2.23.0 — 2026-11-16 — harnais bench O1 (volet A + stub amplify) — GO #9 6930944260
 
 Branche `feat/oiran-2.23.0-bench-o1` depuis `243ed5c`. Nouvelle crate `OIRAN/benchmarks/o1` (binaire `polaris-bench-o1`). Objectif : fournir la seule source de chiffres « 400G » en attendant la trace CPU d'ANR1 (2.21.13).
