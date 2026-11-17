@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{self, BufRead};
+use std::fs;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -898,6 +901,192 @@ pub fn load_path_streaming_index(path: &std::path::Path) -> Result<StreamingEven
 pub struct StreamingRepresentativesIndex {
     pub events: Vec<EventRecord>,
     pub source_event_count: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SpilledRepresentative {
+    key: String,
+    ordinal: u64,
+    event: EventRecord,
+}
+
+static REPRESENTATIVE_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn flush_representative_run(
+    staging_dir: &Path,
+    run_index: usize,
+    records: &mut Vec<SpilledRepresentative>,
+) -> Result<PathBuf, String> {
+    records.sort_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then_with(|| left.ordinal.cmp(&right.ordinal))
+    });
+    let path = staging_dir.join(format!("run-{run_index:06}.jsonl"));
+    let file = fs::File::create(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    let mut offset = 0usize;
+    while offset < records.len() {
+        let key = records[offset].key.clone();
+        let mut last = offset;
+        while last + 1 < records.len() && records[last + 1].key == key {
+            last += 1;
+        }
+        serde_json::to_writer(&mut writer, &records[last]).map_err(|error| error.to_string())?;
+        writer.write_all(b"\n").map_err(|error| error.to_string())?;
+        offset = last + 1;
+    }
+    writer.flush().map_err(|error| error.to_string())?;
+    records.clear();
+    Ok(path)
+}
+
+struct RepresentativeRunReader {
+    path: PathBuf,
+    lines: io::Lines<BufReader<fs::File>>,
+    current: Option<SpilledRepresentative>,
+}
+
+impl RepresentativeRunReader {
+    fn open(path: PathBuf) -> Result<Self, String> {
+        let file = fs::File::open(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let mut reader = Self {
+            path,
+            lines: BufReader::new(file).lines(),
+            current: None,
+        };
+        reader.advance()?;
+        Ok(reader)
+    }
+
+    fn advance(&mut self) -> Result<(), String> {
+        self.current = match self.lines.next() {
+            Some(Ok(line)) => Some(
+                serde_json::from_str(&line)
+                    .map_err(|error| format!("{}: {error}", self.path.display()))?,
+            ),
+            Some(Err(error)) => return Err(format!("{}: {error}", self.path.display())),
+            None => None,
+        };
+        Ok(())
+    }
+}
+
+/// Disk-backed equivalent of `load_paths_streaming_representatives_with_progress`.
+///
+/// Input order is recorded as a monotonic ordinal. Each sorted run retains the
+/// greatest ordinal for a semantic key; the external merge applies the same
+/// rule across runs. This is exactly the legacy BTreeMap `insert` contract:
+/// the last observation in manifest/shard order wins. Only `memory_cap_bytes`
+/// of serialized run records are accumulated before spilling.
+pub fn load_paths_spilling_representatives_with_progress<F>(
+    paths: &[PathBuf],
+    staging_root: &Path,
+    memory_cap_bytes: usize,
+    mut progress: F,
+) -> Result<StreamingRepresentativesIndex, String>
+where
+    F: FnMut(usize, usize),
+{
+    if memory_cap_bytes == 0 {
+        return Err("representative run memory cap must be greater than zero".into());
+    }
+    let sequence = REPRESENTATIVE_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let staging_dir = staging_root.join(format!(
+        "representatives-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&staging_dir)
+        .map_err(|error| format!("{}: {error}", staging_dir.display()))?;
+
+    let mut records = Vec::<SpilledRepresentative>::new();
+    let mut retained_bytes = 0usize;
+    let mut run_paths = Vec::<PathBuf>::new();
+    let mut source_event_count = 0usize;
+    let mut ordinal = 0u64;
+    for path in paths {
+        let file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        for (line_no, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.map_err(|error| format!("{} line {}: {error}", path.display(), line_no + 1))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).map_err(|error| {
+                format!("{} line {}: invalid JSON: {error}", path.display(), line_no + 1)
+            })?;
+            let mut event = parse_event(value)
+                .map_err(|error| format!("{} line {}: {error}", path.display(), line_no + 1))?;
+            source_event_count = source_event_count.saturating_add(1);
+            ordinal = ordinal.saturating_add(1);
+            compact_publication_event(&mut event);
+            let record = SpilledRepresentative {
+                key: publication_semantic_key(&event),
+                ordinal,
+                event,
+            };
+            retained_bytes = retained_bytes.saturating_add(
+                serde_json::to_vec(&record)
+                    .map_err(|error| error.to_string())?
+                    .len(),
+            );
+            records.push(record);
+            if retained_bytes >= memory_cap_bytes {
+                let path = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
+                run_paths.push(path);
+                retained_bytes = 0;
+            }
+            if source_event_count % 100_000 == 0 {
+                progress(source_event_count, 0);
+            }
+        }
+    }
+    if !records.is_empty() {
+        let path = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
+        run_paths.push(path);
+    }
+
+    let mut readers = run_paths
+        .iter()
+        .cloned()
+        .map(RepresentativeRunReader::open)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut events = Vec::<EventRecord>::new();
+    loop {
+        let Some(next_key) = readers
+            .iter()
+            .filter_map(|reader| reader.current.as_ref().map(|record| record.key.as_str()))
+            .min()
+            .map(str::to_owned)
+        else {
+            break;
+        };
+        let mut winner: Option<SpilledRepresentative> = None;
+        for reader in &mut readers {
+            if reader.current.as_ref().is_some_and(|record| record.key == next_key) {
+                let candidate = reader.current.take().expect("checked above");
+                if winner
+                    .as_ref()
+                    .is_none_or(|current| candidate.ordinal > current.ordinal)
+                {
+                    winner = Some(candidate);
+                }
+                reader.advance()?;
+            }
+        }
+        events.push(winner.expect("at least one run owns the minimum key").event);
+    }
+    deterministic_sort(&mut events);
+    progress(source_event_count, events.len());
+
+    for path in run_paths {
+        fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    fs::remove_dir(&staging_dir)
+        .map_err(|error| format!("{}: {error}", staging_dir.display()))?;
+    Ok(StreamingRepresentativesIndex {
+        events,
+        source_event_count,
+    })
 }
 
 pub fn load_path_streaming_representatives(
@@ -5195,5 +5384,177 @@ mod tests {
         assert_eq!(event.probe_type.as_deref(), Some("vprobe"));
         assert_eq!(event.physical_link.as_deref(), Some("enp4s0f1np1"));
         assert_eq!(event.timestamp_source.as_deref(), Some("hw_ptp"));
+    }
+
+    #[test]
+    fn spilling_representatives_match_legacy_across_multiple_runs() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "oiran-spilling-representatives-{}-{nonce}",
+            std::process::id()
+        ));
+        let staging = root.join("staging");
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("events-000001.jsonl");
+        let second = root.join("events-000002.jsonl");
+
+        let write_event = |writer: &mut BufWriter<fs::File>, index: usize, generation: usize| {
+            let packet = generation * 10_000 + index + 1;
+            let value = serde_json::json!({
+                "event_id": format!("evt-{generation}-{index:05}"),
+                "capture_id": "cap-multi-shard",
+                "capture_point_id": "N3",
+                "timestamp": {"seconds": 1, "nanoseconds": packet, "raw_ticks": packet, "display": "1Z"},
+                "interface": "N3",
+                "protocol": "GTP-U",
+                "message_name": "G-PDU",
+                "source_endpoint": {"address": "10.0.0.1", "network_function": "UPF"},
+                "destination_endpoint": {"address": "10.0.0.2", "network_function": "gNB"},
+                "direction": "CORE_TO_RAN",
+                "session_identifiers": [
+                    {"name": "teid", "value": format!("0x{index:08x}"), "pseudonymized": false},
+                    {"name": "tunnel_endpoint_ip", "value": "10.0.0.2", "pseudonymized": false}
+                ],
+                "information_elements": [],
+                "decoding_status": "DECODED",
+                "decoder_name": "test",
+                "decoder_version": "1",
+                "raw_payload_reference": "sha256:test",
+                "packet_references": [{
+                    "source_file": "N3.pcapng", "packet_number": packet,
+                    "byte_offset": 0, "interface_id": 0,
+                    "captured_length": 64, "original_length": 64
+                }],
+                "errors": []
+            });
+            serde_json::to_writer(&mut *writer, &value).unwrap();
+            writer.write_all(b"\n").unwrap();
+        };
+        let write_ngap = |writer: &mut BufWriter<fs::File>, packet: usize| {
+            let value = serde_json::json!({
+                "event_id": format!("evt-ngap-{packet:05}"),
+                "capture_id": "cap-ngap-occurrences",
+                "capture_point_id": "N2",
+                "timestamp": {"seconds": 2, "nanoseconds": packet, "raw_ticks": packet, "display": "2Z"},
+                "interface": "N2",
+                "protocol": "NGAP",
+                "message_name": "UplinkNASTransport",
+                "source_endpoint": {"address": "10.0.0.3", "network_function": "gNB"},
+                "destination_endpoint": {"address": "10.0.0.4", "network_function": "AMF"},
+                "direction": "RAN_TO_CORE",
+                "session_identifiers": [
+                    {"name": "ran_ue_ngap_id", "value": "77", "pseudonymized": false},
+                    {"name": "amf_ue_ngap_id", "value": "88", "pseudonymized": false}
+                ],
+                "information_elements": [],
+                "decoding_status": "DECODED",
+                "decoder_name": "test",
+                "decoder_version": "1",
+                "raw_payload_reference": "sha256:test",
+                "packet_references": [{
+                    "source_file": "N2.pcapng", "packet_number": packet,
+                    "byte_offset": 0, "interface_id": 0,
+                    "captured_length": 64, "original_length": 64
+                }],
+                "errors": []
+            });
+            serde_json::to_writer(&mut *writer, &value).unwrap();
+            writer.write_all(b"\n").unwrap();
+        };
+        {
+            let mut writer = BufWriter::new(fs::File::create(&first).unwrap());
+            for index in 0..2_100 {
+                write_event(&mut writer, index, 1);
+            }
+            write_ngap(&mut writer, 30_001);
+            write_ngap(&mut writer, 30_002);
+            writer.flush().unwrap();
+        }
+        {
+            let mut writer = BufWriter::new(fs::File::create(&second).unwrap());
+            for index in (0..2_100).step_by(7) {
+                write_event(&mut writer, index, 2);
+            }
+            write_ngap(&mut writer, 30_003);
+            write_ngap(&mut writer, 30_004);
+            writer.flush().unwrap();
+        }
+        let paths = vec![first.clone(), second.clone()];
+        let legacy = load_paths_streaming_representatives_with_progress(&paths, |_, _| {})
+            .expect("legacy reference");
+        let spilled = load_paths_spilling_representatives_with_progress(
+            &paths,
+            &staging,
+            8 * 1024,
+            |_, _| {},
+        )
+        .expect("disk-backed representatives");
+
+        assert_eq!(spilled.events.len(), 2_104, "at least 2,000 representatives");
+        assert_eq!(legacy.source_event_count, spilled.source_event_count);
+        assert_eq!(
+            serde_json::to_value(&legacy.events).unwrap(),
+            serde_json::to_value(&spilled.events).unwrap(),
+            "ordered representatives must be byte-for-byte equivalent as JSON",
+        );
+        let replaced = spilled
+            .events
+            .iter()
+            .find(|event| event.first_identifier("teid") == Some("0x00000000"))
+            .unwrap();
+        assert_eq!(replaced.event_id, "evt-2-00000", "last observation wins");
+        assert_eq!(
+            spilled
+                .events
+                .iter()
+                .filter(|event| event.protocol == "NGAP")
+                .count(),
+            4,
+            "73713d0 contract: every NGAP occurrence survives compaction",
+        );
+
+        fs::remove_file(first).unwrap();
+        fs::remove_file(second).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spilling_representatives_match_legacy_on_certified_fixture() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl");
+        let staging = std::env::temp_dir().join(format!(
+            "oiran-spilling-fixture-{}",
+            std::process::id()
+        ));
+        let paths = vec![source];
+        let legacy = load_paths_streaming_representatives_with_progress(&paths, |_, _| {})
+            .expect("legacy fixture representatives");
+        let spilled = load_paths_spilling_representatives_with_progress(
+            &paths,
+            &staging,
+            4 * 1024,
+            |_, _| {},
+        )
+        .expect("disk-backed fixture representatives");
+        assert_eq!(
+            serde_json::to_value(&legacy.events).unwrap(),
+            serde_json::to_value(&spilled.events).unwrap(),
+            "certified fixture representatives differ",
+        );
+
+        let mut legacy_events = legacy.events;
+        let mut spilled_events = spilled.events;
+        let legacy_discovery = discover_sessions(&mut legacy_events);
+        let spilled_discovery = discover_sessions(&mut spilled_events);
+        assert_eq!(
+            serde_json::to_value(legacy_discovery).unwrap(),
+            serde_json::to_value(spilled_discovery).unwrap(),
+            "certified fixture discovery differs",
+        );
     }
 }

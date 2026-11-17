@@ -1,5 +1,23 @@
 # Changelog
 
+## OIRAN API 2.21.37 + live-probe 0.6.15 — 2026-11-17 — représentants de publication bornés sur disque
+
+Sprint mémoire ANR1, lot A uniquement (#10, ordres 6957740499 et 6961300090), sur la base 2.21.36 `73713d0`.
+
+- Les représentants compacts ne sont plus retenus dans un `BTreeMap` global pendant le scan. Ils sont écrits en runs triés avec un plafond de **64 MiB**, puis fusionnés extérieurement.
+- L'ordinal d'entrée est conservé dans les runs : pour une clé sémantique compactable, la dernière observation gagne exactement comme dans l'ancien chemin.
+- Les occurrences NGAP, NAS-5GMM et NAS-5GSM introduites en 2.21.36 restent distinctes par `(capture_id, packet_number)` ; le chemin historique de `73713d0` demeure l'oracle d'équivalence.
+- Découverte et corrélation utilisent les mêmes projections `EventRecord` compactées. Les corps complets restent dans les shards JSONL et sont rechargés par identifiant, lot de sessions par lot de sessions, par le chemin de publication existant.
+- Après la fusion, les pages temporaires du scan sont rendues avant les phases de découverte/corrélation.
+- Hors lot : aucune modification du traitement du page cache (lot B) ni des flows LTE/runtime (lot C). La contribution de `cgroup_file_kb` reste **OUVERTE** et mesurée seulement dans les traces RSS.
+
+Gardes obligatoires : équivalence fixture + synthétique multi-shards (au moins 2 000 représentants et plusieurs runs), preuve de mutation de « dernière observation gagne », mesure `rss_publication` avant/après, puis douze campagnes consécutives sans échec. Aucun déploiement ni geste lab dans ce sprint.
+
+Résultats locaux, commandes exécutées en `nice -n 19 ionice -c3 ... -j 2` :
+- synthétique multi-shards : 2 104 représentants, égalité JSON avec l'oracle, quatre occurrences NGAP préservées ; mutation de l'ordinal → test en échec, restauration → PASS ;
+- `rss_publication 100000`, mêmes 100 002 événements sources / 33 736 projections : phase 07 `vmrss_kb` 146 068 → 129 232 ; pic `VmHWM` 163 404 → 209 632 pendant les runs (surcoût borné déclaré, validation lab encore requise) ;
+- douze campagnes : `live-probe` 174 PASS / 0 FAIL, `oiran-api` 190 PASS / 0 FAIL, vTAP 12 PASS / 0 FAIL et intégration 3 PASS / 0 FAIL à chaque campagne ; aucun nouvel `#[ignore]`.
+
 ## OIRAN API 2.21.36 + session-engine 0.5.14 + live-probe 0.6.14 — 2026-11-17 — deux essais du même UE ne fusionnent plus
 
 Upgrade **patch**. Contexte : essai 7 (ANR2 #10 6960552952), aucune session nouvelle exposée depuis le 16/11 20:48 alors que les events N2/N4 de la fenêtre sont publiés. Défaut reproduit en local : deux essais successifs du MÊME UE (identifiants NGAP réutilisés, contexte précédent non libéré) étaient **fusionnés** dans la session du premier, et le 2e écrasait des events N2 du 1er.

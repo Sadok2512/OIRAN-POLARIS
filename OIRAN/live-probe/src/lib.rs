@@ -65,6 +65,10 @@ const MAX_N3_FLOW_AGGREGATES: usize = 4096;
 /// dataset — the latter is `derived_output_hard_limit_bytes()` and is
 /// operator-configurable (2.7.23).
 const MAX_CONTINUOUS_DERIVED_BYTES: u64 = 64 * 1024 * 1024;
+/// 2.21.37 — hard ceiling for the in-memory portion of publication
+/// representatives. Complete normalized events stay in immutable JSONL shards;
+/// sorted runs and their external merge operate on compact projections only.
+const PUBLICATION_REPRESENTATIVE_RUN_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// Published operational upper bound for a closed ring segment. Every
 /// continuous cycle logs this SLO and its actual duration.
 pub const CONTINUOUS_CLOSED_SEGMENT_SLO_MINUTES: u64 = 10;
@@ -6493,8 +6497,13 @@ impl CaptureManager {
         // Quand la rétention est active, la passe est conservée
         // (archive_stale_captures peut supprimer des captures
         // entières du hot view).
-        let index = session_engine::load_paths_streaming_representatives_with_progress(
+        let representative_staging = dataset_dir
+            .join(".publish-staging")
+            .join("representatives");
+        let index = session_engine::load_paths_spilling_representatives_with_progress(
             &event_paths,
+            &representative_staging,
+            PUBLICATION_REPRESENTATIVE_RUN_MEMORY_BYTES,
             |scanned_events, retained_events| {
                 trace_publication_rss_progress(
                     publication_started_epoch_ms,
@@ -6506,6 +6515,10 @@ impl CaptureManager {
         )?;
         let event_count = index.source_event_count;
         let mut events = index.events;
+        // The legacy BTreeMap kept keys, tree nodes and freed allocation pages
+        // resident through phase 07. Runs are gone at this point; return those
+        // pages before discovery/correlation consumes the compact projections.
+        release_unused_heap_pages();
         let retention_active = retention_cutoff_epoch_s().is_some();
         let retention_staging = dataset_dir.join(".publish-staging").join("ids");
         let mut retained_event_ids = SpillingEventIdSet::new(
@@ -11361,6 +11374,63 @@ pub fn vtap_out_dirs() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_spill_path_matches_legacy_fixture_end_to_end() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/oiran_events.jsonl");
+        let paths = vec![source];
+        let staging = temporary_root("publication-spill-equivalence");
+        let legacy = session_engine::load_paths_streaming_representatives_with_progress(
+            &paths,
+            |_, _| {},
+        )
+        .expect("legacy representatives");
+        let spilled = session_engine::load_paths_spilling_representatives_with_progress(
+            &paths,
+            &staging,
+            4 * 1024,
+            |_, _| {},
+        )
+        .expect("spilled representatives");
+
+        fn outputs(mut events: Vec<EventRecord>, source_event_count: usize) -> Value {
+            let discovery = discover_sessions(&mut events);
+            let mut edges = correlate_discovered_tunnels(&events, &discovery);
+            edges.extend(correlate_cross_interface_evidence(&events));
+            let edges = fold_overlapping_edges(edges);
+            let reconstruction = reconstruct(events.clone(), ReconstructionHints::default());
+            let callflow = build_callflow(&reconstruction, edges.clone());
+            let lte_callflows = offline_lte_callflows(&events).expect("LTE callflows");
+            let mut session_ids = discovery
+                .pdu_sessions
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<Vec<_>>();
+            session_ids.extend(lte_callflows.iter().map(|flow| flow.session_id.clone()));
+            session_ids.sort();
+            serde_json::json!({
+                "representatives": events,
+                "discovery": discovery,
+                "edges": edges,
+                "callflow": callflow,
+                "lte_callflows": lte_callflows,
+                "manifest": {
+                    "event_count": source_event_count,
+                    "session_ids": session_ids,
+                    "state": "COMPLETED"
+                }
+            })
+        }
+
+        assert_eq!(
+            outputs(legacy.events, legacy.source_event_count),
+            outputs(spilled.events, spilled.source_event_count),
+            "representatives, discovery, edges, callflows and manifest differ",
+        );
+    }
 
     #[test]
     fn phase_ten_event_id_extractor_reads_only_the_top_level_key() {
