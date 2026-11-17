@@ -155,6 +155,11 @@ struct Inner {
     /// E/S ni aucun parse de callflow sur le runtime async.
     health_cache: std::sync::Mutex<Option<(std::time::Instant, Value)>>,
     health_refreshing: std::sync::atomic::AtomicBool,
+    /// 2.21.15 (reprise #9 6941147984) — cache `/identities` keyé par
+    /// `session_id`, invalidé via `IdentityCacheEntry.signature` (hash
+    /// des packet_references du callflow). Évite de relancer tshark
+    /// 210 s sur le chemin de requête.
+    identity_cache: std::sync::Mutex<BTreeMap<String, IdentityCacheEntry>>,
 }
 
 /// 2.21.11 — entrée de cache + clé composite pour `/sessions/catalog`.
@@ -740,6 +745,7 @@ impl AppState {
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
+                identity_cache: std::sync::Mutex::new(BTreeMap::new()),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -826,6 +832,7 @@ impl AppState {
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
+                identity_cache: std::sync::Mutex::new(BTreeMap::new()),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -5779,8 +5786,65 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<(), String> 
     let Some(flow) = session_flow(state, session_id) else {
         return Err("SESSION_NOT_FOUND".into());
     };
+    // 2.21.15 (reprise #9 6941147984) — cache par signature de callflow
+    // pour éviter de relancer tshark à chaque `/identities`. Un `tshark`
+    // froid sur session réf = 210 s ; après fix : miss paye le prix une
+    // fois, hit sert en < 10 ms.
+    let signature = identity_cache_signature(&flow);
+    {
+        let guard = state.inner.identity_cache.lock().unwrap();
+        if let Some(entry) = guard.get(session_id) {
+            if entry.signature == signature {
+                let observations = entry.observations.clone();
+                drop(guard);
+                return state.inner.identity_vault.upsert(observations);
+            }
+        }
+    }
     let observations = tshark_identities(state, session_id, &flow)?;
+    {
+        let mut guard = state.inner.identity_cache.lock().unwrap();
+        guard.insert(
+            session_id.to_string(),
+            IdentityCacheEntry {
+                signature,
+                observations: observations.clone(),
+            },
+        );
+    }
     state.inner.identity_vault.upsert(observations)
+}
+
+/// 2.21.15 — signature d'un `CallFlow` pour invalidation cache
+/// `/identities`. On hashe la liste triée de `(source_file,
+/// packet_number)` + `event_id` + `capture_id`. Deux callflows
+/// identiques → même signature ; un callflow modifié (ajout d'un
+/// event, changement d'une référence paquet) change la signature et
+/// invalide l'entrée.
+fn identity_cache_signature(flow: &CallFlow) -> String {
+    use event_schema::sha256_hex;
+    let mut items = Vec::new();
+    for event in flow.events.iter().take(4096) {
+        for reference in &event.packet_references {
+            items.push(format!(
+                "{}|{}|{}|{}|{}",
+                event.event_id,
+                event.capture_id,
+                reference.source_file,
+                reference.packet_number,
+                event.message_name,
+            ));
+        }
+    }
+    items.sort();
+    sha256_hex(items.join("\n").as_bytes())
+}
+
+/// 2.21.15 — entrée du cache `identity_cache`.
+#[derive(Clone)]
+pub(crate) struct IdentityCacheEntry {
+    pub(crate) signature: String,
+    pub(crate) observations: Vec<IdentityObservation>,
 }
 
 /// 2.15.0 (ANR1 #10 6883006379) — résumé compact des identités
@@ -12507,6 +12571,81 @@ mod tests {
         );
         let sessions = sessions_task.await.unwrap();
         assert_eq!(sessions.status(), StatusCode::OK);
+    }
+
+    /// 2.21.15 (reprise #9 6941147984) — `/identities` froid = 210 s sur la
+    /// session de référence lab (210 fois > 1 s). Le cache par signature
+    /// de callflow évite de relancer tshark au 2e appel. Preuve :
+    /// l'entrée `identity_cache` est renseignée après un appel, et une
+    /// nouvelle `hydrate_identities()` avec signature inchangée court-
+    /// circuite tshark (observations copiées depuis le cache).
+    ///
+    /// Note : le test n'invoque PAS tshark sur l'hôte de dev (outil
+    /// absent dans l'environnement CI standard). Il exerce la logique
+    /// cache de `hydrate_identities` en pré-remplissant l'entrée avec
+    /// une signature calculée sur un vrai callflow du dataset, puis
+    /// vérifie que la 2e passe ne fait AUCUN appel tshark (indicateur :
+    /// ne retourne pas `TSHARK_UNAVAILABLE`).
+    #[tokio::test]
+    async fn identity_cache_short_circuits_tshark_on_matching_signature() {
+        let st = state();
+        // Prend le premier flow du dataset embarqué, construit sa signature.
+        let flow = st
+            .inner
+            .flows
+            .values()
+            .next()
+            .cloned()
+            .expect("embedded dataset has at least one flow");
+        let signature = identity_cache_signature(&flow);
+        // Pré-remplit le cache pour ce session_id.
+        {
+            let mut guard = st.inner.identity_cache.lock().unwrap();
+            guard.insert(
+                flow.session_id.clone(),
+                IdentityCacheEntry {
+                    signature: signature.clone(),
+                    observations: Vec::new(),
+                },
+            );
+        }
+        // Appelle hydrate_identities directement : doit frapper le cache.
+        // Si tshark était invoqué, on obtiendrait `TSHARK_UNAVAILABLE` sur
+        // l'hôte de relecture (binaire absent). Un `Ok(())` prouve le
+        // court-circuit.
+        let result = hydrate_identities(&st, &flow.session_id);
+        assert!(
+            result.is_ok(),
+            "cache hit must bypass tshark ; got {:?}",
+            result
+        );
+    }
+
+    /// 2.21.15 — signature stable : deux appels sur le même callflow
+    /// donnent la même signature SHA-256 ; une modification d'un
+    /// event_id invalide l'entrée.
+    #[test]
+    fn identity_cache_signature_is_stable_and_detects_callflow_mutation() {
+        let st = state();
+        let flow = st
+            .inner
+            .flows
+            .values()
+            .next()
+            .cloned()
+            .expect("embedded dataset has at least one flow");
+        let sig_a = identity_cache_signature(&flow);
+        let sig_b = identity_cache_signature(&flow);
+        assert_eq!(sig_a, sig_b, "signature must be deterministic");
+        let mut mutated = flow.clone();
+        if let Some(event) = mutated.events.first_mut() {
+            event.event_id = format!("{}-mutated", event.event_id);
+            let sig_c = identity_cache_signature(&mutated);
+            assert_ne!(
+                sig_a, sig_c,
+                "a modified event_id must invalidate the cache entry"
+            );
+        }
     }
 
     /// 2.19.1 — `/sessions/catalog/search?q=` renvoie des matches

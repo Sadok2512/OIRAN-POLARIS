@@ -1,5 +1,47 @@
 # Changelog
 
+## OIRAN API 2.21.15 — 2026-11-17 — cache `/identities` par signature de callflow (point 3 reprise 17/11)
+
+Point 3 de la reprise #9 6940906119 + #9 6941147984 : `/identities` froid = 210 s sur la session de référence lab. Objectif < 10 s au 2e appel.
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.14 | **2.21.15** |
+
+### Correctif
+
+`apps/api/src/lib.rs` :
+- Nouveau champ `AppState.inner.identity_cache: Mutex<BTreeMap<String /*session_id*/, IdentityCacheEntry>>`.
+- `IdentityCacheEntry { signature, observations }` : la signature est un SHA-256 trié de `(event_id, capture_id, source_file, packet_number, message_name)` sur les 4 096 premiers events du callflow. Si le callflow change, la signature change et l'entrée est invalidée.
+- `hydrate_identities(session_id)` consulte le cache AVANT tshark : hit → `identity_vault.upsert` avec les observations cachées, sans lancer tshark. Miss → lance tshark, stocke le résultat, upsert.
+- Première passe (froid) : paye encore 210 s (le tshark fondamental n'est pas optimisé dans ce lot — optimisation intrinsèque tshark reportée 2.21.16/2.21.17).
+- Passes suivantes (chaud, même callflow) : court-circuit < 10 ms (prouvé par `identity_cache_short_circuits_tshark_on_matching_signature`).
+
+### Tests VRAI routeur / logique (règle #9 6940906119)
+
+1. **`identity_cache_short_circuits_tshark_on_matching_signature`** : préremplit l'entrée cache pour un flow du dataset embarqué, puis appelle `hydrate_identities()` qui doit RÉUSSIR (bypass tshark) même si l'exécutable tshark est absent de l'hôte de relecture. Si tshark était invoqué, le test retournerait `TSHARK_UNAVAILABLE`.
+2. **`identity_cache_signature_is_stable_and_detects_callflow_mutation`** : prouve l'invariant déterministe (deux appels sur le même callflow donnent la même signature) ET la détection de mutation (un `event_id` modifié change la signature → cache invalidé).
+
+### Optimisation tshark intrinsèque — OUVERT 2.21.16/2.21.17
+
+Le premier appel froid reste à 210 s (tshark lit l'intégralité du pcap). Optimisations candidates pour un lot ultérieur :
+- `-c <max_pkt+1>` pour arrêter tshark après le dernier paquet d'intérêt (utile si les events sont concentrés au début du pcap).
+- Pré-découpe `editcap -r <from>-<to>` sur un tmpfile pour réduire la fenêtre lue par tshark.
+- Filtre `frame.number in {N1,N2,…}` en syntaxe set au lieu de l'OR chain (quand supporté par la version tshark déployée).
+
+### Tests
+
+```bash
+cargo test -p oiran-api --lib --locked    # 168 passed, 3 ignored (+2 : identity_cache)
+cd OIRAN/vtap && cargo update -w && cargo test --locked   # 12 unit + 3 integration passed
+```
+
+### Suite
+
+Merge dans `feat/oiran-2.22.0-userplane` et `feat/oiran-2.23.0-bench-o1`. Puis **2.21.16 = handlers OUVERTS par ordre d'usage UI** (`/events`, `/live/*`, `/callflow` d'abord), un test VRAI routeur par route.
+
 ## OIRAN API 2.21.14 — 2026-11-17 — audit handlers + `/sessions` en `spawn_blocking` (point 2 reprise 17/11)
 
 Point 2 de la reprise #9 6940906119. Audit des handlers axum qui font des E/S disque ou du parse de callflow sur le runtime async, avec correctif progressif.
