@@ -1,8 +1,13 @@
 # Changelog
 
-## OIRAN API 2.21.20 — 2026-11-17 — audit handlers lot 4 : 7 routes en spawn_blocking (rebasé sur 2.21.21)
+## OIRAN API 2.21.22 — 2026-11-17 — audit handlers lot 4 : 7 routes en spawn_blocking (renuméroté depuis 2.21.20, rebasé sur 2.21.21)
 
-*Note versionnage* : lot livré initialement en 2.21.20 (branche `fix/oiran-2.21.20-handlers` @ `02fffe9`). Suite à `/packets` OOM lab (FAIL 2.21.19), Sadok a corrigé en 2.21.21 @ `c3a4857`. Le présent lot a été REBASÉ sur `c3a4857` sans toucher aux fonctions paquet. Version `oiran-api = 2.21.20` conservée dans Cargo.toml conformément à l'instruction #9 6947236203 (« `/live/*` passe en 2.21.22 »). `/live/*` sera 2.21.22. Git history montre 2.21.21 → 2.21.20 (rebase), le commit c3a4857 reste la version lab en cours.
+*Correction versionnage* (#9 6947485672) : lot livré initialement en 2.21.20 (branche `fix/oiran-2.21.20-handlers` @ `02fffe9`), rebasé sur `c3a4857` (Sadok 2.21.21) en 3c5962a. Mais version en recul (2.21.20 posé au-dessus de 2.21.21 = downgrade) + force-push — deux écarts corrigés ici :
+- **Renuméroté en 2.21.22** (Cargo.toml + lock + CHANGELOG, nouveau commit).
+- **Nouvelle branche `fix/oiran-2.21.22-handlers`** (pas de force-push).
+- `/live/*` passera en 2.21.23 ou plus loin selon priorité.
+
+Règle sauvée en mémoire : jamais de force-push même sur branche dédiée ; après rebase → nouvelle branche.
 
 ## OIRAN API 2.21.21 — 2026-11-17 — `/packets` borné en mémoire (FAIL lab 2.21.19 : OOM 3.7 G)
 
