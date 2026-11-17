@@ -2826,12 +2826,21 @@ async fn dataset_sessions(
 }
 
 async fn ues(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
+    // 2.21.19 (audit handlers lot 3 #9 6945061505) — iteration
+    // discovery.ue_contexts + capture_manager.datasets() sync. Déport
+    // spawn_blocking.
+    tokio::task::spawn_blocking(move || ues_blocking(&state, &query))
+        .await
+        .unwrap_or_else(|_| Json(json!({"error": "ues handler panicked"})))
+}
+
+fn ues_blocking(state: &AppState, query: &ListQuery) -> Json<Value> {
     let mut unique = state
         .inner
         .discovery
         .ue_contexts
         .iter()
-        .map(|context| (context.context_id.clone(), ue_summary(&state, context)))
+        .map(|context| (context.context_id.clone(), ue_summary(state, context)))
         .collect::<BTreeMap<_, _>>();
     for dataset in state.inner.capture_manager.datasets() {
         if let Some(discovery) = &dataset.discovery {
@@ -2853,35 +2862,46 @@ async fn ues(State(state): State<AppState>, Query(query): Query<ListQuery>) -> J
         query.sort.as_deref().unwrap_or("first_timestamp_ns"),
         query.order.as_deref(),
     );
-    paginated(items, &query)
+    paginated(items, query)
 }
 
 async fn ue(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if let Some(value) = state
-        .inner
-        .discovery
-        .ue_contexts
-        .iter()
-        .find(|context| context.context_id == id)
-        .map(|context| ok(ue_summary(&state, context)).into_response())
-    {
-        return value;
-    }
-    for dataset in state.inner.capture_manager.datasets() {
-        if let Some(context) = dataset.discovery.as_ref().and_then(|discovery| {
-            discovery
-                .ue_contexts
-                .iter()
-                .find(|context| context.context_id == id)
-        }) {
-            return ok(live_ue_summary(&dataset, context)).into_response();
+    // 2.21.19 — iteration capture_manager.datasets() + discovery sync.
+    tokio::task::spawn_blocking(move || {
+        if let Some(value) = state
+            .inner
+            .discovery
+            .ue_contexts
+            .iter()
+            .find(|context| context.context_id == id)
+            .map(|context| ok(ue_summary(&state, context)).into_response())
+        {
+            return value;
         }
-    }
-    api_error(
-        StatusCode::NOT_FOUND,
-        "UE_NOT_FOUND",
-        "unknown UE context id",
-    )
+        for dataset in state.inner.capture_manager.datasets() {
+            if let Some(context) = dataset.discovery.as_ref().and_then(|discovery| {
+                discovery
+                    .ue_contexts
+                    .iter()
+                    .find(|context| context.context_id == id)
+            }) {
+                return ok(live_ue_summary(&dataset, context)).into_response();
+            }
+        }
+        api_error(
+            StatusCode::NOT_FOUND,
+            "UE_NOT_FOUND",
+            "unknown UE context id",
+        )
+    })
+    .await
+    .unwrap_or_else(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UE_HANDLER_FAILED",
+            "ue handler panicked",
+        )
+    })
 }
 
 async fn ue_sessions(
@@ -6552,13 +6572,26 @@ fn session_callflow_blocking(state: &AppState, id: &str, query: &CallflowQuery) 
 }
 
 async fn session_correlations(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let flow = if let Some(flow) = flow_for(&state, &id) {
+    // 2.21.19 — flow_for / live_flow_for / lte_evidence_store.callflow_page_by_session sync.
+    tokio::task::spawn_blocking(move || session_correlations_blocking(&state, &id))
+        .await
+        .unwrap_or_else(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SESSION_CORRELATIONS_FAILED",
+                "session_correlations handler panicked",
+            )
+        })
+}
+
+fn session_correlations_blocking(state: &AppState, id: &str) -> Response {
+    let flow = if let Some(flow) = flow_for(state, id) {
         flow.clone()
-    } else if let Some((_dataset, flow)) = live_flow_for(&state, &id) {
+    } else if let Some((_dataset, flow)) = live_flow_for(state, id) {
         flow
     } else {
         return match state.inner.lte_evidence_store.callflow_page_by_session(
-            &id,
+            id,
             None,
             MAX_CALLFLOW_PAGE_EVENTS,
         ) {
@@ -6667,28 +6700,33 @@ fn packet_source_path(state: &AppState, packet: &Value) -> Option<PathBuf> {
 }
 
 async fn packets(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
-    let mut items = packet_values(&state);
-    if let Some(capture_id) = query.capture_id.as_deref() {
-        items.retain(|packet| packet["capture_id"] == capture_id);
-    }
-    if let Some(event_id) = query.event_id.as_deref() {
-        items.retain(|packet| packet["event_id"] == event_id);
-    }
-    if let Some(packet_number) = query.packet_number {
-        items.retain(|packet| packet["packet_number"].as_u64() == Some(packet_number));
-    }
-    if let Some(interface) = query.interface.as_deref() {
-        items.retain(|packet| packet["interface"] == interface);
-    }
-    if let Some(protocol) = query.protocol.as_deref() {
-        items.retain(|packet| packet["protocol"] == protocol);
-    }
-    if let Some(search) = query.search.as_deref() {
-        let search = search.to_ascii_lowercase();
-        items.retain(|packet| packet.to_string().to_ascii_lowercase().contains(&search));
-    }
-    sanitize_all(&mut items);
-    paginated(items, &query)
+    // 2.21.19 — packet_values(state) traverse flow_values + callflows.
+    tokio::task::spawn_blocking(move || {
+        let mut items = packet_values(&state);
+        if let Some(capture_id) = query.capture_id.as_deref() {
+            items.retain(|packet| packet["capture_id"] == capture_id);
+        }
+        if let Some(event_id) = query.event_id.as_deref() {
+            items.retain(|packet| packet["event_id"] == event_id);
+        }
+        if let Some(packet_number) = query.packet_number {
+            items.retain(|packet| packet["packet_number"].as_u64() == Some(packet_number));
+        }
+        if let Some(interface) = query.interface.as_deref() {
+            items.retain(|packet| packet["interface"] == interface);
+        }
+        if let Some(protocol) = query.protocol.as_deref() {
+            items.retain(|packet| packet["protocol"] == protocol);
+        }
+        if let Some(search) = query.search.as_deref() {
+            let search = search.to_ascii_lowercase();
+            items.retain(|packet| packet.to_string().to_ascii_lowercase().contains(&search));
+        }
+        sanitize_all(&mut items);
+        paginated(items, &query)
+    })
+    .await
+    .unwrap_or_else(|_| Json(json!({"error": "packets handler panicked"})))
 }
 
 async fn packet(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -12881,6 +12919,119 @@ mod tests {
         );
         let sess = sess_task.await.unwrap();
         assert_eq!(sess.status(), StatusCode::OK);
+    }
+
+    /// 2.21.19 (audit handlers lot 3 #9 6945061505) — un test VRAI
+    /// routeur par route fixée : /ues, /ue/:id, /session_correlations,
+    /// /packets. Chaque test lance la route lourde en concurrence et
+    /// mesure `/health` qui DOIT répondre en < 500 ms.
+    #[tokio::test]
+    async fn ues_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_u = app.clone();
+        let ues_task = tokio::spawn(async move {
+            app_u.oneshot(req("/api/v1/ues", false)).await.unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "/health starved by /ues ; {:?}",
+            start.elapsed()
+        );
+        assert_eq!(ues_task.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ue_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let ue_id = st
+            .inner
+            .discovery
+            .ue_contexts
+            .first()
+            .map(|context| context.context_id.clone())
+            .unwrap_or_else(|| "nonexistent".into());
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_u = app.clone();
+        let uid = ue_id.clone();
+        let ue_task = tokio::spawn(async move {
+            app_u
+                .oneshot(req(&format!("/api/v1/ues/{uid}"), false))
+                .await
+                .unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "/health starved by /ues/{{id}} ; {:?}",
+            start.elapsed()
+        );
+        let _ = ue_task.await.unwrap(); // 200 ou 404 selon existence
+    }
+
+    #[tokio::test]
+    async fn session_correlations_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let session_id = st
+            .inner
+            .flows
+            .keys()
+            .next()
+            .cloned()
+            .expect("embedded dataset has at least one session");
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_c = app.clone();
+        let sid = session_id.clone();
+        let c_task = tokio::spawn(async move {
+            app_c
+                .oneshot(req(
+                    &format!("/api/v1/sessions/{sid}/correlations"),
+                    false,
+                ))
+                .await
+                .unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "/health starved by /sessions/:id/correlations ; {:?}",
+            start.elapsed()
+        );
+        assert_eq!(c_task.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn packets_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_p = app.clone();
+        let p_task = tokio::spawn(async move {
+            app_p.oneshot(req("/api/v1/packets", false)).await.unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "/health starved by /packets ; {:?}",
+            start.elapsed()
+        );
+        assert_eq!(p_task.await.unwrap().status(), StatusCode::OK);
     }
 
     /// 2.19.1 — `/sessions/catalog/search?q=` renvoie des matches
