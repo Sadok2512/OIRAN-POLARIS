@@ -3611,9 +3611,31 @@ async fn subscribers(State(state): State<AppState>, Query(query): Query<ListQuer
 }
 
 async fn subscriber_journey(State(state): State<AppState>, Path(pseudo): Path<String>) -> Response {
-    let flows = queryable_flows(&state);
-    let index = subscriber_journey::JourneyIndex::from_flows(flows.values());
-    let sessions = index.sessions(&pseudo);
+    // 2.21.20 — queryable_flows + JourneyIndex::from_flows + fs reads.
+    tokio::task::spawn_blocking(move || {
+        let flows = queryable_flows(&state);
+        let index = subscriber_journey::JourneyIndex::from_flows(flows.values());
+        let sessions = index.sessions(&pseudo);
+        subscriber_journey_render(&state, &flows, &index, &pseudo, sessions)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SUBSCRIBER_JOURNEY_FAILED",
+            "subscriber_journey handler panicked",
+        )
+    })
+}
+
+fn subscriber_journey_render(
+    state: &AppState,
+    flows: &BTreeMap<String, CallFlow>,
+    index: &subscriber_journey::JourneyIndex,
+    pseudo: &str,
+    sessions: Vec<subscriber_journey::JourneySession>,
+) -> Response {
+    let sessions = sessions;
     if sessions.is_empty() {
         return api_error(
             StatusCode::NOT_FOUND,
@@ -3625,7 +3647,7 @@ async fn subscriber_journey(State(state): State<AppState>, Path(pseudo): Path<St
     for session in &sessions {
         let context_id = flows
             .get(&session.session_id)
-            .and_then(|flow| discovered_session_for_flow(&state, flow))
+            .and_then(|flow| discovered_session_for_flow(state, flow))
             .map(|session| session.ue_context_id.clone())
             .unwrap_or_else(|| format!("ue-context-for-{}", session.session_id));
         contexts
@@ -3637,14 +3659,27 @@ async fn subscriber_journey(State(state): State<AppState>, Path(pseudo): Path<St
         "subscriber_pseudonym":pseudo,
         "contexts":contexts.into_iter().map(|(ue_context_id, session_ids)| json!({"ue_context_id":ue_context_id,"session_ids":session_ids})).collect::<Vec<_>>(),
         "sessions":sessions,
-        "links":index.links(&pseudo),
+        "links":index.links(pseudo),
         "ordering":"capture_id,packet_number,event_id"
     })).into_response()
 }
 
 async fn subscriber_tmsi(State(state): State<AppState>, Path(pseudo): Path<String>) -> Response {
-    let index = cached_journey_index(&state);
-    if index.sessions(&pseudo).is_empty() {
+    // 2.21.20 — cached_journey_index parcourt flows + callflows.
+    tokio::task::spawn_blocking(move || subscriber_tmsi_blocking(&state, &pseudo))
+        .await
+        .unwrap_or_else(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SUBSCRIBER_TMSI_FAILED",
+                "subscriber_tmsi handler panicked",
+            )
+        })
+}
+
+fn subscriber_tmsi_blocking(state: &AppState, pseudo: &str) -> Response {
+    let index = cached_journey_index(state);
+    if index.sessions(pseudo).is_empty() {
         return api_error(
             StatusCode::NOT_FOUND,
             "SUBSCRIBER_NOT_FOUND",
@@ -4125,6 +4160,24 @@ async fn sessions_filter(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<SessionsFilterRequest>,
+) -> Response {
+    // 2.21.20 — role_from_headers + cached_journey_index + heavy filter
+    // traversal. Wrap entier dans spawn_blocking (headers Send, request Send).
+    tokio::task::spawn_blocking(move || sessions_filter_blocking(state, headers, request))
+        .await
+        .unwrap_or_else(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SESSIONS_FILTER_FAILED",
+                "sessions_filter handler panicked",
+            )
+        })
+}
+
+fn sessions_filter_blocking(
+    state: AppState,
+    headers: HeaderMap,
+    request: SessionsFilterRequest,
 ) -> Response {
     let role = role_from_headers(&state, &headers);
     if request.identity.is_some() && !role.can_control() {
@@ -4818,7 +4871,7 @@ fn build_protocol_tree(
 /// Recherche insensible à la casse sur messages ET paramètres. Tri par
 /// pertinence (exact > préfixe > contient). Jamais de liste figée :
 /// 100 % issu de `ProtocolTreeBuilder` construit sur les events réels.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 struct SessionsCatalogSearchQuery {
     #[serde(default)]
     q: Option<String>,
@@ -4832,37 +4885,49 @@ async fn sessions_catalog_search(
     State(state): State<AppState>,
     Query(query): Query<SessionsCatalogSearchQuery>,
 ) -> Response {
-    let needle = match query.q.as_deref() {
-        Some(s) if !s.trim().is_empty() => s.trim().to_owned(),
-        _ => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "SEARCH_QUERY_EMPTY",
-                "query parameter `q` is required and must be non-empty",
-            );
-        }
-    };
-    let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let interfaces_scope = parse_csv(&query.interfaces);
-    let empty_set = std::collections::BTreeSet::<String>::new();
-    let builder = build_protocol_tree(&state, &interfaces_scope, &empty_set, None, None, None);
-    let results = session_catalog::search_protocol_tree(
-        &builder,
-        &needle,
-        &interfaces_scope,
-        limit,
-    );
-    let total = results.len();
-    ok(json!({
-        "results": results,
-        "query": {
-            "q": needle,
-            "interfaces": query.interfaces,
-            "limit": limit,
-        },
-        "total": total,
-    }))
-    .into_response()
+    // 2.21.20 — build_protocol_tree parcourt datasets + callflows.
+    tokio::task::spawn_blocking(move || {
+        let needle = match query.q.as_deref() {
+            Some(s) if !s.trim().is_empty() => s.trim().to_owned(),
+            _ => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "SEARCH_QUERY_EMPTY",
+                    "query parameter `q` is required and must be non-empty",
+                );
+            }
+        };
+        let limit = query.limit.unwrap_or(50).clamp(1, 200);
+        let interfaces_scope = parse_csv(&query.interfaces);
+        let empty_set = std::collections::BTreeSet::<String>::new();
+        let builder =
+            build_protocol_tree(&state, &interfaces_scope, &empty_set, None, None, None);
+        let results = session_catalog::search_protocol_tree(
+            &builder,
+            &needle,
+            &interfaces_scope,
+            limit,
+        );
+        let total = results.len();
+        ok(json!({
+            "results": results,
+            "query": {
+                "q": needle,
+                "interfaces": query.interfaces,
+                "limit": limit,
+            },
+            "total": total,
+        }))
+        .into_response()
+    })
+    .await
+    .unwrap_or_else(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SESSIONS_CATALOG_SEARCH_FAILED",
+            "sessions_catalog_search handler panicked",
+        )
+    })
 }
 
 /// 2.19.1 — `GET /api/v1/sessions/catalog/param?interface=&protocol=
@@ -5112,6 +5177,23 @@ async fn sessions_columns(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<session_catalog::SessionsColumnsRequest>,
+) -> Response {
+    // 2.21.20 — gros parcours datasets + callflows pour calcul des colonnes.
+    tokio::task::spawn_blocking(move || sessions_columns_blocking(state, headers, request))
+        .await
+        .unwrap_or_else(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SESSIONS_COLUMNS_FAILED",
+                "sessions_columns handler panicked",
+            )
+        })
+}
+
+fn sessions_columns_blocking(
+    state: AppState,
+    headers: HeaderMap,
+    request: session_catalog::SessionsColumnsRequest,
 ) -> Response {
     let role = role_from_headers(&state, &headers);
     let requested_columns = match session_catalog::validate_columns(&request.columns) {
@@ -7046,18 +7128,25 @@ async fn correlation_edges(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Json<Value> {
-    let mut items = state
-        .inner
-        .flows
-        .values()
-        .flat_map(|flow| flow.correlation_edges.iter())
-        .filter_map(|edge| serde_json::to_value(edge).ok())
-        .collect::<Vec<_>>();
-    if let Some(interface) = query.interface.as_deref() {
-        items.retain(|x| x["source_interface"] == interface || x["target_interface"] == interface);
-    }
-    sanitize_all(&mut items);
-    paginated(items, &query)
+    // 2.21.20 — iteration flows + correlation_edges + serialize.
+    tokio::task::spawn_blocking(move || {
+        let mut items = state
+            .inner
+            .flows
+            .values()
+            .flat_map(|flow| flow.correlation_edges.iter())
+            .filter_map(|edge| serde_json::to_value(edge).ok())
+            .collect::<Vec<_>>();
+        if let Some(interface) = query.interface.as_deref() {
+            items.retain(|x| {
+                x["source_interface"] == interface || x["target_interface"] == interface
+            });
+        }
+        sanitize_all(&mut items);
+        paginated(items, &query)
+    })
+    .await
+    .unwrap_or_else(|_| Json(json!({"error": "correlation_edges handler panicked"})))
 }
 
 async fn correlation_rules() -> Json<Value> {
@@ -7067,7 +7156,7 @@ async fn correlation_rules() -> Json<Value> {
     ]))
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 struct ExportQuery {
     format: Option<String>,
 }
@@ -7076,7 +7165,20 @@ async fn export_callflow(
     Path(id): Path<String>,
     Query(query): Query<ExportQuery>,
 ) -> Response {
-    let mut value = if let Some(flow) = flow_for(&state, &id) {
+    // 2.21.20 — flow_for + flow_value_for + callflow fs writes.
+    tokio::task::spawn_blocking(move || export_callflow_blocking(&state, &id, &query))
+        .await
+        .unwrap_or_else(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EXPORT_CALLFLOW_FAILED",
+                "export_callflow handler panicked",
+            )
+        })
+}
+
+fn export_callflow_blocking(state: &AppState, id: &str, query: &ExportQuery) -> Response {
+    let mut value = if let Some(flow) = flow_for(state, id) {
         flow_value_for(&state, &id)
             .cloned()
             .unwrap_or_else(|| serde_json::to_value(flow).unwrap_or(json!({})))
@@ -13290,6 +13392,117 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(p_task.await.unwrap().status(), StatusCode::OK);
+    }
+
+    /// 2.21.20 — tests VRAI routeur pour les handlers du lot 4.
+    #[tokio::test]
+    async fn subscriber_tmsi_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_s = app.clone();
+        let s_task = tokio::spawn(async move {
+            app_s
+                .oneshot(req(
+                    "/api/v1/subscribers/sha256-nonexistent/tmsi",
+                    false,
+                ))
+                .await
+                .unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "/health starved by /subscribers/.../tmsi ; {:?}",
+            start.elapsed()
+        );
+        let _ = s_task.await.unwrap(); // 404 attendu sur pseudo synthétique
+    }
+
+    #[tokio::test]
+    async fn sessions_catalog_search_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_s = app.clone();
+        let s_task = tokio::spawn(async move {
+            app_s
+                .oneshot(req("/api/v1/sessions/catalog/search?q=Cause", false))
+                .await
+                .unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "/health starved by /sessions/catalog/search ; {:?}",
+            start.elapsed()
+        );
+        assert_eq!(s_task.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn correlation_edges_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_e = app.clone();
+        let e_task = tokio::spawn(async move {
+            app_e
+                .oneshot(req("/api/v1/correlation/edges", false))
+                .await
+                .unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "/health starved by /correlation_edges ; {:?}",
+            start.elapsed()
+        );
+        assert_eq!(e_task.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn export_callflow_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let session_id = st
+            .inner
+            .flows
+            .keys()
+            .next()
+            .cloned()
+            .expect("embedded dataset has at least one session");
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_x = app.clone();
+        let sid = session_id.clone();
+        let x_task = tokio::spawn(async move {
+            app_x
+                .oneshot(req(
+                    &format!("/api/v1/sessions/{sid}/export?format=json"),
+                    false,
+                ))
+                .await
+                .unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "/health starved by /sessions/.../export ; {:?}",
+            start.elapsed()
+        );
+        let _ = x_task.await.unwrap();
     }
 
     /// 2.19.1 — `/sessions/catalog/search?q=` renvoie des matches
