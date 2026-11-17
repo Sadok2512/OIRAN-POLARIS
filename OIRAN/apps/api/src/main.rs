@@ -1,4 +1,4 @@
-use oiran_api::{router, ApiConfig, AppState};
+use oiran_api::{router, warm_health_snapshot, ApiConfig, AppState};
 use std::{env, net::SocketAddr, path::PathBuf};
 
 #[tokio::main]
@@ -22,6 +22,7 @@ async fn run() -> Result<(), String> {
     let state = AppState::load(ApiConfig::from_workspace(&workspace))?;
     let dist = workspace.join("apps/web/dist");
     let frontend = dist.is_dir().then_some(dist);
+    warm_health_snapshot(&state);
     let app = router(state, frontend);
     let listener = tokio::net::TcpListener::bind(bind)
         .await

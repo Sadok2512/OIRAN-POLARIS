@@ -1389,7 +1389,22 @@ fn compute_health_counters(state: &AppState) -> Value {
 /// 2.21.13 — durée de validité de l'instantané `/health`.
 const HEALTH_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// 2.21.13 — attente max du tout premier calcul avant de répondre sans compteurs.
-const HEALTH_FIRST_COMPUTE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// 2.21.22 (FAIL lab 2.21.21 : 5 réponses `/health` à 1,66–2,01 s pendant
+/// `counters_status=computing`) — en production `/health` n'attend JAMAIS :
+/// sans instantané il répond aussitôt `computing`, et l'instantané est
+/// amorcé au démarrage (`warm_health_snapshot`). L'attente n'existe que sous
+/// `cfg(test)`, où les tests lisent les compteurs dès le premier appel.
+const HEALTH_FIRST_COMPUTE_WAIT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(2)
+} else {
+    std::time::Duration::ZERO
+};
+
+/// 2.21.22 — amorce l'instantané `/health` au démarrage du service, en
+/// arrière-plan, pour que le premier `/health` ait déjà ses compteurs.
+pub fn warm_health_snapshot(state: &AppState) {
+    spawn_health_refresh(state);
+}
 
 fn spawn_health_refresh(state: &AppState) {
     use std::sync::atomic::Ordering;
@@ -1413,6 +1428,11 @@ fn spawn_health_refresh(state: &AppState) {
 /// jamais en silence ; au tout premier appel, attente ≤ 2 s puis réponse
 /// `counters_status = "computing"`.
 async fn health(State(state): State<AppState>) -> Json<Value> {
+    health_response(&state, HEALTH_FIRST_COMPUTE_WAIT).await
+}
+
+async fn health_response(state: &AppState, first_wait: std::time::Duration) -> Json<Value> {
+    let state = state.clone();
     let snapshot = |state: &AppState| state.inner.health_cache.lock().unwrap().clone();
     let mut current = snapshot(&state);
     let stale = current
@@ -1423,7 +1443,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         spawn_health_refresh(&state);
     }
     if current.is_none() {
-        let deadline = std::time::Instant::now() + HEALTH_FIRST_COMPUTE_WAIT;
+        let deadline = std::time::Instant::now() + first_wait;
         while current.is_none() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             current = snapshot(&state);
@@ -12852,6 +12872,29 @@ mod tests {
         assert_eq!(second["data"]["counters_status"], "stale");
         assert!(second["data"]["counters_age_ms"].as_u64().unwrap() >= 60_000);
         assert_eq!(second["data"]["session_count"], count);
+    }
+
+    /// 2.21.22 (FAIL lab 2.21.21) — sans instantané et avec un calcul en
+    /// cours, `/health` en production répond aussitôt `computing`, sans attendre.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_never_waits_for_first_counters_in_production_mode() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        *st.inner.health_cache.lock().unwrap() = None;
+        st.inner.health_refreshing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let start = Instant::now();
+        let Json(value) = health_response(&st, Duration::ZERO).await;
+        assert!(start.elapsed() < Duration::from_millis(50), "vu {:?}", start.elapsed());
+        assert_eq!(value["data"]["counters_status"], "computing");
+        assert_eq!(value["data"]["status"], "healthy");
+        st.inner.health_refreshing.store(false, std::sync::atomic::Ordering::SeqCst);
+        warm_health_snapshot(&st);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while st.inner.health_cache.lock().unwrap().is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let Json(value) = health_response(&st, Duration::ZERO).await;
+        assert_eq!(value["data"]["counters_status"], "fresh");
     }
 
     /// 2.21.14 (règle #9 6940906119 — audit handlers) — prouve via le

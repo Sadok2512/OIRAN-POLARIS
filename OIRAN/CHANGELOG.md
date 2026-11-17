@@ -1,5 +1,15 @@
 # Changelog
 
+## OIRAN API 2.21.22 — 2026-11-17 — `/health` n'attend plus jamais en production (FAIL lab 2.21.21, gate a)
+
+Upgrade **patch**. Cause : sans instantané de compteurs, `/health` attendait jusqu'à 2 s le premier calcul (2.21.13). Au lab : 5 réponses entre 1,66 et 2,01 s avec `counters_status=computing` pendant `/identities` froid (ANR2 #10).
+
+- Production : aucune attente. Sans instantané → réponse immédiate `status=healthy`, `counters_status=computing`, sans compteurs (jamais de compteur inventé).
+- `warm_health_snapshot` amorce l'instantané au démarrage (`main.rs`), en arrière-plan.
+- L'attente ≤ 2 s ne subsiste que sous `cfg(test)`.
+- Test `health_never_waits_for_first_counters_in_production_mode` : réponse < 50 ms en `computing`, puis `fresh` après amorçage.
+- Numérotation : les lots DEVMAT sont décalés d'un cran (handlers 2.21.23, mémoire 2.21.24, `/live/*` 2.21.25).
+
 ## OIRAN API 2.21.21 — 2026-11-17 — `/packets` borné en mémoire (FAIL lab 2.21.19 : OOM 3.7 G)
 
 Upgrade **patch**. Cause : `packet_values` matérialisait TOUS les callflows (`queryable_flows`) puis leur copie JSON, puis un objet par paquet avec son arbre d'IE. Au lab, `/packets?page=1&page_size=100` → 502 + `oom-kill` (3.7G memory peak, ANR2 #10). Défaut antérieur à 2.21.19, rendu visible par la preuve d) ; `/packet/:id` et `/packets/:capture/:n/dissect` avaient le même chemin.
