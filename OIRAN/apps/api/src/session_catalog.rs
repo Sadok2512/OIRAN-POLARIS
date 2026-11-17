@@ -501,7 +501,7 @@ fn parse_i64_from(value: &Value) -> Option<i64> {
 /// stable, impossible dans un `name` de spec 3GPP).
 pub type ProtocolTreeKey = (String, String, String, String);
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct ProtocolTreeBuilder {
     /// Compte d'occurrences par (interface, protocol, message).
     message_counts: BTreeMap<(String, String, String), usize>,

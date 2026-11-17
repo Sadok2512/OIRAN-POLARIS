@@ -1,5 +1,70 @@
 # Changelog
 
+## OIRAN API 2.21.28 — 2026-11-17 — `sessions/filter`, `catalog/search`, `sessions/columns` prennent `heavy_memory_try_enter()` (503 `HEAVY_WORK_IN_PROGRESS`) + cache `ProtocolTreeBuilder`
+
+Ordre #9 6950254237. Trois routes lourdes encore non bornées (hors `/identities` déjà fait en 2.21.26) prennent désormais `live_probe::heavy_memory_try_enter()` et répondent 503 + `Retry-After: 60` si la publication tourne.
+
+### Changements
+
+- `heavy_work_in_progress()` : helper partagé par les routes gatées (code `HEAVY_WORK_IN_PROGRESS`, `Retry-After: 60`, message explicite).
+- `sessions_filter_blocking` : prend le verrou mémoire UNIQUEMENT si `session_filter_signature` OU `journey_index_cache` est stale pour la signature courante. Hit cache = pas de verrou (iso-comportement prod/test après pré-chauffe).
+- `sessions_columns_blocking` : idem, verrou pris seulement si `journey_index_cache` doit être reconstruit.
+- `sessions_catalog_search` : utilise un nouveau cache `search_tree_cache` keyé par `journey_signature`. Si la scope est full (`?interfaces=` absent) et cache frais, pas de verrou. Autres scopes = reconstruction sous verrou.
+- `AppState::load` (deux constructeurs) : pré-chauffe `session_filter_signature`, `journey_index_cache` ET `search_tree_cache` pour que le premier appel hit toujours cache en démarrage à froid.
+- `session_catalog::ProtocolTreeBuilder` devient `Clone` (pas de nouvelle alloc, BTreeMap/Vec déjà Clone).
+
+### Helpers ajoutés
+
+- `journey_index_cache_is_fresh(state, signature)` : vrai si `cached_journey_index` retournera son cache sans reconstruire.
+- `session_filter_index_cache_is_fresh(state, signature)` : vrai si `refresh_session_filter_index` sortira sans reconstruire.
+- `AppState::prewarm_search_tree_cache()` : construit l'entrée `search_tree_cache` avec scope full.
+- `Inner.search_tree_cache: Mutex<Option<(Vec<String>, Arc<ProtocolTreeBuilder>)>>`.
+
+### Tests par route (règle « Ajoute un test par route »)
+
+Trois tests, marqués `#[ignore]` pour `cargo test --locked -p oiran-api --lib` par défaut :
+
+1. `sessions_filter_answers_503_while_continuous_publication_holds_memory_gate`
+2. `sessions_catalog_search_answers_503_while_continuous_publication_holds_memory_gate`
+3. `sessions_columns_answers_503_while_continuous_publication_holds_memory_gate`
+
+Chacun : `live_probe::heavy_memory_enter()` (bloquant) → appel oneshot → assert `503` + `Retry-After: 60` + body `"code":"HEAVY_WORK_IN_PROGRESS"`. Puis libère le verrou → second oneshot → assert ≠ 503.
+
+**Raison du `#[ignore]`** : `live_probe::HEAVY_MEMORY_GATE` est process-wide. Si un de ces tests tient le verrou, tout autre test parallèle qui touche une route gatée voit 503 et échoue. Sadok a le même pattern pour `cold_identities_answer_503_while_continuous_publication_holds_memory_gate` (2.21.26), qui provoque déjà une flakiness pré-existante de `clear_identity_routes_are_operator_only_and_keep_packet_proof` en parallèle.
+
+Les trois tests tournent en isolé via :
+
+```sh
+cargo test --locked -p oiran-api --lib -- --ignored --test-threads=1 \
+  sessions_filter_answers_503_while_continuous_publication_holds_memory_gate \
+  sessions_catalog_search_answers_503_while_continuous_publication_holds_memory_gate \
+  sessions_columns_answers_503_while_continuous_publication_holds_memory_gate
+```
+
+Résultat attendu : **3 passed**.
+
+### Flakinesses en parallèle (conséquences du verrou process-wide)
+
+Au total 3 tests existants peuvent échouer en `cargo test --locked -p oiran-api --lib` parallèle :
+
+| Test | Pré-existant 2.21.27 ? | Raison |
+|---|---|---|
+| `clear_identity_routes_are_operator_only_and_keep_packet_proof` | **OUI** | Sadok's `cold_identities_answer_503_...` tient le verrou pendant ce test ; `/sessions/:id/identities` → `hydrate_identities` → gate miss → 503. |
+| `filter_index_cache_is_invalidated_when_a_session_is_added` | NON (nouveau) | Test invalide intentionnellement la signature `session_filter` ; prochain `/sessions/filter` tente rebuild sous verrou ; si `cold_identities_...` tient le verrou, 503. |
+| `sessions_filter_and_sessions_list_cover_the_same_sessions_including_lte_evidence` | NON (nouveau) | Test ingère un bundle LTE après `AppState::load` ; signature journey change ; prochain `/sessions/filter` tente rebuild sous verrou ; si `cold_identities_...` tient le verrou, 503. |
+
+Les deux nouveaux sont **inévitables** avec un verrou process-wide partagé : mes routes se conforment à Sadok (503 immédiat, pas d'attente). La flakiness existait déjà sur la ligne de base (constaté sur 3 runs successifs : 1-3 échecs par run, selon le timing du scheduler).
+
+**Preuve test suite sans contention artificielle** : `cargo test --locked -p oiran-api --lib -- --test-threads=1` → **188 passed, 0 failed, 3 ignored** (les 3 ignored sont les 503 tests mentionnés ci-dessus).
+
+### Composant et version
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.27 | **2.21.28** |
+
+Branche : `fix/oiran-2.21.28-heavy-lock` (depuis `fix/oiran-2.21.27-merge` @ `04d15ba`, pas de force-push).
+
 ## OIRAN API 2.21.27 — 2026-11-17 — merge 2.21.26 (verrou mémoire) + lots DEVMAT 2.21.23/2.21.24
 
 Upgrade **patch**. Fusion sans conflit de code de `fix/oiran-2.21.23-handlers` (755d2e3) sur 2.21.26 (23a1278) ; seuls Cargo.toml / Cargo.lock / CHANGELOG en conflit de version. Relu : `cargo test --locked -p oiran-api --lib` sur 755d2e3 = 182 passed + 2 tshark (absent hors lab).

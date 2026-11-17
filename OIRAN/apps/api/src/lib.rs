@@ -150,6 +150,13 @@ struct Inner {
     /// scope (interfaces/technologies/from/to/run_id) pour que deux
     /// portées différentes ne se partagent pas une entrée.
     sessions_catalog_cache: std::sync::Mutex<SessionsCatalogCache>,
+    /// 2.21.28 (ordre #9 6950254237) — cache `ProtocolTreeBuilder` de
+    /// `/sessions/catalog/search` keyé par `journey_signature`.
+    /// Permet au handler, lorsque la signature n'a pas changé, de
+    /// répondre sans reconstruire et sans tenter
+    /// `heavy_memory_try_enter()`. Pré-chauffé à `AppState::load`.
+    search_tree_cache:
+        std::sync::Mutex<Option<(Vec<String>, std::sync::Arc<session_catalog::ProtocolTreeBuilder>)>>,
     /// 2.21.13 — instantané des compteurs de `/health`, recalculé en
     /// arrière-plan (`spawn_blocking`). `/health` ne fait plus AUCUNE
     /// E/S ni aucun parse de callflow sur le runtime async.
@@ -710,7 +717,7 @@ impl AppState {
             );
         }
         let session_filter_index = session_filters::SessionFilterIndex::from_flows(flows.values());
-        Ok(Self {
+        let state = Self {
             inner: Arc::new(Inner {
                 flows,
                 flow_values,
@@ -743,12 +750,24 @@ impl AppState {
                 journey_index_cache: std::sync::Mutex::new(None),
                 list_row_cache: std::sync::Mutex::new(ListRowCache::new()),
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
+                search_tree_cache: std::sync::Mutex::new(None),
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
                 identity_cache: std::sync::Mutex::new(BTreeMap::new()),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
-        })
+        };
+        // 2.21.28 (ordre #9 6950254237) — pré-chauffe les caches
+        // `session_filter_signature` + `journey_index_cache` +
+        // `search_tree_cache` à la construction de l'état. Objectif :
+        // qu'un appel qui arrive après un démarrage à froid (ou
+        // n'importe quel test unitaire) hit cache et ne tente pas
+        // d'acquérir `heavy_memory_try_enter()`. Iso-comportement
+        // prod / test.
+        state.refresh_session_filter_index();
+        let _ = cached_journey_index(&state);
+        state.prewarm_search_tree_cache();
+        Ok(state)
     }
 
     fn load_operational(
@@ -802,7 +821,7 @@ impl AppState {
         let compact_index_registry = Arc::new(read_time_patch::CompactJsonlIndexRegistry::new(
             read_time_patch_counters.clone(),
         ));
-        Ok(Self {
+        let state = Self {
             inner: Arc::new(Inner {
                 flows: BTreeMap::new(),
                 flow_values: BTreeMap::new(),
@@ -830,6 +849,7 @@ impl AppState {
                 journey_index_cache: std::sync::Mutex::new(None),
                 list_row_cache: std::sync::Mutex::new(ListRowCache::new()),
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
+                search_tree_cache: std::sync::Mutex::new(None),
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
                 identity_cache: std::sync::Mutex::new(BTreeMap::new()),
@@ -837,7 +857,14 @@ impl AppState {
                     session_filters::SessionFilterIndex::empty(),
                 ),
             }),
-        })
+        };
+        // 2.21.28 (ordre #9 6950254237) — pré-chauffe idem à
+        // `load`. Permet aux routes gated d'hit cache au premier
+        // appel sans tenter `heavy_memory_try_enter()`.
+        state.refresh_session_filter_index();
+        let _ = cached_journey_index(&state);
+        state.prewarm_search_tree_cache();
+        Ok(state)
     }
 }
 
@@ -846,6 +873,20 @@ impl AppState {
     /// partir des `flows` statiques + des `callflows/` de chaque
     /// dataset publié par le `CaptureManager` (continuous +
     /// derived). Appelé à chaque rafraîchissement opérationnel.
+    /// 2.21.28 (ordre #9 6950254237) — construit l'entrée
+    /// `search_tree_cache` avec scope full (interfaces=∅) et stocke la
+    /// signature courante. Appelé au `load` ; les appels suivants à
+    /// `/sessions/catalog/search` sans `?interfaces=` hit cache sans
+    /// prendre le verrou mémoire tant que la signature ne change pas.
+    fn prewarm_search_tree_cache(&self) {
+        let signature = journey_signature(self);
+        let empty_set = std::collections::BTreeSet::<String>::new();
+        let builder = build_protocol_tree(self, &empty_set, &empty_set, None, None, None);
+        if let Ok(mut guard) = self.inner.search_tree_cache.lock() {
+            *guard = Some((signature, std::sync::Arc::new(builder)));
+        }
+    }
+
     fn refresh_session_filter_index(&self) {
         // 2.18.12 (audit perf) — appelée à CHAQUE page de
         // POST /sessions/filter : relisait et re-parsait tous les call
@@ -3470,6 +3511,32 @@ type ListRowCache =
     std::collections::HashMap<(String, String), (ListRowCacheSignature, Value, Value)>;
 type JourneyCache = Option<(Vec<String>, std::sync::Arc<subscriber_journey::JourneyIndex>)>;
 
+/// 2.21.28 (ordre #9 6950254237) — vrai si `cached_journey_index(state)`
+/// retournera son cache sans reconstruire. Permet au handler de ne
+/// prendre `heavy_memory_try_enter()` que quand une reconstruction est
+/// réellement nécessaire (iso-comportement pour tout appel hit-cache).
+fn journey_index_cache_is_fresh(state: &AppState, signature: &[String]) -> bool {
+    match state.inner.journey_index_cache.lock() {
+        Ok(guard) => guard
+            .as_ref()
+            .map(|(cached_signature, _)| cached_signature.as_slice() == signature)
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// 2.21.28 (ordre #9 6950254237) — vrai si
+/// `refresh_session_filter_index` retournera sans reconstruire.
+fn session_filter_index_cache_is_fresh(state: &AppState, signature: &[String]) -> bool {
+    match state.inner.session_filter_signature.lock() {
+        Ok(guard) => guard
+            .as_ref()
+            .map(|cached_signature| cached_signature.as_slice() == signature)
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::JourneyIndex> {
     let signature = journey_signature(state);
     if let Ok(cache) = state.inner.journey_index_cache.lock() {
@@ -4265,6 +4332,24 @@ fn sessions_filter_blocking(
             "identity-scoped session filtering requires an operator bearer",
         );
     }
+    // 2.21.28 (ordre #9 6950254237) — borne process-wide : un seul
+    // travail lourd en mémoire (publication OU route API) à la fois.
+    // La publication prend le verrou en bloquant ; ici on `try` et on
+    // répond 503 explicite si elle tourne. Même pattern que le chemin
+    // froid `/identities` (2.21.26, Sadok) : le verrou n'est pris QUE
+    // si une reconstruction (filter index OU journey index) est
+    // nécessaire. Un appel qui hit les deux caches ne touche pas le
+    // verrou — iso-comportement test / prod.
+    let signature = journey_signature(&state);
+    let filter_fresh = session_filter_index_cache_is_fresh(&state, &signature);
+    let journey_fresh = journey_index_cache_is_fresh(&state, &signature);
+    if !filter_fresh || !journey_fresh {
+        let Some(_heavy_memory_gate) = live_probe::heavy_memory_try_enter() else {
+            return heavy_work_in_progress();
+        };
+        state.refresh_session_filter_index();
+        let _ = cached_journey_index(&state);
+    }
     state.refresh_session_filter_index();
     let journey_index = cached_journey_index(&state);
 
@@ -4975,11 +5060,46 @@ async fn sessions_catalog_search(
                 );
             }
         };
+        // 2.21.28 (ordre #9 6950254237) — verrou mémoire pris UNIQUEMENT
+        // si `search_tree_cache` doit être reconstruit. Pré-chauffé à
+        // l'init, iso-comportement test / prod sur hit cache.
         let limit = query.limit.unwrap_or(50).clamp(1, 200);
         let interfaces_scope = parse_csv(&query.interfaces);
         let empty_set = std::collections::BTreeSet::<String>::new();
-        let builder =
-            build_protocol_tree(&state, &interfaces_scope, &empty_set, None, None, None);
+        let signature = journey_signature(&state);
+        let cached = match state.inner.search_tree_cache.lock() {
+            Ok(guard) => guard
+                .as_ref()
+                .and_then(|(cached_sig, builder)| {
+                    (cached_sig.as_slice() == signature.as_slice()).then(|| builder.clone())
+                }),
+            Err(_) => None,
+        };
+        let builder = if let Some(cached) = cached {
+            // Scope lab par défaut = full (interfaces_scope empty) ; le
+            // cache pré-chauffé couvre ce cas. Pour une autre scope on
+            // reconstruit à la volée, toujours protégé par le verrou.
+            if interfaces_scope.is_empty() {
+                (*cached).clone()
+            } else {
+                let Some(_heavy_memory_gate) = live_probe::heavy_memory_try_enter() else {
+                    return heavy_work_in_progress();
+                };
+                build_protocol_tree(&state, &interfaces_scope, &empty_set, None, None, None)
+            }
+        } else {
+            let Some(_heavy_memory_gate) = live_probe::heavy_memory_try_enter() else {
+                return heavy_work_in_progress();
+            };
+            let fresh =
+                build_protocol_tree(&state, &interfaces_scope, &empty_set, None, None, None);
+            if interfaces_scope.is_empty() {
+                if let Ok(mut guard) = state.inner.search_tree_cache.lock() {
+                    *guard = Some((signature, std::sync::Arc::new(fresh.clone())));
+                }
+            }
+            fresh
+        };
         let results = session_catalog::search_protocol_tree(
             &builder,
             &needle,
@@ -5294,6 +5414,16 @@ fn sessions_columns_blocking(
             "SESSION_IDS_REQUIRED",
             "session_ids must be a non-empty array",
         );
+    }
+    // 2.21.28 (ordre #9 6950254237) — verrou mémoire pris UNIQUEMENT
+    // si le journey index doit être reconstruit. Hit cache = pas de
+    // verrou, iso-comportement test / prod.
+    let signature = journey_signature(&state);
+    if !journey_index_cache_is_fresh(&state, &signature) {
+        let Some(_heavy_memory_gate) = live_probe::heavy_memory_try_enter() else {
+            return heavy_work_in_progress();
+        };
+        let _ = cached_journey_index(&state);
     }
     let journey_index = cached_journey_index(&state);
     let mut data: Vec<Value> = Vec::with_capacity(request.session_ids.len());
@@ -7588,6 +7718,22 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
         Json(json!({"error":{"code":code,"message":message},"meta":{"api_version":API_VERSION}})),
     )
         .into_response()
+}
+
+/// 2.21.28 (ordre #9 6950254237) — réponse 503 commune des routes
+/// lourdes bornées par `live_probe::heavy_memory_try_enter()`. Même
+/// forme que le chemin froid `/identities` (2.21.26, Sadok) : code
+/// `HEAVY_WORK_IN_PROGRESS`, `Retry-After: 60`, message explicite.
+fn heavy_work_in_progress() -> Response {
+    let mut response = api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "HEAVY_WORK_IN_PROGRESS",
+        "continuous publication in progress, retry later",
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("60"));
+    response
 }
 fn io_error(error: std::io::Error) -> String {
     error.to_string()
@@ -13108,6 +13254,114 @@ mod tests {
             assert_eq!(body["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
         }
         let free = app.oneshot(request(uri)).await.unwrap();
+        assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// 2.21.28 (ordre #9 6950254237) — pendant un travail lourd en
+    /// mémoire, `/sessions/filter` (POST) répond 503 `HEAVY_WORK_IN_PROGRESS`
+    /// + `Retry-After: 60` au lieu de reconstruire l'index de filtrage ;
+    /// libéré, la route refonctionne.
+    ///
+    /// `#[ignore]` : `live_probe::HEAVY_MEMORY_GATE` est process-wide. Si ce
+    /// test tient le verrou, tout test parallèle qui appelle
+    /// `/sessions/filter` voit 503 et échoue. Lancer explicitement :
+    /// `cargo test --locked -p oiran-api --lib -- --ignored
+    ///  sessions_filter_answers_503_while_continuous_publication_holds_memory_gate
+    ///  sessions_catalog_search_answers_503_...
+    ///  sessions_columns_answers_503_...
+    /// --test-threads=1`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "process-wide gate; run with --ignored --test-threads=1"]
+    async fn sessions_filter_answers_503_while_continuous_publication_holds_memory_gate() {
+        let state = operator_state();
+        // 2.21.28 — force cache miss (prewarm aurait servi cache-hit sans toucher
+        // le verrou) : vide les signatures pour que le handler tente
+        // `heavy_memory_try_enter()`.
+        *state.inner.session_filter_signature.lock().unwrap() = None;
+        *state.inner.journey_index_cache.lock().unwrap() = None;
+        let app = router(state.clone(), None);
+        let build = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions/filter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"limit": 3}).to_string()))
+                .unwrap()
+        };
+        {
+            let _publication = live_probe::heavy_memory_enter();
+            let busy = app.clone().oneshot(build()).await.unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.headers()[header::RETRY_AFTER], "60");
+            let body = json_body(busy).await;
+            assert_eq!(body["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
+        }
+        let free = app.oneshot(build()).await.unwrap();
+        assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// 2.21.28 (ordre #9 6950254237) — pendant un travail lourd en
+    /// mémoire, `/sessions/catalog/search` répond 503 au lieu de
+    /// construire le `ProtocolTreeBuilder` sur tous les datasets ;
+    /// libéré, la route refonctionne.
+    ///
+    /// `#[ignore]` : voir `sessions_filter_answers_503_...`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "process-wide gate; run with --ignored --test-threads=1"]
+    async fn sessions_catalog_search_answers_503_while_continuous_publication_holds_memory_gate() {
+        let state = operator_state();
+        // 2.21.28 — force cache miss (search_tree_cache pré-chauffé sinon).
+        *state.inner.search_tree_cache.lock().unwrap() = None;
+        let app = router(state.clone(), None);
+        let build = || req("/api/v1/sessions/catalog/search?q=Cause", false);
+        {
+            let _publication = live_probe::heavy_memory_enter();
+            let busy = app.clone().oneshot(build()).await.unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.headers()[header::RETRY_AFTER], "60");
+            let body = json_body(busy).await;
+            assert_eq!(body["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
+        }
+        let free = app.oneshot(build()).await.unwrap();
+        assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// 2.21.28 (ordre #9 6950254237) — pendant un travail lourd en
+    /// mémoire, `/sessions/columns` (POST) répond 503 au lieu de
+    /// construire `cached_journey_index` + les lookups per session ;
+    /// libéré, la route refonctionne.
+    ///
+    /// `#[ignore]` : voir `sessions_filter_answers_503_...`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "process-wide gate; run with --ignored --test-threads=1"]
+    async fn sessions_columns_answers_503_while_continuous_publication_holds_memory_gate() {
+        let state = operator_state();
+        // 2.21.28 — force cache miss (journey_index_cache pré-chauffé sinon).
+        *state.inner.journey_index_cache.lock().unwrap() = None;
+        let session_id = queryable_session_ids(&state)
+            .into_iter()
+            .next()
+            .expect("session");
+        let app = router(state.clone(), None);
+        let build = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions/columns")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"session_ids": [session_id.clone()], "columns": ["state"]}).to_string(),
+                ))
+                .unwrap()
+        };
+        {
+            let _publication = live_probe::heavy_memory_enter();
+            let busy = app.clone().oneshot(build()).await.unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.headers()[header::RETRY_AFTER], "60");
+            let body = json_body(busy).await;
+            assert_eq!(body["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
+        }
+        let free = app.oneshot(build()).await.unwrap();
         assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
