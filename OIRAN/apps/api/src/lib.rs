@@ -2210,7 +2210,7 @@ fn live_ue_summary(
     })
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 struct ListQuery {
     page: Option<usize>,
     page_size: Option<usize>,
@@ -3773,19 +3773,41 @@ fn cached_live_list_row(
 }
 
 async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
-    let journey_index = cached_journey_index(&state);
+    // 2.21.14 (audit handlers #9 6940906119) — ce handler itère
+    // `state.inner.capture_manager.datasets()` puis appelle
+    // `cached_live_list_row` qui résout chaque `callflow(dataset, session_id)` :
+    // potentiellement N I/O disque + parse JSON. Même profil que
+    // `/health` pré-2.21.13. Correctif : déport dans `spawn_blocking`.
+    let state_blocking = state.clone();
+    let query_blocking = query.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let state = state_blocking;
+        let query = query_blocking;
+        sessions_blocking(&state, &query)
+    })
+    .await
+    .unwrap_or_else(|_| serde_json::json!({"data": [], "meta": {"error": "sessions handler panicked"}}));
+    Json(result)
+}
+
+/// 2.21.14 — logique synchrone de `/sessions` extraite dans une fonction
+/// pure appelée depuis `spawn_blocking`. Aucun `.await` ici ; toutes les
+/// opérations (fs::read callflow, parse JSON) restent sur un thread du
+/// pool bloquant tokio.
+fn sessions_blocking(state: &AppState, query: &ListQuery) -> Value {
+    let journey_index = cached_journey_index(state);
     let mut unique = state
         .inner
         .flows
         .values()
         .map(|flow| {
-            let mut summary = session_summary(&state, flow);
+            let mut summary = session_summary(state, flow);
             decorate_subscriber_summary(&mut summary, flow, &journey_index);
             // 2.15.0 (ANR1 #10 6883006379) — identités compactes
             // directement dans la liste /sessions pour que l'UI
             // n'ait pas besoin d'ouvrir chaque session.
             if let Some(object) = summary.as_object_mut() {
-                let mut identities = identity_summary_for_session(&state, &flow.session_id);
+                let mut identities = identity_summary_for_session(state, &flow.session_id);
                 merge_sbi_identities(&mut identities, &flow.events);
                 object.insert("identities".into(), identities);
             }
@@ -3794,7 +3816,7 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
         .collect::<BTreeMap<_, _>>();
     for dataset in state.inner.capture_manager.datasets() {
         for session_id in &dataset.session_ids {
-            let Some(summary) = cached_live_list_row(&state, &dataset, session_id, &journey_index)
+            let Some(summary) = cached_live_list_row(state, &dataset, session_id, &journey_index)
             else {
                 continue;
             };
@@ -3817,7 +3839,7 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
                             if let Some(object) = summary.as_object_mut() {
                                 object.insert(
                                     "identities".into(),
-                                    identity_summary_for_session(&state, &session.session_id),
+                                    identity_summary_for_session(state, &session.session_id),
                                 );
                             }
                             unique.insert(session.session_id.clone(), summary);
@@ -3861,7 +3883,14 @@ async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>)
         query.order.as_deref(),
     );
     sanitize_all(&mut items);
-    paginated(items, &query)
+    paginated_value(items, query)
+}
+
+/// 2.21.14 — variante pure Value (hors axum) de `paginated` pour permettre
+/// l'appel depuis `sessions_blocking`.
+fn paginated_value(items: Vec<Value>, query: &ListQuery) -> Value {
+    let Json(value) = paginated(items, query);
+    value
 }
 
 /// 2.10.0 — `GET /sessions/available_causes` : liste les causes
@@ -12433,6 +12462,51 @@ mod tests {
         assert_eq!(second["data"]["counters_status"], "stale");
         assert!(second["data"]["counters_age_ms"].as_u64().unwrap() >= 60_000);
         assert_eq!(second["data"]["session_count"], count);
+    }
+
+    /// 2.21.14 (règle #9 6940906119 — audit handlers) — prouve via le
+    /// VRAI routeur que `/health` répond pendant qu'un `/sessions` long
+    /// est en cours. Avant 2.21.14, `/sessions` itérait
+    /// `datasets().callflow()` sur le runtime async : sous charge, le
+    /// même profil que `/health` pré-2.21.13.
+    ///
+    /// Le test exploite le fait que l'instantané `/health` est servi
+    /// par le cache mémoire (TTL 5 s) et que `/sessions` est désormais
+    /// déporté dans `spawn_blocking` : `/health` doit répondre
+    /// quasi-instantanément même pendant l'exécution de `/sessions`.
+    #[tokio::test]
+    async fn sessions_route_is_spawned_blocking_and_does_not_starve_health_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        // Amorce l'instantané `/health` (cache fresh).
+        let _ = app
+            .clone()
+            .oneshot(req("/api/v1/health", false))
+            .await
+            .unwrap();
+        // Lance `/sessions` en concurrence : va s'exécuter via
+        // `spawn_blocking` et laisser le runtime libre pour `/health`.
+        let app_sessions = app.clone();
+        let sessions_task = tokio::spawn(async move {
+            app_sessions
+                .oneshot(req("/api/v1/sessions", false))
+                .await
+                .unwrap()
+        });
+        // Pendant ce temps, `/health` doit rendre un résultat `fresh` ou
+        // `stale` en < 200 ms (pas d'E/S sur le chemin de requête).
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "/health should not be starved by /sessions ; observed {:?}",
+            elapsed
+        );
+        let sessions = sessions_task.await.unwrap();
+        assert_eq!(sessions.status(), StatusCode::OK);
     }
 
     /// 2.19.1 — `/sessions/catalog/search?q=` renvoie des matches
