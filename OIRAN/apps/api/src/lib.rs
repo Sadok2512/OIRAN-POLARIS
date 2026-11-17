@@ -1667,6 +1667,15 @@ fn host_memory() -> Value {
 }
 
 async fn metrics(State(state): State<AppState>) -> Json<Value> {
+    // 2.21.17 (audit handlers lot 2 #9 6944132663) — mesure fs
+    // (measure_path, /proc/loadavg) + iteration flows + capture_manager.
+    // Déport dans spawn_blocking pour ne pas bloquer le runtime async.
+    tokio::task::spawn_blocking(move || metrics_blocking(&state))
+        .await
+        .unwrap_or_else(|_| Json(json!({"error": "metrics handler panicked"})))
+}
+
+fn metrics_blocking(state: &AppState) -> Json<Value> {
     let sample = measure_path(&state.inner.storage_path).ok();
     let source_events = state
         .inner
@@ -3542,17 +3551,23 @@ fn decorate_subscriber_summary(
 }
 
 async fn subscribers(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
-    let index = cached_journey_index(&state);
-    let mut rows = serde_json::to_value(index.subscribers())
-        .unwrap_or_else(|_| Value::Array(Vec::new()))
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    if let Some(search) = query.search.as_deref() {
-        let search = search.to_ascii_lowercase();
-        rows.retain(|row| row.to_string().to_ascii_lowercase().contains(&search));
-    }
-    paginated(rows, &query)
+    // 2.21.17 — cached_journey_index parcourt datasets + callflows en
+    // synchrone (fs). Déport dans spawn_blocking.
+    tokio::task::spawn_blocking(move || {
+        let index = cached_journey_index(&state);
+        let mut rows = serde_json::to_value(index.subscribers())
+            .unwrap_or_else(|_| Value::Array(Vec::new()))
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(search) = query.search.as_deref() {
+            let search = search.to_ascii_lowercase();
+            rows.retain(|row| row.to_string().to_ascii_lowercase().contains(&search));
+        }
+        paginated(rows, &query)
+    })
+    .await
+    .unwrap_or_else(|_| Json(json!({"error": "subscribers handler panicked"})))
 }
 
 async fn subscriber_journey(State(state): State<AppState>, Path(pseudo): Path<String>) -> Response {
@@ -5187,13 +5202,26 @@ fn resolve_summary_for_columns(
 }
 
 async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let journey_index = cached_journey_index(&state);
-    if let Some(flow) = flow_for(&state, &id) {
-        let mut summary = session_summary(&state, flow);
+    // 2.21.17 — iteration datasets + callflow() + lte catalog en sync.
+    tokio::task::spawn_blocking(move || session_blocking(&state, &id))
+        .await
+        .unwrap_or_else(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SESSION_FAILED",
+                "session handler panicked",
+            )
+        })
+}
+
+fn session_blocking(state: &AppState, id: &str) -> Response {
+    let journey_index = cached_journey_index(state);
+    if let Some(flow) = flow_for(state, id) {
+        let mut summary = session_summary(state, flow);
         decorate_subscriber_summary(&mut summary, flow, &journey_index);
         return ok(json!({"summary":summary,"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
     }
-    if let Some((dataset_id, flow)) = live_flow_for(&state, &id) {
+    if let Some((dataset_id, flow)) = live_flow_for(state, id) {
         let dataset = state
             .inner
             .capture_manager
@@ -5203,7 +5231,7 @@ async fn session(State(state): State<AppState>, Path(id): Path<String>) -> Respo
         decorate_subscriber_summary(&mut summary, &flow, &journey_index);
         return ok(json!({"summary":summary,"procedures":flow.procedures,"accounting":flow.accounting,"capture_references":flow.capture_references})).into_response();
     }
-    if let Ok(Some((manifest, lte))) = state.inner.lte_evidence_store.find_session(&id) {
+    if let Ok(Some((manifest, lte))) = state.inner.lte_evidence_store.find_session(id) {
         let procedures = lte.procedures.iter().enumerate().map(|(index, name)| json!({
             "id":format!("lte-procedure-{index}"),"name":name,"event_ids":[],"status":"OBSERVED"
         })).collect::<Vec<_>>();
@@ -6688,12 +6716,26 @@ async fn packet_dissect(
     if let Err(response) = require_operator(&state, &headers) {
         return response;
     }
-    let packet = packet_values(&state).into_iter().find(|packet| {
+    // 2.21.17 — tshark sub-process + fs::read paquets. Déport dans
+    // spawn_blocking (sinon le runtime bloque pendant l'invocation tshark).
+    tokio::task::spawn_blocking(move || packet_dissect_blocking(&state, &capture_id, packet_number))
+        .await
+        .unwrap_or_else(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PACKET_DISSECT_FAILED",
+                "packet dissect handler panicked",
+            )
+        })
+}
+
+fn packet_dissect_blocking(state: &AppState, capture_id: &str, packet_number: u64) -> Response {
+    let packet = packet_values(state).into_iter().find(|packet| {
         packet["capture_id"] == capture_id
             && packet["packet_number"].as_u64() == Some(packet_number)
     });
     let Some(packet) = packet else {
-        return if capture_is_known(&state, &capture_id) {
+        return if capture_is_known(state, capture_id) {
             api_error(
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "PACKET_OUT_OF_RANGE",
@@ -6707,7 +6749,7 @@ async fn packet_dissect(
             )
         };
     };
-    let Some(source) = packet_source_path(&state, &packet) else {
+    let Some(source) = packet_source_path(state, &packet) else {
         return api_error(
             StatusCode::NOT_FOUND,
             "CAPTURE_SOURCE_NOT_FOUND",
@@ -12750,6 +12792,95 @@ mod tests {
         );
         let cf = cf_task.await.unwrap();
         assert_eq!(cf.status(), StatusCode::OK);
+    }
+
+    /// 2.21.17 (audit handlers lot 2 #9 6944132663) — `/metrics` lit
+    /// `measure_path(storage_path)`, `/proc/loadavg`, et parcourt les
+    /// flows + capture_manager en sync. Preuve de non-blocage via VRAI
+    /// routeur.
+    #[tokio::test]
+    async fn metrics_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_m = app.clone();
+        let metrics_task = tokio::spawn(async move {
+            app_m.oneshot(req("/api/v1/metrics", false)).await.unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "/health starved by /metrics ; elapsed {:?}",
+            elapsed
+        );
+        let metrics = metrics_task.await.unwrap();
+        assert_eq!(metrics.status(), StatusCode::OK);
+    }
+
+    /// 2.21.17 — `/subscribers` consulte `cached_journey_index` qui
+    /// parcourt datasets + callflows. Déport spawn_blocking vérifié
+    /// via VRAI routeur.
+    #[tokio::test]
+    async fn subscribers_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_s = app.clone();
+        let sub_task = tokio::spawn(async move {
+            app_s.oneshot(req("/api/v1/subscribers", false)).await.unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "/health starved by /subscribers ; elapsed {:?}",
+            elapsed
+        );
+        let sub = sub_task.await.unwrap();
+        assert_eq!(sub.status(), StatusCode::OK);
+    }
+
+    /// 2.21.17 — `/sessions/:id` consulte `flow_for` + `live_flow_for` +
+    /// LTE catalog. Déport spawn_blocking vérifié via VRAI routeur.
+    #[tokio::test]
+    async fn session_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let session_id = st
+            .inner
+            .flows
+            .keys()
+            .next()
+            .cloned()
+            .expect("embedded dataset has at least one session");
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_s = app.clone();
+        let sid = session_id.clone();
+        let sess_task = tokio::spawn(async move {
+            app_s
+                .oneshot(req(&format!("/api/v1/sessions/{sid}"), false))
+                .await
+                .unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "/health starved by /sessions/{{id}} ; elapsed {:?}",
+            elapsed
+        );
+        let sess = sess_task.await.unwrap();
+        assert_eq!(sess.status(), StatusCode::OK);
     }
 
     /// 2.19.1 — `/sessions/catalog/search?q=` renvoie des matches
