@@ -1,5 +1,16 @@
 # Changelog
 
+## OIRAN API 2.21.21 — 2026-11-17 — `/packets` borné en mémoire (FAIL lab 2.21.19 : OOM 3.7 G)
+
+Upgrade **patch**. Cause : `packet_values` matérialisait TOUS les callflows (`queryable_flows`) puis leur copie JSON, puis un objet par paquet avec son arbre d'IE. Au lab, `/packets?page=1&page_size=100` → 502 + `oom-kill` (3.7G memory peak, ANR2 #10). Défaut antérieur à 2.21.19, rendu visible par la preuve d) ; `/packet/:id` et `/packets/:capture/:n/dissect` avaient le même chemin.
+
+- `/packets` : passe 1 flow par flow (un seul callflow en mémoire à la fois), clés légères filtrées, tri canonique inchangé (capture_id, packet_number, event_id) ; passe 2 : seuls les paquets de la page sont matérialisés en rechargeant leurs seules sessions. Dédoublonnage `packet_id` (première occurrence) et sémantique des filtres/`search` identiques.
+- `/packet/:id` : recherche flow par flow, arrêt au premier match, en `spawn_blocking`.
+- dissect et `capture_is_known` : même parcours flow par flow.
+- Priorité des sources inchangée (LTE > dataset > mémoire ; une source qui ne résout pas laisse la précédente).
+- Test `packets_page_streams_flows_and_matches_legacy_materialized_listing` : toutes les pages identiques à l'ancien algorithme (gardé en référence de test), filtres et `find_packet` couverts.
+- Note : 2.21.20 est sur `fix/oiran-2.21.20-handlers` (DEVMAT) ; `/live/*` passe en 2.21.22.
+
 ## OIRAN API 2.21.19 — 2026-11-17 — audit handlers lot 3 : /ues + /ue/:id + /session_correlations + /packets en spawn_blocking
 
 Lot 3 des handlers OUVERTS. Règle bloquante `cargo test --locked -p oiran-api --lib` AVANT push respectée.

@@ -49,7 +49,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path as FsPath, PathBuf},
     process::Command,
@@ -6629,52 +6629,224 @@ async fn provenance(State(state): State<AppState>, Path(id): Path<String>) -> Re
     find_event(&state,&id).map(|x|{let mut v=json!({"event_id":id,"capture_id":x["capture_id"],"packet_references":x["packet_references"],"raw_payload_reference":x["raw_payload_reference"]});sanitize_value(&mut v);ok(v).into_response()}).unwrap_or_else(||api_error(StatusCode::NOT_FOUND,"EVENT_NOT_FOUND","unknown event id"))
 }
 
-fn packet_values(state: &AppState) -> Vec<Value> {
-    let mut packets = BTreeMap::<String, Value>::new();
-    let all_flows = queryable_flow_values(state);
-    for flow in &all_flows {
+/// 2.21.21 — source d'un flow requêtable, résolue sans le charger.
+/// Même priorité que `queryable_flows` : la dernière source qui résout gagne
+/// (LTE > dataset > mémoire), une source qui ne résout pas laisse la précédente.
+enum FlowSource {
+    Memory,
+    Dataset(String),
+    Lte,
+}
+
+fn queryable_flow_sources(state: &AppState) -> BTreeMap<String, Vec<FlowSource>> {
+    let mut sources = BTreeMap::<String, Vec<FlowSource>>::new();
+    for session_id in state.inner.flows.keys() {
+        sources.entry(session_id.clone()).or_default().push(FlowSource::Memory);
+    }
+    for dataset in state.inner.capture_manager.datasets() {
+        for session_id in &dataset.session_ids {
+            sources
+                .entry(session_id.clone())
+                .or_default()
+                .push(FlowSource::Dataset(dataset.dataset_id.clone()));
+        }
+    }
+    match state.inner.lte_evidence_store.catalog() {
+        Ok(catalog) => {
+            for manifest in catalog {
+                for session_id in manifest.session_ids {
+                    sources.entry(session_id).or_default().push(FlowSource::Lte);
+                }
+            }
+        }
+        Err(error) => eprintln!("PACKETS_LTE_CATALOG_SKIPPED reason={}", error),
+    }
+    sources
+}
+
+fn load_queryable_flow(state: &AppState, session_id: &str, sources: &[FlowSource]) -> Option<Value> {
+    for source in sources.iter().rev() {
+        let flow = match source {
+            FlowSource::Memory => state.inner.flows.get(session_id).cloned(),
+            FlowSource::Dataset(dataset_id) => {
+                state.inner.capture_manager.callflow(dataset_id, session_id)
+            }
+            FlowSource::Lte => match state
+                .inner
+                .lte_evidence_store
+                .callflow_for_export_by_session(session_id)
+            {
+                Ok(flow) => flow,
+                Err(error) => {
+                    eprintln!(
+                        "PACKETS_LTE_CALLFLOW_SKIPPED session_id={} reason={}",
+                        session_id, error
+                    );
+                    None
+                }
+            },
+        };
+        if let Some(flow) = flow {
+            return serde_json::to_value(flow).ok();
+        }
+    }
+    None
+}
+
+/// Parcourt les flows requêtables UN PAR UN (jamais tous en mémoire) et
+/// appelle `visit(session_index, event, reference)` pour chaque référence
+/// paquet, dans l'ordre exact de l'ancien `packet_values`. `visit` renvoie
+/// `false` pour arrêter le parcours.
+fn for_each_packet_reference(
+    state: &AppState,
+    only_sessions: Option<&BTreeSet<usize>>,
+    mut visit: impl FnMut(usize, &Value, &Value) -> bool,
+) {
+    for (index, (session_id, sources)) in queryable_flow_sources(state).iter().enumerate() {
+        if only_sessions.is_some_and(|wanted| !wanted.contains(&index)) {
+            continue;
+        }
+        let Some(flow) = load_queryable_flow(state, session_id, sources) else {
+            continue;
+        };
         for event in flow["events"].as_array().into_iter().flatten() {
-            let capture_id = event["capture_id"].as_str().unwrap_or("unknown");
-            let capture_tag = capture_id
-                .strip_prefix("sha256:")
-                .unwrap_or(capture_id)
-                .chars()
-                .take(12)
-                .collect::<String>();
             for reference in event["packet_references"].as_array().into_iter().flatten() {
-                let number = reference["packet_number"].as_u64().unwrap_or(0);
-                let packet_id = format!("pkt-{capture_tag}-{number}");
-                packets.entry(packet_id.clone()).or_insert_with(|| {
-                    json!({
-                        "packet_id":packet_id,"capture_id":capture_id,"event_id":event["event_id"],
-                        "timestamp":event["timestamp"],"timestamp_ns":event["timestamp_ns"],
-                        "interface":event["interface"],"protocol":event["protocol"],
-                        "source":event["source_participant"],"destination":event["destination_participant"],
-                        "direction":event["direction"],"message_name":event["message_name"],
-                        "captured_length":reference["captured_length"],"original_length":reference["original_length"],
-                        "byte_offset":reference["byte_offset"],"packet_number":number,
-                        "source_file":reference["source_file"],"decode_status":event["decoding_status"],
-                        "decoder_name":event["decoder_name"],"decoder_version":event["decoder_version"],
-                        "raw_payload_reference":event["raw_payload_reference"],"information_elements":event["decoded_ie_tree"],
-                        "raw_bytes":"RESTRICTED_NOT_STORED_IN_EVENT_MODEL"
-                    })
-                });
+                if !visit(index, event, reference) {
+                    return;
+                }
             }
         }
     }
-    let mut values = packets.into_values().collect::<Vec<_>>();
-    values.sort_by(|a, b| {
-        a["capture_id"]
-            .as_str()
-            .cmp(&b["capture_id"].as_str())
-            .then_with(|| {
-                a["packet_number"]
-                    .as_u64()
-                    .cmp(&b["packet_number"].as_u64())
-            })
-            .then_with(|| a["event_id"].as_str().cmp(&b["event_id"].as_str()))
+}
+
+fn packet_id_for(event: &Value, reference: &Value) -> String {
+    let capture_id = event["capture_id"].as_str().unwrap_or("unknown");
+    let capture_tag = capture_id
+        .strip_prefix("sha256:")
+        .unwrap_or(capture_id)
+        .chars()
+        .take(12)
+        .collect::<String>();
+    let number = reference["packet_number"].as_u64().unwrap_or(0);
+    format!("pkt-{capture_tag}-{number}")
+}
+
+fn packet_value_for(event: &Value, reference: &Value) -> Value {
+    let capture_id = event["capture_id"].as_str().unwrap_or("unknown");
+    let number = reference["packet_number"].as_u64().unwrap_or(0);
+    json!({
+        "packet_id":packet_id_for(event, reference),"capture_id":capture_id,"event_id":event["event_id"],
+        "timestamp":event["timestamp"],"timestamp_ns":event["timestamp_ns"],
+        "interface":event["interface"],"protocol":event["protocol"],
+        "source":event["source_participant"],"destination":event["destination_participant"],
+        "direction":event["direction"],"message_name":event["message_name"],
+        "captured_length":reference["captured_length"],"original_length":reference["original_length"],
+        "byte_offset":reference["byte_offset"],"packet_number":number,
+        "source_file":reference["source_file"],"decode_status":event["decoding_status"],
+        "decoder_name":event["decoder_name"],"decoder_version":event["decoder_version"],
+        "raw_payload_reference":event["raw_payload_reference"],"information_elements":event["decoded_ie_tree"],
+        "raw_bytes":"RESTRICTED_NOT_STORED_IN_EVENT_MODEL"
+    })
+}
+
+/// Premier paquet (après dédoublonnage par `packet_id`) qui satisfait `matches`.
+fn find_packet(state: &AppState, matches: impl Fn(&str, &Value, &Value) -> bool) -> Option<Value> {
+    let mut seen = HashSet::<String>::new();
+    let mut found = None;
+    for_each_packet_reference(state, None, |_, event, reference| {
+        let packet_id = packet_id_for(event, reference);
+        if !seen.insert(packet_id.clone()) {
+            return true;
+        }
+        if matches(&packet_id, event, reference) {
+            found = Some(packet_value_for(event, reference));
+            return false;
+        }
+        true
     });
-    values
+    found
+}
+
+struct PacketKey {
+    capture_id: String,
+    packet_number: u64,
+    event_id: Option<String>,
+    packet_id: String,
+    session_index: usize,
+}
+
+/// `/packets` borné en mémoire : passe 1 = clés légères filtrées, tri canonique
+/// (capture_id, packet_number, event_id) ; passe 2 = seuls les paquets de la page
+/// sont matérialisés, en rechargeant uniquement leurs sessions.
+fn packets_page(state: &AppState, query: &ListQuery) -> Json<Value> {
+    let search = query.search.as_deref().map(str::to_ascii_lowercase);
+    let mut seen = HashSet::<String>::new();
+    let mut keys = Vec::<PacketKey>::new();
+    for_each_packet_reference(state, None, |session_index, event, reference| {
+        let packet_id = packet_id_for(event, reference);
+        if !seen.insert(packet_id.clone()) {
+            return true;
+        }
+        let capture_id = event["capture_id"].as_str().unwrap_or("unknown");
+        let packet_number = reference["packet_number"].as_u64().unwrap_or(0);
+        if query.capture_id.as_deref().is_some_and(|wanted| wanted != capture_id)
+            || query.event_id.as_deref().is_some_and(|wanted| event["event_id"] != wanted)
+            || query.packet_number.is_some_and(|wanted| wanted != packet_number)
+            || query.interface.as_deref().is_some_and(|wanted| event["interface"] != wanted)
+            || query.protocol.as_deref().is_some_and(|wanted| event["protocol"] != wanted)
+        {
+            return true;
+        }
+        if let Some(search) = search.as_deref() {
+            let text = packet_value_for(event, reference).to_string().to_ascii_lowercase();
+            if !text.contains(search) {
+                return true;
+            }
+        }
+        keys.push(PacketKey {
+            capture_id: capture_id.to_string(),
+            packet_number,
+            event_id: event["event_id"].as_str().map(str::to_string),
+            packet_id,
+            session_index,
+        });
+        true
+    });
+    drop(seen);
+    keys.sort_by(|a, b| {
+        a.capture_id
+            .cmp(&b.capture_id)
+            .then_with(|| a.packet_number.cmp(&b.packet_number))
+            .then_with(|| a.event_id.cmp(&b.event_id))
+    });
+    let total = keys.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(25).clamp(1, 100);
+    let start = (page - 1).saturating_mul(page_size);
+    let page_keys = keys.into_iter().skip(start).take(page_size).collect::<Vec<_>>();
+    let sessions = page_keys.iter().map(|key| key.session_index).collect::<BTreeSet<_>>();
+    let wanted = page_keys
+        .iter()
+        .map(|key| (key.packet_id.clone(), key.session_index))
+        .collect::<HashMap<_, _>>();
+    let mut built = HashMap::<String, Value>::new();
+    if !page_keys.is_empty() {
+        for_each_packet_reference(state, Some(&sessions), |session_index, event, reference| {
+            let packet_id = packet_id_for(event, reference);
+            if wanted.get(&packet_id) == Some(&session_index) && !built.contains_key(&packet_id) {
+                built.insert(packet_id, packet_value_for(event, reference));
+            }
+            built.len() < wanted.len()
+        });
+    }
+    let mut data = page_keys
+        .iter()
+        .filter_map(|key| built.remove(&key.packet_id))
+        .collect::<Vec<_>>();
+    sanitize_all(&mut data);
+    Json(
+        json!({"data":data,"meta":{"page":page,"page_size":page_size,"total":total,"total_pages":total.div_ceil(page_size)}}),
+    )
 }
 
 fn queryable_flow_values(state: &AppState) -> Vec<Value> {
@@ -6685,13 +6857,23 @@ fn queryable_flow_values(state: &AppState) -> Vec<Value> {
 }
 
 fn capture_is_known(state: &AppState, capture_id: &str) -> bool {
-    queryable_flow_values(state).iter().any(|flow| {
-        flow["events"]
+    // 2.21.21 — parcours flow par flow, sans matérialiser tous les flows.
+    let mut known = false;
+    for (session_id, sources) in queryable_flow_sources(state) {
+        let Some(flow) = load_queryable_flow(state, &session_id, &sources) else {
+            continue;
+        };
+        if flow["events"]
             .as_array()
             .into_iter()
             .flatten()
             .any(|event| event["capture_id"] == capture_id)
-    })
+        {
+            known = true;
+            break;
+        }
+    }
+    known
 }
 
 fn packet_source_path(state: &AppState, packet: &Value) -> Option<PathBuf> {
@@ -6700,50 +6882,36 @@ fn packet_source_path(state: &AppState, packet: &Value) -> Option<PathBuf> {
 }
 
 async fn packets(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
-    // 2.21.19 — packet_values(state) traverse flow_values + callflows.
-    tokio::task::spawn_blocking(move || {
-        let mut items = packet_values(&state);
-        if let Some(capture_id) = query.capture_id.as_deref() {
-            items.retain(|packet| packet["capture_id"] == capture_id);
-        }
-        if let Some(event_id) = query.event_id.as_deref() {
-            items.retain(|packet| packet["event_id"] == event_id);
-        }
-        if let Some(packet_number) = query.packet_number {
-            items.retain(|packet| packet["packet_number"].as_u64() == Some(packet_number));
-        }
-        if let Some(interface) = query.interface.as_deref() {
-            items.retain(|packet| packet["interface"] == interface);
-        }
-        if let Some(protocol) = query.protocol.as_deref() {
-            items.retain(|packet| packet["protocol"] == protocol);
-        }
-        if let Some(search) = query.search.as_deref() {
-            let search = search.to_ascii_lowercase();
-            items.retain(|packet| packet.to_string().to_ascii_lowercase().contains(&search));
-        }
-        sanitize_all(&mut items);
-        paginated(items, &query)
-    })
-    .await
-    .unwrap_or_else(|_| Json(json!({"error": "packets handler panicked"})))
+    // 2.21.21 — borné en mémoire (OOM 3.7 G en 2.21.19 au lab) et hors runtime.
+    tokio::task::spawn_blocking(move || packets_page(&state, &query))
+        .await
+        .unwrap_or_else(|_| Json(json!({"error": "packets handler panicked"})))
 }
 
 async fn packet(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    packet_values(&state)
-        .into_iter()
-        .find(|packet| packet["packet_id"] == id)
-        .map(|mut packet| {
-            sanitize_value(&mut packet);
-            ok(packet).into_response()
-        })
-        .unwrap_or_else(|| {
-            api_error(
-                StatusCode::NOT_FOUND,
-                "PACKET_NOT_FOUND",
-                "unknown packet id",
-            )
-        })
+    // 2.21.21 — recherche flow par flow, arrêt au premier match, hors runtime.
+    tokio::task::spawn_blocking(move || {
+        find_packet(&state, |packet_id, _, _| packet_id == id)
+            .map(|mut packet| {
+                sanitize_value(&mut packet);
+                ok(packet).into_response()
+            })
+            .unwrap_or_else(|| {
+                api_error(
+                    StatusCode::NOT_FOUND,
+                    "PACKET_NOT_FOUND",
+                    "unknown packet id",
+                )
+            })
+    })
+    .await
+    .unwrap_or_else(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "PACKET_LOOKUP_FAILED",
+            "packet handler panicked",
+        )
+    })
 }
 
 async fn packet_dissect(
@@ -6768,9 +6936,9 @@ async fn packet_dissect(
 }
 
 fn packet_dissect_blocking(state: &AppState, capture_id: &str, packet_number: u64) -> Response {
-    let packet = packet_values(state).into_iter().find(|packet| {
-        packet["capture_id"] == capture_id
-            && packet["packet_number"].as_u64() == Some(packet_number)
+    let packet = find_packet(state, |_, event, reference| {
+        event["capture_id"] == capture_id
+            && reference["packet_number"].as_u64().unwrap_or(0) == packet_number
     });
     let Some(packet) = packet else {
         return if capture_is_known(state, capture_id) {
@@ -10193,12 +10361,59 @@ mod tests {
         );
     }
 
+    /// 2.21.21 — référence : l'ancien `packet_values` (tous les flows en mémoire).
+    fn legacy_packet_values(state: &AppState) -> Vec<Value> {
+        let mut packets = BTreeMap::<String, Value>::new();
+        for flow in &queryable_flow_values(state) {
+            for event in flow["events"].as_array().into_iter().flatten() {
+                for reference in event["packet_references"].as_array().into_iter().flatten() {
+                    packets
+                        .entry(packet_id_for(event, reference))
+                        .or_insert_with(|| packet_value_for(event, reference));
+                }
+            }
+        }
+        let mut values = packets.into_values().collect::<Vec<_>>();
+        values.sort_by(|a, b| {
+            a["capture_id"].as_str().cmp(&b["capture_id"].as_str())
+                .then_with(|| a["packet_number"].as_u64().cmp(&b["packet_number"].as_u64()))
+                .then_with(|| a["event_id"].as_str().cmp(&b["event_id"].as_str()))
+        });
+        values
+    }
+
+    #[test]
+    fn packets_page_streams_flows_and_matches_legacy_materialized_listing() {
+        let state = operator_state();
+        let legacy = legacy_packet_values(&state);
+        assert!(legacy.len() > 3, "reference dataset must expose packets");
+        let mut query = ListQuery::default();
+        query.page_size = Some(2);
+        for page in 1..=legacy.len().div_ceil(2) {
+            query.page = Some(page);
+            let Json(value) = packets_page(&state, &query);
+            assert_eq!(value["meta"]["total"].as_u64(), Some(legacy.len() as u64));
+            let Json(expected) = paginated(legacy.clone(), &query);
+            assert_eq!(value["data"], expected["data"], "page {page}");
+        }
+        let first = legacy[0].clone();
+        query.page = Some(1);
+        query.page_size = Some(100);
+        query.capture_id = first["capture_id"].as_str().map(str::to_string);
+        query.packet_number = first["packet_number"].as_u64();
+        let Json(value) = packets_page(&state, &query);
+        assert_eq!(value["data"][0]["packet_id"], first["packet_id"]);
+        let found = find_packet(&state, |id, _, _| Some(id) == first["packet_id"].as_str())
+            .expect("find_packet must resolve a listed packet");
+        assert_eq!(found["event_id"], first["event_id"]);
+    }
+
     #[tokio::test]
     async fn packet_dissect_resolves_a_listed_reference_and_classifies_failures() {
         let state = operator_state();
-        let packet = packet_values(&state)
-            .into_iter()
-            .find(|packet| packet_source_path(&state, packet).is_some())
+        let packet = find_packet(&state, |_, event, reference| {
+            packet_source_path(&state, &packet_value_for(event, reference)).is_some()
+        })
             .expect("reference dataset must expose a readable packet source");
         let capture_id = packet["capture_id"].as_str().unwrap();
         let packet_number = packet["packet_number"].as_u64().unwrap();
