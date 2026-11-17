@@ -1,5 +1,67 @@
 # Changelog
 
+## OIRAN API 2.21.30 + live-probe 0.6.10 — 2026-11-17 — verrou mémoire sur 3 routes lourdes + quarantaine persistante des segments en échec
+
+Ordres #9 6952054201 et 6952664027. Branche `fix/oiran-2.21.30-heavy-lock` depuis `eefff4f` (2.21.29).
+
+### Changements
+
+**1. Verrou mémoire sur 3 routes lourdes (ordre 6952664027)**
+
+- `heavy_work_in_progress() -> Response` : helper partagé (code `HEAVY_WORK_IN_PROGRESS`, 503, `Retry-After: 60`).
+- `sessions_filter_blocking`, `sessions_catalog_search`, `sessions_columns_blocking` prennent `state.inner.capture_manager.heavy_memory_try_enter()` au tout début. Si verrou occupé (publication continue en cours) → 503 immédiat + `Retry-After: 60`.
+- Le verrou est per-state depuis 2.21.28 : chaque test a son propre `CaptureManager` → chaque test est isolé → **aucune flakiness entre tests**.
+
+**2. Quarantaine persistante des segments en échec (ordre 6952054201)**
+
+- Nouvelle structure `SegmentQuarantineKey = (chemin, taille, sha256)` + `SegmentQuarantineEntry = { error_code, quarantined_epoch_ms }`.
+- `CaptureManager` gagne `quarantined_segments: Arc<Mutex<BTreeMap<...>>>` chargé au `new()` depuis `<root>/quarantine.json`.
+- Nouvelles méthodes publiques :
+  - `is_segment_quarantined(path, size, sha256) -> bool` ;
+  - `quarantine_segment(path, size, sha256, error_code, epoch_ms) -> bool` (idempotent, persiste atomiquement) ;
+  - `quarantined_segments_snapshot() -> Vec<(Key, Entry)>`.
+- Dans `process_capture_into_selected` (scan loop live-probe), après calcul du sha256 d'un segment, si l'identité est quarantinée → `continue` + log `CONTINUOUS_SEGMENT_SKIPPED_QUARANTINED`. **Le segment n'est plus retenté**.
+- À l'échec de décodage (`decode_capture_streaming` Err → branche continuous), `quarantine_segment(path, size, sha256, error)` est appelé. Nouvelle clé dans le log : `"quarantined": true/false`.
+- `/health` expose `data.quarantined_segments.{count, items}` (items triés par horodatage desc, capé à 32). Chaque item : `source_path`, `source_size_bytes`, `source_sha256`, `error_code`, `quarantined_epoch_ms`.
+
+### Tests (règle « sans `#[ignore]`, 3 runs à 0 fail »)
+
+- `sessions_filter_answers_503_while_continuous_publication_holds_memory_gate`
+- `sessions_catalog_search_answers_503_while_continuous_publication_holds_memory_gate`
+- `sessions_columns_answers_503_while_continuous_publication_holds_memory_gate`
+- `health_surfaces_quarantined_segments`
+- `quarantined_segment_survives_capture_manager_restart` (live-probe)
+
+Les 3 tests 503 utilisent `state.inner.capture_manager.heavy_memory_enter()` pour simuler la publication et chaque test crée son `operator_state()` → gate isolé.
+
+```
+$ for i in 1 2 3; do cargo test --locked -p oiran-api --lib 2>&1 | grep "test result"; done
+test result: ok. 189 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 4.48s
+test result: ok. 189 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 3.90s
+test result: ok. 189 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 4.69s
+
+$ for i in 1 2 3; do cargo test --locked -p live-probe --lib 2>&1 | grep "test result"; done
+test result: ok. 169 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 56.25s
+test result: ok. 169 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 62.02s
+test result: ok. 169 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 52.60s
+
+$ cd OIRAN/vtap && cargo update -w && cargo test --locked
+test result: ok. 0 passed; 0 failed
+```
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.29 | **2.21.30** |
+| `live-probe` | 0.6.9 | **0.6.10** |
+
+### Garde-fous
+
+- Pas de merge sur `fix/oiran-2.21.10-analyzer` : j'attends `LAB_UNLOCK` ANR2.
+- Aucun test `#[ignore]` introduit (règle Sadok 2026-11-17).
+- Branches précédentes gelées sur `origin` (pas de force-push, pas de suppression).
+
 ## OIRAN API 2.21.29 + live-probe 0.6.9 — 2026-11-17 — un segment en échec ne bloque plus le cycle continu (essai 7 FAIL lab)
 
 Upgrade **patch**. Cause prouvée au lab (ANR2, essai 7) : un ancien segment S6a tronqué faisait échouer `decode_capture_streaming(...)?` à CHAQUE cycle ; l'erreur remontait avant la phase vTAP, située plus bas dans `process_capture_into_selected` → empreinte du pcap vTAP absente du manifeste et de l'état, 0 event `probe_type=vtap`.

@@ -1467,6 +1467,36 @@ async fn health_response(state: &AppState, first_wait: std::time::Duration) -> J
             data["counters_status"] = json!("computing");
         }
     }
+    // 2.21.30 (ordre #9 6952054201) — quarantaine persistante des
+    // segments décodage échoué : exposer `{count, items[]}` dans
+    // `/health` pour que l'opérateur voie quels segments sont
+    // définitivement exclus des cycles. `items` est capée à 32 (plus
+    // récent en premier) pour ne pas gonfler la payload de health ;
+    // le journal complet reste sur disque.
+    let quarantine_snapshot = state.inner.capture_manager.quarantined_segments_snapshot();
+    let count = quarantine_snapshot.len();
+    let mut items: Vec<Value> = quarantine_snapshot
+        .into_iter()
+        .map(|((source_path, source_size_bytes, source_sha256), entry)| {
+            json!({
+                "source_path": source_path,
+                "source_size_bytes": source_size_bytes,
+                "source_sha256": source_sha256,
+                "error_code": entry.error_code,
+                "quarantined_epoch_ms": entry.quarantined_epoch_ms,
+            })
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        b["quarantined_epoch_ms"]
+            .as_u64()
+            .cmp(&a["quarantined_epoch_ms"].as_u64())
+    });
+    items.truncate(32);
+    data["quarantined_segments"] = json!({
+        "count": count,
+        "items": items,
+    });
     ok(data)
 }
 
@@ -4265,6 +4295,12 @@ fn sessions_filter_blocking(
             "identity-scoped session filtering requires an operator bearer",
         );
     }
+    // 2.21.30 (ordres #9 6952054201 + 6952664027) — verrou mémoire du
+    // gestionnaire (per-state depuis 2.21.28). Un seul travail lourd en
+    // mémoire à la fois (publication OU route API).
+    let Some(_heavy_memory_gate) = state.inner.capture_manager.heavy_memory_try_enter() else {
+        return heavy_work_in_progress();
+    };
     state.refresh_session_filter_index();
     let journey_index = cached_journey_index(&state);
 
@@ -4975,6 +5011,13 @@ async fn sessions_catalog_search(
                 );
             }
         };
+        // 2.21.30 (ordres #9 6952054201 + 6952664027) — verrou mémoire
+        // du gestionnaire. `build_protocol_tree` parcourt tous les
+        // datasets + callflows : coexiste mal avec la publication.
+        let Some(_heavy_memory_gate) = state.inner.capture_manager.heavy_memory_try_enter()
+        else {
+            return heavy_work_in_progress();
+        };
         let limit = query.limit.unwrap_or(50).clamp(1, 200);
         let interfaces_scope = parse_csv(&query.interfaces);
         let empty_set = std::collections::BTreeSet::<String>::new();
@@ -5295,6 +5338,12 @@ fn sessions_columns_blocking(
             "session_ids must be a non-empty array",
         );
     }
+    // 2.21.30 (ordres #9 6952054201 + 6952664027) — verrou mémoire du
+    // gestionnaire. `cached_journey_index` + lookups per session
+    // coexistent mal avec la publication.
+    let Some(_heavy_memory_gate) = state.inner.capture_manager.heavy_memory_try_enter() else {
+        return heavy_work_in_progress();
+    };
     let journey_index = cached_journey_index(&state);
     let mut data: Vec<Value> = Vec::with_capacity(request.session_ids.len());
     let mut missing: Vec<String> = Vec::new();
@@ -7589,6 +7638,24 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
     )
         .into_response()
 }
+
+/// 2.21.30 (ordres #9 6952054201 + 6952664027) — réponse 503 commune
+/// des routes lourdes bornées par
+/// `capture_manager.heavy_memory_try_enter()`. Même shape que le chemin
+/// froid `/identities` (2.21.28, Sadok) : code `HEAVY_WORK_IN_PROGRESS`,
+/// `Retry-After: 60`, message explicite.
+fn heavy_work_in_progress() -> Response {
+    let mut response = api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "HEAVY_WORK_IN_PROGRESS",
+        "continuous publication in progress, retry later",
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("60"));
+    response
+}
+
 fn io_error(error: std::io::Error) -> String {
     error.to_string()
 }
@@ -8801,6 +8868,76 @@ mod tests {
         assert_eq!(v["data"]["source_events"], 76);
         assert_eq!(v["data"]["capabilities"]["live_capture"], true);
         assert_eq!(v["data"]["capabilities"]["capture_control"], false)
+    }
+
+    /// 2.21.30 (ordre #9 6952054201) — `/health` expose la quarantaine
+    /// persistante des segments en échec de décodage. Clé opérateur :
+    /// `data.quarantined_segments.count` + `data.quarantined_segments.items[]`
+    /// avec `(source_path, source_size_bytes, source_sha256, error_code,
+    /// quarantined_epoch_ms)`.
+    ///
+    /// Isolation : construit un `AppState` avec un `capture_root`
+    /// temporaire, pour que les autres tests (qui partagent le
+    /// workspace) ne polluent pas la quarantaine via disque.
+    #[tokio::test]
+    async fn health_surfaces_quarantined_segments() {
+        let workspace = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut config = test_config(workspace, "health-quarantine");
+        let capture_root = temporary_directory("health-quarantine-captures");
+        config.capture_root = capture_root.clone();
+        let st = AppState::load(config).unwrap();
+
+        // Sans quarantaine : le bloc est présent mais vide.
+        let app = router(st.clone(), None);
+        let body = json_body(
+            app.clone()
+                .oneshot(req("/api/v1/health", true))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["data"]["quarantined_segments"]["count"], 0);
+        assert_eq!(
+            body["data"]["quarantined_segments"]["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // Quarantinons un segment via l'API publique du gestionnaire.
+        let path = "/tmp/synthetic-n2-seg-0001.pcap";
+        let size = 1_048_576u64;
+        let sha = "a".repeat(64);
+        assert!(st.inner.capture_manager.quarantine_segment(
+            path,
+            size,
+            &sha,
+            "CONTINUOUS_SEGMENT_DECODE_FAILED: SYNTHETIC",
+            1_792_500_000_000,
+        ));
+
+        let body = json_body(
+            app.oneshot(req("/api/v1/health", true)).await.unwrap(),
+        )
+        .await;
+        assert_eq!(body["data"]["quarantined_segments"]["count"], 1);
+        let items = body["data"]["quarantined_segments"]["items"]
+            .as_array()
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["source_path"], path);
+        assert_eq!(items[0]["source_size_bytes"], size);
+        assert_eq!(items[0]["source_sha256"], sha);
+        assert_eq!(
+            items[0]["error_code"],
+            "CONTINUOUS_SEGMENT_DECODE_FAILED: SYNTHETIC"
+        );
+        assert_eq!(items[0]["quarantined_epoch_ms"], 1_792_500_000_000u64);
     }
 
     #[tokio::test]
@@ -13108,6 +13245,90 @@ mod tests {
             assert_eq!(body["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
         }
         let free = app.oneshot(request(uri)).await.unwrap();
+        assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// 2.21.30 (ordres #9 6952054201 + 6952664027) — pendant un travail
+    /// lourd (publication), `POST /sessions/filter` répond 503
+    /// `HEAVY_WORK_IN_PROGRESS` + `Retry-After: 60` ; libéré, la route
+    /// refonctionne. Le verrou étant porté par `capture_manager`
+    /// (instance par état depuis 2.21.28), chaque test a son propre
+    /// verrou — aucun impact sur les autres tests parallèles.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_filter_answers_503_while_continuous_publication_holds_memory_gate() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        let build = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions/filter")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"limit": 3}).to_string()))
+                .unwrap()
+        };
+        {
+            let _publication = state.inner.capture_manager.heavy_memory_enter();
+            let busy = app.clone().oneshot(build()).await.unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.headers()[header::RETRY_AFTER], "60");
+            let body = json_body(busy).await;
+            assert_eq!(body["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
+        }
+        let free = app.oneshot(build()).await.unwrap();
+        assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// 2.21.30 — même pattern pour `GET /sessions/catalog/search`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_catalog_search_answers_503_while_continuous_publication_holds_memory_gate() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        let build = || {
+            Request::builder()
+                .uri("/api/v1/sessions/catalog/search?q=Cause")
+                .body(Body::empty())
+                .unwrap()
+        };
+        {
+            let _publication = state.inner.capture_manager.heavy_memory_enter();
+            let busy = app.clone().oneshot(build()).await.unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.headers()[header::RETRY_AFTER], "60");
+            let body = json_body(busy).await;
+            assert_eq!(body["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
+        }
+        let free = app.oneshot(build()).await.unwrap();
+        assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// 2.21.30 — même pattern pour `POST /sessions/columns`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_columns_answers_503_while_continuous_publication_holds_memory_gate() {
+        let state = operator_state();
+        let session_id = queryable_session_ids(&state)
+            .into_iter()
+            .next()
+            .expect("session");
+        let app = router(state.clone(), None);
+        let build = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions/columns")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"session_ids": [session_id.clone()], "columns": ["state"]}).to_string(),
+                ))
+                .unwrap()
+        };
+        {
+            let _publication = state.inner.capture_manager.heavy_memory_enter();
+            let busy = app.clone().oneshot(build()).await.unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.headers()[header::RETRY_AFTER], "60");
+            let body = json_body(busy).await;
+            assert_eq!(body["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
+        }
+        let free = app.oneshot(build()).await.unwrap();
         assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 

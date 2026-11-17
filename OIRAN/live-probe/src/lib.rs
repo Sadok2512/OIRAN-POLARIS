@@ -1680,6 +1680,14 @@ pub struct CaptureManager {
     /// (`(chemin, taille)`), pour ne pas gonfler `ingestion_failures` à
     /// chaque cycle. Le log structuré, lui, sort à chaque cycle.
     reported_segment_failures: Arc<Mutex<BTreeSet<(String, u64)>>>,
+    /// 0.6.10 (ordre #9 6952054201) — quarantaine PERSISTANTE des
+    /// segments dont le décodage a définitivement échoué. Clé
+    /// `(chemin, taille, sha256)` ; valeur `{ error_code, epoch_ms }`.
+    /// Un segment en quarantaine est EXCLU des cycles d'import
+    /// suivants (pas retenté) tant que son identité ne change pas.
+    /// Persistance : `<root>/quarantine.json`. Chargé au `new()`,
+    /// réécrit atomiquement à chaque nouveau segment quarantiné.
+    quarantined_segments: Arc<Mutex<BTreeMap<SegmentQuarantineKey, SegmentQuarantineEntry>>>,
     // 2.7.6: per-deployment HMAC-SHA256 secret. Loaded once from a root-only
     // 0600 file at startup and shared by every import this manager runs,
     // including after a probe restart against the same key path. Wrapped in
@@ -1698,6 +1706,118 @@ pub struct CaptureManager {
     disk_sample_override_for_tests: Option<Result<disk_safety::FilesystemSample, String>>,
 }
 
+/// 0.6.10 (ordre #9 6952054201) — clé d'identité d'un segment
+/// quarantiné : `(chemin, taille, sha256)`. L'identité inclut le sha256
+/// pour qu'un fichier réécrit sous le même chemin (rare) soit retenté
+/// une fois (différent sha256 → non quarantiné).
+pub type SegmentQuarantineKey = (String, u64, String);
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SegmentQuarantineEntry {
+    pub error_code: String,
+    pub quarantined_epoch_ms: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct QuarantineFile {
+    #[serde(default)]
+    segments: Vec<SerializedQuarantineRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SerializedQuarantineRecord {
+    source_path: String,
+    source_size_bytes: u64,
+    source_sha256: String,
+    error_code: String,
+    quarantined_epoch_ms: u64,
+}
+
+fn quarantine_path(root: &Path) -> PathBuf {
+    root.join("quarantine.json")
+}
+
+fn load_quarantined_segments(
+    root: &Path,
+) -> BTreeMap<SegmentQuarantineKey, SegmentQuarantineEntry> {
+    let path = quarantine_path(root);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return BTreeMap::new(),
+    };
+    let file: QuarantineFile = match serde_json::from_slice(&bytes) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "QUARANTINE_LOAD_SKIPPED",
+                    "path": path.display().to_string(),
+                    "reason": error.to_string(),
+                })
+            );
+            return BTreeMap::new();
+        }
+    };
+    file.segments
+        .into_iter()
+        .map(|record| {
+            (
+                (
+                    record.source_path,
+                    record.source_size_bytes,
+                    record.source_sha256,
+                ),
+                SegmentQuarantineEntry {
+                    error_code: record.error_code,
+                    quarantined_epoch_ms: record.quarantined_epoch_ms,
+                },
+            )
+        })
+        .collect()
+}
+
+fn persist_quarantined_segments(
+    root: &Path,
+    segments: &BTreeMap<SegmentQuarantineKey, SegmentQuarantineEntry>,
+) {
+    let records = segments
+        .iter()
+        .map(|((path, size, sha256), entry)| SerializedQuarantineRecord {
+            source_path: path.clone(),
+            source_size_bytes: *size,
+            source_sha256: sha256.clone(),
+            error_code: entry.error_code.clone(),
+            quarantined_epoch_ms: entry.quarantined_epoch_ms,
+        })
+        .collect::<Vec<_>>();
+    let file = QuarantineFile { segments: records };
+    let bytes = match serde_json::to_vec_pretty(&file) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "QUARANTINE_PERSIST_FAILED",
+                    "path": quarantine_path(root).display().to_string(),
+                    "reason": error.to_string(),
+                })
+            );
+            return;
+        }
+    };
+    if let Err(error) = atomic_write(&quarantine_path(root), &bytes) {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "QUARANTINE_PERSIST_FAILED",
+                "path": quarantine_path(root).display().to_string(),
+                "reason": error,
+            })
+        );
+    }
+}
+
 impl CaptureManager {
     /// 0.6.8 — entrée bloquante (publication continue).
     pub fn heavy_memory_enter(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -1713,6 +1833,57 @@ impl CaptureManager {
             Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => None,
         }
+    }
+
+    /// 0.6.10 (ordre #9 6952054201) — vrai si ce segment a déjà été
+    /// quarantiné sous la même identité `(chemin, taille, sha256)`.
+    pub fn is_segment_quarantined(&self, path: &str, size: u64, sha256: &str) -> bool {
+        let key = (path.to_string(), size, sha256.to_string());
+        self.quarantined_segments
+            .lock()
+            .map(|guard| guard.contains_key(&key))
+            .unwrap_or(false)
+    }
+
+    /// 0.6.10 (ordre #9 6952054201) — enregistre un segment en quarantaine
+    /// (chemin + taille + sha256 + erreur + horodatage) et persiste à
+    /// `<root>/quarantine.json`. Idempotent : ré-enregistrer le même
+    /// segment ne change pas l'entrée. Retourne `true` si l'entrée est
+    /// nouvelle.
+    pub fn quarantine_segment(
+        &self,
+        path: &str,
+        size: u64,
+        sha256: &str,
+        error_code: &str,
+        epoch_ms: u64,
+    ) -> bool {
+        let key = (path.to_string(), size, sha256.to_string());
+        let mut guard = match self.quarantined_segments.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.contains_key(&key) {
+            return false;
+        }
+        guard.insert(
+            key,
+            SegmentQuarantineEntry {
+                error_code: error_code.to_string(),
+                quarantined_epoch_ms: epoch_ms,
+            },
+        );
+        persist_quarantined_segments(&self.root, &guard);
+        true
+    }
+
+    /// 0.6.10 (ordre #9 6952054201) — snapshot immuable de la quarantaine
+    /// pour `/health` ou la vue capture côté API.
+    pub fn quarantined_segments_snapshot(&self) -> Vec<(SegmentQuarantineKey, SegmentQuarantineEntry)> {
+        self.quarantined_segments
+            .lock()
+            .map(|guard| guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
     }
 
     pub fn new(root: PathBuf, execution_enabled: bool) -> Result<Self, String> {
@@ -1779,6 +1950,9 @@ impl CaptureManager {
         let interface_probe: Arc<dyn InterfaceProbe> = Arc::new(SysfsInterfaceProbe {
             interface_root: interface_root.clone(),
         });
+        // 0.6.10 (ordre #9 6952054201) — charge la quarantaine persistée
+        // AVANT de move `root` dans la struct (sinon emprunt après move).
+        let quarantined_segments = load_quarantined_segments(&root);
         let manager = Self {
             root,
             interface_root,
@@ -1793,6 +1967,7 @@ impl CaptureManager {
             continuous_vtap_dirs: Arc::new(Mutex::new(Vec::new())),
             heavy_memory_gate: Arc::new(Mutex::new(())),
             reported_segment_failures: Arc::new(Mutex::new(BTreeSet::new())),
+            quarantined_segments: Arc::new(Mutex::new(quarantined_segments)),
             pseudonym_key: Arc::new(pseudonym_key),
             interface_probe,
             // 2.14.11 (ANR1 #10 6860508699) — override test-only par
@@ -5572,6 +5747,24 @@ impl CaptureManager {
                 {
                     continue;
                 }
+                // 0.6.10 (ordre #9 6952054201) — segment quarantiné
+                // persistant : identité `(chemin, taille, sha256)`.
+                // Non retentée. Log d'exclusion pour audit opérateur.
+                let path_str = path.display().to_string();
+                let path_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if self.is_segment_quarantined(&path_str, path_size, &checksum) {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_SEGMENT_SKIPPED_QUARANTINED",
+                            "path": path_str,
+                            "size_bytes": path_size,
+                            "sha256": checksum,
+                            "action": "segment_excluded_cycle_continues",
+                        })
+                    );
+                    continue;
+                }
                 let capture_hash = format!("sha256:{checksum}");
                 // 2.21.5 — stamp Live/Vtap dérivé du chemin pcap, apposé
                 // sur CHAQUE event publié. `vtap_*.pcap` → probe_type=vtap,
@@ -5634,26 +5827,42 @@ impl CaptureManager {
                     Err(error) => {
                         decoded_spool_rewind(&mut decoded_spool, spool_mark)?;
                         let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        let path_display = path.display().to_string();
                         let first_report = self
                             .reported_segment_failures
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .insert((path.display().to_string(), size_bytes));
+                            .insert((path_display.clone(), size_bytes));
                         if first_report {
                             let code = format!("CONTINUOUS_SEGMENT_DECODE_FAILED: {error}");
                             let _ = self.update(CONTINUOUS_CAPTURE_ID, |job| {
                                 bump_failure(&mut job.metrics, &code);
                             });
                         }
+                        // 0.6.10 (ordre #9 6952054201) — quarantaine
+                        // persistante : identité = (chemin, taille, sha256
+                        // calculé juste avant). Les cycles suivants ne
+                        // retentent plus ce segment tant que son identité
+                        // ne change pas.
+                        let error_code = format!("CONTINUOUS_SEGMENT_DECODE_FAILED: {error}");
+                        let newly_quarantined = self.quarantine_segment(
+                            &path_display,
+                            size_bytes,
+                            &checksum,
+                            &error_code,
+                            epoch_ms(),
+                        );
                         eprintln!(
                             "{}",
                             serde_json::json!({
                                 "event": "CONTINUOUS_SEGMENT_DECODE_FAILED",
-                                "path": path.display().to_string(),
+                                "path": path_display,
                                 "interface": interface.interface,
                                 "size_bytes": size_bytes,
+                                "sha256": checksum,
                                 "error": error,
                                 "deduplicated": !first_report,
+                                "quarantined": newly_quarantined,
                                 "action": "segment_skipped_cycle_continues",
                             })
                         );
@@ -11000,6 +11209,73 @@ mod tests {
     fn phase_ten_event_id_extractor_reads_only_the_top_level_key() {
         let line = r#"{"decoded_ie_tree":{"event_id":"nested-decoy"}, "event_id" : "capture-001:42", "message_name":"Registration Accept"}"#;
         assert_eq!(event_id_from_json_line(line).as_deref(), Some("capture-001:42"));
+    }
+
+    /// 0.6.10 (ordre #9 6952054201) — la quarantaine persistante d'un
+    /// segment en échec de décodage survit à un redémarrage de
+    /// `CaptureManager`. `is_segment_quarantined` doit renvoyer true
+    /// pour l'identité `(chemin, taille, sha256)` ; la méthode
+    /// `quarantined_segments_snapshot` doit exposer l'entrée avec son
+    /// `error_code` et son horodatage.
+    #[test]
+    fn quarantined_segment_survives_capture_manager_restart() {
+        let root = temporary_root("quarantine-persist");
+        let key_path = root.join(".oiran-pseudonym.key");
+
+        let manager_1 =
+            CaptureManager::with_pseudonym_key_path(root.clone(), false, key_path.clone())
+                .unwrap();
+        assert!(manager_1.quarantined_segments_snapshot().is_empty());
+
+        let path = "/var/lib/oiran/captures/pcap/n2/seg-0001.pcap";
+        let size = 2_048_576u64;
+        let sha256 = "0".repeat(64);
+        let fresh = manager_1.quarantine_segment(
+            path,
+            size,
+            &sha256,
+            "CONTINUOUS_SEGMENT_DECODE_FAILED: SYNTHETIC_TRUNCATED",
+            1_792_000_000_000,
+        );
+        assert!(fresh, "premier quarantine_segment doit être neuf");
+        let dup = manager_1.quarantine_segment(
+            path,
+            size,
+            &sha256,
+            "CONTINUOUS_SEGMENT_DECODE_FAILED: SYNTHETIC_TRUNCATED",
+            1_792_000_000_001,
+        );
+        assert!(!dup, "second quarantine_segment identique doit être idempotent");
+
+        assert!(manager_1.is_segment_quarantined(path, size, &sha256));
+        let snapshot_1 = manager_1.quarantined_segments_snapshot();
+        assert_eq!(snapshot_1.len(), 1);
+        assert_eq!(snapshot_1[0].0 .0, path);
+        assert_eq!(snapshot_1[0].0 .1, size);
+        assert_eq!(snapshot_1[0].0 .2, sha256);
+        assert_eq!(
+            snapshot_1[0].1.error_code,
+            "CONTINUOUS_SEGMENT_DECODE_FAILED: SYNTHETIC_TRUNCATED"
+        );
+        assert_eq!(snapshot_1[0].1.quarantined_epoch_ms, 1_792_000_000_000);
+
+        // Nouveau CaptureManager (simule un redémarrage de la sonde).
+        // L'identité quarantinée est rechargée depuis `root/quarantine.json`.
+        drop(manager_1);
+        let manager_2 =
+            CaptureManager::with_pseudonym_key_path(root.clone(), false, key_path).unwrap();
+        assert!(
+            manager_2.is_segment_quarantined(path, size, &sha256),
+            "la quarantaine doit survivre au redémarrage"
+        );
+        let snapshot_2 = manager_2.quarantined_segments_snapshot();
+        assert_eq!(snapshot_2.len(), 1);
+        assert_eq!(snapshot_2[0].1.error_code, snapshot_1[0].1.error_code);
+
+        // Un sha256 différent (contenu modifié) → non quarantiné : on
+        // retenterait le segment reconstruit.
+        let other_sha = "1".repeat(64);
+        assert!(!manager_2.is_segment_quarantined(path, size, &other_sha));
     }
 
     #[test]
