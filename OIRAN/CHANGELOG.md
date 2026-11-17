@@ -1,5 +1,63 @@
 # Changelog
 
+## OIRAN API 2.21.16 — 2026-11-17 — `/sessions/:id/events` + `/sessions/:id/callflow` en `spawn_blocking` (audit handlers, lot 1 UI)
+
+Lot 1 des 22 handlers OUVERTS de l'audit 2.21.14, ordre d'usage UI prioritaire (#9 6941147984 : « `/events`, `/live/*`, `/callflow` d'abord »). Chaque route exerce son fix via un test VRAI routeur dédié.
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.15 | **2.21.16** |
+
+### Correctifs
+
+**`/sessions/:id/events`** (`apps/api/src/lib.rs:6264` avant 2.21.16) :
+- Logique sync extraite en `fn session_events_blocking(state, id, query) -> Response`.
+- Handler async → `tokio::task::spawn_blocking` autour. Évite de bloquer le runtime sur `flow_value_for` / `live_flow_for` (callflow fs::read + parse JSON) + `apply_read_time_patch` + `extend_items_with_pfcp_siblings_from_jsonl` (fs::read JSONL).
+
+**`/sessions/:id/callflow`** :
+- Logique sync extraite en `fn session_callflow_blocking(state, id, query) -> Response`.
+- Handler async → `spawn_blocking`. Évite de bloquer sur `read_callflow_page(path, cursor, limit)` (fs::read + parse JSON avec pagination) + `callflow_page_from_value` + `insert_pfcp_siblings_into_callflow`.
+
+`CallflowQuery` rendu `Clone` (comme `ListQuery` en 2.21.14).
+
+### Tests VRAI routeur (règle #9 6940906119)
+
+1. `session_events_route_is_spawned_blocking_real_router` :
+   - `state()` + `router(state, None)`.
+   - Amorce `/health`.
+   - `tokio::spawn router.oneshot("/api/v1/sessions/{id}/events")`.
+   - En concurrence : `/health` doit répondre en **< 500 ms** sinon FAIL.
+   - Attend `events_task` → 200 OK.
+
+2. `session_callflow_route_is_spawned_blocking_real_router` :
+   - Même structure sur `/api/v1/sessions/{id}/callflow`.
+
+### Audit — statut après 2.21.16
+
+| Route | Statut | Lot |
+|---|---|---|
+| `/health` | FIXÉ | 2.21.13 |
+| `/sessions` | FIXÉ | 2.21.14 |
+| `/sessions/catalog` | FIXÉ | 2.22.4 |
+| `/sessions/:id/identities` | FIXÉ (spawn_blocking + cache signature) | 2.21.10 + 2.21.15 |
+| `/sessions/:id/events` | **FIXÉ** | **2.21.16** |
+| `/sessions/:id/callflow` | **FIXÉ** | **2.21.16** |
+| `/live/*` (live-trace handlers) | À auditer en 2.21.17 | — |
+| 15 autres (`/metrics`, `/ues`, `/ue*`, `/subscribers`, `/subscriber_*`, `/sessions/filter`, `/sessions/catalog/search`, `/sessions/columns`, `/sessions/:id` (session), `/session_correlations`, `/event/*`, `/provenance/*`, `/packet*`, `/correlation_edges`, `/export_callflow`) | OUVERT | 2.21.17+ |
+
+### Tests
+
+```bash
+cargo test -p oiran-api --lib --locked    # 170 passed, 3 ignored (+2 : events + callflow real-router)
+cd OIRAN/vtap && cargo update -w && cargo test --locked   # 12 unit + 3 integration passed
+```
+
+### Suite
+
+Merge dans `feat/oiran-2.22.0-userplane` et `feat/oiran-2.23.0-bench-o1`. **2.21.17** : prochain lot handlers (candidats : `/live/traces/:id/sessions`, `/sessions/filter`, `/session_correlations`, `/sessions/:id` — ordre par poids typique UI).
+
 ## OIRAN API 2.21.15 — 2026-11-17 — cache `/identities` par signature de callflow (point 3 reprise 17/11)
 
 Point 3 de la reprise #9 6940906119 + #9 6941147984 : `/identities` froid = 210 s sur la session de référence lab. Objectif < 10 s au 2e appel.

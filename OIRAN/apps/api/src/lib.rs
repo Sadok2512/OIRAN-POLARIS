@@ -2237,7 +2237,7 @@ struct ListQuery {
     packet_number: Option<u64>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 struct CallflowQuery {
     limit: Option<usize>,
     cursor: Option<String>,
@@ -6266,6 +6266,25 @@ async fn session_events(
     Path(id): Path<String>,
     Query(query): Query<ListQuery>,
 ) -> Response {
+    // 2.21.16 (audit handlers #9 6941147984) — session_events_blocking
+    // lit un callflow JSON du capture_manager, applique le patch
+    // read-time, étend avec les PFCP siblings du JSONL raw (fs::read).
+    // Tout sur runtime async pré-2.21.16. Correctif : spawn_blocking.
+    let state_bl = state.clone();
+    let id_bl = id.clone();
+    let query_bl = query.clone();
+    tokio::task::spawn_blocking(move || session_events_blocking(&state_bl, &id_bl, &query_bl))
+        .await
+        .unwrap_or_else(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SESSION_EVENTS_FAILED",
+                "session events handler panicked",
+            )
+        })
+}
+
+fn session_events_blocking(state: &AppState, id: &str, query: &ListQuery) -> Response {
     // 2.14.8 (ANR1 #10) — chaque chemin fournit (items, dataset_root
     // optionnel) : A (reference_dataset_enabled) → `state.inner.storage_path`
     // joint à `datasets/<id>` indirect, on résout ici via la config
@@ -6276,13 +6295,13 @@ async fn session_events(
     // sert tel quel (les callflows LTE sont produits dans un autre
     // flux et n'ont pas le mélange old/new shards).
     let (mut items, dataset_root): (Vec<Value>, Option<PathBuf>) =
-        if let Some(flow_value) = flow_value_for(&state, &id) {
+        if let Some(flow_value) = flow_value_for(state, id) {
             // Path A : events déjà patchés à `AppState::load` ; la
             // ré-application depuis le dataset_dir configuré reste
             // idempotente (compteurs inchangés).
             let items = flow_value["events"].as_array().cloned().unwrap_or_default();
             (items, state.inner.reference_dataset_root.clone())
-        } else if let Some((dataset_id, flow)) = live_flow_for(&state, &id) {
+        } else if let Some((dataset_id, flow)) = live_flow_for(state, id) {
             let items = serde_json::to_value(flow.events)
                 .ok()
                 .and_then(|value| value.as_array().cloned())
@@ -6290,7 +6309,7 @@ async fn session_events(
             (items, state.inner.capture_manager.dataset_root(&dataset_id))
         } else {
             match state.inner.lte_evidence_store.callflow_page_by_session(
-                &id,
+                id,
                 None,
                 MAX_CALLFLOW_PAGE_EVENTS,
             ) {
@@ -6309,23 +6328,17 @@ async fn session_events(
             }
         };
     let patch_status = if let Some(root) = dataset_root.as_deref() {
-        apply_read_time_patch(&state, &mut items, root, &id)
+        apply_read_time_patch(state, &mut items, root, id)
     } else {
         read_time_patch::PatchStatus::NotApplicable
     };
-    // 2.15.2 (ANR1 #10 6885876387) — réconciliation avec le JSONL
-    // raw : la PFCP Session Establishment Request type 50 absente
-    // du callflow persisté est récupérée si elle partage un
-    // `pfcp_sequence`/`seid` avec la Response/Modification déjà
-    // présente. Fix 2.15.0 pré-publication ne couvrait pas le
-    // chemin prod (callflow déjà écrit sur disque avant 2.15.0).
     if let Some(root) = dataset_root.as_deref() {
         let _ = read_time_patch::extend_items_with_pfcp_siblings_from_jsonl(&mut items, root);
     }
     read_time_patch::fill_unknown_participants_by_interface(&mut items);
-    filter_events(&mut items, &query);
+    filter_events(&mut items, query);
     sanitize_all(&mut items);
-    paginated_with_patch_status(items, &query, patch_status).into_response()
+    paginated_with_patch_status(items, query, patch_status).into_response()
 }
 
 fn callflow_page_from_value(
@@ -6434,26 +6447,44 @@ async fn session_callflow(
     Path(id): Path<String>,
     Query(query): Query<CallflowQuery>,
 ) -> Response {
+    // 2.21.16 (audit handlers #9 6941147984) — read_callflow_page lit un
+    // fichier JSON potentiellement large sur disque + parse. Déport
+    // dans spawn_blocking pour ne pas bloquer le runtime async.
+    let state_bl = state.clone();
+    let id_bl = id.clone();
+    let query_bl = query.clone();
+    tokio::task::spawn_blocking(move || session_callflow_blocking(&state_bl, &id_bl, &query_bl))
+        .await
+        .unwrap_or_else(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SESSION_CALLFLOW_FAILED",
+                "session callflow handler panicked",
+            )
+        })
+}
+
+fn session_callflow_blocking(state: &AppState, id: &str, query: &CallflowQuery) -> Response {
     let limit = query.limit.unwrap_or(DEFAULT_CALLFLOW_PAGE_EVENTS);
     if !(1..=MAX_CALLFLOW_PAGE_EVENTS).contains(&limit) {
         return callflow_read_error("CALLFLOW_LIMIT_INVALID");
     }
     let cursor = query.cursor.as_deref();
-    let result = if let Some(path) = flow_path_for(&state, &id) {
+    let result = if let Some(path) = flow_path_for(state, id) {
         read_callflow_page(path, cursor, limit).map(Some)
-    } else if let Some(flow_value) = flow_value_for(&state, &id) {
+    } else if let Some(flow_value) = flow_value_for(state, id) {
         callflow_page_from_value(flow_value, cursor, limit).map(Some)
     } else {
         match state
             .inner
             .capture_manager
-            .callflow_page_by_session(&id, cursor, limit)
+            .callflow_page_by_session(id, cursor, limit)
         {
             Ok(Some(value)) => Ok(Some(value)),
             Ok(None) => state
                 .inner
                 .lte_evidence_store
-                .callflow_page_by_session(&id, cursor, limit)
+                .callflow_page_by_session(id, cursor, limit)
                 .map_err(|error| error.to_string()),
             Err(error) => Err(error),
         }
@@ -6463,10 +6494,10 @@ async fn session_callflow(
             // 2.15.3 — même réconciliation PFCP que /events (2.15.2), sur la
             // première page du callflow lue par le ladder p900.
             if cursor.is_none() {
-                let dataset_root = if flow_value_for(&state, &id).is_some() {
+                let dataset_root = if flow_value_for(state, id).is_some() {
                     state.inner.reference_dataset_root.clone()
                 } else {
-                    live_flow_for(&state, &id).and_then(|(dataset_id, _)| {
+                    live_flow_for(state, id).and_then(|(dataset_id, _)| {
                         state.inner.capture_manager.dataset_root(&dataset_id)
                     })
                 };
@@ -12646,6 +12677,79 @@ mod tests {
                 "a modified event_id must invalidate the cache entry"
             );
         }
+    }
+
+    /// 2.21.16 (audit handlers #9 6941147984, point UI `/events`) — prouve
+    /// via le VRAI routeur que `/sessions/:id/events` est non-bloquant
+    /// pour `/health` même en charge concurrente.
+    #[tokio::test]
+    async fn session_events_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let session_id = st
+            .inner
+            .flows
+            .keys()
+            .next()
+            .cloned()
+            .expect("embedded dataset has at least one session");
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_events = app.clone();
+        let sid = session_id.clone();
+        let events_task = tokio::spawn(async move {
+            app_events
+                .oneshot(req(&format!("/api/v1/sessions/{sid}/events"), false))
+                .await
+                .unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "/health starved by /events ; elapsed {:?}",
+            elapsed
+        );
+        let events = events_task.await.unwrap();
+        assert_eq!(events.status(), StatusCode::OK);
+    }
+
+    /// 2.21.16 (audit handlers #9 6941147984, point UI `/callflow`) — même
+    /// invariant pour `/sessions/:id/callflow`.
+    #[tokio::test]
+    async fn session_callflow_route_is_spawned_blocking_real_router() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        let session_id = st
+            .inner
+            .flows
+            .keys()
+            .next()
+            .cloned()
+            .expect("embedded dataset has at least one session");
+        let _ = app.clone().oneshot(req("/api/v1/health", false)).await.unwrap();
+        let app_cf = app.clone();
+        let sid = session_id.clone();
+        let cf_task = tokio::spawn(async move {
+            app_cf
+                .oneshot(req(&format!("/api/v1/sessions/{sid}/callflow"), false))
+                .await
+                .unwrap()
+        });
+        let start = Instant::now();
+        let health = app.oneshot(req("/api/v1/health", false)).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "/health starved by /callflow ; elapsed {:?}",
+            elapsed
+        );
+        let cf = cf_task.await.unwrap();
+        assert_eq!(cf.status(), StatusCode::OK);
     }
 
     /// 2.19.1 — `/sessions/catalog/search?q=` renvoie des matches
