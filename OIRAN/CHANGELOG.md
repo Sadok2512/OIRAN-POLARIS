@@ -1,5 +1,16 @@
 # Changelog
 
+## OIRAN API 2.21.31 + live-probe 0.6.11 — 2026-11-17 — un pcap vTAP fermé déclenche la publication à lui seul (FAIL lab 2.21.29)
+
+Upgrade **patch**, sur 2.21.30 (DEVMAT, relu : oiran-api 189 passed et live-probe 169 passed, 3 exécutions sur 3, aucun `#[ignore]` ajouté).
+
+**Correction de mon diagnostic 2.21.29.** Au lab, le segment S6a tronqué n'atteint jamais `decode_capture_streaming(...)?` dans `process_capture_into_selected` : il est rejeté avant, à la pré-validation `CONTINUOUS_SEGMENT_NOT_FINALIZED` (`continue`). La vraie cause (ANR2 #10 6953258407) : la phase vTAP vit DANS la publication, déclenchée uniquement par un NOUVEAU segment dumpcap (`changed`). Avec le SBI en TLS et aucun nouveau segment, la phase vTAP ne tournait jamais. Le correctif 2.21.29 reste utile (segment en échec au décodage complet), mais il ne fermait pas ce cas.
+
+- `unpublished_vtap_pcap` : un pcap vTAP fermé (> 24 o), dont l'empreinte n'est pas dans le dataset publié, positionne `changed` ; log `CONTINUOUS_VTAP_TRIGGERS_PUBLICATION`. Une publication au plus par `(chemin, taille)` : un pcap rejeté par la phase vTAP ne boucle pas.
+- Test `closed_vtap_pcap_triggers_publication_without_new_dumpcap_segment` : reproduit le lab (seul candidat dumpcap tronqué, rejeté en pré-validation) → le pcap vTAP est publié. **Preuve de mutation** : sans le déclencheur, le test échoue (timeout de 30 s).
+- Constat : les tests `start_continuous_import` se sautent (SKIP visible) si `/tmp` est sous le seuil disque. Exécutés ici avec 15 G libres.
+- Numérotation : le chantier mémoire ANR1 passe en 2.21.32 (live-probe 0.6.12).
+
 ## OIRAN API 2.21.30 + live-probe 0.6.10 — 2026-11-17 — verrou mémoire sur 3 routes lourdes + quarantaine persistante des segments en échec
 
 Ordres #9 6952054201 et 6952664027. Branche `fix/oiran-2.21.30-heavy-lock` depuis `eefff4f` (2.21.29).

@@ -1680,6 +1680,10 @@ pub struct CaptureManager {
     /// (`(chemin, taille)`), pour ne pas gonfler `ingestion_failures` à
     /// chaque cycle. Le log structuré, lui, sort à chaque cycle.
     reported_segment_failures: Arc<Mutex<BTreeSet<(String, u64)>>>,
+    /// 0.6.11 — pcaps vTAP `(chemin, taille)` ayant déjà déclenché une
+    /// publication : un pcap que la phase vTAP rejette (manifeste absent,
+    /// décodage en échec) ne relance pas une publication à chaque scan.
+    vtap_publication_triggers: Arc<Mutex<BTreeSet<(String, u64)>>>,
     /// 0.6.10 (ordre #9 6952054201) — quarantaine PERSISTANTE des
     /// segments dont le décodage a définitivement échoué. Clé
     /// `(chemin, taille, sha256)` ; valeur `{ error_code, epoch_ms }`.
@@ -1967,6 +1971,7 @@ impl CaptureManager {
             continuous_vtap_dirs: Arc::new(Mutex::new(Vec::new())),
             heavy_memory_gate: Arc::new(Mutex::new(())),
             reported_segment_failures: Arc::new(Mutex::new(BTreeSet::new())),
+            vtap_publication_triggers: Arc::new(Mutex::new(BTreeSet::new())),
             quarantined_segments: Arc::new(Mutex::new(quarantined_segments)),
             pseudonym_key: Arc::new(pseudonym_key),
             interface_probe,
@@ -3919,6 +3924,27 @@ impl CaptureManager {
             })?;
             cycle_trace.pending_stability = pending_stability_this_scan as u64;
             cycle_trace.ingested_this_cycle = ingested_this_scan as u64;
+            // 0.6.11 (essai 7 FAIL lab, ANR2 #10 6953258407) — la phase vTAP
+            // vit dans la publication, qui n'était déclenchée que par un
+            // NOUVEAU segment dumpcap. Avec le SBI en TLS, aucun segment
+            // nouveau (le seul candidat, S6a tronqué, est rejeté à la
+            // pré-validation `CONTINUOUS_SEGMENT_NOT_FINALIZED`) → la phase
+            // vTAP ne tournait jamais. Un pcap vTAP fermé et non publié
+            // déclenche désormais la publication à lui seul.
+            if !changed {
+                if let Some(vtap_pcap) = self.unpublished_vtap_pcap(&base) {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_VTAP_TRIGGERS_PUBLICATION",
+                            "cycle_id": continuous_cycle_id,
+                            "path": vtap_pcap.display().to_string(),
+                            "reason": "closed vTAP pcap not in published dataset; no new dumpcap segment",
+                        })
+                    );
+                    changed = true;
+                }
+            }
             let mut published = !changed;
             if changed {
                 let selected_files = pending_publication
@@ -5667,6 +5693,50 @@ impl CaptureManager {
             None,
             None,
         )
+    }
+
+    /// 0.6.11 — premier pcap vTAP fermé (> 24 o) dont l'empreinte n'est pas
+    /// dans le dataset continu publié et qui n'a pas encore déclenché de
+    /// publication. Les rejets (manifeste, décodage) restent journalisés par
+    /// la phase vTAP elle-même.
+    fn unpublished_vtap_pcap(&self, base: &Path) -> Option<PathBuf> {
+        let vtap_dirs = self.continuous_vtap_dirs.lock().unwrap().clone();
+        if vtap_dirs.is_empty() {
+            return None;
+        }
+        let published = fs::read(base.join("dataset/dataset_manifest.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<LiveDataset>(&bytes).ok())
+            .map(|dataset| dataset.checksums.into_values().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        let mut triggers = self
+            .vtap_publication_triggers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for vtap_dir in vtap_dirs {
+            let Ok(entries) = crate::capture_source::VtapSource::ingestible_entries(&vtap_dir) else {
+                continue;
+            };
+            for pcap in entries {
+                let size = fs::metadata(&pcap).map(|m| m.len()).unwrap_or(0);
+                if size <= 24 {
+                    continue;
+                }
+                let key = (pcap.display().to_string(), size);
+                if triggers.contains(&key) {
+                    continue;
+                }
+                let Ok(checksum) = sha256_hex_file(&pcap) else {
+                    continue;
+                };
+                if published.contains(&checksum) {
+                    continue;
+                }
+                triggers.insert(key);
+                return Some(pcap);
+            }
+        }
+        None
     }
 
     fn process_capture_into_selected(
@@ -13109,6 +13179,73 @@ mod tests {
         assert!(!dataset.checksums.contains_key("N2.pcapng"));
         let failures = manager.reported_segment_failures.lock().unwrap().len();
         assert_eq!(failures, 1);
+    }
+
+    /// 0.6.11 (essai 7 FAIL lab, ANR2 #10 6953258407) — reproduit le lab :
+    /// le seul segment dumpcap candidat est tronqué (rejeté à la
+    /// pré-validation `CONTINUOUS_SEGMENT_NOT_FINALIZED`), donc aucun nouveau
+    /// segment ; un pcap vTAP fermé doit quand même être publié.
+    #[test]
+    fn closed_vtap_pcap_triggers_publication_without_new_dumpcap_segment() {
+        if skip_if_disk_too_full("closed_vtap_pcap_triggers_publication_without_new_dumpcap_segment") {
+            return;
+        }
+        let source = temporary_root("vtap-trigger-source");
+        let vtap_dir = temporary_root("vtap-trigger-out");
+        let root = temporary_root("vtap-trigger-root");
+        fs::create_dir_all(source.join("N2")).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let n2 = fs::read(fixture.join("N2.pcapng")).unwrap();
+        fs::write(source.join("N2/final-1.pcapng"), &n2[..n2.len() * 3 / 5 + 7]).unwrap();
+        write_rotation_closures(&source, "N2", 1);
+        let vtap_pcap = vtap_dir.join("vtap_SBI_20261117T170000Z.pcap");
+        fs::copy(fixture.join("N4.pcapng"), &vtap_pcap).unwrap();
+        fs::write(
+            crate::capture_source::append_vtap_manifest_suffix(&vtap_pcap),
+            br#"{"schema":"polaris.vtap.manifest.v1","probe_id":"oiran-vtap-lab-01","probe_type":"vtap","interface":"SBI","timestamp_source":"ebpf_monotonic","pcap":"vtap_SBI_20261117T170000Z.pcap","counters":{},"connections":[],"open_items":[]}"#,
+        )
+        .unwrap();
+        let vtap_checksum = sha256_hex_file(&vtap_pcap).unwrap();
+        thread::sleep(Duration::from_millis(250));
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source,
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
+                max_segments: 1,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+                vtap_out_dirs: vec![vtap_dir.clone()],
+            })
+            .unwrap();
+        let manifest = root.join(CONTINUOUS_CAPTURE_ID).join("dataset/dataset_manifest.json");
+        wait_for(|| {
+            fs::read(&manifest)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<LiveDataset>(&bytes).ok())
+                .is_some_and(|dataset| dataset.checksums.values().any(|c| c == &vtap_checksum))
+        });
+        // Le segment tronqué est bien rejeté (pré-validation), comme au lab.
+        wait_for(|| {
+            manager
+                .get(CONTINUOUS_CAPTURE_ID)
+                .is_some_and(|job| job.metrics.ingestion_failures >= 1)
+        });
+        // Un pcap vTAP déjà publié ne relance pas de publication.
+        assert!(manager.unpublished_vtap_pcap(&root.join(CONTINUOUS_CAPTURE_ID)).is_none());
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
     }
 
     #[test]
