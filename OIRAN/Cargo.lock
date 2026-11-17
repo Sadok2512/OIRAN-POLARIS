@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-sbi"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "decoder-ngap",
  "event-schema",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.21.17"
+version = "2.21.18"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -685,6 +685,7 @@ dependencies = [
  "decoder-nas",
  "decoder-ngap",
  "decoder-s1ap",
+ "decoder-sbi",
  "disk-safety",
  "event-schema",
  "http-body-util",

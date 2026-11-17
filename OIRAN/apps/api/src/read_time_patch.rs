@@ -521,6 +521,30 @@ fn kind_from_ngap_u32(value: u32) -> decoder_ngap::PduKind {
 /// (TS 36.413) ou NGAP (TS 38.413). Les deux appelées à la même
 /// signature mais via deux tables disjointes. Une seule source de
 /// vérité par protocole (les fonctions publiques des décodeurs).
+/// 2.21.18 (ANR2 #10, FAIL 2.21.16 : 724 `UnsupportedSbiOperation`
+/// servis) — les events SBI stockés ont été nommés à l'ingestion par le
+/// catalogue de l'époque. On reclasse à la lecture, avec la MÊME fonction
+/// que le décodeur (`decoder_sbi::classify_sanitized_operation`), sur
+/// l'URI anonymisée et la méthode stockées sur l'event brut. Ne touche que
+/// les events nommés `UnsupportedSbiOperation…` ; sans correspondance, le
+/// libellé d'origine est conservé (jamais d'invention).
+fn sbi_name_for(raw: &Value) -> Option<String> {
+    if raw.get("protocol").and_then(Value::as_str) != Some("SBI-HTTP2") {
+        return None;
+    }
+    let current = raw.get("message_name").and_then(Value::as_str)?;
+    if !current.starts_with("UnsupportedSbiOperation") {
+        return None;
+    }
+    let ies = raw.get("information_elements").and_then(Value::as_array)?;
+    let ie = |name: &str| {
+        ies.iter()
+            .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|item| item.get("value").and_then(Value::as_str))
+    };
+    decoder_sbi::classify_sanitized_operation(ie("Request URI (sanitized)")?, ie("HTTP method"))
+}
+
 fn s1ap_name_for(raw: &Value) -> Option<String> {
     let protocol = raw.get("protocol").and_then(Value::as_str)?;
     let code = raw
@@ -681,7 +705,9 @@ fn patch_one(
     let new_message_name = if let Some(parent_name) = parent_s1ap_name.as_deref() {
         nas_name_for(raw, parent_name)
     } else {
-        s1ap_name_for(raw).or_else(|| nas_name_only(raw))
+        s1ap_name_for(raw)
+            .or_else(|| nas_name_only(raw))
+            .or_else(|| sbi_name_for(raw))
     };
 
     // Publier les nouvelles valeurs si elles diffèrent (idempotent).
@@ -2705,6 +2731,49 @@ mod tests {
             ],
         })];
         assert!(extract_identity_summary_from_items(&items).is_none());
+    }
+
+    /// 2.21.18 — un event SBI stocké `UnsupportedSbiOperation…` est
+    /// reclassé à la lecture avec la MÊME fonction que le décodeur ;
+    /// une URI inconnue garde son libellé (jamais d'invention).
+    #[test]
+    fn sbi_unsupported_events_are_reclassified_at_read_time_with_decoder_catalogue() {
+        let dir = std::env::temp_dir().join(format!("rtp-sbi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbi = |id: &str, method: &str, uri: &str| {
+            json!({
+                "event_id": id, "parent_event_id": null, "interface": "SBI",
+                "protocol": "SBI-HTTP2",
+                "message_name": "UnsupportedSbiOperation [conn=x/stream=1]",
+                "source_endpoint": {"address":"10.77.20.20","port":40000,"network_function":"AMF"},
+                "destination_endpoint": {"address":"10.77.20.30","port":7777,"network_function":"UDM"},
+                "direction": "UNKNOWN",
+                "information_elements": [
+                    {"name":"HTTP method","value":method},
+                    {"name":"Request URI (sanitized)","value":uri}
+                ]
+            })
+        };
+        let raw = vec![
+            sbi("sbi-1", "POST", "/nnrf-disc/v1/nf-instances"),
+            sbi("sbi-2", "GET", "/nzzz-unknown/v1/whatever"),
+        ];
+        let expected = decoder_sbi::classify_sanitized_operation("/nnrf-disc/v1/nf-instances", Some("POST"));
+        let jsonl_path = write_jsonl(&dir, &raw);
+        let index = RawEventIndex::from_jsonl_path(&jsonl_path).unwrap();
+        let mut events = vec![
+            stale_callflow_event("sbi-1", "AMF", "UDM", "UNKNOWN", "UnsupportedSbiOperation [conn=x/stream=1]"),
+            stale_callflow_event("sbi-2", "AMF", "UDM", "UNKNOWN", "UnsupportedSbiOperation [conn=x/stream=1]"),
+        ];
+        let counters = Arc::new(PatchCounters::new());
+        patch_flow_events(&mut events, &index, &lab_endpoint_map(), &counters);
+        match expected {
+            Some(name) => assert_eq!(events[0]["message_name"], name),
+            None => panic!("le catalogue SBI doit connaître nnrf-disc POST"),
+        }
+        assert!(events[1]["message_name"].as_str().unwrap().starts_with("UnsupportedSbiOperation"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
