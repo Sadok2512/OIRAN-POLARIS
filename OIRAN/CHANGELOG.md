@@ -1,5 +1,81 @@
 # Changelog
 
+## OIRAN API 2.21.14 — 2026-11-17 — audit handlers + `/sessions` en `spawn_blocking` (point 2 reprise 17/11)
+
+Point 2 de la reprise #9 6940906119. Audit des handlers axum qui font des E/S disque ou du parse de callflow sur le runtime async, avec correctif progressif.
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.13 | **2.21.14** |
+
+### Correctif `/sessions`
+
+`apps/api/src/lib.rs:3775` : `sessions()` itérait `state.inner.flows.values()` + `state.inner.capture_manager.datasets()` + `cached_live_list_row` (qui résout `callflow(dataset, session_id)` = N × fs::read + parse JSON) + `lte_evidence_store.catalog() + session_page()`. Tout sur le runtime async : même profil de blocage que `/health` pré-2.21.13.
+
+Fix : logique synchrone extraite dans `fn sessions_blocking(state, query) -> Value` ; le handler async se contente de `tokio::task::spawn_blocking` autour. `ListQuery` rendu `Clone`. Nouveau helper `paginated_value(items, query)` (variante Value de `paginated` pour appel hors contexte axum).
+
+### Test VRAI routeur (règle #9 6940906119)
+
+`sessions_route_is_spawned_blocking_and_does_not_starve_health_real_router` :
+1. `state()` + `router(state, None)`.
+2. Amorce `/health` (cache fresh).
+3. Lance `/sessions` via `tokio::spawn` + `router.oneshot("/api/v1/sessions")`.
+4. En concurrence, mesure `/health` → **< 500 ms** sinon FAIL.
+5. Attend `sessions_task` → 200 OK.
+
+Aucun `sleep` en simulation. L'invariant exerce bien les 2 vrais handlers sur le vrai routeur.
+
+### Audit — liste exhaustive des handlers avec iteration datasets/callflow sur runtime
+
+Pour chaque handler ci-dessous, la logique itère `state.inner.capture_manager.datasets()` et/ou appelle `capture_manager.callflow(dataset_id, session_id)` et/ou désérialise un callflow JSON en synchrone. Scope de fix : déport dans `spawn_blocking` (par analogie `/sessions`) OU cache keyé par `commit_seq` (par analogie `/sessions/catalog` 2.22.4). Correctifs restants = **OUVERTS 2.21.15+** — chaque fix exige un test VRAI routeur dédié.
+
+| Route | `apps/api/src/lib.rs` | Statut |
+|---|---|---|
+| `GET /health` | 1408 | **FIXÉ 2.21.13** (cache + spawn_blocking recalc) |
+| `GET /sessions` | 3775 | **FIXÉ 2.21.14** (spawn_blocking + test réel) |
+| `GET /sessions/catalog` | 4881 | **FIXÉ 2.22.4** (cache commit_seq) |
+| `GET /sessions/:id/identities` | 6024 | **FIXÉ 2.21.10** (spawn_blocking hydrate) |
+| `GET /metrics` | 1662 (datasets() l. 1720) | OUVERT — itère `datasets()` + capture_manager state |
+| `GET /ues` | 2812 (datasets() l. 2820) | OUVERT — itère tous les flows cross-dataset |
+| `GET /ue/:id` | 2843 (datasets() l. 2854) | OUVERT |
+| `GET /ue/:id/sessions` | 2871 (datasets() + callflow()) | OUVERT |
+| `GET /subscribers` | 3537 (datasets() + callflow() l. 3386-3441) | OUVERT |
+| `GET /subscriber_journey/:pseudo` | 3551 (datasets() + callflow() l. 3478-3483) | OUVERT |
+| `GET /subscriber_tmsi/:pseudo` | 3583 (datasets() + callflow()) | OUVERT |
+| `POST /sessions/filter` | 4033 (datasets() + callflow() l. 4251) | OUVERT — gros parcours, cache keyé par filtre + commit_seq souhaitable |
+| `GET /sessions/catalog/search` | 4740 (datasets() + callflow() l. 4712) | OUVERT |
+| `POST /sessions/columns` | 5020 (datasets() + callflow() l. 5113) | OUVERT — mêmes contraintes que `/sessions/catalog` |
+| `GET /sessions/:id` | 5153 (datasets() + callflow() l. 3748) | OUVERT — single lookup, probablement rapide, à spawn_blocking par précaution |
+| `GET /sessions/:id/events` | 6171 | OUVERT — lit fichier events par session ; potentiellement très lourd |
+| `GET /sessions/:id/callflow` | 6339 | OUVERT — sert le callflow JSON (même lecture) |
+| `GET /sessions/:id/correlations` | 6402 | OUVERT |
+| `GET /event/:id` | 6434 | OUVERT |
+| `GET /provenance/:id` | 6443 | OUVERT |
+| `GET /packets` | 6517 | OUVERT |
+| `GET /packet/:id` | 6542 | OUVERT |
+| `POST /packet_dissect` | 6559 | OUVERT — invoque tshark (sub-process) |
+| `GET /correlation_edges` | 6653 | OUVERT |
+| `POST /export_callflow` | 6682 | OUVERT |
+
+OUVERT = non fixé dans 2.21.14 mais DOCUMENTÉ. Fix progressif dans 2.21.15 et suivants, un ou plusieurs handlers par lot, chacun avec son test VRAI routeur.
+
+### Point 3 de la reprise 17/11 — `/identities` froid 210 s
+
+Non traité dans 2.21.14 (scope déjà large). Laissé OUVERT : profiler `tshark_identities` (nombre d'appels tshark, taille pcaps lus, nombre paquets passés) et proposer correctif (filtre `frame.number` en une passe, lecture limitée aux segments de la session, cache par signature). À faire en 2.21.15.
+
+### Tests
+
+```bash
+cargo test -p oiran-api   --lib --locked            # 164 passed, 3 ignored (+1 sessions real-router)
+cd OIRAN/vtap && cargo update -w && cargo test --locked  # 12 unit + 3 integration passed
+```
+
+### Suite
+
+Merge dans `feat/oiran-2.22.0-userplane` et `feat/oiran-2.23.0-bench-o1`. VEILLE sur #9 pour validation ANR1 lab.
+
 ## OIRAN API 2.21.13 — 2026-11-17 — `/health` sans E/S : instantané recalculé en arrière-plan (patch)
 
 Fix lab critique (correctif `99f8651` par Sadok ; intégré dans la branche bench O1 par merge non-destructif).
