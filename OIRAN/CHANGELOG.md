@@ -1,5 +1,51 @@
 # Changelog
 
+## OIRAN API 2.21.34 — 2026-11-17 — `/live/traces/:id/sessions` prend `heavy_memory_try_enter()` (503 + `Retry-After: 60`)
+
+Ordre #9 6956890331. Branche `fix/oiran-2.21.34-live` depuis `f88ee7b` (2.21.32), pas de force-push. 2.21.33 réservée au chantier mémoire publication (ANR1 #10).
+
+### Changement
+
+- `/live/traces/:id/sessions` (`sessions_for_trace`) est la seule route `/live/*` qui parcourt `state.inner.flows` + toutes les sessions de `capture_manager.datasets()` et appelle `identity_vault.for_session(...)` pour chaque — profil de parcours identique aux 3 routes gatées en 2.21.30 (`sessions/filter`, `catalog/search`, `sessions/columns`).
+- Handler refactoré : prend `state.inner.capture_manager.heavy_memory_try_enter()` dans un `spawn_blocking`. Si verrou occupé (publication continue) → 503 immédiat + `Retry-After: 60` (`heavy_work_in_progress()`). Scope du gate couvre `correlate_sessions_by_pseudonyms`.
+- Les 6 autres routes `/live/*` (`list`, `create`, `remove`, `audit`, `marker`, `stream`) ne parcourent pas flows/datasets — **pas gatées**. `stream` est SSE long-lived, gater à l'entrée casserait la connexion sans raison.
+
+### Test (règle `/9 6956890331` — 12 runs à 0 fail avant de conclure)
+
+- `sessions_for_trace_answers_503_while_continuous_publication_holds_memory_gate` : POST crée une trace pseudonyme via l'API publique (bearer operator + CSRF), puis GET sous `heavy_memory_enter()` tenu → assert 503 + `Retry-After: 60` + body `HEAVY_WORK_IN_PROGRESS`. Libération → re-GET = ≠ 503. Verrou per-state (2.21.28) = aucun impact sur autres tests.
+
+Preuves :
+
+```sh
+$ for i in $(seq 1 12); do cargo test --locked -p oiran-api --lib 2>&1 | grep "test result"; done
+test result: ok. 190 passed; 0 failed; 3 ignored    (12 fois, 0 échec)
+
+$ for i in 1 2 3; do cargo test --locked -p live-probe --lib 2>&1 | grep "test result"; done
+test result: ok. 170 passed; 0 failed; 6 ignored    (3 fois, 0 échec)
+
+$ cd OIRAN/vtap && cargo update -w && cargo test --locked
+test result: ok. 12 passed; 0 failed    + autres crates vtap workspace
+```
+
+Les 3 `ignored` de `oiran-api` sont des tests lab-only pré-existants. Aucun nouveau `#[ignore]`.
+
+### Composant et version
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.32 | **2.21.34** |
+
+### Hors scope (confié à ANR1 #10)
+
+- Audit mémoire publication (`publish_events_to_dataset_dir`, `offline_lte_callflows`, `07-after-lte-flows-built` ~4 G) : règle `feedback_polaris_publication_audit_out_of_scope`.
+
+### Garde-fous
+
+- Pas de merge sur `fix/oiran-2.21.10-analyzer` : j'attends `LAB_UNLOCK` ANR2.
+- Pas de touche à `publish_events_to_dataset_dir` ni `offline_lte_callflows`.
+- Aucun test `#[ignore]` introduit (règle Sadok 2026-11-17 15:33).
+- Branches précédentes gelées sur `origin` (pas de force-push, pas de suppression).
+
 ## OIRAN API 2.21.32 + live-probe 0.6.12 — 2026-11-17 — verrou mémoire lecture/écriture : seule la publication exclut les routes
 
 Upgrade **patch**. En 2.21.30, `sessions_filter_blocking` prend le verrou mémoire. Or l'hydratation d'identités en arrière-plan (`schedule_identity_hydration` → `hydrate_identities`, verrou pris en 2.21.26) le tenait aussi : `/sessions/filter` répondait **503 alors qu'aucune publication ne tournait**. Preuve par trace (`GATEDBG`, instrumentation retirée) : détenteur = `hydrate_identities`, demandeur refusé = `sessions_filter_blocking`. Effet : `filter_index_cache_is_invalidated_when_a_session_is_added` échouait 3 fois sur 12 (visible depuis que tshark est installé localement). Même effet en production pour l'UI.

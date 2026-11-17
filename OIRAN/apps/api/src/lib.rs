@@ -13332,6 +13332,57 @@ mod tests {
         assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// 2.21.34 (ordre #9 6956890331) — pendant un travail lourd en
+    /// mémoire (publication continue), `GET /live/traces/:id/sessions`
+    /// répond 503 `HEAVY_WORK_IN_PROGRESS` + `Retry-After: 60` au lieu
+    /// de corréler flows + datasets × identity_vault. Libéré, la route
+    /// refonctionne. Verrou `capture_manager` per-state → chaque test
+    /// est isolé.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_for_trace_answers_503_while_continuous_publication_holds_memory_gate() {
+        let state = operator_state();
+        let app = router(state.clone(), None);
+        // Crée une trace pseudonyme via l'API publique.
+        let csrf = sha256_hex(b"oiran-csrf-v1:test-operator-token");
+        let create = Request::builder()
+            .method("POST")
+            .uri("/api/v1/live/traces")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer test-operator-token")
+            .header(CSRF_HEADER, csrf)
+            .body(Body::from(
+                json!({
+                    "key_type": "pseudonym",
+                    "value": "psn-live-test-0001",
+                    "duration_s": 60,
+                    "interfaces": [],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let create_response = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let body = json_body(create_response).await;
+        let trace_id = body["data"]["trace_id"].as_str().unwrap().to_owned();
+
+        let build = move || {
+            Request::builder()
+                .uri(format!("/api/v1/live/traces/{trace_id}/sessions"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        {
+            let _publication = state.inner.capture_manager.heavy_memory_enter();
+            let busy = app.clone().oneshot(build()).await.unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.headers()[header::RETRY_AFTER], "60");
+            let body = json_body(busy).await;
+            assert_eq!(body["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
+        }
+        let free = app.oneshot(build()).await.unwrap();
+        assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     /// 2.21.22 (FAIL lab 2.21.21) — sans instantané et avec un calcul en
     /// cours, `/health` en production répond aussitôt `computing`, sans attendre.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

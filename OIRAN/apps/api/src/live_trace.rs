@@ -733,14 +733,35 @@ pub(crate) async fn sessions_for_trace(
         };
         (s.trace.subscriber_pseudonyms.clone(), s.trace.armed)
     };
-    let pseudos_set: HashSet<String> = pseudos.iter().cloned().collect();
-    let matches = correlate_sessions_by_pseudonyms(&state, &pseudos_set);
-    live_ok(json!({
-        "trace_id": id,
-        "armed": armed,
-        "subscriber_pseudonyms": pseudos,
-        "sessions": matches,
-    }))
+    // 2.21.34 (ordre #9 6956890331) — `correlate_sessions_by_pseudonyms`
+    // parcourt `state.inner.flows`, puis toutes les sessions de chaque
+    // dataset du `capture_manager`, et appelle `identity_vault.for_session`
+    // pour chacune. Coexiste mal avec la publication continue en
+    // mémoire : on prend `capture_manager.heavy_memory_try_enter()` et
+    // on répond 503 + `Retry-After: 60` si elle tourne. Le parcours
+    // CPU/IO est déporté en `spawn_blocking` pour ne pas bloquer le
+    // runtime async.
+    tokio::task::spawn_blocking(move || {
+        let Some(_heavy_memory_gate) = state.inner.capture_manager.heavy_memory_try_enter() else {
+            return heavy_work_in_progress();
+        };
+        let pseudos_set: HashSet<String> = pseudos.iter().cloned().collect();
+        let matches = correlate_sessions_by_pseudonyms(&state, &pseudos_set);
+        live_ok(json!({
+            "trace_id": id,
+            "armed": armed,
+            "subscriber_pseudonyms": pseudos,
+            "sessions": matches,
+        }))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "LIVE_SESSIONS_FOR_TRACE_FAILED",
+            "sessions_for_trace handler panicked",
+        )
+    })
 }
 
 fn correlate_sessions_by_pseudonyms(state: &AppState, pseudos: &HashSet<String>) -> Vec<Value> {
