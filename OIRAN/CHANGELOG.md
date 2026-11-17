@@ -1,5 +1,56 @@
 # Changelog
 
+## OIRAN API 2.21.19 — 2026-11-17 — audit handlers lot 3 : /ues + /ue/:id + /session_correlations + /packets en spawn_blocking
+
+Lot 3 des handlers OUVERTS. Règle bloquante `cargo test --locked -p oiran-api --lib` AVANT push respectée.
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.18 | **2.21.19** |
+
+### Correctifs (4 routes)
+
+- **`/ues`** : `fn ues_blocking(state, query)` ; iteration `discovery.ue_contexts` + `capture_manager.datasets()`.
+- **`/ue/:id`** : wrap inline `spawn_blocking` ; recherche cross-datasets.
+- **`/sessions/:id/correlations`** : `fn session_correlations_blocking(state, id)` ; `flow_for` + `live_flow_for` + `lte_evidence_store.callflow_page_by_session`.
+- **`/packets`** : wrap inline `spawn_blocking` ; `packet_values(state)` qui parcourt flow_values + callflows.
+
+### Tests VRAI routeur (règle #9 6940906119)
+
+```
+ues_route_is_spawned_blocking_real_router
+ue_route_is_spawned_blocking_real_router
+session_correlations_route_is_spawned_blocking_real_router
+packets_route_is_spawned_blocking_real_router
+```
+
+### Audit — statut post-2.21.19 : **14/22 FIXÉES**
+
+| Route | Statut |
+|---|---|
+| `/health`, `/sessions`, `/sessions/catalog`, `/sessions/:id/identities`, `/sessions/:id/events`, `/sessions/:id/callflow`, `/metrics`, `/subscribers`, `/sessions/:id`, `/packet_dissect` | FIXÉ (lots 2.21.13–2.21.17) |
+| `/ues`, `/ue/:id`, `/sessions/:id/correlations`, `/packets` | **FIXÉ 2.21.19** |
+| 8 restants (`/ue/:id/sessions`, `/subscriber_journey/:pseudo`, `/subscriber_tmsi/:pseudo`, `/sessions/filter`, `/sessions/catalog/search`, `/sessions/columns`, `/event/:id`, `/provenance/:id`, `/packet/:id`, `/correlation_edges`, `/export_callflow`, `/live/*`) | OUVERT 2.21.20+ |
+
+### Règle (sauvée mémoire) — fix décodeur couvre données existantes
+
+Suite au FAIL 2.21.16 corrigé par Sadok en 2.21.18 : un fix de décodeur ne reclassifie pas les events déjà stockés. Patch read-time OU redécodage + preuve lab requis.
+
+### Tests (règle bloquante #9 6944132663)
+
+```bash
+cd OIRAN && cargo test --locked -p oiran-api --lib
+# test result: ok. 176 passed; 0 failed; 3 ignored (+4 real-router)
+cd OIRAN/vtap && cargo update -w && cargo test --locked
+# unit: 12 passed ; integration: 3 passed
+```
+
+### Suite
+
+Merge dans P2 et bench O1 après `--locked` strict. 2.21.20 : handlers restants (`/sessions/filter`, `/sessions/columns`, `/sessions/catalog/search`, `/live/*`, etc.).
+
 ## OIRAN API 2.21.18 — 2026-11-17 — reclassement SBI à la lecture (décodeur 0.4.8) (patch)
 
 - Rapport ANR2 #10 (FAIL 2.21.16) : santé pendant `/identities` PASS, catalogue PASS (`protocol_tree=10`, `network_elements=14`), mais **`UnsupportedSbiOperation=724`** sur `5g-session-0bfac1e7ae159a77` au lieu de 0.
