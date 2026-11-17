@@ -1,5 +1,17 @@
 # Changelog
 
+## OIRAN API 2.21.13 — 2026-11-17 — `/health` sans E/S : instantané recalculé en arrière-plan (patch)
+
+Fix lab critique (correctif `99f8651` par Sadok ; intégré dans la branche P2 par merge non-destructif).
+
+- Rapport ANR1 #10 6931550052 : 2.21.12 FAIL, retour arrière en 2.21.9. Pendant un `/identities` froid (210,6 s), 20/20 `/health` en timeout de 5 s.
+- Cause (lecture du code) : le blocage ne venait PAS de `/identities` (déjà en `spawn_blocking` depuis 2.21.10). C'est `/health` qui appelait `queryable_session_ids()`, lequel relit et désérialise depuis le disque le callflow JSON de CHAQUE session de CHAQUE dataset, plus des pages LTE, et ce sur le runtime async. Sous la charge de tshark (disque, CPU) et avec l'Analyzer à son plafond mémoire, chaque appel dépassait 5 s.
+- Le test 2.21.10 `spawn_blocking_does_not_starve_async_runtime_for_health_during_slow_identities` ne testait pas `/health` (un `sleep` à côté d'un autre `sleep`) : il ne pouvait pas attraper le défaut. Il est conservé, mais n'est plus la preuve.
+- Correctif : `compute_health_counters()` (logique 2.21.12 inchangée) exécuté UNIQUEMENT en `spawn_blocking` ; `/health` sert l'instantané mémoire (TTL 5 s), relance le recalcul en arrière-plan s'il est périmé (un seul recalcul à la fois), et sert l'instantané périmé avec `counters_status = "stale"` et `counters_age_ms`. Au tout premier appel : attente ≤ 2 s, sinon `counters_status = "computing"`. Plus aucune E/S ni verrou de `capture_manager` sur le chemin de requête de `/health`. Nouveaux champs : `counters_status` (fresh/stale/computing), `counters_age_ms`.
+- Test sur le VRAI routeur : `health_serves_snapshot_without_io_while_counters_refresh_is_slow` (instantané vieilli de 60 s + recalcul « bloqué » → réponse en < 200 ms, `stale`, âge ≥ 60 000 ms, même `session_count`).
+- **Règle retenue** (#9 6940906119) : un test de non-blocage DOIT exercer le vrai `router(state).oneshot()`, jamais une simulation `sleep` tokio.
+- OUVERT : `/identities` froid prend 210 s sur ce dataset. Il n'est plus bloquant pour le service, mais reste lent. Point 3 de la reprise 2026-11-17 : profiler + correctif (filtre `frame.number` en une passe, cache par signature, lecture limitée aux segments de la session).
+
 ## OIRAN API 2.22.4 — 2026-11-16 — jointure DL TEID + buckets throughput + câblage pipeline (iso-comportement par défaut)
 
 Lot P2.4 — ferme les 3 points demandés en tête par Sadok (#9 6928930450) et ajoute les buckets throughput + câblage pipeline multi-capture.

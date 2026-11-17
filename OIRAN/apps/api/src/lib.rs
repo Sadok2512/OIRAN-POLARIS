@@ -150,6 +150,11 @@ struct Inner {
     /// scope (interfaces/technologies/from/to/run_id) pour que deux
     /// portées différentes ne se partagent pas une entrée.
     sessions_catalog_cache: std::sync::Mutex<SessionsCatalogCache>,
+    /// 2.21.13 — instantané des compteurs de `/health`, recalculé en
+    /// arrière-plan (`spawn_blocking`). `/health` ne fait plus AUCUNE
+    /// E/S ni aucun parse de callflow sur le runtime async.
+    health_cache: std::sync::Mutex<Option<(std::time::Instant, Value)>>,
+    health_refreshing: std::sync::atomic::AtomicBool,
 }
 
 /// 2.21.11 — entrée de cache + clé composite pour `/sessions/catalog`.
@@ -733,6 +738,8 @@ impl AppState {
                 journey_index_cache: std::sync::Mutex::new(None),
                 list_row_cache: std::sync::Mutex::new(ListRowCache::new()),
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
+                health_cache: std::sync::Mutex::new(None),
+                health_refreshing: std::sync::atomic::AtomicBool::new(false),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -817,6 +824,8 @@ impl AppState {
                 journey_index_cache: std::sync::Mutex::new(None),
                 list_row_cache: std::sync::Mutex::new(ListRowCache::new()),
                 sessions_catalog_cache: std::sync::Mutex::new(SessionsCatalogCache::default()),
+                health_cache: std::sync::Mutex::new(None),
+                health_refreshing: std::sync::atomic::AtomicBool::new(false),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -1313,7 +1322,9 @@ fn live_flow_for(state: &AppState, id: &str) -> Option<(String, CallFlow)> {
         })
 }
 
-async fn health(State(state): State<AppState>) -> Json<Value> {
+/// 2.21.13 — calcul des compteurs de `/health` (lourd : relit les
+/// callflows de chaque session). Exécuté UNIQUEMENT en `spawn_blocking`.
+fn compute_health_counters(state: &AppState) -> Value {
     // Reference mode populates `Inner.flows / Inner.manifest / Inner.discovery`
     // at startup. Operational mode leaves them empty by design and projects
     // its liveness via `capture_manager.dataset(CONTINUOUS_DATASET_ID)`.
@@ -1354,10 +1365,8 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
             }
         }
     }
-    let queryable_session_count = queryable_session_ids(&state).len();
-    ok(json!({
-        "status":"healthy",
-        "mode":"LIVE_CAPTURE_CAPABLE_EXECUTION_GATED",
+    let queryable_session_count = queryable_session_ids(state).len();
+    json!({
         "dataset":dataset,
         "source_events":source_events,
         // Same union as an unfiltered GET /sessions. The narrower continuous
@@ -1367,7 +1376,71 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "published_session_count":published_session_count,
         "ue_context_count":ue_context_count,
         "capabilities":{"live_capture":true,"capture_control":state.inner.capture_manager.execution_enabled(),"session_analysis":true,"multi_session":true,"dataset_registry":true,"packet_analysis":true,"exports":true,"future_sse":false}
-    }))
+    })
+}
+
+/// 2.21.13 — durée de validité de l'instantané `/health`.
+const HEALTH_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+/// 2.21.13 — attente max du tout premier calcul avant de répondre sans compteurs.
+const HEALTH_FIRST_COMPUTE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn spawn_health_refresh(state: &AppState) {
+    use std::sync::atomic::Ordering;
+    if state.inner.health_refreshing.swap(true, Ordering::AcqRel) {
+        return; // un recalcul est déjà en cours
+    }
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let counters = compute_health_counters(&state);
+        *state.inner.health_cache.lock().unwrap() = Some((std::time::Instant::now(), counters));
+        state.inner.health_refreshing.store(false, Ordering::Release);
+    });
+}
+
+/// 2.21.13 (ANR1 #10 6931550052 : 20/20 `/health` en timeout pendant un
+/// `/identities` froid) — `/health` lisait et parsait le callflow JSON de
+/// CHAQUE session (`queryable_session_ids`) sur le runtime async : sous
+/// la charge tshark + plafond mémoire, > 5 s par appel. Désormais :
+/// instantané servi depuis la mémoire, recalculé en arrière-plan ; un
+/// instantané périmé est servi tel quel avec son âge (`counters_age_ms`),
+/// jamais en silence ; au tout premier appel, attente ≤ 2 s puis réponse
+/// `counters_status = "computing"`.
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    let snapshot = |state: &AppState| state.inner.health_cache.lock().unwrap().clone();
+    let mut current = snapshot(&state);
+    let stale = current
+        .as_ref()
+        .map(|(at, _)| at.elapsed() >= HEALTH_SNAPSHOT_TTL)
+        .unwrap_or(true);
+    if stale {
+        spawn_health_refresh(&state);
+    }
+    if current.is_none() {
+        let deadline = std::time::Instant::now() + HEALTH_FIRST_COMPUTE_WAIT;
+        while current.is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            current = snapshot(&state);
+        }
+    }
+    let mut data = json!({
+        "status":"healthy",
+        "mode":"LIVE_CAPTURE_CAPABLE_EXECUTION_GATED",
+    });
+    match current {
+        Some((at, counters)) => {
+            if let (Some(target), Some(source)) = (data.as_object_mut(), counters.as_object()) {
+                for (key, value) in source {
+                    target.insert(key.clone(), value.clone());
+                }
+                target.insert("counters_status".into(), json!(if at.elapsed() >= HEALTH_SNAPSHOT_TTL { "stale" } else { "fresh" }));
+                target.insert("counters_age_ms".into(), json!(at.elapsed().as_millis() as u64));
+            }
+        }
+        None => {
+            data["counters_status"] = json!("computing");
+        }
+    }
+    ok(data)
 }
 
 async fn version(State(state): State<AppState>) -> Json<Value> {
@@ -12332,6 +12405,34 @@ mod tests {
         // On vérifie quand même que la tâche bloquante termine propre.
         let hydrate = blocking.await.expect("blocking task joined");
         assert_eq!(hydrate, "hydrate done");
+    }
+
+    /// 2.21.13 — VRAI test du routeur : `/health` répond vite même quand
+    /// le calcul de ses compteurs est bloqué (verrou du cache tenu par un
+    /// recalcul simulé), en servant l'instantané existant avec son âge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_serves_snapshot_without_io_while_counters_refresh_is_slow() {
+        use std::time::{Duration, Instant};
+        let st = state();
+        let app = router(st.clone(), None);
+        // 1er appel : calcule l'instantané.
+        let first = json_body(app.clone().oneshot(req("/api/v1/health", false)).await.unwrap()).await;
+        assert_eq!(first["data"]["counters_status"], "fresh");
+        let count = first["data"]["session_count"].clone();
+        // Instantané vieilli + recalcul « bloqué » (flag tenu) : /health ne
+        // doit faire aucun calcul et répondre aussitôt avec l'état stale.
+        {
+            let mut guard = st.inner.health_cache.lock().unwrap();
+            let (_, v) = guard.clone().unwrap();
+            *guard = Some((Instant::now() - Duration::from_secs(60), v));
+        }
+        st.inner.health_refreshing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let start = Instant::now();
+        let second = json_body(app.oneshot(req("/api/v1/health", false)).await.unwrap()).await;
+        assert!(start.elapsed() < Duration::from_millis(200), "vu {:?}", start.elapsed());
+        assert_eq!(second["data"]["counters_status"], "stale");
+        assert!(second["data"]["counters_age_ms"].as_u64().unwrap() >= 60_000);
+        assert_eq!(second["data"]["session_count"], count);
     }
 
     /// 2.19.1 — `/sessions/catalog/search?q=` renvoie des matches
