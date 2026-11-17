@@ -1,5 +1,9 @@
 # Changelog
 
+## OIRAN API 2.21.20 — 2026-11-17 — audit handlers lot 4 : 7 routes en spawn_blocking (rebasé sur 2.21.21)
+
+*Note versionnage* : lot livré initialement en 2.21.20 (branche `fix/oiran-2.21.20-handlers` @ `02fffe9`). Suite à `/packets` OOM lab (FAIL 2.21.19), Sadok a corrigé en 2.21.21 @ `c3a4857`. Le présent lot a été REBASÉ sur `c3a4857` sans toucher aux fonctions paquet. Version `oiran-api = 2.21.20` conservée dans Cargo.toml conformément à l'instruction #9 6947236203 (« `/live/*` passe en 2.21.22 »). `/live/*` sera 2.21.22. Git history montre 2.21.21 → 2.21.20 (rebase), le commit c3a4857 reste la version lab en cours.
+
 ## OIRAN API 2.21.21 — 2026-11-17 — `/packets` borné en mémoire (FAIL lab 2.21.19 : OOM 3.7 G)
 
 Upgrade **patch**. Cause : `packet_values` matérialisait TOUS les callflows (`queryable_flows`) puis leur copie JSON, puis un objet par paquet avec son arbre d'IE. Au lab, `/packets?page=1&page_size=100` → 502 + `oom-kill` (3.7G memory peak, ANR2 #10). Défaut antérieur à 2.21.19, rendu visible par la preuve d) ; `/packet/:id` et `/packets/:capture/:n/dissect` avaient le même chemin.
@@ -9,7 +13,80 @@ Upgrade **patch**. Cause : `packet_values` matérialisait TOUS les callflows (`q
 - dissect et `capture_is_known` : même parcours flow par flow.
 - Priorité des sources inchangée (LTE > dataset > mémoire ; une source qui ne résout pas laisse la précédente).
 - Test `packets_page_streams_flows_and_matches_legacy_materialized_listing` : toutes les pages identiques à l'ancien algorithme (gardé en référence de test), filtres et `find_packet` couverts.
-- Note : 2.21.20 est sur `fix/oiran-2.21.20-handlers` (DEVMAT) ; `/live/*` passe en 2.21.22.
+
+## OIRAN API 2.21.20 (détails lot handlers 4) — audit mémoire des 7 routes
+
+Lot 4 des handlers OUVERTS. Branche dédiée `fix/oiran-2.21.20-handlers` depuis `fix/oiran-2.21.10-analyzer` : pas de push sur la fix originale tant qu'ANR2 n'a pas publié `LAB_UNLOCK` (déploiement 2.21.19 en cours, #9 6945570574).
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.19 | **2.21.20** |
+
+### Correctifs (7 routes)
+
+- **`/subscribers/:pseudo/journey`** : `fn subscriber_journey_render(state, flows, index, pseudo, sessions)` ; wrap spawn_blocking autour de `queryable_flows` + `JourneyIndex::from_flows`.
+- **`/subscribers/:pseudo/tmsi`** : `fn subscriber_tmsi_blocking(state, pseudo)` ; `cached_journey_index`.
+- **`/sessions/filter`** (POST) : `fn sessions_filter_blocking(state, headers, request)` ; `refresh_session_filter_index` + `cached_journey_index` + gros parcours.
+- **`/sessions/catalog/search`** : wrap inline spawn_blocking ; `build_protocol_tree` parcourt datasets + callflows.
+- **`/sessions/columns`** (POST) : `fn sessions_columns_blocking(state, headers, request)` ; validation + parcours.
+- **`/correlation/edges`** : wrap inline ; iteration `flows + correlation_edges`.
+- **`/sessions/:id/export`** : `fn export_callflow_blocking(state, id, query)` ; `flow_for` + `flow_value_for` + `lte_evidence_store.callflow_for_export_by_session`.
+
+`SessionsCatalogSearchQuery` + `ExportQuery` rendus `Clone`.
+
+### Tests VRAI routeur (règle #9 6940906119) — 4 nouveaux (GET routes)
+
+1. `subscriber_tmsi_route_is_spawned_blocking_real_router`
+2. `sessions_catalog_search_route_is_spawned_blocking_real_router`
+3. `correlation_edges_route_is_spawned_blocking_real_router`
+4. `export_callflow_route_is_spawned_blocking_real_router`
+
+Chaque test : `tokio::spawn router.oneshot(route lourde)` + `/health` en **< 500 ms** sinon FAIL.
+
+Pour les routes POST (`/sessions/filter`, `/sessions/columns`), tests VRAI routeur différés (nécessitent construction de body JSON complet) ; la logique spawn_blocking est en place.
+
+### Audit — statut post-2.21.20 : **21/22 FIXÉES**
+
+OUVERTES restantes : `/live/*` (module live_trace séparé, à auditer en 2.21.21).
+
+### Règle (sauvée mémoire) — fix décodeur couvre données existantes
+
+Appliquée pour toute évolution SBI/NGAP/NAS à venir.
+
+### Tests (règle bloquante #9 6944132663)
+
+```bash
+cd OIRAN && cargo test --locked -p oiran-api --lib
+# test result: ok. 180 passed; 0 failed; 3 ignored (+4 real-router)
+cd OIRAN/vtap && cargo update -w && cargo test --locked
+# unit: 12 passed ; integration: 3 passed
+```
+
+### Suite
+
+**Ne PAS pousser** sur `fix/oiran-2.21.10-analyzer` pendant le déploiement ANR2 2.21.19. Attendre `LAB_UNLOCK`. Branche `fix/oiran-2.21.20-handlers` disponible pour relecture Sadok sans conflit lab.
+
+Après LAB_UNLOCK : rebase + merge dans fix/P2/bench O1.
+
+### Audit mémoire post-2.21.21 (règle #9 6947236203)
+
+**Leçon** : `spawn_blocking` protège `/health`, pas la mémoire. Les 7 routes fixées en 2.21.20 ont été auditées contre l'OOM lab :
+
+| Route | État mémoire | Statut | Action |
+|---|---|---|---|
+| `/subscribers/:pseudo/journey` | charge `queryable_flows` entier via `queryable_flows(&state)` | **OUVERT** | mémoire estimée : lab N sessions × ~5 MB/callflow = plusieurs GB. Fix 2.21.22+ : `queryable_flow_sources` + streaming par flow. |
+| `/subscribers/:pseudo/tmsi` | consulte `cached_journey_index` (cache mémoire) | FIXÉ (cache borné) | cache stable, pas de charge full dataset. |
+| `/sessions/filter` (POST) | charge `cached_journey_index` + gros parcours | **OUVERT** | besoin d'un parcours streaming + pagination. Fix 2.21.22+. |
+| `/sessions/catalog/search` | `build_protocol_tree` parcourt datasets + callflows | **OUVERT** | sur dataset lab, risque comparable à /packets pré-fix Sadok. Fix 2.21.22+. |
+| `/sessions/columns` (POST) | gros parcours sessions | **OUVERT** | fix 2.21.22+. |
+| `/correlation/edges` | iteration `flows + correlation_edges` (≤ quelques k edges) | FIXÉ (borné naturellement) | pas un vecteur full dataset. |
+| `/sessions/:id/export` | `flow_for` + `flow_value_for` par session unique | FIXÉ (1 flow) | charge UN seul callflow en mémoire. |
+
+**4 OUVERTS mémoire** (subscriber_journey, sessions_filter, sessions_catalog_search, sessions_columns) à traiter en 2.21.22+. Pattern à appliquer : `queryable_flow_sources(&state).for_each(|source| { let flow = load_queryable_flow(source); ... })`.
+
+**Tests d'équivalence** : pour chaque conversion future, test `legacy_materialized_result == streaming_result` (Sadok pattern `packets_page_streams_flows_and_matches_legacy_materialized_listing`).
 
 ## OIRAN API 2.21.19 — 2026-11-17 — audit handlers lot 3 : /ues + /ue/:id + /session_correlations + /packets en spawn_blocking
 
