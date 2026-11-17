@@ -1,5 +1,16 @@
 # Changelog
 
+## OIRAN API 2.21.26 + live-probe 0.6.7 — 2026-11-17 — un seul travail lourd en mémoire à la fois (FAIL lab 2.21.22 : OOM 4,0 G)
+
+Upgrade **patch** (oiran-api 2.21.22 → 2.21.26 ; 2.21.23–2.21.25 sont les lots DEVMAT sur `fix/oiran-2.21.23-handlers`, fusionnés ensuite). live-probe 0.6.6 → 0.6.7.
+
+Cause prouvée par le journal lab : la publication continue (`publish_events_to_dataset_dir`, trace `07-after-lte-flows-built`, vmrss ≈ 4,0 G) et un `/identities` froid (tshark + hydratation) tournaient en même temps sous un cgroup de 4 G → `oom-kill`, 502. `/health` sans attente (2.21.22) est confirmé au lab (max 81 ms).
+
+- live-probe : verrou process-wide `HEAVY_MEMORY_GATE`. La publication le prend en bloquant (elle attend la fin d'un travail lourd API).
+- oiran-api : le chemin froid de `/identities` (miss du cache → tshark) le prend en `try` ; occupé → **503 `HEAVY_WORK_IN_PROGRESS` + `Retry-After: 60`**, jamais d'OOM. Un hit de cache n'est pas concerné.
+- Test `cold_identities_answer_503_while_continuous_publication_holds_memory_gate`.
+- OUVERT (non fermé par ce lot) : l'empreinte propre de la publication (~4 G pour ~535 k events) — réduction à faire dans live-probe.
+
 ## OIRAN API 2.21.22 — 2026-11-17 — `/health` n'attend plus jamais en production (FAIL lab 2.21.21, gate a)
 
 Upgrade **patch**. Cause : sans instantané de compteurs, `/health` attendait jusqu'à 2 s le premier calcul (2.21.13). Au lab : 5 réponses entre 1,66 et 2,01 s avec `counters_status=computing` pendant `/identities` froid (ANR2 #10).
