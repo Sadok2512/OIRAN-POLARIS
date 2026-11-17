@@ -1,5 +1,15 @@
 # Changelog
 
+## OIRAN API 2.21.29 + live-probe 0.6.9 — 2026-11-17 — un segment en échec ne bloque plus le cycle continu (essai 7 FAIL lab)
+
+Upgrade **patch**. Cause prouvée au lab (ANR2, essai 7) : un ancien segment S6a tronqué faisait échouer `decode_capture_streaming(...)?` à CHAQUE cycle ; l'erreur remontait avant la phase vTAP, située plus bas dans `process_capture_into_selected` → empreinte du pcap vTAP absente du manifeste et de l'état, 0 event `probe_type=vtap`.
+
+- **Import continu uniquement** (capture ponctuelle : contrat `decoder_failure_does_not_finalize_or_register_dataset` inchangé, l'erreur remonte). Segment dumpcap en échec de décodage : events partiels retirés du spool (`decoded_spool_mark` / `decoded_spool_rewind`), log `CONTINUOUS_SEGMENT_DECODE_FAILED` (`action=segment_skipped_cycle_continues`), `ingestion_failures` compté une seule fois par `(chemin, taille)`, puis le cycle continue (autres segments, phase vTAP).
+- Phase vTAP : même retrait des events partiels sur `VTAP_DECODE_FAILED` (avant : events partiels publiés).
+- Test `failing_dumpcap_segment_is_skipped_and_vtap_phase_still_ingests` (pcapng tronqué prouvé en erreur + pcap vTAP ingéré dans le même cycle).
+- OUVERT : le segment en échec reste non ingéré et est re-tenté à chaque cycle (`closed_not_ingested_segments` le montre) ; pas de quarantaine persistante dans ce lot.
+- Numérotation : lot DEVMAT « verrou routes lourdes » → 2.21.30.
+
 ## OIRAN API 2.21.28 + live-probe 0.6.8 — 2026-11-17 — verrou mémoire par gestionnaire (FAIL gate ANR2 2.21.26)
 
 Upgrade **patch**. Le verrou 0.6.7 était process-wide (`static`) : dans `cargo test`, la publication d'un autre test (autre `AppState`) le tenait et `clear_identity_routes_are_operator_only_and_keep_packet_proof` recevait un 503 parasite au lieu de 200 (lab : 178 passed, 1 failed). Défaut de conception du garde, pas du test.

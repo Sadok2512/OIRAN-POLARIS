@@ -1676,6 +1676,10 @@ pub struct CaptureManager {
     /// mutuellement → 503 parasite, FAIL gate ANR2 2.21.26). La publication
     /// le prend en bloquant ; l'API le prend en `try` (503 si occupé).
     heavy_memory_gate: Arc<Mutex<()>>,
+    /// 0.6.9 — segments dont l'échec de décodage a déjà été compté
+    /// (`(chemin, taille)`), pour ne pas gonfler `ingestion_failures` à
+    /// chaque cycle. Le log structuré, lui, sort à chaque cycle.
+    reported_segment_failures: Arc<Mutex<BTreeSet<(String, u64)>>>,
     // 2.7.6: per-deployment HMAC-SHA256 secret. Loaded once from a root-only
     // 0600 file at startup and shared by every import this manager runs,
     // including after a probe restart against the same key path. Wrapped in
@@ -1788,6 +1792,7 @@ impl CaptureManager {
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
             continuous_vtap_dirs: Arc::new(Mutex::new(Vec::new())),
             heavy_memory_gate: Arc::new(Mutex::new(())),
+            reported_segment_failures: Arc::new(Mutex::new(BTreeSet::new())),
             pseudonym_key: Arc::new(pseudonym_key),
             interface_probe,
             // 2.14.11 (ANR1 #10 6860508699) — override test-only par
@@ -5588,7 +5593,12 @@ impl CaptureManager {
                 let mut n3_aggregator = N3FlowAggregator::default();
                 let mut keepalive_aggregator = KeepaliveAggregator::default();
                 let mut individual_events = 0usize;
-                let mut report = decode_capture_streaming(
+                // 0.6.9 (essai 7 FAIL lab) — un segment dont le décodage
+                // échoue (ex. ancien S6a tronqué) ne bloque plus le cycle :
+                // ses events partiels sont retirés du spool, l'échec est
+                // journalisé, et la suite (autres segments, phase vTAP) tourne.
+                let spool_mark = decoded_spool_mark(&mut decoded_spool)?;
+                let decode_outcome = decode_capture_streaming(
                     &DecodeConfig {
                         input: path.clone(),
                         capture_id: capture_hash,
@@ -5615,7 +5625,41 @@ impl CaptureManager {
                             .and_then(|_| decoded_spool.write_all(b"\n"))
                             .map_err(display_error)
                     },
-                )?;
+                );
+                let mut report = match decode_outcome {
+                    Ok(report) => report,
+                    // Capture ponctuelle : contrat inchangé, une erreur de
+                    // décodage n'enregistre ni ne finalise le dataset.
+                    Err(error) if capture_id != CONTINUOUS_CAPTURE_ID => return Err(error),
+                    Err(error) => {
+                        decoded_spool_rewind(&mut decoded_spool, spool_mark)?;
+                        let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        let first_report = self
+                            .reported_segment_failures
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert((path.display().to_string(), size_bytes));
+                        if first_report {
+                            let code = format!("CONTINUOUS_SEGMENT_DECODE_FAILED: {error}");
+                            let _ = self.update(CONTINUOUS_CAPTURE_ID, |job| {
+                                bump_failure(&mut job.metrics, &code);
+                            });
+                        }
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "event": "CONTINUOUS_SEGMENT_DECODE_FAILED",
+                                "path": path.display().to_string(),
+                                "interface": interface.interface,
+                                "size_bytes": size_bytes,
+                                "error": error,
+                                "deduplicated": !first_report,
+                                "action": "segment_skipped_cycle_continues",
+                            })
+                        );
+                        continue;
+                    }
+                };
                 let n3_aggregates = if aggregate_gtpu {
                     n3_aggregator.finish()
                 } else {
@@ -5807,6 +5851,7 @@ impl CaptureManager {
                 let mut n3_aggregator = N3FlowAggregator::default();
                 let mut keepalive_aggregator = KeepaliveAggregator::default();
                 let mut individual_events = 0usize;
+                let spool_mark = decoded_spool_mark(&mut decoded_spool)?;
                 let decode_outcome = decode_capture_streaming(
                     &DecodeConfig {
                         input: vtap_pcap.clone(),
@@ -5830,6 +5875,7 @@ impl CaptureManager {
                 let mut report = match decode_outcome {
                     Ok(report) => report,
                     Err(e) => {
+                        decoded_spool_rewind(&mut decoded_spool, spool_mark)?;
                         let msg = format!("VTAP_DECODE_FAILED: {e}");
                         let _ = self.update(CONTINUOUS_CAPTURE_ID, |job| {
                             bump_failure(&mut job.metrics, &msg);
@@ -10417,6 +10463,24 @@ fn capture_files(directory: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// 0.6.9 — position courante du spool d'events décodés (après flush).
+fn decoded_spool_mark(spool: &mut BufWriter<std::fs::File>) -> Result<u64, String> {
+    use std::io::Seek;
+    spool.flush().map_err(display_error)?;
+    spool.get_mut().stream_position().map_err(display_error)
+}
+
+/// 0.6.9 — retire du spool tout ce qui a été écrit depuis `mark`
+/// (events partiels d'un segment dont le décodage a échoué).
+fn decoded_spool_rewind(spool: &mut BufWriter<std::fs::File>, mark: u64) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom};
+    spool.flush().map_err(display_error)?;
+    let file = spool.get_mut();
+    file.set_len(mark).map_err(display_error)?;
+    file.seek(SeekFrom::Start(mark)).map_err(display_error)?;
+    Ok(())
+}
+
 fn capture_files_for(directory: &Path, interface: &str) -> Vec<PathBuf> {
     capture_files(directory)
         .into_iter()
@@ -12700,6 +12764,75 @@ mod tests {
             "pending_segments must reach 0; got {final_pending}"
         );
         manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+    }
+
+    /// 0.6.9 (essai 7 FAIL lab) — un segment dumpcap dont le décodage échoue
+    /// (pcapng tronqué au milieu d'un bloc) ne doit plus faire échouer le
+    /// cycle entier : la phase vTAP tourne quand même et ingère son pcap,
+    /// et aucun event partiel du segment en échec n'est publié.
+    #[test]
+    fn failing_dumpcap_segment_is_skipped_and_vtap_phase_still_ingests() {
+        if skip_if_disk_too_full("failing_dumpcap_segment_is_skipped_and_vtap_phase_still_ingests") {
+            return;
+        }
+        let root = temporary_root("segment-fail-vtap");
+        let pcap_dir = root.join("pcaps");
+        let vtap_dir = root.join("vtap");
+        fs::create_dir_all(&pcap_dir).unwrap();
+        fs::create_dir_all(&vtap_dir).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let n2 = fs::read(fixture.join("N2.pcapng")).unwrap();
+        // Coupé au milieu d'un bloc : décodage en erreur.
+        fs::write(pcap_dir.join("N2.pcapng"), &n2[..n2.len() * 3 / 5 + 7]).unwrap();
+        let vtap_pcap = vtap_dir.join("vtap_SBI_20261117T150000Z.pcap");
+        fs::copy(fixture.join("N4.pcapng"), &vtap_pcap).unwrap();
+        fs::write(
+            crate::capture_source::append_vtap_manifest_suffix(&vtap_pcap),
+            br#"{"schema":"polaris.vtap.manifest.v1","probe_id":"oiran-vtap-lab-01","probe_type":"vtap","interface":"SBI","timestamp_source":"ebpf_monotonic","pcap":"vtap_SBI_20261117T150000Z.pcap","counters":{},"connections":[],"open_items":[]}"#,
+        )
+        .unwrap();
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.join("mgr"),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        *manager.continuous_vtap_dirs.lock().unwrap() = vec![vtap_dir.clone()];
+        let truncated_alone = decode_capture_streaming(
+            &DecodeConfig {
+                input: pcap_dir.join("N2.pcapng"),
+                capture_id: "sha256:test".into(),
+                interface: "N2".into(),
+                endpoints: endpoint_map(),
+            },
+            manager.pseudonym_key.as_ref(),
+            |_| Ok(()),
+        );
+        assert!(truncated_alone.is_err(), "le segment de test doit échouer au décodage");
+        let dataset_dir = root.join("out/dataset-1");
+        let dataset = manager
+            .process_capture_into_selected(
+                CONTINUOUS_CAPTURE_ID,
+                "dataset-1".into(),
+                &pcap_dir,
+                &dataset_dir,
+                dataset_dir.display().to_string(),
+                &[spec("N2", "br-n2", "NGAP", "gNB-AMF", "sctp")],
+                None,
+                None,
+            )
+            .expect("le cycle ne doit plus échouer à cause d'un segment");
+        assert!(
+            dataset.checksums.keys().any(|key| key.starts_with("vtap_SBI_")),
+            "la phase vTAP doit avoir ingéré son pcap : {:?}",
+            dataset.checksums.keys().collect::<Vec<_>>()
+        );
+        assert!(!dataset.checksums.contains_key("N2.pcapng"));
+        let failures = manager.reported_segment_failures.lock().unwrap().len();
+        assert_eq!(failures, 1);
     }
 
     #[test]
