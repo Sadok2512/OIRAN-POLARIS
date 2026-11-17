@@ -6031,7 +6031,7 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<(), String> 
     }
     // 2.21.26 (FAIL lab 2.21.22 : OOM 4,0 G) — le chemin froid (tshark) ne
     // tourne jamais pendant la publication continue ; réponse 503 explicite.
-    let Some(_heavy_memory_gate) = live_probe::heavy_memory_try_enter() else {
+    let Some(_heavy_memory_gate) = state.inner.capture_manager.heavy_memory_try_enter() else {
         return Err("HEAVY_WORK_IN_PROGRESS".into());
     };
     let observations = tshark_identities(state, session_id, &flow)?;
@@ -13100,7 +13100,7 @@ mod tests {
         };
         let uri = format!("/api/v1/sessions/{session_id}/identities");
         {
-            let _publication = live_probe::heavy_memory_enter();
+            let _publication = state.inner.capture_manager.heavy_memory_enter();
             let busy = app.clone().oneshot(request(uri.clone())).await.unwrap();
             assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(busy.headers()[header::RETRY_AFTER], "60");

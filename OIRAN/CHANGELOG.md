@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.21.28 + live-probe 0.6.8 — 2026-11-17 — verrou mémoire par gestionnaire (FAIL gate ANR2 2.21.26)
+
+Upgrade **patch**. Le verrou 0.6.7 était process-wide (`static`) : dans `cargo test`, la publication d'un autre test (autre `AppState`) le tenait et `clear_identity_routes_are_operator_only_and_keep_packet_proof` recevait un 503 parasite au lieu de 200 (lab : 178 passed, 1 failed). Défaut de conception du garde, pas du test.
+
+- `CaptureManager::heavy_memory_enter()` / `heavy_memory_try_enter()` : verrou porté par le gestionnaire (`Arc<Mutex<()>>`, partagé par ses clones). En production un seul gestionnaire → même protection qu'en 0.6.7 ; en test chaque état est isolé.
+- Base : 2.21.27 (fusion 2.21.26 + lots DEVMAT 2.21.23/2.21.24).
+- Numérotation : le lot DEVMAT « verrou sur les routes lourdes » passe en 2.21.29.
+
 ## OIRAN API 2.21.27 — 2026-11-17 — merge 2.21.26 (verrou mémoire) + lots DEVMAT 2.21.23/2.21.24
 
 Upgrade **patch**. Fusion sans conflit de code de `fix/oiran-2.21.23-handlers` (755d2e3) sur 2.21.26 (23a1278) ; seuls Cargo.toml / Cargo.lock / CHANGELOG en conflit de version. Relu : `cargo test --locked -p oiran-api --lib` sur 755d2e3 = 182 passed + 2 tshark (absent hors lab).
