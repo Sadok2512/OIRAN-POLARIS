@@ -574,7 +574,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "live-probe"
-version = "0.6.13"
+version = "0.6.14"
 dependencies = [
  "callflow-renderer",
  "callflow-schema",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.21.35"
+version = "2.21.36"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "session-engine"
-version = "0.5.13"
+version = "0.5.14"
 dependencies = [
  "event-schema",
  "serde",

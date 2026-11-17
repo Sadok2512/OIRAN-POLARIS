@@ -1156,8 +1156,12 @@ fn publication_semantic_key(event: &EventRecord) -> String {
         .to_ascii_lowercase()
         .replace(' ', "")
         .replace('-', "");
-    let preserve_occurrence = (protocol_is(event, "NGAP")
-        && procedure.contains("pdusessionresourcesetup"))
+    // 2.21.36 — tout NGAP / NAS est une procédure de signalisation (faible
+    // volume) : chaque occurrence est préservée. Avant, deux essais du même
+    // UE (mêmes identifiants, mêmes adresses) partageaient une clé et le
+    // second écrasait les events N2 du premier (« last observation wins »).
+    let preserve_occurrence = protocol_is(event, "NGAP")
+        || protocol_is_any(event, &["NAS-5GMM", "NAS-5GSM"])
         || (protocol_is(event, "S1AP")
             && (procedure.contains("initialcontextsetup")
                 || procedure.contains("erabsetup")))
@@ -1665,8 +1669,20 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
             "{}:{}:{}",
             event.capture_point_id, ran_endpoint, amf_endpoint
         );
-        let matching = contexts.iter().position(|context| {
-            context.state != "RELEASED"
+        // 2.21.36 — InitialUEMessage et InitialContextSetupRequest ouvrent
+        // une NOUVELLE connexion logique UE (TS 38.413 §8.3.1 / §8.6.1) :
+        // ils ne prolongent jamais un contexte déjà établi. Sinon deux essais
+        // successifs du même UE, avec identifiants NGAP réutilisés et sans
+        // release observée, étaient fusionnés dans la session du premier.
+        let opens_new_connection = event.message_name.contains("InitialUEMessage");
+        let restarts_context_setup = event.message_name.contains("InitialContextSetupRequest");
+        // Le contexte le plus RÉCENT gagne (`rposition`) : après ouverture
+        // d'une nouvelle connexion, les messages suivants la prolongent, pas
+        // l'ancienne restée non libérée.
+        let matching = contexts.iter().rposition(|context| {
+            !opens_new_connection
+                && !(restarts_context_setup && context.state == "ACTIVE")
+                && context.state != "RELEASED"
                 && context.association_id == association_id
                 && ((ran.is_some() && context.ran_ue_ngap_id == ran)
                     || (amf.is_some() && context.amf_ue_ngap_id == amf))

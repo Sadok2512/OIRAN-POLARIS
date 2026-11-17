@@ -1,5 +1,18 @@
 # Changelog
 
+## OIRAN API 2.21.36 + session-engine 0.5.14 + live-probe 0.6.14 — 2026-11-17 — deux essais du même UE ne fusionnent plus
+
+Upgrade **patch**. Contexte : essai 7 (ANR2 #10 6960552952), aucune session nouvelle exposée depuis le 16/11 20:48 alors que les events N2/N4 de la fenêtre sont publiés. Défaut reproduit en local : deux essais successifs du MÊME UE (identifiants NGAP réutilisés, contexte précédent non libéré) étaient **fusionnés** dans la session du premier, et le 2e écrasait des events N2 du 1er.
+
+Deux causes, deux correctifs :
+- `discover_sessions` : `InitialUEMessage` ouvre toujours une nouvelle connexion logique UE ; `InitialContextSetupRequest` sur un contexte déjà `ACTIVE` aussi (TS 38.413). Le rattachement d'un message suit le contexte le **plus récent** (`rposition`).
+- `publication_semantic_key` : toute occurrence NGAP / NAS-5GMM / NAS-5GSM est préservée par `(capture_id, packet_number)`, comme SBI depuis 2.18.3. Avant, deux essais aux mêmes identifiants/adresses partageaient une clé (« last observation wins »). Effet de bord voulu : des NAS répétés dans un même essai (ex. deux `UplinkNASTransport` au seq 13 du jeu de test) ne sont plus compactés (12 → 20 events N2 dans la session du jeu de test). Volume NGAP/NAS faible devant GTP-U.
+
+- Test `successive_runs_of_same_ue_get_distinct_sessions_without_overwriting` (2e essai = copie pcapng aux timestamps décalés, autre `capture_id`, mêmes identifiants) : 2 sessions, aucune ne mélange les essais, le 1er essai garde tous ses events N2. **Preuve de mutation** : sur l'ancien `session-engine`, « session … mélange deux essais ».
+- Workspace complet : 741 passed, 0 failed.
+- OUVERT, déclaré : quand deux essais réutilisent AUSSI les mêmes TEID/SEID (cas du jeu de test copié), le rattachement N3/N4 est ambigu et la corrélation reste fermée (aucun N3/N4 n'est attribué à tort). Au lab, à vérifier : TEID/SEID différents d'un essai à l'autre ?
+- Numérotation : le sprint mémoire ANR1 passe en 2.21.37 (live-probe 0.6.15).
+
 ## OIRAN API 2.21.35 + live-probe 0.6.13 — 2026-11-17 — quarantaine étendue au chemin de pré-validation (`CONTINUOUS_SEGMENT_NOT_FINALIZED`)
 
 Ordre #9 6958155284 (relecture 2.21.34 validée + écart OUVERT au lab). Branche `fix/oiran-2.21.35-prevalidation-quarantine` depuis `98e9f1c` (ma 2.21.34), pas de force-push. 2.21.33 réservée au chantier mémoire ANR1 #10.

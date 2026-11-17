@@ -14242,6 +14242,105 @@ mod tests {
         }
     }
 
+    /// 2.21.36 — copie un pcapng en décalant le timestamp de chaque
+    /// Enhanced Packet Block (type 6) : mêmes paquets, autre contenu, donc
+    /// autre `capture_id`. Simule un 2e essai du même UE (mêmes
+    /// identifiants NGAP) sans dépendre d'un outil externe.
+    fn shifted_pcapng_copy(source: &Path, target: &Path, shift_ticks: u64) {
+        let mut bytes = fs::read(source).unwrap();
+        let mut offset = 0usize;
+        while offset + 12 <= bytes.len() {
+            let block_type = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let block_len =
+                u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            assert!(block_len >= 12 && offset + block_len <= bytes.len(), "pcapng LE attendu");
+            if block_type == 6 {
+                let high = u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap());
+                let low = u32::from_le_bytes(bytes[offset + 16..offset + 20].try_into().unwrap());
+                let ts = ((u64::from(high) << 32) | u64::from(low)) + shift_ticks;
+                bytes[offset + 12..offset + 16].copy_from_slice(&((ts >> 32) as u32).to_le_bytes());
+                bytes[offset + 16..offset + 20].copy_from_slice(&(ts as u32).to_le_bytes());
+            }
+            offset += block_len;
+        }
+        fs::write(target, bytes).unwrap();
+    }
+
+    /// 2.21.36 (essai 7, ANR2 #10 6960552952 : aucune session nouvelle
+    /// depuis le 16/11) — deux essais successifs du MÊME UE, identifiants
+    /// NGAP réutilisés, publiés en deux cycles : chaque essai doit avoir SA
+    /// session, et le 2e ne doit ni absorber ni écraser les events N2 du 1er.
+    #[test]
+    fn successive_runs_of_same_ue_get_distinct_sessions_without_overwriting() {
+        let root = temporary_root("successive-runs-same-ue");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(), false, root.join(".oiran-pseudonym.key"),
+        ).unwrap();
+        let base = root.join(CONTINUOUS_CAPTURE_ID);
+        fs::create_dir_all(base.join("pcap")).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let n2_capture_of_run = |run: usize| -> String {
+            let path = base.join("pcap").join(format!("N2.pcap-run-{run}.pcapng"));
+            format!("sha256:{}", sha256_hex_file(&path).unwrap())
+        };
+        let mut first_run_n2_in_flows = 0usize;
+        for run in 0..2usize {
+            let mut selected = BTreeSet::new();
+            for interface in ["N2", "N3", "N4"] {
+                let path = base.join("pcap").join(format!("{interface}.pcap-run-{run}.pcapng"));
+                let src = fixture.join(format!("{interface}.pcapng"));
+                if run == 0 {
+                    fs::copy(&src, &path).unwrap();
+                } else {
+                    shifted_pcapng_copy(&src, &path, 86_400_000_000);
+                }
+                selected.insert(path);
+            }
+            manager.process_continuous_capture_selected(
+                &base, &interface_specs(), 128 * 1024 * 1024, &selected,
+            ).unwrap();
+            let manifest: LiveDataset = serde_json::from_slice(
+                &fs::read(base.join("dataset/dataset_manifest.json")).unwrap()).unwrap();
+            let callflows = dataset_callflows_dir(&base.join("dataset"), &manifest);
+            let flows = manifest.session_ids.iter().map(|sid| {
+                serde_json::from_slice::<CallFlow>(
+                    &fs::read(callflows.join(format!("{sid}.json"))).unwrap()).unwrap()
+            }).collect::<Vec<_>>();
+            let n2_runs = (0..=run).map(n2_capture_of_run).collect::<Vec<_>>();
+            // Aucune session ne mélange les N2 de deux essais.
+            for flow in &flows {
+                let mixed = n2_runs.iter()
+                    .filter(|cap| flow.events.iter().any(|e| &e.capture_id == *cap))
+                    .count();
+                assert!(mixed <= 1, "session {} mélange deux essais", flow.session_id);
+            }
+            // Chaque essai publié a sa propre session N2.
+            for cap in &n2_runs {
+                assert!(flows.iter().any(|f| f.events.iter().any(|e| &e.capture_id == cap)),
+                    "l'essai {cap} n'a aucune session");
+            }
+            let first = n2_capture_of_run(0);
+            let count = flows.iter()
+                .flat_map(|f| f.events.iter())
+                .filter(|e| e.capture_id == first)
+                .count();
+            if run == 0 {
+                first_run_n2_in_flows = count;
+                assert!(count > 0);
+            } else {
+                assert_eq!(count, first_run_n2_in_flows,
+                    "le 2e essai a écrasé des events N2 du 1er");
+            }
+        }
+        assert_eq!(
+            serde_json::from_slice::<LiveDataset>(
+                &fs::read(base.join("dataset/dataset_manifest.json")).unwrap()).unwrap()
+                .session_ids.len(),
+            2
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn legacy_shard_zero_metadata_and_bytes_survive_three_cycles() {
