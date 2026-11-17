@@ -6021,6 +6021,8 @@ impl CaptureManager {
         publication_bytes_written: u64,
         publication_started_epoch_ms: Option<u64>,
     ) -> Result<LiveDataset, String> {
+        // 0.6.7 — un seul travail lourd en mémoire à la fois (voir HEAVY_MEMORY_GATE).
+        let _heavy_memory_gate = heavy_memory_enter();
         let events_path = dataset_dir.join("oiran_events.jsonl");
         let event_paths = event_paths
             .map(ToOwned::to_owned)
@@ -18143,3 +18145,28 @@ mod tests {
         }
     }
 }
+
+/// 0.6.7 (FAIL lab oiran-api 2.21.22 : OOM 4,0 G = publication continue
+/// « 07-after-lte-flows-built » ~4 G + `/identities` froid en parallèle,
+/// cgroup 4 G) — verrou process-wide des travaux lourds en mémoire.
+/// La publication le prend en bloquant (elle attend la fin d'un travail
+/// lourd de l'API) ; l'API le prend en `try` et répond 503 explicite si la
+/// publication tourne. Jamais deux travaux lourds en même temps.
+static HEAVY_MEMORY_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Entrée bloquante (publication).
+pub fn heavy_memory_enter() -> std::sync::MutexGuard<'static, ()> {
+    HEAVY_MEMORY_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Entrée non bloquante (requêtes API) : `None` = un travail lourd tourne.
+pub fn heavy_memory_try_enter() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match HEAVY_MEMORY_GATE.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+

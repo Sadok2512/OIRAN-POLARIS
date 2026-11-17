@@ -6029,6 +6029,11 @@ fn hydrate_identities(state: &AppState, session_id: &str) -> Result<(), String> 
             }
         }
     }
+    // 2.21.26 (FAIL lab 2.21.22 : OOM 4,0 G) — le chemin froid (tshark) ne
+    // tourne jamais pendant la publication continue ; réponse 503 explicite.
+    let Some(_heavy_memory_gate) = live_probe::heavy_memory_try_enter() else {
+        return Err("HEAVY_WORK_IN_PROGRESS".into());
+    };
     let observations = tshark_identities(state, session_id, &flow)?;
     {
         let mut guard = state.inner.identity_cache.lock().unwrap();
@@ -6379,6 +6384,17 @@ async fn session_identities(
                 &error,
                 "packet dissector unavailable",
             ),
+            "HEAVY_WORK_IN_PROGRESS" => {
+                let mut response = api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &error,
+                    "continuous publication in progress, retry later",
+                );
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, header::HeaderValue::from_static("60"));
+                response
+            }
             _ => api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "IDENTITY_VAULT_FAILED",
@@ -13065,6 +13081,34 @@ mod tests {
         assert_eq!(second["data"]["counters_status"], "stale");
         assert!(second["data"]["counters_age_ms"].as_u64().unwrap() >= 60_000);
         assert_eq!(second["data"]["session_count"], count);
+    }
+
+    /// 2.21.26 (FAIL lab 2.21.22 : OOM) — pendant un travail lourd (publication
+    /// continue), le chemin froid `/identities` répond 503 + Retry-After au
+    /// lieu de matérialiser en parallèle ; libéré, la route refonctionne.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_identities_answer_503_while_continuous_publication_holds_memory_gate() {
+        let state = operator_state();
+        let session_id = queryable_session_ids(&state).into_iter().next().expect("session");
+        let app = router(state.clone(), None);
+        let request = |uri: String| {
+            Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let uri = format!("/api/v1/sessions/{session_id}/identities");
+        {
+            let _publication = live_probe::heavy_memory_enter();
+            let busy = app.clone().oneshot(request(uri.clone())).await.unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.headers()[header::RETRY_AFTER], "60");
+            let body = json_body(busy).await;
+            assert_eq!(body["error"]["code"], "HEAVY_WORK_IN_PROGRESS");
+        }
+        let free = app.oneshot(request(uri)).await.unwrap();
+        assert_ne!(free.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// 2.21.22 (FAIL lab 2.21.21) — sans instantané et avec un calcul en
