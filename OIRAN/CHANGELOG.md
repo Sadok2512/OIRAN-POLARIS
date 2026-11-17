@@ -1,5 +1,54 @@
 # Changelog
 
+## OIRAN API 2.21.35 + live-probe 0.6.13 — 2026-11-17 — quarantaine étendue au chemin de pré-validation (`CONTINUOUS_SEGMENT_NOT_FINALIZED`)
+
+Ordre #9 6958155284 (relecture 2.21.34 validée + écart OUVERT au lab). Branche `fix/oiran-2.21.35-prevalidation-quarantine` depuis `98e9f1c` (ma 2.21.34), pas de force-push. 2.21.33 réservée au chantier mémoire ANR1 #10.
+
+### Défaut corrigé (prouvé au lab, ANR2 #10 6957906053)
+
+La quarantaine 0.6.10 (2.21.30) ne couvrait que l'échec AU DÉCODAGE (`run_continuous_import_inner` → `publish_events_to_dataset_dir` → `decode_capture_streaming` avec callback d'événements). Le segment S6a tronqué du lab était rejeté AVANT, à la PRÉ-VALIDATION (`decode_capture_streaming(... |_| Ok(()))` dans `run_continuous_import_inner`, code `CONTINUOUS_SEGMENT_NOT_FINALIZED`) → pas quarantiné → retenté à chaque cycle → `/health.quarantined_segments.count = 0` au lab.
+
+### Changements
+
+- `CaptureManager::quarantine_segment(path, size, sha256, error_code, epoch_ms)` et `is_segment_quarantined(path, size, sha256)` sont désormais appelés AUX DEUX sites de pré-validation dans `run_continuous_import_inner` (segment direct + segment copié dans l'anneau).
+- Skip précoce : au TOP de chaque itération de candidat (après le filtre `seen_checksums`), on vérifie `self.is_segment_quarantined(path, size, sha256)` → si vrai → log `CONTINUOUS_SEGMENT_SKIPPED_QUARANTINED` + `continue`. Jamais de re-pré-validation sur identité quarantinée.
+- Garde anti-fichier-actif : la quarantaine est posée APRÈS la vérification de stabilité (`has_successor || stable_across_scans`). Un fichier encore en cours d'écriture ne peut PAS être mis en quarantaine, car il n'arrive pas à la pré-validation.
+- Levée automatique : la clé `(chemin, taille, sha256)` inclut la taille et le sha256. Un fichier qui grossit ou est réécrit a une **nouvelle identité** → non quarantiné sur la nouvelle clé → retenté une fois.
+- Log enrichi `CONTINUOUS_SEGMENT_NOT_FINALIZED` : ajoute `"sha256"` et `"quarantined": true/false` (true = nouvelle entrée, false = déjà présent).
+
+### Tests (règle « 12 runs à 0 fail, SKIP si `/tmp` saturé »)
+
+- `truncated_closed_segment_is_quarantined_in_prevalidation` : écrit un segment N2 tronqué (3/5 du fixture + 7 octets) explicitement fermé via `capture-rotation.jsonl`. Démarre `start_continuous_import`. Attend `metrics.ingestion_failures >= 1` + `quarantined_segments_snapshot` contient le segment. Vérifie taille, sha256, error_code `CONTINUOUS_SEGMENT_NOT_FINALIZED: …`.
+- `quarantine_key_is_lifted_when_file_identity_changes` : pré-quarantiné `(path, size_a, sha_a)` ; vérifie que `is_segment_quarantined(path, size_b, sha_b)` et `(path, size_a, sha_b)` et `(path, size_b, sha_a)` renvoient tous `false`. Prouve la levée automatique.
+- Les 2 tests utilisent `skip_if_disk_too_full` existant (saute si `/tmp` sous `SafetyState::StopNewCaptures` ou `DiskHardLimit` — règle Sadok « SKIP si /tmp saturé »).
+
+Preuves — 12 runs consécutifs :
+
+```sh
+$ for i in $(seq 1 12); do cargo test --locked -p live-probe --lib 2>&1 | grep "test result"; done
+test result: ok. 172 passed; 0 failed; 6 ignored    (×12, 0 échec)
+
+$ cargo test --locked -p oiran-api --lib
+test result: ok. 190 passed; 0 failed; 3 ignored
+
+$ cd OIRAN/vtap && cargo update -w && cargo test --locked
+test result: ok. 12 passed; 0 failed    (+ sous-crates)
+```
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.34 | **2.21.35** |
+| `live-probe` | 0.6.12 | **0.6.13** |
+
+### Garde-fous
+
+- Pas de touche à `publish_events_to_dataset_dir` ni `offline_lte_callflows` (ANR1 #10, sprint de nuit).
+- Pas de merge sur `fix/oiran-2.21.10-analyzer` : j'attends `LAB_UNLOCK` ANR2.
+- Aucun test `#[ignore]` introduit.
+- Branches précédentes gelées sur `origin`.
+
 ## OIRAN API 2.21.34 — 2026-11-17 — `/live/traces/:id/sessions` prend `heavy_memory_try_enter()` (503 + `Retry-After: 60`)
 
 Ordre #9 6956890331. Branche `fix/oiran-2.21.34-live` depuis `f88ee7b` (2.21.32), pas de force-push. 2.21.33 réservée au chantier mémoire publication (ANR1 #10).

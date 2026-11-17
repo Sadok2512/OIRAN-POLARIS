@@ -3673,6 +3673,32 @@ impl CaptureManager {
                 if state.seen_checksums.contains(&candidate.checksum) {
                     continue;
                 }
+                // 0.6.13 (ordre #9 6958155284) — segment déjà quarantiné à
+                // la pré-validation (CONTINUOUS_SEGMENT_NOT_FINALIZED) :
+                // on saute SANS retenter. La clé `(chemin, taille, sha256)`
+                // inclut la taille et le sha256 → une mutation du contenu
+                // (fichier qui grossit, est réécrit) lève automatiquement
+                // la quarantaine. Même log d'exclusion que pour la
+                // quarantaine « décodage échoué » de 0.6.10.
+                let candidate_path_str = candidate.path.display().to_string();
+                if self.is_segment_quarantined(
+                    &candidate_path_str,
+                    candidate.size_bytes,
+                    &candidate.checksum,
+                ) {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_SEGMENT_SKIPPED_QUARANTINED",
+                            "path": candidate_path_str,
+                            "size_bytes": candidate.size_bytes,
+                            "sha256": candidate.checksum,
+                            "interface": candidate.interface,
+                            "action": "segment_excluded_cycle_continues",
+                        })
+                    );
+                    continue;
+                }
                 let fingerprint = (candidate.size_bytes, candidate.modified);
                 let stable_across_scans = observed.get(&candidate.path) == Some(&fingerprint);
                 observed.insert(candidate.path.clone(), fingerprint);
@@ -3731,6 +3757,36 @@ impl CaptureManager {
                         candidate.path.display().to_string(),
                         format!("CONTINUOUS_SEGMENT_NOT_FINALIZED: {error}"),
                         epoch_ms(),
+                    );
+                    // 0.6.13 (ordre #9 6958155284) — quarantaine persistante
+                    // du segment en échec de pré-validation. Le flot n'arrive
+                    // ici que si `has_successor || stable_across_scans` (file
+                    // FERMÉ), donc on ne quarantinera JAMAIS un fichier
+                    // actif/en cours d'écriture. L'identité est
+                    // `(chemin, taille, sha256)` : si le fichier est
+                    // ultérieurement réécrit ou grossit, la nouvelle sha256
+                    // ne match plus et la quarantaine est automatiquement
+                    // levée (le segment est retenté une fois).
+                    let path_str = candidate.path.display().to_string();
+                    let quarantined_fresh = self.quarantine_segment(
+                        &path_str,
+                        candidate.size_bytes,
+                        &candidate.checksum,
+                        &format!("CONTINUOUS_SEGMENT_NOT_FINALIZED: {error}"),
+                        epoch_ms(),
+                    );
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_SEGMENT_NOT_FINALIZED",
+                            "path": path_str,
+                            "interface": candidate.interface,
+                            "size_bytes": candidate.size_bytes,
+                            "sha256": candidate.checksum,
+                            "error": error,
+                            "quarantined": quarantined_fresh,
+                            "action": "segment_skipped_cycle_continues",
+                        })
                     );
                     atomic_write(
                         &state_path,
@@ -3857,6 +3913,31 @@ impl CaptureManager {
                         candidate.path.display().to_string(),
                         format!("CONTINUOUS_SEGMENT_NOT_FINALIZED: {error}"),
                         epoch_ms(),
+                    );
+                    // 0.6.13 (ordre #9 6958155284) — même quarantaine qu'au
+                    // premier site de pré-validation : identité
+                    // `(chemin, taille, sha256)`, log explicite, levée
+                    // automatique si le fichier change.
+                    let path_str = candidate.path.display().to_string();
+                    let quarantined_fresh = self.quarantine_segment(
+                        &path_str,
+                        candidate.size_bytes,
+                        &candidate.checksum,
+                        &format!("CONTINUOUS_SEGMENT_NOT_FINALIZED: {error}"),
+                        epoch_ms(),
+                    );
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "CONTINUOUS_SEGMENT_NOT_FINALIZED",
+                            "path": path_str,
+                            "interface": candidate.interface,
+                            "size_bytes": candidate.size_bytes,
+                            "sha256": candidate.checksum,
+                            "error": error,
+                            "quarantined": quarantined_fresh,
+                            "action": "segment_skipped_cycle_continues",
+                        })
                     );
                     atomic_write(
                         &state_path,
@@ -13252,6 +13333,128 @@ mod tests {
         // Un pcap vTAP déjà publié ne relance pas de publication.
         assert!(manager.unpublished_vtap_pcap(&root.join(CONTINUOUS_CAPTURE_ID)).is_none());
         manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+    }
+
+    /// 0.6.13 (ordre #9 6958155284) — un segment fermé (rotation
+    /// terminée) qui échoue à la pré-validation
+    /// `CONTINUOUS_SEGMENT_NOT_FINALIZED` doit être persisté en
+    /// quarantaine `(chemin, taille, sha256)`. `/health` surface la
+    /// liste ; les cycles suivants sautent le segment avec le log
+    /// `CONTINUOUS_SEGMENT_SKIPPED_QUARANTINED`. La quarantaine 0.6.10
+    /// ne couvrait que le chemin de décodage ingestion, pas la
+    /// pré-validation — d'où la 2.21.35.
+    #[test]
+    fn truncated_closed_segment_is_quarantined_in_prevalidation() {
+        if skip_if_disk_too_full("truncated_closed_segment_is_quarantined_in_prevalidation") {
+            return;
+        }
+        let source = temporary_root("prevalidation-quarantine-source");
+        let root = temporary_root("prevalidation-quarantine-root");
+        fs::create_dir_all(source.join("N2")).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1");
+        let n2 = fs::read(fixture.join("N2.pcapng")).unwrap();
+        // Segment tronqué (3/5 + 7 octets), explicitement fermé par
+        // `capture-rotation.jsonl` → arrivera à la pré-validation.
+        let truncated_path = source.join("N2/final-1.pcapng");
+        fs::write(&truncated_path, &n2[..n2.len() * 3 / 5 + 7]).unwrap();
+        write_rotation_closures(&source, "N2", 1);
+        let truncated_sha = sha256_hex_file(&truncated_path).unwrap();
+        let truncated_size = fs::metadata(&truncated_path).unwrap().len();
+        thread::sleep(Duration::from_millis(250));
+
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        assert!(manager.quarantined_segments_snapshot().is_empty());
+
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source,
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
+                max_segments: 1,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
+            })
+            .unwrap();
+
+        // Attend que la pré-validation échoue puis que la quarantaine
+        // soit persistée.
+        wait_for(|| {
+            manager
+                .get(CONTINUOUS_CAPTURE_ID)
+                .is_some_and(|job| job.metrics.ingestion_failures >= 1)
+                && manager
+                    .quarantined_segments_snapshot()
+                    .iter()
+                    .any(|((p, _, _), _)| p == &truncated_path.display().to_string())
+        });
+
+        let snapshot = manager.quarantined_segments_snapshot();
+        let entry = snapshot
+            .iter()
+            .find(|((p, _, _), _)| p == &truncated_path.display().to_string())
+            .expect("segment tronqué doit être quarantiné");
+        assert_eq!(entry.0 .1, truncated_size);
+        assert_eq!(entry.0 .2, truncated_sha);
+        assert!(
+            entry.1.error_code.starts_with("CONTINUOUS_SEGMENT_NOT_FINALIZED"),
+            "error_code devrait commencer par CONTINUOUS_SEGMENT_NOT_FINALIZED, vu: {}",
+            entry.1.error_code
+        );
+
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
+    }
+
+    /// 0.6.13 (ordre #9 6958155284) — la clé de quarantaine inclut la
+    /// taille ET le sha256, pas seulement le chemin : un fichier
+    /// ultérieurement réécrit ou agrandi a une nouvelle identité et
+    /// doit être ré-essayé (la quarantaine est levée automatiquement
+    /// pour l'ancienne identité). Garantit qu'un segment encore en
+    /// cours d'écriture au moment de la première observation ne reste
+    /// pas quarantiné indéfiniment.
+    #[test]
+    fn quarantine_key_is_lifted_when_file_identity_changes() {
+        let root = temporary_root("quarantine-identity-change");
+        let manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        let path = "/tmp/synthetic-prevalidation-seg.pcap";
+        let old_sha = "a".repeat(64);
+        let old_size = 1_024u64;
+        manager.quarantine_segment(
+            path,
+            old_size,
+            &old_sha,
+            "CONTINUOUS_SEGMENT_NOT_FINALIZED: SYNTHETIC",
+            1_792_500_000_000,
+        );
+        assert!(manager.is_segment_quarantined(path, old_size, &old_sha));
+
+        // Identité nouvelle (fichier a grossi) → quarantaine NON active
+        // pour la nouvelle identité (ancienne reste pour audit).
+        let new_sha = "b".repeat(64);
+        let new_size = 2_048u64;
+        assert!(!manager.is_segment_quarantined(path, new_size, &new_sha));
+        // Taille identique mais sha différent (fichier réécrit sous le
+        // même path avec contenu différent) → même raisonnement.
+        assert!(!manager.is_segment_quarantined(path, old_size, &new_sha));
+        // Sha identique mais taille différente → non quarantiné
+        // (incohérent mais couvert par la clé composite).
+        assert!(!manager.is_segment_quarantined(path, new_size, &old_sha));
     }
 
     #[test]
