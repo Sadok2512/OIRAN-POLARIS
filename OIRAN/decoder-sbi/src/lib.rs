@@ -1073,6 +1073,16 @@ fn header(headers: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
+/// 2.21.18 — classement public d'une opération SBI à partir de l'URI
+/// ANONYMISÉE (`Request URI (sanitized)` stockée sur l'event) et de la
+/// méthode HTTP : même fonction que le décodage, donc même résultat qu'un
+/// redécodage. Utilisé par l'API pour reclasser à la lecture les events
+/// décodés par une version antérieure du catalogue. `None` = opération
+/// inconnue (l'appelant garde `UnsupportedSbiOperation`, jamais d'invention).
+pub fn classify_sanitized_operation(sanitized_path: &str, method: Option<&str>) -> Option<String> {
+    classify(Some(sanitized_path), method).1
+}
+
 fn classify(path: Option<&str>, method: Option<&str>) -> (Option<String>, Option<String>) {
     let Some(path) = path else {
         return (None, None);

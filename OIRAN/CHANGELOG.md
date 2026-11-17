@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.21.18 — 2026-11-17 — reclassement SBI à la lecture (décodeur 0.4.8) (patch)
+
+- Rapport ANR2 #10 (FAIL 2.21.16) : santé pendant `/identities` PASS, catalogue PASS (`protocol_tree=10`, `network_elements=14`), mais **`UnsupportedSbiOperation=724`** sur `5g-session-0bfac1e7ae159a77` au lieu de 0.
+- Cause : les events servis ont été nommés À L'INGESTION par le catalogue SBI de l'époque. Le catalogue étendu de la 2.21.11 ne s'appliquait qu'aux events nouvellement décodés ; l'Analyzer ne redécode pas le stock.
+- Correctif : `decoder_sbi::classify_sanitized_operation(uri_anonymisée, méthode)` (decoder-sbi 0.4.8), publique et identique au classement du décodage (`classify`, appelée sur la même URI anonymisée). `read_time_patch` l'applique aux events SBI-HTTP2 nommés `UnsupportedSbiOperation…`, depuis les IEs `Request URI (sanitized)` et `HTTP method` de l'event brut. Le résultat est donc le même qu'un redécodage. URI inconnue → libellé d'origine conservé (jamais d'invention). Compteur existant `events_patched.message_name` + provenance `read_time_patch.fields`.
+- Condition : le correctif à la lecture s'applique quand l'index compact est prêt (`PatchStatus::Applied`) ; pendant sa construction, les events sont servis tels quels (`index_building_responses`, déjà exposé dans `/api/v1/version.read_time_patch`).
+- Test : `sbi_unsupported_events_are_reclassified_at_read_time_with_decoder_catalogue`. `cargo test --locked -p oiran-api --lib` : 170 passed (+ 2 tests tshark, outil absent sur l'hôte de relecture) ; decoder-sbi 38 passed ; vTAP `--locked` OK ; audit du lock Rust 1.83 : 0 incompatible.
+
 ## OIRAN API 2.21.17 — 2026-11-17 — audit handlers lot 2 : `/metrics`, `/subscribers`, `/sessions/:id`, `/packet_dissect` en `spawn_blocking`
 
 Lot 2 des handlers OUVERTS du 2.21.14. **Règle bloquante retenue** (#9 6944132663) : `cd OIRAN && cargo test --locked -p oiran-api --lib` DOIT passer avant push, sa sortie dans le rapport. Sadok a corrigé mon Cargo.lock 3× (2.21.12/15/16).

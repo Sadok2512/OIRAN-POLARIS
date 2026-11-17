@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-sbi"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "decoder-ngap",
  "event-schema",
@@ -685,6 +685,7 @@ dependencies = [
  "decoder-nas",
  "decoder-ngap",
  "decoder-s1ap",
+ "decoder-sbi",
  "disk-safety",
  "event-schema",
  "http-body-util",

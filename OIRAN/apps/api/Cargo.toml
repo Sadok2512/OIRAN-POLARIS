@@ -21,6 +21,7 @@ decoder-nas = { path = "../../decoder-nas" }
 # (TS 38.413) + NAS 5GMM/5GSM (TS 24.501) ; même table publique
 # consommée par l'ingestion.
 decoder-ngap = { path = "../../decoder-ngap" }
+decoder-sbi = { path = "../../decoder-sbi" }
 correlation-engine = { path = "../../correlation-engine" }
 session-engine = { path = "../../session-engine" }
 serde = { version = "1.0", features = ["derive"] }
