@@ -1,5 +1,61 @@
 # Changelog
 
+## OIRAN API 2.21.17 — 2026-11-17 — audit handlers lot 2 : `/metrics`, `/subscribers`, `/sessions/:id`, `/packet_dissect` en `spawn_blocking`
+
+Lot 2 des handlers OUVERTS du 2.21.14. **Règle bloquante retenue** (#9 6944132663) : `cd OIRAN && cargo test --locked -p oiran-api --lib` DOIT passer avant push, sa sortie dans le rapport. Sadok a corrigé mon Cargo.lock 3× (2.21.12/15/16).
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `oiran-api` | 2.21.16 | **2.21.17** |
+
+### Correctifs (4 routes)
+
+- **`/metrics`** : `measure_path(storage_path)` + `/proc/loadavg` + iteration flows + capture_manager.list(). Extrait en `fn metrics_blocking(state) -> Json<Value>`, handler wrap `spawn_blocking`.
+- **`/subscribers`** : `cached_journey_index` traverse datasets + callflows. Wrap inline `spawn_blocking` autour du body entier.
+- **`/sessions/:id`** : `flow_for` + `live_flow_for` + `lte_evidence_store.find_session`. Extrait en `fn session_blocking(state, id)`, handler wrap `spawn_blocking`.
+- **`/packet_dissect`** : invoque tshark (sub-process) + `packet_values(state)` + `packet_source_path`. Extrait en `fn packet_dissect_blocking(state, capture_id, packet_number)`, handler wrap `spawn_blocking`.
+
+### Tests VRAI routeur (règle #9 6940906119) — 3 nouveaux
+
+1. `metrics_route_is_spawned_blocking_real_router` : `/health` répond < 500 ms pendant `/metrics` concurrent.
+2. `subscribers_route_is_spawned_blocking_real_router` : idem pour `/subscribers`.
+3. `session_route_is_spawned_blocking_real_router` : idem pour `/sessions/{id}`.
+
+(`/packet_dissect` nécessite un contexte de capture + tshark installé — test différé à un lot ultérieur qui fournira le fixture complet.)
+
+### Audit — statut post-2.21.17
+
+| Route | Statut | Lot |
+|---|---|---|
+| `/health` | FIXÉ | 2.21.13 |
+| `/sessions` | FIXÉ | 2.21.14 |
+| `/sessions/catalog` | FIXÉ (cache) | 2.22.4 |
+| `/sessions/:id/identities` | FIXÉ (spawn_blocking + cache signature) | 2.21.10 + 2.21.15 |
+| `/sessions/:id/events` | FIXÉ | 2.21.16 |
+| `/sessions/:id/callflow` | FIXÉ | 2.21.16 |
+| `/metrics` | **FIXÉ** | **2.21.17** |
+| `/subscribers` | **FIXÉ** | **2.21.17** |
+| `/sessions/:id` | **FIXÉ** | **2.21.17** |
+| `/packet_dissect` | **FIXÉ** | **2.21.17** |
+| 12 autres (`/ues`, `/ue/:id`, `/ue/:id/sessions`, `/subscriber_journey/:pseudo`, `/subscriber_tmsi/:pseudo`, `/sessions/filter`, `/sessions/catalog/search`, `/sessions/columns`, `/session_correlations`, `/event/:id`, `/provenance/:id`, `/packets`, `/packet/:id`, `/correlation_edges`, `/export_callflow`, `/live/*`) | OUVERT | 2.21.18+ |
+
+Bilan : **10/22 routes FIXÉES**, 12 OUVERTES.
+
+### Tests (règle bloquante #9 6944132663)
+
+```bash
+cd OIRAN && cargo test --locked -p oiran-api --lib
+# test result: ok. 171 passed; 0 failed; 3 ignored (+3 : metrics, subscribers, session)
+cd OIRAN/vtap && cargo update -w && cargo test --locked
+# unit : 12 passed ; integration : 3 passed
+```
+
+### Suite
+
+Merge dans `feat/oiran-2.22.0-userplane` et `feat/oiran-2.23.0-bench-o1` après validation du `--locked`. **2.21.18** : prochains OUVERTS (`/sessions/filter`, `/sessions/columns`, `/session_correlations`, `/live/traces/:id/sessions`).
+
 ## OIRAN API 2.21.16 — 2026-11-17 — `/sessions/:id/events` + `/sessions/:id/callflow` en `spawn_blocking` (audit handlers, lot 1 UI)
 
 Lot 1 des 22 handlers OUVERTS de l'audit 2.21.14, ordre d'usage UI prioritaire (#9 6941147984 : « `/events`, `/live/*`, `/callflow` d'abord »). Chaque route exerce son fix via un test VRAI routeur dédié.
