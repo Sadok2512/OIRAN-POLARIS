@@ -1675,7 +1675,7 @@ pub struct CaptureManager {
     /// (0.6.7 était process-wide : deux AppState de test se bloquaient
     /// mutuellement → 503 parasite, FAIL gate ANR2 2.21.26). La publication
     /// le prend en bloquant ; l'API le prend en `try` (503 si occupé).
-    heavy_memory_gate: Arc<Mutex<()>>,
+    heavy_memory_gate: Arc<std::sync::RwLock<()>>,
     /// 0.6.9 — segments dont l'échec de décodage a déjà été compté
     /// (`(chemin, taille)`), pour ne pas gonfler `ingestion_failures` à
     /// chaque cycle. Le log structuré, lui, sort à chaque cycle.
@@ -1824,15 +1824,21 @@ fn persist_quarantined_segments(
 
 impl CaptureManager {
     /// 0.6.8 — entrée bloquante (publication continue).
-    pub fn heavy_memory_enter(&self) -> std::sync::MutexGuard<'_, ()> {
+    /// 0.6.11 — `RwLock` : la publication prend l'écriture (exclusive).
+    pub fn heavy_memory_enter(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
         self.heavy_memory_gate
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 0.6.8 — entrée non bloquante (requêtes API) : `None` = travail lourd en cours.
-    pub fn heavy_memory_try_enter(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
-        match self.heavy_memory_gate.try_lock() {
+    /// 0.6.11 — partagée (lecture) : deux travaux API ne s'excluent plus
+    /// entre eux, seule la publication les exclut. En 0.6.8 l'hydratation
+    /// d'identités en arrière-plan (`schedule_identity_hydration`) tenait le
+    /// verrou et `/sessions/filter` répondait 503 sans aucune publication
+    /// (prouvé par trace : `filter_index_cache_is_invalidated…` 3 échecs/12).
+    pub fn heavy_memory_try_enter(&self) -> Option<std::sync::RwLockReadGuard<'_, ()>> {
+        match self.heavy_memory_gate.try_read() {
             Ok(guard) => Some(guard),
             Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => None,
@@ -1969,7 +1975,7 @@ impl CaptureManager {
             continuous_stop: Arc::new(AtomicBool::new(false)),
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
             continuous_vtap_dirs: Arc::new(Mutex::new(Vec::new())),
-            heavy_memory_gate: Arc::new(Mutex::new(())),
+            heavy_memory_gate: Arc::new(std::sync::RwLock::new(())),
             reported_segment_failures: Arc::new(Mutex::new(BTreeSet::new())),
             vtap_publication_triggers: Arc::new(Mutex::new(BTreeSet::new())),
             quarantined_segments: Arc::new(Mutex::new(quarantined_segments)),

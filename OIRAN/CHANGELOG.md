@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.21.32 + live-probe 0.6.12 — 2026-11-17 — verrou mémoire lecture/écriture : seule la publication exclut les routes
+
+Upgrade **patch**. En 2.21.30, `sessions_filter_blocking` prend le verrou mémoire. Or l'hydratation d'identités en arrière-plan (`schedule_identity_hydration` → `hydrate_identities`, verrou pris en 2.21.26) le tenait aussi : `/sessions/filter` répondait **503 alors qu'aucune publication ne tournait**. Preuve par trace (`GATEDBG`, instrumentation retirée) : détenteur = `hydrate_identities`, demandeur refusé = `sessions_filter_blocking`. Effet : `filter_index_cache_is_invalidated_when_a_session_is_added` échouait 3 fois sur 12 (visible depuis que tshark est installé localement). Même effet en production pour l'UI.
+
+- `heavy_memory_gate` passe en `RwLock` : publication = écriture (exclusive, bloquante) ; routes API = lecture partagée (`try_read`, 503 seulement si une publication tient ou attend le verrou).
+- Résultat : oiran-api 12 exécutions sur 12 à 0 échec (contre 3 échecs sur 12 avant).
+- Numérotation : le chantier mémoire ANR1 passe en 2.21.33 (live-probe 0.6.13).
+
 ## OIRAN API 2.21.31 + live-probe 0.6.11 — 2026-11-17 — un pcap vTAP fermé déclenche la publication à lui seul (FAIL lab 2.21.29)
 
 Upgrade **patch**, sur 2.21.30 (DEVMAT, relu : oiran-api 189 passed et live-probe 169 passed, 3 exécutions sur 3, aucun `#[ignore]` ajouté).
@@ -9,7 +17,7 @@ Upgrade **patch**, sur 2.21.30 (DEVMAT, relu : oiran-api 189 passed et live-prob
 - `unpublished_vtap_pcap` : un pcap vTAP fermé (> 24 o), dont l'empreinte n'est pas dans le dataset publié, positionne `changed` ; log `CONTINUOUS_VTAP_TRIGGERS_PUBLICATION`. Une publication au plus par `(chemin, taille)` : un pcap rejeté par la phase vTAP ne boucle pas.
 - Test `closed_vtap_pcap_triggers_publication_without_new_dumpcap_segment` : reproduit le lab (seul candidat dumpcap tronqué, rejeté en pré-validation) → le pcap vTAP est publié. **Preuve de mutation** : sans le déclencheur, le test échoue (timeout de 30 s).
 - Constat : les tests `start_continuous_import` se sautent (SKIP visible) si `/tmp` est sous le seuil disque. Exécutés ici avec 15 G libres.
-- Numérotation : le chantier mémoire ANR1 passe en 2.21.32 (live-probe 0.6.12).
+- Numérotation : voir 2.21.32.
 
 ## OIRAN API 2.21.30 + live-probe 0.6.10 — 2026-11-17 — verrou mémoire sur 3 routes lourdes + quarantaine persistante des segments en échec
 
