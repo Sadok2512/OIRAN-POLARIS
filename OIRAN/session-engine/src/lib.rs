@@ -1355,12 +1355,19 @@ fn compact_publication_event(event: &mut EventRecord) {
             }
         }
     }
-    event.timestamp.clear();
-    event.decoding_status.clear();
-    event.decoder_name.clear();
-    event.decoder_version.clear();
-    event.raw_payload_reference.clear();
-    event.errors.clear();
+    // 2.21.60 (ordre #9 6991281552) — libération EFFECTIVE des
+    // buffers String compactés. `.clear()` ne libère pas la
+    // capacité (RFC Rust : « len=0 mais cap inchangé »). Pour
+    // 1.6M events × 6 Strings × 30-50 B de buffer moyen = 300-
+    // 500 MB de mémoire anonyme retenue inutilement en prod. On
+    // réaffecte un `String::new()` (capacité 0) : le buffer
+    // d'origine est droppé immédiatement.
+    event.timestamp = String::new();
+    event.decoding_status = String::new();
+    event.decoder_name = String::new();
+    event.decoder_version = String::new();
+    event.raw_payload_reference = String::new();
+    event.errors = Vec::new();
     // Schema compatibility is checked while the full JSONL is decoded. None
     // of the publication discovery/correlation passes reads it afterwards,
     // whereas retaining one copy per representative keeps a JSON object node,
@@ -1368,6 +1375,25 @@ fn compact_publication_event(event: &mut EventRecord) {
     // both are consumed by downstream discovery/correlation.
     if let Some(source) = event.source_json.as_object_mut() {
         source.remove("schema_version");
+    }
+    // 2.21.60 — `identifiers` est filtré à STABLE_IDENTIFIERS
+    // (≤ 30 pairs possibles) mais son `Vec` garde sa capacité
+    // d'origine qui peut être bien supérieure (dataset prod :
+    // jusqu'à 60 pairs par event avant filtre). `shrink_to_fit`
+    // réduit au strict nécessaire.
+    event.identifiers.shrink_to_fit();
+    // 2.21.60 — `packet_references` tronqué à 1-2 ci-dessus.
+    event.packet_references.shrink_to_fit();
+    // 2.21.60 — `information_elements` : pour SBI/Diameter/SIP/
+    // GTP-U/S1AP, remplacé par `Value::Array(Vec::new())` qui
+    // est déjà vide. Pour PFCP/NGAP, filtré par `retain` : le
+    // `Vec` sous-jacent du `Value::Array` garde sa capacité.
+    // On réalloue un `Value::Array` compact.
+    if let Some(items) = event.information_elements.as_array() {
+        if !items.is_empty() && items.len() < items.capacity() / 2 {
+            let compact: Vec<Value> = items.iter().cloned().collect();
+            event.information_elements = Value::Array(compact);
+        }
     }
 }
 
@@ -6240,5 +6266,100 @@ mod tests {
             serde_json::to_value(spilled_discovery).unwrap(),
             "certified fixture discovery differs",
         );
+    }
+
+    /// 2.21.60 (ordre #9 6991281552) — garde byte-identical pour
+    /// le dataset publié. Le correctif mémoire remplace
+    /// `String.clear()` par `String::new()` et `Vec::shrink_to_fit`
+    /// sur les structures compactées. Ces opérations ne changent
+    /// QUE la capacité des buffers ; le contenu (len, valeur
+    /// textuelle) reste identique. La sérialisation JSON d'une
+    /// `String` vide est `""` quel que soit la capacité. Celle
+    /// d'un `Vec` ne dépend pas de sa capacité.
+    ///
+    /// Ce test prend un `EventRecord` représentatif (SBI + NGAP +
+    /// PFCP IE), applique `compact_publication_event`, sérialise,
+    /// et vérifie que la représentation JSON correspond au
+    /// baseline attendu — garantissant par construction que les
+    /// datasets publiés `f1012b8` et `2.21.60` sont byte-identiques.
+    #[test]
+    fn compact_publication_event_produces_byte_identical_serialization_as_2_21_59() {
+        // NGAP event avec IE filtrables.
+        let line = r#"{"event_id":"evt-1","capture_id":"sha256:abc","capture_point_id":"N2","interface":"N2","protocol":"NGAP","message_name":"InitialContextSetupRequest","source_endpoint":{"address":"10.0.0.1","network_function":"gNB"},"destination_endpoint":{"address":"10.0.0.2","network_function":"AMF"},"direction":"RAN_TO_CORE","session_identifiers":[{"name":"ran_ue_ngap_id","value":"42","pseudonymized":false},{"name":"amf_ue_ngap_id","value":"7","pseudonymized":false},{"name":"ephemeral_tx","value":"abc","pseudonymized":false}],"information_elements":[{"id":85,"name":"RAN-UE-NGAP-ID","value":"ran_ue_ngap_id=42","raw_sha256":"a","status":"DECODED"},{"id":85,"name":"NAS-PDU","value":"opaque","raw_sha256":"b","status":"DECODED"},{"id":85,"name":"GTP-TEID","value":"teid=0x1234","raw_sha256":"c","status":"DECODED"}],"decoding_status":"DECODED","decoder_name":"ngap","decoder_version":"1","raw_payload_reference":"sha256:xxx","packet_references":[{"source_file":"a.pcap","packet_number":1,"byte_offset":0,"interface_id":0,"captured_length":100,"original_length":100},{"source_file":"a.pcap","packet_number":1,"byte_offset":0,"interface_id":0,"captured_length":100,"original_length":100}],"errors":[],"timestamp":{"seconds":1,"nanoseconds":0,"raw_ticks":1000000000,"display":"1.000000000Z"}}"#;
+        let value: Value = serde_json::from_str(line).unwrap();
+        let mut event = parse_event(value).unwrap();
+        compact_publication_event(&mut event);
+        // Champs vidés : sérialisation == "".
+        assert_eq!(event.timestamp, "");
+        assert_eq!(event.decoding_status, "");
+        assert_eq!(event.decoder_name, "");
+        assert_eq!(event.decoder_version, "");
+        assert_eq!(event.raw_payload_reference, "");
+        assert!(event.errors.is_empty());
+        // Capacité RÉELLEMENT libérée (correctif 2.21.60) :
+        // String::new() a cap=0, String::clear() aurait gardé
+        // la capacité d'origine (cap ≥ 8 pour "DECODED").
+        // Mutation : revert à clear() → ces assertions rouges.
+        assert_eq!(event.timestamp.capacity(), 0, "preuve de libération de capacité (mutation : clear() aurait cap > 0)");
+        assert_eq!(event.decoder_name.capacity(), 0);
+        assert_eq!(event.raw_payload_reference.capacity(), 0);
+        // Champs CONSERVÉS pour byte-identical : event_id,
+        // capture_id, capture_point_id, interface, protocol,
+        // message_name, source_*, destination_*, direction,
+        // identifiers filtrés, information_elements filtrés,
+        // packet_references tronqués.
+        assert_eq!(event.event_id, "evt-1");
+        assert_eq!(event.capture_id, "sha256:abc");
+        assert_eq!(event.interface, "N2");
+        assert_eq!(event.protocol, "NGAP");
+        // STABLE_IDENTIFIERS gardés (ran_ue_ngap_id, amf_ue_ngap_id),
+        // "ephemeral_tx" filtré.
+        assert!(event.identifiers.iter().any(|(k, _)| k == "ran_ue_ngap_id"));
+        assert!(event.identifiers.iter().any(|(k, _)| k == "amf_ue_ngap_id"));
+        assert!(!event.identifiers.iter().any(|(k, _)| k == "ephemeral_tx"));
+        // NGAP : information_elements filtré, pas vidé. Les 3 IE
+        // ont des noms qui contiennent "teid" (GTP-TEID) ou ne
+        // contiennent aucune needle (NAS-PDU, RAN-UE-NGAP-ID) ;
+        // RAN-UE-NGAP-ID a la value `ran_ue_ngap_id=42` qui ne
+        // matche aucune needle. Donc seul GTP-TEID est retenu.
+        let ies = event.information_elements.as_array().unwrap();
+        assert_eq!(ies.len(), 1, "NGAP : filtre doit garder GTP-TEID : {ies:?}");
+        // Sérialisation finale byte-identique à ce qu'elle aurait
+        // été avec `clear()` (seule la capacité des Strings
+        // vidées change, pas leur contenu).
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["timestamp"], serde_json::json!(""));
+        assert_eq!(json["decoding_status"], serde_json::json!(""));
+        assert_eq!(json["decoder_name"], serde_json::json!(""));
+    }
+
+    /// 2.21.60 — mutation : si le correctif jetait un champ encore
+    /// lu (ex. `event_id`, `capture_id`, STABLE_IDENTIFIERS, ou
+    /// une IE tunnel), le test ci-dessus deviendrait rouge.
+    #[test]
+    fn compact_publication_event_preserves_sbi_representative_identity() {
+        let line = r#"{"event_id":"evt-sbi","capture_id":"sha256:def","capture_point_id":"SBI","interface":"SBI","protocol":"SBI-HTTP2","message_name":"UpdateSMContext","source_endpoint":{"address":"10.0.0.3","network_function":"AMF"},"destination_endpoint":{"address":"10.0.0.4","network_function":"SMF"},"direction":"CORE_TO_CORE","session_identifiers":[{"name":"sm_context_reference","value":"ctx-01","pseudonymized":false}],"information_elements":[{"id":0,"name":"HTTP method","value":"POST","raw_sha256":"a","status":"DECODED"}],"decoding_status":"DECODED","decoder_name":"sbi","decoder_version":"1","raw_payload_reference":"sha256:yyy","packet_references":[{"source_file":"b.pcap","packet_number":5,"byte_offset":0,"interface_id":0,"captured_length":200,"original_length":200}],"errors":[],"timestamp":{"seconds":2,"nanoseconds":0,"raw_ticks":2000000000,"display":"2.000000000Z"},"sbi":{"operation":"UpdateSMContext","http_method":"POST","request_uri":"/nsmf-pdusession/v1/sm-contexts/42/modify"}}"#;
+        let value: Value = serde_json::from_str(line).unwrap();
+        let mut event = parse_event(value).unwrap();
+        compact_publication_event(&mut event);
+        // SBI : information_elements doit être entièrement VIDÉ
+        // (pas dans [PFCP, NGAP]).
+        let ies = event.information_elements.as_array().unwrap();
+        assert!(ies.is_empty(), "SBI : IE doit être vidé : {ies:?}");
+        // Identité SBI préservée.
+        assert_eq!(event.event_id, "evt-sbi");
+        assert_eq!(event.capture_id, "sha256:def");
+        assert_eq!(event.message_name, "UpdateSMContext");
+        // sm_context_reference est STABLE_IDENTIFIER.
+        assert!(event
+            .identifiers
+            .iter()
+            .any(|(k, v)| k == "sm_context_reference" && v == "ctx-01"));
+        // source_json compacté : sbi.request_uri/http_method/operation gardés, schema_version supprimé.
+        let sbi = event.source_json.get("sbi").unwrap();
+        assert_eq!(sbi["request_uri"], "/nsmf-pdusession/v1/sm-contexts/42/modify");
+        assert_eq!(sbi["http_method"], "POST");
+        assert_eq!(sbi["operation"], "UpdateSMContext");
+        assert!(event.source_json.get("schema_version").is_none());
     }
 }

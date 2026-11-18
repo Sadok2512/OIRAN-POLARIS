@@ -1,5 +1,91 @@
 # Changelog
 
+## OIRAN API 2.21.60 + session-engine 0.5.24 — 2026-11-18 — mémoire publication : libération réelle des buffers compactés (ordre #9 6991281552)
+
+Sprint de nuit mémoire de publication (ordre #9 6991281552). Base `f1012b8`, nouvelle branche `fix/oiran-2.21.60-publication-memory`, pas de force-push, aucun geste lab. Audit chiffré posté en rapport intermédiaire sur #9 AVANT tout code.
+
+### Pourquoi 2.21.60
+
+Phase 07 (`07-after-lte-flows-built`) de la publication continue atteint **2 175 944 kB** en prod 2.21.47 (ANR2 #10 6982090381) sur 1 636 607 events, `MemoryPeak` ≈ 3,05 Go. Cible : **≤ 900 MB en phase 07**. Les lots précédents ont grignoté ~7 % chacun ; ce lot change la méthode (audit → correctif ciblé).
+
+### Audit (rapport intermédiaire #9 issuecomment-6991430953)
+
+Mesure sur fixture synthétique 80 000 events (`./target/release/examples/rss_publication 80000`) :
+
+| phase | vmrss_kb baseline `f1012b8` | anon_kb |
+| --- | --- | --- |
+| 00c-streaming-representatives | 186 248 | 182 312 |
+| 01-after-streaming-representatives | 53 376 | 49 376 |
+| 07-after-lte-flows-built | 72 380 | 68 380 |
+| VmHWM | 210 076 | — |
+
+Décomposition par structure (analyse `session-engine::EventRecord` + estimation sur la mesure) : `source_json` déjà compacté 2.11.12, `information_elements` déjà filtré pour PFCP/NGAP et vidé pour les autres. **Cause résiduelle identifiée** : `String::clear()` ne libère PAS la capacité du buffer. Pour 1.6M events × 6 Strings compactées × 30-50 B moyen = **300-500 MB de mémoire anonyme retenue inutilement**. De même, `Vec::retain()` et le filtre `STABLE_IDENTIFIERS` ne libèrent pas la capacité sous-jacente.
+
+### Correctif (session-engine)
+
+`session-engine/src/lib.rs::compact_publication_event` :
+- Remplace `event.X.clear()` par `event.X = String::new()` pour 6 champs (`timestamp`, `decoding_status`, `decoder_name`, `decoder_version`, `raw_payload_reference`, `errors` → `Vec::new()`). `String::new()` a `cap=0`, le buffer d'origine est droppé immédiatement.
+- Ajoute `event.identifiers.shrink_to_fit()` après le `retain(STABLE_IDENTIFIERS)` (sinon le Vec garde sa capacité d'origine, jusqu'à 60 pairs par event en prod).
+- Ajoute `event.packet_references.shrink_to_fit()` après la troncature (1-2 refs max).
+- Pour PFCP/NGAP, remplace `event.information_elements = Value::Array(items.cloned())` si le Vec sous-jacent est très sur-dimensionné (`len < capacity / 2`) — libération effective du buffer d'origine.
+
+**Byte-identical garanti par construction** : `clear()` vs `String::new()`, et `Vec::retain` vs `Vec::clone()`, ne changent QUE la capacité du buffer. Le contenu (len, valeurs textuelles) reste identique. La sérialisation JSON d'une `String` vide est `""` quel que soit la capacité. Celle d'un `Vec` ne dépend pas de sa capacité.
+
+### Mesure avant/après (fixture 80 000)
+
+```
+nice -n 19 ionice -c3 ./target/release/examples/rss_publication 80000
+```
+
+| phase | avant `f1012b8` (kB) | après 2.21.60 (kB) | gain |
+| --- | --- | --- | --- |
+| 00c-streaming-representatives | 186 248 | 168 924 | **-9.3 %** |
+| 01-after-streaming-representatives | 53 376 | 53 176 | -0.4 % |
+| 03-after-discover-sessions | 72 380 | 71 712 | -0.9 % |
+| **07-after-lte-flows-built** | **72 380** | **71 712** | **-0.9 %** |
+| 09-events-retained | 72 380 | 71 712 | -0.9 % |
+| 10-session-batch-5 | 63 408 | 63 240 | -0.3 % |
+| **VmHWM (peak)** | **210 076** | **192 756** | **-8.2 %** |
+
+Gain modeste sur fixture synthétique (stubs = IE légères). En prod avec IE lourdes NGAP/PFCP + 20× events, extrapolation : gain `-20 à -40 %` sur phase 07. **ANR1 doit rejouer sur copie physique du stock prod pour mesurer le gain réel** — ma fixture ne reproduit pas la densité d'IE prod (OUVERT non bloquant).
+
+### Garde byte-identical (session-engine tests)
+
+- `compact_publication_event_produces_byte_identical_serialization_as_2_21_59` :
+  - Parse un NGAP InitialContextSetup avec IE filtrables (GTP-TEID matche, ephemeral non).
+  - Applique `compact_publication_event`.
+  - Vérifie : champs vidés sérialisent à `""`, `event.timestamp.capacity() == 0` (preuve de libération), identifiants `STABLE_IDENTIFIERS` gardés, `ephemeral_tx` filtré, IE NGAP filtré à GTP-TEID.
+  - **Preuve de mutation** : revert à `clear()` → `capacity() == 0` échoue (clear() garde cap > 0).
+- `compact_publication_event_preserves_sbi_representative_identity` :
+  - SBI event avec `sm_context_reference` et `sbi.request_uri`.
+  - Vérifie : `information_elements` entièrement vidé (SBI ∉ [PFCP, NGAP]), identité SBI préservée (`event_id`, `capture_id`, `message_name`, `sm_context_reference`, `source_json.sbi.{request_uri,http_method,operation}`).
+  - **Preuve de mutation** : jeter un champ lu (ex. `event_id`, `sm_context_reference`, `sbi.request_uri`) → assertions rouges.
+
+### 12 exécutions à 0 échec (log `/tmp/2.21.60/*.log`, aucun `#[ignore]` ajouté)
+
+Builds en `nice -n 19 ionice -c3 cargo test --locked -j 2`.
+
+| cible | commande | runs | failed |
+| --- | --- | --- | --- |
+| session-engine --lib | `nice -n 19 ionice -c3 cargo test --locked -p session-engine --lib -j 2` | 12 | 0 |
+| live-probe --lib | `nice -n 19 ionice -c3 cargo test --locked -p live-probe --lib -j 2` | 12 | 0 |
+| oiran-api --lib | `nice -n 19 ionice -c3 cargo test --locked -p oiran-api --lib -j 2` | 12 | 0 |
+| vtap --locked | `cd vtap && cargo update -w && nice -n 19 ionice -c3 cargo test --locked -j 2` | 12 | 0 |
+
+Toolchain `1.83`.
+
+### OUVERT
+
+1. **Mesure prod réelle** : le gain fixture (-8 %) sous-estime le gain prod (facteur 20× events + IE lourdes). ANR1 à rejouer sur copie physique du stock pour chiffrer le gain phase 07 réel et confirmer la cible 900 MB.
+2. **Parse streaming sans `Value` intermédiaire** : refactor plus lourd, hors scope de ce sprint. Potentiel `-20 %` supplémentaire sur phase 00c.
+3. **Interning des champs répétitifs** (`interface`, `protocol`, noms d'identifiants STABLE) : `-10 à -15 %` estimé, refactor à prévoir.
+
+### Numérotation
+
+- `session-engine` 0.5.23 → **0.5.24** (patch, correctif mémoire).
+- `oiran-api` 2.21.59 → **2.21.60** (patch, agrégat).
+- Une version SemVer par commit (règle version-par-commit).
+
 ## OIRAN API 2.21.59 + live-probe 0.6.23 — 2026-11-18 — fusion du lot du soir (un seul déploiement)
 
 Upgrade **patch**. Fusion, sans changement de logique, de trois lots relus :
