@@ -2214,6 +2214,7 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
         "sbi_unattached_ambiguous".into(),
         sbi_counters.unattached_ambiguous,
     );
+    event_accounting.insert("sbi_unattached_no_key".into(), sbi_counters.unattached_no_key);
     event_accounting.insert(
         "duplicate_observations".into(),
         duplicate_observations.len(),
@@ -2294,6 +2295,10 @@ struct SbiAttachCounters {
     by_exact_key: usize,
     by_time_window: usize,
     unattached_ambiguous: usize,
+    /// 2.21.57 — SBI sans aucune clé (ni pseudonyme, ni PDU, ni tunnel) :
+    /// jamais rattachables, désormais comptés pour que la somme des quatre
+    /// compteurs égale le nombre total de SBI (comparaison entre versions).
+    unattached_no_key: usize,
 }
 
 /// 2.21.49 — marge autour de la vie d'une session pour le rattachement
@@ -2522,6 +2527,7 @@ fn attach_sbi_to_sessions(
         // de capture), parmi les seules sessions candidates par clé ; une
         // seule session dans la fenêtre, sinon non rattaché (fail-closed).
         let mut key_candidates: Option<BTreeSet<usize>> = None;
+        let mut had_tunnel_key = false;
         if let (Some(pseudo), Some(pdu_id)) = (&pseudo, &pdu_id) {
             if let Some(indices) = pseudo_pdu.get(&(pseudo.clone(), pdu_id.clone())) {
                 key_candidates = Some(indices.clone());
@@ -2535,6 +2541,7 @@ fn attach_sbi_to_sessions(
                 .first_identifier("gtp_teid")
                 .and_then(event_schema::normalize_teid_hex);
             if let (Some(ip), Some(teid)) = (ip, teid) {
+                had_tunnel_key = true;
                 if let Some(indices) = tunnel_idx.get(&(ip, teid)) {
                     key_candidates = Some(match key_candidates {
                         Some(previous) if indices.len() != 1 => {
@@ -2590,8 +2597,10 @@ fn attach_sbi_to_sessions(
                     method_time_window = true;
                     inside.into_iter().collect()
                 } else {
-                    if pseudo.is_some() || pdu_id.is_some() {
+                    if pseudo.is_some() || pdu_id.is_some() || had_tunnel_key {
                         counters.unattached_ambiguous += 1;
+                    } else {
+                        counters.unattached_no_key += 1;
                     }
                     Vec::new()
                 }
@@ -5594,6 +5603,7 @@ mod tests {
             5_000,
             23,
         ));
+        events.push(sbi("evt-sbi-nokey", "NFHeartbeat", &[], 2_003, 24));
         let discovery = discover_sessions(&mut events.clone());
         assert_eq!(discovery.pdu_sessions.len(), 2);
         let session_of = |needle: &str| {
@@ -5618,6 +5628,19 @@ mod tests {
         assert_eq!(b.sbi_time_window_event_ids.len(), 3, "rattachement marqué fenêtre");
         assert_eq!(discovery.event_accounting["sbi_attached_time_window"], 3);
         assert_eq!(discovery.event_accounting["sbi_unattached_ambiguous"], 1);
+        assert_eq!(discovery.event_accounting["sbi_unattached_no_key"], 1);
+        assert!(session_of("evt-sbi-nokey").is_empty());
+        // Somme des quatre compteurs = nombre de SBI.
+        let total: usize = [
+            "sbi_attached_exact_key",
+            "sbi_attached_time_window",
+            "sbi_unattached_ambiguous",
+            "sbi_unattached_no_key",
+        ]
+        .iter()
+        .map(|k| discovery.event_accounting[*k])
+        .sum();
+        assert_eq!(total, events.iter().filter(|e| protocol_is(e, "SBI-HTTP2")).count());
     }
 
     /// 2.21.51 — `(pseudonyme, PDU)` doit être une clé exacte même quand

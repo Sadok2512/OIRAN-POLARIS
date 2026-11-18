@@ -1,5 +1,15 @@
 # Changelog
 
+## OIRAN API 2.21.57 + session-engine 0.5.23 — 2026-11-18 — comptabilité SBI complète
+
+Upgrade **patch**, sur 2.21.55 (`b94e84d`, jamais tagguée). 2.21.56 réservée à ANR1 (filtre).
+
+Constat ANR2 (#10 6989585318) : avec 2.21.55, `time_window` passe de 1504 à 4567 (+3063 SBI rattachés, 10/10 B1 dans la bonne session, essai 7 et anti-sur-rattachement PASS), mais `sbi_unattached_ambiguous` passe de 1889 à 4802. Raison : un SBI sans pseudonyme ni PDU n'était compté **nulle part**. En 2.21.55, ceux dont l'URI porte le pseudonyme deviennent comptables. Ce compteur seul ne pouvait donc pas servir de gate entre versions.
+- Nouveau compteur `sbi_unattached_no_key` (ni pseudonyme, ni PDU, ni tunnel). Un SBI avec seulement un tunnel inconnu est compté ambigu.
+- Les quatre compteurs couvrent chaque SBI parcouru par le rattachement : la somme est comparable d'une version à l'autre.
+- Aucune règle de rattachement modifiée.
+- Test : la somme des quatre compteurs égale le nombre de SBI de la fixture.
+
 ## OIRAN API 2.21.55 + session-engine 0.5.22 — 2026-11-18 — pseudonyme SBI relu dans l'URI sanitisée
 
 Upgrade **patch**, basé sur 2.21.51 (`a33bb6a`, production). 2.21.52 (ANR1, filtre) et 2.21.53/54 (DEVMAT, HPACK) sont des lots séparés.
