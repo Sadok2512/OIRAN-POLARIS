@@ -1,5 +1,13 @@
 # Changelog
 
+## OIRAN API 2.21.52 — 2026-11-18 — fenêtre sessions indexée, sans relecture des callflows
+
+- `SessionFilterIndex` conserve désormais les bornes temporelles fermées de chaque session pendant sa construction.
+- `POST /api/v1/sessions/filter` applique `time_window` depuis ces bornes en O(1) par session et ne recharge aucun callflow pour une requête fenêtre seule, y compris avec `limit: 0`.
+- Les filtres étendus qui ne dépendent pas du résumé construisent désormais les résumés uniquement pour la page servie.
+- Le garde mémoire existant reste strict : pendant une publication, la route répond immédiatement `503 HEAVY_WORK_IN_PROGRESS` avec `Retry-After` au lieu d'attendre ou d'expirer.
+- Tests : équivalence du résultat, bornes inclusives et garde de mutation qui devient rouge si une résolution de flow par session est réintroduite.
+
 ## OIRAN API 2.21.51 + session-engine 0.5.21 — 2026-11-18 — clés exactes SBI réellement disponibles
 
 Upgrade **patch**, basé sur 2.21.49 (`0d2e8b2`, production). 2.21.50 (`/sessions/filter`, ANR1) en échec de gate prod, non fusionnée ici.

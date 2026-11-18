@@ -162,6 +162,8 @@ struct Inner {
     identity_cache: std::sync::Mutex<BTreeMap<String, IdentityCacheEntry>>,
     #[cfg(test)]
     filter_summary_resolutions: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    filter_flow_resolutions: std::sync::atomic::AtomicUsize,
 }
 
 /// 2.21.11 — entrée de cache + clé composite pour `/sessions/catalog`.
@@ -750,6 +752,8 @@ impl AppState {
                 identity_cache: std::sync::Mutex::new(BTreeMap::new()),
                 #[cfg(test)]
                 filter_summary_resolutions: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                filter_flow_resolutions: std::sync::atomic::AtomicUsize::new(0),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -839,6 +843,8 @@ impl AppState {
                 identity_cache: std::sync::Mutex::new(BTreeMap::new()),
                 #[cfg(test)]
                 filter_summary_resolutions: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                filter_flow_resolutions: std::sync::atomic::AtomicUsize::new(0),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -4510,6 +4516,15 @@ fn sessions_filter_blocking(
         || run_id_filter.is_some()
         || free_text_search.is_some()
         || search_pseudonym.is_some();
+    let needs_flow_for_match = !criteria.is_empty()
+        || !network_elements_scope.is_empty()
+        || run_id_filter.is_some()
+        || free_text_search.is_some()
+        || search_pseudonym.is_some();
+    let needs_summary_for_match = !technologies.is_empty()
+        || !dataset_kinds.is_empty()
+        || !states.is_empty()
+        || !correlation_statuses.is_empty();
     let has_extended_filter = !technologies.is_empty()
         || !dataset_kinds.is_empty()
         || !states.is_empty()
@@ -4577,68 +4592,71 @@ fn sessions_filter_blocking(
 
     // 2.19.0/2.19.1 — si extended filters présents, on filtre puis on
     // re-trie par clé canonique conservée dans matching_keys (jamais par
-    // ts). 2.21.50 : le prédicat `time_window`, qui ne dépend que du
-    // callflow, passe AVANT `resolve_summary`. L'ancien ordre construisait
-    // la ligne complète de TOUTES les sessions (patch read-time + identités,
-    // avec hydratations tshark en arrière-plan), puis rejetait presque tout.
-    // La logique du prédicat et l'ordre de sortie restent identiques.
+    // ts). 2.21.52 : le prédicat `time_window` lit les bornes déjà calculées
+    // dans `SessionFilterIndex`, avant toute résolution de callflow ou de
+    // summary. L'ordre canonique de sortie reste identique.
     let mut matched_hits_by_session: BTreeMap<String, Vec<session_catalog::CriterionHit>> =
         BTreeMap::new();
     let (effective_sorted_ids, prebuilt_items): (Vec<String>, Option<BTreeMap<String, Value>>) =
         if has_extended_filter {
             let mut built: BTreeMap<String, Value> = BTreeMap::new();
+            let mut matching_extended = Vec::new();
             for session_id in &sorted_ids {
-                let flow_for_match: Option<&CallFlow> = if has_2191_filter {
+                // 2.21.52 : la fenêtre lit les bornes de l'index. Aucun
+                // callflow n'est relu pour ce prédicat, y compris sur
+                // `limit=0` (aperçu exact).
+                if from_ns.is_some() || to_ns.is_some() {
+                    let overlaps = state
+                        .inner
+                        .session_filter_index
+                        .read()
+                        .expect("session_filter_index poisoned")
+                        .overlaps_time_window(session_id, from_ns, to_ns);
+                    if !overlaps {
+                        continue;
+                    }
+                }
+                #[cfg(test)]
+                if needs_flow_for_match {
+                    state
+                        .inner
+                        .filter_flow_resolutions
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let flow_for_match: Option<&CallFlow> = if needs_flow_for_match {
                     state.inner.flows.get(session_id)
                 } else {
                     None
                 };
-                let owned_live_flow: Option<CallFlow> = if has_2191_filter && flow_for_match.is_none() {
-                    live_flow_for(&state, session_id).map(|(_, flow)| flow)
-                } else {
-                    None
-                };
+                let owned_live_flow: Option<CallFlow> =
+                    if needs_flow_for_match && flow_for_match.is_none() {
+                        live_flow_for(&state, session_id).map(|(_, flow)| flow)
+                    } else {
+                        None
+                    };
                 let events_ref: &[callflow_schema::CallFlowEvent] =
                     match (flow_for_match, &owned_live_flow) {
                         (Some(f), _) => f.events.as_slice(),
                         (None, Some(f)) => f.events.as_slice(),
                         _ => &[],
                     };
-                // 2.21.50 : élimine les sessions hors fenêtre avant la
-                // construction coûteuse du summary.
-                if from_ns.is_some() || to_ns.is_some() {
-                    let has_event_in_window = events_ref.iter().any(|event| {
-                        let Some(ts) = event.timestamp_ns.parse::<i128>().ok() else {
-                            return false;
-                        };
-                        if let Some(f) = from_ns {
-                            if ts < f {
-                                return false;
-                            }
-                        }
-                        if let Some(t) = to_ns {
-                            if ts > t {
-                                return false;
-                            }
-                        }
-                        true
-                    });
-                    if !has_event_in_window {
+                let summary = if needs_summary_for_match {
+                    let Some(summary) = resolve_summary(session_id) else {
+                        continue;
+                    };
+                    if !passes_extended_filter(
+                        &summary,
+                        &technologies,
+                        &dataset_kinds,
+                        &states,
+                        &correlation_statuses,
+                    ) {
                         continue;
                     }
-                }
-                let Some(summary) = resolve_summary(session_id) else {
-                    continue;
+                    Some(summary)
+                } else {
+                    None
                 };
-                if !passes_extended_filter(
-                    &summary,
-                    &technologies,
-                    &dataset_kinds,
-                    &states,
-                    &correlation_statuses,
-                ) {
-                    continue;
-                }
                 // 2.19.1 — filtres protocolaires + time window +
                 // run_id + search + network_elements. Besoin des
                 // events du flow pour matcher criteria/search.
@@ -4708,14 +4726,20 @@ fn sessions_filter_blocking(
                 if !hits.is_empty() {
                     matched_hits_by_session.insert(session_id.clone(), hits);
                 }
-                built.insert(session_id.clone(), summary);
+                matching_extended.push(session_id.clone());
+                if let Some(summary) = summary {
+                    built.insert(session_id.clone(), summary);
+                }
             }
-            let mut rows: Vec<(String, (String, u64, String))> = built
-                .keys()
+            let mut rows: Vec<(String, (String, u64, String))> = matching_extended
+                .iter()
                 .filter_map(|id| matching_keys.get(id).map(|k| (id.clone(), k.clone())))
                 .collect();
             rows.sort_by(|a, b| a.1.cmp(&b.1));
-            (rows.into_iter().map(|(id, _)| id).collect(), Some(built))
+            (
+                rows.into_iter().map(|(id, _)| id).collect(),
+                needs_summary_for_match.then_some(built),
+            )
         } else {
             (sorted_ids.clone(), None)
         };
@@ -12671,6 +12695,10 @@ mod tests {
             .inner
             .filter_summary_resolutions
             .store(0, Ordering::SeqCst);
+        state
+            .inner
+            .filter_flow_resolutions
+            .store(0, Ordering::SeqCst);
         let (status, body) = post_sessions_filter(
             &state,
             json!({
@@ -12694,10 +12722,19 @@ mod tests {
             actual, expected,
             "time-window result changed from fixture reference"
         );
+        assert_eq!(
+            state.inner.filter_flow_resolutions.load(Ordering::SeqCst),
+            0,
+            "time-window-only filtering must not resolve any callflow"
+        );
 
         state
             .inner
             .filter_summary_resolutions
+            .store(0, Ordering::SeqCst);
+        state
+            .inner
+            .filter_flow_resolutions
             .store(0, Ordering::SeqCst);
         let (status, outside) = post_sessions_filter(
             &state,
@@ -12720,6 +12757,11 @@ mod tests {
                 .load(Ordering::SeqCst),
             0,
             "out-of-window sessions must be rejected before summary construction"
+        );
+        assert_eq!(
+            state.inner.filter_flow_resolutions.load(Ordering::SeqCst),
+            0,
+            "mutation guard: restoring per-session flow resolution must make this assertion red"
         );
     }
 
