@@ -12,7 +12,8 @@ use decoder_ngap::NgapDecoder;
 use decoder_pfcp::PfcpDecoder;
 use decoder_rtp::RtpFlowAggregator;
 use decoder_s1ap::S1apDecoder;
-use decoder_sbi::{decode_connections, SbiDecodeReport};
+use decoder_sbi::{decode_connections, decode_connections_with_carry, SbiDecodeReport};
+pub use decoder_sbi::{SbiCarryContext, SbiCarryMetrics, DEFAULT_HPACK_CARRY_MAX_CONNECTIONS};
 use decoder_sip::{SipDecoder, SIP_DEFAULT_PORT};
 use event_schema::{sha256_hex, Endpoint, NormalizedEvent, PacketReference, PseudonymKey};
 use plugin_runtime::{DecoderInput, ProtocolDecoder};
@@ -153,10 +154,15 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
     // the mission mandates for a fresh import.
     let pseudonym_key = PseudonymKey::generate()?;
     let mut events = Vec::new();
-    let report = decode_capture_streaming(config, &pseudonym_key, |event| {
-        events.push(event);
-        Ok(())
-    })?;
+    let report = decode_capture_streaming_with_sbi_carry(
+        config,
+        &pseudonym_key,
+        None,
+        |event| {
+            events.push(event);
+            Ok(())
+        },
+    )?;
     // 2.7.13: canonical processing order is (capture_id, seq, event_id).
     // The timestamp never participates in a processing sort — it may only
     // be used as presentation when rendering the call-flow ladder in
@@ -188,6 +194,23 @@ pub fn decode_capture(config: &DecodeConfig) -> Result<DecodeOutput, String> {
 pub fn decode_capture_streaming<F>(
     config: &DecodeConfig,
     pseudonym_key: &PseudonymKey,
+    sink: F,
+) -> Result<DecodeReport, String>
+where
+    F: FnMut(NormalizedEvent) -> Result<(), String>,
+{
+    decode_capture_streaming_with_sbi_carry(config, pseudonym_key, None, sink)
+}
+
+/// 2.21.46 (ordre #9 6977819264) — variante qui accepte un carry
+/// HPACK persistant entre segments pcap consécutifs. Si
+/// `sbi_carry.is_some()` et que `config.interface == "SBI"`, la
+/// table dynamique HPACK est préservée pour chaque connexion TCP
+/// déjà vue dans un segment précédent.
+pub fn decode_capture_streaming_with_sbi_carry<F>(
+    config: &DecodeConfig,
+    pseudonym_key: &PseudonymKey,
+    mut sbi_carry: Option<&mut SbiCarryContext>,
     mut sink: F,
 ) -> Result<DecodeReport, String>
 where
@@ -347,6 +370,7 @@ where
                     finalized,
                     config,
                     &pseudonym_key,
+                    sbi_carry.as_deref_mut(),
                     &mut sink,
                     &mut event_count,
                     &mut sink_error,
@@ -396,6 +420,7 @@ where
             connections,
             config,
             &pseudonym_key,
+            sbi_carry.as_deref_mut(),
             &mut sink,
             &mut event_count,
             &mut sink_error,
@@ -460,6 +485,7 @@ fn emit_sbi_connections<F>(
     connections: Vec<transport_tcp::ReassembledConnection>,
     config: &DecodeConfig,
     pseudonym_key: &PseudonymKey,
+    mut sbi_carry: Option<&mut SbiCarryContext>,
     sink: &mut F,
     event_count: &mut usize,
     sink_error: &mut Option<String>,
@@ -471,13 +497,23 @@ fn emit_sbi_connections<F>(
         if sink_error.is_some() {
             return;
         }
-        let (events, report) = decode_connections(
-            std::slice::from_ref(&connection),
-            &config.capture_id,
-            &config.interface,
-            &config.endpoints,
-            pseudonym_key,
-        );
+        let (events, report) = match sbi_carry.as_deref_mut() {
+            Some(carry) => decode_connections_with_carry(
+                std::slice::from_ref(&connection),
+                &config.capture_id,
+                &config.interface,
+                &config.endpoints,
+                pseudonym_key,
+                carry,
+            ),
+            None => decode_connections(
+                std::slice::from_ref(&connection),
+                &config.capture_id,
+                &config.interface,
+                &config.endpoints,
+                pseudonym_key,
+            ),
+        };
         aggregate.tcp_connections += report.tcp_connections;
         aggregate.http2_frames += report.http2_frames;
         aggregate.http2_streams += report.http2_streams;

@@ -31,7 +31,9 @@ use event_schema::{
     sha256_hex, DecodeStatus, EvidenceReference, EvidenceState, InformationElement, NamedValue,
     NormalizedEvent, Protocol, PseudonymKey, Sha256Hasher,
 };
-use oiran_decode::{decode_capture_streaming, DecodeConfig, DecodeReport};
+use oiran_decode::{
+    decode_capture_streaming, decode_capture_streaming_with_sbi_carry, DecodeConfig, DecodeReport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use session_engine::{
@@ -1715,6 +1717,27 @@ pub struct CaptureManager {
     /// puisse faire varier le disque PENDANT que le worker continu tourne.
     disk_sample_override_for_tests:
         Arc<Mutex<Option<Result<disk_safety::FilesystemSample, String>>>>,
+    /// 2.21.48 (ordre #9 6977819264 + 6980189831 — révision 2.21.46
+    /// refusée pour tri par checksum). Carry HPACK par connexion TCP
+    /// pour chaque interface SBI, conservé **entre cycles** de
+    /// publication (une connexion NRF dure des heures, un cycle ingère
+    /// ~4 segments). Borné à `DEFAULT_HPACK_CARRY_MAX_CONNECTIONS = 256`
+    /// (≤ 4 MiB au pire). Métriques (`connections_tracked`,
+    /// `connections_resumed`, `connections_evicted`, `invalidations`)
+    /// exposables via `/health`. Vide à la création ; invalidé
+    /// (fail-closed) à chaque discontinuité du ring.
+    sbi_hpack_carry_by_interface:
+        Arc<Mutex<BTreeMap<String, oiran_decode::SbiCarryContext>>>,
+    /// 2.21.48 — dernière position **dans `state.seen_order`** du
+    /// segment traité par interface. Un segment n'est admis en carry
+    /// que si sa position = `last + 1` (continuité stricte du ring
+    /// dumpcap). `seen_order` est peuplé par `remember_checksum`
+    /// (`live-probe/src/lib.rs::remember_checksum`), donc son ordre
+    /// est celui de l'ingestion, **jamais** celui du checksum ni du
+    /// `ts`. Toute discontinuité (trou, échec, redémarrage ou
+    /// simple absence d'historique) ⇒ `carry.invalidate_all()`.
+    sbi_hpack_last_seen_order_pos_by_interface:
+        Arc<Mutex<BTreeMap<String, usize>>>,
 }
 
 /// 0.6.10 (ordre #9 6952054201) — clé d'identité d'un segment
@@ -1988,6 +2011,8 @@ impl CaptureManager {
             quarantined_segments: Arc::new(Mutex::new(quarantined_segments)),
             pseudonym_key: Arc::new(pseudonym_key),
             interface_probe,
+            sbi_hpack_carry_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
+            sbi_hpack_last_seen_order_pos_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
             // 2.14.11 (ANR1 #10 6860508699) — override test-only par
             // défaut à `None` (production). Les tests internes
             // live-probe installent une valeur permissive via
@@ -5936,10 +5961,56 @@ impl CaptureManager {
         // `LiveDataset.zero_event_captures`.
         let mut zero_event_captures: Vec<String> = Vec::new();
         let endpoints = endpoint_map();
+        // 2.21.48 (ordre #9 6980189831) — l'ordre canonique du ring
+        // dumpcap est **`state.seen_order`** (VecDeque<String>
+        // alimentée par `remember_checksum` au moment où le segment
+        // est ingéré, cf. live-probe/src/lib.rs::remember_checksum
+        // ≈ L8748). Il reflète la **séquence d'arrivée** des
+        // segments du ring. **Jamais** le checksum (16 premiers
+        // hex sont la clé du nom, donc `files.sort()` trie par
+        // hash — ordre arbitraire et non-reproductible d'un
+        // segment à l'autre) et **jamais** le `ts`. L'état est
+        // chargé ici en lecture seule depuis `import_state.json`
+        // à côté du dataset courant.
+        let import_state_path: Option<PathBuf> = dataset_dir
+            .parent()
+            .map(|p| p.join("import_state.json"));
+        let import_state: ContinuousImportState = match &import_state_path {
+            Some(path) if path.is_file() => fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default(),
+            _ => ContinuousImportState::default(),
+        };
         for interface in interfaces {
-            let mut files = capture_files_for(pcap_dir, &interface.interface);
-            files.sort();
-            for path in files {
+            // 2.21.48 — pour les interfaces porteuses de HPACK (`SBI`
+            // en priorité), construire la séquence des segments
+            // **dans l'ordre d'ingestion du ring** (`seen_order`,
+            // filtré par interface). Pour les autres interfaces, le
+            // tri de `capture_files_for()` reste acceptable (aucun
+            // décodage stateful inter-segment). Seuls les segments
+            // physiquement présents sur disque sont retenus ; une
+            // entrée `seen_order` dont le fichier a disparu
+            // (nettoyage ring) est ignorée.
+            // `(Option<pos_dans_seen_order>, path)` ; `pos` est posée
+            // uniquement pour SBI (le carry HPACK en dépend). Les
+            // autres interfaces gardent un tri lexicographique sans
+            // impact fonctionnel (aucun état inter-segment).
+            let files: Vec<(Option<usize>, PathBuf)> = if interface.interface == "SBI" {
+                ring_ordered_segments_for_interface(
+                    &import_state,
+                    pcap_dir,
+                    &interface.interface,
+                )
+                .into_iter()
+                .map(|(pos, _sha, path)| (Some(pos), path))
+                .collect()
+            } else {
+                let mut files = capture_files_for(pcap_dir, &interface.interface);
+                files.sort();
+                files.into_iter().map(|p| (None, p)).collect()
+            };
+            for (seen_order_pos, path) in files {
                 if selected_files.is_some_and(|selected| !selected.contains(&path)) {
                     continue;
                 }
@@ -6002,15 +6073,44 @@ impl CaptureManager {
                 // ses events partiels sont retirés du spool, l'échec est
                 // journalisé, et la suite (autres segments, phase vTAP) tourne.
                 let spool_mark = decoded_spool_mark(&mut decoded_spool)?;
-                let decode_outcome = decode_capture_streaming(
-                    &DecodeConfig {
+                // 2.21.48 (ordre #9 6980189831) — pour SBI, vérifier
+                // la continuité stricte N → N+1 dans `seen_order`
+                // AVANT d'appliquer le carry. Si discontigu
+                // (segment manquant, quarantaine, redémarrage, saut
+                // cycle), invalider tout le carry pour cette
+                // interface : fail-closed, aucun indexed HPACK n'est
+                // décodé depuis une table dynamique obsolète.
+                let is_sbi = interface.interface == "SBI";
+                if is_sbi {
+                    if let Some(current_pos) = seen_order_pos {
+                        let last_pos_opt = self
+                            .sbi_hpack_last_seen_order_pos_by_interface
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .get(&interface.interface)
+                            .copied();
+                        if !hpack_carry_is_contiguous(last_pos_opt, current_pos) {
+                            let mut carries = self
+                                .sbi_hpack_carry_by_interface
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let carry = carries.entry(interface.interface.clone()).or_insert_with(|| {
+                                oiran_decode::SbiCarryContext::new(
+                                    oiran_decode::DEFAULT_HPACK_CARRY_MAX_CONNECTIONS,
+                                )
+                            });
+                            carry.invalidate_all();
+                        }
+                    }
+                }
+                let decode_outcome = {
+                    let config = DecodeConfig {
                         input: path.clone(),
                         capture_id: capture_hash,
                         interface: interface.interface.clone(),
                         endpoints: endpoints.clone(),
-                    },
-                    &pseudonym_key,
-                    |event| {
+                    };
+                    let mut sink = |event: NormalizedEvent| -> Result<(), String> {
                         // 2.9.5 (devmat #9 T1) : les keepalives (PFCP HB,
                         // Diameter Device-Watchdog, GTPv2 Echo, GTP-U Echo)
                         // sont toujours agrégés par (interface, paire de
@@ -6028,15 +6128,68 @@ impl CaptureManager {
                             .write_all(event.to_json_with_probe(&probe_stamp).as_bytes())
                             .and_then(|_| decoded_spool.write_all(b"\n"))
                             .map_err(display_error)
-                    },
-                );
+                    };
+                    if is_sbi {
+                        let mut carries = self
+                            .sbi_hpack_carry_by_interface
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let carry = carries.entry(interface.interface.clone()).or_insert_with(|| {
+                            oiran_decode::SbiCarryContext::new(
+                                oiran_decode::DEFAULT_HPACK_CARRY_MAX_CONNECTIONS,
+                            )
+                        });
+                        decode_capture_streaming_with_sbi_carry(
+                            &config,
+                            &pseudonym_key,
+                            Some(carry),
+                            sink,
+                        )
+                    } else {
+                        decode_capture_streaming(&config, &pseudonym_key, sink)
+                    }
+                };
                 let mut report = match decode_outcome {
-                    Ok(report) => report,
+                    Ok(report) => {
+                        // 2.21.48 — le décodage a réussi : enregistrer
+                        // la position de ce segment pour l'interface,
+                        // afin que la continuité stricte N → N+1 soit
+                        // vérifiée au segment suivant.
+                        if is_sbi {
+                            if let Some(current_pos) = seen_order_pos {
+                                self.sbi_hpack_last_seen_order_pos_by_interface
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert(interface.interface.clone(), current_pos);
+                            }
+                        }
+                        report
+                    }
                     // Capture ponctuelle : contrat inchangé, une erreur de
                     // décodage n'enregistre ni ne finalise le dataset.
                     Err(error) if capture_id != CONTINUOUS_CAPTURE_ID => return Err(error),
                     Err(error) => {
                         decoded_spool_rewind(&mut decoded_spool, spool_mark)?;
+                        // 2.21.48 — fail-closed : un segment en échec
+                        // casse la continuité TCP, les tables HPACK
+                        // de l'interface SBI ne reflètent plus la
+                        // réalité. Invalider et NE PAS mettre à jour
+                        // `last_pos` (le segment suivant sera donc
+                        // vu discontinu et ré-invalidera).
+                        if is_sbi {
+                            let mut carries = self
+                                .sbi_hpack_carry_by_interface
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let carry = carries
+                                .entry(interface.interface.clone())
+                                .or_insert_with(|| {
+                                    oiran_decode::SbiCarryContext::new(
+                                        oiran_decode::DEFAULT_HPACK_CARRY_MAX_CONNECTIONS,
+                                    )
+                                });
+                            carry.invalidate_all();
+                        }
                         let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                         let path_display = path.display().to_string();
                         let first_report = self
@@ -8743,6 +8896,47 @@ fn native_segment_source(root: &Path, path: &Path) -> bool {
         .and_then(|relative| relative.components().next())
         .and_then(|component| component.as_os_str().to_str())
         .is_some_and(|name| name.starts_with("continuous-segment-"))
+}
+
+/// 2.21.48 (ordre #9 6980189831) — l'ordre canonique du ring
+/// dumpcap, filtré pour une interface. Source d'ordre = **position
+/// dans `state.seen_order`** (poussée par `remember_checksum` au
+/// moment de l'ingestion, séquence réelle d'arrivée). L'interface
+/// est lue dans `state.segments[sha256].interface`. Les segments
+/// dont le fichier `owned_file` a disparu de `pcap_dir` sont
+/// ignorés (nettoyage ring). Retourne `(pos, sha256, chemin)` dans
+/// l'ordre du ring, **jamais** trié par checksum ni par `ts`.
+pub fn ring_ordered_segments_for_interface(
+    state: &ContinuousImportState,
+    pcap_dir: &Path,
+    interface: &str,
+) -> Vec<(usize, String, PathBuf)> {
+    let mut out = Vec::new();
+    for (pos, sha) in state.seen_order.iter().enumerate() {
+        let Some(segment) = state.segments.get(sha) else {
+            continue;
+        };
+        if segment.interface != interface {
+            continue;
+        }
+        let path = pcap_dir.join(&segment.owned_file);
+        if path.is_file() {
+            out.push((pos, sha.clone(), path));
+        }
+    }
+    out
+}
+
+/// 2.21.48 (ordre #9 6980189831) — un segment n'est admis dans le
+/// carry HPACK que si sa position dans `seen_order` est **exactement**
+/// `last + 1`. Cas qui échouent (fail-closed) :
+///   * `last_pos = None` : première rencontre après démarrage ou
+///     après `invalidate_all` ; aucun état à continuer.
+///   * `current_pos != last_pos + 1` : trou (segment perdu/quarantiné),
+///     réordonnancement, ou saut de cycle qui a sauté un segment.
+/// Jamais d'approximation : égalité stricte.
+pub fn hpack_carry_is_contiguous(last_pos: Option<usize>, current_pos: usize) -> bool {
+    matches!(last_pos, Some(last) if current_pos == last + 1)
 }
 
 fn remember_checksum(state: &mut ContinuousImportState, checksum: String) {
@@ -19276,5 +19470,191 @@ mod tests {
             Some(v) => std::env::set_var("OIRAN_IMS_BRIDGE_DEVICE", v),
             None => std::env::remove_var("OIRAN_IMS_BRIDGE_DEVICE"),
         }
+    }
+
+    // --- 2.21.48 (ordre #9 6980189831) HPACK carry : continuité du
+    // ring et persistance inter-cycles ----------------------------
+
+    fn imported_segment_for_test(
+        interface: &str,
+        source_path: &str,
+        owned_file: &str,
+    ) -> ImportedSegment {
+        ImportedSegment {
+            interface: interface.to_string(),
+            owned_file: owned_file.to_string(),
+            size_bytes: 1024,
+            packets: 1,
+            imported_epoch_ms: 1,
+            source_path: source_path.to_string(),
+            historical_context: false,
+        }
+    }
+
+    /// 2.21.48 test (a) — continuité stricte N → N+1 : si le dernier
+    /// segment décodé portait la position `N` dans `seen_order`, le
+    /// segment courant à la position `N+1` est **contigu** et le
+    /// carry HPACK est applicable (le worker continu ne l'invalidera
+    /// pas). Preuve de mutation : si la condition était « différence
+    /// ≤ 1 » au lieu d'égalité stricte, le test ferait aussi passer
+    /// `N` (déjà vu) ou `N-1` (ordre inversé) ; ici seul `N+1` est
+    /// accepté.
+    #[test]
+    fn hpack_carry_is_contiguous_accepts_n_plus_one_only() {
+        assert!(hpack_carry_is_contiguous(Some(5), 6));
+        assert!(hpack_carry_is_contiguous(Some(0), 1));
+        // Preuve de mutation : tout autre delta doit échouer.
+        assert!(!hpack_carry_is_contiguous(Some(5), 5));
+        assert!(!hpack_carry_is_contiguous(Some(5), 4));
+        assert!(!hpack_carry_is_contiguous(Some(5), 7));
+    }
+
+    /// 2.21.48 test (b) — trou dans le ring : segment N puis segment
+    /// N+2 (le N+1 est manquant/quarantiné/en échec) → le carry
+    /// n'est **pas** applicable, le worker doit `invalidate_all` et
+    /// le segment suivant retombe en `HPACK_CONTEXT_UNAVAILABLE`.
+    #[test]
+    fn hpack_carry_is_not_contiguous_when_gap_in_ring() {
+        // Trou : N puis N+2.
+        assert!(!hpack_carry_is_contiguous(Some(10), 12));
+        // Premier démarrage (aucun historique) → fail-closed aussi.
+        assert!(!hpack_carry_is_contiguous(None, 0));
+        assert!(!hpack_carry_is_contiguous(None, 42));
+    }
+
+    /// 2.21.48 test (c) — PREUVE DE MUTATION : les segments sont
+    /// retournés **dans l'ordre d'ingestion** (`seen_order`), jamais
+    /// dans l'ordre de leurs empreintes. Setup : deux segments de
+    /// l'interface `SBI` dont les sha16 sont choisis pour que le
+    /// tri lexicographique (`files.sort()`) donne B avant A, alors
+    /// que le ring a ingéré A avant B. Un ancien code
+    /// (`files.sort()` sur les noms `{iface}.pcap-{sha16}.{ext}`)
+    /// présenterait B puis A — on prouverait ainsi un **ordre de
+    /// décodage faux**. Ce test exige l'inverse : A (ingéré en 1er)
+    /// doit précéder B, peu importe la valeur alphabétique du sha.
+    #[test]
+    fn ring_ordered_segments_follow_seen_order_not_checksum() {
+        let dir = temporary_root("ring-order-vs-checksum");
+        let pcap_dir = dir.join("pcap");
+        fs::create_dir_all(&pcap_dir).unwrap();
+        // sha_a < sha_b lexicographiquement MAIS sha_a est ingéré
+        // APRÈS sha_b dans le ring (`seen_order = [sha_b, sha_a]`).
+        let sha_a =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let sha_b =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
+        let file_a = format!("SBI.pcap-{}.pcapng", &sha_a[..16]);
+        let file_b = format!("SBI.pcap-{}.pcapng", &sha_b[..16]);
+        // Les fichiers doivent exister sur disque (filtre dans
+        // `ring_ordered_segments_for_interface`).
+        fs::write(pcap_dir.join(&file_a), b"\0").unwrap();
+        fs::write(pcap_dir.join(&file_b), b"\0").unwrap();
+
+        let mut state = ContinuousImportState::default();
+        // Ring : B ingéré en 1er, A en 2e.
+        state.seen_order.push_back(sha_b.clone());
+        state.seen_order.push_back(sha_a.clone());
+        state
+            .segments
+            .insert(sha_b.clone(), imported_segment_for_test("SBI", "src-b", &file_b));
+        state
+            .segments
+            .insert(sha_a.clone(), imported_segment_for_test("SBI", "src-a", &file_a));
+
+        let ordered = ring_ordered_segments_for_interface(&state, &pcap_dir, "SBI");
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].1, sha_b, "sha_b (ingéré en 1er) doit venir en 1er");
+        assert_eq!(ordered[1].1, sha_a, "sha_a (ingéré en 2e) doit venir en 2e");
+        // Preuve de mutation : un `files.sort()` sur les noms de
+        // fichiers aurait ordonné sha_a d'abord (16 fois 'a') alors
+        // que le ring dit l'inverse.
+        let mut by_checksum = vec![file_a.clone(), file_b.clone()];
+        by_checksum.sort();
+        assert_eq!(
+            by_checksum,
+            vec![file_a.clone(), file_b.clone()],
+            "le tri par nom donne {} < {} — différent du ring",
+            file_a,
+            file_b
+        );
+        let ring_names: Vec<String> = ordered
+            .iter()
+            .map(|(_, _, p)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_ne!(
+            ring_names, by_checksum,
+            "ring et checksum DOIVENT diverger sur ce setup"
+        );
+        assert_eq!(ring_names, vec![file_b.clone(), file_a.clone()]);
+
+        // Interface autre : rien ne remonte.
+        let ordered_n2 = ring_ordered_segments_for_interface(&state, &pcap_dir, "N2");
+        assert!(ordered_n2.is_empty());
+    }
+
+    /// 2.21.48 test (d) — continuité **inter-cycles** : le carry et
+    /// la position « dernier segment traité » vivent dans le
+    /// `CaptureManager` lui-même (`Arc<Mutex<…>>`) et survivent donc
+    /// à chaque appel de `process_capture_into_selected` (un
+    /// `process_capture_into_selected` = un cycle). Un segment à la
+    /// position N au cycle 1 pose `last_pos = N` ; au cycle 2, le
+    /// segment N+1 est jugé **contigu** et le carry s'applique.
+    /// Ce test prouve la **structure** : les champs sont partagés
+    /// entre tous les appels sur le même manager.
+    #[test]
+    fn hpack_carry_state_is_shared_across_cycles_in_capture_manager() {
+        let dir = temporary_root("hpack-carry-intercycle");
+        let manager = CaptureManager::with_helper_and_interface_root(
+            dir.clone(),
+            false,
+            CaptureHelperClient::new(dir.join("helper.sock"), 0),
+            dir.clone(),
+            dir.join("pseudonym.key"),
+        )
+        .expect("manager");
+        // Cycle 1 : on simule le passage d'un segment en insérant
+        // une entrée `SbiCarryContext` pour l'interface SBI et en
+        // enregistrant sa position dans `seen_order`. Le carry
+        // (`SbiCarryContext`) est conservé vide ici (API `store`
+        // privée ; sa fonctionnalité est déjà couverte par les 3
+        // tests `hpack_carry_*` de `decoder-sbi`), mais le simple
+        // fait qu'il soit présent dans la map prouve que le cycle
+        // 2 va retrouver le même objet via `entry().or_insert_with`.
+        {
+            let mut carries = manager
+                .sbi_hpack_carry_by_interface
+                .lock()
+                .expect("carry lock");
+            carries
+                .entry("SBI".to_string())
+                .or_insert_with(|| oiran_decode::SbiCarryContext::new(16));
+        }
+        manager
+            .sbi_hpack_last_seen_order_pos_by_interface
+            .lock()
+            .expect("pos lock")
+            .insert("SBI".to_string(), 10);
+
+        // Cycle 2 : récupérer la position depuis le manager — elle
+        // doit survivre, prouvant la persistance inter-cycles.
+        let last_pos = manager
+            .sbi_hpack_last_seen_order_pos_by_interface
+            .lock()
+            .expect("pos lock")
+            .get("SBI")
+            .copied();
+        assert_eq!(last_pos, Some(10));
+        // Un segment à la position 11 est contigu.
+        assert!(hpack_carry_is_contiguous(last_pos, 11));
+        // Un segment à la position 13 est un trou.
+        assert!(!hpack_carry_is_contiguous(last_pos, 13));
+
+        // La map carry persiste aussi.
+        let carry_len = manager
+            .sbi_hpack_carry_by_interface
+            .lock()
+            .expect("carry lock")
+            .len();
+        assert_eq!(carry_len, 1, "l'entry SBI doit persister entre cycles");
     }
 }

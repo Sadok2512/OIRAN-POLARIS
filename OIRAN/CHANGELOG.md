@@ -1,5 +1,77 @@
 # Changelog
 
+## OIRAN API 2.21.48 + decoder-sbi 0.4.10 + oiran-decode 0.8.1 + live-probe 0.6.20 — 2026-11-18 — carry HPACK par connexion TCP, ordre canonique du ring, continuité inter-cycles (ordre #9 6980189831)
+
+Révision de la **2.21.46 refusée** (ordre #9 6980189831). Base `a33bb6a` (2.21.51 d'ANR1), nouvelle branche `fix/oiran-2.21.48-hpack-carry-ordered`, pas de force-push, aucun geste lab.
+
+Numérotation : la 2.21.48 était réservée pour la révision CLAUDE DEVMAT de la 2.21.46 refusée, pendant qu'ANR1 publiait 2.21.47/2.21.49/2.21.51. Le lot est branché depuis la HEAD courante de `develop` (`a33bb6a`) mais garde son numéro réservé.
+
+### Pourquoi 2.21.46 refusée (rappel ordre #9 6980189831)
+
+1. **Tri par checksum, pas par ring.** `live-probe/src/lib.rs::process_capture_into_selected` triait les segments via `files.sort()` sur les noms `{iface}.pcap-{sha16}.{ext}`. Ce tri suit l'empreinte, **pas** la séquence d'ingestion. Appliquer la table dynamique d'un segment ultérieur à un segment antérieur donne des **indices HPACK valides mais faux**, et un décodage sans erreur de noms et chemins **fabriqués** — pire cas, donnée inventée.
+2. **Carry perdu entre cycles.** Le `SbiCarryContext` était local à `process_capture_into_selected`, donc à un cycle. Or un cycle ingère ~4 segments alors qu'une connexion NRF dure des heures : la couverture réelle du carry était quasi nulle.
+
+### Correctifs 2.21.48
+
+#### Ordre canonique du ring prouvé — jamais le checksum, jamais `ts`
+
+- Source d'ordre = **`ContinuousImportState.seen_order`** (`VecDeque<String>`), alimentée par `remember_checksum` (`live-probe/src/lib.rs::remember_checksum` ≈ L8748) au moment où le segment est ingéré dans le ring local. L'ordre est donc **la séquence réelle d'arrivée** des segments dumpcap.
+- Nouvelle fonction publique `ring_ordered_segments_for_interface(state, pcap_dir, interface) -> Vec<(pos, sha256, PathBuf)>` : filtre `seen_order` par interface (via `state.segments[sha].interface`) et ne garde que les segments dont le fichier possédé est encore présent sur disque.
+- Dans `process_capture_into_selected`, pour l'interface `SBI` uniquement (les autres n'ont pas de décodage stateful inter-segment), les fichiers sont pris dans l'ordre `seen_order`, **jamais** `files.sort()`.
+
+#### Continuité stricte N → N+1 dans le même ring
+
+- Nouvelle fonction publique `hpack_carry_is_contiguous(last_pos: Option<usize>, current_pos: usize) -> bool` : accepte uniquement `Some(last) == current - 1`. Toute discontinuité (trou, segment en échec, segment quarantiné, redémarrage, saut cycle, premier segment) ⇒ **fail-closed**.
+- Dans `process_capture_into_selected`, AVANT le décodage d'un segment SBI, la position courante est comparée à la dernière traitée pour l'interface. Si non-contigu ⇒ `carry.invalidate_all()` ; `metrics.invalidations` est incrémenté. Aucune table dynamique obsolète n'est jamais appliquée à un indice.
+- En cas d'erreur de décodage (fail-closed symétrique de 2.21.46), le carry est aussi invalidé et `last_pos` n'est **pas** mis à jour : le segment suivant sera donc vu discontinu et re-invalidera.
+
+#### Carry inter-cycles au niveau du worker
+
+- Deux nouveaux champs sur `CaptureManager` (`live-probe/src/lib.rs::CaptureManager`) :
+  - `sbi_hpack_carry_by_interface: Arc<Mutex<BTreeMap<String, SbiCarryContext>>>` — carry par interface SBI, borné à `DEFAULT_HPACK_CARRY_MAX_CONNECTIONS = 256` par instance (≤ 4 MiB au pire).
+  - `sbi_hpack_last_seen_order_pos_by_interface: Arc<Mutex<BTreeMap<String, usize>>>` — dernière position traitée dans `seen_order` par interface.
+- Les deux champs sont partagés via `Arc` entre tous les clones du manager et survivent donc à chaque appel de `process_capture_into_selected` (= à chaque cycle de publication continue). Les connexions NRF persistant sur des dizaines de cycles retrouvent leur table dynamique.
+- Métriques exposées via `SbiCarryContext::metrics()` (`connections_tracked`, `connections_resumed`, `connections_evicted`, `invalidations`). Prêt pour exposition `/health` ou manifeste.
+
+### Tests (nouveaux ou reportés)
+
+**Dans `decoder-sbi/src/lib.rs` (3 tests reportés de 2.21.46, tous passent) :**
+1. `hpack_carry_preserves_dynamic_table_across_segments_so_indexed_headers_decode_cleanly` — bloc 1 « literal + incremental indexing » manuel (RFC 7541 §6.2.1, opcode `0x40|name-index`, reproduit la stratégie des encoders SBI réels), bloc 2 indexed-only. Avec carry → `Decoded`. Sans carry (preuve de mutation) → `HPACK_CONTEXT_UNAVAILABLE`.
+2. `hpack_carry_invalidation_turns_subsequent_segment_into_hpack_context_unavailable` — `invalidate_all` entre les 2 segments ⇒ fail-closed.
+3. `hpack_carry_evicts_oldest_connection_when_over_max_and_bumps_counter` — LRU strict.
+
+**Dans `live-probe/src/lib.rs` (4 tests nouveaux, exigés par l'ordre #9 6980189831) :**
+- **(a)** `hpack_carry_is_contiguous_accepts_n_plus_one_only` — `Some(5) → 6` passe ; `(Some(5), 5)`, `(Some(5), 4)`, `(Some(5), 7)` échouent. **Preuve de mutation** : un relâchement en « delta ≤ 1 » ferait passer `(Some(5), 5)` ou `(Some(5), 4)` ; l'assertion d'égalité stricte l'empêche.
+- **(b)** `hpack_carry_is_not_contiguous_when_gap_in_ring` — `(Some(10), 12)` (trou) et `(None, _)` (premier démarrage) sont tous deux non-contigus → fail-closed.
+- **(c)** `ring_ordered_segments_follow_seen_order_not_checksum` — **preuve de mutation** du tri. Setup : sha_a = 16× 'a', sha_b = 16× 'f'. Noms `SBI.pcap-aaaa...pcapng` < `SBI.pcap-ffff...pcapng` lexicographiquement, mais `seen_order = [sha_b, sha_a]` (B ingéré en 1er). `ring_ordered_segments_for_interface` retourne `[B, A]` ; `files.sort()` aurait retourné `[A, B]`. Les deux listes sont vérifiées **différentes** par assertion, ce qui démontre que l'ancien code aurait appliqué B comme « précédent » de A alors que le ring dit l'inverse.
+- **(d)** `hpack_carry_state_is_shared_across_cycles_in_capture_manager` — construit un `CaptureManager`, écrit `last_pos = 10` et insère un `SbiCarryContext` pour SBI ; vérifie que la map et la position SURVIVENT à un deuxième accès (prouve l'`Arc<Mutex>` partagé). `hpack_carry_is_contiguous(Some(10), 11) == true` ; `(Some(10), 13) == false`.
+
+### 12 exécutions à 0 échec (log `/tmp/2.21.48/*.log`, aucun `#[ignore]` ajouté)
+
+| cible | commande | runs | failed |
+| --- | --- | --- | --- |
+| decoder-sbi | `cargo test --locked -p decoder-sbi` | 12 | 0 |
+| live-probe --lib | `cargo test --locked -p live-probe --lib` | 12 | 0 |
+| oiran-api --lib | `cargo test --locked -p oiran-api --lib` | 12 | 0 |
+| vtap --locked | `cd vtap && cargo update -w && cargo test --locked` | 12 | 0 |
+
+`cargo update -w` dans `vtap/` : `decoder-sbi → 0.4.10`, `oiran-decode → 0.8.1` (règle vtap-lock-après-bump).
+
+### OUVERT
+
+- **Stock SBI PARTIAL antérieur à 2.21.48** : conserve `HPACK_CONTEXT_UNAVAILABLE`. Pas de redécodage planifié dans ce lot (règle « fix décodeur couvre les données existantes » → OUVERT).
+- **Capture démarrée en milieu de connexion TCP ou après un trou** : fail-closed naturel (contigu = false à la 1ère observation), aucun nom n'est deviné.
+- **Bornage 256 connexions/interface SBI** : à ajuster si une capture lab remonte > 60 connexions simultanées ; `connections_evicted` est le signal à surveiller.
+- **Exposition `/health` des métriques carry** : structure disponible via `SbiCarryContext::metrics()`, raccordement endpoint HTTP non inclus dans ce lot (sera posé par le prochain patch oiran-api).
+
+### Numérotation
+
+- `decoder-sbi` 0.4.9 → **0.4.10** (patch, nouvelle API `SbiCarryContext`, `decode_connections_with_carry`).
+- `oiran-decode` 0.8.0 → **0.8.1** (patch, `decode_capture_streaming_with_sbi_carry` + réexport).
+- `live-probe` 0.6.19 → **0.6.20** (patch, câble le carry **inter-cycles** dans `CaptureManager` + tri **ring** pour SBI).
+- `oiran-api` 2.21.51 → **2.21.48** (régression de numéro volontaire : la 2.21.48 est réservée CLAUDE DEVMAT par l'ordre ; la fusion avec la trunk 2.21.51 sera gérée par ANR1).
+- Une version SemVer par commit (règle version-par-commit).
+
 ## OIRAN API 2.21.51 + session-engine 0.5.21 — 2026-11-18 — clés exactes SBI réellement disponibles
 
 Upgrade **patch**, basé sur 2.21.49 (`0d2e8b2`, production). 2.21.50 (`/sessions/filter`, ANR1) en échec de gate prod, non fusionnée ici.
