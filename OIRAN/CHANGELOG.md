@@ -1,5 +1,16 @@
 # Changelog
 
+## OIRAN API 2.21.38 + session-engine 0.5.15 + live-probe 0.6.16 — 2026-11-17 — fallback SBI borné par ancre de capture
+
+Sprint de nuit ANR1 n°2 (#10, ordre 6964246166), base 2.21.37 `679f2fb`.
+
+- Les rattachements SBI exacts gardent leur priorité : `(subscriber_pseudonym, pdu_session_id)`, puis `(tunnel_endpoint_ip, gtp_teid)`. `sm_context_reference` devient une troisième clé exacte lorsqu'elle résout une seule session.
+- Un SBI portant seulement `subscriber_pseudonym` n'est plus diffusé vers toutes les sessions historiques de l'abonné. Il se rattache uniquement si son `capture_id` possède exactement une session ancrée par un SBI à clé exacte et si cette session appartient au même pseudonyme.
+- Zéro ancre ou plusieurs ancres compatibles échoue fermé. Le nombre d'événements concernés est publié sous `DiscoveryResult.event_accounting.sbi_unattached_no_anchor`, donc visible dans le manifeste de capture.
+- Aucun timestamp n'intervient : les SBI sont traités dans l'ordre canonique `(capture_id, seq)` (`packet_number`, puis `event_id` comme départage déterministe).
+- Tests : deux essais du même abonné sur deux captures SBI, ambiguïté à deux ancres, clé `sm_context_reference`, et non-régression de 34 événements vTAP avec une ancre `CreateSMContext` exacte.
+- Aucun geste lab ; recette réservée à ANR2.
+
 ## OIRAN API 2.21.37 + live-probe 0.6.15 — 2026-11-17 — représentants de publication bornés sur disque
 
 Sprint mémoire ANR1, lot A uniquement (#10, ordres 6957740499 et 6961300090), sur la base 2.21.36 `73713d0`.
