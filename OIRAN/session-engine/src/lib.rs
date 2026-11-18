@@ -1602,9 +1602,25 @@ fn parse_event(v: Value) -> Result<EventRecord, String> {
     // continuous importer to exceed its 256 MiB service cgroup while building
     // session/call-flow indexes.
     let mut compact_source = serde_json::Map::new();
-    for key in ["schema_version", "procedure", "sbi"] {
+    for key in ["schema_version", "procedure"] {
         if let Some(value) = v.get(key) {
             compact_source.insert(key.to_string(), value.clone());
+        }
+    }
+    // Publication only reads these three SBI attributes when proving an SCP
+    // forwarded request (correlation-engine::correlate_sbi_routing). Keeping
+    // the other eight metadata fields in every SBI representative retained
+    // most of the real-lab RSS even though none participates in discovery,
+    // correlation or callflow construction.
+    if let Some(sbi) = v.get("sbi").and_then(Value::as_object) {
+        let mut compact_sbi = serde_json::Map::new();
+        for key in ["request_uri", "http_method", "operation"] {
+            if let Some(value) = sbi.get(key) {
+                compact_sbi.insert(key.to_string(), value.clone());
+            }
+        }
+        if !compact_sbi.is_empty() {
+            compact_source.insert("sbi".to_string(), Value::Object(compact_sbi));
         }
     }
     // 2.20.0 — lit les champs multi-sonde optionnels s'ils sont
@@ -3093,6 +3109,55 @@ mod tests {
         assert!(record.source_json.get("schema_version").is_none());
         assert_eq!(record.source_json["procedure"], "REGISTRATION");
         assert_eq!(record.source_json["sbi"]["operation"], "CreateSMContext");
+    }
+
+    #[test]
+    fn sbi_publication_projection_is_equivalent_for_consumed_fields() {
+        let base = serde_json::json!({
+            "event_id": "evt-sbi-equivalence",
+            "capture_id": "cap-sbi",
+            "capture_point_id": "SBI",
+            "timestamp": {"seconds": 1, "nanoseconds": 2, "raw_ticks": 3, "display": "1.000000002Z"},
+            "interface": "SBI",
+            "protocol": "SBI-HTTP2",
+            "message_name": "CreateSMContext",
+            "source_endpoint": {"address": "10.0.0.1", "network_function": "SCP"},
+            "destination_endpoint": {"address": "10.0.0.2", "network_function": "SMF"},
+            "direction": "CORE_TO_CORE",
+            "session_identifiers": [],
+            "information_elements": [],
+            "decoding_status": "DECODED",
+            "decoder_name": "decoder-sbi",
+            "decoder_version": "1",
+            "raw_payload_reference": "sha256:test",
+            "packet_references": [{"source_file": "SBI.pcapng", "packet_number": 1, "byte_offset": 0, "interface_id": 0, "captured_length": 64, "original_length": 64}],
+            "errors": [],
+            "sbi": {
+                "request_uri": "/nsmf-pdusession/v1/sm-contexts/1",
+                "http_method": "POST",
+                "operation": "CreateSMContext",
+                "tcp_connection_id": "discarded",
+                "http2_stream_id": 17,
+                "consumer_nf": "SCP",
+                "producer_nf": "SMF",
+                "service": "nsmf-pdusession",
+                "http_status": 201,
+                "scp_transit": true,
+                "transaction_duration_ns": 42
+            }
+        });
+        let full = parse_event(base.clone()).expect("full SBI event parses");
+        let mut already_compact = base;
+        already_compact["sbi"] = serde_json::json!({
+            "request_uri": "/nsmf-pdusession/v1/sm-contexts/1",
+            "http_method": "POST",
+            "operation": "CreateSMContext"
+        });
+        let compact = parse_event(already_compact).expect("compact SBI event parses");
+
+        assert_eq!(full.source_json, compact.source_json);
+        assert_eq!(full.source_json["sbi"].as_object().unwrap().len(), 3);
+        assert!(full.source_json["sbi"].get("tcp_connection_id").is_none());
     }
 
     #[test]

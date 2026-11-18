@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.21.47 + session-engine 0.5.19 + live-probe 0.6.19 — 2026-11-18 — projection SBI bornée sur données réelles
+
+Upgrade **patch**, basé sur 2.21.45 (`3d7a502`). Aucun geste lab.
+
+- Copie en lecture seule de l'intégralité disponible dans `event-shards` : 260 fichiers, 204 688 877 octets et 80 435 événements (le stock disponible ne contient pas les ~500 000 demandés ; aucune duplication artificielle).
+- `rss_publication` accepte un répertoire de shards réels. Sur 77 101 représentants, l'audit avant correctif attribue 70 124 752 octets à `source_json`, dont 60 705 857 au sous-arbre SBI ; RSS 287 636 kB en phase 01 et 338 876 kB aux phases 07/09.
+- La projection SBI ne retient plus que les trois attributs effectivement lus après normalisation par `correlate_sbi_routing` : `request_uri`, `http_method`, `operation`. Les huit métadonnées non consommées restent intactes dans les shards canoniques ; seule la projection temporaire de publication est bornée.
+- Gate d'équivalence ancien/nouveau sur les trois champs consommés ; la mutation qui restaure le sous-arbre SBI complet fait échouer ce gate. La preuve existante « dernière observation gagne » et l'équivalence fixture sont exécutées avec lui pendant douze campagnes consécutives, sans échec ni test ignoré.
+
 ## OIRAN API 2.21.45 — 2026-11-18 — fusion 2.21.43 (NGAP, DEVMAT) + 2.21.44 (reprise capture après arrêt disque)
 
 Upgrade **patch**. Fusion sans conflit de code de `fix/oiran-2.21.43-ngap-partial` (4428663, relue) sur 2.21.44 (3c356fe) ; seuls Cargo.toml / Cargo.lock / CHANGELOG en conflit de version.

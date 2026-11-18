@@ -7,7 +7,33 @@
 //! `/proc/self/status` before, after each phase, and after drop.
 
 use live_probe::{interface_specs, CaptureManager, CONTINUOUS_CAPTURE_ID};
-use std::{env, fs, io::Write, path::PathBuf};
+use std::{
+    env, fs,
+    io::{BufRead, Write},
+    path::{Path, PathBuf},
+};
+
+fn copy_real_shards(source: &Path, writer: &mut impl Write) -> usize {
+    let mut paths = fs::read_dir(source)
+        .expect("read real-shard directory")
+        .map(|entry| entry.expect("read real-shard entry").path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut count = 0usize;
+    for path in paths {
+        let reader = std::io::BufReader::new(fs::File::open(&path).expect("open real shard"));
+        for line in reader.lines() {
+            let line = line.expect("read real-shard record");
+            if line.trim().is_empty() {
+                continue;
+            }
+            writeln!(writer, "{line}").expect("copy real-shard record");
+            count += 1;
+        }
+    }
+    count
+}
 
 fn read_status(key: &str) -> u64 {
     let s = fs::read_to_string("/proc/self/status").unwrap_or_default();
@@ -30,14 +56,15 @@ fn report(stage: &str) {
 }
 
 fn main() {
-    let history_size: usize = env::args()
+    let requested_history_size: usize = env::args()
         .nth(1)
-        .expect("usage: rss_publication <history-size>")
+        .expect("usage: rss_publication <history-size> [real-shard-directory]")
         .parse()
         .expect("history-size integer");
+    let real_shards = env::args().nth(2).map(PathBuf::from);
     let root = env::temp_dir().join(format!(
         "oiran-rss-publication-{}-{}",
-        history_size,
+        requested_history_size,
         std::process::id()
     ));
     fs::create_dir_all(&root).unwrap();
@@ -49,7 +76,11 @@ fn main() {
     {
         let mut writer =
             std::io::BufWriter::with_capacity(1 << 20, fs::File::create(&history_path).unwrap());
-        for i in 0..history_size {
+        if let Some(source) = real_shards.as_deref() {
+            let copied = copy_real_shards(source, &mut writer);
+            assert_eq!(requested_history_size, copied, "real-shard event count");
+        } else {
+        for i in 0..requested_history_size {
             let session = (i / 500) + 1;
             let ts_ns = 1_792_872_462_000_000_000u64 + (i as u64) * 1000;
             let ts_s = ts_ns / 1_000_000_000;
@@ -115,8 +146,10 @@ fn main() {
             });
             writeln!(writer, "{}", event).unwrap();
         }
+        }
         writer.flush().unwrap();
     }
+    let history_size = requested_history_size;
     let manifest = serde_json::json!({
         "dataset_id": "dataset-continuous-lab-import",
         "capture_id": "continuous-lab-import",
