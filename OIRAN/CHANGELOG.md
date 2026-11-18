@@ -1,5 +1,15 @@
 # Changelog
 
+## OIRAN API 2.21.61 — 2026-11-18 — lignes du filtre préchauffées après publication
+
+Upgrade **patch**, basé sur 2.21.59 (`f1012b8`).
+
+- Cause auditée : les index de filtrage et de parcours étaient préchauffés, mais le premier `POST /sessions/filter {"limit":100}` reconstruisait encore jusqu'à 100 entrées `ListRowCache`. Chaque miss relisait et parsait le callflow, appliquait le read-time patch et extrayait les identités avant de servir la page.
+- Le callback synchrone de publication préchauffe maintenant la partie stable et cacheable des lignes live sous le même verrou lourd exclusif. Le parcours abonné, le vault et l'hydratation tshark restent hors préchauffage et sont ajoutés à la requête comme auparavant.
+- Si l'index compact du read-time patch n'est pas prêt, les lignes sont explicitement reportées et ses workers sont déclenchés ; aucune ligne non patchée n'est figée dans le cache.
+- L'audit `OIRAN_SESSIONS_FILTER_PHASE_AUDIT=1` détaille les hits/miss de ligne et la construction de page sans journaliser d'identité.
+- Test de non-régression : réponse froide et réponse préchauffée identiques octet pour octet ; le premier filtre après préchauffage ne reconstruit aucune ligne. Mutation : retirer le préchauffage des lignes rend le test rouge.
+
 ## OIRAN API 2.21.59 + live-probe 0.6.23 — 2026-11-18 — fusion du lot du soir (un seul déploiement)
 
 Upgrade **patch**. Fusion, sans changement de logique, de trois lots relus :

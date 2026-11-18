@@ -168,6 +168,8 @@ struct Inner {
     filter_index_rebuilds: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     journey_index_rebuilds: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    list_row_cache_builds: std::sync::atomic::AtomicUsize,
 }
 
 /// 2.21.11 — entrée de cache + clé composite pour `/sessions/catalog`.
@@ -762,6 +764,8 @@ impl AppState {
                 filter_index_rebuilds: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 journey_index_rebuilds: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                list_row_cache_builds: std::sync::atomic::AtomicUsize::new(0),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -857,6 +861,8 @@ impl AppState {
                 filter_index_rebuilds: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 journey_index_rebuilds: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                list_row_cache_builds: std::sync::atomic::AtomicUsize::new(0),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -3621,15 +3627,59 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
     state.refresh_session_filter_index();
     let filter_ready_ms = started.elapsed().as_millis();
     let _ = cached_journey_index(state);
+    let journey_ready_ms = started.elapsed().as_millis();
+    let list_rows = prewarm_live_list_row_cache_locked(state);
     eprintln!(
         "{}",
         json!({
             "event": "SESSIONS_FILTER_PREWARM_READY",
             "trigger": trigger,
             "filter_ready_ms": filter_ready_ms,
+            "journey_ready_ms": journey_ready_ms,
+            "list_rows_cached": list_rows.cached,
+            "list_rows_deferred": list_rows.deferred,
+            "list_rows_missing": list_rows.missing,
             "total_ms": started.elapsed().as_millis(),
         })
     );
+}
+
+#[derive(Default)]
+struct ListRowPrewarmStats {
+    cached: usize,
+    deferred: usize,
+    missing: usize,
+}
+
+/// 2.21.61 — remplit la partie stable de `ListRowCache` pendant que le
+/// verrou lourd exclusif protège encore la publication. Le read-time patch
+/// doit être prêt : sinon on déclenche ses workers et on reporte explicitement
+/// les lignes ; le callback de la publication suivante réessaiera. Aucun accès
+/// au vault et aucun tshark ne sont lancés dans ce chemin.
+fn prewarm_live_list_row_cache_locked(state: &AppState) -> ListRowPrewarmStats {
+    let mut stats = ListRowPrewarmStats::default();
+    for dataset in state.inner.capture_manager.datasets() {
+        if let Some(root) = state
+            .inner
+            .capture_manager
+            .dataset_root(&dataset.dataset_id)
+        {
+            let bundle = state.inner.compact_index_registry.ensure_tracking(&root);
+            spawn_compact_index_workers(&state.inner.compact_index_registry, &bundle);
+            if !bundle.all_ready() {
+                stats.deferred = stats.deferred.saturating_add(dataset.session_ids.len());
+                continue;
+            }
+        }
+        for session_id in &dataset.session_ids {
+            if cached_live_list_row_base(state, &dataset, session_id).is_some() {
+                stats.cached = stats.cached.saturating_add(1);
+            } else {
+                stats.missing = stats.missing.saturating_add(1);
+            }
+        }
+    }
+    stats
 }
 
 /// 2.21.56 — branche le préchauffage sur le commit de publication et tente
@@ -4069,6 +4119,33 @@ fn cached_live_list_row(
     // la signature du fichier callflow. Seuls le parcours abonné et
     // le vault (qui évoluent sans que le fichier change) sont
     // recalculés à chaque requête.
+    let (mut summary, events_identities) = cached_live_list_row_base(state, dataset, session_id)?;
+    decorate_subscriber_summary_by_id(&mut summary, session_id, &journey_index);
+    if let Some(object) = summary.as_object_mut() {
+        let mut identities = identity_summary_for_session(&state, session_id);
+        if identities.is_null() {
+            schedule_identity_hydration(&state, session_id);
+            identities = events_identities;
+        } else {
+            fill_missing_identities(&mut identities, &events_identities);
+        }
+        object.insert("identities".into(), identities);
+    }
+    Some(summary)
+}
+
+/// 2.21.61 — partie stable et cacheable d'une ligne de liste live.
+/// Elle exclut volontairement le parcours abonné, le vault et le lancement
+/// de l'hydratation tshark : le préchauffage de publication peut donc la
+/// construire sans effet de bord, puis chaque requête ajoute les données
+/// dynamiques exactement comme avant.
+fn cached_live_list_row_base(
+    state: &AppState,
+    dataset: &live_probe::LiveDataset,
+    session_id: &String,
+) -> Option<(Value, Value)> {
+    let audit = std::env::var_os("OIRAN_SESSIONS_FILTER_PHASE_AUDIT").is_some();
+    let started = std::time::Instant::now();
     let key = (dataset.dataset_id.clone(), session_id.clone());
     // 2.21.3 — signature étendue avec `commit_seq` (live-probe 0.6.1).
     // Un bump de la publication incrémentale invalide la ligne même
@@ -4090,37 +4167,48 @@ fn cached_live_list_row(
                 .map(|entry| (entry.1.clone(), entry.2.clone()))
         })
     });
-    let (mut summary, events_identities) = if let Some(hit) = cached {
-        hit
-    } else {
-        let Some(flow) = state
-            .inner
-            .capture_manager
-            .callflow(&dataset.dataset_id, session_id)
-        else {
-            return None;
-        };
-        let (summary, events_identities, cacheable) =
-            live_list_row(state, dataset, session_id, &flow);
-        if let (Some(signature), true) = (signature, cacheable) {
-            if let Ok(mut cache) = state.inner.list_row_cache.lock() {
-                cache.insert(key, (signature, summary.clone(), events_identities.clone()));
-            }
+    if let Some(hit) = cached {
+        if audit {
+            eprintln!(
+                "SESSIONS_FILTER_ROW phase=cache_hit elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
         }
-        (summary, events_identities)
-    };
-    decorate_subscriber_summary_by_id(&mut summary, session_id, &journey_index);
-    if let Some(object) = summary.as_object_mut() {
-        let mut identities = identity_summary_for_session(&state, session_id);
-        if identities.is_null() {
-            schedule_identity_hydration(&state, session_id);
-            identities = events_identities;
-        } else {
-            fill_missing_identities(&mut identities, &events_identities);
-        }
-        object.insert("identities".into(), identities);
+        return Some(hit);
     }
-    Some(summary)
+    #[cfg(test)]
+    state
+        .inner
+        .list_row_cache_builds
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let flow_started = std::time::Instant::now();
+    let Some(flow) = state
+        .inner
+        .capture_manager
+        .callflow(&dataset.dataset_id, session_id)
+    else {
+        return None;
+    };
+    let flow_ms = flow_started.elapsed().as_millis();
+    let build_started = std::time::Instant::now();
+    let (summary, events_identities, cacheable) =
+        live_list_row(state, dataset, session_id, &flow);
+    let build_ms = build_started.elapsed().as_millis();
+    if let (Some(signature), true) = (signature, cacheable) {
+        if let Ok(mut cache) = state.inner.list_row_cache.lock() {
+            cache.insert(key, (signature, summary.clone(), events_identities.clone()));
+        }
+    }
+    if audit {
+        eprintln!(
+            "SESSIONS_FILTER_ROW phase=cache_miss flow_ms={} build_ms={} total_ms={} cacheable={}",
+            flow_ms,
+            build_ms,
+            started.elapsed().as_millis(),
+            cacheable
+        );
+    }
+    Some((summary, events_identities))
 }
 
 async fn sessions(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Json<Value> {
@@ -4942,6 +5030,13 @@ fn sessions_filter_blocking(
     // `ts` dans cette étape). Fast path : build paresseux par
     // page. Extended filter : on réutilise `prebuilt_items`.
     let page_set: std::collections::BTreeSet<&str> = page_ids.iter().copied().collect();
+    let page_construction_started = std::time::Instant::now();
+    let list_cache_before = state
+        .inner
+        .list_row_cache
+        .lock()
+        .map(|cache| cache.len())
+        .unwrap_or(0);
     let mut items_by_id: std::collections::BTreeMap<String, Value> =
         std::collections::BTreeMap::new();
     if let Some(mut prebuilt) = prebuilt_items {
@@ -5004,6 +5099,23 @@ fn sessions_filter_blocking(
                 }
             }
         }
+    }
+    if audit_enabled {
+        let list_cache_after = state
+            .inner
+            .list_row_cache
+            .lock()
+            .map(|cache| cache.len())
+            .unwrap_or(0);
+        eprintln!(
+            "SESSIONS_FILTER_PAGE_CONSTRUCTION requested_rows={} resolved_rows={} cache_before={} cache_after={} identity_hydrations_running={} elapsed_ms={}",
+            page_ids.len(),
+            items_by_id.len(),
+            list_cache_before,
+            list_cache_after,
+            IDENTITY_HYDRATION_RUNNING.load(std::sync::atomic::Ordering::Relaxed),
+            page_construction_started.elapsed().as_millis()
+        );
     }
     audit_phase("page_summaries");
     // Assemble la page DANS l'ordre canonique page_ids — pas
@@ -10110,6 +10222,47 @@ mod tests {
         config.capture_root = capture_root.clone();
         let state = AppState::load_with_capture_manager(config, manager).unwrap();
         wait_for_compact_index_ready(&state, std::time::Duration::from_secs(10)).await;
+
+        // 2.21.61 — la réponse chaude doit être strictement identique à la
+        // réponse froide, et la première requête après préchauffage ne doit
+        // reconstruire aucune ligne. Mutation : retirer
+        // `prewarm_live_list_row_cache_locked` de la fonction de préchauffage
+        // laisse le cache vide et rend les assertions suivantes rouges.
+        let (cold_status, cold_filter) =
+            post_sessions_filter(&state, json!({"limit": 100}), None).await;
+        assert_eq!(cold_status, StatusCode::OK);
+        let cold_bytes = serde_json::to_vec(&cold_filter).unwrap();
+        state.inner.list_row_cache.lock().unwrap().clear();
+        state
+            .inner
+            .list_row_cache_builds
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        {
+            let _gate = state.inner.capture_manager.heavy_memory_enter();
+            prewarm_session_filter_caches_locked(&state, "test");
+        }
+        let builds_after_prewarm = state
+            .inner
+            .list_row_cache_builds
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(builds_after_prewarm, 1, "prewarm must build the fixture row");
+        assert_eq!(state.inner.list_row_cache.lock().unwrap().len(), 1);
+        let (warm_status, warm_filter) =
+            post_sessions_filter(&state, json!({"limit": 100}), None).await;
+        assert_eq!(warm_status, StatusCode::OK);
+        assert_eq!(
+            serde_json::to_vec(&warm_filter).unwrap(),
+            cold_bytes,
+            "prewarmed page must be byte-for-byte equivalent to the cold page"
+        );
+        assert_eq!(
+            state
+                .inner
+                .list_row_cache_builds
+                .load(std::sync::atomic::Ordering::SeqCst),
+            builds_after_prewarm,
+            "first filter request rebuilt a prewarmed list row"
+        );
 
         // Pré-condition : vault VIDE pour cette session (reproduction
         // fidèle du cas prod).
