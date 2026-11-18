@@ -1,5 +1,101 @@
 # Changelog
 
+## OIRAN API 2.21.53 + decoder-sbi 0.4.10 + oiran-decode 0.8.1 + live-probe 0.6.20 — 2026-11-18 — carry HPACK ordonné par seq+run du ring dumpcap, continuité inter-cycles (ordre #9 6985951083)
+
+Révision de 2.21.46 et 2.21.48 refusées (ordre #9 6985951083). Base `a33bb6a` (2.21.51 ANR1), nouvelle branche `fix/oiran-2.21.53-hpack-carry-seq`, pas de force-push, aucun geste lab. Numéro 2.21.52 réservé à ANR1.
+
+### Pourquoi 2.21.48 refusée (rappel ordre)
+
+1. **Positions globales dans `seen_order`.** `ring_ordered_segments_for_interface` (2.21.48) renvoyait la position dans tout `seen_order`, N2/N3/N4/SBI mélangés ⇒ deux segments SBI consécutifs ne portaient quasiment jamais `pos`/`pos+1` ⇒ `hpack_carry_is_contiguous` invalidait à chaque fois ⇒ gain réel ≈ 0.
+2. **Tri lexico après redémarrage.** `seen_order.extend(state.seen_checksums.iter())` sur un `BTreeSet` ⇒ ordre lexicographique des SHA après tout rebuild ⇒ deux segments voisins par checksum jugés « contigus » ⇒ table HPACK de l'un appliquée à l'autre = **en-têtes fabriqués**, défaut refusé en 2.21.46.
+3. **Positions glissantes.** `seen_order.retain(...)` décale tous les index ⇒ `last_pos` mémorisée désigne un autre segment après purge.
+4. **Tests de 2.21.48 ne testaient pas le câblage** (comparaison intra-test de `files.sort()`, pas de mutation du code de production).
+
+### Correctifs 2.21.53
+
+#### Source d'ordre = `(run_id, seq)` du ring dumpcap, par interface
+
+Nouvelle fonction publique `parse_ring_filename(source_path) -> Option<(run_id, seq)>` dans `live-probe/src/lib.rs`. Reconnaît le format dumpcap prod `{iface_lc}_{YYYYMMDDTHHMMSSZ}_{NNNNN}_{YYYYMMDDHHMMSS}.pcapng` (confirmé par noms observés en prod : `n2_20261026T121214Z_00001_20261026121214.pcapng`, `n4_20261104T142333Z_00056_20261106212341.pcapng`, `s6a_20261107T213849Z_00025_20261108213852.pcapng`). `run_id` = horodatage de démarrage du ring (stable pour un même process dumpcap) ; `seq` = numéro de rotation (5 chiffres) parsé en u64. Format non reconnu ⇒ `None` ⇒ segment **exclu** (fail-closed).
+
+Nouvelle fonction publique `ring_ordered_segments_for_interface(state, pcap_dir, interface) -> Vec<RingOrderedSegment>` : itère `state.segments` (map), filtre par interface, parse `source_path` ; retourne les segments **triés par `(run_id, seq)`**, jamais par checksum, jamais par position dans `seen_order` (qui mixe les interfaces et bascule en lexico après rebuild). Les segments dont `source_path` est non parsable ou dont `owned_file` a disparu sont exclus.
+
+#### Continuité stricte : même `run_id` + `seq+1`
+
+Nouvelle fonction publique `hpack_carry_is_contiguous(last: Option<&(String, u64)>, current: &(String, u64)) -> bool` : exige **à la fois** `last_run == current_run` ET `current_seq == last_seq + 1`. Toute discontinuité ⇒ fail-closed :
+- `last == None` : premier démarrage.
+- `last_run != current_run` : redémarrage dumpcap (nouveau process, nouvelle table dynamique chez le pair).
+- `current_seq != last_seq + 1` : trou, réordonnancement, segment quarantiné, segment en échec.
+
+#### Carry inter-cycles dans `CaptureManager`
+
+Deux champs `Arc<Mutex<BTreeMap<String, …>>>` partagés entre tous les clones :
+- `sbi_hpack_carry_by_interface: BTreeMap<String, SbiCarryContext>` — carry HPACK par interface SBI, borné à `DEFAULT_HPACK_CARRY_MAX_CONNECTIONS = 256`.
+- `sbi_hpack_last_ring_pos_by_interface: BTreeMap<String, (String, u64)>` — dernière position traitée (`run_id`, `seq`), **par interface**.
+
+Les deux survivent à chaque appel de `process_capture_into_selected` (= à chaque cycle de publication). Les connexions NRF persistant sur dizaines de cycles retrouvent leur table dynamique tant que le ring reste contigu.
+
+#### Fail-closed sémantique : `invalidations` compte les ÉVÉNEMENTS
+
+`SbiCarryContext::invalidate_all` incrémente `metrics.invalidations` de **1 par appel** (pas par le nombre de connexions supprimées). Un appel sur carry vide compte quand même : il prouve qu'un fail-closed s'est produit et que le segment suivant ne s'appuiera pas sur une table dynamique obsolète. Le nombre de connexions évacuées est capturé par la décroissance de `len()`.
+
+#### Exposition métriques
+
+- Nouvelle struct publique `SbiCarryMetricsSnapshot { connections_tracked, connections_resumed, connections_evicted, invalidations, last_cycle_epoch_ms }` (Serialize).
+- Nouveau champ `CaptureManager.sbi_hpack_carry_metrics_snapshot: Arc<Mutex<BTreeMap<String, SbiCarryMetricsSnapshot>>>` mis à jour en fin de chaque cycle sous `process_capture_into_selected`.
+- Nouvelle méthode publique `CaptureManager::hpack_carry_metrics_snapshot() -> BTreeMap<String, SbiCarryMetricsSnapshot>` : prête à être consommée par un endpoint oiran-api existant (`/health`, manifest dataset) — raccordement HTTP non inclus dans ce lot.
+
+### Tests (nouveaux et reportés)
+
+**decoder-sbi (3 tests inchangés depuis 2.21.46/2.21.48) :**
+1. `hpack_carry_preserves_dynamic_table_across_segments_so_indexed_headers_decode_cleanly` — bloc 1 manuel « literal + incremental indexing » (RFC 7541 §6.2.1), bloc 2 indexed-only. Avec carry → Decoded ; sans carry → `HPACK_CONTEXT_UNAVAILABLE`.
+2. `hpack_carry_invalidation_turns_subsequent_segment_into_hpack_context_unavailable` — `invalidate_all` fail-closed.
+3. `hpack_carry_evicts_oldest_connection_when_over_max_and_bumps_counter` — LRU strict.
+
+**live-probe (4 tests NOUVEAUX, exigés par l'ordre #9 6985951083) :**
+
+- `parse_ring_filename_extracts_run_id_and_seq_from_dumpcap_names` — vérifie les formats prod observés et le fail-closed sur noms non conformes.
+- `hpack_carry_is_contiguous_requires_same_run_and_next_seq` — couvre (a), (b), (d) + preuves de mutation :
+  - (a) seq 1 puis seq 2 même run → contigu ;
+  - (b) seq 1 puis seq 3 (trou) → non contigu ;
+  - (d) run différent → non contigu ;
+  - preuves : seq identique, seq en arrière, `None` initial → tous non contigus.
+- `ring_ordered_segments_use_source_path_seq_not_checksum_or_seen_order` — **preuve de mutation** sur la source d'ordre : 3 segments SBI avec sha16 ordonnés `00 < 55 < ff` lexico mais `(run_id, seq)` = `(RUN1, 1)=ff`, `(RUN1, 2)=00`, `(RUN2, 1)=55`. Résultat attendu = ordre ring, assertion `!= lex_sorted` — démontre explicitement la divergence.
+- `process_capture_into_selected_applies_ring_order_and_fail_closed_on_gap_or_run_change` — **tests sur le vrai chemin `process_capture_into_selected`**, 4 cycles successifs sur un même `CaptureManager` :
+  - cycle 1 (seq 1, RUN1) → `last_ring_pos = (RUN1, 1)` ;
+  - cycle 2 (seq 2, RUN1) → contigu, `last_ring_pos = (RUN1, 2)`, `invalidations` INCHANGÉE (preuve (a) de non-régression) ;
+  - cycle 3 (seq 4, RUN1 — trou en seq 3) → `invalidations ++` (preuve (b)) ;
+  - cycle 4 (seq 1, RUN2 — redémarrage dumpcap) → `invalidations ++` (preuve (d)).
+  Les sha16 des 4 fichiers sont ordonnés `00 < 55 < aa < ff` lexicographiquement, mais le ring demande `ff(seq1) → aa(seq2) → 55(seq4) → 00(run2)`. L'évolution de `last_ring_pos` prouve que l'ordre suivi est celui du ring, pas du checksum (preuve (c) sur le vrai chemin, par construction).
+
+### 12 exécutions à 0 échec (log `/tmp/2.21.53/*.log`, aucun `#[ignore]` ajouté)
+
+Builds en `nice -n 19 ionice -c3 cargo test --locked -j 2`.
+
+| cible | commande | runs | failed |
+| --- | --- | --- | --- |
+| decoder-sbi | `nice -n 19 ionice -c3 cargo test --locked -p decoder-sbi -j 2` | 12 | 0 |
+| live-probe --lib | `nice -n 19 ionice -c3 cargo test --locked -p live-probe --lib -j 2` | 12 | 0 |
+| oiran-api --lib | `nice -n 19 ionice -c3 cargo test --locked -p oiran-api --lib -j 2` | 12 | 0 |
+| vtap --locked | `cd vtap && cargo update -w && nice -n 19 ionice -c3 cargo test --locked -j 2` | 12 | 0 |
+
+`cargo update -w` dans `vtap/` : `decoder-sbi 0.4.9 → 0.4.10`, `oiran-decode 0.8.0 → 0.8.1` (règle vtap-lock-après-bump). Rust-toolchain : `1.83` (`rust-version.workspace = true`).
+
+### OUVERT
+
+1. **Stock SBI PARTIAL antérieur à 2.21.53** : conserve `HPACK_CONTEXT_UNAVAILABLE`. Pas de redécodage ni patch read-time (règle « fix décodeur couvre les données existantes »).
+2. **Capture démarrée en milieu de connexion TCP ou après un trou** : fail-closed naturel (`None` ou `run_id` différent).
+3. **Bornage 256 connexions/interface SBI** : à ajuster si une capture lab remonte > 60 connexions simultanées (`connections_evicted` à surveiller).
+4. **Raccord HTTP de `hpack_carry_metrics_snapshot()`** : structure disponible ; l'endpoint `/health` (ou manifest dataset) le consommera dans un prochain patch oiran-api.
+5. **Tests `process_capture_into_selected` : vérification du décodage HPACK effectif** : les pcap de test actuels prouvent la **logique de continuité et d'invalidation** (`last_ring_pos`, `invalidations`), mais ne reproduisent pas un reassembly TCP complet SBI avec DECODED/PARTIAL. La validation end-to-end avec de vraies connexions SBI dépend des pcap fixture SBI à venir du lab (OUVERT lab non bloquant).
+
+### Numérotation
+
+- `decoder-sbi` 0.4.9 → **0.4.10** (patch, nouvelle sémantique `invalidations` + API `SbiCarryContext` / `decode_connections_with_carry`).
+- `oiran-decode` 0.8.0 → **0.8.1** (patch, `decode_capture_streaming_with_sbi_carry` + réexport).
+- `live-probe` 0.6.19 → **0.6.20** (patch, carry inter-cycles + ordre canonique `(run_id, seq)` + métriques snapshot).
+- `oiran-api` 2.21.51 → **2.21.53** (patch, SemVer monotone ; 2.21.52 réservé ANR1).
+- Une version SemVer par commit (règle version-par-commit).
+
 ## OIRAN API 2.21.51 + session-engine 0.5.21 — 2026-11-18 — clés exactes SBI réellement disponibles
 
 Upgrade **patch**, basé sur 2.21.49 (`0d2e8b2`, production). 2.21.50 (`/sessions/filter`, ANR1) en échec de gate prod, non fusionnée ici.

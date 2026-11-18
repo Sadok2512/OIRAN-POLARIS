@@ -23,6 +23,176 @@ const MAX_HEADER_BLOCK: usize = 256 * 1024;
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// 2.21.46 (ordre #9 6977819264) — borne par défaut du carry HPACK
+/// par interface SBI. 256 connexions × 2 décodeurs × ~8 KiB (table
+/// dynamique HPACK par défaut, RFC 7541 §4.2) ≈ 4 MiB au pire cas.
+/// ANR2 n'a jamais vu plus de ~60 connexions SBI simultanées sur une
+/// capture continue (comptées sur dataset 2.21.37 : 48 shards vTAP,
+/// typiquement NRF + un petit nombre d'AMF/SMF). La borne ne peut
+/// être dépassée : toute insertion au-delà évince la connexion la
+/// moins récemment vue et incrémente `connections_evicted` ; au
+/// prochain segment la connexion évincée retombe en
+/// `HPACK_CONTEXT_UNAVAILABLE` tant qu'un HEADERS indexé n'est pas
+/// retrouvé par HPACK (fail-closed, jamais de nom deviné).
+pub const DEFAULT_HPACK_CARRY_MAX_CONNECTIONS: usize = 256;
+
+/// 2.21.46 (ordre #9 6977819264) — compteurs visibles du carry HPACK.
+/// Exposés pour les opérateurs et consignés dans le rapport SBI à
+/// la fin de chaque cycle d'ingestion continu.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SbiCarryMetrics {
+    /// Nombre de connexions TCP distinctes jamais suivies par ce
+    /// carry depuis sa création (compteur cumulatif, jamais remis à
+    /// zéro).
+    pub connections_tracked: usize,
+    /// Nombre de fois qu'une connexion déjà présente a été
+    /// retrouvée au début d'un segment suivant (preuve que la table
+    /// dynamique HPACK est réutilisée au lieu d'être recréée).
+    pub connections_resumed: usize,
+    /// Nombre d'évictions (LRU) déclenchées par la borne
+    /// `max_connections`.
+    pub connections_evicted: usize,
+    /// Nombre d'invalidations manuelles — `invalidate_all` appelé
+    /// par le worker continu lorsqu'un segment manque ou échoue
+    /// (fail-closed : les connexions actives perdent leur état et
+    /// retombent en `HPACK_CONTEXT_UNAVAILABLE` au segment suivant).
+    pub invalidations: usize,
+}
+
+/// 2.21.46 (ordre #9 6977819264) — carry HPACK par connexion TCP
+/// pour la capture continue. Conserve la table dynamique HPACK d'un
+/// segment pcap au suivant **pour la même clé 5-tuple TCP**. Utilisé
+/// uniquement par le worker continu (`live_probe`) ; le décodage
+/// one-shot (`decode_connections`) n'a pas de carry, sa table HPACK
+/// repart de zéro par appel comme avant 2.21.46.
+///
+/// Fail-closed : si le worker détecte un segment manquant ou en échec,
+/// il appelle `invalidate_all`. Toutes les connexions suivies perdent
+/// leur état HPACK et retomberont en `HPACK_CONTEXT_UNAVAILABLE` sur
+/// le premier HEADERS indexé qui dépend d'une entrée perdue. Aucun
+/// nom n'est deviné, aucune table partielle n'est maintenue.
+///
+/// Mémoire bornée : `max_connections` (valeur par défaut
+/// `DEFAULT_HPACK_CARRY_MAX_CONNECTIONS`). Au-delà, LRU basé sur un
+/// compteur monotone — l'entrée au compteur minimum est évincée et
+/// `metrics.connections_evicted` est incrémenté.
+pub struct SbiCarryContext {
+    entries: HashMap<transport_tcp::TcpConnectionKey, CarryEntry>,
+    touch_counter: u64,
+    max_connections: usize,
+    metrics: SbiCarryMetrics,
+}
+
+struct CarryEntry {
+    decoders: [Decoder<'static>; 2],
+    last_touch: u64,
+}
+
+impl std::fmt::Debug for SbiCarryContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SbiCarryContext")
+            .field("connections", &self.entries.len())
+            .field("max_connections", &self.max_connections)
+            .field("metrics", &self.metrics)
+            .finish()
+    }
+}
+
+impl SbiCarryContext {
+    /// Crée un carry neuf. `max_connections` borne le nombre de
+    /// connexions suivies simultanément. 0 désactive le carry
+    /// (aucune connexion n'est jamais stockée).
+    pub fn new(max_connections: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            touch_counter: 0,
+            max_connections,
+            metrics: SbiCarryMetrics::default(),
+        }
+    }
+
+    /// Fail-closed : invalide toutes les connexions suivies. À
+    /// appeler lorsque le ring d'ingestion signale un segment
+    /// manquant ou une erreur de décodage — la continuité est
+    /// rompue, les tables dynamiques HPACK ne reflètent plus l'état
+    /// réel des pairs. Les compteurs cumulatifs survivent.
+    ///
+    /// 2.21.53 — `invalidations` compte les ÉVÉNEMENTS d'invalidation
+    /// (appels à `invalidate_all`), pas seulement le nombre de
+    /// connexions supprimées. Un appel sur carry vide compte
+    /// toujours pour 1 : il prouve qu'un fail-closed s'est produit
+    /// et qu'un futur segment ne s'appuiera pas sur une table
+    /// dynamique obsolète. Le nombre de connexions évacuées, lui,
+    /// est capturé indirectement par la décroissance de `len()`.
+    pub fn invalidate_all(&mut self) {
+        self.metrics.invalidations = self.metrics.invalidations.saturating_add(1);
+        self.entries.clear();
+    }
+
+    /// Nombre de connexions actuellement suivies.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Le carry est vide.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Borne configurée à la création.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// Instantané des compteurs à des fins de rapport.
+    pub fn metrics(&self) -> &SbiCarryMetrics {
+        &self.metrics
+    }
+
+    fn take(&mut self, key: &transport_tcp::TcpConnectionKey) -> Option<[Decoder<'static>; 2]> {
+        let entry = self.entries.remove(key)?;
+        self.metrics.connections_resumed = self.metrics.connections_resumed.saturating_add(1);
+        Some(entry.decoders)
+    }
+
+    fn store(
+        &mut self,
+        key: transport_tcp::TcpConnectionKey,
+        decoders: [Decoder<'static>; 2],
+        newly_tracked: bool,
+    ) {
+        if self.max_connections == 0 {
+            return;
+        }
+        if newly_tracked {
+            self.metrics.connections_tracked =
+                self.metrics.connections_tracked.saturating_add(1);
+        }
+        self.touch_counter = self.touch_counter.saturating_add(1);
+        self.entries.insert(
+            key,
+            CarryEntry {
+                decoders,
+                last_touch: self.touch_counter,
+            },
+        );
+        while self.entries.len() > self.max_connections {
+            if let Some(victim_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_touch)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&victim_key);
+                self.metrics.connections_evicted =
+                    self.metrics.connections_evicted.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SbiDecodeReport {
     pub tcp_connections: usize,
@@ -82,6 +252,48 @@ pub fn decode_connections(
     endpoint_names: &HashMap<String, String>,
     pseudonym_key: &PseudonymKey,
 ) -> (Vec<NormalizedEvent>, SbiDecodeReport) {
+    decode_connections_inner(
+        connections,
+        capture_id,
+        interface,
+        endpoint_names,
+        pseudonym_key,
+        None,
+    )
+}
+
+/// 2.21.46 (ordre #9 6977819264) — version `decode_connections` qui
+/// réutilise la table dynamique HPACK d'un segment au suivant pour
+/// les connexions TCP déjà vues. Utilisée par le worker continu
+/// (`live_probe::process_capture_into_selected`) ; le chemin one-shot
+/// (`decode_capture`, tests d'intégration vtap) utilise
+/// `decode_connections` sans carry.
+pub fn decode_connections_with_carry(
+    connections: &[ReassembledConnection],
+    capture_id: &str,
+    interface: &str,
+    endpoint_names: &HashMap<String, String>,
+    pseudonym_key: &PseudonymKey,
+    carry: &mut SbiCarryContext,
+) -> (Vec<NormalizedEvent>, SbiDecodeReport) {
+    decode_connections_inner(
+        connections,
+        capture_id,
+        interface,
+        endpoint_names,
+        pseudonym_key,
+        Some(carry),
+    )
+}
+
+fn decode_connections_inner(
+    connections: &[ReassembledConnection],
+    capture_id: &str,
+    interface: &str,
+    endpoint_names: &HashMap<String, String>,
+    pseudonym_key: &PseudonymKey,
+    mut carry: Option<&mut SbiCarryContext>,
+) -> (Vec<NormalizedEvent>, SbiDecodeReport) {
     let mut events = Vec::new();
     let mut report = SbiDecodeReport {
         tcp_connections: connections.len(),
@@ -122,14 +334,30 @@ pub fn decode_connections(
                 .unwrap_or(0);
             (packet_number, frame.direction_index, frame.offset)
         });
+        // 2.21.46 (ordre #9 6977819264) — carry HPACK. Si le worker
+        // continu a déjà vu cette connexion dans un segment précédent,
+        // on récupère sa paire de `Decoder` (tables dynamiques
+        // HPACK). Sinon, on en crée une neuve. En fin de traitement,
+        // les décodeurs sont remis dans le carry.
+        let (mut decoders, newly_tracked) = match carry.as_deref_mut() {
+            Some(carry) => match carry.take(&connection.key) {
+                Some(existing) => (existing, false),
+                None => ([Decoder::new(), Decoder::new()], true),
+            },
+            None => ([Decoder::new(), Decoder::new()], false),
+        };
         let (decoded, streams, incomplete, errors) = transactions(
             connection,
             frames,
+            &mut decoders,
             capture_id,
             interface,
             endpoint_names,
             pseudonym_key,
         );
+        if let Some(carry) = carry.as_deref_mut() {
+            carry.store(connection.key.clone(), decoders, newly_tracked);
+        }
         report.http2_streams += streams;
         report.incomplete_streams += incomplete;
         report.sbi_transactions += decoded.len();
@@ -250,6 +478,7 @@ fn overlapping(spans: &[ProvenanceSpan], start: usize, end: usize) -> Vec<&Prove
 fn transactions(
     connection: &ReassembledConnection,
     frames: Vec<Frame>,
+    decoders: &mut [Decoder<'static>; 2],
     capture_id: &str,
     interface: &str,
     endpoint_names: &HashMap<String, String>,
@@ -261,7 +490,12 @@ fn transactions(
     // keep going; the very next block that decodes cleanly re-synchronises the
     // direction automatically. No permanent direction poisoning — that
     // regressed 0.4.2 to a 70x event inflation on well-formed captures.
-    let mut decoders = [Decoder::new(), Decoder::new()];
+    //
+    // 2.21.46 (ordre #9 6977819264) — les décodeurs sont désormais
+    // possédés par l'appelant. Chemin one-shot → paire neuve créée
+    // dans `decode_connections` ; chemin carry → paire retrouvée
+    // depuis `SbiCarryContext` (table dynamique préservée d'un
+    // segment pcap au suivant, pour la même clé 5-tuple TCP).
     let mut continuations: HashMap<(usize, u32), (Vec<u8>, Frame)> = HashMap::new();
     let mut streams: BTreeMap<u32, StreamState> = BTreeMap::new();
     let mut errors = Vec::new();
@@ -2915,6 +3149,349 @@ mod tests {
             "exactly one HPACK_CONTEXT_UNAVAILABLE expected (saw {}): {:?}",
             unavail_count, report.errors
         );
+    }
+
+    // --- 2.21.46 (ordre #9 6977819264) HPACK carry across segments ---
+
+    /// Construit un pcap-like `ReassembledConnection` à partir d'une
+    /// séquence de blocs HEADERS (côté client) + d'un bloc réponse
+    /// (côté serveur). Les ports/IP sont paramétrés pour qu'on puisse
+    /// exprimer "deux segments de la MÊME connexion TCP" en répétant
+    /// la même clé. `packet_offset` décale les PacketReference.
+    fn two_way_conn(
+        client: TcpEndpoint,
+        server: TcpEndpoint,
+        client_bytes: Vec<u8>,
+        server_bytes: Vec<u8>,
+        packet_offset: u64,
+    ) -> ReassembledConnection {
+        let key = TcpConnectionKey::new(client.clone(), server.clone()).0;
+        ReassembledConnection {
+            key,
+            directions: [
+                direction(
+                    client.clone(),
+                    server.clone(),
+                    client_bytes,
+                    packet_offset + 1,
+                ),
+                direction(server, client, server_bytes, packet_offset + 2),
+            ],
+        }
+    }
+
+    /// 2.21.46 — carry préservé entre segments : un `Encoder` HPACK
+    /// partagé émet un bloc "literal + incremental indexing" au 1er
+    /// envoi, puis un bloc "indexed only" au 2e envoi. En captures
+    /// continues, chaque segment pcap devient un
+    /// `ReassembledConnection` distinct (nouveau `TcpReassembler`).
+    /// Sans carry, le 2e bloc tombe en `HPACK_CONTEXT_UNAVAILABLE`.
+    /// Avec carry, la table dynamique du 1er segment est réutilisée
+    /// et le 2e bloc décode proprement — aucun nom n'est deviné,
+    /// aucun stream n'est inventé.
+    #[test]
+    fn hpack_carry_preserves_dynamic_table_across_segments_so_indexed_headers_decode_cleanly() {
+        let client = TcpEndpoint {
+            address: "10.0.0.11".into(),
+            port: 51001,
+        };
+        let server = TcpEndpoint {
+            address: "10.0.0.12".into(),
+            port: 7777,
+        };
+        let path = b"/nnrf-nfm/v1/nf-instances/4e3a2c-devmat-2-21-46-carry";
+        // 1er bloc construit manuellement : literal + incremental
+        // indexing (opcode 01xxxxxx, prefix 6 bits, name indexé
+        // depuis la static table). Chaque entrée est AJOUTÉE à la
+        // table dynamique du décodeur (RFC 7541 §6.2.1). On émet
+        // les 4 headers dans cet ordre pour obtenir, après décodage,
+        // dyn[62..=65] = { :scheme, :path, :authority, :method }.
+        //
+        // Note : `hpack::Encoder` ne fait PAS d'incremental indexing
+        // pour les headers dont le NAME est déjà dans la static
+        // table (:method, :path, :authority, :scheme) — il émet des
+        // literals sans indexing. Un encoder réel SBI (Open5GS,
+        // free5GC, nghttp2) utilise la stratégie opposée : il
+        // indexe tout pour amortir les requêtes répétées. Ce test
+        // reproduit le comportement du vrai réseau (SBI 5G), pas
+        // celui de la bibliothèque de test.
+        let mut block1: Vec<u8> = Vec::new();
+        // :method PATCH — name index 2 (:method) dans la static,
+        // value literal "PATCH" sans Huffman.
+        block1.push(0x40 | 2);
+        block1.push(b"PATCH".len() as u8);
+        block1.extend_from_slice(b"PATCH");
+        // :authority nrf.oiran.local — name index 1, value literal.
+        block1.push(0x40 | 1);
+        block1.push(b"nrf.oiran.local".len() as u8);
+        block1.extend_from_slice(b"nrf.oiran.local");
+        // :path /nnrf-nfm/... — name index 4 (:path /), value literal.
+        block1.push(0x40 | 4);
+        assert!(path.len() < 127, "test path fits in a single-byte length");
+        block1.push(path.len() as u8);
+        block1.extend_from_slice(path);
+        // :scheme http — name index 6, value literal "http".
+        block1.push(0x40 | 6);
+        block1.push(b"http".len() as u8);
+        block1.extend_from_slice(b"http");
+        // 2e bloc : 100 % indexed vers la dynamic table du 1er.
+        //   62  = :scheme http       (dernière ajoutée)
+        //   63  = :path /nnrf-...    (avant-dernière)
+        //   64  = :authority         (…)
+        //   65  = :method PATCH      (première ajoutée)
+        let block2: Vec<u8> = vec![0x80 | 65, 0x80 | 64, 0x80 | 63, 0x80 | 62];
+        // Au 2e encode, :authority value, :path value, et content-type
+        // value sont indexés dans la table dynamique de l'encoder. Un
+        // Decoder neuf (sans carry) ne les retrouvera pas.
+        let mut resp_enc = Encoder::new();
+        let ok1 = resp_enc.encode([(b":status".as_slice(), b"204".as_slice())]);
+        let ok2 = resp_enc.encode([(b":status".as_slice(), b"204".as_slice())]);
+
+        let mut seg1_client = PREFACE.to_vec();
+        seg1_client.extend(frame(1, 5, 1, &block1));
+        let mut seg1_server = Vec::new();
+        seg1_server.extend(frame(1, 5, 1, &ok1));
+        let mut seg2_client = Vec::new();
+        seg2_client.extend(frame(1, 5, 3, &block2));
+        let mut seg2_server = Vec::new();
+        seg2_server.extend(frame(1, 5, 3, &ok2));
+
+        let seg1 = two_way_conn(
+            client.clone(),
+            server.clone(),
+            seg1_client.clone(),
+            seg1_server.clone(),
+            0,
+        );
+        let seg2 = two_way_conn(
+            client.clone(),
+            server.clone(),
+            seg2_client.clone(),
+            seg2_server.clone(),
+            10,
+        );
+
+        // Décodage AVEC carry : les 2 segments sont décodés dans le
+        // même carry, le 2e segment retrouve la table du 1er.
+        let mut carry = SbiCarryContext::new(16);
+        let (events1, report1) = decode_connections_with_carry(
+            &[seg1.clone()],
+            "sha256:seg1",
+            "SBI",
+            &HashMap::new(),
+            &test_key(),
+            &mut carry,
+        );
+        let (events2, report2) = decode_connections_with_carry(
+            &[seg2.clone()],
+            "sha256:seg2",
+            "SBI",
+            &HashMap::new(),
+            &test_key(),
+            &mut carry,
+        );
+        assert_eq!(
+            events1.len(),
+            1,
+            "segment 1 must emit exactly one stream (seeded by literal headers): {events1:?}"
+        );
+        assert_eq!(
+            events2.len(),
+            1,
+            "segment 2 must emit its stream because HPACK carry reuses dynamic table; got {events2:?}"
+        );
+        assert_eq!(
+            events2[0].decoding_status,
+            DecodeStatus::Decoded,
+            "segment 2 must be DECODED when carry provides prior dynamic table"
+        );
+        assert!(
+            !report2
+                .errors
+                .iter()
+                .any(|e| e.contains(HPACK_CONTEXT_UNAVAILABLE)),
+            "segment 2 must not raise HPACK_CONTEXT_UNAVAILABLE with carry active: {:?}",
+            report2.errors
+        );
+        let _ = report1;
+        // Compteurs du carry : 1 connexion suivie, 1 reprise.
+        let metrics = carry.metrics().clone();
+        assert_eq!(metrics.connections_tracked, 1);
+        assert_eq!(
+            metrics.connections_resumed, 1,
+            "the second segment must prove that the dynamic table was reused"
+        );
+        assert_eq!(metrics.invalidations, 0);
+        assert_eq!(metrics.connections_evicted, 0);
+
+        // Preuve de mutation : SANS carry (nouveaux Decoder par segment),
+        // le 2e segment DOIT retomber en HPACK_CONTEXT_UNAVAILABLE.
+        let (events2_no_carry, report2_no_carry) = decode_connections(
+            &[seg2],
+            "sha256:seg2-mutation",
+            "SBI",
+            &HashMap::new(),
+            &test_key(),
+        );
+        assert!(
+            report2_no_carry
+                .errors
+                .iter()
+                .any(|e| e.contains(HPACK_CONTEXT_UNAVAILABLE))
+                || events2_no_carry.iter().any(|event| {
+                    event
+                        .errors
+                        .iter()
+                        .any(|error| error.contains(HPACK_CONTEXT_UNAVAILABLE))
+                }),
+            "mutation proof: without carry, segment 2 must surface HPACK_CONTEXT_UNAVAILABLE \
+             (otherwise the test is not actually exercising the carry): {events2_no_carry:?} / {:?}",
+            report2_no_carry.errors
+        );
+    }
+
+    /// 2.21.46 — fail-closed sur segment manquant : après
+    /// `invalidate_all`, la table dynamique est perdue pour toutes
+    /// les connexions, le segment suivant retombe en
+    /// `HPACK_CONTEXT_UNAVAILABLE` sur les headers indexés (aucun
+    /// nom deviné, aucun stream inventé). Incrémente le compteur
+    /// `invalidations`.
+    #[test]
+    fn hpack_carry_invalidation_turns_subsequent_segment_into_hpack_context_unavailable() {
+        let client = TcpEndpoint {
+            address: "10.0.0.21".into(),
+            port: 52001,
+        };
+        let server = TcpEndpoint {
+            address: "10.0.0.22".into(),
+            port: 7777,
+        };
+        let path = b"/nnrf-nfm/v1/nf-instances/invalidated";
+        // 1er bloc manuel (literal + incremental indexing) pour que
+        // le décodeur peuple sa table dynamique — même logique que
+        // le test `preserves_dynamic_table_across_segments`.
+        let mut block1: Vec<u8> = Vec::new();
+        block1.push(0x40 | 2);
+        block1.push(b"PATCH".len() as u8);
+        block1.extend_from_slice(b"PATCH");
+        block1.push(0x40 | 1);
+        block1.push(b"nrf.oiran.local".len() as u8);
+        block1.extend_from_slice(b"nrf.oiran.local");
+        block1.push(0x40 | 4);
+        block1.push(path.len() as u8);
+        block1.extend_from_slice(path);
+        block1.push(0x40 | 6);
+        block1.push(b"http".len() as u8);
+        block1.extend_from_slice(b"http");
+        // Bloc 2 = indexed-only vers la dynamic table du bloc 1.
+        //   62 = :scheme http        (dernière ajoutée)
+        //   63 = :path /nnrf-...
+        //   64 = :authority
+        //   65 = :method PATCH
+        let block2: Vec<u8> = vec![0x80 | 65, 0x80 | 64, 0x80 | 63, 0x80 | 62];
+        let mut resp_enc = Encoder::new();
+        let ok1 = resp_enc.encode([(b":status".as_slice(), b"204".as_slice())]);
+        let ok2 = resp_enc.encode([(b":status".as_slice(), b"204".as_slice())]);
+        let mut seg1_client = PREFACE.to_vec();
+        seg1_client.extend(frame(1, 5, 1, &block1));
+        let mut seg1_server = Vec::new();
+        seg1_server.extend(frame(1, 5, 1, &ok1));
+        let mut seg2_client = Vec::new();
+        seg2_client.extend(frame(1, 5, 3, &block2));
+        let mut seg2_server = Vec::new();
+        seg2_server.extend(frame(1, 5, 3, &ok2));
+        let seg1 = two_way_conn(
+            client.clone(),
+            server.clone(),
+            seg1_client,
+            seg1_server,
+            0,
+        );
+        let seg2 = two_way_conn(client, server, seg2_client, seg2_server, 10);
+
+        let mut carry = SbiCarryContext::new(16);
+        let (_, _) = decode_connections_with_carry(
+            &[seg1],
+            "sha256:seg1",
+            "SBI",
+            &HashMap::new(),
+            &test_key(),
+            &mut carry,
+        );
+        assert_eq!(carry.len(), 1, "segment 1 must have populated the carry");
+        // Simulation worker continu : segment intermédiaire manquant
+        // ou en échec → fail-closed.
+        carry.invalidate_all();
+        assert_eq!(carry.len(), 0, "invalidate_all must drop every carried entry");
+        assert_eq!(carry.metrics().invalidations, 1);
+
+        let (events2, report2) = decode_connections_with_carry(
+            &[seg2],
+            "sha256:seg2",
+            "SBI",
+            &HashMap::new(),
+            &test_key(),
+            &mut carry,
+        );
+        let any_unavail_in_errors = report2
+            .errors
+            .iter()
+            .any(|e| e.contains(HPACK_CONTEXT_UNAVAILABLE));
+        let any_unavail_in_events = events2.iter().any(|event| {
+            event
+                .errors
+                .iter()
+                .any(|error| error.contains(HPACK_CONTEXT_UNAVAILABLE))
+        });
+        assert!(
+            any_unavail_in_errors || any_unavail_in_events,
+            "after invalidate_all, segment 2 must fail-closed on indexed headers: \
+             report.errors={:?}, events={:?}",
+            report2.errors,
+            events2
+        );
+    }
+
+    /// 2.21.46 — bornage mémoire : au-delà de `max_connections`,
+    /// l'entrée au compteur LRU minimum est évincée et le compteur
+    /// `connections_evicted` est incrémenté. La connexion évincée
+    /// retombe en `HPACK_CONTEXT_UNAVAILABLE` à son retour.
+    #[test]
+    fn hpack_carry_evicts_oldest_connection_when_over_max_and_bumps_counter() {
+        let mut carry = SbiCarryContext::new(1);
+        let a = TcpEndpoint {
+            address: "10.0.0.31".into(),
+            port: 53001,
+        };
+        let b = TcpEndpoint {
+            address: "10.0.0.32".into(),
+            port: 53002,
+        };
+        let c = TcpEndpoint {
+            address: "10.0.0.33".into(),
+            port: 53003,
+        };
+        let server = TcpEndpoint {
+            address: "10.0.0.99".into(),
+            port: 7777,
+        };
+        let (key_a, _) = TcpConnectionKey::new(a, server.clone());
+        let (key_b, _) = TcpConnectionKey::new(b, server.clone());
+        let (key_c, _) = TcpConnectionKey::new(c, server);
+        carry.store(key_a.clone(), [Decoder::new(), Decoder::new()], true);
+        carry.store(key_b.clone(), [Decoder::new(), Decoder::new()], true);
+        carry.store(key_c.clone(), [Decoder::new(), Decoder::new()], true);
+        assert_eq!(
+            carry.len(),
+            1,
+            "cap enforced: only the most recently stored entry survives"
+        );
+        assert!(
+            carry.entries.contains_key(&key_c),
+            "most recent key must remain"
+        );
+        assert_eq!(carry.metrics().connections_tracked, 3);
+        assert_eq!(carry.metrics().connections_evicted, 2);
     }
 
     // --- 2.8.0 SBI multipart / n2SmInfo tests ---------------------
