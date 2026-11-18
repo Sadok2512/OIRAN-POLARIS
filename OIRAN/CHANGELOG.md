@@ -1,5 +1,15 @@
 # Changelog
 
+## OIRAN API 2.21.42 + session-engine 0.5.18 — 2026-11-18 — retrait du rattachement SBI par ancre de capture (2.21.38 + 2.21.40), en attente du diagnostic lab
+
+Upgrade **patch**, sur 2.21.41 (ANR1, compaction des projections).
+
+Deux recettes lab ont échoué sur le même gate (ANR2 #10 6965682013 et 6968855854) : avec l'ancre de capture (2.21.38), puis avec les clés exactes uniquement si uniques (2.21.40), la session de l'essai 7 perd ses **34 SBI vTAP** (0/34, `sbi_unattached_no_anchor` = 719 puis 1 529). Les tests locaux passaient : le modèle de test ne reproduit pas les clés réelles du lab. On ne code pas une 3e fois à l'aveugle.
+
+- `session-engine/src/lib.rs` revient au rattachement SBI de 2.21.37 (diff de 4f62bec + 328a5d2 appliqué à l'envers, aucun autre changement). Comportement prouvé au lab : 34/34 SBI vTAP sur la session de l'essai 7.
+- Le sur-rattachement (992 SBI d'autres jours sur cette session) redevient **OUVERT**, avec diagnostic lab en lecture seule demandé avant tout nouveau code.
+- Conservés : catalogue SBI 2.21.39 (DEVMAT) et compaction des projections 2.21.41 (ANR1).
+
 ## OIRAN API 2.21.41 + session-engine 0.5.17 + live-probe 0.6.17 — 2026-11-18 — projection de publication compacte
 
 - Ajoute une mesure reproductible par champ (`OIRAN_PUBLICATION_FIELD_AUDIT=1`) fondée sur `size_of` et les capacités possédées, sans estimation des métadonnées de l'allocateur.
