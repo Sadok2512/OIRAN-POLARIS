@@ -1748,6 +1748,13 @@ pub struct CaptureManager {
     /// pendant qu'un cycle tourne.
     sbi_hpack_carry_metrics_snapshot:
         Arc<Mutex<BTreeMap<String, SbiCarryMetricsSnapshot>>>,
+    /// 2.21.58 (ordre #9 6989701705) — compteur cumulatif par
+    /// interface des segments SBI **hors ring** décodés. Comme
+    /// le carry du ring n'est plus touché par les hors-ring, ce
+    /// compteur est la seule preuve que ces segments ont bien été
+    /// présentés au décodage. Agrégé dans le snapshot à la fin
+    /// de chaque cycle.
+    sbi_off_ring_segments_decoded_by_interface: Arc<Mutex<BTreeMap<String, usize>>>,
 }
 
 /// 2.21.53 — snapshot public des compteurs carry HPACK pour une
@@ -1760,6 +1767,14 @@ pub struct SbiCarryMetricsSnapshot {
     pub connections_resumed: usize,
     pub connections_evicted: usize,
     pub invalidations: usize,
+    /// 2.21.58 (ordre #9 6989701705) — nombre de segments SBI
+    /// **hors ring** présentés au décodage pendant le cycle
+    /// courant. Un hors-ring est désormais décodé avec un carry
+    /// jetable (`None`), SANS toucher au carry du ring. Ce
+    /// compteur prouve que ces segments ont bien été décodés
+    /// même si `invalidations` n'augmente pas.
+    #[serde(default)]
+    pub off_ring_segments_decoded: usize,
     pub last_cycle_epoch_ms: u64,
 }
 
@@ -2051,6 +2066,7 @@ impl CaptureManager {
             sbi_hpack_carry_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
             sbi_hpack_last_ring_pos_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
             sbi_hpack_carry_metrics_snapshot: Arc::new(Mutex::new(BTreeMap::new())),
+            sbi_off_ring_segments_decoded_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
             // 2.14.11 (ANR1 #10 6860508699) — override test-only par
             // défaut à `None` (production). Les tests internes
             // live-probe installent une valeur permissive via
@@ -6131,59 +6147,53 @@ impl CaptureManager {
                 // ses events partiels sont retirés du spool, l'échec est
                 // journalisé, et la suite (autres segments, phase vTAP) tourne.
                 let spool_mark = decoded_spool_mark(&mut decoded_spool)?;
-                // 2.21.54 (ordre #9 6987366620) — logique de carry
-                // par type de segment :
-                //   * Segment ring (nom parsable + source_path
-                //     lisible) : continuité stricte `(run_id, seq)`
-                //     via `hpack_carry_is_contiguous`. Non contigu
-                //     → `invalidate_all`.
-                //   * Segment hors ring (vTAP, legacy, state
-                //     absent) : **toujours** `invalidate_all` juste
-                //     avant le décodage, carry repart vide. Les
-                //     événements SBI de ce segment sont décodés
-                //     SANS état HPACK partagé (fail-closed).
+                // 2.21.58 (ordre #9 6989701705) — logique corrigée :
+                // le carry du ring est **UNIQUEMENT** touché par
+                // les segments ring. Les segments hors ring
+                // (vTAP, legacy, state absent/corrompu) sont
+                // décodés avec un carry jetable (`None`), sans
+                // jamais toucher au carry partagé du ring. Raison :
+                // une sonde vTAP et le ring dumpcap peuvent voir
+                // **le même 5-tuple TCP** à des positions
+                // différentes du flux ; mélanger leurs tables
+                // dynamiques produirait des en-têtes fabriqués
+                // (défaut 2.21.54).
                 let is_sbi = interface.interface == "SBI";
-                if is_sbi {
-                    if is_ring {
-                        if let Some(current_ring_pos) = ring_pos.as_ref() {
-                            let last_pos = self
-                                .sbi_hpack_last_ring_pos_by_interface
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .get(&interface.interface)
-                                .cloned();
-                            if !hpack_carry_is_contiguous(last_pos.as_ref(), current_ring_pos) {
-                                let mut carries = self
-                                    .sbi_hpack_carry_by_interface
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                let carry = carries
-                                    .entry(interface.interface.clone())
-                                    .or_insert_with(|| {
-                                        oiran_decode::SbiCarryContext::new(
-                                            oiran_decode::DEFAULT_HPACK_CARRY_MAX_CONNECTIONS,
-                                        )
-                                    });
-                                carry.invalidate_all();
-                            }
-                        }
-                    } else {
-                        // Hors ring : invalidation systématique
-                        // avant le décodage ; last_ring_pos n'est
-                        // pas mis à jour (le prochain segment ring
-                        // réévalue sa continuité indépendamment).
-                        let mut carries = self
-                            .sbi_hpack_carry_by_interface
+                if is_sbi && !is_ring {
+                    // Compteur : ce segment hors ring va être
+                    // présenté au décodage. Seule preuve que
+                    // l'univers SBI n'a pas rétréci, puisque
+                    // `invalidations` du carry ring ne doit plus
+                    // bouger.
+                    self.sbi_off_ring_segments_decoded_by_interface
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .entry(interface.interface.clone())
+                        .and_modify(|v| *v = v.saturating_add(1))
+                        .or_insert(1);
+                }
+                if is_sbi && is_ring {
+                    if let Some(current_ring_pos) = ring_pos.as_ref() {
+                        let last_pos = self
+                            .sbi_hpack_last_ring_pos_by_interface
                             .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let carry = carries
-                            .entry(interface.interface.clone())
-                            .or_insert_with(|| {
-                                oiran_decode::SbiCarryContext::new(
-                                    oiran_decode::DEFAULT_HPACK_CARRY_MAX_CONNECTIONS,
-                                )
-                            });
-                        carry.invalidate_all();
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .get(&interface.interface)
+                            .cloned();
+                        if !hpack_carry_is_contiguous(last_pos.as_ref(), current_ring_pos) {
+                            let mut carries = self
+                                .sbi_hpack_carry_by_interface
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let carry = carries
+                                .entry(interface.interface.clone())
+                                .or_insert_with(|| {
+                                    oiran_decode::SbiCarryContext::new(
+                                        oiran_decode::DEFAULT_HPACK_CARRY_MAX_CONNECTIONS,
+                                    )
+                                });
+                            carry.invalidate_all();
+                        }
                     }
                 }
                 let decode_outcome = {
@@ -6212,7 +6222,9 @@ impl CaptureManager {
                             .and_then(|_| decoded_spool.write_all(b"\n"))
                             .map_err(display_error)
                     };
-                    if is_sbi {
+                    if is_sbi && is_ring {
+                        // Ring : carry partagé, continuité déjà
+                        // évaluée ci-dessus.
                         let mut carries = self
                             .sbi_hpack_carry_by_interface
                             .lock()
@@ -6229,6 +6241,14 @@ impl CaptureManager {
                             Some(carry),
                             sink,
                         )
+                    } else if is_sbi {
+                        // 2.21.58 — hors ring : carry jetable
+                        // (`None`). Jamais le carry du ring. Même
+                        // si le 5-tuple TCP de ce segment est
+                        // identique à une connexion ring en cours,
+                        // aucune table dynamique ne traverse — ni
+                        // dans un sens, ni dans l'autre.
+                        decode_capture_streaming(&config, &pseudonym_key, sink)
                     } else {
                         decode_capture_streaming(&config, &pseudonym_key, sink)
                     }
@@ -6253,11 +6273,14 @@ impl CaptureManager {
                     Err(error) if capture_id != CONTINUOUS_CAPTURE_ID => return Err(error),
                     Err(error) => {
                         decoded_spool_rewind(&mut decoded_spool, spool_mark)?;
-                        // 2.21.53 — fail-closed sur erreur :
-                        // invalider le carry et NE PAS mettre à jour
-                        // `last_ring_pos` (le segment suivant sera vu
-                        // discontinu et re-invalidera).
-                        if is_sbi {
+                        // 2.21.58 — fail-closed sur erreur :
+                        // n'invalider le carry ring que si le
+                        // segment en échec était un segment ring.
+                        // Un hors-ring en échec ne doit jamais
+                        // modifier le carry du ring (sinon le
+                        // ring suivant perdrait sa table pour une
+                        // erreur qui ne lui appartient pas).
+                        if is_sbi && is_ring {
                             let mut carries = self
                                 .sbi_hpack_carry_by_interface
                                 .lock()
@@ -6379,30 +6402,57 @@ impl CaptureManager {
                 reports.insert(key, report);
             }
         }
-        // 2.21.53 (ordre #9 6985951083) — snapshot des métriques
-        // carry HPACK par interface en fin de cycle, pour
-        // exposition via `CaptureManager::hpack_carry_metrics_snapshot()`
-        // (consommé par un endpoint oiran-api existant). Mise à
-        // jour atomique sous lock, pas de pointeur fuyant.
+        // 2.21.58 (ordre #9 6989701705) — snapshot des métriques
+        // carry HPACK par interface en fin de cycle. Agrège :
+        //   * les compteurs du `SbiCarryContext` ring (tracked,
+        //     resumed, evicted, invalidations) ;
+        //   * `off_ring_segments_decoded` tenu séparément par
+        //     interface (seule preuve que les segments hors ring
+        //     ont été présentés au décodage — puisque le carry du
+        //     ring ne doit plus bouger pour eux).
         {
             let carries = self
                 .sbi_hpack_carry_by_interface
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let off_ring_counts = self
+                .sbi_off_ring_segments_decoded_by_interface
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
             let mut snapshot = self
                 .sbi_hpack_carry_metrics_snapshot
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let now_ms = epoch_ms();
-            for (iface, carry) in carries.iter() {
-                let m = carry.metrics();
+            // Union des interfaces (celles vues côté ring et côté off-ring).
+            let interfaces: BTreeSet<String> = carries
+                .keys()
+                .cloned()
+                .chain(off_ring_counts.keys().cloned())
+                .collect();
+            for iface in interfaces {
+                let (tracked, resumed, evicted, invalidations) = carries
+                    .get(&iface)
+                    .map(|c| {
+                        let m = c.metrics();
+                        (
+                            m.connections_tracked,
+                            m.connections_resumed,
+                            m.connections_evicted,
+                            m.invalidations,
+                        )
+                    })
+                    .unwrap_or((0, 0, 0, 0));
+                let off_ring = off_ring_counts.get(&iface).copied().unwrap_or(0);
                 snapshot.insert(
-                    iface.clone(),
+                    iface,
                     SbiCarryMetricsSnapshot {
-                        connections_tracked: m.connections_tracked,
-                        connections_resumed: m.connections_resumed,
-                        connections_evicted: m.connections_evicted,
-                        invalidations: m.invalidations,
+                        connections_tracked: tracked,
+                        connections_resumed: resumed,
+                        connections_evicted: evicted,
+                        invalidations,
+                        off_ring_segments_decoded: off_ring,
                         last_cycle_epoch_ms: now_ms,
                     },
                 );
@@ -20273,20 +20323,26 @@ mod tests {
             Some(("20261118T093000Z".to_string(), 1)),
             "le segment ring doit avoir avancé last_ring_pos (preuve qu'il a été décodé)"
         );
-        // L'off-ring a aussi été présenté : il a déclenché
-        // `invalidate_all`. On attend au moins 2 invalidations :
-        // 1 pour l'init (last_pos=None), 1 pour l'off-ring.
+        // 2.21.58 — l'off-ring est décodé avec un carry **jetable**
+        // (pas le carry du ring). Il n'incrémente donc plus
+        // `invalidations` du carry ring. La preuve que l'off-ring
+        // a été présenté est désormais le compteur
+        // `off_ring_segments_decoded ≥ 1`.
         // Preuve de mutation : si on remettait un `continue` sur
-        // nom non lisible, l'off-ring ne déclencherait aucune
-        // invalidation, donc `invalidations <= 1`.
+        // nom non lisible, `off_ring_segments_decoded` resterait
+        // à 0.
         let snap = manager
             .hpack_carry_metrics_snapshot()
             .get("SBI")
             .cloned()
             .unwrap_or_default();
         assert!(
-            snap.invalidations >= 2,
-            "l'off-ring doit déclencher un invalidate_all supplémentaire : snap={snap:?}"
+            snap.off_ring_segments_decoded >= 1,
+            "l'off-ring doit être compté comme décodé : snap={snap:?}"
+        );
+        assert_eq!(
+            snap.invalidations, 1,
+            "l'off-ring ne doit PAS incrémenter invalidations du carry ring (seule l'init au cycle 1 compte pour 1) : snap={snap:?}"
         );
     }
 
@@ -20336,17 +20392,22 @@ mod tests {
             last, None,
             "sans import_state, aucun segment n'est marqué ring → last_ring_pos reste None"
         );
-        // Les 2 fichiers ont chacun déclenché un `invalidate_all`
-        // → invalidations >= 2. Preuve : si un seul était
-        // décodé (régression), invalidations ne monterait qu'à 1.
+        // 2.21.58 — les 2 fichiers hors ring sont décodés avec un
+        // carry jetable, donc n'incrémentent pas `invalidations`
+        // du carry ring (qui reste à 0 dans un scénario sans
+        // segment ring). On compte via `off_ring_segments_decoded`.
         let snap = manager
             .hpack_carry_metrics_snapshot()
             .get("SBI")
             .cloned()
             .unwrap_or_default();
         assert!(
-            snap.invalidations >= 2,
-            "les 2 fichiers SBI doivent chacun être présentés : snap={snap:?}"
+            snap.off_ring_segments_decoded >= 2,
+            "les 2 fichiers SBI hors ring doivent être présentés : snap={snap:?}"
+        );
+        assert_eq!(
+            snap.invalidations, 0,
+            "aucun segment ring → carry ring ne bouge pas : snap={snap:?}"
         );
     }
 
@@ -20433,8 +20494,156 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert!(
-            snap.invalidations >= 1,
-            "le SBI doit être décodé (invalidé car hors ring) : snap={snap:?}"
+            snap.off_ring_segments_decoded >= 1,
+            "le SBI doit être décodé (carry jetable car state corrompu → off-ring) : snap={snap:?}"
+        );
+    }
+
+    /// 2.21.58 test (h) — PREUVE DE NON-CONTAMINATION DU CARRY
+    /// RING. Un segment hors ring de **même 5-tuple TCP** qu'un
+    /// segment ring ne doit jamais polluer le carry ring, ni
+    /// dans un sens ni dans l'autre.
+    ///
+    /// Setup :
+    ///   * Cycle 1 : 1 segment ring (seq 1) + 1 segment hors ring
+    ///     portant **la même connexion TCP** (ports 51001↔7777
+    ///     identiques).
+    ///   * Cycle 2 : segment ring (seq 2), même run.
+    ///
+    /// Assertions :
+    ///   * Après cycle 1 : `last_ring_pos = (RUN1, 1)` (ring
+    ///     traité), `off_ring_segments_decoded == 1` (hors-ring
+    ///     présenté), **`invalidations == 1`** (seule l'init
+    ///     cycle 1 compte, l'off-ring n'a PAS invalidé).
+    ///   * Après cycle 2 : `last_ring_pos = (RUN1, 2)` (ring N+1
+    ///     contigu), `invalidations` toujours **1** (preuve que
+    ///     le hors-ring n'a pas rendu le ring suivant
+    ///     discontinu via corruption de la table).
+    ///
+    /// Preuve de mutation : si on remettait le carry partagé pour
+    /// le hors-ring (régression 2.21.54), l'off-ring effectuerait
+    /// un `invalidate_all` sur le carry ring → `invalidations ≥ 2`
+    /// → assertion rouge.
+    #[test]
+    fn off_ring_segments_do_not_contaminate_ring_carry_even_on_same_5_tuple() {
+        let root = temporary_root("hpack-same-5tuple");
+        let pcap_dir = root.join("pcap");
+        fs::create_dir_all(&pcap_dir).unwrap();
+        let block_r1 =
+            sbi_block1_preface_and_literal_headers(b"/nnrf-nfm/v1/nf-instances/ring-seq1");
+        let block_off =
+            sbi_block1_preface_and_literal_headers(b"/nnrf-nfm/v1/nf-instances/off-ring-same-5tuple");
+        let block_r2 = sbi_block2_indexed_only(3);
+        // Les 3 pcap portent la même paire de ports 51001↔7777
+        // (same 5-tuple) via `write_sbi_pcap_sha_named`.
+        let (sha_r1, name_r1) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block_r1);
+        let (_, name_off) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block_off);
+        let (sha_r2, name_r2) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block_r2);
+        // State : r1 et r2 sont enregistrés (ring, mêmes run_id,
+        // seq=1 puis seq=2). L'off-ring n'y est pas.
+        let mut state = ContinuousImportState::default();
+        state.segments.insert(
+            sha_r1.clone(),
+            imported_segment(
+                "SBI",
+                "/src/sbi/sbi_20261118T093000Z_00001_20261118110100.pcapng",
+                &name_r1,
+            ),
+        );
+        state.segments.insert(
+            sha_r2.clone(),
+            imported_segment(
+                "SBI",
+                "/src/sbi/sbi_20261118T093000Z_00002_20261118110200.pcapng",
+                &name_r2,
+            ),
+        );
+        let ds_parent = root.join("datasets");
+        fs::create_dir_all(&ds_parent).unwrap();
+        fs::write(
+            ds_parent.join("import_state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let manager = CaptureManager::with_helper_and_interface_root(
+            root.clone(),
+            false,
+            CaptureHelperClient::new(root.join("helper.sock"), 0),
+            root.clone(),
+            root.join("pseudonym.key"),
+        )
+        .expect("manager");
+        let call_cycle = |cycle_label: &str, selected_files: &[&str]| {
+            let ds_dir = ds_parent.join(format!("dataset-{cycle_label}"));
+            let selected: BTreeSet<PathBuf> =
+                selected_files.iter().map(|f| pcap_dir.join(f)).collect();
+            let _ = manager.process_capture_into_selected(
+                CONTINUOUS_CAPTURE_ID,
+                format!("ds-{cycle_label}"),
+                &pcap_dir,
+                &ds_dir,
+                ds_dir.display().to_string(),
+                &sbi_interfaces(),
+                Some(&selected),
+                None,
+            );
+        };
+
+        // Cycle 1 : ring seq 1 + hors-ring même 5-tuple.
+        call_cycle("c1", &[&name_r1, &name_off]);
+        let last1 = manager
+            .sbi_hpack_last_ring_pos_by_interface
+            .lock()
+            .unwrap()
+            .get("SBI")
+            .cloned();
+        assert_eq!(
+            last1,
+            Some(("20261118T093000Z".to_string(), 1)),
+            "cycle 1 : ring seq 1 doit avancer last_ring_pos"
+        );
+        let snap1 = manager
+            .hpack_carry_metrics_snapshot()
+            .get("SBI")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            snap1.off_ring_segments_decoded, 1,
+            "cycle 1 : hors-ring compté comme décodé : snap1={snap1:?}"
+        );
+        assert_eq!(
+            snap1.invalidations, 1,
+            "cycle 1 : UNIQUEMENT l'init (ring last=None non-contigu). \
+             Preuve de non-contamination : le hors-ring n'a PAS invalidé le carry ring. \
+             snap1={snap1:?}"
+        );
+
+        // Cycle 2 : ring seq 2 (contigu à seq 1). Le carry ring
+        // doit contenir la table du seq 1 intacte (preuve que le
+        // hors-ring n'a rien effacé).
+        call_cycle("c2", &[&name_r2]);
+        let last2 = manager
+            .sbi_hpack_last_ring_pos_by_interface
+            .lock()
+            .unwrap()
+            .get("SBI")
+            .cloned();
+        assert_eq!(
+            last2,
+            Some(("20261118T093000Z".to_string(), 2)),
+            "cycle 2 : ring seq 2 contigu doit avancer last_ring_pos"
+        );
+        let snap2 = manager
+            .hpack_carry_metrics_snapshot()
+            .get("SBI")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            snap2.invalidations, 1,
+            "cycle 2 : AUCUNE nouvelle invalidation (ring seq 2 contigu à seq 1). \
+             Mutation : si le hors-ring partageait le carry ring en cycle 1, \
+             invalidations serait ≥ 2 (invalidate avant le hors-ring). \
+             snap2={snap2:?}"
         );
     }
 }

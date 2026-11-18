@@ -1513,6 +1513,7 @@ async fn health_response(state: &AppState, first_wait: std::time::Duration) -> J
                 "connections_resumed": m.connections_resumed,
                 "connections_evicted": m.connections_evicted,
                 "invalidations": m.invalidations,
+                "off_ring_segments_decoded": m.off_ring_segments_decoded,
                 "last_cycle_epoch_ms": m.last_cycle_epoch_ms,
             })
         })

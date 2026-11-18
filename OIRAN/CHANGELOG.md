@@ -1,5 +1,87 @@
 # Changelog
 
+## OIRAN API 2.21.58 + live-probe 0.6.22 — 2026-11-18 — carry HPACK : carry jetable pour hors-ring, non-contamination du carry ring même sur 5-tuple identique (ordre #9 6989701705)
+
+Correctif du dernier défaut 2.21.54 (ordre #9 6989701705) : le hors-ring contaminait le carry **partagé** du ring. Même branche `fix/oiran-2.21.53-hpack-carry-seq`, nouveau commit, pas de force-push, aucun geste lab.
+
+### Pourquoi 2.21.54 refusée
+
+Dans `process_capture_into_selected` pour SBI (live-probe ≈ L6170–6186, pré-2.21.58), un segment **hors ring** faisait :
+1. `invalidate_all()` sur le **carry partagé du ring**.
+2. Décodage avec ce **même carry** (passé `Some(carry)`). Les tables HPACK du hors-ring y restaient.
+3. `last_ring_pos` non modifié.
+
+Au cycle suivant, le segment ring N+1 était jugé contigu à N, donc **aucune nouvelle invalidation**. Il décodait alors avec un carry qui :
+- (1) avait perdu la table de N (effacée par le hors-ring) → **gain du carry perdu** ;
+- (2) contenait les tables du hors-ring. Une sonde vTAP et le ring dumpcap peuvent voir **le même 5-tuple TCP** (same client port, same server port 7777) à des positions différentes du flux → application d'une table étrangère au segment ring = **en-têtes fabriqués**.
+
+### Correctif 2.21.58
+
+#### Carry jetable pour hors-ring
+
+Dans `process_capture_into_selected`, branche SBI :
+- **Segment ring** : carry partagé `Some(&mut self.sbi_hpack_carry_by_interface[iface])`, continuité stricte `(run_id, seq)`.
+- **Segment hors ring** : `decode_capture_streaming(&config, &key, sink)` — **jamais** le carry ring. L'ordre dit « carry jetable et vide (ou `None`) » ; comme chaque segment est un seul pcap, `None` = carry jetable qui ne vit que pour ce segment et ne fuit nulle part.
+
+Le carry du ring et `last_ring_pos` **restent intacts** quand un hors-ring passe. Si un segment ring est en échec de décodage, l'`invalidate_all` reste (comportement 2.21.53). Si un hors-ring est en échec, le carry ring n'est **pas** touché (défaut 2.21.54 fermé).
+
+#### Nouveau compteur `off_ring_segments_decoded`
+
+Comme `invalidations` du carry ring ne doit plus bouger pour les hors-ring, un nouveau champ public `SbiCarryMetricsSnapshot.off_ring_segments_decoded: usize` tient le compte des segments hors ring présentés au décodage. Agrégé par interface, exposé via `/health → data.hpack_carry.by_interface[*].off_ring_segments_decoded`.
+
+Nouveau champ `CaptureManager.sbi_off_ring_segments_decoded_by_interface: Arc<Mutex<BTreeMap<String, usize>>>` — cumulatif cross-cycles, incrémenté dans `process_capture_into_selected` juste avant le décodage de chaque hors-ring.
+
+### Tests
+
+**Nouveau test (h, exigé par l'ordre #9 6989701705) :**
+
+- **`off_ring_segments_do_not_contaminate_ring_carry_even_on_same_5_tuple`** — 2 cycles sur un `CaptureManager` :
+  - Cycle 1 : ring seq 1 (`20261118T093000Z`, 1) + hors-ring de **même 5-tuple TCP** (ports 51001↔7777 identiques via `write_sbi_pcap_sha_named`).
+  - Cycle 2 : ring seq 2 (contigu).
+  - Assertions :
+    - `last_ring_pos = (RUN1, 1)` après cycle 1, puis `(RUN1, 2)` après cycle 2.
+    - `off_ring_segments_decoded == 1` après cycle 1 (hors-ring présenté).
+    - **`invalidations == 1` après cycle 1 ET après cycle 2** — preuve de non-contamination : le hors-ring n'a PAS invalidé le carry ring, et le ring seq 2 reste contigu à seq 1 (donc 0 invalidation supplémentaire).
+  - **Preuve de mutation** : remettre le carry partagé pour le hors-ring (régression 2.21.54) → `invalidations ≥ 2` après cycle 1 (invalidate_all avant le hors-ring) → **assertion rouge**.
+
+**Tests (e), (f), (g) adaptés** à la nouvelle sémantique — les assertions `invalidations >= N` sont remplacées par `off_ring_segments_decoded >= N` (seul compteur qui prouve désormais la présentation hors-ring, puisque le carry ring reste intact). Preuves de mutation inchangées.
+
+**Tests (a), (b), (c), (d)** (2.21.53) continuent de passer sans modification.
+
+### Raccord HTTP (OUVERT 4 déjà fermé en 2.21.54)
+
+`apps/api/src/lib.rs::health` : champ `off_ring_segments_decoded` ajouté à chaque entrée `by_interface`.
+
+### Équivalence de comptage (inchangée)
+
+L'univers SBI reste `capture_files_for` (2.21.54), donc **nombre d'événements SBI 2.21.58 ≥ 2.21.51** par construction. Seules différences possibles = PARTIAL → DECODED sur des ring segments contigus. Les hors-ring sont décodés comme pré-2.21.53 (sans état HPACK partagé = carry neuf par pcap).
+
+### 12 exécutions à 0 échec (log `/tmp/2.21.58/*.log`, aucun `#[ignore]` ajouté)
+
+Builds en `nice -n 19 ionice -c3 cargo test --locked -j 2`.
+
+| cible | commande | runs | failed |
+| --- | --- | --- | --- |
+| decoder-sbi | `nice -n 19 ionice -c3 cargo test --locked -p decoder-sbi -j 2` | 12 | 0 |
+| live-probe --lib | `nice -n 19 ionice -c3 cargo test --locked -p live-probe --lib -j 2` | 12 | 0 (183 tests, +1) |
+| oiran-api --lib | `nice -n 19 ionice -c3 cargo test --locked -p oiran-api --lib -j 2` | 12 | 0 |
+| vtap --locked | `cd vtap && cargo update -w && nice -n 19 ionice -c3 cargo test --locked -j 2` | 12 | 0 |
+
+Toolchain `1.83`.
+
+### OUVERT
+
+1. **Stock SBI PARTIAL antérieur à 2.21.58** : conserve `HPACK_CONTEXT_UNAVAILABLE`.
+2. **Bornage 256 connexions/interface SBI** : `connections_evicted` à surveiller.
+3. **Vérification DECODED/PARTIAL end-to-end** : tests prouvent la logique (ring/off-ring, continuité, non-contamination) mais pas le reassembly TCP complet SBI (dépend des pcap fixture SBI du lab).
+
+### Numérotation
+
+- `live-probe` 0.6.21 → **0.6.22** (patch, carry jetable + compteur `off_ring_segments_decoded`).
+- `oiran-api` 2.21.54 → **2.21.58** (patch, raccord HTTP du nouveau compteur ; numéros 2.21.55–2.21.57 réservés ANR1).
+- `decoder-sbi` 0.4.10 et `oiran-decode` 0.8.1 : inchangés.
+- Une version SemVer par commit (règle version-par-commit).
+
 ## OIRAN API 2.21.54 + live-probe 0.6.21 — 2026-11-18 — carry HPACK : univers SBI inchangé, le ring n'ordonne et ne décide que du carry (ordre #9 6987366620)
 
 Correctif de la régression silencieuse 2.21.53 (ordre #9 6987366620). Ajouté au même commit flow : branche `fix/oiran-2.21.53-hpack-carry-seq`, nouveau commit (pas de force-push), aucun geste lab.
