@@ -31,7 +31,9 @@ use event_schema::{
     sha256_hex, DecodeStatus, EvidenceReference, EvidenceState, InformationElement, NamedValue,
     NormalizedEvent, Protocol, PseudonymKey, Sha256Hasher,
 };
-use oiran_decode::{decode_capture_streaming, DecodeConfig, DecodeReport};
+use oiran_decode::{
+    decode_capture_streaming, decode_capture_streaming_with_sbi_carry, DecodeConfig, DecodeReport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use session_engine::{
@@ -5936,6 +5938,15 @@ impl CaptureManager {
         // `LiveDataset.zero_event_captures`.
         let mut zero_event_captures: Vec<String> = Vec::new();
         let endpoints = endpoint_map();
+        // 2.21.46 (ordre #9 6977819264) — carry HPACK par interface
+        // SBI. Les tables dynamiques sont conservées d'un segment
+        // pcap au suivant pour la même clé TCP ; ANR2 mesurait 36 439
+        // SBI PARTIAL sur 37 055 en HPACK_CONTEXT_UNAVAILABLE
+        // (dataset 2.21.42). Instancié ici pour couvrir les segments
+        // triés (`files.sort()`, ordre canonique du ring d'ingestion).
+        // Invalidé sur segment en échec (fail-closed).
+        let mut sbi_carry_by_interface: HashMap<String, oiran_decode::SbiCarryContext> =
+            HashMap::new();
         for interface in interfaces {
             let mut files = capture_files_for(pcap_dir, &interface.interface);
             files.sort();
@@ -6002,7 +6013,25 @@ impl CaptureManager {
                 // ses events partiels sont retirés du spool, l'échec est
                 // journalisé, et la suite (autres segments, phase vTAP) tourne.
                 let spool_mark = decoded_spool_mark(&mut decoded_spool)?;
-                let decode_outcome = decode_capture_streaming(
+                // 2.21.46 — accès au carry HPACK pour l'interface SBI
+                // uniquement. Les autres interfaces (NGAP, Diameter,
+                // PFCP, …) ne consomment pas HPACK ; passer `None` ne
+                // change rien à leur comportement.
+                let interface_name = interface.interface.clone();
+                let mut sbi_carry_for_segment = if interface_name == "SBI" {
+                    Some(
+                        sbi_carry_by_interface
+                            .entry(interface_name.clone())
+                            .or_insert_with(|| {
+                                oiran_decode::SbiCarryContext::new(
+                                    oiran_decode::DEFAULT_HPACK_CARRY_MAX_CONNECTIONS,
+                                )
+                            }),
+                    )
+                } else {
+                    None
+                };
+                let decode_outcome = decode_capture_streaming_with_sbi_carry(
                     &DecodeConfig {
                         input: path.clone(),
                         capture_id: capture_hash,
@@ -6010,6 +6039,7 @@ impl CaptureManager {
                         endpoints: endpoints.clone(),
                     },
                     &pseudonym_key,
+                    sbi_carry_for_segment.as_deref_mut(),
                     |event| {
                         // 2.9.5 (devmat #9 T1) : les keepalives (PFCP HB,
                         // Diameter Device-Watchdog, GTPv2 Echo, GTP-U Echo)
@@ -6037,6 +6067,16 @@ impl CaptureManager {
                     Err(error) if capture_id != CONTINUOUS_CAPTURE_ID => return Err(error),
                     Err(error) => {
                         decoded_spool_rewind(&mut decoded_spool, spool_mark)?;
+                        // 2.21.46 — fail-closed : un segment en échec
+                        // casse la continuité TCP, les tables HPACK
+                        // suivies pour cette interface ne reflètent
+                        // plus l'état réel. Toutes les connexions
+                        // retombent en HPACK_CONTEXT_UNAVAILABLE au
+                        // segment suivant tant qu'un HEADERS indexé
+                        // non trouvé n'a pas été résynchronisé.
+                        if let Some(carry) = sbi_carry_for_segment.as_deref_mut() {
+                            carry.invalidate_all();
+                        }
                         let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                         let path_display = path.display().to_string();
                         let first_report = self

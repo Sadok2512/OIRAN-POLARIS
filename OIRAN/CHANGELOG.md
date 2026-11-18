@@ -1,5 +1,60 @@
 # Changelog
 
+## OIRAN API 2.21.46 + decoder-sbi 0.4.10 + oiran-decode 0.8.1 + live-probe 0.6.19 — 2026-11-18 — carry HPACK par connexion TCP entre segments consécutifs (ordre #9 6977819264)
+
+Upgrade **patch**, sur 2.21.45. Base `3d7a502`, nouvelle branche `fix/oiran-2.21.46-hpack-carry`, pas de force-push, aucun geste lab.
+
+### Déclencheur (chiffres de l'ordre #9 6977819264, non recalculés ici)
+
+ANR2 (#10 6975302726) sur dataset 2.21.42 : **36 439 SBI PARTIAL sur 37 055 sont `HPACK_CONTEXT_UNAVAILABLE`**, dont `HpackContextUnavailable:PATCH` 35 656 (heartbeats NRF). Cause : la table dynamique HPACK est recréée à chaque nouveau segment dumpcap alors que la connexion TCP continue.
+
+### Audit (au format fichier:ligne)
+
+- `decoder-sbi/src/lib.rs:264` (avant 2.21.46) — `let mut decoders = [Decoder::new(), Decoder::new()];` recréés à chaque appel de `transactions`, i.e. à chaque `ReassembledConnection`.
+- `oiran-decode/src/lib.rs:470-480` (avant 2.21.46) — `emit_sbi_connections` consomme chaque `ReassembledConnection` et appelle `decode_connections` qui elle-même ne persiste rien entre appels.
+- `live-probe/src/lib.rs:5883-6005` (avant 2.21.46) — `process_capture_into_selected` itère sur `interfaces × files` (triés via `files.sort()` sur les noms horodatés, ordre canonique du ring) et appelle `decode_capture_streaming` PAR SEGMENT ; un `TcpReassembler` neuf est créé à chaque appel, donc une connexion TCP qui s'étend sur plusieurs segments devient plusieurs `ReassembledConnection` sans continuité de table HPACK.
+
+### Correctif
+
+- `decoder-sbi` expose `pub struct SbiCarryContext` (owned par le worker continu) qui maintient `HashMap<TcpConnectionKey, [Decoder<'static>; 2]>` avec LRU sur un compteur monotone (pas de dépendance externe). Expose `SbiCarryMetrics { connections_tracked, connections_resumed, connections_evicted, invalidations }` et une constante `DEFAULT_HPACK_CARRY_MAX_CONNECTIONS = 256` (× 2 décodeurs × ~8 KiB ≤ 4 MiB au pire cas, bornage mémoire).
+- `pub fn decode_connections_with_carry(...)` (nouvelle API) : variante qui retrouve les décodeurs par clé `TcpConnectionKey` au début du segment et les remet au carry en fin. `decode_connections` (ancienne API, one-shot) reste inchangée côté comportement — elle appelle `decode_connections_inner(..., None)`.
+- `oiran-decode` expose `pub fn decode_capture_streaming_with_sbi_carry(config, key, Option<&mut SbiCarryContext>, sink)`. `decode_capture_streaming` existante wrappe avec `None` → aucun changement pour les 23 autres sites d'appel.
+- `live-probe::process_capture_into_selected` instancie un `HashMap<String, SbiCarryContext>` par interface AVANT la boucle de fichiers ; seules les interfaces `SBI` reçoivent un carry (`None` pour NGAP/Diameter/PFCP). Ordre canonique **préservé** : les segments sont consommés dans l'ordre `files.sort()` déjà en vigueur (`files` est trié par nom, i.e. horodatage dumpcap croissant), jamais par `ts`.
+- **Fail-closed** : si `decode_capture_streaming_with_sbi_carry` retourne `Err`, on appelle `sbi_carry_for_segment.invalidate_all()` AVANT `continue`. Toutes les connexions suivies pour cette interface perdent leur état HPACK et retomberont en `HPACK_CONTEXT_UNAVAILABLE` au segment suivant tant qu'un HEADERS indexé non résolvable n'a pas été re-synchronisé. Aucun nom n'est deviné, aucun stream n'est inventé.
+
+### Tests (decoder-sbi/src/lib.rs, 3 ajouts)
+
+1. `hpack_carry_preserves_dynamic_table_across_segments_so_indexed_headers_decode_cleanly` : 2 `ReassembledConnection` avec même `TcpConnectionKey` (ports 7777↔51001). Bloc 1 construit à la main : 4 headers « literal + incremental indexing » (RFC 7541 §6.2.1, opcode `0x40|name-index`) → le décodeur peuple sa dynamic table avec `:method PATCH`, `:authority nrf.oiran.local`, `:path /nnrf-nfm/...`, `:scheme http`. Bloc 2 = 4 octets `0x80|65..62` (pure indexed vers la dynamic table). AVEC carry : segment 2 décode `Decoded`, 0 `HPACK_CONTEXT_UNAVAILABLE`, `metrics.connections_resumed == 1`. SANS carry (preuve de mutation) : `HPACK_CONTEXT_UNAVAILABLE` sur le segment 2.
+2. `hpack_carry_invalidation_turns_subsequent_segment_into_hpack_context_unavailable` : même bloc 1/2 que ci-dessus. Entre les 2 segments, `carry.invalidate_all()` est appelé → `metrics.invalidations == 1`, `len() == 0`. Le segment 2 fail-closed en `HPACK_CONTEXT_UNAVAILABLE` (indexed vers dynamic entries supprimés).
+3. `hpack_carry_evicts_oldest_connection_when_over_max_and_bumps_counter` : `SbiCarryContext::new(1)`, 3 insertions → `len == 1`, dernière key présente, `metrics.connections_evicted == 2`.
+
+Pourquoi le test construit block 1 **à la main** et non via `hpack::Encoder` : hpack 0.3.0 côté encoder n'émet « literal + incremental indexing » QUE pour les headers dont le NAME est totalement absent de la static table. Les encoders SBI réels (Open5GS, free5GC, nghttp2) utilisent la stratégie opposée — ils indexent `(name,value)` pour amortir les requêtes répétées. Le test reproduit le comportement du vrai réseau (octets HPACK « literal + incremental indexing » sur des noms static), pas celui de la bibliothèque de test.
+
+### 12 exécutions à 0 échec (log `/tmp/2.21.46/*.log`, aucun `#[ignore]` ajouté)
+
+| cible | commande | runs | failed |
+| --- | --- | --- | --- |
+| decoder-sbi | `cargo test --locked -p decoder-sbi` | 12 | 0 |
+| live-probe --lib | `cargo test --locked -p live-probe --lib` | 12 | 0 |
+| oiran-api --lib | `cargo test --locked -p oiran-api --lib` | 12 | 0 |
+| vtap --locked | `cd vtap && cargo update -w && cargo test --locked` | 12 | 0 |
+
+`cargo update -w` dans `vtap/` : propagation `decoder-sbi 0.4.9 → 0.4.10`, `oiran-decode 0.8.0 → 0.8.1` (règle vtap-lock-après-bump).
+
+### OUVERT
+
+- **Stock SBI PARTIAL antérieur à 2.21.46 déjà stocké** : conserve son statut `HPACK_CONTEXT_UNAVAILABLE`. Pas de redécodage planifié dans ce lot (règle « fix décodeur couvre les données existantes » → déclaré OUVERT ; redécodage ou patch read-time à prévoir).
+- **Capture démarrée en milieu de connexion TCP (pas de segment précédent connu)** : le carry ne peut rien deviner, fail-closed inchangé (test `mid_connection_capture_marks_hpack_context_unavailable_and_correlates_by_stream_id` 2.21.5 reste pertinent).
+- **Bornage mémoire 256 connexions par interface SBI** : ANR2 n'a jamais observé > 60 connexions SBI simultanées, mais la borne reste matière à ajustement si une capture lab remonte plus. Le compteur `connections_evicted` est le signal à surveiller.
+
+### Numérotation
+
+- `decoder-sbi` 0.4.9 → **0.4.10** (patch).
+- `oiran-decode` 0.8.0 → **0.8.1** (patch, nouvelle API publique `SbiCarryContext` + `decode_capture_streaming_with_sbi_carry`).
+- `live-probe` 0.6.18 → **0.6.19** (patch, câble le carry dans `process_capture_into_selected`).
+- `oiran-api` 2.21.45 → **2.21.46** (patch, agrégat).
+- Une version SemVer par commit (règle version-par-commit).
+
 ## OIRAN API 2.21.45 — 2026-11-18 — fusion 2.21.43 (NGAP, DEVMAT) + 2.21.44 (reprise capture après arrêt disque)
 
 Upgrade **patch**. Fusion sans conflit de code de `fix/oiran-2.21.43-ngap-partial` (4428663, relue) sur 2.21.44 (3c356fe) ; seuls Cargo.toml / Cargo.lock / CHANGELOG en conflit de version.
