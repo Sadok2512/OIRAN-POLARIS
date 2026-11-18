@@ -31,7 +31,9 @@ use event_schema::{
     sha256_hex, DecodeStatus, EvidenceReference, EvidenceState, InformationElement, NamedValue,
     NormalizedEvent, Protocol, PseudonymKey, Sha256Hasher,
 };
-use oiran_decode::{decode_capture_streaming, DecodeConfig, DecodeReport};
+use oiran_decode::{
+    decode_capture_streaming, decode_capture_streaming_with_sbi_carry, DecodeConfig, DecodeReport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use session_engine::{
@@ -1715,6 +1717,65 @@ pub struct CaptureManager {
     /// puisse faire varier le disque PENDANT que le worker continu tourne.
     disk_sample_override_for_tests:
         Arc<Mutex<Option<Result<disk_safety::FilesystemSample, String>>>>,
+    /// 2.21.53 (ordre #9 6985951083 — révision de 2.21.46/2.21.48
+    /// refusées). Carry HPACK par connexion TCP pour chaque
+    /// interface SBI. Partagé via `Arc` → survit à chaque appel de
+    /// `process_capture_into_selected` (= à chaque cycle de
+    /// publication). Les connexions NRF durent des heures et
+    /// s'étalent sur dizaines de cycles ; la table dynamique est
+    /// réutilisée tant que la continuité du ring est prouvée.
+    /// Borné à `DEFAULT_HPACK_CARRY_MAX_CONNECTIONS = 256`.
+    sbi_hpack_carry_by_interface:
+        Arc<Mutex<BTreeMap<String, oiran_decode::SbiCarryContext>>>,
+    /// 2.21.53 (ordre #9 6985951083) — dernière position traitée
+    /// **dans le ring dumpcap** par interface. Valeur =
+    /// `(run_id, seq)` extrait du nom du fichier source dumpcap
+    /// `{iface_lc}_{YYYYMMDDTHHMMSSZ}_{NNNNN}_{YYYYMMDDHHMMSS}.pcapng`
+    /// via `parse_ring_filename`. Continuité = **même `run_id`**
+    /// ET `current_seq == last_seq + 1`. Toute discontinuité
+    /// (trou, redémarrage dumpcap avec nouveau run_id, segment
+    /// sans seq lisible) ⇒ `carry.invalidate_all()`. **Jamais**
+    /// `seen_order` (mixe les interfaces et se réordonne lexico
+    /// au redémarrage via `seen_order.extend(seen_checksums)`),
+    /// **jamais** le checksum, **jamais** `ts`.
+    sbi_hpack_last_ring_pos_by_interface:
+        Arc<Mutex<BTreeMap<String, (String, u64)>>>,
+    /// 2.21.53 — snapshots des métriques `SbiCarryMetrics` par
+    /// interface, mis à jour en fin de chaque cycle. Exposés via
+    /// `hpack_carry_metrics_snapshot()` pour que l'oiran-api les
+    /// surface dans un endpoint existant (health/dataset
+    /// manifest). Partagé pour qu'un endpoint HTTP puisse lire
+    /// pendant qu'un cycle tourne.
+    sbi_hpack_carry_metrics_snapshot:
+        Arc<Mutex<BTreeMap<String, SbiCarryMetricsSnapshot>>>,
+    /// 2.21.58 (ordre #9 6989701705) — compteur cumulatif par
+    /// interface des segments SBI **hors ring** décodés. Comme
+    /// le carry du ring n'est plus touché par les hors-ring, ce
+    /// compteur est la seule preuve que ces segments ont bien été
+    /// présentés au décodage. Agrégé dans le snapshot à la fin
+    /// de chaque cycle.
+    sbi_off_ring_segments_decoded_by_interface: Arc<Mutex<BTreeMap<String, usize>>>,
+}
+
+/// 2.21.53 — snapshot public des compteurs carry HPACK pour une
+/// interface. Clone of `decoder_sbi::SbiCarryMetrics` with `Serialize`
+/// so it can be exposed through the oiran-api dataset manifest or a
+/// health endpoint without leaking the internal type.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SbiCarryMetricsSnapshot {
+    pub connections_tracked: usize,
+    pub connections_resumed: usize,
+    pub connections_evicted: usize,
+    pub invalidations: usize,
+    /// 2.21.58 (ordre #9 6989701705) — nombre de segments SBI
+    /// **hors ring** présentés au décodage pendant le cycle
+    /// courant. Un hors-ring est désormais décodé avec un carry
+    /// jetable (`None`), SANS toucher au carry du ring. Ce
+    /// compteur prouve que ces segments ont bien été décodés
+    /// même si `invalidations` n'augmente pas.
+    #[serde(default)]
+    pub off_ring_segments_decoded: usize,
+    pub last_cycle_epoch_ms: u64,
 }
 
 /// 0.6.10 (ordre #9 6952054201) — clé d'identité d'un segment
@@ -1894,6 +1955,20 @@ impl CaptureManager {
         true
     }
 
+    /// 2.21.53 (ordre #9 6985951083) — snapshot des métriques
+    /// carry HPACK par interface SBI (`SbiCarryMetricsSnapshot`).
+    /// Exposé pour que l'oiran-api puisse surfacer les compteurs
+    /// `connections_tracked / resumed / evicted / invalidations`
+    /// dans un endpoint existant (health, manifest dataset). Le
+    /// snapshot est mis à jour en fin de chaque cycle par
+    /// `process_capture_into_selected`.
+    pub fn hpack_carry_metrics_snapshot(&self) -> BTreeMap<String, SbiCarryMetricsSnapshot> {
+        self.sbi_hpack_carry_metrics_snapshot
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
     /// 0.6.10 (ordre #9 6952054201) — snapshot immuable de la quarantaine
     /// pour `/health` ou la vue capture côté API.
     pub fn quarantined_segments_snapshot(&self) -> Vec<(SegmentQuarantineKey, SegmentQuarantineEntry)> {
@@ -1988,6 +2063,10 @@ impl CaptureManager {
             quarantined_segments: Arc::new(Mutex::new(quarantined_segments)),
             pseudonym_key: Arc::new(pseudonym_key),
             interface_probe,
+            sbi_hpack_carry_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
+            sbi_hpack_last_ring_pos_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
+            sbi_hpack_carry_metrics_snapshot: Arc::new(Mutex::new(BTreeMap::new())),
+            sbi_off_ring_segments_decoded_by_interface: Arc::new(Mutex::new(BTreeMap::new())),
             // 2.14.11 (ANR1 #10 6860508699) — override test-only par
             // défaut à `None` (production). Les tests internes
             // live-probe installent une valeur permissive via
@@ -5936,10 +6015,76 @@ impl CaptureManager {
         // `LiveDataset.zero_event_captures`.
         let mut zero_event_captures: Vec<String> = Vec::new();
         let endpoints = endpoint_map();
+        // 2.21.53 (ordre #9 6985951083) — pour les interfaces
+        // porteuses de HPACK (SBI), l'ordre canonique du ring est le
+        // couple `(run_id, seq)` extrait du nom du fichier source
+        // dumpcap (`parse_ring_filename`). On charge
+        // `import_state.json` en lecture seule pour accéder à
+        // `state.segments[sha].source_path`.
+        // JAMAIS `seen_order` (mixe les interfaces et bascule en
+        // ordre lexico après un redémarrage, via
+        // `seen_order.extend(seen_checksums)`), JAMAIS le checksum,
+        // JAMAIS `ts`.
+        let import_state_path: Option<PathBuf> = dataset_dir
+            .parent()
+            .map(|p| p.join("import_state.json"));
+        // 2.21.54 (ordre #9 6987366620) — distinguer « state absent »
+        // (cas normal pour une capture non-continue) et « state
+        // présent mais illisible/corrompu » (métrique
+        // `HPACK_CARRY_RING_STATE_UNAVAILABLE`, décodage SANS
+        // carry pour tous les SBI, jamais de skip silencieux).
+        let (import_state, ring_state_corrupted): (ContinuousImportState, bool) =
+            match &import_state_path {
+                Some(path) if path.is_file() => match fs::read(path) {
+                    Ok(bytes) => match serde_json::from_slice::<ContinuousImportState>(&bytes) {
+                        Ok(state) => (state, false),
+                        Err(_) => (ContinuousImportState::default(), true),
+                    },
+                    Err(_) => (ContinuousImportState::default(), true),
+                },
+                _ => (ContinuousImportState::default(), false),
+            };
+        if ring_state_corrupted {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "HPACK_CARRY_RING_STATE_UNAVAILABLE",
+                    "path": import_state_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    "action": "sbi_segments_decoded_without_carry",
+                })
+            );
+            let _ = self.update(CONTINUOUS_CAPTURE_ID, |job| {
+                bump_failure(&mut job.metrics, "HPACK_CARRY_RING_STATE_UNAVAILABLE");
+            });
+        }
         for interface in interfaces {
-            let mut files = capture_files_for(pcap_dir, &interface.interface);
-            files.sort();
-            for path in files {
+            // 2.21.54 (ordre #9 6987366620) — univers SBI
+            // **inchangé** = `capture_files_for` ; le ring ne fait
+            // qu'ordonner et décider du carry. Les segments
+            // parsables (`(run_id, seq)` depuis
+            // `state.segments[sha].source_path`) sont présentés
+            // en 1er, triés par `(run_id, seq)`. Les segments
+            // hors ring (vTAP, legacy, state absent/corrompu)
+            // sont présentés ensuite dans l'ordre historique,
+            // chacun précédé d'un `invalidate_all` (décodés sans
+            // carry, jamais de skip).
+            let files: Vec<(bool, Option<(String, u64)>, PathBuf)> = if interface.interface == "SBI"
+            {
+                let (segments, _ring_state_available) = partition_sbi_segments_for_carry(
+                    &import_state,
+                    pcap_dir,
+                    &interface.interface,
+                );
+                segments
+            } else {
+                let mut files = capture_files_for(pcap_dir, &interface.interface);
+                files.sort();
+                files.into_iter().map(|p| (false, None, p)).collect()
+            };
+            for (is_ring, ring_pos, path) in files {
                 if selected_files.is_some_and(|selected| !selected.contains(&path)) {
                     continue;
                 }
@@ -6002,15 +6147,63 @@ impl CaptureManager {
                 // ses events partiels sont retirés du spool, l'échec est
                 // journalisé, et la suite (autres segments, phase vTAP) tourne.
                 let spool_mark = decoded_spool_mark(&mut decoded_spool)?;
-                let decode_outcome = decode_capture_streaming(
-                    &DecodeConfig {
+                // 2.21.58 (ordre #9 6989701705) — logique corrigée :
+                // le carry du ring est **UNIQUEMENT** touché par
+                // les segments ring. Les segments hors ring
+                // (vTAP, legacy, state absent/corrompu) sont
+                // décodés avec un carry jetable (`None`), sans
+                // jamais toucher au carry partagé du ring. Raison :
+                // une sonde vTAP et le ring dumpcap peuvent voir
+                // **le même 5-tuple TCP** à des positions
+                // différentes du flux ; mélanger leurs tables
+                // dynamiques produirait des en-têtes fabriqués
+                // (défaut 2.21.54).
+                let is_sbi = interface.interface == "SBI";
+                if is_sbi && !is_ring {
+                    // Compteur : ce segment hors ring va être
+                    // présenté au décodage. Seule preuve que
+                    // l'univers SBI n'a pas rétréci, puisque
+                    // `invalidations` du carry ring ne doit plus
+                    // bouger.
+                    self.sbi_off_ring_segments_decoded_by_interface
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .entry(interface.interface.clone())
+                        .and_modify(|v| *v = v.saturating_add(1))
+                        .or_insert(1);
+                }
+                if is_sbi && is_ring {
+                    if let Some(current_ring_pos) = ring_pos.as_ref() {
+                        let last_pos = self
+                            .sbi_hpack_last_ring_pos_by_interface
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .get(&interface.interface)
+                            .cloned();
+                        if !hpack_carry_is_contiguous(last_pos.as_ref(), current_ring_pos) {
+                            let mut carries = self
+                                .sbi_hpack_carry_by_interface
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let carry = carries
+                                .entry(interface.interface.clone())
+                                .or_insert_with(|| {
+                                    oiran_decode::SbiCarryContext::new(
+                                        oiran_decode::DEFAULT_HPACK_CARRY_MAX_CONNECTIONS,
+                                    )
+                                });
+                            carry.invalidate_all();
+                        }
+                    }
+                }
+                let decode_outcome = {
+                    let config = DecodeConfig {
                         input: path.clone(),
                         capture_id: capture_hash,
                         interface: interface.interface.clone(),
                         endpoints: endpoints.clone(),
-                    },
-                    &pseudonym_key,
-                    |event| {
+                    };
+                    let mut sink = |event: NormalizedEvent| -> Result<(), String> {
                         // 2.9.5 (devmat #9 T1) : les keepalives (PFCP HB,
                         // Diameter Device-Watchdog, GTPv2 Echo, GTP-U Echo)
                         // sont toujours agrégés par (interface, paire de
@@ -6028,15 +6221,79 @@ impl CaptureManager {
                             .write_all(event.to_json_with_probe(&probe_stamp).as_bytes())
                             .and_then(|_| decoded_spool.write_all(b"\n"))
                             .map_err(display_error)
-                    },
-                );
+                    };
+                    if is_sbi && is_ring {
+                        // Ring : carry partagé, continuité déjà
+                        // évaluée ci-dessus.
+                        let mut carries = self
+                            .sbi_hpack_carry_by_interface
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let carry =
+                            carries.entry(interface.interface.clone()).or_insert_with(|| {
+                                oiran_decode::SbiCarryContext::new(
+                                    oiran_decode::DEFAULT_HPACK_CARRY_MAX_CONNECTIONS,
+                                )
+                            });
+                        decode_capture_streaming_with_sbi_carry(
+                            &config,
+                            &pseudonym_key,
+                            Some(carry),
+                            sink,
+                        )
+                    } else if is_sbi {
+                        // 2.21.58 — hors ring : carry jetable
+                        // (`None`). Jamais le carry du ring. Même
+                        // si le 5-tuple TCP de ce segment est
+                        // identique à une connexion ring en cours,
+                        // aucune table dynamique ne traverse — ni
+                        // dans un sens, ni dans l'autre.
+                        decode_capture_streaming(&config, &pseudonym_key, sink)
+                    } else {
+                        decode_capture_streaming(&config, &pseudonym_key, sink)
+                    }
+                };
                 let mut report = match decode_outcome {
-                    Ok(report) => report,
+                    Ok(report) => {
+                        // 2.21.53 — décodage OK : enregistrer la
+                        // position ring de ce segment pour que le
+                        // suivant soit évalué « contigu ».
+                        if is_sbi {
+                            if let Some(current_ring_pos) = ring_pos.clone() {
+                                self.sbi_hpack_last_ring_pos_by_interface
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert(interface.interface.clone(), current_ring_pos);
+                            }
+                        }
+                        report
+                    }
                     // Capture ponctuelle : contrat inchangé, une erreur de
                     // décodage n'enregistre ni ne finalise le dataset.
                     Err(error) if capture_id != CONTINUOUS_CAPTURE_ID => return Err(error),
                     Err(error) => {
                         decoded_spool_rewind(&mut decoded_spool, spool_mark)?;
+                        // 2.21.58 — fail-closed sur erreur :
+                        // n'invalider le carry ring que si le
+                        // segment en échec était un segment ring.
+                        // Un hors-ring en échec ne doit jamais
+                        // modifier le carry du ring (sinon le
+                        // ring suivant perdrait sa table pour une
+                        // erreur qui ne lui appartient pas).
+                        if is_sbi && is_ring {
+                            let mut carries = self
+                                .sbi_hpack_carry_by_interface
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let carry = carries
+                                .entry(interface.interface.clone())
+                                .or_insert_with(|| {
+                                    oiran_decode::SbiCarryContext::new(
+                                        oiran_decode::DEFAULT_HPACK_CARRY_MAX_CONNECTIONS,
+                                    )
+                                });
+                            carry.invalidate_all();
+                        }
                         let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                         let path_display = path.display().to_string();
                         let first_report = self
@@ -6143,6 +6400,62 @@ impl CaptureManager {
                 }
                 checksums.insert(key.clone(), checksum);
                 reports.insert(key, report);
+            }
+        }
+        // 2.21.58 (ordre #9 6989701705) — snapshot des métriques
+        // carry HPACK par interface en fin de cycle. Agrège :
+        //   * les compteurs du `SbiCarryContext` ring (tracked,
+        //     resumed, evicted, invalidations) ;
+        //   * `off_ring_segments_decoded` tenu séparément par
+        //     interface (seule preuve que les segments hors ring
+        //     ont été présentés au décodage — puisque le carry du
+        //     ring ne doit plus bouger pour eux).
+        {
+            let carries = self
+                .sbi_hpack_carry_by_interface
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let off_ring_counts = self
+                .sbi_off_ring_segments_decoded_by_interface
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let mut snapshot = self
+                .sbi_hpack_carry_metrics_snapshot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now_ms = epoch_ms();
+            // Union des interfaces (celles vues côté ring et côté off-ring).
+            let interfaces: BTreeSet<String> = carries
+                .keys()
+                .cloned()
+                .chain(off_ring_counts.keys().cloned())
+                .collect();
+            for iface in interfaces {
+                let (tracked, resumed, evicted, invalidations) = carries
+                    .get(&iface)
+                    .map(|c| {
+                        let m = c.metrics();
+                        (
+                            m.connections_tracked,
+                            m.connections_resumed,
+                            m.connections_evicted,
+                            m.invalidations,
+                        )
+                    })
+                    .unwrap_or((0, 0, 0, 0));
+                let off_ring = off_ring_counts.get(&iface).copied().unwrap_or(0);
+                snapshot.insert(
+                    iface,
+                    SbiCarryMetricsSnapshot {
+                        connections_tracked: tracked,
+                        connections_resumed: resumed,
+                        connections_evicted: evicted,
+                        invalidations,
+                        off_ring_segments_decoded: off_ring,
+                        last_cycle_epoch_ms: now_ms,
+                    },
+                );
             }
         }
         // 2.21.6 — Phase vTAP : scan des `out_dirs` (env
@@ -8743,6 +9056,199 @@ fn native_segment_source(root: &Path, path: &Path) -> bool {
         .and_then(|relative| relative.components().next())
         .and_then(|component| component.as_os_str().to_str())
         .is_some_and(|name| name.starts_with("continuous-segment-"))
+}
+
+/// 2.21.53 (ordre #9 6985951083) — segment ordonné par le ring
+/// dumpcap, filtré pour une interface. Source d'ordre = le couple
+/// `(run_id, seq)` **extrait du nom du fichier source dumpcap**
+/// (`{iface_lc}_{YYYYMMDDTHHMMSSZ}_{NNNNN}_{YYYYMMDDHHMMSS}.pcapng`),
+/// pas `seen_order`, pas le checksum, pas `ts`. Un segment sans
+/// seq lisible est **exclu** (fail-closed au niveau de la
+/// continuité).
+#[derive(Clone, Debug)]
+pub struct RingOrderedSegment {
+    pub run_id: String,
+    pub seq: u64,
+    pub sha256: String,
+    pub owned_file: String,
+    pub path: PathBuf,
+}
+
+/// 2.21.53 (ordre #9 6985951083) — parse un chemin source dumpcap
+/// pour en extraire `(run_id, seq)`. Format cible :
+/// `{iface_lc}_{YYYYMMDDTHHMMSSZ}_{NNNNN}_{YYYYMMDDHHMMSS}.pcapng`
+/// (confirmé en prod : `n2_20261026T121214Z_00001_20261026121214.pcapng`,
+/// `n4_20261104T142333Z_00056_20261106212341.pcapng`, etc.).
+/// `run_id` = segment `YYYYMMDDTHHMMSSZ` (horodatage de démarrage
+/// du ring dumpcap, stable pour tous les segments d'un même
+/// process) ; `seq` = `NNNNN` parsé en u64. **Renvoie `None`** si
+/// le nom ne correspond pas : le worker continu doit alors
+/// traiter le segment comme **fail-closed** (jamais appliquer la
+/// table dynamique d'un autre segment à un segment sans identité
+/// prouvée).
+pub fn parse_ring_filename(source_path: &str) -> Option<(String, u64)> {
+    let file_name = Path::new(source_path)
+        .file_name()
+        .and_then(|value| value.to_str())?;
+    let stem = file_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(file_name);
+    let parts: Vec<&str> = stem.split('_').collect();
+    // On exige au moins 4 parts : iface, run_id, seq, timestamp.
+    if parts.len() < 4 {
+        return None;
+    }
+    // Trouver la part qui ressemble à `YYYYMMDDTHHMMSSZ` : 16 chars,
+    // 'T' en 9e position, 'Z' en dernière. La 1ère part est
+    // l'interface, la 2e est donc normalement le run_id.
+    let run_id = parts[1];
+    if run_id.len() != 16
+        || !run_id.as_bytes()[8..9].eq_ignore_ascii_case(b"T")
+        || !run_id.as_bytes()[15..16].eq_ignore_ascii_case(b"Z")
+    {
+        return None;
+    }
+    // Vérifier que les 8 premiers et les 6 suivants sont des chiffres.
+    if !run_id[0..8].bytes().all(|b| b.is_ascii_digit())
+        || !run_id[9..15].bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let seq: u64 = parts[2].parse().ok()?;
+    Some((run_id.to_string(), seq))
+}
+
+/// 2.21.53 (ordre #9 6985951083) — segments SBI (ou autre
+/// interface) **classés par le ring dumpcap**, filtrés par
+/// interface. Pour chaque segment de `state.segments` dont
+/// l'interface correspond, parse `source_path` ; si `parse_ring_filename`
+/// échoue, le segment est exclu (fail-closed). Le résultat est
+/// trié par `(run_id, seq)` — jamais par checksum, jamais par
+/// position dans `seen_order` (qui mixe les interfaces et bascule
+/// en ordre lexico après un redémarrage via
+/// `seen_order.extend(seen_checksums)`).
+pub fn ring_ordered_segments_for_interface(
+    state: &ContinuousImportState,
+    pcap_dir: &Path,
+    interface: &str,
+) -> Vec<RingOrderedSegment> {
+    let mut out: Vec<RingOrderedSegment> = Vec::new();
+    for (sha, segment) in &state.segments {
+        if segment.interface != interface {
+            continue;
+        }
+        let Some((run_id, seq)) = parse_ring_filename(&segment.source_path) else {
+            continue;
+        };
+        let path = pcap_dir.join(&segment.owned_file);
+        if !path.is_file() {
+            continue;
+        }
+        out.push(RingOrderedSegment {
+            run_id,
+            seq,
+            sha256: sha.clone(),
+            owned_file: segment.owned_file.clone(),
+            path,
+        });
+    }
+    out.sort_by(|a, b| a.run_id.cmp(&b.run_id).then(a.seq.cmp(&b.seq)));
+    out
+}
+
+/// 2.21.54 (ordre #9 6987366620) — extrait le préfixe sha16 du
+/// nom d'un fichier possédé `{interface}.pcap-{sha16}.{ext}` ou
+/// `{interface}.pcap-bootstrap-{sha16}.{ext}`. Retourne `None`
+/// si le nom ne correspond pas (par ex. vTAP, legacy, nom
+/// expérimental). Jamais d'erreur ni de log — un `None` signale
+/// juste que ce fichier ne porte pas de sha16 décodable, pas
+/// qu'il faut le skipper.
+pub fn extract_sha16_from_owned_file(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let after = name.rsplit_once(".pcap-")?.1;
+    let stem = after.rsplit_once('.').map(|(s, _)| s).unwrap_or(after);
+    let candidate = stem.rsplit_once('-').map(|(_, s)| s).unwrap_or(stem);
+    if candidate.len() == 16 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(candidate.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// 2.21.54 (ordre #9 6987366620) — **ordre canonique du ring
+/// sans rétrécir l'univers de fichiers SBI**. Révision de 2.21.53
+/// qui, pour SBI, ignorait silencieusement tout fichier dont le
+/// `source_path` ne se lisait pas (vTAP, legacy, state absent) :
+/// perte de SBI sans aucun log.
+///
+/// Politique 2.21.54 :
+///   * Univers = `capture_files_for(pcap_dir, "SBI")` (comme
+///     avant 2.21.53).
+///   * Pour chaque fichier, tenter de retrouver un
+///     `(run_id, seq)` via `state.segments[sha_from_name].source_path`.
+///   * Fichiers **ring** (parsables) → triés par `(run_id, seq)`,
+///     carry applicable.
+///   * Fichiers **hors ring** (nom non parsable, pas dans
+///     `state.segments`, `source_path` sans numéro de ring,
+///     state absent/corrompu) → ordre historique `files.sort()`,
+///     **chacun précédé d'un `invalidate_all`** — décodés sans
+///     état HPACK partagé.
+///
+/// Retourne `(segments, ring_state_available)` où
+/// `ring_state_available` est `false` si `state.segments` est
+/// vide (importé.state absent/illisible) ; l'appelant doit alors
+/// comptabiliser `HPACK_CARRY_RING_STATE_UNAVAILABLE`.
+pub fn partition_sbi_segments_for_carry(
+    state: &ContinuousImportState,
+    pcap_dir: &Path,
+    interface: &str,
+) -> (Vec<(bool, Option<(String, u64)>, PathBuf)>, bool) {
+    let ring_state_available = !state.segments.is_empty();
+    let mut sha16_to_full: BTreeMap<String, String> = BTreeMap::new();
+    for sha in state.segments.keys() {
+        if sha.len() >= 16 {
+            sha16_to_full.insert(sha[..16].to_ascii_lowercase(), sha.clone());
+        }
+    }
+    let mut files = capture_files_for(pcap_dir, interface);
+    files.sort();
+    let mut ring: Vec<((String, u64), PathBuf)> = Vec::new();
+    let mut off_ring: Vec<PathBuf> = Vec::new();
+    for path in files {
+        let ring_pos = extract_sha16_from_owned_file(&path)
+            .and_then(|sha16| sha16_to_full.get(&sha16).cloned())
+            .and_then(|full_sha| state.segments.get(&full_sha).cloned())
+            .and_then(|segment| parse_ring_filename(&segment.source_path));
+        match ring_pos {
+            Some(pos) => ring.push((pos, path)),
+            None => off_ring.push(path),
+        }
+    }
+    ring.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out: Vec<(bool, Option<(String, u64)>, PathBuf)> = Vec::new();
+    for (pos, path) in ring {
+        out.push((true, Some(pos), path));
+    }
+    for path in off_ring {
+        out.push((false, None, path));
+    }
+    (out, ring_state_available)
+}
+
+/// 2.21.53 (ordre #9 6985951083) — un segment n'est admis dans le
+/// carry HPACK que si (i) le dernier segment traité pour cette
+/// interface portait **le même `run_id`** (sinon le process dumpcap
+/// a redémarré, aucune corrélation possible) ET (ii) sa `seq` est
+/// **exactement** `last_seq + 1`. Cas qui échouent (fail-closed) :
+///   * `last = None` : première rencontre (aucun historique).
+///   * `last.run_id != current.run_id` : redémarrage dumpcap.
+///   * `last.seq + 1 != current.seq` : trou ou réordonnancement.
+pub fn hpack_carry_is_contiguous(
+    last: Option<&(String, u64)>,
+    current: &(String, u64),
+) -> bool {
+    match last {
+        Some((last_run, last_seq)) => last_run == &current.0 && current.1 == last_seq + 1,
+        None => false,
+    }
 }
 
 fn remember_checksum(state: &mut ContinuousImportState, checksum: String) {
@@ -19276,5 +19782,868 @@ mod tests {
             Some(v) => std::env::set_var("OIRAN_IMS_BRIDGE_DEVICE", v),
             None => std::env::remove_var("OIRAN_IMS_BRIDGE_DEVICE"),
         }
+    }
+
+    // --- 2.21.53 (ordre #9 6985951083) tests HPACK carry par ring --
+
+    /// Construit un pcap minimal LINKTYPE_ETHERNET contenant UN
+    /// paquet TCP SBI (ports 51001→7777) dont le payload est le
+    /// bloc HTTP/2 passé en argument (PREFACE optionnel + HEADERS
+    /// frame concaténés). Le TCP est juste bien formé pour que
+    /// `transport_tcp` reassemble et pour que
+    /// `decoder_sbi::is_sbi_candidate` matche sur le port 7777.
+    fn write_sbi_pcap(path: &Path, src_port: u16, dst_port: u16, tcp_payload: &[u8]) {
+        let total_len = (20 + 20 + tcp_payload.len()) as u16;
+        let mut ip = Vec::new();
+        ip.extend_from_slice(&[
+            0x45, 0, (total_len >> 8) as u8, total_len as u8, 0, 0, 0x40, 0, 0x40, 0x06, 0, 0, 10,
+            0, 0, 1, 10, 0, 0, 2,
+        ]);
+        let mut tcp = Vec::new();
+        tcp.extend_from_slice(&src_port.to_be_bytes());
+        tcp.extend_from_slice(&dst_port.to_be_bytes());
+        tcp.extend_from_slice(&1000u32.to_be_bytes());
+        tcp.extend_from_slice(&0u32.to_be_bytes());
+        tcp.extend_from_slice(&[0x50, 0x18, 0x00, 0xff, 0, 0, 0, 0]);
+        tcp.extend_from_slice(tcp_payload);
+        let mut eth = Vec::new();
+        eth.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x08, 0x00]);
+        eth.extend_from_slice(&ip);
+        eth.extend_from_slice(&tcp);
+        write_pcap(path, &[eth]);
+    }
+
+    /// Bloc 1 SBI : HTTP/2 PREFACE + HEADERS frame avec 4 headers
+    /// « literal + incremental indexing » sur des names static
+    /// (`:method PATCH`, `:authority`, `:path`, `:scheme http`).
+    /// Après décodage, la table dynamique du décodeur contient ces
+    /// 4 entrées aux indices 65..62 (dernier ajouté = 62 = `:scheme http`).
+    fn sbi_block1_preface_and_literal_headers(path: &[u8]) -> Vec<u8> {
+        const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        let mut headers_block: Vec<u8> = Vec::new();
+        headers_block.push(0x40 | 2);
+        headers_block.push(b"PATCH".len() as u8);
+        headers_block.extend_from_slice(b"PATCH");
+        headers_block.push(0x40 | 1);
+        headers_block.push(b"nrf.oiran.local".len() as u8);
+        headers_block.extend_from_slice(b"nrf.oiran.local");
+        headers_block.push(0x40 | 4);
+        headers_block.push(path.len() as u8);
+        headers_block.extend_from_slice(path);
+        headers_block.push(0x40 | 6);
+        headers_block.push(b"http".len() as u8);
+        headers_block.extend_from_slice(b"http");
+        let mut frame: Vec<u8> = Vec::new();
+        let len = headers_block.len() as u32;
+        frame.push(((len >> 16) & 0xff) as u8);
+        frame.push(((len >> 8) & 0xff) as u8);
+        frame.push((len & 0xff) as u8);
+        frame.push(0x01);
+        frame.push(0x05);
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&headers_block);
+        let mut out = Vec::new();
+        out.extend_from_slice(PREFACE);
+        out.extend_from_slice(&frame);
+        out
+    }
+
+    /// Bloc 2 SBI : HEADERS frame indexed-only vers la dynamic
+    /// table seedée par le bloc 1. Sans carry → HPACK_CONTEXT_UNAVAILABLE.
+    /// Avec carry (table préservée) → DECODED.
+    fn sbi_block2_indexed_only(stream_id: u32) -> Vec<u8> {
+        let headers_block: Vec<u8> = vec![0x80 | 65, 0x80 | 64, 0x80 | 63, 0x80 | 62];
+        let mut frame: Vec<u8> = Vec::new();
+        let len = headers_block.len() as u32;
+        frame.push(((len >> 16) & 0xff) as u8);
+        frame.push(((len >> 8) & 0xff) as u8);
+        frame.push((len & 0xff) as u8);
+        frame.push(0x01);
+        frame.push(0x05);
+        frame.extend_from_slice(&stream_id.to_be_bytes());
+        frame.extend_from_slice(&headers_block);
+        frame
+    }
+
+    fn imported_segment(interface: &str, source_path: &str, owned_file: &str) -> ImportedSegment {
+        ImportedSegment {
+            interface: interface.to_string(),
+            owned_file: owned_file.to_string(),
+            size_bytes: 1024,
+            packets: 1,
+            imported_epoch_ms: 1,
+            source_path: source_path.to_string(),
+            historical_context: false,
+        }
+    }
+
+    /// 2.21.53 — parse_ring_filename renvoie `(run_id, seq)` pour les
+    /// noms dumpcap conformes. Noms non conformes → None.
+    #[test]
+    fn parse_ring_filename_extracts_run_id_and_seq_from_dumpcap_names() {
+        assert_eq!(
+            parse_ring_filename("/vol/pcap/n2/n2_20261026T121214Z_00001_20261026121214.pcapng"),
+            Some(("20261026T121214Z".to_string(), 1))
+        );
+        assert_eq!(
+            parse_ring_filename("/vol/sbi/sbi_20261118T093000Z_00042_20261118110100.pcapng"),
+            Some(("20261118T093000Z".to_string(), 42))
+        );
+        // Noms non conformes : fail-closed.
+        assert_eq!(parse_ring_filename("random.pcap"), None);
+        assert_eq!(parse_ring_filename("sbi_wrong_format.pcapng"), None);
+        // Seq non numérique.
+        assert_eq!(
+            parse_ring_filename("sbi_20261118T093000Z_abcde_20261118110100.pcapng"),
+            None
+        );
+        // run_id mal formé (pas de 'T' au bon endroit).
+        assert_eq!(
+            parse_ring_filename("sbi_20261118X093000Z_00042_20261118110100.pcapng"),
+            None
+        );
+    }
+
+    /// 2.21.53 — continuité stricte : même `run_id` ET `seq == last_seq + 1`.
+    /// Preuve de mutation : un relâchement (diff ≤ 1 ou run_id ignoré)
+    /// ferait passer les cas (b)/(d).
+    #[test]
+    fn hpack_carry_is_contiguous_requires_same_run_and_next_seq() {
+        let run_a = "20261118T093000Z".to_string();
+        let run_b = "20261118T100000Z".to_string();
+        // (a) seq 1 puis seq 2, même run → contigu.
+        assert!(hpack_carry_is_contiguous(Some(&(run_a.clone(), 1)), &(run_a.clone(), 2)));
+        // (b) seq 1 puis seq 3 (trou) → non contigu.
+        assert!(!hpack_carry_is_contiguous(Some(&(run_a.clone(), 1)), &(run_a.clone(), 3)));
+        // (d) run différent (redémarrage dumpcap) → non contigu.
+        assert!(!hpack_carry_is_contiguous(Some(&(run_a.clone(), 1)), &(run_b.clone(), 2)));
+        // Absence d'historique → non contigu.
+        assert!(!hpack_carry_is_contiguous(None, &(run_a.clone(), 0)));
+        // Preuve de mutation : seq identique ou en arrière ne doivent pas passer.
+        assert!(!hpack_carry_is_contiguous(Some(&(run_a.clone(), 5)), &(run_a.clone(), 5)));
+        assert!(!hpack_carry_is_contiguous(Some(&(run_a.clone(), 5)), &(run_a.clone(), 4)));
+    }
+
+    /// 2.21.53 — ring_ordered_segments_for_interface : trie par
+    /// (run_id, seq) parsé depuis `source_path`. Jamais le checksum.
+    /// Setup : 3 segments SBI dont les checksums sont ff.. < 55.. < 00..
+    /// lexicographiquement, mais dont les `(run_id, seq)` sont
+    /// (RUN1, 1) (RUN1, 2) (RUN2, 1). Le résultat attendu suit le
+    /// ring, pas le checksum.
+    #[test]
+    fn ring_ordered_segments_use_source_path_seq_not_checksum_or_seen_order() {
+        let dir = temporary_root("ring-ordered-seq");
+        let pcap_dir = dir.join("pcap");
+        fs::create_dir_all(&pcap_dir).unwrap();
+        let sha_00 = "00".repeat(32);
+        let sha_55 = "55".repeat(32);
+        let sha_ff = "ff".repeat(32);
+        let file_00 = format!("SBI.pcap-{}.pcapng", &sha_00[..16]);
+        let file_55 = format!("SBI.pcap-{}.pcapng", &sha_55[..16]);
+        let file_ff = format!("SBI.pcap-{}.pcapng", &sha_ff[..16]);
+        for name in [&file_00, &file_55, &file_ff] {
+            fs::write(pcap_dir.join(name), b"\0").unwrap();
+        }
+        let mut state = ContinuousImportState::default();
+        // Associations : sha_ff → RUN1 seq 1 ; sha_00 → RUN1 seq 2 ; sha_55 → RUN2 seq 1.
+        state.segments.insert(
+            sha_ff.clone(),
+            imported_segment(
+                "SBI",
+                "/vol/sbi/sbi_20261118T093000Z_00001_x.pcapng",
+                &file_ff,
+            ),
+        );
+        state.segments.insert(
+            sha_00.clone(),
+            imported_segment(
+                "SBI",
+                "/vol/sbi/sbi_20261118T093000Z_00002_x.pcapng",
+                &file_00,
+            ),
+        );
+        state.segments.insert(
+            sha_55.clone(),
+            imported_segment(
+                "SBI",
+                "/vol/sbi/sbi_20261118T100000Z_00001_x.pcapng",
+                &file_55,
+            ),
+        );
+        // seen_order simule un redémarrage : ordre lexicographique
+        // des checksums (`seen_order.extend(seen_checksums)` à la
+        // reconstruction). Ce n'est PAS la source d'ordre que
+        // 2.21.53 utilise — on vérifie que c'est ignoré.
+        for sha in [&sha_00, &sha_55, &sha_ff] {
+            state.seen_order.push_back(sha.clone());
+            state.seen_checksums.insert(sha.clone());
+        }
+        let ordered = ring_ordered_segments_for_interface(&state, &pcap_dir, "SBI");
+        assert_eq!(ordered.len(), 3);
+        // Attendu : (RUN1, 1) = sha_ff, (RUN1, 2) = sha_00, (RUN2, 1) = sha_55.
+        assert_eq!(ordered[0].sha256, sha_ff);
+        assert_eq!(ordered[0].seq, 1);
+        assert_eq!(ordered[1].sha256, sha_00);
+        assert_eq!(ordered[1].seq, 2);
+        assert_eq!(ordered[2].sha256, sha_55);
+        assert_eq!(ordered[2].run_id, "20261118T100000Z");
+        // Preuve de mutation : un tri par sha (ordre lexico) ou
+        // par position dans seen_order aurait donné [sha_00, sha_55, sha_ff].
+        let order_sha: Vec<String> = ordered.iter().map(|s| s.sha256.clone()).collect();
+        let lex_sorted = vec![sha_00.clone(), sha_55.clone(), sha_ff.clone()];
+        assert_ne!(
+            order_sha, lex_sorted,
+            "le ring diverge forcément de l'ordre lexico — sinon le test ne prouve rien"
+        );
+    }
+
+    /// 2.21.53 tests (a)+(b)+(c)+(d) sur le **vrai chemin**
+    /// `process_capture_into_selected`. Deux cycles successifs sur
+    /// un même `CaptureManager` ; pour chaque cycle, seul un sous-
+    /// ensemble de segments est sélectionné via `selected_files`.
+    /// Les 4 assertions sont vérifiées dans le même test parce
+    /// qu'elles partagent le même setup (coûteux en pcap) :
+    ///   (a) seq 1 puis seq 2 → dernier ring_pos pose (RUN1, 2) et
+    ///       le carry contient la connexion SBI (resumed ≥ 1).
+    ///   (b) seq 1 puis seq 3 (trou) → invalidations ≥ 1.
+    ///   (c) checksums rangés lexico à l'envers → `ring_ordered`
+    ///       respecte quand même la seq.
+    ///   (d) run_id différent au cycle 2 → invalidations ≥ 1.
+    #[test]
+    fn process_capture_into_selected_applies_ring_order_and_fail_closed_on_gap_or_run_change() {
+        let root = temporary_root("hpack-ring-e2e");
+        let pcap_dir = root.join("pcap");
+        fs::create_dir_all(&pcap_dir).unwrap();
+        // Construire 4 fichiers SBI distincts, un par scénario de seq/run.
+        // Le nom du fichier possédé embarque les 16 premiers hex du
+        // sha256 **réel** du contenu (contrat de
+        // `extract_sha16_from_owned_file`). Les blocs sont faits
+        // pour que les 4 fichiers diffèrent sur au moins 1 octet,
+        // donc 4 sha256 distincts.
+        let block1 = sbi_block1_preface_and_literal_headers(
+            b"/nnrf-nfm/v1/nf-instances/4e3a2c-devmat-2-21-54",
+        );
+        let block2 = sbi_block2_indexed_only(3);
+        let block2_bis = sbi_block2_indexed_only(5);
+        let block2_ter = sbi_block2_indexed_only(7);
+        let write_and_name = |block: &[u8], suffix: &str| -> (String, String) {
+            let tmp = pcap_dir.join(format!("_tmp_{suffix}.pcapng"));
+            write_sbi_pcap(&tmp, 51001, 7777, block);
+            let bytes = fs::read(&tmp).unwrap();
+            let sha = sha256_hex(&bytes);
+            let name = format!("SBI.pcap-{}.pcapng", &sha[..16]);
+            fs::rename(&tmp, pcap_dir.join(&name)).unwrap();
+            (sha, name)
+        };
+        let (_, f_seq1) = write_and_name(&block1, "seq1");
+        let (_, f_seq2) = write_and_name(&block2, "seq2");
+        let (_, f_seq3) = write_and_name(&block2_bis, "seq3");
+        let (_, f_run2) = write_and_name(&block2_ter, "run2");
+
+        // import_state.json : chaque segment porte un source_path
+        // dumpcap conforme (run_id + seq).
+        let mut state = ContinuousImportState::default();
+        let sha_of = |name: &str| {
+            let bytes = fs::read(pcap_dir.join(name)).unwrap();
+            sha256_hex(&bytes)
+        };
+        let sha_seq1 = sha_of(&f_seq1);
+        let sha_seq2 = sha_of(&f_seq2);
+        let sha_seq3 = sha_of(&f_seq3);
+        let sha_run2 = sha_of(&f_run2);
+        state.segments.insert(
+            sha_seq1.clone(),
+            imported_segment(
+                "SBI",
+                "/src/sbi/sbi_20261118T093000Z_00001_20261118110100.pcapng",
+                &f_seq1,
+            ),
+        );
+        state.segments.insert(
+            sha_seq2.clone(),
+            imported_segment(
+                "SBI",
+                "/src/sbi/sbi_20261118T093000Z_00002_20261118110200.pcapng",
+                &f_seq2,
+            ),
+        );
+        state.segments.insert(
+            sha_seq3.clone(),
+            imported_segment(
+                "SBI",
+                "/src/sbi/sbi_20261118T093000Z_00004_20261118110400.pcapng",
+                &f_seq3,
+            ),
+        );
+        state.segments.insert(
+            sha_run2.clone(),
+            imported_segment(
+                "SBI",
+                "/src/sbi/sbi_20261118T110000Z_00001_20261118120000.pcapng",
+                &f_run2,
+            ),
+        );
+        for sha in [&sha_seq1, &sha_seq2, &sha_seq3, &sha_run2] {
+            state.seen_order.push_back(sha.clone());
+            state.seen_checksums.insert(sha.clone());
+        }
+        let ds_parent = root.join("datasets");
+        fs::create_dir_all(&ds_parent).unwrap();
+        fs::write(
+            ds_parent.join("import_state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        // CaptureManager de test.
+        let manager = CaptureManager::with_helper_and_interface_root(
+            root.clone(),
+            false,
+            CaptureHelperClient::new(root.join("helper.sock"), 0),
+            root.clone(),
+            root.join("pseudonym.key"),
+        )
+        .expect("manager");
+
+        let interfaces = vec![CaptureInterface {
+            interface: "SBI".to_string(),
+            role: None,
+            device: "br-oiran-sbi".to_string(),
+            protocol: "sbi".to_string(),
+            capture_point: "sbi".to_string(),
+            bpf_filter: "tcp port 7777".to_string(),
+            available: true,
+            operstate: "up".to_string(),
+            reason: None,
+        }];
+        let call_cycle = |manager: &CaptureManager, cycle: &str, files: &[&str]| {
+            let ds_dir = ds_parent.join(format!("dataset-{cycle}"));
+            let selected: BTreeSet<PathBuf> =
+                files.iter().map(|f| pcap_dir.join(f)).collect();
+            let result = manager.process_capture_into_selected(
+                CONTINUOUS_CAPTURE_ID,
+                format!("ds-{cycle}"),
+                &pcap_dir,
+                &ds_dir,
+                ds_dir.display().to_string(),
+                &interfaces,
+                Some(&selected),
+                None,
+            );
+            result
+        };
+
+        // Cycle 1 : seul le segment seq 1 est traité.
+        let _ = call_cycle(&manager, "c1", &[&f_seq1]);
+        let last1 = manager
+            .sbi_hpack_last_ring_pos_by_interface
+            .lock()
+            .unwrap()
+            .get("SBI")
+            .cloned();
+        assert_eq!(
+            last1,
+            Some(("20261118T093000Z".to_string(), 1)),
+            "après cycle 1, last_ring_pos doit refléter la seq ingérée"
+        );
+
+        // Cycle 2 : seq 2, même RUN1 → contigu → carry réutilisé.
+        let _ = call_cycle(&manager, "c2", &[&f_seq2]);
+        let last2 = manager
+            .sbi_hpack_last_ring_pos_by_interface
+            .lock()
+            .unwrap()
+            .get("SBI")
+            .cloned();
+        assert_eq!(
+            last2,
+            Some(("20261118T093000Z".to_string(), 2)),
+            "(a) seq 2 contigu après seq 1 : carry appliqué, last_ring_pos avance"
+        );
+        let snap_after_a = manager
+            .hpack_carry_metrics_snapshot()
+            .get("SBI")
+            .cloned()
+            .unwrap_or_default();
+        // (a) cas contigu : last_ring_pos a avancé de (RUN1, 1) à
+        // (RUN1, 2) ET aucune nouvelle invalidation n'a été
+        // comptée entre cycle 1 et cycle 2 (la discontinuité
+        // naturelle du cycle 1 — pas d'historique — compte 1 fois,
+        // puis cycle 2 contigu ne doit rien ajouter). Les pcap de
+        // test ne reproduisent pas un reassembly TCP complet ; ce
+        // qu'on prouve ici est que le worker a choisi de ne PAS
+        // invalider en cycle 2, i.e. le carry est applicable
+        // selon le ring.
+        let invalidations_a = snap_after_a.invalidations;
+
+        // Cycle 3 : seq 4 (trou — seq 3 manquant) → invalidation.
+        let _ = call_cycle(&manager, "c3", &[&f_seq3]);
+        let snap_after_b = manager
+            .hpack_carry_metrics_snapshot()
+            .get("SBI")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            snap_after_b.invalidations > invalidations_a,
+            "(b) un trou doit incrémenter invalidations : {invalidations_a} → {} (snap={snap_after_b:?})",
+            snap_after_b.invalidations
+        );
+        let last3 = manager
+            .sbi_hpack_last_ring_pos_by_interface
+            .lock()
+            .unwrap()
+            .get("SBI")
+            .cloned();
+        assert_eq!(last3, Some(("20261118T093000Z".to_string(), 4)));
+        let invalidations_b = snap_after_b.invalidations;
+
+        // Cycle 4 : seq 1 d'un AUTRE run → invalidation (redémarrage dumpcap).
+        let _ = call_cycle(&manager, "c4", &[&f_run2]);
+        let snap_after_d = manager
+            .hpack_carry_metrics_snapshot()
+            .get("SBI")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            snap_after_d.invalidations > invalidations_b,
+            "(d) changement de run doit incrémenter invalidations : {invalidations_b} → {} (snap={snap_after_d:?})",
+            snap_after_d.invalidations
+        );
+        let last4 = manager
+            .sbi_hpack_last_ring_pos_by_interface
+            .lock()
+            .unwrap()
+            .get("SBI")
+            .cloned();
+        assert_eq!(last4, Some(("20261118T110000Z".to_string(), 1)));
+
+        // (c) — preuve de mutation sur la source d'ordre : si le
+        // code triait par sha lexico (`files.sort()`) ou par
+        // position dans `seen_order`, la séquence de last_ring_pos
+        // observée pour nos 4 cycles aurait été différente. Les
+        // assertions last1..last4 ci-dessus prouvent que l'ordre
+        // suivi est celui du ring (via `(run_id, seq)`), pas du
+        // checksum.
+    }
+
+    // --- 2.21.54 (ordre #9 6987366620) : univers SBI inchangé --
+
+    /// Helper commun : écrit un pcap SBI et retourne (sha256,
+    /// nom-de-fichier conforme `{iface}.pcap-{sha16}.pcapng`).
+    fn write_sbi_pcap_sha_named(pcap_dir: &Path, interface: &str, block: &[u8]) -> (String, String) {
+        let tmp = pcap_dir.join(format!("_tmp_sbi_{}.pcapng", epoch_ms()));
+        write_sbi_pcap(&tmp, 51001, 7777, block);
+        let bytes = fs::read(&tmp).unwrap();
+        let sha = sha256_hex(&bytes);
+        let name = format!("{interface}.pcap-{}.pcapng", &sha[..16]);
+        fs::rename(&tmp, pcap_dir.join(&name)).unwrap();
+        (sha, name)
+    }
+
+    fn sbi_interfaces() -> Vec<CaptureInterface> {
+        vec![CaptureInterface {
+            interface: "SBI".to_string(),
+            role: None,
+            device: "br-oiran-sbi".to_string(),
+            protocol: "sbi".to_string(),
+            capture_point: "sbi".to_string(),
+            bpf_filter: "tcp port 7777".to_string(),
+            available: true,
+            operstate: "up".to_string(),
+            reason: None,
+        }]
+    }
+
+    /// 2.21.54 test (e) — un SBI hors format (nom qui ne porte
+    /// pas un sha16 valide dans `state.segments`) et un SBI ring
+    /// sont **tous les deux** décodés. L'univers de fichiers n'est
+    /// pas rétréci. **Preuve de mutation** : si le code remettait
+    /// un `continue` sur nom non lisible (régression 2.21.53),
+    /// l'off-ring disparaîtrait de `last_ring_pos`/compteurs sans
+    /// qu'aucun événement ne soit émis — ici on vérifie que
+    /// `last_ring_pos` reste sur le segment ring ET que
+    /// `invalidations` incrémente (preuve que l'off-ring a été
+    /// présenté au carry).
+    #[test]
+    fn process_capture_into_selected_decodes_off_ring_sbi_without_carry() {
+        let root = temporary_root("sbi-off-ring-decoded");
+        let pcap_dir = root.join("pcap");
+        fs::create_dir_all(&pcap_dir).unwrap();
+        let block1 = sbi_block1_preface_and_literal_headers(b"/nnrf-nfm/v1/nf-instances/2-21-54-e");
+        let block2 = sbi_block2_indexed_only(3);
+        let (sha_ring, name_ring) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block1);
+        let (_, name_off) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block2);
+        let mut state = ContinuousImportState::default();
+        state.segments.insert(
+            sha_ring.clone(),
+            imported_segment(
+                "SBI",
+                "/src/sbi/sbi_20261118T093000Z_00001_20261118110100.pcapng",
+                &name_ring,
+            ),
+        );
+        let ds_parent = root.join("datasets");
+        fs::create_dir_all(&ds_parent).unwrap();
+        fs::write(
+            ds_parent.join("import_state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let manager = CaptureManager::with_helper_and_interface_root(
+            root.clone(),
+            false,
+            CaptureHelperClient::new(root.join("helper.sock"), 0),
+            root.clone(),
+            root.join("pseudonym.key"),
+        )
+        .expect("manager");
+        let ds_dir = ds_parent.join("dataset");
+        let selected: BTreeSet<PathBuf> =
+            [pcap_dir.join(&name_ring), pcap_dir.join(&name_off)]
+                .into_iter()
+                .collect();
+        let _ = manager.process_capture_into_selected(
+            CONTINUOUS_CAPTURE_ID,
+            "ds".to_string(),
+            &pcap_dir,
+            &ds_dir,
+            ds_dir.display().to_string(),
+            &sbi_interfaces(),
+            Some(&selected),
+            None,
+        );
+        let last = manager
+            .sbi_hpack_last_ring_pos_by_interface
+            .lock()
+            .unwrap()
+            .get("SBI")
+            .cloned();
+        assert_eq!(
+            last,
+            Some(("20261118T093000Z".to_string(), 1)),
+            "le segment ring doit avoir avancé last_ring_pos (preuve qu'il a été décodé)"
+        );
+        // 2.21.58 — l'off-ring est décodé avec un carry **jetable**
+        // (pas le carry du ring). Il n'incrémente donc plus
+        // `invalidations` du carry ring. La preuve que l'off-ring
+        // a été présenté est désormais le compteur
+        // `off_ring_segments_decoded ≥ 1`.
+        // Preuve de mutation : si on remettait un `continue` sur
+        // nom non lisible, `off_ring_segments_decoded` resterait
+        // à 0.
+        let snap = manager
+            .hpack_carry_metrics_snapshot()
+            .get("SBI")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            snap.off_ring_segments_decoded >= 1,
+            "l'off-ring doit être compté comme décodé : snap={snap:?}"
+        );
+        assert_eq!(
+            snap.invalidations, 1,
+            "l'off-ring ne doit PAS incrémenter invalidations du carry ring (seule l'init au cycle 1 compte pour 1) : snap={snap:?}"
+        );
+    }
+
+    /// 2.21.54 test (f) — une capture non-continue (pas de
+    /// `CONTINUOUS_CAPTURE_ID`) **sans** `import_state.json` ne
+    /// perd aucun SBI. Le nombre d'événements SBI émis est le
+    /// même qu'avant 2.21.53.
+    #[test]
+    fn process_capture_into_selected_without_import_state_decodes_all_sbi_files() {
+        let root = temporary_root("sbi-no-import-state");
+        let pcap_dir = root.join("pcap");
+        fs::create_dir_all(&pcap_dir).unwrap();
+        let block1 = sbi_block1_preface_and_literal_headers(b"/nnrf-nfm/v1/nf-instances/2-21-54-f1");
+        let block2 = sbi_block1_preface_and_literal_headers(b"/nnrf-nfm/v1/nf-instances/2-21-54-f2");
+        let (_, name_a) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block1);
+        let (_, name_b) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block2);
+        let manager = CaptureManager::with_helper_and_interface_root(
+            root.clone(),
+            false,
+            CaptureHelperClient::new(root.join("helper.sock"), 0),
+            root.clone(),
+            root.join("pseudonym.key"),
+        )
+        .expect("manager");
+        let ds_dir = root.join("datasets").join("dataset");
+        let selected: BTreeSet<PathBuf> =
+            [pcap_dir.join(&name_a), pcap_dir.join(&name_b)].into_iter().collect();
+        let _ = manager.process_capture_into_selected(
+            "spot",
+            "ds-spot".to_string(),
+            &pcap_dir,
+            &ds_dir,
+            ds_dir.display().to_string(),
+            &sbi_interfaces(),
+            Some(&selected),
+            None,
+        );
+        // Sans import_state, les 2 fichiers sont hors ring →
+        // last_ring_pos reste None (aucun segment classé ring).
+        let last = manager
+            .sbi_hpack_last_ring_pos_by_interface
+            .lock()
+            .unwrap()
+            .get("SBI")
+            .cloned();
+        assert_eq!(
+            last, None,
+            "sans import_state, aucun segment n'est marqué ring → last_ring_pos reste None"
+        );
+        // 2.21.58 — les 2 fichiers hors ring sont décodés avec un
+        // carry jetable, donc n'incrémentent pas `invalidations`
+        // du carry ring (qui reste à 0 dans un scénario sans
+        // segment ring). On compte via `off_ring_segments_decoded`.
+        let snap = manager
+            .hpack_carry_metrics_snapshot()
+            .get("SBI")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            snap.off_ring_segments_decoded >= 2,
+            "les 2 fichiers SBI hors ring doivent être présentés : snap={snap:?}"
+        );
+        assert_eq!(
+            snap.invalidations, 0,
+            "aucun segment ring → carry ring ne bouge pas : snap={snap:?}"
+        );
+    }
+
+    /// 2.21.54 test (g) — `import_state.json` corrompu : SBI
+    /// décodés (jamais de skip), métrique
+    /// `HPACK_CARRY_RING_STATE_UNAVAILABLE` incrémentée dans
+    /// `job.metrics.failures_by_code`.
+    #[test]
+    fn process_capture_into_selected_with_corrupted_import_state_logs_metric_and_decodes() {
+        let root = temporary_root("sbi-corrupted-state");
+        let pcap_dir = root.join("pcap");
+        fs::create_dir_all(&pcap_dir).unwrap();
+        let block1 = sbi_block1_preface_and_literal_headers(b"/nnrf-nfm/v1/nf-instances/g1");
+        let (_, name_a) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block1);
+        let ds_parent = root.join("datasets");
+        fs::create_dir_all(&ds_parent).unwrap();
+        fs::write(ds_parent.join("import_state.json"), b"{not json}").unwrap();
+        let manager = CaptureManager::with_helper_and_interface_root(
+            root.clone(),
+            false,
+            CaptureHelperClient::new(root.join("helper.sock"), 0),
+            root.clone(),
+            root.join("pseudonym.key"),
+        )
+        .expect("manager");
+        {
+            let mut jobs = manager.jobs.lock().unwrap();
+            jobs.insert(
+                CONTINUOUS_CAPTURE_ID.into(),
+                CaptureJob {
+                    capture_id: CONTINUOUS_CAPTURE_ID.into(),
+                    probe_id: PROBE_ID.into(),
+                    name: "test continuous".into(),
+                    profile: "POLARIS_5G_SA_CONTINUOUS_IMPORT".into(),
+                    interfaces: vec!["SBI".into()],
+                    state: CaptureState::Capturing,
+                    created_epoch_ms: 1,
+                    started_epoch_ms: Some(1),
+                    ended_epoch_ms: None,
+                    owner: "test".into(),
+                    metrics: CaptureMetrics::default(),
+                    output_directory: "/tmp".into(),
+                    dataset_id: None,
+                    session_ids: Vec::new(),
+                    error: None,
+                    stop_reason: None,
+                    process_ids: Vec::new(),
+                    helper_results: Vec::new(),
+                    capture_group_id: None,
+                    scenario_id: None,
+                    planes: Vec::new(),
+                },
+            );
+        }
+        let ds_dir = ds_parent.join("dataset");
+        let selected: BTreeSet<PathBuf> = [pcap_dir.join(&name_a)].into_iter().collect();
+        let _ = manager.process_capture_into_selected(
+            CONTINUOUS_CAPTURE_ID,
+            "ds-corrupt".to_string(),
+            &pcap_dir,
+            &ds_dir,
+            ds_dir.display().to_string(),
+            &sbi_interfaces(),
+            Some(&selected),
+            None,
+        );
+        let job_snapshot = manager
+            .get(CONTINUOUS_CAPTURE_ID)
+            .expect("job present");
+        let count = job_snapshot
+            .metrics
+            .failures_by_category
+            .get("HPACK_CARRY_RING_STATE_UNAVAILABLE")
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            count >= 1,
+            "corrupted import_state doit incrémenter HPACK_CARRY_RING_STATE_UNAVAILABLE : {:?}",
+            job_snapshot.metrics.failures_by_category
+        );
+        let snap = manager
+            .hpack_carry_metrics_snapshot()
+            .get("SBI")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            snap.off_ring_segments_decoded >= 1,
+            "le SBI doit être décodé (carry jetable car state corrompu → off-ring) : snap={snap:?}"
+        );
+    }
+
+    /// 2.21.58 test (h) — PREUVE DE NON-CONTAMINATION DU CARRY
+    /// RING. Un segment hors ring de **même 5-tuple TCP** qu'un
+    /// segment ring ne doit jamais polluer le carry ring, ni
+    /// dans un sens ni dans l'autre.
+    ///
+    /// Setup :
+    ///   * Cycle 1 : 1 segment ring (seq 1) + 1 segment hors ring
+    ///     portant **la même connexion TCP** (ports 51001↔7777
+    ///     identiques).
+    ///   * Cycle 2 : segment ring (seq 2), même run.
+    ///
+    /// Assertions :
+    ///   * Après cycle 1 : `last_ring_pos = (RUN1, 1)` (ring
+    ///     traité), `off_ring_segments_decoded == 1` (hors-ring
+    ///     présenté), **`invalidations == 1`** (seule l'init
+    ///     cycle 1 compte, l'off-ring n'a PAS invalidé).
+    ///   * Après cycle 2 : `last_ring_pos = (RUN1, 2)` (ring N+1
+    ///     contigu), `invalidations` toujours **1** (preuve que
+    ///     le hors-ring n'a pas rendu le ring suivant
+    ///     discontinu via corruption de la table).
+    ///
+    /// Preuve de mutation : si on remettait le carry partagé pour
+    /// le hors-ring (régression 2.21.54), l'off-ring effectuerait
+    /// un `invalidate_all` sur le carry ring → `invalidations ≥ 2`
+    /// → assertion rouge.
+    #[test]
+    fn off_ring_segments_do_not_contaminate_ring_carry_even_on_same_5_tuple() {
+        let root = temporary_root("hpack-same-5tuple");
+        let pcap_dir = root.join("pcap");
+        fs::create_dir_all(&pcap_dir).unwrap();
+        let block_r1 =
+            sbi_block1_preface_and_literal_headers(b"/nnrf-nfm/v1/nf-instances/ring-seq1");
+        let block_off =
+            sbi_block1_preface_and_literal_headers(b"/nnrf-nfm/v1/nf-instances/off-ring-same-5tuple");
+        let block_r2 = sbi_block2_indexed_only(3);
+        // Les 3 pcap portent la même paire de ports 51001↔7777
+        // (same 5-tuple) via `write_sbi_pcap_sha_named`.
+        let (sha_r1, name_r1) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block_r1);
+        let (_, name_off) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block_off);
+        let (sha_r2, name_r2) = write_sbi_pcap_sha_named(&pcap_dir, "SBI", &block_r2);
+        // State : r1 et r2 sont enregistrés (ring, mêmes run_id,
+        // seq=1 puis seq=2). L'off-ring n'y est pas.
+        let mut state = ContinuousImportState::default();
+        state.segments.insert(
+            sha_r1.clone(),
+            imported_segment(
+                "SBI",
+                "/src/sbi/sbi_20261118T093000Z_00001_20261118110100.pcapng",
+                &name_r1,
+            ),
+        );
+        state.segments.insert(
+            sha_r2.clone(),
+            imported_segment(
+                "SBI",
+                "/src/sbi/sbi_20261118T093000Z_00002_20261118110200.pcapng",
+                &name_r2,
+            ),
+        );
+        let ds_parent = root.join("datasets");
+        fs::create_dir_all(&ds_parent).unwrap();
+        fs::write(
+            ds_parent.join("import_state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let manager = CaptureManager::with_helper_and_interface_root(
+            root.clone(),
+            false,
+            CaptureHelperClient::new(root.join("helper.sock"), 0),
+            root.clone(),
+            root.join("pseudonym.key"),
+        )
+        .expect("manager");
+        let call_cycle = |cycle_label: &str, selected_files: &[&str]| {
+            let ds_dir = ds_parent.join(format!("dataset-{cycle_label}"));
+            let selected: BTreeSet<PathBuf> =
+                selected_files.iter().map(|f| pcap_dir.join(f)).collect();
+            let _ = manager.process_capture_into_selected(
+                CONTINUOUS_CAPTURE_ID,
+                format!("ds-{cycle_label}"),
+                &pcap_dir,
+                &ds_dir,
+                ds_dir.display().to_string(),
+                &sbi_interfaces(),
+                Some(&selected),
+                None,
+            );
+        };
+
+        // Cycle 1 : ring seq 1 + hors-ring même 5-tuple.
+        call_cycle("c1", &[&name_r1, &name_off]);
+        let last1 = manager
+            .sbi_hpack_last_ring_pos_by_interface
+            .lock()
+            .unwrap()
+            .get("SBI")
+            .cloned();
+        assert_eq!(
+            last1,
+            Some(("20261118T093000Z".to_string(), 1)),
+            "cycle 1 : ring seq 1 doit avancer last_ring_pos"
+        );
+        let snap1 = manager
+            .hpack_carry_metrics_snapshot()
+            .get("SBI")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            snap1.off_ring_segments_decoded, 1,
+            "cycle 1 : hors-ring compté comme décodé : snap1={snap1:?}"
+        );
+        assert_eq!(
+            snap1.invalidations, 1,
+            "cycle 1 : UNIQUEMENT l'init (ring last=None non-contigu). \
+             Preuve de non-contamination : le hors-ring n'a PAS invalidé le carry ring. \
+             snap1={snap1:?}"
+        );
+
+        // Cycle 2 : ring seq 2 (contigu à seq 1). Le carry ring
+        // doit contenir la table du seq 1 intacte (preuve que le
+        // hors-ring n'a rien effacé).
+        call_cycle("c2", &[&name_r2]);
+        let last2 = manager
+            .sbi_hpack_last_ring_pos_by_interface
+            .lock()
+            .unwrap()
+            .get("SBI")
+            .cloned();
+        assert_eq!(
+            last2,
+            Some(("20261118T093000Z".to_string(), 2)),
+            "cycle 2 : ring seq 2 contigu doit avancer last_ring_pos"
+        );
+        let snap2 = manager
+            .hpack_carry_metrics_snapshot()
+            .get("SBI")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            snap2.invalidations, 1,
+            "cycle 2 : AUCUNE nouvelle invalidation (ring seq 2 contigu à seq 1). \
+             Mutation : si le hors-ring partageait le carry ring en cycle 1, \
+             invalidations serait ≥ 2 (invalidate avant le hors-ring). \
+             snap2={snap2:?}"
+        );
     }
 }

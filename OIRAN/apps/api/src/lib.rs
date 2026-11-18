@@ -1497,6 +1497,31 @@ async fn health_response(state: &AppState, first_wait: std::time::Duration) -> J
         "count": count,
         "items": items,
     });
+    // 2.21.54 (ordre #9 6987366620 — raccord HTTP du carry HPACK) :
+    // expose `hpack_carry_metrics_snapshot()` sous `data.hpack_carry`
+    // pour que l'opérateur voie, par interface SBI, le nombre de
+    // connexions suivies / reprises / évincées et le nombre
+    // d'invalidations (fail-closed). Vide si aucun cycle SBI n'a
+    // encore tourné.
+    let hpack_snapshot = state.inner.capture_manager.hpack_carry_metrics_snapshot();
+    let hpack_items: Vec<Value> = hpack_snapshot
+        .iter()
+        .map(|(iface, m)| {
+            json!({
+                "interface": iface,
+                "connections_tracked": m.connections_tracked,
+                "connections_resumed": m.connections_resumed,
+                "connections_evicted": m.connections_evicted,
+                "invalidations": m.invalidations,
+                "off_ring_segments_decoded": m.off_ring_segments_decoded,
+                "last_cycle_epoch_ms": m.last_cycle_epoch_ms,
+            })
+        })
+        .collect();
+    data["hpack_carry"] = json!({
+        "interface_count": hpack_items.len(),
+        "by_interface": hpack_items,
+    });
     ok(data)
 }
 
