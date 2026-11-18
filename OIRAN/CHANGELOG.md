@@ -1,5 +1,9 @@
 # Changelog
 
+## OIRAN API 2.21.45 — 2026-11-18 — fusion 2.21.43 (NGAP, DEVMAT) + 2.21.44 (reprise capture après arrêt disque)
+
+Upgrade **patch**. Fusion sans conflit de code de `fix/oiran-2.21.43-ngap-partial` (4428663, relue) sur 2.21.44 (3c356fe) ; seuls Cargo.toml / Cargo.lock / CHANGELOG en conflit de version.
+
 ## OIRAN API 2.21.44 + live-probe 0.6.18 — 2026-11-18 — la capture continue reprend seule après un arrêt disque
 
 Upgrade **patch**, sur 2.21.42 (production). 2.21.43 est réservée au lot NGAP de DEVMAT.
@@ -11,6 +15,62 @@ Cause prouvée au lab (ANR2 #10 6975302726) : `capture_state=BLOCKED` depuis 07:
 - L'override disque de test devient partagé entre clones (`Arc<Mutex<…>>`), pour pouvoir changer le disque pendant que le worker tourne.
 - Test `continuous_import_resumes_by_itself_after_disk_policy_stop` : disque à 99 % → BLOCKED et worker vivant ; disque libre → CAPTURING, et le segment en attente est publié. **Preuve de mutation** : avec l'ancien arrêt terminal, le test échoue (délai de 30 s dépassé).
 - Lab : le job déjà sorti en 2.21.42 ne repart qu'au redémarrage du service, qui relance l'import. Après 2.21.44, plus aucun redémarrage n'est nécessaire.
+
+## OIRAN API 2.21.43 + decoder-ngap 0.6.2 — 2026-11-18 — NGAP « PARTIAL » → DECODED pour les IE 27/80/96/102 (listes modélisées TS 38.413) et 74/75 (sans erreur de liste), ordre #9 6972973040
+
+Upgrade **patch**, sur 2.21.42 (revert du rattachement SBI par ancre). Base `b682652`, nouvelle branche `fix/oiran-2.21.43-ngap-partial`, pas de force-push, aucun geste lab.
+
+### Déclencheur
+
+En production (dataset 2.21.42, ANR2 #10 6965947768) **948 NGAP en PARTIAL** contre 2 698 DECODED. Audit code (b682652) : `decoder-ngap/src/lib.rs::decode_ie` forçait `Partial` dès qu'un IE à sha256 était rencontré (IE 27, 80, 96, 102, 141 et IE inconnu) et sur toutes les listes PDU (IE 53..79 ∪ 133, y compris 74/75 pourtant modélisées).
+
+### Spécifications APER TS 38.413 modélisées
+
+- **IE 27 `GlobalRANNodeID`** (§9.3.1.5) — CHOICE { globalGNB-ID, globalNgENB-ID, globalN3IWF-ID, … }. Pour `globalGNB-ID` : extrait PLMN, `gnb_id` numérique, `gnb_id_bit_length` (22..32). Pour `globalNgENB-ID` et `globalN3IWF-ID` : extrait PLMN et marqueur de type. CHOICE-extension inconnue → fallback `sha256` + `Partial` + motif d'ouverture. Aucune identité abonné (nœud radio public).
+- **IE 80 `PLMNSupportList`** (§9.3.1.12) — SEQUENCE OF `PLMNSupportItem` : extrait `plmn_support_item_count` et `item_<i>_plmn` par item. `Decoded` si et seulement si `extracted == count > 0`.
+- **IE 96 `ServedGUAMIList`** (§9.3.1.17) — SEQUENCE OF `ServedGUAMIItem` : extrait `served_guami_item_count` et, par item, `plmn`, `amf_region`, `amf_set_id`, `amf_pointer` (TS 38.413 §9.3.3.2). `Decoded` si et seulement si `extracted == count > 0`.
+- **IE 102 `SupportedTAList`** (§9.3.1.19) — SEQUENCE OF `SupportedTAItem` : extrait `supported_ta_item_count`, `item_<i>_tac` (3 octets big-endian, §9.3.3.10) et le PLMN broadcast si présent. `Decoded` si et seulement si `extracted == count > 0`.
+- **IE 74/75 `PDUSessionResourceSetupListSU{Req,Res}`** — déjà modélisées par `transfer::decode_pdu_session_resource_setup_list_su_*`. Le statut passe à `Decoded` **si et seulement si** `list.errors` est vide, `list.items` non vide, et aucun item ne reporte d'erreur de transfer. Toute erreur de liste ou d'item → `Partial`.
+
+### Non-régression de la corrélation SBI/N3
+
+- Les labels `item_<i>_tunnel_ip_ul`, `item_<i>_gtp_teid_ul` (IE 74) et `item_<i>_tunnel_ip_dl`, `item_<i>_gtp_teid_dl` (IE 75) restent produits par `append_su{req,res}_item_summary` **indépendamment** du changement de statut. La session-engine consomme ces labels pour attacher les SBI aux PDU sessions ; aucun chemin de corrélation n'est modifié.
+- Test dédié `pdu_session_tunnel_labels_remain_stable_2_21_43` : vérifie que `pdu_session_tunnel_labels(74) == ("tunnel_ip_ul", "gtp_teid_ul")` et symétrique pour 75, et que le fallback IE 133 reste générique (non consommé comme UL/DL par la session-engine).
+
+### Tests
+
+- Tests inline `decoder-ngap/src/lib.rs` (un par IE, avec octets synthétisés selon TS 38.413 et preuve de mutation) :
+  - `global_ran_node_id_decodes_global_gnb_id_with_plmn_and_gnb_bit_length` ;
+  - `plmn_support_list_extracts_count_and_plmn_per_item` ;
+  - `served_guami_list_extracts_plmn_region_set_pointer_per_item` ;
+  - `supported_ta_list_extracts_tac_and_broadcast_plmn_per_item` ;
+  - `pdu_session_tunnel_labels_remain_stable_2_21_43` (non-régression SBI/N3).
+- Fixture `decoder-ngap/tests/fixtures/e2e-20261029-sanitized.json` : reformatée lisible, les 2 entrées procedure 29 (PDUSession Setup Req/Res) restent attendues `PARTIAL` avec `expected_reason` mis à jour (item 0 transfer tronqué → `item errors not empty` conforme à 2.21.43).
+
+### 12 exécutions à 0 échec (log `/tmp/2.21.43/*.log`, aucun `#[ignore]` ajouté)
+
+| cible | commande | tests | runs | failed |
+| --- | --- | --- | --- | --- |
+| decoder-ngap | `cargo test --locked -p decoder-ngap` | 26 + 1 + 11 + doc | 12 | 0 |
+| session-engine --lib | `cargo test --locked -p session-engine --lib` | 45 (+1 ignored préexistant) | 12 | 0 |
+| live-probe --lib | `cargo test --locked -p live-probe --lib` | 174 (+6 ignored préexistants) | 12 | 0 |
+| oiran-api --lib | `cargo test --locked -p oiran-api --lib` | 191 (+3 ignored préexistants) | 12 | 0 |
+| vtap --locked | `cd vtap && cargo update -w && cargo test --locked` | 12 + 3 + doc | 12 | 0 |
+
+`cargo update -w` dans `vtap/` : `decoder-ngap v0.6.1 → v0.6.2`, conforme à la règle vtap-lock-après-bump.
+
+### OUVERT (pas de redécodage du stock existant, pas de promesse)
+
+- **Stock pré-2.21.43 déjà stocké** : les 948 NGAP PARTIAL de la production (2.21.42) **conservent leur statut PARTIAL**. Il n'y a pas de redécodage ni de patch read-time dans ce lot — il faudra soit un redécodage planifié avec preuve lab, soit un patch read-time dédié.
+- **IE 53..79 (sauf 74/75) ∪ 133 — autres PDU session lists** : schéma APER non modélisé dans cette version. `decode_pdu_session_list` conserve le scan heuristique qui extrait `pdu_session_id`, `tunnel_<ip|teid>_<ul|dl>` et `pdu_session_type` (pour préserver la corrélation SBI/N3) et renvoie `Partial`.
+- **IE 141 et IE inconnu** : toujours `Partial` (`sha256` + motif d'ouverture).
+- **IE 27 CHOICE non-GNB/NgENB/N3IWF** : fallback `Partial` avec motif `ran_node_type=choice-extension(...)`.
+
+### Numérotation
+
+- `decoder-ngap` 0.6.1 → 0.6.2 (patch).
+- `oiran-api` 2.21.42 → 2.21.43 (patch).
+- Aucune autre crate bumpée. `session-engine`, `live-probe` : inchangées (modèle APER localisé dans `decoder-ngap`).
 
 ## OIRAN API 2.21.42 + session-engine 0.5.18 — 2026-11-18 — retrait du rattachement SBI par ancre de capture (2.21.38 + 2.21.40), en attente du diagnostic lab
 

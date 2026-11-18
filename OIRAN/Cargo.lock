@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-ngap"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "decoder-nas",
  "decoder-s1ap",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.21.44"
+version = "2.21.45"
 dependencies = [
  "axum",
  "callflow-renderer",
