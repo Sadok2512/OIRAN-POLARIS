@@ -1164,6 +1164,30 @@ fn classify(path: Option<&str>, method: Option<&str>) -> (Option<String>, Option
         };
         return (Some("Nnrf_NFManagement".into()), Some(operation.into()));
     }
+    // 2.21.39 (ordre #9 6965054336, table vTAP ANR2 2026-11-18 01:05 UTC) —
+    // Nnrf_NFManagement NFStatus Subscribe/Unsubscribe/Update. TS 29.510
+    // §5.2.2.3 : « The NF Service Consumer may subscribe to be notified of
+    // NF status changes ». Observé lab : 341 POST `/subscriptions`,
+    // 65 DELETE `/subscriptions/<uuid>`, 45 PATCH `/subscriptions/<uuid>`.
+    if path.contains("/nnrf-nfm/") && path.contains("/subscriptions") {
+        let operation = match method {
+            Some("POST") => "NFStatusSubscribe",
+            Some("DELETE") => "NFStatusUnsubscribe",
+            Some("PATCH") => "NFStatusUpdate",
+            _ => "NFStatusSubscriptionOperation",
+        };
+        return (Some("Nnrf_NFManagement".into()), Some(operation.into()));
+    }
+    // 2.21.39 — Nnrf_NFManagement NFStatusNotify. TS 29.510 §5.2.2.4 :
+    // callback POST vers le consumer pour notifier un changement de statut.
+    // Open5GS pose le callback sur `/nnrf-nfm/v1/nf-status-notify` (observé
+    // lab : 193+12 POST). URI hors TS stricte mais service NRF.
+    if path.contains("/nnrf-nfm/") && path.contains("/nf-status-notify") {
+        return (
+            Some("Nnrf_NFManagement".into()),
+            Some("NFStatusNotify".into()),
+        );
+    }
     // Nnrf_NFDiscovery.
     if path.contains("/nnrf-disc/") {
         return (
@@ -1907,6 +1931,59 @@ mod tests {
         assert_eq!(
             classified("/nnrf-nfm/v1/nf-instances/abcdef", "GET").1.as_deref(),
             Some("GetNFInstance")
+        );
+    }
+
+    /// 2.21.39 (ordre #9 6965054336) — table vTAP ANR2 : 341 POST, 65
+    /// DELETE, 45 PATCH sur `/nnrf-nfm/v1/subscriptions[/<uuid>]`
+    /// étaient UnsupportedSbiOperation. TS 29.510 §5.2.2.3.
+    #[test]
+    fn classifies_nnrf_nfmanagement_nf_status_subscribe_unsubscribe_update() {
+        let (svc, op) = classified("/nnrf-nfm/v1/subscriptions", "POST");
+        assert_eq!(svc.as_deref(), Some("Nnrf_NFManagement"));
+        assert_eq!(op.as_deref(), Some("NFStatusSubscribe"));
+        assert_eq!(
+            classified(
+                "/nnrf-nfm/v1/subscriptions/4e8f1a7c-0000-4000-8000-000000000001",
+                "DELETE"
+            )
+            .1
+            .as_deref(),
+            Some("NFStatusUnsubscribe")
+        );
+        assert_eq!(
+            classified(
+                "/nnrf-nfm/v1/subscriptions/4e8f1a7c-0000-4000-8000-000000000002",
+                "PATCH"
+            )
+            .1
+            .as_deref(),
+            Some("NFStatusUpdate")
+        );
+        // Preuve de mutation : la méthode est consultée pour choisir
+        // l'opération ; une méthode inconnue (`HEAD`) tombe sur le
+        // fallback `NFStatusSubscriptionOperation`, pas sur Subscribe
+        // par défaut. Protège contre la régression « POST implicite ».
+        assert_eq!(
+            classified("/nnrf-nfm/v1/subscriptions", "HEAD").1.as_deref(),
+            Some("NFStatusSubscriptionOperation")
+        );
+    }
+
+    /// 2.21.39 (ordre #9 6965054336) — table vTAP ANR2 : 193 + 12 POST
+    /// sur `/nnrf-nfm/v1/nf-status-notify` étaient
+    /// UnsupportedSbiOperation. Open5GS callback NFStatusNotify.
+    #[test]
+    fn classifies_nnrf_nfmanagement_nf_status_notify() {
+        let (svc, op) = classified("/nnrf-nfm/v1/nf-status-notify", "POST");
+        assert_eq!(svc.as_deref(), Some("Nnrf_NFManagement"));
+        assert_eq!(op.as_deref(), Some("NFStatusNotify"));
+        // Preuve de mutation : la branche `nf-status-notify` NE DOIT
+        // PAS avaler les URI nf-instances (test anti-régression sur
+        // l'ordre des branches dans `classify`).
+        assert_eq!(
+            classified("/nnrf-nfm/v1/nf-instances/abcdef", "PUT").1.as_deref(),
+            Some("RegisterNFInstance")
         );
     }
 

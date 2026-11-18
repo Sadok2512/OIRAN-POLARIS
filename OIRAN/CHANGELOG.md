@@ -1,5 +1,75 @@
 # Changelog
 
+## OIRAN API 2.21.39 + decoder-sbi 0.4.9 — 2026-11-18 — catalogue SBI à 100 % sur la table vTAP ANR2 (2 URI NRF ajoutées)
+
+Sprint de nuit CLAUDE DEVMAT (#9, ordre 6965054336). Base `4f62bec` (2.21.38), nouvelle branche `fix/oiran-2.21.39-sbi-catalogue`, pas de force-push.
+
+### Déclencheur
+
+Table vTAP ANR2 publiée le 2026-11-18 01:05 UTC (#9 6965805305) : 34 `UnsupportedSbiOperation` sur `nnrf-nfm` + 193+12 sur `/nnrf-nfm/v1/nf-status-notify`, dans le dataset 2.21.37. Analyse :
+- 48 554 events UnsupportedSbiOperation sur URI DÉJÀ classées par `classify` (ex : 47 973 PATCH `/nnrf-nfm/v1/nf-instances/<uuid>`, 423 GET, 121 PATCH `/nudm-uecm/.../amf-3gpp-access`, etc.) → events du **stock pré-2.21.3** nommés à l'ingestion avec l'ancien catalogue → le reclassement à la lecture 2.21.18 (`sbi_name_for`) les traite déjà, aucun code à ajouter.
+- 2 URI NON classées par `classify` actuel : `/nnrf-nfm/v1/subscriptions[/<uuid>]` (POST/DELETE/PATCH, 341+65+45) et `/nnrf-nfm/v1/nf-status-notify` (POST, 193+12).
+
+### Changements (decoder-sbi)
+
+`classify` dans `decoder-sbi/src/lib.rs` gagne 2 branches dans le service `Nnrf_NFManagement` (TS 29.510) :
+
+| Opération | Méthode | URI | Ligne |
+|---|---|---|---|
+| NFStatusSubscribe | POST | `/nnrf-nfm/.../subscriptions` | 1172 |
+| NFStatusUnsubscribe | DELETE | `/nnrf-nfm/.../subscriptions/<uuid>` | 1173 |
+| NFStatusUpdate | PATCH | `/nnrf-nfm/.../subscriptions/<uuid>` | 1174 |
+| NFStatusNotify | POST | `/nnrf-nfm/.../nf-status-notify` | 1185 |
+
+Ordre des branches : `nf-instances` D'ABORD (déjà existant), puis `subscriptions`, puis `nf-status-notify`. Les 3 branches `/nnrf-nfm/` sont disjointes (pas d'URI qui combine `/nf-instances` ET `/subscriptions`). Préservation de la sémantique existante (test de non-régression sur `/nf-instances` dans le test `classifies_nnrf_nfmanagement_nf_status_notify`).
+
+### Reclassement à la lecture (2.21.18 déjà en place)
+
+Le patch de lecture `sbi_name_for` (`apps/api/src/read_time_patch.rs:531`) appelle `decoder_sbi::classify_sanitized_operation` sur chaque event stocké avec `UnsupportedSbiOperation…`. L'ajout des 2 branches dans `classify` reclasse automatiquement les events stock sans réingestion. Preuve par test `stored_sbi_events_are_reclassified_at_read_time_for_new_catalogue_entries_2_21_39`.
+
+### Tests (règle « sans `#[ignore]`, 12 runs à 0 fail »)
+
+- `decoder-sbi::classifies_nnrf_nfmanagement_nf_status_subscribe_unsubscribe_update` : couvre les 3 méthodes (POST/DELETE/PATCH) + fallback `NFStatusSubscriptionOperation` pour méthode inconnue (preuve de mutation).
+- `decoder-sbi::classifies_nnrf_nfmanagement_nf_status_notify` : couvre POST + anti-régression sur `/nf-instances/<uuid>` PUT = toujours `RegisterNFInstance` (preuve de mutation sur l'ordre des branches).
+- `read_time_patch::stored_sbi_events_are_reclassified_at_read_time_for_new_catalogue_entries_2_21_39` : prouve que 4 events stockés `UnsupportedSbiOperation [conn=x/stream=N]` deviennent `NFStatusSubscribe`/`NFStatusUnsubscribe`/`NFStatusUpdate`/`NFStatusNotify` au read-time, SANS réingestion. Preuve de mutation : URI non catalogue garde son libellé (jamais d'invention).
+
+Preuves — 12 runs consécutifs :
+
+```sh
+$ for i in $(seq 1 12); do cargo test --locked -p decoder-sbi 2>&1 | grep "test result" | head -1; done
+test result: ok. 40 passed; 0 failed    (×12, 0 échec)
+
+$ for i in $(seq 1 12); do cargo test --locked -p oiran-api --lib 2>&1 | grep "test result"; done
+test result: ok. 191 passed; 0 failed; 3 ignored    (×12, 0 échec)
+
+$ cargo test --locked -p live-probe --lib
+test result: ok. 174 passed; 0 failed; 6 ignored
+
+$ cd OIRAN/vtap && cargo update -w && cargo test --locked
+test result: ok. 12 passed; 0 failed    (+ sous-crates)
+```
+
+Les `ignored` (3 oiran-api, 6 live-probe) sont lab-only pré-existants. **Aucun nouveau `#[ignore]`**.
+
+### Composants et versions
+
+| Composant | Avant | Après |
+|---|---|---|
+| `decoder-sbi` | 0.4.8 | **0.4.9** |
+| `oiran-api` | 2.21.38 | **2.21.39** |
+
+### Hors scope
+
+- URI NRF spec TS 29.510 **non observées au lab** (ex : `UpdateNFHeartBeat`, `/oauth2/token`, `/bootstrapping`, `SCPDomainRoutingInfoGet`) : non ajoutées car « une URI hors spécification reste non classée, et tu l'écris dans le rapport » — ces URI ne sont pas « hors spec » mais « hors production Open5GS observée ». Elles resteront `UnsupportedSbiOperation` tant qu'elles ne sont pas vues en lab, conformément à la règle « aucune hypothèse d'URI ».
+- `publish_events_to_dataset_dir`, `offline_lte_callflows` : chantier mémoire ANR1 #10 (hors périmètre CLAUDE DEVMAT).
+
+### Garde-fous
+
+- **Aucun geste lab** (la table ANR2 était la seule source).
+- Pas de merge sur `fix/oiran-2.21.10-analyzer`.
+- Aucun chiffre sans sa commande (table ANR2 publiée avec la commande jq).
+- Branches précédentes gelées sur `origin`.
+
 ## OIRAN API 2.21.38 + session-engine 0.5.15 + live-probe 0.6.16 — 2026-11-17 — fallback SBI borné par ancre de capture
 
 Sprint de nuit ANR1 n°2 (#10, ordre 6964246166), base 2.21.37 `679f2fb`.

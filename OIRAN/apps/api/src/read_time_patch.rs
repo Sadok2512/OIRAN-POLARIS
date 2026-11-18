@@ -2733,6 +2733,76 @@ mod tests {
         assert!(extract_identity_summary_from_items(&items).is_none());
     }
 
+    /// 2.21.39 (ordre #9 6965054336) — le reclassement à la lecture
+    /// 2.21.18 doit couvrir **automatiquement** le stock pré-2.21.39 :
+    /// les events stockés avec `UnsupportedSbiOperation…` dont l'URI
+    /// correspond à l'une des 2 nouvelles entrées catalogue 2.21.39
+    /// (`/nnrf-nfm/.../subscriptions` et `/nnrf-nfm/.../nf-status-notify`)
+    /// doivent être reclassés en `NFStatusSubscribe` / `NFStatusUnsubscribe`
+    /// / `NFStatusUpdate` / `NFStatusNotify`, sans réingestion.
+    #[test]
+    fn stored_sbi_events_are_reclassified_at_read_time_for_new_catalogue_entries_2_21_39() {
+        let dir = std::env::temp_dir().join(format!("rtp-sbi-2-21-39-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sbi = |id: &str, method: &str, uri: &str| {
+            json!({
+                "event_id": id, "parent_event_id": null, "interface": "SBI",
+                "protocol": "SBI-HTTP2",
+                "message_name": "UnsupportedSbiOperation [conn=x/stream=1]",
+                "source_endpoint": {"address":"10.77.20.20","port":40000,"network_function":"AMF"},
+                "destination_endpoint": {"address":"10.77.20.30","port":7777,"network_function":"NRF"},
+                "direction": "UNKNOWN",
+                "information_elements": [
+                    {"name":"HTTP method","value":method},
+                    {"name":"Request URI (sanitized)","value":uri}
+                ]
+            })
+        };
+        let raw = vec![
+            sbi("sbi-nfsub-post", "POST", "/nnrf-nfm/v1/subscriptions"),
+            sbi("sbi-nfsub-del",  "DELETE", "/nnrf-nfm/v1/subscriptions/4e8f1a7c-0000-4000-8000-000000000001"),
+            sbi("sbi-nfsub-pat",  "PATCH",  "/nnrf-nfm/v1/subscriptions/4e8f1a7c-0000-4000-8000-000000000002"),
+            sbi("sbi-nfnotify",   "POST",   "/nnrf-nfm/v1/nf-status-notify"),
+        ];
+        let jsonl_path = write_jsonl(&dir, &raw);
+        let index = RawEventIndex::from_jsonl_path(&jsonl_path).unwrap();
+        let mut events = vec![
+            stale_callflow_event("sbi-nfsub-post", "AMF", "NRF", "UNKNOWN", "UnsupportedSbiOperation [conn=x/stream=1]"),
+            stale_callflow_event("sbi-nfsub-del",  "AMF", "NRF", "UNKNOWN", "UnsupportedSbiOperation [conn=x/stream=1]"),
+            stale_callflow_event("sbi-nfsub-pat",  "AMF", "NRF", "UNKNOWN", "UnsupportedSbiOperation [conn=x/stream=1]"),
+            stale_callflow_event("sbi-nfnotify",   "AMF", "NRF", "UNKNOWN", "UnsupportedSbiOperation [conn=x/stream=1]"),
+        ];
+        let counters = Arc::new(PatchCounters::new());
+        patch_flow_events(&mut events, &index, &lab_endpoint_map(), &counters);
+        assert_eq!(events[0]["message_name"].as_str(), Some("NFStatusSubscribe"));
+        assert_eq!(events[1]["message_name"].as_str(), Some("NFStatusUnsubscribe"));
+        assert_eq!(events[2]["message_name"].as_str(), Some("NFStatusUpdate"));
+        assert_eq!(events[3]["message_name"].as_str(), Some("NFStatusNotify"));
+        // Preuve de mutation : si une URI ne correspond à aucune entrée du
+        // catalogue, le libellé stocké est conservé (jamais d'invention).
+        // On remplace `write_jsonl` par une URI non catalogue et on vérifie
+        // le non-changement.
+        let raw_unknown = vec![sbi("sbi-unknown", "POST", "/nzzz-made-up/v1/does-not-exist")];
+        let unknown_dir = dir.join("unknown");
+        std::fs::create_dir_all(&unknown_dir).unwrap();
+        let jsonl_unknown = write_jsonl(&unknown_dir, &raw_unknown);
+        let idx_unknown = RawEventIndex::from_jsonl_path(&jsonl_unknown).unwrap();
+        let mut unknown_events = vec![stale_callflow_event(
+            "sbi-unknown",
+            "AMF",
+            "NRF",
+            "UNKNOWN",
+            "UnsupportedSbiOperation [conn=x/stream=99]",
+        )];
+        patch_flow_events(&mut unknown_events, &idx_unknown, &lab_endpoint_map(), &counters);
+        assert!(unknown_events[0]["message_name"]
+            .as_str()
+            .unwrap()
+            .starts_with("UnsupportedSbiOperation"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 2.21.18 — un event SBI stocké `UnsupportedSbiOperation…` est
     /// reclassé à la lecture avec la MÊME fonction que le décodeur ;
     /// une URI inconnue garde son libellé (jamais d'invention).
