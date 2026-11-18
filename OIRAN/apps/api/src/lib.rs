@@ -164,6 +164,10 @@ struct Inner {
     filter_summary_resolutions: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     filter_flow_resolutions: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    filter_index_rebuilds: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    journey_index_rebuilds: std::sync::atomic::AtomicUsize,
 }
 
 /// 2.21.11 — entrée de cache + clé composite pour `/sessions/catalog`.
@@ -754,6 +758,10 @@ impl AppState {
                 filter_summary_resolutions: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 filter_flow_resolutions: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                filter_index_rebuilds: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                journey_index_rebuilds: std::sync::atomic::AtomicUsize::new(0),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -845,6 +853,10 @@ impl AppState {
                 filter_summary_resolutions: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 filter_flow_resolutions: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                filter_index_rebuilds: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                journey_index_rebuilds: std::sync::atomic::AtomicUsize::new(0),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -859,6 +871,8 @@ impl AppState {
     /// dataset publié par le `CaptureManager` (continuous +
     /// derived). Appelé à chaque rafraîchissement opérationnel.
     fn refresh_session_filter_index(&self) {
+        let audit = std::env::var_os("OIRAN_SESSIONS_FILTER_PHASE_AUDIT").is_some();
+        let started = std::time::Instant::now();
         // 2.18.12 (audit perf) — appelée à CHAQUE page de
         // POST /sessions/filter : relisait et re-parsait tous les call
         // flows (+ exports LTE) à chaque fois. Reconstruction seulement si
@@ -866,6 +880,12 @@ impl AppState {
         let signature = journey_signature(self);
         if let Ok(last) = self.inner.session_filter_signature.lock() {
             if last.as_ref() == Some(&signature) {
+                if audit {
+                    eprintln!(
+                        "SESSIONS_FILTER_PHASE phase=filter_index cache=hit elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                }
                 return;
             }
         }
@@ -917,6 +937,16 @@ impl AppState {
         }
         if let Ok(mut guard) = self.inner.session_filter_index.write() {
             *guard = index;
+        }
+        #[cfg(test)]
+        self.inner
+            .filter_index_rebuilds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if audit {
+            eprintln!(
+                "SESSIONS_FILTER_PHASE phase=filter_index cache=rebuild elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
         }
     }
 }
@@ -3513,10 +3543,18 @@ type ListRowCache =
 type JourneyCache = Option<(Vec<String>, std::sync::Arc<subscriber_journey::JourneyIndex>)>;
 
 fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::JourneyIndex> {
+    let audit = std::env::var_os("OIRAN_SESSIONS_FILTER_PHASE_AUDIT").is_some();
+    let started = std::time::Instant::now();
     let signature = journey_signature(state);
     if let Ok(cache) = state.inner.journey_index_cache.lock() {
         if let Some((cached, index)) = cache.as_ref() {
             if *cached == signature {
+                if audit {
+                    eprintln!(
+                        "SESSIONS_FILTER_PHASE phase=journey_index cache=hit elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                }
                 return index.clone();
             }
         }
@@ -3535,7 +3573,78 @@ fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::
     if let Ok(mut cache) = state.inner.journey_index_cache.lock() {
         *cache = Some((signature, index.clone()));
     }
+    #[cfg(test)]
+    state
+        .inner
+        .journey_index_rebuilds
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if audit {
+        eprintln!(
+            "SESSIONS_FILTER_PHASE phase=journey_index cache=rebuild elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
     index
+}
+
+/// 2.21.56 — construit les deux caches payés auparavant par le premier
+/// `/sessions/filter` après une publication. L'appelant tient toujours la
+/// garde lourde exclusive : tant que le préchauffage n'est pas terminé, les
+/// routes reçoivent un 503 explicite et ne voient jamais un cache partiel.
+fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
+    let started = std::time::Instant::now();
+    state.refresh_session_filter_index();
+    let filter_ready_ms = started.elapsed().as_millis();
+    let _ = cached_journey_index(state);
+    eprintln!(
+        "{}",
+        json!({
+            "event": "SESSIONS_FILTER_PREWARM_READY",
+            "trigger": trigger,
+            "filter_ready_ms": filter_ready_ms,
+            "total_ms": started.elapsed().as_millis(),
+        })
+    );
+}
+
+/// 2.21.56 — branche le préchauffage sur le commit de publication et tente
+/// aussi un amorçage avant l'ouverture du listener. Si une publication tient
+/// déjà le verrou au démarrage, l'observateur synchrone prend le relais à son
+/// `upsert_dataset`; le report est journalisé, jamais silencieux.
+pub fn install_session_filter_cache_prewarm(state: &AppState) {
+    let weak = Arc::downgrade(&state.inner);
+    state
+        .inner
+        .capture_manager
+        .set_dataset_publish_observer(Some(Arc::new(move || {
+            let Some(inner) = weak.upgrade() else {
+                eprintln!(
+                    "{}",
+                    json!({"event": "SESSIONS_FILTER_PREWARM_SKIPPED", "reason": "state_dropped"})
+                );
+                return;
+            };
+            let state = AppState { inner };
+            let _gate = state.inner.capture_manager.heavy_memory_enter();
+            prewarm_session_filter_caches_locked(&state, "publication");
+        })));
+
+    if let Some(_gate) = state
+        .inner
+        .capture_manager
+        .heavy_memory_try_enter_exclusive()
+    {
+        prewarm_session_filter_caches_locked(state, "startup");
+    } else {
+        eprintln!(
+            "{}",
+            json!({
+                "event": "SESSIONS_FILTER_PREWARM_DEFERRED",
+                "trigger": "startup",
+                "reason": "publication_in_progress"
+            })
+        );
+    }
 }
 
 /// 2.21.23 — stream les flows requêtables UN PAR UN. `queryable_flows`
@@ -4299,6 +4408,21 @@ fn sessions_filter_blocking(
     headers: HeaderMap,
     request: SessionsFilterRequest,
 ) -> Response {
+    let audit_enabled = std::env::var_os("OIRAN_SESSIONS_FILTER_PHASE_AUDIT").is_some();
+    let audit_started = std::time::Instant::now();
+    let mut audit_previous = audit_started;
+    let mut audit_phase = |phase: &str| {
+        if audit_enabled {
+            let now = std::time::Instant::now();
+            eprintln!(
+                "SESSIONS_FILTER_PHASE phase={} phase_ms={} total_ms={}",
+                phase,
+                now.duration_since(audit_previous).as_millis(),
+                now.duration_since(audit_started).as_millis()
+            );
+            audit_previous = now;
+        }
+    };
     let role = role_from_headers(&state, &headers);
     if request.identity.is_some() && !role.can_control() {
         return api_error(
@@ -4313,8 +4437,11 @@ fn sessions_filter_blocking(
     let Some(_heavy_memory_gate) = state.inner.capture_manager.heavy_memory_try_enter() else {
         return heavy_work_in_progress();
     };
+    audit_phase("heavy_gate");
     state.refresh_session_filter_index();
+    audit_phase("refresh_filter_index");
     let journey_index = cached_journey_index(&state);
+    audit_phase("cached_journey_index");
 
     let messages: Vec<(Option<String>, String)> = request
         .messages
@@ -4723,6 +4850,7 @@ fn sessions_filter_blocking(
         } else {
             (sorted_ids.clone(), None)
         };
+    audit_phase("match_and_order");
 
     let start_index = match request.cursor.as_deref() {
         None => 0,
@@ -4767,6 +4895,7 @@ fn sessions_filter_blocking(
             response["meta"]["search_matched_pseudonym"] =
                 serde_json::Value::String(pseudo.to_owned());
         }
+        audit_phase("serialize_preview");
         return (StatusCode::OK, Json(response)).into_response();
     }
 
@@ -4851,6 +4980,7 @@ fn sessions_filter_blocking(
             }
         }
     }
+    audit_phase("page_summaries");
     // Assemble la page DANS l'ordre canonique page_ids — pas
     // de re-sort sur `ts` ou autre après ça.
     let mut data: Vec<Value> = page_ids
@@ -4922,6 +5052,7 @@ fn sessions_filter_blocking(
             session_catalog::FilterCombinator::Or => Value::String("or".to_owned()),
         };
     }
+    audit_phase("decorate_page");
     (StatusCode::OK, Json(response)).into_response()
 }
 
@@ -12714,6 +12845,53 @@ mod tests {
             state.inner.filter_flow_resolutions.load(Ordering::SeqCst),
             0,
             "mutation guard: restoring per-session flow resolution must make this assertion red"
+        );
+    }
+
+    /// 2.21.56 — le premier filtre servi ne doit reconstruire aucun des
+    /// deux index : ils sont prêts avant l'ouverture du listener (ou dans le
+    /// callback de publication). Mutation : retirer l'un des deux appels de
+    /// `prewarm_session_filter_caches_locked` incrémente le compteur associé
+    /// pendant la requête et rend ce test rouge.
+    #[tokio::test]
+    async fn session_filter_prewarm_makes_first_request_cache_hot() {
+        use std::sync::atomic::Ordering;
+
+        let state = state();
+        assert_eq!(state.inner.filter_index_rebuilds.load(Ordering::SeqCst), 0);
+        assert_eq!(state.inner.journey_index_rebuilds.load(Ordering::SeqCst), 0);
+
+        install_session_filter_cache_prewarm(&state);
+        let filter_rebuilds_after_warm =
+            state.inner.filter_index_rebuilds.load(Ordering::SeqCst);
+        let journey_rebuilds_after_warm =
+            state.inner.journey_index_rebuilds.load(Ordering::SeqCst);
+        assert_eq!(filter_rebuilds_after_warm, 1);
+        assert_eq!(journey_rebuilds_after_warm, 1);
+
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "limit": 100,
+                "time_window": {
+                    "from": "0",
+                    "to": i128::MAX.to_string(),
+                }
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body["data"].as_array().unwrap().is_empty());
+        assert_eq!(
+            state.inner.filter_index_rebuilds.load(Ordering::SeqCst),
+            filter_rebuilds_after_warm,
+            "first request rebuilt the prewarmed filter index"
+        );
+        assert_eq!(
+            state.inner.journey_index_rebuilds.load(Ordering::SeqCst),
+            journey_rebuilds_after_warm,
+            "first request rebuilt the prewarmed journey index"
         );
     }
 

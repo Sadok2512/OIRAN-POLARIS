@@ -1,5 +1,17 @@
 # Changelog
 
+## OIRAN API 2.21.56 + live-probe 0.6.20 — 2026-11-18 — index filtre préchauffés au commit de publication
+
+Upgrade **patch**, basé sur 2.21.55 (`b94e84d`) et intégrant le filtre temporel indexé de 2.21.52 (`5a04dac`).
+
+- Audit sur copie physique du stock complet (`dataset_manifest.json` SHA-256 `a11b2c9cd68ea91a51a78b8449371ef2a76bcaed589984b1a933027344c746be`) : processus neuf, premier appel fenêtre = 3,186679 s, dont 1 319 ms de reconstruction `SessionFilterIndex`, 1 105 ms de reconstruction `JourneyIndex` et 757 ms de page ; premier appel sans fenêtre sur un second processus neuf = 4,096253 s, dont 1 428 ms + 1 122 ms pour les deux index et 1 528 ms pour 100 summaries. La cause « index payés par le premier appel post-publication » est confirmée par mesure.
+- `CaptureManager` notifie maintenant l'API synchroniquement après l'upsert atomique du dataset. L'API prend le même verrou lourd en exclusif, reconstruit `SessionFilterIndex` et `JourneyIndex`, puis seulement laisse le worker annoncer `phase=end`.
+- Au démarrage, le même préchauffage est tenté avant l'ouverture du listener. Si une publication tient déjà le verrou, le report est explicite et son callback de commit prend le relais ; aucun garde ne se saute en silence.
+- Pendant publication ou préchauffage, `/sessions/filter` conserve le contrat 503 immédiat `HEAVY_WORK_IN_PROGRESS` + `Retry-After` ; aucun cache partiel n'est servi.
+- `OIRAN_SESSIONS_FILTER_PHASE_AUDIT=1` journalise les phases et le statut hit/rebuild sans donnée d'identité.
+- Gate sur la même copie physique, processus neuf et index préchauffés avant listener : premier appel fenêtre = 1,108443 s ; premier appel sans fenêtre (`limit: 100`) sur un second processus neuf = 1,973967 s. Les deux bornes locales (< 2 s / < 5 s) sont tenues.
+- Tests : équivalence temporelle inchangée ; le premier filtre après préchauffage ne reconstruit aucun index. Mutation : retirer un appel de préchauffage rend le test rouge via les compteurs de rebuild.
+
 ## OIRAN API 2.21.55 + session-engine 0.5.22 — 2026-11-18 — pseudonyme SBI relu dans l'URI sanitisée
 
 Upgrade **patch**, basé sur 2.21.51 (`a33bb6a`, production). 2.21.52 (ANR1, filtre) et 2.21.53/54 (DEVMAT, HPACK) sont des lots séparés.
