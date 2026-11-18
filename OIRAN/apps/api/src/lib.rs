@@ -160,6 +160,8 @@ struct Inner {
     /// des packet_references du callflow). Évite de relancer tshark
     /// 210 s sur le chemin de requête.
     identity_cache: std::sync::Mutex<BTreeMap<String, IdentityCacheEntry>>,
+    #[cfg(test)]
+    filter_summary_resolutions: std::sync::atomic::AtomicUsize,
 }
 
 /// 2.21.11 — entrée de cache + clé composite pour `/sessions/catalog`.
@@ -746,6 +748,8 @@ impl AppState {
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
                 identity_cache: std::sync::Mutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                filter_summary_resolutions: std::sync::atomic::AtomicUsize::new(0),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -833,6 +837,8 @@ impl AppState {
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
                 identity_cache: std::sync::Mutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                filter_summary_resolutions: std::sync::atomic::AtomicUsize::new(0),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -846,7 +852,7 @@ impl AppState {
     /// partir des `flows` statiques + des `callflows/` de chaque
     /// dataset publié par le `CaptureManager` (continuous +
     /// derived). Appelé à chaque rafraîchissement opérationnel.
-    fn refresh_session_filter_index(&self) {
+    fn refresh_session_filter_index(&self) -> bool {
         // 2.18.12 (audit perf) — appelée à CHAQUE page de
         // POST /sessions/filter : relisait et re-parsait tous les call
         // flows (+ exports LTE) à chaque fois. Reconstruction seulement si
@@ -854,7 +860,7 @@ impl AppState {
         let signature = journey_signature(self);
         if let Ok(last) = self.inner.session_filter_signature.lock() {
             if last.as_ref() == Some(&signature) {
-                return;
+                return false;
             }
         }
         let mut index = session_filters::SessionFilterIndex::empty();
@@ -906,6 +912,7 @@ impl AppState {
         if let Ok(mut guard) = self.inner.session_filter_index.write() {
             *guard = index;
         }
+        true
     }
 }
 
@@ -3500,12 +3507,14 @@ type ListRowCache =
     std::collections::HashMap<(String, String), (ListRowCacheSignature, Value, Value)>;
 type JourneyCache = Option<(Vec<String>, std::sync::Arc<subscriber_journey::JourneyIndex>)>;
 
-fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::JourneyIndex> {
+fn cached_journey_index_with_status(
+    state: &AppState,
+) -> (std::sync::Arc<subscriber_journey::JourneyIndex>, bool) {
     let signature = journey_signature(state);
     if let Ok(cache) = state.inner.journey_index_cache.lock() {
         if let Some((cached, index)) = cache.as_ref() {
             if *cached == signature {
-                return index.clone();
+                return (index.clone(), true);
             }
         }
     }
@@ -3523,7 +3532,11 @@ fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::
     if let Ok(mut cache) = state.inner.journey_index_cache.lock() {
         *cache = Some((signature, index.clone()));
     }
-    index
+    (index, false)
+}
+
+fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::JourneyIndex> {
+    cached_journey_index_with_status(state).0
 }
 
 /// 2.21.23 — stream les flows requêtables UN PAR UN. `queryable_flows`
@@ -4287,6 +4300,8 @@ fn sessions_filter_blocking(
     headers: HeaderMap,
     request: SessionsFilterRequest,
 ) -> Response {
+    let audit_phases = std::env::var_os("OIRAN_SESSIONS_FILTER_PHASE_AUDIT").is_some();
+    let phase_start = std::time::Instant::now();
     let role = role_from_headers(&state, &headers);
     if request.identity.is_some() && !role.can_control() {
         return api_error(
@@ -4301,8 +4316,14 @@ fn sessions_filter_blocking(
     let Some(_heavy_memory_gate) = state.inner.capture_manager.heavy_memory_try_enter() else {
         return heavy_work_in_progress();
     };
-    state.refresh_session_filter_index();
-    let journey_index = cached_journey_index(&state);
+    let heavy_memory_try_enter_ms = phase_start.elapsed().as_millis();
+    let refresh_start = std::time::Instant::now();
+    let filter_index_rebuilt = state.refresh_session_filter_index();
+    let refresh_session_filter_index_ms = refresh_start.elapsed().as_millis();
+    let journey_start = std::time::Instant::now();
+    let (journey_index, journey_cache_hit) = cached_journey_index_with_status(&state);
+    let cached_journey_index_ms = journey_start.elapsed().as_millis();
+    let filter_start = std::time::Instant::now();
 
     let messages: Vec<(Option<String>, String)> = request
         .messages
@@ -4500,6 +4521,11 @@ fn sessions_filter_blocking(
     // aucune source ne connaît l'id (session supprimée entre
     // l'index et la résolution).
     let resolve_summary = |session_id: &str| -> Option<Value> {
+        #[cfg(test)]
+        state
+            .inner
+            .filter_summary_resolutions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(flow) = state.inner.flows.get(session_id) {
             let mut summary = session_summary(&state, flow);
             decorate_subscriber_summary(&mut summary, flow, &journey_index);
@@ -4549,19 +4575,58 @@ fn sessions_filter_blocking(
         None
     };
 
-    // 2.19.0/2.19.1 — si extended filters présents, on construit
-    // TOUS les summaries des sorted_ids, on filtre, puis on re-tri
-    // par clé canonique conservée dans matching_keys (jamais par
-    // ts). Le fast path 2.18 (aucun extended filter) garde la
-    // construction paresseuse par page. `matched_criteria` est
-    // mémorisé par session pour injection dans le summary à la
-    // sortie.
+    // 2.19.0/2.19.1 — si extended filters présents, on filtre puis on
+    // re-trie par clé canonique conservée dans matching_keys (jamais par
+    // ts). 2.21.50 : le prédicat `time_window`, qui ne dépend que du
+    // callflow, passe AVANT `resolve_summary`. L'ancien ordre construisait
+    // la ligne complète de TOUTES les sessions (patch read-time + identités,
+    // avec hydratations tshark en arrière-plan), puis rejetait presque tout.
+    // La logique du prédicat et l'ordre de sortie restent identiques.
     let mut matched_hits_by_session: BTreeMap<String, Vec<session_catalog::CriterionHit>> =
         BTreeMap::new();
     let (effective_sorted_ids, prebuilt_items): (Vec<String>, Option<BTreeMap<String, Value>>) =
         if has_extended_filter {
             let mut built: BTreeMap<String, Value> = BTreeMap::new();
             for session_id in &sorted_ids {
+                let flow_for_match: Option<&CallFlow> = if has_2191_filter {
+                    state.inner.flows.get(session_id)
+                } else {
+                    None
+                };
+                let owned_live_flow: Option<CallFlow> = if has_2191_filter && flow_for_match.is_none() {
+                    live_flow_for(&state, session_id).map(|(_, flow)| flow)
+                } else {
+                    None
+                };
+                let events_ref: &[callflow_schema::CallFlowEvent] =
+                    match (flow_for_match, &owned_live_flow) {
+                        (Some(f), _) => f.events.as_slice(),
+                        (None, Some(f)) => f.events.as_slice(),
+                        _ => &[],
+                    };
+                // 2.21.50 : élimine les sessions hors fenêtre avant la
+                // construction coûteuse du summary.
+                if from_ns.is_some() || to_ns.is_some() {
+                    let has_event_in_window = events_ref.iter().any(|event| {
+                        let Some(ts) = event.timestamp_ns.parse::<i128>().ok() else {
+                            return false;
+                        };
+                        if let Some(f) = from_ns {
+                            if ts < f {
+                                return false;
+                            }
+                        }
+                        if let Some(t) = to_ns {
+                            if ts > t {
+                                return false;
+                            }
+                        }
+                        true
+                    });
+                    if !has_event_in_window {
+                        continue;
+                    }
+                }
                 let Some(summary) = resolve_summary(session_id) else {
                     continue;
                 };
@@ -4577,18 +4642,6 @@ fn sessions_filter_blocking(
                 // 2.19.1 — filtres protocolaires + time window +
                 // run_id + search + network_elements. Besoin des
                 // events du flow pour matcher criteria/search.
-                let flow_for_match: Option<&CallFlow> = state.inner.flows.get(session_id);
-                let owned_live_flow: Option<CallFlow> = if flow_for_match.is_none() {
-                    live_flow_for(&state, session_id).map(|(_, flow)| flow)
-                } else {
-                    None
-                };
-                let events_ref: &[callflow_schema::CallFlowEvent] =
-                    match (flow_for_match, &owned_live_flow) {
-                        (Some(f), _) => f.events.as_slice(),
-                        (None, Some(f)) => f.events.as_slice(),
-                        _ => &[],
-                    };
                 let participants_ref: &[callflow_schema::Participant] =
                     match (flow_for_match, &owned_live_flow) {
                         (Some(f), _) => f.participants.as_slice(),
@@ -4616,28 +4669,6 @@ fn sessions_filter_blocking(
                 // 2.19.1 : run_id (capture_references porte les ids).
                 if let Some(run) = run_id_filter.as_deref() {
                     if !capture_references_ref.iter().any(|r| r == run) {
-                        continue;
-                    }
-                }
-                // 2.19.1 : time_window ⇒ au moins un event dans [from,to].
-                if from_ns.is_some() || to_ns.is_some() {
-                    let has_event_in_window = events_ref.iter().any(|event| {
-                        let Some(ts) = event.timestamp_ns.parse::<i128>().ok() else {
-                            return false;
-                        };
-                        if let Some(f) = from_ns {
-                            if ts < f {
-                                return false;
-                            }
-                        }
-                        if let Some(t) = to_ns {
-                            if ts > t {
-                                return false;
-                            }
-                        }
-                        true
-                    });
-                    if !has_event_in_window {
                         continue;
                     }
                 }
@@ -4688,6 +4719,8 @@ fn sessions_filter_blocking(
         } else {
             (sorted_ids.clone(), None)
         };
+    let filter_ms = filter_start.elapsed().as_millis();
+    let page_start = std::time::Instant::now();
 
     let start_index = match request.cursor.as_deref() {
         None => 0,
@@ -4731,6 +4764,19 @@ fn sessions_filter_blocking(
         if let Some(pseudo) = search_pseudonym.as_deref() {
             response["meta"]["search_matched_pseudonym"] =
                 serde_json::Value::String(pseudo.to_owned());
+        }
+        if audit_phases {
+            eprintln!(
+                "SESSIONS_FILTER_PHASE_MS heavy_memory_try_enter={} refresh_session_filter_index={} cached_journey_index={} filter={} page_construction={} total={} filter_index_rebuilt={} journey_cache_hit={}",
+                heavy_memory_try_enter_ms,
+                refresh_session_filter_index_ms,
+                cached_journey_index_ms,
+                filter_ms,
+                page_start.elapsed().as_millis(),
+                phase_start.elapsed().as_millis(),
+                filter_index_rebuilt,
+                journey_cache_hit,
+            );
         }
         return (StatusCode::OK, Json(response)).into_response();
     }
@@ -4886,6 +4932,19 @@ fn sessions_filter_blocking(
             session_catalog::FilterCombinator::And => Value::String("and".to_owned()),
             session_catalog::FilterCombinator::Or => Value::String("or".to_owned()),
         };
+    }
+    if audit_phases {
+        eprintln!(
+            "SESSIONS_FILTER_PHASE_MS heavy_memory_try_enter={} refresh_session_filter_index={} cached_journey_index={} filter={} page_construction={} total={} filter_index_rebuilt={} journey_cache_hit={}",
+            heavy_memory_try_enter_ms,
+            refresh_session_filter_index_ms,
+            cached_journey_index_ms,
+            filter_ms,
+            page_start.elapsed().as_millis(),
+            phase_start.elapsed().as_millis(),
+            filter_index_rebuilt,
+            journey_cache_hit,
+        );
     }
     (StatusCode::OK, Json(response)).into_response()
 }
@@ -12587,6 +12646,81 @@ mod tests {
             .collect();
         assert!(ids.contains(&lte_session_id.as_str()), "new LTE session missing after cache");
         assert!(after["meta"]["total"].as_u64().unwrap() > before_total);
+    }
+
+    /// 2.21.50 — équivalence de résultat avec la sémantique historique
+    /// `time_window` (au moins un event dans [from,to]), tout en prouvant
+    /// que les summaries coûteux ne sont plus construits pour les sessions
+    /// rejetées par ce prédicat. Mutation : remettre `resolve_summary` avant
+    /// le test de fenêtre rend la seconde assertion rouge (> 0).
+    #[tokio::test]
+    async fn sessions_filter_time_window_prunes_before_summary_with_equivalent_result() {
+        use std::sync::atomic::Ordering;
+
+        let state = state();
+        let expected: BTreeSet<String> = queryable_flows(&state)
+            .into_values()
+            .filter(|flow| {
+                flow.events
+                    .iter()
+                    .any(|event| event.timestamp_ns.parse::<i128>().is_ok_and(|ts| ts >= 0))
+            })
+            .map(|flow| flow.session_id)
+            .collect();
+        state
+            .inner
+            .filter_summary_resolutions
+            .store(0, Ordering::SeqCst);
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "limit": 100,
+                "time_window": {
+                    "from": "0",
+                    "to": i128::MAX.to_string(),
+                }
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let actual: BTreeSet<String> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["session_id"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "time-window result changed from fixture reference"
+        );
+
+        state
+            .inner
+            .filter_summary_resolutions
+            .store(0, Ordering::SeqCst);
+        let (status, outside) = post_sessions_filter(
+            &state,
+            json!({
+                "limit": 100,
+                "time_window": {
+                    "from": i128::MAX.to_string(),
+                    "to": i128::MAX.to_string(),
+                }
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(outside["data"].as_array().unwrap().is_empty());
+        assert_eq!(
+            state
+                .inner
+                .filter_summary_resolutions
+                .load(Ordering::SeqCst),
+            0,
+            "out-of-window sessions must be rejected before summary construction"
+        );
     }
 
     /// 2.18.5 — ANR2 #10 6901691533 : p900 lit /sessions/filter, qui
