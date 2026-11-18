@@ -94,6 +94,108 @@ impl EventRecord {
     }
 }
 
+/// Breakdown used by the publication RSS harness. Every value is a retained
+/// byte lower bound derived from `size_of` for inline/vector storage plus the
+/// owned capacities reachable from the named field. Allocator metadata is not
+/// guessed. `source_json_sbi` is an informational subset of `source_json`.
+pub fn publication_projection_field_bytes(events: &[EventRecord]) -> BTreeMap<&'static str, usize> {
+    fn add(map: &mut BTreeMap<&'static str, usize>, key: &'static str, value: usize) {
+        let current = map.entry(key).or_default();
+        *current = current.saturating_add(value);
+    }
+    fn value_bytes(value: &Value) -> usize {
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+            Value::String(value) => value.capacity(),
+            Value::Array(values) => {
+                values.capacity() * std::mem::size_of::<Value>()
+                    + values.iter().map(value_bytes).sum::<usize>()
+            }
+            Value::Object(values) => {
+                values.len() * std::mem::size_of::<(String, Value)>()
+                    + values
+                        .iter()
+                        .map(|(key, value)| key.capacity() + value_bytes(value))
+                        .sum::<usize>()
+            }
+        }
+    }
+    let mut bytes = BTreeMap::new();
+    add(
+        &mut bytes,
+        "event_record_inline",
+        events.len() * std::mem::size_of::<EventRecord>(),
+    );
+    for event in events {
+        for (key, value) in [
+            ("event_id", &event.event_id),
+            ("capture_id", &event.capture_id),
+            ("capture_point_id", &event.capture_point_id),
+            ("timestamp", &event.timestamp),
+            ("interface", &event.interface),
+            ("protocol", &event.protocol),
+            ("message_name", &event.message_name),
+            ("source_address", &event.source_address),
+            ("destination_address", &event.destination_address),
+            ("source_participant", &event.source_participant),
+            ("destination_participant", &event.destination_participant),
+            ("direction", &event.direction),
+            ("decoding_status", &event.decoding_status),
+            ("decoder_name", &event.decoder_name),
+            ("decoder_version", &event.decoder_version),
+            ("raw_payload_reference", &event.raw_payload_reference),
+        ] {
+            add(&mut bytes, key, value.capacity());
+        }
+        if let Some(value) = &event.parent_event_id {
+            add(&mut bytes, "parent_event_id", value.capacity());
+        }
+        add(
+            &mut bytes,
+            "identifiers_vec",
+            event.identifiers.capacity() * std::mem::size_of::<(String, String)>(),
+        );
+        for (name, value) in &event.identifiers {
+            add(&mut bytes, "identifier_names", name.capacity());
+            add(&mut bytes, "identifier_values", value.capacity());
+        }
+        add(
+            &mut bytes,
+            "information_elements",
+            value_bytes(&event.information_elements),
+        );
+        add(
+            &mut bytes,
+            "packet_references_vec",
+            event.packet_references.capacity() * std::mem::size_of::<PacketRef>(),
+        );
+        for packet in &event.packet_references {
+            add(&mut bytes, "packet_reference_paths", packet.source_file.capacity());
+        }
+        add(
+            &mut bytes,
+            "errors",
+            event.errors.capacity() * std::mem::size_of::<String>()
+                + event.errors.iter().map(String::capacity).sum::<usize>(),
+        );
+        add(&mut bytes, "source_json", value_bytes(&event.source_json));
+        if let Some(sbi) = event.source_json.get("sbi") {
+            add(&mut bytes, "source_json_sbi", value_bytes(sbi));
+        }
+        for (key, value) in [
+            ("probe_id", event.probe_id.as_ref()),
+            ("probe_type", event.probe_type.as_ref()),
+            ("physical_link", event.physical_link.as_ref()),
+            ("timestamp_source", event.timestamp_source.as_ref()),
+        ] {
+            if let Some(value) = value {
+                add(&mut bytes, key, value.capacity());
+            }
+        }
+    }
+    bytes
+}
+
 fn lte_subscriber_pseudonym(event: &EventRecord) -> Option<&str> {
     event
         .first_identifier("subscriber_pseudonym")
@@ -1250,6 +1352,14 @@ fn compact_publication_event(event: &mut EventRecord) {
     event.decoder_version.clear();
     event.raw_payload_reference.clear();
     event.errors.clear();
+    // Schema compatibility is checked while the full JSONL is decoded. None
+    // of the publication discovery/correlation passes reads it afterwards,
+    // whereas retaining one copy per representative keeps a JSON object node,
+    // key and value alive for the whole publication. Procedure and SBI stay:
+    // both are consumed by downstream discovery/correlation.
+    if let Some(source) = event.source_json.as_object_mut() {
+        source.remove("schema_version");
+    }
 }
 
 fn publication_semantic_key(event: &EventRecord) -> String {
@@ -3056,6 +3166,22 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_projection_drops_only_unread_schema_metadata() {
+        let mut record = event("schema-audit", "NAS-5GS", "RegistrationRequest", &[], 1);
+        record.source_json = serde_json::json!({
+            "schema_version": "1.5.0",
+            "procedure": "REGISTRATION",
+            "sbi": {"operation": "CreateSMContext"}
+        });
+
+        compact_publication_event(&mut record);
+
+        assert!(record.source_json.get("schema_version").is_none());
+        assert_eq!(record.source_json["procedure"], "REGISTRATION");
+        assert_eq!(record.source_json["sbi"]["operation"], "CreateSMContext");
+    }
 
     #[test]
     fn streaming_index_preserves_distinct_setup_occurrences() {

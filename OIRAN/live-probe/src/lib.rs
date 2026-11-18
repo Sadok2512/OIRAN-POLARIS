@@ -6556,6 +6556,14 @@ impl CaptureManager {
             "01-after-streaming-representatives",
             Some(events.len()),
         );
+        if std::env::var("OIRAN_PUBLICATION_FIELD_AUDIT").as_deref() == Ok("1") {
+            eprintln!(
+                "PUBLICATION_FIELD_AUDIT phase=01 method=size_of_plus_owned_capacity events={} fields={}",
+                events.len(),
+                serde_json::to_string(&session_engine::publication_projection_field_bytes(&events))
+                    .unwrap_or_else(|_| "{}".into()),
+            );
+        }
         let capture_job = self.get(capture_id);
         // 2.7.28: when restore runs in a manager that never saw the
         // continuous worker start, `capture_job` is None. Fall back to
@@ -11425,10 +11433,70 @@ mod tests {
             })
         }
 
+        fn semantic_outputs(mut events: Vec<EventRecord>, source_event_count: usize) -> Value {
+            let discovery = discover_sessions(&mut events);
+            let mut edges = correlate_discovered_tunnels(&events, &discovery);
+            edges.extend(correlate_cross_interface_evidence(&events));
+            let edges = fold_overlapping_edges(edges);
+            let reconstruction = reconstruct(events.clone(), ReconstructionHints::default());
+            let callflow = build_callflow(&reconstruction, edges.clone());
+            let lte_callflows = offline_lte_callflows(&events).expect("LTE callflows");
+            let mut session_ids = discovery
+                .pdu_sessions
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<Vec<_>>();
+            session_ids.extend(lte_callflows.iter().map(|flow| flow.session_id.clone()));
+            session_ids.sort();
+            serde_json::json!({
+                "discovery": discovery,
+                "edges": edges,
+                "callflow": callflow,
+                "lte_callflows": lte_callflows,
+                "manifest": {
+                    "event_count": source_event_count,
+                    "session_ids": session_ids,
+                    "state": "COMPLETED"
+                }
+            })
+        }
+
+        let compact_fixture = legacy.events.clone();
+
         assert_eq!(
             outputs(legacy.events, legacy.source_event_count),
             outputs(spilled.events, spilled.source_event_count),
             "representatives, discovery, edges, callflows and manifest differ",
+        );
+
+        let mut schema_fixture = compact_fixture.clone();
+        for event in &mut schema_fixture {
+            event.source_json["schema_version"] = Value::String("1.5.0".into());
+        }
+        assert_eq!(
+            semantic_outputs(schema_fixture, legacy.source_event_count),
+            semantic_outputs(compact_fixture.clone(), legacy.source_event_count),
+            "fixture sessions, edges, callflows or manifest changed after dropping schema metadata",
+        );
+
+        let compact_synthetic = compact_fixture
+            .into_iter()
+            .take(64)
+            .enumerate()
+            .map(|(index, mut event)| {
+                event.capture_id = "synthetic-compact-projection".into();
+                event.event_id = format!("synthetic-event-{index}");
+                event
+            })
+            .collect::<Vec<_>>();
+        let mut schema_synthetic = compact_synthetic.clone();
+        for event in &mut schema_synthetic {
+            event.source_json["schema_version"] = Value::String("1.5.0".into());
+        }
+        assert_eq!(
+            semantic_outputs(schema_synthetic, 64),
+            semantic_outputs(compact_synthetic, 64),
+            "synthetic sessions, edges, callflows or manifest changed after dropping schema metadata",
         );
     }
 

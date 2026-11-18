@@ -1,5 +1,12 @@
 # Changelog
 
+## OIRAN API 2.21.41 + session-engine 0.5.17 + live-probe 0.6.17 — 2026-11-18 — projection de publication compacte
+
+- Ajoute une mesure reproductible par champ (`OIRAN_PUBLICATION_FIELD_AUDIT=1`) fondée sur `size_of` et les capacités possédées, sans estimation des métadonnées de l'allocateur.
+- Après validation du schéma lors du décodage du JSONL complet, retire `schema_version` de la projection compacte retenue pendant les phases de découverte/corrélation. `procedure`, `sbi`, les identifiants et les références paquet restent intacts.
+- Sur `rss_publication 500000`, la phase 01 passe de 402788 à 286888 kB et les phases 07/09 de 520088 à 404140 kB ; mêmes 500002 événements et 1000 sessions.
+- Les tests comparent sessions, arêtes, callflows et manifeste avec/sans la métadonnée sur fixture et projection synthétique. La preuve de mutation échoue si la suppression est neutralisée.
+
 ## OIRAN API 2.21.40 + session-engine 0.5.16 — 2026-11-18 — une clé SBI n'est exacte que si elle désigne UNE session (FAIL lab 2.21.38)
 
 Upgrade **patch**, sur 2.21.39 (DEVMAT, relue : decoder-sbi 40, oiran-api 191, session-engine 48).
