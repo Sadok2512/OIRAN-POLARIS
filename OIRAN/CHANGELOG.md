@@ -1,5 +1,14 @@
 # Changelog
 
+## OIRAN API 2.21.55 + session-engine 0.5.22 — 2026-11-18 — pseudonyme SBI relu dans l'URI sanitisée
+
+Upgrade **patch**, basé sur 2.21.51 (`a33bb6a`, production). 2.21.52 (ANR1, filtre) et 2.21.53/54 (DEVMAT, HPACK) sont des lots séparés.
+
+Cause prouvée par ANR2 (#10 6988143045, B1, 10/10 exemples) : des SBI stockés `UnsupportedSbiOperation` (PUT `nudm-uecm`/`nudr-dr` `.../smf-registrations/<PDU>`) n'exportent que `pdu_session_id`. Le pseudonyme est pourtant dans l'URI déjà sanitisée (`subscriber-psn-<32 hex>`, même domaine que l'identifiant). Résultat : 1108 SBI « PDU sans session ».
+- `attach_sbi_to_sessions` relit le pseudonyme dans `sbi.request_uri` quand l'identifiant manque. Lecture stricte, fail-closed : `psn-` + 32 hex minuscules, un seul pseudonyme distinct par URI. Appliqué à la publication, donc couvre le stock existant ; aucune identité en clair n'est lue.
+- Règles de rattachement inchangées : clé exacte unique, puis fenêtre en dernier recours.
+- Test : un SBI historique sans identifiant rattache par clé exacte ; une URI non conforme n'est pas rattachée. Mutation : retirer la relecture rend le test rouge.
+
 ## OIRAN API 2.21.51 + session-engine 0.5.21 — 2026-11-18 — clés exactes SBI réellement disponibles
 
 Upgrade **patch**, basé sur 2.21.49 (`0d2e8b2`, production). 2.21.50 (`/sessions/filter`, ANR1) en échec de gate prod, non fusionnée ici.

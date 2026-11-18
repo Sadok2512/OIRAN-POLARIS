@@ -2254,6 +2254,39 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
 /// `ue_context_id` de la session. Les deux index étant construits
 /// sur des IE strictement présentes (pseudonyme OU tuple tunnel),
 /// l'attache est **exacte** — un timing n'intervient à aucun moment.
+/// 2.21.55 (ANR2 #10 6988143045, B1) — les SBI stockés avant le
+/// catalogue courant (`UnsupportedSbiOperation`, ex. PUT
+/// `nudm-uecm/.../smf-registrations/<PDU>`) n'exportent pas
+/// `subscriber_pseudonym`, alors que l'URI sanitisée par le décodeur le
+/// porte déjà : `subscriber-psn-<32 hex>` (`decoder-sbi::sanitize_uri`,
+/// même domaine que l'identifiant). Lecture stricte, fail-closed : un
+/// seul segment `subscriber-psn-` de 32 hex minuscules, sinon `None`.
+/// Aucune identité en clair n'est lue (l'URI stockée est déjà
+/// pseudonymisée). Appliqué à la publication : couvre le stock existant.
+fn sbi_uri_subscriber_pseudonym(event: &EventRecord) -> Option<String> {
+    let uri = event
+        .source_json
+        .get("sbi")
+        .and_then(|sbi| sbi.get("request_uri"))
+        .and_then(Value::as_str)?;
+    let path = uri.split('?').next().unwrap_or(uri);
+    let mut found: Option<&str> = None;
+    for segment in path.split('/') {
+        let Some(pseudo) = segment.strip_prefix("subscriber-") else {
+            continue;
+        };
+        let hex = pseudo.strip_prefix("psn-")?;
+        if hex.len() != 32 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return None;
+        }
+        if found.is_some_and(|previous| previous != pseudo) {
+            return None;
+        }
+        found = Some(pseudo);
+    }
+    found.map(str::to_owned)
+}
+
 /// 2.21.49 — résultat comptable du rattachement SBI (exposé dans
 /// `DiscoveryResult.event_accounting`).
 #[derive(Default)]
@@ -2482,7 +2515,8 @@ fn attach_sbi_to_sessions(
         let pdu_id = event.first_identifier("pdu_session_id").map(str::to_owned);
         let pseudo = event
             .first_identifier("subscriber_pseudonym")
-            .map(str::to_owned);
+            .map(str::to_owned)
+            .or_else(|| sbi_uri_subscriber_pseudonym(event));
         // Règle des sondes pro : 1) clé exacte UNIQUE ; 2) sinon, en dernier
         // recours, la fenêtre de vie de la session (même horloge de l'hôte
         // de capture), parmi les seules sessions candidates par clé ; une
@@ -5665,6 +5699,64 @@ mod tests {
             "tunnel unique après compaction du SBI ; got {:?}",
             a.event_ids
         );
+        assert_eq!(discovery.event_accounting["sbi_attached_exact_key"], 1);
+    }
+
+    /// 2.21.55 — SBI historique sans identifiant pseudonyme : le
+    /// pseudonyme est relu dans l'URI sanitisée et la clé exacte
+    /// `(pseudonyme, PDU)` rattache.
+    #[test]
+    fn sbi_pseudonym_is_read_from_sanitized_uri_when_identifier_missing() {
+        let psn = "psn-0123456789abcdef0123456789abcdef";
+        let nas = timed(
+            event("evt-nas-reg", "NGAP", "InitialUEMessage",
+                &[("subscriber_pseudonym", psn), ("ran_ue_ngap_id", "7")], 1),
+            100,
+        );
+        let ids = |extra: &[(&'static str, &'static str)]| {
+            let mut v = vec![("ran_ue_ngap_id", "7"), ("amf_ue_ngap_id", "70")];
+            v.extend_from_slice(extra);
+            v
+        };
+        let ics = timed(event("evt-ics", "NGAP", "InitialContextSetupRequest", &ids(&[]), 2), 101);
+        let setup = timed(
+            event("evt-pdu-setup", "NGAP", "PDUSessionResourceSetupRequest",
+                &ids(&[("pdu_session_id", "1")]), 3),
+            102,
+        );
+        let resp = timed(
+            event("evt-pdu-resp", "NGAP", "PDUSessionResourceSetupResponse",
+                &ids(&[("pdu_session_id", "1")]), 4),
+            103,
+        );
+        let mut sbi = timed(
+            event("evt-sbi-uecm", "SBI-HTTP2", "UnsupportedSbiOperation",
+                &[("pdu_session_id", "1")], 5),
+            9_000,
+        );
+        sbi.capture_id = "capture-vtap".into();
+        sbi.source_json = serde_json::json!({"sbi": {
+            "request_uri": format!("/nudm-uecm/v1/subscriber-{psn}/registrations/smf-registrations/1"),
+            "http_method": "PUT"
+        }});
+        let mut bad = sbi.clone();
+        bad.event_id = "evt-sbi-bad".into();
+        bad.source_json = serde_json::json!({"sbi": {
+            "request_uri": "/nudm-uecm/v1/subscriber-psn-XYZ/registrations/smf-registrations/1"
+        }});
+        let events = vec![nas, ics, setup, resp, sbi, bad];
+        let discovery = discover_sessions(&mut events.clone());
+        let session = discovery
+            .pdu_sessions
+            .iter()
+            .find(|s| s.event_ids.iter().any(|id| id == "evt-pdu-setup"))
+            .expect("session PDU 1");
+        assert!(
+            session.event_ids.iter().any(|id| id == "evt-sbi-uecm"),
+            "pseudonyme lu dans l'URI → clé exacte ; got {:?}",
+            session.event_ids
+        );
+        assert!(!session.event_ids.iter().any(|id| id == "evt-sbi-bad"), "URI non conforme : fail-closed");
         assert_eq!(discovery.event_accounting["sbi_attached_exact_key"], 1);
     }
 
