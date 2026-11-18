@@ -1,5 +1,15 @@
 # Changelog
 
+## OIRAN API 2.21.51 + session-engine 0.5.21 — 2026-11-18 — clés exactes SBI réellement disponibles
+
+Upgrade **patch**, basé sur 2.21.49 (`0d2e8b2`, production). 2.21.50 (`/sessions/filter`, ANR1) en échec de gate prod, non fusionnée ici.
+
+Cause prouvée par ANR2 (#10 6983842360) : `sbi_attached_exact_key=0`, `pseudo_pdu_keys=0`, 0 candidat exact sur 531 584 SBI compactés.
+- `compact_publication_event` jetait `gtp_teid`, alors que le lookup SBI par tunnel lit précisément `gtp_teid` : `gtp_teid` ajouté aux identifiants stables. Les shards canoniques sont intacts : la republication couvre les données déjà stockées.
+- `(pseudonyme, PDU)` n'était indexé que depuis les events de la session portant le SUPI ; or les N2/N4/N3 d'une PDU session ne le portent pas (il vit sur le NAS du même contexte UE). La clé est maintenant aussi indexée depuis les pseudonymes du contexte UE exact (`event_context`), jamais par proximité temporelle.
+- La fenêtre de temps reste le dernier recours ; ses règles 2.21.49 sont inchangées.
+- Tests : clé `(pseudonyme NAS, PDU)` rattache par clé exacte hors fenêtre ; tunnel exact après compaction du SBI. Mutations : retirer `gtp_teid` de la compaction ou l'index contexte → chaque test concerné rouge.
+
 ## OIRAN API 2.21.49 + session-engine 0.5.20 — 2026-11-18 — rattachement SBI par fenêtre de temps (règle des sondes pro)
 
 Upgrade **patch**, basé sur 2.21.47 (`9100bb1`). 2.21.48 réservée au lot HPACK de DEVMAT. Décision Sadok du 18/11 : « on fait exactement comme les prope pro ».

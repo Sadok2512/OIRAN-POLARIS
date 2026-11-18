@@ -1290,6 +1290,10 @@ fn compact_publication_event(event: &mut EventRecord) {
         "far_id",
         "qer_id",
         "teid",
+        // 2.21.51 (ANR2 #10 6983842360) — le lookup SBI par tunnel lit
+        // `gtp_teid` (n2SmInfo décodé) : la compaction le jetait, donc
+        // 0 rattachement par clé exacte sur les représentants publiés.
+        "gtp_teid",
         "tunnel_endpoint_ip",
         "tunnel_direction",
         "transport_layer_address",
@@ -2326,6 +2330,15 @@ fn attach_sbi_to_sessions(
                 if !entry.contains(&idx) {
                     entry.push(idx);
                 }
+                // 2.21.51 (ANR2 #10 6983842360 : `pseudo_pdu_keys=0`) —
+                // les events N2/N4/N3 d'une PDU session ne portent pas le
+                // SUPI ; le pseudonyme vit sur le NAS du MÊME contexte UE
+                // (lien `event_context` exact). Sans cette entrée, la clé
+                // `(pseudonyme, PDU)` n'existait jamais.
+                pseudo_pdu
+                    .entry(((*pseudo).to_owned(), session.pdu_session_id.clone()))
+                    .or_default()
+                    .insert(idx);
             }
         }
     }
@@ -5571,6 +5584,88 @@ mod tests {
         assert_eq!(b.sbi_time_window_event_ids.len(), 3, "rattachement marqué fenêtre");
         assert_eq!(discovery.event_accounting["sbi_attached_time_window"], 3);
         assert_eq!(discovery.event_accounting["sbi_unattached_ambiguous"], 1);
+    }
+
+    /// 2.21.51 — `(pseudonyme, PDU)` doit être une clé exacte même quand
+    /// le pseudonyme n'est porté que par le NAS du contexte UE (cas réel :
+    /// les N2 PDUSessionResource* ne portent pas le SUPI).
+    #[test]
+    fn sbi_pseudo_pdu_key_comes_from_the_ue_context_nas() {
+        let ids = |extra: &[(&'static str, &'static str)]| {
+            let mut v = vec![("ran_ue_ngap_id", "7"), ("amf_ue_ngap_id", "70")];
+            v.extend_from_slice(extra);
+            v
+        };
+        let nas = timed(
+            event("evt-nas-reg", "NGAP", "InitialUEMessage",
+                &[("subscriber_pseudonym", "psn-ctx"), ("ran_ue_ngap_id", "7")], 1),
+            100,
+        );
+        let ics = timed(event("evt-ics", "NGAP", "InitialContextSetupRequest", &ids(&[]), 2), 101);
+        let setup = timed(
+            event("evt-pdu-setup", "NGAP", "PDUSessionResourceSetupRequest",
+                &ids(&[("pdu_session_id", "5")]), 3),
+            102,
+        );
+        let resp = timed(
+            event("evt-pdu-resp", "NGAP", "PDUSessionResourceSetupResponse",
+                &ids(&[("pdu_session_id", "5")]), 4),
+            103,
+        );
+        // Hors de toute fenêtre : seule la clé exacte peut le rattacher.
+        let mut sbi = timed(
+            event("evt-sbi-ctx", "SBI-HTTP2", "UpdateSMContext",
+                &[("subscriber_pseudonym", "psn-ctx"), ("pdu_session_id", "5")], 5),
+            9_000,
+        );
+        sbi.capture_id = "capture-vtap".into();
+        let events = vec![nas, ics, setup, resp, sbi];
+        let discovery = discover_sessions(&mut events.clone());
+        let session = discovery
+            .pdu_sessions
+            .iter()
+            .find(|s| s.event_ids.iter().any(|id| id == "evt-pdu-setup"))
+            .expect("session PDU 5");
+        assert!(
+            session.event_ids.iter().any(|id| id == "evt-sbi-ctx"),
+            "SBI (pseudonyme du NAS, PDU 5) rattaché par clé exacte ; got {:?}",
+            session.event_ids
+        );
+        assert!(session.sbi_time_window_event_ids.is_empty());
+        assert_eq!(discovery.event_accounting["sbi_attached_exact_key"], 1);
+    }
+
+    /// 2.21.51 — la compaction de publication doit garder `gtp_teid`, lu
+    /// par le lookup SBI par tunnel.
+    #[test]
+    fn sbi_tunnel_key_survives_publication_compaction() {
+        let mut events = two_runs_same_ids();
+        events[0].identifiers.retain(|(name, _)| name != "item_0_gtp_teid_ul");
+        events[0].identifiers.push(("item_0_gtp_teid_ul".into(), "0x0a01".into()));
+        // La clé tunnel du N2 vit aussi dans un IE (cas réel 2.9.17) : la
+        // compaction garde les IE NGAP porteurs de tunnel.
+        let mut sbi = timed(
+            event("evt-sbi-tunnel", "SBI-HTTP2", "N1N2MessageTransfer",
+                &[("tunnel_endpoint_ip", "10.77.22.13"), ("gtp_teid", "0x0a01")], 30),
+            9_000,
+        );
+        sbi.capture_id = "capture-vtap".into();
+        events.push(sbi);
+        for event in events.iter_mut().filter(|e| protocol_is(e, "SBI-HTTP2")) {
+            compact_publication_event(event);
+        }
+        let discovery = discover_sessions(&mut events.clone());
+        let a = discovery
+            .pdu_sessions
+            .iter()
+            .find(|s| s.event_ids.iter().any(|id| id == "evt-n2-setup-a"))
+            .unwrap();
+        assert!(
+            a.event_ids.iter().any(|id| id == "evt-sbi-tunnel"),
+            "tunnel unique après compaction du SBI ; got {:?}",
+            a.event_ids
+        );
+        assert_eq!(discovery.event_accounting["sbi_attached_exact_key"], 1);
     }
 
     #[test]
