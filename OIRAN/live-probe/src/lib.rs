@@ -1711,7 +1711,10 @@ pub struct CaptureManager {
     /// production (mesure sysfs réelle) ; `Some(Ok(…))` dans les tests
     /// pour que le disque local du runner (saturé à 98 %+ sur certaines
     /// machines dev) n'influence pas la décision `capture_budget`.
-    disk_sample_override_for_tests: Option<Result<disk_safety::FilesystemSample, String>>,
+    /// 0.6.18 — partagé entre clones (`Arc<Mutex<…>>`) pour qu'un test
+    /// puisse faire varier le disque PENDANT que le worker continu tourne.
+    disk_sample_override_for_tests:
+        Arc<Mutex<Option<Result<disk_safety::FilesystemSample, String>>>>,
 }
 
 /// 0.6.10 (ordre #9 6952054201) — clé d'identité d'un segment
@@ -1995,7 +1998,7 @@ impl CaptureManager {
             // branche `#[cfg(test)]` n'affecte PAS les consommateurs
             // (oiran-api, etc.) : cfg(test) ne traverse pas les
             // crates.
-            disk_sample_override_for_tests: {
+            disk_sample_override_for_tests: Arc::new(Mutex::new({
                 #[cfg(test)]
                 {
                     Some(Ok(disk_safety::FilesystemSample {
@@ -2009,7 +2012,7 @@ impl CaptureManager {
                 {
                     None
                 }
-            },
+            })),
         };
         manager.recover_registry()?;
         manager.load_recovery_registry()?;
@@ -2145,7 +2148,10 @@ impl CaptureManager {
         &mut self,
         sample: Option<Result<disk_safety::FilesystemSample, String>>,
     ) {
-        self.disk_sample_override_for_tests = sample;
+        *self
+            .disk_sample_override_for_tests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sample;
     }
 
     /// 2.14.6 (ANR1 #10) — swap test-only de la Policy consommée par
@@ -2165,6 +2171,8 @@ impl CaptureManager {
     /// DISK_SAFETY dès que le runner dépasse ~97 %.
     fn effective_disk_sample(&self) -> Result<disk_safety::FilesystemSample, String> {
         self.disk_sample_override_for_tests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
             .unwrap_or_else(|| measure_path(&self.root))
     }
@@ -4200,7 +4208,16 @@ impl CaptureManager {
                 // commit after publish), so the next scan will re-discover
                 // it once eviction frees space. Only DISK_SAFETY_POLICY and
                 // other non-recoverable terminals exit the worker.
-                let recoverable = error == "CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT";
+                // 0.6.18 (ANR2 #10 6975302726 : capture BLOQUÉE depuis 07:37
+                // alors que le stockage est revenu NORMAL à 79 %) — l'arrêt
+                // disque est lui aussi récupérable : le worker reste vivant,
+                // le segment n'est pas consommé, et la reprise est
+                // automatique au premier scan où la politique l'autorise
+                // (exigence Sadok 13/11 : revenir seul, sans geste).
+                let recoverable = matches!(
+                    error,
+                    "CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT" | "CONTINUOUS_IMPORT_DISK_POLICY_STOP"
+                );
                 self.update(CONTINUOUS_CAPTURE_ID, |job| {
                     job.state = CaptureState::Blocked;
                     job.error = Some(error.into());
@@ -4212,6 +4229,39 @@ impl CaptureManager {
                 if !recoverable {
                     return Ok(());
                 }
+            } else {
+                // 0.6.18 — scan sans arrêt : un blocage récupérable levé
+                // repasse en CAPTURING, de façon visible.
+                self.update(CONTINUOUS_CAPTURE_ID, |job| {
+                    // Le chemin de publication peut avoir déjà vidé `error` :
+                    // on reconnaît le blocage récupérable aussi par sa raison.
+                    let recoverable_block = matches!(
+                        job.error.as_deref(),
+                        Some("CONTINUOUS_IMPORT_DISK_POLICY_STOP")
+                            | Some("CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT")
+                    ) || (job.error.is_none()
+                        && matches!(
+                            job.stop_reason.as_deref(),
+                            Some("DISK_SAFETY_POLICY") | Some("BOUNDED_STORAGE_FULL")
+                        )
+                        && job.ended_epoch_ms.is_none());
+                    if job.state == CaptureState::Blocked && recoverable_block {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "event": "CONTINUOUS_IMPORT_RESUMED",
+                                "reason": format!(
+                                    "{} cleared",
+                                    job.error.clone().or_else(|| job.stop_reason.clone()).unwrap_or_default()
+                                ),
+                            })
+                        );
+                        job.state = CaptureState::Capturing;
+                        job.error = None;
+                        job.stop_reason = None;
+                        job.ended_epoch_ms = None;
+                    }
+                })?;
             }
             // 2.8.2 (#10 comment 6687323881): persist the source
             // cache ONLY when `source_segments` signalled a cache
@@ -12671,6 +12721,75 @@ mod tests {
             "expected CAPTURE_STORAGE_BUDGET_REJECTED in blockers, got {:?}",
             outcome.blockers
         );
+    }
+
+    /// 0.6.18 (ANR2 #10 6975302726) — un arrêt pour politique disque doit
+    /// se lever TOUT SEUL : disque saturé → BLOCKED (worker vivant), disque
+    /// revenu normal → CAPTURING et le segment en attente est publié.
+    #[test]
+    fn continuous_import_resumes_by_itself_after_disk_policy_stop() {
+        if skip_if_disk_too_full("continuous_import_resumes_by_itself_after_disk_policy_stop") {
+            return;
+        }
+        let source = temporary_root("disk-resume-source");
+        let root = temporary_root("disk-resume-root");
+        fs::create_dir_all(source.join("N2")).unwrap();
+        let mut manager = CaptureManager::with_pseudonym_key_path(
+            root.clone(),
+            false,
+            root.join(".oiran-pseudonym.key"),
+        )
+        .unwrap();
+        let free = disk_safety::FilesystemSample {
+            total_bytes: 500 * 1024 * 1024 * 1024,
+            available_bytes: 450 * 1024 * 1024 * 1024,
+            total_inodes: 10_000_000,
+            available_inodes: 9_000_000,
+        };
+        let saturated = disk_safety::FilesystemSample {
+            available_bytes: 5 * 1024 * 1024 * 1024,
+            ..free.clone()
+        };
+        manager
+            .start_continuous_import(ContinuousImportConfig {
+                source_root: source.clone(),
+                scan_interval: Duration::from_millis(200),
+                stable_age: Duration::from_millis(200),
+                max_owned_bytes: 128 * 1024 * 1024,
+                max_segment_bytes: 64 * 1024 * 1024,
+                max_segments: 1,
+                native_segment_seconds: None,
+                historical_n2_bootstrap: None,
+                runtime_pdu_evidence: None,
+                vtap_out_dirs: Vec::new(),
+            })
+            .unwrap();
+        manager.set_disk_sample_override_for_tests(Some(Ok(saturated)));
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("datasets/OIRAN_5G_PDU_SESSION_DATA_V1/N2.pcapng");
+        fs::copy(&fixture, source.join("N2/final-1.pcapng")).unwrap();
+        write_rotation_closures(&source, "N2", 1);
+        wait_for(|| {
+            manager.get(CONTINUOUS_CAPTURE_ID).is_some_and(|job| {
+                job.state == CaptureState::Blocked
+                    && job.error.as_deref() == Some("CONTINUOUS_IMPORT_DISK_POLICY_STOP")
+                    && job.ended_epoch_ms.is_none()
+            })
+        });
+        manager.set_disk_sample_override_for_tests(Some(Ok(free)));
+        let checksum = sha256_hex_file(&fixture).unwrap();
+        let manifest = root.join(CONTINUOUS_CAPTURE_ID).join("dataset/dataset_manifest.json");
+        wait_for(|| {
+            manager.get(CONTINUOUS_CAPTURE_ID).is_some_and(|job| {
+                job.state == CaptureState::Capturing && job.error.is_none()
+            }) && fs::read(&manifest)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<LiveDataset>(&bytes).ok())
+                .is_some_and(|dataset| dataset.checksums.values().any(|c| c == &checksum))
+        });
+        manager.stop(CONTINUOUS_CAPTURE_ID, "operator").unwrap();
     }
 
     fn skip_if_disk_too_full(reason: &str) -> bool {

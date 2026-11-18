@@ -1,5 +1,17 @@
 # Changelog
 
+## OIRAN API 2.21.44 + live-probe 0.6.18 — 2026-11-18 — la capture continue reprend seule après un arrêt disque
+
+Upgrade **patch**, sur 2.21.42 (production). 2.21.43 est réservée au lot NGAP de DEVMAT.
+
+Cause prouvée au lab (ANR2 #10 6975302726) : `capture_state=BLOCKED` depuis 07:37:33 (`CONTINUOUS_IMPORT_DISK_POLICY_STOP`, `DISK_SAFETY_POLICY`) alors que le stockage est revenu `NORMAL` (79,04 %). Sur le chemin d'import des segments dumpcap, l'arrêt disque était **terminal** : le worker sortait (`return Ok(())`), seul un redémarrage pouvait relancer l'import. Contraire à l'exigence du 13/11 : revenir seul, sans geste.
+
+- `CONTINUOUS_IMPORT_DISK_POLICY_STOP` devient récupérable, comme `CONTINUOUS_IMPORT_BACKPRESSURE_LIMIT` : `BLOCKED` visible, `ended_epoch_ms` non posé, worker vivant, le segment refusé n'est pas consommé.
+- Au premier scan sans arrêt, un blocage récupérable repasse en `CAPTURING` avec le log `CONTINUOUS_IMPORT_RESUMED` (reconnu par `error` ou, s'il a déjà été vidé par la publication, par `stop_reason` et `ended_epoch_ms` absent).
+- L'override disque de test devient partagé entre clones (`Arc<Mutex<…>>`), pour pouvoir changer le disque pendant que le worker tourne.
+- Test `continuous_import_resumes_by_itself_after_disk_policy_stop` : disque à 99 % → BLOCKED et worker vivant ; disque libre → CAPTURING, et le segment en attente est publié. **Preuve de mutation** : avec l'ancien arrêt terminal, le test échoue (délai de 30 s dépassé).
+- Lab : le job déjà sorti en 2.21.42 ne repart qu'au redémarrage du service, qui relance l'import. Après 2.21.44, plus aucun redémarrage n'est nécessaire.
+
 ## OIRAN API 2.21.42 + session-engine 0.5.18 — 2026-11-18 — retrait du rattachement SBI par ancre de capture (2.21.38 + 2.21.40), en attente du diagnostic lab
 
 Upgrade **patch**, sur 2.21.41 (ANR1, compaction des projections).
