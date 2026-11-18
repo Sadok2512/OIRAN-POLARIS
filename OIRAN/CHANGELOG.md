@@ -1,5 +1,16 @@
 # Changelog
 
+## OIRAN API 2.21.40 + session-engine 0.5.16 — 2026-11-18 — une clé SBI n'est exacte que si elle désigne UNE session (FAIL lab 2.21.38)
+
+Upgrade **patch**, sur 2.21.39 (DEVMAT, relue : decoder-sbi 40, oiran-api 191, session-engine 48).
+
+Cause prouvée au lab (ANR2 #10 6965682013) : en 2.21.38, la session de l'essai 7 n'a plus **aucun** SBI. `(subscriber_pseudonym, pdu_session_id)` est identique d'un essai à l'autre du même UE (PDU 1 à chaque essai) ; `pseudo_pdu` et `tunnel_idx` gardaient la **première** session (`or_insert`) → le CreateSMContext vTAP ancrait sa capture sur l'essai le plus ancien, et tout le SBI vTAP y partait.
+
+- `pseudo_pdu` et `tunnel_idx` indexent l'ensemble des sessions par clé ; une clé n'est exacte (et n'ancre sa capture) que si elle désigne **une seule** session. Clé ambiguë → pas d'ancre par elle ; l'ancre vient d'une clé propre à l'essai (tunnel `(tunnel_endpoint_ip, gtp_teid)` ou `sm_context_reference`).
+- Test `ambiguous_subscriber_pdu_key_does_not_anchor_vtap_capture_on_older_run` : deux essais, même `(pseudonyme, PDU 1)`, tunnels distincts ; le CreateSMContext, l'UpdateSMContext tunnel et le SBI pseudonyme seul vont tous à l'essai 2. **Preuve de mutation** : en reprenant la première session, « evt-vtap-create doit aller à l'essai 2 » échoue.
+- OUVERT : si un essai ne porte AUCUNE clé propre (ni tunnel ni SM context) dans sa capture vTAP, son SBI reste non rattaché (`sbi_unattached_no_anchor`), sans être attribué à un autre essai.
+- Numérotation : le lot mémoire ANR1 passe en 2.21.41.
+
 ## OIRAN API 2.21.39 + decoder-sbi 0.4.9 — 2026-11-18 — catalogue SBI à 100 % sur la table vTAP ANR2 (2 URI NRF ajoutées)
 
 Sprint de nuit CLAUDE DEVMAT (#9, ordre 6965054336). Base `4f62bec` (2.21.38), nouvelle branche `fix/oiran-2.21.39-sbi-catalogue`, pas de force-push.

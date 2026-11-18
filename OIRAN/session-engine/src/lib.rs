@@ -2136,9 +2136,9 @@ fn attach_sbi_to_sessions(
         .collect();
 
     // Index (pseudo, pdu_session_id) → session_index.
-    let mut pseudo_pdu: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut pseudo_pdu: BTreeMap<(String, String), BTreeSet<usize>> = BTreeMap::new();
     // Index (tunnel_endpoint_ip_norm, gtp_teid_norm) → session_index.
-    let mut tunnel_idx: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut tunnel_idx: BTreeMap<(String, String), BTreeSet<usize>> = BTreeMap::new();
     // sm_context_reference → session index. Entries are learned from session
     // evidence and from SBI already attached by a stronger exact key.
     let mut sm_context_idx: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
@@ -2181,7 +2181,8 @@ fn attach_sbi_to_sessions(
                 }
                 pseudo_pdu
                     .entry(((*pseudo).to_owned(), session.pdu_session_id.clone()))
-                    .or_insert(idx);
+                    .or_default()
+                    .insert(idx);
             }
         }
     }
@@ -2198,7 +2199,8 @@ fn attach_sbi_to_sessions(
                 }
                 pseudo_pdu
                     .entry((pseudo.to_owned(), pdu_id.clone()))
-                    .or_insert(idx);
+                    .or_default()
+                    .insert(idx);
             }
             if let Some(reference) = event.first_identifier("sm_context_reference") {
                 sm_context_idx
@@ -2292,7 +2294,8 @@ fn attach_sbi_to_sessions(
                     if let Some(teid) = normalized_teid {
                         tunnel_idx
                             .entry((normalized_ip, teid))
-                            .or_insert(idx);
+                            .or_default()
+                            .insert(idx);
                     }
                 }
             }
@@ -2335,8 +2338,15 @@ fn attach_sbi_to_sessions(
             .map(str::to_owned);
         let mut target_idx = None;
         if let (Some(pseudo), Some(pdu_id)) = (&pseudo, &pdu_id) {
-            if let Some(&idx) = pseudo_pdu.get(&(pseudo.clone(), pdu_id.clone())) {
-                target_idx = Some(idx);
+            // 2.21.39 — une clé n'est EXACTE que si elle désigne une seule
+            // session. `(pseudonyme, pdu_session_id)` se répète d'un essai à
+            // l'autre du même UE (PDU 1 à chaque essai) : en 2.21.38 la
+            // première session (le plus ancien essai) gagnait, ce qui ancrait
+            // la capture vTAP de l'essai 7 sur une session d'un autre jour.
+            if let Some(indices) = pseudo_pdu.get(&(pseudo.clone(), pdu_id.clone())) {
+                if indices.len() == 1 {
+                    target_idx = indices.iter().next().copied();
+                }
             }
         }
         if target_idx.is_none() {
@@ -2347,8 +2357,10 @@ fn attach_sbi_to_sessions(
                 .first_identifier("gtp_teid")
                 .and_then(event_schema::normalize_teid_hex);
             if let (Some(ip), Some(teid)) = (ip, teid) {
-                if let Some(&idx) = tunnel_idx.get(&(ip, teid)) {
-                    target_idx = Some(idx);
+                if let Some(indices) = tunnel_idx.get(&(ip, teid)) {
+                    if indices.len() == 1 {
+                        target_idx = indices.iter().next().copied();
+                    }
                 }
             }
         }
@@ -2549,7 +2561,7 @@ fn sbi_identity_source(event: &EventRecord) -> String {
 fn index_tunnel_names(
     named: &std::collections::BTreeMap<&str, &str>,
     session_idx: usize,
-    tunnel_idx: &mut std::collections::BTreeMap<(String, String), usize>,
+    tunnel_idx: &mut std::collections::BTreeMap<(String, String), std::collections::BTreeSet<usize>>,
 ) {
     for (name, value) in named.iter() {
         let (prefix, ip_norm) = if let Some(prefix) = name.strip_suffix("tunnel_endpoint_ip") {
@@ -2574,7 +2586,8 @@ fn index_tunnel_names(
                 if let Some(teid_norm) = event_schema::normalize_teid_hex(teid_raw) {
                     tunnel_idx
                         .entry((ip_norm.clone(), teid_norm))
-                        .or_insert(session_idx);
+                        .or_default()
+                        .insert(session_idx);
                 }
             }
         }
@@ -5494,6 +5507,77 @@ mod tests {
             .filter(|id| id.starts_with("evt-vtap-"))
             .count();
         assert_eq!(attached_vtap, 34);
+        assert_eq!(discovery.event_accounting["sbi_unattached_no_anchor"], 0);
+    }
+
+    /// 2.21.39 (FAIL lab 2.21.38, ANR2 #10 6965682013 : 0 SBI dans la
+    /// session de l'essai 7) — deux essais du même abonné ont la MÊME clé
+    /// `(pseudonyme, pdu_session_id=1)` ; seule la clé tunnel est propre à
+    /// l'essai. Le CreateSMContext ambigu ne doit pas ancrer la capture vTAP
+    /// sur le premier essai : l'ancre vient du tunnel, et tout le SBI de la
+    /// capture va à l'essai 2.
+    #[test]
+    fn ambiguous_subscriber_pdu_key_does_not_anchor_vtap_capture_on_older_run() {
+        let n2 = |id: &str, ran: &str, teid: &str, packet: u64| {
+            event(
+                id,
+                "NGAP",
+                "PDUSessionResourceSetupRequest",
+                &[
+                    ("subscriber_pseudonym", "psn-repeated-ue"),
+                    ("pdu_session_id", "1"),
+                    ("ran_ue_ngap_id", ran),
+                    ("amf_ue_ngap_id", ran),
+                    ("tunnel_endpoint_ip", "10.45.0.1"),
+                    ("gtp_teid", teid),
+                ],
+                packet,
+            )
+        };
+        let mut events = vec![n2("evt-n2-run-1", "1", "0x0001", 1), n2("evt-n2-run-2", "2", "0x0002", 2)];
+        let vtap = |id: &str, op: &str, ids: &[(&str, &str)], packet: u64| {
+            let mut e = event(id, "SBI-HTTP2", op, ids, packet);
+            e.capture_id = "capture-vtap-run-2".into();
+            e.probe_type = Some("vtap".into());
+            e
+        };
+        events.push(vtap(
+            "evt-vtap-create",
+            "CreateSMContext",
+            &[("subscriber_pseudonym", "psn-repeated-ue"), ("pdu_session_id", "1")],
+            1,
+        ));
+        events.push(vtap(
+            "evt-vtap-update-tunnel",
+            "UpdateSMContext",
+            &[
+                ("subscriber_pseudonym", "psn-repeated-ue"),
+                ("tunnel_endpoint_ip", "10.45.0.1"),
+                ("gtp_teid", "0x0002"),
+            ],
+            2,
+        ));
+        events.push(vtap(
+            "evt-vtap-am-data",
+            "GetAmData",
+            &[("subscriber_pseudonym", "psn-repeated-ue")],
+            3,
+        ));
+        let discovery = discover_sessions(&mut events.clone());
+        assert_eq!(discovery.pdu_sessions.len(), 2);
+        let with = |needle: &str| {
+            discovery
+                .pdu_sessions
+                .iter()
+                .find(|s| s.event_ids.iter().any(|id| id == needle))
+                .map(|s| s.session_id.clone())
+        };
+        let run_2 = with("evt-n2-run-2").expect("session essai 2");
+        let run_1 = with("evt-n2-run-1").expect("session essai 1");
+        assert_ne!(run_1, run_2);
+        for id in ["evt-vtap-create", "evt-vtap-update-tunnel", "evt-vtap-am-data"] {
+            assert_eq!(with(id).as_deref(), Some(run_2.as_str()), "{id} doit aller à l'essai 2");
+        }
         assert_eq!(discovery.event_accounting["sbi_unattached_no_anchor"], 0);
     }
 
