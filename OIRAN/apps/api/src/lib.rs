@@ -160,6 +160,10 @@ struct Inner {
     /// des packet_references du callflow). Évite de relancer tshark
     /// 210 s sur le chemin de requête.
     identity_cache: std::sync::Mutex<BTreeMap<String, IdentityCacheEntry>>,
+    #[cfg(test)]
+    filter_summary_resolutions: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    filter_flow_resolutions: std::sync::atomic::AtomicUsize,
 }
 
 /// 2.21.11 — entrée de cache + clé composite pour `/sessions/catalog`.
@@ -746,6 +750,10 @@ impl AppState {
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
                 identity_cache: std::sync::Mutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                filter_summary_resolutions: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                filter_flow_resolutions: std::sync::atomic::AtomicUsize::new(0),
                 session_filter_index: std::sync::RwLock::new(session_filter_index),
             }),
         })
@@ -833,6 +841,10 @@ impl AppState {
                 health_cache: std::sync::Mutex::new(None),
                 health_refreshing: std::sync::atomic::AtomicBool::new(false),
                 identity_cache: std::sync::Mutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                filter_summary_resolutions: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                filter_flow_resolutions: std::sync::atomic::AtomicUsize::new(0),
                 session_filter_index: std::sync::RwLock::new(
                     session_filters::SessionFilterIndex::empty(),
                 ),
@@ -4489,6 +4501,15 @@ fn sessions_filter_blocking(
         || run_id_filter.is_some()
         || free_text_search.is_some()
         || search_pseudonym.is_some();
+    let needs_flow_for_match = !criteria.is_empty()
+        || !network_elements_scope.is_empty()
+        || run_id_filter.is_some()
+        || free_text_search.is_some()
+        || search_pseudonym.is_some();
+    let needs_summary_for_match = !technologies.is_empty()
+        || !dataset_kinds.is_empty()
+        || !states.is_empty()
+        || !correlation_statuses.is_empty();
     let has_extended_filter = !technologies.is_empty()
         || !dataset_kinds.is_empty()
         || !states.is_empty()
@@ -4549,46 +4570,76 @@ fn sessions_filter_blocking(
         None
     };
 
-    // 2.19.0/2.19.1 — si extended filters présents, on construit
-    // TOUS les summaries des sorted_ids, on filtre, puis on re-tri
-    // par clé canonique conservée dans matching_keys (jamais par
-    // ts). Le fast path 2.18 (aucun extended filter) garde la
-    // construction paresseuse par page. `matched_criteria` est
-    // mémorisé par session pour injection dans le summary à la
-    // sortie.
+    // 2.19.0/2.19.1 — si extended filters présents, on filtre puis on
+    // re-trie par clé canonique conservée dans matching_keys (jamais par
+    // ts). 2.21.52 : le prédicat `time_window` lit les bornes déjà calculées
+    // dans `SessionFilterIndex`, avant toute résolution de callflow ou de
+    // summary. L'ordre canonique de sortie reste identique.
     let mut matched_hits_by_session: BTreeMap<String, Vec<session_catalog::CriterionHit>> =
         BTreeMap::new();
     let (effective_sorted_ids, prebuilt_items): (Vec<String>, Option<BTreeMap<String, Value>>) =
         if has_extended_filter {
             let mut built: BTreeMap<String, Value> = BTreeMap::new();
+            let mut matching_extended = Vec::new();
             for session_id in &sorted_ids {
-                let Some(summary) = resolve_summary(session_id) else {
-                    continue;
-                };
-                if !passes_extended_filter(
-                    &summary,
-                    &technologies,
-                    &dataset_kinds,
-                    &states,
-                    &correlation_statuses,
-                ) {
-                    continue;
+                // 2.21.52 : la fenêtre lit les bornes de l'index. Aucun
+                // callflow n'est relu pour ce prédicat, y compris sur
+                // `limit=0` (aperçu exact).
+                if from_ns.is_some() || to_ns.is_some() {
+                    let overlaps = state
+                        .inner
+                        .session_filter_index
+                        .read()
+                        .expect("session_filter_index poisoned")
+                        .overlaps_time_window(session_id, from_ns, to_ns);
+                    if !overlaps {
+                        continue;
+                    }
                 }
-                // 2.19.1 — filtres protocolaires + time window +
-                // run_id + search + network_elements. Besoin des
-                // events du flow pour matcher criteria/search.
-                let flow_for_match: Option<&CallFlow> = state.inner.flows.get(session_id);
-                let owned_live_flow: Option<CallFlow> = if flow_for_match.is_none() {
-                    live_flow_for(&state, session_id).map(|(_, flow)| flow)
+                #[cfg(test)]
+                if needs_flow_for_match {
+                    state
+                        .inner
+                        .filter_flow_resolutions
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let flow_for_match: Option<&CallFlow> = if needs_flow_for_match {
+                    state.inner.flows.get(session_id)
                 } else {
                     None
                 };
+                let owned_live_flow: Option<CallFlow> =
+                    if needs_flow_for_match && flow_for_match.is_none() {
+                        live_flow_for(&state, session_id).map(|(_, flow)| flow)
+                    } else {
+                        None
+                    };
                 let events_ref: &[callflow_schema::CallFlowEvent] =
                     match (flow_for_match, &owned_live_flow) {
                         (Some(f), _) => f.events.as_slice(),
                         (None, Some(f)) => f.events.as_slice(),
                         _ => &[],
                     };
+                let summary = if needs_summary_for_match {
+                    let Some(summary) = resolve_summary(session_id) else {
+                        continue;
+                    };
+                    if !passes_extended_filter(
+                        &summary,
+                        &technologies,
+                        &dataset_kinds,
+                        &states,
+                        &correlation_statuses,
+                    ) {
+                        continue;
+                    }
+                    Some(summary)
+                } else {
+                    None
+                };
+                // 2.19.1 — filtres protocolaires + time window +
+                // run_id + search + network_elements. Besoin des
+                // events du flow pour matcher criteria/search.
                 let participants_ref: &[callflow_schema::Participant] =
                     match (flow_for_match, &owned_live_flow) {
                         (Some(f), _) => f.participants.as_slice(),
@@ -4616,28 +4667,6 @@ fn sessions_filter_blocking(
                 // 2.19.1 : run_id (capture_references porte les ids).
                 if let Some(run) = run_id_filter.as_deref() {
                     if !capture_references_ref.iter().any(|r| r == run) {
-                        continue;
-                    }
-                }
-                // 2.19.1 : time_window ⇒ au moins un event dans [from,to].
-                if from_ns.is_some() || to_ns.is_some() {
-                    let has_event_in_window = events_ref.iter().any(|event| {
-                        let Some(ts) = event.timestamp_ns.parse::<i128>().ok() else {
-                            return false;
-                        };
-                        if let Some(f) = from_ns {
-                            if ts < f {
-                                return false;
-                            }
-                        }
-                        if let Some(t) = to_ns {
-                            if ts > t {
-                                return false;
-                            }
-                        }
-                        true
-                    });
-                    if !has_event_in_window {
                         continue;
                     }
                 }
@@ -4677,14 +4706,20 @@ fn sessions_filter_blocking(
                 if !hits.is_empty() {
                     matched_hits_by_session.insert(session_id.clone(), hits);
                 }
-                built.insert(session_id.clone(), summary);
+                matching_extended.push(session_id.clone());
+                if let Some(summary) = summary {
+                    built.insert(session_id.clone(), summary);
+                }
             }
-            let mut rows: Vec<(String, (String, u64, String))> = built
-                .keys()
+            let mut rows: Vec<(String, (String, u64, String))> = matching_extended
+                .iter()
                 .filter_map(|id| matching_keys.get(id).map(|k| (id.clone(), k.clone())))
                 .collect();
             rows.sort_by(|a, b| a.1.cmp(&b.1));
-            (rows.into_iter().map(|(id, _)| id).collect(), Some(built))
+            (
+                rows.into_iter().map(|(id, _)| id).collect(),
+                needs_summary_for_match.then_some(built),
+            )
         } else {
             (sorted_ids.clone(), None)
         };
@@ -12587,6 +12622,99 @@ mod tests {
             .collect();
         assert!(ids.contains(&lte_session_id.as_str()), "new LTE session missing after cache");
         assert!(after["meta"]["total"].as_u64().unwrap() > before_total);
+    }
+
+    /// 2.21.50 — équivalence de résultat avec la sémantique historique
+    /// `time_window` (au moins un event dans [from,to]), tout en prouvant
+    /// que les summaries coûteux ne sont plus construits pour les sessions
+    /// rejetées par ce prédicat. Mutation : remettre `resolve_summary` avant
+    /// le test de fenêtre rend la seconde assertion rouge (> 0).
+    #[tokio::test]
+    async fn sessions_filter_time_window_prunes_before_summary_with_equivalent_result() {
+        use std::sync::atomic::Ordering;
+
+        let state = state();
+        let expected: BTreeSet<String> = queryable_flows(&state)
+            .into_values()
+            .filter(|flow| {
+                flow.events
+                    .iter()
+                    .any(|event| event.timestamp_ns.parse::<i128>().is_ok_and(|ts| ts >= 0))
+            })
+            .map(|flow| flow.session_id)
+            .collect();
+        state
+            .inner
+            .filter_summary_resolutions
+            .store(0, Ordering::SeqCst);
+        state
+            .inner
+            .filter_flow_resolutions
+            .store(0, Ordering::SeqCst);
+        let (status, body) = post_sessions_filter(
+            &state,
+            json!({
+                "limit": 100,
+                "time_window": {
+                    "from": "0",
+                    "to": i128::MAX.to_string(),
+                }
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let actual: BTreeSet<String> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["session_id"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "time-window result changed from fixture reference"
+        );
+        assert_eq!(
+            state.inner.filter_flow_resolutions.load(Ordering::SeqCst),
+            0,
+            "time-window-only filtering must not resolve any callflow"
+        );
+
+        state
+            .inner
+            .filter_summary_resolutions
+            .store(0, Ordering::SeqCst);
+        state
+            .inner
+            .filter_flow_resolutions
+            .store(0, Ordering::SeqCst);
+        let (status, outside) = post_sessions_filter(
+            &state,
+            json!({
+                "limit": 100,
+                "time_window": {
+                    "from": i128::MAX.to_string(),
+                    "to": i128::MAX.to_string(),
+                }
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(outside["data"].as_array().unwrap().is_empty());
+        assert_eq!(
+            state
+                .inner
+                .filter_summary_resolutions
+                .load(Ordering::SeqCst),
+            0,
+            "out-of-window sessions must be rejected before summary construction"
+        );
+        assert_eq!(
+            state.inner.filter_flow_resolutions.load(Ordering::SeqCst),
+            0,
+            "mutation guard: restoring per-session flow resolution must make this assertion red"
+        );
     }
 
     /// 2.18.5 — ANR2 #10 6901691533 : p900 lit /sessions/filter, qui
