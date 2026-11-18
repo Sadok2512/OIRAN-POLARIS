@@ -1,5 +1,18 @@
 # Changelog
 
+## OIRAN API 2.21.49 + session-engine 0.5.20 — 2026-11-18 — rattachement SBI par fenêtre de temps (règle des sondes pro)
+
+Upgrade **patch**, basé sur 2.21.47 (`9100bb1`). 2.21.48 réservée au lot HPACK de DEVMAT. Décision Sadok du 18/11 : « on fait exactement comme les prope pro ».
+
+Cause : au lab, les identifiants se répètent d'un essai à l'autre (TEID 0xf124 dans 30 sessions, `(pseudonyme, PDU 1)` dans 136 — ANR2 #10). `pseudo_pdu` et `tunnel_idx` gardaient la PREMIÈRE session vue (`or_insert`) et le repli pseudo-seul rattachait un SBI à TOUTES les sessions de l'abonné : SBI d'anciens essais rattachés en trop.
+
+- Les index de clés deviennent des ensembles : une clé n'est exacte que si elle désigne UNE session.
+- Clé exacte unique → rattachement par clé (inchangé), compté `sbi_attached_exact_key`.
+- Sinon, dernier recours : fenêtre de vie de la session (min/max des events non-SBI, ± 2 s, même horloge de l'hôte de capture), restreinte aux candidates par clé et au `pdu_session_id` s'il est présent. Rattaché seulement si les sessions dans la fenêtre appartiennent à UN seul contexte UE ; sinon non rattaché (`sbi_unattached_ambiguous`). Fail-closed.
+- Rattachement par fenêtre marqué : `DiscoveredPduSession.sbi_time_window_event_ids` (serde default, rétrocompatible) et compteur `sbi_attached_time_window` dans `event_accounting`.
+- Ordre canonique inchangé ; les SBI sont parcourus dans l'ordre `canonical_sort_key`.
+- Tests : deux essais aux mêmes clés → SBI au bon essai, marqué fenêtre ; SBI hors fenêtre → non rattaché ; fenêtres chevauchantes de deux contextes → non rattaché ; clé unique prime sur le temps, non marquée. Preuve de mutation : retirer le filtre de fenêtre fait échouer le test des deux essais.
+
 ## OIRAN API 2.21.47 + session-engine 0.5.19 + live-probe 0.6.19 — 2026-11-18 — projection SBI bornée sur données réelles
 
 Upgrade **patch**, basé sur 2.21.45 (`3d7a502`). Aucun geste lab.

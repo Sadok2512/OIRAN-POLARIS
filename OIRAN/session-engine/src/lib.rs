@@ -284,6 +284,11 @@ pub struct DiscoveredPduSession {
     pub interfaces: Vec<String>,
     pub correlation_status: String,
     pub event_ids: Vec<String>,
+    /// 2.21.49 — events SBI rattachés à cette session par FENÊTRE DE
+    /// TEMPS (dernier recours, voir `attach_sbi_to_sessions`), distincts
+    /// des rattachements par clé exacte. L'UI les marque comme tels.
+    #[serde(default)]
+    pub sbi_time_window_event_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2144,6 +2149,7 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
                 interfaces,
                 correlation_status: "UNKNOWN".into(),
                 event_ids: related.iter().map(|event| event.event_id.clone()).collect(),
+                sbi_time_window_event_ids: Vec::new(),
             };
             procedures.extend(discover_procedures(context, Some(&session), &related));
             pdu_sessions.push(session);
@@ -2170,7 +2176,7 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
     // La règle est fail-closed : un SBI qui n'a ni (pseudonyme,
     // pduSessionId) ni (TEID, IP) reste non rattaché et compte en
     // `unmatched`. Aucun critère temporel n'est utilisé.
-    attach_sbi_to_sessions(&events, &mut pdu_sessions, &mut event_context);
+    let sbi_counters = attach_sbi_to_sessions(&events, &mut pdu_sessions, &mut event_context);
 
     let assigned: HashSet<_> = event_context.keys().cloned().collect();
     let mut background_event_ids = Vec::new();
@@ -2198,6 +2204,12 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
     event_accounting.insert("session_events".into(), session_associated);
     event_accounting.insert("background_events".into(), background_event_ids.len());
     event_accounting.insert("unmatched_events".into(), unmatched_event_ids.len());
+    event_accounting.insert("sbi_attached_exact_key".into(), sbi_counters.by_exact_key);
+    event_accounting.insert("sbi_attached_time_window".into(), sbi_counters.by_time_window);
+    event_accounting.insert(
+        "sbi_unattached_ambiguous".into(),
+        sbi_counters.unattached_ambiguous,
+    );
     event_accounting.insert(
         "duplicate_observations".into(),
         duplicate_observations.len(),
@@ -2238,13 +2250,28 @@ pub fn discover_sessions(events: &mut Vec<EventRecord>) -> DiscoveryResult {
 /// `ue_context_id` de la session. Les deux index étant construits
 /// sur des IE strictement présentes (pseudonyme OU tuple tunnel),
 /// l'attache est **exacte** — un timing n'intervient à aucun moment.
+/// 2.21.49 — résultat comptable du rattachement SBI (exposé dans
+/// `DiscoveryResult.event_accounting`).
+#[derive(Default)]
+struct SbiAttachCounters {
+    by_exact_key: usize,
+    by_time_window: usize,
+    unattached_ambiguous: usize,
+}
+
+/// 2.21.49 — marge autour de la vie d'une session pour le rattachement
+/// par fenêtre de temps (SBI d'enregistrement émis juste avant le N2 de
+/// la session, SBI de libération juste après).
+const SBI_TIME_WINDOW_MARGIN_NS: i128 = 2_000_000_000;
+
 fn attach_sbi_to_sessions(
     events: &[EventRecord],
     pdu_sessions: &mut Vec<DiscoveredPduSession>,
     event_context: &mut BTreeMap<String, String>,
-) {
+) -> SbiAttachCounters {
+    let mut counters = SbiAttachCounters::default();
     if pdu_sessions.is_empty() {
-        return;
+        return counters;
     }
     // Snapshot de lookup event_id → &EventRecord.
     let event_by_id: BTreeMap<_, _> = events
@@ -2253,9 +2280,13 @@ fn attach_sbi_to_sessions(
         .collect();
 
     // Index (pseudo, pdu_session_id) → session_index.
-    let mut pseudo_pdu: BTreeMap<(String, String), usize> = BTreeMap::new();
-    // Index (tunnel_endpoint_ip_norm, gtp_teid_norm) → session_index.
-    let mut tunnel_idx: BTreeMap<(String, String), usize> = BTreeMap::new();
+    // 2.21.49 — ensembles : une clé n'est EXACTE que si elle désigne une
+    // seule session (au lab, `(pseudonyme, PDU 1)` et les TEID se répètent
+    // d'un essai à l'autre — ANR2 #10 6972508696 : TEID 0xf124 dans 30
+    // sessions, `(pseudonyme, 1)` dans 136).
+    let mut pseudo_pdu: BTreeMap<(String, String), BTreeSet<usize>> = BTreeMap::new();
+    // Index (tunnel_endpoint_ip_norm, gtp_teid_norm) → sessions.
+    let mut tunnel_idx: BTreeMap<(String, String), BTreeSet<usize>> = BTreeMap::new();
     // 2.18.7 (ANR1 #10 6901968948) — Index pseudo → ensemble de
     // sessions. Fallback pour les events SBI qui portent le
     // `subscriber_pseudonym` mais PAS de `pdu_session_id` (ex.
@@ -2311,7 +2342,8 @@ fn attach_sbi_to_sessions(
                 }
                 pseudo_pdu
                     .entry((pseudo.to_owned(), pdu_id.clone()))
-                    .or_insert(idx);
+                    .or_default()
+                    .insert(idx);
             }
             // 2.9.15 (#9 comment 6728928219) : ANR2 a prouvé que le
             // N2 `PDUSessionResourceSetupRequest` publie son tuple
@@ -2399,14 +2431,38 @@ fn attach_sbi_to_sessions(
                     if let Some(teid) = normalized_teid {
                         tunnel_idx
                             .entry((normalized_ip, teid))
-                            .or_insert(idx);
+                            .or_default()
+                            .insert(idx);
                     }
                 }
             }
         }
     }
 
-    for event in events.iter().filter(|event| protocol_is(event, "SBI-HTTP2")) {
+    // 2.21.49 — fenêtre de vie de chaque session, calculée sur ses events
+    // NON-SBI (N2/N3/N4) avant tout rattachement SBI.
+    let windows: Vec<Option<(i128, i128)>> = pdu_sessions
+        .iter()
+        .map(|session| {
+            let stamps = session
+                .event_ids
+                .iter()
+                .filter_map(|id| event_by_id.get(id))
+                .filter(|event| !protocol_is(event, "SBI-HTTP2"))
+                .map(|event| event.timestamp_ns)
+                .collect::<Vec<_>>();
+            let first = stamps.iter().min().copied()?;
+            let last = stamps.iter().max().copied()?;
+            Some((first - SBI_TIME_WINDOW_MARGIN_NS, last + SBI_TIME_WINDOW_MARGIN_NS))
+        })
+        .collect();
+
+    let mut sbi_events = events
+        .iter()
+        .filter(|event| protocol_is(event, "SBI-HTTP2"))
+        .collect::<Vec<_>>();
+    sbi_events.sort_by(|left, right| canonical_sort_key(left).cmp(&canonical_sort_key(right)));
+    for event in sbi_events {
         if event_context.contains_key(&event.event_id) {
             continue;
         }
@@ -2414,20 +2470,17 @@ fn attach_sbi_to_sessions(
         let pseudo = event
             .first_identifier("subscriber_pseudonym")
             .map(str::to_owned);
-        // 2.18.7 (ANR1 #10 6901968948) — on n'a plus un seul
-        // `target_idx` mais un VEC d'indices : les events SBI qui
-        // ne portent pas de PDU session ID (ex. Nudm_SDM am-data)
-        // doivent pouvoir se rattacher à toutes les sessions
-        // actives du même abonné. La trace Live le fait déjà par
-        // simple substring du pseudonyme dans le JSON de l'event ;
-        // on offre le même filet côté session-engine.
-        let mut target_indices: Vec<usize> = Vec::new();
+        // Règle des sondes pro : 1) clé exacte UNIQUE ; 2) sinon, en dernier
+        // recours, la fenêtre de vie de la session (même horloge de l'hôte
+        // de capture), parmi les seules sessions candidates par clé ; une
+        // seule session dans la fenêtre, sinon non rattaché (fail-closed).
+        let mut key_candidates: Option<BTreeSet<usize>> = None;
         if let (Some(pseudo), Some(pdu_id)) = (&pseudo, &pdu_id) {
-            if let Some(&idx) = pseudo_pdu.get(&(pseudo.clone(), pdu_id.clone())) {
-                target_indices.push(idx);
+            if let Some(indices) = pseudo_pdu.get(&(pseudo.clone(), pdu_id.clone())) {
+                key_candidates = Some(indices.clone());
             }
         }
-        if target_indices.is_empty() {
+        if key_candidates.as_ref().is_none_or(|set| set.len() != 1) {
             let ip = event
                 .first_identifier("tunnel_endpoint_ip")
                 .map(event_schema::normalize_ip);
@@ -2435,41 +2488,92 @@ fn attach_sbi_to_sessions(
                 .first_identifier("gtp_teid")
                 .and_then(event_schema::normalize_teid_hex);
             if let (Some(ip), Some(teid)) = (ip, teid) {
-                if let Some(&idx) = tunnel_idx.get(&(ip, teid)) {
-                    target_indices.push(idx);
+                if let Some(indices) = tunnel_idx.get(&(ip, teid)) {
+                    key_candidates = Some(match key_candidates {
+                        Some(previous) if indices.len() != 1 => {
+                            let both = previous
+                                .intersection(indices)
+                                .copied()
+                                .collect::<BTreeSet<_>>();
+                            if both.is_empty() {
+                                previous
+                            } else {
+                                both
+                            }
+                        }
+                        _ => indices.clone(),
+                    });
                 }
             }
         }
-        // 2.18.7 — fallback pseudo-seul (dernier recours).
-        // S'applique SEULEMENT si les 2 clés dual précédentes
-        // n'ont rien trouvé. Évite de dupliquer un event SBI
-        // (pseudo+pdu+tunnel déjà prouvés) sur toutes les
-        // sessions d'un même abonné : la précision du match dual
-        // reste prioritaire. Ne s'applique qu'aux SBI qui portent
-        // un pseudonyme — jamais de hypothèse.
-        if target_indices.is_empty() {
-            if let Some(pseudo) = pseudo.as_deref() {
-                if let Some(indices) = pseudo_only.get(pseudo) {
-                    target_indices = indices.clone();
+        let mut method_time_window = false;
+        let targets: Vec<usize> = match key_candidates {
+            Some(set) if set.len() == 1 => set.into_iter().collect(),
+            other => {
+                let pool: Vec<usize> = match other {
+                    Some(set) => set.into_iter().collect(),
+                    None => pseudo
+                        .as_deref()
+                        .and_then(|value| pseudo_only.get(value))
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                let inside = pool
+                    .into_iter()
+                    .filter(|idx| {
+                        pdu_id
+                            .as_ref()
+                            .is_none_or(|pdu| &pdu_sessions[*idx].pdu_session_id == pdu)
+                    })
+                    .filter(|idx| {
+                        windows[*idx].is_some_and(|(start, end)| {
+                            event.timestamp_ns >= start && event.timestamp_ns <= end
+                        })
+                    })
+                    .collect::<BTreeSet<_>>();
+                // Plusieurs sessions dans la fenêtre : acceptable seulement si
+                // elles appartiennent au MÊME contexte UE (sessions PDU
+                // concurrentes d'un même enregistrement : l'opération abonné
+                // les concerne toutes). Contextes différents → ambigu.
+                let contexts = inside
+                    .iter()
+                    .map(|idx| pdu_sessions[*idx].ue_context_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                if !inside.is_empty() && contexts.len() == 1 {
+                    method_time_window = true;
+                    inside.into_iter().collect()
+                } else {
+                    if pseudo.is_some() || pdu_id.is_some() {
+                        counters.unattached_ambiguous += 1;
+                    }
+                    Vec::new()
                 }
             }
+        };
+        if targets.is_empty() {
+            continue;
         }
-        for idx in target_indices {
+        if method_time_window {
+            counters.by_time_window += 1;
+        } else {
+            counters.by_exact_key += 1;
+        }
+        for idx in targets {
             let session = &mut pdu_sessions[idx];
             session.event_ids.push(event.event_id.clone());
+            if method_time_window {
+                session.sbi_time_window_event_ids.push(event.event_id.clone());
+            }
             if !session.interfaces.iter().any(|iface| iface == &event.interface) {
                 session.interfaces.push(event.interface.clone());
                 session.interfaces.sort();
             }
-            // event_context est un BTreeMap<event_id, context_id>.
-            // Insertion unique : si plusieurs sessions rattachent
-            // le même SBI (cas pseudo-seul), le 1er UE context
-            // est retenu (déterministe par ordre d'indices).
             event_context
                 .entry(event.event_id.clone())
                 .or_insert_with(|| session.ue_context_id.clone());
         }
     }
+    counters
 }
 
 /// 2.18.0 (ANR1 #10 E2E-5G — SBI identities) — agrégat compact des
@@ -2600,7 +2704,7 @@ fn sbi_identity_source(event: &EventRecord) -> String {
 fn index_tunnel_names(
     named: &std::collections::BTreeMap<&str, &str>,
     session_idx: usize,
-    tunnel_idx: &mut std::collections::BTreeMap<(String, String), usize>,
+    tunnel_idx: &mut std::collections::BTreeMap<(String, String), std::collections::BTreeSet<usize>>,
 ) {
     for (name, value) in named.iter() {
         let (prefix, ip_norm) = if let Some(prefix) = name.strip_suffix("tunnel_endpoint_ip") {
@@ -2625,7 +2729,8 @@ fn index_tunnel_names(
                 if let Some(teid_norm) = event_schema::normalize_teid_hex(teid_raw) {
                     tunnel_idx
                         .entry((ip_norm.clone(), teid_norm))
-                        .or_insert(session_idx);
+                        .or_default()
+                        .insert(session_idx);
                 }
             }
         }
@@ -4944,6 +5049,7 @@ mod tests {
             interfaces: vec!["N2".into()],
             correlation_status: "OPEN".into(),
             event_ids: vec!["evt-n2-pdu".into()],
+            sbi_time_window_event_ids: Vec::new(),
         }];
         let mut event_context: BTreeMap<String, String> = BTreeMap::new();
         event_context.insert("evt-nas-reg".into(), "ue-ctx-201".into());
@@ -5014,6 +5120,7 @@ mod tests {
             interfaces: vec!["N3".into()],
             correlation_status: "OPEN".into(),
             event_ids: vec!["evt-n3-gtpu-ul".into()],
+            sbi_time_window_event_ids: Vec::new(),
         }];
         let mut event_context: BTreeMap<String, String> = BTreeMap::new();
         event_context.insert("evt-n3-gtpu-ul".into(), "ue-ctx-orphan".into());
@@ -5096,6 +5203,7 @@ mod tests {
             // SEULE la session A pointe sur evt-sbi-a-sm-ctx ;
             // sbi_other n'est PAS dans event_ids.
             event_ids: vec!["evt-sbi-a-sm-ctx".into()],
+            sbi_time_window_event_ids: Vec::new(),
         };
         let events = vec![sbi_full.clone(), sbi_other.clone()];
         let summary = collect_sbi_identities_for_session(&session, &events);
@@ -5136,6 +5244,7 @@ mod tests {
             interfaces: vec!["N2".into()],
             correlation_status: "OPEN".into(),
             event_ids: vec!["evt-n2-only".into()],
+            sbi_time_window_event_ids: Vec::new(),
         };
         let summary = collect_sbi_identities_for_session(&session, &[n2]);
         assert!(summary.msisdn_pseudonym.is_none());
@@ -5352,6 +5461,180 @@ mod tests {
             "SBI-HTTP2 doit apparaître dans session.interfaces ; got {:?}",
             session.interfaces
         );
+    }
+
+    /// 2.21.49 — règle des sondes pro. Deux essais du même abonné, avec
+    /// les MÊMES `(pseudonyme, PDU 1)` et le MÊME tunnel (cas du lab :
+    /// identifiants réutilisés), séparés dans le temps. Le SBI de l'essai 2
+    /// va à l'essai 2 par fenêtre de temps, marqué comme tel ; un SBI hors
+    /// de toute fenêtre reste non rattaché ; une clé unique prime sur le
+    /// temps.
+    fn timed(mut e: EventRecord, seconds: i128) -> EventRecord {
+        e.timestamp_ns = seconds * 1_000_000_000;
+        e
+    }
+
+    fn two_runs_same_ids() -> Vec<EventRecord> {
+        let run = |n: &str, ran: &str, at: i128, packet: u64| {
+            vec![
+                timed(
+                    event(
+                        &format!("evt-n2-setup-{n}"),
+                        "NGAP",
+                        "PDUSessionResourceSetupRequest",
+                        &[
+                            ("subscriber_pseudonym", "psn-repeat"),
+                            ("pdu_session_id", "1"),
+                            ("ran_ue_ngap_id", ran),
+                            ("amf_ue_ngap_id", ran),
+                            ("item_0_tunnel_ip_ul", "10.77.22.13"),
+                            ("item_0_gtp_teid_ul", "0xf124"),
+                        ],
+                        packet,
+                    ),
+                    at,
+                ),
+                timed(
+                    event(
+                        &format!("evt-n2-resp-{n}"),
+                        "NGAP",
+                        "PDUSessionResourceSetupResponse",
+                        &[("pdu_session_id", "1"), ("ran_ue_ngap_id", ran), ("amf_ue_ngap_id", ran)],
+                        packet + 1,
+                    ),
+                    at + 30,
+                ),
+            ]
+        };
+        let mut events = run("a", "1", 1_000, 1);
+        events.extend(run("b", "2", 2_000, 10));
+        events
+    }
+
+    #[test]
+    fn sbi_ambiguous_keys_attach_by_time_window_to_the_right_run_and_are_marked() {
+        let mut events = two_runs_same_ids();
+        let sbi = |id: &str, op: &str, ids: &[(&str, &str)], at: i128, packet: u64| {
+            let mut e = timed(event(id, "SBI-HTTP2", op, ids, packet), at);
+            e.capture_id = "capture-vtap".into();
+            e
+        };
+        events.push(sbi(
+            "evt-sbi-create",
+            "CreateSMContext",
+            &[("subscriber_pseudonym", "psn-repeat"), ("pdu_session_id", "1")],
+            2_001,
+            20,
+        ));
+        events.push(sbi(
+            "evt-sbi-n1n2",
+            "N1N2MessageTransfer",
+            &[("tunnel_endpoint_ip", "10.77.22.13"), ("gtp_teid", "0xf124"), ("pdu_session_id", "1")],
+            2_002,
+            21,
+        ));
+        events.push(sbi(
+            "evt-sbi-am-data",
+            "GetAmData",
+            &[("subscriber_pseudonym", "psn-repeat")],
+            2_010,
+            22,
+        ));
+        events.push(sbi(
+            "evt-sbi-orphan",
+            "GetAmData",
+            &[("subscriber_pseudonym", "psn-repeat")],
+            5_000,
+            23,
+        ));
+        let discovery = discover_sessions(&mut events.clone());
+        assert_eq!(discovery.pdu_sessions.len(), 2);
+        let session_of = |needle: &str| {
+            discovery
+                .pdu_sessions
+                .iter()
+                .filter(|s| s.event_ids.iter().any(|id| id == needle))
+                .map(|s| s.session_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let run_b = session_of("evt-n2-setup-b");
+        assert_eq!(run_b.len(), 1);
+        for id in ["evt-sbi-create", "evt-sbi-n1n2", "evt-sbi-am-data"] {
+            assert_eq!(session_of(id), run_b, "{id} doit aller à l'essai 2, et à lui seul");
+        }
+        assert!(session_of("evt-sbi-orphan").is_empty(), "hors fenêtre : non rattaché");
+        let b = discovery
+            .pdu_sessions
+            .iter()
+            .find(|s| s.session_id == run_b[0])
+            .unwrap();
+        assert_eq!(b.sbi_time_window_event_ids.len(), 3, "rattachement marqué fenêtre");
+        assert_eq!(discovery.event_accounting["sbi_attached_time_window"], 3);
+        assert_eq!(discovery.event_accounting["sbi_unattached_ambiguous"], 1);
+    }
+
+    #[test]
+    fn sbi_overlapping_windows_of_two_contexts_stay_unattached() {
+        let mut events = two_runs_same_ids();
+        // L'essai 2 démarre pendant l'essai 1 : fenêtres chevauchantes.
+        for e in events.iter_mut().skip(2) {
+            e.timestamp_ns -= 990 * 1_000_000_000;
+        }
+        let mut sbi = timed(
+            event(
+                "evt-sbi-overlap",
+                "SBI-HTTP2",
+                "CreateSMContext",
+                &[("subscriber_pseudonym", "psn-repeat"), ("pdu_session_id", "1")],
+                20,
+            ),
+            1_015,
+        );
+        sbi.capture_id = "capture-vtap".into();
+        events.push(sbi);
+        let discovery = discover_sessions(&mut events.clone());
+        assert_eq!(discovery.pdu_sessions.len(), 2);
+        assert!(discovery
+            .pdu_sessions
+            .iter()
+            .all(|s| !s.event_ids.iter().any(|id| id == "evt-sbi-overlap")));
+        assert_eq!(discovery.event_accounting["sbi_unattached_ambiguous"], 1);
+        assert_eq!(discovery.event_accounting["sbi_attached_time_window"], 0);
+    }
+
+    #[test]
+    fn sbi_unique_exact_key_wins_over_time_and_is_not_marked_time_window() {
+        let mut events = two_runs_same_ids();
+        // `pdu_session_id=2` n'existe que dans... aucune session : on prend
+        // un SM context unique à la place : (pseudonyme, PDU 1) est ambigu,
+        // mais un tunnel propre à l'essai 1 tranche, même hors fenêtre.
+        events[0]
+            .identifiers
+            .retain(|(name, _)| name != "item_0_gtp_teid_ul");
+        events[0]
+            .identifiers
+            .push(("item_0_gtp_teid_ul".into(), "0x0a01".into()));
+        let mut late = timed(
+            event(
+                "evt-sbi-late-unique",
+                "SBI-HTTP2",
+                "N1N2MessageTransfer",
+                &[("tunnel_endpoint_ip", "10.77.22.13"), ("gtp_teid", "0x0a01")],
+                30,
+            ),
+            9_000,
+        );
+        late.capture_id = "capture-vtap".into();
+        events.push(late);
+        let discovery = discover_sessions(&mut events.clone());
+        let a = discovery
+            .pdu_sessions
+            .iter()
+            .find(|s| s.event_ids.iter().any(|id| id == "evt-n2-setup-a"))
+            .unwrap();
+        assert!(a.event_ids.iter().any(|id| id == "evt-sbi-late-unique"));
+        assert!(a.sbi_time_window_event_ids.is_empty());
+        assert_eq!(discovery.event_accounting["sbi_attached_exact_key"], 1);
     }
 
     /// 2.18.7 — un abonné avec DEUX sessions actives : un SBI

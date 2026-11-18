@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-api"
-version = "2.21.47"
+version = "2.21.49"
 dependencies = [
  "axum",
  "callflow-renderer",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "session-engine"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "event-schema",
  "serde",
