@@ -1680,6 +1680,10 @@ pub struct CaptureManager {
     /// mutuellement → 503 parasite, FAIL gate ANR2 2.21.26). La publication
     /// le prend en bloquant ; l'API le prend en `try` (503 si occupé).
     heavy_memory_gate: Arc<std::sync::RwLock<()>>,
+    /// 0.6.20 — callback API exécuté après l'upsert atomique d'un dataset
+    /// publié. Il préchauffe les index dépendants avant l'annonce de fin de
+    /// cycle et n'est jamais appelé sous le mutex `datasets`.
+    dataset_publish_observer: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
     /// 0.6.9 — segments dont l'échec de décodage a déjà été compté
     /// (`(chemin, taille)`), pour ne pas gonfler `ingestion_failures` à
     /// chaque cycle. Le log structuré, lui, sort à chaque cycle.
@@ -1852,6 +1856,29 @@ impl CaptureManager {
         }
     }
 
+    /// 0.6.20 — entrée exclusive non bloquante pour le préchauffage des
+    /// caches consommateurs. Tant que cette garde vit, les routes lourdes
+    /// obtiennent le même 503 explicite que pendant une publication.
+    pub fn heavy_memory_try_enter_exclusive(
+        &self,
+    ) -> Option<std::sync::RwLockWriteGuard<'_, ()>> {
+        match self.heavy_memory_gate.try_write() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// 0.6.20 — installe l'unique observateur du consommateur API.
+    /// La notification synchrone garantit que `phase=end` n'est émis
+    /// qu'après le préchauffage demandé par le consommateur.
+    pub fn set_dataset_publish_observer(
+        &self,
+        observer: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.dataset_publish_observer.lock().unwrap() = observer;
+    }
+
     /// 0.6.10 (ordre #9 6952054201) — vrai si ce segment a déjà été
     /// quarantiné sous la même identité `(chemin, taille, sha256)`.
     pub fn is_segment_quarantined(&self, path: &str, size: u64, sha256: &str) -> bool {
@@ -1983,6 +2010,7 @@ impl CaptureManager {
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
             continuous_vtap_dirs: Arc::new(Mutex::new(Vec::new())),
             heavy_memory_gate: Arc::new(std::sync::RwLock::new(())),
+            dataset_publish_observer: Arc::new(Mutex::new(None)),
             reported_segment_failures: Arc::new(Mutex::new(BTreeSet::new())),
             vtap_publication_triggers: Arc::new(Mutex::new(BTreeSet::new())),
             quarantined_segments: Arc::new(Mutex::new(quarantined_segments)),
@@ -7169,10 +7197,21 @@ impl CaptureManager {
 
     fn upsert_dataset(&self, dataset: LiveDataset, dataset_dir: &Path) -> Result<(), String> {
         validate_dataset_artifacts(&dataset, dataset_dir)?;
-        self.datasets
-            .lock()
-            .unwrap()
-            .insert(dataset.dataset_id.clone(), dataset);
+        {
+            self.datasets
+                .lock()
+                .unwrap()
+                .insert(dataset.dataset_id.clone(), dataset);
+        }
+        let observer = self.dataset_publish_observer.lock().unwrap().clone();
+        if let Some(observer) = observer {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer())).is_err() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"event": "DATASET_PUBLISH_OBSERVER_PANICKED"})
+                );
+            }
+        }
         Ok(())
     }
 

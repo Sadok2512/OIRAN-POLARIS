@@ -9,6 +9,17 @@ Constat ANR2 (#10 6989585318) : avec 2.21.55, `time_window` passe de 1504 à 456
 - Les quatre compteurs couvrent chaque SBI parcouru par le rattachement : la somme est comparable d'une version à l'autre.
 - Aucune règle de rattachement modifiée.
 - Test : la somme des quatre compteurs égale le nombre de SBI de la fixture.
+## OIRAN API 2.21.56 + live-probe 0.6.20 — 2026-11-18 — index filtre préchauffés au commit de publication
+
+Upgrade **patch**, basé sur 2.21.55 (`b94e84d`) et intégrant le filtre temporel indexé de 2.21.52 (`5a04dac`).
+
+- Audit sur copie physique du stock complet (`dataset_manifest.json` SHA-256 `a11b2c9cd68ea91a51a78b8449371ef2a76bcaed589984b1a933027344c746be`) : processus neuf, premier appel fenêtre = 3,186679 s, dont 1 319 ms de reconstruction `SessionFilterIndex`, 1 105 ms de reconstruction `JourneyIndex` et 757 ms de page ; premier appel sans fenêtre sur un second processus neuf = 4,096253 s, dont 1 428 ms + 1 122 ms pour les deux index et 1 528 ms pour 100 summaries. La cause « index payés par le premier appel post-publication » est confirmée par mesure.
+- `CaptureManager` notifie maintenant l'API synchroniquement après l'upsert atomique du dataset. L'API prend le même verrou lourd en exclusif, reconstruit `SessionFilterIndex` et `JourneyIndex`, puis seulement laisse le worker annoncer `phase=end`.
+- Au démarrage, le même préchauffage est tenté avant l'ouverture du listener. Si une publication tient déjà le verrou, le report est explicite et son callback de commit prend le relais ; aucun garde ne se saute en silence.
+- Pendant publication ou préchauffage, `/sessions/filter` conserve le contrat 503 immédiat `HEAVY_WORK_IN_PROGRESS` + `Retry-After` ; aucun cache partiel n'est servi.
+- `OIRAN_SESSIONS_FILTER_PHASE_AUDIT=1` journalise les phases et le statut hit/rebuild sans donnée d'identité.
+- Gate sur la même copie physique, processus neuf et index préchauffés avant listener : premier appel fenêtre = 1,108443 s ; premier appel sans fenêtre (`limit: 100`) sur un second processus neuf = 1,973967 s. Les deux bornes locales (< 2 s / < 5 s) sont tenues.
+- Tests : équivalence temporelle inchangée ; le premier filtre après préchauffage ne reconstruit aucun index. Mutation : retirer un appel de préchauffage rend le test rouge via les compteurs de rebuild.
 
 ## OIRAN API 2.21.55 + session-engine 0.5.22 — 2026-11-18 — pseudonyme SBI relu dans l'URI sanitisée
 
@@ -18,6 +29,14 @@ Cause prouvée par ANR2 (#10 6988143045, B1, 10/10 exemples) : des SBI stockés 
 - `attach_sbi_to_sessions` relit le pseudonyme dans `sbi.request_uri` quand l'identifiant manque. Lecture stricte, fail-closed : `psn-` + 32 hex minuscules, un seul pseudonyme distinct par URI. Appliqué à la publication, donc couvre le stock existant ; aucune identité en clair n'est lue.
 - Règles de rattachement inchangées : clé exacte unique, puis fenêtre en dernier recours.
 - Test : un SBI historique sans identifiant rattache par clé exacte ; une URI non conforme n'est pas rattachée. Mutation : retirer la relecture rend le test rouge.
+
+## OIRAN API 2.21.52 — 2026-11-18 — fenêtre sessions indexée, sans relecture des callflows
+
+- `SessionFilterIndex` conserve désormais les bornes temporelles fermées de chaque session pendant sa construction.
+- `POST /api/v1/sessions/filter` applique `time_window` depuis ces bornes en O(1) par session et ne recharge aucun callflow pour une requête fenêtre seule, y compris avec `limit: 0`.
+- Les filtres étendus qui ne dépendent pas du résumé construisent désormais les résumés uniquement pour la page servie.
+- Le garde mémoire existant reste strict : pendant une publication, la route répond immédiatement `503 HEAVY_WORK_IN_PROGRESS` avec `Retry-After` au lieu d'attendre ou d'expirer.
+- Tests : équivalence du résultat, bornes inclusives et garde de mutation qui devient rouge si une résolution de flow par session est réintroduite.
 
 ## OIRAN API 2.21.51 + session-engine 0.5.21 — 2026-11-18 — clés exactes SBI réellement disponibles
 
