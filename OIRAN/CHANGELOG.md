@@ -1,5 +1,15 @@
 # Changelog
 
+## OIRAN API 2.21.50 — 2026-11-18 — `/sessions/filter` élimine la fenêtre avant les résumés coûteux
+
+Upgrade **patch**, basé sur 2.21.49 (`0d2e8b2`).
+
+- Audit chronométré par phase, activable uniquement avec `OIRAN_SESSIONS_FILTER_PHASE_AUDIT` : verrou mémoire, rafraîchissement d'index, index de parcours, filtre et construction de page. Sur l'instance de développement en lecture seule, l'appel exact du lot a pris 274 ms à froid (index filtre 12 ms, parcours 12 ms, filtre 248 ms), puis 104 ms et 66 ms à chaud. L'hypothèse d'une reconstruction permanente de l'index est fermée : les appels chauds indiquent `filter_index_rebuilt=false` et `journey_cache_hit=true`.
+- Cause prouvée : avec `time_window`, `sessions_filter_blocking` construisait d'abord le résumé complet de chaque session (patch read-time, identités et hydratation tshark), puis seulement vérifiait si un event appartenait à la fenêtre. En production, l'appel exact a dépassé 30 s et des workers filtre accompagnés de tshark ont été observés.
+- Correctif : la présence d'un event dans `[from,to]` est évaluée sur le callflow avant `resolve_summary`; seuls les survivants construisent un résumé. Le tri canonique et tous les prédicats restent inchangés.
+- Même instance et même corps après correctif : 58 ms à froid, puis 41 ms et 36 ms ; phase filtre 30/33/28 ms. La cible de 5 s est tenue. Le miroir dev ne contient toutefois aucun event dans cette fenêtre (`total=0`) alors que son manifeste annonce davantage de sessions que les callflows présents : cohérence du stock dev déclarée **OUVERTE**, sans extrapolation sur les données absentes.
+- Test d'équivalence sur fixture : mêmes identifiants pour une fenêtre couvrante et zéro construction de résumé pour une fenêtre hors données. Mutation rétablissant l'ancien ordre : échec attendu (`left: 2`, `right: 0`).
+
 ## OIRAN API 2.21.49 + session-engine 0.5.20 — 2026-11-18 — rattachement SBI par fenêtre de temps (règle des sondes pro)
 
 Upgrade **patch**, basé sur 2.21.47 (`9100bb1`). 2.21.48 réservée au lot HPACK de DEVMAT. Décision Sadok du 18/11 : « on fait exactement comme les prope pro ».
