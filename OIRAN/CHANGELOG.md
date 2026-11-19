@@ -61,9 +61,48 @@ python3 /tmp/audit.py OIRAN/vtap/Cargo.lock  → OK : 53 packages, 0 exigent rus
 - IE 60/67/70/79/133 : forme longue (`v[0] & 0x80 != 0`) → statut Partial avec marqueur `length_form=unsupported`. **OUVERT NON-BLOQUANT** jusqu'à trame prod qui dépasserait 128 items.
 - Chemin de re-décodage lab (replay pcap → events) : **OUVERT**, mesure par ANR1/ANR2 hors scope CLAUDE2.
 
+## OIRAN API 2.21.64 — 2026-11-19 — fusion HPACK/préchauffage et comptage callflow enrichi
+
+Upgrade **patch** sans déploiement, basé sur 2.21.62 (`8eeadf2`) et 2.21.63 (`68b3348`). 2.21.63 inclut déjà les lots filtre 2.21.56 et cache de lignes 2.21.61.
+
+- Fusionne le carry HPACK isolé de 2.21.62 avec le préchauffage borné après publication de 2.21.63.
+- Ferme l'écart de l'essai 7 : le callflow persisté porte 67 events, puis la réconciliation à la lecture ajoute cinq siblings PFCP N4 uniques depuis les shards. `pagination.returned_events` et `pagination.total_events` sont désormais recalculés après cet enrichissement et annoncent 72, comme la liste réellement servie.
+- Test de non-régression sur le chemin physique `CaptureManager` : un callflow persisté à deux events enrichi d'un sibling PFCP doit servir trois events et annoncer `returned_events=total_events=3`.
+
 ## OIRAN API 2.21.62 — 2026-11-18 — HPACK seul sur la production 2.21.57 (isolation de l'écart mémoire 2.21.59)
 
 Upgrade **patch**. 2.21.59 (fusion du lot du soir) a été retirée de la prod : `MemoryPeak` 3 987 660 800 contre 3 238 051 840 en 2.21.57 (ANR2 #10 6992115760). Pour isoler la cause, cette version ne fusionne **que** 2.21.58 (DEVMAT `1c61086`, carry HPACK ordonné par le ring, carry jetable hors ring) sur 2.21.57 (`c1f2798`). Le préchauffage des index de 2.21.56 n'y est **pas**. Conflits limités aux versions, au Cargo.lock et au CHANGELOG.
+
+## OIRAN API 2.21.63 + live-probe 0.6.24 + session-engine 0.5.24 — 2026-11-18 — préchauffage après publication sans chevauchement RSS
+
+Upgrade **patch**, basé sur 2.21.61 (`c153103`).
+
+- Audit physique : le préchauffage de démarrage lançait les indexeurs compacts pendant la première publication continue. Le pic cgroup était atteint avant le callback de publication ; les structures de publication et les caches de lecture coexistaient donc inutilement.
+- Le démarrage avec import continu reporte désormais explicitement le préchauffage au callback synchrone de publication. Les traces RSS avant libération du tas, après libération et après préchauffage rendent tout report observable.
+- Une publication continue n'effectue plus deux `upsert_dataset` successifs du même dataset : le dataset est déplacé une seule fois vers le registre et l'observateur n'est notifié qu'une fois.
+- Le `commit_seq.txt` de l'import incrémental est maintenant incrémenté dans le répertoire publié, et non perdu avec `.dataset-next` ; l'invalidation sub-seconde des lignes préchauffées redevient effective.
+- Le callback attend, sous la garde lourde, que les index compacts soient prêts avant de figer les lignes du filtre. Une borne explicite de 120 s produit `SESSIONS_FILTER_PREWARM_INDEX_TIMEOUT` au lieu d'un report silencieux.
+- Pour le JSONL plat de plusieurs Gio, la passe initiale du moteur de sessions et chacun des lots de callflows marquent toutes les 16 Mio déjà consommées `POSIX_FADV_DONTNEED` ; les petits shards sont libérés à EOF. Leur cache fichier propre ne s'accumule plus jusqu'à la fin du fichier et ne chevauche plus le commit/préchauffage. L'observateur entre explicitement dans le runtime Tokio capturé au démarrage avant de lancer les workers d'index.
+- La construction des index compacts read-time et PFCP applique la même fenêtre d'éviction de 16 Mio, afin que le préchauffage ne recharge pas ensuite tout le JSONL plat dans le cache cgroup.
+- Tests de mutation : l'import continu ne reconstruit aucun cache au démarrage ; un cycle publié notifie exactement une fois ; le premier filtre reste chaud.
+
+## OIRAN API 2.21.61 — 2026-11-18 — lignes du filtre préchauffées après publication
+
+Upgrade **patch**, basé sur 2.21.59 (`f1012b8`).
+
+- Cause auditée : les index de filtrage et de parcours étaient préchauffés, mais le premier `POST /sessions/filter {"limit":100}` reconstruisait encore jusqu'à 100 entrées `ListRowCache`. Chaque miss relisait et parsait le callflow, appliquait le read-time patch et extrayait les identités avant de servir la page.
+- Le callback synchrone de publication préchauffe maintenant la partie stable et cacheable des lignes live sous le même verrou lourd exclusif. Le parcours abonné, le vault et l'hydratation tshark restent hors préchauffage et sont ajoutés à la requête comme auparavant.
+- Si l'index compact du read-time patch n'est pas prêt, les lignes sont explicitement reportées et ses workers sont déclenchés ; aucune ligne non patchée n'est figée dans le cache.
+- L'audit `OIRAN_SESSIONS_FILTER_PHASE_AUDIT=1` détaille les hits/miss de ligne et la construction de page sans journaliser d'identité.
+- Test de non-régression : réponse froide et réponse préchauffée identiques octet pour octet ; le premier filtre après préchauffage ne reconstruit aucune ligne. Mutation : retirer le préchauffage des lignes rend le test rouge.
+
+## OIRAN API 2.21.59 + live-probe 0.6.23 — 2026-11-18 — fusion du lot du soir (un seul déploiement)
+
+Upgrade **patch**. Fusion, sans changement de logique, de trois lots relus :
+- **2.21.57** (`c1f2798`, en production) : rattachement SBI (clés exactes, pseudonyme relu dans l'URI, fenêtre de temps en dernier recours, comptabilité complète) ;
+- **2.21.56** (ANR1, `a896dd1`) : `/sessions/filter` sur des bornes de temps indexées, index filtre et index de parcours préchauffés à la fin de la publication ;
+- **2.21.58** (DEVMAT, `1c61086`) : carry HPACK SBI ordonné par `(run_id, seq)` du ring dumpcap, continuité stricte, carry jetable pour les segments hors ring, univers de fichiers SBI inchangé.
+Conflits limités aux versions, au Cargo.lock et au CHANGELOG. live-probe passe en 0.6.23, au-dessus des 0.6.20 (ANR1) et 0.6.22 (DEVMAT).
 
 ## OIRAN API 2.21.57 + session-engine 0.5.23 — 2026-11-18 — comptabilité SBI complète
 
@@ -74,6 +113,17 @@ Constat ANR2 (#10 6989585318) : avec 2.21.55, `time_window` passe de 1504 à 456
 - Les quatre compteurs couvrent chaque SBI parcouru par le rattachement : la somme est comparable d'une version à l'autre.
 - Aucune règle de rattachement modifiée.
 - Test : la somme des quatre compteurs égale le nombre de SBI de la fixture.
+## OIRAN API 2.21.56 + live-probe 0.6.20 — 2026-11-18 — index filtre préchauffés au commit de publication
+
+Upgrade **patch**, basé sur 2.21.55 (`b94e84d`) et intégrant le filtre temporel indexé de 2.21.52 (`5a04dac`).
+
+- Audit sur copie physique du stock complet (`dataset_manifest.json` SHA-256 `a11b2c9cd68ea91a51a78b8449371ef2a76bcaed589984b1a933027344c746be`) : processus neuf, premier appel fenêtre = 3,186679 s, dont 1 319 ms de reconstruction `SessionFilterIndex`, 1 105 ms de reconstruction `JourneyIndex` et 757 ms de page ; premier appel sans fenêtre sur un second processus neuf = 4,096253 s, dont 1 428 ms + 1 122 ms pour les deux index et 1 528 ms pour 100 summaries. La cause « index payés par le premier appel post-publication » est confirmée par mesure.
+- `CaptureManager` notifie maintenant l'API synchroniquement après l'upsert atomique du dataset. L'API prend le même verrou lourd en exclusif, reconstruit `SessionFilterIndex` et `JourneyIndex`, puis seulement laisse le worker annoncer `phase=end`.
+- Au démarrage, le même préchauffage est tenté avant l'ouverture du listener. Si une publication tient déjà le verrou, le report est explicite et son callback de commit prend le relais ; aucun garde ne se saute en silence.
+- Pendant publication ou préchauffage, `/sessions/filter` conserve le contrat 503 immédiat `HEAVY_WORK_IN_PROGRESS` + `Retry-After` ; aucun cache partiel n'est servi.
+- `OIRAN_SESSIONS_FILTER_PHASE_AUDIT=1` journalise les phases et le statut hit/rebuild sans donnée d'identité.
+- Gate sur la même copie physique, processus neuf et index préchauffés avant listener : premier appel fenêtre = 1,108443 s ; premier appel sans fenêtre (`limit: 100`) sur un second processus neuf = 1,973967 s. Les deux bornes locales (< 2 s / < 5 s) sont tenues.
+- Tests : équivalence temporelle inchangée ; le premier filtre après préchauffage ne reconstruit aucun index. Mutation : retirer un appel de préchauffage rend le test rouge via les compteurs de rebuild.
 
 ## OIRAN API 2.21.55 + session-engine 0.5.22 — 2026-11-18 — pseudonyme SBI relu dans l'URI sanitisée
 
@@ -83,6 +133,14 @@ Cause prouvée par ANR2 (#10 6988143045, B1, 10/10 exemples) : des SBI stockés 
 - `attach_sbi_to_sessions` relit le pseudonyme dans `sbi.request_uri` quand l'identifiant manque. Lecture stricte, fail-closed : `psn-` + 32 hex minuscules, un seul pseudonyme distinct par URI. Appliqué à la publication, donc couvre le stock existant ; aucune identité en clair n'est lue.
 - Règles de rattachement inchangées : clé exacte unique, puis fenêtre en dernier recours.
 - Test : un SBI historique sans identifiant rattache par clé exacte ; une URI non conforme n'est pas rattachée. Mutation : retirer la relecture rend le test rouge.
+
+## OIRAN API 2.21.52 — 2026-11-18 — fenêtre sessions indexée, sans relecture des callflows
+
+- `SessionFilterIndex` conserve désormais les bornes temporelles fermées de chaque session pendant sa construction.
+- `POST /api/v1/sessions/filter` applique `time_window` depuis ces bornes en O(1) par session et ne recharge aucun callflow pour une requête fenêtre seule, y compris avec `limit: 0`.
+- Les filtres étendus qui ne dépendent pas du résumé construisent désormais les résumés uniquement pour la page servie.
+- Le garde mémoire existant reste strict : pendant une publication, la route répond immédiatement `503 HEAVY_WORK_IN_PROGRESS` avec `Retry-After` au lieu d'attendre ou d'expirer.
+- Tests : équivalence du résultat, bornes inclusives et garde de mutation qui devient rouge si une résolution de flow par session est réintroduite.
 ## OIRAN API 2.21.58 + live-probe 0.6.22 — 2026-11-18 — carry HPACK : carry jetable pour hors-ring, non-contamination du carry ring même sur 5-tuple identique (ordre #9 6989701705)
 
 Correctif du dernier défaut 2.21.54 (ordre #9 6989701705) : le hors-ring contaminait le carry **partagé** du ring. Même branche `fix/oiran-2.21.53-hpack-carry-seq`, nouveau commit, pas de force-push, aucun geste lab.

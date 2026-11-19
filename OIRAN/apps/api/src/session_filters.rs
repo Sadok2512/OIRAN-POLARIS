@@ -10,6 +10,8 @@
 //!   `*_pseudonym` dans `decoded_ie_tree` (déjà anonymisés côté décodeur)
 //! * `has_failure` — vrai si au moins un événement a `semantic_status =
 //!   FAILURE`
+//! * `first_timestamp_ns` / `last_timestamp_ns` — bornes temporelles de la
+//!   session, calculées une seule fois pendant la construction de l'index
 //!
 //! Mémoire : chaque entrée coûte O(messages uniques + causes uniques +
 //! pseudonymes uniques) par session — de l'ordre du kilooctet. Pour
@@ -79,6 +81,11 @@ pub struct SessionFilterEntry {
     pub causes: BTreeSet<(String, String, bool)>, // (domain, value, is_failure)
     pub pseudonyms: BTreeSet<String>,
     pub has_failure: bool,
+    /// 2.21.52 — intervalle temporel fermé de la session. Les timestamps
+    /// invalides sont ignorés ; une session sans timestamp valide ne matche
+    /// aucune fenêtre explicite.
+    pub first_timestamp_ns: Option<i128>,
+    pub last_timestamp_ns: Option<i128>,
     /// 2.10.1 (devmat review) : ancre de pagination canonique.
     /// `anchor_capture_id` = min capture_id string observé sur
     /// les événements de la session (lexicographique stable).
@@ -127,6 +134,20 @@ impl SessionFilterIndex {
             .flat_map(|event| event.packet_references.iter().map(|p| p.packet_number))
             .min()
             .unwrap_or(0);
+        let mut timestamp_bounds = flow
+            .events
+            .iter()
+            .filter_map(|event| event.timestamp_ns.parse::<i128>().ok());
+        let first_timestamp = timestamp_bounds.next();
+        let (first_timestamp_ns, last_timestamp_ns) = match first_timestamp {
+            Some(first) => timestamp_bounds.fold((Some(first), Some(first)), |(min, max), ts| {
+                (
+                    min.map(|value| value.min(ts)),
+                    max.map(|value| value.max(ts)),
+                )
+            }),
+            None => (None, None),
+        };
         let mut entry = SessionFilterEntry {
             session_id: flow.session_id.clone(),
             interfaces: flow.interfaces.clone(),
@@ -134,6 +155,8 @@ impl SessionFilterIndex {
             causes: BTreeSet::new(),
             pseudonyms: BTreeSet::new(),
             has_failure: false,
+            first_timestamp_ns,
+            last_timestamp_ns,
             anchor_capture_id,
             first_packet_number,
         };
@@ -192,6 +215,24 @@ impl SessionFilterIndex {
 
     pub fn entry(&self, session_id: &str) -> Option<&SessionFilterEntry> {
         self.sessions.get(session_id)
+    }
+
+    /// 2.21.52 — préfiltre temporel O(1), sans relecture du callflow.
+    /// Une session matche lorsque son intervalle fermé `[premier, dernier]`
+    /// chevauche la fenêtre demandée.
+    pub fn overlaps_time_window(
+        &self,
+        session_id: &str,
+        from_ns: Option<i128>,
+        to_ns: Option<i128>,
+    ) -> bool {
+        let Some(entry) = self.sessions.get(session_id) else {
+            return false;
+        };
+        let (Some(first), Some(last)) = (entry.first_timestamp_ns, entry.last_timestamp_ns) else {
+            return false;
+        };
+        from_ns.map_or(true, |from| last >= from) && to_ns.map_or(true, |to| first <= to)
     }
 
     /// Filtre les sessions en ET logique. `messages` et `causes`
@@ -700,6 +741,36 @@ mod tests {
             Some(("cap-a", 100u64, "alpha"))
         );
         assert_eq!(index.pagination_key("mid"), Some(("cap-b", 1u64, "mid")));
+    }
+
+    #[test]
+    fn time_window_uses_indexed_session_bounds_without_events_reload() {
+        let mut first = event(
+            "e-first",
+            "N2",
+            "NGAP",
+            "InitialUEMessage",
+            serde_json::json!([]),
+            "NORMAL",
+        );
+        first.timestamp_ns = "100".into();
+        let mut last = event(
+            "e-last",
+            "N2",
+            "NGAP",
+            "UEContextRelease",
+            serde_json::json!([]),
+            "NORMAL",
+        );
+        last.timestamp_ns = "200".into();
+        let index =
+            SessionFilterIndex::from_flows(&[flow("bounded", vec![first, last], vec!["N2"])]);
+
+        assert!(index.overlaps_time_window("bounded", Some(100), Some(200)));
+        assert!(index.overlaps_time_window("bounded", Some(150), Some(150)));
+        assert!(!index.overlaps_time_window("bounded", Some(201), None));
+        assert!(!index.overlaps_time_window("bounded", None, Some(99)));
+        assert!(!index.overlaps_time_window("missing", None, None));
     }
 
     #[test]

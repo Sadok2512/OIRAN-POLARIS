@@ -574,7 +574,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "live-probe"
-version = "0.6.22"
+version = "0.6.24"
 dependencies = [
  "callflow-renderer",
  "callflow-schema",
@@ -880,9 +880,10 @@ dependencies = [
 
 [[package]]
 name = "session-engine"
-version = "0.5.23"
+version = "0.5.24"
 dependencies = [
  "event-schema",
+ "libc",
  "serde",
  "serde_json",
 ]

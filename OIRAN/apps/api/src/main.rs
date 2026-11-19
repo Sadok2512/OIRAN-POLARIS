@@ -1,4 +1,6 @@
-use oiran_api::{router, warm_health_snapshot, ApiConfig, AppState};
+use oiran_api::{
+    install_session_filter_cache_prewarm, router, warm_health_snapshot, ApiConfig, AppState,
+};
 use std::{env, net::SocketAddr, path::PathBuf};
 
 #[tokio::main]
@@ -20,6 +22,7 @@ async fn run() -> Result<(), String> {
     }
     let workspace = PathBuf::from(workspace);
     let state = AppState::load(ApiConfig::from_workspace(&workspace))?;
+    install_session_filter_cache_prewarm(&state);
     let dist = workspace.join("apps/web/dist");
     let frontend = dist.is_dir().then_some(dist);
     warm_health_snapshot(&state);
