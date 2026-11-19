@@ -2,6 +2,14 @@
 
 ## OIRAN API 2.21.78 — 2026-11-19 — débit live GTP-U par seconde / session / QFI (SSE indépendant) (ordre #9 7013448739, corrections #9 7013902603)
 
+### Corrections suite à l'ordre 7014327787 (filigrane + rattrapage startup)
+
+3. **Double comptage sous charge — fermé.** L'ancien dédoublonnage via `prior: HashSet<event_id>` global avec `clear()` à 200 000 doublonnait les bytes du fichier courant sous iperf (clear → tous les events paraissent neufs). Correctif : **filigrane `(packet_number, event_id)` par fichier** stocké dans `PcapFileState`. L'event n'est routé que si `(packet_number, event_id) > (last_packet_number, last_event_id)` lexicographiquement — ne se vide **jamais**, disparaît avec le fichier. La méthode `PcapFileState::consume` avance le filigrane et retourne `true`/`false` dans la même opération. Tests :
+   - `watermark_prevents_double_counting_under_load_above_200k_packets` : 250 000 events sur un fichier, 5 passages avec les mêmes bytes → passage 1 route 250 000, passages 2-5 routent 0.
+   - `watermark_lets_multiple_events_on_same_packet_pass` : deux events partageant un `packet_number` mais avec `event_id` différents passent tous les deux (ordre lex).
+
+4. **Rattrapage ring au démarrage — fermé.** Au premier poll, un ring dumpcap de N fichiers forçait N décodages successifs. Correctif : au premier passage (`initial_catchup_done == false`), **tous** les pcapng d'une interface **SAUF le plus récent** sont marqués comme déjà consommés (`consumed_bytes = size`, `last_packet_number = u64::MAX`), sans décodage. Le débit commence « maintenant ». La borne dynamique de reprise du ring n'est plus un coût au démarrage.
+
 ### Corrections suite au refus 7013902603 (même branche, nouveau commit)
 
 1. **Faux gap à la rotation — fermé.** L'ancienne version comptait `gap = file_size` pour chaque fichier disparu : chaque rotation du ring dumpcap aurait sonné l'alerte. Correctif : `PcapFileState { size, mtime, consumed_bytes }` par fichier. Le `gap` à la disparition est `size - consumed_bytes` → 0 pour un fichier GC'é après lecture intégrale. Tests dédiés :

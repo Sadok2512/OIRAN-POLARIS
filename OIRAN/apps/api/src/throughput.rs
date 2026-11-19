@@ -183,11 +183,47 @@ pub(crate) struct ThroughputRegistry {
 /// taille au dernier `decode_capture_streaming` ayant retourné `Ok`,
 /// `0` si tous les essais ont échoué. Un fichier disparu contribue
 /// `size - consumed_bytes` au gap (= 0 si entièrement consommé).
-#[derive(Clone, Debug)]
+///
+/// 2.21.78 (correction 7014327787) — **filigrane par fichier** :
+/// `last_packet_number` + `last_event_id` identifient le dernier
+/// event déjà routé. Un event re-apparu après un décodage ultérieur
+/// (fichier qui grossit) n'est routé que si
+/// `(packet_number, event_id) > (last_packet_number, last_event_id)`
+/// en ordre lexicographique. Ce filigrane **n'est jamais effacé**,
+/// il disparaît avec le fichier. Supprime le besoin d'un
+/// dédoublonnage global (`prior.clear()` à 200 000 → double comptage
+/// sous charge iperf).
+#[derive(Clone, Debug, Default)]
 pub(crate) struct PcapFileState {
     pub size: u64,
     pub mtime: Option<std::time::SystemTime>,
     pub consumed_bytes: u64,
+    /// Plus grand `packet_references[0].packet_number` déjà routé
+    /// depuis ce fichier. `0` tant qu'aucun event n'a été observé.
+    pub last_packet_number: u64,
+    /// `event_id` du dernier event routé au `last_packet_number`
+    /// courant. Permet la coexistence d'events multiples sur un même
+    /// packet (p.ex. NGAP + NAS enfant) via comparaison lexicographique
+    /// sur `(packet_number, event_id)`.
+    pub last_event_id: String,
+}
+
+impl PcapFileState {
+    /// 2.21.78 (correction 7014327787) — un event doit être routé si
+    /// son `(packet_number, event_id)` dépasse le filigrane. Retourne
+    /// `true` **et** avance le filigrane dans la même opération ; le
+    /// caller n'a pas besoin de synchroniser.
+    pub fn consume(&mut self, packet_number: u64, event_id: &str) -> bool {
+        if packet_number > self.last_packet_number
+            || (packet_number == self.last_packet_number && event_id > self.last_event_id.as_str())
+        {
+            self.last_packet_number = packet_number;
+            self.last_event_id = event_id.to_owned();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl ThroughputRegistry {
@@ -835,6 +871,8 @@ mod tests {
             size: 4096,
             mtime: Some(SystemTime::UNIX_EPOCH),
             consumed_bytes: 4096,
+            last_packet_number: 0,
+            last_event_id: String::new(),
         };
         // 3 polls avec (size, mtime) identiques → 0 incrément.
         for _ in 0..3 {
@@ -861,6 +899,8 @@ mod tests {
             size: 1500,
             mtime: None,
             consumed_bytes: 1500, // lu en entier
+            last_packet_number: 0,
+            last_event_id: String::new(),
         };
         let gap = prev.size.saturating_sub(prev.consumed_bytes);
         if gap > 0 {
@@ -880,6 +920,8 @@ mod tests {
             size: 1500,
             mtime: None,
             consumed_bytes: 500, // seulement 500/1500 consommés (decode erroré)
+            last_packet_number: 0,
+            last_event_id: String::new(),
         };
         let gap = prev.size.saturating_sub(prev.consumed_bytes);
         if gap > 0 {
@@ -891,6 +933,66 @@ mod tests {
         reg.bump_bytes_gap(10);
         let events = collect_events(&reg, "s_gap");
         assert!(events.iter().any(|e| e["kind"] == "gap"));
+    }
+
+    /// 2.21.78 (correction 7014327787 §1) — un fichier qui grossit
+    /// sur N passages avec plus de 200 000 paquets ne doit PAS
+    /// produire de double comptage. Le filigrane `(packet_number,
+    /// event_id)` par fichier garantit qu'un event déjà routé ne l'est
+    /// jamais à nouveau — peu importe la relecture du fichier.
+    ///
+    /// Test unitaire direct sur `PcapFileState::consume` : simule 5
+    /// passages avec le même fichier à 250 000 events, chaque passage
+    /// ré-itère l'ensemble (comme le fait `decode_capture_streaming`).
+    /// Après 5 passages, la somme des bytes passés au `observe_event`
+    /// est exactement celle d'un seul passage.
+    #[test]
+    fn watermark_prevents_double_counting_under_load_above_200k_packets() {
+        let mut state = PcapFileState::default();
+        let total_events = 250_000u64;
+        // Passage 1 : tous les events sont nouveaux.
+        let mut routed_pass1 = 0u64;
+        for pn in 1..=total_events {
+            let event_id = format!("evt-{pn}");
+            if state.consume(pn, &event_id) {
+                routed_pass1 += 1;
+            }
+        }
+        assert_eq!(routed_pass1, total_events);
+        assert_eq!(state.last_packet_number, total_events);
+
+        // Passages 2 à 5 : exactement le même ensemble → 0 route.
+        let mut routed_rest = 0u64;
+        for _pass in 2..=5u32 {
+            for pn in 1..=total_events {
+                let event_id = format!("evt-{pn}");
+                if state.consume(pn, &event_id) {
+                    routed_rest += 1;
+                }
+            }
+        }
+        assert_eq!(
+            routed_rest, 0,
+            "aucun event ré-émis après le premier passage ; filigrane doit bloquer tous les doublons"
+        );
+    }
+
+    /// 2.21.78 (correction 7014327787) — Deux events partageant le
+    /// même `packet_number` (p.ex. NGAP parent + NAS enfant) doivent
+    /// tous les deux être routés, grâce à la comparaison
+    /// lexicographique sur `(packet_number, event_id)`.
+    #[test]
+    fn watermark_lets_multiple_events_on_same_packet_pass() {
+        let mut state = PcapFileState::default();
+        assert!(state.consume(5, "evt-aaa"));
+        assert!(
+            state.consume(5, "evt-bbb"),
+            "même packet, event_id lexicalement > doit passer"
+        );
+        // Mais un event antérieur ou identique est rejeté.
+        assert!(!state.consume(5, "evt-bbb"), "même packet, même event_id = doublon");
+        assert!(!state.consume(5, "evt-aaa"), "event_id lexicalement < = doublon");
+        assert!(!state.consume(4, "evt-zzz"), "packet antérieur = doublon");
     }
 
     /// Cap `MAX_ACTIVE_BUCKETS_PER_SESSION` — au-delà, les octets sont
