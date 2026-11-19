@@ -22,6 +22,22 @@ pub const DEFAULT_TEMPLATE_DURATION_SECONDS: u64 = 60;
 pub const SUPPORT_SUPPORTED: &str = "SUPPORTED";
 pub const SUPPORT_BACKEND_REQUIRED: &str = "BACKEND_REQUIRED";
 pub const SUPPORT_CERTIFICATION_REQUIRED: &str = "CERTIFICATION_REQUIRED";
+/// 0.29.17 (ordre #9 7015853247) — un scénario dont la liste de steps
+/// résolue contient `ims_register` ou `voice_call` ne peut pas tourner
+/// dans Control : l'exécuteur retourne systématiquement 423
+/// `IMS_NOT_AVAILABLE` (voir `lib.rs::execute_step` et pré-validation
+/// de `start_scenario`). Ces builtins (p.ex. `tpl-voice-long`,
+/// `tpl-voice-short`) restent dans le catalogue pour que la commande
+/// SOP SIPp (hors Control) puisse s'y référer, mais la vue
+/// `/scenario-definitions` doit les marquer explicitement non
+/// supportés pour éviter la confusion opérateur.
+pub const SUPPORT_UNSUPPORTED_BACKEND: &str = "UNSUPPORTED_BACKEND";
+/// 0.29.17 — raison stable renvoyée par la vue avec
+/// `support_status=UNSUPPORTED_BACKEND` : le controller n'embarque ni
+/// client SIP ni codec RTP. La production voix passe par la SOP
+/// `docs/SOP_VOIX_SIP_IMS_LITE.md` (SIPp externe dans le netns UE).
+pub const SUPPORT_UNSUPPORTED_BACKEND_REASON_IMS: &str =
+    "IMS_NOT_AVAILABLE: aucun client SIP embarqué";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ScenarioTemplateDescriptor {
@@ -1183,6 +1199,19 @@ pub fn definition_support_status(definition: &ScenarioDefinition) -> &'static st
     SUPPORT_SUPPORTED
 }
 
+/// 0.29.17 (ordre #9 7015853247) — un scénario demande un client SIP
+/// si l'un de ses steps (ou sous-steps `repeat`) est `ims_register`
+/// ou `voice_call`. Audit #9 `7015668134` : l'exécuteur retourne
+/// `IMS_NOT_AVAILABLE` pour les deux, aucun client SIP n'est embarqué.
+pub fn definition_requires_sip_client(definition: &ScenarioDefinition) -> bool {
+    definition.steps.iter().any(step_requires_sip_client)
+}
+
+fn step_requires_sip_client(step: &ScenarioStep) -> bool {
+    matches!(step.step_type.as_str(), "ims_register" | "voice_call")
+        || step.steps.iter().any(step_requires_sip_client)
+}
+
 fn step_requires_udp_rate_duration_backend(step: &ScenarioStep) -> bool {
     step.parameters
         .get("protocol")
@@ -1804,5 +1833,38 @@ mod tests {
         );
         assert_eq!(first_catalog, second_catalog);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 0.29.17 (ordre #9 7015853247) — `definition_requires_sip_client`
+    /// doit détecter `ims_register` et `voice_call` directement (top
+    /// level) ET à l'intérieur d'un `repeat` (cas `tpl-voice-short`).
+    /// Prouve les deux fenêtres de détection et garantit que les
+    /// builtins seedés sont correctement classés.
+    #[test]
+    fn definition_requires_sip_client_detects_voice_steps_at_top_level_and_inside_repeat() {
+        let voice_long = builtin_templates()
+            .into_iter()
+            .find(|t| t.id == "tpl-voice-long")
+            .expect("tpl-voice-long doit être seedé");
+        assert!(
+            definition_requires_sip_client(&voice_long),
+            "tpl-voice-long contient `voice_call` au top level"
+        );
+        let voice_short = builtin_templates()
+            .into_iter()
+            .find(|t| t.id == "tpl-voice-short")
+            .expect("tpl-voice-short doit être seedé");
+        assert!(
+            definition_requires_sip_client(&voice_short),
+            "tpl-voice-short contient `voice_call` à l'intérieur d'un `repeat`"
+        );
+        let small = builtin_templates()
+            .into_iter()
+            .find(|t| t.id == "tpl-small-traffic")
+            .expect("tpl-small-traffic doit être seedé");
+        assert!(
+            !definition_requires_sip_client(&small),
+            "tpl-small-traffic n'a aucun step SIP"
+        );
     }
 }

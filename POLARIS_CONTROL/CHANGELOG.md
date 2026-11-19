@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.29.17 (polaris-control-api) — 2026-11-19 — vue `/scenario-definitions` marque `tpl-voice-*` UNSUPPORTED_BACKEND (ordre #9 7015853247)
+
+Audit #9 `7015668134` a prouvé que les builtins `tpl-voice-long` / `tpl-voice-short` ne tournent pas : l'exécuteur retourne systématiquement 423 `IMS_NOT_AVAILABLE` (`lib.rs::execute_step`, `start_scenario`), et aucun client SIP n'est embarqué (0 match `grep -rn "sip\|rtp\|kamailio\|sipp"` dans le workspace). La définition reste dans le catalogue pour que la SOP SIPp externe puisse s'y référer, mais la vue `/scenario-definitions` doit l'exposer explicitement pour éviter la confusion opérateur.
+
+### Scope
+
+- **Nouveaux constants** dans `scenario_definitions` :
+  - `SUPPORT_UNSUPPORTED_BACKEND = "UNSUPPORTED_BACKEND"` (nouveau statut, distinct de `BACKEND_REQUIRED` qui signifie « backend nécessaire mais absent »).
+  - `SUPPORT_UNSUPPORTED_BACKEND_REASON_IMS = "IMS_NOT_AVAILABLE: aucun client SIP embarqué"` (raison stable).
+- **Nouvelle fonction** `scenario_definitions::definition_requires_sip_client(&ScenarioDefinition) -> bool` — détecte `ims_register` / `voice_call` au top-level ET à l'intérieur d'un `repeat` (recherche récursive via `step.steps`).
+- **Vue** `scenario_definition_view` (`lib.rs:9274+`) ajoute deux champs **quand** `definition_requires_sip_client` est vrai :
+  - `support_status: "UNSUPPORTED_BACKEND"`.
+  - `support_reason: "IMS_NOT_AVAILABLE: aucun client SIP embarqué"`.
+- Les champs ne sont **pas** présents pour les scénarios data (preuve par test `view_does_not_mark_data_builtin_unsupported`).
+- **Catalogue inchangé** : ni l'`id`, ni la `version`, ni les steps des builtins voix ne sont modifiés. La migration builtin idempotente de 0.19.3 continue de fonctionner.
+
+### Tests ajoutés
+
+- `scenario_definitions::tests::definition_requires_sip_client_detects_voice_steps_at_top_level_and_inside_repeat` — vérifie la détection sur `tpl-voice-long` (top level) et `tpl-voice-short` (dans `repeat`), et son absence sur `tpl-small-traffic`.
+- `scenario_definition_view_tests::view_marks_voice_builtins_unsupported_backend` — `tpl-voice-long` et `tpl-voice-short` ont bien `support_status` + `support_reason` dans leur vue, sans altération d'`id`/`version`.
+- `scenario_definition_view_tests::view_does_not_mark_data_builtin_unsupported` — `tpl-small-traffic` n'a pas ces champs.
+
+### Référence
+
+- Audit : #9 `7015668134`.
+- Ordre : #9 `7015853247`.
+- Base : `fix/oiran-2.21.74-filter-ready-503` @ `29fe4e3` (PROD).
+
 ## 0.29.16 (polaris-control-api) — 2026-11-04 — privacy contract lock-down for `subscriber_pseudonym` / `identity_pseudonym`
 
 - `privacy_safe_value()` adds a single lock-down exception agreed with

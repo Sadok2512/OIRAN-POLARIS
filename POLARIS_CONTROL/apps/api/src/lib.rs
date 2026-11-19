@@ -9285,8 +9285,93 @@ fn scenario_definition_view(definition: &ScenarioDefinition) -> Value {
             "backend_support".into(),
             json!(definition_support_status(definition)),
         );
+        // 0.29.17 (ordre #9 7015853247) — expose `support_status` et
+        // `support_reason` quand un step `ims_register`/`voice_call`
+        // est présent. Aucun client SIP n'est embarqué dans Control
+        // (audit #9 7015668134) : l'exécuteur renvoie systématiquement
+        // IMS_NOT_AVAILABLE. Le builtin reste dans le catalogue pour
+        // que la SOP SIPp externe puisse s'y référer, mais la vue
+        // signale explicitement que le scénario ne peut pas tourner
+        // via Control.
+        if scenario_definitions::definition_requires_sip_client(definition) {
+            object.insert(
+                "support_status".into(),
+                json!(scenario_definitions::SUPPORT_UNSUPPORTED_BACKEND),
+            );
+            object.insert(
+                "support_reason".into(),
+                json!(scenario_definitions::SUPPORT_UNSUPPORTED_BACKEND_REASON_IMS),
+            );
+        }
     }
     value
+}
+
+#[cfg(test)]
+mod scenario_definition_view_tests {
+    use super::*;
+    use scenario_definitions::{
+        builtin_templates, SUPPORT_UNSUPPORTED_BACKEND, SUPPORT_UNSUPPORTED_BACKEND_REASON_IMS,
+    };
+
+    /// 0.29.17 (ordre #9 7015853247) — la vue
+    /// `/scenario-definitions` doit marquer `tpl-voice-long` et
+    /// `tpl-voice-short` avec `support_status: UNSUPPORTED_BACKEND`
+    /// et `support_reason: IMS_NOT_AVAILABLE: aucun client SIP
+    /// embarqué`, sans les retirer du catalogue, sans changer leur
+    /// `id` ni leur `version`.
+    #[test]
+    fn view_marks_voice_builtins_unsupported_backend() {
+        for id in ["tpl-voice-long", "tpl-voice-short"] {
+            let definition = builtin_templates()
+                .into_iter()
+                .find(|t| t.id == id)
+                .expect("builtin présent");
+            let stored_id = definition.id.clone();
+            let stored_version = definition.version;
+            let view = scenario_definition_view(&definition);
+            let object = view.as_object().expect("view est un objet");
+            assert_eq!(
+                object.get("id").and_then(Value::as_str),
+                Some(stored_id.as_str()),
+                "id du builtin non altéré"
+            );
+            assert_eq!(
+                object.get("version").and_then(Value::as_u64),
+                Some(u64::from(stored_version)),
+                "version du builtin non altérée"
+            );
+            assert_eq!(
+                object.get("support_status").and_then(Value::as_str),
+                Some(SUPPORT_UNSUPPORTED_BACKEND),
+                "{id} doit porter support_status=UNSUPPORTED_BACKEND"
+            );
+            assert_eq!(
+                object.get("support_reason").and_then(Value::as_str),
+                Some(SUPPORT_UNSUPPORTED_BACKEND_REASON_IMS),
+                "{id} doit porter la raison IMS_NOT_AVAILABLE"
+            );
+            // Preuve négative : les scénarios data n'ont PAS ces champs.
+        }
+    }
+
+    #[test]
+    fn view_does_not_mark_data_builtin_unsupported() {
+        let definition = builtin_templates()
+            .into_iter()
+            .find(|t| t.id == "tpl-small-traffic")
+            .expect("tpl-small-traffic seedé");
+        let view = scenario_definition_view(&definition);
+        let object = view.as_object().expect("view est un objet");
+        assert!(
+            !object.contains_key("support_status"),
+            "tpl-small-traffic n'a pas de step SIP → pas de champ support_status"
+        );
+        assert!(
+            !object.contains_key("support_reason"),
+            "tpl-small-traffic n'a pas de step SIP → pas de champ support_reason"
+        );
+    }
 }
 
 async fn list_scenario_templates() -> Json<Value> {
