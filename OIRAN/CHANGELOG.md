@@ -1,5 +1,9 @@
 # Changelog
 
+## OIRAN API 2.21.68 + live-probe 0.6.25 — 2026-11-19 — indicateur `queue_occupancy_percent` honnête + quarantaine hors de `pending_segments` (ordre #9 7006248573)
+
+*Entrée intégrée dans le train 2.21.72 ci-dessous (merge --no-ff).*
+
 ## OIRAN API 2.21.66 + decoder-ngap 0.6.3 — 2026-11-19 — NGAP partiels : NGSetup + libération de session (ordre #9 7004955176)
 
 Branche `fix/oiran-2.21.66-ngap-setup-release`, base `8eeadf2` (`fix/oiran-2.21.62-hpack-only`). Pas de déploiement, pas de force-push, aucun geste lab.

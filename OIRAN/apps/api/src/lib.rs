@@ -1882,6 +1882,13 @@ fn metrics_blocking(state: &AppState) -> Json<Value> {
         "observed_at_epoch_s":epoch_seconds(),"mode":if active.is_empty(){"HISTORICAL_DATASET_ANALYSIS"}else{"LIVE_CAPTURE"},
         "packet_rate_pps":latest_metrics.map(|m|m.packets_per_second),"bitrate_bps":latest_metrics.map(|m|m.bits_per_second),"decode_rate_eps":latest_metrics.map(|m|m.decode_events_per_second),
         "packet_drops":latest_metrics.and_then(|m|m.packet_drops),"capture_queue_utilization_percent":latest_metrics.and_then(|m|m.queue_occupancy_percent),
+        // 2.21.68 (ordre #9 7006248573) : séparation stock vs file.
+        // `capture_queue_utilization_percent` reste pour back-compat UI
+        // mais sourcée sur la VRAIE `queue_occupancy_percent` (0-100 %).
+        // Le stock part dans `capture_owned_bytes_percent` SANS clamp
+        // (peut dépasser 100 % — c'est la vérité). ANR2 7005944378 §2 :
+        // 562 % jadis masqués par `.min(100.0)` sont désormais lisibles.
+        "capture_owned_bytes_percent":latest_metrics.and_then(|m|m.owned_bytes_percent),
         "active_captures":active.len(),"active_sessions":live_sessions,"historical_sessions":state.inner.flows.len(),
         "historical_events":source_events,"live_events":live_events,"decode_errors":decode_errors,
         "last_ingested_epoch_ms":latest_metrics.and_then(|m|m.last_ingested_epoch_ms),
@@ -1912,6 +1919,12 @@ fn metrics_blocking(state: &AppState) -> Json<Value> {
         "zero_event_segments":latest_metrics.map(|m|m.zero_event_segments).unwrap_or(0),
         "zero_event_segment_paths":latest_metrics.map(|m|m.zero_event_segment_paths.clone()).unwrap_or_default(),
         "orphan_fingerprints_recovered":latest_metrics.map(|m|m.orphan_fingerprints_recovered).unwrap_or(0),
+        // 2.21.68 (ordre #9 7006248573) : segments quarantinés visibles
+        // dans le dernier scan (PCAPNG tronqués, décodeurs en échec, etc.).
+        // Sortis de `pending_segments` : ils ne sont plus en attente mais
+        // en dette de quarantaine, exposée séparément pour l'opérateur.
+        "quarantined_segments":latest_metrics.map(|m|m.quarantined_segments).unwrap_or(0),
+        "quarantined_segment_paths":latest_metrics.map(|m|m.quarantined_segment_paths.clone()).unwrap_or_default(),
         "capture_state":capture_state_label,
         "capture_stop_reason":capture_stop_reason,
         "capture_error":capture_error,
