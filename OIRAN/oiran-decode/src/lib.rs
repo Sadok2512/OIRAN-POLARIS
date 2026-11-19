@@ -850,6 +850,7 @@ fn register_sdp_flows_from_sip(
         let mut sdp_c: Option<String> = None;
         let mut sdp_port: Option<u16> = None;
         let mut sdp_pt: Option<u8> = None;
+        let mut sdp_clock_rate_hz: Option<u32> = None;
         for id in &event.session_identifiers {
             if id.name == "sip_call_id" {
                 call_id = Some(id.value.clone());
@@ -868,6 +869,13 @@ fn register_sdp_flows_from_sip(
                         .and_then(|v| v.split(',').next())
                         .and_then(|first| first.parse::<u8>().ok());
                 }
+                // 2.21.79 (CLAUDE1, ordre #9 7012275179 §1) — propage le
+                // `clock_rate` SDP vers l'agrégateur RTP pour le calcul
+                // de jitter sur PT dynamique.
+                "sdp.m.audio.rtpmap_clock_rate_hz" => {
+                    sdp_clock_rate_hz =
+                        ie.value.as_deref().and_then(|v| v.parse::<u32>().ok());
+                }
                 _ => {}
             }
         }
@@ -877,6 +885,7 @@ fn register_sdp_flows_from_sip(
                 port,
                 call_id: cid,
                 payload_type: sdp_pt,
+                clock_rate_hz: sdp_clock_rate_hz,
             });
         }
     }
