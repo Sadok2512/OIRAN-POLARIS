@@ -2,6 +2,34 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.14.4 — 2026-11-19 — p900 2.8.7 : non-régression contrat `/identities` (ordre #9 7012275179)
+
+Bundle p900 2.8.7 déployé par ANR1 après `oiran-api 2.21.76`. Aucun déploiement UI séparé.
+
+### Scope vérifié
+
+- Grep du frontend : **aucun composant, service, test ou route ne consomme aujourd'hui `/identities`**. L'ancien `GET /identities?q=...` et le nouveau `POST /identities/lookup` ne sont utilisés que par des opérateurs via outillage externe (curl/scripts) pour cette revue.
+  - `grep -rn "/identities" OIRAN/apps/web/src/` : 0 match actif (seul `utils/identityIes.ts` nomme des IEs 3GPP, pas la route).
+  - `grep -rn "api.*identities\|fetch.*identities" OIRAN/apps/web/src/` : 0 match.
+- Côté UX, la saisie IMSI/MSISDN/IMEI pour une live trace reste exclusivement sur `POST /live/traces` (déjà body-based, compliant L2 depuis 2.16.0). Aucune bascule client n'est requise pour 2.8.7.
+
+### Préparation future (si besoin UX)
+
+Quand la p900 ajoutera un formulaire de lookup `/identities` dédié, la convention sera **impérativement** :
+```ts
+await api('/identities/lookup', {
+  method: 'POST',
+  body: JSON.stringify({ value, page: 1, page_size: 50 }),
+  headers: { 'content-type': 'application/json', 'x-csrf-token': csrfOf(bearerToken) },
+});
+```
+— la valeur ne doit **jamais** figurer dans une query string, un router URL, ni un `history.pushState`.
+
+### Versions
+
+- `@oiran/web` : 2.14.2 → 2.14.4 (bump mineur ; back-compat JSON Metrics inchangé). Le bump `2.14.3` sur `feat/p900-2.8.6-capture-stock` (branche feature) n'est pas mergé sur la prod — si ANR1 fusionne les deux, la version finale sera `2.14.4`.
+- **p900 : 2.8.7** (bundle ANR1, correspondance éditoriale via cette entrée).
+
 ## 2.9.0 — 2026-11-07 (ANR2 bandwidth — ETag/304 polling + version footer)
 
 - `services/api.ts` now caches `ETag` per GET URL and sends

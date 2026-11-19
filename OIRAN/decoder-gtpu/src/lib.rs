@@ -176,6 +176,24 @@ impl ProtocolDecoder for GtpuDecoder {
                         pseudonymized: false,
                     });
                 }
+                // 2.21.76 (ordre #9 7012275179 §CLAUDE2.D-09) — QFI
+                // propagé dans `session_identifiers` du event GTP-U
+                // normalisé. Avant 2.21.74 il était uniquement dans
+                // l'IE « PDU Session Container » au format
+                // `pdu_type=X,qfi=Y`, inexploitable par la session-engine
+                // comme clé d'agrégation. Premier QFI valide gagné (une
+                // seule session par tunnel dans le cas nominal).
+                if let Some(qfi) = header
+                    .extensions
+                    .iter()
+                    .find_map(|ext| ext.qfi)
+                {
+                    ids.push(NamedValue {
+                        name: "qfi".into(),
+                        value: qfi.to_string(),
+                        pseudonymized: false,
+                    });
+                }
                 if header.message_type == 255 {
                     if let Some((source, destination)) = inner_ipv4_addresses(
                         &input.payload
@@ -465,5 +483,57 @@ mod tests {
                     && identifier.value == expected.as_str()
             }));
         }
+    }
+
+    /// 2.21.76 (ordre #9 7012275179 §CLAUDE2.D-09) — un paquet GTP-U N3
+    /// avec extension PDU Session Container (type `0x85`) et un QFI
+    /// doit exposer ce QFI dans `session_identifiers` (`qfi=<n>`). Avant
+    /// 2.21.76 il n'y était pas : seule la représentation texte
+    /// `pdu_type=X,qfi=Y` dans l'IE existait, inexploitable par la
+    /// session-engine comme clé d'agrégation par QFI.
+    #[test]
+    fn qfi_is_propagated_into_session_identifiers_2_21_76() {
+        let packets = vec![];
+        let timestamp = event_schema::ExactTimestamp {
+            seconds: 1,
+            nanoseconds: 0,
+            raw_ticks: 1,
+            resolution_base: 10,
+            resolution_exponent: 9,
+        };
+        let key = event_schema::PseudonymKey::from_bytes([0xaa; 32]);
+        // Paquet du test `extension_and_sequence` : extension 0x85 (PDU
+        // Session Container) portant QFI=9.
+        let payload = [
+            0x36, 0xff, 0, 12, 0, 0, 0, 1, 0, 9, 0, 0x85, 1, 0x10, 0x09, 0, 1, 2, 3, 4,
+        ];
+        let input = DecoderInput {
+            capture_id: "sha256:synthetic",
+            packet_references: &packets,
+            timestamp: &timestamp,
+            interface: "N3",
+            source_endpoint: event_schema::Endpoint {
+                address: "10.0.0.1".into(),
+                port: Some(2152),
+                network_function: Some("gNB".into()),
+            },
+            destination_endpoint: event_schema::Endpoint {
+                address: "10.0.0.2".into(),
+                port: Some(2152),
+                network_function: Some("UPF".into()),
+            },
+            payload: &payload,
+            raw_payload_reference: "sha256:synthetic",
+            pseudonym_key: &key,
+        };
+        let output = GtpuDecoder.decode(&input);
+        let event = &output.events[0];
+        let qfi = event
+            .session_identifiers
+            .iter()
+            .find(|identifier| identifier.name == "qfi")
+            .expect("QFI doit être présent dans session_identifiers");
+        assert_eq!(qfi.value, "9");
+        assert!(!qfi.pseudonymized, "QFI n'est pas une identité, pas pseudo");
     }
 }
