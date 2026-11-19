@@ -253,6 +253,154 @@ fn full_pdu_setup_response_decodes_ie75_and_inner_transfer() {
     assert_eq!(decoded.dl.qfis[0].qfi, 5);
 }
 
+// ===== 2.21.66 (ordre #9 7004955176) — NGSetup + libération de session =====
+//
+// Hex générés par `/tmp/ngap_release_fixtures.py` (pycrate TS 38.413
+// V17.3.0). Valeurs synthétiques : PLMN 001/01, aucun IMSI/MSISDN.
+
+const PDU_NGSETUP_REQUEST: &str =
+    "00150038000004001b00080000f110000000040052400f06006f6972616e2d676e622d6c61620066000d00000000010000f110000000080015400140";
+
+#[test]
+fn ngsetup_request_decodes_global_ran_node_id_and_supported_ta() {
+    let pdu = parse(&bytes(PDU_NGSETUP_REQUEST)).expect("parse NGSetupRequest");
+    assert_eq!(pdu.procedure_code, 21);
+    assert_eq!(pdu.kind, PduKind::Initiating);
+    assert_eq!(pdu.message_name, "NGSetupRequest");
+    assert!(pdu.ies.iter().any(|ie| ie.id == 27), "GlobalRANNodeID present");
+    assert!(pdu.ies.iter().any(|ie| ie.id == 82), "RANNodeName present");
+    assert!(pdu.ies.iter().any(|ie| ie.id == 102), "SupportedTAList present");
+    assert!(pdu.ies.iter().any(|ie| ie.id == 21), "DefaultPagingDRX present");
+}
+
+const PDU_NGSETUP_RESPONSE: &str =
+    "201500330000040001000f06006f6972616e2d616d662d6c616200600008000000f1100210000056400180005000080000f11000000008";
+
+#[test]
+fn ngsetup_response_decodes_served_guami_and_plmn_support() {
+    let pdu = parse(&bytes(PDU_NGSETUP_RESPONSE)).expect("parse NGSetupResponse");
+    assert_eq!(pdu.procedure_code, 21);
+    assert_eq!(pdu.kind, PduKind::SuccessfulOutcome);
+    assert_eq!(pdu.message_name, "NGSetupResponse");
+    assert!(pdu.ies.iter().any(|ie| ie.id == 96), "ServedGUAMIList present");
+    assert!(pdu.ies.iter().any(|ie| ie.id == 80), "PLMNSupportList present");
+}
+
+const PDU_NGSETUP_FAILURE: &str = "4015000e000002000f40020000006b400130";
+
+#[test]
+fn ngsetup_failure_decodes_cause_and_time_to_wait_v10s() {
+    let pdu = parse(&bytes(PDU_NGSETUP_FAILURE)).expect("parse NGSetupFailure");
+    assert_eq!(pdu.procedure_code, 21);
+    assert_eq!(pdu.kind, PduKind::UnsuccessfulOutcome);
+    assert_eq!(pdu.message_name, "NGSetupFailure");
+    let tw = pdu
+        .ies
+        .iter()
+        .find(|ie| ie.id == 107)
+        .expect("TimeToWait IE present");
+    assert_eq!(tw.known_name, Some("TimeToWait"));
+    // Fixture pycrate : v10s (idx 3) → ext(0)+011+pad → 0b00110000 = 0x30.
+    assert_eq!(tw.value, vec![0x30]);
+}
+
+const PDU_UE_CONTEXT_RELEASE_COMMAND: &str =
+    "0029001100000200720004000c0022000f40020100";
+
+#[test]
+fn ue_context_release_command_decodes_ue_ids_and_cause() {
+    let pdu = parse(&bytes(PDU_UE_CONTEXT_RELEASE_COMMAND))
+        .expect("parse UEContextReleaseCommand");
+    assert_eq!(pdu.procedure_code, 41);
+    assert_eq!(pdu.kind, PduKind::Initiating);
+    assert_eq!(pdu.message_name, "UEContextReleaseCommand");
+    assert!(pdu.ies.iter().any(|ie| ie.id == 114), "UE-NGAP-IDs present");
+    assert!(pdu.ies.iter().any(|ie| ie.id == 15), "Cause present");
+}
+
+const PDU_UE_CONTEXT_RELEASE_COMPLETE: &str =
+    "20290018000003000a4002000c005540020022003c40050100050006";
+
+#[test]
+fn ue_context_release_complete_decodes_two_pdu_sessions() {
+    let pdu = parse(&bytes(PDU_UE_CONTEXT_RELEASE_COMPLETE))
+        .expect("parse UEContextReleaseComplete");
+    assert_eq!(pdu.procedure_code, 41);
+    assert_eq!(pdu.kind, PduKind::SuccessfulOutcome);
+    assert_eq!(pdu.message_name, "UEContextReleaseComplete");
+    let ie_60 = pdu
+        .ies
+        .iter()
+        .find(|ie| ie.id == 60)
+        .expect("PDUSessionResourceListCxtRelCpl present");
+    assert_eq!(ie_60.known_name, Some("PDUSessionResourceListCxtRelCpl"));
+    // Raw contient 2 items `pDUSessionID` = 5 et 6 (voir fixture python).
+    assert_eq!(ie_60.value, vec![0x01, 0x00, 0x05, 0x00, 0x06]);
+}
+
+const PDU_UE_CONTEXT_RELEASE_REQUEST: &str =
+    "002a401c000004000a0002000c00550002002200850003000007000f40020000";
+
+#[test]
+fn ue_context_release_request_decodes_one_pdu_session() {
+    let pdu = parse(&bytes(PDU_UE_CONTEXT_RELEASE_REQUEST))
+        .expect("parse UEContextReleaseRequest");
+    assert_eq!(pdu.procedure_code, 42);
+    assert_eq!(pdu.kind, PduKind::Initiating);
+    assert_eq!(pdu.message_name, "UEContextReleaseRequest");
+    let ie_133 = pdu
+        .ies
+        .iter()
+        .find(|ie| ie.id == 133)
+        .expect("PDUSessionResourceListCxtRelReq present");
+    assert_eq!(ie_133.known_name, Some("PDUSessionResourceListCxtRelReq"));
+    // Raw contient 1 item `pDUSessionID` = 7.
+    assert_eq!(ie_133.value, vec![0x00, 0x00, 0x07]);
+}
+
+const PDU_SESSION_RESOURCE_RELEASE_COMMAND: &str =
+    "001c0019000003000a0002000c005500020022004f0006000005020000";
+
+#[test]
+fn pdu_session_resource_release_command_is_wired_to_procedure_code_28() {
+    let pdu = parse(&bytes(PDU_SESSION_RESOURCE_RELEASE_COMMAND))
+        .expect("parse PDUSessionResourceReleaseCommand");
+    assert_eq!(pdu.procedure_code, 28);
+    assert_eq!(pdu.kind, PduKind::Initiating);
+    assert_eq!(
+        pdu.message_name, "PDUSessionResourceReleaseCommand",
+        "2.21.66 : procedureCode 28 n'est plus UnknownNGAPProcedure"
+    );
+    let ie_79 = pdu
+        .ies
+        .iter()
+        .find(|ie| ie.id == 79)
+        .expect("PDUSessionResourceToReleaseListRelCmd present");
+    assert_eq!(ie_79.known_name, Some("PDUSessionResourceToReleaseListRelCmd"));
+    // 1 item : pDUSessionID=5, transfer de 2 octets Cause(radioNetwork=0, unspecified).
+    assert_eq!(ie_79.value, vec![0x00, 0x00, 0x05, 0x02, 0x00, 0x00]);
+}
+
+const PDU_SESSION_RESOURCE_RELEASE_RESPONSE: &str =
+    "201c0018000003000a4002000c005540020022004640050000050100";
+
+#[test]
+fn pdu_session_resource_release_response_is_wired_to_procedure_code_28() {
+    let pdu = parse(&bytes(PDU_SESSION_RESOURCE_RELEASE_RESPONSE))
+        .expect("parse PDUSessionResourceReleaseResponse");
+    assert_eq!(pdu.procedure_code, 28);
+    assert_eq!(pdu.kind, PduKind::SuccessfulOutcome);
+    assert_eq!(pdu.message_name, "PDUSessionResourceReleaseResponse");
+    let ie_70 = pdu
+        .ies
+        .iter()
+        .find(|ie| ie.id == 70)
+        .expect("PDUSessionResourceReleasedListRelRes present");
+    assert_eq!(ie_70.known_name, Some("PDUSessionResourceReleasedListRelRes"));
+    // 1 item : pDUSessionID=5, transfer de 1 octet (structure vide).
+    assert_eq!(ie_70.value, vec![0x00, 0x00, 0x05, 0x01, 0x00]);
+}
+
 const PDU_INITIAL_CONTEXT_SETUP_REQUEST: &str =
     "000e0076000006000a0002000c00550002000c001c00070000f11002100000470027000005002021000003008b000a01f00a4d0b171122334400860001000088000700050000090000005e00200000000000000000000000000000000000000000000000000000000000000000007700091c000c000700030000";
 

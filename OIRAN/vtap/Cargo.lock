@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-ngap"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "decoder-nas",
  "decoder-s1ap",
