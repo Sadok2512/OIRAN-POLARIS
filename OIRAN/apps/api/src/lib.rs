@@ -93,6 +93,10 @@ struct Inner {
     discovery: DiscoveryResult,
     storage_path: PathBuf,
     capture_manager: CaptureManager,
+    /// 2.21.63 — interdit le préchauffage startup de courir devant la
+    /// première publication continue. L'observateur de publication devient
+    /// l'unique frontière de préchauffage dans ce mode.
+    continuous_import_enabled: bool,
     probe_registry: ProbeRegistry,
     derived_import_root: PathBuf,
     lte_evidence_store: LteEvidenceStore,
@@ -732,6 +736,7 @@ impl AppState {
                 discovery,
                 storage_path: workspace,
                 capture_manager,
+                continuous_import_enabled: config.continuous_import_enabled,
                 probe_registry,
                 derived_import_root,
                 lte_evidence_store,
@@ -834,6 +839,7 @@ impl AppState {
                 discovery: discover_sessions(&mut Vec::new()),
                 storage_path: workspace,
                 capture_manager,
+                continuous_import_enabled: config.continuous_import_enabled,
                 probe_registry,
                 derived_import_root,
                 lte_evidence_store,
@@ -3622,7 +3628,72 @@ fn cached_journey_index(state: &AppState) -> std::sync::Arc<subscriber_journey::
 /// `/sessions/filter` après une publication. L'appelant tient toujours la
 /// garde lourde exclusive : tant que le préchauffage n'est pas terminé, les
 /// routes reçoivent un 503 explicite et ne voient jamais un cache partiel.
+fn trace_session_filter_prewarm_rss(trigger: &str, phase: &str) {
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let proc_kb = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}:")))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let cgroup_dir = fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                let mut fields = line.splitn(3, ':');
+                let _hierarchy = fields.next()?;
+                let _controllers = fields.next()?;
+                let path = fields.next()?;
+                Some(PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/')))
+            })
+        });
+    let cgroup_bytes = |name: &str| {
+        cgroup_dir
+            .as_ref()
+            .and_then(|dir| fs::read_to_string(dir.join(name)).ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let memory_stat = cgroup_dir
+        .as_ref()
+        .and_then(|dir| fs::read_to_string(dir.join("memory.stat")).ok())
+        .unwrap_or_default();
+    let stat_bytes = |name: &str| {
+        memory_stat
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next() == Some(name))
+                    .then(|| fields.next())
+                    .flatten()
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+    };
+    eprintln!(
+        "{}",
+        json!({
+            "event": "SESSIONS_FILTER_PREWARM_RSS",
+            "trigger": trigger,
+            "phase": phase,
+            "vmrss_kb": proc_kb("VmRSS"),
+            "vmhwm_kb": proc_kb("VmHWM"),
+            "rss_anon_kb": proc_kb("RssAnon"),
+            "rss_file_kb": proc_kb("RssFile"),
+            "cgroup_current_bytes": cgroup_bytes("memory.current"),
+            "cgroup_peak_bytes": cgroup_bytes("memory.peak"),
+            "cgroup_anon_bytes": stat_bytes("anon"),
+            "cgroup_file_bytes": stat_bytes("file"),
+        })
+    );
+}
+
 fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
+    trace_session_filter_prewarm_rss(trigger, "before_heap_release");
+    live_probe::release_publication_heap_pages();
+    trace_session_filter_prewarm_rss(trigger, "after_heap_release");
     let started = std::time::Instant::now();
     state.refresh_session_filter_index();
     let filter_ready_ms = started.elapsed().as_millis();
@@ -3639,9 +3710,11 @@ fn prewarm_session_filter_caches_locked(state: &AppState, trigger: &str) {
             "list_rows_cached": list_rows.cached,
             "list_rows_deferred": list_rows.deferred,
             "list_rows_missing": list_rows.missing,
+            "index_wait_ms": list_rows.index_wait_ms,
             "total_ms": started.elapsed().as_millis(),
         })
     );
+    trace_session_filter_prewarm_rss(trigger, "after_prewarm");
 }
 
 #[derive(Default)]
@@ -3649,6 +3722,7 @@ struct ListRowPrewarmStats {
     cached: usize,
     deferred: usize,
     missing: usize,
+    index_wait_ms: u128,
 }
 
 /// 2.21.61 — remplit la partie stable de `ListRowCache` pendant que le
@@ -3666,8 +3740,29 @@ fn prewarm_live_list_row_cache_locked(state: &AppState) -> ListRowPrewarmStats {
         {
             let bundle = state.inner.compact_index_registry.ensure_tracking(&root);
             spawn_compact_index_workers(&state.inner.compact_index_registry, &bundle);
+            // 2.21.63 — attendre les workers déjà réclamés sous la garde de
+            // publication : la première requête ne doit jamais payer les
+            // lignes. La borne explicite empêche un index cassé de bloquer
+            // la publication indéfiniment.
+            let wait_started = std::time::Instant::now();
+            let deadline = wait_started + std::time::Duration::from_secs(120);
+            while !bundle.all_ready() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            stats.index_wait_ms = stats
+                .index_wait_ms
+                .saturating_add(wait_started.elapsed().as_millis());
             if !bundle.all_ready() {
                 stats.deferred = stats.deferred.saturating_add(dataset.session_ids.len());
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "SESSIONS_FILTER_PREWARM_INDEX_TIMEOUT",
+                        "dataset_id": dataset.dataset_id,
+                        "timeout_ms": 120_000,
+                        "deferred_rows": dataset.session_ids.len(),
+                    })
+                );
                 continue;
             }
         }
@@ -3688,6 +3783,7 @@ fn prewarm_live_list_row_cache_locked(state: &AppState) -> ListRowPrewarmStats {
 /// `upsert_dataset`; le report est journalisé, jamais silencieux.
 pub fn install_session_filter_cache_prewarm(state: &AppState) {
     let weak = Arc::downgrade(&state.inner);
+    let runtime_handle = tokio::runtime::Handle::try_current().ok();
     state
         .inner
         .capture_manager
@@ -3700,11 +3796,34 @@ pub fn install_session_filter_cache_prewarm(state: &AppState) {
                 return;
             };
             let state = AppState { inner };
+            let Some(runtime_handle) = runtime_handle.as_ref() else {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "SESSIONS_FILTER_PREWARM_SKIPPED",
+                        "reason": "tokio_runtime_unavailable"
+                    })
+                );
+                return;
+            };
+            // L'observateur est appelé par le thread d'import continu. Entrer
+            // le runtime capturé au démarrage rend les spawn d'index compacts
+            // valides ; sans ceci Tokio panique hors réacteur.
+            let _runtime_guard = runtime_handle.enter();
             let _gate = state.inner.capture_manager.heavy_memory_enter();
             prewarm_session_filter_caches_locked(&state, "publication");
         })));
 
-    if let Some(_gate) = state
+    if state.inner.continuous_import_enabled {
+        eprintln!(
+            "{}",
+            json!({
+                "event": "SESSIONS_FILTER_PREWARM_DEFERRED",
+                "trigger": "startup",
+                "reason": "continuous_publication_will_notify"
+            })
+        );
+    } else if let Some(_gate) = state
         .inner
         .capture_manager
         .heavy_memory_try_enter_exclusive()
@@ -13071,6 +13190,22 @@ mod tests {
             journey_rebuilds_after_warm,
             "first request rebuilt the prewarmed journey index"
         );
+    }
+
+    /// 2.21.63 — avec l'import continu, le préchauffage de démarrage ne doit
+    /// jamais concurrencer les structures de publication. Le callback de
+    /// publication reste l'unique déclencheur.
+    #[test]
+    fn continuous_import_defers_startup_filter_prewarm() {
+        use std::sync::atomic::Ordering;
+
+        let mut state = state();
+        Arc::get_mut(&mut state.inner)
+            .expect("test owns the only AppState reference")
+            .continuous_import_enabled = true;
+        install_session_filter_cache_prewarm(&state);
+        assert_eq!(state.inner.filter_index_rebuilds.load(Ordering::SeqCst), 0);
+        assert_eq!(state.inner.journey_index_rebuilds.load(Ordering::SeqCst), 0);
     }
 
     /// 2.18.5 — ANR2 #10 6901691533 : p900 lit /sessions/filter, qui

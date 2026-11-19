@@ -1045,8 +1045,9 @@ impl CompactJsonlIndex {
         let mut file = std::fs::File::open(&self.path).map_err(|error| error.to_string())?;
         file.seek(SeekFrom::Start(from))
             .map_err(|error| error.to_string())?;
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::new(&file);
         let mut current_offset = from;
+        let mut advised_offset = from;
         let mut line_buffer = String::new();
         let mut local_entries: u64 = 0;
         let mut local_bytes: u64 = 0;
@@ -1061,6 +1062,14 @@ impl CompactJsonlIndex {
             }
             let line_start = current_offset;
             current_offset = current_offset.saturating_add(bytes_read as u64);
+            if current_offset.saturating_sub(advised_offset) >= 16 * 1024 * 1024 {
+                advise_read_range(
+                    &file,
+                    advised_offset,
+                    current_offset.saturating_sub(advised_offset),
+                );
+                advised_offset = current_offset;
+            }
             let trimmed = line_buffer.trim_end_matches(['\n', '\r']);
             if trimmed.is_empty() {
                 continue;
@@ -1086,6 +1095,11 @@ impl CompactJsonlIndex {
                 local_bytes = local_bytes.saturating_add(20);
             }
         }
+        advise_read_range(
+            &file,
+            advised_offset,
+            current_offset.saturating_sub(advised_offset),
+        );
         self.last_offset.store(current_offset, Ordering::Relaxed);
         if local_entries > 0 {
             self.entries.fetch_add(local_entries, Ordering::Relaxed);
@@ -1784,8 +1798,9 @@ fn scan_pfcp_file(
     use std::io::{Seek, SeekFrom};
     let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     file.seek(SeekFrom::Start(from)).map_err(|error| error.to_string())?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(&file);
     let mut offset = from;
+    let mut advised_offset = from;
     let mut added = 0usize;
     let mut line = String::new();
     loop {
@@ -1797,6 +1812,14 @@ fn scan_pfcp_file(
         }
         let start = offset;
         offset += read as u64;
+        if offset.saturating_sub(advised_offset) >= 16 * 1024 * 1024 {
+            advise_read_range(
+                &file,
+                advised_offset,
+                offset.saturating_sub(advised_offset),
+            );
+            advised_offset = offset;
+        }
         if !line.contains("\"protocol\":\"PFCP\"") {
             continue;
         }
@@ -1813,8 +1836,30 @@ fn scan_pfcp_file(
             by_key.entry(key).or_default().push((file_idx, start));
         }
     }
+    advise_read_range(
+        &file,
+        advised_offset,
+        offset.saturating_sub(advised_offset),
+    );
     Ok((offset, added))
 }
+
+#[cfg(target_family = "unix")]
+fn advise_read_range(file: &std::fs::File, offset: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+
+    let _ = unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            offset.min(i64::MAX as u64) as libc::off_t,
+            len.min(i64::MAX as u64) as libc::off_t,
+            libc::POSIX_FADV_DONTNEED,
+        )
+    };
+}
+
+#[cfg(not(target_family = "unix"))]
+fn advise_read_range(_file: &std::fs::File, _offset: u64, _len: u64) {}
 
 /// Relit sur disque les events PFCP qui partagent une clé connue.
 fn pfcp_events_for_keys(index: &PfcpIndex, keys: &BTreeSet<String>) -> Vec<Value> {

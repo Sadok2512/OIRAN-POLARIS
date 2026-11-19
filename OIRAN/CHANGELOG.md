@@ -1,5 +1,18 @@
 # Changelog
 
+## OIRAN API 2.21.63 + live-probe 0.6.24 + session-engine 0.5.24 — 2026-11-18 — préchauffage après publication sans chevauchement RSS
+
+Upgrade **patch**, basé sur 2.21.61 (`c153103`).
+
+- Audit physique : le préchauffage de démarrage lançait les indexeurs compacts pendant la première publication continue. Le pic cgroup était atteint avant le callback de publication ; les structures de publication et les caches de lecture coexistaient donc inutilement.
+- Le démarrage avec import continu reporte désormais explicitement le préchauffage au callback synchrone de publication. Les traces RSS avant libération du tas, après libération et après préchauffage rendent tout report observable.
+- Une publication continue n'effectue plus deux `upsert_dataset` successifs du même dataset : le dataset est déplacé une seule fois vers le registre et l'observateur n'est notifié qu'une fois.
+- Le `commit_seq.txt` de l'import incrémental est maintenant incrémenté dans le répertoire publié, et non perdu avec `.dataset-next` ; l'invalidation sub-seconde des lignes préchauffées redevient effective.
+- Le callback attend, sous la garde lourde, que les index compacts soient prêts avant de figer les lignes du filtre. Une borne explicite de 120 s produit `SESSIONS_FILTER_PREWARM_INDEX_TIMEOUT` au lieu d'un report silencieux.
+- Pour le JSONL plat de plusieurs Gio, la passe initiale du moteur de sessions et chacun des lots de callflows marquent toutes les 16 Mio déjà consommées `POSIX_FADV_DONTNEED` ; les petits shards sont libérés à EOF. Leur cache fichier propre ne s'accumule plus jusqu'à la fin du fichier et ne chevauche plus le commit/préchauffage. L'observateur entre explicitement dans le runtime Tokio capturé au démarrage avant de lancer les workers d'index.
+- La construction des index compacts read-time et PFCP applique la même fenêtre d'éviction de 16 Mio, afin que le préchauffage ne recharge pas ensuite tout le JSONL plat dans le cache cgroup.
+- Tests de mutation : l'import continu ne reconstruit aucun cache au démarrage ; un cycle publié notifie exactement une fois ; le premier filtre reste chaud.
+
 ## OIRAN API 2.21.61 — 2026-11-18 — lignes du filtre préchauffées après publication
 
 Upgrade **patch**, basé sur 2.21.59 (`f1012b8`).
