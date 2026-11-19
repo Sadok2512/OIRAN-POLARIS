@@ -2,6 +2,42 @@
 
 Format: SemVer. Pre-release suffix `-dev` indicates this is cut from main.
 
+## 2.14.3 — 2026-11-19 — p900 2.8.6 : moniteurs stock capture + segments quarantinés (ordre #9 7008184610)
+
+Dépend d'`oiran-api 2.21.72` (train) côté backend pour que `/metrics` expose les trois nouveaux champs (`capture_owned_bytes_percent`, `quarantined_segments`, `quarantined_segment_paths`). Pas de déploiement — ANR1 bundle la **version p900 2.8.6** après le déploiement de 2.21.72.
+
+### Scope
+- `src/types/api.ts` : étend l'interface `Metrics` avec trois champs optionnels (`?`) pour la back-compat avec oiran-api ≤ 2.21.67 (les anciens serveurs ne renvoient pas ces clés — JSON parsera `undefined`, pas d'erreur).
+- `src/pages/ReportsPages.tsx::LiveMonitoring` :
+  - **Moniteur « Stock capture »** : affiche `capture_owned_bytes_percent` avec `showPercentNoCap` — **sans plafond d'affichage**. ANR2 prod 2.21.57 : 562 % (clampé 100 % par le bug 2.21.67-) est désormais lisible tel quel.
+  - **Moniteur « Segments quarantinés »** : affiche `quarantined_segments` via `showCount`. Note : « Sortis de pending_segments ».
+- Nouveau composant `QuarantineList` : panneau repliable (replié par défaut) listant jusqu'à 16 chemins quarantinés (basename tronqué à 40 caractères). Aucun identifiant abonné : les chemins quarantaine portent `<iface>.pcap-<hash>.pcapng`, pas d'IMSI/MSISDN.
+
+### Règles d'affichage (ordre cœur)
+- `null` / `undefined` → « — » (pas « 0 », pas « NOT AVAILABLE »).
+- `0` → `0.0 %` ou `0` (donnée légitime, pas absence).
+- Valeur > 100 → affichée telle quelle (`561.9 %`).
+- Liste vide → pas de panneau quarantine rendu.
+
+### Tests (vitest)
+- `src/test/p900-2.8.6-capture-stock.test.tsx` : **15 tests**, 0 échec.
+  - 4 tests sur `showPercentNoCap` (null, undefined, 0, > 100).
+  - 3 tests sur `showCount` (null, 0, large).
+  - 2 tests sur `truncatePath` (slash, long basename avec ellipse).
+  - 5 scénarios `LiveMonitoring` (null, 0, > 100, liste vide, liste non vide avec toggle).
+  - 1 test de privacy sur `QuarantineList` (aucun IMSI 15-digit, aucun mot `imsi`/`msisdn`).
+- Suite complète : `node_modules/node/bin/node node_modules/vitest/vitest.mjs run` → **109 passed (109)**, 15 test files.
+
+### Versions
+- `@oiran/web` : 2.14.2 → 2.14.3 (bump mineur : ajouts rétrocompat).
+- **p900 : 2.8.6** (bundle ANR1, SemVer piloté par cette entrée ; aucune automation ne modifie `package.json` pour p900 — la correspondance est éditoriale ici).
+
+### Référence
+- Branche : `feat/p900-2.8.6-capture-stock` @ (HEAD poussé).
+- Base : `fix/oiran-2.21.64-merge` @ `2468bfc` (branche frontend indépendante du train Rust, s'applique propre sur 2.21.64 OU 2.21.72).
+- Accusé #9 : `7008232140`.
+- Prérequis backend : train `fix/oiran-2.21.72-train` @ `eaa21f0` (ou lot 2.21.68 standalone) pour les champs `/metrics`.
+
 ## 2.9.0 — 2026-11-07 (ANR2 bandwidth — ETag/304 polling + version footer)
 
 - `services/api.ts` now caches `ETag` per GET URL and sends
