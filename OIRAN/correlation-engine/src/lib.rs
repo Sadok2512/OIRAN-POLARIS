@@ -504,7 +504,110 @@ fn ims_edges_from_events(events: &[EventRecord]) -> Vec<CorrelationEdge> {
         }
     }
 
+    // --- Règle 3 : sip-pdu-ims-5qi1-vonr-exact ------------------------
+    // 2.21.79 (CLAUDE1, ordre #9 7012275179 §3). Une liaison VoNR EXACT
+    // n'est émise QUE si les DEUX preuves concordent dans le même
+    // capture_scope :
+    //   (a) un PDU session NAS avec `dnn="ims"` (decoder-nas), ET
+    //   (b) un dedicated QoS flow NGAP portant 5QI=1 (decoder-ngap
+    //       transfer, `item_X_fiveqi_Y=1` ou `item_X_qfi_Y=<qfi>`
+    //       associé à un `five_qi=1`), ET
+    //   (c) l'event SIP du même `capture_scope` (sinon aucune arête).
+    //
+    // L'arête relie le SIP (preuve d'application VoNR) au PDU NAS
+    // (preuve d'identité et de DNN=ims) avec `evidence_type =
+    // EXACT_VONR_DEDICATED_FLOW`. Sans (a) ni (b), aucune liaison —
+    // conforme à « EXACT seulement si les deux preuves concordent.
+    // Sinon, pas de liaison. »
+    let nas_ims_pdus: Vec<&EventRecord> = events
+        .iter()
+        .filter(|e| {
+            e.protocol.eq_ignore_ascii_case("NAS-5GSM")
+                || e.protocol.eq_ignore_ascii_case("NAS")
+                    && e.first_identifier("dnn").is_some()
+        })
+        .filter(|e| {
+            e.first_identifier("dnn")
+                .map(|v| v.eq_ignore_ascii_case("ims"))
+                .unwrap_or(false)
+        })
+        .collect();
+    let ngap_5qi1_flows: Vec<&EventRecord> = events
+        .iter()
+        .filter(|e| e.interface == "N2" && protocol_is(e, "NGAP"))
+        .filter(|e| ngap_event_has_5qi_1(e))
+        .collect();
+    if !nas_ims_pdus.is_empty() && !ngap_5qi1_flows.is_empty() {
+        for sip in events
+            .iter()
+            .filter(|e| e.interface == "IMS" && protocol_is(e, "SIP"))
+        {
+            let scope = capture_scope(sip);
+            let has_ims_dnn = nas_ims_pdus.iter().any(|e| capture_scope(e) == scope);
+            let has_5qi1 = ngap_5qi1_flows.iter().any(|e| capture_scope(e) == scope);
+            if !(has_ims_dnn && has_5qi1) {
+                continue;
+            }
+            // Edge SIP ↔ (NAS DNN=ims) : on choisit le premier NAS
+            // match dans le scope (déterministe, par ordre de events).
+            let Some(nas_match) = nas_ims_pdus.iter().find(|e| capture_scope(e) == scope) else {
+                continue;
+            };
+            let ngap_match_id = ngap_5qi1_flows
+                .iter()
+                .find(|e| capture_scope(e) == scope)
+                .map(|e| e.event_id.clone())
+                .unwrap_or_default();
+            let mut found = edge(
+                sip,
+                nas_match,
+                vec![
+                    "dnn=ims".into(),
+                    "five_qi=1".into(),
+                    format!("ngap_five_qi_1_event_id={ngap_match_id}"),
+                    format!("capture_scope={scope}"),
+                ],
+                "sip-pdu-ims-5qi1-vonr-exact",
+                "EXACT",
+                "SIP IMS signalling is bound to a NAS PDU session with DNN=ims and an NGAP dedicated QoS flow carrying 5QI=1 in the same capture scope (both proofs required)",
+            );
+            found.rule_version = E2E_EVIDENCE_RULE_VERSION.into();
+            found.evidence_type = "EXACT_VONR_DEDICATED_FLOW".into();
+            found.scope = "vonr-dnn-5qi1".into();
+            found.limitations = vec![
+                "This rule requires BOTH proofs (DNN=ims in NAS AND 5QI=1 dedicated QoS flow in NGAP) within the same capture_scope ; missing either proof suppresses the edge entirely".into(),
+            ];
+            edges.push(found);
+        }
+    }
+
     edges
+}
+
+/// 2.21.79 (CLAUDE1, ordre #9 7012275179 §3) — détecte un flux NGAP
+/// avec 5QI=1 dans les IE sérialisées par `decoder-ngap`. Les IE sont
+/// un `serde_json::Value::Array` ; chaque élément a `name`/`value` en
+/// strings. `decoder-ngap` sérialise 5QI comme sous-clé d'une chaîne
+/// composite (ex. `item_X_fiveqi_Y=1,item_X_qfi_Z=5`), donc on
+/// recherche la sous-chaîne dans `value` et `name`. On accepte les
+/// deux orthographes (`five_qi=1`, `fiveqi=1`) pour robustesse
+/// cross-version decoder-ngap.
+fn ngap_event_has_5qi_1(event: &EventRecord) -> bool {
+    let Some(items) = event.information_elements.as_array() else {
+        return false;
+    };
+    items.iter().any(|ie| {
+        let name = ie.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let value = ie.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        let hit = |s: &str| {
+            s.contains("five_qi=1")
+                || s.contains("fiveqi=1")
+                || s.contains("fiveqi_0=1")
+                || s.contains("fiveqi_1=1")
+                || s.contains("5qi=1")
+        };
+        hit(name) || hit(value)
+    })
 }
 
 /// Prepares explicit LTE bearer edges from the uniquely partitioned LTE
@@ -3577,6 +3680,147 @@ mod tests {
             !edges.iter().any(|e| e.rule_id.starts_with("sip-")
                 || e.rule_id.starts_with("rtp-")),
             "aucune règle IMS ne doit matcher sans events SIP/RTP ; got {edges:?}"
+        );
+    }
+
+    /// 2.21.79 (CLAUDE1, ordre #9 7012275179 §3) — règle
+    /// `sip-pdu-ims-5qi1-vonr-exact` : elle émet UNIQUEMENT quand les
+    /// DEUX preuves concordent (DNN=ims en NAS + 5QI=1 en NGAP +
+    /// événement SIP, tous dans le même capture_scope).
+    #[test]
+    fn sip_pdu_ims_5qi1_emits_exact_vonr_edge_when_both_proofs_concur() {
+        let sip = e(
+            "sip-1",
+            "IMS",
+            "SIP",
+            "INVITE",
+            1,
+            &[("sip_call_id", "call-vonr")],
+            json!([]),
+        );
+        let nas_ims = e(
+            "nas-ims",
+            "N1",
+            "NAS-5GSM",
+            "PDUSessionEstablishmentRequest",
+            2,
+            &[("dnn", "ims")],
+            json!([]),
+        );
+        let ngap_5qi1 = e(
+            "ngap-5qi1",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            3,
+            &[],
+            json!([
+                {"name":"PduSessionResourceSetupRequestTransfer","value":"item_0_qfi_0=1,item_0_fiveqi_0=1"}
+            ]),
+        );
+        let edges = correlate_cross_interface_evidence(&[sip, nas_ims, ngap_5qi1]);
+        let matched: Vec<_> = edges
+            .iter()
+            .filter(|e| e.rule_id == "sip-pdu-ims-5qi1-vonr-exact")
+            .collect();
+        assert_eq!(
+            matched.len(),
+            1,
+            "une seule arête VoNR EXACT attendue ; got {edges:?}"
+        );
+        let edge = matched[0];
+        assert_eq!(edge.confidence, "EXACT");
+        assert_eq!(edge.evidence_type, "EXACT_VONR_DEDICATED_FLOW");
+        assert_eq!(edge.scope, "vonr-dnn-5qi1");
+        assert!(edge
+            .matching_identifiers
+            .iter()
+            .any(|m| m == "dnn=ims"));
+        assert!(edge
+            .matching_identifiers
+            .iter()
+            .any(|m| m == "five_qi=1"));
+    }
+
+    /// 2.21.79 — sans NGAP 5QI=1, aucune arête VoNR EXACT, même si
+    /// DNN=ims et SIP sont présents. « EXACT seulement si les DEUX
+    /// preuves concordent. Sinon, pas de liaison. »
+    #[test]
+    fn sip_pdu_ims_without_5qi1_yields_no_vonr_exact_edge() {
+        let sip = e(
+            "sip-1",
+            "IMS",
+            "SIP",
+            "INVITE",
+            1,
+            &[("sip_call_id", "call-vonr")],
+            json!([]),
+        );
+        let nas_ims = e(
+            "nas-ims",
+            "N1",
+            "NAS-5GSM",
+            "PDUSessionEstablishmentRequest",
+            2,
+            &[("dnn", "ims")],
+            json!([]),
+        );
+        let ngap_other = e(
+            "ngap-5qi9",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            3,
+            &[],
+            json!([
+                {"name":"PduSessionResourceSetupRequestTransfer","value":"item_0_qfi_0=5,item_0_fiveqi_0=9"}
+            ]),
+        );
+        let edges = correlate_cross_interface_evidence(&[sip, nas_ims, ngap_other]);
+        assert!(
+            !edges.iter().any(|e| e.rule_id == "sip-pdu-ims-5qi1-vonr-exact"),
+            "aucune arête VoNR EXACT sans 5QI=1 ; got {edges:?}"
+        );
+    }
+
+    /// 2.21.79 — sans DNN=ims en NAS, aucune arête VoNR EXACT, même
+    /// avec 5QI=1 (un dedicated flow sur un PDU internet n'est pas
+    /// VoNR).
+    #[test]
+    fn sip_with_5qi1_but_non_ims_dnn_yields_no_vonr_exact_edge() {
+        let sip = e(
+            "sip-1",
+            "IMS",
+            "SIP",
+            "INVITE",
+            1,
+            &[("sip_call_id", "call-vonr")],
+            json!([]),
+        );
+        let nas_internet = e(
+            "nas-internet",
+            "N1",
+            "NAS-5GSM",
+            "PDUSessionEstablishmentRequest",
+            2,
+            &[("dnn", "internet")],
+            json!([]),
+        );
+        let ngap_5qi1 = e(
+            "ngap-5qi1",
+            "N2",
+            "NGAP",
+            "PDUSessionResourceSetupRequest",
+            3,
+            &[],
+            json!([
+                {"name":"PduSessionResourceSetupRequestTransfer","value":"item_0_qfi_0=1,item_0_fiveqi_0=1"}
+            ]),
+        );
+        let edges = correlate_cross_interface_evidence(&[sip, nas_internet, ngap_5qi1]);
+        assert!(
+            !edges.iter().any(|e| e.rule_id == "sip-pdu-ims-5qi1-vonr-exact"),
+            "aucune arête VoNR EXACT sans DNN=ims ; got {edges:?}"
         );
     }
 }

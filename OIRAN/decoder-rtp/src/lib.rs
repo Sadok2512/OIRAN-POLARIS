@@ -64,7 +64,19 @@ struct FlowState {
     first_timestamp: Option<u32>,
     last_timestamp: Option<u32>,
     last_arrival_ns: Option<u64>,
-    jitter_fixed: u64, // Q16.16 or similar — kept as integer accumulator
+    /// 2.21.79 — accumulateur de jitter EN TICKS RTP (unité
+    /// de l'horloge d'échantillonnage, pas des ns locaux). `None` tant
+    /// qu'aucun `clock_rate_hz` n'est connu (PT dynamique sans
+    /// `a=rtpmap`), auquel cas on ne calcule pas de jitter.
+    jitter_rtp_ticks: Option<u64>,
+    /// 2.21.79 — horloge d'échantillonnage du flux, soit lue dans la
+    /// table statique PT (RFC 3551 §6) pour PT 0..=34, soit transmise
+    /// par le SDP `a=rtpmap` pour les PT dynamiques (96..=127).
+    clock_rate_hz: Option<u32>,
+    /// 2.21.79 — raison pour laquelle `jitter_ns` sortira `null` quand
+    /// `clock_rate_hz` est inconnu, émise en IE pour que l'opérateur
+    /// voie pourquoi le flux n'a pas de jitter chiffré.
+    jitter_unknown_reason: Option<String>,
     payload_type: Option<u8>,
     call_id: Option<String>,
     first_packet_reference: Option<PacketReference>,
@@ -79,6 +91,11 @@ pub struct SdpFlowRegistration {
     pub port: u16,
     pub call_id: String,
     pub payload_type: Option<u8>,
+    /// 2.21.79 — horloge d'échantillonnage lue dans
+    /// `a=rtpmap:<pt> <encoding>/<clock_rate>` pour les PT dynamiques
+    /// (96..=127). `None` pour les PT statiques (RFC 3551 §6) : le
+    /// aggregator résoudra via `static_rtp_clock_rate_hz`.
+    pub clock_rate_hz: Option<u32>,
 }
 
 pub struct RtpFlowAggregator {
@@ -87,6 +104,10 @@ pub struct RtpFlowAggregator {
     /// `INVITE`/`200 OK` apporte un SDP.
     endpoint_to_call_id: BTreeMap<(String, u16), String>,
     endpoint_pt: BTreeMap<(String, u16), u8>,
+    /// 2.21.79 — `(ip, port) → clock_rate_hz` apporté par SDP `a=rtpmap`.
+    /// Ne remplace pas la table statique PT ; les deux sources peuvent
+    /// coexister, et `clock_rate_for_pt` préfère le SDP quand présent.
+    endpoint_clock_rate: BTreeMap<(String, u16), u32>,
 }
 
 impl Default for RtpFlowAggregator {
@@ -101,17 +122,81 @@ impl RtpFlowAggregator {
             flows: BTreeMap::new(),
             endpoint_to_call_id: BTreeMap::new(),
             endpoint_pt: BTreeMap::new(),
+            endpoint_clock_rate: BTreeMap::new(),
         }
     }
 
     /// Enregistre un (ip, port) comme flux RTP attendu pour un Call-ID.
     /// Idempotent ; si le flux change de Call-ID, le nouveau remplace.
     pub fn register_sdp_flow(&mut self, registration: SdpFlowRegistration) {
+        let SdpFlowRegistration {
+            ip,
+            port,
+            call_id,
+            payload_type,
+            clock_rate_hz,
+        } = registration;
         self.endpoint_to_call_id
-            .insert((registration.ip.clone(), registration.port), registration.call_id);
-        if let Some(pt) = registration.payload_type {
-            self.endpoint_pt.insert((registration.ip, registration.port), pt);
+            .insert((ip.clone(), port), call_id);
+        if let Some(pt) = payload_type {
+            self.endpoint_pt.insert((ip.clone(), port), pt);
         }
+        if let Some(rate) = clock_rate_hz {
+            self.endpoint_clock_rate.insert((ip, port), rate);
+        }
+    }
+
+    /// 2.21.79 — Horloge d'échantillonnage statique RFC 3551 §6 pour les
+    /// PT 0..=34. Retourne `None` pour tout PT dynamique (96..=127) et
+    /// pour les PT réservés : l'appelant doit s'en remettre à
+    /// `endpoint_clock_rate` (apporté par SDP `a=rtpmap`). Les valeurs
+    /// sont figées par l'IANA ; ne pas les patcher à la main sans mise
+    /// à jour explicite du registre.
+    fn static_rtp_clock_rate_hz(payload_type: u8) -> Option<u32> {
+        match payload_type {
+            0 => Some(8000),     // PCMU
+            3 => Some(8000),     // GSM
+            4 => Some(8000),     // G723
+            5 => Some(8000),     // DVI4 8 kHz
+            6 => Some(16_000),   // DVI4 16 kHz
+            7 => Some(8000),     // LPC
+            8 => Some(8000),     // PCMA
+            9 => Some(8000),     // G722 (special : sampling 16 kHz mais RTP ts à 8 kHz, RFC 3551 §4.5.2)
+            10 => Some(44_100),  // L16 stereo
+            11 => Some(44_100),  // L16 mono
+            12 => Some(8000),    // QCELP
+            13 => Some(8000),    // CN
+            14 => Some(90_000),  // MPA
+            15 => Some(8000),    // G728
+            16 => Some(11_025),  // DVI4 11.025 kHz
+            17 => Some(22_050),  // DVI4 22.05 kHz
+            18 => Some(8000),    // G729
+            25..=34 => Some(90_000), // CelB, JPEG, nv, H261, MPV, MP2T, H263 — vidéo 90 kHz
+            _ => None,
+        }
+    }
+
+    /// 2.21.79 — Résout `clock_rate_hz` pour un flux : d'abord `a=rtpmap`
+    /// via SDP (fiable pour PT dynamiques), sinon table statique PT. Les
+    /// deux endpoints du flux sont essayés pour trouver un rtpmap, car
+    /// seul l'offerer SIP inclut le `a=rtpmap` complet dans son SDP.
+    fn clock_rate_for_flow(
+        &self,
+        source_ip: &str,
+        source_port: u16,
+        destination_ip: &str,
+        destination_port: u16,
+        payload_type: u8,
+    ) -> Option<u32> {
+        self.endpoint_clock_rate
+            .get(&(source_ip.to_string(), source_port))
+            .copied()
+            .or_else(|| {
+                self.endpoint_clock_rate
+                    .get(&(destination_ip.to_string(), destination_port))
+                    .copied()
+            })
+            .or_else(|| Self::static_rtp_clock_rate_hz(payload_type))
     }
 
     pub fn registered_flows(&self) -> usize {
@@ -158,11 +243,30 @@ impl RtpFlowAggregator {
             destination_port,
             ssrc: header.ssrc,
         };
+        // 2.21.79 — résolution d'horloge RTP AVANT d'insérer dans l'entrée
+        // flux : si aucune horloge n'est connue (PT dynamique sans
+        // `a=rtpmap`), on marque le flux comme « jitter non chiffré ».
+        let resolved_clock_rate = self.clock_rate_for_flow(
+            source_ip,
+            source_port,
+            destination_ip,
+            destination_port,
+            header.payload_type,
+        );
         let state = self.flows.entry(key).or_default();
         state.packets = state.packets.saturating_add(1);
         state.call_id = call_id;
         if state.payload_type.is_none() {
             state.payload_type = Some(header.payload_type);
+        }
+        if state.clock_rate_hz.is_none() {
+            state.clock_rate_hz = resolved_clock_rate;
+            if resolved_clock_rate.is_none() && state.jitter_unknown_reason.is_none() {
+                state.jitter_unknown_reason = Some(format!(
+                    "RTP clock rate inconnue pour PT {} : ni dans la table statique RFC 3551 §6 (PT 0..=34), ni dans un SDP a=rtpmap pour ce flux",
+                    header.payload_type
+                ));
+            }
         }
         if state.first_seq.is_none() {
             state.first_seq = Some(header.sequence_number);
@@ -178,18 +282,30 @@ impl RtpFlowAggregator {
             if header.sequence_number < prev_seq {
                 state.seq_wraps = state.seq_wraps.saturating_add(1);
             }
-            // Jitter update per RFC 3550 §6.4.1 — `D(i-1,i) = (R_i -
-            // R_{i-1}) - (S_i - S_{i-1})`, où R est l'horloge locale
-            // et S le timestamp RTP. Converti en unités "90 kHz" si
-            // PT audio dynamique — ici on garde l'unité ns (locale)
-            // et on exprime jitter_ns en delta absolu puis moyenné.
-            let r_delta = arrival_ns.saturating_sub(prev_arr) as i64;
-            let s_delta = header.timestamp.wrapping_sub(prev_ts) as i64;
-            let d = (r_delta - s_delta).unsigned_abs();
-            // Moyenne glissante : J <- J + (D - J) / 16.
-            let prev_j = state.jitter_fixed as i64;
-            let step = (d as i64 - prev_j) / 16;
-            state.jitter_fixed = (prev_j + step).max(0) as u64;
+            // 2.21.79 (CLAUDE1, ordre #9 7012275179 §1) — Jitter RFC 3550
+            // §6.4.1 CALCULÉ EN TICKS RTP. `R_i - R_{i-1}` (arrivée locale,
+            // en ns) est converti en ticks d'horloge RTP via
+            // `r_ticks = r_delta_ns * clock_rate_hz / 1e9`. `S_i - S_{i-1}`
+            // (timestamp RTP) est déjà en ticks. `D` est donc en ticks, la
+            // moyenne glissante reste en ticks, et `jitter_ns` final sort
+            // via `J_ticks * 1e9 / clock_rate_hz`. Si `clock_rate_hz` est
+            // None : on NE CALCULE PAS, et `jitter_rtp_ticks` reste None.
+            if let Some(clock_rate_hz) = state.clock_rate_hz {
+                let r_delta_ns = arrival_ns.saturating_sub(prev_arr);
+                // ticks = ns × clock / 1e9. Multiplication en u128 pour
+                // éviter l'overflow sur r_delta_ns × clock_rate_hz quand
+                // les deux sont grands (ex. gap réseau 1 s × 90 kHz).
+                let r_ticks =
+                    (r_delta_ns as u128).saturating_mul(clock_rate_hz as u128) / 1_000_000_000u128;
+                let s_delta_ticks = header.timestamp.wrapping_sub(prev_ts) as i64;
+                let r_ticks_i64 = r_ticks.min(i64::MAX as u128) as i64;
+                let d_ticks = (r_ticks_i64 - s_delta_ticks).unsigned_abs();
+                // Moyenne glissante en ticks : J <- J + (D - J) / 16.
+                let prev_j = state.jitter_rtp_ticks.unwrap_or(0) as i64;
+                let step = (d_ticks as i64 - prev_j) / 16;
+                let new_j = (prev_j + step).max(0) as u64;
+                state.jitter_rtp_ticks = Some(new_j);
+            }
         }
         state.last_seq = Some(header.sequence_number);
         state.last_timestamp = Some(header.timestamp);
@@ -265,7 +381,15 @@ impl RtpFlowAggregator {
                 _ => state.packets,
             };
             let loss = expected_packets.saturating_sub(state.packets);
-            let jitter_ns = state.jitter_fixed;
+            // 2.21.79 — conversion ticks RTP → ns pour l'émission. Si
+            // l'horloge est inconnue, `jitter_ns` sort en `null` + une
+            // raison `jitter_null_reason` dans l'IE suivant.
+            let jitter_ns_value: Option<u64> = match (state.jitter_rtp_ticks, state.clock_rate_hz) {
+                (Some(ticks), Some(rate)) if rate > 0 => {
+                    Some(((ticks as u128).saturating_mul(1_000_000_000u128) / rate as u128).min(u64::MAX as u128) as u64)
+                }
+                _ => None,
+            };
             let packet_refs = state
                 .first_packet_reference
                 .map(|r| vec![r])
@@ -304,11 +428,24 @@ impl RtpFlowAggregator {
                     raw_sha256: None,
                     status: DecodeStatus::Decoded,
                 },
+                // 2.21.79 — `jitter_ns` ne sort une valeur que si
+                // `clock_rate_hz` est connue (table statique RFC 3551 §6
+                // ou `a=rtpmap`). Sinon `value=null` + une IE
+                // `jitter_null_reason` dit pourquoi. Jamais un chiffre
+                // sans sens physique.
                 InformationElement {
                     id: None,
                     name: "jitter_ns".into(),
                     length: 8,
-                    value: Some(jitter_ns.to_string()),
+                    value: jitter_ns_value.map(|v| v.to_string()),
+                    raw_sha256: None,
+                    status: DecodeStatus::Decoded,
+                },
+                InformationElement {
+                    id: None,
+                    name: "jitter_clock_rate_hz".into(),
+                    length: 4,
+                    value: state.clock_rate_hz.map(|v| v.to_string()),
                     raw_sha256: None,
                     status: DecodeStatus::Decoded,
                 },
@@ -351,6 +488,21 @@ impl RtpFlowAggregator {
                     name: "sip_call_id".into(),
                     length: call_id.len() as u32,
                     value: Some(call_id.clone()),
+                    raw_sha256: None,
+                    status: DecodeStatus::Decoded,
+                });
+            }
+            if jitter_ns_value.is_none() {
+                let reason = state.jitter_unknown_reason.clone().unwrap_or_else(|| {
+                    format!(
+                        "jitter non chiffré : clock_rate inconnue pour PT {payload_type}"
+                    )
+                });
+                ies.push(InformationElement {
+                    id: None,
+                    name: "jitter_null_reason".into(),
+                    length: reason.len() as u32,
+                    value: Some(reason),
                     raw_sha256: None,
                     status: DecodeStatus::Decoded,
                 });
@@ -551,6 +703,7 @@ mod tests {
             port: 49170,
             call_id: "cid-vonr-9f8e7d6c5b4a3210".into(),
             payload_type: Some(0),
+            clock_rate_hz: None,
         });
         for (idx, seq) in (0u16..200u16).enumerate() {
             let pkt = rtp_packet(0, seq, 100 + seq as u32 * 160, 0xdeadbeef, &[0xaa; 160]);
@@ -587,6 +740,7 @@ mod tests {
             port: 49170,
             call_id: "cid-vonr-9f8e7d6c5b4a3210".into(),
             payload_type: Some(0),
+            clock_rate_hz: None,
         });
         // Send seq 0, 1, 2, SKIP 3-4, 5, 6 → expected=7, got=5, loss=2.
         let pattern = [0u16, 1, 2, 5, 6];
@@ -622,6 +776,7 @@ mod tests {
             port: 49170,
             call_id: "cid-vonr-9f8e7d6c5b4a3210".into(),
             payload_type: Some(0),
+            clock_rate_hz: None,
         });
         let rtp = rtp_packet(0, 0, 100, 0xdeadbeef, &[0xaa; 160]);
         agg.observe_rtp("10.0.0.1", 40000, "10.0.0.2", 49170, &rtp, 0, &pr(1), &ts(0));
@@ -633,6 +788,7 @@ mod tests {
             port: 49171,
             call_id: "cid-vonr-9f8e7d6c5b4a3210".into(),
             payload_type: None,
+            clock_rate_hz: None,
         });
         agg.observe_rtcp("10.0.0.1", 40001, "10.0.0.2", 49171, &sr);
         agg.observe_rtcp("10.0.0.1", 40001, "10.0.0.2", 49171, &rr);
@@ -670,5 +826,206 @@ mod tests {
         assert!(!accepted, "unregistered flows must not be aggregated");
         let events = agg.finish("sha256:cap", "IMS");
         assert!(events.is_empty());
+    }
+
+    /// 2.21.79 (CLAUDE1, ordre #9 7012275179 §1) — PT 0 (PCMU statique
+    /// 8 kHz) : paquets envoyés à intervalle régulier, timestamp RTP en
+    /// phase avec l'arrivée réelle → le jitter doit rester petit, pas
+    /// infini comme avant 2.21.79.
+    #[test]
+    fn jitter_stays_small_when_rtp_and_arrival_clocks_match_pt0_pcmu() {
+        let mut agg = RtpFlowAggregator::new();
+        agg.register_sdp_flow(SdpFlowRegistration {
+            ip: "10.0.0.2".into(),
+            port: 49170,
+            call_id: "cid-pt0".into(),
+            payload_type: Some(0),
+            clock_rate_hz: None,
+        });
+        // PCMU = 8000 Hz. 1 trame audio = 20 ms = 20_000_000 ns = 160 ticks RTP.
+        let frame_ns: u64 = 20_000_000;
+        let frame_ticks: u32 = 160;
+        for i in 0..100u16 {
+            let pkt = rtp_packet(0, i, 1000 + i as u32 * frame_ticks, 0xdead, &[0xaa; 160]);
+            agg.observe_rtp(
+                "10.0.0.1",
+                40000,
+                "10.0.0.2",
+                49170,
+                &pkt,
+                frame_ns.saturating_mul(i as u64),
+                &pr(1 + i as u64),
+                &ts(frame_ns.saturating_mul(i as u64)),
+            );
+        }
+        let events = agg.finish("sha256:cap", "IMS");
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        let jitter_ns = ev
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "jitter_ns")
+            .unwrap()
+            .value
+            .as_deref()
+            .expect("jitter_ns doit avoir une valeur (clock_rate connue)");
+        let j: u64 = jitter_ns.parse().unwrap();
+        // Horloge d'arrivée en phase parfaite avec RTP → jitter devrait
+        // approcher 0. 1 ms = 1_000_000 ns de marge est généreux pour
+        // couvrir le bootstrap du filtre I/16 (RFC 3550).
+        assert!(j < 1_000_000, "jitter attendu ~0, obtenu {j} ns");
+        let rate_ie = ev
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "jitter_clock_rate_hz")
+            .unwrap();
+        assert_eq!(rate_ie.value.as_deref(), Some("8000"));
+    }
+
+    /// 2.21.79 — PT 0 (PCMU) : si on injecte un retard réseau de 10 ms
+    /// toutes les 10 trames, le jitter sort de 0 et devient mesurable,
+    /// EN NANOSECONDES RÉELLES (pas en unité mixte).
+    #[test]
+    fn jitter_rises_when_arrival_delays_despite_pcmu_pt0() {
+        let mut agg = RtpFlowAggregator::new();
+        agg.register_sdp_flow(SdpFlowRegistration {
+            ip: "10.0.0.2".into(),
+            port: 49170,
+            call_id: "cid-pt0-jitter".into(),
+            payload_type: Some(0),
+            clock_rate_hz: None,
+        });
+        let frame_ns: u64 = 20_000_000;
+        let frame_ticks: u32 = 160;
+        for i in 0..200u16 {
+            let arrival_ns = frame_ns.saturating_mul(i as u64)
+                + if i % 10 == 0 { 10_000_000 } else { 0 };
+            let pkt = rtp_packet(0, i, 1000 + i as u32 * frame_ticks, 0xdead, &[0xaa; 160]);
+            agg.observe_rtp(
+                "10.0.0.1",
+                40000,
+                "10.0.0.2",
+                49170,
+                &pkt,
+                arrival_ns,
+                &pr(1 + i as u64),
+                &ts(arrival_ns),
+            );
+        }
+        let events = agg.finish("sha256:cap", "IMS");
+        let j: u64 = events[0]
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "jitter_ns")
+            .unwrap()
+            .value
+            .as_deref()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // Retard injecté de 10 ms régulier → jitter moyen attendu de
+        // l'ordre du ms. La valeur exacte dépend du filtre I/16 ;
+        // on se contente d'un plancher strict > 0 et < 10 ms.
+        assert!(j > 0, "jitter doit être > 0 avec gigue injectée");
+        assert!(j < 10_000_000, "jitter ne doit pas exploser ({j} ns)");
+    }
+
+    /// 2.21.79 — PT dynamique 96 sans `a=rtpmap` : horloge inconnue →
+    /// `jitter_ns` sort en `null` + une IE `jitter_null_reason` explique
+    /// pourquoi. **Jamais une valeur fausse.**
+    #[test]
+    fn jitter_is_null_with_reason_when_dynamic_pt_lacks_rtpmap() {
+        let mut agg = RtpFlowAggregator::new();
+        agg.register_sdp_flow(SdpFlowRegistration {
+            ip: "10.0.0.2".into(),
+            port: 49170,
+            call_id: "cid-dyn".into(),
+            payload_type: Some(96),
+            clock_rate_hz: None, // SDP sans a=rtpmap
+        });
+        for i in 0..20u16 {
+            let pkt = rtp_packet(96, i, 1000 + i as u32 * 160, 0xcafe, &[0xaa; 160]);
+            agg.observe_rtp(
+                "10.0.0.1",
+                40000,
+                "10.0.0.2",
+                49170,
+                &pkt,
+                20_000_000u64 * i as u64,
+                &pr(1 + i as u64),
+                &ts(20_000_000u64 * i as u64),
+            );
+        }
+        let events = agg.finish("sha256:cap", "IMS");
+        let jitter_ie = events[0]
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "jitter_ns")
+            .unwrap();
+        assert!(
+            jitter_ie.value.is_none(),
+            "jitter_ns doit sortir `null` sans horloge ; obtenu {:?}",
+            jitter_ie.value
+        );
+        let reason_ie = events[0]
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "jitter_null_reason")
+            .expect("jitter_null_reason doit expliquer pourquoi");
+        let reason = reason_ie.value.as_deref().unwrap();
+        assert!(
+            reason.contains("PT 96") || reason.contains("rtpmap"),
+            "raison doit mentionner le PT ou rtpmap : {reason}"
+        );
+        let rate_ie = events[0]
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "jitter_clock_rate_hz")
+            .unwrap();
+        assert!(rate_ie.value.is_none());
+    }
+
+    /// 2.21.79 — PT dynamique 96 avec `a=rtpmap` apportant 16 000 Hz :
+    /// horloge connue → jitter calculé en ticks et converti en ns.
+    #[test]
+    fn jitter_computes_with_dynamic_pt_when_rtpmap_provides_clock_rate() {
+        let mut agg = RtpFlowAggregator::new();
+        agg.register_sdp_flow(SdpFlowRegistration {
+            ip: "10.0.0.2".into(),
+            port: 49170,
+            call_id: "cid-dyn-rtpmap".into(),
+            payload_type: Some(96),
+            clock_rate_hz: Some(16_000),
+        });
+        // 16 kHz : 1 trame audio AMR-WB = 20 ms = 320 ticks RTP.
+        let frame_ns: u64 = 20_000_000;
+        let frame_ticks: u32 = 320;
+        for i in 0..100u16 {
+            let pkt = rtp_packet(96, i, 1000 + i as u32 * frame_ticks, 0xfeed, &[0xaa; 160]);
+            agg.observe_rtp(
+                "10.0.0.1",
+                40000,
+                "10.0.0.2",
+                49170,
+                &pkt,
+                frame_ns.saturating_mul(i as u64),
+                &pr(1 + i as u64),
+                &ts(frame_ns.saturating_mul(i as u64)),
+            );
+        }
+        let events = agg.finish("sha256:cap", "IMS");
+        let jitter_ie = events[0]
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "jitter_ns")
+            .unwrap();
+        let j: u64 = jitter_ie.value.as_deref().unwrap().parse().unwrap();
+        assert!(j < 1_000_000, "jitter attendu ~0, obtenu {j} ns");
+        let rate_ie = events[0]
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "jitter_clock_rate_hz")
+            .unwrap();
+        assert_eq!(rate_ie.value.as_deref(), Some("16000"));
     }
 }

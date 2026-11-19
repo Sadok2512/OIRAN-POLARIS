@@ -1,5 +1,74 @@
 # Changelog
 
+## OIRAN API 2.21.79 + decoder-sip 0.2.0 + decoder-rtp 0.2.0 + correlation-engine 0.6.12 + oiran-decode 0.8.2 — 2026-11-19 — corrections voix sûres (ordre #9 7012275179 CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.74-filter-ready-503` @ `29fe4e3` (= PROD). Lot CLAUDE1 numéroté impair (règle numerology 7007412446). **Trois correctifs sûrs, AVANT le gros chantier GTP-U inner (ligne 11 de l'audit A0-VOIX 7012175926).**
+
+### §1 — Jitter RTP en unités d'horloge RTP (ligne 4)
+
+`decoder-rtp::observe_rtp` calculait `D = |r_delta_ns - s_delta_rtp|` sans conversion d'unités : `r_delta_ns` en ns locaux, `s_delta_rtp` en ticks d'horloge RTP (8 kHz pour PCMU, 90 kHz pour vidéo, etc.). Résultat sans sens physique.
+
+- **Table statique** PT→clock_rate (RFC 3551 §6) pour PT 0..=34 (PCMU/PCMA 8 kHz, G722 8 kHz spécial RFC 3551 §4.5.2, L16 44.1 kHz, MPA 90 kHz, DVI4 variable, vidéo 90 kHz, …).
+- **PT dynamique** (96..=127) : `clock_rate` lu dans SDP `a=rtpmap:<pt> <encoding>/<clock_rate>[/<channels>]` (RFC 4566 §6) et propagé via `SdpFlowRegistration.clock_rate_hz`. Nouveau champ `SdpSummary::media_audio_rtpmap_clock_rate_hz` + parsing dans `decoder-sip::parse_sdp`.
+- **Calcul** : `r_ticks = r_delta_ns × clock_rate / 1e9` en u128 (anti-overflow), `D = |r_ticks - s_delta_rtp|` en ticks, filtre glissant RFC 3550 §6.4.1 `J ← J + (D − J) / 16` en ticks. À l'émission : `jitter_ns = J_ticks × 1e9 / clock_rate`.
+- **Fail-closed** : si aucune `clock_rate` n'est connue (PT dynamique sans rtpmap), `jitter_ns` sort `null` + IE `jitter_null_reason` qui dit pourquoi. **Jamais une valeur fausse.** IE `jitter_clock_rate_hz` ajoutée pour auditer la source d'horloge.
+
+Tests : 4 tests jitter dans `decoder-rtp` (PT 0 PCMU phase parfaite → jitter ~0 ; PT 0 avec retard injecté → jitter mesurable > 0 ; PT 96 dynamique sans rtpmap → `jitter_ns=null` + raison ; PT 96 dynamique avec rtpmap 16 kHz → calcul normal).
+
+### §2 — Pseudonyme SIP unifié avec NAS (ligne 16)
+
+`decoder-sip` émettait `subscriber_pseudonym = pseudonym(key, SUBSCRIBER_PSEUDO_DOMAIN, URI_bytes)`, `decoder-nas` émet `subscriber_pseudonym = pseudonym_subscriber_digits(key, IMSI_digits)` — deux inputs différents, deux pseudos différents, aucun appel rattaché à un abonné NAS.
+
+- Nouveau helper `decoder_sip::extract_subscriber_digits_from_uri` qui reconnaît les formes canoniques 3GPP TS 23.003 §13.4 :
+  - `sip:<imsi>@ims.mnc…mcc….3gppnetwork.org` → IMSI pur
+  - `sip:+<msisdn>@…;user=phone` → MSISDN E.164 sans `+`
+  - `tel:+<msisdn>` → idem
+  - `sips:…` idem `sip:`
+  - User non-numérique ou mixte → `None` (**aucun pseudonyme unifié émis**)
+- Le hash `pseudonym_subscriber_digits(key, digits)` est appliqué aux chiffres canoniques → résultat **identique** à NAS/Diameter/S6a pour la même identité physique.
+- IE renommées : l'ancien `subscriber_pseudonym` (hash URI) devient `from_uri_pseudonym` (présentation opaque, non-unifiée). Le nouveau `subscriber_pseudonym` est émis UNIQUEMENT quand les chiffres sont extractibles. Idem `peer_subscriber_pseudonym` (hash URI) ↔ nouveau `peer_subscriber_pseudonym` (digits-based) + nouveau `to_uri_pseudonym` pour la présentation.
+- `session_identifiers` propage le pseudo unifié avec `pseudonymized: true` pour que la corrélation engine le lise exactement comme les events NAS.
+
+Tests : 3 tests dans `decoder-sip` (`extract_subscriber_digits_from_uri` sur 9 formes canoniques ; `sip_subscriber_pseudonym_equals_nas_pseudonym_on_same_identity` prouve l'égalité ; `sip_without_numeric_user_emits_no_unified_subscriber_pseudonym` prouve la fail-closed).
+
+### §3 — Règles de corrélation DNN=ims ET 5QI=1 EXACT (lignes 14-15)
+
+Nouvelle règle `sip-pdu-ims-5qi1-vonr-exact` dans `correlation-engine::ims_edges_from_events` : émet une arête `EXACT_VONR_DEDICATED_FLOW` entre un SIP et un NAS `PDUSessionEstablishmentRequest` **SEULEMENT SI** les trois preuves concordent dans le même `capture_scope` :
+
+1. événement SIP sur interface IMS ;
+2. événement NAS avec `dnn="ims"` dans ses identifiers ;
+3. événement NGAP transfer portant `five_qi=1` / `fiveqi=1` / `5qi=1` dans ses IE (robustesse cross-version decoder-ngap).
+
+Si DNN=ims OU 5QI=1 manque → aucune arête (« EXACT seulement si les deux preuves concordent. Sinon, pas de liaison. »). Helper `ngap_event_has_5qi_1` tolère les deux orthographes.
+
+Tests : 3 tests dans `correlation-engine` (match complet → 1 arête EXACT ; sans 5QI=1 → aucune arête ; avec 5QI=1 mais DNN=internet → aucune arête).
+
+### MOS : hors scope
+
+Rappel ordre cœur : MOS (ligne 6 de l'audit) **pas dans ce lot**. Sera traité dans un lot ultérieur avec modèle E-model / ITU-T G.107 explicité.
+
+### Design ligne 11 (SIP/RTP dans GTP-U N3)
+
+Rendu dans un commentaire #9 séparé (pas de code). Code attend l'inventaire A0-LAB (ANR1) — sans IMS sur le lab, rien à valider.
+
+### Preuves exécutées en local
+
+```
+cargo test --locked -p decoder-rtp     --lib → 9 passed; 0 failed
+cargo test --locked -p decoder-sip     --lib → 8 passed; 0 failed
+cargo test --locked -p correlation-engine --lib → 39 passed; 0 failed
+cargo test --locked -p oiran-decode    --lib → 15 passed; 0 failed
+cargo test --locked -p live-probe      --lib → 185 passed; 0 failed; 6 ignored
+cargo test --locked -p oiran-api       --lib → 199 passed; 0 failed; 3 ignored
+12 × cargo test --locked -p decoder-rtp --lib -j 2 jitter → 12 × 4 passed; 0 failed
+12 × cargo test --locked -p decoder-sip --lib -j 2 sip_subscriber → 12 × 1 passed; 0 failed
+12 × cargo test --locked -p correlation-engine --lib -j 2 vonr → 12 × 3 passed; 0 failed
+
+(cd OIRAN/vtap && cargo update -w && cargo test --locked -j 2) → 12+3 passed; 0 failed
+python3 /tmp/audit.py OIRAN/Cargo.lock       → OK 137 pkg, 0 > 1.83
+python3 /tmp/audit.py OIRAN/vtap/Cargo.lock  → OK  53 pkg, 0 > 1.83
+```
+
 ## OIRAN API 2.21.74 + live-probe 0.6.26 — 2026-11-19 — `/sessions/filter` 503 jusqu'aux caches READY (ordre #10 7009381757)
 
 Branche `fix/oiran-2.21.74-filter-ready-503`, base exacte `fix/oiran-2.21.72-train @ eaa21f0`. Aucun déploiement.

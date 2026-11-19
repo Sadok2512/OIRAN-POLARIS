@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-rtp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "event-schema",
 ]
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "decoder-sip"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "event-schema",
  "plugin-runtime",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "oiran-decode"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "capture-pcap",
  "decoder-diameter",

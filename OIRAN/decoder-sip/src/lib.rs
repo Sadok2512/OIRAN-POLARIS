@@ -22,8 +22,9 @@
 //! le même id.
 
 use event_schema::{
-    pseudonym, sha256_hex, DecodeStatus, Direction, EvidenceReference, EvidenceState,
-    InformationElement, NormalizedEvent, Protocol, SUBSCRIBER_PSEUDO_DOMAIN,
+    pseudonym, pseudonym_subscriber_digits, sha256_hex, DecodeStatus, Direction,
+    EvidenceReference, EvidenceState, InformationElement, NormalizedEvent, Protocol,
+    SUBSCRIBER_PSEUDO_DOMAIN,
 };
 use plugin_runtime::{
     DecoderCapabilities, DecoderInput, DecoderManifest, DecoderOutput, ProtocolDecoder,
@@ -71,6 +72,13 @@ pub struct SdpSummary {
     /// premier port + les codecs en PT list.
     pub media_audio_port: u16,
     pub media_audio_codec_pts: Vec<u8>,
+    /// 2.21.79 (CLAUDE1, ordre #9 7012275179 §1) — `a=rtpmap:<pt>
+    /// <encoding>/<clock_rate>[/<channels>]` (RFC 4566 §6). Nécessaire
+    /// pour calculer le jitter RTP sur les PT dynamiques (96..=127) où
+    /// l'horloge n'est pas fixée par la table statique RFC 3551 §6.
+    /// Première paire `(pt, clock_rate_hz)` trouvée dans le bloc audio,
+    /// `None` si absent.
+    pub media_audio_rtpmap_clock_rate_hz: Option<u32>,
 }
 
 /// Parse best-effort d'un message SIP à partir de son payload UDP/TCP.
@@ -191,6 +199,50 @@ fn split_name_addr(value: &str) -> (String, String) {
     (uri, tag)
 }
 
+/// 2.21.79 (CLAUDE1, ordre #9 7012275179 §2) — Extrait les chiffres
+/// IMSI/MSISDN canoniques depuis le user-part d'une URI SIP/TEL :
+///
+/// * `sip:208930000000001@ims.mnc093.mcc208.3gppnetwork.org` → `208930000000001` (IMSI, 3GPP TS 23.003 §13.4.2)
+/// * `sip:+33612345678@ims.example.com;user=phone`           → `33612345678` (MSISDN E.164 sans `+`)
+/// * `tel:+33612345678`                                      → `33612345678`
+/// * `sips:…`                                                → idem `sip:`
+/// * `sip:alice@ims.example.com`                             → `None` (user non-numérique)
+/// * `sip:208...999a@...`                                    → `None` (user mixte)
+///
+/// Retourne `None` quand aucune identité numérique canonique n'est
+/// extractible. Le hash NAS est calculé via
+/// `pseudonym_subscriber_digits(key, digits)` sur les mêmes bytes :
+/// deux chemins (NAS et SIP) rendent le MÊME pseudonyme pour la
+/// même identité physique.
+fn extract_subscriber_digits_from_uri(uri: &str) -> Option<Vec<u8>> {
+    let scheme_stripped = uri
+        .strip_prefix("sip:")
+        .or_else(|| uri.strip_prefix("sips:"))
+        .or_else(|| uri.strip_prefix("tel:"))
+        .unwrap_or(uri);
+    // Coupe à `@` (sip/sips) et à `;` (params tel/sip) et `,` (telURI extensions).
+    let user_part = scheme_stripped
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim();
+    // `+<digits>` (E.164) → strip `+`.
+    let canonical = user_part.strip_prefix('+').unwrap_or(user_part);
+    // Filtre : user DOIT être entièrement composé de chiffres ASCII
+    // décimaux et non vide. Pas de tolérance : un user mixte
+    // (`208...999a`) retourne `None`.
+    if canonical.is_empty() || !canonical.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(canonical.as_bytes().to_vec())
+}
+
 /// Parse SDP minimal (RFC 4566) : `c=IN IPx <addr>` + première
 /// `m=audio <port> RTP/AVP <pt...>`.
 fn parse_sdp(body: &[u8]) -> Option<SdpSummary> {
@@ -223,7 +275,26 @@ fn parse_sdp(body: &[u8]) -> Option<SdpSummary> {
                 in_audio_media = false;
             }
         } else if in_audio_media && line.starts_with("a=") {
-            // not yet decoded further
+            // 2.21.79 — `a=rtpmap:<pt> <encoding>/<clock_rate>[/<channels>]`
+            // RFC 4566 §6. On ne garde que la première paire du bloc
+            // audio (celle qui correspond au PT préféré de l'offerer).
+            if summary.media_audio_rtpmap_clock_rate_hz.is_none() {
+                if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+                    let mut parts = rest.split_whitespace();
+                    let _pt = parts.next();
+                    if let Some(encoding_desc) = parts.next() {
+                        let mut subparts = encoding_desc.split('/');
+                        let _encoding_name = subparts.next();
+                        if let Some(rate_str) = subparts.next() {
+                            if let Ok(rate) = rate_str.parse::<u32>() {
+                                if rate > 0 {
+                                    summary.media_audio_rtpmap_clock_rate_hz = Some(rate);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     if summary.media_audio_port == 0 && summary.connection_address.is_empty() {
@@ -346,6 +417,27 @@ fn emit_event(mut msg: SipMessage, input: &DecoderInput<'_>) -> NormalizedEvent 
         let trimmed = uri.split(';').next().unwrap_or(uri).trim();
         pseudonym(key, SUBSCRIBER_PSEUDO_DOMAIN, trimmed.as_bytes())
     };
+    // 2.21.79 (CLAUDE1, ordre #9 7012275179 §2) — extraction des chiffres
+    // IMSI/MSISDN avant pseudonymisation URI, pour que `subscriber_pseudonym`
+    // SIP soit *identique* à `subscriber_pseudonym` NAS sur la même
+    // identité. Les URIs qui ne portent pas de chiffres (ex. `sip:alice@…`)
+    // retombent sur le pseudonyme URI pur (non-unifié, utilisé seulement
+    // pour l'affichage).
+    let from_digits_pseudo = msg
+        .from_uri_pseudonym
+        .as_deref()
+        .and_then(extract_subscriber_digits_from_uri)
+        .map(|digits| pseudonym_subscriber_digits(key, &digits));
+    let to_digits_pseudo = msg
+        .to_uri_pseudonym
+        .as_deref()
+        .and_then(extract_subscriber_digits_from_uri)
+        .map(|digits| pseudonym_subscriber_digits(key, &digits));
+    let request_digits_pseudo = msg
+        .request_uri_pseudonym
+        .as_deref()
+        .and_then(extract_subscriber_digits_from_uri)
+        .map(|digits| pseudonym_subscriber_digits(key, &digits));
     if let Some(uri) = msg.request_uri_pseudonym.as_deref() {
         msg.request_uri_pseudonym = Some(pseudo_uri(uri));
     }
@@ -398,12 +490,41 @@ fn emit_event(mut msg: SipMessage, input: &DecoderInput<'_>) -> NormalizedEvent 
         raw_sha256: None,
         status: DecodeStatus::Decoded,
     });
-    if let Some(uri) = msg.from_uri_pseudonym.as_deref() {
+    // 2.21.79 (CLAUDE1, ordre #9 7012275179 §2) — `subscriber_pseudonym`
+    // UNIFIÉ avec NAS : dérivé des chiffres canoniques IMSI/MSISDN
+    // extraits du user-part de l'URI From. Deux chemins (NAS et SIP)
+    // produisent la MÊME valeur pour la même identité → corrélation
+    // directe par pseudonyme. Le pseudonyme URI pur reste exposé en
+    // `from_uri_pseudonym` pour les cas où le user-part n'est pas
+    // numérique (`sip:alice@…`), afin de ne pas perdre la provenance
+    // présentationnelle. L'IE `subscriber_pseudonym` n'est émise QUE
+    // quand l'extraction a réussi — pas de valeur fausse.
+    if let Some(unified) = from_digits_pseudo.as_deref() {
         ies.push(InformationElement {
             id: None,
             name: "subscriber_pseudonym".into(),
+            length: unified.len() as u32,
+            value: Some(unified.into()),
+            raw_sha256: None,
+            status: DecodeStatus::Decoded,
+        });
+    }
+    if let Some(uri) = msg.from_uri_pseudonym.as_deref() {
+        ies.push(InformationElement {
+            id: None,
+            name: "from_uri_pseudonym".into(),
             length: uri.len() as u32,
             value: Some(uri.into()),
+            raw_sha256: None,
+            status: DecodeStatus::Decoded,
+        });
+    }
+    if let Some(unified) = to_digits_pseudo.as_deref() {
+        ies.push(InformationElement {
+            id: None,
+            name: "peer_subscriber_pseudonym".into(),
+            length: unified.len() as u32,
+            value: Some(unified.into()),
             raw_sha256: None,
             status: DecodeStatus::Decoded,
         });
@@ -411,9 +532,19 @@ fn emit_event(mut msg: SipMessage, input: &DecoderInput<'_>) -> NormalizedEvent 
     if let Some(uri) = msg.to_uri_pseudonym.as_deref() {
         ies.push(InformationElement {
             id: None,
-            name: "peer_subscriber_pseudonym".into(),
+            name: "to_uri_pseudonym".into(),
             length: uri.len() as u32,
             value: Some(uri.into()),
+            raw_sha256: None,
+            status: DecodeStatus::Decoded,
+        });
+    }
+    if let Some(unified) = request_digits_pseudo.as_deref() {
+        ies.push(InformationElement {
+            id: None,
+            name: "request_subscriber_pseudonym".into(),
+            length: unified.len() as u32,
+            value: Some(unified.into()),
             raw_sha256: None,
             status: DecodeStatus::Decoded,
         });
@@ -479,6 +610,19 @@ fn emit_event(mut msg: SipMessage, input: &DecoderInput<'_>) -> NormalizedEvent 
             raw_sha256: None,
             status: DecodeStatus::Decoded,
         });
+        // 2.21.79 (CLAUDE1, ordre #9 7012275179 §1) — clock_rate SDP
+        // propagée pour que `RtpFlowAggregator` puisse calculer le
+        // jitter en ticks RTP sur les PT dynamiques (96..=127).
+        if let Some(rate) = sdp.media_audio_rtpmap_clock_rate_hz {
+            ies.push(InformationElement {
+                id: None,
+                name: "sdp.m.audio.rtpmap_clock_rate_hz".into(),
+                length: 4,
+                value: Some(rate.to_string()),
+                raw_sha256: None,
+                status: DecodeStatus::Decoded,
+            });
+        }
     }
 
     let mut session_identifiers = Vec::new();
@@ -487,6 +631,17 @@ fn emit_event(mut msg: SipMessage, input: &DecoderInput<'_>) -> NormalizedEvent 
             name: "sip_call_id".into(),
             value: msg.call_id.clone(),
             pseudonymized: false,
+        });
+    }
+    // 2.21.79 (CLAUDE1, ordre #9 7012275179 §2) — propage le pseudo
+    // unifié dans `session_identifiers` pour que la corrélation moteur
+    // (`correlation-engine::subscriber_key`) rattache SIP ↔ NAS via le
+    // même filtre `subscriber_pseudonym` que le reste du pipeline.
+    if let Some(unified) = from_digits_pseudo.as_deref() {
+        session_identifiers.push(event_schema::NamedValue {
+            name: "subscriber_pseudonym".into(),
+            value: unified.into(),
+            pseudonymized: true,
         });
     }
 
@@ -681,5 +836,148 @@ Content-Length: 0\r\n\
         let out = d.decode(&input(b"\x00\x01\x02not SIP", &k, "IMS"));
         assert_eq!(out.status, DecodeStatus::Malformed);
         assert_eq!(out.events[0].message_name, "MalformedSipMessage");
+    }
+
+    /// 2.21.79 (CLAUDE1, ordre #9 7012275179 §2) — table de vérité de
+    /// l'extracteur de chiffres : IMSI pur, MSISDN E.164, Tel URI, user
+    /// non-numérique, user mixte.
+    #[test]
+    fn extract_subscriber_digits_from_uri_canonical_forms() {
+        // IMSI 3GPP TS 23.003 §13.4.2 (sip:imsi@ims.mncXXX.mccYYY.3gppnetwork.org)
+        assert_eq!(
+            extract_subscriber_digits_from_uri("sip:208930000000001@ims.mnc093.mcc208.3gppnetwork.org"),
+            Some(b"208930000000001".to_vec())
+        );
+        // sips: idem
+        assert_eq!(
+            extract_subscriber_digits_from_uri("sips:208930000000001@ims.mnc093.mcc208.3gppnetwork.org"),
+            Some(b"208930000000001".to_vec())
+        );
+        // MSISDN E.164 — +33612345678 → 33612345678
+        assert_eq!(
+            extract_subscriber_digits_from_uri("sip:+33612345678@ims.example.com;user=phone"),
+            Some(b"33612345678".to_vec())
+        );
+        // tel: URI — même pattern
+        assert_eq!(
+            extract_subscriber_digits_from_uri("tel:+33612345678"),
+            Some(b"33612345678".to_vec())
+        );
+        // Parameters après `;` ignorés
+        assert_eq!(
+            extract_subscriber_digits_from_uri("sip:208930000000001@ims.example.com;transport=udp"),
+            Some(b"208930000000001".to_vec())
+        );
+        // User textuel → None (pas d'identité numérique)
+        assert_eq!(extract_subscriber_digits_from_uri("sip:alice@ims.example.com"), None);
+        // User mixte → None (strictement numérique attendu)
+        assert_eq!(extract_subscriber_digits_from_uri("sip:208abc999@ims.example.com"), None);
+        // User vide → None
+        assert_eq!(extract_subscriber_digits_from_uri("sip:@ims.example.com"), None);
+        // URI sans schéma supporté → fallback (user part = chaîne complète)
+        assert_eq!(extract_subscriber_digits_from_uri("bob@ims.example.com"), None);
+    }
+
+    /// 2.21.79 (CLAUDE1, ordre #9 7012275179 §2) — INVARIANT : le
+    /// `subscriber_pseudonym` SIP, dérivé des chiffres canoniques
+    /// extraits de l'URI From, DOIT ÉGALER le pseudonyme produit
+    /// par `event_schema::pseudonym_subscriber_digits` sur les MÊMES
+    /// chiffres (= ce que NAS fait sur son SUPI). Donc SIP ↔ NAS se
+    /// rejoignent sur la même identité physique.
+    #[test]
+    fn sip_subscriber_pseudonym_equals_nas_pseudonym_on_same_identity() {
+        let k = key();
+        let imsi = b"208930000000001"; // 15 digits
+        let nas_pseudo = pseudonym_subscriber_digits(&k, imsi);
+
+        // SIP From URI porte le même IMSI en user-part.
+        let payload = format!(
+            "\
+INVITE sip:208930000000002@ims.example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-vonr-sub\r\n\
+From: <sip:208930000000001@ims.mnc093.mcc208.3gppnetwork.org>;tag=t1\r\n\
+To: <sip:208930000000002@ims.mnc093.mcc208.3gppnetwork.org>\r\n\
+Call-ID: cid-sub-unification\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\
+\r\n"
+        );
+        let d = SipDecoder;
+        let out = d.decode(&input(payload.as_bytes(), &k, "IMS"));
+        assert_eq!(out.status, DecodeStatus::Decoded);
+        let ev = &out.events[0];
+
+        // IE `subscriber_pseudonym` == NAS pseudonym.
+        let sip_sub = ev
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "subscriber_pseudonym")
+            .expect("subscriber_pseudonym doit être émis quand l'URI porte des chiffres")
+            .value
+            .as_deref()
+            .unwrap();
+        assert_eq!(sip_sub, nas_pseudo, "SIP et NAS doivent produire le MÊME pseudonyme");
+
+        // Pseudo URI (`from_uri_pseudonym`) existe aussi, mais c'est une
+        // valeur DIFFÉRENTE (hash de l'URI complète, pas seulement des
+        // chiffres canoniques).
+        let from_uri_pseudo = ev
+            .information_elements
+            .iter()
+            .find(|ie| ie.name == "from_uri_pseudonym")
+            .unwrap()
+            .value
+            .as_deref()
+            .unwrap();
+        assert_ne!(from_uri_pseudo, nas_pseudo);
+
+        // session_identifiers doit contenir le pseudo unifié pour que
+        // la corrélation engine le lise.
+        let si_sub = ev
+            .session_identifiers
+            .iter()
+            .find(|v| v.name == "subscriber_pseudonym")
+            .expect("subscriber_pseudonym doit être propagé dans session_identifiers");
+        assert_eq!(si_sub.value, nas_pseudo);
+        assert!(si_sub.pseudonymized);
+    }
+
+    /// 2.21.79 — URI alphabétique (`sip:alice@…`) → aucun
+    /// `subscriber_pseudonym` émis (pas de valeur fausse). Seul
+    /// `from_uri_pseudonym` (opaque, présentationnel) reste.
+    #[test]
+    fn sip_without_numeric_user_emits_no_unified_subscriber_pseudonym() {
+        let k = key();
+        let payload = b"\
+INVITE sip:bob@ims.example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-vonr-alpha\r\n\
+From: <sip:alice@ims.example.com>;tag=ta\r\n\
+To: <sip:bob@ims.example.com>\r\n\
+Call-ID: cid-alpha\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\
+\r\n";
+        let d = SipDecoder;
+        let out = d.decode(&input(payload, &k, "IMS"));
+        let ev = &out.events[0];
+        assert!(
+            ev.information_elements
+                .iter()
+                .find(|ie| ie.name == "subscriber_pseudonym")
+                .is_none(),
+            "aucun subscriber_pseudonym ne doit sortir sans chiffres extractibles"
+        );
+        assert!(
+            ev.session_identifiers
+                .iter()
+                .find(|v| v.name == "subscriber_pseudonym")
+                .is_none(),
+            "aucun subscriber_pseudonym ne doit figurer dans session_identifiers non plus"
+        );
+        // from_uri_pseudonym (opaque, non-unifié) reste présent.
+        assert!(ev
+            .information_elements
+            .iter()
+            .any(|ie| ie.name == "from_uri_pseudonym"));
     }
 }
