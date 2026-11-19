@@ -5374,13 +5374,24 @@ async fn cleanup_lte_run(
         srsenb_stopped,
         sidecars_removed,
         epc_healthy,
+        // 0.29.18 (ordre #9 7022643606) — `dumpcaps_preserved` reste
+        // tracé pour l'audit (invariant de lab : 12 dumpcap externes
+        // actifs) mais n'entre PLUS dans le critère de propreté du run.
+        // L'arrêt d'urgence est une sortie de secours : son succès ne
+        // doit JAMAIS dépendre de l'état du lab (grant, garde CPU,
+        // infrastructure dumpcap). Si les 4 vérifications moteur
+        // (UE/ENB stoppés, sidecars retirés, EPC healthy) passent, le
+        // run est CLEAN ; `dumpcaps_preserved=false` est une alerte
+        // d'environnement remontée par le gate de START, pas un gate
+        // de STOP. Pré-0.29.18 (commit 95e8b05) incluait cet invariant
+        // dans l'AND de propreté, ce qui bloquait tout emergency stop
+        // en environnement de test et masquait le vrai état du run.
         dumpcaps_preserved: external_dumpcap_count() == 12,
     };
     let clean = cleanup.srsue_stopped
         && cleanup.srsenb_stopped
         && cleanup.sidecars_removed
-        && cleanup.epc_healthy
-        && cleanup.dumpcaps_preserved;
+        && cleanup.epc_healthy;
     let _ =
         state.lte_runs_v2.lock().map(|mut store| {
             if clean {

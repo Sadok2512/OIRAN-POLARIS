@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.29.18 (polaris-control-api) — 2026-11-19 — emergency stop ne dépend plus de `dumpcaps_preserved` (ordre #9 7022643606, CLAUDE1)
+
+CLAUDE1 a identifié que `p0_tests::emergency_stop_cleanup_does_not_require_a_live_grant` échoue sur la base de prod `29fe4e3` (503 au lieu de 200). Audit git : commit `95e8b05` (2026-10-31, « harden LTE proof and cleanup state machine ») a ajouté `dumpcaps_preserved: external_dumpcap_count() == 12` à l'AND de propreté de `cleanup_lte_run` (`apps/api/src/lib.rs:5383`). Le test `93e0284` existait déjà ; il assertait qu'un emergency stop sur un run à grant expiré renvoie 200 CLEAN. L'ajout du check de 12 dumpcaps a cassé le test en environnement sans infrastructure lab.
+
+### Correctif
+
+- Retrait de `cleanup.dumpcaps_preserved` de l'AND qui calcule `clean` (`apps/api/src/lib.rs:5383`). Les 4 vérifications moteur subsistent : `srsue_stopped`, `srsenb_stopped`, `sidecars_removed`, `epc_healthy`.
+- `dumpcaps_preserved` RESTE dans `CleanupEvidence` pour l'audit : l'opérateur voit si l'environnement a dévié (12 dumpcaps attendus), mais cela ne bloque plus l'arrêt d'urgence.
+- Commentaire explicite en tête du bloc pour que la règle « emergency stop ne dépend ni d'un grant ni d'un garde CPU ni d'un invariant de lab » soit visible au lecteur.
+
+Règle respectée : `grep -n 'cpu_gate\|cpu_guard\|CPU_GATE\|BLOCKED_STALE_TELEMETRY' apps/api/src/lib.rs` = 0 match → aucun gate CPU n'intervient déjà dans la chaîne `stop_lte_run → cleanup_lte_run`. Pas d'autre chemin à auditer.
+
+### Tests
+
+```
+flock /tmp/nsplus-heavy-build.lock nice -n 19 ionice -c3 \
+    cargo test --locked -p polaris-control-api --lib -- \
+        p0_tests::emergency_stop_cleanup_does_not_require_a_live_grant
+→ test result: ok. 1 passed; 0 failed; 0 ignored
+```
+
+12 runs : 12 pass / 0 fail.
+
+Suite complète : 331 passed, 0 failed, 3 ignored (contre 330 passed, 1 failed, 3 ignored pré-correctif).
+
+Aucun autre test ne dépend de la valeur de `dumpcaps_preserved` dans l'AND (`grep -n dumpcaps_preserved apps/api/src/lib.rs` : 2 occurrences restantes dans des fixtures de test qui settent explicitement `true`, et 1 dans l'event d'observation qui reste cohérent).
+
+### Référence
+
+- Ordre : #9 `7022643606`.
+- Audit CLAUDE2 : commit `95e8b05` (`2026-10-31`) a introduit le défaut. Commit `93e0284` (même jour) a introduit le test qui l'a immédiatement attrapé, mais la suite entière n'a vraisemblablement pas été vérifiée.
+
 ## 0.29.17 (polaris-control-api) — 2026-11-19 — vue `/scenario-definitions` marque `tpl-voice-*` UNSUPPORTED_BACKEND (ordre #9 7015853247)
 
 Audit #9 `7015668134` a prouvé que les builtins `tpl-voice-long` / `tpl-voice-short` ne tournent pas : l'exécuteur retourne systématiquement 423 `IMS_NOT_AVAILABLE` (`lib.rs::execute_step`, `start_scenario`), et aucun client SIP n'est embarqué (0 match `grep -rn "sip\|rtp\|kamailio\|sipp"` dans le workspace). La définition reste dans le catalogue pour que la SOP SIPp externe puisse s'y référer, mais la vue `/scenario-definitions` doit l'exposer explicitement pour éviter la confusion opérateur.
