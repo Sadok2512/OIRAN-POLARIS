@@ -1,5 +1,35 @@
 # Changelog
 
+## OIRAN API 2.21.67 + live-probe 0.6.26 + session-engine 0.5.25 — 2026-11-19 — décomposition phase 01 (ordre #9 7006049224 CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.64-merge` (`2468bfc`). Pivot décidé par le cœur après mesure réelle ANR2 (#10 7005944378) : le pic cgroup 2,98 GB en prod 2.21.57 est atteint **pendant la phase 01** (`load_paths_spilling_representatives_with_progress`), pas en phase 07/08 comme supposé initialement. La branche 2.21.65 (streaming callflows, levier A) reste sur sa branche sans push ultérieur ; son gain mesuré sur les sondes qu'elle avait ajoutées est ≈ 0.
+
+### Pourquoi
+
+ANR2 a publié `vmrss_kb`, `vmhwm_kb` et `cgroup_peak_kb` pour chaque phase 00c → 09 (commentaire 7005944378) : les trois arrivent déjà au plafond à `01-after-streaming-representatives`. Les phases suivantes ne contribuent plus que quelques dizaines de kilo-octets au pic. **Le fix doit viser la phase 01, et l'audit doit savoir si le pic est page cache (file) ou anonyme (anon) — puis quelle sous-opération y contribue.**
+
+### Correctif 2.21.67 (décomposition pure instrumentation)
+
+- Nouvelle fonction `session_engine::load_paths_spilling_representatives_with_stages<F, G>` — même comportement et sortie (`StreamingRepresentativesIndex`) que `_with_progress`, plus un **second** callback `stage(name, counts)` invoqué à chaque transition sous-phase.
+- `load_paths_spilling_representatives_with_progress` devient un alias nul construit par-dessus `_with_stages` : API publique inchangée.
+- Points de sonde émis dans l'ordre d'exécution : `01-00-start`, `01-10-shard-open`, `01-20-shard-lines` (tous les 100 k events), `01-30-pre-flush`, `01-31-post-flush`, `01-40-shard-end`, `01-50-scan-end`, `01-55-post-final-flush`, `01-60-merge-start`, `01-70-merge-progress` (tous les 100 k merged), `01-80-merge-end`, `01-90-post-sort`, `01-99-end`. Chaque point porte des compteurs réels : `shard_idx`, `shard_bytes`, `records_in_flight`, `retained_bytes_in_flight`, `run_count`, `source_event_count`, `events_len`, `merged_count`. Jamais d'estimation.
+- Nouveau helper `live-probe::trace_publication_rss_counts` — même format `PUBLICATION_RSS_TRACE phase=... anon_kb=... file_kb=... cgroup_anon_kb=... cgroup_file_kb=... cgroup_peak_kb=...` qu'ANR2 ingère déjà, plus les compteurs passés par `stage(...)` en suffixe `key=value ...`.
+- `publish_events_to_dataset_dir` consomme maintenant `_with_stages` et les traduit directement en `PUBLICATION_RSS_TRACE phase=01-...`.
+
+### Byte-identique (12 runs à 0 échec)
+
+- Test `spilling_with_stages_matches_with_progress_byte_identical` (session-engine) : compare `serde_json::to_vec_pretty` du champ `events` de `StreamingRepresentativesIndex` entre `_with_progress` et `_with_stages` sur un fixture PFCP (3 events, N4) qui exerce la compaction par `publication_semantic_key`.
+- Test `spilling_with_stages_byte_identical_twelve_consecutive_runs` : 12 passes dans le même binaire, exposant toute dérive d'ordinal global (`REPRESENTATIVE_RUN_SEQUENCE`).
+- Lot aussi vérifié par 12 invocations `cargo test` séparées.
+
+### Zéro gain visé par 2.21.67
+
+Cette version est une **instrumentation**. Elle ne retire aucun octet du pic. Le but est que la prochaine mesure ANR1/ANR2 montre, par sous-phase :
+- où `cgroup_file_kb` monte (= page cache à traiter avec `POSIX_FADV_DONTNEED` mieux calibré) ;
+- où `cgroup_anon_kb` monte (= RAM applicative : `records: Vec<SpilledRepresentative>`, `events: Vec<EventRecord>` ou leurs expansions).
+
+Le levier B (représentants compacts ≈ 400 B contre 1,1–1,2 Ko sur 250 k entrées → ~100 MB utile, soit plusieurs centaines de MB RSS après multiplication glibc) sera chiffré **après** la mesure, pas avant.
+
 ## OIRAN API 2.21.64 — 2026-11-19 — fusion HPACK/préchauffage et comptage callflow enrichi
 
 Upgrade **patch** sans déploiement, basé sur 2.21.62 (`8eeadf2`) et 2.21.63 (`68b3348`). 2.21.63 inclut déjà les lots filtre 2.21.56 et cache de lignes 2.21.61.

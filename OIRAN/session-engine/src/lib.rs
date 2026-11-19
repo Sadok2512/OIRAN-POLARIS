@@ -1090,14 +1090,49 @@ pub fn load_paths_spilling_representatives_with_progress<F>(
     paths: &[PathBuf],
     staging_root: &Path,
     memory_cap_bytes: usize,
-    mut progress: F,
+    progress: F,
 ) -> Result<StreamingRepresentativesIndex, String>
 where
     F: FnMut(usize, usize),
 {
+    load_paths_spilling_representatives_with_stages(
+        paths,
+        staging_root,
+        memory_cap_bytes,
+        progress,
+        |_: &str, _: &[(&str, u64)]| {},
+    )
+}
+
+/// 2.21.67 (CLAUDE1, ordre #9 7006049224) — variante avec un second
+/// callback `stage(name, counts)` invoqué à chaque transition
+/// sous-phase 01-xx. Le call-site (live-probe) le traduit en
+/// `PUBLICATION_RSS_TRACE phase=01-...` via
+/// `trace_publication_rss_counts`. Le comportement et la sortie
+/// (`StreamingRepresentativesIndex`) sont rigoureusement inchangés
+/// par rapport à `_with_progress` : les sondes sont des pure hooks
+/// d'observation, aucun allocator n'est touché.
+pub fn load_paths_spilling_representatives_with_stages<F, G>(
+    paths: &[PathBuf],
+    staging_root: &Path,
+    memory_cap_bytes: usize,
+    mut progress: F,
+    mut stage: G,
+) -> Result<StreamingRepresentativesIndex, String>
+where
+    F: FnMut(usize, usize),
+    G: FnMut(&str, &[(&str, u64)]),
+{
     if memory_cap_bytes == 0 {
         return Err("representative run memory cap must be greater than zero".into());
     }
+    stage(
+        "01-00-start",
+        &[
+            ("shard_count", paths.len() as u64),
+            ("memory_cap_bytes", memory_cap_bytes as u64),
+        ],
+    );
     let sequence = REPRESENTATIVE_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let staging_dir = staging_root.join(format!(
         "representatives-{}-{sequence}",
@@ -1111,8 +1146,20 @@ where
     let mut run_paths = Vec::<PathBuf>::new();
     let mut source_event_count = 0usize;
     let mut ordinal = 0u64;
-    for path in paths {
+    for (shard_idx, path) in paths.iter().enumerate() {
         let file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let shard_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        stage(
+            "01-10-shard-open",
+            &[
+                ("shard_idx", shard_idx as u64),
+                ("shard_bytes", shard_size),
+                ("records_in_flight", records.len() as u64),
+                ("retained_bytes_in_flight", retained_bytes as u64),
+                ("run_count", run_paths.len() as u64),
+                ("source_event_count", source_event_count as u64),
+            ],
+        );
         let mut reader = BufReader::new(&file);
         let mut line = String::new();
         let mut line_no = 0usize;
@@ -1151,12 +1198,40 @@ where
             );
             records.push(record);
             if retained_bytes >= memory_cap_bytes {
+                stage(
+                    "01-30-pre-flush",
+                    &[
+                        ("run_idx", run_paths.len() as u64),
+                        ("records_in_flight", records.len() as u64),
+                        ("retained_bytes_in_flight", retained_bytes as u64),
+                        ("source_event_count", source_event_count as u64),
+                    ],
+                );
                 let path = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
                 run_paths.push(path);
                 retained_bytes = 0;
+                stage(
+                    "01-31-post-flush",
+                    &[
+                        ("run_count", run_paths.len() as u64),
+                        ("records_in_flight", records.len() as u64),
+                        ("source_event_count", source_event_count as u64),
+                    ],
+                );
             }
             if source_event_count % 100_000 == 0 {
                 progress(source_event_count, 0);
+                stage(
+                    "01-20-shard-lines",
+                    &[
+                        ("shard_idx", shard_idx as u64),
+                        ("source_event_count", source_event_count as u64),
+                        ("records_in_flight", records.len() as u64),
+                        ("retained_bytes_in_flight", retained_bytes as u64),
+                        ("run_count", run_paths.len() as u64),
+                        ("consumed_bytes", consumed_bytes),
+                    ],
+                );
             }
             if consumed_bytes.saturating_sub(advised_bytes) >= 16 * 1024 * 1024 {
                 advise_file_range_no_longer_needed(
@@ -1172,18 +1247,52 @@ where
             advised_bytes,
             consumed_bytes.saturating_sub(advised_bytes),
         );
+        stage(
+            "01-40-shard-end",
+            &[
+                ("shard_idx", shard_idx as u64),
+                ("shard_lines", line_no as u64),
+                ("shard_bytes_consumed", consumed_bytes),
+                ("records_in_flight", records.len() as u64),
+                ("run_count", run_paths.len() as u64),
+            ],
+        );
     }
+    stage(
+        "01-50-scan-end",
+        &[
+            ("source_event_count", source_event_count as u64),
+            ("records_in_flight", records.len() as u64),
+            ("retained_bytes_in_flight", retained_bytes as u64),
+            ("run_count", run_paths.len() as u64),
+        ],
+    );
     if !records.is_empty() {
         let path = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
         run_paths.push(path);
     }
+    stage(
+        "01-55-post-final-flush",
+        &[
+            ("run_count", run_paths.len() as u64),
+            ("source_event_count", source_event_count as u64),
+        ],
+    );
 
     let mut readers = run_paths
         .iter()
         .cloned()
         .map(RepresentativeRunReader::open)
         .collect::<Result<Vec<_>, _>>()?;
+    stage(
+        "01-60-merge-start",
+        &[
+            ("run_count", run_paths.len() as u64),
+            ("reader_count", readers.len() as u64),
+        ],
+    );
     let mut events = Vec::<EventRecord>::new();
+    let mut merged_count: u64 = 0;
     loop {
         let Some(next_key) = readers
             .iter()
@@ -1207,8 +1316,29 @@ where
             }
         }
         events.push(winner.expect("at least one run owns the minimum key").event);
+        merged_count = merged_count.saturating_add(1);
+        if merged_count % 100_000 == 0 {
+            stage(
+                "01-70-merge-progress",
+                &[
+                    ("merged_count", merged_count),
+                    ("events_len", events.len() as u64),
+                ],
+            );
+        }
     }
+    stage(
+        "01-80-merge-end",
+        &[
+            ("merged_count", merged_count),
+            ("events_len", events.len() as u64),
+        ],
+    );
     deterministic_sort(&mut events);
+    stage(
+        "01-90-post-sort",
+        &[("events_len", events.len() as u64)],
+    );
     progress(source_event_count, events.len());
 
     for path in run_paths {
@@ -1216,6 +1346,13 @@ where
     }
     fs::remove_dir(&staging_dir)
         .map_err(|error| format!("{}: {error}", staging_dir.display()))?;
+    stage(
+        "01-99-end",
+        &[
+            ("events_len", events.len() as u64),
+            ("source_event_count", source_event_count as u64),
+        ],
+    );
     Ok(StreamingRepresentativesIndex {
         events,
         source_event_count,
@@ -3492,6 +3629,139 @@ mod tests {
         let representative = &index.events[0];
         assert!(representative.first_identifier("pfcp_sequence").is_some());
         assert!(representative.first_identifier("pdr_id").is_some());
+    }
+
+    /// 2.21.67 (CLAUDE1, ordre #9 7006049224) — l'instrumentation
+    /// sous-phase 01 doit être une pure observation : la sortie
+    /// `StreamingRepresentativesIndex` (`events` + `source_event_count`)
+    /// doit être strictement identique entre
+    /// `load_paths_spilling_representatives_with_progress` (sans sondes)
+    /// et `_with_stages` (avec sondes). 12 passes dans le même binaire
+    /// pour exposer toute dérive d'ordinal global
+    /// (`REPRESENTATIVE_RUN_SEQUENCE`).
+    fn spilling_byte_identical_fixture() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!(
+            "oiran-stages-eq-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test"),
+        ));
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap());
+        for (packet, sequence, pdr) in [(1, "100", "1"), (2, "101", "2"), (3, "102", "1")] {
+            let record = serde_json::json!({
+                "event_id": format!("evt-{packet}"),
+                "capture_id": "cap",
+                "capture_point_id": "N4",
+                "timestamp": {"seconds":1,"nanoseconds":packet,"raw_ticks":packet,"display":"1Z"},
+                "interface": "N4",
+                "protocol": "PFCP",
+                "message_name": "SessionModificationRequest",
+                "source_endpoint": {"address":"a","network_function":"SMF"},
+                "destination_endpoint": {"address":"b","network_function":"UPF"},
+                "direction": "CORE_TO_CORE",
+                "session_identifiers": [
+                    {"name":"seid","value":"42","pseudonymized":false},
+                    {"name":"teid","value":"0x01020304","pseudonymized":false},
+                    {"name":"pfcp_sequence","value":sequence,"pseudonymized":false},
+                    {"name":"pdr_id","value":pdr,"pseudonymized":false}
+                ],
+                "information_elements": [
+                    {"name":"Create PDR","value":format!("pdr_id={pdr},far_id={pdr},teid=0x01020304,ipv4=10.0.0.2")}
+                ],
+                "decoding_status": "DECODED",
+                "decoder_name": "test",
+                "decoder_version": "1",
+                "raw_payload_reference": "sha256:test",
+                "packet_references": [{"source_file":"x","packet_number":packet,"byte_offset":0,"interface_id":0,"captured_length":1,"original_length":1}],
+                "errors": []
+            });
+            writeln!(writer, "{record}").unwrap();
+        }
+        writer.flush().unwrap();
+
+        let staging_legacy = std::env::temp_dir().join(format!(
+            "oiran-stages-eq-legacy-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("l"),
+        ));
+        let staging_stages = std::env::temp_dir().join(format!(
+            "oiran-stages-eq-stages-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("s"),
+        ));
+        std::fs::create_dir_all(&staging_legacy).unwrap();
+        std::fs::create_dir_all(&staging_stages).unwrap();
+
+        let legacy = load_paths_spilling_representatives_with_progress(
+            &[tmp.clone()],
+            &staging_legacy,
+            64 * 1024 * 1024,
+            |_, _| {},
+        )
+        .unwrap();
+        let mut stages_seen: Vec<String> = Vec::new();
+        let staged = load_paths_spilling_representatives_with_stages(
+            &[tmp.clone()],
+            &staging_stages,
+            64 * 1024 * 1024,
+            |_, _| {},
+            |name, _| stages_seen.push(name.to_string()),
+        )
+        .unwrap();
+
+        std::fs::remove_file(&tmp).unwrap();
+        let _ = std::fs::remove_dir_all(&staging_legacy);
+        let _ = std::fs::remove_dir_all(&staging_stages);
+
+        assert_eq!(
+            legacy.source_event_count, staged.source_event_count,
+            "source_event_count diverge entre _with_progress et _with_stages"
+        );
+        assert_eq!(
+            legacy.events.len(),
+            staged.events.len(),
+            "nombre de représentants diverge entre _with_progress et _with_stages"
+        );
+        let left = serde_json::to_vec_pretty(&legacy.events).unwrap();
+        let right = serde_json::to_vec_pretty(&staged.events).unwrap();
+        assert_eq!(
+            left, right,
+            "sortie JSONL byte-pretty diverge entre _with_progress et _with_stages"
+        );
+        // Les sondes attendues doivent toutes avoir été émises au moins
+        // une fois pour ce fixture (3 events, 1 shard, 1 run).
+        for expected in [
+            "01-00-start",
+            "01-10-shard-open",
+            "01-40-shard-end",
+            "01-50-scan-end",
+            "01-55-post-final-flush",
+            "01-60-merge-start",
+            "01-80-merge-end",
+            "01-90-post-sort",
+            "01-99-end",
+        ] {
+            assert!(
+                stages_seen.iter().any(|s| s == expected),
+                "sonde manquante : {expected} (vues : {:?})",
+                stages_seen
+            );
+        }
+    }
+
+    #[test]
+    fn spilling_with_stages_matches_with_progress_byte_identical() {
+        spilling_byte_identical_fixture();
+    }
+
+    #[test]
+    fn spilling_with_stages_byte_identical_twelve_consecutive_runs() {
+        for run in 1..=12u32 {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                spilling_byte_identical_fixture,
+            ))
+            .unwrap_or_else(|_| panic!("byte-identical fixture failed at run {run}/12"));
+        }
     }
 
     /// Gate mémoire 2.11.12. Exécution volontairement explicite :

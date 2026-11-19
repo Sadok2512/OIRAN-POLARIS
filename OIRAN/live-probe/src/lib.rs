@@ -6932,7 +6932,14 @@ impl CaptureManager {
         let representative_staging = dataset_dir
             .join(".publish-staging")
             .join("representatives");
-        let index = session_engine::load_paths_spilling_representatives_with_progress(
+        // 2.21.67 (CLAUDE1, ordre #9 7006049224) : décomposition de la
+        // phase 01 (pic cgroup 2,98 GB sur prod 2.21.57, ANR2 #10
+        // 7005944378). Le callback `stage(name, counts)` reçoit les
+        // transitions sous-phase 01-xx avec des COMPTEURS RÉELS ; on
+        // les pousse tels quels dans `trace_publication_rss_counts`
+        // (même format `PUBLICATION_RSS_TRACE phase=...` déjà parsé
+        // par ANR2). Zéro extrapolation.
+        let index = session_engine::load_paths_spilling_representatives_with_stages(
             &event_paths,
             &representative_staging,
             PUBLICATION_REPRESENTATIVE_RUN_MEMORY_BYTES,
@@ -6942,6 +6949,14 @@ impl CaptureManager {
                     "00c-streaming-representatives",
                     scanned_events,
                     retained_events,
+                );
+            },
+            |stage_name, counts| {
+                trace_publication_rss_counts(
+                    publication_started_epoch_ms,
+                    stage_name,
+                    None,
+                    counts,
                 );
             },
         )?;
@@ -10757,6 +10772,7 @@ pub(crate) fn trace_publication_rss(
         phase,
         0,
         indexed_events.unwrap_or(0),
+        "",
     );
 }
 
@@ -10771,6 +10787,33 @@ pub(crate) fn trace_publication_rss_progress(
         phase,
         scanned_events,
         indexed_events,
+        "",
+    );
+}
+
+/// 2.21.67 (CLAUDE1, ordre #9 7006049224) — même ligne que
+/// `trace_publication_rss` plus des COMPTEURS RÉELS passés par le
+/// call-site (shard_idx, records_in_flight, retained_bytes_in_flight,
+/// run_count, merged_count, etc.). Pas d'estimation. Utilisé par
+/// `load_paths_spilling_representatives_with_stages` via un callback
+/// `stage(name, counts)`.
+pub(crate) fn trace_publication_rss_counts(
+    publication_started_epoch_ms: u64,
+    phase: &str,
+    indexed_events: Option<usize>,
+    counts: &[(&str, u64)],
+) {
+    let mut suffix = String::new();
+    for (key, value) in counts {
+        use std::fmt::Write as _;
+        let _ = write!(&mut suffix, " {key}={value}");
+    }
+    trace_publication_rss_detail(
+        publication_started_epoch_ms,
+        phase,
+        0,
+        indexed_events.unwrap_or(0),
+        &suffix,
     );
 }
 
@@ -10779,6 +10822,7 @@ fn trace_publication_rss_detail(
     phase: &str,
     scanned_events: usize,
     indexed_events: usize,
+    extras_suffix: &str,
 ) {
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     let value = |name: &str| {
@@ -10824,7 +10868,7 @@ fn trace_publication_rss_detail(
         .unwrap_or(0)
         / 1024;
     eprintln!(
-        "PUBLICATION_RSS_TRACE phase={phase} elapsed_ms={elapsed_ms} scanned_events={scanned_events} indexed_events={indexed_events} anon_kb={} file_kb={} vmrss_kb={} vmhwm_kb={} vmpeak_kb={} cgroup_source={SERVICE_CGROUP} cgroup_anon_kb={} cgroup_file_kb={} cgroup_shmem_kb={} cgroup_peak_kb={cgroup_peak_kb}",
+        "PUBLICATION_RSS_TRACE phase={phase} elapsed_ms={elapsed_ms} scanned_events={scanned_events} indexed_events={indexed_events} anon_kb={} file_kb={} vmrss_kb={} vmhwm_kb={} vmpeak_kb={} cgroup_source={SERVICE_CGROUP} cgroup_anon_kb={} cgroup_file_kb={} cgroup_shmem_kb={} cgroup_peak_kb={cgroup_peak_kb}{extras_suffix}",
         value("RssAnon"),
         value("RssFile"),
         value("VmRSS"),
