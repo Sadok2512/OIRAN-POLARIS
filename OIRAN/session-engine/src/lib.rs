@@ -1389,13 +1389,29 @@ where
             );
         }
     }
-    stage(
-        "01-80-merge-end",
-        &[
-            ("merged_count", merged_count),
-            ("events_len", events.len() as u64),
-        ],
+    // 2.21.75 (CLAUDE1, ordre #9 7007412446 §2) — ANR1 (#10 7007328564)
+    // a mesuré que le pic anon n'est PAS à `01-50-scan-end`
+    // (39 489 records en vol, 329 020 KiB) mais à `01-80-merge-end`
+    // sur le `Vec<EventRecord>` final : 544 292 représentants,
+    // anon 1 931 196 KiB, soit +1 602 176 KiB pendant la fusion
+    // des 30 runs, ≈ 3,0 Ko par EventRecord fusionné. Le breakdown
+    // par champ à 01-50 ne voyait que le DERNIER buffer in-flight,
+    // pas le pic réel. On déplace la mesure sur `events` ici.
+    let final_field_breakdown = publication_projection_field_bytes_counted(
+        events.len(),
+        events.iter(),
     );
+    let events_inline_bytes = events.capacity() * std::mem::size_of::<EventRecord>();
+    let mut merge_end_counts: Vec<(&str, u64)> = vec![
+        ("merged_count", merged_count),
+        ("events_len", events.len() as u64),
+        ("events_capacity", events.capacity() as u64),
+        ("events_inline_bytes", events_inline_bytes as u64),
+    ];
+    for (field, bytes) in &final_field_breakdown {
+        merge_end_counts.push((*field, *bytes as u64));
+    }
+    stage("01-80-merge-end", &merge_end_counts);
     // 2.21.71 (CLAUDE1, ordre #9 7006855142 §2) — les readers de runs
     // terminent avec leur fd ouvert. On libère les fds (drop), puis on
     // ré-ouvre chaque run juste pour émettre un DONTNEED « whole file »

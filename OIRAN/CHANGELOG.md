@@ -1,5 +1,28 @@
 # Changelog
 
+## OIRAN API 2.21.75 + live-probe 0.6.30 + session-engine 0.5.28 — 2026-11-19 — comptage par champ à 01-80-merge-end (correction ordre #9 7007412446 §2 CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur 2.21.73 (`0085d33`). Correction obligatoire du lot 2.21.69 : la mesure ANR1 (#10 7007328564, cgroup désormais exact grâce à 2.21.69) a prouvé que le pic anon n'est **pas** à `01-50-scan-end` (39 489 records en vol, anon 329 020 KiB) mais à `01-80-merge-end` sur le `Vec<EventRecord>` final : **544 292 représentants, anon 1 931 196 KiB**, soit +1 602 176 KiB pendant la fusion des 30 runs, ≈ 3,0 Ko par EventRecord fusionné. Le breakdown à 01-50 ne voyait que le dernier buffer in-flight.
+
+### Correctif
+
+- `_with_stages` émet à `01-80-merge-end` le même breakdown par champ (`publication_projection_field_bytes_counted` sur `events.iter()`) qu'à 01-50, plus :
+  - `events_len` = `events.len()` (== merged_count).
+  - `events_capacity` = `events.capacity()`.
+  - `events_inline_bytes` = `events.capacity() × size_of::<EventRecord>()`.
+- `01-50-scan-end` reste en place : utile pour mesurer le buffer in-flight, mais la source dominante de l'anon est maintenant `01-80`.
+
+### Lecture attendue
+
+Pour chaque `(field, bytes)` de la ligne `PUBLICATION_RSS_TRACE phase=01-80-merge-end …`, `bytes / merged_count` = octets anon par représentant fusionné pour ce champ. Le champ qui domine indique la cible du levier B. Le poste utile est **`events_len × size_of::<EventRecord>()`** (inline) + `event_record_inline` (déjà couvert par le helper) + les tailles heap par champ. L'écart `events_capacity − events_len` × `size_of::<EventRecord>()` chiffre le sur-alloué du `Vec::push` (croissance géométrique classique).
+
+### Byte-identique
+
+Aucune donnée touchée, seules des sondes ajoutées. Tests existants passent, 12 runs à 0 échec :
+- `cargo test --locked -p session-engine --lib -j 2 spilling_with_stages` → 2/2 ok × 12.
+- Tests complets : session-engine 54/54, live-probe 185/185, oiran-api 195/195.
+- Lock OK, 137 packages, 0 > 1.83.
+
 ## OIRAN API 2.21.73 + live-probe 0.6.29 + session-engine 0.5.27 — 2026-11-19 — comptage par champ à 01-50-scan-end (étape 3/3, ordre #9 7006855142 CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur 2.21.71 (`daaea89`). Étape 3/3 du lot 2.21.69 : chiffrer où partent les **3,55 Ko d'anon par représentant** mesurés par ANR1 (`anon` 1 932 738 560 / 544 292 représentants = 3 550, #10 7006752946). **Instrumentation pure, zéro octet retiré.**
