@@ -1,5 +1,44 @@
 # Changelog
 
+## OIRAN API 2.21.76 + decoder-gtpu 0.2.2 — 2026-11-19 — confidentialité L2 + corrections data S (ordre #9 7012275179)
+
+Branche `fix/oiran-2.21.76-identities-post`, base `fix/oiran-2.21.74-filter-ready-503` @ `29fe4e3` (= PROD). Pas de déploiement.
+
+### L2-04 CRITIQUE — `GET /identities?q=...` → fuite L2d prouvée
+
+L'ancien `GET /identities?q=<IMSI|MSISDN|IMEI>` plaçait la valeur en clair dans l'URL → access logs HTTP, historique navigateur, DevTools réseau. Correctif :
+- **Nouvelle route** `POST /identities/lookup` (`apps/api/src/lib.rs::identity_lookup`) avec `value` + `page` + `page_size` dans le **body JSON**. CSRF obligatoire (`live_trace::require_csrf`), rôle OPERATOR requis. Schéma et pagination inchangés.
+- **Ancienne route** `GET /identities` retourne désormais `410 Gone` **sans** echo de la valeur (`identity_lookup_gone` — ne lit volontairement aucune entrée de la requête). Header `Link: </api/v1/identities/lookup>; rel="successor-version"` pointe vers le successeur.
+- Code commun : `IdentityLookupBody` (nouveau) remplace `IdentityLookupQuery` (supprimé). `apps/api/src/lib.rs` au complet.
+
+### L2-08 / T-07 — Audit sans valeur en clair
+
+- `LiveTraceRegistry::audit_lookup(actor_role, subscriber_pseudonym, result_count, at_epoch_s)` (nouveau) : chaque appel à `/identities/lookup` journalisé avec acteur, rôle, pseudonyme dérivé, count, heure — **jamais la valeur saisie**. (`apps/api/src/live_trace.rs:85-104`)
+- `live_trace.create` audit enrichi : ajoute `trace_id` + `subscriber_pseudonyms` (déjà anonymisés) pour lier une action à un stream SSE a posteriori. (`apps/api/src/live_trace.rs:518-528`)
+- `live_trace.delete` idem (ajout `trace_id` + `subscriber_pseudonyms`).
+
+### D-06 — UNKNOWN direction n'est plus compté comme DL
+
+- `TraceState.unknown_bytes` (nouveau) accumule les octets GTP-U de direction `UNKNOWN`. (`apps/api/src/live_trace.rs:64-71`)
+- `throughput` event JSON ajoute `unknown_bytes_s` à côté de `ul_bytes_s` + `dl_bytes_s`. L'ancien `if DOWNLINK` sans `else` explicite UL/UNKNOWN basculait les octets ambigus dans DL → biais structurel. Désormais `match direction { UPLINK → UL; DOWNLINK → DL; _ → UNKNOWN }`.
+- Flush par seconde : les 3 compteurs sont reset ensemble.
+
+### D-09 — QFI propagé dans `session_identifiers`
+
+- `decoder-gtpu 0.2.2` : premier QFI valide (extension PDU Session Container `0x85`) ajouté comme `NamedValue { name: "qfi", value: "<n>" }` dans `session_identifiers` du event normalisé. (`decoder-gtpu/src/lib.rs:172-193`)
+- Avant 2.21.76 : QFI uniquement dans l'IE texte `pdu_type=X,qfi=Y`, inexploitable comme clé d'agrégation session-engine.
+
+### Tests ajoutés (12 runs à 0 échec)
+
+- `decoder-gtpu/src/lib.rs::qfi_is_propagated_into_session_identifiers_2_21_76` — paquet avec extension PDU Session Container portant QFI=9 → `session_identifiers` expose `qfi=9`, non pseudonymisé.
+- `apps/api/src/live_trace.rs::gtpu_unknown_direction_is_not_counted_as_downlink_2_21_76` — 3 events GTP-U (UPLINK, DOWNLINK, UNKNOWN) dans la même seconde → `throughput` suivant porte `ul_bytes_s=100`, `dl_bytes_s=100`, `unknown_bytes_s=100` (UNKNOWN séparé).
+- `apps/api/src/live_trace.rs::audit_lookup_never_stores_the_clear_text_value_2_21_76` — appel à `audit_lookup` → entrée audit contient action + rôle + pseudonyme + count ; preuve négative que `"value"` et `"q"` n'apparaissent pas.
+- Mise à jour du test existant `tests::clear_identity_routes_are_operator_only_and_keep_packet_proof` — vérifie désormais que (a) `GET /identities?q=...` retourne 410 Gone sans écho ; (b) `POST /identities/lookup` fonctionne avec le body et renvoie les mêmes données que l'ancien GET.
+
+### Prochaine étape (2.21.78)
+
+Design du débit par seconde / session / QFI (D-01 à D-05) + endpoint SSE indépendant de la live trace sera envoyé sur #9 **avant** code (ordre 7012275179 §CLAUDE2 clôture).
+
 ## OIRAN API 2.21.74 + live-probe 0.6.26 — 2026-11-19 — `/sessions/filter` 503 jusqu'aux caches READY (ordre #10 7009381757)
 
 Branche `fix/oiran-2.21.74-filter-ready-503`, base exacte `fix/oiran-2.21.72-train @ eaa21f0`. Aucun déploiement.

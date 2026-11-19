@@ -1091,7 +1091,14 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         .route("/subscribers", get(subscribers))
         .route("/subscribers/:pseudo/journey", get(subscriber_journey))
         .route("/subscribers/:pseudo/tmsi", get(subscriber_tmsi))
-        .route("/identities", get(identity_lookup))
+        // 2.21.76 (ordre #9 7012275179 §CLAUDE2.L2-04) — fuite L2d prouvée :
+        // la valeur en clair (IMSI/MSISDN/IMEI) voyageait dans l'URL query
+        // string → journaux HTTP, historique navigateur. Nouvelle route
+        // POST avec `value` dans le body. Ancienne GET désactivée (410
+        // Gone, sans écho de la valeur). Pagination `page` + `page_size`
+        // restent côté body (pas de query string du tout).
+        .route("/identities", get(identity_lookup_gone))
+        .route("/identities/lookup", post(identity_lookup))
         .route("/events/:id", get(event))
         .route("/events/:id/provenance", get(provenance))
         .route("/packets", get(packets))
@@ -6004,9 +6011,12 @@ fn session_blocking(state: &AppState, id: &str) -> Response {
     )
 }
 
+// 2.21.76 (ordre #9 7012275179 §CLAUDE2.L2-04) — body JSON pour le POST
+// `/identities/lookup`. Mêmes champs que l'ancien query GET, mais la
+// valeur `value` (anciennement `q`) ne voyage plus dans l'URL.
 #[derive(Deserialize)]
-struct IdentityLookupQuery {
-    q: String,
+struct IdentityLookupBody {
+    value: String,
     #[serde(default = "default_identity_lookup_page")]
     page: usize,
     #[serde(default = "default_identity_lookup_page_size")]
@@ -6974,30 +6984,53 @@ async fn session_identities(
     }
 }
 
+// 2.21.76 (ordre #9 7012275179 §CLAUDE2.L2-04) — ancien `GET /identities?q=`
+// était une fuite L2d (valeur en clair dans l'URL → access logs, historique
+// navigateur, DevTools réseau). Retourne 410 Gone **sans** echo de la query.
+// Le `Link` header pointe vers la route de remplacement.
+async fn identity_lookup_gone(headers: HeaderMap) -> Response {
+    let mut response = api_error(
+        StatusCode::GONE,
+        "IDENTITY_LOOKUP_GET_REMOVED",
+        "GET /identities is removed; use POST /identities/lookup with the value in the body",
+    );
+    let _ = headers; // on ne lit volontairement AUCUNE entrée de requête
+    response
+        .headers_mut()
+        .insert("Link", "</api/v1/identities/lookup>; rel=\"successor-version\"".parse().unwrap());
+    response
+}
+
 async fn identity_lookup(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<IdentityLookupQuery>,
+    Json(input): Json<IdentityLookupBody>,
 ) -> Response {
-    if let Err(response) = require_operator(&state, &headers) {
+    let role = match require_operator(&state, &headers) {
+        Ok(role) => role,
+        Err(response) => return response,
+    };
+    // CSRF requis : la valeur en clair ne doit pas être soumise par un
+    // formulaire cross-origin sans jeton.
+    if let Err(response) = live_trace::require_csrf(&state, &headers) {
         return response;
     }
-    let q = query.q.trim();
-    if q.len() < 4 || q.len() > 128 {
+    let trimmed = input.value.trim();
+    if trimmed.len() < 4 || trimmed.len() > 128 {
         return api_error(
             StatusCode::BAD_REQUEST,
             "IDENTITY_QUERY_INVALID",
-            "identity query length is invalid",
+            "identity value length is invalid",
         );
     }
-    if query.page == 0 || !(1..=100).contains(&query.page_size) {
+    if input.page == 0 || !(1..=100).contains(&input.page_size) {
         return api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "IDENTITY_PAGINATION_INVALID",
             "page must be >= 1 and page_size must be 1..100",
         );
     }
-    let matches = match state.inner.identity_vault.lookup(q) {
+    let matches = match state.inner.identity_vault.lookup(trimmed) {
         Ok(matches) => matches,
         Err(_) => {
             return api_error(
@@ -7008,11 +7041,11 @@ async fn identity_lookup(
         }
     };
     let total = matches.len();
-    let start = query.page_size.saturating_mul(query.page.saturating_sub(1));
+    let start = input.page_size.saturating_mul(input.page.saturating_sub(1));
     let matches = matches
         .into_iter()
         .skip(start)
-        .take(query.page_size)
+        .take(input.page_size)
         .collect::<Vec<_>>();
     let sessions = matches
         .iter()
@@ -7021,11 +7054,20 @@ async fn identity_lookup(
     let subscriber_pseudonym = matches
         .iter()
         .find_map(|item| item.subscriber_pseudonym.clone());
+    // 2.21.76 (ordre #9 7012275179 §CLAUDE2.L2-08) — audit du lookup :
+    // acteur, rôle, pseudonyme dérivé, nombre de résultats, heure.
+    // **Jamais** la valeur saisie.
+    state.inner.live_traces.audit_lookup(
+        role.name(),
+        subscriber_pseudonym.as_deref(),
+        total,
+        epoch_seconds(),
+    );
     operator_envelope(
         json!({"sessions":sessions,"subscriber_pseudonym":subscriber_pseudonym,"matches":matches.into_iter().map(|item|json!({
         "session_id":item.session_id,"subscriber_pseudonym":item.subscriber_pseudonym,"type":item.kind,
         "event_id":item.event_id,"capture_id":item.capture_id,"packet_number":item.packet_number
-    })).collect::<Vec<_>>(),"pagination":{"page":query.page,"page_size":query.page_size,"total":total} }),
+    })).collect::<Vec<_>>(),"pagination":{"page":input.page,"page_size":input.page_size,"total":total} }),
     )
 }
 
@@ -15249,7 +15291,11 @@ mod tests {
         assert!(body["data"]["imsi"].is_string());
         assert_eq!(body["meta"]["identity_access"], "operator");
 
-        let response = router(state, None)
+        // 2.21.76 (ordre #9 7012275179 §CLAUDE2.L2-04) — ancien GET
+        // retourne désormais 410 Gone **sans** echo de la valeur. Nous
+        // validons ici que la réponse ne contient PAS la valeur en
+        // clair, et que le `Link` header pointe vers le successeur.
+        let gone_response = router(state.clone(), None)
             .oneshot(
                 Request::builder()
                     .uri(format!(
@@ -15257,6 +15303,43 @@ mod tests {
                     ))
                     .header(header::AUTHORIZATION, "Bearer test-operator-token")
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gone_response.status(), StatusCode::GONE);
+        assert_eq!(
+            gone_response
+                .headers()
+                .get("Link")
+                .and_then(|v| v.to_str().ok()),
+            Some("</api/v1/identities/lookup>; rel=\"successor-version\"")
+        );
+        let gone_body = json_body(gone_response).await;
+        assert!(
+            !gone_body.to_string().contains(&synthetic_identity),
+            "410 body must not echo the clear-text value"
+        );
+
+        // Le successeur `POST /identities/lookup` prend la valeur dans
+        // le corps JSON, jamais dans l'URL.
+        let csrf = sha256_hex(b"oiran-csrf-v1:test-operator-token");
+        let response = router(state, None)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/identities/lookup")
+                    .header(header::AUTHORIZATION, "Bearer test-operator-token")
+                    .header(CSRF_HEADER, csrf)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "value": synthetic_identity,
+                            "page": 1,
+                            "page_size": 1,
+                        }))
+                        .unwrap(),
+                    ))
                     .unwrap(),
             )
             .await

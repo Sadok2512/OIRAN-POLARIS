@@ -56,6 +56,13 @@ struct TraceState {
     throughput_second: u64,
     ul_bytes: u64,
     dl_bytes: u64,
+    /// 2.21.76 (ordre #9 7012275179 §CLAUDE2.D-06) — jusqu'à 2.21.74
+    /// les events GTP-U de direction `UNKNOWN` tombaient dans le
+    /// bucket DL par le `else if DOWNLINK` **sans** `else` explicite UL.
+    /// Désormais comptabilisés séparément : l'opérateur voit les
+    /// octets dont la direction n'est pas encore résolue (lookahead
+    /// SCTP/TCP reassembly non abouti) sans fausser UL/DL.
+    unknown_bytes: u64,
     /// 2.18.6 — dernier packet_number émis par capture_id.
     last_packet: HashMap<String, u64>,
     /// 2.18.6 — messages déjà émis (capture_id, packet_number, event_id).
@@ -75,12 +82,33 @@ impl LiveTraceRegistry {
             audit: Mutex::new(VecDeque::new()),
         }
     }
-    fn audit(&self, entry: Value) {
+    pub(crate) fn audit(&self, entry: Value) {
         let mut audit = self.audit.lock().unwrap();
         audit.push_front(entry);
         while audit.len() > 500 {
             audit.pop_back();
         }
+    }
+
+    /// 2.21.76 (ordre #9 7012275179 §CLAUDE2.L2-08) — journalise un
+    /// lookup `/identities/lookup` : acteur, rôle, pseudonyme dérivé,
+    /// nombre de résultats, heure. La **valeur saisie n'entre jamais**
+    /// dans l'audit — le caller ne la passe pas, et le pseudonyme est
+    /// la seule représentation persistante.
+    pub(crate) fn audit_lookup(
+        &self,
+        actor_role: &str,
+        subscriber_pseudonym: Option<&str>,
+        result_count: usize,
+        at_epoch_s: u64,
+    ) {
+        self.audit(serde_json::json!({
+            "action": "identity.lookup",
+            "actor_role": actor_role,
+            "subscriber_pseudonym": subscriber_pseudonym,
+            "result_count": result_count,
+            "at_epoch_s": at_epoch_s,
+        }));
     }
     fn purge(map: &mut HashMap<String, TraceState>) {
         let now = epoch_seconds();
@@ -200,12 +228,23 @@ impl LiveTraceRegistry {
                     let rate = BufferedEvent {
                         id: state.next_id,
                         kind: "throughput".into(),
-                        payload: json!({"second":state.throughput_second,"ul_bytes_s":state.ul_bytes,"dl_bytes_s":state.dl_bytes,"capture_id":event.capture_id,"packet_number":packet}),
+                        // 2.21.76 (ordre #9 7012275179 §CLAUDE2.D-06) —
+                        // `unknown_bytes_s` séparé pour que les octets
+                        // non classifiés ne gonflent plus le DL.
+                        payload: json!({
+                            "second": state.throughput_second,
+                            "ul_bytes_s": state.ul_bytes,
+                            "dl_bytes_s": state.dl_bytes,
+                            "unknown_bytes_s": state.unknown_bytes,
+                            "capture_id": event.capture_id,
+                            "packet_number": packet,
+                        }),
                     };
                     state.events.push_back(rate.clone());
                     let _ = state.tx.send(rate);
                     state.ul_bytes = 0;
                     state.dl_bytes = 0;
+                    state.unknown_bytes = 0;
                 }
                 state.throughput_second = second;
                 let bytes = event
@@ -213,10 +252,12 @@ impl LiveTraceRegistry {
                     .first()
                     .map(|p| u64::from(p.original_length))
                     .unwrap_or(0);
-                if event.direction.as_str() == "UPLINK" {
-                    state.ul_bytes += bytes
-                } else if event.direction.as_str() == "DOWNLINK" {
-                    state.dl_bytes += bytes
+                match event.direction.as_str() {
+                    "UPLINK" => state.ul_bytes = state.ul_bytes.saturating_add(bytes),
+                    "DOWNLINK" => state.dl_bytes = state.dl_bytes.saturating_add(bytes),
+                    // 2.21.76 : tout le reste (UNKNOWN, REFERENCE_ONLY, …)
+                    // est compté séparément, plus jamais mélangé à DL.
+                    _ => state.unknown_bytes = state.unknown_bytes.saturating_add(bytes),
                 }
             }
             if let Some(procedure) = event.procedure.as_deref() {
@@ -488,17 +529,30 @@ pub(crate) async fn create(
             throughput_second: 0,
             ul_bytes: 0,
             dl_bytes: 0,
+            unknown_bytes: 0,
             last_packet: HashMap::new(),
             seen: HashSet::new(),
         },
     );
     drop(traces);
-    state.inner.live_traces.audit(json!({"action":"live_trace.create","actor_role":role.name(),"key_type":trace.key_type,"duration_s":input.duration_s,"at_epoch_s":now}));
+    // 2.21.76 (ordre #9 7012275179 §CLAUDE2.T-07) — audit enrichi : le
+    // `trace_id` et la **liste de pseudonymes** identifient de façon
+    // unique la trace, sans jamais stocker la valeur saisie. Rapproche
+    // l'entrée d'audit d'un stream SSE a posteriori.
+    state.inner.live_traces.audit(json!({
+        "action": "live_trace.create",
+        "actor_role": role.name(),
+        "trace_id": trace_id,
+        "key_type": trace.key_type,
+        "subscriber_pseudonyms": trace.subscriber_pseudonyms,
+        "duration_s": input.duration_s,
+        "at_epoch_s": now,
+    }));
     start_reader(state);
     live_ok(serde_json::to_value(trace).unwrap())
 }
 
-fn require_csrf(state: &AppState, headers: &HeaderMap) -> Result<Role, Response> {
+pub(crate) fn require_csrf(state: &AppState, headers: &HeaderMap) -> Result<Role, Response> {
     let role = role_from_headers(state, headers);
     let bearer = headers
         .get(header::AUTHORIZATION)
@@ -544,7 +598,15 @@ pub(crate) async fn remove(
             "trace not found",
         );
     };
-    state.inner.live_traces.audit(json!({"action":"live_trace.delete","actor_role":role.name(),"key_type":removed.trace.key_type,"at_epoch_s":epoch_seconds()}));
+    // 2.21.76 (ordre #9 7012275179 §CLAUDE2.T-07) — audit delete enrichi.
+    state.inner.live_traces.audit(json!({
+        "action": "live_trace.delete",
+        "actor_role": role.name(),
+        "trace_id": id,
+        "key_type": removed.trace.key_type,
+        "subscriber_pseudonyms": removed.trace.subscriber_pseudonyms,
+        "at_epoch_s": epoch_seconds(),
+    }));
     live_ok(json!({"trace_id":id,"deleted":true}))
 }
 
@@ -830,6 +892,7 @@ mod tests {
             throughput_second: 0,
             ul_bytes: 0,
             dl_bytes: 0,
+            unknown_bytes: 0,
             last_packet: HashMap::new(),
             seen: HashSet::new(),
         }
@@ -1173,5 +1236,135 @@ mod tests {
         // vault d'une session connue — couvert en intégration par
         // la route `/api/v1/live/traces/:id/sessions` exposée dans
         // `lib.rs::router`. Ce test documente l'invariant unitaire.
+    }
+
+    /// 2.21.76 (ordre #9 7012275179 §CLAUDE2.D-06) — un event GTP-U de
+    /// direction `UNKNOWN` **n'est plus compté dans dl_bytes_s** : il
+    /// alimente `unknown_bytes_s` séparé. Preuve par trois events
+    /// (UPLINK, DOWNLINK, UNKNOWN) → le flush `throughput` qui suit
+    /// doit porter ul/dl/unknown séparés et >0.
+    #[test]
+    fn gtpu_unknown_direction_is_not_counted_as_downlink_2_21_76() {
+        use event_schema::{
+            DecodeStatus, Direction, Endpoint, EvidenceReference, EvidenceState, ExactTimestamp,
+            NormalizedEvent, PacketReference, Protocol,
+        };
+        let r = LiveTraceRegistry::new();
+        r.traces
+            .lock()
+            .unwrap()
+            .insert("t".into(), state(u64::MAX, false, vec!["psn-x".into()]));
+        let base_event = |direction: Direction, packet_number: u64, seconds: i64| {
+            let p = PacketReference {
+                source_file: "x".into(),
+                source_sha256: None,
+                packet_number,
+                byte_offset: 0,
+                interface_id: 0,
+                link_type: None,
+                sll2_protocol_type: None,
+                sll2_reserved: None,
+                sll2_interface_index: None,
+                sll2_arphrd_type: None,
+                sll2_packet_type: None,
+                sll2_address_length: None,
+                sll2_address: None,
+                captured_length: 100,
+                original_length: 100,
+            };
+            NormalizedEvent {
+                event_id: format!("evt-{direction:?}-{packet_number}"),
+                parent_event_id: None,
+                probe_id: "test".into(),
+                capture_point_id: "N3".into(),
+                capture_id: "c".into(),
+                packet_references: vec![p],
+                timestamp: ExactTimestamp {
+                    seconds,
+                    nanoseconds: 0,
+                    raw_ticks: (seconds.max(0) as u64) * 1_000_000_000,
+                    resolution_base: 10,
+                    resolution_exponent: 9,
+                },
+                interface: "N3".into(),
+                protocol: Protocol::Gtpu,
+                // Le pseudonyme doit apparaître dans le JSON encodé
+                // pour que `route_normalized` match.
+                message_name: "GTP-U psn-x".into(),
+                message_type: 0xFF,
+                procedure_code: None,
+                procedure: None,
+                security_state: None,
+                source_byte_offset: None,
+                source_endpoint: Endpoint {
+                    address: "10.0.0.1".into(),
+                    port: None,
+                    network_function: None,
+                },
+                destination_endpoint: Endpoint {
+                    address: "10.0.0.2".into(),
+                    port: None,
+                    network_function: None,
+                },
+                direction,
+                session_identifiers: vec![],
+                information_elements: vec![],
+                decoder_name: "decoder-gtpu".into(),
+                decoder_version: "0.2.2".into(),
+                schema_version: NormalizedEvent::SCHEMA_VERSION,
+                decoding_status: DecodeStatus::Decoded,
+                errors: vec![],
+                raw_payload_reference: "sha256:x".into(),
+                evidence_references: vec![EvidenceReference {
+                    state: EvidenceState::Exact,
+                    kind: "packet-provenance".into(),
+                    reference: "sha256:x".into(),
+                }],
+                sbi: None,
+            }
+        };
+        // Même seconde (=10) : accumulation.
+        r.route_normalized(&base_event(Direction::Uplink, 1, 10));
+        r.route_normalized(&base_event(Direction::Downlink, 2, 10));
+        r.route_normalized(&base_event(Direction::Unknown, 3, 10));
+        // Seconde suivante (=11) : déclenche le flush des buckets de la seconde 10.
+        r.route_normalized(&base_event(Direction::Uplink, 4, 11));
+        let traces = r.traces.lock().unwrap();
+        let state = traces.get("t").unwrap();
+        let throughput = state
+            .events
+            .iter()
+            .find(|e| e.kind == "throughput")
+            .expect("un event throughput doit avoir été émis");
+        assert_eq!(throughput.payload["second"], 10);
+        assert_eq!(throughput.payload["ul_bytes_s"], 100);
+        assert_eq!(throughput.payload["dl_bytes_s"], 100);
+        assert_eq!(
+            throughput.payload["unknown_bytes_s"], 100,
+            "un event UNKNOWN doit alimenter unknown_bytes_s, PAS dl_bytes_s"
+        );
+    }
+
+    /// 2.21.76 (ordre #9 7012275179 §CLAUDE2.L2-08) — `audit_lookup`
+    /// enregistre acteur, rôle, pseudonyme, count, heure — JAMAIS la
+    /// valeur en clair. Preuve négative : on injecte une "valeur" en
+    /// clair et on vérifie qu'elle n'apparaît nulle part dans l'audit.
+    #[test]
+    fn audit_lookup_never_stores_the_clear_text_value_2_21_76() {
+        let r = LiveTraceRegistry::new();
+        // Pas de "valeur" passée à audit_lookup → preuve par type
+        // signature : la fonction ne prend que acteur/rôle/pseudonyme/count.
+        r.audit_lookup("operator", Some("psn-abc123"), 2, 1_792_600_000);
+        let audit = r.audit.lock().unwrap();
+        let entry = audit.front().expect("une entrée d'audit");
+        assert_eq!(entry["action"], "identity.lookup");
+        assert_eq!(entry["actor_role"], "operator");
+        assert_eq!(entry["subscriber_pseudonym"], "psn-abc123");
+        assert_eq!(entry["result_count"], 2);
+        // Preuve négative : aucun des champs ne contient une "value"
+        // ou "q" résiduel.
+        let serialized = entry.to_string();
+        assert!(!serialized.contains("\"value\""));
+        assert!(!serialized.contains("\"q\""));
     }
 }
