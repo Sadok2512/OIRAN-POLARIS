@@ -46,6 +46,82 @@ Voir plus bas (bloc `## Preuves 2.21.87`) pour les commandes et chiffres :
 - 12 runs des tests ajoutés (2.21.78 : 14 tests débit ; 2.21.85 : 3 tests double tampon dont GC-survival) ;
 - `grep -c '^name = ' Cargo.lock` + rust-version 1.83 audit.
 
+### Preuves 2.21.87 (règle CPU #9 7018292949 appliquée)
+
+Préflight final (après nettoyage worktrees, rapport cleanup `7019221418`) :
+
+```
+cat /proc/loadavg             → 2.03 2.76 2.72
+cat /proc/pressure/cpu        → some avg10=0.06 full avg10=0.00  (GO)
+cat /proc/pressure/memory     → some avg10=0.05 full avg10=0.02 (soft) ; recheck 60s après : full avg10=0.00 (GO)
+free -b (avail)               → 9 623 719 936 (≥ 4 GiB GO)
+df -B1 / (avail)              → 43 960 991 744 (≥ 25 Go GO après cleanup)
+```
+
+Build workspace (`cargo check --locked --workspace --tests -j 2`) sous `flock -w 900 /tmp/nsplus-heavy-build.lock timeout 45m nice -n 19 ionice -c3` :
+
+```
+Finished dev profile [unoptimized + debuginfo] target(s) in 1m 00s
+DURATION 61s, cpu some avg10 before=3.62 / after=4.18.
+```
+
+Tests lib `oiran-api` complets :
+
+```
+cargo test --locked -p oiran-api --lib -j 2 -- --test-threads=2
+→ test result: ok. 217 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out ; 15.41 s.
+DURATION 127s, cpu some avg10 before=3.83 / after=0.69.
+```
+
+Tests lib `live-probe` complets :
+
+```
+cargo test --locked -p live-probe --lib -j 2 -- --test-threads=2
+→ test result: ok. 186 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out ; 70.07 s.
+DURATION 114s, cpu some avg10 before=0.26 / after=0.03.
+```
+
+Tests workspace complets :
+
+```
+cargo test --locked --workspace -j 2 -- --test-threads=2
+→ Chaque crate : ok. passed; 0 failed. Aucun FAILED, aucun error.
+   oiran-api 217 passed, live-probe 186 passed + 6 ignored, et 36 autres crates (5…52 tests).
+DURATION 189s, cpu some avg10 before=0.30 / after=0.43.
+```
+
+Vtap (lock + tests), ordre `cd OIRAN/vtap && cargo update -w && cargo test --locked` :
+
+```
+cd OIRAN/vtap && cargo update -w && cargo test --locked -j 2 -- --test-threads=2
+→ Cargo.lock vtap inchangé (diff vide) ; 53 packages.
+→ test result: ok. 12 passed; 0 failed. (binaire vtap unit tests)
+→ test result: ok.  3 passed; 0 failed. (dataset_restore intégration)
+→ test result: ok.  0 passed; 0 failed. (vtap_wiring : skip quand env lab absent)
+DURATION 23s, cpu some avg10 before=0.58 / after=0.38.
+```
+
+12 runs des tests ajoutés par 2.21.78 (throughput) + 2.21.85 (double tampon, 3 tests dont GC-survival) :
+
+```
+for i in $(seq 1 12); do
+  flock -w 900 /tmp/nsplus-heavy-build.lock timeout 10m nice -n 19 ionice -c3 \
+    cargo test --locked -p oiran-api --lib -j 2 -- --test-threads=2 throughput 2_21_85
+done
+→ 12/12 passed, 0/12 failed
+→ test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 202 filtered out
+→ MAX cpu some avg10 pendant les 12 runs = 0.18 (très largement sous 25)
+DURATION 14s (compile cache chaud).
+```
+
+Audit `Cargo.lock` (inchangé par le train — aucune nouvelle dépendance ajoutée vs 2.21.83 ∪ 2.21.78 ∪ 2.21.85) :
+
+```
+grep -c '^name = ' OIRAN/Cargo.lock       → 137
+grep -c '^name = ' OIRAN/vtap/Cargo.lock  → 53
+cd OIRAN/vtap && git diff Cargo.lock      → (vide, update -w pas de changement)
+```
+
 ## OIRAN API 2.21.85 — 2026-11-19 — double tampon READY pour `/sessions/filter` (ordre #9 7015585561 CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur `fix/oiran-2.21.83-train` @ `4dcaa9f`. Branche `fix/oiran-2.21.85-double-buffer-ready`. Design accepté dans #9 `7015280516`, 3 conditions #9 `7015585561`.
