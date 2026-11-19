@@ -1,5 +1,66 @@
 # Changelog
 
+## OIRAN API 2.21.66 + decoder-ngap 0.6.3 — 2026-11-19 — NGAP partiels : NGSetup + libération de session (ordre #9 7004955176)
+
+Branche `fix/oiran-2.21.66-ngap-setup-release`, base `8eeadf2` (`fix/oiran-2.21.62-hpack-only`). Pas de déploiement, pas de force-push, aucun geste lab.
+
+### Audit préalable (#9 comment 7005375740)
+
+Posté AVANT code. 4 gaps identifiés :
+
+- **GAP #4 — procedureCode 28** absent de `message_name` : `PDUSessionResourceReleaseCommand/Response/Failure` étaient tagués `UnknownNGAPProcedure`.
+- **GAP #3 — IE 60 / 67 / 70 / 79 / 133** (release lists) tombaient dans le fallback `decode_pdu_session_list` : `nested_list_sha256=<hash>,pdu_session_id=<v[2]>` (1 item max, PARTIAL).
+- **GAP #2 — IE 107 TimeToWait** absent de `ie_name()` → event annoté `errors += "unknown NGAP IE 107 preserved by length and SHA-256"`. Impact : `NGSetupFailure` sans délai de reprise.
+- **GAP #1 — IE 19 CriticalityDiagnostics** idem GAP #2.
+
+### Correctif decoder-ngap 0.6.3
+
+- `message_name()` : ajout `(28, Initiating) → PDUSessionResourceReleaseCommand`, `(28, SuccessfulOutcome) → PDUSessionResourceReleaseResponse`, `(28, UnsuccessfulOutcome) → PDUSessionResourceReleaseFailure`.
+- `ie_name()` : `107 → "TimeToWait"`, `19 → "CriticalityDiagnostics"`.
+- `decode_time_to_wait(v: &[u8])` : ENUMERATED {v1s=0, v2s=1, v5s=2, v10s=3, v20s=4, v60s=5}. Extension marker 1 bit + 3 bits de valeur root + 4 bits de padding = 1 octet APER aligné. Décodage : `ext = v[0] >> 7`, `value = (v[0] >> 4) & 0x07`. Fixture pycrate : v10s → `0x30`.
+- `decode_criticality_diagnostics(v: &[u8])` : structural seulement (sha256 + preamble d'optionnalité). Décodage complet des `iEsCriticalityDiagnostics` (SEQUENCE OF { iECriticality, iE-ID, typeOfError }) déclaré OUVERT — hors scope 2.21.66.
+- `decode_pdu_session_release_list(id: u16, v: &[u8])` : walker APER SEQUENCE OF item { pDUSessionID (1 octet) [, transfer OCTET STRING] } pour IE 60/67/70/79/133 (TS 38.413 §9.3.4.*). Émet `release_list_type=…,release_item_count=N,item_<i>_pdu_session_id=…[,item_<i>_transfer_length=…,item_<i>_transfer_sha256=…]`. Statut DECODED si tous les items extraits.
+- Route dispatch (`decode_ie`) : 60/67/70/79/133 → `decode_pdu_session_release_list` ; 107 → `decode_time_to_wait` ; 19 → `decode_criticality_diagnostics` ; 74/75 et 53/55 restent sur `decode_pdu_session_list` (walker setup inchangé — pas de régression SBI/N3).
+
+### Couverture données stockées (règle « fix couvre existant »)
+
+Les IE stockées dans les JSONL ne gardent que le texte décodé + `raw_sha256` du contenu brut (compacté par `session-engine::compact_publication_event`). **Le brut est perdu après compaction**, donc le chemin de re-décodage est le **replay pcap** via `oiran-decode`. Le **test de couverture stockée** (`stored_release_list_bytes_round_trip_to_full_decode_in_2_21_66`) démontre en construction byte-pour-byte : les mêmes 5 octets `01 00 05 00 06` qui produisaient `nested_list_sha256=<hash>,pdu_session_id=0` en 0.6.2 produisent désormais `nested_list_sha256=<hash> (identique),release_item_count=2,item_0_pdu_session_id=5,item_1_pdu_session_id=6` en 0.6.3. Le sha256 est inchangé → provenance stable. Chemin de re-décodage lab déclaré OUVERT jusqu'à ce qu'ANR1/ANR2 valident un replay sur capture physique.
+
+### Fixtures ground-truth (pycrate TS 38.413 V17.3.0)
+
+Générées par `/tmp/ngap_release_fixtures.py` (matériel de preuve, hors repo). PLMN 001/01, aucun IMSI/MSISDN.
+
+### Tests (12 runs sans échec, aucun `#[ignore]`)
+
+```
+cd OIRAN && nice -n 19 ionice -c3 cargo test --locked -p decoder-ngap
+```
+
+Résultats : **33 + 1 + 19 = 53 tests** par run, **12 runs à 0 échec**. 15 nouveaux tests (voir `src/lib.rs::*release_list_*`, `*time_to_wait_*`, `*criticality_diagnostics_*`, `stored_release_list_bytes_round_trip_to_full_decode_in_2_21_66`, et `tests/pycrate_fixtures.rs::ngsetup_*` / `*release_*`).
+
+Chaque nouveau test contient une **preuve de mutation** (appel avec octets vides / extension → statut non-Decoded).
+
+### Verrou vTAP (règle « cargo update -w après bump crate shared »)
+
+```
+cd OIRAN/vtap && cargo update -w && nice -n 19 ionice -c3 cargo test --locked
+```
+→ `decoder-ngap 0.6.2 → 0.6.3` dans `vtap/Cargo.lock` ; `3 tests passed`.
+
+### Audit rust-version 1.83
+
+```
+python3 /tmp/audit.py OIRAN/Cargo.lock       → OK : 137 packages, 0 exigent rust-version > 1.83
+python3 /tmp/audit.py OIRAN/vtap/Cargo.lock  → OK : 53 packages, 0 exigent rust-version > 1.83
+```
+
+### Écarts ouverts (déclarés, non prouvés fermés)
+
+- IE 19 CriticalityDiagnostics : décodage complet (procedureCode / typeOfError par IE) **OUVERT**. Sortie actuelle : sha256 + preamble d'optionnalité.
+- IE 114 UE-NGAP-IDs : décodé uniquement pour `value.len() == 4` (étroit). **OUVERT NON-BLOQUANT** jusqu'à trame prod qui dépasserait.
+- IE 60/67/70/79/133 : forme longue (`v[0] & 0x80 != 0`) → statut Partial avec marqueur `length_form=unsupported`. **OUVERT NON-BLOQUANT** jusqu'à trame prod qui dépasserait 128 items.
+- Chemin de re-décodage lab (replay pcap → events) : **OUVERT**, mesure par ANR1/ANR2 hors scope CLAUDE2.
+
 ## OIRAN API 2.21.62 — 2026-11-18 — HPACK seul sur la production 2.21.57 (isolation de l'écart mémoire 2.21.59)
 
 Upgrade **patch**. 2.21.59 (fusion du lot du soir) a été retirée de la prod : `MemoryPeak` 3 987 660 800 contre 3 238 051 840 en 2.21.57 (ANR2 #10 6992115760). Pour isoler la cause, cette version ne fusionne **que** 2.21.58 (DEVMAT `1c61086`, carry HPACK ordonné par le ring, carry jetable hors ring) sur 2.21.57 (`c1f2798`). Le préchauffage des index de 2.21.56 n'y est **pas**. Conflits limités aux versions, au Cargo.lock et au CHANGELOG.

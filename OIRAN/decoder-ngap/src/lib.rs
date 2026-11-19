@@ -211,7 +211,20 @@ fn decode_ie(ie: &NgapIe, pseudonym_key: &PseudonymKey) -> (Option<String>, Deco
             DecodeStatus::Decoded,
             true,
         ),
-        53..=79 | 133 => decode_pdu_session_list(ie.id, &ie.value),
+        // 2.21.66 (ordre #9 7004955176) — release list IEs 60/67/70/79/133
+        // reçoivent un walker dédié SEQUENCE OF { pDUSessionID (+ optional
+        // transfer) } ; les autres (notamment 74/75 et 53/55) gardent le
+        // walker setup historique.
+        60 | 67 | 70 | 79 | 133 => decode_pdu_session_release_list(ie.id, &ie.value),
+        53..=79 => decode_pdu_session_list(ie.id, &ie.value),
+        // 2.21.66 — IE 19 CriticalityDiagnostics (TS 38.413 §9.3.1.19),
+        // présent dans NGSetupResponse / NGSetupFailure / Release*. Décodé
+        // structurellement (preamble + sha256) ; décodage complet OUVERT.
+        19 => decode_criticality_diagnostics(&ie.value),
+        // 2.21.66 — IE 107 TimeToWait (TS 38.413 §9.3.1.37), présent dans
+        // NGSetupFailure. ENUMERATED {v1s, v2s, v5s, v10s, v20s, v60s, ...}
+        // encodé sur 3 bits de poids fort d'un octet APER.
+        107 => decode_time_to_wait(&ie.value),
         80 => decode_plmn_support_list(&ie.value),
         82 => decode_printable("ran_node_name", &ie.value),
         86 => decode_single_enum("relative_amf_capacity", &ie.value),
@@ -994,6 +1007,161 @@ fn decode_plmn(v: &[u8]) -> String {
     format!("{mcc}-{mnc}")
 }
 
+/// 2.21.66 (ordre #9 7004955176) — IE 60 / 67 / 70 / 79 / 133 : walker
+/// APER SEQUENCE OF `PDUSessionResource*Item` (TS 38.413 §9.3.4.*). Chaque
+/// item est une SEQUENCE { pDUSessionID (INTEGER 0..255, 1 octet) [,
+/// pDUSessionResourceReleaseCommandTransfer / pDUSessionResourceReleaseResponseTransfer
+/// OCTET STRING] }. Le pdu_session_id est extrait par item, le transfer
+/// intérieur reste prouvable via son sha256 (profondeur APER complète
+/// hors scope 2.21.66).
+///
+/// Mapping id → présence d'un `transfer` intérieur :
+/// - 60 (CxtRelCpl) / 133 (CxtRelReq) : pdu_session_id seul ;
+/// - 67 (ReleasedNot) / 70 (RelRes) / 79 (RelCmd) : pdu_session_id + transfer.
+fn decode_pdu_session_release_list(id: u16, v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
+    if v.len() < 2 {
+        return malformed();
+    }
+    let label_prefix = match id {
+        60 => "cxt_rel_cpl",
+        67 => "released_not",
+        70 => "rel_res",
+        79 => "to_release",
+        133 => "cxt_rel_req",
+        _ => "release",
+    };
+    let has_inner_transfer = matches!(id, 67 | 70 | 79);
+    // SEQUENCE OF APER : bit d'extension (1b, doit être 0 pour nos versions)
+    // + length determinant (7b pour N-1, N ≤ 128 ; forme longue non gérée
+    // ici, documentée OUVERTE).
+    let first = v[0];
+    if first & 0x80 != 0 {
+        return (
+            Some(format!(
+                "nested_list_sha256={},release_list_type={label_prefix},length_form=unsupported",
+                sha256_hex(v)
+            )),
+            DecodeStatus::Partial,
+            false,
+        );
+    }
+    let count = (first & 0x7f) as usize + 1;
+    let mut value = format!("nested_list_sha256={}", sha256_hex(v));
+    value.push_str(&format!(
+        ",release_list_type={label_prefix},release_item_count={count}"
+    ));
+    let mut cursor = 1usize;
+    let mut extracted = 0usize;
+    for index in 0..count {
+        // SEQUENCE Item : 1 bit d'extension + preamble optionnel +
+        // pDUSessionID (1 octet). APER aligné : preamble = 1 octet.
+        if cursor + 2 > v.len() {
+            break;
+        }
+        let _item_preamble = v[cursor];
+        cursor += 1;
+        let pdu_session_id = v[cursor];
+        cursor += 1;
+        value.push_str(&format!(",item_{index}_pdu_session_id={pdu_session_id}"));
+        // Alias canonique 1er item (comme setup su_req / su_res) : la
+        // session-engine indexe sur `pdu_session_id` nu.
+        if index == 0 {
+            value.push_str(&format!(",pdu_session_id={pdu_session_id}"));
+        }
+        if has_inner_transfer {
+            if cursor >= v.len() {
+                break;
+            }
+            let (len, n) = match aper_length(&v[cursor..]) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            cursor += n;
+            if cursor + len > v.len() {
+                break;
+            }
+            let transfer_bytes = &v[cursor..cursor + len];
+            cursor += len;
+            value.push_str(&format!(
+                ",item_{index}_transfer_length={len},item_{index}_transfer_sha256={}",
+                sha256_hex(transfer_bytes)
+            ));
+        }
+        extracted += 1;
+    }
+    let status = if extracted == count {
+        DecodeStatus::Decoded
+    } else {
+        DecodeStatus::Partial
+    };
+    (Some(value), status, false)
+}
+
+/// 2.21.66 (ordre #9 7004955176) — IE 107 TimeToWait (TS 38.413
+/// §9.3.1.29). ENUMERATED {v1s, v2s, v5s, v10s, v20s, v60s, ...} extensible.
+/// Root enum à 6 valeurs → ceil(log2(6)) = 3 bits d'index + 1 bit
+/// d'extension = 4 bits, byte-aligned APER. Décodage : ext = bit 7,
+/// valeur root = bits 6..4 (`(v[0] >> 4) & 0x07`). Fixture pycrate :
+/// v10s → 0x30 (`0b00110000`).
+fn decode_time_to_wait(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
+    if v.len() != 1 {
+        return malformed();
+    }
+    let ext_present = (v[0] >> 7) & 1;
+    if ext_present != 0 {
+        return (
+            Some(format!(
+                "time_to_wait_extended=true,time_to_wait_raw_octet=0x{:02x}",
+                v[0]
+            )),
+            DecodeStatus::Partial,
+            false,
+        );
+    }
+    let raw = (v[0] >> 4) & 0x07;
+    let name = match raw {
+        0 => Some("v1s"),
+        1 => Some("v2s"),
+        2 => Some("v5s"),
+        3 => Some("v10s"),
+        4 => Some("v20s"),
+        5 => Some("v60s"),
+        _ => None,
+    };
+    match name {
+        Some(label) => (
+            Some(format!("time_to_wait={label},time_to_wait_raw={raw}")),
+            DecodeStatus::Decoded,
+            false,
+        ),
+        None => (
+            Some(format!("time_to_wait_extended=true,time_to_wait_raw={raw}")),
+            DecodeStatus::Partial,
+            false,
+        ),
+    }
+}
+
+/// 2.21.66 (ordre #9 7004955176) — IE 19 CriticalityDiagnostics
+/// (TS 38.413 §9.3.1.23). SEQUENCE { procedureCode?, triggeringMessage?,
+/// procedureCriticality?, iEsCriticalityDiagnostics? (SEQUENCE OF {
+/// iECriticality, iE-ID, typeOfError }) }. Décodage structural seulement :
+/// preamble d'optionnalité + sha256. Décodage complet déclaré OUVERT.
+fn decode_criticality_diagnostics(v: &[u8]) -> (Option<String>, DecodeStatus, bool) {
+    if v.is_empty() {
+        return malformed();
+    }
+    (
+        Some(format!(
+            "criticality_diagnostics_sha256={},crit_diag_preamble=0x{:02x}",
+            sha256_hex(v),
+            v[0]
+        )),
+        DecodeStatus::Partial,
+        false,
+    )
+}
+
 fn malformed() -> (Option<String>, DecodeStatus, bool) {
     (None, DecodeStatus::Malformed, false)
 }
@@ -1367,6 +1535,11 @@ pub fn message_name(code: u8, kind: PduKind) -> &'static str {
         (21, PduKind::Initiating) => "NGSetupRequest",
         (21, PduKind::SuccessfulOutcome) => "NGSetupResponse",
         (21, PduKind::UnsuccessfulOutcome) => "NGSetupFailure",
+        // 2.21.66 (ordre #9 7004955176) — procedureCode 28 câblé :
+        // libération de session côté NGAP (TS 38.413 §8.2.4).
+        (28, PduKind::Initiating) => "PDUSessionResourceReleaseCommand",
+        (28, PduKind::SuccessfulOutcome) => "PDUSessionResourceReleaseResponse",
+        (28, PduKind::UnsuccessfulOutcome) => "PDUSessionResourceReleaseFailure",
         (29, PduKind::Initiating) => "PDUSessionResourceSetupRequest",
         (29, PduKind::SuccessfulOutcome) => "PDUSessionResourceSetupResponse",
         (29, PduKind::UnsuccessfulOutcome) => "PDUSessionResourceSetupFailure",
@@ -1384,6 +1557,11 @@ fn ie_name(id: u16) -> Option<&'static str> {
         1 => "AMFName",
         10 => "AMF-UE-NGAP-ID",
         15 => "Cause",
+        // 2.21.66 (ordre #9 7004955176) — IE id 19 et 107 : noms exposés
+        // pour que les events ne portent plus `errors += "unknown NGAP IE
+        // 19/107 preserved by length and SHA-256"`.
+        19 => "CriticalityDiagnostics",
+        107 => "TimeToWait",
         // 2.7.7: identity-bearing IE names rewritten so no serialised field
         // carries `tmsi` / `imeisv` (POLARIS 0.29.16 privacy allowlist).
         26 => "identity_pseudonym",
@@ -1882,3 +2060,125 @@ fn pdu_session_type_marker_does_not_match_arbitrary_bytes() {
 // The old canonical "one-octet-per-primitive" fixture builders and tests have
 // been removed in 0.5.0: see `tests/aper_transfer_fixtures.rs` for the new
 // asn1tools-grounded fixtures that exercise the real X.691 walker.
+
+/// 2.21.66 (ordre #9 7004955176) — IE 60 : SEQUENCE OF
+/// `PDUSessionResourceItemCxtRelCpl { pDUSessionID }`, 2 items (5, 6).
+/// Fixture ground-truth : hex `0100050006` (voir
+/// `tests/pycrate_fixtures.rs::ue_context_release_complete_decodes_two_pdu_sessions`).
+#[test]
+fn release_list_cxt_rel_cpl_extracts_both_pdu_session_ids() {
+    let value = [0x01, 0x00, 0x05, 0x00, 0x06];
+    let (text, status, _) = decode_pdu_session_release_list(60, &value);
+    assert_eq!(status, DecodeStatus::Decoded);
+    let text = text.expect("some");
+    assert!(text.contains("release_list_type=cxt_rel_cpl"), "{text}");
+    assert!(text.contains("release_item_count=2"), "{text}");
+    assert!(text.contains("item_0_pdu_session_id=5"), "{text}");
+    assert!(text.contains("item_1_pdu_session_id=6"), "{text}");
+    // Alias canonique 1er item : `pdu_session_id=5` pour que la
+    // session-engine indexe sans préfixe (cohérent avec su_req/su_res).
+    assert!(text.contains(",pdu_session_id=5"), "{text}");
+    // Preuve de mutation : octets vides → Malformed.
+    assert_eq!(decode_pdu_session_release_list(60, &[]).1, DecodeStatus::Malformed);
+}
+
+/// 2.21.66 — IE 79 avec transfer intérieur : SEQUENCE OF
+/// `PDUSessionResourceToReleaseItemRelCmd { pDUSessionID, release_command_transfer }`.
+/// Fixture ground-truth : hex `000005020000` — 1 item, pdu_session_id=5,
+/// transfer de 2 octets (Cause radioNetwork=0, unspecified).
+#[test]
+fn release_list_to_release_extracts_pdu_session_id_and_transfer_sha256() {
+    let value = [0x00, 0x00, 0x05, 0x02, 0x00, 0x00];
+    let (text, status, _) = decode_pdu_session_release_list(79, &value);
+    assert_eq!(status, DecodeStatus::Decoded);
+    let text = text.expect("some");
+    assert!(text.contains("release_list_type=to_release"), "{text}");
+    assert!(text.contains("release_item_count=1"), "{text}");
+    assert!(text.contains("item_0_pdu_session_id=5"), "{text}");
+    assert!(text.contains("item_0_transfer_length=2"), "{text}");
+    assert!(text.contains("item_0_transfer_sha256="), "{text}");
+}
+
+/// 2.21.66 — IE 70 PDUSessionResourceReleasedListRelRes.
+/// Fixture ground-truth : hex `0000050100` — 1 item, pdu_session_id=5,
+/// transfer de 1 octet (structure vide).
+#[test]
+fn release_list_rel_res_extracts_pdu_session_id_and_transfer_sha256() {
+    let value = [0x00, 0x00, 0x05, 0x01, 0x00];
+    let (text, status, _) = decode_pdu_session_release_list(70, &value);
+    assert_eq!(status, DecodeStatus::Decoded);
+    let text = text.expect("some");
+    assert!(text.contains("release_list_type=rel_res"), "{text}");
+    assert!(text.contains("item_0_pdu_session_id=5"), "{text}");
+    assert!(text.contains("item_0_transfer_length=1"), "{text}");
+}
+
+/// 2.21.66 — IE 133 PDUSessionResourceListCxtRelReq.
+/// Fixture ground-truth : hex `000007` — 1 item, pdu_session_id=7, pas de transfer.
+#[test]
+fn release_list_cxt_rel_req_extracts_pdu_session_id() {
+    let value = [0x00, 0x00, 0x07];
+    let (text, status, _) = decode_pdu_session_release_list(133, &value);
+    assert_eq!(status, DecodeStatus::Decoded);
+    let text = text.expect("some");
+    assert!(text.contains("release_list_type=cxt_rel_req"), "{text}");
+    assert!(text.contains("item_0_pdu_session_id=7"), "{text}");
+    assert!(text.contains(",pdu_session_id=7"), "{text}");
+    // Pas de transfer → pas de `item_0_transfer_sha256=`.
+    assert!(!text.contains("item_0_transfer_"), "{text}");
+}
+
+/// 2.21.66 — IE 107 TimeToWait : décodage v10s via fixture pycrate.
+#[test]
+fn time_to_wait_decodes_v10s_from_pycrate_octet() {
+    let (text, status, _) = decode_time_to_wait(&[0x30]);
+    assert_eq!(status, DecodeStatus::Decoded);
+    let text = text.expect("some");
+    assert!(text.contains("time_to_wait=v10s"), "{text}");
+    assert!(text.contains("time_to_wait_raw=3"), "{text}");
+    // Preuve de mutation : extension → Partial.
+    assert_eq!(decode_time_to_wait(&[0x80]).1, DecodeStatus::Partial);
+    // Preuve de mutation : longueur invalide → Malformed.
+    assert_eq!(decode_time_to_wait(&[]).1, DecodeStatus::Malformed);
+}
+
+/// 2.21.66 — IE 19 CriticalityDiagnostics : structural seulement.
+#[test]
+fn criticality_diagnostics_returns_structural_sha256_and_preamble() {
+    let (text, status, _) = decode_criticality_diagnostics(&[0xc0, 0x12]);
+    assert_eq!(status, DecodeStatus::Partial);
+    let text = text.expect("some");
+    assert!(text.contains("criticality_diagnostics_sha256="), "{text}");
+    assert!(text.contains("crit_diag_preamble=0xc0"), "{text}");
+    assert_eq!(decode_criticality_diagnostics(&[]).1, DecodeStatus::Malformed);
+}
+
+/// 2.21.66 — Couverture données stockées : les octets d'un IE 60 (list
+/// Cpl, 2 items) stockés dans un pcap avant 0.6.3 produisaient
+/// `nested_list_sha256=<hash>` avec `pdu_session_id=0` (lecture
+/// erronée du 1er octet de length). Rejoués avec 0.6.3, les mêmes
+/// octets produisent le décodage complet : les 2 pdu_session_id sont
+/// extraits et le sha256 du blob reste identique (provenance stable).
+#[test]
+fn stored_release_list_bytes_round_trip_to_full_decode_in_2_21_66() {
+    let stored_hex = [0x01, 0x00, 0x05, 0x00, 0x06];
+    let (text_new, status_new, _) = decode_pdu_session_release_list(60, &stored_hex);
+    assert_eq!(status_new, DecodeStatus::Decoded);
+    let text_new = text_new.expect("some");
+    let sha_new = text_new
+        .split(',')
+        .find_map(|pair| pair.strip_prefix("nested_list_sha256="))
+        .expect("sha256 present");
+    // Preuve byte-pour-byte : le sha256 du blob n'a pas changé — la
+    // provenance reste stable, seule la richesse du décodage augmente.
+    let sha_direct = sha256_hex(&stored_hex);
+    assert_eq!(
+        sha_new, sha_direct,
+        "le sha256 de l'IE stockée doit être inchangé entre 0.6.2 et 0.6.3"
+    );
+    // Preuve que les deux pdu_session_id sont maintenant extraits
+    // (avant 2.21.66, seul le 1er byte de length était faussement
+    // lu comme pdu_session_id).
+    assert!(text_new.contains("item_0_pdu_session_id=5"), "{text_new}");
+    assert!(text_new.contains("item_1_pdu_session_id=6"), "{text_new}");
+}
