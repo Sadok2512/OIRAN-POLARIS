@@ -1702,6 +1702,10 @@ pub struct CaptureManager {
     /// mutuellement → 503 parasite, FAIL gate ANR2 2.21.26). La publication
     /// le prend en bloquant ; l'API le prend en `try` (503 si occupé).
     heavy_memory_gate: Arc<std::sync::RwLock<()>>,
+    /// 0.6.20 — callback API exécuté après l'upsert atomique d'un dataset
+    /// publié. Il préchauffe les index dépendants avant l'annonce de fin de
+    /// cycle et n'est jamais appelé sous le mutex `datasets`.
+    dataset_publish_observer: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
     /// 0.6.9 — segments dont l'échec de décodage a déjà été compté
     /// (`(chemin, taille)`), pour ne pas gonfler `ingestion_failures` à
     /// chaque cycle. Le log structuré, lui, sort à chaque cycle.
@@ -1933,6 +1937,29 @@ impl CaptureManager {
         }
     }
 
+    /// 0.6.20 — entrée exclusive non bloquante pour le préchauffage des
+    /// caches consommateurs. Tant que cette garde vit, les routes lourdes
+    /// obtiennent le même 503 explicite que pendant une publication.
+    pub fn heavy_memory_try_enter_exclusive(
+        &self,
+    ) -> Option<std::sync::RwLockWriteGuard<'_, ()>> {
+        match self.heavy_memory_gate.try_write() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// 0.6.20 — installe l'unique observateur du consommateur API.
+    /// La notification synchrone garantit que `phase=end` n'est émis
+    /// qu'après le préchauffage demandé par le consommateur.
+    pub fn set_dataset_publish_observer(
+        &self,
+        observer: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.dataset_publish_observer.lock().unwrap() = observer;
+    }
+
     /// 0.6.10 (ordre #9 6952054201) — vrai si ce segment a déjà été
     /// quarantiné sous la même identité `(chemin, taille, sha256)`.
     pub fn is_segment_quarantined(&self, path: &str, size: u64, sha256: &str) -> bool {
@@ -2078,6 +2105,7 @@ impl CaptureManager {
             continuous_runtime_evidence: Arc::new(Mutex::new(None)),
             continuous_vtap_dirs: Arc::new(Mutex::new(Vec::new())),
             heavy_memory_gate: Arc::new(std::sync::RwLock::new(())),
+            dataset_publish_observer: Arc::new(Mutex::new(None)),
             reported_segment_failures: Arc::new(Mutex::new(BTreeSet::new())),
             vtap_publication_triggers: Arc::new(Mutex::new(BTreeSet::new())),
             quarantined_segments: Arc::new(Mutex::new(quarantined_segments)),
@@ -4170,16 +4198,38 @@ impl CaptureManager {
                     publication_started_epoch_ms,
                 ) {
                     Ok(dataset) => {
-                        self.upsert_dataset(dataset.clone(), &base.join("dataset"))?;
-                        // Publication is the commit point. If persisting the
-                        // marker fails, the checksum remains unseen and the
-                        // next scan safely retries the segment.
-                        persist_published_checksums(&state_path, &mut state, &pending_publication)?;
+                        // 2.21.63 — extraire uniquement les petites valeurs
+                        // nécessaires après le commit, puis DÉPLACER le dataset
+                        // complet dans le registre. En 2.21.61, deux upserts et
+                        // deux clones de `LiveDataset.discovery` restaient en
+                        // vie pendant le préchauffage consommateur.
                         let packets = dataset
                             .decode_reports
                             .values()
                             .map(|report| report.packets as u64)
                             .sum();
+                        let dataset_id = dataset.dataset_id.clone();
+                        let session_ids = dataset.session_ids.clone();
+                        let zero_event_captures = dataset.zero_event_captures.clone();
+                        let event_count = dataset.event_count;
+                        let last_packet_epoch_ms = dataset.last_packet_epoch_ms;
+                        let fresh_packet_count = dataset.fresh_packet_count;
+                        let active_ue_ips = dataset.active_ue_ips.clone();
+                        let publication_bytes_written = dataset.publication_bytes_written;
+                        let publication_files_created = dataset.publication_files_created;
+                        self.upsert_dataset(dataset, &base.join("dataset"))?;
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "event": "CONTINUOUS_PUBLICATION_PHASE",
+                                "phase": "manifest-swap-complete",
+                                "selected_segments": selected_files.len(),
+                            })
+                        );
+                        // Publication is the commit point. If persisting the
+                        // marker fails, the checksum remains unseen and the
+                        // next scan safely retries the segment.
+                        persist_published_checksums(&state_path, &mut state, &pending_publication)?;
                         // Never walk the base recursively here: a retired
                         // overlay tree may still be undergoing asynchronous
                         // whiteout deletion. Count the three owned surfaces
@@ -4188,8 +4238,8 @@ impl CaptureManager {
                             .saturating_add(committed_ring_bytes(&base.join("pcap")))
                             .saturating_add(work_bytes(&base));
                         self.update(CONTINUOUS_CAPTURE_ID, |job| {
-                            job.dataset_id = Some(dataset.dataset_id.clone());
-                            job.session_ids = dataset.session_ids.clone();
+                            job.dataset_id = Some(dataset_id.clone());
+                            job.session_ids = session_ids.clone();
                             job.metrics.packets_received = packets;
                             job.metrics.bytes_received = bytes;
                             job.metrics.storage_bytes = bytes;
@@ -4217,33 +4267,33 @@ impl CaptureManager {
                             // observé en production 2.10.2).
                             // Cumul lifetime worker ; liste bornée à
                             // 16 chemins.
-                            if !dataset.zero_event_captures.is_empty() {
+                            if !zero_event_captures.is_empty() {
                                 job.metrics.zero_event_segments = job
                                     .metrics
                                     .zero_event_segments
                                     .saturating_add(
-                                        dataset.zero_event_captures.len() as u64,
+                                        zero_event_captures.len() as u64,
                                     );
                                 let mut combined: Vec<String> = std::mem::take(
                                     &mut job.metrics.zero_event_segment_paths,
                                 );
-                                combined.extend(dataset.zero_event_captures.iter().cloned());
+                                combined.extend(zero_event_captures.iter().cloned());
                                 let combined_len = combined.len();
                                 let skip = combined_len.saturating_sub(16);
                                 job.metrics.zero_event_segment_paths =
                                     combined.into_iter().skip(skip).collect();
                             }
-                            job.metrics.decoded_events = dataset.event_count as u64;
-                            job.metrics.sessions_indexed = dataset.session_ids.len() as u64;
+                            job.metrics.decoded_events = event_count as u64;
+                            job.metrics.sessions_indexed = session_ids.len() as u64;
                             job.metrics.last_ingested_epoch_ms = Some(epoch_ms());
-                            job.metrics.last_packet_epoch_ms = dataset.last_packet_epoch_ms;
-                            job.metrics.fresh_packet_count = dataset.fresh_packet_count;
-                            job.metrics.active_ue_ips = dataset.active_ue_ips.clone();
+                            job.metrics.last_packet_epoch_ms = last_packet_epoch_ms;
+                            job.metrics.fresh_packet_count = fresh_packet_count;
+                            job.metrics.active_ue_ips = active_ue_ips.clone();
                             job.error = None;
                         })?;
                         cycle_trace.publication_completed = true;
-                        cycle_trace.bytes_written = dataset.publication_bytes_written;
-                        cycle_trace.files_created = dataset.publication_files_created;
+                        cycle_trace.bytes_written = publication_bytes_written;
+                        cycle_trace.files_created = publication_files_created;
                         cycle_trace.segments_ingested = state.seen_checksums.len() as u64;
                         cycle_trace.pending = pending.saturating_sub(ingested_this_scan as u64);
                         published = true;
@@ -4693,7 +4743,10 @@ impl CaptureManager {
         interfaces: &[CaptureInterface],
         max_owned_bytes: u64,
     ) -> Result<LiveDataset, String> {
-        self.process_continuous_capture_inner(base, interfaces, max_owned_bytes, None, None)
+        let dataset =
+            self.process_continuous_capture_inner(base, interfaces, max_owned_bytes, None, None)?;
+        self.register_non_worker_publication(base, &dataset, 0)?;
+        Ok(dataset)
     }
 
     fn process_continuous_capture_selected(
@@ -4703,13 +4756,38 @@ impl CaptureManager {
         max_owned_bytes: u64,
         selected_files: &BTreeSet<PathBuf>,
     ) -> Result<LiveDataset, String> {
-        self.process_continuous_capture_inner(
+        let dataset = self.process_continuous_capture_inner(
             base,
             interfaces,
             max_owned_bytes,
             Some(selected_files),
             None,
-        )
+        )?;
+        self.register_non_worker_publication(base, &dataset, selected_files.len())?;
+        Ok(dataset)
+    }
+
+    /// Direct publication entry points are used by recovery/tests/RSS tools
+    /// and historically make the committed dataset immediately queryable on
+    /// their manager. The production worker uses `*_selected_at` and performs
+    /// its single move-only upsert after this function returns, so it never
+    /// recreates the publication/prewarm overlap fixed in 2.21.63.
+    fn register_non_worker_publication(
+        &self,
+        base: &Path,
+        dataset: &LiveDataset,
+        selected_segments: usize,
+    ) -> Result<(), String> {
+        self.upsert_dataset(dataset.clone(), &base.join("dataset"))?;
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "CONTINUOUS_PUBLICATION_PHASE",
+                "phase": "manifest-swap-complete",
+                "selected_segments": selected_segments,
+            })
+        );
+        Ok(())
     }
 
     /// Continuous-worker entry point carrying the cycle's publication clock
@@ -4816,15 +4894,6 @@ impl CaptureManager {
             ));
         }
         let dataset = commit_incremental_publication(&current, &next, dataset)?;
-        self.upsert_dataset(dataset.clone(), &current)?;
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "event": "CONTINUOUS_PUBLICATION_PHASE",
-                "phase": "manifest-swap-complete",
-                "selected_segments": selected_files.map_or(0, BTreeSet::len),
-            })
-        );
         Ok(dataset)
     }
 
@@ -6896,6 +6965,12 @@ impl CaptureManager {
                 );
             },
         )?;
+        // 2.21.63 — la passe streaming vient de lire tous les shards
+        // immuables. Ces pages propres ne sont plus nécessaires à la
+        // publication ; les laisser dans le cache cgroup faisait coexister
+        // ~3,2 Gio de page cache avec le commit et le préchauffage. Les
+        // indexeurs read-time les reliront plus tard, sous la garde, si besoin.
+        advise_files_no_longer_needed(&event_paths);
         let event_count = index.source_event_count;
         let mut events = index.events;
         // The legacy BTreeMap kept keys, tree nodes and freed allocation pages
@@ -7077,7 +7152,23 @@ impl CaptureManager {
             atomic_write(&html_path, html.as_bytes())
         };
         let mut session_ids: Vec<String> = Vec::new();
+        // 2.21.65 (CLAUDE1, ordre #9 7005689840) — point de mesure
+        // AVANT la construction des LTE flows. Combiné avec le point
+        // 07a ci-dessous, `L` et `k_lte` sont comptés à l'exécution
+        // (jamais estimés) ; ANR2 lit `cgroup_peak_kb` entre 06b et
+        // 07a pour quantifier la rétention retirée par le streaming.
+        trace_publication_rss_counts(
+            publication_started_epoch_ms,
+            "06b-before-lte-flows",
+            Some(events.len()),
+            &[],
+        );
+        let mut lte_flow_count: u64 = 0;
+        let mut lte_flow_events_total: u64 = 0;
         stream_offline_lte_callflows(&events, |flow| {
+            lte_flow_count = lte_flow_count.saturating_add(1);
+            lte_flow_events_total = lte_flow_events_total
+                .saturating_add(flow.events.len() as u64);
             write_callflow(&flow)?;
             session_ids.push(flow.session_id);
             Ok(())
@@ -7087,8 +7178,28 @@ impl CaptureManager {
             "07-after-lte-flows-streamed",
             Some(events.len()),
         );
+        trace_publication_rss_counts(
+            publication_started_epoch_ms,
+            "07a-after-lte-flows-streamed",
+            Some(events.len()),
+            &[
+                ("lte_flows", lte_flow_count),
+                ("lte_flow_events_total", lte_flow_events_total),
+            ],
+        );
+        trace_publication_rss_counts(
+            publication_started_epoch_ms,
+            "07b-before-runtime-flows",
+            Some(events.len()),
+            &[("runtime_flows_candidate", active_pdu_contexts.len() as u64)],
+        );
+        let mut runtime_flow_count: u64 = 0;
+        let mut runtime_flow_events_total: u64 = 0;
         for active in active_pdu_contexts.iter() {
             let flow = runtime_pdu_callflow(&events, active);
+            runtime_flow_count = runtime_flow_count.saturating_add(1);
+            runtime_flow_events_total = runtime_flow_events_total
+                .saturating_add(flow.events.len() as u64);
             write_callflow(&flow)?;
             session_ids.push(flow.session_id);
         }
@@ -7096,6 +7207,15 @@ impl CaptureManager {
             publication_started_epoch_ms,
             "08-after-runtime-flows-streamed",
             Some(events.len()),
+        );
+        trace_publication_rss_counts(
+            publication_started_epoch_ms,
+            "08a-after-runtime-flows-streamed",
+            Some(events.len()),
+            &[
+                ("runtime_flows", runtime_flow_count),
+                ("runtime_flow_events_total", runtime_flow_events_total),
+            ],
         );
         let indexed_events_count = events.len();
         let retained_publication_events = if indexed_events_count
@@ -7209,9 +7329,17 @@ impl CaptureManager {
                     .map_err(display_error)?;
                 for event_path in &event_paths {
                     let file = fs::File::open(event_path).map_err(display_error)?;
-                    let reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, file);
-                    for line in reader.lines() {
-                        let line = line.map_err(display_error)?;
+                    let mut reader = BufReader::with_capacity(STREAM_CHUNK_BYTES, &file);
+                    let mut line = String::new();
+                    let mut consumed_bytes = 0u64;
+                    let mut advised_bytes = 0u64;
+                    loop {
+                        line.clear();
+                        let read = reader.read_line(&mut line).map_err(display_error)?;
+                        if read == 0 {
+                            break;
+                        }
+                        consumed_bytes = consumed_bytes.saturating_add(read as u64);
                         if line.trim().is_empty() { continue; }
                         let event_id = match event_id_from_json_line(&line) {
                             Some(value) => value,
@@ -7223,7 +7351,24 @@ impl CaptureManager {
                                 scratch_writers[idx].write_all(b"\n").map_err(display_error)?;
                             }
                         }
+                        // Le stock physique conserve aussi un JSONL plat de
+                        // plusieurs Gio. Attendre EOF pour DONTNEED recrée le
+                        // pic RSS cgroup à chaque lot ; évincer par fenêtres
+                        // déjà consommées borne le cache même pour ce fichier.
+                        if consumed_bytes.saturating_sub(advised_bytes) >= 16 * 1024 * 1024 {
+                            let _ = advise_open_file_range_no_longer_needed(
+                                &file,
+                                advised_bytes,
+                                consumed_bytes.saturating_sub(advised_bytes),
+                            );
+                            advised_bytes = consumed_bytes;
+                        }
                     }
+                    let _ = advise_open_file_range_no_longer_needed(
+                        &file,
+                        advised_bytes,
+                        consumed_bytes.saturating_sub(advised_bytes),
+                    );
                 }
                 for mut writer in scratch_writers {
                     writer.flush().map_err(display_error)?;
@@ -7505,10 +7650,21 @@ impl CaptureManager {
 
     fn upsert_dataset(&self, dataset: LiveDataset, dataset_dir: &Path) -> Result<(), String> {
         validate_dataset_artifacts(&dataset, dataset_dir)?;
-        self.datasets
-            .lock()
-            .unwrap()
-            .insert(dataset.dataset_id.clone(), dataset);
+        {
+            self.datasets
+                .lock()
+                .unwrap()
+                .insert(dataset.dataset_id.clone(), dataset);
+        }
+        let observer = self.dataset_publish_observer.lock().unwrap().clone();
+        if let Some(observer) = observer {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer())).is_err() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"event": "DATASET_PUBLISH_OBSERVER_PANICKED"})
+                );
+            }
+        }
         Ok(())
     }
 
@@ -8052,6 +8208,20 @@ fn commit_incremental_publication(
         &current.join("dataset_manifest.json"),
         &serde_json::to_vec_pretty(&dataset).map_err(|error| error.to_string())?,
     )?;
+    // 2.21.63 — `publish_events_to_dataset_dir` écrit son marqueur dans le
+    // staging. Le swap incrémental ne déplace que les shards/callflows et
+    // réécrit le manifest : sans ce bump au vrai point de commit, le dataset
+    // publié restait éternellement à seq=0 et les caches ne voyaient que la
+    // mtime. Le marqueur visible est monotone sur `current`.
+    let visible_commit_seq = commit_seq::bump_and_write(current)?;
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "event": "CONTINUOUS_PUBLICATION_COMMIT_VISIBLE",
+            "dataset_id": dataset.dataset_id,
+            "commit_seq": visible_commit_seq,
+        })
+    );
 
     // Only unreferenced derived generations are collected. Event shards are
     // append-only and are never passed to this GC.
@@ -10301,6 +10471,58 @@ fn release_unused_heap_pages() {
     }
 }
 
+/// 2.21.63 — frontière explicite entre la publication et les caches
+/// consommateurs. L'API appelle ce trim après que les structures temporaires
+/// de publication ont été libérées et avant son préchauffage sous verrou lourd.
+pub fn release_publication_heap_pages() {
+    release_unused_heap_pages();
+}
+
+fn advise_files_no_longer_needed(paths: &[PathBuf]) {
+    let mut bytes = 0u64;
+    let mut advised = 0usize;
+    let mut failed = 0usize;
+    for path in paths {
+        let Ok(file) = fs::File::open(path) else {
+            failed = failed.saturating_add(1);
+            continue;
+        };
+        let len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if advise_open_file_no_longer_needed(&file) {
+            advised = advised.saturating_add(1);
+            bytes = bytes.saturating_add(len);
+        } else {
+            failed = failed.saturating_add(1);
+        }
+    }
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "event": "CONTINUOUS_PUBLICATION_FILE_CACHE_RELEASE",
+            "files_advised": advised,
+            "bytes_advised": bytes,
+            "failures": failed,
+        })
+    );
+}
+
+fn advise_open_file_no_longer_needed(file: &fs::File) -> bool {
+    advise_open_file_range_no_longer_needed(file, 0, 0)
+}
+
+fn advise_open_file_range_no_longer_needed(file: &fs::File, offset: u64, len: u64) -> bool {
+    use std::os::fd::AsRawFd;
+
+    unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            offset.min(i64::MAX as u64) as libc::off_t,
+            len.min(i64::MAX as u64) as libc::off_t,
+            libc::POSIX_FADV_DONTNEED,
+        ) == 0
+    }
+}
+
 /// 2.7.28 (issue #10, ANR2 defect on 2.7.27): cross-process advisory
 /// publication lock. `process_continuous_capture` and
 /// `restore_from_archive_segment` both route their dataset-next → dataset
@@ -10603,6 +10825,7 @@ pub(crate) fn trace_publication_rss(
         phase,
         0,
         indexed_events.unwrap_or(0),
+        "",
     );
 }
 
@@ -10617,6 +10840,32 @@ pub(crate) fn trace_publication_rss_progress(
         phase,
         scanned_events,
         indexed_events,
+        "",
+    );
+}
+
+/// 2.21.65 (CLAUDE1, ordre #9 7005689840) — trace la même ligne que
+/// `trace_publication_rss`, plus des COMPTEURS RÉELS (`L`, `R`, `k_lte`,
+/// `k_rt`, etc.) collés en suffixe `key=value ...` dans le même format
+/// parsable qu'ANR2 ingère déjà. Aucune estimation : le call-site passe
+/// les comptes lus pendant l'exécution de la phase 07/08.
+pub(crate) fn trace_publication_rss_counts(
+    publication_started_epoch_ms: u64,
+    phase: &str,
+    indexed_events: Option<usize>,
+    counts: &[(&str, u64)],
+) {
+    let mut suffix = String::new();
+    for (key, value) in counts {
+        use std::fmt::Write as _;
+        let _ = write!(&mut suffix, " {key}={value}");
+    }
+    trace_publication_rss_detail(
+        publication_started_epoch_ms,
+        phase,
+        0,
+        indexed_events.unwrap_or(0),
+        &suffix,
     );
 }
 
@@ -10625,6 +10874,7 @@ fn trace_publication_rss_detail(
     phase: &str,
     scanned_events: usize,
     indexed_events: usize,
+    extras_suffix: &str,
 ) {
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     let value = |name: &str| {
@@ -10670,7 +10920,7 @@ fn trace_publication_rss_detail(
         .unwrap_or(0)
         / 1024;
     eprintln!(
-        "PUBLICATION_RSS_TRACE phase={phase} elapsed_ms={elapsed_ms} scanned_events={scanned_events} indexed_events={indexed_events} anon_kb={} file_kb={} vmrss_kb={} vmhwm_kb={} vmpeak_kb={} cgroup_source={SERVICE_CGROUP} cgroup_anon_kb={} cgroup_file_kb={} cgroup_shmem_kb={} cgroup_peak_kb={cgroup_peak_kb}",
+        "PUBLICATION_RSS_TRACE phase={phase} elapsed_ms={elapsed_ms} scanned_events={scanned_events} indexed_events={indexed_events} anon_kb={} file_kb={} vmrss_kb={} vmhwm_kb={} vmpeak_kb={} cgroup_source={SERVICE_CGROUP} cgroup_anon_kb={} cgroup_file_kb={} cgroup_shmem_kb={} cgroup_peak_kb={cgroup_peak_kb}{extras_suffix}",
         value("RssAnon"),
         value("RssFile"),
         value("VmRSS"),
@@ -12394,10 +12644,9 @@ mod tests {
     /// 2.21.65 — `stream_offline_lte_callflows` cède exactement les mêmes
     /// `CallFlow` que `offline_lte_callflows` (qui est désormais un alias nul
     /// construit par-dessus le streamer), dans le même ordre et octet-identiques
-    /// à la sérialisation `serde_json::to_vec_pretty`. Le test exerce aussi la
-    /// propagation d'erreur `MAX_OFFLINE_LTE_SESSIONS` via le même code chemin.
-    #[test]
-    fn stream_offline_lte_callflows_matches_offline_lte_callflows_byte_identical() {
+    /// à la sérialisation `serde_json::to_vec_pretty`. Factorisé pour le harness
+    /// 12 runs.
+    fn stream_lte_callflows_byte_identical_fixture() {
         let pseudo = "subscriber-test-pseudonym";
         let events = vec![
             lte_event(
@@ -12451,6 +12700,27 @@ mod tests {
                 left.session_id
             );
             assert_eq!(left.session_id, right.session_id);
+        }
+    }
+
+    #[test]
+    fn stream_offline_lte_callflows_matches_offline_lte_callflows_byte_identical() {
+        stream_lte_callflows_byte_identical_fixture();
+    }
+
+    /// 2.21.65 (CLAUDE1, ordre #9 7005689840) — 12 runs consécutifs du
+    /// test byte-identique. Rejoue les 12 passes dans le même binaire
+    /// pour exposer toute dérive d'ordinal global (ex. `REPRESENTATIVE_RUN_SEQUENCE`
+    /// ou `ATOMIC_WRITE_SEQUENCE`) qui changerait la sortie en fonction
+    /// du nombre de publications déjà exécutées. Panic au premier
+    /// écart ; aucune fuite d'état admise.
+    #[test]
+    fn stream_offline_lte_callflows_byte_identical_twelve_consecutive_runs() {
+        for run in 1..=12u32 {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                stream_lte_callflows_byte_identical_fixture,
+            ))
+            .unwrap_or_else(|_| panic!("byte-identical fixture failed at run {run}/12"));
         }
     }
 
@@ -13465,6 +13735,21 @@ mod tests {
             vtap_out_dirs: Vec::new(),
         };
         let manager = CaptureManager::with_pseudonym_key_path(root.clone(), false, root.join(".oiran-pseudonym.key")).unwrap();
+        let published_event_counts = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let published_event_counts_observer = published_event_counts.clone();
+        let published_manifest = root
+            .join(CONTINUOUS_CAPTURE_ID)
+            .join("dataset/dataset_manifest.json");
+        manager.set_dataset_publish_observer(Some(Arc::new(move || {
+            let manifest: LiveDataset = serde_json::from_slice(
+                &fs::read(&published_manifest).expect("published manifest readable"),
+            )
+            .expect("published manifest valid");
+            published_event_counts_observer
+                .lock()
+                .unwrap()
+                .push(manifest.event_count);
+        })));
         manager.start_continuous_import(config.clone()).unwrap();
         wait_for(|| {
             manager
@@ -13472,6 +13757,14 @@ mod tests {
                 .is_some_and(|job| job.metrics.segments_ingested == 3)
         });
         let first = manager.get(CONTINUOUS_CAPTURE_ID).unwrap();
+        let observed = published_event_counts.lock().unwrap().clone();
+        let unique = observed.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(
+            observed.len(),
+            commit_seq::read(&root.join(CONTINUOUS_CAPTURE_ID).join("dataset")) as usize,
+            "each committed event count must notify publication exactly once: {observed:?}"
+        );
+        assert_eq!(observed.len(), unique.len(), "duplicate observer payload: {observed:?}");
         assert!(first.metrics.packets_received > 0);
         assert!(first.metrics.decoded_events > 0);
         assert!(!first.session_ids.is_empty());

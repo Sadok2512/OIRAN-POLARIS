@@ -1113,16 +1113,29 @@ where
     let mut ordinal = 0u64;
     for path in paths {
         let file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        for (line_no, line) in BufReader::new(file).lines().enumerate() {
-            let line = line.map_err(|error| format!("{} line {}: {error}", path.display(), line_no + 1))?;
+        let mut reader = BufReader::new(&file);
+        let mut line = String::new();
+        let mut line_no = 0usize;
+        let mut consumed_bytes = 0u64;
+        let mut advised_bytes = 0u64;
+        loop {
+            line.clear();
+            let read = reader
+                .read_line(&mut line)
+                .map_err(|error| format!("{} line {}: {error}", path.display(), line_no + 1))?;
+            if read == 0 {
+                break;
+            }
+            line_no = line_no.saturating_add(1);
+            consumed_bytes = consumed_bytes.saturating_add(read as u64);
             if line.trim().is_empty() {
                 continue;
             }
             let value: Value = serde_json::from_str(&line).map_err(|error| {
-                format!("{} line {}: invalid JSON: {error}", path.display(), line_no + 1)
+                format!("{} line {}: invalid JSON: {error}", path.display(), line_no)
             })?;
             let mut event = parse_event(value)
-                .map_err(|error| format!("{} line {}: {error}", path.display(), line_no + 1))?;
+                .map_err(|error| format!("{} line {}: {error}", path.display(), line_no))?;
             source_event_count = source_event_count.saturating_add(1);
             ordinal = ordinal.saturating_add(1);
             compact_publication_event(&mut event);
@@ -1145,7 +1158,20 @@ where
             if source_event_count % 100_000 == 0 {
                 progress(source_event_count, 0);
             }
+            if consumed_bytes.saturating_sub(advised_bytes) >= 16 * 1024 * 1024 {
+                advise_file_range_no_longer_needed(
+                    &file,
+                    advised_bytes,
+                    consumed_bytes.saturating_sub(advised_bytes),
+                );
+                advised_bytes = consumed_bytes;
+            }
         }
+        advise_file_range_no_longer_needed(
+            &file,
+            advised_bytes,
+            consumed_bytes.saturating_sub(advised_bytes),
+        );
     }
     if !records.is_empty() {
         let path = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
@@ -1195,6 +1221,27 @@ where
         source_event_count,
     })
 }
+
+/// 2.21.63 / session-engine 0.5.24 — une publication physique parcourt des
+/// centaines de shards immuables. Rendre chaque fichier propre au noyau dès
+/// sa dernière ligne évite que leur page cache s'accumule jusqu'à EOF et
+/// chevauche les structures de reconstruction.
+#[cfg(target_family = "unix")]
+fn advise_file_range_no_longer_needed(file: &fs::File, offset: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+
+    let _ = unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            offset.min(i64::MAX as u64) as libc::off_t,
+            len.min(i64::MAX as u64) as libc::off_t,
+            libc::POSIX_FADV_DONTNEED,
+        )
+    };
+}
+
+#[cfg(not(target_family = "unix"))]
+fn advise_file_range_no_longer_needed(_file: &fs::File, _offset: u64, _len: u64) {}
 
 pub fn load_path_streaming_representatives(
     path: &std::path::Path,
