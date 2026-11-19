@@ -1,5 +1,35 @@
 # Changelog
 
+## OIRAN API 2.21.65 + live-probe 0.6.23 — 2026-11-19 — publication en flux (prototype, écart ouvert n° 6, ordre #9 7004955176 CLAUDE1)
+
+Upgrade **patch**, basé sur 2.21.62 (`8eeadf2`, HPACK seul). **Prototype** : aucun déploiement, aucun geste lab. La mesure sera faite par ANR1 sur une copie, cf. commande dans #9.
+
+### Pourquoi
+
+Audit mémoire `publish_events_to_dataset_dir` (#9 commentaire CLAUDE1 7005469930) : le pic 2,9–3,7 GB observé n'est pas dans les représentants compacts mais dans `Vec<CallFlow>` additif — `lte_flows` (phase 07) + `runtime_flows` (phase 08) étaient retenus jusqu'après la boucle de session-batch (anciennes lignes 7280-7309), puis écrits en masse. Sur 50 LTE × 5 k events × ~1 KB/event, c'est ~250 MB additifs en plus de `events`+`discovery`+`global_edges`+`retained_publication_events` → facteur glibc 3,5× = plusieurs centaines de MB de RSS évitables.
+
+`shrink_to_fit` / `String::new()` dans `compact_publication_event` (2.21.60) n'avait donné que −0,9 % parce qu'il s'attaquait à la mauvaise tête : les champs de `EventRecord` déjà `clear()`'d ou absents.
+
+### Correctif 2.21.65 (levier A — « callflows écrits en flux »)
+
+- `stream_offline_lte_callflows<F>(events, emit)` — nouveau. Au plus un `CallFlow` LTE résident à un instant donné. Ordre inchangé (= `discover_lte_sessions`).
+- `offline_lte_callflows` devient un alias nul construit par-dessus le streamer (compat `apps/api:602` + tests).
+- `publish_events_to_dataset_dir` : les LTE + runtime callflows sont bâtis, écrits (JSON + HTML, `atomic_write`), puis droppés **avant** la boucle de session-batch. Traces renommées `07-after-lte-flows-streamed` / `08-after-runtime-flows-streamed`.
+- Boucles d'écriture terminale `for flow in lte_flows` / `for flow in runtime_flows` supprimées — déjà sur disque.
+
+### Byte-identique
+
+- Nouveau test `stream_offline_lte_callflows_matches_offline_lte_callflows_byte_identical` : 2 sessions LTE complètes (S1AP + GTPv2-C + GTP-U), compare `serde_json::to_vec_pretty` sur chaque `CallFlow` entre `offline_lte_callflows` (chemin legacy) et `stream_offline_lte_callflows`.
+- Aucun changement dans `build_lte_callflow`, `build_callflow`, `offline_lte_callflows` (comportement extérieur), `discover_lte_sessions`, `correlate_*`. Seule la rétention mémoire change.
+
+### Gain attendu (calcul explicite — voir design CLAUDE1 #9 7005490213)
+
+`M_old = (L + R) · k · b` avec L=50, R=100, k=5 000, b=1 024 → 768 MB d'objets utiles. `M_new ≈ 1 · k · b` = 5 MB. **Économie utile ≈ 763 MB**, ou ≈ 2,67 GB de RSS (facteur glibc). Nouveau pic estimé 230 MB → 1,0 GB. Cible phase 07 de 0,9 GB atteignable, à confirmer ANR1.
+
+### Levier B (« ids + offsets ») — hors prototype
+
+Refactor `events: Vec<EventRecord>` → `Vec<CompactRepresentative>` avec rappatriement par offset JSONL, proposé en lot séparé si le levier A ne suffit pas (impact sur `discover_sessions`/`correlate_*`).
+
 ## OIRAN API 2.21.62 — 2026-11-18 — HPACK seul sur la production 2.21.57 (isolation de l'écart mémoire 2.21.59)
 
 Upgrade **patch**. 2.21.59 (fusion du lot du soir) a été retirée de la prod : `MemoryPeak` 3 987 660 800 contre 3 238 051 840 en 2.21.57 (ANR2 #10 6992115760). Pour isoler la cause, cette version ne fusionne **que** 2.21.58 (DEVMAT `1c61086`, carry HPACK ordonné par le ring, carry jetable hors ring) sur 2.21.57 (`c1f2798`). Le préchauffage des index de 2.21.56 n'y est **pas**. Conflits limités aux versions, au Cargo.lock et au CHANGELOG.

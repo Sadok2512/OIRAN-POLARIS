@@ -256,6 +256,27 @@ const HISTORICAL_N2_BOOTSTRAP_PATH: &str = "/var/lib/docker/volumes/oiran_lab_pc
 /// Materialises bounded LTE sessions from already-decoded evidence. This does
 /// not start a capture or expand the live-capture interface allowlist.
 pub fn offline_lte_callflows(events: &[EventRecord]) -> Result<Vec<CallFlow>, String> {
+    let mut out = Vec::new();
+    stream_offline_lte_callflows(events, |flow| {
+        out.push(flow);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// 2.21.65 — variante streaming de `offline_lte_callflows`. Chaque `CallFlow`
+/// est cédé à `emit` dès qu'il est bâti puis droppé immédiatement ; au plus
+/// un `CallFlow` LTE est résident à un instant donné. Les sessions sont
+/// explorées dans l'ordre déterministe de `discover_lte_sessions`
+/// (= ordre canonique `(capture_id, packet_number, event_id)`), et la sortie
+/// par `emit` est octet-identique à ce que `offline_lte_callflows` produisait
+/// avant 2.21.65 : même `build_lte_callflow`, même filtre d'edges par session,
+/// mêmes entrées `&[EventRecord]`. Cible : briser la rétention Vec<CallFlow>
+/// phase 07 → 10 dans `publish_events_to_dataset_dir` (écart ouvert n° 6).
+pub fn stream_offline_lte_callflows<F>(events: &[EventRecord], mut emit: F) -> Result<(), String>
+where
+    F: FnMut(CallFlow) -> Result<(), String>,
+{
     let sessions = discover_lte_sessions(events);
     if sessions.len() > MAX_OFFLINE_LTE_SESSIONS {
         return Err(format!(
@@ -265,20 +286,19 @@ pub fn offline_lte_callflows(events: &[EventRecord]) -> Result<Vec<CallFlow>, St
         ));
     }
     let global_edges = fold_overlapping_edges(correlate_lte_evidence(events));
-    Ok(sessions
-        .iter()
-        .map(|session| {
-            let ids = session.event_ids.iter().collect::<BTreeSet<_>>();
-            let edges = global_edges
-                .iter()
-                .filter(|edge| {
-                    ids.contains(&edge.source_event_id) && ids.contains(&edge.target_event_id)
-                })
-                .cloned()
-                .collect();
-            build_lte_callflow(session, events, edges)
-        })
-        .collect())
+    for session in &sessions {
+        let ids = session.event_ids.iter().collect::<BTreeSet<_>>();
+        let edges = global_edges
+            .iter()
+            .filter(|edge| {
+                ids.contains(&edge.source_event_id) && ids.contains(&edge.target_event_id)
+            })
+            .cloned()
+            .collect();
+        let flow = build_lte_callflow(session, events, edges);
+        emit(flow)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -7031,19 +7051,50 @@ impl CaptureManager {
         //   * `SessionPlan.edges` supprimé : les edges pertinentes sont
         //     re-filtrées depuis `global_edges` au moment de la boucle
         //     par session (petit coût CPU, gros gain mémoire).
-        let lte_flows: Vec<CallFlow> = offline_lte_callflows(&events)?;
+        //
+        // 2.21.65 (CLAUDE1, #9 écart ouvert n° 6) : les `lte_flows` et
+        // `runtime_flows` restaient résidents en `Vec<CallFlow>` depuis
+        // la phase 07/08 jusqu'au terminus post-boucle-session (7280-7309).
+        // Sur 50 LTE × 5 k events × ~1 KB/event, c'est ~250 MB additifs
+        // en plus de `events`+`discovery`+`global_edges`+`retained_events`.
+        // On ne garde plus un seul `Vec<CallFlow>` : chaque call-flow est
+        // bâti, écrit (JSON + HTML, atomique), puis droppé AVANT que la
+        // boucle de session-batch commence. Byte-identique côté sortie
+        // (même `build_lte_callflow` / `build_callflow` sur les mêmes
+        // `&[EventRecord]`), seule la rétention mémoire change.
+        let write_callflow = |flow: &CallFlow| -> Result<(), String> {
+            let json_path = dataset_dir
+                .join("callflows")
+                .join(format!("{}.json", flow.session_id));
+            let html_path = dataset_dir
+                .join("callflows")
+                .join(format!("{}.html", flow.session_id));
+            atomic_write(
+                &json_path,
+                &serde_json::to_vec_pretty(flow).map_err(|error| error.to_string())?,
+            )?;
+            let html = callflow_renderer::render(flow).map_err(|error| error.to_string())?;
+            atomic_write(&html_path, html.as_bytes())
+        };
+        let mut session_ids: Vec<String> = Vec::new();
+        stream_offline_lte_callflows(&events, |flow| {
+            write_callflow(&flow)?;
+            session_ids.push(flow.session_id);
+            Ok(())
+        })?;
         trace_publication_rss(
             publication_started_epoch_ms,
-            "07-after-lte-flows-built",
+            "07-after-lte-flows-streamed",
             Some(events.len()),
         );
-        let runtime_flows: Vec<CallFlow> = active_pdu_contexts
-            .iter()
-            .map(|active| runtime_pdu_callflow(&events, active))
-            .collect();
+        for active in active_pdu_contexts.iter() {
+            let flow = runtime_pdu_callflow(&events, active);
+            write_callflow(&flow)?;
+            session_ids.push(flow.session_id);
+        }
         trace_publication_rss(
             publication_started_epoch_ms,
-            "08-after-runtime-flows-built",
+            "08-after-runtime-flows-streamed",
             Some(events.len()),
         );
         let indexed_events_count = events.len();
@@ -7094,7 +7145,6 @@ impl CaptureManager {
         let session_scratch_staging_root = dataset_dir
             .join(".publish-staging")
             .join("session-scratch");
-        let mut session_ids = Vec::new();
         let batch_size = session_publication_batch_size();
         let pdu_sessions_len = discovery.pdu_sessions.len();
         for (batch_idx, chunk) in discovery
@@ -7257,36 +7307,9 @@ impl CaptureManager {
             "10a-after-session-callflows",
             Some(indexed_events_count),
         );
-        for flow in lte_flows {
-            let json_path = dataset_dir
-                .join("callflows")
-                .join(format!("{}.json", flow.session_id));
-            let html_path = dataset_dir
-                .join("callflows")
-                .join(format!("{}.html", flow.session_id));
-            atomic_write(
-                &json_path,
-                &serde_json::to_vec_pretty(&flow).map_err(|error| error.to_string())?,
-            )?;
-            let html = callflow_renderer::render(&flow).map_err(|error| error.to_string())?;
-            atomic_write(&html_path, html.as_bytes())?;
-            session_ids.push(flow.session_id);
-        }
-        for flow in runtime_flows {
-            let json_path = dataset_dir
-                .join("callflows")
-                .join(format!("{}.json", flow.session_id));
-            let html_path = dataset_dir
-                .join("callflows")
-                .join(format!("{}.html", flow.session_id));
-            atomic_write(
-                &json_path,
-                &serde_json::to_vec_pretty(&flow).map_err(|error| error.to_string())?,
-            )?;
-            let html = callflow_renderer::render(&flow).map_err(|error| error.to_string())?;
-            atomic_write(&html_path, html.as_bytes())?;
-            session_ids.push(flow.session_id);
-        }
+        // 2.21.65 : les LTE + runtime callflows ont été écrits en flux
+        // AVANT la boucle de session-batch (phase 07/08). Plus rien à
+        // matérialiser ici.
         if let Some((prior_dir, prior)) = &prior_continuous {
             for (name, report) in &prior.decode_reports {
                 reports
@@ -12366,6 +12389,69 @@ mod tests {
         );
         assert_eq!(flows[0].correlation_status["E2E"], "STRONG");
         assert!(!serde_json::to_string(&flows).unwrap().contains("001010"));
+    }
+
+    /// 2.21.65 — `stream_offline_lte_callflows` cède exactement les mêmes
+    /// `CallFlow` que `offline_lte_callflows` (qui est désormais un alias nul
+    /// construit par-dessus le streamer), dans le même ordre et octet-identiques
+    /// à la sérialisation `serde_json::to_vec_pretty`. Le test exerce aussi la
+    /// propagation d'erreur `MAX_OFFLINE_LTE_SESSIONS` via le même code chemin.
+    #[test]
+    fn stream_offline_lte_callflows_matches_offline_lte_callflows_byte_identical() {
+        let pseudo = "subscriber-test-pseudonym";
+        let events = vec![
+            lte_event(
+                "lte-s1-a", "S1-MME", "S1AP", "InitialContextSetupResponse",
+                &[("enb_ue_s1ap_id", "11"), ("mme_ue_s1ap_id", "21"),
+                  ("subscriber_pseudonym", pseudo), ("erab_teid", "0x1111")],
+                "UPLINK", 1,
+            ),
+            lte_event(
+                "lte-s11-a", "S11", "GTPv2-C", "CreateSessionResponse",
+                &[("subscriber_pseudonym", pseudo), ("f_teid", "0x1111"),
+                  ("bearer_f_teid", "0x2222")], "DOWNLINK", 2,
+            ),
+            lte_event(
+                "lte-s1u-a", "S1-U", "GTP-U", "G-PDU",
+                &[("teid", "0x1111")], "UPLINK", 3,
+            ),
+            lte_event(
+                "lte-s1-b", "S1-MME", "S1AP", "InitialContextSetupResponse",
+                &[("enb_ue_s1ap_id", "33"), ("mme_ue_s1ap_id", "44"),
+                  ("subscriber_pseudonym", "other-pseudo"), ("erab_teid", "0x3333")],
+                "UPLINK", 4,
+            ),
+            lte_event(
+                "lte-s11-b", "S11", "GTPv2-C", "CreateSessionResponse",
+                &[("subscriber_pseudonym", "other-pseudo"), ("f_teid", "0x3333"),
+                  ("bearer_f_teid", "0x4444")], "DOWNLINK", 5,
+            ),
+        ];
+        let batched = offline_lte_callflows(&events).unwrap();
+        let mut streamed: Vec<CallFlow> = Vec::new();
+        stream_offline_lte_callflows(&events, |flow| {
+            streamed.push(flow);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            batched.len(),
+            streamed.len(),
+            "streamed produced {} flows but batched produced {}",
+            streamed.len(),
+            batched.len()
+        );
+        assert!(!batched.is_empty(), "test fixture must produce ≥ 1 LTE flow");
+        for (left, right) in batched.iter().zip(streamed.iter()) {
+            let left_bytes = serde_json::to_vec_pretty(left).unwrap();
+            let right_bytes = serde_json::to_vec_pretty(right).unwrap();
+            assert_eq!(
+                left_bytes, right_bytes,
+                "streamed flow {} diverges from batched output (byte-pretty-serde)",
+                left.session_id
+            );
+            assert_eq!(left.session_id, right.session_id);
+        }
     }
 
     #[test]
