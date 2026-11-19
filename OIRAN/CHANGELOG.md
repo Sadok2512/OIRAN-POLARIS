@@ -1,5 +1,35 @@
 # Changelog
 
+## OIRAN API 2.21.73 + live-probe 0.6.29 + session-engine 0.5.27 — 2026-11-19 — comptage par champ à 01-50-scan-end (étape 3/3, ordre #9 7006855142 CLAUDE1)
+
+Upgrade **patch** sans déploiement, basé sur 2.21.71 (`daaea89`). Étape 3/3 du lot 2.21.69 : chiffrer où partent les **3,55 Ko d'anon par représentant** mesurés par ANR1 (`anon` 1 932 738 560 / 544 292 représentants = 3 550, #10 7006752946). **Instrumentation pure, zéro octet retiré.**
+
+### Correctif
+
+- Nouvelle fonction `session-engine::publication_projection_field_bytes_counted<I>(event_count, events: I)` — consomme un `IntoIterator<Item = &EventRecord>` sans cloner. La fonction `publication_projection_field_bytes(&[EventRecord])` existante devient un alias nul construit par-dessus.
+- `_with_stages` émet à `01-50-scan-end` les compteurs suivants en plus des précédents :
+  - **Buffer `records`** : `records_in_flight` (len), `records_capacity`, `records_inline_bytes` = `capacity() × size_of::<SpilledRepresentative>()`.
+  - **Clés sémantiques** : `records_key_bytes_len` = Σ `record.key.len()`, `records_key_bytes_capacity` = Σ `record.key.capacity()`.
+  - **Breakdown par champ EventRecord** via `publication_projection_field_bytes_counted` : `event_record_inline`, `event_id`, `capture_id`, `capture_point_id`, `timestamp`, `interface`, `protocol`, `message_name`, `source_address`, `destination_address`, `source_participant`, `destination_participant`, `direction`, `decoding_status`, `decoder_name`, `decoder_version`, `raw_payload_reference`, `parent_event_id`, `identifiers_vec`, `identifier_names`, `identifier_values`, `information_elements`, `packet_references_vec`, `packet_reference_paths`, `errors`, `source_json`, `source_json_sbi`, `probe_id`, `probe_type`, `physical_link`, `timestamp_source`.
+- Chaque champ est émis en suffixe `key=value` de la ligne `PUBLICATION_RSS_TRACE phase=01-50-scan-end …`. ANR1 lit directement la ligne, somme par champ, isole le poste dominant.
+
+### Lecture attendue
+
+À `01-50-scan-end`, les `records` représentent le dernier lot in-flight (celui qui sera flushé juste après). Tous les lots précédents sont déjà sur disque et ne pèsent plus sur `anon`. **Le breakdown par champ sur ce buffer donne la distribution unitaire** — i.e., pour chaque `(field, bytes)` divisé par `records_in_flight`, on obtient le nombre d'octets anon consommés par représentant pour ce champ. Le poste qui domine détermine la cible du levier B :
+
+- Si `information_elements` domine → cibler la compaction stricte PFCP/NGAP (actuellement `retain` par substring sur `name`/`value`).
+- Si les `identifier_*` dominent → réduire la liste `STABLE_IDENTIFIERS` ou passer en `smallvec`.
+- Si `source_json` + `source_json_sbi` dominent → compacter encore `sbi.*` hors des 3 attributs utilisés.
+- Si `event_record_inline` + `records_inline_bytes` dominent → passer à `CompactRepresentative` (ids + offsets).
+
+**Pas de levier B avant cette lecture.**
+
+### Byte-identique
+
+Aucune modification des données. Les tests `spilling_with_stages_matches_with_progress_byte_identical`, `spilling_with_stages_byte_identical_twelve_consecutive_runs`, `spilling_representatives_match_legacy_across_multiple_runs` continuent de passer. 12 invocations `cargo test` séparées : 12/12 ok.
+
+Fin du lot 2.21.69 (étapes 1 → 3). Les trois commits sont sur la même branche `fix/oiran-2.21.69-cgroup-resolve`, chacun à sa version SemVer (2.21.69 / 2.21.71 / 2.21.73), poussés dans l'ordre.
+
 ## OIRAN API 2.21.71 + live-probe 0.6.28 + session-engine 0.5.26 — 2026-11-19 — fadvise DONTNEED par bloc (étape 2/3, ordre #9 7006855142 CLAUDE1)
 
 Upgrade **patch** sans déploiement, basé sur 2.21.69 (`058adc2`). Étape 2/3 du lot 2.21.69 : viser les 2,18 Go de `cgroup_file_kb` mesurés par ANR1 (#10 7006752946).

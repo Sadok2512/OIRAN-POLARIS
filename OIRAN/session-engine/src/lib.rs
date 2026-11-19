@@ -99,6 +99,21 @@ impl EventRecord {
 /// owned capacities reachable from the named field. Allocator metadata is not
 /// guessed. `source_json_sbi` is an informational subset of `source_json`.
 pub fn publication_projection_field_bytes(events: &[EventRecord]) -> BTreeMap<&'static str, usize> {
+    publication_projection_field_bytes_counted(events.len(), events.iter())
+}
+
+/// 2.21.73 (CLAUDE1, ordre #9 7006855142 §3) — variante consommant
+/// un itérateur `&EventRecord` plus un compte explicite. Permet le
+/// comptage par champ directement sur un buffer intermédiaire (ex.
+/// `Vec<SpilledRepresentative>`) sans cloner les events. Appelé par
+/// `_with_stages` à `01-50-scan-end`.
+pub fn publication_projection_field_bytes_counted<'a, I>(
+    event_count: usize,
+    events: I,
+) -> BTreeMap<&'static str, usize>
+where
+    I: IntoIterator<Item = &'a EventRecord>,
+{
     fn add(map: &mut BTreeMap<&'static str, usize>, key: &'static str, value: usize) {
         let current = map.entry(key).or_default();
         *current = current.saturating_add(value);
@@ -124,7 +139,7 @@ pub fn publication_projection_field_bytes(events: &[EventRecord]) -> BTreeMap<&'
     add(
         &mut bytes,
         "event_record_inline",
-        events.len() * std::mem::size_of::<EventRecord>(),
+        event_count * std::mem::size_of::<EventRecord>(),
     );
     for event in events {
         for (key, value) in [
@@ -1278,15 +1293,42 @@ where
         );
         drop(file);
     }
-    stage(
-        "01-50-scan-end",
-        &[
-            ("source_event_count", source_event_count as u64),
-            ("records_in_flight", records.len() as u64),
-            ("retained_bytes_in_flight", retained_bytes as u64),
-            ("run_count", run_paths.len() as u64),
-        ],
+    // 2.21.73 (CLAUDE1, ordre #9 7006855142 §3) — comptage par
+    // champ des représentants ENCORE EN MÉMOIRE (`records`) à ce
+    // point. Les représentants déjà flushés sur disque ne pèsent
+    // plus sur `anon` ; seuls les in-flight contribuent. Le
+    // breakdown par champ identifie où partent les ≈ 3,55 Ko par
+    // représentant mesurés par ANR1 (#10 7006752946).
+    //
+    // `_counted` consomme un itérateur sans cloner les events ;
+    // zéro allocation significative. Le résultat est aplati en
+    // `(key, value)` pour la trace.
+    let field_breakdown = publication_projection_field_bytes_counted(
+        records.len(),
+        records.iter().map(|record| &record.event),
     );
+    let mut records_key_bytes: usize = 0;
+    let mut records_key_bytes_capacity: usize = 0;
+    for record in records.iter() {
+        records_key_bytes = records_key_bytes.saturating_add(record.key.len());
+        records_key_bytes_capacity =
+            records_key_bytes_capacity.saturating_add(record.key.capacity());
+    }
+    let records_inline_bytes = records.capacity() * std::mem::size_of::<SpilledRepresentative>();
+    let mut scan_end_counts: Vec<(&str, u64)> = vec![
+        ("source_event_count", source_event_count as u64),
+        ("records_in_flight", records.len() as u64),
+        ("records_capacity", records.capacity() as u64),
+        ("records_inline_bytes", records_inline_bytes as u64),
+        ("records_key_bytes_len", records_key_bytes as u64),
+        ("records_key_bytes_capacity", records_key_bytes_capacity as u64),
+        ("retained_bytes_in_flight", retained_bytes as u64),
+        ("run_count", run_paths.len() as u64),
+    ];
+    for (field, bytes) in &field_breakdown {
+        scan_end_counts.push((*field, *bytes as u64));
+    }
+    stage("01-50-scan-end", &scan_end_counts);
     if !records.is_empty() {
         let path = flush_representative_run(&staging_dir, run_paths.len(), &mut records)?;
         run_paths.push(path);
