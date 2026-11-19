@@ -1,8 +1,36 @@
 # Changelog
 
+## OIRAN API 2.21.72 — 2026-11-19 — train de livraison : 2.21.66 + 2.21.68 + 2.21.70 merge --no-ff (ordre #9 7007412446)
+
+Train objectif « un seul déploiement après 2.21.64 ». Branche `fix/oiran-2.21.72-train`, base `2468bfc` (`fix/oiran-2.21.64-merge`). Trois merges `--no-ff` dans l'ordre chronologique :
+
+1. **2.21.66** (NGAP partiels — `a3fc681`) : décoder-ngap 0.6.3, procedureCode 28, IE 19/107 décodés, forme longue release lists, UE-NGAP-IDs 2 branches CHOICE. Voir section dédiée ci-dessous.
+2. **2.21.68** (queue_occupancy honnête + quarantaine — `77efd30`) : live-probe 0.6.25, redéfinition `queue_occupancy_percent`, nouveau `owned_bytes_percent` sans clamp, `quarantined_segments` exclu de pending. Voir section dédiée ci-dessous.
+3. **2.21.70** (pagination /callflow — `17dc76d`) : `total_events` cohérent multi-pages, clés PFCP session complète. Voir section dédiée ci-dessous.
+
+### Conflits résolus
+- `apps/api/Cargo.toml` : trois versions concurrentes → version finale `2.21.72`.
+- `Cargo.lock` : idem pour l'entrée `oiran-api`.
+- `CHANGELOG.md` : trois en-têtes concurrents → ordre conservé (chronologique descendant).
+
+### Tests train
+- `cargo test --locked -p decoder-ngap` : 57 tests, 0 échec (inchangé depuis 2.21.66).
+- `cargo test --locked -p live-probe --lib` : 185 passed, 0 failed, 6 ignored pré-existants (inchangé depuis 2.21.68).
+- `cargo test --locked -p oiran-api --lib` : 197 passed, 0 failed, 3 ignored pré-existants (inchangé depuis 2.21.70).
+- `cargo test --locked` workspace complet (sanity).
+- `cd OIRAN/vtap && cargo update -w && cargo test --locked` : 12+3 OK.
+- `python3 /tmp/audit.py OIRAN/Cargo.lock` + `vtap/Cargo.lock` : 137+53 packages, 0 > rust-version 1.83.
+- 12 runs des tests ajoutés par les trois lots (decoder-ngap + live-probe + oiran-api) à 0 échec.
+
+### Références
+- Accusé train : #9 comment `7007419335`.
+- Rendus individuels : 2.21.66 (`7005568235` + `7006113833`), 2.21.68 (`7006716234`), 2.21.70 (`7007171670`).
+
+---
+
 ## OIRAN API 2.21.68 + live-probe 0.6.25 — 2026-11-19 — indicateur `queue_occupancy_percent` honnête + quarantaine hors de `pending_segments` (ordre #9 7006248573)
 
-*Entrée intégrée dans le train 2.21.72 ci-dessous (merge --no-ff).*
+*Entrée intégrée dans le train 2.21.72 ci-dessus (merge --no-ff).*
 
 ## OIRAN API 2.21.66 + decoder-ngap 0.6.3 — 2026-11-19 — NGAP partiels : NGSetup + libération de session (ordre #9 7004955176)
 
@@ -96,6 +124,60 @@ jq -r 'select(.protocol=="NGAP") | .decoding_status' /tmp/ngap-replay.jsonl | so
 - Chemin de re-décodage lab (replay pcap → events sur dataset physique prod) : **OUVERT**, mesure chiffrée par ANR1/ANR2 hors scope CLAUDE2 code. La commande ci-dessus est l'entry-point.
 - CriticalityDiagnostics item `iE-Extensions` : les items avec `opt_iE_Extensions=1` ont leur structure d'extension skippée (le bit est lu mais le contenu n'est pas décodé — rare en prod). **OUVERT NON-BLOQUANT**.
 - UE-NGAP-IDs extension du CHOICE (au-delà des 2 alternatives root `pair` et `amf_only`) : marqueur `ue_ngap_ids_choice_extension=true` + sha256. **OUVERT NON-BLOQUANT**.
+
+## OIRAN API 2.21.70 — 2026-11-19 — pagination `/callflow` `total_events` cohérent multi-pages + clés PFCP session complète (ordre #9 7006855142)
+
+Branche `fix/oiran-2.21.70-callflow-pagination`, base `2468bfc` (`fix/oiran-2.21.64-merge`). Pas de déploiement, pas de force-push, aucun geste lab.
+
+### Défaut noté en revue cœur 7006855142 §CLAUDE2
+
+2.21.64 ne bump `pagination.total_events` que quand `insert_pfcp_siblings_into_callflow` insère effectivement des siblings — c'est-à-dire en page 1. Sur une page 2+ (curseur présent), les siblings ne sont pas ré-insérés et `total_events` reste figé sur le total persisté → **incohérence multi-pages**. En plus, la même fonction dérivait les clés PFCP (sequence/seid) des `events` de la page restreinte : sur une page 1 avec limit petit qui ne contenait pas la PFCP Response, **zéro sibling** était inséré (le p900 ne voyait pas la Request-50 attendue).
+
+### Correctif oiran-api 2.21.70
+
+- **Nouveau type public** `read_time_patch::PfcpSessionKeys` (sequences, seids, interfaces, event_ids d'une session complète).
+- **Nouvelle fonction** `read_time_patch::collect_pfcp_session_keys(events: &[Value]) -> PfcpSessionKeys` : pure, pas d'I/O, extrait les clés d'une liste persistée.
+- **Nouvelle fonction** `read_time_patch::extend_items_with_pfcp_siblings_using_session_keys(items, dataset_root, &session_keys)` : variante d'`extend_items_with_pfcp_siblings_from_jsonl` qui utilise des clés fournies **en amont** (session entière), pas celles dérivées des `items` restreints.
+- **Nouvelle fonction** `read_time_patch::insert_pfcp_siblings_into_callflow_using_session_keys(events, dataset_root, &session_keys)` : variante callflow avec clés session.
+- **Nouvelle fonction** `read_time_patch::count_pfcp_siblings_for_persisted_events(events: &[Value], dataset_root)` : compte canonique du sibling count pour la session entière (indépendant du curseur).
+- **Handler** `session_callflow_blocking` (`apps/api/src/lib.rs:7236+`) :
+  - Charge une fois par requête la liste persistée COMPLÈTE via le nouveau helper `load_persisted_callflow_events(state, id)` (priorité `flow_path_for` → `flow_value_for` → `capture_manager` → `lte_evidence_store`).
+  - Extrait `session_keys` via `collect_pfcp_session_keys` (pure).
+  - En page 1 (`cursor.is_none()`) : insère les siblings via `insert_pfcp_siblings_into_callflow_using_session_keys` (clés session, pas clés page).
+  - Sur toutes les pages : calcule `session_sibling_count` via `count_pfcp_siblings_for_persisted_events` et ajuste `pagination.total_events = persisted_total + session_sibling_count`. **Identique sur page 1, page 2, page N.**
+- **Retro-compatibilité** : `insert_pfcp_siblings_into_callflow` et `extend_items_with_pfcp_siblings_from_jsonl` restent publiques avec leur signature historique — elles délèguent maintenant aux variantes `*_using_session_keys` en construisant les clés depuis les `items` passés. Les call-sites existants (par ex. `apps/api/src/lib.rs:7051` pour `/sessions/:id/events`) ne changent pas.
+
+### Non-régression consommateurs `queue_occupancy_percent` (vérifié 2.21.68)
+
+`grep -rn "queue_occupancy_percent\|capture_queue_utilization_percent\|owned_bytes_percent" OIRAN/ --include=*.rs --include=*.ts --include=*.tsx` :
+
+- `live-probe/src/lib.rs` : 3 écritures (dans 2.21.68 branche).
+- `apps/api/src/lib.rs:1884` : expose `capture_queue_utilization_percent` dans `/metrics`. **Sourcé sur la vraie file 0-100 % depuis 2.21.68 → comportement AMÉLIORÉ, pas cassé.**
+- `apps/web/src/pages/ReportsPages.tsx` (p900) : lit `capture_queue_utilization_percent` et l'affiche en « Capture queue : X% ». UI inchangée, valeur maintenant correcte (0-100 %).
+- `apps/web/src/types/api.ts` : typage `Metrics.capture_queue_utilization_percent: number | null` — back-compat.
+- `apps/web/src/test/app-shell-live-state.test.tsx` : utilise `null` par défaut — pas de régression.
+- `disk-safety/**/*.rs` : **aucun consommateur** (vérifié par grep). Pas de garde à ajuster.
+- `worker-runtime/src/lib.rs` : `queue_occupancy` (count de batches) est un concept distinct, pas lié au `queue_occupancy_percent` de live-probe.
+
+Aucun consommateur cassé par 2.21.68. Le lot peut déployer comme tel une fois mergé.
+
+### Tests de non-régression (aucun `#[ignore]` ajouté)
+
+Dans `apps/api/src/read_time_patch.rs::callflow_pfcp_insert_tests` :
+
+- `count_pfcp_siblings_matches_insert_pfcp_siblings_delta_2_21_70` — Fixture 2 siblings PFCP sur session connue + 1 sibling sur autre session ; prouve que `count_pfcp_siblings_for_persisted_events` == delta de `insert_pfcp_siblings_into_callflow` (= 2).
+- `multi_page_total_events_is_coherent_and_no_event_id_duplicate_2_21_70` — Fixture 5 events persistés + 1 sibling. Pagination simulée (limit=2) sur 3 pages. Vérifie :
+  - `total_events` constant sur page 1, 2, 3 (= 6 = N + K).
+  - `sum(returned_events) = total_events`.
+  - Aucun doublon d'`event_id` entre pages.
+  - La page 1 reçoit bien le sibling même si elle ne contient PAS la PFCP Response (via les clés session).
+- Régression `tests::prod_pfcp_request_type_50_appears_in_events_even_when_absent_from_callflow` (existant) : reste PASS — le JSONL expose la PFCP Request-50 absente du callflow, qui est bien ajoutée et comptée dans `total_events = 3`.
+
+### Écarts OUVERTS après 2.21.70
+
+- `load_persisted_callflow_events` relit le fichier callflow via `serde_json::from_reader` (pas de streaming). Pour les callflows > 10 MB, doublage mémoire ponctuel. **OUVERT NON-BLOQUANT** jusqu'à mesure prod.
+- Le pré-chargement des events se fait à chaque requête `/callflow`. Si profiling pointe cette fonction, cache session-level envisageable (invalidation par mtime du file). **OUVERT NON-BLOQUANT**.
+- UI p900 dashboard n'affiche pas encore `capture_owned_bytes_percent` / `quarantined_segments` (introduits 2.21.68). **Lot UI séparé OUVERT**.
 
 ## OIRAN API 2.21.64 — 2026-11-19 — fusion HPACK/préchauffage et comptage callflow enrichi
 

@@ -7069,6 +7069,60 @@ fn session_events_blocking(state: &AppState, id: &str, query: &ListQuery) -> Res
     paginated_with_patch_status(items, query, patch_status).into_response()
 }
 
+/// 2.21.70 (ordre #9 7006855142) — Charge la liste COMPLÈTE des events
+/// persistés d'une session, indépendante de la pagination. Utilisé par
+/// `session_callflow_blocking` pour calculer le `session_sibling_count`
+/// sur toutes les pages. L'ordre de résolution reflète celui du handler
+/// (`flow_path_for` → `flow_value_for` → `capture_manager` →
+/// `lte_evidence_store`), de sorte que les deux chemins (page et
+/// comptage) voient la MÊME liste persistée.
+fn load_persisted_callflow_events(state: &AppState, id: &str) -> Vec<Value> {
+    if let Some(path) = flow_path_for(state, id) {
+        // Lecture directe du fichier, sans la limite de pagination.
+        if let Ok(file) = std::fs::File::open(path) {
+            let reader = std::io::BufReader::new(file);
+            if let Ok(value) = serde_json::from_reader::<_, Value>(reader) {
+                return value
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+        return Vec::new();
+    }
+    if let Some(flow_value) = flow_value_for(state, id) {
+        return flow_value
+            .get("events")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+    }
+    if let Ok(Some(value)) = state
+        .inner
+        .capture_manager
+        .callflow_page_by_session(id, None, MAX_CALLFLOW_PAGE_EVENTS)
+    {
+        return value
+            .get("events")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+    }
+    if let Ok(Some(value)) = state
+        .inner
+        .lte_evidence_store
+        .callflow_page_by_session(id, None, MAX_CALLFLOW_PAGE_EVENTS)
+    {
+        return value
+            .get("events")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+    }
+    Vec::new()
+}
+
 fn callflow_page_from_value(
     source: &Value,
     cursor: Option<&str>,
@@ -7219,33 +7273,58 @@ fn session_callflow_blocking(state: &AppState, id: &str, query: &CallflowQuery) 
     };
     match result {
         Ok(Some(mut value)) => {
-            // 2.15.3 — même réconciliation PFCP que /events (2.15.2), sur la
-            // première page du callflow lue par le ladder p900.
+            // 2.21.70 (ordre #9 7006855142) — dataset root et clés PFCP
+            // de la SESSION COMPLÈTE calculées UNE fois par requête,
+            // indépendamment du curseur. Les deux chemins (insertion page 1,
+            // comptage total pour toutes les pages) utilisent les MÊMES
+            // clés — garantie que `total_events` est cohérent.
+            let dataset_root = if flow_value_for(state, id).is_some() {
+                state.inner.reference_dataset_root.clone()
+            } else {
+                live_flow_for(state, id).and_then(|(dataset_id, _)| {
+                    state.inner.capture_manager.dataset_root(&dataset_id)
+                })
+            };
+            let session_keys = if dataset_root.is_some() {
+                read_time_patch::collect_pfcp_session_keys(
+                    &load_persisted_callflow_events(state, id),
+                )
+            } else {
+                read_time_patch::PfcpSessionKeys::default()
+            };
+            // 2.15.3 — réconciliation PFCP sur la page 1. 2.21.70 : clés
+            // de session complète → les siblings sont insérés en page 1
+            // même si cette page ne contient pas les events PFCP porteurs.
             let mut pfcp_siblings_added = 0usize;
             if cursor.is_none() {
-                let dataset_root = if flow_value_for(state, id).is_some() {
-                    state.inner.reference_dataset_root.clone()
-                } else {
-                    live_flow_for(state, id).and_then(|(dataset_id, _)| {
-                        state.inner.capture_manager.dataset_root(&dataset_id)
-                    })
-                };
                 if let (Some(root), Some(events)) = (
                     dataset_root.as_deref(),
                     value.get_mut("events").and_then(Value::as_array_mut),
                 ) {
                     pfcp_siblings_added =
-                        read_time_patch::insert_pfcp_siblings_into_callflow(events, root)
-                            .unwrap_or_default();
+                        read_time_patch::insert_pfcp_siblings_into_callflow_using_session_keys(
+                            events,
+                            root,
+                            &session_keys,
+                        )
+                        .unwrap_or_default();
                 }
             }
-            // 2.21.64 — `read_callflow_page` calcule la pagination depuis le
-            // callflow persisté. La réconciliation PFCP ci-dessus peut ensuite
-            // enrichir la première page avec des siblings du JSONL brut. Les
-            // compteurs doivent décrire la liste effectivement servie : avant
-            // ce correctif, l'essai 7 renvoyait 72 events tout en annonçant
-            // `returned_events=67` et `total_events=67`.
-            if pfcp_siblings_added > 0 {
+            // 2.21.70 — comptage canonique du sibling count (session
+            // entière), indépendant du curseur. Garantit que `total_events`
+            // est le MÊME sur toutes les pages. Preuve par test :
+            // `multi_page_total_events_is_coherent_and_no_event_id_duplicate_2_21_70`
+            // dans `read_time_patch::callflow_pfcp_insert_tests`.
+            let session_sibling_count: usize = if let Some(root) = dataset_root.as_deref() {
+                read_time_patch::count_pfcp_siblings_for_persisted_events(
+                    &load_persisted_callflow_events(state, id),
+                    root,
+                )
+                .unwrap_or(0)
+            } else {
+                0
+            };
+            if session_sibling_count > 0 {
                 let returned_events = value
                     .get("events")
                     .and_then(Value::as_array)
@@ -7255,11 +7334,16 @@ fn session_callflow_blocking(state: &AppState, id: &str, query: &CallflowQuery) 
                     .get_mut("pagination")
                     .and_then(Value::as_object_mut)
                 {
-                    let total_events = pagination
+                    // `pagination.total_events` est le compte **persisté**
+                    // (le reader sous-jacent ne sait rien des siblings).
+                    // 2.21.70 : total session = persisté + session_sibling_count,
+                    // identique sur toutes les pages.
+                    let persisted_total = pagination
                         .get("total_events")
                         .and_then(Value::as_u64)
-                        .unwrap_or(returned_events.saturating_sub(pfcp_siblings_added) as u64)
-                        .saturating_add(pfcp_siblings_added as u64);
+                        .unwrap_or(returned_events.saturating_sub(pfcp_siblings_added) as u64);
+                    let total_events = persisted_total
+                        .saturating_add(session_sibling_count as u64);
                     pagination.insert("returned_events".into(), returned_events.into());
                     pagination.insert("total_events".into(), total_events.into());
                 }
