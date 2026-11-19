@@ -227,6 +227,99 @@ L'ancien `GET /identities?q=<IMSI|MSISDN|IMEI>` plaçait la valeur en clair dans
 
 Design du débit par seconde / session / QFI (D-01 à D-05) + endpoint SSE indépendant de la live trace sera envoyé sur #9 **avant** code (ordre 7012275179 §CLAUDE2 clôture).
 
+## OIRAN API 2.21.78 — 2026-11-19 — débit live GTP-U par seconde / session / QFI (SSE indépendant) (ordre #9 7013448739, corrections #9 7013902603)
+
+### Correction suite à l'ordre 7014783020 (séparation live trace / débit)
+
+5. **Régression live trace sur les events late — fermée.** Le filigrane `(packet_number, event_id)` monotone (étape précédente) jetait en silence les events reconstruits en retard que la live trace doit **justement** exposer avec `late:true` (contrat 2.18.10 ANR2 #10 6902524402). Correctif : **deux dédoublonnages distincts** sur `PcapFileState` :
+   - `route_once_for_live_trace(event_id)` — ensemble `routed_event_ids: HashSet<String>` par fichier. Un event late (pn < filigrane, event_id inédit) est routé à la live trace, qui le marque `late:true` via sa logique interne existante.
+   - `should_count_in_throughput(packet_number, event_id)` — filigrane monotone inchangé. Un event late est **rejeté** (débit non recompté).
+   - Les deux sets disparaissent avec le fichier et ne sont jamais vidés à un seuil global.
+   - Test `late_event_routed_to_live_trace_but_not_counted_in_throughput` : un event `(pn=5, "evt-B")` late après `(pn=10, "evt-A")` est routé à la live trace mais pas compté dans le débit ; `last_packet_number` reste à 10.
+
+### Corrections suite à l'ordre 7014327787 (filigrane + rattrapage startup)
+
+3. **Double comptage sous charge — fermé.** L'ancien dédoublonnage via `prior: HashSet<event_id>` global avec `clear()` à 200 000 doublonnait les bytes du fichier courant sous iperf (clear → tous les events paraissent neufs). Correctif : **filigrane `(packet_number, event_id)` par fichier** stocké dans `PcapFileState`. L'event n'est routé que si `(packet_number, event_id) > (last_packet_number, last_event_id)` lexicographiquement — ne se vide **jamais**, disparaît avec le fichier. La méthode `PcapFileState::consume` avance le filigrane et retourne `true`/`false` dans la même opération. Tests :
+   - `watermark_prevents_double_counting_under_load_above_200k_packets` : 250 000 events sur un fichier, 5 passages avec les mêmes bytes → passage 1 route 250 000, passages 2-5 routent 0.
+   - `watermark_lets_multiple_events_on_same_packet_pass` : deux events partageant un `packet_number` mais avec `event_id` différents passent tous les deux (ordre lex).
+
+4. **Rattrapage ring au démarrage — fermé.** Au premier poll, un ring dumpcap de N fichiers forçait N décodages successifs. Correctif : au premier passage (`initial_catchup_done == false`), **tous** les pcapng d'une interface **SAUF le plus récent** sont marqués comme déjà consommés (`consumed_bytes = size`, `last_packet_number = u64::MAX`), sans décodage. Le débit commence « maintenant ». La borne dynamique de reprise du ring n'est plus un coût au démarrage.
+
+### Corrections suite au refus 7013902603 (même branche, nouveau commit)
+
+1. **Faux gap à la rotation — fermé.** L'ancienne version comptait `gap = file_size` pour chaque fichier disparu : chaque rotation du ring dumpcap aurait sonné l'alerte. Correctif : `PcapFileState { size, mtime, consumed_bytes }` par fichier. Le `gap` à la disparition est `size - consumed_bytes` → 0 pour un fichier GC'é après lecture intégrale. Tests dédiés :
+   - `fully_consumed_file_removed_contributes_zero_gap` (gap = 0 quand `consumed_bytes == size`).
+   - `half_consumed_file_removed_reports_unread_bytes_as_gap` (gap = 1000 quand `consumed_bytes == 500`, `size == 1500`).
+
+2. **Redécodage full ring à chaque poll — fermé.** L'ancienne version appelait `decode_capture_streaming` sur CHAQUE pcapng à chaque passage. Correctif : lecture incrémentale par fichier via `PcapFileState`. La décision `should_decode` compare `(size, mtime)` au poll précédent :
+   - `(size, mtime)` identiques → **0 décodage** (skip complet).
+   - `size` augmenté → re-décodage (dédup via `prior` HashSet).
+   - `size` diminué (truncation / réutilisation du path) → re-décodage.
+   - Nouveau fichier → décodage initial.
+   - `consumed_bytes = size` si `decode_capture_streaming` a retourné `Ok`, sinon valeur précédente (permet gap mesurable).
+   - Nouveau compteur `throughput.files_decoded` monotone, incrémenté **uniquement** quand un décodage a effectivement lieu.
+   - Test : `file_state_change_detector_does_not_rescan_unchanged` prouve que 3 polls avec `(size, mtime)` identiques n'incrémentent pas le compteur.
+
+
+
+Branche `fix/oiran-2.21.78-throughput-sse`, base `fix/oiran-2.21.74-filter-ready-503` @ `29fe4e3` (PROD). Pas de déploiement.
+
+### Nouveauté
+
+- **Nouveau module** `apps/api/src/throughput.rs` : `ThroughputRegistry` qui maintient par session un ensemble de buckets `(qfi, direction)` sur la seconde courante, flush au second boundary.
+- **Nouveau endpoint** `GET /sessions/:id/throughput/stream` : SSE avec `KeepAlive 15s`, `Last-Event-ID` (query + header), 404 symétrique pour `session_id` inconnu, 409 Conflict au `MAX_STREAM_SUBSCRIBERS=10` ou `MAX_TRACKED_SESSIONS=256`.
+- **Payload** `throughput_bucket` : `{session_id, second, qfi: u32|null, direction: "UPLINK"|"DOWNLINK"|"UNKNOWN", bytes_s, packets_s, cumulative_bytes, cumulative_packets, decode_lag_ms, degraded: bool}`. Idle flush émet un bucket avec `bytes_s=0,silence:true` après 3 s sans trafic.
+- **Payload** `gap` : `{bytes_gap, cumulative_bytes_gap}` broadcasté sur tous les streams actifs dès qu'un fichier pcap disparaît en rotation.
+
+### 3 conditions cœur fermées par construction
+
+1. **Zéro perte à la rotation** (condition 1) : `live_trace::start_reader` énumère désormais **TOUS** les pcapng par interface (trié par mtime), pas seulement le plus récent. Un index `known_sizes: HashMap<PathBuf, u64>` détecte les fichiers disparus entre deux polls ; la perte compte dans `throughput.bump_bytes_gap(size)`, qui broadcast un event `gap` à tous les streams. Test : `rotation_gap_is_counted_and_broadcast_never_silent`.
+
+2. **Octets = longueur filaire** (condition 2) : `ThroughputRegistry::observe_event` somme `event.packet_references[i].original_length`, jamais `captured_length`. Test : `wire_bytes_uses_original_length_not_captured_length` prouve que `captured_length=128` + `original_length=1500` produit `bytes_s=1500`.
+
+3. **decode_lag_ms + degraded** (condition 3) : chaque event calcule `now_ns - event.timestamp.unix_nanoseconds()` en ms et prend le max du bucket. Au flush, si `max_lag_ms > DEGRADED_LAG_MS=5_000`, le payload porte `degraded: true` et le compteur `degraded_events_emitted` s'incrémente. Test : `decode_lag_above_5s_flags_bucket_as_degraded` vérifie avec un event d'il y a 6 s.
+
+### LiveEventBus — lecteur unique
+
+`live_trace::start_reader` est désormais partagé : il tourne tant qu'il y a (a) une trace active ou (b) un stream de débit actif. Appelé idempotemment par `throughput::stream_for_session`. Aucune I/O dupliquée, aucun second polling.
+
+### Résolution TEID → `session_id`
+
+`throughput::resolve_session_id_for_event(state, event)` parcourt `state.inner.flows` et cherche dans `callflow.events[*].decoded_ie_tree` les identifiants `teid`/`gtp_teid`/`gtp_teid_ul`/`gtp_teid_dl` matchant (normalisation via `event_schema::normalize_teid_hex`). Fail-closed : `None` → le compteur `unmapped_teid_events` s'incrémente, l'event est ignoré. Test : `unmapped_teid_increments_counter_but_never_leaks_into_a_random_session`.
+
+### Tests (9 ajoutés, 12 runs à 0 échec)
+
+- `session_bucket_accumulates_bytes_within_a_second`
+- `wire_bytes_uses_original_length_not_captured_length` (condition 2)
+- `unknown_direction_is_a_distinct_bucket` (continuité D-06)
+- `qfi_split_produces_two_buckets_per_second`
+- `unmapped_teid_increments_counter_but_never_leaks_into_a_random_session`
+- `rotation_gap_is_counted_and_broadcast_never_silent` (condition 1)
+- `decode_lag_above_5s_flags_bucket_as_degraded` (condition 3)
+- `flush_emits_buckets_in_canonical_qfi_direction_order`
+- `active_buckets_cap_counts_overflow_as_gap`
+
+12 runs `cargo test --locked -p oiran-api --lib` : voir le rapport #9.
+
+### Bornes
+
+- `MAX_TRACKED_SESSIONS = 256` sessions actives.
+- `MAX_STREAM_SUBSCRIBERS = 10` subscribers SSE par session (409 au 11ᵉ).
+- `MAX_ACTIVE_BUCKETS_PER_SESSION = 32` tuples (qfi, direction).
+- `REPLAY_BUFFER = 1024` events SSE conservés pour `Last-Event-ID`.
+- `SESSION_IDLE_TIMEOUT_S = 3600` purge des sessions sans GET SSE.
+
+### Confidentialité
+
+Payload sans IMSI/MSISDN/pseudonyme/IP/TEID. Seul `session_id` opaque + QFI (entier) + direction + compteurs. Aucun identifiant en URL (saisie = identifiant de session déjà exposé par `/sessions`).
+
+### Écarts OUVERTS
+
+- Latence structurelle : polling 750 ms + rotation pcapng ≈ ~1,5 s. Gate campagne D3 (< 5 s) atteignable. Si réclamé, inotify/fd-watch dans un lot suivant.
+- Pas de breakdown par TEID dans le payload (sémantique `qfi+direction` demandée).
+- Pas de persistance historique du débit — endpoint live seul.
+- Pas de stream multi-session via un seul GET — à ajouter si l'UI p900 le réclame.
+
 ## OIRAN API 2.21.74 + live-probe 0.6.26 — 2026-11-19 — `/sessions/filter` 503 jusqu'aux caches READY (ordre #10 7009381757)
 
 Branche `fix/oiran-2.21.74-filter-ready-503`, base exacte `fix/oiran-2.21.72-train @ eaa21f0`. Aucun déploiement.

@@ -302,7 +302,7 @@ fn sort_by_capture_order(events: &mut [event_schema::NormalizedEvent]) {
     });
 }
 
-fn start_reader(state: AppState) {
+pub(crate) fn start_reader(state: AppState) {
     if state
         .inner
         .live_traces
@@ -312,12 +312,26 @@ fn start_reader(state: AppState) {
         return;
     }
     tokio::spawn(async move {
-        let mut seen = HashSet::new();
+        // 2.21.78 (correction 7014327787) — plus de `prior` HashSet global
+        // (le `clear()` à 200 000 doublonnait sous iperf). Le
+        // dédoublonnage est désormais per-file via `PcapFileState.consume`
+        // (filigrane `(packet_number, event_id)` qui ne se vide jamais).
+        let mut file_state: HashMap<std::path::PathBuf, crate::throughput::PcapFileState> =
+            HashMap::new();
+        // 2.21.78 (correction 7014327787) — rattrapage du ring au
+        // démarrage : au premier passage, tous les pcapng SAUF le plus
+        // récent par interface sont marqués comme déjà consommés (sans
+        // décodage). Le débit commence « maintenant ». Si false, le
+        // premier passage décode normalement (régime nominal).
+        let mut initial_catchup_done = false;
         loop {
             {
-                let mut traces = state.inner.live_traces.traces.lock().unwrap();
-                LiveTraceRegistry::purge(&mut traces);
-                if traces.is_empty() {
+                let traces = state.inner.live_traces.traces.lock().unwrap();
+                let traces_empty = traces.is_empty();
+                drop(traces);
+                // 2.21.78 : le reader reste actif si (a) traces live
+                // ou (b) streams de débit sont en cours.
+                if traces_empty && !state.inner.throughput.has_active_streams() {
                     state
                         .inner
                         .live_traces
@@ -332,13 +346,14 @@ fn start_reader(state: AppState) {
                 source.filter(|p| p.starts_with("/var/lib/docker/volumes/oiran_lab_pcap/_data"))
             {
                 let state2 = state.clone();
-                let mut prior = seen;
-                seen = tokio::task::spawn_blocking(move || {
+                let mut states = file_state;
+                let catchup = !initial_catchup_done;
+                file_state = tokio::task::spawn_blocking(move || {
                     let key = match event_schema::PseudonymKey::load_or_generate(
                         &event_schema::PseudonymKey::resolve_default_path(),
                     ) {
                         Ok(k) => k,
-                        Err(_) => return prior,
+                        Err(_) => return states,
                     };
                     for interface in [
                         "N2", "N4", "N3", "SBI", "S1-MME", "S11", "S5-C", "S5-U", "S1-U", "Sxab",
@@ -352,54 +367,182 @@ fn start_reader(state: AppState) {
                             other => other,
                         };
                         let dir = root.join(directory.to_ascii_lowercase());
-                        let Ok(entries) = fs::read_dir(dir) else {
+                        let Ok(entries) = fs::read_dir(&dir) else {
                             continue;
                         };
-                        let Some(path) = entries
+                        // 2.21.78 (correction 7013902603) — énumère tous les
+                        // pcapng, triés par mtime ancien → récent. La
+                        // décision de redécoder est prise PAR FICHIER selon
+                        // `(size, mtime)` vs `file_state`.
+                        let mut paths: Vec<_> = entries
                             .flatten()
                             .map(|entry| entry.path())
                             .filter(|path| {
                                 path.extension().and_then(|v| v.to_str()) == Some("pcapng")
                             })
-                            .max_by_key(|path| path.metadata().and_then(|m| m.modified()).ok())
-                        else {
-                            continue;
-                        };
-                        let capture_id =
-                            format!("sha256:{}", sha256_hex(path.to_string_lossy().as_bytes()));
-                        let config = oiran_decode::DecodeConfig {
-                            input: path,
-                            capture_id,
-                            interface: interface.into(),
-                            endpoints: HashMap::new(),
-                        };
-                        // 2.18.10 (ANR2 #10 6902524402 : 24/55 messages `late`) —
-                        // le décodeur émet dans l'ordre de RECONSTRUCTION
-                        // (réassemblage SCTP / flux HTTP/2 : un message
-                        // complet peut sortir après des paquets plus
-                        // récents). On collecte les nouveaux events d'une
-                        // passe et on les route triés par packet_number
-                        // (ordre canonique intra-capture), puis event_id.
-                        let mut fresh = Vec::new();
-                        let _ = oiran_decode::decode_capture_streaming(&config, &key, |event| {
-                            if prior.insert(event.event_id.clone()) {
-                                fresh.push(event);
-                            }
-                            Ok(())
+                            .collect();
+                        paths.sort_by_key(|path| {
+                            path.metadata().and_then(|m| m.modified()).ok()
                         });
-                        sort_by_capture_order(&mut fresh);
-                        for event in &fresh {
-                            state2.inner.live_traces.route_normalized(event);
+                        // 2.21.78 (correction défaut 1) — détecte les fichiers
+                        // précédemment vus qui ont DISPARU. Le gap n'est
+                        // PAS la taille totale : c'est `last_size -
+                        // consumed_bytes`. Un fichier lu en entier et GC'é
+                        // par le ring dumpcap contribue 0 — pas d'alerte
+                        // sur le régime normal du ring.
+                        let present: std::collections::HashSet<std::path::PathBuf> =
+                            paths.iter().cloned().collect();
+                        let gone: Vec<_> = states
+                            .keys()
+                            .filter(|p| p.starts_with(&dir) && !present.contains(*p))
+                            .cloned()
+                            .collect();
+                        for path in &gone {
+                            if let Some(file_state) = states.remove(path) {
+                                let gap = file_state
+                                    .size
+                                    .saturating_sub(file_state.consumed_bytes);
+                                if gap > 0 {
+                                    state2.inner.throughput.bump_bytes_gap(gap);
+                                }
+                            }
                         }
-                        if prior.len() > 200_000 {
-                            prior.clear();
+                        // 2.21.78 (correction 7014327787) — rattrapage du
+                        // ring au démarrage : tous les fichiers sauf le
+                        // plus récent sont marqués consommés sans décodage.
+                        // Le filigrane est au MAX pour que toute re-lecture
+                        // ultérieure (très improbable : fichier passé) soit
+                        // ignorée.
+                        let last_idx = paths.len().saturating_sub(1);
+                        for path in paths.iter().enumerate() {
+                            let (idx, path) = path;
+                            let meta = match path.metadata() {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            let size = meta.len();
+                            let mtime = meta.modified().ok();
+                            let is_newest = idx == last_idx;
+                            // Rattrapage : au premier passage, tous les
+                            // fichiers sauf le plus récent sont ignorés.
+                            if catchup && !is_newest {
+                                states.insert(
+                                    path.clone(),
+                                    crate::throughput::PcapFileState {
+                                        size,
+                                        mtime,
+                                        consumed_bytes: size,
+                                        last_packet_number: u64::MAX,
+                                        last_event_id: String::new(),
+                                        routed_event_ids: Default::default(),
+                                    },
+                                );
+                                continue;
+                            }
+                            // 2.21.78 (correction défaut 2) — lecture
+                            // incrémentale : `(size, mtime)` inchangé
+                            // ⇒ **0 décodage**.
+                            let prev = states.get(path).cloned().unwrap_or_default();
+                            let should_decode = if prev.size == size && prev.mtime == mtime && prev.size > 0 {
+                                false
+                            } else if prev.consumed_bytes >= size && prev.size == size {
+                                // Already fully consumed at that size.
+                                false
+                            } else {
+                                true
+                            };
+                            if !should_decode {
+                                // Mémorise au moins la taille (si c'est la
+                                // première vue du fichier avec taille nulle,
+                                // il peut toujours grandir plus tard).
+                                states.insert(
+                                    path.clone(),
+                                    crate::throughput::PcapFileState {
+                                        size,
+                                        mtime,
+                                        consumed_bytes: prev.consumed_bytes,
+                                        last_packet_number: prev.last_packet_number,
+                                        last_event_id: prev.last_event_id,
+                                        routed_event_ids: prev.routed_event_ids,
+                                    },
+                                );
+                                continue;
+                            }
+                            state2.inner.throughput.bump_file_decoded();
+                            let capture_id = format!(
+                                "sha256:{}",
+                                sha256_hex(path.to_string_lossy().as_bytes())
+                            );
+                            let config = oiran_decode::DecodeConfig {
+                                input: path.clone(),
+                                capture_id,
+                                interface: interface.into(),
+                                endpoints: HashMap::new(),
+                            };
+                            let mut fresh = Vec::new();
+                            let decode_result =
+                                oiran_decode::decode_capture_streaming(&config, &key, |event| {
+                                    fresh.push(event);
+                                    Ok(())
+                                });
+                            sort_by_capture_order(&mut fresh);
+                            // 2.21.78 (corrections 7014327787 + 7014783020)
+                            // — **deux dédoublonnages distincts** :
+                            //   - live trace : `route_once_for_live_trace`
+                            //     via set d'`event_id` par fichier. Un event
+                            //     late (packet_number < filigrane mais
+                            //     event_id inédit) est routé avec `late:true`
+                            //     par la logique interne de `route_normalized`.
+                            //   - débit : `should_count_in_throughput` avance
+                            //     le filigrane `(packet_number, event_id)`
+                            //     monotone — aucun double comptage même sous
+                            //     iperf 10⁵ pps.
+                            let mut file_state_entry =
+                                states.remove(path).unwrap_or_default();
+                            for event in &fresh {
+                                let packet_number = event
+                                    .packet_references
+                                    .first()
+                                    .map(|p| p.packet_number)
+                                    .unwrap_or(0);
+                                if file_state_entry.route_once_for_live_trace(&event.event_id) {
+                                    state2.inner.live_traces.route_normalized(event);
+                                }
+                                if file_state_entry.should_count_in_throughput(
+                                    packet_number,
+                                    &event.event_id,
+                                ) {
+                                    let session_id = crate::throughput::resolve_session_id_for_event(
+                                        &state2, event,
+                                    );
+                                    state2
+                                        .inner
+                                        .throughput
+                                        .observe_event(event, session_id.as_deref());
+                                }
+                            }
+                            file_state_entry.size = size;
+                            file_state_entry.mtime = mtime;
+                            file_state_entry.consumed_bytes = if decode_result.is_ok() {
+                                size
+                            } else {
+                                prev.consumed_bytes
+                            };
+                            states.insert(path.clone(), file_state_entry);
                         }
                     }
-                    prior
+                    if states.len() > 1024 {
+                        states.clear();
+                    }
+                    states
                 })
                 .await
                 .unwrap_or_default();
+                initial_catchup_done = true;
             }
+            // 2.21.78 — tick régulier du registre de débit : émet un
+            // bucket zéro après IDLE_FLUSH_INTERVAL_S de silence.
+            state.inner.throughput.tick();
             tokio::time::sleep(Duration::from_millis(750)).await;
         }
     });
