@@ -261,7 +261,7 @@ fn sort_by_capture_order(events: &mut [event_schema::NormalizedEvent]) {
     });
 }
 
-fn start_reader(state: AppState) {
+pub(crate) fn start_reader(state: AppState) {
     if state
         .inner
         .live_traces
@@ -272,11 +272,18 @@ fn start_reader(state: AppState) {
     }
     tokio::spawn(async move {
         let mut seen = HashSet::new();
+        // 2.21.78 (ordre #9 7013448739 condition 1) — tailles des
+        // pcapng vues au poll précédent, par chemin. Si un fichier
+        // disparaît (rotation GC), on compte les octets perdus.
+        let mut known_sizes: HashMap<std::path::PathBuf, u64> = HashMap::new();
         loop {
             {
-                let mut traces = state.inner.live_traces.traces.lock().unwrap();
-                LiveTraceRegistry::purge(&mut traces);
-                if traces.is_empty() {
+                let traces = state.inner.live_traces.traces.lock().unwrap();
+                let traces_empty = traces.is_empty();
+                drop(traces);
+                // 2.21.78 : le reader reste actif si (a) traces live
+                // ou (b) streams de débit sont en cours.
+                if traces_empty && !state.inner.throughput.has_active_streams() {
                     state
                         .inner
                         .live_traces
@@ -292,12 +299,13 @@ fn start_reader(state: AppState) {
             {
                 let state2 = state.clone();
                 let mut prior = seen;
-                seen = tokio::task::spawn_blocking(move || {
+                let mut sizes = known_sizes;
+                (seen, known_sizes) = tokio::task::spawn_blocking(move || {
                     let key = match event_schema::PseudonymKey::load_or_generate(
                         &event_schema::PseudonymKey::resolve_default_path(),
                     ) {
                         Ok(k) => k,
-                        Err(_) => return prior,
+                        Err(_) => return (prior, sizes),
                     };
                     for interface in [
                         "N2", "N4", "N3", "SBI", "S1-MME", "S11", "S5-C", "S5-U", "S1-U", "Sxab",
@@ -311,54 +319,103 @@ fn start_reader(state: AppState) {
                             other => other,
                         };
                         let dir = root.join(directory.to_ascii_lowercase());
-                        let Ok(entries) = fs::read_dir(dir) else {
+                        let Ok(entries) = fs::read_dir(&dir) else {
                             continue;
                         };
-                        let Some(path) = entries
+                        // 2.21.78 (condition 1) — énumère TOUS les pcapng
+                        // du répertoire, triés par mtime (ancien → récent).
+                        // La dédup via `prior` évite le re-traitement ;
+                        // décoder plusieurs fichiers garantit que le
+                        // queue du précédent est terminé AVANT le passage
+                        // au suivant.
+                        let mut paths: Vec<_> = entries
                             .flatten()
                             .map(|entry| entry.path())
                             .filter(|path| {
                                 path.extension().and_then(|v| v.to_str()) == Some("pcapng")
                             })
-                            .max_by_key(|path| path.metadata().and_then(|m| m.modified()).ok())
-                        else {
-                            continue;
-                        };
-                        let capture_id =
-                            format!("sha256:{}", sha256_hex(path.to_string_lossy().as_bytes()));
-                        let config = oiran_decode::DecodeConfig {
-                            input: path,
-                            capture_id,
-                            interface: interface.into(),
-                            endpoints: HashMap::new(),
-                        };
-                        // 2.18.10 (ANR2 #10 6902524402 : 24/55 messages `late`) —
-                        // le décodeur émet dans l'ordre de RECONSTRUCTION
-                        // (réassemblage SCTP / flux HTTP/2 : un message
-                        // complet peut sortir après des paquets plus
-                        // récents). On collecte les nouveaux events d'une
-                        // passe et on les route triés par packet_number
-                        // (ordre canonique intra-capture), puis event_id.
-                        let mut fresh = Vec::new();
-                        let _ = oiran_decode::decode_capture_streaming(&config, &key, |event| {
-                            if prior.insert(event.event_id.clone()) {
-                                fresh.push(event);
-                            }
-                            Ok(())
+                            .collect();
+                        paths.sort_by_key(|path| {
+                            path.metadata().and_then(|m| m.modified()).ok()
                         });
-                        sort_by_capture_order(&mut fresh);
-                        for event in &fresh {
-                            state2.inner.live_traces.route_normalized(event);
+                        // 2.21.78 (condition 1) — détecte les fichiers
+                        // précédemment vus qui ont DISPARU (rotation GC
+                        // ou purge disque). Chaque disparition compte
+                        // les octets non lus comme gap.
+                        let present: std::collections::HashSet<std::path::PathBuf> =
+                            paths.iter().cloned().collect();
+                        let gone: Vec<_> = sizes
+                            .keys()
+                            .filter(|p| p.starts_with(&dir) && !present.contains(*p))
+                            .cloned()
+                            .collect();
+                        for path in &gone {
+                            let size = sizes.remove(path).unwrap_or(0);
+                            if size > 0 {
+                                state2.inner.throughput.bump_bytes_gap(size);
+                            }
                         }
-                        if prior.len() > 200_000 {
-                            prior.clear();
+                        for path in paths {
+                            // Mémorise la taille courante pour détecter
+                            // la disparition au poll suivant.
+                            if let Ok(meta) = path.metadata() {
+                                sizes.insert(path.clone(), meta.len());
+                            }
+                            let capture_id = format!(
+                                "sha256:{}",
+                                sha256_hex(path.to_string_lossy().as_bytes())
+                            );
+                            let config = oiran_decode::DecodeConfig {
+                                input: path,
+                                capture_id,
+                                interface: interface.into(),
+                                endpoints: HashMap::new(),
+                            };
+                            // 2.18.10 (ANR2 #10 6902524402) — tri par
+                            // ordre canonique intra-capture avant routage.
+                            let mut fresh = Vec::new();
+                            let _ = oiran_decode::decode_capture_streaming(
+                                &config,
+                                &key,
+                                |event| {
+                                    if prior.insert(event.event_id.clone()) {
+                                        fresh.push(event);
+                                    }
+                                    Ok(())
+                                },
+                            );
+                            sort_by_capture_order(&mut fresh);
+                            for event in &fresh {
+                                state2.inner.live_traces.route_normalized(event);
+                                // 2.21.78 — observe aussi pour le débit
+                                // live. Résolution TEID → session_id en
+                                // interne, fail-closed si inconnue.
+                                let session_id = crate::throughput::resolve_session_id_for_event(
+                                    &state2, event,
+                                );
+                                state2
+                                    .inner
+                                    .throughput
+                                    .observe_event(event, session_id.as_deref());
+                            }
+                            if prior.len() > 200_000 {
+                                prior.clear();
+                            }
                         }
                     }
-                    prior
+                    // Bornes sur `sizes` — on garde max 1024 fichiers,
+                    // au-delà on purge les plus vieux.
+                    if sizes.len() > 1024 {
+                        sizes.clear();
+                    }
+                    (prior, sizes)
                 })
                 .await
                 .unwrap_or_default();
             }
+            // 2.21.78 — tick régulier du registre de débit : émet un
+            // bucket zéro après IDLE_FLUSH_INTERVAL_S de silence.
+            state.inner.throughput.tick();
             tokio::time::sleep(Duration::from_millis(750)).await;
         }
     });

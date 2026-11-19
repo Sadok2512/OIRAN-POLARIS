@@ -15,6 +15,9 @@ mod read_time_patch;
 mod session_catalog;
 mod session_filters;
 mod subscriber_journey;
+// 2.21.78 (ordre #9 7013448739) — débit live GTP-U par seconde, par
+// session, par QFI. SSE indépendant de la live trace.
+mod throughput;
 
 use axum::{
     body::Body,
@@ -105,6 +108,11 @@ struct Inner {
     administrator_token_sha256: Option<String>,
     identity_vault: IdentityVault,
     live_traces: live_trace::LiveTraceRegistry,
+    /// 2.21.78 (ordre #9 7013448739) — registre des flux SSE de débit
+    /// par session. Partagé avec le lecteur unique de `live_trace`
+    /// (voir `start_reader`) qui lui pousse chaque event GTP-U
+    /// résolu à une session via `TeidSessionIndex`.
+    throughput: throughput::ThroughputRegistry,
     /// 2.14.7 (ANR1 #10) — compteurs du patcher à la lecture. Partagé
     /// via `Arc` : chaque chargement/accès à un `flow_value`
     /// incrémente ces compteurs sans verrouillage global. Exposé dans
@@ -751,6 +759,7 @@ impl AppState {
                 administrator_token_sha256: config.administrator_token_sha256,
                 identity_vault,
                 live_traces: live_trace::LiveTraceRegistry::new(),
+                throughput: throughput::ThroughputRegistry::new(),
                 read_time_patch_counters: read_time_patch_counters.clone(),
                 reference_dataset_root: Some(dataset_dir.clone()),
                 raw_index_cache: read_time_patch::RawIndexCache::new(
@@ -857,6 +866,7 @@ impl AppState {
                 administrator_token_sha256: config.administrator_token_sha256,
                 identity_vault,
                 live_traces: live_trace::LiveTraceRegistry::new(),
+                throughput: throughput::ThroughputRegistry::new(),
                 read_time_patch_counters,
                 reference_dataset_root: None,
                 raw_index_cache,
@@ -1043,6 +1053,16 @@ pub fn router(state: AppState, frontend_dist: Option<PathBuf>) -> Router {
         )
         .route("/live/traces/:id/markers", post(live_trace::marker))
         .route("/live/traces/:id/stream", get(live_trace::stream))
+        // 2.21.78 (ordre #9 7013448739) — débit live par session,
+        // indépendant de la live trace. SSE : un event
+        // `throughput_bucket` par (qfi, direction) par seconde + un
+        // event `gap` à chaque octet perdu en rotation. Pas de pseudo,
+        // pas d'identité : `:id` est un `session_id` opaque déjà
+        // exposé par `/sessions` et `/sessions/filter`.
+        .route(
+            "/sessions/:id/throughput/stream",
+            get(throughput::stream_for_session),
+        )
         .route(
             "/live/traces/:id/sessions",
             get(live_trace::sessions_for_trace),
